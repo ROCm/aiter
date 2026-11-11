@@ -33,6 +33,12 @@ token pool (past 4 GiB for the ``pool_4g`` cases) and read it in place through
 the slot table; the result must equal the packed call on the gathered rows bit
 for bit. The span limit cases must be rejected: one request whose K/V spans one
 token past 4 GiB - 1 MiB, or whose int32 slot table spans one entry past it.
+The paged cases store a layout's K/V in a paged cache [pages, page, HK, 256] on random
+pages (NaN elsewhere): the halves of one K|V record per token with pages further apart
+than they are long (1568-token pages 19,992 rows apart), or two
+dense buffers. qsa_paged_kv_pool and qsa_paged_kv_slots must give the packed K/V back
+row for row, and the op over them must equal the packed call bit for bit; on gfx942 the
+record cases must report the gfx950-only stride rule instead.
 On gfx950 the strided cases store the same layouts' K/V as interleaved K|V
 records (one per token, as vLLM's QSA cache does) or as padded rows and read them
 in place, packed and through kv_slots (past 4 GiB for the ``pool_4g`` cases); the
@@ -89,7 +95,13 @@ from aiter import dtypes
 from aiter.jit.utils.chip_info import get_gfx_runtime
 from aiter.ops.flydsl import qsa_sparse_prefill as flydsl_prefill
 from aiter.ops.flydsl.kernels.qsa import sparse_prefill_common
-from aiter.ops.qsa import qsa_sparse_prefill
+from aiter.ops.qsa import (
+    can_use_flydsl_qsa_sparse_prefill,
+    qsa_paged_kv_pool,
+    qsa_paged_kv_slots,
+    qsa_sparse_prefill,
+    qsa_sparse_prefill_problem,
+)
 from aiter.test_common import benchmark, checkAllclose, run_perftest
 
 torch.set_default_device("cuda")
@@ -251,6 +263,18 @@ SLOT_CASES = {
         "chunk_2048_ctx_30720",
         POOL_4G_ROWS,
         8_000_000 // PAGE,
+    ),
+}
+# name -> (layout, page tokens, rows between pages, "record" (K|V halves of one record per
+# token) or "separate" (two dense buffers)).
+PAGED_CASES = {
+    "paged_ragged_4_pitched_pages": ("ragged_4", 1568, 19992, "record"),
+    "paged_hk2_ragged_pages_apart": ("hk2_ragged", 64, 96, "record"),
+    "paged_extend_64_ctx_70065_dense_pages": (
+        "extend_64_ctx_70065",
+        64,
+        64,
+        "separate",
     ),
 }
 # name -> (K/V tokens of one request, read through kv_slots): one past the
@@ -1189,6 +1213,103 @@ def test_qsa_kv_slots(case, heads):
     return ret
 
 
+def make_paged(k, v, query_lens, prefix_lens, case, generator):
+    """K and V [pages, page, HK, 256] of a paged cache holding each request's packed K/V on
+    random pages (every other element NaN), and the int32 block table [requests, pages].
+    """
+    _, page, pitch, kind = PAGED_CASES[case]
+    lengths = [n + p for n, p in zip(query_lens, prefix_lens)]
+    counts = [-(-n // page) for n in lengths]
+    pages = 2 * sum(counts) + 1
+    chosen = torch.randperm(pages, generator=generator, device="cuda")
+    if kind == "record":
+        record = torch.full(
+            (pages, pitch, 2, *k.shape[1:]), float("nan"), dtype=k.dtype
+        )
+        caches = (record[:, :page, 0], record[:, :page, 1])
+    else:
+        caches = tuple(
+            torch.full((pages, page, *k.shape[1:]), float("nan"), dtype=k.dtype)
+            for _ in range(2)
+        )
+    table = torch.zeros(len(lengths), max(counts), dtype=dtypes.i32)
+    first = used = 0
+    for r, (n, count) in enumerate(zip(lengths, counts)):
+        table[r, :count] = chosen[used : used + count].to(dtypes.i32)
+        tokens = torch.arange(n)
+        for cache, packed in zip(caches, (k, v)):
+            cache[table[r, tokens // page].long(), tokens % page] = packed[
+                first : first + n
+            ]
+        first += n
+        used += count
+    return *caches, table
+
+
+@benchmark()
+def test_qsa_paged_kv(case, heads):
+    """K/V read in place from a paged cache through qsa_paged_kv_pool and
+    qsa_paged_kv_slots: the pools hold the packed K/V at the slots, the op accepts them,
+    and its output equals the packed call bit for bit."""
+    layout, page, pitch, kind = PAGED_CASES[case]
+    query_lens, prefix_lens, *_ = CASES[layout]
+    generator = torch.Generator(device="cuda").manual_seed(
+        list(CASES).index(layout) * 16 + heads
+    )
+    q, k, v, indices = make_inputs(layout, heads, generator)
+    k_cache, v_cache, table = make_paged(k, v, query_lens, prefix_lens, case, generator)
+    pool = qsa_paged_kv_pool(k_cache, v_cache)
+    assert pool is not None, f"{case}: no pool"
+    assert (pool.page_size, pool.rows_per_page) == (page, pitch), f"{case}: {pool[2:]}"
+    # The table is built without a host synchronization: a step's first layer builds it
+    # among that step's launches.
+    torch.cuda.synchronize()
+    torch.cuda.set_sync_debug_mode("error")
+    try:
+        slots = qsa_paged_kv_slots(
+            query_lens, prefix_lens, table, pool.page_size, pool.rows_per_page
+        )
+    finally:
+        torch.cuda.set_sync_debug_mode("default")
+    rows = slots.long()
+    # Rows of the pool, not the formula: the packed K/V sit where the slots say.
+    assert torch.equal(pool.k[rows], k) and torch.equal(pool.v[rows], v), case
+    kwargs = {
+        "query_lens": query_lens,
+        "prefix_lens": prefix_lens,
+        "softmax_scale": SCALE,
+    }
+    problem = qsa_sparse_prefill_problem(
+        q, pool.k, pool.v, indices, **kwargs, kv_slots=slots
+    )
+    ret = {
+        "gfx": get_gfx_runtime(),
+        "rows": q.shape[0],
+        "kv_tokens": slots.numel(),
+        "pages": k_cache.shape[0],
+    }
+    if kind == "record" and get_gfx_runtime() != "gfx950":
+        # Interleaved rows are strided: the op reads them on gfx950 only.
+        assert problem == "Strided K/V rows are supported on gfx950 only", problem
+        assert not can_use_flydsl_qsa_sparse_prefill(
+            q, pool.k, pool.v, indices, **kwargs, kv_slots=slots
+        )
+        return ret
+    assert problem is None, f"{case}: {problem}"
+    ref = run_torch(q, k, v, indices, query_lens, prefix_lens, SCALE)
+    packed = qsa_sparse_prefill(q, k, v, indices, **kwargs)
+    paged = qsa_sparse_prefill(q, pool.k, pool.v, indices, **kwargs, kv_slots=slots)
+    ret["flydsl err"] = checkAllclose(
+        ref, paged.to(dtypes.fp32), rtol=2e-2, atol=2e-2, msg=f"{case} H{heads}: out"
+    )
+    assert ret["flydsl err"] == 0, f"{case} H{heads}: mismatch {ret['flydsl err']}"
+    bitwise = checkAllclose(
+        packed, paged, rtol=0, atol=0, msg=f"{case} H{heads} paged vs packed: out"
+    )
+    assert bitwise == 0, f"{case} H{heads}: the paged call differs from the packed call"
+    return ret
+
+
 def make_rows(rows, kv_heads, padding):
     """NaN-filled K and V views [rows, kv_heads, 256] with strided rows: the halves of
     one interleaved K|V record per row (padding None), or rows of two buffers with
@@ -1519,6 +1640,11 @@ def kv_bytes(case):
     if case in STRIDE_REJECT_CASES:
         tokens, _, k_strides, v_strides, *_ = STRIDE_REJECT_CASES[case]
         return tokens * (k_strides[0] + v_strides[0]) * 2
+    if case in PAGED_CASES:
+        layout, page, pitch, _ = PAGED_CASES[case]
+        query_lens, prefix_lens, hk = CASES[layout][:3]
+        pages = 2 * sum(-(-(n + p) // page) for n, p in zip(query_lens, prefix_lens))
+        return (pages + 1) * pitch * 2 * hk * HEAD_DIM * 2
     if case in STRIDE_CASES:
         layout, _, pool_rows, _ = STRIDE_CASES[case]
     else:
@@ -1551,6 +1677,7 @@ def main():
             *ROUTE_CASES,
             *GRAPH_CASES,
             *SLOT_CASES,
+            *PAGED_CASES,
             *STRIDE_CASES,
             *SPAN_LIMIT_CASES,
             *STRIDE_REJECT_CASES,
@@ -1561,13 +1688,14 @@ def main():
             *ROUTE_CASES,
             *GRAPH_CASES,
             *SLOT_CASES,
+            *PAGED_CASES,
             *STRIDE_CASES,
             *SPAN_LIMIT_CASES,
             *STRIDE_REJECT_CASES,
             *MAX_STRIDE_CASES,
         ],
-        help="input layouts to run (functional, route, graph, kv_slots, strided, span "
-        "limit, stride rejection, max stride and performance cases)",
+        help="input layouts to run (functional, route, graph, kv_slots, paged, strided, "
+        "span limit, stride rejection, max stride and performance cases)",
     )
     parser.add_argument(
         "-g",
@@ -1579,7 +1707,13 @@ def main():
     )
     args = parser.parse_args()
 
-    layouts = {**ROUTE_CASES, **GRAPH_CASES, **SLOT_CASES, **STRIDE_CASES}
+    layouts = {
+        **ROUTE_CASES,
+        **GRAPH_CASES,
+        **SLOT_CASES,
+        **PAGED_CASES,
+        **STRIDE_CASES,
+    }
     for suite, cases, test in (
         (
             "functional",
@@ -1589,6 +1723,7 @@ def main():
         ("route", list(ROUTE_CASES), test_qsa_route),
         ("graph", list(GRAPH_CASES), test_qsa_graph_replay),
         ("kv_slots", list(SLOT_CASES), test_qsa_kv_slots),
+        ("paged", list(PAGED_CASES), test_qsa_paged_kv),
         ("strided", list(STRIDE_CASES), test_qsa_strided_kv),
         ("span limit", list(SPAN_LIMIT_CASES), test_qsa_span_limit),
         ("stride rejected", list(STRIDE_REJECT_CASES), test_qsa_stride_rejected),

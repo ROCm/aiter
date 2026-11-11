@@ -9,6 +9,7 @@ modules directly.
 """
 
 from collections.abc import Sequence
+from typing import NamedTuple
 
 import torch
 
@@ -248,6 +249,102 @@ def qsa_sparse_prefill(
     )
 
 
+class PagedKVPool(NamedTuple):
+    """K and V of a paged cache as the token pools ``qsa_sparse_prefill`` reads in place
+    through ``kv_slots``: ``k`` and ``v`` are [rows, heads, dim] views of the cache
+    memory, and token ``o`` of page ``p`` is row ``p * rows_per_page + o``."""
+
+    k: torch.Tensor
+    v: torch.Tensor
+    page_size: int
+    rows_per_page: int
+
+
+def qsa_paged_kv_pool(
+    k_cache: torch.Tensor, v_cache: torch.Tensor
+) -> PagedKVPool | None:
+    """K and V of a paged cache [pages, page_size, heads, dim] as token pools, or None
+    when ``qsa_sparse_prefill`` cannot read the cache that way.
+
+    K and V share their shape and strides (they may be the two halves of one record per
+    token), and strides are arbitrary otherwise: pages may sit further apart than they
+    are long. The cache must hold dense head vectors, and K and V must start 16-byte
+    aligned. The op reads four-token blocks at four consecutive pool rows starting at a
+    multiple of four: a block lies in one page and starts at a multiple of four tokens
+    when the page holds a multiple of four tokens, and its row is a multiple of four
+    when pages start a multiple of four rows apart. dtype, head dimension, row stride
+    and the other operand rules are those of ``qsa_sparse_prefill_problem``, asked of
+    the pools.
+    """
+    if k_cache.ndim != 4 or k_cache.shape != v_cache.shape or 0 in k_cache.shape:
+        return None
+    if k_cache.stride() != v_cache.stride():
+        return None
+    pages, page_size, heads, dim = k_cache.shape
+    page_stride, token_stride, head_stride, element_stride = k_cache.stride()
+    if (
+        element_stride != 1
+        or (heads > 1 and head_stride != dim)
+        or token_stride < heads * dim
+    ):
+        return None
+    rows_per_page, rest = divmod(page_stride, token_stride)
+    if (
+        rest
+        or page_size % 4
+        or rows_per_page % 4
+        or k_cache.data_ptr() % 16
+        or v_cache.data_ptr() % 16
+    ):
+        return None
+    shape = ((pages - 1) * rows_per_page + page_size, heads, dim)
+    stride = (token_stride, dim, 1)
+    return PagedKVPool(
+        k_cache.as_strided(shape, stride),
+        v_cache.as_strided(shape, stride),
+        page_size,
+        rows_per_page,
+    )
+
+
+def qsa_paged_kv_slots(
+    query_lens: Sequence[int],
+    prefix_lens: Sequence[int],
+    block_table: torch.Tensor,
+    page_size: int,
+    rows_per_page: int,
+) -> torch.Tensor:
+    """``kv_slots`` for ``qsa_sparse_prefill`` over a ``qsa_paged_kv_pool``: the int32 pool
+    row of every key of the requests, in packed order (request r's tokens
+    0 .. prefix_r + query_r - 1, requests in order). Token t of request r is row
+    ``block_table[r, t // page_size] * rows_per_page + t % page_size``.
+
+    ``block_table`` [requests, pages] holds exactly these requests' rows, on the device
+    of the op. The host lengths are copied without a synchronization and the rest is
+    device work, so the table can be built per step and shared by every layer. Build it
+    outside graph capture: the lengths are staged in host memory and copied when it runs.
+    """
+    lengths = [q + p for q, p in zip(query_lens, prefix_lens, strict=True)]
+    longest = max(lengths, default=0)
+    if block_table.ndim != 2 or block_table.shape[0] != len(lengths):
+        raise ValueError("block_table must be [requests, pages], one row per request")
+    if -(-longest // page_size) > block_table.shape[1]:
+        raise ValueError("block_table is too narrow for the longest request")
+    device = block_table.device
+    counts = torch.tensor(
+        lengths, dtype=torch.int64, device="cpu", pin_memory=device.type == "cuda"
+    )
+    counts = counts.to(device, non_blocking=True)
+    total = sum(lengths)
+    request = torch.repeat_interleave(
+        torch.arange(len(lengths), device=device), counts, output_size=total
+    )
+    first = torch.cumsum(counts, 0) - counts
+    token = torch.arange(total, device=device) - first[request]
+    page = block_table[request, token // page_size].long()
+    return (page * rows_per_page + token % page_size).to(torch.int32)
+
+
 def qsa_sparse_prefill_problem(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -298,9 +395,12 @@ __all__ = [
     "FP4_GROUP",
     "FP8_DTYPE",
     "FP8_MAX",
+    "PagedKVPool",
     "can_use_flydsl_qsa_sparse_prefill",
     "qsa_cache_row_layout",
     "qsa_expand_block_indices",
+    "qsa_paged_kv_pool",
+    "qsa_paged_kv_slots",
     "qsa_paged_mqa_logits",
     "qsa_select_paged_tokens",
     "qsa_sparse_paged_gqa",
