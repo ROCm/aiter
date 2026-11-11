@@ -134,6 +134,38 @@ def create_wmma_layouts(num_warps, ctas_per_cga=(1, 1)):
     return (wmma_layout, operand_a, operand_b)
 
 
+def create_sliced_k_layouts(num_warps, BLOCK_M, BLOCK_N, ctas_per_cga=(1, 1)):
+    """Layouts of the compute_bound kernel with SLICED_K: wave w computes K slice w of every
+    BLOCK_K stage for the whole CTA tile (a rank-3 [num_warps, BLOCK_M, BLOCK_N] WMMA layout), so
+    each A and B element is read from LDS once per CTA. Also returns the fp32 LDS scratch layout
+    and the register layout of the final sum over the slices."""
+
+    cga = []
+    if tuple(ctas_per_cga) != (1, 1):
+        cga = make_cga_layout(list(ctas_per_cga), list(ctas_per_cga), [0, 1])
+    cga_3d = [[0, m, n] for m, n in cga]
+    wmma_layout = gl.amd.AMDWMMALayout(
+        version=3,
+        transposed=True,
+        warp_bases=[[1 << i, 0, 0] for i in range(int(math.log2(num_warps)))],
+        reg_bases=[],
+        instr_shape=[16, 16, 32],
+        cga_layout=cga_3d,
+        rank=3,
+    )
+    operand_a = gl.DotOperandLayout(operand_index=0, parent=wmma_layout, k_width=8)
+    operand_b = gl.DotOperandLayout(operand_index=1, parent=wmma_layout, k_width=8)
+    cta_n = BLOCK_N // ctas_per_cga[1]
+    red_smem = gl.PaddedSharedLayout.with_identity_for(
+        [[cta_n, 4]], [num_warps, BLOCK_M, BLOCK_N], [2, 1, 0], cga_3d
+    )
+    tn = min(32, cta_n // 4)
+    red_reg = gl.BlockedLayout(
+        [num_warps, 1, 4], [1, 32 // tn, tn], [1, num_warps, 1], [2, 1, 0], cga_3d
+    )
+    return (wmma_layout, operand_a, operand_b, red_smem, red_reg)
+
+
 @gluon.jit(repr=_gemm_a16w16_bandwidth_bound_repr)
 def _gemm_a16w16_bandwidth_bound_kernel(
     a_ptr,
@@ -529,6 +561,41 @@ def _gemm_a16w16_bandwidth_bound_kernel(
         )
 
 
+@gluon.jit
+def _load_operand_a(
+    a, LAYOUT: gl.constexpr, A_LAYOUT: gl.constexpr, SLICED_K: gl.constexpr
+):
+    """LDS -> registers for A of one stage ([BLOCK_M, BLOCK_K] for LAYOUT[0] == "T", else
+    [BLOCK_K, BLOCK_M]). With SLICED_K the stage is viewed as num_warps K slices
+    [KS, BLOCK_M, BLOCK_K / KS] and wave w reads slice w."""
+    KS: gl.constexpr = gl.num_warps()
+    if SLICED_K:
+        if LAYOUT[0] == "T":
+            a = a.reshape([a.shape[0], KS, a.shape[1] // KS]).permute([1, 0, 2])
+        else:
+            a = a.reshape([KS, a.shape[0] // KS, a.shape[1]]).permute([0, 2, 1])
+    elif LAYOUT[0] != "T":
+        a = a.permute([1, 0])
+    return gl.amd.cdna4.async_copy.load_shared_relaxed(a, A_LAYOUT)
+
+
+@gluon.jit
+def _load_operand_b(
+    b, LAYOUT: gl.constexpr, B_LAYOUT: gl.constexpr, SLICED_K: gl.constexpr
+):
+    """LDS -> registers for B of one stage ([BLOCK_K, BLOCK_N] for LAYOUT[1] == "T", else
+    [BLOCK_N, BLOCK_K]); with SLICED_K viewed as [KS, BLOCK_K / KS, BLOCK_N]."""
+    KS: gl.constexpr = gl.num_warps()
+    if SLICED_K:
+        if LAYOUT[1] == "T":
+            b = b.reshape([KS, b.shape[0] // KS, b.shape[1]])
+        else:
+            b = b.reshape([b.shape[0], KS, b.shape[1] // KS]).permute([1, 2, 0])
+    elif LAYOUT[1] != "T":
+        b = b.permute([1, 0])
+    return gl.amd.cdna4.async_copy.load_shared_relaxed(b, B_LAYOUT)
+
+
 @gluon.jit(repr=_gemm_a16w16_compute_bound_repr)
 def _gemm_a16w16_compute_bound_kernel(
     a_ptr,
@@ -557,6 +624,13 @@ def _gemm_a16w16_compute_bound_kernel(
     activation: gl.constexpr,
     USE_ACTIVATION: gl.constexpr,
     ADD_BIAS: gl.constexpr,
+    SHARED_LAYOUT_C: gl.constexpr,
+    NUM_CTAS: gl.constexpr = 1,
+    GROUP_SIZE_M: gl.constexpr = 0,
+    B2B_WMMA: gl.constexpr = 0,
+    SLICED_K: gl.constexpr = 0,
+    RED_SMEM: gl.constexpr = None,
+    RED_REG: gl.constexpr = None,
 ):
     """Local-load pipelining across K-tiles.
 
@@ -567,13 +641,38 @@ def _gemm_a16w16_compute_bound_kernel(
     Requires NUM_BUFFERS >= 2.  With NUM_BUFFERS == 2 the TDM must complete
     fully before each ds_read batch (async_wait(0)), but the ds_read/wmma
     overlap is still preserved.  NUM_BUFFERS >= 3 is recommended.
+
+    NUM_CTAS, GROUP_SIZE_M and B2B_WMMA work as in the bandwidth_bound kernel.
+    SHARED_LAYOUT_C is the LDS staging layout of C for the TDM store.
+
+    SLICED_K splits each BLOCK_K stage into num_warps K slices, one per wave, for the whole CTA
+    tile (layouts from create_sliced_k_layouts), so A and B are read from LDS once per CTA; the
+    slice partials are summed through LDS (RED_SMEM, RED_REG) after the K loop.
     """
     gl.static_assert(NUM_BUFFERS >= 2, "compute_bound kernel requires NUM_BUFFERS >= 2")
+    if B2B_WMMA:
+        # back-to-back WMMA issue: HW_REG_WAVE_SCHED_MODE bit 2
+        gl.inline_asm_elementwise(
+            "s_setreg_imm32_b32 hwreg(HW_REG_WAVE_SCHED_MODE, 2, 1), 1; v_mov_b32 $0, 0;",
+            constraints="=v",
+            args=[],
+            dtype=gl.int32,
+            is_pure=False,
+            pack=1,
+        )
 
     pid = gl.program_id(axis=0)
     num_pid_m = gl.cdiv(M, BLOCK_M)
-    pid_m = pid % num_pid_m
-    pid_n = pid // num_pid_m
+    if GROUP_SIZE_M == 0:
+        pid_m = pid % num_pid_m
+        pid_n = pid // num_pid_m
+    else:
+        num_pid_n = gl.cdiv(N, BLOCK_N)
+        group_size = GROUP_SIZE_M * num_pid_n
+        first_m = (pid // group_size) * GROUP_SIZE_M
+        group_m = min(num_pid_m - first_m, GROUP_SIZE_M)
+        pid_m = first_m + (pid % group_size) % group_m
+        pid_n = (pid % group_size) // group_m
 
     # Descriptors start at this block's (M, N) offset by biasing the base
     # pointer — subsequent async_loads use [0, 0] and step only along K.
@@ -643,7 +742,12 @@ def _gemm_a16w16_compute_bound_kernel(
     load_idx = 0
     compute_idx = 0
 
-    accumulator = gl.zeros((BLOCK_M, BLOCK_N), dtype=gl.float32, layout=WMMA_LAYOUT)
+    if SLICED_K:
+        accumulator = gl.zeros(
+            (gl.num_warps(), BLOCK_M, BLOCK_N), dtype=gl.float32, layout=WMMA_LAYOUT
+        )
+    else:
+        accumulator = gl.zeros((BLOCK_M, BLOCK_N), dtype=gl.float32, layout=WMMA_LAYOUT)
 
     # TDM prologue: fill the pipeline with NUM_BUFFERS-1 tiles
     for _ in gl.static_range(NUM_BUFFERS - 1):
@@ -682,25 +786,13 @@ def _gemm_a16w16_compute_bound_kernel(
     # (NUM_BUFFERS-2)*2 lets exactly one tile (tile 0) complete.
     gl.amd.gfx1250.tdm.async_wait((NUM_BUFFERS - 2) * 2)
 
-    if LAYOUT[0] == "T":
-        cur_a = gl.amd.cdna4.async_copy.load_shared_relaxed(
-            a_buffer.index(compute_idx % NUM_BUFFERS), OPERAND_LAYOUT_A
-        )
-    else:
-        cur_a = gl.amd.cdna4.async_copy.load_shared_relaxed(
-            a_buffer.index(compute_idx % NUM_BUFFERS).permute([1, 0]),
-            OPERAND_LAYOUT_A,
-        )
+    cur_a = _load_operand_a(
+        a_buffer.index(compute_idx % NUM_BUFFERS), LAYOUT, OPERAND_LAYOUT_A, SLICED_K
+    )
 
-    if LAYOUT[1] == "T":
-        cur_b = gl.amd.cdna4.async_copy.load_shared_relaxed(
-            b_buffer.index(compute_idx % NUM_BUFFERS), OPERAND_LAYOUT_B
-        )
-    else:
-        cur_b = gl.amd.cdna4.async_copy.load_shared_relaxed(
-            b_buffer.index(compute_idx % NUM_BUFFERS).permute([1, 0]),
-            OPERAND_LAYOUT_B,
-        )
+    cur_b = _load_operand_b(
+        b_buffer.index(compute_idx % NUM_BUFFERS), LAYOUT, OPERAND_LAYOUT_B, SLICED_K
+    )
 
     # Main pipeline loop — first iteration peeled out below, then loop runs
     # for (num_k_tiles - (NUM_BUFFERS - 1) - 1) remaining iterations.
@@ -747,25 +839,19 @@ def _gemm_a16w16_compute_bound_kernel(
     # Pre-load the NEXT tile's operands into registers *before* the WMMA
     # below.  The hardware can run LDS reads and the matrix unit in
     # parallel, hiding the ds_read latency inside the WMMA execution.
-    if LAYOUT[0] == "T":
-        next_a = gl.amd.cdna4.async_copy.load_shared_relaxed(
-            a_buffer.index((compute_idx + 1) % NUM_BUFFERS), OPERAND_LAYOUT_A
-        )
-    else:
-        next_a = gl.amd.cdna4.async_copy.load_shared_relaxed(
-            a_buffer.index((compute_idx + 1) % NUM_BUFFERS).permute([1, 0]),
-            OPERAND_LAYOUT_A,
-        )
+    next_a = _load_operand_a(
+        a_buffer.index((compute_idx + 1) % NUM_BUFFERS),
+        LAYOUT,
+        OPERAND_LAYOUT_A,
+        SLICED_K,
+    )
 
-    if LAYOUT[1] == "T":
-        next_b = gl.amd.cdna4.async_copy.load_shared_relaxed(
-            b_buffer.index((compute_idx + 1) % NUM_BUFFERS), OPERAND_LAYOUT_B
-        )
-    else:
-        next_b = gl.amd.cdna4.async_copy.load_shared_relaxed(
-            b_buffer.index((compute_idx + 1) % NUM_BUFFERS).permute([1, 0]),
-            OPERAND_LAYOUT_B,
-        )
+    next_b = _load_operand_b(
+        b_buffer.index((compute_idx + 1) % NUM_BUFFERS),
+        LAYOUT,
+        OPERAND_LAYOUT_B,
+        SLICED_K,
+    )
 
     cur_a = next_a
     cur_b = next_b
@@ -818,25 +904,19 @@ def _gemm_a16w16_compute_bound_kernel(
         # Pre-load the NEXT tile's operands into registers *before* the WMMA
         # below.  The hardware can run LDS reads and the matrix unit in
         # parallel, hiding the ds_read latency inside the WMMA execution.
-        if LAYOUT[0] == "T":
-            next_a = gl.amd.cdna4.async_copy.load_shared_relaxed(
-                a_buffer.index((compute_idx + 1) % NUM_BUFFERS), OPERAND_LAYOUT_A
-            )
-        else:
-            next_a = gl.amd.cdna4.async_copy.load_shared_relaxed(
-                a_buffer.index((compute_idx + 1) % NUM_BUFFERS).permute([1, 0]),
-                OPERAND_LAYOUT_A,
-            )
+        next_a = _load_operand_a(
+            a_buffer.index((compute_idx + 1) % NUM_BUFFERS),
+            LAYOUT,
+            OPERAND_LAYOUT_A,
+            SLICED_K,
+        )
 
-        if LAYOUT[1] == "T":
-            next_b = gl.amd.cdna4.async_copy.load_shared_relaxed(
-                b_buffer.index((compute_idx + 1) % NUM_BUFFERS), OPERAND_LAYOUT_B
-            )
-        else:
-            next_b = gl.amd.cdna4.async_copy.load_shared_relaxed(
-                b_buffer.index((compute_idx + 1) % NUM_BUFFERS).permute([1, 0]),
-                OPERAND_LAYOUT_B,
-            )
+        next_b = _load_operand_b(
+            b_buffer.index((compute_idx + 1) % NUM_BUFFERS),
+            LAYOUT,
+            OPERAND_LAYOUT_B,
+            SLICED_K,
+        )
 
         cur_a = next_a
         cur_b = next_b
@@ -879,25 +959,19 @@ def _gemm_a16w16_compute_bound_kernel(
 
     load_idx += 1
 
-    if LAYOUT[0] == "T":
-        next_a = gl.amd.cdna4.async_copy.load_shared_relaxed(
-            a_buffer.index((compute_idx + 1) % NUM_BUFFERS), OPERAND_LAYOUT_A
-        )
-    else:
-        next_a = gl.amd.cdna4.async_copy.load_shared_relaxed(
-            a_buffer.index((compute_idx + 1) % NUM_BUFFERS).permute([1, 0]),
-            OPERAND_LAYOUT_A,
-        )
+    next_a = _load_operand_a(
+        a_buffer.index((compute_idx + 1) % NUM_BUFFERS),
+        LAYOUT,
+        OPERAND_LAYOUT_A,
+        SLICED_K,
+    )
 
-    if LAYOUT[1] == "T":
-        next_b = gl.amd.cdna4.async_copy.load_shared_relaxed(
-            b_buffer.index((compute_idx + 1) % NUM_BUFFERS), OPERAND_LAYOUT_B
-        )
-    else:
-        next_b = gl.amd.cdna4.async_copy.load_shared_relaxed(
-            b_buffer.index((compute_idx + 1) % NUM_BUFFERS).permute([1, 0]),
-            OPERAND_LAYOUT_B,
-        )
+    next_b = _load_operand_b(
+        b_buffer.index((compute_idx + 1) % NUM_BUFFERS),
+        LAYOUT,
+        OPERAND_LAYOUT_B,
+        SLICED_K,
+    )
 
     cur_a = next_a
     cur_b = next_b
@@ -908,25 +982,19 @@ def _gemm_a16w16_compute_bound_kernel(
     for i in gl.static_range(NUM_BUFFERS - 2):
         gl.amd.gfx1250.tdm.async_wait((NUM_BUFFERS - 3 - i) * 2)
 
-        if LAYOUT[0] == "T":
-            next_a = gl.amd.cdna4.async_copy.load_shared_relaxed(
-                a_buffer.index((compute_idx + 1) % NUM_BUFFERS), OPERAND_LAYOUT_A
-            )
-        else:
-            next_a = gl.amd.cdna4.async_copy.load_shared_relaxed(
-                a_buffer.index((compute_idx + 1) % NUM_BUFFERS).permute([1, 0]),
-                OPERAND_LAYOUT_A,
-            )
+        next_a = _load_operand_a(
+            a_buffer.index((compute_idx + 1) % NUM_BUFFERS),
+            LAYOUT,
+            OPERAND_LAYOUT_A,
+            SLICED_K,
+        )
 
-        if LAYOUT[1] == "T":
-            next_b = gl.amd.cdna4.async_copy.load_shared_relaxed(
-                b_buffer.index((compute_idx + 1) % NUM_BUFFERS), OPERAND_LAYOUT_B
-            )
-        else:
-            next_b = gl.amd.cdna4.async_copy.load_shared_relaxed(
-                b_buffer.index((compute_idx + 1) % NUM_BUFFERS).permute([1, 0]),
-                OPERAND_LAYOUT_B,
-            )
+        next_b = _load_operand_b(
+            b_buffer.index((compute_idx + 1) % NUM_BUFFERS),
+            LAYOUT,
+            OPERAND_LAYOUT_B,
+            SLICED_K,
+        )
         accumulator = gl.amd.gfx1250.wmma(cur_a, cur_b, accumulator)
 
         cur_a = next_a
@@ -939,10 +1007,27 @@ def _gemm_a16w16_compute_bound_kernel(
     # if NUM_BUFFERS > 2:
     #     gl.amd.sched_barrier(0)
 
+    # In a cluster the K loop has no cluster barrier: a multicast load returns data only to
+    # the CTAs that issued it (CDNA5 ISA 10.7), and each CTA's own TDM waits cover its LDS.
+    # As in the bandwidth_bound kernel, all CTAs leave the K loop together.
+    if NUM_CTAS > 1:
+        gl.amd.gfx1250.cluster.arrive()
+        gl.amd.gfx1250.cluster.wait()
+
+    if SLICED_K:
+        # Sum the K-slice partials through LDS; the rings are dead, so the scratch can reuse them.
+        gl.barrier()
+        red = gl.allocate_shared_memory(
+            gl.float32, [gl.num_warps(), BLOCK_M, BLOCK_N], RED_SMEM
+        )
+        red.store(accumulator)
+        gl.barrier()
+        accumulator = gl.sum(red.load(RED_REG), axis=0)
+
     # Bias
     if ADD_BIAS:
         offs_bias = pid_n * BLOCK_N + gl.arange(
-            0, BLOCK_N, layout=gl.SliceLayout(0, WMMA_LAYOUT)
+            0, BLOCK_N, layout=gl.SliceLayout(0, accumulator.type.layout)
         )
         bias_vals = gl.load(bias_ptr + offs_bias, mask=offs_bias < N, other=0.0)
         accumulator = accumulator + bias_vals[None, :]
@@ -952,9 +1037,6 @@ def _gemm_a16w16_compute_bound_kernel(
         accumulator = activation(accumulator)
 
     # TDM Store: accumulator → shared memory → global memory
-    SHARED_LAYOUT_C: gl.constexpr = gl.PaddedSharedLayout.with_identity_for(
-        [[BLOCK_N, 8]], [BLOCK_M, BLOCK_N], [1, 0]
-    )
     c_buffer = gl.allocate_shared_memory(
         c_ptr.type.element_ty,
         shape=[BLOCK_M, BLOCK_N],
@@ -964,6 +1046,10 @@ def _gemm_a16w16_compute_bound_kernel(
 
     # Ensure all wavefronts have finished writing to LDS before TDM reads it.
     gl.barrier()
+    if NUM_CTAS > 1:
+        # as in the bandwidth_bound kernel's TDM store of C
+        gl.amd.gfx1250.cluster.arrive()
+        gl.amd.gfx1250.cluster.wait()
 
     c_desc = gl.amd.gfx1250.tdm.make_tensor_descriptor(
         base=c_ptr,

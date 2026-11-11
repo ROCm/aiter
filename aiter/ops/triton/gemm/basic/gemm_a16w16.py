@@ -364,6 +364,7 @@ def gemm_a16w16_(
         from aiter.ops.triton._gluon_kernels.gfx1250.gemm.basic.gemm_a16w16 import (
             _KERNEL_MAP,
             create_shared_layouts,
+            create_sliced_k_layouts,
             create_store_layout,
             create_wmma_layouts,
         )
@@ -384,8 +385,30 @@ def gemm_a16w16_(
         M, K = x.shape
         N, _ = w.shape
 
+        if x.stride(1) == 1:
+            layout = "T"
+        elif x.stride(0) == 1:
+            layout = "N"
+        else:
+            raise ValueError(
+                f"x must be contiguous in at least one dimension, got strides {x.stride()}"
+            )
+
+        # w is (N, K); the kernel reads it as (K, N)
+        if w.stride(0) == 1:
+            layout += "T"
+        elif w.stride(1) == 1:
+            layout += "N"
+        else:
+            raise ValueError(
+                f"w must be contiguous in at least one dimension, got strides {w.T.stride()}"
+            )
+
         if config is None:
-            config, _ = get_gemm_config("GEMM-A16W16", M, N, K, backend="gluon")
+            # a -layout=<layout> config file, if any, overrides buckets of the N/K file
+            config, _ = get_gemm_config(
+                "GEMM-A16W16", M, N, K, backend="gluon", layout=layout
+            )
 
         kernel_type_from_config = config.pop("kernel_type", None)
         if kernel_type_from_config is not None:
@@ -397,8 +420,9 @@ def gemm_a16w16_(
         NUM_BUFFERS = config.get("NUM_BUFFERS", 2)
         num_warps = config["num_warps"]
         waves_per_eu = config.get("waves_per_eu", 0)
-        # bandwidth_bound only: workgroup cluster (BLOCK_M/BLOCK_N are then cluster-wide),
-        # grouped tile order, back-to-back WMMA and a TDM store of C
+        # workgroup cluster (BLOCK_M/BLOCK_N are then cluster-wide), grouped tile order and
+        # back-to-back WMMA for both kernel types; TDM_STORE selects the TDM store of C in
+        # bandwidth_bound (compute_bound always stores C that way)
         num_ctas = config.get("num_ctas", 1)
         bw_options = {
             "NUM_CTAS": num_ctas,
@@ -438,32 +462,21 @@ def gemm_a16w16_(
 
         w = w.T
 
-        if x.stride(1) == 1:
-            layout = "T"
-        elif x.stride(0) == 1:
-            layout = "N"
-        else:
-            raise ValueError(
-                f"x must be contiguous in at least one dimension, got strides {x.stride()}"
-            )
-
-        if w.stride(1) == 1:
-            layout += "T"
-        elif w.stride(0) == 1:
-            layout += "N"
-        else:
-            raise ValueError(
-                f"w must be contiguous in at least one dimension, got strides {w.stride()}"
-            )
-
         if y is None:
             y = torch.empty((M, N), dtype=dtype, device=x.device)
 
-        if kernel_type != "bandwidth_bound":
-            assert num_ctas == 1 and not any(
-                v for k, v in bw_options.items() if k != "NUM_CTAS"
-            ), f"num_ctas and {list(bw_options)} need kernel_type='bandwidth_bound'"
-            bw_options = {}
+        sliced_k = config.get("SLICED_K", 0)
+        if kernel_type == "compute_bound":
+            bw_options.pop("TDM_STORE")
+            if sliced_k:
+                # each wave takes BLOCK_K / num_warps of every stage, at least one WMMA deep
+                assert BLOCK_K % (32 * num_warps) == 0, (
+                    f"SLICED_K needs BLOCK_K % (32 * num_warps) == 0, got BLOCK_K={BLOCK_K}, "
+                    f"num_warps={num_warps}"
+                )
+                bw_options["SLICED_K"] = 1
+        else:
+            assert not sliced_k, "SLICED_K needs kernel_type='compute_bound'"
         ctas_per_cga = cluster_shape(num_ctas, BLOCK_M, BLOCK_N)
         wmma_layout, operand_a, operand_b = create_wmma_layouts(num_warps, ctas_per_cga)
         shared_a, shared_b = create_shared_layouts(
@@ -476,10 +489,19 @@ def gemm_a16w16_(
             cga_a=operand_a.cga_layout,
             cga_b=operand_b.cga_layout,
         )
-        if bw_options.get("TDM_STORE"):
+        if kernel_type == "compute_bound" or bw_options.get("TDM_STORE"):
             bw_options["SHARED_LAYOUT_C"] = create_store_layout(
                 BLOCK_M, BLOCK_N, ctas_per_cga, wmma_layout.cga_layout
             )
+        if bw_options.get("SLICED_K"):
+            # the LDS rings and the C staging keep the 2-D layouts above
+            (
+                wmma_layout,
+                operand_a,
+                operand_b,
+                bw_options["RED_SMEM"],
+                bw_options["RED_REG"],
+            ) = create_sliced_k_layouts(num_warps, BLOCK_M, BLOCK_N, ctas_per_cga)
 
         grid = (triton.cdiv(M, BLOCK_M) * triton.cdiv(N, BLOCK_N), 1)
 
