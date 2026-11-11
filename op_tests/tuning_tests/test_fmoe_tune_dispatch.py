@@ -91,13 +91,14 @@ def _kernel_names(tasks):
 class TestFmoeTuneDispatch(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
-        from aiter.tuning.moe.backends import asm_1stage, asm_stage1, common
+        from aiter.tuning.moe.backends import asm_1stage, asm_stage1, common, flydsl
         from csrc.ck_gemm_moe_2stages_codegen import gemm_moe_tune
 
         cls.gemm_moe_tune = gemm_moe_tune
         cls.backends_common = common
         cls.backend_asm_stage1 = asm_stage1
         cls.backend_asm_1stage = asm_1stage
+        cls.backend_flydsl = flydsl
 
     def setUp(self):
         m = self.gemm_moe_tune
@@ -349,7 +350,7 @@ class TestFmoeTuneDispatch(unittest.TestCase):
 
     def test_flydsl_stage1_drops_kernels_whose_k_does_not_divide(self):
         m = self.gemm_moe_tune
-        kernels = m.get_flydsl_stage1_kernels("fp4", "fp4", "bf16")
+        kernels = self.backend_flydsl.get_flydsl_stage1_kernels("fp4", "fp4", "bf16")
 
         def divides(kparams, model_dim):
             k_batch = kparams.get("k_batch", 1) or 1
@@ -442,13 +443,12 @@ class TestFmoeTuneDispatch(unittest.TestCase):
         self.assertNotIn(256, tile_ks(384))
 
     def test_flydsl_bf16_activation_stage2_fits_lds(self):
-        m = self.gemm_moe_tune
         limit = 160 * 1024
 
         def lds(p):
             return p["tile_m"] * (p["tile_k"] * 2 + p["tile_n"] * 4)
 
-        catalog = m.get_flydsl_stage2_kernels("bf16", "fp4", "bf16")
+        catalog = self.backend_flydsl.get_flydsl_stage2_kernels("bf16", "fp4", "bf16")
         self.assertTrue(
             any(lds(p) > limit for p in catalog.values()),
             "no catalog kernel exceeds the LDS limit; the filter is not exercised",
