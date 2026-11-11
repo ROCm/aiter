@@ -467,7 +467,6 @@ def _make_dualwave_swp_fp8_traits(
                 "conventional_bn64 requires paged=True and num_kv_splits=1"
             )
         block_m = 128
-        dualwave_swp_setprio = False
         dualwave_swp_enable_stagger = False
     if head_dim_v is None:
         head_dim_v = head_dim

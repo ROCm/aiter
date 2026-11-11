@@ -32,6 +32,10 @@ from aiter.ops.flydsl.kernels.fmha_gfx950.pipeline import (
 )
 from aiter.ops.flydsl.kernels.tensor_shim import _run_compiled
 
+# conventional_bn64 wave priorities: K reads + QK above V reads + PV above softmax.
+BN64_QK_PRIO = 2
+BN64_PV_PRIO = 1
+
 
 def build_flash_attn_dualwave_swp_fp8_module(
     num_heads,
@@ -391,6 +395,14 @@ def build_flash_attn_dualwave_swp_fp8_module(
         v_o = [ctx.c_zero_v16f32 for _ in range_constexpr(D_CHUNKS)]
         init_args = [m_row, l_row] + v_o
         loop_results = init_args
+
+        def _bn64_prio(v):
+            # sched_barrier keeps the priority switch at its phase boundary.
+            if const_expr(traits.DUALWAVE_SWP_SETPRIO):
+                rocdl.sched_barrier(0)
+                _s_setprio(v)
+                rocdl.sched_barrier(0)
+
         for j, loop_args in range(t0, t_end, fx.Int64(1), init=init_args):
             j = fx.Int64(j)
             m_row = loop_args[0]
@@ -405,6 +417,8 @@ def build_flash_attn_dualwave_swp_fp8_module(
             fx.gpu.barrier()
             # Same fence after the barrier; no stable sched_barrier equivalent in the pinned FlyDSL.
             rocdl.sched_barrier(0)
+            # The just-synchronised WG gets the SIMDs for its K reads and QK so its waves reach the next barrier together.
+            _bn64_prio(BN64_QK_PRIO)
             pf = j + fx.Int64(1)
             if pf < t_end:
                 prefetch_loader = kv_gmem_to_lds
@@ -415,6 +429,7 @@ def build_flash_attn_dualwave_swp_fp8_module(
                 prefetch_loader.load_v(pf * BN, next_buf, prefetch_page)
             v_k = kv_lds_to_regs.load_k(buf)
             v_s = gemm_helper.qk(v_k, q_wide)
+            _bn64_prio(0)
             if const_expr(traits.CAUSAL):
                 v_s = softmax_helper.causal_mask_tile_if_needed(v_s, fx.Int32(j))
             else:
@@ -431,6 +446,9 @@ def build_flash_attn_dualwave_swp_fp8_module(
             v_s = softmax_helper.sub_m(v_s, m_new)
             v_p = softmax_helper.exp2(v_s, 0)
             v_p = softmax_helper.exp2(v_p, 16)
+            # Past its exps a wave feeds the matrix pipe (V reads, PV); waves still in softmax yield to it.
+            # Held to the next barrier.
+            _bn64_prio(BN64_PV_PRIO)
             # Row sum before PV so P's fp32 copy dies before the V reads (3 waves/SIMD budget).
             l_row = softmax_helper.reduce_sum(l_row, v_p)
             v_p = gemm_helper.cast_p_fp8_direct(v_p)
@@ -443,6 +461,7 @@ def build_flash_attn_dualwave_swp_fp8_module(
         m_row = loop_results[0]
         l_row = loop_results[1]
         v_o = [loop_results[2 + i] for i in range_constexpr(D_CHUNKS)]
+        _bn64_prio(0)
         # No stable approximate-reciprocal API at v0.4.0: 1.0 / x lowers to arith.divf (IEEE).
         inv_l_rcp = rocdl.rcp(T.f32, fx.as_ir_value(l_row))
         inv_l = fx.Float32(
