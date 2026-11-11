@@ -1217,7 +1217,7 @@ class FlyQuickAllReduce:
     def _check_sp_payload(self, mode, inp, out, tile_bytes: int) -> int:
         """Validate a reduce-scatter / all-gather pair; return the full tensor's bytes."""
         inp_ptr, out_ptr = check_tensors(
-            inp, out, device_index=self._device_index, owner="QuickAllReduceInt4"
+            inp, out, device_index=self._device_index, owner="FlyQuickAllReduce"
         )
         inp_bytes = int(inp.numel()) * int(inp.element_size())
         out_bytes = int(out.numel()) * int(out.element_size())
@@ -1236,10 +1236,10 @@ class FlyQuickAllReduce:
             )
         if full_bytes > MAX_PAYLOAD_BYTES:
             raise ValueError(
-                "QuickAllReduceInt4 payload must not exceed the 4 GiB buffer window"
+                "FlyQuickAllReduce payload must not exceed the 4 GiB buffer window"
             )
         if max(inp_ptr, out_ptr) < min(inp_ptr + inp_bytes, out_ptr + out_bytes):
-            raise ValueError("QuickAllReduceInt4 requires non-overlapping input/output")
+            raise ValueError("FlyQuickAllReduce requires non-overlapping input/output")
         return full_bytes
 
     def _sp_preflight(self, kind, inp, out) -> None:
@@ -1264,7 +1264,7 @@ class FlyQuickAllReduce:
         """
         if torch.cuda.is_current_stream_capturing():
             raise RuntimeError(
-                f"QuickAllReduceInt4: {kind} needs the single-phase preflight, "
+                f"FlyQuickAllReduce: {kind} needs the single-phase preflight, "
                 "which loads kernels and agrees the configuration across ranks "
                 "and cannot run under CUDA graph capture; call "
                 "compile_sp(full, shard) on every rank before capture"
@@ -1298,7 +1298,7 @@ class FlyQuickAllReduce:
             raise error
         if failed:
             raise RuntimeError(
-                "QuickAllReduceInt4 single-phase preflight failed on another "
+                "FlyQuickAllReduce single-phase preflight failed on another "
                 "rank, so nothing launches: " + "; ".join(failed)
             )
         differing = [
@@ -1307,7 +1307,7 @@ class FlyQuickAllReduce:
             if len({fp[i][1] for _msg, fp in votes}) > 1
         ]
         raise RuntimeError(
-            "QuickAllReduceInt4 single-phase calls differ across ranks, so "
+            "FlyQuickAllReduce single-phase calls differ across ranks, so "
             "nothing launches: "
             + "; ".join(
                 f"rank {r} " + ", ".join(f"{fp[i][0]}={fp[i][1]}" for i in differing)

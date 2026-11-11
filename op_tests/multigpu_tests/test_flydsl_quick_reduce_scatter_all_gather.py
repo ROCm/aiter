@@ -1,11 +1,11 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
 
-"""Runtime correctness for ``QuickAllReduceInt4.reduce_scatter`` / ``all_gather``.
+"""Runtime correctness for ``FlyQuickAllReduce.reduce_scatter`` / ``all_gather``.
 
-Same layout as ``test_flydsl_quick_allreduce_int4.py``: ``python3`` this file
+Same layout as ``test_flydsl_quick_allreduce.py``: ``python3`` this file
 first runs untimed validity, then a ``@benchmark`` / markdown sweep. Every rank
-is a ``multiprocessing`` spawn worker with its own ``QuickAllReduceInt4``
+is a ``multiprocessing`` spawn worker with its own ``FlyQuickAllReduce``
 engine; the oracle is an untimed fp32 NCCL all-reduce / all-gather of the same
 per-rank inputs. INT4 is lossy, so accuracy is NMSE against the exact fp32
 result (plus ``checkAllclose`` with the all-reduce test's tolerances); the
@@ -109,13 +109,15 @@ import torch
 import aiter
 from aiter.dist.utils import get_distributed_init_method, get_ip, get_open_port
 from aiter.jit.utils.chip_info import get_gfx_runtime
+from aiter.ops.flydsl.allreduce_policy import (
+    MAX_PAYLOAD_BYTES,
+    SUPPORTED_WORLDS,
+    TwoShotRung,
+)
 from aiter.ops.flydsl.kernels.comm.allreduce_shared import (
     BLOCK,
     DEFAULT_GRID_CAP,
-    MAX_PAYLOAD_BYTES,
-    SUPPORTED_WORLDS,
     TILE_BYTES,
-    TwoShotRung,
 )
 from aiter.test_common import benchmark, checkAllclose, run_perftest
 
@@ -129,7 +131,7 @@ SUPPORTED_ARCHS = ("gfx942", "gfx950")
 # and about 1.1e-2 on Student-t(3) data; 2e-2 is a bound a correct kernel stays
 # under with margin and a wrong block / offset (NMSE ~ 1-2) exceeds.
 NMSE_MAX = 2e-2
-# checkAllclose tolerances as in test_flydsl_quick_allreduce_int4.py: calibrated
+# checkAllclose tolerances as in test_flydsl_quick_allreduce.py: calibrated
 # to the INT4 group-16 codec, not bit identity. NMSE stays the accuracy gate.
 CLOSE_RTOL = 1e-1
 CLOSE_ATOL = 1e-1
@@ -540,7 +542,7 @@ def _compile_capture_refused(fly, full, shard) -> bool:
     do), so every rank refuses alike, and the engine stays ready."""
     import torch.distributed as dist
 
-    from aiter.ops.flydsl import quick_allreduce_int4 as host
+    from aiter.ops.flydsl import quick_allreduce as host
 
     with ExitStack() as stack:
         votes = stack.enter_context(mock.patch.object(dist, "all_gather_object"))
@@ -672,8 +674,9 @@ def _interleave(fly, rank: int, tp: int, device, sp_rows: int) -> dict:
 
 def _check_unsupported_engines(rank: int, tp: int, device, gloo) -> None:
     """Engines the single-phase modes cannot run on refuse them before any
-    launch: the ring, and a fine-grained inbox (validated on the uncached one)."""
-    from aiter.ops.flydsl import QuickAllReduceInt4
+    launch: the ring, a fine-grained inbox (validated on the uncached one) and a
+    codec other than INT4."""
+    from aiter.ops.flydsl import FlyQuickAllReduce
 
     full = torch.zeros((32 * tp, _REFUSE_HIDDEN), dtype=torch.bfloat16, device=device)
     shard = torch.zeros((32, _REFUSE_HIDDEN), dtype=torch.bfloat16, device=device)
@@ -688,11 +691,14 @@ def _check_unsupported_engines(rank: int, tp: int, device, gloo) -> None:
             {"inbox_memory": "finegrained", "ladder": _sp_ladder(_PINNED_CAP)},
         ),
         ("ring", "mesh algorithm", {"algorithm": "ring", "ladder": (ring_rung,)}),
+        (
+            "INT5 mesh",
+            "codec='int4'",
+            {"rs_codec": "int5", "ladder": _sp_ladder(_PINNED_CAP)},
+        ),
     ):
         with closing(
-            QuickAllReduceInt4(
-                group=gloo, device=device, rank=rank, world_size=tp, **kw
-            )
+            FlyQuickAllReduce(group=gloo, device=device, rank=rank, world_size=tp, **kw)
         ) as fly, _no_launch(fly):
             for name, call in (
                 ("reduce_scatter", partial(fly.reduce_scatter, full, shard)),
@@ -715,7 +721,7 @@ def _init_rank(rank: int, tp: int, init_method: str):
         rank=rank,
         device_id=device,
     )
-    # QuickAllReduceInt4 exchanges IPC metadata over a non-NCCL group;
+    # FlyQuickAllReduce exchanges IPC metadata over a non-NCCL group;
     # NCCL stays for the fp32 references.
     return device, dist.new_group(backend="gloo")
 
@@ -737,10 +743,10 @@ def _run_rank(
 ) -> list[dict]:
     import torch.distributed as dist
 
-    from aiter.ops.flydsl import QuickAllReduceInt4
+    from aiter.ops.flydsl import FlyQuickAllReduce
 
     device, gloo = _init_rank(rank, tp, init_method)
-    fly = QuickAllReduceInt4(
+    fly = FlyQuickAllReduce(
         group=gloo,
         device=device,
         rank=rank,
@@ -784,7 +790,7 @@ def _run_rank_extras(rank: int, tp: int, init_method: str) -> dict:
     """The graph, interleave and unsupported-engine checks of one rank."""
     import torch.distributed as dist
 
-    from aiter.ops.flydsl import QuickAllReduceInt4
+    from aiter.ops.flydsl import FlyQuickAllReduce
 
     device, gloo = _init_rank(rank, tp, init_method)
     res = {}
@@ -794,7 +800,7 @@ def _run_rank_extras(rank: int, tp: int, init_method: str) -> dict:
             # grid cap; the all-reduce runs on the same engine.
             pinned = stack.enter_context(
                 closing(
-                    QuickAllReduceInt4(
+                    FlyQuickAllReduce(
                         group=gloo,
                         device=device,
                         rank=rank,
@@ -809,7 +815,7 @@ def _run_rank_extras(rank: int, tp: int, init_method: str) -> dict:
             )
             shipped = stack.enter_context(
                 closing(
-                    QuickAllReduceInt4(
+                    FlyQuickAllReduce(
                         group=gloo, device=device, rank=rank, world_size=tp
                     )
                 )
@@ -822,7 +828,7 @@ def _run_rank_extras(rank: int, tp: int, init_method: str) -> dict:
             # not leave the others in a state that fails their checks.
             cold = stack.enter_context(
                 closing(
-                    QuickAllReduceInt4(
+                    FlyQuickAllReduce(
                         group=gloo,
                         device=device,
                         rank=rank,
@@ -843,7 +849,7 @@ def _check_residency_stub() -> None:
     that fits fewer blocks per CU than the grid needs is refused, naming the
     build, and one that fits as many passes. The needed counts are worked out
     by hand for 256 and 512 CUs."""
-    from aiter.ops.flydsl.quick_allreduce_int4 import _check_sp_residency
+    from aiter.ops.flydsl.quick_allreduce import _check_sp_residency
 
     def launch(*fits):
         return types.SimpleNamespace(
@@ -898,8 +904,8 @@ def _run_rank_preflight(rank: int, tp: int, init_method: str) -> dict:
     """
     import torch.distributed as dist
 
-    from aiter.ops.flydsl import QuickAllReduceInt4
-    from aiter.ops.flydsl import quick_allreduce_int4 as host
+    from aiter.ops.flydsl import FlyQuickAllReduce
+    from aiter.ops.flydsl import quick_allreduce as host
 
     device, gloo = _init_rank(rank, tp, init_method)
     odd = rank == 1
@@ -907,7 +913,7 @@ def _run_rank_preflight(rank: int, tp: int, init_method: str) -> dict:
 
     def engine():
         return closing(
-            QuickAllReduceInt4(
+            FlyQuickAllReduce(
                 group=gloo,
                 device=device,
                 rank=rank,
@@ -1114,14 +1120,14 @@ def _load_stall_kernel(directory: str):
     *directory* with the stall hook, under another module name; the module the
     engines normally build from stays as it is. FlyDSL reads the source file of
     the factory while it builds, so the copy must stay until the last build."""
-    from aiter.ops.flydsl.kernels.comm import quick_allreduce_int4 as kern
+    from aiter.ops.flydsl.kernels.comm import quick_allreduce_mesh as kern
 
     with open(kern.__file__) as f:
         src = _slow_reader_source(f.read())
-    path = os.path.join(directory, "quick_allreduce_int4_slow_reader.py")
+    path = os.path.join(directory, "quick_allreduce_mesh_slow_reader.py")
     with open(path, "w") as f:
         f.write(src)
-    name = f"{kern.__package__}.quick_allreduce_int4_slow_reader"
+    name = f"{kern.__package__}.quick_allreduce_mesh_slow_reader"
     spec = importlib.util.spec_from_file_location(name, path)
     module = importlib.util.module_from_spec(spec)
     sys.modules[name] = module
@@ -1196,9 +1202,9 @@ def _run_rank_slow_reader(rank: int, tp: int, init_method: str, variant: str) ->
     builds are made on first use)."""
     import torch.distributed as dist
 
-    from aiter.ops.flydsl import QuickAllReduceInt4
+    from aiter.ops.flydsl import FlyQuickAllReduce
 
-    host = importlib.import_module("aiter.ops.flydsl.quick_allreduce_int4")
+    host = importlib.import_module("aiter.ops.flydsl.quick_allreduce")
     device, gloo = _init_rank(rank, tp, init_method)
     res = {"own_cache_entries": None}
     try:
@@ -1212,13 +1218,13 @@ def _run_rank_slow_reader(rank: int, tp: int, init_method: str, variant: str) ->
                 stack.enter_context(
                     mock.patch.object(
                         host,
-                        "make_quick_allreduce_int4_kernel",
-                        _load_stall_kernel(directory).make_quick_allreduce_int4_kernel,
+                        "make_quick_allreduce_mesh_kernel",
+                        _load_stall_kernel(directory).make_quick_allreduce_mesh_kernel,
                     )
                 )
             fly = stack.enter_context(
                 closing(
-                    QuickAllReduceInt4(
+                    FlyQuickAllReduce(
                         group=gloo,
                         device=device,
                         rank=rank,
@@ -1306,7 +1312,7 @@ def _run_pool(world_size, worker, *, timeout=None, **kwds):
         raise ValueError(f"unsupported world_size={world_size}")
     n_gpu = torch.cuda.device_count()
     if n_gpu < world_size:
-        raise RuntimeError(f"QuickAllReduceInt4 needs {world_size} GPUs, have {n_gpu}")
+        raise RuntimeError(f"FlyQuickAllReduce needs {world_size} GPUs, have {n_gpu}")
     init_method = get_distributed_init_method(get_ip(), get_open_port())
     limit = float(os.environ.get("FLYDSL_QR_TIMEOUT", "3600"))
     if timeout is not None:
@@ -1494,7 +1500,7 @@ test_quick_reduce_scatter_all_gather.__test__ = False
 
 def main():
     if ARCH not in SUPPORTED_ARCHS:
-        aiter.logger.warning("QuickAllReduceInt4 unsupported on %s; skipping", ARCH)
+        aiter.logger.warning("FlyQuickAllReduce unsupported on %s; skipping", ARCH)
         return
     n_gpu = torch.cuda.device_count()
     parser = argparse.ArgumentParser(

@@ -49,7 +49,7 @@ values. INT5 and INT6 use the same scale and add more bits for each value. FP16
 sends the values without quantization and is used in testing.
 
 The mesh also runs one lap on its own, for sequence parallelism.
-`QuickAllReduceInt4.reduce_scatter(inp, out)` leaves each rank a contiguous
+`FlyQuickAllReduce.reduce_scatter(inp, out)` leaves each rank a contiguous
 block of rows of the sum, and `all_gather(inp, out)` concatenates the ranks'
 blocks. Both use INT4, `super_tile=1`, the 32 KiB tile (the payload is a whole
 number of tiles) and the inbox and colors of the all-reduce's `super_tile=1`
