@@ -41,15 +41,28 @@ MLA_MODEL_FAMILIES = ("deepseek", "kimik25")
 MLA_MODEL_ALL = ("deepseek-V3", "kimik25-tp4")
 
 
+def _mla_model_family(name: str) -> str:
+    """Return the model family, with the same split as get_model_configs."""
+    delimiter = "_" if "_" in name else "-"
+    return name.split(delimiter)[0]
+
+
 def model_benchmark_configs(args):
     # Shared get_parser() --model help advertises "all". Expand it to the
     # configs this benchmark can run instead of asserting before any load.
     models = args.model
     if models == "all":
         models = ",".join(MLA_MODEL_ALL)
-    assert any(family in models for family in MLA_MODEL_FAMILIES), (
-        f"Only these model families are supported for this benchmark: "
-        f"{', '.join(MLA_MODEL_FAMILIES)}."
+    # Check each entry. A search of the joined string accepts a mixed list
+    # such as "deepseek-V3,llama3-8B", then Llama runs with DeepSeek MLA dims.
+    entries = [name.strip() for name in models.split(",") if name.strip()]
+    unsupported = [
+        name for name in entries if _mla_model_family(name) not in MLA_MODEL_FAMILIES
+    ]
+    assert not unsupported, (
+        "Only these model families are supported for this benchmark: "
+        f"{', '.join(MLA_MODEL_FAMILIES)}. "
+        f"Unsupported model entries: {', '.join(unsupported)}."
     )
     config_file = args.model_configs
     configs = get_model_configs(config_path=config_file, models=models)

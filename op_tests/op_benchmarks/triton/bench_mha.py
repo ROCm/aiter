@@ -52,12 +52,13 @@ class BenchRun:
 
 VALID_FUNCTIONS = {"fwd", "bwd", "fwd_varlen", "bwd_varlen", "fwd_kvcache"}
 
-# The (left, right) window variants the default sweep benches: dense and a representative causal
-# sliding window. A swept axis like the default function/dtype sets.
-# Omit both window CLI options (--window-size-left and --window-size-right) to run this default
-# sweep. Pass either flag to run one window. An omitted side is unbounded (-1). For a dense only
-# bench, explicitly pass (-1, -1).
-DEFAULT_WINDOWS = [(-1, -1), (1024, 0)]
+# Default sweep: dense (-1, -1) and a causal left window (1024, -1).
+# Native Triton rejects a right bound other than -1, so (1024, 0) never
+# runs on -impl default. With causal=True, (1024, -1) is that window.
+# Omit both window flags to run this sweep. Pass either flag to run one
+# window. An omitted side is unbounded (-1). For a dense only bench,
+# explicitly pass (-1, -1).
+DEFAULT_WINDOWS = [(-1, -1), (1024, -1)]
 
 
 def _resolve_windows(
@@ -693,6 +694,10 @@ def run_benchmark(run: BenchRun):
         # (see aiter.ops.triton.attention.mha gluon backend).
         if is_gluon and (is_bwd or is_decode):
             warnings.warn("Skipping: Gluon backend only supports fwd / fwd_varlen.")
+            return 0
+        # Fused backward rejects a left window. dao_ai does not use that path.
+        if fused and is_bwd and window_size_left > 0 and impl != "dao_ai":
+            warnings.warn("Skipping: fused bwd does not support a sliding window.")
             return 0
         mha_set_use_fused_bwd_kernel(fused)
         make_fn = get_make_fn(function, dtype, run.backend)
