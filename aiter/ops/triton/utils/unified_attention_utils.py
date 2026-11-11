@@ -25,7 +25,9 @@ Lookup walks the axes in the order "schema" lists them and takes the first key
 that exists: an exact EQ first, then LEQ bounds ascending, then GEQ
 descending, then "any". So the leftmost axis wins: D before Q is what makes
 head_size outrank max_seqlen_q.
-Dtypes fall back too: DT_fp8_fp8, then DT_fp8_any, DT_any_fp8, then "any".
+Dtypes fall back too: DT_fp8_fp8, then DT_fp8_any, DT_any_fp8, then "any". The second dtype is the K
+cache's; a V cache of another dtype (A8K4V8: NVFP4 K, fp8 V) first tries DT_<q>_<k>_<v>, e.g.
+DT_fp8_nvfp4_fp8, then that same chain.
 SW is the keys a row can see, min(window, max_seqlen_k), and 0 with no window:
 SW_GEQ_<n> targets a window size, a bare SW matches any window, and a table
 may not mix SW_LEQ and SW_GEQ keys.
@@ -40,8 +42,6 @@ and the SPLIT_MIN_* floors; see compute_segment_params.
 import copy
 import functools
 import itertools
-import json
-import os
 
 import torch
 import triton
@@ -55,44 +55,6 @@ from aiter.ops.triton.utils.config_utils import (
 from aiter.ops.triton.utils.types import e4m3_dtype
 
 _CONFIG_NAME = "UNIFIED-ATTENTION"
-
-# AITER_GFX1250_UA3D_NHD_CFG='{"SEGMENTS_PER_CU": 16, "num_stages": 3, ...}' overrides the
-# kv_split (SEGMENTS_PER_CU / MIN_SEGMENTS / MAX_SEGMENTS) and attn_3d (num_warps / num_stages / waves_per_eu)
-# entries of the gfx1250 Triton 3D split-KV decode path for plain (non-shuffled) bf16 or fp8 q / KV.
-# Unset keeps the DEFAULT.json entries. Arithmetic and kernel source are unchanged.
-_UA3D_NHD_KEYS = {"kv_split": ("SEGMENTS_PER_CU", "MIN_SEGMENTS", "MAX_SEGMENTS"),
-                  "attn_3d": ("num_warps", "num_stages", "waves_per_eu")}
-
-
-def _parse_ua3d_nhd_override():
-    raw = os.environ.get("AITER_GFX1250_UA3D_NHD_CFG", "").strip()
-    if not raw:
-        return None
-    cfg = json.loads(raw)
-    allowed = {k for ks in _UA3D_NHD_KEYS.values() for k in ks}
-    if not isinstance(cfg, dict):
-        raise ValueError(f"AITER_GFX1250_UA3D_NHD_CFG={raw!r}: expected a JSON object")
-    bad = [k for k, v in cfg.items() if k not in allowed or not isinstance(v, int) or v < 1]
-    if bad:
-        raise ValueError(f"AITER_GFX1250_UA3D_NHD_CFG={raw!r}: keys must be positive ints from {sorted(allowed)}")
-    return cfg
-
-
-_UA3D_NHD_OVERRIDE = _parse_ua3d_nhd_override()
-
-
-def _ua3d_nhd_override_applies(op, params, backend, arch) -> bool:
-    return (
-        _UA3D_NHD_OVERRIDE is not None
-        and op in _UA3D_NHD_KEYS
-        and backend == "triton"
-        and (arch or arch_info.get_arch()) == "gfx1250"
-        and not params.shuffled_kv_cache
-        and params.all_decode
-        and params.sliding_window <= 0
-        and params.q_dtype in (torch.bfloat16, e4m3_dtype)
-        and params.kv_cache_dtype in (torch.bfloat16, e4m3_dtype)
-    )
 _OPS = ("attn_2d", "attn_3d", "reduce", "kv_split")
 
 # Groups of RDNA GPUs have similar hardware. Use the same config file until further investigation shows they diverge.
@@ -111,7 +73,7 @@ _AXIS_KIND = {
     "SW": "opt_num",  # keys a row can see, 0 when off; bare SW = any window
     "SKLT": "bool",  # max_seqlen_k < 2048
     "SHUF": "bool",  # shuffled_kv_cache
-    "DT": "enum",  # (q dtype tag, kv dtype tag)
+    "DT": "enum",  # (q dtype tag, K cache dtype tag[, V cache dtype tag when it differs])
     # 2d programs per CU, rounded up to a power of 2, so P bounds must be powers of 2
     "P": "num",
 }
@@ -173,8 +135,12 @@ def _candidates(axis: str, value, parts: set) -> list[str]:
     if kind == "bool":
         return ([axis] if value else []) + ["any"]
     if kind == "enum":
-        q, kv = value
-        return [f"{axis}_{q}_{kv}", f"{axis}_{q}_any", f"{axis}_any_{kv}", "any"]
+        q, kv = value[:2]
+        # a V cache dtype unlike K's (A8K4V8) tries its own DT_q_k_v first
+        own = (
+            [f"{axis}_{q}_{kv}_{value[2]}"] if len(value) > 2 and value[2] != kv else []
+        )
+        return own + [f"{axis}_{q}_{kv}", f"{axis}_{q}_any", f"{axis}_any_{kv}", "any"]
     if kind == "opt_num" and not value:
         return ["any"]
 
@@ -289,6 +255,7 @@ def _axis_values(
     kv_dtype,
     programs_per_cu,
     num_queries_per_kv=1,
+    v_dtype=None,
 ) -> dict:
     return {
         "D": head_size,
@@ -298,7 +265,8 @@ def _axis_values(
         "SW": max(1, min(sliding_window, max_seqlen_k)) if sliding_window > 0 else 0,
         "SKLT": max_seqlen_k < 2048,
         "SHUF": shuffled_kv_cache,
-        "DT": (get_dtype_str(q_dtype), get_dtype_str(kv_dtype)),
+        "DT": (get_dtype_str(q_dtype), get_dtype_str(kv_dtype))
+        + ((get_dtype_str(v_dtype),) if v_dtype is not None else ()),
         "P": programs_per_cu,
     }
 
@@ -346,6 +314,7 @@ def _get_unified_attention_config_cached(
     backend: str,
     arch: str | None,
     num_queries_per_kv: int = 1,
+    v_cache_dtype: torch.dtype | None = None,
 ) -> dict:
     assert op in _OPS, f"Unknown config op {op!r}, expected one of {_OPS}"
     assert head_size > 0, "head_size must be positive"
@@ -363,6 +332,7 @@ def _get_unified_attention_config_cached(
         kv_dtype,
         programs_per_cu,
         num_queries_per_kv,
+        v_dtype=v_cache_dtype,
     )
     _, config = _lookup(table, axes, values)
     return compute_tile_params(config, block_size)
@@ -402,13 +372,11 @@ def get_unified_attention_config(
         backend,
         arch,
         params.num_queries_per_kv,
+        v_cache_dtype=getattr(params, "v_cache_dtype", None),
     )
-    config = copy.deepcopy(config)
-    if _ua3d_nhd_override_applies(op, params, backend, arch):
-        config.update({k: v for k, v in _UA3D_NHD_OVERRIDE.items() if k in _UA3D_NHD_KEYS[op]})
     # NUM_SEGMENTS is derived out here rather than in the cached lookup: it
     # reads the launch's program count, which is not part of the cache key.
-    return compute_segment_params(config, params)
+    return compute_segment_params(copy.deepcopy(config), params)
 
 
 def explain(op: str, params, backend: str = "triton", arch: str | None = None) -> str:
@@ -425,6 +393,7 @@ def explain(op: str, params, backend: str = "triton", arch: str | None = None) -
         params.kv_cache_dtype,
         _programs_per_cu(params),
         params.num_queries_per_kv,
+        v_dtype=getattr(params, "v_cache_dtype", None),
     )
     key, config = _lookup(table, axes, values)
     derived = compute_segment_params(

@@ -9,7 +9,8 @@
       "D",
       "SHUF",
       "DT",
-      "BS"
+      "BS",
+      "Q"
     ],
     "reduce": [
       "D",
@@ -21,7 +22,8 @@
       "D",
       "SHUF",
       "DT",
-      "BS"
+      "BS",
+      "Q"
     ]
   },
   "attn_2d": {
@@ -161,25 +163,25 @@
       "num_stages": 2,
       "waves_per_eu": 2
     },
-    "D_LEQ_64.DT_bf16_bf16": {
+    "D_LEQ_64.DT_bf16_bf16.Q_LEQ_1": {
       "BLOCK_M": 16,
       "num_warps": 1,
       "num_stages": 3,
       "waves_per_eu": 2
     },
-    "D_LEQ_64.DT_bf16_fp8": {
+    "D_LEQ_64.DT_bf16_fp8.Q_LEQ_1": {
       "BLOCK_M": 16,
       "num_warps": 1,
       "num_stages": 3,
       "waves_per_eu": 2
     },
-    "D_LEQ_64.DT_fp8_bf16": {
+    "D_LEQ_64.DT_fp8_bf16.Q_LEQ_1": {
       "BLOCK_M": 16,
       "num_warps": 1,
       "num_stages": 3,
       "waves_per_eu": 2
     },
-    "D_LEQ_64.DT_fp8_fp8": {
+    "D_LEQ_64.DT_fp8_fp8.Q_LEQ_1": {
       "BLOCK_M": 16,
       "num_warps": 1,
       "num_stages": 3,
@@ -260,25 +262,25 @@
       "TILE_SIZE_MIN": 1,
       "TILE_SIZE_MAX": 4096
     },
-    "D_LEQ_64.DT_bf16_bf16": {
+    "D_LEQ_64.DT_bf16_bf16.Q_LEQ_1": {
       "MIN_SEGMENTS": 4,
       "SEGMENTS_PER_CU": 16,
       "TILE_SIZE_MIN": 1,
       "TILE_SIZE_MAX": 4096
     },
-    "D_LEQ_64.DT_bf16_fp8": {
+    "D_LEQ_64.DT_bf16_fp8.Q_LEQ_1": {
       "MIN_SEGMENTS": 4,
       "SEGMENTS_PER_CU": 16,
       "TILE_SIZE_MIN": 1,
       "TILE_SIZE_MAX": 4096
     },
-    "D_LEQ_64.DT_fp8_bf16": {
+    "D_LEQ_64.DT_fp8_bf16.Q_LEQ_1": {
       "MIN_SEGMENTS": 4,
       "SEGMENTS_PER_CU": 16,
       "TILE_SIZE_MIN": 1,
       "TILE_SIZE_MAX": 4096
     },
-    "D_LEQ_64.DT_fp8_fp8": {
+    "D_LEQ_64.DT_fp8_fp8.Q_LEQ_1": {
       "MIN_SEGMENTS": 4,
       "SEGMENTS_PER_CU": 16,
       "TILE_SIZE_MIN": 1,
