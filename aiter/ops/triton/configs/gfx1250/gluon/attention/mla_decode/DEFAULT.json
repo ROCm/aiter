@@ -272,9 +272,11 @@
         "waves_per_eu": 1
       },
       "H_LEQ_8.B_LEQ_32.KV_LEQ_32768": {
+        "EARLY_PRIME": 1,
         "NPOT_SPLITS": 12,
-        "PARTIAL_BF16": 0,
+        "PARTIAL_BF16": 1,
         "Q_FROM_LDS": 0,
+        "SPLIT_FP8": 1,
         "num_stages": 2,
         "num_warps": 1,
         "waves_per_eu": 1
@@ -304,9 +306,11 @@
         "waves_per_eu": 1
       },
       "H_LEQ_8.B_LEQ_64.KV_LEQ_32768": {
-        "NPOT_SPLITS": 12,
+        "EARLY_PRIME": 1,
+        "NPOT_SPLITS": 6,
         "PARTIAL_BF16": 1,
         "Q_FROM_LDS": 0,
+        "SPLIT_FP8": 1,
         "num_stages": 2,
         "num_warps": 1,
         "waves_per_eu": 1
@@ -363,6 +367,55 @@
         "NPOT_SPLITS": 6,
         "PARTIAL_BF16": 1,
         "Q_FROM_LDS": 0,
+        "num_stages": 2,
+        "num_warps": 1,
+        "waves_per_eu": 1
+      },
+      "H_LEQ_8.B_LEQ_32.KV_LEQ_65536": {
+        "EARLY_PRIME": 1,
+        "NPOT_SPLITS": 12,
+        "PARTIAL_BF16": 1,
+        "Q_FROM_LDS": 0,
+        "SPLIT_FP8": 1,
+        "num_stages": 2,
+        "num_warps": 1,
+        "waves_per_eu": 1
+      },
+      "H_LEQ_8.B_LEQ_64.KV_LEQ_65536": {
+        "EARLY_PRIME": 1,
+        "NPOT_SPLITS": 6,
+        "PARTIAL_BF16": 1,
+        "Q_FROM_LDS": 0,
+        "SPLIT_FP8": 1,
+        "num_stages": 2,
+        "num_warps": 1,
+        "waves_per_eu": 1
+      },
+      "H_LEQ_8.B_LEQ_32.KV_LEQ_131072": {
+        "EARLY_PRIME": 1,
+        "NPOT_SPLITS": 12,
+        "PARTIAL_BF16": 1,
+        "Q_FROM_LDS": 0,
+        "SPLIT_FP8": 1,
+        "num_stages": 2,
+        "num_warps": 1,
+        "waves_per_eu": 1
+      },
+      "H_LEQ_8.B_LEQ_64.KV_LEQ_131072": {
+        "EARLY_PRIME": 1,
+        "NPOT_SPLITS": 6,
+        "PARTIAL_BF16": 1,
+        "Q_FROM_LDS": 0,
+        "SPLIT_FP8": 1,
+        "num_stages": 2,
+        "num_warps": 1,
+        "waves_per_eu": 1
+      },
+      "H_LEQ_8": {
+        "EARLY_PRIME": 0,
+        "PARTIAL_BF16": 0,
+        "Q_FROM_LDS": 0,
+        "SPLIT_FP8": 1,
         "num_stages": 2,
         "num_warps": 1,
         "waves_per_eu": 1

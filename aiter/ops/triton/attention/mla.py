@@ -513,13 +513,15 @@ def mla_decode_fwd(
             max_seqlen_kv,
         )
         # The tuned table is keyed on H, B and KV only. NPOT_SPLITS (a split
-        # count), PARTIAL_BF16 and XCHG_MODE were measured for page64, rank 512
-        # and RoPE 64, and XCHG_MODE=1 needs a 64-token tile. Other geometries
-        # keep NUM_SEGMENTS_PER_SEQ and the current path.
+        # count), PARTIAL_BF16, XCHG_MODE, EARLY_PRIME and SPLIT_FP8 were
+        # measured for page64, rank 512 and RoPE 64, and XCHG_MODE=1 needs a
+        # 64-token tile. Other geometries keep NUM_SEGMENTS_PER_SEQ and the
+        # current path.
         npot_splits = tuned.pop("NPOT_SPLITS", 0)
         partial_bf16 = bool(tuned.pop("PARTIAL_BF16", False))
         if (block_size, kv_lora_rank, qk_rope_head_dim) != (64, 512, 64):
-            tuned.pop("XCHG_MODE", None)
+            for key in ("XCHG_MODE", "EARLY_PRIME", "SPLIT_FP8"):
+                tuned.pop(key, None)
             npot_splits, partial_bf16 = 0, False
         if npot_splits:
             tuned["NUM_SEGMENTS_PER_SEQ"] = npot_splits

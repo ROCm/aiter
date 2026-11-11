@@ -879,6 +879,47 @@ class MLAProgram:
         )
 
     @gluon.jit
+    def with_q(self, q_lora, q_rope):
+        # The same program with new Q operands. EARLY_PRIME issues the first KV
+        # loads with a program built before Q is ready, then attaches Q.
+        return MLAProgram(
+            self.cfg,
+            q_lora,
+            q_rope,
+            self.kv_lora_shared,
+            self.k_rope_shared,
+            self.kv_lora_scales_shared,
+            self.k_rope_scales_shared,
+            self.kv_buffer_ptr,
+            self.output_ptr,
+            self.segm_max_ptr,
+            self.segm_expsum_ptr,
+            self.tile_start,
+            self.tile_end,
+            self.safe_tile_end,
+            self.kv_head_idx,
+            self.context_len,
+            self.context_len_q_pos_qk,
+            self.query_pos_qk,
+            self.query_offset_0_qk,
+            self.query_offset_1_qk,
+            self.query_mask_0_qk,
+            self.query_mask_1_qk,
+            self.query_offset_0_pv,
+            self.query_offset_1_pv,
+            self.query_mask_0_pv,
+            self.query_mask_1_pv,
+            self.kv_lora_desc,
+            self.k_rope_desc,
+            self.kv_lora_scales_desc,
+            self.k_rope_scales_desc,
+            self.stride_kv_buffer_0,
+            self.stride_kv_buffer_1,
+            self.stride_kv_buffer_2,
+            self.stride_kv_buffer_3,
+        )
+
+    @gluon.jit
     def get_next_buffer_id(self, buffer_id):
         if self.cfg.NUM_STAGES == 2:
             return 1 - buffer_id
@@ -1922,6 +1963,81 @@ def _mla_decode_lds_pipeline(
 
 
 @gluon.jit
+def _mla_process_q(
+    cfg: MLAConfig,
+    Q_lora_load,
+    Q_rope_load,
+    q_lora_shared,
+    q_rope_shared,
+):
+    # Store the loaded Q to LDS and return its operands.
+    q_lora_shared.store(Q_lora_load)
+    if cfg.Q_FROM_LDS:
+        Q_lora = q_lora_shared
+    else:
+        Q_lora = q_lora_shared.load(layout=cfg.Q_DOT_LAYOUT)
+    q_rope_shared.store(Q_rope_load)
+    if cfg.Q_FROM_LDS:
+        Q_rope = q_rope_shared
+    else:
+        Q_rope = q_rope_shared.load(layout=cfg.Q_DOT_LAYOUT)
+    return Q_lora, Q_rope
+
+
+@gluon.jit
+def _mla_load_q_regs(
+    cfg: MLAConfig,
+    query_ptr,
+    q_start_idx,
+    token_q_block_local_idx,
+    kv_head_idx,
+    head_offset,
+    query_stride_0,
+    query_stride_1,
+    num_tokens_per_seq,
+    num_query_heads,
+):
+    # Load Q from global memory straight into the WMMA operand layout. No LDS
+    # buffer, so nothing stays live beside the KV ring (EARLY_PRIME).
+    layout: gl.constexpr = cfg.Q_DOT_LAYOUT
+    m = gl.arange(0, cfg.BLOCK_M, layout=gl.SliceLayout(1, layout))
+    pos = token_q_block_local_idx * cfg.BLOCK_Q + m // cfg.NUM_QUERIES_PER_KV
+    head = (
+        kv_head_idx * cfg.NUM_QUERIES_PER_KV + head_offset + m % cfg.NUM_QUERIES_PER_KV
+    )
+    d_lora = gl.arange(0, cfg.KV_LORA_RANK, layout=gl.SliceLayout(0, layout))
+    d_rope = gl.arange(0, cfg.QK_ROPE_HEAD_DIM, layout=gl.SliceLayout(0, layout))
+    # Padding rows read a valid row instead of a masked one: no branches, so
+    # all Q loads are in flight at once. Their results are never stored.
+    pos = gl.minimum(pos, num_tokens_per_seq - 1)
+    head = gl.minimum(head, num_query_heads - 1)
+    row = (q_start_idx + pos) * query_stride_0 + head * query_stride_1
+    q_lora = gl.load(query_ptr + row[:, None] + d_lora[None, :])
+    q_rope = gl.load(query_ptr + row[:, None] + (cfg.KV_LORA_RANK + d_rope)[None, :])
+    return q_lora, q_rope
+
+
+@gluon.jit
+def _mla_ring_prime(
+    pgm: MLAProgram,
+    block_tables_ptr_shifted,
+    j_hbm_start,
+    NUM_STAGES: gl.constexpr,
+):
+    # Prime unconditionally, re-reading the last tile in a short segment: the
+    # wait-count pass takes the minimum over all paths, and a skipped prime
+    # would lower every wait in the loop to zero.
+    num_tiles = pgm.tile_end - pgm.tile_start
+    for prime in gl.static_range(NUM_STAGES - 1):
+        _, page = pgm.load_physical_block_idx_with_mod(
+            prime, block_tables_ptr_shifted, j_hbm_start, num_tiles
+        )
+        row = pgm.get_kv_buffer_row_offsets(page)
+        pgm.tdm_load_global_to_shared_kv_lora(row, prime)
+        pgm.tdm_load_global_to_shared_k_rope(row, prime)
+
+
+@gluon.jit
 def _mla_decode_kv_ring(
     pgm: MLAProgram,
     block_tables_ptr_shifted,
@@ -1929,23 +2045,17 @@ def _mla_decode_kv_ring(
     seq_len,
     qk_factor,
     NUM_STAGES: gl.constexpr,
+    PRIMED: gl.constexpr = False,
 ):
+    # PRIMED: the caller already issued the prime loads (EARLY_PRIME).
     # Keeps NUM_STAGES - 1 tiles of this segment in flight. Each tile is two
     # TDM loads, LoRA then RoPE, and the wait counts below rely on that order.
     # Like the two-stage loop, a tile waits for its LoRA, issues the next fill
     # behind the LoRA QK, then waits for its RoPE.
     PREFETCH: gl.constexpr = NUM_STAGES - 1
     num_tiles = pgm.tile_end - pgm.tile_start
-    # Prime unconditionally, re-reading the last tile in a short segment: the
-    # wait-count pass takes the minimum over all paths, and a skipped prime
-    # would lower every wait in the loop to zero.
-    for prime in gl.static_range(PREFETCH):
-        _, page = pgm.load_physical_block_idx_with_mod(
-            prime, block_tables_ptr_shifted, j_hbm_start, num_tiles
-        )
-        row = pgm.get_kv_buffer_row_offsets(page)
-        pgm.tdm_load_global_to_shared_kv_lora(row, prime)
-        pgm.tdm_load_global_to_shared_k_rope(row, prime)
+    if not PRIMED:
+        _mla_ring_prime(pgm, block_tables_ptr_shifted, j_hbm_start, NUM_STAGES)
 
     L, M, acc = pgm.allocate_accumulator()
     slot: gl.int32 = 0
@@ -2020,6 +2130,8 @@ _mla_decode_fwd_kernel_repr = make_kernel_repr(
         "TDM_PARTIAL_STORE",
         "Q_FROM_LDS",
         "XCHG_MODE",
+        "EARLY_PRIME",
+        "SPLIT_FP8",
     ],
 )
 
@@ -2077,6 +2189,8 @@ def _mla_decode_fwd_kernel(
     TDM_PARTIAL_STORE: gl.constexpr = 0,
     Q_FROM_LDS: gl.constexpr = 0,
     XCHG_MODE: gl.constexpr = 0,
+    EARLY_PRIME: gl.constexpr = 0,
+    SPLIT_FP8: gl.constexpr = 0,
     FP8_MIN: tl.constexpr = float8_info.min,
     FP8_MAX: tl.constexpr = float8_info.max,
 ):
@@ -2086,6 +2200,21 @@ def _mla_decode_fwd_kernel(
     if Q_FROM_LDS:
         gl.static_assert(QUERY_DTYPE != "nvfp4" and KV_CACHE_DTYPE != "nvfp4")
         gl.static_assert(not USE_LDS_PIPELINE)
+    # SPLIT_FP8: the bf16 query and P are each split into hi + lo FP8 parts
+    # (Q: one scale per row; P: a constant 256), so QK and PV run as FP8 x FP8
+    # WMMA without converting K/V to bf16, at the numerics of the bf16 path.
+    # Two-stage loop only.
+    if SPLIT_FP8:
+        gl.static_assert(QUERY_DTYPE == "bf16" and KV_CACHE_DTYPE == "fp8")
+        gl.static_assert(num_stages == 2)
+        gl.static_assert(not USE_LDS_PIPELINE and not Q_FROM_LDS)
+        CFG_QUERY_DTYPE: gl.constexpr = "fp8"
+    else:
+        CFG_QUERY_DTYPE: gl.constexpr = QUERY_DTYPE
+    if EARLY_PRIME:
+        # Issue the first KV loads, then load Q straight into registers.
+        gl.static_assert(not USE_LDS_PIPELINE and not Q_FROM_LDS)
+        gl.static_assert(QUERY_DTYPE != "nvfp4" and KV_CACHE_DTYPE != "nvfp4")
     cfg = MLAConfig(
         KV_LORA_RANK,
         QK_ROPE_HEAD_DIM,
@@ -2103,7 +2232,7 @@ def _mla_decode_fwd_kernel(
         False,
         False,
         SHUFFLED_KV_CACHE,
-        QUERY_DTYPE,
+        CFG_QUERY_DTYPE,
         KV_CACHE_DTYPE,
         ALL_DECODE,
         K_WIDTH,
@@ -2188,6 +2317,8 @@ def _mla_decode_fwd_kernel(
 
     if out_scale_ptr is not None:
         out_factor = out_factor / tl.load(out_scale_ptr)
+    if SPLIT_FP8:
+        out_factor = out_factor * (1.0 / 256.0)
 
     context_len = seq_len - num_tokens_per_seq
     block_tables_ptr_shifted = block_tables_ptr + seq_idx * block_tables_stride
@@ -2200,16 +2331,17 @@ def _mla_decode_fwd_kernel(
         KV_LORA_RANK_LOAD: gl.constexpr = KV_LORA_RANK
         QK_ROPE_HEAD_DIM_LOAD: gl.constexpr = QK_ROPE_HEAD_DIM
 
-    q_lora_shared = gl.allocate_shared_memory(
-        query_ptr.type.element_ty,
-        shape=[BLOCK_M, KV_LORA_RANK_LOAD],
-        layout=cfg.Q_LORA_SHARED_LAYOUT,
-    )
-    q_rope_shared = gl.allocate_shared_memory(
-        query_ptr.type.element_ty,
-        shape=[BLOCK_M, QK_ROPE_HEAD_DIM_LOAD],
-        layout=cfg.Q_ROPE_SHARED_LAYOUT,
-    )
+    if not EARLY_PRIME and not SPLIT_FP8:
+        q_lora_shared = gl.allocate_shared_memory(
+            query_ptr.type.element_ty,
+            shape=[BLOCK_M, KV_LORA_RANK_LOAD],
+            layout=cfg.Q_LORA_SHARED_LAYOUT,
+        )
+        q_rope_shared = gl.allocate_shared_memory(
+            query_ptr.type.element_ty,
+            shape=[BLOCK_M, QK_ROPE_HEAD_DIM_LOAD],
+            layout=cfg.Q_ROPE_SHARED_LAYOUT,
+        )
 
     # load Q
     offs_q_m_lora = gl.arange(
@@ -2234,28 +2366,20 @@ def _mla_decode_fwd_kernel(
         + head_offset
         + offs_q_m_lora % cfg.NUM_QUERIES_PER_KV
     )
-    query_offset_lora = (
-        query_offset_0_lora[:, None] * query_stride_0
-        + query_offset_1_lora[:, None] * query_stride_1
-    )
     query_mask_0_lora = query_pos_lora < num_tokens_per_seq
     query_mask_1_lora = query_offset_1_lora < num_query_heads
 
     # Q_lora : (BLOCK_M, KV_LORA_RANK)
-    Q_lora_load = gl.load(
-        query_ptr + query_offset_lora + offs_q_d_lora[None, :],
-        mask=(
-            None
-            if USE_LDS_PIPELINE
-            else query_mask_0_lora[:, None] & query_mask_1_lora[:, None]
-        ),
-        other=None if USE_LDS_PIPELINE else 0.0,
-    )
-    q_lora_shared.store(Q_lora_load)
-    if Q_FROM_LDS:
-        Q_lora = q_lora_shared
-    else:
-        Q_lora = q_lora_shared.load(layout=cfg.Q_DOT_LAYOUT)
+    # Padding rows read a valid row instead of a masked one: the loads need no
+    # branches, so they are all in flight at once. Their results are never stored.
+    q_lora_rows = (
+        q_start_idx + gl.minimum(query_pos_lora, num_tokens_per_seq - 1)
+    ) * query_stride_0 + gl.minimum(
+        query_offset_1_lora, num_query_heads - 1
+    ) * query_stride_1
+    q_lora_ptrs = query_ptr + q_lora_rows[:, None] + offs_q_d_lora[None, :]
+    if not EARLY_PRIME:
+        Q_lora_load = gl.load(q_lora_ptrs)
 
     query_pos_rope = (
         token_q_block_local_idx * BLOCK_Q + offs_q_m_rope // cfg.NUM_QUERIES_PER_KV
@@ -2266,28 +2390,74 @@ def _mla_decode_fwd_kernel(
         + head_offset
         + offs_q_m_rope % cfg.NUM_QUERIES_PER_KV
     )
-    query_offset_rope = (
-        query_offset_0_rope[:, None] * query_stride_0
-        + query_offset_1_rope[:, None] * query_stride_1
-    )
     query_mask_0_rope = query_pos_rope < num_tokens_per_seq
     query_mask_1_rope = query_offset_1_rope < num_query_heads
 
     # Q_rope : (BLOCK_M, QK_ROPE_HEAD_DIM)
-    Q_rope_load = gl.load(
-        query_ptr + query_offset_rope + (KV_LORA_RANK_LOAD + offs_q_d_rope)[None, :],
-        mask=(
-            None
-            if USE_LDS_PIPELINE
-            else query_mask_0_rope[:, None] & query_mask_1_rope[:, None]
-        ),
-        other=None if USE_LDS_PIPELINE else 0.0,
+    q_rope_rows = (
+        q_start_idx + gl.minimum(query_pos_rope, num_tokens_per_seq - 1)
+    ) * query_stride_0 + gl.minimum(
+        query_offset_1_rope, num_query_heads - 1
+    ) * query_stride_1
+    q_rope_ptrs = (
+        query_ptr + q_rope_rows[:, None] + (KV_LORA_RANK_LOAD + offs_q_d_rope)[None, :]
     )
-    q_rope_shared.store(Q_rope_load)
-    if Q_FROM_LDS:
-        Q_rope = q_rope_shared
+    if not EARLY_PRIME:
+        Q_rope_load = gl.load(q_rope_ptrs)
+    if EARLY_PRIME:
+        # Placeholders: Q is loaded after the first KV loads are issued.
+        Q_lora = seq_len
+        Q_rope = seq_len
+    elif SPLIT_FP8:
+        # Q = s * (hi + lo): one per-row scale for both FP8 parts.
+        amax = gl.maximum(
+            gl.max(gl.abs(Q_lora_load.to(gl.float32)), axis=1),
+            gl.convert_layout(
+                gl.max(gl.abs(Q_rope_load.to(gl.float32)), axis=1),
+                gl.SliceLayout(1, cfg.Q_LORA_LOAD_LAYOUT),
+            ),
+        )
+        q_s = gl.maximum(amax, 1e-12) / FP8_MAX
+        inv_l = (1.0 / q_s)[:, None]
+        inv_r = gl.convert_layout(1.0 / q_s, gl.SliceLayout(1, cfg.Q_ROPE_LOAD_LAYOUT))[
+            :, None
+        ]
+        ql = Q_lora_load.to(gl.float32) * inv_l
+        qr = Q_rope_load.to(gl.float32) * inv_r
+        ql_hi = ql.to(gl.float8e4nv)
+        qr_hi = qr.to(gl.float8e4nv)
+        ql_lo = (ql - ql_hi.to(gl.float32)).to(gl.float8e4nv)
+        qr_lo = (qr - qr_hi.to(gl.float32)).to(gl.float8e4nv)
+        sh_l = gl.allocate_shared_memory(
+            gl.float8e4nv, [BLOCK_M, KV_LORA_RANK_LOAD], cfg.Q_LORA_SHARED_LAYOUT, ql_hi
+        )
+        sh_r = gl.allocate_shared_memory(
+            gl.float8e4nv,
+            [BLOCK_M, QK_ROPE_HEAD_DIM_LOAD],
+            cfg.Q_ROPE_SHARED_LAYOUT,
+            qr_hi,
+        )
+        sl_l = gl.allocate_shared_memory(
+            gl.float8e4nv, [BLOCK_M, KV_LORA_RANK_LOAD], cfg.Q_LORA_SHARED_LAYOUT, ql_lo
+        )
+        sl_r = gl.allocate_shared_memory(
+            gl.float8e4nv,
+            [BLOCK_M, QK_ROPE_HEAD_DIM_LOAD],
+            cfg.Q_ROPE_SHARED_LAYOUT,
+            qr_lo,
+        )
+        Q_lora = sh_l.load(layout=cfg.Q_DOT_LAYOUT)
+        Q_rope = sh_r.load(layout=cfg.Q_DOT_LAYOUT)
+        Q_lora_lo = sl_l.load(layout=cfg.Q_DOT_LAYOUT)
+        Q_rope_lo = sl_r.load(layout=cfg.Q_DOT_LAYOUT)
+        qk_factor = (
+            gl.convert_layout(q_s, gl.SliceLayout(1, cfg.QK_WMMA_UNPACKED_LAYOUT))
+            * qk_factor
+        )[:, None]
     else:
-        Q_rope = q_rope_shared.load(layout=cfg.Q_DOT_LAYOUT)
+        Q_lora, Q_rope = _mla_process_q(
+            cfg, Q_lora_load, Q_rope_load, q_lora_shared, q_rope_shared
+        )
 
     if QUERY_DTYPE == "nvfp4":
         # A4W4
@@ -2431,6 +2601,70 @@ def _mla_decode_fwd_kernel(
         stride_kv_buffer_3,
     )
 
+    if EARLY_PRIME:
+        # Issue the first KV loads, then wait for Q and store it: the Q global
+        # loads and the first pages are in flight together.
+        if num_stages > 2:
+            _mla_ring_prime(
+                pgm, block_tables_ptr_shifted, segm_idx * tiles_per_segment, num_stages
+            )
+        else:
+            j_hbm_early: gl.int32 = 0
+            j_hbm_early, first_block_idx = pgm.load_physical_block_idx(
+                j_hbm_early, block_tables_ptr_shifted, segm_idx * tiles_per_segment
+            )
+            j_hbm_early, next_block_idx_early = pgm.load_physical_block_idx_with_mod(
+                j_hbm_early,
+                block_tables_ptr_shifted,
+                segm_idx * tiles_per_segment,
+                pgm.tile_end - pgm.tile_start,
+            )
+            first_row_offsets = pgm.get_kv_buffer_row_offsets(first_block_idx)
+            pgm.tdm_load_global_to_shared_kv_lora(first_row_offsets, 0)
+            pgm.tdm_load_global_to_shared_k_rope(first_row_offsets, 0)
+        # The Q loads go after the page-id loads, so the TDM issue above does
+        # not wait for them (load counters complete in order).
+        # Load Q straight into the WMMA operand layout, without LDS.
+        Q_lora, Q_rope = _mla_load_q_regs(
+            cfg,
+            query_ptr,
+            q_start_idx,
+            token_q_block_local_idx,
+            kv_head_idx,
+            head_offset,
+            query_stride_0,
+            query_stride_1,
+            num_tokens_per_seq,
+            num_query_heads,
+        )
+        if SPLIT_FP8:
+            # Q = s * (hi + lo) in the WMMA operand layout, one scale per row.
+            q_s = (
+                gl.maximum(
+                    gl.maximum(
+                        gl.max(gl.abs(Q_lora.to(gl.float32)), axis=1),
+                        gl.max(gl.abs(Q_rope.to(gl.float32)), axis=1),
+                    ),
+                    1e-12,
+                )
+                / FP8_MAX
+            )
+            q_inv = (1.0 / q_s)[:, None]
+            ql = Q_lora.to(gl.float32) * q_inv
+            qr = Q_rope.to(gl.float32) * q_inv
+            Q_lora = ql.to(gl.float8e4nv)
+            Q_rope = qr.to(gl.float8e4nv)
+            Q_lora_lo = (ql - Q_lora.to(gl.float32)).to(gl.float8e4nv)
+            Q_rope_lo = (qr - Q_rope.to(gl.float32)).to(gl.float8e4nv)
+            qk_factor = (
+                gl.convert_layout(q_s, gl.SliceLayout(1, cfg.QK_WMMA_UNPACKED_LAYOUT))
+                * qk_factor
+            )[:, None]
+        pgm = pgm.with_q(Q_lora, Q_rope)
+
+    if SPLIT_FP8:
+        pgm_lo = pgm.with_q(Q_lora_lo, Q_rope_lo)
+
     if USE_LDS_PIPELINE:
         _mla_decode_lds_pipeline(
             pgm,
@@ -2456,6 +2690,7 @@ def _mla_decode_fwd_kernel(
             seq_len,
             qk_factor,
             num_stages,
+            PRIMED=EARLY_PRIME,
         )
     else:
         if KV_CACHE_DTYPE == "nvfp4":
@@ -2468,15 +2703,20 @@ def _mla_decode_fwd_kernel(
         j_hbm: gl.int32 = 0
         buffer_id: gl.int32 = 0
 
-        j_hbm, physical_block_idx = pgm.load_physical_block_idx(
-            j_hbm, block_tables_ptr_shifted, j_hbm_start
-        )
-        j_hbm, next_physical_block_idx = pgm.load_physical_block_idx_with_mod(
-            j_hbm, block_tables_ptr_shifted, j_hbm_start, max_num_tiles_this_seg
-        )
-        row_offsets = pgm.get_kv_buffer_row_offsets(physical_block_idx)
-        pgm.tdm_load_global_to_shared_kv_lora(row_offsets, 0)
-        pgm.tdm_load_global_to_shared_k_rope(row_offsets, 0)
+        if EARLY_PRIME:
+            j_hbm = j_hbm_early
+            physical_block_idx = first_block_idx
+            next_physical_block_idx = next_block_idx_early
+        else:
+            j_hbm, physical_block_idx = pgm.load_physical_block_idx(
+                j_hbm, block_tables_ptr_shifted, j_hbm_start
+            )
+            j_hbm, next_physical_block_idx = pgm.load_physical_block_idx_with_mod(
+                j_hbm, block_tables_ptr_shifted, j_hbm_start, max_num_tiles_this_seg
+            )
+            row_offsets = pgm.get_kv_buffer_row_offsets(physical_block_idx)
+            pgm.tdm_load_global_to_shared_kv_lora(row_offsets, 0)
+            pgm.tdm_load_global_to_shared_k_rope(row_offsets, 0)
 
         for _ in range(pgm.tile_start, pgm.tile_end - 1):
             physical_block_idx = next_physical_block_idx
@@ -2499,6 +2739,8 @@ def _mla_decode_fwd_kernel(
                 kv_lora = pgm.tdm_shared_load_kv_lora(1, buffer_id)
                 kv_lora_scales = None
             S = pgm.compute_qk_lora(kv_lora, q_lora_scales, kv_lora_scales, S)
+            if SPLIT_FP8:
+                S = pgm_lo.compute_qk_lora(kv_lora, None, None, S)
 
             next_buffer_id = pgm.get_next_buffer_id(buffer_id)
             row_offsets = pgm.get_kv_buffer_row_offsets(physical_block_idx)
@@ -2514,6 +2756,8 @@ def _mla_decode_fwd_kernel(
                 k_rope = pgm.tdm_shared_load_k_rope(2, buffer_id)
                 k_rope_scales = None
             S = pgm.compute_qk_rope(k_rope, q_rope_scales, k_rope_scales, S)
+            if SPLIT_FP8:
+                S = pgm_lo.compute_qk_rope(k_rope, None, None, S)
             S = S * qk_factor
 
             p, alpha, M = pgm.softmax_part0(S, M)
@@ -2545,7 +2789,16 @@ def _mla_decode_fwd_kernel(
                 )
             else:
                 kv_lora_trans = pgm.tdm_shared_load_kv_lora_trans(2, buffer_id)
-                acc = pgm.compute_pkv_lora_trans(p, kv_lora_trans, kv_lora_scales, acc)
+                if SPLIT_FP8:
+                    p256 = p * 256.0
+                    p_hi = p256.to(gl.float8e4nv)
+                    p_lo = (p256 - p_hi.to(gl.float32)).to(gl.float8e4nv)
+                    acc = pgm.compute_pkv_lora_trans(p_hi, kv_lora_trans, None, acc)
+                    acc = pgm.compute_pkv_lora_trans(p_lo, kv_lora_trans, None, acc)
+                else:
+                    acc = pgm.compute_pkv_lora_trans(
+                        p, kv_lora_trans, kv_lora_scales, acc
+                    )
 
             buffer_id = next_buffer_id
 
@@ -2561,6 +2814,8 @@ def _mla_decode_fwd_kernel(
             kv_lora = pgm.tdm_shared_load_kv_lora(1, buffer_id)
             kv_lora_scales = None
         S = pgm.compute_qk_lora(kv_lora, q_lora_scales, kv_lora_scales, S)
+        if SPLIT_FP8:
+            S = pgm_lo.compute_qk_lora(kv_lora, None, None, S)
         if KV_CACHE_DTYPE == "nvfp4":
             k_rope = pgm.tdm_shared_load_k_rope(1, buffer_id)
             k_rope_scales = pgm.tdm_shared_load_k_rope_scales(
@@ -2570,6 +2825,8 @@ def _mla_decode_fwd_kernel(
             k_rope = pgm.tdm_shared_load_k_rope(0, buffer_id)
             k_rope_scales = None
         S = pgm.compute_qk_rope(k_rope, q_rope_scales, k_rope_scales, S)
+        if SPLIT_FP8:
+            S = pgm_lo.compute_qk_rope(k_rope, None, None, S)
         S = S * qk_factor
 
         seq_offset = (pgm.tile_end - 1) * cfg.TILE_SIZE + gl.arange(
@@ -2606,7 +2863,14 @@ def _mla_decode_fwd_kernel(
             )
         else:
             kv_lora_trans = pgm.tdm_shared_load_kv_lora_trans(0, buffer_id)
-            acc = pgm.compute_pkv_lora_trans(p, kv_lora_trans, kv_lora_scales, acc)
+            if SPLIT_FP8:
+                p256 = p * 256.0
+                p_hi = p256.to(gl.float8e4nv)
+                p_lo = (p256 - p_hi.to(gl.float32)).to(gl.float8e4nv)
+                acc = pgm.compute_pkv_lora_trans(p_hi, kv_lora_trans, None, acc)
+                acc = pgm.compute_pkv_lora_trans(p_lo, kv_lora_trans, None, acc)
+            else:
+                acc = pgm.compute_pkv_lora_trans(p, kv_lora_trans, kv_lora_scales, acc)
 
     # if kv_scale_ptr is not None:
     #     if KV_CACHE_DTYPE == "nvfp4":
