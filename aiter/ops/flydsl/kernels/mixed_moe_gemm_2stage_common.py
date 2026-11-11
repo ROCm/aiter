@@ -139,6 +139,7 @@ def compile_mixed_moe_gemm1_common(
     shared_expert_id: int | None = None,
     clamp_shared: bool = True,
     v2_output_layout: bool = False,
+    stage2_skips_inter_pad: bool = False,
 ):
     """Compile stage1 kernel: act(X @ W_gate.T, X @ W_up.T) -> [tokens*topk, inter_dim]."""
     heterogeneous_b = shared_expert_id is not None
@@ -2834,6 +2835,12 @@ def compile_mixed_moe_gemm1_common(
 
         if const_expr(clear_gui_padding):
             tile2_pad = 0
+        elif const_expr(stage2_skips_inter_pad and not gate_only):
+            # Stage 2 reads the unpadded width rounded up to its 32-wide K
+            # blocks and skips the rest of the padding.
+            tile2_pad = min(
+                inter_dim_pad, (32 - (inter_dim - inter_dim_pad) % 32) % 32
+            )
 
         # inter_in counts both gate and up, so restore padding for both.
         inter_in = fx.Int64(i32_inter_in)
