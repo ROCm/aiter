@@ -14,15 +14,15 @@
   "version": 1
  },
  "pa_decode_bf16": {
-  "fingerprint": "2134772696f53baa",
-  "signature": "Q:positional:torch.Tensor, K:positional:torch.Tensor, V:positional:torch.Tensor, kv_indices:positional:torch.Tensor, context_lens:positional:torch.Tensor, softmax_scale:positional:float, kv_indptr:positional:torch.Tensor, gqa:positional:int=8, mtp:positional:int=0, query_scale:positional:torch.Tensor | None=None, key_scale:positional:torch.Tensor | None=None, value_scale:positional:torch.Tensor | None=None, qo_indptr:positional:torch.Tensor | None=None, work_indptr:positional:torch.Tensor | None=None, work_info:positional:torch.Tensor | None=None, split_o:positional:torch.Tensor | None=None, split_lse:positional:torch.Tensor | None=None, sink:positional:torch.Tensor | None=None, out:positional:torch.Tensor | None=None, kernelName:positional:str | None=None, -> torch.Tensor",
+  "fingerprint": "42a64204b4bb2435",
+  "signature": "Q:positional:torch.Tensor, K:positional:torch.Tensor, V:positional:torch.Tensor, kv_indices:positional:torch.Tensor, context_lens:positional:torch.Tensor, softmax_scale:positional:float, kv_indptr:positional:torch.Tensor, gqa:positional:int=8, mtp:positional:int=0, query_scale:positional:torch.Tensor | None=None, key_scale:positional:torch.Tensor | None=None, value_scale:positional:torch.Tensor | None=None, qo_indptr:positional:torch.Tensor | None=None, work_indptr:positional:torch.Tensor | None=None, work_info:positional:torch.Tensor | None=None, split_o:positional:torch.Tensor | None=None, split_lse:positional:torch.Tensor | None=None, sink:positional:torch.Tensor | None=None, out:positional:torch.Tensor | None=None, -> torch.Tensor",
   "source": "aiter/ops/attention.py",
   "supersedes": [],
   "version": 1
  },
  "pa_fwd": {
-  "fingerprint": "1788ec30c6323c86",
-  "signature": "Q:positional:torch.Tensor, K:positional:torch.Tensor, V:positional:torch.Tensor, block_tables:positional:torch.Tensor, context_lens:positional:torch.Tensor, block_tables_stride0:positional:int, max_qlen:positional:int=1, K_QScale:positional:torch.Tensor | None=None, V_QScale:positional:torch.Tensor | None=None, out_:positional:torch.Tensor | None=None, qo_indptr:positional:torch.Tensor | None=None, high_precision:positional:int | None=1, kernelName:positional:str | None=None, -> torch.Tensor",
+  "fingerprint": "6afde3d0a53acf6a",
+  "signature": "Q:positional:torch.Tensor, K:positional:torch.Tensor, V:positional:torch.Tensor, block_tables:positional:torch.Tensor, context_lens:positional:torch.Tensor, block_tables_stride0:positional:int, max_qlen:positional:int=1, K_QScale:positional:torch.Tensor | None=None, V_QScale:positional:torch.Tensor | None=None, out_:positional:torch.Tensor | None=None, qo_indptr:positional:torch.Tensor | None=None, high_precision:positional:int | None=1, -> torch.Tensor",
   "source": "aiter/ops/attention.py",
   "supersedes": [],
   "version": 1

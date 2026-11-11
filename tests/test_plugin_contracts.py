@@ -385,13 +385,13 @@ def _routed_function_names(root: Path) -> dict[str, str]:
 
 
 def test_the_backend_suffix_gate_is_not_vacuous():
-    """The gate above passes trivially unless the decoupling is real.
+    """A neutral op name is not enough if the function under it is not.
 
-    If every routed function happened to be neutrally named too, the gate
-    would hold without the op= argument doing any work, and a later route
-    put straight on a backend-named function would be the first to find out.
-    So pin that at least one contract is a neutral name sitting on a
-    backend-named function -- `pa_fwd` on `pa_fwd_asm` is the case.
+    Routing a backend-named function makes its entire signature the contract,
+    pins and all -- that is how `kernelName` reached `pa_fwd`'s contract
+    while its name looked clean. So the rule is checked at both ends: the op
+    name carries no backend (above), and neither does the function the route
+    decorates (here).
     """
 
     routed = _routed_function_names(_REPO)
@@ -400,12 +400,63 @@ def test_the_backend_suffix_gate_is_not_vacuous():
         "the route scan and the contract baseline disagree about which ops "
         "are routed"
     )
-    decoupled = {
-        op: fn
-        for op, fn in routed.items()
-        if fn.endswith(_BACKEND_SUFFIXES) and not op.endswith(_BACKEND_SUFFIXES)
+    offenders = sorted(f for f in routed.values() if f.endswith(_BACKEND_SUFFIXES))
+    assert not offenders, (
+        "a route sits directly on a backend-named function: "
+        + ", ".join(offenders)
+        + " -- that function's whole signature becomes the contract, which is "
+        "how `kernelName` first leaked into `pa_fwd`. Route the layer beneath "
+        "the pins instead"
+    )
+
+
+# Parameters that name something AITER has and a provider does not. The test
+# is not "does this string look backend-ish" but "could a provider honour it":
+# `backend` picks among AITER's implementations, `kernelName` picks one asm
+# kernel. A provider has its own kernel and no way to satisfy either, so a
+# contract carrying one would make it decline every call that passes it.
+_UNHONOURABLE_PARAMS = ("backend", "kernelName")
+
+
+def test_no_routed_contract_carries_a_parameter_a_provider_cannot_honour():
+    """The suffix gate checks the op's NAME; a backend also leaks through its
+    ARGUMENTS, and that leak is quieter.
+
+    `pa_fwd` was first routed on `pa_fwd_asm`, which carried `kernelName`
+    straight into the contract: a neutral name with an asm-only knob inside
+    it. Both pins now sit above the routed layer, where passing one bypasses
+    routing instead of asking a provider for a kernel it does not have.
+    """
+
+    named = {
+        op: [p for p in _UNHONOURABLE_PARAMS if p + ":" in entry["signature"]]
+        for op, entry in json.loads(_BASELINE.read_text()).items()
     }
-    assert decoupled, (
-        "no routed op sits on a backend-named function, so the suffix gate "
-        "above is not actually constraining anything"
+    named = {op: ps for op, ps in named.items() if ps}
+    assert not named, (
+        "routed contracts carrying a parameter no provider can honour: "
+        + "; ".join(f"{op} ({', '.join(ps)})" for op, ps in sorted(named.items()))
+        + " -- keep the pin above the routed layer, where it bypasses routing"
+    )
+
+
+def test_the_parameter_gate_matches_the_names_it_claims_to_guard():
+    """The gate is a substring list, so it is only as live as that list.
+
+    Pin that each guarded name still appears in the tree as a real parameter;
+    otherwise the list has drifted into guarding nothing and would pass while
+    a live pin leaks through.
+    """
+
+    seen = set()
+    for path in (_REPO / "aiter").rglob("*.py"):
+        text = path.read_text(encoding="utf-8")
+        for name in _UNHONOURABLE_PARAMS:
+            if f"{name}: str | None" in text or f"{name}=None" in text:
+                seen.add(name)
+    missing = sorted(set(_UNHONOURABLE_PARAMS) - seen)
+    assert not missing, (
+        "guarded parameter names no longer appear in the tree: "
+        + ", ".join(missing)
+        + " -- the gate above is guarding a name nothing uses"
     )
