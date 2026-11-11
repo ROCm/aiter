@@ -6,13 +6,14 @@ Unit tests for the input rotation behind run_perftest.
 Run: python3 -m unittest op_tests.tuning_tests.test_perftest_rotation -v
 """
 
+import copy
 import types
 import unittest
 from unittest.mock import patch
 
 import torch
 
-from aiter.test_common import input_copies
+from aiter.test_common import input_copies, perftest
 from aiter.utility import measure
 
 MiB = 1 << 20
@@ -42,6 +43,39 @@ class TestInputCopies(unittest.TestCase):
         self.assertIs(copies[-1][0], args)
         self.assertIs(copies[-1][1], kwargs)
         self.assertEqual(input_copies(args, kwargs, 1), [(args, kwargs)])
+
+    def test_copies_come_from_pristine_not_the_caller(self):
+        out = torch.full((4,), float("nan"))
+        args, kwargs = (torch.ones(4),), {"out": out}
+        pristine = copy.deepcopy((args, kwargs))
+        out.fill_(1)
+        copies = input_copies(args, kwargs, 4, pristine)
+        self.assertEqual(len(copies), 4)
+        self.assertIs(copies[0], pristine)
+        for a, k in copies[:-1]:
+            self.assertIsNot(k["out"], out)
+            self.assertTrue(torch.isnan(k["out"]).all())
+        self.assertIs(copies[-1][1], kwargs)
+        self.assertEqual(input_copies(args, kwargs, 1, pristine), [(args, kwargs)])
+
+
+@unittest.skipUnless(torch.cuda.is_available(), "needs a GPU")
+class TestPerftestCopiesStartAsPassed(unittest.TestCase):
+    def test_no_copy_sees_what_the_sizing_call_wrote(self):
+        x = torch.ones(1024, device="cuda")
+        out = torch.full_like(x, float("nan"))
+        seen = {}
+
+        def func(x, out):
+            if out.data_ptr() not in seen:
+                seen[out.data_ptr()] = bool(torch.isnan(out).all())
+            out.copy_(x)
+            return out
+
+        perftest(num_iters=4, num_warmup=1)(func)(x, out)
+        copies = {p: nan for p, nan in seen.items() if p != out.data_ptr()}
+        self.assertEqual(len(copies), 3)
+        self.assertTrue(all(copies.values()), copies)
 
 
 def _cache(level, kib, instances=1):

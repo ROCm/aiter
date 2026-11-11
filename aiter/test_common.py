@@ -58,14 +58,20 @@ def perftest(
     def decorator(func):
         def wrapper(*args, **kwargs):
             num = num_rotate_args
+            pristine = None
             if num < 1:
                 gpu_id = torch.cuda.current_device()
+                free_memory = torch.cuda.mem_get_info(gpu_id)[0]
+                if 2 * _device_tensor_bytes(args, kwargs) <= free_memory:
+                    pristine = copy.deepcopy((args, kwargs))
                 iter_used_memory, inputSize, _, _ = device_memory_profiling(
                     func, *args, **kwargs
                 )
 
                 properties = torch.cuda.get_device_properties(gpu_id)
                 free_memory = torch.cuda.mem_get_info(gpu_id)[0]
+                if pristine is not None:
+                    free_memory += _device_tensor_bytes(*pristine)
                 cache_size = min(
                     getattr(properties, "L2_cache_size", 4096 * 1024) * 64 * 128,
                     (free_memory - iter_used_memory + inputSize) * 0.9,
@@ -74,7 +80,8 @@ def perftest(
                 num = int((cache_size + inputSize - 1) // inputSize)
             num = min(num, num_iters)
 
-            rotate_args = input_copies(args, kwargs, num)
+            rotate_args = input_copies(args, kwargs, num, pristine)
+            del pristine
             run_iters(num_warmup, func, *args, **kwargs)
             torch.cuda.synchronize()
             if int(os.environ.get("AITER_LOG_MORE", "0")) or use_cuda_event:
@@ -228,12 +235,24 @@ def run_iters(num_iters, func, *args, **kwargs):
     return data
 
 
-def input_copies(args, kwargs, num):
+def _device_tensor_bytes(args, kwargs):
+    tensors = (*args, *kwargs.values())
+    return sum(t.nbytes for t in tensors if isinstance(t, torch.Tensor) and t.is_cuda)
+
+
+def input_copies(args, kwargs, num, pristine=None):
     """`num - 1` deep copies of the inputs, then the caller's own `(args, kwargs)`.
 
     Each copy is one deepcopy of both, so a tensor or storage shared between them stays shared.
+    `pristine`, a deepcopy taken before `func` first ran, is the first copy and the source of
+    the rest, so no copy starts from what that run wrote.
     """
-    return [copy.deepcopy((args, kwargs)) for _ in range(num - 1)] + [(args, kwargs)]
+    if num < 2:
+        return [(args, kwargs)]
+    source = (args, kwargs) if pristine is None else pristine
+    first = [] if pristine is None else [pristine]
+    rest = [copy.deepcopy(source) for _ in range(num - 1 - len(first))]
+    return first + rest + [(args, kwargs)]
 
 
 def run_iters_rotate(num_iters, func, rotate_args):
