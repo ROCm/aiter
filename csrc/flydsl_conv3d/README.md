@@ -127,11 +127,12 @@ python3 csrc/flydsl_conv3d/conv3d_tune.py -i $M/wan21_vae_bf16_untuned_conv3d.cs
    per K tile, a multiple of 32 that divides C/groups padded to 32; one
    `tensor_wait` + barrier per K tile) and `patch` (kH x kW input reuse: one
    TDM patch of (R + kH - 1) x (C + kW - 1) pixels per (kT, channel) group,
-   read by all kH * kW taps). `num_buffers` is the value that ran: the runtime
-   clamps a request to the LDS capacity and the K-tile count (and, with
-   `patch`, to kH * kW), and the tuner records the clamped value. Rows without
-   these columns, or with empty cells, run 2 buffers, no unroll, `tile_k=32`
-   and no patch.
+   read by all kH * kW taps) and `b_prefetch` (fragment-load order of the
+   WMMA loop, see `--b_prefetches`). `num_buffers` is the value that ran: the
+   runtime clamps a request to the LDS capacity and the K-tile count (and,
+   with `patch`, to kH * kW), and the tuner records the clamped value. Rows
+   without these columns, or with empty cells, run 2 buffers, no unroll,
+   `tile_k=32`, no patch and no `b_prefetch`.
 
    A gfx1250 conv whose kH x kW window fits one padded channel tile
    (kH * kW * C/groups <= 32, groups 1, unit H/W stride and dilation, e.g.
@@ -240,6 +241,19 @@ python3 -m pytest op_tests/tuning_tests/test_config_shape_collision.py
   off: otherwise LLVM's post-RA scheduler can move a last-use scratch reload
   above another reload of the same spill slot, which then reads stale data
   (one of them faulted on gfx1250 that way).
+
+### `--b_prefetches`
+- **Type**: `0`, `1` or `0,1`
+- **Default**: `0`
+- **Description**: gfx1250 only. Time every candidate above without and/or
+  with `b_prefetch`, an order of the WMMA loop's LDS fragment loads. Without
+  it the compiler sinks the next K tile's fragment loads into the WMMA stream
+  and refills the register a WMMA has just read, so each refill waits for
+  the WMMAs in flight (`s_wait_alu depctr_va_vdst(0)`). With it the next
+  tile's B fragments go out before the first WMMA into registers of their
+  own, and each A fragment is refilled two WMMA groups after its last read.
+  That costs about one B tile of VGPRs: rows that already ran 3-4 waves per
+  SIMD can drop a wave and get slower, which is why it is a tuned column.
 
 ### `--tiles_from` / `--tiles_topk`
 - **Type**: path / int

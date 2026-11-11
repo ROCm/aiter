@@ -391,15 +391,17 @@ def run_conv3d_gfx1250(
     variant="bandwidth_bound",
     main_loop_unroll=None,
     tile_k=None,
+    b_prefetch=None,
     packed_weight=None,  # (K, kT*kH*kW*cgp) from prepare_operands_gfx1250
     out=None,  # contiguous bf16 result in output_layout, written in place
     **_ignored,
 ):
     """Run gfx1250 FlyDSL conv3d (TDM+WMMA; optional split-K / dyn_hw / tuned tile).
 
-    ``num_buffers`` / ``main_loop_unroll`` / ``tile_k`` / ``patch_reuse`` left
-    at None take the tuned row's columns (``patch`` for ``patch_reuse``), else
-    2 buffers, no unroll, 32 channels per K tile and no patch. A ``tile_k`` that
+    ``num_buffers`` / ``main_loop_unroll`` / ``tile_k`` / ``patch_reuse`` /
+    ``b_prefetch`` left at None take the tuned row's columns (``patch`` for
+    ``patch_reuse``), else 2 buffers, no unroll, 32 channels per K tile, no
+    patch and no B prefetch. A ``tile_k`` that
     cannot run here (``tile_k_unsupported_gfx1250``) falls back to 32; the patch
     path is dropped where it cannot run (``patch_unsupported_gfx1250``).
     """
@@ -605,6 +607,8 @@ def run_conv3d_gfx1250(
         tile_k = TILE_K
     if patch_reuse is None:
         patch_reuse = tuned_pipe.get("patch", False)
+    if b_prefetch is None:
+        b_prefetch = tuned_pipe.get("b_prefetch", False)
     use_patch = bool(patch_reuse) and (
         patch_unsupported_gfx1250(kh, kw, sh, sw, sk, min(int(num_buffers), kh * kw))
         is None
@@ -663,6 +667,7 @@ def run_conv3d_gfx1250(
         main_loop_unroll=main_loop_unroll and not use_patch,
         tile_k=tile_k,
         patch=use_patch,
+        b_prefetch=b_prefetch,
     )
     exe = compile_conv3d_implicit_gfx1250(param)
     launch_stream = torch.cuda.current_stream() if stream is None else stream

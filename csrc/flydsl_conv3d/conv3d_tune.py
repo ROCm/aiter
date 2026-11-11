@@ -109,18 +109,28 @@ DEFAULT_PIPELINES = ((2, False),)
 DEFAULT_TILE_KS = (32,)
 # gfx1250 kH x kW patch reuse settings every tile is timed with by default.
 DEFAULT_PATCHES = (False,)
+# gfx1250 b_prefetch settings every tile is timed with by default.
+DEFAULT_B_PREFETCHES = (False,)
 
 
-def _parse_patches(text):
+def _parse_bools(text, flag="--patches"):
     out = []
     for item in filter(None, (s.strip() for s in str(text).split(","))):
         if item not in ("0", "1"):
-            raise ValueError(f"--patches takes 0 and/or 1, got {item!r}")
+            raise ValueError(f"{flag} takes 0 and/or 1, got {item!r}")
         if (item == "1") not in out:
             out.append(item == "1")
     if not out:
-        raise ValueError("--patches needs at least one of 0, 1")
+        raise ValueError(f"{flag} needs at least one of 0, 1")
     return tuple(out)
+
+
+def _parse_patches(text):
+    return _parse_bools(text, "--patches")
+
+
+def _parse_b_prefetches(text):
+    return _parse_bools(text, "--b_prefetches")
 
 
 def _parse_tile_ks(text):
@@ -247,6 +257,7 @@ def run_flydsl_conv3d_gfx1250(
     main_loop_unroll=False,
     tile_k=32,
     patch=False,
+    b_prefetch=False,
 ):
     # Pin the final legal split-K recorded in the candidate metadata and CSV.
     del wgm
@@ -270,6 +281,7 @@ def run_flydsl_conv3d_gfx1250(
         main_loop_unroll=main_loop_unroll,
         tile_k=tile_k,
         patch_reuse=patch,
+        b_prefetch=b_prefetch,
     )
 
 
@@ -406,6 +418,14 @@ class Conv3dTuner(TunerCommon):
             "kH x kW patch reuse (one TDM input patch per (kT, channel) group "
             "shared by all kH * kW taps); 1 is skipped where the shape cannot "
             "take it (kH * kW == 1, H/W stride > 1, split-K). Default 0.",
+        )
+        self.parser.add_argument(
+            "--b_prefetches",
+            type=_parse_b_prefetches,
+            default=DEFAULT_B_PREFETCHES,
+            help="gfx1250: 0, 1 or 0,1 -- time every tile without and/or with "
+            "b_prefetch (the next K tile's B fragments loaded ahead of the "
+            "WMMAs, A refilled in place a few WMMA groups late). Default 0.",
         )
         self.parser.add_argument(
             "--tiles_from",
@@ -571,11 +591,13 @@ class Conv3dTuner(TunerCommon):
         tiles=None,
         tile_ks=DEFAULT_TILE_KS,
         patches=DEFAULT_PATCHES,
+        b_prefetches=DEFAULT_B_PREFETCHES,
     ):
         """Candidate tasks for one shape.
 
         gfx1250 times every tile with each ``pipelines`` pair, each ``tile_ks``
-        width and each ``patches`` setting that fits the shape; ``tiles``, as
+        width, each ``patches`` setting that fits the shape and each
+        ``b_prefetches`` setting; ``tiles``, as
         ``(tile_m, tile_n, wave_m, wave_n, block_rows)``, replaces the policy's
         tile candidates (see ``--tiles_from``).
         """
@@ -782,8 +804,9 @@ class Conv3dTuner(TunerCommon):
                         lds = lds_bytes_tap(tile_m, tile_n, num_buffers=nb, tile_k=tk)
                     if lds > get_lds_capacity_bytes():
                         continue
-                    if (nb, unroll, tk, patch) not in variants:
-                        variants.append((nb, unroll, tk, patch))
+                    for bpf in b_prefetches:
+                        if (nb, unroll, tk, patch, bpf) not in variants:
+                            variants.append((nb, unroll, tk, patch, bpf))
             else:
                 base_name = tile_kernel_name(tile_m, tile_n, wave_m, wave_n, wgm) + (
                     f"_r{block_rows}" if block_rows > 1 else ""
@@ -791,18 +814,20 @@ class Conv3dTuner(TunerCommon):
                 gen, gen_args = generate_data, shape_args
                 fn, fn_keys = run_flydsl_conv3d, ["x", "weight", "bias"]
                 output_keys = None
-                variants = [(None, None, None, None)]
-            for nb, unroll, tk, patch in variants:
+                variants = [(None, None, None, None, None)]
+            for nb, unroll, tk, patch, bpf in variants:
                 kname = base_name
                 fn_args = (fn_keys, params, tile, wgm, sk, block_rows)
                 if is_1250:
-                    fn_args = (*fn_args, nb, unroll, tk, patch)
+                    fn_args = (*fn_args, nb, unroll, tk, patch, bpf)
                     if (nb, unroll) != (2, False):
                         kname += f"_b{nb}" + ("_u" if unroll else "")
                     if tk != CGP_ALIGN:
                         kname += f"_k{tk}"
                     if patch:
                         kname += "_p"
+                    if bpf:
+                        kname += "_bp"
                 info = (
                     keys,
                     tile_m,
@@ -816,6 +841,7 @@ class Conv3dTuner(TunerCommon):
                     unroll,
                     tk,
                     patch,
+                    bpf,
                     kname,
                 )
                 tasks.append(
@@ -864,6 +890,7 @@ class Conv3dTuner(TunerCommon):
                 tiles,
                 args.tile_ks,
                 args.patches,
+                args.b_prefetches,
             )
             if not shape_tasks:
                 logger.warning(f"no legal candidate for {keys}")
@@ -949,6 +976,7 @@ class Conv3dTuner(TunerCommon):
                 main_loop_unroll,
                 tile_k,
                 patch,
+                b_prefetch,
                 kernel_name,
             ) = info
             tflops, bw = self.calculate(el)
@@ -968,6 +996,7 @@ class Conv3dTuner(TunerCommon):
                     ),
                     "tile_k": tile_k,
                     "patch": None if patch is None else int(patch),
+                    "b_prefetch": None if b_prefetch is None else int(b_prefetch),
                     "splitK": splitk,
                     "us": time,
                     "kernelName": kernel_name,
@@ -982,7 +1011,7 @@ class Conv3dTuner(TunerCommon):
                     f"is tile=({tile_m},{tile_n},{wave_m},{wave_n}) wgm={wgm} "
                     f"block_rows={block_rows} num_buffers={num_buffers} "
                     f"main_loop_unroll={main_loop_unroll} tile_k={tile_k} "
-                    f"patch={patch} "
+                    f"patch={patch} b_prefetch={b_prefetch} "
                     f"splitK={splitk}, {time}us, "
                     f"{err_ratio=}, {tflops=} TFLOPS, {bw=} GB/s"
                 )
