@@ -14,11 +14,12 @@ using fp8_t  = _BitInt(8);
 using bf8_t  = unsigned _BitInt(8);
 
 // Compile-time tile/MFMA configuration for the 16mx8_32nx1 variant (T_M=NUM_WARPS,
-// T_N=1). Used when H > 32. KV_TILE=32, NUM_WARPS=8, BLOCK_SIZE=512.
+// T_N=1). Used when H > 32. KV_TILE=32, NUM_WARPS=4, BLOCK_SIZE=256, two KV LDS
+// slots (2 x 33,792 B with bf16), two blocks per CU.
 template <int Q_TILE_SIZE_  = 16,
           int KV_TILE_SIZE_ = 32,
           int D_TILE_SIZE_  = 512,
-          int NUM_WARPS_    = 8,
+          int NUM_WARPS_    = 4,
           typename D_ATTN_  = bf16_t,
           bool SPLIT_       = false>
 struct opus_mla_v4_prefill_a16w16_16mx8_32nx1_traits
@@ -76,10 +77,7 @@ struct opus_mla_v4_prefill_a16w16_16mx8_32nx1_traits
     static constexpr int k_ds_read_insts = (GEMM0_E_N * GEMM0_E_K * W_N * W_K) / (WARP_SIZE * VEC_KV);
     static constexpr int v_ds_read_insts = (GEMM1_E_N * GEMM1_E_K * W_N * W_K) / (WARP_SIZE * VEC_TR_V);
 
-    static constexpr size_t smem_size_bytes()
-    {
-        return 4 * smem_kv_tile_elems * sizeof(D_ATTN);
-    }
+    static constexpr size_t smem_size_bytes() { return 2 * smem_kv_tile_elems * sizeof(D_ATTN); }
 };
 
 // Compile-time tile/MFMA configuration for the 16mx1_16nx4 variant (T_M=1,
