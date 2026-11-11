@@ -335,6 +335,22 @@ def _moe_prepare_unsorted_input(
     return topk_ids_i32, topk_weights_f32, topk_ids_i32, num_valid_ids, moe_buf
 
 
+def _adaptive_output_usable(output, M, model_dim, dtype, device):
+    """Whether a caller ``output`` can be the adaptive sort's atomic moe_buf.
+
+    The BM16 sort zeroes moe_buf with 4-byte stores, so the buffer has to be
+    4-byte aligned on top of matching what fused_moe would have allocated.
+    """
+    return (
+        output is not None
+        and tuple(output.shape) == (M, model_dim)
+        and output.dtype == dtype
+        and output.device == device
+        and output.is_contiguous()
+        and output.data_ptr() % 4 == 0
+    )
+
+
 def _adaptive_moe_sort(
     topk_ids,
     topk_weights,
@@ -348,6 +364,7 @@ def _adaptive_moe_sort(
     skip_quant=False,
     moebuf_dtype=dtypes.bf16,
     num_local_tokens=None,
+    output=None,
 ):
     device = topk_ids.device
     M = topk_ids.shape[0]
@@ -360,11 +377,15 @@ def _adaptive_moe_sort(
     sorted_weights = torch.empty(max_sorted, dtype=dtypes.fp32, device=device)
     reverse_sorted = torch.empty(M * topk, dtype=dtypes.i32, device=device)
     m_indices = torch.empty(max_sorted, dtype=dtypes.i32, device=device)
-    moe_buf = (
-        torch.empty((M, model_dim), dtype=moebuf_dtype, device=device)
-        if atomic
-        else torch.empty((0, 0), dtype=moebuf_dtype, device=device)
-    )
+    if atomic and _adaptive_output_usable(output, M, model_dim, moebuf_dtype, device):
+        # The sort kernel zeroes (BM16) or we zero below (other BM) whatever buffer
+        # it is handed, so a caller output can stand in for moe_buf: stage2
+        # accumulates straight into it and _return_output skips the copy.
+        moe_buf = output
+    elif atomic:
+        moe_buf = torch.empty((M, model_dim), dtype=moebuf_dtype, device=device)
+    else:
+        moe_buf = torch.empty((0, 0), dtype=moebuf_dtype, device=device)
     # BM16 sort fuses output zeroing; three-stage sort only sorts.
     # Atomic GEMM2 needs a zeroed destination on every invocation.
     if atomic and BM != 16:
@@ -415,7 +436,7 @@ def _adaptive_moe_sort(
 #     opus / ck / flydsl sort + accumulate      yes        sort kernel zeroes what it is handed
 #     ... + reduce mode (non-EP)                yes        buffer is born in fused_moe_2stages
 #     FLAT 1stage (tuned flat=1/2)              no         kernel needs 8 spare bytes past the rows
-#     adaptive-aux sort (a4w4, atomic)          no         parameter not threaded yet
+#     adaptive-aux sort (a4w4, atomic)          yes        if 4-byte aligned (BM16 zeroes in 4B)
 #     caller presort (register_presorted_moe)   yes        zeroed here unless caller did
 #     grouped a4w4/a8w4 (gfx1250)               no         callee has no out param
 #
@@ -630,7 +651,8 @@ def _moe_sorting_impl(
         # adaptive (fused) sort emits the a4w4 extras (m_indices + reverse_sorted)
         # plus the atomic zero-init; opus single-pass aux is the env-gated fallback.
         # It has no expert_mask support, so EP always takes the Opus aux sort.
-        # `output` not threaded here: this buffer also feeds stage1 as moe_buf.
+        # A suitable caller `output` becomes moe_buf (stage2 accumulates in place);
+        # otherwise the sort allocates its own and _return_output copies.
         return _adaptive_moe_sort(
             topk_ids,
             topk_weights,
@@ -642,6 +664,7 @@ def _moe_sorting_impl(
             emit_aux=True,
             moebuf_dtype=moebuf_dtype,
             num_local_tokens=num_local_tokens,
+            output=output,
         )
 
     max_num_tokens_padded = int(topk_ids.numel() + num_experts * block_size - topk)
