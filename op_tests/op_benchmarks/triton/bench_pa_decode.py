@@ -1,4 +1,5 @@
 import sys
+import warnings
 
 import torch
 import triton
@@ -190,6 +191,9 @@ def paged_attn_decode(
         num_splits = get_recommended_splits(
             BS, H_KV, max_context_length=max_context_len
         )
+        if output_gate != "none" and num_splits < 2:
+            # The gate needs the PS reduce (2+ partitions), so both gated modes skip.
+            return None
         # The gate is the second half of each head of a fused [B, H, 2 * D] projection.
         gate = torch.randn(BS, H_Q, 2 * D, dtype=output_type, device="cuda")[..., D:]
 
@@ -349,6 +353,12 @@ def run_benchmark(args):
             args.backend,
             args.output_gate,
         )
+        if fn is None:
+            warnings.warn(
+                f"Skipping BS={BS} HK={HK} SEQ_LEN={SEQ_LEN}: one recommended "
+                "partition, where output_gate is rejected."
+            )
+            return float("nan")
 
         fn()
         torch.cuda.synchronize()

@@ -11,6 +11,7 @@ from triton.language.extra.hip import libdevice as hip_libdevice
 import aiter
 from aiter.ops.triton._triton_kernels.common.activation import _sigmoid_exp2
 from aiter.ops.triton.utils._triton import arch_info
+from aiter.ops.triton.utils.config_utils import load_config_json, resolve_config_dir
 
 CXX_PS_REDUCE_AVAILABLE = True
 try:
@@ -4675,6 +4676,14 @@ def _paged_attention_decode_v2_with_dot_kernel_reshape_wrapper(
     )
 
 
+@lru_cache(maxsize=2)
+def _ps_reduce_num_warps(output_gate: bool) -> int:
+    """num_warps of the Triton PS reduce, with or without the output gate."""
+    cfg_dir = resolve_config_dir("attention", "PA_DECODE_GLUON", backend="gluon")
+    entry = "ps_reduce_output_gate" if output_gate else "ps_reduce"
+    return load_config_json(f"{cfg_dir}/DEFAULT.json")[entry]["num_warps"]
+
+
 def _paged_attention_decode_v2_reduce_kernel_wrapper(
     grid,
     output_ptr,  # [num_seqs, query_length, num_kv_heads, query_group_size, head_size]
@@ -4763,8 +4772,7 @@ def _paged_attention_decode_v2_reduce_kernel_wrapper(
             stride_output_gate_kv_head=stride_output_gate[2],
             stride_output_gate_group_size=stride_output_gate[3],
             USE_OUTPUT_GATE=output_gate_ptr is not None,
-            # One wave per (sequence, head) slice is fastest at decode sizes.
-            num_warps=1 if output_gate_ptr is not None else 4,
+            num_warps=_ps_reduce_num_warps(output_gate_ptr is not None),
         )
     else:
         assert output_gate_ptr is None, "output gate needs the PS reduce"
