@@ -1,16 +1,16 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-"""MiniMax-M3 NVFP4 sparse paged attention, decode (FlyDSL, gfx950).
+"""MiniMax-M3 NVFP4 sparse paged attention, decode and prefill (FlyDSL, gfx950).
 
-The kernel takes the selector's output directly: ``topk_idx [Hkv, rows, 16]`` logical
+The kernels take the selector's output directly: ``topk_idx [Hkv, rows, 16]`` logical
 128-token block ids plus the request block table; K / V pages are the single-buffer
 NVFP4 page (see ``kernels/minimax_m3_sparse_pa_nvfp4_common.py``).
 
 Reference: an fp64 torch attention over K / V = e2m1 x e4m3 scale x global scale taken
 from the token-major codes and scale bytes the pages were *built from* -- nothing is
 read back through the kernel's lane layout, so a wrong page layout cannot cancel. The
-kernel does the products exactly in f16, so what is left against the reference is the
+kernels do the products exactly in f16, so what is left against the reference is the
 bf16 output (relative L2 of ~1.7e-3) and the f16 Q / P.
 
 Run (exits nonzero if any check fails):
@@ -30,6 +30,9 @@ import aiter
 from aiter.jit.utils.chip_info import get_gfx_runtime
 from aiter.ops.flydsl.kernels.minimax_m3_sparse_pa_nvfp4_decode import (
     minimax_m3_sparse_pa_nvfp4_decode,
+)
+from aiter.ops.flydsl.kernels.minimax_m3_sparse_pa_nvfp4_prefill import (
+    minimax_m3_sparse_pa_nvfp4_prefill,
 )
 from aiter.test_common import benchmark, checkAllclose, run_perftest
 
@@ -245,6 +248,23 @@ def decode_call(c, splits=None, **kw):
     )
 
 
+def prefill_call(c, **kw):
+    out = torch.empty_like(c["q"])
+    return minimax_m3_sparse_pa_nvfp4_prefill(
+        c["q"],
+        c["cache"],
+        c["topk"],
+        c["bt"],
+        c["row_req"],
+        c["row_kv"],
+        SM_SCALE,
+        out,
+        c["k_scale"],
+        c["v_scale"],
+        **kw,
+    )
+
+
 # (name, seq_lens, q_lens, hkv, group, kwargs)
 DECODE_CASES = [
     ("ragged_h1", [5000, 2300, 900, 100], [1] * 4, 1, 16, {}),
@@ -265,6 +285,21 @@ DECODE_CASES = [
     ("batch130_h4", [200 + 97 * i for i in range(130)], [1] * 130, 4, 16, {"fill": 12}),
 ]
 DECODE_SPLITS = (None, 1, 2, 4, 8, 16)
+
+
+PREFILL_CASES = [
+    ("chunk_h1", [3000, 700, 130], [300, 700, 130], 1, 16, {}),
+    ("chunk_h4", [3000, 700, 130], [300, 700, 130], 4, 16, {}),
+    ("chunk_h2", [2100, 5], [1000, 5], 2, 16, {}),
+    ("group8", [3000, 700], [300, 700], 1, 8, {}),
+    ("one_row", [1, 129], [1, 1], 1, 16, {}),
+    ("edges", [128, 256, 257, 255, 1], [128, 256, 5, 3, 1], 1, 16, {}),
+    ("full_prompt", [1500], [1500], 1, 16, {}),
+    ("fewer_than_topk", [900, 400], [900, 100], 1, 16, {"fill": 4}),
+    ("junk_ids", [3000, 700], [300, 700], 1, 16, {"junk": True}),
+    ("ragged_batch", [2000, 33, 4097, 512], [511, 33, 70, 512], 1, 16, {}),
+]
+PREFILL_TQ = ((4, 2), (4, 1), (2, 1), (1, 1))
 
 
 def check(name, out, ref, tol=REL_L2_TOL):
@@ -291,6 +326,19 @@ def test_correctness(name, hkv, group, rows, splits):
     ref = run_torch(c)
     out = decode_call(c, splits)
     ok, err, mx = check(f"decode {name} splits={splits}", out, ref)
+    return {"rel_l2": err, "max_abs": mx, "ok": ok}
+
+
+@benchmark()
+def test_prefill_correctness(name, hkv, group, rows, tq, rounds):
+    case = {c[0]: c for c in PREFILL_CASES}[name]
+    _, seq_lens, q_lens, hkv_, group_, kw = case
+    c = make_case(
+        seq_lens, q_lens, hkv_, group_, seed=zlib.crc32(name.encode()) % 1000, **kw
+    )
+    ref = run_torch(c)
+    out = prefill_call(c, tq=tq, rounds=rounds)
+    ok, err, mx = check(f"prefill {name} tq={tq} rounds={rounds}", out, ref)
     return {"rel_l2": err, "max_abs": mx, "ok": ok}
 
 
@@ -352,6 +400,14 @@ def padding_rows():
         c0 = dict(c, seq_lens=torch.tensor([0, 700], dtype=torch.int32, device="cuda"))
         out = decode_call(c0, s)
         bad += int(out[0].abs().max().item() != 0 or not torch.equal(out[1], ref[1]))
+    c1 = dict(
+        c,
+        row_kv=torch.tensor([0, int(c["row_kv"][1])], dtype=torch.int32, device="cuda"),
+    )
+    out = prefill_call(c1)
+    bad += int(
+        out[0].abs().max().item() != 0 or not torch.equal(out[1], prefill_call(c)[1])
+    )
     if bad:
         print("padding rows: FAILED")
     return bad
@@ -490,6 +546,72 @@ def test_decode_perf(rows, query_len, hkv, group, ctx):
     }
 
 
+@benchmark()
+def test_prefill_perf(q_len, hkv, group, ctx):
+    """One request, a chunk of ``q_len`` rows ending at ``ctx`` keys; random top-k blocks
+    per row (no overlap between neighbouring rows, the worst case for the page reuse).
+    """
+    pool, kd, vd = perf_pool(hkv, 8192)
+    g = torch.Generator(device="cuda").manual_seed(2)
+    nblk = math.ceil(ctx / BLK)
+    bt = torch.randint(
+        0, pool.shape[0], (1, nblk), generator=g, device="cuda", dtype=torch.int32
+    )
+    kv = (ctx - q_len + 1 + torch.arange(q_len, device="cuda")).int()
+    row_req = torch.zeros(q_len, dtype=torch.int32, device="cuda")
+    sb = (kv - 1) // BLK
+    sc = torch.rand(hkv, q_len, nblk, generator=g, device="cuda")
+    sc = torch.where(
+        torch.arange(nblk, device="cuda") < sb[None, :, None],
+        sc,
+        torch.full_like(sc, -1.0),
+    )
+    topk = torch.full((hkv, q_len, TOPK), -1, dtype=torch.int32, device="cuda")
+    v, i = sc.topk(TOPK - 1, dim=-1)
+    topk[..., : TOPK - 1] = torch.where(v >= 0, i.int(), torch.full_like(i.int(), -1))
+    topk[..., TOPK - 1] = sb.int()[None, :]
+    q = torch.randn(q_len, hkv * group, D, generator=g, device="cuda").bfloat16()
+    out = torch.empty_like(q)
+    ks = vs = torch.ones(1, dtype=torch.float32, device="cuda")
+    _, us = run_perftest(
+        minimax_m3_sparse_pa_nvfp4_prefill,
+        q,
+        pool,
+        topk,
+        bt,
+        row_req,
+        kv,
+        SM_SCALE,
+        out,
+        ks,
+        vs,
+        num_iters=10,
+        num_warmup=2,
+    )
+    nref = min(q_len, 8)
+    ref = run_torch(
+        {
+            "q": q[:nref],
+            "topk": topk[:, :nref],
+            "bt": bt % BASE_PAGES,
+            "row_req": row_req[:nref],
+            "row_kv": kv[:nref],
+            "hkv": hkv,
+            "group": group,
+            "kd": kd,
+            "vd": vd,
+        }
+    )
+    nvalid = int((topk >= 0).sum().item())
+    keys = nvalid * BLK - int(((sb + 1) * BLK - kv).sum().item()) * hkv
+    return {
+        "us": us,
+        "TFLOPS": 4 * group * D * keys / us / 1e6,
+        "TB/s": nvalid * 2 * PAGE_B / us / 1e6,  # logical: re-used pages count again
+        "err": rel_l2(out[:nref], ref),
+    }
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     ap.add_argument(
@@ -511,6 +633,12 @@ def main(argv=None):
         if want(name):
             for sp in DECODE_SPLITS:
                 rows.append(test_correctness(name, hkv, group, sum(q_lens), sp))
+    for name, seq_lens, q_lens, hkv, group, kw in PREFILL_CASES:
+        if want(name):
+            for tq, rnd in PREFILL_TQ:
+                rows.append(
+                    test_prefill_correctness(name, hkv, group, sum(q_lens), tq, rnd)
+                )
     df = pd.DataFrame(rows)
     failed += int((~df["ok"]).sum())
     aiter.logger.info(
@@ -534,6 +662,15 @@ def main(argv=None):
         ]
         df = pd.DataFrame(perf)
         aiter.logger.info("decode perf:\n%s", df.to_markdown(index=False))
+        failed += int((df["err"] > REL_L2_TOL).sum())
+        perf = [
+            test_prefill_perf(ql, hkv, g, ctx)
+            for (ql, ctx), (hkv, g) in itertools.product(
+                [(512, 4096), (2048, 32768), (8192, 32768)], [(1, 16), (4, 16)]
+            )
+        ]
+        df = pd.DataFrame(perf)
+        aiter.logger.info("prefill perf:\n%s", df.to_markdown(index=False))
         failed += int((df["err"] > REL_L2_TOL).sum())
     print("FAILED" if failed else "PASSED", failed)
     return 1 if failed else 0
