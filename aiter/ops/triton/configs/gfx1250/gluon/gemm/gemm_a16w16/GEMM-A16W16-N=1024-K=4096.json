@@ -96,12 +96,17 @@
   "kernel_type": "compute_bound"
  },
  "M_LEQ_8192": {
-  "BLOCK_M": 128,
-  "BLOCK_N": 128,
+  "BLOCK_M": 512,
+  "BLOCK_N": 1024,
   "BLOCK_K": 128,
   "NUM_BUFFERS": 3,
   "num_warps": 4,
-  "kernel_type": "compute_bound"
+  "kernel_type": "bandwidth_bound",
+  "waves_per_eu": 1,
+  "num_ctas": 16,
+  "GROUP_SIZE_M": 0,
+  "B2B_WMMA": 1,
+  "TDM_STORE": 1
  },
  "any": {
   "BLOCK_M": 128,
