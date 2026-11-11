@@ -288,6 +288,7 @@ def collect():
     import pandas as pd
 
     from aiter.jit.utils.chip_info import get_gfx, get_gfx_runtime
+    from aiter.tuning.moe import fused_moe
     from csrc.ck_gemm_moe_2stages_codegen import gemm_moe_tune
 
     gfx = get_gfx_runtime()
@@ -340,7 +341,7 @@ def collect():
             counts = dict.fromkeys(BACKENDS, 0)
             with (
                 mock.patch.dict(os.environ, env, clear=True),
-                mock.patch.object(gemm_moe_tune, "mp_tuner", fake_mp_tuner),
+                mock.patch.object(fused_moe, "mp_tuner", fake_mp_tuner),
                 contextlib.redirect_stdout(io.StringIO()),
                 contextlib.ExitStack() as patches,
             ):

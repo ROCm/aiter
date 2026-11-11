@@ -17,13 +17,14 @@ sys.path.insert(0, str(REPO_ROOT))
 
 class TestFastScanCliSafety(unittest.TestCase):
     def test_generic_fmoe_rejects_fast_scan_before_dispatch(self):
+        from aiter.tuning.moe import fused_moe
         from csrc.ck_gemm_moe_2stages_codegen import gemm_moe_tune
 
         tuner = gemm_moe_tune.FmoeTuner.__new__(gemm_moe_tune.FmoeTuner)
         args = SimpleNamespace(fast_scan=True)
         with (
             mock.patch.object(
-                gemm_moe_tune,
+                fused_moe,
                 "mp_tuner",
                 side_effect=AssertionError("generic candidates were dispatched"),
             ),
@@ -909,8 +910,8 @@ class TestMoePowerRanking(unittest.TestCase):
     def test_power_rank_orders_pairs_by_stage_energy(self):
         import pandas as pd
 
+        from aiter.tuning.moe.fused_moe import rank_moe_pairs
         from aiter.utility.selection_policy import POWER
-        from csrc.ck_gemm_moe_2stages_codegen.gemm_moe_tune import rank_moe_pairs
 
         pairs = pd.DataFrame(
             [
@@ -963,8 +964,8 @@ class TestMoePowerRanking(unittest.TestCase):
     def test_latency_rank_ignores_energy_order(self):
         import pandas as pd
 
+        from aiter.tuning.moe.fused_moe import rank_moe_pairs
         from aiter.utility.selection_policy import LATENCY
-        from csrc.ck_gemm_moe_2stages_codegen.gemm_moe_tune import rank_moe_pairs
 
         pairs = pd.DataFrame(
             [
@@ -994,8 +995,8 @@ class TestMoePowerRanking(unittest.TestCase):
     def test_unmeasured_power_sorts_last(self):
         import pandas as pd
 
+        from aiter.tuning.moe.fused_moe import rank_moe_pairs
         from aiter.utility.selection_policy import POWER
-        from csrc.ck_gemm_moe_2stages_codegen.gemm_moe_tune import rank_moe_pairs
 
         pairs = pd.DataFrame(
             [

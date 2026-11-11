@@ -109,9 +109,11 @@ def two_stage(us1, us2, kernel1="s1", kernel2="s2", **row):
 class TestFmoeWinnerReplay(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
+        from aiter.tuning.moe import fused_moe
         from csrc.ck_gemm_moe_2stages_codegen import gemm_moe_tune
 
         cls.gemm_moe_tune = gemm_moe_tune
+        cls.fused_moe = fused_moe
         cls.shape = cls.make_shape(token=32)
         cls.other_shape = cls.make_shape(token=64)
 
@@ -190,7 +192,7 @@ class TestFmoeWinnerReplay(unittest.TestCase):
             else:
                 self.args.profile_file = ""
             with (
-                mock.patch.object(self.gemm_moe_tune, "AITER_ROOT_DIR", root),
+                mock.patch.object(self.fused_moe, "AITER_ROOT_DIR", root),
                 mock.patch.dict(os.environ, env, clear=True),
                 mock.patch("aiter.test_common.run_perftest", fake_perftest),
                 mock.patch.object(torch, "randn"),

@@ -91,6 +91,7 @@ def _kernel_names(tasks):
 class TestFmoeTuneDispatch(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
+        from aiter.tuning.moe import fused_moe
         from aiter.tuning.moe.backends import (
             asm_1stage,
             asm_stage1,
@@ -101,6 +102,7 @@ class TestFmoeTuneDispatch(unittest.TestCase):
         from csrc.ck_gemm_moe_2stages_codegen import gemm_moe_tune
 
         cls.gemm_moe_tune = gemm_moe_tune
+        cls.fused_moe = fused_moe
         cls.backends_common = common
         cls.backend_asm_stage1 = asm_stage1
         cls.backend_asm_1stage = asm_1stage
@@ -156,8 +158,8 @@ class TestFmoeTuneDispatch(unittest.TestCase):
         cleaned = {k: v for k, v in os.environ.items() if k not in _TUNER_ENV}
         cleaned.update(env or {})
         with (
-            mock.patch.object(self.gemm_moe_tune, "get_gfx", return_value=gfx),
-            mock.patch.object(self.gemm_moe_tune, "mp_tuner", fake_mp),
+            mock.patch.object(self.fused_moe, "get_gfx", return_value=gfx),
+            mock.patch.object(self.fused_moe, "mp_tuner", fake_mp),
             mock.patch.dict(os.environ, cleaned, clear=True),
             contextlib.redirect_stdout(io.StringIO()),
             contextlib.ExitStack() as stack,
@@ -684,11 +686,11 @@ class TestFmoeTuneDispatch(unittest.TestCase):
         cleaned = {k: v for k, v in os.environ.items() if k not in _TUNER_ENV}
         cleaned.update(env)
         with (
-            mock.patch.object(self.gemm_moe_tune, "get_gfx", return_value="gfx950"),
+            mock.patch.object(self.fused_moe, "get_gfx", return_value="gfx950"),
             mock.patch.object(
                 self.backend_asm_1stage, "get_gfx", return_value="gfx950"
             ),
-            mock.patch.object(self.gemm_moe_tune, "mp_tuner", fake_mp),
+            mock.patch.object(self.fused_moe, "mp_tuner", fake_mp),
             mock.patch.dict(os.environ, cleaned, clear=True),
             contextlib.redirect_stdout(io.StringIO()),
         ):
