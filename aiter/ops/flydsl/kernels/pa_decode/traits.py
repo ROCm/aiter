@@ -552,6 +552,7 @@ class PaDecodeTraits:
     BLOCK_THREADS: int
     IS_GFX950: bool
     IS_GFX942: bool
+    packed_q_absmax: bool
     DUAL_GROUP: bool
     STAGE_PAGES: int
     GROUP_LDS_BYTES: int
@@ -994,6 +995,9 @@ class PaDecodeTraits:
             cache_key=cache_key,
             IS_GFX950=is_gfx950,
             IS_GFX942=is_gfx942,
+            # gfx942 head-1024 tiles already spill; the packed Q prologue shifts
+            # their allocation (per-tensor transposed-V b64 32K: 0.87x).
+            packed_q_absmax=is_gfx950 or (is_gfx942 and head_dim <= 256),
             DUAL_GROUP=DUAL_GROUP,
             STAGE_PAGES=STAGE_PAGES,
             GROUP_LDS_BYTES=GROUP_LDS_BYTES,
