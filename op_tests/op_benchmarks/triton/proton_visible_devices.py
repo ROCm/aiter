@@ -41,22 +41,21 @@ def proton_visible_devices() -> Iterator[None]:
         for name in present:
             os.environ.pop(name, None)
 
+        unset = ", ".join(present)
         if donor is not None and rocr_value is None:
             os.environ[_ROCR_KEY] = saved[donor]
             log_lines.append(
                 "ROCR_VISIBLE_DEVICES is unset. "
-                "Copying %s=%s into ROCR_VISIBLE_DEVICES for this block. "
-                "Unsetting %s." % (donor, saved[donor], ", ".join(present))
+                f"Copying {donor}={saved[donor]} into ROCR_VISIBLE_DEVICES "
+                f"for this block. Unsetting {unset}."
             )
         elif present:
             kept = (
-                " Keeping ROCR_VISIBLE_DEVICES=%s." % rocr_value
+                f" Keeping ROCR_VISIBLE_DEVICES={rocr_value}."
                 if rocr_value is not None
                 else ""
             )
-            log_lines.append(
-                "Unsetting %s so Proton can start.%s" % (", ".join(present), kept)
-            )
+            log_lines.append(f"Unsetting {unset} so Proton can start.{kept}")
 
         if log_lines:
             log_lines.append(
