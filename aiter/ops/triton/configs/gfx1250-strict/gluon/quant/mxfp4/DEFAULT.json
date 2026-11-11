@@ -1,8 +1,0 @@
-{
-    "any": {
-        "NUM_ITER": 1,
-        "BLOCK_SIZE_M": 32,
-        "BLOCK_SIZE_N": 256,
-        "NUM_WARPS": 4
-    }
-}

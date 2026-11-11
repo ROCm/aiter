@@ -9,5 +9,5 @@ real A0 tables once it is tuned.
 
 Families whose DEFAULT.json is keyed by kernel variant or shape rather than
 by M (attention, KDA, grouped GEMM, block_cat, MoE a8w4/a4w4) have no generic
-entry and are not here; resolve_config_dir() reads the gfx1250 table for them
+entry and are not here, nor are the Gluon quant tables (aiter requires those to have two bucket axes); resolve_config_dir() reads the gfx1250 table for them
 with a one-time "untuned" warning.
