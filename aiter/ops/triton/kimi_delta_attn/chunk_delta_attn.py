@@ -25,8 +25,9 @@ Notes on the fla-compatible surface:
     * ``allow_neg_eigval`` / ``return_intermediate_states`` / ``cp_context`` /
       ``cu_seqlens_cpu`` have no counterpart yet and are rejected rather than
       silently ignored.
-    * Tensor arguments are made contiguous here, as fla's ``@input_guard``
-      does, because some kernels below assume contiguous strides.
+    * Tensor arguments are made contiguous, as fla's ``@input_guard`` does,
+      because some kernels below assume contiguous strides. On gfx1250 the
+      FlashKDA kernels read q, k, v and g at their own token stride instead.
     * ``out`` and the paged ``state_cache`` are inference-only and are rejected
       when an input requires grad.
 """
@@ -311,13 +312,10 @@ def chunk_kimi_delta_attn(
         cu_seqlens is not None,
     )
 
-    # Match fla, which puts `@input_guard` on its autograd Function. Several
-    # kernels below index their operands with contiguous strides rather than
-    # reading the tensor's own, so a view would be read as garbage instead of
-    # raising: `q`/`k` reach the unguarded l2norm, `initial_state` the
-    # unguarded state kernel. No-op for the contiguous inputs serving stacks
-    # normally pass.
-    q, k, v, g, beta = (t.contiguous() for t in (q, k, v, g, beta))
+    # Match fla's `@input_guard`: several kernels below index their operands
+    # with contiguous strides, so a view would be read as garbage. q, k, v and
+    # g are left to `chunk_delta_attn_fwd`, which packs them where needed.
+    beta = beta.contiguous()
     if A_log is not None:
         A_log = A_log.contiguous()
     if dt_bias is not None:
@@ -342,6 +340,10 @@ def chunk_kimi_delta_attn(
                 "`out` and `state_cache` are inference-only; they are not "
                 "supported when an input requires grad."
             )
+        # `chunk_delta_attn_bwd` indexes the saved q, k, v and g with
+        # contiguous strides, so pack them here rather than in the forward.
+        q, k, v, g = (t.contiguous() for t in (q, k, v, g))
+        tensors = (q, k, v, g) + tensors[4:]
         o, final_state = _ChunkKimiDeltaAttnFunction.apply(
             *tensors,
             {

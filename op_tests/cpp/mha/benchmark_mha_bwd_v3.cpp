@@ -12,14 +12,15 @@
 //   - prec: fp16 / bf16
 //   - mode: 0 (batch) / 1 (group)
 //   - bias_type: 0 (no bias)
-//   - no dropout, no alibi, no dbias, no sink, no deterministic
+//   - no dropout, no alibi, no dbias, no sink
+//   - deterministic: gfx1250 only
 //   - mask: 0 / t / b / t:l,r / b:l,r / xt:w / xb:w / g:y,x
 //   - iperm / operm (bhsd vs bshd)
 //
 // CPU validation reproduces only the asm-supported scenarios. When the user
-// requests an unsupported config (drop>0, bias!=n, dbias, deterministic),
-// the validation step is skipped and a warning is printed; the perf number
-// is still reported so the asm kernel selection can be probed.
+// requests an unsupported config (drop>0, bias!=n, dbias), the validation
+// step is skipped and a warning is printed; the perf number is still reported
+// so the asm kernel selection can be probed.
 
 #include "mha_bwd.h"
 
@@ -429,7 +430,8 @@ bool check_err(const HostTensor<T>& out,
             max_abs = d;
         sq_err += d * d;
         sq_ref += b * b;
-        if(d > atol + rtol * std::fabs(b))
+        // Negated so a NaN output counts as bad instead of slipping past.
+        if(!(d <= atol + rtol * std::fabs(b)))
             ++bad_cnt;
     }
     const double frac = static_cast<double>(bad_cnt) / out.numel();
@@ -782,6 +784,14 @@ std::tuple<bool, ArgParser> create_args(int argc, char** argv)
     p.insert("h_k", "-1", "num of head, for k/v, -1 means equal to h");
     p.insert("s", "3328", "seqlen_q");
     p.insert("s_k", "-1", "seqlen_k, -1 means equal to s");
+    p.insert("s_pad",
+             "0",
+             "group mode: rows of padding after every batch's q and k; seqstart_q/k then "
+             "walk the padded rows and cu_seqlen_q/k the real ones");
+    p.insert("seqlen_ptr",
+             "0",
+             "group mode: pass the real lengths as seqlen_q/k (one per batch) instead of "
+             "cu_seqlen_q/k; rejected with -s_pad>0, the asm v3 path never reads them");
     p.insert("d", "128", "head dim for q, k");
     p.insert("d_v", "-1", "head dim for v, -1 means equal to d");
     p.insert("scale", "0", "scale factor. 0 means 1/sqrt(hdim)");
@@ -803,7 +813,15 @@ std::tuple<bool, ArgParser> create_args(int argc, char** argv)
     p.insert("timer", "gpu", "gpu / cpu");
     p.insert("warmup", "10", "warmup iters");
     p.insert("repeat", "10", "repeat iters");
-    p.insert("deterministic", "0", "must be 0 in the v3-only host");
+    p.insert("deterministic", "0", "1: deterministic dQ (asm has it on gfx1250 only)");
+    p.insert("dtm_runs",
+             "0",
+             "with -v=1: rerun the checked call N times and compare dq/dk/dv bit for "
+             "bit; a mismatch fails the run when -deterministic=1");
+    p.insert("det_split",
+             "0",
+             "with -deterministic=1: number of private dq_acc planes on gfx1250, 0 picks "
+             "it from the shape");
     p.insert("bwd_v3", "1", "the v3-only host always force asm v3");
     p.insert("v3_atomic_fp32", "1", "0: atomic16, 1: atomic32 (fp32 dq_acc)");
     p.insert("v3_bf16_cvt", "1", "0:RTNE; 1:RTNA; 2:RTZ");
@@ -887,6 +905,8 @@ bool run_bench(const ArgParser& arg)
     const int v3_bf16_cvt     = arg.get_int("v3_bf16_cvt");
     const bool v3_api_check   = arg.get_bool("v3_api_check");
     const bool cpu_lp_round   = arg.get_bool("cpu_lp_round");
+    const int dtm_runs        = arg.get_int("dtm_runs");
+    const int det_split       = arg.get_int("det_split");
 
     // Reject features the asm-v3 path can't run.
     auto reject = [&](const char* why) {
@@ -899,8 +919,6 @@ bool run_bench(const ArgParser& arg)
         return false;
     if(p_drop > 0.f && reject("p_drop > 0"))
         return false;
-    if(deterministic && reject("deterministic"))
-        return false;
 
     ck_tile::stream_config sc{nullptr,
                               true,
@@ -912,8 +930,21 @@ bool run_bench(const ArgParser& arg)
     // Sequence layout
     auto seqlens_q = generate_seqlens(mode, batch, seqlen_q, -1, -1, seed);
     auto seqlens_k = generate_seqlens(mode, batch, seqlen_k, -1, -1, seed);
-    auto seqstart_q_host = to_seqstarts(seqlens_q);
-    auto seqstart_k_host = to_seqstarts(seqlens_k);
+    const int s_pad       = (mode == mode_e::group) ? std::max(arg.get_int("s_pad"), 0) : 0;
+    const bool seqlen_ptr = (mode == mode_e::group) && arg.get_bool("seqlen_ptr");
+    // fmha_v3_bwd never reads seqlen_q/k_ptr, so with padding its kernels would take the padded
+    // lengths in seqstart_q/k for the real ones.
+    if(seqlen_ptr && s_pad > 0 && reject("seqlen_ptr with s_pad > 0"))
+        return false;
+    auto padded     = [&](std::vector<int32_t> lens) {
+        for(auto& l : lens)
+            l += s_pad;
+        return lens;
+    };
+    auto seqstart_q_host  = to_seqstarts(padded(seqlens_q));
+    auto seqstart_k_host  = to_seqstarts(padded(seqlens_k));
+    auto cu_seqlen_q_host = to_seqstarts(seqlens_q);
+    auto cu_seqlen_k_host = to_seqstarts(seqlens_k);
 
     int32_t max_seqlen_q = 0;
     int32_t max_seqlen_k = 0;
@@ -1008,8 +1039,22 @@ bool run_bench(const ArgParser& arg)
     DeviceMem dv_buf(dv_host.bytes());
     DeviceMem do_buf(do_host.bytes());
     DeviceMem dbias_buf(1);
+    // Group-mode sequence metadata, int32, one array for q and one for k. Batch mode uploads
+    // them too but passes every pointer as nullptr.
+    //   seqstart_*  [batch + 1]: prefix sums of the padded lengths (real + s_pad). seqstart[b] is
+    //                            the row batch b starts at in the packed tensors: Q/O/dO/dQ on
+    //                            the q side, K/V/dK/dV on the k side. Passed in every group run.
+    //   cu_seqlen_* [batch + 1]: prefix sums of the real lengths. Passed only with -s_pad > 0.
+    //   seqlen_*    [batch]:     the real lengths themselves. Passed only with -seqlen_ptr=1, in
+    //                            place of cu_seqlen_*; fmha_v3_bwd never reads them.
+    // E.g. real q lengths {20, 30, 40} with -s_pad=10 give seqstart_q = {0, 30, 70, 120} and
+    // cu_seqlen_q = {0, 20, 50, 90}: batch 1 owns rows [30, 60), and rows [60, 70) are padding.
     DeviceMem seqstart_q_buf(seqstart_q_host.size() * sizeof(int32_t));
     DeviceMem seqstart_k_buf(seqstart_k_host.size() * sizeof(int32_t));
+    DeviceMem cu_seqlen_q_buf(cu_seqlen_q_host.size() * sizeof(int32_t));
+    DeviceMem cu_seqlen_k_buf(cu_seqlen_k_host.size() * sizeof(int32_t));
+    DeviceMem seqlen_q_buf(seqlens_q.size() * sizeof(int32_t));
+    DeviceMem seqlen_k_buf(seqlens_k.size() * sizeof(int32_t));
     DeviceMem drop_seed_buf(drop_prefs ? sizeof(uint64_t) : 0);
     DeviceMem drop_offset_buf(drop_prefs ? sizeof(uint64_t) : 0);
     DeviceMem alibi_buf(1);
@@ -1038,6 +1083,10 @@ bool run_bench(const ArgParser& arg)
     do_buf.ToDevice(do_host.data());
     seqstart_q_buf.ToDevice(seqstart_q_host.data());
     seqstart_k_buf.ToDevice(seqstart_k_host.data());
+    cu_seqlen_q_buf.ToDevice(cu_seqlen_q_host.data());
+    cu_seqlen_k_buf.ToDevice(cu_seqlen_k_host.data());
+    seqlen_q_buf.ToDevice(seqlens_q.data());
+    seqlen_k_buf.ToDevice(seqlens_k.data());
     if(drop_prefs)
     {
         drop_seed_buf.ToDevice(&drop_seed);
@@ -1111,6 +1160,7 @@ bool run_bench(const ArgParser& arg)
         a.has_dropout      = (p_drop > 0.f);
         a.is_store_randval = false;
         a.is_deterministic = deterministic;
+        a.det_split        = static_cast<uint32_t>(std::max(det_split, 0));
 
         a.q_ptr      = q_buf.GetDeviceBuffer();
         a.k_ptr      = k_buf.GetDeviceBuffer();
@@ -1130,10 +1180,12 @@ bool run_bench(const ArgParser& arg)
 
         a.seqstart_q_ptr  = (mode == mode_e::group ? seqstart_q_buf.GetDeviceBuffer() : nullptr);
         a.seqstart_k_ptr  = (mode == mode_e::group ? seqstart_k_buf.GetDeviceBuffer() : nullptr);
-        a.seqlen_q_ptr    = nullptr;
-        a.seqlen_k_ptr    = nullptr;
-        a.cu_seqlen_q_ptr = nullptr;
-        a.cu_seqlen_k_ptr = nullptr;
+        // seqlen_* and cu_seqlen_* are two exclusive ways of giving the real lengths.
+        const bool use_cu = s_pad > 0 && !seqlen_ptr;
+        a.seqlen_q_ptr    = (seqlen_ptr ? seqlen_q_buf.GetDeviceBuffer() : nullptr);
+        a.seqlen_k_ptr    = (seqlen_ptr ? seqlen_k_buf.GetDeviceBuffer() : nullptr);
+        a.cu_seqlen_q_ptr = (use_cu ? cu_seqlen_q_buf.GetDeviceBuffer() : nullptr);
+        a.cu_seqlen_k_ptr = (use_cu ? cu_seqlen_k_buf.GetDeviceBuffer() : nullptr);
 
         a.seqlen_q     = shape_seqlen_q;
         a.seqlen_k     = shape_seqlen_k;
@@ -1566,7 +1618,7 @@ bool run_bench(const ArgParser& arg)
                             max_ref_per_row[r] = std::fabs(b);
                         if(diff > max_abs_per_row[r])
                             max_abs_per_row[r] = diff;
-                        if(diff > atol + rtol * std::fabs(b))
+                        if(!(diff <= atol + rtol * std::fabs(b)))
                             ++bad_per_row[r];
                     }
             std::cerr << label << " per-row bad-count (rows=" << total_rows << "):" << std::endl;
@@ -1644,6 +1696,30 @@ bool run_bench(const ArgParser& arg)
     print_stats("[dQ]", acc_dq);
     print_stats("[dK]", acc_dk);
     print_stats("[dV]", acc_dv);
+
+    if(dtm_runs > 0)
+    {
+        HostTensor<DQ> dq_rerun(dq_host.shape());
+        HostTensor<DK> dk_rerun(dk_host.shape());
+        HostTensor<DV> dv_rerun(dv_host.shape());
+        bool same_dq = true, same_dk = true, same_dv = true;
+        for(int r = 0; r < dtm_runs; ++r)
+        {
+            dq_buf.SetZero();
+            aiter::mha_bwd(mha_args, sc_v);
+            dq_buf.FromDevice(dq_rerun.data());
+            dk_buf.FromDevice(dk_rerun.data());
+            dv_buf.FromDevice(dv_rerun.data());
+            same_dq &= std::memcmp(dq_rerun.data(), dq_host.data(), dq_host.bytes()) == 0;
+            same_dk &= std::memcmp(dk_rerun.data(), dk_host.data(), dk_host.bytes()) == 0;
+            same_dv &= std::memcmp(dv_rerun.data(), dv_host.data(), dv_host.bytes()) == 0;
+        }
+        std::cout << "[dtm] runs:" << dtm_runs << " dQ:" << (same_dq ? "y" : "n")
+                  << " dK:" << (same_dk ? "y" : "n") << " dV:" << (same_dv ? "y" : "n")
+                  << std::endl;
+        if(deterministic)
+            pass &= same_dq && same_dk && same_dv;
+    }
 
     std::cout << ", valid:" << (pass ? "y" : "n") << std::flush << std::endl;
     return pass;

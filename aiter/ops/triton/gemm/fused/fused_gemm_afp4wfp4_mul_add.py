@@ -14,6 +14,7 @@ from aiter.ops.triton._triton_kernels.gemm.fused.fused_gemm_afp4wfp4_mul_add imp
 )
 from aiter.ops.triton.utils._triton import arch_info
 from aiter.ops.triton.utils.config_utils import AITER_TRITON_CONFIGS_PATH
+from aiter.ops.triton.utils.device_info import get_num_xcds
 from aiter.ops.triton.utils.logger import AiterTritonLogger
 from aiter.utility.triton.triton_metadata_redirect import AOTMetadataContext
 
@@ -161,6 +162,11 @@ def fused_gemm_afp4wfp4_mul_add(
         config["SPLITK_BLOCK_SIZE"] = 2 * K
         y_pp = None
 
+    # The scale loads are unmasked, so BLOCK_SIZE_K must not run past K.
+    if config["BLOCK_SIZE_K"] >= 2 * K:
+        config["BLOCK_SIZE_K"] = triton.next_power_of_2(2 * K)
+        config["SPLITK_BLOCK_SIZE"] = 2 * K
+
     grid = lambda META: (
         (
             META["NUM_KSPLIT"]
@@ -200,6 +206,7 @@ def fused_gemm_afp4wfp4_mul_add(
         IS_B_TENSOR=IS_B_TENSOR,
         FUSE_TYPE=fuse_type,
         **config,
+        NUM_XCDS=get_num_xcds(),
     )
 
     if config["NUM_KSPLIT"] > 1:
@@ -391,6 +398,7 @@ def fused_gemm_afp4wfp4_preshuffle_add_mul(
             IS_B_TENSOR=IS_B_TENSOR,
             FUSE_TYPE=fuse_type,
             **config,
+            NUM_XCDS=get_num_xcds(),
         )
 
     M_POW2 = triton.next_power_of_2(M)

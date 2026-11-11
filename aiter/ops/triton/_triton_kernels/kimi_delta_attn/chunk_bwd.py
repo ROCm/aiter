@@ -68,7 +68,7 @@ from aiter.ops.triton._triton_kernels.kimi_delta_attn.utils.index import (
 )
 from aiter.ops.triton._triton_kernels.kimi_delta_attn.utils.l2norm import l2norm_fwd
 from aiter.ops.triton.utils._triton import arch_info
-from aiter.ops.triton.utils._triton.pid_preprocessing import remap_xcd
+from aiter.ops.triton._triton_kernels.common.pid_preprocessing import remap_xcd
 
 
 @triton.jit

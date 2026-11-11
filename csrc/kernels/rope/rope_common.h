@@ -7825,7 +7825,9 @@ template <typename T,
           bool IS_MROPE,
           bool IS_INTERLEAVED,
           int M,
-          typename KVT>
+          typename KVT,
+          bool HAS_Q_FP8     = false,
+          bool HAS_K_UNQUANT = false>
 __global__ void fused_mrope_rms_kv_kernel(const T* qkv,
                                           const T* q_w,
                                           const T* k_w,
@@ -7859,7 +7861,10 @@ __global__ void fused_mrope_rms_kv_kernel(const T* qkv,
                                           int64_t k_head_stride    = 0,
                                           int64_t v_token_stride   = 0,
                                           int64_t v_head_stride    = 0,
-                                          bool v_norm              = false)
+                                          bool v_norm              = false,
+                                          KVT* q_out_fp8           = nullptr,
+                                          const float* per_tensor_q_scale = nullptr,
+                                          T* k_out_unquantized     = nullptr)
 {
     constexpr int VEC_SIZE        = HEAD_SIZE / WARP_SIZE;
     constexpr int HALF_HEAD_SIZE  = HEAD_SIZE / 2;
@@ -8060,6 +8065,19 @@ __global__ void fused_mrope_rms_kv_kernel(const T* qkv,
             T* q_ = &q_out[(static_cast<int64_t>(token_id) * num_heads_q + head_id_in_token) *
                            HEAD_SIZE];
             out_vec.store(q_ + access_id_in_head);
+            if constexpr(HAS_Q_FP8)
+            {
+                // Fold the Q -> fp8 quantization (static per-tensor scale) into the
+                // kernel epilogue, mirroring the K/V path, so the caller can skip a
+                // separate scaled_quant launch. The bf16 q_out above is still written
+                // for callers that consume it.
+                vec_t<KVT, VEC_SIZE> out_q_fp8_vec;
+                out_q_fp8_vec.from_(out_vec, *per_tensor_q_scale);
+                KVT* q_fp8_ =
+                    &q_out_fp8[(static_cast<int64_t>(token_id) * num_heads_q + head_id_in_token) *
+                               HEAD_SIZE];
+                out_q_fp8_vec.store(q_fp8_ + access_id_in_head);
+            }
         }
         else
         {
@@ -8108,6 +8126,14 @@ __global__ void fused_mrope_rms_kv_kernel(const T* qkv,
                     (static_cast<int64_t>(token_id) * num_heads_k + head_id_k) * HEAD_SIZE +
                     access_id_in_head;
                 out_kv_vec.store(k_out + k_out_offset);
+            }
+            // Only HAS_K_UNQUANT instantiations store k_out_unquantized; others keep base codegen.
+            if constexpr(HAS_K_UNQUANT)
+            {
+                const int64_t k_out_offset =
+                    (static_cast<int64_t>(token_id) * num_heads_k + head_id_k) * HEAD_SIZE +
+                    access_id_in_head;
+                out_vec.store(k_out_unquantized + k_out_offset);
             }
         }
     }
@@ -8366,7 +8392,10 @@ void fused_rope_rms_set_kv(const T* qkv,
                            int64_t k_head_stride    = 0,
                            int64_t v_token_stride   = 0,
                            int64_t v_head_stride    = 0,
-                           bool v_norm              = false)
+                           bool v_norm              = false,
+                           KVT* q_out_fp8           = nullptr,
+                           const float* per_tensor_q_scale = nullptr,
+                           T* k_out_unquantized     = nullptr)
 {
     AITER_CHECK(head_size == 64 || head_size == 128 || head_size == 256 || head_size == 512);
     // po2_div/po2_mod in the paged and shuffle-layout address math assume these are
@@ -8394,10 +8423,11 @@ void fused_rope_rms_set_kv(const T* qkv,
     dim3 numBlocks((total_warps + num_warps_per_block - 1) / num_warps_per_block);
     std::array<int64_t, 1> mrope_section = {0};
 
-#define DISPATCH_NEOX(HEAD_SIZE)                                             \
+#define DISPATCH_NEOX(HEAD_SIZE, HAS_Q_FP8, HAS_K_UNQUANT)                   \
     if(is_neox_style)                                                        \
     {                                                                        \
-        fused_mrope_rms_kv_kernel<T, HEAD_SIZE, true, false, false, 1, KVT>  \
+        fused_mrope_rms_kv_kernel<T, HEAD_SIZE, true, false, false, 1, KVT,  \
+                                  HAS_Q_FP8, HAS_K_UNQUANT>                  \
             <<<numBlocks, threadsPerBlock, 0, stream>>>(qkv,                 \
                                                         q_w,                 \
                                                         k_w,                 \
@@ -8431,11 +8461,15 @@ void fused_rope_rms_set_kv(const T* qkv,
                                                         k_head_stride,       \
                                                         v_token_stride,      \
                                                         v_head_stride,       \
-                                                        v_norm);             \
+                                                        v_norm,              \
+                                                        q_out_fp8,           \
+                                                        per_tensor_q_scale,  \
+                                                        k_out_unquantized);  \
     }                                                                        \
     else                                                                     \
     {                                                                        \
-        fused_mrope_rms_kv_kernel<T, HEAD_SIZE, false, false, false, 1, KVT> \
+        fused_mrope_rms_kv_kernel<T, HEAD_SIZE, false, false, false, 1, KVT, \
+                                  HAS_Q_FP8, HAS_K_UNQUANT>                  \
             <<<numBlocks, threadsPerBlock, 0, stream>>>(qkv,                 \
                                                         q_w,                 \
                                                         k_w,                 \
@@ -8469,17 +8503,53 @@ void fused_rope_rms_set_kv(const T* qkv,
                                                         k_head_stride,       \
                                                         v_token_stride,      \
                                                         v_head_stride,       \
-                                                        v_norm);             \
+                                                        v_norm,              \
+                                                        q_out_fp8,           \
+                                                        per_tensor_q_scale,  \
+                                                        k_out_unquantized);  \
     }
 
-    switch(head_size)
+#define DISPATCH_HEAD_SIZE(HAS_Q_FP8, HAS_K_UNQUANT)              \
+    switch(head_size)                                             \
+    {                                                             \
+    case 64: DISPATCH_NEOX(64, HAS_Q_FP8, HAS_K_UNQUANT) break;   \
+    case 128: DISPATCH_NEOX(128, HAS_Q_FP8, HAS_K_UNQUANT) break; \
+    case 256: DISPATCH_NEOX(256, HAS_Q_FP8, HAS_K_UNQUANT) break; \
+    case 512: DISPATCH_NEOX(512, HAS_Q_FP8, HAS_K_UNQUANT) break; \
+    }
+
+    // HAS_K_UNQUANT=true is only instantiated for fp8 caches; the host rejects others.
+    if constexpr(!std::is_same_v<KVT, T>)
     {
-    case 64: DISPATCH_NEOX(64) break;
-    case 128: DISPATCH_NEOX(128) break;
-    case 256: DISPATCH_NEOX(256) break;
-    case 512: DISPATCH_NEOX(512) break;
+        if(k_out_unquantized != nullptr)
+        {
+            if(q_out_fp8 != nullptr)
+            {
+                DISPATCH_HEAD_SIZE(true, true)
+            }
+            else
+            {
+                DISPATCH_HEAD_SIZE(false, true)
+            }
+            return;
+        }
+    }
+    else
+    {
+        AITER_CHECK(k_out_unquantized == nullptr,
+                    "k_out_unquantized requires an fp8 KV cache; with a same-dtype cache "
+                    "k_out is already unquantized");
+    }
+    if(q_out_fp8 != nullptr)
+    {
+        DISPATCH_HEAD_SIZE(true, false)
+    }
+    else
+    {
+        DISPATCH_HEAD_SIZE(false, false)
     }
 
+#undef DISPATCH_HEAD_SIZE
 #undef DISPATCH_NEOX
 }
 

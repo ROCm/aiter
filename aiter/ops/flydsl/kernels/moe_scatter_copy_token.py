@@ -94,7 +94,7 @@ def build_moe_scatter_copy_token_module(row_bytes: int):
 
         if bid_i32 < fx.Uint32(num_dst):
             srow = ptr_buf_tensor(dst_src)[bid_i32]
-            if fx.Int32(srow) >= fx.Int32(0):
+            if fx.Int32(srow) >= 0:
                 # A row is a contiguous run of n_units copy units.
                 if const_expr(vec_width > 1):
                     src_t = ptr_buf_tensor(src, cdt, unit_elems=vec_width)
