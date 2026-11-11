@@ -13,7 +13,7 @@ import torch
 from torch import Tensor
 
 from aiter import logger
-from aiter.jit.utils.chip_info import get_gfx
+from aiter.jit.utils.chip_info import get_gfx, get_gfx_runtime
 from aiter.utility.graph_alloc import capture_scoped_cache, persistent_alloc
 
 from .gemm_a16w16_band import band_stream_name_supported, gemm_a16w16_band
@@ -195,6 +195,7 @@ def flydsl_hgemm(
     stream: torch.cuda.Stream | None = None,
     k_stagger: int = 0,
     b_non_temporal: bool = False,
+    bpreshuffle: bool = False,
 ) -> torch.Tensor:
     """Run the A16W16 kernel with AITER's ``B[N, K]`` convention.
 
@@ -207,6 +208,9 @@ def flydsl_hgemm(
     ``b_non_temporal`` streams B's async loads with the non-temporal cache
     hint. It is independent of k_stagger; tune both, since shared B can
     benefit from caching. Both options default off.
+    ``bpreshuffle`` reads AITER's BF16 ``shuffle_weight(..., (16, 16))``
+    layout on gfx950 (ft/sk), without retaining an unshuffled copy. The
+    full-tile path currently requires split_k=k_waves=1.
     ``policy="bs"`` selects the BF16 band-stream decode kernel for the
     validated 256-CU gfx950 M/N/K and configuration catalog. It requires
     no bias, split_k=1 and BF16 output. As on the legacy FT path, strided
@@ -222,7 +226,14 @@ def flydsl_hgemm(
     if launch_stream.device != a.device:
         raise ValueError(f"`stream` must be on {a.device}, got {launch_stream.device}")
 
-    gfx = get_gfx()
+    gfx = get_gfx_runtime() if bpreshuffle else get_gfx()
+    if bpreshuffle and (
+        gfx != "gfx950"
+        or policy not in ("ft", "sk")
+        or a.dtype != torch.bfloat16
+        or (policy == "ft" and (split_k != 1 or k_waves != 1))
+    ):
+        raise ValueError("BF16 preshuffle requires gfx950 sk or unsplit ft policy")
     _validate_k_stagger(k_stagger, gfx, policy)
     _validate_b_non_temporal(b_non_temporal, gfx, policy)
     if policy == "bs":
@@ -275,6 +286,7 @@ def flydsl_hgemm(
             k_waves=k_waves,
             out=out,
             stream=launch_stream,
+            bpreshuffle=bpreshuffle,
         )
     if gfx in ("gfx1250", "gfx1250-strict"):
         if k_waves != 1:
@@ -319,6 +331,7 @@ def flydsl_hgemm(
         "group_m": group_m,
         "k_stagger": k_stagger,
         "b_non_temporal": b_non_temporal,
+        "bpreshuffle": bpreshuffle,
         "use_half_tile_interleaved": policy in ("ht", "hti"),
     }
     return gemm_a16w16(
