@@ -178,6 +178,7 @@ def fused_allreduce_rmsnorm_mxfp4_quant(
     use_1stage: bool,
     bf16_out_ptr: int = 0,
     gemma_norm: bool = False,
+    hadamard_rotate: bool = False,
 ) -> None: ...
 
 
@@ -221,6 +222,29 @@ def dispose(_fa: int) -> None: ...
 
 @compile_ops("module_custom_all_reduce", develop=True)
 def meta_size() -> int: ...
+
+
+@compile_ops("module_custom_all_reduce", develop=True)
+def lamportBufferSize(world_size: int) -> int: ...
+
+
+@compile_ops("module_custom_all_reduce", develop=True)
+def initLamport(
+    _fa: int,
+    self_ptr: int,
+    ipc_handle_ptrs: list[int],
+    offsets: list[int],
+) -> None: ...
+
+
+@compile_ops("module_custom_all_reduce", develop=True)
+def lamportKernel(_fa: int, numel: int) -> int: ...
+
+
+@compile_ops("module_custom_all_reduce", develop=True)
+def lamportAllReduce(
+    _fa: int, inp: torch.Tensor, out: torch.Tensor, kernel: int
+) -> None: ...
 
 
 @compile_ops("module_custom_all_reduce", develop=True)

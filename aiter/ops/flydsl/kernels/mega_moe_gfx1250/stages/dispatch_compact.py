@@ -13,7 +13,12 @@ from aiter import dtypes, logger
 
 from ...tensor_shim import _preload_compiled, _run_compiled
 from ..arena import _align_up
-from ..config import _DISPATCH_COMPACT, _WAVE_SIZE
+from ..config import (
+    _COMPACT_ROUTE_SPEC,
+    _COMPACT_ROUTE_UPTO,
+    _DISPATCH_COMPACT,
+    _WAVE_SIZE,
+)
 from ..dispatch_tdm import _make_dispatch_tdm, tdm_max_warps, tdm_stage_capacity
 from ..recipe import MegaMoEConfig
 from ..s1f_ctl import (
@@ -208,7 +213,16 @@ class _CompactDispatch(_Dispatch):
         if blocks_env is not None or warps_env is not None:
             schedule = ((None, int(blocks_env or "64"), int(warps_env or "8")),)
         else:
-            schedule = _DISPATCH_COMPACT
+            # Up to _COMPACT_ROUTE_UPTO tokens/rank the steps past 256 walk
+            # routes with _COMPACT_ROUTE_SPEC blocks/warps (see config.py).
+            upto = _COMPACT_ROUTE_UPTO
+            rb, rw = _COMPACT_ROUTE_SPEC
+            head = tuple(
+                e
+                for e in _DISPATCH_COMPACT
+                if e[0] is not None and e[0] < min(upto, 512)
+            )
+            schedule = head + ((upto, rb, rw, True), _DISPATCH_COMPACT[-1])
         super().__init__(config, schedule)
         self.compact = _CompactGeometry.of(config)
         self.scale_stride = _align_up(config.dispatch_scale_nbytes, 128)
@@ -349,6 +363,7 @@ class _CompactDispatch(_Dispatch):
                         tok_map=False,
                         quant_blocks=_QUANT_FUSE_BLOCKS,
                     )
+        self._precompile_s1f_plans()
         self._kernels = self._build_kernels()
         # Width in whatever recv_dtype counts: bytes on both quantizing wires.
         width = (
@@ -659,6 +674,54 @@ class _CompactDispatch(_Dispatch):
         )
         return _CompactStep(recv_bound=bound, align_m=align_m, rows=min(rows, geo.cap))
 
+    def _precompile_s1f_plans(self) -> None:
+        """Compile every stage-1 plan variant before serving.
+
+        With S1F on (the default) the plan is keyed by (align_m, slot, waves,
+        blocks, tok_map, fused quant), and waves/blocks follow the step's token
+        count, so eager steps (prefill, or any width the warmup never ran)
+        reached the JIT inside the serving loop (the first ~100 s of a c512
+        run had 250-470 ms prefill steps). This walks every recv bound a
+        fused step can have (<= the S1F max recv, 4096), takes the
+        alignments they map to, and one token count per distinct
+        (waves, blocks), and compiles all variants (compile only, no launch).
+        """
+        if not self.fusion.enabled:
+            return
+        from ..compact_plan import compact_plan_blocks
+        from ..s1f_ctl import _QUANT_FUSE_BLOCKS as _qfb
+        from ..s1f_ctl import _S1F_MAX_RECV as _lim
+
+        config = self.config
+        limit = min(int(config.max_recv), int(_lim))
+        saved = self._step
+        bounds = sorted(set(range(16, limit + 1, 16)) | {1, limit})
+        steps = {}
+        for b in bounds:
+            st = self._step_for(b)
+            steps.setdefault(int(st.align_m), st)
+        max_tok = min(int(config.max_tokens_per_rank), limit)
+        widths = {}
+        for tok in range(1, max_tok + 1):
+            routes = tok * int(config.topk)
+            wb = (self._plan_waves_for(tok), compact_plan_blocks(routes))
+            widths.setdefault(wb, tok)
+        try:
+            for align_m, st in sorted(steps.items()):
+                self._step = st
+                if not self.fusion.plan_mode(align_m):
+                    continue
+                for tok in sorted(widths.values()):
+                    for slot in range(self._PLAN_SLOTS):
+                        self._plan_for(align_m, slot, tok)
+                        self._plan_for(align_m, slot, tok, tok_map=False)
+                        if _qfb:
+                            self._plan_for(
+                                align_m, slot, tok, tok_map=False, quant_blocks=_qfb
+                            )
+        finally:
+            self._step = saved
+
     def _plan_waves_for(self, token_count: int | None) -> int:
         """Wave count for this step's route count.
 
@@ -671,7 +734,7 @@ class _CompactDispatch(_Dispatch):
         if token_count is not None:
             routes = min(routes, max(1, int(token_count) * int(self.config.topk)))
         waves = compact_plan_waves(npes=self.config.world_size, max_routes=routes)
-        if self.fusion.enabled:
+        if self.fusion.enabled and not self.fusion.step_off():
             # The stage-1 plan runs alone between the quant and the kernel,
             # and its tables want the wide scan.
             waves = max(waves, 16)
@@ -712,13 +775,15 @@ class _CompactDispatch(_Dispatch):
 
         align_m = int(align_m)
         slot = int(slot)
-        plan_s1f = self.fusion.plan_mode(align_m)
+        # A step over the S1F max recv keeps the S1F=0 plan.
+        fused = self.fusion.enabled and not self.fusion.step_off()
+        plan_s1f = fused and self.fusion.plan_mode(align_m)
         write_tok_map = (not plan_s1f) or bool(tok_map)
-        qb = int(quant_blocks)
+        qb = int(quant_blocks) if plan_s1f else 0
         # With the stage-1 kernel off, one launch per alignment and slot, as
         # before: the width is the plan's own default. On, the width follows
         # the step, and tok_map / the fused quant are their own kernels.
-        if self.fusion.enabled:
+        if fused:
             waves = self._plan_waves_for(token_count)
             routes = (
                 self.compact.max_routes
@@ -740,7 +805,7 @@ class _CompactDispatch(_Dispatch):
                 )
             config, geo, arena = self.config, self.compact, self.res.arena
             extra = {}
-            if self.fusion.enabled:
+            if fused:
                 full_waves = compact_plan_waves(
                     npes=config.world_size, max_routes=geo.max_routes
                 )
@@ -831,7 +896,7 @@ class _CompactDispatch(_Dispatch):
         quant_src: torch.Tensor | None = None,
         ready_event: torch.cuda.Event | None = None,
     ) -> None:
-        plan_s1f = self.fusion.plan_mode(align_m)
+        plan_s1f = self.fusion.plan_mode(align_m) and not self.fusion.step_off()
         qb = _QUANT_FUSE_BLOCKS if plan_s1f and quant_src is not None else 0
         plan_stream = self._plan_stream
         if ready_event is None:
