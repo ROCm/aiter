@@ -67,6 +67,7 @@ from aiter.ops.opus.moe_stage1_a8w4 import (
     opus_a8w4_stage1_wrapper as _opus_a8w4_stage1_wrapper,
 )
 from aiter.presorted_moe import (  # noqa: F401  register_presorted_moe is public
+    _PRESORTED_MOE_SORT_KEYS,
     aux_sort_capacity,
     bytes_overlap,
     drop_presort_on_error,
@@ -1918,8 +1919,16 @@ def _fused_moe_impl(
             f"{metadata.block_m}; moe_sorting and both gemm tiles share this size"
         )
     block_size_M = metadata.block_m if block_size_M is None else block_size_M
-    if presorted_aux and not metadata.output_aux:
-        presorted_moe_ignored("the selected MoE pipeline takes no BM=16 aux sort")
+    if (
+        presorted_aux
+        and not metadata.output_aux
+        and "sorted_token_ids_moe_sorting" not in presorted_aux
+    ):
+        presorted_moe_ignored(
+            "the selected MoE pipeline takes no BM=16 aux sort and the "
+            "presort carries no moe_sorting-layout ids"
+        )
+        presorted_aux = None
     asm_mode = AsmMoeMode(metadata.flat)
     if metadata.full_impl is not None:
         full_output = metadata.full_impl(
@@ -2160,6 +2169,70 @@ def _fused_moe_impl(
             compact_scale=fused_compact_scale,
             num_local_tokens=num_local_tokens,
         )
+        local_topk_ids = None
+    elif (
+        presorted_aux
+        and asm_mode.requires_host_sort
+        and asm_mode is not AsmMoeMode.POST_REDUCE
+        and not need_local_topk_ids
+        and (
+            presorted := match_presorted_moe(
+                presorted_aux,
+                topk_ids,
+                topk_weight,
+                block_m=metadata.block_m,
+                num_experts=global_E,
+                topk=topk,
+                stage_block_m=block_size_M,
+                expert_mask=expert_mask,
+                num_local_tokens=num_local_tokens,
+                output=output,
+            )
+        )
+        is not None
+    ):
+        # A caller's presort for a pipeline that reads moe_sorting's layout:
+        # the same sort as the aux one but for the padding ids, carried in
+        # sorted_token_ids_moe_sorting. The aux-only m_indices / reverse_sorted
+        # go unused.
+        sorted_ids = presorted["sorted_token_ids_moe_sorting"]
+        sorted_weights = presorted["sorted_weights"]
+        sorted_expert_ids = presorted["sorted_expert_ids"]
+        num_valid_ids = presorted["num_valid_ids"]
+        if sorted_ids.shape != presorted["sorted_token_ids"].shape:
+            raise ValueError("presort: the two sorted id layouts differ in size")
+        if not runtime_stage2_reduce:
+            # GEMM2 accumulates: it needs a zeroed [M, model_dim] destination,
+            # which moe_sorting would have zeroed. Take the caller's buffer
+            # when the presort says it zeroed it, else zero one here.
+            caller_buf = presorted.get("moe_buf")
+            if output is not None:
+                moe_buf = output
+                zeroed = (
+                    presorted.get("moe_buf_zeroed")
+                    and int(presorted.get("moe_buf_ptr", 0)) == output.data_ptr()
+                )
+            elif (
+                caller_buf is not None
+                and tuple(caller_buf.shape) == (M, model_dim)
+                and caller_buf.dtype == dtype
+                and caller_buf.is_contiguous()
+                and not any(
+                    bytes_overlap(caller_buf, presorted[k])
+                    for k in _PRESORTED_MOE_SORT_KEYS
+                )
+            ):
+                moe_buf = caller_buf
+                zeroed = bool(presorted.get("moe_buf_zeroed"))
+            else:
+                moe_buf = torch.empty(
+                    (M, model_dim), dtype=dtype, device=topk_ids.device
+                )
+                zeroed = False
+            if not zeroed:
+                moe_buf.zero_()
+        else:
+            moe_buf = torch.empty((0, 0), dtype=dtype, device=topk_ids.device)
         local_topk_ids = None
     else:
         sort_output = output if asm_mode.requires_host_sort else None
