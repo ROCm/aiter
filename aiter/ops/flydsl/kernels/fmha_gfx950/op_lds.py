@@ -82,6 +82,17 @@ class DualwaveFp8PageIdLoader(DualwaveFp8KernelContext):
 
     def begin_page_ids(self, tiles):
         handles = []
+        if const_expr(self.traits.BODY_VARIANT == "conventional_bn64"):
+            # i32 clamp: SALU has no 64-bit ordered compare.
+            for tile in tiles:
+                tile = fx.Int32(tile)
+                last = fx.Int32(self.split_t_end) - fx.Int32(1)
+                clamped = (tile < last).select(tile, last)
+                first = fx.Int32(self.split_t0)
+                clamped = (clamped > first).select(clamped, first)
+                bt = self.lds.bt.view(fx.make_layout(self.traits.PAGED_BT_LDS_SIZE, 1))
+                handles.append(fx.memref_load(bt, clamped - first))
+            return handles
         for tile in tiles:
             last = fx.Index(self.split_t_end) - 1
             clamped = (tile < last).select(tile, last)

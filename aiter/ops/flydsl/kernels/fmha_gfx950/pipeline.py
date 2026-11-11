@@ -988,17 +988,31 @@ class DualwaveFp8KernelContext:
         # Bounds follow the logical tile, not the clamped page id: invalid-token
         # V must be zero even when the last page contains stale fp8 NaNs.
         # Signed: tiles wholly past the sequence end would underflow in index math.
-        remaining = fx.Int64(self.seqlen_kv_v) - fx.Int64(tile_start)
-        valid = (remaining > fx.Int64(0)).select(remaining, fx.Int64(0))
-        valid = (valid < fx.Int64(self.traits.BLOCK_N)).select(
-            valid, fx.Int64(self.traits.BLOCK_N)
+        shuffled = (which == "k" and self.traits.K_SHUFFLED) or (
+            which == "v" and self.traits.V_SHUFFLED
         )
-        nrec = valid * fx.Int64(self.stride_kv_n_v)
-        if const_expr(
-            (which == "k" and self.traits.K_SHUFFLED)
-            or (which == "v" and self.traits.V_SHUFFLED)
-        ):
-            nrec = (valid > fx.Int64(0)).select(self.page_byte_stride, fx.Int64(0))
+        if const_expr(self.traits.BODY_VARIANT == "conventional_bn64" and not shuffled):
+            # i32 tile math: SALU has no 64-bit ordered compare. No max/min clamp: it combines into VALU v_med3_i32
+            # and the descriptor then needs a readfirstlane waterfall. Shuffled keeps i64: an i32 compare there
+            # reschedules the causal body into a spill at 168 VGPR.
+            remaining = self.seqlen_kv_i32 - fx.Int32(tile_start)
+            full = fx.Int32(self.traits.BLOCK_N * self.traits.DEFAULT_STRIDE_KV_N)
+            part = remaining * fx.Int32(self.traits.DEFAULT_STRIDE_KV_N)
+            nrec = fx.Int64(
+                (remaining > fx.Int32(0)).select(
+                    (remaining < fx.Int32(self.traits.BLOCK_N)).select(part, full),
+                    fx.Int32(0),
+                )
+            )
+        else:
+            remaining = fx.Int64(self.seqlen_kv_v) - fx.Int64(tile_start)
+            valid = (remaining > fx.Int64(0)).select(remaining, fx.Int64(0))
+            valid = (valid < fx.Int64(self.traits.BLOCK_N)).select(
+                valid, fx.Int64(self.traits.BLOCK_N)
+            )
+            nrec = valid * fx.Int64(self.stride_kv_n_v)
+            if const_expr(shuffled):
+                nrec = (valid > fx.Int64(0)).select(self.page_byte_stride, fx.Int64(0))
         return _make_page_view(
             base_iter,
             page_id,
