@@ -546,6 +546,11 @@ def test_a_readback_under_capture_is_refused_and_takes_the_context_with_it():
     Measured on gfx950 / torch 2.10.0+rocm7.2.4. If a future ROCm or PyTorch
     makes readback under capture legal, or recoverable, this goes red and the
     obligation stated in #7240 should be revisited.
+
+    Both assertions were mutation-checked by swapping the `.item()` in the
+    probe for a `torch.empty` -- an operation capture permits. That reports
+    NOT_REFUSED and CONTEXT_SURVIVED, failing both, so neither assertion is
+    satisfied by something other than the behaviour it names.
     """
 
     result = subprocess.run(
