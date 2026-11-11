@@ -327,12 +327,10 @@ def _fused_gemm_a16w16_dual_splitk_reduce_kernel(
     ACTUAL_KSPLIT2: tl.constexpr,
     MAX_KSPLIT2: tl.constexpr,
 ):
-    """Sums the split-K partials of each part that was split (ACTUAL_KSPLIT > 1)."""
+    """Sums the split-K partials of each part that was split (ACTUAL_KSPLIT > 1).
+    A part that is not split is not compiled, so its input may be None."""
     tl.assume(stride_c1_out_m > 0)
     tl.assume(stride_c1_out_n > 0)
-    tl.assume(stride_c2_in_k > 0)
-    tl.assume(stride_c2_in_m > 0)
-    tl.assume(stride_c2_in_n > 0)
     tl.assume(stride_c2_out_m > 0)
     tl.assume(stride_c2_out_n > 0)
 
@@ -341,7 +339,11 @@ def _fused_gemm_a16w16_dual_splitk_reduce_kernel(
     tl.assume(pid_m >= 0)
     tl.assume(pid_n >= 0)
 
+    pid_n2 = pid_n
     if ACTUAL_KSPLIT1 > 1:
+        tl.assume(stride_c1_in_k > 0)
+        tl.assume(stride_c1_in_m > 0)
+        tl.assume(stride_c1_in_n > 0)
         num_pid_n1 = tl.cdiv(N1, BLOCK_SIZE_N)
         if pid_n < num_pid_n1:
             _dual_splitk_reduce_tile(
@@ -361,12 +363,17 @@ def _fused_gemm_a16w16_dual_splitk_reduce_kernel(
                 ACTUAL_KSPLIT1,
                 MAX_KSPLIT1,
             )
-        else:
+        pid_n2 = pid_n - num_pid_n1
+    if ACTUAL_KSPLIT2 > 1:
+        tl.assume(stride_c2_in_k > 0)
+        tl.assume(stride_c2_in_m > 0)
+        tl.assume(stride_c2_in_n > 0)
+        if pid_n2 >= 0:
             _dual_splitk_reduce_tile(
                 c2_in_ptr,
                 c2_out_ptr,
                 pid_m,
-                pid_n - num_pid_n1,
+                pid_n2,
                 M,
                 N2,
                 stride_c2_in_k,
@@ -379,24 +386,6 @@ def _fused_gemm_a16w16_dual_splitk_reduce_kernel(
                 ACTUAL_KSPLIT2,
                 MAX_KSPLIT2,
             )
-    else:
-        _dual_splitk_reduce_tile(
-            c2_in_ptr,
-            c2_out_ptr,
-            pid_m,
-            pid_n,
-            M,
-            N2,
-            stride_c2_in_k,
-            stride_c2_in_m,
-            stride_c2_in_n,
-            stride_c2_out_m,
-            stride_c2_out_n,
-            BLOCK_SIZE_M,
-            BLOCK_SIZE_N,
-            ACTUAL_KSPLIT2,
-            MAX_KSPLIT2,
-        )
 
 
 def _get_config(

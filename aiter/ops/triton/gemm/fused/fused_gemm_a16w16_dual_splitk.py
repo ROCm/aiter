@@ -152,8 +152,10 @@ def fused_gemm_a16w16_dual_splitk(
         (triton.cdiv(N1, REDUCE_BLOCK_SIZE_N) if reduce1 else 0)
         + (triton.cdiv(n2, REDUCE_BLOCK_SIZE_N) if reduce2 else 0),
     )
-    c1_in = y1_pp if reduce1 else y2_pp
-    c2_in = y2_pp if reduce2 else y1_pp
+    c1_in = y1_pp if reduce1 else None
+    c2_in = y2_pp if reduce2 else None
+    c1_in_strides = y1_pp.stride() if reduce1 else (0, 0, 0)
+    c2_in_strides = y2_pp.stride() if reduce2 else (0, 0, 0)
     _fused_gemm_a16w16_dual_splitk_reduce_kernel[grid_reduce](
         c1_in,
         y1,
@@ -162,14 +164,10 @@ def fused_gemm_a16w16_dual_splitk(
         M,
         N1,
         n2,
-        c1_in.stride(0),
-        c1_in.stride(1),
-        c1_in.stride(2),
+        *c1_in_strides,
         y1.stride(0),
         y1.stride(1),
-        c2_in.stride(0),
-        c2_in.stride(1),
-        c2_in.stride(2),
+        *c2_in_strides,
         y2.stride(0),
         y2.stride(1),
         REDUCE_BLOCK_SIZE_M,
