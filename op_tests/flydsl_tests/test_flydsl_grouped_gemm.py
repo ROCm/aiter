@@ -45,7 +45,11 @@ from aiter.fused_moe import (
 )
 from aiter.ops.flydsl.moe_common import GateMode, apply_gate_up
 from aiter.ops.quant import per_1x32_f4_quant
-from aiter.ops.shuffle import moe_shuffle_scale, moe_shuffle_weight, moe_shuffle_weight_iod
+from aiter.ops.shuffle import (
+    moe_shuffle_scale,
+    moe_shuffle_weight,
+    moe_shuffle_weight_iod,
+)
 from aiter.utility import dtypes, fp4_utils
 
 # Build every tensor straight on the device (like op_tests/test_moe_2stage.py) so
@@ -493,6 +497,7 @@ def _run_grouped_via_fused_moe(
     )
     w2_scale = moe_shuffle_scale(w2_scale_raw.contiguous(), experts_cnt=experts)
     moe_shuffle_weight_iod(w1_grouped, w1_scale, experts, gate_up=True)
+    moe_shuffle_weight_iod(w2_grouped, w2_scale, experts)
 
     if data_format == "a4w4":
         w1_arg = w1_grouped.view(dtypes.fp4x2)

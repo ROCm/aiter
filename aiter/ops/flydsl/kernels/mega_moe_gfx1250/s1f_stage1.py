@@ -649,7 +649,7 @@ def make_s1f_stage1(
     N1 = 2 * int(inter_dim)
     assert N1 % tile_n == 0
     NT = N1 // tile_n
-    # IOD-placed W1 (iod_locality.placed_w1): XCC x is on IOD domain
+    # IOD-placed W1 (iod_locality.place_w13): XCC x is on IOD domain
     # ((x + c) % 8) >= 4, c the launch's rotation, which holds n-tiles of that
     # parity.
     assert not LOC or (XQ and NT % 2 == 0), "iod_loc needs xcc_queues, even NT"
@@ -801,6 +801,7 @@ def make_s1f_stage1(
         arg_a1_scale: fx.Tensor,
         arg_w1_scale: fx.Tensor,
         arg_a2_scale: fx.Tensor,
+        arg_loc_phase: fx.Tensor,
         arg_psum: fx.Pointer,
         arena: fx.Int64,
         inp_tok: fx.Int64,
@@ -858,6 +859,7 @@ def make_s1f_stage1(
             arg_a1_scale: fx.Pointer,
             arg_w1_scale: fx.Pointer,
             arg_a2_scale: fx.Pointer,
+            arg_loc_phase: fx.Pointer,
             arg_psum: fx.Pointer,
             arena: fx.Int64,
             inp_tok: fx.Int64,
@@ -2075,6 +2077,7 @@ def make_s1f_stage1(
                     arg_a1,
                     arg_a2_scale,
                     arg_a1,
+                    arg_loc_phase,
                     i32_m,
                     n1,
                     f32_swiglu_limit,
@@ -2096,6 +2099,7 @@ def make_s1f_stage1(
             fx.get_iter(arg_a1_scale),
             fx.get_iter(arg_w1_scale),
             fx.get_iter(arg_a2_scale),
+            fx.get_iter(arg_loc_phase),
             arg_psum,
             arena,
             inp_tok,

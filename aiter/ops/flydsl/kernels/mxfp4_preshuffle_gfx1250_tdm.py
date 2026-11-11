@@ -235,15 +235,14 @@ def build_gemm_a8w4_tdm_task(
       must drain tensorcnt and storecnt before reusing the arena or exiting.
     - ``tdm_snop``: ``s_nop 0`` after every TDM issue, so no branch or label
       directly follows one (a gfx1250 TDM hazard).
-    - ``b_placed``: B and B-scale come from one IOD-placed buffer (see
-      ``iod_locality.place_w13`` / ``place_w2``) passed as both ``arg_b`` and
-      ``arg_scale_b``: page 0 holds the per-page phase, then 16 KiB granules.
+    - ``b_placed``: ``arg_b`` / ``arg_scale_b`` hold the IOD-placed layout
+      (see ``iod_locality``) and ``arg_loc_phase`` their page offsets and phases.
       The layout tiling is (b_placed tile_n) x (tile_k / b_placed); its unit
-      (expert, n-tile) lives on domain n % 2 at local granules
-      ``lu * GPU_LOC + j``; j < 2 LOC_KT is half h of layout k-tile m,
-      j = 4 (m / 2) + 2 h + m % 2, the rest hold the B scales of 8 layout
-      k-tiles each. With b_placed 2 a tile is one half and a k-tile one
-      layout pair, loaded as a 3-D [rows, pair, row] tensor.
+      (expert, n-tile) lives on domain n % 2, its B at local granules
+      ``lu * 2 LOC_KT + j``, j = 4 (m / 2) + 2 h + m % 2 for half h of layout
+      k-tile m, its scales at local byte ``(lu * LOC_KT + m) * 2 KiB``. With
+      b_placed 2 a tile is one half and a k-tile one layout pair, loaded as a
+      3-D [rows, pair, row] tensor.
     - ``loc_sched``: only tags the kernel name (the launcher's schedule).
     """
     if tile_meta is not None or item_hooks is not None:
@@ -352,18 +351,17 @@ def build_gemm_a8w4_tdm_task(
     )
     _ = cache_tag
     LOC_GRAN = 16384
-    LOC_PAGE = 2 << 20
+    LOC_STAGE = 2048
     # The layout tiling is (b_placed tile_n) x (tile_k / b_placed).
     LOC_KT = K_TILES * max(b_placed, 1)
-    GPU_LOC = 2 * LOC_KT + ceildiv(LOC_KT, 8)
-    GPU_LOC += GPU_LOC % 2
     if b_placed:
-        # One wave's B half of a layout k-tile is one granule; 8 layout
-        # k-tiles of B scales fill one more.
+        # One wave's B half of a layout k-tile is one granule, a layout k-tile's
+        # B scales one 2 KiB stage; a unit's B and its scales each span at most
+        # two pages.
         assert b_placed in (1, 2)
         assert tile_n * tile_k == 4 * LOC_GRAN and (tile_n * b_placed) % 128 == 0
         assert m_warp * n_warp == 4 and cluster_n == 1 and cluster_m == 1
-        assert not HAS_K_TAIL and LOC_KT % 2 == 0 and GPU_LOC <= 64
+        assert not HAS_K_TAIL and LOC_KT % 2 == 0 and 2 * LOC_KT <= 64
     if enable_ep_scatter:
         if stage1_act != 0:
             raise ValueError("enable_ep_scatter is gemm2-only (stage1_act must be 0)")
@@ -587,6 +585,7 @@ def build_gemm_a8w4_tdm_task(
         arg_bias: fx.Pointer,
         arg_quant_scale: fx.Pointer,
         arg_ep_row_map: fx.Pointer,
+        arg_loc_phase: fx.Pointer,
         i32_m: fx.Int32,
         i32_n: fx.Int32,
         f32_swiglu_limit: fx.Float32,
@@ -847,22 +846,44 @@ def build_gemm_a8w4_tdm_task(
             loc_nt = loc_nt >> (b_placed - 1)
             loc_e = (expert < n_experts).select(expert, 0)
             loc_d = loc_nt & 1
-            loc_g0 = (loc_e * (total_n_tiles >> b_placed) + (loc_nt >> 1)) * GPU_LOC
-            loc_pg0 = loc_g0 >> 6
-            loc_phs = fx.recast_iter(i32_ptr, arg_b)
-            loc_ph0 = loc_phs[loc_pg0]
-            loc_ph1 = loc_phs[loc_pg0 + 1]
+            loc_u = loc_e * (total_n_tiles >> b_placed) + (loc_nt >> 1)
+            # Header: the granule pairs ahead of the weight / scale in their
+            # first page, the index of the scale pages' phases.
+            loc_phs = fx.recast_iter(i32_ptr, arg_loc_phase)
+            loc_qb = loc_phs[0]
+            loc_qs = loc_phs[1]
+            loc_sph = loc_phs[2]
+            loc_gb = loc_u * (2 * LOC_KT)
+            loc_sb = loc_u * (LOC_KT * LOC_STAGE)
+            loc_pb = (loc_gb + loc_qb) >> 6
+            loc_ps = ((loc_sb >> 14) + loc_qs) >> 6
+            loc_phb = (loc_phs[3 + loc_pb], loc_phs[4 + loc_pb])
+            loc_phsc = (loc_phs[loc_sph + loc_ps], loc_phs[loc_sph + loc_ps + 1])
             b_off0 = fx.Int64(0)
             sb_off0 = fx.Int64(0)
 
-            def loc_addr(j):
-                """Byte offset of the unit's local granule j (page 0 is the phase table)."""
-                g = loc_g0 + j
-                pg = g >> 6
-                k = g & 63
-                ph = (pg == loc_pg0).select(loc_ph0, loc_ph1)
+            def loc_gran(g, q0, pg0, phs):
+                """Byte offset of the unit's domain's local granule g, in granule pair
+                g; q0 pairs precede the storage in its first page, and g's page is
+                pg0 or the next."""
+                q = g + q0
+                pg = q >> 6
+                k = q & 63
+                ph = (pg == pg0).select(phs[0], phs[1])
                 bit = (loc_d ^ ph ^ (k >> 2) ^ (k >> 5)) & 1
-                return fx.Int64(pg + 1) * LOC_PAGE + fx.Int64((k << 1) | bit) * LOC_GRAN
+                return fx.Int64((g << 1) | bit) * LOC_GRAN
+
+            def loc_addr(j):
+                """Byte offset of the unit's B granule j in ``arg_b``."""
+                return loc_gran(loc_gb + j, loc_qb, loc_pb, loc_phb)
+
+            def loc_scale(lm):
+                """Byte offset of the unit's layout k-tile lm scale stage in ``arg_scale_b``."""
+                s = loc_sb + lm * LOC_STAGE
+                return loc_gran(s >> 14, loc_qs, loc_ps, loc_phsc) + fx.Int64(
+                    s & (LOC_GRAN - 1)
+                )
+
         assert num_waves_per_tensor_tdm in (
             1,
             2,
@@ -1131,7 +1152,7 @@ def build_gemm_a8w4_tdm_task(
             k_adv=SC_INNER * 4,
             wv=waves[3],
             loc="S" if b_placed else None,
-            pair_stride=LOC_GRAN // 8 // 4 if b_placed == 2 else None,
+            pair_stride=LOC_STAGE // 4 if b_placed == 2 else None,
         )
 
         # Wave ids are runtime, so one stream serves every wave and one test per
@@ -1191,11 +1212,8 @@ def build_gemm_a8w4_tdm_task(
                 elif const_expr(j.loc == "S"):
                     # A layout k-tile's scale stage is 2 KiB, rows of tile_k /
                     # b_placed bytes; this tile's rows start loc_sub SB_SUPERS in.
-                    assert SB_SUPERS * SC_INNER * 4 * 8 == LOC_GRAN
-                    lm = kt * b_placed
-                    imm = loc_addr(2 * LOC_KT + lm // 8) + fx.Int64(
-                        (lm % 8) * (LOC_GRAN // 8)
-                    )
+                    assert SB_SUPERS * SC_INNER * 4 == LOC_STAGE
+                    imm = loc_scale(kt * b_placed)
                     if const_expr(b_placed == 2):
                         imm = imm + fx.Int64(loc_sub * (SB_SUPERS * SC_INNER * 2))
                 else:
@@ -2689,6 +2707,7 @@ def launch_gemm_a8w4_tdm(
     m_align: Constexpr[int] = 0,
     b_placed: Constexpr[int] = 0,
     loc_sched: Constexpr[int] = 0,
+    arg_loc_phase: fx.Tensor = None,
 ):
     """Launch the grouped contiguous-M a8w4 MoE GEMM for gfx1250.
 
@@ -2777,6 +2796,7 @@ def launch_gemm_a8w4_tdm(
         arg_bias: fx.Pointer,
         arg_quant_scale: fx.Pointer,
         arg_ep_row_map: fx.Pointer,
+        arg_loc_phase: fx.Pointer,
         i32_m: fx.Int32,
         i32_n: fx.Int32,
         f32_swiglu_limit: fx.Float32,
@@ -2796,6 +2816,7 @@ def launch_gemm_a8w4_tdm(
                 arg_bias,
                 arg_quant_scale,
                 arg_ep_row_map,
+                arg_loc_phase,
                 i32_m,
                 i32_n,
                 f32_swiglu_limit,
@@ -2846,6 +2867,8 @@ def launch_gemm_a8w4_tdm(
         arg_ep_row_map = arg_c
     if arg_quant_scale is None:
         arg_quant_scale = arg_c
+    if arg_loc_phase is None:
+        arg_loc_phase = arg_c
     kargs = (
         fx.get_iter(arg_c),
         arg_a,
@@ -2856,6 +2879,7 @@ def launch_gemm_a8w4_tdm(
         arg_bias,
         fx.get_iter(arg_quant_scale),
         fx.get_iter(arg_ep_row_map),
+        fx.get_iter(arg_loc_phase),
         i32_m,
         N,
         f32_swiglu_limit,

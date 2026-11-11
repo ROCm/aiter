@@ -6,7 +6,7 @@
 home(addr) = a14 ^ a17 ^ a20 ^ phase[addr >> 21]; workgroup b of a grid whose
 workgroups all run is on domain ((b + 3) % 8) >= 4. One launch of 8 probers,
 one per workgroup class, all running: prober b walks every page and times one
-cold load in each of its first 16 granules, whose in-page home bits
+cold load in each of 16 granules of a 256 KiB aligned window, whose home bits
 a14 ^ a17 alternate, so the faster parity names domain(b) ^ phase(page) without
 an absolute latency threshold. Eight concurrent single loads do not contend.
 
@@ -18,12 +18,13 @@ domain(b) = ((b + c) & 7) >= 4 for a rotation c that follows the hardware pipe
 it lands on (HW_ID2 PIPE_ID 1, 2, 3 -> c = 3, 2, 1; pipe 0 -> 0 or 4). A process
 that launches from many streams (ATOM, MORI) gets pipe 0 at load time, so the
 probe saw c = 0 there on every rank. The classes still split cleanly into a
-rotation, so each pass first reads its rotation from the relative pattern of
-the eight classes and only passes on the c = 3 rotation the GEMM schedules
-assume are kept (c = 7, its complement, was never observed); the others are
-relaunched on another stream. Each class must agree with the domain formula on
-(nearly) every page of the kept passes; if one does not, or too few passes land
-on c = 3, the probe reports it instead of returning a phase.
+rotation, so each pass reads its rotation from the relative pattern of the
+eight classes and is kept only if every prober's ``launch_rotation`` names the
+same one (mod 4; c and c + 4 differ by a global flip the phase absorbs, and
+the GEMMs read c the same way); the others are relaunched on another stream.
+Each class must agree with the domain formula on (nearly) every page of the
+kept passes; if one does not, or too few passes are kept, the probe reports it
+instead of returning a phase.
 """
 
 import numpy as np
@@ -92,6 +93,8 @@ def _launch_probe(
     lat: fx.Int64,
     npg: fx.Int32,
     line: fx.Int32,
+    win0: fx.Int32,
+    win1: fx.Int32,
     stream: fx.Stream,
 ):
     # The cache key follows only this body's globals, not the kernel's below.
@@ -103,16 +106,27 @@ def _launch_probe(
         lat: fx.Int64,
         npg: fx.Int32,
         line: fx.Int32,
+        win0: fx.Int32,
+        win1: fx.Int32,
     ):
         bid = fx.Int32(fx.block_idx.x)
         tid = fx.Int32(fx.thread_idx.x)
         if tid == fx.Int32(0):
             rsrc = create_buffer_resource_from_addr(arith.unwrap(lat))
             # A 128 B line per (pass, prober): cold, and never shared.
-            lo = fx.Int64((line * fx.Int32(PROBERS) + bid) & fx.Int32(127)) * fx.Int64(128)
+            slot = (line * fx.Int32(PROBERS) + bid) & fx.Int32(127)
+            lo = fx.Int64(slot) * fx.Int64(128)
             for p in range(fx.Int32(0), npg, fx.Int32(1)):
+                win = (p == fx.Int32(0)).select(
+                    win0, (p == npg - fx.Int32(1)).select(win1, fx.Int32(0))
+                )
                 for g in range(fx.Int32(0), fx.Int32(NGRAN), fx.Int32(1)):
-                    off = (fx.Int64(p) << fx.Int64(21)) + fx.Int64(g) * fx.Int64(16384) + lo
+                    off = (
+                        (fx.Int64(p) << fx.Int64(21))
+                        + fx.Int64(win)
+                        + fx.Int64(g) * fx.Int64(16384)
+                        + lo
+                    )
                     t = _timed_load(base + off)
                     buffer_store(
                         arith.unwrap(t),
@@ -125,7 +139,7 @@ def _launch_probe(
                 arith.unwrap(fx.Int32(PROBERS * NGRAN) * npg + bid),
             )
 
-    kernel(base, lat, npg, line).launch(
+    kernel(base, lat, npg, line, win0, win1).launch(
         grid=(PROBERS, 1, 1), block=(32, 1, 1), stream=stream
     )
 
@@ -146,16 +160,43 @@ def _rotation(odd_fast: np.ndarray):
     return None
 
 
-def probe_phase(buf: torch.Tensor, npass: int = 4):
-    """Phase of every 2 MiB page of ``buf`` (2 MiB aligned).
+PAGE = 2 << 20
+WIN = NGRAN * 16384
 
-    Returns (phase u8[npg], weak pages, per-class agreement, rotation of every
-    launch); phase is None when a workgroup class does not follow the domain
-    formula or fewer than ``npass`` launches after the warm-up run at the
-    rotation ``launch_rotation`` reads from their hardware queue.
+
+def probe_windows(start: int, nbytes: int, lo: int, hi: int):
+    """(first page, pages, window offset in the first page, in the last) for
+    the pages bytes [start, start + nbytes) touch, each window WIN aligned
+    within [lo, hi) (the bytes the probe may read); None if a page has none."""
+    base = start - start % PAGE
+    npg = -(-(start + nbytes - base) // PAGE)
+    wins = []
+    for p in (0, npg - 1):
+        pg = base + p * PAGE
+        a = max(pg, lo)
+        a = pg + -(-(a - pg) // WIN) * WIN
+        if a + WIN > min(pg + PAGE, hi):
+            return None
+        wins.append(a - pg)
+    return base, npg, wins[0], wins[1]
+
+
+def probe_phase(buf: torch.Tensor, npass: int = 4, span=None):
+    """Phase of every 2 MiB page ``buf`` touches.
+
+    The probe reads one WIN window per page within ``span`` (lo, hi), the
+    readable bytes around ``buf`` (default its own), which ``probe_windows``
+    must find. Returns (phase u8[npg], weak pages, per-class agreement,
+    rotation of every launch); phase is None when a workgroup class does not
+    follow the domain formula or fewer than ``npass`` launches after the
+    warm-up run at the rotation ``launch_rotation`` reads from their hardware
+    queue.
     """
-    npg = buf.numel() * buf.element_size() // (2 << 20)
-    assert buf.data_ptr() % (2 << 20) == 0 and npg > 0
+    nbytes = buf.numel() * buf.element_size()
+    lo, hi = span or (buf.data_ptr(), buf.data_ptr() + nbytes)
+    wins = probe_windows(buf.data_ptr(), nbytes, lo, hi)
+    assert wins is not None and nbytes > 0
+    base, npg, win0, win1 = wins
     assert npass + 1 <= MAX_LAUNCHES
     dev = buf.device
     lat = torch.zeros(PROBERS * npg * NGRAN + PROBERS, dtype=torch.int32, device=dev)
@@ -168,7 +209,14 @@ def probe_phase(buf: torch.Tensor, npass: int = 4):
     for line in range(MAX_LAUNCHES):
         stream.wait_stream(current)
         _run_compiled(
-            _launch_probe, buf.data_ptr(), lat.data_ptr(), npg, line, fx.Stream(stream)
+            _launch_probe,
+            base,
+            lat.data_ptr(),
+            npg,
+            line,
+            win0,
+            win1,
+            fx.Stream(stream),
         )
         current.wait_stream(stream)
         h = lat.cpu().numpy()
@@ -197,4 +245,7 @@ def probe_phase(buf: torch.Tensor, npass: int = 4):
     agree = (est == phase[None, None, :]).mean((0, 2))
     if agree.min() < MIN_CLASS_AGREE:
         return None, weak, agree, rotations
+    # A window's a20 flips its granules' homes, which the votes read as phase.
+    phase[0] ^= (win0 >> 20) & 1
+    phase[-1] ^= (win1 >> 20) & 1 if npg > 1 else 0
     return phase, weak, agree, rotations

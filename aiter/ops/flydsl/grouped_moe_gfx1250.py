@@ -1844,21 +1844,20 @@ def grouped_gemm_gfx1250_a8w4(
             _tdm_kw["n_warp"] = _base_nw
             _tdm_kw["m_warp2"] = _ov_mw2 if _ov_mw2 is not None else _base_mw
             _tdm_kw["n_warp2"] = _ov_nw2 if _ov_nw2 is not None else _base_nw
-        # A W2 placed by moe_shuffle_weight_iod serves its layout tiling and the
-        # one with tile_n halved (four waves, 1 x 4); GEMM2 keeps the tuned
-        # tile_n2 when it is one of them, so every token count reads the local copy.
-        from .iod_locality import mode as iod_mode
+        # A weight placed by moe_shuffle_weight_iod is readable only by its
+        # layout tiling and the one with tile_n halved, four waves (1 x 4), no
+        # cluster, two waves per TDM tensor; each GEMM keeps the tuned tile_n
+        # when it is one of them.
+        from .iod_locality import pin_tile
 
-        if w2_scale is not None and iod_mode():
-            from .iod_locality import placed_tile
-
-            tile2 = placed_tile(w2, w2_scale)
-            if tile2 is not None:
-                ln, lk = tile2
-                if _tdm_kw.get("tile_n2") == ln // 2:
-                    ln, lk = ln // 2, lk * 2
-                _tdm_kw["tile_n2"], _tdm_kw["tile_k2"] = ln, lk
-                _tdm_kw["m_warp2"], _tdm_kw["n_warp2"] = 1, 4
+        for _w, _sfx in ((w1, ""), (w2, "2")):
+            _tile = pin_tile(_w, _tdm_kw.get(f"tile_n{_sfx}"))
+            if _tile is None:
+                continue
+            _tdm_kw[f"tile_n{_sfx}"], _tdm_kw[f"tile_k{_sfx}"] = _tile
+            _tdm_kw[f"m_warp{_sfx}"], _tdm_kw[f"n_warp{_sfx}"] = 1, 4
+            _tdm_kw[f"cluster_m{_sfx}"] = _tdm_kw[f"cluster_n{_sfx}"] = 1
+            _tdm_kw[f"waves_per_tensor_tdm{_sfx}"] = 2
         return _grouped_a8w4_tdm_moe(
             hidden_states,
             w1,

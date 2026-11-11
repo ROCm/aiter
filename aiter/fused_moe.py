@@ -1646,6 +1646,13 @@ def _fused_moe_impl(
 
     if grouped_a8w4_out is not None:
         return _return_output(grouped_a8w4_out, output)
+    from aiter.ops.flydsl.iod_locality import placed_tile
+
+    if placed_tile(w1) or placed_tile(w2):
+        raise ValueError(
+            "MoE weights placed by moe_shuffle_weight_iod are readable only by "
+            "the gfx1250 grouped MoE path, which this call does not take"
+        )
     if herd_topk and get_gfx() == "gfx1250":
         raise ValueError(
             "gfx1250 HERD needs the grouped MoE path (per_1x32 MXFP4 weights, "

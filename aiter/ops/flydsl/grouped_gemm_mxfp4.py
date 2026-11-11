@@ -252,30 +252,30 @@ def flydsl_grouped_gemm_a8w4_masked(
             (persistent_workers + cluster_n - 1) // cluster_n * cluster_n
         )
     waves_per_tensor_tdm = _select_num_waves_per_tensor_tdm(waves_per_tensor_tdm)
-    # AITER_MOE_LOC (GEMM1 / GEMM2 weights placed by moe_shuffle_weight_iod at
-    # load time, gfx1250 only): see iod_locality.mode.
-    from .iod_locality import mode as iod_mode
+    # A weight placed by moe_shuffle_weight_iod at load time (AITER_MOE_LOC,
+    # gfx1250 only) holds only the placed layout, so it is always read placed;
+    # iod_locality.mode picks the schedule.
+    from .iod_locality import lookup, mode as iod_mode
 
-    iod_loc = iod_mode()
-    b_placed = loc_sched = 0
-    placed = None
-    if (
-        iod_loc
-        and cluster_m == 1
-        and cluster_n == 1
-        and waves_per_tensor_tdm == 2
-        and m_warp * n_warp == 4
+    loc_phase, b_placed = lookup(w, w_scales, N, K, tile_n, tile_k)
+    loc_sched = 0
+    if loc_phase is not None:
+        if not (
+            cluster_m == 1
+            and cluster_n == 1
+            and waves_per_tensor_tdm == 2
+            and m_warp * n_warp == 4
+        ):
+            raise ValueError(
+                "an IOD-placed weight needs cluster 1 x 1, waves_per_tensor_tdm 2 "
+                f"and four waves, got cluster {cluster_m} x {cluster_n}, "
+                f"waves_per_tensor_tdm {waves_per_tensor_tdm}, waves {m_warp} x {n_warp}"
+            )
+        iod_loc = iod_mode()
         # The schedule is persistent, which the EP scatter serves only unquantized.
-        and not (stage2_scatter is not None and stage2_scatter.combine_quant_bits)
-    ):
-        from .iod_locality import lookup
-
-        placed, b_placed = lookup(w, w_scales, N, K, tile_n, tile_k)
-    if placed is None:
-        iod_loc = 0
-    if iod_loc:
-        w = w_scales = placed
-        if iod_loc in (1, 2):
+        if iod_loc in (1, 2) and not (
+            stage2_scatter is not None and stage2_scatter.combine_quant_bits
+        ):
             loc_sched = iod_loc
             # Four workers per CU: fewer leave the tail of the per-domain
             # task list on too few CUs (measured on 256 CUs: 512 -> 73 us,
@@ -373,6 +373,7 @@ def flydsl_grouped_gemm_a8w4_masked(
         float(situ_beta),
         float(situ_linear_beta),
         *layout_spec,
+        out.view(-1) if loc_phase is None else loc_phase,
         specialization_key=(
             gemm_spec,
             route_spec,

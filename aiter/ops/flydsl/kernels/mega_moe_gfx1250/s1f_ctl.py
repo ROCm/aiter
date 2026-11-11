@@ -77,6 +77,7 @@ def _s1f_xcc_queues(tile_m: int) -> int:
         return int(int(tile_m) <= _S1F_XCC_QUEUE_MAX_TILE_M)
     return int(mode)
 
+
 #: Placeholder reason for the one step that probes the GEMM1 configuration.
 _S1F_PROBING = "probing the GEMM1 configuration"
 # Decode steps have too little expert GEMM to hide the compact plan if the plan
@@ -663,19 +664,11 @@ class _Stage1Fusion:
         bufs = {**self.d._slot_bufs(step["slot"])}
         if stream is None:
             stream = torch.cuda.current_stream()
-        # AITER_MOE_LOC=1 with W1 placed by moe_shuffle_weight_iod at load
-        # time: the per-XCC queues hand each XCC its IOD's n-tiles.
-        placed = None
-        from aiter.ops.flydsl.iod_locality import enabled as iod_enabled
+        # A W1 placed by moe_shuffle_weight_iod at load time is read placed,
+        # the per-XCC queues handing each XCC its IOD's n-tiles.
+        from aiter.ops.flydsl.iod_locality import lookup
 
-        if iod_enabled():
-            from aiter.ops.flydsl.iod_locality import W13_TILE, lookup
-
-            placed, ratio = lookup(w, w_scales, N, K, *W13_TILE)
-            if ratio != 1:
-                placed = None
-        if placed is not None:
-            w = w_scales = placed
+        loc_phase, _ = lookup(w, w_scales, N, K, _S1F_TILE_N, _S1F_TILE_K)
 
         def launch_args(psum_t, send_t, runs_t, tsrc_t, n_tok):
             return (
@@ -685,6 +678,7 @@ class _Stage1Fusion:
                 a_scales.view(torch.int32),
                 w_scales.view(torch.int32),
                 quant_scale.view(torch.uint8),
+                quant_scale.view(torch.uint8) if loc_phase is None else loc_phase,
                 ptr_arg(psum_t),
                 self.d.res.arena.handle,
                 step["payload_ptr"],
@@ -704,7 +698,7 @@ class _Stage1Fusion:
         g1_opts = {
             "tdm_b_th": int(tdm_b_th),
             "tdm_as_in_prologue": int(bool(tdm_as_in_prologue)),
-            "iod_loc": int(placed is not None),
+            "iod_loc": int(loc_phase is not None),
         }
         pkey = (align_m, int(stage1_act), int(quant_wmma_rep), *g1_opts.values())
         if (
