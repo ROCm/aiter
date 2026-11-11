@@ -158,10 +158,12 @@ class PaDecodeQueryLoader:
 
     def _q_early(self):
         # MXFP4: Q ahead of the K/V bursts, so its staging does not wait for them
-        # (a padded row would read past the query).
+        # (a padded row would read past the query). gfx942 clamps padded rows
+        # to the last real one instead; staging zeroes them.
         return (
             self.traits.MTP4_FUSED
             or self.traits.DECODE_Q_EARLY
+            or self.traits.GFX942_Q_EARLY
             or (
                 (self.traits.kv_dtype == MXFP4_KV_DTYPE)
                 and self.traits.CTA_ROWS % MFMA_MNK == 0
@@ -796,14 +798,16 @@ class PaDecodeKVLoader:
             self.traits.sVScale_off, a, buf_off
         )
 
-    def load_k_chunk(self, phys, a):
+    def load_k_chunk(self, phys, a, qkhe_lo=0, qkhe_hi=None):
         # K token = warp*TOK_PER_WARP + a*MFMA_MNK + lane16, matching the
         # softmax mask and probability-word scatter.
         within_page_tok = (
             self.ctx.warp * self.traits.TOK_PER_WARP + a * MFMA_MNK + self.ctx.lane16
         ) % self.traits.block_size
         ops = []
-        for qkhe in range_constexpr(self.traits.QKHE_LOOP):
+        if qkhe_hi is None:
+            qkhe_hi = self.traits.QKHE_LOOP
+        for qkhe in range_constexpr(qkhe_lo, qkhe_hi):
             he_idx = qkhe * self.traits.RGROUP_QUARTERS + self.ctx.rgroup
             if const_expr(self.traits.kv_dtype == fx.BFloat16):
                 for qkr in range_constexpr(2):
@@ -995,6 +999,38 @@ class PaDecodeKVLoader:
             fx.rocdl.sched_vmem(len(flat) // 2)
 
         return fx.Vector.from_elements(flat, dtype=fx.Int64)
+
+    def warp_pages_raw(self, tt_i32):
+        """Issue the block-table load of this warp's pages of tile ``tt_i32``.
+
+        Returns them unpinned, so no wait is placed at the load;
+        ``pin_warp_pages`` applies the context bound where they are used.
+        """
+        first = (
+            tt_i32 * KV_COMPUTE_BLOCK // self.traits.block_size
+            + (self.ctx.warp * self.traits.TOK_PER_WARP) // self.traits.block_size
+        )
+        element_offset = self.ctx.seq * self.ctx.max_blocks_per_seq + first
+        if const_expr(self.traits.PAGES_PER_CHUNK == 1):
+            return first, fx.Vector.from_elements(
+                [fx.Int32(self.bt_scalar[element_offset])], dtype=fx.Int32
+            )
+        bt_copy_atom = fx.make_copy_atom(fx.rocdl.BufferCopy128b(), fx.Int32)
+        frag = fx.make_fragment_like(fx.slice(self.bt_buf, (0, None)))
+        fx.copy(bt_copy_atom, fx.slice(self.bt_buf, (element_offset, None)), frag)
+        return first, fx.Vector(fx.memref_load_vec(frag))
+
+    def pin_warp_pages(self, raw):
+        first, loaded = raw
+        return fx.Vector.from_elements(
+            [
+                (first + i < self.ctx.num_pages).select(
+                    fx.Int32(loaded[i]), fx.Int32(0)
+                )
+                for i in range_constexpr(self.traits.PAGES_PER_CHUNK)
+            ],
+            dtype=fx.Int32,
+        )
 
     def load_k(self, tt_i32):
         base_page = (
@@ -1200,9 +1236,21 @@ class PaDecodeKVLoader:
         if const_expr(self.traits.kv_dtype == MXFP4_KV_DTYPE):
             self.mxfp4_init()
             return self.mxfp4_prefetch("k")
-        k_pf0 = fx.full(self.traits.NCHUNK * self.traits.N_SUBCHUNKS, 0, fx.Int64)
+        if const_expr(self.traits.STREAM_KV):
+            # K streams within the tile; carry this warp's page ids instead.
+            k_pf0 = fx.full(self.traits.PAGES_PER_CHUNK, 0, fx.Int32)
+        else:
+            k_pf0 = fx.full(self.traits.NCHUNK * self.traits.N_SUBCHUNKS, 0, fx.Int64)
         if self.ctx.part_start < self.ctx.part_end:
-            if const_expr(self.traits.D256_PIPE and self.traits.per_token_kv):
+            if const_expr(self.traits.STREAM_KV):
+                k_pf0 = self.fetch_v_pages(self.ctx.part_start)
+                if const_expr(self.traits.per_token_kv):
+                    self.stage_scales(
+                        k_pf0,
+                        self.scale_buffer_offset(fx.Int32(self.ctx.part_start)),
+                        self.ctx.part_start,
+                    )
+            elif const_expr(self.traits.D256_PIPE and self.traits.per_token_kv):
                 # Put scales ahead of K on vmcnt, so waiting for their LDS
                 # writes does not also drain the first K prefetch.
                 phys_vec0 = self.fetch_v_pages(self.ctx.part_start)

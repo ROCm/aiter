@@ -72,14 +72,16 @@ class PaDecodeContext:
         self.warp = self.tid // WAVE  # 0..NWARP-1
         self.lane = self.tid - self.warp * WAVE  # 0..63
         self.seq = self.planned_seq
-        self.kv_query = fx.Int32(gpu.block_id("y"))
+        # A split-major grid puts (KV head, query split) on x, the slot on y.
+        qx, px = ("x", "y") if self.traits.SPLIT_MAJOR else ("y", "x")
+        self.kv_query = fx.Int32(gpu.block_id(qx))
         self.kv_h = self.kv_query // self.traits.query_splits
         self.query_begin = (
             self.kv_query % self.traits.query_splits
         ) * self.traits.QUERIES_PER_CTA
-        self.n_kv = fx.Int32(gpu.grid_dim.y) // self.traits.query_splits
-        self.part = fx.Int32(gpu.block_id("x"))
-        self.partial_slot = self.kv_h * fx.Int32(gpu.grid_dim.x) + self.part
+        self.n_kv = fx.Int32(getattr(gpu.grid_dim, qx)) // self.traits.query_splits
+        self.part = fx.Int32(gpu.block_id(px))
+        self.partial_slot = self.kv_h * fx.Int32(getattr(gpu.grid_dim, px)) + self.part
 
     def init_query_mapping(self):
         self.rgroup = (
