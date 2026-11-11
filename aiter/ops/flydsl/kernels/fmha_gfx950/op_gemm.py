@@ -81,7 +81,7 @@ class DualwaveFp8GemmHelper(DualwaveFp8KernelContext):
         return packs
 
     def _load_q_wide_global(self):
-        """Pull this lane's Q operands straight from global into VGPRs (head_dim > 128)."""
+        """Pull this lane's Q operands straight from global into VGPRs (head_dim > 128, or BN64)."""
         traits = self.traits
         d_base = self.lane_div_32 * 32
         packs = []

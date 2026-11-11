@@ -577,7 +577,8 @@ def _make_dualwave_swp_fp8_traits(
 
     splitk = num_kv_splits > 1
 
-    qlds = head_dim <= 128
+    # BN64 loads Q straight into VGPRs: dropping the Q stage lets 3 WGs share a CU.
+    qlds = head_dim <= 128 and body_variant != "conventional_bn64"
 
     lds_bytes = lds_kv_total_size * elem_bytes + vt_bf16_total * eb_bf
     if qlds:
@@ -1168,6 +1169,13 @@ class DualwaveFp8KernelContext:
         )
 
     def global_idx_q(self, token_idx, col):
+        if const_expr(self.traits.GQA_PACK_M):
+            # Packed row r reads token q_start + r // G at head q_head_idx + r % G.
+            return (
+                (self.q_tok_base + token_idx) * self.stride_q_n_v
+                + self.ctx_ref.q_head_row * self.traits.HEAD_DIM
+                + col
+            )
         return (
             (self.q_tok_base + token_idx) * self.stride_q_n_v
             + self.q_head_idx * self.traits.HEAD_DIM

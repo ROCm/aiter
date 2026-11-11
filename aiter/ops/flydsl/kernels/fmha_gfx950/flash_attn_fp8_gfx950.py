@@ -363,7 +363,7 @@ def build_flash_attn_dualwave_swp_fp8_module(
     @flyc.jit
     def _conventional_bn64_body(ctx):
         (
-            q_loader,
+            _q_loader,
             gemm_helper,
             softmax_helper,
             kv_gmem_to_lds,
@@ -376,12 +376,12 @@ def build_flash_attn_dualwave_swp_fp8_module(
         t_end = fx.Int64(ctx.split_t_end)
 
         kv_gmem_to_lds.load_block_table_to_lds()
-        q_loader.stage_q_to_lds()
         rocdl.s_waitcnt(vmcnt=0, lgkmcnt=0, expcnt=0)
         fx.gpu.barrier()
         page = kv_gmem_to_lds.end_page_ids(kv_gmem_to_lds.begin_page_ids([t0]))[0]
         kv_gmem_to_lds.load_k(t0 * BN, fx.Int32(0), page)
         kv_gmem_to_lds.load_v(t0 * BN, fx.Int32(0), page)
+        # Q comes straight from global (no LDS stage) so 3 WGs fit per CU.
         ctx.init_q_row()
         q_row = ctx.q_row
         q_wide = gemm_helper.load_q_wide()
@@ -431,15 +431,14 @@ def build_flash_attn_dualwave_swp_fp8_module(
             v_s = softmax_helper.sub_m(v_s, m_new)
             v_p = softmax_helper.exp2(v_s, 0)
             v_p = softmax_helper.exp2(v_p, 16)
-            v_p_fp32 = v_p
+            # Row sum before PV so P's fp32 copy dies before the V reads (3 waves/SIMD budget).
+            l_row = softmax_helper.reduce_sum(l_row, v_p)
             v_p = gemm_helper.cast_p_fp8_direct(v_p)
             v_v = kv_lds_to_regs.load_v(buf, j * BN if traits.V_SHUFFLED else None)
             if const_expr(not traits.V_SHUFFLED):
                 # Inline transpose reads are invisible to LLVM's wait insertion.
                 rocdl.s_waitcnt(lgkmcnt=0)
             v_o = gemm_helper.pv(v_p, v_v, v_o)
-            # Keep denominator arithmetic beyond the full-tile V branch for PV overlap.
-            l_row = softmax_helper.reduce_sum(l_row, v_p_fp32)
             loop_results = yield [m_new, l_row] + v_o
         m_row = loop_results[0]
         l_row = loop_results[1]
@@ -747,7 +746,10 @@ def build_flash_attn_dualwave_swp_fp8_module(
                 BlockTable,
                 block_table_stride,
                 value_attrs={
-                    "rocdl.waves_per_eu": 1,
+                    # BN64 fits 3 waves/SIMD (<=168 VGPR, 3 WGs of LDS per CU).
+                    "rocdl.waves_per_eu": (
+                        3 if traits.BODY_VARIANT == "conventional_bn64" else 1
+                    ),
                     "rocdl.flat_work_group_size": f"{BLOCK_SIZE},{BLOCK_SIZE}",
                     "passthrough": passthrough_entries,
                 },
