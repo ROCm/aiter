@@ -18,18 +18,13 @@ from aiter.test_common import benchmark, checkAllclose, run_perftest
 torch.set_default_device("cuda")
 
 SUPPORTED_GFX = ["gfx942", "gfx950"]
-NUM_HEADS = 12
-NUM_HEADS_KV = 1
-QK_HEAD_DIM = 576
-V_HEAD_DIM = 512
-PAGE_SIZE = 1
-DECODE_QLEN = 1
 
 # Pytorch reference, from FlyDSL tests/kernels/test_mla_decode.py
 
+
 def ref_attention(query, key, value, scale):
     """Single-sequence MLA attention (no causal mask needed for decode_qlen=1)."""
-  
+
     attn_weights = torch.einsum("qhd,khd->hqk", query.float(), key.float()) * scale
     lse = attn_weights.logsumexp(dim=-1)
     m = attn_weights.max(-1).values
@@ -38,13 +33,16 @@ def ref_attention(query, key, value, scale):
     out = torch.einsum("hqk,khd->qhd", attn_weights_exp.float(), value.float())
     out = out / denom.transpose(0, 1).unsqueeze(-1)
 
-    return out.to(torch.bfloat16), lse
+    return out, lse
 
 
-def run_torch(q, kv_cache, qo_indptr, kv_indptr, kv_indices, kv_last_page_lens, sm_scale, out, lse):
+def run_torch(
+    q, kv_cache, qo_indptr, kv_indptr, kv_indices, kv_last_page_lens, sm_scale, out, lse
+):
     """Pure-PyTorch paged MLA attention reference."""
 
     num_page, page_size, nhead_kv, _ = kv_cache.shape
+    v_head_dim = out.shape[-1]
     qs = torch.tensor_split(q, qo_indptr.tolist()[1:])
     kvc = torch.index_select(kv_cache, 0, kv_indices)
     kvs = torch.tensor_split(kvc, kv_indptr.tolist()[1:])
@@ -58,7 +56,7 @@ def run_torch(q, kv_cache, qo_indptr, kv_indptr, kv_indices, kv_last_page_lens, 
         kvc_i = kvs[i].flatten(0, 1)[:real_kv_seq_len]
         q_i = qs[i]
         k_i = kvc_i
-        v_i = kvc_i[:, :, :V_HEAD_DIM]
+        v_i = kvc_i[:, :, :v_head_dim]
         o_i, lse_i = ref_attention(q_i, k_i, v_i, sm_scale)
         os_list.append(o_i)
         lses.append(lse_i)
@@ -67,30 +65,45 @@ def run_torch(q, kv_cache, qo_indptr, kv_indptr, kv_indices, kv_last_page_lens, 
     lse[:] = torch.concat(lses, dim=1).transpose(0, 1)[:]
     return out, lse
 
-def run_torch_persistent(query,
-        kv_buffer,
-        kv_page_indices,
-        work_indptr,
-        work_info_set,
-        final_output,
-        split_output,
-        split_lse,
-        sm_scale):
+
+def run_torch_persistent(
+    query,
+    kv_buffer,
+    kv_page_indices,
+    work_indptr,
+    work_info_set,
+    kv_last_page_lens,
+    final_output,
+    split_output,
+    split_lse,
+    sm_scale,
+):
     """Execute the persistent-decode work list with run_torch, one work at a time.
 
     Unsplit works (partial_qo_loc < 0) write final_output[qo_start:qo_end];
     split works write split_output / split_lse rows [partial_qo_loc, partial_qo_loc + qo_len).
+    Only the work that ends its batch (kv_offset == 0) may have a partial last page.
     Returns the split slot indices that were written.
     """
     page_size = kv_buffer.shape[1]
     work_indptr_l = work_indptr.tolist()
     work_info_l = work_info_set.tolist()
+    last_page_lens_l = kv_last_page_lens.tolist()
     num_heads = query.shape[1]
 
     slots = []
     for cu in range(len(work_indptr_l) - 1):
         for work_idx in range(work_indptr_l[cu], work_indptr_l[cu + 1]):
-            _, partial_qo_loc, qo_start, qo_end, kv_start, kv_end, _, _ = work_info_l[work_idx]
+            (
+                batch_idx,
+                partial_qo_loc,
+                qo_start,
+                qo_end,
+                kv_start,
+                kv_end,
+                kv_offset,
+                _,
+            ) = work_info_l[work_idx]
             qo_len = qo_end - qo_start
             num_pages = kv_end - kv_start
             if qo_len <= 0 or num_pages <= 0:
@@ -98,7 +111,10 @@ def run_torch_persistent(query,
 
             qo_indptr = torch.tensor([0, qo_len], dtype=torch.int32)
             kv_indptr = torch.tensor([0, num_pages], dtype=torch.int32)
-            kv_last_page_lens = torch.tensor([page_size], dtype=torch.int32)
+            last_page_len = (
+                last_page_lens_l[batch_idx] if kv_offset == 0 else page_size
+            )
+            work_last_page_lens = torch.tensor([last_page_len], dtype=torch.int32)
 
             if partial_qo_loc < 0:
                 out = final_output[qo_start:qo_end]
@@ -114,7 +130,7 @@ def run_torch_persistent(query,
                 qo_indptr,
                 kv_indptr,
                 kv_page_indices[kv_start:kv_end],
-                kv_last_page_lens,
+                work_last_page_lens,
                 sm_scale,
                 out,
                 lse,
@@ -122,11 +138,31 @@ def run_torch_persistent(query,
 
     return torch.tensor(sorted(slots), dtype=torch.long)
 
-def get_mla_metadata_torch(qo_indptr, kv_indptr, kv_indices, num_cus, kv_granularity=16, max_split_per_batch=32):
-    """Minimal persistent-decode planner (page_size=1).
 
-    Splits each batch's KV range into equal, granularity-aligned chunks and
-    spreads the resulting works evenly over ``num_cus`` CUs.
+def merge_splits_torch(work_info_set, final_output, split_output, split_lse):
+    """LSE-combine split works into final_output[qo_start:qo_end]."""
+    groups = {}
+    for _, loc, qo_start, qo_end, *_ in work_info_set.tolist():
+        if loc >= 0:
+            groups.setdefault((qo_start, qo_end), []).append(loc)
+
+    for (qo_start, qo_end), locs in groups.items():
+        qo_len = qo_end - qo_start
+        o = torch.stack([split_output[loc : loc + qo_len, 0] for loc in locs])
+        lse = torch.stack([split_lse[loc : loc + qo_len, 0, :, 0] for loc in locs])
+        weights = torch.exp(lse - lse.logsumexp(dim=0)).unsqueeze(-1)
+        final_output[qo_start:qo_end] = (weights * o).sum(dim=0)
+    return final_output
+
+
+def get_mla_metadata_torch(
+    qo_indptr, kv_indptr, kv_indices, num_cus, kv_granularity=16, max_split_per_batch=32
+):
+    """Minimal persistent-decode planner.
+
+    KV ranges and ``kv_granularity`` are in pages. Splits each batch's KV range
+    into equal, granularity-aligned chunks and spreads the resulting works
+    evenly over ``num_cus`` CUs.
 
     Returns:
         kv_page_indices: [num_kv_pages] int32, indexed by work ``kv_start:kv_end``.
@@ -138,7 +174,9 @@ def get_mla_metadata_torch(qo_indptr, kv_indptr, kv_indices, num_cus, kv_granula
     qo_indptr_l = qo_indptr.tolist()
     kv_indptr_l = kv_indptr.tolist()
     batch_size = len(qo_indptr_l) - 1
-    splits_per_batch = min(max_split_per_batch, (num_cus + batch_size - 1) // batch_size)
+    splits_per_batch = min(
+        max_split_per_batch, (num_cus + batch_size - 1) // batch_size
+    )
 
     works = []
     partial_qo_loc = 0
@@ -156,7 +194,9 @@ def get_mla_metadata_torch(qo_indptr, kv_indptr, kv_indices, num_cus, kv_granula
             else:
                 loc = partial_qo_loc
                 partial_qo_loc += qo_end - qo_start
-            works.append([b, loc, qo_start, qo_end, kv_start, split_end, kv_end - split_end, 0])
+            works.append(
+                [b, loc, qo_start, qo_end, kv_start, split_end, kv_end - split_end, 0]
+            )
 
     work_info_set = torch.tensor(works, dtype=torch.int32)
     work_indptr = (torch.arange(num_cus + 1, dtype=torch.int32) * len(works)) // num_cus
@@ -164,18 +204,26 @@ def get_mla_metadata_torch(qo_indptr, kv_indptr, kv_indices, num_cus, kv_granula
     return kv_page_indices, work_indptr.to(torch.int32), work_info_set
 
 
-
-def _make_inputs(batch_size, ctx_len, decode_qlen, q_nhead, q_head_dim, kv_nhead, kv_head_dim, page_size, q_dtype, kv_dtype, out_dtype):
-    """Build Q, paged KV, and persistent-decode metadata.
-    """
-
-    kv_max_sz = 65536 * 32
-    num_page = (kv_max_sz + page_size - 1) // page_size
+def _make_inputs(
+    batch_size,
+    ctx_len,
+    decode_qlen,
+    q_nhead,
+    kv_nhead,
+    qkv_head_dim,
+    rope_dim,
+    page_size,
+    q_dtype,
+    kv_dtype,
+    out_dtype,
+):
+    """Build Q, paged KV, and persistent-decode metadata."""
 
     # -- Sequence metadata --
-    # seq_lens_kv = torch.full((batch_size,), ctx_len, dtype=torch.int)
-    kv_block_nums = torch.full((batch_size,), (ctx_len + page_size - 1) // page_size, dtype=torch.int)
-    kv_last_page_lens = torch.ones(batch_size, dtype=torch.int)
+    kv_block_nums = torch.full(
+        (batch_size,), (ctx_len + page_size - 1) // page_size, dtype=torch.int
+    )
+    kv_last_page_lens = torch.full((batch_size,), page_size, dtype=torch.int)
     if ctx_len % page_size != 0:
         kv_last_page_lens.fill_(ctx_len % page_size)
 
@@ -188,33 +236,47 @@ def _make_inputs(batch_size, ctx_len, decode_qlen, q_nhead, q_head_dim, kv_nhead
     qo_indptr = torch.zeros(batch_size + 1, dtype=torch.int)
     qo_indptr[1:] = torch.cumsum(seq_lens_qo, dim=0)
     total_q = qo_indptr[-1].item()
-    max_seqlen_qo = decode_qlen
 
     # -- KV buffer and Q --
-    kv_buffer = torch.randn((num_page, page_size, kv_nhead, QK_HEAD_DIM), dtype=torch.bfloat16)
+    qk_rope_dim = qkv_head_dim + rope_dim
+    kv_buffer = torch.randn(
+        (num_page, page_size, kv_nhead, qk_rope_dim), dtype=torch.bfloat16
+    )
     kv_buffer = kv_buffer.to(kv_dtype)
 
-    q = torch.randn((total_q, q_nhead, QK_HEAD_DIM), dtype=torch.bfloat16)
+    q = torch.randn((total_q, q_nhead, qk_rope_dim), dtype=torch.bfloat16)
     q = q.to(q_dtype)
 
-    sm_scale = 1.0 / (QK_HEAD_DIM**0.5)
+    sm_scale = 1.0 / (qk_rope_dim**0.5)
 
     num_cus = torch.cuda.get_device_properties(q.device).multi_processor_count
     kv_page_indices, work_indptr, work_info_set = get_mla_metadata_torch(
-        qo_indptr, kv_indptr, kv_indices, num_cus, kv_granularity=max(page_size, 16)
+        qo_indptr,
+        kv_indptr,
+        kv_indices,
+        num_cus,
+        kv_granularity=max(1, 16 // page_size),
     )
 
     num_partial_slots = max(1, int((work_info_set[:, 1] >= 0).sum()) * decode_qlen)
-    final_output = torch.empty((total_q, q_nhead, V_HEAD_DIM), dtype=out_dtype)
-    split_output = torch.empty((num_partial_slots, 1, q_nhead, V_HEAD_DIM), dtype=torch.float32)
-    split_lse = torch.empty((num_partial_slots, 1, q_nhead, 1), dtype=torch.float32)
+    # Zero-filled so rows a work list leaves untouched compare equal.
+    final_output = torch.zeros((total_q, q_nhead, qkv_head_dim), dtype=out_dtype)
+    split_output = torch.zeros(
+        (num_partial_slots, 1, q_nhead, qkv_head_dim), dtype=torch.float32
+    )
+    split_lse = torch.zeros((num_partial_slots, 1, q_nhead, 1), dtype=torch.float32)
 
     return (
         q,
         kv_buffer,
+        qo_indptr,
+        kv_indptr,
+        kv_indices,
+        kv_last_page_lens,
         kv_page_indices,
         work_indptr,
         work_info_set,
+        sm_scale,
         final_output,
         split_output,
         split_lse,
@@ -222,7 +284,19 @@ def _make_inputs(batch_size, ctx_len, decode_qlen, q_nhead, q_head_dim, kv_nhead
 
 
 @benchmark()
-def test_mla_fwd_decode(batch=1, context_len=64):
+def test_mla_fwd_decode(
+        batch_size,
+        context_len,
+        decode_qlen,
+        q_nhead,
+        kv_nhead,
+        qkv_head_dim,
+        rope_dim,
+        page_size,
+        q_dtype,
+        kv_dtype,
+        out_dtype,
+    ):
     if not torch.cuda.is_available():
         pytest.skip("ROCm is not available")
     if get_gfx() not in SUPPORTED_GFX:
@@ -231,15 +305,31 @@ def test_mla_fwd_decode(batch=1, context_len=64):
     (
         query,
         kv_buffer,
+        qo_indptr,
+        kv_indptr,
+        kv_indices,
+        kv_last_page_lens,
         kv_page_indices,
         work_indptr,
         work_info_set,
+        sm_scale,
         final_output,
         split_output,
         split_lse,
-    ) = _make_inputs(batch, context_len)
+    ) = _make_inputs(
+        batch_size,
+        context_len,
+        decode_qlen,
+        q_nhead,
+        kv_nhead,
+        qkv_head_dim,
+        rope_dim,
+        page_size,
+        q_dtype,
+        kv_dtype,
+        out_dtype,
+    )
 
-    sm_scale = 1.0 / (QK_HEAD_DIM**0.5)
     ref_final_output = final_output.clone()
     ref_split_output = split_output.clone()
     ref_split_lse = split_lse.clone()
@@ -249,10 +339,37 @@ def test_mla_fwd_decode(batch=1, context_len=64):
         kv_page_indices,
         work_indptr,
         work_info_set,
+        kv_last_page_lens,
         ref_final_output,
         ref_split_output,
         ref_split_lse,
         sm_scale,
+    )
+
+    # Sanity-check the work-list reference against whole-sequence attention.
+    full_output = torch.empty(final_output.shape, dtype=torch.float32)
+    full_lse = torch.empty((query.shape[0], q_nhead), dtype=torch.float32)
+    run_torch(
+        query,
+        kv_buffer,
+        qo_indptr,
+        kv_indptr,
+        kv_indices,
+        kv_last_page_lens,
+        sm_scale,
+        full_output,
+        full_lse,
+    )
+    merged_output = merge_splits_torch(
+        work_info_set,
+        ref_final_output.float(),
+        ref_split_output,
+        ref_split_lse,
+    )
+    checkAllclose(
+        full_output,
+        merged_output,
+        msg="torch: work-list reference vs whole-sequence attention",
     )
 
     props = torch.cuda.get_device_properties(query.device)
@@ -260,9 +377,21 @@ def test_mla_fwd_decode(batch=1, context_len=64):
     if lds_size is None:
         lds_size = props.shared_memory_per_block
 
-
-    candidates = {"torch": run_torch}
-    flops = 2 * batch * NUM_HEADS * context_len * (QK_HEAD_DIM + V_HEAD_DIM)
+    candidates = {
+        "torch": lambda: run_torch_persistent(
+            query,
+            kv_buffer,
+            kv_page_indices,
+            work_indptr,
+            work_info_set,
+            kv_last_page_lens,
+            final_output,
+            split_output,
+            split_lse,
+            sm_scale,
+        ),
+    }
+    flops = 2 * batch_size * q_nhead * context_len * (2 * qkv_head_dim + rope_dim)
     nbytes = sum(
         tensor.numel() * tensor.element_size()
         for tensor in (query, kv_buffer, split_output[slots], split_lse[slots])
@@ -270,17 +399,22 @@ def test_mla_fwd_decode(batch=1, context_len=64):
 
     ret = {"gfx": get_gfx()}
     for name, candidate in candidates.items():
-        (out, lse), us = run_perftest(candidate)
+        _, us = run_perftest(candidate)
+        final_err = checkAllclose(
+            ref_final_output,
+            final_output,
+            msg=f"{name}: MLA decode final output",
+        )
         output_err = checkAllclose(
             ref_split_output,
-            out,
+            split_output,
             atol=1e-3,
             rtol=1e-3,
             msg=f"{name}: MLA decode split output",
         )
         lse_err = checkAllclose(
             ref_split_lse,
-            lse,
+            split_lse,
             atol=1e-3,
             rtol=1e-3,
             msg=f"{name}: MLA decode split LSE",
@@ -288,9 +422,8 @@ def test_mla_fwd_decode(batch=1, context_len=64):
         ret[f"{name} us"] = us
         ret[f"{name} TFLOPS"] = flops / us / 1e6
         ret[f"{name} TB/s"] = nbytes / us / 1e6
-        ret[f"{name} err"] = max(output_err, lse_err)
+        ret[f"{name} err"] = max(final_err, output_err, lse_err)
     return ret
-
 
 
 def main():
@@ -318,15 +451,108 @@ def main():
         default=[64],
         help="KV context lengths. Example: -s 64 2048",
     )
+    parser.add_argument(
+        "-q",
+        "--decode-qlen",
+        type=int,
+        nargs="*",
+        default=[1],
+        help="Decode query lengths. Example: -q 1 2",
+    )
+    parser.add_argument(
+        "-n",
+        "--num-heads",
+        type=int,
+        nargs="*",
+        default=[12],
+        help="Numbers of query heads. Example: -n 12 16",
+    )
+    parser.add_argument(
+        "-nk",
+        "--num-heads-kv",
+        type=int,
+        nargs="*",
+        default=[1],
+        help="Numbers of KV heads. Example: -nk 1",
+    )
+    parser.add_argument(
+        "-rd",
+        "--rope-dim",
+        type=int,
+        nargs="*",
+        default=[64],
+        help="RoPE dimensions. Example: -rd 64",
+    )
+    parser.add_argument(
+        "-qkv",
+        "--qkv-head-dim",
+        type=int,
+        nargs="*",
+        default=[512],
+        help="QKV head dimensions (nope, i.e. LoRA dim). Example: -qkv 512",
+    )
+    parser.add_argument(
+        "-p",
+        "--page-size",
+        type=int,
+        nargs="*",
+        default=[1],
+        help="KV page sizes. Example: -p 1 16",
+    )
+    parser.add_argument(
+        "-kvd",
+        "--kv-dtype",
+        type=dtypes.str2Dtype,
+        choices=[dtypes.bf16, dtypes.fp8],
+        nargs="*",
+        default=[dtypes.bf16],
+        metavar="{bf16,fp8}",
+        help="KV cache dtypes. Example: -kvd bf16 fp8",
+    )
 
     args = parser.parse_args()
 
     rows = []
-    for batch, context_len in itertools.product(args.batch, args.context_len):
+    for (
+        batch,
+        context_len,
+        decode_qlen,
+        num_heads,
+        num_heads_kv,
+        qkv_head_dim,
+        rope_dim,
+        page_size,
+        kv_dtype,
+    ) in itertools.product(
+        args.batch,
+        args.context_len,
+        args.decode_qlen,
+        args.num_heads,
+        args.num_heads_kv,
+        args.qkv_head_dim,
+        args.rope_dim,
+        args.page_size,
+        args.kv_dtype,
+    ):
         try:
-            rows.append(test_mla_fwd_decode(batch, context_len))
+            rows.append(
+                test_mla_fwd_decode(
+                    batch,
+                    context_len,
+                    decode_qlen,
+                    num_heads,
+                    num_heads_kv,
+                    qkv_head_dim,
+                    rope_dim,
+                    page_size,
+                    dtypes.bf16,
+                    kv_dtype,
+                    dtypes.bf16,
+                )
+            )
         except pytest.skip.Exception as e:
             aiter.logger.warning("Skipped: %s", e)
+
     if not rows:
         return
     df = pd.DataFrame(rows)
