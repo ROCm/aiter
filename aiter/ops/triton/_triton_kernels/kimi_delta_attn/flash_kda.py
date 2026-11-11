@@ -110,8 +110,8 @@ DEVICE_ARCH = arch_info.get_arch()
 # gfx1250 and its A0 variant gfx1250-strict share the TDM / scan-prefetch path
 # (arch_info.is_tdm_avail() already includes both).
 _IS_GFX1250_FAMILY = DEVICE_ARCH in ("gfx1250", "gfx1250-strict")
-_GLUON_ARCH_OK: bool = DEVICE_ARCH in ("gfx950", "gfx1250")
-_GLUON_K2C_ARCH_OK: bool = DEVICE_ARCH in ("gfx950", "gfx1250")
+_GLUON_ARCH_OK: bool = DEVICE_ARCH in ("gfx950", "gfx1250", "gfx1250-strict")
+_GLUON_K2C_ARCH_OK: bool = DEVICE_ARCH in ("gfx950", "gfx1250", "gfx1250-strict")
 _SCAN_PREFETCH: bool = AITER_FDA_SCAN_PREFETCH and _IS_GFX1250_FAMILY
 
 _LOGGED_ROUTES: set = set()
