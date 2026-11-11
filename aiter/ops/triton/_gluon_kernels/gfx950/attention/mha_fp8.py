@@ -68,17 +68,19 @@ def async_load_k(
             k_offs,
             mask=(k_offs_n < seqlen_k - start_n)[None, :],
         )
-        cdna4_async.buffer_load_to_shared(
-            k_pe_buffer.index(write_idx % 2),
-            k_ptr,
-            k_pe_offs,
-            mask=(k_pe_offs_n < seqlen_k - start_n)[None, :],
-        )
+        if k_pe_buffer is not None:
+            cdna4_async.buffer_load_to_shared(
+                k_pe_buffer.index(write_idx % 2),
+                k_ptr,
+                k_pe_offs,
+                mask=(k_pe_offs_n < seqlen_k - start_n)[None, :],
+            )
     else:
         cdna4_async.buffer_load_to_shared(k_buffer.index(write_idx % 2), k_ptr, k_offs)
-        cdna4_async.buffer_load_to_shared(
-            k_pe_buffer.index(write_idx % 2), k_ptr, k_pe_offs
-        )
+        if k_pe_buffer is not None:
+            cdna4_async.buffer_load_to_shared(
+                k_pe_buffer.index(write_idx % 2), k_ptr, k_pe_offs
+            )
     cdna4_async.commit_group()
 
 
@@ -108,10 +110,8 @@ def async_load_v(
 
 
 @gluon.jit
-def local_load_k(k_buffer, k_pe_buffer, read_idx, layout):
-    k = cdna4_async.load_shared_relaxed(k_buffer.index(read_idx % 2), layout)
-    k_pe = cdna4_async.load_shared_relaxed(k_pe_buffer.index(read_idx % 2), layout)
-    return k, k_pe
+def local_load_k(k_buffer, read_idx, layout):
+    return cdna4_async.load_shared_relaxed(k_buffer.index(read_idx % 2), layout)
 
 
 @gluon.jit
@@ -161,18 +161,17 @@ def attn_fwd_tile(
     MASK: gl.constexpr,
 ):
     qk = gl.zeros([BLOCK_M, BLOCK_N], dtype=gl.float32, layout=MFMA_LAYOUT)
-    qk = gl.amd.cdna4.mfma_scaled(q_pe, None, "e4m3", k_pe, None, "e4m3", qk)
+    if q_pe is not None:
+        qk = gl.amd.cdna4.mfma_scaled(q_pe, None, "e4m3", k_pe, None, "e4m3", qk)
     qk = gl.amd.cdna4.mfma_scaled(q, None, "e4m3", k, None, "e4m3", qk)
     if MASK:
         qk = apply_mask(
             qk, start_n, offs_m, seqlen_k, causal_offset, BLOCK_N, MFMA_LAYOUT, CAUSAL
         )
     m_ij = fast_maximum(m_i, gl.reduce(qk, 1, fast_maximum) * qk_scale)
-    # A row with no visible key yet keeps m_ij = -inf; shift it by 0 so p and alpha are 0, not NaN.
-    m_shift = gl.where(m_ij == float("-inf"), 0.0, m_ij)
-    qk_shifted = gl.fma(qk, qk_scale, -(m_shift - LOG2_FP8_MAX)[:, None])
+    qk_shifted = gl.fma(qk, qk_scale, -(m_ij - LOG2_FP8_MAX)[:, None])
     p = gl.exp2(qk_shifted)
-    alpha = gl.exp2(m_i - m_shift)
+    alpha = gl.exp2(m_i - m_ij)
     l_ij = gl.sum(p, 1)
     l_i = gl.fma(l_i, alpha, l_ij)
     acc = acc * alpha[:, None]
@@ -256,7 +255,10 @@ def attn_fwd_inner(
             v_buffer, v_ptr, v_offs, v_offs_n, i + 1, next_n, seqlen_k, stride_v_n, MASK
         )
         cdna4_async.wait_group(2)
-        k, k_pe = local_load_k(k_buffer, k_pe_buffer, i, DOT_LAYOUT_K)
+        k = local_load_k(k_buffer, i, DOT_LAYOUT_K)
+        k_pe = None
+        if k_pe_buffer is not None:
+            k_pe = local_load_k(k_pe_buffer, i, DOT_LAYOUT_K)
         v = local_load_v(v_buffer, i, DOT_LAYOUT_V)
         acc, l_i, m_i = attn_fwd_tile(
             acc,
@@ -351,14 +353,8 @@ def _mha_varlen_fwd_fp8(
     DOT_LAYOUT_V: gl.constexpr = gl.DotOperandLayout(1, MFMA_LAYOUT, k_width=4)
 
     LOAD_LAYOUT_Q: gl.constexpr = _make_load_layout(HEAD_DIM_NOPE, 16, num_warps, False)
-    LOAD_LAYOUT_Q_PE: gl.constexpr = _make_load_layout(
-        HEAD_DIM_PE, 16, num_warps, False
-    )
     ASYNC_LAYOUT_K: gl.constexpr = _kv_async_copy_layouts(
         HEAD_DIM_NOPE, BLOCK_N, num_warps, 8, 16
-    )[0]
-    ASYNC_LAYOUT_K_PE: gl.constexpr = _kv_async_copy_layouts(
-        HEAD_DIM_PE, BLOCK_N, num_warps, 8, 16
     )[0]
     ASYNC_LAYOUT_V: gl.constexpr = _kv_async_copy_layouts(
         HEAD_DIM_V, BLOCK_N, num_warps, 8, 16
@@ -366,9 +362,6 @@ def _mha_varlen_fwd_fp8(
     STORE_LAYOUT_O: gl.constexpr = _make_load_layout(HEAD_DIM_V, 8, num_warps, False)
 
     SHARED_LAYOUT_K: gl.constexpr = _make_kv_shared_layouts(HEAD_DIM_NOPE, BLOCK_N, 8)[
-        0
-    ]
-    SHARED_LAYOUT_K_PE: gl.constexpr = _make_kv_shared_layouts(HEAD_DIM_PE, BLOCK_N, 8)[
         0
     ]
     SHARED_LAYOUT_V: gl.constexpr = _make_kv_shared_layouts(HEAD_DIM_V, BLOCK_N, 8)[1]
@@ -424,35 +417,49 @@ def _mha_varlen_fwd_fp8(
         other=0.0,
     )
     q = gl.convert_layout(q, layout=DOT_LAYOUT_Q)
-    offs_q_pe_m = gl.arange(0, BLOCK_M, layout=gl.SliceLayout(1, LOAD_LAYOUT_Q_PE))
-    offs_q_pe_d = HEAD_DIM_NOPE + gl.arange(
-        0, HEAD_DIM_PE, layout=gl.SliceLayout(0, LOAD_LAYOUT_Q_PE)
-    )
-    q_pe = gl.amd.cdna4.buffer_load(
-        ptr=q_ptr,
-        offsets=offs_q_pe_m[:, None] * stride_q_m + offs_q_pe_d[None, :],
-        mask=((pid_m * BLOCK_M + offs_q_pe_m) < seqlen_q)[:, None],
-        other=0.0,
-    )
-    q_pe = gl.convert_layout(q_pe, layout=DOT_LAYOUT_Q)
+    q_pe = None
+    k_pe_offs = None
+    k_pe_offs_n = None
+    k_pe_buffer = None
+    if HEAD_DIM_PE > 0:
+        LOAD_LAYOUT_Q_PE: gl.constexpr = _make_load_layout(
+            HEAD_DIM_PE, 16, num_warps, False
+        )
+        ASYNC_LAYOUT_K_PE: gl.constexpr = _kv_async_copy_layouts(
+            HEAD_DIM_PE, BLOCK_N, num_warps, 8, 16
+        )[0]
+        SHARED_LAYOUT_K_PE: gl.constexpr = _make_kv_shared_layouts(
+            HEAD_DIM_PE, BLOCK_N, 8
+        )[0]
+        offs_q_pe_m = gl.arange(0, BLOCK_M, layout=gl.SliceLayout(1, LOAD_LAYOUT_Q_PE))
+        offs_q_pe_d = HEAD_DIM_NOPE + gl.arange(
+            0, HEAD_DIM_PE, layout=gl.SliceLayout(0, LOAD_LAYOUT_Q_PE)
+        )
+        q_pe = gl.amd.cdna4.buffer_load(
+            ptr=q_ptr,
+            offsets=offs_q_pe_m[:, None] * stride_q_m + offs_q_pe_d[None, :],
+            mask=((pid_m * BLOCK_M + offs_q_pe_m) < seqlen_q)[:, None],
+            other=0.0,
+        )
+        q_pe = gl.convert_layout(q_pe, layout=DOT_LAYOUT_Q)
+        k_pe_offs_d = HEAD_DIM_NOPE + gl.arange(
+            0, HEAD_DIM_PE, layout=gl.SliceLayout(1, ASYNC_LAYOUT_K_PE)
+        )
+        k_pe_offs_n = gl.arange(0, BLOCK_N, layout=gl.SliceLayout(0, ASYNC_LAYOUT_K_PE))
+        k_pe_offs = k_pe_offs_d[:, None] + k_pe_offs_n[None, :] * stride_k_n
+        k_pe_buffer = gl.allocate_shared_memory(
+            k_ptr.dtype.element_ty, [2, HEAD_DIM_PE, BLOCK_N], SHARED_LAYOUT_K_PE
+        )
 
     k_offs_d = gl.arange(0, HEAD_DIM_NOPE, layout=gl.SliceLayout(1, ASYNC_LAYOUT_K))
     k_offs_n = gl.arange(0, BLOCK_N, layout=gl.SliceLayout(0, ASYNC_LAYOUT_K))
     k_offs = k_offs_d[:, None] + k_offs_n[None, :] * stride_k_n
-    k_pe_offs_d = HEAD_DIM_NOPE + gl.arange(
-        0, HEAD_DIM_PE, layout=gl.SliceLayout(1, ASYNC_LAYOUT_K_PE)
-    )
-    k_pe_offs_n = gl.arange(0, BLOCK_N, layout=gl.SliceLayout(0, ASYNC_LAYOUT_K_PE))
-    k_pe_offs = k_pe_offs_d[:, None] + k_pe_offs_n[None, :] * stride_k_n
     v_offs_n = gl.arange(0, BLOCK_N, layout=gl.SliceLayout(1, ASYNC_LAYOUT_V))
     v_offs_d = gl.arange(0, HEAD_DIM_V, layout=gl.SliceLayout(0, ASYNC_LAYOUT_V))
     v_offs = v_offs_n[:, None] * stride_v_n + v_offs_d[None, :]
 
     k_buffer = gl.allocate_shared_memory(
         k_ptr.dtype.element_ty, [2, HEAD_DIM_NOPE, BLOCK_N], SHARED_LAYOUT_K
-    )
-    k_pe_buffer = gl.allocate_shared_memory(
-        k_ptr.dtype.element_ty, [2, HEAD_DIM_PE, BLOCK_N], SHARED_LAYOUT_K_PE
     )
     v_buffer = gl.allocate_shared_memory(
         v_ptr.dtype.element_ty, [2, BLOCK_N, HEAD_DIM_V], SHARED_LAYOUT_V
@@ -461,7 +468,7 @@ def _mha_varlen_fwd_fp8(
     acc = gl.zeros((BLOCK_M, HEAD_DIM_V), dtype=gl.float32, layout=MFMA_LAYOUT)
     m_i = gl.full(
         [BLOCK_M],
-        float("-inf"),
+        -1e30,
         dtype=gl.float32,
         layout=gl.SliceLayout(1, MFMA_LAYOUT),
     )

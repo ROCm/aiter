@@ -257,6 +257,8 @@ def mha_varlen_fwd(
     Returns:
         out [Tq, H, d_v] bfloat16, and with ``return_lse`` also lse [H, Tq] float32 (natural log,
         -inf for a row that sees no key).
+
+    Limits: gfx950 only. d_v must be 128. d_qk - d_v, the rope part, must be 0 or 64.
     """
     arch = get_arch()
     assert arch == "gfx950", f"mha_varlen_fwd is only supported on gfx950, got {arch}"
@@ -264,10 +266,10 @@ def mha_varlen_fwd(
     Tq, H, DQK = q.shape
     DV = v.shape[-1]
     D_PE = DQK - DV
-    assert (DV, D_PE) == (
-        128,
+    assert DV == 128 and D_PE in (
+        0,
         64,
-    ), f"needs d_v 128 and d_qk - d_v 64, got d_qk {DQK}, d_v {DV}"
+    ), f"needs d_v 128 and d_qk - d_v 0 or 64, got d_qk {DQK}, d_v {DV}"
     Tk = k.shape[0]
     assert k.shape == (
         Tk,

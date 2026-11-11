@@ -16,7 +16,7 @@ op_tests/triton_tests/attention/test_lse_merge.py	10
 op_tests/triton_tests/attention/test_mha.py	924
 op_tests/triton_tests/attention/test_mha_dao_ai.py	55
 op_tests/triton_tests/attention/test_mha_fp8.py	53
-op_tests/triton_tests/attention/test_mha_fp8_gfx1250.py	1
+op_tests/triton_tests/attention/test_mha_fp8_e2e.py	1
 op_tests/triton_tests/attention/test_mha_mxfp8.py	1
 op_tests/triton_tests/attention/test_mha_spatial_swizzle.py	76
 op_tests/triton_tests/attention/test_mha_v3.py	321
