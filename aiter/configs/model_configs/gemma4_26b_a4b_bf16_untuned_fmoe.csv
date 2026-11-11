@@ -14,6 +14,7 @@ token,model_dim,inter_dim,expert,topk,act_type,dtype,q_dtype_a,q_dtype_w,q_type,
 4096,2816,768,128,8,ActivationType.GeluTanh,torch.bfloat16,torch.bfloat16,torch.bfloat16,QuantType.No,1,0
 8192,2816,768,128,8,ActivationType.GeluTanh,torch.bfloat16,torch.bfloat16,torch.bfloat16,QuantType.No,1,0
 16384,2816,768,128,8,ActivationType.GeluTanh,torch.bfloat16,torch.bfloat16,torch.bfloat16,QuantType.No,1,0
+32768,2816,768,128,8,ActivationType.GeluTanh,torch.bfloat16,torch.bfloat16,torch.bfloat16,QuantType.No,1,0
 1,2816,768,64,8,ActivationType.GeluTanh,torch.bfloat16,torch.bfloat16,torch.bfloat16,QuantType.No,1,0
 2,2816,768,64,8,ActivationType.GeluTanh,torch.bfloat16,torch.bfloat16,torch.bfloat16,QuantType.No,1,0
 4,2816,768,64,8,ActivationType.GeluTanh,torch.bfloat16,torch.bfloat16,torch.bfloat16,QuantType.No,1,0
@@ -29,3 +30,4 @@ token,model_dim,inter_dim,expert,topk,act_type,dtype,q_dtype_a,q_dtype_w,q_type,
 4096,2816,768,64,8,ActivationType.GeluTanh,torch.bfloat16,torch.bfloat16,torch.bfloat16,QuantType.No,1,0
 8192,2816,768,64,8,ActivationType.GeluTanh,torch.bfloat16,torch.bfloat16,torch.bfloat16,QuantType.No,1,0
 16384,2816,768,64,8,ActivationType.GeluTanh,torch.bfloat16,torch.bfloat16,torch.bfloat16,QuantType.No,1,0
+32768,2816,768,64,8,ActivationType.GeluTanh,torch.bfloat16,torch.bfloat16,torch.bfloat16,QuantType.No,1,0
