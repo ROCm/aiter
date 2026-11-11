@@ -3106,31 +3106,51 @@ __global__ void fused_qk_rope_concat_and_cache_mla_seg_kernel(
                                   static_cast<int>((HPT - 1) * q_pe_stride_1) + PE_DIM,
                                   pe_chunk, pe_lane);
 
+        // One descriptor over the HPT heads, the head picked by soffset. Each
+        // head needs its own soffset SGPR: a buffer op that reuses an address
+        // register of an in-flight one waits (s_wait_xcnt) for its address
+        // translation, which serializes the cold loads behind TLB misses.
         in_vec_t nope_in[HPT];
-#pragma unroll
-        for(int k = 0; k < HPT; ++k)
         {
-            const int h = head_base + k;
             auto in_buf = opus::make_gmem<scalar_t>(
-                q_nope + token_idx * q_nope_stride_0 + h * q_nope_stride_1,
-                KV_LORA * sizeof(scalar_t));
-            nope_in[k] = in_buf.template load<VEC>(threadIdx.x * VEC);
+                q_nope + token_idx * q_nope_stride_0 + head_base * q_nope_stride_1,
+                (static_cast<int>((HPT - 1) * q_nope_stride_1) + KV_LORA) * sizeof(scalar_t));
+            int soff[HPT];
+#pragma unroll
+            for(int k = 0; k < HPT; ++k)
+            {
+                soff[k] = static_cast<int>(k * q_nope_stride_1 * sizeof(scalar_t));
+#if defined(__HIP_DEVICE_COMPILE__)
+                if(k > 0)
+                    asm volatile("" : "+s"(soff[k]));
+#endif
+            }
+#pragma unroll
+            for(int k = 0; k < HPT; ++k)
+                nope_in[k] = in_buf.template _load<VEC>(
+                    static_cast<int>(threadIdx.x * VEC * sizeof(scalar_t)), soff[k]);
+#if defined(__HIP_DEVICE_COMPILE__)
+#pragma unroll
+            for(int k = 1; k < HPT; ++k)
+                asm volatile("" ::"s"(soff[k]));
+#endif
         }
         // A padded token (HPT > 1 returned up front) is dropped the same way,
         // by an out-of-bounds offset: a return here is a branch the compiler
         // may sink the nope load past, which ATT showed it doing.
         const bool q_live =
             !LAT || slot_idx >= 0 || compute_all_q_rope; // uniform over the block
-#pragma unroll
-        for(int k = 0; k < HPT; ++k)
         {
-            const int h        = head_base + k;
-            query_t* q_out_row =
-                q_out + token_idx * q_out_stride_0 + h * q_out_stride_1 + NOPE_OFF;
-            auto out_buf = opus::make_gmem<query_t>(q_out_row, KV_LORA * sizeof(query_t));
-            out_buf.template store<VEC, q_vec_t>(
-                cvt_vec(nope_in[k], inv_qscale, q_out),
-                q_live ? static_cast<int>(threadIdx.x) * VEC : KV_LORA);
+            const int extent = static_cast<int>((HPT - 1) * q_out_stride_1) + KV_LORA;
+            auto out_buf     = opus::make_gmem<query_t>(
+                q_out + token_idx * q_out_stride_0 + head_base * q_out_stride_1 + NOPE_OFF,
+                extent * sizeof(query_t));
+#pragma unroll
+            for(int k = 0; k < HPT; ++k)
+                out_buf.template store<VEC, q_vec_t>(
+                    cvt_vec(nope_in[k], inv_qscale, q_out),
+                    q_live ? static_cast<int>(threadIdx.x) * VEC : extent,
+                    static_cast<int>(k * q_out_stride_1));
         }
         if(wave_pe)
             rope_pe_emit(pe_op,
