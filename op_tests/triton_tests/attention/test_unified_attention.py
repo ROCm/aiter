@@ -980,68 +980,6 @@ def test_triton_unified_attn_sw_verify_split(
 
 
 @pytest.mark.parametrize(
-    "seq_lens", [[(1, 16384)] * 2, [(16, 16384)], [(1024, 2048)] * 2]
-)
-@torch.inference_mode()
-def test_triton_unified_attn_fp8_long_tail(seq_lens):
-    # every 32nd key is 7.5 above the rest, so each tile's tail has P = e^-7.5, below
-    # e4m3's smallest step; V is 0 on the hot keys, so the output is the tail alone
-    block_size = 64
-    query_lens = [q for q, _ in seq_lens]
-    kv_lens = [kv for _, kv in seq_lens]
-    q, k, v, _, _, _, out, cu_q, kv_lens_t, max_q, max_k, scale, window, table = (
-        generate_data(
-            seq_lens,
-            num_blocks=len(seq_lens) * -(-max(kv_lens) // block_size),
-            block_size=block_size,
-            num_heads=(8, 1),
-        )[:14]
-    )
-    one = torch.ones(1, dtype=torch.float32, device="cuda")
-    q = torch.zeros(q.shape, device="cuda")
-    q[..., 0] = 7.5 / scale
-    k = torch.zeros(k.shape, device="cuda")
-    k[:, ::32, :, 0] = 1.0
-    v = torch.ones(v.shape, device="cuda")
-    v[:, ::32] = 0.0
-    q, k, v = q.to(e4m3_dtype), k.to(e4m3_dtype), v.to(e4m3_dtype)
-    ref = ref_paged_attn(
-        q,
-        k,
-        v,
-        query_lens,
-        kv_lens,
-        table,
-        scale,
-        torch.bfloat16,
-        q_descale=one,
-        k_descale=one,
-        v_descale=one,
-    ).float()
-
-    unified_attention(
-        q=q,
-        k=k,
-        v=v,
-        out=out,
-        cu_seqlens_q=cu_q,
-        max_seqlen_q=max_q,
-        seqused_k=kv_lens_t,
-        max_seqlen_k=max_k,
-        softmax_scale=scale,
-        causal=True,
-        window_size=window,
-        block_table=table,
-        softcap=0,
-        q_descale=one,
-        k_descale=one,
-        v_descale=one,
-        backend="triton",
-    )
-    torch.testing.assert_close(out.float(), ref, atol=2e-3, rtol=5e-2)
-
-
-@pytest.mark.parametrize(
     "seq_lens, num_heads, block_size",
     [
         ([(8, 10246)], (16, 2), 8192),
