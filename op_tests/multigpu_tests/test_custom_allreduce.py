@@ -308,6 +308,12 @@ _LL_GFX1250_MIXED_SIZES = [32000, 32768, 512]
 # bits depend on the order the ranks are summed in (see rank_order).
 _LL2S_GFX1250_MIXED_SIZES = [40 * 7168, 25 * 3584, 160 * 7168]
 
+# gfx1250 all-reduces whose output is their input (fp32 elements): 0.36 MB,
+# 0.79 MB, 1.57 MB and 3.67 MB. At TP2 and TP6 all four take the one-shot LL,
+# with 256-thread and 512-thread waves and with 2 and 4 packets a sender. At
+# TP4 and TP8 the larger ones take the two-shot (ar2sMinBytes).
+_LL_GFX1250_INPLACE_SIZES = [25 * 3584, 192 * 1024, 384 * 1024, 896 * 1024]
+
 
 def _is_gfx1250() -> bool:
     return (
@@ -352,6 +358,7 @@ def _allreduce_mixed_size_regression(
     check_every,
     vary_inputs=False,
     rank_order=False,
+    inplace=False,
 ):
     from aiter.dist.device_communicators.custom_all_reduce import CustomAllreduce
 
@@ -395,7 +402,14 @@ def _allreduce_mixed_size_regression(
     done = torch.cuda.Event()
     for iteration in range(iterations):
         round_inputs, round_refs = variants[iteration % len(variants)]
-        outs = [ca_comm.custom_all_reduce(x, use_new=True) for x in round_inputs]
+        if inplace:
+            # The output overwrites the input as the peers' lines arrive, so a
+            # rank that publishes after that sends its partly reduced output.
+            outs = [x.clone() for x in round_inputs]
+            for x in outs:
+                ca_comm.all_reduce(x, out=x)
+        else:
+            outs = [ca_comm.custom_all_reduce(x, use_new=True) for x in round_inputs]
         if iteration % check_every != check_every - 1:
             continue
         done.record()
@@ -473,6 +487,23 @@ def test_allreduce_ll2s_gfx1250_mixed_size_regression(tp_size, iterations=200):
     )
 
 
+def test_allreduce_ll_gfx1250_inplace_regression(tp_size, iterations=200):
+    # An LL all-reduce whose output aliases its input must publish this rank's
+    # input before any reduced value lands there.
+    if not _is_gfx1250():
+        return
+    _run_mixed_size_regression(
+        tp_size,
+        _LL_GFX1250_INPLACE_SIZES,
+        iterations,
+        "gfx1250 LL in-place",
+        1,
+        vary_inputs=True,
+        rank_order=True,
+        inplace=True,
+    )
+
+
 def _run_mixed_size_regression(
     tp_size,
     sizes,
@@ -481,6 +512,7 @@ def _run_mixed_size_regression(
     check_every,
     vary_inputs=False,
     rank_order=False,
+    inplace=False,
 ):
     torch.multiprocessing.spawn(
         _allreduce_mixed_size_regression,
@@ -494,6 +526,7 @@ def _run_mixed_size_regression(
             check_every,
             vary_inputs,
             rank_order,
+            inplace,
         ),
         nprocs=tp_size,
         join=True,
@@ -582,7 +615,7 @@ parser.add_argument(
     "--regression",
     action="store_true",
     help="run only the correctness checks: tail (eager and graph), LL128 and "
-    "gfx1250 LL mixed sizes",
+    "gfx1250 LL mixed sizes, and gfx1250 LL in place",
 )
 parser.add_argument(
     "--iterations",
@@ -624,6 +657,7 @@ if __name__ == "__main__":
                     test_allreduce_ll128_mixed_size_regression(tp)
             test_allreduce_ll_gfx1250_mixed_size_regression(args.tp_size)
             test_allreduce_ll2s_gfx1250_mixed_size_regression(args.tp_size)
+            test_allreduce_ll_gfx1250_inplace_regression(args.tp_size)
     if args.regression:
         raise SystemExit(0)
     with_graph = args.mode == "graph"
