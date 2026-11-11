@@ -31,6 +31,7 @@ from ..jit.core import compile_ops
 from ..jit.utils.asm_guard import require_gfx1250_asm
 from ..jit.utils.chip_info import get_cu_num, get_gfx_runtime
 from ..jit.utils.torch_guard import torch_compile_guard
+from ..plugin import route as _route
 from ..utility import dtypes
 from .opus.mla import (
     opus_mla_v4_prefill_a8w8_gfx950_fwd,
@@ -767,6 +768,7 @@ def _mla_sparse_prefill_v41_fake(
     return torch.empty((t, h, 512), dtype=torch.bfloat16, device=q.device)
 
 
+@_route(op="mla_sparse_prefill_v41")
 @torch_compile_guard(mutates_args=["out"], gen_fake=_mla_sparse_prefill_v41_fake)
 def mla_sparse_prefill_v41(
     q: torch.Tensor,

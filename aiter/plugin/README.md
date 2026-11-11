@@ -15,7 +15,7 @@ default-deny, and only a framework calling `configure()` turns anything on. A
 provider wheel arriving as somebody's transitive dependency cannot change which
 kernels run.
 
-**Five ops are routed today**, and `tests/plugin_contracts.json` is the list
+**Six ops are routed today**, and `tests/plugin_contracts.json` is the list
 that cannot drift from what dispatch actually hands you:
 
 | op | version |
@@ -25,6 +25,7 @@ that cannot drift from what dispatch actually hands you:
 | `pertoken_quant` | 1 |
 | `gemm_a8w8_blockscale` | 1 |
 | `gemm_a8w8_blockscale_bpreshuffle` | 1 |
+| `mla_sparse_prefill_v41` | 1 |
 
 If your op is not in that file it is not routed — there is nothing to serve,
 and `plugin.status()['routed_ops']` says the same at runtime.
