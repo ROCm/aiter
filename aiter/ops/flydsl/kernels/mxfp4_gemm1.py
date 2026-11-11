@@ -1670,10 +1670,8 @@ def compile_gemm1_a4w4_port(
     #
     # situ_beta / situ_linear_beta / swiglu_limit are deliberately absent: they
     # are floats, so they would make ugly symbols, and they cannot collide.
-    # FlyDSL's disk cache is not keyed on this symbol name -- the key is a hash
-    # over the launcher source, its dependency sources, and every scalar closure
-    # value reachable from it (see jit_function._jit_function_cache_key /
-    # _collect_closure_scalar_vals), and gemm1_kernel closes over all three.
+    # FlyDSL's disk cache is not keyed on this symbol name but on the traced IR,
+    # where all three are constants.
     gu_tag = "il" if interleave else "sep"
     name_suffix = (
         f"{a_dtype}_h{D_HIDDEN}_i{D_INTER}_ne{NE}_bm{BM}_{variant_tag}_{gu_tag}"

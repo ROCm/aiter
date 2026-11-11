@@ -61,7 +61,9 @@ def _gemm1_body_a16w4(
     w_dtype="fp4",
     w_layout="standard",
     k_wave=1,
+    activation_bf16=False,
     rocm_arch="",
+    prefetch=1,
 ):
     """a16w4/a16wi4/a16w16 (bf16 A x mxfp4/int4/bf16 W) fused stage1 gemm1 body.
 
@@ -289,7 +291,7 @@ def _gemm1_body_a16w4(
         gpu.barrier()
         compute_tile(b0, preload_a(0))
         gpu.barrier()
-    else:
+    elif const_expr(prefetch == 1):
         a_loader.store_tile(k_base, slot=0)
         b_cur = load_b_tile(k_base)
         for kt in range_constexpr(K_TILES_TOTAL):
@@ -308,6 +310,55 @@ def _gemm1_body_a16w4(
             compute_tile(b_cur, a_frags)
             if const_expr(kt + 1 < K_TILES_TOTAL):
                 b_cur = b_nxt
+    else:
+        # gfx942 MXFP4 deep pipeline (prefetch=P>1). store_tile's VGPR staging waits
+        # on its own global load before the LDS write, and load_scale decodes its
+        # e8m0 dword right after issuing it; with in-order vmcnt both expose one
+        # memory latency per K tile. Here A (gmem->VGPR) and B raw + scale dwords
+        # are issued P tiles ahead; A is written to the free LDS slot after this
+        # tile's MFMAs and scales are decoded when consumed. Loads, MFMA order and
+        # values are those of prefetch=1, so the output is bitwise identical.
+        _depth = min(prefetch, K_TILES_TOTAL)
+
+        def issue_b_tile(base_k):
+            g_sc = [b_loader.load_scale_raw(base_k, c) for c in cols_gate]
+            u_sc = [b_loader.load_scale_raw(base_k, c) for c in cols_up]
+            g_raw = [b_loader.load_raw(base_k, c) for c in cols_gate]
+            u_raw = [b_loader.load_raw(base_k, c) for c in cols_up]
+            return base_k, g_raw, u_raw, g_sc, u_sc
+
+        def finish_b_tile(tile):
+            base_k, g_raw, u_raw, g_sc, u_sc = tile
+            g_scale = [
+                b_loader.convert_scale(base_k, c, s) for c, s in zip(cols_gate, g_sc)
+            ]
+            u_scale = [
+                b_loader.convert_scale(base_k, c, s) for c, s in zip(cols_up, u_sc)
+            ]
+            return g_raw, u_raw, g_scale, u_scale
+
+        a_loader.store_tile(k_base, slot=0)
+        a_inflight = {}
+        b_inflight = {}
+        for pk in range_constexpr(1, _depth):
+            a_inflight[pk] = a_loader.issue_tile(k_base + fx.Int32(pk * TILE_K))
+        for pk in range_constexpr(_depth):
+            b_inflight[pk] = issue_b_tile(k_base + fx.Int32(pk * TILE_K))
+        for kt in range_constexpr(K_TILES_TOTAL):
+            cur_slot = kt % A_LDS_STAGES
+            rocdl.s_waitcnt(lgkmcnt=0)
+            gpu.barrier()  # A(kt) committed by every wave before ds_read
+            a_frags = preload_a(cur_slot)
+            nxt = kt + _depth
+            if const_expr(nxt < K_TILES_TOTAL):
+                a_inflight[nxt] = a_loader.issue_tile(k_base + fx.Int32(nxt * TILE_K))
+                b_inflight[nxt] = issue_b_tile(k_base + fx.Int32(nxt * TILE_K))
+            compute_tile(finish_b_tile(b_inflight.pop(kt)), a_frags)
+            if const_expr(kt + 1 < K_TILES_TOTAL):
+                # Slot (kt+1)%2 was last read in iteration kt-1, before this barrier.
+                a_loader.commit_tile(
+                    a_inflight.pop(kt + 1), slot=(kt + 1) % A_LDS_STAGES
+                )
     # ---- k_wave slice-K reduce (aiter mixed_moe LDS-reduce): each wave stores its
     # nm = num_acc_n*m_repeat vec4-f32 acc-slots to a per-wave LDS region, then sums its
     # peers' (peer = g*num_n_waves + wave_n_id) partials. Gate/up reduced in SEPARATE
@@ -368,6 +419,9 @@ def _gemm1_body_a16w4(
             for ni in range_constexpr(num_acc_n):
                 g = fx.Float32(fx.Vector(fx.memref_load_vec(acc_gate[mi][ni]))[ii])
                 u = fx.Float32(fx.Vector(fx.memref_load_vec(acc_up[mi][ni]))[ii])
+                if const_expr(activation_bf16):
+                    g = g.to(fx.BFloat16).to(fx.Float32)
+                    u = u.to(fx.BFloat16).to(fx.Float32)
                 # mixed_moe clamps SiLU before the shared unclamped helper.
                 # Do not clamp inside silu_mul_batch (that helper is shared).
                 if const_expr(act == "silu"):
@@ -403,7 +457,9 @@ def compile_gemm1_a16w4_port(
     w_dtype="fp4",
     w_layout="standard",
     k_wave=1,
+    activation_bf16=False,
     rocm_arch,
+    prefetch=1,
 ):
     """a16w4/a16wi4/a16w16 (bf16 A x mxfp4/int4/bf16 W1) fused stage1 builder.
 
@@ -422,12 +478,21 @@ def compile_gemm1_a16w4_port(
     ``k_wave`` (aiter slice-K, default 1): repartition 4 waves into (4/k_wave) N-waves x
     k_wave K-waves; partials LDS-reduced. k_wave in {1,2,4}; requires 4 % k_wave == 0 and
     D_HIDDEN % (k_wave*TILE_K) == 0.
+
+    ``act="silu_clamped"`` uses the runtime clamp without the GPT-OSS slope
+    or up offset. ``activation_bf16=True`` rounds GEMM accumulators to bf16
+    before that activation, matching a separate bf16 gate/up GEMM. Defaults
+    preserve the existing fused f32 activation path.
     """
     assert w_dtype in (
         "fp4",
         "int4",
         "bf16",
     ), f"w_dtype must be 'mxfp4', 'int4' or 'bf16', got {w_dtype!r}"
+    if w_dtype in ("fp4", "int4") and (TILE_K <= 0 or TILE_K % 128):
+        raise ValueError(
+            f"{w_dtype} TILE_K must be a positive multiple of 128, got {TILE_K}"
+        )
     assert w_layout in (
         "standard",
         "guinterleave",
@@ -436,6 +501,10 @@ def compile_gemm1_a16w4_port(
         w_layout == "guinterleave" and w_dtype != "fp4"
     ), f"w_layout='guinterleave' is mxfp4-only, got w_dtype={w_dtype!r}"
     assert k_wave in (1, 2, 4), f"k_wave must be 1, 2, or 4, got {k_wave}"
+    assert 1 <= prefetch <= 4, f"prefetch must be in 1..4, got {prefetch}"
+    assert prefetch == 1 or (
+        w_dtype == "fp4" and str(rocm_arch).startswith("gfx942")
+    ), "prefetch > 1 is the gfx942 MXFP4 VGPR-staged pipeline"
     assert 4 % k_wave == 0, f"4 must be divisible by k_wave, got {k_wave}"
     _K = D_HIDDEN
     _INTER = D_INTER
@@ -481,16 +550,22 @@ def compile_gemm1_a16w4_port(
 
     assert act in (
         "silu",
+        "silu_clamped",
         "swiglu",
         "situv2",
-    ), f"a16w4 gemm1 act must be 'silu', 'swiglu', or 'situv2', got {act!r}"
+    ), f"unsupported a16w4 gemm1 activation: {act!r}"
+    if activation_bf16 and act != "silu_clamped":
+        raise ValueError("activation_bf16 requires act='silu_clamped'")
     _act_tag = "" if act == "silu" else f"_{act}"
+    if activation_bf16:
+        _act_tag += "_abf16"
     _bcm_tag = "" if b_cache_mod == 2 else f"_bcm{b_cache_mod}"
     _xcd_tag = f"_xcd{xcd_swizzle}" if xcd_swizzle > 0 else ""
     _wpe_tag = f"_w{waves_per_eu}" if waves_per_eu else ""
     _wd_tag = "" if w_dtype == "fp4" else f"_{w_dtype}"
     _wl_tag = "" if w_layout == "standard" else f"_{w_layout}"
     _kw_tag = f"_kw{k_wave}" if k_wave > 1 else ""
+    _kw_tag += f"_pf{prefetch}" if prefetch > 1 else ""
     name_suffix = f"a16w4{_wd_tag}{_wl_tag}_h{_K}_i{_INTER}_ne{NE}_bm{BM}_tn{TILE_N}{_act_tag}{_bcm_tag}{_xcd_tag}{_wpe_tag}{_kw_tag}"
 
     @fx.struct
@@ -583,7 +658,9 @@ def compile_gemm1_a16w4_port(
                 w_dtype=w_dtype,
                 w_layout=w_layout,
                 k_wave=k_wave,
+                activation_bf16=activation_bf16,
                 rocm_arch=rocm_arch,
+                prefetch=prefetch,
             )
 
     @flyc.jit
