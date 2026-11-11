@@ -112,7 +112,7 @@ class DualwaveFp8KvGmemToLdsLoader(DualwaveFp8PageIdLoader):
     def __init__(self, ctx):
         super().__init__(ctx)
 
-    def load_k(self, tile_start, buf_id, page_id=None):
+    def load_k(self, tile_start, buf_id, page_id=None, real_tile=False, full=False):
         """DMA one K tile into LDS, one pass per head-dim band.
 
         A band's LDS line is this wave's n-rows of `chunk` bytes, row-contiguous,
@@ -123,14 +123,14 @@ class DualwaveFp8KvGmemToLdsLoader(DualwaveFp8PageIdLoader):
         eb = traits.ELEM_BYTES
         k_div = self.k_div
         if const_expr(traits.PAGED):
-            k_div = self.kv_page_div("k", page_id, tile_start)
+            k_div = self.kv_page_div("k", page_id, tile_start, real_tile)
         k_lds_byte_base = self.lds_kv_base_idx + self.k_buf_base(buf_id) * eb
         if const_expr(traits.BODY_VARIANT == "conventional_bn64"):
-            self._load_k_bn64(k_div, tile_start, k_lds_byte_base)
+            self._load_k_bn64(k_div, tile_start, k_lds_byte_base, full)
         else:
             self._load_k_bands(k_div, tile_start, k_lds_byte_base)
 
-    def _shuffled_k_src_elem(self, global_d, n_in_tile, tile_start):
+    def _shuffled_k_src_elem(self, global_d, n_in_tile, tile_start, full=False):
         """Element index of a shuffled-layout K chunk, or an OOB sentinel past the tail."""
         traits = self.traits
         layout = fx.make_layout(
@@ -142,12 +142,14 @@ class DualwaveFp8KvGmemToLdsLoader(DualwaveFp8PageIdLoader):
                 fx.crd2idx((fx.Int32(global_d // 16), fx.Int32(n_in_tile), 0), layout)
             )
         )
+        if const_expr(full):
+            return src_elem
         # Shuffled tokens are strided across the page, so a prefix descriptor
         # bound cannot mask the logical K tail.
         valid = n_in_tile + tile_start < self.seqlen_kv_v
         return valid.select(src_elem, fx.Index(0x7FFFFFF0))
 
-    def _load_k_bn64(self, k_div, tile_start, k_lds_byte_base):
+    def _load_k_bn64(self, k_div, tile_start, k_lds_byte_base, full=False):
         traits = self.traits
         ownership = k_stripe_layout(traits.HEAD_DIM, traits.VEC_KV)
         logical = fx.make_layout((traits.BLOCK_N, traits.HEAD_DIM), (1, traits.BLOCK_N))
@@ -167,7 +169,9 @@ class DualwaveFp8KvGmemToLdsLoader(DualwaveFp8PageIdLoader):
                 self.kv_gmem_elem_offset + n_in_tile * self.stride_kv_n_v + global_d
             )
             if const_expr(traits.K_SHUFFLED):
-                src_elem = self._shuffled_k_src_elem(global_d, n_in_tile, tile_start)
+                src_elem = self._shuffled_k_src_elem(
+                    global_d, n_in_tile, tile_start, full
+                )
             lds_addr = k_lds_byte_base + stripe * traits.K_BAND_LINE_STRIDE[0]
             self.buffer_load_lds_128(k_div, lds_addr, src_elem, 0)
 
@@ -224,15 +228,15 @@ class DualwaveFp8KvGmemToLdsLoader(DualwaveFp8PageIdLoader):
 
         _run()
 
-    def load_v(self, tile_start, buf_id, page_id=None):
+    def load_v(self, tile_start, buf_id, page_id=None, real_tile=False):
         if const_expr(self.traits.V_SHUFFLED):
-            self._stage_v_fp8_coalesced(tile_start, buf_id, page_id)
+            self._stage_v_fp8_coalesced(tile_start, buf_id, page_id, real_tile)
         else:
             self._stage_v_fp8_block_dma(tile_start, buf_id, page_id)
 
-    def _stage_v_fp8_coalesced(self, tile_start, buf_id, page_id):
+    def _stage_v_fp8_coalesced(self, tile_start, buf_id, page_id, real_tile=False):
         traits = self.traits
-        v_div = self.kv_page_div("v", page_id, tile_start)
+        v_div = self.kv_page_div("v", page_id, tile_start, real_tile)
         aligned_base = ((self.lds_vt_base_idx + 127) // 128) * 128
         buf_off = buf_id * traits.BLOCK_N * traits.HEAD_DIM_V
         num_dma = traits.BLOCK_N * traits.HEAD_DIM_V // 1024
@@ -339,11 +343,16 @@ class DualwaveFp8KvLdsToVgprLoader(DualwaveFp8KernelContext):
 
         return (_read_strip(n_lo), _read_strip(n_hi))
 
-    def load_v(self, buf_id, tile_start=None):
+    def load_v(self, buf_id, tile_start=None, full=False):
         if const_expr(
             self.traits.BODY_VARIANT == "conventional_bn64" and self.traits.V_SHUFFLED
         ):
-            packs = self._load_v_fp8_bn64(buf_id, tile_start)
+            if const_expr(full):
+                packs = self._load_v_fp8_coalesced(
+                    buf_id, tile_start, mask_tail=False, plain_lds=True
+                )
+            else:
+                packs = self._load_v_fp8_bn64(buf_id, tile_start)
         elif const_expr(self.traits.V_SHUFFLED):
             packs = self._load_v_fp8_coalesced(buf_id, tile_start)
         else:

@@ -103,12 +103,26 @@ class DualwaveFp8GemmHelper(DualwaveFp8KernelContext):
         q_all_wide = self._load_q_wide_lds() if q_wide is None else q_wide
         v_s_lo = self.c_zero_v16f32
         v_s_hi = self.c_zero_v16f32
-        for ws in range_constexpr(traits.HEAD_DIM // 64):
-            q_w = q_all_wide[ws]
-            v_s_lo = self._mfma_acc_fp8_wide(k_lo[ws], q_w, v_s_lo)
-            v_s_hi = self._mfma_acc_fp8_wide(k_hi[ws], q_w, v_s_hi)
         n_ds = const_expr(traits.HEAD_DIM // 64 * 4)
         n_mfma = const_expr(traits.HEAD_DIM // 64 * 2)
+        if const_expr(traits.BODY_VARIANT == "conventional_bn64"):
+            # Low strip's K steps first: its operands come in the first read group and the
+            # high strip's reads get two MFMAs to land instead of one.
+            for ws in range_constexpr(traits.HEAD_DIM // 64):
+                v_s_lo = self._mfma_acc_fp8_wide(k_lo[ws], q_all_wide[ws], v_s_lo)
+            for ws in range_constexpr(traits.HEAD_DIM // 64):
+                v_s_hi = self._mfma_acc_fp8_wide(k_hi[ws], q_all_wide[ws], v_s_hi)
+            if const_expr(traits.K_SHUFFLED and traits.CAUSAL):
+                # All K reads up front: no read waits behind an MFMA's issue. Non-causal shuffled
+                # spills with the extra live K operands.
+                rocdl.sched_group_barrier(traits.SCHED_DS_READ_MASK, n_ds, 12)
+                rocdl.sched_group_barrier(traits.SCHED_MFMA_MASK, n_mfma, 12)
+                return (v_s_lo, v_s_hi)
+        else:
+            for ws in range_constexpr(traits.HEAD_DIM // 64):
+                q_w = q_all_wide[ws]
+                v_s_lo = self._mfma_acc_fp8_wide(k_lo[ws], q_w, v_s_lo)
+                v_s_hi = self._mfma_acc_fp8_wide(k_hi[ws], q_w, v_s_hi)
         rocdl.sched_group_barrier(traits.SCHED_DS_READ_MASK, n_ds // 2, 12)
         rocdl.sched_group_barrier(traits.SCHED_MFMA_MASK, 1, 12)
         rocdl.sched_group_barrier(traits.SCHED_DS_READ_MASK, n_ds // 2, 12)

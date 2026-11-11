@@ -403,13 +403,7 @@ def build_flash_attn_dualwave_swp_fp8_module(
                 _s_setprio(v)
                 rocdl.sched_barrier(0)
 
-        for j, loop_args in range(t0, t_end, fx.Int64(1), init=init_args):
-            j = fx.Int64(j)
-            m_row = loop_args[0]
-            l_row = loop_args[1]
-            v_o = [loop_args[2 + i] for i in range_constexpr(D_CHUNKS)]
-            buf = fx.Int32(j) % fx.Int32(2)
-            next_buf = fx.Int32(1) - buf
+        def _tile_top():
             # Publish the prefetched tile and release the slot all waves last read.
             rocdl.s_waitcnt(vmcnt=0, lgkmcnt=0, expcnt=0)
             # Keep the scheduler from moving LDS accesses across the barrier; the pinned FlyDSL exports no stable equivalent.
@@ -419,21 +413,16 @@ def build_flash_attn_dualwave_swp_fp8_module(
             rocdl.sched_barrier(0)
             # The just-synchronised WG gets the SIMDs for its K reads and QK so its waves reach the next barrier together.
             _bn64_prio(BN64_QK_PRIO)
-            pf = j + fx.Int64(1)
-            if pf < t_end:
-                prefetch_loader = kv_gmem_to_lds
-                prefetch_page = prefetch_loader.end_page_ids(
-                    prefetch_loader.begin_page_ids([pf])
-                )[0]
-                prefetch_loader.load_k(pf * BN, next_buf, prefetch_page)
-                prefetch_loader.load_v(pf * BN, next_buf, prefetch_page)
-            v_k = kv_lds_to_regs.load_k(buf)
-            v_s = gemm_helper.qk(v_k, q_wide)
-            _bn64_prio(0)
-            if const_expr(traits.CAUSAL):
-                v_s = softmax_helper.causal_mask_tile_if_needed(v_s, fx.Int32(j))
-            else:
-                v_s = softmax_helper.seq_pad_mask_if_needed(v_s, fx.Int32(j))
+
+        def _tile_softmax_pv(j, loop_args, buf, v_s, masked):
+            m_row = loop_args[0]
+            l_row = loop_args[1]
+            v_o = [loop_args[2 + i] for i in range_constexpr(D_CHUNKS)]
+            if const_expr(masked):
+                if const_expr(traits.CAUSAL):
+                    v_s = softmax_helper.causal_mask_tile_if_needed(v_s, fx.Int32(j))
+                else:
+                    v_s = softmax_helper.seq_pad_mask_if_needed(v_s, fx.Int32(j))
             m_tile = softmax_helper.floor_masked_max(softmax_helper.reduce_max(v_s))
             if const_expr(traits.DUALWAVE_SWP_LAZY_RESCALE):
                 v_o, m_new, l_row = softmax_helper.lazy_correct_o(
@@ -452,12 +441,73 @@ def build_flash_attn_dualwave_swp_fp8_module(
             # Row sum before PV so P's fp32 copy dies before the V reads (3 waves/SIMD budget).
             l_row = softmax_helper.reduce_sum(l_row, v_p)
             v_p = gemm_helper.cast_p_fp8_direct(v_p)
-            v_v = kv_lds_to_regs.load_v(buf, j * BN if traits.V_SHUFFLED else None)
+            if const_expr(not masked):
+                # Without the general loop's full-tile branch the V reads would hoist into the softmax and spill.
+                rocdl.sched_barrier(0)
+            # A fast tile is full, so its V needs no invalid-token masking.
+            v_v = kv_lds_to_regs.load_v(
+                buf,
+                j * BN if traits.V_SHUFFLED else None,
+                full=not masked,
+            )
             if const_expr(not traits.V_SHUFFLED):
                 # Inline transpose reads are invisible to LLVM's wait insertion.
                 rocdl.s_waitcnt(lgkmcnt=0)
             v_o = gemm_helper.pv(v_p, v_v, v_o)
-            loop_results = yield [m_new, l_row] + v_o
+            return [m_new, l_row] + v_o
+
+        # Fast tiles [t0, t_main) are full, prefetch a real tile and need no mask. Causal: tile j ends at or below
+        # the block's first row's diagonal (64 j + 63 <= q_start + delta), so every row sees all its keys, and
+        # q_start + delta < seqlen_kv (active block) makes it full. Non-causal: every tile but the last is full.
+        # The general loop finishes the rest: the last tile, and causal diagonal tiles.
+        t_main = t_end - fx.Int64(1)
+        if const_expr(traits.CAUSAL):
+            diag_first = fx.Int32(ctx.q_start) + ctx.delta_i32 + fx.Int32(1)
+            diag_first = (diag_first > fx.Int32(0)).select(diag_first, fx.Int32(0))
+            t_full = fx.Int64(fx.arith.shrui(diag_first, fx.Int32(BN.bit_length() - 1)))
+            t_main = (t_main < t_full).select(t_main, t_full)
+        t_main = (t_main > t0).select(t_main, t0)
+
+        fast_results = init_args
+        for j, loop_args in range(t0, t_main, fx.Int64(1), init=init_args):
+            j = fx.Int64(j)
+            buf = fx.Int32(j) % fx.Int32(2)
+            next_buf = fx.Int32(1) - buf
+            _tile_top()
+            # pf <= t_main < t_end: a real tile, so no prefetch branch. pf < t_main is full; pf == t_main may be
+            # partial (or causal-masked) only in its K tail, which the general loop masks, so K skips the tail sentinel.
+            pf = j + fx.Int64(1)
+            page = kv_gmem_to_lds.end_page_ids(kv_gmem_to_lds.begin_page_ids([pf]))[0]
+            kv_gmem_to_lds.load_k(pf * BN, next_buf, page, real_tile=True, full=True)
+            kv_gmem_to_lds.load_v(pf * BN, next_buf, page, real_tile=True)
+            # As the general loop's prefetch branch: keep the DMA address math out of QK.
+            rocdl.sched_barrier(0)
+            v_k = kv_lds_to_regs.load_k(buf)
+            v_s = gemm_helper.qk(v_k, q_wide)
+            # Stands in for the mask branch: the max/exp would otherwise interleave into QK and spill Q.
+            rocdl.sched_barrier(0)
+            _bn64_prio(0)
+            fast_results = yield _tile_softmax_pv(j, loop_args, buf, v_s, False)
+
+        init_args = list(fast_results)
+        loop_results = init_args
+        for j, loop_args in range(t_main, t_end, fx.Int64(1), init=init_args):
+            j = fx.Int64(j)
+            buf = fx.Int32(j) % fx.Int32(2)
+            next_buf = fx.Int32(1) - buf
+            _tile_top()
+            pf = j + fx.Int64(1)
+            if pf < t_end:
+                prefetch_loader = kv_gmem_to_lds
+                prefetch_page = prefetch_loader.end_page_ids(
+                    prefetch_loader.begin_page_ids([pf])
+                )[0]
+                prefetch_loader.load_k(pf * BN, next_buf, prefetch_page)
+                prefetch_loader.load_v(pf * BN, next_buf, prefetch_page)
+            v_k = kv_lds_to_regs.load_k(buf)
+            v_s = gemm_helper.qk(v_k, q_wide)
+            _bn64_prio(0)
+            loop_results = yield _tile_softmax_pv(j, loop_args, buf, v_s, True)
         m_row = loop_results[0]
         l_row = loop_results[1]
         v_o = [loop_results[2 + i] for i in range_constexpr(D_CHUNKS)]

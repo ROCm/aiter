@@ -983,7 +983,7 @@ class DualwaveFp8KernelContext:
             fx.make_layout(1, 1),
         )
 
-    def kv_page_div(self, which, page_id, tile_start):
+    def kv_page_div(self, which, page_id, tile_start, real_tile=False):
         base_iter = self.k_iter if which == "k" else self.v_iter
         # Bounds follow the logical tile, not the clamped page id: invalid-token
         # V must be zero even when the last page contains stale fp8 NaNs.
@@ -1011,7 +1011,10 @@ class DualwaveFp8KernelContext:
                 valid, fx.Int64(self.traits.BLOCK_N)
             )
             nrec = valid * fx.Int64(self.stride_kv_n_v)
-            if const_expr(shuffled):
+            if const_expr(shuffled and real_tile):
+                # The caller proved tile_start < seqlen_kv; the K tail sentinel still masks a partial tile.
+                nrec = self.page_byte_stride
+            elif const_expr(shuffled):
                 nrec = (valid > fx.Int64(0)).select(self.page_byte_stride, fx.Int64(0))
         return _make_page_view(
             base_iter,
