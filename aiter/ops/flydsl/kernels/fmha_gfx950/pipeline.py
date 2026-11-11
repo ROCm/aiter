@@ -955,9 +955,16 @@ class DualwaveFp8KernelContext:
         if const_expr(traits.PAGED):
             self.k_div = None
             self.v_div = None
-            self.page_byte_stride = fx.Int64(traits.BLOCK_N) * fx.Int64(
-                self.stride_kv_n_v
-            )
+            if const_expr(traits.BODY_VARIANT == "conventional_bn64"):
+                # The router (_strides_ok) only admits stride_kv_n == num_kv_heads * head_dim, so the page stride is a
+                # compile-time constant and page -> byte offset becomes a shift.
+                self.page_byte_stride = fx.Int64(
+                    traits.BLOCK_N * traits.DEFAULT_STRIDE_KV_N
+                )
+            else:
+                self.page_byte_stride = fx.Int64(traits.BLOCK_N) * fx.Int64(
+                    self.stride_kv_n_v
+                )
             self.page_layout = fx.make_layout(
                 fx.Int32(self.page_byte_stride), fx.Int32(1)
             )
