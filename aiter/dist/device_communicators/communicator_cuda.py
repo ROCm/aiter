@@ -234,6 +234,22 @@ class CudaCommunicator(DeviceCommunicatorBase):
             self.all2all_backend if value is not None else None
         )
 
+    def all_reduce_add(
+        self,
+        input_,
+        other,
+        use_new: bool = True,
+        ca_fp8_quant: bool = False,
+        prefill_support: bool = False,
+    ) -> torch.Tensor:
+        """all_reduce(input_ + other). gfx1250: the Lamport one-shot kernel adds
+        the pair as it sends, so the sum is never written; elsewhere the add
+        and then all_reduce."""
+        ca_comm = self.ca_comm
+        if ca_comm is not None and ca_comm.should_lamport_ar_add(input_, other):
+            return ca_comm.lamport_ar_add(input_, other)
+        return self.all_reduce(input_ + other, use_new, ca_fp8_quant, prefill_support)
+
     def all_reduce(
         self,
         input_,
@@ -362,10 +378,21 @@ class CudaCommunicator(DeviceCommunicatorBase):
                 self.cpu_group,
                 *self.gluon_ar,
             )
+        ca_comm = self.ca_comm
+        # gfx1250 Lamport one-shot fused kernel: no barrier and no copy-in, so
+        # it beats the routes below up to its size cap (see
+        # _LAMPORT_AR_RMS_MAX_BYTES).
+        if (
+            ca_comm is not None
+            and x_pad_to_multiple == 0
+            and ca_comm.should_lamport_ar_rms(input_, res_inp_, weight_, out_n)
+        ):
+            return ca_comm.lamport_fused_ar_rms(
+                input_, res_inp_, weight_, eps, gemma_norm
+            )
         can_use_fuse_ar_rms = (
             n <= 16384 and total_bytes < 8 * 1024 * 8192 and self.world_size != 6
         )
-        ca_comm = self.ca_comm
         can_use_custom_ar = (
             ca_comm is not None
             and not ca_comm.disabled
