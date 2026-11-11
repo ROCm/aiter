@@ -94,8 +94,7 @@ fp16, for every wire format.
 * The group scale is an E5M2 byte (bias 12) spanning `[2**-12, 1.75 * 2**19]`,
   so every fp16 extremum fits and no group clips below the fp16 limit above,
   including the ring's requantized partial sums. NaN and Inf become finite
-  values. `SCALE_CODEC_TAG` is part of every kernel's launch name: bump it when
-  the codec changes, or a warm FlyDSL cache keeps loading old binaries.
+  values.
 
 ## Inbox memory
 
@@ -413,12 +412,6 @@ These variables are not new, but they change where the FlyDSL kernels run.
 If the `AITER_CUSTOM_AR_*` window and the one-shot window do not overlap,
 `CustomAllreduce` does not build the plain one-shot.
 
-### Development variables
-
-| Variable | Effect |
-|---|---|
-| `FLYDSL_EXTRA_SOURCE_DIRS` | Adds directories to the FlyDSL JIT cache key. Refer to [The JIT cache does not see changes in shared modules](#the-jit-cache-does-not-see-changes-in-shared-modules). |
-
 ## Tests and benchmarks
 
 Two multi-GPU tests check and time the kernels. The `--scenario` option selects
@@ -474,23 +467,13 @@ and how it prevents bias in the comparison.
 
 ## Notes
 
-### The JIT cache does not see changes in shared modules
+### The JIT cache follows changes in shared modules
 
-The FlyDSL JIT cache key includes the source of the kernel function. It does
-not include helper functions from other modules, for example
-`transport.py`, `quick_allreduce_codec.py` or the epilogue modules
-(`*_epilogue.py`, `*_rmsnorm.py`). If you change a helper,
-FlyDSL can run an old binary from the cache.
-
-To prevent this, set this variable at the repository root before you run a
-test:
-
-```bash
-export FLYDSL_EXTRA_SOURCE_DIRS=$PWD/aiter/ops/flydsl/kernels/comm
-```
-
-FlyDSL then includes all the `.py` files in this directory tree in the cache
-key. The tree includes `kernels_common.py`, which the codec also uses.
+FlyDSL 0.5.0 and later key the JIT cache on the traced kernel IR. A change to a
+helper in another module, for example `transport.py`,
+`quick_allreduce_codec.py` or the epilogue modules (`*_epilogue.py`,
+`*_rmsnorm.py`), changes the IR of every kernel that uses it, so FlyDSL
+compiles a new binary.
 
 ### Each rank compiles its own binary
 

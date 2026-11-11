@@ -105,10 +105,9 @@ _K_HALF2_1056 = 0xE420E420  # -1056.0 fp16x2 = -(1024 + 32)
 _FP16_MAX = 65504.0
 # Exponent bias of the E5M2 group scale.
 _SCALE_BIAS = 12
-# Bump whenever the group-scale codec changes. The codec helpers are only
-# called from nested functions, so FlyDSL does not hash them into the disk
-# cache key; the kernels put this tag in their launch names, which is what
-# keeps a warm cache from loading binaries built with an older codec.
+# Names the group-scale codec in every mesh and ring launch name. FlyDSL 0.5.0
+# keys its cache on the traced IR, so a codec change rebuilds the kernels
+# without a new tag; the tag only labels the binaries.
 SCALE_CODEC_TAG = "s5m2b12"
 
 
