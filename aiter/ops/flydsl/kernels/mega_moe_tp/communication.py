@@ -108,6 +108,7 @@ from .mega_moe_tp_config import (
     FLAG_YAG,
     LRDY_STRIDE,
     N_XCD,
+    NCHA_MAX,
     NCTA_MAX,
     NT,
     NTT,
@@ -133,7 +134,9 @@ def build_communication(kc: KernelCtx) -> dict:
     a8, act, agr, ar, comm_bf16 = kc.get("a8 act agr ar comm_bf16")
     a16, APL, XSB, SIB = kc.get("a16 APL XSB SIB")
     XD, L_AGS, XIB, IPB, AGS_RS = kc.get("XD L_AGS XIB IPB AGS_RS")
-    RAW, G2 = kc.get("RAW G2")
+    RAW, G2, ALQ = kc.get("RAW G2 ALQ")
+    # the all-gather's destination ranks (ALQ: this one)
+    AGP = 1 if ALQ else TPC
     # (RAW) the route rows' column groups (GEMM2 iterations, NW x 64 columns) per RS chunk
     RGW = NW * 64
     const_expr, lb, ll_rs, route_fp8 = kc.get("const_expr lb ll_rs route_fp8")
@@ -1191,16 +1194,28 @@ def build_communication(kc: KernelCtx) -> dict:
             return _ags_d(r) + i32(XB)
         return L_AGS + i32(AG_SCB) + r * i32(XSB)
 
+    def _agm(a):
+        """the all-gathered rows per source rank (ALQ: every rank quantizes all its rows
+        itself, ttot, one source)"""
+        return a["ttot"] if ALQ else a["m"]
+
+    def _agrank(a):
+        return i32(0) if ALQ else a["rank"]
+
+    def _ag_dst(a, p, key, nbytes=None):
+        """(ALQ: own memory only)"""
+        return own_rs(a, key, nbytes) if ALQ else peer_rs(a, p, key, nbytes)
+
     def ag_split(a):
-        m = fx.max(a["m"], i32(1))
+        m = fx.max(_agm(a), i32(1))
         return fx.min(fx.max(i32(gpu.grid_dim.x) // m, i32(1)), i32(NCHA))
 
     def ag_rows(a):
         bid = i32(gpu.block_id("x"))
         nblk = i32(gpu.grid_dim.x)
         S = ag_split(a)
-        nr = fx.min(fx.max(ceildiv(a["m"] - bid, nblk), i32(0)), i32(agr))
-        m = fx.max(a["m"], i32(1))
+        nr = fx.min(fx.max(ceildiv(_agm(a) - bid, nblk), i32(0)), i32(agr))
+        m = fx.max(_agm(a), i32(1))
         s = bid // m
         split = S > i32(1)
         live = s < S
@@ -1226,7 +1241,7 @@ def build_communication(kc: KernelCtx) -> dict:
         return f
 
     def ag_row_vals(a, rxl, i, g):
-        return _row32(rxl, (a["rank"] * a["m"] if ar else i32(0)) + i, g, 0)
+        return _row32(rxl, (_agrank(a) * _agm(a) if ar else i32(0)) + i, g, 0)
 
     @flyc.jit
     def quant_chunks(L, t0, stride, a, k_lo, k_hi):
@@ -1283,7 +1298,7 @@ def build_communication(kc: KernelCtx) -> dict:
     @flyc.jit
     def ag_send(L, lane, a):
         row0, stride, nrows, qb, qs, cnt = ag_rows(a)
-        rank = a["rank"]
+        rank = _agrank(a)
         if const_expr(not ar and not MLL):
             mp = (ag_split(a) > i32(1)).select(
                 i32(0), _meta_pending(a, lane, a["epoch"], own=True)
@@ -1296,15 +1311,17 @@ def build_communication(kc: KernelCtx) -> dict:
         j = lane - r * i32(XLPR)
         rok = r < nrows
         i = row0 + fx.min(r, fx.max(nrows - i32(1), i32(0))) * stride
-        gslot = rank * a["m"] + i
+        gslot = rank * _agm(a) + i
         x_bytes = a["ttot"] * i32(XB)
         xs_bytes = a["ttot"] * i32(XSB)
-        rx = [peer_rs(a, p, "off_x", x_bytes) for p in range(TPC)]
-        rs = [peer_rs(a, p, "off_xs", xs_bytes) for p in range(TPC)]
+        rx = [_ag_dst(a, p, "off_x", x_bytes) for p in range(AGP)]
+        rs = [_ag_dst(a, p, "off_xs", xs_bytes) for p in range(AGP)]
         args = (L, lane, a, r, j, rok, gslot, rx, rs, x_bytes, xs_bytes, qb, qs, cnt)
         # (split, few chunks per sender: the sequential stores-bump pipeline would get
         # chunk 0's flag out before the later chunks' stores land)
-        if (ag_split(a) > i32(1)) & (cnt <= i32(AGPMAX)):
+        if const_expr(ALQ):
+            _ag_send_alq(*args)
+        elif (ag_split(a) > i32(1)) & (cnt <= i32(AGPMAX)):
             _ag_send_par(*args)
         else:
             _ag_send_seq(*args)
@@ -1325,6 +1342,36 @@ def build_communication(kc: KernelCtx) -> dict:
         wait_vm(0)
         if lane < cnt:
             _ag_count_rank(a, fx.min(qb + lane * qs, i32(NCHA - 1)))
+
+    @flyc.jit
+    def _ag_send_alq(
+        L, lane, a, r, j, rok, gslot, rx, rs, x_bytes, xs_bytes, qb, qs, cnt
+    ):
+        """(ALQ: own rows, own buffers) all chunks' stores, then one count per sending
+        CTA: the last one flags every chunk (per-chunk counts: a device atomic round trip
+        per chunk of each CTA, the chunk-ordered pipeline 4x longer than the all-gather)
+        """
+        for k in range_constexpr(NCHA):
+            if i32(k) < cnt:
+                q = fx.min(qb + i32(k) * qs, i32(NCHA - 1))
+                ag_chunk(L, lane, a, q, r, j, rok, gslot, rx, rs, x_bytes, xs_bytes)
+        wait_lgkm0()
+        if lane == i32(0):
+            lds_atomic_add(L, L_CTL + C_AGFREE * 4, 1, REL)
+        wait_vm(0)
+        if (lane == i32(0)) & rok:
+            _alq_done(a)
+
+    @flyc.jit
+    def _alq_done(a):
+        ga = ctrl_at(a, i32(CTRL_AGG) + i32((NCHA_MAX - 1) * LRDY_STRIDE))
+        m = _agm(a)
+        S = ag_split(a)
+        senders = (S > i32(1)).select(m * S, fx.min(m, i32(gpu.grid_dim.x)))
+        if g_add_agent(ga, 1) + i32(1) == senders:
+            g_st_sys(ga, i32(0))
+            for q in range_constexpr(NCHA):
+                _ag_flag(a, i32(q))
 
     @flyc.jit
     def _ag_send_seq(
@@ -1364,7 +1411,7 @@ def build_communication(kc: KernelCtx) -> dict:
         )
         doff = rok.select(gslot * i32(XB) + cb, x_bytes)
         soff = (rok & (j == i32(0))).select(gslot * i32(XSB) + q * i32(SCQ), xs_bytes)
-        for p in range_constexpr(TPC):
+        for p in range_constexpr(AGP):
             bst(dv, rx[p], doff, 0, AUX_SYS)
             bst(sv, rs[p], soff, 0, AUX_SYS)
 
@@ -1373,7 +1420,7 @@ def build_communication(kc: KernelCtx) -> dict:
         spin0(L, lane, L_CTL + C_AGFREE * 4, i32(1))
 
     def _ag_senders(a, q, x):
-        m = fx.max(a["m"], i32(1))
+        m = fx.max(_agm(a), i32(1))
         S = ag_split(a)
         lo = (S > i32(1)).select((q % S) * m, i32(0))
         hi = (S > i32(1)).select(lo + m, i32(gpu.grid_dim.x))
@@ -1395,7 +1442,7 @@ def build_communication(kc: KernelCtx) -> dict:
     @flyc.jit
     def _ag_count_rank(a, q):
         ga = ctrl_at(a, i32(CTRL_AGG) + q * i32(LRDY_STRIDE))
-        if g_add_agent(ga, 1) + i32(1) == fx.max(a["m"], i32(1)):
+        if g_add_agent(ga, 1) + i32(1) == fx.max(_agm(a), i32(1)):
             g_st_sys(ga, i32(0))
             _ag_flag(a, q)
 
@@ -1409,20 +1456,22 @@ def build_communication(kc: KernelCtx) -> dict:
 
     @flyc.jit
     def _ag_flag(a, q):
-        idx = i32(FLAG_AGQ) + q * i32(MAX_TP) + a["rank"]
         for p in range_constexpr(TPC):
-            bst(a["epoch"], peer_rs(a, p, "off_flag"), idx * i32(4), 0, AUX_SYS)
+            if const_expr(ALQ):  # (own flags, of every source rank)
+                idx = i32(FLAG_AGQ) + q * i32(MAX_TP) + i32(p)
+                bst(a["epoch"], own_rs(a, "off_flag"), idx * i32(4), 0, AUX_SYS)
+            else:
+                idx = i32(FLAG_AGQ) + q * i32(MAX_TP) + a["rank"]
+                bst(a["epoch"], peer_rs(a, p, "off_flag"), idx * i32(4), 0, AUX_SYS)
 
     @flyc.jit
     def _ag_bump_rank(a, q):
         ga = ctrl_at(a, i32(CTRL_AGG) + q * i32(LRDY_STRIDE))
-        m = fx.max(a["m"], i32(1))
+        m = fx.max(_agm(a), i32(1))
         nx = fx.min((ag_split(a) > i32(1)).select(m, i32(gpu.grid_dim.x)), i32(N_XCD))
         if g_add_agent(ga, 1) + i32(1) == nx:
             g_st_sys(ga, i32(0))
-            idx = i32(FLAG_AGQ) + q * i32(MAX_TP) + a["rank"]
-            for p in range_constexpr(TPC):
-                bst(a["epoch"], peer_rs(a, p, "off_flag"), idx * i32(4), 0, AUX_SYS)
+            _ag_flag(a, q)
 
     def _ag_nmeta(a):
         return fx.max(ceildiv(a["m"] * i32(TOPK) // i32(4), i32(64)), i32(1))

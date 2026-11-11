@@ -351,6 +351,7 @@ def kernel_config(
     a16: bool = False,
     nsk: int = 0,
     xd: bool = False,
+    alq: bool = False,
 ):
     """The derived compile-time values of one compile_mega_moe_tp instance."""
     a8 = a8 or a16
@@ -491,6 +492,7 @@ def kernel_config(
         + (f"_nsk{nsk}" if nsk != NSK else "")
         + (f"_bpf{BPF}" if BPF else "")
         + ("_xd" if XD else "")
+        + ("_alq" if sm and ar and alq else "")
     )
     # small-M schedule (smallm.py): needs the dynamic schedule's LL route rows
     SM = bool(sm)
@@ -498,6 +500,9 @@ def kernel_config(
     # (small-M a16) the route rows bf16 (not two-term LL packets: half the bytes), each
     # (piece, route, column group) then an epoch flag (the lo plane's space of routes)
     RAW = bool(SM and a16 and os.environ.get("AITER_MEGAMOE_TP_RAW", "1") == "1")
+    # (small-M ar: every rank holds every row) each rank quantizes all rows into its own
+    # activation buffers instead of its 1 / tp all-gathered: no xGMI hop before GEMM1
+    ALQ = bool(SM and ar and alq)
     # the exported GEMM1 intermediate's bytes per route row (xg)
     # (per plane: IPB)
     IPB = I if a8 else I // 2

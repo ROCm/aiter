@@ -92,6 +92,8 @@ class LaunchCfg:
     nc: int = 0  # (small-M, few tokens) persistent CTAs of the launch (0: all)
     # (small-M a16) GEMM1's intermediate straight to xg: its LDS takes the half blocks
     xd: bool = False
+    # (small-M ar) every rank quantizes all rows itself (no activation all-gather)
+    alq: bool = False
 
 
 # --- intra-node symmetric memory (hipIpc, via quick_allreduce_int4_ipc) ---------------
@@ -761,7 +763,11 @@ class MegaMoeTPEngine:
                     nc=self._sm_nc(tot),
                     nsk=self._sm_nsk(tot),
                     xd=self._sm_xd(tot),
+                    # (measured: a16 from 64 tokens 3-8 us faster; fewer tokens ~1 us slower)
+                    alq=self.ar and self.a16 and tot >= 64,
                 )
+                # (ar small-M: every row quantized by this rank's CTAs, agr rows each)
+                assert not cfg.alq or tot <= self.agr * (cfg.nc or self.n_cta)
             elif self.a16:
                 raise ValueError(
                     f'act_dtype="bf16": {tot} tokens are beyond the small-M schedule'
@@ -872,6 +878,7 @@ class MegaMoeTPEngine:
                 ar2=cfg.ar2,
                 nsk=cfg.nsk,
                 xd=cfg.xd,
+                alq=cfg.alq,
             )
             self._launchers[self._key(cfg)] = fn
         return fn
