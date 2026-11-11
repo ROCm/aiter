@@ -30,6 +30,7 @@ from dataclasses import dataclass, field, replace
 from functools import wraps
 from importlib import metadata
 from inspect import Parameter, Signature, signature
+from math import isfinite
 from threading import RLock
 from types import MappingProxyType
 from typing import Any, ParamSpec, Protocol, TypeVar, cast
@@ -70,7 +71,25 @@ class Op:
 
 @dataclass(frozen=True, slots=True)
 class KernelCandidate:
-    """An immutable identity and entry point for one provider kernel."""
+    """An immutable identity and entry point for one provider kernel.
+
+    ``latency_us`` is optional, self-reported, and answers one question:
+
+        for *this call*, how long does this kernel take, in microseconds?
+
+    It is not a tuning result for some other shape. AITER labels what it
+    records with the conditions of the call the candidate was offered for, so a
+    number measured elsewhere arrives wearing conditions it was never measured
+    under -- worse than no number, because it looks sourced. A provider with
+    nothing for the shape in front of it omits the field rather than
+    extrapolating; omission is how to say "I do not know", which is why zero, a
+    negative, ``inf`` and ``nan`` are refused rather than recorded.
+
+    It never influences routing. Preference is the enable list, which names an
+    owner for that decision; a number a provider picks for itself must not be
+    able to outrank it. AITER records it, hands it back, and does nothing else
+    with it.
+    """
 
     provider: str
     kernel_id: str
@@ -79,12 +98,25 @@ class KernelCandidate:
     # evidence reference, not that a provider must have one to serve.
     qualification: str | None = None
     run: Callable[..., Any] = field(repr=False, compare=False, default=None)
+    # Appended, never inserted: a provider may build this positionally, and
+    # anything before `run` would silently take its argument. See the docstring
+    # for what the number means -- that is where a provider author reads it.
+    latency_us: float | None = None
 
     def __post_init__(self) -> None:
         identity = (self.provider, self.kernel_id, self.artifact_digest)
         if not all(identity) or not callable(self.run):
             raise ValueError(
                 "candidate identity must be complete and run must be callable"
+            )
+        # Each of these looks like data and carries none, and would be recorded,
+        # handed back, and eventually compared against a real number.
+        if self.latency_us is not None and not (
+            isfinite(self.latency_us) and self.latency_us > 0
+        ):
+            raise ValueError(
+                f"latency_us must be a positive finite number of microseconds, "
+                f"or omitted entirely; got {self.latency_us!r}"
             )
 
 
@@ -133,6 +165,10 @@ class Decision:
     artifact_digest: str | None = None
     qualification: str | None = None
     config_source: str | None = None
+    # Appended for the same reason as on KernelCandidate. What the selected
+    # candidate reported, unchanged; None on a native route, where there is no
+    # candidate to report one.
+    latency_us: float | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -498,6 +534,7 @@ def _selected(op: Op, candidate: KernelCandidate, config: _Config) -> Decision:
         kernel_id=candidate.kernel_id,
         artifact_digest=candidate.artifact_digest,
         qualification=candidate.qualification,
+        latency_us=candidate.latency_us,
         config_source=config.source,
     )
 
