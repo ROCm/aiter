@@ -1,14 +1,39 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-"""Common types shared across MoE FlyDSL kernel modules."""
+"""Shared types and activation configuration for MoE FlyDSL modules."""
 
+import math
+import os
 from enum import Enum
 
 import torch
 
 DEFAULT_SITUV2_BETA = 4.0
 DEFAULT_SITUV2_LINEAR_BETA = 25.0
+
+
+def resolve_swiglu_limit(
+    swiglu_limit: "object" = None,
+) -> "tuple[float | None, str]":
+    """Return the validated SiLU/SwiGLU clamp limit and the name it came from.
+
+    ``None`` falls back to AITER_MXFP4_TUNE_SWIGLU_LIMIT; an unset or empty
+    variable keeps the activation default (``None``).
+    """
+    source = "swiglu_limit"
+    if swiglu_limit is None:
+        swiglu_limit = os.environ.get("AITER_MXFP4_TUNE_SWIGLU_LIMIT") or None
+        source = "AITER_MXFP4_TUNE_SWIGLU_LIMIT"
+    if swiglu_limit is None:
+        return None, source
+    try:
+        limit = float(swiglu_limit)
+    except (TypeError, ValueError) as error:
+        raise ValueError(f"{source} must be a finite positive number") from error
+    if not math.isfinite(limit) or limit <= 0:
+        raise ValueError(f"{source} must be a finite positive number")
+    return limit, source
 
 
 def get_flydsl_activation_name(activation) -> str:

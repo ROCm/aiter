@@ -11,11 +11,19 @@ import torch.nn.functional as F
 
 import aiter
 from aiter import dtypes, hipb_create_extension, hipb_mm
+from aiter.jit.core import AITER_CONFIGS
+from aiter.jit.utils.chip_info import get_cu_num
 from aiter.jit.utils.chip_info import get_gfx_runtime as get_gfx
 from aiter.ops.gemm_op_a16w16 import _SEMA_SHAPE, get_semaphore_workspace
 from aiter.ops.shuffle import shuffle_weight
 from aiter.test_common import benchmark, checkAllclose, perftest
-from aiter.tuned_gemm import tgemm, triton_gemm
+from aiter.tuned_gemm import (
+    get_GEMM_A16W16_config,
+    hipb_gemm,
+    skinny_gemm,
+    tgemm,
+    triton_gemm,
+)
 
 # TEST_NUM_ITERS = 10
 TEST_NUM_ITERS = 100
@@ -508,6 +516,177 @@ def check_graph(dtype, m, n, k, otype):
     ), f"another graph in the pool wrote into the splitK counter at {(m, n, k)}"
 
 
+def _tuned_rows_per_libtype(libtypes):
+    """One tuned (M, N, K, bias, otype) per libtype for this GPU, unshuffled B."""
+    df = pd.read_csv(AITER_CONFIGS.AITER_CONFIG_GEMM_BF16_FILE)
+    df = df[
+        (df["gfx"] == get_gfx())
+        & (df["cu_num"] == get_cu_num())
+        & (df["dtype"] == str(dtypes.bf16))
+        & (~df["bpreshuffle"].astype(bool))
+        & (~df["scaleAB"].astype(bool))
+    ]
+    rows = {}
+    for lib in libtypes:
+        hit = df[df["libtype"] == lib]
+        if len(hit):
+            r = hit.iloc[0]
+            rows[lib] = (
+                int(r["M"]),
+                int(r["N"]),
+                int(r["K"]),
+                bool(r["bias"]),
+                getattr(torch, r["outdtype"].removeprefix("torch.")),
+            )
+    return rows
+
+
+def _check_out(label, expect_lib, x, w, bias, otype, call):
+    """`call(out)` into a NaN-filled buffer, judged against `call(None)`.
+
+    The reference is the same backend without ``out``, so this measures only
+    whether ``out`` is honoured -- each backend's accuracy has its own tests.
+    """
+    shape = (*x.shape[:-1], w.shape[0])
+    if expect_lib is not None:
+        cfg = get_GEMM_A16W16_config(
+            M=x.shape[0],
+            N=w.shape[0],
+            K=x.shape[1],
+            bias=bias is not None,
+            dtype=str(x.dtype),
+            otype=str(otype),
+            bpreshuffle=bool(getattr(w, "is_shuffled", False)),
+        )
+        assert cfg["libtype"] == expect_lib, f"{label}: routed to {cfg['libtype']}"
+    out = torch.full(shape, float("nan"), dtype=otype, device="cuda")
+    ret = call(out)
+    return {
+        "case": label,
+        "libtype": expect_lib or "direct",
+        "returns out": ret.data_ptr() == out.data_ptr(),
+        "written": not bool(out.isnan().any()),
+        "err vs no out": checkAllclose(call(None), out, msg=f"{label}: "),
+    }
+
+
+def test_gemm_out():
+    """`tgemm.mm(out=)` lands in the caller's buffer on every backend.
+
+    A backend that returns a tensor of its own leaves `out` unwritten without
+    any error -- the fp8 torch path once did -- so each case asserts the
+    routing it meant to reach, then that `out` is the answer and holds it.
+    """
+    bf16 = dtypes.bf16
+    rand = lambda *shape, dtype=bf16: torch.randn(*shape, dtype=dtype, device="cuda")
+    cases = []
+
+    def via_mm(label, lib, x, w, bias, otype):
+        cases.append(
+            (
+                label,
+                lib,
+                x,
+                w,
+                bias,
+                otype,
+                lambda out: tgemm.mm(x, w, bias, otype=otype, out=out),
+            )
+        )
+
+    x, w, b = rand(128, 8192), rand(32, 8192), rand(32)
+    via_mm("torch bf16+bias", "torch", x, w, b, bf16)
+    via_mm("torch bf16->fp32+bias", "torch", x, w, b, dtypes.fp32)
+    via_mm("torch bf16->fp16", "torch", x, w, None, dtypes.fp16)
+    x8, w8 = x.to(dtypes.fp8), w.to(dtypes.fp8)
+    via_mm("torch fp8->bf16", "torch", x8, w8, None, bf16)
+    xs, ws = rand(4, 8192), rand(32, 8192)
+    via_mm("skinny bf16+bias", "skinny", xs, ws, rand(32), bf16)
+    # The router sends no fp32-out shape to skinny, so called direct: its
+    # kernels write bf16, and a buffer of another dtype takes that by copy.
+    cases.append(
+        (
+            "skinny bf16->fp32",
+            None,
+            xs,
+            ws,
+            None,
+            dtypes.fp32,
+            lambda out: skinny_gemm(xs, ws, 2, None, dtypes.fp32, out=out),
+        )
+    )
+    # A 3-D input that `view` cannot flatten goes to `F.linear` untuned.
+    xt = rand(4, 64, 8192).transpose(0, 1)
+    via_mm("unflattenable 3-D input", None, xt, w, None, bf16)
+    if get_gfx() == "gfx950":
+        xa, wa = rand(64, 5120), rand(256, 5120)
+        wa_shuffled = shuffle_weight(wa, layout=(16, 16))
+        # fp32 out: at bf16 out this path differs run to run by up to 3.0 here,
+        # which would drown the comparison against its own `out=None` call.
+        via_mm("asm shuffled", "asm", xa, wa_shuffled, None, dtypes.fp32)
+    for lib, (m, n, k, has_bias, otype) in _tuned_rows_per_libtype(
+        ["asm", "flydsl", "opus", "triton"]
+    ).items():
+        via_mm(
+            f"{lib} tuned {m}x{n}x{k}",
+            lib,
+            rand(m, k),
+            rand(n, k),
+            rand(n) if has_bias else None,
+            otype,
+        )
+    init_hipblas()
+    xh, wh, bh = rand(128, 4096), rand(256, 4096), rand(256)
+    cases.append(
+        (
+            "hipblaslt bf16+bias",
+            None,
+            xh,
+            wh,
+            bh,
+            bf16,
+            lambda out: hipb_gemm(xh, wh, -1, bh, bf16, out=out),
+        )
+    )
+
+    rows = [_check_out(*case) for case in cases]
+    torch.cuda.synchronize()
+    bad = [
+        r["case"]
+        for r in rows
+        if not (r["returns out"] and r["written"] and r["err vs no out"] == 0)
+    ]
+    assert not bad, f"out= not honoured by: {bad}"
+    return rows
+
+
+def test_gemm_compile_packed_params(m=256, n=512, k=1024, layers=3):
+    """`torch.compile` of `tgemm.mm` whose weights and biases share one storage.
+
+    The op must not declare its inputs as mutated: functionalization then
+    clones the shared base storage and reads past the end of each bias view.
+    """
+    flat = torch.randn(layers * (n * k + n), dtype=dtypes.bf16, device="cuda") * 0.05
+    params = []
+    for i in range(layers):
+        base = i * (n * k + n)
+        params.append(flat[base : base + n * k].view(n, k))
+        params.append(flat[base + n * k : base + n * k + n])
+    x = torch.randn(m, k, dtype=dtypes.bf16, device="cuda")
+
+    def fn(x, *wb):
+        return [tgemm.mm(x, wb[2 * i], wb[2 * i + 1]) for i in range(layers)]
+
+    outs = torch.compile(fn, fullgraph=True)(x, *params)
+    refs = fn(x, *params)
+    rows = []
+    for i, (out, ref) in enumerate(zip(outs, refs)):
+        err = checkAllclose(ref, out, msg=f"compile packed layer {i}: ")
+        rows.append({"case": f"compile packed layer {i}", "err vs eager": err})
+    assert all(r["err vs eager"] == 0 for r in rows), rows
+    return rows
+
+
 parser = argparse.ArgumentParser(
     formatter_class=argparse.RawTextHelpFormatter,
     description="config input of a16w16_gemm_test",
@@ -517,11 +696,13 @@ parser.add_argument(
     "--test",
     type=str,
     nargs="*",
-    choices=["normal", "skinny"],
+    choices=["normal", "skinny", "out", "compile"],
     default=["normal"],
     help="""Select test to run.
     e.g.: -t normal    # default
-          or -t skinny""",
+          or -t skinny
+          or -t out    # tgemm.mm(out=) on every backend
+          or -t compile    # torch.compile with weights/biases in one storage""",
 )
 parser.add_argument(
     "-d",
@@ -607,6 +788,10 @@ for test in args.test:
     elif test == "skinny":
         ret = test_skinny_gemm()
         df += ret
+    elif test == "out":
+        df += test_gemm_out()
+    elif test == "compile":
+        df += test_gemm_compile_packed_params()
 df = pd.DataFrame(df)
 df_md = df.to_markdown(index=False)
 aiter.logger.info("gemm_a16w16 summary (markdown):\n%s", df_md)

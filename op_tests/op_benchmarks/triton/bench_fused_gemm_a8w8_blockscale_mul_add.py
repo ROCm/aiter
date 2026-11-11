@@ -1,5 +1,6 @@
+import functools
+
 import torch
-import triton
 
 from aiter.ops.triton.gemm.fused.fused_gemm_a8w8_blockscale_mul_add import (
     fused_gemm_a8w8_blockscale_mul_add,
@@ -14,6 +15,9 @@ from op_tests.op_benchmarks.triton.utils.benchmark_utils import (
     get_caller_name_no_ext,
     print_vgpr,
 )
+from op_tests.op_benchmarks.triton.utils.rotating_buffer_bench import (
+    RotatingBufferBench,
+)
 from op_tests.triton_tests.gemm.basic.test_gemm_a8w8_blockscale import (
     generate_gemm_a8w8_blockscale_inputs,
 )
@@ -26,7 +30,14 @@ kernel_label = "fused_gemm_a8w8_blockscale_mul_add"
 shape = "(N=7168, K=256)"
 
 
-def bench_fn(M: int, N: int, K: int, metric: str, **kwargs):
+def bench_fn(
+    bencher: RotatingBufferBench,
+    M: int,
+    N: int,
+    K: int,
+    metric: str,
+    **kwargs,
+):
     """
     Single-shape timing of the fused A8W8 blockscale GEMM + mul_add epilogue via
     its public wrapper.
@@ -43,7 +54,8 @@ def bench_fn(M: int, N: int, K: int, metric: str, **kwargs):
     c_dtype = torch.bfloat16
 
     # GEMM inputs. ``output=True`` pre-allocates ``y`` of shape (M, N).
-    x, w, _, x_scales, _, w_scales, y = generate_gemm_a8w8_blockscale_inputs(
+    _p_gen_gemm = functools.partial(
+        generate_gemm_a8w8_blockscale_inputs,
         M,
         N,
         K,
@@ -52,37 +64,40 @@ def bench_fn(M: int, N: int, K: int, metric: str, **kwargs):
         dtype=c_dtype,
         output=True,
     )
+    # (x, weight, weight_shuffled, x_scale, x_scale_shuffled, w_scale, y)
+    _out_vals_keys_gemm = ["x", "w", "_", "x_scales", "_", "w_scales", "y"]
+
     # mul/add operands: full (M, N) tensors (default operand case).
-    a, b = make_mul_add_ab(M, N, c_dtype, a_kind="tensor", b_kind="tensor")
+    _p_gen_mul_add = functools.partial(
+        make_mul_add_ab, M, N, c_dtype, a_kind="tensor", b_kind="tensor"
+    )
+    _out_vals_keys_mul_add = ["a", "b"]
+
+    rot_bufs = bencher.build_pool(
+        [_p_gen_gemm, _p_gen_mul_add], [_out_vals_keys_gemm, _out_vals_keys_mul_add]
+    )
+
+    kernel_fn = functools.partial(
+        fused_gemm_a8w8_blockscale_mul_add, dtype=c_dtype, fuse_type=0
+    )
 
     flops = 2.0 * M * N * K  # single fused output
-    # bytes moved, summed as numel() * element_size() per tensor; the (M, N)
-    # mul/add tensors and the output are all counted.
+    # bytes moved, derived from M/N/K; the blockscale scale tensors keep their
+    # own numel (one scale per block, which doesn't reduce to a clean M/N/K
+    # product). The (M, N) mul/add tensors and the output are all counted.
+    buf0 = rot_bufs[0]
+    a, b = buf0["a"], buf0["b"]
     mem = (
-        x.numel() * x.element_size()
-        + w.numel() * w.element_size()
-        + x_scales.numel() * x_scales.element_size()
-        + w_scales.numel() * w_scales.element_size()
-        + (a.numel() * a.element_size() if isinstance(a, torch.Tensor) else 0)
-        + (b.numel() * b.element_size() if isinstance(b, torch.Tensor) else 0)
-        + y.numel() * y.element_size()
+        (M * K) * buf0["x"].element_size()
+        + (N * K) * buf0["w"].element_size()
+        + buf0["x_scales"].numel() * buf0["x_scales"].element_size()
+        + buf0["w_scales"].numel() * buf0["w_scales"].element_size()
+        + ((M * N) * a.element_size() if isinstance(a, torch.Tensor) else 0)
+        + ((M * N) * b.element_size() if isinstance(b, torch.Tensor) else 0)
+        + (M * N) * buf0["y"].element_size()
     )
 
-    ms = triton.testing.do_bench(
-        lambda: fused_gemm_a8w8_blockscale_mul_add(
-            x,
-            w,
-            x_scales,
-            w_scales,
-            a,
-            b,
-            dtype=c_dtype,
-            y=y,
-            fuse_type=0,
-        ),
-        warmup=25,
-        rep=100,
-    )
+    ms = bencher.bench(kernel_fn)
 
     return metric_to_scalar(metric, ms, flops, mem)
 

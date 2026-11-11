@@ -8,7 +8,7 @@ import math
 import flydsl.compiler as flyc
 import flydsl.expr as fx
 from flydsl.expr import const_expr, range_constexpr, rocdl
-from flydsl.expr.rocdl import cluster, tdm_ops
+from flydsl.expr.rocdl import cluster
 from flydsl.expr.typing import Constexpr, T
 from flydsl.expr.typing import Vector as Vec
 from flydsl.runtime.device import get_rocm_arch
@@ -62,12 +62,37 @@ def launch_gemm_a8w8(
     batch: fx.Int32 = 1,
     a_preshuffle: Constexpr[bool] = False,
     a_scale_preshuffled: Constexpr[bool] = False,
+    b_scale_32x32: Constexpr[bool] = False,
+    k_tail: Constexpr[bool] = False,
 ):
     mx32 = is_mxscale and block_size == 32
     mx128 = is_mxscale and block_size == 128
     if a_scale_preshuffled and not mx32:
         raise ValueError("a_scale_preshuffled is supported only for mxfp8_32")
+    # b_scale_32x32: B scale is the raw row-major [N/32, K/32] 32x32 block
+    # scale (one e8m0 per 32x32 weight block) instead of the n32k4-shuffled
+    # [N, K/32] 1x32 one. A 32x32 block is a 1x32 scale repeated over its 32
+    # rows, so every lane of a 32-column group reads the same word.
+    if b_scale_32x32 and not mx32:
+        raise ValueError("b_scale_32x32 is supported only for mxfp8_32")
     preload = preload_ks > 0
+    # k_tail: K is a multiple of 32 but not of tile_k. The k-tile count rounds
+    # up and the last tile's K-advancing TDM loads clamp their inner extent to
+    # the valid K, so the hardware zero-fills the rest and those products add
+    # nothing. Only the row-major layouts are covered: a shuffled A or n32k4
+    # scale does not keep its leading K bytes contiguous.
+    if k_tail and not (
+        mx32
+        and b_scale_32x32
+        and not a_preshuffle
+        and not a_scale_preshuffled
+        and split_k == 1
+        and not preload
+    ):
+        raise ValueError(
+            "[FlyDSL gfx1250] k_tail needs mxfp8_32 with a 32x32 B scale, a "
+            "row-major A and A scale, split_k 1 and no scale preload"
+        )
     # A-preshuffle: A is shuffle_mxfp8fp4_a-tiled, [M, K] -> [M/2, K/128, 2, 128]
     A_PAIR = 2 if a_preshuffle else 1
     if a_preshuffle and batched:
@@ -79,19 +104,25 @@ def launch_gemm_a8w8(
         raise ValueError(
             f"[FlyDSL gfx1250] a_preshuffle needs an even tile_m, got {tile_m}"
         )
-    if batched and not (mx128 and split_k == 1):
+    if batched and not (is_mxscale and split_k == 1):
         raise ValueError(
-            "[FlyDSL gfx1250] the batched path needs mx128 and split_k==1, got "
+            "[FlyDSL gfx1250] the batched path needs mxscale and split_k==1, got "
             f"is_mxscale={is_mxscale}, block_size={block_size}, split_k={split_k}"
+        )
+    if batched and mx32 and a_scale_preshuffled:
+        raise ValueError(
+            "[FlyDSL gfx1250] the batched mxfp8_32 path reads a row-major "
+            "[M, B, K/32] A scale; a_scale_preshuffled is 2-D only"
         )
     if preload and not (
         batched
+        and mx128
         and cluster_m == 1
         and cluster_n == 1
         and preload_ks % (tile_k // 128) == 0
     ):
         raise ValueError(
-            f"[FlyDSL gfx1250] preload_ks={preload_ks} needs batched, no cluster "
+            f"[FlyDSL gfx1250] preload_ks={preload_ks} needs batched mx128, no cluster "
             f"and a multiple of tile_k/128={tile_k // 128}; got batched={batched}, "
             f"cluster={cluster_m}x{cluster_n}"
         )
@@ -141,7 +172,11 @@ def launch_gemm_a8w8(
         if mx32
         else ((tile_m, K_WS) if sa_m_major else (K_WS, tile_m))
     )
-    SB_SHAPE = (tile_n // 32, tile_k) if mx32 else (N_BLOCKS, K_WS)
+    SB_SHAPE = (
+        ((tile_n // 32, tile_k // 32) if b_scale_32x32 else (tile_n // 32, tile_k))
+        if mx32
+        else (N_BLOCKS, K_WS)
+    )
     STAGE_SA = ((SA_SHAPE[0] * SA_SHAPE[1] + 15) // 16) * 16
     STAGE_SB = ((SB_SHAPE[0] * SB_SHAPE[1] + 15) // 16) * 16
     SA_OFF = STAGE_A + STAGE_B
@@ -182,6 +217,8 @@ def launch_gemm_a8w8(
         + (f"_pre{preload_ks}" if preload else "")
         + ("_apre" if a_preshuffle else "")
         + ("_aspre" if a_scale_preshuffled else "")
+        + ("_bs32x32" if b_scale_32x32 else "")
+        + ("_ktail" if k_tail else "")
     )
 
     @flyc.kernel(name=kernel_name, known_block_size=[block, 1, 1])
@@ -198,7 +235,12 @@ def launch_gemm_a8w8(
         i32_lda: fx.Int32,
         i32_ldc: fx.Int32,
     ):
-        K_TILES = i32_k // (tile_k * split_k)
+        if const_expr(k_tail):
+            # The ragged last tile needs no separate extent: every view spans
+            # the whole K and boundary_check drops what lies past it.
+            K_TILES = (i32_k + tile_k - 1) // tile_k
+        else:
+            K_TILES = i32_k // (tile_k * split_k)
         k64 = fx.Int64(i32_k)
         lda64 = fx.Int64(i32_lda)
         ldc64 = fx.Int64(i32_ldc)
@@ -206,6 +248,7 @@ def launch_gemm_a8w8(
         tid = fx.Int32(fx.thread_idx.x)
         bid_x, bid_y, bid_z = fx.block_idx
         kt_base = fx.Int64(bid_z) * fx.Int64(K_TILES) if split_k > 1 else None
+        kt_base_i32 = fx.Int32(bid_z) * fx.Int32(K_TILES) if split_k > 1 else None
         bz64 = fx.Int64(bid_z) if const_expr(batched) else None
         wave = rocdl.readfirstlane(T.i32, tid // WAVE)
         lane = tid % WAVE
@@ -230,6 +273,10 @@ def launch_gemm_a8w8(
                 (i32_m + 31) // 32 - blk_m // 32
                 if const_expr(a_scale_preshuffled)
                 else mn_oob
+            )
+            # Batched A scale is [M, B, K//32]: its row stride is B * K//32.
+            stride_ask64 = (
+                fx.Int64(i32_stride_ascale_k) if const_expr(batched) else k64 // 32
             )
         elif const_expr(mx128):
             nb_oob = (i32_n // 128 - blk_n // 128) if not ALIGNED_N else None
@@ -268,157 +315,205 @@ def launch_gemm_a8w8(
             b_off0 = b_off0 + bz64 * fx.Int64(i32_n) * k64
 
         W_A, W_B = 0, 1
-        gA = _gv(gA_base, a_off0, (A_LDS_ROWS, A_TDM_ROW), (A_TDM_ROW, 1))
-        atomA = fx.atom_set_value(
-            fx.rocdl.make_tdm_atom(
-                gA,
-                [a_oob, None],
-                strides=[lda64 * A_PAIR, None],
-                num_warps=1,
-                pad_interval=A_PAD_INTERVAL,
-                pad_amount=LDS_PAD_A,
-                early_timeout=True,
-            ),
-            "workgroup_mask",
-            a_mask,
+        # A spans the whole K like the scales do. Its LDS row pads once per
+        # A_PAD_INTERVAL, and a flat (row, stride) box can only state a single
+        # skip at the end, so a row needing more than one pad splits its K axis
+        # on the view and the box alike; A_PAD_SPLIT == 1 keeps the flat form.
+        A_K_CHUNKS = (i32_k * A_PAIR) // A_PAD_INTERVAL
+        if const_expr(A_PAD_SPLIT == 1):
+            A_TILE = (A_LDS_ROWS, A_TDM_ROW)
+            A_BOX_STRIDE = (A_LDS_ROW, 1)
+            A_BOX = fx.make_layout(A_TILE, A_BOX_STRIDE)
+            gA = _gv(gA_base, a_off0, (a_oob, i32_k * A_PAIR), (lda64 * A_PAIR, 1))
+        else:
+            A_TILE = (A_LDS_ROWS, (A_PAD_SPLIT, A_PAD_INTERVAL))
+            A_BOX_STRIDE = (A_LDS_ROW, (A_PAD_INTERVAL + LDS_PAD_A, 1))
+            A_BOX = fx.make_layout(A_TILE, A_BOX_STRIDE)
+            gA = _gv(
+                gA_base,
+                a_off0,
+                (a_oob, (A_K_CHUNKS, A_PAD_INTERVAL)),
+                (lda64 * A_PAIR, (A_PAD_INTERVAL, 1)),
+            )
+        atomA, coordA = fx.rocdl.cdna5.make_tiled_tdm_atom(
+            fx.rocdl.TensorLoad(), gA, A_BOX, A_TILE, num_warps=1
         )
-        gB = _gv(gB_base, b_off0, (tile_n // 16, tile_k * 16), (tile_k * 16, 1))
-        atomB = fx.atom_set_value(
-            fx.rocdl.make_tdm_atom(
-                gB,
-                [None, None],
-                strides=[k64 * 16, None],
-                num_warps=1,
-                early_timeout=True,
-            ),
-            "workgroup_mask",
-            b_mask,
+        atomA = fx.atom_set_value(atomA, "workgroup_mask", a_mask)
+        blkA = fx.zipped_divide(coordA, A_TILE)[None, (0, None)]
+        B_TILE = (tile_n // 16, tile_k * 16)
+        gB = _gv(gB_base, b_off0, (tile_n // 16, i32_k * 16), (k64 * 16, 1))
+        atomB, coordB = fx.rocdl.cdna5.make_tiled_tdm_atom(
+            fx.rocdl.TensorLoad(),
+            gB,
+            fx.make_layout(B_TILE, (B_LDS_ROW, 1)),
+            B_TILE,
+            num_warps=1,
         )
-        W_SA = W_SB = gSA = atomSA = gSB = atomSB = sa_imm = sb_imm = None
+        atomB = fx.atom_set_value(atomB, "workgroup_mask", b_mask)
+        blkB = fx.zipped_divide(coordB, B_TILE)[None, (0, None)]
+        W_SA = W_SB = gSA = atomSA = gSB = atomSB = blkSA = blkSB = None
         if const_expr(is_mxscale):
 
-            def _tdm1(
-                gt, outer, inner, o_stride, mask=0
-            ):  # single-warp 2-D atom, both dims clamped
-                atom = fx.rocdl.make_tdm_atom(
+            def _tdm1(gt, tile, lds_row, mask=0, k_outer=False):
+                """Single-warp 2-D scale atom, clamped by its own view.
+
+                ``gt`` spans the whole K, not one k-tile: the rest index the
+                copy uses carries the split-k base, so a one-split extent
+                would put the later tiles out of bounds, where boundary_check
+                returns zeros instead of failing. The ragged last tile is
+                clamped by that same extent, which is why no caller writes an
+                extent per iteration any more.
+
+                ``k_outer`` is the non-m-major mx128 A scale, whose K is the
+                outer axis; its rest has to come from that axis instead.
+                """
+                atom, coord = fx.rocdl.cdna5.make_tiled_tdm_atom(
+                    fx.rocdl.TensorLoad(),
                     gt,
-                    [outer, inner],
-                    strides=[o_stride, None],
+                    fx.make_layout(tile, (lds_row, 1)),
+                    tile,
                     num_warps=1,
-                    early_timeout=True,
                 )
-                return fx.atom_set_value(atom, "workgroup_mask", mask)
+                atom = fx.atom_set_value(atom, "workgroup_mask", mask)
+                keep = (None, 0) if k_outer else (0, None)
+                return atom, fx.zipped_divide(coord, tile)[None, keep]
 
             W_SA, W_SB = 2 % num_waves, 3 % num_waves
+            # Every scale view below spans the whole K (see _tdm1): the K-tile
+            # count the rest index walks is i32_k // tile_k for mx32 and
+            # i32_k // 128 for mx128, split-k base included.
             if const_expr(mx32):
                 if const_expr(a_scale_preshuffled):
                     sa_off0 = blk_m64 // 32 * k64
-                    gSA = _gv(arg_scale_a, sa_off0, SA_SHAPE, (tile_k, 1))
-                    atomSA = _tdm1(gSA, sa_oob, None, k64, a_mask)
-
-                    def sa_imm(kt):
-                        return fx.Int64(kt) * tile_k
-
+                    gSA = _gv(arg_scale_a, sa_off0, (sa_oob, i32_k), (k64, 1))
+                    atomSA, blkSA = _tdm1(gSA, SA_SHAPE, SA_SHAPE[1], a_mask)
                 else:
-                    sa_off0 = blk_m64 * (k64 // 32)
-                    gSA = _gv(arg_scale_a, sa_off0, SA_SHAPE, (tile_k // 32, 1))
-                    atomSA = _tdm1(gSA, sa_oob, None, k64 // 32, a_mask)
+                    sa_off0 = blk_m64 * stride_ask64
+                    if const_expr(batched):
+                        sa_off0 = sa_off0 + bz64 * (k64 // 32)
+                    gSA = _gv(
+                        arg_scale_a, sa_off0, (sa_oob, i32_k // 32), (stride_ask64, 1)
+                    )
+                    atomSA, blkSA = _tdm1(gSA, SA_SHAPE, SA_SHAPE[1], a_mask)
 
-                    def sa_imm(kt):
-                        return fx.Int64(kt) * (tile_k // 32)
-
-                sb_off0 = blk_n64 // 32 * k64
-                gSB = _gv(arg_scale_b, sb_off0, SB_SHAPE, (tile_k, 1))
-                atomSB = _tdm1(gSB, None, None, k64, b_mask)
-
-                def sb_imm(kt):
-                    return fx.Int64(kt) * tile_k
-
+                # Both B scale layouts hold N*K/1024 (32x32) or N*K/32 (n32k4)
+                # bytes per batch, one 32-row super-row after another.
+                sb_row = k64 // 32 if const_expr(b_scale_32x32) else k64
+                sb_off0 = blk_n64 // 32 * sb_row
+                if const_expr(batched):
+                    sb_off0 = sb_off0 + bz64 * (fx.Int64(i32_n) // 32) * sb_row
+                sb_k = i32_k // 32 if const_expr(b_scale_32x32) else i32_k
+                gSB = _gv(arg_scale_b, sb_off0, (SB_SHAPE[0], sb_k), (sb_row, 1))
+                atomSB, blkSB = _tdm1(gSB, SB_SHAPE, SB_SHAPE[1], b_mask)
             else:
                 sb_off0 = blk_n64 // 128 * (k64 // 128)
                 if const_expr(batched):
                     sb_off0 = sb_off0 + bz64 * (fx.Int64(i32_n) // 128) * (k64 // 128)
                 if const_expr(sa_m_major):
                     sa_off0 = blk_m64 * stride_ask64 + bz64 * (k64 // 128)
-                    gSA = _gv(arg_scale_a, sa_off0, SA_TDM_SHAPE, (SA_LDS_ROW, 1))
-                    atomSA = _tdm1(gSA, mn_oob, None, stride_ask64, a_mask)
-
-                    def sa_imm(kt):
-                        return fx.Int64(kt * K_WS)
-
+                    gSA = _gv(
+                        arg_scale_a, sa_off0, (mn_oob, i32_k // 128), (stride_ask64, 1)
+                    )
+                    atomSA, blkSA = _tdm1(gSA, SA_TDM_SHAPE, SA_LDS_ROW, a_mask)
                 else:
+                    # K is this layout's outer axis, so the rest comes from it
+                    # and the tile's inner width (tile_m) overhangs mn_oob,
+                    # which boundary_check drops.
                     sa_off0 = blk_m64
-                    gSA = _gv(arg_scale_a, sa_off0, SA_SHAPE, (tile_m, 1))
-                    atomSA = _tdm1(gSA, None, mn_oob, stride_ask64, a_mask)
+                    gSA = _gv(
+                        arg_scale_a, sa_off0, (i32_k // 128, mn_oob), (stride_ask64, 1)
+                    )
+                    atomSA, blkSA = _tdm1(
+                        gSA, SA_SHAPE, SA_SHAPE[1], a_mask, k_outer=True
+                    )
 
-                    def sa_imm(kt):
-                        return fx.Int64(kt * K_WS) * stride_ask64
+                # nb_oob is None exactly when every N tile is whole, and then
+                # N_BLOCKS is already the real row count.
+                sb_rows = N_BLOCKS if nb_oob is None else nb_oob
+                gSB = _gv(
+                    arg_scale_b, sb_off0, (sb_rows, i32_k // 128), (k64 // 128, 1)
+                )
+                atomSB, blkSB = _tdm1(gSB, SB_TDM_SHAPE, SB_LDS_ROW, b_mask)
 
-                gSB = _gv(arg_scale_b, sb_off0, SB_TDM_SHAPE, (SB_LDS_ROW, 1))
-                atomSB = _tdm1(gSB, nb_oob, None, k64 // 128, b_mask)
+        def _tcopy(w, atom, blk, ptr, tile, box_stride, stage, kt_i32):
+            """Wave ``w`` loads k-tile ``kt_i32`` of ``atom`` into ``ptr``.
 
-                def sb_imm(kt):
-                    return fx.Int64(kt) * K_WS
-
-        def _wcopy(w, atom, gt, lv, imm_offset):
+            The LDS view carries the size-1 rest tdm_partition needs; the
+            k-tile number replaces the old imm_offset, so nothing here scales
+            by a row width any more.
+            """
+            ts, tg = fx.rocdl.cdna5.tdm_partition(
+                atom,
+                0,
+                fx.make_layout(1, 1),
+                _lv(ptr, (tile, 1), (box_stride, stage)),
+                blk,
+            )
             if wave == w:
-                fx.copy(atom, gt, lv, imm_offset=imm_offset)
+                fx.copy(atom, tg[None, kt_i32], ts[None, 0])
 
         def issue(s, kt):
             pa = _buf_ptr(s)
-            ktg = fx.Int64(kt) if kt_base is None else fx.Int64(kt) + kt_base
-            _wcopy(
-                W_A,
-                atomA,
-                gA,
-                _lv(pa, (A_LDS_ROWS, A_TDM_ROW), (A_LDS_ROW, 1)),
-                ktg * A_TDM_ROW,
-            )
-            _wcopy(
+            ktb = fx.Int32(kt) if kt_base is None else fx.Int32(kt) + kt_base_i32
+            _tcopy(W_A, atomA, blkA, pa, A_TILE, A_BOX_STRIDE, STAGE_A, ktb)
+            _tcopy(
                 W_B,
                 atomB,
-                gB,
-                _lv(
-                    fx.add_offset(pa, STAGE_A),
-                    (tile_n // 16, tile_k * 16),
-                    (B_LDS_ROW, 1),
-                ),
-                ktg * (tile_k * 16),
+                blkB,
+                fx.add_offset(pa, STAGE_A),
+                B_TILE,
+                (B_LDS_ROW, 1),
+                (tile_n // 16) * B_LDS_ROW,
+                ktb,
             )
             if const_expr(is_mxscale and not preload):
-                _wcopy(
+                _tcopy(
                     W_SA,
                     atomSA,
-                    gSA,
-                    _lv(fx.add_offset(pa, SA_OFF), SA_SHAPE, (SA_SHAPE[1], 1)),
-                    sa_imm(ktg),
+                    blkSA,
+                    fx.add_offset(pa, SA_OFF),
+                    SA_SHAPE,
+                    (SA_SHAPE[1], 1),
+                    SA_SHAPE[0] * SA_SHAPE[1],
+                    ktb,
                 )
-                _wcopy(
+                _tcopy(
                     W_SB,
                     atomSB,
-                    gSB,
-                    _lv(fx.add_offset(pa, SB_OFF), SB_SHAPE, (SB_SHAPE[1], 1)),
-                    sb_imm(ktg),
+                    blkSB,
+                    fx.add_offset(pa, SB_OFF),
+                    SB_SHAPE,
+                    (SB_SHAPE[1], 1),
+                    SB_SHAPE[0] * SB_SHAPE[1],
+                    ktb,
                 )
 
         panel_ptr = fx.add_offset(base_ptr, PANEL_OFF) if const_expr(preload) else None
 
         def preload_scales():
-            _wcopy(
+            # The panel holds the first preload_ks worth, i.e. rest tile 0.
+            zero = fx.Int32(0)
+            _tcopy(
                 W_SA,
                 atomSA,
-                gSA,
-                _lv(panel_ptr, SA_TDM_SHAPE, (SA_LDS_ROW, 1)),
-                fx.Int64(0),
+                blkSA,
+                panel_ptr,
+                SA_TDM_SHAPE,
+                (SA_LDS_ROW, 1),
+                SA_TDM_SHAPE[0] * SA_LDS_ROW,
+                zero,
             )
-            _wcopy(
+            _tcopy(
                 W_SB,
                 atomSB,
-                gSB,
-                _lv(fx.add_offset(panel_ptr, PANEL_A), SB_TDM_SHAPE, (SB_LDS_ROW, 1)),
-                fx.Int64(0),
+                blkSB,
+                fx.add_offset(panel_ptr, PANEL_A),
+                SB_TDM_SHAPE,
+                (SB_LDS_ROW, 1),
+                SB_TDM_SHAPE[0] * SB_LDS_ROW,
+                zero,
             )
-            tdm_ops.tensor_wait(0)
+            rocdl.s_wait_tensorcnt(0)
             workgroup_barrier(use_cluster=False)
 
         def _scale_buf(pbuf, cur_kt):
@@ -498,7 +593,10 @@ def launch_gemm_a8w8(
         def load_sb(buf, sbuf, wn, ks):
             if const_expr(mx32):
                 col = wnb + wn * 16 + lane16
-                word = (col // 32) * SC_WORDS + ks * 32 + (col % 32)
+                if const_expr(b_scale_32x32):
+                    word = (col // 32) * (tile_k // 128) + ks
+                else:
+                    word = (col // 32) * SC_WORDS + ks * 32 + (col % 32)
                 return lds_load_b32(buf, SB_OFF + word * 4)[0]
             if const_expr(ALIGNED_N):
                 n_block = (
@@ -854,20 +952,26 @@ def launch_gemm_a8w8(
             c_off_rt = c_off_rt + bz64 * fx.Int64(i32_n)
         if const_expr(split_k > 1):
             c_off_rt = c_off_rt + fx.Int64(bid_z) * fx.Int64(i32_m) * ldc64
-        gtC = _gv(gC_base, c_off_rt, (tile_m, C_LDS_ROW), (C_LDS_ROW, 1))
-        atomC = fx.rocdl.make_tdm_atom(
+        C_TILE = (tile_m, C_LDS_ROW)
+        gtC = _gv(gC_base, c_off_rt, (mn_oob, tile_n), (ldc64, 1))
+        atomC, coordC = fx.rocdl.cdna5.make_tiled_tdm_atom(
+            fx.rocdl.TensorStore(),
             gtC,
-            [mn_oob, tile_n if C_PAD else None],
-            strides=[ldc64, None],
+            fx.make_layout(C_TILE, (C_LDS_ROW, 1)),
+            C_TILE,
             num_warps=num_waves,
-            early_timeout=False,
         )
-        fx.copy(
-            atomC,
-            _lv(fx.recast_iter(out_cls, base_ptr), (tile_m, C_LDS_ROW), (C_LDS_ROW, 1)),
-            gtC,
+        blkC = fx.zipped_divide(coordC, C_TILE)[None, (0, None)]
+        sC = _lv(
+            fx.recast_iter(out_cls, base_ptr),
+            (C_TILE, 1),
+            ((C_LDS_ROW, 1), tile_m * C_LDS_ROW),
         )
-        tdm_ops.tensor_wait(0)
+        tCs, tCg = fx.rocdl.cdna5.tdm_partition(
+            atomC, wave, fx.make_layout(num_waves, 1), sC, blkC
+        )
+        fx.copy(atomC, tCs[None, 0], tCg[None, 0])
+        rocdl.s_wait_tensorcnt(0)
 
     gx = (i32_m + (tile_m - 1)) // tile_m
     gy = (N + (tile_n - 1)) // tile_n

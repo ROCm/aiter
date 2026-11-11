@@ -26,9 +26,9 @@
 #include "aiter_ctypes_error.h"
 
 #include "aiter_hip_common.h"
-#include "opus/mla_decode_a8w8_16mx1_32nx4.hpp"
+#include "opus/gfx950/mla_decode_a8w8_16mx1_32nx4.hpp"
 #include "opus/mla_decode_kargs.h"
-#include "opus/mla_decode_mxfp8_16mx8_32nx1.hpp"
+#include "opus/gfx950/mla_decode_mxfp8_16mx8_32nx1.hpp"
 
 #include <algorithm>
 #include <cstdio>
@@ -40,7 +40,7 @@ AITER_CTYPES_ERROR_DEF
 
 namespace {
 
-// fp8 32mx4 / 64nx1 (csrc/kernels/mla/opus/mla_decode_a8w8_32mx4_64nx1.hpp): 4 waves x 32 packed
+// fp8 32mx4 / 64nx1 (csrc/kernels/mla/opus/gfx950/mla_decode_a8w8_32mx4_64nx1.hpp): 4 waves x 32 packed
 // query rows, i.e. the 128-row work items aiter's metadata packs by default for fp8. Prebuilt
 // only: its register map (Q, half of O and the K/V ring in AGPRs, the other half of O and both
 // score buffers in VGPRs) needs the pin toolchain, and a stock ROCm clang forces every MFMA into
@@ -83,7 +83,7 @@ inline bool opus_env_flag(const char* name)
 // (csrc/py_itfs_cu/asm_mla.cu): what asm runs on its qh32 / qseqlen4 kernel (128 packed rows
 // per workgroup) goes to 32mx4, what it runs on qh16 / qseqlen4 (64 rows) to 32mx2. nhead
 // here is nhead per KV head (MLA has one), after mla.py's fold of the non-native head counts.
-// aiter/mla.py keeps the same table so a shape with no build stays on the asm path.
+// aiter/mla.py asks opus_mla_decode_supported, so a shape with no build stays on the asm path.
 enum class OpusA8W8Route
 {
     k32mx4,
@@ -352,7 +352,7 @@ AITER_CTYPES_DEFINE_ENTRYPOINT_VOID(
     kargs.work_info_set =
         static_cast<const opus_mla_decode_work_info*>(work_info_set->data_ptr());
     kargs.H              = H;
-    kargs.total_tokens   = static_cast<int>(kv->size(0));
+    kargs.total_tokens   = static_cast<int>(kv->numel() / kHeadDimQk);
     kargs.softmax_scale  = softmax_scale;
     kargs.stride_q_b     = H * kHeadDimQk;
     kargs.stride_q_h     = kHeadDimQk;
@@ -385,6 +385,15 @@ AITER_CTYPES_DEFINE_ENTRYPOINT_VOID(
             kargs, q_scale, kv_scale, max_seqlen_q, causal, num_workers, stream);
     else
         AITER_CHECK(false, __func__, ": q/kv must be bf16 or fp8.");
+}
+
+// 1 if opus_mla_decode_fwd has a build for this shape (nhead as it will see it); bf16 has one
+// for every head count.
+AITER_CTYPES_DEFINE_ENTRYPOINT(opus_mla_decode_supported,
+                               (bool fp8, int nhead, int max_seqlen_q, hipStream_t stream),
+                               (fp8, nhead, max_seqlen_q, stream))
+{
+    return !fp8 || opus_a8w8_route(nhead, max_seqlen_q) != OpusA8W8Route::kNone;
 }
 
 AITER_CTYPES_DEFINE_ENTRYPOINT_VOID(

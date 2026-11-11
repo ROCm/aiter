@@ -369,7 +369,7 @@ def test_ncdhw_to_cblocked_mapping_and_zero_padding():
 
 def test_oidhw_to_kmajor_prepack_mapping_and_zero_padding():
     K_out, C, T, R, S, block_k = 2, 3, 2, 1, 2, 16
-    w = torch.arange(K_out * C * T * R * S, dtype=torch.float16).reshape(
+    w = torch.arange(K_out * C * T * R * S, device="cuda", dtype=torch.float16).reshape(
         K_out, C, T, R, S
     )
 
@@ -399,7 +399,7 @@ def test_oidhw_to_kmajor_prepack_mapping_and_zero_padding():
 
 def test_oidhw_to_3x3x3_prepack_mapping_and_zero_padding():
     K_out, C, block_c = 2, 3, 4
-    w = torch.arange(K_out * C * 3 * 3 * 3, dtype=torch.float16).reshape(
+    w = torch.arange(K_out * C * 3 * 3 * 3, device="cuda", dtype=torch.float16).reshape(
         K_out, C, 3, 3, 3
     )
 
@@ -431,7 +431,7 @@ def test_oidhw_to_3x3x3_prepack_mapping_and_zero_padding():
 def test_weight_prepack_cache_reuses_and_invalidates(monkeypatch):
     cache = conv_prepack._LRUPackCache(maxsize=2)
     monkeypatch.setattr(conv_prepack, "_PACK_CACHE_3D_GENERAL", cache)
-    w = torch.arange(3, dtype=torch.float16).reshape(1, 1, 1, 1, 3)
+    w = torch.arange(3, device="cuda", dtype=torch.float16).reshape(1, 1, 1, 1, 3)
 
     first, first_pad = conv_prepack.get_or_make_weight_pack_3d(w, block_k=4)
     cached, cached_pad = conv_prepack.get_or_make_weight_pack_3d(w, block_k=4)
@@ -485,7 +485,9 @@ def test_weight_prepack_cache_uses_lru_eviction(monkeypatch):
     cache = conv_prepack._LRUPackCache(maxsize=2)
     monkeypatch.setattr(conv_prepack, "_PACK_CACHE_3D_GENERAL", cache)
     weights = [
-        (torch.arange(3, dtype=torch.float16) + offset).reshape(1, 1, 1, 1, 3)
+        (torch.arange(3, device="cuda", dtype=torch.float16) + offset).reshape(
+            1, 1, 1, 1, 3
+        )
         for offset in (0, 10, 20)
     ]
 
@@ -556,16 +558,16 @@ def test_general_masks_weight_tail_when_block_k_exceeds_pack_granularity(monkeyp
     ids=["stride-length", "stride-zero", "padding-negative", "dilation-zero"],
 )
 def test_invalid_spatial_parameters(kwargs, match):
-    x = torch.empty((1, 4, 3, 4, 4), dtype=torch.float16)
-    w = torch.empty((4, 4, 1, 1, 1), dtype=torch.float16)
+    x = torch.empty((1, 4, 3, 4, 4), device="cuda", dtype=torch.float16)
+    w = torch.empty((4, 4, 1, 1, 1), device="cuda", dtype=torch.float16)
 
     with pytest.raises(ValueError, match=match):
         conv3d(x, w, **kwargs)
 
 
 def test_invalid_layout():
-    x = torch.empty((1, 4, 3, 4, 4), dtype=torch.float16)
-    w = torch.empty((4, 4, 1, 1, 1), dtype=torch.float16)
+    x = torch.empty((1, 4, 3, 4, 4), device="cuda", dtype=torch.float16)
+    w = torch.empty((4, 4, 1, 1, 1), device="cuda", dtype=torch.float16)
 
     with pytest.raises(ValueError, match="layout must be 'ncdhw' or 'ndhwc'"):
         conv3d(x, w, layout="nchw")
@@ -612,7 +614,7 @@ def test_nonpositive_output_shape():
 
 
 def test_3x3x3_prepack_rejects_other_kernel_shapes():
-    w = torch.empty((4, 4, 1, 3, 3), dtype=torch.float16)
+    w = torch.empty((4, 4, 1, 3, 3), device="cuda", dtype=torch.float16)
 
     with pytest.raises(ValueError, match="3x3x3 prepack requires a 3x3x3 weight"):
         prepack_oidhw_to_3x3x3(w)
@@ -1057,8 +1059,8 @@ def test_route_and_run_dispatches_to_selected_wrapper(
     for name in wrapper_names:
         monkeypatch.setattr(conv3d_module, name, wrapper(name))
 
-    x = torch.empty((1, 4, 3, 5, 7))
-    w = torch.empty((6, 4, 3, 3, 3))
+    x = torch.empty((1, 4, 3, 5, 7), device="cuda", dtype=torch.float32)
+    w = torch.empty((6, 4, 3, 3, 3), device="cuda", dtype=torch.float32)
     result = conv3d_module._route_and_run(
         x,
         w,
@@ -1148,7 +1150,15 @@ def test_prepack_launcher_uses_complete_3d_key(monkeypatch):
     monkeypatch.setattr(conv_launch, "_ncx_to_cblocked_kernel", kernel)
 
     conv_launch._launch_ncdhw_to_cblocked(
-        torch.empty(1), torch.empty(1), 2, 65, 3, 5, 7, 128, 64
+        torch.empty(1, device="cuda", dtype=torch.float32),
+        torch.empty(1, device="cuda", dtype=torch.float32),
+        2,
+        65,
+        3,
+        5,
+        7,
+        128,
+        64,
     )
 
     expected = [
@@ -1174,10 +1184,10 @@ def test_general_launcher_uses_complete_3d_key_and_layout(monkeypatch):
     monkeypatch.setattr(conv_launch, "_conv3d_general_kernel", kernel)
 
     conv_launch._launch_general_3d(
-        torch.empty(1),
-        torch.empty(1),
+        torch.empty(1, device="cuda", dtype=torch.float32),
+        torch.empty(1, device="cuda", dtype=torch.float32),
         None,
-        torch.empty(1),
+        torch.empty(1, device="cuda", dtype=torch.float32),
         2,
         5,
         5,
@@ -1220,10 +1230,10 @@ def test_1x1x1_launcher_uses_complete_3d_key_and_layout(monkeypatch):
     monkeypatch.setattr(conv_launch, "_conv3d_1x1x1_kernel", kernel)
 
     conv_launch._launch_1x1x1_3d(
-        torch.empty(1),
-        torch.empty((7, 5, 1, 1, 1)),
+        torch.empty(1, device="cuda", dtype=torch.float32),
+        torch.empty((7, 5, 1, 1, 1), device="cuda", dtype=torch.float32),
         None,
-        torch.empty(1),
+        torch.empty(1, device="cuda", dtype=torch.float32),
         2,
         5,
         3,
@@ -1254,10 +1264,10 @@ def test_3x3x3_launchers_use_complete_3d_key(monkeypatch, layout):
     seen = []
     kernel = _KernelSpy()
     common = [
-        torch.empty(1),
-        torch.empty(1),
+        torch.empty(1, device="cuda", dtype=torch.float32),
+        torch.empty(1, device="cuda", dtype=torch.float32),
         None,
-        torch.empty(1),
+        torch.empty(1, device="cuda", dtype=torch.float32),
         2,
         65,
         4,
@@ -1331,16 +1341,18 @@ def test_winograd_launchers_use_complete_3d_key_and_axes(
     monkeypatch.setattr(
         conv_launch, "_winograd_hw_f4x3_output_transform_kernel", kernels[2]
     )
-    x = torch.empty((2, 65, 4, 9, 11), dtype=torch.float16)
+    x = torch.empty((2, 65, 4, 9, 11), device="cuda", dtype=torch.float16)
     x_blocked = (
-        torch.empty((2, 2, 4, 9, 11, 64), dtype=torch.float16) if use_cblocked else None
+        torch.empty((2, 2, 4, 9, 11, 64), device="cuda", dtype=torch.float16)
+        if use_cblocked
+        else None
     )
 
     conv_launch._launch_winograd_hw_f4x3(
         x,
-        torch.empty(1),
+        torch.empty(1, device="cuda", dtype=torch.float32),
         None,
-        torch.empty(1),
+        torch.empty(1, device="cuda", dtype=torch.float32),
         2,
         65,
         4,

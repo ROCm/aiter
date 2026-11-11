@@ -10,12 +10,23 @@ import torch
 
 # The MX combine wire, shared by the gemm2 scatter epilogue that writes it
 # (mxfp4_preshuffle_gfx1250_tdm.py) and the reduce that reads it (combine.py).
-# A slot is a payload plane of hidden fp8 bytes -- or half that many fp4 bytes --
-# followed by a scale plane of hidden/COMBINE_SCALE_BLOCK e8m0 bytes.
+# A slot is hidden/COMBINE_CHUNK chunks, each its fp8 or fp4 payload and then a
+# COMBINE_SCALE_LINE line that starts with its e8m0 scales, one per
+# COMBINE_SCALE_BLOCK features. The scales get a whole line because a remote
+# write covering part of a cache line costs far more than its bytes.
 #
-# Both plane bases stay cache-line aligned -- the payload plane is a multiple of
-# 128 bytes and the slot stride is a power of two -- and that must not slip.
+# Chunks start cache-line aligned and the slot stride is a power of two; that
+# must not slip. 256 is the smallest chunk whose payload is whole lines on every
+# wire (fp4 128B, fp8 256B, bf16 512B) and whose scales are a whole dword.
 COMBINE_SCALE_BLOCK = 32
+COMBINE_CHUNK = 256
+COMBINE_SCALE_LINE = 128
+
+
+def combine_chunk_bytes(quant_bits: int) -> int:
+    """Wire bytes of one chunk: its payload, then its scale line."""
+    return COMBINE_CHUNK * quant_bits // 8 + COMBINE_SCALE_LINE
+
 
 _DTYPE_INFO = {
     torch.int8: ("|i1", 1, None),
@@ -93,6 +104,10 @@ class Stage2ScatterContext:
     # gemm2 epilogue quantize per 1x32 e8m0 before the P2P write and have
     # ep_combine_fused dequantize on the way out.
     combine_quant_bits: int = 0
+    # S1F (AITER_MEGA_S1F=1): a stand-in for the GEMM1 launch with the
+    # signature of ``flydsl_grouped_gemm_a8w4_masked``; it runs the fused
+    # dispatch + GEMM1 stage-1 kernel instead. None keeps the default GEMM1.
+    stage1_gemm1: object = None
 
     def __post_init__(self):
         if self.combine_quant_bits not in (0, 8, 4):

@@ -2,6 +2,616 @@
 // Copyright (C) 2025-2026, Advanced Micro Devices, Inc. All rights reserved.
 
 #include "v1_comm.cuh"
+#include <cstdlib>
+#include <cstring>
+
+constexpr int32_t kPaMetadataSharedMaxBatches = 512;
+constexpr int32_t kPaMetadataSharedMaxWaves = kPaMetadataSharedMaxBatches / opus::get_warp_size();
+constexpr int32_t kPaMetadataMaxParallelBatches = 32768;
+// Larger pages leave few tasks, where the serial generator is faster than the parallel launch.
+constexpr int32_t kPaMetadataParallelPageSize = 16;
+
+struct PaMetadataV12ChunkRecord
+{
+    int64_t pages;
+    int32_t tasks;
+    int32_t reductions;
+    int32_t partials;
+    int32_t reserved[3];
+};
+
+static_assert(sizeof(PaMetadataV12ChunkRecord) == sizeof(PaWorkInfo));
+
+__device__ __forceinline__ int64_t pa_metadata_v1_2_prefix_sum(int64_t value)
+{
+    for(int32_t offset = 1; offset < opus::get_warp_size(); offset <<= 1)
+    {
+        const int64_t previous = __shfl_up(static_cast<long long>(value), offset);
+        if(opus::lane_id() >= offset)
+            value += previous;
+    }
+    return value;
+}
+
+__device__ __forceinline__ int64_t pa_metadata_v1_2_divide(int64_t numerator, int64_t denominator)
+{
+    if(numerator <= int64_t{0xffffffff} && denominator <= int64_t{0xffffffff})
+        return static_cast<uint32_t>(numerator) / static_cast<uint32_t>(denominator);
+    return numerator / denominator;
+}
+
+__device__ __forceinline__ int32_t pa_metadata_v1_2_worker(
+    int64_t offset, int64_t total, int32_t workers)
+{
+    const int64_t average = pa_metadata_v1_2_divide(total, workers);
+    const int64_t remainder = total - average * workers;
+    const int64_t larger_payload = (average + 1) * remainder;
+    const int64_t worker = offset < larger_payload
+        ? pa_metadata_v1_2_divide(offset, average + 1)
+        : remainder + pa_metadata_v1_2_divide(offset - larger_payload, max(average, int64_t{1}));
+    return static_cast<int32_t>(min(worker, static_cast<int64_t>(workers - 1)));
+}
+
+__device__ __forceinline__ int32_t pa_metadata_v1_2_parts(
+    int64_t begin, int64_t pages, int64_t total, int32_t workers)
+{
+    if(pages == 0)
+        return 0;
+    return pa_metadata_v1_2_worker(begin + pages - 1, total, workers) -
+           pa_metadata_v1_2_worker(begin, total, workers) + 1;
+}
+
+__device__ __forceinline__ int64_t pa_metadata_v1_2_block_prefix(
+    int64_t value, int64_t* wave_totals, bool wave_only)
+{
+    const int32_t lane = opus::lane_id();
+    const int32_t wave = threadIdx.x / opus::get_warp_size();
+    const int32_t waves = blockDim.x / opus::get_warp_size();
+    const int64_t prefix = pa_metadata_v1_2_prefix_sum(value);
+    if(wave_only)
+        return prefix;
+    if(lane == opus::get_warp_size() - 1)
+        wave_totals[wave] = prefix;
+    __syncthreads();
+    if(wave == 0)
+    {
+        const int64_t wave_prefix = pa_metadata_v1_2_prefix_sum(
+            lane < waves ? wave_totals[lane] : 0);
+        if(lane < waves)
+            wave_totals[lane] = wave_prefix;
+    }
+    __syncthreads();
+    const int64_t result = prefix + (wave > 0 ? wave_totals[wave - 1] : 0);
+    __syncthreads();
+    return result;
+}
+
+__device__ __forceinline__ void pa_metadata_v1_2_emit(
+    PaMetadataV1KernelParameter params, int32_t sequence, int32_t part,
+    int32_t sequence_parts, int64_t pages_before, int32_t tasks_before,
+    int32_t reductions_before, int32_t partials_before, int32_t total_tasks,
+    int64_t total_pages)
+{
+    const int32_t workers = params.num_splits / params.num_heads_k;
+    const int32_t first_worker = pa_metadata_v1_2_worker(pages_before, total_pages, workers);
+    const int32_t worker = first_worker + part;
+    const int64_t average = pa_metadata_v1_2_divide(total_pages, workers);
+    const int64_t remainder = total_pages - average * workers;
+    const int32_t pages = (static_cast<uint32_t>(max(params.p_context_lens[sequence], 0)) +
+                           params.block_size - 1) >> (__ffs(params.block_size) - 1);
+    const int64_t begin = max(pages_before, worker * average + min(int64_t{worker}, remainder));
+    const int64_t end = min(pages_before + pages,
+        (worker + 1) * average + min(int64_t{worker + 1}, remainder));
+    const int32_t qo_start = params.p_seqlens_qo_indptr[sequence];
+    const int32_t qo_end = params.p_seqlens_qo_indptr[sequence + 1];
+    const int32_t partial = sequence_parts > 1 ? partials_before + part * (qo_end - qo_start) : -1;
+    if(sequence_parts > 1)
+        params.p_reduce_partial_map[reductions_before + part] = partial;
+    auto* works = reinterpret_cast<PaWorkInfo*>(params.p_work_info_set_raw);
+    for(int32_t head = 0; head < params.num_heads_k; ++head)
+    {
+        PaWorkInfo work{};
+        work.batch_idx = sequence;
+        work.partial_qo_loc = partial;
+        work.qo_start = qo_start;
+        work.qo_end = qo_end;
+        work.kv_start = params.p_pages_kv_indptr[sequence] + static_cast<int32_t>(begin - pages_before);
+        work.kv_end = params.p_pages_kv_indptr[sequence] + static_cast<int32_t>(end - pages_before);
+        work.kv_offset = head * workers + worker;
+        work.q_head_range = static_cast<int32_t>(
+            (static_cast<uint32_t>((head + 1) * params.qhead_granularity) << 16) |
+            static_cast<uint32_t>(head * params.qhead_granularity));
+        works[head * total_tasks + tasks_before + part] = work;
+    }
+}
+
+__device__ __forceinline__ void pa_metadata_v1_2_finalize(PaMetadataV1KernelParameter params)
+{
+    auto* works = reinterpret_cast<PaWorkInfo*>(params.p_work_info_set_raw);
+    const int32_t total_tasks = params.p_work_indptr[params.num_cu];
+    for(int32_t worker = threadIdx.x; worker < params.num_cu; worker += blockDim.x)
+    {
+        int32_t begin = 0;
+        int32_t end = total_tasks;
+        while(begin < end)
+        {
+            const int32_t middle = begin + (end - begin) / 2;
+            if(works[middle].kv_offset < worker)
+                begin = middle + 1;
+            else
+                end = middle;
+        }
+        params.p_work_indptr[worker] = begin;
+    }
+    __syncthreads();
+    for(int32_t task = threadIdx.x; task < total_tasks; task += blockDim.x)
+        works[task].kv_offset = 0;
+    const int32_t total_reduce = params.p_reduce_indptr[params.num_batches];
+    __shared__ int64_t wave_totals[kPaMetadataSharedMaxWaves];
+    int32_t groups = 0;
+    if(total_reduce > 0)
+    {
+        const int32_t wave_size = opus::get_warp_size();
+        const bool wave_only = blockDim.x == wave_size;
+        for(int32_t begin = 0; begin < params.num_batches; begin += blockDim.x)
+        {
+            const int32_t sequence = begin + threadIdx.x;
+            const bool active = sequence < params.num_batches;
+            const int32_t reduce_begin = active ? params.p_reduce_indptr[sequence] : 0;
+            const int32_t reduce_end = active ? params.p_reduce_indptr[sequence + 1] : 0;
+            const bool split = reduce_end > reduce_begin;
+            const int32_t prefix = static_cast<int32_t>(pa_metadata_v1_2_block_prefix(
+                split, wave_totals, wave_only));
+            const int32_t count = wave_only ? __shfl(prefix, wave_size - 1) :
+                static_cast<int32_t>(wave_totals[blockDim.x / wave_size - 1]);
+            __syncthreads();
+            if(split)
+            {
+                const int32_t group = groups + prefix - 1;
+                params.p_reduce_indptr[group + 1] = reduce_end;
+                params.p_reduce_final_map[group * 2] = params.p_seqlens_qo_indptr[sequence];
+                params.p_reduce_final_map[group * 2 + 1] = params.p_seqlens_qo_indptr[sequence + 1];
+            }
+            groups += count;
+            __syncthreads();
+        }
+    }
+    for(int32_t tile = groups + 1 + threadIdx.x; tile < params.reduce_indptr_size; tile += blockDim.x)
+        params.p_reduce_indptr[tile] = total_reduce;
+}
+
+__launch_bounds__(kPaMetadataSharedMaxBatches, 1) __global__
+void kn_get_pa_metadata_v1_2_shared(PaMetadataV1KernelParameter params)
+{
+    __shared__ int64_t wave_totals[kPaMetadataSharedMaxWaves];
+    __shared__ int64_t page_prefixes[kPaMetadataSharedMaxBatches];
+    __shared__ int32_t task_prefixes[kPaMetadataSharedMaxBatches];
+    __shared__ int32_t partial_prefixes[kPaMetadataSharedMaxBatches];
+    __shared__ int64_t total_pages;
+    __shared__ int32_t total_tasks;
+    const int32_t sequence = threadIdx.x;
+    const int32_t wave_size = opus::get_warp_size();
+    const int32_t wave = sequence / wave_size;
+    const int32_t waves = blockDim.x / wave_size;
+    const bool wave_only = params.num_batches <= wave_size;
+    if(!wave_only || wave == 0)
+    {
+        const bool active = sequence < params.num_batches;
+        const int32_t qo_length = active ? params.p_seqlens_qo_indptr[sequence + 1] -
+                                           params.p_seqlens_qo_indptr[sequence] : 0;
+        const uint32_t context = active ? max(params.p_context_lens[sequence], 0) : 0;
+        const int64_t pages = (context + params.block_size - 1) >> (__ffs(params.block_size) - 1);
+        const int64_t page_prefix = pa_metadata_v1_2_block_prefix(pages, wave_totals, wave_only);
+        const int64_t page_count = wave_only ? __shfl(static_cast<long long>(page_prefix), wave_size - 1) :
+            wave_totals[waves - 1];
+        if(!wave_only)
+            __syncthreads();
+        const int32_t parts = pa_metadata_v1_2_parts(page_prefix - pages, pages,
+            max(page_count, int64_t{1}), params.num_splits / params.num_heads_k);
+        const int32_t reductions = parts > 1 ? parts : 0;
+        const int32_t task_prefix = static_cast<int32_t>(pa_metadata_v1_2_block_prefix(
+            parts, wave_totals, wave_only));
+        const int32_t task_count = wave_only ? __shfl(task_prefix, wave_size - 1) :
+            static_cast<int32_t>(wave_totals[waves - 1]);
+        if(!wave_only)
+            __syncthreads();
+        const int32_t reduce_prefix = static_cast<int32_t>(pa_metadata_v1_2_block_prefix(
+            reductions, wave_totals, wave_only));
+        const int32_t partial_prefix = static_cast<int32_t>(pa_metadata_v1_2_block_prefix(
+            reductions * qo_length, wave_totals, wave_only));
+        if(active)
+        {
+            page_prefixes[sequence] = page_prefix;
+            task_prefixes[sequence] = task_prefix;
+            partial_prefixes[sequence] = partial_prefix;
+            params.p_reduce_indptr[sequence + 1] = reduce_prefix;
+        }
+        if(sequence == 0)
+        {
+            params.p_reduce_indptr[0] = 0;
+            params.p_work_indptr[params.num_cu] = task_count * params.num_heads_k;
+            params.p_work_metadata_ptrs[0] = reinterpret_cast<uintptr_t>(params.p_work_indptr);
+            params.p_work_metadata_ptrs[1] = reinterpret_cast<uintptr_t>(params.p_work_info_set_raw);
+            total_pages = max(page_count, int64_t{1});
+            total_tasks = task_count;
+        }
+    }
+    __syncthreads();
+    for(int32_t task = threadIdx.x; task < total_tasks; task += blockDim.x)
+    {
+        int32_t begin = 0;
+        int32_t end = params.num_batches;
+        while(begin < end)
+        {
+            const int32_t middle = begin + (end - begin) / 2;
+            if(task_prefixes[middle] <= task)
+                begin = middle + 1;
+            else
+                end = middle;
+        }
+        const int32_t tasks_before = begin > 0 ? task_prefixes[begin - 1] : 0;
+        pa_metadata_v1_2_emit(params, begin, task - tasks_before,
+            task_prefixes[begin] - tasks_before, begin > 0 ? page_prefixes[begin - 1] : 0,
+            tasks_before, params.p_reduce_indptr[begin], begin > 0 ? partial_prefixes[begin - 1] : 0,
+            total_tasks, total_pages);
+    }
+    __syncthreads();
+    pa_metadata_v1_2_finalize(params);
+}
+
+template <typename Prefix>
+__device__ __forceinline__ int32_t pa_metadata_v1_2_wave_upper_bound(
+    Prefix prefix, Prefix key, int32_t count)
+{
+    int32_t upper = 0;
+    for(int32_t step = opus::get_warp_size(); step > 0; step >>= 1)
+    {
+        const int32_t candidate = upper + step;
+        const int32_t source_lane = min(candidate - 1, opus::get_warp_size() - 1);
+        const Prefix value = __shfl(prefix, source_lane);
+        if(candidate <= count && value <= key)
+            upper = candidate;
+    }
+    return upper;
+}
+
+__device__ __forceinline__ int32_t pa_metadata_v1_2_prefix_sum32(int32_t value)
+{
+    for(int32_t offset = 1; offset < opus::get_warp_size(); offset <<= 1)
+    {
+        const int32_t previous = __shfl_up(value, offset);
+        if(opus::lane_id() >= offset)
+            value += previous;
+    }
+    return value;
+}
+
+template <int32_t Workers>
+__device__ __forceinline__ bool pa_metadata_v1_2_uniform(
+    PaMetadataV1KernelParameter params, int32_t thread, uint32_t context,
+    int32_t tile_count, int32_t page_offset, int32_t qo_start, int32_t qo_end)
+{
+    const int32_t batch = params.num_batches;
+    if((batch & (batch - 1)) != 0)
+        return false;
+    const int32_t parts = Workers >> (__ffs(batch) - 1);
+    const int32_t query_length = qo_end - qo_start;
+    const uint32_t first_context = __shfl(context, 0);
+    const int32_t first_query_length = __shfl(query_length, 0);
+    const int32_t first_tiles = __shfl(tile_count, 0);
+    const bool active = opus::lane_id() < batch;
+    const bool uniform = __all(!active ||
+        (context == first_context && query_length == first_query_length));
+    if(!uniform || first_tiles == 0 || (first_tiles & (parts - 1)) != 0)
+        return false;
+    const int32_t part_shift = __ffs(parts) - 1;
+    const int32_t worker = thread & (Workers - 1);
+    const int32_t sequence = worker >> part_shift;
+    const int32_t part = worker & (parts - 1);
+    const int32_t pages_per_part = (first_tiles >> part_shift) * 16;
+    const int32_t query_begin = __shfl(qo_start, sequence);
+    const int32_t query_end = __shfl(qo_end, sequence);
+    const int32_t kv_base = __shfl(page_offset, sequence);
+    if(thread == 0)
+    {
+        params.p_work_metadata_ptrs[0] = reinterpret_cast<uintptr_t>(params.p_work_indptr);
+        params.p_work_metadata_ptrs[1] = reinterpret_cast<uintptr_t>(params.p_work_info_set_raw);
+        params.p_work_indptr[Workers] = Workers;
+    }
+    for(int32_t tile = thread; tile < params.reduce_indptr_size; tile += blockDim.x * gridDim.x)
+        params.p_reduce_indptr[tile] = min(tile, batch) * parts;
+    if(thread < batch)
+    {
+        params.p_reduce_final_map[thread * 2] = qo_start;
+        params.p_reduce_final_map[thread * 2 + 1] = qo_end;
+    }
+    if(thread < Workers)
+    {
+        params.p_work_indptr[thread] = thread;
+        params.p_reduce_partial_map[thread] = thread * first_query_length;
+        PaWorkInfo work{};
+        work.batch_idx = sequence;
+        work.partial_qo_loc = thread * first_query_length;
+        work.qo_start = query_begin;
+        work.qo_end = query_end;
+        work.kv_start = kv_base + part * pages_per_part;
+        work.kv_end = kv_base + min((part + 1) * pages_per_part,
+            static_cast<int32_t>((first_context + 15) / 16));
+        work.q_head_range = static_cast<int32_t>(
+            static_cast<uint32_t>(params.qhead_granularity) << 16);
+        reinterpret_cast<PaWorkInfo*>(params.p_work_info_set_raw)[thread] = work;
+    }
+    return true;
+}
+
+__device__ __forceinline__ int32_t pa_metadata_v1_2_worker32(
+    uint32_t offset, uint32_t average, uint32_t remainder, int32_t workers)
+{
+    const uint32_t larger_payload = (average + 1) * remainder;
+    const bool larger = offset < larger_payload;
+    const uint32_t numerator = larger ? offset : offset - larger_payload;
+    const uint32_t denominator = larger ? average + 1 : max(average, uint32_t{1});
+    const uint32_t worker = numerator / denominator + (larger ? 0 : remainder);
+    return min(static_cast<int32_t>(worker), workers - 1);
+}
+
+template <int32_t Workers, int32_t NumHeads>
+__launch_bounds__(kPaMetadataSharedMaxBatches, 1) __global__
+void kn_get_pa_metadata_v1_2_wave(PaMetadataV1KernelParameter params)
+{
+    const int32_t lane = opus::lane_id();
+    const int32_t wave_size = opus::get_warp_size();
+    const int32_t thread = blockIdx.x * blockDim.x + threadIdx.x;
+    const int32_t thread_count = gridDim.x * blockDim.x;
+    constexpr int32_t workers = Workers;
+    const bool active = lane < params.num_batches;
+    const int32_t qo_start = active ? params.p_seqlens_qo_indptr[lane] : 0;
+    const int32_t qo_end = active ? params.p_seqlens_qo_indptr[lane + 1] : 0;
+    const int32_t qo_length = qo_end - qo_start;
+    const int32_t page_offset = active ? params.p_pages_kv_indptr[lane] : 0;
+    const uint32_t context = active ? max(params.p_context_lens[lane], 0) : 0;
+    constexpr int32_t pages_per_tile = 16;
+    const int32_t sequence_pages = (context + params.block_size - 1) >> (__ffs(params.block_size) - 1);
+    const int32_t tiles = (sequence_pages + pages_per_tile - 1) / pages_per_tile;
+    if(pa_metadata_v1_2_uniform<Workers>(
+        params, thread, context, tiles, page_offset, qo_start, qo_end))
+        return;
+    const int32_t tile_prefix = pa_metadata_v1_2_prefix_sum32(tiles);
+    const int32_t tiles_before = tile_prefix - tiles;
+    const int32_t total_tiles = max(__shfl(tile_prefix, wave_size - 1), 1);
+    const int32_t average = total_tiles / workers;
+    const int32_t remainder = total_tiles - average * workers;
+    const bool sequence_partitions = NumHeads == 1 && Workers == 256 &&
+        (params.num_batches == 4 || params.num_batches == 8) &&
+        params.qhead_granularity == 16 && total_tiles >= workers &&
+        __all(!active || (qo_length == 4 && tiles > 0));
+    const int32_t first_worker = pa_metadata_v1_2_worker32(tiles_before, average, remainder, workers);
+    const int32_t last_worker = pa_metadata_v1_2_worker32(max(tile_prefix - 1, 0), average, remainder, workers);
+    const int32_t extra = workers - params.num_batches;
+    const int32_t parts = sequence_partitions
+        ? min(tiles, 1 + static_cast<int32_t>(static_cast<int64_t>(tile_prefix) * extra / total_tiles -
+                                             static_cast<int64_t>(tiles_before) * extra / total_tiles))
+        : (tiles > 0 ? last_worker - first_worker + 1 : 0);
+    const int32_t task_prefix = pa_metadata_v1_2_prefix_sum32(parts);
+    const int32_t total_tasks = __shfl(task_prefix, wave_size - 1);
+    const int32_t reductions = parts > 1 ? parts : 0;
+    const uint64_t lane_mask = ~uint64_t{0} >> (wave_size - lane - 1);
+    const uint64_t single_parts = __ballot(parts == 1);
+    const uint64_t reduce_groups = __ballot(reductions > 0);
+    const int32_t reduce_prefix = task_prefix - __popcll(single_parts & lane_mask);
+    const int32_t partial_prefix = __all(!active || qo_length == 4)
+        ? reduce_prefix * 4
+        : pa_metadata_v1_2_prefix_sum32(reductions * qo_length);
+    const int32_t group_prefix = __popcll(reduce_groups & lane_mask);
+    const int32_t groups = __popcll(reduce_groups);
+    const int32_t total_reduce = __shfl(reduce_prefix, wave_size - 1);
+    if(thread == 0)
+    {
+        params.p_work_metadata_ptrs[0] = reinterpret_cast<uintptr_t>(params.p_work_indptr);
+        params.p_work_metadata_ptrs[1] = reinterpret_cast<uintptr_t>(params.p_work_info_set_raw);
+        params.p_work_indptr[Workers * NumHeads] = total_tasks * NumHeads;
+        params.p_reduce_indptr[0] = 0;
+    }
+    if(thread < wave_size)
+    {
+        if(reductions > 0)
+        {
+            params.p_reduce_indptr[group_prefix] = reduce_prefix;
+            params.p_reduce_final_map[(group_prefix - 1) * 2] = qo_start;
+            params.p_reduce_final_map[(group_prefix - 1) * 2 + 1] = qo_end;
+        }
+        for(int32_t tile = groups + 1 + lane; tile < params.reduce_indptr_size; tile += wave_size)
+            params.p_reduce_indptr[tile] = total_reduce;
+    }
+    auto* works = reinterpret_cast<PaWorkInfo*>(params.p_work_info_set_raw);
+    for(int32_t task_base = 0; task_base < total_tasks; task_base += thread_count)
+    {
+        const int32_t task = task_base + thread;
+        const int32_t sequence = pa_metadata_v1_2_wave_upper_bound(task_prefix, task, params.num_batches);
+        const int32_t source_lane = min(sequence, params.num_batches - 1);
+        const int32_t sequence_parts = __shfl(parts, source_lane);
+        const int32_t tasks_before = __shfl(task_prefix - parts, source_lane);
+        const int32_t part = task - tasks_before;
+        const int32_t worker = __shfl(first_worker, source_lane) + part;
+        const int32_t sequence_begin = __shfl(tiles_before, source_lane);
+        const int32_t sequence_end = __shfl(tile_prefix, source_lane);
+        const int32_t begin = sequence_partitions
+            ? sequence_begin + static_cast<int64_t>(part) * (sequence_end - sequence_begin) / max(sequence_parts, 1)
+            : max(sequence_begin, worker * average + min(worker, remainder));
+        const int32_t end = sequence_partitions
+            ? sequence_begin + static_cast<int64_t>(part + 1) * (sequence_end - sequence_begin) / max(sequence_parts, 1)
+            : min(sequence_end, (worker + 1) * average + min(worker + 1, remainder));
+        const int32_t query_begin = __shfl(qo_start, source_lane);
+        const int32_t query_end = __shfl(qo_end, source_lane);
+        const int32_t partials_before = __shfl(partial_prefix - reductions * qo_length, source_lane);
+        const int32_t partial = sequence_parts > 1
+            ? partials_before + part * (query_end - query_begin)
+            : -1;
+        const int32_t reduce_begin = __shfl(reduce_prefix - reductions, source_lane);
+        const int32_t kv_base = __shfl(page_offset, source_lane);
+        const int32_t kv_pages = __shfl(sequence_pages, source_lane);
+        if(task < total_tasks)
+        {
+            if(sequence_parts > 1)
+                params.p_reduce_partial_map[reduce_begin + part] = partial;
+            for(int32_t head = 0; head < NumHeads; ++head)
+            {
+                PaWorkInfo work{};
+                work.batch_idx = sequence;
+                work.partial_qo_loc = partial;
+                work.qo_start = query_begin;
+                work.qo_end = query_end;
+                work.kv_start = kv_base + (begin - sequence_begin) * pages_per_tile;
+                work.kv_end = kv_base + min((end - sequence_begin) * pages_per_tile, kv_pages);
+                work.q_head_range = static_cast<int32_t>(
+                    (static_cast<uint32_t>((head + 1) * params.qhead_granularity) << 16) |
+                    static_cast<uint32_t>(head * params.qhead_granularity));
+                works[head * total_tasks + task] = work;
+            }
+        }
+    }
+    if(sequence_partitions)
+    {
+        if(thread < workers)
+            params.p_work_indptr[thread] = min(thread, total_tasks);
+        return;
+    }
+    const int32_t local_worker = thread % workers;
+    const int32_t tile_start = local_worker * average + min(local_worker, remainder);
+    const int32_t sequence = pa_metadata_v1_2_wave_upper_bound(tile_prefix, tile_start, params.num_batches);
+    const int32_t source_lane = min(sequence, params.num_batches - 1);
+    const int32_t tasks_before = __shfl(task_prefix - parts, source_lane);
+    const int32_t sequence_first_worker = __shfl(first_worker, source_lane);
+    const int32_t task = sequence < params.num_batches
+        ? tasks_before + local_worker - sequence_first_worker
+        : total_tasks;
+    if(thread < Workers * NumHeads)
+        params.p_work_indptr[thread] = (thread / workers) * total_tasks + task;
+}
+
+__device__ __forceinline__ PaMetadataV12ChunkRecord* pa_metadata_v1_2_scratch(
+    PaMetadataV1KernelParameter params)
+{
+    const int64_t capacity = (static_cast<int64_t>(params.num_batches) +
+                             params.num_splits / params.num_heads_k - 1) * params.num_heads_k;
+    auto* works = reinterpret_cast<PaWorkInfo*>(params.p_work_info_set_raw);
+    return reinterpret_cast<PaMetadataV12ChunkRecord*>(works + capacity);
+}
+
+__launch_bounds__(kPaMetadataSharedMaxBatches, 1) __global__
+void kn_scan_pa_metadata_v1_2_chunks(PaMetadataV1KernelParameter params)
+{
+    __shared__ int64_t wave_totals[kPaMetadataSharedMaxWaves];
+    const int32_t sequence = blockIdx.x * kPaMetadataSharedMaxBatches + threadIdx.x;
+    const bool active = sequence < params.num_batches;
+    const uint32_t context = active ? max(params.p_context_lens[sequence], 0) : 0;
+    const int64_t pages = (context + params.block_size - 1) >> (__ffs(params.block_size) - 1);
+    const int64_t prefix = pa_metadata_v1_2_block_prefix(pages, wave_totals, false);
+    auto* rows = pa_metadata_v1_2_scratch(params);
+    if(active)
+        rows[sequence].pages = prefix;
+    if(threadIdx.x == blockDim.x - 1)
+        rows[params.num_batches + blockIdx.x].pages = prefix;
+}
+
+__launch_bounds__(kPaMetadataSharedMaxBatches, 1) __global__
+void kn_plan_pa_metadata_v1_2_chunks(PaMetadataV1KernelParameter params)
+{
+    __shared__ int64_t wave_totals[kPaMetadataSharedMaxWaves];
+    const int32_t sequence = blockIdx.x * kPaMetadataSharedMaxBatches + threadIdx.x;
+    const bool active = sequence < params.num_batches;
+    const int32_t chunks = (params.num_batches + kPaMetadataSharedMaxBatches - 1) /
+                           kPaMetadataSharedMaxBatches;
+    auto* rows = pa_metadata_v1_2_scratch(params);
+    auto* totals = rows + params.num_batches;
+    auto* counts = totals + chunks;
+    int64_t total_pages = 0;
+    int64_t page_base = 0;
+    for(int32_t chunk = 0; chunk < chunks; ++chunk)
+    {
+        total_pages += totals[chunk].pages;
+        if(chunk < blockIdx.x)
+            page_base += totals[chunk].pages;
+    }
+    const int32_t qo_length = active ? params.p_seqlens_qo_indptr[sequence + 1] -
+                                       params.p_seqlens_qo_indptr[sequence] : 0;
+    const uint32_t context = active ? max(params.p_context_lens[sequence], 0) : 0;
+    const int64_t pages = (context + params.block_size - 1) >> (__ffs(params.block_size) - 1);
+    const int64_t pages_before = active ? page_base + rows[sequence].pages - pages : 0;
+    const int32_t parts = pa_metadata_v1_2_parts(pages_before, pages,
+        max(total_pages, int64_t{1}), params.num_splits / params.num_heads_k);
+    const int32_t reductions = parts > 1 ? parts : 0;
+    const int32_t task_prefix = static_cast<int32_t>(pa_metadata_v1_2_block_prefix(
+        parts, wave_totals, false));
+    const int32_t reduce_prefix = static_cast<int32_t>(pa_metadata_v1_2_block_prefix(
+        reductions, wave_totals, false));
+    const int32_t partial_prefix = static_cast<int32_t>(pa_metadata_v1_2_block_prefix(
+        reductions * qo_length, wave_totals, false));
+    if(active)
+    {
+        rows[sequence].pages = pages_before;
+        rows[sequence].tasks = task_prefix;
+        rows[sequence].reductions = reduce_prefix;
+        rows[sequence].partials = partial_prefix;
+    }
+    if(threadIdx.x == blockDim.x - 1)
+    {
+        counts[blockIdx.x].tasks = task_prefix;
+        counts[blockIdx.x].reductions = reduce_prefix;
+        counts[blockIdx.x].partials = partial_prefix;
+    }
+}
+
+__launch_bounds__(kPaMetadataSharedMaxBatches, 1) __global__
+void kn_emit_pa_metadata_v1_2_chunks(PaMetadataV1KernelParameter params)
+{
+    const int32_t sequence = blockIdx.x * kPaMetadataSharedMaxBatches + threadIdx.x;
+    if(sequence >= params.num_batches)
+        return;
+    const int32_t chunks = (params.num_batches + kPaMetadataSharedMaxBatches - 1) /
+                           kPaMetadataSharedMaxBatches;
+    auto* rows = pa_metadata_v1_2_scratch(params);
+    auto* totals = rows + params.num_batches;
+    auto* counts = totals + chunks;
+    int64_t total_pages = 0;
+    int32_t total_tasks = 0;
+    int32_t task_base = 0;
+    int32_t reduce_base = 0;
+    int32_t partial_base = 0;
+    for(int32_t chunk = 0; chunk < chunks; ++chunk)
+    {
+        total_pages += totals[chunk].pages;
+        total_tasks += counts[chunk].tasks;
+        if(chunk < blockIdx.x)
+        {
+            task_base += counts[chunk].tasks;
+            reduce_base += counts[chunk].reductions;
+            partial_base += counts[chunk].partials;
+        }
+    }
+    const int32_t tasks_before = threadIdx.x > 0 ? rows[sequence - 1].tasks : 0;
+    const int32_t reductions_before = threadIdx.x > 0 ? rows[sequence - 1].reductions : 0;
+    const int32_t partials_before = threadIdx.x > 0 ? rows[sequence - 1].partials : 0;
+    const int32_t parts = rows[sequence].tasks - tasks_before;
+    params.p_reduce_indptr[sequence + 1] = reduce_base + rows[sequence].reductions;
+    if(sequence == 0)
+    {
+        params.p_reduce_indptr[0] = 0;
+        params.p_work_indptr[params.num_cu] = total_tasks * params.num_heads_k;
+        params.p_work_metadata_ptrs[0] = reinterpret_cast<uintptr_t>(params.p_work_indptr);
+        params.p_work_metadata_ptrs[1] = reinterpret_cast<uintptr_t>(params.p_work_info_set_raw);
+    }
+    for(int32_t part = 0; part < parts; ++part)
+        pa_metadata_v1_2_emit(params, sequence, part, parts, rows[sequence].pages,
+            task_base + tasks_before, reduce_base + reductions_before, partial_base + partials_before,
+            total_tasks, max(total_pages, int64_t{1}));
+}
+
+__launch_bounds__(kPaMetadataSharedMaxBatches, 1) __global__
+void kn_finalize_pa_metadata_v1_2(PaMetadataV1KernelParameter params)
+{
+    pa_metadata_v1_2_finalize(params);
+}
 
 template <int32_t kPackedQoLenPerWg_,
           bool kQoSplits_,
@@ -177,15 +787,15 @@ __launch_bounds__(opus::get_warp_size(), 1) __global__
                             work_info.partial_qo_loc = partial_idx + qo_tile_idx * qo_tile_size;
 
                             // set reduce info
-                            if(lane_idx == 0)
+                            if(split_idx == 0)
                             {
-                                params.p_reduce_indptr[global_reduce_tile_idx + 1] =
+                                const int32_t reduce_tile_idx = global_reduce_tile_idx + qo_tile_idx;
+                                params.p_reduce_indptr[reduce_tile_idx + 1] =
                                     last_reduce_indptr + (qo_tile_idx + 1) * num_splits;
-                                params.p_reduce_final_map[global_reduce_tile_idx * 2] =
+                                params.p_reduce_final_map[reduce_tile_idx * 2] =
                                     work_info.qo_start;
-                                params.p_reduce_final_map[global_reduce_tile_idx * 2 + 1] =
+                                params.p_reduce_final_map[reduce_tile_idx * 2 + 1] =
                                     work_info.qo_end;
-                                global_reduce_tile_idx += 1;
                             }
 
                             if constexpr(Traits::kQoSplits)
@@ -209,7 +819,8 @@ __launch_bounds__(opus::get_warp_size(), 1) __global__
                             work_info.partial_qo_loc = -1;
                         }
 
-                        p_work_info_set[num_works + qo_tile_idx] = work_info;
+                        if(split_idx == 0)
+                            p_work_info_set[num_works + qo_tile_idx] = work_info;
                     };
 
                     // record a work in work_info_set
@@ -256,6 +867,8 @@ __launch_bounds__(opus::get_warp_size(), 1) __global__
                         }
                     }
 
+                    if(curr_n_split_idx > 0)
+                        global_reduce_tile_idx += num_qo_tiles;
                     num_works += num_qo_tiles;
 
                     // update state
@@ -417,6 +1030,7 @@ void get_pa_metadata_v1_2_device(const aiter_tensor_t& seqlens_qo_indptr, // [ba
                                  const int32_t block_size,
                                  const int32_t max_seqlen_qo,
                                  const int32_t ori_uni_seqlen_qo,
+                                 const bool fast_mode,
                                  const int32_t topk,
                                  const int32_t max_split_per_batch,
                                  aiter_tensor_t& work_metadata_ptrs,
@@ -442,10 +1056,10 @@ void get_pa_metadata_v1_2_device(const aiter_tensor_t& seqlens_qo_indptr, // [ba
     int32_t qk_batch_ratio = 1;
     int32_t uni_seqlen_qo  = ori_uni_seqlen_qo;
 
-    int32_t num_splits =
-        max_split_per_batch < 0 ? num_cu : min(num_cu, max_split_per_batch * num_batches);
+    int32_t num_splits = max_split_per_batch < 0 ? num_cu : static_cast<int32_t>(
+        std::min<int64_t>(num_cu, static_cast<int64_t>(max_split_per_batch) * num_batches));
 
-    AITER_CHECK(num_splits % num_heads_k == 0,
+    AITER_CHECK(num_heads_k > 0 && num_splits > 0 && num_splits % num_heads_k == 0,
                 __func__,
                 ": only supports #num_splits evenly divisible by #kv_heads.");
 
@@ -476,6 +1090,73 @@ void get_pa_metadata_v1_2_device(const aiter_tensor_t& seqlens_qo_indptr, // [ba
     params.is_causal                   = is_causal;
     params.topk                        = topk;
     params.qk_batch_ratio              = qk_batch_ratio;
+
+    const int64_t work_capacity = static_cast<int64_t>(num_batches + num_cu / num_heads_k - 1) *
+                                  num_heads_k;
+    const int32_t chunks =
+        (num_batches + kPaMetadataSharedMaxBatches - 1) / kPaMetadataSharedMaxBatches;
+    const int64_t scratch_rows =
+        num_batches > kPaMetadataSharedMaxBatches ? static_cast<int64_t>(num_batches) + 2 * chunks
+                                                  : 0;
+
+    // The parallel kernels only reproduce the dense, single-Q-tile, full-CU, page-16 layout.
+    const bool layout_supported =
+        topk < 0 && num_splits == num_cu && block_size == kPaMetadataParallelPageSize &&
+        (kv_granularity == block_size || kv_granularity == 256) &&
+        max_seqlen_qo > 0 && num_heads_per_head_k > 0 &&
+        static_cast<int64_t>(max_seqlen_qo) * num_heads_per_head_k <= kPackedQoLenPerWg &&
+        static_cast<int64_t>(num_heads_k) * num_heads_per_head_k <= 65535;
+    // Parallel output needs scratch rows; smaller legacy allocations fall back to serial.
+    const bool buffers_fit =
+        work_info_set.numel() >= (work_capacity + scratch_rows) * 8 &&
+        reduce_partial_map.numel() >=
+            std::min<int64_t>(work_capacity / num_heads_k, 2 * (num_cu / num_heads_k - 1));
+    const bool tile_layout_supported =
+        topk < 0 && num_splits == num_cu && num_cu == 256 && dev_prop.warpSize == 64 &&
+        get_gpu_arch() == "gfx950" && block_size == 16 &&
+        kv_granularity == 256 && max_seqlen_qo == 4 && ori_uni_seqlen_qo == 4 &&
+        num_heads_per_head_k == 16 && num_heads_k == 1 && is_causal;
+    if(fast_mode && num_batches > 0 && num_batches <= 64 &&
+       tile_layout_supported && buffers_fit)
+    {
+        const int32_t threads = std::min(kPaMetadataSharedMaxBatches,
+            ((std::max(num_batches, static_cast<int32_t>(work_capacity / num_heads_k)) +
+              dev_prop.warpSize - 1) / dev_prop.warpSize) * dev_prop.warpSize);
+        kn_get_pa_metadata_v1_2_wave<256, 1>
+            <<<threads / dev_prop.warpSize, dev_prop.warpSize, 0, stream>>>(params);
+        HIP_CALL_LAUNCH(hipGetLastError());
+        return;
+    }
+    if(kv_granularity == 256 && block_size == 16)
+    {
+        params.kv_granularity      = block_size;
+        params.kv_granularity_log2 = __builtin_ctz(block_size);
+        params.blocks_per_unit    = 1;
+    }
+    if(fast_mode && num_batches > 0 && num_batches <= kPaMetadataMaxParallelBatches &&
+       layout_supported && buffers_fit)
+    {
+        if(num_batches <= kPaMetadataSharedMaxBatches)
+        {
+            const int32_t threads = std::min(kPaMetadataSharedMaxBatches,
+                std::max(dev_prop.warpSize, next_power_of_two(std::max(num_batches,
+                    static_cast<int32_t>(work_capacity / num_heads_k)))));
+            kn_get_pa_metadata_v1_2_shared<<<1, threads, 0, stream>>>(params);
+            HIP_CALL_LAUNCH(hipGetLastError());
+        }
+        else
+        {
+            kn_scan_pa_metadata_v1_2_chunks<<<chunks, kPaMetadataSharedMaxBatches, 0, stream>>>(params);
+            HIP_CALL_LAUNCH(hipGetLastError());
+            kn_plan_pa_metadata_v1_2_chunks<<<chunks, kPaMetadataSharedMaxBatches, 0, stream>>>(params);
+            HIP_CALL_LAUNCH(hipGetLastError());
+            kn_emit_pa_metadata_v1_2_chunks<<<chunks, kPaMetadataSharedMaxBatches, 0, stream>>>(params);
+            HIP_CALL_LAUNCH(hipGetLastError());
+            kn_finalize_pa_metadata_v1_2<<<1, kPaMetadataSharedMaxBatches, 0, stream>>>(params);
+            HIP_CALL_LAUNCH(hipGetLastError());
+        }
+        return;
+    }
 
     // launch kernel
     MLA_METADATA_DISPATCHER(

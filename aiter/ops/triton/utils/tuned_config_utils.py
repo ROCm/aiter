@@ -11,16 +11,14 @@ import os
 
 import triton
 
-from aiter.ops.triton.utils._triton import arch_info
 from aiter.ops.triton.utils.logger import AiterTritonLogger
 
 logger = AiterTritonLogger()
 
 from aiter.ops.triton.utils.config_utils import (
-    AITER_TRITON_CONFIGS_PATH,
     USE_LRU_CACHE,
-    _dtype_dir,
     load_config_json,
+    resolve_config_dir,
 )
 
 
@@ -65,13 +63,9 @@ def _get_tuned_kernel_entry(
     Do NOT use this directly — the entry is the shared cached object, so
     ``get_tuned_kernel_config()`` copies it before handing it out.
     """
-    arch = arch_info.get_arch()
-    # Nested layout of configs/AGENTS.md: <arch>/<backend>/<op>/<d_type>/DEFAULT.json,
-    # <d_type> being the config name lowercased with dashes folded to underscores.
-    dtype_dir = _dtype_dir(config_name)
-    config_path = (
-        f"{AITER_TRITON_CONFIGS_PATH}/{arch}/{backend}/{op}/{dtype_dir}/DEFAULT.json"
-    )
+    # Nested layout of configs/AGENTS.md: <arch>/<backend>/<op>/<d_type>/DEFAULT.json, or
+    # the <arch>/<cu_num>cu/ tree of this device's CU count (resolve_config_dir()).
+    config_path = f"{resolve_config_dir(op, config_name, backend=backend)}/DEFAULT.json"
     published = load_config_json(config_path, required=False) or {}
     return config_path, published.get(kernel_name)
 
