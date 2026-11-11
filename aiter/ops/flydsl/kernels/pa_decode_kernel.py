@@ -461,7 +461,7 @@ def compile_pa_decode_tile(
             """Zero this CTA's query rows of ``seq`` in the final output."""
             tid = fx.Int32(gpu.thread_id("x"))
             row_units = traits.head_dim // 8
-            kv_query = fx.Int32(gpu.block_id("y"))
+            kv_query = fx.Int32(gpu.block_id("x" if traits.SPLIT_MAJOR else "y"))
             kv_h = kv_query // traits.query_splits
             first_row = (
                 (kv_query % traits.query_splits)

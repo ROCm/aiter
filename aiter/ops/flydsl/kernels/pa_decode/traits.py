@@ -496,12 +496,23 @@ class PaDecodeSchedule:
                 or (single_tile_plan and split_workgroups <= 2 * num_compute_units)
             )
         )
-        # gfx942 split CTAs launch split-major, so a task's splits dispatch
-        # together instead of after every slot of the previous split. BF16
-        # head-dim splits forced by LDS only gain when tasks are long. Several
-        # KV heads launch head-major on small grids, where the plan's empty
-        # slots otherwise delay every head after the first.
-        split_major = "gfx94" in arch and (
+        # Split CTAs launch split-major, so a task's splits dispatch together
+        # instead of after every slot of the previous split. BF16 head-dim
+        # splits forced by LDS only gain when tasks are long. Several KV heads
+        # launch head-major on small grids, where the plan's empty slots
+        # otherwise delay every head after the first. gfx950 gains only while
+        # at most a quarter of the CUs hold work (on fuller grids slot-major
+        # order ran up to 1.25x faster), and not for BF16 rows past D128
+        # (0.91-0.93x on LDS-forced splits).
+        split_major = (
+            "gfx94" in arch
+            or (
+                is_gfx950
+                and kv_dtype != MXFP4_KV_DTYPE
+                and (kv_dtype in FP8_KV_DTYPES or head_dim <= 128)
+                and split_workgroups <= num_compute_units // 4
+            )
+        ) and (
             (
                 query_splits > 1
                 and (
