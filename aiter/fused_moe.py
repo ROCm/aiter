@@ -4961,16 +4961,20 @@ def get_2stage_cfgs(
         # Given a pad, stage 1 may leave that many trailing columns of its uninitialized
         # output unwritten, so it gets only the columns its stage 2 skips: the Opus stage
         # 2 reads the unpadded width, the v1 FlyDSL one skips whole 128-column blocks of
-        # its last K tile, CK-Tile whole 128-column blocks, and the v2 layout and CK ones
-        # read every column. Stage 1 computes the others: zero from w1's zero padding,
-        # times w2's zero padding.
+        # the last K tile it runs with (resolve_flydsl_stage2_tile_k), CK-Tile whole
+        # 128-column blocks, and the v2 layout and CK ones read every column. Stage 1
+        # computes the others: zero from w1's zero padding, times w2's zero padding.
         if is_opus2:
             stage1_inter_dim_pad = intermediate_pad
         elif is_flydsl2 and not is_flydsl2_layout:
-            params2 = _get_flydsl_moe_kernels().get_flydsl_kernel_params(kernelName2)
+            flydsl_moe_kernels = _get_flydsl_moe_kernels()
+            params2 = flydsl_moe_kernels.get_flydsl_kernel_params(kernelName2)
             if params2 is None:
                 raise ValueError(f"Invalid FlyDSL GEMM2 kernel name: {kernelName2}")
-            stage1_inter_dim_pad = min(params2["tile_k"], intermediate_pad // 128 * 128)
+            tile_k2 = flydsl_moe_kernels.resolve_flydsl_stage2_tile_k(
+                inter_dim, params2["tile_k"]
+            )
+            stage1_inter_dim_pad = min(tile_k2, intermediate_pad // 128 * 128)
         elif is_cktile2:
             stage1_inter_dim_pad = intermediate_pad // 128 * 128
         else:

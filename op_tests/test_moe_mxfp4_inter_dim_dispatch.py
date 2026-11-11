@@ -245,6 +245,23 @@ _FP8_STAGE1 = "flydsl_moe1_afp8_wfp4_bf16_t32x128x256_w4_gui_fp8"
             256,
             128,
         ),
+        # A tile_k of 256 runs as 128 unless 256 divides inter_dim.
+        (
+            dtypes.fp4x2,
+            384,
+            _FP4_STAGE1,
+            "flydsl_moe2_afp4_wfp4_bf16_t32x128x256_atomic",
+            256,
+            128,
+        ),
+        (
+            dtypes.fp4x2,
+            768,
+            _FP4_STAGE1,
+            "flydsl_moe2_afp4_wfp4_bf16_t32x128x256_atomic",
+            384,
+            256,
+        ),
         # The Opus stage 2 reads only the unpadded width.
         (
             dtypes.fp8,
