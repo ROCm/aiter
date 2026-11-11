@@ -240,22 +240,23 @@ class PaDecodeSchedule:
         partition_workgroups = num_seqs * num_kv_heads * num_partitions
         assert query_length >= 1, f"query_length must be >= 1, got {query_length}"
         split_workgroups = work_capacity * num_kv_heads
+        # KV tiles of the sequences before capacity bounds them; None when the
+        # context bound is unknown.
+        tile_demand = None
         single_tile_plan = False
         if sliding_window == 0 and max_context_length is not None:
             context_tiles = (
                 max_context_length + KV_COMPUTE_BLOCK - 1
             ) // KV_COMPUTE_BLOCK
-            split_workgroups = min(
-                split_workgroups, num_seqs * num_kv_heads * context_tiles
-            )
+            tile_demand = num_seqs * num_kv_heads * context_tiles
+            split_workgroups = min(split_workgroups, tile_demand)
         if sliding_window > 0:
             # Bound the unaligned MTP window union, excluding padding CTAs.
             window_tiles = (
                 sliding_window + query_length - 2 + KV_COMPUTE_BLOCK - 1
             ) // KV_COMPUTE_BLOCK + 1
-            split_workgroups = min(
-                split_workgroups, num_seqs * num_kv_heads * window_tiles
-            )
+            tile_demand = num_seqs * num_kv_heads * window_tiles
+            split_workgroups = min(split_workgroups, tile_demand)
             # For n nonempty sequences, T <= n * window_tiles and the budget
             # leaves >= n * (window_tiles - 1) extras. Prefix apportionment
             # therefore gives each visible tile its own task, even after refresh.
@@ -293,12 +294,24 @@ class PaDecodeSchedule:
             ):
                 query_splits = 2
             elif (
-                "gfx94" in arch
+                ("gfx94" in arch or is_gfx950)
                 and kv_dtype != MXFP4_KV_DTYPE
                 and query_length * query_group_size > MFMA_MNK
                 and (kv_dtype == fx.BFloat16 or head_dim <= 128)
+                # gfx950 per-token FP8 keeps its fused MTP tiles. gfx950 MTP
+                # plans hold capacity to one or two slots per CU whatever the
+                # load, so its FP8 split also bounds the tiles (eight per CU).
+                and (
+                    not is_gfx950
+                    or kv_dtype == fx.BFloat16
+                    or (
+                        not per_token_kv
+                        and tile_demand is not None
+                        and tile_demand <= 8 * num_compute_units
+                    )
+                )
             ):
-                # gfx942 MTP tiles with idle CUs: per-CTA latency dominates,
+                # MTP tiles with idle CUs: per-CTA latency dominates,
                 # so split the query positions over more CTAs (re-reading K/V
                 # from L2). Split FP8 (to D128; D256 measured 0.93-1.05x) into
                 # single-M-tile CTAs while about three fit per CU, else in two
@@ -318,11 +331,13 @@ class PaDecodeSchedule:
                                 else num_compute_units
                             )
                         )
-                        # Four D128 M-tiles hold 360 VGPRs; on busy grids two
-                        # split-major CTAs of two M-tiles share K/V and fit two
-                        # per CU (D192 and two-M-tile rows measured slower).
+                        # Four D128 M-tiles hold 360 VGPRs; on busy gfx942
+                        # grids two split-major CTAs of two M-tiles share K/V
+                        # and fit two per CU (D192 and two-M-tile rows, and
+                        # gfx950, measured slower).
                         or (
-                            head_dim == 128
+                            "gfx94" in arch
+                            and head_dim == 128
                             and query_length * query_group_size >= 4 * MFMA_MNK
                             and split_workgroups > num_compute_units
                         )
