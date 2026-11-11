@@ -1376,6 +1376,22 @@ def wide_tile_rows(query_tile: int) -> int:
     return math.ceil(query_tile * get_cu_num() * platform().wide_tiles_per_cu)
 
 
+def plan_query_tile(group, hk, query_lens, prefix_lens, query_tile: int) -> int:
+    """BQ of a union plan for a layout of Q heads per KV head `group`, `hk` KV heads and
+    these requests, from the `query_tile` asked for."""
+    # Full H6/H3 prefill fills 126/128 MFMA rows (BQ21 / BQ42 with 64-bit membership). Keep the
+    # established tiles for prefix/ragged work and batches too small to fill the persistent grid.
+    full = hk == 1 and len(query_lens) == 1 and prefix_lens[0] == 0
+    if group == 6 and full and query_tile >= 21 and query_lens[0] >= wide_tile_rows(21):
+        return 21
+    if group == 3 and full and query_tile == 32 and query_lens[0] >= wide_tile_rows(42):
+        return 42
+    return min(
+        query_tile,
+        128 // group if group == 12 else 1 << ((128 // group).bit_length() - 1),
+    )
+
+
 def allocate_plan(
     *, inputs, query_tile: int, scratch: bool = True, slotted: bool = False
 ) -> SparsePlan:
@@ -1384,32 +1400,9 @@ def allocate_plan(
         raise ValueError("Require 1<=BQ<=32")
     config = platform()
     num_cus = get_cu_num()
-    # Full H6/H3 prefill fills 126/128 MFMA rows (BQ21 / BQ42 with 64-bit membership). Keep the
-    # established tiles for prefix/ragged work and batches too small to fill the persistent grid.
-    full = (
-        inputs.k.shape[1] == 1
-        and len(inputs.query_lens) == 1
-        and inputs.prefix_lens[0] == 0
+    query_tile = plan_query_tile(
+        group, inputs.k.shape[1], inputs.query_lens, inputs.prefix_lens, query_tile
     )
-    if (
-        group == 6
-        and full
-        and query_tile >= 21
-        and inputs.query_lens[0] >= wide_tile_rows(21)
-    ):
-        query_tile = 21
-    elif (
-        group == 3
-        and full
-        and query_tile == 32
-        and inputs.query_lens[0] >= wide_tile_rows(42)
-    ):
-        query_tile = 42
-    else:
-        query_tile = min(
-            query_tile,
-            128 // group if group == 12 else 1 << ((128 // group).bit_length() - 1),
-        )
     q_lens = np.asarray(inputs.query_lens, dtype=np.int64)
     lengths = q_lens + np.asarray(inputs.prefix_lens, dtype=np.int64)
     # Equal tiles per request, larger first: a tiny last tile would route its few rows direct, after union.

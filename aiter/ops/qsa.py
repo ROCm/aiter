@@ -8,7 +8,7 @@ Consumers should import from here rather than from the backend-specific
 modules directly.
 """
 
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from typing import NamedTuple
 
 import torch
@@ -45,6 +45,9 @@ try:
     )
     from aiter.ops.flydsl.qsa_sparse_prefill import (
         qsa_sparse_prefill_problem as _flydsl_qsa_sparse_prefill_problem,
+    )
+    from aiter.ops.flydsl.qsa_sparse_prefill import (
+        qsa_sparse_prefill_warmup as _flydsl_qsa_sparse_prefill_warmup,
     )
 
     _HAS_FLYDSL_PREFILL = True
@@ -390,6 +393,34 @@ def qsa_sparse_prefill_available() -> bool:
     return _HAS_FLYDSL_PREFILL
 
 
+def qsa_sparse_prefill_warmup(
+    run: Callable[[torch.Tensor, torch.Tensor, tuple[int, ...], tuple[int, ...]], bool],
+    *,
+    num_q_heads: int,
+    num_kv_heads: int,
+    selection_width: int,
+    device: torch.device,
+) -> tuple[tuple[int, ...], ...]:
+    """Compile the kernels ``qsa_sparse_prefill`` calls can use, through ``run``: one
+    call of the caller's own per kernel-variant class, on synthetic Q and indices.
+    ``run(q, indices, query_lens, prefix_lens)`` makes the call and returns whether it
+    did. Returns the request lengths that ran: none where the op cannot run (FlyDSL
+    missing, see ``qsa_sparse_prefill_available``, or an architecture it does not
+    support).
+
+    See ``aiter.ops.flydsl.qsa_sparse_prefill.qsa_sparse_prefill_warmup``.
+    """
+    if not _HAS_FLYDSL_PREFILL:
+        return ()
+    return _flydsl_qsa_sparse_prefill_warmup(
+        run,
+        num_q_heads=num_q_heads,
+        num_kv_heads=num_kv_heads,
+        selection_width=selection_width,
+        device=device,
+    )
+
+
 __all__ = [
     "DEFAULT_LOGITS_WORKSPACE_BYTES",
     "FP4_GROUP",
@@ -407,5 +438,6 @@ __all__ = [
     "qsa_sparse_prefill",
     "qsa_sparse_prefill_available",
     "qsa_sparse_prefill_problem",
+    "qsa_sparse_prefill_warmup",
     "qsa_store_quantized_rows",
 ]

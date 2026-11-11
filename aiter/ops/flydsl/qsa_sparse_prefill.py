@@ -34,7 +34,11 @@ from .kernels.qsa.sparse_prefill_common import (
     platform,
 )
 
-__all__ = ["flydsl_qsa_sparse_prefill", "qsa_sparse_prefill_problem"]
+__all__ = [
+    "flydsl_qsa_sparse_prefill",
+    "qsa_sparse_prefill_problem",
+    "qsa_sparse_prefill_warmup",
+]
 
 # Kernels use unsigned 32-bit buffer byte offsets; the 1 MiB margin keeps out-of-range
 # sentinels plus their lane offsets from wrapping.
@@ -428,6 +432,67 @@ def qsa_sparse_prefill_problem(
         q, k, v, indices, query_lens, prefix_lens, softmax_scale, out, kv_slots
     )
     return checked.message if isinstance(checked, _Rejected) else None
+
+
+def _warmup_layouts(group, hk):
+    """Request lengths, none with a prefix, of one call per kernel-variant class of Q
+    heads per KV head `group` and `hk` KV heads. A call's variants follow from whether
+    it gets a union plan (from `_union_min_rows` rows) and that plan's query tile; the
+    rest of what a variant compiles in (heads, scale, width, stride, pool span) is the
+    caller's and fixed across calls."""
+    union_rows = _union_min_rows(group)
+    # Direct kernels only; then the base tile (a second request keeps a full prefill off
+    # the wide tiles).
+    layouts = [(max(union_rows - 1, 1),), (-(-union_rows // 2),) * 2]
+    for tile in (21, 42):
+        # The first row count that has a union plan and takes the wide tile (a device
+        # with few CUs takes it from fewer rows than the union gate).
+        rows = max(prepare.wide_tile_rows(tile), union_rows)
+        if prepare.plan_query_tile(group, hk, (rows,), (0,), 32) == tile:
+            layouts.append((rows,))
+    return tuple(layouts)
+
+
+def _prefill_selection(query_lens, topk, device):
+    """indices [rows, 4 topk + 3] of requests without a prefix, in the layout the op
+    takes: the row at request position p (v = p + 1 tokens) selects its last
+    min(v // 4, topk) complete four-token blocks, then its v % 4 tail tokens; the rest of
+    the row is -1."""
+    visible = torch.cat([torch.arange(1, n + 1, device=device) for n in query_lens])
+    first = 4 * (visible // 4 - topk).clamp(min=0)
+    indices = first[:, None] + torch.arange(4 * topk + 3, device=device)
+    return torch.where(indices < visible[:, None], indices, -1).to(torch.int32)
+
+
+def qsa_sparse_prefill_warmup(
+    run, *, num_q_heads, num_kv_heads, selection_width, device
+):
+    """Compile the kernels the op's calls can use, so that no served call compiles them.
+
+    ``run(q, indices, query_lens, prefix_lens)`` makes one call to the op the way the
+    caller serves it (its K/V, scale, slot table and out), and returns whether it did;
+    the compile keys are those of that call. It is called once per kernel-variant
+    class, on synthetic Q (zeros) and indices, with requests of no prefix: below the
+    union threshold, over it, and at each wide tile's first row count where the tile
+    policy takes one. Returns the request lengths for which ``run`` returned true; none
+    on an architecture other than gfx942 and gfx950 (which have no tile policy), or when
+    `selection_width` is not a width the op takes.
+    """
+    if get_gfx_runtime() not in ("gfx942", "gfx950"):
+        return ()
+    topk, rest = divmod(selection_width - 3, 4)
+    if rest or topk % 256 or not 256 <= topk <= 1024:
+        return ()
+    warmed = []
+    for query_lens in _warmup_layouts(num_q_heads // num_kv_heads, num_kv_heads):
+        q = torch.zeros(
+            sum(query_lens), num_q_heads, 256, dtype=torch.bfloat16, device=device
+        )
+        indices = _prefill_selection(query_lens, topk, device)
+        if run(q, indices, query_lens, (0,) * len(query_lens)):
+            warmed.append(query_lens)
+    torch.cuda.synchronize(device)
+    return tuple(warmed)
 
 
 def flydsl_qsa_sparse_prefill(
