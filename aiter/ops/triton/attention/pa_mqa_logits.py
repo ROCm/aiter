@@ -30,7 +30,8 @@ from packaging.version import Version
 from triton.backends.compiler import GPUTarget
 
 from aiter import dtypes
-from aiter.jit.utils.chip_info import get_gfx
+from aiter.jit.utils.build_targets import base_gfx_arch
+from aiter.jit.utils.chip_info import get_gfx, get_gfx_runtime
 from aiter.ops.triton.utils.common_utils import max_addressable_bytes
 from aiter.ops.triton.utils.config_utils import AITER_TRITON_CONFIGS_PATH
 from aiter.ops.triton.utils.device_info import get_num_sms
@@ -348,7 +349,22 @@ def _compile_deepgemm_fp8_paged_mqa_logits(
             )
     cdna_version = get_cdna_version()
     warp_size = 32 if is_gfx1250 else 64
-    target = GPUTarget("hip", gfx_version, warp_size)
+    # get_gfx() follows GPU_ARCHS, so it names gfx1250 on a gfx1250-strict (MI450
+    # A0) device when GPU_ARCHS=gfx1250. Compile for the device that runs the
+    # kernel: gfx1250 code can use instructions gfx1250-strict lacks (e.g.
+    # v_wmma_f32_16x16x128_fp8_fp8), which then run on A0 and give wrong results.
+    target_arch = gfx_version
+    try:
+        runtime_arch = get_gfx_runtime()
+    except (RuntimeError, KeyError):
+        runtime_arch = None
+    if (
+        runtime_arch
+        and runtime_arch != gfx_version
+        and base_gfx_arch(runtime_arch) == gfx_version
+    ):
+        target_arch = runtime_arch
+    target = GPUTarget("hip", target_arch, warp_size)
 
     # gfx942 uses the AMD fnuz e4m3 variant (*fp8e4b8); gfx950 and gfx1250 use
     # the OCP/IEEE e4m3 variant (*fp8e4nv), matching utils.types.get_fp8_dtypes.
@@ -411,7 +427,7 @@ def _compile_deepgemm_fp8_paged_mqa_logits(
         "num_ctas": 1,
         "enable_fp_fusion": True,
         "cluster_dims": [1, 1, 1],
-        "arch": gfx_version,
+        "arch": target_arch,
         "backend_name": "hip",
         "warp_size": warp_size,
         "name": (
