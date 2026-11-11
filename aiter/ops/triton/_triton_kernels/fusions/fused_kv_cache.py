@@ -389,6 +389,7 @@ _fused_qk_rope_cat_and_cache_mla_kernel_repr = make_kernel_repr(
         "HAVE_K_SCALE",
         "UPCAST_OPERAND",
         "APPLY_ROPE",
+        "FP4_KV_FORMAT",
     ],
 )
 
@@ -458,6 +459,7 @@ def _fused_qk_rope_cat_and_cache_mla_kernel(
     HAVE_K_SCALE: tl.constexpr = False,
     UPCAST_OPERAND: tl.constexpr = False,
     APPLY_ROPE: tl.constexpr = True,
+    FP4_KV_FORMAT: tl.constexpr = "nvfp4",
 ):
     pid = tl.program_id(0)
 
@@ -632,6 +634,7 @@ def _fused_qk_rope_cat_and_cache_mla_kernel(
                     SHUFFLED_KV_CACHE,
                     SCALE_K_WIDTH_NOPE,
                     SCALE_K_WIDTH_ROPE,
+                    FP4_KV_FORMAT,
                 )
     else:
         pid = pid - B * QH + B * KH
@@ -700,6 +703,7 @@ def _fused_qk_rope_cat_and_cache_mla_kernel(
                     SHUFFLED_KV_CACHE,
                     SCALE_K_WIDTH_NOPE,
                     SCALE_K_WIDTH_ROPE,
+                    FP4_KV_FORMAT,
                 )
 
 

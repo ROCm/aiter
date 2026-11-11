@@ -26,10 +26,12 @@ _REQUIRES_GFX950 = pytest.mark.skipif(
 )
 
 
-def _dequantize_mxfp4(packed: torch.Tensor, scales: torch.Tensor) -> torch.Tensor:
+def _dequantize_mxfp4(
+    packed: torch.Tensor, scales: torch.Tensor, block_size: int = 32
+) -> torch.Tensor:
     """Dequantize row-wise MXFP4 payload and E8M0 scales."""
     values = mxfp4_to_f32(packed)
-    scale_f32 = e8m0_to_f32(scales).repeat_interleave(32, dim=-1)
+    scale_f32 = e8m0_to_f32(scales).repeat_interleave(block_size, dim=-1)
     return values * scale_f32
 
 
@@ -37,6 +39,7 @@ def torch_dynamic_mxfp4_quant(
     x: torch.Tensor,
     scaling_mode: str = "even",
     is_nvfp4: bool = False,
+    block_size: int | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """
     Quantize a tensor to MX FP4 format based of AMD Quark Spec.
@@ -50,11 +53,12 @@ def torch_dynamic_mxfp4_quant(
         x: The input tensor, typically fp16 or bf16.
         scaling_mode: The method to calculate MX block scaling.
             - "even" (default): `even_round`.
+        block_size: Values per scale; 16 for NVFP4 and 32 for MXFP4 when None.
     Returns:
         A tuple of (x_fp4, blockscale_e8m0).
     """
     # Create padded x. Needed because mxfp4 works with block of 32 elements
-    QUANT_BLOCK_SIZE = 16 if is_nvfp4 else 32
+    QUANT_BLOCK_SIZE = block_size or (16 if is_nvfp4 else 32)
     EXP_BIAS_FP32 = 127
     EXP_BIAS_FP4 = 1
     EBITS_F32 = 8
@@ -219,6 +223,22 @@ def torch_dequant_nvfp4(
     )
     out = ref * sc
     return out.contiguous().to(out_dtype)
+
+
+def torch_dequant_mxfp4(
+    x: torch.Tensor,
+    scale: torch.Tensor,
+    out_dtype: torch.dtype = torch.bfloat16,
+    block_size: int = 32,
+) -> torch.Tensor:
+    """Dequantize packed E2M1 bytes with one raw E8M0 scale byte per
+    ``block_size`` values."""
+    assert x.dtype == torch.uint8
+    assert scale.dtype == torch.uint8
+    assert (
+        scale.shape[-1] * block_size == x.shape[-1] * 2
+    ), f"Expected scale last dim {x.shape[-1] * 2 // block_size}, got {scale.shape[-1]}"
+    return _dequantize_mxfp4(x, scale, block_size).contiguous().to(out_dtype)
 
 
 @pytest.mark.parametrize(

@@ -1,7 +1,28 @@
 import triton
 import triton.language as tl
 
-from aiter.ops.triton._triton_kernels.quant.quant import _nvfp4_quant_op
+from aiter.ops.triton._triton_kernels.quant.quant import (
+    _mxfp4_quant_op,
+    _nvfp4_quant_op,
+)
+
+
+@triton.jit
+def _fp4_kv_quant_op(x, BLOCK_D: tl.constexpr, FP4_KV_FORMAT: tl.constexpr):
+    """Quantize one token's row to packed E2M1 plus one scale byte per block.
+
+    "mxfp4" (and the latent of "mxfp4_fp8rope"): E8M0 scale per 32 values.
+    "mxfp4_b16": E8M0 scale per 16 values. "nvfp4": E4M3 scale per 16 values.
+    """
+    if FP4_KV_FORMAT == "mxfp4" or FP4_KV_FORMAT == "mxfp4_fp8rope":
+        x_fp4, x_scales = _mxfp4_quant_op(x.to(tl.float32), BLOCK_D, 1, 32)
+    elif FP4_KV_FORMAT == "mxfp4_b16":
+        x_fp4, x_scales = _mxfp4_quant_op(x.to(tl.float32), BLOCK_D, 1, 16)
+    else:
+        tl.static_assert(FP4_KV_FORMAT == "nvfp4")
+        x_fp4, x_scales = _nvfp4_quant_op(x, BLOCK_D, 1, 16)
+        x_scales = x_scales.to(tl.float8e4nv).to(tl.uint8, bitcast=True)
+    return x_fp4, x_scales
 
 
 @triton.jit
@@ -23,6 +44,7 @@ def _store_mla_kv_cache(
     SHUFFLED_KV_CACHE: tl.constexpr,
     SCALE_K_WIDTH_NOPE: tl.constexpr,
     SCALE_K_WIDTH_ROPE: tl.constexpr,
+    FP4_KV_FORMAT: tl.constexpr = "nvfp4",
 ):
     if SHUFFLED_KV_CACHE:
         if kv_cache_ptr.dtype.element_ty == tl.bfloat16:
@@ -32,16 +54,23 @@ def _store_mla_kv_cache(
             # FP8 E4M3 or packed FP4 E2M1
             K_WIDTH: tl.constexpr = 16
 
+        if FP4_KV_FORMAT == "mxfp4" or FP4_KV_FORMAT == "mxfp4_fp8rope":
+            FP4_QUANT_BLOCK_SIZE: tl.constexpr = 32
+        else:
+            FP4_QUANT_BLOCK_SIZE: tl.constexpr = 16
+        ROPE_FP8: tl.constexpr = FP4_KV_FORMAT == "mxfp4_fp8rope"
+
         if kv_cache_ptr.dtype.element_ty == tl.uint8:
-            NVFP4_QUANT_BLOCK_SIZE: tl.constexpr = 16
-            k_nope, k_nope_scales = _nvfp4_quant_op(
-                k_nope, BLOCK_D_nope, 1, NVFP4_QUANT_BLOCK_SIZE
-            )
-            k_pe, k_pe_scales = _nvfp4_quant_op(
-                k_pe, BLOCK_D_pe, 1, NVFP4_QUANT_BLOCK_SIZE
+            k_nope, k_nope_scales = _fp4_kv_quant_op(
+                k_nope, BLOCK_D_nope, FP4_KV_FORMAT
             )
             BLOCK_D_nope_STORE: tl.constexpr = BLOCK_D_nope // 2
-            BLOCK_D_pe_STORE: tl.constexpr = BLOCK_D_pe // 2
+            if ROPE_FP8:
+                k_pe = k_pe.to(tl.float8e4nv).to(tl.uint8, bitcast=True)
+                BLOCK_D_pe_STORE: tl.constexpr = BLOCK_D_pe
+            else:
+                k_pe, k_pe_scales = _fp4_kv_quant_op(k_pe, BLOCK_D_pe, FP4_KV_FORMAT)
+                BLOCK_D_pe_STORE: tl.constexpr = BLOCK_D_pe // 2
         else:
             BLOCK_D_nope_STORE: tl.constexpr = BLOCK_D_nope
             BLOCK_D_pe_STORE: tl.constexpr = BLOCK_D_pe
@@ -63,7 +92,7 @@ def _store_mla_kv_cache(
         ) * kv_cache_stride_d
 
         if kv_cache_ptr.dtype.element_ty == tl.uint8:
-            nope_scale_offset: tl.constexpr = BLOCK_D_nope // NVFP4_QUANT_BLOCK_SIZE
+            nope_scale_offset: tl.constexpr = BLOCK_D_nope // FP4_QUANT_BLOCK_SIZE
         else:
             nope_scale_offset: tl.constexpr = 0
         kv_cache_pe_offs = (
@@ -82,21 +111,13 @@ def _store_mla_kv_cache(
         )
 
         if kv_cache_ptr.dtype.element_ty == tl.uint8:
-            BLOCK_D_nope_scales: tl.constexpr = BLOCK_D_nope // NVFP4_QUANT_BLOCK_SIZE
-            BLOCK_D_pe_scales: tl.constexpr = BLOCK_D_pe // NVFP4_QUANT_BLOCK_SIZE
+            BLOCK_D_nope_scales: tl.constexpr = BLOCK_D_nope // FP4_QUANT_BLOCK_SIZE
             d_nope_offs_shfl = tl.arange(
                 0, BLOCK_D_nope_scales // SCALE_K_WIDTH_NOPE
             ).to(tl.int64)
-            d_pe_offs_shfl = tl.arange(0, BLOCK_D_pe_scales // SCALE_K_WIDTH_ROPE).to(
-                tl.int64
-            )
             k_nope_width_shfl = tl.arange(0, SCALE_K_WIDTH_NOPE).to(tl.int64)
-            k_pe_width_shfl = tl.arange(0, SCALE_K_WIDTH_ROPE).to(tl.int64)
             k_nope_scales = k_nope_scales.reshape(
                 (BLOCK_D_nope_scales // SCALE_K_WIDTH_NOPE, SCALE_K_WIDTH_NOPE)
-            )
-            k_pe_scales = k_pe_scales.reshape(
-                (BLOCK_D_pe_scales // SCALE_K_WIDTH_ROPE, SCALE_K_WIDTH_ROPE)
             )
             pid_sub_blk = pid_blk % 128
             kv_cache_nope_scales_offs = (
@@ -107,28 +128,26 @@ def _store_mla_kv_cache(
                 + (pid_sub_blk // 32) * SCALE_K_WIDTH_NOPE
                 + k_nope_width_shfl[None, :]
             ) * kv_cache_stride_d
-            kv_cache_pe_scales_offs = (
-                BLOCK_SIZE
-                * (BLOCK_D_nope_STORE + BLOCK_D_nope_scales + BLOCK_D_pe_STORE)
-                + (pid_blk // 128) * BLOCK_D_pe_scales * 128
-                + d_pe_offs_shfl[:, None] * SCALE_K_WIDTH_ROPE * 128
-                + (pid_sub_blk % 32) * 4 * SCALE_K_WIDTH_ROPE
-                + (pid_sub_blk // 32) * SCALE_K_WIDTH_ROPE
-                + k_pe_width_shfl[None, :]
-            ) * kv_cache_stride_d
-            e4m3_dtype = tl.float8e4nv
-            tl.store(
-                kv_cache_ptrs + kv_cache_nope_scales_offs,
-                k_nope_scales.to(e4m3_dtype).to(
-                    kv_cache_ptr.dtype.element_ty, bitcast=True
-                ),
-            )
-            tl.store(
-                kv_cache_ptrs + kv_cache_pe_scales_offs,
-                k_pe_scales.to(e4m3_dtype).to(
-                    kv_cache_ptr.dtype.element_ty, bitcast=True
-                ),
-            )
+            tl.store(kv_cache_ptrs + kv_cache_nope_scales_offs, k_nope_scales)
+            if not ROPE_FP8:
+                BLOCK_D_pe_scales: tl.constexpr = BLOCK_D_pe // FP4_QUANT_BLOCK_SIZE
+                d_pe_offs_shfl = tl.arange(
+                    0, BLOCK_D_pe_scales // SCALE_K_WIDTH_ROPE
+                ).to(tl.int64)
+                k_pe_width_shfl = tl.arange(0, SCALE_K_WIDTH_ROPE).to(tl.int64)
+                k_pe_scales = k_pe_scales.reshape(
+                    (BLOCK_D_pe_scales // SCALE_K_WIDTH_ROPE, SCALE_K_WIDTH_ROPE)
+                )
+                kv_cache_pe_scales_offs = (
+                    BLOCK_SIZE
+                    * (BLOCK_D_nope_STORE + BLOCK_D_nope_scales + BLOCK_D_pe_STORE)
+                    + (pid_blk // 128) * BLOCK_D_pe_scales * 128
+                    + d_pe_offs_shfl[:, None] * SCALE_K_WIDTH_ROPE * 128
+                    + (pid_sub_blk % 32) * 4 * SCALE_K_WIDTH_ROPE
+                    + (pid_sub_blk // 32) * SCALE_K_WIDTH_ROPE
+                    + k_pe_width_shfl[None, :]
+                ) * kv_cache_stride_d
+                tl.store(kv_cache_ptrs + kv_cache_pe_scales_offs, k_pe_scales)
     else:
         # non-shuffled KV cache
         kv_cache_ptrs = (
@@ -168,6 +187,7 @@ def _cat_and_cache_mla_kernel(
     SCALE_K_WIDTH_NOPE: tl.constexpr = 4,
     SCALE_K_WIDTH_ROPE: tl.constexpr = 4,
     HAVE_K_SCALE: tl.constexpr = False,
+    FP4_KV_FORMAT: tl.constexpr = "nvfp4",
 ):
     pid = tl.program_id(0)
 
@@ -225,6 +245,7 @@ def _cat_and_cache_mla_kernel(
             SHUFFLED_KV_CACHE,
             SCALE_K_WIDTH_NOPE,
             SCALE_K_WIDTH_ROPE,
+            FP4_KV_FORMAT,
         )
 
         # if SHUFFLED_KV_CACHE:

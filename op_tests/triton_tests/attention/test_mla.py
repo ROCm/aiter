@@ -11,10 +11,12 @@ from aiter.ops.triton.attention.mla import (
     mla_prefill_fwd,
 )
 from aiter.ops.triton.utils._triton import arch_info
+from aiter.ops.triton.utils.fp4_kv import fp4_kv_scale_block
 from aiter.ops.triton.utils.shuffle import shuffle_scale_batched, shuffle_weight
 from aiter.ops.triton.utils.types import e4m3_dtype
 from aiter.test_common import checkAllclose
 from op_tests.triton_tests.quant.test_quant_mxfp4 import (
+    torch_dequant_mxfp4,
     torch_dequant_nvfp4,
     torch_dynamic_mxfp4_quant,
 )
@@ -182,12 +184,17 @@ def shuffle_kv_buffer(
     return kv_buffer_shuffled
 
 
-def dynamic_nvfp4_quant_kv_buffer(
+def dynamic_fp4_quant_kv_buffer(
     kv_buffer: torch.Tensor,
     kv_lora_rank: int,
+    fp4_kv_format: str = "nvfp4",
 ):
+    """Reference packed FP4 cache (layout of aiter.ops.triton.utils.fp4_kv)."""
     dtype = kv_buffer.dtype
     assert dtype == torch.bfloat16
+    is_nvfp4 = fp4_kv_format == "nvfp4"
+    rope_fp8 = fp4_kv_format == "mxfp4_fp8rope"
+    scale_block = fp4_kv_scale_block(fp4_kv_format)
 
     _num_blocks, block_size, num_kv_heads, head_size = kv_buffer.shape
 
@@ -196,9 +203,9 @@ def dynamic_nvfp4_quant_kv_buffer(
     def quant_and_shuffle(kv_lora_or_rope_buffer):
         d = kv_lora_or_rope_buffer.shape[-1]
         quant_head_size = d // 2
-        scale_width = d // 16
+        scale_width = d // scale_block
         cache_shuffled, cache_shuffled_scale = torch_dynamic_mxfp4_quant(
-            kv_lora_or_rope_buffer, is_nvfp4=True
+            kv_lora_or_rope_buffer, is_nvfp4=is_nvfp4, block_size=scale_block
         )
         cache_shuffled_scale = cache_shuffled_scale.view(
             -1, num_kv_heads, block_size, scale_width
@@ -221,6 +228,14 @@ def dynamic_nvfp4_quant_kv_buffer(
         )
         return cache_shuffled, quant_head_size, scale_width
 
+    def fp8_shuffle(rope):
+        # The FP8 cache's (16, 16) shuffle, as in shuffle_kv_buffer.
+        d = rope.shape[-1]
+        rope = rope.to(e4m3_dtype).view(torch.uint8)
+        rope = rope.reshape(-1, num_kv_heads, block_size // 16, 16, d // 32, 2, 16)
+        rope = rope.permute(0, 1, 2, 4, 5, 3, 6).contiguous()
+        return rope.view(-1, num_kv_heads, block_size, d), d, 0
+
     kv_buffer_shuffled = kv_buffer.view(
         -1, block_size, num_kv_heads, head_size
     ).permute(0, 2, 1, 3)
@@ -228,8 +243,8 @@ def dynamic_nvfp4_quant_kv_buffer(
         quant_and_shuffle(kv_buffer_shuffled[..., :kv_lora_rank])
     )
     kv_buffer_quant_and_shuffled_rope, quant_head_size_rope, scale_width_rope = (
-        quant_and_shuffle(kv_buffer_shuffled[..., kv_lora_rank:])
-    )
+        fp8_shuffle if rope_fp8 else quant_and_shuffle
+    )(kv_buffer_shuffled[..., kv_lora_rank:])
     kv_buffer_quant_and_shuffled_lora = kv_buffer_quant_and_shuffled_lora.view(
         -1, num_kv_heads, block_size * (quant_head_size_lora + scale_width_lora)
     )
@@ -252,19 +267,41 @@ def dynamic_nvfp4_quant_kv_buffer(
     return kv_buffer_quant_and_shuffled
 
 
-def dequant_nvfp4_kv_buffer(kv_buffer: torch.Tensor, kv_lora_rank: int):
-    """``[blocks, block_size, heads, d]`` values an NVFP4 cache decodes to.
+def dynamic_nvfp4_quant_kv_buffer(kv_buffer: torch.Tensor, kv_lora_rank: int):
+    return dynamic_fp4_quant_kv_buffer(kv_buffer, kv_lora_rank, "nvfp4")
+
+
+def dequant_fp4_kv_buffer(
+    kv_buffer: torch.Tensor, kv_lora_rank: int, fp4_kv_format: str = "mxfp4"
+):
+    """``[blocks, block_size, heads, d]`` values an FP4 cache decodes to.
 
     The decode reference attends over these, so it sees exactly the values the
     kernel reads, and any error left is the kernel's own arithmetic.
     """
+    is_nvfp4 = fp4_kv_format == "nvfp4"
+    block = fp4_kv_scale_block(fp4_kv_format)
     num_blocks, block_size, num_kv_heads, head_size = kv_buffer.shape
     rows = kv_buffer.reshape(-1, head_size)
     out = []
     for part in (rows[:, :kv_lora_rank], rows[:, kv_lora_rank:]):
-        fp4, scales = torch_dynamic_mxfp4_quant(part.contiguous(), is_nvfp4=True)
-        out.append(torch_dequant_nvfp4(fp4, scales, out_dtype=torch.float32))
+        if fp4_kv_format == "mxfp4_fp8rope" and part.shape[-1] != kv_lora_rank:
+            out.append(part.to(e4m3_dtype).float())
+            continue
+        fp4, scales = torch_dynamic_mxfp4_quant(
+            part.contiguous(), is_nvfp4=is_nvfp4, block_size=block
+        )
+        if is_nvfp4:
+            out.append(torch_dequant_nvfp4(fp4, scales, out_dtype=torch.float32))
+        else:
+            out.append(
+                torch_dequant_mxfp4(fp4, scales, torch.float32, block_size=block)
+            )
     return torch.cat(out, dim=-1).view(num_blocks, block_size, num_kv_heads, head_size)
+
+
+def dequant_mxfp4_kv_buffer(kv_buffer: torch.Tensor, kv_lora_rank: int):
+    return dequant_fp4_kv_buffer(kv_buffer, kv_lora_rank, "mxfp4").to(torch.bfloat16)
 
 
 def ref_masked_attention(
@@ -348,14 +385,15 @@ def torch_mla_extend(
 @pytest.mark.parametrize("num_blocks", [32768])
 @pytest.mark.parametrize("varlen", [True, False])
 @pytest.mark.parametrize(
-    "q_dtype, kv_dtype, out_dtype, block_size, use_out_scale",
+    "q_dtype, kv_dtype, out_dtype, block_size, use_out_scale, fp4_kv_format",
     [
-        (torch.bfloat16, torch.bfloat16, torch.bfloat16, 64, False),
-        (torch.bfloat16, e4m3_dtype, torch.bfloat16, 64, False),
-        (e4m3_dtype, e4m3_dtype, torch.bfloat16, 64, False),
-        (e4m3_dtype, e4m3_dtype, e4m3_dtype, 64, True),
-        (e4m3_dtype, torch.uint8, torch.bfloat16, 128, False),
-        (torch.uint8, torch.uint8, torch.bfloat16, 128, False),
+        (torch.bfloat16, torch.bfloat16, torch.bfloat16, 64, False, "nvfp4"),
+        (torch.bfloat16, e4m3_dtype, torch.bfloat16, 64, False, "nvfp4"),
+        (e4m3_dtype, e4m3_dtype, torch.bfloat16, 64, False, "nvfp4"),
+        (e4m3_dtype, e4m3_dtype, e4m3_dtype, 64, True, "nvfp4"),
+        (e4m3_dtype, torch.uint8, torch.bfloat16, 128, False, "nvfp4"),
+        (torch.uint8, torch.uint8, torch.bfloat16, 128, False, "nvfp4"),
+        (e4m3_dtype, torch.uint8, torch.bfloat16, 128, False, "mxfp4"),
     ],
 )
 @pytest.mark.parametrize("shuffled_kv_cache", [True, False])
@@ -374,6 +412,7 @@ def test_mla_decode_fwd(
     kv_dtype: torch.dtype,
     out_dtype: torch.dtype,
     use_out_scale: bool,
+    fp4_kv_format: str,
     shuffled_kv_cache: bool,
 ):
     if DEVICE_ARCH not in (
@@ -386,9 +425,9 @@ def test_mla_decode_fwd(
 
     if kv_dtype == torch.uint8:
         if DEVICE_ARCH not in ("gfx1250",):
-            pytest.skip(f"NVFP4 requires {DEVICE_ARCH}")
+            pytest.skip(f"{fp4_kv_format} requires {DEVICE_ARCH}")
         if not shuffled_kv_cache:
-            pytest.skip("NVFP4 requires shuffled KV cache")
+            pytest.skip(f"{fp4_kv_format} requires shuffled KV cache")
 
     torch.cuda.empty_cache()
     random.seed(0)
@@ -460,10 +499,13 @@ def test_mla_decode_fwd(
 
     if shuffled_kv_cache:
         if kv_dtype == torch.uint8:
-            maybe_shuffled_kv_buffer = dynamic_nvfp4_quant_kv_buffer(
-                kv_buffer, kv_lora_rank
+            maybe_shuffled_kv_buffer = dynamic_fp4_quant_kv_buffer(
+                kv_buffer, kv_lora_rank, fp4_kv_format
             )
-            kv_buffer = kv_buffer.to(e4m3_dtype)
+            if fp4_kv_format == "mxfp4":
+                kv_buffer = dequant_mxfp4_kv_buffer(kv_buffer, kv_lora_rank)
+            else:
+                kv_buffer = kv_buffer.to(e4m3_dtype)
         else:
             kv_buffer = kv_buffer.to(kv_dtype)
             maybe_shuffled_kv_buffer = shuffle_kv_buffer(kv_buffer, kv_lora_rank)
@@ -488,6 +530,7 @@ def test_mla_decode_fwd(
         q_scales=query_scales,
         out_scale=output_scale,
         shuffled_kv_cache=shuffled_kv_cache,
+        fp4_kv_format=fp4_kv_format,
     )
 
     ref_output = torch_mla_extend(
@@ -521,15 +564,18 @@ def test_mla_decode_fwd(
     )
 
 
+@pytest.mark.parametrize(
+    "fp4_kv_format", ["mxfp4", "mxfp4_b16", "mxfp4_fp8rope", "nvfp4"]
+)
 @pytest.mark.parametrize("ctx_len", [1, 19, 67, 127, 128, 129, 200, 300, 1328])
 @pytest.mark.parametrize("num_heads", [16, 128])
 @pytest.mark.parametrize("batch_size", [1, 5])
 @pytest.mark.parametrize("decode_qlen", [1, 2])
 @torch.inference_mode()
-def test_mla_decode_fwd_nvfp4_kv_matches_decoded_cache(
-    ctx_len, num_heads, batch_size, decode_qlen
+def test_mla_decode_fwd_fp4_kv_matches_decoded_cache(
+    fp4_kv_format, ctx_len, num_heads, batch_size, decode_qlen
 ):
-    """FP8 query against an NVFP4 cache, with unit scales and sharp attention,
+    """FP8 query against an FP4 cache, with unit scales and sharp attention,
     checked against attention over the values the cache decodes to.
 
     test_mla_decode_fwd's random descales flatten the softmax and its absolute
@@ -538,6 +584,9 @@ def test_mla_decode_fwd_nvfp4_kv_matches_decoded_cache(
     """
     if DEVICE_ARCH != "gfx1250":
         pytest.skip("FP4 KV cache requires gfx1250")
+    lds_pipeline = fp4_kv_format != "nvfp4" and decode_qlen == 1 and num_heads == 128
+    if fp4_kv_format == "mxfp4_fp8rope" and not lds_pipeline:
+        pytest.skip("mxfp4_fp8rope is read by the LDS pipeline only")
     kv_lora_rank, qk_rope_head_dim, block_size = 512, 64, 128
     if decode_qlen > 1 and ctx_len % block_size == 1:
         pytest.xfail(
@@ -552,8 +601,8 @@ def test_mla_decode_fwd_nvfp4_kv_matches_decoded_cache(
     kv = torch.randn(
         (num_blocks, block_size, 1, head_dim), dtype=torch.bfloat16, device="cuda"
     )
-    cache = dynamic_nvfp4_quant_kv_buffer(kv, kv_lora_rank)
-    decoded = dequant_nvfp4_kv_buffer(kv, kv_lora_rank)
+    cache = dynamic_fp4_quant_kv_buffer(kv, kv_lora_rank, fp4_kv_format)
+    decoded = dequant_fp4_kv_buffer(kv, kv_lora_rank, fp4_kv_format)
     block_tables = (
         torch.randperm(num_blocks, device="cuda")[: batch_size * blocks_per_seq]
         .view(batch_size, blocks_per_seq)
@@ -590,6 +639,7 @@ def test_mla_decode_fwd_nvfp4_kv_matches_decoded_cache(
         one,
         one,
         shuffled_kv_cache=True,
+        fp4_kv_format=fp4_kv_format,
     )
     ref = []
     for b in range(batch_size):
@@ -600,7 +650,138 @@ def test_mla_decode_fwd_nvfp4_kv_matches_decoded_cache(
             ref.append(torch.softmax(s, dim=-1) @ visible[:, :kv_lora_rank])
     ref = torch.stack(ref)
     rel = ((out.float() - ref).norm() / ref.norm()).item()
-    assert rel < 1e-2, f"relative L2 error {rel:.4f}"
+    # Single-query MXFP4 decode over 128 heads takes the FP8 LDS pipeline,
+    # which rounds P to FP8 as the FP8 cache does; its expansion is checked
+    # exactly by test_mla_decode_fwd_mxfp4_lds_pipeline_matches_fp8.
+    tol = 3e-2 if lds_pipeline else 1e-2
+    assert rel < tol, f"relative L2 error {rel:.4f}"
+
+
+@pytest.mark.parametrize("num_segments", [1, 4])
+@pytest.mark.parametrize("fp4_kv_format", ["mxfp4", "mxfp4_b16", "mxfp4_fp8rope"])
+@pytest.mark.parametrize(
+    "output_kind,num_kv_heads",
+    [("padded", 2), ("strided", 1), ("offset", 1), ("fp8", 1)],
+)
+@torch.inference_mode()
+def test_mla_decode_fwd_mxfp4_lds_pipeline_matches_fp8(
+    monkeypatch, output_kind: str, num_kv_heads: int, fp4_kv_format, num_segments
+):
+    """The MXFP4 LDS pipeline expands each cache block to FP8 tiles and runs
+    the FP8 tile schedule, so over an FP8 cache that holds the values the
+    MXFP4 cache decodes to (exact in E4M3 here), the single-segment FP8 LDS
+    pipeline must give the same output, also when the MXFP4 decode splits
+    sequences into segments."""
+    if DEVICE_ARCH != "gfx1250":
+        pytest.skip("LDS pipeline requires gfx1250")
+
+    import aiter.ops.triton.attention.mla as mla_module
+
+    kernel = mla_module.gluon_mla_decode_fwd_kernel
+    launches = []
+
+    class CaptureLaunch:
+        def __getitem__(self, grid):
+            def launch(*args, **kwargs):
+                launches.append(kwargs)
+                return kernel[grid](*args, **kwargs)
+
+            return launch
+
+    monkeypatch.setattr(mla_module, "gluon_mla_decode_fwd_kernel", CaptureLaunch())
+    select_config = mla_module.select_3d_config
+    segments = {"n": num_segments}
+
+    def forced_segments(*args, **kwargs):
+        attn, reduce = select_config(*args, **kwargs)
+        attn["NUM_SEGMENTS_PER_SEQ"] = reduce["NUM_SEGMENTS_PER_SEQ"] = segments["n"]
+        return attn, reduce
+
+    monkeypatch.setattr(mla_module, "select_3d_config", forced_segments)
+    torch.manual_seed(0)
+    # One, two and three or more blocks; partial first and second halves.
+    lengths = [1, 64, 65, 128, 129, 192, 193, 256, 257, 385, 4097]
+    batch_size, num_query_heads = len(lengths), 128 * num_kv_heads
+    blocks_per_seq, num_blocks = 33, 160
+    seq_lens_kv = torch.tensor(lengths, dtype=torch.int32, device="cuda")
+    cu_seqlens_q = torch.arange(batch_size + 1, dtype=torch.int32, device="cuda")
+    block_tables = torch.randint(
+        0, num_blocks, (batch_size, blocks_per_seq), dtype=torch.int32, device="cuda"
+    )
+    kv = (
+        torch.randn(
+            (num_blocks, 128, num_kv_heads, 576), device="cuda", dtype=torch.bfloat16
+        )
+        * 0.5
+    )
+    cache = dynamic_fp4_quant_kv_buffer(kv, 512, fp4_kv_format)
+    decoded = dequant_fp4_kv_buffer(kv, 512, fp4_kv_format).view(
+        num_blocks * 2, 64, num_kv_heads, 576
+    )
+    fp8_pages = decoded.to(e4m3_dtype)
+    assert torch.equal(fp8_pages.float(), decoded)
+    fp8_cache = shuffle_kv_buffer(fp8_pages, 512)
+    fp8_block_tables = torch.stack(
+        (2 * block_tables, 2 * block_tables + 1), dim=-1
+    ).view(batch_size, 2 * blocks_per_seq)
+    query = torch.randn(
+        (batch_size, num_query_heads, 576), device="cuda", dtype=torch.bfloat16
+    ).to(e4m3_dtype)
+    q_descale = None if output_kind == "strided" else torch.tensor([0.3], device="cuda")
+    kv_descale = (
+        None if output_kind == "strided" else torch.tensor([0.4], device="cuda")
+    )
+    output_scale = torch.tensor([0.25 if output_kind == "fp8" else 0.7], device="cuda")
+    out_dtype = e4m3_dtype if output_kind == "fp8" else torch.bfloat16
+    width = 513 if output_kind == "strided" else 520
+    offset = 1 if output_kind == "offset" else 0
+
+    def run(kv_buffer, tables, **kwargs):
+        storage = torch.full(
+            (batch_size, num_query_heads, width), 16.0, device="cuda", dtype=out_dtype
+        )
+        output = storage[..., offset : offset + 512]
+        mla_decode_fwd(
+            q=query,
+            kv_buffer=kv_buffer,
+            out=output,
+            cu_seqlens_q=cu_seqlens_q,
+            seqused_k=seq_lens_kv,
+            max_seqlen_kv=max(lengths),
+            block_tables=tables,
+            softmax_scale=576**-0.5,
+            kv_lora_rank=512,
+            qk_rope_head_dim=64,
+            causal=True,
+            q_descale=q_descale,
+            kv_descale=kv_descale,
+            out_scale=output_scale,
+            shuffled_kv_cache=True,
+            **kwargs,
+        )
+        return storage
+
+    mxfp4_storage = run(cache, block_tables, fp4_kv_format=fp4_kv_format)
+    segments["n"] = 1
+    fp8_storage = run(fp8_cache, fp8_block_tables)
+    assert [k["USE_LDS_PIPELINE"] for k in launches] == [True, True]
+    assert [k["KV_CACHE_DTYPE"] for k in launches] == [fp4_kv_format, "fp8"]
+    assert [k["NUM_SEGMENTS_PER_SEQ"] for k in launches] == [num_segments, 1]
+    actual, expected = mxfp4_storage.float(), fp8_storage.float()
+    assert torch.isfinite(actual).all()
+    # Bytes outside the output view are untouched.
+    assert torch.equal(actual[..., :offset], expected[..., :offset])
+    assert torch.equal(actual[..., offset + 512 :], expected[..., offset + 512 :])
+    rel = ((actual - expected).norm() / expected.norm()).item()
+    # An FP8 output can round a last-bit difference to a whole FP8 step. A
+    # segment rounds P to FP8 after subtracting its own running max, which
+    # moves the output by about 3e-3 while its error against FP32 attention
+    # stays the same (2.5% here at every segment count).
+    if output_kind == "fp8":
+        tol = 2e-2
+    else:
+        tol = 1e-4 if num_segments == 1 else 5e-3
+    assert rel < tol, f"relative L2 {rel:.3e}"
 
 
 @pytest.mark.parametrize(

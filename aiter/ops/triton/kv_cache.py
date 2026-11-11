@@ -2,10 +2,14 @@
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
 import torch
-import triton
 
 from aiter.jit.utils.torch_guard import torch_compile_guard
 from aiter.ops.triton._triton_kernels.kv_cache import _cat_and_cache_mla_kernel
+from aiter.ops.triton.utils.fp4_kv import (
+    fp4_kv_row_bytes,
+    fp4_kv_scale_block,
+    fp4_kv_scale_k_width,
+)
 from aiter.ops.triton.utils.logger import AiterTritonLogger
 from aiter.ops.triton.utils.types import e4m3_dtype
 
@@ -20,6 +24,7 @@ def cat_and_cache_mla_fake_tensor(
     k_scale: torch.Tensor,
     apply_scale: bool = True,
     shuffled_kv_cache: bool = False,
+    fp4_kv_format: str = "nvfp4",
 ) -> None:
     return None
 
@@ -33,6 +38,7 @@ def cat_and_cache_mla(
     k_scale: torch.Tensor,
     apply_scale: bool = True,
     shuffled_kv_cache: bool = False,
+    fp4_kv_format: str = "nvfp4",
 ) -> None:
     """
     Perform concat k_nope and k_pe to kv_cache inplace
@@ -42,6 +48,9 @@ def cat_and_cache_mla(
     - k_pe: Matrix W with shape (B_slot, KH, D2).
     - kv_cache: Matrix W with shape (B_cache, KH, D1 + D2).
     - slot_mapping: Matrix W with shape (B_slot, ).
+    - fp4_kv_format: For a packed FP4 (uint8) kv_cache, "nvfp4", "mxfp4",
+      "mxfp4_b16" or "mxfp4_fp8rope" (see aiter.ops.triton.utils.fp4_kv).
+      Ignored for BF16/FP8 caches.
 
     B is the number of decode tokens, B_slot is the number of prefill + decode tokens, B_cahce is the max number of tokens of kv_cache
     QH must be multiple of KH
@@ -72,18 +81,9 @@ def cat_and_cache_mla(
     if kv_cache_dtype == torch.uint8:
         assert shuffled_kv_cache, "shuffle_kv_cache must be True for FP4 KV cache"
         _b_cache, h_cache, block_size, d_cache = kv_cache.shape
-        SCALE_K_LORA = d_nope // 16
-        SCALE_K_ROPE = d_rope // 16
-        SCALE_K_WIDTH_NOPE = (
-            min(16, triton.next_power_of_2(SCALE_K_LORA))
-            if SCALE_K_LORA >= 4
-            else SCALE_K_LORA
-        )
-        SCALE_K_WIDTH_ROPE = (
-            min(16, triton.next_power_of_2(SCALE_K_ROPE))
-            if SCALE_K_ROPE >= 4
-            else SCALE_K_ROPE
-        )
+        scale_block = fp4_kv_scale_block(fp4_kv_format)
+        SCALE_K_WIDTH_NOPE = fp4_kv_scale_k_width(d_nope // scale_block)
+        SCALE_K_WIDTH_ROPE = fp4_kv_scale_k_width(d_rope // scale_block)
     else:
         if shuffled_kv_cache:
             _b_cache, h_cache, block_size, d_cache = kv_cache.shape
@@ -96,9 +96,11 @@ def cat_and_cache_mla(
     ), "K batch dimensions and slot_mapping should be identical (bk == bk == b_slot)"
     assert kh == kh2 == h_cache, "K head should be identical"
     if kv_cache.dtype == torch.uint8:
-        assert (
-            (d_nope + d_rope) // 2 + (d_nope + d_rope) // 16
-        ) == d_cache, "The D dimension of kv_cache should be (d_nope + d_rope) // 2 + (d_nope + d_rope) // 16 for FP4 KV cache"
+        expected_d_cache = fp4_kv_row_bytes(d_nope, d_rope, fp4_kv_format)
+        assert expected_d_cache == d_cache, (
+            f"The D dimension of kv_cache should be {expected_d_cache} for an "
+            f"{fp4_kv_format} KV cache, got {d_cache}"
+        )
     else:
         assert (
             d_nope + d_rope == d_cache
@@ -138,5 +140,6 @@ def cat_and_cache_mla(
         SCALE_K_WIDTH_NOPE=SCALE_K_WIDTH_NOPE,
         SCALE_K_WIDTH_ROPE=SCALE_K_WIDTH_ROPE,
         HAVE_K_SCALE=(k_scale is not None and apply_scale),
+        FP4_KV_FORMAT=fp4_kv_format if kv_cache_dtype == torch.uint8 else "nvfp4",
         num_warps=1,
     )
