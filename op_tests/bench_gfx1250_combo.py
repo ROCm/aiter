@@ -79,8 +79,9 @@ same thing to every op:
     score_qk_fp4    16, 128, 512, a subset of score_qk's tiers. The axis is
                     the decode batch (sequences) of its MTP 1 and MTP 4 cases;
                     its prefill cases are fixed; see _SCORE_QK_FP4_TOKENS.
-    --dsr1 moe,     1..16384 per-GPU decode batch, plus 1536, the recipe's
-    mla_decode      max_num_seqs; see _DSR1_BATCH.
+    --dsr1 moe,     per-GPU decode batch up to 16384, plus 1536, the recipe's
+    mla_decode      max_num_seqs; MoE starts at 4, MLA decode at 1. See
+                    _DSR1_MOE_BATCH and _DSR1_BATCH.
     mla_prefill     1024..16384 tokens per step; see _DSR1_MLA_PREFILL_TOKENS.
                     The per-sequence length sweep is fixed in the source.
 
@@ -637,12 +638,16 @@ _MOE_CONFIG = {
 _DSR1_BATCH = _tokens(
     (1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 1536, 2048, 4096, 8192, 16384)
 )
+# The DSR1 MoE sweep leaves out bs 1 and 2.
+_DSR1_MOE_BATCH = _tokens(
+    (4, 8, 16, 32, 64, 128, 256, 512, 1024, 1536, 2048, 4096, 8192, 16384)
+)
 # 256 routed experts over EP4, plus the shared expert ATOM fuses in as one more
 # expert (ATOM_FUSE_SHARED_EXPERT=1) that every token selects.
 _DSR1_MOE_CONFIG = {
     "experts": 65,
     "shared_experts": 1,
-    "tokens": _DSR1_BATCH,
+    "tokens": _DSR1_MOE_BATCH,
     "topk": 9,
     "model_dim": 7168,
     "inter_dim": 2048,
