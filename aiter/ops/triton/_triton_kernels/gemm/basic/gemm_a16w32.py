@@ -150,6 +150,17 @@ def _gemm_a16w32_bf16x3_kernel(
             cache_modifier=".wt",
         )
         tile_id = pid_m * num_pid_n + pid_n
+        # The release of the arrival covers only the wave that adds it. So each wave
+        # drains its partial stores before the barrier (a bare s_barrier).
+        tl.inline_asm_elementwise(
+            "s_waitcnt vmcnt(0)",
+            "=v,v",
+            [tile_id],
+            dtype=tl.int32,
+            is_pure=False,
+            pack=1,
+        )
+        tl.debug_barrier()
         arrived = tl.atomic_add(cnt_ptr + tile_id, 1, sem="acq_rel", scope="gpu")
         if arrived == NUM_KSPLIT - 1:
             total = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)

@@ -3,6 +3,7 @@ import math
 
 import triton
 
+from aiter.ops.triton._triton_kernels.gemm.basic.gemm_a16w32 import _get_config
 from aiter.ops.triton.gemm.basic.gemm_a16w32 import gemm_a16w32
 from op_tests.op_benchmarks.triton.utils.argparse import (
     add_argparse_ff,
@@ -24,10 +25,25 @@ from op_tests.triton_tests.gemm.basic.test_gemm_a16w32 import (
 )
 
 
+def _gen_inputs(M, N, K, keys):
+    names = ("x", "w", "w_bf16x3", "y")
+    inputs = dict(zip(names, generate_gemm_a16w32_inputs(M, N, K, output=True)))
+    return tuple(inputs[key] for key in keys)
+
+
 def bench_gemm_fn(bencher: RotatingBufferBench, M: int, N: int, K: int, metric: str):
-    _p_gen = functools.partial(generate_gemm_a16w32_inputs, M, N, K, output=True)
-    _out_vals_keys = ["x", "w", "w_bf16x3", "y"]
-    rot_bufs = bencher.build_pool([_p_gen], [_out_vals_keys])
+    # The config of M selects one kernel, which reads only w (fp32 FMA) or only
+    # w_bf16x3 (bf16x3). That weight rotates, and the other one is fixed.
+    config, _ = _get_config(M, N, K)
+    fma = config.get("kernel_type") == "bandwidth_bound"
+    read, unread = ("w", "w_bf16x3") if fma else ("w_bf16x3", "w")
+    rot_keys = ["x", read, "y"]
+    rot_bufs = bencher.build_pool(
+        [functools.partial(_gen_inputs, M, N, K, rot_keys)],
+        [rot_keys],
+        inp_gen_fixed_fns=[functools.partial(_gen_inputs, M, N, K, [unread])],
+        inp_fixed_keys=[[unread]],
+    )
 
     flops = 2.0 * M * N * K
     # the fp32 weight size: the FMA kernel reads it, the bf16x3 kernel reads 1.5x

@@ -41,6 +41,22 @@ def test_split_bf16x3_is_exact():
     assert torch.equal(total, w)
 
 
+def test_split_bf16x3_limits():
+    # Exact from 2**-110 to below 2**128 - 2**119, and lossy only under 2**-133.
+    ulp = 2.0**-23
+    exact = [0.0, 2.0**-110 * (1 + ulp), -(2.0**-110) * (2 - ulp), 2.0**128 - 2.0**120]
+    tiny = [2.0**-126 + 2.0**-149, -(2.0**-120) * (1 + ulp)]
+    w = torch.tensor([exact + tiny], dtype=torch.float32, device="cuda")
+    # fp64 on the CPU keeps the subnormal terms.
+    total = split_bf16x3(w).cpu().double().sum(dim=0)
+    w64 = w.cpu().double()
+    assert torch.equal(total[:, : len(exact)], w64[:, : len(exact)])
+    assert (total - w64).abs().max().item() <= 2.0**-134
+    for bad in (2.0**128 - 2.0**119, float("inf"), float("nan")):
+        with pytest.raises(ValueError):
+            split_bf16x3(torch.full((1, 4), bad, dtype=torch.float32, device="cuda"))
+
+
 @pytest.mark.parametrize("M", [1, 3, 16, 32, 33, 64, 127, 256, 1000, 2048, 4096])
 @pytest.mark.parametrize("N, K", SHAPES_NK)
 def test_gemm_a16w32(M, N, K):

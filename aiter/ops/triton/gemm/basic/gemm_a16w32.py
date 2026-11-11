@@ -27,7 +27,9 @@ def split_bf16x3(weight: torch.Tensor) -> torch.Tensor:
     Splits an fp32 weight into three bf16 terms whose fp32 sum is the weight.
 
     Three bf16 terms hold 24 mantissa bits, as fp32 does, so the sum is exact for
-    finite normal values. Call it once, when the weights load.
+    0 and for 2**-110 <= |w| < 2**128 - 2**119 (about 3.396e38). Below 2**-110,
+    the bits under 2**-133 (the smallest bf16 step) are lost. Call it once, when
+    the weights load.
 
     Args:
         weight (torch.Tensor): FP32 matrix with shape (N, K).
@@ -36,7 +38,8 @@ def split_bf16x3(weight: torch.Tensor) -> torch.Tensor:
         torch.Tensor: Contiguous BF16 tensor with shape (3, N, K), largest term first.
 
     Raises:
-        ValueError: If the weight has inf or NaN values.
+        ValueError: If the weight has inf or NaN values, or values that round to
+            inf in bf16 (|w| >= 2**128 - 2**119).
     """
     assert weight.dtype == torch.float32 and weight.dim() == 2, "fp32 (N, K) weight"
     if not torch.isfinite(weight).all():
@@ -47,6 +50,8 @@ def split_bf16x3(weight: torch.Tensor) -> torch.Tensor:
         term = rest.to(torch.bfloat16)
         terms.append(term)
         rest -= term.to(torch.float32)
+    if not torch.isfinite(terms[0]).all():
+        raise ValueError("the weight has values that round to inf in bf16")
     return torch.stack(terms).contiguous()
 
 
@@ -172,9 +177,10 @@ def gemm_a16w32_(
         y (torch.Tensor): FP32 output with shape (M, N).
 
     Limits: configs exist for gfx950 only. Split-K launches use counters of the
-    current stream, so a captured graph must not run on two streams at the same
-    time. With torch < 2.10, run one eager split-K call on a stream before a graph
-    capture on that stream.
+    current stream, and graphs captured on a stream can share its counters. So
+    do not run one graph on two streams at the same time, or two graphs captured
+    on one stream at the same time on different streams. With torch < 2.10, run
+    one eager split-K call on a stream before a graph capture on that stream.
     """
     _LOGGER.info("GEMM_A16W32: x.shape=%s, w.shape=%s", tuple(x.shape), tuple(w.shape))
     assert x.dtype == torch.bfloat16 and x.dim() == 2, "bf16 (M, K) x"
