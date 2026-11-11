@@ -694,6 +694,11 @@ __device__ void mla_v4_prefill_accum_le2_tiles(
         constexpr int mxscl_chunk = T::D_NOPE_SIZE / T::D_128B_NOPE_SIZE;
         constexpr int mxscl_col   = T::D_NOPE_SIZE % T::D_128B_NOPE_SIZE;
         auto v_k_mxscl = load<1>(s_k_nope, u_rk_mxscl + mxscl_col + sk_nope_slice(number<mxscl_chunk>{}));
+#if defined(OPUS_MLA_V4_DMA)
+        // Folded cache format: the KV scale is a unit 2^0 and the trailer bytes
+        // now hold RoPE, so the scale is materialised rather than read.
+        static_for<vector_traits<decltype(v_k_mxscl)>::size()>([&](auto i) { v_k_mxscl[i.value] = static_cast<D_NOPE>(127); });
+#endif
         v_k_mxscl[3] = (lane_id >= 32) ? static_cast<D_NOPE>(0) : v_k_mxscl[3];
         v_k_mxscl[7] = (lane_id >= 32) ? static_cast<D_NOPE>(0) : v_k_mxscl[7];
         v_k_nope[0] = load<T::VEC_KV_NOPE>(s_k_nope, u_rk_nope);
@@ -858,6 +863,11 @@ __device__ void mla_v4_prefill_accum_pipelined(
 
     auto load_mxscl = [&](auto slot_off) {
         auto v_mxscl = load<1>(s_k_nope, u_rk_mxscl + mxscl_col + sk_nope_slice(number<mxscl_chunk>{}) + slot_off);
+#if defined(OPUS_MLA_V4_DMA)
+        // Folded cache format: the KV scale is a unit 2^0 and the trailer bytes
+        // now hold RoPE, so the scale is materialised rather than read.
+        static_for<vector_traits<decltype(v_mxscl)>::size()>([&](auto i) { v_mxscl[i.value] = static_cast<D_NOPE>(127); });
+#endif
         if (lane_id >= 32) {
             v_mxscl[3] = static_cast<D_NOPE>(0);
             v_mxscl[7] = static_cast<D_NOPE>(0);

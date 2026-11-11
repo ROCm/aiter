@@ -27,13 +27,14 @@ from typing import NamedTuple
 import torch
 
 from .. import logger
-from ..jit.core import compile_ops
+from ..jit.core import compile_ops, get_args_of_build
 from ..jit.utils.asm_guard import require_gfx1250_asm
 from ..jit.utils.chip_info import get_cu_num, get_gfx_runtime
 from ..jit.utils.torch_guard import torch_compile_guard
 from ..plugin import route as _route
 from ..utility import dtypes
 from .opus.mla import (
+    PREFILL_MD_NAME,
     opus_mla_v4_prefill_a8w8_gfx950_fwd,
     opus_mla_v4_prefill_a8w8_gfx1250_fwd,
     opus_mla_v4_prefill_a16w16_gfx950_fwd,
@@ -231,6 +232,20 @@ def mla_sparse_prefill_fp8_asm(
 # ---------------------------------------------------------------------------
 # opus
 # ---------------------------------------------------------------------------
+
+
+@functools.cache
+def fp8_kv_dma_layout_enabled(gfx: str) -> bool:
+    """Whether the fp8 kernel for ``gfx`` reads the DMA KV layout.
+
+    Only the gfx950 kernel has the DMA path, and only when the module is built
+    with ``-DOPUS_MLA_V4_DMA`` (its ``flags_extra_hip`` in optCompilerConfig.json),
+    so the wrapper follows that flag rather than assuming it.
+    """
+    if gfx != "gfx950":
+        return False
+    flags = get_args_of_build(PREFILL_MD_NAME)["flags_extra_hip"]
+    return any("-DOPUS_MLA_V4_DMA" in f for f in flags)
 
 
 def _opus_fwd(gfx: str, op_gfx950, op_gfx1250):
@@ -434,6 +449,7 @@ def _opus_sparse_prefill_v4(
     softmax_scale,
     out,
     num_kv_splits=None,
+    kv_dma_layout=False,
 ):
     if q_nope.dtype != unified_kv_nope.dtype or q_nope.dtype != kv_nope.dtype:
         raise RuntimeError(
@@ -450,6 +466,12 @@ def _opus_sparse_prefill_v4(
     fwd = _opus_fwd(gfx, *kernels)
     if q_rope.dtype != torch.bfloat16:
         raise RuntimeError(f"q_rope must be bf16, got {q_rope.dtype}")
+    if fp8_kv_dma_layout_enabled(gfx) and not kv_dma_layout:
+        from .triton.mla_v4_kv_rescale import to_dma_kv_layout
+
+        # Can be fused into SGLang's upstream KV quantization, which would then write this layout directly.
+        unified_kv_nope = to_dma_kv_layout(unified_kv_nope, unified_kv_rope)
+        kv_nope = to_dma_kv_layout(kv_nope, kv_rope)
     n, h, _ = q_nope.shape
     out = _out_bf16(n, h, q_nope.device, out)
     args = (
@@ -659,6 +681,7 @@ def _mla_sparse_prefill_v4_fake(
     out: torch.Tensor | None = None,
     num_kv_splits: int | None = None,
     backend: str | None = None,
+    kv_dma_layout: bool = False,
 ) -> torch.Tensor:
     if out is not None:
         return out
@@ -683,9 +706,20 @@ def mla_sparse_prefill_v4(
     out: torch.Tensor | None = None,
     num_kv_splits: int | None = None,
     backend: str | None = None,
+    kv_dma_layout: bool = False,
 ) -> torch.Tensor:
     """MLA sparse prefill over the v4 layout: NoPE rows holding their own E8M0
     scales, plus bf16 RoPE. Supported NoPE dtypes: fp8.
+
+    Where :func:`fp8_kv_dma_layout_enabled` holds, the opus kernel reads the KV
+    caches in the DMA layout (one 512 B fp8 row per position: NoPE at scale 2^0,
+    fp8 RoPE in [448, 512)). Caches in the served layout are converted to it on
+    every call, into new tensors, by
+    :func:`aiter.ops.triton.mla_v4_kv_rescale.to_dma_kv_layout`; callers whose
+    caches are already in that layout pass ``kv_dma_layout=True`` to skip it.
+    QK^T takes its RoPE in bf16 from ``q_rope`` and ``unified_kv_rope`` /
+    ``kv_rope``, so those must hold the rows' real RoPE; the rows' fp8 RoPE feeds
+    only P*V.
 
     Args:
       q_nope:            ``[T, H, 512]`` NoPE (fp8: 448 values, 14 E8M0 scales, pad).
@@ -706,6 +740,8 @@ def mla_sparse_prefill_v4(
       out:               Optional ``[T, H, 512]`` bf16 output; allocated if ``None``.
       num_kv_splits:     as in :func:`mla_sparse_prefill` (opus only).
       backend:           ``"asm"``, ``"opus"`` or ``None``.
+      kv_dma_layout:     the KV caches are already in the DMA layout; ignored
+        where the kernel reads the served layout.
 
     Returns:
       ``out``.
@@ -742,7 +778,7 @@ def mla_sparse_prefill_v4(
             return _asm_sparse_prefill_v4(*args)
         except RuntimeError as e:  # asm is stricter about dtypes and shapes than opus
             _warn_asm_fallback(str(e))
-    return _opus_sparse_prefill_v4(*args, num_kv_splits)
+    return _opus_sparse_prefill_v4(*args, num_kv_splits, kv_dma_layout)
 
 
 def _mla_sparse_prefill_v41_fake(
