@@ -316,7 +316,8 @@ def plan_pa_decode(
 
     Allocate outside graph capture; pass ``plan`` to refresh buffers in place.
     The budget counts task slots across KV heads before query splitting. It
-    defaults to two slots per CU, or one on gfx950 when ``query_length`` > 1.
+    defaults to two slots per CU. On gfx950 with ``query_length`` > 1 it is
+    four slots per sequence and KV head, clamped to one to two slots per CU.
     Each nonempty sequence gets at least one task. Elsewhere the remaining
     slots go to sequences in proportion to their tiles. On gfx950, batches that
     fit one row per planner thread instead give a sequence of t tiles
@@ -386,14 +387,15 @@ def plan_pa_decode(
     if plan is None:
         if workgroup_budget is None:
             # gfx950 multi-query tasks quantize and stage every query row, so
-            # one slot per CU, with longer tasks, pays that cost less often.
-            slots_per_cu = (
-                1
-                if query_length > 1
-                and properties.gcnArchName.split(":", 1)[0] == "gfx950"
-                else 2
-            )
-            workgroup_budget = slots_per_cu * num_compute_units
+            # down to one slot per CU, with longer tasks, pays that cost less
+            # often. Four slots per sequence stay so that uneven lengths can
+            # still be split.
+            workgroup_budget = 2 * num_compute_units
+            if query_length > 1 and properties.gcnArchName.split(":", 1)[0] == "gfx950":
+                workgroup_budget = min(
+                    max(4 * batch * num_kv_heads, num_compute_units),
+                    workgroup_budget,
+                )
         if workgroup_budget < 1:
             raise ValueError("workgroup_budget must be positive")
         capacity = min(
