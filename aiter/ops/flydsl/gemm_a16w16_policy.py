@@ -24,6 +24,20 @@ from .kernels.gemm_a16w16_skinny_gfx950 import skinny_config_error
 
 __all__ = ["GemmConfigPruner", "get_flydsl_a16w16_configs"]
 
+_WIDE_GRID_BLOCK_M = (192, 208, 224)
+
+
+def _config_key(config):
+    return tuple(sorted(config.items()))
+
+
+def _uniform_async_loads(param):
+    """Whether whole-thread vector loads cover the A and B tiles exactly."""
+    per_iter = param.block_threads * param.async_load_bytes // param.in_data_bytes
+    return all(
+        rows * param.block_k % per_iter == 0 for rows in (param.block_m, param.block_n)
+    )
+
 
 @dataclass(frozen=True)
 class GemmConfigPruner:
@@ -425,7 +439,7 @@ def get_flydsl_a16w16_configs(
     # the stricter HTI/alignment requirements for each candidate.
     split_k_candidates = list(range(1, min(k, 9) + 1))
     selections = {
-        "block_m": [16, 32, 48, 64, 80, 96, 128, 192, 208, 224, 256],
+        "block_m": [16, 32, 48, 64, 80, 96, 128, *_WIDE_GRID_BLOCK_M, 256],
         "block_n": [16, 32, 64, 80, 96, 128, 160, 256],
         "block_k": [64, 128, 256],
         "stages": list(range(2, 10)),
@@ -440,6 +454,13 @@ def get_flydsl_a16w16_configs(
         dict(zip(selections, combo))
         for combo in itertools.product(*selections.values())
     ]
+    # Stagger and B cache-policy copies cover only the original grid with
+    # uniform loads. Copying the added tiles too overflows the tuning budget.
+    memory_bases = {
+        _config_key(config)
+        for config in configs
+        if config["block_m"] not in _WIDE_GRID_BLOCK_M
+    }
     for group_m in (1, 2, 8, 16):
         configs.append(
             {
@@ -709,15 +730,8 @@ def get_flydsl_a16w16_configs(
             "b_is_transposed": True,
             "has_bias": has_bias,
         }
-        if (
-            make_gemm_a16w16_param_and_validate(
-                m,
-                n,
-                k,
-                validation_config,
-            )
-            is not None
-        ):
+        param = make_gemm_a16w16_param_and_validate(m, n, k, validation_config)
+        if param is not None:
             valid_configs.append(config)
             # Atomic and workspace reductions trade launch count for traffic;
             # keep both so tuning picks the faster one per shape.
@@ -733,7 +747,12 @@ def get_flydsl_a16w16_configs(
             # Stagger is a measured option, never a global default. At small
             # M, a single row tile streams B; preserve the original catalog
             # and let tuning race stagger and B cache policy against the original.
-            if m <= 128 and m <= config["block_m"]:
+            if (
+                m <= 128
+                and m <= config["block_m"]
+                and _config_key(config) in memory_bases
+                and _uniform_async_loads(param)
+            ):
                 memory_configs.extend(
                     {**config, "k_stagger": stride, "b_non_temporal": nt}
                     for stride in (0, 1, 3)

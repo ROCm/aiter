@@ -13,6 +13,7 @@ Run:
 import csv
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from unittest import mock
 
 import torch
@@ -23,6 +24,24 @@ GFX, CU_NUM = "gfx942", 304
 M, N, K = 32, 256, 1024
 BF16 = str(torch.bfloat16)
 KEY = (GFX, CU_NUM, M, N, K, False, BF16, BF16, False, False)
+
+
+def _fake_gfx950_param(m, n, k, kwargs):
+    """Stand in for a validated gfx950 param with the real load geometry."""
+    from aiter.ops.flydsl.kernels.gemm_a16w16_gfx950_utils import (
+        GFX950_DMA_BYTES,
+        GFX950_WAVE_SIZE,
+    )
+
+    waves = kwargs["m_waves"] * kwargs["n_waves"] * kwargs["k_waves"]
+    return SimpleNamespace(
+        block_m=kwargs["block_m"],
+        block_n=kwargs["block_n"],
+        block_k=kwargs["block_k"],
+        block_threads=waves * GFX950_WAVE_SIZE,
+        async_load_bytes=GFX950_DMA_BYTES,
+        in_data_bytes=2,
+    )
 
 
 class TestA16W16TunedConfigLookup(unittest.TestCase):
@@ -578,7 +597,7 @@ class TestGfx950FlydslMemoryCandidates(unittest.TestCase):
                 policy.itertools,
                 "product",
                 side_effect=[
-                    [tuple(wide.values())],
+                    [tuple(wide.values()), tuple({**wide, "block_n": 80}.values())],
                     [(24, 64, 4, 2)],
                 ],
             ),
@@ -590,7 +609,7 @@ class TestGfx950FlydslMemoryCandidates(unittest.TestCase):
                 policy.torch.cuda, "get_device_properties", return_value=None
             ),
             mock.patch.object(
-                policy, "make_gemm_a16w16_param_and_validate", return_value=object()
+                policy, "make_gemm_a16w16_param_and_validate", _fake_gfx950_param
             ),
             mock.patch.object(policy, "skinny_config_error", return_value=None),
             mock.patch.object(policy, "band_stream_config", return_value=None),
@@ -607,6 +626,13 @@ class TestGfx950FlydslMemoryCandidates(unittest.TestCase):
             or (config["block_m"], config["block_n"]) == (128, 96)
         ]
         self.assertEqual(len(derived), 7)
+        copied = {
+            (config["block_m"], config["block_n"])
+            for config in configs
+            if "k_stagger" in config
+        }
+        self.assertEqual(copied, {(128, 96)})
+        self.assertIn({**wide, "block_n": 80}, configs)
         self.assertEqual(configs[-1]["policy"], "sk")
         self.assertNotIn("k_stagger", configs[-1])
         self.assertNotIn("b_non_temporal", configs[-1])
@@ -694,7 +720,7 @@ class TestGfx950FlydslCandidates(unittest.TestCase):
             mock.patch.object(torch.cuda, "current_device", lambda: 0),
             mock.patch.object(torch.cuda, "get_device_properties", lambda _: props),
             mock.patch.object(
-                policy, "make_gemm_a16w16_param_and_validate", lambda *args: object()
+                policy, "make_gemm_a16w16_param_and_validate", _fake_gfx950_param
             ),
         ):
             configs = policy.get_flydsl_a16w16_configs(
@@ -733,7 +759,7 @@ class TestGfx950FlydslCandidates(unittest.TestCase):
             mock.patch.object(torch.cuda, "current_device", lambda: 0),
             mock.patch.object(torch.cuda, "get_device_properties", lambda _: props),
             mock.patch.object(
-                policy, "make_gemm_a16w16_param_and_validate", lambda *args: object()
+                policy, "make_gemm_a16w16_param_and_validate", _fake_gfx950_param
             ),
         ):
             configs = policy.get_flydsl_a16w16_configs(
@@ -843,7 +869,7 @@ class TestGfx950FlydslCandidates(unittest.TestCase):
             mock.patch.object(torch.cuda, "current_device", lambda: 0),
             mock.patch.object(torch.cuda, "get_device_properties", lambda _: props),
             mock.patch.object(
-                policy, "make_gemm_a16w16_param_and_validate", lambda *args: object()
+                policy, "make_gemm_a16w16_param_and_validate", _fake_gfx950_param
             ),
         ):
             configs = policy.get_flydsl_a16w16_configs(
@@ -936,7 +962,7 @@ class TestGfx950FlydslCandidates(unittest.TestCase):
             mock.patch.object(torch.cuda, "current_device", lambda: 0),
             mock.patch.object(torch.cuda, "get_device_properties", lambda _: props),
             mock.patch.object(
-                policy, "make_gemm_a16w16_param_and_validate", lambda *args: object()
+                policy, "make_gemm_a16w16_param_and_validate", _fake_gfx950_param
             ),
         ):
             configs = policy.get_flydsl_a16w16_configs(
@@ -966,7 +992,7 @@ class TestGfx950FlydslCandidates(unittest.TestCase):
             mock.patch.object(torch.cuda, "current_device", lambda: 0),
             mock.patch.object(torch.cuda, "get_device_properties", lambda _: props),
             mock.patch.object(
-                policy, "make_gemm_a16w16_param_and_validate", lambda *args: object()
+                policy, "make_gemm_a16w16_param_and_validate", _fake_gfx950_param
             ),
         ):
             for shape, tile in (
