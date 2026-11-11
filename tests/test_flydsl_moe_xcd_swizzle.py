@@ -76,3 +76,45 @@ def test_flydsl_moe_xcd_swizzle_uneven_grid():
     torch.cuda.synchronize()
     _check_close(data["ref_stage1"], stage1_out, "xcd4_uneven_grid_stage1")
     _check_close(data["ref_stage2"], out, "xcd4_uneven_grid_stage2")
+
+
+@pytest.mark.parametrize("xcd_swizzle", [1, 4])
+def test_flydsl_moe_xcd_swizzle_stage1_padded_tail(xcd_swizzle):
+    """Stage 1's grid covers the worst-case sorted length, past num_valid_ids.
+    The remap spreads only the valid rows over the XCDs; a valid tile it skips
+    leaves NaN, and a tile past num_valid_ids must not take a valid one's place."""
+    if get_gfx_runtime() != "gfx950":
+        pytest.skip("gfx950 FlyDSL required")
+    from aiter.ops.flydsl.moe_kernels import flydsl_moe_stage1
+
+    token, model_dim, inter_dim, E, topk, block_m = 40, 512, 256, 32, 2, 32
+    data = _generate_a8w4_gui_data(token, model_dim, inter_dim, E, topk, block_m)
+    valid_blocks = int(data["num_valid_ids"][0]) // block_m
+    grid_y = min(token * topk * block_m, data["sorted_ids"].shape[0]) // block_m
+    assert valid_blocks < grid_y, (valid_blocks, grid_y)
+
+    stage1_out = torch.full(
+        (token, topk, inter_dim), float("nan"), dtype=torch.bfloat16, device="cuda"
+    )
+    flydsl_moe_stage1(
+        a=data["a_q"],
+        w1=data["w1_shuf"],
+        sorted_token_ids=data["sorted_ids"],
+        sorted_expert_ids=data["sorted_expert_ids"],
+        num_valid_ids=data["num_valid_ids"],
+        out=stage1_out,
+        topk=topk,
+        tile_m=block_m,
+        tile_n=128,
+        tile_k=_stage1_tile_k(model_dim),
+        a_dtype="fp8",
+        b_dtype="fp4",
+        out_dtype="bf16",
+        act="swiglu",
+        gate_mode="interleave",
+        w1_scale=data["w1_scale_shuf"],
+        a1_scale=data["a_scale_sort"],
+        xcd_swizzle=xcd_swizzle,
+    )
+    torch.cuda.synchronize()
+    _check_close(data["ref_stage1"], stage1_out, f"xcd{xcd_swizzle}_padded_tail")
