@@ -1073,6 +1073,7 @@ class CustomAllreduce:
             self._ops_all_reduce = ops.all_reduce_gfx1250
             self._ops_all_reduce_residual = None
             self._ops_all_gather = ops.all_gather_gfx1250
+            self._ops_dcp_merge = ops.dcp_merge_gfx1250
             self._ops_reduce_scatter = ops.reduce_scatter_gfx1250
             self._ops_fused_ar_rms = ops.fused_allreduce_rmsnorm_gfx1250
             self._ops_fused_ar_rms_quant = ops.fused_allreduce_rmsnorm_quant_gfx1250
@@ -1098,6 +1099,7 @@ class CustomAllreduce:
             self._ops_all_reduce = ops.all_reduce
             self._ops_all_reduce_residual = ops.all_reduce_residual
             self._ops_all_gather = None
+            self._ops_dcp_merge = None
             self._ops_reduce_scatter = ops.reduce_scatter
             self._ops_fused_ar_rms = ops.fused_allreduce_rmsnorm
             self._ops_fused_ar_rms_quant = ops.fused_allreduce_rmsnorm_quant
@@ -1316,6 +1318,12 @@ class CustomAllreduce:
             self._init_gfx1250(rank, world_size, max_size)
         else:
             self._init_ipc(rank, world_size, max_size)
+
+        # Rows a source the gfx1250 DCP merge takes, 0 where it does not run
+        # (see custom_dcp_merge).
+        self._dcp_merge_max_rows = (
+            ops.dcp_merge_max_rows_gfx1250(self._ptr) if self._is_gfx1250 else 0
+        )
 
     def _all_reduce_and(self, value: bool, require: str = "") -> bool:
         """Logical AND of a per-rank verdict across the group (MIN on 0/1).
@@ -2267,6 +2275,70 @@ class CustomAllreduce:
         if view_dtype is not None and out is not None:
             out = out.view(orig_dtype)
         return out
+
+    def should_custom_dcp_merge(self, o: torch.Tensor, lse: torch.Tensor) -> bool:
+        """Whether custom_dcp_merge takes these decode context parallel partials.
+
+        gfx1250 only: o [B, H, 128] bf16 with 8-byte aligned rows, lse [B, H]
+        fp32, H divisible by the group, and B * H / world_size rows a source
+        within what the LL scratch holds.
+        """
+        if self.disabled or not getattr(self, "_dcp_merge_max_rows", 0):
+            return False
+        if o.dim() != 3 or o.dtype != torch.bfloat16 or o.shape[2] != 128:
+            return False
+        if o.stride(2) != 1 or o.stride(0) % 4 or o.stride(1) % 4 or o.data_ptr() % 8:
+            return False
+        if lse.dtype != torch.float32 or lse.shape != o.shape[:2]:
+            return False
+        b, h, _ = o.shape
+        if h % self.world_size:
+            return False
+        return b * (h // self.world_size) <= self._dcp_merge_max_rows
+
+    def custom_dcp_merge(
+        self,
+        o: torch.Tensor,
+        lse: torch.Tensor,
+        owned_counts: torch.Tensor | None = None,
+        return_lse: bool = False,
+    ):
+        """Merge decode context parallel partials across the group, in one kernel.
+
+        Every rank holds o [B, H, 128] and lse [B, H] over its own KV shard.
+        Rank r gets heads r * H / n .. (r + 1) * H / n - 1 merged over all the
+        shards by their LSE: [B, H / n, 128] bf16, and with return_lse also the
+        merged LSE [B, H / n] fp32. owned_counts ([B], optional): a row with 0
+        owned KV slots on a rank contributes nothing from that rank. The math
+        is ATOM's cp_lse_a2a (pack, all-to-all, LSE combine).
+        should_custom_dcp_merge(o, lse) must hold.
+
+        It reads o and lse in place, so it needs no registered buffer and is
+        the same inside and outside CUDA graph capture.
+        """
+        b, h, d = o.shape
+        hl = h // self.world_size
+        out = torch.empty((b, hl, d), dtype=o.dtype, device=o.device)
+        out_lse = (
+            torch.empty((b, hl), dtype=torch.float32, device=o.device)
+            if return_lse
+            else None
+        )
+        owned_ptr = 0
+        if owned_counts is not None:
+            if owned_counts.dtype != torch.int32 or not owned_counts.is_contiguous():
+                owned_counts = owned_counts.to(torch.int32).contiguous()
+            assert owned_counts.numel() >= b
+            owned_ptr = owned_counts.data_ptr()
+        self._ops_dcp_merge(
+            self._ptr,
+            o,
+            lse,
+            owned_ptr,
+            out,
+            out_lse.data_ptr() if out_lse is not None else 0,
+        )
+        return (out, out_lse) if return_lse else out
 
     # Tensors one `all_gatherv` launch takes (kAllGatherVMax).
     _ALL_GATHERV_MAX: ClassVar[int] = 4

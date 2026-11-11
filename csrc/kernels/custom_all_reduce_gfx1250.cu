@@ -730,4 +730,47 @@ void two_sync_latency(fptr_t _fa, int64_t blocks)
 #undef LAUNCH_TWO_SYNC
 }
 
+// ---- DCP merge (see dcp_merge_ll_gfx1250) ----
+
+int64_t dcp_merge_max_rows(fptr_t _fa)
+{
+    return reinterpret_cast<aiter::CustomAllreduce*>(_fa)->dcp_merge_max_rows();
+}
+
+void dcp_merge(fptr_t _fa,
+               const aiter_tensor_t& o,
+               const aiter_tensor_t& lse,
+               int64_t owned_ptr,
+               const aiter_tensor_t& out,
+               int64_t out_lse_ptr)
+{
+    HipDeviceGuard device_guard(o.device_id);
+    hipStream_t stream = aiter::getCurrentHIPStream();
+    auto fa            = reinterpret_cast<aiter::CustomAllreduce*>(_fa);
+    if(o.dim() != 3 || o.dtype() != AITER_DTYPE_bf16 || o.size(2) != 128 || o.stride(2) != 1 ||
+       o.stride(0) % 4 != 0 || o.stride(1) % 4 != 0 || reinterpret_cast<uintptr_t>(o.data_ptr()) % 8 != 0)
+        throw std::invalid_argument("gfx1250 DCP merge: o must be [B, H, 128] bf16 with 8-byte aligned rows");
+    const int64_t B = o.size(0), H = o.size(1);
+    if(lse.dim() != 2 || lse.dtype() != AITER_DTYPE_fp32 || lse.size(0) != B || lse.size(1) != H)
+        throw std::invalid_argument("gfx1250 DCP merge: lse must be [B, H] fp32");
+    const int64_t ws = fa->world_size_;
+    if(H % ws != 0 || B * (H / ws) > fa->dcp_merge_max_rows())
+        throw std::invalid_argument("gfx1250 DCP merge: " + std::to_string(B) + " x " + std::to_string(H) +
+                                    " heads do not fit world size " + std::to_string(ws));
+    if(out.dtype() != AITER_DTYPE_bf16 || (int64_t)out.numel() != B * (H / ws) * 128 || !out.is_contiguous())
+        throw std::invalid_argument("gfx1250 DCP merge: out must be a contiguous [B, H / world_size, 128] bf16");
+    fa->dcp_merge(stream,
+                  o.data_ptr(),
+                  reinterpret_cast<const float*>(lse.data_ptr()),
+                  reinterpret_cast<const int*>(owned_ptr),
+                  out.data_ptr(),
+                  reinterpret_cast<float*>(out_lse_ptr),
+                  (int)B,
+                  (int)H,
+                  o.stride(0),
+                  o.stride(1),
+                  lse.stride(0),
+                  lse.stride(1));
+}
+
 } // namespace aiter

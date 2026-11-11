@@ -94,6 +94,13 @@ void reduce_scatter(fptr_t _fa,
                     int64_t reg_ptr, int64_t reg_bytes);
 void dispose(fptr_t _fa);
 int64_t meta_size(int64_t world_size);
+int64_t dcp_merge_max_rows(fptr_t _fa);
+void dcp_merge(fptr_t _fa,
+               const aiter_tensor_t& o,
+               const aiter_tensor_t& lse,
+               int64_t owned_ptr,
+               const aiter_tensor_t& out,
+               int64_t out_lse_ptr);
 int64_t ll_ar_max_bytes(int64_t world_size);
 // register_input/output_buffer receive direct device pointers per rank.
 void register_input_buffer(fptr_t _fa,

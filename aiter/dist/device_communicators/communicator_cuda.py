@@ -292,6 +292,25 @@ class CudaCommunicator(DeviceCommunicatorBase):
         torch.distributed.all_reduce(out, group=self.device_group)
         return out
 
+    def dcp_lse_merge(
+        self,
+        o: torch.Tensor,
+        lse: torch.Tensor,
+        owned_counts: torch.Tensor | None = None,
+        return_lse: bool = False,
+    ):
+        """Merge decode context parallel partials with the custom kernel (see
+        CustomAllreduce.custom_dcp_merge), or return None when it does not take
+        them and the caller merges its own way."""
+        ca_comm = self.ca_comm
+        if (
+            ca_comm is None
+            or ca_comm.disabled
+            or not ca_comm.should_custom_dcp_merge(o, lse)
+        ):
+            return None
+        return ca_comm.custom_dcp_merge(o, lse, owned_counts, return_lse)
+
     def fused_allreduce_rmsnorm(
         self,
         input_,
