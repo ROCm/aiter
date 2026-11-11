@@ -167,6 +167,13 @@ def _get_config(M: int, N: int, K: int):
     return get_gemm_config("GEMM-A16W16", M, N, K)  # returns (config, is_tuned)
 ```
 
+Unified attention keys have only the axes that they need, for example
+`D_LEQ_128.Q_LEQ_1.DT_fp8_fp8`. The dtype key is `DT_<q>_<k>` (query, K
+cache). When the V cache dtype is not the K cache dtype (A8K4V8), the loader
+first tries the three-dtype key `DT_<q>_<k>_<v>`, then `DT_<q>_<k>`,
+`DT_<q>_any`, `DT_any_<k>` and `"any"`. See
+[Unified attention](configs/AGENTS.md#unified-attention).
+
 [`configs/AGENTS.md`](configs/AGENTS.md) has the layout, the file names, the
 loaders, the JSON format and the steps to add a config. To tune a GEMM, use
 the scripts in [`utils/_triton/tuning/`](utils/_triton/tuning/README.md).

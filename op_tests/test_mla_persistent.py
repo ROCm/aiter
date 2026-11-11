@@ -635,6 +635,7 @@ def torch_mla_extend_split_kv(
         *plan_dtypes,
         fast_mode=fast_mode,
         intra_batch_mode=intra_batch_mode,
+        page_size=page_size,
     ).fold_factor
     if fold_factor > 1:
         # mla_decode_fwd views qo as (total_s * fold_factor, nheads // fold_factor)
@@ -1688,18 +1689,24 @@ def test_mla(
                 )
             )
 
-            checkAllclose(
+            split_err = checkAllclose(
                 split_out_ref,
                 out_asm,
                 msg=f"mla_decode-absorb_fp8    [golden fp8 split_out_ref vs aiter_asm]: {us_asm_decode:>8.2f} us......",
             )
+            # Enforce the gfx942 QH64 regression; retain warning-only checks for
+            # unrelated shapes with pre-existing short-context FP8 mismatches.
+            if nhead == 64 and get_gfx() == "gfx942":
+                assert split_err < 0.05
 
             if partial_out_ref.shape[0] > 0:
-                checkAllclose(
+                partial_err = checkAllclose(
                     partial_out_ref,
                     attn_logits[: partial_out_ref.shape[0]].flatten(0, 1),
                     msg=f"mla_decode-absorb_fp8    [partial_out_ref vs attn_logits]: {us_asm_decode:>8.2f} us......",
                 )
+                if nhead == 64 and get_gfx() == "gfx942":
+                    assert partial_err < 0.05
 
         cal_diff(out_ref, out_asm, "out", True)
         return err, us_asm_decode
@@ -1968,6 +1975,83 @@ def test_mla_v1_0_kv_tail():
     assert not bad, (
         f"v1_0 decode mismatches the reference at kv_granularity {kv_granularity}: "
         + ", ".join(f"ctx_len {k} on {v:.1%} of outputs" for k, v in bad.items())
+    )
+
+
+def check_fp8_gqa16_multi_tile_batch(
+    decode_qlen: int, persistent: bool = True, return_lse: bool = False
+) -> None:
+    """gfx950 fp8 gqa16 decode with 128 rows of 3 KV tiles each.
+    The waves of a workgroup share Q, K, V and softmax data through LDS. A
+    missing s_barrier or s_waitcnt gives wrong rows only under load, so every
+    call runs a full batch next to a copy on a side stream."""
+    nhead, kv_lora_rank, qk_head_dim, num_kv = 16, 512, 576, 1 << 20
+    batch_size, sm_scale = 128, 1.0 / 16
+    one = torch.ones(1, dtype=torch.float)
+    kv_buffer = torch.randn((num_kv, qk_head_dim)).to(dtypes.fp8)
+    copy_src, copy_dst = torch.zeros(64 << 20), torch.empty(64 << 20)
+    side_stream = torch.cuda.Stream()
+    qo_indptr = torch.arange(batch_size + 1, dtype=torch.int) * decode_qlen
+    kv_last_page_lens = torch.ones(batch_size, dtype=torch.int)
+    num_bad = 0
+    for kv_len in range(257, 385, 2):
+        kv_indptr = torch.arange(batch_size + 1, dtype=torch.int) * kv_len
+        kv_indices = torch.randint(0, num_kv, (batch_size * kv_len,), dtype=torch.int)
+        q = torch.randn((batch_size * decode_qlen, nhead, qk_head_dim)) * 3
+        q = q.to(dtypes.fp8)
+        out = torch.empty(
+            (batch_size * decode_qlen, nhead, kv_lora_rank), dtype=torch.bfloat16
+        )
+        if persistent:
+            splits = _make_mla_metadata(
+                qo_indptr,
+                kv_indptr,
+                kv_last_page_lens,
+                nhead,
+                1,
+                dtypes.fp8,
+                dtypes.fp8,
+                1,
+                decode_qlen,
+                decode_qlen,
+                1,
+            )
+        else:
+            splits = {
+                "num_kv_splits": 1,
+                "num_kv_splits_indptr": torch.arange(batch_size + 1, dtype=torch.int),
+            }
+        side_stream.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(side_stream):
+            for _ in range(4):
+                copy_dst.copy_(copy_src)
+        aiter.mla.mla_decode_fwd(
+            q,
+            kv_buffer.view(-1, 1, 1, qk_head_dim),
+            out,
+            qo_indptr,
+            kv_indptr,
+            kv_indices,
+            kv_last_page_lens,
+            decode_qlen,
+            sm_scale=sm_scale,
+            q_scale=one,
+            kv_scale=one,
+            return_lse=return_lse,
+            **splits,
+        )
+        torch.cuda.current_stream().wait_stream(side_stream)
+        k = kv_buffer[kv_indices.long()].float().view(batch_size, kv_len, -1)
+        q = q.float().view(batch_size, decode_qlen, nhead, -1)
+        s = torch.einsum("bqhd,bkd->bqhk", q, k) * sm_scale
+        last = kv_len - decode_qlen + torch.arange(decode_qlen).view(1, -1, 1, 1)
+        s = s.masked_fill(torch.arange(kv_len) > last, float("-inf"))
+        ref = torch.softmax(s, -1) @ k[:, None, :, :kv_lora_rank]
+        err = (out.float().view_as(ref) - ref).abs().amax(-1)
+        num_bad += int((err > 0.1 * ref.abs().amax(-1)).sum())
+    assert num_bad == 0, (
+        f"qlen {decode_qlen}, persistent {persistent}, lse {return_lse}: "
+        f"{num_bad} wrong (row, query, head) outputs"
     )
 
 
@@ -2264,7 +2348,7 @@ parser.add_argument(
     type=dtypes.str2tuple,
     nargs="*",
     const=None,
-    default=[(16, 1), (16, 2), (16, 4), (48, 1), (128, 2)],
+    default=[(16, 1), (16, 2), (16, 4), (48, 1), (64, 1), (128, 2)],
     help="""Number of heads.
     e.g.: -n 16,1""",
 )
@@ -2421,6 +2505,10 @@ def main():
     aiter.logger.info("_fold_seqlen_indptr cuda-graph capture: passed")
     test_mla_v1_0_kv_tail()
     aiter.logger.info("v1_0 KV tail end-to-end: passed")
+    if get_gfx() == "gfx950":
+        check_fp8_gqa16_multi_tile_batch(1)
+        check_fp8_gqa16_multi_tile_batch(1, return_lse=True)
+        aiter.logger.info("fp8 gqa16 qlen 1 multi-tile batch: passed")
     return df if args.nhead else None
 
 

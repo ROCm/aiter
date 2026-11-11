@@ -1,11 +1,10 @@
-# SPDX-License-Identifier: Apache-2.0
-# Copyright (C) 2026 Advanced Micro Devices, Inc.
+# SPDX-License-Identifier: MIT
+# Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
 
-"""Deprecated alias for :mod:`aiter.ops.flydsl.ipc_heap`.
+"""Old name of :mod:`aiter.ops.flydsl.ipc_heap`, kept for external importers.
 
-This shim keeps the old import path and class name working for external
-callers such as vLLM. New code should import ``IpcHeap`` from
-``aiter.ops.flydsl.ipc_heap``.
+vLLM imports ``UncachedIpcHeap`` from here. Import ``IpcHeap`` from
+``ipc_heap`` in new code. Remove this module once vLLM imports ``ipc_heap``.
 """
 
 from .ipc_heap import IpcHeap, UncachedIpcHeap
