@@ -10,6 +10,7 @@ from aiter.ops.triton.gemm.fused.fused_gemm_a16w16_dual_splitk import (
     fused_gemm_a16w16_dual_splitk,
 )
 from aiter.ops.triton.utils._triton.arch_info import get_arch
+from aiter.ops.triton.utils.gemm_config_utils import compute_splitk_params
 from op_tests.triton_tests.gemm.basic.test_gemm_a16w16 import (
     generate_gemm_a16w16_inputs,
 )
@@ -82,25 +83,23 @@ def test_gemm(M, N1, N2, K, dtype, output):
     _assert_close(y_triton, run_torch(x, w, dtype), N1)
 
 
-@pytest.mark.parametrize("M, N1, N2, K", get_x_vals()[1:5] + _ODD_SHAPES)
+@pytest.mark.parametrize("M, N1, N2, K", get_x_vals() + _ODD_SHAPES)
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 @pytest.mark.parametrize("output", [True, False])
-@pytest.mark.parametrize(
-    "ks1, ks2, skip_reduce1, skip_reduce2",
-    [
-        (1, 4, False, True),
-        (4, 1, True, False),
-        (2, 4, True, True),
-        (2, 4, True, False),
-        (2, 4, False, True),
-        (1, 1, True, True),
-    ],
-)
-def test_gemm_skip_reduce(
+@pytest.mark.parametrize("ks1, ks2", [(1, 1), (1, 4), (2, 1), (2, 4)])
+@pytest.mark.parametrize("skip_reduce1", [False, True])
+@pytest.mark.parametrize("skip_reduce2", [False, True])
+def test_gemm_ksplit_skip_reduce(
     M, N1, N2, K, dtype, output, ks1, ks2, skip_reduce1, skip_reduce2
 ):
-    """Each part returns its partials when its flag is set and it is split, and its
-    reduced columns otherwise."""
+    """Every split count / skip flag combination, through each part's reduce: a part
+    returns its partials when its flag is set and it is split, and its reduced
+    columns otherwise."""
+    config = _config(ks1, ks2)
+    for part, ks in ((1, ks1), (2, ks2)):
+        sub = {"BLOCK_SIZE_K": config[f"BLOCK_SIZE_K{part}"], "NUM_KSPLIT": ks}
+        if compute_splitk_params(sub, K)["NUM_KSPLIT"] != ks:
+            pytest.skip(f"K = {K} cannot be split {ks} ways")
     x, w, _, _, y = generate_gemm_a16w16_inputs(M, N1 + N2, K, dtype, output=output)
     outs = run_triton(
         x,
@@ -108,10 +107,12 @@ def test_gemm_skip_reduce(
         N2,
         dtype,
         y,
-        config=_config(ks1, ks2),
+        config=config,
         skip_reduce1=skip_reduce1,
         skip_reduce2=skip_reduce2,
     )
+    if not (skip_reduce1 or skip_reduce2):
+        outs = (outs[:, :N1], outs[:, N1:])
     ref = run_torch(x, w, dtype)
     for out, ks, skip, ref_part in zip(
         outs, (ks1, ks2), (skip_reduce1, skip_reduce2), (ref[:, :N1], ref[:, N1:])
@@ -122,18 +123,6 @@ def test_gemm_skip_reduce(
         else:
             assert out.shape == ref_part.shape and out.dtype == dtype
         triton.testing.assert_close(out, ref_part, atol=0.1, rtol=1e-1)
-
-
-@pytest.mark.parametrize("M, N1, N2, K", [(64, 16384, 96, 5120)] + _ODD_SHAPES)
-@pytest.mark.parametrize("ks1, ks2", [(1, 1), (1, 4), (2, 1), (2, 4)])
-def test_gemm_ksplit(M, N1, N2, K, ks1, ks2):
-    """Explicit split counts per part, through both the first-part reduce and the
-    second-part reduce."""
-    x, w, _, _, _ = generate_gemm_a16w16_inputs(
-        M, N1 + N2, K, torch.bfloat16, output=False
-    )
-    y_triton = run_triton(x, w, N2, config=_config(ks1, ks2))
-    _assert_close(y_triton, run_torch(x, w), N1)
 
 
 @pytest.mark.parametrize("M, N1, N2, K", [(4, 16384, 96, 5120), (16, 1000, 40, 1000)])
