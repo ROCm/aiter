@@ -312,6 +312,7 @@ def fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert(
     q_packed_out: torch.Tensor | None = None,
     q_rope_out: torch.Tensor | None = None,
     use_fnuz: bool = False,
+    hca_kv_indices: dict | None = None,
 ):
     """The whole DSv4 decode producer in one launch.
 
@@ -338,6 +339,17 @@ def fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert(
     then UNINITIALISED and only its shape is meaningful. Use it only when the
     consumer reads the packed pair alone (a pure-decode step on the aiter
     path); anything that reads Q as bf16, prefill included, must leave it on.
+
+    ``hca_kv_indices`` (COPY_HCA_KV_INDICES) also writes the HCA layer's
+    sparse-attention index list for its first ``num_tokens`` tokens (the
+    decode tokens, which lead the batch): per token, its SWA slots then its
+    compressed slots, as rows of the flat 640 B record grid both caches share,
+    ``base + (slot // page) * block_rows + slot % page``. Keys:
+    ``swa_indices``, ``swa_indptr``, ``comp_indices``, ``comp_indptr`` (int32,
+    ragged), ``dst_indices``, ``dst_indptr`` (int32 outputs, the indptr is
+    ``swa_indptr + comp_indptr``), ``num_tokens``, ``block_rows``,
+    ``swa_base``, ``comp_base``, ``swa_page``, ``comp_page`` (pages: powers of
+    two).
     """
     t, h, dim = q.shape
     if dim != _V4_DIM_QK:
@@ -386,8 +398,41 @@ def fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert(
         q_packed = q_rope = q_out
 
     fp8_max = _v4_fp8_max(use_fnuz)
-    # One extra slot along dim 1 carries the KV row for the token.
-    _fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert_kernel[(t, padded_heads + 1)](
+    hca = hca_kv_indices
+    copy_hca = hca is not None
+    if copy_hca:
+        hca_t = (
+            hca["swa_indices"],
+            hca["swa_indptr"],
+            hca["comp_indices"],
+            hca["comp_indptr"],
+            hca["dst_indices"],
+            hca["dst_indptr"],
+        )
+        for x in hca_t:
+            if x.dtype != torch.int32 or not x.is_contiguous():
+                raise RuntimeError("hca_kv_indices tensors must be contiguous int32")
+        if not 0 <= hca["num_tokens"] <= t:
+            raise RuntimeError(f"hca num_tokens {hca['num_tokens']} not in [0, {t}]")
+        for k in ("swa_page", "comp_page"):
+            if hca[k] <= 0 or hca[k] & (hca[k] - 1):
+                raise RuntimeError(f"hca {k} {hca[k]} must be a power of two")
+        hca_s = (
+            int(hca["num_tokens"]),
+            int(hca["block_rows"]),
+            int(hca["swa_base"]),
+            int(hca["comp_base"]),
+        )
+        hca_pages = (int(hca["swa_page"]), int(hca["comp_page"]))
+    else:
+        hca_t = (kv_slot_mapping,) * 6
+        hca_s = (0, 0, 0, 0)
+        hca_pages = (1, 1)
+    # One extra slot along dim 1 carries the KV row for the token, and one
+    # more the HCA index list.
+    _fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert_kernel[
+        (t, padded_heads + 1 + int(copy_hca))
+    ](
         q,
         q_out,
         q_packed,
@@ -415,6 +460,11 @@ def fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert(
         bool(pack_q),
         bool(write_q),
         bool(use_fnuz),
+        *hca_t,
+        *hca_s,
+        copy_hca,
+        *hca_pages,
+        128,
         num_warps=4,
     )
     if pack_q:

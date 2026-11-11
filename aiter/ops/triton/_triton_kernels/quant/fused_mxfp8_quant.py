@@ -438,8 +438,24 @@ def _fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert_kernel(
     PACK_Q: tl.constexpr,
     WRITE_Q: tl.constexpr,
     USE_FNUZ: tl.constexpr,
+    hca_swa_ptr,  # [nnz_swa] int32 SWA-cache slots (ragged)
+    hca_swa_indptr_ptr,  # [hca_num_tokens + 1]
+    hca_comp_ptr,  # [nnz_comp] int32 compressed-cache slots (ragged)
+    hca_comp_indptr_ptr,  # [hca_num_tokens + 1]
+    hca_dst_ptr,  # [nnz_swa + nnz_comp] int32 record-grid rows
+    hca_dst_indptr_ptr,  # [hca_num_tokens + 1]
+    hca_num_tokens,
+    hca_block_rows,
+    hca_swa_base,
+    hca_comp_base,
+    COPY_HCA_KV_INDICES: tl.constexpr,
+    HCA_SWA_PAGE: tl.constexpr,
+    HCA_COMP_PAGE: tl.constexpr,
+    HCA_BLOCK: tl.constexpr,
 ):
-    """One program per (token, slot); slot == padded_heads is the KV row.
+    """One program per (token, slot); slot == padded_heads is the KV row and,
+    with COPY_HCA_KV_INDICES, slot == padded_heads + 1 writes the token's HCA
+    sparse-attention index list.
 
     Padding slots zero-fill every Q output. That is a correctness requirement,
     not tidiness: an unwritten scale byte of 0xFF is E8M0 NaN, and the decode
@@ -450,6 +466,47 @@ def _fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert_kernel(
     # at 128 heads
     tok = tl.program_id(0).to(tl.int64)
     h = tl.program_id(1)
+
+    # ---- HCA: [SWA | compressed] slots -> rows of the record grid ---------
+    # The sparse decode reads one index list per token over the flat 640 B
+    # record grid both caches live in. A slot of either cache maps to
+    #     base + (slot // page) * block_rows + slot % page,
+    # where base (where this layer's cache starts inside a block) is the only
+    # per-layer term. Writing the list here, next to the KV insert the layer
+    # runs anyway, saves the HCA layer an index launch of its own.
+    if COPY_HCA_KV_INDICES:  # noqa: SIM102 -- constexpr, prunes the branch
+        if h == padded_heads + 1:
+            if tok < hca_num_tokens:
+                s0 = tl.load(hca_swa_indptr_ptr + tok)
+                s1 = tl.load(hca_swa_indptr_ptr + tok + 1)
+                c0 = tl.load(hca_comp_indptr_ptr + tok)
+                c1 = tl.load(hca_comp_indptr_ptr + tok + 1)
+                out0 = s0 + c0
+                tl.store(hca_dst_indptr_ptr + tok, out0)
+                if tok == hca_num_tokens - 1:
+                    tl.store(hca_dst_indptr_ptr + hca_num_tokens, s1 + c1)
+                for i in range(0, s1 - s0, HCA_BLOCK):
+                    off = i + tl.arange(0, HCA_BLOCK)
+                    m = off < s1 - s0
+                    slot = tl.load(hca_swa_ptr + s0 + off, mask=m, other=0)
+                    row = (
+                        hca_swa_base
+                        + (slot // HCA_SWA_PAGE) * hca_block_rows
+                        + slot % HCA_SWA_PAGE
+                    )
+                    tl.store(hca_dst_ptr + out0 + off, row, mask=m)
+                out1 = out0 + (s1 - s0)
+                for i in range(0, c1 - c0, HCA_BLOCK):
+                    off = i + tl.arange(0, HCA_BLOCK)
+                    m = off < c1 - c0
+                    slot = tl.load(hca_comp_ptr + c0 + off, mask=m, other=0)
+                    row = (
+                        hca_comp_base
+                        + (slot // HCA_COMP_PAGE) * hca_block_rows
+                        + slot % HCA_COMP_PAGE
+                    )
+                    tl.store(hca_dst_ptr + out1 + off, row, mask=m)
+            return
     d = tl.arange(0, HEAD)
     half: tl.constexpr = ROPE // 2
 
