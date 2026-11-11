@@ -155,12 +155,14 @@ def _prepare_conv2d_padding(
     padding_mode: str = "zeros",
     *,
     layout: str = "nchw",
+    x_blocked: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, tuple[int, int]]:
     """Return the input and effective padding for an existing Conv2D kernel.
 
     Nonzero modes use F.pad, then convert to the requested storage layout.
     Zeros and zero-padding calls return the original tensor without allocation
     or launch; layout conversion on those paths is the caller's responsibility.
+    Prepacked activations cannot be supplied when padding is materialized.
     Using F.pad here does not provide a backward for the convolution kernels.
     """
     if source.ndim != 4:
@@ -172,6 +174,11 @@ def _prepare_conv2d_padding(
     _validate_conv2d_padding_mode(padding_mode, height, width, padding)
     if padding_mode == "zeros" or padding == (0, 0):
         return source, padding
+    if x_blocked is not None:
+        raise ValueError(
+            "x_blocked cannot be used with materialized padding; "
+            "omit it to pack the padded input"
+        )
     if not source.is_cuda:
         raise ValueError("materialized conv2d padding requires a CUDA/ROCm tensor")
 
