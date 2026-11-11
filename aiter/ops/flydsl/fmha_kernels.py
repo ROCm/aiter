@@ -931,9 +931,9 @@ def flydsl_flash_attn_paged_fwd(
         max_seqlen_q = int((qo_indptr[1:] - qo_indptr[:-1]).max())
     if max_seqlen_k is None:
         page_size = 1 if k.dim() == 3 else k.shape[1]
-        pages = kv_indptr[1:] - kv_indptr[:-1]
+        pages = kv_indptr[1 : _batch + 1] - kv_indptr[:_batch]
         max_seqlen_k = int(
-            ((pages - 1).clamp(min=0) * page_size + kv_last_page_lens).max()
+            ((pages - 1).clamp(min=0) * page_size + kv_last_page_lens[:_batch]).max()
         )
 
     _out_dtype = _A8W8_GFX1250_OUT_DTYPE if _is_b8 else q.dtype
