@@ -10,6 +10,7 @@ from flydsl._mlir.dialects import llvm
 from flydsl.expr import as_ir_value as as_mlir_value
 from flydsl.expr import range_constexpr, rocdl
 from flydsl.expr.typing import T
+from flydsl.expr.typing import Vector as Vec
 
 from aiter.ops.flydsl.kernels.fmha_gfx950.pipeline import (
     DualwaveFp8KernelContext,
@@ -103,6 +104,39 @@ class DualwaveFp8SoftmaxHelper(DualwaveFp8KernelContext):
                 lo_list, hi_list = self.v_s_vec_to_lists(v_s)
                 self._causal_mask_inplace((lo_list, hi_list), tile_idx)
                 s_lo, s_hi = _score_lists_to_vecs((lo_list, hi_list))
+            return s_lo, s_hi
+
+        return _run(v_s, tile_idx)
+
+    def causal_mask_diag(self, v_s, tile_idx, hi_vis):
+        """causal_mask_tile_if_needed for a tile whose high strip may be skipped: without
+        hi_vis the high strip already holds the floor, whose P is exactly 0."""
+        traits = self.traits
+
+        @flyc.jit
+        def _run(v_s, tile_idx):
+            s_lo, s_hi = v_s
+            kv_end_pos = (tile_idx + 1) * traits.BLOCK_N
+            if self.ctx_ref.q_start_pos_i32 + self.delta_i32 < fx.Int32(kv_end_pos):
+                lo_list, hi_list = self.v_s_vec_to_lists(v_s)
+                kv_start_i32 = fx.Int32(tile_idx * traits.BLOCK_N)
+                rel_lo_i32 = fx.Int32(
+                    self.ctx_ref.q_row_i32
+                    + self.delta_i32
+                    - kv_start_i32
+                    - fx.Int32(self.lane_div_32) * 4
+                )
+                neg_inf_i32 = fx.Int32(traits.NEG_INF_F32_BITS)
+                thresholds = _causal_pair_thresholds(False)
+                _apply_dualwave_causal_mask_pair(
+                    lo_list, rel_lo_i32, neg_inf_i32, thresholds
+                )
+                s_lo = Vec.from_elements(lo_list, fx.Float32).ir_value()
+                if hi_vis:
+                    _apply_dualwave_causal_mask_pair(
+                        hi_list, rel_lo_i32 - 32, neg_inf_i32, thresholds
+                    )
+                    s_hi = Vec.from_elements(hi_list, fx.Float32).ir_value()
             return s_lo, s_hi
 
         return _run(v_s, tile_idx)

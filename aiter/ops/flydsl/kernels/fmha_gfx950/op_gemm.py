@@ -4,6 +4,7 @@
 
 """The two GEMMs: QK^T and PV."""
 
+import flydsl.compiler as flyc
 import flydsl.expr as fx
 from flydsl._mlir import ir
 from flydsl._mlir.dialects import llvm
@@ -128,6 +129,26 @@ class DualwaveFp8GemmHelper(DualwaveFp8KernelContext):
         rocdl.sched_group_barrier(traits.SCHED_DS_READ_MASK, n_ds // 2, 12)
         rocdl.sched_group_barrier(traits.SCHED_MFMA_MASK, n_mfma - 1, 12)
         return (v_s_lo, v_s_hi)
+
+    def qk_strip(self, k_strip, q_wide):
+        """S for one 32-key N-strip of load_k."""
+        v_s = self.c_zero_v16f32
+        for ws in range_constexpr(self.traits.HEAD_DIM // 64):
+            v_s = self._mfma_acc_fp8_wide(k_strip[ws], q_wide[ws], v_s)
+        return v_s
+
+    def qk_strip_if(self, k_loader, buf_id, q_wide, pred):
+        """qk_strip of the high strip under a uniform branch; the floor every tile max is clamped to otherwise."""
+        floor = fx.full(16, fx.Float32(self.c_neg_floor), fx.Float32).ir_value()
+
+        @flyc.jit
+        def _run():
+            v_s = floor
+            if pred:
+                v_s = self.qk_strip(k_loader.load_k_strip(buf_id, 1), q_wide)
+            return v_s
+
+        return _run()
 
     def cast_p_fp8_direct(self, v_p):
         lo_partial_list, hi_full = v_p

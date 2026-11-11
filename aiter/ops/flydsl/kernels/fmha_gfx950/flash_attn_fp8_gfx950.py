@@ -414,13 +414,13 @@ def build_flash_attn_dualwave_swp_fp8_module(
             # The just-synchronised WG gets the SIMDs for its K reads and QK so its waves reach the next barrier together.
             _bn64_prio(BN64_QK_PRIO)
 
-        def _tile_softmax_pv(j, loop_args, buf, v_s, masked):
+        def _tile_softmax_pv(j, loop_args, buf, v_s, masked, hi_vis=None):
             m_row = loop_args[0]
             l_row = loop_args[1]
             v_o = [loop_args[2 + i] for i in range_constexpr(D_CHUNKS)]
             if const_expr(masked):
                 if const_expr(traits.CAUSAL):
-                    v_s = softmax_helper.causal_mask_tile_if_needed(v_s, fx.Int32(j))
+                    v_s = softmax_helper.causal_mask_diag(v_s, fx.Int32(j), hi_vis)
                 else:
                     v_s = softmax_helper.seq_pad_mask_if_needed(v_s, fx.Int32(j))
             m_tile = softmax_helper.floor_masked_max(softmax_helper.reduce_max(v_s))
@@ -433,6 +433,7 @@ def build_flash_attn_dualwave_swp_fp8_module(
                 softmax_helper.scale_o(v_o, corr)
                 l_row = softmax_helper.apply_l_rescale(l_row, corr)
             v_s = softmax_helper.sub_m(v_s, m_new)
+            # A skipped high strip's floor scores exp to exactly 0; branching its exps away costs ~12 VGPRs.
             v_p = softmax_helper.exp2(v_s, 0)
             v_p = softmax_helper.exp2(v_p, 16)
             # Past its exps a wave feeds the matrix pipe (V reads, PV); waves still in softmax yield to it.
@@ -518,10 +519,28 @@ def build_flash_attn_dualwave_swp_fp8_module(
                 )[0]
                 prefetch_loader.load_k(pf * BN, next_buf, prefetch_page)
                 prefetch_loader.load_v(pf * BN, next_buf, prefetch_page)
-            v_k = kv_lds_to_regs.load_k(buf)
-            v_s = gemm_helper.qk(v_k, q_wide)
+            if const_expr(traits.CAUSAL):
+                # A wave whose last row sees no key of the high 32-key strip skips its K reads, MFMAs and
+                # mask; the floor scores leave the max alone and P there is exactly 0.
+                wave_tokens = traits.ROWS_PER_WAVE
+                if const_expr(traits.GQA_PACK_M):
+                    wave_tokens = traits.ROWS_PER_WAVE // traits.GQA_GROUP_SIZE
+                hi_vis = ctx.q_start_pos_i32 + ctx.delta_i32 + fx.Int32(
+                    wave_tokens - 1
+                ) >= fx.Int32(j * BN) + fx.Int32(BN // 2)
+                v_s_lo = gemm_helper.qk_strip(
+                    kv_lds_to_regs.load_k_strip(buf, 0), q_wide
+                )
+                v_s = (
+                    v_s_lo,
+                    gemm_helper.qk_strip_if(kv_lds_to_regs, buf, q_wide, hi_vis),
+                )
+            else:
+                hi_vis = None
+                v_k = kv_lds_to_regs.load_k(buf)
+                v_s = gemm_helper.qk(v_k, q_wide)
             _bn64_prio(0)
-            loop_results = yield _tile_softmax_pv(j, loop_args, buf, v_s, True)
+            loop_results = yield _tile_softmax_pv(j, loop_args, buf, v_s, True, hi_vis)
         m_row = loop_results[0]
         l_row = loop_results[1]
         v_o = [loop_results[2 + i] for i in range_constexpr(D_CHUNKS)]

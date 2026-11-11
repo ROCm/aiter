@@ -319,6 +319,10 @@ class DualwaveFp8KvLdsToVgprLoader(DualwaveFp8KernelContext):
     def load_k(self, buf_id):
         # Read K in the wide 32x32x64 QK operand layout (32 contiguous head-dim/lane,
         # two N-strips, two head-dim halves).
+        return (self.load_k_strip(buf_id, 0), self.load_k_strip(buf_id, 1))
+
+    def load_k_strip(self, buf_id, strip):
+        """One 32-key N-strip (0 low, 1 high) of load_k."""
         traits = self.traits
         k_base = self.k_buf_base(buf_id)
         d_base = self.lane_div_32 * 32
@@ -341,7 +345,7 @@ class DualwaveFp8KvLdsToVgprLoader(DualwaveFp8KernelContext):
                 out.append(self.read_i32x8_lds(self.lds.kv.ptr, addr))
             return out
 
-        return (_read_strip(n_lo), _read_strip(n_hi))
+        return _read_strip(n_hi if strip else n_lo)
 
     def load_v(self, buf_id, tile_start=None, full=False):
         if const_expr(
