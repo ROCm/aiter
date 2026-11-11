@@ -59,6 +59,7 @@ def fused_recurrent_kda(
     out_gate: torch.Tensor | None = None,
     norm_weight: torch.Tensor | None = None,
     norm_eps: float = 1e-5,
+    skip_negative_state_slots: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor | None]:
     """Fused recurrent Kimi Delta Attention (KDA), gfx950/gfx1250 Gluon decode path.
 
@@ -99,6 +100,9 @@ def fused_recurrent_kda(
             full slab only for a sequence's first token, then compact
             (a, k, err) records per token for replay after verification.
         pad_slot_guard: paged only: state slots <= 0 mark padded sequences
+        skip_negative_state_slots: gfx1250 plain single-token paged decode only.
+            Leave output and state unchanged for negative slots. Slot0 is valid.
+            Cannot be combined with pad_slot_guard.
         config: tuning dict (BV, SK, num_warps, num_buffers, use_tdm_store,
             use_tdm_load, use_tdm_fused_load); None resolves a tuned bucket
             from ``configs/<arch>/gluon/attention/kda_decode/DEFAULT.json``,
@@ -204,8 +208,42 @@ def fused_recurrent_kda(
         state_ref is not None and state_ref.dtype == torch.bfloat16 and T > 1
     )
     bucket_T = max(avg_T, 2) if bf16_resident else avg_T
+    tuned_paged_decode = (
+        _ARCH in ("gfx1250", "gfx1250-strict")
+        and ssm_state_indices is not None
+        and ssm_state_indices.ndim == 1
+        and num_accepted_tokens is None
+        and not cache_state_updates
+        and not (use_conv or use_rms_gate)
+        and inplace_final_state
+        and state_v_first
+        and initial_state is not None
+        and initial_state.dtype == torch.float32
+        and initial_state.data_ptr() % 16 == 0
+        and H == HV == 12
+        and K == V == 128
+        and q.dtype == k.dtype == v.dtype == g.dtype == beta.dtype == torch.bfloat16
+        and beta.ndim == 3
+        and use_qk_l2norm_in_kernel
+        and use_gate_in_kernel
+        and use_beta_sigmoid_in_kernel
+        and not allow_neg_eigval
+        and lower_bound == -5.0
+        and dt_bias is not None
+    )
     config = get_kda_config(
-        bucket_T, N, HV, K, V, overrides=config, fused=use_conv or use_rms_gate
+        bucket_T,
+        N,
+        HV,
+        K,
+        V,
+        overrides=config,
+        fused=use_conv or use_rms_gate,
+        **(
+            {"tuned_paged_decode": tuned_paged_decode}
+            if _ARCH in ("gfx1250", "gfx1250-strict")
+            else {}
+        ),
     )
     BV = config["BV"]
     SK = config["SK"]
@@ -234,16 +272,16 @@ def fused_recurrent_kda(
 
     is_paged = ssm_state_indices is not None
     if is_paged:
-        assert ssm_state_indices.stride(-1) == 1, "state index rows must be dense"
+        assert (
+            ssm_state_indices.ndim == 1 or ssm_state_indices.stride(-1) == 1
+        ), "state index rows must be dense"
         assert (
             num_accepted_tokens is None or num_accepted_tokens.is_contiguous()
         ), "num_accepted_tokens must be contiguous"
         assert (
             ssm_state_indices.ndim > 1 or B * T == N
         ), "a flat ssm_state_indices requires one token per sequence; pass [N, T]"
-        stride_indices_seq = (
-            ssm_state_indices.stride(0) if ssm_state_indices.ndim > 1 else 1
-        )
+        stride_indices_seq = ssm_state_indices.stride(0)
     else:
         stride_indices_seq = 1
         assert num_accepted_tokens is None, "spec decoding requires ssm_state_indices"
@@ -331,6 +369,13 @@ def fused_recurrent_kda(
     if pad_slot_guard:
         assert is_paged, "pad_slot_guard requires ssm_state_indices"
 
+    if skip_negative_state_slots:
+        assert _ARCH in ("gfx1250", "gfx1250-strict")
+        assert is_paged and ssm_state_indices.ndim == 1
+        assert num_accepted_tokens is None and not cache_state_updates
+        assert not (use_conv or use_rms_gate or pad_slot_guard)
+        assert (B == 1 and T == N) if cu_seqlens is not None else T == 1
+
     if _LOG_INFO:
         _LOGGER.info(
             f"KDA_DECODE: B={B} T={T} N={N} H={H} HV={HV} K={K} V={V} BV={BV} "
@@ -401,6 +446,11 @@ def fused_recurrent_kda(
         USE_TDM_LOAD=use_tdm_load,
         CACHE_STATE_UPDATES=cache_state_updates,
         PAD_SLOT_GUARD=pad_slot_guard,
+        **(
+            {"SKIP_NEGATIVE_STATE_SLOTS": skip_negative_state_slots}
+            if _ARCH in ("gfx1250", "gfx1250-strict")
+            else {}
+        ),
         USE_TDM_FUSED_LOAD=use_tdm_fused_load,
         TDM_STORE_BUFS=tdm_store_bufs,
         W=W,

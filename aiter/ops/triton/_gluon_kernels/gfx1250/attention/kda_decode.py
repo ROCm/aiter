@@ -341,6 +341,7 @@ _fused_recurrent_kda_packed_decode_repr = make_kernel_repr(
         "USE_TDM_FUSED_LOAD",
         "CACHE_STATE_UPDATES",
         "PAD_SLOT_GUARD",
+        "SKIP_NEGATIVE_STATE_SLOTS",
         "USE_CONV",
         "USE_RMS_GATE",
     ],
@@ -412,6 +413,7 @@ def fused_recurrent_kda_packed_decode_kernel(
     CACHE_STATE_UPDATES: gl.constexpr = False,  # per-token (a, k, err), needs ssm_state_indices and no tdm_store
     USE_TDM_FUSED_LOAD: gl.constexpr = False,  # token operands via one fused TDM + LDS
     PAD_SLOT_GUARD: gl.constexpr = False,
+    SKIP_NEGATIVE_STATE_SLOTS: gl.constexpr = False,
     W: gl.constexpr = 4,
     USE_CONV: gl.constexpr = False,
     USE_RMS_GATE: gl.constexpr = False,
@@ -481,6 +483,11 @@ def fused_recurrent_kda_packed_decode_kernel(
         n_tok = T
     if n_tok == 0:
         return
+
+    if SKIP_NEGATIVE_STATE_SLOTS:
+        skip_slot = gl.load(state_indices_ptr + i_n * stride_indices_seq).to(gl.int32)
+        if skip_slot < 0:
+            return
 
     off_k = gl.arange(0, K, layout=K_LAYOUT)
     off_v = gl.arange(0, BV, layout=V_LAYOUT)
@@ -996,6 +1003,7 @@ def get_kda_config(
     V: int,
     overrides: dict | None = None,
     fused: bool = False,
+    tuned_paged_decode: bool = False,
 ) -> dict:
     cfg_dir = resolve_config_dir("attention", "KDA_DECODE", backend="gluon")
     tuned = load_config_json(f"{cfg_dir}/DEFAULT.json")
@@ -1003,6 +1011,14 @@ def get_kda_config(
     aligned = K % 32 == 0 and V % 32 == 0
     if fused:
         bucket = "fused"
+    elif (
+        tuned_paged_decode
+        and avg_T == 1
+        and num_seqs == 72
+        and HV == 12
+        and K == V == 128
+    ):
+        bucket = "t1_paged_n72_h12_k128_v128"
     elif avg_T > 1:
         if aligned and num_seq_heads >= 3072 and V % 128 == 0:
             bucket = "t_gt1_seq_heads_geq_3072"

@@ -17,7 +17,7 @@ from aiter.ops.triton.utils import config_utils as triton_core
 from aiter.ops.triton.utils._triton.arch_info import get_arch
 from op_tests.triton_tests.utils.kda_ref import chunk_kda_ref
 
-arch = get_arch()
+arch = get_arch().removesuffix("-strict")
 
 pytestmark = pytest.mark.skipif(
     arch not in ("gfx950", "gfx1250"),

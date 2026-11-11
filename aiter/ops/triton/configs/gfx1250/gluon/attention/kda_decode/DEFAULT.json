@@ -38,5 +38,14 @@
     "SK": 32,
     "num_warps": 4,
     "num_buffers": 2
+  },
+  "t1_paged_n72_h12_k128_v128": {
+    "BV": 128,
+    "SK": 16,
+    "num_warps": 2,
+    "num_buffers": 1,
+    "use_tdm_load": true,
+    "use_tdm_store": true,
+    "tdm_store_bufs": 1
   }
 }
