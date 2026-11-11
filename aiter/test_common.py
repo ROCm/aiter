@@ -74,9 +74,7 @@ def perftest(
                 num = int((cache_size + inputSize - 1) // inputSize)
             num = min(num, num_iters)
 
-            rotate_args = [
-                (copy.deepcopy(args), copy.deepcopy(kwargs)) for _ in range(num - 1)
-            ] + [(args, kwargs)]
+            rotate_args = input_copies(args, kwargs, num)
             run_iters(num_warmup, func, *args, **kwargs)
             torch.cuda.synchronize()
             if int(os.environ.get("AITER_LOG_MORE", "0")) or use_cuda_event:
@@ -228,6 +226,14 @@ def run_iters(num_iters, func, *args, **kwargs):
     for _ in range(num_iters):
         data = func(*args, **kwargs)
     return data
+
+
+def input_copies(args, kwargs, num):
+    """`num - 1` deep copies of the inputs, then the caller's own `(args, kwargs)`.
+
+    Each copy is one deepcopy of both, so a tensor or storage shared between them stays shared.
+    """
+    return [copy.deepcopy((args, kwargs)) for _ in range(num - 1)] + [(args, kwargs)]
 
 
 def run_iters_rotate(num_iters, func, rotate_args):

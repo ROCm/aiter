@@ -12,9 +12,36 @@ from unittest.mock import patch
 
 import torch
 
+from aiter.test_common import input_copies
 from aiter.utility import measure
 
 MiB = 1 << 20
+
+
+def _storage(t):
+    return t.untyped_storage().data_ptr()
+
+
+class TestInputCopies(unittest.TestCase):
+    def test_sharing_between_args_and_kwargs_survives(self):
+        buf = torch.zeros(4)
+        args, kwargs = (buf, buf), {"out": buf[:2]}
+        copies = input_copies(args, kwargs, 3)
+        self.assertEqual(len(copies), 3)
+        for a, k in copies[:-1]:
+            self.assertIsNot(a[0], buf)
+            self.assertIs(a[0], a[1])
+            self.assertEqual(_storage(k["out"]), _storage(a[0]))
+            k["out"].fill_(7)
+            self.assertEqual(a[0].tolist(), [7, 7, 0, 0])
+        self.assertEqual(buf.tolist(), [0, 0, 0, 0])
+
+    def test_callers_inputs_are_the_last_slot(self):
+        args, kwargs = (torch.zeros(2),), {"scale": 2.0}
+        copies = input_copies(args, kwargs, 4)
+        self.assertIs(copies[-1][0], args)
+        self.assertIs(copies[-1][1], kwargs)
+        self.assertEqual(input_copies(args, kwargs, 1), [(args, kwargs)])
 
 
 def _cache(level, kib, instances=1):
