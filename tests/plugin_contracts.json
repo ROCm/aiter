@@ -1,4 +1,18 @@
 {
+ "deepseek_v41_decode_attn_pre": {
+  "fingerprint": "8e77c79ac048f62c",
+  "signature": "residual:positional, pre_mix:positional, hc_fn:positional, hc_scale:positional, hc_base:positional, attn_norm_weight:positional, wqkv_a:positional, wqkv_a_scale:positional, q_norm_weight:positional, kv_norm_weight:positional, wq_b:positional, wq_b_scale:positional, cos_cache:positional, sin_cache:positional, positions:positional, kv_cache:positional, kv_slots:positional, pre_out:positional, post_out:positional, comb_out:positional, q_out:positional, layer_index:keyword-only, sublayer_output:keyword-only=None, post_mix:keyword-only=None, comb_mix:keyword-only=None, residual_out:keyword-only=None, normed_out:keyword-only=None, q_latent_out:keyword-only=None, q_latent_scale_out:keyword-only=None, index_wq_b:keyword-only=None, index_wq_b_scale:keyword-only=None, index_weights_proj:keyword-only=None, index_q_out:keyword-only=None, index_q_scale_out:keyword-only=None, index_weights_out:keyword-only=None, aux_out:keyword-only=None, eps:keyword-only=1e-20, hc_eps:keyword-only=1e-06, group:keyword-only=None, stream:keyword-only=None, -> None",
+  "source": "aiter/ops/deepseek_v41_decode.py",
+  "supersedes": [],
+  "version": 1
+ },
+ "deepseek_v41_decode_layer_post": {
+  "fingerprint": "c68ac02eeacdab41",
+  "signature": "q:positional, kv_cache:positional, topk_rows:positional, topk_count:positional, window_meta:positional, attn_sink:positional, positions:positional, cos_cache:positional, sin_cache:positional, wo_a:positional, wo_a_scale:positional, wo_b:positional, wo_b_scale:positional, residual:positional, pre_mix:positional, post_mix:positional, comb_mix:positional, hc_fn:positional, hc_scale:positional, hc_base:positional, ffn_norm_weight:positional, gate_weight:positional, gate_bias:positional, w13:positional, w13_scale:positional, w2:positional, w2_scale:positional, shared_w13:positional, shared_w13_scale:positional, shared_w2:positional, shared_w2_scale:positional, residual_out:positional, pre_out:positional, post_out:positional, comb_out:positional, ffn_out:positional, softmax_scale:keyword-only, ring_slots:keyword-only, layer_index:keyword-only, ffn_normed_out:keyword-only=None, top_k:keyword-only=6, routed_scaling_factor:keyword-only=1.5, swiglu_limit:keyword-only=10.0, eps:keyword-only=1e-20, hc_eps:keyword-only=1e-06, group:keyword-only=None, stream:keyword-only=None, -> None",
+  "source": "aiter/ops/deepseek_v41_decode.py",
+  "supersedes": [],
+  "version": 1
+ },
  "gemm_a8w8_blockscale": {
   "fingerprint": "47ec95c460883544",
   "signature": "XQ:positional:Tensor, WQ:positional:Tensor, x_scale:positional:Tensor, w_scale:positional:Tensor, dtype:positional:torch.dtype=dtypes.bf16, isBpreshuffled:positional:bool=False, split_k:positional:int | None=None, -> torch.Tensor",
