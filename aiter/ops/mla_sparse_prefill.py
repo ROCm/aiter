@@ -292,25 +292,13 @@ _KV_SPLIT_FIT = {
 }
 
 
-# gfx1250 v4 takes one tile narrower while N * H <= this * CUs (half for bf16 at H <= 32), as
-# gfx1250_pick_tile in opus_mla_prefill_fwd.cu.
-_GFX1250_NARROW_HEADS_PER_CU = 32
-
-
-def _opus_split_fit(gfx: str, kernel: str, n: int, h: int) -> _SplitFit:
+def _opus_split_fit(gfx: str, kernel: str, h: int) -> _SplitFit:
     """The split-K fit of the ``kernel`` (v4_a16w16, v4_a8w8, v41_a8w8, v41_a8w4) variant that
-    serves ``n`` tokens of ``h`` heads, as the launcher picks it."""
+    serves ``h`` heads, as the launcher picks it."""
     if gfx == "gfx1250" and kernel == "v41_a8w8":
         tile = "16mx1_16nx4" if h <= 32 else "16mx4_64nx1"
     elif gfx == "gfx1250":
-        limit = _GFX1250_NARROW_HEADS_PER_CU * get_cu_num()
-        if h <= 16:
-            tile = "16mx1_16nx4"
-        elif h <= 32:
-            narrow = n * h <= (limit // 2 if kernel == "v4_a16w16" else limit)
-            tile = "16mx1_16nx4" if narrow else "32mx1_16nx4"
-        else:
-            tile = "32mx1_16nx4" if n * h <= limit else "16mx4_64nx1"
+        tile = "16mx1_16nx4" if h <= 16 else "32mx1_16nx4" if h <= 32 else "16mx4_64nx1"
     elif kernel in ("v41_a8w8", "v41_a8w4"):
         tile = "16mx1_16nx4" if h <= 16 else "16mx4_64nx1"
     else:
@@ -409,7 +397,7 @@ def _opus_sparse_prefill(
 
     n, h, _ = q.shape
     nnz = kv_indices_prefix.numel() + kv_indices_extend.numel()
-    fit = _opus_split_fit(gfx, "v4_a16w16", n, h)
+    fit = _opus_split_fit(gfx, "v4_a16w16", h)
     num_kv_splits = _kv_splits(num_kv_splits, fit, n, h, nnz)
     fwd(
         q,
@@ -483,7 +471,7 @@ def _opus_sparse_prefill_v4(
         attn_sink,
     )
     nnz = kv_indices_prefix.numel() + kv_indices_extend.numel()
-    fit = _opus_split_fit(gfx, "v4_a8w8", n, h)
+    fit = _opus_split_fit(gfx, "v4_a8w8", h)
     num_kv_splits = _kv_splits(num_kv_splits, fit, n, h, nnz)
     fwd(
         *args,
@@ -568,7 +556,7 @@ def _opus_sparse_prefill_v41(
         attn_sink,
     )
     nnz = kv_indices_prefix.numel() + kv_indices_extend.numel()
-    fit = _opus_split_fit(gfx, variant, n, h)
+    fit = _opus_split_fit(gfx, variant, h)
     num_kv_splits = _kv_splits(num_kv_splits, fit, n, h, nnz)
     fwd(*args, out, float(softmax_scale), *_split_args(n, num_kv_splits, h, q.device))
     return out
