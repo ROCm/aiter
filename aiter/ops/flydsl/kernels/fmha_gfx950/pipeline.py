@@ -1026,7 +1026,13 @@ class DualwaveFp8KernelContext:
         self.load_atom_128 = fx.make_copy_atom(fx.rocdl.BufferCopy128b(), fx.Int32)
         self.load_atom_64 = fx.make_copy_atom(fx.rocdl.BufferCopy64b(), fx.Int32)
         self.store_atom_64 = fx.make_copy_atom(fx.rocdl.BufferCopy64b(), fx.Int32)
-        self.store_atom_128 = fx.make_copy_atom(fx.rocdl.BufferCopy128b(), fx.Int32)
+        if const_expr(traits.BODY_VARIANT == "conventional_bn64"):
+            # O is written once and never reread by this kernel: non-temporal stores keep it from evicting KV lines.
+            self.store_atom_128 = fx.make_copy_atom(
+                fx.rocdl.BufferCopy128b(2), fx.Int32
+            )
+        else:
+            self.store_atom_128 = fx.make_copy_atom(fx.rocdl.BufferCopy128b(), fx.Int32)
         self.dma_atom = fx.make_copy_atom(fx.rocdl.BufferCopyLDS128b(), 128)
         self.o_store_reg = fx.make_rmem_tensor(fx.make_layout(2, 1), fx.Int32)
         self.o_store_reg_128 = fx.make_rmem_tensor(fx.make_layout(4, 1), fx.Int32)
