@@ -678,6 +678,12 @@ def flydsl_gemm(
     assert (
         scale_a is None and scale_b is None and scale_c is None
     ), "FlyDSL hgemm does not support scaling yet."
+    if inp.shape[0] == 0:
+        # A zero-row launch has an empty grid, which hipModuleLaunchKernel rejects.
+        if out is not None:
+            return out
+        dtype = otype or (bias.dtype if bias is not None else inp.dtype)
+        return torch.empty((0, weights.shape[0]), dtype=dtype, device=inp.device)
     flydsl_gemm_kernels = _get_flydsl_gemm_kernels()
     flydsl_config = _flydsl_hgemm_kernel_params(config["kernelName"])
     skinny = flydsl_config["policy"] == flydsl_gemm_kernels.SKINNY_POLICY
