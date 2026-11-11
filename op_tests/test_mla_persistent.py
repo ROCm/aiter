@@ -13,7 +13,6 @@ import torch
 
 import aiter
 from aiter import dtypes
-from aiter.jit.core import is_experimental_enabled
 from aiter.jit.utils.chip_info import get_gfx
 from aiter.test_common import benchmark, checkAllclose, run_perftest
 
@@ -600,6 +599,9 @@ def torch_mla_extend_split_kv(
     is_causal=True,
     q_scale=None,
     kv_scale=None,
+    fast_mode=True,
+    intra_batch_mode=False,
+    plan_dtypes=None,
 ):
 
     _num_page, page_size, _nhead_kv, _ = kvc_cache.shape
@@ -607,6 +609,8 @@ def torch_mla_extend_split_kv(
     dev = kvc_cache.device
     is_fp8_q = q.dtype == dtypes.fp8
     is_fp8_kvc = kvc_cache.dtype == dtypes.fp8
+    if plan_dtypes is None:
+        plan_dtypes = (q.dtype, kvc_cache.dtype)
 
     if is_fp8_q:
         q = q.to(torch.float)
@@ -623,77 +627,20 @@ def torch_mla_extend_split_kv(
 
     io_transformed = False
     q_ratio = 1
-    if (
-        nheads == 16
-        or (get_gfx() == "gfx942" and nheads == 128 and is_fp8_q and is_fp8_kvc)
-        or (
-            get_gfx() == "gfx950"
-            and nheads == 128
-            and is_fp8_q
-            and is_fp8_kvc
-            and is_experimental_enabled()
-        )
-        or (
-            get_gfx() == "gfx942"
-            and nheads in (16, 32, 64)
-            and nheads * max_seqlen_q == 128
-            and is_fp8_q
-            and is_fp8_kvc
-            and is_experimental_enabled()
-        )
-        or (
-            get_gfx() == "gfx950"
-            and nheads == 8
-            and is_fp8_q
-            and is_fp8_kvc
-            and max_seqlen_q == 4
-        )
-        or (
-            get_gfx() == "gfx942"
-            and nheads == 8
-            and not is_fp8_q
-            and not is_fp8_kvc
-            and max_seqlen_q == 2
-        )
-        or (
-            # fp8/fp8 PS GQA catch-all -- mirrors aiter/mla.py / asm_mla.cu
-            get_gfx() == "gfx950"
-            and is_fp8_q
-            and is_fp8_kvc
-            and ((nheads == 32) or (nheads == 64) or (nheads == 128))
-        )
-        or (
-            get_gfx() == "gfx942"
-            and nheads == 64
-            and is_fp8_q
-            and is_fp8_kvc
-            and max_seqlen_q == 1
-        )
-        or (get_gfx() == "gfx950" and not is_fp8_q and not is_fp8_kvc)
-        or (
-            get_gfx() == "gfx950"
-            and nheads == 96
-            and is_fp8_q
-            and is_fp8_kvc
-            and max_seqlen_q <= 6
-        )
-        or (
-            get_gfx() == "gfx950"
-            and is_fp8_q
-            and is_fp8_kvc
-            and nheads == 12
-            and nheads * max_seqlen_q <= 128
-        )
-    ):
-        # Natively support cases
-        pass
-    elif nheads in range(32, 128 + 1, 16):
-        # we use nhead=16 to simulate such cases by customized metadata
-        # metadata also views qo's tensor as shape (total_s * (nhead // 16), 16, ...)
+    # Read the head fold from the planner rules mla_decode_fwd and
+    # get_mla_metadata_v1 use, for the planner mode the metadata was built with.
+    fold_factor = aiter.get_mla_decode_shape_support(
+        nheads,
+        max_seqlen_q,
+        *plan_dtypes,
+        fast_mode=fast_mode,
+        intra_batch_mode=intra_batch_mode,
+        page_size=page_size,
+    ).fold_factor
+    if fold_factor > 1:
+        # mla_decode_fwd views qo as (total_s * fold_factor, nheads // fold_factor)
         ori_nheads = nheads
-
-        fold_factor = nheads // 16
-        nheads = 16
+        nheads = nheads // fold_factor
         total_s = total_q * fold_factor
         if max_seqlen_q == 1:
             q_ratio = fold_factor
@@ -986,6 +933,9 @@ def torch_mla_split_kv_and_reduce(
     is_causal=True,
     q_scale=None,
     kv_scale=None,
+    fast_mode=True,
+    intra_batch_mode=False,
+    plan_dtypes=None,
 ):
     total_q, nhead, _ = q.shape
     partial_out, partial_lse, split_out, split_lse, io_transformed = (
@@ -1007,6 +957,9 @@ def torch_mla_split_kv_and_reduce(
             is_causal=is_causal,
             q_scale=q_scale,
             kv_scale=kv_scale,
+            fast_mode=fast_mode,
+            intra_batch_mode=intra_batch_mode,
+            plan_dtypes=plan_dtypes,
         )
     )
 
@@ -1077,6 +1030,8 @@ def torch_mla_extend_3buffer_split_kv_and_reduce(
     q_scale=None,
     kv_scale=None,
     scale_dim=4,
+    fast_mode=True,
+    intra_batch_mode=False,
 ):
 
     num_page = kvc_cache.shape[0]
@@ -1120,7 +1075,20 @@ def torch_mla_extend_3buffer_split_kv_and_reduce(
         is_causal,
         q_scale,
         kv_scale,
+        fast_mode=fast_mode,
+        intra_batch_mode=intra_batch_mode,
+        # mla_decode_fwd plans the byte KV buffer as fp8.
+        plan_dtypes=(q.dtype, dtypes.fp8),
     )
+
+
+# get_mla_metadata_v1 planner per mode: (fast_mode, intra_batch_mode).
+# fast -> v1_2, v1_0 -> the -nps default, v1_1 -> neither flag.
+MLA_METADATA_MODES = {
+    "fast": (True, False),
+    "v1_0": (False, True),
+    "v1_1": (False, False),
+}
 
 
 def _make_mla_metadata(
@@ -1138,7 +1106,17 @@ def _make_mla_metadata(
     non_persistent_mode=False,
     causal=True,
     is_cp_round_robin=False,
+    metadata_mode=None,
+    kv_granularity=None,
 ):
+    if metadata_mode is None:
+        metadata_mode = "v1_0" if non_persistent_mode else "fast"
+    fast_mode, intra_batch_mode = MLA_METADATA_MODES[metadata_mode]
+    if kv_granularity is None:
+        kv_granularity = max(
+            page_size,
+            32 if nhead == 64 and dtype == dtypes.fp8 and kvtype == dtypes.fp8 else 16,
+        )
     names = (
         "work_meta_data",
         "work_indptr",
@@ -1154,9 +1132,9 @@ def _make_mla_metadata(
         dtype,
         kvtype,
         is_sparse=False,
-        fast_mode=not non_persistent_mode,
+        fast_mode=fast_mode,
         num_kv_splits=max_split_per_batch,
-        intra_batch_mode=non_persistent_mode,
+        intra_batch_mode=intra_batch_mode,
     )
     metadata = {
         name: torch.empty(shape, dtype=buffer_dtype, device=qo_indptr.device)
@@ -1176,15 +1154,12 @@ def _make_mla_metadata(
         metadata["reduce_final_map"],
         metadata["reduce_partial_map"],
         page_size=page_size,
-        kv_granularity=max(
-            page_size,
-            32 if nhead == 64 and dtype == dtypes.fp8 and kvtype == dtypes.fp8 else 16,
-        ),
+        kv_granularity=kv_granularity,
         max_seqlen_qo=int(max_seqlen_qo),
         uni_seqlen_qo=decode_qlen,
-        fast_mode=not non_persistent_mode,
+        fast_mode=fast_mode,
         max_split_per_batch=max_split_per_batch,
-        intra_batch_mode=non_persistent_mode,
+        intra_batch_mode=intra_batch_mode,
         dtype_q_nope=dtype,
         dtype_kv_nope=kvtype,
         is_cp_round_robin=is_cp_round_robin,
@@ -1212,6 +1187,8 @@ def test_mla(
     scale_dim,
     return_lse,
     causal,
+    metadata_mode=None,
+    kv_granularity=None,
 ):
     ret = {}
 
@@ -1333,6 +1310,9 @@ def test_mla(
             (cu_num + batch_size - 1) // batch_size, max_split_per_batch
         )
 
+    if metadata_mode is None:
+        metadata_mode = "v1_0" if non_persistent_mode else "fast"
+    fast_mode, intra_batch_mode = MLA_METADATA_MODES[metadata_mode]
     metadata = _make_mla_metadata(
         qo_indptr,
         kv_indptr,
@@ -1345,8 +1325,9 @@ def test_mla(
         max_seqlen_qo,
         decode_qlen,
         max_split_per_batch,
-        non_persistent_mode=non_persistent_mode,
         causal=causal,
+        metadata_mode=metadata_mode,
+        kv_granularity=kv_granularity,
     )
     work_meta_data = metadata["work_meta_data"]
     work_indptr = metadata["work_indptr"]
@@ -1469,7 +1450,8 @@ def test_mla(
             reduce_indptr=reduce_indptr,
             reduce_final_map=reduce_final_map,
             reduce_partial_map=reduce_partial_map,
-            intra_batch_mode=non_persistent_mode,
+            intra_batch_mode=intra_batch_mode,
+            fast_mode=fast_mode,
             kv_scale=kv_scale,
             causal=causal,
         )
@@ -1508,6 +1490,8 @@ def test_mla(
                     is_causal=causal,
                     q_scale=None,
                     kv_scale=kv_scale,
+                    fast_mode=fast_mode,
+                    intra_batch_mode=intra_batch_mode,
                 )
             )
 
@@ -1547,7 +1531,8 @@ def test_mla(
             reduce_indptr=reduce_indptr,
             reduce_final_map=reduce_final_map,
             reduce_partial_map=reduce_partial_map,
-            intra_batch_mode=non_persistent_mode,
+            intra_batch_mode=intra_batch_mode,
+            fast_mode=fast_mode,
             return_lse=return_lse,
             causal=causal,
         )
@@ -1584,6 +1569,8 @@ def test_mla(
                     reduce_partial_map=reduce_partial_map,
                     max_seqlen_q=max_seqlen_qo,
                     is_causal=causal,
+                    fast_mode=fast_mode,
+                    intra_batch_mode=intra_batch_mode,
                 )
             )
 
@@ -1650,7 +1637,8 @@ def test_mla(
             reduce_indptr=reduce_indptr,
             reduce_final_map=reduce_final_map,
             reduce_partial_map=reduce_partial_map,
-            intra_batch_mode=non_persistent_mode,
+            intra_batch_mode=intra_batch_mode,
+            fast_mode=fast_mode,
             return_lse=return_lse,
             causal=causal,
         )
@@ -1696,21 +1684,29 @@ def test_mla(
                     is_causal=causal,
                     q_scale=q_scale,
                     kv_scale=kv_scale,
+                    fast_mode=fast_mode,
+                    intra_batch_mode=intra_batch_mode,
                 )
             )
 
-            checkAllclose(
+            split_err = checkAllclose(
                 split_out_ref,
                 out_asm,
                 msg=f"mla_decode-absorb_fp8    [golden fp8 split_out_ref vs aiter_asm]: {us_asm_decode:>8.2f} us......",
             )
+            # Enforce the gfx942 QH64 regression; retain warning-only checks for
+            # unrelated shapes with pre-existing short-context FP8 mismatches.
+            if nhead == 64 and get_gfx() == "gfx942":
+                assert split_err < 0.05
 
             if partial_out_ref.shape[0] > 0:
-                checkAllclose(
+                partial_err = checkAllclose(
                     partial_out_ref,
                     attn_logits[: partial_out_ref.shape[0]].flatten(0, 1),
                     msg=f"mla_decode-absorb_fp8    [partial_out_ref vs attn_logits]: {us_asm_decode:>8.2f} us......",
                 )
+                if nhead == 64 and get_gfx() == "gfx942":
+                    assert partial_err < 0.05
 
         cal_diff(out_ref, out_asm, "out", True)
         return err, us_asm_decode
@@ -1771,7 +1767,8 @@ def test_mla(
             reduce_indptr=reduce_indptr,
             reduce_final_map=reduce_final_map,
             reduce_partial_map=reduce_partial_map,
-            intra_batch_mode=non_persistent_mode,
+            intra_batch_mode=intra_batch_mode,
+            fast_mode=fast_mode,
             causal=causal,
         )
 
@@ -1810,6 +1807,8 @@ def test_mla(
                     max_seqlen_q=max_seqlen_qo,
                     is_causal=causal,
                     scale_dim=scale_dim,
+                    fast_mode=fast_mode,
+                    intra_batch_mode=intra_batch_mode,
                 )
             )
 
@@ -1933,6 +1932,127 @@ def test_mla(
     ret["decode:TB/s"] = bytes / us_asm_decode / 1e6
 
     return ret
+
+
+def test_mla_v1_0_kv_tail():
+    # v1_0 folds a 1-4 key tail into the previous split. gfx942 plans 16 splits per
+    # row, so 17-20 keys end in one split at granularity 16; gfx950 plans
+    # seqlen // 196 splits, so 513-516 keys do at granularity 256. 16 and 512 keep
+    # their split count and are the controls.
+    gfx = get_gfx()
+    if gfx == "gfx942":
+        kv_granularity, ctx_lens = 16, [16, 17, 18, 19, 20]
+    elif gfx == "gfx950":
+        kv_granularity, ctx_lens = 256, [512, 513, 514, 515, 516]
+    else:
+        return
+    bad = {}
+    for ctx_len in ctx_lens:
+        ret = test_mla(
+            ctx_lens=ctx_len,
+            batch_size=1,
+            nhead=16,
+            kv_lora_rank=512,
+            qk_nope_head_dim=512,
+            qk_rope_head_dim=64,
+            v_head_dim=512,
+            dtype=dtypes.bf16,
+            kvtype=dtypes.bf16,
+            page_size=1,
+            varlen=False,
+            decode_qlen=1,
+            max_split_per_batch=32,
+            non_persistent_mode=True,
+            paged_layout="LEGACY",
+            scale_dim=16,
+            return_lse=False,
+            causal=True,
+            metadata_mode="v1_0",
+            kv_granularity=kv_granularity,
+        )
+        if ret["decode:err"] > 0.05:
+            bad[ctx_len] = ret["decode:err"]
+    assert not bad, (
+        f"v1_0 decode mismatches the reference at kv_granularity {kv_granularity}: "
+        + ", ".join(f"ctx_len {k} on {v:.1%} of outputs" for k, v in bad.items())
+    )
+
+
+def check_fp8_gqa16_multi_tile_batch(
+    decode_qlen: int, persistent: bool = True, return_lse: bool = False
+) -> None:
+    """gfx950 fp8 gqa16 decode with 128 rows of 3 KV tiles each.
+    The waves of a workgroup share Q, K, V and softmax data through LDS. A
+    missing s_barrier or s_waitcnt gives wrong rows only under load, so every
+    call runs a full batch next to a copy on a side stream."""
+    nhead, kv_lora_rank, qk_head_dim, num_kv = 16, 512, 576, 1 << 20
+    batch_size, sm_scale = 128, 1.0 / 16
+    one = torch.ones(1, dtype=torch.float)
+    kv_buffer = torch.randn((num_kv, qk_head_dim)).to(dtypes.fp8)
+    copy_src, copy_dst = torch.zeros(64 << 20), torch.empty(64 << 20)
+    side_stream = torch.cuda.Stream()
+    qo_indptr = torch.arange(batch_size + 1, dtype=torch.int) * decode_qlen
+    kv_last_page_lens = torch.ones(batch_size, dtype=torch.int)
+    num_bad = 0
+    for kv_len in range(257, 385, 2):
+        kv_indptr = torch.arange(batch_size + 1, dtype=torch.int) * kv_len
+        kv_indices = torch.randint(0, num_kv, (batch_size * kv_len,), dtype=torch.int)
+        q = torch.randn((batch_size * decode_qlen, nhead, qk_head_dim)) * 3
+        q = q.to(dtypes.fp8)
+        out = torch.empty(
+            (batch_size * decode_qlen, nhead, kv_lora_rank), dtype=torch.bfloat16
+        )
+        if persistent:
+            splits = _make_mla_metadata(
+                qo_indptr,
+                kv_indptr,
+                kv_last_page_lens,
+                nhead,
+                1,
+                dtypes.fp8,
+                dtypes.fp8,
+                1,
+                decode_qlen,
+                decode_qlen,
+                1,
+            )
+        else:
+            splits = {
+                "num_kv_splits": 1,
+                "num_kv_splits_indptr": torch.arange(batch_size + 1, dtype=torch.int),
+            }
+        side_stream.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(side_stream):
+            for _ in range(4):
+                copy_dst.copy_(copy_src)
+        aiter.mla.mla_decode_fwd(
+            q,
+            kv_buffer.view(-1, 1, 1, qk_head_dim),
+            out,
+            qo_indptr,
+            kv_indptr,
+            kv_indices,
+            kv_last_page_lens,
+            decode_qlen,
+            sm_scale=sm_scale,
+            q_scale=one,
+            kv_scale=one,
+            return_lse=return_lse,
+            **splits,
+        )
+        torch.cuda.current_stream().wait_stream(side_stream)
+        k = kv_buffer[kv_indices.long()].float().view(batch_size, kv_len, -1)
+        q = q.float().view(batch_size, decode_qlen, nhead, -1)
+        s = torch.einsum("bqhd,bkd->bqhk", q, k) * sm_scale
+        last = kv_len - decode_qlen + torch.arange(decode_qlen).view(1, -1, 1, 1)
+        s = s.masked_fill(torch.arange(kv_len) > last, float("-inf"))
+        ref = torch.softmax(s, -1) @ k[:, None, :, :kv_lora_rank]
+        err = (out.float().view_as(ref) - ref).abs().amax(-1)
+        num_bad += int((err > 0.1 * ref.abs().amax(-1)).sum())
+    assert num_bad == 0, (
+        f"qlen {decode_qlen}, persistent {persistent}, lse {return_lse}: "
+        f"{num_bad} wrong (row, query, head) outputs"
+    )
 
 
 _HEADS = 16
@@ -2228,7 +2348,7 @@ parser.add_argument(
     type=dtypes.str2tuple,
     nargs="*",
     const=None,
-    default=[(16, 1), (16, 2), (16, 4), (48, 1), (128, 2)],
+    default=[(16, 1), (16, 2), (16, 4), (48, 1), (64, 1), (128, 2)],
     help="""Number of heads.
     e.g.: -n 16,1""",
 )
@@ -2253,6 +2373,16 @@ parser.add_argument(
     action="store_true",
     help="""variable kv seqlens per batch. Default: False.
     --varlen # True""",
+)
+parser.add_argument(
+    "-mm",
+    "--metadata_mode",
+    type=str,
+    choices=list(MLA_METADATA_MODES),
+    default=None,
+    help="""get_mla_metadata_v1 planner: fast (v1_2), v1_0 or v1_1.
+    Default: v1_0 with -nps, else fast.
+    e.g.: -mm v1_1""",
 )
 parser.add_argument(
     "-pl",
@@ -2364,6 +2494,8 @@ def main():
                     scale_dim=args.scale_dim,
                     return_lse=args.return_lse,
                     causal=args.causal,
+                    metadata_mode=args.metadata_mode
+                    or ("v1_0" if args.non_persistent_mode else "fast"),
                 )
                 df.append(ret)
         df = pd.DataFrame(df)
@@ -2371,6 +2503,12 @@ def main():
         aiter.logger.info("mla_persistent summary (markdown):\n%s", df_md)
     check_fold_seqlen_indptr_cuda_graph_capture()
     aiter.logger.info("_fold_seqlen_indptr cuda-graph capture: passed")
+    test_mla_v1_0_kv_tail()
+    aiter.logger.info("v1_0 KV tail end-to-end: passed")
+    if get_gfx() == "gfx950":
+        check_fp8_gqa16_multi_tile_batch(1)
+        check_fp8_gqa16_multi_tile_batch(1, return_lse=True)
+        aiter.logger.info("fp8 gqa16 qlen 1 multi-tile batch: passed")
     return df if args.nhead else None
 
 

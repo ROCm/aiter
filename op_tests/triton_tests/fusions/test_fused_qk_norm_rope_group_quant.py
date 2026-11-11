@@ -31,12 +31,21 @@ def make_inputs(num_tokens):
     # Some tokens are pad tokens.
     batch_ids[3::5] = -1
     return {
-        "q": torch.randn(num_tokens, NUM_HEADS, HEAD_DIM, device="cuda").bfloat16(),
-        "kv": torch.randn(num_tokens, HEAD_DIM, device="cuda").bfloat16(),
-        "k_weight": torch.rand(HEAD_DIM, device="cuda").bfloat16() + 0.5,
+        "q": torch.randn(
+            num_tokens, NUM_HEADS, HEAD_DIM, device="cuda", dtype=torch.float32
+        ).bfloat16(),
+        "kv": torch.randn(
+            num_tokens, HEAD_DIM, device="cuda", dtype=torch.float32
+        ).bfloat16(),
+        "k_weight": torch.rand(HEAD_DIM, device="cuda", dtype=torch.float32).bfloat16()
+        + 0.5,
         "positions": torch.randint(0, MAX_POS, (num_tokens,), device="cuda"),
-        "cos": torch.rand(MAX_POS, ROPE_DIM // 2, device="cuda").bfloat16(),
-        "sin": torch.rand(MAX_POS, ROPE_DIM // 2, device="cuda").bfloat16(),
+        "cos": torch.rand(
+            MAX_POS, ROPE_DIM // 2, device="cuda", dtype=torch.float32
+        ).bfloat16(),
+        "sin": torch.rand(
+            MAX_POS, ROPE_DIM // 2, device="cuda", dtype=torch.float32
+        ).bfloat16(),
         "eps": 1e-6,
         "swa_nope": torch.zeros(num_tokens, HEAD_DIM, dtype=e4m3_dtype, device="cuda"),
         "swa_rope": torch.zeros(
@@ -90,7 +99,7 @@ def test_fused_qk_norm_rope_group_quant(num_tokens):
     # The scale rounding modes differ only when amax / 448 is a power of two or
     # amax is 0. Random data does not have these cases. Add them to two Q rows.
     # Token 0, head 0: the RMS is 8, so in group 0 amax / 448 = 14 / 8 / 448 = 2^-8.
-    row = torch.full((HEAD_DIM,), 8.0, device="cuda")
+    row = torch.full((HEAD_DIM,), 8.0, device="cuda", dtype=torch.float32)
     row[0], row[1], row[2:5] = 14.0, 4.0, 6.0  # 14**2 + 4**2 + 3 * 6**2 = 5 * 8**2
     inputs["q"][0, 0] = row
     # Token 1, head 0: group 1 is all zeros.

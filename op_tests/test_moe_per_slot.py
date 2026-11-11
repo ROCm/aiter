@@ -70,7 +70,7 @@ class Family:
     v2_epilog: str = ""
 
 
-_PER_1X32 = dict(q_type=QuantType.per_1x32, gfx=("gfx950",))
+_PER_1X32 = {"q_type": QuantType.per_1x32, "gfx": ("gfx950",)}
 _V2 = dict(
     a_dtype=dtypes.fp4x2,
     w_dtype=dtypes.fp4x2,
@@ -370,37 +370,37 @@ def v2_config(fam, dtype, token, model_dim, inter_dim, local_E, topk):
     if _CONFIG_DIR is None:
         _CONFIG_DIR = tempfile.TemporaryDirectory(prefix="aiter_per_slot_")
     kn1, kn2, block_m = v2_kernels(fam, model_dim, inter_dim, local_E)
-    row = dict(
-        gfx=get_gfx(),
-        cu_num=get_cu_num(),
-        token=_FUSED_MOE.get_padded_M(token),
-        model_dim=model_dim,
-        inter_dim=inter_dim,
-        expert=local_E,
-        topk=topk,
-        act_type=str(fam.activation),
-        dtype=str(dtype),
-        q_dtype_a=str(fam.a_dtype),
-        q_dtype_w=str(fam.w_dtype),
-        q_type=str(fam.q_type),
-        use_g1u1=1,
-        doweight_stage1=0,
-        block_m=block_m,
-        ksplit=0,
-        us1=0,
-        kernelName1=kn1,
-        err1="",
-        us2=0,
-        kernelName2=kn2,
-        err2="",
-        us=0,
-        run_1stage=0,
-        xbf16=0,
-        flat=0,
-        tflops=0,
-        bw=0,
-        _tag="",
-    )
+    row = {
+        "gfx": get_gfx(),
+        "cu_num": get_cu_num(),
+        "token": _FUSED_MOE.get_padded_M(token),
+        "model_dim": model_dim,
+        "inter_dim": inter_dim,
+        "expert": local_E,
+        "topk": topk,
+        "act_type": str(fam.activation),
+        "dtype": str(dtype),
+        "q_dtype_a": str(fam.a_dtype),
+        "q_dtype_w": str(fam.w_dtype),
+        "q_type": str(fam.q_type),
+        "use_g1u1": 1,
+        "doweight_stage1": 0,
+        "block_m": block_m,
+        "ksplit": 0,
+        "us1": 0,
+        "kernelName1": kn1,
+        "err1": "",
+        "us2": 0,
+        "kernelName2": kn2,
+        "err2": "",
+        "us": 0,
+        "run_1stage": 0,
+        "xbf16": 0,
+        "flat": 0,
+        "tflops": 0,
+        "bw": 0,
+        "_tag": "",
+    }
     name = f"{fam.v2_epilog}-{token}-{model_dim}-{inter_dim}-{local_E}"
     path = os.path.join(_CONFIG_DIR.name, f"{name}.csv")
     pd.DataFrame([row]).to_csv(path, index=False)
