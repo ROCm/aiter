@@ -10,7 +10,14 @@ import logging
 import torch
 from flydsl.expr.typing import Int32, Int64, Stream
 
-from .allreduce_policy import oneshot_ladder, resolve_family_policy, resolve_link
+from .allreduce_policy import (
+    AllReduceAlgorithm,
+    OneShotRung,
+    oneshot_ladder,
+    resolve_family_policy,
+    resolve_link,
+    select_rung,
+)
 from .comm_collectives_host_shared import (
     _cuda_index,
     _StEngine,
@@ -22,14 +29,6 @@ from .comm_collectives_host_shared import (
     preload_launcher,
     require_arch,
     resolve_inbox_flags,
-)
-from .allreduce_policy import (
-    AllReduceAlgorithm,
-    OneShotRung,
-    oneshot_ladder,
-    resolve_family_policy,
-    resolve_link,
-    select_rung,
 )
 from .kernels.comm.one_shot_allreduce import (
     make_one_shot_allreduce_kernel,

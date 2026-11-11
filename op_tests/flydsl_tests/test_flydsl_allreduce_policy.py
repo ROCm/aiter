@@ -21,9 +21,8 @@ from aiter.dist.device_communicators.quick_all_reduce import (
     QuickAllReduce,
     is_weak_contiguous,
 )
-from aiter.ops.flydsl import comm_collectives_host_shared as H
 from aiter.ops.flydsl import allreduce_policy as P
-from aiter.ops.flydsl.comm_collectives_host_shared import eligible_payload_bytes
+from aiter.ops.flydsl import comm_collectives_host_shared as H
 from aiter.ops.flydsl.allreduce_policy import (
     SUPPORTED_BLOCKS,
     AllReduceAlgorithm,
@@ -34,6 +33,7 @@ from aiter.ops.flydsl.allreduce_policy import (
     oneshot_ladder,
     ring_st_ladder,
 )
+from aiter.ops.flydsl.comm_collectives_host_shared import eligible_payload_bytes
 from aiter.ops.flydsl.kernels.comm.one_shot_allreduce import SUPPORTED_ATOMS
 from aiter.ops.flydsl.kernels.comm.quick_allreduce_mesh import SUPER_TILES
 from aiter.ops.flydsl.kernels.comm.quick_allreduce_ring import RING_SUPER_TILES
