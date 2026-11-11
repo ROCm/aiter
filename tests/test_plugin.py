@@ -5,7 +5,7 @@ from __future__ import annotations
 
 import inspect
 from dataclasses import dataclass
-from typing import Any, ClassVar
+from typing import Any, ClassVar, NamedTuple
 
 import pytest
 
@@ -734,6 +734,131 @@ def test_a_reported_latency_does_not_influence_routing(monkeypatch):
     assert add(2, 3) == 1, "the enable list decides, not the reported number"
     assert plugin.last_decision().provider == "slowpoke"
     assert plugin.last_decision().latency_us == 99999.0
+
+
+class _Workspace(NamedTuple):
+    """Shaped like `MlaV4NmPsWorkspace`: a handle the caller owns and passes in."""
+
+    o_acc: object
+    lse_acc: object
+    desc: object
+
+
+def test_a_caller_owned_workspace_reaches_the_provider_unchanged(monkeypatch):
+    """A contract can carry a workspace, and this is what that has to mean.
+
+    #7240 says a caller-owned handle is supported. Until an op with one was
+    routed that was an assertion nobody had executed, and the question it hides
+    is concrete: dispatch canonicalizes arguments through generated code, so a
+    `NamedTuple` could plausibly arrive rebuilt, flattened into its fields, or
+    copied. Any of those breaks the ownership the pattern exists for -- the
+    provider would be writing into scratch the caller cannot read back.
+
+    It arrives as the same object. `is`, not `==`, is the whole assertion.
+    """
+
+    seen = {}
+
+    @plugin.route(op="test.with_workspace", version=1)
+    def with_workspace(query, keys, workspace, out=None, return_lse=False):
+        return "native"
+
+    class Serving:
+        name = "wsprov"
+        api_versions: ClassVar[set] = {plugin.API_VERSION}
+        op_versions: ClassVar[dict] = {"test.with_workspace": {1}}
+
+        def select(self, op, args, kwargs):
+            seen["select"] = args
+
+            def run(*call_args, **call_kwargs):
+                seen["run"] = call_args
+                return "provider"
+
+            return plugin.KernelCandidate(
+                provider="wsprov",
+                kernel_id="ws-1",
+                artifact_digest="sha256:abc",
+                run=run,
+            )
+
+    monkeypatch.setattr(
+        plugin, "_entry_points", lambda: (_EntryPoint("wsprov", Serving()),)
+    )
+    plugin.configure(enable=("wsprov",), source="test")
+
+    workspace = _Workspace("o_acc", "lse_acc", "desc")
+    assert with_workspace("Q", "K", workspace, out="OUT", return_lse=True) == "provider"
+
+    assert seen["select"][2] is workspace, (
+        "select() received a different object than the caller passed; a "
+        "caller-owned workspace that is rebuilt on the way in is not caller-owned"
+    )
+    assert seen["run"][2] is workspace, "run() received a rebuilt workspace"
+    assert seen["select"][2]._fields == ("o_acc", "lse_acc", "desc"), (
+        "the workspace was flattened or coerced; a provider indexing it by "
+        "field would break"
+    )
+    assert seen["select"][3:] == ("OUT", True), (
+        "defaults past the workspace stopped being canonicalized into "
+        "positional arguments"
+    )
+
+
+def test_a_contract_that_returns_nothing_still_routes(monkeypatch):
+    """Some ops deliver through mutation and return None. Dispatch must not
+    read that as failure.
+
+    `fused_qk_norm_rope_cache_quant_shuffle` is the first routed contract shaped
+    this way: it writes q, k and the KV cache in place and returns nothing. A
+    dispatch that treated a falsy return as "the provider declined" would fall
+    back to native after the provider had already written -- running the work
+    twice, the second time over the first one's output.
+
+    Nothing in dispatch inspects the return value, and this is the test that
+    says so rather than leaving it to be rediscovered.
+    """
+
+    native_calls = []
+
+    @plugin.route(op="test.in_place", version=1)
+    def in_place(destination, source) -> None:
+        native_calls.append("native")
+
+    provider_calls = []
+
+    class Serving:
+        name = "mutprov"
+        api_versions: ClassVar[set] = {plugin.API_VERSION}
+        op_versions: ClassVar[dict] = {"test.in_place": {1}}
+
+        def select(self, op, args, kwargs):
+            def run(destination, source):
+                provider_calls.append("provider")
+                destination.append(source)  # the whole result, in place
+
+            return plugin.KernelCandidate(
+                provider="mutprov",
+                kernel_id="k",
+                artifact_digest="sha256:abc",
+                run=run,
+            )
+
+    monkeypatch.setattr(
+        plugin, "_entry_points", lambda: (_EntryPoint("mutprov", Serving()),)
+    )
+    plugin.configure(enable=("mutprov",), source="test")
+
+    destination = []
+    assert in_place(destination, "written") is None
+    assert destination == ["written"], "the provider's in-place write was lost"
+    assert provider_calls == ["provider"]
+    assert native_calls == [], (
+        "a None return was treated as a decline and the op ran natively as "
+        "well -- the work would be done twice, the second over the first's "
+        "output"
+    )
+    assert plugin.last_decision().route == "provider"
 
 
 def test_routing_one_op_name_twice_is_an_error():
