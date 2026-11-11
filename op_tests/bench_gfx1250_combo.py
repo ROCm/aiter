@@ -82,6 +82,7 @@ same thing to every op:
     --dsr1 moe,     1..16384 per-GPU decode batch, plus 1536, the recipe's
     mla_decode      max_num_seqs; see _DSR1_BATCH.
     mla_prefill     1024..16384 tokens per step; see _DSR1_MLA_PREFILL_TOKENS.
+                    The per-sequence length sweep is fixed in the source.
 
 With the variable unset, the child-UT ops (score_qk, a8w8_blockscale) pass no
 shape flag at all, so each UT sweeps the range its owner maintains. The
@@ -258,7 +259,9 @@ and reports one rank:
     mla_decode   test_mla_decode_pagesize64.test_mla at -n 128,1: Q fp8
                  [batch, 128, 576], page64 kv-shuffled fp8 KV, 256..24K context.
     mla_prefill  test_fmha_fwd_with_sink_varlen_asm's perf case: causal,
-                 128 heads, qk 192 / v 128, bf16, 1024-token sequences.
+                 128 heads, qk 192 / v 128, bf16. "packed" rows sweep the step
+                 size over 1024-token sequences; "seq_len" rows sweep the
+                 per-sequence length 256..64K at a ~16K-token step.
 
 ``a16w16`` is not one of them: it uses the DSv4 shape grid below and lets the
 global tuned GEMM table select the backend for every shape. A missing row uses
@@ -654,10 +657,44 @@ _DSR1_MLA_DECODE_CTX = (256, 512, 1024, 2048, 4096, 8192, 16384, 24576)
 # token (bf16 staging, fp8 cache and reference, fp32 reference copy), ~200 GB
 # here; twice that no longer fits one GPU.
 _DSR1_MLA_DECODE_MAX_KV_TOKENS = 32 * 1024 * 1024
-# One prefill step, up to the recipe's max_num_batched_tokens (12288) and one
-# tier past it, packed as 1024-token sequences.
+# Two prefill sweeps. "packed": one step of T tokens, up to the recipe's
+# max_num_batched_tokens (12288) and one tier past it, as 1024-token sequences
+# (MLPerf ISL mean 804). "seq_len": the per-sequence length L, which sets causal
+# attention's work (sum of L^2) at a fixed ~16K-token step; 3072 is about the
+# longest MLPerf prompt, 32K/64K are single long sequences past the workload.
 _DSR1_MLA_PREFILL_TOKENS = _tokens((1024, 2048, 4096, 8192, 12288, 16384))
 _DSR1_MLA_PREFILL_SEQ_LEN = 1024
+_DSR1_MLA_PREFILL_SEQ_LENS = (
+    256,
+    512,
+    1024,
+    2048,
+    3072,
+    4096,
+    8192,
+    16384,
+    32768,
+    65536,
+)
+_DSR1_MLA_PREFILL_STEP = 16384
+
+
+def _dsr1_prefill_cases():
+    """(scenario, seq_len, seqlens) for both prefill sweeps, duplicates dropped."""
+    cases, seen = [], set()
+    seq = _DSR1_MLA_PREFILL_SEQ_LEN
+    for tokens in _DSR1_MLA_PREFILL_TOKENS:
+        seqlens = [seq] * (tokens // seq) + ([tokens % seq] if tokens % seq else [])
+        cases.append(("packed", seq, seqlens))
+        seen.add(tuple(seqlens))
+    for seq_len in _DSR1_MLA_PREFILL_SEQ_LENS:
+        seqlens = [seq_len] * max(1, _DSR1_MLA_PREFILL_STEP // seq_len)
+        if tuple(seqlens) not in seen:
+            cases.append(("seq_len", seq_len, seqlens))
+            seen.add(tuple(seqlens))
+    return cases
+
+
 _MLA_DECODE_KEEP = [
     "batch",
     "ctx_len",
@@ -671,8 +708,10 @@ _MLA_DECODE_KEEP = [
     "kernel",
 ]
 _MLA_PREFILL_KEEP = [
-    "tokens",
+    "scenario",
+    "seq_len",
     "num_seqs",
+    "tokens",
     "hdim_q",
     "hdim_v",
     "hq",
@@ -2514,16 +2553,22 @@ def run_mla_prefill(args):
     mod = _import_quietly("mla_prefill", table, "test_fmha_fwd_with_sink_varlen_asm")
     if mod is None:
         return
-    seq = _DSR1_MLA_PREFILL_SEQ_LEN
     rows = []
     with _silence(), torch.device("cuda"):
-        for tokens, init in itertools.product(_DSR1_MLA_PREFILL_TOKENS, inits):
-            seqlens = [seq] * (tokens // seq) + ([tokens % seq] if tokens % seq else [])
-            row = {"tokens": tokens, "num_seqs": len(seqlens)}
+        for (scenario, seq, seqlens), init in itertools.product(
+            _dsr1_prefill_cases(), inits
+        ):
+            tokens = sum(seqlens)
+            row = {
+                "scenario": scenario,
+                "seq_len": seq,
+                "num_seqs": len(seqlens),
+                "tokens": tokens,
+            }
             box = []
             try:
                 with _smi_case(
-                    f"mla_prefill/tokens={tokens}/seq={seq}/init={init}"
+                    f"mla_prefill/{scenario}/tokens={tokens}/seq={seq}/init={init}"
                 ), _capture() as box:
                     row.update(
                         mod.test_fmha_fwd_with_sink_varlen_asm_perf(
