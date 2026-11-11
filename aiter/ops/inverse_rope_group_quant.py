@@ -12,6 +12,7 @@ import torch
 from torch import Tensor
 
 from ..jit.core import compile_ops
+from ..plugin import route as _route
 from ..utility.dtypes import get_dtype_fp8
 
 # Mirrors aiter::ScaleLayout in csrc/include/inverse_rope_group_quant.h.
@@ -88,6 +89,7 @@ def scale_shape(
     return (s, num_groups, scale_groups)
 
 
+@_route(op="inverse_rope_group_quant", version=1)
 def inverse_rope_group_quant(
     o: Tensor,
     positions: Tensor,

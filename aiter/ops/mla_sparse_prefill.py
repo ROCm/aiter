@@ -814,6 +814,7 @@ def _mla_sparse_prefill_v41_fake(
 
 
 @torch_compile_guard(mutates_args=["out"], gen_fake=_mla_sparse_prefill_v41_fake)
+@_route(op="mla_sparse_prefill_v41", version=1)
 def mla_sparse_prefill_v41(
     q: torch.Tensor,
     q_scale: torch.Tensor,
