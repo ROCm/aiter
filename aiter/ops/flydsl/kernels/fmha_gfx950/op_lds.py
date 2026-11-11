@@ -347,14 +347,18 @@ class DualwaveFp8KvLdsToVgprLoader(DualwaveFp8KernelContext):
         def _run():
             packs = [[fx.Int64(0).ir_value()] * traits.D_CHUNKS for _ in range(4)]
             if full_tile:
-                packs = self._load_v_fp8_coalesced(buf_id, tile_start, mask_tail=False)
+                packs = self._load_v_fp8_coalesced(
+                    buf_id, tile_start, mask_tail=False, plain_lds=True
+                )
             else:
-                packs = self._load_v_fp8_coalesced(buf_id, tile_start)
+                packs = self._load_v_fp8_coalesced(buf_id, tile_start, plain_lds=True)
             return packs
 
         return _run()
 
-    def _load_v_fp8_coalesced(self, buf_id, tile_start, mask_tail=True):
+    def _load_v_fp8_coalesced(
+        self, buf_id, tile_start, mask_tail=True, plain_lds=False
+    ):
         traits = self.traits
         aligned_base = ((self.lds_vt_base_idx + 127) // 128) * 128
         tile_base = aligned_base + buf_id * traits.BLOCK_N * traits.HEAD_DIM_V
@@ -368,6 +372,12 @@ class DualwaveFp8KvLdsToVgprLoader(DualwaveFp8KernelContext):
             shuffled_v_layout(traits.HEAD_DIM_V),
         )
         source = thr_copy.partition_S(tile)
+        if const_expr(plain_lds):
+            vt_i8_ty = fx.PointerType.get(
+                fx.Int8.ir_type, fx.AddressSpace.Shared, alignment=16
+            )
+            vt_i8 = fx.recast_iter(vt_i8_ty, self.lds.kv.ptr)
+            vt_base_i32 = fx.Int32(self.lds_kv_base_idx)
         token_layout = shuffled_v_tokens()
         masks = []
         if const_expr(mask_tail):
@@ -391,9 +401,22 @@ class DualwaveFp8KvLdsToVgprLoader(DualwaveFp8KernelContext):
         packs = [[None] * traits.D_CHUNKS for _ in range(4)]
         for dc in range_constexpr(traits.D_CHUNKS):
             for half in range_constexpr(2):
-                fragment = fx.make_rmem_tensor(16, fx.Float8E4M3FN)
-                fx.copy(copy_atom, source[(None, half), dc, 0], fragment)
-                words = Vec(fragment.load()).bitcast(fx.Int32)
+                if const_expr(plain_lds):
+                    # A plain ds_read_b128: the copy-atom load makes the waitcnt pass hold V's reads behind the
+                    # next tile's DMA (vmcnt(0)) though they read the slot the loop-top wait already published.
+                    v_addr = fx.Int32(
+                        fx.ptrtoint(fx.get_iter(source[(None, half), dc, 0]))
+                    )
+                    words = Vec(
+                        fx.ptr_load(
+                            fx.add_offset(vt_i8, v_addr - vt_base_i32),
+                            result_type=Vec.make_type(4, fx.Int32),
+                        )
+                    )
+                else:
+                    fragment = fx.make_rmem_tensor(16, fx.Float8E4M3FN)
+                    fx.copy(copy_atom, source[(None, half), dc, 0], fragment)
+                    words = Vec(fragment.load()).bitcast(fx.Int32)
                 if const_expr(mask_tail):
                     # Integer masks remove invalid bytes without sanitizing valid NaNs.
                     words = words & Vec.from_elements(
