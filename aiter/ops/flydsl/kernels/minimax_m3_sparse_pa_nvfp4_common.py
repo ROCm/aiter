@@ -3,8 +3,9 @@
 
 """Shared pieces of the MiniMax-M3 NVFP4 sparse paged-attention kernels (FlyDSL, gfx950).
 
-The page layout, the MFMA mapping and the conversion / softmax helpers the kernels share
-(the decode kernel today; a prefill kernel reads the same page).
+Both kernels (decode and prefill) read the same single-buffer K/V page and share the
+MFMA mapping, so the page loader, the exact dequantization and the softmax helpers
+live here.
 
 Page layout (128 tokens, ``2 * Hkv * 9216`` bytes; the global fp32 k / v scales are
 NOT in the page). ``[K side | V side]``; a side is ``Hkv x 8192 B`` of e2m1 data
@@ -33,11 +34,15 @@ import flydsl.expr as fx
 from flydsl._mlir import ir as _ir
 from flydsl._mlir.dialects import arith as _arith
 from flydsl._mlir.dialects import llvm as _llvm
+from flydsl.expr import range_constexpr
 from flydsl.expr.typing import T
 from flydsl.expr.typing import Vector as Vec
 
+from aiter.ops.flydsl.kernels import buffer_ops
+
 BLK = 128  # tokens per page == sparse block
 D = 128
+HG = 16  # MFMA N: query heads of one kv head (group 8 runs with half the lanes masked)
 NW = 4
 KPW = BLK // NW  # keys per wave and block
 NDT = D // 16  # d-tiles of O^T
@@ -169,3 +174,90 @@ def mfma_f16(a4, b4, acc):
             Vec.make_type(4, fx.Float32), [a, b, acc, 0, 0, 0]
         )
     )
+
+
+def page_loader(arg_cache, page_bytes, kvh, hkv, w, n, g):
+    """Returns ``load(page) -> RAW dwords`` of this lane's share of a page.
+
+    raw[0:4], raw[4:8]  K data of key rows st = 0, 1 (dims 32 g .. 32 g + 31)
+    raw[8]              K scale bytes [st][group] of those rows
+    raw[9:17]           V data, dword dt = 8 keys (8 g .. 8 g + 7) of dim 8 n + dt
+    raw[17:19]          V scale bytes of keys 8 g .. 8 g + 7, dim group n // 2
+    """
+    side_b = hkv * HEAD_B
+    k_data = kvh * DATA_B
+    k_scl = hkv * DATA_B + kvh * SCALE_B
+    v_data = side_b + kvh * DATA_B
+    v_scl = side_b + hkv * DATA_B + kvh * SCALE_B
+    k_rows = [w * KPW + 8 * (n // 4) + 4 * st + n % 4 for st in range_constexpr(2)]
+    k_load = [(k_data + r * (D // 2) + g * 16) // 4 for r in k_rows]
+    k_scale_load = (k_scl + ((w * 4 + g) * 16 + n) * 4) // 4
+    v_load = (v_data + ((w * 4 + g) * BLK + 8 * n) * 4) // 4
+    v_scale_load = (v_scl + (n // 2) * BLK + w * KPW + 8 * g) // 4
+
+    def load(page):
+        pr = buffer_ops.create_buffer_resource_from_addr(
+            arg_cache + fx.Int64(page) * fx.Int64(page_bytes),
+            num_records_bytes=page_bytes,
+        )
+        raw = []
+        for st in range_constexpr(2):
+            kd = fx.Vector(
+                buffer_ops.buffer_load(pr, k_load[st], vec_width=4, dtype=fx.Int32)
+            )
+            raw += [kd[i] for i in range_constexpr(4)]
+        raw.append(
+            fx.Int32(
+                buffer_ops.buffer_load(pr, k_scale_load, vec_width=1, dtype=fx.Int32)
+            )
+        )
+        for h in range_constexpr(2):
+            vd = fx.Vector(
+                buffer_ops.buffer_load(pr, v_load + 4 * h, vec_width=4, dtype=fx.Int32)
+            )
+            raw += [vd[i] for i in range_constexpr(4)]
+        vs = fx.Vector(
+            buffer_ops.buffer_load(pr, v_scale_load, vec_width=2, dtype=fx.Int32)
+        )
+        raw += [vs[i] for i in range_constexpr(2)]
+        return raw
+
+    return load
+
+
+def dequant_page(raw):
+    """K frags ``kf[st][ks]`` (A operands of S^T) and V^T frags ``vf[dt]`` in f16.
+
+    Each is cvt(e2m1 pair) * scale pair: one convert and one packed multiply per two
+    elements, and the product is exact in f16."""
+    kf = []
+    for st in range_constexpr(2):
+        ksc = cvt_fp8x2_f16(raw[8], st == 1)  # [group 2g, group 2g + 1] of row st
+        row = []
+        for ks in range_constexpr(NKS):
+            sv = Vec.from_elements([ksc[ks // 2], ksc[ks // 2]], fx.Float16)
+            row.append(
+                Vec.from_elements(
+                    [
+                        (cvt_fp4x2_f16(raw[st * 4 + ks], i) * sv).bitcast(fx.Int32)[0]
+                        for i in range_constexpr(4)
+                    ],
+                    fx.Int32,
+                )
+            )
+        kf.append(row)
+    vs = []
+    for h in range_constexpr(2):
+        vs += [cvt_fp8x2_f16(raw[17 + h], False), cvt_fp8x2_f16(raw[17 + h], True)]
+    # A V byte holds two consecutive keys: already the operand's f16 pair.
+    vf = [
+        Vec.from_elements(
+            [
+                (cvt_fp4x2_f16(raw[9 + dt], i) * vs[i]).bitcast(fx.Int32)[0]
+                for i in range_constexpr(4)
+            ],
+            fx.Int32,
+        )
+        for dt in range_constexpr(NDT)
+    ]
+    return kf, vf
