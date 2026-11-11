@@ -410,6 +410,49 @@ def _v4_rope_full(x, cos, sin, lane, WIDTH: tl.constexpr):
 
 
 @triton.jit
+def _v4_hca_write_index_list(
+    t,
+    swa_ptr,
+    swa_indptr_ptr,
+    comp_ptr,
+    comp_indptr_ptr,
+    dst_ptr,
+    dst_indptr_ptr,
+    num_tokens,
+    block_rows,
+    swa_base,
+    comp_base,
+    SWA_PAGE: tl.constexpr,
+    COMP_PAGE: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    """Token ``t`` of a segment: its [SWA | compressed] slots as record-grid
+    rows ``base + (slot // page) * block_rows + slot % page``, at
+    ``swa_indptr[t] + comp_indptr[t]``, plus that indptr entry."""
+    s0 = tl.load(swa_indptr_ptr + t)
+    s1 = tl.load(swa_indptr_ptr + t + 1)
+    c0 = tl.load(comp_indptr_ptr + t)
+    c1 = tl.load(comp_indptr_ptr + t + 1)
+    out0 = s0 + c0
+    tl.store(dst_indptr_ptr + t, out0)
+    if t == num_tokens - 1:
+        tl.store(dst_indptr_ptr + num_tokens, s1 + c1)
+    for i in range(0, s1 - s0, BLOCK):
+        off = i + tl.arange(0, BLOCK)
+        m = off < s1 - s0
+        slot = tl.load(swa_ptr + s0 + off, mask=m, other=0)
+        row = swa_base + (slot // SWA_PAGE) * block_rows + slot % SWA_PAGE
+        tl.store(dst_ptr + out0 + off, row, mask=m)
+    out1 = out0 + (s1 - s0)
+    for i in range(0, c1 - c0, BLOCK):
+        off = i + tl.arange(0, BLOCK)
+        m = off < c1 - c0
+        slot = tl.load(comp_ptr + c0 + off, mask=m, other=0)
+        row = comp_base + (slot // COMP_PAGE) * block_rows + slot % COMP_PAGE
+        tl.store(dst_ptr + out1 + off, row, mask=m)
+
+
+@triton.jit
 def _fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert_kernel(
     q_in_ptr,  # [T, num_heads_q, HEAD] bf16
     q_out_ptr,  # [T, padded_heads, HEAD] bf16
@@ -452,10 +495,22 @@ def _fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert_kernel(
     HCA_SWA_PAGE: tl.constexpr,
     HCA_COMP_PAGE: tl.constexpr,
     HCA_BLOCK: tl.constexpr,
+    hcp_swa_ptr,  # prefill segment: same layout, its own tokens
+    hcp_swa_indptr_ptr,
+    hcp_comp_ptr,
+    hcp_comp_indptr_ptr,
+    hcp_dst_ptr,
+    hcp_dst_indptr_ptr,
+    hcp_num_tokens,
+    hcp_token_offset,  # batch row of the segment's first token
+    COPY_HCA_KV_INDICES_PREFILL: tl.constexpr,
+    HCP_SLOT: tl.constexpr,
 ):
     """One program per (token, slot); slot == padded_heads is the KV row and,
     with COPY_HCA_KV_INDICES, slot == padded_heads + 1 writes the token's HCA
-    sparse-attention index list.
+    sparse-attention index list (decode segment). With
+    COPY_HCA_KV_INDICES_PREFILL, slot == HCP_SLOT does the same for the
+    prefill segment, whose tokens start at batch row hcp_token_offset.
 
     Padding slots zero-fill every Q output. That is a correctness requirement,
     not tidiness: an unwritten scale byte of 0xFF is E8M0 NaN, and the decode
@@ -477,35 +532,43 @@ def _fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert_kernel(
     if COPY_HCA_KV_INDICES:  # noqa: SIM102 -- constexpr, prunes the branch
         if h == padded_heads + 1:
             if tok < hca_num_tokens:
-                s0 = tl.load(hca_swa_indptr_ptr + tok)
-                s1 = tl.load(hca_swa_indptr_ptr + tok + 1)
-                c0 = tl.load(hca_comp_indptr_ptr + tok)
-                c1 = tl.load(hca_comp_indptr_ptr + tok + 1)
-                out0 = s0 + c0
-                tl.store(hca_dst_indptr_ptr + tok, out0)
-                if tok == hca_num_tokens - 1:
-                    tl.store(hca_dst_indptr_ptr + hca_num_tokens, s1 + c1)
-                for i in range(0, s1 - s0, HCA_BLOCK):
-                    off = i + tl.arange(0, HCA_BLOCK)
-                    m = off < s1 - s0
-                    slot = tl.load(hca_swa_ptr + s0 + off, mask=m, other=0)
-                    row = (
-                        hca_swa_base
-                        + (slot // HCA_SWA_PAGE) * hca_block_rows
-                        + slot % HCA_SWA_PAGE
-                    )
-                    tl.store(hca_dst_ptr + out0 + off, row, mask=m)
-                out1 = out0 + (s1 - s0)
-                for i in range(0, c1 - c0, HCA_BLOCK):
-                    off = i + tl.arange(0, HCA_BLOCK)
-                    m = off < c1 - c0
-                    slot = tl.load(hca_comp_ptr + c0 + off, mask=m, other=0)
-                    row = (
-                        hca_comp_base
-                        + (slot // HCA_COMP_PAGE) * hca_block_rows
-                        + slot % HCA_COMP_PAGE
-                    )
-                    tl.store(hca_dst_ptr + out1 + off, row, mask=m)
+                _v4_hca_write_index_list(
+                    tok,
+                    hca_swa_ptr,
+                    hca_swa_indptr_ptr,
+                    hca_comp_ptr,
+                    hca_comp_indptr_ptr,
+                    hca_dst_ptr,
+                    hca_dst_indptr_ptr,
+                    hca_num_tokens,
+                    hca_block_rows,
+                    hca_swa_base,
+                    hca_comp_base,
+                    HCA_SWA_PAGE,
+                    HCA_COMP_PAGE,
+                    HCA_BLOCK,
+                )
+            return
+    if COPY_HCA_KV_INDICES_PREFILL:  # noqa: SIM102 -- constexpr, prunes the branch
+        if h == HCP_SLOT:
+            t_p = tok - hcp_token_offset
+            if (t_p >= 0) & (t_p < hcp_num_tokens):
+                _v4_hca_write_index_list(
+                    t_p,
+                    hcp_swa_ptr,
+                    hcp_swa_indptr_ptr,
+                    hcp_comp_ptr,
+                    hcp_comp_indptr_ptr,
+                    hcp_dst_ptr,
+                    hcp_dst_indptr_ptr,
+                    hcp_num_tokens,
+                    hca_block_rows,
+                    hca_swa_base,
+                    hca_comp_base,
+                    HCA_SWA_PAGE,
+                    HCA_COMP_PAGE,
+                    HCA_BLOCK,
+                )
             return
     d = tl.arange(0, HEAD)
     half: tl.constexpr = ROPE // 2
