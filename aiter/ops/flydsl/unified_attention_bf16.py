@@ -437,16 +437,31 @@ def _unified_attention_varlen(
         num_cu = torch.cuda.get_device_properties(dev).multi_processor_count
         capacity = _plan_capacity(pseudo, num_kv_heads, num_cu)
         capacity += int(os.environ.get("PP_VL_EXTRA", "0"))
+        # With a slot per pseudo-sequence the batch already fills the CUs:
+        # one task each, written straight to out, and no reducer.
+        direct = capacity == pseudo and out.stride() == (
+            q.shape[1] * _VALUE_DIM,
+            _VALUE_DIM,
+            1,
+        )
+        # Otherwise spare slots go to the longest rows: a row has at most one
+        # task plus the slots beyond the live rows, of which there are at least
+        # ceil(tokens / b).
+        max_partitions = (
+            1
+            if direct
+            else min(num_cu, capacity - -(-num_tokens // _QUERY_BLOCK) + 1)
+        )
         need = {
             "query_map": (pseudo * 4, torch.int32),
             "context_lengths": (pseudo, torch.int32),
             "work_info": (capacity * 4, torch.int32),
             "reduce_info": (pseudo * 2, torch.int32),
-            **_partial_need(num_kv_heads, capacity, rows),
+            **({} if direct else _partial_need(num_kv_heads, capacity, rows)),
         }
         workspace = _workspace(
             q,
-            "varlen",
+            "varlen_direct" if direct else "varlen",
             need,
             f"{num_seqs} sequences, {num_tokens} query tokens",
             explicit,
@@ -464,20 +479,29 @@ def _unified_attention_varlen(
             work_info=workspace["work_info"][: capacity * 4].view(capacity, 4),
             reduce_info=workspace["reduce_info"][: pseudo * 2].view(pseudo, 2),
             num_kv_heads=num_kv_heads,
-            max_partitions=num_cu,
+            max_partitions=max_partitions,
             query_length=_QUERY_BLOCK,
             max_batch_size=pseudo,
         )
         plan_pa_decode(
             context_lengths, num_kv_heads, query_length=_QUERY_BLOCK, plan=plan
         )
-        shape = (num_kv_heads, capacity, rows)
-        scalars = shape[0] * shape[1] * shape[2]
-        pmax = workspace["max_logits"][:scalars].view(shape)
-        psum = workspace["exp_sums"][:scalars].view(shape)
-        pout = workspace["temporary_output"][: scalars * _VALUE_DIM].view(
-            *shape, _VALUE_DIM
-        )
+        no_scale = flyc.from_c_void_p(fx.Float32, 0)
+        if direct:
+            partials = (no_scale, no_scale, flyc.from_c_void_p(fx.BFloat16, 0))
+        else:
+            shape = (num_kv_heads, capacity, rows)
+            scalars = shape[0] * shape[1] * shape[2]
+            pmax = workspace["max_logits"][:scalars].view(shape)
+            psum = workspace["exp_sums"][:scalars].view(shape)
+            pout = workspace["temporary_output"][: scalars * _VALUE_DIM].view(
+                *shape, _VALUE_DIM
+            )
+            partials = (
+                ptr_arg(pmax, fx.Float32),
+                ptr_arg(psum, fx.Float32),
+                ptr_arg(pout, fx.BFloat16),
+            )
         compiled = compile_pa_decode_pingpong(
             head_dim=_HEAD_DIM,
             value_dim=_VALUE_DIM,
@@ -489,19 +513,17 @@ def _unified_attention_varlen(
             # first CTAs the two longest (15-60% slower on prefill steps).
             pair_ctas=0,
             varlen=True,
+            direct_output=direct,
         )
         stream = torch.cuda.current_stream(dev)
-        no_scale = flyc.from_c_void_p(fx.Float32, 0)
         _run_compiled(
             compiled["launch"],
-            ptr_arg(pmax, fx.Float32),
-            ptr_arg(psum, fx.Float32),
-            ptr_arg(pout, fx.BFloat16),
+            *partials,
             ptr_arg(q, fx.BFloat16),
             ptr_arg(k, fx.BFloat16),
             ptr_arg(v, fx.BFloat16),
             ptr_arg(block_table, fx.Int32),
-            no_scale,
+            ptr_arg(out, fx.BFloat16) if direct else no_scale,
             no_scale,
             int(block_table.shape[1]),
             pseudo,
@@ -515,6 +537,8 @@ def _unified_attention_varlen(
             ptr_arg(query_map, fx.Int32),
             stream,
         )
+        if direct:
+            return out
         # Pseudo-sequence p writes rows query_map[p, 0] + [0, valid) of out; the
         # view supplies the batch and head geometry, and fits short outputs.
         output = out.as_strided(
@@ -539,9 +563,8 @@ def _unified_attention_varlen(
             query_seq_len=_QUERY_BLOCK,
             query_group_size=group,
             head_size=_VALUE_DIM,
-            # Every sequence owns at least one of the capacity's task slots.
             max_partitions=max(
-                1, min(num_cu, capacity - pseudo + 1, -(-int(max_seqlen_k) // 256))
+                1, min(max_partitions, -(-int(max_seqlen_k) // 256))
             ),
             stream=stream,
             reduce_info=plan.reduce_info,

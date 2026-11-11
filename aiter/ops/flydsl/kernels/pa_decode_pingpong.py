@@ -186,6 +186,7 @@ def compile_pa_decode_pingpong(
     window=0,
     sink_dtype=None,
     seq_query_length=0,
+    direct_output=False,
 ):
     """``pair_ctas`` > 0 gives each CTA two adjacent work slots.
 
@@ -201,6 +202,10 @@ def compile_pa_decode_pingpong(
     block-table row, valid queries, unused) per work-info sequence; queries at
     or past the valid count repeat the last one and the reducer drops them.
     Without it sequence s owns query rows [s * QLEN, (s + 1) * QLEN).
+
+    ``direct_output`` (varlen, plans with one task per pseudo-sequence) writes
+    normalized rows to a contiguous [tokens, heads, DV] output passed in the
+    launch's ``key_scale`` slot, so no reducer runs.
     """
     stages = stages or int(os.environ.get("PP_STAGES", "0"))
     prio = int(os.environ.get("PP_PRIO", "0"))
@@ -264,6 +269,7 @@ def compile_pa_decode_pingpong(
     QLEN = query_length
     ROWS = QLEN * GQA
     assert R * M * 16 >= ROWS, "layout must cover every query row"
+    DIRECT = bool(direct_output) and bool(varlen) and not window
     key = (
         D,
         DV,
@@ -298,6 +304,7 @@ def compile_pa_decode_pingpong(
         sink_dtype,
         seq_query_length,
         OAUX,
+        DIRECT,
     )
     if key in _CACHE:
         return _CACHE[key]
@@ -367,6 +374,8 @@ def compile_pa_decode_pingpong(
         v_swizzle = lambda t: (t & 7) << 1
     if varlen:
         kernel_name += "_varlen"
+    if DIRECT:
+        kernel_name += "_direct"
     if window:
         kernel_name += f"_sw{window}" + (f"_sink{sink_dtype}" if sink_dtype else "")
     SPLIT = max(seq_query_length // query_length, 1) if window and not varlen else 1
@@ -1773,7 +1782,7 @@ def compile_pa_decode_pingpong(
                 _uni64(buf_base_i64(pout_ptr) + fx.Int64(partial) * (ROWS * DV * 2)),
                 num_records_bytes=ROWS * DV * 2,
             )
-            if const_expr(window):
+            if const_expr(window or DIRECT):
                 # The sequence's valid query rows of out; padded rows drop.
                 row_bytes = n_kv * (GQA * DV * 2)
                 pout_rs = create_buffer_resource_from_addr(
@@ -1829,7 +1838,7 @@ def compile_pa_decode_pingpong(
                 inv = (lt > zero).select(fx.Float32(rcp_f32(lt)), zero)
                 wb = [fx.full(4, w * inv, fx.Float32) for w in ws]
                 row = queries[m] * GQA + l16
-                if const_expr(window):
+                if const_expr(window or DIRECT):
                     # Row of query q, head h in out [tokens, KV heads * GQA, DV].
                     row = (queries[m] * n_kv + kv_h) * GQA + l16
                 for nb in range_constexpr(NB):
@@ -1848,7 +1857,7 @@ def compile_pa_decode_pingpong(
                         soff,
                         aux=_aux(OAUX),
                     )
-                if const_expr(not window):
+                if const_expr(not (window or DIRECT)):
                     mlir_rocdl.raw_ptr_buffer_store(
                         fx.Float32(mm * fx.Float32(1.0 / LOG2E)).ir_value(),
                         pmax_rs,
@@ -1886,6 +1895,16 @@ def compile_pa_decode_pingpong(
                 fx.Float32,
             )
             row = rb * (M * 16) + n32
+            out_row = row
+            if const_expr(DIRECT):
+                row_bytes = n_kv * (GQA * DV * 2)
+                pout_rs = create_buffer_resource_from_addr(
+                    _uni64(
+                        buf_base_i64(out_ptr) + fx.Int64(first_row) * fx.Int64(row_bytes)
+                    ),
+                    num_records_bytes=fx.Int64(_uni(valid * row_bytes)),
+                )
+                out_row = (row // GQA * n_kv + kv_h) * GQA + row % GQA
             for dblk in range_constexpr(SNB):
                 o = final[2 + dblk]
                 for j in range_constexpr(4):
@@ -1896,26 +1915,27 @@ def compile_pa_decode_pingpong(
                         (part * inv).to(fx.BFloat16).ir_value(),
                         pout_rs,
                         fx.Int32(
-                            (row * DV + dblk * 32 + 8 * j + 4 * h32) * 2
+                            (out_row * DV + dblk * 32 + 8 * j + 4 * h32) * 2
                         ).ir_value(),
                         soff,
                         aux=_aux(0),
                     )
-            # Both lane halves hold the row's m and l; duplicate stores agree.
-            mlir_rocdl.raw_ptr_buffer_store(
-                fx.Float32(final[0] * fx.Float32(scale_log2 / LOG2E)).ir_value(),
-                pmax_rs,
-                fx.Int32(row * 4).ir_value(),
-                soff,
-                aux=_aux(0),
-            )
-            mlir_rocdl.raw_ptr_buffer_store(
-                fx.Float32(lt).ir_value(),
-                psum_rs,
-                fx.Int32(row * 4).ir_value(),
-                soff,
-                aux=_aux(0),
-            )
+            if const_expr(not DIRECT):
+                # Both lane halves hold the row's m and l; duplicate stores agree.
+                mlir_rocdl.raw_ptr_buffer_store(
+                    fx.Float32(final[0] * fx.Float32(scale_log2 / LOG2E)).ir_value(),
+                    pmax_rs,
+                    fx.Int32(row * 4).ir_value(),
+                    soff,
+                    aux=_aux(0),
+                )
+                mlir_rocdl.raw_ptr_buffer_store(
+                    fx.Float32(lt).ir_value(),
+                    psum_rs,
+                    fx.Int32(row * 4).ir_value(),
+                    soff,
+                    aux=_aux(0),
+                )
 
         if const_expr(mf32):
             store32()
@@ -1945,6 +1965,7 @@ def compile_pa_decode_pingpong(
         work_info_ptr: fx.Pointer,
         work_capacity: fx.Int32,
         query_map_ptr: fx.Pointer,
+        out_ptr: fx.Pointer,
     ):
         work = fx.recast_iter(fx.Int32, work_info_ptr)
 
@@ -1973,7 +1994,7 @@ def compile_pa_decode_pingpong(
                 fx.Int32(task[3]),
                 slot,
                 work_capacity,
-                pout_ptr,
+                out_ptr,
                 pout_ptr,
                 fx.Int32(0),
             )
@@ -2109,6 +2130,8 @@ def compile_pa_decode_pingpong(
                 work_info,
                 work_capacity,
                 query_map,
+                # Direct varlen output takes the unused key_scale slot.
+                key_scale,
                 **(
                     {
                         "value_attrs": {
