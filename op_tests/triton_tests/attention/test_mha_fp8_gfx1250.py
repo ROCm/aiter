@@ -174,7 +174,7 @@ def mla_inputs(q_lens, k_lens, hq, hk, seed):
 
 
 @torch.no_grad()
-def mla_torch(q, k, v, k_pe, q_lens, k_lens, causal):
+def mla_torch(q, k, v, k_pe, q_lens, k_lens, causal, scale=MLA_SCALE):
     """fp32 out [Tq, H, dv] and lse [H, Tq]; masks are bottom-right aligned."""
     hq, hk = q.shape[1], k.shape[1]
     k = torch.cat([k.float(), k_pe.float().expand(-1, hk, -1)], dim=-1)
@@ -184,7 +184,7 @@ def mla_torch(q, k, v, k_pe, q_lens, k_lens, causal):
     qs = ks = 0
     for lq, lk in zip(q_lens, k_lens):
         s = torch.einsum("qhd,khd->hqk", q[qs : qs + lq].float(), k[ks : ks + lk])
-        s = s * MLA_SCALE
+        s = s * scale
         if causal:
             rows = torch.arange(lq, device="cuda")[:, None] + (lk - lq)
             s = s.masked_fill(
@@ -200,12 +200,13 @@ def mla_torch(q, k, v, k_pe, q_lens, k_lens, causal):
 
 
 def check_mla(o, lse, ref_o, ref_lse):
-    """Rows without a visible key: o = 0 and lse = -inf."""
+    """Rows without a visible key: o = 0 and lse = -inf. lse None: check only o."""
     empty = torch.isinf(ref_lse)
-    assert torch.isinf(lse[empty]).all()
     assert (o.float().transpose(0, 1)[empty] == 0).all()
     torch.testing.assert_close(o.float(), ref_o, atol=8e-2, rtol=0)
-    torch.testing.assert_close(lse[~empty], ref_lse[~empty], atol=1e-2, rtol=0)
+    if lse is not None:
+        assert torch.isinf(lse[empty]).all()
+        torch.testing.assert_close(lse[~empty], ref_lse[~empty], atol=1e-2, rtol=0)
 
 
 @pytest.mark.parametrize(
@@ -221,7 +222,9 @@ def check_mla(o, lse, ref_o, ref_lse):
         (False, [512], [65536], 24, 24),  # split-KV
     ],
 )
-def test_mha_fp8_mla_varlen(causal, q_lens, k_lens, hq, hk):
+@pytest.mark.parametrize("return_lse", [True, False])
+def test_mha_fp8_mla_varlen(causal, q_lens, k_lens, hq, hk, return_lse):
+    """return_lse=False is the default path. It uses other kernel options."""
     if get_arch() != "gfx1250":
         pytest.skip("Only supported on gfx1250")
     q, k, v, k_pe = mla_inputs(q_lens, k_lens, hq, hk, seed=0)
@@ -236,9 +239,51 @@ def test_mha_fp8_mla_varlen(causal, q_lens, k_lens, hq, hk):
         max(k_lens),
         sm_scale=MLA_SCALE,
         causal=causal,
-        return_lse=True,
+        return_lse=return_lse,
     )
+    assert (lse is not None) == return_lse
     check_mla(o, lse, *mla_torch(q, k, v, k_pe, q_lens, k_lens, causal))
+
+
+@pytest.mark.parametrize("return_lse", [True, False])
+@pytest.mark.parametrize("zero", ["sm_scale", "q_scale"])
+@pytest.mark.parametrize("causal", [True, False])
+def test_mha_fp8_mla_varlen_zero_scale(causal, zero, return_lse):
+    """A zero softmax scale, or a zero q scale of a sequence, gives equal weights to
+    the visible keys. The result must not have NaN or Inf values."""
+    if get_arch() != "gfx1250":
+        pytest.skip("Only supported on gfx1250")
+    q_lens, k_lens, h = [300, 100], [500, 100], 8
+    q, k, v, k_pe = mla_inputs(q_lens, k_lens, h, h, seed=4)
+    q_scale = torch.ones((len(q_lens), h), dtype=torch.float32, device="cuda")
+    k_scale = torch.ones((len(k_lens), h), dtype=torch.float32, device="cuda")
+    v_scale = torch.ones((len(k_lens), h), dtype=torch.float32, device="cuda")
+    sm_scale = 0.0 if zero == "sm_scale" else MLA_SCALE
+    if zero == "q_scale":
+        q_scale[0] = 0.0
+    o, lse = mha_fwd_mla_varlen(
+        q,
+        k,
+        v,
+        k_pe,
+        _cu(q_lens),
+        _cu(k_lens),
+        max(q_lens),
+        max(k_lens),
+        q_scale=q_scale,
+        k_scale=k_scale,
+        v_scale=v_scale,
+        sm_scale=sm_scale,
+        causal=causal,
+        return_lse=return_lse,
+    )
+    seq_q = torch.repeat_interleave(
+        torch.arange(len(q_lens), device="cuda"), torch.tensor(q_lens, device="cuda")
+    )
+    q_ref = q.float() * q_scale[seq_q][..., None]
+    ref = mla_torch(q_ref, k, v, k_pe, q_lens, k_lens, causal, scale=sm_scale)
+    assert torch.isfinite(o.float()).all()
+    check_mla(o, lse, *ref)
 
 
 @pytest.mark.parametrize("causal", [True, False])
@@ -311,42 +356,41 @@ def test_mha_fp8_mla_varlen_scales(causal):
     check_mla(o, lse, *ref)
 
 
-def test_mha_fp8_mla_varlen_merge():
-    """A context pass (split-KV) merged in place with a causal new-token pass."""
+@pytest.mark.parametrize("context_first", [True, False])
+def test_mha_fp8_mla_varlen_merge(context_first):
+    """A context pass (split-KV) and a causal new-token pass, merged in place. The
+    second pass merges the result of the first one through o_init and lse_init."""
     if get_arch() != "gfx1250":
         pytest.skip("Only supported on gfx1250")
     q_lens, ctx_lens, h = [700, 300], [6000, 20000], 24
     q, k_new, v_new, kpe_new = mla_inputs(q_lens, q_lens, h, h, seed=1)
     _, k_ctx, v_ctx, kpe_ctx = mla_inputs(q_lens, ctx_lens, h, h, seed=2)
     cu_q, cu_ctx = _cu(q_lens), _cu(ctx_lens)
-    o, lse = mha_fwd_mla_varlen(
-        q,
-        k_ctx,
-        v_ctx,
-        kpe_ctx,
-        cu_q,
-        cu_ctx,
-        max(q_lens),
-        max(ctx_lens),
-        sm_scale=MLA_SCALE,
-        return_lse=True,
-    )
-    mha_fwd_mla_varlen(
-        q,
-        k_new,
-        v_new,
-        kpe_new,
-        cu_q,
-        cu_q,
-        max(q_lens),
-        max(q_lens),
-        sm_scale=MLA_SCALE,
-        causal=True,
-        out=o,
-        lse_out=lse,
-        o_init=o,
-        lse_init=lse,
-    )
+    passes = [
+        (k_ctx, v_ctx, kpe_ctx, cu_ctx, max(ctx_lens), False),
+        (k_new, v_new, kpe_new, cu_q, max(q_lens), True),
+    ]
+    if not context_first:
+        passes.reverse()
+    o = lse = None
+    for k, v, k_pe, cu_k, max_k, causal in passes:
+        o, lse = mha_fwd_mla_varlen(
+            q,
+            k,
+            v,
+            k_pe,
+            cu_q,
+            cu_k,
+            max(q_lens),
+            max_k,
+            sm_scale=MLA_SCALE,
+            causal=causal,
+            out=o,
+            lse_out=lse,
+            return_lse=True,
+            o_init=o,
+            lse_init=lse,
+        )
     # The same keys in one call: per sequence, the context keys then the new keys.
     k_all, v_all, kpe_all, k_lens = [], [], [], []
     for s in range(len(q_lens)):

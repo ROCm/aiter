@@ -6,6 +6,9 @@ launcher, the argument marshalling in ``mha_fwd``) and measure the kernel
 itself. Everything the timed callable touches is preallocated for the same
 reason -- nothing but the launch happens inside the graph.
 
+The mla_varlen variant uses ``RotatingBufferBench``: each captured call reads a
+different copy of the inputs, so the inputs are not in the cache.
+
 Usage:
     python bench_mha_fp8.py                          # default seqlen sweep
     python bench_mha_fp8.py --seqlen_q 4096 --batch 2
@@ -24,6 +27,9 @@ import torch
 import triton
 
 from aiter.ops.triton.attention.mha_fp8 import mha_fwd, mha_fwd_mla_varlen
+from op_tests.op_benchmarks.triton.utils.rotating_buffer_bench import (
+    RotatingBufferBench,
+)
 
 FP8_DTYPE = torch.float8_e4m3fn
 FP8_MAX = 448.0
@@ -82,24 +88,30 @@ def num_pairs(sq, sk, causal):
     return sq * sk
 
 
-def bench_mla_varlen_case(b, hq, hk, sq, sk, causal, rep, device):
+def bench_mla_varlen_case(b, hq, hk, sq, sk, causal, kernels_per_graph, device):
     """mha_fwd_mla_varlen on b sequences of sq queries and sk keys."""
     d, d_pe, dv = 128, 64, 128
-    q = torch.randn((b * sq, hq, d + d_pe), device=device, dtype=torch.float32)
-    q = q.to(FP8_DTYPE)
-    # k and v are views of one buffer and k_pe a view of the latent, as in vLLM.
-    kv = torch.randn((b * sk, hk, d + dv), device=device, dtype=torch.float32)
-    k, v = kv.to(FP8_DTYPE).split([d, dv], dim=-1)
-    latent = torch.randn((b * sk, 512 + d_pe), device=device, dtype=torch.float32)
-    k_pe = latent.to(FP8_DTYPE)[:, 512:].unsqueeze(1)
+
+    def make_inputs():
+        q = torch.randn((b * sq, hq, d + d_pe), device=device, dtype=torch.float32)
+        q = q.to(FP8_DTYPE)
+        # k and v are views of one buffer and k_pe a view of the latent, as in vLLM.
+        kv = torch.randn((b * sk, hk, d + dv), device=device, dtype=torch.float32)
+        k, v = kv.to(FP8_DTYPE).split([d, dv], dim=-1)
+        latent = torch.randn((b * sk, 512 + d_pe), device=device, dtype=torch.float32)
+        k_pe = latent.to(FP8_DTYPE)[:, 512:].unsqueeze(1)
+        o = torch.empty((b * sq, hq, dv), device=device, dtype=torch.bfloat16)
+        return q, k, v, k_pe, o
+
     cu_q = torch.arange(0, b + 1, device=device, dtype=torch.int32) * sq
     cu_k = torch.arange(0, b + 1, device=device, dtype=torch.int32) * sk
-    o = torch.empty((b * sq, hq, dv), device=device, dtype=torch.bfloat16)
+    bencher = RotatingBufferBench()
+    bencher.build_pool([make_inputs], [("q", "k", "v", "k_pe", "o")])
 
-    def run():
+    def run(q, k, v, k_pe, o):
         mha_fwd_mla_varlen(q, k, v, k_pe, cu_q, cu_k, sq, sk, causal=causal, out=o)
 
-    ms = triton.testing.do_bench_cudagraph(run, rep=rep)
+    ms = bencher.bench(run, kernels_per_graph=kernels_per_graph)
     flops = 2.0 * b * hq * num_pairs(sq, sk, causal) * (d + d_pe + dv)
     num_bytes = (
         b * sq * hq * (d + d_pe)
@@ -145,6 +157,12 @@ def main():
     parser.add_argument(
         "--rep", type=int, default=500, help="do_bench_cudagraph replay budget, in ms"
     )
+    parser.add_argument(
+        "--kernels_per_graph",
+        type=int,
+        default=100,
+        help="mla_varlen: calls in each RotatingBufferBench CUDA graph",
+    )
     args = parser.parse_args()
 
     assert torch.cuda.is_available(), "bench_mha.py needs a GPU"
@@ -173,7 +191,7 @@ def main():
             args.seqlen_q,
             seqlen_k,
             args.causal,
-            args.rep,
+            args.kernels_per_graph,
             device,
         )
         print(

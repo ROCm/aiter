@@ -1,10 +1,10 @@
 import torch
 import triton.experimental.gluon.language as gl
-import triton.language as tl
 from triton.experimental import gluon
 from triton.language.core import PropagateNan
 from triton.language.core import _aggregate as aggregate
 
+from aiter.ops.triton._gluon_kernels.common.utils import find_seq_idx
 from aiter.ops.triton.utils._triton.kernel_repr import make_kernel_repr
 from aiter.ops.triton.utils.common_utils import strip_annotate
 from aiter.ops.triton.utils.types import e4m3_dtype
@@ -1811,27 +1811,6 @@ def load_q(
             cache=cfg.Q_CACHE_MODIFIER,
         )
     return q
-
-
-@gluon.jit
-def find_seq_idx(
-    query_start_len_ptr,
-    target_idx,
-    num_seqs,
-    BLOCK_Q: gl.constexpr,
-    use_q_block_mode: tl.constexpr = True,
-):
-    left = 0
-    right = num_seqs
-    while left < right:
-        mid = (left + right) // 2
-        val = gl.load(query_start_len_ptr + mid)
-        mid_val = val // BLOCK_Q + mid if use_q_block_mode else val
-        if mid_val <= target_idx:
-            left = mid + 1
-        else:
-            right = mid
-    return left - 1
 
 
 unified_attention_gluon_kernel_2d_repr = make_kernel_repr(

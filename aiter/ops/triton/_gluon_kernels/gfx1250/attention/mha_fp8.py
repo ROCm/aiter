@@ -1,15 +1,16 @@
-import triton
 import triton.experimental.gluon.language as gl
 import triton.language as tl
 from triton.experimental import gluon
 from triton.language.extra.libdevice import fast_dividef
 
-from aiter.ops.triton._gluon_kernels.gfx1250.attention.unified_attention_2d import (
-    find_seq_idx,
-)
+from aiter.ops.triton._gluon_kernels.common.utils import find_seq_idx
 from aiter.ops.triton.utils._triton.kernel_repr import make_kernel_repr
 
 RCP_LN2 = gl.constexpr(1.4426950408889634)
+LN2 = gl.constexpr(0.6931471805599453)
+# A zero softmax scale gives equal weights. A smaller positive scale keeps that result
+# and keeps masked logits at -inf, where -inf * 0 would give NaN.
+MIN_SOFTMAX_SCALE = gl.constexpr(1e-30)
 
 
 @gluon.jit
@@ -945,6 +946,7 @@ def _mha_fwd_mla_varlen(
     else:
         sc = sm_scale
         o_scale = 1.0
+    sc = gl.maximum(sc, MIN_SOFTMAX_SCALE)
     qk_scale = sc * RCP_LN2
 
     offs_m = gl.arange(0, BLOCK_M, layout=gl.SliceLayout(1, L))
@@ -954,7 +956,7 @@ def _mha_fwd_mla_varlen(
     if HAS_INIT:
         lse_init = gl.load(lse_rows, mask=row_ok, other=float("-inf"))
         has_init = lse_init > float("-inf")
-        m_i = gl.where(has_init, lse_init / sc, float("-inf"))
+        m_i = gl.where(has_init, lse_init * RCP_LN2, float("-inf"))
         l_i = gl.where(has_init, 1.0, 0.0)
         o_init = gl.load(
             o_ptr
@@ -973,7 +975,6 @@ def _mha_fwd_mla_varlen(
     tdm_load_k(k_pe_desc, k_pe_smem, tb, BLOCK_N, PE_DIM, 1, 0, tb < te)
     tdm_load_v(v_desc, v_smem, tb, BLOCK_N, HEAD_DIM_V, 1, 0, tb < te)
     if tb < te:
-        m_i = m_i * qk_scale
         acc0, acc1 = split_subtile(acc)
         tdm_load_k(k_desc, k_smem, tb + 1, BLOCK_N, HEAD_DIM, 1, 1, tb + 1 < te)
         tdm_load_k(k_pe_desc, k_pe_smem, tb + 1, BLOCK_N, PE_DIM, 1, 1, tb + 1 < te)
@@ -1234,7 +1235,6 @@ def _mha_fwd_mla_varlen(
             p_quant = gl.convert_layout(p.to(v_ptr.type.element_ty), PL)
             acc0 = gl.amd.gfx1250.wmma(p_quant, v0, acc0)
             acc1 = gl.amd.gfx1250.wmma(p_quant, v1, acc1)
-        m_i = m_i / qk_scale
         acc = concat_subtile(acc0, acc1)
     gl.amd.gfx1250.tdm.async_wait(0)
 
@@ -1259,65 +1259,5 @@ def _mha_fwd_mla_varlen(
     gl.amd.gfx1250.tdm.async_store(o_desc, [0, 0], o_smem)
     gl.amd.gfx1250.tdm.async_wait(0)
     if RETURN_LSE:
-        lse = gl.where(l_i == 0.0, float("-inf"), m_i * sc + gl.log(l_safe))
+        lse = gl.where(l_i == 0.0, float("-inf"), m_i * LN2 + gl.log(l_safe))
         gl.store(lse_rows + split * stride_lse_s, lse, mask=row_ok)
-
-
-_mla_varlen_reduce_repr = make_kernel_repr(
-    "_mla_varlen_reduce", ["HEAD_DIM", "NUM_SPLITS", "RETURN_LSE", "HAS_INIT"]
-)
-
-
-@triton.jit(repr=_mla_varlen_reduce_repr)
-def _mla_varlen_reduce(
-    o_part_ptr,
-    lse_part_ptr,
-    o_ptr,
-    lse_ptr,
-    stride_op_s,
-    stride_op_t,
-    stride_op_h,
-    stride_lp_s,
-    stride_lp_h,
-    stride_o_t,
-    stride_o_h,
-    stride_lse_h,
-    stride_lse_t,
-    HEAD_DIM: tl.constexpr,
-    NUM_SPLITS: tl.constexpr,
-    RETURN_LSE: tl.constexpr,
-    HAS_INIT: tl.constexpr,
-):
-    """Reduces the split-KV partials of one (token, head)"""
-    t = tl.program_id(0).to(tl.int64)
-    h = tl.program_id(1).to(tl.int64)
-    offs = tl.arange(0, HEAD_DIM)
-    splits = tl.arange(0, NUM_SPLITS)
-    lse = tl.load(lse_part_ptr + splits * stride_lp_s + h * stride_lp_h + t)
-    o = tl.load(
-        o_part_ptr
-        + splits[:, None] * stride_op_s
-        + t * stride_op_t
-        + h * stride_op_h
-        + offs[None, :]
-    )
-    m = tl.max(lse, 0)
-    if HAS_INIT:
-        lse_init = tl.load(lse_ptr + h * stride_lse_h + t * stride_lse_t)
-        m = tl.maximum(m, lse_init)
-    m = tl.where(m == float("-inf"), 0.0, m)
-    w = tl.exp(lse - m)
-    w_sum = tl.sum(w, 0)
-    o = tl.sum(o * w[:, None], 0)
-    if HAS_INIT:
-        w_init = tl.exp(lse_init - m)
-        o_init = tl.load(o_ptr + t * stride_o_t + h * stride_o_h + offs)
-        o += w_init * o_init.to(tl.float32)
-        w_sum += w_init
-    o = o / tl.where(w_sum == 0.0, 1.0, w_sum)
-    tl.store(
-        o_ptr + t * stride_o_t + h * stride_o_h + offs, o.to(o_ptr.dtype.element_ty)
-    )
-    if RETURN_LSE:
-        lse = tl.where(w_sum == 0.0, float("-inf"), m + tl.log(w_sum))
-        tl.store(lse_ptr + h * stride_lse_h + t * stride_lse_t, lse)

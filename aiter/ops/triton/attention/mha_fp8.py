@@ -8,8 +8,8 @@ import triton.experimental.gluon.language as gl
 from aiter.ops.triton._gluon_kernels.gfx1250.attention.mha_fp8 import (
     _mha_fwd_mla_varlen,
     _mha_fwd_subtiled,
-    _mla_varlen_reduce,
 )
+from aiter.ops.triton.attention.utils import lse_merge
 from aiter.ops.triton.utils._triton.arch_info import get_arch
 from aiter.ops.triton.utils.config_utils import load_config_json, resolve_config_dir
 from aiter.ops.triton.utils.device_info import get_num_sms
@@ -283,6 +283,8 @@ def mha_fwd_mla_varlen(
     cu_seqlens_q, cu_seqlens_k: [B + 1] int32 start offsets of the sequences.
     q_scale:   optional [B, HQ] fp32 dequant scales; k_scale and v_scale [B, HK].
                Give all three scales or none. None means a scale of 1.
+    sm_scale:  softmax scale, 192 ** -0.5 by default. It must not be negative. A zero
+               scale (also from a zero q or k scale) gives equal weights to the keys.
     causal:    causal mask aligned to the bottom-right corner of each sequence.
     out:       optional [total_q, HQ, dv] output; bf16 by default.
     lse_out:   optional [HQ, total_q] fp32 natural-log LSE; return_lse allocates one.
@@ -300,6 +302,9 @@ def mha_fwd_mla_varlen(
     assert q.shape[2] == 192 and k.shape[2] == 128 and k_pe.shape[2] == 64
     assert head_dim_v in (64, 128) and v.stride() == k.stride()
     assert k_pe.shape[1] in (1, num_k_heads) and num_heads % num_k_heads == 0
+    if sm_scale is None:
+        sm_scale = q.shape[-1] ** -0.5
+    assert sm_scale >= 0, "sm_scale must be a number that is not negative"
     has_scales = q_scale is not None
     assert (k_scale is not None) == has_scales and (v_scale is not None) == has_scales
     if has_scales:
@@ -332,14 +337,19 @@ def mha_fwd_mla_varlen(
     else:
         qblk_per_seq = 0
     if num_splits > 1:
+        # One partial per split. lse_merge also merges o_init as one more partial.
+        num_parts = num_splits + (o_init is not None)
         o_k = torch.empty(
-            (num_splits, total_q, num_heads, head_dim_v),
+            (num_parts, total_q, num_heads, head_dim_v),
             dtype=torch.float32,
             device=q.device,
         )
         lse_k = torch.empty(
-            (num_splits, num_heads, total_q), dtype=torch.float32, device=q.device
+            (num_parts, num_heads, total_q), dtype=torch.float32, device=q.device
         )
+        if o_init is not None:
+            o_k[num_splits].copy_(out)
+            lse_k[num_splits].copy_(lse_out)
     else:
         o_k = out.unsqueeze(0)
         lse_k = (out if lse_out is None else lse_out).unsqueeze(0)
@@ -371,7 +381,7 @@ def mha_fwd_mla_varlen(
         lse_k.stride(0),
         *(q_scale.stride() if has_scales else (0, 0)),
         *(k_scale.stride() if has_scales else (0, 0)),
-        q.shape[-1] ** -0.5 if sm_scale is None else sm_scale,
+        sm_scale,
         num_seqs,
         num_heads,
         num_heads // num_k_heads,
@@ -397,25 +407,10 @@ def mha_fwd_mla_varlen(
         enable_fp_fusion=True,
     )
     if num_splits > 1:
-        lse = out if lse_out is None else lse_out
-        _mla_varlen_reduce[(total_q, num_heads)](
+        lse_merge(
             o_k,
             lse_k,
-            out,
-            lse,
-            o_k.stride(0),
-            o_k.stride(1),
-            o_k.stride(2),
-            lse_k.stride(0),
-            lse_k.stride(1),
-            out.stride(0),
-            out.stride(1),
-            lse.stride(0),
-            lse.stride(1),
-            HEAD_DIM=head_dim_v,
-            NUM_SPLITS=num_splits,
-            RETURN_LSE=lse_out is not None,
-            HAS_INIT=o_init is not None,
-            num_warps=1,
+            out.unsqueeze(0),
+            None if lse_out is None else lse_out.unsqueeze(0),
         )
     return out, lse_out
