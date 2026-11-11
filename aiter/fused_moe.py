@@ -4958,20 +4958,37 @@ def get_2stage_cfgs(
             and q_dtype_w == dtypes.fp4x2
         )
         _s1_fp4q = is_flydsl1 and "_fp4" in kernelName1.split("_t")[-1]
+        # Given a pad, stage 1 may leave that many trailing columns of its uninitialized
+        # output unwritten, so it gets only the columns its stage 2 skips: the Opus stage
+        # 2 reads the unpadded width, the v1 FlyDSL one skips whole 128-column blocks of
+        # its last K tile, CK-Tile whole 128-column blocks, and the v2 layout and CK ones
+        # read every column. Stage 1 computes the others: zero from w1's zero padding,
+        # times w2's zero padding.
+        if is_opus2:
+            stage1_inter_dim_pad = intermediate_pad
+        elif is_flydsl2 and not is_flydsl2_layout:
+            params2 = _get_flydsl_moe_kernels().get_flydsl_kernel_params(kernelName2)
+            if params2 is None:
+                raise ValueError(f"Invalid FlyDSL GEMM2 kernel name: {kernelName2}")
+            stage1_inter_dim_pad = min(params2["tile_k"], intermediate_pad // 128 * 128)
+        elif is_cktile2:
+            stage1_inter_dim_pad = intermediate_pad // 128 * 128
+        else:
+            stage1_inter_dim_pad = 0
         if is_opus1:
             stage1_func = functools.partial(
                 _opus_a8w4_stage1_wrapper,
                 kernelName=kernelName1,
                 activation=activation,
                 block_m=block_m,
-                inter_dim_pad=intermediate_pad,
+                inter_dim_pad=stage1_inter_dim_pad,
             )
         elif is_flydsl1:
             stage1_func = functools.partial(
                 _flydsl_stage1_wrapper,
                 kernelName=kernelName1,
                 activation=activation,
-                inter_dim_pad=intermediate_pad,
+                inter_dim_pad=stage1_inter_dim_pad,
                 model_dim_pad=hidden_pad,
             )
         else:
