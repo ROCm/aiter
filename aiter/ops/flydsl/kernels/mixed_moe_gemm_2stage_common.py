@@ -531,19 +531,36 @@ def compile_mixed_moe_gemm1_common(
             by = gpu.block_id("x")
             bx_persist = gpu.block_id("y")
 
+            numids_rsrc = ptr_rsrc(arg_num_valid_ids, fx.Int32(4))
+            num_valid_i32 = buffer_ops.buffer_load(
+                numids_rsrc, fx.Int32(0), vec_width=1, dtype=T.i32
+            )
+
             if const_expr(xcd_swizzle > 0):
                 num_xcds = 8
                 # Use the launch dimensions, including the stage2 tail padding.
                 grid_x = fx.Index(gpu.grid_dim.x)
                 grid_y = fx.Index(gpu.grid_dim.y)
-                bx_persist, by = xcd_remap_grid(
+                # grid_y covers the worst-case padded row count. Remap only the
+                # rows valid at runtime so the empty tail is not concentrated
+                # on the last XCDs; rows past them keep their ids and exit.
+                rows_per_y = sort_block_m * persist_m
+                valid_y = (
+                    fx.Index(fx.Int32(num_valid_i32)) + rows_per_y - 1
+                ) // rows_per_y
+                valid_y = (valid_y < grid_y).select(valid_y, grid_y)
+                valid_y = (valid_y > 0).select(valid_y, fx.Index(1))
+                remap_m, remap_n = xcd_remap_grid(
                     bx_persist,
                     by,
-                    grid_m=grid_y,
+                    grid_m=valid_y,
                     grid_n=grid_x,
                     xcd_swizzle=xcd_swizzle,
                     num_xcds=num_xcds,
                 )
+                wg_live = bx_persist < valid_y
+                bx_persist = wg_live.select(remap_m, bx_persist)
+                by = wg_live.select(remap_n, by)
 
             by_n = by * tile_n
 
@@ -597,11 +614,6 @@ def compile_mixed_moe_gemm1_common(
             x_rsrc = ptr_rsrc(arg_x, x_nbytes_i32)
 
             shared_w_rsrc = ptr_rsrc(arg_shared_w, shared_w_nbytes)
-
-            numids_rsrc = ptr_rsrc(arg_num_valid_ids, fx.Int32(4))
-            num_valid_i32 = buffer_ops.buffer_load(
-                numids_rsrc, fx.Int32(0), vec_width=1, dtype=T.i32
-            )
 
             sx_rsrc = 1
             sw_rsrc = 1
