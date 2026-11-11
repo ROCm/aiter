@@ -31,6 +31,8 @@ DT_fp8_nvfp4_fp8, then that same chain.
 SW is the keys a row can see, min(window, max_seqlen_k), and 0 with no window:
 SW_GEQ_<n> targets a window size, a bare SW matches any window, and a table
 may not mix SW_LEQ and SW_GEQ keys.
+NS is the launch's sequence count, padded slots included. A table that lists it
+puts it last, so a key naming only DT and NS outranks nothing but "any".
 
 A section with no axes, like reduce above, is just a config.
 
@@ -76,6 +78,7 @@ _AXIS_KIND = {
     "DT": "enum",  # (q dtype tag, K cache dtype tag[, V cache dtype tag when it differs])
     # 2d programs per CU, rounded up to a power of 2, so P bounds must be powers of 2
     "P": "num",
+    "NS": "num",  # num_seqs in the launch (mixed prefill+decode batches carry many)
 }
 
 
@@ -256,6 +259,7 @@ def _axis_values(
     programs_per_cu,
     num_queries_per_kv=1,
     v_dtype=None,
+    num_seqs=1,
 ) -> dict:
     return {
         "D": head_size,
@@ -268,6 +272,7 @@ def _axis_values(
         "DT": (get_dtype_str(q_dtype), get_dtype_str(kv_dtype))
         + ((get_dtype_str(v_dtype),) if v_dtype is not None else ()),
         "P": programs_per_cu,
+        "NS": num_seqs,
     }
 
 
@@ -315,6 +320,7 @@ def _get_unified_attention_config_cached(
     arch: str | None,
     num_queries_per_kv: int = 1,
     v_cache_dtype: torch.dtype | None = None,
+    num_seqs: int = 1,
 ) -> dict:
     assert op in _OPS, f"Unknown config op {op!r}, expected one of {_OPS}"
     assert head_size > 0, "head_size must be positive"
@@ -333,9 +339,15 @@ def _get_unified_attention_config_cached(
         programs_per_cu,
         num_queries_per_kv,
         v_dtype=v_cache_dtype,
+        num_seqs=num_seqs,
     )
     _, config = _lookup(table, axes, values)
     return compute_tile_params(config, block_size)
+
+
+@functools.lru_cache(maxsize=64)
+def _uses_ns(op: str, backend, arch) -> bool:
+    return "NS" in _load(op, backend, arch)[1]
 
 
 def get_unified_attention_config(
@@ -373,6 +385,8 @@ def get_unified_attention_config(
         arch,
         params.num_queries_per_kv,
         v_cache_dtype=getattr(params, "v_cache_dtype", None),
+        # only a table whose schema names NS reads it; keep the cache key small otherwise
+        num_seqs=params.num_seqs if _uses_ns(op, backend, arch) else 1,
     )
     # NUM_SEGMENTS is derived out here rather than in the cached lookup: it
     # reads the launch's program count, which is not part of the cache key.
@@ -394,6 +408,7 @@ def explain(op: str, params, backend: str = "triton", arch: str | None = None) -
         _programs_per_cu(params),
         params.num_queries_per_kv,
         v_dtype=getattr(params, "v_cache_dtype", None),
+        num_seqs=params.num_seqs,
     )
     key, config = _lookup(table, axes, values)
     derived = compute_segment_params(
