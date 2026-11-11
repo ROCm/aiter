@@ -38,7 +38,8 @@ def fused_gemm_a16w16_dual_splitk(
     n2: int,
     dtype: torch.dtype | None = torch.bfloat16,
     y: torch.Tensor | None = None,
-    skip_reduce: bool | None = False,
+    skip_reduce1: bool | None = False,
+    skip_reduce2: bool | None = False,
     config: dict | None = None,
     num_ksplit2: int | None = None,
 ):
@@ -52,15 +53,16 @@ def fused_gemm_a16w16_dual_splitk(
     - x: Matrix X with shape (M, K).
     - w: Matrix W with shape (N1 + n2, K).
     - n2: Rows of W that form the second part.
-    - skip_reduce: Return the second part's split-K partials instead of reducing
-      them (requires NUM_KSPLIT1 == 1).
+    - skip_reduce1, skip_reduce2: Return that part's split-K partials instead of
+      reducing them.
     - num_ksplit2: Overrides the config's NUM_KSPLIT2 and is kept exactly (splits
       past K hold zeros), e.g. for a consumer that sums a fixed number of partials.
 
     Returns:
-    - y: The output matrix with shape (M, N1 + n2), or with skip_reduce and
-      NUM_KSPLIT2 > 1, (y, y2_pp): y holds the first part in its first N1 columns
-      and y2_pp the second part's fp32 partials, shape (NUM_KSPLIT2, M, n2).
+    - y: The output matrix with shape (M, N1 + n2).
+    - With skip_reduce1 or skip_reduce2, (y1, y2) instead: for a part whose flag is
+      set and NUM_KSPLIT > 1, its fp32 partials with shape (NUM_KSPLIT, M, N_part);
+      otherwise its columns of y.
     """
     _LOGGER.info(
         "FUSED_GEMM_A16W16_DUAL_SPLITK: x=%s w=%s n2=%d",
@@ -86,7 +88,6 @@ def fused_gemm_a16w16_dual_splitk(
     _part_splitk_params(config, 1, K)
     _part_splitk_params(config, 2, K, exact=num_ksplit2 is not None)
     num_ksplit1, num_ksplit2 = config["NUM_KSPLIT1"], config["NUM_KSPLIT2"]
-    assert not skip_reduce or num_ksplit1 == 1, "skip_reduce needs NUM_KSPLIT1 == 1"
 
     grid_m = triton.cdiv(M, config["BLOCK_SIZE_M"])
     grid1 = grid_m * triton.cdiv(N1, config["BLOCK_SIZE_N1"]) * num_ksplit1
@@ -131,20 +132,28 @@ def fused_gemm_a16w16_dual_splitk(
         **config,
     )
 
-    if num_ksplit1 == 1 and num_ksplit2 == 1:
-        return y
-    if skip_reduce:
-        return y, y2_pp
+    reduce1 = y1_pp is not None and not skip_reduce1
+    reduce2 = y2_pp is not None and not skip_reduce2
+    out = y
+    if skip_reduce1 or skip_reduce2:
+        out = (
+            y1_pp if skip_reduce1 and y1_pp is not None else y1,
+            y2_pp if skip_reduce2 and y2_pp is not None else y2,
+        )
+    if not (reduce1 or reduce2):
+        return out
 
     REDUCE_BLOCK_SIZE_M = 32
     REDUCE_BLOCK_SIZE_N = 32
+    ksplit1 = num_ksplit1 if reduce1 else 1
+    ksplit2 = num_ksplit2 if reduce2 else 1
     grid_reduce = (
         triton.cdiv(M, REDUCE_BLOCK_SIZE_M),
-        (triton.cdiv(N1, REDUCE_BLOCK_SIZE_N) if num_ksplit1 > 1 else 0)
-        + (triton.cdiv(n2, REDUCE_BLOCK_SIZE_N) if num_ksplit2 > 1 else 0),
+        (triton.cdiv(N1, REDUCE_BLOCK_SIZE_N) if reduce1 else 0)
+        + (triton.cdiv(n2, REDUCE_BLOCK_SIZE_N) if reduce2 else 0),
     )
-    c1_in = c1 if y1_pp is not None else c2
-    c2_in = c2 if y2_pp is not None else c1
+    c1_in = y1_pp if reduce1 else y2_pp
+    c2_in = y2_pp if reduce2 else y1_pp
     _fused_gemm_a16w16_dual_splitk_reduce_kernel[grid_reduce](
         c1_in,
         y1,
@@ -165,9 +174,9 @@ def fused_gemm_a16w16_dual_splitk(
         y2.stride(1),
         REDUCE_BLOCK_SIZE_M,
         REDUCE_BLOCK_SIZE_N,
-        num_ksplit1,
-        triton.next_power_of_2(num_ksplit1),
-        num_ksplit2,
-        triton.next_power_of_2(num_ksplit2),
+        ksplit1,
+        triton.next_power_of_2(ksplit1),
+        ksplit2,
+        triton.next_power_of_2(ksplit2),
     )
-    return y
+    return out

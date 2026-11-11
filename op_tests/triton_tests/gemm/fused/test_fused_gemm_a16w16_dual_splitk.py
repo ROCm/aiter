@@ -25,11 +25,9 @@ def run_torch(x, w, dtype=torch.bfloat16):
     return F.linear(x.float(), w.float()).to(dtype)
 
 
-def run_triton(
-    x, w, n2, dtype=torch.bfloat16, y=None, skip_reduce=False, config=None, **kwargs
-):
+def run_triton(x, w, n2, dtype=torch.bfloat16, y=None, config=None, **kwargs):
     return fused_gemm_a16w16_dual_splitk(
-        x, w, n2, dtype=dtype, y=y, skip_reduce=skip_reduce, config=config, **kwargs
+        x, w, n2, dtype=dtype, y=y, config=config, **kwargs
     )
 
 
@@ -87,17 +85,43 @@ def test_gemm(M, N1, N2, K, dtype, output):
 @pytest.mark.parametrize("M, N1, N2, K", get_x_vals()[1:5] + _ODD_SHAPES)
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 @pytest.mark.parametrize("output", [True, False])
-def test_gemm_skip_reduce(M, N1, N2, K, dtype, output):
+@pytest.mark.parametrize(
+    "ks1, ks2, skip_reduce1, skip_reduce2",
+    [
+        (1, 4, False, True),
+        (4, 1, True, False),
+        (2, 4, True, True),
+        (2, 4, True, False),
+        (2, 4, False, True),
+        (1, 1, True, True),
+    ],
+)
+def test_gemm_skip_reduce(
+    M, N1, N2, K, dtype, output, ks1, ks2, skip_reduce1, skip_reduce2
+):
+    """Each part returns its partials when its flag is set and it is split, and its
+    reduced columns otherwise."""
     x, w, _, _, y = generate_gemm_a16w16_inputs(M, N1 + N2, K, dtype, output=output)
-    y_triton, y2_pp = run_triton(
-        x, w, N2, dtype, y, skip_reduce=True, config=_config(1, 4)
+    outs = run_triton(
+        x,
+        w,
+        N2,
+        dtype,
+        y,
+        config=_config(ks1, ks2),
+        skip_reduce1=skip_reduce1,
+        skip_reduce2=skip_reduce2,
     )
-    assert y2_pp.shape == (4, M, N2) and y2_pp.dtype == torch.float32
     ref = run_torch(x, w, dtype)
-    triton.testing.assert_close(y_triton[:, :N1], ref[:, :N1], atol=0.1, rtol=1e-1)
-    triton.testing.assert_close(
-        y2_pp.sum(0).to(dtype), ref[:, N1:], atol=0.1, rtol=1e-1
-    )
+    for out, ks, skip, ref_part in zip(
+        outs, (ks1, ks2), (skip_reduce1, skip_reduce2), (ref[:, :N1], ref[:, N1:])
+    ):
+        if skip and ks > 1:
+            assert out.shape == (ks, *ref_part.shape) and out.dtype == torch.float32
+            out = out.sum(0).to(dtype)
+        else:
+            assert out.shape == ref_part.shape and out.dtype == dtype
+        triton.testing.assert_close(out, ref_part, atol=0.1, rtol=1e-1)
 
 
 @pytest.mark.parametrize("M, N1, N2, K", [(64, 16384, 96, 5120)] + _ODD_SHAPES)
@@ -119,10 +143,10 @@ def test_gemm_exact_num_ksplit2(M, N1, N2, K, num_ksplit2):
     x, w, _, _, _ = generate_gemm_a16w16_inputs(
         M, N1 + N2, K, torch.bfloat16, output=False
     )
-    y_triton, y2_pp = run_triton(x, w, N2, skip_reduce=True, num_ksplit2=num_ksplit2)
+    y1, y2_pp = run_triton(x, w, N2, skip_reduce2=True, num_ksplit2=num_ksplit2)
     assert y2_pp.shape == (num_ksplit2, M, N2)
     ref = run_torch(x, w)
-    triton.testing.assert_close(y_triton[:, :N1], ref[:, :N1], atol=0.1, rtol=1e-1)
+    triton.testing.assert_close(y1, ref[:, :N1], atol=0.1, rtol=1e-1)
     triton.testing.assert_close(
         y2_pp.sum(0).to(torch.bfloat16), ref[:, N1:], atol=0.1, rtol=1e-1
     )
