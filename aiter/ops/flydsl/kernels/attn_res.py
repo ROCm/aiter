@@ -6,8 +6,9 @@
 ``flydsl_attn_res`` takes the arguments of Triton ``attn_res_gate`` and returns
 the same outputs. The candidates are the ``B`` rows of ``block_residual`` plus
 the prefix; the prefix candidate is the FP32 sum ``prefix + add_hidden [+
-add_hidden2]``, used unrounded. Scores use RMS-normalized candidates against the
-pre-folded ``score_weight``, and an online softmax mixes the raw values.
+add_hidden2]``, used unrounded unless ``bf16_intermediates`` is set. Scores use
+RMS-normalized candidates against the pre-folded ``score_weight``, and an online
+softmax mixes the raw values.
 """
 
 # Do not add ``from __future__ import annotations``: FlyDSL inspects annotations
@@ -301,6 +302,7 @@ class _AttnResSpec:
     fp8_dtype: torch.dtype | None = None
     block_alias: bool = False
     bf16_dot: bool = False
+    bf16_intermediates: bool = False
 
     @property
     def kernel_name(self) -> str:
@@ -312,6 +314,7 @@ class _AttnResSpec:
             f"{'_fp8' if self.fp8_dtype is not None else ''}"
             f"{'_wide' if self.wide_grid else ''}"
             f"{'_bf16dot' if self.bf16_dot else ''}"
+            f"{'_bf16mid' if self.bf16_intermediates else ''}"
         )
 
 
@@ -387,6 +390,8 @@ def _build_attn_res(spec: _AttnResSpec, device_index: int):
 
     native_swap = spec.native_swap
     bf16_dot = spec.bf16_dot
+    bf16_intermediates = spec.bf16_intermediates
+    fp32_prefix = has_add and not bf16_intermediates
     # Alternate buffers per group so the next group's writes need no second
     # barrier. Waves pad to a power of two so a DPP row reduce over wave_stride
     # lanes sums one value.
@@ -650,7 +655,8 @@ def _build_attn_res(spec: _AttnResSpec, device_index: int):
                 in_flight.append(issue_block_source(source))
 
             # Mix the unrounded FP32 sum, as attn_res_gate does; only the stores
-            # round to BF16.
+            # round to BF16. bf16_intermediates mixes the rounded sum instead, as
+            # a separate BF16 add would give.
             q_local = []
             prefix_local = []
             prefix_rounded = []
@@ -672,7 +678,10 @@ def _build_attn_res(spec: _AttnResSpec, device_index: int):
                     prefix_rounded.append(prefix_value.to(fx.BFloat16))
                 else:
                     prefix_rounded.append(prefix_value)
-                prefix_local.append(prefix_value)
+                if const_expr(bf16_intermediates):
+                    prefix_local.append(prefix_rounded[tile])
+                else:
+                    prefix_local.append(prefix_value)
 
             if const_expr(has_add):
                 prefix_out_div = row_of(fx.rocdl.make_buffer_tensor(prefix_out), token)
@@ -768,7 +777,8 @@ def _build_attn_res(spec: _AttnResSpec, device_index: int):
                         source_local = take_block_source(block)
                     group_partials.append(
                         local_sumsq_dot(
-                            source_local, not (has_add and src == prefix_slot)
+                            source_local,
+                            not (fp32_prefix and src == prefix_slot),
                         )
                     )
                     group_local.append(source_local)
@@ -816,6 +826,10 @@ def _build_attn_res(spec: _AttnResSpec, device_index: int):
 
             if const_expr(fp8):
                 y_local = [y_tile(tile) for tile in range_constexpr(tiles_per_thread)]
+                if const_expr(bf16_intermediates):
+                    y_local = [
+                        value.to(fx.BFloat16).to(fx.Float32) for value in y_local
+                    ]
                 thread_amax = zero
                 for tile in range_constexpr(tiles_per_thread):
                     thread_amax = thread_amax.maximumf(
@@ -1112,6 +1126,7 @@ def _plan_launch(
     out_quant_dtype,
     rows_per_wg,
     block_out,
+    bf16_intermediates,
 ) -> _LaunchPlan:
     if add_hidden2 is not None and add_hidden is None:
         raise ValueError("add_hidden2 requires add_hidden")
@@ -1268,6 +1283,7 @@ def _plan_launch(
                 narrow_prefetch_in_flight=tuning.narrow_prefetch_in_flight,
                 bf16_dot=gfx950_ops
                 and not (wide_grid and num_tokens > _WIDE_BF16_DOT_MAX_TOKENS),
+                bf16_intermediates=bf16_intermediates,
             ),
             prefix.device.index,
         )
@@ -1304,6 +1320,7 @@ def flydsl_attn_res(
     rows_per_wg: int | None = None,
     stream: torch.cuda.Stream | None = None,
     block_out: torch.Tensor | None = None,
+    bf16_intermediates: bool = False,
 ):
     """Drop-in for Triton ``attn_res_gate`` on BF16 inputs over ``B + 1`` candidates.
 
@@ -1337,6 +1354,10 @@ def flydsl_attn_res(
     size. ``rows_per_wg`` packs one-wave rows (D=1024) per workgroup; multi-wave
     rows reject any value other than 1.
 
+    ``bf16_intermediates`` rounds the prefix candidate and, with
+    ``out_quant_dtype``, the pre-quant ``y`` to BF16, as a model running the add,
+    the mix, and the quant as separate BF16 ops does (vLLM's ``attn_res``).
+
     With ``block_out``, cached plans key on exact data pointers, so each new
     buffer address revalidates.
     """
@@ -1358,6 +1379,7 @@ def flydsl_attn_res(
         close_block,
         out_quant_dtype,
         rows_per_wg,
+        bool(bf16_intermediates),
     )
     plan = _LAUNCH_PLANS.get(key)
     if plan is None:
@@ -1375,6 +1397,7 @@ def flydsl_attn_res(
             out_quant_dtype,
             rows_per_wg,
             block_out,
+            bool(bf16_intermediates),
         )
         if len(_LAUNCH_PLANS) >= _MAX_LAUNCH_PLANS:
             _LAUNCH_PLANS.clear()

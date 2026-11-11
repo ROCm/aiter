@@ -75,12 +75,15 @@ class _Config:
     onorm: bool = False
     fp8: bool = False
     scale: float = 1.0
+    bf16_intermediates: bool = False
 
 
 MIX = _Config()
 ALL_ON = _Config(add=True, close=True, onorm=True)
 ALL_ON_FP8 = dataclasses.replace(ALL_ON, fp8=True)
 EVERY_FEATURE = _Config(add=True, add2=True, close=True, onorm=True, scale=0.7)
+EVERY_FEATURE_BF16 = dataclasses.replace(EVERY_FEATURE, bf16_intermediates=True)
+ALL_ON_FP8_BF16 = dataclasses.replace(ALL_ON_FP8, bf16_intermediates=True)
 _BENCH_CONFIGS = {"mix": MIX, "all-on": ALL_ON, "all-on fp8": ALL_ON_FP8}
 
 
@@ -88,10 +91,17 @@ def _flag_surface():
     """Every valid combination: add2 needs add, and fp8 needs the output norm."""
     adds = ((False, False), (True, False), (True, True))
     norms = ((False, False), (True, False), (True, True))
-    for (add, add2), close, (onorm, fp8) in itertools.product(
-        adds, (False, True), norms
+    for (add, add2), close, (onorm, fp8), bf16 in itertools.product(
+        adds, (False, True), norms, (False, True)
     ):
-        yield _Config(add=add, add2=add2, close=close, onorm=onorm, fp8=fp8)
+        yield _Config(
+            add=add,
+            add2=add2,
+            close=close,
+            onorm=onorm,
+            fp8=fp8,
+            bf16_intermediates=bf16,
+        )
 
 
 def _num_cus() -> int:
@@ -148,6 +158,8 @@ def _gate_args(inputs, cfg: _Config):
         "close_block": cfg.close,
         "out_quant_dtype": dtypes.fp8 if cfg.fp8 else None,
     }
+    if cfg.bf16_intermediates:
+        kwargs["bf16_intermediates"] = True
     return args, kwargs
 
 
@@ -249,7 +261,7 @@ def test_flydsl_attn_res_flag_surface(cfg: _Config):
 @pytest.mark.parametrize("hidden_size", (_D, _D_SMALL))
 @pytest.mark.parametrize("num_blocks", range(_MAX_BLOCKS + 1))
 def test_flydsl_attn_res_num_blocks(hidden_size: int, num_blocks: int):
-    for cfg in (MIX, EVERY_FEATURE, ALL_ON_FP8):
+    for cfg in (MIX, EVERY_FEATURE, ALL_ON_FP8, EVERY_FEATURE_BF16, ALL_ON_FP8_BF16):
         _run_and_check(17, num_blocks, cfg, hidden_size=hidden_size)
 
 
@@ -263,7 +275,7 @@ def test_flydsl_attn_res_layouts(cfg: _Config):
 
 
 @_skip_unsupported_gfx
-@pytest.mark.parametrize("cfg", (MIX, ALL_ON, ALL_ON_FP8), ids=str)
+@pytest.mark.parametrize("cfg", (MIX, ALL_ON, ALL_ON_FP8, ALL_ON_FP8_BF16), ids=str)
 def test_flydsl_attn_res_token_counts(cfg: _Config):
     """T > num_cus switches D=7168 to the 256-thread wide grid; test both sides."""
     for tokens in (1, _num_cus(), _num_cus() + 1):
@@ -297,12 +309,8 @@ def test_flydsl_attn_res_empty(cfg: _Config):
 
 @_skip_unsupported_gfx
 @pytest.mark.parametrize("hidden_size", (_D, _D_SMALL))
-def test_flydsl_attn_res_prefix_candidate_is_unrounded(hidden_size: int):
-    """Mix the FP32 sum ``256 + 0.5``, not its BF16 rounding 256.
-
-    A zero ``score_weight`` gives both candidates weight 1/2, so ``y`` is
-    ``(-256 + 256.5) / 2 = 0.25`` exactly; a rounded candidate gives 0.
-    """
+def test_flydsl_attn_res_prefix_candidate_rounding(hidden_size: int):
+    """A zero ``score_weight`` averages -256 with the prefix: 0.25 from the FP32 sum 256.5, 0 from its BF16 rounding."""
     prefix = torch.full((17, hidden_size), 256.0, dtype=torch.bfloat16)
     add_hidden = torch.full_like(prefix, 0.5)
     block_residual = torch.full((17, 1, hidden_size), -256.0, dtype=torch.bfloat16)
@@ -313,6 +321,11 @@ def test_flydsl_attn_res_prefix_candidate_is_unrounded(hidden_size: int):
     )
     assert torch.equal(y, torch.full_like(prefix, 0.25))
     assert torch.equal(prefix_out, prefix)
+
+    y, _ = flydsl_attn_res(
+        prefix, block_residual, score_weight, _EPS, add_hidden, bf16_intermediates=True
+    )
+    assert torch.equal(y, torch.zeros_like(prefix))
 
 
 @_skip_unsupported_gfx
@@ -382,7 +395,12 @@ def test_flydsl_attn_res_matches_triton_gate(
 @_skip_unsupported_gfx
 @pytest.mark.parametrize("hidden_size", (_D, _D_SMALL))
 @pytest.mark.parametrize(
-    ("num_blocks", "cfg"), ((_MAX_BLOCKS, MIX), (_MAX_BLOCKS, EVERY_FEATURE))
+    ("num_blocks", "cfg"),
+    (
+        (_MAX_BLOCKS, MIX),
+        (_MAX_BLOCKS, EVERY_FEATURE),
+        (_MAX_BLOCKS, EVERY_FEATURE_BF16),
+    ),
 )
 def test_flydsl_attn_res_float64_oracle(hidden_size: int, num_blocks: int, cfg):
     inputs = _make_inputs(17, hidden_size, num_blocks)
@@ -400,7 +418,7 @@ def test_flydsl_attn_res_float64_oracle(hidden_size: int, num_blocks: int, cfg):
 
 
 @_skip_unsupported_gfx
-@pytest.mark.parametrize("cfg", (MIX, ALL_ON), ids=str)
+@pytest.mark.parametrize("cfg", (MIX, ALL_ON, EVERY_FEATURE_BF16), ids=str)
 def test_flydsl_attn_res_wide_grid_above_bf16_dot_limit(cfg: _Config):
     limit = attn_res_kernel._WIDE_BF16_DOT_MAX_TOKENS
     for tokens in (limit, limit + 1):
@@ -425,7 +443,7 @@ def test_flydsl_attn_res_wave_counts(hidden_size: int, cfg: _Config):
 
 @_skip_unsupported_gfx
 @pytest.mark.parametrize("hidden_size", (_D, _D_SMALL))
-@pytest.mark.parametrize("cfg", (MIX, ALL_ON, ALL_ON_FP8), ids=str)
+@pytest.mark.parametrize("cfg", (MIX, ALL_ON, ALL_ON_FP8, ALL_ON_FP8_BF16), ids=str)
 def test_flydsl_attn_res_without_gfx950_ops(monkeypatch, hidden_size: int, cfg):
     monkeypatch.setattr(attn_res_kernel, "_has_gfx950_ops", lambda: False)
     attn_res_kernel._clear_caches()
