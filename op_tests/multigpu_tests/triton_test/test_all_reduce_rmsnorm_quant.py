@@ -28,7 +28,10 @@ HIDDEN = 2048
 EPS = 1e-6
 TOKENS = [1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048]
 
-SKIP = torch.cuda.device_count() < WORLD_SIZE or arch_info.get_arch() != "gfx1250"
+SKIP = torch.cuda.device_count() < WORLD_SIZE or arch_info.get_arch() not in (
+    "gfx1250",
+    "gfx1250-strict",
+)
 pytestmark = pytest.mark.skipif(SKIP, reason="needs 4 gfx1250 GPUs")
 
 
