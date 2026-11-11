@@ -844,5 +844,10 @@ def compile_gfx1250_pa_decode(
         )
     if llvm_options:
         launch.compile_hints["llvm_options"] = llvm_options
+    # Past 256 VGPRs a gfx1250 wave reaches its registers through s_set_vgpr_msb
+    # banks. There the per-token MTP4 kernel (285 VGPRs) intermittently finds
+    # lane 0 of a live 64-bit offset overwritten and its K/V scale loads fault
+    # under load. Four waves per SIMD cap every tile kernel at 256 VGPRs.
+    launch.compile_hints["waves_per_eu"] = 4
     compiled = {"launch": launch, "kernel": pa_decode_tile_kernel}
     return _GFX1250_PA_DECODE_CACHE.setdefault(t, compiled)
