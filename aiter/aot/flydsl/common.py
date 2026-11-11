@@ -84,7 +84,7 @@ def run_only_env() -> Iterator[None]:
     """Force FlyDSL run-only mode: load AOT artifacts, never JIT-compile.
 
     Any kernel without a usable AOT cache raises RuntimeError at the call
-    site (with manager_key/cache_key/cache_dir details) instead of silently
+    site (naming the missing artifact and its cache dir) instead of silently
     masking missing precompiled coverage.
     """
     with override_env("FLYDSL_RUNTIME_RUN_ONLY", "1"):
@@ -173,9 +173,11 @@ def replay_env(arch: str, workers: int | None = None) -> dict[str, str]:
     env.update(
         GPU_ARCHS=arch,
         AITER_AOT_REPLAY="1",
-        HIP_VISIBLE_DEVICES="-1",
-        ROCR_VISIBLE_DEVICES="-1",
-        CUDA_VISIBLE_DEVICES="-1",
+        # An empty list hides every GPU. "-1" would too, but ROCm 10's
+        # rocprofiler-sdk aborts any process it is loaded into on "-1".
+        HIP_VISIBLE_DEVICES="",
+        ROCR_VISIBLE_DEVICES="",
+        CUDA_VISIBLE_DEVICES="",
     )
     if workers is not None:
         env["AITER_MAX_JOBS"] = str(workers)
