@@ -159,6 +159,17 @@ In MOE dispatch tables, flag:
 - Triton keys (`BLOCK_SIZE_N`, `num_stages`) in a Gluon file, or Gluon keys
   (`block_n`, `num_buffers`, `persistent_iters`) in a Triton file.
 
+In unified attention configs, flag:
+
+- A table without an `"any"` entry.
+- A dtype tag that is not `bf16`, `fp8` or `nvfp4`. fp16 uses `bf16`.
+- A three-dtype key (`DT_<q>_<k>_<v>`) with `any` in it, or with the same V
+  and K tags. The loader tries a three-dtype key only when the V cache dtype
+  is not the K cache dtype, and only with exact tags.
+- A change to the `DT` fallback order (`DT_<q>_<k>_<v>`, `DT_<q>_<k>`,
+  `DT_<q>_any`, `DT_any_<k>`, `any`) without an update to
+  `configs/AGENTS.md#unified-attention` and `aiter/ops/triton/README.md`.
+
 ## Configs: Python code
 
 Tuning values are in JSON files in `configs/`, never in Python or CSV files.

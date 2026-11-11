@@ -6,12 +6,6 @@
 wave64 (gfx942/gfx950) and wave32 (gfx1250) in one file, dispatched by get_gfx().
 """
 
-# do NOT add `from __future__ import annotations`: PEP 563 stringifies
-# annotations, defeating flydsl's JitFunction._make_cache_key runtime detection
-# (is_runtime = hasattr(ann, "__get_c_pointers__")). Int32 params like
-# kv_in_row_stride / num_tokens would then be baked into the cache key per value,
-# forcing a fresh ~30-70ms JIT compile per batch size / KV stride.
-
 import math
 from functools import lru_cache
 
@@ -1451,7 +1445,7 @@ def flydsl_qk_norm_rope_quant(
         raise ValueError("kv_write (swa_kv) is BF16 only; not supported with quant")
     from aiter.jit.utils.chip_info import get_gfx as _get_gfx
 
-    is_gfx1250 = _get_gfx() == "gfx1250"
+    is_gfx1250 = _get_gfx() in ("gfx1250", "gfx1250-strict")
 
     H = num_q_heads
     T_tok = q.shape[0]
