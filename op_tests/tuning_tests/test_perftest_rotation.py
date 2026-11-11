@@ -13,7 +13,7 @@ from unittest.mock import patch
 
 import torch
 
-from aiter.test_common import input_copies, perftest
+from aiter.test_common import device_memory_profiling, input_copies, perftest
 from aiter.utility import measure
 
 MiB = 1 << 20
@@ -57,6 +57,23 @@ class TestInputCopies(unittest.TestCase):
             self.assertTrue(torch.isnan(k["out"]).all())
         self.assertIs(copies[-1][1], kwargs)
         self.assertEqual(input_copies(args, kwargs, 1, pristine), [(args, kwargs)])
+
+
+@unittest.skipUnless(torch.cuda.is_available(), "needs a GPU")
+class TestInputSize(unittest.TestCase):
+    def test_kwargs_count_and_a_shared_tensor_counts_once(self):
+        a = torch.ones(MiB // 4, device="cuda")
+        b = torch.ones(MiB // 4, device="cuda")
+
+        def func(a, b):
+            return a + b
+
+        for args, kwargs in (((a, b), {}), ((a,), {"b": b}), ((), {"a": a, "b": b})):
+            with self.subTest(kwargs=sorted(kwargs)):
+                _, size, _, _ = device_memory_profiling(func, *args, **kwargs)
+                self.assertEqual(size, 2 * MiB + 1)
+        _, size, _, _ = device_memory_profiling(func, a, b=a)
+        self.assertEqual(size, MiB + 1)
 
 
 @unittest.skipUnless(torch.cuda.is_available(), "needs a GPU")

@@ -189,16 +189,7 @@ def benchmark():
 
 def device_memory_profiling(func, *args, **kwargs):
     gpu_id = torch.cuda.current_device()
-    inputSize = (
-        sum(
-            [
-                el.nbytes
-                for el in args
-                if isinstance(el, torch.Tensor) and el.device.index == gpu_id
-            ]
-        )
-        + 1
-    )
+    inputSize = _device_tensor_bytes(args, kwargs, gpu_id) + 1
     torch.cuda.reset_peak_memory_stats(gpu_id)
     cuda_memory_before = (
         torch.cuda.mem_get_info(gpu_id)[1] - torch.cuda.mem_get_info(gpu_id)[0]
@@ -235,9 +226,19 @@ def run_iters(num_iters, func, *args, **kwargs):
     return data
 
 
-def _device_tensor_bytes(args, kwargs):
-    tensors = (*args, *kwargs.values())
-    return sum(t.nbytes for t in tensors if isinstance(t, torch.Tensor) and t.is_cuda)
+def _device_tensor_bytes(args, kwargs, device_index=None):
+    """Bytes of the GPU tensors in `args` and `kwargs`, each tensor counted once.
+
+    `device_index=None` counts every GPU; otherwise only tensors on that device.
+    """
+    tensors = {
+        id(t): t
+        for t in (*args, *kwargs.values())
+        if isinstance(t, torch.Tensor)
+        and t.is_cuda
+        and device_index in (None, t.device.index)
+    }
+    return sum(t.nbytes for t in tensors.values())
 
 
 def input_copies(args, kwargs, num, pristine=None):
