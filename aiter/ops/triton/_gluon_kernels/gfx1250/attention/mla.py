@@ -1,8 +1,6 @@
 # The kernels in this file are adapted from vLLM:
 # https://github.com/vllm-project/vllm/blob/main/vllm/attention/ops/triton_unified_attention.py
 
-import math
-
 import torch
 import triton.experimental.gluon.language as gl
 import triton.language as tl
@@ -14,6 +12,26 @@ from aiter.ops.triton.utils.common_utils import strip_annotate
 from aiter.ops.triton.utils.types import e4m3_dtype
 
 float8_info = torch.finfo(e4m3_dtype)
+
+
+@gluon.constexpr_function
+def _group_split_layout(layout, group):
+    """``layout`` over ``[rows, cols]`` as the same distribution over
+    ``[rows, cols // group, group]`` (``group`` a power of two): what V's layout
+    is once its channels are viewed as scale groups, so that per-group scales
+    loaded in it broadcast onto V without a conversion."""
+
+    def split(bases):
+        return [[r, c // group, c % group] for r, c in bases]
+
+    rows, cols = layout.shape
+    return gl.DistributedLinearLayout(
+        reg_bases=split(layout.reg_bases),
+        lane_bases=split(layout.lane_bases),
+        warp_bases=split(layout.warp_bases),
+        block_bases=split(layout.block_bases),
+        shape=[rows, cols // group, group],
+    )
 
 
 @aggregate
@@ -52,8 +70,9 @@ class MLAConfig:
     Q_ROPE_SCALES_DOT_LAYOUT: gl.constexpr
     KV_LORA_SCALES_DOT_LAYOUT: gl.constexpr
     K_ROPE_SCALES_DOT_LAYOUT: gl.constexpr
-    KV_LORA_DOT_PACKED_LAYOUT: gl.constexpr
-    KV_LORA_SCALES_DOT_BROADCAST_LAYOUT: gl.constexpr
+    # FP4 V read token-packed (two tokens per byte) by the transposed LDS load,
+    # so that its upcast along tokens lands in V_DOT_LAYOUT.
+    V_FP4_PACKED_LAYOUT: gl.constexpr
 
     # Layout for loading Q
     Q_LORA_LOAD_LAYOUT: gl.constexpr
@@ -274,26 +293,22 @@ class MLAConfig:
                 operand_index=1, parent=self.QK_WMMA_LAYOUT, k_width=register_k_width
             )
         )
+        # An FP4 cache's PV runs as a BF16 WMMA on upcast V. k_width 32 there
+        # drops token bit 4 of every 32-token chunk (rows 0-15 counted twice,
+        # 16-31 never); 16 is the widest that holds.
+        pv_k_width = 16 if self.KV_CACHE_DTYPE == "nvfp4" else register_k_width
         self.P_DOT_LAYOUT = gl.constexpr(
             gl.DotOperandLayout(
                 operand_index=0,
                 parent=self.PV_WMMA_LAYOUT,
-                k_width=(
-                    register_k_width
-                    if self.KV_CACHE_DTYPE != "nvfp4"
-                    else (register_k_width * 2)
-                ),
+                k_width=pv_k_width,
             )
         )
         self.V_DOT_LAYOUT = gl.constexpr(
             gl.DotOperandLayout(
                 operand_index=1,
                 parent=self.PV_WMMA_LAYOUT,
-                k_width=(
-                    register_k_width
-                    if self.KV_CACHE_DTYPE != "nvfp4"
-                    else (register_k_width * 2)
-                ),
+                k_width=pv_k_width,
             )
         )
 
@@ -330,49 +345,17 @@ class MLAConfig:
                 )
             )
 
-            self.KV_LORA_DOT_PACKED_LAYOUT = gl.constexpr(
+            self.V_FP4_PACKED_LAYOUT = gl.constexpr(
                 gl.DotOperandLayout(
                     operand_index=1,
-                    parent=(
-                        gl.amd.AMDWMMALayout(
-                            version=3,
-                            transposed=True,
-                            warp_bases=warp_bases_pv,
-                            reg_bases=[],
-                            instr_shape=[16, 16, 64],
-                        )
+                    parent=gl.amd.AMDWMMALayout(
+                        version=3,
+                        transposed=True,
+                        warp_bases=warp_bases_pv,
+                        reg_bases=[],
+                        instr_shape=[16, 16, 64],
                     ),
-                    k_width=self.K_WIDTH,
-                )
-            )
-
-            # BLOCK_SIZE == 128 and quantization block size == 16 is asserted, hence hardcoded the first and the last dimension of V_SCALES_DOT_BROADCAST_LAYOUT
-            log2_num_head_broadcast_chunk = int(
-                math.log2((self.KV_LORA_RANK // self.HEAD_SIZE_SPLIT) // 16)
-            )
-            log2_num_warps = int(math.log2(NUM_WARPS))
-            self.KV_LORA_SCALES_DOT_BROADCAST_LAYOUT = gl.constexpr(
-                gl.DistributedLinearLayout(
-                    reg_bases=[
-                        [1, 0, 0],
-                        [2, 0, 0],
-                        [4, 0, 0],
-                        [8, 0, 0],
-                        [16, 0, 0],
-                        [64, 0, 0],
-                    ]
-                    + [
-                        [0, 2**v, 0]
-                        for v in range(log2_num_warps, log2_num_head_broadcast_chunk)
-                    ],
-                    lane_bases=[[0, 0, 1], [0, 0, 2], [0, 0, 4], [0, 0, 8], [32, 0, 0]],
-                    warp_bases=[[0, 2**v, 0] for v in range(log2_num_warps)],
-                    block_bases=[],
-                    shape=[
-                        self.BLOCK_SIZE,
-                        (self.KV_LORA_RANK // self.HEAD_SIZE_SPLIT) // 16,
-                        16,
-                    ],
+                    k_width=pv_k_width // 2,
                 )
             )
         else:
@@ -380,8 +363,7 @@ class MLAConfig:
             self.Q_ROPE_SCALES_DOT_LAYOUT = gl.constexpr(None)
             self.KV_LORA_SCALES_DOT_LAYOUT = gl.constexpr(None)
             self.K_ROPE_SCALES_DOT_LAYOUT = gl.constexpr(None)
-            self.KV_LORA_DOT_PACKED_LAYOUT = gl.constexpr(None)
-            self.KV_LORA_SCALES_DOT_BROADCAST_LAYOUT = gl.constexpr(None)
+            self.V_FP4_PACKED_LAYOUT = gl.constexpr(None)
 
         assert NUM_BLOCKS_GATHER_PER_TILE == 1
 
@@ -1276,8 +1258,16 @@ class MLAProgram:
         self, p, acc0, acc1, wait_count, buffer_id, scales_dtype
     ):
         gl.amd.gfx1250.tdm.async_wait(wait_count)
-        v_scales_dummy = gl.full(
-            (self.cfg.BLOCK_SIZE, self.cfg.KV_LORA_RANK // self.cfg.HEAD_SIZE_SPLIT),
+        HALF: gl.constexpr = self.cfg.KV_LORA_RANK // self.cfg.HEAD_SIZE_SPLIT
+        GROUP: gl.constexpr = self.cfg.BLOCK_SCALES_SIZE
+        SCALES_LAYOUT: gl.constexpr = _group_split_layout(
+            gl.to_linear_layout(self.cfg.V_DOT_LAYOUT, [self.cfg.BLOCK_SIZE, HALF]),
+            GROUP,
+        )
+        # The upcast applies one scale per packed group along tokens, but FP4
+        # scales vary per token, so V is upcast at unit scale and scaled after.
+        unit_scales = gl.full(
+            (self.cfg.BLOCK_SIZE, HALF),
             127,
             dtype=tl.uint8,
             layout=self.cfg.V_DOT_LAYOUT,
@@ -1286,70 +1276,22 @@ class MLAProgram:
         p = gl.convert_layout(p, self.cfg.P_DOT_LAYOUT)
         for static_idx in gl.static_range(self.cfg.HEAD_SIZE_SPLIT):
             v = gl.amd.gfx1250.load_shared_fp4_repacked(
-                self.kv_lora_shared.index(buffer_id)
-                .reshape(
-                    (
-                        1,
-                        self.cfg.BLOCK_SIZE // 16,
-                        (self.cfg.KV_LORA_RANK // 2) // (2 * 16),
-                        2,
-                        16,
-                        16,
-                    )
-                )
-                .permute((0, 1, 4, 2, 3, 5))
-                .reshape((self.cfg.BLOCK_SIZE, self.cfg.KV_LORA_RANK // 2))
-                .slice(
-                    static_idx
-                    * (self.cfg.KV_LORA_RANK // self.cfg.HEAD_SIZE_SPLIT // 2),
-                    (self.cfg.KV_LORA_RANK // self.cfg.HEAD_SIZE_SPLIT // 2),
-                    1,
+                self.lds_unshuffle_kv_lora_trans(buffer_id).slice(
+                    static_idx * (HALF // 2), HALF // 2, 1
                 ),
-                self.cfg.KV_LORA_DOT_PACKED_LAYOUT,
+                self.cfg.V_FP4_PACKED_LAYOUT,
             )
-
+            v = gl.amd.gfx1250.scaled_upcast(v, unit_scales, gl.bfloat16, axis=0)
+            v = gl.convert_layout(v, self.cfg.V_DOT_LAYOUT, assert_trivial=True)
             v_scales = (
-                (
-                    self.kv_lora_scales_shared.index(buffer_id)
-                    .reshape(
-                        (
-                            1,
-                            self.cfg.BLOCK_SIZE // 128,
-                            (self.cfg.KV_LORA_RANK // 16)
-                            // self.cfg.SCALE_K_WIDTH_LORA,
-                            128 // 4,
-                            4,
-                            self.cfg.SCALE_K_WIDTH_LORA,
-                        )
-                    )
-                    .permute((0, 1, 4, 3, 2, 5))
-                    .reshape((self.cfg.BLOCK_SIZE, self.cfg.KV_LORA_RANK // 16, 1))
-                    .slice(
-                        static_idx
-                        * (self.cfg.KV_LORA_RANK // self.cfg.HEAD_SIZE_SPLIT // 16),
-                        (self.cfg.KV_LORA_RANK // self.cfg.HEAD_SIZE_SPLIT // 16),
-                        1,
-                    )
-                )
-                .load(layout=self.cfg.KV_LORA_SCALES_DOT_BROADCAST_LAYOUT)
-                .to(scales_dtype, bitcast=True)
+                self.lds_unshuffle_kv_lora_scales(buffer_id)
+                .reshape((self.cfg.BLOCK_SIZE, self.cfg.KV_LORA_RANK // GROUP, 1))
+                .slice(static_idx * (HALF // GROUP), HALF // GROUP, 1)
+                .load(layout=SCALES_LAYOUT)
             )
-
-            v = gl.amd.gfx1250.scaled_upcast(v, v_scales_dummy, gl.bfloat16, axis=0)
-            v = v.reshape(
-                (
-                    self.cfg.BLOCK_SIZE,
-                    self.cfg.KV_LORA_RANK // self.cfg.HEAD_SIZE_SPLIT // 16,
-                    16,
-                )
-            )
-
-            v_scales = v_scales.to(gl.bfloat16)
-            v = v * v_scales
-            v = v.reshape(
-                (self.cfg.BLOCK_SIZE, self.cfg.KV_LORA_RANK // self.cfg.HEAD_SIZE_SPLIT)
-            )
-            v = v.to(gl.bfloat16)
+            v = v.reshape((self.cfg.BLOCK_SIZE, HALF // GROUP, GROUP))
+            v = v * v_scales.to(scales_dtype, bitcast=True).to(gl.bfloat16)
+            v = v.reshape((self.cfg.BLOCK_SIZE, HALF)).to(gl.bfloat16)
             v = gl.convert_layout(v, self.cfg.V_DOT_LAYOUT, assert_trivial=True)
 
             if static_idx == 0:
