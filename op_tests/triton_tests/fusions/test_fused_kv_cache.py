@@ -295,7 +295,7 @@ def test_fused_qk_cat_and_cache_mla(
 ):
     # The gluon kernel has no NoPE form. That also rules out the NVFP4 cache,
     # which is gfx1250-only.
-    if DEVICE_ARCH == "gfx1250":
+    if DEVICE_ARCH in ("gfx1250", "gfx1250-strict"):
         pytest.skip("fused_qk_cat_and_cache_mla has no gfx1250 kernel")
     torch.manual_seed(0)
     dtype = torch.bfloat16
@@ -475,10 +475,14 @@ def test_fused_qk_rope_reshape_and_cache(
         k = k / 20
         v = v / 20
 
-    if cache_dtype == torch.uint8 and arch_info.get_arch() not in ("gfx1250",):
+    if cache_dtype == torch.uint8 and arch_info.get_arch() not in (
+        "gfx1250",
+        "gfx1250-strict",
+    ):
         pytest.skip("FP4 cases only supported on gfx1250")
     elif cache_dtype == e4m3_dtype and arch_info.get_arch() not in (
         "gfx1250",
+        "gfx1250-strict",
         "gfx950",
     ):
         pytest.skip("FP8 cases only supported on gfx1250 and gfx950")
