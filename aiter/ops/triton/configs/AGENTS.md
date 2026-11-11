@@ -275,6 +275,10 @@ table for each op (`attn_2d`, `attn_3d`, `reduce`, `kv_split`) and a
   `DT_fp8_nvfp4` entry.
 - Do not use `any` in a three-dtype key. Do not write a three-dtype key with
   the same V and K tags: the loader never tries it.
+- `NS` is the number of sequences in the launch (`num_seqs`, padded slots
+  included). Only a table that lists it reads it, and it goes last in the
+  schema, so a key such as `DT_bf16_bf16.NS_LEQ_8` takes over only launches
+  that would otherwise use `"any"`.
 
 ## Autotune
 

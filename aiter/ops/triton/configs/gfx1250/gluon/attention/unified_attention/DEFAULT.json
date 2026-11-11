@@ -6,7 +6,8 @@
       "Q",
       "SW",
       "SKLT",
-      "DT"
+      "DT",
+      "NS"
     ],
     "attn_3d": [
       "D",
@@ -277,6 +278,15 @@
       "NUM_BUFFERS": 2,
       "TILE_SIZE_MIN": 128,
       "TILE_SIZE_MAX": 128
+    },
+    "DT_bf16_bf16.NS_LEQ_8": {
+      "BLOCK_M": 256,
+      "num_warps": 4,
+      "waves_per_eu": 2,
+      "LOOP_VARIANT": 2,
+      "NUM_BUFFERS": 2,
+      "TILE_SIZE_MIN": 64,
+      "TILE_SIZE_MAX": 64
     },
     "any": {
       "BLOCK_M": 128,
