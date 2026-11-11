@@ -65,6 +65,9 @@ def test_fused_mixed_sample_matches_the_race(rows, vocab, dtype):
 def test_fused_mixed_sample_agrees_with_hip_kernel(vocab):
     rows = 64
     logits, temps, noise = _inputs(rows, vocab, torch.bfloat16, seed=vocab)
+    # The HIP op scales by 1/T before it subtracts the max, so at a small T it
+    # loses near ties that this op keeps (small-T cases are checked against the
+    # float64 race instead, in test_fused_mixed_sample_small_temperature).
     temps = temps.clamp_min(0.3)
     hip = torch.empty(rows, dtype=torch.int32, device="cuda")
     aiter.mixed_sample_outer_exponential(hip, logits, noise, temps, eps=EPS)

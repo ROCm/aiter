@@ -53,6 +53,14 @@ def fused_mixed_sample(
       This is the race of ``aiter.mixed_sample_outer_exponential``, with the
       same noise.
 
+    The two can pick different tokens on a near tie of the two best race keys.
+    This kernel subtracts the row max before it scales by ``1/T``;
+    ``mixed_sample_outer_exponential`` scales first and then subtracts, which
+    loses the low bits of the logits when ``1/T`` is large. So at a small T the
+    HIP op's near-tie window is wider, and this op is the one that agrees with
+    the float64 race (``test_fused_mixed_sample_small_temperature``). Away from
+    near ties, both pick the same token.
+
     The kernel splits each row into vocab tiles (stage 1) and combines the
     tiles (stage 2). With ``greedy_eps=0.0`` and ``temperatures >= 0``, the
     greedy rule is the ``temperature == 0`` rule of
