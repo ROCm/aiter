@@ -55,13 +55,13 @@ UNBOUNDED_OUTER_EXTENT = 2**31 - 1
 # How payload stores into a cacheable (fine-grained) inbox are written back from
 # the L2 of every XCD before completion-publish raises the flag:
 #   "none"          nothing beyond the kernel-boundary release (uncached inbox);
-#   "per_wg"        every payload workgroup ends with a system-scope release;
-#   "last_wg"       the last workgroup to finish on each XCD releases, found by a
-#                   per-XCD arrival counter under round-robin WG-to-XCD dispatch;
+#   "last_wg"       the last workgroup to finish on each XCD releases;
 #   "flush_kernel"  a one-workgroup-per-XCD kernel releases between payload and
-#                   completion-publish, also assuming round-robin dispatch.
-FG_RELEASE_MODES = ("none", "per_wg", "last_wg", "flush_kernel")
-_FG_RELEASE_NEEDS_XCDS = frozenset({"last_wg", "flush_kernel"})
+#                   completion-publish.
+# Both releasing modes assume round-robin dispatch (workgroup bid runs on XCD
+# bid % n_xcd). They stay correct when n_xcd is a multiple of the true XCD
+# count: each residue class still lies on one XCD and releases it.
+FG_RELEASE_MODES = ("none", "last_wg", "flush_kernel")
 
 
 def v_pc_partial_elems(seq_len, heads, head_dim):
@@ -2800,66 +2800,52 @@ def make_attention_a2a_kernel(
                     hadamard,
                     v4_output,
                 )
-            if const_expr(fg_release in ("per_wg", "last_wg")):
-                # A system-scope writeback covers the whole L2 of this XCD, so one
-                # lane suffices once the stores of every wave have reached it. A
-                # workgroup-scope release may not wait for them, hence the
-                # explicit wait. The partial-only launch already releases before
-                # its ready flags.
+            if const_expr(fg_release == "last_wg"):
+                # A system-scope writeback covers the whole L2 of this XCD. One
+                # lane callig the memory fence suffices once the stores of every
+                # wave have reached it. Every workgroup must have it's pending
+                # stores completed before the first lane of the last WG flushes.
                 fx.rocdl.s_waitcnt(vmcnt=0)
                 fx.barrier()
-                # Nested rather than combined: const_expr must gate the runtime test.
-                if const_expr(fg_release == "per_wg"):  # noqa: SIM102
-                    if tid == 0:
+                if tid == 0:
+                    # Round-robin dispatch puts workgroup bid on XCD
+                    # bid % n_xcd. The workgroup that arrives last there
+                    # is the first point at which every line of that XCD is in its L2.
+                    xcd = fx.Int32(bid) % fx.Int32(n_xcd)
+                    # The count the last arrival on XCD xcd reads: the number of
+                    # its workgroups minus one.
+                    last_seen = (fx.Int32(block_num - 1) - xcd) // fx.Int32(n_xcd)
+                    arrived = fx.add_offset(
+                        fx.inttoptr(
+                            fx.PointerType.get(
+                                fx.Int32.ir_type,
+                                address_space=fx.AddressSpace.Global,
+                                alignment=4,
+                            ),
+                            addr_xcd_arrived,
+                        ),
+                        xcd,
+                    )
+                    previous = fx.atomic_add(
+                        arrived,
+                        fx.Int32(1),
+                        ordering=fx.AtomicOrdering.Monotonic,
+                        syncscope=fx.rocdl.SyncScope.Agent,
+                    )
+                    if previous == last_seen:
+                        # Zero the counter, all WGs have arrived.
+                        fx.generic_store(
+                            arrived,
+                            fx.Int32(0),
+                            memory_order=fx.AtomicOrdering.Monotonic,
+                            syncscope=fx.rocdl.SyncScope.Agent,
+                        )
+                        # Write back this XCD's L2 so the payload is visible
+                        # to peers before completion-publish.
                         fx.memory_fence(
                             ordering=fx.AtomicOrdering.Release,
                             syncscope=fx.rocdl.SyncScope.OneAs,
                         )
-                if const_expr(fg_release == "last_wg"):  # noqa: SIM102
-                    if tid == 0:
-                        # Round-robin dispatch puts workgroup bid on XCD
-                        # bid % n_xcd. The workgroup that arrives last there, not
-                        # the one dispatched last, is the first point at which
-                        # every line of that XCD is in its L2. Monotonic: a
-                        # releasing atomic would add an agent-scope writeback to
-                        # every workgroup.
-                        xcd_coord = fx.idx2crd(
-                            fx.Int32(bid),
-                            fx.make_layout((n_xcd, UNBOUNDED_OUTER_EXTENT), (1, n_xcd)),
-                        )
-                        xcd = fx.Int32(fx.get_scalar(fx.get(xcd_coord, 0)))
-                        # Count the last arrival on XCD x reads: its workgroups - 1.
-                        last_seen = (fx.Int32(block_num - 1) - xcd) // fx.Int32(n_xcd)
-                        arrived = fx.add_offset(
-                            fx.inttoptr(
-                                fx.PointerType.get(
-                                    fx.Int32.ir_type,
-                                    address_space=fx.AddressSpace.Global,
-                                    alignment=4,
-                                ),
-                                addr_xcd_arrived,
-                            ),
-                            xcd,
-                        )
-                        previous = fx.atomic_add(
-                            arrived,
-                            fx.Int32(1),
-                            ordering=fx.AtomicOrdering.Monotonic,
-                            syncscope=fx.rocdl.SyncScope.Agent,
-                        )
-                        if previous == last_seen:
-                            # No workgroup of this launch touches the counter again,
-                            # and the next launch is stream-ordered after this one.
-                            fx.generic_store(
-                                arrived,
-                                fx.Int32(0),
-                                memory_order=fx.AtomicOrdering.Monotonic,
-                                syncscope=fx.rocdl.SyncScope.Agent,
-                            )
-                            fx.memory_fence(
-                                ordering=fx.AtomicOrdering.Release,
-                                syncscope=fx.rocdl.SyncScope.OneAs,
-                            )
 
     return attention_a2a_single_push
 
@@ -2979,13 +2965,10 @@ def make_attention_a2a_jit(
         raise ValueError(
             f"fg_release must be one of {FG_RELEASE_MODES}, got {fg_release!r}"
         )
-    if fg_release in _FG_RELEASE_NEEDS_XCDS:
-        if n_xcd < 1:
-            raise ValueError(
-                f"fg_release={fg_release!r} needs the XCD count, got {n_xcd}"
-            )
-    else:
+    if fg_release == "none":
         n_xcd = 0
+    elif n_xcd < 1:
+        raise ValueError(f"fg_release={fg_release!r} needs the XCD count, got {n_xcd}")
     split_v_exchange = needs_split_v_exchange(v_pack, seq_len)
     pc_partial = v4_output == "v" and codec == "e4m3_pc" and v4_amax
     common = {

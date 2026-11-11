@@ -25,7 +25,6 @@ from aiter.ops.mha_v4_quant import (
 from .comm_collectives_host_shared import resolve_inbox_flags
 from .communication_ops_host_utils import make_symmetric_heap
 from .kernels.attention_a2a_intranode_kernel import (
-    _FG_RELEASE_NEEDS_XCDS,
     FG_RELEASE_MODES,
     _transport_bytes,
     make_attention_a2a_dequant_jit,
@@ -41,6 +40,9 @@ _DEFAULT_BLOCK_NUM = 128
 _DEFAULT_WARP_NUM_PER_BLOCK = 8
 _MAX_RAW_BUFFER_BYTES = 0xFFFFFFFF
 _DEFAULT_FG_RELEASE = "last_wg"
+# Assumed when the XCD count cannot be read. Safe for 1, 2, 4 or 8 XCDs:
+# a multiple of the true count only adds releases.
+_FALLBACK_N_XCD = 8
 
 
 def _resolve_fg_release(inbox_memory, device):
@@ -48,8 +50,6 @@ def _resolve_fg_release(inbox_memory, device):
 
     An uncached inbox caches nothing, so it needs none. Otherwise
     AITER_A2A_FG_RELEASE picks a mode of FG_RELEASE_MODES (default "last_wg").
-    The modes that rely on round-robin dispatch need the XCD count; without it
-    they fall back to "per_wg", which assumes nothing about dispatch.
     """
     if inbox_memory != "finegrained":
         return "none", 0
@@ -58,21 +58,12 @@ def _resolve_fg_release(inbox_memory, device):
         raise ValueError(
             f"AITER_A2A_FG_RELEASE must be one of {FG_RELEASE_MODES}, got {mode!r}"
         )
-    if mode not in _FG_RELEASE_NEEDS_XCDS:
+    if mode == "none":
         return mode, 0
     from aiter.jit.utils.chip_info import get_num_xcds
 
-    try:
-        with torch.cuda.device(device):
-            return mode, get_num_xcds(default=None)
-    except (RuntimeError, OSError) as exc:
-        warnings.warn(
-            f"AITER_A2A_FG_RELEASE={mode!r} needs the XCD count ({exc}); "
-            "using 'per_wg'",
-            RuntimeWarning,
-            stacklevel=3,
-        )
-        return "per_wg", 0
+    with torch.cuda.device(device):
+        return mode, get_num_xcds(default=_FALLBACK_N_XCD)
 
 
 def _payload_size(
@@ -250,7 +241,7 @@ class AttentionA2AIntraNodeOp:
     wait loop trap after N polls instead of hanging; part of the cache key.
     AITER_A2A_FG_RELEASE selects how a fine-grained inbox's payload lines are
     written back from every XCD's L2 before the completion flag: "last_wg"
-    (default), "flush_kernel", "per_wg", or "none" (unsafe, for measurement);
+    (default), "flush_kernel", or "none" (unsafe, for measurement);
     see FG_RELEASE_MODES. Part of the cache key, and all ranks must agree.
     """
 
