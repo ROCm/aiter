@@ -338,6 +338,35 @@ def test_pa_decode_reduce_split_groups(device, head_size, dtype, with_sinks):
         )
 
 
+@pytest.mark.parametrize(
+    "per_token_kv,query_length,cluster_merge",
+    [(True, 4, 0), (True, 4, 8), (False, 1, 0)],
+)
+def test_gfx1250_pa_decode_tile_vgpr_cap(per_token_kv, query_length, cluster_merge):
+    """gfx1250 tile kernels compile for four waves per SIMD, at most 256 VGPRs.
+
+    The per-token MTP4 kernel otherwise takes 285 VGPRs and intermittently
+    faults under load (MiniMax-M3 decode at concurrency 64).
+    """
+    if importlib.util.find_spec("flydsl") is None:
+        pytest.skip("FlyDSL is not installed")
+    from aiter.ops.flydsl.kernels.pa_decode_kernel import compile_gfx1250_pa_decode
+
+    compiled = compile_gfx1250_pa_decode(
+        head_dim=128,
+        query_group_size=16,
+        block_size=128,
+        softmax_scale=None,
+        query_dtype="bf16",
+        per_token_kv=per_token_kv,
+        query_length=query_length,
+        trans_v=False,
+        sliding_window=0,
+        cluster_merge=cluster_merge,
+    )
+    assert compiled["launch"].compile_hints["waves_per_eu"] == 4
+
+
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
 @pytest.mark.parametrize(
     "mode,dim,scratch_offset",
