@@ -635,20 +635,17 @@ def test_flydsl_attn_res_runs_on_the_given_stream(explicit: bool):
 @_skip_unsupported_gfx
 @pytest.mark.skipif(torch.cuda.device_count() < 2, reason="needs two GPUs")
 def test_flydsl_attn_res_runs_on_the_inputs_device():
-    # A plan built on cuda:0 cannot launch on cuda:1, so start and end with empty caches.
-    attn_res_kernel._clear_caches()
-    try:
-        with torch.cuda.device(1):
+    """The same geometry runs on cuda:0, then on cuda:1 while cuda:0 is current."""
+    for device in (0, 1):
+        with torch.cuda.device(device):
             inputs = _make_inputs(17, num_blocks=3)
             expected = _call(attn_res_reference, inputs, MIX)[0]
         with torch.cuda.device(0):
             out = _call(flydsl_attn_res, inputs, MIX)
             assert torch.cuda.current_device() == 0
-        torch.cuda.synchronize(1)
-        assert out[0].device == torch.device("cuda", 1)
-        _assert_y_close(out[0], expected, MIX, "inputs on cuda:1")
-    finally:
-        attn_res_kernel._clear_caches()
+        torch.cuda.synchronize(device)
+        assert out[0].device == torch.device("cuda", device)
+        _assert_y_close(out[0], expected, MIX, f"inputs on cuda:{device}")
 
 
 _BLOCK_OUT_CFGS = tuple(

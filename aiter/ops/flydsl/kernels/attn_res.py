@@ -284,7 +284,7 @@ _ARCH_TUNING = {
 
 @dataclass(frozen=True)
 class _AttnResSpec:
-    """Must hold every compile-time choice: it is the ``_build_attn_res`` cache key."""
+    """Must hold every compile-time choice: with the device it keys ``_build_attn_res``."""
 
     hidden_size: int
     num_blocks: int
@@ -330,8 +330,12 @@ def _clear_caches() -> None:
 
 
 @lru_cache(maxsize=256)
-def _build_attn_res(spec: _AttnResSpec):
-    """Return one fixed-shape, compile-time-specialized AttnRes launcher."""
+def _build_attn_res(spec: _AttnResSpec, device_index: int):
+    """Return one fixed-shape, compile-time-specialized AttnRes launcher.
+
+    A launcher keeps the kernel it first loads, which belongs to one device, so
+    each device gets its own.
+    """
     hidden_size = spec.hidden_size
     num_blocks = spec.num_blocks
     has_add = spec.has_add
@@ -1254,7 +1258,8 @@ def _plan_launch(
                 narrow_prefetch_in_flight=tuning.narrow_prefetch_in_flight,
                 bf16_dot=gfx950_ops
                 and not (wide_grid and num_tokens > _WIDE_BF16_DOT_MAX_TOKENS),
-            )
+            ),
+            prefix.device.index,
         )
 
     return _LaunchPlan(
