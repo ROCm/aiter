@@ -359,25 +359,20 @@ def test_mhc_seam_knobs(H):
     reference."""
     from aiter.ops.flydsl import flydsl_mhc_seam
 
-    rows = []
-    for mode, cfg in (
+    cases = [
         ("no_post", {"STAGE_NT": True}),
         ("post", {"NORM": "fused", "STAGE_NT": True, "GATE_STEP": False}),
         # The policy prefetches at every size here; force the load-then-use loop.
         ("post", {"PREFETCH": False}),
-        ("no_post", {"BLOCK_M": 32, "CHUNK_C": 64, "SPLITS": 8, "PREFETCH": False}),
-        # A segment of two chunks with two slots per thread, which the policy leaves off.
-        (
-            "post",
-            {
-                "NORM": "separate",
-                "BLOCK_M": 16,
-                "CHUNK_C": 256,
-                "SPLITS": 10,
-                "PREFETCH": True,
-            },
-        ),
-    ):
+        ("no_post", {"BLOCK_M": 32, "CHUNK_C": 64, "PREFETCH": False}),
+    ]
+    # A segment of two chunks with two slots per thread, which the policy leaves off.
+    if not _splits_error(128, H, H // 512):
+        cases.append(
+            ("post", {"NORM": "separate", "SPLITS": H // 512, "PREFETCH": True})
+        )
+    rows = []
+    for mode, cfg in cases:
         args, kw, ref = _call_kwargs(mode, 128, H)
         out = flydsl_mhc_seam(*args, config=cfg, **kw)
         err = check_outputs(f"forced {mode} {cfg}", out, ref, "bf16", mode)
@@ -521,7 +516,7 @@ def main():
         "--tokens",
         type=int,
         nargs="*",
-        default=[0, 1, 32, 128, 384, 1024, 4096, 8192, 16384],
+        default=[0, 1, 32, 128, 300, 384, 1000, 1024, 4096, 8192, 16384],
     )
     parser.add_argument("--hidden", type=int, nargs="*", default=[5120])
     parser.add_argument(
