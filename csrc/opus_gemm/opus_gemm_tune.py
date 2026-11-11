@@ -732,10 +732,15 @@ def kid_rejects_shape(k_inst, M, N, K):
         )
 
     if k_inst.kernel_tag == "a16w16_mono_tile":
-        # mono_tile is divisible-only (has_oob=False is intrinsic; the
-        # launcher asserts M%B_M==N%B_N==K%B_K==0) and has no splitk /
-        # K-tail mask path. Reject any non-aligned shape up front.
-        if M % k_inst.B_M != 0 or N % k_inst.B_N != 0 or K % k_inst.B_K != 0:
+        # The generated launcher only guards N and K. The kernel bounds the
+        # partial M tile through its per-WG buffer resource, and the runtime
+        # launch plan deliberately accepts M tails for mono_tile, so the
+        # tuner must not reject the same shapes the dispatcher selects.
+        if N % k_inst.B_N != 0 or K % k_inst.B_K != 0:
+            return True
+        # The launcher also requires at least two K iterations
+        # (loops_ >= 2). K % B_K == 0 above makes the division exact.
+        if K < 2 * k_inst.B_K:
             return True
         # N%16 vector-store guard (same root cause as a16w16 family);
         # already implied by N%B_N==0 with B_N % 64 == 0, but keep the
