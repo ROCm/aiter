@@ -42,8 +42,8 @@ _MAX_BLOCK_THREADS = 1024
 # Buffer loads and stores take a 32-bit byte offset from the tensor's base.
 _BUFFER_LIMIT_BYTES = 1 << 32
 # 2 is the non-temporal cache policy. Outputs are write-once and never read back.
-# Block sources are read once per launch, so they use it only where
-# _ArchTuning.nontemporal_block_loads is set.
+# Block sources are read once per launch, so they use it once the call moves at
+# least _ArchTuning.nontemporal_block_min_bytes.
 _NONTEMPORAL_CACHE_MODIFIER = 2
 # Multi-wave rows on the wide grid.
 _WIDE_ROW_THREADS = 256
@@ -252,13 +252,11 @@ def _resolve_rows_per_wg(row_threads: int, rows_per_wg: int | None) -> int:
 
 @dataclass(frozen=True)
 class _ArchTuning:
-    """Launch and codegen choices for one GPU arch.
+    """Launch and codegen choices for one GPU arch, measured on MI300X and MI355X."""
 
-    The gfx942 values are measured on MI300X. gfx950 keeps its earlier values
-    because these levers are unmeasured there.
-    """
-
-    nontemporal_block_loads: bool
+    # On gfx950, non-temporal block loads are 4 to 24% faster once a call moves
+    # 440 MB or more, and up to 16% slower at 335 MB or less.
+    nontemporal_block_min_bytes: int
     # Block-source loads in flight on the narrow grid; the prefix is already in
     # registers.
     narrow_prefetch_in_flight: int
@@ -268,13 +266,13 @@ class _ArchTuning:
 
 _ARCH_TUNING = {
     "gfx942": _ArchTuning(
-        nontemporal_block_loads=True,
+        nontemporal_block_min_bytes=0,
         narrow_prefetch_in_flight=8,
         wide_grid_cu_divisor=2,
         alias_wide_grid_cu_divisor=1,
     ),
     "gfx950": _ArchTuning(
-        nontemporal_block_loads=False,
+        nontemporal_block_min_bytes=384 << 20,
         narrow_prefetch_in_flight=3,
         wide_grid_cu_divisor=1,
         alias_wide_grid_cu_divisor=1,
@@ -1236,6 +1234,17 @@ def _plan_launch(
             and _wide_row_supported(hidden_size)
         )
         gfx950_ops = _has_gfx950_ops()
+        block_out_rows_written = (
+            0 if block_out_shape is None else 1 if block_alias else num_blocks + 1
+        )
+        rows_read = num_blocks + 1 + len(adds)
+        rows_written = 1 + int(bool(adds)) + block_out_rows_written
+        moved_bytes = (
+            num_tokens
+            * hidden_size
+            * prefix.element_size()
+            * (rows_read + rows_written)
+        )
         launcher = _build_attn_res(
             _AttnResSpec(
                 hidden_size=hidden_size,
@@ -1254,7 +1263,8 @@ def _plan_launch(
                 fp8_dtype=out_quant_dtype,
                 block_alias=block_alias,
                 native_swap=gfx950_ops,
-                nontemporal_block_loads=tuning.nontemporal_block_loads,
+                nontemporal_block_loads=moved_bytes
+                >= tuning.nontemporal_block_min_bytes,
                 narrow_prefetch_in_flight=tuning.narrow_prefetch_in_flight,
                 bf16_dot=gfx950_ops
                 and not (wide_grid and num_tokens > _WIDE_BF16_DOT_MAX_TOKENS),

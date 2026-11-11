@@ -408,6 +408,13 @@ def test_flydsl_attn_res_wide_grid_above_bf16_dot_limit(cfg: _Config):
 
 
 @_skip_unsupported_gfx
+@pytest.mark.parametrize("cfg", (MIX, ALL_ON), ids=str)
+def test_flydsl_attn_res_call_larger_than_the_mall(cfg: _Config):
+    """20480 rows of D=1024 move over 384 MiB, so gfx950 takes non-temporal block loads."""
+    _run_and_check(20480, _MAX_BLOCKS, cfg, hidden_size=_D_SMALL)
+
+
+@_skip_unsupported_gfx
 @pytest.mark.parametrize("hidden_size", (2048, 3072, 5120, 9216, 16384))
 @pytest.mark.parametrize("cfg", (MIX, EVERY_FEATURE, ALL_ON_FP8), ids=str)
 def test_flydsl_attn_res_wave_counts(hidden_size: int, cfg: _Config):
