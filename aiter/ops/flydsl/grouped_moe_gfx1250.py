@@ -807,6 +807,10 @@ def _grouped_a8w4_tdm_moe(
         ),
     )
     max_m = max(_align_m, _tdm_align_up(token_num * topk, _align_m))
+    # Expert segments start on _align_m rows; a GEMM whose tile_m is smaller skips
+    # the tiles that fall wholly in an expert's alignment gap (compact plans keep
+    # their own alignment, so they opt out).
+    _layout_align = 0 if _compact else _align_m
     if _compact:
         # Rows this step can hold, falling back to the arena's when the caller
         # gave no bound. The arena is sized for a full prefill, so spending it on
@@ -1039,6 +1043,7 @@ def _grouped_a8w4_tdm_moe(
     )
     if _gemm2_m_align:
         _ep_gemm2_kwargs["m_align"] = _gemm2_m_align
+    _gemm2_align = _ep_gemm2_kwargs.pop("m_align", _layout_align)
 
     out_is_f16 = 1 if (dtype == torch.float16 or dtype == dtypes.fp16) else 0
     two_inter = 2 * inter_dim
@@ -1273,6 +1278,7 @@ def _grouped_a8w4_tdm_moe(
             tdm_b_th=tdm_b_th,
             lds_soa_load_interleave=lds_soa_load_interleave,
             rolled_drain=rolled_drain,
+            m_align=_layout_align,
             k_waves=k_waves1,
             row_major_ascale=int(_row_major_ascale),
             a_row_stride_bytes=_a1_wire_stride,
@@ -1314,6 +1320,7 @@ def _grouped_a8w4_tdm_moe(
             tdm_b_th=tdm_b_th,
             lds_soa_load_interleave=lds_soa_load_interleave,
             rolled_drain=rolled_drain,
+            m_align=_layout_align,
             k_waves=k_waves1,
             row_major_ascale=int(_row_major_ascale),
             a_row_stride_bytes=_a1_wire_stride,
@@ -1367,6 +1374,7 @@ def _grouped_a8w4_tdm_moe(
         rolled_drain=rolled_drain,
         k_waves=k_waves2,
         **_ep_gemm2_kwargs,
+        m_align=_gemm2_align,
     )
 
     if kernel_bench_callable is not None:
@@ -1453,6 +1461,7 @@ def _grouped_a8w4_tdm_moe(
                         lds_soa_load_interleave=lds_soa_load_interleave,
                         row_major_ascale=int(_row_major_ascale),
                         rolled_drain=rolled_drain,
+                        m_align=_layout_align,
                         k_waves=k_waves1,
                         **_situ_kw,
                     ),
@@ -1496,6 +1505,7 @@ def _grouped_a8w4_tdm_moe(
                         lds_soa_load_interleave=lds_soa_load_interleave,
                         row_major_ascale=int(_row_major_ascale),
                         rolled_drain=rolled_drain,
+                        m_align=_layout_align,
                         k_waves=k_waves1,
                         **_situ_kw,
                     ),
@@ -1536,6 +1546,7 @@ def _grouped_a8w4_tdm_moe(
                     tdm_b_th=tdm_b_th,
                     lds_soa_load_interleave=lds_soa_load_interleave,
                     rolled_drain=rolled_drain,
+                    m_align=_layout_align,
                     k_waves=k_waves2,
                 ),
             )
@@ -1866,6 +1877,50 @@ def grouped_gemm_gfx1250_a8w4(
                     cfg_row.get("persistent_workers2"), 0
                 )
 
+        # Prefill shape rule (no CSV row): large-M tiles for model_dim 16384 /
+        # inter_dim 4096 at token_num >= 2048. Measured on gfx1250 (one EP8 rank,
+        # E=64): fp4 activations -20% at T=8192, -11% at 4096, -9% at 2048,
+        # +12% at 1024; fp8 activations -11% at 4096/8192, even at 2048, +25%
+        # at <= 1024, so decode keeps the kernel defaults.
+        # AITER_TDM_PREFILL_TILE_RULE=0 disables.
+        if (
+            cfg_row is None
+            and model_dim == 16384
+            and inter_dim == 4096
+            and token_num >= 2048
+            and os.environ.get("AITER_TDM_PREFILL_TILE_RULE", "1") in _TRUTHY_ENV
+        ):
+            _tdm_kw.update(
+                tile_m=128,
+                tile_n=256,
+                tile_k=128,
+                num_buffers=4,
+                tile_m2=128,
+                tile_n2=256,
+                tile_k2=256,
+                num_buffers2=2,
+            )
+        # Same rule for inter_dim 512 (one TP8 EP1 rank, E=512): 128-row gate-up
+        # tiles, gemm2 keeps 64 (gap tiles skipped via m_align). Whole MoE,
+        # fp4 activations: -8% at T=8192, -5% at 4096, even at 2048, +16% at 1024.
+        elif (
+            cfg_row is None
+            and model_dim == 16384
+            and inter_dim == 512
+            and token_num >= 4096
+            and os.environ.get("AITER_TDM_PREFILL_TILE_RULE", "1") in _TRUTHY_ENV
+        ):
+            _tdm_kw.update(
+                tile_m=128,
+                tile_n=256,
+                tile_k=128,
+                num_buffers=3,
+                tile_m2=64,
+                tile_n2=256,
+                tile_k2=128,
+                num_buffers2=3,
+            )
+
         # Env overrides for tuning (present-check so any set value wins over CSV /
         # defaults). Stage2 (*2) falls back to the stage1 value when unset. Set
         # AITER_TDM_TILE_M / _TILE_N / _TILE_K / _NUM_BUFFERS (+ *_M2/_N2/_K2/
@@ -1976,6 +2031,7 @@ def _get_compiled_gather_reduce(
     split_k: int = 1,
     vec_dwords: int = 2,
     w_dtype: str = "f32",
+    ep_compact: int = 0,
 ):
     """Compile and cache the one-pass MoE gather-reduce kernel."""
     from aiter.ops.flydsl.kernels.moe_gather_reduce import (
@@ -1983,7 +2039,7 @@ def _get_compiled_gather_reduce(
     )
 
     return build_moe_gather_reduce_module(
-        model_dim, topk, out_dtype, split_k, vec_dwords, w_dtype
+        model_dim, topk, out_dtype, split_k, vec_dwords, w_dtype, ep_compact
     )
 
 
@@ -2286,8 +2342,22 @@ def flydsl_moe_gather_reduce(
         )
 
     gather_vec = _choose_gather_reduce_vec(token_num, model_dim)
+    # EP route maps carry DROPPED_ROUTE_ROW slots (most of the top-k on one rank): use the compact kernel
+    # (whole-row block + skip dropped routes). Non-EP maps are all live and keep the original kernel.
+    from aiter.ops.flydsl.kernels.moe_gather_reduce import (
+        GR_EP_COMPACT_ENV,
+        GR_EP_ROWLOOP_MIN_TOKENS,
+    )
+
+    # GR_EP_COMPACT_ENV: 0 off, 1 = skip dropped only, 2 = skip + whole-row block, 3 (default) = auto by token count.
+    if num_valid_tokens is None or not GR_EP_COMPACT_ENV:
+        ep_compact = 0
+    elif GR_EP_COMPACT_ENV in (1, 2):
+        ep_compact = GR_EP_COMPACT_ENV
+    else:
+        ep_compact = 2 if token_num >= GR_EP_ROWLOOP_MIN_TOKENS else 1
     launch = _get_compiled_gather_reduce(
-        model_dim, topk, out_dtype, split_k, gather_vec, w_dtype
+        model_dim, topk, out_dtype, split_k, gather_vec, w_dtype, ep_compact
     )
     slice_stride_dw = E * max_m * (model_dim // 2)
     # Skip dead-tail output tokens whose route map is unwritten. Default (no
