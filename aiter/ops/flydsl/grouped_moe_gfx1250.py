@@ -838,7 +838,7 @@ def _grouped_a8w4_tdm_moe(
     # Small TP batches: one workgroup counts, scans and remaps every route, in
     # place of the counter fill, route and psum-remap launches; it runs where the
     # psum is built below. HERD routes carry K+1 candidates per row and are
-    # dropped to K by herd_route_psum_remap, which this kernel does not do.
+    # dropped to K by herd_route_psum, which this kernel does not do.
     _fused_tp_route = (
         not herd_topk
         and not _compact
@@ -934,11 +934,12 @@ def _grouped_a8w4_tdm_moe(
     elif not _fused_tp_route:
         _fuse_ep_route_quant = False
         if herd_topk:
-            _masked_m, topids_to_rows, herd_psum, herd_gather_w = herd_route_psum_remap(
-                topk_ids,
+            from aiter.ops.flydsl.herd_topk import herd_route_psum
+
+            herd_gather_w, _, _masked_m, topids_to_rows, herd_psum = herd_route_psum(
                 topk_weight,
+                topk_ids,
                 E,
-                max_m,
                 _align_m,
                 herd_routed_scaling_factor,
                 num_valid_rows=num_local_tokens,
@@ -2085,77 +2086,6 @@ def fused_route_psum_remap(
         current_stream_arg(),
     )
     return masked_m, topids_to_rows.view(token_num, topk), psum
-
-
-@functools.cache
-def _get_compiled_route_psum_herd(topk: int, has_num_valid_rows: bool = False):
-    from aiter.ops.flydsl.kernels.moe_contiguous_psum import (
-        build_moe_route_psum_herd_module,
-    )
-
-    return build_moe_route_psum_herd_module(topk, has_num_valid_rows)
-
-
-def herd_route_psum_remap(
-    cand_ids: torch.Tensor,
-    cand_scores: torch.Tensor,
-    experts: int,
-    max_m: int,
-    tile_m: int,
-    routed_scaling_factor: float = 1.0,
-    num_valid_rows: torch.Tensor | None = None,
-):
-    """HERD drop, route and prefix sum over Top-(K+1) candidates.
-
-    ``num_valid_rows``: optional int32 device tensor whose first element is the
-    count of real rows. Rows at or past it are padding: they stay out of the
-    batch popularity, and their routes take ``DROPPED_ROUTE_ROW`` and weight 0.
-    Read on device, so a replayed CUDA graph follows each step's count.
-    """
-    device = cand_ids.device
-    token_num, kp1 = cand_ids.shape
-    topk = kp1 - 1
-    experts = int(experts)
-    if experts > _FUSED_ROUTE_PSUM_MAX_EXPERTS:
-        raise ValueError(
-            f"herd_route_psum_remap supports at most "
-            f"{_FUSED_ROUTE_PSUM_MAX_EXPERTS} experts, got {experts}"
-        )
-    topids_to_rows = torch.empty(token_num * topk, dtype=torch.int32, device=device)
-    gather_w = torch.empty(token_num * topk, dtype=torch.float32, device=device)
-    masked_m = torch.empty(experts, dtype=torch.int32, device=device)
-    starts = torch.empty(experts, dtype=torch.int32, device=device)
-    psum = torch.empty(experts, dtype=torch.int32, device=device)
-    if num_valid_rows is None:
-        # Unread without a count; a null pointer stands in for the argument.
-        valid_rows_i32 = torch.empty(0, dtype=torch.int32, device=device)
-    else:
-        valid_rows_i32 = (
-            num_valid_rows.reshape(-1)[:1].to(device=device, dtype=torch.int32)
-        ).contiguous()
-    _run_compiled(
-        _get_compiled_route_psum_herd(topk, num_valid_rows is not None),
-        ptr_arg(cand_ids.to(torch.int32).contiguous().reshape(-1)),
-        ptr_arg(cand_scores.to(torch.float32).contiguous().reshape(-1)),
-        ptr_arg(topids_to_rows),
-        ptr_arg(gather_w),
-        ptr_arg(masked_m),
-        ptr_arg(starts),
-        ptr_arg(psum),
-        int(token_num),
-        experts,
-        int(max_m),
-        int(tile_m),
-        float(routed_scaling_factor),
-        ptr_arg(valid_rows_i32),
-        current_stream_arg(),
-    )
-    return (
-        masked_m,
-        topids_to_rows.view(token_num, topk),
-        psum,
-        gather_w.view(token_num, topk),
-    )
 
 
 def contiguous_psum(masked_m: torch.Tensor, experts: int, tile_m: int):
