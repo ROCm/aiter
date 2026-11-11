@@ -203,8 +203,9 @@ class AttentionA2AIntraNodeOp:
 
     Inbox_memory selects the memory type of the buffers peers write into:
     "uncached" allocates them in the MoRI symmetric heap, "finegrained" in HIP
-    IPC buffers exchanged over group. "auto" (default) is uncached on xGMI and
-    fine-grained on PCIe at TP4 and TP8. Only "uncached" needs MoRI initialized.
+    IPC buffers exchanged over group. "uncached" is the default, so existing
+    callers are unchanged. "auto" is uncached on xGMI and fine-grained on PCIe
+    at TP4 and TP8. Only "uncached" needs MoRI initialized.
 
     Returned outputs, and views of them, live in the op's peer-written buffers.
     They stay valid after the op is closed or deleted, as long as they are
@@ -239,7 +240,7 @@ class AttentionA2AIntraNodeOp:
         softmax_scale=None,
         hadamard=None,
         valid_kv_len=None,
-        inbox_memory="auto",
+        inbox_memory="uncached",
         group,
     ):
         self._next_role = 0
