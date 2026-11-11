@@ -10,6 +10,19 @@ from aiter.ops.triton.utils.types import e4m3_dtype
 float8_info = torch.finfo(e4m3_dtype)
 
 
+# e4m3 flushes P < 2^-9 to zero, so P is scaled into range for the PV dot and the epilogue
+# divides it back out. P <= 1, and e4m3fnuz (gfx942) tops out at 240, so 128 there.
+P_FP8_SCALE = tl.constexpr(256.0 if float8_info.max >= 448 else 128.0)
+
+
+@triton.jit
+def _cast_p(P, dtype: tl.constexpr):
+    if dtype.is_fp8():
+        return (P * P_FP8_SCALE).to(dtype)
+    else:
+        return P.to(dtype)
+
+
 @triton.jit
 def fast_exp(x):
     RCP_LN2: tl.constexpr = 1.4426950408889634
@@ -381,7 +394,7 @@ def kernel_unified_attention_2d(
             acc = acc * alpha[:, None]
             L = L * alpha + l_j
             M = m_j
-            acc = tl.dot(P.to(V.dtype), V, acc=acc)
+            acc = tl.dot(_cast_p(P, V.dtype), V, acc=acc)
 
         masked_tile_start = unmasked_tile_end
 
@@ -538,7 +551,7 @@ def kernel_unified_attention_2d(
         M = m_j
 
         # acc : (BLOCK_M, HEAD_SIZE_PADDED)
-        acc = tl.dot(P.to(V.dtype), V, acc=acc)
+        acc = tl.dot(_cast_p(P, V.dtype), V, acc=acc)
 
     # epilogue
     # This helps the compiler do Newton Raphson on l_i vs on acc which is much larger.
@@ -547,6 +560,8 @@ def kernel_unified_attention_2d(
     else:
         one_over_L = 1.0 / L[:, None]
     acc = acc * one_over_L
+    if Q.dtype.is_fp8():
+        acc = acc * (1.0 / P_FP8_SCALE)
     if out_scale_ptr is not None:
         acc = acc / tl.load(out_scale_ptr)
 
@@ -965,8 +980,10 @@ def kernel_unified_attention_3d(
         M = m_j
 
         # acc : (BLOCK_M, HEAD_SIZE_PADDED)
-        acc = tl.dot(P.to(V.dtype), V, acc=acc)
+        acc = tl.dot(_cast_p(P, V.dtype), V, acc=acc)
 
+    if Q.dtype.is_fp8():
+        out_factor = out_factor * (1.0 / P_FP8_SCALE)
     acc = acc * out_factor
     if NUM_SEGMENTS_PER_SEQ == 1:
         one_over_L = 1.0 / L[:, None]

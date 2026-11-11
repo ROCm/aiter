@@ -16,6 +16,19 @@ float8_info = torch.finfo(e4m3_dtype)
 
 _MAX_PROPAGATE_NAN_ALL = gl.constexpr(PropagateNan.ALL)
 
+# e4m3 flushes P < 2^-9 to zero, so P is scaled into range for the PV MMA and out_scale
+# divides it back out.
+_P_FP8_SCALE = gl.constexpr(256.0)
+
+
+@gluon.jit
+def _cast_p(p, dtype: gl.constexpr):
+    if dtype.is_fp8():
+        return (p * _P_FP8_SCALE).to(dtype)
+    else:
+        return p.to(dtype)
+
+
 # tdm.async_gather takes a source column in upstream Triton (desc, rows, col, dst) but not in every gfx1250 build
 # (desc, rows, dst); _tdm_gather calls whichever this Triton has.
 _GATHER_TAKES_COL = gl.constexpr(
@@ -1363,6 +1376,9 @@ class AttentionProgram:
             out_scale = 1.0
         if v_descale_ptr is not None:
             out_scale = out_scale * gl.load(v_descale_ptr)
+        # an NVFP4 V runs a BF16 PV, so its P is not scaled
+        if q.dtype.is_fp8() and not cfg.V_NVFP4:
+            out_scale = out_scale * (1.0 / _P_FP8_SCALE)
 
         return AttentionProgram(
             cfg,
@@ -1473,7 +1489,7 @@ class AttentionProgram:
         acc = acc * alpha[:, None]
         l_ij = gl.sum(p, 1)
         if target_dtype != gl.bfloat16 and not self.cfg.V_NVFP4:
-            p = p.to(target_dtype)
+            p = _cast_p(p, target_dtype)
         else:
             # NVFP4 V: the PV WMMA is BF16 whatever the Q dtype
             p = p.to(gl.bfloat16, fp_downcast_rounding="rtz")
@@ -1832,7 +1848,7 @@ class AttentionProgram:
         acc0 = acc0 * alpha[:, None]
         acc1 = acc1 * alpha[:, None]
         if target_dtype != gl.bfloat16:
-            p = p.to(target_dtype)
+            p = _cast_p(p, target_dtype)
         else:
             p = p.to(target_dtype, fp_downcast_rounding="rtz")
         L = L * alpha + l_ij
@@ -2277,7 +2293,7 @@ def attention_loop_tensor_subtile_split(
         p = pgm.concat_subtile(p0, p1)
         l_ij = gl.sum(p, 1)
         L = L * alpha + l_ij
-        p = p.to(q.dtype)
+        p = _cast_p(p, q.dtype)
         k = kv_loader.load_k_from_shared(
             later="VK",
             wait_count=2,
@@ -2369,7 +2385,7 @@ def attention_loop_tensor_subtile_split(
     p = pgm.concat_subtile(p0, p1)
     l_ij = gl.sum(p, 1)
     L = L * alpha + l_ij
-    p = p.to(q.dtype)
+    p = _cast_p(p, q.dtype)
 
     if cfg.NUM_BUFFERS == 2 or not MERGE_EPI_TDM_WAITS:
         kv_loader.load_v_to_shared(next2_physical_block_idx, buffer_id=buf_tile_next2)
@@ -2436,7 +2452,7 @@ def attention_loop_tensor_subtile_split(
         qk1 = pgm.compute_qk_subtile(k1_s)
     l_ij = gl.sum(p, 1)
     L = L * alpha + l_ij
-    p = p.to(q.dtype)
+    p = _cast_p(p, q.dtype)
     qk1 = pgm.apply_mask_qk_subtile(qk1, epilogue_t_3, 1)
 
     v0_s, v1_s = pgm.split_subtile(v)
@@ -2472,7 +2488,7 @@ def attention_loop_tensor_subtile_split(
     acc0 = acc0 * alpha[:, None]
     l_ij = gl.sum(p, 1)
     L = L * alpha + l_ij
-    p = p.to(q.dtype)
+    p = _cast_p(p, q.dtype)
 
     v0_s, v1_s = pgm.split_subtile(v)
     acc0 = pgm.compute_pv(p, v0_s, acc0)
@@ -2917,8 +2933,8 @@ def _unified_attention_gluon_kernel_2d(
                 mask=query_mask_1_pv,
                 other=float("-inf"),
             ).to(dtype=gl.float32)
-            # NOTE: See softmax0 why
-            M = M / SCALE
+            # S is raw q.k, so the sink is divided by the full QK scale, descales included
+            M = M * (pgm.cfg.RCP_LN2 / pgm.QK_scale)
         else:
             M = gl.full(
                 [BLOCK_M],
