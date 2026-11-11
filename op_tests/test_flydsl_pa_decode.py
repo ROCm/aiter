@@ -94,8 +94,9 @@ def test_pa_decode_plan(
         ]
         total_tiles = max(sum(last - first for first, last in ranges), 1)
         remaining = plan.capacity - sum(last > first for first, last in ranges)
-        # gfx950 single-block plans bound every task by the smallest tile
-        # count T whose tasks fit the capacity; others split proportionally.
+        # gfx942/gfx950 single-block plans bound every task by the smallest
+        # tile count T whose tasks fit the capacity; others split
+        # proportionally.
         args = calls[-1][0]
         balanced = len(args) > 3 and args[3] and args[0] <= args[1]
         if balanced:
