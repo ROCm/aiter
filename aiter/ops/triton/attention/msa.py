@@ -33,7 +33,7 @@ from aiter.ops.triton._triton_kernels.attention.msa import (
     msa_gfx950_triton_kernel,
     msa_k4v8_store_kernel,
     msa_merge_kernel,
-    msa_q_mxfp8x2_kernel,
+    msa_q_mxfp8_kernel,
     msa_union_kernel,
 )
 
@@ -214,7 +214,7 @@ def msa_fwd(
     query_pos: torch.Tensor | None = None,
     out: torch.Tensor | None = None,
     kv_splits: int | None = None,
-    q_mode: str = "mxfp8x2",
+    q_mode: str = "mxfp8",
     p_fp8: bool = True,
     workspace: dict | None = None,
     num_warps: int = 4,
@@ -237,13 +237,14 @@ def msa_fwd(
     with none gives 0.
 
     q_mode: how QK^T meets the MXFP4 K.
+      "mxfp8"    Q as one MXFP8 term, one scaled MFMA (default; ~2% rms Q
+                 rounding, accuracy-neutral end to end on MiniMax-M3.1)
       "mxfp8x2"  Q as two MXFP8 terms (hi + lo), two scaled MFMAs; about
-                 bf16 accuracy (default)
-      "mxfp8"    Q as one MXFP8 term, one scaled MFMA; ~2% rms Q rounding
+                 bf16 Q accuracy
       "bf16"     bf16 Q, K upcast to bf16
     p_fp8: P as fp8 (fp8 MFMA against the fp8 V) rather than bf16 (V upcast).
-    backend: "triton" (any arch) or "gluon" (gfx950; q_mode mxfp8x2 and fp8
-    P only).
+    backend: "triton" (any arch) or "gluon" (gfx950; q_mode mxfp8 / mxfp8x2,
+    fp8 P).
     workspace: the split partials and arrival counters, grown on demand and
     reused across calls (a module-level one per device by default). Size it
     with msa_workspace() before CUDA graph capture.
@@ -356,20 +357,21 @@ def _gluon_fwd(
         msa_gfx950_gluon_prefill_kernel,
     )
 
-    if q_mode != "mxfp8x2" or not p_fp8:
-        raise ValueError("the gluon backend runs q_mode='mxfp8x2' with fp8 P")
+    if q_mode not in ("mxfp8", "mxfp8x2") or not p_fp8:
+        raise ValueError("the gluon backend runs q_mode 'mxfp8' or 'mxfp8x2' with fp8 P")
+    qt = 2 if q_mode == "mxfp8x2" else 1
     if hg != 16:
         raise ValueError("the gluon backend needs 16 query heads per KV head")
     rows, num_heads, _ = q.shape
     num_kv_heads = kv_cache.shape[1]
-    q8 = torch.empty((rows, num_heads, 2, HEAD_DIM), dtype=_FP8, device=q.device)
+    q8 = torch.empty((rows, num_heads, qt, HEAD_DIM), dtype=_FP8, device=q.device)
     qs = torch.empty(
-        (rows, num_heads, 2, HEAD_DIM // 32), dtype=torch.uint8, device=q.device
+        (rows, num_heads, qt, HEAD_DIM // 32), dtype=torch.uint8, device=q.device
     )
     pairs = rows * num_heads
-    msa_q_mxfp8x2_kernel[(triton.cdiv(pairs, 64),)](
+    msa_q_mxfp8_kernel[(triton.cdiv(pairs, 64),)](
         q, q8, qs, sm_scale * 1.4426950408889634, pairs, num_heads, q.stride(0),
-        q.stride(1), D=HEAD_DIM, BLOCK=64, num_warps=4,
+        q.stride(1), D=HEAD_DIM, QT=qt, BLOCK=64, num_warps=4,
     )  # fmt: skip
     if dql == 0:
         # Prefill: TQ consecutive rows walk the union of the pages they selected.
@@ -390,7 +392,7 @@ def _gluon_fwd(
             q8, qs, kv_cache, kv_cache.view(_FP8), uniq, count, tokblk, query_pos,
             out, vs, rows, kv_cache.stride(0), kv_cache.stride(1), out.stride(0),
             out.stride(1), NUM_HEADS=num_heads, TOPK=n_topk, TQ=tq, P_SCALE=P_SCALE,
-            NUM_WARPS=num_warps, num_warps=num_warps,
+            NUM_WARPS=num_warps, QT=qt, num_warps=num_warps,
         )  # fmt: skip
         return
     msa_gfx950_gluon_kernel[(rows, num_kv_heads, kv_splits)](
@@ -420,6 +422,7 @@ def _gluon_fwd(
         DECODE_QL=dql,
         P_SCALE=P_SCALE,
         NUM_WARPS=num_warps,
+        QT=qt,
         num_warps=num_warps,
     )
     if kv_splits > 1:

@@ -10,8 +10,9 @@ each block loads from HBM straight into dot-operand registers (no LDS):
   S^T-free form: S = Q K^T   mfma_scaled 16x16x128, A = MXFP8 Q, B = MXFP4 K
                  O += P V    mfma_scaled 16x16x128, A = fp8 P,   B = fp8 V
 
-Q arrives pre-quantized as two MXFP8 terms (hi + lo, see msa_q_mxfp8x2_kernel)
-so QK^T is two chained scaled MFMAs at about bf16 accuracy. One program is one
+Q arrives pre-quantized as QT MXFP8 terms (msa_q_mxfp8_kernel): QT = 1 is one
+scaled MFMA per block (the default, accuracy-neutral end to end); QT = 2 adds a
+lo term, q - hi, for about bf16 Q accuracy at a second MFMA. One program is one
 query row x the HG query heads of one KV head x one split of its top-k blocks.
 """
 
@@ -39,8 +40,8 @@ def _shuffled(offs_k, offs_n, K_EXTENT: gl.constexpr):
 
 @gluon.jit
 def msa_gfx950_gluon_kernel(
-    q8_ptr,  # e4m3 [rows, H, 2, D]: hi, lo terms (already scaled by sm_scale*log2e)
-    qs_ptr,  # u8   [rows, H, 2, D/32]
+    q8_ptr,  # e4m3 [rows, H, QT, D]: hi (, lo) terms, already scaled by sm_scale*log2e
+    qs_ptr,  # u8   [rows, H, QT, D/32]
     cache_u8_ptr,
     cache_f8_ptr,
     topk_ptr,
@@ -65,6 +66,7 @@ def msa_gfx950_gluon_kernel(
     DECODE_QL: gl.constexpr,
     P_SCALE: gl.constexpr,
     NUM_WARPS: gl.constexpr,
+    QT: gl.constexpr,
 ):
     MFMA: gl.constexpr = gl.amd.AMDMFMALayout(4, [16, 16, 128], True, [1, NUM_WARPS])
     A_OP: gl.constexpr = gl.DotOperandLayout(0, MFMA, 16)
@@ -90,16 +92,17 @@ def msa_gfx950_gluon_kernel(
     # Q terms, straight into the A operand and its scale layout.
     qh = gl.arange(0, HG, layout=gl.SliceLayout(1, A_OP))[:, None]
     qd = gl.arange(0, D, layout=gl.SliceLayout(0, A_OP))[None, :]
-    q_row = q8_ptr + (row.to(gl.int64) * NUM_HEADS + g * HG) * (2 * D)
-    q_offs = qh * (2 * D) + qd
+    q_row = q8_ptr + (row.to(gl.int64) * NUM_HEADS + g * HG) * (QT * D)
+    q_offs = qh * (QT * D) + qd
     q_hi = gl.amd.cdna4.buffer_load(q_row, q_offs)
-    q_lo = gl.amd.cdna4.buffer_load(q_row, q_offs + D)
     sh = gl.arange(0, HG, layout=gl.SliceLayout(1, Q_SCL))[:, None]
     ss = gl.arange(0, NUM_SCALES, layout=gl.SliceLayout(0, Q_SCL))[None, :]
-    qs_row = qs_ptr + (row.to(gl.int64) * NUM_HEADS + g * HG) * (2 * NUM_SCALES)
-    qs_offs = sh * (2 * NUM_SCALES) + ss
+    qs_row = qs_ptr + (row.to(gl.int64) * NUM_HEADS + g * HG) * (QT * NUM_SCALES)
+    qs_offs = sh * (QT * NUM_SCALES) + ss
     qs_hi = gl.amd.cdna4.buffer_load(qs_row, qs_offs)
-    qs_lo = gl.amd.cdna4.buffer_load(qs_row, qs_offs + NUM_SCALES)
+    if QT == 2:
+        q_lo = gl.amd.cdna4.buffer_load(q_row, q_offs + D)
+        qs_lo = gl.amd.cdna4.buffer_load(qs_row, qs_offs + NUM_SCALES)
 
     # Loop-invariant operand offsets inside one (page, KV head) record.
     kb = gl.arange(0, D // 2, layout=gl.SliceLayout(1, B_OP))[:, None]
@@ -134,7 +137,8 @@ def msa_gfx950_gluon_kernel(
         v = gl.amd.cdna4.buffer_load(cache_f8_ptr + base, v_offs)
         s = gl.zeros([HG, PAGE], gl.float32, MFMA)
         s = gl.amd.cdna4.mfma_scaled(q_hi, qs_hi, "e4m3", k, k_sc, "e2m1", s)
-        s = gl.amd.cdna4.mfma_scaled(q_lo, qs_lo, "e4m3", k, k_sc, "e2m1", s)
+        if QT == 2:
+            s = gl.amd.cdna4.mfma_scaled(q_lo, qs_lo, "e4m3", k, k_sc, "e2m1", s)
         ok = valid & (blk * PAGE + tok_n <= pos)
         s = gl.where(ok[None, :], s, float("-inf"))
         m_new = gl.maximum(m_i, gl.max(s, axis=1))
@@ -187,6 +191,7 @@ def msa_gfx950_gluon_prefill_kernel(
     TQ: gl.constexpr,
     P_SCALE: gl.constexpr,
     NUM_WARPS: gl.constexpr,
+    QT: gl.constexpr,
 ):
     """TQ consecutive query rows x the HG heads of one KV head walk the union of
     the pages they selected (msa_union_kernel), so a page several rows share is
@@ -211,17 +216,18 @@ def msa_gfx950_gluon_prefill_kernel(
     qm = gl.arange(0, M, layout=gl.SliceLayout(1, A_OP))[:, None]
     qd = gl.arange(0, D, layout=gl.SliceLayout(0, A_OP))[None, :]
     q_ok = (r0 + qm // HG) < num_rows
-    q_offs = ((r0 + qm // HG).to(gl.int64) * NUM_HEADS + g * HG + qm % HG) * (2 * D) + qd
+    q_offs = ((r0 + qm // HG).to(gl.int64) * NUM_HEADS + g * HG + qm % HG) * (QT * D) + qd
     q_hi = gl.load(q8_ptr + q_offs, mask=q_ok, other=0.0)
-    q_lo = gl.load(q8_ptr + q_offs + D, mask=q_ok, other=0.0)
     sm = gl.arange(0, M, layout=gl.SliceLayout(1, Q_SCL))[:, None]
     ss = gl.arange(0, NUM_SCALES, layout=gl.SliceLayout(0, Q_SCL))[None, :]
     s_ok = (r0 + sm // HG) < num_rows
     qs_offs = ((r0 + sm // HG).to(gl.int64) * NUM_HEADS + g * HG + sm % HG) * (
-        2 * NUM_SCALES
+        QT * NUM_SCALES
     ) + ss
     qs_hi = gl.load(qs_ptr + qs_offs, mask=s_ok, other=127)
-    qs_lo = gl.load(qs_ptr + qs_offs + NUM_SCALES, mask=s_ok, other=127)
+    if QT == 2:
+        q_lo = gl.load(q8_ptr + q_offs + D, mask=q_ok, other=0.0)
+        qs_lo = gl.load(qs_ptr + qs_offs + NUM_SCALES, mask=s_ok, other=127)
 
     kb = gl.arange(0, D // 2, layout=gl.SliceLayout(1, B_OP))[:, None]
     kn = gl.arange(0, PAGE, layout=gl.SliceLayout(0, B_OP))[None, :]
@@ -250,7 +256,8 @@ def msa_gfx950_gluon_prefill_kernel(
         v = gl.amd.cdna4.buffer_load(cache_f8_ptr + base, v_offs)
         s = gl.zeros([M, PAGE], gl.float32, MFMA)
         s = gl.amd.cdna4.mfma_scaled(q_hi, qs_hi, "e4m3", k, k_sc, "e2m1", s)
-        s = gl.amd.cdna4.mfma_scaled(q_lo, qs_lo, "e4m3", k, k_sc, "e2m1", s)
+        if QT == 2:
+            s = gl.amd.cdna4.mfma_scaled(q_lo, qs_lo, "e4m3", k, k_sc, "e2m1", s)
         ok = (row_blk[:, None] >= 0) & (
             row_blk[:, None] * PAGE + tok_n[None, :] <= row_pos[:, None]
         )

@@ -352,7 +352,7 @@ def _merge_splits(
 
 
 @triton.jit
-def msa_q_mxfp8x2_kernel(
+def msa_q_mxfp8_kernel(
     q_ptr,
     q8_ptr,
     qs_ptr,
@@ -362,10 +362,12 @@ def msa_q_mxfp8x2_kernel(
     stride_qt,
     stride_qh,
     D: tl.constexpr,
+    QT: tl.constexpr,
     BLOCK: tl.constexpr,
 ):
-    """Q * qk_scale_log2 of BLOCK (row, head) pairs as two MXFP8 terms, hi then
-    lo: q8 [rows, H, 2, D] e4m3, qs [rows, H, 2, D/32] E8M0 (the Gluon MSA's Q)."""
+    """Q * qk_scale_log2 of BLOCK (row, head) pairs as QT MXFP8 terms (hi, then
+    lo = q - hi when QT == 2): q8 [rows, H, QT, D] e4m3, qs [rows, H, QT, D/32]
+    E8M0 (the Gluon MSA's Q)."""
     pair = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
     ok = pair < num_pairs
     row = (pair // num_heads).to(tl.int64)
@@ -378,13 +380,16 @@ def msa_q_mxfp8x2_kernel(
     )
     q = q.to(tl.float32) * qk_scale_log2
     hi, hi_sc, hi_deq = _mxfp8_quant(q, BLOCK, D)
-    lo, lo_sc, _ = _mxfp8_quant(q - hi_deq, BLOCK, D)
     base = pair.to(tl.int64)[:, None]
-    tl.store(q8_ptr + base * (2 * D) + offs_d[None, :], hi, mask=ok[:, None])
-    tl.store(q8_ptr + base * (2 * D) + D + offs_d[None, :], lo, mask=ok[:, None])
     offs_s = tl.arange(0, D // 32)[None, :]
-    tl.store(qs_ptr + base * (2 * (D // 32)) + offs_s, hi_sc, mask=ok[:, None])
-    tl.store(qs_ptr + base * (2 * (D // 32)) + D // 32 + offs_s, lo_sc, mask=ok[:, None])
+    tl.store(q8_ptr + base * (QT * D) + offs_d[None, :], hi, mask=ok[:, None])
+    tl.store(qs_ptr + base * (QT * (D // 32)) + offs_s, hi_sc, mask=ok[:, None])
+    if QT == 2:
+        lo, lo_sc, _ = _mxfp8_quant(q - hi_deq, BLOCK, D)
+        tl.store(q8_ptr + base * (2 * D) + D + offs_d[None, :], lo, mask=ok[:, None])
+        tl.store(
+            qs_ptr + base * (2 * (D // 32)) + D // 32 + offs_s, lo_sc, mask=ok[:, None]
+        )
 
 
 @triton.jit
