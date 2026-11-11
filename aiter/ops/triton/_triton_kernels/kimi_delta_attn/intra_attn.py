@@ -33,6 +33,7 @@ from aiter.ops.triton._triton_kernels.kimi_delta_attn.utils.index import (
 from aiter.ops.triton._triton_kernels.kimi_delta_attn.wy_fast import (
     recompute_w_u_fwd,
 )
+from aiter.ops.triton.utils._triton.kernel_repr import make_kernel_repr
 from aiter.ops.triton.utils.tuned_config_utils import autotune_configs
 
 if IS_TF32_SUPPORTED:
@@ -50,6 +51,12 @@ else:
     def _gather(src, index, axis, _builder=None):
         """Row-gather fallback: broadcasts the selected row across the output."""
         return tl.sum(src * (tl.arange(0, src.shape[0]) == index)[:, None], 0)[None, :]
+
+
+_intra_sub_chunk_repr = make_kernel_repr(
+    "chunk_delta_attn_fwd_kernel_intra_sub_chunk",
+    ["BT", "BC", "BK", "BATCH_INVARIANT"],
+)
 
 
 @triton.heuristics(
@@ -238,7 +245,7 @@ def _chunk_delta_attn_fwd_intra_token_parallel(
     key=["BT", "BC", "HV"],
     **autotune_cache_kwargs,
 )
-@triton.jit(do_not_specialize=["T"])
+@triton.jit(do_not_specialize=["T"], repr=_intra_sub_chunk_repr)
 def chunk_delta_attn_fwd_kernel_intra_sub_chunk(
     q,
     k,
@@ -258,6 +265,7 @@ def chunk_delta_attn_fwd_kernel_intra_sub_chunk(
     BK: tl.constexpr,
     IS_VARLEN: tl.constexpr,
     USE_GATHER: tl.constexpr,
+    BATCH_INVARIANT: tl.constexpr,
 ):
     i_t, i_i, i_bh = (
         tl.program_id(0).to(tl.int64),
@@ -297,8 +305,14 @@ def chunk_delta_attn_fwd_kernel_intra_sub_chunk(
     p_beta = beta + o_c * HV
     b_beta = tl.load(p_beta, mask=m_c, other=0.0)
 
-    # Reference gate at the mid-point of this sub-chunk (same for all K tiles)
-    i_gn = i_ti + min(BC // 2, T - i_ti - 1)
+    # Reference gate row of this sub-chunk (same for all K tiles). The default
+    # is the mid-point, clamped to T. BATCH_INVARIANT uses row 0, which does not
+    # depend on T.
+    if BATCH_INVARIANT:
+        i_rn = 0
+    else:
+        i_rn = min(BC // 2, T - i_ti - 1)
+    i_gn = i_ti + i_rn
 
     # Accumulate Aqk and Akk over K tiles (BK ≤ 64 to keep tl.dot shape small)
     b_Aqk = tl.zeros([BC, BC], dtype=tl.float32)
@@ -317,7 +331,7 @@ def chunk_delta_attn_fwd_kernel_intra_sub_chunk(
         if USE_GATHER:
             b_gn = _gather(
                 b_g,
-                tl.full([1, BK], min(BC // 2, T - i_ti - 1), dtype=tl.int16),
+                tl.full([1, BK], i_rn, dtype=tl.int16),
                 axis=0,
             )
         else:
@@ -697,6 +711,7 @@ def chunk_delta_attn_fwd_intra(
     chunk_indices: torch.Tensor | None = None,
     safe_gate: bool = False,
     disable_recompute: bool = False,
+    batch_invariant: bool = False,
 ) -> tuple:
     """Intra-chunk attention (base Triton sub-chunk kernel)."""
     B, T, H, K = k.shape
@@ -737,6 +752,7 @@ def chunk_delta_attn_fwd_intra(
             BC=BC,
             BK=BK,
             USE_GATHER=IS_GATHER_SUPPORTED,
+            BATCH_INVARIANT=batch_invariant,
         )
     else:
         _chunk_delta_attn_fwd_intra_token_parallel(
