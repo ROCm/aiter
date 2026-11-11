@@ -891,6 +891,207 @@ __global__ void __launch_bounds__(512, 1) ag_ll_gfx1250(
 }
 
 // ---------------------------------------------------------------------------
+// DCP merge: the all-to-all and LSE combine of decode context parallelism
+// ---------------------------------------------------------------------------
+// Under DCP each of the ngpus ranks attends all H = ngpus * HL query heads over
+// its own shard of the KV cache. It holds a partial output o [B, H, 128] bf16
+// and its log-sum-exp lse [B, H] fp32. Rank r owns heads r * HL .. r * HL +
+// HL - 1 and needs their partials from every rank, merged by their LSE. This
+// kernel does the all-to-all and the merge in one launch over the LL scratch,
+// in place of a pack kernel, an all-to-all with its copy-in and a combine
+// kernel.
+//
+// A (b, h) row of 128 bf16 travels as 32 LL lines of 8 bytes, [d0, flag, d1,
+// flag], plus one line [lse, flag, 0, flag]. Rank s writes its rows for rank r
+// into slot s of rank r's LL scratch: data line (b * HL + hl) * 32 + j, LSE
+// line B * HL * 32 + b * HL + hl. It shares the LL kernels' epochs, banks and
+// slot stride and interleaves with them: a line another call wrote has an
+// older epoch.
+//
+// A block is 2 x W threads, in waves of 32:
+// - The first W send. A wave takes U rows (b, peer, hl) a round. It loads them
+//   all (a lane 8 bytes of the row, plus the row's LSE and the peer's scratch
+//   base), then issues their stores. On gfx1250 a load issued after a remote
+//   store waits for that store, about a fabric round trip.
+// - The other W merge. A wave takes one output row (b, hl) at a time. Lane j
+//   polls line j and the LSE line of every peer in one batch, reads the own
+//   shard's row from o, and combines. These waves issue no remote store.
+//
+// The combine matches ATOM's Triton combine. A non-finite LSE counts as -inf (a
+// shard with no KV for the row). m = max LSE, or 0 if all are -inf, and g =
+// log(sum exp(lse - m)) + m. out = sum over shards s = 0..ngpus-1 of
+// exp(lse_s - g) * o_s in fp32, rounded to bf16 once. A shard whose weight is 0
+// is skipped, since its o may be NaN. owned (optional, [B] int32): a row this
+// rank owns no KV slot of sends -inf.
+template <int ngpus, int U>
+__global__ void __launch_bounds__(1024, 1) dcp_merge_ll_gfx1250(
+    uint8_t* const* __restrict__ peer_scratch,
+    const opus::bf16_t* __restrict__ o,
+    const float* __restrict__ lse,
+    const int* __restrict__ owned,
+    opus::bf16_t* __restrict__ out,
+    float* __restrict__ out_lse,
+    int B,
+    int HL,
+    int64_t o_sb,
+    int64_t o_sh,
+    int64_t l_sb,
+    int64_t l_sh,
+    int rank,
+    uint32_t* __restrict__ block_flags)
+{
+    using PL              = typename opus::vector_t<opus::bf16_t, 4>;
+    constexpr int    P    = 32; // lines a row: 128 bf16, 4 a line
+    constexpr size_t slot = kLLPackCapacity;
+
+    __shared__ uint32_t s_flag;
+    if(threadIdx.x == 0)
+    {
+        uint32_t f = block_flags[blockIdx.x] + 1u;
+        if(f == 0u)
+            f = 2u; // flag is never 0 (0 == cleared scratch); keep bank parity
+        s_flag = f;
+    }
+    __syncthreads();
+    const uint32_t flag    = s_flag;
+    const size_t   bankOff = (size_t)(flag & 1u) * ngpus * slot;
+    const size_t   lseOff  = (size_t)B * HL * P;
+    const int      W       = blockDim.x / 2;
+    const int      lane    = threadIdx.x % 32;
+    const int      wpb     = W / 32;
+    const int      wave    = blockIdx.x * wpb + (threadIdx.x % W) / 32;
+    const int      nwaves  = gridDim.x * wpb;
+
+    auto row_lse = [&](int b, int h) {
+        float v = lse[(int64_t)b * l_sb + (int64_t)h * l_sh];
+        if(owned != nullptr && owned[b] == 0)
+            v = -INFINITY;
+        return v;
+    };
+
+    if(threadIdx.x < W)
+    {
+        const int rows = B * (ngpus - 1) * HL;
+        for(int r0 = wave; r0 < rows; r0 += nwaves * U)
+        {
+            uint2        d[U];
+            float        lv[U];
+            LLPackedMsg* dst[U];
+            int          row[U];
+#pragma unroll
+            for(int u = 0; u < U; ++u)
+            {
+                const int r = r0 + u * nwaves;
+                if(r < rows)
+                {
+                    const int hl   = r % HL;
+                    const int k    = 1 + (r / HL) % (ngpus - 1);
+                    const int b    = r / (HL * (ngpus - 1));
+                    const int peer = (rank + k) % ngpus;
+                    const int h    = peer * HL + hl;
+                    d[u]   = *reinterpret_cast<const uint2*>(o + (int64_t)b * o_sb + (int64_t)h * o_sh + 4 * lane);
+                    lv[u]  = row_lse(b, h);
+                    dst[u] = reinterpret_cast<LLPackedMsg*>(peer_scratch[peer]) + bankOff + (size_t)rank * slot;
+                    row[u] = b * HL + hl;
+                }
+            }
+#pragma unroll
+            for(int u = 0; u < U; ++u)
+            {
+                if(r0 + u * nwaves < rows)
+                {
+                    ll_store_b128(reinterpret_cast<uint32_t*>(&dst[u][(size_t)row[u] * P + lane]),
+                                  d[u].x, flag, d[u].y, flag);
+                    if(lane == 0)
+                        ll_store_b128(reinterpret_cast<uint32_t*>(&dst[u][lseOff + row[u]]),
+                                      __float_as_uint(lv[u]), flag, 0u, flag);
+                }
+            }
+        }
+    }
+    else
+    {
+        const LLPackedMsg* own = reinterpret_cast<const LLPackedMsg*>(peer_scratch[rank]) + bankOff;
+        const int          rows = B * HL;
+        for(int q = wave; q < rows; q += nwaves)
+        {
+            const int hl = q % HL;
+            const int b  = q / HL;
+            const int h  = rank * HL + hl;
+            // the own shard's row, loaded before the polls so its latency overlaps them
+            const uint2 mine = *reinterpret_cast<const uint2*>(o + (int64_t)b * o_sb + (int64_t)h * o_sh + 4 * lane);
+            const float mlse = row_lse(b, h);
+            uint32_t    w[ngpus][4];
+            uint32_t    l[ngpus][4];
+            uint32_t    pending = ((1u << ngpus) - 1u) & ~(1u << rank);
+            while(pending)
+            {
+#pragma unroll
+                for(int s = 0; s < ngpus; ++s)
+                    if(pending & (1u << s))
+                    {
+                        const LLPackedMsg* src = own + (size_t)s * slot;
+                        ll_load_b128(reinterpret_cast<const uint32_t*>(&src[(size_t)q * P + lane]),
+                                     w[s][0], w[s][1], w[s][2], w[s][3]);
+                        ll_load_b128(reinterpret_cast<const uint32_t*>(&src[lseOff + q]),
+                                     l[s][0], l[s][1], l[s][2], l[s][3]);
+                    }
+#pragma unroll
+                for(int s = 0; s < ngpus; ++s)
+                    if((pending & (1u << s)) && w[s][1] == flag && w[s][3] == flag && l[s][1] == flag &&
+                       l[s][3] == flag)
+                        pending &= ~(1u << s);
+            }
+            float ls[ngpus];
+            float m = -INFINITY;
+#pragma unroll
+            for(int s = 0; s < ngpus; ++s)
+            {
+                float v = s == rank ? mlse : __uint_as_float(l[s][0]);
+                if(v != v || v == INFINITY)
+                    v = -INFINITY;
+                ls[s] = v;
+                m     = fmaxf(m, v);
+            }
+            if(m == -INFINITY)
+                m = 0.f;
+            float sum = 0.f;
+#pragma unroll
+            for(int s = 0; s < ngpus; ++s)
+                sum += expf(ls[s] - m);
+            const float g = logf(sum) + m;
+            float       acc[4] = {0.f, 0.f, 0.f, 0.f};
+#pragma unroll
+            for(int s = 0; s < ngpus; ++s)
+            {
+                float f = expf(ls[s] - g);
+                if(f != f)
+                    f = 0.f;
+                if(f != 0.f)
+                {
+                    const uint32_t pw[2] = {s == rank ? mine.x : w[s][0], s == rank ? mine.y : w[s][2]};
+                    const PL       pv    = *reinterpret_cast<const PL*>(pw);
+#pragma unroll
+                    for(int j = 0; j < 4; ++j)
+                        acc[j] += upcast_s(pv[j]) * f;
+                }
+            }
+            PL ov;
+#pragma unroll
+            for(int j = 0; j < 4; ++j)
+                ov[j] = downcast_s<opus::bf16_t>(acc[j]);
+            *reinterpret_cast<PL*>(out + (size_t)q * 128 + 4 * lane) = ov;
+            if(out_lse != nullptr && lane == 0)
+                out_lse[q] = g;
+        }
+    }
+
+    for(int e = blockIdx.x + threadIdx.x * gridDim.x; e < kMaxBlocks;
+        e += gridDim.x * blockDim.x)
+        block_flags[e] = flag;
+}
+
+// ---------------------------------------------------------------------------
 // Lamport one-shot fused allreduce + residual add + RMSNorm (2-byte dtypes)
 // ---------------------------------------------------------------------------
 /*
@@ -2240,6 +2441,76 @@ public:
         DISPATCH_NGPUS_1250(world_size_, LAUNCH_AG_LL12);
 #undef LAUNCH_AG_LL12
 #undef LAUNCH_AG_LL12_U
+    }
+
+    // Rows of 128 bf16 a source that dcp_merge fits in an LL slot (32 data lines
+    // and one LSE line a row), or 0 where it does not run: LL off, or more than
+    // kLLMaxRanks ranks. dcp_merge takes B x H / world_size rows at most this.
+    int64_t dcp_merge_max_rows() const
+    {
+        return ll_enabled() && world_size_ <= kLLMaxRanks ? (int64_t)(kLLPackCapacity / 33) : 0;
+    }
+
+    // DCP merge (see dcp_merge_ll_gfx1250): o [B, H, 128] bf16 and lse [B, H]
+    // fp32 in, out [B, H / world_size, 128] bf16 and out_lse (optional) out.
+    // W = 256 threads a role. Blocks: one per 8 sender rows, up to one a CU; a
+    // sender wave then takes 1, 2, 4 or 8 rows a round, so that one round covers
+    // the message when it can.
+    void dcp_merge(hipStream_t stream,
+                   const void* o,
+                   const float* lse,
+                   const int* owned,
+                   void* out,
+                   float* out_lse,
+                   int B,
+                   int H,
+                   int64_t o_sb,
+                   int64_t o_sh,
+                   int64_t l_sb,
+                   int64_t l_sh)
+    {
+        ensure_ll_tables_();
+        static const int cus = []() {
+            int dev = 0, n = 0;
+            if(hipGetDevice(&dev) != hipSuccess ||
+               hipDeviceGetAttribute(&n, hipDeviceAttributeMultiprocessorCount, dev) != hipSuccess || n <= 0)
+                n = 256;
+            return n;
+        }();
+        constexpr int W   = 256;
+        constexpr int wpb = W / 32;
+        const int     HL  = H / world_size_;
+        const int     rows   = B * (world_size_ - 1) * HL;
+        const int     blocks = std::max(1, std::min({cus, kMaxBlocks, (rows + wpb - 1) / wpb}));
+        const int     per    = (rows + blocks * wpb - 1) / (blocks * wpb);
+        const int     U      = per <= 1 ? 1 : per <= 2 ? 2 : per <= 4 ? 4 : 8;
+
+        auto peers = reinterpret_cast<uint8_t* const*>(d_ll_peers_);
+        auto in    = reinterpret_cast<const opus::bf16_t*>(o);
+        auto res   = reinterpret_cast<opus::bf16_t*>(out);
+#define LAUNCH_DCP_U(NG, UU)                                                                      \
+        dcp_merge_ll_gfx1250<NG, UU><<<blocks, 2 * W, 0, stream>>>(                              \
+            peers, in, lse, owned, res, out_lse, B, HL, o_sb, o_sh, l_sb, l_sh, rank_, d_ll_block_flags_)
+#define LAUNCH_DCP(NG)            \
+        if(U == 1)                \
+        {                         \
+            LAUNCH_DCP_U(NG, 1);  \
+        }                         \
+        else if(U == 2)           \
+        {                         \
+            LAUNCH_DCP_U(NG, 2);  \
+        }                         \
+        else if(U == 4)           \
+        {                         \
+            LAUNCH_DCP_U(NG, 4);  \
+        }                         \
+        else                      \
+        {                         \
+            LAUNCH_DCP_U(NG, 8);  \
+        }
+        DISPATCH_NGPUS_1250(world_size_, LAUNCH_DCP);
+#undef LAUNCH_DCP
+#undef LAUNCH_DCP_U
     }
 
     // gfx1250: return raw device pointers (no hipIpc handles).
