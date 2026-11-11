@@ -1190,6 +1190,13 @@ def fused_moe(
     clamp_shared: bool = True,
     herd_topk: int = 0,
     herd_routed_scaling_factor: float = 1.0,
+    # True makes `output` an addend (e.g. a shared-expert output): the result is
+    # accumulated into it and it is returned. It is never zeroed or overwritten.
+    accumulate_output: bool = False,
+    # Recorded once the addend is written (e.g. on a side stream). Nothing reads
+    # the addend before waiting on it, and an accumulating stage 2 waits only
+    # right before it runs, so the producer overlaps sorting and stage 1.
+    output_ready_event: torch.cuda.Event | None = None,
 ):
     """Run fused MoE, dispatching to FHMoE when shared-expert tensors are present.
 
@@ -1214,6 +1221,10 @@ def fused_moe(
     )
     if not clamp_shared and not has_shared_expert:
         raise ValueError("clamp_shared=False requires FHMoE shared-expert dispatch")
+    if accumulate_output and output is None:
+        raise ValueError("accumulate_output=True requires output=")
+    if output_ready_event is not None and not accumulate_output:
+        raise ValueError("output_ready_event requires accumulate_output=True")
     if has_shared_expert:
         if herd_topk:
             raise ValueError("herd_topk does not support fused shared experts")
@@ -1221,6 +1232,8 @@ def fused_moe(
         unsupported = []
         if stage2_scatter is not None:
             unsupported.append("stage2_scatter")
+        if accumulate_output:
+            unsupported.append("accumulate_output")
         if quant_type_a is not None:
             unsupported.append("quant_type_a")
         fhmoe_quant_dtype_a = (
@@ -1287,9 +1300,7 @@ def fused_moe(
         )
     if not block_size_M:
         block_size_M = -1
-    enable_ep_scatter = stage2_scatter is not None
-    scatter_source_map = stage2_scatter.source_token_map if enable_ep_scatter else None
-    return fused_moe_(
+    common_args = dict(  # noqa: C408
         hidden_states=hidden_states,
         w1=w1,
         w2=w2,
@@ -1315,6 +1326,25 @@ def fused_moe(
         beta=beta,
         linear_beta=linear_beta,
         gate_mode=gate_mode,
+        output=output,
+        quant_type_a=None if quant_type_a is None else quant_type_a.value,
+        quant_dtype_a=quant_dtype_a,
+        quant_dtype_a2=quant_dtype_a2,
+        herd_topk=herd_topk,
+        herd_routed_scaling_factor=herd_routed_scaling_factor,
+        accumulate_output=accumulate_output,
+    )
+    if output_ready_event is not None:
+        # A CUDA event cannot cross the custom-op schema.
+        return _fused_moe_impl(
+            **common_args,
+            stage2_scatter=stage2_scatter,
+            _output_ready_event=output_ready_event,
+        )
+    enable_ep_scatter = stage2_scatter is not None
+    scatter_source_map = stage2_scatter.source_token_map if enable_ep_scatter else None
+    return fused_moe_(
+        **common_args,
         ep_arena_handle=stage2_scatter.arena_handle if enable_ep_scatter else 0,
         ep_combine_input_offset=(
             stage2_scatter.combine_input_offset if enable_ep_scatter else 0
@@ -1330,12 +1360,6 @@ def fused_moe(
             int(stage2_scatter.combine_quant_bits) if enable_ep_scatter else 0
         ),
         ep_source_token_map=scatter_source_map,
-        output=output,
-        quant_type_a=None if quant_type_a is None else quant_type_a.value,
-        quant_dtype_a=quant_dtype_a,
-        quant_dtype_a2=quant_dtype_a2,
-        herd_topk=herd_topk,
-        herd_routed_scaling_factor=herd_routed_scaling_factor,
     )
 
 
@@ -1380,6 +1404,7 @@ def fused_moe_fake(
     quant_dtype_a2: torch.dtype | None = None,
     herd_topk: int = 0,
     herd_routed_scaling_factor: float = 1.0,
+    accumulate_output: bool = False,
 ) -> torch.Tensor:
     device = topk_ids.device
     M, _topk = topk_ids.shape
@@ -1443,6 +1468,7 @@ def fused_moe_(
     quant_dtype_a2: torch.dtype | None = None,
     herd_topk: int = 0,
     herd_routed_scaling_factor: float = 1.0,
+    accumulate_output: bool = False,
 ) -> torch.Tensor:
     stage2_scatter = None
     if ep_source_token_map is not None:
@@ -1488,6 +1514,7 @@ def fused_moe_(
         quant_dtype_a2=quant_dtype_a2,
         herd_topk=herd_topk,
         herd_routed_scaling_factor=herd_routed_scaling_factor,
+        accumulate_output=accumulate_output,
     )
 
 
@@ -1524,6 +1551,7 @@ def _fused_moe_impl(
     quant_dtype_a2: torch.dtype | None = None,
     herd_topk: int = 0,
     herd_routed_scaling_factor: float = 1.0,
+    accumulate_output: bool = False,
     *,
     _q_dtype_a: torch.dtype | None = None,
     _metadata_transform: Callable | None = None,
@@ -1532,6 +1560,7 @@ def _fused_moe_impl(
     _stage2_extra_args: dict | None = None,
     _stage2_override: Callable | None = None,
     _enforce_metadata_block_size: bool = False,
+    _output_ready_event: torch.cuda.Event | None = None,
 ) -> torch.Tensor:
     # Consume a caller's presort first, so every path (including early returns
     # and errors) clears it.
@@ -1608,6 +1637,21 @@ def _fused_moe_impl(
         output, (M, model_dim), dtype, hidden_states.device
     )
     _validate_output_buffer_no_overlap(output, hidden_states)
+    # The addend is only ever added to: by a stage 2 that accumulates into it, or
+    # by _finish. Clearing `output` keeps every path from zeroing or overwriting it.
+    addend = output if accumulate_output else None
+    if addend is not None:
+        output = None
+
+    def _finish(ret):
+        if addend is None:
+            return _return_output(ret, output)
+        if ret is addend:
+            return ret
+        if _output_ready_event is not None:
+            torch.cuda.current_stream().wait_event(_output_ready_event)
+        return addend.add_(ret)
+
     quant_type = quant_remap.get(quant_type, quant_type)
     q_dtype_w = w1.dtype
     q_dtype_a = resolve_activation_dtype(
@@ -1678,7 +1722,7 @@ def _fused_moe_impl(
         )
 
     if grouped_a8w4_out is not None:
-        return _return_output(grouped_a8w4_out, output)
+        return _finish(grouped_a8w4_out)
     if herd_topk and get_gfx() == "gfx1250":
         raise ValueError(
             "gfx1250 HERD needs the grouped MoE path (per_1x32 MXFP4 weights, "
@@ -1931,7 +1975,7 @@ def _fused_moe_impl(
                 q_dtype_w=q_dtype_w,
             )
         )
-        return _return_output(full_output, output)
+        return _finish(full_output)
 
     # Ensure block_size_M is int (metadata.block_m from CSV may be float)
     if block_size_M is not None:
@@ -1999,6 +2043,19 @@ def _fused_moe_impl(
     # refactored mixed_moe_gemm_2stage_common); keep the fused sort+quant on
     # the expanded-scale path only.
     fused_compact_scale = False
+    # A stage 2 that atomically adds into moe_buf can add straight into the
+    # addend: the sort and stage 1 get an empty moe_buf, so nothing zeroes it, and
+    # stage 2 waits on the event. Reduce/scatter epilogues overwrite their output,
+    # so they and the 1-stage pipelines leave the add to _finish.
+    fold_addend = (
+        addend is not None
+        and not metadata.run_1stage
+        and asm_mode is AsmMoeMode.SORTED
+        and not runtime_stage2_reduce
+        and _stage2_override is None
+        # Atomic GEMM2 accumulates with 4-byte atomics.
+        and addend.data_ptr() % 4 == 0
+    )
     if herd_topk:
         (
             sorted_ids,
@@ -2017,7 +2074,7 @@ def _fused_moe_impl(
             block_size_M,
             None,
             None,
-            accumulate=not runtime_stage2_reduce,
+            accumulate=not runtime_stage2_reduce and not fold_addend,
             output=output,
             herd_topk=herd_topk,
             herd_routed_scaling_factor=herd_routed_scaling_factor,
@@ -2042,6 +2099,7 @@ def _fused_moe_impl(
             if _is_mxmoe_opus_metadata(metadata)
             else parse_g2_kname_any(_kn2)["atomic"]
         )
+        fold_addend = fold_addend and _atomic
         # The presort layout has to match both the selected kernels' tile size
         # and the block size the stages are given, which a caller's
         # block_size_M can override.
@@ -2064,7 +2122,7 @@ def _fused_moe_impl(
             num_valid_ids = presorted["num_valid_ids"]
             sort_m_indices = presorted["m_indices"]
             sort_reverse_sorted = presorted["reverse_sorted"]
-            if _atomic and not runtime_stage2_reduce:
+            if _atomic and not runtime_stage2_reduce and not fold_addend:
                 # Atomic GEMM2 accumulates with 4-byte atomics and faults on an
                 # output at an odd bf16 element, so such an output gets a fresh
                 # moe_buf and _return_output copies back.
@@ -2102,7 +2160,7 @@ def _fused_moe_impl(
                 expert_mask,
                 num_local_tokens,
                 return_local_topk_ids=need_local_topk_ids,
-                accumulate=_atomic and not runtime_stage2_reduce,
+                accumulate=_atomic and not runtime_stage2_reduce and not fold_addend,
                 output_aux=metadata.output_aux,
                 output=output,
             )
@@ -2133,16 +2191,17 @@ def _fused_moe_impl(
             global_experts=global_E,
             block_m=block_size_M,
             moebuf_dtype=dtype,
-            accumulate=not runtime_stage2_reduce,
+            accumulate=not runtime_stage2_reduce and not fold_addend,
             compact_scale=fused_compact_scale,
             num_local_tokens=num_local_tokens,
         )
         local_topk_ids = None
     else:
         sort_output = output if asm_mode.requires_host_sort else None
-        if asm_mode is AsmMoeMode.POST_REDUCE:
-            # The reducer overwrites the final output, including masked rows.
-            # An empty buffer also suppresses the sort's EP zero-fill.
+        if asm_mode is AsmMoeMode.POST_REDUCE or fold_addend:
+            # The reducer overwrites the final output, including masked rows, and
+            # a folded stage 2 adds into the addend instead. An empty buffer also
+            # suppresses the sort's EP zero-fill.
             sort_output = torch.empty((0, 0), dtype=dtype, device=topk_ids.device)
         sorting_ret = moe_sorting(
             topk_ids,
@@ -2212,7 +2271,7 @@ def _fused_moe_impl(
         )
         if kernel_bench_callable is not None:
             kernel_bench_callable.append(("stage1", _stage1_call))
-        return _return_output(_stage1_call(), output)
+        return _finish(_stage1_call())
     else:
         ret = fused_moe_2stages(
             hidden_states,
@@ -2258,13 +2317,15 @@ def _fused_moe_impl(
             _metadata_config_file=_metadata_config_file,
             _stage1_extra_args=_stage1_extra_args,
             _stage2_extra_args=_stage2_extra_args,
-            output=output,
+            # moe_buf is empty when folding, so stage 2 adds into the addend.
+            output=addend if fold_addend else output,
             _stage2_override=_stage2_override,
             routing_num_experts=global_E,
             prequantized_a1=prequantized_a1,
             prequantized_a1_scale=prequantized_a1_scale,
+            _stage2_wait_event=_output_ready_event if fold_addend else None,
         )
-        return _return_output(ret, output)
+        return _finish(ret)
 
 
 def fused_moe_1stage(
@@ -5535,6 +5596,7 @@ def fused_moe_2stages(
     routing_num_experts: int | None = None,
     prequantized_a1: torch.Tensor | None = None,
     prequantized_a1_scale: torch.Tensor | None = None,
+    _stage2_wait_event: torch.cuda.Event | None = None,
 ):
     quant_func = get_quant(quant_type)
     gate_mode = GateMode(gate_mode)
@@ -5987,6 +6049,8 @@ def fused_moe_2stages(
         )
     if kernel_bench_callable is not None:
         kernel_bench_callable.append(("stage2", _stage2_call))
+    if _stage2_wait_event is not None:
+        torch.cuda.current_stream().wait_event(_stage2_wait_event)
     stage2_output = _stage2_call()
     return moe_out if _stage2_override is None else stage2_output
 

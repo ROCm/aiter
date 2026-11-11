@@ -3,6 +3,7 @@
 
 import argparse
 import gc
+import inspect
 import itertools
 import logging
 import os
@@ -678,6 +679,20 @@ def test_fmoe(
     elif err != 0 and logits_diff > 0.01:
         logger.warning(
             f"accuracy check failed (non-strict): err={err}, logits_diff={logits_diff}"
+        )
+    if not has_nan:
+        _check_accumulate_output(
+            lambda **kw: fused_moe(
+                input,
+                w1_qt_aiter,
+                w2_qt_aiter,
+                topk_weights,
+                topk_ids,
+                **_fused_moe_kwargs,
+                **kw,
+            ),
+            out2_ck,
+            f"(token:{token} quant:{AQDType})",
         )
 
     return {"us": us2, "logits_diff": float(logits_diff)}
@@ -2376,6 +2391,79 @@ def test_output_buffer_contract():
     aiter.logger.info("moe_2stage: output buffer contract passed")
 
 
+def _check_accumulate_output(moe, ref, described, new_addend=torch.zeros_like):
+    """Check that moe(output=addend, accumulate_output=True) returns ref + addend.
+
+    With output_ready_event, a side stream writes the addend late, so reading it
+    before the wait, zeroing it, or overwriting it all fail the comparison.
+    """
+    scale = ref.float().abs().mean().item()
+    shared = torch.randn_like(ref) * scale
+    expected = ref.float() + shared.float()
+    for use_event in (False, True):
+        addend = new_addend(ref)
+        kwargs = {"output": addend, "accumulate_output": True}
+        if use_event:
+            side = torch.cuda.Stream()
+            side.wait_stream(torch.cuda.current_stream())
+            kwargs["output_ready_event"] = torch.cuda.Event()
+            with torch.cuda.stream(side):
+                # Long enough that fused_moe is enqueued before the addend lands.
+                torch.cuda._sleep(50_000_000)
+                addend.copy_(shared)
+                kwargs["output_ready_event"].record()
+        else:
+            addend.copy_(shared)
+        out = moe(**kwargs)
+        msg = f"accumulate_output {described} {use_event=}"
+        assert out is addend, f"{msg}: addend not returned"
+        # Bf16 accumulation order moves the sum by far less than atol; a lost or
+        # stale addend moves it by about `scale`.
+        err = checkAllclose(expected, out.float(), atol=0.05 * scale, msg=f"{msg}: ")
+        assert err <= 0.05, f"{msg}: {err=}"
+
+
+def test_accumulate_output():
+    """Validate accumulate_output / output_ready_event and their argument checks."""
+    torch.manual_seed(0)
+    token, model_dim, inter_dim, E, topk = 32, 512, 256, 8, 2
+    dtype = dtypes.bf16
+    hidden = torch.randn((token, model_dim), dtype=dtype) / 10
+    w1 = torch.randn((E, inter_dim * 2, model_dim), dtype=dtype) / 10
+    w2 = torch.randn((E, model_dim, inter_dim), dtype=dtype) / 10
+    gating = torch.randn((token, E), dtype=dtype)
+    topk_weights, topk_ids = fused_topk(hidden, gating, topk, True)
+    args = (hidden, w1, w2, topk_weights, topk_ids)
+    ref = fused_moe(*args)
+
+    def misaligned_zeros_like(t):
+        # An odd bf16 offset rules out stage 2's 4-byte atomics, so the result
+        # is added at the end instead of in stage 2.
+        return torch.zeros(t.numel() + 1, dtype=t.dtype)[1:].view(t.shape)
+
+    for new_addend in (torch.zeros_like, misaligned_zeros_like):
+        _check_accumulate_output(
+            lambda **kw: fused_moe(*args, **kw), ref, new_addend.__name__, new_addend
+        )
+
+    for described, kwargs in (
+        ("accumulate_output without output", {"accumulate_output": True}),
+        (
+            "output_ready_event without accumulate_output",
+            {"output": torch.empty_like(ref), "output_ready_event": torch.cuda.Event()},
+        ),
+    ):
+        try:
+            fused_moe(*args, **kwargs)
+        except ValueError:
+            continue
+        raise AssertionError(f"fused_moe accepted {described}")
+    # Callers feature-detect the API from the public signature.
+    assert "output_ready_event" in inspect.signature(fused_moe).parameters
+
+    aiter.logger.info("moe_2stage: accumulate_output contract passed")
+
+
 def test_swiglu_mxfp4_nonsplit_nobias_dispatch():
     if get_gfx() != "gfx950":
         aiter.logger.info(
@@ -2660,6 +2748,7 @@ if args.bm16_scale_boundary:
     test_bm16_tiled_scale_boundary()
 else:
     test_output_buffer_contract()
+    test_accumulate_output()
     test_swiglu_mxfp4_nonsplit_nobias_dispatch()
     test_swiglu_mxfp4_untagged_layout_dispatch()
     test_swiglu_oai_flat_dispatch()
