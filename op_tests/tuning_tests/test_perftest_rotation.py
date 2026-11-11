@@ -58,6 +58,15 @@ class TestInputCopies(unittest.TestCase):
         self.assertIs(copies[-1][1], kwargs)
         self.assertEqual(input_copies(args, kwargs, 1, pristine), [(args, kwargs)])
 
+    def test_last_timed_call_reads_the_callers_set(self):
+        args, kwargs = (torch.zeros(2),), {}
+        for num_iters, num in ((6, 3), (5, 3), (4, 3), (101, 101), (101, 50), (3, 8)):
+            with self.subTest(num_iters=num_iters, num=num):
+                ring = input_copies(args, kwargs, num, num_iters=num_iters)
+                self.assertEqual(len(ring), num)
+                self.assertIs(ring[(num_iters - 1) % num][0], args)
+                self.assertEqual(sum(a is args for a, _ in ring), 1)
+
 
 @unittest.skipUnless(torch.cuda.is_available(), "needs a GPU")
 class TestInputSize(unittest.TestCase):
@@ -93,6 +102,19 @@ class TestPerftestCopiesStartAsPassed(unittest.TestCase):
         copies = {p: nan for p, nan in seen.items() if p != out.data_ptr()}
         self.assertEqual(len(copies), 3)
         self.assertTrue(all(copies.values()), copies)
+
+    def test_returned_data_is_the_callers_out(self):
+        def func(x, out):
+            out.add_(x)
+            return out
+
+        for num_iters, num in ((6, 3), (5, 3), (4, 3), (101, 50)):
+            with self.subTest(num_iters=num_iters, num=num):
+                x = torch.ones(16, device="cuda")
+                out = torch.zeros_like(x)
+                timed = perftest(num_iters=num_iters, num_warmup=2, num_rotate_args=num)
+                data, _ = timed(func)(x, out)
+                self.assertIs(data, out)
 
 
 def _cache(level, kib, instances=1):

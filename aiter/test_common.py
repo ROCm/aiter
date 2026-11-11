@@ -80,7 +80,7 @@ def perftest(
                 num = int((cache_size + inputSize - 1) // inputSize)
             num = min(num, num_iters)
 
-            rotate_args = input_copies(args, kwargs, num, pristine)
+            rotate_args = input_copies(args, kwargs, num, pristine, num_iters)
             del pristine
             run_iters(num_warmup, func, *args, **kwargs)
             torch.cuda.synchronize()
@@ -241,19 +241,20 @@ def _device_tensor_bytes(args, kwargs, device_index=None):
     return sum(t.nbytes for t in tensors.values())
 
 
-def input_copies(args, kwargs, num, pristine=None):
-    """`num - 1` deep copies of the inputs, then the caller's own `(args, kwargs)`.
+def input_copies(args, kwargs, num, pristine=None, num_iters=None):
+    """`num` input sets: `num - 1` deep copies and the caller's own `(args, kwargs)`.
 
-    Each copy is one deepcopy of both, so a tensor or storage shared between them stays shared.
-    `pristine`, a deepcopy taken before `func` first ran, is the first copy and the source of
-    the rest, so no copy starts from what that run wrote.
+    Each copy is one deepcopy of both, taken from `pristine` (copied before `func` first ran)
+    when given. The caller's set sits where call `num_iters - 1` of an `i % num` loop reads,
+    or last when `num_iters` is None.
     """
     if num < 2:
         return [(args, kwargs)]
     source = (args, kwargs) if pristine is None else pristine
     first = [] if pristine is None else [pristine]
-    rest = [copy.deepcopy(source) for _ in range(num - 1 - len(first))]
-    return first + rest + [(args, kwargs)]
+    copies = first + [copy.deepcopy(source) for _ in range(num - 1 - len(first))]
+    slot = num - 1 if num_iters is None else (num_iters - 1) % num
+    return copies[:slot] + [(args, kwargs)] + copies[slot:]
 
 
 def run_iters_rotate(num_iters, func, rotate_args):
