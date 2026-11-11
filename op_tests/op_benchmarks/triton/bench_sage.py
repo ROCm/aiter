@@ -1742,6 +1742,15 @@ def _make_kernel_runner_impl(
         )
 
         if args.e2e:
+            if q_bshd.dtype != torch.bfloat16:
+                return lambda: launch_mha_v4_packed(
+                    *_production_quantize_mxfp8(q_bshd, k_bshd, v_bshd, softmax_scale),
+                    fp8_format,
+                    fp8_format,
+                    fp8_format,
+                    *mxfp8_scale_modes,
+                    softmax_scale=softmax_scale,
+                )
             return lambda: launch_mha_v4(
                 q_bshd,
                 k_bshd,
