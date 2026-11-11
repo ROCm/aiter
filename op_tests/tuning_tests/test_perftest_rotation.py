@@ -13,6 +13,7 @@ from unittest.mock import patch
 
 import torch
 
+from aiter import test_common
 from aiter.test_common import device_memory_profiling, input_copies, perftest
 from aiter.utility import measure
 
@@ -68,6 +69,30 @@ class TestInputCopies(unittest.TestCase):
                 self.assertEqual(sum(a is args for a, _ in ring), 1)
 
 
+class TestUnrotatableWarning(unittest.TestCase):
+    def setUp(self):
+        test_common._warned_unrotatable.clear()
+        self.addCleanup(test_common._warned_unrotatable.clear)
+
+    def test_closure_warns_once_per_function(self):
+        x = torch.ones(2)
+        first, second = (lambda: x + 1), (lambda: x + 2)
+        with self.assertLogs(test_common.logger, "WARNING") as logs:
+            for _ in range(3):
+                test_common.warn_if_unrotatable(first, (), {})
+            test_common.warn_if_unrotatable(second, (), {"scale": 2.0})
+        self.assertEqual(len(logs.output), 2)
+        self.assertIn("num_rotate_args=1", logs.output[0])
+        self.assertIn("test_perftest_rotation.py", logs.output[0])
+
+    def test_gpu_tensor_arguments_do_not_warn(self):
+        with (
+            patch.object(test_common, "_device_tensor_bytes", return_value=8),
+            self.assertNoLogs(test_common.logger, "WARNING"),
+        ):
+            test_common.warn_if_unrotatable(lambda x: x, (torch.ones(2),), {})
+
+
 @unittest.skipUnless(torch.cuda.is_available(), "needs a GPU")
 class TestInputSize(unittest.TestCase):
     def test_kwargs_count_and_a_shared_tensor_counts_once(self):
@@ -115,6 +140,22 @@ class TestPerftestCopiesStartAsPassed(unittest.TestCase):
                 timed = perftest(num_iters=num_iters, num_warmup=2, num_rotate_args=num)
                 data, _ = timed(func)(x, out)
                 self.assertIs(data, out)
+
+
+@unittest.skipUnless(torch.cuda.is_available(), "needs a GPU")
+class TestPerftestUnrotatableWarning(unittest.TestCase):
+    def test_closure_warns_only_in_auto_mode(self):
+        test_common._warned_unrotatable.clear()
+        self.addCleanup(test_common._warned_unrotatable.clear)
+        x = torch.ones(16, device="cuda")
+        out = torch.empty_like(x)
+        closure = lambda: out.copy_(x)
+        with self.assertNoLogs(test_common.logger, "WARNING"):
+            perftest(num_iters=3, num_rotate_args=1)(closure)()
+            perftest(num_iters=3)(lambda x, out: out.copy_(x))(x, out)
+        with self.assertLogs(test_common.logger, "WARNING") as logs:
+            perftest(num_iters=3)(closure)()
+        self.assertEqual(len(logs.output), 1)
 
 
 def _cache(level, kib, instances=1):

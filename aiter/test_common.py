@@ -60,6 +60,7 @@ def perftest(
             num = num_rotate_args
             pristine = None
             if num < 1:
+                warn_if_unrotatable(func, args, kwargs)
                 gpu_id = torch.cuda.current_device()
                 free_memory = torch.cuda.mem_get_info(gpu_id)[0]
                 if 2 * _device_tensor_bytes(args, kwargs) <= free_memory:
@@ -239,6 +240,27 @@ def _device_tensor_bytes(args, kwargs, device_index=None):
         and device_index in (None, t.device.index)
     }
     return sum(t.nbytes for t in tensors.values())
+
+
+_warned_unrotatable = set()
+
+
+def warn_if_unrotatable(func, args, kwargs):
+    """Warn once per function when it gets no GPU tensors, since perftest cannot copy them."""
+    if _device_tensor_bytes(args, kwargs):
+        return
+    code = getattr(func, "__code__", None)
+    name = getattr(func, "__qualname__", type(func).__name__)
+    if code is not None:
+        name = f"{name} ({code.co_filename}:{code.co_firstlineno})"
+    if name in _warned_unrotatable:
+        return
+    _warned_unrotatable.add(name)
+    logger.warning(
+        f"perftest: {name} takes no GPU tensors, so its inputs cannot be rotated "
+        "and are timed warm. Pass the tensors as arguments, or num_rotate_args=1 "
+        "to time without rotation."
+    )
 
 
 def input_copies(args, kwargs, num, pristine=None, num_iters=None):
