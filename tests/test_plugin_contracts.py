@@ -332,3 +332,19 @@ def test_the_versions_a_contract_still_accepts_are_part_of_the_baseline(tmp_path
     bumped = routed_contracts_for(tmp_path, SUPERSEDING)["demo.bumped"]
     assert bumped["supersedes"] == [1]
     assert bumped["version"] == 2
+
+
+def test_the_sparse_prefill_contract_carries_no_backend_pin():
+    """`backend=` selects which native implementation AITER would run.
+
+    That question is answered by the dispatcher above the routed layer, so it
+    is not part of the contract: a provider has one kernel, and handing it a
+    pin naming AITER's would leave it declining every call from the spelling
+    that pins -- which on the DSV4.1 prefill path is every downstream caller.
+    """
+
+    contract = json.loads(_BASELINE.read_text())["mla_sparse_prefill"]
+    assert "backend" not in contract["signature"], (
+        "the routed sparse-prefill contract grew a backend pin: "
+        + contract["signature"]
+    )

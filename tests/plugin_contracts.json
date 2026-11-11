@@ -13,6 +13,13 @@
   "supersedes": [],
   "version": 1
  },
+ "mla_sparse_prefill": {
+  "fingerprint": "1f95f64a09fbd513",
+  "signature": "q:positional:torch.Tensor, unified_kv:positional:torch.Tensor, kv_indices_prefix:positional:torch.Tensor, kv_indptr_prefix:positional:torch.Tensor, kv:positional:torch.Tensor, kv_indices_extend:positional:torch.Tensor, kv_indptr_extend:positional:torch.Tensor, attn_sink:positional:torch.Tensor | None, softmax_scale:positional:float, out:positional:torch.Tensor | None=None, num_kv_splits:positional:int | None=None, -> torch.Tensor",
+  "source": "aiter/ops/mla_sparse_prefill.py",
+  "supersedes": [],
+  "version": 1
+ },
  "pertoken_quant": {
   "fingerprint": "ffb84335bd354c41",
   "signature": "x:positional, scale:positional=None, x_scale:positional=None, scale_dtype:positional=dtypes.fp32, quant_dtype:positional=dtypes.i8, dtypeMax:positional=None",

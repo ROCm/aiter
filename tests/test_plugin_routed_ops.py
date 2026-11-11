@@ -159,6 +159,81 @@ def test_rmsnorm_provider_serves_through_either_public_spelling(monkeypatch):
     assert provider.select_calls == 2
 
 
+def _sparse_prefill_args(tokens=2, heads=1, dim=512):
+    """Well-formed enough to reach the routed layer, which dispatches at once.
+
+    Shapes are not exercised here: a provider that serves means the native
+    never runs, and the point of this test is which callers reach the
+    provider at all.
+    """
+    return {
+        "q": torch.rand(tokens, heads, dim),
+        "unified_kv": torch.rand(4, dim),
+        "kv_indices_prefix": torch.zeros(4, dtype=torch.int32),
+        "kv_indptr_prefix": torch.tensor([0, 2, 4], dtype=torch.int32),
+        "kv": torch.rand(4, dim),
+        "kv_indices_extend": torch.zeros(4, dtype=torch.int32),
+        "kv_indptr_extend": torch.tensor([0, 2, 4], dtype=torch.int32),
+        "attn_sink": None,
+        "softmax_scale": 1.0,
+    }
+
+
+def test_sparse_prefill_serves_through_either_public_spelling(monkeypatch):
+    """`mla_sparse_prefill` and `pa_sparse_prefill_opus` are one op.
+
+    They take the same arguments and forward them unchanged to the same
+    implementation; the second name differs only by pinning the backend the
+    first one would have chosen anyway. Routing their convergence point is
+    what makes a provider reach the callers who use the backend-named
+    spelling -- which, on the DSV4.1 prefill path, is all of them.
+    """
+
+    from aiter.ops.mla_sparse_prefill import mla_sparse_prefill
+    from aiter.ops.pa_sparse_prefill_opus import pa_sparse_prefill_opus
+
+    served = torch.full((2, 1, 512), 7.0)
+    provider = _Provider("aklr", _candidate("aklr", served))
+    provider.op_versions = {"mla_sparse_prefill": {1}}
+    plugin.configure(enable=("aklr",), source="test")
+    monkeypatch.setattr(
+        plugin, "_entry_points", lambda: (_EntryPoint("aklr", provider),)
+    )
+
+    for spelling in (mla_sparse_prefill, pa_sparse_prefill_opus):
+        result = spelling(**_sparse_prefill_args())
+        decision = plugin.last_decision()
+        assert (decision.route, decision.provider) == ("provider", "aklr")
+        assert torch.equal(result, served)
+
+    assert provider.select_calls == 2
+
+
+def test_the_backend_pin_is_not_part_of_the_sparse_prefill_contract(monkeypatch):
+    """`backend=` is answered above the routed layer, so it never reaches a provider.
+
+    A provider serving this contract has one kernel, not a choice of AITER's;
+    being handed a pin it cannot satisfy would leave it declining every call
+    from the spelling that pins. The dispatcher settles the native backend
+    first and the op begins below that.
+    """
+
+    from aiter.ops.mla_sparse_prefill import mla_sparse_prefill
+
+    served = torch.full((2, 1, 512), 7.0)
+    provider = _Provider("aklr", _candidate("aklr", served))
+    provider.op_versions = {"mla_sparse_prefill": {1}}
+    plugin.configure(enable=("aklr",), source="test")
+    monkeypatch.setattr(
+        plugin, "_entry_points", lambda: (_EntryPoint("aklr", provider),)
+    )
+
+    result = mla_sparse_prefill(**_sparse_prefill_args(), backend="opus")
+
+    assert plugin.last_decision().route == "provider"
+    assert torch.equal(result, served)
+
+
 _REFERENCE_PROVIDER = '''
 """A reference provider for the two routed contracts.
 
