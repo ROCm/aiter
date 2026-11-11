@@ -38,6 +38,7 @@ _MAX_BLOCKS = 8
 _WARP_SIZE = 64
 _VEC_WIDTH = 8  # 8 bf16 values = one 128-bit global-memory transaction.
 _TAIL_VEC_WIDTH = 4  # 4 bf16 values = one 64-bit transaction for a row's tail tile.
+_F32_VEC_WIDTH = 4  # 4 fp32 values = one 128-bit transaction.
 _TILE_CANDIDATES = (2, 4, 8, 1)
 _MAX_BLOCK_THREADS = 1024
 # Buffer loads and stores take a 32-bit byte offset from the tensor's base.
@@ -303,6 +304,7 @@ class _AttnResSpec:
     block_alias: bool = False
     bf16_dot: bool = False
     bf16_intermediates: bool = False
+    fp32_score_weight: bool = False
 
     @property
     def kernel_name(self) -> str:
@@ -315,6 +317,7 @@ class _AttnResSpec:
             f"{'_wide' if self.wide_grid else ''}"
             f"{'_bf16dot' if self.bf16_dot else ''}"
             f"{'_bf16mid' if self.bf16_intermediates else ''}"
+            f"{'_q32' if self.fp32_score_weight else ''}"
         )
 
 
@@ -391,6 +394,7 @@ def _build_attn_res(spec: _AttnResSpec, device_index: int):
     native_swap = spec.native_swap
     bf16_dot = spec.bf16_dot
     bf16_intermediates = spec.bf16_intermediates
+    fp32_score_weight = spec.fp32_score_weight
     fp32_prefix = has_add and not bf16_intermediates
     # Alternate buffers per group so the next group's writes need no second
     # barrier. Waves pad to a power of two so a DPP row reduce over wave_stride
@@ -572,6 +576,20 @@ def _build_attn_res(spec: _AttnResSpec, device_index: int):
         def load_bf16_vec(divided, tile):
             return fx.memref_load_vec(issue_bf16_vec(divided, tile))
 
+        f32_atom = fx.make_copy_atom(fx.rocdl.BufferCopy128b(), fx.Float32)
+
+        def load_f32_vec(divided4, tile):
+            chunks = tile_widths[tile] // _F32_VEC_WIDTH
+            first = vector_index_for(tile) * chunks
+            parts = []
+            for chunk in range_constexpr(chunks):
+                register = fx.make_rmem_tensor(_F32_VEC_WIDTH, fx.Float32)
+                fx.copy(f32_atom, fx.slice(divided4, (None, first + chunk)), register)
+                parts.append(fx.memref_load_vec(register))
+            if const_expr(chunks == 1):
+                return parts[0]
+            return parts[0].shuffle(parts[1], list(range(tile_widths[tile])))
+
         def store_bf16_vec(value, divided, tile):
             width = tile_widths[tile]
             register = fx.make_rmem_tensor(width, fx.BFloat16)
@@ -624,7 +642,12 @@ def _build_attn_res(spec: _AttnResSpec, device_index: int):
 
         def run_row():
             prefix_div = row_of(prefix_buf, token)
-            score_weight_div = divide_row(score_weight_buf)
+            if const_expr(fp32_score_weight):
+                score_weight_div = fx.logical_divide(
+                    score_weight_buf, fx.make_layout(_F32_VEC_WIDTH, 1)
+                )
+            else:
+                score_weight_div = divide_row(score_weight_buf)
             y_div = row_of(y_buf, token)
 
             def issue_block_source(block):
@@ -665,7 +688,10 @@ def _build_attn_res(spec: _AttnResSpec, device_index: int):
                 if const_expr(has_add2):
                     add2_div = row_of(fx.rocdl.make_buffer_tensor(add_hidden2), token)
             for tile in range_constexpr(tiles_per_thread):
-                q_local.append(load_bf16_vec(score_weight_div, tile))
+                if const_expr(fp32_score_weight):
+                    q_local.append(load_f32_vec(score_weight_div, tile))
+                else:
+                    q_local.append(load_bf16_vec(score_weight_div, tile))
                 prefix_value = load_bf16_vec(prefix_div, tile)
                 if const_expr(has_add):
                     prefix_value = prefix_value.to(fx.Float32) + load_bf16_vec(
@@ -1195,8 +1221,15 @@ def _plan_launch(
                 f"strides {block_out.stride()}"
             )
         tensors["block_out"] = block_out_rows
-    if any(t.dtype != torch.bfloat16 for t in tensors.values()):
-        raise TypeError("only BF16 inputs are supported")
+    fp32_score_weight = score_weight.dtype == torch.float32
+    if any(
+        t.dtype != torch.bfloat16
+        for name, t in tensors.items()
+        if not (name == "score_weight" and fp32_score_weight)
+    ):
+        raise TypeError(
+            "only BF16 inputs, and a BF16 or FP32 score_weight, are supported"
+        )
     if any(t.device != prefix.device for t in tensors.values()):
         raise ValueError("all tensors must be on prefix.device")
     if not prefix.is_cuda:
@@ -1282,8 +1315,10 @@ def _plan_launch(
                 >= tuning.nontemporal_block_min_bytes,
                 narrow_prefetch_in_flight=tuning.narrow_prefetch_in_flight,
                 bf16_dot=gfx950_ops
+                and not fp32_score_weight
                 and not (wide_grid and num_tokens > _WIDE_BF16_DOT_MAX_TOKENS),
                 bf16_intermediates=bf16_intermediates,
+                fp32_score_weight=fp32_score_weight,
             ),
             prefix.device.index,
         )
@@ -1326,8 +1361,8 @@ def flydsl_attn_res(
 
     ``prefix`` is ``[.., D]``, ``block_residual`` is ``[.., B, D]`` with ``B`` in
     0..8 (a strided view such as ``cap[:, :B]`` is fine), and ``score_weight``
-    is the pre-folded ``[D]`` scoring vector. ``logit = scale * rstd *
-    dot(v, score_weight)`` with ``rstd`` from ``eps``, softmaxed over the
+    is the pre-folded BF16 or FP32 ``[D]`` scoring vector. ``logit = scale *
+    rstd * dot(v, score_weight)`` with ``rstd`` from ``eps``, softmaxed over the
     candidates; the raw values are mixed. ``add_hidden`` [and ``add_hidden2``]
     fold into the prefix candidate as an unrounded FP32 sum. ``output_rms_weight``
     applies an output RMSNorm with ``output_rms_eps``.
@@ -1346,9 +1381,10 @@ def flydsl_attn_res(
     meet the extent of any input, so views that interleave in one buffer raise
     ``ValueError``.
 
-    Every input must be a BF16 CUDA tensor on ``prefix.device`` with unit
-    trailing stride, positive leading strides that are multiples of
-    8, a 16-byte-aligned base pointer, and an extent under 4 GiB.
+    Every input other than ``score_weight`` must be a BF16 CUDA tensor on
+    ``prefix.device``. Every input needs a unit trailing stride, positive leading
+    strides that are multiples of 8, a base pointer aligned to 8 elements, and an
+    extent under 4 GiB.
     ``stream`` must be on ``prefix.device``. Requires gfx942 or gfx950 (wave64).
     ``D`` must be a positive multiple of 8 with a wave-aligned row
     size. ``rows_per_wg`` packs one-wave rows (D=1024) per workgroup; multi-wave
@@ -1356,7 +1392,9 @@ def flydsl_attn_res(
 
     ``bf16_intermediates`` rounds the prefix candidate and, with
     ``out_quant_dtype``, the pre-quant ``y`` to BF16, as a model running the add,
-    the mix, and the quant as separate BF16 ops does (vLLM's ``attn_res``).
+    the mix, and the quant as separate BF16 ops does. Together with an FP32
+    ``score_weight`` of ``norm_weight.float() * qk_weight.float()``,
+    ``bf16_intermediates`` matches vLLM's ``attn_res``.
 
     With ``block_out``, cached plans key on exact data pointers, so each new
     buffer address revalidates.

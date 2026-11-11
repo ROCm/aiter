@@ -76,6 +76,7 @@ class _Config:
     fp8: bool = False
     scale: float = 1.0
     bf16_intermediates: bool = False
+    fp32_score: bool = False
 
 
 MIX = _Config()
@@ -84,6 +85,8 @@ ALL_ON_FP8 = dataclasses.replace(ALL_ON, fp8=True)
 EVERY_FEATURE = _Config(add=True, add2=True, close=True, onorm=True, scale=0.7)
 EVERY_FEATURE_BF16 = dataclasses.replace(EVERY_FEATURE, bf16_intermediates=True)
 ALL_ON_FP8_BF16 = dataclasses.replace(ALL_ON_FP8, bf16_intermediates=True)
+EVERY_FEATURE_VLLM = dataclasses.replace(EVERY_FEATURE_BF16, fp32_score=True)
+ALL_ON_FP8_VLLM = dataclasses.replace(ALL_ON_FP8_BF16, fp32_score=True)
 _BENCH_CONFIGS = {"mix": MIX, "all-on": ALL_ON, "all-on fp8": ALL_ON_FP8}
 
 
@@ -137,6 +140,7 @@ def _make_inputs(
     return SimpleNamespace(
         **views,
         score_weight=score_weight.to(torch.bfloat16),
+        score_weight_fp32=score_weight,
         output_rms_weight=(1.0 + 0.1 * torch.randn(hidden_size)).to(torch.bfloat16),
         parents=parents,
     )
@@ -146,7 +150,7 @@ def _gate_args(inputs, cfg: _Config):
     args = (
         inputs.prefix,
         inputs.block_residual,
-        inputs.score_weight,
+        inputs.score_weight_fp32 if cfg.fp32_score else inputs.score_weight,
         _EPS,
         inputs.add_hidden if cfg.add else None,
         inputs.add_hidden2 if cfg.add2 else None,
@@ -261,12 +265,22 @@ def test_flydsl_attn_res_flag_surface(cfg: _Config):
 @pytest.mark.parametrize("hidden_size", (_D, _D_SMALL))
 @pytest.mark.parametrize("num_blocks", range(_MAX_BLOCKS + 1))
 def test_flydsl_attn_res_num_blocks(hidden_size: int, num_blocks: int):
-    for cfg in (MIX, EVERY_FEATURE, ALL_ON_FP8, EVERY_FEATURE_BF16, ALL_ON_FP8_BF16):
+    for cfg in (
+        MIX,
+        EVERY_FEATURE,
+        ALL_ON_FP8,
+        EVERY_FEATURE_BF16,
+        ALL_ON_FP8_BF16,
+        EVERY_FEATURE_VLLM,
+        ALL_ON_FP8_VLLM,
+    ):
         _run_and_check(17, num_blocks, cfg, hidden_size=hidden_size)
 
 
 @_skip_unsupported_gfx
-@pytest.mark.parametrize("cfg", (MIX, EVERY_FEATURE, ALL_ON_FP8), ids=str)
+@pytest.mark.parametrize(
+    "cfg", (MIX, EVERY_FEATURE, ALL_ON_FP8, EVERY_FEATURE_VLLM), ids=str
+)
 def test_flydsl_attn_res_layouts(cfg: _Config):
     _run_and_check(17, _MAX_BLOCKS - 1, cfg, pad=8)
     _run_and_check(17, _MAX_BLOCKS, cfg, pad=16)
@@ -275,7 +289,9 @@ def test_flydsl_attn_res_layouts(cfg: _Config):
 
 
 @_skip_unsupported_gfx
-@pytest.mark.parametrize("cfg", (MIX, ALL_ON, ALL_ON_FP8, ALL_ON_FP8_BF16), ids=str)
+@pytest.mark.parametrize(
+    "cfg", (MIX, ALL_ON, ALL_ON_FP8, ALL_ON_FP8_BF16, ALL_ON_FP8_VLLM), ids=str
+)
 def test_flydsl_attn_res_token_counts(cfg: _Config):
     """T > num_cus switches D=7168 to the 256-thread wide grid; test both sides."""
     for tokens in (1, _num_cus(), _num_cus() + 1):
@@ -283,7 +299,9 @@ def test_flydsl_attn_res_token_counts(cfg: _Config):
 
 
 @_skip_unsupported_gfx
-@pytest.mark.parametrize("cfg", (MIX, EVERY_FEATURE, ALL_ON_FP8), ids=str)
+@pytest.mark.parametrize(
+    "cfg", (MIX, EVERY_FEATURE, ALL_ON_FP8, EVERY_FEATURE_VLLM), ids=str
+)
 def test_flydsl_attn_res_rows_per_wg(cfg: _Config):
     """T=17 leaves three idle waves in the last workgroup."""
     _run_and_check(17, _MAX_BLOCKS, cfg, hidden_size=_D_SMALL, rows_per_wg=4)
@@ -326,6 +344,21 @@ def test_flydsl_attn_res_prefix_candidate_rounding(hidden_size: int):
         prefix, block_residual, score_weight, _EPS, add_hidden, bf16_intermediates=True
     )
     assert torch.equal(y, torch.zeros_like(prefix))
+
+
+@_skip_unsupported_gfx
+@pytest.mark.parametrize("hidden_size", (_D, _D_SMALL))
+def test_flydsl_attn_res_fp32_score_weight_is_not_rounded(hidden_size: int):
+    """An FP32 ``score_weight`` changes ``y`` from its BF16 rounding, and both match the reference."""
+    inputs = _make_inputs(17, hidden_size, _MAX_BLOCKS - 1)
+    outputs = {}
+    for cfg in (EVERY_FEATURE_BF16, EVERY_FEATURE_VLLM):
+        expected = _call(attn_res_reference, inputs, cfg)
+        outputs[cfg] = _call(flydsl_attn_res, inputs, cfg)
+        _assert_y_close(outputs[cfg][0], expected[0], cfg, f"{cfg}")
+    assert not torch.equal(
+        outputs[EVERY_FEATURE_BF16][0], outputs[EVERY_FEATURE_VLLM][0]
+    )
 
 
 @_skip_unsupported_gfx
@@ -418,7 +451,9 @@ def test_flydsl_attn_res_float64_oracle(hidden_size: int, num_blocks: int, cfg):
 
 
 @_skip_unsupported_gfx
-@pytest.mark.parametrize("cfg", (MIX, ALL_ON, EVERY_FEATURE_BF16), ids=str)
+@pytest.mark.parametrize(
+    "cfg", (MIX, ALL_ON, EVERY_FEATURE_BF16, EVERY_FEATURE_VLLM), ids=str
+)
 def test_flydsl_attn_res_wide_grid_above_bf16_dot_limit(cfg: _Config):
     limit = attn_res_kernel._WIDE_BF16_DOT_MAX_TOKENS
     for tokens in (limit, limit + 1):
@@ -434,7 +469,9 @@ def test_flydsl_attn_res_call_larger_than_the_mall(cfg: _Config):
 
 @_skip_unsupported_gfx
 @pytest.mark.parametrize("hidden_size", (2048, 3072, 5120, 9216, 16384))
-@pytest.mark.parametrize("cfg", (MIX, EVERY_FEATURE, ALL_ON_FP8), ids=str)
+@pytest.mark.parametrize(
+    "cfg", (MIX, EVERY_FEATURE, ALL_ON_FP8, ALL_ON_FP8_VLLM), ids=str
+)
 def test_flydsl_attn_res_wave_counts(hidden_size: int, cfg: _Config):
     """Rows of 2, 3, 5, 9, and 16 waves: the cross-wave finish pads waves to a power of two."""
     _run_and_check(17, _MAX_BLOCKS, cfg, hidden_size=hidden_size)
@@ -443,7 +480,9 @@ def test_flydsl_attn_res_wave_counts(hidden_size: int, cfg: _Config):
 
 @_skip_unsupported_gfx
 @pytest.mark.parametrize("hidden_size", (_D, _D_SMALL))
-@pytest.mark.parametrize("cfg", (MIX, ALL_ON, ALL_ON_FP8, ALL_ON_FP8_BF16), ids=str)
+@pytest.mark.parametrize(
+    "cfg", (MIX, ALL_ON, ALL_ON_FP8, ALL_ON_FP8_BF16, ALL_ON_FP8_VLLM), ids=str
+)
 def test_flydsl_attn_res_without_gfx950_ops(monkeypatch, hidden_size: int, cfg):
     monkeypatch.setattr(attn_res_kernel, "_has_gfx950_ops", lambda: False)
     attn_res_kernel._clear_caches()
@@ -480,6 +519,9 @@ def _invalid_call(case: str):
         args[0] = torch.randn(1, 2 * _D, dtype=torch.bfloat16)[:, ::2]
     elif case == "misaligned_base":
         args[0] = torch.randn(1, _D + 8, dtype=torch.bfloat16)[:, 1 : 1 + _D]
+    elif case == "fp16_score_weight":
+        args[2] = inputs.score_weight.half()
+        error = TypeError
     elif case == "misaligned_weight":
         args[2] = torch.randn(_D + 8, dtype=torch.bfloat16)[1 : 1 + _D]
     elif case == "rows_per_wg_over_block_limit":
@@ -504,6 +546,7 @@ def _invalid_call(case: str):
         "non_unit_trailing_stride",
         "misaligned_base",
         "misaligned_weight",
+        "fp16_score_weight",
         "rows_per_wg_over_block_limit",
     ),
 )
