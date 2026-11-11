@@ -34,8 +34,6 @@ from aiter.fused_moe import (
     AsmMoeMode,
     _mxfp4_a4w4_stage1_fw,
     _mxfp4_a4w4_stage2_fw,
-    cktile_moe_stage1,
-    cktile_moe_stage2,
     fused_moe,
     moe_sorting,
     swiglu_limit_tag,
@@ -100,16 +98,21 @@ from aiter.test_common import (
     tensor_compare_diagnostics,
 )
 from aiter.tuning.moe.backends.asm_1stage import (
-    run_1stage_fmoe_g1u1_tkw1,
+    gen_1stage_asm_task,
+    get_1stage_file_info,
+    get_1stage_fmoe_func,
     run_1stage_fmoe_fp8_blockscale_g1u1,
     run_1stage_fmoe_g1u1,
-    get_1stage_fmoe_func,
-    get_1stage_file_info,
-    gen_1stage_asm_task,
+    run_1stage_fmoe_g1u1_tkw1,
 )
 from aiter.tuning.moe.backends.asm_stage1 import (
     gen_2stages_asm1_task,
     run_asm_stage1,
+)
+from aiter.tuning.moe.backends.cktile import (
+    _gen_2stages_task_cktile,
+    cktile_moe_stage1_out,
+    cktile_moe_stage2_out,
 )
 from aiter.tuning.moe.backends.common import _is_tune_excluded_kernel, get_kernels_dict
 from aiter.tuning.moe.compare import (
@@ -701,87 +704,6 @@ class FmoeTuner(TunerCommon):
         )
 
     @staticmethod
-    def cktile_moe_stage1_out(
-        a1_fp8,
-        w1_qt_shffle_ck,
-        w2_qt_shffle_ck,
-        sorted_ids,
-        sorted_expert_ids,
-        sorted_weights,
-        num_valid_ids,
-        w1_scale_aiter,
-        bias,
-        dtype,
-        topk,
-        blockM,
-        act_type,
-    ):
-        M_sorted = sorted_ids.shape[0]
-        model_dim = a1_fp8.shape[1]
-        a1_scale = torch.ones(
-            (M_sorted, model_dim // 32), dtype=dtypes.fp8_e8m0, device=a1_fp8.device
-        )
-        return cktile_moe_stage1(
-            a1_fp8,
-            w1_qt_shffle_ck,
-            w2_qt_shffle_ck,
-            sorted_ids,
-            sorted_expert_ids,
-            num_valid_ids,
-            None,
-            topk,
-            blockM,
-            a1_scale=a1_scale,
-            w1_scale=w1_scale_aiter.view(dtypes.fp8_e8m0),
-            sorted_weights=sorted_weights,
-            bias1=bias,
-            activation=act_type,
-            split_k=1,
-            dtype=dtype,
-        )
-
-    @staticmethod
-    def cktile_moe_stage2_out(
-        a2_qt,
-        w1_qt_shffle_ck,
-        w2_qt_shffle_ck,
-        sorted_ids,
-        sorted_expert_ids,
-        sorted_weights,
-        num_valid_ids,
-        w2_scale_aiter,
-        a2_scale_sort,
-        bias,
-        dtype,
-        topk,
-        blockM,
-        act_type,
-    ):
-        token_num = a2_qt.shape[0]
-        model_dim = w2_qt_shffle_ck.shape[1]
-        out = torch.zeros(
-            (token_num, model_dim),
-            dtype=dtype,
-            device=a2_qt.device,
-        )
-        return cktile_moe_stage2(
-            a2_qt,
-            w1_qt_shffle_ck,
-            w2_qt_shffle_ck,
-            sorted_ids,
-            sorted_expert_ids,
-            num_valid_ids,
-            out,
-            topk,
-            w2_scale=w2_scale_aiter.view(dtypes.fp8_e8m0),
-            a2_scale=a2_scale_sort,
-            block_m=blockM,
-            activation=act_type,
-            sorted_weights=sorted_weights,
-            bias2=bias,
-        )
-
-    @staticmethod
     def run_flydsl_stage1_out(
         a1_qt,
         w1_qt_shffle_ck,
@@ -1359,6 +1281,9 @@ class FmoeTuner(TunerCommon):
     get_1stage_fmoe_func = staticmethod(get_1stage_fmoe_func)
     get_1stage_file_info = staticmethod(get_1stage_file_info)
     gen_1stage_asm_task = staticmethod(gen_1stage_asm_task)
+    cktile_moe_stage1_out = staticmethod(cktile_moe_stage1_out)
+    cktile_moe_stage2_out = staticmethod(cktile_moe_stage2_out)
+    _gen_2stages_task_cktile = staticmethod(_gen_2stages_task_cktile)
     torch_moe_tkw1 = staticmethod(torch_moe_tkw1)
     torch_moe_2stages = staticmethod(torch_moe_2stages)
     torch_moe_blockscale = staticmethod(torch_moe_blockscale)
@@ -1693,165 +1618,6 @@ class FmoeTuner(TunerCommon):
                             limit_cosine_diff_compare if clamp_limit else None,
                         )
                     )
-        return tasks_ck
-
-    def _gen_2stages_task_cktile(self, info, blockMs):
-        """A8W4 (fp8 activation + fp4 weight + per_1x32) uses cktile path."""
-        tasks_ck = []
-        (
-            _gfx,
-            _cu_num,
-            token,
-            model_dim,
-            inter_dim,
-            expert,
-            topk,
-            act_type,
-            dtype,
-            q_dtype_a,
-            q_dtype_w,
-            q_type,
-            use_g1u1,
-            doweight_stage1,
-        ) = info
-
-        _gen_data_args_s1 = (
-            token,
-            model_dim,
-            inter_dim,
-            expert,
-            topk,
-            act_type,
-            dtype,
-            q_dtype_a,
-            q_dtype_w,
-            q_type,
-            use_g1u1,
-            doweight_stage1,
-        )
-        _gen_data_args_s2 = (
-            token,
-            model_dim,
-            inter_dim,
-            expert,
-            topk,
-            act_type,
-            dtype,
-            q_dtype_a,
-            q_dtype_w,
-            q_type,
-            use_g1u1,
-            doweight_stage1,
-        )
-
-        for blockM in blockMs:
-            if blockM not in [32, 64] or not use_g1u1:
-                continue
-
-            cktile_s1_name = f"cktile_a8w4_bm{blockM}"
-            tasks_ck.append(
-                (
-                    (info, "stage1", cktile_s1_name, blockM),
-                    FmoeTuner.generate_data_2stages,
-                    (*_gen_data_args_s1, blockM, 1),
-                    FmoeTuner.cktile_moe_stage1_out,
-                    (
-                        [
-                            "a1_qt_fp8_cast",
-                            "w1_qt_shffle_ck",
-                            "w2_qt_shffle_ck",
-                            "sorted_ids",
-                            "sorted_expert_ids",
-                            "sorted_weights",
-                            "num_valid_ids",
-                            "w1_scale_aiter",
-                            "bias",
-                        ],
-                        dtype,
-                        topk,
-                        blockM,
-                        act_type,
-                    ),
-                    {},
-                    FmoeTuner.run_torch_moe_stage1,
-                    (
-                        [
-                            "a1_qt",
-                            "w1_qt",
-                            "w2_qt",
-                            "topk_weights",
-                            "topk_ids",
-                            "a1_scale",
-                            "w1_scale",
-                            "sorted_ids",
-                            "num_valid_ids",
-                            "bias",
-                        ],
-                        dtype,
-                        act_type,
-                        q_type,
-                        doweight_stage1,
-                        topk,
-                        blockM,
-                    ),
-                    {},
-                    (None),
-                    0.01,
-                    0.01,
-                    cosine_diff_compare,
-                )
-            )
-
-            cktile_s2_name = f"cktile_a8w4_bm{blockM}"
-            tasks_ck.append(
-                (
-                    (info, "stage2", cktile_s2_name, blockM),
-                    FmoeTuner.generate_data_2stages,
-                    (*_gen_data_args_s2, blockM, 2),
-                    FmoeTuner.cktile_moe_stage2_out,
-                    (
-                        [
-                            "a2_qt",
-                            "w1_qt_shffle_ck",
-                            "w2_qt_shffle_ck",
-                            "sorted_ids",
-                            "sorted_expert_ids",
-                            "sorted_weights",
-                            "num_valid_ids",
-                            "w2_scale_aiter",
-                            "a2_scale_mxfp4_sort",
-                            "bias",
-                        ],
-                        dtype,
-                        topk,
-                        blockM,
-                        act_type,
-                    ),
-                    {},
-                    FmoeTuner.run_torch_moe_stage2,
-                    (
-                        [
-                            "ref1_bf16",
-                            "w1_qt",
-                            "w2_qt",
-                            "topk_weights",
-                            "topk_ids",
-                            "a2_scale_none",
-                            "w2_scale",
-                            "bias",
-                        ],
-                        dtype,
-                        q_type,
-                        doweight_stage1,
-                    ),
-                    {},
-                    (None),
-                    0.01,
-                    0.01,
-                    cosine_diff_compare,
-                )
-            )
-
         return tasks_ck
 
     def gen_flydsl_2stages_task(self, info, blockMs):
