@@ -552,10 +552,12 @@ def build_gemm_a8w4_tdm_task(
                 and K // tile_k >= num_buffers * 4
             )
             or (
-                bool(explicit_vgpr_partition)
-                and cluster_n == 2
-                and stage1_act == 1
-                and bool(stage1_quant_out)
+                cluster_n == 2
+                and not enable_ep_scatter
+                and (
+                    (stage1_act == 1 and bool(stage1_quant_out))
+                    or (not stage1_act and not stage1_quant_out)
+                )
             )
         )
         and bool(next_stage_on)
