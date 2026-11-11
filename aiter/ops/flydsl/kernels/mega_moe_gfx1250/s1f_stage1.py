@@ -1993,6 +1993,7 @@ def make_s1f_stage1(
             i32_m,
             inp_cur_tok,
             f32_swiglu_limit,
+            value_attrs=lay["kernel_attrs"],
         ).launch(grid=(G, 1, 1), block=(block, 1, 1), stream=stream)
 
     launch.compile_hints = dict(launch_gemm_a8w4_tdm.compile_hints)
