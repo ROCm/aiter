@@ -28,8 +28,10 @@ rules are in [`configs/AGENTS.md`](configs/AGENTS.md).
    `@triton.jit` device helpers go in `_triton_kernels/common/`.
 7. Use architecture names (`gfx942`, `gfx950`, `gfx1250`) in code and folder
    names. Do not use product names such as MI300 or MI355.
-8. Allocate tensors on the device of the inputs (`device=x.device`). Do not
-   use `device="cuda"` in library code.
+8. Allocate tensors on the device of the inputs (`device=x.device`). Give
+   floating-point allocations an explicit `dtype`. Do not use
+   `device="cuda"` in library code. Do not call `torch.set_default_device` or
+   `torch.set_default_dtype`.
 9. Use absolute imports from the category path, for example
    `from aiter.ops.triton.gemm.basic.gemm_a16w16 import gemm_a16w16`. Do not
    use relative imports or the old flat paths.
@@ -40,7 +42,8 @@ rules are in [`configs/AGENTS.md`](configs/AGENTS.md).
 ### Configs
 
 11. Put tuning values in the JSON files in `configs/`. Do not put tuning
-    values in Python or in CSV files.
+    values in Python or in CSV files. Do not put comments or notes in the
+    JSON files.
 12. Read configs only through the loaders in `utils/`.
 13. In GEMM configs, use only `M_LEQ_<x>` keys and `"any"` for M buckets.
 14. Use `autotune_configs()` for every `@triton.autotune` config list.
@@ -52,6 +55,9 @@ rules are in [`configs/AGENTS.md`](configs/AGENTS.md).
     the wrapper folder. See the
     [test rules](../../../op_tests/triton_tests/README.md).
 17. Add a benchmark: `op_tests/op_benchmarks/triton/bench_<op>.py`.
+    Benchmarks obey the
+    [device and dtype rules](../../../op_tests/triton_tests/README.md#device-and-dtype)
+    of the tests.
 
 ### Comments and docs
 
@@ -85,6 +91,27 @@ rules are in [`configs/AGENTS.md`](configs/AGENTS.md).
     the merge.
 
 ## Reference
+
+### FlashAttention Dao-AI implementation
+
+Select the Dao-AI Triton implementation per call through the public MHA API:
+
+```python
+from aiter.ops.triton.attention.mha import flash_attn_func
+
+out = flash_attn_func(q, k, v, implementation="dao_ai")
+```
+
+`flash_attn_varlen_func` accepts the same selector. Omitting it preserves the
+configured Triton default. The selected implementation and dropout RNG state
+are retained for backward. This does not change the separate `aiter.ops.mha`
+dispatch. The Dao-AI varlen LSE layout remains `(heads, total_q)`.
+
+KV-cache attention uses the existing public Triton wrapper. It does not support
+backward, nonzero softcap or split counts above one. Its kernel package is
+internal at `_triton_kernels/attention/dao_ai/`. The former
+`_triton_kernels/flash_attn_triton_amd/` path forwards imports temporarily so
+current FlashAttention releases continue to work during the transition.
 
 ### Folder layout
 
@@ -138,6 +165,16 @@ configs/<arch>/<backend>/<op>/<d_type>/DEFAULT.json
 configs/<arch>/<backend>/<op>/<d_type>/<CONFIG_NAME>-<suffix>.json
 ```
 
+`<op>` is `gemm`, `moe`, `conv`, `mhc`, `attention`, `gmm`, `fusions`, `quant`
+or `normalization`.
+
+The plain `<arch>/` folder holds the configs of the CU count the arch was
+tuned on. A family tuned on another CU count has its own tree,
+`configs/<arch>/<cu_num>cu/<backend>/<op>/<d_type>/`, with its own
+`DEFAULT.json`. The loaders read that tree on a device with that CU count
+and the plain folder in every other case. See
+[CU trees](configs/AGENTS.md#cu-trees).
+
 The suffix depends on the family. For example, GEMM files use
 `N=<N>-K=<K>`, batched GEMM files use `B=<B>-N=<N>-K=<K>` and MHC files use
 `C=<C>`. Some families use a custom suffix.
@@ -150,6 +187,13 @@ kernel loads its config with one call:
 def _get_config(M: int, N: int, K: int):
     return get_gemm_config("GEMM-A16W16", M, N, K)  # returns (config, is_tuned)
 ```
+
+Unified attention keys have only the axes that they need, for example
+`D_LEQ_128.Q_LEQ_1.DT_fp8_fp8`. The dtype key is `DT_<q>_<k>` (query, K
+cache). When the V cache dtype is not the K cache dtype (A8K4V8), the loader
+first tries the three-dtype key `DT_<q>_<k>_<v>`, then `DT_<q>_<k>`,
+`DT_<q>_any`, `DT_any_<k>` and `"any"`. See
+[Unified attention](configs/AGENTS.md#unified-attention).
 
 [`configs/AGENTS.md`](configs/AGENTS.md) has the layout, the file names, the
 loaders, the JSON format and the steps to add a config. To tune a GEMM, use

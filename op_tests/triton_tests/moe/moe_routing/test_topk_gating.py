@@ -84,7 +84,9 @@ def test_exact_sigmoid_topk_matches_torch(
         device="cuda",
     )
     logits = backing[:, 7 : 7 + experts]
-    bias = (torch.randn(experts, device="cuda") * 0.1).to(torch.bfloat16)
+    bias = (torch.randn(experts, device="cuda", dtype=torch.float32) * 0.1).to(
+        torch.bfloat16
+    )
 
     if case == "ties":
         logits.zero_()
@@ -105,6 +107,7 @@ def test_exact_sigmoid_topk_matches_torch(
             20,
             experts // 4,
             device="cuda",
+            dtype=torch.float32,
         )
 
     expected_weights, expected_ids = _torch_reference(
@@ -172,3 +175,58 @@ def test_exact_sigmoid_topk_matches_torch(
         rtol=2e-5,
         equal_nan=True,
     )
+
+
+@pytest.mark.parametrize("bias_dtype", [torch.bfloat16, torch.float32])
+@pytest.mark.parametrize("need_renorm", [True, False])
+@pytest.mark.parametrize(
+    "experts,topk,rows",
+    [
+        (512, 5, 16),  # Top-(4+1) HERD candidates
+        (768, 9, 8),  # Top-(8+1) HERD candidates
+        (896, 16, 64),  # Kimi-K3 routing
+        (896, 17, 64),  # Kimi-K3 HERD candidates
+        (1024, 17, 128),
+    ],
+)
+def test_exact_sigmoid_topk_herd_widths(experts, topk, rows, need_renorm, bias_dtype):
+    """K+1 widths pad their slots to a power of two and mask the stores, and an
+    FP32 bias (Kimi-K3's) takes the same path as a BF16 one."""
+    torch.manual_seed(experts * topk + rows)
+    logits = torch.randn((rows, experts), dtype=torch.bfloat16, device="cuda")
+    bias = (torch.randn(experts, device="cuda", dtype=torch.float32) * 0.1).to(
+        bias_dtype
+    )
+    valid = rows - 3
+    num_valid_rows = torch.tensor([valid], dtype=torch.int32, device="cuda")
+    expected_weights, expected_ids = _torch_reference(
+        logits, bias, topk, need_renorm, 2.5
+    )
+    expected_ids[valid:] = -1
+    expected_weights[valid:] = 0.0
+    # The row stride covers every padded slot, so a store past topk shows up
+    # in the gap instead of in the next row.
+    stride = 2 * topk
+    weights_buf = torch.full((rows, stride), -7.0, dtype=torch.float32, device="cuda")
+    ids_buf = torch.full((rows, stride), -7, dtype=torch.int32, device="cuda")
+    weights, ids = weights_buf[:, :topk], ids_buf[:, :topk]
+
+    assert topk_ops._can_use_gfx1250_exact_sigmoid_topk(logits, bias, weights, ids)
+    topk_ops.biased_grouped_topk(
+        logits, bias, weights, ids, 1, 1, need_renorm, 2.5, num_valid_rows
+    )
+
+    assert torch.equal(ids, expected_ids)
+    torch.testing.assert_close(weights, expected_weights, atol=2e-5, rtol=2e-5)
+    assert torch.all(ids_buf[:, topk:] == -7)
+    assert torch.all(weights_buf[:, topk:] == -7.0)
+    if bias_dtype != logits.dtype:
+        # The wave32 HIP kernel aborts on a bias of another dtype.
+        return
+    hip_weights = torch.empty_like(weights)
+    hip_ids = torch.empty_like(ids)
+    topk_ops.biased_grouped_topk_hip(
+        logits, bias, hip_weights, hip_ids, 1, 1, need_renorm, 2.5, num_valid_rows
+    )
+    assert torch.equal(ids, hip_ids)
+    torch.testing.assert_close(weights, hip_weights, atol=2e-5, rtol=2e-5)

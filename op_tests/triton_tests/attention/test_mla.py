@@ -20,11 +20,93 @@ from op_tests.triton_tests.quant.test_quant_mxfp4 import (
 
 DEVICE_ARCH = arch_info.get_arch()
 
-torch.set_default_device("cuda")
-
 
 def uniform_random(shape, start=0, end=1, dtype=None, device=None):
     return (end - start) * torch.rand(shape, dtype=dtype, device=device) + start
+
+
+def input_helper(
+    batch_size: int,
+    ctx_lens: int,
+    decode_qlen: int,
+    num_query_heads: int,
+    num_kv_heads: int,
+    kv_lora_rank: int,
+    qk_rope_head_dim: int,
+    block_size: int,
+    num_blocks: int | None,
+    varlen: bool,
+    device: str = "cuda",
+):
+    """Generates the paged-KV shapes/tensors shared by the decode and prefill
+    tests. ``decode_qlen > 0`` fixes the query length (decode); ``0`` lets it
+    vary with ``varlen`` like the KV length (prefill).
+
+    ``num_blocks`` is the size of the block pool to draw (possibly repeated)
+    block indices from. Pass ``None`` to instead allocate exactly as many
+    blocks as needed and assign each sequence a unique set of blocks (e.g. for
+    benchmarking realistic KV cache footprint/bandwidth)."""
+    qk_head_dim = kv_lora_rank + qk_rope_head_dim
+
+    cu_seqlens_q = torch.zeros(batch_size + 1, dtype=torch.int, device=device)
+    seq_lens_qo = torch.empty(batch_size, dtype=torch.int, device=device)
+    seq_lens_kv = torch.empty(batch_size, dtype=torch.int, device=device)
+    if varlen:
+        for i in range(batch_size):
+            seq_lens_kv[i] = max(random.normalvariate(ctx_lens, ctx_lens / 2), ctx_lens)
+    else:
+        seq_lens_kv.fill_(ctx_lens)
+    if decode_qlen > 0:
+        seq_lens_qo.fill_(decode_qlen)
+    else:
+        if varlen:
+            for i in range(batch_size):
+                seq_lens_qo[i] = max(
+                    min(random.normalvariate(ctx_lens, ctx_lens / 2), ctx_lens), 1
+                )
+        else:
+            seq_lens_qo.fill_(ctx_lens)
+
+    cu_seqlens_q[1 : batch_size + 1] = torch.cumsum(seq_lens_qo, dim=0)
+    total_num_query_tokens = cu_seqlens_q[-1].item()
+
+    max_seqlen_kv = seq_lens_kv.max().item()
+    max_num_blocks_per_seq = (max_seqlen_kv + block_size - 1) // block_size
+    if num_blocks is None:
+        num_blocks = batch_size * max_num_blocks_per_seq
+        block_tables = torch.randperm(
+            num_blocks, dtype=torch.int32, device=device
+        ).reshape(batch_size, max_num_blocks_per_seq)
+    else:
+        block_tables = torch.randint(
+            0,
+            num_blocks,
+            (batch_size, max_num_blocks_per_seq),
+            dtype=torch.int32,
+            device=device,
+        )
+    kv_buffer = torch.randn(
+        (num_blocks, block_size, num_kv_heads, qk_head_dim),
+        dtype=torch.bfloat16,
+        device=device,
+    )
+    query = torch.randn(
+        (total_num_query_tokens, num_query_heads, qk_head_dim),
+        dtype=torch.bfloat16,
+        device=device,
+    )
+    sm_scale = 1.0 / (qk_head_dim**0.5)
+
+    return (
+        cu_seqlens_q,
+        seq_lens_kv,
+        max_seqlen_kv,
+        block_tables,
+        kv_buffer,
+        query,
+        sm_scale,
+        qk_head_dim,
+    )
 
 
 def shuffle_kv_buffer(
@@ -191,7 +273,7 @@ def ref_masked_attention(
         attn *= q_descale
     if kv_descale is not None:
         attn *= kv_descale
-    empty_mask = torch.ones(query_len, kv_len, device=q.device)
+    empty_mask = torch.ones(query_len, kv_len, device=q.device, dtype=torch.float32)
     mask = torch.triu(empty_mask, diagonal=kv_len - query_len + 1).bool()
     attn.masked_fill_(mask, float("-inf"))
     attn = torch.softmax(attn, dim=-1)
@@ -296,40 +378,30 @@ def test_mla_decode_fwd(
     random.seed(0)
     torch.manual_seed(0)
     num_query_heads, num_kv_heads = num_heads
-    qk_head_dim = kv_lora_rank + qk_rope_head_dim
 
-    cu_seqlens_q = torch.zeros(batch_size + 1, dtype=torch.int, device="cuda")
-    seq_lens_qo = torch.empty(batch_size, dtype=torch.int, device="cuda")
-    seq_lens_kv = torch.empty(batch_size, dtype=torch.int, device="cuda")
-    if varlen:
-        for i in range(batch_size):
-            seq_lens_kv[i] = max(random.normalvariate(ctx_lens, ctx_lens / 2), ctx_lens)
-    else:
-        seq_lens_kv.fill_(ctx_lens)
-    seq_lens_qo.fill_(decode_qlen)
-
-    cu_seqlens_q[1 : batch_size + 1] = torch.cumsum(seq_lens_qo, dim=0)
+    (
+        cu_seqlens_q,
+        seq_lens_kv,
+        max_seqlen_kv,
+        block_tables,
+        kv_buffer,
+        query,
+        sm_scale,
+        qk_head_dim,
+    ) = input_helper(
+        batch_size,
+        ctx_lens,
+        decode_qlen,
+        num_query_heads,
+        num_kv_heads,
+        kv_lora_rank,
+        qk_rope_head_dim,
+        block_size,
+        num_blocks,
+        varlen,
+    )
     total_num_query_tokens = cu_seqlens_q[-1].item()
 
-    max_seqlen_kv = seq_lens_kv.max().item()
-    max_num_blocks_per_seq = (max_seqlen_kv + block_size - 1) // block_size
-    block_tables = torch.randint(
-        0,
-        num_blocks,
-        (batch_size, max_num_blocks_per_seq),
-        dtype=torch.int32,
-        device="cuda",
-    )
-    kv_buffer = torch.randn(
-        (num_blocks, block_size, num_kv_heads, qk_head_dim),
-        dtype=torch.bfloat16,
-        device="cuda",
-    )
-    query = torch.randn(
-        (total_num_query_tokens, num_query_heads, qk_head_dim),
-        dtype=torch.bfloat16,
-        device="cuda",
-    )
     query_scales = None
     if q_dtype == torch.uint8:
         query = query / 10
@@ -345,8 +417,6 @@ def test_mla_decode_fwd(
     else:
         query = query.to(q_dtype)
         maybe_quant_query = query
-
-    sm_scale = 1.0 / (qk_head_dim**0.5)
 
     q_descale = None
     kv_descale = None
@@ -367,7 +437,9 @@ def test_mla_decode_fwd(
         )
 
     output = torch.empty(
-        (total_num_query_tokens, num_query_heads, kv_lora_rank), dtype=out_dtype
+        (total_num_query_tokens, num_query_heads, kv_lora_rank),
+        dtype=out_dtype,
+        device="cuda",
     )
 
     if shuffled_kv_cache:
@@ -494,11 +566,19 @@ def test_mla_decode_fwd_lds_pipeline_ring_wraparound(
         kv_buffer[0, 0, :, 0] = torch.finfo(e4m3_dtype).max
         kv_buffer[0, 0, :, 1] = torch.finfo(e4m3_dtype).min
     shuffled_kv_buffer = shuffle_kv_buffer(kv_buffer, 512)
-    q_descale = None if output_kind == "strided" else torch.tensor([0.3], device="cuda")
-    kv_descale = (
-        None if output_kind == "strided" else torch.tensor([0.4], device="cuda")
+    q_descale = (
+        None
+        if output_kind == "strided"
+        else torch.tensor([0.3], device="cuda", dtype=torch.float32)
     )
-    output_scale = torch.tensor([0.25 if output_kind == "fp8" else 0.7], device="cuda")
+    kv_descale = (
+        None
+        if output_kind == "strided"
+        else torch.tensor([0.4], device="cuda", dtype=torch.float32)
+    )
+    output_scale = torch.tensor(
+        [0.25 if output_kind == "fp8" else 0.7], device="cuda", dtype=torch.float32
+    )
     out_dtype = e4m3_dtype if output_kind == "fp8" else torch.bfloat16
     width = 513 if output_kind == "strided" else 520
     storage = torch.full(
@@ -572,6 +652,168 @@ def test_mla_decode_fwd_lds_pipeline_ring_wraparound(
         assert (storage[..., :offset].float() == 16).all()
 
 
+@pytest.mark.parametrize(
+    "kv_lora_rank, block_size, dtype",
+    [
+        (64, 64, e4m3_dtype),
+        (128, 64, e4m3_dtype),
+        (512, 64, e4m3_dtype),
+        (128, 128, torch.bfloat16),
+        (512, 128, e4m3_dtype),
+    ],
+)
+@torch.inference_mode()
+def test_mla_decode_fwd_unshuffled_pipeline_ring_wraparound(
+    monkeypatch, kv_lora_rank, block_size, dtype
+):
+    if DEVICE_ARCH != "gfx1250":
+        pytest.skip("unshuffled LDS pipeline requires gfx1250")
+
+    import aiter.ops.triton.attention.mla as mla_module
+
+    kernel = mla_module.gluon_mla_decode_fwd_kernel
+    launches = []
+    heuristic_configs = []
+    select_config = mla_module.select_3d_config
+
+    def capture_config(*args, **kwargs):
+        attn, reduce = select_config(*args, **kwargs)
+        heuristic_configs.append(attn.copy())
+        return attn, reduce
+
+    monkeypatch.setattr(mla_module, "select_3d_config", capture_config)
+
+    class CaptureLaunch:
+        def __getitem__(self, grid):
+            def launch(*args, **kwargs):
+                launches.append(kwargs)
+                assert not kwargs["SHUFFLED_KV_CACHE"]
+                if block_size == 128:
+                    for key, value in heuristic_configs[-1].items():
+                        assert kwargs[key] == value
+                    assert not kwargs.get("Q_FROM_LDS", False)
+                    assert not kwargs.get("TDM_PARTIAL_STORE", False)
+                else:
+                    assert kwargs["num_stages"] == 3
+                    assert kwargs["Q_FROM_LDS"]
+                    assert kwargs["TDM_PARTIAL_STORE"]
+                return kernel[grid](*args, **kwargs)
+
+            return launch
+
+    monkeypatch.setattr(mla_module, "gluon_mla_decode_fwd_kernel", CaptureLaunch())
+    torch.manual_seed(0)
+    batch_size, num_query_heads, num_blocks = 32, 64, 128
+    qk_head_dim = kv_lora_rank + 64
+    max_seqlen_kv = 16385
+    # Mixed lengths cover page boundaries, ring reuse and partial final pages.
+    # Rank 64 uses direct stores despite the tuned TDM store flag.
+    if block_size == 128 and dtype == e4m3_dtype:
+        tuned = mla_module._tuned_decode_config(
+            "pipelined_unshuffled",
+            "fp8",
+            "fp8",
+            num_query_heads,
+            batch_size,
+            max_seqlen_kv,
+        )
+        assert tuned
+        assert (
+            mla_module._pipelined_unshuffled_lds_bytes(
+                block_size,
+                tuned["BLOCK_M"],
+                kv_lora_rank,
+                64,
+                1,
+                1,
+                tuned["num_stages"],
+                tuned["Q_FROM_LDS"],
+            )
+            > 256 * 1024
+        )
+        assert (
+            mla_module._pipelined_unshuffled_lds_bytes(
+                block_size, num_query_heads, kv_lora_rank, 64, 1, 1
+            )
+            <= 256 * 1024
+        )
+    lengths = [
+        1,
+        block_size,
+        block_size + 1,
+        2 * block_size + 1,
+        16 * block_size + 1,
+        max_seqlen_kv,
+    ]
+    lengths.extend([block_size + 1] * (batch_size - len(lengths)))
+    seq_lens_kv = torch.tensor(lengths, dtype=torch.int32, device="cuda")
+    cu_seqlens_q = torch.arange(batch_size + 1, dtype=torch.int32, device="cuda")
+    block_tables = torch.randint(
+        0,
+        num_blocks,
+        (batch_size, (max_seqlen_kv + block_size - 1) // block_size),
+        dtype=torch.int32,
+        device="cuda",
+    )
+    # Logical pages may reuse physical pages; the oracle follows the same table.
+    kv_buffer = torch.randn(
+        (num_blocks, block_size, 1, qk_head_dim), dtype=torch.bfloat16, device="cuda"
+    ).to(dtype)
+    query = torch.randn(
+        (batch_size, num_query_heads, qk_head_dim), dtype=torch.bfloat16, device="cuda"
+    ).to(dtype)
+    q_descale = torch.tensor([0.3], dtype=torch.float32, device="cuda")
+    kv_descale = torch.tensor([0.4], dtype=torch.float32, device="cuda")
+    output_scale = torch.tensor([0.7], dtype=torch.float32, device="cuda")
+    output = torch.empty(
+        (batch_size, num_query_heads, kv_lora_rank), dtype=torch.bfloat16, device="cuda"
+    )
+    mla_decode_fwd(
+        q=query,
+        kv_buffer=kv_buffer,
+        out=output,
+        cu_seqlens_q=cu_seqlens_q,
+        seqused_k=seq_lens_kv,
+        max_seqlen_kv=max_seqlen_kv,
+        block_tables=block_tables,
+        softmax_scale=qk_head_dim**-0.5,
+        kv_lora_rank=kv_lora_rank,
+        qk_rope_head_dim=64,
+        causal=True,
+        q_descale=q_descale,
+        kv_descale=kv_descale,
+        out_scale=output_scale,
+        shuffled_kv_cache=False,
+    )
+    assert len(launches) == 1
+    ref_output = torch_mla_extend(
+        query,
+        kv_buffer,
+        cu_seqlens_q,
+        seq_lens_kv,
+        block_tables,
+        kv_lora_rank,
+        qk_head_dim**-0.5,
+        q_descale=q_descale,
+        kv_descale=kv_descale,
+        out_scale=output_scale,
+        o_dtype=torch.float32,
+    )
+    assert torch.isfinite(output).all()
+    tol_err_ratio = 0.01
+    assert (
+        checkAllclose(
+            output.float(),
+            ref_output,
+            atol=1.5e-1,
+            rtol=1.5e-1,
+            tol_err_ratio=tol_err_ratio,
+            msg="mla_decode_fwd unshuffled pipeline output",
+        )
+        <= tol_err_ratio
+    )
+
+
 @pytest.mark.parametrize("batch_size", [1])
 @pytest.mark.parametrize("ctx_lens", [200])
 @pytest.mark.parametrize("num_heads", [(16, 1), (128, 1)])
@@ -606,43 +848,31 @@ def test_mla_prefill_fwd(
     torch.manual_seed(0)
 
     num_query_heads, num_kv_heads = num_heads
-    cu_seqlens_q = torch.zeros(batch_size + 1, dtype=torch.int, device="cuda")
-    seq_lens_qo = torch.empty(batch_size, dtype=torch.int, device="cuda")
-    seq_lens_kv = torch.empty(batch_size, dtype=torch.int, device="cuda")
-    if varlen:
-        for i in range(batch_size):
-            seq_lens_kv[i] = max(random.normalvariate(ctx_lens, ctx_lens / 2), ctx_lens)
-            seq_lens_qo[i] = max(
-                min(random.normalvariate(ctx_lens, ctx_lens / 2), ctx_lens), 1
-            )
-    else:
-        seq_lens_kv.fill_(ctx_lens)
-        seq_lens_qo.fill_(ctx_lens)
 
-    cu_seqlens_q[1 : batch_size + 1] = torch.cumsum(seq_lens_qo, dim=0)
-    total_num_query_tokens = cu_seqlens_q[-1].item()
-
-    max_seqlen_kv = seq_lens_kv.max().item()
-    max_num_blocks_per_seq = (max_seqlen_kv + block_size - 1) // block_size
-    block_tables = torch.randint(
-        0,
+    (
+        cu_seqlens_q,
+        seq_lens_kv,
+        max_seqlen_kv,
+        block_tables,
+        kv_buffer,
+        q,
+        sm_scale,
+        _,
+    ) = input_helper(
+        batch_size,
+        ctx_lens,
+        0,  # decode_qlen=0 -> query length varies with varlen, like prefill
+        num_query_heads,
+        num_kv_heads,
+        kv_lora_rank,
+        qk_rope_head_dim,
+        block_size,
         num_blocks,
-        (batch_size, max_num_blocks_per_seq),
-        dtype=torch.int32,
-        device="cuda",
+        varlen,
     )
-    qk_head_dim = kv_lora_rank + qk_rope_head_dim
-    kv_buffer = torch.randn(
-        (num_blocks, block_size, num_kv_heads, qk_head_dim),
-        dtype=torch.bfloat16,
-        device="cuda",
-    ).to(kv_dtype)
-    q = torch.randn(
-        (total_num_query_tokens, num_query_heads, qk_head_dim),
-        dtype=torch.bfloat16,
-        device="cuda",
-    ).to(q_dtype)
-    sm_scale = 1.0 / (qk_head_dim**0.5)
+    total_num_query_tokens = cu_seqlens_q[-1].item()
+    kv_buffer = kv_buffer.to(kv_dtype)
+    q = q.to(q_dtype)
 
     q_descale = None
     kv_descale = None
@@ -657,7 +887,9 @@ def test_mla_prefill_fwd(
         out_scale = 1 / torch.rand(1, dtype=torch.float32, device="cuda")
 
     out = torch.empty(
-        (total_num_query_tokens, num_query_heads, kv_lora_rank), dtype=out_dtype
+        (total_num_query_tokens, num_query_heads, kv_lora_rank),
+        dtype=out_dtype,
+        device="cuda",
     )
 
     mla_prefill_fwd(
@@ -760,23 +992,25 @@ def test_mla_gluon_decode_over_2gb(batch, ctx, nhead, kv_lora_rank, qk_rope_head
     random.seed(0)
     torch.manual_seed(0)
     used = batch * ctx
-    kv_data = torch.randn((used, head_dim), dtype=dtype)
-    q_nope = torch.randn((batch, nhead, kv_lora_rank), dtype=dtype)
-    q_pe = torch.randn((batch, nhead, qk_rope_head_dim), dtype=dtype)
-    kv_indptr = torch.arange(0, (batch + 1) * ctx, ctx, dtype=torch.int32)
+    kv_data = torch.randn((used, head_dim), dtype=dtype, device="cuda")
+    q_nope = torch.randn((batch, nhead, kv_lora_rank), dtype=dtype, device="cuda")
+    q_pe = torch.randn((batch, nhead, qk_rope_head_dim), dtype=dtype, device="cuda")
+    kv_indptr = torch.arange(
+        0, (batch + 1) * ctx, ctx, dtype=torch.int32, device="cuda"
+    )
 
     # reference: small cache (rows 0..used) -> within_2gb=True -> buffer_load path
-    idx_ref = torch.arange(used, dtype=torch.int32)
+    idx_ref = torch.arange(used, dtype=torch.int32, device="cuda")
     assert kv_data.shape[0] * kv_data.stride(0) * 2 <= gb2
     o_ref = _mla_gluon_decode(
         mla_gluon, kv_data, idx_ref, kv_indptr, q_nope, q_pe, batch, nhead, ctx
     )
 
     # under test: >2 GB cache, identical KV at the top -> global_load path
-    kv_big = torch.zeros((n_big, head_dim), dtype=dtype)
+    kv_big = torch.zeros((n_big, head_dim), dtype=dtype, device="cuda")
     base = n_big - used
     kv_big[base : base + used].copy_(kv_data)
-    idx_big = torch.arange(used, dtype=torch.int32) + base
+    idx_big = torch.arange(used, dtype=torch.int32, device="cuda") + base
     assert kv_big.shape[0] * kv_big.stride(0) * 2 > gb2
     o_big = _mla_gluon_decode(
         mla_gluon, kv_big, idx_big, kv_indptr, q_nope, q_pe, batch, nhead, ctx
@@ -836,7 +1070,9 @@ def test_mla_decode_fwd_lds_pipeline_eligibility(
         (batch_size + extra_tokens, 128, 576), dtype=e4m3_dtype, device="meta"
     )
     kv_buffer = torch.empty((64, 1, 64, 576), dtype=e4m3_dtype, device="meta")
-    output = torch.empty((batch_size + extra_tokens, 128, 512), device="meta")
+    output = torch.empty(
+        (batch_size + extra_tokens, 128, 512), dtype=torch.float32, device="meta"
+    )
     block_tables = torch.empty((batch_size, 32), dtype=torch.int32, device="meta")
     if wide_view:
         tensors = {"query": query, "output": output, "block_tables": block_tables}
@@ -880,3 +1116,56 @@ def test_mla_decode_fwd_lds_pipeline_eligibility(
         assert isinstance(result, tuple) and len(result) == 3
     else:
         assert result is output
+
+
+@pytest.mark.parametrize("query_stride", [1, 2])
+@pytest.mark.parametrize("dtype", [torch.bfloat16, e4m3_dtype])
+def test_mla_decode_fwd_unshuffled_query_stride_eligibility(
+    monkeypatch, query_stride, dtype
+):
+    import aiter.ops.triton.attention.mla as mla_module
+
+    monkeypatch.setattr(mla_module, "DEVICE_ARCH", "gfx1250")
+    monkeypatch.setattr(mla_module, "IS_DEVICE_ARCH_GFX12", True)
+    monkeypatch.setattr(mla_module, "get_num_sms", lambda: 96)
+    launches = []
+
+    class CaptureLaunch:
+        def __init__(self, pipelined):
+            self.pipelined = pipelined
+
+        def __getitem__(self, grid):
+            def launch(*args, **kwargs):
+                launches.append(self.pipelined)
+
+            return launch
+
+    monkeypatch.setattr(mla_module, "gluon_mla_decode_fwd_kernel", CaptureLaunch(True))
+    monkeypatch.setattr(
+        mla_module, "gluon_mla_decode_fwd_kernel_non_pipelined", CaptureLaunch(False)
+    )
+    # Metadata-only dispatch check. No GPU allocation or kernel launch.
+    batch_size, heads, head_dim = 128, 64, 576
+    query = torch.empty(
+        (batch_size, heads, head_dim * query_stride), dtype=dtype, device="meta"
+    )[..., ::query_stride]
+    output = torch.empty((batch_size, heads, 512), dtype=torch.bfloat16, device="meta")
+    result = mla_module.mla_decode_fwd(
+        q=query,
+        kv_buffer=torch.empty((1, 64, 1, head_dim), dtype=dtype, device="meta"),
+        out=output,
+        cu_seqlens_q=torch.empty((batch_size + 1,), dtype=torch.int32, device="meta"),
+        seqused_k=torch.empty((batch_size,), dtype=torch.int32, device="meta"),
+        max_seqlen_kv=1,
+        block_tables=torch.empty((batch_size, 1), dtype=torch.int32, device="meta"),
+        softmax_scale=head_dim**-0.5,
+        kv_lora_rank=512,
+        qk_rope_head_dim=64,
+        causal=True,
+        q_descale=None,
+        kv_descale=None,
+        shuffled_kv_cache=False,
+    )
+    assert query.stride(2) == query_stride
+    assert launches == [query_stride == 1]
+    assert result is output

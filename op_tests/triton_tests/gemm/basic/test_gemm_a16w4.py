@@ -249,9 +249,10 @@ def test_gptq_to_gemm_a16w4(M, N, K, group_size, sym, desc_act, checkpoint_forma
     num_groups = K // group_size
     x = torch.randn((M, K), dtype=dtype, device="cuda")
     q = torch.randint(0, 16, (K, N), device="cuda")
-    scales = ((torch.rand((num_groups, N), device="cuda") + 0.5) / (4.6 * K**0.5)).to(
-        dtype
-    )
+    scales = (
+        (torch.rand((num_groups, N), dtype=torch.float32, device="cuda") + 0.5)
+        / (4.6 * K**0.5)
+    ).to(dtype)
     zeros = torch.randint(0, 16, (num_groups, N), device="cuda")
     if sym:
         zeros.fill_(8)
@@ -289,9 +290,10 @@ def test_awq_to_gemm_a16w4(M, N, K, group_size):
     num_groups = K // group_size
     x = torch.randn((M, K), dtype=dtype, device="cuda")
     q = torch.randint(0, 16, (K, N), device="cuda")
-    scales = ((torch.rand((num_groups, N), device="cuda") + 0.5) / (4.6 * K**0.5)).to(
-        dtype
-    )
+    scales = (
+        (torch.rand((num_groups, N), dtype=torch.float32, device="cuda") + 0.5)
+        / (4.6 * K**0.5)
+    ).to(dtype)
     zeros = torch.randint(0, 16, (num_groups, N), device="cuda")
 
     # Checkpoint tensors, packed as AWQ stores them (nibble i holds column order[i]).
