@@ -294,6 +294,20 @@ class MQAAsyncKVLoader:
     def wait(self, wait_count):
         gl.amd.cdna4.async_copy.wait_group(wait_count)
 
+    @gluon.jit
+    def wait_shared_reads(self):
+        # A one-wave barrier doesn't wait for LDS reads, so wait here before
+        # the async copy overwrites their buffer.
+        if self.kv_cfg.NUM_WARPS == 1:
+            gl.inline_asm_elementwise(
+                "s_waitcnt lgkmcnt(0)",
+                "=r",
+                [],
+                dtype=gl.int32,
+                is_pure=False,
+                pack=1,
+            )
+
 
 @gluon.jit
 def _mqa_dot(
@@ -706,6 +720,8 @@ def mqa_logits_loop_double_buf(
         mfma_k = kv_loader.load_from_shared(
             wait_count=1, target_layout=dot_b_layout, buffer_id=buf_cur
         )
+        # The prefetch below overwrites the slot just read.
+        kv_loader.wait_shared_reads()
         kv_loader.load_to_shared(
             start_ind + (i + 2) * BLOCK_KV,
             buffer_id=buf_cur,
@@ -753,6 +769,8 @@ def mqa_logits_loop_double_buf(
         mfma_k = kv_loader.load_from_shared(
             wait_count=1, target_layout=dot_b_layout, buffer_id=buf_cur
         )
+        # The prefetch below overwrites the slot just read.
+        kv_loader.wait_shared_reads()
         kv_loader.load_to_shared(
             start_ind + num_full_tiles * BLOCK_KV,
             buffer_id=buf_cur,
