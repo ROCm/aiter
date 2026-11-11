@@ -410,7 +410,10 @@ def compile_decode(
                 if const_expr(LATE_V):
                     # K of the next page now, its V after the QK of this one.
                     nxt = load_k(nxt_pr)
-                    after_qk = lambda: nxt.extend(load_v(nxt_pr))
+
+                    def after_qk(nxt=nxt, nxt_pr=nxt_pr):
+                        nxt.extend(load_v(nxt_pr))
+
                     bufs.append(nxt)
                 else:
                     after_qk = None

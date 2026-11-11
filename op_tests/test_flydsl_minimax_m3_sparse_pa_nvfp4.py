@@ -173,22 +173,22 @@ def make_case(
                     topk[h, i, 1] = -1
     q = (torch.randn(rows, hkv * group, D, generator=g)).bfloat16()
     dev = device
-    return dict(
-        q=q.to(dev),
-        cache=cache,
-        topk=topk.to(dev),
-        bt=bt.to(dev),
-        row_req=row_req.to(dev),
-        row_kv=row_kv.to(dev),
-        seq_lens=torch.tensor(seq_lens, dtype=torch.int32, device=dev),
-        q_lens=list(q_lens),
-        k_scale=torch.tensor([k_scale], dtype=torch.float32, device=dev),
-        v_scale=torch.tensor([v_scale], dtype=torch.float32, device=dev),
-        hkv=hkv,
-        group=group,
-        kd=deq(kc, ks, k_scale),
-        vd=deq(vc, vs, v_scale),  # fp64 [pages, 128, hkv, 128]
-    )
+    return {
+        "q": q.to(dev),
+        "cache": cache,
+        "topk": topk.to(dev),
+        "bt": bt.to(dev),
+        "row_req": row_req.to(dev),
+        "row_kv": row_kv.to(dev),
+        "seq_lens": torch.tensor(seq_lens, dtype=torch.int32, device=dev),
+        "q_lens": list(q_lens),
+        "k_scale": torch.tensor([k_scale], dtype=torch.float32, device=dev),
+        "v_scale": torch.tensor([v_scale], dtype=torch.float32, device=dev),
+        "hkv": hkv,
+        "group": group,
+        "kd": deq(kc, ks, k_scale),
+        "vd": deq(vc, vs, v_scale),  # fp64 [pages, 128, hkv, 128]
+    }
 
 
 def run_torch(c):
@@ -422,17 +422,17 @@ def test_decode_perf(rows, query_len, hkv, group, ctx):
     # first rows against the fp64 oracle (the 256 base pages stand for every page)
     nref = min(rows, 8)
     ref = run_torch(
-        dict(
-            q=q[:nref],
-            topk=topk[:, :nref],
-            bt=bt % BASE_PAGES,
-            row_req=(torch.arange(nref, device="cuda") // query_len).int(),
-            row_kv=kv[:nref].int(),
-            hkv=hkv,
-            group=group,
-            kd=kd,
-            vd=vd,
-        )
+        {
+            "q": q[:nref],
+            "topk": topk[:, :nref],
+            "bt": bt % BASE_PAGES,
+            "row_req": (torch.arange(nref, device="cuda") // query_len).int(),
+            "row_kv": kv[:nref].int(),
+            "hkv": hkv,
+            "group": group,
+            "kd": kd,
+            "vd": vd,
+        }
     )
     err = rel_l2(out[:nref], ref)
     # keys actually read: every valid block is full except each row's tail
