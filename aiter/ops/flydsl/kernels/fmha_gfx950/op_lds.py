@@ -11,6 +11,7 @@ from flydsl.expr.typing import T
 from flydsl.expr.typing import Vector as Vec
 
 from aiter.ops.flydsl.kernels.fmha_gfx950.operand_layouts import (
+    k_row_permutation,
     k_stripe_layout,
     shuffled_v_copy,
     shuffled_v_layout,
@@ -130,13 +131,17 @@ class DualwaveFp8KvGmemToLdsLoader(DualwaveFp8PageIdLoader):
         else:
             self._load_k_bands(k_div, tile_start, k_lds_byte_base)
 
-    def _shuffled_k_src_elem(self, global_d, n_in_tile, tile_start, full=False):
-        """Element index of a shuffled-layout K chunk, or an OOB sentinel past the tail."""
+    def _shuffled_k_page_layout(self):
+        """(16-byte head-dim chunk, token, byte) of one shuffled K page; bn64 keeps the same layout in LDS."""
         traits = self.traits
-        layout = fx.make_layout(
+        return fx.make_layout(
             (traits.HEAD_DIM // 16, traits.BLOCK_N, 16),
             (traits.BLOCK_N * 16, 16, 1),
         )
+
+    def _shuffled_k_src_elem(self, global_d, n_in_tile, tile_start, full=False):
+        """Element index of a shuffled-layout K chunk, or an OOB sentinel past the tail."""
+        layout = self._shuffled_k_page_layout()
         src_elem = self.kv_gmem_elem_offset + fx.Index(
             fx.get_scalar(
                 fx.crd2idx((fx.Int32(global_d // 16), fx.Int32(n_in_tile), 0), layout)
@@ -151,6 +156,9 @@ class DualwaveFp8KvGmemToLdsLoader(DualwaveFp8PageIdLoader):
 
     def _load_k_bn64(self, k_div, tile_start, k_lds_byte_base, full=False):
         traits = self.traits
+        if const_expr(traits.K_SHUFFLED):
+            self._load_k_bn64_shuffled(k_div, tile_start, k_lds_byte_base, full)
+            return
         ownership = k_stripe_layout(traits.HEAD_DIM, traits.VEC_KV)
         logical = fx.make_layout((traits.BLOCK_N, traits.HEAD_DIM), (1, traits.BLOCK_N))
         for pas in range_constexpr(2):
@@ -173,6 +181,31 @@ class DualwaveFp8KvGmemToLdsLoader(DualwaveFp8PageIdLoader):
                     global_d, n_in_tile, tile_start, full
                 )
             lds_addr = k_lds_byte_base + stripe * traits.K_BAND_LINE_STRIDE[0]
+            self.buffer_load_lds_128(k_div, lds_addr, src_elem, 0)
+
+    def _load_k_bn64_shuffled(self, k_div, tile_start, k_lds_byte_base, full=False):
+        """One DMA per 16-byte head-dim chunk: all 64 tokens of a chunk are 1 KB contiguous in the shuffled page.
+
+        LDS keeps the page's chunk-major layout, but key slot n receives token k_row_permutation(n), so QK's scores
+        come out in V's intact 16-token order and P needs no lane swaps before PV.
+        """
+        traits = self.traits
+        page = self._shuffled_k_page_layout()
+        token = fx.Int32(
+            fx.get_scalar(
+                fx.crd2idx(
+                    fx.Int32(self.lane_in_warp), k_row_permutation(traits.BLOCK_N)
+                )
+            )
+        )
+        for pas in range_constexpr(traits.HEAD_DIM // 16 // traits.NUM_WAVES):
+            chunk = self.wave_id_uni + pas * traits.NUM_WAVES
+            src_elem = self._shuffled_k_src_elem(
+                chunk * 16, fx.Index(token), tile_start, full
+            )
+            lds_addr = k_lds_byte_base + fx.Int32(
+                fx.get_scalar(fx.crd2idx((fx.Int32(chunk), 0, 0), page))
+            )
             self.buffer_load_lds_128(k_div, lds_addr, src_elem, 0)
 
     def _load_k_bands(self, k_div, tile_start, k_lds_byte_base):
@@ -332,6 +365,22 @@ class DualwaveFp8KvLdsToVgprLoader(DualwaveFp8KernelContext):
         rows_per_line = (
             8 if traits.BODY_VARIANT == "conventional_bn64" else traits.NUM_WAVES
         )
+        if const_expr(self.k_rows_permuted()):
+            # Chunk-major slots (see _load_k_bn64_shuffled): a lane's 32 head-dim bytes span two 1 KB chunks.
+            page = fx.make_layout(
+                (traits.HEAD_DIM // 16, traits.BLOCK_N), (traits.BLOCK_N * 16, 16)
+            )
+            key = n_hi if strip else n_lo
+            out = []
+            for ws in range_constexpr(traits.HEAD_DIM // 64):
+                off = fx.crd2idx(
+                    (fx.Int32((ws * 64 + d_base) // 16), fx.Int32(key)), page
+                )
+                addr = fx.Int32(k_base) + fx.Int32(fx.get_scalar(off))
+                out.append(
+                    self.read_i32x8_lds(self.lds.kv.ptr, addr, traits.BLOCK_N * 16)
+                )
+            return out
 
         def _read_strip(key):
             out = []

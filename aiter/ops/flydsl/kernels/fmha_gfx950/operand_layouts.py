@@ -72,3 +72,38 @@ def probability_swap_pairs():
                 indices.append(fx.crd2idx(coord, compact).to_py_value())
             pairs.append(tuple(indices))
     return pairs
+
+
+def _c_key_rows():
+    # QK's C ownership seen from lane 0 of each 32-lane half: (lane half, accumulator value) -> key row of a strip.
+    mma = wide_fp8_mma()
+    rows = fx.composition(fx.make_layout((32, 32), (1, 0)), mma.tv_layout_C_tiled)
+    return fx.coalesce(fx.slice(rows, ((0, None), ((None, None), (0, 0)))))
+
+
+def probability_tokens():
+    """(lane half, value) -> token of one 32-token strip that PV's shuffled V operand pairs with that P value."""
+    tokens = shuffled_v_tokens()
+    return fx.coalesce(fx.slice(tokens, ((0, None), ((None, 0), (0, 0)))))
+
+
+def k_row_permutation(block_n):
+    """LDS key slot -> token loaded there, so QK's C value at slot crow(h, v) holds token probability_tokens(h, v).
+
+    P then leaves QK in V's intact 16-token order and needs no lane swaps. Within a strip it is tokens o crow^-1;
+    the strips (32 keys each) are independent, so the strip index passes through.
+    """
+    strip = fx.composition(probability_tokens(), fx.right_inverse(_c_key_rows()))
+    strip_keys = fx.size(strip).to_py_value()
+    return fx.make_layout(
+        (fx.get_shape(strip).to_py_value(), block_n // strip_keys),
+        (fx.get_stride(strip).to_py_value(), strip_keys),
+    )
+
+
+def probability_mask_columns():
+    """Column offsets for masking permuted scores: (token offset of the high lane half, per-value token offsets)."""
+    tokens = probability_tokens()
+    lane_off = fx.crd2idx((1, 0), tokens).to_py_value()
+    values = fx.size(tokens).to_py_value() // 2
+    return lane_off, [fx.crd2idx((0, v), tokens).to_py_value() for v in range(values)]

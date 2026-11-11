@@ -18,7 +18,6 @@ from aiter.ops.flydsl.kernels.fmha_gfx950.pipeline import (
     _anchor_v_o,
     _apply_dualwave_causal_mask_pair,
     _attn_mask_vec2_imm,
-    _causal_pair_thresholds,
     _exp2_score_slice,
     _p_headroom_log2,
     _read_exec_i64,
@@ -50,7 +49,8 @@ class DualwaveFp8SoftmaxHelper(DualwaveFp8KernelContext):
         s_lo, s_hi = v_s
         kv_tile_start = tile_idx * traits.BLOCK_N
         kv_start_i32 = fx.Int32(kv_tile_start)
-        lane_off_i32 = fx.Int32(self.lane_div_32) * 4
+        lane_off, pair_thresholds = self.score_mask_columns()
+        lane_off_i32 = fx.Int32(self.lane_div_32) * lane_off
         # q_row_i32 is set by init_q_row (called after helper construction), so read
         # it from the live ctx.
         rel_lo_i32 = fx.Int32(
@@ -58,7 +58,6 @@ class DualwaveFp8SoftmaxHelper(DualwaveFp8KernelContext):
         )
         rel_hi_i32 = rel_lo_i32 - 32
         neg_inf_i32 = fx.Int32(traits.NEG_INF_F32_BITS)
-        pair_thresholds = _causal_pair_thresholds(False)
         _apply_dualwave_causal_mask_pair(s_lo, rel_lo_i32, neg_inf_i32, pair_thresholds)
         _apply_dualwave_causal_mask_pair(s_hi, rel_hi_i32, neg_inf_i32, pair_thresholds)
 
@@ -120,14 +119,14 @@ class DualwaveFp8SoftmaxHelper(DualwaveFp8KernelContext):
             if self.ctx_ref.q_start_pos_i32 + self.delta_i32 < fx.Int32(kv_end_pos):
                 lo_list, hi_list = self.v_s_vec_to_lists(v_s)
                 kv_start_i32 = fx.Int32(tile_idx * traits.BLOCK_N)
+                lane_off, thresholds = self.score_mask_columns()
                 rel_lo_i32 = fx.Int32(
                     self.ctx_ref.q_row_i32
                     + self.delta_i32
                     - kv_start_i32
-                    - fx.Int32(self.lane_div_32) * 4
+                    - fx.Int32(self.lane_div_32) * lane_off
                 )
                 neg_inf_i32 = fx.Int32(traits.NEG_INF_F32_BITS)
-                thresholds = _causal_pair_thresholds(False)
                 _apply_dualwave_causal_mask_pair(
                     lo_list, rel_lo_i32, neg_inf_i32, thresholds
                 )
@@ -145,9 +144,10 @@ class DualwaveFp8SoftmaxHelper(DualwaveFp8KernelContext):
         traits = self.traits
         s_lo, s_hi = v_s_lists
         kv_tile_start = tile_idx * traits.BLOCK_N
-        col_base = fx.Int32(kv_tile_start) + fx.Int32(self.lane_div_32) * 4
+        lane_off, pair_thresholds = self.score_mask_columns()
+        col_base = fx.Int32(kv_tile_start) + fx.Int32(self.lane_div_32) * lane_off
         for r in range_constexpr(16):
-            thr = (r // 4) * 8 + (r % 4)
+            thr = pair_thresholds[r // 2][r % 2]
             col_lo = col_base + fx.Int32(thr)
             col_hi = col_lo + 32
             s_lo[r] = (col_lo < self.seqlen_kv_i32).select(s_lo[r], self.c_neg_inf)

@@ -16,6 +16,7 @@ from flydsl.expr.typing import Vector as Vec
 from aiter.ops.flydsl.kernels.fmha_gfx950.operand_layouts import probability_swap_pairs
 from aiter.ops.flydsl.kernels.fmha_gfx950.pipeline import (
     DualwaveFp8KernelContext,
+    _anchor_i32x8,
     _anchor_v_o,
 )
 
@@ -160,6 +161,10 @@ class DualwaveFp8GemmHelper(DualwaveFp8KernelContext):
             p_base = pks * 8
             f32 += [hi_full[p_base + s] for s in range_constexpr(8)]
         packed = self._pack_fp8_i32x8(f32)
+        if const_expr(self.k_rows_permuted()):
+            # K's permuted rows already put P in V's intact 16-token order (operand_layouts.k_row_permutation).
+            # The anchor keeps the fp8 packing from sinking past the V-read branch, which would keep P's fp32 live.
+            return _anchor_i32x8(packed)
         if const_expr(self.traits.V_SHUFFLED):
             # Match V's intact 16-token vectors after rounding P to fp8.
             words = Vec(packed)

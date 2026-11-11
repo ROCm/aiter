@@ -16,6 +16,9 @@ from flydsl.expr.typing import T
 from flydsl.expr.typing import Vector as Vec
 
 from aiter.ops.flydsl.kernels import buffer_ops
+from aiter.ops.flydsl.kernels.fmha_gfx950.operand_layouts import (
+    probability_mask_columns,
+)
 
 from ..kernels_common import LOG2E as _LOG2E
 
@@ -102,6 +105,12 @@ def _anchor_scalar_f32(x):
         "=v,0",
         has_side_effects=True,
     )
+
+
+def _anchor_i32x8(v):
+    """Pin a packed i32x8 operand at the current source position (no-op asm; no stable scheduling anchor)."""
+    v_ir = as_mlir_value(v)
+    return llvm.inline_asm(v_ir.type, [v_ir], "", "=v,0", has_side_effects=True)
 
 
 def _anchor_v_o(traits, v_o):
@@ -1161,6 +1170,21 @@ class DualwaveFp8KernelContext:
     def init_q_row(self):
         _init_dualwave_q_row(self)
 
+    def k_rows_permuted(self):
+        """Shuffled bn64 K sits chunk-major in LDS with its rows permuted (operand_layouts.k_row_permutation)."""
+        return (
+            self.traits.BODY_VARIANT == "conventional_bn64" and self.traits.K_SHUFFLED
+        )
+
+    def score_mask_columns(self):
+        """(lane-half column offset, per-pair column thresholds) of a 32-key strip of QK's scores."""
+        if const_expr(self.k_rows_permuted()):
+            lane_off, cols = probability_mask_columns()
+            return lane_off, [
+                (cols[2 * p], cols[2 * p + 1]) for p in range(len(cols) // 2)
+            ]
+        return 4, _causal_pair_thresholds(False)
+
     def k_buf_base(self, buf_id):
         traits = self.traits
         if const_expr(isinstance(buf_id, int)):
@@ -1219,7 +1243,7 @@ class DualwaveFp8KernelContext:
             + col
         )
 
-    def read_i32x8_lds(self, base_ptr, byte_row):
+    def read_i32x8_lds(self, base_ptr, byte_row, half_stride=16):
         vec_ty = Vec.make_type(4, fx.Int32)
         ptr_ty = fx.PointerType.get(
             fx.Int8.ir_type, fx.AddressSpace.Shared, alignment=16
@@ -1227,6 +1251,6 @@ class DualwaveFp8KernelContext:
         base_ptr = fx.recast_iter(ptr_ty, base_ptr)
         halves = []
         for h in range_constexpr(2):
-            p = fx.add_offset(base_ptr, fx.Int32(byte_row + h * 16))
+            p = fx.add_offset(base_ptr, fx.Int32(byte_row + h * half_stride))
             halves.append(fx.ptr_load(p, result_type=vec_ty))
         return halves[0].shuffle(halves[1], [0, 1, 2, 3, 4, 5, 6, 7]).ir_value()
