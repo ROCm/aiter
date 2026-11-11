@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import NamedTuple
 
 import flydsl.expr as fx
 import torch
@@ -133,6 +134,35 @@ def _bf16_lds_bytes(head_dim, query_rows, block_size):
     max_sum_bytes = (m_tiles + 1) * MFMA_MNK * 5 * 4
     pages_per_chunk = (64 + block_size - 1) // block_size
     return qp_bytes + max_sum_bytes + 4 * pages_per_chunk * 4
+
+
+class PaDecodeCacheKey(NamedTuple):
+    """Tile specialization key. ``select`` builds it by keyword and ``create``
+    reads it by name, so a field one change adds and another misses fails
+    loudly instead of shifting the rest. Tests read the last two by position."""
+
+    head_dim: int
+    query_group_size: int
+    block_size: int
+    num_partitions: int
+    softmax_scale: float | None
+    query_dtype: object
+    per_token_kv: bool
+    query_length: int
+    trans_v: bool
+    wide_kv_addressing: bool
+    BUFFER_KV: bool
+    prefetch_v: bool
+    PER_TOKEN_M1: bool
+    query_splits: int
+    single_tile_plan: bool
+    sliding_window: int
+    kv_dtype: object
+    mask_unowned_kv: bool
+    direct_output: bool
+    sparse_grid: bool
+    D256_PIPE: bool
+    stage_pages: int
 
 
 @dataclass(frozen=True)
@@ -398,30 +428,30 @@ class PaDecodeSchedule:
                 or (single_tile_plan and split_workgroups <= 2 * num_compute_units)
             )
         )
-        cache_key = (
-            head_dim,
-            query_group_size,
-            block_size,
-            num_partitions,
-            softmax_scale,
-            query_dtype,
-            per_token_kv,
-            query_length,
-            trans_v,
-            wide_kv_addressing,
-            BUFFER_KV,
-            prefetch_v,
-            PER_TOKEN_M1,
-            query_splits,
-            single_tile_plan,
-            sliding_window,
-            kv_dtype,
-            bool(mask_unowned_kv),
-            direct_output,
+        cache_key = PaDecodeCacheKey(
+            head_dim=head_dim,
+            query_group_size=query_group_size,
+            block_size=block_size,
+            num_partitions=num_partitions,
+            softmax_scale=softmax_scale,
+            query_dtype=query_dtype,
+            per_token_kv=per_token_kv,
+            query_length=query_length,
+            trans_v=trans_v,
+            wide_kv_addressing=wide_kv_addressing,
+            BUFFER_KV=BUFFER_KV,
+            prefetch_v=prefetch_v,
+            PER_TOKEN_M1=PER_TOKEN_M1,
+            query_splits=query_splits,
+            single_tile_plan=single_tile_plan,
+            sliding_window=sliding_window,
+            kv_dtype=kv_dtype,
+            mask_unowned_kv=bool(mask_unowned_kv),
+            direct_output=direct_output,
             # At most one CTA per CU: room for two four-wave groups per CTA.
-            split_workgroups * query_splits <= num_compute_units,
-            D256_PIPE,
-            stage_pages,
+            sparse_grid=split_workgroups * query_splits <= num_compute_units,
+            D256_PIPE=D256_PIPE,
+            stage_pages=stage_pages,
         )
         return cls(
             cache_key=cache_key,
@@ -560,30 +590,28 @@ class PaDecodeTraits:
     def create(cls, schedule: PaDecodeSchedule) -> PaDecodeTraits:
         """Derive the immutable kernel layout after a specialization cache miss."""
         cache_key = schedule.cache_key
-        (
-            head_dim,
-            query_group_size,
-            block_size,
-            _num_partitions,
-            softmax_scale,
-            query_dtype,
-            per_token_kv,
-            query_length,
-            trans_v,
-            wide_kv_addressing,
-            BUFFER_KV,
-            prefetch_v,
-            PER_TOKEN_M1,
-            query_splits,
-            single_tile_plan,
-            sliding_window,
-            kv_dtype,
-            mask_unowned_kv,
-            DIRECT,
-            SPARSE_GRID,
-            D256_PIPE,
-            stage_page_capacity,
-        ) = cache_key
+        head_dim = cache_key.head_dim
+        query_group_size = cache_key.query_group_size
+        block_size = cache_key.block_size
+        _num_partitions = cache_key.num_partitions
+        softmax_scale = cache_key.softmax_scale
+        query_dtype = cache_key.query_dtype
+        per_token_kv = cache_key.per_token_kv
+        query_length = cache_key.query_length
+        trans_v = cache_key.trans_v
+        wide_kv_addressing = cache_key.wide_kv_addressing
+        BUFFER_KV = cache_key.BUFFER_KV
+        prefetch_v = cache_key.prefetch_v
+        PER_TOKEN_M1 = cache_key.PER_TOKEN_M1
+        query_splits = cache_key.query_splits
+        single_tile_plan = cache_key.single_tile_plan
+        sliding_window = cache_key.sliding_window
+        kv_dtype = cache_key.kv_dtype
+        mask_unowned_kv = cache_key.mask_unowned_kv
+        DIRECT = cache_key.direct_output
+        SPARSE_GRID = cache_key.sparse_grid
+        D256_PIPE = cache_key.D256_PIPE
+        stage_page_capacity = cache_key.stage_pages
         is_gfx950 = schedule.is_gfx950
         is_gfx942 = schedule.is_gfx942
         # MXFP4 V is widened to bf16 in LDS, so both run the bf16 PV MFMA.
@@ -663,9 +691,10 @@ class PaDecodeTraits:
             block_size == 16 or not wide_kv_addressing or BUFFER_KV
         )
         # gfx950 FP8 MTP4 tiles: scores stay frag * k_scale and the positive
-        # per-row scale folds into exp2's FMA; P shares one v_scale * norm per
-        # chunk; a power-of-two V normalization rides the PV MFMA's P scale,
-        # which accumulates onto O * corr.
+        # per-row scale folds into exp2's FMA; each chunk's P is multiplied by
+        # one v_scale / v_max factor, shared by the M-tiles, before the FP8
+        # pack, and PV's output is scaled back by v_max (the PV MFMA itself
+        # takes unit scales).
         FP8_MTP4_LEAN = (
             is_gfx950
             and MTP4_FUSED
@@ -695,8 +724,9 @@ class PaDecodeTraits:
             and (softmax_scale is None or softmax_scale > 0)
         )
         # gfx950 BF16 single-M-tile decode reads every K and V byte once:
-        # stream both nontemporally. Streaming K alone slowed caches that fit
-        # the MALL; streaming both did not.
+        # stream both nontemporally. A cache that stays MALL-resident across
+        # calls loses that reuse (MiniMax-M3 b4 8K replayed hot: ~0.96x); cold
+        # KV, as in serving, gains.
         BF16_DECODE_NT_KV = (
             is_gfx950
             and (kv_dtype == fx.BFloat16)

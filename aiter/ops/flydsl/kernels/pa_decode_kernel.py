@@ -717,8 +717,8 @@ def compile_pa_decode_tile(
         # The leading arguments preload into the free user SGPRs (14 dwords on
         # gfx950), so the task skips a kernarg round trip.
         pa_decode_tile_launch.compile_hints["llvm_options"] = {
-            "amdgpu-kernarg-preload": True,
-            "amdgpu-kernarg-preload-count": 16,
+            "amdgpu-kernarg-preload": AITER_FLYDSL_KERNARG_PRELOAD,
+            "amdgpu-kernarg-preload-count": min(16, AITER_FLYDSL_KERNARG_PRELOAD_COUNT),
         }
     if traits.FP8_MTP4_LEAN:
         # Two CTAs per CU: hold the allocator to 256 registers per wave.
