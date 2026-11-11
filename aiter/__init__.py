@@ -3,7 +3,46 @@
 
 import logging
 import os
+import subprocess
 import sys
+
+
+def _check_triton_conflicts():
+    """Remove triton variants that conflict with amd-triton."""
+    import importlib.metadata
+
+    conflicts = ["triton", "pytorch-triton", "pytorch-triton-rocm", "triton-rocm"]
+    found = []
+    for pkg in conflicts:
+        try:
+            importlib.metadata.version(pkg)
+            found.append(pkg)
+        except importlib.metadata.PackageNotFoundError:
+            pass
+    if found:
+        print(
+            f"[aiter] Conflicting triton package(s) detected: {', '.join(found)}. "
+            "Removing and reinstalling amd-triton..."
+        )
+        for pkg in found:
+            subprocess.call(
+                [sys.executable, "-m", "pip", "uninstall", "-y", pkg],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+        subprocess.call(
+            [sys.executable, "-m", "pip", "install", "--force-reinstall", "--no-deps", "amd-triton"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        raise RuntimeError(
+            f"[aiter] Removed conflicting packages: {', '.join(found)} "
+            "and reinstalled amd-triton. Please restart Python."
+        )
+
+
+if not int(os.environ.get("AITER_USE_SYSTEM_TRITON", "0")):
+    _check_triton_conflicts()
 
 import torch
 

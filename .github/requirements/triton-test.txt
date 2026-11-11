@@ -1,4 +1,5 @@
-# Triton is installed via .github/scripts/install_triton.sh (auto-detects ROCm version).
+# Triton is installed from PyPI as amd-triton.
+amd-triton==3.9.0.dev20261110
 
 # Build deps (needed for --no-build-isolation editable install).
 setuptools>=45
