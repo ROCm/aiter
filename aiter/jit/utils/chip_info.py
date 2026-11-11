@@ -95,6 +95,12 @@ def get_gfx():
     return GFX_MAP.get(gfx_num, "unknown")
 
 
+if __package__:
+    from .lds_capacity import _LDS_CAPACITY_BYTES as _LDS_CAPACITY_BYTES
+else:
+    from lds_capacity import _LDS_CAPACITY_BYTES as _LDS_CAPACITY_BYTES
+
+
 def get_lds_capacity_bytes(gfx: str | None = None) -> int:
     """Return the architectural LDS capacity for one workgroup."""
     if __package__:

@@ -17,14 +17,21 @@ UTILS = Path(__file__).resolve().parents[1] / "aiter" / "jit" / "utils"
 
 @contextmanager
 def isolated_wrapper(package):
-    # Isolate this wrapper from chip_info's unrelated Torch and HIP imports.
+    # Isolate LDS imports and the wrapper from unrelated Torch/HIP imports.
     tree = ast.parse((UTILS / "chip_info.py").read_text())
-    function = next(
+    members = [
         node
         for node in tree.body
-        if isinstance(node, ast.FunctionDef) and node.name == "get_lds_capacity_bytes"
-    )
-    code = compile(ast.Module(body=[function], type_ignores=[]), "chip_info.py", "exec")
+        if (isinstance(node, ast.FunctionDef) and node.name == "get_lds_capacity_bytes")
+        or (
+            isinstance(node, ast.If)
+            and any(
+                isinstance(child, ast.ImportFrom) and child.module == "lds_capacity"
+                for child in ast.walk(node)
+            )
+        )
+    ]
+    code = compile(ast.Module(body=members, type_ignores=[]), "chip_info.py", "exec")
     get_gfx = mock.Mock(return_value="gfx1250-strict")
     namespace = {"__package__": package, "get_gfx": get_gfx}
     with mock.patch.dict(sys.modules):
@@ -81,6 +88,17 @@ class LdsCapacityTest(unittest.TestCase):
         ]
         with self.assertRaisesRegex(ValueError, "Unknown LDS capacity.*gfx9999"):
             lookup("GFX9999:sramecc+")
+
+    def test_table_reexport_in_package_and_flattened_codegen(self):
+        for package in ("_lds_test_package", ""):
+            with self.subTest(package=package), isolated_wrapper(package) as (
+                lookup,
+                _,
+            ):
+                helper_name = f"{package}.lds_capacity" if package else "lds_capacity"
+                table = lookup.__globals__["_LDS_CAPACITY_BYTES"]
+                self.assertIs(table, sys.modules[helper_name]._LDS_CAPACITY_BYTES)
+                self.assertEqual(table["gfx1250-strict"], 327680)
 
     def test_wrapper_in_package_and_flattened_codegen(self):
         for package in ("_lds_test_package", ""):
