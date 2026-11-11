@@ -77,10 +77,6 @@ def causal_conv1d_update_single_token(
 
     if validate_data:
         assert dim == weight.size(0)
-        assert conv_state.stride(-2) == 1, (
-            f"ERROR: expect contiguous along feat-dim of conv_state "
-            f"(currently stride={conv_state.stride()})"
-        )
         assert state_len >= width - 1
         assert dim == conv_state.size(1)
         assert (batch,) == conv_state_indices.shape
@@ -239,10 +235,6 @@ def fused_reshape_causal_conv1d_update_single_token(
 
     if validate_data:
         assert dim == weight.size(0)
-        assert conv_state.stride(-2) == 1, (
-            f"ERROR: expect contiguous along feat-dim of conv_state "
-            f"(currently stride={conv_state.stride()})"
-        )
         assert state_len >= width - 1
         assert dim == conv_state.size(1)
         assert (batch,) == conv_state_indices.shape

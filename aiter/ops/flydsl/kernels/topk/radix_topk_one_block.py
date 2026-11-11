@@ -167,7 +167,9 @@ def build_radix_topk_one_block_body(
     bitmap_words = max(bounded_row_capacity // 32, 1)
     words_per_thread = -(-bitmap_words // block_threads)
     bounded_candidate_capacity = _BOUNDED_CANDIDATE_CAPACITY if bounded_rows else 16
-    wave_reduce_offsets = tuple(wave_size >> s for s in range(1, wave_size.bit_length()))
+    wave_reduce_offsets = tuple(
+        wave_size >> s for s in range(1, wave_size.bit_length())
+    )
     stable_sort_enabled = (
         stable and not short_rows and block_threads == 1024 and k <= 2048
     )
@@ -1394,7 +1396,10 @@ def build_radix_topk_one_block_body(
         def set_bit_if(bitmap, col, pred):
             if pred:
                 atomic_or_i32(
-                    bitmap, one << (col % fx.Int32(32)), col // fx.Int32(32), "workgroup"
+                    bitmap,
+                    one << (col % fx.Int32(32)),
+                    col // fx.Int32(32),
+                    "workgroup",
                 )
 
         def reserve_slots(count):
@@ -1424,7 +1429,9 @@ def build_radix_topk_one_block_body(
             before = (uniform_wave > zero).select(before, zero)
             return before + inclusive - value, total
 
-        def publish_threshold(view, pred, threshold_slot, bucket, above_slot, above, count):
+        def publish_threshold(
+            view, pred, threshold_slot, bucket, above_slot, above, count
+        ):
             if pred:
                 view[threshold_slot] = bucket
                 view[above_slot] = above
@@ -1461,7 +1468,11 @@ def build_radix_topk_one_block_body(
             vector_idx = step * block_threads + tid
             active = vector_idx < full_vector_count
             values = _load_f32x4(input_vector_tiles, active.select(vector_idx, zero))
-            return vector_idx, active, [_f32_to_ord(values[i]) for i in range_constexpr(_VEC)]
+            return (
+                vector_idx,
+                active,
+                [_f32_to_ord(values[i]) for i in range_constexpr(_VEC)],
+            )
 
         def hit_mask(steps, first_step, bound):
             """One bit per vector item of `steps` whose key is at or above `bound`."""
@@ -1511,9 +1522,11 @@ def build_radix_topk_one_block_body(
                 for o in ords:
                     first, second = keep_top2(first, second, o, active)
                 vectors.append((vector_idx, active, ords))
-            if const_expr(reload_key_steps > 0):
+            if const_expr(reload_key_steps > 0):  # noqa: SIM102
                 if row_len > fx.Int32(register_key_capacity):
-                    for step in range_constexpr(register_key_steps, bounded_key_vector_steps):
+                    for step in range_constexpr(
+                        register_key_steps, bounded_key_vector_steps
+                    ):
                         _, active, ords = load_key_step(step)
                         for o in ords:
                             first, second = keep_top2(first, second, o, active)
@@ -1575,7 +1588,7 @@ def build_radix_topk_one_block_body(
             """
             hit_bits = hit_mask(vectors, 0, bound)
             reload_bits = zero
-            if const_expr(reload_key_steps > 0):
+            if const_expr(reload_key_steps > 0):  # noqa: SIM102
                 if row_len > fx.Int32(register_key_capacity):
                     reload_bits = hit_mask(
                         [
@@ -1725,9 +1738,7 @@ def build_radix_topk_one_block_body(
                 prefix_threshold = (prefix_threshold << width2) | metadata[
                     _SECOND_THRESHOLD
                 ]
-                if (metadata[_SELECTED_BUCKET_COUNT] == remaining_k) | (
-                    shift2 == zero
-                ):
+                if (metadata[_SELECTED_BUCKET_COUNT] == remaining_k) | (shift2 == zero):
                     finish_candidates(
                         count, shift2, bits - shift2, prefix_threshold, remaining_k
                     )
@@ -1881,7 +1892,9 @@ def build_radix_topk_one_block_body(
             else:
                 if row_len <= fx.Int32(_COMPACT_CAPACITY):
                     run_cached_path(short_histograms)
-                elif const_expr(bounded_rows) and row_len <= fx.Int32(bounded_row_capacity):
+                elif const_expr(bounded_rows) and row_len <= fx.Int32(
+                    bounded_row_capacity
+                ):
                     run_bounded_path()
                 else:
                     run_streaming_path(

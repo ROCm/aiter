@@ -192,6 +192,9 @@ def chunk_delta_attn_fwd(
         )
         return o, final_state, None, None, None, None, None, None, None
 
+    # The kernels below index q, k, v and g with packed strides.
+    q, k, v, g = (t.contiguous() for t in (q, k, v, g))
+
     # ------------------------------------------------------------------
     # Step 0 — Optional QK L2 normalization (matches FLA API)
     # ------------------------------------------------------------------
