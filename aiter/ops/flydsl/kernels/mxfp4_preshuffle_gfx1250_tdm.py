@@ -57,9 +57,6 @@ def is_fx_set_register_available():
     return callable(getattr(fx, "set_register", None))
 
 
-# computePadEncoding keeps log2(dwords) - 1 in three bits, so a padded LDS
-# row cannot declare an interval wider than this.
-_TDM_MAX_PAD_INTERVAL_BYTES = 1024
 IGLP_PARAMS = {
     "a8w4": {
         "default": {"mma_group": 10, "mma_first_group": 10, "ds_first_n": 0},
@@ -868,14 +865,15 @@ def build_gemm_a8w4_tdm_task(
             waves = [wave_groups[i % len(wave_groups)] for i in range(4)]
             # Number of rotating A/B/A-scale/B-scale loads issued by each wave.
             TDM_PER = 4 * num_waves_per_tensor_tdm // num_waves
+        nw = 1
         base_i32 = fx.recast_iter(p32_shared, base_ptr)
 
-        # Waves in one ``wv`` differ only in which share of the tile they issue,
-        # which the atom's own warp distribution decides, so the whole list
+        # Waves in one ``wv`` differ only in runtime atom state, so the whole list
         # collapses to one atom: ``wv`` is the smallest unit needing its own code.
         Job = namedtuple(
             "Job",
-            "atom blk on_i32 lds_off lds_stage lds_row inner outer waves nw",
+            "atom gt on_i32 lds_off lds_stage lds_row inner outer k_adv waves "
+            "tail_ext",
         )
         jobs = []
         as_prologue_jobs = []
@@ -896,78 +894,74 @@ def build_gemm_a8w4_tdm_task(
             wv,
             pad=None,
             wg_mask=None,
+            split_inner=False,
             target_jobs=None,
             cache_modifier=0,
         ):
-            """Build one tiled-atom load of an (outer, inner) tile for ``wv``.
-
-            The owners no longer carve the tile up by hand: the atom is built
-            with ``num_warps=len(wv)`` and tdm_partition hands each owner its
-            share of the same compact LDS traversal, whichever axis that ends
-            up splitting. That subsumes the old outer/inner segment arithmetic
-            and the ``split_inner`` flag that chose between them.
-
-            The view spans every k-tile the rest index can reach instead of one
-            tile at a runtime offset, so the ragged last tile is clamped by the
-            view's own extent: the per-iteration ``extent_1`` write is gone,
-            and with it the ``imm_offset`` the old interface needed.
-
-            ``pad`` is implicit too -- a box row wider than the tile leaves
-            exactly the slack the old pad_interval/pad_amount pair described --
-            so it is kept only to assert the two agree.
-            """
-            nw = len(wv)
             if const_expr(k_waves > 1 and k_adv):
                 # This group's first k-tile, in the view's element units.
                 g_off = g_off + fx.Int64(k_group * K_TILES) * fx.Int64(
                     k_adv // 4 if on_i32 else k_adv
                 )
-            if pad is not None:
-                assert pad == (inner, lds_row - inner), (
-                    f"the LDS box row already states this pad: row {lds_row}, "
-                    f"tile {inner}, declared {pad}"
-                )
-            assert lds_row == inner or inner <= _TDM_MAX_PAD_INTERVAL_BYTES, (
-                f"a padded row of {inner} needs its K axis split (the pad "
-                f"interval caps at {_TDM_MAX_PAD_INTERVAL_BYTES})"
-            )
-            # k_adv counts LDS elements on an i32 view and bytes otherwise;
-            # either way it is the tile's inner width, so the coordinate rest
-            # steps exactly one tile per k-tile.
-            k_step = (k_adv // 4 if on_i32 else k_adv) if k_adv else 0
-            assert (
-                not k_step or k_step == inner
-            ), f"rest step {k_step} must equal the tile's inner width {inner}"
+            split_i = split_inner and len(wv) > 1
+            if const_expr(len(wv) > 1):
+                if const_expr(split_i):
+                    assert inner % len(wv) == 0, "TDM inner extent must divide owners"
+                else:
+                    assert outer % len(wv) == 0, "TDM outer extent must divide owners"
+            seg = outer if split_i else outer // len(wv)
+            inner_seg = inner // len(wv) if split_i else inner
+            wave_outer_off = 0 if split_i or len(wv) == 1 else (wave - wv[0]) * seg
+            wave_inner_off = (wave - wv[0]) * inner_seg if split_i else 0
             gt = tensor_view(
-                g_base + g_off,
-                (outer if oob is None else oob, inner * K_TILES if k_adv else inner),
+                g_base
+                + (
+                    g_off
+                    + fx.Int64(wave_outer_off) * g_stride
+                    + fx.Int64(wave_inner_off)
+                ),
+                (seg, inner_seg),
                 (g_stride, 1),
             )
-            tile = (outer, inner)
-            atom, coord = fx.rocdl.cdna5.make_tiled_tdm_atom(
-                fx.rocdl.TensorLoad(cache_modifier=cache_modifier),
+            ext = None if oob is None else oob - wave_outer_off
+            pad_kw = {"pad_interval": pad[0], "pad_amount": pad[1]} if pad else {}
+            atom = fx.rocdl.make_tdm_atom(
                 gt,
-                fx.make_layout(tile, (lds_row, 1)),
-                tile,
+                [ext, None],
+                strides=[g_stride, None],
                 num_warps=nw,
+                # Descriptor bit 21: release to the peers already present and
+                # re-broadcast later, so early arrivals are not held for a merge.
+                early_timeout=bool(wg_mask is not None),
+                cache_modifier=cache_modifier,
+                **pad_kw,
             )
             if const_expr(wg_mask is not None):
                 # A runtime zero mask keeps a partial-M tail on the ordinary
                 # global-load path; nonzero masks select CLUSTER_LOAD_ASYNC.
                 atom = fx.atom_set_value(atom, "workgroup_mask", fx.Int32(wg_mask))
-            blk = fx.zipped_divide(coord, tile)[None, (0, None)]
+            # Every K-advancing load lays a tile out k128-major, so the ragged
+            # last tile keeps the first K_TAIL/tile_k of its data extent; the
+            # scales hold whole k128s, KWS_TAIL/KWS of theirs. The extent is
+            # relative to this wave's base, which imm_offset bumps.
+            tail_ext = None
+            if const_expr(HAS_K_TAIL and k_adv):
+                tail_ext = (
+                    inner * KWS_TAIL // KWS if on_i32 else inner * K_TAIL // tile_k
+                ) - wave_inner_off
             (jobs if target_jobs is None else target_jobs).append(
                 Job(
                     atom,
-                    blk,
+                    gt,
                     on_i32,
-                    lds_off,
+                    lds_off + wave_outer_off * lds_row + wave_inner_off,
                     lds_stage,
                     lds_row,
-                    inner,
-                    outer,
+                    inner_seg,
+                    seg,
+                    k_adv,
                     wv,
-                    nw,
+                    tail_ext,
                 )
             )
 
@@ -988,6 +982,7 @@ def build_gemm_a8w4_tdm_task(
                 k_adv=16 * A_ROW_B,
                 wv=waves[0],
                 wg_mask=a_mcast_mask,
+                split_inner=tile_m // 16 < len(waves[0]),
             )
         else:
             add_tdm_loads(
@@ -1072,6 +1067,7 @@ def build_gemm_a8w4_tdm_task(
                 lds_row=AS_FULL_INNER,
                 k_adv=0,
                 wv=waves[2],
+                split_inner=AS_SUPERS < len(waves[2]),
                 target_jobs=as_prologue_jobs,
             )
         else:
@@ -1088,6 +1084,7 @@ def build_gemm_a8w4_tdm_task(
                 lds_row=AS_INNER,
                 k_adv=AS_INNER * 4,
                 wv=waves[2],
+                split_inner=AS_SUPERS < len(waves[2]),
             )
         add_tdm_loads(
             gSB_base,
@@ -1117,18 +1114,30 @@ def build_gemm_a8w4_tdm_task(
 
         def issue(s, kt, my_jobs=None):
             base_i8 = fx.recast_iter(p8_shared, base_ptr)
+            # Only the last tile is ragged: a prologue kt picks its extent at
+            # compile time, a loop kt selects it with one scalar compare.
+            static_kt = isinstance(kt, int)
+            is_tail = None
+            if const_expr(HAS_K_TAIL):
+                is_tail = (
+                    kt == K_TILES - 1 if static_kt else fx.Int32(kt) == K_TILES - 1
+                )
 
             def emit(j):
                 base = base_i32 if j.on_i32 else base_i8
                 dst = lds_view(
                     base + j.lds_off + s * j.lds_stage,
-                    ((j.outer, j.inner), 1),
-                    ((j.lds_row, 1), j.outer * j.lds_row),
+                    (j.outer, j.inner),
+                    (j.lds_row, 1),
                 )
-                ts, tg = fx.rocdl.cdna5.tdm_partition(
-                    j.atom, wave - j.waves[0], fx.make_layout(j.nw, 1), dst, j.blk
-                )
-                fx.copy(j.atom, tg[None, fx.Int32(kt)], ts[None, 0])
+                atom = j.atom
+                if const_expr(j.tail_ext is not None and not static_kt):
+                    atom = fx.atom_set_value(
+                        atom, "extent_1", fx.Int32(is_tail.select(j.tail_ext, j.inner))
+                    )
+                elif const_expr(j.tail_ext is not None and is_tail):
+                    atom = fx.atom_set_value(atom, "extent_1", fx.Int32(j.tail_ext))
+                fx.copy(atom, j.gt, dst, imm_offset=fx.Int64(kt * j.k_adv))
                 if const_expr(tdm_snop):
                     # A branch must never directly follow a TDM issue (see
                     # mega_moe_gfx1250.tdm_prims); the owner test around this
@@ -1157,17 +1166,10 @@ def build_gemm_a8w4_tdm_task(
                 if owns(job.waves):
                     destination = tensor_view(
                         base_i32 + job.lds_off,
-                        ((job.outer, job.inner), 1),
-                        ((job.lds_row, 1), job.outer * job.lds_row),
+                        (job.outer, job.inner),
+                        (job.lds_row, 1),
                     )
-                    ts, tg = fx.rocdl.cdna5.tdm_partition(
-                        job.atom,
-                        wave - job.waves[0],
-                        fx.make_layout(job.nw, 1),
-                        destination,
-                        job.blk,
-                    )
-                    fx.copy(job.atom, tg[None, 0], ts[None, 0])
+                    fx.copy(job.atom, job.gt, destination)
                     if const_expr(tdm_snop):
                         rocdl.s_nop(0)
 

@@ -155,14 +155,10 @@ fx.copy(copy, fx.slice(tA, (None, tid)), rA)   # after partitioning tA (§7b: pr
   pass `num_records_bytes=` for a const byte count, or `max_size=False` to derive
   from the layout.
 - gfx1250 TDM uses a different atom — `fx.rocdl.cdna5.make_tiled_tdm_atom` +
-  `fx.rocdl.cdna5.tdm_partition` (raw VA, not a buffer resource). No aiter kernel
-  calls `fx.rocdl.make_tdm_atom` any more; a reintroduced one is a site to
-  migrate back. Its `tensor_extents=` and `strides=` move into the global view's
-  layout, `imm_offset=` becomes the coordinate tensor's i32 tile index,
-  `pad_interval` / `pad_amount` become row slack in the LDS box, a hand-split
-  across waves becomes `num_warps=` plus a matching `tdm_partition` warp layout,
-  and `early_timeout` is dropped rather than rewritten as atom state. Leave the
-  old interface alone only for the gather/scatter family
+  `fx.rocdl.cdna5.tdm_partition` (raw VA, not a buffer resource). A site still on
+  `fx.rocdl.make_tdm_atom` is one to migrate: its `tensor_extents=` and `strides=`
+  move into the global view's layout, and its `imm_offset=` becomes the coordinate
+  tensor's i32 tile index. Leave it alone only for the gather/scatter family
   (`make_tensor_gather_descriptor` / `tensor_load_gather`, per-row addresses) or a
   tile whose innermost dimension spans under 16 bytes per warp.
 - A scalar-base + per-thread-offset load with no layout form may stay on
