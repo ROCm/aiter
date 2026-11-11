@@ -290,6 +290,7 @@ os.environ.setdefault("AITER_FORCE_GFX1250", "1")
 
 import argparse
 import contextlib
+import inspect
 import itertools
 import json
 import re
@@ -1381,6 +1382,10 @@ def run_moe(args):
         args.suite, _MOE_DATA_FORMATS
     )
     init_pairs = _init_pairs(args, defaults=(("uniform", "auto"),))
+    # A UT that takes shared_experts routes them itself and counts their bytes;
+    # older ones get the shared expert pinned into the routing here.
+    native_shared = "shared_experts" in inspect.signature(moe_mod.run_moe).parameters
+    shared_kwargs = {"shared_experts": shared} if shared and native_shared else {}
     for tokens, fmt, (data_init, scale_init) in itertools.product(
         cfg["tokens"], data_formats, init_pairs
     ):
@@ -1393,7 +1398,7 @@ def run_moe(args):
         active = [None]
         routing = (
             _pinned_shared_experts(shared, active)
-            if shared
+            if shared and not native_shared
             else contextlib.nullcontext()
         )
         with _smi_case(label), _capture() as box, routing:
@@ -1413,6 +1418,7 @@ def run_moe(args):
                 scale_init=scale_init,
                 check_aot_cache=False,
                 raise_on_fail=False,
+                **shared_kwargs,
             )
         us1, us2 = metrics.get("gemm1_us"), metrics.get("gemm2_us")
         rows.append(
