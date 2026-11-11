@@ -37,6 +37,7 @@ def _get_gemm_config_cached(
     backend: str = "triton",
     B: int | None = None,
     cu_num=DEVICE_CU_NUM,
+    layout: str | None = None,
 ) -> tuple[dict, bool]:
     """
     Internal cached implementation. Do NOT use this directly — use
@@ -94,6 +95,19 @@ def _get_gemm_config_cached(
             config_dict = specialized_config
             break
 
+    # A layout first looks for a file with a "-layout=<layout>" suffix, whose buckets override
+    # those of the specialized file (or DEFAULT.json). TN tunes go in the specialized file.
+    if layout is not None:
+        for suffix in specialized_suffixes:
+            layout_config = load_config_json(
+                f"{cfg_dir}/{config_name}-{suffix}-layout={layout}.json",
+                required=False,
+            )
+            if layout_config is not None:
+                tuned_keys |= set(layout_config)
+                config_dict = {**config_dict, **layout_config}
+                break
+
     # Explicit bounds override file-defined bounds; legacy files use the standard bounds.
     search_bounds = (
         bounds if bounds is not None else config_dict.get("M_BOUNDS", STANDARD_M_BOUNDS)
@@ -147,6 +161,7 @@ def get_gemm_config(
     backend: str = "triton",
     B: int | None = None,
     cu_num=DEVICE_CU_NUM,
+    layout: str | None = None,
 ) -> tuple[dict, bool]:
     """
     Load a GEMM configuration using the standardized M_LEQ_x/M_GEQ_y/any format.
@@ -160,6 +175,10 @@ def get_gemm_config(
     2. If B, N and K are provided, try B-specialized config: {config_name}-B={B}-N={N}-K={K}.json
     3. If N and K are provided, try to load specialized config: {config_name}-N={N}-K={K}.json
        Or if specialized_filename is provided, use: {config_name}-{specialized_filename}.json
+    3a. If layout is given, try {config_name}-<suffix of step 2/3>-layout={layout}.json; its
+       buckets override those of the file found so far, which (with DEFAULT.json behind it) is
+       the fallback for every bucket the layout file does not set. TN tunes go in the file of
+       step 2/3 rather than a -layout=TN file
     4. Search M_LEQ_x using explicit bounds, file M_BOUNDS or STANDARD_M_BOUNDS
     5. If no M_LEQ_x matches, search for M_GEQ_x keys in reverse order
     6. Fall back to "any" if no bounds match
@@ -179,13 +198,15 @@ def get_gemm_config(
             DEFAULT.json. Default: this device's (DEVICE_CU_NUM). None reads
             the default tree only. Kernels never pass it; the tuning scripts
             do, to address one tree.
+        layout: Operand layout of the call ("TN", "TT", "NT" or "NN"), for kernels whose
+            configs can differ per layout (optional). None reads no layout file.
 
     Returns:
         Dictionary with the config params (a fresh deep-copy safe to mutate),
         bool indicating if the config is tuned.(True if tuned, False otherwise)
     """
     config, is_tuned = _get_gemm_config_cached(
-        config_name, M, N, K, bounds, specialized_filename, backend, B, cu_num
+        config_name, M, N, K, bounds, specialized_filename, backend, B, cu_num, layout
     )
     return _copy_gemm_config(config), is_tuned
 
