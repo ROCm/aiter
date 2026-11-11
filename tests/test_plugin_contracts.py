@@ -377,3 +377,90 @@ def test_the_versions_a_contract_still_accepts_are_part_of_the_baseline(tmp_path
     bumped = routed_contracts_for(tmp_path, SUPERSEDING)["demo.bumped"]
     assert bumped["supersedes"] == [1]
     assert bumped["version"] == 2
+
+
+def _routed_docstrings(root: Path) -> dict[str, tuple[str, str | None]]:
+    """Every routed op's source file and the docstring on its function."""
+
+    found: dict[str, tuple[str, str | None]] = {}
+    for path in sorted(root.glob("aiter/**/*.py")):
+        tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+        spellings = _route_spellings(tree)
+        if not spellings:
+            continue
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.FunctionDef):
+                continue
+            for decorator in node.decorator_list:
+                if not _is_route(decorator, spellings):
+                    continue
+                keywords = {k.arg: k.value for k in decorator.keywords}
+                op = ast.literal_eval(keywords["op"])
+                found[op] = (
+                    str(path.relative_to(root)),
+                    ast.get_docstring(node),
+                )
+    return found
+
+
+def test_every_routed_op_documents_its_contract():
+    """A routed op's docstring is the only contract an out-of-tree provider gets.
+
+    `plugin_contracts.json` pins the signature, which is names and arity. It
+    cannot say what a parameter MEANS, and the two ops whose names differ by
+    one suffix are routinely the pair whose meanings differ -- so the prose is
+    what a provider implements against, and a routed op without it ships a
+    contract nobody outside this tree can read.
+    """
+
+    missing = sorted(
+        op for op, (_, doc) in _routed_docstrings(_REPO).items() if not doc
+    )
+    assert not missing, (
+        "routed ops with no docstring: "
+        + ", ".join(missing)
+        + " -- an out-of-tree provider has only the signature to go on"
+    )
+
+
+# Returning a new tensor and writing into a caller's buffer are the same
+# signature to every check that exists: `plugin_contracts.json` records names
+# and arity, and a provider that gets this backwards returns a plausible wrong
+# answer rather than failing. So the docstring has to say which one it is.
+_OUTPUT_DISCIPLINE = ("return", "in place", "in-place", "writes", "written")
+
+
+def test_every_routed_op_says_whether_it_returns_or_writes():
+    """The one fact a provider cannot infer from the signature.
+
+    `gemm_a8w8_ck(XQ, WQ, x_scale, w_scale, Out, bias=None, splitK=0)` and
+    `gemm_a8w8(XQ, WQ, x_scale, w_scale, bias=None, dtype=bf16, splitK=None)`
+    are the shape of the mistake: seven parameters each, and the fifth is an
+    output buffer in one and a bias in the other. Nothing about the names
+    catches that, and neither does arity.
+    """
+
+    silent = sorted(
+        op
+        for op, (_, doc) in _routed_docstrings(_REPO).items()
+        if doc and not any(word in doc.lower() for word in _OUTPUT_DISCIPLINE)
+    )
+    assert (
+        not silent
+    ), "routed ops whose docstring never says what they return or write: " + ", ".join(
+        silent
+    )
+
+
+def test_the_documentation_gate_is_not_vacuous():
+    """Both gates above pass trivially if nothing is routed. Pin that it is."""
+
+    documented = _routed_docstrings(_REPO)
+    assert documented, (
+        "the scanner found no routed ops; the gates above would pass without "
+        "checking anything"
+    )
+    assert set(documented) == set(json.loads(_BASELINE.read_text())), (
+        "the docstring scan and the contract baseline disagree about which "
+        "ops are routed"
+    )
