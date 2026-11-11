@@ -729,12 +729,8 @@ _MLA_PREFILL_KEEP = [
     "public us",
     "public TFLOPS",
     "public TB/s",
-    "flydsl us",
-    "flydsl TFLOPS",
-    "flydsl TB/s",
     "asm kernel",
     "public kernel",
-    "flydsl kernel",
     "kernel_trace_error",
 ]
 _GEMM_KEEP = [
@@ -2550,16 +2546,29 @@ def run_mla_decode(args):
     _print_table(table, rows, keep=_MLA_DECODE_KEEP)
 
 
+@contextlib.contextmanager
+def _without_flydsl_fmha(mod):
+    """Keep the varlen FMHA UT from adding its direct FlyDSL candidate."""
+    saved = getattr(mod, "flydsl_flash_attn_varlen_fwd", None)
+    mod.flydsl_flash_attn_varlen_fwd = None
+    try:
+        yield
+    finally:
+        mod.flydsl_flash_attn_varlen_fwd = saved
+
+
 def run_mla_prefill(args):
     """DSR1 MLA prefill: causal varlen FMHA, 128 heads, qk 192 / v 128, timed
-    as the ASM kernel, the public flash_attn_varlen_func route, and FlyDSL."""
+    as the ASM kernel and the public flash_attn_varlen_func route ATOM calls.
+    DSR1 never reaches FlyDSL here (causal D192x128 stays on the ASM kernel
+    unless AITER_ENABLE_EXPERIMENTAL is set), so its candidate is left out."""
     table = "mla prefill (DSR1, varlen FMHA D192x128, bf16, causal)"
     inits = _randn_or_const_inits(args, "mla_prefill")
     mod = _import_quietly("mla_prefill", table, "test_fmha_fwd_with_sink_varlen_asm")
     if mod is None:
         return
     rows = []
-    with _silence(), torch.device("cuda"):
+    with _silence(), torch.device("cuda"), _without_flydsl_fmha(mod):
         for (scenario, seq, seqlens), init in itertools.product(
             _dsr1_prefill_cases(), inits
         ):
@@ -2585,7 +2594,7 @@ def run_mla_prefill(args):
             if box:
                 _attach_backend_kernels(
                     row,
-                    ("asm", "public", "flydsl"),
+                    ("asm", "public"),
                     _profile_kernel_blocks(box[0].splitlines()),
                 )
             rows.append(row)

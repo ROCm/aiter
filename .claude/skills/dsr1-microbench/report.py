@@ -72,8 +72,9 @@ OPS = [
             "seqlens, True, 'randn')"
         ),
         "how": (
-            "Three backends: asm (fmha_fwd_with_sink_varlen_asm), public "
-            "(flash_attn_varlen_func: the asm kernel plus one torch copy), FlyDSL."
+            "asm is fmha_fwd_with_sink_varlen_asm; public is flash_attn_varlen_func, "
+            "the call ATOM makes (the asm kernel plus one torch copy). DSR1 prefill "
+            "never takes FlyDSL, so the UT's FlyDSL candidate is switched off."
         ),
     },
 ]
@@ -327,7 +328,8 @@ def render(run_dir):
             ("sweep", lambda r: r.get("scenario"), ""),
             ("seq len", lambda r: f"{r['seq_len']:,}", "n"),
         ] + cols
-    for b, label in (("asm", "asm"), ("public", "public"), ("flydsl", "FlyDSL")):
+    backends = [("asm", "asm"), ("public", "public"), ("flydsl", "FlyDSL")]
+    for b, label in [x for x in backends if any(f"{x[0]} us" in r for r in pre)]:
         cols += [
             (f"{label} us", lambda r, b=b: num(r.get(f"{b} us")), "n"),
             (f"{label} TFLOPS", lambda r, b=b: num(r.get(f"{b} TFLOPS")), "n"),
