@@ -91,12 +91,13 @@ def _kernel_names(tasks):
 class TestFmoeTuneDispatch(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
-        from aiter.tuning.moe.backends import asm_stage1, common
+        from aiter.tuning.moe.backends import asm_1stage, asm_stage1, common
         from csrc.ck_gemm_moe_2stages_codegen import gemm_moe_tune
 
         cls.gemm_moe_tune = gemm_moe_tune
         cls.backends_common = common
         cls.backend_asm_stage1 = asm_stage1
+        cls.backend_asm_1stage = asm_1stage
 
     def setUp(self):
         m = self.gemm_moe_tune
@@ -646,7 +647,7 @@ class TestFmoeTuneDispatch(unittest.TestCase):
         post_reduce = m.AsmMoeMode.POST_REDUCE.value
 
         def tags(**overrides):
-            with self.asm_gfx950(m, pin_gfx=True):
+            with self.asm_gfx950(self.backend_asm_1stage, pin_gfx=True):
                 tasks = self.tuner.gen_1stage_asm_task(
                     self.info(model_dim=7168, **overrides)
                 )
@@ -679,6 +680,9 @@ class TestFmoeTuneDispatch(unittest.TestCase):
         cleaned.update(env)
         with (
             mock.patch.object(self.gemm_moe_tune, "get_gfx", return_value="gfx950"),
+            mock.patch.object(
+                self.backend_asm_1stage, "get_gfx", return_value="gfx950"
+            ),
             mock.patch.object(self.gemm_moe_tune, "mp_tuner", fake_mp),
             mock.patch.dict(os.environ, cleaned, clear=True),
             contextlib.redirect_stdout(io.StringIO()),
