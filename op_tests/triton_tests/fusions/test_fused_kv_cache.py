@@ -1226,7 +1226,7 @@ def _k4v8_write(T, QH, KH, D, num_blocks, block_size, slot_mapping, seed=0):
 @pytest.mark.parametrize("D", [64, 128, 256])
 @pytest.mark.parametrize("QH, KH", [(8, 1), (16, 4)])
 def test_fused_qk_rope_reshape_and_cache_k4v8(scenario, block_size, D, QH, KH):
-    if DEVICE_ARCH not in ("gfx1250",):
+    if DEVICE_ARCH not in ("gfx1250", "gfx1250-strict"):
         pytest.skip("NVFP4 KV cache is only supported on GFX1250")
     num_blocks = 8
     slot_mapping = _k4v8_slots(scenario, num_blocks, block_size)
@@ -1268,7 +1268,7 @@ def test_k4v8_cache_write_unified_attention(block_size, QH, KH):
     """Write an A8K4V8 cache with fused_qk_rope_reshape_and_cache and run
     unified_attention (FP8 Q, NVFP4 K, FP8 V, shuffled) on it, against
     ref_paged_attn on the dequantized K and the fp8 V with its descale."""
-    if DEVICE_ARCH not in ("gfx1250",):
+    if DEVICE_ARCH not in ("gfx1250", "gfx1250-strict"):
         pytest.skip("A8K4V8 attention is only supported on GFX1250")
     from aiter.ops.triton.attention.unified_attention import unified_attention
     from op_tests.op_benchmarks.triton.bench_unified_attention import (
@@ -1386,7 +1386,7 @@ def test_reshape_and_cache_k4v8(scenario, block_size, D, KH, packed):
     """The write-only A8K4V8 op: bit-exact V and K up to NVFP4 rounding ties against the
     reference builders over the whole cache, and byte-identical to the cache write of
     fused_qk_rope_reshape_and_cache given that kernel's own roped K."""
-    if DEVICE_ARCH not in ("gfx1250",):
+    if DEVICE_ARCH not in ("gfx1250", "gfx1250-strict"):
         pytest.skip("NVFP4 KV cache is only supported on GFX1250")
     num_blocks = 8
     QH = 4 * KH
