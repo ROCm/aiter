@@ -230,7 +230,9 @@ def _derive_knobs(cfg: dict, T: int, H: int, cu_num: int) -> dict:
     if cfg["CACHE_NT_X"] is None:
         cfg["CACHE_NT_X"] = cfg["CACHE_NT"]
     if cfg["PREFETCH"] is None:
-        cfg["PREFETCH"] = _prefetch(H, cfg["BLOCK_M"], cfg["CHUNK_C"], cfg["SPLITS"])
+        cfg["PREFETCH"] = _prefetch(
+            H, cfg["BLOCK_M"], cfg["CHUNK_C"], cfg["SPLITS"]
+        ) and (cfg["NORM"] == "fused" or T <= _SEPARATE_PREFETCH_MAX_T)
     return cfg
 
 
@@ -284,7 +286,6 @@ def _separate_norm_policy(
         SPLITS=_splits(T, H, bm, cc, cu_num),
         CACHE_NT=cache_nt,
         CACHE_NT_X=cache_nt_x,
-        PREFETCH=None if T <= _SEPARATE_PREFETCH_MAX_T else False,
     )
 
 

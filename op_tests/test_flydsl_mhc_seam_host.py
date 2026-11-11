@@ -134,9 +134,10 @@ def test_prefetch_follows_the_segment_geometry(dispatch, config, prefetch):
     assert dispatch.compiled[0][1]["prefetch"] is prefetch
 
 
+@pytest.mark.parametrize("config", [None, {"NORM": "separate"}])
 @pytest.mark.parametrize("T, prefetch", [(1024, True), (2048, False)])
-def test_separate_policy_prefetches_up_to_1024_tokens(dispatch, T, prefetch):
-    seam.flydsl_mhc_seam(**_inputs(T=T, H=5120))
+def test_separate_path_prefetches_up_to_1024_tokens(dispatch, T, prefetch, config):
+    seam.flydsl_mhc_seam(**_inputs(T=T, H=5120), config=config)
     assert dispatch.compiled[0][1]["norm"] is False
     assert dispatch.compiled[0][1]["prefetch"] is prefetch
 
