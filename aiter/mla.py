@@ -1286,6 +1286,16 @@ def mla_decode_fwd(
             and get_gfx() == "gfx950"
         ):
             mgc = 32
+        # gfx950 fp8 gqa16 qlen1 kernel (a8w8_qh16_qseqlen1) does the same with
+        # SUB_KV=128 tiles.
+        if (
+            nhead == 16
+            and q.dtype == dtypes.fp8
+            and kv_buffer.dtype == dtypes.fp8
+            and max_seqlen_q == 1
+            and get_gfx() == "gfx950"
+        ):
+            mgc = 128
 
         # QH64's BF16 direct-output epilogue does not write LSE. Request FP32
         # partials and merge even a single split when the caller needs LSE.
