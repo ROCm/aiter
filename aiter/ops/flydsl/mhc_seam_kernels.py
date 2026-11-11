@@ -65,6 +65,8 @@ MHC_SEAM_DEFAULTS = {
     "NORM": "fused",
     # nt hint on the sublayer_out load; None: CACHE_NT
     "CACHE_NT_X": None,
+    # issue each chunk's residual / sublayer_out loads one step early; None: _prefetch
+    "PREFETCH": None,
 }
 _NORMS = ("fused", "separate")
 
@@ -95,6 +97,9 @@ _SEPARATE_NORM_TABLE = (
     (2048, 32, 128, False, True),
     (32768, 32, 128, True, False),
 )
+# The separate path's tokens above which the fused pass does not prefetch: it is 1.00-1.01x
+# from 1024 to 8192 tokens there, against 0.95x at 256 and 512.
+_SEPARATE_PREFETCH_MAX_T = 512
 # (BLOCK_M, CHUNK_C) tried, in order, when a row's tile is illegal for H
 _FALLBACK_TILES = tuple((bm, cc) for cc in (64, 128, 256) for bm in (32, 64, 16))
 
@@ -158,6 +163,12 @@ def _splits(T: int, H: int, bm: int, cc: int, cu_num: int) -> int:
     ]
     full = [s for s in fitting if _round_fill(blocks * s, cu_num) >= _MIN_ROUND_FILL]
     return max(full or fitting)
+
+
+def _prefetch(H: int, bm: int, cc: int, splits: int) -> bool:
+    """Off for two-chunk segments with several post-mix slots per thread, which spill."""
+    slots = bm * (cc // mhc_seam.VEC) // mhc_seam.BLOCK
+    return not (H // cc // splits == 2 and slots > 1)
 
 
 def _mode(has_post: bool, identity_pre: bool) -> str:
@@ -225,6 +236,8 @@ def _derive_knobs(cfg: dict, T: int, H: int, cu_num: int) -> dict:
         cfg["STAGE_NT"] = True
     if cfg["CACHE_NT_X"] is None:
         cfg["CACHE_NT_X"] = cfg["CACHE_NT"]
+    if cfg["PREFETCH"] is None:
+        cfg["PREFETCH"] = _prefetch(H, cfg["BLOCK_M"], cfg["CHUNK_C"], cfg["SPLITS"])
     return cfg
 
 
@@ -278,6 +291,7 @@ def _separate_norm_policy(
         SPLITS=_splits(T, H, bm, cc, cu_num),
         CACHE_NT=cache_nt,
         CACHE_NT_X=cache_nt_x,
+        PREFETCH=None if T <= _SEPARATE_PREFETCH_MAX_T else False,
     )
 
 
@@ -706,6 +720,7 @@ def _compile_launcher(
         stage_nt=bool(cfg["STAGE_NT"]),
         waves_per_eu=cfg["WAVES_PER_EU"],
         norm=not separate,
+        prefetch=bool(cfg["PREFETCH"]),
     )
     finish_kwargs = {
         "hidden": H,

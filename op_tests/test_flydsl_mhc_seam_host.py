@@ -113,6 +113,34 @@ def test_config_overrides_preserve_policy_and_cache_semantics(dispatch):
     assert len(dispatch.compiled) == 8
 
 
+@pytest.mark.parametrize(
+    "config, prefetch",
+    [
+        # Two chunks per segment and two post-mix slots per thread: the build that spills.
+        ({"BLOCK_M": 16, "CHUNK_C": 256, "SPLITS": 10}, False),
+        ({"BLOCK_M": 16, "CHUNK_C": 256, "SPLITS": 5}, True),
+        # One slot per thread fits at two chunks.
+        ({"BLOCK_M": 16, "CHUNK_C": 128, "SPLITS": 20}, True),
+        # A single chunk only hoists its loads above the gate staging.
+        ({"BLOCK_M": 16, "CHUNK_C": 256, "SPLITS": 20}, True),
+        # An explicit value is kept.
+        ({"BLOCK_M": 16, "CHUNK_C": 256, "SPLITS": 10, "PREFETCH": True}, True),
+        ({"BLOCK_M": 16, "CHUNK_C": 256, "SPLITS": 5, "PREFETCH": False}, False),
+    ],
+)
+def test_prefetch_follows_the_segment_geometry(dispatch, config, prefetch):
+    seam.flydsl_mhc_seam(**_inputs(H=5120), config=dict(config, NORM="separate"))
+    assert dispatch.compiled[0][0] == "compile_mhc_seam_fused"
+    assert dispatch.compiled[0][1]["prefetch"] is prefetch
+
+
+@pytest.mark.parametrize("T, prefetch", [(512, True), (1024, False)])
+def test_separate_policy_prefetches_up_to_512_tokens(dispatch, T, prefetch):
+    seam.flydsl_mhc_seam(**_inputs(T=T, H=5120))
+    assert dispatch.compiled[0][1]["norm"] is False
+    assert dispatch.compiled[0][1]["prefetch"] is prefetch
+
+
 @pytest.mark.parametrize("norm", ["fused", "separate"])
 def test_cached_runner_uses_each_calls_tensors_scratch_and_stream(dispatch, norm):
     first = _inputs()

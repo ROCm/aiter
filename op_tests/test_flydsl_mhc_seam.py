@@ -363,6 +363,20 @@ def test_mhc_seam_knobs(H):
     for mode, cfg in (
         ("no_post", {"STAGE_NT": True}),
         ("post", {"NORM": "fused", "STAGE_NT": True, "GATE_STEP": False}),
+        # The policy prefetches at every size here; force the load-then-use loop.
+        ("post", {"PREFETCH": False}),
+        ("no_post", {"BLOCK_M": 32, "CHUNK_C": 64, "SPLITS": 8, "PREFETCH": False}),
+        # A segment of two chunks with two slots per thread, which the policy leaves off.
+        (
+            "post",
+            {
+                "NORM": "separate",
+                "BLOCK_M": 16,
+                "CHUNK_C": 256,
+                "SPLITS": 10,
+                "PREFETCH": True,
+            },
+        ),
     ):
         args, kw, ref = _call_kwargs(mode, 128, H)
         out = flydsl_mhc_seam(*args, config=cfg, **kw)

@@ -482,24 +482,19 @@ def compile_mhc_seam_fused(
     stage_nt: bool,
     waves_per_eu: int,
     norm: bool,
+    prefetch: bool = False,
 ) -> Any:
-    """The fused pass: the post-mix, the collapse, the gate projection, and the sums of squares.
+    """The fused pass: post-mix, collapse, gate projection, and sums of squares.
 
-    Serves both NORM paths. `norm` says which finish pass reads what this publishes, and the
-    pass is otherwise the same: with it, the collapse goes to the `stage` buffer the fused
-    finish rescales and both sums of squares go to `sums`; without it, the collapse is already
-    `layer_input` -- the contract's un-normalised value, which `aiter.rms_norm` then takes --
-    and the one sum of squares rides in the published line's slot after the gate rows.
+    A workgroup owns `block_m` tokens of one hidden segment and sweeps it in `chunk_c`-wide
+    chunks. A chunk's streams are post-mixed together, then staged one at a time in LDS as the
+    MFMA A operand; `fn` arrives packed in B-fragment order and is read straight from global.
 
-    A workgroup owns `block_m` tokens by one hidden segment and sweeps the segment in
-    `chunk_c`-wide chunks. The streams of a chunk are post-mixed together -- every output stream
-    reads all input streams -- and then published one at a time into an LDS tile that the matrix
-    core reads as the MFMA A operand, which is the only way the post-mix's thread map (a thread
-    owns `VEC` contiguous columns of one token) reaches the fragment's (a lane holds one token's
-    one k element).
+    With `norm`, the collapse goes to `stage` and both sums of squares to `sums`. Without it,
+    the collapse is `layer_input` and `sum(R'^2)` rides in the published line after the gate rows.
 
-    `fn` needs no such staging: it arrives packed in B-fragment order, so it is read straight
-    from global, and the publish adds each gate row's two limbs back together.
+    `prefetch` issues each chunk's `residual` and `sublayer_out` loads one step early: the
+    first chunk's ahead of the gate staging, each later one's ahead of the previous projection.
     """
     _require_streams(streams)
     _require_fast_narrow(fast_fp_math, fast_narrow)
@@ -525,6 +520,9 @@ def compile_mhc_seam_fused(
     )
     # Where `pre` starts in a staged row; `post` is at 0 and `comb` follows it.
     pre_base = coeffs - streams
+    # One B fragment per stream, so a chunk's `fn` loads all issue before the prefetch: `vmcnt`
+    # retires in order. A single-chunk segment has nothing to prefetch and keeps one.
+    carry = prefetch and seg_chunks > 1
 
     @fx.struct
     class SharedStorage:
@@ -541,6 +539,7 @@ def compile_mhc_seam_fused(
         + ("_ntx" if load_nt_x else "")
         + ("_nts" if store_nt else "")
         + ("_ntg" if stage_nt else "")
+        + ("_pf" if prefetch else "")
     )
 
     @flyc.kernel(name=name, known_block_size=[BLOCK, 1, 1])
@@ -652,7 +651,10 @@ def compile_mhc_seam_fused(
             None, None, 0, None
         ]
         frag_a = thr_mma.make_fragment_A(s_a)
-        frag_b = thr_mma.make_fragment_B(t_fn[None, None, 0])
+        frags_b = [
+            thr_mma.make_fragment_B(t_fn[None, None, 0])
+            for _ in range_constexpr(streams if carry else 1)
+        ]
         frag_c = thr_mma.make_fragment_C(my_acc)
         frag_c.fill(0)
 
@@ -663,7 +665,7 @@ def compile_mhc_seam_fused(
         p_fn = thr_b.partition_S(t_fn)
         p_acc = thr_c.partition_S(my_acc)
         cf_a = thr_a.retile(frag_a)
-        cf_b = thr_b.retile(frag_b)
+        cfs_b = [thr_b.retile(f) for f in frags_b]
         cf_c = thr_c.retile(frag_c)
 
         def stage_gates(out_gates: Any) -> None:
@@ -722,25 +724,57 @@ def compile_mhc_seam_fused(
                     else:
                         out_gates[token_local, slot_i] = pre_value
 
+        def load_residual(safe: Any, col: Any) -> list[Any]:
+            """One slot's `residual` vectors, one per stream."""
+            return [
+                _load_bf16(residual, _offset(res_major, safe, i, 0) + col, VEC, load_nt)
+                for i in range_constexpr(streams)
+            ]
+
+        def load_sublayer_out(safe: Any, col: Any) -> Any:
+            """One slot's `sublayer_out` vector."""
+            return _load_bf16(
+                sublayer_out, _offset(token_major, safe, 0) + col, VEC, load_nt_x
+            )
+
+        def slot_address(chunk: Any, g: int) -> tuple[Any, Any, Any, Any, Any]:
+            """(token in the tile, slot group, live, clamped token, column) of slot `g`."""
+            token_local, group = slot_coord(g)
+            token = token0 + token_local
+            live = token < n_tok
+            safe = live.select(token, fx.Int32(0))
+            col = chunk * fx.Int32(chunk_c) + group * fx.Int32(VEC)
+            return token_local, group, live, safe, col
+
+        # The vectors a slot loads per chunk: each stream's residual, then `sublayer_out`.
+        slot_loads = streams + (1 if has_post else 0)
+
+        def load_chunk(chunk: Any) -> list[Any]:
+            """Issue every slot's loads of one chunk, flat by slot."""
+            loads = []
+            for g in range_constexpr(slots):
+                _, _, _, safe, col = slot_address(chunk, g)
+                loads.extend(load_residual(safe, col))
+                if const_expr(has_post):
+                    loads.append(load_sublayer_out(safe, col))
+            return loads
+
         def post_mix_chunk(
-            chunk: Any, sq: list[Any], sqc: list[Any]
+            chunk: Any, loads: list[Any] | None, sq: list[Any], sqc: list[Any]
         ) -> tuple[list[Any], list[Any], list[Any]]:
             """Post-mix and collapse one chunk; publish the new residual and the un-normalised
-            collapse, carry both sums of squares, and hand the rounded streams on."""
+            collapse, carry both sums of squares, and hand the rounded streams on.
+
+            `loads` is the chunk's `load_chunk`, issued earlier; None loads each slot here.
+            """
             held = []
             for g in range_constexpr(slots):
-                token_local, group = slot_coord(g)
-                token = token0 + token_local
-                live = token < n_tok
-                safe = live.select(token, fx.Int32(0))
-                col = chunk * fx.Int32(chunk_c) + group * fx.Int32(VEC)
-
-                res = [
-                    _load_bf16(
-                        residual, _offset(res_major, safe, i, 0) + col, VEC, load_nt
-                    )
-                    for i in range_constexpr(streams)
-                ]
+                token_local, _, live, safe, col = slot_address(chunk, g)
+                base = g * slot_loads
+                if const_expr(loads is None):
+                    res = load_residual(safe, col)
+                else:
+                    res = loads[base : base + streams]
                 pre = [
                     s_gates[token_local, fx.Int32(pre_base + j)]
                     for j in range_constexpr(streams)
@@ -757,15 +791,11 @@ def compile_mhc_seam_fused(
                         ]
                         for i in range_constexpr(streams)
                     ]
-                    y = [
-                        fx.Float32(e)
-                        for e in _load_bf16(
-                            sublayer_out,
-                            _offset(token_major, safe, 0) + col,
-                            VEC,
-                            load_nt_x,
-                        )
-                    ]
+                    if const_expr(loads is None):
+                        x = load_sublayer_out(safe, col)
+                    else:
+                        x = loads[base + streams]
+                    y = [fx.Float32(e) for e in x]
                     src = [
                         [fx.Float32(res[i][e]) for e in range_constexpr(VEC)]
                         for i in range_constexpr(streams)
@@ -823,11 +853,21 @@ def compile_mhc_seam_fused(
                     sqc[g] = sqc[g] + collapse_squares
             return held, sq, sqc
 
-        def project_chunk(chunk: Any, held: list[Any]) -> None:
+        def fn_tile(chunk: Any, j: int) -> Any:
+            """This thread's share of stream `j`'s `fn` tile for one chunk."""
+            return p_fn[None, None, None, fx.Int32(j * chunks) + chunk]
+
+        def load_fn(chunk: Any) -> None:
+            """Issue the chunk's `fn` tile of every stream into its own B fragment."""
+            for j in range_constexpr(streams):
+                fx.copy(wgt_copy, fn_tile(chunk, j), cfs_b[j])
+
+        def project_chunk(chunk: Any, held: list[Any], fn_issued: bool) -> None:
             """Contract the chunk's rounded streams against `fn`, one stream at a time.
 
             The A tile holds a single stream, which is what keeps `chunk_c` at the width the
-            bandwidth phase wants inside the LDS budget.
+            bandwidth phase wants inside the LDS budget. `fn_issued`: `load_fn` has issued the
+            chunk's `fn` tiles; otherwise each stream's is loaded just before its MFMA.
             """
             for j in range_constexpr(streams):
                 fx.gpu.barrier()
@@ -841,20 +881,44 @@ def compile_mhc_seam_fused(
                             held[g][j][e], fx.BFloat16(0.0)
                         )
                 fx.gpu.barrier()
-                k_tile = fx.Int32(j * chunks) + chunk
                 fx.copy(lds_copy, p_a, cf_a)
-                fx.copy(wgt_copy, p_fn[None, None, None, k_tile], cf_b)
-                fx.gemm(tiled_mma, frag_c, frag_a, frag_b, frag_c)
+                if const_expr(fn_issued):
+                    fx.gemm(tiled_mma, frag_c, frag_a, frags_b[j], frag_c)
+                else:
+                    fx.copy(wgt_copy, fn_tile(chunk, j), cfs_b[0])
+                    fx.gemm(tiled_mma, frag_c, frag_a, frags_b[0], frag_c)
 
         # ── Chunk loop ──
+        first = seg * fx.Int32(seg_chunks)
+        # The first chunk's loads go ahead of the gate staging, which does not feed them.
+        loads = load_chunk(first) if prefetch else None
         stage_gates(s_gates)
         fx.gpu.barrier()
         sq = [fx.Float32(0.0) for _ in range_constexpr(slots)]
         sqc = [fx.Float32(0.0) for _ in range_constexpr(slots)]
-        for c in range(seg_chunks):
-            chunk = seg * fx.Int32(seg_chunks) + fx.Int32(c)
-            held, sq, sqc = post_mix_chunk(chunk, sq, sqc)
-            project_chunk(chunk, held)
+        if const_expr(carry):
+            # The last chunk is peeled so that nothing loads past the segment.
+            for c in range(seg_chunks - 1):
+                chunk = first + c
+                held, sq, sqc = post_mix_chunk(chunk, loads, sq, sqc)
+                load_fn(chunk)
+                # The scheduler would otherwise interleave the `fn` loads with the prefetch,
+                # and the projection's wait on its `fn` would then cover the prefetch too.
+                rocdl.sched_barrier(0)
+                loads = load_chunk(chunk + 1)
+                project_chunk(chunk, held, fn_issued=True)
+                # Keeps the next post-mix, the prefetch's consumer, out of this projection.
+                rocdl.sched_barrier(0)
+            # Nothing is prefetched behind the last chunk, so its `fn` tiles load as the default
+            # path's do, each just before its MFMA, and only one is live at a time.
+            last = first + (seg_chunks - 1)
+            held, sq, sqc = post_mix_chunk(last, loads, sq, sqc)
+            project_chunk(last, held, fn_issued=False)
+        else:
+            for c in range(seg_chunks):
+                chunk = first + c
+                held, sq, sqc = post_mix_chunk(chunk, loads, sq, sqc)
+                project_chunk(chunk, held, fn_issued=False)
 
         # ── Publish ──
         # Each wave holds a partial over its share of the contraction, published in `fold_rounds`
