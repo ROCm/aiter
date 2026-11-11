@@ -22,24 +22,45 @@ SUPPORTED_GFX = ["gfx942", "gfx950"]
 # Pytorch reference, from FlyDSL tests/kernels/test_mla_decode.py
 
 
-def ref_attention(query, key, value, scale):
-    """Single-sequence MLA attention (no causal mask needed for decode_qlen=1)."""
+def ref_attention(query, key, value, scale, mask):
+    """Single-sequence masked MLA attention.
+
+    ``mask`` is a bool [s_q, s_k] tensor; query row i attends to key j iff
+    mask[i, j]. Rows with no visible key return out = 0 and lse = -inf, so they
+    drop out of an LSE merge.
+    """
 
     attn_weights = torch.einsum("qhd,khd->hqk", query.float(), key.float()) * scale
+    attn_weights.masked_fill_(~mask, float("-inf"))
     lse = attn_weights.logsumexp(dim=-1)
-    m = attn_weights.max(-1).values
+    m = attn_weights.max(-1).values.nan_to_num(neginf=0.0)
     attn_weights_exp = torch.exp(attn_weights - m.unsqueeze(-1))
     denom = attn_weights_exp.sum(-1)
     out = torch.einsum("hqk,khd->qhd", attn_weights_exp.float(), value.float())
-    out = out / denom.transpose(0, 1).unsqueeze(-1)
+    # denom >= 1 for any row with a visible key; fully masked rows have out == 0.
+    out = out / denom.clamp(min=1.0).transpose(0, 1).unsqueeze(-1)
 
     return out, lse
 
 
 def run_torch(
-    q, kv_cache, qo_indptr, kv_indptr, kv_indices, kv_last_page_lens, sm_scale, out, lse
+    q,
+    kv_cache,
+    qo_indptr,
+    kv_indptr,
+    kv_indices,
+    kv_last_page_lens,
+    sm_scale,
+    out,
+    lse,
+    kv_tail_lens=None,
 ):
-    """Pure-PyTorch paged MLA attention reference."""
+    """Pure-PyTorch paged MLA attention reference.
+
+    ``kv_tail_lens[i]`` is the number of tokens of sequence i that follow the
+    KV pages given here (non-zero when only a split chunk is passed); the
+    causal mask is placed as if those tokens were present.
+    """
 
     num_page, page_size, nhead_kv, _ = kv_cache.shape
     v_head_dim = out.shape[-1]
@@ -57,7 +78,13 @@ def run_torch(
         q_i = qs[i]
         k_i = kvc_i
         v_i = kvc_i[:, :, :v_head_dim]
-        o_i, lse_i = ref_attention(q_i, k_i, v_i, sm_scale)
+        tail = 0 if kv_tail_lens is None else kv_tail_lens[i]
+        s_q = q_i.shape[0]
+        # Query row r sits at chunk-local position (real_kv_seq_len + tail - s_q + r).
+        mask = torch.ones(s_q, real_kv_seq_len, dtype=torch.bool).tril(
+            diagonal=real_kv_seq_len + tail - s_q
+        )
+        o_i, lse_i = ref_attention(q_i, k_i, v_i, sm_scale, mask)
         os_list.append(o_i)
         lses.append(lse_i)
 
@@ -115,6 +142,11 @@ def run_torch_persistent(
                 last_page_lens_l[batch_idx] if kv_offset == 0 else page_size
             )
             work_last_page_lens = torch.tensor([last_page_len], dtype=torch.int32)
+            kv_tail_len = (
+                0
+                if kv_offset == 0
+                else (kv_offset - 1) * page_size + last_page_lens_l[batch_idx]
+            )
 
             if partial_qo_loc < 0:
                 out = final_output[qo_start:qo_end]
@@ -134,6 +166,7 @@ def run_torch_persistent(
                 sm_scale,
                 out,
                 lse,
+                kv_tail_lens=[kv_tail_len],
             )
 
     return torch.tensor(sorted(slots), dtype=torch.long)
@@ -301,6 +334,8 @@ def test_mla_fwd_decode(
         pytest.skip("ROCm is not available")
     if get_gfx() not in SUPPORTED_GFX:
         pytest.skip(f"MLA decode is unsupported on {get_gfx()}")
+    if context_len < decode_qlen:
+        pytest.skip("context_len must cover all decode_qlen query tokens")
 
     (
         query,
@@ -391,7 +426,7 @@ def test_mla_fwd_decode(
             sm_scale,
         ),
     }
-    flops = 2 * batch_size * q_nhead * context_len * (2 * qkv_head_dim + rope_dim)
+    flops = 2 * batch_size * q_nhead * decode_qlen * context_len * (2 * qkv_head_dim + rope_dim)
     nbytes = sum(
         tensor.numel() * tensor.element_size()
         for tensor in (query, kv_buffer, split_output[slots], split_lse[slots])
