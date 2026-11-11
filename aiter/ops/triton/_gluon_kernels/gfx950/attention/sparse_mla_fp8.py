@@ -714,7 +714,11 @@ class Program:
         return acc, m_i, l_i
 
     @gluon.jit
-    def loop_two_lists(self, q, kv_ptr, x_kv_ptr, indptr_ptr, idx_ptr, x_indptr_ptr, x_idx_ptr, main_row0, main_stride, extra_row0, extra_stride, c, k_scale, x_ks_ptr, MAIN_BLOCK_LOG2: gl.constexpr, EXTRA_BLOCK_LOG2: gl.constexpr,):  # fmt: skip
+    def loop_two_lists(
+        self, q, kv_ptr, x_kv_ptr, indptr_ptr, idx_ptr, x_indptr_ptr, x_idx_ptr,
+        main_row0, main_stride, extra_row0, extra_stride, c, k_scale, x_ks_ptr,
+        MAIN_BLOCK_LOG2: gl.constexpr, EXTRA_BLOCK_LOG2: gl.constexpr,
+    ):  # fmt: skip
         """The SWA list from kv, then the top-k list from x_kv. A split's tile range
         may cover either list or both. Returns (acc, m, l, acc's V scale)."""
         row = self.row
@@ -774,7 +778,10 @@ class Program:
             self.store_rows(x, part_acc_ptr + base * D, D)
 
     @gluon.jit
-    def finish(self, acc, m_i, l_i, v_scale, sink_ptr, lse_ptr, out_ptr, out_stride0, out_stride1, epi,):  # fmt: skip
+    def finish(
+        self, acc, m_i, l_i, v_scale, sink_ptr, lse_ptr, out_ptr, out_stride0,
+        out_stride1, epi,
+    ):  # fmt: skip
         """Normalize (the sink adds to the denominator) and store the rows, and the
         natural-log LSE if asked. An empty row comes out 0."""
         cfg = self.cfg
