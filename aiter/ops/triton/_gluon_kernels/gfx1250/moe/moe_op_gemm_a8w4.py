@@ -1728,28 +1728,18 @@ def _moe_gemm_a8w4_decode(
         # the aliased w_buffer slot) despite s_wait_dscnt 0 + s_barrier before
         # it, when 3-4 of these workgroups share a WGP. Under decode load that
         # put garbage (up to ~1e38) into a few MoE rows per million calls.
-        # buffer_store keeps the base in the descriptor. Its voffset is 32-bit,
-        # so rebase Y to this tile in index_type and pass only the in-tile
-        # offsets. A tile past 2**31 elements would wrap if that product were
-        # the voffset, which is what the widened gl.store was closing.
+        # buffer_store voffset is 32-bit bytes; the tile origin stays in the
+        # index_type pointer. The offset is only this tile's rows and columns.
         OUT_LAYOUT: gl.constexpr = out.type.layout
         tile_m = block_id * BLOCK_M
         tile_n = pid_n * OUT_BLOCK_N
-        offs_y_m = tile_m + gl.arange(0, BLOCK_M, layout=gl.SliceLayout(1, OUT_LAYOUT))
-        offs_y_n = tile_n + gl.arange(
-            0, OUT_BLOCK_N, layout=gl.SliceLayout(0, OUT_LAYOUT)
-        )
-        mask_y = (offs_y_m < M)[:, None] & (offs_y_n < yN)[None, :]
-        y_base = (
-            Y
-            + start_m.to(index_type) * stride_y_m
-            + tile_m.to(index_type) * stride_y_m
-            + tile_n.to(index_type) * stride_y_n
-        )
-        offs_y = stride_y_m * (offs_y_m[:, None] - tile_m) + stride_y_n * (
-            offs_y_n[None, :] - tile_n
-        )
-        gl.amd.gfx1250.buffer_store(out, y_base, offs_y, mask=mask_y)
+        Y += (start_m.to(index_type) + tile_m.to(index_type)) * stride_y_m
+        Y += tile_n.to(index_type) * stride_y_n
+        in_m = gl.arange(0, BLOCK_M, layout=gl.SliceLayout(1, OUT_LAYOUT))
+        in_n = gl.arange(0, OUT_BLOCK_N, layout=gl.SliceLayout(0, OUT_LAYOUT))
+        mask_y = ((tile_m + in_m) < M)[:, None] & ((tile_n + in_n) < yN)[None, :]
+        offs_y = in_m[:, None] * stride_y_m + in_n[None, :] * stride_y_n
+        gl.amd.gfx1250.buffer_store(out, Y, offs_y, mask=mask_y)
 
 
 def _gather_idx_dtype(gather_indx):
