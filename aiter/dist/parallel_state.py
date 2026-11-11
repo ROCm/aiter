@@ -860,6 +860,28 @@ class GroupCoordinator:
             return self.device_communicator.all_reduce(input_ + other)
         return fused(input_, other, ca_use_new, ca_fp8_quant, prefill_support)
 
+    def dcp_lse_merge(
+        self,
+        o: torch.Tensor,
+        lse: torch.Tensor,
+        owned_counts: torch.Tensor | None = None,
+        return_lse: bool = False,
+    ):
+        """Merge decode context parallel partials over this group in one kernel.
+
+        o [B, H, D] and lse [B, H] are this rank's attention partials over its
+        KV shard. The result is [B, H / world_size, D] for this rank's heads,
+        merged by LSE (with return_lse, also the merged LSE). Returns None when
+        no custom kernel takes the inputs; the caller then merges its own way
+        (for example with an all-to-all).
+        """
+        if self.world_size == 1 or self.device_communicator is None:
+            return None
+        merge = getattr(self.device_communicator, "dcp_lse_merge", None)
+        if merge is None:
+            return None
+        return merge(o, lse, owned_counts, return_lse)
+
     def fused_allreduce_rmsnorm(
         self,
         input_: torch.Tensor,

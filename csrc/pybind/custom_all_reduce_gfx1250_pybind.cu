@@ -58,6 +58,10 @@ PYBIND11_MODULE(AITER_EXTENSION_NAME, m)
     // for every supported world size.
     m.def("meta_size", &aiter::meta_size, py::arg("world_size") = 8);
     m.def("ll_ar_max_bytes", &aiter::ll_ar_max_bytes, py::arg("world_size"));
+    m.def("dcp_merge_max_rows", &aiter::dcp_merge_max_rows, py::arg("_fa"));
+    m.def("dcp_merge", &aiter::dcp_merge,
+          py::arg("_fa"), py::arg("o"), py::arg("lse"), py::arg("owned_ptr"),
+          py::arg("out"), py::arg("out_lse_ptr"));
     m.def("register_input_buffer", &aiter::register_input_buffer,
           py::arg("_fa"), py::arg("self_ptr"), py::arg("all_ptrs"));
     m.def("register_output_buffer", &aiter::register_output_buffer,
