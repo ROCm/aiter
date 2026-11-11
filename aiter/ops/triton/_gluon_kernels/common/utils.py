@@ -99,3 +99,26 @@ def interleaved_rope(x, cos, sin):
     rotated = _get_gptj_rotated_x(x, is_even, NUM_ROWS, NUM_COLS, NUM_COLS // 2)
     # The helper reshapes x. convert_layout gives rotated the layout of x again.
     return x * cos + gl.convert_layout(rotated, x.type.layout) * sin
+
+
+@gluon.jit
+def find_seq_idx(
+    query_start_len_ptr,
+    target_idx,
+    num_seqs,
+    BLOCK_Q: gl.constexpr,
+    use_q_block_mode: gl.constexpr = True,
+):
+    """Index of the sequence that holds query block (or token) target_idx, by binary
+    search of the start offsets in query_start_len_ptr."""
+    left = 0
+    right = num_seqs
+    while left < right:
+        mid = (left + right) // 2
+        val = gl.load(query_start_len_ptr + mid)
+        mid_val = val // BLOCK_Q + mid if use_q_block_mode else val
+        if mid_val <= target_idx:
+            left = mid + 1
+        else:
+            right = mid
+    return left - 1
