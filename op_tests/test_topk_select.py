@@ -1169,14 +1169,12 @@ class _NoFlyDSLState:
     """A launcher with none of the state a TopK launcher copies per GPU."""
 
 
-# What a further GPU's launcher has to start from: FlyDSL 0.4.0's in-process
+# What a further GPU's launcher has to start from: FlyDSL 0.5.0's in-process
 # caches, and the target it resolves with the signature on a first call.
 _FRESH_PER_DEVICE = {
     "_mem_cache": {},
-    "_call_state_cache": {},
     "_last_compiled": None,
     "cache_manager": None,
-    "manager_key": None,
     "_sig": None,
     "_backend_target": None,
 }
