@@ -477,7 +477,7 @@ class _Stage1Fusion:
     ):
         from .s1f_stage1 import make_s1f_stage1
 
-        xcc_queues = 1 if iod_loc else _s1f_xcc_queues(tile_m)
+        xcc_queues = _s1f_xcc_queues(tile_m)
         key = (
             tile_m,
             producers,
@@ -665,7 +665,7 @@ class _Stage1Fusion:
         if stream is None:
             stream = torch.cuda.current_stream()
         # A W1 placed by moe_shuffle_weight_iod at load time is read placed,
-        # the per-XCC queues handing each XCC its IOD's n-tiles.
+        # the GEMM1 queues handing each XCC its IOD's n-tiles.
         from aiter.ops.flydsl.iod_locality import lookup
 
         loc_phase, _ = lookup(w, w_scales, N, K, _S1F_TILE_N, _S1F_TILE_K)
