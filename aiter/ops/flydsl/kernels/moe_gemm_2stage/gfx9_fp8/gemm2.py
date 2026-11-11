@@ -138,7 +138,7 @@ def compile_moe_gemm2(
     def _make_down_weight_view(p_weight, expert_id):
         element_num = 16 // (p_weight.dtype.width // 8)
         return fx.make_view(
-            p_weight + fx.Int64(expert_id * N * K),
+            p_weight + fx.Int64(expert_id) * N * K,
             fx.make_layout(
                 ((16, N // 16), (element_num, K // element_num)),
                 ((element_num, 16 * K), (1, 16 * element_num)),
@@ -399,7 +399,7 @@ def compile_moe_gemm2(
 
             element_num = 16 // (weight_dtype.width // 8)
             arg_p_weight = fx.make_view(
-                fxh._as_ptr(p_weight, weight_dtype) + fx.Int64(expert_id * N * K),
+                fxh._as_ptr(p_weight, weight_dtype) + fx.Int64(expert_id) * N * K,
                 fx.make_layout(
                     ((16, N // 16), (element_num, K // element_num)),
                     ((element_num, 16 * K), (1, 16 * element_num)),

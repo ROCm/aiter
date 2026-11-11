@@ -220,10 +220,12 @@ def compile_moe_gemm1(
                     acc.append(_swiglu_oai(gate[j], up[j]))
             else:
                 log2_exp1 = -1.4426950408889634
-                gate_log2 = gate * log2_exp1
                 for j in range_constexpr(gate.numel):
-                    tmp = rocdl.exp2(T.f32, _raw(gate_log2[j]))
-                    acc.append((gate[j] * rocdl.rcp(T.f32, 1.0 + tmp)) * up[j])
+                    g, u = gate[j], up[j]
+                    if const_expr(bool(swiglu_limit)):
+                        g, u = _clamp_gateup(g, u)
+                    tmp = rocdl.exp2(T.f32, _raw(g * log2_exp1))
+                    acc.append((g * rocdl.rcp(T.f32, 1.0 + tmp)) * u)
             acc = Vec.from_elements(acc, fx.Float32)
             c_frag_bf16[None, None, i].store(_f32_to_bf16(acc))
 
@@ -258,6 +260,8 @@ def compile_moe_gemm1(
                     if const_expr(activation == "swiglu"):
                         acc.append(_swiglu_oai(g, u))
                     else:
+                        if const_expr(bool(swiglu_limit)):
+                            g, u = _clamp_gateup(g, u)
                         tmp = rocdl.exp2(T.f32, _raw(g * log2_exp1))
                         acc.append((g * rocdl.rcp(T.f32, 1.0 + tmp)) * u)
                 acc = Vec.from_elements(acc, fx.Float32)
@@ -271,7 +275,7 @@ def compile_moe_gemm1(
         )
         element_num = 16 // (p_weight.dtype.width // 8)
         return fx.make_view(
-            p_weight + fx.Int64(expert_id * N * K),
+            p_weight + fx.Int64(expert_id) * N * K,
             fx.composition(
                 fx.make_layout(
                     ((16, N // 16), (element_num, K // element_num)),
