@@ -599,7 +599,14 @@ class TestGfx950FlydslMemoryCandidates(unittest.TestCase):
                 112, 18432, 1536, torch.bfloat16, torch.bfloat16, False
             )
         self.assertEqual(configs[0], wide)
-        self.assertEqual(len(configs), 7)
+        # The fixed rectangular families are only removed by the real pruner.
+        derived = [
+            config
+            for config in configs
+            if config.get("policy") == "sk"
+            or (config["block_m"], config["block_n"]) == (128, 96)
+        ]
+        self.assertEqual(len(derived), 7)
         self.assertEqual(configs[-1]["policy"], "sk")
         self.assertNotIn("k_stagger", configs[-1])
         self.assertNotIn("b_non_temporal", configs[-1])
@@ -783,10 +790,13 @@ class TestGfx950FlydslCandidates(unittest.TestCase):
                 )
             )
 
+        # Stagger and B cache-policy variants have no workspace twin.
         atomic = {
             without_workspace(config)
             for config in raw_configs
-            if config["split_k"] > 1 and not config.get("use_split_k_workspace")
+            if config["split_k"] > 1
+            and not config.get("use_split_k_workspace")
+            and "k_stagger" not in config
         }
         workspace = {
             without_workspace(config)
