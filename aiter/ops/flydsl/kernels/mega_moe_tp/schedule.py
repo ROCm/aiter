@@ -102,6 +102,8 @@ def build_schedule(kc: KernelCtx) -> dict:
     rch, report_chunk, spin_sys_ge = kc.get("rch report_chunk spin_sys_ge")
     unit_fields, zero_masked = kc.get("unit_fields zero_masked")
     SM, route_regs = kc.get("SM route_regs")
+    # the exported intermediate's bytes per route row (MXFP4 / MXFP8)
+    XIB, IPB, SIB, XD = kc.get("XIB IPB SIB XD")
 
     @flyc.jit
     def gemm2_dispatch(L, tid, a, expert, ks0, icnt, r0, rows, signal):
@@ -852,7 +854,7 @@ def build_schedule(kc: KernelCtx) -> dict:
                 lds_st(L, wt0 + r * i32(4), fx.Int32(wv))
         wait_lgkm0()
         rx, rxs = xg_rs(a)
-        u16 = I // 2 // 16
+        u16 = XIB // 16
         nq = fx.max(R * i32(u16), i32(1))
         NQ = ceildiv(RG * u16, 64)
         for b0 in range_constexpr(0, NQ, 8):
@@ -863,22 +865,22 @@ def build_schedule(kc: KernelCtx) -> dict:
                 c = q - row * i32(u16)
                 rix = lds_ld_i32(L, rix0 + row * i32(4))
                 dq.append(
-                    (row, c, bld(rx, rix * i32(I // 2) + c * i32(16), 0, V4I, AUX_SYS))
+                    (row, c, bld(rx, rix * i32(XIB) + c * i32(16), 0, V4I, AUX_SYS))
                 )
             for row, c, dv in dq:
                 lds_st(L, ib0 + row * i32(SI_STRIDE) + c * i32(16), dv, 16)
-        ns = fx.max(R * i32(I // 128), i32(1))
+        ns = fx.max(R * i32(SIB // 4), i32(1))
         ds = []
-        for k in range_constexpr(ceildiv(RG * (I // 128), 64)):
+        for k in range_constexpr(ceildiv(RG * (SIB // 4), 64)):
             q = fx.min(lane + i32(k * 64), ns - i32(1))
-            row = q // i32(I // 128)
-            c = q - row * i32(I // 128)
+            row = q // i32(SIB // 4)
+            c = q - row * i32(SIB // 4)
             rix = lds_ld_i32(L, rix0 + row * i32(4))
             ds.append(
-                (row, c, bld(rxs, rix * i32(I // 32) + c * i32(4), 0, T.i32, AUX_SYS))
+                (row, c, bld(rxs, rix * i32(SIB) + c * i32(4), 0, T.i32, AUX_SYS))
             )
         for row, c, sv in ds:
-            lds_st(L, is0 + row * i32(I // 32) + c * i32(4), fx.Int32(sv))
+            lds_st(L, is0 + row * i32(SIB) + c * i32(4), fx.Int32(sv))
         wait_lgkm0()
         if lane == i32(0):
             u = L_CTL + (i32(C_G2U) + b * i32(4)) * i32(4)
@@ -939,31 +941,29 @@ def build_schedule(kc: KernelCtx) -> dict:
     def lb_import(L, tid, a, rows):
         ag_stage_free(L, tid % i32(64), a)
         cbar(L, tid)
-        u16 = I // 2 // 16
+        u16 = XIB // 16
         rx, rxs = xg_rs(a)
         nq = fx.max(rows * i32(u16), i32(1))
-        ns = fx.max(rows * i32(I // 128), i32(1))
+        ns = fx.max(rows * i32(SIB // 4), i32(1))
         dq, ds = [], []
         for k in range_constexpr(ceildiv(RG * u16, NT)):
             q = fx.min(tid + i32(k * NT), nq - i32(1))
             row = q // i32(u16)
             c = q - row * i32(u16)
             rix = lds_ld_i32(L, L_RIX + row * i32(4))
-            dq.append(
-                (row, c, bld(rx, rix * i32(I // 2) + c * i32(16), 0, V4I, AUX_SYS))
-            )
-        for k in range_constexpr(ceildiv(RG * (I // 128), NT)):
+            dq.append((row, c, bld(rx, rix * i32(XIB) + c * i32(16), 0, V4I, AUX_SYS)))
+        for k in range_constexpr(ceildiv(RG * (SIB // 4), NT)):
             q = fx.min(tid + i32(k * NT), ns - i32(1))
-            row = q // i32(I // 128)
-            c = q - row * i32(I // 128)
+            row = q // i32(SIB // 4)
+            c = q - row * i32(SIB // 4)
             rix = lds_ld_i32(L, L_RIX + row * i32(4))
             ds.append(
-                (row, c, bld(rxs, rix * i32(I // 32) + c * i32(4), 0, T.i32, AUX_SYS))
+                (row, c, bld(rxs, rix * i32(SIB) + c * i32(4), 0, T.i32, AUX_SYS))
             )
         for row, c, v in dq:
             lds_st(L, i32(L_INTER) + row * i32(SI_STRIDE) + c * i32(16), v, 16)
         for row, c, sv in ds:
-            lds_st(L, i32(L_INTERS) + row * i32(I // 32) + c * i32(4), fx.Int32(sv))
+            lds_st(L, i32(L_INTERS) + row * i32(SIB) + c * i32(4), fx.Int32(sv))
         cbar(L, tid)
 
     @flyc.jit
@@ -975,34 +975,53 @@ def build_schedule(kc: KernelCtx) -> dict:
 
     def xg_rs(a):
         rx = rsrc(a["xg"])
-        rxs = rsrc(fx.Int64(a["xg"]) + fx.Int64(a["ttot"] * i32(TOPK * (I // 2))))
+        rxs = rsrc(fx.Int64(a["xg"]) + fx.Int64(a["ttot"] * i32(TOPK * XIB)))
         return rx, rxs
 
-    @flyc.jit
     def xq_export(L, tid, a, i0, icnt, r0, rows):
-        u16 = icnt // i32(32)
+        """the block's columns [i0, i0 + icnt) of every row (per plane: hi, a16 lo) to xg
+        (XD: GEMM1 stored them, their stores done)"""
+        if const_expr(XD):
+            wait_vm(0)
+        else:
+            _xq_export(L, tid, a, i0, icnt, r0, rows)
+
+    @flyc.jit
+    def _xq_export(L, tid, a, i0, icnt, r0, rows):
+        u16 = icnt * i32(IPB // 128) // i32(16 * (I // 128))
         rx, rxs = xg_rs(a)
-        for q_ in range(tid, rows * u16, i32(NT)):
-            q = i32(q_)
-            row = q // u16
-            c = q - row * u16
-            rix = lds_ld_i32(L, L_RIX + (r0 + row) * i32(4))
-            v = lds_ld(L, i32(L_INTER) + row * i32(SI_STRIDE) + c * i32(16), V4I, 16)
-            bst(v, rx, rix * i32(I // 2) + i0 // i32(2) + c * i32(16), 0, AUX_SYS)
-        nsd = icnt // i32(128)
-        for q_ in range(tid, rows * nsd, i32(NT)):
-            q = i32(q_)
-            row = q // nsd
-            c = q - row * nsd
-            rix = lds_ld_i32(L, L_RIX + (r0 + row) * i32(4))
-            sv = lds_ld_i32(L, i32(L_INTERS) + row * i32(I // 32) + c * i32(4))
-            bst(sv, rxs, rix * i32(I // 32) + i0 // i32(32) + c * i32(4), 0, AUX_SYS)
-        if (icnt % i32(128)) != i32(0):  # (small-M half block: its 2 scales per row)
-            for row_ in range(tid, rows, i32(NT)):
-                row = i32(row_)
+        for pl in range_constexpr(XIB // IPB):
+            for q_ in range(tid, rows * u16, i32(NT)):
+                q = i32(q_)
+                row = q // u16
+                c = q - row * u16
                 rix = lds_ld_i32(L, L_RIX + (r0 + row) * i32(4))
-                sv = lds_ld(L, i32(L_INTERS) + row * i32(I // 32), T.i16, 2)
-                bst(sv, rxs, rix * i32(I // 32) + i0 // i32(32), 0, AUX_SYS)
+                v = lds_ld(
+                    L,
+                    i32(L_INTER) + row * i32(SI_STRIDE) + i32(pl * IPB) + c * i32(16),
+                    V4I,
+                    16,
+                )
+                doff = i0 * i32(IPB // 128) // i32(I // 128) + c * i32(16)
+                bst(v, rx, rix * i32(XIB) + i32(pl * IPB) + doff, 0, AUX_SYS)
+            nsd = icnt // i32(128)
+            so = pl * (I // 32)
+            for q_ in range(tid, rows * nsd, i32(NT)):
+                q = i32(q_)
+                row = q // nsd
+                c = q - row * nsd
+                rix = lds_ld_i32(L, L_RIX + (r0 + row) * i32(4))
+                sv = lds_ld_i32(L, i32(L_INTERS + so) + row * i32(SIB) + c * i32(4))
+                soff = rix * i32(SIB) + i32(so) + i0 // i32(32) + c * i32(4)
+                bst(sv, rxs, soff, 0, AUX_SYS)
+            if (icnt % i32(128)) != i32(
+                0
+            ):  # (small-M half block: its 2 scales per row)
+                for row_ in range(tid, rows, i32(NT)):
+                    row = i32(row_)
+                    rix = lds_ld_i32(L, L_RIX + (r0 + row) * i32(4))
+                    sv = lds_ld(L, i32(L_INTERS + so) + row * i32(SIB), T.i16, 2)
+                    bst(sv, rxs, rix * i32(SIB) + i32(so) + i0 // i32(32), 0, AUX_SYS)
         wait_vm(0)
 
     return locals()

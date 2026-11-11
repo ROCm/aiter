@@ -25,6 +25,7 @@ bytes per CTA even:
 from __future__ import annotations
 
 import math
+import types
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
@@ -43,6 +44,8 @@ from .common import (
     lds_st,
     lds_st_rel,
     rsrc,
+    spin0,
+    spin_lds_ge,
 )
 from .mega_moe_tp_config import (
     C_DYNP,
@@ -74,6 +77,8 @@ QC = 3
 C_SMK, C_SM2 = 66, 70
 # this CTA's split-K unit was its block's last piece
 C_SMLAST = 67
+# 1: sm_g2_runs stored this CTA's G2 runs
+C_SM2R = 74
 # the chunk-table rotation: the plan's chunk j is the table's (j + C_JSH) % chunks (_rot)
 C_JSH = 69
 
@@ -86,6 +91,7 @@ def build_smallm(kc: KernelCtx) -> dict:
     gather_routes_chunk, gemm1, gemm2 = kc.get("gather_routes_chunk gemm1 gemm2")
     lb_import, spin_sys_ge, unit_fields = kc.get("lb_import spin_sys_ge unit_fields")
     xq_export, _xcd_rank = kc.get("xq_export _xcd_rank")
+    RAW, raw_flags = kc.get("RAW raw_flags")
 
     KS1, MT, TMAX, _g1_out, nsk = kc.get("KS1 MT TMAX _g1_out nsk")
     (HB,) = kc.get("HB")
@@ -94,21 +100,25 @@ def build_smallm(kc: KernelCtx) -> dict:
     # split-K pieces (ascending): the K steps of a piece a multiple of the B interleave
     IL1 = nsk * KCS // math.gcd(nsk, KCS)
     SKS = [s for s in (2, 3, 4, 6, 12) if KS1 % s == 0 and (KS1 // s) % IL1 == 0]
+    # (a16: no half blocks, the LDS) one round of more than C / 2 blocks: the first C - r
+    # blocks in 2 K pieces on the first 2 (C - r) CTAs instead of halves (split-K partials)
+    KP = kc.a16 and not HB and 2 in SKS
     # split-K launches: G2 inter pieces per share (NKS = KS2 / QF k-steps a whole number of
     # GEMM2 iterations per share of GPC groups)
     QF = 1
     for q_ in (2, 3, 6):
         if KS2 % q_ == 0:
             n2 = KS2 // q_
-            s2 = _nsk2_for(n2, G2)
+            s2 = _nsk2_for(n2, G2, nsk)
             if GPC % (s2 * n2 // math.gcd(s2, n2) // n2) == 0:
                 QF = q_
                 break
     # the partial slots after the export area of xg (MegaMoeTPEngine.xg)
-    XG_PART = TMAX * TOPK * (I // 2 + I // 32 + 8)
+    XIB, SIB = kc.get("XIB SIB")
+    XG_PART = TMAX * TOPK * (XIB + SIB + 8)
 
     # a G2 share: GPC groups (of NW * 64 columns), a whole number of GEMM2 iterations
-    nsk2 = _nsk2_for(KS2, G2)
+    nsk2 = _nsk2_for(KS2, G2, nsk)
     assert GPC % (nsk2 * KS2 // math.gcd(nsk2, KS2) // KS2) == 0
     # the early-share cap per CTA without an extra block: G1 block bytes / G2 share bytes
     # (2 * 128 * H vs H / NCK * I weights)
@@ -129,61 +139,75 @@ def build_smallm(kc: KernelCtx) -> dict:
     def smf(a, b, bank):
         return ctrl_at(a, i32(CTRL_SMF) + (bank * i32(NCTA_MAX) + b) * i32(G1C_STRIDE))
 
+    def _plan_scalars(L, nun):
+        """the G1 layout scalars of this CTA (sm_units / sm_g2_runs)"""
+        C = i32(gpu.grid_dim.x)
+        x = _xcd_rank(C)
+        nb = nun * i32(KS2)
+        # split-K: few blocks (hot experts) run in sk K pieces each, one unit per CTA
+        # (from 4 pieces on: below, the partial sums cost more than the spread gains)
+        sk = i32(1)
+        for s_ in SKS:
+            sk = ((nb * i32(s_) <= C) & (nb * i32(4) <= C)).select(i32(s_), sk)
+        nu = nb * sk
+        q = nu // C
+        r = nu - q * C
+        # half blocks (HB): the last round's r blocks as 2 r 64-column halves (the K
+        # halves on the two wave pairs) on the last 2 r CTAs: the round ends after half
+        # a block (else these CTAs bound the G1 phase at a whole extra block); after a
+        # full round only while at least half the CTAs stay free for the early shares
+        hb = fx.Boolean(False)
+        if const_expr(HB):
+            hb = (
+                (sk == i32(1))
+                & (r > i32(0))
+                & (r * i32(2) <= C)
+                & ((q == i32(0)) | ((q < i32(QC)) & (r * i32(HBF) <= C)))
+            )
+        # partial halves (HB, one round of more than C / 2 blocks): the first
+        # C - r blocks as halves on the first 2 (C - r) CTAs, every CTA one unit; the
+        # chunks of the halved blocks are done after half a block ("early")
+        hp = fx.Boolean(False)
+        if const_expr(HB or KP):
+            hp = (sk == i32(1)) & (q == i32(0)) & (r * i32(2) > C) & (r < C)
+        sh2 = (C - r) * i32(2)
+        rr = hp.select(C - sh2, hb.select(r * i32(2), r))
+        # G1 layout: q >= QC: q contiguous blocks per CTA (few unit boundaries), the r
+        # remaining blocks (the last chunks) one each on the last r CTAs; else rounds
+        # (block u -> CTA u % C, the last round on the first r CTAs). Either way the
+        # chunks of the first q * C blocks are done after q blocks ("early").
+        cont = (q >= i32(QC)) & (sk == i32(1))
+        hi = (cont | hb | hp).select(x >= C - rr, x < r)
+        n1 = hp.select(i32(1), q + hi.select(i32(1), i32(0)))
+        b0 = x * q
+        j0 = b0 // i32(KS2)
+        nc = (q > i32(0)).select((b0 + q + i32(KS2 - 1)) // i32(KS2) - j0, i32(0))
+        n = cont.select(nc + hi.select(i32(1), i32(0)), n1)
+        return types.SimpleNamespace(**locals())
+
     @flyc.jit
     def sm_units(L, tid, a):
         """(after the chunk table, tid 0) this CTA's G1 inter blocks as unit records (chunk
-        entry, i0, icnt, chunk) and its G2 runs"""
+        entry, i0, icnt, chunk); its G2 runs come later (sm_g2_runs, off the G1 start)
+        """
         if tid == i32(0):
             nun = lds_ld_i32(L, L_CTL + C_NCH * 4)
             last = lds_ld_i32(L, L_DCH + fx.max(nun - i32(1), i32(0)) * i32(4))
             ce_l = last.shrui(i32(16)) & i32(0xFF)
-            lds_st(
-                L,
-                L_CTL + C_JSH * 4,
-                ((nun > i32(0)) & (ce_l > i32(1))).select(nun - ce_l, i32(0)),
+            jsh = ((nun > i32(0)) & (ce_l > i32(1))).select(nun - ce_l, i32(0))
+            lds_st(L, L_CTL + C_JSH * 4, jsh)
+            g = _plan_scalars(L, nun)
+            C, x, sk, q, r, hb, hp = g.C, g.x, g.sk, g.q, g.r, g.hb, g.hp
+            sh2, rr, cont, hi, b0, j0, nc, n = (
+                g.sh2,
+                g.rr,
+                g.cont,
+                g.hi,
+                g.b0,
+                g.j0,
+                g.nc,
+                g.n,
             )
-            C = i32(gpu.grid_dim.x)
-            x = _xcd_rank(C)
-            nb = nun * i32(KS2)
-            # split-K: few blocks (hot experts) run in sk K pieces each, one unit per CTA
-            # (from 4 pieces on: below, the partial sums cost more than the spread gains)
-            sk = i32(1)
-            for s_ in SKS:
-                sk = ((nb * i32(s_) <= C) & (nb * i32(4) <= C)).select(i32(s_), sk)
-            nu = nb * sk
-            q = nu // C
-            r = nu - q * C
-            # half blocks (HB): the last round's r blocks as 2 r 64-column halves (the K
-            # halves on the two wave pairs) on the last 2 r CTAs: the round ends after half
-            # a block (else these CTAs bound the G1 phase at a whole extra block); after a
-            # full round only while at least half the CTAs stay free for the early shares
-            hb = fx.Boolean(False)
-            if const_expr(HB):
-                hb = (
-                    (sk == i32(1))
-                    & (r > i32(0))
-                    & (r * i32(2) <= C)
-                    & ((q == i32(0)) | ((q < i32(QC)) & (r * i32(HBF) <= C)))
-                )
-            # partial halves (HB, one round of more than C / 2 blocks): the first
-            # C - r blocks as halves on the first 2 (C - r) CTAs, every CTA one unit; the
-            # chunks of the halved blocks are done after half a block ("early")
-            hp = fx.Boolean(False)
-            if const_expr(HB):
-                hp = (sk == i32(1)) & (q == i32(0)) & (r * i32(2) > C) & (r < C)
-            sh2 = (C - r) * i32(2)
-            rr = hp.select(C - sh2, hb.select(r * i32(2), r))
-            # G1 layout: q >= QC: q contiguous blocks per CTA (few unit boundaries), the r
-            # remaining blocks (the last chunks) one each on the last r CTAs; else rounds
-            # (block u -> CTA u % C, the last round on the first r CTAs). Either way the
-            # chunks of the first q * C blocks are done after q blocks ("early").
-            cont = (q >= i32(QC)) & (sk == i32(1))
-            hi = (cont | hb | hp).select(x >= C - rr, x < r)
-            n1 = hp.select(i32(1), q + hi.select(i32(1), i32(0)))
-            b0 = x * q
-            j0 = b0 // i32(KS2)
-            nc = (q > i32(0)).select((b0 + q + i32(KS2 - 1)) // i32(KS2) - j0, i32(0))
-            n = cont.select(nc + hi.select(i32(1), i32(0)), n1)
             for k_ in range(i32(0), fx.min(n, i32(UL_MAX)), i32(1)):
                 k = i32(k_)
                 xtra = k >= nc  # (cont) the remainder block
@@ -202,29 +226,45 @@ def build_smallm(kc: KernelCtx) -> dict:
                 lo_b = fx.max(b0, jc * i32(KS2))
                 hi_b = fx.min(b0 + q, (jc + i32(1)) * i32(KS2))
                 one = (cont == fx.Boolean(False)) | xtra
-                j = _rot(L, one.select(jr, jc))
+                j = one.select(jr, jc) + jsh
+                j = (j >= nun).select(j - nun, j)  # (_rot)
                 ul = L_CTL + (i32(C_UL) + k * i32(4)) * i32(4)
                 lds_st(L, ul, lds_ld_i32(L, L_DCH + j * i32(4)))
+                # (KP: the "half" units are K pieces of 2 of whole blocks)
+                hoff = ph.select((p % i32(2)) * i32(64), i32(0))
+                hcnt = ph.select(i32(64), one.select(i32(1), hi_b - lo_b) * i32(128))
+                pc = one.select(piece, i32(0))
+                skf = sk
+                if const_expr(KP):
+                    hoff = i32(0)
+                    hcnt = one.select(i32(1), hi_b - lo_b) * i32(128)
+                    pc = ph.select(p % i32(2), pc)
+                    skf = ph.select(i32(2), sk)
                 lds_st(
                     L,
                     ul + i32(4),
-                    one.select(bk, lo_b - jc * i32(KS2)) * i32(128)
-                    + ph.select((p % i32(2)) * i32(64), i32(0)),
+                    one.select(bk, lo_b - jc * i32(KS2)) * i32(128) + hoff,
                 )
-                lds_st(
-                    L,
-                    ul + i32(8),
-                    ph.select(i32(64), one.select(i32(1), hi_b - lo_b) * i32(128)),
-                )
+                lds_st(L, ul + i32(8), hcnt)
                 # (the A loader reads the K piece from here too)
-                lds_st(
-                    L,
-                    ul + i32(12),
-                    j | (one.select(piece, i32(0)) << i32(16)) | (sk << i32(24)),
-                )
-            # G2: early shares (the chunks done after q blocks of every CTA) on the CTAs
-            # without an extra block, up to D each; the rest even over all CTAs
-            # (split-K: the G2 shares split the inter dim too, QF pieces each)
+                lds_st(L, ul + i32(12), j | (pc << i32(16)) | (skf << i32(24)))
+            lds_st(L, L_CTL + C_UNIT * 4, i32(0))
+            lds_st(L, L_CTL + (C_UNIT + 1) * 4, fx.min(n, i32(UL_MAX)))
+            lds_st(L, L_CTL + C_SMK * 4, i32(-1))
+            lds_st_rel(L, L_CTL + C_PLAN * 4, i32(1))
+
+    @flyc.jit
+    def sm_g2_runs(L, tid, a):
+        """(a helper wave, after the plan) this CTA's G2 runs: early shares (the chunks done
+        after q blocks of every CTA) on the CTAs without an extra block, up to D each; the
+        rest even over all CTAs (split-K: the G2 shares split the inter dim too, QF pieces
+        each)"""
+        if (tid % i32(64)) == i32(0):
+            spin_lds_ge(L, L_CTL + C_PLAN * 4, i32(1))
+            nun = lds_ld_i32(L, L_CTL + C_NCH * 4)
+            g = _plan_scalars(L, nun)
+            C, x, sk, q, r, hb, hp = g.C, g.x, g.sk, g.q, g.r, g.hb, g.hp
+            rr, cont, hi = g.rr, g.cont, g.hi
             qg = (sk == i32(1)).select(i32(1), i32(QF))
             ng2 = nun * i32(NCK) * qg
             early = (sk == i32(1)).select((q * C) // i32(KS2) * i32(NCK), i32(0))
@@ -263,10 +303,7 @@ def build_smallm(kc: KernelCtx) -> dict:
             lds_st(L, L_CTL + (C_SM2 + 2) * 4, s2)
             lds_st(L, L_CTL + (C_SM2 + 3) * 4, t2)
             lds_st(L, L_CTL + C_DYNP * 4, qg)
-            lds_st(L, L_CTL + C_UNIT * 4, i32(0))
-            lds_st(L, L_CTL + (C_UNIT + 1) * 4, fx.min(n, i32(UL_MAX)))
-            lds_st(L, L_CTL + C_SMK * 4, i32(-1))
-            lds_st_rel(L, L_CTL + C_PLAN * 4, i32(1))
+            lds_st_rel(L, L_CTL + C_SM2R * 4, i32(1))
 
     def _chunk(ent):
         return ent & i32(0xFFFF), ent.shrui(i32(24)), ent.shrui(i32(16)) & i32(0xFF)
@@ -284,18 +321,18 @@ def build_smallm(kc: KernelCtx) -> dict:
         slot u; else act + MXFP4 to L_INTER"""
 
         @flyc.jit
-        def out(L, lane, w, a, res, grp, P, MTE):
+        def out(L, lane, w, a, res, grp, P, MTE, i0):
             if sk > i32(1):
                 rp = _part_rs(a)
                 for j in range_constexpr(len(res)):
                     bst(res[j], rp, _part_off(u, w, j, lane), 0, AUX_SYS)
             else:
-                _g1_out(L, lane, w, a, res, grp, P, MTE)
+                _g1_out(L, lane, w, a, res, grp, P, MTE, i0)
 
         return out
 
     @flyc.jit
-    def _part_finish(L, tid, a, u0, sk):
+    def _part_finish(L, tid, a, u0, sk, i0):
         """(the last K piece of a block) the sum of its sk partial slots u0.. -> act + MXFP4
         to L_INTER"""
         lane = tid % i32(64)
@@ -327,7 +364,7 @@ def build_smallm(kc: KernelCtx) -> dict:
                         acc[i] = fx.Vector(acc[i]) + fx.Vector(live.select(vs[i], zero))
                 part = yield acc
             res += list(part)
-        _g1_out(L, lane, w, a, res, i32(0), 1, MT)
+        _g1_out(L, lane, w, a, res, i32(0), 1, MT, i0)
 
     @flyc.jit
     def _sm_g1(L, tid, a, u, bank):
@@ -379,7 +416,7 @@ def build_smallm(kc: KernelCtx) -> dict:
                 lds_st(L, L_CTL + C_SMLAST * 4, last.select(i32(1), i32(0)))
             cbar(L, tid)
             if lds_ld_i32(L, L_CTL + C_SMLAST * 4) == i32(1):
-                _part_finish(L, tid, a, blk * sk, sk)
+                _part_finish(L, tid, a, blk * sk, sk, i0)
                 cbar(L, tid)
                 xq_export(L, tid, a, i0, icnt, i32(0), R)
                 cbar(L, tid)
@@ -450,6 +487,8 @@ def build_smallm(kc: KernelCtx) -> dict:
                 dup=ce > i32(1),
             )
         cbar(L, tid)
+        if const_expr(RAW):
+            raw_flags(L, tid, a, (qg == i32(1)).select(i32(0), piece), c0, c1)
 
     @flyc.jit
     def _sm_run(L, tid, a, s0, s1, bank, run):
@@ -475,6 +514,7 @@ def build_smallm(kc: KernelCtx) -> dict:
         ue = lds_ld_i32(L, L_CTL + (C_UNIT + 1) * 4)
         for u_ in range(i32(0), ue, i32(1)):
             _sm_g1(L, tid, a, i32(u_), bank)
+        spin0(L, tid % i32(64), L_CTL + C_SM2R * 4, i32(1))
         for run in range_constexpr(2):
             _sm_run(
                 L,

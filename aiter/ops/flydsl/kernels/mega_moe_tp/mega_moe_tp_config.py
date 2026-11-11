@@ -137,10 +137,11 @@ def mega_moe_tp_shape_supported(model_dim: int, inter_dim: int, tp: int) -> bool
     )
 
 
-def _nsk2_for(nks: int, g2: int) -> int:
-    if g2 % (NSK * nks // math.gcd(NSK, nks) // nks) == 0:
-        return NSK
-    return 3 if nks % 3 == 0 else 2
+def _nsk2_for(nks: int, g2: int, nsk: int = NSK) -> int:
+    """GEMM2's B ring depth (<= GEMM1's nsk: the ring is shared)"""
+    if g2 % (nsk * nks // math.gcd(nsk, nks) // nks) == 0:
+        return nsk
+    return min(nsk, 3 if nks % 3 == 0 else 2)
 
 
 def gemm2_group_step(H: int, I: int) -> int:
@@ -167,16 +168,24 @@ def mega_moe_tp_consts(
     lb: bool = False,
     hb: bool = False,
     rl: int = 0,
+    a16: bool = False,
+    nsk: int = NSK,
+    bpf: int = 0,
+    xd: bool = False,
 ) -> dict:
     """hb: the A chunk buffers hold two chunks (small-M half blocks: the K halves of a
     64-column GEMM1 block on the two wave pairs); rl: (small-M) the route list's entries
-    (every route by expert, rank order: the per-chunk gathers copy from it)"""
+    (every route by expert, rank order: the per-chunk gathers copy from it); a16 (with a8):
+    bf16 activations as two MXFP8 terms, hi + lo (each A chunk row: hi, then lo; each k-step
+    two MFMAs); xd: (small-M) GEMM1 stores its intermediate straight to xg, the GEMM2 one
+    (imported) then in the A buffers (unused past GEMM1), the AG staging its own"""
+    APL = 2 if a16 else 1  # activation planes
     RG = MT * 16
     KS1 = H // 128
     KS2 = I // 128
     G2 = H // 64 // NW
     NSC_BLK = ceildiv(RG, 64)
-    acb = KCS * (128 if a8 else 64)
+    acb = KCS * (128 if a8 else 64) * APL
     NA_ROWOPS = RG * acb // 1024
     GPC = gemm2_chunk_groups(H, I)
     c = {
@@ -188,12 +197,16 @@ def mega_moe_tp_consts(
         "CH1": ceildiv(H // 32, 8),
         "CH2": ceildiv(I // 32, 8),
         "ACB": acb,
-        "XB": H if a8 else H // 2,
+        "XB": (H if a8 else H // 2) * APL,
+        # the activation scale bytes per row (e8m0 per 32, per plane)
+        "XSB": H // 32 * APL,
         # row pad 16: every intermediate row 16 B aligned for the 128-bit LDS ops
-        "SI_STRIDE": (I if a8 else I // 2) + 16,
+        "SI_STRIDE": (I if a8 else I // 2) * APL + 16,
+        # the intermediate's scale bytes per row (per plane: hi, then lo)
+        "SIB": I // 32 * APL,
         "NA_ROWOPS": NA_ROWOPS,
         "NSC_BLK": NSC_BLK,
-        "NA_L": NA_ROWOPS + NSC_BLK * KCS,
+        "NA_L": NA_ROWOPS + NSC_BLK * KCS * APL,
         "GPC": GPC,
         "NCK": G2 // GPC,
         "CW": GPC * NW * 64,
@@ -201,7 +214,7 @@ def mega_moe_tp_consts(
         "NBW": ceildiv(dyn_e, 32),
         # A chunk buffer strides (rows / scales)
         "ABS": RG * acb * (2 if hb else 1),
-        "ASS": KCS * NSC_BLK * 64 * 4 * (2 if hb else 1),
+        "ASS": KCS * NSC_BLK * 64 * 4 * (2 if hb else 1) * APL,
     }
     off = 0
 
@@ -211,7 +224,7 @@ def mega_moe_tp_consts(
         start, off = off, off + n
         return start
 
-    c["L_RING"] = take(NW * NSK * SLOT)
+    c["L_RING"] = take(NW * nsk * SLOT)
     c["L_A"] = take(nab * c["ABS"])
     c["L_AS"] = take(nab * c["ASS"])
     c["L_B1"] = c["L_A"]
@@ -219,10 +232,30 @@ def mega_moe_tp_consts(
     c["B1_FITS"] = (
         c["L_B1S"] + RG * (I // 32) <= c["L_AS"] + nab * KCS * NSC_BLK * 64 * 4
     )
-    c["L_INTER"] = take(
-        max(RG * c["SI_STRIDE"], agr * (c["XB"] + H // 32) - RG * (I // 32))
-    )
-    c["L_INTERS"] = take(RG * (I // 32))
+    # (xd) the AG staging rows (data, then scales) from the A buffers' end, row 0 last
+    c["AGS_RS"] = ceildiv(c["XB"] + c["XSB"], 16) * 16
+    c["AGS_OV"] = False
+    if xd:
+        # (the AG staging, live at the start only: the last A buffers, their first loads
+        # after it is free)
+        c["L_INTER"] = c["L_A"]
+        c["L_INTERS"] = c["L_A"] + ceildiv(RG * c["SI_STRIDE"], 16) * 16
+        assert c["L_INTERS"] + RG * c["SIB"] <= c["L_AS"] + nab * c["ASS"]
+        ags = agr * c["AGS_RS"]
+        c["AGS_OV"] = ags <= nab * c["ABS"]
+        if c["AGS_OV"]:
+            c["L_AGS"] = c["L_A"] + nab * c["ABS"] - ags
+        else:
+            c["L_AGS"] = take(ags)
+    else:
+        inter_b = (
+            ceildiv(
+                max(RG * c["SI_STRIDE"], agr * (c["XB"] + c["XSB"]) - RG * c["SIB"]), 16
+            )
+            * 16
+        )
+        c["L_INTER"] = c["L_AGS"] = take(inter_b)
+        c["L_INTERS"] = take(RG * c["SIB"])
     nrix = 256 if lb else min(TMAX, DYN_MAX)
     c["L_RIX"] = take(nrix * 4)
     c["L_WT"] = take(nrix * 4)
@@ -235,10 +268,11 @@ def mega_moe_tp_consts(
     c["L_ROFF"] = take(dyn_e * 4) if rl else 0
     c["L_RLI"] = take(rl * 4) if rl else 0
     c["L_RLW"] = take(rl * 4) if rl else 0
+    c["L_BPF"] = take(NW * 256) if bpf else 0
     c["LDS_BYTES"] = ceildiv(off, 128) * 128
     assert H // 256 <= NCHA_MAX
-    assert KS1 % NSK == 0 and NSK % KCS == 0
-    assert (NSK - 1) * OPS <= 63 and c["NA_L"] * (max(ALOAD_DEPTH, nab) - 1) <= 63
+    assert KS1 % nsk == 0 and nsk % KCS == 0
+    assert (nsk - 1) * OPS <= 63 and c["NA_L"] * (max(ALOAD_DEPTH, nab) - 1) <= 63
     assert not lb or RG <= 256
     assert c["NCK"] <= NCK_MAX and c["NCK"] <= 31
     return c
@@ -314,13 +348,22 @@ def kernel_config(
     lbp: int = 0,
     sm: bool = False,
     ar2: bool = False,
+    a16: bool = False,
+    nsk: int = 0,
+    xd: bool = False,
 ):
     """The derived compile-time values of one compile_mega_moe_tp instance."""
+    a8 = a8 or a16
+    APL = 2 if a16 else 1
     if swiglu_limit is None:
         swiglu_limit = 7.0 if act == "swiglu" else float("inf")
     TN = tn in (1, 2)
     assert not TN or not ar
-    nsk = NSK
+    nsk = nsk or NSK  # the B ring's k-steps per wave
+    # (small-M a16) GEMM1's intermediate straight to xg (mega_moe_tp_consts xd)
+    XD = bool(sm and a16 and xd)
+    # (experiment) GEMM1 B prefetch distance (k-steps, into L2)
+    BPF = int(os.environ.get("AITER_MEGAMOE_TP_BPF", "0")) if sm else 0
     # small-M half blocks (smallm.py): 64-column GEMM1 blocks, the K halves on the two wave
     # pairs (both A chunks in one buffer), when the LDS takes the second A chunk
     HB = (
@@ -334,22 +377,28 @@ def kernel_config(
     # aiter #7095's route histograms): the chunk gathers copy instead of scanning
     RL = min(TMAX, DYN_MAX) * TOPK if sm and not lb else 0
     if HB:
-        c_ = mega_moe_tp_consts(H, I, MT, TMAX, agr, E, nab, nch, a8, lb, True, RL)
+        c_ = mega_moe_tp_consts(
+            H, I, MT, TMAX, agr, E, nab, nch, a8, lb, True, RL, a16, nsk, BPF, XD
+        )
         HB = c_["LDS_BYTES"] <= 160 * 1024 and 2 * c_["NA_L"] * (ALOAD_DEPTH - 1) <= 63
-    c = mega_moe_tp_consts(H, I, MT, TMAX, agr, E, nab, nch, a8, lb, HB, RL)
+    c = mega_moe_tp_consts(
+        H, I, MT, TMAX, agr, E, nab, nch, a8, lb, HB, RL, a16, nsk, BPF, XD
+    )
     ABS, ASS = c["ABS"], c["ASS"]
     RG, KS1, NCH, KS2, G2 = c["RG"], c["KS1"], c["NCH"], c["KS2"], c["G2"]
     CH1, CH2, SI_STRIDE = c["CH1"], c["CH2"], c["SI_STRIDE"]
-    ACB, XB = c["ACB"], c["XB"]
+    ACB, XB, XSB = c["ACB"], c["XB"], c["XSB"]
     NA_ROWOPS, NSC_BLK, NA_L = c["NA_ROWOPS"], c["NSC_BLK"], c["NA_L"]
     GPC, NCK, CW, NAB, NBW = c["GPC"], c["NCK"], c["CW"], c["NAB"], c["NBW"]
     L_RING, L_A, L_AS, L_DYN = c["L_RING"], c["L_A"], c["L_AS"], c["L_DYN"]
     L_INTER, L_INTERS, L_RIX, L_WT = c["L_INTER"], c["L_INTERS"], c["L_RIX"], c["L_WT"]
+    L_AGS, AGS_RS, AGS_OV = c["L_AGS"], c["AGS_RS"], c["AGS_OV"]
     L_CTL, LDS_BYTES = c["L_CTL"], c["LDS_BYTES"]
     L_B1, L_B1S = c["L_B1"], c["L_B1S"]
     L_DCNT, L_DCH = c["L_DCNT"], c["L_DCH"]
     L_EOFF, L_DPRE = c["L_EOFF"], c["L_DPRE"]
     L_ROFF, L_RLI, L_RLW = c["L_ROFF"], c["L_RLI"], c["L_RLW"]
+    L_BPF = c["L_BPF"]
     L_WSUM = L_DCH + nch * 4
     assert npp >= 1 and nsk % (npp * KCS) == 0 and (KS1 * npp) % nsk == 0
     assert 3 <= NAB <= 4
@@ -399,7 +448,7 @@ def kernel_config(
         and H2 < UL_MAX
     )
     LBMIX_DIV = 4
-    XLPR = (256 if a8 else 128) // 16
+    XLPR = (256 if a8 else 128) * APL // 16
     assert agr <= 64 // XLPR
     AUX_RT = AUX_SYS if lb else AUX_SC1
     ADEPTH = min(ALOAD_DEPTH, NAB - 1) if lb and NAB > 3 else ALOAD_DEPTH
@@ -420,7 +469,7 @@ def kernel_config(
         + ("_llr" if DLL else "")
         + ("_cb16" if comm_bf16 else "")
         + ("_ag8" if AG8 else "")
-        + ("_a8" if a8 else "")
+        + ("_a16" if a16 else "_a8" if a8 else "")
         + ("_lb" if lb else "")
         + (f"_q{LBQ}" if LBQ > 1 else "")
         + (("_cg" + "x".join(str(w) for w in CGW)) if _cg else "")
@@ -439,10 +488,21 @@ def kernel_config(
         + (f"_sm{_SM_KEY}" if sm else "")
         + ("_hb" if HB else "")
         + ("_ar2" if ar and ar2 else "")
+        + (f"_nsk{nsk}" if nsk != NSK else "")
+        + (f"_bpf{BPF}" if BPF else "")
+        + ("_xd" if XD else "")
     )
     # small-M schedule (smallm.py): needs the dynamic schedule's LL route rows
     SM = bool(sm)
-    assert not SM or (DLL and not lb and not a8)
+    assert not SM or (DLL and not lb)
+    # (small-M a16) the route rows bf16 (not two-term LL packets: half the bytes), each
+    # (piece, route, column group) then an epoch flag (the lo plane's space of routes)
+    RAW = bool(SM and a16 and os.environ.get("AITER_MEGAMOE_TP_RAW", "1") == "1")
+    # the exported GEMM1 intermediate's bytes per route row (xg)
+    # (per plane: IPB)
+    IPB = I if a8 else I // 2
+    XIB = IPB * APL
+    SIB = c["SIB"]
     const_expr = fx.const_expr
     layout_tag = f"{CTRL_INTS}/{FLAG_INTS}/{DEADLINE}/{NCTA_MAX}"
     return KernelCtx(**locals())

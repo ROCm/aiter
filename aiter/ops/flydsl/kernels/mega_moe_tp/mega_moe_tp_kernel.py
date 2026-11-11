@@ -147,6 +147,9 @@ def compile_mega_moe_tp(
     lbp: int = 0,
     sm: bool = False,
     ar2: bool = False,
+    a16: bool = False,
+    nsk: int = 0,
+    xd: bool = False,
 ):
     """Build the launcher of one (shape, variant) instance; LaunchCfg (host) picks them.
 
@@ -160,7 +163,8 @@ def compile_mega_moe_tp(
     ll_rs: LL ReduceScatter packets; ll_route: LL route rows too.
     comm_bf16: bf16 (not MXFP8) ReduceScatter / all-reduce partials (no LL).
     ag8: all-reduce whose second hop carries MXFP8 rows (else bf16).
-    a8: activations as MXFP8 (E4M3 + E8M0 per 32) instead of MXFP4.
+    a8: activations as MXFP8 (E4M3 + E8M0 per 32) instead of MXFP4. a16: bf16 activations as
+        two MXFP8 terms (hi + residual lo; the bf16 accuracy at fp8 x fp4 MFMA rate).
     lb: (rch = 16 * MT) large batches in two phases without partial sums:
         GEMM1 units (row chunk x inter piece) export their quantized intermediate; GEMM2
         units (column group x row chunk) take the full inter dim and are claimed by
@@ -406,6 +410,8 @@ def compile_mega_moe_tp(
                 if const_expr(DLL):
                     if tid < i32(NT + 192):
                         zero_masked(L, tid % i32(64), a, 0, 1)
+                        if const_expr(kc.SM):
+                            kc.sm_g2_runs(L, tid, a)
                         push_dll(L, tid, a, 2)
                     else:
                         push_dll(L, tid, a, 3)

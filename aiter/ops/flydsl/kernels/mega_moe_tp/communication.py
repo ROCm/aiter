@@ -131,6 +131,11 @@ def build_communication(kc: KernelCtx) -> dict:
     RG, SCAN_G, SCAN_IT, SI_STRIDE = kc.get("RG SCAN_G SCAN_IT SI_STRIDE")
     TMAX, TN, TOPK, TPC, VPL, XB, XLPR = kc.get("TMAX TN TOPK TPC VPL XB XLPR")
     a8, act, agr, ar, comm_bf16 = kc.get("a8 act agr ar comm_bf16")
+    a16, APL, XSB, SIB = kc.get("a16 APL XSB SIB")
+    XD, L_AGS, XIB, IPB, AGS_RS = kc.get("XD L_AGS XIB IPB AGS_RS")
+    RAW, G2 = kc.get("RAW G2")
+    # (RAW) the route rows' column groups (GEMM2 iterations, NW x 64 columns) per RS chunk
+    RGW = NW * 64
     const_expr, lb, ll_rs, route_fp8 = kc.get("const_expr lb ll_rs route_fp8")
     situ_beta, situ_linear_beta = kc.get("situ_beta situ_linear_beta")
     swiglu_limit = kc.swiglu_limit
@@ -168,6 +173,19 @@ def build_communication(kc: KernelCtx) -> dict:
     def ll_vals(q):
         sc = e8_scale(q[3])
         return fp8x4_unpack(fx.Int32(q[0]), sc) + fp8x4_unpack(fx.Int32(q[2]), sc)
+
+    def ll_vals2(pk, i, n):
+        """packet i's 8 values; a16: + its lo term's (packet n + i)"""
+        v = ll_vals(pk[i])
+        if const_expr(a16):
+            lo = ll_vals(pk[n + i])
+            v = [v[j] + lo[j] for j in range(8)]
+        return v
+
+    def part_lo(a):
+        """(a16) the recv region's lo plane offset (its hi plane's bytes)"""
+        rows = a["mmax"] * a["tp"] if ar else a["mmax"]
+        return a["tp"] * rows * i32(H * 2)
 
     def ll_pending(a, lane, pkts):
         bad = i32(0)
@@ -440,7 +458,9 @@ def build_communication(kc: KernelCtx) -> dict:
             base = i32(0) if p == 0 else i32(p - 1) * rb
             for q_ in range(lane, i32(H // 8), i32(64)):
                 q = i32(q_)
-                if const_expr(DLL):
+                if const_expr(RAW):
+                    bst(z, rs, base + (ridx * i32(H) + q * i32(8)) * i32(2), 0, AUX_SYS)
+                elif const_expr(DLL):
                     v = ll_pkt(a, i32(0), i32(0), i32(0))
                     bst(v, rs, base + (ridx * i32(H) + q * i32(8)) * i32(2), 0, AUX_SC1)
                 elif const_expr(route_fp8):
@@ -451,6 +471,43 @@ def build_communication(kc: KernelCtx) -> dict:
                         bst(z, rs, base + soff + q * i32(16), 0, AUX_SC1)
                 else:
                     bst(z, rs, base + (ridx * i32(H) + q * i32(8)) * i32(2), 0, AUX_SC1)
+
+        if const_expr(RAW):  # (then every piece's column group flags)
+            wait_vm(0)
+            rf = _raw_rs(a)
+            for q_ in range(lane, i32(NPC * G2), i32(64)):
+                q = i32(q_)
+                p = q // i32(G2)
+                bst(a["epoch"], rf, _raw_flag(a, p, ridx, q - p * i32(G2)), 0, AUX_SYS)
+
+    def _raw_rs(a):
+        """(RAW) the routes buffer: bf16 rows, then (the lo plane's space) the flags"""
+        return rsrc(a["routes"], route_region_bytes(a["ttot"]) * i32(2))
+
+    def _raw_flag(a, p, ridx, g):
+        """(RAW) the flag of piece p's route row ridx, column group g"""
+        n = a["ttot"] * i32(TOPK)
+        return route_region_bytes(a["ttot"]) + ((p * n + ridx) * i32(G2) + g) * i32(4)
+
+    @flyc.jit
+    def raw_flags(L, tid, a, pidx, g0, g1):
+        """(RAW, after a GEMM2 call over column groups [g0, g1) of the gathered rows and a
+        compute barrier) the rows' flags: the rows' system-scope stores are acknowledged
+        visible (each wave's vmcnt(0)), no L2 write-back (a release fence: 7-13 us more)
+        """
+        if tid < i32(64):
+            rows = fx.min(lds_ld_i32(L, L_CTL + C_CNT * 4), i32(TMAX))
+            ng = g1 - g0
+            _raw_flags_w(L, tid, a, pidx, g0, ng, rows)
+
+    @flyc.jit
+    def _raw_flags_w(L, tid, a, pidx, g0, ng, rows):
+        rf = _raw_rs(a)
+        for q_ in range(tid, rows * ng, i32(64)):
+            q = i32(q_)
+            row = q // ng
+            ridx = lds_ld_i32(L, L_RIX + row * i32(4))
+            bst(a["epoch"], rf, _raw_flag(a, pidx, ridx, g0 + q - row * ng), 0, AUX_SYS)
 
     @flyc.jit
     def _wave_claim(L, tid, n):
@@ -467,10 +524,32 @@ def build_communication(kc: KernelCtx) -> dict:
                 lds_st(L, L_RIX + slot * i32(4), idx)
                 lds_st(L, L_WT + slot * i32(4), wv)
 
-    def act_quant_store(L, lane, w, accg, accu, nb, mte=None):
+    def _xd_dst(L, a, row, i0):
+        """(XD) the intermediate row's xg data / scale resources and its offsets (rows past
+        the unit's out of range), i0 the unit's first column"""
+        n = a["ttot"] * i32(TOPK)
+        rx = rsrc(a["xg"], n * i32(XIB))
+        rxs = rsrc(fx.Int64(a["xg"]) + fx.Int64(n * i32(XIB)), n * i32(SIB))
+        ok = row < fx.min(lds_ld_i32(L, L_CTL + C_CNT * 4), i32(TMAX))
+        rix = lds_ld_i32(L, L_RIX + ok.select(row, i32(0)) * i32(4))
+        doff = ok.select(rix * i32(XIB) + i0, n * i32(XIB))
+        soff = ok.select(rix * i32(SIB) + i0 // i32(32), n * i32(SIB))
+        return rx, rxs, doff, soff
+
+    def _inter_st(L, xd, row, col, pk, pl=0):
+        """an MXFP8 word of the intermediate (plane pl) to L_INTER, XD: to xg"""
+        if const_expr(XD):
+            rx, _, doff, _ = xd
+            bst(pk, rx, doff + i32(pl * IPB) + col, 0, AUX_SYS)
+        else:
+            lds_st(L, L_INTER + row * i32(SI_STRIDE) + i32(pl * I) + col, pk, align=4)
+
+    def act_quant_store(L, lane, w, accg, accu, nb, mte=None, i0=None, a=None):
+        """i0, a: (XD) the unit's first column, the kernel args"""
         q4 = lane // i32(16)
         for m in range_constexpr(MT if mte is None else mte):
             row = i32(m * 16) + lane % i32(16)
+            xd = _xd_dst(L, a, row, i0) if const_expr(XD) else None
             gs, us = [], []
             for t in range_constexpr(2):
                 ga, ua = fx.Vector(accg[m * 2 + t]), fx.Vector(accu[m * 2 + t])
@@ -484,11 +563,13 @@ def build_communication(kc: KernelCtx) -> dict:
             am = am.maximumf(am.shuffle_xor(i32(16), i32(64)))
             am = am.maximumf(am.shuffle_xor(i32(32), i32(64)))
             e8, qs = _e8m0_from_amax(am, max_norm=448.0 if a8 else 6.0)
+            his = []
             for t in range_constexpr(2):
                 col = nb * i32(128) + w * i32(32) + i32(t * 16) + q4 * i32(4)
                 if const_expr(a8):
                     pk = fp8x4_pack(xs[t * 4 : t * 4 + 4], qs)
-                    lds_st(L, L_INTER + row * i32(SI_STRIDE) + col, pk, align=4)
+                    his.append(pk)
+                    _inter_st(L, xd, row, col, pk)
                 else:
                     pk = fp4_pack(xs[t * 4 : t * 4 + 4], qs)
                     lds_st(
@@ -497,13 +578,37 @@ def build_communication(kc: KernelCtx) -> dict:
                         fx.Int16(pk & i32(0xFFFF)),
                         align=2,
                     )
-            _q0_store(L, q4, row, nb, w, e8)
+            _q0_st(L, q4, row, nb, w, e8, 0, xd)
+            if const_expr(a16):
+                # the residual's own MXFP8 term (lo plane: + I bytes, scales + I / 32)
+                fh = fp8x4_unpack(his[0], qs) + fp8x4_unpack(his[1], qs)
+                res = [xs[i] - fh[i] for i in range(8)]
+                am = amax(res)
+                am = am.maximumf(am.shuffle_xor(i32(16), i32(64)))
+                am = am.maximumf(am.shuffle_xor(i32(32), i32(64)))
+                e8l, qsl = _e8m0_from_amax(am, max_norm=448.0)
+                for t in range_constexpr(2):
+                    col = nb * i32(128) + w * i32(32) + i32(t * 16) + q4 * i32(4)
+                    pk = fp8x4_pack(res[t * 4 : t * 4 + 4], qsl)
+                    _inter_st(L, xd, row, col, pk, 1)
+                _q0_st(L, q4, row, nb, w, e8l, I // 32, xd)
+
+    def _q0_st(L, q4, row, nb, w, e8, po, xd):
+        if const_expr(XD):  # (lane group 0's scale byte; the others out of range)
+            _, rxs, _, soff = xd
+            off = soff + i32(po) + nb * i32(4) + w
+            bst(fx.Int8(e8), rxs, (q4 == i32(0)).select(off, i32(1 << 30)), 0, AUX_SYS)
+        else:
+            _q0_store(L, q4, row, nb, w, e8, po)
 
     @flyc.jit
-    def _q0_store(L, q4, row, nb, w, e8):
+    def _q0_store(L, q4, row, nb, w, e8, po=0):
         if q4 == i32(0):
             lds_st(
-                L, L_INTERS + row * i32(I // 32) + nb * i32(4) + w, fx.Int8(e8), align=1
+                L,
+                L_INTERS + row * i32(SIB) + i32(po) + nb * i32(4) + w,
+                fx.Int8(e8),
+                align=1,
             )
 
     def claim_addr(a, bank_off):
@@ -540,7 +645,7 @@ def build_communication(kc: KernelCtx) -> dict:
     @flyc.jit
     def _push_store(a, r_dst, prow, c0, v, acc, ok):
         col = c0 + v * i32(8)
-        if const_expr(comm_bf16):
+        if const_expr(comm_bf16 or RAW):  # (RAW: bf16, then the item's flag: _raw_part)
             if ok:
                 bst(pack_bf16x8(acc), r_dst, (prow * i32(H) + col) * i32(2), 0, AUX_SYS)
         else:
@@ -551,8 +656,16 @@ def build_communication(kc: KernelCtx) -> dict:
         d0, d1, e8i = mxfp8x8(acc)
         if const_expr(ll_rs):
             pkt = ll_pkt(a, d0, d1, e8i)
+            if const_expr(a16):  # (the residual's own MXFP8 term, the lo plane)
+                sc = e8_scale(e8i)
+                deq = fp8x4_unpack(d0, sc) + fp8x4_unpack(d1, sc)
+                l0, l1, e8l = mxfp8x8([acc[i] - deq[i] for i in range(8)])
+                pkl = ll_pkt(a, l0, l1, e8l)
             if ok:
                 bst(pkt, r_dst, (prow * i32(H) + col) * i32(2), 0, AUX_SYS)
+                if const_expr(a16):
+                    off = (prow * i32(H) + col) * i32(2) + part_lo(a)
+                    bst(pkl, r_dst, off, 0, AUX_SYS)
         else:
             doff, soff = part_offs(a, prow, col)
             sc = scales4(e8i)
@@ -605,6 +718,11 @@ def build_communication(kc: KernelCtx) -> dict:
             pc = fx.min(i32(p), a["tp"] - i32(1))
             off = ((pc * rstride + row) * i32(H) + c0 + vc * i32(8)) * i32(2)
             out.append(fx.Vector(bld(r_recv, off, 0, V4I, AUX_SYS)))
+        if const_expr(a16):  # (the lo packets after the hi ones)
+            for p in range_constexpr(MAX_TP):
+                pc = fx.min(i32(p), a["tp"] - i32(1))
+                off = ((pc * rstride + row) * i32(H) + c0 + vc * i32(8)) * i32(2)
+                out.append(fx.Vector(bld(r_recv, off + part_lo(a), 0, V4I, AUX_SYS)))
         return out
 
     @flyc.jit
@@ -653,8 +771,16 @@ def build_communication(kc: KernelCtx) -> dict:
     @flyc.jit
     def _final_ll(tid, a, r_recv, row, c0, v, vc):
         lane = tid % i32(64)
+        if const_expr(RAW):
+            _y_store(a, row, c0, v, _raw_recv(a, lane, r_recv, row, a["mmax"], c0, vc))
+        else:
+            _final_ll_pkts(tid, a, r_recv, row, c0, v, vc)
+
+    @flyc.jit
+    def _final_ll_pkts(tid, a, r_recv, row, c0, v, vc):
+        lane = tid % i32(64)
         pk = recv_pkts(a, r_recv, row, a["mmax"], c0, vc)
-        live = [(i32(p) < a["tp"]) & (v < i32(CW // 8)) for p in range(MAX_TP)]
+        live = [(i32(p) < a["tp"]) & (v < i32(CW // 8)) for p in range(MAX_TP)] * APL
         pend = ll_pending(a, lane, zip(pk, live))
         t0 = now()
         while (pend != i32(0)) & alive(t0):
@@ -664,7 +790,7 @@ def build_communication(kc: KernelCtx) -> dict:
         _report_if(a, (pend != i32(0)) & (lane == i32(0)), ERR_COMM)
         acc = [fx.Float32(0.0)] * 8
         for p in range_constexpr(MAX_TP):
-            acc = sum_live(acc, ll_vals(pk[p]), i32(p) < a["tp"])
+            acc = sum_live(acc, ll_vals2(pk, p, MAX_TP), i32(p) < a["tp"])
         _y_store(a, row, c0, v, acc)
 
     @flyc.jit
@@ -1047,9 +1173,23 @@ def build_communication(kc: KernelCtx) -> dict:
 
     AG_SROW = XB
     AG_SCB = agr * AG_SROW
-    assert AG_SCB + agr * (H // 32) <= L_INTERS - L_INTER + RG * (I // 32)
+    assert XD or AG_SCB + agr * XSB <= L_INTERS - L_INTER + RG * SIB
+    # activation scale bytes per AG chunk (8 groups of 32, per plane)
+    SCQ = 8 * APL
     NCHA = H // 256
     AG_WIN = max(1, 64 // TPC)
+
+    def _ags_d(r):
+        """AG staging row r's data (XD: rows from the region's end, row 0 last)"""
+        if const_expr(XD):
+            return L_AGS + (i32(agr - 1) - r) * i32(AGS_RS)
+        return L_AGS + r * i32(AG_SROW)
+
+    def _ags_s(r):
+        """AG staging row r's scales"""
+        if const_expr(XD):
+            return _ags_d(r) + i32(XB)
+        return L_AGS + i32(AG_SCB) + r * i32(XSB)
 
     def ag_split(a):
         m = fx.max(a["m"], i32(1))
@@ -1105,15 +1245,40 @@ def build_communication(kc: KernelCtx) -> dict:
                 words = [fp8x4_pack(f[dw * 4 : dw * 4 + 4], qs) for dw in range(8)]
             else:
                 words = [fp4_pack(f[dw * 8 : dw * 8 + 8], qs) for dw in range(4)]
-            lds_st(
-                L,
-                L_INTER + r * i32(AG_SROW) + g * i32(4 * len(words)),
-                fx.Vector.from_elements(words, fx.Int32),
-                16,
-            )
-            lds_st(
-                L, L_INTER + i32(AG_SCB) + r * i32(H // 32) + g, fx.Int8(e8), align=1
-            )
+            if const_expr(a16):
+                # hi + lo: the residual's own MXFP8 term; chunk c of 8 groups: hi (256 B),
+                # lo (256 B); its scales: hi (8), lo (8)
+                c, gi = g // i32(8), g % i32(8)
+
+                def res4(dw, words=words, qs=qs, f=f):  # (per 4: never all live)
+                    h4 = fp8x4_unpack(words[dw], qs)
+                    return [f[dw * 4 + i] - h4[i] for i in range(4)]
+
+                am = None
+                for dw in range_constexpr(8):
+                    a4 = amax(res4(dw))
+                    am = a4 if am is None else am.maximumf(a4)
+                e8l, qsl = _e8m0_from_amax(am, max_norm=448.0)
+                lw = [fp8x4_pack(res4(dw), qsl) for dw in range(8)]
+                base = _ags_d(r) + c * i32(512) + gi * i32(32)
+                sb = _ags_s(r) + c * i32(16) + gi
+                for pl, ww, ee in ((0, words, e8), (1, lw, e8l)):
+                    for h in range_constexpr(2):
+                        lds_st(
+                            L,
+                            base + i32(pl * 256 + h * 16),
+                            fx.Vector.from_elements(ww[h * 4 : h * 4 + 4], fx.Int32),
+                            16,
+                        )
+                    lds_st(L, sb + i32(pl * 8), fx.Int8(ee), align=1)
+            else:
+                lds_st(
+                    L,
+                    _ags_d(r) + g * i32(4 * len(words)),
+                    fx.Vector.from_elements(words, fx.Int32),
+                    16,
+                )
+                lds_st(L, _ags_s(r) + g, fx.Int8(e8), align=1)
 
     @flyc.jit
     def ag_send(L, lane, a):
@@ -1133,7 +1298,7 @@ def build_communication(kc: KernelCtx) -> dict:
         i = row0 + fx.min(r, fx.max(nrows - i32(1), i32(0))) * stride
         gslot = rank * a["m"] + i
         x_bytes = a["ttot"] * i32(XB)
-        xs_bytes = a["ttot"] * i32(H // 32)
+        xs_bytes = a["ttot"] * i32(XSB)
         rx = [peer_rs(a, p, "off_x", x_bytes) for p in range(TPC)]
         rs = [peer_rs(a, p, "off_xs", xs_bytes) for p in range(TPC)]
         args = (L, lane, a, r, j, rok, gslot, rx, rs, x_bytes, xs_bytes, qb, qs, cnt)
@@ -1190,10 +1355,15 @@ def build_communication(kc: KernelCtx) -> dict:
     def ag_chunk(L, lane, a, q, r, j, rok, gslot, rx, rs, x_bytes, xs_bytes):
         rr = fx.min(r, i32(agr - 1))
         cb = q * i32(XLPR * 16) + j * i32(16)
-        dv = lds_ld(L, L_INTER + rr * i32(AG_SROW) + cb, V4I, 16)
-        sv = lds_ld(L, L_INTER + i32(AG_SCB) + rr * i32(H // 32) + q * i32(8), V2I, 8)
+        dv = lds_ld(L, _ags_d(rr) + cb, V4I, 16)
+        sv = lds_ld(
+            L,
+            _ags_s(rr) + q * i32(SCQ),
+            V4I if a16 else V2I,
+            SCQ,
+        )
         doff = rok.select(gslot * i32(XB) + cb, x_bytes)
-        soff = (rok & (j == i32(0))).select(gslot * i32(H // 32) + q * i32(8), xs_bytes)
+        soff = (rok & (j == i32(0))).select(gslot * i32(XSB) + q * i32(SCQ), xs_bytes)
         for p in range_constexpr(TPC):
             bst(dv, rx[p], doff, 0, AUX_SYS)
             bst(sv, rs[p], soff, 0, AUX_SYS)
@@ -1482,17 +1652,25 @@ def build_communication(kc: KernelCtx) -> dict:
                 v = (tid == i32(C_PULL)).select(i32(NCK), v)
             lds_st(L, L_CTL + tid * i32(4), v)
 
-    def _dll_rows(a, t, c0, vc, P, npc=NPC):
+    def _dll_rows(a, t, c0, vc, P, npc=NPC, ks=None):
+        """the item's route row packets (k, piece) of routes ks (default all); a16: then
+        their lo packets (each region's second half)"""
         rb = route_region_bytes(a["ttot"])
-        r_routes = rsrc(a["routes"], rb)
-        r_pr = rsrc(a["proutes"], i32(NPC - 1) * rb)
+        r_routes = rsrc(a["routes"], rb * i32(APL))
+        r_pr = rsrc(a["proutes"], i32(NPC - 1) * rb * i32(APL))
         out = []
-        for k in range_constexpr(TOPK):
-            off = ((t * i32(TOPK) + i32(k)) * i32(H) + c0 + vc * i32(8)) * i32(2)
-            out.append(fx.Vector(bld(r_routes, off, 0, V4I, AUX_SC1)))
-            for p in range_constexpr(1, npc):
-                o2 = (i32(p) < P).select(i32(p - 1) * rb + off, i32(NPC) * rb)
-                out.append(fx.Vector(bld(r_pr, o2, 0, V4I, AUX_SC1)))
+        for pl in range_constexpr(APL):
+            for k in range(TOPK) if ks is None else ks:
+                off = ((t * i32(TOPK) + i32(k)) * i32(H) + c0 + vc * i32(8)) * i32(2)
+                out.append(
+                    fx.Vector(bld(r_routes, off + rb * i32(pl), 0, V4I, AUX_SC1))
+                )
+                for p in range_constexpr(1, npc):
+                    o2 = (i32(p) < P).select(
+                        i32(p - 1) * rb + off + i32(pl * (NPC - 1)) * rb,
+                        i32(2 * NPC) * rb,
+                    )
+                    out.append(fx.Vector(bld(r_pr, o2, 0, V4I, AUX_SC1)))
         return out
 
     # (DLL ag_rs) the pushing waves then sum their share of this rank's (row, column chunk)
@@ -1527,21 +1705,86 @@ def build_communication(kc: KernelCtx) -> dict:
                 v = lane + i32(j * 64)
                 vc = fx.min(v, i32(CW // 8 - 1))
                 # (one inter piece, the small-M units: its TOPK rows only)
-                if P == i32(1):
+                if const_expr(RAW):
+                    if P == i32(1):
+                        _push_raw(L, tid, a, t, c0, v, vc, P, r_dst, prow, 1)
+                    else:
+                        _push_raw(L, tid, a, t, c0, v, vc, P, r_dst, prow, NPC)
+                elif P == i32(1):
                     _push_one(L, tid, a, t, c0, v, vc, P, r_dst, prow, ws, 1)
                 else:
                     _push_one(L, tid, a, t, c0, v, vc, P, r_dst, prow, ws, NPC)
+            if const_expr(RAW and ARLL):
+                for pr in range_constexpr(TPC):
+                    _raw_part(a, lane, peer_rs(a, pr, "off_part"), prow, c0)
+            elif const_expr(RAW):
+                _raw_part(a, lane, r_dst, prow, c0)
         if const_expr(ARLL):
             final_all_ll(tid, a, ws)
         if const_expr(FINI):
             final_own_ll(tid, a, ws)
 
     @flyc.jit
+    def _push_raw(L, tid, a, t, c0, v, vc, P, r_dst, prow, npc):
+        """(RAW) _push_one over bf16 route rows: lane i polls flag i of the item's (route,
+        column group, piece) ones, then every lane sums its 8 columns of the live rows
+        """
+        lane = tid % i32(64)
+        rf = _raw_rs(a)
+        NF = TOPK * (CW // RGW) * npc
+        i = fx.min(lane, i32(NF - 1))
+        k = i // i32((CW // RGW) * npc)
+        r_ = i - k * i32((CW // RGW) * npc)
+        gg = r_ // i32(npc)
+        p = r_ - gg * i32(npc)
+        foff = _raw_flag(a, p, t * i32(TOPK) + k, c0 // i32(RGW) + gg)
+        live = (lane < i32(NF)) & (p < P)
+
+        def pending():
+            f = fx.Int32(bld(rf, foff, 0, T.i32, AUX_SC1))
+            bad = (live & (f != a["epoch"])).select(i32(1), i32(0))
+            return wave_red(bad, lane, fx.max)
+
+        pend = pending()
+        t0 = now()
+        while (pend != i32(0)) & alive(t0):
+            rocdl.s_sleep(2)
+            pend = pending()
+        _report_if(a, (pend != i32(0)) & (lane == i32(0)), ERR_COMM)
+        rb = route_region_bytes(a["ttot"])
+        r_routes = rsrc(a["routes"], rb)
+        r_pr = rsrc(a["proutes"], i32(NPC - 1) * rb)
+        acc = [fx.Float32(0.0)] * 8
+        for k in range_constexpr(TOPK):
+            off = ((t * i32(TOPK) + i32(k)) * i32(H) + c0 + vc * i32(8)) * i32(2)
+            for p in range_constexpr(npc):
+                if const_expr(p == 0):
+                    d = bld(r_routes, off, 0, V4I, AUX_SC1)
+                else:
+                    o2 = (i32(p) < P).select(i32(p - 1) * rb + off, i32(NPC) * rb)
+                    d = bld(r_pr, o2, 0, V4I, AUX_SC1)
+                acc = sum_live(acc, bf16x8_to_f32(d), i32(p) < P)
+        if const_expr(ARLL):
+            for pr in range_constexpr(TPC):
+                _push_store(
+                    a,
+                    peer_rs(a, pr, "off_part"),
+                    prow,
+                    c0,
+                    v,
+                    acc,
+                    v < i32(CW // 8),
+                )
+        else:
+            _push_store(a, r_dst, prow, c0, v, acc, v < i32(CW // 8))
+
+    @flyc.jit
     def _push_one(L, tid, a, t, c0, v, vc, P, r_dst, prow, ws, npc):
         """one push item column slice: the sum of its routes' npc piece rows -> owner"""
         lane = tid % i32(64)
-        live = [(v < i32(CW // 8)) & (i32(p) < P) for p in range(npc)] * TOPK
-        if const_expr(TOPK * npc <= 48):
+        live = [(v < i32(CW // 8)) & (i32(p) < P) for p in range(npc)] * TOPK * APL
+        acc = [fx.Float32(0.0)] * 8
+        if const_expr(TOPK * npc * APL <= 24):
             pk = _dll_rows(a, t, c0, vc, P, npc)
             pend = ll_pending(a, lane, zip(pk, live))
             t0 = now()
@@ -1549,18 +1792,33 @@ def build_communication(kc: KernelCtx) -> dict:
                 rocdl.s_sleep(2)
                 pk = _dll_rows(a, t, c0, vc, P, npc)
                 pend = ll_pending(a, lane, zip(pk, live))
+            for k in range_constexpr(TOPK):
+                for p in range_constexpr(npc):
+                    acc = sum_live(
+                        acc, ll_vals2(pk, k * npc + p, TOPK * npc), i32(p) < P
+                    )
         else:
-            pend = ll_pending(a, lane, zip(_dll_rows(a, t, c0, vc, P, npc), live))
+            # (many pieces: the packets of one route at a time, polled, then summed: only
+            # npc x APL of them live)
+            lk = live[:npc] * APL
+
+            def pend_all():
+                pd = i32(0)
+                for k in range_constexpr(TOPK):
+                    pk = _dll_rows(a, t, c0, vc, P, npc, [k])
+                    pd = fx.max(pd, ll_pending(a, lane, zip(pk, lk)))
+                return pd
+
+            pend = pend_all()
             t0 = now()
             while (pend != i32(0)) & alive(t0):
                 rocdl.s_sleep(2)
-                pend = ll_pending(a, lane, zip(_dll_rows(a, t, c0, vc, P, npc), live))
-            pk = _dll_rows(a, t, c0, vc, P, npc)
+                pend = pend_all()
+            for k in range_constexpr(TOPK):
+                pk = _dll_rows(a, t, c0, vc, P, npc, [k])
+                for p in range_constexpr(npc):
+                    acc = sum_live(acc, ll_vals2(pk, p, npc), i32(p) < P)
         _report_if(a, (pend != i32(0)) & (lane == i32(0)), ERR_COMM)
-        acc = [fx.Float32(0.0)] * 8
-        for k in range_constexpr(TOPK):
-            for p in range_constexpr(npc):
-                acc = sum_live(acc, ll_vals(pk[k * npc + p]), i32(p) < P)
         if const_expr(ARLL):
             for pr in range_constexpr(TPC):
                 _push_store(
@@ -1600,6 +1858,61 @@ def build_communication(kc: KernelCtx) -> dict:
                     _yag_post(a, p, idx, lane == i32(0))
 
     @flyc.jit
+    def _final_all_pkts(a, lane, r_recv, t, trows, c0, v, vc):
+        live = [(i32(p) < a["tp"]) & (v < i32(CW // 8)) for p in range(MAX_TP)] * APL
+        pk = recv_pkts(a, r_recv, t, trows, c0, vc)
+        pend = ll_pending(a, lane, zip(pk, live))
+        t0 = now()
+        while (pend != i32(0)) & alive(t0):
+            rocdl.s_sleep(1)
+            pk = recv_pkts(a, r_recv, t, trows, c0, vc)
+            pend = ll_pending(a, lane, zip(pk, live))
+        _report_if(a, (pend != i32(0)) & (lane == i32(0)), ERR_COMM)
+        acc = [fx.Float32(0.0)] * 8
+        for p in range_constexpr(MAX_TP):
+            acc = sum_live(acc, ll_vals2(pk, p, MAX_TP), i32(p) < a["tp"])
+        return acc
+
+    def _raw_pflag(a, prow, c0):
+        """(RAW) the flag of the partial row prow's column chunk (the recv region's lo
+        plane space)"""
+        return part_lo(a) + (prow * i32(NCK) + c0 // i32(CW)) * i32(4)
+
+    @flyc.jit
+    def _raw_part(a, lane, r_dst, prow, c0):
+        """(RAW, after an item's bf16 partial stores to r_dst) their flag"""
+        wait_vm(0)
+        if lane == i32(0):
+            bst(a["epoch"], r_dst, _raw_pflag(a, prow, c0), 0, AUX_SYS)
+
+    @flyc.jit
+    def _raw_recv(a, lane, r_recv, row, rstride, c0, vc):
+        """(RAW) every rank's bf16 partial of row's 8 columns (lane p polls rank p's flag)"""
+        pc = fx.min(lane, a["tp"] - i32(1))
+        foff = _raw_pflag(a, pc * rstride + row, c0)
+        live = lane < a["tp"]
+
+        def pending():
+            f = fx.Int32(bld(r_recv, foff, 0, T.i32, AUX_SYS))
+            return wave_red(
+                (live & (f != a["epoch"])).select(i32(1), i32(0)), lane, fx.max
+            )
+
+        pend = pending()
+        t0 = now()
+        while (pend != i32(0)) & alive(t0):
+            rocdl.s_sleep(1)
+            pend = pending()
+        _report_if(a, (pend != i32(0)) & (lane == i32(0)), ERR_COMM)
+        acc = [fx.Float32(0.0)] * 8
+        for p in range_constexpr(MAX_TP):
+            pp = fx.min(i32(p), a["tp"] - i32(1))
+            off = ((pp * rstride + row) * i32(H) + c0 + vc * i32(8)) * i32(2)
+            d = bld(r_recv, off, 0, V4I, AUX_SYS)
+            acc = sum_live(acc, bf16x8_to_f32(d), i32(p) < a["tp"])
+        return acc
+
+    @flyc.jit
     def final_all_ll(tid, a, ws=0):
         lane = tid % i32(64)
         ttot = a["ttot"]
@@ -1615,18 +1928,10 @@ def build_communication(kc: KernelCtx) -> dict:
             for j in range_constexpr(VPL):
                 v = lane + i32(j * 64)
                 vc = fx.min(v, i32(CW // 8 - 1))
-                live = [(i32(p) < a["tp"]) & (v < i32(CW // 8)) for p in range(MAX_TP)]
-                pk = recv_pkts(a, r_recv, t, trows, c0, vc)
-                pend = ll_pending(a, lane, zip(pk, live))
-                t0 = now()
-                while (pend != i32(0)) & alive(t0):
-                    rocdl.s_sleep(1)
-                    pk = recv_pkts(a, r_recv, t, trows, c0, vc)
-                    pend = ll_pending(a, lane, zip(pk, live))
-                _report_if(a, (pend != i32(0)) & (lane == i32(0)), ERR_COMM)
-                acc = [fx.Float32(0.0)] * 8
-                for p in range_constexpr(MAX_TP):
-                    acc = sum_live(acc, ll_vals(pk[p]), i32(p) < a["tp"])
+                if const_expr(RAW):
+                    acc = _raw_recv(a, lane, r_recv, t, trows, c0, vc)
+                else:
+                    acc = _final_all_pkts(a, lane, r_recv, t, trows, c0, v, vc)
                 if v < i32(CW // 8):
                     bst(
                         pack_bf16x8(acc),

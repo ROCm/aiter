@@ -17,6 +17,7 @@ from ..kernels_common import ceildiv
 from ..mxfp4_gemm_common import _activation_mul_batch, _e8m0_from_amax
 from .common import (
     AUX_SC1,
+    AUX_SYS,
     REL,
     V4F,
     V4I,
@@ -28,6 +29,7 @@ from .common import (
     dma16,
     fp4_pack,
     fp8x4_pack,
+    fp8x4_unpack,
     i32,
     lds_atomic_add,
     lds_ld,
@@ -81,16 +83,27 @@ def build_gemm(kc: KernelCtx) -> dict:
     L_B1, L_B1S, L_CTL, L_DCH, L_INTER = kc.get("L_B1 L_B1S L_CTL L_DCH L_INTER")
     L_INTERS, L_RING, L_RIX, L_WT, MT = kc.get("L_INTERS L_RING L_RIX L_WT MT")
     MTSKIP, NA_L, NA_ROWOPS, NAB, NCG = kc.get("MTSKIP NA_L NA_ROWOPS NAB NCG")
+    XD, AGS_OV, AGS_RS, ABS = kc.get("XD AGS_OV AGS_RS ABS")
+    (RAW,) = kc.get("RAW")
+    (ag_rows,) = kc.get("ag_rows")
     # (small-M) a unit's MFMAs over its row tiles only up to 16 rows: 1 tile, else MT
     SMSKIP = kc.SM and MT >= 2
     ABS, ASS, HB = kc.get("ABS ASS HB")
     (TMAX_,) = kc.get("TMAX")
     # (small-M GEMM1) the k-step pair's scale dwords loaded once (with the even step)
     SDD = kc.SM
+    # (experiment) GEMM1 B prefetch into L2, BPF k-steps ahead of the ring (0: off)
+    BPF = kc.BPF
+    BPFO = 1 if BPF > 0 else 0  # (its one VMEM op per k-step)
+    (L_BPF,) = kc.get("L_BPF")
     # (HB) half block: 64 columns of GEMM1, wave w: columns 32 (w % 2), K half w // 2
     KH = KS1 // 2
     NCH, NCK, NSC_BLK, RG, SI_STRIDE = kc.get("NCH NCK NSC_BLK RG SI_STRIDE")
     TOPK, XB, a8, a_frag = kc.get("TOPK XB a8 a_frag")
+    XSB, APL, SIB, NPC = kc.get("XSB APL SIB NPC")
+    LPR = ACB // 16  # A loader lanes per row
+    # (the A scale buffers: [plane][half (HB)][k-step])
+    HBN = 2 if kc.HB else 1
     act_quant_store, ag_stage_free = kc.get("act_quant_store ag_stage_free")
     ag_wait_chunk, cbar, const_expr = kc.get("ag_wait_chunk cbar const_expr")
     ll_pkt, npp, nsk, route_fp8 = kc.get("ll_pkt npp nsk route_fp8")
@@ -185,6 +198,16 @@ def build_gemm(kc: KernelCtx) -> dict:
         su0 = uni((e * i32(2 * I) + i32(I) + icol0) // i32(32)) * i32(CH1 * 256)
         return lane, w, rw, rws, (vg0, vg1, vu0, vu1), vsl, sg0, su0
 
+    def _bpf_voff(lane, vs):
+        """(BPF) lane's 64 B of the four 1 KB B regions of a k-step: region lane // 16"""
+        t = lane // i32(16)
+        base = [v - lane * i32(16) for v in vs]
+        b = (t == i32(0)).select(
+            base[0],
+            (t == i32(1)).select(base[1], (t == i32(2)).select(base[2], base[3])),
+        )
+        return b + (lane % i32(16)) * i32(64)
+
     def _g1_so(pas, kk):
         return pas * i32(128 * (H // 2)) + kk * i32(1024)
 
@@ -212,21 +235,33 @@ def build_gemm(kc: KernelCtx) -> dict:
         ]
         # all A fragments / scales of the k-step first, then the MFMAs: the LDS reads
         # overlap instead of one exposed lgkmcnt(0) wait per 16-row block
-        afs, sas = [], []
-        for m in range_constexpr(MTE):
-            row = i32(m * 16) + lane % i32(16)
-            afs.append(a_frag(abuf, row, k, lane // i32(16)))
-            sas.append(
-                fx.Int32(lds_ld(asbuf, row * i32(4) + lane // i32(16), T.i8, 1))
-                & i32(0xFF)
-            )
-        for m in range_constexpr(MTE):
-            for t in range_constexpr(4):
-                j = o + (t // 2) * 2 * MTE + m * 2 + t % 2
-                acc[j] = mfma(b[t], afs[m], acc[j], sc[t], sas[m], a8)
+        for pl in range_constexpr(
+            APL
+        ):  # (a16: the hi, then the lo term: one live at a time)
+            afs, sas = [], []
+            for m in range_constexpr(MTE):
+                row = i32(m * 16) + lane % i32(16)
+                afs.append(a_frag(abuf + i32(pl * 256), row, k, lane // i32(16)))
+                sas.append(
+                    fx.Int32(
+                        lds_ld(
+                            asbuf + i32(pl * HBN * KCS * NSC_BLK * 64 * 4),
+                            row * i32(4) + lane // i32(16),
+                            T.i8,
+                            1,
+                        )
+                    )
+                    & i32(0xFF)
+                )
+            for m in range_constexpr(MTE):
+                for t in range_constexpr(4):
+                    j = o + (t // 2) * 2 * MTE + m * 2 + t % 2
+                    acc[j] = mfma(b[t], afs[m], acc[j], sc[t], sas[m], a8)
 
-    def _g1_out(L, lane, w, a, acc, grp, P, MTE):
-        ag_stage_free(L, lane, a)
+    def _g1_out(L, lane, w, a, acc, grp, P, MTE, i0=None):
+        """i0: the unit's first column (XD: the intermediate's xg columns)"""
+        if const_expr(not XD):  # (XD: the AG staging has its own LDS)
+            ag_stage_free(L, lane, a)
         for pp in range_constexpr(P):
             o = pp * 4 * MTE
             act_quant_store(
@@ -237,6 +272,8 @@ def build_gemm(kc: KernelCtx) -> dict:
                 acc[o + 2 * MTE : o + 4 * MTE],
                 grp * i32(P) + i32(pp),
                 MTE,
+                i0,
+                a,
             )
 
     @flyc.jit
@@ -244,6 +281,8 @@ def build_gemm(kc: KernelCtx) -> dict:
         MTE = MT if MTE is None else MTE
         lane, w, rw, rws, vs, vsl, sg0, su0 = _g1_operands(tid, a, expert, i0)
         ring = uni(L + i32(L_RING) + w * i32(nsk * SLOT))
+        if const_expr(BPF > 0):
+            bpf_dst, bpf_v = L + i32(L_BPF) + w * i32(256), _bpf_voff(lane, vs)
         IL = nsk * (P * KCS) // math.gcd(nsk, P * KCS)
         assert KS1 * P % IL == 0
         if const_expr(kr is None):
@@ -274,12 +313,20 @@ def build_gemm(kc: KernelCtx) -> dict:
                 sso = _g1_sso(pas, kk)
                 dma4(slot + i32(4096), rws, vsl, sg0 + sso)
                 dma4(slot + i32(4096 + 256), rws, vsl, su0 + sso)
+            if const_expr(BPF > 0):
+                # (into L2 BPF k-steps ahead of the ring: its loads then hit)
+                gp = fx.min(g + i32(BPF), total - i32(1))
+                grp = gp // GS
+                r = gp - grp * GS
+                kp = r // i32(P)
+                pp = grp * i32(P) + (r - kp * i32(P))
+                dma4(bpf_dst, rw, bpf_v, _g1_so(pp, kp + k0))
 
         def ops_newer(s_):
             # VMEM ops issued after step s_'s (the nsk - 1 later slots)
             if not sdd:
-                return (nsk - 1) * OPS
-            return sum(OPS - 2 * ((s_ + j) % 2) for j in range(1, nsk))
+                return (nsk - 1) * (OPS + BPFO)
+            return sum(OPS + BPFO - 2 * ((s_ + j) % 2) for j in range(1, nsk))
 
         for kk in range_constexpr(nsk):
             issue_b(i32(kk), kk, kk % 2 == 1)
@@ -326,7 +373,7 @@ def build_gemm(kc: KernelCtx) -> dict:
                     if k == KCS - 1:
                         release_a_chunk(L, lane, buf)
                 res = yield acc
-            (_g1_out if out is None else out)(L, lane, w, a, res, grp, P, MTE)
+            (_g1_out if out is None else out)(L, lane, w, a, res, grp, P, MTE, i0)
         qend = qbase + (nnb // i32(P)) * nch
         if lane == i32(0):
             lds_st(L, L_CTL + C_QBASE * 4 + w * i32(4), qend)
@@ -339,6 +386,8 @@ def build_gemm(kc: KernelCtx) -> dict:
         """
         MTE = MT
         lane, w, rw, rws, vs, vsl, sg0, su0 = _g1_operands(tid, a, expert, i0, True)
+        if const_expr(BPF > 0):
+            bpf_dst, bpf_v = L + i32(L_BPF) + w * i32(256), _bpf_voff(lane, vs)
         kh = w // i32(2)
         ring = uni(L + i32(L_RING) + w * i32(nsk * SLOT))
         IL = nsk * KCS // math.gcd(nsk, KCS)
@@ -356,11 +405,14 @@ def build_gemm(kc: KernelCtx) -> dict:
                 sso = _g1_sso(i32(0), kk)
                 dma4(slot + i32(4096), rws, vsl, sg0 + sso)
                 dma4(slot + i32(4096 + 256), rws, vsl, su0 + sso)
+            if const_expr(BPF > 0):
+                kp = fx.min(g + i32(BPF), i32(KH - 1)) + k0
+                dma4(bpf_dst, rw, bpf_v, _g1_so(i32(0), kp))
 
         def ops_newer(s_):
             if not SDD:
-                return (nsk - 1) * OPS
-            return sum(OPS - 2 * ((s_ + j) % 2) for j in range(1, nsk))
+                return (nsk - 1) * (OPS + BPFO)
+            return sum(OPS + BPFO - 2 * ((s_ + j) % 2) for j in range(1, nsk))
 
         for kk in range_constexpr(nsk):
             issue_b(i32(kk), kk, kk % 2 == 1)
@@ -405,7 +457,7 @@ def build_gemm(kc: KernelCtx) -> dict:
                 acc[j] = fx.Vector(acc[j]) + fx.Vector(
                     lds_ld(pr, i32(j * 1024) + lane * i32(16), V4F, 16)
                 )
-            _g1_out(L, lane, w, a, acc, i32(0), 1, MTE)
+            _g1_out(L, lane, w, a, acc, i32(0), 1, MTE, i0)
 
     def unit_fields(L, u):
         f = [
@@ -417,8 +469,9 @@ def build_gemm(kc: KernelCtx) -> dict:
     @flyc.jit
     def a_loader(L, tid, a):
         lane = tid % i32(64)
-        rx = rsrc(a["ax"])
-        rxs = rsrc(a["axs"])
+        # (sized: a chunk's rows past the unit's are out-of-range loads, no memory traffic)
+        rx = rsrc(a["ax"], a["ttot"] * i32(XB))
+        rxs = rsrc(a["axs"], a["ttot"] * i32(XSB))
         spin0(L, lane, L_CTL + C_PLAN * 4, i32(1))
         ub = uni(lds_ld_acq(L, L_CTL + C_UNIT * 4))
         ue = uni(lds_ld_acq(L, L_CTL + (C_UNIT + 1) * 4))
@@ -438,25 +491,22 @@ def build_gemm(kc: KernelCtx) -> dict:
             rows = fx.min(R - r0, i32(RG))
             arow = []
             for j in range_constexpr(NA_ROWOPS):
-                if const_expr(a8):
-                    row = i32(j * 4) + lane // i32(16)
-                    col = (lane % i32(16)) ^ (row & i32(7))
-                else:
-                    row = i32(j * 8) + lane // i32(8)
-                    col = (lane % i32(8)) ^ (row & i32(7))
+                # (LPR lanes x 16 B per row: 8 MXFP4, 16 MXFP8, 32 the a16 hi + lo)
+                row = i32(j * (64 // LPR)) + lane // i32(LPR)
+                col = (lane % i32(LPR)) ^ (row & i32(7))
                 rr = (row < rows).select(row, i32(0))
+                tk = lds_ld_i32(L, L_RIX + (r0 + rr) * i32(4)) // i32(TOPK)
                 arow.append(
-                    (lds_ld_i32(L, L_RIX + (r0 + rr) * i32(4)) // i32(TOPK)) * i32(XB)
-                    + col * i32(16)
+                    (row < rows).select(
+                        tk * i32(XB) + col * i32(16), a["ttot"] * i32(XB)
+                    )
                 )
             ascl = []
             for j in range_constexpr(NSC_BLK):
                 row = i32(j * 64) + lane
                 rr = (row < rows).select(row, i32(0))
-                ascl.append(
-                    (lds_ld_i32(L, L_RIX + (r0 + rr) * i32(4)) // i32(TOPK))
-                    * i32(H // 32)
-                )
+                tk = lds_ld_i32(L, L_RIX + (r0 + rr) * i32(4)) // i32(TOPK)
+                ascl.append((row < rows).select(tk * i32(XSB), a["ttot"] * i32(XSB)))
             if const_expr(lb):
                 nc, c0 = i32(NCH), i32(0)
             else:
@@ -481,6 +531,9 @@ def build_gemm(kc: KernelCtx) -> dict:
                         L_CTL + C_AFREE * 4 + b * i32(4),
                         i32(NW) * (q // i32(NAB)),
                     )
+                if const_expr(XD):  # noqa: SIM102 (the AG staging in the last buffers)
+                    if (q < i32(NAB)) & (b >= _ags_b0(a)):
+                        ag_stage_free(L, lane, a)
                 rocdl.sched_barrier(0)
                 cc = c0 + cidx % nc
                 if cidx < nc:  # noqa: SIM102
@@ -499,16 +552,25 @@ def build_gemm(kc: KernelCtx) -> dict:
         for j in range_constexpr(NA_ROWOPS):
             # (sc1: the peers' rows of this launch, never a stale L2 line of the last one)
             dma16(abase + i32(j * 1024), rx, arow[j], cc * i32(ACB), aux=AUX_SC1)
-        for k in range_constexpr(KCS):
-            for j in range_constexpr(NSC_BLK):
-                dst = (
-                    L
-                    + i32(L_AS)
-                    + b * i32(ASS)
-                    + i32(half * KCS * NSC_BLK * 64 * 4)
-                    + i32((k * NSC_BLK + j) * 64 * 4)
-                )
-                dma4(dst, rxs, ascl[j], cc * i32(8) + i32(k * 4), sys=True)
+        for pl in range_constexpr(APL):  # (a16: the hi, then the lo scales)
+            for k in range_constexpr(KCS):
+                for j in range_constexpr(NSC_BLK):
+                    dst = (
+                        L
+                        + i32(L_AS)
+                        + b * i32(ASS)
+                        + i32((pl * HBN + half) * KCS * NSC_BLK * 64 * 4)
+                        + i32((k * NSC_BLK + j) * 64 * 4)
+                    )
+                    soff = cc * i32(8 * APL) + i32(pl * 8 + k * 4)
+                    dma4(dst, rxs, ascl[j], soff, sys=True)
+
+    def _ags_b0(a):
+        """(XD) the first A buffer this CTA's AG staging rows overlap (NAB: none)"""
+        if const_expr(not AGS_OV):
+            return i32(NAB)
+        nr = ag_rows(a)[2]
+        return (i32(NAB * ABS) - nr * i32(AGS_RS)) // i32(ABS)
 
     @flyc.jit
     def _a_half(L, lane, a, rx, rxs, arow, ascl):
@@ -526,6 +588,9 @@ def build_gemm(kc: KernelCtx) -> dict:
                 spin_lds_ge(
                     L, L_CTL + C_AFREE * 4 + b * i32(4), i32(NW) * (q // i32(NAB))
                 )
+            if const_expr(XD):  # noqa: SIM102 (the AG staging in the last buffers)
+                if (q < i32(NAB)) & (b >= _ags_b0(a)):
+                    ag_stage_free(L, lane, a)
             rocdl.sched_barrier(0)
             _a_chunk(L, b, rx, rxs, arow, ascl, cidx)
             _a_chunk(L, b, rx, rxs, arow, ascl, cidx + i32(NCH // 2), 1)
@@ -571,20 +636,39 @@ def build_gemm(kc: KernelCtx) -> dict:
             wait_vm(rlag_wait)
             report_chunk(L, lane, w, (gi // i32(GPC)) - i32(lag))
 
-    def store_route_fp8(rs, accs, wt, rix, n0, q4, ok, oob, a):
-        d, e8s = [], []
-        for half in range_constexpr(2):
-            f = [
-                fx.Float32(fx.Vector(accs[2 * half + h])[i]) * wt
-                for h in range(2)
-                for i in range(4)
-            ]
+    def _route_terms(fs):
+        """MXFP8 of the two 8-value halves (scales shared by the 4 lanes of a 32-column
+        block): words, scales and the dequantized values"""
+        d, e8s, deq = [], [], []
+        for f in fs:
             am = amax(f)
             am = am.maximumf(am.shuffle_xor(i32(16), i32(64)))
             am = am.maximumf(am.shuffle_xor(i32(32), i32(64)))
             e8, qs = _e8m0_from_amax(am, max_norm=448.0)
-            d += [fp8x4_pack(f[0:4], qs), fp8x4_pack(f[4:8], qs)]
+            p0, p1 = fp8x4_pack(f[0:4], qs), fp8x4_pack(f[4:8], qs)
+            d += [p0, p1]
             e8s.append(fx.Int32(e8) & i32(0xFF))
+            deq.append(fp8x4_unpack(p0, qs) + fp8x4_unpack(p1, qs))
+        return d, e8s, deq
+
+    def store_route_fp8(rs, accs, wt, rix, n0, q4, ok, oob, a, lop=None):
+        """lop (a16): the region's lo plane offset (the residual's MXFP8 packets)"""
+        fs = [
+            [
+                fx.Float32(fx.Vector(accs[2 * half + h])[i]) * wt
+                for h in range(2)
+                for i in range(4)
+            ]
+            for half in range(2)
+        ]
+        d, e8s, deq = _route_terms(fs)
+        if const_expr(lop is not None):
+            res = [[fs[h][i] - deq[h][i] for i in range(8)] for h in range(2)]
+            dl, e8l, _ = _route_terms(res)
+            _route_store(rs, dl, e8l, rix, n0, q4, ok, oob, a, lop)
+        _route_store(rs, d, e8s, rix, n0, q4, ok, oob, a)
+
+    def _route_store(rs, d, e8s, rix, n0, q4, ok, oob, a, lop=None):
         d0, d1 = swap16(d[0], d[1])
         d2, d3 = swap16(d[2], d[3])
         d0, d2 = swap32(d0, d2)
@@ -594,6 +678,8 @@ def build_gemm(kc: KernelCtx) -> dict:
         if const_expr(DLL):
             e8 = ((q4 >> i32(1)) == i32(0)).select(e8s[0], e8s[1])
             off = (rix * i32(H) + col) * i32(2)
+            if const_expr(lop is not None):
+                off = off + lop
             for h in range_constexpr(2):
                 d = lo if h == 0 else hi
                 pkt = ll_pkt(a, d[0], d[1], e8)
@@ -707,7 +793,7 @@ def build_gemm(kc: KernelCtx) -> dict:
             is0 = b0.select(i32(L_INTERS), i32(L_B1S))
             rix0 = i32(L_RIX) + buf * i32(128 * 4)
             wt0 = i32(L_WT) + buf * i32(128 * 4)
-        NSK2 = _nsk2_for(NKS, G2)
+        NSK2 = _nsk2_for(NKS, G2, nsk)
         GPI = (NSK2 * NKS // math.gcd(NSK2, NKS)) // NKS
         assert G2 % GPI == 0
         WAIT_B2 = (NSK2 - 1) * OPS
@@ -725,8 +811,14 @@ def build_gemm(kc: KernelCtx) -> dict:
             fx.Int64(a["routes"]),
             fx.Int64(a["proutes"]) + fx.Int64(pidx - i32(1)) * fx.Int64(routes_bytes),
         )
-        r_routes = rsrc(dst, routes_bytes)
-        oob = routes_bytes
+        lop = None
+        if const_expr(APL > 1 and not RAW):  # (a16: the lo plane after the hi one)
+            lop = (pidx == i32(0)).select(routes_bytes, i32(NPC - 1) * routes_bytes)
+            r_routes = rsrc(dst, lop + routes_bytes)
+            oob = lop + routes_bytes
+        else:
+            r_routes = rsrc(dst, routes_bytes)
+            oob = routes_bytes
         ring = uni(L + i32(L_RING) + w * i32(nsk * SLOT))
         q4 = lane // i32(16)
         g_lo = i32(0) if gi_lo is None else uni(gi_lo)
@@ -858,9 +950,10 @@ def build_gemm(kc: KernelCtx) -> dict:
                             (s1 >> (sh0 + i32(8))) & i32(0xFF),
                         ]
                         af_l, sa_l = [], []
-                        for m in range_constexpr(MTE):
+                        for pm in range_constexpr(APL * MTE):  # (a16: hi, then lo)
+                            pl, m = pm // MTE, pm % MTE
                             row = i32(m * 16) + lane % i32(16)
-                            ib = ib0 + row * i32(SI_STRIDE)
+                            ib = ib0 + row * i32(SI_STRIDE) + i32(pl * I)
                             if const_expr(a8):
                                 kb = ib + (ka + i32(k)) * i32(128) + q4 * i32(16)
                                 af_l.append(
@@ -883,7 +976,8 @@ def build_gemm(kc: KernelCtx) -> dict:
                                     lds_ld(
                                         L,
                                         is0
-                                        + row * i32(I // 32)
+                                        + row * i32(SIB)
+                                        + i32(pl * (I // 32))
                                         + (ka + i32(k)) * i32(4)
                                         + q4,
                                         T.i8,
@@ -894,10 +988,11 @@ def build_gemm(kc: KernelCtx) -> dict:
                             )
                         rocdl.sched_barrier(0)
                         rocdl.s_setprio(1)
-                        for m in range_constexpr(MTE):
+                        for pm in range_constexpr(APL * MTE):
+                            m = pm % MTE
                             for t in range_constexpr(4):
                                 acc[m * 4 + t] = mfma(
-                                    b[t], af_l[m], acc[m * 4 + t], sb[t], sa_l[m], a8
+                                    b[t], af_l[pm], acc[m * 4 + t], sb[t], sa_l[pm], a8
                                 )
                         rocdl.s_setprio(0)
                         wait_lgkm0()
@@ -908,7 +1003,7 @@ def build_gemm(kc: KernelCtx) -> dict:
                     ccol = (q4 & i32(1)) * i32(16) + (q4 >> i32(1)) * i32(8)
                     for m in range_constexpr(MTE):
                         ok, wt, rix = row_meta[m]
-                        if const_expr(route_fp8):
+                        if const_expr(route_fp8 and not RAW):
                             store_route_fp8(
                                 r_routes,
                                 acc[m * 4 : m * 4 + 4],
@@ -919,6 +1014,7 @@ def build_gemm(kc: KernelCtx) -> dict:
                                 ok,
                                 oob,
                                 a,
+                                lop,
                             )
                         else:
                             pk = []
@@ -943,7 +1039,13 @@ def build_gemm(kc: KernelCtx) -> dict:
                                 ov = fx.Vector.from_elements(lo + hi, fx.Int32)
                                 col = n0 + i32(half * 32) + ccol
                                 voff = (rix * i32(H) + col) * i32(2)
-                                bst(ov, r_routes, ok.select(voff, oob), 0, AUX_RT)
+                                bst(
+                                    ov,
+                                    r_routes,
+                                    ok.select(voff, oob),
+                                    0,
+                                    AUX_SYS if RAW else AUX_RT,
+                                )
                     if const_expr(not DLL):
                         maybe_report(L, lane, w, gi, signal, LAG * RLAG, LAG)
 
