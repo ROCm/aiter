@@ -142,12 +142,6 @@ def run_torch_persistent(
                 last_page_lens_l[batch_idx] if kv_offset == 0 else page_size
             )
             work_last_page_lens = torch.tensor([last_page_len], dtype=torch.int32)
-            kv_tail_len = (
-                0
-                if kv_offset == 0
-                else (kv_offset - 1) * page_size + last_page_lens_l[batch_idx]
-            )
-
             if partial_qo_loc < 0:
                 out = final_output[qo_start:qo_end]
                 lse = torch.empty((qo_len, num_heads), dtype=torch.float32)
@@ -166,7 +160,7 @@ def run_torch_persistent(
                 sm_scale,
                 out,
                 lse,
-                kv_tail_lens=[kv_tail_len],
+                kv_tail_lens=[kv_offset],
             )
 
     return torch.tensor(sorted(slots), dtype=torch.long)
@@ -189,7 +183,14 @@ def merge_splits_torch(work_info_set, final_output, split_output, split_lse):
 
 
 def get_mla_metadata_torch(
-    qo_indptr, kv_indptr, kv_indices, num_cus, kv_granularity=16, max_split_per_batch=32
+    qo_indptr,
+    kv_indptr,
+    kv_indices,
+    kv_last_page_lens,
+    page_size,
+    num_cus,
+    kv_granularity=16,
+    max_split_per_batch=32,
 ):
     """Minimal persistent-decode planner.
 
@@ -206,6 +207,7 @@ def get_mla_metadata_torch(
     """
     qo_indptr_l = qo_indptr.tolist()
     kv_indptr_l = kv_indptr.tolist()
+    last_page_lens_l = kv_last_page_lens.tolist()
     batch_size = len(qo_indptr_l) - 1
     splits_per_batch = min(
         max_split_per_batch, (num_cus + batch_size - 1) // batch_size
@@ -227,8 +229,14 @@ def get_mla_metadata_torch(
             else:
                 loc = partial_qo_loc
                 partial_qo_loc += qo_end - qo_start
+            pages_left = kv_end - split_end
+            kv_offset = (
+                0
+                if pages_left == 0
+                else (pages_left - 1) * page_size + last_page_lens_l[b]
+            )
             works.append(
-                [b, loc, qo_start, qo_end, kv_start, split_end, kv_end - split_end, 0]
+                [b, loc, qo_start, qo_end, kv_start, split_end, kv_offset, 0]
             )
 
     work_info_set = torch.tensor(works, dtype=torch.int32)
@@ -287,6 +295,8 @@ def _make_inputs(
         qo_indptr,
         kv_indptr,
         kv_indices,
+        kv_last_page_lens,
+        page_size,
         num_cus,
         kv_granularity=max(1, 16 // page_size),
     )
