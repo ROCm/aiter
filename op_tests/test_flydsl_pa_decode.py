@@ -213,10 +213,14 @@ def test_pa_decode_reduce_split_groups(device, head_size, dtype, with_sinks):
     Register-only CTAs (24 and 32 partition bounds) and the register branch of
     dual-mode CTAs reduce the same packed partials with one group and with
     split groups; sequences above 32 partitions take the LDS branch and match
-    a float64 reference. Slots past the live tasks hold NaN.
+    a float64 reference. Slots past the live tasks hold NaN. gfx950 splits only
+    dual-mode CTAs (bounds above 64), and its single 32-partition dual rung
+    must match the register-only ladder bit for bit.
     """
-    if get_gfx_runtime() != "gfx1250":
-        pytest.skip("gfx1250 splits register rungs across partition groups")
+    arch = get_gfx_runtime()
+    if arch not in ("gfx950", "gfx1250"):
+        pytest.skip("partition groups split rungs on gfx950 and gfx1250")
+    wave = 32 if arch == "gfx1250" else 64
     import flydsl.compiler as flyc
     import flydsl.expr as fx
 
@@ -257,7 +261,7 @@ def test_pa_decode_reduce_split_groups(device, head_size, dtype, with_sinks):
     def run(partitions, groups):
         pairs = pairs_for(partitions)
         compiled = compile_pa_decode_ps_reduce(
-            architecture="gfx1250",
+            architecture=arch,
             max_context_partition_num=partitions,
             head_size=head_size,
             output_dtype_str=get_dtype_str(dtype),
@@ -315,8 +319,25 @@ def test_pa_decode_reduce_split_groups(device, head_size, dtype, with_sinks):
         reference[seq] = (
             (weights[..., None] * logits[:, f : f + c].double()).sum(1).float()
         )
+
+    def fits(partitions, split):
+        # A CTA holds at most 1024 threads.
+        waves = head_size // (2 if pairs_for(partitions) else 1) // wave
+        return split * waves <= 1024 // wave
+
+    if arch == "gfx950":
+        # Up to 32 live partitions, the dual CTA's single 32-wide rung adds the
+        # same products in the same order as the register-only ladder.
+        ladder = run(32, 1)
+        small = [seq for seq, c in enumerate(counts) if c <= 32]
+        for split in (1, 4):
+            if fits(256, split):
+                rung = run(256, split)
+                assert torch.equal(
+                    ladder[small].view(torch.int16), rung[small].view(torch.int16)
+                ), f"gfx950 dual rung split={split} differs from the ladder"
     for partitions, split in ((32, 4), (24, 4), (32, 2), (64, 16), (256, 4), (256, 16)):
-        if split * head_size // (2 if pairs_for(partitions) else 1) // 32 > 32:
+        if not fits(partitions, split) or (arch == "gfx950" and partitions <= 64):
             continue
         single, grouped = run(partitions, 1), run(partitions, split)
         register = [seq for seq, c in enumerate(counts) if c <= min(partitions, 32)]
