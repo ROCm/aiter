@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
 
-"""Runtime correctness for ``QuickAllReduceInt4.allreduce_rmsnorm`` and
+"""Runtime correctness for ``FlyQuickAllReduce.allreduce_rmsnorm`` and
 ``allreduce_rmsnorm_mxfp4``.
 
 Every rank feeds its own input plus a shared residual and weight. Checks per
@@ -9,7 +9,7 @@ case:
 
 * against an fp32 NCCL all-reduce followed by fp32 add + RMSNorm (SQNR, the
   INT4 codec is lossy);
-* against unfused ``QuickAllReduceInt4.allreduce`` + fp32 add + RMSNorm
+* against unfused ``FlyQuickAllReduce.allreduce`` + fp32 add + RMSNorm
   (tight: the only difference is the bf16 rounding of the reduced sum that
   the fused kernel skips);
 * bitwise equality of ``out`` / ``residual_out`` across ranks;
@@ -55,7 +55,7 @@ from aiter.ops.flydsl.allreduce_policy import (
     resolve_link,
 )
 from aiter.ops.flydsl.kernels.comm.allreduce_shared import WORLD
-from aiter.ops.flydsl.kernels.comm.quick_allreduce_int4 import (
+from aiter.ops.flydsl.kernels.comm.quick_allreduce_mesh import (
     DEFAULT_ATOMS,
     WIDE_ATOMS,
     max_payload_bytes,
@@ -171,7 +171,7 @@ def _unfused_mxfp4(fly, inp, res, weight, out, ar, res_t, q, q_s, *, gemma_norm)
 def _run_rank(rank, tp, init_method, cases, time_it, norm_ladder):
     import torch.distributed as dist
 
-    from aiter.ops.flydsl import QuickAllReduceInt4
+    from aiter.ops.flydsl import FlyQuickAllReduce
 
     device = torch.device(f"cuda:{rank}")
     torch.cuda.set_device(device)
@@ -184,7 +184,7 @@ def _run_rank(rank, tp, init_method, cases, time_it, norm_ladder):
     )
     gloo = dist.new_group(backend="gloo")
     group = dist.group.WORLD
-    fly = QuickAllReduceInt4(
+    fly = FlyQuickAllReduce(
         group=gloo,
         device=device,
         rank=rank,
@@ -377,7 +377,7 @@ CAPTURE_EPS = 0.5
 def _capture_first_rank(rank, tp, init_method, norm_ladder, hidden):
     import torch.distributed as dist
 
-    from aiter.ops.flydsl import QuickAllReduceInt4
+    from aiter.ops.flydsl import FlyQuickAllReduce
     from aiter.ops.flydsl.allreduce_host_shared import launcher_loaded
 
     device = torch.device(f"cuda:{rank}")
@@ -391,7 +391,7 @@ def _capture_first_rank(rank, tp, init_method, norm_ladder, hidden):
     )
     gloo = dist.new_group(backend="gloo")
     group = dist.group.WORLD
-    fly = QuickAllReduceInt4(
+    fly = FlyQuickAllReduce(
         group=gloo,
         device=device,
         rank=rank,
@@ -612,7 +612,7 @@ def _validate(tp):
 
 def main():
     if ARCH not in SUPPORTED_ARCHS:
-        aiter.logger.warning("QuickAllReduceInt4 unsupported on %s; skipping", ARCH)
+        aiter.logger.warning("FlyQuickAllReduce unsupported on %s; skipping", ARCH)
         return
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
@@ -633,7 +633,7 @@ def main():
     for tp in (WORLD, 4, 2):
         if n_gpu < tp:
             aiter.logger.warning(
-                "QuickAllReduceInt4 needs %s GPUs, have %s; skipping tp=%s",
+                "FlyQuickAllReduce needs %s GPUs, have %s; skipping tp=%s",
                 tp,
                 n_gpu,
                 tp,
