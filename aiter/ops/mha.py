@@ -4847,6 +4847,85 @@ def mha_batch_prefill_func(
     return result[0] if len(result) == 1 else tuple(result)
 
 
+def mha_paged_fwd_prefill(
+    q,
+    k,
+    v,
+    qo_indptr,
+    kv_indptr,
+    kv_page_indices,
+    kv_last_page_lens,
+    max_seqlen_q=None,
+    max_seqlen_k=None,
+    softmax_scale=None,
+    causal=False,
+    window_size=(-1, -1),
+    return_lse=False,
+    out=None,
+    sink=None,
+):
+    """Forward prefill against a PAGED K/V cache.
+
+    ``k``/``v`` are the page pool -- ``[num_blocks, page_size, nheads_k, hdim]``, or
+    ``[num_blocks, nheads_k, hdim]`` at page size 1. ``qo_indptr`` carries this batch's
+    query token offsets; ``kv_indptr`` is a cumulative PAGE count (not tokens) into
+    ``kv_page_indices``, and ``kv_last_page_lens`` gives each request's fill of its
+    last page.
+
+    Routes to the gfx1250 FlyDSL kernel when it can serve the configuration, and falls
+    back to ``mha_batch_prefill_func`` (CK) otherwise. A separate entry rather than a
+    hook inside ``mha_batch_prefill_func``: that one has no backend fan-out and its
+    signature carries CK-only options (kv_block_descale, logits_soft_cap, the vLLM 2-D
+    block_table) that the FlyDSL path does not implement.
+    """
+    if _FLYDSL_AVAILABLE and (len(window_size) < 3 or window_size[2] == 0):
+        from .flydsl.fmha_kernels import flydsl_flash_attn_paged_fwd
+
+        _flydsl_result = flydsl_flash_attn_paged_fwd(
+            q,
+            k,
+            v,
+            qo_indptr,
+            kv_indptr,
+            kv_page_indices,
+            kv_last_page_lens=kv_last_page_lens,
+            max_seqlen_q=max_seqlen_q,
+            max_seqlen_k=max_seqlen_k,
+            softmax_scale=softmax_scale,
+            causal=causal,
+            window_size=window_size,
+            return_lse=return_lse,
+            out=out,
+            sink=sink,
+        )
+        if _flydsl_result is not None:
+            return _flydsl_result
+
+    if max_seqlen_q is None or max_seqlen_k is None:
+        raise ValueError(
+            "max_seqlen_q/max_seqlen_k are required for the CK fallback; the FlyDSL "
+            "path declined this configuration"
+        )
+    return mha_batch_prefill_func(
+        q,
+        k,
+        v,
+        qo_indptr,
+        kv_indptr,
+        kv_page_indices,
+        max_seqlen_q,
+        max_seqlen_k,
+        softmax_scale=softmax_scale,
+        causal=causal,
+        window_size=window_size,
+        return_lse=return_lse,
+        out=out,
+        kv_last_page_lens=kv_last_page_lens,
+        sink_size=int(window_size[2]) if len(window_size) > 2 else 0,
+        sink_ptr=sink,
+    )
+
+
 def flash_attn_fp8_pertensor_func(
     q,
     k,
