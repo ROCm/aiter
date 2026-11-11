@@ -101,7 +101,10 @@ if INTERLEAVED_LDS_LOAD not in (None, 0, 1):
 # K256 order: prefix/barrier WMMAs -> ds_first_group -> mma_first_group
 # -> ds_group -> (mma_group -> ds_group)* -> remainder -> ksl0_fence_mma.
 # Counts group existing instructions; they do not add computation.
-# Prefill means tile_m == tile_n == tile_k == 256. An omitted
+# Prefill means tile_m == tile_n == tile_k == 256 over a preshuffled A. Its
+# groups and fixed VGPR placement are tuned to that LDS layout; the same tile
+# over padded A rows (MegaMoE dispatch, unshuffled TP) keeps the earlier
+# prefill_padded groups and ordinary allocation. An omitted
 # mma_first_group uses mma_group; ds_first_group=0 skips the leading DS group.
 HYPER_PARAMS = {
     "a8w4": {
@@ -127,6 +130,18 @@ HYPER_PARAMS = {
             "ksl1_prefence_mma": 4,
             "wmma_in_barrier": 4,
         },
+        "prefill_padded": {
+            "mma_group": 15,
+            "mma_first_group": 14,
+            "ds_first_group": 15,
+            "ds_group": 0,
+            "wmma_2x4": False,
+            "tdm_early_timeout": False,
+            "ksl0_prefix_mma": 0,
+            "ksl0_fence_mma": 8,
+            "ksl1_prefence_mma": 0,
+            "wmma_in_barrier": 0,
+        },
     },
     "a4w4": {
         "default": {
@@ -151,6 +166,18 @@ HYPER_PARAMS = {
             "ksl0_fence_mma": 4,
             "ksl1_prefence_mma": 4,
             "wmma_in_barrier": 4,
+        },
+        "prefill_padded": {
+            "mma_group": 11,
+            "mma_first_group": 13,
+            "wmma_2x4": False,
+            "tdm_early_timeout": False,
+            "ds_first_group": 16,
+            "ds_group": 0,
+            "ksl0_prefix_mma": 0,
+            "ksl0_fence_mma": 8,
+            "ksl1_prefence_mma": 0,
+            "wmma_in_barrier": 0,
         },
     },
 }
@@ -363,13 +390,14 @@ def build_gemm_a8w4_tdm_task(
     wmma_m_rep = warp_tile_m // WMMA_M
     wmma_n_rep = warp_tile_n // WMMA_N
     n_acc = wmma_m_rep * wmma_n_rep
-    is_prefill = tile_m == tile_n == tile_k == 256
+    is_prefill_tile = tile_m == tile_n == tile_k == 256
+    is_prefill = is_prefill_tile and bool(a_preshuffled)
     USE_EXPLICIT_VGPR_PARTITION = bool(is_prefill and callable(sched_vgpr))
     # Only fixed high-VGPR placement needs the relaxed occupancy target.
     # Attach it per kernel; a launcher-wide hint also changes ordinary tiles.
     kernel_attrs = {"rocdl.waves_per_eu": "1"} if USE_EXPLICIT_VGPR_PARTITION else {}
     hyper_params = HYPER_PARAMS["a4w4" if a_is_fp4 else "a8w4"][
-        "prefill" if is_prefill else "default"
+        "prefill" if is_prefill else "prefill_padded" if is_prefill_tile else "default"
     ]
     sched_mma_group = hyper_params["mma_group"]
     sched_first_group = hyper_params.get("mma_first_group", sched_mma_group)
@@ -1300,6 +1328,10 @@ def build_gemm_a8w4_tdm_task(
             # LLVM can fold it into every load and materialize many full VGPR
             # addresses instead of one base plus DS offset immediates.
             # Tied input/output: identity, no instruction or memory barrier.
+            # Only the fixed VGPR placement needs this; with ordinary
+            # allocation the folded addresses run faster.
+            if const_expr(not USE_EXPLICIT_VGPR_PARTITION):
+                return fx.Int32(addr)
             return fx.Int32(
                 llvm_dialect.InlineAsmOp(
                     res=T.i32,
