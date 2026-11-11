@@ -41,6 +41,14 @@ def _gen_opus_moe_stage1_a8w4_fake_tensors(
     num_valid_ids: Tensor,
     out: Tensor,
     out_scale: Tensor,
+    topk: int,
+    block_m: int,
+    kernelName: str,
+    inter_dim_pad: int,
+    activation: int,
+    swiglu_limit: float,
+    situ_beta: float,
+    situ_linear_beta: float,
 ) -> Tensor:
     return out
 

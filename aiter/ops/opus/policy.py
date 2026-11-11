@@ -5,7 +5,7 @@
 This module runs before the exact-kid :func:`opus_gemm` or :func:`opus_bmm`
 entry. A16W16 policy validates tuned candidates and supplies explicit
 per-architecture heuristic candidates. The gfx950 MXFP8 BMM policy owns tuned
-CSV discovery, legacy-id normalization and its fallback kid/split selection.
+CSV discovery, local-id lookup and its fallback kid/split selection.
 Exact launch, workspace materialization and C++ dispatch remain outside this
 module; no policy path replaces a caller-supplied exact kid inside the public
 launcher.
@@ -20,16 +20,24 @@ import pandas as pd
 
 from aiter import logger
 from csrc.opus_gemm.opus_gemm_common import (
-    DEFAULT_COMPILED_KIDS_BY_ARCH,
+    DEFAULT_COMPILED_KIDS_BY_NAMESPACE,
     GFX942_BF16WS_EXACT_N,
+    MX32_KID_STRIDE,
     canonical_output_dtype,
     get_kernel_instance,
+    get_registry,
+    parse_integer,
 )
 
 from ...jit.core import AITER_CONFIGS, AITER_LOG_TUNED_CONFIG
+from ...jit.utils.build_targets import base_gfx_arch
 from ...jit.utils.chip_info import get_cu_num
 from ...jit.utils.chip_info import get_gfx_runtime as get_gfx
-from ..gemm_op_common import get_padded_m, with_mxscale_w_scale_block
+from ..gemm_op_common import (
+    get_padded_m,
+    mxscale_bmm_groups_of_block,
+    with_mxscale_w_scale_block,
+)
 from ._arch import GFX942, GFX950, GFX1250
 from .launch_plan import (
     A16W16LaunchPlan,
@@ -55,7 +63,7 @@ _A16W16_TUNED_KEY_COLUMNS = (
 
 @cache
 def _load_a16w16_opus_tuned() -> dict:
-    """Load only OPUS rows from the merged global A16W16 tuned config."""
+    """Load only OPUS rows from the merged A16W16 tuned config."""
     path = AITER_CONFIGS.AITER_CONFIG_GEMM_BF16_FILE
     try:
         df = pd.read_csv(path).drop_duplicates()
@@ -104,6 +112,23 @@ def _load_a16w16_opus_tuned() -> dict:
     if df.empty:
         return {}
     df[integer_columns] = numeric.loc[valid].astype("int64")
+    valid_symbols = []
+    for row in df.to_dict("records"):
+        try:
+            cu_num = parse_integer(row["cu_num"], name="saved CU count", minimum=1)
+            instance = get_kernel_instance(
+                row["gfx"], "a16w16", row["solidx"], cu_num=cu_num
+            )
+            name = str(row.get("kernelName", ""))
+            valid_symbols.append(
+                instance is not None
+                and (name in ("", "nan", "None") or name == instance.name)
+            )
+        except (ValueError, KeyError, TypeError):
+            valid_symbols.append(False)
+    df = df.loc[valid_symbols]
+    if df.empty:
+        return {}
 
     if "us" in df.columns:
         df["_opus_sort_us"] = pd.to_numeric(df["us"], errors="coerce")
@@ -158,23 +183,23 @@ def _heuristic_a16w16_kid_gfx950(
 
     if M <= 4:
         if M % 64 == 0 and N % 64 == 0 and K % 128 == 0:
-            return 1208
-        return 208
+            return 60
+        return 14
     if M <= 64:
         if M % 64 == 0 and N % 32 == 0 and K % 128 == 0:
-            return 1206
-        return 206
+            return 58
+        return 12
     if M <= 128:
         if M % 64 == 0 and N % 64 == 0 and K % 64 == 0:
-            return 1200
-        return 200
+            return 52
+        return 6
     if split_barrier_ok and not has_bias:
         if M % 256 == 0 and N % 256 == 0 and K % 64 == 0:
-            return 1300
-        return 300
+            return 76
+        return 30
     if M % 64 == 0 and N % 64 == 0 and K % 64 == 0:
-        return 1200
-    return 200
+        return 52
+    return 6
 
 
 def _heuristic_a16w16_kid_gfx1250(
@@ -190,24 +215,25 @@ def _heuristic_a16w16_kid_gfx1250(
     M, N = map(int, (M, N))
     if M % 32 == 0:
         if N % 128 == 0:
-            return 20007
+            return 7
         if N % 64 == 0:
-            return 20006
+            return 6
         if N % 32 == 0:
-            return 20005
+            return 5
     if N % 128 == 0:
-        return 20004
+        return 4
     if N % 64 == 0:
-        return 20003
-    return 20000
+        return 3
+    return 0
 
 
-@lru_cache(maxsize=1)
-def _gfx942_heuristic_symbol_to_kid() -> dict[str, int]:
+@lru_cache(maxsize=8)
+def _gfx942_heuristic_symbol_to_kid(cu_num=None) -> dict[str, int]:
     """Build the canonical gfx942 launcher-symbol mapping from the registry."""
+    cu_num = get_cu_num() if cu_num is None else cu_num
     result: dict[str, int] = {}
-    for kid in DEFAULT_COMPILED_KIDS_BY_ARCH[GFX942]:
-        instance = get_kernel_instance(GFX942, "a16w16", kid)
+    for kid in DEFAULT_COMPILED_KIDS_BY_NAMESPACE.get((GFX942, cu_num), ()):
+        instance = get_kernel_instance(GFX942, "a16w16", kid, cu_num=cu_num)
         if instance is None:
             raise RuntimeError(f"gfx942 heuristic kid {kid} has no a16w16 instance")
         previous = result.setdefault(instance.name, int(kid))
@@ -219,9 +245,9 @@ def _gfx942_heuristic_symbol_to_kid() -> dict[str, int]:
     return result
 
 
-def _gfx942_heuristic_kid_for_symbol(symbol: str) -> int:
+def _gfx942_heuristic_kid_for_symbol(symbol: str, cu_num=None) -> int:
     try:
-        return _gfx942_heuristic_symbol_to_kid()[symbol]
+        return _gfx942_heuristic_symbol_to_kid(cu_num)[symbol]
     except KeyError as exc:
         raise RuntimeError(
             f"gfx942 heuristic returned unknown launcher symbol {symbol!r}"
@@ -318,6 +344,8 @@ def _heuristic_a16w16_kid_gfx942(
     batch: int = 1,
     has_bias: bool = False,
     output_dtype: object = "bf16",
+    *,
+    cu_num: int | None = None,
 ) -> int:
     """Return the original gfx942 no-tuned-row fallback kid."""
     del batch
@@ -328,7 +356,7 @@ def _heuristic_a16w16_kid_gfx942(
         symbol = "opus_gemm_gfx942_splitk_p1_256x64x64x64_2x2_16x16x16_0x0x0"
     else:
         symbol = "opus_gemm_gfx942_splitk_legacy_512x128x128x64_2x4_16x16x16_0x0x0"
-    return _gfx942_heuristic_kid_for_symbol(symbol)
+    return _gfx942_heuristic_kid_for_symbol(symbol, cu_num)
 
 
 _A16W16_HEURISTICS = {
@@ -382,20 +410,24 @@ def select_a16w16_heuristic_kid(
     batch: int,
     has_bias: bool,
     output_dtype: object,
+    cu_num: int | None = None,
 ) -> int:
     """Select one baseline-parity A16 kid before the exact public call."""
     arch = str(arch).lower().split(":", 1)[0]
     heuristic = _A16W16_HEURISTICS.get(arch)
     if heuristic is None:
         raise ValueError(f"no OPUS a16w16 heuristic for runtime arch {arch}")
-    kid = int(heuristic(M, N, K, batch, has_bias, output_dtype))
-    if kid not in DEFAULT_COMPILED_KIDS_BY_ARCH.get(arch, frozenset()):
+    cu_num = get_cu_num() if cu_num is None else cu_num
+    args = (M, N, K, batch, has_bias, output_dtype)
+    kid = int(heuristic(*args, cu_num=cu_num) if arch == GFX942 else heuristic(*args))
+    if kid not in DEFAULT_COMPILED_KIDS_BY_NAMESPACE.get((arch, cu_num), ()):
         raise RuntimeError(
-            f"{arch} a16w16 heuristic returned kid {kid}, which is not in "
-            "DEFAULT_COMPILED_KIDS_BY_ARCH"
+            f"{arch}/{cu_num} a16w16 heuristic returned kid {kid} outside its default compile set"
         )
-    instance = get_kernel_instance(arch, "a16w16", kid)
-    if instance is not None and instance.max_m is not None and int(M) > instance.max_m:
+    instance = get_kernel_instance(arch, "a16w16", kid, cu_num=cu_num)
+    if instance is None:
+        raise ValueError(f"unknown OPUS a16w16 kernel {arch}/{cu_num}/{kid}")
+    if instance.max_m is not None and int(M) > instance.max_m:
         raise RuntimeError(
             f"opus {arch} a16w16 heuristic refuses M={M}: "
             f"kid {kid} requires M <= {instance.max_m}. "
@@ -420,11 +452,11 @@ def _resolve_a16w16_candidate(
 ) -> A16W16LaunchPlan | None:
     """Apply caller-only redirects, then validate one exact candidate."""
     if arch == GFX942 and N not in GFX942_BF16WS_EXACT_N:
-        if kid == 10210:
-            kid = 10200
-        elif kid == 10213:
-            kid = 10203
-        elif kid == 10216:
+        if kid == 9:
+            kid = 4
+        elif kid == 10:
+            kid = 6
+        elif kid == 11:
             return None
 
     try:
@@ -513,6 +545,7 @@ def resolve_a16w16_heuristic_candidate(
             batch=batch,
             has_bias=has_bias,
             output_dtype=output_dtype,
+            cu_num=cu_num,
         )
     except (TypeError, ValueError):
         return None
@@ -576,13 +609,6 @@ def resolve_a16w16_caller_candidate(
 
 # ---- gfx950 MXFP8 BMM tuned-row and heuristic policy ---------------------
 
-_MXSCALE_BMM_KID_OFFSET = 8000
-# Upper end of the pre-globalisation id space a tuned CSV may still be written
-# in. Raised past 653 for the GROUP_N=GROUP_K=32 twins, which sit at their
-# mirror's id plus 1000. Still unambiguous: every local id stays below the 8000
-# offset, so widening the window only admits ids that would otherwise have been
-# rejected outright. The row-major 1x32 twins sit at 1800-1899.
-_MXSCALE_BMM_LOCAL_KID_MAX = 1899
 _TUNED_PERF_COLUMNS = ("us", "tflops", "bw", "errRatio")
 _C_INT_MAX = (1 << 31) - 1
 
@@ -627,7 +653,7 @@ def _load_mxscale_bmm_tuned(
         logger.warning("MXFP8 BMM tuned CSV was not found at %s", path)
         return {}
 
-    required = {"gfx", "b", "m", "n", "k", "kernelId", "splitK"}
+    required = {"gfx", "cu_num", "b", "m", "n", "k", "kernelId", "splitK"}
     missing = required.difference(df.columns)
     if missing:
         raise ValueError(f"MXFP8 BMM tuned CSV is missing columns {sorted(missing)}")
@@ -642,10 +668,8 @@ def _load_mxscale_bmm_tuned(
         else pd.Series(True, index=df.index, dtype=bool)
     )
 
-    # Normalize legacy local ids, then validate each complete saved launch.
+    # Validate each complete saved launch in its gfx/CU table.
     opus_kids = pd.to_numeric(df.loc[opus_rows, "kernelId"], errors="coerce")
-    legacy_rows = opus_kids.between(0, _MXSCALE_BMM_LOCAL_KID_MAX)
-    opus_kids.loc[legacy_rows] += _MXSCALE_BMM_KID_OFFSET
     integer_kids = (
         opus_kids.notna() & opus_kids.lt(float("inf")) & opus_kids.eq(opus_kids.round())
     )
@@ -654,7 +678,19 @@ def _load_mxscale_bmm_tuned(
         kid = int(opus_kids.at[index])
         arch = str(df.at[index, "gfx"]).lower().split(":", 1)[0]
         try:
-            if mxscale_bmm_kid_block(kid) != df.at[index, "w_scale_block"]:
+            cu_num = parse_integer(
+                df.at[index, "cu_num"], name="saved CU count", minimum=1
+            )
+            instance = get_kernel_instance(arch, "a8w8_mxscale_bmm", kid, cu_num=cu_num)
+            name = str(df.at[index, "kernelName"]) if "kernelName" in df else ""
+            if instance is None or (
+                name not in ("", "nan", "None") and name != instance.name
+            ):
+                raise ValueError("saved kernel symbol disagrees with the catalog")
+            if (
+                mxscale_bmm_kid_block(kid, gfx=arch, cu_num=cu_num)
+                != df.at[index, "w_scale_block"]
+            ):
                 raise ValueError("kid and weight-scale block disagree")
             split_k = _parse_mxscale_bmm_tuned_split_k(df.at[index, "splitK"])
             batch, m, n, k = (
@@ -669,6 +705,7 @@ def _load_mxscale_bmm_tuned(
                 n,
                 k,
                 split_k,
+                cu_num,
             )
         except (TypeError, ValueError, OverflowError):
             continue
@@ -695,7 +732,7 @@ def _load_mxscale_bmm_tuned(
     # could hand a 128 kid a scale buffer with sixteen times the entries -- not
     # a shape error downstream, just the wrong stride, so a plausible wrong
     # answer at full speed.
-    shape_keys = ["gfx", "b", "m", "n", "k", "w_scale_block"]
+    shape_keys = ["gfx", "cu_num", "b", "m", "n", "k", "w_scale_block"]
     duplicate_shapes = df.duplicated(subset=shape_keys, keep=False)
     if duplicate_shapes.any():
         rows = df.loc[duplicate_shapes, shape_keys].drop_duplicates().to_dict("records")
@@ -713,6 +750,8 @@ def lookup_mxscale_bmm_config(
     w_scale_block: str = "128x128",
     libtype: str | None = None,
     bpreshuffle: bool = False,
+    gfx: str | None = None,
+    cu_num: int | None = None,
 ):
     """Return the exact or existing padded-M tuned row for one shape.
 
@@ -723,12 +762,18 @@ def lookup_mxscale_bmm_config(
     for OPUS), and it selects among rows rather than describing them: a row
     tuned for one block is meaningless for the other.
     """
-    gfx = get_gfx()
+    if gfx is None:
+        gfx = get_gfx()
+    if cu_num is None:
+        cu_num = get_cu_num()
     tuned = _load_mxscale_bmm_tuned(libtype, bpreshuffle)
+    # A0 bring-up: reuse gfx1250 family tuned rows when strict has none.
+    if base_gfx_arch(gfx) != gfx and gfx not in {key[0] for key in tuned}:
+        gfx = base_gfx_arch(gfx)
     row, padded_m = None, m
     for gl in (None, 0, 1):
         padded_m = m if gl is None else get_padded_m(m, n, k, gl)
-        row = tuned.get((gfx, b, padded_m, n, k, w_scale_block))
+        row = tuned.get((gfx, cu_num, b, padded_m, n, k, w_scale_block))
         if row is not None:
             break
 
@@ -768,17 +813,10 @@ def mxscale_bmm_group_of_block(w_scale_block: str) -> int:
     return mxscale_bmm_groups_of_block(w_scale_block)[1]
 
 
-def mxscale_bmm_groups_of_block(w_scale_block: str) -> tuple[int, int]:
-    groups = {"1x32": (1, 32), "32x32": (32, 32), "128x128": (128, 128)}
-    if w_scale_block not in groups:
-        raise ValueError(f"unsupported OPUS MXFP8 BMM scale block {w_scale_block!r}")
-    return groups[w_scale_block]
-
-
 def _heuristic_mxscale_bmm_kid(
-    g: int, m: int, n: int, k: int, *, group_size: int = 128
+    g: int, m: int, n: int, k: int, *, group_size: int = 128, gfx=None, cu_num=None
 ) -> int:
-    """Choose a final global row-major kid when the tuned table has no usable row.
+    """Choose a final local row-major kid when the tuned table has no usable row.
 
     GROUP_K=32 takes each pick's twin (kid + 1000).
     """
@@ -793,36 +831,44 @@ def _heuristic_mxscale_bmm_kid(
         and divisible(k, 256)
         and (m >= 2048 or (m >= 1024 and g >= 8))
     ):
-        return offset + (8158 if 4096 <= k <= 8192 else 8157 if k > 8192 else 8150)
-    if m < 64:
-        return offset + (8640 if divisible(n, 64) and divisible(k, 256) else 8653)
-    if m <= 256 and k <= 1024 and divisible(n, 32) and divisible(k, 256):
-        return offset + 8320
-    if divisible(n, 64) and divisible(k, 128):
-        return offset + 8653
-    return offset + 8000
+        seed = offset + (16 if 4096 <= k <= 8192 else 154 if k > 8192 else 15)
+    elif m < 64:
+        seed = offset + (140 if divisible(n, 64) and divisible(k, 256) else 144)
+    elif m <= 256 and k <= 1024 and divisible(n, 32) and divisible(k, 256):
+        seed = offset + 71
+    elif divisible(n, 64) and divisible(k, 128):
+        seed = offset + 144
+    else:
+        seed = offset
+    gfx = gfx or get_gfx()
+    cu_num = get_cu_num() if cu_num is None else cu_num
+    if get_kernel_instance(gfx, "a8w8_mxscale_bmm", seed, cu_num=cu_num) is None:
+        raise ValueError(f"no OPUS MXFP8 BMM heuristic for {gfx}")
+    return seed
 
 
 # (B_M, B_N, workgroups per CU) of the flatmm split-K tiles the untuned plan
 # picks among, in 128x128 numbering; the GROUP_K=32 twins are kid + 1000.
 _MX_PLAN_TILES = {
-    8314: (16, 32, 2),
-    8319: (16, 32, 4),
-    8320: (64, 32, 2),
-    8321: (32, 32, 2),
-    8653: (64, 64, 2),
-    8137: (128, 128, 1),
+    66: (16, 32, 2),
+    70: (16, 32, 4),
+    71: (64, 32, 2),
+    72: (32, 32, 2),
+    144: (64, 64, 2),
+    8: (128, 128, 1),
 }
 
 
-def _heuristic_mxscale_bmm_plans(g: int, m: int, n: int, k: int, offset: int):
+def _heuristic_mxscale_bmm_plans(
+    g: int, m: int, n: int, k: int, offset: int, cu_num: int
+):
     """Untuned (kid, split) candidates, best first.
 
     The tile follows the output size E = G*M*N, measured on gfx950 over
     G 1-16, M 1-2048, N 512-7168, K 1024-16384. Below M 64 the tile is as
     tall as M needs, since every padded row is weight bandwidth spent for
     nothing. The 256x256 pipeline needs about 2**23 outputs to fill the GPU
-    from K 4096 up (past 8192 on the sliding-panel 8157); at short K it is
+    from K 4096 up (past 8192 on the sliding-panel 154); at short K it is
     prologue bound and wants twice that. Split-K only pays at
     K >= 8192, and only while the tiles leave the CUs half empty, keeping at
     least 2048 of K per split.
@@ -830,25 +876,25 @@ def _heuristic_mxscale_bmm_plans(g: int, m: int, n: int, k: int, offset: int):
     e = g * m * n
     if m < 64:
         if m <= 16 or (m <= 48 and e < 1 << 16):
-            kid = 8319
+            kid = 70
         elif m <= 32:
-            kid = 8321
+            kid = 72
         elif n % 64 == 0 and e >= 1 << 19:
-            kid = 8653
+            kid = 144
         else:
-            kid = 8320
+            kid = 71
     else:
         big_log2 = 23 + (2 if k <= 1024 else 1 if k < 4096 else 0)
         if n % 256 == 0 and k % 256 == 0 and e >= 1 << big_log2:
-            yield offset + (8158 if k <= 8192 else 8157), 1
+            yield offset + (16 if k <= 8192 else 154), 1
         if m > 64 and k >= 2048 and n % 128 == 0 and e >= 1 << (20 if k > 8192 else 21):
-            kid = 8137
+            kid = 8
         elif e <= 1 << 16 and k % 512 == 0:
-            kid = 8314
+            kid = 66
         elif n % 64 == 0 and (e >= 1 << 19 or k >= 8192):
-            kid = 8653
+            kid = 144
         else:
-            kid = 8321
+            kid = 72
     block_m, block_n, wg_per_cu = _MX_PLAN_TILES[kid]
     tiles = g * -(-m // block_m) * -(-n // block_n)
     split_k = 1
@@ -856,7 +902,7 @@ def _heuristic_mxscale_bmm_plans(g: int, m: int, n: int, k: int, offset: int):
         split_k < 8
         and k >= 8192
         and k // (2 * split_k) >= 2048
-        and tiles * 4 * split_k <= 2 * get_cu_num() * wg_per_cu
+        and tiles * 4 * split_k <= 2 * cu_num * wg_per_cu
     ):
         split_k *= 2
     yield offset + kid, split_k
@@ -866,66 +912,72 @@ def _heuristic_mxscale_bmm_plans(g: int, m: int, n: int, k: int, offset: int):
 
 # Row-major-weight 1x32 fallback candidates, most to least preferred; each
 # later one needs less N/K alignment.
-_MX1X32_FALLBACK = (9853, 9840, 9820, 9800, 9818)
+_MX1X32_FALLBACK = (2144, 2140, 2071, 2000, 2069)
 
 
 @cache
-def _mx1x32_twins() -> dict[int, int]:
+def _mx1x32_twins(gfx: str, cu_num: int) -> dict[int, int]:
     """{32x32 kid: the row-major 1x32 kid of the same tile}, matched by name."""
-    from csrc.opus_gemm.opus_gemm_common import a8w8_mxscale_bmm_kernel_lists
+    registry = get_registry("a8w8_mxscale_bmm", gfx, cu_num)
 
     by_name = {
         inst.name: int(kid)
-        for fam in a8w8_mxscale_bmm_kernel_lists
-        for kid, inst in fam.items()
+        for kid, inst in registry.items()
         if inst.GROUP_N == 1 and not inst.needs_preshuffled_b
     }
     return {
         int(kid): by_name[inst.name.replace("_1x32x32", "_1x1x32")]
-        for fam in a8w8_mxscale_bmm_kernel_lists
-        for kid, inst in fam.items()
+        for kid, inst in registry.items()
         if inst.GROUP_N == 32
         and inst.GROUP_K == 32
         and inst.name.replace("_1x32x32", "_1x1x32") in by_name
     }
 
 
-def _mx1x32_twin(kid32: int, g: int, m: int, n: int, k: int) -> int | None:
+def _mx1x32_twin(
+    kid32: int, g: int, m: int, n: int, k: int, *, gfx: str, cu_num: int
+) -> int | None:
     """The 1x32 kid of a 32x32 pick: same tile, per-row B scales.
 
     The 256x256 pipeline tiles stage a sliding B-row window next to the A panel
-    (9894), which takes a narrower window than the 32x32 tile; below 2**24
-    output elements a flatmm tile is still ahead of it: the 256-wide 9825
-    up to its 64 K-tiles, the 128x128 9837 past them.
+    (2154), which takes a narrower window than the 32x32 tile; below 2**24
+    output elements a flatmm tile is still ahead of it: the 256-wide 2076
+    up to its 64 K-tiles, the 128x128 2008 past them.
     """
-    if kid32 in (9150, 9157, 9158):
+    if kid32 in (1015, 1154, 1016):
         if g * m * n >= 1 << 24:
-            return 9894
-        return 9825 if k <= 8192 else 9837
-    return _mx1x32_twins().get(kid32)
+            return 2154
+        return 2076 if k <= 8192 else 2008
+    return _mx1x32_twins(gfx, cu_num).get(kid32)
 
 
-def _heuristic_mxscale_bmm_1x32_kid(g: int, m: int, n: int, k: int) -> tuple[int, int]:
+def _heuristic_mxscale_bmm_1x32_kid(
+    g: int, m: int, n: int, k: int, *, gfx: str, cu_num: int
+) -> tuple[int, int]:
     """The 1x32 twin of the 32x32 plan, else the first fallback that runs.
 
-    The 18xx tiles measure within a few percent of their 32x32 twins, so the
+    The row-major 1x32 tiles measure within a few percent of their 32x32 twins, so the
     32x32 table (and heuristic) already ranks them for the shape.
     """
     candidates = []
     try:
         kid32, split32 = resolve_a8w8_mxscale_bmm_plan(
-            g, m, n, k, w_scale_block="32x32"
+            g, m, n, k, w_scale_block="32x32", gfx=gfx, cu_num=cu_num
         )
     except (TypeError, ValueError, OverflowError):
         kid32, split32 = None, 1
-    twin = None if kid32 is None else _mx1x32_twin(kid32, g, m, n, k)
+    twin = (
+        None
+        if kid32 is None
+        else _mx1x32_twin(kid32, g, m, n, k, gfx=gfx, cu_num=cu_num)
+    )
     if twin is not None:
         candidates += [(twin, split32), (twin, 1)]
     candidates += [(kid, 1) for kid in _MX1X32_FALLBACK]
     for kid, split_k in dict.fromkeys(candidates):
         try:
             plan = _get_cached_a8w8_mxscale_bmm_plan(
-                get_gfx(), kid, "bf16", m, g, n, k, split_k
+                gfx, kid, "bf16", m, g, n, k, split_k, cu_num=cu_num
             )
         except (TypeError, ValueError, OverflowError):
             continue
@@ -935,8 +987,8 @@ def _heuristic_mxscale_bmm_1x32_kid(g: int, m: int, n: int, k: int) -> tuple[int
     )
 
 
-# Preshuffled-B fallback candidates by M band, in local ids (GROUP_K=128 adds
-# 8000, GROUP_K=32 9000). The first of each band is what the tuned table picks
+# Preshuffled-B fallback candidates by M band, in local ids (GROUP_K=32 adds
+# MX32_KID_STRIDE). The first of each band is what the tuned table picks
 # there most often at K=4096; the later ones only have to run where it cannot,
 # which is why each band ends in the 32-wide, 128-deep tiles that divide any N
 # and K the family accepts at all, and then in the compact tiles.
@@ -951,9 +1003,9 @@ def _heuristic_mxscale_bmm_1x32_kid(g: int, m: int, n: int, k: int) -> tuple[int
 # tile can prefetch; it goes last so it only answers shapes the bands drop.
 # GROUP_K=32 has no compact twin and so keeps the band tiles' K floor.
 _BPRESHUFFLE_FALLBACK_BANDS = (
-    (64, (179, 398, 171, 338, 483, 484)),
-    (512, (171, 175, 338, 398, 483, 484)),
-    (None, (205, 348, 175, 338, 398, 484, 483)),
+    (64, (28, 88, 24, 80, 138, 139)),
+    (512, (24, 27, 80, 88, 138, 139)),
+    (None, (34, 83, 27, 80, 88, 139, 138)),
 )
 
 
@@ -966,49 +1018,47 @@ def _heuristic_mxscale_bmm_bpreshuffle_kid(
     group_size: int = 128,
     group_n: int | None = None,
     output_dtype="bf16",
+    gfx: str | None = None,
+    cu_num: int | None = None,
 ) -> int | None:
     """A preshuffled-B kid that runs this shape, for a shape the table lacks.
 
     Per-row K32 scales prefer larger tiles for sufficiently large output grids.
     Every candidate is checked for admissibility; None when no candidate runs.
     """
+    gfx = gfx or get_gfx()
+    cu_num = get_cu_num() if cu_num is None else cu_num
+    scope = {"gfx": gfx, "cu_num": cu_num}
     _validate_mxscale_bmm_group_size(group_size)
     group_n = group_size if group_n is None else group_n
     block = f"{group_n}x{group_size}"
     mxscale_bmm_groups_of_block(block)
+
     if block == "1x32":
         # The 64x64 tile amortizes operand/scale loads once there are enough
         # output tiles. Smaller grids retain the decode tiles; tuned rows can
         # additionally choose split-K. Keep K128/N16 alignment fallbacks.
         wide_tiles = g * ((m + 63) // 64) * (n // 64)
-        preferred = (9713,) if m >= 64 and wide_tiles >= 256 else ()
+        preferred = (242,) if m >= 64 and wide_tiles >= 256 else ()
         if m >= 256:
-            preferred += (9703,)
-        for kid in (*preferred, 9700, 9704, 9708, 9710):
-            try:
-                _get_cached_a8w8_mxscale_bmm_plan(
-                    get_gfx(), kid, output_dtype, m, g, n, k, 1
-                )
-            except (TypeError, ValueError, OverflowError):
-                continue
-            return kid
-        return None
-    base = 9000 if group_size == 32 else 8000
-    candidates = next(
-        c for bound, c in _BPRESHUFFLE_FALLBACK_BANDS if bound is None or m <= bound
-    )
-    for local in candidates:
-        kid = base + local
+            preferred += (234,)
+        candidates = (*preferred, 231, 235, 239, 241)
+    else:
+        candidates = next(
+            c for bound, c in _BPRESHUFFLE_FALLBACK_BANDS if bound is None or m <= bound
+        )
+    for kid in candidates:
+        if block != "1x32" and group_size == 32:
+            kid += MX32_KID_STRIDE
         if not (
-            mxscale_bmm_kid_group(kid) == group_size
-            and mxscale_bmm_kid_takes_b_layout(kid, True)
-            and mxscale_bmm_kid_takes_plain_scales(kid)
-            and mxscale_bmm_kid_runs_m(kid, m)
+            mxscale_bmm_kid_block(kid, **scope) == block
+            and mxscale_bmm_kid_takes_b_layout(kid, True, **scope)
+            and mxscale_bmm_kid_takes_plain_scales(kid, **scope)
         ):
             continue
         try:
             _get_cached_a8w8_mxscale_bmm_plan(
-                get_gfx(), kid, output_dtype, m, g, n, k, 1
+                gfx, kid, output_dtype, m, g, n, k, 1, cu_num=cu_num
             )
         except (TypeError, ValueError, OverflowError):
             continue
@@ -1016,28 +1066,16 @@ def _heuristic_mxscale_bmm_bpreshuffle_kid(
     return None
 
 
-# ---- kid admissibility -----------------------------------------------------
-#
-# Three properties of a kid that a caller cannot infer from the tensors it
-# holds, and that therefore have to be checked against the catalog before a kid
-# is dispatched. Two of them fail silently if they are not:
-#
-#   * B layout. A (16,16) preshuffled weight has the same shape, dtype and
-#     strides as a row-major one, so a mismatched kid reads the right bytes in
-#     the wrong order and returns a plausible wrong answer.
-#   * Scale layout. Same hazard: an M-packed or shuffle_scale panel holds the
-#     same bytes in another order.
-#   * M alignment. This one throws in the launcher, so it is the benign case.
-#
-# All three read the codegen catalog, which is also what the tuner filters on --
-# a hand-kept list here disagreed with the tuner's once and cost ~9% at the wo_a
-# decode shapes, so there is one source of truth on purpose.
+# Read kernel layout, scale grouping and M alignment from the registry.
 
 
 @cache
-def _mxscale_bmm_kid_table() -> dict[int, tuple[int, bool, bool, int, int]]:
+def _mxscale_bmm_kid_table(
+    gfx=None, cu_num=None
+) -> dict[int, tuple[int, bool, bool, int, int]]:
     """kid -> (m_align, needs_preshuffled_b, needs_host_rearranged_scales, GROUP_K)."""
-    from csrc.opus_gemm.opus_gemm_common import a8w8_mxscale_bmm_kernel_lists
+    gfx = gfx or get_gfx()
+    cu_num = get_cu_num() if cu_num is None else cu_num
 
     return {
         int(kid): (
@@ -1047,38 +1085,39 @@ def _mxscale_bmm_kid_table() -> dict[int, tuple[int, bool, bool, int, int]]:
             int(inst.GROUP_K),
             int(inst.GROUP_N),
         )
-        for fam in a8w8_mxscale_bmm_kernel_lists
-        for kid, inst in fam.items()
+        for kid, inst in get_registry("a8w8_mxscale_bmm", gfx, cu_num).items()
     }
 
 
-def mxscale_bmm_kid_runs_m(kid: int, m: int) -> bool:
+def mxscale_bmm_kid_runs_m(kid: int, m: int, *, gfx=None, cu_num=None) -> bool:
     """True iff kid's launcher accepts this M. Unknown kid -> False."""
-    entry = _mxscale_bmm_kid_table().get(int(kid))
+    entry = _mxscale_bmm_kid_table(gfx, cu_num).get(int(kid))
     return entry is not None and m % entry[0] == 0
 
 
-def mxscale_bmm_kid_takes_b_layout(kid: int, b_preshuffled: bool) -> bool:
+def mxscale_bmm_kid_takes_b_layout(
+    kid: int, b_preshuffled: bool, *, gfx=None, cu_num=None
+) -> bool:
     """True iff kid wants B in the layout the caller says it has."""
-    entry = _mxscale_bmm_kid_table().get(int(kid))
+    entry = _mxscale_bmm_kid_table(gfx, cu_num).get(int(kid))
     return entry is not None and entry[1] == bool(b_preshuffled)
 
 
-def mxscale_bmm_kid_takes_plain_scales(kid: int) -> bool:
+def mxscale_bmm_kid_takes_plain_scales(kid: int, *, gfx=None, cu_num=None) -> bool:
     """True iff kid reads x_scale / w_scale as the public entry passes them."""
-    entry = _mxscale_bmm_kid_table().get(int(kid))
+    entry = _mxscale_bmm_kid_table(gfx, cu_num).get(int(kid))
     return entry is not None and not entry[2]
 
 
-def mxscale_bmm_kid_group(kid: int) -> int | None:
+def mxscale_bmm_kid_group(kid: int, *, gfx=None, cu_num=None) -> int | None:
     """The kid's quantisation block (GROUP_K), or None for an unknown kid."""
-    entry = _mxscale_bmm_kid_table().get(int(kid))
+    entry = _mxscale_bmm_kid_table(gfx, cu_num).get(int(kid))
     return None if entry is None else entry[3]
 
 
-def mxscale_bmm_kid_block(kid: int) -> str | None:
+def mxscale_bmm_kid_block(kid: int, *, gfx=None, cu_num=None) -> str | None:
     """Complete weight-scale block, including independent N grouping."""
-    entry = _mxscale_bmm_kid_table().get(int(kid))
+    entry = _mxscale_bmm_kid_table(gfx, cu_num).get(int(kid))
     return None if entry is None else f"{entry[4]}x{entry[3]}"
 
 
@@ -1089,10 +1128,15 @@ def resolve_a8w8_mxscale_bmm_plan(
     k: int,
     *,
     w_scale_block: str = "128x128",
+    gfx: str | None = None,
+    cu_num: int | None = None,
 ) -> tuple[int, int]:
-    """Resolve one final global kid/split pair for the caller's scale blocks."""
+    """Resolve one final local kid/split pair for the caller's scale blocks."""
+    gfx = gfx or get_gfx()
+    cu_num = get_cu_num() if cu_num is None else cu_num
+    scope = {"gfx": gfx, "cu_num": cu_num}
     group_size = mxscale_bmm_group_of_block(w_scale_block)
-    config = lookup_mxscale_bmm_config(g, m, n, k, w_scale_block=w_scale_block)
+    config = lookup_mxscale_bmm_config(g, m, n, k, w_scale_block=w_scale_block, **scope)
     libtype = config.get("libtype", "opus") if config is not None else "opus"
     if libtype != "opus":
         raise NotImplementedError(
@@ -1103,19 +1147,19 @@ def resolve_a8w8_mxscale_bmm_plan(
         try:
             kid = int(config["kernelId"])
             if not (
-                mxscale_bmm_kid_takes_b_layout(kid, False)
-                and mxscale_bmm_kid_takes_plain_scales(kid)
+                mxscale_bmm_kid_takes_b_layout(kid, False, **scope)
+                and mxscale_bmm_kid_takes_plain_scales(kid, **scope)
             ):
                 raise ValueError(
                     f"kid {kid} wants a preshuffled B or host-rearranged scales"
                 )
-            if mxscale_bmm_kid_block(kid) != w_scale_block:
+            if mxscale_bmm_kid_block(kid, **scope) != w_scale_block:
                 raise ValueError(
                     f"kid {kid} does not take w_scale_block={w_scale_block}"
                 )
             split_k = _parse_mxscale_bmm_tuned_split_k(config["splitK"])
             plan = _get_cached_a8w8_mxscale_bmm_plan(
-                get_gfx(),
+                gfx,
                 kid,
                 "bf16",
                 m,
@@ -1123,6 +1167,7 @@ def resolve_a8w8_mxscale_bmm_plan(
                 n,
                 k,
                 split_k,
+                cu_num,
             )
         except (TypeError, ValueError, OverflowError) as exc:
             logger.warning(
@@ -1141,17 +1186,17 @@ def resolve_a8w8_mxscale_bmm_plan(
             return plan.resolved_kid, plan.abi_split_k
 
     if w_scale_block == "1x32":
-        return _heuristic_mxscale_bmm_1x32_kid(g, m, n, k)
+        return _heuristic_mxscale_bmm_1x32_kid(g, m, n, k, **scope)
     offset = 1000 if group_size == 32 else 0
-    for kid, split_k in _heuristic_mxscale_bmm_plans(g, m, n, k, offset):
+    for kid, split_k in _heuristic_mxscale_bmm_plans(g, m, n, k, offset, cu_num):
         try:
             plan = _get_cached_a8w8_mxscale_bmm_plan(
-                get_gfx(), kid, "bf16", m, g, n, k, split_k
+                gfx, kid, "bf16", m, g, n, k, split_k, cu_num=cu_num
             )
         except (TypeError, ValueError, OverflowError):
             continue
         return plan.resolved_kid, plan.abi_split_k
-    kid = _heuristic_mxscale_bmm_kid(g, m, n, k, group_size=group_size)
+    kid = _heuristic_mxscale_bmm_kid(g, m, n, k, group_size=group_size, **scope)
     return kid, 1
 
 

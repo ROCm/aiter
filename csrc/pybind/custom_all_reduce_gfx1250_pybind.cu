@@ -29,10 +29,30 @@ PYBIND11_MODULE(AITER_EXTENSION_NAME, m)
     m.def("all_gather", &aiter::all_gather,
           py::arg("_fa"), py::arg("inp"), py::arg("out"),
           py::arg("dim"), py::arg("reg_inp_ptr"), py::arg("reg_inp_bytes"));
+    m.def("fused_allreduce_rmsnorm", &aiter::fused_allreduce_rmsnorm,
+          py::arg("_fa"), py::arg("inp"), py::arg("res_inp"), py::arg("res_out"),
+          py::arg("out"), py::arg("w"), py::arg("eps"),
+          py::arg("reg_ptr"), py::arg("reg_bytes"),
+          py::arg("use_1stage"), py::arg("gemma_norm") = false);
+    m.def("fused_allreduce_rmsnorm_quant", &aiter::fused_allreduce_rmsnorm_quant,
+          py::arg("_fa"), py::arg("inp"), py::arg("res_inp"), py::arg("res_out"),
+          py::arg("out"), py::arg("scale_out"), py::arg("w"), py::arg("eps"),
+          py::arg("reg_ptr"), py::arg("reg_bytes"),
+          py::arg("use_1stage"), py::arg("gemma_norm") = false,
+          py::arg("bf16_out_ptr") = 0);
     m.def("p2p_bw_test", &aiter::p2p_bw_test,
           py::arg("_fa"), py::arg("inp"), py::arg("out"),
           py::arg("unroll"), py::arg("threads"), py::arg("blocks"),
           py::arg("reg_inp_ptr"), py::arg("reg_inp_bytes"));
+    m.def("lamport_ar_rms_buffer_size", &aiter::lamport_ar_rms_buffer_size,
+          py::arg("world_size"), py::arg("max_bytes"));
+    m.def("init_lamport_ar_rms", &aiter::init_lamport_ar_rms,
+          py::arg("_fa"), py::arg("all_ptrs"), py::arg("max_bytes"));
+    m.def("fused_allreduce_rmsnorm_lamport", &aiter::fused_allreduce_rmsnorm_lamport,
+          py::arg("_fa"), py::arg("inp"), py::arg("res_inp"), py::arg("res_out"),
+          py::arg("out"), py::arg("w"), py::arg("eps"), py::arg("gemma_norm") = false);
+    m.def("allreduce_add_lamport", &aiter::allreduce_add_lamport,
+          py::arg("_fa"), py::arg("inp"), py::arg("other"), py::arg("out"));
     m.def("dispose", &aiter::dispose, py::arg("_fa"));
     // Default is the max world size, so callers that omit it get a buffer safe
     // for every supported world size.
@@ -52,6 +72,10 @@ PYBIND11_MODULE(AITER_EXTENSION_NAME, m)
           py::arg("_fa"), py::arg("ptrs_out"));
     m.def("register_graph_buffers", &aiter::register_graph_buffers,
           py::arg("_fa"), py::arg("ptrs_per_rank"));
+    m.def("get_graph_buffer_ipc_meta", &aiter::get_graph_buffer_ipc_meta,
+          py::arg("_fa"), py::arg("handle_out"), py::arg("offset_out"));
+    m.def("register_graph_buffers_ipc", &aiter::register_graph_buffers_ipc,
+          py::arg("_fa"), py::arg("handle_ptrs"), py::arg("offset_ptrs"));
     m.def("start_sync_latency", &aiter::start_sync_latency,
           py::arg("_fa"), py::arg("blocks"));
     m.def("end_sync_latency", &aiter::end_sync_latency,
