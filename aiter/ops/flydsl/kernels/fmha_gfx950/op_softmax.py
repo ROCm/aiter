@@ -8,7 +8,7 @@ import flydsl.compiler as flyc
 import flydsl.expr as fx
 from flydsl._mlir.dialects import llvm
 from flydsl.expr import as_ir_value as as_mlir_value
-from flydsl.expr import range_constexpr, rocdl
+from flydsl.expr import const_expr, range_constexpr, rocdl
 from flydsl.expr.typing import T
 from flydsl.expr.typing import Vector as Vec
 
@@ -19,8 +19,10 @@ from aiter.ops.flydsl.kernels.fmha_gfx950.pipeline import (
     _apply_dualwave_causal_mask_pair,
     _attn_mask_vec2_imm,
     _exp2_score_slice,
+    _lane_pair_reduce,
     _p_headroom_log2,
     _read_exec_i64,
+    _reduce_score_pair,
     _scale_o_accs,
     _scale_sub_score_pair,
     _score_lists_to_vecs,
@@ -260,3 +262,120 @@ class DualwaveFp8SoftmaxHelper(DualwaveFp8KernelContext):
             return (o_out, m_out, l_out)
 
         return _run(v_o, m_row, l_row, m_tile_max)
+
+    # conventional_bn64 softmax. The loop carries nsm = bias - scale * m instead of the row max m, and l as this lane's
+    # half-row sum (both lane halves of a row rescale by the same factor, so the halves meet once in the epilogue).
+    # The default body and _store_lse keep the m-carry above.
+
+    def nsm_init(self):
+        """Huge finite offset (m at the floor): the first tile always rebases, a keyless row keeps P = exp2(-inf) = 0,
+        and no -inf/inf pair meets in the FMA."""
+        return fx.Float32(3.0e38)
+
+    def half_row_max(self, v_s):
+        """This lane's half-row max: "every lane within the threshold" is the same test as with the full row max."""
+        reducer = lambda a, b, _fm: fx.maxnumf(a, b)
+        return fx.maxnumf(
+            _reduce_score_pair(v_s, self.c_neg_inf, reducer, self.fm_fast),
+            self.c_neg_floor,
+        )
+
+    def _rebase_nsm(self, v_o, nsm, l_row, m_half):
+        """Rebase to the whole row's max, so both lane halves of a row agree on the offset. Monotonic (nsm only falls):
+        corr <= 1."""
+        m_row_tile = _lane_pair_reduce(m_half, lambda a, b, _fm: fx.maxnumf(a, b), None)
+        bias = fx.Float32(_p_headroom_log2(self.traits))
+        nsm_new = fx.minnumf(
+            fx.Float32(nsm), bias - fx.Float32(m_row_tile) * self.c_logit_scale
+        )
+        corr = fx.math.exp2(fx.Float32(nsm_new - nsm), fastmath="afn").ir_value()
+        scaled_accs = list(v_o)
+        self.scale_o(scaled_accs, corr)
+        return (
+            [
+                as_mlir_value(scaled_accs[dc])
+                for dc in range_constexpr(self.traits.D_CHUNKS)
+            ],
+            nsm_new,
+            l_row * corr,
+        )
+
+    def rebase_nsm(self, v_o, nsm, l_row, m_half):
+        """Eager rescale (no lazy threshold): rebase every tile."""
+        return self._rebase_nsm(v_o, nsm, l_row, m_half)
+
+    def lazy_correct_o_nsm(self, v_o, nsm, l_row, m_half):
+        """lazy_correct_o on the nsm carry: the test is one FMA, scale * m_tile + nsm <= thr + bias."""
+        limit = fx.Float32(
+            self.traits.DUALWAVE_SWP_RESCALE_THRESHOLD + _p_headroom_log2(self.traits)
+        )
+
+        @flyc.jit
+        def _run(v_o, nsm, l_row, m_half):
+            t = fx.Float32(m_half) * self.c_logit_scale + nsm
+            # Finite clamped max and finite offset: t is never NaN, so "no lane above" reads straight off VCC.
+            above = t > limit
+            ballot = rocdl.ballot(T.i64, as_mlir_value(above))
+            all_below = (fx.Int64(ballot) == fx.Int64(0)).ir_value()
+            all_below = llvm.intr_expect(all_below, fx.Boolean(True).ir_value())
+
+            o_out = [
+                as_mlir_value(v_o[dc]) for dc in range_constexpr(self.traits.D_CHUNKS)
+            ]
+            n_out = as_mlir_value(nsm)
+            l_out = as_mlir_value(l_row)
+            if fx.Boolean(all_below):
+                pass
+            else:
+                scaled, nsm_new, l_new = self._rebase_nsm(v_o, nsm, l_row, m_half)
+                o_out = [
+                    as_mlir_value(scaled[dc])
+                    for dc in range_constexpr(self.traits.D_CHUNKS)
+                ]
+                l_out = as_mlir_value(l_new)
+                n_out = self.anchor_scalar_f32(nsm_new)
+            return (o_out, n_out, l_out)
+
+        return _run(v_o, nsm, l_row, m_half)
+
+    def sub_nsm(self, v_s, nsm, scalar):
+        """scale * s + nsm. scalar: one v_fma_f32 per score (SLP is off for this variant), which co-issues under the
+        MFMAs where a packed FMA waits for the matrix pipe."""
+        s_lo, s_hi = v_s
+        if const_expr(not scalar):
+            scale_v = fx.full(16, fx.Float32(self.c_logit_scale), fx.Float32)
+            nsm_v = fx.full(16, fx.Float32(nsm), fx.Float32)
+            lo = fx.fma(Vec(s_lo), scale_v, nsm_v, fastmath=self.fm_fast)
+            hi = fx.fma(Vec(s_hi), scale_v, nsm_v, fastmath=self.fm_fast)
+            return as_mlir_value(lo), as_mlir_value(hi)
+        out = []
+        for vec in (s_lo, s_hi):
+            vals = [
+                fx.fma(
+                    fx.Float32(Vec(vec)[r]),
+                    fx.Float32(self.c_logit_scale),
+                    fx.Float32(nsm),
+                )
+                for r in range_constexpr(16)
+            ]
+            out.append(Vec.from_elements(vals, fx.Float32).ir_value())
+        return out[0], out[1]
+
+    def half_row_sum(self, l_row, v_p, scalar):
+        """l_row plus this lane's sum of P. scalar: an explicit pairwise tree of v_add_f32 (SLP off). The anchor keeps
+        the sum, and with it P's fp32 copy, ahead of the V reads; without the per-tile lane swap pinning it, shuffled
+        spills 8-11 VGPRs."""
+        p_lo, p_hi = _score_lists_to_vecs(v_p)
+        if const_expr(not scalar):
+            tile = (Vec(p_lo) + Vec(p_hi)).reduce(
+                "add", init_val=self.c_zero_f, fastmath=self.fm_fast
+            )
+            return _anchor_scalar_f32(l_row + tile)
+        cur = [fx.Float32(Vec(p_lo)[i]) + fx.Float32(Vec(p_hi)[i]) for i in range(16)]
+        while len(cur) > 1:
+            h = len(cur) // 2
+            cur = [cur[i] + cur[i + h] for i in range(h)]
+        return _anchor_scalar_f32(l_row + cur[0])
+
+    def finish_half_row_sum(self, l_row):
+        return _lane_pair_reduce(l_row, lambda a, b, _fm: a + b, None)

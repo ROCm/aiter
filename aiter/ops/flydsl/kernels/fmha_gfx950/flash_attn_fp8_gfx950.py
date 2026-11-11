@@ -113,6 +113,8 @@ def build_flash_attn_dualwave_swp_fp8_module(
     NUM_HEADS_Q = traits.NUM_HEADS_Q
     BATCH_INTERLEAVE_GROUP = traits.BATCH_INTERLEAVE_GROUP
     RETURN_LSE = traits.RETURN_LSE
+    # Scalar softmax FMAs and row-sum adds for conventional_bn64 (needs SLP off, see the llvm options below).
+    BN64_SCALAR_SOFTMAX = traits.BODY_VARIANT == "conventional_bn64"
     DEFAULT_STRIDE_Q_N = traits.DEFAULT_STRIDE_Q_N
     DEFAULT_STRIDE_O_N = traits.DEFAULT_STRIDE_O_N
     DEFAULT_STRIDE_KV_N = traits.DEFAULT_STRIDE_KV_N
@@ -390,10 +392,11 @@ def build_flash_attn_dualwave_swp_fp8_module(
         q_row = ctx.q_row
         q_wide = gemm_helper.load_q_wide()
 
-        m_row = ctx.c_neg_floor
+        # Carries nsm = bias - scale * m (not m) and l as this lane's half-row sum.
+        nsm = softmax_helper.nsm_init()
         l_row = ctx.c_zero_f
         v_o = [ctx.c_zero_v16f32 for _ in range_constexpr(D_CHUNKS)]
-        init_args = [m_row, l_row] + v_o
+        init_args = [nsm, l_row] + v_o
         loop_results = init_args
 
         def _bn64_prio(v):
@@ -415,7 +418,7 @@ def build_flash_attn_dualwave_swp_fp8_module(
             _bn64_prio(BN64_QK_PRIO)
 
         def _tile_softmax_pv(j, loop_args, buf, v_s, masked, hi_vis=None):
-            m_row = loop_args[0]
+            nsm = loop_args[0]
             l_row = loop_args[1]
             v_o = [loop_args[2 + i] for i in range_constexpr(D_CHUNKS)]
             if const_expr(masked):
@@ -423,16 +426,14 @@ def build_flash_attn_dualwave_swp_fp8_module(
                     v_s = softmax_helper.causal_mask_diag(v_s, fx.Int32(j), hi_vis)
                 else:
                     v_s = softmax_helper.seq_pad_mask_if_needed(v_s, fx.Int32(j))
-            m_tile = softmax_helper.floor_masked_max(softmax_helper.reduce_max(v_s))
+            m_half = softmax_helper.half_row_max(v_s)
             if const_expr(traits.DUALWAVE_SWP_LAZY_RESCALE):
-                v_o, m_new, l_row = softmax_helper.lazy_correct_o(
-                    v_o, m_row, l_row, m_tile
+                v_o, nsm, l_row = softmax_helper.lazy_correct_o_nsm(
+                    v_o, nsm, l_row, m_half
                 )
             else:
-                m_new, corr = softmax_helper.rescale_from_tile_max(m_row, m_tile)
-                softmax_helper.scale_o(v_o, corr)
-                l_row = softmax_helper.apply_l_rescale(l_row, corr)
-            v_s = softmax_helper.sub_m(v_s, m_new)
+                v_o, nsm, l_row = softmax_helper.rebase_nsm(v_o, nsm, l_row, m_half)
+            v_s = softmax_helper.sub_nsm(v_s, nsm, BN64_SCALAR_SOFTMAX)
             # A skipped high strip's floor scores exp to exactly 0; branching its exps away costs ~12 VGPRs.
             v_p = softmax_helper.exp2(v_s, 0)
             v_p = softmax_helper.exp2(v_p, 16)
@@ -440,7 +441,7 @@ def build_flash_attn_dualwave_swp_fp8_module(
             # Held to the next barrier.
             _bn64_prio(BN64_PV_PRIO)
             # Row sum before PV so P's fp32 copy dies before the V reads (3 waves/SIMD budget).
-            l_row = softmax_helper.reduce_sum(l_row, v_p)
+            l_row = softmax_helper.half_row_sum(l_row, v_p, BN64_SCALAR_SOFTMAX)
             v_p = gemm_helper.cast_p_fp8_direct(v_p)
             if const_expr(not masked):
                 # Without the general loop's full-tile branch the V reads would hoist into the softmax and spill.
@@ -455,7 +456,7 @@ def build_flash_attn_dualwave_swp_fp8_module(
                 # Inline transpose reads are invisible to LLVM's wait insertion.
                 rocdl.s_waitcnt(lgkmcnt=0)
             v_o = gemm_helper.pv(v_p, v_v, v_o)
-            return [m_new, l_row] + v_o
+            return [nsm, l_row] + v_o
 
         # Fast tiles [t0, t_main) are full, prefetch a real tile and need no mask. Causal: tile j ends at or below
         # the block's first row's diagonal (64 j + 63 <= q_start + delta), so every row sees all its keys, and
@@ -541,8 +542,7 @@ def build_flash_attn_dualwave_swp_fp8_module(
                 v_s = gemm_helper.qk(v_k, q_wide)
             _bn64_prio(0)
             loop_results = yield _tile_softmax_pv(j, loop_args, buf, v_s, True, hi_vis)
-        m_row = loop_results[0]
-        l_row = loop_results[1]
+        l_row = softmax_helper.finish_half_row_sum(loop_results[1])
         v_o = [loop_results[2 + i] for i in range_constexpr(D_CHUNKS)]
         _bn64_prio(0)
         # No stable approximate-reciprocal API at v0.4.0: 1.0 / x lowers to arith.divf (IEEE).
@@ -551,7 +551,8 @@ def build_flash_attn_dualwave_swp_fp8_module(
             (fx.Float32(l_row) > ctx.c_zero_f).select(inv_l_rcp, ctx.c_zero_f)
         )
         softmax_helper.scale_o(v_o, inv_l * ctx.vd_fp8)
-        output_store.store_final_o(v_o, q_row, m_row, l_row)
+        # Paged has no LSE, so the epilogue needs neither m nor l.
+        output_store.store_final_o(v_o, q_row)
 
     # BN128: two BLOCK_N=64 KV tiles per iteration, one merged softmax correction.
     @flyc.kernel(known_block_size=[BLOCK_SIZE, 1, 1])
@@ -868,6 +869,10 @@ def build_flash_attn_dualwave_swp_fp8_module(
         "lsr-drop-solution": True,
         "disable-machine-sink": True,
     }
+    if BN64_SCALAR_SOFTMAX:
+        # Keeps SLP from re-packing the scalar softmax into v_pk ops, which wait for the matrix pipe. Per variant:
+        # the option is global LLVM state for the compile, and the default body's ISA must not change.
+        _dualwave_swp_llvm_options["slp-threshold"] = 100000
 
     _dualwave_swp_compile_hints = {
         "fast_fp_math": True,

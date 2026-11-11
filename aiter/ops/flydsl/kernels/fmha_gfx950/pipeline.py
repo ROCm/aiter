@@ -1066,6 +1066,14 @@ class DualwaveFp8KernelContext:
         # fp8 feeds raw Q/K into the MFMA, so q/k descale * softmax scale multiplies
         # the fp32 logits after QK.
         self.c_logit_scale = c_sm_scale_log2e * (_qd * _kd)
+        if const_expr(self.traits.BODY_VARIANT == "conventional_bn64"):
+            # Wave-uniform: in an SGPR the per-score FMAs read it as a scalar operand, not a VGPR splat.
+            # Raw rocdl op: no stable uniform-broadcast API in the pinned FlyDSL.
+            self.c_logit_scale = fx.Float32(
+                _bitcast_f32(
+                    rocdl.readfirstlane(T.i32, _bitcast_i32(self.c_logit_scale))
+                )
+            )
 
     def init_tile_bounds(self):
         traits = self.traits
