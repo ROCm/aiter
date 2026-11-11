@@ -13,54 +13,56 @@ from triton.experimental import gluon
 @gluon.jit
 def issue_loads(
     producer,
-    a_desc,
-    b_desc,
-    off_m,
-    off_n,
+    a_d,
+    b_d,
     a_buffer,
     b_buffer,
     BLOCK_K: gl.constexpr,
     TRANSPOSE_B: gl.constexpr,
     NUM_BUFFERS: gl.constexpr,
 ):
-    """Start the TDM copies for one K step into the next ring slot.
+    """Start the TDM copies for one K step, then step the descriptors one K tile.
 
-    A single CTA has no multicast, so it issues both loads itself. One fused op then costs one TDM
-    slot instead of two, which is worth 3% on the small-M buckets. A cluster shares the loads
-    already, where fusing measures flat, so it keeps the two separate copies.
+    The descriptors are carried, so a load needs no offset maths: the caller placed them on the
+    tile once and each step adds BLOCK_K. Rebuilding them from the base every load instead cost
+    a multiply and a bounds update for each load, 0.211 scalar ALU ops for each wmma against
+    0.078 in the reference kernel.
+
+    clamp_bounds keeps the descriptor bounds with the moved offsets. Without it the last K tile
+    of a K that does not divide BLOCK_K reads past K instead of zero-filling, and every such
+    shape is wrong: 64x64x288 gave a relative error of 0.94. Compiling it out when BLOCK_K
+    divides K takes the loop's scalar ALU from 48 to 20 ops for each 256 wmma, matching the
+    reference kernel exactly, and measures flat: that axis is not the gap.
+
+    A single CTA has no multicast, so it issues both loads itself. One fused op then costs one
+    TDM slot instead of two, which is worth 3% on the small-M buckets. A cluster shares the
+    loads already, where fusing measures flat, so it keeps the two separate copies.
     """
     num_ctas: gl.constexpr = gl.num_ctas()
     slot = producer % NUM_BUFFERS
-    off_k = producer * BLOCK_K
     if num_ctas == 1:
         # Split the warps between the two members; the hints must be disjoint bitmasks.
         half: gl.constexpr = gl.num_warps() // 2
         hint_a: gl.constexpr = (1 << half) - 1
         hint_b: gl.constexpr = ((1 << gl.num_warps()) - 1) ^ hint_a
-        # clamp_bounds keeps the descriptor bounds with the moved offsets. Without it the last
-        # K tile of a K that does not divide BLOCK_K reads past K instead of zero-filling, and
-        # every such shape is wrong: 64x64x288 gave a relative error of 0.94.
-        a_d = gl.amd.cdna5.tdm.update_tensor_descriptor(
-            a_desc, add_offsets=[off_m, off_k], clamp_bounds=True
-        )
-        if TRANSPOSE_B:
-            b_d = gl.amd.cdna5.tdm.update_tensor_descriptor(
-                b_desc, add_offsets=[off_n, off_k], clamp_bounds=True
-            )
-        else:
-            b_d = gl.amd.cdna5.tdm.update_tensor_descriptor(
-                b_desc, add_offsets=[off_k, off_n], clamp_bounds=True
-            )
         gl.amd.cdna5.tdm.async_load_fused(
             [(a_d, a_buffer.index(slot), hint_a), (b_d, b_buffer.index(slot), hint_b)]
         )
     else:
-        gl.amd.cdna5.tdm.async_load(a_desc, [off_m, off_k], a_buffer.index(slot))
-        if TRANSPOSE_B:
-            gl.amd.cdna5.tdm.async_load(b_desc, [off_n, off_k], b_buffer.index(slot))
-        else:
-            gl.amd.cdna5.tdm.async_load(b_desc, [off_k, off_n], b_buffer.index(slot))
-    return producer + 1
+        gl.amd.cdna5.tdm.async_load(a_d, [0, 0], a_buffer.index(slot))
+        gl.amd.cdna5.tdm.async_load(b_d, [0, 0], b_buffer.index(slot))
+    a_d = gl.amd.cdna5.tdm.update_tensor_descriptor(
+        a_d, add_offsets=[0, BLOCK_K], clamp_bounds=True
+    )
+    if TRANSPOSE_B:
+        b_d = gl.amd.cdna5.tdm.update_tensor_descriptor(
+            b_d, add_offsets=[0, BLOCK_K], clamp_bounds=True
+        )
+    else:
+        b_d = gl.amd.cdna5.tdm.update_tensor_descriptor(
+            b_d, add_offsets=[BLOCK_K, 0], clamp_bounds=True
+        )
+    return producer + 1, a_d, b_d
 
 
 @gluon.constexpr_function
@@ -195,13 +197,24 @@ def compute_tile(
     consumer = 0
     acc = gl.zeros((BLOCK_M, BLOCK_N), dtype=ACC_DTYPE, layout=WMMA)
 
+    # Place the descriptors on this tile once. The K loop then only adds BLOCK_K.
+    a_d = gl.amd.cdna5.tdm.update_tensor_descriptor(
+        a_desc, add_offsets=[off_m, 0], clamp_bounds=True
+    )
+    if TRANSPOSE_B:
+        b_d = gl.amd.cdna5.tdm.update_tensor_descriptor(
+            b_desc, add_offsets=[off_n, 0], clamp_bounds=True
+        )
+    else:
+        b_d = gl.amd.cdna5.tdm.update_tensor_descriptor(
+            b_desc, add_offsets=[0, off_n], clamp_bounds=True
+        )
+
     for _ in gl.static_range(NUM_BUFFERS - 1):
-        producer = issue_loads(
+        producer, a_d, b_d = issue_loads(
             producer,
-            a_desc,
-            b_desc,
-            off_m,
-            off_n,
+            a_d,
+            b_d,
             a_buffer,
             b_buffer,
             BLOCK_K,
@@ -211,12 +224,10 @@ def compute_tile(
 
     # Steady state: one load issue and one consume per step keep the ring full.
     for _ in range(gl.cdiv(K, BLOCK_K) - (NUM_BUFFERS - 1)):
-        producer = issue_loads(
+        producer, a_d, b_d = issue_loads(
             producer,
-            a_desc,
-            b_desc,
-            off_m,
-            off_n,
+            a_d,
+            b_d,
             a_buffer,
             b_buffer,
             BLOCK_K,
