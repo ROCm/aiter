@@ -141,6 +141,7 @@ class PaDecodeSchedule:
 
     cache_key: tuple[object, ...]
     is_gfx950: bool
+    is_gfx942: bool
     PER_TOKEN_M1: bool
 
     @classmethod
@@ -183,12 +184,15 @@ class PaDecodeSchedule:
             raise NotImplementedError("Non-transposed key cache is not implemented")
         arch = str(get_rocm_arch()).split(":", 1)[0]
         is_gfx950 = "gfx95" in arch
+        is_gfx942 = arch == "gfx942"
         kv_dtype, query_dtype = pa_fx_dtypes(kv_dtype, query_dtype)
         if direct_output and not (
-            kv_dtype == MXFP4_KV_DTYPE or (is_gfx950 and num_partitions == 1)
+            kv_dtype == MXFP4_KV_DTYPE
+            or ((is_gfx950 or is_gfx942) and num_partitions == 1)
         ):
             raise NotImplementedError(
-                "direct_output requires gfx1250, MXFP4 or a one-partition gfx950 plan"
+                "direct_output requires gfx1250, MXFP4 or a one-partition "
+                "gfx942/gfx950 plan"
             )
         # The MMAs read FP8 as the arch's format: FNUZ on gfx94x, OCP elsewhere
         # (gfx950, and gfx1250, whose schedule the tests still query).
@@ -422,6 +426,7 @@ class PaDecodeSchedule:
         return cls(
             cache_key=cache_key,
             is_gfx950=is_gfx950,
+            is_gfx942=is_gfx942,
             PER_TOKEN_M1=PER_TOKEN_M1,
         )
 
@@ -516,6 +521,7 @@ class PaDecodeTraits:
     STEPS_PER_CHUNK: int
     BLOCK_THREADS: int
     IS_GFX950: bool
+    IS_GFX942: bool
     DUAL_GROUP: bool
     STAGE_PAGES: int
     GROUP_LDS_BYTES: int
@@ -579,6 +585,7 @@ class PaDecodeTraits:
             stage_page_capacity,
         ) = cache_key
         is_gfx950 = schedule.is_gfx950
+        is_gfx942 = schedule.is_gfx942
         # MXFP4 V is widened to bf16 in LDS, so both run the bf16 PV MFMA.
         PV_BF16 = kv_dtype in (fx.BFloat16, MXFP4_KV_DTYPE)
         TUNED_SHAPE = (
@@ -905,12 +912,15 @@ class PaDecodeTraits:
             NWARP_PAD * f32 if per_token_kv else 0
         )  # m-independent: one cross-warp slot
         total_bytes = sVScaleMax_off + sVScaleMax_bytes
-        # gfx950 one-partition decode tasks walk all of a sequence's tiles in
-        # one CTA (sparse grids: at most one CTA per CU). Two four-wave groups take alternate tiles, each with its own
-        # LDS copy, and merge once at the end, so each SIMD interleaves two
-        # independent tile chains.
+        # gfx942/gfx950 one-partition decode tasks walk all of a sequence's
+        # tiles in one CTA (sparse grids: at most one CTA per CU). Two
+        # four-wave groups take alternate tiles, each with its own LDS copy,
+        # and merge once at the end, so each SIMD interleaves two independent
+        # tile chains.
         DUAL_GROUP = (
-            is_gfx950
+            # gfx942 wider heads already take up to 512 VGPRs per wave, so an
+            # eight-wave CTA of them cannot launch.
+            (is_gfx950 or (is_gfx942 and head_dim == 128))
             and (DIRECT or _num_partitions == 1)
             and SPARSE_GRID
             # The head-256 pipe's waves leave no room for a second group.
@@ -953,6 +963,7 @@ class PaDecodeTraits:
         return cls(
             cache_key=cache_key,
             IS_GFX950=is_gfx950,
+            IS_GFX942=is_gfx942,
             DUAL_GROUP=DUAL_GROUP,
             STAGE_PAGES=STAGE_PAGES,
             GROUP_LDS_BYTES=GROUP_LDS_BYTES,

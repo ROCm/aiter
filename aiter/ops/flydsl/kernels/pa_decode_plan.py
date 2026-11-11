@@ -35,7 +35,7 @@ def compile_pa_decode_plan(max_batch, threads, windowed, balanced=False):
     """Compile a batch bucket and block size for dense or windowed plans.
 
     Actual batch, task capacity, partition cap and window are runtime values.
-    ``balanced`` (gfx950) sizes each row's tasks by the smallest tile count
+    ``balanced`` (gfx942, gfx950) sizes each row's tasks by the smallest tile count
     per task that fits the capacity, instead of one task per row plus a
     tile-proportional share of the rest.
     """
@@ -319,10 +319,10 @@ def plan_pa_decode(
     defaults to two slots per CU. On gfx950 with ``query_length`` > 1 it is
     four slots per sequence and KV head, clamped to one to two slots per CU.
     Each nonempty sequence gets at least one task. Elsewhere the remaining
-    slots go to sequences in proportion to their tiles. On gfx950, batches that
-    fit one row per planner thread instead give a sequence of t tiles
-    min(ceil(t / T), max_partitions) tasks, with T the smallest tile bound
-    from ceil(total tiles / capacity) up whose tasks fit the capacity. Tasks
+    slots go to sequences in proportion to their tiles. On gfx942 and gfx950,
+    batches that fit one row per planner thread instead give a sequence of t
+    tiles min(ceil(t / T), max_partitions) tasks, with T the smallest tile
+    bound from ceil(total tiles / capacity) up whose tasks fit the capacity. Tasks
     then end close together when lengths differ.
 
     ``max_partitions`` is in [1, device CU count], defaulting to CU count;
@@ -437,7 +437,7 @@ def plan_pa_decode(
             max_batch,
             _block_threads(plan.capacity),
             sliding_window > 0,
-            properties.gcnArchName.split(":", 1)[0] == "gfx950",
+            properties.gcnArchName.split(":", 1)[0] in ("gfx942", "gfx950"),
         )
         _run_compiled(
             launch,

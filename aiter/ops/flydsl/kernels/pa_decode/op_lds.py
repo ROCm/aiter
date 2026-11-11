@@ -188,7 +188,7 @@ class PaDecodeQueryLoader:
         if const_expr(self.traits.Q_ABSMAX_F32):
             return fmath.absf(q_unit.to(fx.Float32)).reduce(ReductionOp.MAX)
         if const_expr(
-            self.traits.IS_GFX950
+            (self.traits.IS_GFX950 or self.traits.IS_GFX942)
             and self.traits.query_dtype in (fx.BFloat16, fx.Float16)
             and q_unit.shape[0] % 2 == 0
         ):
@@ -219,7 +219,7 @@ class PaDecodeQueryLoader:
 
     def _packed_absmax(self):
         return (
-            self.traits.IS_GFX950
+            (self.traits.IS_GFX950 or self.traits.IS_GFX942)
             and not self.traits.Q_ABSMAX_F32
             and self.traits.query_dtype in (fx.BFloat16, fx.Float16)
             and self.traits.QLOAD_UNIT % 2 == 0

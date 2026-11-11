@@ -223,7 +223,7 @@ def compile_pa_decode_tile(
 
     ``direct_output`` (gfx950, MXFP4): no plan -- ``work_info`` is the int32 context
     lengths -- one task per sequence, the output written directly with the query's
-    row/head strides (an empty row is zero-filled). FP8/BF16 on gfx950 accept it
+    row/head strides (an empty row is zero-filled). FP8/BF16 on gfx942/gfx950 accept it
     with a one-partition plan (capacity equal to the batch): ``pmax`` carries the
     plan's ``reduce_info``, slot s runs packed task s and zero-fills sequence s
     when it owns no task, and ``pout`` is the output.

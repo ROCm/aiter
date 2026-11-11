@@ -949,10 +949,10 @@ def pa_decode(
     # CTA. That merge costs two device-scope round trips (sparse decode 64
     # rows: 17.7 us vs 10.3 us for tile plus reducer), so wider plans merge
     # within workgroup clusters instead.
-    # gfx950 one-partition plans (capacity == batch) store final rows from
-    # the tile kernel too, without the reducer launch.
+    # gfx942/gfx950 one-partition plans (capacity == batch) store final rows
+    # from the tile kernel too, without the reducer launch.
     direct_output = (
-        arch == "gfx950"
+        arch in ("gfx942", "gfx950")
         and num_partitions == 1
         and sinks is None
         and output.stride() == query.stride()
