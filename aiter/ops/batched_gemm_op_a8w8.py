@@ -456,9 +456,9 @@ def batched_gemm_a8w8_mxscale_bpreshuffle_fused_quant(
     standalone ``quantize_fp8`` of the bf16 output is removed.
 
     Returns ``(y_fp8 [M, G, N] e4m3, y_scale [M, (G*N)//32] e8m0)``, bit-identical
-    to ``quantize_fp8`` of the unfused bf16 output. gfx1250 flydsl mxfp8_32 only;
-    raises ``NotImplementedError`` otherwise so a caller can fall back to the
-    bf16 GEMM + ``quantize_fp8``.
+    to ``quantize_fp8`` of the unfused bf16 output. gfx1250 flydsl mxfp8_32 and
+    gfx950 flydsl (N a multiple of 32); raises ``NotImplementedError`` otherwise
+    so a caller can fall back to the bf16 GEMM + ``quantize_fp8``.
     """
     from .flydsl.batched_gemm_a8w8 import (
         bmm_a8w8_mxfp8_fused_quant_supported,
@@ -494,10 +494,9 @@ def batched_gemm_a8w8_mxscale_bpreshuffle_fused_quant(
 def _fused_quant_tuned_kernel(
     g: int, m: int, n: int, k: int, w_scale_block: str, gfx: str, cu_num: int
 ) -> str | None:
-    """The preshuffle table's flydsl batched mxfp8_32 kernel for this shape, the
-    one the bf16 entry runs, so both entries share the tuned tile; None (the
-    runner's own choice) when there is no such row."""
-    from .flydsl import batched_gemm_a8w8_gfx1250 as bmm_gfx1250
+    """The preshuffle table's flydsl batched kernel for this shape, the one the
+    bf16 entry runs, so both entries share the tuned tile; None (the runner's
+    own choice) when there is no such row."""
 
     cfg = lookup_mxscale_bmm_config(
         g,
@@ -512,6 +511,14 @@ def _fused_quant_tuned_kernel(
     if cfg is None or cfg["libtype"] != "flydsl":
         return None
     name = cfg["kernelName"]
+    if gfx == "gfx950":
+        from .flydsl.batched_gemm_a8w8_gfx950 import parse_bmm_kernel_name
+
+        # The runner would set aside a tile that splits a 32-column group.
+        parsed = parse_bmm_kernel_name(name)
+        return name if parsed is not None and parsed["tile_n"] % 32 == 0 else None
+    from .flydsl import batched_gemm_a8w8_gfx1250 as bmm_gfx1250
+
     if bmm_gfx1250.parse_bmm_mx32_kernel_name(name) is None:
         return None
     return name
@@ -521,11 +528,13 @@ def batched_gemm_a8w8_mxscale_bpreshuffle_fused_quant_supported(
     w_scale: tuple[int, ...], n: int, k: int
 ) -> bool:
     """Whether :func:`batched_gemm_a8w8_mxscale_bpreshuffle_fused_quant` can run
-    this shape (gfx1250 flydsl mxfp8_32). Lets a caller choose the fused path
-    once instead of catching ``NotImplementedError`` per call."""
+    this shape (gfx1250 flydsl mxfp8_32, gfx950 flydsl). Lets a caller choose
+    the fused path once instead of catching ``NotImplementedError`` per call."""
     from .flydsl.batched_gemm_a8w8 import bmm_a8w8_mxfp8_fused_quant_supported
 
-    return bmm_a8w8_mxfp8_fused_quant_supported(_w_scale_block_of(w_scale, n, k))
+    return n % 32 == 0 and bmm_a8w8_mxfp8_fused_quant_supported(
+        _w_scale_block_of(w_scale, n, k)
+    )
 
 
 @torch_compile_guard(mutates_args=[], gen_fake=_batched_gemm_a8w8_mxscale_fake)

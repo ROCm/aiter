@@ -16,7 +16,7 @@ operand      shape                        notes
 ``WQ``       ``[B, N, K]`` fp8            shuffle_weight(., (16, 16))
 ``x_scale``  ``[M, B, K // XK]`` e8m0     row-major, XK = x_scale_k
 ``w_scale``  ``[B, N // WN, K // WK]``    e8m0, WN x WK = w_scale_n x w_scale_k
-``Out``      ``[M, B, N]`` bf16
+``Out``      ``[M, B, N]`` bf16           e4m3 with fuse_quant_out
 ===========  ===========================  ==================================
 
 Every block edge is 32 or 128. Scales sit in LDS panels, one row per A row or
@@ -326,6 +326,7 @@ def launch_bmm_a8w8_mxscale(
     arg_scale_b: fx.Pointer,
     arg_partials: fx.Pointer,
     arg_counters: fx.Pointer,
+    arg_scale_out: fx.Pointer,
     i32_m: fx.Int32,
     stream: fx.Stream,
     N: Constexpr[int],
@@ -348,6 +349,7 @@ def launch_bmm_a8w8_mxscale(
     b_nt: Constexpr[bool] = False,
     x_scale_transposed: Constexpr[bool] = False,
     xcd_swizzle: Constexpr[int] = 0,
+    fuse_quant_out: Constexpr[bool] = False,
 ):
     """splits > 1 splits K over that many workgroups per output tile. A tile's
     splits run on one XCD; each writes an FP32 partial, and the last to arrive
@@ -369,7 +371,17 @@ def launch_bmm_a8w8_mxscale(
     (small M) streams past the caches, where a reused one (large M) should
     stay. x_scale_transposed reads a column-major [K // 128, M] x_scale of
     1x128 blocks (batch 1), the blockscale convention; its LDS panel is then
-    column-major too."""
+    column-major too.
+    fuse_quant_out group-32 MXFP8-quantizes the bf16 C tile in the epilogue
+    instead of storing it: arg_c takes the e4m3 [M, B, N] output and
+    arg_scale_out the row-major [M, B * N // 32] e8m0 scales, the pair
+    ``quantize_fp8`` of the bf16 output gives. arg_scale_out is unused
+    otherwise."""
+    if fuse_quant_out and tile_n % 32:
+        raise ValueError(
+            f"[FlyDSL gfx950] fuse_quant_out needs tile_n a multiple of 32, "
+            f"got {tile_n}"
+        )
     k_steps = tile_k // MFMA_K
     k_span = _padded_k(K) // splits  # the K range of one split
     half_step = K % MFMA_K != 0  # the last MFMA step holds 64 K
@@ -443,7 +455,7 @@ def launch_bmm_a8w8_mxscale(
     )
     kernel_name = format_kernel_name(
         f"bmm_a8w8_mxscale{config}_b{batch}_s{x_scale_k}_{w_scale_n}x{w_scale_k}"
-        f"{'_xt' if x_scale_transposed else ''}"
+        f"{'_xt' if x_scale_transposed else ''}{'_fq' if fuse_quant_out else ''}"
     )
 
     @fx.struct
@@ -459,6 +471,7 @@ def launch_bmm_a8w8_mxscale(
         arg_scale_b: fx.Int64,
         arg_partials: fx.Int64,
         arg_counters: fx.Int64,
+        arg_scale_out: fx.Int64,
         i32_m: fx.Int32,
     ):
         tid = fx.Int32(fx.thread_idx.x)
@@ -1043,29 +1056,36 @@ def launch_bmm_a8w8_mxscale(
                 lds.data.ptr,
             )
 
+            def stage_part(vals, part):
+                """Stage the accumulator rows of C chunk part in LDS as bf16."""
+                gpu.barrier()
+                for mi in range_constexpr(m_rep):
+                    mrow = wmb + mi * MFMA_M
+                    if mrow // c_rows == part:
+                        for ni in range_constexpr(n_rep):
+                            tile_vals = vals[mi * n_rep + ni].to(BFloat16)
+                            col = wnb + ni * MFMA_N + lane16
+                            for ii in range_constexpr(4):
+                                row = mrow % c_rows + kgrp * 4 + ii
+                                fx.ptr_store(
+                                    tile_vals[ii],
+                                    fx.add_offset(lds_bf16, row * c_row + col),
+                                )
+                gpu.barrier()
+
+            def rows_in_tile():
+                rows_left = i32_m - blk_m
+                return (rows_left < tile_m).select(rows_left, fx.Int32(tile_m))
+
             def store_tile(vals):
                 """Stage the bf16 tile in LDS c_rows rows at a time, and store whole
                 16-byte rows of each chunk."""
-                rows_left = i32_m - blk_m
-                rows_left = (rows_left < tile_m).select(rows_left, fx.Int32(tile_m))
+                rows_left = rows_in_tile()
                 c_tile = arg_c + (fx.Int64(blk_m) * ldc + bz * N + fx.Int64(blk_n)) * 2
                 c_dst = _buffer(c_tile, T.i32, 16, fx.Int64(rows_left) * (ldc * 2))
                 chunks = tile_n // 8  # 16-byte chunks per C row
                 for part in range_constexpr(tile_m // c_rows):
-                    gpu.barrier()
-                    for mi in range_constexpr(m_rep):
-                        mrow = wmb + mi * MFMA_M
-                        if mrow // c_rows == part:
-                            for ni in range_constexpr(n_rep):
-                                tile_vals = vals[mi * n_rep + ni].to(BFloat16)
-                                col = wnb + ni * MFMA_N + lane16
-                                for ii in range_constexpr(4):
-                                    row = mrow % c_rows + kgrp * 4 + ii
-                                    fx.ptr_store(
-                                        tile_vals[ii],
-                                        fx.add_offset(lds_bf16, row * c_row + col),
-                                    )
-                    gpu.barrier()
+                    stage_part(vals, part)
                     for i in range_constexpr(ceildiv(c_rows * chunks, threads)):
                         idx = i * threads + tid
                         row = idx // chunks
@@ -1083,6 +1103,112 @@ def launch_bmm_a8w8_mxscale(
                                 frag,
                                 fx.slice(c_dst, (None, (grow * ldc + chunk * 8) // 2)),
                             )
+
+            def store_tile_quant(vals):
+                """store_tile's LDS staging, then each thread quantizes one row's
+                32 contiguous columns -- a group never straddles tiles, since
+                tile_n is a multiple of 32 -- and stores 32 e4m3 bytes and the
+                group's e8m0 scale: amax of the bf16 values floored at 1e-10,
+                scale ceil_pow2(amax / 448), values clamped to +-448 and
+                rounded to nearest even, as ``quantize_fp8`` does."""
+                rows_left = rows_in_tile()
+                c_tile = arg_c + fx.Int64(blk_m) * ldc + bz * N + fx.Int64(blk_n)
+                c_dst = _buffer(c_tile, T.i32, 16, fx.Int64(rows_left) * ldc)
+                s_ptr = fx.inttoptr(
+                    fx.PointerType.get(T.i8, fx.AddressSpace.Global, 1),
+                    arg_scale_out
+                    + fx.Int64(blk_m) * (ldc // 32)
+                    + (bz * N + fx.Int64(blk_n)) // 32,
+                )
+                groups = tile_n // 32  # quant groups per C row
+                fp8_max, fp8_min = fx.Float32(448.0), fx.Float32(-448.0)
+                for part in range_constexpr(tile_m // c_rows):
+                    stage_part(vals, part)
+                    for i in range_constexpr(ceildiv(c_rows * groups, threads)):
+                        idx = i * threads + tid
+                        row = idx // groups
+                        grp = idx % groups
+                        if row < c_rows:
+                            words = []
+                            for q in range_constexpr(4):
+                                frag = fx.make_rmem_tensor(4, Int32)
+                                src = fx.make_view(
+                                    fx.add_offset(
+                                        lds_i32, (row * c_row + grp * 32) // 2 + q * 4
+                                    ),
+                                    fx.make_layout(4, 1),
+                                )
+                                fx.copy(read16, src, frag)
+                                w4 = frag.load()
+                                words.extend(w4[e] for e in range_constexpr(4))
+                            # bf16 pairs, the lower address in the low half.
+                            xs = []
+                            for w in words:
+                                xs.append((w << fx.Int32(16)).bitcast(Float32))
+                                xs.append((w & fx.Int32(-65536)).bitcast(Float32))
+                            amax = abs(xs[0])
+                            for e in range_constexpr(1, 32):
+                                amax = fx.maxnumf(amax, abs(xs[e]))
+                            amax = fx.maxnumf(amax, fx.Float32(1e-10))
+                            # ceil_pow2(amax * fp32(1 / 448)): bump the exponent
+                            # when any mantissa bit is set.
+                            work = (
+                                amax * fx.Int32(0x3B124925).bitcast(Float32)
+                            ).bitcast(Int32)
+                            e8 = (work >> fx.Int32(23)) & fx.Int32(0xFF)
+                            e8 = ((work & fx.Int32(0x7FFFFF)) != fx.Int32(0)).select(
+                                e8 + fx.Int32(1), e8
+                            )
+                            e8 = (e8 > fx.Int32(0xFF)).select(fx.Int32(0xFF), e8)
+                            # 1 / scale, exact for a power of two.
+                            inv = ((fx.Int32(254) - e8) << fx.Int32(23)).bitcast(
+                                Float32
+                            )
+                            qs = [
+                                fx.maxnumf(fx.minnumf(x * inv, fp8_max), fp8_min)
+                                for x in xs
+                            ]
+                            packed = []
+                            for wi in range_constexpr(8):
+                                lo = fx.rocdl.cvt_pk_fp8_f32(
+                                    T.i32,
+                                    qs[wi * 4],
+                                    qs[wi * 4 + 1],
+                                    fx.Int32(0),
+                                    0,
+                                )
+                                packed.append(
+                                    fx.rocdl.cvt_pk_fp8_f32(
+                                        T.i32,
+                                        qs[wi * 4 + 2],
+                                        qs[wi * 4 + 3],
+                                        lo,
+                                        1,
+                                    )
+                                )
+                            grow = part * c_rows + row
+                            for h in range_constexpr(2):
+                                frag = fx.make_rmem_tensor(4, Int32)
+                                frag.store(
+                                    fx.Vector.from_elements(
+                                        packed[h * 4 : h * 4 + 4], Int32
+                                    )
+                                )
+                                fx.copy(
+                                    global16,
+                                    frag,
+                                    fx.slice(
+                                        c_dst,
+                                        (None, (grow * ldc + grp * 32) // 4 + h * 4),
+                                    ),
+                                )
+                            if grow < rows_left:
+                                fx.ptr_store(
+                                    fx.Vector.from_elements([fx.Uint8(e8)], Int8),
+                                    fx.add_offset(
+                                        s_ptr, fx.Int64(grow) * (ldc // 32) + grp
+                                    ),
+                                )
 
             def store_direct(vals):
                 """Store the bf16 tile straight from the accumulators, 2 bytes
@@ -1107,7 +1233,9 @@ def launch_bmm_a8w8_mxscale(
                                 )
 
             vals = [Vec(acc.load()) for acc in accs]
-            if const_expr(splits == 1):
+            if const_expr(fuse_quant_out and splits == 1):
+                store_tile_quant(vals)
+            elif const_expr(splits == 1):
                 store_tile(vals)
             else:
                 # Publish this split's partial in the lanes' own fragment order,
@@ -1162,7 +1290,9 @@ def launch_bmm_a8w8_mxscale(
                                 frag,
                             )
                             total[f] = total[f] + frag.load().bitcast(Float32)
-                    if const_expr(tile_m * tile_n <= 32 * 32):
+                    if const_expr(fuse_quant_out):
+                        store_tile_quant(total)
+                    elif const_expr(tile_m * tile_n <= 32 * 32):
                         store_direct(total)
                     else:
                         store_tile(total)
@@ -1191,6 +1321,7 @@ def launch_bmm_a8w8_mxscale(
         fx.Int64(fx.ptrtoint(arg_scale_b)),
         fx.Int64(fx.ptrtoint(arg_partials)),
         fx.Int64(fx.ptrtoint(arg_counters)),
+        fx.Int64(fx.ptrtoint(arg_scale_out)),
         i32_m,
     ).launch(
         grid=grid,
