@@ -1837,8 +1837,9 @@ def graph_capture():
         for group in (get_pp_group(), get_dp_group(), get_ep_group()):
             if group is not None and group.device_communicator is not None:
                 stack.enter_context(group.graph_capture(context))
-            if _DCP is not None and _DCP.world_size > 1:
-                stack.enter_context(_DCP.graph_capture(context))
+        for group in (_DCP, _PCP):
+            if group is not None and group.world_size > 1:
+                stack.enter_context(group.graph_capture(context))
         for group in _CUSTOM.values():
             stack.enter_context(group.graph_capture(context))
         yield context

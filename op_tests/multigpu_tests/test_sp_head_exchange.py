@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
-"""SP4 head-exchange layout, graph replay, and vector alignment contracts."""
+"""SP4 head-exchange layout, graph replay, and vector alignment contracts;
+the SP4 all-to-all."""
 
 import resource
 import socket
@@ -85,23 +86,101 @@ def _worker(rank, port, invalid_source):
             for _ in range(5):
                 graph.replay()
             torch.testing.assert_close(out.cpu(), expected, rtol=0, atol=0)
+
+    # The communicator's wrappers: a producer writing the registered pool,
+    # a staged input, and a captured input bound in place.
+    x = (torch.arange(16 * 32, device=rank).view(16, 32) + rank * 17) % 127
+    x = x.to(torch.bfloat16)
+    peers = [None] * 4
+    dist.all_gather_object(peers, x.cpu())
+    expected = torch.cat([peer[rank * 4 : (rank + 1) * 4] for peer in peers], dim=1)
+    assert ca.should_head_exchange(x)
+    view = ca.registered_input_view(x.shape, x.dtype)
+    view.copy_(x)
+    for out in (ca.head_exchange(view, registered=True), ca.head_exchange(x)):
+        torch.testing.assert_close(out.cpu(), expected, rtol=0, atol=0)
+    graph = torch.cuda.CUDAGraph()
+    with ca.capture(), torch.cuda.graph(graph, stream=stream):
+        out = ca.head_exchange(x)
+    # The pool still holds the staged x: the replay must read x itself.
+    x.add_(1)
+    graph.replay()
+    torch.testing.assert_close(out.cpu(), expected + 1, rtol=0, atol=0)
+    solo = CustomAllreduce(dist.new_subgroups(1)[0], torch.device("cuda", rank))
+    assert solo.disabled and not solo.should_head_exchange(x)
+    with pytest.raises(RuntimeError, match="head_exchange needs"):
+        solo.head_exchange(x)
     torch.cuda.synchronize()
     dist.barrier()
     ca.close()
     dist.destroy_process_group()
 
 
-@pytest.mark.parametrize("invalid_source", [None, "staged", "registered"])
-def test_sp_head_exchange(invalid_source, capfd):
+def _all_to_all_worker(rank, port):
+    from aiter.dist.parallel_state import (
+        destroy_distributed_environment,
+        destroy_model_parallel,
+        ensure_model_parallel_initialized,
+        get_tp_group,
+        graph_capture,
+        init_distributed_environment,
+    )
+
+    torch.cuda.set_device(rank)
+    init_distributed_environment(
+        world_size=4, rank=rank, distributed_init_method=f"tcp://127.0.0.1:{port}"
+    )
+    ensure_model_parallel_initialized(4, 1)
+    comm = get_tp_group().device_communicator
+
+    def part(r, seed, shape):
+        gen = torch.Generator(device="cuda").manual_seed(seed * 4 + r)
+        return torch.randn(shape, generator=gen, device="cuda").to(torch.bfloat16)
+
+    # all_to_all: block i (3 rows) of rank r's input is block r on rank i.
+    def expected(seed):
+        parts = [part(r, seed, (12, 37, 5)) for r in range(4)]
+        return torch.cat([p[rank * 3 : rank * 3 + 3] for p in parts])
+
+    assert comm.pynccl_comm is not None and not comm.pynccl_comm.disabled
+    send = part(rank, 0, (12, 37, 5))
+    recv = torch.empty_like(send)
+    comm.all_to_all(recv, send)
+    torch.testing.assert_close(recv, expected(0), rtol=0, atol=0)
+    graph = torch.cuda.CUDAGraph()
+    with graph_capture() as gc, torch.cuda.graph(graph, stream=gc.stream):
+        comm.all_to_all(recv, send)
+    for seed in range(1, 4):
+        send.copy_(part(rank, seed, (12, 37, 5)))
+        recv.zero_()
+        graph.replay()
+        torch.testing.assert_close(recv, expected(seed), rtol=0, atol=0)
+
+    torch.cuda.synchronize()
+    destroy_model_parallel()
+    destroy_distributed_environment()
+
+
+def _sp4_port():
     if torch.version.hip is None or torch.cuda.device_count() < 4:
         pytest.skip("requires four ROCm GPUs with peer access")
     from aiter.jit.utils.chip_info import get_gfx_runtime
 
     if get_gfx_runtime() != "gfx950":
-        pytest.skip("SP4 head exchange is validated on gfx950")
+        pytest.skip("SP4 collectives are validated on gfx950")
     with socket.socket() as sock:
         sock.bind(("127.0.0.1", 0))
-        port = sock.getsockname()[1]
+        return sock.getsockname()[1]
+
+
+def test_sp_all_to_all():
+    port = _sp4_port()
+    mp.spawn(_all_to_all_worker, args=(port,), nprocs=4, join=True)
+
+
+@pytest.mark.parametrize("invalid_source", [None, "staged", "registered"])
+def test_sp_head_exchange(invalid_source, capfd):
+    port = _sp4_port()
     if invalid_source is None:
         mp.spawn(_worker, args=(port, invalid_source), nprocs=4, join=True)
     else:

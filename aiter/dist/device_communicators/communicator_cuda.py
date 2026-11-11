@@ -949,6 +949,10 @@ class CudaCommunicator(DeviceCommunicatorBase):
             input_tensor = input_.movedim(dim, 0).contiguous()
 
             assert input_tensor.shape[0] % world_size == 0
+            # Axis 0 is already the caller's layout: scatter straight into it.
+            if dim == 0 and output_.is_contiguous():
+                pynccl_comm.reduce_scatter(output_, input_tensor)
+                return
             chunk_size = input_tensor.shape[0] // world_size
             tmp_shape = (chunk_size,) + input_tensor.shape[1:]
             # pynccl writes the scattered result with the split axis at 0, so it
@@ -1002,6 +1006,16 @@ class CudaCommunicator(DeviceCommunicatorBase):
 
         # Reshape before returning
         return output.movedim(0, dim).contiguous()
+
+    def all_to_all(self, output: torch.Tensor, input_: torch.Tensor) -> None:
+        """Equal split along dim 0 into a same-shape ``output``: input block i goes
+        to group rank i, output block i comes from it. On the current stream through
+        pynccl (graph-capturable), else torch.distributed."""
+        pynccl_comm = self.pynccl_comm
+        if pynccl_comm is not None and not pynccl_comm.disabled:
+            pynccl_comm.all_to_all(output, input_)
+        else:
+            torch.distributed.all_to_all_single(output, input_, group=self.device_group)
 
     def send(self, tensor: torch.Tensor, dst: int | None = None) -> None:
         """Sends a tensor to the destination rank in a blocking way"""

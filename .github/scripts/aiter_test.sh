@@ -112,7 +112,7 @@ for file in "${sharded_files[@]}"; do
             # no tests are collected, so an empty run cannot report success.
             test_cmd=(timeout 60m python3 -m pytest -q "$file")
             ;;
-        op_tests/test_fhmoe.py|op_tests/tuning_tests/test_fhmoe_tuner.py|op_tests/test_graph_alloc.py|op_tests/test_hipb_grouped_gemm.py|op_tests/flydsl_tests/test_gemm2_valid_token_count.py)
+        op_tests/test_fhmoe.py|op_tests/tuning_tests/test_fhmoe_tuner.py|op_tests/test_graph_alloc.py|op_tests/test_hipb_grouped_gemm.py|op_tests/flydsl_tests/test_gemm2_valid_token_count.py|op_tests/multigpu_tests/test_sp_head_exchange.py)
             # These files contain pytest-style test functions and intentionally
             # have no script entry point; direct execution would only import them.
             test_cmd=(timeout 60m python3 -m pytest -q "$file")
@@ -188,6 +188,22 @@ for file in "${sharded_files[@]}"; do
             test_cmd=(
                 timeout 60m
                 python3 "$file" -w 2 4 8 --heads 8 40
+            )
+            ;;
+        op_tests/multigpu_tests/test_parallel_groups.py)
+            {
+                echo "Running $file at its default layout, then with a PCP group"
+            } | tee -a latest_test.log
+            # The default layout has no PCP group (pcp=1), so it cannot check
+            # that graph_capture() arms PCP's custom all-reduce.
+            test_cmd=(
+                timeout 60m
+                bash -c '
+                    set -euo pipefail
+                    python3 "$1"
+                    exec python3 "$1" --tp 2 --pcp 2 --dp 1
+                '
+                _ "$file"
             )
             ;;
         op_tests/multigpu_tests/test_custom_allreduce.py|op_tests/multigpu_tests/test_custom_allgatherv.py)
