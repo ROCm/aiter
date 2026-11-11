@@ -192,6 +192,7 @@ def build_gemm_a8w4_tdm_task(
     c_cache_modifier=0,
     scatter_cache_policy=0,
     defer_ep_wait=0,
+    lookahead=None,
 ):
     """Build the grouped contiguous-M a8w4 TDM GEMM tile body (``gemm_task``).
 
@@ -254,6 +255,20 @@ def build_gemm_a8w4_tdm_task(
       under the next tile's mainloop. The next tile's epilogue waits for them
       before it restages C; the caller must drain tensorcnt before it counts
       the scatter as done or exits.
+    - ``lookahead`` (persistent decode GEMMs, post-compute mainloop, K tiles a
+      multiple of num_buffers): a one-element list the caller fills with a
+      dict before calling the body. The drain issues the next tile's k-tiles
+      0..num_buffers-1 into the stages it frees, so the pipeline stays full
+      across the tile boundary. Keys, all called or read on every wave:
+      ``pre`` (i32: bit 0 B side, bit 1 A side already issued for this tile
+      by the previous one; an A side issued early skips ``a_ready``);
+      ``publish()`` after the steady loop, before the first drain fence (the
+      caller makes the next tile visible to every wave there); ``plan()``
+      after that fence, returning ``a`` / ``b`` (i32 0/1: may the A / B side
+      run ahead), ``m_tile``, ``n_tile``, ``expert`` and ``rows`` of the next
+      tile. The caller passes the same bits as the next tile's ``pre``. C
+      stages past the input stages; the fp4 stage-1 epilogue issues the last
+      stage after its store wait, the deferred EP scatter before restaging C.
     """
     if tile_meta is not None or item_hooks is not None:
         assert explicit_tile and persistent_workers, "S1F hooks need explicit tiles"
@@ -497,6 +512,23 @@ def build_gemm_a8w4_tdm_task(
         assert not planar_lds_on and not tdm_as_in_prologue and _mid_compute
         assert _pro_stages * PITCH <= C_Q_OFF, "C staging overlaps the prologue"
         assert C_Q_OFF + tile_m * (tile_n // 4) <= ARENA_B, "C staging past arena"
+    if lookahead is not None:
+        # The drain hands stage j to the next tile's k-tile j, so the drain
+        # must free the stages in order 0..num_buffers-1, and nothing but the
+        # input stages may sit in them across the tile boundary.
+        assert explicit_tile and persistent_workers and not _mid_compute
+        assert not next_stage_on and not tdm_as_in_prologue and k_waves == 1
+        assert cluster_m == 1 and cluster_n == 1 and not defer_c_wait
+        assert K_TILES % num_buffers == 0, (
+            f"lookahead needs K tiles ({K_TILES}) divisible by num_buffers "
+            f"({num_buffers})"
+        )
+        assert (stage1_quant_out and stage1_act and a_is_fp4) or (
+            enable_ep_scatter and defer_ep_wait
+        ), "lookahead needs the fp4 stage-1 epilogue or the deferred EP scatter"
+        if stage1_quant_out:
+            C_Q_OFF = ((INPUT_LDS_B + 127) // 128) * 128
+            ARENA_B = max(ARENA_B, C_Q_OFF + tile_m * (tile_n // 4))
 
     # Quant epilogue compile-time constants.
     QUANT_ROWS_PER_TILE = quant_wmma_rep * 16
@@ -555,6 +587,7 @@ def build_gemm_a8w4_tdm_task(
         f"{_explicit_vgpr_partition}{_planar_lds}"
         f"{_interleaved_lds_load}{_persistent}{_drain}{_malign}{_kwaves}{_cpol}"
         f"{'_dew' if defer_ep_wait else ''}"
+        f"{'_la' if lookahead is not None else ''}"
     )
 
     # Compile the static path directly, preserving its launch ABI and the
@@ -996,143 +1029,170 @@ def build_gemm_a8w4_tdm_task(
                 )
             )
 
-        if const_expr(a_preshuffled):
-            # One M16 group is contiguous across the K32 slabs in the packed
-            # (M/16, K/128, 4, 16, 16-byte) A buffer.
-            add_tdm_loads(
-                gA_base,
-                a_off0,
-                16 * A_GROW,
-                (mn_oob + 15) // 16,
-                16 * A_ROW_B,
-                tile_m // 16,
-                on_i32=False,
-                lds_off=A_LDS_OFF,
-                lds_stage=A_LDS_STAGE,
-                lds_row=16 * A_ROW_B,
-                k_adv=16 * A_ROW_B,
-                wv=waves[0],
-                wg_mask=a_mcast_mask,
-                cache_modifier=a_cache_modifier,
-            )
-        else:
-            add_tdm_loads(
-                gA_base,
-                a_off0,
-                A_GROW,
-                mn_oob,
-                A_ROW_B,
-                tile_m,
-                on_i32=False,
-                lds_off=A_LDS_OFF,
-                lds_stage=A_LDS_STAGE,
-                lds_row=A_LDS_ROW,
-                k_adv=A_ROW_B,
-                wv=waves[0],
-                pad=(A_ROW_B, LDS_PAD_A),
-                wg_mask=a_mcast_mask,
-                cache_modifier=a_cache_modifier,
-            )
-        add_tdm_loads(
-            gB_base,
+        def add_item_loads(
+            a_off0,
             b_off0,
-            Kp16,
-            None,
-            PACK_TK * 16,
-            tile_n // 16,
-            on_i32=False,
-            lds_off=B_LDS_OFF,
-            lds_stage=B_LDS_STAGE,
-            lds_row=B_LDS_ROW,
-            k_adv=PACK_TK * 16,
-            wv=waves[1],
-            wg_mask=b_mcast_mask,
-            cache_modifier=tdm_b_th,
-        )
-        if const_expr(row_major_ascale and tdm_as_in_prologue):
-            # The compact wire is row-major with a padded global row pitch.
-            # Keep that layout in the resident LDS region too: each owner wave
-            # brings in a slice of M rows across the complete K-scale range.
-            add_tdm_loads(
-                gSA_base,
-                blk_m64 * SA_GROW,
-                SA_GROW,
-                None,
-                AS_FULL_KDW,
-                tile_m,
-                on_i32=True,
-                lds_off=AS_FULL_OFF // 4,
-                lds_stage=0,
-                lds_row=AS_FULL_KDW,
-                k_adv=0,
-                wv=waves[2],
-                cache_modifier=a_cache_modifier,
-                target_jobs=as_prologue_jobs,
-            )
-        elif const_expr(row_major_ascale):
-            # Compact dispatch lands e8m0 row-major at the wire pitch. The
-            # rotating path keeps one tile_k slice in each pipeline buffer.
-            add_tdm_loads(
-                gSA_base,
-                blk_m64 * SA_GROW,
-                SA_GROW,
-                None,
-                SA_KDW,
-                tile_m,
-                on_i32=True,
-                lds_off=SA_LDS_OFF // 4,
-                lds_stage=SA_LDS_STAGE // 4,
-                lds_row=SA_KDW,
-                k_adv=SA_KDW * 4,
-                wv=waves[2],
-                cache_modifier=a_cache_modifier,
-            )
-        elif const_expr(tdm_as_in_prologue):
-            add_tdm_loads(
-                gSA_base,
-                (blk_m64 // (wmma_m_rep * 16)) * AS_FULL_INNER,
-                AS_FULL_INNER,
-                None,
-                AS_FULL_INNER,
-                AS_SUPERS,
-                on_i32=True,
-                lds_off=AS_FULL_OFF // 4,
-                lds_stage=0,
-                lds_row=AS_FULL_INNER,
-                k_adv=0,
-                wv=waves[2],
-                cache_modifier=a_cache_modifier,
-                target_jobs=as_prologue_jobs,
-            )
-        else:
-            add_tdm_loads(
-                gSA_base,
-                (blk_m64 // (wmma_m_rep * 16)) * AS_FULL_INNER,
-                AS_FULL_INNER,
-                None,
-                AS_INNER,
-                AS_SUPERS,
-                on_i32=True,
-                lds_off=SA_LDS_OFF // 4,
-                lds_stage=SA_LDS_STAGE // 4,
-                lds_row=AS_INNER,
-                k_adv=AS_INNER * 4,
-                wv=waves[2],
-                cache_modifier=a_cache_modifier,
-            )
-        add_tdm_loads(
-            gSB_base,
             sb_off0,
-            SB_OUTER_STRIDE,
-            None,
-            SC_INNER,
-            SB_SUPERS,
-            on_i32=True,
-            lds_off=SB_LDS_OFF // 4,
-            lds_stage=SB_LDS_STAGE // 4,
-            lds_row=SC_INNER,
-            k_adv=SC_INNER * 4,
-            wv=waves[3],
+            blk_m64,
+            mn_oob,
+            target_jobs=None,
+            a_mcast_mask=None,
+            b_mcast_mask=None,
+        ):
+            """The A / B / A-scale / B-scale loads of the tile at these offsets."""
+            if const_expr(a_preshuffled):
+                # One M16 group is contiguous across the K32 slabs in the packed
+                # (M/16, K/128, 4, 16, 16-byte) A buffer.
+                add_tdm_loads(
+                    gA_base,
+                    a_off0,
+                    16 * A_GROW,
+                    (mn_oob + 15) // 16,
+                    16 * A_ROW_B,
+                    tile_m // 16,
+                    on_i32=False,
+                    lds_off=A_LDS_OFF,
+                    lds_stage=A_LDS_STAGE,
+                    lds_row=16 * A_ROW_B,
+                    k_adv=16 * A_ROW_B,
+                    wv=waves[0],
+                    wg_mask=a_mcast_mask,
+                    cache_modifier=a_cache_modifier,
+                    target_jobs=target_jobs,
+                )
+            else:
+                add_tdm_loads(
+                    gA_base,
+                    a_off0,
+                    A_GROW,
+                    mn_oob,
+                    A_ROW_B,
+                    tile_m,
+                    on_i32=False,
+                    lds_off=A_LDS_OFF,
+                    lds_stage=A_LDS_STAGE,
+                    lds_row=A_LDS_ROW,
+                    k_adv=A_ROW_B,
+                    wv=waves[0],
+                    pad=(A_ROW_B, LDS_PAD_A),
+                    wg_mask=a_mcast_mask,
+                    cache_modifier=a_cache_modifier,
+                    target_jobs=target_jobs,
+                )
+            add_tdm_loads(
+                gB_base,
+                b_off0,
+                Kp16,
+                None,
+                PACK_TK * 16,
+                tile_n // 16,
+                on_i32=False,
+                lds_off=B_LDS_OFF,
+                lds_stage=B_LDS_STAGE,
+                lds_row=B_LDS_ROW,
+                k_adv=PACK_TK * 16,
+                wv=waves[1],
+                wg_mask=b_mcast_mask,
+                cache_modifier=tdm_b_th,
+                target_jobs=target_jobs,
+            )
+            if const_expr(row_major_ascale and tdm_as_in_prologue):
+                # The compact wire is row-major with a padded global row pitch.
+                # Keep that layout in the resident LDS region too: each owner wave
+                # brings in a slice of M rows across the complete K-scale range.
+                add_tdm_loads(
+                    gSA_base,
+                    blk_m64 * SA_GROW,
+                    SA_GROW,
+                    None,
+                    AS_FULL_KDW,
+                    tile_m,
+                    on_i32=True,
+                    lds_off=AS_FULL_OFF // 4,
+                    lds_stage=0,
+                    lds_row=AS_FULL_KDW,
+                    k_adv=0,
+                    wv=waves[2],
+                    cache_modifier=a_cache_modifier,
+                    target_jobs=as_prologue_jobs,
+                )
+            elif const_expr(row_major_ascale):
+                # Compact dispatch lands e8m0 row-major at the wire pitch. The
+                # rotating path keeps one tile_k slice in each pipeline buffer.
+                add_tdm_loads(
+                    gSA_base,
+                    blk_m64 * SA_GROW,
+                    SA_GROW,
+                    None,
+                    SA_KDW,
+                    tile_m,
+                    on_i32=True,
+                    lds_off=SA_LDS_OFF // 4,
+                    lds_stage=SA_LDS_STAGE // 4,
+                    lds_row=SA_KDW,
+                    k_adv=SA_KDW * 4,
+                    wv=waves[2],
+                    cache_modifier=a_cache_modifier,
+                    target_jobs=target_jobs,
+                )
+            elif const_expr(tdm_as_in_prologue):
+                add_tdm_loads(
+                    gSA_base,
+                    (blk_m64 // (wmma_m_rep * 16)) * AS_FULL_INNER,
+                    AS_FULL_INNER,
+                    None,
+                    AS_FULL_INNER,
+                    AS_SUPERS,
+                    on_i32=True,
+                    lds_off=AS_FULL_OFF // 4,
+                    lds_stage=0,
+                    lds_row=AS_FULL_INNER,
+                    k_adv=0,
+                    wv=waves[2],
+                    cache_modifier=a_cache_modifier,
+                    target_jobs=as_prologue_jobs,
+                )
+            else:
+                add_tdm_loads(
+                    gSA_base,
+                    (blk_m64 // (wmma_m_rep * 16)) * AS_FULL_INNER,
+                    AS_FULL_INNER,
+                    None,
+                    AS_INNER,
+                    AS_SUPERS,
+                    on_i32=True,
+                    lds_off=SA_LDS_OFF // 4,
+                    lds_stage=SA_LDS_STAGE // 4,
+                    lds_row=AS_INNER,
+                    k_adv=AS_INNER * 4,
+                    wv=waves[2],
+                    cache_modifier=a_cache_modifier,
+                    target_jobs=target_jobs,
+                )
+            add_tdm_loads(
+                gSB_base,
+                sb_off0,
+                SB_OUTER_STRIDE,
+                None,
+                SC_INNER,
+                SB_SUPERS,
+                on_i32=True,
+                lds_off=SB_LDS_OFF // 4,
+                lds_stage=SB_LDS_STAGE // 4,
+                lds_row=SC_INNER,
+                k_adv=SC_INNER * 4,
+                wv=waves[3],
+                target_jobs=target_jobs,
+            )
+
+        add_item_loads(
+            a_off0,
+            b_off0,
+            sb_off0,
+            blk_m64,
+            mn_oob,
+            a_mcast_mask=a_mcast_mask,
+            b_mcast_mask=b_mcast_mask,
         )
 
         # Wave ids are runtime, so one stream serves every wave and one test per
@@ -1181,6 +1241,78 @@ def build_gemm_a8w4_tdm_task(
             for g in range_constexpr(len(job_waves)):
                 if owns(job_waves[g]):
                     fn([j for j in jobs if j.waves == job_waves[g]])
+
+        # Lookahead: the drain issues the next tile's k-tiles 0..num_buffers-1
+        # into the stages it frees. A wave group owns only A-side (A, A-scale)
+        # or only B-side (B, B-scale) loads, so each group runs ahead on its
+        # own verdict, and its fences count the loads it ran ahead with.
+        a_side = {waves[0], waves[2]}
+        if const_expr(lookahead is not None):
+            for g in job_waves:
+                assert (g in a_side) != (g in {waves[1], waves[3]}), (
+                    "lookahead needs every wave group to own one side only"
+                )
+        la = {}
+
+        def la_resolve():
+            # A deferred A verdict (a flag load the caller issued in plan)
+            # resolves at its first use, past a barrier that drained the load,
+            # and outside any per-wave branch so later uses see it.
+            if "a" not in la:
+                la["a"] = fx.Int32(la["a_fn"]())
+
+        def la_side_ok(g):
+            return la["a"] if g in a_side else la["b"]
+
+        def la_plan():
+            """The next tile from the caller, and its loads."""
+            nxt = lookahead[0]["plan"]()
+            la.clear()
+            if callable(nxt["a"]):
+                la["a_fn"] = nxt["a"]
+            else:
+                la["a"] = fx.Int32(nxt["a"])
+            la["b"] = fx.Int32(nxt["b"])
+            blk_m_n = fx.Int64(fx.Int32(nxt["m_tile"]) * tile_m)
+            blk_n_n = fx.Int64(fx.Int32(nxt["n_tile"]) * tile_n)
+            eb_n = fx.Int64(fx.Int32(nxt["expert"]))
+            la_jobs = []
+            add_item_loads(
+                blk_m_n * A_GROW,
+                (eb_n * B_BATCH_ROWS + blk_n_n // 16) * Kp16,
+                (blk_n_n // 32) * SB_OUTER_STRIDE + eb_n * (N_SUPERS * K4),
+                blk_m_n,
+                fx.Int32(nxt["rows"]),
+                target_jobs=la_jobs,
+            )
+            la["jobs"] = la_jobs
+
+        def la_issue(stage):
+            """The next tile's k-tile ``stage`` into stage buffer ``stage``."""
+            la_resolve()
+            for g in range_constexpr(len(job_waves)):
+                if owns(job_waves[g]):
+                    if la_side_ok(job_waves[g]) != fx.Int32(0):
+                        issue(
+                            stage,
+                            stage,
+                            [j for j in la["jobs"] if j.waves == job_waves[g]],
+                        )
+
+        def la_wait(base, ahead):
+            """Wait until ``base`` stages of this tile are in flight, plus the
+            ``ahead`` lookahead stages of groups that issued them (younger, so
+            they retire after this tile's)."""
+            if const_expr(ahead == 0):
+                tdm_ops.tensor_wait(TDM_PER * base)
+            else:
+                la_resolve()
+                for g in range_constexpr(len(job_waves)):
+                    if owns(job_waves[g]):
+                        if la_side_ok(job_waves[g]) != fx.Int32(0):
+                            tdm_ops.tensor_wait(TDM_PER * (base + ahead))
+                        else:
+                            tdm_ops.tensor_wait(TDM_PER * base)
 
         def issue_as_prologue():
             """Loads the full A-scale K range into its resident LDS buffer."""
@@ -1748,10 +1880,34 @@ def build_gemm_a8w4_tdm_task(
                 # num_buffers<=2 mid-compute prefetches one tile and under-overlaps.
                 if const_expr(tile_m <= 32 or num_buffers <= 2):
                     # Post-compute issue: better for decode (small tile_m).
-                    a_ready_gate()
-                    for i in range_constexpr(num_buffers):
-                        issue(i, i)
+                    if const_expr(lookahead is not None):
+                        # The previous tile's drain may have issued this tile's
+                        # first stages for one side or both (bit 0 B, bit 1 A;
+                        # A only after this tile's a_ready held).
+                        pre = fx.Int32(lookahead[0]["pre"])
+                        for g in range_constexpr(len(job_waves)):
+                            wv = job_waves[g]
+                            bit = 2 if wv in a_side else 1
+                            if owns(wv):
+                                if (pre & fx.Int32(bit)) == fx.Int32(0):
+                                    if const_expr(a_ready is not None and wv in a_side):
+                                        a_ready[0]()
+                                    for i in range_constexpr(num_buffers):
+                                        issue(i, i, [j for j in jobs if j.waves == wv])
+                    else:
+                        a_ready_gate()
+                        for i in range_constexpr(num_buffers):
+                            issue(i, i)
                     n_steady = K_TILES - num_buffers
+                    _first_hook = (
+                        item_hooks[0].get("first_ready")
+                        if item_hooks is not None
+                        else None
+                    )
+                    if const_expr(_first_hook is not None and not next_stage_on):
+                        # Trace only: the loop's first fence, taken early.
+                        pipeline_fence(outstanding=TDM_PER * (num_buffers - 1))
+                        _first_hook()
                     if const_expr(next_stage_on):
                         # Every rolled iteration reads the carry, so prime it here --
                         # outside ``dispatch_wave_job``, since every wave runs this once.
@@ -1799,14 +1955,28 @@ def build_gemm_a8w4_tdm_task(
                                         cluster_sync()
 
                     dispatch_wave_job(steady_post)
+                    if const_expr(lookahead is not None):
+                        # The next tile is claimed by now; the caller makes it
+                        # visible to every wave before the first drain fence.
+                        lookahead[0]["publish"]()
                     for j in range_constexpr(num_buffers):
                         kt = n_steady + j
                         buf = kt % num_buffers
                         has_next = next_stage_on and j + 1 < num_buffers
-                        pipeline_fence(
-                            outstanding=TDM_PER
-                            * max(0, num_buffers - 1 - j - (1 if has_next else 0))
-                        )
+                        if const_expr(lookahead is not None):
+                            # K_TILES % num_buffers == 0: drain tile j sits in
+                            # stage j, free once this fence's barrier passed.
+                            la_wait(num_buffers - 1 - j, max(0, j - 1))
+                            workgroup_barrier()
+                            if const_expr(j == 0):
+                                la_plan()
+                            else:
+                                la_issue(j - 1)
+                        else:
+                            pipeline_fence(
+                                outstanding=TDM_PER
+                                * max(0, num_buffers - 1 - j - (1 if has_next else 0))
+                            )
                         next_stage_buf = (
                             (kt + 1) % num_buffers if const_expr(has_next) else None
                         )
@@ -1887,7 +2057,9 @@ def build_gemm_a8w4_tdm_task(
                                 steady_mid_iteration(my_jobs, kt, kt % num_buffers)
 
                     dispatch_wave_job(steady_mid)
-                    if const_expr(item_hooks is not None):
+                    if const_expr(
+                        item_hooks is not None and "drain_start" in item_hooks[0]
+                    ):
                         # S1F: no TDM issue and no VMEM wait follow until the
                         # epilogue, so a load issued here stays in flight.
                         item_hooks[0]["drain_start"]()
@@ -2011,8 +2183,23 @@ def build_gemm_a8w4_tdm_task(
                     )
             # The epilogue restages C in this arena. Draining our own tensorcnt
             # suffices: peer multicast loads are pairwise matched with ours.
-            stage_fence(0)
-            if const_expr(item_hooks is not None):
+            if const_expr(lookahead is not None):
+                # This tile's loads only; C stages past the input stages. The
+                # last stage is free now: GEMM2 hands it over at once, the
+                # fp4 stage-1 epilogue after its own store wait (that wait
+                # would otherwise hold for a stage issued just before it).
+                la_wait(0, num_buffers - 1)
+                if const_expr(raw_drain):
+                    rocdl.s_wait_dscnt(0)
+                    rocdl.s_barrier_signal(-1)
+                    rocdl.s_barrier_wait(-1)
+                else:
+                    workgroup_barrier()
+                if const_expr(enable_ep_scatter):
+                    la_issue(num_buffers - 1)
+            else:
+                stage_fence(0)
+            if const_expr(item_hooks is not None and "epi_start" in item_hooks[0]):
                 item_hooks[0]["epi_start"]()
             is_fp4_quant = bool(stage1_quant_out and a_is_fp4)
             STORE_N = tile_n // (4 if is_fp4_quant else 2) if stage1_act else tile_n
@@ -2268,7 +2455,11 @@ def build_gemm_a8w4_tdm_task(
                 if const_expr(defer_ep_wait):
                     # The previous tile's scatter may still read the C stage:
                     # each wave retires its own, then no wave restages early.
-                    tdm_ops.tensor_wait(0)
+                    # It is older than every lookahead load, which stays out.
+                    if const_expr(lookahead is not None):
+                        la_wait(0, num_buffers)
+                    else:
+                        tdm_ops.tensor_wait(0)
                     rocdl.s_barrier_signal(-1)
                     rocdl.s_barrier_wait(-1)
                 if const_expr(enable_ep_scatter):
@@ -2619,7 +2810,9 @@ def build_gemm_a8w4_tdm_task(
                     if const_expr(stage1_quant_out and stage1_act):
                         rocdl.s_wait_storecnt(0)
                     tdm_ops.tensor_wait(0)
-            if const_expr(item_hooks is not None):
+                if const_expr(lookahead is not None):
+                    la_issue(num_buffers - 1)
+            if const_expr(item_hooks is not None and "epi_end" in item_hooks[0]):
                 # Same region as drain_start / epi_start (inside has_work).
                 item_hooks[0]["epi_end"]()
 
