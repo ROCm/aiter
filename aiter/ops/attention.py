@@ -29,6 +29,7 @@ from csrc.cpp_itfs.torch_utils import direct_register_custom_op
 from ..jit.core import _atoi_flag, compile_ops, env_flag_atoi, is_experimental_enabled
 from ..jit.utils.asm_guard import is_gfx1250_asm_supported, require_gfx1250_asm
 from ..jit.utils.chip_info import get_cu_num, get_gfx, get_gfx_runtime
+from ..plugin import route as _route
 from .opus.mla import opus_mla_decode_fwd, opus_mla_decode_mxfp8_fwd  # noqa: F401
 
 MD_NAME = "module_attention"
@@ -144,6 +145,7 @@ def _pa_fwd_asm(
 ) -> None: ...
 
 
+@_route(op="pa_fwd", version=1)
 def pa_fwd_asm(
     Q: torch.Tensor,
     K: torch.Tensor,
@@ -161,6 +163,24 @@ def pa_fwd_asm(
     ) = 1,  # [0, 1, 2] 2 is the highest precision, this is only for fp8 kvcache
     kernelName: str | None = None,
 ) -> torch.Tensor:
+    """Paged attention forward over a block table.
+
+    Args:
+        Q: ``[sum_qlen, heads, head_dim]`` query.
+        K, V: paged caches indexed through ``block_tables``.
+        block_tables: ``[batch, max_blocks]`` page ids per sequence.
+        context_lens: ``[batch]`` KV length per sequence.
+        block_tables_stride0: row stride of ``block_tables``.
+        max_qlen: longest query in the batch; 1 is plain decode.
+        K_QScale, V_QScale: fp8 dequant scales, ``None`` for unquantized KV.
+        out_: optional output buffer. Given, it is written and returned;
+            otherwise one shaped like ``Q`` is allocated.
+        qo_indptr: ``[batch+1]`` query offsets for a ragged batch.
+        high_precision: 0, 1 or 2 for fp8 KV, 2 being the most precise.
+        kernelName: pin one asm kernel instead of letting the shape pick.
+
+    Returns the output tensor -- ``out_`` itself when one was passed.
+    """
     output = out_ if out_ is not None else torch.empty_like(Q)
     _pa_fwd_asm(
         Q,
@@ -454,6 +474,7 @@ def _pa_decode_bf16_asm(
 ) -> None: ...
 
 
+@_route(op="pa_decode_bf16", version=1)
 def pa_decode_bf16_asm(
     Q: torch.Tensor,
     K: torch.Tensor,
@@ -490,6 +511,11 @@ def pa_decode_bf16_asm(
         s_eff internally), shape [kv_head_num * gqa].  The kernel always reads
         this slot, so when `sink` is None a -inf buffer is allocated, making the
         sink a numerical no-op.
+
+    ``out`` is an optional caller-owned buffer: given, it is written and
+    returned; otherwise one is allocated. The output tensor comes back either
+    way, so a provider serving this contract returns what it wrote rather
+    than leaving the caller to re-read ``out``.
     """
     require_gfx1250_asm("pa_decode_bf16_asm")
     device = Q.device
@@ -604,6 +630,7 @@ def _pa_ps_reduce_waves(batch_size: int, kv_pages: int, num_cu: int) -> int:
     return 8 if kv_pages * 16 >= batch_size * context_threshold else 0
 
 
+@_route(op="pa_persistent_fwd", version=1)
 def pa_persistent_fwd(
     Q: torch.Tensor,  # [sum_qlen, kv_heads * gqa + kv_heads * 2, head_dim]
     K: torch.Tensor,  # [num_blocks, kv_heads, head_dim / x, block_size, x]

@@ -332,3 +332,80 @@ def test_the_versions_a_contract_still_accepts_are_part_of_the_baseline(tmp_path
     bumped = routed_contracts_for(tmp_path, SUPERSEDING)["demo.bumped"]
     assert bumped["supersedes"] == [1]
     assert bumped["version"] == 2
+
+
+# The suffixes #7150 inventories as backend markers. A contract named with one
+# would say "serve the asm kernel" to a provider whose kernel is by definition
+# not that one -- the thing the first routed ops were chosen to avoid.
+_BACKEND_SUFFIXES = ("_asm", "_ck", "_opus", "_hip", "_triton", "_tuned", "_gfx1250")
+
+
+def test_no_routed_op_name_carries_a_backend_suffix():
+    """The contract names the OPERATION; the function may name a backend.
+
+    `@route(op=...)` takes the contract name as a string, independent of the
+    Python name it decorates -- which is what lets a backend-named public
+    entry point be routed without renaming it and without touching a single
+    downstream caller. `pa_fwd_asm` is routed as `pa_fwd`, `rmsnorm` sits on
+    `_rms_norm_fwd_dispatch`.
+
+    The freedom cuts both ways, so this pins the direction that matters: a
+    provider implements against the op name, and an op name carrying `_asm`
+    or `_opus` asks it to be a backend it is not.
+    """
+
+    named = sorted(
+        op for op in json.loads(_BASELINE.read_text()) if op.endswith(_BACKEND_SUFFIXES)
+    )
+    assert not named, (
+        "routed contracts whose name carries a backend: "
+        + ", ".join(named)
+        + " -- route the operation under a neutral op= and leave the "
+        "function name alone"
+    )
+
+
+def _routed_function_names(root: Path) -> dict[str, str]:
+    """Op name -> the Python function the route decorates."""
+
+    found: dict[str, str] = {}
+    for path in sorted(root.glob("aiter/**/*.py")):
+        tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+        spellings = _route_spellings(tree)
+        if not spellings:
+            continue
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.FunctionDef):
+                continue
+            for decorator in node.decorator_list:
+                if _is_route(decorator, spellings):
+                    keywords = {k.arg: k.value for k in decorator.keywords}
+                    found[ast.literal_eval(keywords["op"])] = node.name
+    return found
+
+
+def test_the_backend_suffix_gate_is_not_vacuous():
+    """The gate above passes trivially unless the decoupling is real.
+
+    If every routed function happened to be neutrally named too, the gate
+    would hold without the op= argument doing any work, and a later route
+    put straight on a backend-named function would be the first to find out.
+    So pin that at least one contract is a neutral name sitting on a
+    backend-named function -- `pa_fwd` on `pa_fwd_asm` is the case.
+    """
+
+    routed = _routed_function_names(_REPO)
+    assert routed, "no routed ops found; the scanner has gone stale"
+    assert set(routed) == set(json.loads(_BASELINE.read_text())), (
+        "the route scan and the contract baseline disagree about which ops "
+        "are routed"
+    )
+    decoupled = {
+        op: fn
+        for op, fn in routed.items()
+        if fn.endswith(_BACKEND_SUFFIXES) and not op.endswith(_BACKEND_SUFFIXES)
+    }
+    assert decoupled, (
+        "no routed op sits on a backend-named function, so the suffix gate "
+        "above is not actually constraining anything"
+    )
