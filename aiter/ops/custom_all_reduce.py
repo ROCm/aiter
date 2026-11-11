@@ -160,6 +160,7 @@ def fused_allreduce_rmsnorm_quant_per_group(
     bf16_out_ptr: int = 0,
     transpose_scale: bool = False,
     gemma_norm: bool = False,
+    mx_scale: bool = False,
 ) -> None: ...
 
 
