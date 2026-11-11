@@ -180,6 +180,14 @@ _LAZY_IMPORTS = {
         ".kernels.minimax_m3_index_score",
         "index_score_supported_fp4",
     ),
+    "minimax_m3_index_score_nvfp4_flydsl": (
+        ".kernels.minimax_m3_index_score",
+        "score_flydsl_nvfp4",
+    ),
+    "minimax_m3_index_score_nvfp4_flydsl_supported": (
+        ".kernels.minimax_m3_index_score",
+        "index_score_supported_nvfp4",
+    ),
     "minimax_m3_index_score_prefill_flydsl": (
         ".kernels.minimax_m3_index_score_prefill",
         "score_prefill_flydsl",
@@ -241,6 +249,8 @@ __all__ = [
     "minimax_m3_index_score_flydsl_supported",
     "minimax_m3_index_score_fp4_flydsl",
     "minimax_m3_index_score_fp4_flydsl_supported",
+    "minimax_m3_index_score_nvfp4_flydsl",
+    "minimax_m3_index_score_nvfp4_flydsl_supported",
     "minimax_m3_index_score_prefill_alloc",
     "minimax_m3_index_score_prefill_flydsl",
     "minimax_m3_index_score_prefill_fp4_flydsl",
