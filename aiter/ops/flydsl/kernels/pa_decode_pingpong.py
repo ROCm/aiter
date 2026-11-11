@@ -263,6 +263,9 @@ def compile_pa_decode_pingpong(
         int(os.environ.get("PP_VSPLIT", "2")) if VSEG == 6 else (2 if VSEG == 8 else 0)
     )
     ANCHOR = int(os.environ.get("PP_ANCHOR", "0")) if mf32 == 2 else 0
+    # Tile DMA address math in unsigned 32-bit pieces (power-of-two pages).
+    FASTDMA = int(os.environ.get("PP_FASTDMA", "1")) and block_size & (block_size - 1) == 0
+    FASTDMA = int(bool(FASTDMA))
     D = head_dim
     DV = value_dim
     GQA = query_group_size
@@ -300,6 +303,7 @@ def compile_pa_decode_pingpong(
         VSEG,
         VSPLIT,
         ANCHOR,
+        FASTDMA,
         window,
         sink_dtype,
         seq_query_length,
@@ -351,6 +355,8 @@ def compile_pa_decode_pingpong(
         f"pa_decode_pingpong_kvbf16_d{D}_v{DV}_bs{block_size}_gqa{GQA}_mtp{QLEN}"
         f"_m{M}r{R}c{CH}_s{stages}_p{prio}_c{int(pair_tasks)}_n{nocompute}_a{dma_aux}_x{stagger}{pin}y{ysched}g{grp_mod}k{nopk}i{xissue}u{unroll}l{lsum}f{fuse}{fsched}w{mf32}{yahead}{KPRE}{VSEG}{VSPLIT}{ANCHOR}"
     )
+    if FASTDMA:
+        kernel_name += "_fd"
     # Online-softmax state: [m (SM), l (SM), O (SM * SNB)].
     SM = 1 if mf32 else M
     SNB = DV // 32 if mf32 else NB
@@ -619,8 +625,46 @@ def compile_pa_decode_pingpong(
                     tok0 % block_size,
                 )
 
+        if const_expr(FASTDMA):
+            page_shift = (block_size // TILE).bit_length() - 1
+            k_page_bytes32 = _uni(n_kv * (block_size * K_ROW))
+            v_page_bytes32 = _uni(n_kv * (block_size * V_ROW))
+
+        def zext(x):
+            return fx.Int64(x) & fx.Int64(0xFFFFFFFF)
+
+        def issue_fast(tile, stage):
+            # Pages and in-page offsets fit 32 bits unsigned; only the page
+            # base needs 64 (a 32 x 32 multiply). K and V share the row and
+            # tail math.
+            tok0 = tile * TILE
+            phys = fx.Int32(
+                buf_scalar_load(
+                    bt, table_seq * max_blocks_per_seq + (tile >> page_shift)
+                )
+            )
+            if const_expr(nocompute == 2):
+                phys = fx.Int32(1)
+            row_idx = (tok0 & (block_size - 1)) * n_kv + kv_h
+            left = context - tok0
+            rows_m1 = ((left < TILE).select(left, TILE) - 1) * n_kv
+            stage_off = stage * STAGE
+
+            def fire(base, page_bytes, row, voffs, copies, lds_off):
+                addr = _uni64(
+                    base + zext(phys) * zext(page_bytes) + zext(row_idx * row)
+                )
+                # Rows at or past the context read as zero.
+                dma_fire(addr, _uni(rows_m1 * row + row), voffs, copies, lds_off)
+
+            fire(k_base, k_page_bytes32, K_ROW, k_voff, K_COPIES, stage_off)
+            fire(v_base, v_page_bytes32, V_ROW, v_voff, V_COPIES, stage_off + K_STAGE)
+
         def issue(tile, stage):
             if const_expr(nocompute == 3):
+                return
+            if const_expr(FASTDMA):
+                issue_fast(tile, stage)
                 return
             tok0 = tile * TILE
             phys = fx.Int32(
