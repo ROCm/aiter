@@ -604,6 +604,138 @@ def test_no_dataclass_field_has_a_default_python_3_11_would_reject():
     )
 
 
+def test_a_positional_candidate_still_binds_run_to_run():
+    """A new field goes on the end, because providers build this positionally.
+
+    `KernelCandidate` is what every provider constructs, out of tree, with no
+    way for AITER to see the call sites. A field inserted before `run` takes
+    `run`'s argument, and the provider gets an error about a field it never
+    passed. Appending is the only backward-compatible place, and this test is
+    what says so to whoever adds the next one.
+    """
+
+    candidate = plugin.KernelCandidate(
+        "aklr", "kernel-1", "sha256:abc", "experimental", lambda *a, **k: 100
+    )
+
+    assert candidate.run(1, 2) == 100, "the fifth positional argument is run"
+    assert candidate.qualification == "experimental"
+    assert candidate.latency_us is None
+
+
+def test_a_provider_that_reports_nothing_reports_None(monkeypatch):
+    """Not reporting is the default and stays the default.
+
+    Every provider written before this field existed takes this path, and so
+    does every provider that simply has no number for the shape in front of it.
+    """
+
+    provider = _Provider("aklr", _candidate("aklr"))
+    monkeypatch.setattr(
+        plugin, "_entry_points", lambda: (_EntryPoint("aklr", provider),)
+    )
+    plugin.configure(enable=("aklr",), source="test")
+    add = _route_add([])
+
+    assert add(2, 3) == 100
+    assert plugin.last_decision().latency_us is None
+    assert plugin.explain("test.add", 2, 3).decision.latency_us is None
+
+
+def test_a_reported_latency_reaches_every_reader(monkeypatch):
+    """Recorded and handed back unchanged, through the readers that exist.
+
+    No new API: the number rides the Decision, so whatever already reads a
+    Decision reads this too.
+    """
+
+    seen = []
+    plugin.on_decision(seen.append)
+    candidate = plugin.KernelCandidate(
+        provider="aklr",
+        kernel_id="kernel-1",
+        artifact_digest="sha256:abc",
+        latency_us=12.4,
+        run=lambda *args, **kwargs: 100,
+    )
+    provider = _Provider("aklr", candidate)
+    monkeypatch.setattr(
+        plugin, "_entry_points", lambda: (_EntryPoint("aklr", provider),)
+    )
+    plugin.configure(enable=("aklr",), source="test")
+    add = _route_add([])
+
+    assert add(2, 3) == 100
+    assert plugin.last_decision().latency_us == 12.4
+    assert [d.latency_us for d in seen] == [12.4]
+    assert plugin.explain("test.add", 2, 3).decision.latency_us == 12.4, (
+        "explain() is the per-call reader, and the one a future side-by-side "
+        "comparison would be built on: the number must be there without run()"
+    )
+
+
+def test_a_native_route_reports_no_latency(monkeypatch):
+    """Nobody reports for native, so there is nothing to report."""
+
+    _enabled_but_unable(monkeypatch)
+    add = _route_add([])
+
+    assert add(2, 3) == 5
+    assert plugin.last_decision().route == "native"
+    assert plugin.last_decision().latency_us is None
+
+
+@pytest.mark.parametrize("bad", [0, -1.0, float("inf"), float("nan")])
+def test_a_latency_that_cannot_mean_anything_is_refused(bad):
+    """There is one way to say "I do not know", and it is not a number.
+
+    Zero, negative, inf and nan each look like data and carry none. A provider
+    without a number omits the field; anything else would be recorded, handed
+    back, and eventually compared against a real one.
+    """
+
+    with pytest.raises(ValueError, match="latency_us"):
+        plugin.KernelCandidate(
+            provider="aklr",
+            kernel_id="kernel-1",
+            artifact_digest="sha256:abc",
+            latency_us=bad,
+            run=lambda *args, **kwargs: None,
+        )
+
+
+def test_a_reported_latency_does_not_influence_routing(monkeypatch):
+    """Observation, not input. The enable list is still the only preference.
+
+    If this ever became an input, a provider could win by reporting a small
+    number, and the enable list -- the one place that names an owner for the
+    decision -- would stop deciding.
+    """
+
+    def candidate_at(name, latency, result):
+        return plugin.KernelCandidate(
+            provider=name,
+            kernel_id=f"kernel-{name}",
+            artifact_digest="sha256:abc",
+            latency_us=latency,
+            run=lambda *args, **kwargs: result,
+        )
+
+    slow = _Provider("slowpoke", candidate_at("slowpoke", 99999.0, 1))
+    fast = _Provider("speedy", candidate_at("speedy", 1.0, 2))
+    monkeypatch.setattr(
+        plugin,
+        "_entry_points",
+        lambda: (_EntryPoint("speedy", fast), _EntryPoint("slowpoke", slow)),
+    )
+    plugin.configure(enable=("slowpoke", "speedy"), source="test")
+    add = _route_add([])
+
+    assert add(2, 3) == 1, "the enable list decides, not the reported number"
+    assert plugin.last_decision().provider == "slowpoke"
+    assert plugin.last_decision().latency_us == 99999.0
+
+
 def test_routing_one_op_name_twice_is_an_error():
     _route_add([])
     with pytest.raises(ValueError, match="already routed"):
