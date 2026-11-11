@@ -6,7 +6,6 @@ import functools
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
-from flydsl._mlir.dialects import llvm  # llvm.intr.fake.use: no fx wrapper
 from flydsl.expr import const_expr, range_constexpr
 from flydsl.expr.typing import ReductionOp, T
 from flydsl.expr.typing import Vector as Vec
@@ -23,7 +22,6 @@ from ..tensor_shim import (
     ptr_buf_tensor,
 )
 from .dispatch import (
-    DISPATCH_TABLE_SIZE,
     DispatchSlot,
     _classify_fanout_wave_route,
     _derive_next_fanout_pairs,
@@ -230,36 +228,6 @@ def _store_i32_agent_relaxed(addr_i64, offset, val):
     flag/counter atomic.
     """
     _store_i32_monotonic(addr_i64, offset, val, fx.rocdl.SyncScope.AgentOneAs)
-
-
-# Dispatch-table scalar cache warm-up.  Every ``dp(slot)`` is an
-# s_buffer_load that LLVM sinks to its first use, so each plan phase stalls
-# on a cold scalar-cache line.  One helper warp touches every 64-byte line of
-# the table while the owner is idle in its prologue barrier, so the later
-# per-phase loads hit.
-# s_buffer_load is readnone, so a load with no consumer is deleted.  Each
-# result is pinned with llvm.intr.fake.use, which emits no instruction
-# (FlyDSL 0.5.0 has no fx wrapper for it), and the warp waits for the loads
-# with lgkmcnt(0).
-
-
-def _keep_alive(vals):
-    """Keep each fx value live up to here (llvm.intr.fake.use, no ISA)."""
-    for v in vals:
-        llvm.intr_fake_use([v.ir_value()])
-
-
-def _kcache_touch(addr_table, num_dwords):
-    """Load one dword of every 64-byte line of ``addr_table[0:num_dwords]``
-    and keep them alive (forces the loads to land in the scalar cache
-    here; the result itself is discarded)."""
-    table = ptr_buf_tensor(addr_table, fx.Int32)
-    offsets = list(range(0, num_dwords, 16))
-    if offsets[-1] != num_dwords - 1:
-        offsets.append(num_dwords - 1)
-    vals = [fx.Int32(buf_scalar_load(table, fx.Int32(dw))) for dw in offsets]
-    _keep_alive(vals)
-    fx.rocdl.s_waitcnt(lgkmcnt=0)
 
 
 def _store_i32_sys_relaxed(addr_i64, offset, val):
@@ -3904,10 +3872,6 @@ def _compile_fast_mega_moe_prepare(
                 count_scratch=count_scratch,
                 prepare_blocks=prepare_blocks,
             )
-            # Scalar-cache warm-up of the dispatch table in the shadow of
-            # the ticket round trip.
-            if (tid >> fx.Int32(6)) == fx.Int32(num_waves - 1):
-                _kcache_touch(addr_disp, DISPATCH_TABLE_SIZE * 2)
         if const_expr(pre_ticket):
             # Decode fused path: every role is self-contained (the owner
             # counts, plans and publishes alone; quant CTAs only stride their
@@ -4244,9 +4208,6 @@ def _compile_fast_mega_moe_prepare(
                         if tid == fx.Int32(0):
                             fx.ptr_store(parity_lane, bcast_scratch)
                             fx.ptr_store(expected_lane, bcast_scratch + fx.Int64(1))
-                    if const_expr(not pre_ticket):  # noqa: SIM102
-                        if (tid >> fx.Int32(6)) == fx.Int32(num_waves - 1):
-                            _kcache_touch(addr_disp, DISPATCH_TABLE_SIZE * 2)
                     fx.barrier()
                     parity = fx.Int32(fx.ptr_load(bcast_scratch))
                     expected = fx.Int32(fx.ptr_load(bcast_scratch + fx.Int64(1)))
