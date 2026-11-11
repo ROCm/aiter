@@ -853,7 +853,7 @@ def _decode_topk_ids(tokens, E, topk):
 
 
 @benchmark()
-def test_route_psum_fused(numel, E, tile_m, topk=0):
+def test_route_psum_fused(numel, E, tile_m, topk=0, packed=False):
     """Single-workgroup route + LDS atomic + psum + remap, all in one launch.
 
     Collapses what test_topids_to_rows and test_contiguous_psum cover separately,
@@ -861,9 +861,11 @@ def test_route_psum_fused(numel, E, tile_m, topk=0):
     prefix sum, and the row invariants against the *contiguous* bands it emits.
 
     With ``topk`` set, routing is decode-shaped (``_decode_topk_ids``) and max_m
-    is the TP grouped path's.
+    is the TP grouped path's. With ``packed``, the expert-tile map is the int64
+    (expert_end << 32) | expert_bits form the grouped GEMM reads for
+    reuse_resident_b, so the decode below has to match the split path's.
     """
-    launch = build_moe_route_psum_fused_module()
+    launch = build_moe_route_psum_fused_module(packed_expert_map=packed)
     if topk:
         topk_ids = _decode_topk_ids(numel // topk, E, topk).reshape(-1)
         max_m = max(tile_m, (numel + tile_m - 1) // tile_m * tile_m)
@@ -881,7 +883,7 @@ def test_route_psum_fused(numel, E, tile_m, topk=0):
     expert_tile_map = torch.full(
         ((numel + E * tile_m + tile_m - 1) // tile_m,),
         -99,
-        dtype=I32,
+        dtype=torch.int64 if packed else I32,
     )
 
     def fn():
@@ -925,10 +927,18 @@ def test_route_psum_fused(numel, E, tile_m, topk=0):
         assert bool(
             ((r >= lo) & (r < lo + counts.cpu().long()[ids])).all()
         ), f"{name}: row outside its expert's contiguous band"
-        tile_experts = expert_tile_map.cpu().long()[r // tile_m]
+        tile_map = expert_tile_map.cpu().long()[r // tile_m]
+        # Packed entries carry the expert end in the high word and the expert id
+        # in the low one, with bit 31 flagging a reusable weight tile.
+        tile_experts = (tile_map & 0x7FFFFFFF) if packed else tile_map
         assert bool(
             (tile_experts == ids).all()
         ), f"{name}: expert tile map disagrees with routed rows"
+        if packed:
+            ends = ref_starts.cpu().long()[ids] + counts.cpu().long()[ids]
+            assert bool(
+                ((tile_map >> 32) == ends).all()
+            ), f"{name}: packed expert end disagrees with the prefix sum"
         assert len(set(r.tolist())) == numel, f"{name}: rows not a bijection"
         ret[f"{name} us"] = us
         ret[f"{name} TB/s"] = nbytes / us / 1e6
@@ -1314,6 +1324,17 @@ def main():
     summarize(
         "moe_route_psum_fused (M3 decode)",
         [test_route_psum_fused(t * 5, 129, 64, topk=5) for t in (1, 4, 16)],
+    )
+    # The packed int64 expert-tile map, which the grouped GEMM reads for
+    # reuse_resident_b. Same kernel, so only the map format differs.
+    summarize(
+        "moe_route_psum_fused (packed map)",
+        [
+            test_route_psum_fused(n, E, tm, packed=True)
+            for n, E, tm in itertools.product(
+                args.numel, [e for e in args.experts if e <= 512], args.tile_m
+            )
+        ],
     )
     summarize(
         "moe_route_psum_herd",
