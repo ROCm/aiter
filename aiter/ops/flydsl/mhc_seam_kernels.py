@@ -76,30 +76,23 @@ _NORMS = ("fused", "separate")
 # BLOCK_M stays 32 above 1024 tokens: the accumulator is as wide as the limb stack, which a
 # 64-token tile cannot afford.
 _FUSED_NORM_TABLE = (
-    (1, 16, 128, False),
-    (32, 16, 128, False),
-    (128, 32, 128, False),
-    (384, 32, 64, False),
-    (512, 32, 64, False),
-    (1024, 32, 64, False),
+    (384, 16, 128, False),
     (2048, 32, 64, False),
-    (4096, 32, 64, False),
-    (8192, 32, 64, True),
-    (16384, 32, 64, True),
-    (32768, 32, 64, True),
+    (32768, 32, 128, True),
 )
 # Same sweep: (max T, BLOCK_M, CHUNK_C, CACHE_NT, CACHE_NT_X).
 # Below the threshold, fused norm avoids the cost of a separate RMSNorm launch.
-_SEPARATE_NORM_ABOVE = 128
+_SEPARATE_NORM_ABOVE = 256
 _SEPARATE_NORM_TABLE = (
-    (384, 16, 256, True, False),
-    (1024, 16, 128, False, True),
+    (384, 16, 128, True, False),
+    (1024, 32, 64, False, True),
     (2048, 32, 128, False, True),
-    (32768, 32, 128, True, False),
+    (8192, 32, 128, True, False),
+    (32768, 32, 128, True, True),
 )
-# The separate path's tokens above which the fused pass does not prefetch: it is 1.00-1.01x
-# from 1024 to 8192 tokens there, against 0.95x at 256 and 512.
-_SEPARATE_PREFETCH_MAX_T = 512
+# The separate path's tokens above which the fused pass does not prefetch: there it is no
+# faster at the table's tiles.
+_SEPARATE_PREFETCH_MAX_T = 1024
 # (BLOCK_M, CHUNK_C) tried, in order, when a row's tile is illegal for H
 _FALLBACK_TILES = tuple((bm, cc) for cc in (64, 128, 256) for bm in (32, 64, 16))
 
@@ -190,7 +183,7 @@ def get_mhc_seam_config(
     """Return a mutable copy of the launch config for this shape, device, and mode.
 
     Modes are ``post``, ``no_post``, ``identity_pre``, and ``no_post_identity_pre``.
-    Post mode prefers separate RMSNorm above 128 tokens when a legal tile exists;
+    Post mode prefers separate RMSNorm above 256 tokens when a legal tile exists;
     other modes use fused RMSNorm. Set ``norm`` to force ``"fused"`` or ``"separate"``.
     """
     return dict(_policy(T, H, arch, cu_num, mode, norm))

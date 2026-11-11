@@ -61,7 +61,7 @@ def dispatch(monkeypatch):
     seam._compile_launcher.cache_clear()
 
 
-def _inputs(T=129, H=512):
+def _inputs(T=257, H=512):
     def empty(*shape, dtype=torch.float32):
         return torch.empty(shape, dtype=dtype, device="meta")
 
@@ -134,8 +134,8 @@ def test_prefetch_follows_the_segment_geometry(dispatch, config, prefetch):
     assert dispatch.compiled[0][1]["prefetch"] is prefetch
 
 
-@pytest.mark.parametrize("T, prefetch", [(512, True), (1024, False)])
-def test_separate_policy_prefetches_up_to_512_tokens(dispatch, T, prefetch):
+@pytest.mark.parametrize("T, prefetch", [(1024, True), (2048, False)])
+def test_separate_policy_prefetches_up_to_1024_tokens(dispatch, T, prefetch):
     seam.flydsl_mhc_seam(**_inputs(T=T, H=5120))
     assert dispatch.compiled[0][1]["norm"] is False
     assert dispatch.compiled[0][1]["prefetch"] is prefetch
