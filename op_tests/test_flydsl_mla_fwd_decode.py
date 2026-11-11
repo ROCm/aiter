@@ -339,6 +339,7 @@ def test_mla_fwd_decode(
         q_dtype,
         kv_dtype,
         out_dtype,
+        num_iters=2,
     ):
     if not torch.cuda.is_available():
         pytest.skip("ROCm is not available")
@@ -444,7 +445,9 @@ def test_mla_fwd_decode(
 
     ret = {"gfx": get_gfx()}
     for name, candidate in candidates.items():
-        _, us = run_perftest(candidate)
+        for tensor in (final_output, split_output, split_lse):
+            tensor.zero_()
+        _, us = run_perftest(candidate, num_iters=num_iters)
         final_err = checkAllclose(
             ref_final_output,
             final_output,
@@ -554,6 +557,13 @@ def main():
         metavar="{bf16,fp8}",
         help="KV cache dtypes. Example: -kvd bf16 fp8",
     )
+    parser.add_argument(
+        "-i",
+        "--num-iters",
+        type=int,
+        default=2,
+        help="Benchmark iterations per candidate. Example: -i 101",
+    )
 
     args = parser.parse_args()
 
@@ -593,6 +603,7 @@ def main():
                     dtypes.bf16,
                     kv_dtype,
                     dtypes.bf16,
+                    num_iters=args.num_iters,
                 )
             )
         except pytest.skip.Exception as e:
