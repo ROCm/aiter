@@ -1,0 +1,6 @@
+{
+    "any": {
+        "num_warps": 4,
+        "PREFETCH": 2
+    }
+}
