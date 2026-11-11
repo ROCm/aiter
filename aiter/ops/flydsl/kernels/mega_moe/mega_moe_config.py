@@ -7,8 +7,6 @@ from collections.abc import Callable
 from dataclasses import dataclass, replace
 from functools import cache
 
-from . import envs
-
 TOKEN_BUCKETS = (
     1,
     2,
@@ -29,9 +27,9 @@ TOKEN_BUCKETS = (
 )
 FIXED_GRID_MULT_VALUES = (1, 2, 3, 4, 6, 8, 12, 16, 24, 32)
 P2P_FP8_MIN_MTPR = 1024
-# Fixed-slot (direct expert slots, no count exchange) is the default up to MTPR
-# 128; AITER_MEGA_FIXED_SLOT_MAX_MTPR extends it (see envs.py).
-FIXED_SLOT_MAX_MTPR = envs.AITER_MEGA_FIXED_SLOT_MAX_MTPR
+# Largest MTPR dispatched fixed-slot (direct expert slots, no count exchange):
+# the MTPR classes up to 128; larger ones take the compact dispatch.
+FIXED_SLOT_MAX_MTPR = 255
 MAX_MTPR_CLASS = 32768
 # Source-indexed payload storage cuts the maximum-capacity activation buffer by
 # roughly ``topk``, so every rank at the max-capacity MTPR class uses it

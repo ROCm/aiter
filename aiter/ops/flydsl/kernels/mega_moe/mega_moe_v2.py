@@ -19,7 +19,6 @@ from ..flydsl_dispatch_combine_intranode_op import (
     group_major_capacity,
 )
 from ..tensor_shim import torch_stream
-from . import envs
 from .dispatch import DISPATCH_TABLE_SIZE, DispatchSlot
 from .mega_moe_config import (
     DEFAULT_SMALL_M_MTPRS,
@@ -243,8 +242,6 @@ class MegaMoEV2:
                 f", small-input capacities {plan.small_m_mtprs}" if plan.small_m_mtprs else "",
                 ", large-input route" if plan.large_m else "",
             )
-        if envs.AITER_MEGA_MOE_PRELOAD:
-            self.preload_aot_bundles()
 
     @property
     def small_m_mtpr(self) -> int:
@@ -387,7 +384,10 @@ class MegaMoEV2:
 
     def preload_aot_bundles(self):
         """Load the paired Stage1 and Stage2 production bundles, and the small- and
-        large-input kernels when this instance built them."""
+        large-input kernels when this instance built them.
+
+        Building an instance never preloads; without this call each kernel loads
+        at its first launch."""
         self.preload_stage1_bundle()
         self.preload_stage2_bundle()
         for runtime in self._small_m_runtimes:
@@ -497,11 +497,6 @@ class MegaMoEV2:
         )
 
         self.sort_block_m = 32
-        # Opt-in hardware bounds checking for the Stage1 control buffers.  Off
-        # by default so production keeps today's descriptors; turn it on while
-        # sweeping configurations, where an indexing mistake would otherwise
-        # page-fault and can leave a GPU needing a privileged reset.
-        self._s1_bounds_check = envs.AITER_MEGA_MOE_BOUNDS_CHECK
         self._s1_w1 = w1.contiguous().view(torch.uint8)
         self._s1_w1_scale = w1_scale.contiguous().view(torch.uint8)
         op = self.comb_op._gm
@@ -1011,7 +1006,6 @@ class MegaMoEV2:
             "situ_linear_beta": self.situ_linear_beta,
             "a_dtype": self._a_dtype,
             "out_dtype": self._a_dtype,
-            "bounds_check": self._s1_bounds_check,
         }
         entry = self._active_bundle_entry
         use_bundle = (
@@ -1090,9 +1084,7 @@ class MegaMoEV2:
             config = self._select_config(run_tokens)
         # Combine skips top-k slots with id -1 (never dispatched, so their partial
         # is stale). The check costs prefill time, so it runs only when the
-        # caller says ids may be -1.
-        if mask_invalid_slots is None:
-            mask_invalid_slots = self._combine_mask
+        # caller says ids may be -1 (None or False: off).
         self._run_fused_stage1(
             x,
             wts,
@@ -1131,8 +1123,8 @@ class MegaMoEV2:
         max_tokens=None,
     ):
         """``mask_invalid_slots``: ids may contain -1 (skipped, contributing zero).
-        None defers to AITER_MEGA_COMBINE_MASK (default off); the small- and
-        large-input routes always skip -1 slots.
+        None or False leaves the check off (it costs prefill time); the small-
+        and large-input routes always skip -1 slots.
 
         ``max_tokens``: rows of this call on its largest EP rank, counting graph
         padding, passed identically on every rank; it selects the route. None
@@ -1266,8 +1258,6 @@ class MegaMoEV2:
         )
 
         FlyDSLDispatchCombineIntraNodeOp._ENABLE_COMBINE_NO_STAGE1 = True
-        # Default of forward(mask_invalid_slots=...).
-        self._combine_mask = envs.AITER_MEGA_COMBINE_MASK
         comb_cfg = self.comb_cfg
         dev = torch.device("cuda", comb_cfg.rank)
         k = comb_cfg.num_experts_per_token

@@ -921,8 +921,8 @@ class SiluQuantEpilogue:
         assert evec in (2, 8)
         # FP4 output is only implemented in the evec==2 store branch; the evec==8
         # vectorized store (_store_quant_vec8) is FP8-only.  Force evec=2 for FP4
-        # so the default AITER_MEGA_S1_EPI_EVEC=8 never routes FP4 to the FP8
-        # store path (which would write FP8 words into the Int8 FP4 buffer).
+        # so Stage1's evec=8 never routes FP4 to the FP8 store path (which would
+        # write FP8 words into the Int8 FP4 buffer).
         self._evec = 2 if self._is_fp4 else evec
         # fused_v8: the fused kernels' evec 8 store pass (_store_quant_vec8_fused: valid rows, a store cache policy,
         # tile_rows); lean (fused_v8 only): bit 0 = that pass without serial waits, bit 1 = fast SiLU.
