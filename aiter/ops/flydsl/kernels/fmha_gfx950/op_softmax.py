@@ -379,3 +379,188 @@ class DualwaveFp8SoftmaxHelper(DualwaveFp8KernelContext):
 
     def finish_half_row_sum(self, l_row):
         return _lane_pair_reduce(l_row, lambda a, b, _fm: a + b, None)
+
+    # conventional_bn64 fast loop, max-free (lazy rescale only): no row max on the common path. Every P is at most the
+    # partial sum it is in, so "every 8-element partial sum <= 2**(thr + bias)" (e4m3's 448) proves no P overflows fp8
+    # and the offset stays. A tile that fails takes the inf test (recompute S from LDS), then a max-of-P rebase with
+    # the same bound and target (max P -> 2**bias) as lazy_correct_o_nsm.
+
+    # Bound on max P from the four sums of 8 (sums of 16 fall back more often, a single sum of 32 more still).
+    BOUND_LEVEL = 2
+
+    def _fast_limit(self):
+        return self.traits.DUALWAVE_SWP_RESCALE_THRESHOLD + _p_headroom_log2(
+            self.traits
+        )
+
+    def first_tile_offset(self, v_s, nsm, first):
+        """The first tile sets the offset from its row max (O and l are still zero, nothing to rescale), so the huge
+        nsm_init never reaches the exp and the first tile does not take the recompute path.
+        """
+        bias = _p_headroom_log2(self.traits)
+
+        @flyc.jit
+        def _run(v_s, nsm, first):
+            n_out = as_mlir_value(nsm)
+            if first:
+                m_row_tile = _lane_pair_reduce(
+                    self.half_row_max(v_s), lambda a, b, _fm: fx.maxnumf(a, b), None
+                )
+                nsm_tile = (
+                    fx.Float32(bias) - fx.Float32(m_row_tile) * self.c_logit_scale
+                )
+                n_out = self.anchor_scalar_f32(fx.minnumf(fx.Float32(nsm), nsm_tile))
+            return n_out
+
+        return _run(v_s, nsm, first)
+
+    def exp_and_bound(self, v_s, nsm):
+        """P = exp2(scale * s + nsm), this lane's half-row sum of P, and an upper bound on max P (the max of the
+        partial sums at BOUND_LEVEL), from one scalar v_add_f32 tree."""
+        v_x = self.sub_nsm(v_s, nsm, True)
+        v_p = _exp2_score_slice(v_x, 0)
+        p_lo, p_hi = _exp2_score_slice(v_p, 16)
+        cur = [fx.Float32(p_lo[i]) + fx.Float32(p_hi[i]) for i in range(16)]
+        levels = [cur]
+        while len(cur) > 1:
+            h = len(cur) // 2
+            cur = [cur[i] + cur[i + h] for i in range(h)]
+            levels.append(cur)
+        bound = levels[self.BOUND_LEVEL + 1]
+        mb = bound[0]
+        for v in bound[1:]:
+            mb = fx.maxnumf(mb, v)
+        p_lo, p_hi = _score_lists_to_vecs((p_lo, p_hi))
+        return p_lo, p_hi, as_mlir_value(cur[0]), as_mlir_value(mb)
+
+    def _max_p_rebase(self, v_o, nsm, l_row, p_lo, p_hi, l_tile):
+        """Exact max of P. Below the limit everywhere: nothing to do. Otherwise scale P, its sum, O and l by
+        corr = min(1, 2**bias / row max P): the same target as a max-based rebase, nsm only falls.
+        """
+        limit = self._fast_limit()
+        bias = _p_headroom_log2(self.traits)
+
+        def reducer(a, b, _fm):
+            return fx.maxnumf(a, b)
+
+        @flyc.jit
+        def _run(v_o, nsm, l_row, p_lo, p_hi, l_tile):
+            maxp = _reduce_score_pair(
+                _score_pair_to_lists((p_lo, p_hi)), self.c_zero_f, reducer, None
+            )
+            over = fx.Float32(maxp) > fx.Float32(2.0**limit)
+            ballot = rocdl.ballot(T.i64, as_mlir_value(over))
+            all_ok = (fx.Int64(ballot) == fx.Int64(0)).ir_value()
+            o_out = [
+                as_mlir_value(v_o[dc]) for dc in range_constexpr(self.traits.D_CHUNKS)
+            ]
+            n_out = as_mlir_value(nsm)
+            l_out = as_mlir_value(l_row)
+            plo_out = as_mlir_value(p_lo)
+            phi_out = as_mlir_value(p_hi)
+            lt_out = as_mlir_value(l_tile)
+            if fx.Boolean(all_ok):
+                pass
+            else:
+                # Both lane halves of a row take the same corr. The floor keeps log2 off a row whose P is all 0.
+                maxp_row = fx.maxnumf(
+                    _lane_pair_reduce(maxp, reducer, None), fx.Float32(1.0e-30)
+                )
+                lg = fx.math.log2(fx.Float32(maxp_row), fastmath="afn")
+                d = fx.minnumf(fx.Float32(bias) - fx.Float32(lg), self.c_zero_f)
+                corr = fx.math.exp2(fx.Float32(d), fastmath="afn").ir_value()
+                scaled = list(v_o)
+                self.scale_o(scaled, corr)
+                o_out = [
+                    as_mlir_value(scaled[dc])
+                    for dc in range_constexpr(self.traits.D_CHUNKS)
+                ]
+                l_out = as_mlir_value(fx.Float32(l_row) * fx.Float32(corr))
+                n_out = self.anchor_scalar_f32(fx.Float32(nsm) + d)
+                cv = fx.full(16, fx.Float32(corr), fx.Float32)
+                plo_out = as_mlir_value(Vec(p_lo) * cv)
+                phi_out = as_mlir_value(Vec(p_hi) * cv)
+                lt_out = as_mlir_value(fx.Float32(l_tile) * fx.Float32(corr))
+            return (o_out, n_out, l_out, plo_out, phi_out, lt_out)
+
+        return _run(v_o, nsm, l_row, p_lo, p_hi, l_tile)
+
+    def _recompute_if_inf(self, v_o, nsm, l_row, p_lo, p_hi, l_tile, mb, recompute_s):
+        """Some P overflowed to inf (a logit beat the offset by > 128 log2 units; P = exp2(finite) is never NaN, so
+        neither is the bound). K is still in LDS (no barrier since): redo S and the max-based lazy rescale from the
+        pre-tile state, which this tile has not touched yet."""
+
+        @flyc.jit
+        def _run(v_o, nsm, l_row, p_lo, p_hi, l_tile, mb):
+            bad = fx.Float32(mb) > fx.Float32(3.0e38)
+            ballot = rocdl.ballot(T.i64, as_mlir_value(bad))
+            any_bad = (fx.Int64(ballot) != fx.Int64(0)).ir_value()
+            any_bad = llvm.intr_expect(any_bad, fx.Boolean(False).ir_value())
+            o_out = [
+                as_mlir_value(v_o[dc]) for dc in range_constexpr(self.traits.D_CHUNKS)
+            ]
+            n_out = as_mlir_value(nsm)
+            l_out = as_mlir_value(l_row)
+            plo_out = as_mlir_value(p_lo)
+            phi_out = as_mlir_value(p_hi)
+            lt_out = as_mlir_value(l_tile)
+            if fx.Boolean(any_bad):
+                helper = self
+                v_s2 = recompute_s()
+                o2, n2, l2 = helper.lazy_correct_o_nsm(
+                    v_o, nsm, l_row, helper.half_row_max(v_s2)
+                )
+                plo2, phi2, lt2, _mb2 = helper.exp_and_bound(v_s2, n2)
+                o_out = [
+                    as_mlir_value(o2[dc])
+                    for dc in range_constexpr(self.traits.D_CHUNKS)
+                ]
+                n_out = as_mlir_value(n2)
+                l_out = as_mlir_value(l2)
+                plo_out = as_mlir_value(plo2)
+                phi_out = as_mlir_value(phi2)
+                lt_out = as_mlir_value(lt2)
+            return (o_out, n_out, l_out, plo_out, phi_out, lt_out)
+
+        return _run(v_o, nsm, l_row, p_lo, p_hi, l_tile, mb)
+
+    def merged_test_rebase(self, v_o, nsm, l_row, p_lo, p_hi, l_tile, mb, recompute_s):
+        """One compare + branch per tile: inf > 2**limit, so "no lane over the limit" also proves no lane overflowed.
+        recompute_s: re-reads K from LDS and redoes QK (the inf fallback)."""
+        limit = self._fast_limit()
+
+        @flyc.jit
+        def _run(v_o, nsm, l_row, p_lo, p_hi, l_tile, mb):
+            # "Some lane over" straight off VCC; mb is never NaN (sums of P in [0, inf]).
+            over = fx.Float32(mb) > fx.Float32(2.0**limit)
+            ballot = rocdl.ballot(T.i64, as_mlir_value(over))
+            any_over = (fx.Int64(ballot) != fx.Int64(0)).ir_value()
+            any_over = llvm.intr_expect(any_over, fx.Boolean(False).ir_value())
+            o_out = [
+                as_mlir_value(v_o[dc]) for dc in range_constexpr(self.traits.D_CHUNKS)
+            ]
+            n_out = as_mlir_value(nsm)
+            l_out = as_mlir_value(l_row)
+            plo_out = as_mlir_value(p_lo)
+            phi_out = as_mlir_value(p_hi)
+            lt_out = as_mlir_value(l_tile)
+            if fx.Boolean(any_over):
+                helper = self
+                o2, n2, l2, plo2, phi2, lt2 = helper._recompute_if_inf(
+                    v_o, nsm, l_row, p_lo, p_hi, l_tile, mb, recompute_s
+                )
+                o3, n3, l3, plo3, phi3, lt3 = helper._max_p_rebase(
+                    o2, n2, l2, plo2, phi2, lt2
+                )
+                o_out = [
+                    as_mlir_value(o3[dc])
+                    for dc in range_constexpr(self.traits.D_CHUNKS)
+                ]
+                n_out = as_mlir_value(n3)
+                l_out = as_mlir_value(l3)
+                plo_out = as_mlir_value(plo3)
+                phi_out = as_mlir_value(phi3)
+                lt_out = as_mlir_value(lt3)
+            return (o_out, n_out, l_out, plo_out, phi_out, lt_out)
+
+        return _run(v_o, nsm, l_row, p_lo, p_hi, l_tile, mb)

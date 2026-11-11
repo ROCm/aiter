@@ -115,6 +115,8 @@ def build_flash_attn_dualwave_swp_fp8_module(
     RETURN_LSE = traits.RETURN_LSE
     # Scalar softmax FMAs and row-sum adds for conventional_bn64 (needs SLP off, see the llvm options below).
     BN64_SCALAR_SOFTMAX = traits.BODY_VARIANT == "conventional_bn64"
+    # The bound test is the lazy threshold's test without the row max; eager rescale keeps the max-based fast loop.
+    BN64_MAX_FREE = BN64_SCALAR_SOFTMAX and traits.DUALWAVE_SWP_LAZY_RESCALE
     DEFAULT_STRIDE_Q_N = traits.DEFAULT_STRIDE_Q_N
     DEFAULT_STRIDE_O_N = traits.DEFAULT_STRIDE_O_N
     DEFAULT_STRIDE_KV_N = traits.DEFAULT_STRIDE_KV_N
@@ -470,7 +472,39 @@ def build_flash_attn_dualwave_swp_fp8_module(
             t_main = (t_main < t_full).select(t_main, t_full)
         t_main = (t_main > t0).select(t_main, t0)
 
-        def _fast_tile(j, loop_args, buf, next_buf):
+        def _fast_softmax_pv(j, loop_args, buf, v_s, first):
+            """Max-free softmax (softmax_helper.merged_test_rebase): no row max unless a tile fails the bound test."""
+            nsm = loop_args[0]
+            l_row = loop_args[1]
+            v_o = [loop_args[2 + i] for i in range_constexpr(D_CHUNKS)]
+            if const_expr(first is not None):
+                nsm = softmax_helper.first_tile_offset(v_s, nsm, first)
+            p_lo, p_hi, l_tile, mb = softmax_helper.exp_and_bound(v_s, nsm)
+            _bn64_prio(BN64_PV_PRIO)
+
+            def _recompute_s():
+                # K is still in this tile's LDS buffer: no barrier since the first read.
+                return gemm_helper.qk(kv_lds_to_regs.load_k(buf), q_wide)
+
+            v_o, nsm, l_row, p_lo, p_hi, l_tile = softmax_helper.merged_test_rebase(
+                v_o, nsm, l_row, p_lo, p_hi, l_tile, mb, _recompute_s
+            )
+            # Anchored so the sum, and P's fp32 copy, die before the V reads.
+            l_row = softmax_helper.anchor_scalar_f32(fx.Float32(l_row) + l_tile)
+            v_p = gemm_helper.cast_p_fp8_direct(
+                softmax_helper.v_s_vec_to_lists((p_lo, p_hi))
+            )
+            rocdl.sched_barrier(0)
+            v_v = kv_lds_to_regs.load_v(
+                buf, j * BN if traits.V_SHUFFLED else None, full=True
+            )
+            if const_expr(not traits.V_SHUFFLED):
+                # Inline transpose reads are invisible to LLVM's wait insertion.
+                rocdl.s_waitcnt(lgkmcnt=0)
+            v_o = gemm_helper.pv(v_p, v_v, v_o)
+            return [nsm, l_row] + v_o
+
+        def _fast_tile(j, loop_args, buf, next_buf, first=None):
             _tile_top()
             # pf <= t_main < t_end: a real tile, so no prefetch branch. pf < t_main is full; pf == t_main may be
             # partial (or causal-masked) only in its K tail, which the general loop masks, so K skips the tail sentinel.
@@ -485,6 +519,8 @@ def build_flash_attn_dualwave_swp_fp8_module(
             # Stands in for the mask branch: the max/exp would otherwise interleave into QK and spill Q.
             rocdl.sched_barrier(0)
             _bn64_prio(0)
+            if const_expr(BN64_MAX_FREE):
+                return _fast_softmax_pv(j, loop_args, buf, v_s, first)
             return _tile_softmax_pv(j, loop_args, buf, v_s, False)
 
         # Unrolled by two over a unit-step pair counter: t0 is 0 (bn64 has no split-K), so pair halves read the
@@ -493,7 +529,7 @@ def build_flash_attn_dualwave_swp_fp8_module(
         pair_results = init_args
         for p, loop_args in range(t0, n_pairs, fx.Int64(1), init=init_args):
             j = fx.Int64(p) * fx.Int64(2)
-            args = _fast_tile(j, list(loop_args), 0, 1)
+            args = _fast_tile(j, list(loop_args), 0, 1, j == t0)
             args = _fast_tile(j + fx.Int64(1), args, 1, 0)
             pair_results = yield args
         init_args = list(pair_results)
@@ -503,7 +539,9 @@ def build_flash_attn_dualwave_swp_fp8_module(
         ):
             j = fx.Int64(j)
             buf = fx.Int32(j) % fx.Int32(2)
-            fast_results = yield _fast_tile(j, loop_args, buf, fx.Int32(1) - buf)
+            fast_results = yield _fast_tile(
+                j, loop_args, buf, fx.Int32(1) - buf, j == t0
+            )
 
         init_args = list(fast_results)
         loop_results = init_args
