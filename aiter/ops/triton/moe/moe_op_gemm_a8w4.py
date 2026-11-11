@@ -315,6 +315,12 @@ def get_kernel_config_gluon(m, n, k, routing_data, out_mx_quant=False):
         cfg["persistent_iters"],
     )
 
+    # gfx1250-strict: the prefill kernel (block_m > 16, not persistent) with
+    # BLOCK_N > 128 spills heavily in the SwiGLU / gammas epilogue and returns
+    # wrong results; BLOCK_N = 128 keeps it spill-free and correct.
+    if get_arch() == "gfx1250-strict" and block_m != 16 and persistent_iters == 1:
+        block_n = min(block_n, 128)
+
     num_buffers = min(num_buffers, triton.cdiv(k, block_k))
     block_m *= ctas_per_cga[0]
     block_n *= ctas_per_cga[1]

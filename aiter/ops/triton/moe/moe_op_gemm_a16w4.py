@@ -579,6 +579,7 @@ def moe_gemm_a16w4(
                 num_warps=config["num_warps"],
                 num_stages=config["num_stages"],
                 UPCAST_INDICES=should_upcast_indices(x, w, y),
+                F32_WMMA=get_arch() == "gfx1250-strict",
                 waves_per_eu=config["waves_per_eu"],
                 matrix_instr_nonkdim=config["matrix_instr_nonkdim"],
                 kpack=config["kpack"],

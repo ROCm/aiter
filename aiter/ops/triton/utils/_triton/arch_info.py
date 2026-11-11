@@ -27,6 +27,27 @@ def get_arch():
     return _CACHED_ARCH
 
 
+try:
+    from triton.language.target_info import current_target
+    from triton.runtime.jit import constexpr_function
+except ImportError:  # older Triton: no gfx1250 Gluon kernels to gate
+
+    def is_gfx1250_strict():
+        return get_arch() == "gfx1250-strict"
+
+else:
+
+    @constexpr_function
+    def is_gfx1250_strict():
+        """Compile-time branch for @gluon.jit / @triton.jit kernels."""
+        target = current_target()
+        return (
+            target is not None
+            and target.backend == "hip"
+            and target.arch == "gfx1250-strict"
+        )
+
+
 def is_gluon_avail():
     return get_arch() in ("gfx950", "gfx1250", "gfx1250-strict")
 

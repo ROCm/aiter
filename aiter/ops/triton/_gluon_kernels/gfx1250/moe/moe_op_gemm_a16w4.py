@@ -103,6 +103,13 @@ def unswizzle_mx_scale_gfx1250(
     return scale
 
 
+@gluon.jit
+def _wmma_bf16(x, w, acc, F32_WMMA: gl.constexpr):
+    if F32_WMMA:
+        return gl.amd.gfx1250.wmma(x.to(gl.float32), w.to(gl.float32), acc)
+    return gl.amd.gfx1250.wmma(x, w, acc)
+
+
 @gluon.jit(launch_metadata=matmul_launch_metadata)
 def _moe_gemm_a16w4(
     Y,
@@ -157,6 +164,7 @@ def _moe_gemm_a16w4(
     W_CACHE_MODIFIER: gl.constexpr,
     num_warps: gl.constexpr,
     UPCAST_INDICES: gl.constexpr = False,
+    F32_WMMA: gl.constexpr = False,
 ):
     MX_PACK_DIVISOR: gl.constexpr = 32
     NUM_TDM_OPS: gl.constexpr = 3  # X, W (fp4 packed), W_scale (e8m0 expanded)
@@ -258,6 +266,14 @@ def _moe_gemm_a16w4(
     off_w_n_scale = pid_n * SCALE_BLOCK_N
 
     # WMMA layout for plain bf16 x bf16: instr_shape [16, 16, 32], k_width=8.
+    # F32_WMMA (gfx1250-strict, which restricts bf16 WMMA): upcast operands to
+    # f32 (exact) and use the f32 16x16x4 instruction, k_width=2.
+    if F32_WMMA:
+        WMMA_K: gl.constexpr = 4
+        DOT_K_WIDTH: gl.constexpr = 2
+    else:
+        WMMA_K: gl.constexpr = 32
+        DOT_K_WIDTH: gl.constexpr = 8
     if num_warps == 4:
         WARP_BASES: gl.constexpr = [[0, 1], [0, 2]]
     else:
@@ -271,13 +287,13 @@ def _moe_gemm_a16w4(
         transposed=True,
         warp_bases=WARP_BASES,
         reg_bases=[],
-        instr_shape=[16, 16, 32],
+        instr_shape=[16, 16, WMMA_K],
     )
     DOT_LAYOUT_X: gl.constexpr = gl.DotOperandLayout(
-        operand_index=0, parent=WMMA_LAYOUT, k_width=8
+        operand_index=0, parent=WMMA_LAYOUT, k_width=DOT_K_WIDTH
     )
     DOT_LAYOUT_W: gl.constexpr = gl.DotOperandLayout(
-        operand_index=1, parent=WMMA_LAYOUT, k_width=8
+        operand_index=1, parent=WMMA_LAYOUT, k_width=DOT_K_WIDTH
     )
 
     # Blocked layouts for fp4-packed W (BLOCK_N, BLOCK_K // 2) and its expanded e8m0
@@ -467,7 +483,7 @@ def _moe_gemm_a16w4(
         w_bf16 = gl.amd.gfx1250.scaled_upcast(w_packed, w_scale, gl.bfloat16, axis=1)
         # (N, K) -> (K, N) for the B operand of WMMA, then move to the dot-operand layout.
         w_kn = gl.convert_layout(w_bf16.trans(1, 0), DOT_LAYOUT_W)
-        acc = gl.amd.gfx1250.wmma(x_tile, w_kn, acc)
+        acc = _wmma_bf16(x_tile, w_kn, acc, F32_WMMA)
         read_idx += 1
 
     if B is not None:
@@ -515,7 +531,7 @@ def _moe_gemm_a16w4(
         w_scale = ws_buffer_slice.load(layout=COMPACT_SCALE_LAYOUT)
         w_bf16 = gl.amd.gfx1250.scaled_upcast(w_packed, w_scale, gl.bfloat16, axis=1)
         w_kn = gl.convert_layout(w_bf16.trans(1, 0), DOT_LAYOUT_W)
-        acc = gl.amd.gfx1250.wmma(x_tile, w_kn, acc)
+        acc = _wmma_bf16(x_tile, w_kn, acc, F32_WMMA)
         read_idx += 1
 
     # bias / activation / write-back

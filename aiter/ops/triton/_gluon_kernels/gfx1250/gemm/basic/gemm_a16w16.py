@@ -70,7 +70,9 @@ def create_shared_layouts(
     return (SHARED_LAYOUT_A, SHARED_LAYOUT_B)
 
 
-def create_wmma_layouts(num_warps):
+def create_wmma_layouts(num_warps, f32_wmma=False):
+    """f32_wmma (gfx1250-strict, which restricts bf16/f16 WMMA): use the f32
+    16x16x4 instruction; operands are upcast to f32 (exact) by wmma_16bit."""
     warp_bases = []
     for i in range(int(math.log2(num_warps))):
         if i == 0:
@@ -79,12 +81,27 @@ def create_wmma_layouts(num_warps):
             warp_bases.append((1 << (i - 1), 0))
     warp_bases = tuple(warp_bases)
 
+    instr_k, k_width = (4, 2) if f32_wmma else (32, 8)
     wmma_layout = gl.amd.AMDWMMALayout(
-        version=3, transposed=True, warp_bases=warp_bases, instr_shape=[16, 16, 32]
+        version=3,
+        transposed=True,
+        warp_bases=warp_bases,
+        instr_shape=[16, 16, instr_k],
     )
-    operand_a = gl.DotOperandLayout(operand_index=0, parent=wmma_layout, k_width=8)
-    operand_b = gl.DotOperandLayout(operand_index=1, parent=wmma_layout, k_width=8)
+    operand_a = gl.DotOperandLayout(
+        operand_index=0, parent=wmma_layout, k_width=k_width
+    )
+    operand_b = gl.DotOperandLayout(
+        operand_index=1, parent=wmma_layout, k_width=k_width
+    )
     return (wmma_layout, operand_a, operand_b)
+
+
+@gluon.jit
+def wmma_16bit(a, b, acc, F32_WMMA: gl.constexpr):
+    if F32_WMMA:
+        return gl.amd.gfx1250.wmma(a.to(gl.float32), b.to(gl.float32), acc)
+    return gl.amd.gfx1250.wmma(a, b, acc)
 
 
 @gluon.jit(repr=_gemm_a16w16_bandwidth_bound_repr)
@@ -115,6 +132,7 @@ def _gemm_a16w16_bandwidth_bound_kernel(
     activation: gl.constexpr,
     USE_ACTIVATION: gl.constexpr,
     ADD_BIAS: gl.constexpr,
+    F32_WMMA: gl.constexpr = False,
 ):
     pid = gl.program_id(axis=0)
     num_pid_m = gl.cdiv(M, BLOCK_M)
@@ -281,7 +299,7 @@ def _gemm_a16w16_bandwidth_bound_kernel(
                 OPERAND_LAYOUT_B,
             )
 
-        accumulator = gl.amd.gfx1250.wmma(cur_a, cur_b, accumulator)
+        accumulator = wmma_16bit(cur_a, cur_b, accumulator, F32_WMMA)
 
         compute_idx += 1
 
@@ -339,7 +357,7 @@ def _gemm_a16w16_bandwidth_bound_kernel(
             OPERAND_LAYOUT_B,
         )
 
-    accumulator = gl.amd.gfx1250.wmma(cur_a, cur_b, accumulator)
+    accumulator = wmma_16bit(cur_a, cur_b, accumulator, F32_WMMA)
 
     compute_idx += 1
 
@@ -367,7 +385,7 @@ def _gemm_a16w16_bandwidth_bound_kernel(
                 OPERAND_LAYOUT_B,
             )
 
-        accumulator = gl.amd.gfx1250.wmma(cur_a, cur_b, accumulator)
+        accumulator = wmma_16bit(cur_a, cur_b, accumulator, F32_WMMA)
         compute_idx += 1
 
     # Bias
@@ -436,6 +454,7 @@ def _gemm_a16w16_compute_bound_kernel(
     activation: gl.constexpr,
     USE_ACTIVATION: gl.constexpr,
     ADD_BIAS: gl.constexpr,
+    F32_WMMA: gl.constexpr = False,
 ):
     """Local-load pipelining across K-tiles.
 
@@ -587,7 +606,7 @@ def _gemm_a16w16_compute_bound_kernel(
     # ---- Peeled first iteration ----
     # WMMA for the current tile — uses operands pre-loaded in the
     # *previous* iteration so no ds_read stall before the matrix op.
-    accumulator = gl.amd.gfx1250.wmma(cur_a, cur_b, accumulator)
+    accumulator = wmma_16bit(cur_a, cur_b, accumulator, F32_WMMA)
 
     # Issue TDM for the tile that is (NUM_BUFFERS-1) steps ahead
     gl.amd.gfx1250.tdm.async_load(
@@ -658,7 +677,7 @@ def _gemm_a16w16_compute_bound_kernel(
 
         # WMMA for the current tile — uses operands pre-loaded in the
         # *previous* iteration so no ds_read stall before the matrix op.
-        accumulator = gl.amd.gfx1250.wmma(cur_a, cur_b, accumulator)
+        accumulator = wmma_16bit(cur_a, cur_b, accumulator, F32_WMMA)
 
         # Issue TDM for the tile that is (NUM_BUFFERS-1) steps ahead
         gl.amd.gfx1250.tdm.async_load(
@@ -726,7 +745,7 @@ def _gemm_a16w16_compute_bound_kernel(
     # the descriptors are already positioned at the last tile, so rewrite the
     # OOB extent to the real remaining size (the M/N extents are unchanged from
     # make) and skip the trailing add_offsets since there is no next load.
-    accumulator = gl.amd.gfx1250.wmma(cur_a, cur_b, accumulator)
+    accumulator = wmma_16bit(cur_a, cur_b, accumulator, F32_WMMA)
 
     k_main = (num_k_tiles - 1) * BLOCK_K
     if LAYOUT[0] == "T":
@@ -806,14 +825,14 @@ def _gemm_a16w16_compute_bound_kernel(
                 b_buffer.index((compute_idx + 1) % NUM_BUFFERS).permute([1, 0]),
                 OPERAND_LAYOUT_B,
             )
-        accumulator = gl.amd.gfx1250.wmma(cur_a, cur_b, accumulator)
+        accumulator = wmma_16bit(cur_a, cur_b, accumulator, F32_WMMA)
 
         cur_a = next_a
         cur_b = next_b
         compute_idx += 1
 
     # Final WMMA for the last pre-loaded tile
-    accumulator = gl.amd.gfx1250.wmma(cur_a, cur_b, accumulator)
+    accumulator = wmma_16bit(cur_a, cur_b, accumulator, F32_WMMA)
 
     # if NUM_BUFFERS > 2:
     #     gl.amd.sched_barrier(0)

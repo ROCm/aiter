@@ -8,6 +8,7 @@ from triton.language.core import _aggregate as aggregate
 from aiter.ops.triton._gluon_kernels.gfx950.attention.fp8_mqa_logits import (
     _weighted_sum_fma_fold,
 )
+from aiter.ops.triton.utils._triton.arch_info import is_gfx1250_strict
 from aiter.ops.triton.utils._triton.kernel_repr import make_kernel_repr
 from aiter.ops.triton.utils.common_utils import strip_annotate
 
@@ -182,6 +183,14 @@ def _mqa_dot(
         dtype=gl.float32,
         layout=layout,
     )
+    # gfx1250-strict restricts plain fp8 WMMA; with HEAD_SIZE > 64 (16x16x128
+    # layout) scaled WMMA with unit scales is equivalent.
+    if is_gfx1250_strict() and mfma_q.shape[1] > 64:
+        gl.static_assert(mfma_q.dtype == gl.float8e4nv)
+        gl.static_assert(mfma_k.dtype == gl.float8e4nv)
+        return gl.amd.gfx1250.wmma_scaled(
+            mfma_q, None, "e4m3", mfma_k, None, "e4m3", acc
+        )
     return gl.amd.gfx1250.wmma(mfma_q, mfma_k, acc)
 
 

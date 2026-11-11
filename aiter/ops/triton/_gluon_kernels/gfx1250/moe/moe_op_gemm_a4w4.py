@@ -13,6 +13,7 @@ from aiter.ops.triton._triton_kernels.common.pid_preprocessing import (
     remap_xcd,
 )
 from aiter.ops.triton._triton_kernels.moe.activations import _swiglu
+from aiter.ops.triton.utils._triton.arch_info import get_arch
 from aiter.ops.triton.utils._triton.kernel_repr import make_kernel_repr
 
 _MOE_GEMM_A4W4_REPR_KEYS = [
@@ -112,6 +113,9 @@ def get_moe_a4w4_layouts_prefill(
     gather_idx_bitwidth,
     X_SCALES_TDM=False,
 ):
+    # gfx1250-strict lacks the F4-only 32x16x128 scaled WMMA; use the
+    # f8f6f4 16x16x128 instruction instead.
+    WMMA_M = 16 if get_arch() == "gfx1250-strict" else 32
     OUT_BLOCK_N = BLOCK_N // ACTIVATION_REDUCTION_N
     PACKED_BLOCK_M_X = BLOCK_M
     PACKED_BLOCK_K_X = BLOCK_K // 2
@@ -168,7 +172,7 @@ def get_moe_a4w4_layouts_prefill(
         transposed=True,
         warp_bases=warp_bases,
         reg_bases=[],
-        instr_shape=[32, 16, 128],
+        instr_shape=[WMMA_M, 16, 128],
         cga_layout=cga_layout_c,
     )
     WMMA_LAYOUT_PACKED = gl.amd.AMDWMMALayout(
@@ -176,7 +180,7 @@ def get_moe_a4w4_layouts_prefill(
         transposed=True,
         warp_bases=warp_bases,
         reg_bases=[],
-        instr_shape=[32, 16, 64],
+        instr_shape=[WMMA_M, 16, 64],
         cga_layout=cga_layout_c,
     )
     DOT_LAYOUT_X = gl.DotOperandLayout(
@@ -354,6 +358,9 @@ def get_moe_a4w4_layouts_decode(
     gather_idx_bitwidth,
     X_SCALES_TDM=False,
 ):
+    # gfx1250-strict lacks the F4-only 32x16x128 scaled WMMA; use the
+    # f8f6f4 16x16x128 instruction instead.
+    WMMA_M = 16 if get_arch() == "gfx1250-strict" else 32
     OUT_BLOCK_N = BLOCK_N // ACTIVATION_REDUCTION_N
     PACKED_BLOCK_M_X = BLOCK_M
     PACKED_BLOCK_K_X = BLOCK_K // 2
@@ -391,14 +398,14 @@ def get_moe_a4w4_layouts_decode(
         transposed=True,
         warp_bases=warp_bases,
         reg_bases=[],
-        instr_shape=[32, 16, 128],
+        instr_shape=[WMMA_M, 16, 128],
     )
     WMMA_LAYOUT_PACKED = gl.amd.AMDWMMALayout(
         version=3,
         transposed=True,
         warp_bases=warp_bases,
         reg_bases=[],
-        instr_shape=[32, 16, 64],
+        instr_shape=[WMMA_M, 16, 64],
     )
     DOT_LAYOUT_X = gl.DotOperandLayout(
         operand_index=0,

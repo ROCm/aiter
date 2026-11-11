@@ -276,6 +276,7 @@ def gemm_a16w16_(
                 num_warps=num_warps,
                 num_stages=num_stages,
                 waves_per_eu=waves_per_eu,
+                F32_WMMA=get_arch() == "gfx1250-strict",
             )
 
             if NUM_KSPLIT > 1:
@@ -442,7 +443,8 @@ def gemm_a16w16_(
         if y is None:
             y = torch.empty((M, N), dtype=dtype, device=x.device)
 
-        wmma_layout, operand_a, operand_b = create_wmma_layouts(num_warps)
+        f32_wmma = get_arch() == "gfx1250-strict"
+        wmma_layout, operand_a, operand_b = create_wmma_layouts(num_warps, f32_wmma)
         shared_a, shared_b = create_shared_layouts(
             BLOCK_M, BLOCK_N, BLOCK_K, layout, x.element_size() * 8
         )
@@ -482,6 +484,7 @@ def gemm_a16w16_(
             activation=_get_activation_from_str(activation) if activation else None,
             USE_ACTIVATION=activation is not None,
             ADD_BIAS=(bias is not None),
+            F32_WMMA=f32_wmma,
             num_warps=num_warps,
             waves_per_eu=waves_per_eu,
         )

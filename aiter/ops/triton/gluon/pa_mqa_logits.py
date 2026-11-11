@@ -9,6 +9,7 @@ from triton.experimental import gluon
 from triton.experimental.gluon import language as gl
 
 from aiter.ops.triton.gluon.pa_decode_gluon import get_cdna_version
+from aiter.ops.triton.utils._triton.arch_info import is_gfx1250_strict
 
 try:
     from triton.experimental.gluon.language.amd.cdna3 import (
@@ -54,6 +55,17 @@ except Exception:  # noqa: BLE001
 @triton.jit
 def _sum_combine(a, b):
     return a + b
+
+
+@gluon.jit
+def _gfx1250_fp8_wmma(a, b, acc):
+    # gfx1250-strict restricts plain fp8 WMMA; with HiddenDim > 64 (16x16x128
+    # layout) scaled WMMA with unit scales is equivalent.
+    if is_gfx1250_strict() and a.shape[1] > 64:
+        gl.static_assert(a.dtype == gl.float8e4nv)
+        gl.static_assert(b.dtype == gl.float8e4nv)
+        return gl.amd.gfx1250.wmma_scaled(a, None, "e4m3", b, None, "e4m3", acc)
+    return gl.amd.gfx1250.wmma(a, b, acc)
 
 
 @gluon.jit
@@ -487,7 +499,7 @@ def _gluon_deepgemm_fp8_paged_mqa_logits(
         mfma_k = gl.convert_layout(k.T, mfma_layout_b)
 
         if IS_GFX1250:
-            o = gl.amd.gfx1250.wmma(mfma_q, mfma_k, zero)
+            o = _gfx1250_fp8_wmma(mfma_q, mfma_k, zero)
         else:
             o = gl.amd.cdna3.mfma(mfma_q, mfma_k, zero)
         o = o * k_scale_f[None, :]
@@ -542,7 +554,7 @@ def _gluon_deepgemm_fp8_paged_mqa_logits(
 
     mfma_k = gl.convert_layout(k.T, mfma_layout_b)
     if IS_GFX1250:
-        o = gl.amd.gfx1250.wmma(mfma_q, mfma_k, zero)
+        o = _gfx1250_fp8_wmma(mfma_q, mfma_k, zero)
     else:
         o = gl.amd.cdna3.mfma(mfma_q, mfma_k, zero)
 
@@ -801,7 +813,7 @@ def _gluon_deepgemm_fp8_paged_mqa_logits_preshuffle(
                 .permute([1, 0])
                 .load(layout=mfma_layout_b)
             )
-            o = gl.amd.gfx1250.wmma(mfma_q, mfma_k, zero_acc)
+            o = _gfx1250_fp8_wmma(mfma_q, mfma_k, zero_acc)
 
             if j + 1 < n_blocks:
                 gl.amd.gfx1250.tdm.async_wait(2)

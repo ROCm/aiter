@@ -122,6 +122,9 @@ _CONFIG_NAME_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]*")
 _ARCH_OVERRIDE_RE = re.compile(r"[a-z][a-z0-9_]*")
 _ARCH_SAFE_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.+:-]*")
 
+# gfx1250-strict (MI450 A0) shares the gfx1250 tuned configs.
+_CONFIG_ARCH_ALIASES = {"gfx1250-strict": "gfx1250"}
+
 _CU_NUM = None  # the device's CU count, read once per process
 _CU_NUM_READ = False
 
@@ -244,6 +247,7 @@ def resolve_config_dir(
     assert isinstance(dev, str) and _ARCH_SAFE_RE.fullmatch(
         dev
     ), f"arch_info.get_arch() returned a path-unsafe architecture: {dev!r}"
+    dev = _CONFIG_ARCH_ALIASES.get(dev, dev)
     family = f"{backend}/{op}/{_dtype_dir(config_name)}"
     plain = f"{AITER_TRITON_CONFIGS_PATH}/{dev}/{family}"
     if cu_num is DEVICE_CU_NUM:

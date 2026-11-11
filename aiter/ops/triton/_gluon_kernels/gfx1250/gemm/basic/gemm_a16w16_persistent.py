@@ -9,6 +9,9 @@ Gluon persistent Triton GEMM.
 import triton.experimental.gluon.language as gl
 from triton.experimental import gluon
 
+from aiter.ops.triton._gluon_kernels.gfx1250.gemm.basic.gemm_a16w16 import (
+    wmma_16bit,
+)
 from aiter.ops.triton._triton_kernels.common.pid_preprocessing import remap_xcd
 from aiter.ops.triton.utils._triton.kernel_repr import make_kernel_repr
 
@@ -77,6 +80,7 @@ def gemm_a16w16_persistent_kernel_(
     num_warps: gl.constexpr,
     num_stages: gl.constexpr = 0,
     waves_per_eu: gl.constexpr = 0,
+    F32_WMMA: gl.constexpr = False,
 ):
 
     WRITES_FINAL: gl.constexpr = NUM_KSPLIT == 1
@@ -93,17 +97,24 @@ def gemm_a16w16_persistent_kernel_(
             [[BLOCK_K, 8]], [BLOCK_N, BLOCK_K], [1, 0]
         )
 
+    # F32_WMMA: gfx1250-strict restricts bf16/f16 WMMA; see wmma_16bit.
+    if F32_WMMA:
+        WMMA_K: gl.constexpr = 4
+        DOT_K_WIDTH: gl.constexpr = 2
+    else:
+        WMMA_K: gl.constexpr = 32
+        DOT_K_WIDTH: gl.constexpr = 8
     WMMA_LAYOUT: gl.constexpr = gl.amd.AMDWMMALayout(
         version=3,
         transposed=True,
         warp_bases=WARP_BASES,
-        instr_shape=[16, 16, 32],
+        instr_shape=[16, 16, WMMA_K],
     )
     OPERAND_LAYOUT_A: gl.constexpr = gl.DotOperandLayout(
-        operand_index=0, parent=WMMA_LAYOUT, k_width=8
+        operand_index=0, parent=WMMA_LAYOUT, k_width=DOT_K_WIDTH
     )
     OPERAND_LAYOUT_B: gl.constexpr = gl.DotOperandLayout(
-        operand_index=1, parent=WMMA_LAYOUT, k_width=8
+        operand_index=1, parent=WMMA_LAYOUT, k_width=DOT_K_WIDTH
     )
 
     start_pid = gl.program_id(axis=0)
@@ -247,7 +258,7 @@ def gemm_a16w16_persistent_kernel_(
             # main loop
             for _ in range(num_k_tiles - (NUM_BUFFERS - 1)):
                 # compute first then load next segment
-                accumulator = gl.amd.gfx1250.wmma(cur_a, cur_b, accumulator)
+                accumulator = wmma_16bit(cur_a, cur_b, accumulator, F32_WMMA)
 
                 gl.amd.gfx1250.tdm.async_load(
                     a_desc,
@@ -309,13 +320,13 @@ def gemm_a16w16_persistent_kernel_(
                         b_buffer.index((compute_idx + 1) % NUM_BUFFERS).permute([1, 0]),
                         OPERAND_LAYOUT_B,
                     )
-                accumulator = gl.amd.gfx1250.wmma(cur_a, cur_b, accumulator)
+                accumulator = wmma_16bit(cur_a, cur_b, accumulator, F32_WMMA)
 
                 cur_a = next_a
                 cur_b = next_b
                 compute_idx += 1
 
-            accumulator = gl.amd.gfx1250.wmma(cur_a, cur_b, accumulator)
+            accumulator = wmma_16bit(cur_a, cur_b, accumulator, F32_WMMA)
 
             if ADD_BIAS and pid_k == 0 and WRITES_FINAL:
                 offs_bias = n_off + gl.arange(
@@ -379,6 +390,7 @@ def gemm_a16w16_persistent_compute_bound_kernel_(
     num_warps: gl.constexpr,
     num_stages: gl.constexpr = 0,
     waves_per_eu: gl.constexpr = 0,
+    F32_WMMA: gl.constexpr = False,
 ):
 
     WRITES_FINAL: gl.constexpr = NUM_KSPLIT == 1
@@ -397,17 +409,24 @@ def gemm_a16w16_persistent_compute_bound_kernel_(
             [[BLOCK_K, 8]], [BLOCK_N, BLOCK_K], [1, 0]
         )
 
+    # F32_WMMA: gfx1250-strict restricts bf16/f16 WMMA; see wmma_16bit.
+    if F32_WMMA:
+        WMMA_K: gl.constexpr = 4
+        DOT_K_WIDTH: gl.constexpr = 2
+    else:
+        WMMA_K: gl.constexpr = 32
+        DOT_K_WIDTH: gl.constexpr = 8
     WMMA_LAYOUT: gl.constexpr = gl.amd.AMDWMMALayout(
         version=3,
         transposed=True,
         warp_bases=WARP_BASES,
-        instr_shape=[16, 16, 32],
+        instr_shape=[16, 16, WMMA_K],
     )
     OPERAND_LAYOUT_A: gl.constexpr = gl.DotOperandLayout(
-        operand_index=0, parent=WMMA_LAYOUT, k_width=8
+        operand_index=0, parent=WMMA_LAYOUT, k_width=DOT_K_WIDTH
     )
     OPERAND_LAYOUT_B: gl.constexpr = gl.DotOperandLayout(
-        operand_index=1, parent=WMMA_LAYOUT, k_width=8
+        operand_index=1, parent=WMMA_LAYOUT, k_width=DOT_K_WIDTH
     )
 
     start_pid = gl.program_id(axis=0)
@@ -541,7 +560,7 @@ def gemm_a16w16_persistent_compute_bound_kernel_(
 
             load_idx += 1
 
-            accumulator = gl.amd.gfx1250.wmma(cur_a, cur_b, accumulator)
+            accumulator = wmma_16bit(cur_a, cur_b, accumulator, F32_WMMA)
 
             next_a = gl.amd.cdna4.async_copy.load_shared_relaxed(
                 a_buffer.index((compute_idx + 1) % NUM_BUFFERS), OPERAND_LAYOUT_A
@@ -578,13 +597,13 @@ def gemm_a16w16_persistent_compute_bound_kernel_(
                     b_buffer.index((compute_idx + 1) % NUM_BUFFERS).permute([1, 0]),
                     OPERAND_LAYOUT_B,
                 )
-            accumulator = gl.amd.gfx1250.wmma(cur_a, cur_b, accumulator)
+            accumulator = wmma_16bit(cur_a, cur_b, accumulator, F32_WMMA)
 
             cur_a = next_a
             cur_b = next_b
             compute_idx += 1
 
-        accumulator = gl.amd.gfx1250.wmma(cur_a, cur_b, accumulator)
+        accumulator = wmma_16bit(cur_a, cur_b, accumulator, F32_WMMA)
 
         if ADD_BIAS and pid_k == 0 and WRITES_FINAL:
             offs_bias = n_off + gl.arange(
