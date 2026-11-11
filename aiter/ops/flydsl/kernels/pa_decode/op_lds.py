@@ -15,7 +15,13 @@ from ..kernels_common import create_llvm_ptr
 from ..mxfp4_gemm_common import _e8m0_byte_to_f32
 from ..tensor_shim import buf_base_i64, ptr_buf_tensor
 from ..utils import rcp_f32
-from .traits import MFMA_MNK, MXFP4_V_BF16_CHUNK_BYTES
+from .traits import (
+    FP8_KV_DTYPES,
+    KV_COMPUTE_BLOCK,
+    MFMA_MNK,
+    MXFP4_KV_DTYPE,
+    MXFP4_V_BF16_CHUNK_BYTES,
+)
 
 
 def _gptr(base, elem_ty, align):
@@ -102,10 +108,10 @@ class PaDecodeQueryLoader:
         self.gemm = gemm
 
     def init_loaders(self):
-        q_dtype = self.traits.Q_IN_DTYPE
+        q_dtype = self.traits.query_dtype
         _q_copy_op = (
             fx.rocdl.BufferCopy128b()
-            if self.traits.QLOAD_UNIT == 8 and q_dtype != self.traits.FP8
+            if self.traits.QLOAD_UNIT * dsl_size_of(q_dtype) == 16
             else fx.rocdl.BufferCopy64b()
         )
         self.q_buf = ptr_buf_tensor(self.ctx.query_ptr, q_dtype)
@@ -121,7 +127,7 @@ class PaDecodeQueryLoader:
 
     def load_row(self, qi, gs_head):
         qh0 = self.ctx.kv_h * self.traits.query_group_size + gs_head
-        qb = 1 if self.traits.Q_IN_DTYPE == self.traits.FP8 else 2
+        qb = dsl_size_of(self.traits.query_dtype)
         row_byte0 = (
             (self.ctx.seq * self.traits.query_length + self.ctx.query_begin + qi)
             * self.ctx.stride_q_row
@@ -139,7 +145,8 @@ class PaDecodeQueryLoader:
         # MXFP4: Q ahead of the K/V bursts, so its staging does not wait for them
         # (a padded row would read past the query).
         return self.traits.MTP4_FUSED or (
-            self.traits.MXFP4 and self.traits.CTA_ROWS % MFMA_MNK == 0
+            self.traits.kv_dtype == MXFP4_KV_DTYPE
+            and self.traits.CTA_ROWS % MFMA_MNK == 0
         )
 
     def prefetch(self):
@@ -173,7 +180,7 @@ class PaDecodeQueryLoader:
             absmax = fx.maxnumf(absmax, dpp_utils.dpp_xor_f32(absmax, sh))
 
         q_scale = absmax * fx.Float32(1.0 / self.traits.FP8_MAX)
-        if const_expr(self.traits.MXFP4):
+        if const_expr(self.traits.kv_dtype == MXFP4_KV_DTYPE):
             # Published scale is a normal f32: the QK MFMA takes its exponent as the
             # e8m0 byte of Q (see single_query_tile_mxfp4). The floor keeps 1/0 finite
             # and still leaves a bf16 subnormal row (>= 2**-133) inside e4m3.
@@ -202,7 +209,7 @@ class PaDecodeQueryLoader:
 
     @flyc.jit
     def stage_row(self, m, q_row_off, q_units):
-        if const_expr(self.traits.is_bf16_kv):
+        if const_expr(self.traits.kv_dtype == fx.BFloat16):
             for u in range_constexpr(self.traits.N_QLOADS):
                 elem_off = (
                     self.ctx.qh_local * self.traits.head_dim
@@ -210,7 +217,7 @@ class PaDecodeQueryLoader:
                     + u * self.traits.QLOAD_UNIT
                 )
                 self.lds.store(q_row_off + elem_off * 2, fx.BFloat16, q_units[u])
-        elif const_expr(self.traits.Q_IN_DTYPE == self.traits.FP8):
+        elif const_expr(self.traits.query_dtype == fx.Float8E4M3FN):
             self.lds.store_words(
                 q_row_off
                 + self.ctx.qh_local * self.traits.head_dim
@@ -244,7 +251,7 @@ class PaDecodeQueryLoader:
             elif flat_idx < self.traits.CTA_ROWS:
                 self.stage_row(m, q_row_off, self.load_row(qi, gs_head))
             else:
-                if const_expr(self.traits.is_bf16_kv):
+                if const_expr(self.traits.kv_dtype == fx.BFloat16):
                     for u in range_constexpr(self.traits.N_QLOADS):
                         elem_off = (
                             self.ctx.qh_local * self.traits.head_dim
@@ -271,7 +278,7 @@ class PaDecodeQueryLoader:
                         )
 
     def load_operands(self):
-        if const_expr(self.traits.MXFP4):
+        if const_expr(self.traits.kv_dtype == MXFP4_KV_DTYPE):
             return self._load_operands_mxfp4()
         # Match the head-dim permutation of PaDecodeKVLoader.load_k_chunk.
         q_ops_all = []
@@ -287,9 +294,11 @@ class PaDecodeQueryLoader:
                     )
                     * self.traits.QP_ELEM_BYTES,
                     fx.Int64,
-                    4 if self.traits.is_bf16_kv else 2,
+                    4 if self.traits.kv_dtype == fx.BFloat16 else 2,
                 )
-                for qkr in range_constexpr(4 if self.traits.is_bf16_kv else 2):
+                for qkr in range_constexpr(
+                    4 if self.traits.kv_dtype == fx.BFloat16 else 2
+                ):
                     q_ops_all.append(chunk[qkr])
         return q_ops_all
 
@@ -367,20 +376,20 @@ class PaDecodeKVLoader:
         return _load
 
     def init_loaders(self):
-        if const_expr(self.traits.MXFP4):
+        if const_expr(self.traits.kv_dtype == MXFP4_KV_DTYPE):
             return
         if const_expr(self.traits.D256_PIPE):
             self._k_load_vector = self._make_nt_k_loader(self.ctx.key_cache_ptr)
         else:
             self._k_load_vector = self._make_raw_flat_loader(
                 self.ctx.key_cache_ptr,
-                self.traits.KV_DTYPE,
+                self.traits.kv_dtype,
                 self.traits.KV_VECTOR_WIDTH,
                 self.traits.KV_EXTENT,
             )
         self._v_load_vector = self._make_raw_flat_loader(
             self.ctx.value_cache_ptr,
-            self.traits.KV_DTYPE,
+            self.traits.kv_dtype,
             self.traits.KV_VECTOR_WIDTH,
             self.traits.KV_EXTENT,
         )
@@ -422,7 +431,9 @@ class PaDecodeKVLoader:
                 num_records_bytes=bt_num_records_bytes,
             )
         )
-        if const_expr(not self.traits.per_token_kv and not self.traits.PV_BF16):
+        if const_expr(
+            self.traits.kv_dtype in FP8_KV_DTYPES and not self.traits.per_token_kv
+        ):
             key_scale_buf = ptr_buf_tensor(self.ctx.key_scale_ptr, fx.Float32)
             value_scale_buf = ptr_buf_tensor(self.ctx.value_scale_ptr, fx.Float32)
             self.key_scale = fx.Float32(key_scale_buf[0])
@@ -481,9 +492,7 @@ class PaDecodeKVLoader:
         table load stays in the other branch so an in-window page does not
         wait on it.
         """
-        rel = page - self.ctx.part_start * (
-            self.traits.TILE_TOK // self.traits.block_size
-        )
+        rel = page - self.ctx.part_start * (KV_COMPUTE_BLOCK // self.traits.block_size)
         page_id = fx.Int32(0)
         if (rel >= 0) & (rel < self.traits.stage_page_capacity):
             page_id = fx.Int32(
@@ -535,7 +544,7 @@ class PaDecodeKVLoader:
 
     def fetch_v_pages(self, tt_i32):
         base_page = (
-            tt_i32 * self.traits.TILE_TOK // self.traits.block_size
+            tt_i32 * KV_COMPUTE_BLOCK // self.traits.block_size
         )  # tile start is page-aligned
         fetched = self.load_pages(
             base_page
@@ -583,7 +592,7 @@ class PaDecodeKVLoader:
         )
 
     def stage_scales(self, phys_vec, buf_off, tt):
-        tile_valid = self.ctx.context_len - tt * self.traits.TILE_TOK
+        tile_valid = self.ctx.context_len - tt * KV_COMPUTE_BLOCK
         if const_expr(self.traits.block_size >= 64):
             phys = fx.Int32(phys_vec[0])
             chunk_tok = (
@@ -664,7 +673,7 @@ class PaDecodeKVLoader:
         ops = []
         for qkhe in range_constexpr(self.traits.QKHE_LOOP):
             he_idx = qkhe * self.traits.RGROUP_QUARTERS + self.ctx.rgroup
-            if const_expr(self.traits.is_bf16_kv):
+            if const_expr(self.traits.kv_dtype == fx.BFloat16):
                 for qkr in range_constexpr(2):
                     he8_idx = he_idx * 2 + qkr
                     base = self.kv_address(
@@ -731,10 +740,8 @@ class PaDecodeKVLoader:
         """The two page ids of tile ``tt`` (wave-uniform): the pair staged in LDS, or
         the block table past the staged window (``max_context_length`` below the
         context). ``tt`` is not before ``part_start``."""
-        first = tt * (self.traits.TILE_TOK // self.traits.block_size)
-        rel = first - self.ctx.part_start * (
-            self.traits.TILE_TOK // self.traits.block_size
-        )
+        first = tt * (KV_COMPUTE_BLOCK // self.traits.block_size)
+        rel = first - self.ctx.part_start * (KV_COMPUTE_BLOCK // self.traits.block_size)
         # The LDS read stays in bounds whatever rel is; past the window it is replaced.
         cap = self.traits.stage_page_capacity
         ids = self.lds.load(
@@ -854,7 +861,7 @@ class PaDecodeKVLoader:
 
     def load_k(self, tt_i32):
         base_page = (
-            tt_i32 * self.traits.TILE_TOK // self.traits.block_size
+            tt_i32 * KV_COMPUTE_BLOCK // self.traits.block_size
         )  # tile start is page-aligned
         fetched = self.load_pages(
             base_page
@@ -919,7 +926,9 @@ class PaDecodeKVLoader:
         """
         remaining = tile_valid - self.ctx.rgroup * self.traits.TOK_PER_WARP
         bits_per_tok = 8 * self.traits.QP_ELEM_BYTES
-        if const_expr(self.traits.is_bf16_kv and self.traits.block_size >= 64):
+        if const_expr(
+            self.traits.kv_dtype == fx.BFloat16 and self.traits.block_size >= 64
+        ):
             # The per-word form below is fewer VALU ops, but these kernels
             # already sit at the register limit and it spills inside the tile
             # loop there.
@@ -956,7 +965,7 @@ class PaDecodeKVLoader:
     def _tail_masks(self, tile_valid):
         # Only a sequence's last tile holds tokens at or past its context.
         masks = fx.full(self.traits.NVOPS, -1, fx.Int64)
-        if tile_valid < self.traits.TILE_TOK:
+        if tile_valid < KV_COMPUTE_BLOCK:
             masks = fx.Vector.from_elements(
                 self.v_tail_masks(tile_valid), dtype=fx.Int64
             )
@@ -964,7 +973,7 @@ class PaDecodeKVLoader:
 
     @flyc.jit
     def _mask_v_chunk(self, v, masks, tile_valid):
-        if tile_valid < self.traits.TILE_TOK:
+        if tile_valid < KV_COMPUTE_BLOCK:
             v = v & masks
         return v
 
@@ -991,7 +1000,7 @@ class PaDecodeKVLoader:
     def stage_page_ids(self):
         """Stage this task's page ids in LDS so the tile loop never reads the table."""
         traits = self.traits
-        ppt = traits.TILE_TOK // traits.block_size
+        ppt = KV_COMPUTE_BLOCK // traits.block_size
         first_page = self.ctx.part_start * ppt
         n_part_pages = (self.ctx.part_end - self.ctx.part_start) * ppt
         rounds = traits.stage_page_capacity // traits.BLOCK_THREADS
@@ -1012,7 +1021,7 @@ class PaDecodeKVLoader:
     @flyc.jit
     def prefetch_first(self):
         # Empty partitions must not read K/V or block_tables.
-        if const_expr(self.traits.MXFP4):
+        if const_expr(self.traits.kv_dtype == MXFP4_KV_DTYPE):
             self.mxfp4_init()
             return self.mxfp4_prefetch("k")
         k_pf0 = fx.full(self.traits.NCHUNK * self.traits.N_SUBCHUNKS, 0, fx.Int64)
