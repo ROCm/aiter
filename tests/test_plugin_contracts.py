@@ -179,6 +179,51 @@ def routed_contracts(root: Path) -> dict[str, dict[str, object]]:
     return found
 
 
+def test_two_ops_can_share_a_fingerprint_and_still_be_two_contracts():
+    """Identical signatures are not a sign that two ops should be one.
+
+    `batched_gemm_a8w8_mxscale` and `..._bpreshuffle` take the same five
+    arguments, and this gate gives them the same fingerprint -- correctly, since
+    it reads signatures. What separates them is the *content* of `wo_a`: one is
+    row-major, the other is baked into the (16, 16) MFMA-fragment layout, with
+    identical shape, dtype and strides.
+
+    So nothing here, and nothing in the candidate check, can tell a kernel bound
+    to the wrong one apart. `aiter/ops/batched_gemm_op_a8w8.py` says what that
+    costs: "a mismatched kernel reads the right bytes in the wrong order and
+    returns a plausible wrong answer instead of failing."
+
+    The test exists so that a later attempt to deduplicate these -- they look
+    like an obvious merge -- has to delete an explanation rather than just a
+    line.
+    """
+
+    contracts = routed_contracts(_REPO)
+    plain = contracts.get("batched_gemm_a8w8_mxscale")
+    shuffled = contracts.get("batched_gemm_a8w8_mxscale_bpreshuffle")
+
+    # Not a skip. Losing one of these is the exact mistake this test is for:
+    # they look like a duplicate pair, so the plausible way to break it is to
+    # route only one and call the other redundant.
+    assert plain is not None and shuffled is not None, (
+        "one of the batched mxscale GEMMs stopped being routed. They are two "
+        "contracts because the layout of `wo_a` is not visible in the "
+        "signature -- a kernel bound to the wrong one returns a plausible "
+        "wrong answer. If dropping one was deliberate, the reasoning in "
+        "aiter/ops/batched_gemm_op_a8w8.py has to be revised first."
+    )
+
+    assert plain["fingerprint"] == shuffled["fingerprint"], (
+        "these signatures diverged; if that was deliberate the comment above "
+        "needs updating, and if it was not, one of them moved by accident"
+    )
+    assert plain["signature"] == shuffled["signature"]
+    assert set(contracts) >= {
+        "batched_gemm_a8w8_mxscale",
+        "batched_gemm_a8w8_mxscale_bpreshuffle",
+    }, "they must stay two contracts; the layout is not expressible as a flag"
+
+
 def test_routed_contracts_match_the_committed_baseline():
     current = routed_contracts(_REPO)
     baseline = json.loads(_BASELINE.read_text()) if _BASELINE.exists() else {}
