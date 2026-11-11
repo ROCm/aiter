@@ -99,15 +99,15 @@
         "waves_per_eu": 1
     },
     "M_LEQ_4096": {
-        "BLOCK_M": 256,
-        "BLOCK_N": 256,
+        "BLOCK_M": 512,
+        "BLOCK_N": 1024,
         "BLOCK_K": 128,
         "NUM_BUFFERS": 2,
         "num_warps": 4,
         "kernel_type": "bandwidth_bound",
-        "waves_per_eu": 1,
-        "num_ctas": 1,
-        "GROUP_SIZE_M": 0,
+        "waves_per_eu": 0,
+        "num_ctas": 8,
+        "GROUP_SIZE_M": 8,
         "B2B_WMMA": 1,
         "TDM_STORE": 1
     },
