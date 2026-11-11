@@ -44,6 +44,31 @@ read the byte the same way: the bf16-Q path builds an f32 whose exponent field i
 the byte, so 0 is 0.0 and 255 is +inf; the e4m3-Q MFMA takes the raw e8m0 byte, so
 0 is 2^-127 and 255 is NaN. Measured on gfx950, a 255 scale makes the score NaN on
 both paths; do not rely on any other behaviour for these two bytes.
+
+`score_flydsl_nvfp4` scores an NVFP4 index cache: the same e2m1 data view, but one
+e4m3 scale per 16 elements (`k_scale uint8 [pages, 128, 8]`) and no per-tensor
+scale. gfx950's block-scaled MFMA and `v_cvt_scalef32_*_fp4` only apply a power of
+two (measured: the mantissa of the scale is ignored), so K is widened by
+`cvt(scale=1.0)` then an f32 multiply, and fed to the bf16 MFMA; Q (bf16 or e4m3)
+is widened to bf16. `k_round` picks what K is: "e4m3" (default) rounds the product
+`e2m1 * scale` to e4m3 (RNE, saturating at 448) like the vLLM nvfp4 indexer, so the
+scores are bit-identical to vLLM's; "exact" keeps the product unrounded, which bf16
+holds exactly. e4m3 scale bytes must be positive (the sign bit is not read) and not
+0x7F (NaN).
+
+With an e4m3 Q and `k_round="e4m3"` (the default, and the served combination) K never goes through
+f32 per element: each CTA builds, in LDS, the 8 e4m3 bytes `e4m3_rn_satfinite(mag *
+scale)` of every scale byte, and a K dword is looked up from it with `v_perm_b32`
+(selector = e2m1 magnitudes, sign OR-ed in), giving K as e4m3 for ONE fp8 MFMA per
+tile: the same K values as the bf16 arm's, at a quarter of its ALU, which is what
+keeps this kernel at the HBM rate. Scores of the two arms agree to the bit when the
+sums are exact (the op test's `bit_exact` cases); on general data they differ in
+the last digits (measured up to ~5e-5 relative) because the fp8 MFMA accumulates
+differently from the bf16 one.
+
+With an e4m3 Q and `k_round="exact"` the bf16 lift is skipped: e2m1 * scale and an e4m3
+Q are both exact in f16, so K dwords are converted straight to f16 pairs and scored on
+the f16 MFMA; a bf16 Q keeps the bf16 MFMA above.
 """
 
 import math
@@ -102,6 +127,17 @@ SCALE_BYTES = HEAD_DIM // GROUP
 DATA_UNITS = DATA_BYTES // ACCESS_BYTES  # 16 B accesses per token row
 assert KSTEPS * LANE_K == GROUP
 UNIT_SCALE = 0x7F7F7F7F  # e8m0 0x7F = 2^0, in all four scale bytes
+# NVFP4 index cache: same data view, one e4m3 scale per 16 elements. A lane's 16 B
+# (32 elements) spans two groups: dwords 0,1 use scale 2g, dwords 2,3 scale 2g+1.
+NVFP4_GROUP = 16
+NVFP4_SCALE_BYTES = HEAD_DIM // NVFP4_GROUP
+NVFP4_ROUNDINGS = ("e4m3", "exact")
+E4M3_MAX = 448.0
+SIGN8 = 0x80808080  # sign bit of each fp8 byte of a dword
+MAG8 = 0x07070707  # e2m1 magnitude bits of each nibble, spread one per byte
+# e2m1 magnitudes in code order; the e4m3 table of a scale holds mag * scale at [code & 7]
+E2M1_MAGS = (0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0)
+LUT_ENTRIES = 128  # positive e4m3 scale bytes; 2 dwords (8 e4m3 bytes) each
 # K tiles kept in flight per wave (the fp8 scorer uses 3 at 2 KiB a tile; an
 # MXFP4 tile is half the bytes). Swept 2/3/4/6/8: 6 is 15-35% faster than 3 where
 # batch*context is small and within 2% of the best once it is not.
@@ -110,6 +146,10 @@ MXFP4_TILE_DEPTH = 6
 # once, so the L1 has nothing to keep. Not `geom["nt_k"]`, which is tuned for the
 # fp8 layout.
 MXFP4_K_CACHE = 2
+# K tiles in flight per wave on the NVFP4 fp8 arm. Its tiles take ~2x the ALU of an
+# MXFP4 tile and fewer registers, and swept 2/3/4/5/6/8 (32 shapes, in-process A/B
+# against MXFP4): 4 and 5 tie and beat 6 by 0.16 us mean; 8 loses.
+NVFP4_FP8_TILE_DEPTH = 4
 
 
 def fp8_dwords_to_bf16(raw, lo, dwords):
@@ -130,6 +170,20 @@ def fp8_dwords_to_bf16(raw, lo, dwords):
                 )
             )
             elems += [fx.BFloat16(pair[0]), fx.BFloat16(pair[1])]
+    return elems
+
+
+def fp8_dwords_to_f16(raw, lo, dwords):
+    """`fp8_dwords_to_bf16` into f16: 4*dwords f16, exact (e4m3 is a subset of f16)."""
+    one = _to_raw(fx.Float32(1.0))
+    elems = []
+    for d in range_constexpr(dwords):
+        word = _to_raw(fx.Int32(raw[lo + d]))
+        for half in range_constexpr(2):
+            pair = fx.Vector(
+                fx.rocdl.cvt_scalef32_pk_f16_fp8(T.vec(2, T.f16), word, one, bool(half))
+            )
+            elems += [fx.Float16(pair[0]), fx.Float16(pair[1])]
     return elems
 
 
@@ -241,6 +295,140 @@ def fp4_dword_to_bf16(word, scale_f32):
     return elems
 
 
+def e4m3_to_f32(byte):
+    """The e4m3 (fn) byte `byte` (an Int32 in 0..255) as f32, in integer ops.
+
+    Not `v_cvt_pk_f32_fp8`: with that convert feeding the scale multiply, a
+    multi-feature-tile launch returned different scores run to run (cause not
+    pinned down); this is deterministic. The sign bit is not read -- scales are
+    positive -- and 0x7F (NaN) decodes as 480, which is out of contract."""
+    e = (byte >> fx.Int32(3)) & fx.Int32(15)
+    m = byte & fx.Int32(7)
+    normal = (((e + fx.Int32(120)) << fx.Int32(23)) | (m << fx.Int32(20))).bitcast(
+        fx.Float32
+    )
+    sub = fx.Float32(m) * fx.Float32(2.0**-9)  # e == 0: m * 2^-9, sign excluded
+    return (e == fx.Int32(0)).select(sub, normal)
+
+
+def e4m3_table_words(scale_f32):
+    """The 8 e4m3 bytes `e4m3_rn_satfinite(mag * scale)` for mag in E2M1_MAGS, as two
+    dwords (entries 0..3, 4..7). Same clamp-then-convert as `nvfp4_dword_to_bf16`,
+    which the P0 microtest pinned to bit equality with the torch reference."""
+    hi = fx.Float32(E4M3_MAX)
+    v = [(fx.Float32(m) * scale_f32).minimumf(hi) for m in E2M1_MAGS]
+    words = []
+    for d in range_constexpr(2):
+        w = _to_raw(fx.Int32(0))
+        for h in range_constexpr(2):
+            w = fx.rocdl.cvt_pk_fp8_f32(
+                T.i32,
+                _to_raw(v[4 * d + 2 * h]),
+                _to_raw(v[4 * d + 2 * h + 1]),
+                w,
+                bool(h),
+            )
+        words.append(fx.Int32(w))
+    return words
+
+
+def fp4_dword_to_e4m3(w, t_lo, t_hi):
+    """One dword of 8 packed e2m1 -> 8 e4m3 bytes in two dwords, by table lookup.
+
+    `t_lo`/`t_hi` are a scale's `e4m3_table_words`. v_perm_b32 is the lookup: its
+    selector bytes 0..3 pick bytes of `t_lo`, 4..7 of `t_hi`, so a magnitude 0..7 in
+    a selector byte fetches that entry, four at a time. The first result holds the
+    EVEN elements (low nibbles: 0, 2, 4, 6), the second the odd ones (1, 3, 5, 7);
+    the sign bit of each nibble is OR-ed in afterwards. The even/odd order is
+    undone on the Q side (`load_q8_even_odd`), which costs nothing per K tile."""
+    w = fx.Int32(w)
+    ev = fx.rocdl.perm_b32(t_hi, t_lo, w & fx.Int32(MAG8))
+    od = fx.rocdl.perm_b32(t_hi, t_lo, w.shrui(fx.Int32(4)) & fx.Int32(MAG8))
+    return (
+        fx.Int32(ev) | ((w << fx.Int32(4)) & fx.Int32(SIGN8)),
+        fx.Int32(od) | (w & fx.Int32(SIGN8)),
+    )
+
+
+def e4m3_scale_raw_f16x2(byte):
+    """The e4m3 scale byte `byte` (sign ignored) as an f16 pair [s, s], each the f16 whose
+    bit pattern is `(byte & 0x7F) << 7` -- the scale / 2^8 (f16 denormals for the
+    subnormal scales, as `e4m3_scale_raw` does in f32) -- so `UNDO_SCALE_RAW_F16` times
+    it is the scale. Every e4m3 scale is a normal f16, and so is every e2m1 * scale
+    (2^-10 .. 2688, five significant bits), which is why K can be held in f16 exactly.
+    """
+    # One u24 multiply puts `u << 7` in both halves (the two products are 16 bits apart
+    # and 7 bits wide, so they cannot overlap).
+    pair = (byte & fx.Int32(0x7F)) * fx.Int32(0x800080)
+    return fx.Vector.from_elements([pair], fx.Int32).bitcast(fx.Float16)
+
+
+UNDO_SCALE_RAW_F16 = 2.0**8
+
+
+def nvfp4_dword_to_f16(word, scale_raw_f16x2):
+    """`nvfp4_dword_to_bf16` for the exact arm with an e4m3 Q, into f16: one convert and
+    one packed multiply per pair of elements, no f32 and no repack. The convert's scale
+    operand is the exact power of two that undoes the 2^-8 in `e4m3_scale_raw_f16x2`;
+    the product e2m1 * scale is exact in f16. Returns 8 f16 in element order."""
+    w = _to_raw(fx.Int32(word))
+    undo = _to_raw(fx.Float32(UNDO_SCALE_RAW_F16))
+    elems = []
+    for sel in range_constexpr(4):
+        pair = fx.Vector(
+            fx.rocdl.cvt_scalef32_pk_f16_fp4(T.vec(2, T.f16), w, undo, sel)
+        )
+        pair = pair * scale_raw_f16x2
+        elems += [fx.Float16(pair[0]), fx.Float16(pair[1])]
+    return elems
+
+
+def e4m3_scale_raw(byte):
+    """The e4m3 scale byte `byte` (sign bit ignored) as the f32 whose bit pattern is
+    `(byte & 0x7F) << 20`, i.e. the scale divided by 2^120 -- two ops where
+    `e4m3_to_f32` needs a dozen. Normal scales land in f32's normal range; the
+    subnormal ones (e == 0, value m * 2^-9) land in f32's denormals, where the same
+    pattern is m * 2^-129, again the scale / 2^120. Exact only while the multiplier
+    sees denormal inputs unflushed; the op test's scale-range checks pin that."""
+    return ((byte & fx.Int32(0x7F)) << fx.Int32(20)).bitcast(fx.Float32)
+
+
+UNDO_SCALE_RAW = 2.0**120  # `e4m3_scale_raw` times this is the scale
+
+
+def nvfp4_dword_to_bf16(word, scale_raw, k_e4m3):
+    """One dword of 8 packed e2m1, times the e4m3 scale (given as `e4m3_scale_raw`), as
+    8 bf16.
+
+    `v_cvt_scalef32_*_fp4` takes only the exponent of its scale (measured), so the
+    elements are widened at scale 2^120 (an exact power of two, which undoes the
+    2^-120 in `e4m3_scale_raw`) and multiplied by the raw scale in f32 -- exact.
+    `k_e4m3` then rounds each product to e4m3 (RNE, clamped to +-448 first because the
+    convert itself does not saturate) and widens that back; otherwise the product
+    goes straight to bf16, which holds e2m1 * e4m3 exactly.
+    """
+    w = _to_raw(fx.Int32(word))
+    one = _to_raw(fx.Float32(UNDO_SCALE_RAW))
+    s = fx.Float32(scale_raw)
+    prod = []
+    for sel in range_constexpr(4):
+        pair = fx.Vector(fx.rocdl.cvt_scalef32_pk_f32_fp4(T.vec(2, T.f32), w, one, sel))
+        prod += [fx.Float32(pair[0]) * s, fx.Float32(pair[1]) * s]
+    if const_expr(not k_e4m3):
+        return fx.Vector.from_elements(prod, fx.Float32).to(fx.BFloat16)
+    hi, lo = fx.Float32(E4M3_MAX), fx.Float32(-E4M3_MAX)
+    words = []
+    for d in range_constexpr(2):
+        packed = _to_raw(fx.Int32(0))
+        for h in range_constexpr(2):
+            a, b = (prod[4 * d + 2 * h + i].minimumf(hi).maximumf(lo) for i in (0, 1))
+            packed = fx.rocdl.cvt_pk_fp8_f32(
+                T.i32, _to_raw(a), _to_raw(b), packed, bool(h)
+            )
+        words.append(fx.Int32(packed))
+    return fx.Vector.from_elements(fp8_dwords_to_bf16(words, 0, 2), fx.BFloat16)
+
+
 # rocdl.sched_group_barrier instruction-class masks (rocdl._SCHED_MASK_INT_TO_KW).
 _SCHED_MFMA = 8
 _SCHED_VMEM_RD = 32
@@ -257,7 +445,19 @@ _SERVED_DECODE_DEPTH = {
 _ONE_TILE_DECODE_DEPTH = _SERVED_DECODE_DEPTH[(4, 1)]
 
 
-def _decode_depth_table(S: int, H: int):
+# NVFP4 only (opt-in, `geometry(..., nvfp4=True)`): at Q8 / four index heads the shared
+# table's depth 3 for batches 3..16 lands the grid at 1.33-2.67 CTAs per CU slot, so
+# some CUs run two rounds while others idle; depth 2 gives 1024 / 512 CTAs at batch 8
+# (ctx 128K / 64K), whole rounds on 256 CUs. Measured on both arms, S8H4, batch 8..16,
+# ctx 32K..128K: depth 2 is 2..21% faster than 3 on the e4m3 arm (batch 8: -5% / -17% at
+# 128K / 64K; batch 16: -21% at 32K) and 2..21% on the exact arm; batch 2..4 does not move.
+# MXFP4 keeps the shared table, so its work map and outputs do not move.
+_NVFP4_DECODE_DEPTH = {(8, 4): ((2, 1), (16, 2))}
+
+
+def _decode_depth_table(S: int, H: int, nvfp4: bool = False):
+    if nvfp4 and (S, H) in _NVFP4_DECODE_DEPTH:
+        return _NVFP4_DECODE_DEPTH[(S, H)]
     if (S, H) in _SERVED_DECODE_DEPTH:
         return _SERVED_DECODE_DEPTH[(S, H)]
     if S and H and feature_tiles(S, H) == 1:
@@ -356,7 +556,7 @@ def _cu_count(device=None) -> int:
     return torch.cuda.get_device_properties(device).multi_processor_count
 
 
-def geometry(batch, max_block, S, H, cp_world=1, cp_rank=0, device=None):
+def geometry(batch, max_block, S, H, cp_world=1, cp_rank=0, device=None, nvfp4=False):
     """Pick the launch geometry from the BOUNDS -- never seq_lens contents, so
     the grid stays valid across a cudagraph replay. Returns a plain dict.
 
@@ -376,6 +576,9 @@ def geometry(batch, max_block, S, H, cp_world=1, cp_rank=0, device=None):
     spread          what costs is pages piling onto one CU, not the CTA count:
                     an extra CTA holding one page is nearly free, holding four
                     is not.
+    nvfp4           the depth table tuned for the NVFP4 decode scorer (default False: the
+                    table MXFP4 and every existing work map use). A map built with
+                    `nvfp4=True` is only valid for `score_flydsl_nvfp4`; see `_validate_metadata`.
     """
     if not isinstance(batch, int) or not 0 <= batch <= 0xFFFF:
         raise ValueError("batch must be in [0, 65535] for packed request IDs")
@@ -386,9 +589,8 @@ def geometry(batch, max_block, S, H, cp_world=1, cp_rank=0, device=None):
     # A decode launch with a measured depth table and no CP. Past 0xFFFF blocks
     # those shallow depths would not pack, so those capacities fall through to
     # the estimate.
-    served = (
-        _decode_depth_table(S, H) is not None and cp_world == 1 and max_block <= 0xFFFF
-    )
+    table = _decode_depth_table(S, H, nvfp4)
+    served = table is not None and cp_world == 1 and max_block <= 0xFFFF
     if served and S == 1 and batch * ((max_block + 1) // 2) <= _cu_count(device):
         # Q1 launches small enough for the token split below keep it: that
         # regime was measured separately and the depth tables were not.
@@ -406,7 +608,7 @@ def geometry(batch, max_block, S, H, cp_world=1, cp_rank=0, device=None):
         # shape to win. 4 is kept there because it is what shipped; 2 would do
         # as well.
         depth = 2 if max_block <= 256 else 4
-        for limit, tabled in _decode_depth_table(S, H):
+        for limit, tabled in table:
             if batch <= limit:
                 depth = tabled
                 break
@@ -448,10 +650,17 @@ def geometry(batch, max_block, S, H, cp_world=1, cp_rank=0, device=None):
     }
 
 
-def kernel_name(S: int, H: int, geom, mxfp4: bool = False, q_fp8: bool = False) -> str:
+def kernel_name(
+    S: int, H: int, geom, mxfp4: bool = False, q_fp8: bool = False, nvfp4=None
+) -> str:
     """Geometry -> kernel name. The default launch keeps the name it had before
-    any of these knobs existed, so its JIT cache entries are not orphaned."""
-    if mxfp4:
+    any of these knobs existed, so its JIT cache entries are not orphaned.
+    `nvfp4` is None or the K rounding ("e4m3" / "exact") of an NVFP4 cache."""
+    if nvfp4:
+        name = f"m3_index_score_S{S}_H{H}_nvfp4{nvfp4}{'_qf8' if q_fp8 else ''}{'_f16' if q_fp8 and nvfp4 == 'exact' else ''}"
+        depth = NVFP4_FP8_TILE_DEPTH if q_fp8 and nvfp4 == "e4m3" else MXFP4_TILE_DEPTH
+        name += f"_L{geom['pages_per_wave']}_d{depth}"
+    elif mxfp4:
         name = f"m3_index_score_S{S}_H{H}_fp4{'_qf8' if q_fp8 else ''}"
         name += f"_L{geom['pages_per_wave']}_d{MXFP4_TILE_DEPTH}"
     else:
@@ -470,14 +679,36 @@ def kernel_name(S: int, H: int, geom, mxfp4: bool = False, q_fp8: bool = False) 
     return name
 
 
-def build_index_score(S: int, H: int, geom, mxfp4: bool = False, q_fp8: bool = False):
+def build_index_score(
+    S: int, H: int, geom, mxfp4: bool = False, q_fp8: bool = False, nvfp4=None
+):
     """Compile a score kernel specialised on (S, H, geometry, cache format, Q dtype).
 
     S = max query tokens per request (num_spec + 1), H = index heads, and
     F = S*H is the feature count, laid out as column n = tok*H + head.
     `mxfp4` reads the two-view MXFP4 cache instead of the fp8 one; `q_fp8`
-    (MXFP4 only) takes an e4m3 Q and one scaled MFMA per tile.
+    (MXFP4 only) takes an e4m3 Q and one scaled MFMA per tile. `nvfp4` (with
+    `mxfp4` set: same two-view plumbing) reads the NVFP4 cache -- e4m3 scale per 16
+    -- on the bf16 MFMA, `nvfp4` being the K rounding ("e4m3" / "exact"); an e4m3 Q
+    is widened to bf16 there, not fed to the scaled MFMA.
     """
+    assert nvfp4 is None or (mxfp4 and nvfp4 in NVFP4_ROUNDINGS)
+    q8_scaled = q_fp8 and nvfp4 is None  # e4m3 Q on the scaled MFMA (MXFP4 only)
+    # NVFP4 e4m3 K with an e4m3 Q: K comes out of a table as e4m3 bytes, so the dot is
+    # one fp8 MFMA a tile instead of four bf16 ones (and a fraction of the ALU).
+    fp8_arm = q_fp8 and nvfp4 == "e4m3"
+    # NVFP4 exact K with an e4m3 Q: K = e2m1 * scale is exact in f16 and so is Q, so the
+    # dot runs on the f16 MFMA with K converted straight to f16 pairs -- no f32 round trip
+    # and no repack to bf16. A bf16 Q (any exponent) keeps the bf16 route.
+    f16_arm = q_fp8 and nvfp4 == "exact"
+    mfma8 = q8_scaled or fp8_arm
+    # The fences below keep one tile's K loads in flight past the previous tile's
+    # math. The fp8 arm's dequant is long enough that, with a single page per wave
+    # (every spread launch, S4H1 and S8H4 alike), the scheduler does better
+    # overlapping a tile's epilogue with the next tile's dequant; with more pages
+    # the fences win (measured).
+    sched_fence = not (fp8_arm and geom["pages_per_wave"] == 1)
+    scale_bytes = NVFP4_SCALE_BYTES if nvfp4 else SCALE_BYTES
     pages_per_wave = geom["pages_per_wave"]
     nt_k = geom["nt_k"]
     # Context-parallel block remap. At 1/0 every use below is the identity and
@@ -494,22 +725,22 @@ def build_index_score(S: int, H: int, geom, mxfp4: bool = False, q_fp8: bool = F
     PAGE_SLOTS = WAVES // WAVES_PER_TOK
     TOK_TILES_PER_WAVE = TOK_TILES // WAVES_PER_TOK  # token tiles one wave walks
     CHUNK = PAGE_SLOTS * pages_per_wave
-    tile_depth = MXFP4_TILE_DEPTH if mxfp4 else 3
+    tile_depth = (NVFP4_FP8_TILE_DEPTH if fp8_arm else MXFP4_TILE_DEPTH) if mxfp4 else 3
     k_loads = 1 if mxfp4 else K_LOADS
-    # The kernel's only LDS: the cross-wave partial-max exchange, one fp32 per
-    # (wave, tile, lane). Zero unless the token axis is split.
+    # The cross-wave partial-max exchange, one fp32 per (wave, tile, lane), zero
+    # unless the token axis is split; plus, on the fp8 NVFP4 arm only, the e4m3
+    # table of every scale byte.
     RED_SLOTS = WAVES * FEAT_TILES_PER_WAVE * WAVE if WAVES_PER_TOK > 1 else 0
     # Built from only the arrays this config uses, so the default config still
     # reports group_segment_fixed_size = 0 -- no LDS and no barrier at all.
+    shared = {}
+    if RED_SLOTS:
+        shared["red"] = fx.Array[fx.Float32, RED_SLOTS, 16]
+    if fp8_arm:
+        shared["lut"] = fx.Array[fx.Int32, 2 * LUT_ENTRIES, 16]
     SharedStorage = (
-        fx.struct(
-            type(
-                "SharedStorage",
-                (),
-                {"__annotations__": {"red": fx.Array[fx.Float32, RED_SLOTS, 16]}},
-            )
-        )
-        if RED_SLOTS
+        fx.struct(type("SharedStorage", (), {"__annotations__": shared}))
+        if shared
         else None
     )
 
@@ -664,6 +895,54 @@ def build_index_score(S: int, H: int, geom, mxfp4: bool = False, q_fp8: bool = F
                 dtype=fx.Int32,
             )
 
+        def load_q8_even_odd(i):
+            """The fp8 arm's B operand for feature tile i: Q[32g .. 32g+31] with each
+            8 bytes (elements 8d..8d+7) reordered even-then-odd, to match the order
+            `fp4_dword_to_e4m3` emits K in. Per lane, per CTA -- not per K tile."""
+            row, head = q_row_head(i)
+            base = row * i32_stride_q_n + head * i32_stride_q_h + g * fx.Int32(GROUP)
+            q = []
+            for j in range_constexpr(2):
+                raw = fx.add_offset(
+                    fx.get_iter(q_buf), (base + fx.Int32(16 * j)) >> fx.Int32(2)
+                ).load(T.vec(4, T.i32))
+                q += [fx.Int32(raw[k]) for k in range_constexpr(4)]
+            words = []
+            for d in range_constexpr(4):
+                a, b = q[2 * d], q[2 * d + 1]
+                words.append(fx.Int32(fx.rocdl.perm_b32(b, a, fx.Int32(0x06040200))))
+                words.append(fx.Int32(fx.rocdl.perm_b32(b, a, fx.Int32(0x07050301))))
+            return fx.Vector.from_elements(words, dtype=fx.Int32)
+
+        def load_q8_lifted(i):
+            """NVFP4 with an e4m3 Q: the four bf16 B-fragments of feature tile i.
+            K's lane group g holds elements 32g.., so two 16 B e4m3 accesses at
+            32g and 32g+16 cover its four k-steps; each widens exactly."""
+            row, head = q_row_head(i)
+            base = row * i32_stride_q_n + head * i32_stride_q_h + g * fx.Int32(GROUP)
+            frags = []
+            for j in range_constexpr(2):
+                raw = fx.add_offset(
+                    fx.get_iter(q_buf), (base + fx.Int32(16 * j)) >> fx.Int32(2)
+                ).load(T.vec(4, T.i32))
+                for half in range_constexpr(2):
+                    if const_expr(f16_arm):
+                        t = fx.make_rmem_tensor(fx.make_layout(LANE_K, 1), fx.Float16)
+                        t.store(
+                            fx.Vector.from_elements(
+                                fp8_dwords_to_f16(raw, 2 * half, 2), fx.Float16
+                            )
+                        )
+                    else:
+                        t = fx.make_rmem_tensor(fx.make_layout(LANE_K, 1), fx.BFloat16)
+                        t.store(
+                            fx.Vector.from_elements(
+                                fp8_dwords_to_bf16(raw, 2 * half, 2), fx.BFloat16
+                            )
+                        )
+                    frags.append(t)
+            return frags
+
         # Only the token-wave partial-max exchange needs LDS; otherwise the
         # kernel has none and reports group_segment_fixed_size = 0.
         lds = (
@@ -674,8 +953,17 @@ def build_index_score(S: int, H: int, geom, mxfp4: bool = False, q_fp8: bool = F
         # -- stage Q in registers, held for the whole page loop ---------------
         # One 16 B gmem access per (tile, Q access), hoisted so the extra
         # k-steps gfx942 needs cost register slicing, not loads.
-        if const_expr(q_fp8):
+        if const_expr(fp8_arm):
+            q_b = [load_q8_even_odd(i) for i in range_constexpr(FEAT_TILES_PER_WAVE)]
+        elif const_expr(q8_scaled):
             q_b = [load_q8(i) for i in range_constexpr(FEAT_TILES_PER_WAVE)]
+        elif const_expr(nvfp4 and q_fp8):
+            q_frag = [load_q8_lifted(i) for i in range_constexpr(FEAT_TILES_PER_WAVE)]
+            mma_atom = fx.make_mma_atom(
+                fx.rocdl.MFMA(
+                    MFMA_M, MFMA_N, MFMA_K, fx.Float16 if f16_arm else fx.BFloat16
+                )
+            )
         else:
             q_raw = [
                 [load_q_frag(i, j) for j in range_constexpr(Q_LOADS)]
@@ -734,6 +1022,11 @@ def build_index_score(S: int, H: int, geom, mxfp4: bool = False, q_fp8: bool = F
             page = fx.add_offset(
                 fx.get_iter(bt_buf), b * i32_stride_bt_b + column
             ).load(T.i32)
+            if const_expr(nvfp4):
+                # The page id is wave-uniform. Left in a VGPR, the buffer descriptors built
+                # from it are VGPRs too, and every K load becomes a waterfall loop
+                # (readfirstlane + compare + exec-mask dance) inside the tile loop.
+                page = fx.Int32(fx.rocdl.readfirstlane(T.i32, _to_raw(fx.Int32(page))))
             address = k_base + fx.Int64(page) * page_bytes
             if const_expr(mxfp4):
                 # Each descriptor spans exactly the bytes its view owns in a
@@ -748,8 +1041,8 @@ def build_index_score(S: int, H: int, geom, mxfp4: bool = False, q_fp8: bool = F
                 )
                 page_scale = ptr_buf_tensor(
                     fx.inttoptr(arg_ks.type, ks_base + fx.Int64(page) * ks_page_bytes),
-                    fx.Int32,
-                    num_records_bytes=fx.Int32(PAGE * SCALE_BYTES),
+                    fx.Int16 if nvfp4 else fx.Int32,
+                    num_records_bytes=fx.Int32(PAGE * scale_bytes),
                 )
                 page_buffers.append((page_data, page_scale))
             else:
@@ -790,7 +1083,16 @@ def build_index_score(S: int, H: int, geom, mxfp4: bool = False, q_fp8: bool = F
                 # dword, shared by the four lane groups of the token).
                 page_data, page_scale = page
                 data = load_k16(page_data, tok_row * fx.Int32(DATA_UNITS) + g)
-                scale = fx.add_offset(fx.get_iter(page_scale), tok_row).load(T.i32)
+                if const_expr(nvfp4):
+                    # 8 scale bytes a token; the lane group's two (2g, 2g+1) are
+                    # halfword g, loaded alone so no shift is needed to find them.
+                    scale = fx.Int32(
+                        fx.add_offset(
+                            fx.get_iter(page_scale), tok_row * fx.Int32(4) + g
+                        ).load(T.i16)
+                    )
+                else:
+                    scale = fx.add_offset(fx.get_iter(page_scale), tok_row).load(T.i32)
                 return data, scale
             base = (
                 tok_row * i32_stride_k_aux
@@ -807,7 +1109,41 @@ def build_index_score(S: int, H: int, geom, mxfp4: bool = False, q_fp8: bool = F
             the per-feature running max. `p` is the logical block index and
             `tok_tile` the wave's local index within that page. The whole
             arithmetic body of the kernel; the rest is addressing."""
-            if const_expr(q_fp8):
+            if const_expr(fp8_arm):
+                data, scale_word = raws[0]
+                # The lane's two scale bytes (2g, 2g+1 of the token) index the table; the
+                # sign bit is not read.
+                tables = []
+                for sb in (scale_word, fx.Int32(scale_word).shrui(fx.Int32(8))):
+                    idx = (sb & fx.Int32(0x7F)) * fx.Int32(2)
+                    tables.append(
+                        [fx.Int32(fx.ptr_load(lut + idx + fx.Int32(k))) for k in (0, 1)]
+                    )
+                words = []
+                for d in range_constexpr(4):
+                    t_lo, t_hi = tables[d // 2]
+                    words += fp4_dword_to_e4m3(data[d], t_lo, t_hi)
+                a_k = fx.Vector.from_elements(words, dtype=fx.Int32)
+                accs = [
+                    fx.Vector(
+                        fx.rocdl.mfma_scale_f32_16x16x128_f8f6f4(
+                            T.f32x4,
+                            [
+                                a_k,
+                                q_b[i],
+                                zero4,
+                                0,
+                                0,
+                                0,
+                                fx.Int32(UNIT_SCALE),
+                                0,
+                                fx.Int32(UNIT_SCALE),
+                            ],
+                        )
+                    )
+                    for i in range_constexpr(FEAT_TILES_PER_WAVE)
+                ]
+            elif const_expr(q8_scaled):
                 data, scale_word = raws[0]
                 # A = K as fp4 (4 dwords; the other 4 are unused by cbsz=4), scaled
                 # by this lane group's e8m0 byte (scaleA, byte 0 of the shifted
@@ -839,7 +1175,22 @@ def build_index_score(S: int, H: int, geom, mxfp4: bool = False, q_fp8: bool = F
                     for i in range_constexpr(FEAT_TILES_PER_WAVE)
                 ]
             else:
-                if const_expr(mxfp4):
+                if const_expr(nvfp4):
+                    data, scale_word = raws[0]
+                    # e4m3 bytes (2g, 2g+1) of the token, one halfword.
+                    w16 = fx.Int32(scale_word)
+                    if const_expr(f16_arm):
+                        scales = [
+                            e4m3_scale_raw_f16x2(w16),
+                            e4m3_scale_raw_f16x2(w16),
+                            e4m3_scale_raw_f16x2(w16 >> fx.Int32(8)),
+                            e4m3_scale_raw_f16x2(w16 >> fx.Int32(8)),
+                        ]
+                    else:
+                        s_lo = e4m3_scale_raw(w16)
+                        s_hi = e4m3_scale_raw(w16 >> fx.Int32(8))
+                        scales = [s_lo, s_lo, s_hi, s_hi]  # per dword
+                elif const_expr(mxfp4):
                     data, scale_word = raws[0]
                     scale_f32 = e8m0_to_f32(fx.Int32(scale_word), g)
                 accs = []
@@ -848,7 +1199,19 @@ def build_index_score(S: int, H: int, geom, mxfp4: bool = False, q_fp8: bool = F
                     acc.store(zero4)
                     accs.append(acc)
                 for ks in range_constexpr(KSTEPS):
-                    if const_expr(mxfp4):
+                    if const_expr(f16_arm):
+                        kf = fx.make_rmem_tensor(fx.make_layout(LANE_K, 1), fx.Float16)
+                        kf.store(
+                            fx.Vector.from_elements(
+                                nvfp4_dword_to_f16(data[ks], scales[ks]), fx.Float16
+                            )
+                        )
+                    elif const_expr(nvfp4):
+                        kf = fx.make_rmem_tensor(fx.make_layout(LANE_K, 1), fx.BFloat16)
+                        kf.store(
+                            nvfp4_dword_to_bf16(data[ks], scales[ks], nvfp4 == "e4m3")
+                        )
+                    elif const_expr(mxfp4):
                         # The bf16 A-fragment of k-step `ks`: dword ks of the lane's
                         # 16 B.
                         kf = fx.make_rmem_tensor(fx.make_layout(LANE_K, 1), fx.BFloat16)
@@ -871,12 +1234,42 @@ def build_index_score(S: int, H: int, geom, mxfp4: bool = False, q_fp8: bool = F
                 + tw_tok
                 + g * 4
             )
+            if const_expr(fp8_arm or nvfp4):
+                # A tile every one of whose tokens is visible to every feature (the
+                # smallest cutoff is seq_len - S + 1, feature token 0) needs no
+                # mask: all but the last page or two of a request. The test is
+                # wave-uniform, so it is a scalar branch, not a divergent one.
+                tile_end = tok_base - g * 4 + fx.Int32(MFMA_M)
+                visible = tile_end <= seq_len - fx.Int32(S) + fx.Int32(1)
+                full = fx.Int32(
+                    fx.rocdl.readfirstlane(
+                        T.i32, _to_raw(visible.select(fx.Int32(1), fx.Int32(0)))
+                    )
+                ) == fx.Int32(1)
+                for i in range_constexpr(FEAT_TILES_PER_WAVE):
+                    tok, _ = tok_head_of(i)
+                    causal_len = seq_len - fx.Int32(S) + tok + fx.Int32(1)
+                    v = (
+                        accs[i]
+                        if const_expr(mfma8)
+                        else fx.Vector(fx.memref_load_vec(accs[i]))
+                    )
+                    m = run_max[i]
+                    if full:
+                        m = m.maximumf(fx.Float32(v[0]).maximumf(fx.Float32(v[1])))
+                        m = m.maximumf(fx.Float32(v[2]).maximumf(fx.Float32(v[3])))
+                    else:
+                        for r in range_constexpr(4):
+                            ok = (tok_base + fx.Int32(r)) < causal_len
+                            m = m.maximumf(ok.select(fx.Float32(v[r]), neg_inf))
+                    run_max[i] = m
+                return
             for i in range_constexpr(FEAT_TILES_PER_WAVE):
                 tok, _ = tok_head_of(i)
                 causal_len = seq_len - fx.Int32(S) + tok + fx.Int32(1)
                 v = (
                     accs[i]
-                    if const_expr(q_fp8)
+                    if const_expr(mfma8)
                     else fx.Vector(fx.memref_load_vec(accs[i]))
                 )
                 for r in range_constexpr(4):
@@ -889,6 +1282,14 @@ def build_index_score(S: int, H: int, geom, mxfp4: bool = False, q_fp8: bool = F
         # WAVES_PER_TOK > 1 there is no guard -- it would be wave-divergent and every
         # wave must reach the epilogue's barrier -- so those waves run on a clamped
         # page and drop the result at the store.
+        if const_expr(fp8_arm):
+            # Thread t builds the table of scale byte t, once per CTA.
+            lut = lds.lut.ptr
+            t_lo, t_hi = e4m3_table_words(e4m3_to_f32(tid))
+            if tid < fx.Int32(LUT_ENTRIES):
+                fx.ptr_store(t_lo, lut + tid * fx.Int32(2))
+                fx.ptr_store(t_hi, lut + tid * fx.Int32(2) + fx.Int32(1))
+            gpu.barrier()
         _live = True if const_expr(WAVES_PER_TOK > 1) else (pages[0] < limit)
         if _live:
             carry = None
@@ -912,9 +1313,11 @@ def build_index_score(S: int, H: int, geom, mxfp4: bool = False, q_fp8: bool = F
                 for tok_tile in range_constexpr(TOK_TILES_PER_WAVE):
                     raws = queue.pop(0)
                     future = tok_tile + depth
-                    fx.rocdl.sched_barrier(0)
+                    if const_expr(sched_fence):
+                        fx.rocdl.sched_barrier(0)
                     score_tok_tile(p, tok_tile, raws, run_max)
-                    fx.rocdl.sched_barrier(0)
+                    if const_expr(sched_fence):
+                        fx.rocdl.sched_barrier(0)
                     if const_expr(future < TOK_TILES_PER_WAVE):
                         queue.append(
                             [issue_k(page, future, i) for i in range_constexpr(k_loads)]
@@ -1006,7 +1409,8 @@ def build_index_score(S: int, H: int, geom, mxfp4: bool = False, q_fp8: bool = F
     if mxfp4:
 
         @flyc.kernel(
-            name=kernel_name(S, H, geom, mxfp4, q_fp8), known_block_size=[THREADS, 1, 1]
+            name=kernel_name(S, H, geom, mxfp4, q_fp8, nvfp4),
+            known_block_size=[THREADS, 1, 1],
         )
         def score_kernel(
             arg_q: fx.Pointer,
@@ -1179,10 +1583,12 @@ def build_index_score(S: int, H: int, geom, mxfp4: bool = False, q_fp8: bool = F
 _CACHE = {}
 
 
-def _get(S, H, geom, device, mxfp4=False, q_fp8=False):
+def _get(S, H, geom, device, mxfp4=False, q_fp8=False, nvfp4=None):
     key = (S, H, tuple(sorted(geom.items())), device, mxfp4, q_fp8)
+    if nvfp4:  # appended only for NVFP4, so every pre-existing key is unchanged
+        key += (nvfp4,)
     if key not in _CACHE:
-        _CACHE[key] = build_index_score(S, H, geom, mxfp4, q_fp8)
+        _CACHE[key] = build_index_score(S, H, geom, mxfp4, q_fp8, nvfp4)
     return _CACHE[key]
 
 
@@ -1567,27 +1973,29 @@ def _validate_bounds(batch, max_block, geom) -> int:
     return batch * chunks
 
 
-def _validate_cache_mxfp4(k_data, k_scale, device):
-    """Shapes, dtypes and strides of the two MXFP4 views. Contents (block ids
-    inside the pool, e8m0 not 0/255) are a caller contract."""
+def _validate_cache_mxfp4(k_data, k_scale, device, nvfp4=False):
+    """Shapes, dtypes and strides of the two MXFP4 (or, with `nvfp4`, NVFP4) views.
+    Contents (block ids inside the pool, e8m0 not 0/255; e4m3 not NaN) are a
+    caller contract."""
     import torch
 
+    scale_bytes = NVFP4_SCALE_BYTES if nvfp4 else SCALE_BYTES
     _validate_tensor(k_data, "k_data", (torch.uint8,), 3, device, 16, False)
     _validate_tensor(k_scale, "k_scale", (torch.uint8,), 3, device, 4, False)
     if k_data.shape[1:] != (PAGE, DATA_BYTES) or k_data.shape[0] > 0x7FFFFFFF:
         raise ValueError("k_data: expected [pages, 128, 64] uint8 with int32 page IDs")
-    if k_scale.shape != (k_data.shape[0], PAGE, SCALE_BYTES):
+    if k_scale.shape != (k_data.shape[0], PAGE, scale_bytes):
         raise ValueError(
-            "k_scale: expected [pages, 128, 4] uint8, same pages as k_data"
+            f"k_scale: expected [pages, 128, {scale_bytes}] uint8, same pages as k_data"
         )
     if k_data.stride(1) != DATA_BYTES or k_data.stride(2) != 1:
         raise ValueError(
             f"k_data: tokens must be packed (stride(1) {DATA_BYTES}, stride(2) 1), "
             f"got {k_data.stride()}"
         )
-    if k_scale.stride(1) != SCALE_BYTES or k_scale.stride(2) != 1:
+    if k_scale.stride(1) != scale_bytes or k_scale.stride(2) != 1:
         raise ValueError(
-            f"k_scale: tokens must be packed (stride(1) {SCALE_BYTES}, stride(2) 1), "
+            f"k_scale: tokens must be packed (stride(1) {scale_bytes}, stride(2) 1), "
             f"got {k_scale.stride()}"
         )
     # A page stride below the view's own extent makes successive pages overlap.
@@ -1595,9 +2003,9 @@ def _validate_cache_mxfp4(k_data, k_scale, device):
         raise ValueError(
             f"k_data: page stride must be a multiple of 16 B and >= {PAGE * DATA_BYTES}"
         )
-    if k_scale.stride(0) < PAGE * SCALE_BYTES or k_scale.stride(0) % 4:
+    if k_scale.stride(0) < PAGE * scale_bytes or k_scale.stride(0) % 4:
         raise ValueError(
-            f"k_scale: page stride must be a multiple of 4 B and >= {PAGE * SCALE_BYTES}"
+            f"k_scale: page stride must be a multiple of 4 B and >= {PAGE * scale_bytes}"
         )
 
 
@@ -1612,12 +2020,13 @@ def _validate_metadata(
     out=None,
     work_map=None,
     k_scale=None,
+    nvfp4=None,
     **cp,
 ):
     """Metadata only: no device reads, synchronisation or allocations.
 
     `k_scale` selects the MXFP4 cache: `cache` is then its data view and Q may
-    also be e4m3.
+    also be e4m3. `nvfp4` (a K rounding) makes `k_scale` the NVFP4 one.
 
     Contents are a caller contract: 0 <= seq_lens <= INT32_MAX-127, each length
     fits max_block's local CP bound and the global block table, and every
@@ -1631,6 +2040,8 @@ def _validate_metadata(
         raise ValueError("S and H must be positive integers")
     device = idx_q.device
     _validate_arch(device)
+    if nvfp4 is not None and (nvfp4 not in NVFP4_ROUNDINGS or k_scale is None):
+        raise ValueError(f"nvfp4: k_round must be one of {NVFP4_ROUNDINGS}")
     mxfp4 = k_scale is not None
     # fp8 cache: Q is bf16 and this scores what `fused_qknorm_idxrqknorm` writes;
     # the launch binds those two types.
@@ -1643,7 +2054,7 @@ def _validate_metadata(
         16,
     )
     if mxfp4:
-        _validate_cache_mxfp4(cache, k_scale, device)
+        _validate_cache_mxfp4(cache, k_scale, device, nvfp4 is not None)
     else:
         _validate_tensor(cache, "cache", (dtypes.fp8,), 3, device, 16, False)
     if idx_q.shape[1:] != (H, HEAD_DIM) or idx_q.shape[0] % S:
@@ -1658,6 +2069,18 @@ def _validate_metadata(
     batch = idx_q.shape[0] // S
     geom = geometry(batch, max_block, S, H, device=device, **cp)
     rows = _validate_bounds(batch, max_block, geom)
+    if nvfp4 is not None:
+        # The NVFP4 scorer's own depth table is opt-in through the map: a caller that
+        # built its map with `nvfp4=True` (or passes none) gets it; a map built the
+        # shared way keeps the shared geometry. The two row counts differ whenever the
+        # geometries do (except below 9 blocks, where both are one chunk per request).
+        tuned = geometry(batch, max_block, S, H, device=device, nvfp4=True, **cp)
+        if tuned != geom:
+            tuned_rows = _validate_bounds(batch, max_block, tuned)
+            if work_map is None or (
+                tuned_rows != rows and work_map.shape[0] == tuned_rows
+            ):
+                geom, rows = tuned, tuned_rows
     if block_table is not None:
         _validate_tensor(block_table, "block_table", (torch.int32,), 2, device)
         if (
@@ -1708,6 +2131,7 @@ def index_score_supported(
     out=None,
     work_map=None,
     k_scale=None,
+    nvfp4=None,
     **cp,
 ) -> bool:
     """Metadata-only predicate sharing the entry point's validation.
@@ -1732,6 +2156,7 @@ def index_score_supported(
             out,
             work_map,
             k_scale=k_scale,
+            nvfp4=nvfp4,
             **cp,
         )
         scaled = sm_scale * LOG2E
@@ -1767,6 +2192,38 @@ def index_score_supported_fp4(
         out=out,
         work_map=work_map,
         k_scale=k_scale,
+    )
+
+
+def index_score_supported_nvfp4(
+    idx_q,
+    k_data,
+    k_scale,
+    S: int,
+    H: int,
+    max_block: int,
+    block_table,
+    *,
+    seq_lens,
+    sm_scale=1.0,
+    out=None,
+    work_map=None,
+    k_round="e4m3",
+) -> bool:
+    """Metadata-only predicate for `score_flydsl_nvfp4`."""
+    return index_score_supported(
+        idx_q,
+        k_data,
+        S,
+        H,
+        max_block,
+        block_table,
+        seq_lens=seq_lens,
+        sm_scale=sm_scale,
+        out=out,
+        work_map=work_map,
+        k_scale=k_scale,
+        nvfp4=k_round,
     )
 
 
@@ -1821,6 +2278,40 @@ def score_flydsl(
     cp_rank: int = 0,
     k_scale=None,
 ):
+    """Host entry point; see `_score_impl`."""
+    return _score_impl(
+        idx_q,
+        cache,
+        block_table,
+        seq_lens,
+        S,
+        H,
+        sm_scale,
+        max_block,
+        out,
+        work_map,
+        cp_world,
+        cp_rank,
+        k_scale,
+    )
+
+
+def _score_impl(
+    idx_q,
+    cache,
+    block_table,
+    seq_lens,
+    S,
+    H,
+    sm_scale,
+    max_block,
+    out=None,
+    work_map=None,
+    cp_world: int = 1,
+    cp_rank: int = 0,
+    k_scale=None,
+    nvfp4=None,
+):
     """Host entry point.
 
     `cp_world`/`cp_rank` shard the blocks round robin: this rank owns
@@ -1830,7 +2321,8 @@ def score_flydsl(
     compacted [H, tokens, ceil(blocks/world)] shard the CP selector reads.
 
     `k_scale` selects the MXFP4 cache (see `score_flydsl_fp4`): `cache` is then its
-    data view and `idx_q` may also be e4m3.
+    data view and `idx_q` may also be e4m3. `nvfp4` (a K rounding) makes it the NVFP4
+    one instead (see `score_flydsl_nvfp4`).
     """
     import torch
 
@@ -1846,6 +2338,7 @@ def score_flydsl(
         out,
         work_map,
         k_scale=k_scale,
+        nvfp4=nvfp4,
         cp_world=cp_world,
         cp_rank=cp_rank,
     )
@@ -1859,7 +2352,7 @@ def score_flydsl(
         geom = {**geom, "nt_k": MXFP4_K_CACHE}
     if out is None:
         out = alloc_score(batch, S, H, max_block, idx_q.device)
-    launch, _chunk = _get(S, H, geom, idx_q.device.index, mxfp4, q_fp8)
+    launch, _chunk = _get(S, H, geom, idx_q.device.index, mxfp4, q_fp8, nvfp4)
     # The grid depends only on launch-time bounds, never on seq_lens contents,
     # so it stays valid across a cudagraph replay with different lengths.
     chunks = _grid_chunks(max_block, geom)
@@ -1929,4 +2422,47 @@ def score_flydsl_fp4(
         out=out,
         work_map=work_map,
         k_scale=k_scale,
+    )
+
+
+def score_flydsl_nvfp4(
+    idx_q,
+    k_data,
+    k_scale,
+    block_table,
+    seq_lens,
+    S,
+    H,
+    sm_scale,
+    max_block,
+    out=None,
+    work_map=None,
+    k_round="e4m3",
+):
+    """`score_flydsl` for an NVFP4 index cache (decode).
+
+    `k_data [pages, 128, 64]` is the e2m1 view of `score_flydsl_fp4` and `k_scale
+    [pages, 128, 8]` uint8 holds one e4m3 scale per 16 elements (8 B a token, token
+    major; no per-tensor scale), each view with its own page stride. `idx_q` is
+    bf16 or e4m3. `k_round` is "e4m3" (the default: K = e4m3_rn_satfinite(e2m1 *
+    scale), as the vLLM nvfp4 indexer reads it, bit-identical to it; the fp8 MFMA with an
+    e4m3 Q) or "exact" (K = e2m1 * scale, no rounding, on the bf16 MFMA, or on the f16
+    MFMA with an e4m3 Q). Scale bytes must be positive e4m3 (sign bit unread) and not
+    0x7F. Work map and score layout as in `score_flydsl`.
+    """
+    if k_round not in NVFP4_ROUNDINGS:
+        raise ValueError(f"k_round must be one of {NVFP4_ROUNDINGS}, got {k_round!r}")
+    return _score_impl(
+        idx_q,
+        k_data,
+        block_table,
+        seq_lens,
+        S,
+        H,
+        sm_scale,
+        max_block,
+        out=out,
+        work_map=work_map,
+        k_scale=k_scale,
+        nvfp4=k_round,
     )
