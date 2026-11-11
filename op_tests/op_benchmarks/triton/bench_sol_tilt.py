@@ -53,6 +53,19 @@ PACKED = ("mxfp4", "mxfp6", "mxfp4_fp6_p", "mxfp6_fp6_p", "rotated")
 OPS = ["q_abs_max", "jensen_cap", "planes", "factors"]
 
 
+def _without_q_storage(make):
+    """make's output with Q replaced by a one-element view of its shape.
+
+    sol_jensen_cap and sol_tilt_factors read q_abs_max, not Q, so Q's storage would only make
+    the pool's per-call bytes larger than the set the call reads, and leave that set cached.
+    """
+    out = make()
+    kwargs = out[0] if isinstance(out, tuple) else out
+    q = kwargs["q"]
+    kwargs["q"] = q.new_empty((1,) * q.dim()).expand(q.shape)
+    return out
+
+
 def _cases(op, tokens, heads, kv_tile, rank):
     """(recipe, generator, op) for each case of op; each generator builds one call's kwargs."""
     shape = {"batch": 1, "heads": heads}
@@ -64,12 +77,15 @@ def _cases(op, tokens, heads, kv_tile, rank):
     elif op == "jensen_cap":
         for kind in K_KINDS:
             yield kind, functools.partial(
-                make_jensen_inputs,
-                kind,
-                seqlen_q=tokens,
-                seqlen_k=tokens,
-                kv_tile=kv_tile,
-                **shape,
+                _without_q_storage,
+                functools.partial(
+                    make_jensen_inputs,
+                    kind,
+                    seqlen_q=tokens,
+                    seqlen_k=tokens,
+                    kv_tile=kv_tile,
+                    **shape,
+                ),
             ), sol_jensen_cap
     elif op == "planes":
         for k_format, v_format in RECIPES:
@@ -85,12 +101,15 @@ def _cases(op, tokens, heads, kv_tile, rank):
             ), sol_tilt_planes
     else:
         yield "e4m3/e4m3", functools.partial(
-            make_tilt_factor_inputs,
-            seqlen_q=tokens,
-            seqlen_k=tokens,
-            kv_tile=kv_tile,
-            rank=rank,
-            **shape,
+            _without_q_storage,
+            functools.partial(
+                make_tilt_factor_inputs,
+                seqlen_q=tokens,
+                seqlen_k=tokens,
+                kv_tile=kv_tile,
+                rank=rank,
+                **shape,
+            ),
         ), sol_tilt_factors
 
 
