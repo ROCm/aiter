@@ -1556,6 +1556,13 @@ def attention_loop_standard(pgm, kv_loader, q, M, L, acc):
 
     Per iter:
         QK -> SM0 -> SM1 -> PV (K/V double-buffered across iters)
+
+    Tile t lives in slot (t - tile_start) % 2. Indexing the slots as rel % 2
+    (read) and (rel + 1) % 2 (prefetch) with rel = j - tile_start, instead of
+    toggling a loop-carried buffer_id, lets Membar's BufferIndexAnalysis prove
+    the two slots disjoint (same base, different offset, modulus 2), so it does
+    not insert WAR barriers/waits between the reads of one slot and the async
+    refill of the other.
     """
     physical_block_idx = kv_loader.load_block_ids(pgm.tile_start)
     next_physical_block_idx = kv_loader.load_block_ids(pgm.tile_start + 1)
@@ -1565,10 +1572,11 @@ def attention_loop_standard(pgm, kv_loader, q, M, L, acc):
     kv_loader.load_v_to_shared(physical_block_idx, buffer_id=buffer_id)
     # ---- Safe tiles (no mask) ----
     for j in range(pgm.tile_start, pgm.safe_tile_end):
+        rel = j - pgm.tile_start
         if pgm.cfg.NUM_WARPS == 1:
             next2_physical_block_idx = kv_loader.load_block_ids(j + 2)
             k = kv_loader.load_k_from_shared(
-                wait_count=1, target_dtype=q.dtype, buffer_id=buffer_id
+                wait_count=1, target_dtype=q.dtype, buffer_id=rel % 2
             )
         else:
             # Manually inserting barriers to compansate for the relaxed loads
@@ -1581,12 +1589,12 @@ def attention_loop_standard(pgm, kv_loader, q, M, L, acc):
             k = kv_loader.load_k_from_shared(
                 wait_count=0,
                 target_dtype=q.dtype,
-                buffer_id=buffer_id,
+                buffer_id=rel % 2,
                 skip_wait=True,
                 RELAXED=True,
             )
-        kv_loader.load_k_to_shared(next_physical_block_idx, buffer_id=1 - buffer_id)
-        kv_loader.load_v_to_shared(next_physical_block_idx, buffer_id=1 - buffer_id)
+        kv_loader.load_k_to_shared(next_physical_block_idx, buffer_id=(rel + 1) % 2)
+        kv_loader.load_v_to_shared(next_physical_block_idx, buffer_id=(rel + 1) % 2)
 
         S = pgm.compute_qk(k)
         if pgm.cfg.SLIDING_WINDOW > 0:
@@ -1597,27 +1605,27 @@ def attention_loop_standard(pgm, kv_loader, q, M, L, acc):
 
         if pgm.cfg.NUM_WARPS == 1:
             v = kv_loader.load_v_from_shared(
-                wait_count=2, target_dtype=q.dtype, buffer_id=buffer_id
+                wait_count=2, target_dtype=q.dtype, buffer_id=rel % 2
             )
         else:
             # ordered by the wait at the top of the iteration
             v = kv_loader.load_v_from_shared(
                 wait_count=0,
                 target_dtype=q.dtype,
-                buffer_id=buffer_id,
+                buffer_id=rel % 2,
                 skip_wait=True,
                 RELAXED=True,
             )
         acc = pgm.compute_pv(p, v, acc)
-        buffer_id = 1 - buffer_id
         next_physical_block_idx = next2_physical_block_idx
     if not pgm.cfg.ALL_DECODE:
         # ---- Masked tiles (causal boundary) ----
         for j in range(pgm.safe_tile_end, pgm.tile_end - 1):
+            rel = j - pgm.tile_start
             if pgm.cfg.NUM_WARPS == 1:
                 next2_physical_block_idx = kv_loader.load_block_ids(j + 2)
                 k = kv_loader.load_k_from_shared(
-                    wait_count=1, target_dtype=q.dtype, buffer_id=buffer_id
+                    wait_count=1, target_dtype=q.dtype, buffer_id=rel % 2
                 )
             else:
                 # same merged wait as the safe-tile loop
@@ -1627,12 +1635,12 @@ def attention_loop_standard(pgm, kv_loader, q, M, L, acc):
                 k = kv_loader.load_k_from_shared(
                     wait_count=0,
                     target_dtype=q.dtype,
-                    buffer_id=buffer_id,
+                    buffer_id=rel % 2,
                     skip_wait=True,
                     RELAXED=True,
                 )
-            kv_loader.load_k_to_shared(next_physical_block_idx, buffer_id=1 - buffer_id)
-            kv_loader.load_v_to_shared(next_physical_block_idx, buffer_id=1 - buffer_id)
+            kv_loader.load_k_to_shared(next_physical_block_idx, buffer_id=(rel + 1) % 2)
+            kv_loader.load_v_to_shared(next_physical_block_idx, buffer_id=(rel + 1) % 2)
 
             S = pgm.compute_qk(k)
             S = pgm.apply_mask_qk(S, j)
@@ -1642,21 +1650,23 @@ def attention_loop_standard(pgm, kv_loader, q, M, L, acc):
 
             if pgm.cfg.NUM_WARPS == 1:
                 v = kv_loader.load_v_from_shared(
-                    wait_count=2, target_dtype=q.dtype, buffer_id=buffer_id
+                    wait_count=2, target_dtype=q.dtype, buffer_id=rel % 2
                 )
             else:
                 v = kv_loader.load_v_from_shared(
                     wait_count=0,
                     target_dtype=q.dtype,
-                    buffer_id=buffer_id,
+                    buffer_id=rel % 2,
                     skip_wait=True,
                     RELAXED=True,
                 )
             acc = pgm.compute_pv(p, v, acc)
-            buffer_id = 1 - buffer_id
             next_physical_block_idx = next2_physical_block_idx
 
     # Last tile is always masked
+    # Both loops are empty when tile_end - 1 <= tile_start; the prologue's
+    # slot 0 then holds the last tile, as with the old toggle.
+    buffer_id = gl.maximum(pgm.tile_end - 1 - pgm.tile_start, 0) % 2
     if pgm.cfg.NUM_WARPS > 1:
         gl.amd.cdna4.async_copy.wait_group(0)
         _barrier()
