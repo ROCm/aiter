@@ -513,14 +513,14 @@ def mla_decode_fwd(
             max_seqlen_kv,
         )
         # The tuned table is keyed on H, B and KV only. NPOT_SPLITS (a split
-        # count), PARTIAL_BF16, XCHG_MODE, EARLY_PRIME and SPLIT_FP8 were
-        # measured for page64, rank 512 and RoPE 64, and XCHG_MODE=1 needs a
-        # 64-token tile. Other geometries keep NUM_SEGMENTS_PER_SEQ and the
+        # count), PARTIAL_BF16, XCHG_MODE, EARLY_PRIME, SPLIT_FP8 and ROWSPLIT
+        # were measured for page64, rank 512 and RoPE 64, and XCHG_MODE=1 needs
+        # a 64-token tile. Other geometries keep NUM_SEGMENTS_PER_SEQ and the
         # current path.
         npot_splits = tuned.pop("NPOT_SPLITS", 0)
         partial_bf16 = bool(tuned.pop("PARTIAL_BF16", False))
         if (block_size, kv_lora_rank, qk_rope_head_dim) != (64, 512, 64):
-            for key in ("XCHG_MODE", "EARLY_PRIME", "SPLIT_FP8"):
+            for key in ("XCHG_MODE", "EARLY_PRIME", "SPLIT_FP8", "ROWSPLIT"):
                 tuned.pop(key, None)
             npot_splits, partial_bf16 = 0, False
         if npot_splits:
@@ -553,6 +553,17 @@ def mla_decode_fwd(
             BLOCK_Q = max(BLOCK_M // num_queries_per_kv, 1)
             NUM_HEAD_BLOCKS = (num_queries_per_kv + BLOCK_M - 1) // BLOCK_M
             total_num_q_blocks = num_seqs * NUM_HEAD_BLOCKS
+        # ROWSPLIT puts the lo split parts in the padding rows 8-15 of a
+        # 16-row tile: only valid for one query token per sequence and 8 heads.
+        if tuned.get("ROWSPLIT") and not (
+            total_num_tokens == num_seqs
+            and BLOCK_M == 16
+            and num_queries_per_kv == 8
+            and tuned.get("SPLIT_FP8")
+            and tuned.get("EARLY_PRIME")
+            and tuned.get("num_stages", attn_config["num_stages"]) == 2
+        ):
+            tuned.pop("ROWSPLIT")
         if "NUM_SEGMENTS_PER_SEQ" in tuned:
             # NPOT_SPLITS keeps its count. Else use a power of 2.
             # The reduce kernel pads its segment aranges to a power of 2.

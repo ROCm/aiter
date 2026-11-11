@@ -1006,8 +1006,8 @@ def test_mla_decode_fwd_unshuffled_tuned_tp8_bf16(
     monkeypatch, batch_size, max_seqlen_kv, expect_tuned
 ):
     """TP8 entries (H=8, bf16 query, fp8 KV) of the bf16_fp8 group. The launch
-    uses the entry's warps, stages, split count, partial dtype, EARLY_PRIME and
-    SPLIT_FP8, and an empty entry keeps the untuned path."""
+    uses the entry's warps, stages, split count, partial dtype, EARLY_PRIME,
+    SPLIT_FP8 and ROWSPLIT, and an empty entry keeps the untuned path."""
     if DEVICE_ARCH != "gfx1250":
         pytest.skip("unshuffled LDS pipeline requires gfx1250")
 
@@ -1024,7 +1024,7 @@ def test_mla_decode_fwd_unshuffled_tuned_tp8_bf16(
     if entry:
         for key in ("num_warps", "num_stages", "waves_per_eu"):
             assert kwargs[key] == entry[key], (key, kwargs[key], entry[key])
-        for key in ("Q_FROM_LDS", "EARLY_PRIME", "SPLIT_FP8"):
+        for key in ("Q_FROM_LDS", "EARLY_PRIME", "SPLIT_FP8", "ROWSPLIT"):
             assert kwargs.get(key, 0) == entry.get(key, 0), (key, kwargs, entry)
     if "NPOT_SPLITS" in entry:
         # NPOT_SPLITS: the measured count, without power-of-2 rounding.

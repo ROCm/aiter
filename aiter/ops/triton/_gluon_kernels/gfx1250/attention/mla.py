@@ -1985,6 +1985,14 @@ def _mla_process_q(
 
 
 @gluon.jit
+def _mla_fold_row_halves(x, N: gl.constexpr):
+    # Rows r and r + 8 of a 16-row tile are summed; both rows hold the sum.
+    y = gl.sum(x.reshape([2, 8, N]), axis=0)
+    y = gl.join(y, y).permute((2, 0, 1)).reshape([16, N])
+    return gl.convert_layout(y, x.type.layout)
+
+
+@gluon.jit
 def _mla_load_q_regs(
     cfg: MLAConfig,
     query_ptr,
@@ -2132,6 +2140,7 @@ _mla_decode_fwd_kernel_repr = make_kernel_repr(
         "XCHG_MODE",
         "EARLY_PRIME",
         "SPLIT_FP8",
+        "ROWSPLIT",
     ],
 )
 
@@ -2191,6 +2200,7 @@ def _mla_decode_fwd_kernel(
     XCHG_MODE: gl.constexpr = 0,
     EARLY_PRIME: gl.constexpr = 0,
     SPLIT_FP8: gl.constexpr = 0,
+    ROWSPLIT: gl.constexpr = 0,
     FP8_MIN: tl.constexpr = float8_info.min,
     FP8_MAX: tl.constexpr = float8_info.max,
 ):
@@ -2204,6 +2214,12 @@ def _mla_decode_fwd_kernel(
     # (Q: one scale per row; P: a constant 256), so QK and PV run as FP8 x FP8
     # WMMA without converting K/V to bf16, at the numerics of the bf16 path.
     # Two-stage loop only.
+    # ROWSPLIT (H8 decode, one query token per sequence): rows 8-15 of the
+    # 16-row tile are padding, so they carry the lo parts of Q and P. One WMMA
+    # then does both split parts; S and the output fold rows r and r + 8.
+    if ROWSPLIT:
+        gl.static_assert(SPLIT_FP8 and EARLY_PRIME and num_stages == 2)
+        gl.static_assert(BLOCK_M == 16 and num_query_heads == 8 * num_kv_heads)
     if SPLIT_FP8:
         gl.static_assert(QUERY_DTYPE == "bf16" and KV_CACHE_DTYPE == "fp8")
         gl.static_assert(num_stages == 2)
@@ -2656,6 +2672,13 @@ def _mla_decode_fwd_kernel(
             Q_rope = qr.to(gl.float8e4nv)
             Q_lora_lo = (ql - Q_lora.to(gl.float32)).to(gl.float8e4nv)
             Q_rope_lo = (qr - Q_rope.to(gl.float32)).to(gl.float8e4nv)
+            if ROWSPLIT:
+                q_row = gl.arange(
+                    0, BLOCK_M, layout=gl.SliceLayout(1, cfg.Q_DOT_LAYOUT)
+                )
+                q_top = (q_row < BLOCK_M // 2)[:, None]
+                Q_lora = gl.where(q_top, Q_lora, Q_lora_lo)
+                Q_rope = gl.where(q_top, Q_rope, Q_rope_lo)
             qk_factor = (
                 gl.convert_layout(q_s, gl.SliceLayout(1, cfg.QK_WMMA_UNPACKED_LAYOUT))
                 * qk_factor
@@ -2739,7 +2762,7 @@ def _mla_decode_fwd_kernel(
                 kv_lora = pgm.tdm_shared_load_kv_lora(1, buffer_id)
                 kv_lora_scales = None
             S = pgm.compute_qk_lora(kv_lora, q_lora_scales, kv_lora_scales, S)
-            if SPLIT_FP8:
+            if SPLIT_FP8 and not ROWSPLIT:
                 S = pgm_lo.compute_qk_lora(kv_lora, None, None, S)
 
             next_buffer_id = pgm.get_next_buffer_id(buffer_id)
@@ -2756,8 +2779,10 @@ def _mla_decode_fwd_kernel(
                 k_rope = pgm.tdm_shared_load_k_rope(2, buffer_id)
                 k_rope_scales = None
             S = pgm.compute_qk_rope(k_rope, q_rope_scales, k_rope_scales, S)
-            if SPLIT_FP8:
+            if SPLIT_FP8 and not ROWSPLIT:
                 S = pgm_lo.compute_qk_rope(k_rope, None, None, S)
+            if ROWSPLIT:
+                S = _mla_fold_row_halves(S, TILE_SIZE)
             S = S * qk_factor
 
             p, alpha, M = pgm.softmax_part0(S, M)
@@ -2793,8 +2818,17 @@ def _mla_decode_fwd_kernel(
                     p256 = p * 256.0
                     p_hi = p256.to(gl.float8e4nv)
                     p_lo = (p256 - p_hi.to(gl.float32)).to(gl.float8e4nv)
-                    acc = pgm.compute_pkv_lora_trans(p_hi, kv_lora_trans, None, acc)
-                    acc = pgm.compute_pkv_lora_trans(p_lo, kv_lora_trans, None, acc)
+                    if ROWSPLIT:
+                        p_row = gl.arange(
+                            0,
+                            BLOCK_M,
+                            layout=gl.SliceLayout(1, cfg.QK_WMMA_UNPACKED_LAYOUT),
+                        )
+                        p_c = gl.where((p_row < BLOCK_M // 2)[:, None], p_hi, p_lo)
+                        acc = pgm.compute_pkv_lora_trans(p_c, kv_lora_trans, None, acc)
+                    else:
+                        acc = pgm.compute_pkv_lora_trans(p_hi, kv_lora_trans, None, acc)
+                        acc = pgm.compute_pkv_lora_trans(p_lo, kv_lora_trans, None, acc)
                 else:
                     acc = pgm.compute_pkv_lora_trans(
                         p, kv_lora_trans, kv_lora_scales, acc
@@ -2814,7 +2848,7 @@ def _mla_decode_fwd_kernel(
             kv_lora = pgm.tdm_shared_load_kv_lora(1, buffer_id)
             kv_lora_scales = None
         S = pgm.compute_qk_lora(kv_lora, q_lora_scales, kv_lora_scales, S)
-        if SPLIT_FP8:
+        if SPLIT_FP8 and not ROWSPLIT:
             S = pgm_lo.compute_qk_lora(kv_lora, None, None, S)
         if KV_CACHE_DTYPE == "nvfp4":
             k_rope = pgm.tdm_shared_load_k_rope(1, buffer_id)
@@ -2825,8 +2859,10 @@ def _mla_decode_fwd_kernel(
             k_rope = pgm.tdm_shared_load_k_rope(0, buffer_id)
             k_rope_scales = None
         S = pgm.compute_qk_rope(k_rope, q_rope_scales, k_rope_scales, S)
-        if SPLIT_FP8:
+        if SPLIT_FP8 and not ROWSPLIT:
             S = pgm_lo.compute_qk_rope(k_rope, None, None, S)
+        if ROWSPLIT:
+            S = _mla_fold_row_halves(S, TILE_SIZE)
         S = S * qk_factor
 
         seq_offset = (pgm.tile_end - 1) * cfg.TILE_SIZE + gl.arange(
@@ -2867,8 +2903,17 @@ def _mla_decode_fwd_kernel(
                 p256 = p * 256.0
                 p_hi = p256.to(gl.float8e4nv)
                 p_lo = (p256 - p_hi.to(gl.float32)).to(gl.float8e4nv)
-                acc = pgm.compute_pkv_lora_trans(p_hi, kv_lora_trans, None, acc)
-                acc = pgm.compute_pkv_lora_trans(p_lo, kv_lora_trans, None, acc)
+                if ROWSPLIT:
+                    p_row = gl.arange(
+                        0,
+                        BLOCK_M,
+                        layout=gl.SliceLayout(1, cfg.QK_WMMA_UNPACKED_LAYOUT),
+                    )
+                    p_c = gl.where((p_row < BLOCK_M // 2)[:, None], p_hi, p_lo)
+                    acc = pgm.compute_pkv_lora_trans(p_c, kv_lora_trans, None, acc)
+                else:
+                    acc = pgm.compute_pkv_lora_trans(p_hi, kv_lora_trans, None, acc)
+                    acc = pgm.compute_pkv_lora_trans(p_lo, kv_lora_trans, None, acc)
             else:
                 acc = pgm.compute_pkv_lora_trans(p, kv_lora_trans, kv_lora_scales, acc)
 
@@ -2899,6 +2944,8 @@ def _mla_decode_fwd_kernel(
             segm_idx,
         )
     else:
+        if ROWSPLIT:
+            acc = _mla_fold_row_halves(acc, KV_LORA_RANK)
         acc = acc * out_factor
         if cfg.NUM_SEGMENTS_PER_SEQ == 1:
             acc = acc * one_over_L
