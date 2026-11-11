@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-"""MiniMax-M3 prefill index score over an MXFP4 index cache.
+"""MiniMax-M3 prefill index score over an MXFP4 and an NVFP4 index cache.
 
 `score_prefill_flydsl_fp4` is the fp8 prefill kernel built with `k_fp4`: the fp4
 pages stay MXFP4 through LDS and feed the scaled MFMA. It must match aiter's
@@ -12,6 +12,13 @@ Reference: aiter's `per_1x32_f4_quant` (RoundUp) quantizes, `fp4_utils.mxfp4_to_
 x `e8m0_to_f32` dequantizes, and aiter's `pa_sparse_block_score_prefill` (plus the fp8
 FlyDSL kernel) scores the dequantized values as fp8 -- nothing from the kernel under
 test. e8m0 bytes 0 and 255 are outside its contract and are not generated.
+
+The NVFP4 cache (`score_prefill_flydsl_nvfp4`: e2m1 data, one e4m3 scale per 16
+elements, 72 B per token, no per-tensor scale) is checked against a torch oracle that
+dequantizes the cache itself (K = e2m1 x scale, either exact or rounded to e4m3 like
+vLLM's NVFP4 scorer), on data whose fp32 partial sums are exact so the comparison is
+bit for bit whatever the accumulation order. There is no NVFP4 write kernel in this
+change; the pages are written by a torch reference quantizer in this file.
 
 Run (exits nonzero if any check fails):
     python op_tests/test_flydsl_minimax_m3_index_score_prefill_fp4.py [--case SUBSTR ...]
@@ -26,11 +33,12 @@ import torch
 
 import aiter
 from aiter import dtypes
-from aiter.jit.utils.chip_info import get_gfx
+from aiter.jit.utils.chip_info import get_gfx_runtime
 from aiter.ops.flydsl.kernels.minimax_m3_index_score_prefill import (
     LOG2E,
     score_prefill_flydsl,
     score_prefill_flydsl_fp4,
+    score_prefill_flydsl_nvfp4,
 )
 from aiter.ops.flydsl.kernels.minimax_m3_index_score_prefill import (
     alloc_score as prefill_alloc_score,
@@ -529,6 +537,437 @@ def check_prefill_rejections():
     )
 
 
+# ==========================================================================
+# NVFP4 PREFILL (score_prefill_flydsl_nvfp4)
+#
+# A token is 64 B of e2m1 plus 8 e4m3 scale bytes (one per 16 elements, no
+# per-tensor scale). K is e4m3_rn_satfinite(e2m1 * scale), which fits an fp8 cache
+# exactly, so aiter's own fp8 judges (`aiter_scores`) score the same values; and an
+# independent torch oracle scores them in fp32. The quantizer is test-side and has
+# vLLM's `_quant4` numerics.
+#
+# Two kinds of comparison, because the fp8 MFMA's internal accumulation depends on
+# which k elements share an instruction: on exact-sum data (every partial sum exact
+# in fp32) the oracle must be matched to the BIT whatever the partition; on general
+# data the judge is matched to a few fp32 ulps (the kernel's partition is vLLM's,
+# not the fp8 scorer's -- see `_k32_chunk`).
+# ==========================================================================
+E2M1 = (0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0)
+E4M3_MAX = 448.0
+RCP6_F32 = 0x3E2AAAAB
+NV_ROUNDS = ["e4m3"]
+
+
+def e2m1_encode(a):
+    """fp32 -> 4-bit e2m1 codes, round to nearest even (ties to the even code)."""
+    m = a.abs()
+    code = (
+        (m > 0.25).int()
+        + (m >= 0.75).int()
+        + (m > 1.25).int()
+        + (m >= 1.75).int()
+        + (m > 2.5).int()
+        + (m >= 3.5).int()
+        + (m > 5.0).int()
+    )
+    return code + 8 * (a < 0).int()
+
+
+def nv_product(data, scale):
+    """e2m1 data u8 [..., 64] x e4m3 scale u8 [..., 8] -> exact fp32 [..., 128]."""
+    lut = torch.tensor(E2M1, device=data.device)
+    codes = torch.stack([(data & 0xF).long(), (data >> 4).long()], -1)
+    codes = codes.reshape(*data.shape[:-1], D)
+    val = lut[codes & 7] * (1 - 2 * (codes >> 3).float())
+    return val * scale.view(dtypes.fp8).float().repeat_interleave(16, dim=-1)
+
+
+def nv_pack(codes, scale_bytes):
+    """codes int [pages,128,128], scale u8 [pages,128,8] -> (data, scale, exact, e4m3)."""
+    pair = codes.reshape(*codes.shape[:-1], D // 2, 2)
+    data = (pair[..., 0] | (pair[..., 1] << 4)).to(torch.uint8)
+    prod = nv_product(data, scale_bytes)
+    e4m3 = prod.clamp(-E4M3_MAX, E4M3_MAX).to(dtypes.fp8).float()
+    return data, scale_bytes, prod, e4m3
+
+
+def nv_quantize(k):
+    """bf16 [pages,128,128] -> (data, scale, exact fp32, e4m3 fp32), vLLM `_quant4`
+    numerics: scale = RNE e4m3 of min(amax * RN(1/6), 448) per 16 elements, elements
+    * (1 / decoded scale) -> RNE e2m1."""
+    x = k.float().reshape(*k.shape[:-1], D // 16, 16)
+    rcp6 = torch.tensor(RCP6_F32, dtype=torch.int32).view(torch.float32).item()
+    sf = (x.abs().amax(-1) * rcp6).clamp(max=E4M3_MAX).to(dtypes.fp8)
+    sv = sf.float().unsqueeze(-1)
+    quant = torch.where(sv != 0, 1.0 / sv, torch.zeros_like(sv))
+    return nv_pack(
+        e2m1_encode(x * quant).reshape(*k.shape[:-1], D), sf.view(torch.uint8)
+    )
+
+
+def nv_cache_of(cache8):
+    outs = [[], [], [], []]
+    for i in range(0, cache8.shape[0], QCHUNK):
+        for o, t in zip(outs, nv_quantize(cache8[i : i + QCHUNK].to(torch.bfloat16))):
+            o.append(t)
+    return tuple(torch.cat(o) for o in outs)
+
+
+def nv_oracle(c, deq):
+    """[H, total_q, mb] block scores of `c` over the dequantized cache `deq` (fp32
+    [pages,128,D]), in fp32: max over a page's tokens visible to the row, -inf where
+    the page is not visible at all."""
+    H, total_q = c["q8"].shape[1], c["q8"].shape[0]
+    out = torch.full((H, total_q, c["mb"]), -float("inf"), device="cuda")
+    cu, seq, pre = c["cu"].tolist(), c["seq"].tolist(), c["prefix"].tolist()
+    for b in range(len(cu) - 1):
+        ql = cu[b + 1] - cu[b]
+        if ql == 0:
+            continue
+        nblk = -(-seq[b] // P)
+        k = deq[c["bt"][b, :nblk].long()].reshape(nblk * P, D)
+        q = c["q8"][cu[b] : cu[b + 1]].float()  # [ql, H, D]
+        dot = torch.einsum("rhd,td->rht", q, k)  # [ql, H, nblk*128]
+        vis = pre[b] + torch.arange(ql, device="cuda") + 1
+        tok = torch.arange(nblk * P, device="cuda")
+        dot = dot.masked_fill(tok[None, None, :] >= vis[:, None, None], -float("inf"))
+        page = dot.reshape(ql, H, nblk, P).amax(-1)  # [ql, H, nblk]
+        out[:, cu[b] : cu[b + 1], :nblk] = page.permute(1, 0, 2)
+    return out
+
+
+def nv_case(qls, seqs, heads=1, seed=0, exact_sum=False):
+    """A ragged prefill case over an NVFP4 cache. Request b has qls[b] new rows on
+    seqs[b] tokens (prefix = the rest). `exact_sum` makes every partial sum exact in
+    fp32 (|Q| and every scale in [0.5, 2), see the decode test) so a kernel must match
+    the oracle to the bit whatever the accumulation order."""
+    dev = "cuda"
+    g = torch.Generator(device=dev).manual_seed(seed)
+    B, total_q = len(qls), sum(qls)
+    mb = max(1, max(-(-L // P) for L in seqs))
+    pages = B * mb
+    if exact_sum:
+        qb = torch.randint(0x30, 0x48, (total_q, heads, D), device=dev, generator=g)
+        qb = qb | (torch.randint(0, 2, qb.shape, device=dev, generator=g) << 7)
+        q8 = qb.to(torch.uint8).view(dtypes.fp8)
+        codes = torch.randint(0, 16, (pages, P, D), device=dev, generator=g)
+        sb = torch.randint(0x30, 0x48, (pages, P, 8), device=dev, generator=g)
+        kd, ks, exact, e4m3 = nv_pack(codes, sb.to(torch.uint8))
+    else:
+        q8 = (torch.randn(total_q, heads, D, device=dev, generator=g) / 4).to(
+            dtypes.fp8
+        )
+        cache8 = (torch.randn(pages, P, D, device=dev, generator=g) / 4).to(dtypes.fp8)
+        kd, ks, exact, e4m3 = nv_cache_of(cache8)
+    bt = torch.randperm(pages, device=dev, dtype=torch.int32, generator=g).view(B, mb)
+    seq = torch.tensor(seqs, dtype=torch.int32, device=dev)
+    ql = torch.tensor(qls, dtype=torch.int32, device=dev)
+    cu = torch.cat([torch.zeros(1, dtype=torch.int32, device=dev), ql.cumsum(0).int()])
+    return {
+        "q8": q8,
+        "q_bf16": q8.float().bfloat16(),
+        "kd": kd,
+        "ks": ks,
+        "exact": exact,
+        "e4m3": e4m3,
+        "bt": bt.contiguous(),
+        "cu": cu.contiguous(),
+        "seq": seq,
+        "prefix": (seq - ql).contiguous(),
+        "max_q": max(max(qls), 1),
+        "max_seq": max(seqs),
+        "mb": mb,
+    }
+
+
+def run_nv(c, qdt="e4m3", k_round="e4m3", views=None, out=None):
+    heads, rows = c["q8"].shape[1], c["q8"].shape[0]
+    kd, ks = views or (c["kd"], c["ks"])
+    if out is None:
+        out = prefill_alloc_score(rows, heads, c["mb"], "cuda")
+        out.fill_(SENTINEL)
+    score_prefill_flydsl_nvfp4(
+        c["q_bf16"] if qdt == "bf16" else c["q8"],
+        kd,
+        ks,
+        c["bt"],
+        c["cu"],
+        c["seq"],
+        c["prefix"],
+        c["max_q"],
+        c["max_seq"],
+        1.0 / LOG2E,
+        out=out,
+        k_round=k_round,
+    )
+    return out.reshape(heads, rows, c["mb"])
+
+
+def _with_m32(m32):
+    """Force the 32x32x64 (1) or 16x16x128 (0) instruction shape; None keeps the selector."""
+    import aiter.ops.flydsl.kernels.minimax_m3_index_score_prefill as mod
+
+    class _Patch:
+        def __enter__(self):
+            self.orig = mod.geometry
+            if m32 is not None:
+                # the 32-wide shape has no DMA staging (4 waves, 16-wide only)
+                mod.geometry = lambda *a, **k: {
+                    **self.orig(*a, **k),
+                    "m32": m32,
+                    **({"dma": 0} if m32 else {}),
+                }
+
+        def __exit__(self, *exc):
+            mod.geometry = self.orig
+
+    return _Patch()
+
+
+def _with_xwide(ppw=None):
+    """Force the 512-row tile (and optionally the pages-per-wave) for e4m3, whatever the
+    shape: its selection thresholds keep it off the small shapes the tests use."""
+    import aiter.ops.flydsl.kernels.minimax_m3_index_score_prefill as mod
+
+    class _Patch:
+        def __enter__(self):
+            self.saved = (
+                mod._XWIDE_MIN_BLOCKS,
+                mod._XWIDE_MIN_TILES,
+                mod._XWIDE_PPW4_MIN_CHUNK,
+            )
+            mod._XWIDE_MIN_BLOCKS = mod._XWIDE_MIN_TILES = mod._XWIDE_PPW4_MIN_CHUNK = 0
+            mod._use_xwide.cache_clear()
+            self.orig = mod.geometry
+            if ppw is not None:
+                mod.geometry = lambda *a, **k: {
+                    **self.orig(*a, **k),
+                    "pages_per_wave": ppw,
+                }
+
+        def __exit__(self, *exc):
+            mod.geometry = self.orig
+            mod._XWIDE_MIN_BLOCKS, mod._XWIDE_MIN_TILES, mod._XWIDE_PPW4_MIN_CHUNK = (
+                self.saved
+            )
+            mod._use_xwide.cache_clear()
+
+    return _Patch()
+
+
+def nv_ref_of(c, k_round):
+    return c["e4m3"] if k_round == "e4m3" else c["exact"]
+
+
+def check_prefill_nvfp4_bit_exact(qls, seqs, heads, qdt, k_round, m32=None):
+    """Exact-sum data against the fp32 oracle, bit for bit, on either instruction shape.
+    Dead slots (no visible token) may stay unwritten or be -inf, never a score; live ones must all be written.
+    """
+    c = nv_case(qls, seqs, heads, exact_sum=True)
+    ref = nv_oracle(c, nv_ref_of(c, k_round))
+    with _with_m32(m32):
+        try:
+            got = run_nv(c, qdt, k_round)
+        except ValueError as e:
+            if m32 == 1 and "m32" in str(e):
+                return  # this geometry has no 32-wide shape
+            raise
+    live = torch.isfinite(ref)
+    check_scores(got, ref, live, f"q{qls[:3]} seq{seqs[:3]} H{heads}")
+    dead = got[~live]
+    assert bool(
+        ((dead == SENTINEL) | torch.isneginf(dead)).all()
+    ), "a dead slot got a score"
+
+
+def check_prefill_nvfp4_matches_aiter(shape, qdt):
+    """Random data against aiter's HIP scorer on the same e4m3 values, fp8 cache. Equal
+    to a few fp32 ulps, not the bit: the fp8 MFMA sums differently depending on which
+    k elements one instruction holds, and this kernel uses vLLM's grouping."""
+    c = make_prefill_case(*shape)
+    kd, ks, _, e4m3 = nv_cache_of(c["cache"])
+    c = dict(c, cache=e4m3.to(dtypes.fp8))
+    ref, live = aiter_scores(c)
+    cn = dict(c, kd=kd, ks=ks)
+    got = run_nv(cn, qdt)
+    unwritten = int((live & (got == SENTINEL)).sum())
+    assert unwritten == 0, f"{shape}: {unwritten} live slots left unwritten"
+    err = checkAllclose(
+        ref[live].float(), got[live].float(), rtol=1e-6, atol=0, msg=f"{shape}: "
+    )
+    assert err == 0, f"{shape}: mismatch fraction {err} against aiter"
+
+
+def prefill_tail_cases():
+    """(q_lens, seq_lens): cutoffs on and around page / tile boundaries, one-row and
+    one-token requests, a prefix-only continuation, a trailing empty request, chunked
+    prefill on a long context."""
+    return [
+        ([1], [1]),
+        ([1], [127]),
+        ([1], [128]),
+        ([1], [129]),
+        ([2, 1, 3], [128, 129, 257]),
+        ([127, 128, 129], [256, 257, 255]),
+        ([64, 64, 64, 64], [127, 128, 129, 255]),
+        ([100, 1, 300, 17], [100, 2000, 301, 4096]),
+        ([128], [128]),
+        ([129], [129]),
+        ([300], [300]),
+        ([1000], [1001]),
+        ([256, 256], [384, 640]),
+        ([16, 16, 16], [16 + 112, 16 + 128, 16 + 129]),
+        ([512], [20000]),
+        ([5, 0, 7], [900, 900, 1500]),
+        ([4, 0], [300, 300]),
+    ]
+
+
+def check_prefill_nvfp4_tails(qls, seqs, heads, qdt, m32=None):
+    check_prefill_nvfp4_bit_exact(qls, seqs, heads, qdt, "e4m3", m32)
+
+
+def check_prefill_nvfp4_xwide(qls, seqs, heads, qdt, ppw):
+    """e4m3 arm on the 512-row tile, exact-sum data, bit for bit against the oracle."""
+    with _with_xwide(ppw):
+        check_prefill_nvfp4_bit_exact(qls, seqs, heads, qdt, "e4m3")
+
+
+def check_prefill_nvfp4_exact_wide(qls, seqs, heads, qdt, ppw):
+    """The exact arm on the 256-row, 4-wave tile (the one big shapes get: lane-spread
+    score stores, staged 64 B pieces when ppw is 4), forced on whatever the shape."""
+    import aiter.ops.flydsl.kernels.minimax_m3_index_score_prefill as mod
+
+    orig = mod.exact_geometry
+    mod.exact_geometry = lambda *a, **k: {
+        **orig(*a, **k),
+        "tile_q": 256,
+        "pages_per_wave": ppw,
+    }
+    try:
+        check_prefill_nvfp4_bit_exact(qls, seqs, heads, qdt, "exact")
+    finally:
+        mod.exact_geometry = orig
+
+
+def check_prefill_nvfp4_exact_tails(qls, seqs, heads, qdt):
+    """The exact arm (bf16 MFMA, K = e2m1 * scale unrounded) on the same lengths."""
+    check_prefill_nvfp4_bit_exact(qls, seqs, heads, qdt, "exact")
+
+
+def check_prefill_nvfp4_exact_every_shape(shape, qdt):
+    batch, q_len, ctx_len = shape
+    check_prefill_nvfp4_bit_exact([q_len] * batch, [ctx_len] * batch, 1, qdt, "exact")
+
+
+def check_prefill_nvfp4_exact_random(shape, qdt):
+    """Random data against the fp32 oracle on the UNROUNDED K. The accumulation order
+    is the MFMA's, so allow a few fp32 ulps -- and require the e4m3 arm to differ (it
+    scores rounded K), so a kernel that silently fell back to it fails here."""
+    c = make_prefill_case(*shape)
+    kd, ks, exact, e4m3 = nv_cache_of(c["cache"])
+    cn = dict(c, kd=kd, ks=ks, exact=exact, e4m3=e4m3)
+    ref = nv_oracle(cn, exact)
+    live = torch.isfinite(ref)
+    got = run_nv(cn, qdt, "exact")
+    assert int((live & (got == SENTINEL)).sum()) == 0, "live slots left unwritten"
+    rel = (got[live] - ref[live]).abs() / ref[live].abs().clamp(min=1e-2)
+    assert float(rel.max()) <= 4e-6, f"{shape}: max rel error {float(rel.max())}"
+    rounded = run_nv(cn, qdt, "e4m3")
+    assert not torch.equal(got[live], rounded[live]), "exact scored like e4m3"
+
+
+def check_prefill_nvfp4_every_geometry(shape, qdt, m32):
+    batch, q_len, ctx = shape
+    check_prefill_nvfp4_bit_exact([q_len] * batch, [ctx] * batch, 1, qdt, "e4m3", m32)
+
+
+def check_prefill_nvfp4_single_region_views_and_typed_scale():
+    """Both views of one [pages, 9216] allocation (8192 B of e2m1, then 1024 B of
+    scale per page) score like two separate tensors."""
+    c = nv_case([300, 200], [1000, 700], 2)
+    pages = c["kd"].shape[0]
+    buf = torch.empty((pages, P * 64 + P * 8), dtype=torch.uint8, device="cuda")
+    buf[:, : P * 64] = c["kd"].reshape(pages, -1)
+    buf[:, P * 64 :] = c["ks"].reshape(pages, -1)
+    kd = torch.as_strided(buf, (pages, P, 64), (buf.stride(0), 64, 1))
+    ks = torch.as_strided(buf, (pages, P, 8), (buf.stride(0), 8, 1), P * 64)
+    check_equal(run_nv(c, views=(kd, ks)), run_nv(c), "single region")
+
+
+def check_prefill_nvfp4_default_k_round_is_e4m3():
+    """Leaving `k_round` out scores like `k_round="e4m3"` (the vLLM-identical numerics)."""
+    c = nv_case([300, 200], [1000, 700], 2, exact_sum=True)
+    heads, rows = c["q8"].shape[1], c["q8"].shape[0]
+    out = prefill_alloc_score(rows, heads, c["mb"], "cuda")
+    out.fill_(SENTINEL)
+    score_prefill_flydsl_nvfp4(
+        c["q8"],
+        c["kd"],
+        c["ks"],
+        c["bt"],
+        c["cu"],
+        c["seq"],
+        c["prefix"],
+        c["max_q"],
+        c["max_seq"],
+        1.0 / LOG2E,
+        out=out,
+    )
+    expect = run_nv(c, "e4m3", "e4m3")
+    assert torch.equal(
+        out.reshape(expect.shape), expect
+    ), "the default k_round is not e4m3"
+
+
+def check_prefill_nvfp4_modes_do_not_share_a_compiled_kernel():
+    """MXFP4 and NVFP4 prefill in one process, interleaved, each reproducing its
+    own first answer."""
+    c, kd4, ks4 = fp4_prefill_case(1, 300, 1000)
+    cn = nv_case([300], [1000])
+    first = (run_fp4(c, kd4, ks4, "e4m3"), run_nv(cn))
+    again = (run_nv(cn), run_fp4(c, kd4, ks4, "e4m3"))
+    check_equal(again[1], first[0], "mxfp4 after nvfp4")
+    check_equal(again[0], first[1], "nvfp4 after mxfp4")
+
+
+def check_prefill_nvfp4_rejections():
+    c = nv_case([64], [300])
+
+    def bad(what, fn, match):
+        try:
+            fn()
+        except ValueError as e:
+            assert match in str(e), f"{what}: wrong message: {e}"
+            return
+        raise AssertionError(f"{what}: no ValueError")
+
+    kd4, ks4 = c["kd"], c["ks"][:, :, :4]  # an MXFP4-shaped scale view
+    bad("mx scale", lambda: run_nv(c, views=(kd4, ks4)), "[pages, 128, 8]")
+    bad("k_round", lambda: run_nv(c, k_round="bf16"), "k_round")
+    bad(
+        "scale dtype",
+        lambda: run_nv(c, views=(c["kd"], c["ks"].view(torch.int8))),
+        "k_scale",
+    )
+    bad(
+        "sm_scale",
+        lambda: score_prefill_flydsl_nvfp4(
+            c["q8"],
+            c["kd"],
+            c["ks"],
+            c["bt"],
+            c["cu"],
+            c["seq"],
+            c["prefix"],
+            64,
+            300,
+            -1.0,
+        ),
+        "sm_scale",
+    )
+
+
 def _prefill_bytes(batch, q_len, ctx_len, k_row_bytes, q_elem_bytes):
     pairs, pages = _prefill_work(batch, q_len, ctx_len)
     return (
@@ -542,7 +981,7 @@ def _prefill_bytes(batch, q_len, ctx_len, k_row_bytes, q_elem_bytes):
 def test_prefill_fp4(batch, q_len, ctx_len):
     c, kd, ks = fp4_prefill_case(batch, q_len, ctx_len)
     ref, live = aiter_scores(c)
-    ret = {"gfx": get_gfx()}
+    ret = {"gfx": get_gfx_runtime()}
     fp4_row = D // 2 + D // 32  # e2m1 data + e8m0 scales per token
     # Every candidate scores into its own preallocated, sentinel-filled buffer, so the
     # timed region is the scorer alone (no allocation or fill launch).
@@ -593,6 +1032,41 @@ def test_prefill_fp4(batch, q_len, ctx_len):
             _prefill_bytes(batch, q_len, ctx_len, k_row, q_elem) / us / 1e6
         )
         ret[f"{name} err"] = err
+    return ret
+
+
+@benchmark()
+def test_prefill_nvfp4(batch, q_len, ctx_len):
+    # exact_sum data: every partial sum is exact in fp32, so the torch oracle and the
+    # kernel agree to the bit whatever the accumulation order, and err must be 0.
+    c = nv_case([q_len] * batch, [ctx_len] * batch, exact_sum=True)
+    ret = {"gfx": get_gfx_runtime()}
+    heads, rows = c["q8"].shape[1], c["q8"].shape[0]
+    pairs, _ = _prefill_work(batch, q_len, ctx_len)
+    flops = 2 * pairs * P * D
+    k_row = D // 2 + D // 16  # e2m1 data + one e4m3 scale per 16 elements per token
+    nbytes = _prefill_bytes(batch, q_len, ctx_len, k_row, 1)  # Q is e4m3
+    for k_round in ("e4m3", "exact"):
+        ref = nv_oracle(c, nv_ref_of(c, k_round))  # reference only: not timed
+        live = torch.isfinite(ref)
+        # Preallocated, sentinel-filled score buffer: the timed region is the scorer
+        # alone, and an unwritten live slot fails the comparison.
+        out = prefill_alloc_score(rows, heads, c["mb"], "cuda")
+        out.fill_(SENTINEL)
+        got, us = run_perftest(
+            lambda out=out, k_round=k_round: run_nv(c, "e4m3", k_round, out=out),
+            num_iters=10,
+            num_rotate_args=1,
+        )
+        assert not bool((live & (got == SENTINEL)).any()), f"{k_round}: unwritten slot"
+        err = checkAllclose(
+            ref[live], got[live], rtol=0, atol=0, msg=f"nvfp4_{k_round}: prefill"
+        )
+        assert err == 0, f"nvfp4_{k_round}: mismatch fraction {err} against the oracle"
+        ret[f"nvfp4_{k_round} us"] = us
+        ret[f"nvfp4_{k_round} TFLOPS"] = flops / us / 1e6
+        ret[f"nvfp4_{k_round} TB/s"] = nbytes / us / 1e6
+        ret[f"nvfp4_{k_round} err"] = err
     return ret
 
 
@@ -655,13 +1129,102 @@ def build_cases():
         )
     )
     cases.append(("rejections", check_prefill_rejections, ()))
+    # NVFP4, a minimal matrix (the full regression matrix lives outside this file):
+    # exact-sum data to the bit against the torch oracle for both k_round values, on
+    # tile and page boundaries, ragged and empty requests, H = 1/4, both Q dtypes, the
+    # 16- and 32-wide MFMA, the 512-row DMA tile and the 8-wave tile; random data
+    # against aiter's fp8 scorer.
+    tails = prefill_tail_cases()
+    short = [
+        tails[3],
+        tails[5],
+        tails[15],
+    ]  # a page tail, a tile tail, an empty request
+    wide = [([513], [513]), ([1100, 1, 600], [5000, 4099, 2500])]  # 512-row tail tiles
+    for (qls, seqs), heads, qdt, m32 in itertools.product(short, (1, 4), QDTS, (0, 1)):
+        name = f"q{'_'.join(map(str, qls))}_seq{'_'.join(map(str, seqs))}_H{heads}_{qdt}_m32{m32}"
+        cases.append(
+            (
+                f"nvfp4_tails_{name}",
+                check_prefill_nvfp4_tails,
+                (qls, seqs, heads, qdt, m32),
+            )
+        )
+    for (qls, seqs), heads, qdt, ppw in itertools.product(
+        wide, (1, 4), QDTS, (None, 4)
+    ):
+        name = f"q{'_'.join(map(str, qls))}_seq{'_'.join(map(str, seqs))}_H{heads}_{qdt}_ppw{ppw}"
+        cases.append(
+            (
+                f"nvfp4_xwide_{name}",
+                check_prefill_nvfp4_xwide,
+                (qls, seqs, heads, qdt, ppw),
+            )
+        )
+        cases.append(
+            (
+                f"nvfp4_exact_wide_{name}",
+                check_prefill_nvfp4_exact_wide,
+                (qls, seqs, heads, qdt, ppw or 2),
+            )
+        )
+    for (qls, seqs), heads, qdt in itertools.product(short, (1, 4), QDTS):
+        name = (
+            f"q{'_'.join(map(str, qls))}_seq{'_'.join(map(str, seqs))}_H{heads}_{qdt}"
+        )
+        cases.append(
+            (
+                f"nvfp4_exact_tails_{name}",
+                check_prefill_nvfp4_exact_tails,
+                (qls, seqs, heads, qdt),
+            )
+        )
+    for shape in (GEOM_SHAPES[2], GEOM_SHAPES[5]):  # a 128-row and the 8-wave tile
+        name = f"b{shape[0]}_q{shape[1]}_ctx{shape[2]}"
+        cases.append(
+            (
+                f"nvfp4_every_geometry_{name}",
+                check_prefill_nvfp4_every_geometry,
+                (shape, "e4m3", None),
+            )
+        )
+        cases.append(
+            (
+                f"nvfp4_exact_every_shape_{name}",
+                check_prefill_nvfp4_exact_every_shape,
+                (shape, "e4m3"),
+            )
+        )
+    for shape, qdt in itertools.product([SHAPES[2], SHAPES[4], SHAPES[6]], QDTS):
+        name = f"b{shape[0]}_q{shape[1]}_ctx{shape[2]}_{qdt}"
+        cases.append(
+            (
+                f"nvfp4_matches_aiter_{name}",
+                check_prefill_nvfp4_matches_aiter,
+                (shape, qdt),
+            )
+        )
+        cases.append(
+            (
+                f"nvfp4_exact_random_{name}",
+                check_prefill_nvfp4_exact_random,
+                (shape, qdt),
+            )
+        )
+    for fn in (
+        check_prefill_nvfp4_single_region_views_and_typed_scale,
+        check_prefill_nvfp4_default_k_round_is_e4m3,
+        check_prefill_nvfp4_modes_do_not_share_a_compiled_kernel,
+        check_prefill_nvfp4_rejections,
+    ):
+        cases.append((fn.__name__.removeprefix("check_prefill_"), fn, ()))
     return cases
 
 
 def parse_args(argv=None):
     ap = argparse.ArgumentParser(
         formatter_class=argparse.RawTextHelpFormatter,
-        description="MXFP4 prefill index score checks + sweep",
+        description="MXFP4 and NVFP4 prefill index score checks + sweep",
     )
     ap.add_argument(
         "--case",
@@ -678,10 +1241,10 @@ def parse_args(argv=None):
 
 def main(argv=None):
     args = parse_args(argv)
-    if not torch.cuda.is_available() or get_gfx() not in SUPPORTED_GFX:
+    if not torch.cuda.is_available() or get_gfx_runtime() not in SUPPORTED_GFX:
         aiter.logger.warning("requires %s; skipping", SUPPORTED_GFX)
         return 0
-    aiter.logger.info("mxfp4 prefill: running correctness checks...")
+    aiter.logger.info("mxfp4 and nvfp4 prefill: running correctness checks...")
     rows = []
     for name, check, cargs in build_cases():
         if args.case is not None and not any(k in name for k in args.case):
@@ -713,6 +1276,16 @@ def main(argv=None):
     aiter.logger.info(
         "mxfp4 prefill summary (markdown):\n%s",
         pd.DataFrame(perf).to_markdown(index=False),
+    )
+    # A second table, not a merged one: the benchmark signatures differ in columns.
+    nv = [
+        test_prefill_nvfp4(b, q, c)
+        for b, q, c in itertools.product(args.batch, args.q_len, args.ctx_len)
+        if q <= c
+    ]
+    aiter.logger.info(
+        "nvfp4 prefill summary (markdown):\n%s",
+        pd.DataFrame(nv).to_markdown(index=False),
     )
     return 0
 
