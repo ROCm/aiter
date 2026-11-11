@@ -371,6 +371,10 @@ def dispose_gfx1250(_fa: int) -> None: ...
 def meta_size_gfx1250(world_size: int = 8) -> int: ...
 
 
+@compile_ops(GFX1250_MD_NAME, fc_name="ll_ar_max_bytes", develop=True)
+def ll_ar_max_bytes_gfx1250(world_size: int) -> int: ...
+
+
 @compile_ops(GFX1250_MD_NAME, fc_name="register_input_buffer", develop=True)
 def register_input_buffer_gfx1250(
     _fa: int, self_ptr: int, all_ptrs: list[int]

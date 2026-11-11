@@ -269,7 +269,7 @@ class CudaCommunicator(DeviceCommunicatorBase):
         if (
             ca_comm is not None
             and not ca_comm.disabled
-            and ca_comm.should_custom_ar(input_, prefill_support)
+            and ca_comm.should_custom_plain_ar(input_, prefill_support)
         ):
             out = ca_comm.custom_all_reduce(input_, use_new, ca_fp8_quant)
             assert out is not None

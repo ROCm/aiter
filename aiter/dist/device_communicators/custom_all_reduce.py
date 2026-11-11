@@ -19,6 +19,7 @@ import ctypes
 import functools
 import os
 import pickle
+from collections.abc import Callable
 from contextlib import contextmanager
 from typing import Any, ClassVar
 
@@ -217,6 +218,25 @@ _IPC_MIN_ROCM = (7, 14)
 # custom_all_reduce_gfx1250.cuh).
 _GFX1250_LL_MAX_BYTES = 4 * 1024 * 1024
 
+# gfx1250 plain all-reduce cutoff (bytes) per world size while
+# AITER_CUSTOM_AR_MAX_SIZE is unset: CudaCommunicator.all_reduce runs the custom
+# kernels up to it and RCCL above it. It is about where RCCL overtakes the LL
+# kernels, MI455X, bf16 in a CUDA graph, us an all-reduce:
+# - TP2, one tray: the one-shot is level with RCCL at 4.19 MB (16.0 vs 15.3);
+#   past 4 MiB the pull takes 26.6 at 4.59 MB, RCCL 21.9.
+# - TP4, one tray: the two-shot leads at 4.59 MB (22.2 vs 24.1), RCCL from
+#   5.73 MB (25.8 vs 26.2).
+# - TP8, two trays: the two-shot leads up to 8.39 MB (39.2 vs 43.7); past
+#   8 MiB the pull takes 405 at 14.68 MB, RCCL 55.
+# It never exceeds what the LL kernels take (ll_ar_max_bytes). Other world
+# sizes, and the fused AR + RMSNorm paths, keep _car_max_size. See
+# CustomAllreduce.should_custom_plain_ar.
+_GFX1250_PLAIN_AR_MAX_SIZE = {
+    2: 4 * 1024 * 1024,
+    4: 4 * 1024 * 1024,
+    8: 8 * 1024 * 1024,
+}
+
 # Max input bytes custom_all_reduce_residual fuses, per (arch, TP); None = no
 # limit. Larger inputs and unlisted pairs fall back to all-reduce + add.
 # Timed end to end on CUDA graphs on MI300X (gfx942) and MI355X (gfx950).
@@ -322,6 +342,30 @@ def _resolve_car_max_size(pool_size: int) -> int:
         _CAR_MAX_SIZE_ENV,
     )
     return v
+
+
+def _resolve_plain_ar_max_size(
+    is_gfx1250: bool,
+    world_size: int,
+    car_max_size: int,
+    ll_ar_max_bytes: Callable[[int], int] | None,
+) -> int:
+    """Cutoff (bytes) for plain all-reduce, i.e. CudaCommunicator.all_reduce.
+
+    ``car_max_size``, except on gfx1250 at a world size listed in
+    _GFX1250_PLAIN_AR_MAX_SIZE with AITER_CUSTOM_AR_MAX_SIZE unset. There it is
+    the listed size, capped at ``ll_ar_max_bytes(world_size)``, the largest
+    input the LL kernels take. Nothing here depends on the rank, so every rank
+    takes the same path.
+    """
+    default = _GFX1250_PLAIN_AR_MAX_SIZE.get(world_size)
+    if (
+        not is_gfx1250
+        or os.environ.get(_CAR_MAX_SIZE_ENV, "").strip()
+        or default is None
+    ):
+        return car_max_size
+    return min(car_max_size, default, ll_ar_max_bytes(world_size))
 
 
 def _resolve_car_min_size() -> int:
@@ -1249,6 +1293,12 @@ class CustomAllreduce:
         # custom kernels; larger ones fall back to RCCL. Overridable via
         # AITER_CUSTOM_AR_MAX_SIZE (capped at the registered pool size == max_size).
         self._car_max_size = _resolve_car_max_size(max_size)
+        self._plain_ar_max_size = _resolve_plain_ar_max_size(
+            self._is_gfx1250,
+            world_size,
+            self._car_max_size,
+            ops.ll_ar_max_bytes_gfx1250 if self._is_gfx1250 else None,
+        )
         # Custom-AR lower size bound (bytes): inputs at or below this fall back
         # to RCCL. Default 0 (no lower bound). Overridable via
         # AITER_CUSTOM_AR_MIN_SIZE. Custom AR runs only in (min, max].
@@ -1780,6 +1830,20 @@ class CustomAllreduce:
     def should_custom_ar(self, inp: torch.Tensor, prefill_support: bool = False):
         return self._fits_custom_ar_size(inp, prefill_support) and is_weak_contiguous(
             inp
+        )
+
+    def should_custom_plain_ar(
+        self, inp: torch.Tensor, prefill_support: bool = False
+    ) -> bool:
+        """should_custom_ar for plain all-reduce (CudaCommunicator.all_reduce).
+
+        On gfx1250 with AITER_CUSTOM_AR_MAX_SIZE unset, inputs above the
+        measured RCCL crossover go to RCCL (_resolve_plain_ar_max_size). The
+        fused paths keep should_custom_ar.
+        """
+        return (
+            self.should_custom_ar(inp, prefill_support)
+            and inp.numel() * inp.element_size() <= self._plain_ar_max_size
         )
 
     def can_fuse_ar_rms(
