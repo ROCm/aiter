@@ -468,11 +468,7 @@ def build_flash_attn_dualwave_swp_fp8_module(
             t_main = (t_main < t_full).select(t_main, t_full)
         t_main = (t_main > t0).select(t_main, t0)
 
-        fast_results = init_args
-        for j, loop_args in range(t0, t_main, fx.Int64(1), init=init_args):
-            j = fx.Int64(j)
-            buf = fx.Int32(j) % fx.Int32(2)
-            next_buf = fx.Int32(1) - buf
+        def _fast_tile(j, loop_args, buf, next_buf):
             _tile_top()
             # pf <= t_main < t_end: a real tile, so no prefetch branch. pf < t_main is full; pf == t_main may be
             # partial (or causal-masked) only in its K tail, which the general loop masks, so K skips the tail sentinel.
@@ -487,7 +483,25 @@ def build_flash_attn_dualwave_swp_fp8_module(
             # Stands in for the mask branch: the max/exp would otherwise interleave into QK and spill Q.
             rocdl.sched_barrier(0)
             _bn64_prio(0)
-            fast_results = yield _tile_softmax_pv(j, loop_args, buf, v_s, False)
+            return _tile_softmax_pv(j, loop_args, buf, v_s, False)
+
+        # Unrolled by two over a unit-step pair counter: t0 is 0 (bn64 has no split-K), so pair halves read the
+        # fixed LDS buffers 0 and 1. An odd leftover tile runs the dynamic body once.
+        n_pairs = fx.Int64(fx.arith.shrui(fx.Int32(t_main), fx.Int32(1)))
+        pair_results = init_args
+        for p, loop_args in range(t0, n_pairs, fx.Int64(1), init=init_args):
+            j = fx.Int64(p) * fx.Int64(2)
+            args = _fast_tile(j, list(loop_args), 0, 1)
+            args = _fast_tile(j + fx.Int64(1), args, 1, 0)
+            pair_results = yield args
+        init_args = list(pair_results)
+        fast_results = init_args
+        for j, loop_args in range(
+            n_pairs * fx.Int64(2), t_main, fx.Int64(1), init=init_args
+        ):
+            j = fx.Int64(j)
+            buf = fx.Int32(j) % fx.Int32(2)
+            fast_results = yield _fast_tile(j, loop_args, buf, fx.Int32(1) - buf)
 
         init_args = list(fast_results)
         loop_results = init_args
