@@ -66,6 +66,10 @@ _LAZY_IMPORTS = {
         "flydsl_flash_attn_fp8_supported",
     ),
     "flydsl_flash_attn_func": (".fmha_kernels", "flydsl_flash_attn_func"),
+    "flydsl_flash_attn_paged_prefill_func": (
+        ".fmha_kernels",
+        "flydsl_flash_attn_paged_prefill_func",
+    ),
     "flydsl_fp8_quant": (".fp8_quant", "flydsl_fp8_quant"),
     "flydsl_fp8_mqa_logits": (
         ".fp8_mqa_logits_kernels",
@@ -212,6 +216,7 @@ __all__ = [
     "flydsl_flash_attn_fp8_func",
     "flydsl_flash_attn_fp8_supported",
     "flydsl_flash_attn_func",
+    "flydsl_flash_attn_paged_prefill_func",
     "flydsl_fp8_mqa_logits",
     "flydsl_fp8_paged_mqa_logits",
     "flydsl_fp8_paged_mqa_logits_gfx950",

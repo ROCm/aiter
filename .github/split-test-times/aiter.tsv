@@ -49,6 +49,7 @@ op_tests/test_flydsl_moe_gfx942.py	237
 op_tests/test_flydsl_pa_decode.py	272
 op_tests/test_flydsl_pa_mqa_logits_fp4.py	6
 op_tests/test_flydsl_pa_mqa_logits_fp4_prefill.py	6
+op_tests/test_flydsl_paged_fmha.py	240
 op_tests/test_flydsl_qk_norm_rope_quant.py	96
 op_tests/test_flydsl_qsa_paged_mqa_logits.py	8
 op_tests/test_flydsl_qsa_sparse_decode.py	10
