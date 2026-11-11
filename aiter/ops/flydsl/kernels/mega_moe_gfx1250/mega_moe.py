@@ -8,6 +8,7 @@ The rest of the package: ``recipe`` (what runs, at what shape), ``transport``
 (the dispatch and combine ``stages`` over one ``arena``) and ``mori_caps``.
 """
 
+import dataclasses
 import os
 import warnings
 
@@ -15,6 +16,7 @@ import torch
 
 from aiter import ActivationType, QuantType, dtypes
 from aiter.fused_moe import fused_moe
+from aiter.jit.utils.build_targets import is_gfx1250_family
 from aiter.jit.utils.chip_info import get_gfx
 from aiter.ops.flydsl.moe_common import GateMode
 
@@ -39,6 +41,7 @@ from .recipe import (
     _stage_classes,
     read_dispatch_wire_env,
 )
+from .s1f_ctl import read_s1f_mode
 from .stages.base import Routing, _ComputeTarget, _DispatchBatch
 from .stages.dispatch_compact import _MAX_COMPACT_TILE_M, _CompactDispatch
 from .transport import _arena_layout, _capabilities_for, _EpDispatcher
@@ -57,8 +60,10 @@ __all__ = [
 
 def _require_gfx1250():
     gfx = get_gfx()
-    if gfx != "gfx1250":
-        raise RuntimeError(f"MegaMoEGfx1250 requires gfx1250, got {gfx}")
+    # gfx1250-strict (MI450 A0) shares the gfx1250 MegaMoE kernel family. Accept
+    # the family here; exact identity is enforced for build/cache/.co elsewhere.
+    if not is_gfx1250_family(gfx):
+        raise RuntimeError(f"MegaMoEGfx1250 requires the gfx1250 family, got {gfx}")
 
 
 def _alias(owner: str, name: str) -> property:
@@ -253,7 +258,9 @@ class MegaMoEGfx1250:
                 continue
             dispatch, combine = _stage_classes(recipe)
             dispatch_regions = (
-                _CompactDispatch.regions_for_tile(config, _MAX_COMPACT_TILE_M)
+                _CompactDispatch.regions_for_tile(
+                    config, _MAX_COMPACT_TILE_M, s1f=read_s1f_mode()
+                )
                 if stage1_fused
                 else dispatch.regions(config, caps)
             )
@@ -308,6 +315,8 @@ class MegaMoEGfx1250:
         combine_quant: str | None = None,
         combine_wire: str | None = None,
         recv_counter_is_zero: bool = False,
+        shared_add: torch.Tensor | None = None,
+        shared_ready: torch.cuda.Event | None = None,
     ) -> torch.Tensor:
         """Run one MoE layer: dispatch, its expert GEMM, then combine.
 
@@ -335,6 +344,12 @@ class MegaMoEGfx1250:
 
         ``recv_counter_is_zero`` is accepted and ignored: the dispatch
         overwrites the received count, so there is no reset to skip.
+
+        ``shared_add`` (bf16 ``[tokens, hidden]``, e.g. the shared expert's
+        output) is added to the result by the combine itself, so the caller
+        needs no separate add. ``shared_ready``, when given, is waited on by
+        the current stream just before the combine: its producer may run on a
+        side stream beside the dispatch and the expert GEMMs.
         """
         if combine_wire is not None:
             if combine_quant is not None:
@@ -350,6 +365,23 @@ class MegaMoEGfx1250:
             hidden_states, topk_weights, topk_ids, w1, w2, w1_scale, w2_scale, a1_scale
         )
         ep = self._ep
+        step_kw = {}
+        s1f = False
+        hook = None
+        disp = ep._dispatch
+        if isinstance(disp, _CompactDispatch):
+            # The tile is fixed before the stage-1 verdict, which is per tile.
+            disp.prepare_step(recv_token_bound)
+            s1f = disp.fusion.eligible(bias1, bias2)
+            if s1f:
+                # No in-forward plan prefetch under S1F: without the dispatch
+                # tail, the next layer's plan must come after this rank's
+                # reduce. The next forward launches its plan in stream order.
+                next_topk_ids = None
+                hook = disp.fusion.gemm1
+            elif disp.fusion.should_probe():
+                hook = disp.fusion.probe
+            step_kw = {"begin_step": False, "s1f": s1f}
         batch = ep.dispatch(
             hidden_states,
             topk_weights,
@@ -357,8 +389,17 @@ class MegaMoEGfx1250:
             recv_token_bound=recv_token_bound,
             next_topk_ids=next_topk_ids,
             next_recv_token_bound=next_recv_token_bound,
+            **step_kw,
         )
         target = ep.prepare(batch, quant_bits)
+        if hook is not None and target.scatter is not None:
+            # The grouped GEMM reads the hook off dispatch_context (the same
+            # scatter object on the compact path), so swap both: replacing
+            # target.scatter alone leaves the probe / stage-1 hook unreachable.
+            hooked = dataclasses.replace(target.scatter, stage1_gemm1=hook)
+            if target.dispatch_context is target.scatter:
+                target.dispatch_context = hooked
+            target.scatter = hooked
         expert_out = self._compute(
             batch,
             target,
@@ -371,7 +412,11 @@ class MegaMoEGfx1250:
             a1_scale=a1_scale,
             a2_scale=a2_scale,
         )
-        return ep.combine(batch.routing, quant_bits, expert_out)
+        if isinstance(disp, _CompactDispatch):
+            disp.fusion.finish(s1f)
+        if shared_ready is not None:
+            torch.cuda.current_stream().wait_event(shared_ready)
+        return ep.combine(batch.routing, quant_bits, expert_out, shared_add=shared_add)
 
     __call__ = forward
 
