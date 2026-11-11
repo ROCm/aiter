@@ -1206,7 +1206,7 @@ def cmdGenFunc_mha_varlen_fwd(
         dropout_zero = dropout_p == 0
         skip_zero = min_seqlen_q == 0
         has_qscale = q_descale is None or k_descale is None or v_descale is None
-        suffix, filter_fwd = compose_mha_fwd_variant_suffix_and_filter(
+        suffix, _ = compose_mha_fwd_variant_suffix_and_filter(
             dtype=dtype_token,
             logits_positive=logits_positive,
             has_bias=has_bias,
@@ -1234,10 +1234,10 @@ def cmdGenFunc_mha_varlen_fwd(
             filter_fwd_splitkv2 += "_bf16*"
         if 0.0 < logits_soft_cap:
             md_name += "_logits"
-            filter_fwd += "_logits*"
+            filter_fwd_splitkv2 += "_logits*"
         else:
             md_name += "_nlogits"
-            filter_fwd += "_nlogits*"
+            filter_fwd_splitkv2 += "_nlogits*"
         if bias is not None:
             md_name += "_bias"
             filter_fwd_splitkv2 += "_bias*"
@@ -1255,12 +1255,8 @@ def cmdGenFunc_mha_varlen_fwd(
             filter_fwd_splitkv2 += "_m*"
         if return_softmax_lse:
             md_name += "_lse"
-            filter_fwd_splitkv1 += "_lse*"
-            filter_fwd_splitkv2 += "_lse*"
         else:
             md_name += "_nlse"
-            filter_fwd_splitkv1 += "_nlse*"
-            filter_fwd_splitkv2 += "_nlse*"
         md_name += "_pagedkv"
         filter_fwd_splitkv2 += "_pagedkv*"
         filter_fwd_splitkv = f"{filter_fwd_splitkv1}@{filter_fwd_splitkv2}"

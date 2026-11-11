@@ -1466,6 +1466,79 @@ def test_fmha_fwd_bf16_opus_d192_v128_group(
 
 
 # ---------------------------------------------------------------------------
+# Paged-KV varlen forward (block_table): on gfx942 / gfx950 bf16 is taken by the
+# fmha_v3 ASM path, so fp16 is the case that exercises the CK paged-KV split-KV
+# kernels built by cmdGenFunc_mha_varlen_fwd.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("return_lse", [False, True])
+@pytest.mark.parametrize("causal", [False, True])
+@pytest.mark.parametrize("dtype", [dtypes.fp16, dtypes.bf16])
+def test_flash_attn_varlen_func_paged_kv(dtype, causal, return_lse):
+    if not get_gfx().startswith("gfx9"):
+        pytest.skip("CK paged-KV varlen kernels are generated for gfx9 targets only")
+    torch.manual_seed(0)
+    seqlens_q = [64, 100, 1]
+    seqlens_k = [300, 513, 128]
+    nheads, nheads_k, d, page = 8, 2, 128, 128
+
+    nblk = [(s + page - 1) // page for s in seqlens_k]
+    num_blocks = sum(nblk) + 3
+    k_cache = torch.randn(num_blocks, page, nheads_k, d, device="cuda", dtype=dtype)
+    v_cache = torch.randn(num_blocks, page, nheads_k, d, device="cuda", dtype=dtype)
+    # pages of one sequence are scattered over the pool
+    perm = torch.randperm(num_blocks, device="cuda").to(torch.int32)
+    block_table = torch.zeros(
+        len(seqlens_k), max(nblk), device="cuda", dtype=torch.int32
+    )
+    off = 0
+    for b, n in enumerate(nblk):
+        block_table[b, :n] = perm[off : off + n]
+        off += n
+
+    def _cumsum(lengths):
+        return torch.tensor(
+            [0] + torch.tensor(lengths).cumsum(0).tolist(),
+            dtype=torch.int32,
+            device="cuda",
+        )
+
+    cu_q, cu_k = _cumsum(seqlens_q), _cumsum(seqlens_k)
+    q = torch.randn(sum(seqlens_q), nheads, d, device="cuda", dtype=dtype)
+
+    with torch.no_grad():
+        ret = aiter.flash_attn_varlen_func(
+            q,
+            k_cache,
+            v_cache,
+            cu_q,
+            cu_k,
+            max(seqlens_q),
+            max(seqlens_k),
+            causal=causal,
+            return_lse=return_lse,
+            block_table=block_table,
+        )
+    out = ret[0] if isinstance(ret, (tuple, list)) else ret
+    assert not torch.isnan(out).any()
+
+    for b in range(len(seqlens_q)):
+        ql, qh = int(cu_q[b]), int(cu_q[b + 1])
+        pages = block_table[b, : nblk[b]].long()
+        kg = k_cache[pages].reshape(-1, nheads_k, d)[: seqlens_k[b]].unsqueeze(0)
+        vg = v_cache[pages].reshape(-1, nheads_k, d)[: seqlens_k[b]].unsqueeze(0)
+        qg = q[ql:qh].unsqueeze(0)
+        out_ref, _, _ = attention_ref(qg, kg, vg, causal=causal)
+        out_pt, _, _ = attention_ref(
+            qg, kg, vg, causal=causal, upcast=False, reorder_ops=True
+        )
+        tol = max(2 * (out_pt - out_ref).abs().max().item(), 0.01)
+        diff = (out[ql:qh].unsqueeze(0) - out_ref).abs().max().item()
+        assert diff <= tol, f"seq {b} diff {diff} > tol {tol}"
+
+
+# ---------------------------------------------------------------------------
 # Sink forward dispatch: the fmha_v3_varlen_fwd ASM kernels take no sink
 # arguments, so any call with sink_ptr or sink_size must route to CK
 # (mha_varlen_fwd) instead.
