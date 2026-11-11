@@ -60,6 +60,7 @@ if [[ "$TEST_TYPE" == "aiter" ]]; then
                 "$TEST_DIR/tuning_tests/test_csv_validation.py" \
                 "$TEST_DIR/tuning_tests/test_config_shape_collision.py" \
                 "$TEST_DIR/tuning_tests/test_fast_tuning.py" \
+                "$TEST_DIR/tuning_tests/test_fmoe_tuner_flat_output.py" \
                 "$TEST_DIR/tuning_tests/test_fhmoe_tuner.py" \
                 "$TEST_DIR/tuning_tests/test_mixed_mxfp_tuning.py" \
                 "$TEST_DIR/flydsl_tests/test_gemm2_valid_token_count.py"
