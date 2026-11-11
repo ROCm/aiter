@@ -31,6 +31,7 @@ SHAPES = [
     (5120, 2, 32, [5, 2343, 4096]),
 ]
 STAGE2_KERNEL = "flydsl_moe2_layout_afp4_wfp4_bf16_t128x256x256_scatter_sbm128"
+STAGE2_KERNEL_REDUCE = "flydsl_moe2_layout_afp4_wfp4_bf16_t128x256x256_reduce_sbm128"
 STAGE2_INTER = 768
 
 SKIP = arch_info.get_arch() != "gfx950"
@@ -199,7 +200,7 @@ def _check_stage2(rank, device, tp, failures):
         (experts * hidden * STAGE2_INTER // 32,), 127, dtype=torch.uint8, device=device
     )
 
-    def stage2(scatter_intermediate):
+    def stage2(scatter_intermediate, kernel=STAGE2_KERNEL):
         out = torch.full((tokens, hidden), -1, dtype=torch.int16, device=device)
         out = out.view(torch.bfloat16)
         _flydsl_v2_stage2_wrapper(
@@ -211,7 +212,7 @@ def _check_stage2(rank, device, tp, failures):
             counts,
             out,
             topk,
-            kernelName=STAGE2_KERNEL,
+            kernelName=kernel,
             model_dim=hidden,
             inter_dim=STAGE2_INTER,
             num_experts=experts,
@@ -249,8 +250,20 @@ def _check_stage2(rank, device, tp, failures):
         )
         if _bad(out, ref):
             failures.append(f"rank {rank}: stage 2 + fused op: {_bad(out, ref)} differ")
+        try:
+            _run(items["inter"], rev, sw[:0], tokens, comm)
+            failures.append(f"rank {rank}: the fused op took empty sorted_weights")
+        except AssertionError:
+            pass
     finally:
         comm.close()
+    # The same dict in a call with another epilogue: the call clears the dict and
+    # writes out.
+    complete = stage2(items, STAGE2_KERNEL_REDUCE)
+    if items:
+        failures.append(f"rank {rank}: stale scatter_intermediate {sorted(items)}")
+    if bool((complete.view(torch.int16) == -1).all(dim=1).any()):
+        failures.append(f"rank {rank}: the reduce epilogue left rows of out")
 
 
 def _check_timeout(rank, device, tp, failures):

@@ -3309,6 +3309,8 @@ def _mxfp4_a4w4_stage2_fw(
 ):
     """``scatter_intermediate``: see ``_flydsl_v2_stage2_wrapper``. The native
     MXMOE GEMM2 ignores it and returns the complete ``moe_out``."""
+    if scatter_intermediate is not None:
+        scatter_intermediate.clear()  # no items of an earlier call
 
     device = inter_states.device
     # kernelName2's format selects the gemm2 family: a flydsl_moe2_layout name
@@ -3479,7 +3481,10 @@ def _flydsl_v2_stage2_wrapper(
     - ``sorted_weights``: fp32, the weight of each sorted position.
     - ``topk``, ``M``, ``model_dim`` and ``MB``.
 
-    With another epilogue, the dict stays empty and ``out`` is complete."""
+    With another epilogue, the dict is empty and ``out`` is complete. The wrapper
+    clears the dict first, so a caller can use one dict for all calls."""
+    if scatter_intermediate is not None:
+        scatter_intermediate.clear()  # no items of an earlier call
     from aiter.ops.flydsl.kernels.mxmoe_dispatcher import (
         _validate_v2_gemm2_dtypes,
         mxfp4_moe_gemm2,

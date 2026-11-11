@@ -183,6 +183,8 @@ def fused_moe_combine_reduce_scatter(
     assert inter.dim() == 2 and inter.shape[1] == hidden
     assert reverse_sorted.dtype == torch.int32 and reverse_sorted.is_contiguous()
     assert sorted_weights.dtype == torch.float32 and sorted_weights.is_contiguous()
+    # The kernel loads a weight for each (token, k), also for a skipped position.
+    assert sorted_weights.numel() > 0, "sorted_weights is empty"
     assert 0 < num_tokens <= comm.max_tokens
     assert reverse_sorted.numel() >= num_tokens * topk
     rows = triton.cdiv(num_tokens, comm.world)
