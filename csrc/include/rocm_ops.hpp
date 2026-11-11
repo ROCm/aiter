@@ -494,7 +494,9 @@ namespace py = pybind11;
           py::arg("is_neox") = true,                                                \
           py::arg("compute_all_q_rope") = false,                                    \
           py::arg("q_scale_out") = std::nullopt,                                    \
-          py::arg("kv_cache_scale") = std::nullopt);                                \
+          py::arg("kv_cache_scale") = std::nullopt,                                 \
+          py::arg("scale_layout") = "flydsl",                                     \
+          py::arg("rope_dim") = 64);                                               \
     m.def("cp_gather_indexer_k_quant_cache",                                        \
           &aiter::cp_gather_indexer_k_quant_cache,                                  \
           py::arg("kv_cache"),                                                      \

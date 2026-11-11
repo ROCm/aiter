@@ -104,9 +104,9 @@ void indexer_qk_rope_quant_and_cache(
     aiter_tensor_t& slot_mapping, // [num_tokens]
     aiter_tensor_t& norm_weight,  // [head_dim]
     aiter_tensor_t& norm_bias,    // [head_dim]
-    aiter_tensor_t& positions,    // [num_tokens]
-    aiter_tensor_t& cos_cache,    // [max_position, ..., rope_dim / 2]
-    aiter_tensor_t& sin_cache,    // [max_position, ..., rope_dim / 2]
+    std::optional<aiter_tensor_t> positions, // unused for rope_dim=0
+    std::optional<aiter_tensor_t> cos_cache,
+    std::optional<aiter_tensor_t> sin_cache,
     double epsilon,
     int64_t quant_block_size,
     const std::string& scale_fmt,
@@ -119,7 +119,10 @@ void indexer_qk_rope_quant_and_cache(
     // [num_tokens, k_tiles, 4, 16, round_up(n_heads / 16, 4)] u8 e8m0
     std::optional<aiter_tensor_t> q_scale_out = std::nullopt,
     // [num_blocks, k_tiles, 4, kv_block_size] u8 e8m0
-    std::optional<aiter_tensor_t> kv_cache_scale = std::nullopt);
+    std::optional<aiter_tensor_t> kv_cache_scale = std::nullopt,
+    // OPUS: Q scales [T,2,32,H/16], K [pages,4,64,16], K scales [pages,2,32,4].
+    const std::string& scale_layout = "flydsl",
+    int64_t rope_dim = 64);
 
 void cp_gather_indexer_k_quant_cache(
     const aiter_tensor_t& kv_cache,     // [num_blocks, block_size, cache_stride]
