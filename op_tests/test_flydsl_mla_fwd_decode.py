@@ -13,6 +13,7 @@ import torch
 import aiter
 from aiter import dtypes
 from aiter.jit.utils.chip_info import get_gfx
+from aiter.ops.flydsl.kernels.mla_fwd_decode_h16 import mla_fwd_decode_persistent
 from aiter.test_common import benchmark, checkAllclose, run_perftest
 
 torch.set_default_device("cuda")
@@ -425,6 +426,18 @@ def test_mla_fwd_decode(
 
     candidates = {
         "torch": lambda: run_torch_persistent(
+            query,
+            kv_buffer,
+            kv_page_indices,
+            work_indptr,
+            work_info_set,
+            kv_last_page_lens,
+            final_output,
+            split_output,
+            split_lse,
+            sm_scale,
+        ),
+        "flydsl": lambda: mla_fwd_decode_persistent(
             query,
             kv_buffer,
             kv_page_indices,
