@@ -4,7 +4,8 @@
 import triton
 import triton.language as tl
 
-from aiter.ops.triton._triton_kernels.quant.quant import _mxfp8_quant_op
+from aiter.ops.triton._triton_kernels.attention.msa import _k_byte_offsets, _v_offsets
+from aiter.ops.triton._triton_kernels.quant.quant import _mxfp4_quant_op, _mxfp8_quant_op
 from aiter.ops.triton.utils._triton.kernel_repr import make_kernel_repr
 
 # Fused RMSNorm + MXFP8 (1x32 e8m0) quant. Replaces the separate
@@ -1312,3 +1313,211 @@ def _finalize_norm_rope_quant_store_sparse_attn(
     rope_local = block - NOPE_HEAD_DIM
     is_rope = (block >= NOPE_HEAD_DIM) & mask
     tl.store(bf16_ptr + rope_local, result.to(tl.bfloat16), mask=is_rope)
+
+
+# ---------------------------------------------------------------------------
+# MiniMax-M3 sparse attention pre-processing: Gemma norm + partial NeoX RoPE of
+# q / k / index_q / index_k, the k4v8 K/V insert, the NVFP4 index-K insert and
+# q as bf16 or MXFP8. Numerics follow vLLM's fused_minimax_m3_qknorm_rope_kv_insert
+# (fp32 math, bf16 rounding of q / k / index_k) and the NVFP4 index insert of
+# vLLM's FlyDSL norm_rope_nvfp4_insert (tests/kernels/attention/minimax_m3_nvfp4_ref.py).
+# ---------------------------------------------------------------------------
+
+
+@triton.jit
+def _m3_xor_add(s, NH: tl.constexpr, N: tl.constexpr):
+    """[NH, N] -> [NH, N / 2]: lane L plus lane L + N / 2 (the XOR partner)."""
+    lo, hi = tl.split(s.reshape(NH, 2, N // 2).permute(0, 2, 1))
+    return lo + hi
+
+
+@triton.jit
+def _m3_sumsq(x, NH: tl.constexpr, D: tl.constexpr):
+    """sum(x^2) per row of [NH, D] (D == 128) in the HIP kernel's order: lane
+    L's 4 dims [4L, 4L + 4) by an FMA chain, then an XOR butterfly over the 32
+    lanes (16, 8, 4, 2, 1), so the fp32 result is bit for bit the same."""
+    x4 = x.reshape(NH, D // 4, 2, 2)
+    a, b = tl.split(x4)  # dims 4L + {0, 2} | {1, 3}
+    x0, x2 = tl.split(a)
+    x1, x3 = tl.split(b)
+    s = x0 * x0
+    s = tl.fma(x1, x1, s)
+    s = tl.fma(x2, x2, s)
+    s = tl.fma(x3, x3, s)  # [NH, 32], lane-major
+    s = _m3_xor_add(s, NH, 32)
+    s = _m3_xor_add(s, NH, 16)
+    s = _m3_xor_add(s, NH, 8)
+    s = _m3_xor_add(s, NH, 4)
+    s = _m3_xor_add(s, NH, 2)
+    return s  # [NH, 1]
+
+
+@triton.jit
+def _m3_norm_rope(
+    row_ptr,
+    heads_off,
+    NH: tl.constexpr,
+    w_ptr,
+    cs_row,
+    eps,
+    D: tl.constexpr,
+    ROT: tl.constexpr,
+):
+    """[NH, D] fp32: Gemma RMSNorm (x * rsqrt(mean(x^2) + eps) * (1 + w)) and
+    partial NeoX RoPE on dims [0, ROT) of NH consecutive heads of a qkv row."""
+    HALF: tl.constexpr = ROT // 2
+    h = tl.arange(0, NH)[:, None]
+    d = tl.arange(0, D)[None, :]
+    pd = tl.where(d < HALF, d + HALF, tl.where(d < ROT, d - HALF, d))
+    x = tl.load(row_ptr + (heads_off + h) * D + d).to(tl.float32)
+    xp = tl.load(row_ptr + (heads_off + h) * D + pd).to(tl.float32)
+    w = 1.0 + tl.load(w_ptr + d).to(tl.float32)
+    wp = 1.0 + tl.load(w_ptr + pd).to(tl.float32)
+    r = tl.math.rsqrt(_m3_sumsq(x, NH, D) / D + eps)
+    xn = x * r * w
+    xpn = xp * r * wp
+    i = d % HALF
+    c = tl.load(cs_row + i, mask=d < ROT, other=1.0).to(tl.float32)
+    s = tl.load(cs_row + HALF + i, mask=d < ROT, other=0.0).to(tl.float32)
+    rot = tl.where(d < HALF, xn * c - xpn * s, xn * c + xpn * s)
+    return tl.where(d < ROT, rot, xn)
+
+
+@triton.jit
+def _m3_e2m1_codes(y):
+    """E2M1 codes of y (sign in bit 3, from the sign bit, so -0 gives 8),
+    nearest with ties to the even code."""
+    a = tl.abs(y)
+    mag = (
+        (a > 0.25).to(tl.uint8)
+        + (a >= 0.75).to(tl.uint8)
+        + (a > 1.25).to(tl.uint8)
+        + (a >= 1.75).to(tl.uint8)
+        + (a > 2.5).to(tl.uint8)
+        + (a >= 3.5).to(tl.uint8)
+        + (a > 5.0).to(tl.uint8)
+    )
+    sign = (y.to(tl.int32, bitcast=True) < 0).to(tl.uint8)
+    return mag | (sign << 3)
+
+
+_fused_minimax_m3_norm_rope_quant_insert_kernel_repr = make_kernel_repr(
+    "fused_minimax_m3_norm_rope_quant_insert_kernel",
+    ['NQ', 'NKV', 'NIQ', 'ROT', 'OUT_QUANT', 'OUT_QUANT_FORMAT'],
+)
+
+
+@triton.jit(repr=_fused_minimax_m3_norm_rope_quant_insert_kernel_repr)
+def fused_minimax_m3_norm_rope_quant_insert_kernel(
+    qkv_ptr,
+    q_norm_ptr,
+    k_norm_ptr,
+    iq_norm_ptr,
+    ik_norm_ptr,
+    cos_sin_ptr,
+    pos_ptr,
+    slot_ptr,
+    islot_ptr,
+    kv_u8_ptr,
+    kv_f8_ptr,
+    icache_ptr,
+    v_scale_ptr,
+    q_out_ptr,
+    q_scale_ptr,
+    iq_out_ptr,
+    eps,
+    stride_qkv,
+    stride_cs,
+    stride_kv_page,
+    stride_kv_head,
+    stride_icache,
+    stride_q_out,
+    stride_q_scale,
+    stride_iq_out,
+    NQ: tl.constexpr,
+    NKV: tl.constexpr,
+    NIQ: tl.constexpr,
+    D: tl.constexpr,
+    ROT: tl.constexpr,
+    PAGE: tl.constexpr,
+    OUT_QUANT: tl.constexpr,
+    OUT_QUANT_FORMAT: tl.constexpr,
+):
+    """One token: [q (NQ) | k (NKV) | v (NKV) | index_q (NIQ) | index_k (1)] of
+    its qkv row. qkv is read only. Negative slots skip their cache."""
+    tl.static_assert(OUT_QUANT_FORMAT == "mxfp8", "OUT_QUANT_FORMAT must be 'mxfp8'")
+    K_BYTES: tl.constexpr = PAGE * D // 2  # k4v8 record: K data, then K scales,
+    KS_BYTES: tl.constexpr = PAGE * D // 32  # then V
+    t = tl.program_id(0).to(tl.int64)
+    row = qkv_ptr + t * stride_qkv
+    cs_row = cos_sin_ptr + tl.load(pos_ptr + t).to(tl.int64) * stride_cs
+    d = tl.arange(0, D)[None, :]
+
+    # q: bf16, or MXFP8 (E8M0 per 32) of the bf16-rounded q.
+    q = _m3_norm_rope(row, 0, NQ, q_norm_ptr, cs_row, eps, D, ROT).to(tl.bfloat16)
+    hq = tl.arange(0, NQ)[:, None]
+    if OUT_QUANT:
+        g3 = q.to(tl.float32).reshape(NQ, D // 32, 32)
+        sc, qs = _mxfp8_quant_op(g3, QUANT_AXIS=2)
+        q8 = (g3 * qs).reshape(NQ, D).to(q_out_ptr.dtype.element_ty)
+        tl.store(q_out_ptr + t * stride_q_out + hq * D + d, q8)
+        gq = tl.arange(0, D // 32)[None, :]
+        tl.store(
+            q_scale_ptr + t * stride_q_scale + hq * (D // 32) + gq,
+            sc.reshape(NQ, D // 32),
+        )
+    else:
+        tl.store(q_out_ptr + t * stride_q_out + hq * D + d, q)
+
+    # index_q: E4M3(bf16(index_q)), unit scale.
+    iq = _m3_norm_rope(row, NQ + 2 * NKV, NIQ, iq_norm_ptr, cs_row, eps, D, ROT)
+    iq = tl.clamp(iq.to(tl.bfloat16).to(tl.float32), -448.0, 448.0)
+    hi = tl.arange(0, NIQ)[:, None]
+    tl.store(
+        iq_out_ptr + t * stride_iq_out + hi * D + d, iq.to(iq_out_ptr.dtype.element_ty)
+    )
+
+    # index_k: NVFP4 (unit global scale) into [128 x 64 B data | 128 x 8 B scales].
+    islot = tl.load(islot_ptr + t)
+    if islot >= 0:
+        ik = _m3_norm_rope(row, NQ + 2 * NKV + NIQ, 1, ik_norm_ptr, cs_row, eps, D, ROT)
+        g16 = ik.to(tl.bfloat16).to(tl.float32).reshape(D // 16, 16)
+        # vLLM's NVFP4 index insert: scale = e4m3(min(amax * RN(1/6), 448)),
+        # values times RN(1 / scale) (0 for a zero scale).
+        amax = tl.max(tl.abs(g16), axis=1)
+        sf8 = tl.minimum(amax * 0.16666667163372040, 448.0).to(tl.float8e4nv)
+        sfv = sf8.to(tl.float32)
+        rcp = tl.where(sfv != 0, 1.0 / sfv, 0.0)
+        y = g16 * rcp[:, None]
+        codes = _m3_e2m1_codes(y).reshape(D // 2, 2)
+        lo, hi4 = tl.split(codes)
+        ipage = icache_ptr + (islot // PAGE).to(tl.int64) * stride_icache
+        it = islot % PAGE
+        tl.store(ipage + it * (D // 2) + tl.arange(0, D // 2), lo | (hi4 << 4))
+        tl.store(
+            ipage + PAGE * (D // 2) + it * (D // 16) + tl.arange(0, D // 16),
+            sf8.to(tl.uint8, bitcast=True),
+        )
+
+    # k / v: the k4v8 record of each KV head.
+    slot = tl.load(slot_ptr + t)
+    if slot >= 0:
+        page = (slot // PAGE).to(tl.int64)
+        tp = (slot % PAGE).to(tl.int32)
+        hk = tl.arange(0, NKV)[:, None]
+        base = page * stride_kv_page + hk * stride_kv_head
+        k = _m3_norm_rope(row, NQ, NKV, k_norm_ptr, cs_row, eps, D, ROT)
+        k_fp4, k_sc = _mxfp4_quant_op(k.to(tl.bfloat16).to(tl.float32), D, NKV, 32)
+        b = tl.arange(0, D // 2)[None, :]
+        tl.store(kv_u8_ptr + base + _k_byte_offsets(tp, b), k_fp4)
+        tl.store(
+            kv_u8_ptr + base + K_BYTES + tp * (D // 32) + tl.arange(0, D // 32)[None, :],
+            k_sc,
+        )
+        v = tl.load(row + (NQ + NKV + hk) * D + d).to(tl.float32)
+        # v * (1 / v_scale), as msa_k4v8_store writes it
+        v = tl.clamp(v * (1.0 / tl.load(v_scale_ptr)), -448.0, 448.0)
+        tl.store(
+            kv_f8_ptr + base + K_BYTES + KS_BYTES + _v_offsets(tp, d, D),
+            v.to(kv_f8_ptr.dtype.element_ty),
+        )

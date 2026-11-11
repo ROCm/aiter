@@ -12,6 +12,7 @@ from aiter.ops.triton._triton_kernels.quant.fused_mxfp8_quant import (
     _fused_dual_rmsnorm_mxfp8_quant_kernel,
     _fused_flatten_mxfp8_quant_kernel,
     _fused_rms_mxfp8_kernel,
+    fused_minimax_m3_norm_rope_quant_insert_kernel,
 )
 
 __all__ = [
@@ -23,6 +24,7 @@ __all__ = [
     "fused_deepseek_v4_quantize_and_insert_k_cache",
     "fused_dual_rmsnorm_mxfp8_quant",
     "fused_flatten_mxfp8_quant",
+    "fused_minimax_m3_norm_rope_quant_insert",
     "fused_rms_mxfp8_quant",
 ]
 
@@ -867,3 +869,129 @@ def fused_deepseek_v4_compress_norm_rope_store_two_stage(
 # =============================================================================
 # Indexer path (head=128, all FP8, single quant block)
 # =============================================================================
+
+
+def fused_minimax_m3_norm_rope_quant_insert(
+    qkv: torch.Tensor,
+    q_norm_weight: torch.Tensor,
+    k_norm_weight: torch.Tensor,
+    index_q_norm_weight: torch.Tensor,
+    index_k_norm_weight: torch.Tensor,
+    cos_sin_cache: torch.Tensor,
+    positions: torch.Tensor,
+    slot_mapping: torch.Tensor,
+    index_slot_mapping: torch.Tensor,
+    kv_cache: torch.Tensor,
+    index_cache: torch.Tensor,
+    v_scale: torch.Tensor,
+    *,
+    num_heads: int,
+    num_kv_heads: int,
+    num_index_heads: int,
+    eps: float,
+    out_quant: bool = False,
+    out_quant_format: str = "mxfp8",
+    q_out: torch.Tensor | None = None,
+    q_scale_out: torch.Tensor | None = None,
+    index_q_out: torch.Tensor | None = None,
+    num_warps: int | None = None,
+):
+    """MiniMax-M3 sparse-attention pre-processing in one launch.
+
+    qkv rows are [q (num_heads) | k (num_kv_heads) | v (num_kv_heads) |
+    index_q (num_index_heads) | index_k (1)] x 128, bf16; qkv is not written.
+    Each of q / k / index_q / index_k gets Gemma RMSNorm
+    (x * rsqrt(mean(x^2) + eps) * (1 + w)) and partial NeoX RoPE on the first
+    cos_sin_cache.shape[1] dims, in fp32, as vLLM's
+    fused_minimax_m3_qknorm_rope_kv_insert does. Then:
+
+      q        -> q_out: bf16 [T, num_heads * 128], or with out_quant=True and
+                  out_quant_format="mxfp8" the MXFP8 of the bf16-rounded q:
+                  e4m3 q_out [T, num_heads * 128] + E8M0 q_scale_out
+                  [T, num_heads * 4] (row-major, one scale per 32)
+      k, v     -> kv_cache, the k4v8 records (aiter.ops.triton.attention.msa):
+                  uint8 [pages, num_kv_heads, RECORD_BYTES] or its
+                  [pages, num_kv_heads, 128, 196] view; slot_mapping < 0 skips
+      index_q  -> index_q_out: e4m3 [T, num_index_heads * 128] of bf16(index_q)
+      index_k  -> index_cache: NVFP4 uint8 [pages, 128, 72] (128 x 64 B e2m1,
+                  then 128 x 8 B e4m3 scales); index_slot_mapping < 0 skips
+
+    Returns (q_out, q_scale_out or None, index_q_out).
+    """
+    from aiter.ops.triton._triton_kernels.attention.msa import PAGE, RECORD_BYTES
+
+    if out_quant_format != "mxfp8":
+        raise ValueError(f"out_quant_format must be 'mxfp8', got {out_quant_format!r}")
+    T, width = qkv.shape
+    D = 128
+    nq, nkv, niq = num_heads, num_kv_heads, num_index_heads
+    if width != (nq + 2 * nkv + niq + 1) * D or qkv.dtype != torch.bfloat16:
+        raise ValueError("qkv must be bf16 [T, (nq + 2 nkv + niq + 1) * 128]")
+    if qkv.stride(1) != 1:
+        raise ValueError("qkv rows must be contiguous")
+    for n in (nq, nkv, niq):
+        if n & (n - 1):
+            raise ValueError("head counts must be powers of two")
+    rot = cos_sin_cache.shape[1]
+    if rot % 2 or rot > D or cos_sin_cache.stride(1) != 1:
+        raise ValueError("cos_sin_cache must be [max_pos, rotary_dim] contiguous")
+    kv = kv_cache.flatten(2) if kv_cache.dim() == 4 else kv_cache
+    if kv.dtype != torch.uint8 or kv.shape[1:] != (nkv, RECORD_BYTES) or kv.stride(2) != 1:
+        raise ValueError("kv_cache must hold k4v8 records [pages, num_kv_heads, 25088]")
+    if index_cache.dtype != torch.uint8 or tuple(index_cache.shape[1:]) != (PAGE, 72):
+        raise ValueError("index_cache must be NVFP4 uint8 [pages, 128, 72]")
+    if index_cache.stride(1) != 72 or index_cache.stride(2) != 1:
+        raise ValueError("index_cache pages must be contiguous")
+    fp8 = torch.float8_e4m3fn
+    if q_out is None:
+        q_out = torch.empty(
+            (T, nq * D), dtype=fp8 if out_quant else torch.bfloat16, device=qkv.device
+        )
+    if out_quant and q_scale_out is None:
+        q_scale_out = torch.empty((T, nq * D // 32), dtype=torch.uint8, device=qkv.device)
+    if index_q_out is None:
+        index_q_out = torch.empty((T, niq * D), dtype=fp8, device=qkv.device)
+    if T == 0:
+        return q_out, q_scale_out, index_q_out
+    qs = q_scale_out if out_quant else q_out
+    if num_warps is None:
+        # one program per token: a single warp keeps more tokens in flight
+        # (gfx950: 209 vs 445 us at T = 32768); four help only small decode T
+        num_warps = 4 if T <= 256 else 1
+    fused_minimax_m3_norm_rope_quant_insert_kernel[(T,)](
+        qkv,
+        q_norm_weight,
+        k_norm_weight,
+        index_q_norm_weight,
+        index_k_norm_weight,
+        cos_sin_cache,
+        positions,
+        slot_mapping,
+        index_slot_mapping,
+        kv,
+        kv.view(fp8),
+        index_cache,
+        v_scale,
+        q_out,
+        qs,
+        index_q_out,
+        eps,
+        qkv.stride(0),
+        cos_sin_cache.stride(0),
+        kv.stride(0),
+        kv.stride(1),
+        index_cache.stride(0),
+        q_out.stride(0),
+        qs.stride(0),
+        index_q_out.stride(0),
+        NQ=nq,
+        NKV=nkv,
+        NIQ=niq,
+        D=D,
+        ROT=rot,
+        PAGE=PAGE,
+        OUT_QUANT=out_quant,
+        OUT_QUANT_FORMAT=out_quant_format,
+        num_warps=num_warps,
+    )
+    return q_out, q_scale_out if out_quant else None, index_q_out
