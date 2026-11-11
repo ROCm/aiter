@@ -5,6 +5,7 @@
 #include <ATen/hip/impl/HIPGuardImplMasqueradingAsCUDA.h>
 #include "gemm_moe_ck2stages_lookup.h"
 #include "gemm_moe_ck2stages.h"
+#include "gemm_dispatch_utils.h"
 #include "ck2stages_moe_stage1_heuristic_dispatch.hpp"
 #include "ck2stages_moe_stage2_heuristic_dispatch.hpp"
 #include "moe_ck.h"
@@ -56,11 +57,11 @@ MoeKernel moe_dispatch(std::string &kernelName, int block_m, int inter_dim, at::
     }
     if constexpr (stage == 1)
     {
-        return moe_stage1_heuristic_dispatch(block_m, inter_dim, x_dtype, w_dtype, y_dtype, act_op, quant_type, mul_routed_weight, is_shuffled);
+        return moe_stage1_heuristic_dispatch(get_device_gfx(), block_m, inter_dim, x_dtype, w_dtype, y_dtype, act_op, quant_type, mul_routed_weight, is_shuffled);
     }
     else
     {
-        return moe_stage2_heuristic_dispatch(block_m, inter_dim, x_dtype, w_dtype, y_dtype, 0, quant_type, mul_routed_weight, is_shuffled);
+        return moe_stage2_heuristic_dispatch(get_device_gfx(), block_m, inter_dim, x_dtype, w_dtype, y_dtype, 0, quant_type, mul_routed_weight, is_shuffled);
     }
 }
 
@@ -159,6 +160,7 @@ void ck_moe_stage2(torch::Tensor &inter_states,      // [m, k], input token
                    bool is_shuffled = true)
 {
     // std::cerr << __FILE__ << ":" << __LINE__ << " ck_moe_stage2 called!" << nt << " " << block_m.value() << std::endl;
+    const at::hip::OptionalHIPGuardMasqueradingAsCUDA device_guard(device_of(out));
     TORCH_CHECK(out.dtype() == at::ScalarType::BFloat16 || out.dtype() == at::ScalarType::Half,
                 "Out dtype only support BFloat16/Float16!")
 
