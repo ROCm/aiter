@@ -1,1 +1,37 @@
-{}
+{
+ "gemm_a8w8_blockscale": {
+  "fingerprint": "47ec95c460883544",
+  "signature": "XQ:positional:Tensor, WQ:positional:Tensor, x_scale:positional:Tensor, w_scale:positional:Tensor, dtype:positional:torch.dtype=dtypes.bf16, isBpreshuffled:positional:bool=False, split_k:positional:int | None=None, -> torch.Tensor",
+  "source": "aiter/ops/gemm_op_a8w8.py",
+  "supersedes": [],
+  "version": 1
+ },
+ "gemm_a8w8_blockscale_bpreshuffle": {
+  "fingerprint": "dd8528ae4b58d9bb",
+  "signature": "XQ:positional:Tensor, WQ:positional:Tensor, x_scale:positional:Tensor, w_scale:positional:Tensor, dtype:positional:torch.dtype=dtypes.bf16, out:positional:Tensor | None=None, -> Tensor",
+  "source": "aiter/ops/gemm_op_a8w8.py",
+  "supersedes": [],
+  "version": 1
+ },
+ "pertoken_quant": {
+  "fingerprint": "ffb84335bd354c41",
+  "signature": "x:positional, scale:positional=None, x_scale:positional=None, scale_dtype:positional=dtypes.fp32, quant_dtype:positional=dtypes.i8, dtypeMax:positional=None",
+  "source": "aiter/ops/quant.py",
+  "supersedes": [],
+  "version": 1
+ },
+ "rmsnorm": {
+  "fingerprint": "86344aea2f2c16a8",
+  "signature": "input:positional, weight:positional, epsilon:positional, use_model_sensitive_rmsnorm:positional, -> Tensor",
+  "source": "aiter/ops/rmsnorm.py",
+  "supersedes": [],
+  "version": 2
+ },
+ "rmsnorm_with_add": {
+  "fingerprint": "626b013bc0e5008f",
+  "signature": "out:positional:Tensor, input:positional:Tensor, residual_in:positional:Tensor, residual_out:positional:Tensor, weight:positional:Tensor, epsilon:positional:float, gemma_norm:positional:bool=False, use_model_sensitive_rmsnorm:positional:int=0, -> None",
+  "source": "aiter/ops/rmsnorm.py",
+  "supersedes": [],
+  "version": 1
+ }
+}

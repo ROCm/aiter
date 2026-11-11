@@ -1,14 +1,17 @@
 # The kernels in this file are adapted from vLLM:
 # https://github.com/vllm-project/vllm/blob/main/vllm/attention/ops/triton_unified_attention.py
+import os
 from typing import NamedTuple
 
 import torch
 import triton
 
 from aiter.ops.triton._triton_kernels.attention.unified_attention import (
+    attention_output_gate_rows,
     kernel_unified_attention_2d,
     kernel_unified_attention_3d,
     reduce_segments,
+    unified_attention_3d_split_rebalance_kernel,
 )
 from aiter.ops.triton._triton_kernels.flash_attn_triton_amd.utils import get_arch
 from aiter.ops.triton.utils._triton import arch_info
@@ -34,11 +37,19 @@ try:
 except:  # noqa: E722
     _unified_attention_kernel_2d_gfx1250 = None
 try:
+    from aiter.ops.triton._gluon_kernels.gfx1250.attention import (
+        unified_attention_reduce as _gfx1250_reduce,
+    )
     from aiter.ops.triton._gluon_kernels.gfx1250.attention.unified_attention_reduce import (
         reduce_segments_gluon as _reduce_segments_kernel_gfx1250,
     )
+
+    _reduce_segments_split_rebalance_kernel_gfx1250 = (
+        _gfx1250_reduce.reduce_segments_split_rebalance_gluon
+    )
 except:  # noqa: E722
     _reduce_segments_kernel_gfx1250 = None
+    _reduce_segments_split_rebalance_kernel_gfx1250 = None
 
 # gfx950
 try:
@@ -55,6 +66,43 @@ _GLUON_REDUCE_MAX_SEGMENTS = 8
 # (tokens * query heads) per CU; past that the 2D grid fills the GPU.
 _GFX12_3D_MAX_SEQLEN_Q = 16
 _GFX12_3D_MAX_QUERY_ROWS_PER_CU = 8
+# Split rebalance for the gfx1250 gluon 3d kernel (decode and spec-decode verify),
+# always on: every KV segment covers the same number of tiles, so a long sequence gets
+# more segments instead of longer ones. Cutting every sequence into the same number of
+# segments leaves, with mixed context lengths, the longest sequences' segments running
+# long after the rest are done: Qwen3.5 (16 q / 2 kv heads, d 256, fp8, 4-token verify),
+# 64 sequences of 4k-191k tokens: 5.5 TB/s, against 16.7 for 64 x 64k.
+# The segment size is computed on the device each launch from the batch's total KV,
+# for about _GFX12_UA_SPLIT_REBALANCE programs, clamped to
+# [_GFX12_UA_SPLIT_REBALANCE_MIN_TILES, _GFX12_UA_SPLIT_REBALANCE_MAX_TILES] tiles, so
+# it follows the live batch under a CUDA graph too. The grid covers
+# _GFX12_UA_SPLIT_REBALANCE_MAX_KV_LEN tokens at the minimum segment size, since a graph
+# keeps its capture's grid; spare segments exit at once.
+_GFX12_UA_SPLIT_REBALANCE = 2048
+_GFX12_UA_SPLIT_REBALANCE_MIN_TILES = 16
+_GFX12_UA_SPLIT_REBALANCE_MAX_TILES = 256
+_GFX12_UA_SPLIT_REBALANCE_MAX_KV_LEN = 262144
+# The split rebalance reduce, always on for a split-rebalanced launch: the gfx1250
+# decode / spec-decode reduce of the rebalance's 128-256 segments (wider than the
+# in-wave gluon reduce takes) runs reduce_segments_split_rebalance_gluon instead of
+# the Triton reduce_segments: one program per (query token, head), the sequence from
+# the token without a search, only the live segments read, all loads (partials and
+# maxima by TDM into LDS, statistics, output gate) in flight in one round trip.
+# Qwen3.5 a8k4v8 (16 / 2 heads, d 256), reduce alone: c=1024 verify (340 tokens,
+# 10k-150k-token contexts, 128-segment grid) 21 us in the Triton reduce -> 7.7 us
+# with the loads one step ahead; one round trip then 3.0-6.0 -> 2.0-3.4 us under graph
+# replay (verify and draft, 1-8 sequences of 15k-110k tokens).
+# Not bitwise the Triton reduce (another fp32 summation order): ~0.005% of the bf16
+# outputs one rounding step apart. SB segments a merge step (sets the summation
+# order); CHUNK segments a pass loads (a multiple of SB), SPEC of them before the
+# context length (a multiple of SB, <= CHUNK); NUM_WARPS when the value head size is a
+# multiple of 32 * NUM_WARPS, else 1. The output is bitwise the same for every CHUNK,
+# SPEC and NUM_WARPS.
+_GFX12_UA_SPLIT_REBALANCE_REDUCE_SB = 8
+_GFX12_UA_SPLIT_REBALANCE_REDUCE_CHUNK = 64
+_GFX12_UA_SPLIT_REBALANCE_REDUCE_SPEC = 32
+_GFX12_UA_SPLIT_REBALANCE_REDUCE_NUM_WARPS = 2
+
 # attn_3d config keys that steer use_2d_kernel on gfx1250 rather than the launch:
 # MAX_QUERY_ROWS_PER_CU overrides the short-query bound above, and
 # PREFILL_MAX_2D_PRGMS / PREFILL_MIN_KV / PREFILL_MIN_KV_PER_PRGM opt an entry
@@ -69,6 +117,16 @@ _GFX12_ROUTING_KEYS = (
     "PREFILL_FILL_TIERS",
     "PREFILL_REF_BLOCK_M",
 )
+# gfx1250: the output gate inside the 2d kernel's epilogue (its gate tile TDM-loaded
+# before the attention loop) from this longest context on; below it, and with
+# AITER_UA2D_FUSED_EPILOGUE=0, the gate is the separate attention_output_gate_rows
+# launch after the 2d kernel. Short prefills (478-8192 new tokens, no prefix) measured
+# 2-6 us slower with the gate in the epilogue than with the separate launch.
+_UA2D_FUSED_EPILOGUE = os.environ.get("AITER_UA2D_FUSED_EPILOGUE", "1") == "1"
+_UA2D_FUSED_EPILOGUE_MIN_KV = int(
+    os.environ.get("AITER_UA2D_FUSED_EPILOGUE_MIN_KV", "16384")
+)
+
 
 DEVICE_ARCH = arch_info.get_arch()
 IS_DEVICE_ARCH_GFX12 = DEVICE_ARCH in ("gfx1250", "gfx1250-strict")
@@ -130,7 +188,9 @@ class _UAParams(NamedTuple):
 
     # dtypes and modes
     q_dtype: torch.dtype
-    kv_cache_dtype: torch.dtype
+    kv_cache_dtype: torch.dtype  # the K cache's
+    # the V cache's; differs from kv_cache_dtype only for A8K4V8 (NVFP4 K, fp8 V)
+    v_cache_dtype: torch.dtype
     all_decode: bool  # max_seqlen_q == 1
     # equal_seqlen_q and not all_decode: speculative-decode verify, every seq
     # holds max_seqlen_q queries
@@ -156,6 +216,8 @@ class _UAParams(NamedTuple):
     v_descale: torch.Tensor | None = None
     output_scale: torch.Tensor | None = None
     skip_reduce: bool = False
+    # NVFP4 KV cache only: PV as an FP8 WMMA (P and the upcast V in e4m3) instead of BF16
+    force_fp8_pv_on_fp4_kv_cache: bool = False
 
 
 # The kv_split keys that the length-aware split reads.
@@ -274,6 +336,55 @@ def _gfx950_split_params(params: _UAParams):
 _SW_SPLIT_MAX_Q = 16
 
 
+def _gfx12_split_rebalance_tiles(
+    seqused_k: torch.Tensor, num_kv_heads: int, tile_size: int
+) -> torch.Tensor:
+    """The split rebalance's tiles per segment, [1] int32, in one single-program
+    Triton launch (unified_attention_3d_split_rebalance_kernel):
+      clamp(ceil(sum_i ceil(seqused_k[i] / tile_size) * num_kv_heads
+                 / _GFX12_UA_SPLIT_REBALANCE),
+            _GFX12_UA_SPLIT_REBALANCE_MIN_TILES, _GFX12_UA_SPLIT_REBALANCE_MAX_TILES).
+
+    No host read of device data and a fixed grid, so it captures into a CUDA graph
+    and recomputes from the live seqused_k on replay.
+    """
+    assert seqused_k.dim() == 1, "seqused_k must be 1-D [num_seqs]"
+    segm_tiles = torch.empty(1, dtype=torch.int32, device=seqused_k.device)
+    num_seqs = seqused_k.shape[0]
+    unified_attention_3d_split_rebalance_kernel[(1,)](
+        seqused_k,
+        segm_tiles,
+        num_seqs,
+        seqused_k.stride(0),
+        num_kv_heads,
+        TILE_SIZE=tile_size,
+        PROGRAMS=_GFX12_UA_SPLIT_REBALANCE,
+        MIN_TILES=_GFX12_UA_SPLIT_REBALANCE_MIN_TILES,
+        MAX_TILES=_GFX12_UA_SPLIT_REBALANCE_MAX_TILES,
+        BLOCK=min(1024, max(64, triton.next_power_of_2(num_seqs))),
+        num_warps=4,
+    )
+    return segm_tiles
+
+
+def _gfx12_split_rebalance(params: _UAParams, tile_size: int):
+    """The split rebalance's grid width (NUM_SEGMENTS) and its tiles per segment.
+
+    Tiles per segment is a device tensor: the batch's KV tiles over every KV head,
+    over _GFX12_UA_SPLIT_REBALANCE, clamped to [MIN_TILES, MAX_TILES], from one
+    Triton program, so a CUDA graph recomputes it from the live context lengths on
+    replay.
+    """
+    segm_tiles = _gfx12_split_rebalance_tiles(
+        params.seqused_k, params.num_kv_heads, tile_size
+    )
+    kv_cover = max(int(params.max_seqlen_k), _GFX12_UA_SPLIT_REBALANCE_MAX_KV_LEN)
+    num_segments = triton.next_power_of_2(
+        triton.cdiv(kv_cover, _GFX12_UA_SPLIT_REBALANCE_MIN_TILES * tile_size)
+    )
+    return num_segments, segm_tiles
+
+
 def _gfx950_split_grid(params: _UAParams):
     """Decode, and batches too small to fill the GPU, take the split grid."""
     if params.all_decode:
@@ -323,6 +434,12 @@ def use_2d_kernel(params: _UAParams, backend: str = "triton"):
         if params.sliding_window > 0:
             return True
         if params.all_decode:
+            return False
+        if params.max_seqlen_q <= _GFX12_3D_MAX_SEQLEN_Q and is_3d_gluon_available(
+            params, backend
+        ):
+            # the split rebalance keeps the 3d grid full at any batch, where 2d runs
+            # one program per sequence over its whole context
             return False
         route = get_unified_attention_config("attn_3d", params, backend="gluon")
         if params.max_seqlen_q <= _GFX12_3D_MAX_SEQLEN_Q:
@@ -413,8 +530,18 @@ def unified_attention(
     # its seqs, computed by the caller on the host. Lets the gfx1250 router see how
     # evenly a prefill's work spreads over the 2D grid; never read on the GPU.
     attn_work: int | None = None,
+    # NVFP4 (uint8 e2m1) KV cache only: run PV as an FP8 WMMA, with P and the upcast,
+    # scaled V in e4m3, instead of a BF16 WMMA. Same for A8W4 and A4W4; ignored otherwise.
+    force_fp8_pv_on_fp4_kv_cache: bool = False,
     # backend
     backend: str | None = None,  # "triton" | "gluon"
+    # Epilogue of the Qwen3-Next / Qwen3.5 attention: out * sigmoid(output_gate),
+    # output_gate [num_tokens, num_query_heads * head_size_v] (row-strided, e.g. a
+    # slice of the QKV-gate projection), bitwise the unfused sigmoid-mul. With
+    # output_rows ([R] int32/int64), out has R rows: out[r] is query token
+    # output_rows[r] (every token still attends and its KV is read as usual).
+    output_gate: torch.Tensor | None = None,
+    output_rows: torch.Tensor | None = None,
 ):
     assert causal, "Only causal attention is supported"
 
@@ -440,6 +567,24 @@ def unified_attention(
 
     if sinks is not None:
         assert sinks.shape[0] == num_query_heads, "Sinks must be num_query_heads size"
+
+    epilogue = output_gate is not None or output_rows is not None
+    final_out = out
+    if epilogue:
+        assert not skip_reduce, "the output epilogue needs the reduce"
+        assert out.dtype in (torch.bfloat16, torch.float16) and output_scale is None
+        assert out.stride(-1) == 1 and out.stride(-2) == out.shape[-1]
+        if output_gate is not None:
+            assert output_gate.dim() == 2 and output_gate.stride(1) == 1
+            assert output_gate.shape == (num_tokens, num_query_heads * out.shape[-1])
+            assert output_gate.dtype == out.dtype
+        if output_rows is not None:
+            assert output_rows.dim() == 1 and output_rows.is_contiguous()
+            assert out.shape[0] == output_rows.shape[0]
+            # The kernels write every token; the epilogue picks the rows.
+            out = torch.empty(
+                (num_tokens, *out.shape[1:]), dtype=out.dtype, device=out.device
+            )
 
     BLOCK_SCALES_SIZE = 16
     if q_dtype == torch.uint8:
@@ -477,7 +622,12 @@ def unified_attention(
         )
         # The shuffled kernels lay V out with HEAD_SIZE, and a shuffled v does not
         # expose its head size as the last dim, so compare per-page element counts.
-        assert k.shape[1:].numel() == v.shape[1:].numel(), (
+        if k.dtype == torch.uint8 and v.dtype != torch.uint8:
+            # A8K4V8: k is [num_blocks, num_kv_heads, block_size, head_size // 2 + head_size // 16]
+            v_page_numel = k.shape[1] * k.shape[2] * head_size
+        else:
+            v_page_numel = k.shape[1:].numel()
+        assert v.shape[1:].numel() == v_page_numel, (
             "Unified Attention with pre-shuffled KV cache requires the value head "
             "size to match the query/key head size"
         )
@@ -551,6 +701,7 @@ def unified_attention(
         block_scales_size=BLOCK_SCALES_SIZE,
         q_dtype=q_dtype,
         kv_cache_dtype=kv_cache_dtype,
+        v_cache_dtype=v.dtype,
         all_decode=ALL_DECODE,
         spec_decode=SPEC_DECODE,
         attn_work=int(attn_work or 0),
@@ -568,6 +719,7 @@ def unified_attention(
         v_descale=v_descale,
         output_scale=output_scale,
         skip_reduce=skip_reduce,
+        force_fp8_pv_on_fp4_kv_cache=force_fp8_pv_on_fp4_kv_cache,
     )
 
     # if batch contains a prefill
@@ -575,15 +727,26 @@ def unified_attention(
         # The gfx1250 Gluon 2d kernel only handles bf16/fp8 q+kv (with optional
         # sinks / output_scale / shuffled_kv_cache)
         use_gluon_2d = is_2d_gluon_available(params, backend)
+        # the gate in the gfx1250 2d kernel's own epilogue (no row selection)
+        fused_2d_gate = (
+            output_gate is not None
+            and use_gluon_2d
+            and DEVICE_ARCH == "gfx1250"
+            and _2d_gate_fusable(params, output_rows)
+        )
         if use_gluon_2d:
             if DEVICE_ARCH in ("gfx1250", "gfx1250-strict"):
-                _unified_attention_2d_gfx1250(params)
+                _unified_attention_2d_gfx1250(
+                    params, output_gate=output_gate if fused_2d_gate else None
+                )
             elif DEVICE_ARCH == "gfx950":
                 _unified_attention_2d_gfx950(params)
             else:
                 assert False, f"No gluon subwrapper for {DEVICE_ARCH}"
         else:
             _unified_attention_2d_triton(params)
+        if epilogue and not fused_2d_gate:
+            _output_epilogue(out, final_out, output_gate, output_rows)
     else:
         use_gluon_3d = is_3d_gluon_available(params, backend)
         split_params = params
@@ -612,6 +775,9 @@ def unified_attention(
                 for max_fill, min_segments in config["FILL_MIN_SEGMENTS"]:
                     if fill < max_fill:
                         NUM_SEGMENTS = max(NUM_SEGMENTS, min(min_segments, limit))
+        segm_tiles = None
+        if use_gluon_3d and DEVICE_ARCH == "gfx1250":
+            NUM_SEGMENTS, segm_tiles = _gfx12_split_rebalance(params, CONFIG_TILE_SIZE)
         # The triton kernels read a shuffled tile as one contiguous page, so
         # there the tile is the page. The gfx950 gluon loader gathers per token
         # and keeps its tuned tile.
@@ -657,6 +823,7 @@ def unified_attention(
                     segm_expsum,
                     NUM_SEGMENTS,
                     TILE_SIZE,
+                    segm_tiles=segm_tiles,
                 )
             elif DEVICE_ARCH == "gfx950":
                 _unified_attention_3d_gfx950(
@@ -681,6 +848,9 @@ def unified_attention(
             )
 
         if NUM_SEGMENTS == 1:
+            if epilogue:
+                _output_epilogue(segm_output, final_out, output_gate, output_rows)
+                return final_out
             return segm_output
         elif skip_reduce:
             # with a sliding window the segments carve only the window's tiles
@@ -688,13 +858,30 @@ def unified_attention(
             return segm_output, segm_max, segm_expsum
 
         # Gluon reduce (one workgroup/token, in-wave segment merge); valid for all-decode with small split counts, else the Triton reduce_segments.
-        # The Gluon reduce reads the uniform token-major partials only.
+        # The output epilogue is the Triton reduce's, and the Gluon reduce reads the
+        # uniform token-major partials only.
         use_gluon_reduce = (
             is_reduce_gluon_available(params, NUM_SEGMENTS, backend)
             and backend == "gluon"
+            and not epilogue
             and split is None
         )
-        if use_gluon_reduce:
+        # The split rebalance's launch (segm_tiles) takes the split rebalance reduce.
+        if segm_tiles is not None and is_reduce_split_rebalance_gluon_available(
+            params, NUM_SEGMENTS, backend
+        ):
+            _reduce_segments_split_rebalance_gfx1250(
+                params._replace(out=final_out),
+                segm_output,
+                segm_max,
+                segm_expsum,
+                NUM_SEGMENTS,
+                TILE_SIZE,
+                segm_tiles=segm_tiles,
+                output_gate=output_gate,
+                output_rows=output_rows,
+            )
+        elif use_gluon_reduce:
             if DEVICE_ARCH in ("gfx1250", "gfx1250-strict"):
                 _reduce_segments_gfx1250(
                     params,
@@ -703,20 +890,63 @@ def unified_attention(
                     segm_expsum,
                     NUM_SEGMENTS,
                     TILE_SIZE,
+                    segm_tiles=segm_tiles,
                 )
             else:
                 assert False, f"No gluon subwrapper for {DEVICE_ARCH}"
         else:
             _reduce_segments_triton(
-                params,
+                params._replace(out=final_out),
                 segm_output,
                 segm_max,
                 segm_expsum,
                 NUM_SEGMENTS,
                 TILE_SIZE,
                 split,
+                output_gate=output_gate,
+                output_rows=output_rows,
+                segm_tiles=segm_tiles,
             )
-    return out
+    return final_out
+
+
+def _2d_gate_fusable(params: _UAParams, output_rows) -> bool:
+    """Whether the gfx1250 2d kernel applies the output gate in its epilogue: every row
+    (no row selection), a power-of-2 GQA group whose output columns split into
+    128-column groups, and a context from _UA2D_FUSED_EPILOGUE_MIN_KV on."""
+    nq = params.num_queries_per_kv
+    return (
+        output_rows is None
+        and _UA2D_FUSED_EPILOGUE
+        and int(params.max_seqlen_k) >= _UA2D_FUSED_EPILOGUE_MIN_KV
+        and nq & (nq - 1) == 0
+        and (nq * params.head_size_v) % 256 == 0
+        and params.head_size == params.head_size_v
+    )
+
+
+def _output_epilogue(out, final_out, output_gate, output_rows):
+    """The output epilogue of reduce_segments for an attention that ends without it:
+    final_out[r] = out[rows[r]] * sigmoid(gate[rows[r]]), in one launch."""
+    width = out.shape[-2] * out.shape[-1]
+    num_rows = final_out.shape[0]
+    if num_rows == 0:
+        return
+    block = min(1024, triton.next_power_of_2(width))
+    attention_output_gate_rows[(num_rows, triton.cdiv(width, block))](
+        final_out,
+        out,
+        output_gate,
+        output_rows,
+        out.stride(0),
+        output_gate.stride(0) if output_gate is not None else 0,
+        final_out.stride(0),
+        WIDTH=width,
+        BLOCK=block,
+        num_warps=4,
+        # the roundings of the production _gated_pointwise_kernel, which runs unfused
+        enable_fp_fusion=False,
+    )
 
 
 def is_2d_gluon_available(params: _UAParams, backend: str):
@@ -730,9 +960,28 @@ def is_2d_gluon_available(params: _UAParams, backend: str):
             and not params.softcap
             and not params.use_qq_bias
             and not params.use_alibi_slopes
-            and params.q_dtype != torch.uint8
-            and params.kv_cache_dtype != torch.uint8
-            and params.q_dtype == params.kv_cache_dtype
+            and (
+                params.q_dtype == params.kv_cache_dtype
+                # NVFP4 KV: fp8 Q (A8W4) or NVFP4 Q (A4W4), shuffled 128-token pages
+                or (
+                    params.kv_cache_dtype == torch.uint8
+                    and params.q_dtype.itemsize == 1
+                )
+            )
+            and (
+                params.kv_cache_dtype != torch.uint8
+                or (
+                    params.shuffled_kv_cache
+                    and (
+                        params.block_size == 128
+                        # A8K4V8 (fp8 V) also runs 64-token pages
+                        or (
+                            params.block_size == 64
+                            and params.v_cache_dtype != torch.uint8
+                        )
+                    )
+                )
+            )
             and params.head_size_v == params.head_size
         )
     elif DEVICE_ARCH == "gfx950":
@@ -778,7 +1027,36 @@ def is_reduce_gluon_available(params: _UAParams, NUM_SEGMENTS, backend: str):
     return use_gluon and use_gluon_arch
 
 
+def is_reduce_split_rebalance_gluon_available(
+    params: _UAParams, NUM_SEGMENTS, backend: str
+):
+    """reduce_segments_split_rebalance_gluon: gfx1250, every sequence the same query
+    length (decode or spec-decode verify), head size = value head size, a power of 2
+    and a multiple of 32, and a power-of-2 segment count."""
+    d = params.head_size_v
+    return (
+        DEVICE_ARCH in ("gfx1250", "gfx1250-strict")
+        and backend == "gluon"
+        and _reduce_segments_split_rebalance_kernel_gfx1250 is not None
+        and (params.all_decode or params.spec_decode)
+        and d == params.head_size
+        and d & (d - 1) == 0
+        and d % 32 == 0
+        and triton.next_power_of_2(NUM_SEGMENTS) == NUM_SEGMENTS
+    )
+
+
+def _reject_nvfp4_kv_on_triton(params: _UAParams):
+    # The Triton kernels have no NVFP4 decode: a packed uint8 cache would be cast, not dequantized.
+    if params.kv_cache_dtype == torch.uint8 or params.v_cache_dtype == torch.uint8:
+        raise NotImplementedError(
+            "an NVFP4 (uint8) KV cache runs only on the gfx1250 Gluon kernels, which do not support "
+            "softcap, ALiBi slopes or qq_bias; this call would fall back to the Triton kernels"
+        )
+
+
 def _unified_attention_2d_triton(params: _UAParams):
+    _reject_nvfp4_kv_on_triton(params)
     if params.shuffled_kv_cache and (
         params.q_dtype == e4m3_dtype and params.kv_cache_dtype == e4m3_dtype
     ):
@@ -865,6 +1143,7 @@ def _unified_attention_3d_triton(
     TILE_SIZE,
     split: _LengthAwareSplit | None = None,
 ):
+    _reject_nvfp4_kv_on_triton(params)
     if split is None:
         config = get_unified_attention_config("attn_3d", params, backend="triton")
     else:
@@ -980,8 +1259,14 @@ def _reduce_segments_triton(
     NUM_SEGMENTS,
     TILE_SIZE,
     split: _LengthAwareSplit | None = None,
+    output_gate=None,
+    output_rows=None,
+    segm_tiles=None,
 ):
     head_size_padded = triton.next_power_of_2(params.head_size)
+    num_rows = params.num_tokens if output_rows is None else output_rows.shape[0]
+    if num_rows == 0:
+        return
     if split is None:
         config = get_unified_attention_config("reduce", params, backend="triton")
     else:
@@ -1007,7 +1292,7 @@ def _reduce_segments_triton(
         v_head_size_padded, config.get("BLOCK_D") or v_head_size_padded
     )
 
-    reduce_segments[(params.num_tokens, params.num_query_heads, num_d_blocks)](
+    reduce_segments[(num_rows, params.num_query_heads, num_d_blocks)](
         output_ptr=params.out,
         segm_output_ptr=segm_output,
         segm_max_ptr=segm_max,
@@ -1016,6 +1301,7 @@ def _reduce_segments_triton(
         num_seqs=params.num_seqs,
         num_query_heads=params.num_query_heads,
         out_scale_ptr=params.output_scale,
+        segm_tiles_ptr=segm_tiles,
         output_stride_0=params.out.stride(0),
         output_stride_1=params.out.stride(1),
         block_table_stride=params.block_table.stride(0),
@@ -1029,6 +1315,9 @@ def _reduce_segments_triton(
         SLIDING_WINDOW=params.sliding_window,
         BLOCK_Q=None,
         **length_aware,
+        gate_ptr=output_gate,
+        gate_stride_0=output_gate.stride(0) if output_gate is not None else None,
+        rows_ptr=output_rows,
         **config,
         enable_fp_fusion=True,
     )
@@ -1064,7 +1353,7 @@ _reduce_segments_{arch}(
 """
 
 
-def _unified_attention_2d_gfx1250(params: _UAParams):
+def _unified_attention_2d_gfx1250(params: _UAParams, output_gate=None):
     """
     Internal wrapper for the gfx1250 gluon kernel.
 
@@ -1116,6 +1405,22 @@ def _unified_attention_2d_gfx1250(params: _UAParams):
     query_span = (BLOCK_M - 1) // params.num_queries_per_kv + 1
     if query_span > TILE_SIZE or TILE_SIZE <= 32:
         loop_variant = 0
+
+    num_buffers = config["NUM_BUFFERS"]
+    waves_per_eu = config["waves_per_eu"]
+    kv_nvfp4 = params.kv_cache_dtype == torch.uint8
+    if kv_nvfp4:
+        num_buffers = 2
+        if params.v_cache_dtype == torch.uint8:
+            # an NVFP4 V (A8W4, BF16 PV) runs the double-buffered loop variant 0 with one 128-token page per tile
+            TILE_SIZE = params.block_size
+            loop_variant = 0
+        elif loop_variant not in (0, 1, 2):
+            # NVFP4 K with an fp8 V (A8K4V8): loop variants 0, 1 and 2, tiles of one or more pages
+            loop_variant = 1
+        # the NVFP4 path (packed K, scale layouts; the V upcast for an NVFP4 V) needs the whole VGPR file:
+        # one wave per SIMD (2 is 28x slower for A8K4V8 prefill, ~20x for A8W4 decode)
+        waves_per_eu = 1
 
     BLOCK_Q = BLOCK_M // params.num_queries_per_kv
     assert BLOCK_Q >= 1
@@ -1174,7 +1479,7 @@ def _unified_attention_2d_gfx1250(params: _UAParams):
         BLOCK_Q=BLOCK_Q,
         BLOCK_M=BLOCK_M,
         ARCH_NAME=DEVICE_ARCH,
-        waves_per_eu=config["waves_per_eu"],
+        waves_per_eu=waves_per_eu,
         USE_LOAD_BUFFER_OP=False,
         USE_STORE_BUFFER_OP=USE_STORE_BUFFER_OP,
         num_warps=num_warps,
@@ -1185,8 +1490,21 @@ def _unified_attention_2d_gfx1250(params: _UAParams):
         CAUSAL=params.causal,
         # useful for debugging when needed
         REMOVE_INDIRECT_ACCESS=False,
-        NUM_BUFFERS=config["NUM_BUFFERS"],
+        NUM_BUFFERS=num_buffers,
         LOOP_VARIANT=loop_variant,
+        Q_NVFP4=params.q_dtype == torch.uint8,
+        KV_NVFP4=kv_nvfp4,
+        V_NVFP4=params.v_cache_dtype == torch.uint8,
+        query_scales_ptr=params.q_scales,
+        query_scales_stride_0=(
+            params.q_scales.stride(0) if params.q_scales is not None else 0
+        ),
+        query_scales_stride_1=(
+            params.q_scales.stride(1) if params.q_scales is not None else 0
+        ),
+        gate_ptr=output_gate,
+        gate_stride_0=output_gate.stride(0) if output_gate is not None else None,
+        GATE=output_gate is not None,
         enable_fp_fusion=True,
     )
 
@@ -1198,6 +1516,7 @@ def _unified_attention_3d_gfx1250(
     segm_expsum,
     NUM_SEGMENTS,
     TILE_SIZE,
+    segm_tiles=None,
 ):
     # its split carves [0, seq_len), unlike reduce_segments for a sliding window;
     # use_2d_kernel keeps every sliding-window call on the 2d grid here
@@ -1205,6 +1524,12 @@ def _unified_attention_3d_gfx1250(
     NUM_BLOCKS_GATHER_PER_TILE = 1
     QUERY_DTYPE = get_dtype_str(params.q_dtype)
     KV_CACHE_DTYPE = get_dtype_str(params.kv_cache_dtype)
+    # A8K4V8: NVFP4 K, fp8 V
+    V_CACHE_DTYPE = (
+        get_dtype_str(params.v_cache_dtype)
+        if params.v_cache_dtype != params.kv_cache_dtype
+        else ""
+    )
     config = get_unified_attention_config("attn_3d", params, backend="gluon")
     for key in _GFX12_ROUTING_KEYS:
         config.pop(key, None)
@@ -1249,6 +1574,7 @@ def _unified_attention_3d_gfx1250(
             if (params.output_scale is not None and NUM_SEGMENTS == 1)
             else None
         ),
+        segm_tiles_ptr=segm_tiles,
         softcap=params.softcap,
         num_seqs=params.num_seqs,
         num_blocks=params.num_blocks,
@@ -1288,6 +1614,17 @@ def _unified_attention_3d_gfx1250(
         SHUFFLED_KV_CACHE=params.shuffled_kv_cache,
         K_WIDTH=params.k_width,
         SCALE_K_WIDTH=params.scale_k_width,
+        FP8_PV=params.force_fp8_pv_on_fp4_kv_cache
+        and params.v_cache_dtype == torch.uint8,
+        V_CACHE_DTYPE=V_CACHE_DTYPE,
+        USE_STORE_TDM=True,
+        # experiment knob: NVFP4 KV + BF16 PV processed in 2 head-dim halves
+        HEAD_SIZE_SPLIT=(
+            int(os.environ.get("AITER_UA_FP4_HEAD_SPLIT", "1"))
+            if params.v_cache_dtype == torch.uint8
+            and not params.force_fp8_pv_on_fp4_kv_cache
+            else 1
+        ),
         WARP_SIZE=WARP_SIZE,
         NUM_BLOCKS_GATHER_PER_TILE=NUM_BLOCKS_GATHER_PER_TILE,
         QUERY_DTYPE=QUERY_DTYPE,
@@ -1307,6 +1644,7 @@ def _reduce_segments_gfx1250(
     segm_expsum,
     NUM_SEGMENTS,
     TILE_SIZE,
+    segm_tiles=None,
 ):
     head_size_padded = triton.next_power_of_2(params.head_size)
     gluon_num_warps = 8 if params.num_query_heads % 8 == 0 else 4
@@ -1320,6 +1658,7 @@ def _reduce_segments_gfx1250(
         seq_lens_ptr=params.seqused_k,
         num_query_heads=params.num_query_heads,
         out_scale_ptr=params.output_scale,
+        segm_tiles_ptr=segm_tiles,
         output_stride_0=params.out.stride(0),
         output_stride_1=params.out.stride(1),
         H=params.num_query_heads,
@@ -1334,6 +1673,57 @@ def _reduce_segments_gfx1250(
         num_warps=gluon_num_warps,
         **config,
         enable_fp_fusion=True,
+    )
+
+
+def _reduce_segments_split_rebalance_gfx1250(
+    params: _UAParams,
+    segm_output,
+    segm_max,
+    segm_expsum,
+    NUM_SEGMENTS,
+    TILE_SIZE,
+    segm_tiles=None,
+    output_gate=None,
+    output_rows=None,
+):
+    num_rows = params.num_tokens if output_rows is None else output_rows.shape[0]
+    if num_rows == 0:
+        return
+    sb = min(_GFX12_UA_SPLIT_REBALANCE_REDUCE_SB, NUM_SEGMENTS)
+    chunk = _GFX12_UA_SPLIT_REBALANCE_REDUCE_CHUNK
+    chunk = max(sb, min(chunk, NUM_SEGMENTS) // sb * sb)
+    spec = min(_GFX12_UA_SPLIT_REBALANCE_REDUCE_SPEC, chunk) // sb * sb
+    num_warps = _GFX12_UA_SPLIT_REBALANCE_REDUCE_NUM_WARPS
+    if params.head_size_v % (32 * num_warps) != 0:
+        num_warps = 1
+    _reduce_segments_split_rebalance_kernel_gfx1250[(num_rows, params.num_query_heads)](
+        params.out,
+        segm_output,
+        segm_max,
+        segm_expsum,
+        params.seqused_k,
+        params.num_seqs,
+        segm_tiles,
+        params.output_scale,
+        output_gate,
+        output_gate.stride(0) if output_gate is not None else 0,
+        output_rows,
+        params.out.stride(0),
+        params.out.stride(1),
+        H=params.num_query_heads,
+        S=NUM_SEGMENTS,
+        D=params.head_size_v,
+        TILE_SIZE=TILE_SIZE,
+        SEQLEN_Q=1 if params.all_decode else int(params.max_seqlen_q),
+        SB=sb,
+        CHUNK=chunk,
+        SPEC=spec,
+        NUM_WARPS=num_warps,
+        IS_FP8_OUT=(params.out.dtype == e4m3_dtype),
+        FP8_MIN=torch.finfo(e4m3_dtype).min,
+        FP8_MAX=torch.finfo(e4m3_dtype).max,
+        num_warps=num_warps,
     )
 
 
