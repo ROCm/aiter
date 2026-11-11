@@ -221,6 +221,8 @@ def test_deterministic_silu_clamped(model_dim, inter_dim, E, topk):
     assert not out.isnan().any().item(), "deterministic output contains NaN"
     ref = _reference(p, _M, model_dim, inter_dim, E, topk, ActivationType.Silu, **kw)
     default = _run(p, slice(None), ActivationType.Silu, False, **kw)
+    err = _err(ref, out, "deterministic")
+    assert err <= _ERR_MAX, f"checkAllclose mismatch vs the bf16 reference {err:.3%}"
     ld = _cos_diff(ref.float(), out.float())
     ld_default = _cos_diff(ref.float(), default.float())
     assert (
