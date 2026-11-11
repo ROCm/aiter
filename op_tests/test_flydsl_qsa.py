@@ -3797,6 +3797,8 @@ def test_qsa_layer_empty_indexer_keeps_causal_tail():
     case["index_table"] = torch.zeros(1, 1, dtype=dtypes.i32, device=device)
     case["qpos"].fill_(5)
     case["slen"].fill_(6)
+    case["query_lens"] = (1,)
+    case["prefix_lens"] = (5,)
 
     blocks = qsa_indexer_block_ids(
         case["q_indexer"],
@@ -3836,11 +3838,11 @@ def test_qsa_layer_empty_indexer_keeps_causal_tail():
         baseline_blocks = torch.empty(1, _K, dtype=dtypes.i32, device=device)
         baseline = qsa_layer(
             *_layer_args(case),
-            **_layer_kwargs(idx, block_ids=baseline_blocks),
+            **_layer_kwargs(idx, case, block_ids=baseline_blocks),
         )
         if not torch.equal(baseline_blocks, torch.full_like(baseline_blocks, -1)):
             raise AssertionError("empty indexer did not write caller block ids")
-        optimized = qsa_layer(*_layer_args(case), **_layer_kwargs(idx))
+        optimized = qsa_layer(*_layer_args(case), **_layer_kwargs(idx, case))
     finally:
         qsa_paged._expand_block_ids = original_expand
     if widths != [_K, 0]:
@@ -5167,6 +5169,9 @@ def _prepare_qsa_layer(idx, gqa, m, seq_len, page_size, dtype, cache_layout="pac
         "qpos": qpos,
         "slen": slen,
         "ref": ref,
+        # One request: the last ``m`` tokens of ``seq_len``.
+        "query_lens": (m,),
+        "prefix_lens": (seq_len - m,),
     }
 
 
@@ -5185,11 +5190,18 @@ def _layer_args(case):
     )
 
 
-def _layer_kwargs(idx, **extra):
+def _layer_kwargs(idx, case, **extra):
+    """Keyword args for ``qsa_layer``, including this fixture's host lengths.
+
+    On gfx950, a prefill of at least 512 rows whose lengths pass
+    ``_union_prefill_reason`` then runs the sparse prefill kernels.
+    """
     return {
         "token_topk": idx.token_budget,
         "compress_ratio": idx.compress_ratio,
         "score_scale": idx.head_dim**-0.5,
+        "query_lens": case["query_lens"],
+        "prefix_lens": case["prefix_lens"],
         **extra,
     }
 
@@ -5200,7 +5212,7 @@ def test_qsa_layer_flash_next_matches_oracle():
         pytest.skip("unsupported arch")
     idx, gqa = FLASH_NEXT_INDEXER, FLASH_NEXT_GQA
     case = _prepare_qsa_layer(idx, gqa, 2, 128, 16, dtypes.bf16)
-    out = qsa_layer(*_layer_args(case), **_layer_kwargs(idx))
+    out = qsa_layer(*_layer_args(case), **_layer_kwargs(idx, case))
     err = checkAllclose(
         case["ref"].output,
         out.to(dtypes.fp32),
@@ -5218,7 +5230,7 @@ def test_qsa_layer_gluon_parity_matches_oracle():
         pytest.skip("unsupported arch")
     idx, gqa = GLUON_PARITY_INDEXER, GLUON_PARITY_GQA
     case = _prepare_qsa_layer(idx, gqa, 2, 128, 16, dtypes.bf16)
-    out = qsa_layer(*_layer_args(case), **_layer_kwargs(idx))
+    out = qsa_layer(*_layer_args(case), **_layer_kwargs(idx, case))
     err = checkAllclose(
         case["ref"].output,
         out.to(dtypes.fp32),
@@ -5270,7 +5282,7 @@ def test_qsa_layer_decode_graph_replays():
             indices=indices,
             block_ids=block_ids,
             out=out,
-            **_layer_kwargs(idx),
+            **_layer_kwargs(idx, case),
         )
 
     _capture_replay_us(launch)
@@ -5528,7 +5540,7 @@ def _time_layer(case, idx, rotate):
     indices = torch.empty((m, idx.index_width), dtype=dtypes.i32, device=device)
     block_ids = torch.empty((m, idx.block_budget), dtype=dtypes.i32, device=device)
     out = torch.empty_like(case["q_gqa"])
-    kwargs = _layer_kwargs(idx, indices=indices, block_ids=block_ids, out=out)
+    kwargs = _layer_kwargs(idx, case, indices=indices, block_ids=block_ids, out=out)
     n_columns = int(case["index_table"].shape[1]) * int(case["index_cache"].shape[1])
     if n_columns > idx.block_budget:
         kwargs["scores"] = torch.empty((m, n_columns), dtype=dtypes.fp32, device=device)
@@ -5635,7 +5647,7 @@ def bench_qsa_flash_next_e2e_graph(
                 indices=indices,
                 block_ids=block_ids,
                 out=out,
-                **_layer_kwargs(idx),
+                **_layer_kwargs(idx, case),
             )
 
         us = _capture_replay_us(launch)
