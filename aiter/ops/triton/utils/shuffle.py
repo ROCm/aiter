@@ -300,7 +300,9 @@ def shuffle_scale_moe(
 
 
 # --- batched scales (FP4 blockscale16, attention) ---
-def shuffle_scale_batched(data: torch.Tensor, scale_k_width=None) -> torch.Tensor:
+def shuffle_scale_batched(
+    data: torch.Tensor, scale_k_width=None, preshuffle_factor=128
+) -> torch.Tensor:
     """Batched shuffle scales for the FP4 blockscale16 format.
 
     Single-layout permute, no arch branch: the blockscale16 layout is
@@ -311,7 +313,8 @@ def shuffle_scale_batched(data: torch.Tensor, scale_k_width=None) -> torch.Tenso
     data_shape = data.shape
     N = data_shape[-2]
     SCALE_K = data_shape[-1]
-    PRESHUFFLE_FACTOR = 128
+    # rows per preshuffle group: 128, or a smaller page (64-token NVFP4 KV pages)
+    PRESHUFFLE_FACTOR = preshuffle_factor
     if scale_k_width is None:
         SCALE_KWIDTH = (
             min(16, 1 << (SCALE_K - 1).bit_length()) if SCALE_K >= 4 else SCALE_K
