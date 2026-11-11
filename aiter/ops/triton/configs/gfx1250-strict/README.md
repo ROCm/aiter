@@ -2,7 +2,8 @@
 
 Every DEFAULT.json here holds a single generic "any" entry, copied from the
 gfx1250 table's "any" entry. There are no per-M buckets and no N/K-specialized
-files, so loaders report these as untuned (is_tuned=False) and use the same
+files (fused_sigmoid_mul also keeps the gfx1250 "strided" entry, which its
+kernel requires), so loaders report these as untuned (is_tuned=False) and use the same
 config for every shape. They exist so config-driven kernels can run on A0;
 they say nothing about A0 performance. Replace a family's DEFAULT.json with
 real A0 tables once it is tuned.
