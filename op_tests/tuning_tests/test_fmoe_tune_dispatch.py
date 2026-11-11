@@ -91,7 +91,13 @@ def _kernel_names(tasks):
 class TestFmoeTuneDispatch(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
-        from aiter.tuning.moe.backends import asm_1stage, asm_stage1, common, flydsl
+        from aiter.tuning.moe.backends import (
+            asm_1stage,
+            asm_stage1,
+            common,
+            flydsl,
+            opus,
+        )
         from csrc.ck_gemm_moe_2stages_codegen import gemm_moe_tune
 
         cls.gemm_moe_tune = gemm_moe_tune
@@ -99,6 +105,7 @@ class TestFmoeTuneDispatch(unittest.TestCase):
         cls.backend_asm_stage1 = asm_stage1
         cls.backend_asm_1stage = asm_1stage
         cls.backend_flydsl = flydsl
+        cls.backend_opus = opus
 
     def setUp(self):
         m = self.gemm_moe_tune
@@ -267,7 +274,6 @@ class TestFmoeTuneDispatch(unittest.TestCase):
     def test_opus_stage1_rejects_a_model_dim_that_misses_the_mfma_tile(self):
         # Stage1 needs model_dim % 128 == 0. 5184 % 128 == 64, and 1152 still
         # passes the inter_dim gate, so only stage1 disappears.
-        m = self.gemm_moe_tune
         bad = self.tuner.gen_opus_2stages_task(
             self.info(model_dim=5184, inter_dim=1152), BLOCK_MS
         )
@@ -284,13 +290,13 @@ class TestFmoeTuneDispatch(unittest.TestCase):
             [],
         )
         self.assertEqual(
-            m.opus_a8w4_stage1_instances_for_shape(
+            self.backend_opus.opus_a8w4_stage1_instances_for_shape(
                 model_dim=5120, logical_inter_dim=1168, inter_dim_pad=0
             ),
             (),
         )
         self.assertTrue(
-            m.opus_a8w4_stage1_instances_for_shape(
+            self.backend_opus.opus_a8w4_stage1_instances_for_shape(
                 model_dim=5120, logical_inter_dim=1152, inter_dim_pad=0
             )
         )
@@ -321,8 +327,7 @@ class TestFmoeTuneDispatch(unittest.TestCase):
 
     def test_opus_stage2_drops_a_block_n_that_misses_model_dim(self):
         # 5248 = 41 * 128: a multiple of block_n 64 and 128, not of 256.
-        m = self.gemm_moe_tune
-        catalog = m.get_opus_a8w4_stage2_kernels(token=1)
+        catalog = self.backend_opus.get_opus_a8w4_stage2_kernels(token=1)
         by_block_n = {}
         for name, kparams in catalog.items():
             by_block_n.setdefault(int(kparams["kernel_block_n"]), set()).add(name)
