@@ -39,7 +39,12 @@ except ImportError:
     _HAS_FLYDSL = False
 
 try:
-    from aiter.ops.flydsl.qsa_sparse_prefill import flydsl_qsa_sparse_prefill
+    from aiter.ops.flydsl.qsa_sparse_prefill import (
+        flydsl_qsa_sparse_prefill,
+    )
+    from aiter.ops.flydsl.qsa_sparse_prefill import (
+        qsa_sparse_prefill_problem as _flydsl_qsa_sparse_prefill_problem,
+    )
 
     _HAS_FLYDSL_PREFILL = True
 except ImportError:
@@ -243,16 +248,64 @@ def qsa_sparse_prefill(
     )
 
 
+def qsa_sparse_prefill_problem(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    indices: torch.Tensor,
+    *,
+    query_lens: Sequence[int] | None = None,
+    prefix_lens: Sequence[int] | None = None,
+    softmax_scale: float | None = None,
+    out: torch.Tensor | None = None,
+    kv_slots: torch.Tensor | None = None,
+) -> str | None:
+    """The first operand rule a ``qsa_sparse_prefill`` call with these arguments breaks,
+    as the message it raises, or None when the operands are accepted. States of the
+    process (graph capture, one GPU per process) are not operand rules.
+
+    See ``aiter.ops.flydsl.qsa_sparse_prefill.qsa_sparse_prefill_problem``.
+    """
+    if not _HAS_FLYDSL_PREFILL:
+        return "QSA sparse prefill requires FlyDSL"
+    return _flydsl_qsa_sparse_prefill_problem(
+        q,
+        k,
+        v,
+        indices,
+        query_lens=query_lens,
+        prefix_lens=prefix_lens,
+        softmax_scale=softmax_scale,
+        out=out,
+        kv_slots=kv_slots,
+    )
+
+
+def can_use_flydsl_qsa_sparse_prefill(*args, **kwargs) -> bool:
+    """Whether ``qsa_sparse_prefill_problem`` finds no rule broken (same arguments)."""
+    return qsa_sparse_prefill_problem(*args, **kwargs) is None
+
+
+def qsa_sparse_prefill_available() -> bool:
+    """Whether the FlyDSL backend of ``qsa_sparse_prefill`` imports in this process: the
+    answer a consumer asks once. The device and each call are asked of
+    ``qsa_sparse_prefill_problem``."""
+    return _HAS_FLYDSL_PREFILL
+
+
 __all__ = [
     "DEFAULT_LOGITS_WORKSPACE_BYTES",
     "FP4_GROUP",
     "FP8_DTYPE",
     "FP8_MAX",
+    "can_use_flydsl_qsa_sparse_prefill",
     "qsa_cache_row_layout",
     "qsa_expand_block_indices",
     "qsa_paged_mqa_logits",
     "qsa_select_paged_tokens",
     "qsa_sparse_paged_gqa",
     "qsa_sparse_prefill",
+    "qsa_sparse_prefill_available",
+    "qsa_sparse_prefill_problem",
     "qsa_store_quantized_rows",
 ]
