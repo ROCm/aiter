@@ -30,6 +30,7 @@ from aiter.ops.flydsl.kernels import buffer_ops as bo
 __all__ = [
     "CACHE_DEVICE",
     "CACHE_SYSTEM",
+    "EPOCH_MASK",
     "GeometryTuningTable",
     "TaggedMailbox",
     "atomic_add_agent",
@@ -88,6 +89,7 @@ __all__ = [
 _TAGGED_POLL_MAX = 12
 CACHE_DEVICE = 16
 CACHE_SYSTEM = 17
+EPOCH_MASK = (1 << 30) - 1
 DIAG_TICKS = 10 * 100_000_000
 TIMEOUT_BIT = -2147483648
 
@@ -218,9 +220,8 @@ class TaggedMailbox:
                 missing = fx.Int32(0)
                 for rank, address in enumerate(self.epoch_addresses):
                     seen = buffer_load_i32(address, 0, cache_modifier=CACHE_SYSTEM)
-                    missing = missing | (seen < self.expected_epoch).select(
-                        1 << rank, 0
-                    )
+                    behind = ((self.expected_epoch - seen) & fx.Int32(EPOCH_MASK)) == 1
+                    missing = missing | behind.select(1 << rank, 0)
                 atomic_or_global_at(
                     self.diagnostic + 8,
                     missing | fx.Int32(TIMEOUT_BIT),

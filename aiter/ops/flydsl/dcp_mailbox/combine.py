@@ -19,12 +19,10 @@ from flydsl.expr import const_expr, gpu, range_constexpr
 from flydsl.expr.typing import Int32, Int64, T
 
 from aiter.ops.flydsl.dcp_mailbox.common import (
-    EPOCH_MASK,
     KernelAbi,
     bf2_f32,
     bf16_pair,
     epoch_offset,
-    key_tuple,
     pair_layout,
     pair_span,
     token_tile,
@@ -37,6 +35,7 @@ from aiter.ops.flydsl.kernels import buffer_ops as bo
 from aiter.ops.flydsl.kernels.communication_ops_utils import (
     CACHE_DEVICE,
     CACHE_SYSTEM,
+    EPOCH_MASK,
     TaggedMailbox,
     atomic_add_agent,
     buffer_load_i32,
@@ -233,7 +232,6 @@ def build(key: CombineBuild):
     nblk = ((key.tokens + tile - 1) // tile) * hl
     lay = peer_layout(n, mt, hl, d)
     half = pair_span(lay)
-    keyed = key_tuple(key)
     name = (
         f"aiter_dcp_lse_combine_t{key.tokens}_n{n}_h{hl}_d{d}_m{mt}"
         f"_s{key.seqs}_e{int(key.base_e)}_l{int(key.ret_lse)}"
@@ -259,7 +257,6 @@ def build(key: CombineBuild):
         rank: Int32,
         state: Int64,
     ):
-        _ = keyed
         tid = fx.thread_idx.x
         bid = fx.block_idx.x
         first_b = (bid // hl) * tile
@@ -279,7 +276,7 @@ def build(key: CombineBuild):
         if const_expr(key.debug):
             _push_epoch(bid, tid, e, epoch_targets)
         mb = TaggedMailbox(
-            e % (1 << 30),
+            e & fx.Int32(EPOCH_MASK),
             debug=key.debug,
             epoch_addresses=epoch_sources,
             expected_epoch=e + 1,
@@ -354,10 +351,10 @@ def build(key: CombineBuild):
                 )
         _finish(tid, state, e, nblk)
 
-    return _jit(key, combine, nblk, threads, keyed)
+    return _jit(key, combine, nblk, threads)
 
 
-def _jit(key, combine, nblk, threads, keyed):
+def _jit(key, combine, nblk, threads):
     @flyc.jit
     def launch(
         out: Int64,
@@ -378,7 +375,6 @@ def _jit(key, combine, nblk, threads, keyed):
         state: Int64,
         stream: fx.Stream = _STREAM,
     ):
-        _ = keyed
         combine(
             out,
             out_sb,

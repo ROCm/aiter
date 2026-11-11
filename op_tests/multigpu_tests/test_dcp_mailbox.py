@@ -20,7 +20,8 @@ from aiter.ops.flydsl.dcp_mailbox import (
     dcp_query_gather,
 )
 from aiter.ops.flydsl.dcp_mailbox.combine import peer_layout
-from aiter.ops.flydsl.dcp_mailbox.common import EPOCH_MASK, epoch_offset
+from aiter.ops.flydsl.dcp_mailbox.common import epoch_offset
+from aiter.ops.flydsl.kernels.communication_ops_utils import EPOCH_MASK
 
 
 class _Group:
@@ -127,6 +128,13 @@ def worker(rank, world, tokens):
                     if not masked:
                         plain = dcp_lse_combine(cws, out, lse, base_e=base_e)
                         torch.testing.assert_close(plain, res, rtol=0, atol=0)
+            if dim == 64:
+                try:
+                    dcp_lse_combine(cws, out, lse, row_counts=row_counts.cpu())
+                except ValueError as error:
+                    assert "output device" in str(error)
+                else:
+                    raise AssertionError("CPU row_counts must be rejected")
             cws.close()
 
         dim = 512
@@ -138,6 +146,7 @@ def worker(rank, world, tokens):
             torch.bfloat16,
             world * hl,
             max_tokens,
+            debug=True,
         )
         query = torch.randn(
             tokens, hl, dim, device="cuda", dtype=torch.bfloat16, generator=gen
@@ -148,6 +157,12 @@ def worker(rank, world, tokens):
         dist.all_gather(parts, query)
         exp_q = torch.cat(parts, dim=1)
         torch.testing.assert_close(got, exp_q)
+        try:
+            dcp_query_gather(gws, query.cpu())
+        except ValueError as error:
+            assert "same device" in str(error)
+        else:
+            raise AssertionError("CPU query must be rejected")
 
         for _ in range(2):
             split_query = torch.randn(
@@ -199,6 +214,12 @@ def worker(rank, world, tokens):
         dist.all_gather(refs, ref)
         exp_fp8 = torch.cat(refs, dim=1)
         torch.testing.assert_close(qgot.float(), exp_fp8.float(), rtol=0.1, atol=1.0)
+        try:
+            dcp_quant_query_gather(qws, nope, pe, scale.cpu())
+        except ValueError as error:
+            assert "same device" in str(error)
+        else:
+            raise AssertionError("CPU scale must be rejected")
         qws.close()
         gws.close()
 

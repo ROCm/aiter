@@ -7,51 +7,14 @@
 
 from __future__ import annotations
 
-import enum
-import functools
-import hashlib
 import inspect
 import os
-from dataclasses import dataclass, fields
-from pathlib import Path
+from dataclasses import dataclass
 
 import flydsl.expr as fx
 
 PAIR_BYTES = 8
 EPOCH_BYTES = 4
-EPOCH_MASK = (1 << 30) - 1
-
-_SCALARS = (int, float, bool, str, enum.Enum)
-_ROOT = Path(__file__).resolve().parent
-_SHARED_SOURCES = (
-    _ROOT.parent / "kernels" / "communication_ops_utils.py",
-    _ROOT.parent / "kernels" / "kernels_common.py",
-    _ROOT.parent / "kernels" / "quant_utils.py",
-)
-
-
-@functools.cache
-def source_digest() -> str:
-    """Hash the mailbox sources into FlyDSL's JIT key."""
-    h = hashlib.sha256()
-    for path in [*sorted(_ROOT.glob("*.py")), *_SHARED_SOURCES]:
-        h.update(path.name.encode())
-        h.update(path.read_bytes())
-    return h.hexdigest()[:16]
-
-
-def key_tuple(key) -> tuple:
-    """Return all build fields and the mailbox source digest."""
-    out = []
-    for field in fields(key):
-        value = getattr(key, field.name)
-        if not isinstance(value, _SCALARS):
-            raise TypeError(
-                f"{type(key).__name__}.{field.name}={value!r} must be a scalar"
-            )
-        out.append((field.name, value))
-    out.append(("sources", source_digest()))
-    return tuple(out)
 
 
 def pair_layout(items) -> dict:

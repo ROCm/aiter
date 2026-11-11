@@ -30,7 +30,6 @@ from aiter.ops.flydsl.dcp_mailbox.common import (
     KernelAbi,
     bf2_f32,
     epoch_offset,
-    key_tuple,
     pair_layout,
     pair_span,
     token_tile,
@@ -42,6 +41,7 @@ from aiter.ops.flydsl.dcp_mailbox.peer import PeerBuffer
 from aiter.ops.flydsl.kernels import buffer_ops as bo
 from aiter.ops.flydsl.kernels.communication_ops_utils import (
     CACHE_DEVICE,
+    EPOCH_MASK,
     TaggedMailbox,
     buffer_load_i32,
     buffer_resource,
@@ -117,7 +117,6 @@ def build(key: GatherBuild):
     nblk = ((key.tokens + tile - 1) // tile) * hl
     lay = peer_layout(n, mt, hl, w)
     half = pair_span(lay)
-    keyed = key_tuple(key)
     name = (
         f"aiter_dcp_qgather_t{key.tokens}_n{n}_h{hl}_w{w}_p{key.pad_heads}"
         f"_m{mt}_q{key.nope}_f{key.fold}x{key.qlen}_s{key.phase}"
@@ -138,7 +137,6 @@ def build(key: GatherBuild):
         rank: Int32,
         state: Int64,
     ):
-        _ = keyed
         tid = fx.thread_idx.x
         bid = fx.block_idx.x
         first_b = (bid // hl) * tile
@@ -158,7 +156,7 @@ def build(key: GatherBuild):
         if const_expr(key.debug):
             _push_epoch(bid, tid, e, epoch_targets)
         mb = TaggedMailbox(
-            e % (1 << 30),
+            e & fx.Int32(EPOCH_MASK),
             debug=key.debug,
             epoch_addresses=epoch_sources,
             expected_epoch=e + 1,
@@ -256,10 +254,10 @@ def build(key: GatherBuild):
         if const_expr(key.phase != 1):
             _finish(tid, state, e, nblk)
 
-    return _jit(key, gather, nblk, keyed)
+    return _jit(key, gather, nblk)
 
 
-def _jit(key, gather, nblk, keyed):
+def _jit(key, gather, nblk):
     @flyc.jit
     def launch(
         q: Int64,
@@ -275,7 +273,6 @@ def _jit(key, gather, nblk, keyed):
         state: Int64,
         stream: fx.Stream = _STREAM,
     ):
-        _ = keyed
         gather(
             q,
             q_sb,
