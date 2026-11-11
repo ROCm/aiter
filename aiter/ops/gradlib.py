@@ -8,6 +8,7 @@ import torch
 from csrc.cpp_itfs.torch_utils import direct_register_custom_op
 
 from ..jit.core import compile_ops
+from ..jit.utils.torch_guard import torch_compile_guard
 
 
 @compile_ops("module_hipbsolgemm")
@@ -186,6 +187,104 @@ def hipb_findallsols(
 
 @compile_ops("module_hipbsolgemm")
 def getHipblasltKernelName() -> None: ...
+
+
+def gen_hipb_grouped_mm_fake_tensor(
+    a: torch.Tensor,
+    b: torch.Tensor,
+    cu_seqlens: torch.Tensor,
+    out: torch.Tensor,
+    a_is_transposed: bool = False,
+    bias: torch.Tensor | None = None,
+    solution_index: int = -1,
+) -> None:
+    return None
+
+
+@compile_ops(
+    "module_hipb_groupedgemm",
+    fc_name="hipb_grouped_mm",
+    gen_fake=gen_hipb_grouped_mm_fake_tensor,
+)
+def _hipb_grouped_mm(
+    a: torch.Tensor,
+    b: torch.Tensor,
+    cu_seqlens: torch.Tensor,
+    out: torch.Tensor,
+    a_is_transposed: bool = False,
+    bias: torch.Tensor | None = None,
+    solution_index: int = -1,
+) -> None: ...
+
+
+@torch_compile_guard(
+    device="cuda",
+    mutates_args=["out"],
+    gen_fake=gen_hipb_grouped_mm_fake_tensor,
+)
+def hipb_grouped_mm(
+    a: torch.Tensor,
+    b: torch.Tensor,
+    cu_seqlens: torch.Tensor,
+    out: torch.Tensor,
+    a_is_transposed: bool = False,
+    bias: torch.Tensor | None = None,
+    solution_index: int = -1,
+) -> None:
+    _hipb_grouped_mm(a, b, cu_seqlens, out, a_is_transposed, bias, solution_index)
+
+
+def gen_hipb_multistream_mm_fake_tensor(
+    a: torch.Tensor,
+    b: torch.Tensor,
+    cu_seqlens: torch.Tensor,
+    out: torch.Tensor,
+    a_is_transposed: bool = False,
+    bias: torch.Tensor | None = None,
+    b_is_transposed: bool = False,
+) -> None:
+    return None
+
+
+@compile_ops(
+    "module_hipb_groupedgemm",
+    fc_name="hipb_multistream_mm",
+    gen_fake=gen_hipb_multistream_mm_fake_tensor,
+)
+def _hipb_multistream_mm(
+    a: torch.Tensor,
+    b: torch.Tensor,
+    cu_seqlens: torch.Tensor,
+    out: torch.Tensor,
+    a_is_transposed: bool = False,
+    bias: torch.Tensor | None = None,
+    b_is_transposed: bool = False,
+) -> None: ...
+
+
+@torch_compile_guard(
+    device="cuda",
+    mutates_args=["out"],
+    gen_fake=gen_hipb_multistream_mm_fake_tensor,
+)
+def hipb_multistream_mm(
+    a: torch.Tensor,
+    b: torch.Tensor,
+    cu_seqlens: torch.Tensor,
+    out: torch.Tensor,
+    a_is_transposed: bool = False,
+    bias: torch.Tensor | None = None,
+    b_is_transposed: bool = False,
+) -> None:
+    _hipb_multistream_mm(
+        a,
+        b,
+        cu_seqlens,
+        out,
+        a_is_transposed,
+        bias,
+        b_is_transposed,
+    )
 
 
 @compile_ops("module_rocsolgemm")

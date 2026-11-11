@@ -613,11 +613,11 @@ def test_pa_ps(
     else:
         # warmup for get_pa_metadata_v1
         aiter.get_pa_metadata_v1(
-            torch.tensor([0], dtype=torch.int32),
-            torch.tensor([0], dtype=torch.int32),
-            torch.tensor([0], dtype=torch.int32),
-            1,
-            1,
+            qo_indptr,
+            kv_indptr,
+            seq_lens_kv,
+            num_query_heads // num_kv_heads,
+            num_kv_heads,
             is_causal,
             work_metadata_ptrs,
             work_indptr,
@@ -627,8 +627,8 @@ def test_pa_ps(
             reduce_partial_map,
             kv_granularity=max(block_size, 16),
             block_size=block_size,
-            max_seqlen_qo=1,
-            uni_seqlen_qo=1,
+            max_seqlen_qo=int(max_qlen),
+            uni_seqlen_qo=qlen,
             fast_mode=True,
             max_split_per_batch=-1,
         )
