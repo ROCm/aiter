@@ -25,7 +25,6 @@ from aiter.ops.mha_v4_quant import (
 from .comm_collectives_host_shared import resolve_inbox_flags
 from .communication_ops_host_utils import make_symmetric_heap
 from .kernels.attention_a2a_intranode_kernel import (
-    FG_RELEASE_MODES,
     _transport_bytes,
     make_attention_a2a_dequant_jit,
     make_attention_a2a_jit,
@@ -39,31 +38,16 @@ from .kernels.tensor_shim import _run_compiled
 _DEFAULT_BLOCK_NUM = 128
 _DEFAULT_WARP_NUM_PER_BLOCK = 8
 _MAX_RAW_BUFFER_BYTES = 0xFFFFFFFF
-_DEFAULT_FG_RELEASE = "last_wg"
 # Assumed when the XCD count cannot be read. Safe for 1, 2, 4 or 8 XCDs:
 # a multiple of the true count only adds releases.
 _FALLBACK_N_XCD = 8
 
 
-def _resolve_fg_release(inbox_memory, device):
-    """(mode, XCD count) of the release that publishes fine-grained payload lines.
-
-    An uncached inbox caches nothing, so it needs none. Otherwise
-    AITER_A2A_FG_RELEASE picks a mode of FG_RELEASE_MODES (default "last_wg").
-    """
-    if inbox_memory != "finegrained":
-        return "none", 0
-    mode = os.environ.get("AITER_A2A_FG_RELEASE", _DEFAULT_FG_RELEASE)
-    if mode not in FG_RELEASE_MODES:
-        raise ValueError(
-            f"AITER_A2A_FG_RELEASE must be one of {FG_RELEASE_MODES}, got {mode!r}"
-        )
-    if mode == "none":
-        return mode, 0
+def _resolve_n_xcd(device):
     from aiter.jit.utils.chip_info import get_num_xcds
 
     with torch.cuda.device(device):
-        return mode, get_num_xcds(default=_FALLBACK_N_XCD)
+        return get_num_xcds(default=_FALLBACK_N_XCD)
 
 
 def _payload_size(
@@ -239,10 +223,6 @@ class AttentionA2AIntraNodeOp:
 
     Debug: AITER_A2A_SPIN_TIMEOUT_ITERS=N (default 0, off) makes each device
     wait loop trap after N polls instead of hanging; part of the cache key.
-    AITER_A2A_FG_RELEASE selects how a fine-grained inbox's payload lines are
-    written back from every XCD's L2 before the completion flag: "last_wg"
-    (default), "flush_kernel", or "none" (unsafe, for measurement);
-    see FG_RELEASE_MODES. Part of the cache key, and all ranks must agree.
     """
 
     def __init__(
@@ -452,9 +432,7 @@ class AttentionA2AIntraNodeOp:
                 )
         self.valid_kv_len = valid_kv_len
         self.inbox_memory = resolve_inbox_flags(inbox_memory, world_size)[1]
-        self.fg_release, self.n_xcd = _resolve_fg_release(
-            self.inbox_memory, self.device
-        )
+        self.n_xcd = _resolve_n_xcd(self.device)
         # Must run before any symmetric allocation: mismatched configs
         # would otherwise hang in the shmem barrier instead of raising.
         if group.size() != world_size:
@@ -477,7 +455,6 @@ class AttentionA2AIntraNodeOp:
             world_size,
             spin_timeout_iters,
             self.inbox_memory,
-            self.fg_release,
             self.n_xcd,
         )
         configs = [None] * world_size
@@ -688,11 +665,6 @@ class AttentionA2AIntraNodeOp:
                     output.zero_()
             self.xdb_mem.zero_()
             self.xdb_flag = torch.ones(1, dtype=torch.int64, device=device)
-            # Per-XCD arrival counters of fg_release="last_wg". Each payload launch
-            # leaves them at zero, and the launches are stream-ordered.
-            self.xcd_arrived = torch.zeros(
-                max(self.n_xcd, 1), dtype=torch.int32, device=device
-            )
 
             # The heap barrier is host-only: peers must not publish into our flags
             # before our zeroing has completed on the device. The zeroing is enqueued
@@ -767,7 +739,7 @@ class AttentionA2AIntraNodeOp:
                 "spin_timeout_iters": spin_timeout_iters,
                 # A fine-grained inbox may hold payload lines dirty in the L2 of
                 # any XCD; every XCD's L2 is written back before the flag.
-                "fg_release": self.fg_release,
+                "flush_l2": self.inbox_memory == "finegrained",
                 "n_xcd": self.n_xcd,
             }
             for i in range(role_count)
@@ -852,7 +824,6 @@ class AttentionA2AIntraNodeOp:
                 if role == 2 and self.p2p_v_partial_ready_sets
                 else 0
             ),
-            self.xcd_arrived.data_ptr(),
             stream,
         )
         self._submit_role_launch(role, args)

@@ -52,17 +52,6 @@ V_PC_TOKEN_TILE = 32
 # Use only where the index is guaranteed below outer_extent * outer_stride.
 UNBOUNDED_OUTER_EXTENT = 2**31 - 1
 
-# How payload stores into a cacheable (fine-grained) inbox are written back from
-# the L2 of every XCD before completion-publish raises the flag:
-#   "none"          nothing beyond the kernel-boundary release (uncached inbox);
-#   "last_wg"       the last workgroup to finish on each XCD releases;
-#   "flush_kernel"  a one-workgroup-per-XCD kernel releases between payload and
-#                   completion-publish.
-# Both releasing modes assume round-robin dispatch (workgroup bid runs on XCD
-# bid % n_xcd). They stay correct when n_xcd is a multiple of the true XCD
-# count: each residue class still lies on one XCD and releases it.
-FG_RELEASE_MODES = ("none", "last_wg", "flush_kernel")
-
 
 def v_pc_partial_elems(seq_len, heads, head_dim):
     """FP32 elements of the private e4m3_pc partial-maximum workspace."""
@@ -595,8 +584,6 @@ def make_attention_a2a_kernel(
     partial_only=False,
     pc_reduce=False,
     spin_timeout_iters=0,
-    fg_release="none",
-    n_xcd=0,
 ):
     target_arch = current_target().arch
     native_fp6 = (
@@ -823,7 +810,6 @@ def make_attention_a2a_kernel(
         addr_xdb_flag: fx.Int64,
         addr_p2p_partial: fx.Int64,
         addr_p2p_partial_ready: fx.Int64,
-        addr_xcd_arrived: fx.Int64,
     ):
         tid = fx.thread_idx.x
         bid = fx.block_idx.x
@@ -2800,52 +2786,6 @@ def make_attention_a2a_kernel(
                     hadamard,
                     v4_output,
                 )
-            if const_expr(fg_release == "last_wg"):
-                # A system-scope writeback covers the whole L2 of this XCD. One
-                # lane callig the memory fence suffices once the stores of every
-                # wave have reached it. Every workgroup must have it's pending
-                # stores completed before the first lane of the last WG flushes.
-                fx.rocdl.s_waitcnt(vmcnt=0)
-                fx.barrier()
-                if tid == 0:
-                    # Round-robin dispatch puts workgroup bid on XCD
-                    # bid % n_xcd. The workgroup that arrives last there
-                    # is the first point at which every line of that XCD is in its L2.
-                    xcd = fx.Int32(bid) % fx.Int32(n_xcd)
-                    # The count the last arrival on XCD xcd reads: the number of
-                    # its workgroups minus one.
-                    last_seen = (fx.Int32(block_num - 1) - xcd) // fx.Int32(n_xcd)
-                    arrived = fx.add_offset(
-                        fx.inttoptr(
-                            fx.PointerType.get(
-                                fx.Int32.ir_type,
-                                address_space=fx.AddressSpace.Global,
-                                alignment=4,
-                            ),
-                            addr_xcd_arrived,
-                        ),
-                        xcd,
-                    )
-                    previous = fx.atomic_add(
-                        arrived,
-                        fx.Int32(1),
-                        ordering=fx.AtomicOrdering.Monotonic,
-                        syncscope=fx.rocdl.SyncScope.Agent,
-                    )
-                    if previous == last_seen:
-                        # Zero the counter, all WGs have arrived.
-                        fx.generic_store(
-                            arrived,
-                            fx.Int32(0),
-                            memory_order=fx.AtomicOrdering.Monotonic,
-                            syncscope=fx.rocdl.SyncScope.Agent,
-                        )
-                        # Write back this XCD's L2 so the payload is visible
-                        # to peers before completion-publish.
-                        fx.memory_fence(
-                            ordering=fx.AtomicOrdering.Release,
-                            syncscope=fx.rocdl.SyncScope.OneAs,
-                        )
 
     return attention_a2a_single_push
 
@@ -2929,8 +2869,7 @@ def make_attention_a2a_flush_kernel():
     """
 
     @flyc.kernel(known_block_size=[64, 1, 1])
-    def attention_a2a_l2_flush(addr_unused: fx.Int64):
-        _ = addr_unused
+    def attention_a2a_l2_flush():
         fx.memory_fence(
             ordering=fx.AtomicOrdering.Release,
             syncscope=fx.rocdl.SyncScope.OneAs,
@@ -2958,17 +2897,9 @@ def make_attention_a2a_jit(
     v4_amax=False,
     fp8_fnuz=False,
     spin_timeout_iters=0,
-    fg_release="none",
+    flush_l2=False,
     n_xcd=0,
 ):
-    if fg_release not in FG_RELEASE_MODES:
-        raise ValueError(
-            f"fg_release must be one of {FG_RELEASE_MODES}, got {fg_release!r}"
-        )
-    if fg_release == "none":
-        n_xcd = 0
-    elif n_xcd < 1:
-        raise ValueError(f"fg_release={fg_release!r} needs the XCD count, got {n_xcd}")
     split_v_exchange = needs_split_v_exchange(v_pack, seq_len)
     pc_partial = v4_output == "v" and codec == "e4m3_pc" and v4_amax
     common = {
@@ -2989,9 +2920,6 @@ def make_attention_a2a_jit(
         "v4_amax": v4_amax,
         "fp8_fnuz": fp8_fnuz,
         "spin_timeout_iters": spin_timeout_iters,
-        # The flush kernel replaces any release inside the payload kernels.
-        "fg_release": "none" if fg_release == "flush_kernel" else fg_release,
-        "n_xcd": n_xcd,
     }
     # The partial launch precedes the payload launch so no payload block waits
     # on a block of its own launch.
@@ -3004,7 +2932,7 @@ def make_attention_a2a_jit(
     completion = make_attention_a2a_completion_kernel(
         rank=rank, npes=npes, spin_timeout_iters=spin_timeout_iters
     )
-    flush = make_attention_a2a_flush_kernel() if fg_release == "flush_kernel" else None
+    flush = make_attention_a2a_flush_kernel() if flush_l2 else None
     # rank is compile-time so rank-dependent ownership (split frame, k_own_tiles,
     # last-rank padding, odd-rank scales, sender dword selection) folds; the cache
     # therefore grows with world size.
@@ -3026,7 +2954,7 @@ def make_attention_a2a_jit(
         v4_amax,
         fp8_fnuz,
         spin_timeout_iters,
-        fg_release,
+        flush_l2,
         n_xcd,
         current_target().arch,
         os.environ.get("AITER_A2A_FP6_FORCE_SOFTWARE", "0") == "1",
@@ -3043,7 +2971,6 @@ def make_attention_a2a_jit(
         addr_xdb_flag: fx.Int64,
         addr_p2p_partial: fx.Int64,
         addr_p2p_partial_ready: fx.Int64,
-        addr_xcd_arrived: fx.Int64,
         stream: Stream = Stream(None),  # noqa: B008
     ):
         _ = key
@@ -3055,7 +2982,6 @@ def make_attention_a2a_jit(
                 addr_xdb_flag,
                 addr_p2p_partial,
                 addr_p2p_partial_ready,
-                addr_xcd_arrived,
             ).launch(
                 grid=(block_num, 1, 1),
                 block=(warp_num_per_block * 64, 1, 1),
@@ -3063,9 +2989,7 @@ def make_attention_a2a_jit(
             )
         if const_expr(flush is not None):
             # Stream order: after every payload workgroup, before the flag.
-            flush(addr_xcd_arrived).launch(
-                grid=(n_xcd, 1, 1), block=(64, 1, 1), stream=stream
-            )
+            flush().launch(grid=(n_xcd, 1, 1), block=(64, 1, 1), stream=stream)
         for phase in range_constexpr(2):
             completion(
                 addr_xdb_mem, addr_p2p_xdb_mem, addr_xdb_flag, phase == 0
