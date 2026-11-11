@@ -30,9 +30,23 @@ class TestFusedQuantSupportedArch(unittest.TestCase):
         self.assertEqual(gfx1250, {"1x32": True, "32x32": True, "128x128": False})
         self.assertEqual(self._answers("gfx1250-strict"), gfx1250)
 
-    def test_other_arch_has_no_fused_epilogue(self):
+    def test_gfx950_fuses_every_block(self):
         self.assertEqual(
             self._answers("gfx950"),
+            {"1x32": True, "32x32": True, "128x128": True},
+        )
+
+    def test_gfx950_column_major_x_scale_does_not_fuse(self):
+        from aiter.ops.flydsl.batched_gemm_a8w8 import (
+            bmm_a8w8_mxfp8_fused_quant_supported,
+        )
+
+        with patch("aiter.ops.flydsl.batched_gemm_a8w8.get_gfx", return_value="gfx950"):
+            self.assertFalse(bmm_a8w8_mxfp8_fused_quant_supported("128x128", True))
+
+    def test_other_arch_has_no_fused_epilogue(self):
+        self.assertEqual(
+            self._answers("gfx942"),
             {"1x32": False, "32x32": False, "128x128": False},
         )
 
