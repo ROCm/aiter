@@ -3483,7 +3483,6 @@ def bwd_kernel_fused_causal(  # grid = (nheads_k, tl.cdiv(max_seqlen_q // BLOCK_
     DEBUG_TRITON_DETAIL: tl.constexpr,
     NUM_XCD: tl.constexpr = 1,
 ):
-<<<<<<< HEAD:aiter/ops/triton/_triton_kernels/attention/dao_ai/bwd.py
     # The forward's dropout state, read on the device: no host sync, and capture stays legal.
     if ENABLE_DROPOUT:
         philox_seed = tl.load(rng_state)
@@ -3491,7 +3490,6 @@ def bwd_kernel_fused_causal(  # grid = (nheads_k, tl.cdiv(max_seqlen_q // BLOCK_
     else:
         philox_seed = 0
         philox_offset_base = 0
-=======
     # Cast strides to int64 to prevent int32 overflow for large sequences (>2^31 elements).
     # Keeps function signature unchanged to retain 32-bit vectorized load specialization.
     stride_qb = tl.cast(stride_qb, tl.int64)
@@ -3539,7 +3537,6 @@ def bwd_kernel_fused_causal(  # grid = (nheads_k, tl.cdiv(max_seqlen_q // BLOCK_
     stride_az = tl.cast(stride_az, tl.int64)
     stride_ah = tl.cast(stride_ah, tl.int64)
 
->>>>>>> 34a3c41b9 ([Triton] Cast strides to int64 in MHA backward kernels to prevent overflow):aiter/ops/triton/_triton_kernels/flash_attn_triton_amd/bwd.py
     # program ids
     hkid = tl.program_id(0)
     pid = tl.program_id(1)
@@ -4173,7 +4170,6 @@ def bwd_kernel_fused_noncausal(
     DEBUG_TRITON_DETAIL: tl.constexpr,
     NUM_XCD: tl.constexpr = 1,
 ):
-<<<<<<< HEAD:aiter/ops/triton/_triton_kernels/attention/dao_ai/bwd.py
     # The forward's dropout state, read on the device: no host sync, and capture stays legal.
     if ENABLE_DROPOUT:
         philox_seed = tl.load(rng_state)
@@ -4181,7 +4177,6 @@ def bwd_kernel_fused_noncausal(
     else:
         philox_seed = 0
         philox_offset_base = 0
-=======
     # Cast strides to int64 to prevent int32 overflow for large sequences (>2^31 elements).
     # Keeps function signature unchanged to retain 32-bit vectorized load specialization.
     stride_qb = tl.cast(stride_qb, tl.int64)
@@ -4229,7 +4224,6 @@ def bwd_kernel_fused_noncausal(
     stride_az = tl.cast(stride_az, tl.int64)
     stride_ah = tl.cast(stride_ah, tl.int64)
 
->>>>>>> 34a3c41b9 ([Triton] Cast strides to int64 in MHA backward kernels to prevent overflow):aiter/ops/triton/_triton_kernels/flash_attn_triton_amd/bwd.py
     # program ids
     hkid = tl.program_id(0)
     pid = tl.program_id(1)
