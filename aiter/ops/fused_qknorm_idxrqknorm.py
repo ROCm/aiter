@@ -104,6 +104,15 @@ def fused_qknorm_idxrqknorm(
     #   no k_scale/v_scale.
     # index_cache_dtype="mxfp4": index_cache is whole contiguous pages; only the index-K write
     #   changes.
+    # kv_cache_dtype="nvfp4" + index_cache_dtype="nvfp4" (together; an index-less layer, skip_index_branch,
+    #   passes index_cache_dtype "auto"): K, V and index-K are quantized to NVFP4 (e2m1 + one e4m3 scale per
+    #   16 elements) straight into the pages, in the same pass as norm/RoPE. kv_cache_k and kv_cache_v are the
+    #   same uint8 [num_pages, 2 * num_kv_heads * 9216] pages ([K data | K scale | V data | V scale], K scale
+    #   and V in MFMA lane order), block_size 128, 4 B aligned page stride; V is written by atomic and/or on
+    #   32-bit words, so no two tokens of one call may share a slot;
+    #   index_cache is whole contiguous 9216 B pages ([128 x 64 B e2m1][128 x 8 B e4m3]); k_scale / v_scale are
+    #   the fp32 [1] global scales of K and V (the index key has none). The rounding is integer/compare
+    #   arithmetic, not a hardware convert: the bytes do not depend on the arch.
     # q_out may be an e4m3 tensor (fp8 or uint8, insert mode): unit-scale e4m3 cast, saturating
     #   (+-inf too; NaN stays NaN), written instead of the bf16 q (as index_q_out).
     if index_cache_dtype is None:
