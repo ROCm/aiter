@@ -1,0 +1,153 @@
+name: MI450 gfx1250 Operator Tests
+
+# Curated gfx1250 operator manifests (.github/test-manifests) on one MI450
+# GPU with the ROCm 10 image, under the strict contract of
+# .github/scripts/run_pytest_manifest.py. See .github/test-manifests/README.md.
+#
+# The job runs only when these repository variables are set:
+#   AITER_MI450_RUNNER  runner label of a one-GPU MI450 runner
+#   AITER_MI450_IMAGE   ROCm 10 PyTorch image pinned by digest, with the
+#                       gfx1250 B0-to-A0 translations pre-built (README.md)
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '30 22 * * *'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  ci_config:
+    if: ${{ vars.AITER_MI450_RUNNER != '' && vars.AITER_MI450_IMAGE != '' }}
+    uses: ./.github/workflows/ci-config.yaml
+
+  mi450:
+    name: MI450 gfx1250 operators
+    needs: ci_config
+    runs-on: ${{ vars.AITER_MI450_RUNNER }}
+    timeout-minutes: 180
+    env:
+      DOCKER_IMAGE: ${{ vars.AITER_MI450_IMAGE }}
+      REPORTS: test-reports/mi450-gfx1250
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Docker login
+        env:
+          DOCKER_USERNAME: ${{ secrets[needs.ci_config.outputs.docker_username_secret] }}
+          DOCKER_PASSWORD: ${{ secrets[needs.ci_config.outputs.docker_password_secret] }}
+        run: |
+          for attempt in 1 2 3; do
+            if echo "$DOCKER_PASSWORD" | docker login -u "$DOCKER_USERNAME" --password-stdin; then
+              exit 0
+            fi
+            echo "Docker login attempt ${attempt} failed"
+            if [ "${attempt}" != 3 ]; then
+              sleep 10
+            fi
+          done
+          echo "Docker login failed after 3 attempts, continuing anyway"
+
+      - name: Run the container
+        # The ROCm 10 images install Python packages into the system Python,
+        # which pip treats as externally managed (PEP 668). The container is
+        # discarded after the job.
+        run: |
+          set -ex
+          if [ -f "/etc/podinfo/gha-render-devices" ]; then
+            DEVICE_FLAG=$(cat /etc/podinfo/gha-render-devices)
+          else
+            DEVICE_FLAG="--device /dev/dri"
+          fi
+          docker run -dt \
+            --device=/dev/kfd $DEVICE_FLAG \
+            --shm-size=16G \
+            --network=host \
+            --group-add "$(getent group render | cut -d: -f3)" \
+            --group-add "$(getent group video | cut -d: -f3)" \
+            -e GPU_ARCHS=gfx1250 \
+            -e PIP_BREAK_SYSTEM_PACKAGES=1 \
+            -e CONTAINER_IMAGE="${DOCKER_IMAGE}" \
+            -v "${{ github.workspace }}:/workspace" \
+            -w /workspace \
+            --name aiter_mi450 \
+            "${DOCKER_IMAGE}"
+
+      - name: Use the complete ROCm SDK prefix
+        # ROCm 10 images ship ROCm as Python packages. The default prefix,
+        # _rocm_sdk_core, is runtime-only: JIT builds there find no rocPRIM,
+        # and FlyDSL finds no ld.lld or device bitcode (ROCm/FlyDSL#946).
+        # _rocm_sdk_devel is a complete tree. Login shells pick this up.
+        run: |
+          set -ex
+          docker exec -i aiter_mi450 bash -s <<'SH'
+          set -euo pipefail
+          devel="$(python3 -c 'import sysconfig; print(sysconfig.get_paths()["purelib"])')/_rocm_sdk_devel"
+          if [ ! -d "${devel}" ]; then
+            echo "No _rocm_sdk_devel; keeping the image's ROCm prefix."
+            exit 0
+          fi
+          cat > /etc/profile.d/zz-rocm-sdk-devel.sh <<EOF
+          export ROCM_PATH=${devel} ROCM_HOME=${devel} HIP_PATH=${devel} ROCM_SOURCE_DIR=${devel}
+          export LD_LIBRARY_PATH=${devel}/lib\${LD_LIBRARY_PATH:+:\${LD_LIBRARY_PATH}}
+          EOF
+          cat /etc/profile.d/zz-rocm-sdk-devel.sh
+          SH
+
+      - name: Install dependencies and aiter
+        timeout-minutes: 30
+        run: |
+          docker exec -w /workspace aiter_mi450 bash -lc ./.github/scripts/build_aiter_triton.sh
+
+      - name: P0 operators
+        timeout-minutes: 45
+        run: |
+          docker exec -w /workspace aiter_mi450 bash -lc "
+            python3 .github/scripts/run_pytest_manifest.py \
+              --manifest .github/test-manifests/mi450-gfx1250-p0.txt \
+              --require-gfx gfx1250 --timeout 2400 \
+              --artifact-dir ${REPORTS}/p0"
+
+      - name: P1 operators
+        if: ${{ !cancelled() }}
+        timeout-minutes: 45
+        run: |
+          docker exec -w /workspace aiter_mi450 bash -lc "
+            python3 .github/scripts/run_pytest_manifest.py \
+              --manifest .github/test-manifests/mi450-gfx1250-p1.txt \
+              --require-gfx gfx1250 --timeout 2400 \
+              --artifact-dir ${REPORTS}/p1"
+
+      - name: Known failures still fail
+        if: ${{ !cancelled() }}
+        timeout-minutes: 20
+        run: |
+          docker exec -w /workspace aiter_mi450 bash -lc "
+            python3 .github/scripts/run_pytest_manifest.py \
+              --manifest .github/test-manifests/mi450-gfx1250-known-failures.txt \
+              --require-gfx gfx1250 --expect-failure --timeout 900 \
+              --artifact-dir ${REPORTS}/known-failures"
+
+      - name: Upload MI450 test evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: mi450-gfx1250
+          path: ${{ env.REPORTS }}
+          if-no-files-found: warn
+          retention-days: 14
+
+      - name: Cleanup container
+        if: always()
+        run: |
+          docker rm -f aiter_mi450 || true
+          docker logout || true

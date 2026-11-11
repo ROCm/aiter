@@ -1,0 +1,41 @@
+# MI450/gfx1250 P0 operator selectors: 23 nodes.
+#
+# Selected by the AITER team against ROCm/aiter main @ 1834ee16974f and
+# collected on MI455X A0 (ROCm 10.2) at the commit in README.md. The routing
+# test moved to moe/moe_routing/ in #5940. Each line is an exact selector and
+# the number of nodes it must collect. When collection changes, review what was
+# added, removed, or modified before editing a count; never edit a count to
+# restore a green result.
+#
+# The P0 selection is 27 nodes. Four are not gating yet:
+#   test_flydsl_grouped_gemm.py (3 nodes) fails until #7536 is fixed and is
+#     tracked in mi450-gfx1250-known-failures.txt; move it back here when that
+#     run reports it fixed.
+#   test_mla_flydsl.py::test_mla_flydsl page-faults in about one run in four,
+#     even as the first GPU user in its process (#7781).
+
+# Architecture and A0 stepping guards.
+op_tests/test_asm_guard.py::test_rocminfo_reports_the_running_gpu 1
+op_tests/test_asm_guard.py::test_stepping_is_the_node_minimum 1
+op_tests/test_asm_guard.py::test_gate_follows_detected_stepping 1
+
+# gfx1250 code-object registry/assets, bounded numerical loading, and dispatch.
+# Do not select test_gfx1250_co_kernel_matches_torch at function scope: it
+# expands to every packaged code object.
+op_tests/test_opus_co_integration.py::test_gfx1250_co_registry_and_launch_contract 1
+op_tests/test_opus_co_integration.py::test_gfx1250_co_assets_and_host_only_codegen 1
+op_tests/test_opus_co_integration.py::test_gfx1250_co_dir_override_matches_torch 1
+op_tests/test_opus_co_integration.py::test_gfx1250_tuner_selects_co_without_split_k 1
+
+# A16W16 contracts not covered by a basic shape-only test.
+op_tests/test_opus_a16w16_gemm.py::test_gfx1250_bf16_output_accepts_fp32_bias 1
+op_tests/test_opus_a16w16_gemm.py::test_gfx1250_split_k_reducer_row_limit 1
+
+# MoE routing range coverage: n_tokens x n_expts_tot.
+op_tests/triton_tests/moe/moe_routing/test_moe_routing.py::test_topk_in_range 12
+
+# Invalid routing input contract.
+op_tests/test_moe_sorting.py::test_moe_sorting_invalid_topk_ids 1
+
+# DeepSeek-V4 fused QK norm/RoPE input-layout contract.
+op_tests/test_flydsl_qk_norm_rope_quant.py::test_flydsl_qk_norm_rope_quant_cos_sin_4d 1

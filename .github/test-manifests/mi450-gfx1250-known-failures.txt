@@ -1,0 +1,26 @@
+# MI450/gfx1250 known upstream failures: run with --expect-failure.
+#
+# The run passes while every node still fails in setup or call. A node that
+# passes, skips, crashes, or changes count turns it red for review: if the bug
+# is fixed, move the node into the P0 or P1 manifest. Failures whose
+# reproduction hangs the GPU (#7776) or page-faults it (#7781) are not run.
+
+# #7536: P0 grouped expert GEMM tests run FlyDSL in run-only mode, but the AOT
+# build never produces their test-only shapes.
+op_tests/flydsl_tests/test_flydsl_grouped_gemm.py::test_grouped_a8w4_situv2_matches_torch_ref 1
+op_tests/flydsl_tests/test_flydsl_grouped_gemm.py::test_grouped_a4w4_situv2_matches_torch_ref 1
+op_tests/flydsl_tests/test_flydsl_grouped_gemm.py::test_grouped_a4w4_silu_matches_torch_ref 1
+
+# #7777: sparse decode fp8 and v4-unified wrong at kv_len=136; with_extra wrong.
+op_tests/triton_tests/attention/test_pa_decode_sparse.py::test_pa_decode_sparse_fp8_vs_reference[False-136-512-128-1]
+op_tests/triton_tests/attention/test_pa_decode_sparse.py::test_pa_decode_sparse_v4_unified_vs_2buff[False-256-136-128-1]
+op_tests/triton_tests/attention/test_pa_decode_sparse.py::test_pa_decode_sparse_v4_unified_vs_2buff[True-64-136-128-32]
+op_tests/triton_tests/attention/test_pa_decode_sparse.py::test_pa_decode_sparse_with_extra[False-256-False-fp8-256-128-512-128-1]
+op_tests/triton_tests/attention/test_pa_decode_sparse.py::test_pa_decode_sparse_with_extra[False-256-True-fp8-8-128-512-16-128]
+
+# #7778: preshuffled split-K KeyError NUM_BUFFERS.
+op_tests/triton_tests/gemm/basic/test_gemm_afp4wfp4.py::test_gemm_afp4_wfp4_preshuffle_splitk[1-10240-8192]
+op_tests/triton_tests/gemm/basic/test_gemm_afp4wfp4.py::test_gemm_afp4_wfp4_preshuffle_splitk[64-8192-28672]
+
+# #7779: B0-only ASM raises on A0 instead of skipping; a fix shows up as a skip.
+op_tests/test_mla_decode_pagesize64.py::TestMlaQh128::test_reference_and_lse[lengths0-576]
