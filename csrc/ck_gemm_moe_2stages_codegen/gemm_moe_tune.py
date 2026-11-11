@@ -1713,12 +1713,23 @@ class FmoeTuner(TunerCommon):
         kernel_name="",
         topk=2,
         dtype=dtypes.bf16,
+        flat=AsmMoeMode.SORTED,
     ):
-        moe_buf = torch.zeros(
-            (a1.shape[0], a1.shape[1]),
-            dtype=dtype,
-            device="cuda",
-        )
+        if not AsmMoeMode(flat).requires_host_sort:
+            # Match _moe_prepare_unsorted_input: eight coordination bytes
+            # follow the visible output for no_sort/emsort kernels.
+            shape = (a1.shape[0], a1.shape[1])
+            output_bytes = (
+                shape[0] * shape[1] * torch.empty(0, dtype=dtype).element_size()
+            )
+            backing = torch.zeros(output_bytes + 8, dtype=torch.uint8, device=a1.device)
+            moe_buf = backing[:output_bytes].view(dtype).view(shape)
+        else:
+            moe_buf = torch.zeros(
+                (a1.shape[0], a1.shape[1]),
+                dtype=dtype,
+                device="cuda",
+            )
         aiter.fmoe_fp8_blockscale_g1u1(
             moe_buf,
             a1,
@@ -3112,6 +3123,19 @@ class FmoeTuner(TunerCommon):
         if asm_1stage_csv_path and os.path.exists(asm_1stage_csv_path):
             _df = pd.read_csv(asm_1stage_csv_path)
             asm_1stage_flat = _manifest_flat_by_kernel(_df)
+        # Matching gfx942 BF16-manifest entries quantize activation internally.
+        gfx942_bf16_flat = {}
+        if (
+            get_gfx() == "gfx942"
+            and q_type == QuantType.per_1x128
+            and q_dtype_a == dtypes.fp8
+        ):
+            bf16_csv = kernels_list_csv_1stage.format(
+                quantDtype_1stage="blockscaleBf16",
+                extraInfo_1stage=extraInfo_1stage,
+            )
+            if os.path.exists(bf16_csv):
+                gfx942_bf16_flat = _manifest_flat_by_kernel(pd.read_csv(bf16_csv))
         fmoe_func = (
             FmoeTuner.get_1stage_fmoe_func(
                 q_type, q_dtype_a, act_type, use_g1u1, doweight_stage1
@@ -3130,6 +3154,11 @@ class FmoeTuner(TunerCommon):
                 # time the sorted-input producer and its reduction together.
                 flat_flag = int(asm_1stage_flat.get(el, AsmMoeMode.SORTED))
                 asm_mode = AsmMoeMode(flat_flag)
+                input_bf16 = (
+                    not asm_mode.requires_host_sort
+                    and gfx942_bf16_flat.get(el) == flat_flag
+                )
+                stage = "asm_1stage_xbf16" if input_bf16 else "asm_1stage"
                 if asm_mode is AsmMoeMode.POST_REDUCE:
                     if (
                         q_type != QuantType.per_1x32
@@ -3149,10 +3178,12 @@ class FmoeTuner(TunerCommon):
                 else:
                     candidate_func = fmoe_func
                     _data_idx = [0, 1, 2, 3, 4, 5, 6, 7, 18, 10, 11, 17]
+                if input_bf16:
+                    _data_idx[1] = 0
                 _data_names = [_GEN_DATA_1STAGE_KEYS[i] for i in _data_idx]
                 task_1stage.append(
                     (
-                        (info, "asm_1stage", el, tile_m, flat_flag),
+                        (info, stage, el, tile_m, flat_flag),
                         FmoeTuner.generate_data_1stage,
                         (
                             token,
@@ -3180,7 +3211,8 @@ class FmoeTuner(TunerCommon):
                         ),
                         (
                             {"flat": asm_mode}
-                            if asm_mode is AsmMoeMode.POST_REDUCE
+                            if q_type == QuantType.per_1x128
+                            or asm_mode is AsmMoeMode.POST_REDUCE
                             else {}
                         ),
                         (
@@ -3293,7 +3325,7 @@ class FmoeTuner(TunerCommon):
                                 topk,
                                 dtype,
                             ),
-                            {},
+                            {"flat": asm_mode},
                             (FmoeTuner.torch_moe_blockscale),
                             (
                                 [
