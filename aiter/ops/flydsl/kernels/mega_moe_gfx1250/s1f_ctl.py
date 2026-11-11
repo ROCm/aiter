@@ -661,8 +661,10 @@ class _Stage1Fusion:
             "a_strides": (wire_row, wire_row),
             "variant": align_m if align_m in _S1F_VARIANTS else sorted(_S1F_VARIANTS),
         }
-        # The stage-1 kernel runs its own 256x256 n/k tiles.
-        got["tile"], want["tile"] = got["tile"][:1], want["tile"][:1]
+        if os.environ.get("AITER_S1F_ANY_TILE", "1") == "0":
+            # Strict mode (hyi): also require the stage-1 kernel's own n/k tiles.
+            got["tile_nk"] = (int(tile_n), int(tile_k))
+            want["tile_nk"] = (_S1F_TILE_N, _S1F_TILE_K)
         bad = {k: (got[k], want[k]) for k in want if got[k] != want[k]}
         if bad or stage1_act not in (1, 2) or quant_scale is None:
             raise RuntimeError(
