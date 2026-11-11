@@ -23,6 +23,7 @@ logger = logging.getLogger(__name__)
 # checked at import time.
 try:
     from aiter.ops.flydsl import allreduce_policy as fly_policy
+    from aiter.ops.flydsl.allreduce_host_shared import eligible_payload_bytes
     from aiter.ops.flydsl.one_shot_allreduce import OneShotAllReduceRMSNorm
     from aiter.ops.flydsl.quick_allreduce import (
         FlyQuickAllReduce,
@@ -32,6 +33,7 @@ try:
     _FLY_IMPORT_OK = True
 except Exception:  # noqa: BLE001
     fly_policy = None
+    eligible_payload_bytes = None
     OneShotAllReduceRMSNorm = None
     FlyQuickAllReduce = None
     FlyQuickAllReduceRMSNorm = None
@@ -340,14 +342,10 @@ class FlyDSLQuickAllReduce:
         """Whether this path can and should all-reduce *inp*. Never raises."""
         if self.disabled:
             return False
-        if not isinstance(inp, torch.Tensor) or inp.dtype is not torch.bfloat16:
-            return False
-        # Strictly contiguous: the engines reject weakly-contiguous views.
-        if not inp.is_contiguous() or inp.data_ptr() % 16:
-            return False
-        nbytes = inp.numel() * inp.element_size()
-        # Every FlyDSL schedule reads and writes 16 B atoms.
-        if nbytes % 16 or nbytes > fly_policy.MAX_PAYLOAD_BYTES:
+        # bf16, strictly contiguous (the engines reject weakly-contiguous
+        # views), on this device, and in whole 16 B atoms.
+        nbytes = eligible_payload_bytes(inp, device=self.device)
+        if nbytes is None:
             return False
         return self.select(nbytes) is not None
 

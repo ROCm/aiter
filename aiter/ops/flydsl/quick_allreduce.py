@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
 
-"""Host launch for gfx942/gfx950 TP∈{2,4,8} INT4/INT6 all-reduce.
+"""Host launch for gfx942/gfx950 TP∈{2,4,8} INT4/INT5/INT6 all-reduce.
 
 Public types ``FlyQuickAllReduce`` (plain) and ``FlyQuickAllReduceRMSNorm``
 (fused with residual-add + RMSNorm), with two interchangeable schedules selected
@@ -11,8 +11,9 @@ they are named for the topology of each lap instead:
 * ``"mesh"`` the default: fanout to all N-1 peers, twice.
 * ``"ring"`` 2(N-1) single-destination hops.
 
-Super-tile ST∈{1,8} on the mesh, ST∈{1,8,16,32} on the ring. INT4 nibble or
-INT6 bit-plane pair, both with group-16 E5M2 scales. Payload HBM is bf16.
+Super-tile ST∈{1,8} on the mesh, ST∈{1,8,16,32} on the ring. INT4 nibble,
+INT5 nibble+1-bit plane, or INT6 bit-plane pair, all with group-16 E5M2
+scales. INT5 is mesh-only. Payload HBM is bf16.
 
 The kernel configuration comes from a tuning ladder of ``TwoShotRung``, keyed
 on ``(arch, link, world_size)`` in ``allreduce_policy``.
@@ -81,6 +82,7 @@ from .kernels.comm.quick_allreduce_mesh import (
     clamp_grid_cap,
     make_quick_allreduce_mesh_kernel,
     mesh_fanout_fits,
+    mesh_lds_bytes,
 )
 from .kernels.comm.quick_allreduce_ring import (
     make_quick_allreduce_ring_kernel,
@@ -139,6 +141,12 @@ class _Algorithm:
     fused_block_ok: Callable[[int, int, str], bool] | None = None
     # Whether the plain kernel takes the shared ``divisor`` as its last argument.
     has_divisor: bool = False
+    # Whether the schedule carries one wire format on both laps (the mesh).
+    single_codec: bool = False
+    # ``(block, world_size, codec) -> bytes``: LDS of one plain workgroup, to
+    # bound the persistent grid by LDS residency as well as by VGPRs; None
+    # when the VGPR table is the tighter bound for every codec.
+    lds_bytes: Callable[[int, int, str], int] | None = None
 
 
 def _build_mesh(
@@ -189,6 +197,8 @@ ALGORITHMS = {
         fused_st_ladder=fused_mesh_st_ladder,
         fused_block_ok=mesh_fanout_fits,
         has_divisor=True,
+        single_codec=True,
+        lds_bytes=mesh_lds_bytes,
     ),
     "ring": _Algorithm(
         name="ring",
@@ -213,11 +223,17 @@ def _resolve_codecs(algo, world_size, rs_codec, ag_codec):
 
     A codec the selected schedule cannot build raises.
 
-    The mesh has one wire format for both laps, so there ``rs_codec`` and
-    ``ag_codec`` follow each other: give either one and the other takes the
-    same value. Giving two different values raises when the kernel is built.
+    The mesh is single-codec: ``rs_codec`` and ``ag_codec`` follow each other,
+    so give either one and the other takes the same value, and giving two
+    different values raises. It stays on INT4 unless a caller names another
+    format, so the ring's INT6 reduce-scatter default does not leak into it.
     """
-    if algo.name == "mesh" and (rs_codec is None) != (ag_codec is None):
+    if algo.single_codec:
+        if rs_codec is not None and ag_codec is not None and rs_codec != ag_codec:
+            raise ValueError(
+                f"{algo.name} algorithm carries one wire format, got "
+                f"rs_codec={rs_codec!r} != ag_codec={ag_codec!r}"
+            )
         rs_codec = ag_codec = rs_codec if rs_codec is not None else ag_codec
 
     rs_default, ag_default = default_codecs(algo.name, world_size)
@@ -387,6 +403,11 @@ class FlyQuickAllReduce:
                         cu_count=cu_count,
                         block=b,
                     )
+                    if algo.lds_bytes is not None:
+                        # The VGPR table assumes INT4's rank-tile; a wider
+                        # codec can run out of LDS first.
+                        wg_lds = algo.lds_bytes(b, self.world_size, rs_codec)
+                        grid = min(grid, max(1, lds_capacity // wg_lds) * cu_count)
                     shared_grid = torch.tensor(grid, dtype=torch.int64)
                     dist.all_reduce(shared_grid, op=dist.ReduceOp.MIN, group=group)
                     spec = algo.build(

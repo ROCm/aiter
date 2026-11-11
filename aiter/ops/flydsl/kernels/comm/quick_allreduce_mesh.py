@@ -92,6 +92,7 @@ __all__ = [
     "WORLD",
     "clamp_grid_cap",
     "make_quick_allreduce_mesh_kernel",
+    "mesh_lds_bytes",
 ]
 
 PHASES = 2
@@ -174,6 +175,20 @@ def mesh_fanout_quads(block: int, world_size: int, codec: str) -> tuple[int, int
     c = codecs_for_block(int(block))[codec]
     stripes = [(b, min(8, c.n_sectors - b)) for b in range(0, c.n_sectors, 8)]
     return int(block) // QUAD_LANES, max(int(world_size) * w for _, w in stripes)
+
+
+def mesh_lds_bytes(
+    block: int, world_size: int, codec: str, partial_floats: int = 0
+) -> int:
+    """LDS of one mesh workgroup: a packed rank-tile per (destination,
+    rank-atom), then the epilogue's per-wave partials, if any.
+
+    The wider codecs pack bigger rank-tiles, so from INT6 on LDS, not VGPRs,
+    can bound how many workgroups a CU holds (gfx942 TP8 ST=8).
+    """
+    c = codecs_for_block(int(block))[codec]
+    pack_rows = (int(world_size) - 1) * (ATOMS // int(world_size))
+    return pack_rows * c.rank_tile_bytes + int(partial_floats) * 4
 
 
 def mesh_fanout_fits(block: int, world_size: int, codec: str) -> bool:
@@ -287,10 +302,8 @@ def make_quick_allreduce_mesh_kernel(
     # One pack row per (destination, rank-atom).
     pack_rows = n_push * rank_atoms
     pack_i32 = pack_rows * c.rank_tile_i32
-    lds_bytes = pack_rows * c.rank_tile_bytes
-
     # The epilogue's per-wave LDS partials, if any, follow the pack staging.
-    lds_bytes += epilogue.partial_floats * 4
+    lds_bytes = mesh_lds_bytes(block, world_size, codec, epilogue.partial_floats)
     PackStorage = make_pack_storage(pack_i32)
 
     # flags_i32 is also the i32 offset of the wire area, so the flag prefix has

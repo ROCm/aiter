@@ -9,7 +9,8 @@ and in which configuration.
 * **one-shot** (``OneShotAllReduce``) -- one round, no grid-wide barrier, wire
   volume ``(N-1)*S``. Exact: fp32 accumulate, one bf16 rounding.
 * **mesh** (``FlyQuickAllReduce(algorithm="mesh")``) -- two-shot, fanout to all
-  ``N-1`` peers twice, wire volume ``2(N-1)/N*S``, INT4 on the wire.
+  ``N-1`` peers twice, wire volume ``2(N-1)/N*S``, INT4 on the wire by default
+  (INT5, INT6 or FP16 when pinned).
 * **ring** (``FlyQuickAllReduce(algorithm="ring")``) -- two-shot, ``2(N-1)``
   hops, same wire volume as the mesh, traded for per-destination locality.
 
@@ -117,7 +118,7 @@ FANOUT_ORDERS = ("peer", "atom")
 SUPER_TILES = (1, 8)
 
 # Wire formats the mesh can build.
-MESH_CODECS = ("int4", "fp16")
+MESH_CODECS = ("int4", "int5", "int6", "fp16")
 
 # Ring algorithm.
 #
@@ -168,9 +169,14 @@ _TWO_SHOT_CODECS = {
 
 
 def default_codecs(algorithm: str, world_size: int) -> tuple[str, str]:
-    """The ``(rs_codec, ag_codec)`` of a two-shot *algorithm* at *world_size*."""
+    """The ``(rs_codec, ag_codec)`` of a two-shot *algorithm* at *world_size*.
+
+    Only the ring moves its reduce-scatter lap to INT6 (``RS_INT6_MIN_WORLD``).
+    The mesh stays on INT4 at every world size; its INT5 and INT6 are opt-in.
+    """
     rs_codecs, ag_codecs = _TWO_SHOT_CODECS[algorithm]
-    rs = "int6" if int(world_size) >= RS_INT6_MIN_WORLD else "int4"
+    ring_int6 = algorithm == "ring" and int(world_size) >= RS_INT6_MIN_WORLD
+    rs = "int6" if ring_int6 else "int4"
     ag = "int4"
     return (
         rs if rs in rs_codecs else rs_codecs[0],

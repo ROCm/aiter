@@ -49,6 +49,7 @@ from aiter.jit.utils.chip_info import get_gfx
 from aiter.ops.flydsl.allreduce_policy import MAX_BLOCK
 from aiter.ops.flydsl.kernels.comm.quick_allreduce_codec import (
     CODECS,
+    SCALE_CODEC_TAG,
     SECTOR_I32,
     _atom_bf16_to_f16,
     _atom_f16_to_bf16,
@@ -201,7 +202,7 @@ def make_codec_roundtrip_kernel(
             value_attrs={"rocdl.flat_work_group_size": flat_wg},
         ).launch(grid=(grid_x, 1, 1), block=(block, 1, 1), stream=stream)
 
-    tag = f"{codec_name}_{'mem' if via_memory else 'reg'}_b{block}"
+    tag = f"{SCALE_CODEC_TAG}_{codec_name}_{'mem' if via_memory else 'reg'}_b{block}"
     launch.func.__name__ = f"launch_codec_roundtrip_{tag}"
     try:
         codec_roundtrip.func.__name__ = f"codec_roundtrip_{tag}"
@@ -259,7 +260,7 @@ GROUP_ELEMS = 16
 # fraction of the true one.
 SCALE_REL_SLACK = 1.0 / 8.0
 
-CODEC_NAMES = ("int4", "int6")
+CODEC_NAMES = ("int4", "int5", "int6")
 
 
 def _payload(
@@ -369,10 +370,25 @@ def test_int6_codec_is_more_accurate_than_int4():
     xf = x.float()
     rms = {
         c: float((codec_roundtrip(x, c).float() - xf).pow(2).mean().sqrt())
-        for c in CODEC_NAMES
+        for c in ("int4", "int6")
     }
     ratio = rms["int6"] / rms["int4"]
     assert 0.15 <= ratio <= 0.30, f"int6/int4 RMS ratio {ratio:.3f}, expected ~0.25"
+
+
+def test_int5_sits_between_int4_and_int6():
+    """One extra bit vs INT4, one fewer than INT6, on the same input."""
+    x = _payload(n_tiles=4, seed=41)
+    xf = x.float()
+    rms = {
+        c: float((codec_roundtrip(x, c).float() - xf).pow(2).mean().sqrt())
+        for c in ("int4", "int5", "int6")
+    }
+    assert rms["int6"] < rms["int5"] < rms["int4"], rms
+    r54 = rms["int5"] / rms["int4"]
+    r65 = rms["int6"] / rms["int5"]
+    assert 0.35 <= r54 <= 0.70, f"int5/int4 RMS ratio {r54:.3f}, expected ~0.5"
+    assert 0.35 <= r65 <= 0.70, f"int6/int5 RMS ratio {r65:.3f}, expected ~0.5"
 
 
 @pytest.mark.parametrize("codec_name", CODEC_NAMES)
@@ -381,7 +397,7 @@ def test_degenerate_groups_stay_finite(codec_name):
 
     ``1/d`` is materialised as fp16, so without the clamp in ``_codec_quant`` a
     zero-extremum group reaches the codec as Inf and ``0 * Inf`` poisons the
-    tile. INT6 has a quarter of INT4's headroom here, hence both codecs.
+    tile. INT6 has a quarter of INT4's headroom here; INT5 is in between.
     """
     x = _payload(n_tiles=2, seed=43).reshape(-1, GROUP_ELEMS)
     x[0::4] = 0.0
@@ -454,8 +470,8 @@ def test_small_extremum_survives_instead_of_zeroing(codec_name, ext):
     read a scale of 0 and every value in the group came back as 0. The encoder
     bumps such a value to ``0x01``, the smallest non-zero magnitude. 1e-4 is
     below E4M3's old floor of ``2**-7`` and below this codec's scale floor
-    (``2**-12`` for INT4, ``2**-10`` for INT6), so it is quantized against the
-    floor scale and still lands within a step.
+    (``2**-12`` for INT4, ``2**-11`` for INT5, ``2**-10`` for INT6), so it is
+    quantized against the floor scale and still lands within a step.
     """
     decoded = codec_roundtrip(_spike_group(ext, fill=0.0), codec_name)
     assert torch.isfinite(decoded.float()).all()
@@ -474,6 +490,7 @@ def test_scale_floor_keeps_the_encode_factor_in_fp16():
         smallest = 2.0 ** (c.scale_min_e5 - 12)
         assert 1.0 / (smallest * abs(c.dec_step)) <= FP16_MAX, name
     assert CODECS["int4"].scale_min_e5 == 0
+    assert CODECS["int5"].scale_min_e5 == 1
     assert CODECS["int6"].scale_min_e5 == 2
 
 
@@ -489,7 +506,7 @@ def test_fp16_codec_roundtrip_is_identity(block):
 
 
 @pytest.mark.parametrize("block", BLOCK_WIDTHS)
-@pytest.mark.parametrize("codec_name", ("int4", "int6", "fp16"))
+@pytest.mark.parametrize("codec_name", ("int4", "int5", "int6", "fp16"))
 def test_rank_tile_regions_are_whole_sectors(codec_name, block):
     """Every region starts and the rank-tile ends on a 64 B fabric sector.
 
@@ -501,14 +518,15 @@ def test_rank_tile_regions_are_whole_sectors(codec_name, block):
     offsets = [c.hi2_i32_off, c.scale_i32_off, c.rank_tile_i32]
     for off in (o for o in offsets if o is not None):
         assert off % SECTOR_I32 == 0, (codec_name, block, offsets)
-    # No region is short: one nibble i32 per thread, one 2-bit i32 per lane
-    # pair, one scale i32 per group of 8 threads, four fp16x2 i32 per thread.
+    # No region is short: one nibble i32 per thread, one extra-bit i32 per
+    # lane pair (INT6) or quartet (INT5), one scale i32 per group of 8
+    # threads, four fp16x2 i32 per thread.
     if c.name == "fp16":
         assert c.rank_tile_i32 == 4 * block
         return
     if c.hi2_i32_off is not None:
         assert c.hi2_i32_off == block
-        assert c.scale_i32_off - c.hi2_i32_off == block // 2
+        assert c.scale_i32_off - c.hi2_i32_off == block // c.hi_share
     else:
         assert c.scale_i32_off == block
     assert c.rank_tile_i32 - c.scale_i32_off >= block // 8
@@ -575,6 +593,11 @@ def test_default_block_reproduces_the_shipped_geometry():
     t = codecs_for_block(BLOCK)
     assert (t["int4"].scale_i32_off, t["int4"].rank_tile_i32) == (256, 288)
     assert (
+        t["int5"].hi2_i32_off,
+        t["int5"].scale_i32_off,
+        t["int5"].rank_tile_i32,
+    ) == (256, 320, 352)
+    assert (
         t["int6"].hi2_i32_off,
         t["int6"].scale_i32_off,
         t["int6"].rank_tile_i32,
@@ -613,18 +636,14 @@ def test_ring_codec_defaults_widen_from_tp4(world_size, expected):
 
 @pytest.mark.parametrize("world_size", (2, 4, 8))
 def test_mesh_is_int4_at_every_world_size(world_size):
-    """The mesh has no separable lap, so the per-N default must not leak into it.
-
-    It also has no INT6 kernel at all, which is why the TP8 reduce-scatter
-    default narrows back to INT4 here rather than raising.
-    """
     assert _resolve("mesh", world_size) == ("int4", "int4")
 
 
 @pytest.mark.parametrize("world_size", (2, 4, 8))
 def test_mesh_has_one_wire_format_so_one_argument_sets_both(world_size):
     """The mesh sends one wire format on both laps, so naming one of them is
-    enough. Two different values are still an error at build time."""
+    enough. Two different values are an error (see
+    ``test_mesh_rejects_two_different_laps``)."""
     assert _resolve("mesh", world_size, rs="fp16") == ("fp16", "fp16")
     assert _resolve("mesh", world_size, ag="fp16") == ("fp16", "fp16")
     assert _resolve("mesh", world_size, rs="fp16", ag="fp16") == ("fp16", "fp16")
@@ -632,35 +651,36 @@ def test_mesh_has_one_wire_format_so_one_argument_sets_both(world_size):
 
 @pytest.mark.parametrize("codec", ("int4", "int6"))
 def test_explicit_arguments_set_both_laps(codec):
-    """Pinning a wire format is per-lap and explicit.
-
-    This is the path that replaced ``AITER_ALL_REDUCE_CODEC``: the all-gather
-    lap has no other way to reach INT6, and at TP8 an explicit ``"int4"`` is a
-    real downgrade of the reduce-scatter lap rather than a restatement of its
-    default.
-    """
     assert _resolve("ring", 8, rs=codec, ag=codec) == (codec, codec)
 
 
 def test_explicit_argument_outranks_the_per_world_default():
-    """TP8's reduce-scatter lap defaults to INT6; asking for INT4 must get it."""
     assert _resolve("ring", 8) == ("int6", "int4")
     assert _resolve("ring", 8, rs="int4") == ("int4", "int4")
 
 
 def test_one_lap_can_be_pinned_without_disturbing_the_other():
-    """The laps resolve independently, so pinning the cheap one leaves the
-    reduce-scatter lap on its per-world default."""
     assert _resolve("ring", 8, ag="int6") == ("int6", "int6")
     assert _resolve("ring", 8, ag="int4") == ("int6", "int4")
 
 
 def test_explicit_codec_the_schedule_cannot_build_raises():
-    """Naming a codec the schedule has no kernel for is a programming error.
-
-    Only the per-world *default* narrows silently (see
-    ``test_mesh_is_int4_at_every_world_size``); an explicit argument raises, so
-    a caller never believes it pinned a wire format it did not get.
-    """
     with pytest.raises(ValueError, match="rs_codec"):
-        _resolve("mesh", 8, rs="int6")
+        _resolve("mesh", 8, rs="nosuch")
+    with pytest.raises(ValueError, match="rs_codec"):
+        _resolve("ring", 8, rs="int5")
+
+
+@pytest.mark.parametrize("lap", ("rs", "ag"))
+@pytest.mark.parametrize("codec", ("int5", "int6"))
+def test_mesh_mirrors_a_single_named_lap(lap, codec):
+    assert _resolve("mesh", 8, **{lap: codec}) == (codec, codec)
+
+
+def test_mesh_rejects_two_different_laps():
+    with pytest.raises(ValueError, match="one wire format"):
+        _resolve("mesh", 8, rs="int6", ag="int4")
+
+
+if __name__ == "__main__":
+    raise SystemExit(pytest.main([__file__, "-v"]))

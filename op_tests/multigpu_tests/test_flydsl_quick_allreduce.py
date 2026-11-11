@@ -9,7 +9,7 @@ kernels, and ``bench`` compares them with aiter's HIP quick all-reduce.
 **verify** covers what production dispatch can run on this host, and each
 sweep ends in a markdown table:
 
-* ``test_quick_allreduce_int4`` -- the shipping configuration (codecs and
+* ``test_quick_allreduce`` -- the shipping configuration (codecs and
   super-tile left to the per-world defaults and ladders, as production dispatch
   constructs the engine), timed on a CUDA graph of ``GRAPH_INNER``
   back-to-back calls and checked again after every replay. The payloads come
@@ -18,12 +18,12 @@ sweep ends in a markdown table:
   plus the top of its window. A schedule the policy never selects on this
   host (the ring on xGMI) gets one row, for a user who moves the boundary with
   ``AITER_FLY_AR_MESH_MAX_BYTES``.
-* ``test_quick_allreduce_int4_coverage`` -- the kernels those rows ran include
+* ``test_quick_allreduce_coverage`` -- the kernels those rows ran include
   every kernel the engine's own ``cfgs_for`` says the window selects.
-* ``test_quick_allreduce_int4_edge_inputs`` -- payloads that land on the group
+* ``test_quick_allreduce_edge_inputs`` -- payloads that land on the group
   scale's edge cases, sums above E4M3's old ceiling of 480 on every rank, and
   degenerate groups that must stay finite.
-* ``test_quick_allreduce_int4_divisor`` -- the mesh's shared divisor at TP8: an
+* ``test_quick_allreduce_divisor`` -- the mesh's shared divisor at TP8: an
   outlier fill must reach the SQNR floor at divisor 1 (the E5M2 scale does not
   clip it) and lose at most ``DIVISOR_MAX_LOSS_DB`` at divisor 8, and a
   small-magnitude fill must keep full SQNR at the default.
@@ -34,12 +34,13 @@ sweep ends in a markdown table:
   ladder on the shipping payloads, so it covers the geometry that ships.
 
 ``--extended`` adds what production never selects: the legacy fixed shipping
-shapes; ``test_quick_allreduce_int4`` again, as a second table, with ``block``
+shapes; ``test_quick_allreduce`` again, as a second table, with ``block``
 overridden on every rung of the shipping ladder (``KNOB_CASES``), including
 the narrow blocks where a VMEM store-data hazard once showed up; the fp16
 transport over a matrix of pinned ``super_tile``/``block``; and
-``test_quick_allreduce_int4_pinned_codec`` -- the ring with its wire formats
-pinned per lap: all-INT4 at TP8, and one lap lossless to isolate the other.
+``test_quick_allreduce_pinned_codec`` -- the ring with its wire formats
+pinned per lap: all-INT4 at TP8, and one lap lossless to isolate the other;
+and the mesh on its opt-in INT5 and INT6 wire formats at TP4 and TP8.
 
 Every row also checks that all ranks wrote bit-identical output: each rank
 decodes every chunk from the same packets, its own included -- its own from the
@@ -298,15 +299,27 @@ EDGE_CASES = (
     (8, "ring", 512, 5120, "degenerate"),
 )
 
-# (tp, tokens, hidden, rs_codec, ag_codec), ring algo only. ``--extended``
-# only: production leaves both laps at the per-world default.
+# (tp, algorithm, tokens, hidden, rs_codec, ag_codec). ``--extended`` only:
+# production leaves both laps at the per-world default.
 PINNED_CODEC_CASES = (
-    (8, 512, 5120, "int4", "int4"),
+    (8, "ring", 512, 5120, "int4", "int4"),
     # The ring's shipping default at TP8 (RS_INT6_MIN_WORLD), pinned as well.
-    (8, 512, 5120, "int6", "int4"),
-    (8, 512, 5120, "fp16", "int4"),
-    (8, 512, 5120, "int4", "fp16"),
+    (8, "ring", 512, 5120, "int6", "int4"),
+    (8, "ring", 512, 5120, "fp16", "int4"),
+    (8, "ring", 512, 5120, "int4", "fp16"),
+    # The mesh's opt-in wire formats, on a decode payload and on a
+    # TOP_PAYLOAD_BYTES payload, which runs on the mesh ladder's top rung.
+    *(
+        (tp, "mesh", tokens, hidden, codec, codec)
+        for tp in (4, 8)
+        for codec in ("int5", "int6")
+        for tokens, hidden in ((512, 5120), (TOP_PAYLOAD_BYTES // _ROW_BYTES, HIDDEN))
+    ),
 )
+
+# The mesh's pinned INT5/INT6 floors, so a wider codec that decodes at INT4
+# quality fails.
+MESH_PINNED_SQNR_MIN_DB = {"int5": 23.0, "int6": 29.0}
 
 # (tp, algorithm, tokens, hidden, super_tile, block) on the lossless
 # fp16 wire, with the geometry pinned. ``--extended`` only: a default run
@@ -710,7 +723,7 @@ def _metrics(
         atol=CLOSE_ATOL,
         tol_err_ratio=CLOSE_ERR_RATIO,
         printLog=False,
-        msg=f"quick_allreduce_int4 rank {rank}",
+        msg=f"quick_allreduce rank {rank}",
     )
     return {
         "sqnr_db": _sqnr_db(got, ref),
@@ -1501,7 +1514,7 @@ def _transport_key(
 
 
 @benchmark()
-def test_quick_allreduce_int4(
+def test_quick_allreduce(
     tokens,
     hidden,
     dtype,
@@ -1552,7 +1565,7 @@ def _bench_key(
 
 
 @benchmark()
-def bench_quick_allreduce_int4(
+def bench_quick_allreduce(
     tokens,
     hidden,
     tp,
@@ -1602,7 +1615,7 @@ def bench_quick_allreduce_int4(
 
 
 @benchmark()
-def test_quick_allreduce_int4_edge_inputs(tokens, hidden, tp, algorithm, fill):
+def test_quick_allreduce_edge_inputs(tokens, hidden, tp, algorithm, fill):
     """Edge-case payloads on the shipping engine; correctness only."""
     rows = _result(_ship_key(tp, algorithm, None), (tokens, hidden, fill, False))
     label = f"tp={tp} {algorithm} {tokens}x{hidden} fill={fill}"
@@ -1632,7 +1645,7 @@ def test_quick_allreduce_int4_edge_inputs(tokens, hidden, tp, algorithm, fill):
 
 
 @benchmark()
-def test_quick_allreduce_int4_divisor(tokens, hidden, tp, fill, divisor):
+def test_quick_allreduce_divisor(tokens, hidden, tp, fill, divisor):
     """The shared divisor on the shipping mesh engine; correctness only.
 
     ``small`` at the default divisor must keep the plain INT4 accuracy. An
@@ -1678,17 +1691,23 @@ def test_quick_allreduce_int4_divisor(tokens, hidden, tp, fill, divisor):
 
 
 @benchmark()
-def test_quick_allreduce_int4_pinned_codec(tokens, hidden, tp, rs_codec, ag_codec):
-    """The ring with both laps' wire formats pinned; correctness only."""
-    key = _key(tp, algorithm="ring", rs_codec=rs_codec, ag_codec=ag_codec)
+def test_quick_allreduce_pinned_codec(
+    tokens, hidden, tp, algorithm, rs_codec, ag_codec
+):
+    """One schedule with both laps' wire formats pinned; correctness only."""
+    key = _key(tp, algorithm=algorithm, rs_codec=rs_codec, ag_codec=ag_codec)
     rows = _result(key, (tokens, hidden, "normal", False))
-    label = f"tp={tp} ring {tokens}x{hidden} rs={rs_codec} ag={ag_codec}"
+    label = f"tp={tp} {algorithm} {tokens}x{hidden} rs={rs_codec} ag={ag_codec}"
+    if algorithm == "mesh":
+        floor = MESH_PINNED_SQNR_MIN_DB[rs_codec]
+    else:
+        floor = SQNR_MIN_DB_TP8_INT4_RING
     _check_sqnr(
         label,
         rows,
-        floor=SQNR_MIN_DB_TP8_INT4_RING,
-        expected_st=_shipping_st(rows, tokens * hidden * 2, "ring", tp),
-        algorithm="ring",
+        floor=floor,
+        expected_st=_shipping_st(rows, tokens * hidden * 2, algorithm, tp),
+        algorithm=algorithm,
     )
     _check(
         label,
@@ -1758,7 +1777,7 @@ def test_quick_allreduce_run_ahead(tokens, hidden, tp, algorithm):
 
 
 @benchmark()
-def test_quick_allreduce_int4_coverage(tp, algorithm, window):
+def test_quick_allreduce_coverage(tp, algorithm, window):
     """Every kernel production dispatch can select on this host ran in the
     shipping sweep.
 
@@ -3004,7 +3023,10 @@ def _capture_first_fused_rank(rank: int, tp: int, init_method: str) -> dict:
                 eng.allreduce_rmsnorm = allreduce_rmsnorm
 
             events = res["events"]
-            orig_trace = jf.JitFunction._trace_and_compile
+            # FlyDSL 0.5.0 traces on every JIT call and keys its caches on the traced
+            # IR, so a compile is ``MlirCompiler.compile`` (a classmethod) and a cache
+            # load is ``JitCacheManager.get``.
+            orig_compile = jf.MlirCompiler.__dict__["compile"]
             orig_get = jf.JitCacheManager.get
 
             def watch(name, orig):
@@ -3015,7 +3037,9 @@ def _capture_first_fused_rank(rank: int, tp: int, init_method: str) -> dict:
 
                 return wrapped
 
-            jf.JitFunction._trace_and_compile = watch("compile", orig_trace)
+            jf.MlirCompiler.compile = classmethod(
+                watch("compile", orig_compile.__func__)
+            )
             jf.JitCacheManager.get = watch("cache load", orig_get)
             torch.cuda.synchronize()
             g = torch.cuda.CUDAGraph()
@@ -3031,7 +3055,7 @@ def _capture_first_fused_rank(rank: int, tp: int, init_method: str) -> dict:
             except Exception as e:  # noqa: BLE001
                 error = f"{type(e).__name__}: {e}"
             finally:
-                jf.JitFunction._trace_and_compile = orig_trace
+                jf.MlirCompiler.compile = orig_compile
                 jf.JitCacheManager.get = orig_get
             res["capture_error"] = error
             res["ran"] = ran
@@ -3787,10 +3811,10 @@ def _verify(args, tps, algos, dts, link) -> None:
             _register(key, (tokens, hidden, fill, False, DEFAULT_DIVISOR))
     pinned = []
     if args.extended:
-        pinned = [c for c in PINNED_CODEC_CASES if (c[0], "ring") in plans]
-    for tp, tokens, hidden, rs, ag in pinned:
+        pinned = [c for c in PINNED_CODEC_CASES if (c[0], c[1]) in plans]
+    for tp, algorithm, tokens, hidden, rs, ag in pinned:
         _register(
-            _key(tp, algorithm="ring", rs_codec=rs, ag_codec=ag),
+            _key(tp, algorithm=algorithm, rs_codec=rs, ag_codec=ag),
             (tokens, hidden, "normal", False),
         )
     # The fp16 wire through each production schedule's own ladder, on the
@@ -3809,9 +3833,9 @@ def _verify(args, tps, algos, dts, link) -> None:
             (tokens, hidden, "exact", False),
         )
 
-    def _int4_rows(cases):
+    def _rows(cases):
         return [
-            test_quick_allreduce_int4(
+            test_quick_allreduce(
                 tokens,
                 hidden,
                 dtype,
@@ -3824,16 +3848,16 @@ def _verify(args, tps, algos, dts, link) -> None:
         ]
 
     for dtype in dts:
-        rows = _int4_rows(ship)
-        _summarize("flydsl quick allreduce INT4", rows)
+        rows = _rows(ship)
+        _summarize("flydsl quick allreduce", rows)
         _summarize(
-            "flydsl quick allreduce INT4 production kernel coverage",
+            "flydsl quick allreduce production kernel coverage",
             [
-                test_quick_allreduce_int4_coverage(tp, algorithm, window)
+                test_quick_allreduce_coverage(tp, algorithm, window)
                 for tp, algorithm, window in coverage
             ],
         )
-        _summarize("flydsl quick allreduce INT4 block", _int4_rows(knobs))
+        _summarize("flydsl quick allreduce block", _rows(knobs))
         _write_json(args.out, rows)
     _summarize(
         "flydsl quick allreduce run-ahead",
@@ -3851,24 +3875,24 @@ def _verify(args, tps, algos, dts, link) -> None:
         ],
     )
     _summarize(
-        "flydsl quick allreduce INT4 edge inputs",
+        "flydsl quick allreduce edge inputs",
         [
-            test_quick_allreduce_int4_edge_inputs(tokens, hidden, tp, algorithm, fill)
+            test_quick_allreduce_edge_inputs(tokens, hidden, tp, algorithm, fill)
             for tp, algorithm, tokens, hidden, fill in edge
         ],
     )
     _summarize(
-        "flydsl quick allreduce INT4 divisor",
+        "flydsl quick allreduce divisor",
         [
-            test_quick_allreduce_int4_divisor(tokens, hidden, tp, fill, div)
+            test_quick_allreduce_divisor(tokens, hidden, tp, fill, div)
             for tokens, hidden, tp, fill, div in divisor
         ],
     )
     _summarize(
-        "flydsl quick allreduce INT4 pinned codec",
+        "flydsl quick allreduce pinned codec",
         [
-            test_quick_allreduce_int4_pinned_codec(tokens, hidden, tp, rs, ag)
-            for tp, tokens, hidden, rs, ag in pinned
+            test_quick_allreduce_pinned_codec(tokens, hidden, tp, algorithm, rs, ag)
+            for tp, algorithm, tokens, hidden, rs, ag in pinned
         ],
     )
     _summarize(
@@ -4702,7 +4726,7 @@ def _bench(args, tps, algos, link) -> None:
             for shape in shapes:
                 _register(_bench_key(tp, shipped, grid_cap, block, extra), shape)
             rows += [
-                bench_quick_allreduce_int4(
+                bench_quick_allreduce(
                     tokens,
                     hidden,
                     tp,
@@ -4722,7 +4746,7 @@ def _bench(args, tps, algos, link) -> None:
         rows,
         candidates=(*algos, *(name for name, _a, _k in extra), "hip"),
         drop=drop,
-        title="flydsl quick allreduce INT4 vs hip",
+        title="flydsl quick allreduce vs hip",
     )
     for title, df in tables:
         aiter.logger.info("%s (markdown):\n%s", title, fab.to_markdown(df))

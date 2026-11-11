@@ -1990,7 +1990,10 @@ def _capture_ready_failures(rank, tp, hidden, device, dist) -> list[str]:
     torch.cuda.synchronize()
 
     events = []
-    orig_trace = jf.JitFunction._trace_and_compile
+    # FlyDSL 0.5.0 traces on every JIT call and keys its caches on the traced
+    # IR, so a compile is ``MlirCompiler.compile`` (a classmethod) and a cache
+    # load is ``JitCacheManager.get``.
+    orig_compile = jf.MlirCompiler.__dict__["compile"]
     orig_get = jf.JitCacheManager.get
 
     def watch(name, orig):
@@ -2001,7 +2004,7 @@ def _capture_ready_failures(rank, tp, hidden, device, dist) -> list[str]:
 
         return wrapped
 
-    jf.JitFunction._trace_and_compile = watch("compile", orig_trace)
+    jf.MlirCompiler.compile = classmethod(watch("compile", orig_compile.__func__))
     jf.JitCacheManager.get = watch("cache load", orig_get)
     try:
         # Warm the inputs, so only the call itself is inside the capture.
@@ -2011,7 +2014,7 @@ def _capture_ready_failures(rank, tp, hidden, device, dist) -> list[str]:
         with torch.cuda.graph(graph):
             backend.fly_fused_ar_rms(inp, residual, weight, RMS_EPS)
     finally:
-        jf.JitFunction._trace_and_compile = orig_trace
+        jf.MlirCompiler.compile = orig_compile
         jf.JitCacheManager.get = orig_get
     torch.cuda.synchronize()
     backend.close()
