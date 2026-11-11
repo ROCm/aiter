@@ -19,6 +19,7 @@
 #include "custom_all_reduce_gfx1250.cuh"
 #include "aiter_stream.h"
 #include "aiter_tensor.h"
+#include <algorithm>
 #include <cstring>
 #include <limits>
 
@@ -104,6 +105,18 @@ int64_t meta_size(int64_t world_size)
                                 aiter::ar2sScratchBytes((int)world_size)
                           : 0;
     return (int64_t)(aiter::kLLScratchOffset + ll_bytes);
+}
+
+// The largest all-reduce the LL kernels take at this world size: the one-shot
+// up to kLLArMaxBytes, the two-shot up to ar2sMaxBytes. Larger ones take the
+// naive kernels. The Python default cutoff for plain all-reduce stays at or
+// below it.
+int64_t ll_ar_max_bytes(int64_t world_size)
+{
+    aiter::check_ngpus((int)world_size);
+    if(world_size > aiter::kLLMaxRanks)
+        return 0;
+    return (int64_t)std::max(aiter::kLLArMaxBytes, aiter::ar2sMaxBytes((int)world_size));
 }
 
 // ---- Internal dispatch helper ----

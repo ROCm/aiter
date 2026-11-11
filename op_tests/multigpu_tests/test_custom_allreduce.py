@@ -533,6 +533,67 @@ def _run_mixed_size_regression(
     )
 
 
+def _allreduce_plain_cutoff(rank, tp_size, distributed_init_method):
+    import aiter as ops
+    from aiter.dist.device_communicators.custom_all_reduce import (
+        _GFX1250_PLAIN_AR_MAX_SIZE,
+        CustomAllreduce,
+    )
+
+    torch.cuda.set_device(rank)
+    device = torch.device(f"cuda:{rank}")
+    dist.init_process_group(
+        "gloo", world_size=tp_size, rank=rank, init_method=distributed_init_method
+    )
+    ca_comm = CustomAllreduce(dist.group.WORLD, device)
+    try:
+        assert not ca_comm.disabled, "The cutoff check requires custom allreduce"
+        cut = ca_comm._plain_ar_max_size
+        default = _GFX1250_PLAIN_AR_MAX_SIZE.get(tp_size)
+        if (
+            _is_gfx1250()
+            and default is not None
+            and os.environ.get("AITER_CUSTOM_AR_MAX_SIZE", "") == ""
+        ):
+            assert cut == min(default, ops.ll_ar_max_bytes_gfx1250(tp_size)), cut
+            assert cut < ca_comm._car_max_size, (cut, ca_comm._car_max_size)
+        else:
+            assert cut == ca_comm._car_max_size, (cut, ca_comm._car_max_size)
+        # Plain all-reduce takes the custom kernels up to the cutoff and RCCL
+        # above it; the fused paths keep should_custom_ar.
+        sizes = [n for n in (cut - 16, cut, cut + 16) if n > 0]
+        plain = [
+            ca_comm.should_custom_plain_ar(torch.empty(n, dtype=torch.uint8))
+            for n in sizes
+        ]
+        assert plain == [n <= cut for n in sizes], (sizes, plain)
+        fused = [
+            ca_comm.should_custom_ar(torch.empty(n, dtype=torch.uint8)) for n in sizes
+        ]
+        assert fused == [n <= ca_comm._car_max_size for n in sizes], (sizes, fused)
+        # A rank that took the other path would leave its peers waiting.
+        choices = [None] * tp_size
+        dist.all_gather_object(choices, (cut, plain))
+        assert all(c == choices[0] for c in choices), choices
+        if rank == 0:
+            logger.info("plain all-reduce cutoff: TP%d, %d bytes", tp_size, cut)
+    finally:
+        ca_comm.close()
+        dist.destroy_process_group()
+
+
+def test_allreduce_plain_cutoff(tp_size):
+    # With AITER_CUSTOM_AR_MAX_SIZE unset, gfx1250 plain all-reduce at TP2, TP4
+    # and TP8 stops at the measured RCCL crossover; elsewhere it keeps the AR
+    # cutoff.
+    torch.multiprocessing.spawn(
+        _allreduce_plain_cutoff,
+        args=(tp_size, get_distributed_init_method(get_ip(), get_open_port())),
+        nprocs=tp_size,
+        join=True,
+    )
+
+
 # Custom-AR size cutoff (bytes). Mirrors _DEFAULT_CAR_MAX_SIZE in
 # aiter/dist/device_communicators/custom_all_reduce.py and honors the same
 # AITER_CUSTOM_AR_MAX_SIZE override. Inputs at or below this run on the custom
@@ -615,7 +676,8 @@ parser.add_argument(
     "--regression",
     action="store_true",
     help="run only the correctness checks: tail (eager and graph), LL128 and "
-    "gfx1250 LL mixed sizes, and gfx1250 LL in place",
+    "gfx1250 LL mixed sizes, gfx1250 LL in place, and the plain all-reduce "
+    "cutoff",
 )
 parser.add_argument(
     "--iterations",
@@ -658,6 +720,7 @@ if __name__ == "__main__":
             test_allreduce_ll_gfx1250_mixed_size_regression(args.tp_size)
             test_allreduce_ll2s_gfx1250_mixed_size_regression(args.tp_size)
             test_allreduce_ll_gfx1250_inplace_regression(args.tp_size)
+            test_allreduce_plain_cutoff(args.tp_size)
     if args.regression:
         raise SystemExit(0)
     with_graph = args.mode == "graph"
