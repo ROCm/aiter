@@ -174,7 +174,10 @@ def render(run_dir):
     tables = read_tables(run_dir / "combo.log")
     moe = sorted(find(tables, OPS[0]["key"]), key=lambda r: r["token"])
     dec = sorted(find(tables, OPS[1]["key"]), key=lambda r: (r["batch"], r["ctx_len"]))
-    pre = find(tables, OPS[2]["key"])
+    pre = sorted(
+        find(tables, OPS[2]["key"]),
+        key=lambda r: (r.get("seq_len", 0), r["tokens"]),
+    )
     errors = sum(1 for rows in tables.values() for r in rows if r.get("err_msg"))
     out = [
         "<!doctype html><html lang='en'><head><meta charset='utf-8'>",
@@ -199,7 +202,12 @@ def render(run_dir):
             else "-"
         ),
         "mla_prefill": (
-            "T " + ", ".join(str(r["tokens"]) for r in pre) if pre else "-"
+            "seq len "
+            + ", ".join(str(v) for v in sorted({r.get("seq_len", 1024) for r in pre}))
+            + "; T "
+            + ", ".join(str(v) for v in sorted({r["tokens"] for r in pre}))
+            if pre
+            else "-"
         ),
     }
     counts = {"moe": len(moe), "mla_decode": len(dec), "mla_prefill": len(pre)}
@@ -222,7 +230,7 @@ def render(run_dir):
         + [("MLA decode", *k) for k in kernels(dec, "kernel", lambda r: "")]
         + [
             (f"MLA prefill {b}", *k)
-            for b in ("asm", "public", "flydsl")
+            for b in ("asm", "public")
             for k in kernels(pre, f"{b} kernel", lambda r: "")
         ]
     )
@@ -324,12 +332,8 @@ def render(run_dir):
         ("seqs", lambda r: r.get("num_seqs"), "n"),
     ]
     if any("seq_len" in r for r in pre):
-        cols = [
-            ("sweep", lambda r: r.get("scenario"), ""),
-            ("seq len", lambda r: f"{r['seq_len']:,}", "n"),
-        ] + cols
-    backends = [("asm", "asm"), ("public", "public"), ("flydsl", "FlyDSL")]
-    for b, label in [x for x in backends if any(f"{x[0]} us" in r for r in pre)]:
+        cols = [("seq len", lambda r: f"{r['seq_len']:,}", "n")] + cols
+    for b, label in (("asm", "asm"), ("public", "public")):
         cols += [
             (f"{label} us", lambda r, b=b: num(r.get(f"{b} us")), "n"),
             (f"{label} TFLOPS", lambda r, b=b: num(r.get(f"{b} TFLOPS")), "n"),
