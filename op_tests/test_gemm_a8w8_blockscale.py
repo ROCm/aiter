@@ -33,8 +33,8 @@ TEST_NUM_ITERS = 100
 
 
 @perftest(num_iters=TEST_NUM_ITERS)
-def run_torch(x, weight, x_scale, w_scale, dtype=dtypes.bf16):
-    block_shape_n, block_shape_k = block_shape
+def run_torch(x, weight, x_scale, w_scale, dtype=dtypes.bf16, scale_shape=block_shape):
+    block_shape_n, block_shape_k = scale_shape
     m, k = x.shape
     n = weight.shape[0]
     scale_n = (n + block_shape_n - 1) // block_shape_n
@@ -44,7 +44,7 @@ def run_torch(x, weight, x_scale, w_scale, dtype=dtypes.bf16):
     if w_scale.dtype == dtypes.fp8_e8m0:
         w_scale = fp4_utils.e8m0_to_f32(w_scale)
     x = x.to(x_scale.dtype).view(
-        m, k // block_shape[1], block_shape[1]
+        m, k // block_shape_k, block_shape_k
     ) * x_scale.unsqueeze(-1)
     x = x.view(m, k)
 
@@ -114,9 +114,11 @@ def test_gemm(
     scale_init="auto",
     seed=0,
     apre=False,
+    w_scale_block="128x128",
 ):
     ret = {}
-    block_shape_n, block_shape_k = block_shape
+    scale_shape = (32, 32) if w_scale_block == "32x32" else block_shape
+    block_shape_n, block_shape_k = scale_shape
     scale_m = m
     scale_n = (n + block_shape_n - 1) // block_shape_n
     scale_k = (k + block_shape_k - 1) // block_shape_k
@@ -144,7 +146,7 @@ def test_gemm(
         w_scale_raw = bench_init.fill_scale_e8m0(
             (scale_n, scale_k), scale_init, generator
         )
-    use_flydsl_fp8_scale = use_flydsl and ck_preshuffle
+    use_flydsl_fp8_scale = (use_flydsl or w_scale_block == "32x32") and ck_preshuffle
     if use_flydsl_fp8_scale:
         x_scale = x_scale_raw.view(dtypes.fp8_e8m0)
         w_scale = w_scale_raw.view(dtypes.fp8_e8m0)
@@ -152,11 +154,11 @@ def test_gemm(
         x_scale = fp4_utils.e8m0_to_f32(x_scale_raw)
         w_scale = fp4_utils.e8m0_to_f32(w_scale_raw)
 
-    a, _ = run_torch(x, weight, x_scale, w_scale, dtype)
+    a, _ = run_torch(x, weight, x_scale, w_scale, dtype, scale_shape)
 
     x_scale_t = x_scale.transpose(0, 1).contiguous().view(*x_scale.shape)
     gemm_weight = shuffle_weight(weight, layout=(16, 16)) if ck_preshuffle else weight
-    gemm_x_scale = x_scale_t if ck_preshuffle else x_scale
+    gemm_x_scale = x_scale_t if ck_preshuffle and block_shape_k == 128 else x_scale
     run_func = run_gemm_bpreshuffle if ck_preshuffle else run_gemm
     b, avg_b = run_func(x, gemm_weight, gemm_x_scale, w_scale, dtype)
 
@@ -459,6 +461,15 @@ parser.add_argument(
         or --apre True False""",
 )
 parser.add_argument(
+    "--w-scale-block",
+    dest="w_scale_block",
+    choices=["128x128", "32x32"],
+    default="128x128",
+    help="""Weight scale block. 32x32 runs native E8M0 group32 scales (1x32
+    row-major x_scale) on the preshuffled weight.
+    e.g.: --w-scale-block 32x32""",
+)
+parser.add_argument(
     "--csv",
     type=str,
     default=None,
@@ -503,11 +514,22 @@ if len(data_init_list) != len(scale_init_list):
 init_pairs = list(zip(data_init_list, scale_init_list))
 
 if args.ck_preshuffle is None:
-    args.ck_preshuffle = [True] if args.flydsl else [True, False]
+    args.ck_preshuffle = (
+        [True] if args.flydsl or args.w_scale_block == "32x32" else [True, False]
+    )
 l_preshuffle = (
     args.ck_preshuffle if isinstance(args.ck_preshuffle, list) else [args.ck_preshuffle]
 )
 l_apre = args.apre if isinstance(args.apre, list) else [args.apre]
+if args.w_scale_block == "32x32" and get_gfx() not in (
+    "gfx950",
+    "gfx1250",
+    "gfx1250-strict",
+):
+    print(f"skip: native 32x32 E8M0 preshuffle is unsupported on {get_gfx()}")
+    sys.exit(0)
+if args.w_scale_block == "32x32" and (False in l_preshuffle or True in l_apre):
+    parser.error("--w-scale-block 32x32 needs --ck_preshuffle True and no --apre")
 
 df = []
 if args.csv is not None:
@@ -531,6 +553,7 @@ if args.csv is not None:
                             scale_init=scale_init,
                             seed=args.seed,
                             apre=apre,
+                            w_scale_block=args.w_scale_block,
                         )
                         df.append(ret)
 else:
@@ -551,6 +574,7 @@ else:
                                 scale_init=scale_init,
                                 seed=args.seed,
                                 apre=apre,
+                                w_scale_block=args.w_scale_block,
                             )
                             df.append(ret)
 

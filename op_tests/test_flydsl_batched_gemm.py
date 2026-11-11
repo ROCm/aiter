@@ -71,6 +71,48 @@ A8W8_BLOCKS = {
 A8W8_1X32_GFX = ["gfx1250"]
 # Archs whose a8w8 32x32 GEMM runs a ragged last k-tile (K not a multiple of 128).
 RAGGED_K_GFX = ["gfx1250"]
+# Archs whose a8w8 mxfp8_32 batched GEMM also runs the compute kernel.
+COMPUTE_GFX = ["gfx1250"]
+# (b, m, n, k, kernelName): ragged M, persistent N tiles with and without the
+# four-buffer C relocation, a three-wide cluster, and a cluster_n = 1 config that
+# falls back to a one-workgroup cluster at a prime M-tile count.
+COMPUTE_CASES = (
+    (
+        8,
+        333,
+        1024,
+        4096,
+        "flydsl_mxfp8_32_bpreshuffle_compute_wmma_t256x256x128_mw2_nw2_nb2_sk1_cm4_cn2_ps2",
+    ),
+    (
+        3,
+        777,
+        2048,
+        2048,
+        "flydsl_mxfp8_32_bpreshuffle_compute_wmma_t128x256x128_mw2_nw2_nb3_sk1_cm2_cn2",
+    ),
+    (
+        2,
+        333,
+        2048,
+        2048,
+        "flydsl_mxfp8_32_bpreshuffle_compute_wmma_t256x256x128_mw2_nw2_nb4_sk1_cm2_cn2_ps2",
+    ),
+    (
+        1,
+        768,
+        32768,
+        1280,
+        "flydsl_mxfp8_32_bpreshuffle_compute_wmma_t256x256x128_mw2_nw2_nb4_sk1_cm3_cn4",
+    ),
+    (
+        2,
+        1787,
+        1792,
+        5120,
+        "flydsl_mxfp8_32_bpreshuffle_compute_wmma_t256x256x128_mw2_nw2_nb2_sk1_cm4_cn1",
+    ),
+)
 
 
 def _to_e8m0_scale(scale):
@@ -322,6 +364,61 @@ def test_batched_gemm(b, m, n, k, dtype, layout):
     return ret
 
 
+@benchmark()
+def test_batched_gemm_a8w8_compute(b, m, n, k, kernel_name, dtype=dtypes.bf16):
+    """The 32x32 batched GEMM on an explicit compute kernelName; the output starts
+    as NaN and every batch is checked against its own dequantized reference."""
+    torch.manual_seed(SEED)
+    x8, xs8 = quant_act_e8m0(blockwise_randn(m, b, k, dtype=dtype), 32)
+    w = blockwise_randn(b, n, k, dtype=dtype)
+    w = w * torch.exp2(torch.arange(b) % 4 - 1.0).to(dtype)[:, None, None]
+    w8, ws8 = quant_weight_e8m0(w, 32, 32)
+    out = torch.full((m, b, n), float("nan"), dtype=dtype)
+    fn = functools.partial(
+        run_bmm_a8w8_mxfp8,
+        x8,
+        shuffle_weight(w8),
+        xs8,
+        ws8,
+        out,
+        kernel_name=kernel_name,
+    )
+    _, us = run_perftest(fn)
+    x_scale = torch.exp2(xs8.to(dtypes.fp32) - 127).repeat_interleave(32, -1)
+    w_scale = torch.exp2(ws8.to(dtypes.fp32) - 127).repeat_interleave(32, -2)
+    w_scale = w_scale.repeat_interleave(32, -1)
+    ref = torch.einsum(
+        "mbk,bnk->mbn", x8.to(dtypes.fp32) * x_scale, w8.to(dtypes.fp32) * w_scale
+    )
+    assert torch.isfinite(out).all(), f"{kernel_name}: unwritten or non-finite output"
+    errs = []
+    for i in range(b):
+        err = checkAllclose(
+            ref[:, i],
+            out[:, i].to(dtypes.fp32),
+            rtol=1e-2,
+            atol=1e-2,
+            tol_err_ratio=0.01,
+            msg=f"{kernel_name} B={b} M={m} N={n} K={k} batch {i}",
+        )
+        assert err <= 0.01, f"{kernel_name}: batch {i} mismatch ratio {err}"
+        errs.append(err)
+    nbytes = (
+        m * b * k
+        + b * n * k
+        + m * b * (k // 32)
+        + b * (n // 32) * (k // 32)
+        + b * m * n * out.element_size()
+    )
+    return {
+        "gfx": get_gfx(),
+        "compute us": us,
+        "compute TFLOPS": 2 * b * m * n * k / us / 1e6,
+        "compute TB/s": nbytes / us / 1e6,
+        "compute err": max(errs),
+    }
+
+
 def summarize(title: str, rows: list) -> None:
     df = pd.DataFrame(rows)
     aiter.logger.info("%s (markdown):\n%s", title, df.to_markdown(index=False))
@@ -386,6 +483,12 @@ def main():
         help="Output layout (wo_a uses mbn only).\n        e.g.: -l mbn",
     )
     args = parser.parse_args()
+
+    if get_gfx() in COMPUTE_GFX:
+        summarize(
+            "batched_gemm a8w8 on explicit compute kernelNames",
+            [test_batched_gemm_a8w8_compute(*case) for case in COMPUTE_CASES],
+        )
 
     for dtype in args.dtype:
         quant_rows = []

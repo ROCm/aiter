@@ -36,7 +36,13 @@ from torch import Tensor
 
 from aiter.jit.utils.chip_info import get_cu_num, get_gfx, get_lds_capacity_bytes
 
-from .mxfp8_bpreshuffle_gemm_gfx1250 import BASE_NAME_SUFFIX_RE
+from .mxfp8_bpreshuffle_gemm_gfx1250 import (
+    BASE_NAME_SUFFIX_RE,
+    MX32_COMPUTE_WMMA_NAME_PREFIX,
+    compute_kernel_k_pair,
+    is_compute_wmma_kernel_name,
+    run_gemm_a8w8_mxfp8_32_bpreshuffle_gfx1250,
+)
 
 BLOCK_K = 128
 BLOCK_N = 128
@@ -363,11 +369,53 @@ def _pick_bmm_mx32_cache_clear() -> None:
 
 pick_bmm_mx32_kernel_name.cache_clear = _pick_bmm_mx32_cache_clear
 
+# Untuned prefill-sized M runs the compute-bound 256x256 kernel: it fills the
+# GPU with 256-row tiles, while decode-sized M keeps the generic batched kernel
+# and its tuned rows. cluster_m 1 fits every M-tile count; no persistent tiles,
+# so the fused-quant epilogue can run on it too.
+_BMM_MX32_COMPUTE_MIN_M = 1024  # exclusive
+_BMM_MX32_COMPUTE_TILE_N, _BMM_MX32_COMPUTE_TILE_K = 256, 128
+_BMM_MX32_COMPUTE_NB, _BMM_MX32_COMPUTE_CN = 2, 4
+_BMM_MX32_COMPUTE_NAME = (
+    f"{MX32_COMPUTE_WMMA_NAME_PREFIX}_t256x{_BMM_MX32_COMPUTE_TILE_N}"
+    f"x{_BMM_MX32_COMPUTE_TILE_K}_mw2_nw2_nb{_BMM_MX32_COMPUTE_NB}_sk1"
+    f"_cm1_cn{_BMM_MX32_COMPUTE_CN}"
+)
+
+
+@functools.lru_cache(maxsize=1024)
+def pick_bmm_mx32_compute_kernel_name(b: int, m: int, n: int, k: int) -> str | None:
+    """Compute-bound kernelName for an untuned prefill-sized batched mxfp8_32
+    shape, or None: M <= ``_BMM_MX32_COMPUTE_MIN_M`` (decode) and shapes the
+    kernel cannot take keep the generic batched kernel."""
+    if b < 1 or m <= _BMM_MX32_COMPUTE_MIN_M:
+        return None
+    tn, tk, nb = (
+        _BMM_MX32_COMPUTE_TILE_N,
+        _BMM_MX32_COMPUTE_TILE_K,
+        _BMM_MX32_COMPUTE_NB,
+    )
+    k_tiles = k // tk
+    if (
+        n % (tn * _BMM_MX32_COMPUTE_CN)
+        or k % tk
+        or k < 512
+        or k_tiles < nb
+        or k_tiles % compute_kernel_k_pair(nb, tn)
+    ):
+        return None
+    return _BMM_MX32_COMPUTE_NAME
+
 
 def _check_bmm_operands(
-    tag: str, XQ: Tensor, WQ: Tensor, Out: Tensor
+    tag: str, XQ: Tensor, WQ: Tensor, Out: Tensor, fused_fp8_out: bool = False
 ) -> tuple[int, int, int, int, str]:
-    """Shared operand checks of the batched runners; returns (m, b, n, k, out)."""
+    """Shared operand checks of the batched runners; returns (m, b, n, k, out).
+
+    ``fused_fp8_out``: the GEMM quantizes its C tile to e4m3 in the epilogue, so
+    ``Out`` is a 1-byte fp8 buffer. The C staging is still bf16 (what the quant
+    reads), so the returned out name stays ``bf16``.
+    """
     if get_gfx() not in ("gfx1250", "gfx1250-strict"):
         raise RuntimeError(
             f"[FlyDSL gfx1250 bmm] batched {tag} requires gfx1250, got {get_gfx()}"
@@ -391,12 +439,20 @@ def _check_bmm_operands(
         )
     if XQ.element_size() != 1 or WQ.element_size() != 1:
         raise RuntimeError("[FlyDSL gfx1250 bmm] XQ/WQ must be 1-byte fp8 storage")
-    out_dtype = _OUT_DTYPE_NAME.get(Out.dtype)
-    if out_dtype is None:
-        raise RuntimeError(
-            f"[FlyDSL gfx1250 bmm] unsupported out dtype {Out.dtype}; expected "
-            "bf16/fp16"
-        )
+    if fused_fp8_out:
+        if Out.element_size() != 1:
+            raise RuntimeError(
+                "[FlyDSL gfx1250 bmm] fused fp8 Out must be 1-byte e4m3 storage, "
+                f"got {Out.dtype}"
+            )
+        out_dtype = "bf16"  # C staging dtype; the epilogue quantizes it to e4m3
+    else:
+        out_dtype = _OUT_DTYPE_NAME.get(Out.dtype)
+        if out_dtype is None:
+            raise RuntimeError(
+                f"[FlyDSL gfx1250 bmm] unsupported out dtype {Out.dtype}; expected "
+                "bf16/fp16"
+            )
     if XQ.stride() != (b * k, k, 1):
         raise RuntimeError(
             f"[FlyDSL gfx1250 bmm] XQ must be contiguous [M,B,K], got strides "
@@ -420,13 +476,33 @@ def run_bmm_a8w8_mxfp8_32_gfx1250(
     Out: Tensor,
     kernel_name: str | None = None,
     w_scale_32x32: bool = False,
+    y_scale_out: Tensor | None = None,
 ) -> Tensor:
     """Run the batched mxfp8_32 GEMM; writes into ``Out`` and returns it.
 
     ``w_scale_32x32`` selects the raw ``[B, N//32, K//32]`` block scale; else
     w_scale is the n32k4-shuffled 1x32 ``[B, N, K//32]`` (see module doc).
+
+    ``y_scale_out``: when given, the GEMM quantizes its bf16 C tile to e4m3 in
+    the epilogue instead of writing bf16 -- ``Out`` is then the e4m3 ``[M,B,N]``
+    buffer and ``y_scale_out`` the row-major ``[M, (B*N)//32]`` e8m0 scale, the
+    ``(x, x_scale)`` pair a downstream native-quant GEMM reads. Bit-matches a
+    standalone ATOM ``quantize_fp8`` of the bf16 output.
+
+    Without ``kernel_name``, a prefill-sized M runs the compute-bound kernel
+    (``pick_bmm_mx32_compute_kernel_name``), fused quant included.
     """
-    m, b, n, k, out_dtype = _check_bmm_operands("mxfp8_32", XQ, WQ, Out)
+    fused = y_scale_out is not None
+    m, b, n, k, out_dtype = _check_bmm_operands(
+        "mxfp8_32", XQ, WQ, Out, fused_fp8_out=fused
+    )
+    if fused:
+        gn32 = b * n // 32
+        if y_scale_out.element_size() != 1 or y_scale_out.numel() != m * gn32:
+            raise RuntimeError(
+                f"[FlyDSL gfx1250 bmm] y_scale_out must be {m * gn32} e8m0 bytes "
+                f"([M, (B*N)//32]), got {tuple(y_scale_out.shape)} {y_scale_out.dtype}"
+            )
     _lazy_import()
     if n % 32 or k % MX32_BLOCK_K:
         raise RuntimeError(
@@ -444,7 +520,27 @@ def run_bmm_a8w8_mxfp8_32_gfx1250(
     w_shape = (b, n // 32, k_blocks) if w_scale_32x32 else (b, n, k_blocks)
     _check_e8m0(w_scale, "w_scale", "FlyDSL gfx1250 bmm", w_shape)
 
-    name = kernel_name or pick_bmm_mx32_kernel_name(b, m, n, k, w_scale_32x32)
+    name = (
+        kernel_name
+        or pick_bmm_mx32_compute_kernel_name(b, m, n, k)
+        or pick_bmm_mx32_kernel_name(b, m, n, k, w_scale_32x32)
+    )
+    if is_compute_wmma_kernel_name(name):
+        if m:
+            from aiter.utility import dtypes
+
+            run_gemm_a8w8_mxfp8_32_bpreshuffle_gfx1250(
+                XQ[:, 0],
+                WQ[0],
+                x_scale[:, 0].view(dtypes.fp8_e8m0),
+                w_scale[0].view(dtypes.fp8_e8m0),
+                Out[:, 0],
+                name,
+                w_scale_32x32=w_scale_32x32,
+                batch=b,
+                y_scale_out=y_scale_out,
+            )
+        return Out
     cfg = parse_bmm_mx32_kernel_name(name)
     if cfg is None:
         raise ValueError(f"[FlyDSL gfx1250 bmm] unrecognised kernelName: {name!r}")
@@ -489,6 +585,7 @@ def run_bmm_a8w8_mxfp8_32_gfx1250(
         False,  # a_scale_preshuffled
         bool(w_scale_32x32),
         k_tail,
+        fused,  # fuse_quant_out
     )
     # Cached CompiledFunction per constexpr set; see _run_compiled.
     _run_compiled(
@@ -524,6 +621,8 @@ def run_bmm_a8w8_mxfp8_32_gfx1250(
         False,  # a_scale_preshuffled
         bool(w_scale_32x32),
         k_tail,
+        _ptr_arg(y_scale_out) if fused else _ptr_arg(Out),  # arg_scale_out
+        fused,  # fuse_quant_out
         specialization_key=bmm_spec,
     )
     return Out
