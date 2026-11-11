@@ -189,17 +189,15 @@ def _fake_shmem(device):
         sys.modules.update({"mori": package, "mori.shmem": shmem})
     import mori.shmem as ms
 
-    from aiter.ops.flydsl.kernels import (
-        flydsl_dispatch_combine_intranode_op as dispatch_combine,
-    )
-
+    # The dispatch/combine op allocates through MoriShmemAllocator, which looks
+    # these up on mori.shmem at call time, so patching the module covers it.
     def create_tensor(shape, dtype):
         return torch.empty(shape, dtype=dtype, device=device)
 
     with (
         mock.patch.object(ms, "shmem_barrier_all", lambda: None),
         mock.patch.object(ms, "shmem_ptr_p2p", lambda ptr, _rank, _pe: ptr),
-        mock.patch.object(dispatch_combine, "mori_shmem_create_tensor", create_tensor),
+        mock.patch.object(ms, "mori_shmem_create_tensor", create_tensor),
     ):
         yield
 
