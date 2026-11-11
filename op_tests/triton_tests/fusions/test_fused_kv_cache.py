@@ -104,7 +104,7 @@ def test_fused_qk_rope_cat_and_cache_mla(
     block_size: int,
     upcast_operand: bool,
 ):
-    if cache_dtype == torch.uint8 and DEVICE_ARCH not in ("gfx1250",):
+    if cache_dtype == torch.uint8 and DEVICE_ARCH not in ("gfx1250", "gfx1250-strict"):
         pytest.skip("NVFP4 quantization is only supported on GFX1250")
     torch.manual_seed(0)
     dtype = torch.bfloat16
@@ -450,7 +450,7 @@ def test_fused_qk_rope_reshape_and_cache(
     dtype: torch.dtype,
     upcast_operand: bool,
 ):
-    if cache_dtype == torch.uint8 and DEVICE_ARCH not in ("gfx1250",):
+    if cache_dtype == torch.uint8 and DEVICE_ARCH not in ("gfx1250", "gfx1250-strict"):
         pytest.skip("NVFP4 quantization is only supported on GFX1250")
     torch.manual_seed(0)
     pos = True
