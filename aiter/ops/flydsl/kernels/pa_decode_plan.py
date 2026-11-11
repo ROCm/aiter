@@ -200,18 +200,25 @@ def compile_pa_decode_plan(max_batch, threads, windowed):
 
 
 @cache
-def compile_query_block_map(max_batch, threads, query_block):
+def compile_query_block_map(max_batch, threads, query_block, longest_first=False):
     """Split varlen queries into blocks of ``query_block`` in sequence order.
 
     Slot p of ``query_map`` gets (first query row, sequence, valid queries, 0)
     and ``contexts[p]`` the KV tokens its last query sees; slots past the last
     block get no queries and no context. Batch and capacity are runtime values.
+
+    ``longest_first`` orders live blocks by context, longest first, ties in
+    sequence order (a stable descending sort); each block's position costs one
+    pass over the batch.
     """
     scan_blocks = fx.coop.BlockScan[fx.Int32, threads]
 
     @fx.struct
     class EndStorage:
         ends: fx.Array[fx.Int32, max_batch, 16]
+        # KV minus query tokens and KV tokens per sequence, for longest_first.
+        offsets: fx.Array[fx.Int32, max_batch if longest_first else 1, 16]
+        lengths: fx.Array[fx.Int32, max_batch if longest_first else 1, 16]
 
     lookup_bits = (max_batch - 1).bit_length()
 
@@ -235,7 +242,8 @@ def compile_query_block_map(max_batch, threads, query_block):
         contexts = ptr_buf_tensor(contexts_ptr)
         smem = fx.SharedAllocator()
         scan_storage = smem.allocate(scan_blocks.SharedStorage).peek()
-        block_ends = smem.allocate(EndStorage).peek().ends
+        storage = smem.allocate(EndStorage).peek()
+        block_ends = storage.ends
         rows = (batch + threads - 1) // threads
         row_begin = fx.min(fx.Int32(tid) * rows, batch)
         row_end = fx.min(row_begin + rows, batch)
@@ -248,7 +256,42 @@ def compile_query_block_map(max_batch, threads, query_block):
         for seq in range(row_begin, row_end):
             row_start = row_start + blocks_of(cu, seq)
             block_ends[seq] = row_start
+            if fx.const_expr(longest_first):
+                storage.offsets[seq] = lengths[seq] - (cu[seq + 1] - cu[seq])
+                storage.lengths[seq] = lengths[seq]
         fx.gpu.barrier()
+
+        def rank_of(seq, block, num_blocks):
+            """Blocks sorting before (seq, block): longer, or as long and earlier.
+
+            Ordering keys ignore num_tokens truncation and the clamp at zero:
+            block b of n has key offset + b_end with b_end = b + 1 blocks of
+            queries, except the last, whose key is the KV length. Keys rise
+            strictly within a sequence, so each sequence's count is closed-form.
+            """
+            offset = storage.offsets[seq]
+            key = (block == num_blocks - 1).select(
+                storage.lengths[seq], offset + (block + 1) * query_block
+            )
+            rank = fx.Int32(0)
+            for other in range(0, batch):
+                prev = block_ends[fx.max(other - 1, 0)]
+                blocks = block_ends[other] - (other > 0).select(prev, fx.Int32(0))
+                gap = key - storage.offsets[other]
+                last = storage.lengths[other]
+                # Non-last blocks with keys <= key: b_end in [1, gap // qb].
+                inner = fx.max(blocks - 1, 0)
+                below = fx.min(fx.max(gap // query_block, 0), inner)
+                longer = fx.Int32(last > key) + inner - below
+                ties = fx.Int32(last == key) + fx.Int32(
+                    (gap >= query_block)
+                    & (gap % query_block == 0)
+                    & (gap // query_block <= inner)
+                )
+                live = blocks > 0
+                rank = rank + live.select(longer, fx.Int32(0))
+                rank = rank + (live & (other < seq)).select(ties, fx.Int32(0))
+            return rank
 
         last_row = fx.max(num_tokens - 1, 0)
         total_blocks = block_ends[batch - 1]
@@ -271,11 +314,17 @@ def compile_query_block_map(max_batch, threads, query_block):
             valid = fx.min(fx.min(seq_queries - first, num_tokens - row), query_block)
             valid = live.select(fx.max(valid, 0), 0)
             ctx = fx.max(lengths[seq] - seq_queries + first + valid, 0)
-            query_map[slot * 4] = fx.min(fx.max(row, 0), last_row)
-            query_map[slot * 4 + 1] = seq
-            query_map[slot * 4 + 2] = valid
-            query_map[slot * 4 + 3] = fx.Int32(0)
-            contexts[slot] = live.select(ctx, 0)
+            dest = slot
+            if fx.const_expr(longest_first):
+                # Dead slots keep their place after every live block.
+                block = slot - first_block
+                rank = rank_of(seq, block, block_ends[seq] - first_block)
+                dest = live.select(rank, slot)
+            query_map[dest * 4] = fx.min(fx.max(row, 0), last_row)
+            query_map[dest * 4 + 1] = seq
+            query_map[dest * 4 + 2] = valid
+            query_map[dest * 4 + 3] = fx.Int32(0)
+            contexts[dest] = live.select(ctx, 0)
 
     @flyc.jit
     def launch(
@@ -296,12 +345,18 @@ def compile_query_block_map(max_batch, threads, query_block):
 
 
 def build_query_block_map(
-    cu_seqlens_q, seqused_k, num_tokens, query_block, query_map, contexts
+    cu_seqlens_q,
+    seqused_k,
+    num_tokens,
+    query_block,
+    query_map,
+    contexts,
+    longest_first=False,
 ):
     """Fill ``query_map`` [capacity, 4] and ``contexts`` [capacity] on the GPU."""
     batch = seqused_k.numel()
     max_batch = 1 << (batch - 1).bit_length()
-    launch = compile_query_block_map(max_batch, 1024, query_block)
+    launch = compile_query_block_map(max_batch, 1024, query_block, longest_first)
     _run_compiled(
         launch,
         ptr_arg(cu_seqlens_q, fx.Int32),

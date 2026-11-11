@@ -423,6 +423,7 @@ def _unified_attention_varlen(
     import flydsl.expr as fx
 
     from .kernels.pa_decode_pingpong import compile_pa_decode_pingpong
+    from .kernels.pa_decode_plan import build_query_block_map
     from .kernels.tensor_shim import _run_compiled, ptr_arg
     from .pa_decode import PADecodePlan, launch_pa_decode_ps_reduce, plan_pa_decode
 
@@ -472,9 +473,22 @@ def _unified_attention_varlen(
             workspace["captured"] = True
         query_map = workspace["query_map"][: pseudo * 4].view(pseudo, 4)
         context_lengths = workspace["context_lengths"][:pseudo]
-        _build_query_map(
-            cu_seqlens_q, seqused_k, num_tokens, query_map, context_lengths
-        )
+        # The kernel's ordering is one pass over the batch per row; above this
+        # it is slower than the torch sort.
+        if pseudo * num_seqs <= 1 << 19:
+            build_query_block_map(
+                cu_seqlens_q,
+                seqused_k,
+                num_tokens,
+                _QUERY_BLOCK,
+                query_map,
+                context_lengths,
+                longest_first=True,
+            )
+        else:
+            _build_query_map(
+                cu_seqlens_q, seqused_k, num_tokens, query_map, context_lengths
+            )
         plan = PADecodePlan(
             work_info=workspace["work_info"][: capacity * 4].view(capacity, 4),
             reduce_info=workspace["reduce_info"][: pseudo * 2].view(pseudo, 2),
