@@ -256,6 +256,24 @@ def compile_mixed_moe_gemm1_common(
     need_quant = need_fp4 or need_fp8
     need_sort = need_quant
 
+    # For tile-aligned GUI padding, reuse the first output tiles to clear the
+    # padded tail. This avoids launching GEMM blocks whose weights are all zero.
+    real_inter_dim = inter_dim - inter_dim_pad
+    gui_output_tile = tile_n // 2
+    clear_gui_padding = (
+        is_f8_a
+        and is_f4_b
+        and gate_up_interleave
+        and not is_splitk
+        and not need_quant
+        and not enable_bias
+        and not heterogeneous_b
+        and not out_is_f32
+        and 0 < inter_dim_pad <= real_inter_dim
+        and real_inter_dim % gui_output_tile == 0
+        and inter_dim_pad % gui_output_tile == 0
+    )
+
     fp4q_tag = "_fp4q" if need_fp4 else ""
     fp8q_tag = "_fp8q" if need_fp8 else ""
     sort_tag = "_sort" if need_sort else ""
@@ -458,7 +476,6 @@ def compile_mixed_moe_gemm1_common(
         ):
 
             tokens_in = fx.Index(i32_tokens_in)
-            n_in = fx.Index(i32_n_in)
             k_in = fx.Index(i32_k_in)
             size_expert_ids_in = fx.Index(i32_size_expert_ids_in)
             # Runtime clamp bound for the activation.  Host passes the configured
@@ -516,20 +533,9 @@ def compile_mixed_moe_gemm1_common(
 
             if const_expr(xcd_swizzle > 0):
                 num_xcds = 8
-                one = 1
-                tile_n_idx = tile_n
-                inter_pad_idx = 2 * inter_dim_pad
-                if const_expr(mock_gate_only or gate_up_interleave):
-                    grid_x = (n_in - inter_pad_idx + tile_n_idx - one) // tile_n_idx
-                else:
-                    two = 2
-                    grid_x = (
-                        (n_in - inter_pad_idx + two * tile_n_idx - one)
-                        // tile_n_idx
-                        // two
-                    )
-                persist_m_idx = persist_m
-                grid_y = (size_expert_ids_in + persist_m_idx - one) // persist_m_idx
+                # Use the launch dimensions, including the stage2 tail padding.
+                grid_x = fx.Index(gpu.grid_dim.x)
+                grid_y = fx.Index(gpu.grid_dim.y)
                 bx_persist, by = xcd_remap_grid(
                     bx_persist,
                     by,
@@ -2385,6 +2391,30 @@ def compile_mixed_moe_gemm1_common(
                             frag_v,
                             nontemporal=True,
                         )
+                        if const_expr(clear_gui_padding):
+
+                            @flyc.jit
+                            def _clear_gui_tail():
+                                # Each participating output vector owns one equally
+                                # sized vector in the tail; the stores cannot overlap.
+                                if by_n < 2 * inter_dim_pad:
+                                    pad_addr = (
+                                        row_byte_base
+                                        + (real_inter_dim + col_g0) * out_elem_bytes
+                                    )
+                                    pad_ty = fx.BFloat16 if out_is_bf16 else fx.Float16
+                                    zeros = fx.Vector.from_elements(
+                                        [pad_ty(0.0) for _ in range(e_vec)], pad_ty
+                                    )
+                                    fx.generic_store(
+                                        _idx_to_fly_ptr(
+                                            pad_addr, zeros, e_vec * out_elem_bytes
+                                        ),
+                                        zeros,
+                                        nontemporal=True,
+                                    )
+
+                            _clear_gui_tail()
 
                 frag_elem = T.f32 if need_quant else (T.bf16 if out_is_bf16 else T.f16)
 
@@ -2785,19 +2815,27 @@ def compile_mixed_moe_gemm1_common(
         tile2_pad = 0
         if const_expr(not gate_only):
             tile_k_stage2 = tile_k // 2
-            tile2_pad = (
-                tile_k_stage2 - (inter_dim - inter_dim_pad) % tile_k_stage2
-            ) % tile_k_stage2
+            # Keep the partial K tile consumed by stage2, but never extend
+            # beyond the physically allocated intermediate width.
+            tile2_pad = min(
+                inter_dim_pad,
+                (tile_k_stage2 - (inter_dim - inter_dim_pad) % tile_k_stage2)
+                % tile_k_stage2,
+            )
 
+        if const_expr(clear_gui_padding):
+            tile2_pad = 0
+
+        # inter_in counts both gate and up, so restore padding for both.
         inter_in = fx.Int64(i32_inter_in)
         tile_n_index = tile_n
         if const_expr(mock_gate_only or gate_up_interleave):
             gx = (
-                inter_in - inter_dim_pad_total + tile2_pad + tile_n_index - 1
+                inter_in - inter_dim_pad_total + 2 * tile2_pad + tile_n_index - 1
             ) // tile_n_index
         else:
             gx = (
-                (inter_in - inter_dim_pad_total + tile2_pad + 2 * tile_n_index - 1)
+                (inter_in - inter_dim_pad_total + 2 * tile2_pad + 2 * tile_n_index - 1)
                 // tile_n_index
                 // 2
             )
