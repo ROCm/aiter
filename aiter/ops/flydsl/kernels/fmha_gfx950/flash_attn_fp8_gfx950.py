@@ -491,21 +491,13 @@ def build_flash_attn_dualwave_swp_fp8_module(
             )
             # Anchored so the sum, and P's fp32 copy, die before the V reads.
             l_row = softmax_helper.anchor_scalar_f32(fx.Float32(l_row) + l_tile)
-            p_lists = softmax_helper.v_s_vec_to_lists((p_lo, p_hi))
-            if const_expr(traits.V_SHUFFLED and not traits.CAUSAL):
-                # V's LDS reads ahead of P's fp8 packing so the conversions cover their latency before PV's first
-                # wait; the packing's anchor still retires P's fp32 copy before PV. Causal (+8 VGPRs at 160) spills.
-                # Drained first as the champion does: a pending LDS read would make PV's partial waits lgkmcnt(0).
-                rocdl.s_waitcnt(lgkmcnt=0)
-                rocdl.sched_barrier(0)
-                v_v = kv_lds_to_regs.load_v(buf, j * BN, full=True)
-                v_p = gemm_helper.cast_p_fp8_direct(p_lists)
-            else:
-                v_p = gemm_helper.cast_p_fp8_direct(p_lists)
-                rocdl.sched_barrier(0)
-                v_v = kv_lds_to_regs.load_v(
-                    buf, j * BN if traits.V_SHUFFLED else None, full=True
-                )
+            v_p = gemm_helper.cast_p_fp8_direct(
+                softmax_helper.v_s_vec_to_lists((p_lo, p_hi))
+            )
+            rocdl.sched_barrier(0)
+            v_v = kv_lds_to_regs.load_v(
+                buf, j * BN if traits.V_SHUFFLED else None, full=True
+            )
             if const_expr(not traits.V_SHUFFLED):
                 # Inline transpose reads are invisible to LLVM's wait insertion.
                 rocdl.s_waitcnt(lgkmcnt=0)
