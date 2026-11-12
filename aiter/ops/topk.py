@@ -96,7 +96,12 @@ def _gfx1250_reg_mw_fits(
     topk_ids: torch.Tensor,
 ) -> bool:
     """Whether a call that passed _can_use_gfx1250_exact_sigmoid_topk fits the
-    multi-wave kernel of biased_grouped_topk_hip, which beats the Triton one."""
+    multi-wave kernel of biased_grouped_topk_hip, which beats the Triton one.
+
+    Mirrors the gate in front of topk_reg_mw_kernel in biased_grouped_topk
+    (csrc/kernels/topk_softmax_kernels_group.cu); keep the two in step. A call
+    admitted here and rejected there falls through to the LDS kernel, which
+    aborts on an FP32 bias at E = 768 and 896."""
     return (
         gating_output.shape[1] in _GFX1250_REG_MW_EXPERTS
         and topk_ids.shape[1] <= _GFX1250_REG_MW_MAX_TOPK
