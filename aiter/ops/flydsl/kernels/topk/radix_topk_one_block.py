@@ -142,12 +142,15 @@ def build_radix_topk_one_block_body(
         (_COMPACT_CAPACITY // _VEC) + block_threads - 1
     ) // block_threads
     # The bounded path bounds the k-th largest key with the block's per-thread
-    # top-2 keys and reduces across waves through one lane per wave.
+    # top-2 keys and reduces across waves through one lane per wave. Only
+    # 1024-thread blocks keep both the register and the reload keys of a row
+    # within one 32-bit hit mask each.
     bounded_rows = (
         stable
         and not write_values
         and not short_rows
         and wave_size == 32
+        and block_threads == 1024
         and num_waves <= wave_size
         and k <= 2 * block_threads
         and arch in _BOUNDED_ROW_CAPACITY_BY_ARCH
@@ -161,8 +164,8 @@ def build_radix_topk_one_block_body(
     register_key_steps = min(_BOUNDED_REGISTER_STEPS, bounded_key_vector_steps)
     reload_key_steps = bounded_key_vector_steps - register_key_steps
     register_key_capacity = register_key_steps * block_threads * _VEC
-    if bounded_rows and register_key_steps * _VEC > 32:
-        raise ValueError("register keys must fit one 32-bit hit mask")
+    if bounded_rows and max(register_key_steps, reload_key_steps) * _VEC > 32:
+        raise ValueError("register and reload keys must each fit one 32-bit hit mask")
     # Consecutive bitmap words per thread restore column order for the emission.
     bitmap_words = max(bounded_row_capacity // 32, 1)
     words_per_thread = -(-bitmap_words // block_threads)
