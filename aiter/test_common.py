@@ -11,6 +11,7 @@ import torch
 import torch.profiler as tpf
 
 from aiter import logger
+from aiter.utility.measure import flush_llc, llc_flush_buffer
 
 pd.set_option("display.max_rows", 200)
 ## debug ##
@@ -58,10 +59,13 @@ def perftest(
     def decorator(func):
         def wrapper(*args, **kwargs):
             num = num_rotate_args
+            cold = num < 1
             pristine = None
-            if num < 1:
+            if cold:
                 warn_if_unrotatable(func, args, kwargs)
                 gpu_id = torch.cuda.current_device()
+                # Before free memory is read, so the copies leave room for it.
+                llc_flush_buffer(gpu_id)
                 free_memory = torch.cuda.mem_get_info(gpu_id)[0]
                 if 2 * _device_tensor_bytes(args, kwargs) <= free_memory:
                     pristine = copy.deepcopy((args, kwargs))
@@ -83,7 +87,10 @@ def perftest(
 
             rotate_args = input_copies(args, kwargs, num, pristine, num_iters)
             del pristine
-            run_iters(num_warmup, func, *args, **kwargs)
+            num_warmup_calls = num_warmup
+            if len(rotate_args) > 1:
+                num_warmup_calls = max(num_warmup, len(rotate_args))
+            run_iters_rotate(num_warmup_calls, func, rotate_args)
             torch.cuda.synchronize()
             if int(os.environ.get("AITER_LOG_MORE", "0")) or use_cuda_event:
                 latencies = []
@@ -100,6 +107,9 @@ def perftest(
                 if use_cuda_event:
                     return data, avg
 
+            if cold:
+                flush_llc(gpu_id)
+                torch.cuda.synchronize()
             with tpf.profile(
                 activities=[tpf.ProfilerActivity.CPU, tpf.ProfilerActivity.CUDA],
                 profile_memory=False,
@@ -121,6 +131,9 @@ def perftest(
                 graph = torch.cuda.CUDAGraph()
                 with torch.cuda.graph(graph):
                     data = run_iters_rotate(num_iters, func, rotate_args)
+                if cold:
+                    flush_llc(gpu_id)
+                    torch.cuda.synchronize()
                 with tpf.profile(
                     activities=[tpf.ProfilerActivity.CPU, tpf.ProfilerActivity.CUDA],
                     profile_memory=True,

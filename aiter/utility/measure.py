@@ -56,3 +56,16 @@ def llc_bytes(device: int) -> int:
         f"using {llc // MiB} MiB for {arch}"
     )
     return llc
+
+
+@functools.cache
+def llc_flush_buffer(device: int) -> torch.Tensor:
+    """The 2 x LLC buffer that `flush_llc` reads, allocated once per device."""
+    return torch.empty(2 * llc_bytes(device) // 8, dtype=torch.int64, device=device)
+
+
+def flush_llc(device: int) -> None:
+    """Push every earlier input out of the LLC of ``device`` by reading a buffer twice its size."""
+    # Summed as int64: on gfx942 torch's float and amax reductions of this buffer
+    # leave the inputs resident.
+    llc_flush_buffer(device).sum()

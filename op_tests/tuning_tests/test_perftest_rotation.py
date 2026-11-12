@@ -165,6 +165,52 @@ class TestPerftestUnrotatableWarning(unittest.TestCase):
         self.assertEqual(len(logs.output), 1)
 
 
+@unittest.skipUnless(torch.cuda.is_available(), "needs a GPU")
+class TestPerftestWarmupAndFlush(unittest.TestCase):
+    def _trace(self, num_iters, testGraph=False, **kw):
+        trace = []
+        x = torch.ones(16, device="cuda")
+        out = torch.empty_like(x)
+
+        def func(x, out):
+            trace.append(out.data_ptr())
+            return out.copy_(x)
+
+        with patch.object(
+            test_common, "flush_llc", side_effect=lambda _: trace.append("flush")
+        ):
+            perftest(num_iters=num_iters, testGraph=testGraph, **kw)(func)(x, out)
+        return trace
+
+    def test_warmup_reads_every_copy_then_flushes(self):
+        trace = self._trace(num_iters=5, num_warmup=2)
+        self.assertEqual(trace.count("flush"), 1)
+        flush = trace.index("flush")
+        timed = trace[flush + 1 :]
+        self.assertEqual(len(timed), 5)
+        self.assertEqual(len(set(timed)), 5)
+        self.assertEqual(set(trace[flush - 5 : flush]), set(timed))
+
+    def test_graph_replay_is_flushed_too(self):
+        trace = self._trace(num_iters=4, testGraph=True)
+        self.assertEqual(trace.count("flush"), 2)
+        self.assertEqual(trace[-1], "flush")
+
+    def test_explicit_rotation_warms_every_copy_and_never_flushes(self):
+        for num, warmup_calls in ((1, 2), (3, 3)):
+            with self.subTest(num_rotate_args=num):
+                trace = self._trace(num_iters=6, num_warmup=2, num_rotate_args=num)
+                self.assertNotIn("flush", trace)
+                self.assertEqual(len(trace), warmup_calls + 6)
+                self.assertEqual(len(set(trace[:warmup_calls])), num)
+
+    def test_flush_buffer_is_twice_the_llc_and_kept(self):
+        device = torch.cuda.current_device()
+        buf = measure.llc_flush_buffer(device)
+        self.assertEqual(buf.nbytes, 2 * measure.llc_bytes(device))
+        self.assertIs(measure.llc_flush_buffer(device), buf)
+
+
 def _cache(level, kib, instances=1):
     return {"cache_level": level, "cache_size": kib, "num_cache_instance": instances}
 
