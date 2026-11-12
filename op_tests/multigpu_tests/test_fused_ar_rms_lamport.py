@@ -16,7 +16,9 @@ Correctness: every candidate against a torch reference, and the Lamport kernel
 bit for bit against car_fused (two NaNs count as equal). A second table runs one
 mixed sequence per TP on the one shared inbox: row widths and row counts change
 call to call (block a row and cluster shapes), 0xffff is injected now and then,
-and a CUDA graph of three sizes is replayed between eager calls.
+the odd ranks hold the input, residual and weight off 16B alignment (every rank
+must still take the Lamport kernel), and a CUDA graph of three sizes is replayed
+between eager calls.
 
 Timing: run_perftest times kernels on one rank and adds calls of its own, which a
 cross-rank collective cannot take. Instead a CUDA graph of CALLS calls is
@@ -85,6 +87,12 @@ def run_torch(xs, residual, weight, eps):
     inv_rms = torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + eps)
     out = (x * inv_rms * weight.to(dtypes.fp32)).to(xs.dtype)
     return out, res_out
+
+
+def offset_view(t):
+    """t's values one element into a fresh storage, so off 16B alignment."""
+    storage = torch.empty(t.numel() + 1, dtype=t.dtype, device=t.device)
+    return storage[1:].view(t.shape).copy_(t)
 
 
 def bit_mismatch(a, b):
@@ -204,15 +212,31 @@ def check_mixed_sequence(ca, tp, rank, dtype):
     for i, (n, m) in enumerate(cases * 2):
         check(i, m, n, nan=i % 3 == 0)
 
+    # the odd ranks' operands one element into their storage: every rank must
+    # still take the Lamport kernel, the odd ones copying them first; car_fused
+    # gets the aligned originals
+    for n, m in zip(STRESS_NS, STRESS_MS):
+        x, _, residual, weight = make_inputs(tp, rank, 9000 + n, m, n, dtype)
+        want = car_fused(ca, x, residual, weight)
+        if rank % 2:
+            x, residual, weight = (offset_view(t) for t in (x, residual, weight))
+        assert ca.should_lamport_ar_rms(x, residual, weight, n), (m, n)
+        got = tensor_model_parallel_fused_allreduce_rmsnorm(x, residual, weight, EPS)
+        worst = max(worst, pair_mismatch(got, want))
+        calls += 1
+
     # a graph of three sizes, replayed between eager calls of other sizes
     graph_in = [make_inputs(tp, rank, 7000 + n, m, n, dtype) for n, m in GRAPH_CASES]
+    want = [car_fused(ca, x, res, w) for x, _, res, w in graph_in]
+    if rank % 2:  # unaligned operands inside the graph as well
+        x, xs, res, w = graph_in[0]
+        graph_in[0] = (offset_view(x), xs, offset_view(res), offset_view(w))
     graph = torch.cuda.CUDAGraph()
     with graph_capture() as gc, torch.cuda.graph(graph, stream=gc.stream):
         graph_out = [
             tensor_model_parallel_fused_allreduce_rmsnorm(x, res, w, EPS)
             for x, _, res, w in graph_in
         ]
-    want = [car_fused(ca, x, res, w) for x, _, res, w in graph_in]
     for i in range(4):
         graph.replay()
         torch.cuda.synchronize()
