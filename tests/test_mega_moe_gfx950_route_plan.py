@@ -481,7 +481,7 @@ def test_ep4_small_m_buckets_share_one_protocol(mtpr):
 # The EP8 V4.1-Flash fused configs (_tune_v41_flash_ep8_small / _large). On a mismatch the assertion shows the
 # current table.
 _V41EP8_FUSED_DIGEST = (
-    "bedbef374b8682a1efc7f678127e7c21aadd185f9babdef9f4d9ecfa1b63c225"
+    "d5240e1a8f4725a31953eb5394b30bf5a93a0855f01a62a58356c51f90721fa4"
 )
 
 
@@ -645,10 +645,12 @@ def test_ep2_large_m_config():
         assert 0 < config.stage1.num_dispatch_cu < 256
         assert config.stage1.num_dispatch_cu % 2 == 0
         assert config.fused_stage1.batch_rows and config.fused_stage1.bounded_scales
-    # EP4 batches its rows too, so its reads are bounded as well; EP8 V4-Pro does not batch them.
-    for mtpr in (8192, 16384):
-        knobs = select_fused_config(mtpr, mtpr, **V41_FLASH_EP4_SHAPE).fused_stage1
-        assert knobs.batch_rows and knobs.bounded_scales
+    # EP4 and EP8 V4.1-Flash (whose tune builds on EP4's) batch their rows too, so their reads are bounded as well;
+    # EP8 V4-Pro does not batch them.
+    for shape in (V41_FLASH_EP4_SHAPE, V41_FLASH_EP8_SHAPE):
+        for mtpr in (8192, 16384):
+            knobs = select_fused_config(mtpr, mtpr, **shape).fused_stage1
+            assert knobs.batch_rows and knobs.bounded_scales
     assert not select_fused_config(8192, 8192).fused_stage1.batch_rows
 
 
