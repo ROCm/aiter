@@ -1,5 +1,6 @@
 # Triton is installed from PyPI as amd-triton.
 amd-triton==3.9.0.dev20261110
+amd-triton-kernels==1.0.0.dev20261031
 
 # Build deps (needed for --no-build-isolation editable install).
 setuptools>=45

@@ -26,6 +26,7 @@ PACKAGE_NAME = "amd-aiter"
 
 FLYDSL_VERSION = "flydsl==0.5.0"
 TRITON_VERSION = "amd-triton==3.9.0.dev20261110"
+TRITON_KERNELS_VERSION = "amd-triton-kernels==1.0.0.dev20261031"
 
 BUILD_TARGET = os.environ.get("BUILD_TARGET", "auto")
 PREBUILD_KERNELS = int(os.environ.get("PREBUILD_KERNELS", "0"))
@@ -38,7 +39,7 @@ IS_WINDOWS = sys.platform == "win32"
 # flydsl publishes Linux-only wheels.
 FLYDSL_REQUIRES = [] if IS_WINDOWS else [FLYDSL_VERSION]
 AITER_USE_SYSTEM_TRITON = int(os.environ.get("AITER_USE_SYSTEM_TRITON", "0"))
-TRITON_REQUIRES = [] if IS_WINDOWS or AITER_USE_SYSTEM_TRITON else [TRITON_VERSION]
+TRITON_REQUIRES = [] if IS_WINDOWS or AITER_USE_SYSTEM_TRITON else [TRITON_VERSION, TRITON_KERNELS_VERSION]
 # Single skip-C++/HIP-build gate.
 AITER_TRITON_ONLY = os.environ.get("AITER_TRITON_ONLY", "0") == "1"
 
@@ -100,11 +101,12 @@ def _uninstall_triton_conflicts():
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
         )
-    subprocess.call(  # noqa: S603
-        [sys.executable, "-m", "pip", "uninstall", "-y", "triton-kernels"],
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-    )
+    for pkg in ["amd-triton-kernels", "triton-kernels"]:
+        subprocess.call(  # noqa: S603
+            [sys.executable, "-m", "pip", "uninstall", "-y", pkg],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
 
 
 def _torch_version_below(min_version):
@@ -151,22 +153,23 @@ elif not AITER_USE_SYSTEM_TRITON and not IS_WINDOWS:
             " (set AITER_USE_SYSTEM_TRITON=1 to keep your triton)"
         )
     _uninstall_triton_conflicts()
-    try:
-        from importlib.metadata import version as pkg_version
-
-        from packaging.version import Version
-
-        if Version(pkg_version("amd-triton")) != Version(
-            TRITON_VERSION.split("==")[1]
-        ):
-            raise ImportError("version mismatch")
-    except Exception:  # noqa: BLE001
+    for pkg_spec in [TRITON_VERSION, TRITON_KERNELS_VERSION]:
+        pkg_name = pkg_spec.split("==")[0]
+        pkg_ver = pkg_spec.split("==")[1]
         try:
-            subprocess.check_call(
-                [sys.executable, "-m", "pip", "install", TRITON_VERSION]
-            )
+            from importlib.metadata import version as pkg_version
+
+            from packaging.version import Version
+
+            if Version(pkg_version(pkg_name)) != Version(pkg_ver):
+                raise ImportError("version mismatch")
         except Exception:  # noqa: BLE001
-            print("[aiter] Skipping triton install (will be handled by install_requires)")
+            try:
+                subprocess.check_call(
+                    [sys.executable, "-m", "pip", "install", pkg_spec]
+                )
+            except Exception:  # noqa: BLE001
+                print(f"[aiter] Skipping {pkg_name} install (will be handled by install_requires)")
 
 
 def write_install_mode():
