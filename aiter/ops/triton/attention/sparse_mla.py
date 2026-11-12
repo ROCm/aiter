@@ -439,6 +439,7 @@ def _forward_paged(
     inv_rope_positions,
     inv_rope_cos_sin_cache,
     out_mxfp8,
+    use_lru_cache_partials=False,
 ):
     """dsv4 and the SWA+top-k two-loop, until the two launchers merge."""
     from aiter.ops.triton.attention.pa_decode_sparse import pa_decode_sparse
@@ -471,6 +472,7 @@ def _forward_paged(
         extra_cache=extra_kv,
         extra_indices=extra_indices,
         extra_indptr=extra_indptr,
+        use_lru_cache_partials=use_lru_cache_partials,
         out=out,
         inv_rope_positions=inv_rope_positions,
         inv_rope_cos_sin_cache=inv_rope_cos_sin_cache,
@@ -734,6 +736,7 @@ def _forward_dsv4_640(
     extra_indices,
     inv_rope_positions,
     out_mxfp8,
+    use_lru_cache_partials,
 ):
     """fp8_dsv4_mla_640 -> the gfx1250 fp8 driver, for prefill and decode alike.
 
@@ -817,6 +820,7 @@ def _forward_dsv4_640(
         kv_splits=kv_splits,
         has_invalid=has_invalid,
         skip_reduce=skip_reduce,
+        use_lru_cache_partials=use_lru_cache_partials,
         out=out,
     )
     return res if isinstance(res, tuple) else (res, None)
@@ -848,6 +852,7 @@ def sparse_mla_fwd(
     inv_rope_cos_sin_cache: torch.Tensor | None = None,
     out_mxfp8: tuple[torch.Tensor, torch.Tensor] | None = None,
     q_rope: torch.Tensor | None = None,
+    use_lru_cache_partials: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor | None]:
     """Sparse (top-k gathered) MLA attention.
 
@@ -951,6 +956,12 @@ def sparse_mla_fwd(
             The 640 B format serves prefill and decode through the same kernel;
             the split-K heuristic follows the row count (kv_splits=1 forces the
             single pass).
+        use_lru_cache_partials: reuse the split-K partial buffers across calls
+            (an LRU of persistent buffers sized by the next power of two of C)
+            instead of allocating them per call. For the packed caches
+            (fp8_dsv4_mla, fp8_dsv4_mla_640, fp8_g64) and the two-loop, which
+            run pa_decode_sparse's drivers; no effect with one split or with
+            skip_reduce. The flat-pool kernel does not take it.
         out_mxfp8: (data [C, H * D] e4m3, scale [C, H * D // 32] uint8 E8M0) in
             place of out, for the same caches: the output is stored
             MXFP8-quantized, one scale per 32 lanes, and data viewed as
@@ -1052,6 +1063,7 @@ def sparse_mla_fwd(
             extra_indices=extra_indices,
             inv_rope_positions=inv_rope_positions,
             out_mxfp8=out_mxfp8,
+            use_lru_cache_partials=use_lru_cache_partials,
         )
     if fmt in ("fp8_dsv4_mla", "fp8_g64") or (has_extra and fmt != "fp8_scalar"):
         return _forward_paged(
@@ -1075,6 +1087,12 @@ def sparse_mla_fwd(
             inv_rope_positions,
             inv_rope_cos_sin_cache,
             out_mxfp8,
+            use_lru_cache_partials,
+        )
+    if use_lru_cache_partials:
+        raise ValueError(
+            f"use_lru_cache_partials applies to the packed caches and the two-loop "
+            f"(pa_decode_sparse's drivers); the {fmt} flat-pool kernel does not take it"
         )
     arch = arch_info.get_arch()
     assert arch in SUPPORTED_ARCHS, f"sparse_mla_fwd does not support {arch}"
