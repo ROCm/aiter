@@ -3,8 +3,9 @@
 
 """BF16 latent-projection GEMMs: caller buffers and changed graph inputs.
 
-The defaults exercise the three retuned cells and padded-M boundary consumers,
-without bias, scaling, or preshuffled weights. Torch FP32 linear is an untimed reference.
+The defaults exercise the retuned M128/N7168/K3584 cell, its padded-M
+consumers, and unchanged large-M regressions. Bias, scaling and preshuffled
+weights are excluded. Torch FP32 linear is an untimed reference.
 """
 
 import argparse
@@ -20,9 +21,9 @@ from aiter.jit.utils.chip_info import get_gfx_runtime
 from aiter.test_common import benchmark, checkAllclose, run_perftest
 from aiter.tuned_gemm import gemm_a16w16, gemm_a16w16_out
 
-# Exact keys plus representative first/last ragged-M consumers of those keys.
-# The lookup tries exact M, fine padding, then coarse padding; the CSV does
-# not specialize dispatch to the exact three M values alone.
+# The changed M128 key also serves M65..128 through padded-M lookup.
+# Larger shapes and their ragged-M boundaries remain regression coverage;
+# their tuned rows are unchanged by this PR.
 SHAPES = (
     (128, 7168, 3584),
     (16384, 3584, 7168),
