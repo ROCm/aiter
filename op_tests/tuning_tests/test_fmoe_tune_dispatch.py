@@ -91,6 +91,8 @@ def _kernel_names(tasks):
 class TestFmoeTuneDispatch(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
+        import torch
+
         from aiter import ActivationType, QuantType, dtypes
         from aiter.fused_moe import AsmMoeMode
         from aiter.tuning.moe import fused_moe
@@ -107,6 +109,7 @@ class TestFmoeTuneDispatch(unittest.TestCase):
         cls.AsmMoeMode = AsmMoeMode
         cls.QuantType = QuantType
         cls.dtypes = dtypes
+        cls.torch = torch
         cls.gemm_moe_tune = gemm_moe_tune
         cls.fused_moe = fused_moe
         cls.backends_common = common
@@ -192,7 +195,6 @@ class TestFmoeTuneDispatch(unittest.TestCase):
         dtype=None,
         gfx="gfx950",
     ):
-        m = self.gemm_moe_tune
         return (
             gfx,
             256,
@@ -202,7 +204,7 @@ class TestFmoeTuneDispatch(unittest.TestCase):
             8,
             2,
             self.ActivationType.Silu if act_type is None else act_type,
-            m.torch.bfloat16 if dtype is None else dtype,
+            self.torch.bfloat16 if dtype is None else dtype,
             self.dtypes.fp8 if q_dtype_a is None else q_dtype_a,
             self.dtypes.fp4x2 if q_dtype_w is None else q_dtype_w,
             self.QuantType.per_1x32 if q_type is None else q_type,
@@ -482,11 +484,10 @@ class TestFmoeTuneDispatch(unittest.TestCase):
         self.assertNotIn(16, {t[0][3] for t in tasks})
 
     def test_flydsl_v2_rejects_doweight_and_non_bf16_output(self):
-        m = self.gemm_moe_tune
         gen = self.tuner.gen_flydsl_v2_2stages_task
         self.assertTrue(gen(self.info(), BLOCK_MS))
         self.assertEqual(gen(self.info(doweight_stage1=1), BLOCK_MS), [])
-        self.assertEqual(gen(self.info(dtype=m.torch.float16), BLOCK_MS), [])
+        self.assertEqual(gen(self.info(dtype=self.torch.float16), BLOCK_MS), [])
 
     def test_flydsl_v2_stage2_tile_n_must_divide_model_dim(self):
         # 5248 = 41 * 128: tile_n 128 divides it, tile_n 256 does not.

@@ -110,6 +110,7 @@ class TestFmoeWinnerReplay(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         import pandas as pd
+        import torch
 
         from aiter import ActivationType, QuantType, dtypes
         from aiter.fused_moe import AsmMoeMode
@@ -121,6 +122,7 @@ class TestFmoeWinnerReplay(unittest.TestCase):
         cls.QuantType = QuantType
         cls.dtypes = dtypes
         cls.pd = pd
+        cls.torch = torch
         cls.gemm_moe_tune = gemm_moe_tune
         cls.fused_moe = fused_moe
         cls.shape = cls.make_shape(token=32)
@@ -128,8 +130,7 @@ class TestFmoeWinnerReplay(unittest.TestCase):
 
     @classmethod
     def make_shape(cls, token, q_dtype_a=None, q_dtype_w=None, q_type=None):
-        m = cls.gemm_moe_tune
-        bf16 = m.torch.bfloat16
+        bf16 = cls.torch.bfloat16
         return (
             "gfx950",
             256,
@@ -185,7 +186,7 @@ class TestFmoeWinnerReplay(unittest.TestCase):
             return None, timed_us
 
         m = self.gemm_moe_tune
-        torch = m.torch
+        torch = self.torch
         with tempfile.TemporaryDirectory() as root:
             configs = Path(root, "aiter", "configs")
             configs.mkdir(parents=True)
