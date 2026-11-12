@@ -97,7 +97,7 @@ def sparse_mla_bwd(q, kv, o, do, indices, lse, attn_sink, scale=None):
     The op splits the top-k axis into chunks of at most ``_MAX_R_CHUNK`` slots.
     For each chunk, one kernel computes dQ and stores dS and P. A second kernel
     computes interm[t, k, :] = sum_h (dS * Q + P * dO), and a CSR gather adds
-    interm into dKV. dQ and dKV accumulate in fp32.
+    interm into dKV. dQ, interm and dKV are fp32.
 
     Args:
         q: [N, H, D] query.
@@ -151,7 +151,7 @@ def sparse_mla_bwd(q, kv, o, do, indices, lse, attn_sink, scale=None):
     dkv = torch.empty(N_kv, D, device=q.device, dtype=torch.float32)
     chunk_ds = torch.empty(N, H, r_chunk, device=q.device, dtype=torch.bfloat16)
     chunk_p = torch.empty(N, H, r_chunk, device=q.device, dtype=torch.bfloat16)
-    interm = torch.empty(N, r_chunk, D, device=q.device, dtype=torch.bfloat16)
+    interm = torch.empty(N, r_chunk, D, device=q.device, dtype=torch.float32)
 
     for r_start in range(0, padded_topk, r_chunk):
         _bwd_dq_kernel[(N, triton.cdiv(H, dq_kwargs["BLOCK_H"]))](
