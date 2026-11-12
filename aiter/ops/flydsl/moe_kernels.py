@@ -3680,6 +3680,9 @@ def flydsl_moe_fused_quant_preshuffle(
 
     wave_size = get_warp_size()
     warps_per_block = 256 // wave_size
+    if tp_route_params is not None and topids_to_rows is None:
+        # The row-indexed branch would leave the route outputs unwritten.
+        raise ValueError("tp_route_params needs the route-indexed quant")
     if topids_to_rows is not None:
         topids_to_rows_i32 = topids_to_rows.to(
             device=device, dtype=torch.int32
@@ -3726,6 +3729,22 @@ def flydsl_moe_fused_quant_preshuffle(
                 .contiguous()
             )
             assert tp_ids_i32.numel() == numel
+            tp_tile_m = int(tp_route_params["tile_m"])
+            tp_m, tp_psum = tp_route_params["masked_m"], tp_route_params["psum"]
+            # Raw-pointer outputs: a converted or strided copy would drop the
+            # writes, and every used expert may pad up to tile_m - 1 rows.
+            if (
+                n_rows < numel + min(tp_experts, numel) * (tp_tile_m - 1)
+                or tp_m.dtype != torch.int32
+                or tp_psum.dtype != torch.int32
+                or not (tp_m.is_contiguous() and tp_psum.is_contiguous())
+                or min(tp_m.numel(), tp_psum.numel()) < tp_experts
+            ):
+                raise ValueError(
+                    "TP route fusion needs contiguous int32 masked_m/psum of "
+                    f"{tp_experts} elements and {n_rows} >= numel + min(experts, "
+                    "numel) * (tile_m - 1) grouped rows"
+                )
         if fuse_ep_psum:
             if int(ep_psum_params["experts"]) > 256:
                 raise ValueError(
@@ -3797,7 +3816,7 @@ def flydsl_moe_fused_quant_preshuffle(
                     ptr_arg(tp_route_params["masked_m"].reshape(-1)),
                     ptr_arg(tp_route_params["psum"].reshape(-1)),
                     tp_experts,
-                    int(tp_route_params["tile_m"]),
+                    tp_tile_m,
                     (token_num + warps_per_block - 1) // warps_per_block,
                     current_stream_arg(),
                 )
