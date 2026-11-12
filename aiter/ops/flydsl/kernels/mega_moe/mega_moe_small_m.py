@@ -468,7 +468,8 @@ def _plan_flag(no_overflow, total_tiles, hot_expert, routed_rows, fz_tile_m):
     """Low 32 bits of the plan word: num_valid, plus the row-count bits of _PLAN_CACHED_W_BIT /
     _PLAN_FP8_ROWS_BIT."""
     nv_flag = no_overflow.select(total_tiles * fx.Int32(fz_tile_m), fx.Int32(0))
-    nv_flag = nv_flag | (hot_expert | (routed_rows >= fx.Int32(_CACHED_W_MIN_ROWS))).select(
+    cached_min = _CACHED_W_MIN_ROWS if fz_tile_m <= 32 else _CACHED_W_MIN_ROWS_M64
+    nv_flag = nv_flag | (hot_expert | (routed_rows >= fx.Int32(cached_min))).select(
         fx.Int32(1 << _PLAN_CACHED_W_BIT), fx.Int32(0)
     )
     return nv_flag | (hot_expert | (routed_rows >= fx.Int32(_FP8_ROWS_MIN_ROWS))).select(
@@ -1574,9 +1575,12 @@ def run_mega_moe_stage1(out, x, w, scale_x, scale_w, sorted_token_ids, expert_id
 # Combine reducer CTAs of the single kernel.
 _COMBINE_REDUCERS = 256
 # Routed rows a rank receives (before tile padding) from which the streaming GEMM1 / GEMM2 bodies give way to
-# cached-weight ones, whose experts then span enough m-tiles to reuse their weights. Measured: cached loads
-# cost uniform routing at 384 tokens (2304 rows) and gain from 448 (2688).
+# cached-weight ones, whose experts then span enough m-tiles to reuse their weights. The bound is per m-tile height:
+# with 64-row m-tiles an expert needs twice the rows to span two. Measured on EP4 V4.1-Flash: uniform routing at
+# 448-512 tokens (2688-3072 rows, ~32 an expert, 64-row m-tiles) streams 4.5% faster than cached; skewed routing
+# gains from the cache on a rank past ~4608 rows with 64-row m-tiles, and past 2560 with 32-row ones (128 tokens: 1.9%).
 _CACHED_W_MIN_ROWS = 2560
+_CACHED_W_MIN_ROWS_M64 = 4608
 # Routed rows a rank receives from which its GEMM2 sends FP8 rows (1x32 E8M0 scales, the numerics of the main
 # path) to the combine instead of BF16: above the 3072 rows of uniform routing at 512 tokens.
 _FP8_ROWS_MIN_ROWS = 3584
