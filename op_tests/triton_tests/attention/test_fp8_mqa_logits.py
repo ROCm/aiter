@@ -1,12 +1,17 @@
 # tests are adapted from https://github.com/deepseek-ai/DeepGEMM/blob/main/tests/test_attention.py
+import functools
+
 import pytest
 import torch
 
+import aiter.ops.triton.attention.fp8_mqa_logits as mqa_module
 from aiter.ops.triton.attention.fp8_mqa_logits import (
     ASYNC_COPY_SUPPORTS_DISTRIBUTED,
     FOLDED_REDUCTED_SUPPORT,
-    arch as mqa_arch,
     fp8_mqa_logits,
+)
+from aiter.ops.triton.attention.fp8_mqa_logits import (
+    arch as mqa_arch,
 )
 from aiter.ops.triton.utils.types import get_fp8_dtypes
 
@@ -257,6 +262,38 @@ def test_fp8_mqa_logits_nonzero_cu_start(
     assert diff < 1e-4, f"{diff=}"
 
 
+@pytest.fixture(params=["auto", "forced"])
+def rows8_dispatch(request, monkeypatch):
+    """Run with the automatic dispatch and with the eight-row occupancy check
+    bypassed, so small shapes still exercise the eight-row kernel."""
+    if request.param == "forced":
+        monkeypatch.setattr(
+            mqa_module,
+            "_gfx950_rows8_launch",
+            functools.partial(
+                mqa_module._gfx950_rows8_launch, require_full_waves=False
+            ),
+        )
+    return request.param
+
+
+@pytest.mark.parametrize(
+    "s_q,s_k,expected",
+    [
+        (8, 4096, False),
+        (24, 4223, False),
+        (64, 573440, False),
+        (4096, 4095, False),
+        (4096, 8192, True),
+        (4104, 8192, True),
+        (1856, 116480, True),
+    ],
+)
+def test_fp8_mqa_logits_rows8_occupancy_gate(s_q, s_k, expected):
+    """The eight-row path needs a grid that fills every SIMD at its waves."""
+    assert (mqa_module._gfx950_rows8_launch(s_q, s_k) is not None) == expected
+
+
 def _strided_test_tensor(tensor):
     storage = torch.empty(
         tuple(2 * size + 1 for size in tensor.shape),
@@ -337,7 +374,7 @@ def _check_long_kv_logits(logits, inputs, clean_logits=False):
 )
 @torch.inference_mode()
 def test_fp8_mqa_logits_long_kv_windows(
-    s_q, s_k, num_heads, head_dim, clean_logits, strided
+    s_q, s_k, num_heads, head_dim, clean_logits, strided, rows8_dispatch
 ):
     """Check long-KV row groups and their public-wrapper fallback cases."""
     torch.manual_seed(0)
@@ -352,7 +389,7 @@ def test_fp8_mqa_logits_long_kv_windows(
     + [(65537, 129), (65537, 65501)],
 )
 @torch.inference_mode()
-def test_fp8_mqa_logits_long_kv_nonzero_union(s_k, window_length):
+def test_fp8_mqa_logits_long_kv_nonzero_union(s_k, window_length, rows8_dispatch):
     """Check narrow and split KV ranges without a full-range query row."""
     torch.manual_seed(0)
     inputs = _long_kv_test_inputs(8, s_k, 32, 128)
@@ -379,7 +416,7 @@ def test_fp8_mqa_logits_empty_output(s_q, s_k, clean_logits):
 
 
 @torch.inference_mode()
-def test_fp8_mqa_logits_long_kv_graph_replay():
+def test_fp8_mqa_logits_long_kv_graph_replay(rows8_dispatch):
     """Alternate two graphs with fresh inputs and changing valid windows."""
     torch.manual_seed(0)
     states = []
@@ -421,7 +458,7 @@ def test_fp8_mqa_logits_long_kv_graph_replay():
 
 
 @torch.inference_mode()
-def test_fp8_mqa_logits_long_kv_auxiliary_strides():
+def test_fp8_mqa_logits_long_kv_auxiliary_strides(rows8_dispatch):
     if not (
         mqa_arch == "gfx950"
         and e4m3_type == torch.float8_e4m3fn
