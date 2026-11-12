@@ -667,6 +667,8 @@ def _get_pci_chip_id(device_id=None):
 
 
 MI308_CHIP_IDS = {0x74A2, 0x74A8, 0x74B6, 0x74BC}
+# MI300A is the gfx942 APU: 228 CUs and 6 XCCs, against MI300X's 304 and 8.
+MI300A_CHIP_IDS = {0x74A0}
 
 
 def get_device_name():
@@ -692,6 +694,8 @@ def _get_device_name(device_id: int) -> str:
         chip_id = _get_pci_chip_id(device_id)
         if chip_id in MI308_CHIP_IDS:
             return "MI308"
+        if chip_id in MI300A_CHIP_IDS:
+            return "MI300A"
         return "MI300"
     elif gfx == "gfx950":
         num_xcds = _num_xcds_for_device(device_id)

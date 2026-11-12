@@ -266,6 +266,13 @@ def test_pci_chip_id_attribute_follows_runtime_version(hip, version, attribute):
     assert hip.hipDeviceGetAttribute.call_args.args[1:] == (attribute, 0)
 
 
+def test_mi300a_chip_id_is_named_separately_from_mi300(hip):
+    hip.archs[0] = "gfx942:sramecc+:xnack-"
+    hip.hipDeviceGetAttribute.side_effect = _hip_result(0x74A0)
+    assert chip_info.get_device_name() == "MI300A"
+    assert hip.hipDeviceGetAttribute.call_args.args[1:] == (10020, 0)
+
+
 def test_pci_chip_id_raises_on_unknown_version(hip):
     hip.archs[0] = "gfx942:sramecc+:xnack-"
     hip.hipRuntimeGetVersion.side_effect = _hip_result(0, 999)
