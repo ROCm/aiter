@@ -178,10 +178,10 @@ def build_topk_per_row_small_k_module(
     once the survivor buffer is what caps occupancy. A wide block over a short
     row buys nothing and pays the cross-wave barriers.
     """
-    if wave_size != 64:
-        # The chunk selection is a single i64 ballot over the lanes, so a
-        # wave32 target would need a different mask width throughout.
-        raise ValueError(f"wave size must be 64, got {wave_size}")
+    # ROCm's i64 ballot leaves the high half clear on wave32, so the existing
+    # low/high mask storage and lane shifts are valid on both wave sizes.
+    if wave_size not in (32, 64):
+        raise ValueError(f"wave size must be 32 or 64, got {wave_size}")
     if k < 1 or k > wave_size:
         raise ValueError(f"k must be in [1, {wave_size}] (one chunk per lane), got {k}")
     if n_max < k:
