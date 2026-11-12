@@ -1268,7 +1268,8 @@ static LaunchPlan plan_launch(int M, int pitch, const ShapeParams& sp)
     lp.chunk_stride = sample_chunk_stride(pitch, S / SAMPLE_CHUNK_ELEMS);
 
     const int wide_buf         = WIDE_WORDS * (int)sizeof(uint32_t);
-    const bool baseline_wide_c = wide_select_fits(M, cu, PHASE_C_STATIC_LDS + cap * 8, 2 * wide_buf);
+    const bool baseline_wide_c =
+        wide_select_fits(M, cu, PHASE_C_STATIC_LDS + cap * 8, 2 * wide_buf);
     const bool compact_wide_c =
         cap == PHASE_C_CAP &&
         wide_select_fits_allocated(M, cu, PHASE_C_STATIC_LDS + cap * 4, wide_buf);
@@ -1721,16 +1722,20 @@ void top_k_per_row_prefill_sampled(
         else if(ragged_small)
         {
             if(val)
-                topk_small_n<true, true>(in, M, N, row_starts, row_ends, K, idx, val, sp.cu, stream);
+                topk_small_n<true, true>(
+                    in, M, N, row_starts, row_ends, K, idx, val, sp.cu, stream);
             else
-                topk_small_n<true, false>(in, M, N, row_starts, row_ends, K, idx, nullptr, sp.cu, stream);
+                topk_small_n<true, false>(
+                    in, M, N, row_starts, row_ends, K, idx, nullptr, sp.cu, stream);
         }
         else
         {
             if(val)
-                topk_small_n<false, true>(in, M, N, row_starts, row_ends, K, idx, val, sp.cu, stream);
+                topk_small_n<false, true>(
+                    in, M, N, row_starts, row_ends, K, idx, val, sp.cu, stream);
             else
-                topk_small_n<false, false>(in, M, N, row_starts, row_ends, K, idx, nullptr, sp.cu, stream);
+                topk_small_n<false, false>(
+                    in, M, N, row_starts, row_ends, K, idx, nullptr, sp.cu, stream);
         }
         HIP_CALL_LAUNCH(hipGetLastError());
         return;
