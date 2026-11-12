@@ -5,7 +5,7 @@
 
 The defaults exercise both projection groups at their optimized M cases:
 M128/M16384 for N7168/K3584 and M16384 for N3584/K7168, plus padded-M boundaries.
-The unresolved M128/N3584/K7168 atomic-accuracy case is not claimed qualified. Bias, scaling and preshuffled
+The M128/N3584/K7168 case exercises deterministic FP32 partial reduction. Bias, scaling and preshuffled
 weights are excluded. Torch FP32 linear is an untimed reference.
 """
 
@@ -26,6 +26,7 @@ from aiter.tuned_gemm import gemm_a16w16, gemm_a16w16_out
 # Both large projections have exact-shape implementation specializations.
 # Their ragged-M boundaries keep the corresponding original device code.
 SHAPES = (
+    (128, 3584, 7168),
     (128, 7168, 3584),
     (16384, 3584, 7168),
     (16384, 7168, 3584),
@@ -369,6 +370,174 @@ def check_hti_unroll_specialization():
     aiter.logger.info("HTI period shape/config/cache specialization checks passed")
 
 
+def check_packed_split_specialization():
+    from aiter.ops.flydsl.kernels.gemm_a16w16_gfx950 import (
+        _use_packed_split,
+        make_gemm_a16w16_gfx950_kernel_name,
+        make_gemm_a16w16_param_and_validate,
+    )
+
+    cfg = {
+        "in_dtype_id": 2,
+        "out_dtype_id": 2,
+        "block_m": 64,
+        "block_n": 64,
+        "block_k": 64,
+        "stages": 4,
+        "split_k": 4,
+        "m_waves": 2,
+        "n_waves": 2,
+        "k_waves": 1,
+        "group_m": 0,
+        "use_half_tile_interleaved": False,
+        "a_is_transposed": False,
+        "b_is_transposed": True,
+        "has_bias": False,
+    }
+    original = cfg.copy()
+    for m in (64, 65, 127, 128, 129, 256):
+        want = m == 128
+        assert _use_packed_split(m, 3584, 7168, cfg) == want
+        param = make_gemm_a16w16_param_and_validate(m, 3584, 7168, cfg)
+        assert param is not None
+        assert make_gemm_a16w16_gfx950_kernel_name(param).endswith("_ps2r4") == want
+    old = make_gemm_a16w16_param_and_validate(128, 3584, 7168, cfg)
+    new = make_gemm_a16w16_param_and_validate(
+        128, 3584, 7168, {**cfg, "stages": 5, "split_k": 2}
+    )
+    assert old is new
+    assert int(old.stages) == 5 and not bool(old.is_split_k)
+    for field, value in (
+        ("in_dtype_id", 3),
+        ("out_dtype_id", 1),
+        ("has_bias", True),
+        ("a_is_transposed", True),
+        ("b_is_transposed", False),
+        ("use_half_tile_interleaved", True),
+        ("b_non_temporal", True),
+        ("k_stagger", 1),
+        ("group_m", 4),
+        ("split_k", 1),
+        ("block_m", 128),
+        ("block_n", 128),
+        ("block_k", 128),
+        ("stages", 7),
+        ("m_waves", 4),
+        ("n_waves", 4),
+        ("k_waves", 2),
+    ):
+        assert not _use_packed_split(128, 3584, 7168, {**cfg, field: value})
+    for n, k in ((3584, 3584), (7168, 7168), (3576, 7168)):
+        assert not _use_packed_split(128, n, k, cfg)
+    declined = make_gemm_a16w16_param_and_validate(
+        127, 3584, 7168, {**cfg, "packed_split": True}
+    )
+    assert not make_gemm_a16w16_gfx950_kernel_name(declined).endswith("_ps2r4")
+    assert cfg == original
+    aiter.logger.info("Packed split shape/config/cache specialization checks passed")
+
+
+@benchmark()
+def test_packed_split_lifetime(padding, seed):
+    """Independent scratch under graph capture, explicit streams and legal strides."""
+    from aiter.ops.flydsl.kernels.gemm_a16w16_gfx950 import gemm_a16w16 as fly_gemm
+
+    m, n, k = 128, 3584, 7168
+    torch.manual_seed(seed)
+    cfg = {
+        "block_m": 64,
+        "block_n": 64,
+        "block_k": 64,
+        "stages": 4,
+        "split_k": 4,
+        "m_waves": 2,
+        "n_waves": 2,
+        "k_waves": 1,
+        "group_m": 0,
+        "use_half_tile_interleaved": False,
+    }
+    inputs, halos, outputs = [], [], []
+    for _ in range(2):
+        x = torch.randn((m, k + padding), device="cuda", dtype=torch.bfloat16)
+        w = torch.randn((n, k + 2 * padding), device="cuda", dtype=torch.bfloat16)
+        # Nonzero, 16-byte-aligned offsets, exact logical K and padded strides.
+        x = x[:, padding // 2 : padding // 2 + k]
+        w = w[:, padding : padding + k]
+        inputs.append((x, w))
+        halo = torch.full((m * n + 32,), 37.0, device=x.device, dtype=x.dtype)
+        halos.append(halo)
+        outputs.append(halo[16:-16].view(m, n))
+
+    streams = [torch.cuda.Stream(), torch.cuda.Stream()]
+    graphs = []
+    # Compile on the ambient stream, then capture on two new streams without
+    # preallocating scratch there. Each captured invocation owns its workspace.
+    for (x, w), out in zip(inputs, outputs):
+        fly_gemm(x, w.T, out=out, user_kwargs=cfg)
+    for stream, (x, w), out in zip(streams, inputs, outputs):
+        stream.wait_stream(torch.cuda.current_stream())
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph, stream=stream):
+            for _ in range(4):
+                fly_gemm(x, w.T, out=out, user_kwargs=cfg)
+        stream.synchronize()
+        graphs.append(graph)
+
+    for step in range(6):
+        for x, w in inputs:
+            if step % 3 == 0:
+                x.normal_()
+                w.normal_()
+            elif step % 3 == 1:
+                x.mul_(0.125)
+                w.mul_(0.125)
+            else:
+                x.copy_(torch.randint(-4, 5, x.shape, device=x.device).float() / 16)
+                w.copy_(torch.randint(-4, 5, w.shape, device=w.device).float() / 16)
+        saved = [(x.clone(), w.clone()) for x, w in inputs]
+        expected = [run_torch(x, w) for x, w in inputs]
+        for stream, graph, out in zip(streams, graphs, outputs):
+            out.fill_(float("nan"))
+            stream.wait_stream(torch.cuda.current_stream())
+            with torch.cuda.stream(stream):
+                graph.replay()
+                graph.replay()
+        # Pass an explicit launch stream while the ambient stream is different.
+        for stream, (x, w), out in zip(streams, inputs, outputs):
+            fly_gemm(x, w.T, out=out, user_kwargs=cfg, stream=stream)
+        pressure = [
+            torch.full((256, 3584), 91.0, device=outputs[0].device) for _ in range(3)
+        ]
+        for stream in streams:
+            stream.synchronize()
+        for (x, w), (sx, sw), ref, out, halo in zip(
+            inputs, saved, expected, outputs, halos
+        ):
+            assert_result(ref, out, "packed scratch lifetime")
+            assert torch.equal(x, sx) and torch.equal(w, sw)
+            assert (halo[:16] == 37).all().item()
+            assert (halo[-16:] == 37).all().item()
+        del pressure
+
+    ret = {"gfx": get_gfx_runtime()}
+    candidates = {f"graph{i}": graph.replay for i, graph in enumerate(graphs)}
+    for i, (name, fn) in enumerate(candidates.items()):
+        _, us = run_perftest(
+            fn, num_iters=30, num_warmup=5, num_rotate_args=1, use_cuda_event=True
+        )
+        err = assert_result(expected[i], outputs[i], name)
+        us /= 4
+        ret.update(
+            {
+                name + " us": us,
+                name + " TFLOPS": 2 * m * n * k / us / 1e6,
+                name + " TB/s": 2 * (m * k + n * k + m * n) / us / 1e6,
+                name + " err": err,
+            }
+        )
+    return ret
+
+
 def main():
     if get_gfx_runtime() != "gfx950":
         aiter.logger.warning("This tuning qualification targets gfx950; skipping")
@@ -376,18 +545,30 @@ def main():
     check_ring_specialization()
     check_n_grouped_specialization()
     check_hti_unroll_specialization()
+    check_packed_split_specialization()
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
         "-s", "--mnk", nargs="+", type=aiter.dtypes.str2tuple, default=SHAPES
     )
     parser.add_argument("--seed", nargs="+", type=int, default=[912, 913])
+    parser.add_argument("--leading-padding", type=int, nargs="+", default=[0, 16])
     args = parser.parse_args()
+    if any(p < 0 or p % 16 for p in args.leading_padding):
+        parser.error("--leading-padding must contain nonnegative multiples of 16")
     rows = [
         test_latent_gemm(*shape, seed)
         for shape, seed in itertools.product(args.mnk, args.seed)
     ]
     aiter.logger.info(
         "BF16 latent projection GEMMs:\n%s", pd.DataFrame(rows).to_markdown(index=False)
+    )
+    lifetime_rows = [
+        test_packed_split_lifetime(padding, seed)
+        for padding, seed in itertools.product(args.leading_padding, args.seed)
+    ]
+    aiter.logger.info(
+        "Packed split scratch lifetime:\n%s",
+        pd.DataFrame(lifetime_rows).to_markdown(index=False),
     )
 
 

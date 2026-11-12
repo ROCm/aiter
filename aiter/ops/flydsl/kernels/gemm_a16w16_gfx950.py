@@ -60,6 +60,7 @@ class GemmA16W16Gfx950Param:
     mma_m: fx.Constexpr[int]
     mma_n: fx.Constexpr[int]
     mma_k: fx.Constexpr[int]
+    packed_split: fx.Constexpr[bool]
     unroll_hti: fx.Constexpr[bool]
     n_grouped_loads: fx.Constexpr[bool]
     unroll_lds_ring: fx.Constexpr[bool]
@@ -124,6 +125,7 @@ def make_gemm_a16w16_gfx950_param(
     unroll_lds_ring: bool = False,
     n_grouped_loads: bool = False,
     unroll_hti: bool = False,
+    packed_split: bool = False,
 ) -> GemmA16W16Gfx950Param:
     if in_dtype_id not in (GEMM_A16W16_DTYPE_BF16, GEMM_A16W16_DTYPE_FP16):
         raise ValueError(f"unsupported in_dtype_id={in_dtype_id}")
@@ -151,7 +153,7 @@ def make_gemm_a16w16_gfx950_param(
         raise ValueError("group_m must be non-negative")
     in_dbytes = 2
     # Shared C uses the output dtype: fp32 output is never rounded to 16 bits.
-    out_dbytes = 4 if out_dtype_id == GEMM_A16W16_DTYPE_FP32 else 2
+    out_dbytes = 4 if out_dtype_id == GEMM_A16W16_DTYPE_FP32 or packed_split else 2
     block_threads = m_waves * n_waves * k_waves * GFX950_WAVE_SIZE
     max_cshuffle_r2g_vec_size = 16 // out_dbytes
     if use_half_tile_interleaved:
@@ -292,7 +294,8 @@ def make_gemm_a16w16_gfx950_param(
         block_n=block_n,
         block_k=block_k,
         stages=stages,
-        is_split_k=split_k > 1,
+        is_split_k=split_k > 1 and not packed_split,
+        packed_split=packed_split,
         m_waves=m_waves,
         n_waves=n_waves,
         k_waves=k_waves,
@@ -338,6 +341,7 @@ def make_gemm_a16w16_gfx950_kernel_name(param: GemmA16W16Gfx950Param):
     name += "_ring5" if param.unroll_lds_ring else ""
     name += "_ng4sk" if param.n_grouped_loads else ""
     name += "_hti5sk" if param.unroll_hti else ""
+    name += "_ps2r4" if param.packed_split else ""
     return name
 
 
@@ -578,7 +582,9 @@ def gemm_a16w16_gfx950_kernel(
     )
     global_output_dtype = (
         fx.Float32
-        if const_expr(param.out_dtype_id == GEMM_A16W16_DTYPE_FP32)
+        if const_expr(
+            param.out_dtype_id == GEMM_A16W16_DTYPE_FP32 or param.packed_split
+        )
         else elem_dtype
     )
     if const_expr(is_split_k):
@@ -605,7 +611,11 @@ def gemm_a16w16_gfx950_kernel(
     ks_begin = ks_idx * working_k
     ks_end = ks_begin + working_k
     ks_end = (ks_end < k).select(ks_end, k)
-    k_tiles = (ks_end - ks_begin) // block_k
+    if const_expr(param.packed_split):
+        # K7168 split into two complete 3584-element partitions.
+        k_tiles = 56
+    else:
+        k_tiles = (ks_end - ks_begin) // block_k
     if const_expr(param.k_stagger > 0):
         # Rotate only the global K loads, never the LDS ring index. The
         # actual partition length also handles a shorter final split.
@@ -805,7 +815,7 @@ def gemm_a16w16_gfx950_kernel(
     rocdl.sched_barrier(0)
 
     main_loop_end = k_tiles - (stages - 1)
-    if const_expr(param.unroll_lds_ring):
+    if const_expr(param.unroll_lds_ring or param.packed_split):
         # Iterate complete LDS-ring cycles with compile-time read/write slots.
         # This removes per-tile ring-index/address arithmetic without changing
         # K order, asyncmark groups, wait counts, or the workgroup barriers.
@@ -845,98 +855,113 @@ def gemm_a16w16_gfx950_kernel(
     frag_C_out = fx.make_fragment_like(frag_C, global_output_dtype)
     frag_C_out.store(frag_C.load().to(global_output_dtype))
 
-    gpu.barrier()
-    for i in range_constexpr(fx.size(frag_C_out.shape).unpack()):
-        row = fx.get_scalar(thr_mma_cRow[i])
-        col = fx.get_scalar(thr_mma_cCol[i])
-        sC_write[row, col] = frag_C_out[i]
-
-    if const_expr(is_split_k):
-        splitk_protocol.wait_until_initialized(expected_signal)
+    if const_expr(param.packed_split):
+        # MFMA's four values are consecutive rows. Keep them contiguous in
+        # FP32 scratch: [split, row // 4, column, row % 4]. No LDS shuffle or
+        # BF16 rounding is needed before the separate deterministic reduction.
+        for i in range_constexpr(fx.size(frag_C_out.shape).unpack() // 4):
+            row = fx.get_scalar(thr_mma_cRow[i * 4]) + block_m_offset
+            col = fx.get_scalar(thr_mma_cCol[i * 4]) + block_n_offset
+            if (row < m) and (col < n):
+                vals = fx.Vector.from_elements(
+                    [frag_C_out[i * 4 + j] for j in range_constexpr(4)],
+                    fx.Float32,
+                )
+                offset = ks_idx * m * n + row // 4 * n * 4 + col * 4 + row % 4
+                fx.ptr_store(vals, fx.get_iter(out) + offset)
     else:
         gpu.barrier()
+        for i in range_constexpr(fx.size(frag_C_out.shape).unpack()):
+            row = fx.get_scalar(thr_mma_cRow[i])
+            col = fx.get_scalar(thr_mma_cCol[i])
+            sC_write[row, col] = frag_C_out[i]
 
-    cshuffle_r2g_x_threads = block_n // cshuffle_r2g_vec_size
-    cshuffle_vectors = block_m * block_n // cshuffle_r2g_vec_size
-    cshuffle_iters = (cshuffle_vectors + block_threads - 1) // block_threads
-    lane_contig_atomics = is_split_k
-    if const_expr(lane_contig_atomics):
-        # Split-K: lanes walk consecutive output elements (one fp32, or one bf16/fp16
-        # pair for the packed atomics), so each wave-level atomic covers whole 64 B
-        # lines (16 lanes per line) and the memory-side read-modify-write runs once per
-        # line per instruction. The vec-per-lane mapping below would touch 16 lines with
-        # 4 lanes each and pay four passes per line.
-        atom_elems = 1 if param.out_dtype_id == GEMM_A16W16_DTYPE_FP32 else 2
-        wave_idx = tid // GFX950_WAVE_SIZE
-        lane_idx = tid % GFX950_WAVE_SIZE
-        tile_elems = block_m * block_n
-        for i in range_constexpr(cshuffle_iters):
-            chunk = (
-                block_threads * i + wave_idx * GFX950_WAVE_SIZE
-            ) * cshuffle_r2g_vec_size
-            for j in range_constexpr(cshuffle_r2g_vec_size // atom_elems):
-                elem_idx = chunk + (j * GFX950_WAVE_SIZE + lane_idx) * atom_elems
-                if elem_idx < tile_elems:
-                    local_row = elem_idx // block_n
-                    local_col = elem_idx % block_n
-                    global_row = block_m_offset + local_row
-                    global_col = block_n_offset + local_col
-                    if (global_row < m) and (global_col < n):
-                        c_val = fx.ptr_load(
-                            smem_c + elem_idx,
-                            result_type=fx.Vector.make_type(
-                                atom_elems, global_output_dtype
-                            ),
-                        )
-                        for k_slice in range_constexpr(1, k_waves):
-                            c_val = c_val + fx.ptr_load(
-                                smem_c + k_slice * tile_elems + elem_idx,
+        if const_expr(is_split_k):
+            splitk_protocol.wait_until_initialized(expected_signal)
+        else:
+            gpu.barrier()
+
+        cshuffle_r2g_x_threads = block_n // cshuffle_r2g_vec_size
+        cshuffle_vectors = block_m * block_n // cshuffle_r2g_vec_size
+        cshuffle_iters = (cshuffle_vectors + block_threads - 1) // block_threads
+        lane_contig_atomics = is_split_k
+        if const_expr(lane_contig_atomics):
+            # Split-K: lanes walk consecutive output elements (one fp32, or one bf16/fp16
+            # pair for the packed atomics), so each wave-level atomic covers whole 64 B
+            # lines (16 lanes per line) and the memory-side read-modify-write runs once per
+            # line per instruction. The vec-per-lane mapping below would touch 16 lines with
+            # 4 lanes each and pay four passes per line.
+            atom_elems = 1 if param.out_dtype_id == GEMM_A16W16_DTYPE_FP32 else 2
+            wave_idx = tid // GFX950_WAVE_SIZE
+            lane_idx = tid % GFX950_WAVE_SIZE
+            tile_elems = block_m * block_n
+            for i in range_constexpr(cshuffle_iters):
+                chunk = (
+                    block_threads * i + wave_idx * GFX950_WAVE_SIZE
+                ) * cshuffle_r2g_vec_size
+                for j in range_constexpr(cshuffle_r2g_vec_size // atom_elems):
+                    elem_idx = chunk + (j * GFX950_WAVE_SIZE + lane_idx) * atom_elems
+                    if elem_idx < tile_elems:
+                        local_row = elem_idx // block_n
+                        local_col = elem_idx % block_n
+                        global_row = block_m_offset + local_row
+                        global_col = block_n_offset + local_col
+                        if (global_row < m) and (global_col < n):
+                            c_val = fx.ptr_load(
+                                smem_c + elem_idx,
                                 result_type=fx.Vector.make_type(
                                     atom_elems, global_output_dtype
                                 ),
                             )
-                        write_cshuffle_vec_to_global(
-                            out,
-                            out_buf,
-                            global_row * n + global_col,
-                            c_val,
-                            is_split_k,
-                            param.out_dtype_id == GEMM_A16W16_DTYPE_FP32,
-                        )
-    for i in range_constexpr(0 if lane_contig_atomics else cshuffle_iters):
-        vector_idx = block_threads * i + tid
-        if vector_idx < cshuffle_vectors:
-            local_row = vector_idx // cshuffle_r2g_x_threads
-            local_col = vector_idx % cshuffle_r2g_x_threads * cshuffle_r2g_vec_size
-            global_row = block_m_offset + local_row
-            global_col = block_n_offset + local_col
-            if (global_row < m) and (global_col < n):
-                c_vec = fx.ptr_load(
-                    smem_c + local_row * block_n + local_col,
-                    result_type=fx.Vector.make_type(
-                        cshuffle_r2g_vec_size, global_output_dtype
-                    ),
-                )
-                for k_slice in range_constexpr(1, k_waves):
-                    peer_c_vec = fx.ptr_load(
-                        smem_c
-                        + k_slice * block_m * block_n
-                        + local_row * block_n
-                        + local_col,
+                            for k_slice in range_constexpr(1, k_waves):
+                                c_val = c_val + fx.ptr_load(
+                                    smem_c + k_slice * tile_elems + elem_idx,
+                                    result_type=fx.Vector.make_type(
+                                        atom_elems, global_output_dtype
+                                    ),
+                                )
+                            write_cshuffle_vec_to_global(
+                                out,
+                                out_buf,
+                                global_row * n + global_col,
+                                c_val,
+                                is_split_k,
+                                param.out_dtype_id == GEMM_A16W16_DTYPE_FP32,
+                            )
+        for i in range_constexpr(0 if lane_contig_atomics else cshuffle_iters):
+            vector_idx = block_threads * i + tid
+            if vector_idx < cshuffle_vectors:
+                local_row = vector_idx // cshuffle_r2g_x_threads
+                local_col = vector_idx % cshuffle_r2g_x_threads * cshuffle_r2g_vec_size
+                global_row = block_m_offset + local_row
+                global_col = block_n_offset + local_col
+                if (global_row < m) and (global_col < n):
+                    c_vec = fx.ptr_load(
+                        smem_c + local_row * block_n + local_col,
                         result_type=fx.Vector.make_type(
                             cshuffle_r2g_vec_size, global_output_dtype
                         ),
                     )
-                    c_vec = c_vec + peer_c_vec
-                global_offset = global_row * n + global_col
-                write_cshuffle_vec_to_global(
-                    out,
-                    out_buf,
-                    global_offset,
-                    c_vec,
-                    is_split_k,
-                    param.out_dtype_id == GEMM_A16W16_DTYPE_FP32,
-                )
+                    for k_slice in range_constexpr(1, k_waves):
+                        peer_c_vec = fx.ptr_load(
+                            smem_c
+                            + k_slice * block_m * block_n
+                            + local_row * block_n
+                            + local_col,
+                            result_type=fx.Vector.make_type(
+                                cshuffle_r2g_vec_size, global_output_dtype
+                            ),
+                        )
+                        c_vec = c_vec + peer_c_vec
+                    global_offset = global_row * n + global_col
+                    write_cshuffle_vec_to_global(
+                        out,
+                        out_buf,
+                        global_offset,
+                        c_vec,
+                        is_split_k,
+                        param.out_dtype_id == GEMM_A16W16_DTYPE_FP32,
+                    )
 
 
 @flyc.kernel
@@ -1489,6 +1514,74 @@ gemm_a16w16_gfx950.compile_hints = {
 set_slp_vectorize_once_used(gemm_a16w16_gfx950, False)
 
 
+@flyc.kernel(known_block_size=[256, 1, 1])
+def _reduce_latent_packed_split(partial: fx.Tensor, out: fx.Tensor):
+    # Exact M128/N3584 specialization: every thread owns one column x four rows.
+    idx = fx.block_idx.x * 256 + fx.thread_idx.x
+    if idx < 128 * 3584 // 4:
+        ptr = fx.get_iter(partial)
+        first = fx.ptr_load(
+            ptr + idx * 4, result_type=fx.Vector.make_type(4, fx.Float32)
+        )
+        second = fx.ptr_load(
+            ptr + 128 * 3584 + idx * 4,
+            result_type=fx.Vector.make_type(4, fx.Float32),
+        )
+        result = (first + second).to(fx.BFloat16)
+        row = idx // 3584 * 4
+        col = idx % 3584
+        for r in range_constexpr(4):
+            fx.ptr_store(result[r], fx.get_iter(out) + (row + r) * 3584 + col)
+
+
+@flyc.jit
+def _latent_packed_split(
+    out: fx.Tensor,
+    a: fx.Tensor,
+    b: fx.Tensor,
+    partial: fx.Tensor,
+    param: GemmA16W16Gfx950Param,
+    stream: fx.Stream = fx.Stream(None),  # noqa: B008
+):
+    mma = fx.make_tiled_mma(
+        fx.make_mma_atom(fx.rocdl.MFMA(16, 16, 32, fx.BFloat16)),
+        fx.make_layout((2, 2, 1), (2, 1, 0)),
+        fx.make_tile(None, None, fx.make_layout((8, 4), (1, 8))),
+    )
+    # Preserve legal padded leading strides. Only logical extents are fixed.
+    lda = fx.Int32(fx.get_scalar(a.stride[0]))
+    ldb = fx.Int32(fx.get_scalar(b.stride[1]))
+    gemm_a16w16_gfx950_kernel._known_block_size = [256, 1, 1]
+    gemm_a16w16_gfx950_kernel._func.__name__ = make_gemm_a16w16_gfx950_kernel_name(
+        param
+    )
+    gemm_a16w16_gfx950_kernel(
+        partial,
+        a,
+        b,
+        a,
+        a,
+        a,
+        fx.Int32(128),
+        fx.Int32(3584),
+        fx.Int32(7168),
+        fx.Int32(2),
+        fx.Int32(3584),
+        lda,
+        ldb,
+        mma,
+        param,
+    ).launch(grid=(2 * 56, 2, 1), block=(256, 1, 1), stream=stream)
+    _reduce_latent_packed_split(partial, out).launch(
+        grid=(448, 1, 1), block=(256, 1, 1), stream=stream
+    )
+
+
+_latent_packed_split.compile_hints = {
+    "llvm_options": dict(gemm_a16w16_gfx950.compile_hints["llvm_options"])
+}
+
+
 @functools.cache
 def _gemm_a16w16_gfx950_param_for(items):
     # Building the param struct coerces every field through FlyDSL's typing
@@ -1555,15 +1648,44 @@ def _use_unrolled_hti(m, n, k, kwargs):
     return (m, n, k) == (16384, 3584, 7168) and _is_latent_hti_policy(kwargs)
 
 
+def _use_packed_split(m, n, k, kwargs):
+    # No padded-M dispatch: four-row scratch packets require complete rows.
+    return (
+        (m, n, k) == (128, 3584, 7168)
+        and kwargs.get("in_dtype_id") == GEMM_A16W16_DTYPE_BF16
+        and kwargs.get("out_dtype_id") == GEMM_A16W16_DTYPE_BF16
+        and not kwargs.get("has_bias", False)
+        and not kwargs.get("a_is_transposed", False)
+        and kwargs.get("b_is_transposed", True)
+        and not kwargs.get("use_half_tile_interleaved", False)
+        and not kwargs.get("b_non_temporal", False)
+        and kwargs.get("k_stagger", 0) == 0
+        and kwargs.get("group_m", 0) == 0
+        and (kwargs.get("stages"), kwargs.get("split_k")) in ((4, 4), (5, 2))
+        and kwargs.get("block_m") == 64
+        and kwargs.get("block_n") == 64
+        and kwargs.get("block_k") == 64
+        and kwargs.get("m_waves") == 2
+        and kwargs.get("n_waves") == 2
+        and kwargs.get("k_waves", 1) == 1
+    )
+
+
 def make_gemm_a16w16_param_and_validate(m, n, k, kwargs):
     result = None
     # Include the shape-dependent schedule in the constexpr parameter/cache key.
     # Do not mutate caller policy dictionaries or expose an unchecked override.
+    # The exact down-M128 tuned entry used four BF16 atomic partitions.
+    # Replace that schedule with two packed FP32 partitions and one BF16
+    # rounding. Leave padded-M consumers on their unchanged original policy.
+    if _use_packed_split(m, n, k, kwargs):
+        kwargs = {**kwargs, "stages": 5, "split_k": 2}
     kwargs = {
         **kwargs,
         "unroll_lds_ring": _use_unrolled_lds_ring(m, n, k, kwargs),
         "n_grouped_loads": _use_n_grouped_loads(m, n, k, kwargs),
         "unroll_hti": _use_unrolled_hti(m, n, k, kwargs),
+        "packed_split": _use_packed_split(m, n, k, kwargs),
     }
     try:
         result = _gemm_a16w16_gfx950_param_for(tuple(sorted(kwargs.items())))
@@ -1799,6 +1921,28 @@ def gemm_a16w16(
 
     param = make_gemm_a16w16_param_and_validate(m, n, k, kwargs)
     assert param is not None, "unsupported gemm_a16w16_gfx950 shape/config"
+    if param.packed_split:
+        # Per-call storage, allocated on the launch stream. Graph capture owns
+        # its allocation; concurrent streams/graphs never share writable scratch.
+        # Every valid partial is overwritten, so no initialization launch is needed.
+        with torch.cuda.stream(stream):
+            partial = torch.empty((256, 3584), device=device, dtype=torch.float32)
+        args = (
+            _dynamic_tensor_arg(out, 1),
+            _dynamic_tensor_arg(a, 1),
+            _dynamic_tensor_arg(b, 0),
+            _dynamic_tensor_arg(partial, 1),
+            param,
+            stream,
+        )
+        run_cached(
+            _latent_packed_split,
+            *args,
+            constexpr_param=param,
+            compiler=flyc.compile,
+            dispatch_args=args,
+        )
+        return out
     semaphore, signal = get_split_k_buffers(stream, device, split_k)
     a_arg = _dynamic_tensor_arg(a, 0 if a_is_transposed else 1)
     b_arg = _dynamic_tensor_arg(b, 0 if b_is_transposed else 1)
