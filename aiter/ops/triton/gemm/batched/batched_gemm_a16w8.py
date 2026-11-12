@@ -61,6 +61,11 @@ def batched_gemm_a16w8(
         X (torch.Tensor): (B, M, K) bf16, K-contiguous (other dims any stride).
         WQ (torch.Tensor): (B, N, K) fp8, K-contiguous.
         w_scale (torch.Tensor): per-tensor fp32 scale for WQ (numel 1).
+        dtype (torch.dtype): output element type. BF16, FP16, or FP8
+            (float8_e4m3fn, float8_e4m3fnuz, float8_e5m2, float8_e5m2fnuz).
+            The fp32 accumulator times w_scale is cast straight to this dtype,
+            with no extra output scale. The caller keeps the product inside
+            the chosen FP8 finite range (448 for e4m3, 57344 for e5m2).
         YQ (Optional[torch.Tensor]): output, (B, M, N) or (M, B, N) if transpose_bm.
         transpose_bm (bool): write the output as (M, B, N).
 
@@ -77,7 +82,14 @@ def batched_gemm_a16w8(
     assert is_batched_gemm_a16w8_supported(
         X, WQ
     ), "X must be bf16/fp16 and WQ fp8, both K-contiguous"
-    assert dtype in (torch.bfloat16, torch.float16, torch.float8_e4m3fn, torch.float8_e4m3fnuz, torch.float8_e5m2, torch.float8_e5m2fnuz)
+    assert dtype in (
+        torch.bfloat16,
+        torch.float16,
+        torch.float8_e4m3fn,
+        torch.float8_e4m3fnuz,
+        torch.float8_e5m2,
+        torch.float8_e5m2fnuz,
+    )
 
     if YQ is None:
         if transpose_bm:

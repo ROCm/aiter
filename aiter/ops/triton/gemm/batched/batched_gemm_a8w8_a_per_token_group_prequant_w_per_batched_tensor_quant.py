@@ -54,7 +54,10 @@ def batched_gemm_a8w8_a_per_token_group_prequant_w_per_batched_tensor_quant(
         w_scale (torch.Tensor): Per-batch scale for WQ with shape (1,).
         group_size (int): Group size for per-token grouped quantization of X. Must be power of 2.
         bias (Optional[torch.Tensor]): Bias batch with shape (B, 1, N).
-        dtype (Optional[torch.dtype]): Output datatype (BF16 or FP16).
+        dtype (Optional[torch.dtype]): Output datatype (BF16, FP16, or FP8
+            float8_e4m3fn, float8_e4m3fnuz, float8_e5m2, float8_e5m2fnuz).
+            FP8 is a cast of the fp32 accumulator with no extra output scale;
+            the caller keeps values inside the chosen FP8 finite range.
         splitK (Optional[int]): Not supported. Must be None.
         YQ (Optional[torch.Tensor]): Pre-allocated output tensor with shape (B, M, N) or (M, B, N) if transpose_bm=True.
         transpose_bm (Optional[bool]): Transpose batch and M dimensions in output.
