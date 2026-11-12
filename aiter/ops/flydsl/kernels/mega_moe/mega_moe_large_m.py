@@ -1076,8 +1076,11 @@ def emit_presend(
             row_values = [load_at(source_rsrc, lane * fx.Int32(4) + fx.Int32(c * 256), fx.Int32, 4)
                 for c in range_constexpr(fz_n_i32 // 256)]
             if const_expr(fz_enable_scales):
-                row_values.append(load_at(AddrBuffer(addr_in_sc), token * fx.Int32(fz_scale_n_i32)
-                    + lane * fx.Int32(4), fx.Int32, 4, mask=lane * fx.Int32(4) < fx.Int32(fz_scale_n_i32)))
+                # Bounded: load_at moves a masked lane's access ~2 GiB past the base, which faults on an
+                # unbounded descriptor whenever that address is unmapped (the scales are cur_tok <= mtpr rows).
+                row_values.append(load_at(AddrBuffer(addr_in_sc, fz_mtpr * fz_scale_n_i32 * 4),
+                    token * fx.Int32(fz_scale_n_i32) + lane * fx.Int32(4), fx.Int32, 4,
+                    mask=lane * fx.Int32(4) < fx.Int32(fz_scale_n_i32)))
             token_row = fx.Int32(fz_rank * fz_mtpr) + token
             destination_rsrc = AddrBuffer(load_at(AddrBuffer(p_rx), destination, fx.Int64, 1)
                 + fx.Int64(token_row) * fx.Int64(fz_nbytes))
@@ -1319,8 +1322,11 @@ def emit_dispatch_payload(
                     row_values = [load_at(source_rsrc, lane * fx.Int32(4) + fx.Int32(c * 256), fx.Int32, 4)
                         for c in range_constexpr(fz_n_i32 // 256)]
                     if const_expr(fz_enable_scales):
-                        row_values.append(load_at(AddrBuffer(addr_in_sc), token * fx.Int32(fz_scale_n_i32)
-                            + lane * fx.Int32(4), fx.Int32, 4, mask=lane * fx.Int32(4) < fx.Int32(fz_scale_n_i32)))
+                        # Bounded: load_at moves a masked lane's access ~2 GiB past the base, which faults on an
+                        # unbounded descriptor whenever that address is unmapped (the scales are cur_tok <= mtpr rows).
+                        row_values.append(load_at(AddrBuffer(addr_in_sc, fz_mtpr * fz_scale_n_i32 * 4),
+                            token * fx.Int32(fz_scale_n_i32) + lane * fx.Int32(4), fx.Int32, 4,
+                            mask=lane * fx.Int32(4) < fx.Int32(fz_scale_n_i32)))
                     values.append(row_values)
 
                 def _store_row(token, row_values):
