@@ -100,6 +100,7 @@ FAMILIES = [
     ("AITER_CONFIG_GROUPED_FMOE", "tuned_grouped_fmoe"),
     ("AITER_CONFIG_GDN_K5_OPT", "chunk_gdn_h_opt_tuned"),
     ("AITER_CONFIG_PAGED_MQA_LOGITS", "paged_mqa_logits_tuned"),
+    ("AITER_CONFIG_MHA_FWD", "tuned_mha_fwd"),
 ]
 
 
@@ -154,7 +155,13 @@ class TestConfigShapeCollision(unittest.TestCase):
 
     @staticmethod
     def _build_synthetic_family(
-        root, dup, *, with_model_file=True, canonical_raw=None, model_raw=None
+        root,
+        dup,
+        *,
+        with_model_file=True,
+        canonical_raw=None,
+        model_raw=None,
+        gpu_models=None,
     ):
         """Write a minimal isolated config tree for one family and return
         (env_name, name). Uses the a8w8_blockscale family (untuned key = M,N,K).
@@ -166,7 +173,8 @@ class TestConfigShapeCollision(unittest.TestCase):
         and writes no sibling at all, so there is nothing to merge and the file
         is handed straight back. `canonical_raw` and `model_raw` override the
         canonical and model_configs file contents verbatim, for malformed input
-        or cells written a particular way."""
+        or cells written a particular way. `gpu_models` adds a gpu_model column
+        holding one model per row."""
         name = "a8w8_blockscale_tuned_gemm"
         env_name = "AITER_CONFIG_GEMM_A8W8_BLOCKSCALE"
         cfg = os.path.join(root, "aiter", "configs")
@@ -174,14 +182,19 @@ class TestConfigShapeCollision(unittest.TestCase):
         # untuned header drives the dedup key columns.
         with open(os.path.join(cfg, "a8w8_blockscale_untuned_gemm.csv"), "w") as f:
             f.write("M,N,K\n")
-        header = "gfx,cu_num,M,N,K,us\n"
-        second_row = f"gfx950,256,{'1,64,128' if dup else '2,64,128'},20.0\n"
+        first_model, second_model = (
+            (f"{model}," for model in gpu_models) if gpu_models else ("", "")
+        )
+        header = f"gfx,{'gpu_model,' if gpu_models else ''}cu_num,M,N,K,us\n"
+        second_row = (
+            f"gfx950,{second_model}256,{'1,64,128' if dup else '2,64,128'},20.0\n"
+        )
         with open(os.path.join(cfg, f"{name}.csv"), "w") as f:
             if canonical_raw is not None:
                 f.write(canonical_raw)
             else:
                 f.write(header)
-                f.write("gfx950,256,1,64,128,10.0\n")
+                f.write(f"gfx950,{first_model}256,1,64,128,10.0\n")
                 if not with_model_file:
                     f.write(second_row)
         if with_model_file:
@@ -295,6 +308,25 @@ class TestConfigShapeCollision(unittest.TestCase):
         must resolve normally."""
         err = self._run_synthetic(dup=False, with_model_file=False)
         self.assertIsNone(err, f"false-positived on a clean single file:\n{err}")
+
+    def test_rows_for_different_gpu_models_are_not_duplicates(self):
+        """gfx and cu_num cannot tell MI300X from MI325X, so a shape tuned on
+        each must survive; the same model twice is still a duplicate."""
+        for with_model_file in (True, False):
+            with self.subTest(with_model_file=with_model_file):
+                err = self._run_synthetic(
+                    dup=True,
+                    with_model_file=with_model_file,
+                    gpu_models=("mi300x", "mi325x"),
+                )
+                self.assertIsNone(err, f"rows for two GPU models collided:\n{err}")
+                err = self._run_synthetic(
+                    dup=True,
+                    with_model_file=with_model_file,
+                    gpu_models=("mi325x", "mi325x"),
+                )
+                self.assertIsNotNone(err)
+                self.assertIn("gpu_model", err)
 
     def test_selfcheck_tolerates_unparseable_single_file(self):
         """Checking a single file means reading it, which must not become a new
@@ -560,6 +592,39 @@ class TestConfigShapeCollision(unittest.TestCase):
 
     def test_paged_mqa_logits(self):
         self._check_family("AITER_CONFIG_PAGED_MQA_LOGITS", "paged_mqa_logits_tuned")
+
+    def test_mha_fwd(self):
+        self._check_family("AITER_CONFIG_MHA_FWD", "tuned_mha_fwd")
+
+
+@unittest.skipIf(core is None, f"aiter not importable: {_IMPORT_ERR}")
+class TestCompiledTablesRefuseModelRows(unittest.TestCase):
+    """Kernels compiled from a table are looked up by (gfx, cu_num, shape)
+    only, so rows tuned on MI300X and MI325X would collapse into one."""
+
+    def test_filter_tune_df_refuses_rows_that_name_a_gpu_model(self):
+        import pandas as pd
+
+        from aiter.jit.utils.build_targets import filter_tune_df
+
+        row = {"gfx": "gfx942", "cu_num": 304, "M": 128, "N": 4096, "K": 4096}
+        target = [("gfx942", 304)]
+        tagged = pd.DataFrame(
+            [
+                {**row, "gpu_model": "mi300x", "kernelId": 1},
+                {**row, "gpu_model": "mi325x", "kernelId": 2},
+            ]
+        )
+        with self.assertRaisesRegex(RuntimeError, "gpu_model"):
+            filter_tune_df(tagged, target)
+
+        blank = pd.DataFrame(
+            [
+                {**row, "gpu_model": float("nan"), "kernelId": 1},
+                {**row, "gpu_model": " ", "kernelId": 2},
+            ]
+        )
+        self.assertEqual(len(filter_tune_df(blank, target)), 2)
 
 
 def _fix_real_tree():

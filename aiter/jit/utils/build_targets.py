@@ -155,8 +155,25 @@ def filter_tune_df(tune_df, targets: list):
 
     Returns:
         Filtered DataFrame (original index preserved, no reset).
+
+    Raises RuntimeError if any row names a gpu_model: the generated lookup is
+    keyed on (gfx, cu_num, shape) only, so rows tuned on two products that share
+    them (MI300X and MI325X) would silently collapse into one kernel. Drop the
+    check once codegen and the C++ lookup key on the model as well.
     """
     import pandas as pd
+
+    if "gpu_model" in tune_df.columns:
+        models = tune_df["gpu_model"].fillna("").astype(str).str.strip()
+        tagged = tune_df[models != ""]
+        if len(tagged):
+            raise RuntimeError(
+                f"{len(tagged)} tuned row(s) name a gpu_model, e.g. "
+                f"{tagged.iloc[0].to_dict()}. Kernels compiled from this table "
+                "are looked up by (gfx, cu_num, shape) only; per-model rows are "
+                "supported only in tables dispatched at runtime, such as "
+                "tuned_mha_fwd.csv. Leave gpu_model blank here."
+            )
 
     mask = pd.Series([False] * len(tune_df), index=tune_df.index)
     for gfx, cu_num in targets:
