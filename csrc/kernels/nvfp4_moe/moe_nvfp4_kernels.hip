@@ -62,11 +62,13 @@ DEV void gemm_body(const Params& p, int mblk, int e, v4i* lds)
     }
 }
 
-// Grid: x = N group, y = sorted block (XCD remap: any WG order).
+// Grid: x = N group, y = sorted block (XCD remap: any WG order). Empty for other archs of a
+// multi-arch build (moe_nvfp4 rejects them before any launch).
 template <Cfg C>
 __global__ __launch_bounds__(64 * C.ksplit * C.waves)
     __attribute__((amdgpu_waves_per_eu(waves_hint(C)))) void nvfp4_moe_gemm(Params p)
 {
+#if defined(__gfx950__)
     constexpr int BM = 16 * C.m_tiles;
     const int nvalid = p.num_valid[0];
     int mblk         = blockIdx.y;
@@ -87,6 +89,7 @@ __global__ __launch_bounds__(64 * C.ksplit * C.waves)
     dispatch_active_tiles<C.m_tiles>(
         C.m_tiles > 1 ? active_tiles<C.m_tiles>(p, mblk) : C.m_tiles,
         [&](auto ma) { gemm_body<C, decltype(ma)::value>(p, mblk, e, lds); });
+#endif
 }
 
 // ---------------------------------------------------------------- host side
