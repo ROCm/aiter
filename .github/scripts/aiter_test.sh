@@ -42,13 +42,8 @@ fi
 skip_tests=(
     "op_tests/multigpu_tests/bench_mega_moe_v2.py"
     "op_tests/multigpu_tests/bench_attention_a2a.py"
-    "op_tests/multigpu_tests/test_mega_moe_tp.py"
-    "op_tests/multigpu_tests/test_mega_moe_v2.py"
-    "op_tests/multigpu_tests/test_mega_moe_small_m.py"
     "op_tests/multigpu_tests/test_wide_ep_moe.py"
-    "op_tests/multigpu_tests/test_dispatch_combine.py"
     "op_tests/multigpu_tests/test_communication.py"
-    "op_tests/multigpu_tests/test_mori_all2all.py"
     # runs as its own CI step before this suite ("Mori smoke test" in aiter-test.yaml)
     "op_tests/multigpu_tests/test_mori_smoke.py"
     "op_tests/multigpu_tests/test_fused_ar_rms.py"
@@ -155,6 +150,43 @@ for file in "${sharded_files[@]}"; do
                 --standalone
                 --nproc_per_node=8
                 "$file"
+            )
+            ;;
+        op_tests/multigpu_tests/test_mega_moe_v2.py)
+            {
+                echo "Running MegaMoEV2 v4_pro fixed-slot and compact coverage on 8 GPUs"
+            } | tee -a latest_test.log
+            test_cmd=(
+                env MORI_SHMEM_HEAP_SIZE=40G
+                timeout 60m
+                torchrun
+                --standalone
+                --nproc_per_node=8
+                "$file"
+                --network v4_pro
+                --bs-list 128,512
+                --iters 10
+                --accuracy-max-bs 512
+                --rtol 0.10
+            )
+            ;;
+        op_tests/multigpu_tests/test_mega_moe_small_m.py)
+            {
+                echo "Running MegaMoEV2 small-input CI coverage on 8 GPUs when supported"
+            } | tee -a latest_test.log
+            test_cmd=(
+                env AITER_MEGA_SMALL_M=1 MORI_SHMEM_HEAP_SIZE=40G
+                timeout 60m
+                torchrun
+                --standalone
+                --nproc_per_node=8
+                "$file"
+                --alt-steps 120
+                --graph-layers 4
+                --graph-reps 2
+                --time-bs 7,56,168,448
+                --time-calls 20
+                --time-trials 5
             )
             ;;
         op_tests/multigpu_tests/test_mega_moe_tp.py)
