@@ -140,7 +140,11 @@ def _gemm_a16_w16_kernel(
 
         split_k_end = tl.minimum(split_k_start + SPLITK_BLOCK_SIZE, K)
         k_span = split_k_end - split_k_start
-        if EVEN_K:
+        # Fused-activation epilogues keep the runtime trip count: with a
+        # compile-time count, gfx950 codegen for e.g. 256x256x64 tiles with
+        # GELU fails LLVM machine verification ("Virtual register defs don't
+        # dominate all uses").
+        if EVEN_K and not use_activation:
             num_k_iter = SPLITK_BLOCK_SIZE // BLOCK_SIZE_K
         else:
             num_k_iter = tl.cdiv(k_span, BLOCK_SIZE_K)
