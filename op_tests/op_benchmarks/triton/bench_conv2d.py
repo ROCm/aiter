@@ -14,7 +14,8 @@ Two modes:
     3. OVERALL PERFORMANCE        (mean/median/aggregate TFLOPS, layer wins)
 
 Each shape is timed with triton.testing.do_bench against
-torch.nn.functional.conv2d as the reference backend (MIOpen on AMD),
+torch.nn.functional.conv2d as the reference backend (MIOpen on AMD), using
+F.pad before the reference convolution for nonzero padding modes,
 and a correctness check compares the Triton output against F.conv2d
 within the same tolerance model the test suite uses.
 
@@ -23,11 +24,10 @@ solver name is captured only when --miopen-solvers is passed, because
 detection requires a separate subprocess with MIOPEN_LOG_LEVEL=6 (~60s
 fixed startup cost).
 
-For NCHW non-1x1 shapes, two Triton numbers are reported: kernel-only (the
-cblocked input pack is done once up front and handed to the kernel via
-x_blocked=) and kernel+repack (the public call, which packs the input on the
-host every time — the real inference cost when the input layout changes per
-call).
+Nonzero padding modes and --end-to-end time the public call, including padding,
+layout conversion, and activation packing. Weight packs remain cached across
+iterations. Without either option, zero-mode timings retain the legacy
+kernel-only primary metric and optional kernel+repack comparison for NCHW.
 
 No model loading at runtime — model shapes come from the pre-extracted
 conv_shapes.json: each conv layer's (N,C,H,W,K,R,S,stride,pad,dilation) was
@@ -55,6 +55,7 @@ from aiter.ops.triton.conv._utils import (
     _is_1x1_conv,
     _is_3x3_conv,
     _out_hw,
+    _validate_conv2d_padding_mode,
 )
 from aiter.ops.triton.conv.conv2d import (
     _resolve_route,
@@ -82,6 +83,7 @@ def which_kernel(
     dilation=(1, 1),
     layout="nchw",
     padding=(0, 0),
+    padding_mode="zeros",
 ):
     """Name of the Triton kernel ``conv2d`` would route to for these shapes,
     without launching anything. Delegates to the production ``_resolve_route``
@@ -89,6 +91,11 @@ def which_kernel(
     dispatch. Bench-only: used to label rows and pick correctness tolerances."""
     N, C, H, W_in = x.shape
     K_out, _, R, S = w_oihw.shape
+    _validate_conv2d_padding_mode(padding_mode, H, W_in, padding)
+    if padding_mode != "zeros":
+        H += 2 * padding[0]
+        W_in += 2 * padding[1]
+        padding = (0, 0)
     route = _resolve_route(
         R,
         S,
@@ -334,19 +341,25 @@ def bench_one_shape(
     layout: str,
     bias: bool = True,
     measure_repack: bool = True,
+    padding_mode: str = "zeros",
+    end_to_end: bool = False,
 ) -> dict:
     """Time + correctness-check one shape. Returns a dict with full metadata.
 
     Keys: ms_tri, ms_torch, ms_tri_e2e (or None), tflops_tri, tflops_torch,
-    tflops_tri_e2e (or None), correct, kernel_name, has_repack, flops.
+    tflops_tri_e2e (or None), correct, kernel_name, has_repack, flops,
+    padding_mode, timing_scope, torch_conv_layout.
 
-    measure_repack: if True (default), additionally times the kernel+input-repack
-    path for NCHW non-1x1 shapes by timing the public call (which packs the input
-    on the host each time).
+    Nonzero padding modes imply end_to_end: ms_tri times the public call,
+    including padding, layout conversion, and activation packing. Otherwise,
+    ms_tri retains legacy kernel-only timing; measure_repack additionally times
+    the public call for NCHW non-1x1 shapes. Weight packs remain warm in both modes.
     """
     if not torch.cuda.is_available():
         raise RuntimeError("CUDA not available; conv2d bench requires a GPU.")
 
+    _validate_conv2d_padding_mode(padding_mode, H, W, padding)
+    end_to_end = end_to_end or padding_mode != "zeros"
     P, Q = _out_hw(H, W, R, S, stride, padding, dilation)
     if P < 1 or Q < 1:
         raise ValueError(
@@ -378,10 +391,23 @@ def bench_one_shape(
             padding,
             dilation,
             activation="none",
+            padding_mode=padding_mode,
         )
 
-    def run_torch():
-        return F.conv2d(x_in, w, b, stride=stride, padding=padding, dilation=dilation)
+    def prepare_torch_input():
+        if padding_mode == "zeros":
+            return x_in
+        pad_height, pad_width = padding
+        return F.pad(
+            x_in, (pad_width, pad_width, pad_height, pad_height), mode=padding_mode
+        )
+
+    torch_padding = padding if padding_mode == "zeros" else (0, 0)
+
+    def run_torch(source=None):
+        if source is None:
+            source = prepare_torch_input()
+        return F.conv2d(source, w, b, stride, torch_padding, dilation)
 
     # One run for correctness. The routed-kernel name is queried separately via
     # which_kernel (no global side-channel); forced --methods name the kernel
@@ -389,30 +415,34 @@ def bench_one_shape(
     # substrings drive the checks below).
     y_tri = run_triton()
     torch.cuda.synchronize()
-    if method in ("auto", "default") or layout == "nhwc":
+    if method in ("auto", "default", "nhwc") or layout == "nhwc":
         kernel_name = which_kernel(
             x_in,
             w,
             stride=stride,
             padding=padding,
             dilation=dilation,
-            layout=layout,
+            layout="nhwc" if method == "nhwc" else layout,
+            padding_mode=padding_mode,
         )
     else:
         kernel_name = method
     is_winograd = "winograd" in kernel_name.lower() or "wino" in kernel_name.lower()
 
-    y_ref = run_torch()
+    torch_input = prepare_torch_input()
+    torch_conv_layout = (
+        "nhwc"
+        if torch_input.is_contiguous(memory_format=torch.channels_last)
+        else "nchw"
+    )
+    y_ref = run_torch(torch_input)
+    del torch_input
     correct = _check_close(
         y_tri, y_ref, dtype, K_red=C * R * S, is_winograd=is_winograd
     )
 
-    # Kernel-only timing: the cblocked routes pack the input on the host. To
-    # time just the kernel we pre-pack once outside the loop and hand the packed
-    # input back via x_blocked=. Non-cblocked routes do no host pack, so the
-    # plain call already is kernel-only.
     packs_input = "cblocked" in kernel_name.lower()
-    if packs_input:
+    if packs_input and not end_to_end:
         x_blocked_pre, _ = prepack_nchw_to_cblocked(x_in, BLOCK_K)
         cblk_fn = (
             conv2d_winograd_f4x3_cblocked
@@ -438,12 +468,11 @@ def bench_one_shape(
 
     ms_th = triton.testing.do_bench(run_torch, warmup=15, rep=50)
 
-    # Kernel+repack timing: the public call now always packs the input on the
-    # host, so timing it directly includes the repack. NCHW non-1x1 only (1x1
-    # takes raw weights; NHWC has no host-side input pack). For non-cblocked
-    # routes there's no host pack, so this matches the kernel-only number.
     has_repack = (
-        measure_repack and layout != "nhwc" and not _is_1x1_conv(R, S, dilation)
+        not end_to_end
+        and measure_repack
+        and layout != "nhwc"
+        and not _is_1x1_conv(R, S, dilation)
     )
     if has_repack:
         ms_tri_e2e = triton.testing.do_bench(run_triton, warmup=15, rep=50)
@@ -466,6 +495,9 @@ def bench_one_shape(
         "kernel_name": kernel_name,
         "has_repack": has_repack,
         "flops": flops,
+        "padding_mode": padding_mode,
+        "timing_scope": "end_to_end" if end_to_end else "kernel",
+        "torch_conv_layout": torch_conv_layout,
     }
 
 
@@ -490,6 +522,9 @@ def _format_single_shape_line(args, result: dict) -> str:
         f"S={args.S}",
         f"method={args.method}",
         f"layout={args.layout}",
+        f"padding_mode={result['padding_mode']}",
+        f"timing_scope={result['timing_scope']}",
+        f"torch_conv_layout={result['torch_conv_layout']}",
         f"ms_tri={result['ms_tri']:.4f}",
         f"ms_torch={result['ms_torch']:.4f}",
         f"tflops_tri={result['tflops_tri']:.4f}",
@@ -526,6 +561,8 @@ def run_single_shape(args) -> None:
             args.layout,
             bias=not args.no_bias,
             measure_repack=False,
+            padding_mode=args.padding_mode,
+            end_to_end=args.end_to_end,
         )
         print(_format_single_shape_line(args, result))
     finally:
@@ -586,10 +623,12 @@ def _print_layer_table(
     if miopen_enabled:
         headers.append("MIOpen Solver")
     headers.append("Triton Kernel")
-    headers.append("Tri Kernel TF/s")
+    end_to_end = layers[0]["timing_scope"] == "end_to_end"
+    headers.append("Tri End-to-End TF/s" if end_to_end else "Tri Kernel TF/s")
     if has_any_repack:
         headers.append("Tri Kernel+Repack TF/s")
-    headers.extend(["Torch TF/s", "Winner"])
+    headers.append("Torch End-to-End TF/s" if end_to_end else "Torch TF/s")
+    headers.extend(["Torch Input Layout", "Winner"])
 
     rows = []
     for i, lr in enumerate(layers):
@@ -605,7 +644,7 @@ def _print_layer_table(
                 else "—"
             )
         row.append(f"{lr['tflops_torch']:.2f}")
-        # Winner uses kernel TF/s (not kernel+repack) for consistency with old code.
+        row.append(lr["torch_conv_layout"])
         row.append("Triton" if lr["tflops_tri"] > lr["tflops_torch"] else "Torch")
         rows.append(row)
 
@@ -644,6 +683,7 @@ def _print_overall_perf_table(layers: list, has_any_repack: bool) -> None:
     print("OVERALL PERFORMANCE")
     print("=" * 80)
 
+    scope = "end-to-end" if layers[0]["timing_scope"] == "end_to_end" else "kernel"
     tri_tf = [lr["tflops_tri"] for lr in layers]
     th_tf = [lr["tflops_torch"] for lr in layers]
     tri_ms = [lr["ms_tri"] for lr in layers]
@@ -661,7 +701,7 @@ def _print_overall_perf_table(layers: list, has_any_repack: bool) -> None:
 
     rows = [
         [
-            "Mean TFLOPS (kernel)",
+            f"Mean TFLOPS ({scope})",
             f"{statistics.mean(tri_tf):.2f}",
             f"{statistics.mean(th_tf):.2f}",
         ],
@@ -691,7 +731,7 @@ def _print_overall_perf_table(layers: list, has_any_repack: bool) -> None:
         )
     rows.append(
         [
-            "Median TFLOPS (kernel)",
+            f"Median TFLOPS ({scope})",
             f"{statistics.median(tri_tf):.2f}",
             f"{statistics.median(th_tf):.2f}",
         ]
@@ -704,17 +744,17 @@ def _print_overall_perf_table(layers: list, has_any_repack: bool) -> None:
                 f"{statistics.median(th_tf):.2f}",
             ]
         )
-    rows.append(["Aggregate TFLOPS (kernel)", f"{agg_tri:.2f}", f"{agg_th:.2f}"])
+    rows.append([f"Aggregate TFLOPS ({scope})", f"{agg_tri:.2f}", f"{agg_th:.2f}"])
     if has_any_repack:
         rows.append(
             ["Aggregate TFLOPS (kernel+repack)", f"{agg_tri_e2e:.2f}", f"{agg_th:.2f}"]
         )
-    rows.append(["Total kernel time (ms)", f"{sum(tri_ms):.2f}", f"{sum(th_ms):.2f}"])
+    rows.append([f"Total {scope} time (ms)", f"{sum(tri_ms):.2f}", f"{sum(th_ms):.2f}"])
     if has_any_repack:
         rows.append(
             ["Total kernel+repack time (ms)", f"{sum(e2e_ms):.2f}", f"{sum(th_ms):.2f}"]
         )
-    rows.append(["Layer wins (kernel)", f"{tri_wins}/{n}", f"{n - tri_wins}/{n}"])
+    rows.append([f"Layer wins ({scope})", f"{tri_wins}/{n}", f"{n - tri_wins}/{n}"])
     if has_any_repack:
         rows.append(
             ["Layer wins (kernel+repack)", f"{e2e_wins}/{n}", f"{n - e2e_wins}/{n}"]
@@ -815,6 +855,8 @@ def run_sweep(args) -> None:
 
     print(
         f"# dtype={args.dtype} method={args.method} layout={args.layout} "
+        f"padding_mode={args.padding_mode} "
+        f"timing_scope={'end_to_end' if args.end_to_end or args.padding_mode != 'zeros' else 'kernel'} "
         f"miopen_solvers={'on' if args.miopen_solvers else 'off'}"
     )
 
@@ -845,6 +887,8 @@ def run_sweep(args) -> None:
                 args.layout,
                 bias=not args.no_bias,
                 measure_repack=True,
+                padding_mode=args.padding_mode,
+                end_to_end=args.end_to_end,
             )
         except Exception as e:  # noqa: BLE001
             print(f"  {name:<24} ERROR: {type(e).__name__}: {e}", file=sys.stderr)
@@ -873,6 +917,9 @@ def run_sweep(args) -> None:
                 "ms_torch": r["ms_torch"],
                 "correct": r["correct"],
                 "flops": r["flops"],
+                "padding_mode": r["padding_mode"],
+                "timing_scope": r["timing_scope"],
+                "torch_conv_layout": r["torch_conv_layout"],
             }
         )
 
@@ -928,6 +975,18 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         type=str.lower,
         choices=["time", "throughput"],
         default="throughput",
+    )
+    p.add_argument(
+        "--padding-mode",
+        choices=["zeros", "reflect", "replicate", "circular"],
+        default="zeros",
+        help="Conv2D padding mode; nonzero modes always use end-to-end timing",
+    )
+    p.add_argument(
+        "--end-to-end",
+        action="store_true",
+        help="include padding, layout conversion, and activation packing in the "
+        "primary timing; enabled automatically for nonzero padding modes",
     )
     p.add_argument(
         "--no-bias",
@@ -988,6 +1047,9 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p.add_argument("--dilation-w", "--dilation_w", type=int, default=1)
 
     args = p.parse_args(argv)
+
+    if args.miopen_solvers and args.padding_mode != "zeros":
+        p.error("--miopen-solvers currently supports --padding-mode zeros only")
 
     single = [args.N, args.C, args.H, args.W, args.K, args.R, args.S]
     if any(v is not None for v in single):

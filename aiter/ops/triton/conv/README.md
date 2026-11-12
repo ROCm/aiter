@@ -84,7 +84,8 @@ Invalid modes are rejected even when padding is zero.
 `zeros` uses implicit padding. For other modes with nonzero padding, the input
 is padded with `torch.nn.functional.pad` before routing and activation packing;
 convolution then uses padding `(0, 0)`. Zero padding amounts skip materialization.
-Layout conversion may require an extra copy.
+Materialized padding allocates a temporary input; layout conversion may require
+an extra copy.
 
 Input, weight, and bias must share a CUDA/ROCm device. Routed calls use that
 device and restore the caller's current device afterward. Mixed-architecture
@@ -169,10 +170,9 @@ and seed under both backends, only VAE convs swapped to Triton): max diff
 
 - Only `groups=1` is implemented; callers must send depthwise or grouped
   convolutions to another backend.
-- Routed Conv2D supports `zeros`, `reflect`, `replicate`, and `circular`
-  padding as described above. Direct specialized Conv2D APIs and Conv3D
-  still support only zero padding. Per-axis pad amounts may differ, for
-  example `(0, 2)` for Conv2D or `(0, 1, 2)` for Conv3D.
+- All Conv2D APIs support `zeros`, `reflect`, `replicate`, and `circular`
+  padding as described above. Conv3D supports only zero padding. Per-axis pad
+  amounts may differ, for example `(0, 2)` for Conv2D or `(0, 1, 2)` for Conv3D.
 - Inputs must be `fp16` or `bf16`.
 - Forward only (no backward / training).
 
@@ -238,6 +238,14 @@ NOT representative of production):
 python -m op_tests.op_benchmarks.triton.bench_conv2d --dtype fp16 --smoke
 ```
 
+Use `--padding-mode reflect` (or `replicate` / `circular`) to include padding,
+layout conversion, and activation packing in the primary timing. Use
+`--end-to-end` for the same timing scope with `zeros`; otherwise its legacy
+kernel-only metric is retained. Results report the mode and timing scope.
+The reference runs `F.pad + F.conv2d` without forcing a post-pad layout;
+`torch_conv_layout` / `Torch Input Layout` reports that actual layout.
+Weight packs stay cached. `--miopen-solvers` currently supports `zeros` only.
+
 The Conv3D benchmark uses the same frozen-shape-database approach as Conv2D.
 It defaults to the Wan2.2 A14B-style VAE workload and accepts a
 case-insensitive model-name substring with `--model`:
@@ -287,6 +295,8 @@ Conv2D cross-axis flags:
 --layout {nchw,nhwc}                          # default nchw
 --method {auto,default,cblocked,nhwc,winograd_f4x3,winograd_f4x3_cblocked}
 --metric {time,throughput}                    # default throughput
+--padding-mode {zeros,reflect,replicate,circular}
+--end-to-end                                # also include preparation for zeros
 --no-bias                                     # bench the bias=None code path
 --miopen-solvers                              # detect MIOpen solver names (sweep mode; ~60-120s subprocess)
 --show-kernel-name                            # include routed kernel name in single-shape output
