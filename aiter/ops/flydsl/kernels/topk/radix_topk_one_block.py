@@ -58,8 +58,9 @@ _ONE_BLOCK_LDS_BUDGET_BYTES = {
     "gfx950": 78 * 1024,
     "gfx1250": 158 * 1024,
 }
-# A 512-thread block on these arches: two of them resident per CU, each with
-# half the budget above.
+# A 512-thread block without the row cache on these arches: two of them
+# resident per CU, each with half the budget above. With the cache, a
+# 512-thread block takes the budget above minus the cache instead.
 _HALF_BLOCK_LDS_BUDGET_BYTES = {
     "gfx1250": 78 * 1024,
 }
