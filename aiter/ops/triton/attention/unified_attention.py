@@ -699,7 +699,7 @@ def unified_attention(
                     if fill < max_fill:
                         NUM_SEGMENTS = max(NUM_SEGMENTS, min(min_segments, limit))
         segm_tiles = None
-        if use_gluon_3d and DEVICE_ARCH == "gfx1250":
+        if use_gluon_3d and IS_DEVICE_ARCH_GFX12:
             NUM_SEGMENTS, segm_tiles = _gfx12_split_rebalance(params, CONFIG_TILE_SIZE)
         # The triton kernels read a shuffled tile as one contiguous page, so
         # there the tile is the page. The gfx950 gluon loader gathers per token

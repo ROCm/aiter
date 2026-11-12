@@ -107,9 +107,12 @@ AITER_FDA_SCAN_PREFETCH: bool = os.getenv("AITER_FDA_SCAN_PREFETCH", "1").lower(
 )
 
 DEVICE_ARCH = arch_info.get_arch()
-_GLUON_ARCH_OK: bool = DEVICE_ARCH in ("gfx950", "gfx1250")
-_GLUON_K2C_ARCH_OK: bool = DEVICE_ARCH in ("gfx950", "gfx1250")
-_SCAN_PREFETCH: bool = AITER_FDA_SCAN_PREFETCH and DEVICE_ARCH == "gfx1250"
+# gfx1250 and its A0 variant gfx1250-strict share the TDM / scan-prefetch path
+# (arch_info.is_tdm_avail() already includes both).
+_IS_GFX1250_FAMILY = DEVICE_ARCH in ("gfx1250", "gfx1250-strict")
+_GLUON_ARCH_OK: bool = DEVICE_ARCH in ("gfx950", "gfx1250", "gfx1250-strict")
+_GLUON_K2C_ARCH_OK: bool = DEVICE_ARCH in ("gfx950", "gfx1250", "gfx1250-strict")
+_SCAN_PREFETCH: bool = AITER_FDA_SCAN_PREFETCH and _IS_GFX1250_FAMILY
 
 _LOGGED_ROUTES: set = set()
 
@@ -1281,7 +1284,7 @@ def flash_kda_fwd(
         and g.is_contiguous()
         and v.is_contiguous()
     ):
-        tdm = DEVICE_ARCH == "gfx1250"
+        tdm = _IS_GFX1250_FAMILY
         q, stride_q = _tdm_operand(q, tdm and use_gluon_k1)
         k, stride_k = _tdm_operand(k, tdm and use_gluon_k1)
         g, stride_g = _tdm_operand(g, tdm and use_gluon_k1)
@@ -1354,7 +1357,7 @@ def flash_kda_fwd(
     use_gluon_k2c = (
         use_gluon_k2
         and _GLUON_K2C_ARCH_OK
-        and (DEVICE_ARCH == "gfx1250" or segmented or _k2c_gluon_usable(False, V, N, H))
+        and (_IS_GFX1250_FAMILY or segmented or _k2c_gluon_usable(False, V, N, H))
     )
     # sigmoid(beta) per tile, read only by the gfx950 Gluon K2.
     ws_beta = (
@@ -1364,7 +1367,7 @@ def flash_kda_fwd(
     )
 
     if use_gluon_k1:
-        if DEVICE_ARCH == "gfx1250":
+        if _IS_GFX1250_FAMILY:
             from aiter.ops.triton._gluon_kernels.gfx1250.kimi_delta_attn.flash_kda_k1 import (
                 gluon_k1_prepare,
             )
@@ -1512,7 +1515,7 @@ def flash_kda_fwd(
     }
 
     if use_gluon_k2a or use_gluon_k2c:
-        if DEVICE_ARCH == "gfx1250":
+        if _IS_GFX1250_FAMILY:
             from aiter.ops.triton._gluon_kernels.gfx1250.kimi_delta_attn import (
                 flash_kda_k2 as _g2,
             )
@@ -1532,7 +1535,7 @@ def flash_kda_fwd(
         # parallel across segments. Neither writes outputs.
         b_seg = torch.empty(num_segs, H, K, V, dtype=torch.float32, device=dev)
         A_seg = torch.empty(num_segs, H, K, K, dtype=torch.bfloat16, device=dev)
-        if use_gluon_k2a and DEVICE_ARCH == "gfx1250":
+        if use_gluon_k2a and _IS_GFX1250_FAMILY:
             sched = _k2_gluon_schedule(V, num_segs, H)
             _g2.gluon_k2_ab_fused(
                 ws_kd=ws_kd,
@@ -1630,7 +1633,7 @@ def flash_kda_fwd(
         use_gluon_k1, use_gluon_k2a if segmented else None, use_gluon_k2c, C, K, V
     )
     if use_gluon_k2c:
-        if DEVICE_ARCH == "gfx1250":
+        if _IS_GFX1250_FAMILY:
             sched = _k2_gluon_schedule(V, num_segs, H, "k2_c_gluon")
             arch_args = {
                 "beta_raw": beta,

@@ -1436,7 +1436,7 @@ def test_compress_norm_rope_store_matches_reference(
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
 def test_dynamic_mxfp8_quant_gluon_matches_triton(M: int, K: int, dtype):
     arch = arch_info.get_arch()
-    if arch not in ("gfx950", "gfx1250"):
+    if arch not in ("gfx950", "gfx1250", "gfx1250-strict"):
         pytest.skip("The Gluon backend requires gfx950 or gfx1250")
     if arch == "gfx950" and dtype != torch.bfloat16:
         pytest.skip("The gfx950 Gluon kernel requires bf16 input")

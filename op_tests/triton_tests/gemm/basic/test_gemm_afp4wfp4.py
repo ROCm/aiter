@@ -346,7 +346,7 @@ def test_gemm_mxfp4_preshuffled_gfx1250(
     layout,
     output,
 ):
-    if DEVICE_ARCH != "gfx1250":
+    if DEVICE_ARCH not in ("gfx1250", "gfx1250-strict"):
         pytest.skip("Preshuffled gfx1250 kernel only supported on gfx1250")
 
     if N % 32 > 0:

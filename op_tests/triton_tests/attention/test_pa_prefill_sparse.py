@@ -225,7 +225,7 @@ def test_pa_prefill_sparse_vs_reference(T, H, D, prefix_len, extend_len, sentine
     if not torch.cuda.is_available():
         pytest.skip("CUDA required")
 
-    if DEVICE_ARCH not in ("gfx1250",):
+    if DEVICE_ARCH not in ("gfx1250", "gfx1250-strict"):
         pytest.skip("pa_prefill_sparse requires gfx1250")
 
     total_pages = max(T * prefix_len, 1)
@@ -289,7 +289,7 @@ def test_pa_prefill_sparse_prefix_only(T, H, D, prefix_len, extend_len):
     if not torch.cuda.is_available():
         pytest.skip("CUDA required")
 
-    if DEVICE_ARCH not in ("gfx1250",):
+    if DEVICE_ARCH not in ("gfx1250", "gfx1250-strict"):
         pytest.skip("pa_prefill_sparse requires gfx1250")
 
     total_pages = max(T * prefix_len, 1)
@@ -355,7 +355,7 @@ def test_pa_prefill_sparse_extend_only(T, H, D, prefix_len, extend_len):
     if not torch.cuda.is_available():
         pytest.skip("CUDA required")
 
-    if DEVICE_ARCH not in ("gfx1250",):
+    if DEVICE_ARCH not in ("gfx1250", "gfx1250-strict"):
         pytest.skip("pa_prefill_sparse requires gfx1250")
 
     total_ext = max(T * extend_len, 1)
@@ -473,7 +473,7 @@ def test_pa_prefill_sparse_gfx950(T, H, D, prefix_len):
 def _triton_branch_only():
     if not torch.cuda.is_available():
         pytest.skip("CUDA required")
-    if DEVICE_ARCH in ("gfx950", "gfx1250"):
+    if DEVICE_ARCH in ("gfx950", "gfx1250", "gfx1250-strict"):
         pytest.skip("covers the Triton single-source branch")
 
 
@@ -638,7 +638,7 @@ def test_pa_prefill_sparse_out_buffer_every_branch():
     if not torch.cuda.is_available():
         pytest.skip("CUDA required")
     T, H, D = 512, 64, 512
-    two_sources = DEVICE_ARCH == "gfx1250"
+    two_sources = DEVICE_ARCH in ("gfx1250", "gfx1250-strict")
     q, ukv, p_idx, p_indptr, kv, e_idx, e_indptr, sink, scale = _make_inputs(
         T, H, D, 128, 128 if two_sources else 1, T * 128, T * 128 if two_sources else 1
     )

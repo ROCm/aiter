@@ -159,6 +159,7 @@ SUPPORTED_ARCHS = {
         "gfx1200",
         "gfx1201",
         "gfx1250",
+        "gfx1250-strict",
     },
     "CDNA": {"gfx942", "gfx950"},
 }

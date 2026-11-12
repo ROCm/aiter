@@ -223,6 +223,34 @@ def mha_set_swizzle(value: Literal["default", "spatial"]):
     _MHA_SWIZZLE = value
 
 
+def _effective_swizzle(
+    num_q_heads: int, num_k_heads: int, num_xcds: int, num_blocks: int, batch: int
+) -> str:
+    """The swizzle to launch with: "spatial" only where remap_workgroup_spatial
+    maps every (head, block) exactly once.
+
+    The spatial remap assumes the work splits evenly across XCDs: MHA needs
+    num_q_heads % num_xcds == 0; GQA needs num_k_heads % num_xcds == 0, or
+    num_xcds % num_k_heads == 0 with the per-KV-head work (queries per KV head
+    x blocks x batch) divisible by the XCDs sharing that head. Other shapes
+    (e.g. 8 KV heads on a 6-XCD part) would compute some tiles twice and skip
+    others, so they use the default mapping.
+    """
+    if _MHA_SWIZZLE != "spatial":
+        return _MHA_SWIZZLE
+    if num_q_heads == num_k_heads:
+        ok = num_q_heads % num_xcds == 0
+    elif num_k_heads >= num_xcds:
+        ok = num_k_heads % num_xcds == 0
+    else:
+        q_per_kv = num_q_heads // num_k_heads
+        ok = (
+            num_xcds % num_k_heads == 0
+            and (q_per_kv * num_blocks * batch) % (num_xcds // num_k_heads) == 0
+        )
+    return "spatial" if ok else "default"
+
+
 def _get_sliding_window_size(window_size: tuple[int, int]) -> int:
     return max(int(window_size[0]), 0)
 
@@ -894,7 +922,13 @@ def _flash_attn_forward(
             VARLEN=is_varlen,
             BATCH=batch,
             NUM_XCD=get_num_xcds(),
-            SWIZZLE=_MHA_SWIZZLE,
+            SWIZZLE=_effective_swizzle(
+                num_q_heads,
+                num_k_heads,
+                get_num_xcds(),
+                triton.cdiv(seqlen_q, config["BLOCK_M"]),
+                batch,
+            ),
             USE_INT64_STRIDES=use_int64_strides,
             ENABLE_SINK=sink is not None,
             SLIDING_WINDOW=sliding_window,

@@ -29,7 +29,10 @@ NUMELS = [t * HIDDEN for t in (1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048
 NUMELS += [3 * HIDDEN + 8, 600 * HIDDEN + 8]
 MIXED = [8, 1, 2048, 2, 64, 4, 512, 8, 16, 1024, 32, 128, 256, 1, 8]
 
-SKIP = torch.cuda.device_count() < WORLD_SIZE or arch_info.get_arch() != "gfx1250"
+SKIP = torch.cuda.device_count() < WORLD_SIZE or arch_info.get_arch() not in (
+    "gfx1250",
+    "gfx1250-strict",
+)
 pytestmark = pytest.mark.skipif(SKIP, reason="needs 4 gfx1250 GPUs")
 
 

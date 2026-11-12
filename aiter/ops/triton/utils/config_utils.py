@@ -119,7 +119,7 @@ _VALID_BACKENDS = ("triton", "gluon")
 # targets) while still rejecting anything path-unsafe.
 _OP_RE = re.compile(r"[a-z][a-z0-9_]*")
 _CONFIG_NAME_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]*")
-_ARCH_OVERRIDE_RE = re.compile(r"[a-z][a-z0-9_]*")
+_ARCH_OVERRIDE_RE = re.compile(r"[a-z][a-z0-9_]*(?:-[a-z0-9_]+)*")
 _ARCH_SAFE_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.+:-]*")
 
 _CU_NUM = None  # the device's CU count, read once per process
@@ -151,6 +151,34 @@ def get_config_cu_num() -> int | None:
         if type(cu_num) is int and cu_num > 0:
             _CU_NUM = cu_num
     return _CU_NUM
+
+
+@functools.cache
+def _tuned_tree_arch(dev: str, family: str) -> str:
+    """The arch whose config tree a kernel running on ``dev`` reads for ``family``.
+
+    Tuned configs stay keyed by the exact arch: ``dev`` is returned whenever
+    ``configs/<dev>/<family>`` exists. configs/gfx1250-strict (MI450 A0) ships
+    untuned any-only tables for M-bucketed families; families it lacks (keyed
+    by kernel variant or shape, with no generic entry) read the base family
+    tree, with a one-time warning that the values are not tuned for ``dev``.
+    Explicit tuning scopes (a ``cu_num`` argument) never take this path, so a
+    tuner creating the variant tree is not redirected onto the base one.
+    """
+    if os.path.isdir(f"{AITER_TRITON_CONFIGS_PATH}/{dev}/{family}"):
+        return dev
+    try:
+        from aiter.jit.utils.build_targets import base_gfx_arch
+    except ImportError:  # standalone use without the aiter package
+        return dev
+    base = base_gfx_arch(dev)
+    if base != dev and os.path.isdir(f"{AITER_TRITON_CONFIGS_PATH}/{base}/{family}"):
+        logger.warning(
+            f"no {dev} configs for {family}; using the {base} table, "
+            f"which is NOT tuned for {dev}"
+        )
+        return base
+    return dev
 
 
 def resolve_config_dir(
@@ -234,7 +262,7 @@ def resolve_config_dir(
     ), f"unknown backend {backend!r}; expected one of {_VALID_BACKENDS}"
     assert arch is None or (
         isinstance(arch, str) and _ARCH_OVERRIDE_RE.fullmatch(arch)
-    ), f"arch override must match [a-z][a-z0-9_]* (e.g. 'gfx942'), got {arch!r}"
+    ), f"arch override must match [a-z][a-z0-9_]*(-[a-z0-9_]+)* (e.g. 'gfx942', 'gfx1250-strict'), got {arch!r}"
     assert (
         cu_num is DEVICE_CU_NUM
         or cu_num is None
@@ -245,6 +273,8 @@ def resolve_config_dir(
         dev
     ), f"arch_info.get_arch() returned a path-unsafe architecture: {dev!r}"
     family = f"{backend}/{op}/{_dtype_dir(config_name)}"
+    if cu_num is DEVICE_CU_NUM:
+        dev = _tuned_tree_arch(dev, family)
     plain = f"{AITER_TRITON_CONFIGS_PATH}/{dev}/{family}"
     if cu_num is DEVICE_CU_NUM:
         cu_num = get_config_cu_num()

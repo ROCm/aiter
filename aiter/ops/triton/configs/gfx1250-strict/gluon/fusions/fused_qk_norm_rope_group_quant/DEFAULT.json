@@ -1,0 +1,9 @@
+{
+    "any": {
+        "HEADS_PER_PROGRAM": 8,
+        "ROWS_PER_STEP": 4,
+        "waves_per_eu": 6,
+        "cache_modifier": null,
+        "num_warps": 1
+    }
+}
