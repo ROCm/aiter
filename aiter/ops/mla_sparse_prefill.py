@@ -262,9 +262,11 @@ _MAX_KV_SPLITS = 32
 _ANY_COUNT = tuple(range(2, _MAX_KV_SPLITS + 1))
 # Split counts a gfx1250 v4.1 cluster folds in-kernel.
 _CLUSTER_COUNT = (2, 4, 8, 16)
+# Split counts the gfx1250 v4 16mx1 and fp8 32mx1 fits were measured on.
+_FIT_COUNT = (2, 3, 4, 6, 8, 12, 16)
 
 # (arch, kernel) -> fit over H 16-128, topk 384-4096 and N 8-768 on gfx950, topk 512-4096 and
-# N 8-256 on gfx1250. v41_a8w4_16mx1_16nx4 reuses the v41_a8w8 fit.
+# N 8-512 on gfx1250. v41_a8w4_16mx1_16nx4 reuses the v41_a8w8 fit.
 _KV_SPLIT_FIT = {
     ("gfx950", "v4_a16w16_16mx1_16nx4"): _SplitFit(16, 64, 2, _ANY_COUNT, 90, 0.043),
     ("gfx950", "v4_a16w16_32mx4_32nx1"): _SplitFit(128, 32, 1, _ANY_COUNT, 150, 0.014),
@@ -274,11 +276,15 @@ _KV_SPLIT_FIT = {
     ("gfx950", "v41_a8w8_16mx4_64nx1"): _SplitFit(64, 64, 1, _ANY_COUNT, 90, 0.025),
     ("gfx950", "v41_a8w4_16mx1_16nx4"): _SplitFit(16, 64, 2, _ANY_COUNT, 80, 0.046),
     ("gfx950", "v41_a8w4_16mx4_64nx1"): _SplitFit(64, 64, 1, _ANY_COUNT, 250, 0.012),
-    ("gfx1250", "v4_a16w16_16mx1_16nx4"): _SplitFit(16, 64, 1, _ANY_COUNT, 0, 0.10),
+    ("gfx1250", "v4_a16w16_16mx1_16nx4"): _SplitFit(16, 64, 1, _FIT_COUNT, 250, 0.08),
     ("gfx1250", "v4_a16w16_32mx1_16nx4"): _SplitFit(32, 64, 1, _ANY_COUNT, 200, 0.06),
     ("gfx1250", "v4_a16w16_16mx4_64nx1"): _SplitFit(64, 64, 1, _ANY_COUNT, 150, 0.06),
-    ("gfx1250", "v4_a8w8_16mx1_16nx4"): _SplitFit(16, 64, 1, _ANY_COUNT, 200, 0.12),
-    ("gfx1250", "v4_a8w8_32mx1_16nx4"): _SplitFit(32, 64, 1, _ANY_COUNT, 200, 0.06),
+    ("gfx1250", "v4_a8w8_16mx1_16nx4"): _SplitFit(
+        16, 64, 2, _FIT_COUNT, 350, 0.06, 1.25
+    ),
+    ("gfx1250", "v4_a8w8_32mx1_16nx4"): _SplitFit(
+        32, 64, 2, _FIT_COUNT, 200, 0.04, 1.25
+    ),
     ("gfx1250", "v4_a8w8_16mx4_64nx1"): _SplitFit(64, 64, 1, _ANY_COUNT, 200, 0.06),
     ("gfx1250", "v41_a8w8_16mx1_16nx4"): _SplitFit(
         16, 64, 2, _CLUSTER_COUNT, 275, 0.03, 1.75
