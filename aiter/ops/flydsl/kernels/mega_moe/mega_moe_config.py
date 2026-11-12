@@ -283,6 +283,9 @@ class FusedStage1Knobs:
     # GEMM1 A scales staged to LDS in K-loop order: lane l's packed scale word of row group g at K-step s is one
     # dword, so a K-step reads one ds_read_b32 per group (False: four ds_read_u8 per group, packed in VALU).
     ascale_packed: bool = False
+    # GEMM1 width for ranks whose plan selects cached weights (0: keep stage1.tile_n).
+    # The plan uses received rows, so this changes only local work partitioning.
+    g1_cached_tile_n: int = 0
     # GEMM1 epilogue (epi_evec 8): the quantize/store pass without serial waits. Its lane offsets come from
     # the tile, so they are not hoisted out of the persistent loop and reloaded from scratch between the output stores
     # (each reload's vmcnt(0) waits for the stores before it); all rows' LDS reads go first; the 4-lane max uses DPP.
@@ -1591,6 +1594,7 @@ def _tune_v41_flash_ep4_small(config: MegaMoEConfig, bucket: int) -> MegaMoEConf
             config,
             stage1=replace(config.stage1, sort_block_m=32, tile_n=256),
             stage2=replace(config.stage2, block_m=32),
+            fused_stage1=replace(stage1, g1_cached_tile_n=384),
         )
     if bucket == 512:
         # Half the CTAs leave GEMM1 for GEMM2 after a claim past half their XCD's GEMM1 slice: the XGMI-bound

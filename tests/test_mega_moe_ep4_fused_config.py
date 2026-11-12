@@ -72,3 +72,19 @@ def test_large_prefill_local_tune_leaves_other_layouts_unchanged():
     layout = dict(FLASH_EP4, world_size=8, experts_per_rank=48)
     base = select_fused_config(16384, 16384, **layout)
     assert tune_large_m_launch_config(base, 16384, **layout) is base
+
+
+@pytest.mark.parametrize("capacity,tokens", [(256, 192), (256, 256), (512, 320), (512, 383)])
+def test_cached_gemm1_width_is_local_to_ep4_small_256_bucket(capacity, tokens):
+    config = select_fused_config(tokens, capacity, **FLASH_EP4)
+    assert config.stage1.tile_n == 256
+    assert config.fused_stage1.g1_cached_tile_n == 384
+    assert config.fused_stage1.plan_local
+
+
+def test_other_fused_profiles_keep_one_gemm1_width():
+    for tokens in (1, 2, 4, 16, 64, 128, 191, 384, 512):
+        assert select_fused_config(tokens, 512, **FLASH_EP4).fused_stage1.g1_cached_tile_n == 0
+    assert select_fused_config(256, 512).fused_stage1.g1_cached_tile_n == 0
+    for capacity in (8192, 16384):
+        assert select_fused_config(256, capacity, **FLASH_EP4).fused_stage1.g1_cached_tile_n == 0
