@@ -435,7 +435,6 @@ class FmoeTuner(TunerCommon):
             return 0, 0
         flop = 0
         data_bytes = 0
-        stage = ""
         if stage == "stage1":
             ## gemm1
             # input [token, topk, inter_dim]

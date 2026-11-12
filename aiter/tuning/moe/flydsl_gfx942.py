@@ -161,7 +161,7 @@ def tune_flydsl_gfx942(self, args):
                 try:
                     key = tuple(row[self.keys].values)
                     tflops, bw = self.calculate(
-                        (key, "stage1", kernelName1, block_m, e2e_us, err1)
+                        (key, "", kernelName1, block_m, e2e_us, err1)
                     )
                 except Exception:  # noqa: BLE001
                     tflops, bw = 0, 0

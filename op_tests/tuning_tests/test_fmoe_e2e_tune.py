@@ -160,6 +160,15 @@ class TestFmoeE2eTune(unittest.TestCase):
         self.assertEqual(row["run_1stage"], 0)
         self.assertEqual(row["nt"], 0)
 
+    def test_metrics_are_for_the_whole_moe(self):
+        with mock.patch.object(
+            self.tuner, "calculate", wraps=self.tuner.calculate
+        ) as calculate:
+            self.e2e_tune([])
+        # token 4 improves twice: ANY beats the baseline, then DIRECT beats ANY.
+        stages = [call.args[0][1] for call in calculate.call_args_list]
+        self.assertEqual(stages, ["", ""])
+
     def test_existing_rows_are_kept_unless_replaced(self):
         old = {**shape(4), **{c: 0 for c in RESULT_LIST}, "kernelName1": "old"}
         other = {**shape(64), **{c: 0 for c in RESULT_LIST}, "kernelName1": "other"}

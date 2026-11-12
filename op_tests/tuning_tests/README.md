@@ -16,7 +16,8 @@ Minimal test suite for validating the aiter tuning infrastructure.
 | `test_online_tune.py` | 1 | No | `AITER_ONLINE_TUNE` decision logic, `mp_lock` synchronization, MainFunc CSV write, cfg_2stages reload |
 | `test_fmoe_winner_replay.py` | 1 | No | `FmoeTuner.post_process` winner on hand-made results: filters, stage pairing, ties, power ranking, fairness costs, FLAT head-to-head (timing replaced) |
 | `test_fmoe_tune_dispatch.py` | 1 | No | `FmoeTuner.tune()` generator dispatch, opus/FlyDSL shape filters, grouped and MXFP4 candidate selection, `result_to_csv` |
-| `test_fmoe_e2e_tune.py` | 1 | No | FlyDSL gfx942 `--e2e_tune` on stubbed timings: configs tried per shape, a failed config never wins, the winner must beat the baseline, existing rows kept unless replaced |
+| `test_fmoe_e2e_tune.py` | 1 | No | FlyDSL gfx942 `--e2e_tune` on stubbed timings: configs tried per shape, a failed config never wins, the winner must beat the baseline, whole-MoE TFLOPS and bandwidth, existing rows kept unless replaced |
+| `test_fmoe_calculate.py` | 1 | No | `FmoeTuner.calculate` TFLOPS and bandwidth: first GEMM for stage1, second GEMM for stage2, whole MoE for any other stage, `(0, 0)` for an invalid time |
 | `test_fmoe_candidate_snapshot.py` | 1 | No | Candidates `FmoeTuner.tune()` submits against a snapshot taken on the base commit (`AITER_FMOE_CANDIDATE_SNAPSHOT`); skipped without it |
 | `test_tune_pipeline.py` | 2 | Yes | End-to-end: run each tuner on small shapes (mp=1 + mp=default), verify output CSV; `--compare --update_improved`; `AITER_ONLINE_TUNE` e2e |
 | `test_asm_splitk_guard.py` | 1 | No | `GemmTuner.asm_gemm_all_solutions` SplitK semaphore grid guard |
@@ -29,7 +30,8 @@ sharding through `.github/scripts/split_tests.sh`. That gate includes CSV
 validation, shape-collision checks, the mixed-MXFP tuner unit tests, the
 compare logic, the dispatch verification, the one-GPU `mp_tuner` fault and
 worker-death tests, the fused-MoE winner replay, the fused-MoE tune-dispatch
-locks, and the FlyDSL gfx942 e2e tune selection.
+locks, the FlyDSL gfx942 e2e tune selection, and the fused-MoE TFLOPS and
+bandwidth estimate.
 
 The full Level 0+1 workflow repeats the broader CPU suite on its daily/manual
 schedule. GPU tuner-pipeline and all-shape `--run_config` validation remain
@@ -79,6 +81,7 @@ python3 -m unittest op_tests.tuning_tests.test_csv_validation \
   op_tests.tuning_tests.test_fmoe_winner_replay \
   op_tests.tuning_tests.test_fmoe_tune_dispatch \
   op_tests.tuning_tests.test_fmoe_e2e_tune \
+  op_tests.tuning_tests.test_fmoe_calculate \
   op_tests.tuning_tests.test_online_tune -v
 python3 -m pytest op_tests/tuning_tests/test_fhmoe_tuner.py -v
 
