@@ -60,6 +60,7 @@ class GemmA16W16Gfx950Param:
     mma_m: fx.Constexpr[int]
     mma_n: fx.Constexpr[int]
     mma_k: fx.Constexpr[int]
+    unroll_hti: fx.Constexpr[bool]
     n_grouped_loads: fx.Constexpr[bool]
     unroll_lds_ring: fx.Constexpr[bool]
     # derived params
@@ -122,6 +123,7 @@ def make_gemm_a16w16_gfx950_param(
     b_non_temporal: bool = False,
     unroll_lds_ring: bool = False,
     n_grouped_loads: bool = False,
+    unroll_hti: bool = False,
 ) -> GemmA16W16Gfx950Param:
     if in_dtype_id not in (GEMM_A16W16_DTYPE_BF16, GEMM_A16W16_DTYPE_FP16):
         raise ValueError(f"unsupported in_dtype_id={in_dtype_id}")
@@ -283,6 +285,7 @@ def make_gemm_a16w16_gfx950_param(
     return GemmA16W16Gfx950Param(
         unroll_lds_ring=unroll_lds_ring,
         n_grouped_loads=n_grouped_loads,
+        unroll_hti=unroll_hti,
         in_dtype_id=in_dtype_id,
         out_dtype_id=out_dtype_id,
         block_m=block_m,
@@ -334,6 +337,7 @@ def make_gemm_a16w16_gfx950_kernel_name(param: GemmA16W16Gfx950Param):
     # the static-ring implementation from previously cached dynamic-ring code.
     name += "_ring5" if param.unroll_lds_ring else ""
     name += "_ng4sk" if param.n_grouped_loads else ""
+    name += "_hti5sk" if param.unroll_hti else ""
     return name
 
 
@@ -445,7 +449,7 @@ def async_load_to_lds(
         src = fx.make_view(tile.src_base + global_offset, g2s_copy_layout)
         dst = fx.make_view(lds_ptr, g2s_copy_layout)
         rocdl.sched_barrier(0)
-        if const_expr(param.n_grouped_loads):
+        if const_expr(param.n_grouped_loads or param.unroll_hti):
             # The NT specialization uses a lane-varying row/K-local offset and
             # a wave-uniform K-tile offset. The copy atom scales soffset from
             # elements to bytes; keeping K in SGPRs avoids repeated VALU address
@@ -1002,7 +1006,11 @@ def gemm_a16w16_hti_gfx950_kernel(
     ks_begin = ks_idx * working_k
     ks_end = ks_begin + working_k
     ks_end = (ks_end < k).select(ks_end, k)
-    k_tiles = (ks_end - ks_begin) // block_k
+    if const_expr(param.unroll_hti):
+        # The validated specialization has K7168, block_k64 and no split-K.
+        k_tiles = 112
+    else:
+        k_tiles = (ks_end - ks_begin) // block_k
     if const_expr(param.k_stagger > 0):
         # Rotate only the global K loads, never the LDS ring index. The
         # actual partition length also handles a shorter final split.
@@ -1272,50 +1280,56 @@ def gemm_a16w16_hti_gfx950_kernel(
     wait_vmcnt_and_barrier(half_ldg_b_iters + half_ldg_a_iters)
 
     main_loop_end = k_tiles - 2
-    for k_tile in range(0, main_loop_end, 2):
-        next_k_tile = k_tile + 2
-        # 0
-        b0 = load_b_fragment(0, 0)
-        a0 = load_a_fragment(0, 0)
-        async_load_a_to_lds(1, k_tile + 1, 1)
-        rocdl.s_barrier()
-        consume(c00, a0, b0, True)
-        rocdl.s_barrier()
-        b1 = load_b_fragment(1, 0)
-        async_load_b_to_lds(0, next_k_tile, 0)
-        rocdl.s_barrier()
-        consume(c01, a0, b1, True)
-        rocdl.s_barrier()
-        a1 = load_a_fragment(1, 0)
-        async_load_a_to_lds(0, next_k_tile, 0)
-        rocdl.s_barrier()
-        consume(c10, a1, b0, True)
-        rocdl.s_barrier()
-        b0 = load_b_fragment(0, 1)
-        async_load_b_to_lds(1, next_k_tile, 0)
-        wait_vmcnt_and_barrier(2 * half_ldg_b_iters + half_ldg_a_iters)
-        consume(c11, a1, b1, True)
-        rocdl.s_barrier()
-        # 1
-        a0 = load_a_fragment(0, 1)
-        async_load_a_to_lds(1, next_k_tile, 0)
-        rocdl.s_barrier()
-        consume(c00, a0, b0, True)
-        rocdl.s_barrier()
-        b1 = load_b_fragment(1, 1)
-        async_load_b_to_lds(0, next_k_tile + 1, 1)
-        rocdl.s_barrier()
-        consume(c01, a0, b1, True)
-        rocdl.s_barrier()
-        a1 = load_a_fragment(1, 1)
-        async_load_a_to_lds(0, next_k_tile + 1, 1)
-        rocdl.s_barrier()
-        consume(c10, a1, b0, True)
-        rocdl.s_barrier()
-        async_load_b_to_lds(1, next_k_tile + 1, 1)
-        wait_vmcnt_and_barrier(half_ldg_b_iters + half_ldg_a_iters)
-        consume(c11, a1, b1, True)
-        rocdl.s_barrier()
+    # Five two-tile periods cover ten K tiles; 110 steady-state tiles are
+    # exactly eleven such iterations. The existing last-two-tile drain is kept.
+    # Other policies expand one period, retaining their original loop.
+    hti_periods = 5 if const_expr(param.unroll_hti) else 1
+    for cycle in range(0, main_loop_end, 2 * hti_periods):
+        for period in range_constexpr(hti_periods):
+            k_tile = cycle + period * 2
+            next_k_tile = k_tile + 2
+            # 0
+            b0 = load_b_fragment(0, 0)
+            a0 = load_a_fragment(0, 0)
+            async_load_a_to_lds(1, k_tile + 1, 1)
+            rocdl.s_barrier()
+            consume(c00, a0, b0, True)
+            rocdl.s_barrier()
+            b1 = load_b_fragment(1, 0)
+            async_load_b_to_lds(0, next_k_tile, 0)
+            rocdl.s_barrier()
+            consume(c01, a0, b1, True)
+            rocdl.s_barrier()
+            a1 = load_a_fragment(1, 0)
+            async_load_a_to_lds(0, next_k_tile, 0)
+            rocdl.s_barrier()
+            consume(c10, a1, b0, True)
+            rocdl.s_barrier()
+            b0 = load_b_fragment(0, 1)
+            async_load_b_to_lds(1, next_k_tile, 0)
+            wait_vmcnt_and_barrier(2 * half_ldg_b_iters + half_ldg_a_iters)
+            consume(c11, a1, b1, True)
+            rocdl.s_barrier()
+            # 1
+            a0 = load_a_fragment(0, 1)
+            async_load_a_to_lds(1, next_k_tile, 0)
+            rocdl.s_barrier()
+            consume(c00, a0, b0, True)
+            rocdl.s_barrier()
+            b1 = load_b_fragment(1, 1)
+            async_load_b_to_lds(0, next_k_tile + 1, 1)
+            rocdl.s_barrier()
+            consume(c01, a0, b1, True)
+            rocdl.s_barrier()
+            a1 = load_a_fragment(1, 1)
+            async_load_a_to_lds(0, next_k_tile + 1, 1)
+            rocdl.s_barrier()
+            consume(c10, a1, b0, True)
+            rocdl.s_barrier()
+            async_load_b_to_lds(1, next_k_tile + 1, 1)
+            wait_vmcnt_and_barrier(half_ldg_b_iters + half_ldg_a_iters)
+            consume(c11, a1, b1, True)
+            rocdl.s_barrier()
 
     k_tile = main_loop_end
     # 0
@@ -1509,12 +1523,9 @@ def _use_unrolled_lds_ring(m, n, k, kwargs):
     )
 
 
-def _use_n_grouped_loads(m, n, k, kwargs):
-    # Only the measured full-M latent projection; padded-M consumers and the
-    # opposite projection keep their original mapping and address generation.
+def _is_latent_hti_policy(kwargs):
     return (
-        (m, n, k) == (16384, 7168, 3584)
-        and kwargs.get("in_dtype_id") == GEMM_A16W16_DTYPE_BF16
+        kwargs.get("in_dtype_id") == GEMM_A16W16_DTYPE_BF16
         and kwargs.get("out_dtype_id") == GEMM_A16W16_DTYPE_BF16
         and not kwargs.get("has_bias", False)
         and not kwargs.get("a_is_transposed", False)
@@ -1534,6 +1545,16 @@ def _use_n_grouped_loads(m, n, k, kwargs):
     )
 
 
+def _use_n_grouped_loads(m, n, k, kwargs):
+    # Only the measured full-M up projection; padded-M consumers keep old code.
+    return (m, n, k) == (16384, 7168, 3584) and _is_latent_hti_policy(kwargs)
+
+
+def _use_unrolled_hti(m, n, k, kwargs):
+    # This exact down projection has 112 K tiles, including a two-tile drain.
+    return (m, n, k) == (16384, 3584, 7168) and _is_latent_hti_policy(kwargs)
+
+
 def make_gemm_a16w16_param_and_validate(m, n, k, kwargs):
     result = None
     # Include the shape-dependent schedule in the constexpr parameter/cache key.
@@ -1542,6 +1563,7 @@ def make_gemm_a16w16_param_and_validate(m, n, k, kwargs):
         **kwargs,
         "unroll_lds_ring": _use_unrolled_lds_ring(m, n, k, kwargs),
         "n_grouped_loads": _use_n_grouped_loads(m, n, k, kwargs),
+        "unroll_hti": _use_unrolled_hti(m, n, k, kwargs),
     }
     try:
         result = _gemm_a16w16_gfx950_param_for(tuple(sorted(kwargs.items())))

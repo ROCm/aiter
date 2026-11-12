@@ -3,8 +3,9 @@
 
 """BF16 latent-projection GEMMs: caller buffers and changed graph inputs.
 
-The defaults exercise the optimized M128/N7168/K3584 and M16384/N7168/K3584
-cells, their padded-M boundaries, and the unchanged opposite large projection. Bias, scaling and preshuffled
+The defaults exercise both projection groups at their optimized M cases:
+M128/M16384 for N7168/K3584 and M16384 for N3584/K7168, plus padded-M boundaries.
+The unresolved M128/N3584/K7168 atomic-accuracy case is not claimed qualified. Bias, scaling and preshuffled
 weights are excluded. Torch FP32 linear is an untimed reference.
 """
 
@@ -22,8 +23,8 @@ from aiter.test_common import benchmark, checkAllclose, run_perftest
 from aiter.tuned_gemm import gemm_a16w16, gemm_a16w16_out
 
 # The changed M128 key also serves M65..128 through padded-M lookup.
-# The large N7168 projection has an exact-shape implementation specialization;
-# its ragged-M boundaries and the opposite projection keep their original code.
+# Both large projections have exact-shape implementation specializations.
+# Their ragged-M boundaries keep the corresponding original device code.
 SHAPES = (
     (128, 7168, 3584),
     (16384, 3584, 7168),
@@ -297,12 +298,84 @@ def check_n_grouped_specialization():
     aiter.logger.info("N-grouped shape/config/cache specialization checks passed")
 
 
+def check_hti_unroll_specialization():
+    from aiter.ops.flydsl.kernels.gemm_a16w16_gfx950 import (
+        _use_unrolled_hti,
+        make_gemm_a16w16_gfx950_kernel_name,
+        make_gemm_a16w16_param_and_validate,
+    )
+
+    cfg = {
+        "in_dtype_id": 2,
+        "out_dtype_id": 2,
+        "block_m": 256,
+        "block_n": 256,
+        "block_k": 64,
+        "stages": 2,
+        "split_k": 1,
+        "m_waves": 2,
+        "n_waves": 4,
+        "k_waves": 1,
+        "group_m": 4,
+        "use_half_tile_interleaved": True,
+        "a_is_transposed": False,
+        "b_is_transposed": True,
+        "has_bias": False,
+    }
+    original = cfg.copy()
+    for m, n, k in (
+        (16384, 3584, 7168),
+        (16383, 3584, 7168),
+        (16257, 3584, 7168),
+        (16385, 3584, 7168),
+        (16384, 7168, 3584),
+        (16384, 7168, 3456),
+        (16384, 7152, 3584),
+        (128, 3584, 7168),
+    ):
+        want = (m, n, k) == (16384, 3584, 7168)
+        assert _use_unrolled_hti(m, n, k, cfg) == want
+        param = make_gemm_a16w16_param_and_validate(m, n, k, cfg)
+        assert param is not None
+        assert make_gemm_a16w16_gfx950_kernel_name(param).endswith("_hti5sk") == want
+    for field, value in (
+        ("in_dtype_id", 3),
+        ("out_dtype_id", 1),
+        ("has_bias", True),
+        ("a_is_transposed", True),
+        ("b_is_transposed", False),
+        ("use_half_tile_interleaved", False),
+        ("b_non_temporal", True),
+        ("k_stagger", 1),
+        ("group_m", 0),
+        ("split_k", 2),
+        ("block_m", 128),
+        ("block_n", 128),
+        ("block_k", 128),
+        ("stages", 3),
+        ("m_waves", 4),
+        ("n_waves", 2),
+        ("k_waves", 2),
+    ):
+        assert not _use_unrolled_hti(16384, 3584, 7168, {**cfg, field: value})
+    selected = make_gemm_a16w16_param_and_validate(16384, 3584, 7168, cfg)
+    assert selected is make_gemm_a16w16_param_and_validate(16384, 3584, 7168, cfg)
+    declined = make_gemm_a16w16_param_and_validate(
+        16383, 3584, 7168, {**cfg, "unroll_hti": True}
+    )
+    assert selected is not declined
+    assert not make_gemm_a16w16_gfx950_kernel_name(declined).endswith("_hti5sk")
+    assert cfg == original
+    aiter.logger.info("HTI period shape/config/cache specialization checks passed")
+
+
 def main():
     if get_gfx_runtime() != "gfx950":
         aiter.logger.warning("This tuning qualification targets gfx950; skipping")
         return
     check_ring_specialization()
     check_n_grouped_specialization()
+    check_hti_unroll_specialization()
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
         "-s", "--mnk", nargs="+", type=aiter.dtypes.str2tuple, default=SHAPES
