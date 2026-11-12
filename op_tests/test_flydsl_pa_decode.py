@@ -1887,6 +1887,13 @@ def _run_pa_decode_case(case, device, monkeypatch):
         and "invalid_input" not in case
     ):
         pytest.skip("BF16 KV requires bfloat16 queries on gfx942/gfx950")
+    if (
+        arch != "gfx1250"
+        and case["kv_dtype"] == "bf16"
+        and not case["trans_v"]
+        and "invalid_input" not in case
+    ):
+        pytest.skip("BF16 KV requires packed V caches on gfx942/gfx950")
     num_cu = torch.cuda.get_device_properties(device).multi_processor_count
     if case["max_partitions"] is not None and case["max_partitions"] > num_cu:
         pytest.skip(f"plan_pa_decode caps max_partitions at {num_cu} CUs")
