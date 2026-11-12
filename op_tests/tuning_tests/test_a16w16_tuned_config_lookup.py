@@ -64,6 +64,112 @@ class TestA16W16TunedConfigLookup(unittest.TestCase):
         self.assertEqual(config["libtype"], "torch")
 
 
+class TestPackedDownProjectionCsv(unittest.TestCase):
+    """The M128 CSV is explicit; padded consumers keep their prior policy."""
+
+    def test_m128_csv_records_effective_packed_configuration(self):
+        from aiter.ops.flydsl.gemm_kernels import get_flydsl_hgemm_kernel_params
+
+        path = (
+            Path(__file__).resolve().parents[2]
+            / "aiter/configs/model_configs/kimik3_bf16_tuned_gemm.csv"
+        )
+        with path.open() as source:
+            rows = [
+                row
+                for row in csv.DictReader(source)
+                if (
+                    row["gfx"],
+                    row["cu_num"],
+                    row["M"],
+                    row["N"],
+                    row["K"],
+                    row["bias"],
+                    row["dtype"],
+                    row["outdtype"],
+                    row["scaleAB"],
+                    row["bpreshuffle"],
+                )
+                == (
+                    "gfx950",
+                    "256",
+                    "128",
+                    "3584",
+                    "7168",
+                    "False",
+                    BF16,
+                    BF16,
+                    "False",
+                    "False",
+                )
+            ]
+        self.assertEqual(len(rows), 1)
+        row = rows[0]
+        self.assertEqual(row["libtype"], "flydsl")
+        config = get_flydsl_hgemm_kernel_params(row["kernelName"])
+        self.assertEqual(
+            (
+                config["block_m"],
+                config["block_n"],
+                config["block_k"],
+                config["stages"],
+                config["split_k"],
+            ),
+            (64, 64, 64, 5, 2),
+        )
+        self.assertEqual(int(row["splitK"]), config["split_k"])
+
+    def test_padded_lookup_preserves_old_policy_without_mutating_csv(self):
+        from aiter.ops.flydsl.gemm_kernels import get_flydsl_hgemm_kernel_params
+
+        new_name = (
+            "flydsl_hgemm_abf16_wbf16_bf16_t64x64x64x5_ks2_"
+            "w2x2x1_bias0_ktail0_gm0_pft_gfx950"
+        )
+        row = {"libtype": "flydsl", "solidx": -1, "splitK": 2, "kernelName": new_name}
+        original = row.copy()
+        key = ("gfx950", 256, 128, 3584, 7168, False, BF16, BF16, False, False)
+        table = {key: row}
+        with (
+            mock.patch.object(tuned, "get_GEMM_A16W16_config_", lambda: table),
+            mock.patch.object(tuned, "get_padded_m", lambda *_: 128),
+        ):
+            for m in range(65, 129):
+                with self.subTest(m=m):
+                    result = tuned.get_GEMM_A16W16_tuned_config(
+                        m,
+                        3584,
+                        7168,
+                        False,
+                        BF16,
+                        BF16,
+                        gfx="gfx950",
+                        cu_num=256,
+                    )
+                    params = get_flydsl_hgemm_kernel_params(result["kernelName"])
+                    self.assertEqual(
+                        (params["stages"], params["split_k"], result["splitK"]),
+                        (5, 2, 2) if m == 128 else (4, 4, 4),
+                    )
+                    self.assertEqual(row, original)
+            # Even an identical new policy saved at exact M127 must win:
+            # compatibility is about borrowing the M128 row, not the shape alone.
+            exact_key = (*key[:2], 127, *key[3:])
+            table[exact_key] = row.copy()
+            exact = tuned.get_GEMM_A16W16_tuned_config(
+                127,
+                3584,
+                7168,
+                False,
+                BF16,
+                BF16,
+                gfx="gfx950",
+                cu_num=256,
+            )
+            self.assertIs(exact, table[exact_key])
+            self.assertEqual(exact["kernelName"], new_name)
+
+
 class TestGfx1250FlydslCandidates(unittest.TestCase):
     """GemmA16W16Tuner's FlyDSL candidates on gfx1250, with the device mocked."""
 
