@@ -13,6 +13,7 @@ from aiter.ops.triton._triton_kernels.quant.fused_mxfp8_quant import (
     _fused_flatten_mxfp8_quant_kernel,
     _fused_rms_mxfp8_kernel,
 )
+from aiter.plugin import route as _route
 
 __all__ = [
     "fused_deepseek_v4_compress_norm_rope_store",
@@ -105,7 +106,7 @@ def fused_rms_mxfp8_quant(
     return y, scale
 
 
-def fused_dual_rmsnorm_mxfp8_quant(
+def _fused_dual_rmsnorm_mxfp8_quant_native(
     q: torch.Tensor,
     k: torch.Tensor,
     q_weight: torch.Tensor,
@@ -117,28 +118,7 @@ def fused_dual_rmsnorm_mxfp8_quant(
     yk: torch.Tensor | None = None,
     amax_floor: float = 0.0,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Fused dual RMSNorm in a single Triton launch.
-
-    - Q side: RMSNorm(q, q_weight, eps_q) -> MXFP8 (FP8 e4m3fn + uint8 e8m0 1x32).
-    - K side: RMSNorm(k, k_weight, eps_k) -> bf16.
-
-    Replaces the CK `fused_qk_rmsnorm_group_quant` kernel for the MXFP8 GEMM
-    path on V4 (Task #77): one launch instead of two (fused_rms_mxfp8_quant +
-    rmsnorm2d_fwd_), eliminating the ~6us/layer launch-overhead regression.
-
-    Args:
-        q: (M, KQ) bf16 or fp16 — Q-side input (e.g. q_lora).
-        k: (M, KK) bf16 or fp16 — K-side input (e.g. kv_pre).
-        q_weight: (KQ,) bf16 or fp16 — Q RMSNorm weight.
-        k_weight: (KK,) bf16 or fp16 — K RMSNorm weight.
-        eps_q: Q RMSNorm epsilon.
-        eps_k: K RMSNorm epsilon; defaults to eps_q.
-        yq, sq, yk: optional pre-allocated outputs.
-        amax_floor: floor of each Q group's amax (0: none).
-
-    Returns:
-        yq (M, KQ) fp8 e4m3fn, sq (M, KQ // 32) uint8 e8m0, yk (M, KK) bf16.
-    """
+    """The Triton launch, with the output buffers settled. Not public."""
     assert q.dim() == 2, f"q must be 2D, got {q.dim()}"
     assert k.dim() == 2, f"k must be 2D, got {k.dim()}"
     M, KQ = q.shape
@@ -196,6 +176,110 @@ def fused_dual_rmsnorm_mxfp8_quant(
         AMAX_FLOOR=amax_floor,
     )
     return yq, sq, yk
+
+
+def _fused_dual_rmsnorm_mxfp8_quant_fake(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    q_weight: torch.Tensor,
+    k_weight: torch.Tensor,
+    eps_q: float,
+    eps_k: float | None = None,
+    amax_floor: float = 0.0,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """The three tensors the op returns, shaped but not filled.
+
+    Allocating rather than returning an argument is the whole reason the
+    routed contract has no output buffers: see
+    :func:`fused_dual_rmsnorm_mxfp8_quant`.
+    """
+    M, KQ = q.shape
+    KK = k.shape[1]
+    return (
+        torch.empty((M, KQ), dtype=torch.float8_e4m3fn, device=q.device),
+        torch.empty((M, KQ // _QUANT_BLOCK_SIZE), dtype=torch.uint8, device=q.device),
+        torch.empty((M, KK), dtype=k.dtype, device=k.device),
+    )
+
+
+@_route(
+    op="fused_dual_rmsnorm_mxfp8_quant",
+    version=1,
+    fake=_fused_dual_rmsnorm_mxfp8_quant_fake,
+)
+def _fused_dual_rmsnorm_mxfp8_quant_routed(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    q_weight: torch.Tensor,
+    k_weight: torch.Tensor,
+    eps_q: float,
+    eps_k: float | None = None,
+    amax_floor: float = 0.0,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Fused dual RMSNorm in a single Triton launch.
+
+    - Q side: RMSNorm(q, q_weight, eps_q) -> MXFP8 (FP8 e4m3fn + uint8 e8m0 1x32).
+    - K side: RMSNorm(k, k_weight, eps_k) -> bf16.
+
+    Replaces the CK `fused_qk_rmsnorm_group_quant` kernel for the MXFP8 GEMM
+    path on V4 (Task #77): one launch instead of two (fused_rms_mxfp8_quant +
+    rmsnorm2d_fwd_), eliminating the ~6us/layer launch-overhead regression.
+
+    Args:
+        q: (M, KQ) bf16 or fp16 — Q-side input (e.g. q_lora).
+        k: (M, KK) bf16 or fp16 — K-side input (e.g. kv_pre).
+        q_weight: (KQ,) bf16 or fp16 — Q RMSNorm weight.
+        k_weight: (KK,) bf16 or fp16 — K RMSNorm weight.
+        eps_q: Q RMSNorm epsilon.
+        eps_k: K RMSNorm epsilon; defaults to eps_q.
+        amax_floor: floor of each Q group's amax (0: none).
+
+    Returns:
+        yq (M, KQ) fp8 e4m3fn, sq (M, KQ // 32) uint8 e8m0, yk (M, KK) bf16.
+    """
+    return _fused_dual_rmsnorm_mxfp8_quant_native(
+        q, k, q_weight, k_weight, eps_q, eps_k, None, None, None, amax_floor
+    )
+
+
+def fused_dual_rmsnorm_mxfp8_quant(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    q_weight: torch.Tensor,
+    k_weight: torch.Tensor,
+    eps_q: float,
+    eps_k: float | None = None,
+    yq: torch.Tensor | None = None,
+    sq: torch.Tensor | None = None,
+    yk: torch.Tensor | None = None,
+    amax_floor: float = 0.0,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Fused dual RMSNorm + MXFP8 quant -- the neutral name for this op.
+
+    Arguments and output are those of the routed contract; see
+    :func:`_fused_dual_rmsnorm_mxfp8_quant_routed`.
+
+    ``yq``, ``sq`` and ``yk`` are pre-allocated output buffers, and passing
+    any of them bypasses routing. The reason is a schema one rather than a
+    policy one: this function RETURNS the buffers it was given, so an op
+    registered over the full signature would return one of its own
+    arguments. A custom op's schema says its results do not alias its
+    inputs, `register_fake` may not hand an argument back, and `opcheck`
+    rejects it -- so the out-param form cannot be a routed contract at all.
+    Leaving the buffers out keeps the contract honest: every tensor the
+    routed form returns is one it allocated.
+
+    A provider therefore serves the allocating form only. The buffered form
+    runs AITER's own Triton kernel, which is what it asked for by naming the
+    buffers to write.
+    """
+    if yq is None and sq is None and yk is None:
+        return _fused_dual_rmsnorm_mxfp8_quant_routed(
+            q, k, q_weight, k_weight, eps_q, eps_k, amax_floor
+        )
+    return _fused_dual_rmsnorm_mxfp8_quant_native(
+        q, k, q_weight, k_weight, eps_q, eps_k, yq, sq, yk, amax_floor
+    )
 
 
 def fused_flatten_mxfp8_quant(
