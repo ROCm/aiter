@@ -335,6 +335,35 @@ def test_gemm_a8w8_bpreshuffle_rejects_short_weight_k():
         gemm_mod.gemm_a8w8_bpreshuffle(xq, wq, x_scale, w_scale, dtype=torch.bfloat16)
 
 
+@pytest.mark.parametrize("k", [352, 704])
+def test_cktile_rejects_k_off_warp_tile(k):
+    """The untuned CKTile kernel (warp tile 16x16x64) misread the preshuffled
+    weight at K % 64 == 32 (K=352: 99% of C wrong); it must refuse that K.
+    K=704 is a K % 128 tail that stays on the warp tile and is exact."""
+    if get_gfx() not in SUPPORTED_GFX:
+        pytest.skip(f"CKTile bpreshuffle is not built for {get_gfx()}")
+    torch.manual_seed(0)
+    m, n = 32, 4096
+    xq, x_scale = aiter.pertoken_quant(
+        torch.randn((m, k), dtype=dtypes.bf16), quant_dtype=dtypes.fp8
+    )
+    wq, w_scale = aiter.pertoken_quant(
+        torch.randn((n, k), dtype=dtypes.bf16), quant_dtype=dtypes.fp8
+    )
+    wq_shuffled = shuffle_weight(wq, layout=(16, 16))
+    out = torch.empty((m, n), dtype=dtypes.bf16)
+    if k % 64:
+        with pytest.raises(RuntimeError, match="multiple of its warp-tile K"):
+            aiter.gemm_a8w8_bpreshuffle_cktile(
+                xq, wq_shuffled, x_scale, w_scale, out, 0
+            )
+        return
+    aiter.gemm_a8w8_bpreshuffle_cktile(xq, wq_shuffled, x_scale, w_scale, out, 0)
+    ref = run_torch(xq, x_scale, wq, w_scale)
+    err = checkAllclose(ref.float(), out.float(), rtol=1e-2, atol=1e-2)
+    assert err == 0, err
+
+
 def _padded_k_backend(m, n, k, w_k):
     """(libtype, split-K?) the dispatcher picks for a K-padded weight, or None."""
     for kk in (k, w_k):
@@ -636,5 +665,9 @@ def main():
 if __name__ == "__main__":
     main()
     # CI runs this file with python3, which skips its pytest functions; run the
-    # FlyDSL-to-CK fallback checks here so CI exercises them.
-    sys.exit(pytest.main([__file__, "-q", "-k", "falls_back or ck_fallback"]))
+    # FlyDSL-to-CK fallback and CKTile K checks here so CI exercises them.
+    sys.exit(
+        pytest.main(
+            [__file__, "-q", "-k", "falls_back or ck_fallback or off_warp_tile"]
+        )
+    )
