@@ -39,9 +39,12 @@ _LAZY_IMPORTS = {
         ".fp8_mqa_logits_kernels",
         "KERNEL_VARIANTS",
     ),
+    "FlyQuickAllReduce": (".quick_allreduce", "FlyQuickAllReduce"),
+    # Old name of FlyQuickAllReduce, kept for vLLM's _aiter_ops.py. Remove it
+    # once vLLM imports FlyQuickAllReduce.
+    "QuickAllReduceInt4": (".quick_allreduce", "FlyQuickAllReduce"),
     "OneShotAllReduce": (".one_shot_allreduce", "OneShotAllReduce"),
     "DenseGemmConfig": (".gemm_a16wfp4", "DenseGemmConfig"),
-    "QuickAllReduceInt4": (".quick_allreduce_int4", "QuickAllReduceInt4"),
     "PreshuffledA16WFP4Weight": (
         ".gemm_a16wfp4",
         "PreshuffledA16WFP4Weight",
@@ -208,6 +211,7 @@ __all__ = [
     "FP8_MQA_LOGITS_DEFAULT_VARIANT",
     "FP8_MQA_LOGITS_VARIANTS",
     "DenseGemmConfig",
+    "FlyQuickAllReduce",
     "Fp4MqaPlan",
     "GateMode",
     "OneShotAllReduce",

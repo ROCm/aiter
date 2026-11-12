@@ -104,6 +104,7 @@ configs/gfx1250/96cu/gluon/moe/a8w4/DEFAULT.json
 | `utils/tuned_config_utils.py` | `get_tuned_kernel_config`, `autotune_configs` |
 | `utils/quant_config_utils.py` | `get_quant_config` (Gluon quant) |
 | `utils/normalization_config_utils.py` | `get_normalization_config` |
+| `utils/unified_attention_utils.py` | `get_unified_attention_config` (see [Unified attention](#unified-attention)) |
 
 Each function has one home. Do not add re-exports or forwarding wrappers.
 Attention and GMM kernels read their `DEFAULT.json` with
@@ -249,6 +250,31 @@ in lowercase (`mhc_fused_sinkhorn`).
   fallback to other families.
 
 `get_mhc_post_config(M, C)` reads `mhc_post/DEFAULT.json`.
+
+## Unified attention
+
+`get_unified_attention_config(op, params, backend)` in
+`utils/unified_attention_utils.py` reads
+`<arch>/<backend>/attention/unified_attention/DEFAULT.json`. The file has one
+table for each op (`attn_2d`, `attn_3d`, `reduce`, `kv_split`) and a
+`"schema"` that gives the axes of each table, in order.
+
+- A key has only the axes that it needs, joined by `.`, for example
+  `D_LEQ_128.Q_LEQ_1.DT_fp8_fp8`. Each table has an `"any"` entry.
+- The loader tries the axes in the `"schema"` order, so the leftmost axis
+  has the highest precedence. On a number axis it tries `EQ`, then `LEQ`
+  bounds from low to high, then `GEQ` bounds from high to low, then `any`.
+- The dtype axis is `DT_<q>_<k>`: the query dtype, then the K cache dtype.
+  The tags are `bf16` (also for fp16), `fp8` and `nvfp4`.
+- A V cache with a dtype that is not the K cache dtype (A8K4V8: NVFP4 K,
+  fp8 V) has a three-dtype key, `DT_<q>_<k>_<v>`, for example
+  `DT_fp8_nvfp4_fp8`.
+- The dtype fallback order is: `DT_<q>_<k>_<v>` (only when the V dtype is
+  not the K dtype), `DT_<q>_<k>`, `DT_<q>_any`, `DT_any_<k>`, `any`. So an
+  A8K4V8 call without a `DT_fp8_nvfp4_fp8` entry uses the A8W4
+  `DT_fp8_nvfp4` entry.
+- Do not use `any` in a three-dtype key. Do not write a three-dtype key with
+  the same V and K tags: the loader never tries it.
 
 ## Autotune
 
