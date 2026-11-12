@@ -44,6 +44,7 @@ skip_tests=(
     "op_tests/multigpu_tests/bench_attention_a2a.py"
     "op_tests/multigpu_tests/test_mega_moe_tp.py"
     "op_tests/multigpu_tests/test_mega_moe_v2.py"
+    "op_tests/multigpu_tests/test_megamoe_internode.py"
     "op_tests/multigpu_tests/test_mega_moe_small_m.py"
     "op_tests/multigpu_tests/test_wide_ep_moe.py"
     "op_tests/multigpu_tests/test_dispatch_combine.py"

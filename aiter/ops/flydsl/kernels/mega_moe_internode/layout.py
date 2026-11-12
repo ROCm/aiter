@@ -24,6 +24,12 @@ kernel2 reduces them into ``node_accumulator``, ships the remote plane over
 the rail into the peer's ``remote_partial_rx`` and combines both planes into
 the source-order output.  Every region is double buffered by generation
 parity.
+
+With comm_quant="fp8", both local and remote node partials use FP8 with
+1x32 E8M0 scales. Only the remote plane is transmitted over the rail; the
+local plane is decoded from the same format before the final addition.
+Intra-node SDMA independently quantizes per-route GEMM2 rows before node
+reduction; its default path applies to both local and remote source planes.
 """
 
 from __future__ import annotations
@@ -35,6 +41,7 @@ import torch
 SPARSE_QP_TOKEN_BITS = 32
 SPARSE_QP_GENERATION_SHIFT = 32
 MAX_FUSED_TOKENS_PER_RANK = 16384
+MAX_FUSED_MODEL_DIM = 8192
 MAX_PACKED_SOURCE_CAPACITY = (1 << 24) - 1
 MAX_BUFFER_ADDRESSABLE_BYTES = 1 << 32
 
@@ -982,6 +989,7 @@ class Stage2ArenaLayout:
 
 
 __all__ = [
+    "MAX_FUSED_MODEL_DIM",
     "MAX_FUSED_TOKENS_PER_RANK",
     "MAX_PACKED_SOURCE_CAPACITY",
     "SPARSE_QP_GENERATION_SHIFT",

@@ -36,6 +36,7 @@ from typing_extensions import Self
 from ..mega_moe.quant import BLOCK as _QUANT_BLOCK
 from ..mega_moe.quant import per_1x32_mx_quant
 from .layout import (
+    MAX_FUSED_MODEL_DIM,
     MAX_FUSED_TOKENS_PER_RANK,
     Stage1ArenaLayout,
     Stage2ArenaLayout,
@@ -297,8 +298,15 @@ class MegaMoEInternode:
       ``activation`` is a compatible alias;
     * ``situ_beta`` / ``situ_linear_beta``: positive SiTUv2 gate/up saturation
       coefficients, both defaulting to 1;
-    * ``comm_quant``: ``"fp8"`` (default) sends the cross-node rail payload
-      as FP8 with 1x32 E8M0 scales, ``"none"`` sends BF16;
+    * ``comm_quant``: ``"fp8"`` (default) quantizes both local and remote
+      node partials to FP8 with 1x32 E8M0 scales; only the remote partial
+      crosses the rail. Both are decoded before the final addition, so
+      source-node-only routes also incur this rounding. ``"none"`` keeps
+      both node partials in BF16. Independently, intra-node SDMA quantizes
+      per-route GEMM2 rows before node reduction, for both source planes by default;
+    * ``max_tok_per_rank``: a power-of-two transport capacity in [1, 16384],
+      shared by all ranks. Actual input row counts may differ across ranks
+      and need not be powers of two;
     * ``communicator``: a ``mori.cco`` Communicator owned by the caller
       (default: create one per instance);
     * ``max_routes_per_token_per_rank``: upper bound on the experts one
@@ -474,8 +482,8 @@ class MegaMoEInternode:
             raise ValueError(f"MegaMoEInternode requires world_size={WORLD_SIZE} (two nodes of {GPUS_PER_NODE})")
         if not 0 <= int(rank) < int(world_size):
             raise ValueError("rank is outside world_size")
-        if not 1024 <= int(model_dim) <= 8192 or int(model_dim) % 512:
-            raise ValueError("model_dim must be in [1024, 8192] and divisible by 512")
+        if not 1024 <= int(model_dim) <= MAX_FUSED_MODEL_DIM or int(model_dim) % 512:
+            raise ValueError(f"model_dim must be in [1024, {MAX_FUSED_MODEL_DIM}] and divisible by 512")
         if int(inter_dim) <= 0 or int(inter_dim) % 256:
             raise ValueError("inter_dim must be positive and divisible by 256")
         if int(experts) <= 0 or int(experts) % int(world_size):
@@ -486,6 +494,9 @@ class MegaMoEInternode:
             raise ValueError("topk must be in [1, 16]")
         if not 1 <= int(max_tok_per_rank) <= MAX_FUSED_TOKENS_PER_RANK:
             raise ValueError(f"max_tok_per_rank must be in [1, {MAX_FUSED_TOKENS_PER_RANK}]")
+        # Stage2 decodes source IDs with shifts and masks based on this capacity.
+        if int(max_tok_per_rank) & (int(max_tok_per_rank) - 1):
+            raise ValueError("max_tok_per_rank must be a power of two")
         if not 1 <= int(route_cap) <= int(topk):
             raise ValueError("max_routes_per_token_per_rank must be in [1, topk]")
         if str(activation) not in ("silu", "situv2"):

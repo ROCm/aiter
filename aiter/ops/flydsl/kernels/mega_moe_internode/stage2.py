@@ -47,6 +47,8 @@ from . import communication as comm
 from .communication import ccqe_enabled as _rail_ccqe
 from .communication import rail as _rail
 from .gemm import gemm2_compute_v2, issue_a_load_lds_dt, kStages
+from .layout import MAX_FUSED_MODEL_DIM
+from .mega_moe_internode_config import GEMM2_BNS
 
 # Keep constexpr and runtime guards separate (local SIM102/SIM114 exemptions).
 # Raw loads/atomics preserve system scope, ordering and element-offset units;
@@ -244,9 +246,10 @@ def p2p_scatter_epilog(lds_acc_base, accm, n_block_idx, wave, lane, *, N_OUT, BM
 
 
 # fmt: off
-# Words after kernel1's arrival counts for its per-n_block m-block tickets and
-# done count; the host allocates them with the arrival counts.
-K1_CLAIM_WORDS = 64
+# One m-block ticket per N-block plus the done and remote-half done counters.
+# Cover the largest supported hidden dimension at the smallest allowed BN.
+# The host allocation and the specialization guard use this shared bound.
+K1_CLAIM_WORDS = MAX_FUSED_MODEL_DIM // min(GEMM2_BNS) + 2
 # Kernel1 CTAs resident per CU (91 VGPRs, 4 waves -> 5 per CU); the dynamic
 # claim launches at most this many per CU.
 K1_CTAS_PER_CU = 5
@@ -2148,6 +2151,8 @@ def compile_stage2_node_combine(
                       totals = _tot[_j]
                       token_index = _tix[_j]
                       col = _col[_j]
+                      # Both planes use comm_quant's format. The local partial
+                      # is quantized too, even when all routes stay on this node.
                       if const_expr(RAIL_FP8):
                           _vals = [fx.Float32(totals[i])
                                    for i in range_constexpr(VEC)]
@@ -2338,6 +2343,8 @@ def compile_stage2_node_combine(
                 local_index = ((fx.Int32(local_plane * MAX_TOKENS) + token)
                                * fx.Int32(HIDDEN) + col)
                 out_index = token * fx.Int32(HIDDEN) + col
+                # FP8 mode decodes both node partials before summing; only
+                # the remote partial crossed the rail.
                 if const_expr(RAIL_FP8):
                     _lrow = ((fx.Int32(local_plane * MAX_TOKENS) + token)
                              * fx.Int32(ACC_ROW_BYTES))

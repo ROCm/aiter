@@ -175,7 +175,7 @@ def parse_args(argv=None):
         "--comm-quant",
         choices=("fp8", "none"),
         default="fp8",
-        help="cross-node rail payload format of the fused operator",
+        help="node-partial format: fp8 quantizes both local and remote partials; none keeps BF16",
     )
     p.add_argument("--smallop-quant", choices=("a4w4", "a8w4"))
     p.add_argument("--fused-quant", choices=("a4w4", "a8w4"), default="a4w4")
