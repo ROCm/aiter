@@ -1702,7 +1702,9 @@ def emit_dispatch_payload(
             payload_chunk_rows
         )
         num_chunks = (num_chunks > fx.Int32(0)).select(num_chunks, fx.Int32(1))
-        chunk_active = chunk_id < num_chunks
+        # An empty segment has nothing to copy or publish: skip its release
+        # fence and chunk_done round trip (which would only reset it to 0).
+        chunk_active = (chunk_id < num_chunks) & (source_count > fx.Int32(0))
         chunk_begin = chunk_id * fx.Int32(payload_chunk_rows)
         chunk_limit = chunk_begin + fx.Int32(payload_chunk_rows)
         chunk_end = (source_count < chunk_limit).select(source_count, chunk_limit)
