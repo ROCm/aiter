@@ -348,6 +348,7 @@ REJECT = {  # name -> (kwargs of the op call, message of the refusal); a failed 
     ),
     "scale [2]": ({"k_scale": torch.ones(2)}, "one element each"),
     "block 16": ({"block": 16}, "block_size must be 128"),
+    "aliased pages": ({"alias": True}, "page stride must be at least the page size"),
 }
 
 
@@ -369,6 +370,8 @@ def run_reject(name):
     }
     kw.update(REJECT[name][0])
     block = kw.pop("block", PAGE)
+    if kw.pop("alias", False):
+        kv = kv[:1].expand(2, -1)  # page stride 0: both pages are the same bytes
     aiter.fused_qknorm_idxrqknorm(
         qkv, w, w, cs, pos, 4, nkv, 64, 1e-6, w, w, 1, slots, kv, kv, idx, block,
         None, None, slots, **kw,
