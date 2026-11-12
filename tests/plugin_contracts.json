@@ -103,5 +103,12 @@
   "source": "aiter/ops/rmsnorm.py",
   "supersedes": [],
   "version": 1
+ },
+ "sp_qkv_fused": {
+  "fingerprint": "9f14942435574b5f",
+  "signature": "q:positional, x:positional, x_scale:positional, w:positional, w_scale:positional, q_norm_w:positional, k_norm_w:positional, cos_cache:positional, sin_cache:positional, positions:positional, slot_mapping:positional, k_cache:positional, v_cache:positional, k_scale:positional, v_scale:positional, mode:keyword-only, k:keyword-only=None, v:keyword-only=None, index_q:keyword-only=None, index_q_norm_w:keyword-only=None, index_k_norm_w:keyword-only=None, index_cache:keyword-only=None, eps:keyword-only=1e-06, group:keyword-only=None, stream:keyword-only=None, -> None",
+  "source": "aiter/ops/gemm_fusion/sp_qkv/op.py",
+  "supersedes": [],
+  "version": 1
  }
 }
