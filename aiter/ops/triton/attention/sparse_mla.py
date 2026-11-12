@@ -787,6 +787,14 @@ def _forward_dsv4_640(
             f"fp8_dsv4_mla_640 takes bf16 q, or the packed fp8 q with q_rope; "
             f"got {q.dtype} without q_rope"
         )
+    else:
+        # The driver reads only the packed form; pack a bf16 q here (a caller
+        # with a fused Q producer passes the pair instead and skips this pass).
+        from aiter.ops.triton.quant.fused_mxfp8_quant import (
+            fused_deepseek_v4_mxfp8_quant_q_pack,
+        )
+
+        q, q_rope = fused_deepseek_v4_mxfp8_quant_q_pack(q)
 
     def _split(cache, what):
         if cache.ndim == 2:  # the record grid: one row per index
