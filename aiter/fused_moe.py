@@ -455,7 +455,13 @@ def _is_row_major_2d(tensor):
     return (
         tensor.ndim == 2
         and tensor.stride(1) == 1
-        and tensor.stride(0) >= tensor.shape[1]
+        and (
+            tensor.shape[0] == 1
+            or (
+                tensor.stride(0) >= tensor.shape[1]
+                and tensor.stride(0) * tensor.element_size() % 16 == 0
+            )
+        )
     )
 
 

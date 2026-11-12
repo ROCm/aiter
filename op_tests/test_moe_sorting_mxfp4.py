@@ -1104,6 +1104,10 @@ def _check_fused_moe_inline_sort_pad_rows(tokens=32, valid=29):
     w2, w2_scale = fp4_weight(hidden, inter)
     x = torch.randn((tokens, hidden + 64), dtype=dtypes.bf16, device="cuda")[:, :hidden]
     assert not x.is_contiguous()
+    misaligned = torch.randn((tokens, hidden + 4), dtype=dtypes.bf16, device="cuda")[
+        :, :hidden
+    ]
+    assert misaligned.stride(0) * misaligned.element_size() % 16
     inner_strided = torch.randn((tokens, hidden * 2), dtype=dtypes.bf16, device="cuda")[
         :, ::2
     ]
@@ -1147,6 +1151,8 @@ def _check_fused_moe_inline_sort_pad_rows(tokens=32, valid=29):
         contiguous = run(pad_ids, tokens, count, x.contiguous())
         materialized = run(pad_ids, tokens, count, inner_strided)
         materialized_ref = run(pad_ids, tokens, count, inner_strided.contiguous())
+        misaligned_out = run(pad_ids, tokens, count, misaligned)
+        misaligned_ref = run(pad_ids, tokens, count, misaligned.contiguous())
         graph = None
         if tokens == 32:
             graph = torch.cuda.CUDAGraph()
@@ -1172,6 +1178,11 @@ def _check_fused_moe_inline_sort_pad_rows(tokens=32, valid=29):
         / materialized_ref.float().norm()
     ).item()
     assert rel < 0.02, rel
+    rel = (
+        (misaligned_out.float() - misaligned_ref.float()).norm()
+        / misaligned_ref.float().norm()
+    ).item()
+    assert rel < 0.02, rel
     if graph is not None:
         rel = ((out.float() - graph_out.float()).norm() / out.float().norm()).item()
         assert rel < 0.02, rel
@@ -1185,4 +1196,5 @@ if _running_on_gfx950():
         _check_three_stage_sort_pad_rows(bm)
     _check_fused_moe_inline_sort_pad_rows()
     _check_fused_moe_inline_sort_pad_rows(tokens=4, valid=3)
+    _check_fused_moe_inline_sort_pad_rows(tokens=1, valid=1)
     aiter.logger.info("aux sort pad-row / num_local_tokens checks passed")
