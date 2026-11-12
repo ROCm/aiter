@@ -15,6 +15,7 @@ from aiter.jit.core import AITER_CONFIGS
 from aiter.jit.utils.chip_info import get_cu_num
 from aiter.jit.utils.chip_info import get_gfx_runtime as get_gfx
 from aiter.ops.gemm_op_a16w16 import _SEMA_SHAPE, get_semaphore_workspace
+from aiter.ops.gemm_op_common import get_padded_m
 from aiter.ops.shuffle import shuffle_weight
 from aiter.test_common import benchmark, checkAllclose, perftest
 from aiter.tuned_gemm import (
@@ -541,6 +542,76 @@ def _tuned_rows_per_libtype(libtypes):
     return rows
 
 
+def _padded_row_m_limit(r):
+    """First M at which the row's kernel can no longer address A or C, or None."""
+    if r.libtype in ("asm", "flydsl"):
+        out_bytes = 4 if r.outdtype == str(dtypes.fp32) else 2
+        if 2 * r.N * r.K >= 1 << 32:
+            return None
+        return -(-(1 << 32) // max(2 * r.K, out_bytes * r.N))
+    if r.libtype == "opus" and get_gfx() == "gfx950":
+        from csrc.opus_gemm.opus_gemm_common import get_kernel_instance
+
+        inst = get_kernel_instance(
+            "gfx950", "a16w16", int(r.solidx), cu_num=get_cu_num()
+        )
+        if inst is None or inst.is_4g_safe or r.N * r.K >= 1 << 31:
+            return None
+        return -(-(1 << 31) // max(r.K, r.N))
+    return None
+
+
+def test_padded_row_kernel_limits():
+    """An M = 8192 row is not used where its kernel cannot address the operands.
+
+    getPaddedM(gl=1) serves every M > 8192 with the M = 8192 row. ASM and
+    FlyDSL kernels return wrong values or fault once A or C reaches 4 GiB,
+    gfx950 legacy OPUS kids once it reaches 2^31 elements, so the lookup must
+    skip the row there; one M lower it must still use it.
+    """
+    df = pd.read_csv(AITER_CONFIGS.AITER_CONFIG_GEMM_BF16_FILE)
+    df = df[
+        (df["gfx"] == get_gfx())
+        & (df["cu_num"] == get_cu_num())
+        & (df["dtype"] == str(dtypes.bf16))
+        & (~df["bpreshuffle"].astype(bool))
+        & (~df["scaleAB"].astype(bool))
+    ]
+    tuned = set(zip(df["M"], df["N"], df["K"], df["bias"], df["outdtype"]))
+    candidates = df[(df["M"] == 8192) & (df["N"] > 4096)]
+    rows = []
+    for r in candidates.itertuples():
+        key = (r.N, r.K, r.bias, r.outdtype)
+        m_over = _padded_row_m_limit(r)
+        if m_over is None or m_over - 1 <= 8192:
+            continue
+        # Only Ms whose own and gl=0-padded rows are absent reach the M = 8192 row.
+        lookups = [
+            (m, get_padded_m(m, r.N, r.K, 0), get_padded_m(m, r.N, r.K, 1))
+            for m in (m_over - 1, m_over)
+        ]
+        if any(
+            gl1 != 8192 or (m, *key) in tuned or (gl0, *key) in tuned
+            for m, gl0, gl1 in lookups
+        ):
+            continue
+        for m, expect_row in ((m_over - 1, True), (m_over, False)):
+            lib = get_GEMM_A16W16_config(
+                m, r.N, r.K, r.bias, str(dtypes.bf16), r.outdtype
+            )["libtype"]
+            assert (
+                lib == r.libtype
+            ) == expect_row, (
+                f"M={m} N={r.N} K={r.K}: routed to {lib}, M=8192 row is {r.libtype}"
+            )
+            rows.append(
+                {"case": f"{r.libtype} row at M={m} N={r.N} K={r.K}", "libtype": lib}
+            )
+    if not rows:
+        aiter.logger.warning("no M = 8192 row with a kernel size limit on this GPU")
+    return rows
+
+
 def _check_out(label, expect_lib, x, w, bias, otype, call):
     """`call(out)` into a NaN-filled buffer, judged against `call(None)`.
 
@@ -696,13 +767,14 @@ parser.add_argument(
     "--test",
     type=str,
     nargs="*",
-    choices=["normal", "skinny", "out", "compile"],
-    default=["normal"],
+    choices=["normal", "skinny", "out", "compile", "padded"],
+    default=["normal", "padded"],
     help="""Select test to run.
-    e.g.: -t normal    # default
+    e.g.: -t normal padded    # default
           or -t skinny
           or -t out    # tgemm.mm(out=) on every backend
-          or -t compile    # torch.compile with weights/biases in one storage""",
+          or -t compile    # torch.compile with weights/biases in one storage
+          or -t padded    # padded M = 8192 rows past the kernel size limit""",
 )
 parser.add_argument(
     "-d",
@@ -792,6 +864,8 @@ for test in args.test:
         df += test_gemm_out()
     elif test == "compile":
         df += test_gemm_compile_packed_params()
+    elif test == "padded":
+        df += test_padded_row_kernel_limits()
 df = pd.DataFrame(df)
 df_md = df.to_markdown(index=False)
 aiter.logger.info("gemm_a16w16 summary (markdown):\n%s", df_md)
