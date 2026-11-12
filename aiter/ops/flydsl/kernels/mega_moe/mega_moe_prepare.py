@@ -282,6 +282,7 @@ def compile_mega_moe_prepare(
                     tile_state_stride=tile_state_stride,
                     parallel_fanout=parallel_fanout,
                     defer_fanout_to_quant=defer_fanout_to_quant,
+                    plan_scratch=fx.Int64(fx.ptrtoint(count_scratch)),
                 )
             if producer:
                 emit_dispatch_group(
