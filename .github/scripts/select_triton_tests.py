@@ -28,6 +28,9 @@ GFX942_LAUNCH_PATHS = (
     SRC + "attention/pa_prefill_sparse.py",
     SRC + "_triton_kernels/attention/sparse_attention_dsv4.py",
     "op_tests/triton_tests/attention/test_pa_prefill_sparse.py",
+    # sparse_mla_fwd's FlyDSL route (AITER_SPARSE_MLA_FLYDSL) is gfx942-only.
+    SRC + "attention/sparse_mla.py",
+    "op_tests/triton_tests/attention/test_sparse_mla.py",
 )
 TESTS = "op_tests/triton_tests/"
 BENCH = "op_tests/op_benchmarks/triton/"

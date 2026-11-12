@@ -406,6 +406,50 @@ def test_sparse_mla_rope_free(fmt, dots, tol, H, C, topk, ragged, pool):
     )
 
 
+@pytest.mark.parametrize("sink", [False, True])
+@pytest.mark.parametrize("H", [8, 16])
+@pytest.mark.parametrize(
+    "C,topk,ragged,pool,splits,empty_row",
+    [
+        (8, 2048, False, 1 << 16, None, True),
+        (8, 500, True, 1 << 16, 3, True),
+        # Triton's prefill path returns NaN for a keyless row without a sink.
+        (2048, 256, True, 1 << 13, None, False),
+    ],
+    ids=["topk2048", "ragged500_split3", "prefill"],
+)
+def test_sparse_mla_flydsl_route(
+    monkeypatch, H, C, topk, ragged, pool, splits, empty_row, sink
+):
+    """AITER_SPARSE_MLA_FLYDSL=1 serves gfx942 rope-free bf16 H=16 from FlyDSL;
+    H=8 falls through to the Triton kernel."""
+    if arch_info.get_arch() != "gfx942":
+        pytest.skip("the FlyDSL sparse MLA route is gfx942-only")
+    flydsl_sparse_mla = pytest.importorskip("aiter.ops.flydsl.sparse_mla")
+    calls = []
+    fwd = flydsl_sparse_mla.flydsl_sparse_mla_fwd
+
+    def spy(*args, **kwargs):
+        calls.append(kwargs)
+        return fwd(*args, **kwargs)
+
+    monkeypatch.setattr(flydsl_sparse_mla, "flydsl_sparse_mla_fwd", spy)
+    monkeypatch.setenv("AITER_SPARSE_MLA_FLYDSL", "1")
+    _run_and_check(
+        "bf16",
+        C=C,
+        H=H,
+        topk=topk,
+        ragged=ragged,
+        pool=pool,
+        rope=0,
+        sink=sink,
+        empty_row=empty_row,
+        kv_splits=splits,
+    )
+    assert len(calls) == (H == 16)
+
+
 @pytest.mark.parametrize("H", [8, 16, 32, 64, 128])
 @pytest.mark.parametrize(
     "C,topk,ragged,pool",

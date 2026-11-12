@@ -2,6 +2,7 @@
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
 import math
+import os
 
 import torch
 import triton
@@ -29,6 +30,12 @@ from aiter.ops.triton.utils.device_info import get_num_sms, get_num_xcds
 from aiter.ops.triton.utils.logger import AiterTritonLogger
 
 _LOGGER = AiterTritonLogger()
+
+
+def _flydsl_sparse_mla_enabled() -> bool:
+    """Opt-in gate for the FlyDSL gfx942 rope-free port. Not memoized, so the
+    env var can be toggled at runtime."""
+    return os.environ.get("AITER_SPARSE_MLA_FLYDSL", "") == "1"
 
 
 def _check_out(out, q, kv_lora_rank):
@@ -756,6 +763,10 @@ def sparse_mla_fwd(
     read for it. A bf16 pool carries no rope information, so a rope-inside or
     rope-free model on a bf16 cache must pass qk_rope_head_dim=0.
 
+    On gfx942, AITER_SPARSE_MLA_FLYDSL=1 serves rope-free bf16 calls with 16
+    heads, a contiguous pool and no LSE, skip_reduce, extra segment or epilogue
+    from the FlyDSL kernel in aiter.ops.flydsl.sparse_mla. Other calls stay here.
+
     Args:
         q: [C, H, kv_lora_rank + qk_rope_head_dim] queries, one row per
             query token (prefill and decode alike).
@@ -877,6 +888,47 @@ def sparse_mla_fwd(
         _check_index_stream(
             extra_indptr, extra_indices, num_queries, q.device, what="extra_"
         )
+    # FlyDSL port (opt-in): gfx942 rope-free bf16 with 16 heads. Anything
+    # outside its contract falls through to the kernels below.
+    if (
+        _flydsl_sparse_mla_enabled()
+        and fmt == "bf16"
+        and not (has_extra or skip_reduce or return_lse)
+        and inv_rope_positions is None
+        and out_mxfp8 is None
+    ):
+        from aiter.ops.flydsl.sparse_mla import (
+            flydsl_sparse_mla_fwd,
+            flydsl_sparse_mla_fwd_supported,
+        )
+
+        if flydsl_sparse_mla_fwd_supported(
+            q,
+            kv_buffer,
+            kv_indices,
+            kv_lora_rank=kv_lora_rank,
+            qk_rope_head_dim=qk_rope_head_dim,
+            dot_precision=dot_precision,
+            out=out,
+            attn_sink=attn_sink,
+            kv_splits=kv_splits,
+        ):
+            kv_indices = _as_int32_contiguous_1d(kv_indices)
+            if attn_sink is not None:
+                attn_sink = attn_sink.reshape(-1).to(torch.float32).contiguous()
+            out = flydsl_sparse_mla_fwd(
+                q,
+                kv_buffer.view(-1, kv_lora_rank),
+                kv_indices,
+                out,
+                _as_int32_contiguous_1d(kv_indptr),
+                attn_sink=attn_sink,
+                softmax_scale=softmax_scale,
+                # Plans split-K only; a row is never truncated to it.
+                max_seqlen=-(-kv_indices.numel() // num_queries),
+                num_splits=kv_splits,
+            )
+            return out, None
     if fmt in ("fp8_dsv4_mla", "fp8_g64") or (has_extra and fmt != "fp8_scalar"):
         return _forward_paged(
             q,

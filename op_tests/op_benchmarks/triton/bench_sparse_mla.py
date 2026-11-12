@@ -4,6 +4,8 @@
 """Benchmark for sparse_mla_fwd (gluon MLA; gfx950 and gfx942).
 
 Separated rope by default; --qk_rope_head_dim 0 runs the rope-free geometry.
+On gfx942 the rope-free, 16-head runs add a FlyDSL series: the same call with
+AITER_SPARSE_MLA_FLYDSL=1.
 The cache is flushed between iterations by default. Leaving it warm lets the loop
 re-read its KV and flatters decode shapes badly.
 
@@ -13,6 +15,9 @@ Usage:
   python op_tests/op_benchmarks/triton/bench_sparse_mla.py --num_seqs 64 --metric bandwidth
   python op_tests/op_benchmarks/triton/bench_sparse_mla.py --qk_rope_head_dim 0
 """
+
+import os
+from unittest import mock
 
 import torch
 import triton
@@ -40,8 +45,9 @@ D_QK = KV_LORA_RANK + QK_ROPE_HEAD_DIM
 E4M3_DTYPE = get_fp8_e4m3_dtype()
 E4M3_MAX = torch.finfo(E4M3_DTYPE).max
 
-# Picks up the main kernel and _sparse_mla_reduce, nothing else.
-KERNEL_MATCH = "_sparse_mla"
+# Picks up the main kernel and its reduce (Triton _sparse_mla*, or FlyDSL
+# sparse_mla_fwd_* and sparse_mla_combine_*), nothing else.
+KERNEL_MATCH = "sparse_mla"
 FLUSH_BYTES = 512 << 20
 
 _flush_buf = None
@@ -178,6 +184,13 @@ def run_benchmark(args):
             f"note: skipping the fp8-dot series, {arch_info.get_arch()}'s native "
             "fp8 is fnuz and the kernel reads OCP e4m3"
         )
+    if arch_info.get_arch() == "gfx942":
+        if args.qk_rope_head_dim == 0 and args.num_heads == 16:
+            dot_vals.append("flydsl")
+            dot_names.append("FlyDSL bf16")
+            dot_styles.append(("red", "-"))
+        else:
+            print("note: the FlyDSL series needs --qk_rope_head_dim 0 --num_heads 16")
 
     benchmark = triton.testing.Benchmark(
         x_names=["phase", "num_seqs", "num_tokens", "num_heads", "context", "topk"],
@@ -195,6 +208,8 @@ def run_benchmark(args):
     def bench_sparse_mla(
         phase, num_seqs, num_tokens, num_heads, context, topk, dots, metric, **kwargs
     ):
+        flydsl = dots == "flydsl"
+        dots = "bf16" if flydsl else dots
         rope = args.qk_rope_head_dim
         d_qk = KV_LORA_RANK + rope
         q, kv, kv_fp8, kv_scale, indices, indptr = build_case(
@@ -231,7 +246,9 @@ def run_benchmark(args):
                 out=out,
             )
 
-        time_ms = device_time_ms(func, flush=not args.no_flush_l2)
+        route = {"AITER_SPARSE_MLA_FLYDSL": "1" if flydsl else "0"}
+        with mock.patch.dict(os.environ, route):
+            time_ms = device_time_ms(func, flush=not args.no_flush_l2)
 
         nnz = int(indptr[-1].item())
         num_tokens = q.shape[0]
