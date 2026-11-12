@@ -313,7 +313,7 @@ def _a4w4_gemm1_swiglu_vs_torch_ref(M, E, E_LOCAL, TOPK, D, I, block_m, in_kerne
 
     g = torch.Generator(device=device).manual_seed(0)
     x = torch.randn(M, D, generator=g, device=device, dtype=torch.bfloat16)
-    vals, ids = torch.topk(torch.randn(M, E, generator=g, device=device), TOPK, dim=-1)
+    vals, ids = torch.topk(torch.randn(M, E, generator=g, dtype=torch.float32, device=device), TOPK, dim=-1)
     ids = ids.to(torch.int32).contiguous()
     wts = torch.softmax(vals, -1).contiguous()
 
@@ -327,11 +327,11 @@ def _a4w4_gemm1_swiglu_vs_torch_ref(M, E, E_LOCAL, TOPK, D, I, block_m, in_kerne
     ref, tok, _ = gemm1_swiglu_torch_ref(xr, w1r, E_LOCAL, ids, gidx, n, TOPK)
     ref_rq = dequant_e2m1(*mxfp4_quant(ref.bfloat16()))
 
-    gemm_kw = dict(
-        swizzle_mx_scale="GFX1250_SCALE", preshuffle_weights=True,
-        out_mx_quant=True, apply_swiglu=True, alpha=1.0, limit=1e4,
-        swiglu_add_residual=False,
-    )
+    gemm_kw = {
+        "swizzle_mx_scale": "GFX1250_SCALE", "preshuffle_weights": True,
+        "out_mx_quant": True, "apply_swiglu": True, "alpha": 1.0, "limit": 1e4,
+        "swiglu_add_residual": False,
+    }
     if in_kernel_gather:
         y, ys = moe_gemm_a4w4(xq, w1k, xs, s1k, None, rd, gather_indx=gidx, **gemm_kw)
     else:

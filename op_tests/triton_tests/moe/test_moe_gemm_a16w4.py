@@ -432,7 +432,7 @@ def _a16w4_gemm1_swiglu_gather_vs_pregathered(M, E, E_LOCAL, TOPK, D, I, block_m
     """a16w4 GEMM1 with SwiGLU: in-kernel gather must match pre-gathered."""
     g = torch.Generator(device=device).manual_seed(0)
     x = torch.randn(M, D, generator=g, device=device, dtype=torch.bfloat16)
-    vals, ids = torch.topk(torch.randn(M, E, generator=g, device=device), TOPK, dim=-1)
+    vals, ids = torch.topk(torch.randn(M, E, generator=g, dtype=torch.float32, device=device), TOPK, dim=-1)
     ids = ids.to(torch.int32).contiguous()
     wts = torch.softmax(vals, -1).contiguous()
 
@@ -448,10 +448,10 @@ def _a16w4_gemm1_swiglu_gather_vs_pregathered(M, E, E_LOCAL, TOPK, D, I, block_m
     n = int(rd.expt_data.hist.sum())
     tok = gidx.long()[:n] // TOPK
 
-    gemm_kw = dict(
-        swizzle_mx_scale=swizzle_name,
-        apply_swiglu=True, alpha=1.0, limit=1e4, swiglu_add_residual=False,
-    )
+    gemm_kw = {
+        "swizzle_mx_scale": swizzle_name,
+        "apply_swiglu": True, "alpha": 1.0, "limit": 1e4, "swiglu_add_residual": False,
+    }
     y_ikg = moe_gemm_a16w4(x, wq, None, ws_swz, routing_data=rd, gather_indx=gidx, **gemm_kw)
     y_pg = moe_gemm_a16w4(x[tok], wq, None, ws_swz, routing_data=rd, gather_indx=None, **gemm_kw)
 

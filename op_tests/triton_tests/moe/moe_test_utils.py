@@ -3,17 +3,16 @@
 """Helpers shared by the MoE Triton tests."""
 
 import torch
-import triton
 
 from aiter import logger
 from aiter.ops.shuffle import moe_shuffle_scale, moe_shuffle_weight
 from aiter.ops.triton.moe.moe_op_gemm_a4w4 import mxfp4_quant
 from aiter.ops.triton.moe.moe_routing.routing import (
-    _compute_expt_data_internal,
-    ep_sort_routing,
     EpScatterGeometry,
     ExptData,
     RoutingData,
+    _compute_expt_data_internal,
+    ep_sort_routing,
 )
 from aiter.ops.triton.utils.shuffle import moe_weight_decode_view
 
@@ -101,6 +100,7 @@ def assert_close(ref, tri, maxtol=None, rmstol=None, description="--", verbose=T
 
 E2M1 = torch.tensor(
     [0, 0.5, 1, 1.5, 2, 3, 4, 6, -0.0, -0.5, -1, -1.5, -2, -3, -4, -6],
+    dtype=torch.float32,
     device="cuda",
 )
 
@@ -162,7 +162,7 @@ def gemm1_swiglu_torch_ref(xr, w1r, E_LOCAL, ids, gidx, n, TOPK):
     tok = gate // TOPK
     exp = ids.flatten().long()[gate]
     I = w1r.shape[1] // 2
-    ref = torch.empty(n, I, device=xr.device)
+    ref = torch.empty(n, I, dtype=torch.float32, device=xr.device)
     for e in exp.unique().tolist():
         sel = (exp == e).nonzero(as_tuple=True)[0]
         ref[sel] = swiglu_ref(xr[tok[sel]] @ w1r[e].T)
