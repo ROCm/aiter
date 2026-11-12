@@ -531,6 +531,8 @@ def make_s1f_stage1(
     block_runs=MB_RB,
     ticket_span=None,
     ctas_per_cu=2,
+    m_warp=1,
+    n_warp=4,
 ):
     """Build the S1F stage-1 kernel; returns a ``@flyc.jit`` launcher.
 
@@ -752,8 +754,8 @@ def make_s1f_stage1(
             tile_m=tile_m,
             tile_n=tile_n,
             tile_k=tile_k,
-            m_warp=1,
-            n_warp=4,
+            m_warp=m_warp,
+            n_warp=n_warp,
             out_is_f16=0,
             num_buffers=g1_buffers,
             a_is_fp4=1,
@@ -2030,6 +2032,7 @@ def make_s1f_stage1(
             i32_m,
             inp_cur_tok,
             f32_swiglu_limit,
+            value_attrs=lay["kernel_attrs"],
         ).launch(grid=(G, 1, 1), block=(block, 1, 1), stream=stream)
 
     launch.compile_hints = dict(launch_gemm_a8w4_tdm.compile_hints)

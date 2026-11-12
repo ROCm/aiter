@@ -366,7 +366,11 @@ def build_gemm_a8w4_tdm_task(
     wmma_n_rep = warp_tile_n // WMMA_N
     n_acc = wmma_m_rep * wmma_n_rep
     is_prefill = tile_m == tile_n == tile_k == 256
-    USE_EXPLICIT_VGPR_PARTITION = bool(is_prefill and callable(sched_vgpr))
+    # The pinned map (v256-v511 operands, v512-v767 accumulators) is laid out
+    # for the 2x2 wave grid; a 1x4 grid's 128x64 wave tile overflows it.
+    USE_EXPLICIT_VGPR_PARTITION = bool(
+        is_prefill and callable(sched_vgpr) and m_warp == n_warp == 2
+    )
     # Only fixed high-VGPR placement needs the relaxed occupancy target.
     # Attach it per kernel; a launcher-wide hint also changes ordinary tiles.
     kernel_attrs = {"rocdl.waves_per_eu": "1"} if USE_EXPLICIT_VGPR_PARTITION else {}

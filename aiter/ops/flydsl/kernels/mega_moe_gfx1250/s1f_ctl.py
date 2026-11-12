@@ -61,6 +61,10 @@ _S1F_TILE_N, _S1F_TILE_K = 256, 256
 #: consumers inside one launch -- so a variant whose CTAs per CU exceeds what
 #: VGPRs and LDS allow would hang, not just run slow.
 _S1F_VARIANTS = {16: (4, 2), 32: (4, 2), 64: (3, 2), 128: (3, 2), 256: (3, 1)}
+#: GEMM1 (m_warp, n_warp) per tile_m (default 1x4). 2x2 at 256 rows takes the
+#: GEMM body's pinned-VGPR / wmma_2x4 prefill schedule (waves_per_eu=1, which
+#: the one-CTA-per-CU 256 variant already implies).
+_S1F_WARPS = {256: (2, 2)}
 #: m-tiles per group in the GEMM1 work order.
 _S1F_GROUP_M = 8
 # The S1F settings below (with S1F_BLOCK_RUNS in s1f_stage1.py and the compact
@@ -92,6 +96,17 @@ def s1f_max_recv(world_size: int, topk: int) -> int:
         cap = int(env)
         return cap if cap > 0 else 1 << 30
     return _S1F_MAX_RECV_BY_SHAPE.get((int(world_size), int(topk)), _S1F_MAX_RECV)
+
+
+def _s1f_warps(tile_m: int) -> tuple:
+    """GEMM1 (m_warp, n_warp); ``AITER_MEGA_S1F_WARPS=MxN`` forces one grid."""
+    env = os.environ.get("AITER_MEGA_S1F_WARPS", "").strip().lower()
+    if env:
+        m, n = (int(v) for v in env.split("x"))
+        if m * n != 4:
+            raise ValueError(f"AITER_MEGA_S1F_WARPS={env!r} must be a 4-wave grid")
+        return m, n
+    return _S1F_WARPS.get(int(tile_m), (1, 4))
 
 
 def read_s1f_mode() -> bool:
@@ -465,6 +480,7 @@ class _Stage1Fusion:
         if launch is None:
             d, config = self.d, self.d.config
             num_buffers, ctas_per_cu = _S1F_VARIANTS[tile_m]
+            m_warp, n_warp = _s1f_warps(tile_m)
             launch = make_s1f_stage1(
                 rank=config.rank,
                 npes=config.world_size,
@@ -491,6 +507,8 @@ class _Stage1Fusion:
                 block_runs=block_runs,
                 ticket_span=self.ticket_span,
                 ctas_per_cu=ctas_per_cu,
+                m_warp=m_warp,
+                n_warp=n_warp,
             )
             self.launches[key] = launch
         return launch
