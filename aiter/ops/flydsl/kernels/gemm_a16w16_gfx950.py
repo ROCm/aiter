@@ -60,6 +60,7 @@ class GemmA16W16Gfx950Param:
     mma_m: fx.Constexpr[int]
     mma_n: fx.Constexpr[int]
     mma_k: fx.Constexpr[int]
+    n_grouped_loads: fx.Constexpr[bool]
     unroll_lds_ring: fx.Constexpr[bool]
     # derived params
     async_load_bytes: fx.Constexpr[int]
@@ -120,6 +121,7 @@ def make_gemm_a16w16_gfx950_param(
     k_stagger: int = 0,
     b_non_temporal: bool = False,
     unroll_lds_ring: bool = False,
+    n_grouped_loads: bool = False,
 ) -> GemmA16W16Gfx950Param:
     if in_dtype_id not in (GEMM_A16W16_DTYPE_BF16, GEMM_A16W16_DTYPE_FP16):
         raise ValueError(f"unsupported in_dtype_id={in_dtype_id}")
@@ -280,6 +282,7 @@ def make_gemm_a16w16_gfx950_param(
         )
     return GemmA16W16Gfx950Param(
         unroll_lds_ring=unroll_lds_ring,
+        n_grouped_loads=n_grouped_loads,
         in_dtype_id=in_dtype_id,
         out_dtype_id=out_dtype_id,
         block_m=block_m,
@@ -330,6 +333,7 @@ def make_gemm_a16w16_gfx950_kernel_name(param: GemmA16W16Gfx950Param):
     # Kernel bodies do not participate in FlyDSL's disk-cache key. Distinguish
     # the static-ring implementation from previously cached dynamic-ring code.
     name += "_ring5" if param.unroll_lds_ring else ""
+    name += "_ng4sk" if param.n_grouped_loads else ""
     return name
 
 
@@ -441,7 +445,21 @@ def async_load_to_lds(
         src = fx.make_view(tile.src_base + global_offset, g2s_copy_layout)
         dst = fx.make_view(lds_ptr, g2s_copy_layout)
         rocdl.sched_barrier(0)
-        if const_expr(tile.non_temporal):
+        if const_expr(param.n_grouped_loads):
+            # The NT specialization uses a lane-varying row/K-local offset and
+            # a wave-uniform K-tile offset. The copy atom scales soffset from
+            # elements to bytes; keeping K in SGPRs avoids repeated VALU address
+            # updates before each DMA. Async groups and cache policy are unchanged.
+            k_offset = context.ks_begin + tile.k_tile * block_k
+            vector_offset = (
+                safe_global_outer_idx * tile.leading_stride
+                + swizzled_col_idx(
+                    outer_local_idx, k_local_idx, tile.lds_layout, block_k
+                )
+            )
+            src = fx.make_view(tile.src_base + vector_offset, g2s_copy_layout)
+            fx.copy(context.async_g2s_copy_atom, src, dst, soffset=fx.Int32(k_offset))
+        elif const_expr(tile.non_temporal):
             # The async copy atom has no cache-policy operand. Keep the raw
             # load async too, so the existing asyncmark/wait_asyncmark groups
             # still track its completion. src_base is the buffer origin;
@@ -974,7 +992,12 @@ def gemm_a16w16_hti_gfx950_kernel(
     block_swizzle = BlockSwizzle(
         NUM_XCDS=8, NUM_PIDS_THRESHOLD=256, GROUP_M=param.group_m
     )
-    bid_m, bid_n = block_swizzle.swizzle(num_pid_m, num_pid_n, fx.block_idx.x)
+    if const_expr(param.n_grouped_loads):
+        # Reuse the existing XCD-aware bijection with transposed tile axes:
+        # groups of four N tiles improve A reuse for this projection.
+        bid_n, bid_m = block_swizzle.swizzle(num_pid_n, num_pid_m, fx.block_idx.x)
+    else:
+        bid_m, bid_n = block_swizzle.swizzle(num_pid_m, num_pid_n, fx.block_idx.x)
     ks_idx = fx.block_idx.y
     ks_begin = ks_idx * working_k
     ks_end = ks_begin + working_k
@@ -1486,11 +1509,40 @@ def _use_unrolled_lds_ring(m, n, k, kwargs):
     )
 
 
+def _use_n_grouped_loads(m, n, k, kwargs):
+    # Only the measured full-M latent projection; padded-M consumers and the
+    # opposite projection keep their original mapping and address generation.
+    return (
+        (m, n, k) == (16384, 7168, 3584)
+        and kwargs.get("in_dtype_id") == GEMM_A16W16_DTYPE_BF16
+        and kwargs.get("out_dtype_id") == GEMM_A16W16_DTYPE_BF16
+        and not kwargs.get("has_bias", False)
+        and not kwargs.get("a_is_transposed", False)
+        and kwargs.get("b_is_transposed", True)
+        and kwargs.get("use_half_tile_interleaved", False)
+        and not kwargs.get("b_non_temporal", False)
+        and kwargs.get("k_stagger", 0) == 0
+        and kwargs.get("group_m", 0) == 4
+        and kwargs.get("split_k", 1) == 1
+        and kwargs.get("block_m") == 256
+        and kwargs.get("block_n") == 256
+        and kwargs.get("block_k") == 64
+        and kwargs.get("stages") == 2
+        and kwargs.get("m_waves") == 2
+        and kwargs.get("n_waves") == 4
+        and kwargs.get("k_waves", 1) == 1
+    )
+
+
 def make_gemm_a16w16_param_and_validate(m, n, k, kwargs):
     result = None
     # Include the shape-dependent schedule in the constexpr parameter/cache key.
     # Do not mutate caller policy dictionaries or expose an unchecked override.
-    kwargs = {**kwargs, "unroll_lds_ring": _use_unrolled_lds_ring(m, n, k, kwargs)}
+    kwargs = {
+        **kwargs,
+        "unroll_lds_ring": _use_unrolled_lds_ring(m, n, k, kwargs),
+        "n_grouped_loads": _use_n_grouped_loads(m, n, k, kwargs),
+    }
     try:
         result = _gemm_a16w16_gfx950_param_for(tuple(sorted(kwargs.items())))
     except Exception:  # noqa: BLE001 - invalid policies are filtered here
