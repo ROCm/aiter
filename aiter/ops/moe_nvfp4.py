@@ -7,8 +7,10 @@ to f16 in registers (exact), apply the E4M3 block scale and the per-expert
 global multiplier, and run f16 MFMA on f16 or bf16 -> f16 activations (no
 activation quant). Three launches per MoE: fused sort + cast + output zeroing,
 stage 1 (gate/up + SwiGLU-OAI), stage 2 (down, weighted atomic reduce into the
-output, x dtype, so results are not bitwise deterministic). The E4M3 scales of each
-weight tensor are stored once, grouped by GS K-tiles (scale_gs of its K).
+output, so results are not bitwise deterministic). f16 x: stage 2 reduces into
+a zeroed f32 workspace, cast to the f16 output once (two more launches). The
+E4M3 scales of each weight tensor are stored once, grouped by GS K-tiles
+(scale_gs of its K).
 
 Fallback path (T * topk above MAX_SORT_ROWS, more than MAX_SORT_EXPERTS experts,
 or fallback=True): AITER's opus moe_sorting (sort + output zeroing, any T) and
@@ -507,8 +509,9 @@ def moe_nvfp4(
         ValueError: x not bf16 or f16 [T, W.H], topk above 127 (the slot field
             of the sorted ids), fallback=False for a shape the fused sort cannot
             take, a shape without default-rule kernels, or a shape over the
-            kernel limits (32-bit X byte offsets: T * H and T * topk * I
-            below 2^30; at most MAX_GRID_Y sorted blocks).
+            kernel limits (32-bit byte offsets: T * H and T * topk * I
+            below 2^30, T * H below 2^29 for f16 x; at most MAX_GRID_Y sorted
+            blocks).
     """
     T, H = x.shape
     topk = topk_ids.shape[1]
@@ -532,8 +535,11 @@ def moe_nvfp4(
     x = x.contiguous()
     n = T * topk
     nblk = min(W.E, n) + (n + BM - 1) // BM
-    # 32-bit byte offsets of both stages' X, grid y (sorted blocks)
-    if max(T * H, n * W.I) * 2 >= 1 << 31 or _round8(nblk) > MAX_GRID_Y:
+    # 32-bit byte offsets of both stages' X and the f32 output, grid y (sorted blocks)
+    if (
+        max(T * H * (1 if bf16 else 2), n * W.I) * 2 >= 1 << 31
+        or _round8(nblk) > MAX_GRID_Y
+    ):
         raise ValueError(f"NVFP4 MoE: T={T} topk={topk} exceeds the kernel limits")
     out = torch.empty(T, H, dtype=x.dtype, device=dev)
     x_inter = torch.empty(n, W.I, dtype=torch.float16, device=dev)
@@ -575,6 +581,8 @@ def moe_nvfp4(
     # stage 1: x [T, H] -> x_inter [T * topk, I], stage 2: x_inter -> out [T, H]
     _gemm(kernel1, sort, T, topk, W.E, x1, W.w13, W.s13, W.g13, x_inter,
           K=W.H, ntiles=2 * W.I // 16, n_out=W.I)  # fmt: skip
-    _gemm(kernel2, sort, T, topk, W.E, x_inter, W.w2, W.s2, W.g2, out,
+    # f16 x: the expert sum in f32 (f16 atomics overflow on partial sums)
+    acc = out if bf16 else torch.zeros(T, H, dtype=torch.float32, device=dev)
+    _gemm(kernel2, sort, T, topk, W.E, x_inter, W.w2, W.s2, W.g2, acc,
           K=W.I, ntiles=W.H // 16, n_out=W.H)  # fmt: skip
-    return out
+    return out if bf16 else out.copy_(acc)

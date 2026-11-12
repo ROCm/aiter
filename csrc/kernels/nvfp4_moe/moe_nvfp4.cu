@@ -104,11 +104,13 @@ void moe_nvfp4_gemm(int64_t kernel,
                 "x, w, w_sc and out must be contiguous");
     AITER_CHECK(inv_gs.dtype() == AITER_DTYPE_fp32 && inv_gs.is_contiguous(),
                 "inv_gs must be contiguous fp32");
-    // stage 1 reads bf16 x iff _inbf16, stage 2 writes bf16 out iff _outbf16 (else f16)
+    // stage 1 reads bf16 x iff _inbf16 (else f16), stage 2 writes bf16 out iff _outbf16 (else
+    // the f32 workspace of f16 output)
     const bool s1            = moe_nvfp4_cfg_field(kernel, CFG_S1) != 0;
     const aiter_tensor_t& io = s1 ? x : out;
     const bool io_bf16       = moe_nvfp4_cfg_field(kernel, s1 ? CFG_INBF16 : CFG_OUTBF16) != 0;
-    AITER_CHECK(io.dtype() == (io_bf16 ? AITER_DTYPE_bf16 : AITER_DTYPE_fp16),
+    const auto io_other      = s1 ? AITER_DTYPE_fp16 : AITER_DTYPE_fp32;
+    AITER_CHECK(io.dtype() == (io_bf16 ? AITER_DTYPE_bf16 : io_other),
                 s1 ? "x" : "out",
                 " dtype does not match kernel ",
                 moe_nvfp4_cfg_name(kernel));

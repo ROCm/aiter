@@ -4,8 +4,9 @@
 
 Covers moe_nvfp4 and the fused_moe path (w1/w2_global_scale) on the MiniMax-M3.1
 shapes (TP4 / TP8, E 128, topk 4), the main path and the fallback (T 2048), bf16
-and f16 activations, a dispatch CSV (AITER_CONFIG_MOE_NVFP4) naming a kernel
-outside the prebuilt module (per-kernel JIT) and the fused_moe errors.
+and f16 activations, expert contributions that cancel beyond the f16 range, a
+dispatch CSV (AITER_CONFIG_MOE_NVFP4) naming a kernel outside the prebuilt module
+(per-kernel JIT) and the fused_moe errors.
 """
 
 import os
@@ -127,6 +128,30 @@ def test_moe_nvfp4(shape, T, dtype):
         assert torch.isfinite(out).all(), name
         err = _relf(out, ref)
         assert err < TOL, f"{name} I={I} T={T} {dtype}: relF {err:.2e}"
+
+
+@pytest.mark.parametrize("fallback", [False, True])
+@pytest.mark.parametrize("dtype", DTYPES)
+def test_cancellation(dtype, fallback):
+    """Two experts with opposite down weights: each contribution (+-86016) is above
+    the f16 range, their sum is 0 (f16 x: no inf - inf in the output atomics)."""
+    I, E2 = SHAPES["tp8"], 2
+
+    def full(v, *s):
+        return torch.full(s, v, dtype=torch.uint8, device="cuda")
+
+    # fp4 0x2 = 1, 0xA = -1, E4M3 0x38 = 1: stage 1 gives the SwiGLU-OAI bound 56
+    w2 = torch.cat([full(0x22, 1, H, I // 2), full(0xAA, 1, H, I // 2)])
+    W = NvFp4MoeWeights(
+        full(0x22, E2, 2 * I, H // 2), full(0x38, E2, 2 * I, H // 16),
+        w2, full(0x38, E2, H, I // 16),
+        torch.ones(E2, 2, device="cuda"), torch.full((E2,), 8.0, device="cuda"),
+    )  # fmt: skip
+    x = torch.ones(1, H, dtype=dtype, device="cuda")
+    tid = torch.tensor([[0, 1]], dtype=torch.int32, device="cuda")
+    tw = torch.full((1, 2), 0.5, device="cuda")
+    out = moe_nvfp4(W, x, tid, tw, fallback=fallback)
+    assert out.dtype == dtype and (out == 0).all(), out.float().abs().max()
 
 
 def _check_jit_csv():

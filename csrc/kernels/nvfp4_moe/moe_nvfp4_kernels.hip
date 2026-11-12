@@ -6,7 +6,7 @@
 // tiles of 16 rows) is one WG. Each wave walks its K slice (K / ksplit K-tiles) in chunks:
 // weights + E4M3 scale groups + X -> fp4 decode + f16 MFMA (mma_ktile), then the K partial sums
 // of the ksplit waves are reduced in LDS and the stage epilogue runs (stage 1: SwiGLU-OAI, f16
-// x_inter; stage 2: route weight, f16 / bf16 atomics). The X placement (Cfg::x) picks the weight
+// x_inter; stage 2: route weight, bf16 / f32 atomics). The X placement (Cfg::x) picks the weight
 // pipeline: a register ring (moe_nvfp4_wreg.h) for X in registers / an LDS stream / LDS
 // resident, an LDS-DMA ring for X by DMA.
 #include <hip/hip_runtime.h>

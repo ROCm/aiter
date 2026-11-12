@@ -15,7 +15,7 @@ namespace aiter {
 // moe_nvfp4_entry.h: s1, m_tiles, n_tiles, waves, gs, inbf16, outbf16). s1 is 1 exactly for the
 // nvfp4_moe_s1_* names; gs: weight scale layout, K-tiles per scale group (2 pair, 4, 6 SG, 8);
 // inbf16: a stage1 kernel that reads the bf16 activations; outbf16: a stage2 kernel with bf16
-// output (else f16).
+// output (else an f32 workspace, cast to f16 by the caller).
 int64_t moe_nvfp4_num_cfgs();
 std::string moe_nvfp4_cfg_name(int64_t i);
 int64_t moe_nvfp4_cfg_field(int64_t i, int64_t k);
@@ -41,7 +41,7 @@ void moe_nvfp4_sort(const aiter_tensor_t& x,
                     int64_t nblk);
 
 // One GEMM stage of kernel (index into the kernel table) on the sorted rows. Stage 2 out:
-// [T, H], bf16 for _outbf16 kernels, else f16.
+// [T, H], bf16 for _outbf16 kernels, else f32 (zeroed workspace of f16 output).
 void moe_nvfp4_gemm(int64_t kernel,
                     const aiter_tensor_t& x,
                     const aiter_tensor_t& w,
