@@ -98,13 +98,66 @@ if PLANAR_LDS not in (0, 1):
 if INTERLEAVED_LDS_LOAD not in (None, 0, 1):
     raise ValueError("AITER_FLYDSL_INTERLEAVED_LDS_LOAD must be 0 or 1")
 
+# Fixed VGPR placement of the accumulators and operand slots. Unset pins only
+# the preshuffled 256^3 prefill tile; "0" pins nothing; "gemm1", "gemm2" or
+# "all" also pin every other tile of that stage whose layout fits. A gemm1
+# tile is one with an activation or a quantized output.
+PIN_VGPR = os.environ.get("AITER_FLYDSL_PIN_VGPR")
+if PIN_VGPR not in (None, "0", "gemm1", "gemm2", "all"):
+    raise ValueError("AITER_FLYDSL_PIN_VGPR must be 0, gemm1, gemm2 or all")
+# VGPRs kept below the pinned set for scales, LDS bases and loop state.
+PIN_VGPR_RESERVE = int(os.environ.get("AITER_FLYDSL_PIN_VGPR_RESERVE", "64"))
+
+# VGPRs per lane of one gfx1250 SIMD; a wave allocating half of it leaves room
+# for a second wave.
+VGPR_FILE = 1024
+VGPR_FRAME = 256
+
+PinnedVgprLayout = namedtuple("PinnedVgprLayout", "budget acc slots")
+
+
+def _pinned_vgpr_layout(acc_frags, slot_frags, reserve):
+    """Fixed VGPR starts for the accumulators and the two operand slots.
+
+    ``acc_frags`` and ``slot_frags`` are fragment sizes in dwords, in placement
+    order. The set fills the top of the smallest per-wave budget that leaves
+    ``reserve`` VGPRs under it: half the file keeps two waves per SIMD, the
+    whole file one. Accumulators sit highest, then slot 1, then slot 0. A
+    fragment must not cross a 256-VGPR frame, the range one s_set_vgpr_msb
+    setting addresses. Returns None when neither budget fits.
+    """
+
+    def starts(base, frags):
+        out = []
+        for size in frags:
+            if base // VGPR_FRAME != (base + size - 1) // VGPR_FRAME:
+                return None
+            out.append(base)
+            base += size
+        return out
+
+    acc_dwords = sum(acc_frags)
+    slot_dwords = ceildiv(sum(slot_frags), 16) * 16
+    for budget in (VGPR_FILE // 2, VGPR_FILE):
+        acc_base = budget - acc_dwords
+        slot_base = (acc_base - 2 * slot_dwords) // 16 * 16
+        if slot_base < reserve:
+            continue
+        acc = starts(acc_base, acc_frags)
+        slots = [starts(slot_base + s * slot_dwords, slot_frags) for s in range(2)]
+        if acc is not None and None not in slots:
+            return PinnedVgprLayout(budget, acc, slots)
+    return None
+
+
 # K256 order: prefix/barrier WMMAs -> ds_first_group -> mma_first_group
 # -> ds_group -> (mma_group -> ds_group)* -> remainder -> ksl0_fence_mma.
 # Counts group existing instructions; they do not add computation.
 # Prefill means tile_m == tile_n == tile_k == 256 over a preshuffled A. Its
 # groups and fixed VGPR placement are tuned to that LDS layout; the same tile
 # over padded A rows (MegaMoE dispatch, unshuffled TP) keeps the earlier
-# prefill_padded groups and ordinary allocation. An omitted
+# prefill_padded groups and, unless AITER_FLYDSL_PIN_VGPR selects it,
+# ordinary allocation. An omitted
 # mma_first_group uses mma_group; ds_first_group=0 skips the leading DS group.
 HYPER_PARAMS = {
     "a8w4": {
@@ -343,6 +396,7 @@ def build_gemm_a8w4_tdm_task(
     WMMA_N = 32 if a_is_fp4 else 16
     WMMA_K = 128
     WAVE = 32
+    ACT_NDW = 8 if a_is_fp4 else 16
     PACK_TK = tile_k // 2
     KWS = tile_k // WMMA_K
     # K may end on half a k128 (K % 128 == 64, e.g. 576 = 4 x 128 + 64): the
@@ -392,10 +446,30 @@ def build_gemm_a8w4_tdm_task(
     n_acc = wmma_m_rep * wmma_n_rep
     is_prefill_tile = tile_m == tile_n == tile_k == 256
     is_prefill = is_prefill_tile and bool(a_preshuffled)
-    USE_EXPLICIT_VGPR_PARTITION = bool(is_prefill and callable(sched_vgpr))
-    # Only fixed high-VGPR placement needs the relaxed occupancy target.
-    # Attach it per kernel; a launcher-wide hint also changes ordinary tiles.
-    kernel_attrs = {"rocdl.waves_per_eu": "1"} if USE_EXPLICIT_VGPR_PARTITION else {}
+    pin_stage = "gemm1" if stage1_act or stage1_quant_out else "gemm2"
+    pin_vgpr = (
+        is_prefill
+        if PIN_VGPR is None
+        else PIN_VGPR != "0" and (is_prefill or PIN_VGPR in ("all", pin_stage))
+    )
+    vgpr_layout = (
+        _pinned_vgpr_layout(
+            [WMMA_N // 2] * n_acc,
+            [ACT_NDW] * wmma_m_rep + [WMMA_N // 2] * wmma_n_rep,
+            PIN_VGPR_RESERVE,
+        )
+        if pin_vgpr and callable(sched_vgpr)
+        else None
+    )
+    USE_EXPLICIT_VGPR_PARTITION = vgpr_layout is not None
+    # The allocator must see the pinned layout's budget as its occupancy
+    # target. Attach it per kernel; a launcher-wide hint also changes
+    # ordinary tiles.
+    kernel_attrs = (
+        {"rocdl.waves_per_eu": str(VGPR_FILE // vgpr_layout.budget)}
+        if USE_EXPLICIT_VGPR_PARTITION
+        else {}
+    )
     hyper_params = HYPER_PARAMS["a4w4" if a_is_fp4 else "a8w4"][
         "prefill" if is_prefill else "prefill_padded" if is_prefill_tile else "default"
     ]
@@ -477,7 +551,6 @@ def build_gemm_a8w4_tdm_task(
     A_ROW_B = tile_k // A_PACK
     A_KSTEP = WMMA_K // A_PACK
     ACT_ELEM = fx.Float4E2M1FN if a_is_fp4 else fx.Float8E4M3FN
-    ACT_NDW = 8 if a_is_fp4 else 16
 
     LDS_PAD_A = 0 if a_preshuffled else 16
     A_LDS_ROW = A_ROW_B + LDS_PAD_A
@@ -618,7 +691,11 @@ def build_gemm_a8w4_tdm_task(
     _ds_first = f"_dsfirst{sched_ds_first}" if sched_ds_first else ""
     _ds_group = f"_dsgroup{sched_ds_group}" if sched_ds_group else ""
     _ds_wait = "_fencewait" if sched_ds_group else ""
-    _explicit_vgpr_partition = "_regpart" if USE_EXPLICIT_VGPR_PARTITION else ""
+    _explicit_vgpr_partition = ""
+    if USE_EXPLICIT_VGPR_PARTITION:
+        _explicit_vgpr_partition = "_regpart"
+        if vgpr_layout.budget != VGPR_FILE:
+            _explicit_vgpr_partition += str(vgpr_layout.budget)
     _planar_lds = "_planarlds" if planar_lds_on else ""
     _interleaved_lds_load = "_interleavelds" if interleaved_lds_load_on else ""
     _epq = f"_epq{ep_quant_bits}" if ep_quant_bits else ""
@@ -1465,9 +1542,8 @@ def build_gemm_a8w4_tdm_task(
             for _ in range_constexpr(n_acc)
         ]
         if const_expr(USE_EXPLICIT_VGPR_PARTITION):
-            assert n_acc * WMMA_VECTOR_DWORDS <= 512
             for idx in range_constexpr(n_acc):
-                c_frags[idx] = place_vgpr(c_frags[idx], 512 + idx * WMMA_VECTOR_DWORDS)
+                c_frags[idx] = place_vgpr(c_frags[idx], vgpr_layout.acc[idx])
 
         def init_accumulators():
             # Cover prologue TDM latency before the first pipeline wait.
@@ -1476,7 +1552,7 @@ def build_gemm_a8w4_tdm_task(
                 cf = c_frags[idx]
                 zero = fx.constant_vector(0.0, T.vec(WMMA_VECTOR_DWORDS, T.f32))
                 if const_expr(USE_EXPLICIT_VGPR_PARTITION):
-                    start = 512 + idx * WMMA_VECTOR_DWORDS
+                    start = vgpr_layout.acc[idx]
                     end = start + WMMA_VECTOR_DWORDS - 1
                     # Uppercase names select LLVM's physical-register lookup;
                     # the AMDGPU lowercase "v" parser limits operands to v255.
@@ -1606,17 +1682,12 @@ def build_gemm_a8w4_tdm_task(
             sa = fx.make_rmem_tensor(SA_WIDTH, fx.Int32)
             sb = fx.make_rmem_tensor(SB_WIDTH, fx.Int32)
             if const_expr(USE_EXPLICIT_VGPR_PARTITION):
-                slot_width = wmma_m_rep * ACT_NDW + wmma_n_rep * WMMA_VECTOR_DWORDS
-                assert slot_width <= 128
-                reg = 256 + slot_idx * 128
+                regs = vgpr_layout.slots[slot_idx]
                 for wm in range_constexpr(wmma_m_rep):
-                    a[wm] = place_vgpr(a[wm], reg)
-                    reg += ACT_NDW
+                    a[wm] = place_vgpr(a[wm], regs[wm])
                 for wn in range_constexpr(wmma_n_rep):
-                    b[wn] = place_vgpr(b[wn], reg)
-                    reg += WMMA_VECTOR_DWORDS
-                assert reg <= 256 + (slot_idx + 1) * 128
-                # Scales remain free in v0-v255.
+                    b[wn] = place_vgpr(b[wn], regs[wmma_m_rep + wn])
+                # Scales stay with the allocator.
             return RmemSlot(
                 a=a,
                 b=b,
