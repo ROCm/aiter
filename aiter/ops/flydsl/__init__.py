@@ -194,6 +194,9 @@ _LAZY_IMPORTS = {
         ".kernels.minimax_m3_index_score_prefill",
         "alloc_score",
     ),
+    "flydsl_sparse_mla_fwd": (".sparse_mla", "flydsl_sparse_mla_fwd"),
+    "prepare_sparse_mla_order": (".sparse_mla", "prepare_sparse_mla_order"),
+    "order_sparse_mla_indices": (".sparse_mla", "order_sparse_mla_indices"),
 }
 
 __all__ = [
@@ -232,6 +235,7 @@ __all__ = [
     "flydsl_pa_mqa_logits_fp4_varqlen",
     "flydsl_preshuffle_gemm_a8",
     "flydsl_qk_norm_rope_quant",
+    "flydsl_sparse_mla_fwd",
     "gather_kv_b_proj_flydsl",
     "gather_kv_b_proj_flydsl_fp8_supported",
     "gather_kv_b_proj_flydsl_supported",
@@ -247,9 +251,11 @@ __all__ = [
     "minimax_m3_index_score_work_map",
     "minimax_m3_index_score_work_map_capacity",
     "minimax_m3_index_score_work_map_size",
+    "order_sparse_mla_indices",
     "pa_decode",
     "prepare_gemm_a16wfp4_weight",
     "prepare_pa_decode_plan",
+    "prepare_sparse_mla_order",
 ]
 
 _fused_moe_impl_path = "aiter.ops.flydsl.fused_moe_gfx942:run_flydsl_moe_gfx942_impl"
