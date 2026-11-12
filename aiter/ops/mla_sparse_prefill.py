@@ -770,8 +770,56 @@ def _mla_sparse_prefill_v41_fake(
     return torch.empty((t, h, 512), dtype=torch.bfloat16, device=q.device)
 
 
+# Routed below the backend pin, as `mla_sparse_prefill` is. `backend` picks
+# which implementation AITER runs -- a question the dispatcher settles before
+# the op begins. A provider has its own kernel, not a choice of AITER's, so a
+# contract carrying the pin would have it decline every call that passes one.
+#
+# Version 2: v1 was this signature WITH `backend` in it. A v1 provider was
+# built for fifteen arguments and a v2 call offers fourteen, so v1 is not
+# superseded -- the arity check rejecting it is the correct outcome.
+@_route(op="mla_sparse_prefill_v41", version=2)
+def _mla_sparse_prefill_v41_routed(
+    q: torch.Tensor,
+    q_scale: torch.Tensor,
+    unified_kv: torch.Tensor,
+    unified_kv_scale: torch.Tensor,
+    kv_indices_prefix: torch.Tensor,
+    kv_indptr_prefix: torch.Tensor,
+    kv: torch.Tensor,
+    kv_scale: torch.Tensor,
+    kv_indices_extend: torch.Tensor,
+    kv_indptr_extend: torch.Tensor,
+    attn_sink: torch.Tensor | None,
+    softmax_scale: float,
+    out: torch.Tensor | None = None,
+    num_kv_splits: int | None = None,
+) -> torch.Tensor:
+    """MLA v4.1 sparse prefill, below the backend pin.
+
+    Shapes and meanings are those of :func:`mla_sparse_prefill_v41`, minus its
+    ``backend`` argument. ``out`` is written when given and returned either
+    way, so a provider returns what it wrote.
+    """
+    return _opus_sparse_prefill_v41(
+        q,
+        q_scale,
+        unified_kv,
+        unified_kv_scale,
+        kv_indices_prefix,
+        kv_indptr_prefix,
+        kv,
+        kv_scale,
+        kv_indices_extend,
+        kv_indptr_extend,
+        attn_sink,
+        softmax_scale,
+        out,
+        num_kv_splits,
+    )
+
+
 @torch_compile_guard(mutates_args=["out"], gen_fake=_mla_sparse_prefill_v41_fake)
-@_route(op="mla_sparse_prefill_v41", version=1)
 def mla_sparse_prefill_v41(
     q: torch.Tensor,
     q_scale: torch.Tensor,
@@ -824,7 +872,7 @@ def mla_sparse_prefill_v41(
       ``out`` (``[T, H, 512]`` bf16).
     """
     _check_backend("mla_sparse_prefill_v41", backend, ("opus",))
-    return _opus_sparse_prefill_v41(
+    return _mla_sparse_prefill_v41_routed(
         q,
         q_scale,
         unified_kv,
