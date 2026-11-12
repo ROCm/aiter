@@ -248,6 +248,22 @@ def buf_copy_store(buffer, index, value, elem=fx.Int32, unit_elems=1, cache_modi
     )
 
 
+def torch_stream(stream):
+    """The torch stream for ``stream`` (None, a torch stream, an fx.Stream or a raw handle)."""
+    if stream is None:
+        return torch.cuda.current_stream()
+    if isinstance(stream, fx.Stream):
+        stream = 0 if stream.value is None else stream.value
+    if isinstance(stream, int):
+        # ExternalStream(0) would take a new pool stream instead of the null stream the kernel runs on.
+        return (
+            torch.cuda.default_stream()
+            if stream == 0
+            else torch.cuda.ExternalStream(stream)
+        )
+    return stream
+
+
 @lru_cache(maxsize=8)
 def wave_size_of(device_index: int | None = None) -> int:
     """Wave width of the GPU a kernel will dispatch on.

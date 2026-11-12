@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright (c) 2026 FlyDSL Project Contributors
-"""Weight binding contract shared by MegaMoEV2 and its small- and large-input runtimes."""
+"""Weight-binding and forward-input contracts shared by MegaMoEV2 and its small- and large-input runtimes."""
 
 import torch
 
@@ -44,3 +44,27 @@ def check_bindable(weights, spec):
                 f"bind_weights: {name} is {got[0]} {got[1]} on {got[2]}; "
                 f"the instance was built for {expected[0]} {expected[1]} on {expected[2]}"
             )
+
+
+def check_forward_inputs(x_bf16, wts, topk_ids, *, max_rows, model_dim, topk, device):
+    """Return the row count of one rank's forward inputs; raise unless they are
+    contiguous bf16 [rows, model_dim] and float32 / int32 [rows, topk] on ``device``
+    with rows <= ``max_rows``."""
+    rows = int(x_bf16.shape[0])
+    if rows > max_rows:
+        raise ValueError(f"run_tokens={rows} > max_tok_per_rank={max_rows}")
+    for name, tensor, dtype, shape in (
+        ("x_bf16", x_bf16, torch.bfloat16, (rows, model_dim)),
+        ("wts", wts, torch.float32, (rows, topk)),
+        ("topk_ids", topk_ids, torch.int32, (rows, topk)),
+    ):
+        if tensor.dtype != dtype or not tensor.is_contiguous():
+            raise ValueError(
+                f"{name} must be contiguous {str(dtype).removeprefix('torch.')}"
+            )
+        if tuple(tensor.shape) != shape:
+            raise ValueError(f"{name} must have shape {shape}")
+        if tensor.device != device:
+            # A rank that faults on a foreign pointer would leave its peers waiting.
+            raise ValueError(f"x_bf16, wts and topk_ids must be on {device}")
+    return rows

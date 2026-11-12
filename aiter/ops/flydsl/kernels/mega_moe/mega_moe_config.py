@@ -2,12 +2,11 @@
 # Copyright (c) 2025 FlyDSL Project Contributors
 """Static MegaMoEV2 configuration rules for MI355X."""
 
+import os
 from bisect import bisect_left
 from collections.abc import Callable
 from dataclasses import dataclass, replace
 from functools import cache
-
-from . import envs
 
 TOKEN_BUCKETS = (
     1,
@@ -29,9 +28,14 @@ TOKEN_BUCKETS = (
 )
 FIXED_GRID_MULT_VALUES = (1, 2, 3, 4, 6, 8, 12, 16, 24, 32)
 P2P_FP8_MIN_MTPR = 1024
-# Fixed-slot (direct expert slots, no count exchange) is the default up to MTPR
-# 128; AITER_MEGA_FIXED_SLOT_MAX_MTPR extends it (see envs.py).
-FIXED_SLOT_MAX_MTPR = envs.AITER_MEGA_FIXED_SLOT_MAX_MTPR
+# Largest MTPR dispatched fixed-slot (direct expert slots, no count exchange):
+# the MTPR classes up to 128 by default; larger ones take the compact dispatch.
+# AITER_MEGA_FIXED_SLOT_MAX_MTPR raises it: 511 / 1023 / 2047 admit the 256 /
+# 512 / 1024-token capacities, validated on the EP8 V4-Pro layout. Serving
+# recipes set it (the SGLang and ATOM DeepSeek-V4 recipes) and vLLM's
+# DeepSeek-V4 MegaMoE reads FIXED_SLOT_MAX_MTPR, so it stays a public knob.
+# Read once, at import.
+FIXED_SLOT_MAX_MTPR = int(os.environ.get("AITER_MEGA_FIXED_SLOT_MAX_MTPR", "255"))
 MAX_MTPR_CLASS = 32768
 # Source-indexed payload storage cuts the maximum-capacity activation buffer by
 # roughly ``topk``, so every rank at the max-capacity MTPR class uses it
@@ -48,6 +52,18 @@ KIMI_K3_EXPERTS_PER_RANK = 112
 # are tuned in their own right.
 R1_MODEL_DIM, R1_INTER_DIM = 7168, 2048
 V4_MODEL_DIM, V4_INTER_DIM = 7168, 3072
+# EP4 / EP2 DeepSeek-V4.1-Flash: (world_size, experts_per_rank, model_dim, inter_dim).
+V41_FLASH_EP4_LAYOUT = (4, 96, 5120, 2304)
+V41_FLASH_EP2_LAYOUT = (2, 192, 5120, 2304)
+# (world_size, model_dim, inter_dim, experts, topk) of the layouts the fused (small- and large-input) kernels
+# serve: EP8 DeepSeek-V4-Pro and EP4 / EP2 DeepSeek-V4.1-Flash.
+FUSED_LAYOUTS = frozenset(
+    {
+        (8, V4_MODEL_DIM, V4_INTER_DIM, 8 * REFERENCE_EXPERTS_PER_RANK, 6),
+        (4, 5120, 2304, 4 * 96, 6),
+        (2, 5120, 2304, 2 * 192, 6),
+    }
+)
 K3_MODEL_DIM, K3_INTER_DIM = 3584, 3072
 # EPLB redundant-expert profiles (r32 / r64) share V4-Pro's shape and FP4
 # prelude but have no per-bucket tuner of their own.
@@ -58,6 +74,30 @@ V4_EPLB_EXPERTS_PER_RANKS = (52, 56)
 MAX_FANOUT_SEGMENTS = 1024
 MAX_FANOUT_EXPERTS_PER_RANK = 256
 P2P_QUANT_AUTO = "auto"
+# Execution routes of one MegaMoEV2 instance. Every EP rank must take the same
+# route for a call, so a route is chosen from EP-wide inputs only (the plan and
+# the call's max_tokens), never from a rank's own row count.
+ROUTE_STAGED = "staged"
+ROUTE_SMALL_M = "small_m"
+ROUTE_LARGE_M = "large_m"
+# Single-kernel small-input runtimes: power-of-two capacities up to this bound.
+SMALL_M_MAX_MTPR = 512
+DEFAULT_SMALL_M_MTPRS = (256, 512)
+# Instance capacities the large-input persistent kernel is built for. At 32768
+# the staged path stays: it is faster there (large-input E2E +11.7% at 32768
+# uniform tokens) and its source-indexed payload needs 1.75 GiB per GPU where
+# the large-input route-major payload needs 10.5 GiB.
+LARGE_M_MTPRS = (1024, 2048, 4096, 8192, 16384)
+# EP4 DeepSeek-V4.1-Flash takes its large-input tune at 8192 and 16384 only: on gfx950 the kernel faults
+# (illegal memory access) at 1024, 2048 and 4096.
+V41_FLASH_EP4_LARGE_M_MTPRS = (8192, 16384)
+# EP2 DeepSeek-V4.1-Flash takes its large-input tune at the capacities it was measured at.
+V41_FLASH_EP2_LARGE_M_MTPRS = (8192, 16384)
+# The fused kernels have no 2-token variant: 2 tokens take the 1-token config.
+FUSED_TOKEN_BUCKETS = tuple(b for b in TOKEN_BUCKETS if b != 2)
+# Below this many rows per rank the staged (or small-input) path is faster than
+# the large-input kernel, whose geometry is fixed by its capacity.
+LARGE_M_MIN_TOKENS = SMALL_M_MAX_MTPR + 1
 P2P_QUANT_NONE = "none"
 P2P_QUANT_FP8_BLOCKWISE = "fp8_blockwise_1x32"
 SUPPORTED_P2P_QUANT_MODES = (P2P_QUANT_NONE, P2P_QUANT_FP8_BLOCKWISE)
@@ -130,10 +170,195 @@ class Stage2Config:
 
 
 @dataclass(frozen=True, slots=True)
+class FusedStage1Knobs:
+    """Dispatch / plan / GEMM1 knobs only the fused (small- and large-input) kernels read.
+
+    All off is the EP8 DeepSeek-V4-Pro kernel; the EP4 DeepSeek-V4.1-Flash
+    tune (_tune_v41_flash_ep4) turns them on. The protocol knobs (dedup_rows,
+    plan_local, direct_done, tok_done) change what the ranks of a launch
+    exchange: every rank of a launch must agree on them, so they are set per
+    layout, never per token bucket.
+    """
+
+    # Large-input dispatch: at least this many payload producers per destination (0: one per row chunk).
+    payload_min_blocks: int = 0
+    # With payload_min_blocks: a rank with at most payload_small_tokens tokens gives each destination at least
+    # payload_small_blocks producers instead (0: off).
+    payload_small_blocks: int = 0
+    payload_small_tokens: int = 0
+    # One dispatch row per (token, destination rank) instead of per route; GEMM1 reads A through the srcmap.
+    # Every rank of a launch must agree.
+    dedup_rows: bool = False
+    # Small-input fused kernel: every CTA waits on the plan flag itself and invalidates only its L1, instead of one
+    # CTA an XCD acquiring and republishing the flag. No CTA reads the plan, srcmap or token rows before the flag, so
+    # its XCD's L2 holds none of their lines (the launch's acquire dropped the earlier ones).
+    plan_direct: bool = False
+    # Small-input fused kernel: the plan CTA writes the plan through to memory, so it publishes the flag without an L2
+    # writeback first.
+    plan_wt: bool = False
+    # Small-input fused kernel: every CTA waits for the sources itself and builds the plan from the expert counts
+    # in its LDS; GEMM1 takes its tiles from there, and only GEMM2 reads the plan CTA's metadata.
+    plan_local: bool = False
+    # Small-input fused kernel: GEMM2 moves its dispatch-table pointers into SGPRs, so its buffer loads need no
+    # readfirstlane waterfall loop.
+    g2_uniform: bool = False
+    # Small-input fused kernel: the dispatch-table and remote pointers of the head (producers, plan finalize,
+    # kernel entry) in SGPRs, for the same reason.
+    head_uniform: bool = False
+    # Small-input fused kernel: the GEMM2 scatter epilogue reads its rows' ids / weights from LDS once into lanes and
+    # picks them with readlane, instead of an LDS round trip and readfirstlane per row (2: the peer bases too).
+    g2_epi_lean: int = 0
+    # Small-input GEMM1: K-steps its W1 / W1-scale loads are issued ahead of their MFMAs.
+    g1_lookahead: int = 1
+    # Small-input GEMM1: K-steps its A rows are loaded ahead of their MFMAs (2: through registers, see do_tile_la).
+    g1_a_ahead: int = 1
+    # Small-input fused kernel: when a rank's routes need at most this many producers, each of them adds its share of
+    # the source flag to every destination itself after its own drain, instead of the last of all producers storing
+    # it behind a rank-local done counter (0: off; at most mega_moe_small_m._DIRECT_DONE_INC).
+    direct_done: int = 0
+    # Small-input fused kernel: each GEMM2 scatter wave drains its rows and adds one to their tokens' counters on
+    # the destination, whose combine reduces a token once its counter reaches valid routes x GEMM2 n-blocks instead
+    # of after every rank's grid ticket and flag (BF16 rows; the flags stay as the fallback).
+    tok_done: bool = False
+    # Small-input fused kernel: the runtime keeps per-token GEMM2 completion counters (two parity halves): the
+    # tok_done buckets add to them and every launch clears the previous launch's half. Every bucket of a layout
+    # must agree, since a tok_done launch may follow any other.
+    tok_counters: bool = False
+    # Small-input fused kernel: the GEMM2 rows of the first this-many tokens of a destination are BF16 even when
+    # the rank sends FP8 rows, and the combine reduces them as BF16 and leaves them poisoned. Sender and combine
+    # must agree, so every bucket of a layout sets the same value.
+    bf16_head_tokens: int = 0
+    # Large-input GEMM1: m-tiles with at most this many real rows (an expert's padded tail) run a
+    # short_tail_rows-row tile (0: every m-tile runs sort_block_m rows).
+    short_tail_rows: int = 0
+    # With short_tail_rows: a tail tile with at most fold_tail real rows folds into its expert's preceding
+    # m-tile, which then runs sort_block_m + fold_tail rows and reads the W1 slab once for both (0: off).
+    fold_tail: int = 0
+    # With fold_tail: an expert's last m-tile with more than short_tail_rows real rows and at most mid_tail_rows
+    # runs a mid_tail_rows-row tile (0: off).
+    mid_tail_rows: int = 0
+    # Large-input plan: every wave of the plan CTA plans a slice of the local experts (False: one wave plans all).
+    parallel_plan: bool = False
+    # GEMM1 epilogue: output columns per lane in the quantize/store pass (2 or 8).
+    epi_evec: int = 2
+    # Large-input dispatch: a payload chunk issues one system release before its tile-ready and chunk_done RMWs
+    # (False: a second one before chunk_done).
+    merge_release: bool = False
+    # Large-input dispatch: an expert's last payload chunk does not publish payload_ready (no reader).
+    skip_payload_ready: bool = False
+    # Large-input GEMM1 with dedup_rows: one wave issues the acquire once the tile's row stamps landed, then
+    # a barrier (False: every wave acquires).
+    one_row_acquire: bool = False
+    # Large-input dispatch with merge_release: a payload chunk publishes its tiles without a system release; its
+    # peer stores go to the uncached symmetric heap and are drained first (False: one L2 writeback per chunk).
+    no_chunk_release: bool = False
+    # Large-input GEMM1 K-loop reads its A operands through inline asm, so the step's first read does not wait for
+    # the next step's A copy (False: the compiler makes it wait).
+    a_asm_reads: bool = False
+    # Large-input dispatch with dedup_rows: a payload chunk resolves its routes one per thread, then its waves copy
+    # the sent token rows with all loads ahead of the stores (False: one route per wave in turn).
+    batch_rows: bool = False
+    # Large-input parallel plan: the plan CTA's warp 1 sizes the payload geometry (read by the producers only, after
+    # pair_ready) next to the count exchange instead of before it, only warp 0 fences around the barriers every wave
+    # passes, and each wave loads its slice's counts and the peers' row-base pointers with the prefix counts.
+    lean_plan: bool = False
+    # Large-input lean parallel plan: a source writes each count word to its destination with this launch's tag in
+    # the high half, and every plan wave spins on the words it reads (False: count_done flags + a barrier).
+    tag_counts: bool = False
+    # Large-input dispatch with batch_rows: the token-scale reads (presend and payload copy) are bounded by the scale
+    # buffer, so the lanes past a row's scales read nothing (False: their masked loads read 2 GiB past the buffer,
+    # which faults where nothing is mapped there: EP2 at every token count).
+    bounded_scales: bool = False
+    # Large-input dispatch with batch_rows: a route's histogram RMW result is its slot in a fixed-size per-expert
+    # bucket of the pair order, so the order is complete with the histogram (False: prefix + a cursor RMW pass).
+    bucket_pairs: bool = False
+    # Large-input dispatch with bucket_pairs: the payload producers count their routes before the launch gate, next to
+    # the owner's launch handshake (only the group_done RMW stays after it).
+    early_hist: bool = False
+    # Large-input dispatch: a payload producer reads the destination's rows per tile before the plan wait and its
+    # ready-order flag once after it (not in every chunk publish).
+    peer_hoist: bool = False
+    # Large-input launch: the owner clears its rank-local counters between sending and awaiting the launch handshake.
+    early_clear: bool = False
+    # Large-input dispatch with batch_rows: before the plan, the consumer CTAs send the token rows whose lowest expert
+    # at a destination is one of its first presend_experts local experts (the first payload round), so that round's
+    # tasks only send route headers (0: off).
+    presend_experts: int = 0
+    # With presend_experts: the presend covers presend_rows // tokens-on-this-rank experts instead (at least
+    # presend_experts, at most 64), so the first round's rows stay about constant as the rows per expert grow (0: off).
+    presend_rows: int = 0
+    # GEMM1 A scales staged to LDS in K-loop order: lane l's packed scale word of row group g at K-step s is one
+    # dword, so a K-step reads one ds_read_b32 per group (False: four ds_read_u8 per group, packed in VALU).
+    ascale_packed: bool = False
+    # GEMM1 epilogue (epi_evec 8): the quantize/store pass without serial waits. Its lane offsets come from
+    # the tile, so they are not hoisted out of the persistent loop and reloaded from scratch between the output stores
+    # (each reload's vmcnt(0) waits for the stores before it); all rows' LDS reads go first; the 4-lane max uses DPP.
+    # Bit 1: SiLU as v_exp_f32 + v_rcp_f32 (no IEEE divide, no exp2 range fix).
+    epi_lean: int = 0
+    # Small-input fused kernel: the GEMM bodies stream their weights at any routed-row count; only a hot expert
+    # (skewed routing) picks the cached-weight bodies (False: also from mega_moe_small_m._CACHED_W_MIN_ROWS routed
+    # rows, where the experts span enough m-tiles to reuse their weights).
+    stream_w: bool = False
+
+
+@dataclass(frozen=True, slots=True)
+class FusedStage2Knobs:
+    """GEMM2 / combine knobs only the fused kernels read (all off: the EP8 kernels)."""
+
+    # Large-input fused kernel: the GEMM2 units are dealt to the 8 XCDs in chunks of this many; a CTA claims from
+    # its own XCD's counter, then from the next XCDs' once that one is spent (0: one claim counter per work shard).
+    xcd_chunk: int = 0
+    # Large-input fused kernel: P2P row stride rounded up to this many bytes (0: unrounded).
+    row_align: int = 0
+    # Large-input fused kernel: stage the FP8 row scales rank-locally; the m-block's closing unit sends
+    # each row's scales as whole lines (needs row_align to leave the scale lines to the row).
+    scale_stage: bool = False
+    # Large-input fused kernel: every GEMM2 K-step issues its A copy, so its MFMAs no longer wait for it.
+    a_dma_uniform: bool = False
+    # Large-input fused kernel: drop a GEMM2 unit whose m-block is all padding at its claim (needs parallel_plan).
+    skip_pad: bool = False
+    # Large-input fused kernel: the GEMM2 epilogue's per-row chain skips most LDS round trips (readlane row ids and
+    # weights, DPP scale max, branch-free staged scale store).
+    epi_lean: bool = False
+    # Large-input fused kernel: each Combine wave starts its token once that token's rows arrived (per-token
+    # counts, cleared at launch) instead of after a generation barrier over every rank's GEMM2.
+    comb_tok_wait: bool = False
+    # Large-input fused kernel (with xcd_chunk): GEMM2 claims walk groups of this many m-blocks, all n-blocks of a
+    # group before the next, instead of one n-block over every m-block.
+    m_group: int = 0
+    # Large-input fused kernel (with m_group): one CTA in early_k leaves GEMM1 for GEMM2 once its claims pass
+    # early_p/16 of the GEMM1 work. Small-input kernel: the same, per XCD slice of the GEMM1 work.
+    early_k: int = 0
+    early_p: int = 8
+    # Large-input fused kernel (with early_k and a Stage1 mid_tail_rows): when the rank's tokens give its experts at
+    # most mid_tail_rows rows on average, the early CTAs leave after early_p_mid/16 instead (0: off).
+    early_p_mid: int = 0
+    # With early_k: pick the early CTAs (and every CTA's GEMM1 claim shard) by workgroup id, so each XCD has the same
+    # number of early CTAs and both sets cover every shard (False: by arrival ticket).
+    early_xcd: bool = False
+    # Large-input fused kernel (BM64 1-stage, with a_dma_uniform): a GEMM2 unit copies its m-block's A scales for
+    # every K-step into LDS once (LDS DMA past the A slots); the K-steps read them from LDS, not 2 loads per wave.
+    ascale_lds: bool = False
+    # Large-input fused kernel (BM64, with skip_pad, ascale_lds, scale_stage and an equal Stage1 fold_tail): a GEMM2
+    # unit whose next m-block is its expert's tail of at most fold_tail rows also runs those rows (80-row unit, one
+    # more MFMA row group and a 16-row epilogue pass); the tail's own units are dropped at their claim (0: off).
+    fold_tail: int = 0
+    # Large-input fused kernel (with fold_tail, cached W2): a GEMM2 unit whose m-block (with its folded tail) is its
+    # expert's only one streams its W2 slab (nt), as no other m-block rereads it from L2.
+    nt_single: bool = False
+    # Large-input fused kernel (with epi_lean): the P2P rows carry offset int8 (u8 = q + 128) with the same E8M0
+    # scale per 32 values instead of E4M3: same bytes, about half the transport rounding error.
+    route_i8: bool = False
+
+
+@dataclass(frozen=True, slots=True)
 class MegaMoEConfig:
     stage1: Stage1Config
     stage2: Stage2Config
     p2p_quant: str
+    # Fused-kernel knobs (small- and large-input routes only; the staged kernels never read them).
+    fused_stage1: FusedStage1Knobs = FusedStage1Knobs()
+    fused_stage2: FusedStage2Knobs = FusedStage2Knobs()
 
     def __post_init__(self):
         sbm = self.stage1.sort_block_m
@@ -182,6 +407,27 @@ class MegaMoEBundlePlan:
     entries: tuple[MegaMoEBundleEntry, ...]
     stage1_variants: tuple[Stage1Config, ...]
     stage2_variants: tuple[Stage2BundleKey, ...]
+    # Fused routes this instance builds: small-input capacities and the large-input kernel.
+    small_m_mtprs: tuple[int, ...] = ()
+    large_m: bool = False
+
+    def route_for(
+        self, max_tokens: int, *, small_m: bool = True, large_m: bool = True
+    ) -> tuple[str, int]:
+        """(route, capacity) of a call whose largest EP rank has ``max_tokens`` rows.
+
+        Every rank passes the same ``max_tokens``, so every rank takes the same
+        route. ``small_m`` / ``large_m`` exclude a route the caller cannot use.
+        """
+        if not 0 <= max_tokens <= self.mtpr:
+            raise ValueError(f"max_tokens={max_tokens} must be in [0, {self.mtpr}]")
+        if small_m:
+            for capacity in self.small_m_mtprs:
+                if max_tokens <= capacity:
+                    return ROUTE_SMALL_M, capacity
+        if large_m and self.large_m and max_tokens >= LARGE_M_MIN_TOKENS:
+            return ROUTE_LARGE_M, self.mtpr
+        return ROUTE_STAGED, self.mtpr
 
     def entry_for_tokens(self, tokens: int) -> MegaMoEBundleEntry:
         if tokens < 0 or tokens > self.mtpr:
@@ -198,15 +444,80 @@ class MegaMoEBundlePlan:
         )
 
 
-def nearest_token_bucket(tokens: int) -> int:
+def fused_layout_supported(
+    *,
+    arch: str,
+    world_size: int,
+    model_dim: int,
+    inter_dim: int,
+    experts: int,
+    topk: int,
+    quant: str,
+    swiglu_limit: float,
+    act: str = "silu",
+    fanout_masks: tuple[int, ...] = (),
+) -> bool:
+    """Whether the fused kernels support this layout: one of FUSED_LAYOUTS, a8w4 on gfx950.
+
+    The small-input kernel serves every such layout; the large-input kernel the
+    capacities large_m_mtprs_for() gives it.
+    """
+    return (
+        arch.split(":", 1)[0] == "gfx950"
+        and (world_size, model_dim, inter_dim, experts, topk) in FUSED_LAYOUTS
+        and quant == "a8w4"
+        and swiglu_limit == 10.0
+        and act == "silu"
+        and not fanout_masks
+    )
+
+
+def large_m_mtprs_for(
+    *, world_size: int, model_dim: int, inter_dim: int
+) -> tuple[int, ...]:
+    """Instance capacities the large-input kernel is built for on a FUSED_LAYOUTS layout.
+
+    EP8 DeepSeek-V4-Pro takes LARGE_M_MTPRS; EP4 DeepSeek-V4.1-Flash takes V41_FLASH_EP4_LARGE_M_MTPRS, the
+    capacities its one tune was measured at (see _tune_v41_flash_ep4_large).
+    """
+    if (world_size, model_dim, inter_dim) == (4, 5120, 2304):
+        return V41_FLASH_EP4_LARGE_M_MTPRS
+    if (world_size, model_dim, inter_dim) == (2, 5120, 2304):
+        return V41_FLASH_EP2_LARGE_M_MTPRS
+    return LARGE_M_MTPRS
+
+
+def small_m_cu_supported(num_cu: int) -> bool:
+    """The small-input kernel splits its work over 8 XCDs by XCC id (256-CU parts)."""
+    return num_cu == 256
+
+
+def small_m_mtprs_for(mtpr: int, mtprs=DEFAULT_SMALL_M_MTPRS) -> tuple[int, ...]:
+    """Small-input capacities an instance of capacity ``mtpr`` can reach.
+
+    A call picks the smallest capacity >= its max_tokens, so capacities above
+    the first one that covers ``mtpr`` are never used.
+    """
+    mtprs = sorted({int(m) for m in mtprs})
+    for m in mtprs:
+        if m <= 0 or m & (m - 1) or m > SMALL_M_MAX_MTPR:
+            raise ValueError(
+                f"small_m_mtprs: {m} must be a power of two <= {SMALL_M_MAX_MTPR}"
+            )
+    reachable = [m for m in mtprs if m < mtpr]
+    reachable += [m for m in mtprs if m >= mtpr][:1]
+    return tuple(reachable)
+
+
+def nearest_token_bucket(tokens: int, buckets=TOKEN_BUCKETS) -> int:
     if tokens <= 0:
         raise ValueError(f"tokens must be positive, got {tokens}")
-    index = bisect_left(TOKEN_BUCKETS, tokens)
+    index = bisect_left(buckets, tokens)
     if index == 0:
-        return TOKEN_BUCKETS[0]
-    if index == len(TOKEN_BUCKETS):
-        return TOKEN_BUCKETS[-1]
-    lower, upper = TOKEN_BUCKETS[index - 1], TOKEN_BUCKETS[index]
+        return buckets[0]
+    if index == len(buckets):
+        return buckets[-1]
+    lower, upper = buckets[index - 1], buckets[index]
     return upper if upper - tokens <= tokens - lower else lower
 
 
@@ -1045,10 +1356,20 @@ def build_mega_moe_bundle_plan(
     model_dim: int = 7168,
     inter_dim: int = 3072,
     world_size: int = 8,
+    small_m_mtprs: tuple[int, ...] = (),
+    large_m: bool = False,
 ) -> MegaMoEBundlePlan:
-    """Deduplicate variants while keeping Stage1/Stage2 selection atomic."""
+    """Deduplicate variants while keeping Stage1/Stage2 selection atomic.
+
+    ``small_m_mtprs`` / ``large_m`` add the fused routes; the caller has checked
+    the layout supports them (:func:`fused_layout_supported`).
+    """
     if mtpr <= 0 or mtpr & (mtpr - 1):
         raise ValueError(f"mtpr={mtpr} must be a positive power of two")
+    if large_m and mtpr not in LARGE_M_MTPRS:
+        raise ValueError(
+            f"the large-input kernel supports mtpr in {LARGE_M_MTPRS}, got {mtpr}"
+        )
     buckets = tuple(bucket for bucket in TOKEN_BUCKETS if bucket <= mtpr)
     if not buckets or buckets[-1] != mtpr:
         raise ValueError(f"mtpr={mtpr} has no exact token bucket")
@@ -1100,4 +1421,365 @@ def build_mega_moe_bundle_plan(
         entries=tuple(entries),
         stage1_variants=tuple(stage1_variants),
         stage2_variants=tuple(stage2_variants),
+        small_m_mtprs=small_m_mtprs_for(mtpr, small_m_mtprs) if small_m_mtprs else (),
+        large_m=large_m,
+    )
+
+
+# Small- and large-input (fused) routes. Their kernels take the same config
+# types as the staged path, tuned on their own for the one layout they support
+# (fused_layout_supported): the small-input kernel per token bucket, the
+# large-input kernel one config per capacity.
+
+# Small-input token bucket from which the expert m-tile is 64 rows: at ~35+
+# rows per expert a 32-row tile splits every expert in two and streams its
+# weights twice.
+SMALL_M_BM64_MIN_BUCKET = 256
+
+
+def _small_m_stage1(bucket: int, expert_waves: int = 1) -> Stage1Config:
+    grid_mult = max(1, bucket // 4) if bucket <= 16 else 3
+    return Stage1Config(
+        sort_block_m=64 if bucket >= SMALL_M_BM64_MIN_BUCKET else 32,
+        tile_n=256 if bucket <= 8 else 128,
+        num_waves=4,
+        grid_mult=grid_mult,
+        # A layout with more than 64 experts a rank gives every 64-expert wave its own producers.
+        num_dispatch_cu=min(224, _fixed_dispatch_cu(bucket) * expert_waves),
+        mfma_amajor=False,
+        async_a_copy=False,
+        use_tile_resource=bucket <= 16,
+        b_nt=0 if bucket == 1 else 3,
+        waves_per_eu_hint=1 if bucket == 16 else 2,
+    )
+
+
+def _small_m_stage2(bucket: int) -> Stage2Config:
+    # GEMM2 runs in the kernel's own grid (never persistent) with NT B loads.
+    return Stage2Config(
+        block_m=64 if bucket >= SMALL_M_BM64_MIN_BUCKET else 32,
+        block_n=256 if bucket in (1, 4, 64) or bucket >= 128 else 128,
+        persist=False,
+        persist_cu=0,
+        use_nt=True,
+        persist_strided=bucket == 512,
+    )
+
+
+def _large_m_config(expert_waves: int = 1) -> MegaMoEConfig:
+    stage1 = Stage1Config(
+        sort_block_m=128,
+        tile_n=512,
+        num_waves=8,
+        grid_mult=1,
+        num_dispatch_cu=96 * expert_waves,
+        mfma_amajor=True,
+        async_a_copy=True,
+        use_tile_resource=True,
+        b_nt=0,
+        work_shards=4,
+        payload_chunk_rows=384,
+    )
+    stage2 = Stage2Config(
+        block_m=64,
+        block_n=256,
+        persist=True,
+        persist_cu=240,
+        use_nt=False,
+        skew_cu=96,
+    )
+    return MegaMoEConfig(stage1=stage1, stage2=stage2, p2p_quant="fp8_blockwise_1x32")
+
+
+def _tune_v41_flash_ep4_small(config: MegaMoEConfig, bucket: int) -> MegaMoEConfig:
+    """EP4 DeepSeek-V4.1-Flash small-input kernel (96 experts per rank), measured on gfx950."""
+    # One dispatch row per (token, destination) instead of per route: the XGMI-bound dispatch sends ~45% fewer
+    # rows (-3% at 128 tokens, -6% at 512, neutral at 1-32). The plan reaches every CTA in one hop: the plan CTA
+    # writes it through to memory and publishes the flag without an L2 writeback, and each CTA waits on the flag
+    # itself instead of behind its XCD's acquire and republish (-1.8% at 1 token, neutral at 8-512). Every CTA
+    # builds the plan from the expert counts itself once the sources are done, so GEMM1 starts without the plan
+    # CTA's metadata stores and flag hop, and takes its tile metadata from LDS (-3% at 1 token, -2% at 8, -1.2% at
+    # 32, -0.3..-0.6% at 128-512); the counters' reset point moves to the combine. With at most 8 route-carrying
+    # producers (1-2 tokens), each one adds its share of the source flag to every destination after its own
+    # drain, skipping the last-producer counter hop (-1.5% at 1 token, -1% at 2, neutral at 16; 24 producers at 16
+    # tokens: +1.3%). These change what the ranks of a launch exchange, and the ranks of a launch may pick
+    # different buckets: every bucket sets them, as it sets the runtime's per-token counters (used by the
+    # tok_done buckets, cleared by every launch) and the BF16 rows of the first tokens (sender and combine agree).
+    stage1 = replace(
+        config.fused_stage1,
+        dedup_rows=True,
+        plan_direct=True,
+        plan_wt=True,
+        plan_local=True,
+        direct_done=8,
+        tok_counters=True,
+        bf16_head_tokens=4,
+        # GEMM2 keeps the pointers it reads from the dispatch table in SGPRs: every load of its K-loop sat in a
+        # waterfall loop (-1.6..-2.4% at 1-32 tokens, where the GEMM2 K-loop is latency-bound; -0.7..-0.1% at
+        # 64-128). The 64-row tiles of 256-512 tokens spill with it (+5..+7%).
+        g2_uniform=bucket <= 128,
+    )
+    if bucket <= 4:
+        # GEMM1 runs one round of tiles, so its epilogue is on the critical path: the large-input lean epilogue
+        # (8 columns a lane, no serial store waits, fast SiLU) cuts 3% at 1 and 4 tokens (neutral at 8-16).
+        # The combine takes a token once its routes' GEMM2 rows are counted on it, not after every rank's last CTA
+        # publishes its flag: the ticket -> flag -> reduce hops leave the tail (-3% at 1 token, -2.2% at 2 and 4
+        # with the lane-fed scatter it needs; +0.8% at 8, +1.6% at 16, +2.9% at 128 from the per-unit drains).
+        stage1 = replace(stage1, epi_evec=8, epi_lean=3, g2_epi_lean=2, tok_done=True)
+    config = replace(config, fused_stage1=stage1)
+    if bucket == 1:
+        # Streaming GEMM1 weight loads, as the larger buckets (-8%). Head pointers in SGPRs: 160 -> 17 waterfall
+        # loops, 244 -> 217 VGPR (-2%; neutral at 4-128 tokens, +4% at 256-512). GEMM2 scatter rows take their ids,
+        # weights and peer bases from lanes (-1.1%; -0.7% at 4 tokens, neutral at 16-128). GEMM1 loads a K-step's A
+        # rows two steps ahead into registers and W1 two steps ahead in a fully unrolled K-loop, one wave a SIMD
+        # (-2.4%; either alone, or W1 ahead in the rolled loop, is slower).
+        return replace(
+            config,
+            stage1=replace(config.stage1, b_nt=3, waves_per_eu_hint=1),
+            fused_stage1=replace(
+                stage1, head_uniform=True, g1_a_ahead=2, g1_lookahead=2
+            ),
+        )
+    if bucket == 16:
+        # Half the GEMM1 n-tiles (tile_n 256, -3.5%) and GEMM2 block_n 256 (-3%): longer weight slabs per tile.
+        return replace(
+            config,
+            stage1=replace(config.stage1, tile_n=256),
+            stage2=replace(config.stage2, block_n=256),
+        )
+    if bucket == 128:
+        # Half the GEMM1 n-tiles of tile_n 128: each streams a longer W1 slab (-4%).
+        return replace(config, stage1=replace(config.stage1, tile_n=256))
+    if bucket == 512:
+        # Half the CTAs leave GEMM1 for GEMM2 after a claim past half their XCD's GEMM1 slice: the XGMI-bound
+        # GEMM2 scatter starts while GEMM1 still runs (-2.7%; a quarter: +1.1%, neutral to +1.2% at 128 tokens).
+        return replace(
+            config, fused_stage2=replace(config.fused_stage2, early_k=2, early_p=8)
+        )
+    return config
+
+
+def _tune_v41_flash_ep4_large(config: MegaMoEConfig) -> MegaMoEConfig:
+    """EP4 DeepSeek-V4.1-Flash large-input kernel (96 experts per rank), measured on gfx950 at MTPR 8192.
+
+    It serves 8192 and 16384 (V41_FLASH_EP4_LARGE_M_MTPRS) unchanged: the thresholds below are rows a rank of the launch
+    (payload_small_tokens, presend_rows, the early_p_mid bound) and the payload geometry is sized by the plan, so a
+    launch of N rows runs the same schedule at any capacity >= N. The capacity only sizes buffers (pair-order
+    buckets, row stamps, P2P rows), all inside the 32-bit buffer offsets up to 16384 (LargeMRuntime checks them).
+    At 1024, 2048 and 4096 the kernel faults with an illegal memory access on gfx950, so those stay staged.
+    """
+    # One payload producer per destination leaves its ~16 MB a ~750 us copy at 2048 tokens a rank;
+    # 12 split the destination's experts (-24%). XCD-affine GEMM2 claims share each W2 slab in one
+    # XCD's L2 across the expert's m-blocks (-5%). 128-byte P2P rows keep each GEMM2 scatter store
+    # off the cache lines its neighbouring rows' stores touch (-1%). An expert just past 128 rows pads a
+    # second m-tile that is mostly padding; it runs 32 rows instead of 128 (-6%). Row scales leave once per
+    # row as whole lines from the m-block's last n-block, not as ten 16-byte partial-line writes (-2.5%).
+    # A tail of at most 16 rows rides on its expert's previous m-tile, sharing its W1 reads (-1.2%; 32
+    # rows spill the K-loop). All waves of the plan CTA plan the 96 experts, not one (-1.4%), and write
+    # each expert's padding rows together (-1%). The GEMM1 epilogue quantizes 8 columns a lane and stores
+    # them as one 8-byte write (-1.4%). A token row goes to each destination once, from the route to its
+    # lowest expert there (sent first), and GEMM1 waits for the row's arrival stamp (-2.8%). A payload
+    # chunk's chunk_done RMW reuses its tile-ready release (-1.8%), and an expert's last chunk skips the
+    # unread payload_ready release and RMW (-1.9%). One wave, not every wave, invalidates the caches once a
+    # GEMM1 tile's rows landed (-1.1%). A chunk's drained peer stores (uncached heap) need no release before its
+    # tile-ready RMW (-1.7%). GEMM1 reads its A operands in inline asm, so a K-step's first read does not wait for
+    # the next step's A copy, which the compiler cannot tell from this step's buffer (-1.5%). GEMM2 drops an
+    # all-padding m-block at its claim instead of after its GEMM1 tile, and issues its A copy on every K-step so
+    # the MFMAs do not wait for the copy two steps ahead (-1.4% together). A payload chunk resolves its routes one
+    # per thread and copies the sent rows with their loads ahead of the stores, so 8 producers a destination
+    # keep up and the other 16 CTAs run GEMM1 from the start (-1.3%; 8 with the row-at-a-time copy: +1.1%).
+    # The plan sizes the payload geometry off its serial path, fences once instead of in every wave, and loads
+    # its inputs in one round (-1%). The token rows of the first payload round (each destination's first 8
+    # experts) cross XGMI while the plan runs, so GEMM1 starts sooner (-2.2%; 32 experts crowd the plan: +5%).
+    # Each Combine wave starts once its own token's rows arrived, not after every rank's GEMM2 (-1.8%): the ranks
+    # that finish GEMM2 before the most loaded one reduce most of their tokens while it still runs.
+    # GEMM2 is XGMI-bound and the links idle once the dispatch is done, while GEMM1 still runs: half the CTAs
+    # leave GEMM1 for GEMM2 after a claim past a quarter of the GEMM1 work, with GEMM2 claiming 8 m-blocks
+    # at a time in all n-blocks, so the early units find their GEMM1 m-tiles done (-7.5%).
+    # Count words carry the launch tag, so the plan spins on them instead of a count_done round, and each route's
+    # histogram RMW is its slot in a per-expert pair-order bucket, so the producers start without the prefix /
+    # cursor pass; warp 1 sizes the geometry while the other waves plan (-1.2%). GEMM1 stages its A scales in K-loop
+    # order, so a K-step reads each row group's scale word with one ds_read_b32 instead of four serial ds_read_u8
+    # and a VALU pack (-1.8%). Early GEMM2 CTAs are picked per XCD, and the GEMM2 epilogue's per-row chain skips
+    # most LDS round trips (readlane row ids, DPP scale max) (-1.2% together). The GEMM1 epilogue quantizes and
+    # stores without scratch-reload store drains and with a v_rcp SiLU, and a GEMM2 unit copies its m-block's
+    # A scales to LDS once instead of two scale loads per K-step (-1.6% together, each alone below 1%).
+    # An expert's GEMM2 tail of at most 16 rows (~40% of the experts have 129-144 rows) rides on its previous
+    # m-block as an 80-row unit instead of running ten 64-row units of its own (-1.4%).
+    # An expert's last GEMM1 m-tile with 33-64 real rows runs 64 rows, not 128 (-4% at 512 tokens a rank,
+    # where most experts have one ~32-row tile; -1.9% at 1024, neutral at 256-384 and 2048).
+    # GEMM1 streams its W1 loads (nt), as the small buckets: -2% at 512 and 1024, where the short and mid
+    # tiles wait on W1, -0.7% at 2048.
+    # A GEMM2 unit whose m-block is its expert's only one streams W2 (nt) as well: no other m-block rereads the
+    # slab from L2 (-5% at 512, -4% at 1024, -0.7% at 2048, where most experts keep cached loads).
+    # With W2 streamed, up to 64 rows an expert (1024 tokens a rank) the early CTAs leave GEMM1 after 6/16 of its
+    # work instead of 4/16 (-2% at 512, -1.4% at 1024; the later start loses 1.2% at 1280-2048, so it stays 4/16
+    # there).
+    # The P2P rows carry offset int8 instead of E4M3 under the same E8M0 scales: relL2 vs the fp32 reference
+    # 0.0583 -> 0.0525 at 512-2048 tokens, at no measurable cost (same bytes; the extra cvt sits off the XGMI bound).
+    # The presend covers 16384 // tokens experts (8..64): about the same rows at every token count, where 8
+    # experts fit 2048 tokens only (-1% at 512, -1.4% at 1024, -0.7% at 256, unchanged at 2048).
+    # Up to 640 tokens a rank each destination gets 12 payload producers, not 8: the GEMM1 tiles that wait on
+    # the dispatch are most of the first round there (-1.2% at 512, -0.8% at 256; neutral at 768-2048).
+    # The launch head is serial up to the first GEMM1 tile: the producers count their routes before the gate
+    # (written through, so group_done needs no L2 writeback), the owner clears its counters while the handshake
+    # travels, and producers read the destination's rows per tile / ready order once (-1% at 256 and 512).
+    # The batched dispatch's token-scale reads are bounded by the scale buffer: a masked load reads its lane at
+    # 2 GiB past an unbounded buffer, which faults wherever nothing is mapped there (EP2 at every token count).
+    return replace(
+        config,
+        stage1=replace(config.stage1, b_nt=3),
+        fused_stage1=replace(
+            config.fused_stage1,
+            payload_min_blocks=8,
+            batch_rows=True,
+            short_tail_rows=32,
+            fold_tail=16,
+            mid_tail_rows=64,
+            parallel_plan=True,
+            epi_evec=8,
+            dedup_rows=True,
+            merge_release=True,
+            skip_payload_ready=True,
+            one_row_acquire=True,
+            no_chunk_release=True,
+            a_asm_reads=True,
+            payload_small_blocks=12,
+            payload_small_tokens=640,
+            lean_plan=True,
+            presend_experts=8,
+            presend_rows=16384,
+            tag_counts=True,
+            bucket_pairs=True,
+            ascale_packed=True,
+            epi_lean=3,
+            early_hist=True,
+            early_clear=True,
+            peer_hoist=True,
+            bounded_scales=True,
+        ),
+        fused_stage2=replace(
+            config.fused_stage2,
+            xcd_chunk=32,
+            row_align=128,
+            scale_stage=True,
+            a_dma_uniform=True,
+            skip_pad=True,
+            comb_tok_wait=True,
+            m_group=8,
+            early_k=2,
+            early_p=4,
+            early_p_mid=6,
+            early_xcd=True,
+            epi_lean=True,
+            ascale_lds=True,
+            fold_tail=16,
+            nt_single=True,
+            route_i8=True,
+        ),
+    )
+
+
+def _tune_v41_flash_ep2_small(config: MegaMoEConfig, bucket: int) -> MegaMoEConfig:
+    """EP2 DeepSeek-V4.1-Flash small-input kernel (192 experts per rank), measured on gfx950 (MTPR 512; uniform, Zipf
+    and hot-expert routing)."""
+    # The EP4 tune and its launch protocol (dedup rows, local plan, direct done, the tok_done counters and BF16
+    # head rows), with two changes it needs here: 32-row expert tiles at every bucket (8-16 rows an expert at
+    # 256-512 tokens: a 64-row tile would be mostly padding) and 96 producer CTAs (3 64-expert waves of the
+    # EP4 rule leave no consumers; 32 to 224 measured within 2%). Below 256 tokens nothing else won under every
+    # routing: tok_done at 8 tokens (-6% uniform, +11% hot) and tile_n 256 at 32-64 (-1..-4% uniform, +6..+14%
+    # hot) stay off, and producers, direct_done, block_n, early GEMM2 and FP8-row thresholds measured within
+    # noise or worse.
+    config = _tune_v41_flash_ep4_small(config, bucket)
+    stage1 = replace(config.stage1, sort_block_m=32, num_dispatch_cu=96)
+    stage2 = replace(config.stage2, block_m=32)
+    knobs = config.fused_stage1
+    if bucket in (256, 512):
+        # Half the GEMM1 n-tiles, each streaming a longer W1 slab, and GEMM2's dispatch-table pointers in SGPRs
+        # as up to 128 tokens (the 32-row tiles leave the registers the EP4 64-row tiles spilled): -3% uniform,
+        # -8% Zipf, -12% hot at 256 tokens.
+        stage1 = replace(stage1, tile_n=256)
+        knobs = replace(knobs, g2_uniform=True)
+    if bucket == 512:
+        # The 3072 routed rows of uniform routing pass the cached-weight threshold measured on EP8 / EP4, but
+        # each of the 192 experts has ~16 rows, one m-tile: no other tile rereads its weights, so the GEMM
+        # bodies stream them. A hot expert still takes the cached bodies. With the above: -8% uniform, -3% Zipf,
+        # -3.5% hot.
+        knobs = replace(knobs, stream_w=True)
+    return replace(config, stage1=stage1, stage2=stage2, fused_stage1=knobs)
+
+
+def _tune_v41_flash_ep2_large(config: MegaMoEConfig) -> MegaMoEConfig:
+    """EP2 DeepSeek-V4.1-Flash large-input kernel (192 experts per rank), measured on gfx950 at MTPR 8192 and 16384."""
+    # The EP4 tune with 96 producer CTAs (3 64-expert waves of the EP4 rule are 288, more than the CUs; 64 to 160
+    # measured within 1.5%). The EP4 schedule knobs stay: presend_experts 24
+    # (-2..-6% uniform at 4096-16384 tokens a rank) costs 5..30% under Zipf routing at 3072-6144, early_p 5-6
+    # (-6..-9% at 8192+) costs 3-5% at 3072, and payload_min_blocks, payload_small_*, presend_rows, early_p_mid,
+    # m_group, xcd_chunk and early_k measured within noise or worse.
+    config = _tune_v41_flash_ep4_large(config)
+    return replace(config, stage1=replace(config.stage1, num_dispatch_cu=96))
+
+
+@cache
+def _fused_config(
+    bucket: int,
+    mtpr: int,
+    world_size: int,
+    experts_per_rank: int,
+    model_dim: int,
+    inter_dim: int,
+) -> MegaMoEConfig:
+    layout = (world_size, experts_per_rank, model_dim, inter_dim)
+    expert_waves = (experts_per_rank + 63) // 64
+    if mtpr in LARGE_M_MTPRS:
+        config = _large_m_config(expert_waves)
+        if layout == V41_FLASH_EP4_LAYOUT:
+            return _tune_v41_flash_ep4_large(config)
+        if layout == V41_FLASH_EP2_LAYOUT:
+            return _tune_v41_flash_ep2_large(config)
+        return config
+    config = MegaMoEConfig(
+        stage1=_small_m_stage1(bucket, expert_waves),
+        stage2=_small_m_stage2(bucket),
+        p2p_quant="none",
+    )
+    if layout == V41_FLASH_EP4_LAYOUT:
+        return _tune_v41_flash_ep4_small(config, bucket)
+    if layout == V41_FLASH_EP2_LAYOUT:
+        return _tune_v41_flash_ep2_small(config, bucket)
+    return config
+
+
+def select_fused_config(
+    tokens: int,
+    mtpr: int,
+    *,
+    world_size: int = 8,
+    experts_per_rank: int = REFERENCE_EXPERTS_PER_RANK,
+    model_dim: int = V4_MODEL_DIM,
+    inter_dim: int = V4_INTER_DIM,
+) -> MegaMoEConfig:
+    """Small-input (MTPR <= SMALL_M_MAX_MTPR) or large-input (MTPR in LARGE_M_MTPRS)
+    config of a fused_layout_supported() layout (default: EP8 DeepSeek-V4-Pro) for
+    ``tokens`` rows on a rank; an idle rank takes the 1-token config."""
+    if mtpr <= 0 or mtpr & (mtpr - 1):
+        raise ValueError(f"mtpr={mtpr} must be a positive power of two")
+    large_mtprs = large_m_mtprs_for(
+        world_size=world_size, model_dim=model_dim, inter_dim=inter_dim
+    )
+    if mtpr > SMALL_M_MAX_MTPR and mtpr not in large_mtprs:
+        raise ValueError(f"no small- or large-input config for mtpr={mtpr}")
+    if not 0 <= tokens <= mtpr:
+        raise ValueError(f"tokens={tokens} must be in [0, {mtpr}]")
+    if not 0 < experts_per_rank <= 256:
+        raise ValueError(
+            f"experts_per_rank must be in [1, 256], got {experts_per_rank}"
+        )
+    return _fused_config(
+        nearest_token_bucket(max(tokens, 1), FUSED_TOKEN_BUCKETS),
+        mtpr,
+        world_size,
+        experts_per_rank,
+        model_dim,
+        inter_dim,
     )

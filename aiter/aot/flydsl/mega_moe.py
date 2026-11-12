@@ -19,13 +19,12 @@ the MoE replay this one runs in a process of its own, started with
 ``GPU_ARCHS`` naming gfx950 and ``AITER_AOT_REPLAY=1``. It is skipped when
 ``GPU_ARCHS`` names targets without gfx950.
 
-The MTPR 8192 jobs build the instance with the opt-in small- and large-input
-paths turned on (``AITER_MEGA_SMALL_M`` / ``AITER_MEGA_LARGE_M``), so the
-profiles those paths support also get their kernels; the runtime's own
-eligibility checks decide which profiles that is.
+The instance builds every route its plan has (the staged path, and the small-
+and large-input kernels where the layout and MTPR support them), and
+``preload_aot_bundles()`` loads the kernels of all of them.
 
 Usage:
-    # Every profile the service ships (DeepSeek-V4-Pro and Kimi-K3)
+    # Every profile the service ships (DeepSeek-V4-Pro, Kimi-K3, DeepSeek-V4.1-Flash EP4 and EP2)
     python -m aiter.aot.flydsl.mega_moe
 
     # One custom profile
@@ -79,14 +78,24 @@ K3_INTER_DIM = 3072
 K3_ACT = "situv2"
 K3_SITU_BETA = 4.0
 K3_SITU_LINEAR_BETA = 25.0
+# DeepSeek-V4.1-Flash EP4 deployment profile (epr96, d5120 / i2304, a8w4 only:
+# the fused routes are a8w4). Its MTPRs are those of ATOM's instances: decode
+# (128: staged + small-input 256) and prefill (8192 and 16384: staged +
+# small-input + large-input; the EP4 large-input route exists only there).
+V41_FLASH_WORLD_SIZE = 4
+V41_FLASH_EXPERTS_PER_RANKS = (96,)
+V41_FLASH_MODEL_DIM = 5120
+V41_FLASH_INTER_DIM = 2304
+V41_FLASH_MTPRS = (128, 8192, 16384)
+V41_FLASH_QUANTS = ("a8w4",)
+# DeepSeek-V4.1-Flash EP2 deployment profile (epr192, the EP4 shape and MTPRs).
+V41_FLASH_EP2_WORLD_SIZE = 2
+V41_FLASH_EP2_EXPERTS_PER_RANKS = (192,)
 WORLD_SIZE = 8
 TOPK = 6
 MODEL_DIM = 7168
 INTER_DIM = 3072
 SWIGLU_LIMIT = 10.0
-# Instances of this MTPR also build the opt-in small- and large-input paths.
-FUSED_PATHS_MTPR = 8192
-FUSED_PATHS_ENV = {"AITER_MEGA_SMALL_M": "1", "AITER_MEGA_LARGE_M": "1"}
 
 
 def default_jobs(
@@ -146,10 +155,12 @@ def production_jobs(
     quants=DEFAULT_QUANTS,
     world_size=WORLD_SIZE,
     swiglu_limit=SWIGLU_LIMIT,
+    v41_flash_mtprs=V41_FLASH_MTPRS,
 ):
-    """Every geometry the service ships: V4-Pro (default shape) + Kimi-K3.
+    """Every geometry the service ships: V4-Pro (default shape), Kimi-K3 and
+    V4.1-Flash EP4 and EP2 (``v41_flash_mtprs``, a8w4 in ``quants`` only).
 
-    Used by the default build so both profiles are AOT-covered and neither
+    Used by the default build so every profile is AOT-covered and none
     triggers an online JIT compile at serving time.
     """
     jobs = default_jobs(
@@ -168,6 +179,19 @@ def production_jobs(
         situ_beta=K3_SITU_BETA,
         situ_linear_beta=K3_SITU_LINEAR_BETA,
     )
+    for flash_world_size, flash_experts_per_ranks in (
+        (V41_FLASH_WORLD_SIZE, V41_FLASH_EXPERTS_PER_RANKS),
+        (V41_FLASH_EP2_WORLD_SIZE, V41_FLASH_EP2_EXPERTS_PER_RANKS),
+    ):
+        jobs += default_jobs(
+            v41_flash_mtprs,
+            flash_experts_per_ranks,
+            quants=tuple(q for q in quants if q in V41_FLASH_QUANTS),
+            world_size=flash_world_size,
+            model_dim=V41_FLASH_MODEL_DIM,
+            inter_dim=V41_FLASH_INTER_DIM,
+            swiglu_limit=swiglu_limit,
+        )
     return jobs
 
 
@@ -236,9 +260,7 @@ def compile_one_config(**job):
     started = time.time()
     try:
         device = torch.device("cuda", job["rank"])
-        fused_paths = FUSED_PATHS_ENV if job["mtpr"] == FUSED_PATHS_MTPR else {}
         with (
-            mock.patch.dict(os.environ, fused_paths),
             dry_run(ARCH, NUM_CU, name=DEVICE_NAME),
             _fake_shmem(device),
         ):
@@ -261,8 +283,8 @@ def compile_one_config(**job):
                 **_weights(job, device),
             )
             moe.preload_aot_bundles()
-            # preload_aot_bundles() leaves out quantize(), which fixed-slot
-            # forward and the per-stage benchmarks call.
+            # preload_aot_bundles() leaves out the input quant kernel, which
+            # fixed-slot forward, quantize() and the per-stage benchmarks launch.
             moe.quantize(
                 torch.empty((2, job["model_dim"]), dtype=torch.bfloat16, device=device)
             )
@@ -328,12 +350,18 @@ def main():
         and args.inter_dim == INTER_DIM
     )
     if default_shape:
-        # Default build ships both V4-Pro and Kimi-K3 so neither JITs online.
+        # Default build ships V4-Pro, Kimi-K3 and V4.1-Flash EP4 / EP2 so none
+        # JITs online. An explicit --mtpr applies to the V4.1-Flash profiles as well.
         jobs = production_jobs(
             tuple(args.mtpr),
             quants=tuple(args.quant),
             world_size=args.world_size,
             swiglu_limit=args.swiglu_limit,
+            v41_flash_mtprs=(
+                V41_FLASH_MTPRS
+                if list(args.mtpr) == list(DEFAULT_MTPRS)
+                else tuple(args.mtpr)
+            ),
         )
     else:
         jobs = default_jobs(

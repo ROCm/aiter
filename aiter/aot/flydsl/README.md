@@ -96,13 +96,19 @@ variant of the profile's bundle plan.
   process group or mori install is needed.
 - The device reports itself as an MI355X, because the combine launch geometry
   is tuned per GPU model.
-- `quantize()` is replayed too: `preload_aot_bundles()` leaves it out, but
-  fixed-slot `forward` and the per-stage benchmarks call it.
-- The MTPR 8192 jobs build the instance with `AITER_MEGA_SMALL_M=1` and
-  `AITER_MEGA_LARGE_M=1`. Where the runtime's eligibility checks accept the
-  profile (DeepSeek-V4-Pro EP8 a8w4), `preload_aot_bundles()` then also loads
-  the small-input kernel of every token bucket (MTPR 256 and 512) and the
-  large-input persistent kernel.
+- The input quant kernel is replayed too (through `quantize()`):
+  `preload_aot_bundles()` leaves it out, but fixed-slot `forward`, `quantize()`
+  and the per-stage benchmarks launch it.
+- The instance builds every route of its plan. Where the layout supports the
+  fused routes (`FUSED_LAYOUTS`: DeepSeek-V4-Pro EP8 and DeepSeek-V4.1-Flash
+  EP4, a8w4), `preload_aot_bundles()` also loads the small-input kernel of
+  every token bucket of each reachable small-input capacity (256 and 512),
+  and, for an MTPR in `large_m_mtprs_for()` of the layout (1024..16384 on
+  EP8, 8192 and 16384 on EP4), the large-input persistent kernel. The
+  default build covers the EP4 profile at the MTPRs of ATOM's instances (`V41_FLASH_MTPRS`: 128, 8192,
+  16384; the large-input kernel at 8192 and 16384); one MTPR of it alone:
+  `python -m aiter.aot.flydsl.mega_moe --world-size 4 --model-dim 5120
+  --inter-dim 2304 --experts-per-rank 96 --mtpr 8192 --quant a8w4`.
 - `--check` compiles nothing: with `FLYDSL_RUNTIME_RUN_ONLY=1`, any kernel the
   replay reaches but the cache lacks fails the job, which tests that the runtime's
   cache keys hit the artifacts the build produced.
@@ -276,9 +282,10 @@ GPU_ARCHS=gfx1250 python -m aiter.aot.flydsl.moe
 ```
 
 MegaMoE defaults to every profile the service ships: DeepSeek-V4-Pro r0/r32/r64
-(`experts_per_rank=48/52/56`) and Kimi-K3 (`experts_per_rank=112`). The expert
-count is part of the compiled ABI, so one profile cannot safely reuse another
-profile's bundle.
+(`experts_per_rank=48/52/56`), Kimi-K3 (`experts_per_rank=112`) and
+DeepSeek-V4.1-Flash EP4 (`world_size=4`, `experts_per_rank=96`, a8w4, MTPR
+128/8192/16384 unless `--mtpr` is given). The expert count is part of the
+compiled ABI, so one profile cannot safely reuse another profile's bundle.
 
 ### Common arguments
 

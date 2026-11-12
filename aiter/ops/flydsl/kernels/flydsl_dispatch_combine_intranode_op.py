@@ -358,6 +358,81 @@ class FlyDSLDispatchCombineConfig:
         return self.scale_dim * self.scale_type_size
 
 
+def group_major_capacity(
+    *,
+    world_size,
+    hidden_dim,
+    max_tok_per_rank,
+    experts_per_rank,
+    topk,
+    data_type,
+    unit_size,
+    scale_dim,
+    scale_type_size=1,
+    compact=False,
+    indexed_payload=False,
+):
+    """Row capacities of a group-major op: (num_valid_max, payload_rows_max, row_bytes, scale_n_i32)."""
+    # Fixed-slot capacity covers the all-to-one routing case.
+    ll_cap = (world_size * max_tok_per_rank + unit_size - 1) // unit_size * unit_size
+    # Compact fanout may materialize the shared pair as two independently
+    # padded expert sections in addition to every normal expert section.
+    if compact:
+        num_valid_max = (
+            world_size * max_tok_per_rank * topk + (experts_per_rank + 2) * unit_size
+        )
+    else:
+        num_valid_max = experts_per_rank * ll_cap + 256
+    # Route metadata remains expert-major.  Activations and scales use one
+    # deterministic row per (source rank, source token), plus a sentinel.
+    payload_rows_max = (
+        world_size * max_tok_per_rank + 1 if indexed_payload else num_valid_max
+    )
+    scale_bytes = scale_dim * scale_type_size
+    scale_n_i32 = (scale_bytes + 3) // 4 if scale_bytes > 0 else 0
+    return (
+        int(num_valid_max),
+        int(payload_rows_max),
+        _token_bytes_for(data_type, hidden_dim),
+        scale_n_i32,
+    )
+
+
+class GroupMajorPayloadArena:
+    """Symmetric payload storage shared by group-major ops whose calls never overlap.
+
+    Holds the activation rows, their scales, the route weights and the source
+    map -- data every MegaMoE route rewrites or masks before it reads it and
+    finishes reading before its call's closing all-rank barrier, so one call's
+    route can reuse what another route's earlier call left there. Counters,
+    epochs and ready flags are not shared.
+    """
+
+    def __init__(self, capacities):
+        """``capacities``: the group_major_capacity() of every op that will view this arena."""
+        self.rx_bytes = max(rows * row_bytes for _, rows, row_bytes, _ in capacities)
+        self.scale_i32 = max(
+            max(1, rows * scale_n) for _, rows, _, scale_n in capacities
+        )
+        self.route_rows = max(nvm for nvm, _, _, _ in capacities)
+        self.rx = self._sym((self.rx_bytes,), torch.int8)
+        self.scale = self._sym((self.scale_i32,), torch.int32)
+        self.wts = self._sym((self.route_rows,), torch.float32)
+        self.srcmap = self._sym((self.route_rows,), torch.int32)
+
+    @staticmethod
+    def _sym(shape, dtype):
+        t = mori_shmem_create_tensor(shape, dtype)
+        t.zero_()
+        return t
+
+    def nbytes(self):
+        return sum(
+            t.numel() * t.element_size()
+            for t in (self.rx, self.scale, self.wts, self.srcmap)
+        )
+
+
 class FlyDSLDispatchGroupMajorOp:
     """Own expert-major dispatch buffers and metadata for fused stage1."""
 
@@ -376,7 +451,10 @@ class FlyDSLDispatchGroupMajorOp:
         scale_type_size=1,
         compact=False,
         indexed_payload=False,
+        payload_arena=None,
     ):
+        """``payload_arena``: a GroupMajorPayloadArena to view instead of allocating
+        the activation, scale, route-weight and source-map buffers."""
         assert world_size <= 8
         # Compact mode uses a count-first layout without per-expert reservations.
         self.compact = bool(compact)
@@ -401,29 +479,28 @@ class FlyDSLDispatchGroupMajorOp:
         self.scale_dim = scale_dim
         self.scale_type_size = scale_type_size
         self.scale_bytes = scale_dim * scale_type_size
-        self.scale_n_i32 = (self.scale_bytes + 3) // 4 if self.scale_bytes > 0 else 0
         self._dev = torch.device("cuda", rank)
-        self.row_bytes = _token_bytes_for(data_type, hidden_dim)
         self.row_view = _token_view_dim_for(data_type, hidden_dim)
-
-        # Compact fanout may materialize the shared pair as two independently
-        # padded expert sections in addition to every normal expert section.
-        if self.compact:
-            num_valid_max = (
-                world_size * max_tok_per_rank * topk
-                + (experts_per_rank + 2) * unit_size
-            )
-        else:
-            num_valid_max = experts_per_rank * self.ll_cap + 256
-        self.num_valid_max = int(num_valid_max)
-        self.max_blocks = (self.num_valid_max + unit_size - 1) // unit_size
-        # Route metadata remains expert-major.  Activations and scales use one
-        # deterministic row per (source rank, source token), plus a sentinel.
-        self.payload_rows_max = (
-            world_size * max_tok_per_rank + 1
-            if self.indexed_payload
-            else self.num_valid_max
+        (
+            self.num_valid_max,
+            self.payload_rows_max,
+            self.row_bytes,
+            self.scale_n_i32,
+        ) = group_major_capacity(
+            world_size=world_size,
+            hidden_dim=hidden_dim,
+            max_tok_per_rank=max_tok_per_rank,
+            experts_per_rank=experts_per_rank,
+            topk=topk,
+            data_type=data_type,
+            unit_size=unit_size,
+            scale_dim=scale_dim,
+            scale_type_size=scale_type_size,
+            compact=self.compact,
+            indexed_payload=self.indexed_payload,
         )
+        self.max_blocks = (self.num_valid_max + unit_size - 1) // unit_size
+        self.payload_arena = payload_arena
 
         self._alloc()
         ms.shmem_barrier_all()
@@ -441,13 +518,28 @@ class FlyDSLDispatchGroupMajorOp:
         self.done2 = self._sym((npes,), torch.int32)
         self.running = self._sym((epr,), torch.int32)
         self.ll_count = self._sym((epr,), torch.int32)
-        self.rx_em = self._sym((payload_rows * self.row_bytes,), torch.int8)
-        self.scale_em = self._sym(
-            (max(1, payload_rows * self.scale_n_i32),), torch.int32
-        )
+        rx_bytes = payload_rows * self.row_bytes
+        scale_i32 = max(1, payload_rows * self.scale_n_i32)
+        arena = self.payload_arena
+        if arena is None:
+            self.rx_em = self._sym((rx_bytes,), torch.int8)
+            self.scale_em = self._sym((scale_i32,), torch.int32)
+        else:
+            if (
+                rx_bytes > arena.rx_bytes
+                or scale_i32 > arena.scale_i32
+                or nvm > arena.route_rows
+            ):
+                raise ValueError("the payload arena is smaller than this op needs")
+            self.rx_em = arena.rx[:rx_bytes]
+            self.scale_em = arena.scale[:scale_i32]
         self.idx_em = self._sym((nvm,), torch.int32)
-        self.wts_em = self._sym((nvm,), torch.float32)
-        self.srcmap_em = self._sym((nvm,), torch.int32)
+        if arena is None:
+            self.wts_em = self._sym((nvm,), torch.float32)
+            self.srcmap_em = self._sym((nvm,), torch.int32)
+        else:
+            self.wts_em = arena.wts[:nvm]
+            self.srcmap_em = arena.srcmap[:nvm]
         self.gb1 = torch.zeros(1, dtype=torch.int64, device=self._dev)
         self.sorted_expert_ids = torch.zeros(
             self.max_blocks, dtype=torch.int32, device=self._dev
@@ -555,7 +647,12 @@ class FlyDSLDispatchGroupMajorOp:
 
 
 class FlyDSLDispatchCombineIntraNodeOp:
-    def __init__(self, config):
+    def __init__(self, config, *, gm_payload_arena=None, combine_input=None):
+        """``gm_payload_arena``: GroupMajorPayloadArena for the group-major op's payload.
+        ``combine_input``: (token int16, weight float32) symmetric combine-input buffers
+        of another op whose calls never overlap this op's, to view instead of allocating.
+        """
+        self._shared_combine_input = combine_input
         self.cfg = config
         self._check_config()
         if config.tuning_table is None:
@@ -650,6 +747,7 @@ class FlyDSLDispatchCombineIntraNodeOp:
                 scale_type_size=config.scale_type_size,
                 compact=config.gm_compact,
                 indexed_payload=config.gm_indexed_payload,
+                payload_arena=gm_payload_arena,
             )
             # Fused dispatch and combine share one receive-count buffer.
             self._gm.total_recv = self.total_recv
@@ -658,10 +756,48 @@ class FlyDSLDispatchCombineIntraNodeOp:
         self._fx_tis = self._fx_out_shmem_tok_id_to_src
         ms.shmem_barrier_all()
 
+    def combine_output(self, rows):
+        """The first ``rows`` rows of the combine output buffer, as [rows, token view dim]."""
+        cfg = self.cfg
+        return (
+            self.shmem_comb_out_tok.view(torch.int8)[: rows * cfg.combine_token_bytes]
+            .view(cfg.combine_dtype)
+            .view(rows, cfg.combine_token_view_dim)
+        )
+
     def load_tuning_config(self, path=None):
         """Build and attach the geometry tuning table for this op's shape."""
         self.cfg.tuning_table = build_geometry_tuning_table_for_config(self.cfg, path)
         return self.cfg.tuning_table
+
+    @staticmethod
+    def _legacy_token_bytes(cfg):
+        return (
+            cfg.hidden_dim * cfg.max_token_type_size
+            if cfg.max_token_type_size > 0
+            else 0
+        )
+
+    @classmethod
+    def combine_input_numel(cls, cfg):
+        """Elements of the (int16 token, float32 weight) combine input for ``cfg``."""
+        k = cfg.num_experts_per_token
+        mr_worst = cfg.max_recv
+        # Size combine input for both sender-major and fused dest_lid*topk layouts.
+        mr_worst_inp = max(mr_worst, cfg.max_num_inp_token_per_rank * k)
+        comb_tb = max(cfg.combine_token_bytes, cls._legacy_token_bytes(cfg))
+        return (mr_worst_inp * comb_tb + 1) // 2, mr_worst * k
+
+    @classmethod
+    def allocate_combine_input(cls, cfgs):
+        """A zeroed symmetric combine input large enough for every config in ``cfgs``,
+        for ops whose calls never overlap to share (``combine_input=``)."""
+        tok, wts = (max(n) for n in zip(*(cls.combine_input_numel(c) for c in cfgs)))
+        tok = mori_shmem_create_tensor((tok,), torch.int16)
+        wts = mori_shmem_create_tensor((wts,), torch.float32)
+        tok.zero_()
+        wts.zero_()
+        return tok, wts
 
     def _alloc_buffers(self):
         cfg = self.cfg
@@ -669,22 +805,13 @@ class FlyDSLDispatchCombineIntraNodeOp:
         k = cfg.num_experts_per_token
         mt = cfg.max_num_inp_token_per_rank
         mr = cfg.effective_max_recv
-        mr_worst = cfg.max_recv
 
-        # Size combine input for both sender-major and fused dest_lid*topk layouts.
-        mr_worst_inp = max(mr_worst, mt * k)
-
-        legacy_tb = (
-            cfg.hidden_dim * cfg.max_token_type_size
-            if cfg.max_token_type_size > 0
-            else 0
-        )
+        legacy_tb = self._legacy_token_bytes(cfg)
         disp_tb = max(cfg.dispatch_token_bytes, legacy_tb)
         comb_tb = max(cfg.combine_token_bytes, legacy_tb)
         tok_i16_mr = (mr * disp_tb + 1) // 2  # dispatch output (dispatch_dtype)
-        tok_i16_mr_worst = (
-            mr_worst_inp * comb_tb + 1
-        ) // 2  # combine input, worst-case (combine_dtype)
+        # combine input, worst-case (combine_dtype)
+        tok_i16_mr_worst, wts_mr_worst = self.combine_input_numel(cfg)
         tok_i16_mt = (mt * comb_tb + 1) // 2  # combine output (combine_dtype)
 
         self.shmem_disp_out_tok = mori_shmem_create_tensor((tok_i16_mr,), torch.int16)
@@ -695,12 +822,21 @@ class FlyDSLDispatchCombineIntraNodeOp:
         self.shmem_tok_off = mori_shmem_create_tensor((1,), torch.int32)
         self.shmem_recv_tok_num = mori_shmem_create_tensor((npes,), torch.int32)
         self.shmem_tok_id_to_src = mori_shmem_create_tensor((mr,), torch.int32)
-        self.shmem_comb_inp_tok = mori_shmem_create_tensor(
-            (tok_i16_mr_worst,), torch.int16
-        )
-        self.shmem_comb_inp_wts = mori_shmem_create_tensor(
-            (mr_worst * k,), torch.float32
-        )
+        if self._shared_combine_input is None:
+            self.shmem_comb_inp_tok = mori_shmem_create_tensor(
+                (tok_i16_mr_worst,), torch.int16
+            )
+            self.shmem_comb_inp_wts = mori_shmem_create_tensor(
+                (wts_mr_worst,), torch.float32
+            )
+        else:
+            tok, wts = self._shared_combine_input
+            if tok.numel() < tok_i16_mr_worst or wts.numel() < wts_mr_worst:
+                raise ValueError(
+                    "the shared combine input is smaller than this op needs"
+                )
+            self.shmem_comb_inp_tok = tok[:tok_i16_mr_worst]
+            self.shmem_comb_inp_wts = wts[:wts_mr_worst]
         self.shmem_comb_out_tok = mori_shmem_create_tensor((tok_i16_mt,), torch.int16)
         self.shmem_comb_out_wts = mori_shmem_create_tensor((mt * k,), torch.float32)
         self.shmem_xdev_bar_mem = mori_shmem_create_tensor((npes,), torch.int64)

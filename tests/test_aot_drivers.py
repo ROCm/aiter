@@ -1,4 +1,5 @@
-"""AOT driver coverage: MLA config wiring and PA-Gluon's GPU worker policy."""
+"""AOT driver coverage: MLA config wiring, PA-Gluon's GPU worker policy and
+the MegaMoE deployment profiles."""
 
 import inspect
 import pathlib
@@ -135,3 +136,81 @@ class PaGluonProcessLimitTest(unittest.TestCase):
             ):
                 self.assertEqual(cpp_itfs_utils._build_command(3), [*command, "-j1"])
         self.assertEqual(worker_count.call_args_list, [call(3), call(3)])
+
+
+class MegaMoEProductionJobsTest(unittest.TestCase):
+    def test_v41_flash_ep4_profile(self):
+        from aiter.aot.flydsl import mega_moe
+
+        jobs = mega_moe.production_jobs()
+        ep4 = [job for job in jobs if job["world_size"] == 4]
+        # V4-Pro (3 MTPRs x 3 EPLB profiles x 2 quants x 8 ranks), Kimi-K3
+        # (3 x 2 x 8) and V4.1-Flash EP4 / EP2 (3 MTPRs x 4 / 2 ranks, a8w4 only).
+        self.assertEqual(len(jobs), 144 + 48 + 12 + 6)
+        self.assertEqual(
+            {(job["mtpr"], job["rank"]) for job in ep4},
+            {(mtpr, rank) for mtpr in (128, 8192, 16384) for rank in range(4)},
+        )
+        for job in ep4:
+            self.assertEqual(
+                (
+                    job["quant"],
+                    job["experts_per_rank"],
+                    job["model_dim"],
+                    job["inter_dim"],
+                    job["topk"],
+                ),
+                ("a8w4", 96, 5120, 2304, 6),
+            )
+        self.assertEqual(len({job["kernel_name"] for job in jobs}), len(jobs))
+        # The prefill instances (8192, 16384) build the large-input kernel too.
+        from aiter.ops.flydsl.kernels.mega_moe.mega_moe_config import (
+            large_m_mtprs_for,
+        )
+
+        large = large_m_mtprs_for(world_size=4, model_dim=5120, inter_dim=2304)
+        self.assertEqual(
+            {job["mtpr"] for job in ep4 if job["mtpr"] in large}, {8192, 16384}
+        )
+        # Without a8w4 there is no EP4 job: its fused routes are a8w4.
+        self.assertFalse(
+            [
+                job
+                for job in mega_moe.production_jobs(quants=("a4w4",))
+                if job["world_size"] == 4
+            ]
+        )
+
+    def test_v41_flash_ep2_profile(self):
+        from aiter.aot.flydsl import mega_moe
+        from aiter.ops.flydsl.kernels.mega_moe.mega_moe_config import (
+            large_m_mtprs_for,
+        )
+
+        ep2 = [job for job in mega_moe.production_jobs() if job["world_size"] == 2]
+        self.assertEqual(
+            {(job["mtpr"], job["rank"]) for job in ep2},
+            {(mtpr, rank) for mtpr in (128, 8192, 16384) for rank in range(2)},
+        )
+        for job in ep2:
+            self.assertEqual(
+                (
+                    job["quant"],
+                    job["experts_per_rank"],
+                    job["model_dim"],
+                    job["inter_dim"],
+                    job["topk"],
+                ),
+                ("a8w4", 192, 5120, 2304, 6),
+            )
+        large = large_m_mtprs_for(world_size=2, model_dim=5120, inter_dim=2304)
+        self.assertEqual(
+            {job["mtpr"] for job in ep2 if job["mtpr"] in large}, {8192, 16384}
+        )
+        self.assertFalse(
+            [
+                job
+                for job in mega_moe.production_jobs(quants=("a4w4",))
+                if job["world_size"] == 2
+            ]
+        )

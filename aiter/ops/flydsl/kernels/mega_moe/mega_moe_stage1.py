@@ -6,6 +6,7 @@ import functools
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
+import torch
 from flydsl.expr import const_expr, range_constexpr
 from flydsl.expr.typing import T
 from flydsl.expr.typing import Vector as Vec
@@ -19,7 +20,6 @@ from ..tensor_shim import (
     buf_copy_load,
     ptr_buf_tensor,
 )
-from . import envs
 from .dispatch import (
     DispatchSlot,
     emit_direct_fixed_slot_finalize,
@@ -56,6 +56,33 @@ def _validate_fixed_slot_geometry(
     required_cap = ((npes * max_tokens_per_rank + tile_m - 1) // tile_m) * tile_m
     if npes != 8 or experts_per_rank != 48 or cap != required_cap:
         raise ValueError("fixed-slot dispatch requires the direct EP8/EPR48 layout")
+
+
+def stage1_output_nbytes(rows, inter_dim, a_dtype="fp8"):
+    """Bytes of the GEMM1 output for ``rows`` routed rows and of its scale buffer."""
+    out = rows * (inter_dim // 2 if a_dtype == "fp4" else inter_dim)
+    prows = (rows + 255) // 256 * 256
+    pcols = ((inter_dim // 32) + 7) // 8 * 8
+    return out, prows * pcols + inter_dim
+
+
+def stage1_output_buffers(rows, inter_dim, device, a_dtype="fp8", arena=None):
+    """GEMM1 output ``[rows, inter_dim]`` (FP8, or packed FP4) and its scale buffer.
+
+    ``arena``: (output bytes, scale bytes) uint8 tensors to view instead of
+    allocating, shared by routes whose calls never overlap.
+    """
+    out_bytes, osd_bytes = stage1_output_nbytes(rows, inter_dim, a_dtype)
+    if arena is None:
+        out = torch.zeros(out_bytes, dtype=torch.uint8, device=device)
+        osd = torch.zeros(osd_bytes, dtype=torch.uint8, device=device)
+    else:
+        if out_bytes > arena[0].numel() or osd_bytes > arena[1].numel():
+            raise ValueError("the Stage1 output arena is smaller than this route needs")
+        out, osd = arena[0][:out_bytes], arena[1][:osd_bytes]
+    out = out.view(rows, out_bytes // rows)
+    out = out.view(torch.float4_e2m1fn_x2 if a_dtype == "fp4" else torch.float8_e4m3fn)
+    return out, osd
 
 
 def _validate_dispatch_capacity(
@@ -96,7 +123,6 @@ def compile_mega_moe_stage1(
     tile_state_stride: int = 0, a_dtype: str = "fp8", out_dtype: str = "fp8",
     swiglu_limit: float = 0.0,
     act: str = "silu", situ_beta: float = 1.0, situ_linear_beta: float = 1.0,
-    bounds_check: bool = False,
     _return_kernel_spec: bool = False,
 ):
     arch = str(get_rocm_arch() or "")
@@ -211,7 +237,6 @@ def compile_mega_moe_stage1(
     if fixed_slot_dispatch and fz_scale_n_i32 > 64:
         raise ValueError("direct fixed-slot dispatch supports at most 64 packed scale columns")
     fz_enable_scales = fz_scale_bytes > 0
-    fz_safe_end_i32 = (fz_n_i32 // 512) * 512
     _validate_dispatch_capacity(
         fz_mtpr, fz_npes, fz_epr, fz_k, fz_tile_m, fz_nbytes, inter_dim // out_pack, use_tile_resource
     )
@@ -228,12 +253,11 @@ def compile_mega_moe_stage1(
         bc_work: fx.Array[fx.Int8, 16, 16]
         bc_sched: fx.Array[fx.Int8, 16, 16]
 
-    # Compact producers keep two rows in flight (emit_dispatch_payload).
-    FAST_COPY = compact_dispatch and envs.AITER_MEGA_DISPATCH_FAST_COPY
     # Paired GEMM1 K loop for fixed-slot tiles with LDS-DMA A copies; compact
     # prefill is slower with it (its 8-wave tiles already hide the latency).
-    PAIR_K = fixed_slot_dispatch and async_a_copy and envs.AITER_MEGA_S1_FIXED_KPAIR
-    EPI_EVEC = envs.AITER_MEGA_S1_EPI_EVEC
+    PAIR_K = fixed_slot_dispatch and async_a_copy
+    # GEMM1 quant epilogue columns per lane (SiluQuantEpilogue; FP4 output uses 2).
+    EPI_EVEC = 8
     dispatch_path = "fixedslot" if fixed_slot_dispatch else "compact"
     swiglu_suffix = "" if swiglu_limit <= 0 else f"_sl{str(float(swiglu_limit)).replace('.', 'p')}"
     # Activation is baked into the epilogue, so it (and its baked beta/linear_beta)
@@ -245,26 +269,6 @@ def compile_mega_moe_stage1(
     )
     WORK_BATCH = 1
 
-    # Optional hardware bounds checking.  A V# descriptor with a finite
-    # num_records makes the hardware drop out-of-range stores and return zero
-    # for out-of-range loads, so an indexing mistake surfaces as a wrong result
-    # instead of a page fault.  That matters because amdgpu runs with
-    # noretry=1 here: a fault is non-retryable and can leave the queue in a
-    # state only a privileged reset clears.
-    #
-    # Only buffers whose exact allocation is known at this level are bounded.
-    # A bound that is too small would silently clamp a valid access, which is
-    # worse than the fault it replaces, so anything uncertain keeps the
-    # unbounded default.  Notably tile_ready/tile_expected/ready_tile_queue are
-    # allocated as 2 * metadata_blocks while tile_state_stride carries only
-    # metadata_blocks, hence the doubling below.
-    WORK_HEAD_BYTES = 8 * 16 * 4  # workspace["work_head"] = zeros(8 * 16, int32)
-    TILE_STATE_BYTES = tile_state_stride * 2 * 4
-    PER_DESTINATION_BYTES = fz_npes * 4
-
-    def bounded(nbytes):
-        """Keyword arguments pinning a view's V# extent, when enabled."""
-        return {"num_records_bytes": nbytes} if bounds_check else {}
     kernel_name = (
         f"megamoe_stage1_{dispatch_path}_t{sort_block_m}x{tile_n}x{tile_k}"
         f"_a{a_dtype}o{out_dtype}"
@@ -279,13 +283,12 @@ def compile_mega_moe_stage1(
         f"_ix{int(indexed_payload)}"
         f"{swiglu_suffix}"
         f"{act_suffix}"
+        # _ev8b / _fc: the epilogue width and the compact two-row payload copy,
+        # fixed now; kept so kernel names (and AOT caches) stay stable.
         f"_ev{EPI_EVEC}b"
-        f"{'_fc' if FAST_COPY else ''}"
+        f"{'_fc' if compact_dispatch else ''}"
         f"{'_kp2' if PAIR_K else ''}"
         f"{'_ac32' if NARROW_FINAL_A else ''}"
-        # Kept in the name so a bounds-checked build never reuses a cached
-        # unbounded kernel, or the reverse.
-        f"{'_bc1' if bounds_check else ''}"
     )
 
     @flyc.kernel(name=kernel_name, known_block_size=[TOTAL_THREADS, 1, 1])
@@ -302,8 +305,8 @@ def compile_mega_moe_stage1(
         a_scale_lds = lds.A_scale
         c_tile = _LdsF32View(fx.recast_iter(fx.Float32, lds.pool.ptr))
         disp_rsrc = ptr_buf_tensor(addr_disp, fx.Int64)
-        parity_rsrc = ptr_buf_tensor(addr_parity, fx.Int32, **bounded(4))
-        expected_rsrc = ptr_buf_tensor(addr_expected, fx.Int32, **bounded(8))
+        parity_rsrc = ptr_buf_tensor(addr_parity, fx.Int32)
+        expected_rsrc = ptr_buf_tensor(addr_expected, fx.Int32)
 
         def _disp_ptr(slot):
             return disp_rsrc[fx.Int32(int(slot))]
@@ -392,11 +395,7 @@ def compile_mega_moe_stage1(
                     )
                     comm_ops.fence_system_acquire()
                 if tid == fx.Int32(0):
-                    # work_shard indexes this at shard * 16 int32s, so an
-                    # out-of-range WORK_SHARDS lands here first.
-                    work_head_rsrc = ptr_buf_tensor(
-                        a_work_head, fx.Int32, **bounded(WORK_HEAD_BYTES)
-                    )
+                    work_head_rsrc = ptr_buf_tensor(a_work_head, fx.Int32)
                     for shard in range_constexpr(WORK_SHARDS):
                         work_head_rsrc[fx.Int32(shard * 16)] = fx.Int32(0)
                     comm_ops.store_i32_system(
@@ -464,17 +463,15 @@ def compile_mega_moe_stage1(
                 producers_per_destination = ptr_buf_tensor(
                     a_payload_blocks_per_destination,
                     fx.Int32,
-                    **bounded(PER_DESTINATION_BYTES),
                 )[producer_destination]
                 chunks_per_destination = ptr_buf_tensor(
                     a_payload_chunks_per_destination,
                     fx.Int32,
-                    **bounded(PER_DESTINATION_BYTES),
                 )[producer_destination]
                 emit_dispatch_payload(
                     num_waves=NUM_WAVES, fz_epr=fz_epr, fz_k=fz_k, fz_mtpr=fz_mtpr, fz_rank=fz_rank,
                     fz_total_experts=fz_total_experts, fz_nbytes=fz_nbytes, fz_n_i32=fz_n_i32,
-                    fz_safe_end_i32=fz_safe_end_i32, fz_scale_n_i32=fz_scale_n_i32,
+                    fz_scale_n_i32=fz_scale_n_i32,
                     fz_enable_scales=fz_enable_scales, addr_disp=addr_disp, addr_in_tok=addr_in_tok,
                     addr_in_idx=addr_in_idx, addr_in_wts=addr_in_wts, addr_in_sc=addr_in_sc,
                     dispatch_blocks=dispatch_blocks,
@@ -483,7 +480,6 @@ def compile_mega_moe_stage1(
                     chunks_per_destination=chunks_per_destination,
                     tile_state_stride=tile_state_stride,
                     indexed_payload=indexed_payload,
-                    fast_copy=FAST_COPY,
                 )
         if const_expr(fixed_slot_dispatch):
             if is_owner:
@@ -520,13 +516,9 @@ def compile_mega_moe_stage1(
                 out_rsrc = ptr_buf_tensor(
                     fx.get_iter(out), fx.Int8, num_records_bytes=out_nbytes
                 )
-            elif const_expr(EPI_EVEC == 8):
-                out_rsrc = ptr_buf_tensor(
-                    fx.get_iter(out), fx.Int32, unit_elems=2, num_records_bytes=out_nbytes
-                )
             else:
                 out_rsrc = ptr_buf_tensor(
-                    fx.get_iter(out), fx.Int16, num_records_bytes=out_nbytes
+                    fx.get_iter(out), fx.Int32, unit_elems=2, num_records_bytes=out_nbytes
                 )
         os_rsrc = ptr_buf_tensor(
             fx.get_iter(out_scale), fx.Int8, num_records_bytes=os_nbytes
@@ -576,16 +568,14 @@ def compile_mega_moe_stage1(
         total_work = num_m_tiles * fx.Int32(N_TILES)
         use_ready_order = fx.Int32(0) == 1
         if const_expr(compact_dispatch):
-            max_expert_tiles = ptr_buf_tensor(
-                a_max_expert_tiles, fx.Int32, **bounded(4)
-            )[fx.Int32(0)]
+            max_expert_tiles = ptr_buf_tensor(a_max_expert_tiles, fx.Int32)[
+                fx.Int32(0)
+            ]
             use_ready_order = max_expert_tiles * fx.Int32(4) >= num_m_tiles
 
         def _wait_tile_payload(flat):
             tile_index = flat // fx.Int32(N_TILES)
-            expected_tiles = ptr_buf_tensor(
-                addr_tile_expected, fx.Int32, **bounded(TILE_STATE_BYTES)
-            )[tile_index]
+            expected_tiles = ptr_buf_tensor(addr_tile_expected, fx.Int32)[tile_index]
             comm_ops.wait_i32_until_equals(
                 addr_tile_ready + fx.Int64(tile_index) * 4,
                 expected_tiles,
@@ -760,7 +750,6 @@ def compile_mega_moe_stage1_bundle(
     act: str = "silu",
     situ_beta: float = 1.0,
     situ_linear_beta: float = 1.0,
-    bounds_check: bool = False,
     a_dtype: str = "fp8",
     out_dtype: str = "fp8",
 ):
@@ -802,7 +791,6 @@ def compile_mega_moe_stage1_bundle(
             situ_linear_beta=situ_linear_beta,
             a_dtype=a_dtype,
             out_dtype=out_dtype,
-            bounds_check=bounds_check,
             _return_kernel_spec=True,
         )
         for config in variants
@@ -881,7 +869,7 @@ def run_mega_moe_stage1(out, x, w, scale_x, scale_w, sorted_token_ids, expert_id
     b_nt=-1, work_shards=None,
     payload_chunk_rows=0, tile_state_stride=0,
     a_dtype="fp8", out_dtype="fp8",
-    swiglu_limit=0.0, act="silu", situ_beta=1.0, situ_linear_beta=1.0, bounds_check=False):
+    swiglu_limit=0.0, act="silu", situ_beta=1.0, situ_linear_beta=1.0):
     launch = compile_mega_moe_stage1(
         model_dim=model_dim, inter_dim=inter_dim, rank=rank, experts_per_rank=experts_per_rank,
         fuse_npes=fuse_npes, fuse_topk=fuse_topk, fuse_cap=fuse_cap, fuse_mtpr=fuse_mtpr,
@@ -893,7 +881,6 @@ def run_mega_moe_stage1(out, x, w, scale_x, scale_w, sorted_token_ids, expert_id
         b_nt=b_nt, work_shards=work_shards, payload_chunk_rows=payload_chunk_rows,
         tile_state_stride=tile_state_stride, a_dtype=a_dtype, out_dtype=out_dtype,
         swiglu_limit=swiglu_limit, act=act, situ_beta=situ_beta, situ_linear_beta=situ_linear_beta,
-        bounds_check=bounds_check,
     )
     _run_compiled(
         launch, out, x, w, scale_x, scale_w, sorted_token_ids, expert_ids, num_valid_ids, out_scale,
