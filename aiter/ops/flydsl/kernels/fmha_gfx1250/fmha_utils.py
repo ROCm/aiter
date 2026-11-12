@@ -500,9 +500,19 @@ TORCH_DTYPE_MAP = {
     "bf8": torch.float8_e5m2,
 }
 
-# LDS budget for the 12-chunk map both siblings share.
-LDS_QO_BYTES = 17 * 1024
-LDS_CHUNK_BYTES = 26 * 1024
+# LDS budget for the 16-chunk map both siblings share: 16 x 20 KB = the whole 320 KB
+# budget, 4 K|V slots x 2 split halves x (K,V). Q and O each stage ONE whole chunk per
+# wave. 20 KB rather than the 18 KB the widest tile needs: it is what keeps every tile's
+# two n_block halves in different 64 KB LDS segments once the chunks straddle those
+# boundaries. The per-kernel maps are in each sibling's header comment.
+LDS_CHUNK_BYTES = 20 * 1024
+LDS_QO_BYTES = LDS_CHUNK_BYTES
+# O per-wave ceiling. Capacity alone is now LDS_QO_BYTES, which would newly admit
+# v_hdim 256 at BLOCK_M 256 (16896 B/wave) -- the 12-chunk map rejected that only because
+# two waves shared one 26 KB chunk. Doubling BLOCK_M for v_hdim 256 is a DISPATCH change
+# that has never been measured, so keep the old effective bound here; raise it to
+# LDS_QO_BYTES to unlock it deliberately.
+_O_MAX_WARP_BYTES = 9 * 1024
 O_VARIANT = "v2"
 NUM_Q_TILES_CHOICES = (1, 2)
 
@@ -515,9 +525,8 @@ _O_PROBE_DTYPE = fx.BFloat16
 def _o_manager(*, v_hdim, gqa_ratio, num_q_tiles_per_wave, elem_dtype):
     """The O epilogue's LDS staging manager, plus the clearance check both cores need.
 
-    Two waves share a chunk at 0 and LDS_QO_BYTES, and the upper one must stop short of
-    the next chunk -- that clearance is what keeps O off the V rows a dead carried ring
-    head may still be reading."""
+    Each wave owns a whole LDS_CHUNK_BYTES chunk, so the fit is a plain per-wave bound;
+    ``_O_MAX_WARP_BYTES`` holds it below raw capacity on purpose."""
     _o_manager_cls = {"v1": OManagerV1, "v2": OManagerV2, "v3": OManagerV3}[O_VARIANT]
     o_mgr = _o_manager_cls(
         v_hdim=v_hdim,
@@ -526,9 +535,9 @@ def _o_manager(*, v_hdim, gqa_ratio, num_q_tiles_per_wave, elem_dtype):
         q_tiles_per_wave=num_q_tiles_per_wave,
         elem_dtype=elem_dtype,
     )
-    assert LDS_QO_BYTES + o_mgr.warp_lds_size_in_byte() <= LDS_CHUNK_BYTES, (
-        f"O per-wave {o_mgr.warp_lds_size_in_byte()}B does not fit above the "
-        f"{LDS_QO_BYTES}B slice inside a {LDS_CHUNK_BYTES}B chunk"
+    assert o_mgr.warp_lds_size_in_byte() <= _O_MAX_WARP_BYTES, (
+        f"O per-wave {o_mgr.warp_lds_size_in_byte()}B over the "
+        f"{_O_MAX_WARP_BYTES}B per-wave bound"
     )
     return o_mgr
 

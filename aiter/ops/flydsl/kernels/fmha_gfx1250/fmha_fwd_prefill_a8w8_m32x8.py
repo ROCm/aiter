@@ -191,20 +191,25 @@ SUPPORTED_V_HDIM = (64, 128, 256)
 
 # KV sequence block (columns of one QK GEMM tile). Configurable; 64 for now.
 N_BLOCK_CHOICES = (32, 64, 128, 256)
-# ---- LDS chunk layout: 12 x 26 KB = 312 KB of the 320 KB budget. ----
-# Chunk i sits at LDS_CHUNK_BYTES * i. Every K|V tile is split 2-way along n_block, the
-# halves 6 chunks apart so they land in different 64 KB LDS segments:
+# ---- LDS chunk layout: 16 x 20 KB = 320 KB, the whole budget (shared with the 16-bit
+# sibling; the map itself is in fmha_utils). 4 K|V slots, each tile split 2-way along
+# n_block. Slots are grouped in PAIRS: group g = slot//2 owns 8 chunks at g*160 KB, and
+# inside a group the two ".1" halves sit ``_SPLIT_STRIDE`` = 80 KB above the ".0" halves,
+# which is what keeps every tile's two halves in DIFFERENT 64 KB segments.
 #
-#   K[0][0]   0..26  seg 0      K[0][1] 156..182  seg 2
-#   V[0][0]  26..52  seg 0      V[0][1] 182..208  seg 2,3
-#   K[1][0]  52..78  seg 0,1    K[1][1] 208..234  seg 3
-#   V[1][0]  78..104 seg 1      V[1][1] 234..260  seg 3,4
-#   K[2][0] 104..130 seg 1,2    K[2][1] 260..286  seg 4
-#   V[2][0] 130..156 seg 2      V[2][1] 286..312  seg 4
+#   K[0][0]   0.. 20  seg 0      K[2][0] 160..180  seg 2
+#   V[0][0]  20.. 40  seg 0      V[2][0] 180..200  seg 2,3
+#   K[1][0]  40.. 60  seg 0      K[3][0] 200..220  seg 3
+#   V[1][0]  60.. 80  seg 0,1    V[3][0] 220..240  seg 3
+#   K[0][1]  80..100  seg 1      K[2][1] 240..260  seg 3,4
+#   V[0][1] 100..120  seg 1      V[2][1] 260..280  seg 4
+#   K[1][1] 120..140  seg 1,2    K[3][1] 280..300  seg 4
+#   V[1][1] 140..160  seg 2      V[3][1] 300..320  seg 4
 #
-# Q and O own no LDS -- they time-share KV chunks (see _q_wave_base / _o_wave_base).
+# At 8-bit the widest half is 17 KB (hdim 256), so every supported hdim fits with room --
+# unlike the 16-bit sibling, this map costs no n_block scope. Q and O own no LDS: Q takes
+# group 1 (the last slots the prologue fills), O group 0 behind a full TDM drain.
 KV_LDS_SPLITS = 2  # halves one K (or V) tile is split into along n_block
-# Per-wave Q / O region inside a chunk pair. 17 KB covers 32 rows x 256 hdim + pad.
 
 DEFAULT_N_BLOCK = 64
 # Auto-picked n_block, widest first: a wider tile must still fit one chunk per split half
@@ -212,11 +217,14 @@ DEFAULT_N_BLOCK = 64
 N_BLOCK_PREF = (128, 64)
 N_BLOCK_WIDE_MAX_QK_HDIM = 128
 
-# K|V LDS slots the main loop rotates through. 3 is the minimum for the software-pipelined
-# body: it reads V(tile_idx-1) from slot 0 and K(tile_idx) from slot 1 while tile_idx+1 is
-# written into slot 2. Two slots would need V written into the slot this body still reads,
-# which also races the carried ring head.
-N_KV_PP = 3
+# K|V LDS slots the main loop rotates through, and the prefetch distance that follows
+# from it: body ``u`` reads V(u-1) from slot 0 and K(u) from slot 1 while tiles u+1 and
+# u+2 are in flight into slots 2 and 3, so the tile this body issues is u + (N_KV_PP-2).
+# 3 slots (distance 1) left s_wait_tensorcnt exposed; the 4th slot is what buys distance
+# 2. Two slots would need V written into the slot this body still reads, which also
+# races the carried ring head.
+N_KV_PP = 4
+KV_PREFETCH_DISTANCE = N_KV_PP - 2
 
 # Softmax runs in log2 units: LOG2E is folded into Q by the Q loader's bf16 multiply, so
 # the inner loop is a plain exp2_fastmath(S' - m) and m/LSE live in the log2 domain.
@@ -850,8 +858,12 @@ def _attention_prologue(
     assert k_blk_bytes % KV_LDS_SPLITS == 0 and v_blk_bytes % KV_LDS_SPLITS == 0
     # Chunk stride between a tile's two n_block halves (K[slot_idx][0] -> K[slot_idx][1]) and between
     # consecutive slots. Slot slot_idx occupies chunks 2pp, 2pp+1 low and 2pp+6, 2pp+7 high.
-    _SPLIT_STRIDE = 6 * LDS_CHUNK_BYTES  # 156 KB
-    slot_bytes = 2 * LDS_CHUNK_BYTES  # 52 KB: one slot's K|V pair in one half
+    # Chunk stride between a tile's two n_block halves. Uniform across slots: inside a
+    # group the ".1" halves sit 4 chunks above the ".0" ones, and the group offset applies
+    # to both halves equally.
+    _SPLIT_STRIDE = 4 * LDS_CHUNK_BYTES  # 80 KB
+    slot_bytes = 2 * LDS_CHUNK_BYTES  # 40 KB: one slot's K|V pair in one half
+    _GROUP_BYTES = 8 * LDS_CHUNK_BYTES  # 160 KB: the 4 chunks x 2 halves of a slot PAIR
     for _label, _bytes in (("K", k_blk_bytes), ("V", v_blk_bytes)):
         assert _bytes // KV_LDS_SPLITS <= LDS_CHUNK_BYTES, (
             f"{_label} split {_bytes // KV_LDS_SPLITS}B exceeds the {LDS_CHUNK_BYTES}B chunk "
@@ -859,14 +871,19 @@ def _attention_prologue(
         )
     assert 2 * N_KV_PP * slot_bytes <= get_lds_capacity_bytes(
         "gfx1250"
-    ), "12-chunk K|V layout over LDS capacity"
+    ), "16-chunk K|V layout over LDS capacity"
 
-    def _k_lds_buf(
-        slot_idx,
-    ):  # slot ``pp``'s low-half base == K[slot_idx][0] (int or fx.Int32; folds when const)
-        if isinstance(slot_idx, int):
-            slot_idx = fx.Int32(slot_idx)
-        return lds_base + slot_idx * fx.Int32(slot_bytes)
+    def _k_lds_buf(slot_idx):
+        """Slot ``slot_idx``'s low-half base == K[slot_idx][0].
+
+        Slots are laid out in pairs: group ``slot_idx//2`` at ``_GROUP_BYTES``, and the
+        slot's place inside it at ``slot_bytes``. Always a compile-time int here -- the
+        loop carries the resulting bases as ds pointers and rotates them, so the
+        non-uniform slot spacing never reaches the body."""
+        assert isinstance(slot_idx, int), "slot bases are compile-time"
+        return lds_base + fx.Int32(
+            (slot_idx // 2) * _GROUP_BYTES + (slot_idx % 2) * slot_bytes
+        )
 
     def _v_lds_buf(slot_idx):  # V[slot_idx][0] == the slot base one chunk in
         return _k_lds_buf(slot_idx) + fx.Int32(LDS_CHUNK_BYTES)
@@ -874,7 +891,7 @@ def _attention_prologue(
     # Logical slot -> physical chunk pair. Q covers all of physical slot 1 and the low
     # 17 KB of slot 2's K chunks, so physical slot 0 is the only Q-disjoint one; putting
     # the first tile (logical slot 1) there lets the prologue issue it before Q is read.
-    _PHYSICAL_SLOT = [2, 0, 1]
+    _PHYSICAL_SLOT = [0, 1, 2, 3]
 
     def _k_bufs_at(
         slot,
@@ -917,7 +934,7 @@ def _attention_prologue(
         ), f"{_label} per-wave {_bytes}B over the {LDS_QO_BYTES}B slice"
     _q_chunk_sel = (warp_idx & fx.Int32(1)) ^ ((warp_idx >> fx.Int32(2)) & fx.Int32(1))
     q_lds_warp = (
-        _k_lds_buf(1)
+        _k_lds_buf(2)
         + _q_chunk_sel * fx.Int32(_SPLIT_STRIDE)
         + (warp_idx >> fx.Int32(1)) * fx.Int32(LDS_QO_BYTES)
     )
@@ -1046,6 +1063,17 @@ def _attention_prologue(
     v_start_desc = _v_desc(
         _k_lds_buf(_PHYSICAL_SLOT[1]), start_row0, _start_valid, _start_pages
     )
+    # Tile start+1 too: body start issues start+2, so start+1 has no body to issue it.
+    _second_tile_idx = start_tile_idx + fx.Int32(1)
+    _second_row0 = _tile_row0(_second_tile_idx)
+    _second_valid = _kv_valid(_second_tile_idx)
+    _second_pages = _kv_policy.indices_for(_second_tile_idx)
+    k_second_desc = _k_desc(
+        _k_lds_buf(_PHYSICAL_SLOT[2]), _second_row0, _second_valid, _second_pages
+    )
+    v_second_desc = _v_desc(
+        _k_lds_buf(_PHYSICAL_SLOT[2]), _second_row0, _second_valid, _second_pages
+    )
 
     # Per-half counter usage, off the descriptors' declared counts. A counter this half
     # never touches gets -1 ("do not wait on it"), NOT 0.
@@ -1057,7 +1085,15 @@ def _attention_prologue(
     # Fully-drained depths name only WHICH counters are live, and both bands live on the
     # same one, so one prologue fence serves both halves.
     assert _drains[WarpType.LO] == _drains[WarpType.HI], "prologue fence is per-WG"
-    _kv_drain = _drains[WarpType.LO]
+    # The prologue issues TWO tiles, so its fence retires only the first: leaving one
+    # tile's worth of copies outstanding is what hands the loop a full prefetch distance
+    # instead of making body start re-earn it. ``_copy_fence`` sits outside the warp-type
+    # branch and needs ONE immediate, so take the smaller of the two bands' counts --
+    # over-draining the wider band costs part of one tile's cover, once per workgroup.
+    _prologue_drain = tuple(
+        -1 if lo < 0 or hi < 0 else min(lo, hi)
+        for lo, hi in zip(kv_counts[WarpType.LO], kv_counts[WarpType.HI])
+    )
 
     # Under V2 no prologue copy lands on Q's chunks, so all go out before Q is read and
     # overlap its latency. Under V1 Q's own stage shares asynccnt and part2 waits a depth
@@ -1067,10 +1103,13 @@ def _attention_prologue(
             WarpType.LO: [k_start_desc],
             WarpType.HI: [v_start_desc],
         }
-        _late = {WarpType.LO: [], WarpType.HI: []}
+        _late = {WarpType.LO: [k_second_desc], WarpType.HI: [v_second_desc]}
     else:
         _early = {WarpType.LO: [], WarpType.HI: []}
-        _late = {WarpType.LO: [k_start_desc], WarpType.HI: [v_start_desc]}
+        _late = {
+            WarpType.LO: [k_start_desc, k_second_desc],
+            WarpType.HI: [v_start_desc, v_second_desc],
+        }
 
     # Body start reads V(start-1) from logical slot 0 against a zero P. Zero the slot
     # rather than refetching V(start) into it: stale LDS can decode to NaN, and 0*NaN is
@@ -1111,9 +1150,14 @@ def _attention_prologue(
             for _desc in _late[WarpType.HI]:
                 _desc.async_load()
 
+    # The late copies land in logical slot 2 == Q's group, so Q must be out of LDS
+    # first: drain this wave's Q ds_reads, then rendezvous so no wave is still reading
+    # another's slice. One barrier, once per workgroup.
+    rocdl.s_wait_dscnt(0)
+    _bare_barrier()
     _issue_late(_is_lo)
     rocdl.sched_barrier(0)
-    _copy_fence(*_kv_drain)
+    _copy_fence(*_prologue_drain)
 
     return {
         "lane_idx": lane_idx,
@@ -1138,7 +1182,7 @@ def _attention_prologue(
         "start_tile_idx": start_tile_idx,
         "kv_policy": _kv_policy,
         "kv_counts": kv_counts,
-        "kv_drain": _kv_drain,
+        "kv_drain": _prologue_drain,
         "q_frags": q_frags,
     }
 
@@ -1229,7 +1273,13 @@ def _attention_core_multi_kv_tiles(
     kv_policy = prologue["kv_policy"]
     _tile_row0 = kv_policy.tile_row0
     _kv_valid = kv_policy.kv_valid
-    _kv_drain = prologue["kv_drain"]
+    # In-loop fence depth. At distance 2 the tile this body READS was issued two bodies
+    # ago and has had a whole body to land; what is still outstanding at the fence is the
+    # NEXT tile, so retire only down to one tile's worth of copies instead of to zero.
+    # The core is traced once per warp_type, so each half gets its own band's immediate.
+    _kv_drain = prologue["kv_counts"][
+        WarpType.LO if warp_type.is_lo else WarpType.HI
+    ]
     q_frags = prologue["q_frags"]
     # 8-bit Q cannot carry the scale (no f8 multiply); softmax applies it to S.
     _s_scale = softmax_scale * fx.Float32(LOG2E)
@@ -1364,7 +1414,8 @@ def _attention_core_multi_kv_tiles(
 
     _kv_state_idx = len(_init)
     _init = _init + [
-        _raw(v) for v in kv_policy.init_state(start_tile_idx + fx.Int32(1))
+        _raw(v)
+        for v in kv_policy.init_state(start_tile_idx + fx.Int32(KV_PREFETCH_DISTANCE))
     ]
 
     # ========================================================================
@@ -1459,7 +1510,7 @@ def _attention_core_multi_kv_tiles(
         # tile_idx-2 -- so the distance is the same on both and the slot arithmetic has no half
         # to branch on.
         write_slot = slot_of[N_KV_PP - 1]
-        prefetch_tile_idx = tile_idx + fx.Int32(1)
+        prefetch_tile_idx = tile_idx + fx.Int32(KV_PREFETCH_DISTANCE)
         kv_state_prev = list(
             state[_kv_state_idx : _kv_state_idx + kv_policy.num_state_slots]
         )
@@ -1779,23 +1830,14 @@ def _attention_core_multi_kv_tiles(
         # wave 0 is still reading K out of it.
         _bare_barrier()
 
-    _o_free_slots = [
-        fx.Int32(final[_slot_bases_idx + 2]),
-        fx.Int32(final[_slot_bases_idx + 0]),
-    ]
-    o_lds_warp = (
-        ((warp_idx & fx.Int32(1)) > fx.Int32(0)).select(
-            _o_free_slots[1], _o_free_slots[0]
-        )
-        + ((warp_idx >> fx.Int32(1)) & fx.Int32(1)) * fx.Int32(LDS_QO_BYTES)
-        + (warp_idx >> fx.Int32(2)) * fx.Int32(_SPLIT_STRIDE)
-    )
-    # The trailing body's dead clamped tile copies are still in flight. HI's targets
-    # final[1], a V chunk O never touches; LO's two K copies land in final[2] and final[1],
-    # and final[2] IS an O chunk -- so the drain needs a rendezvous behind it, which
-    # ``_attention_epilogue`` supplies, since a wave only retires its own copies and O's
-    # chunk halves are shared by wave pairs.
-    _copy_wait(*_kv_drain)
+    # All 16 chunks belong to K|V now, so O cannot be placed on slots the loop happens to
+    # be done with -- it takes group 0 outright, one 20 KB chunk per wave, behind a FULL
+    # drain and a rendezvous. The drain retires every outstanding copy (two tiles deep at
+    # this point, including the trailing body's dead clamped ones); the barrier then makes
+    # sure no wave is still reading a tile another wave is about to overwrite with O.
+    _copy_wait(*_kv_drain_depths(*_kv_drain))
+    _bare_barrier()
+    o_lds_warp = lds_base + warp_idx * fx.Int32(LDS_QO_BYTES)
     return _epi_state(
         m_list=[
             fx.Float32(final[q_tile_idx * _q_state_slots + 0])
