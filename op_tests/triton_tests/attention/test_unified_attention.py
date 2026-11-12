@@ -2507,6 +2507,9 @@ def _non_causal_case(seq_lens, num_heads, head_size, block_size, dtype, sinks):
 
 
 def _assert_non_causal_close(out, ref, dtype):
+    # The fp8 mismatch check below is false for NaN, so check for NaN and inf first.
+    assert torch.isfinite(out).all(), "non-finite values in the output"
+    assert torch.isfinite(ref).all(), "non-finite values in the reference"
     if dtype.itemsize == 1:
         # fp8: allow 0.5% of the elements outside the tolerance, as the causal tests
         atol, rtol = 1.5e-1, 1.5e-1
@@ -2619,7 +2622,7 @@ def test_unified_attn_non_causal_decode_batch(kv_lens):
 
 
 @torch.inference_mode()
-def test_unified_attn_non_causal_rejects():
+def test_unified_attn_non_causal_rejects(monkeypatch):
     """causal=False raises ValueError for the cases that it does not support."""
     seq_lens = [(8, 300), (8, 600)]
     data = generate_data(
@@ -2655,14 +2658,31 @@ def test_unified_attn_non_causal_rejects():
         args.update(kwargs)
         unified_attention(**args)
 
+    # A finite left or right window bound, also in a decode batch.
+    for window_size in [(127, 0), (-1, 2)]:
+        with pytest.raises(ValueError, match="sliding window"):
+            run(window_size=window_size)
+    with pytest.raises(ValueError, match="sliding window"):
+        run(window_size=(127, 0), max_seqlen_q=1)
+
     assert not unified_attention_supports_non_causal(backend="triton")
     with pytest.raises(ValueError, match="causal=False"):
         run(backend="triton")
     if not unified_attention_supports_non_causal():
-        with pytest.raises(ValueError, match="causal=False"):
-            run()
+        for backend in [None, "gluon"]:
+            with pytest.raises(ValueError, match="causal=False"):
+                run(backend=backend)
         return
-    with pytest.raises(ValueError, match="sliding window"):
-        run(window_size=(127, 0))
     with pytest.raises(ValueError, match="causal=False"):
         run(softcap=30.0)
+    # A V cache dtype that is not the K cache dtype.
+    with pytest.raises(ValueError, match="causal=False"):
+        run(v=value_cache.to(e4m3_dtype))
+
+    # An arch without Gluon support, with backend="gluon": ValueError, not the
+    # AssertionError of the Gluon backend check.
+    module = sys.modules[unified_attention.__module__]
+    monkeypatch.setattr(module, "DEVICE_ARCH", "gfx942")
+    monkeypatch.setattr(module, "_is_gluon_available", lambda: False)
+    with pytest.raises(ValueError, match="gfx950 Gluon"):
+        run(backend="gluon")

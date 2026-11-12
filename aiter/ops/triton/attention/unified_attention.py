@@ -249,8 +249,8 @@ def unified_attention_supports_non_causal(backend: str | None = None) -> bool:
     """Return True if unified_attention can run causal=False on this device.
 
     Only the gfx950 Gluon kernel runs non-causal attention. The call also needs
-    a config that the gfx950 Gluon kernel supports and no sliding window (see
-    _check_non_causal).
+    a config that this kernel supports and no sliding window (see the
+    unified_attention docstring).
     """
     if backend is not None and backend.lower() != "gluon":
         return False
@@ -261,21 +261,15 @@ def unified_attention_supports_non_causal(backend: str | None = None) -> bool:
     )
 
 
-def _check_non_causal(params: _UAParams, backend: str):
-    """Raise ValueError if causal=False cannot run on the gfx950 Gluon kernel."""
-    if params.sliding_window > 0:
-        raise ValueError(
-            "unified_attention: causal=False does not support a sliding window"
-        )
-    if not unified_attention_supports_non_causal(backend):
-        raise ValueError(
-            "unified_attention: causal=False runs only on the gfx950 Gluon kernel "
-            f"(arch '{DEVICE_ARCH}', backend '{backend}')"
-        )
-    if not _gfx950_gluon_supported(params):
+def _check_non_causal_config(params: _UAParams):
+    """Raise ValueError if the gfx950 Gluon kernel cannot run this causal=False call."""
+    if (
+        not _gfx950_gluon_supported(params)
+        or params.v_cache_dtype != params.kv_cache_dtype
+    ):
         raise ValueError(
             "unified_attention: causal=False needs a config that the gfx950 Gluon "
-            "kernel supports: bf16 or fp8 Q and KV of the same dtype, a "
+            "kernel supports: bf16 or fp8 Q, K and V of the same dtype, a "
             "power-of-two head size <= 256 with equal K and V head sizes, and no "
             "softcap, ALiBi or query-query bias"
         )
@@ -525,9 +519,14 @@ def unified_attention(
 
     Returns None. The result is in out.
     """
-    # In a decode batch, each query token attends to all keys in both modes.
-    if not causal and int(max_seqlen_q) == 1:
-        causal = True
+    if not causal:
+        if window_size[0] >= 0 or window_size[1] >= 0:
+            raise ValueError(
+                "unified_attention: causal=False does not support a sliding window"
+            )
+        # In a decode batch, each query token attends to all keys in both modes.
+        if int(max_seqlen_q) == 1:
+            causal = True
 
     if backend is None:
         backend = "gluon" if _is_gluon_available() else "triton"
@@ -536,6 +535,11 @@ def unified_attention(
         "triton",
         "gluon",
     ), f"Unknown backend '{backend}', must be 'triton' or 'gluon'"
+    if not causal and not unified_attention_supports_non_causal(backend):
+        raise ValueError(
+            "unified_attention: causal=False runs only on the gfx950 Gluon kernel "
+            f"(arch '{DEVICE_ARCH}', backend '{backend}')"
+        )
     if backend == "gluon":
         assert (
             _is_gluon_available()
@@ -706,7 +710,7 @@ def unified_attention(
         force_fp8_pv_on_fp4_kv_cache=force_fp8_pv_on_fp4_kv_cache,
     )
     if not causal:
-        _check_non_causal(params, backend)
+        _check_non_causal_config(params)
 
     # if batch contains a prefill
     if use_2d_kernel(params, backend):
