@@ -490,13 +490,30 @@ def batched_gemm_a8w8_mxscale_bpreshuffle_fused_quant(
     return y8, y_scale
 
 
+def _fused_quant_runs(name: str, gfx: str) -> bool:
+    """Whether the fused epilogue can run this flydsl kernel name."""
+    if gfx == "gfx950":
+        from .flydsl.batched_gemm_a8w8_gfx950 import parse_bmm_kernel_name
+
+        # The runner would set aside a tile that splits a 32-column group.
+        parsed = parse_bmm_kernel_name(name)
+        return parsed is not None and parsed["tile_n"] % 32 == 0
+    from .flydsl import batched_gemm_a8w8_gfx1250 as bmm_gfx1250
+
+    return bmm_gfx1250.parse_bmm_mx32_kernel_name(name) is not None
+
+
 @functools.lru_cache(maxsize=1024)
 def _fused_quant_tuned_kernel(
     g: int, m: int, n: int, k: int, w_scale_block: str, gfx: str, cu_num: int
 ) -> str | None:
     """The preshuffle table's flydsl batched kernel for this shape, the one the
-    bf16 entry runs, so both entries share the tuned tile; None (the runner's
-    own choice) when there is no such row."""
+    bf16 entry runs, so both entries share the tuned tile.
+
+    On gfx950, where that row is OPUS or a tile the epilogue cannot run, the
+    shape's flydsl row at the next larger tuned M (else the largest) stands in:
+    the runner's own heuristic tile is far slower there at large M. None (the
+    runner's own choice) when the shape has no usable row."""
 
     cfg = lookup_mxscale_bmm_config(
         g,
@@ -508,20 +525,25 @@ def _fused_quant_tuned_kernel(
         gfx=gfx,
         cu_num=cu_num,
     )
-    if cfg is None or cfg["libtype"] != "flydsl":
+    if (
+        cfg is not None
+        and cfg["libtype"] == "flydsl"
+        and _fused_quant_runs(cfg["kernelName"], gfx)
+    ):
+        return cfg["kernelName"]
+    if gfx != "gfx950":
         return None
-    name = cfg["kernelName"]
-    if gfx == "gfx950":
-        from .flydsl.batched_gemm_a8w8_gfx950 import parse_bmm_kernel_name
-
-        # The runner would set aside a tile that splits a 32-column group.
-        parsed = parse_bmm_kernel_name(name)
-        return name if parsed is not None and parsed["tile_n"] % 32 == 0 else None
-    from .flydsl import batched_gemm_a8w8_gfx1250 as bmm_gfx1250
-
-    if bmm_gfx1250.parse_bmm_mx32_kernel_name(name) is None:
+    rows = sorted(
+        (key[3], row["kernelName"])
+        for key, row in _load_mxscale_bmm_tuned(None, True).items()
+        if key[:3] == (gfx, cu_num, g)
+        and key[4:] == (n, k, w_scale_block)
+        and row.get("libtype") == "flydsl"
+        and _fused_quant_runs(row["kernelName"], gfx)
+    )
+    if not rows:
         return None
-    return name
+    return next((name for row_m, name in rows if row_m >= m), rows[-1][1])
 
 
 def batched_gemm_a8w8_mxscale_bpreshuffle_fused_quant_supported(
