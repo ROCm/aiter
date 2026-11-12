@@ -471,11 +471,9 @@ def unified_attention(
 ):
     """Paged attention for a varlen batch of query tokens.
 
-    Each sequence i has the query tokens cu_seqlens_q[i]:cu_seqlens_q[i + 1]
-    and seqused_k[i] keys in the paged cache that block_table addresses. The
-    query tokens are the last keys of their sequence. With causal=True, a
-    query token attends to the keys up to its own position. With causal=False,
-    it attends to all keys of its sequence.
+    The query tokens are the last positions of their sequence. With causal=True
+    a token sees the keys up to its own position; with causal=False it sees all
+    keys of its sequence.
 
     Args:
         q: [num_tokens, num_query_heads, head_size] queries. An fp4 q
