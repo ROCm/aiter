@@ -7,6 +7,7 @@ from torch import Tensor
 from ..jit.core import compile_ops
 from ..jit.utils.chip_info import get_gfx_runtime
 from ..jit.utils.torch_guard import torch_compile_guard
+from ..plugin import route as _route
 from .quant import get_dtype_max
 
 # opus is the sole rmsnorm backend (fp16/bf16/fp32, any hidden). Only group_size/
@@ -399,13 +400,39 @@ def _use_hip_common(input: Tensor, use_model_sensitive_rmsnorm: int) -> bool:
         and input.dim() == 2
         and input.element_size() == 2
         and input.shape[-1] <= 8192
-        and (input.shape[-1] % 8 == 0 or get_gfx_runtime() != "gfx1250")
+        and (
+            input.shape[-1] % 8 == 0
+            or get_gfx_runtime() not in ("gfx1250", "gfx1250-strict")
+        )
     )
 
 
+# Routed here rather than on either public spelling or on a backend binding.
+# rms_norm and rmsnorm2d_fwd are two public names for one op and both call this
+# directly, so this is where the op begins; the HIP and opus choice is made
+# below it, so a provider sees the op rather than one backend's share of it.
+# Version 2: version 1 was the HIP binding's write-out contract, which is a
+# different shape, not an older spelling of this one.
+@_route(op="rmsnorm", version=2)
 def _rms_norm_fwd_dispatch(
     input, weight, epsilon, use_model_sensitive_rmsnorm
 ) -> Tensor:
+    """RMSNorm over the last axis, returning a new tensor.
+
+    Args:
+        input: ``[M, N]`` activation. Read only -- v1 of this op name wrote
+            into the caller's input, which is why a v1 kernel is not offered
+            a v2 call.
+        weight: ``[N]`` scale applied after normalising.
+        epsilon: added inside the rsqrt.
+        use_model_sensitive_rmsnorm: non-zero selects the model-sensitive
+            variant, which also takes the op off the fast HIP path.
+
+    Returns a newly allocated tensor shaped and typed like ``input``. A
+    provider serving this contract allocates its own output; nothing here is
+    written in place. ``rmsnorm_with_add`` is the separate contract for the
+    fused residual form.
+    """
     # Flat one-guard dispatch: common (bf16/fp16, hidden<=8192, non-T5, 2-D) -> fast HIP
     # module_rmsnorm_quant; opus generic otherwise. rms_norm and rmsnorm2d_fwd both call this
     # directly (not each other) so the vLLM no-add path pays a single torch_compile_guard.
@@ -438,6 +465,7 @@ def rmsnorm2d_fwd(
     return _rms_norm_fwd_dispatch(input, weight, epsilon, use_model_sensitive_rmsnorm)
 
 
+@_route(op="rmsnorm_with_add", version=1)
 @torch_compile_guard(
     mutates_args=["out", "residual_out"], gen_fake=lambda *a, **k: None
 )
@@ -451,6 +479,30 @@ def rmsnorm2d_fwd_with_add(
     gemma_norm: bool = False,
     use_model_sensitive_rmsnorm: int = 0,
 ) -> None:
+    """Fused residual add + RMSNorm. Writes ``out`` and ``residual_out``.
+
+    Computes ``residual_out = input + residual_in`` and then normalises THAT
+    sum into ``out``. Both are outputs, and the un-normalised sum is one of
+    them: the next block needs the running residual, so it has to leave here
+    as well as the normalised activation.
+
+    Args:
+        out: ``[M, N]`` normalised result. Written, not accumulated.
+        input: ``[M, N]`` this block's activation.
+        residual_in: ``[M, N]`` incoming residual.
+        residual_out: ``[M, N]`` receives ``input + residual_in``. May alias
+            ``residual_in``; it may NOT alias ``out``.
+        weight: ``[N]`` RMSNorm weight.
+        epsilon: added inside the rsqrt.
+        gemma_norm: scale by ``1 + weight`` instead of ``weight``.
+        use_model_sensitive_rmsnorm: selects the model-sensitive variant;
+            with the default 0 the fast HIP path is eligible.
+
+    Returns nothing. A provider serving this contract owns both writes and
+    must leave ``out`` and ``residual_out`` fully written for every row; a
+    caller cannot tell a skipped row from a correct one by inspecting the
+    return value, because there is none.
+    """
     if _use_hip_common(input, use_model_sensitive_rmsnorm):
         add_rmsnorm(  # fast HIP module_rmsnorm_quant
             out, input, residual_in, residual_out, weight, epsilon, gemma_norm
