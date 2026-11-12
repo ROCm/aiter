@@ -28,6 +28,8 @@ so the kernels change and change back as M grows. Rows of other archs
 are replayed at the smallest M they serve and bisected between the two ends
 where they request different kernels. Either way that also reaches the FlyDSL
 heuristic kernels the runtime falls back to below a shape's smallest tuned M.
+A table the runtime matches at exactly M (``Table.exact_m``) has each row
+replayed at its M only; the shapes its ``extra_jobs`` name reach its fallback.
 
 Rows are replayed for the arch their ``gfx`` column names (``cu_num`` for
 legacy rows); with ``GPU_ARCHS`` naming targets, only those archs. The
@@ -245,6 +247,55 @@ def _a16w16(job: dict) -> None:
     )
 
 
+def _a16w16_gfx942(job: dict) -> None:
+    from unittest import mock
+
+    from aiter.ops.flydsl.gemm_kernels import flydsl_hgemm
+
+    m, n, k = job["m"], job["n"], job["k"]
+    bf16 = _dtype("bfloat16")
+    # A fallback job must reach the fallback even if a tuned row has its shape.
+    skip = {"AITER_FLYDSL_GEMM_GFX942_SKIP_TABLE": "1"} if job.get("fallback") else {}
+    with mock.patch.dict(os.environ, skip):
+        flydsl_hgemm(
+            _empty(m, k, dtype=bf16),
+            _empty(n, k, dtype=bf16),
+            # The column holds the kernel's name for the dtype, not Torch's.
+            out_dtype=_dtype("float32" if job["out_dtype"] == "fp32" else "bfloat16"),
+        )
+
+
+def _a16w16_gfx942_fallback_jobs(table: Table) -> list[dict]:
+    """Every config the gfx942 cost-model fallback can return, each at the
+    shape that selects it, in both output dtypes. The table matches M exactly,
+    so no row's replay reaches the fallback."""
+    from aiter.ops.flydsl.kernels.gemm_a16w16_gfx942 import (
+        ASYNC_FALLBACK_WITNESSES,
+        FALLBACK_WITNESSES,
+        GFX942_NUM_CUS,
+    )
+
+    shapes = [*FALLBACK_WITNESSES.values(), *ASYNC_FALLBACK_WITNESSES.values()]
+    return [
+        {
+            "table": table.name,
+            "kernel_name": "fallback",
+            "gfx": "gfx942",
+            "cu_num": GFX942_NUM_CUS,
+            "m": m,
+            "m_low": None,
+            "tuned": (),
+            "n": n,
+            "k": k,
+            "N": str(n),
+            "K": str(k),
+            "out_dtype": out_dtype,
+            "fallback": True,
+        }
+        for (m, n, k), out_dtype in itertools.product(shapes, ("bf16", "fp32"))
+    ]
+
+
 def _a4w4_mxscale_bpreshuffle(job: dict) -> None:
     from aiter.ops.gemm_op_a4w4 import gemm_a4w4
     from aiter.utility import dtypes
@@ -290,6 +341,10 @@ class Table:
     all_rows: bool = False
     # Some tables select by kernelName rather than a libtype column.
     kernel_prefix: str = ""
+    # The runtime matches M exactly, so a row serves no smaller M.
+    exact_m: bool = False
+    # Jobs replayed besides the rows: shapes that reach kernels no row does.
+    extra_jobs: Callable[[Table], list[dict]] | None = None
 
 
 TABLES = (
@@ -350,6 +405,16 @@ TABLES = (
         _a16w16,
     ),
     Table(
+        "flydsl_gemm_a16w16_gfx942_tuned",
+        "AITER_CONFIG_FLYDSL_GEMM_A16W16_GFX942",
+        ("gfx", "cu_num", "N", "K", "out_dtype"),
+        _a16w16_gfx942,
+        # Every row is FlyDSL, and the table carries no libtype column to say so.
+        all_rows=True,
+        exact_m=True,
+        extra_jobs=_a16w16_gfx942_fallback_jobs,
+    ),
+    Table(
         "a4w4_mxscale_bpreshuffle_tuned_gemm",
         "AITER_CONFIG_GEMM_A4W4_MXSCALE_BPRESHUFFLE",
         ("gfx", "cu_num", "N", "K"),
@@ -393,8 +458,9 @@ def _column(row: dict, name: str) -> str:
 def parse_csv(csv_path: str) -> list[dict]:
     """One job per FlyDSL row of a tuned GEMM table: its shape and key cells,
     ``m`` its tuned M, ``m_low`` the smallest M it serves (the previous
-    tuned M of its shape, plus one) and ``tuned``, every tuned M of its shape
-    with its kernel's (tile_m, cluster_m)."""
+    tuned M of its shape, plus one; None for an exact-M table) and ``tuned``,
+    every tuned M of its shape with its kernel's (tile_m, cluster_m). Then
+    the table's ``extra_jobs``."""
     table = table_of(csv_path)
     if table is None:
         raise ValueError(
@@ -426,7 +492,7 @@ def parse_csv(csv_path: str) -> list[dict]:
             "gfx": _column(row, "gfx"),
             "cu_num": _int(_column(row, "cu_num"), _DEFAULT_CU_NUM),
             "m": m,
-            "m_low": max(smaller, default=0) + 1,
+            "m_low": None if table.exact_m else max(smaller, default=0) + 1,
             "tuned": tuple((tm, *_tiling(name)) for tm, name in shapes[key].items()),
             "n": _int(_column(row, "N")),
             "k": _int(_column(row, "K")),
@@ -436,6 +502,8 @@ def parse_csv(csv_path: str) -> list[dict]:
         if "b" in table.keys:
             job["b"] = _int(job["b"])
         jobs += [{**job, **variant} for variant in _variants(table, job)]
+    if table.extra_jobs is not None:
+        jobs += table.extra_jobs(table)
     return jobs
 
 
@@ -566,6 +634,7 @@ def describe(job: dict) -> str:
             "x_block",
             "dtype",
             "outdtype",
+            "out_dtype",
             "bias",
             "bpreshuffle",
         )

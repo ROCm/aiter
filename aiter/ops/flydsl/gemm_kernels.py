@@ -18,6 +18,7 @@ from aiter.utility.graph_alloc import capture_scoped_cache, persistent_alloc
 
 from .gemm_a16w16_band import band_stream_name_supported, gemm_a16w16_band
 from .gemm_a16w16_gfx1250 import gemm_a16w16 as gemm_a16w16_gfx1250
+from .kernels.gemm_a16w16_gfx942 import gemm_a16w16 as gemm_a16w16_gfx942
 from .kernels.gemm_a16w16_gfx950 import (
     SPLIT_K_SEMAPHORE_MAX_LEN,
     gemm_a16w16,
@@ -176,27 +177,53 @@ def _validate_b_non_temporal(value, gfx, policy):
         raise ValueError("b_non_temporal supports gfx950 ft/ht/hti/bs policies only")
 
 
+# gfx950 and gfx1250 values of the flydsl_hgemm tile arguments left as None.
+_HGEMM_DEFAULT_TILE = {
+    "block_m": 128,
+    "block_n": 128,
+    "block_k": 64,
+    "stages": 2,
+    "split_k": 1,
+    "m_waves": 2,
+    "n_waves": 2,
+    "k_waves": 1,
+    "group_m": 0,
+}
+
+
 def flydsl_hgemm(
     a: torch.Tensor,
     b: torch.Tensor,
     out: torch.Tensor | None = None,
     bias: torch.Tensor | None = None,
-    block_m: int = 128,
-    block_n: int = 128,
-    block_k: int = 64,
-    stages: int = 2,
-    split_k: int = 1,
-    m_waves: int = 2,
-    n_waves: int = 2,
-    k_waves: int = 1,
-    group_m: int = 0,
+    block_m: int | None = None,
+    block_n: int | None = None,
+    block_k: int | None = None,
+    stages: int | None = None,
+    split_k: int | None = None,
+    m_waves: int | None = None,
+    n_waves: int | None = None,
+    k_waves: int | None = None,
+    group_m: int | None = None,
     policy: str = "ft",
     out_dtype: torch.dtype | None = None,
     stream: torch.cuda.Stream | None = None,
     k_stagger: int = 0,
     b_non_temporal: bool = False,
 ) -> torch.Tensor:
-    """Run the A16W16 kernel with AITER's ``B[N, K]`` convention.
+    """Run the A16W16 kernel for this arch with AITER's ``B[N, K]`` convention.
+
+    Tile arguments left as None are not overridden. On gfx942 they come from
+    the shape's tuned-table row (else the cost-model fallback), and the set
+    ones are passed as ``user_kwargs`` to its ``gemm_a16w16``. Elsewhere they
+    take ``_HGEMM_DEFAULT_TILE``. gfx942 has no main-loop unroll variant, so it
+    ignores the ``ft``/``ht``/``hti`` policies, and does not support ``bias``.
+    The skinny and band-stream policies are gfx950 only.
+
+    On gfx942, a partial tile override keeps unspecified block dimensions,
+    wave counts and ``group_m`` from the selected tuned or fallback config.
+    Setting a tile or pipeline key resets its pipeline flags and split-K before
+    applying the override.
 
     On gfx950 ft/ht/hti, ``k_stagger`` rotates each workgroup's K traversal
     by ``(block_idx.x * k_stagger) % partition_k_tiles`` tiles, within its
@@ -222,9 +249,44 @@ def flydsl_hgemm(
     if launch_stream.device != a.device:
         raise ValueError(f"`stream` must be on {a.device}, got {launch_stream.device}")
 
+    explicit = {
+        name: value
+        for name, value in {
+            "block_m": block_m,
+            "block_n": block_n,
+            "block_k": block_k,
+            "stages": stages,
+            "split_k": split_k,
+            "m_waves": m_waves,
+            "n_waves": n_waves,
+            "k_waves": k_waves,
+            "group_m": group_m,
+        }.items()
+        if value is not None
+    }
     gfx = get_gfx()
+    if policy == SKINNY_POLICY and gfx != "gfx950":
+        raise RuntimeError("The FlyDSL skinny HGEMM policy supports gfx950 only")
     _validate_k_stagger(k_stagger, gfx, policy)
     _validate_b_non_temporal(b_non_temporal, gfx, policy)
+    if gfx == "gfx942":
+        if policy == "bs":
+            raise ValueError("band-stream HGEMM requires gfx950 with 256 CUs")
+        return gemm_a16w16_gfx942(
+            a,
+            b.t(),
+            out=out,
+            bias=bias,
+            user_kwargs=explicit,
+            stream=launch_stream,
+            layout="nt",
+            out_dtype=out_dtype,
+        )
+
+    tile = {**_HGEMM_DEFAULT_TILE, **explicit}
+    block_m, block_n, block_k = tile["block_m"], tile["block_n"], tile["block_k"]
+    stages, split_k, group_m = tile["stages"], tile["split_k"], tile["group_m"]
+    m_waves, n_waves, k_waves = tile["m_waves"], tile["n_waves"], tile["k_waves"]
     if policy == "bs":
         # A tuned row can serve strided inputs too. Preserve the legacy
         # public HGEMM normalization; only the device kernel requires
@@ -256,8 +318,6 @@ def flydsl_hgemm(
             },
         )
     if policy == SKINNY_POLICY:
-        if gfx != "gfx950":
-            raise RuntimeError("The FlyDSL skinny HGEMM policy supports gfx950 only")
         if bias is not None or split_k != 1 or m_waves != 1 or n_waves != 1 or group_m:
             raise ValueError(
                 "The FlyDSL skinny HGEMM policy requires split_k=1, m_waves=1, "
@@ -297,7 +357,7 @@ def flydsl_hgemm(
             )
     if gfx != "gfx950":
         raise RuntimeError(
-            "The FlyDSL A16W16 kernel currently supports gfx950 and gfx1250 only"
+            "The FlyDSL A16W16 kernel currently supports gfx942, gfx950 and gfx1250 only"
         )
 
     if not a.is_contiguous():
