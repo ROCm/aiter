@@ -52,18 +52,16 @@ from .mega_moe_internode_config import (
     STAGE2_SDMA_SEND_ROWS_PER_ROUTE,
     STAGE2_TOKEN_READY,
     lookup_tune,
-    resolve_gemm2_bm,
-    resolve_gemm2_bn,
-    resolve_gemm2_cu,
-    resolve_gemm2_dynamic,
-    resolve_sdma_chunk_tiles,
-    resolve_single_kernel,
-    resolve_stage1_tile,
-    resolve_stage1_waves,
-    resolve_stage2_fused,
-    resolve_stage2_sdma,
-    resolve_stage2_waves,
-    single_kernel_possible,
+    select_gemm2_bm,
+    select_gemm2_bn,
+    select_gemm2_grid,
+    select_sdma_chunk_tiles,
+    select_stage1_tile,
+    select_stage1_waves,
+    select_stage2_sdma,
+    select_stage2_waves,
+    use_dynamic_gemm2_claim,
+    use_single_kernel,
 )
 from .quant import get_rail_record_quant
 from .single_kernel import compile_single_kernel
@@ -74,9 +72,7 @@ from .stage2 import (
     K1_CTAS_PER_CU,
     SCRATCH_WORDS,
     SDMA_PLAN_WORDS_MAX,
-    compile_mega_moe_stage2,
     compile_stage2_fused,
-    compile_stage2_node_combine,
     peer_table_launcher,
 )
 
@@ -381,30 +377,22 @@ class MegaMoEInternode:
         # Tune-table lookups are keyed by GEMM rows = mtpr * topk, as in the
         # fused_moe tune tables.
         rows = self.mtpr * self.topk
-        self._s1_tile = resolve_stage1_tile(
+        self._s1_tile = select_stage1_tile(
             token=rows, model_dim=self.model_dim, inter_dim=self.inter_dim,
             expert=self.epr, topk=self.topk,
         )
         s2_tuned = self._lookup_tune(rows)
-        self._gemm2_bn, _ = resolve_gemm2_bn(s2_tuned or None)
-        gemm2_cu, _ = resolve_gemm2_cu(s2_tuned or None)
+        self._gemm2_bn, _ = select_gemm2_bn(s2_tuned or None)
+        gemm2_cu, _ = select_gemm2_grid(s2_tuned or None)
         self._gemm2_cu = gemm2_cu or WORKER_BLOCKS
-        self._stage2_fused = resolve_stage2_fused(self.mtpr)
-        remote_first = bool(self._stage2_fused and self._s1_tile["split_local"])
+        remote_first = bool(self._s1_tile["split_local"])
         # SDMA needs the remote-first fused kernel (Stage1's local/remote
         # split); it is dropped at runtime setup if MORI gives no SDMA queue.
         self._stage2_sdma = bool(
-            resolve_stage2_sdma(self.mtpr, s2_tuned or None)[0] and remote_first)
-        # The single kernel needs the fused Stage2 body: below the fused-TPR
-        # threshold it switches it on (remote-first when Stage1 splits local).
-        if not self._stage2_fused and single_kernel_possible(
-                self._s1_tile["tile_group"], self._stage2_sdma,
-                self.model_dim // self._gemm2_bn):
-            self._stage2_fused = True
-            remote_first = bool(self._s1_tile["split_local"])
+            select_stage2_sdma(self.mtpr, s2_tuned or None)[0] and remote_first)
         # GEMM2 M tile (fused remote-first stage2 only; 32 elsewhere).
         self._s2_tuned = s2_tuned or None
-        self._gemm2_bm, _ = resolve_gemm2_bm(
+        self._gemm2_bm, _ = select_gemm2_bm(
             self._s2_tuned, tile_group=int(self._s1_tile["tile_group"]),
             fused=remote_first, sdma=self._stage2_sdma)
         # Without a table row: one chunk per rail queue is the balanced
@@ -439,10 +427,9 @@ class MegaMoEInternode:
             self._init_input_records()
             # One kernel for Stage1 + fused Stage2 when both run 8-wave CTAs;
             # Stage1 then publishes per-group GMM1 completion for GEMM2.
-            s1_waves = resolve_stage1_waves(self._s1_tile["tile_group"])
-            self._s2_waves = resolve_stage2_waves(
-                self._stage2_fused, self._stage2_sdma, self.model_dim // self._gemm2_bn)
-            self._single_kernel = resolve_single_kernel(s1_waves, self._s2_waves)
+            s1_waves = select_stage1_waves(self._s1_tile["tile_group"])
+            self._s2_waves = select_stage2_waves(self.model_dim // self._gemm2_bn)
+            self._single_kernel = use_single_kernel(s1_waves, self._s2_waves)
             self._stage1 = compile_stage1(
                 self.layout.stage1, self.layout.stage2,
                 rank=self.rank,
@@ -618,7 +605,7 @@ class MegaMoEInternode:
                                "unset?); stage2 keeps the xGMI push")
                 self._stage2_sdma = False
                 # The default M tile follows the path (xGMI stalls at SDMA's 128).
-                self._gemm2_bm, _ = resolve_gemm2_bm(
+                self._gemm2_bm, _ = select_gemm2_bm(
                     self._s2_tuned, tile_group=int(self._s1_tile["tile_group"]),
                     fused=True, sdma=False)
             _window_view(window.local_ptr, (self.layout.total_bytes,), "|i1").zero_()
@@ -729,11 +716,11 @@ class MegaMoEInternode:
             # DSV4 TPR256: GEMM2 -14~22us).  At G=4 it measured neutral to
             # +12us (K3 TPR512), so G=4 keeps the plain order.
             "m_group": 2 if self._s1_tile["tile_group"] == 2 else 1,
-            "dynamic_claim": resolve_gemm2_dynamic(self.mtpr),
+            "dynamic_claim": use_dynamic_gemm2_claim(self.mtpr),
             "resident_ctas": self._device_cus * K1_CTAS_PER_CU,
             # Fused stage2 overlaps the rail with GEMM2 by doing the
             # remote-source m-blocks first (needs Stage1's local/remote split).
-            "remote_first": bool(self._stage2_fused and self._s1_tile["split_local"]),
+            "remote_first": bool(self._s1_tile["split_local"]),
             "local_experts": self.epr, "tile_group": int(self._s1_tile["tile_group"]),
             "expert_count_plane": s1.region("expert_count").nbytes // 2,
             "gemm2_bm": self._gemm2_bm,
@@ -745,7 +732,7 @@ class MegaMoEInternode:
             # and the per-chunk done counts (128 B apart).
             sd_tiles = (s1.max_route_rows + TILE_M - 1) // TILE_M
             sd_rows = int(STAGE2_SDMA_SEND_ROWS_PER_ROUTE * self.mtpr * self.topk)
-            sd_ct = resolve_sdma_chunk_tiles(self.mtpr * self.topk, self._gemm2_bm // TILE_M)
+            sd_ct = select_sdma_chunk_tiles(self.mtpr * self.topk, self._gemm2_bm // TILE_M)
             sd_chunks = sd_tiles // sd_ct + 2 + 4 * STAGE2_SDMA_RAMP_CHUNKS
             self._sd_send = torch.empty(sd_rows * self.model_dim * 2, dtype=torch.uint8, device=dev)
             self._sd_tile_base = torch.zeros((sd_tiles + 1) * 8, dtype=torch.int32, device=dev)
@@ -785,7 +772,7 @@ class MegaMoEInternode:
             self._k2_compile["threads"] = 64 * s2_waves
         # Token-ready rail for the rail-bound low-topk SDMA path. High topk
         # stays on the established local critical path (K3 measured regression).
-        token_ready = (STAGE2_TOKEN_READY and self._stage2_fused and self._s2_waves == 8
+        token_ready = (STAGE2_TOKEN_READY and self._s2_waves == 8
                        and self._k1_compile["remote_first"]
                        and self._stage2_sdma and self.topk <= 8 and self.mtpr >= 2048)
         if token_ready:
@@ -831,13 +818,9 @@ class MegaMoEInternode:
             )
         else:
             self._launchers["stage1"] = self._stage1
-            if self._stage2_fused:
-                self._launchers["stage2"] = compile_stage2_fused(
-                    self._k1_compile, self._k2_compile, WORKER_BLOCKS
-                )
-            else:
-                self._launchers["gemm2"] = compile_mega_moe_stage2(**self._k1_compile)
-                self._launchers["combine"] = compile_stage2_node_combine(**self._k2_compile)
+            self._launchers["stage2"] = compile_stage2_fused(
+                self._k1_compile, self._k2_compile, WORKER_BLOCKS
+            )
 
     def _compile_launcher(self, name, args) -> None:
         """Compile and execute once, or only compile during preload.
@@ -1006,13 +989,7 @@ class MegaMoEInternode:
             launches = (("single", (*s1_args, *gemm2_args, *output_args, *extra_args)),)
         else:
             launches = (("stage1", (*s1_args, stream)),)
-            if self._stage2_fused:
-                launches += (("stage2", (*gemm2_args, *s1_args[:3], *output_args, *extra_args)),)
-            else:
-                launches += (
-                    ("gemm2", (*gemm2_args, stream)),
-                    ("combine", (*s1_args[:3], *output_args, WORKER_BLOCKS, stream)),
-                )
+            launches += (("stage2", (*gemm2_args, *s1_args[:3], *output_args, *extra_args)),)
         for name, args in launches:
             compiled = self._compiled.get(name)
             if compiled is None or env.compile.compile_only:

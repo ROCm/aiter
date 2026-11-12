@@ -728,12 +728,10 @@ def stage2_tile(net, tpr, s1):
     from aiter.jit.utils.chip_info import get_cu_num, get_gfx_runtime
     from aiter.ops.flydsl.kernels.mega_moe_internode.mega_moe_internode_config import (
         lookup_tune,
-        resolve_gemm2_bm,
-        resolve_gemm2_bn,
-        resolve_gemm2_cu,
-        resolve_stage2_fused,
-        resolve_stage2_sdma,
-        single_kernel_possible,
+        select_gemm2_bm,
+        select_gemm2_bn,
+        select_gemm2_grid,
+        select_stage2_sdma,
     )
 
     tuned = lookup_tune(
@@ -745,23 +743,17 @@ def stage2_tile(net, tpr, s1):
         expert=net["experts"] // EP_SIZE,
         topk=net["topk"],
     )
-    bn, bn_source = resolve_gemm2_bn(tuned)
-    cu, cu_source = resolve_gemm2_cu(tuned)
+    bn, bn_source = select_gemm2_bn(tuned)
+    cu, cu_source = select_gemm2_grid(tuned)
     source = (
         bn_source
         if bn_source == cu_source
         else f"gemm2_bn={bn_source},gemm2_cu={cu_source}"
     )
-    fused = resolve_stage2_fused(tpr)
-    remote_first = bool(fused and s1["split_local"])
-    sdma, comm_source = resolve_stage2_sdma(tpr, tuned)
+    remote_first = bool(s1["split_local"])
+    sdma, comm_source = select_stage2_sdma(tpr, tuned)
     sdma = sdma and remote_first
-    # The single kernel switches the fused Stage2 on at every TPR.
-    if not fused and single_kernel_possible(
-        s1["tile_group"], sdma, net["model_dim"] // bn
-    ):
-        remote_first = bool(s1["split_local"])
-    bm, _ = resolve_gemm2_bm(
+    bm, _ = select_gemm2_bm(
         tuned, tile_group=s1["tile_group"], fused=remote_first, sdma=sdma
     )
     # 0 means kernel1 launches the operator's worker_blocks (256) CTAs.
@@ -1072,7 +1064,6 @@ class MoriSmallOp:
                 **(
                     {"beta": self.situ_beta, "linear_beta": self.situ_linear_beta}
                     if self.shape.activation == "situv2"
-                    and (self.situ_beta, self.situ_linear_beta) != (1.0, 1.0)
                     else {}
                 ),
             )

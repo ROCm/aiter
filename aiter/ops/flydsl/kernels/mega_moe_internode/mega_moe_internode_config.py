@@ -202,7 +202,7 @@ def default_fanout_ctas_per_dest(split_local: int) -> int:
     return _FANOUT_CTAS_PER_DEST[int(bool(split_local))]
 
 
-def resolve_stage1_tile(
+def select_stage1_tile(
     *,
     token: int,
     model_dim: int,
@@ -278,7 +278,7 @@ def resolve_stage1_tile(
 STAGE1_WAVES = 8
 
 
-def resolve_stage1_waves(tile_group: int) -> int:
+def select_stage1_waves(tile_group: int) -> int:
     """Waves per Stage1 CTA (see STAGE1_WAVES)."""
     del tile_group  # every tile group runs at STAGE1_WAVES
     return STAGE1_WAVES
@@ -294,26 +294,14 @@ STAGE2_FUSED_WAVES = 8
 SINGLE_KERNEL = False
 
 
-def resolve_single_kernel(stage1_waves: int, stage2_waves: int) -> bool:
+def use_single_kernel(stage1_waves: int, stage2_waves: int) -> bool:
     """Whether to launch Stage1 + fused Stage2 as one kernel."""
     return bool(SINGLE_KERNEL) and int(stage1_waves) == 8 and int(stage2_waves) == 8
 
 
-def single_kernel_possible(tile_group: int, sdma: bool, n_blocks: int) -> bool:
-    """Whether the single kernel applies (it then forces the fused Stage2 at
-    every TPR): 8-wave Stage1 and an even GEMM2 n_block count."""
-    del sdma  # xGMI or SDMA push
-    return (
-        bool(SINGLE_KERNEL)
-        and resolve_stage1_waves(tile_group) == 8
-        and int(n_blocks) % 2 == 0
-    )
-
-
-def resolve_stage2_waves(fused: bool, sdma: bool, n_blocks: int) -> int:
+def select_stage2_waves(n_blocks: int) -> int:
     """Waves per fused-stage2 CTA (see STAGE2_FUSED_WAVES)."""
-    del sdma  # the SDMA plan follows the CTA width
-    if not fused or int(n_blocks) % 2:
+    if int(n_blocks) % 2:
         return 4
     return STAGE2_FUSED_WAVES
 
@@ -335,19 +323,13 @@ GEMM2_CU_MAX = 2048
 # idle CUs behind the heaviest m-blocks); TPR <= 1024 is even with random
 # routing and 4-5% slower with EPLB (1-2 m-blocks per CTA, the claim is pure cost).
 GEMM2_DYNAMIC_MIN_TPR = 2048
-# Stage2 as one kernel from this max_tok_per_rank up: kernel1 does the
-# remote-source m-blocks first and kernel2's first CTAs reduce and ship the
-# remote plane while the local half is still in GEMM2.  Measured vs two
-# kernels (K3 / DSv4.1 EP16): -5~13% at TPR >= 2048, even to -8% at 1024,
-# +2~6% at 512 (the fused kernel always claims dynamically).
-STAGE2_FUSED_MIN_TPR = 0
 # From this max_tok_per_rank the fused stage2 ships its intra-node rows with
 # the copy engines (SDMA) instead of xGMI stores from the GEMM2 epilogue.
 STAGE2_SDMA_MIN_TPR = 2048
 # SDMA chunk = tickets (32-row tiles) per engine-side wait.  The waits are all
 # posted up front and each costs ~14us on the queue, serialised, so the chunk
 # grows with the rows to keep ~STAGE2_SDMA_CHUNKS of them (K3 TPR 16384: 128
-# tiles/chunk +9~14% vs xGMI, 512 recovers it).  See resolve_sdma_chunk_tiles.
+# tiles/chunk +9~14% vs xGMI, 512 recovers it).  See select_sdma_chunk_tiles.
 STAGE2_SDMA_CHUNKS = 16
 STAGE2_SDMA_CHUNK_TILES_MIN = 128
 # Small chunks (one compute round each) at the head and the tail of each half
@@ -450,7 +432,7 @@ def lookup_tune(
     return row
 
 
-def resolve_gemm2_bn(tuned: dict | None) -> tuple[int, str]:
+def select_gemm2_bn(tuned: dict | None) -> tuple[int, str]:
     """GEMM2 N tile and its source: table > default.
 
     ``tuned`` is the ``lookup_tune`` result (``None`` on a miss); the
@@ -467,7 +449,7 @@ def resolve_gemm2_bn(tuned: dict | None) -> tuple[int, str]:
     return bn, source
 
 
-def resolve_gemm2_bm(
+def select_gemm2_bm(
     tuned: dict | None, *, tile_group: int, fused: bool, sdma: bool
 ) -> tuple[int, str]:
     """GEMM2 M tile and its source: table > rule (fused stage2: GEMM2_BM_SDMA
@@ -494,7 +476,7 @@ def resolve_gemm2_bm(
     return bm, "table"
 
 
-def resolve_gemm2_cu(tuned: dict | None) -> tuple[int, str]:
+def select_gemm2_grid(tuned: dict | None) -> tuple[int, str]:
     """GEMM2 (kernel1) persistent grid and its source: table > 0.
 
     0 keeps the operator's behaviour of launching ``worker_blocks`` CTAs.
@@ -510,17 +492,12 @@ def resolve_gemm2_cu(tuned: dict | None) -> tuple[int, str]:
     return cu, source
 
 
-def resolve_gemm2_dynamic(max_tok_per_rank: int) -> bool:
+def use_dynamic_gemm2_claim(max_tok_per_rank: int) -> bool:
     """Whether kernel1 claims m-blocks dynamically (see GEMM2_DYNAMIC_MIN_TPR)."""
     return int(max_tok_per_rank) >= GEMM2_DYNAMIC_MIN_TPR
 
 
-def resolve_stage2_fused(max_tok_per_rank: int) -> bool:
-    """Whether stage2 runs as one fused kernel (see STAGE2_FUSED_MIN_TPR)."""
-    return int(max_tok_per_rank) >= STAGE2_FUSED_MIN_TPR
-
-
-def resolve_stage2_sdma(
+def select_stage2_sdma(
     max_tok_per_rank: int, tuned: dict | None = None
 ) -> tuple[bool, str]:
     """Whether the fused stage2 moves intra-node rows by SDMA, and the source:
@@ -530,15 +507,13 @@ def resolve_stage2_sdma(
     The best path depends on the model, not just the TPR (46+50, vs xGMI BM64):
     DSv4.1 TPR >= 2048 gains 5~10% with SDMA, K3 is within +-3% and loses on EPLB.
     """
-    if not resolve_stage2_fused(max_tok_per_rank):
-        return False, "default"
     comm = str((tuned or {}).get("intra_comm", "") or "")
     if comm:
         return comm == "sdma", "table"
     return int(max_tok_per_rank) >= STAGE2_SDMA_MIN_TPR, "default"
 
 
-def resolve_sdma_chunk_tiles(rows: int, tile_group_gs: int = 1) -> int:
+def select_sdma_chunk_tiles(rows: int, tile_group_gs: int = 1) -> int:
     """Tickets per SDMA chunk for ``rows`` GEMM rows (mtpr * topk): about
     STAGE2_SDMA_CHUNKS chunks, a power of two >= STAGE2_SDMA_CHUNK_TILES_MIN
     (a multiple of the GEMM2 tile's 32-row tiles, ``tile_group_gs``)."""
