@@ -1154,13 +1154,13 @@ __global__ void topk_reg_kernel(DTYPE_I* __restrict__ gating_output,
     }
 }
 
-// Multi-wave register top-k for decode-sized batches on wave32 (gfx1250),
-// biased sigmoid scores only.
+// Multi-wave register top-k on wave32 (gfx1250), biased sigmoid scores only.
+// Aimed at decode; it also beats topk_reg_kernel at 8192 tokens (E = 512, 1024).
 //
 // topk_reg_kernel runs a row per wave: at decode that is a few dozen waves on
 // a 256-CU part, each walking E / 32 experts per lane through long serial
 // chains. Here a row gets a workgroup of E / 128 waves and every lane owns
-// four consecutive experts (one 8-byte load each for logits and bias):
+// four consecutive experts (one vector load each for logits and bias):
 //
 //   1. sigmoid + bias for the lane's four experts, the lane maximum to LDS;
 //   2. barrier; group g is lane g of every wave (E / 32 experts, as a lane of
@@ -1448,8 +1448,8 @@ __global__ __launch_bounds__(kWaves * 32) void topk_reg_mw_kernel(
         if(lane + W >= n_cand)
             c1 = make_uint4(0u, 0u, 0u, 0u);
         // Each lane below topk gets exactly one of the two pushes, and
-        // ds_permute reads 0 where nothing lands. Targets wrap mod 32, so
-        // ranks past the wave go to lane 31, past topk.
+        // ds_permute reads 0 where nothing lands. Its targets wrap mod 32,
+        // so ranks past the wave are clamped to lane 31, past topk.
         uint32_t got = 0;
         // Keep the lambda: written straight-line, this compiler puts every
         // rank compare in an SGPR mask, each behind an s_delay_alu stall.
