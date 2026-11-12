@@ -3,7 +3,8 @@
 //
 // Shared public API for the OPUS gfx950 bf16 flash-attention forward kernels.
 // A single entry point dispatches (by head dim, inferred from the tensors) to:
-//   * the symmetric  D_QK=128 / D_V=128 kernel (gqa_d128_kernel), batch + group, or
+//   * the symmetric  D_QK=128 / D_V=128 kernel (gqa_d128_kernel), batch + group, and
+//     the only one with a sliding window, or
 //   * the asymmetric D_QK=192 / D_V=128 kernel (gqa_d192_v128_kernel), batch + group.
 //
 // This replaces the former per-hd `fmha_fwd_hd128_bf16_opus_fwd`. The kernel/launch
@@ -24,6 +25,12 @@
 //
 // `causal` selects the causal mask (bottom-right aligned when seqlen_q != seqlen_kv).
 // `softmax_scale` is applied to Q·K^T internally (pass <= 0 for the default 1/sqrt(D_QK)).
+//
+// `window_size_left` bounds the causal mask on the left: a query at KV-coordinate j sees
+// keys [j - window_size_left, j]. -1 (the default) is unbounded, i.e. plain causal. Needs
+// `causal`; a window wider than seqlen_kv is folded back to -1 (plain causal) by the launch
+// layer. Only the D=128 kernel implements it; a window on (192,128) is rejected. There is
+// no right-hand window.
 //
 // `lse` (optional) receives the log-sum-exp of the scaled scores in natural log,
 // float32, contiguous along the query dim:
@@ -48,5 +55,6 @@ void fmha_fwd_bf16_opus_fwd(at::Tensor& q,
                             std::optional<at::Tensor> seqstart_k     = std::nullopt,
                             std::optional<at::Tensor> seqstart_q_pad = std::nullopt,
                             std::optional<at::Tensor> seqstart_k_pad = std::nullopt,
-                            int max_seqlen_q = 0,
-                            int max_seqlen_k = 0);
+                            int max_seqlen_q                         = 0,
+                            int max_seqlen_k                         = 0,
+                            int window_size_left                     = -1);

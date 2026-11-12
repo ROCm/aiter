@@ -43,20 +43,19 @@ struct opus_gqa_kargs {
     const int* ptr_seqstart_q_pad;
     const int* ptr_seqstart_k_pad;
 
+    // Sliding window, only meaningful when the traits' LOCAL is set: a query at
+    // KV-coordinate j attends to [j - window_size_left, j]. Negative means unbounded
+    // (plain causal). right > 0 is not implemented.
+    int window_size_left;
+
     // ── group mode: flattened Q-block axis ──
     // When > 0, the extent of the Q-block axis: the groups' blocks laid end to end, and
     // each block inverts seqstart_q to work out which group it belongs to. The value is
     // therefore fixed by that mapping, not free: see
     // fmha_fwd_bf16_opus_args::total_q_blocks.
     //
-    // The default (0) keeps the rectangular grid, where every group is given as many
-    // Q-blocks as the LONGEST group needs and the surplus returns immediately. That costs
-    // nothing when the lengths are close, but one sequence at max_seqlen beside a batch of
-    // ordinary ones multiplies every group's block count: measured at B=8 with seven ~8.4k
-    // sequences plus one at 16,354, it took the workgroup count from 1,184 to 2,048 (+73%)
-    // for 11% more work, and 53% more time.
-    //
-    // 0 means "not supplied" rather than "no blocks".
+    // 0 means "not supplied" and keeps the rectangular grid, where every group is given as
+    // many Q-blocks as the longest group needs and the surplus returns immediately.
     int total_q_blocks;
 };
 
@@ -68,7 +67,8 @@ template<int Q_TILE_SIZE_ = 32,
         int D_TILE_SIZE_ = 128,
         int NUM_WARPS_ = 8,
         bool CAUSAL_ = false,
-        bool GROUP_MODE_ = false>
+        bool GROUP_MODE_ = false,
+        bool LOCAL_ = false>
 struct opus_gqa_traits {
     static_assert(D_TILE_SIZE_ == 128, "fmha_fwd_hd128_bf16_opus supports D_TILE_SIZE 128 only");
 
@@ -79,6 +79,9 @@ struct opus_gqa_traits {
     static constexpr bool CAUSAL = CAUSAL_;
     // Group (varlen) mode: locate sequences via seqstart, not a uniform batch stride.
     static constexpr bool GROUP_MODE = GROUP_MODE_;
+    // Sliding window: bound the KV range on the left too, via kargs.window_size_left.
+    static constexpr bool LOCAL = LOCAL_;
+    static_assert(!LOCAL_ || CAUSAL_, "LOCAL needs CAUSAL for the right-hand bound");
 
     static constexpr int WARP_SIZE = 64; // AMD wavefront size
     static constexpr int BLOCK_SIZE = NUM_WARPS * WARP_SIZE;

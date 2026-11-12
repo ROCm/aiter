@@ -62,6 +62,10 @@ struct fmha_fwd_bf16_opus_args
     float softmax_scale = 0.f;
     // Bottom-right aligned when seqlen_q != seqlen_k.
     bool causal = false;
+    // Sliding-window attention. >= 0 bounds the window on the left: a query at
+    // KV-coordinate j sees keys [j - window_size_left, j]. -1 (the default) is unbounded,
+    // i.e. plain causal. Needs causal; right > 0 is not implemented.
+    int window_size_left = -1;
 
     // Group mode only. Length of the flattened Q-block axis, so the grid no longer gives
     // every group the longest group's block count. 0 (the default) keeps the rectangular
@@ -73,20 +77,11 @@ struct fmha_fwd_bf16_opus_args
     // than merely retiring surplus ones. Note it is NOT sum_g ceil(seqlen_q[g] / 256) --
     // that sum is smaller whenever the lengths are not multiples of 256, and three groups
     // of 255 would lose the third group's only block.
-    //
-    // Worth supplying when the group lengths are uneven. The rectangle gives every group
-    // the LONGEST group's block count, so one sequence at max_seqlen drags the whole
-    // batch: at B=8 with seven ~8.4k sequences plus one at 16,354 it cost 73% more
-    // workgroups and 53% more time for 11% more work. When the lengths are close the
-    // rectangle wastes under 10% and this is not worth the per-block scalar lookup.
     int total_q_blocks = 0;
 
-    // Group mode only. sum(seqlen_q), i.e. the packed Q row count (q.size(0)). Preferred
-    // over total_q_blocks: the Q block size is a property of the kernel variant, not of
-    // the call, so supplying the row count lets the launcher derive the extent from the
-    // variant it launches.
-    //
-    // When this is > 0 it wins over total_q_blocks; both 0 keeps the rectangular grid.
+    // Group mode only. sum(seqlen_q), i.e. the packed Q row count (q.size(0)), from which
+    // the launcher derives the flat extent. When > 0 it wins over total_q_blocks; both 0
+    // keep the rectangular grid.
     int total_q = 0;
 
     std::string data_type = "bf16";
@@ -96,6 +91,8 @@ struct fmha_fwd_bf16_opus_args
 
 #define FMHA_FWD_HD128_BF16_OPUS_IMPL
 #include "fmha_fwd_hd128_bf16_opus.h"
+#define FMHA_FWD_HD128_BF16_OPUS_SWA_IMPL
+#include "fmha_fwd_hd128_bf16_opus_swa.h"
 #define FMHA_FWD_HD192_V128_BF16_OPUS_IMPL
 #include "fmha_fwd_hd192_v128_bf16_opus.h"
 
@@ -111,13 +108,10 @@ inline float resolve_scale(float softmax_scale, int hdim_q)
     return 1.0f / std::sqrt(static_cast<float>(hdim_q));
 }
 
-// Fill the shared fields of a d128 kargs. Returns false if the arguments are
-// inconsistent.
-//
-// Everything variant-specific (the flat-axis extent, the grid, the traits) is left to the
-// caller, which knows its Q block size.
+// Fill the d128 kargs fields that do not depend on the traits. Returns false if the
+// arguments are inconsistent.
 inline bool fill_d128_kargs(opus_gqa_kargs& kargs, const fmha_fwd_bf16_opus_args& a,
-                            bool& is_group)
+                            bool& is_group, bool& is_local)
 {
     kargs.ptr_q = a.q_ptr;
     kargs.ptr_k = a.k_ptr;
@@ -159,10 +153,14 @@ inline bool fill_d128_kargs(opus_gqa_kargs& kargs, const fmha_fwd_bf16_opus_args
     kargs.ptr_seqstart_k     = is_group ? a.seqstart_k_ptr : nullptr;
     kargs.ptr_seqstart_q_pad = is_group ? a.seqstart_q_pad_ptr : nullptr;
     kargs.ptr_seqstart_k_pad = is_group ? a.seqstart_k_pad_ptr : nullptr;
+
+    // A window at least as wide as the longest KV bounds nothing; fold it to plain causal.
+    is_local               = a.causal && a.window_size_left >= 0 && a.window_size_left < a.seqlen_k;
+    kargs.window_size_left = is_local ? a.window_size_left : -1;
     return true;
 }
 
-// Guards shared by both d128 variants. `ok` distinguishes "refuse" from "nothing to do".
+// Guards for launch_d128. `ok` distinguishes "refuse" from "nothing to do".
 inline bool d128_preflight(const fmha_fwd_bf16_opus_args& a, bool& ok)
 {
     ok = false;
@@ -176,8 +174,8 @@ inline bool d128_preflight(const fmha_fwd_bf16_opus_args& a, bool& ok)
     return !(a.batch == 0 || a.seqlen_q == 0 || a.nhead == 0);
 }
 
-// D_QK = D_V = 128 (symmetric). Covers batch mode and group / varlen; which one is
-// selected follows from the arguments, see below.
+// D_QK = D_V = 128 (symmetric). Covers batch mode, group / varlen and the sliding
+// window; which one is selected follows from the arguments, see below.
 inline bool launch_d128(const fmha_fwd_bf16_opus_args& a, hipStream_t stream)
 {
     bool ok = false;
@@ -185,16 +183,16 @@ inline bool launch_d128(const fmha_fwd_bf16_opus_args& a, hipStream_t stream)
         return ok;
 
     opus_gqa_kargs kargs{};
-    bool is_group = false;
-    if(!fill_d128_kargs(kargs, a, is_group))
+    bool is_group = false, is_local = false;
+    if(!fill_d128_kargs(kargs, a, is_group, is_local))
         return false;
 
     auto launch = [&](auto traits_tag) {
         using Traits          = decltype(traits_tag);
         const int num_q_tiles = ceil_div(a.seqlen_q, Traits::Q_TILE_SIZE);
         const int num_q_blk   = ceil_div(num_q_tiles, Traits::NUM_WARPS);
-        // The flat extent follows this variant's Q block size, so derive it here rather
-        // than take the caller's -- see fmha_fwd_bf16_opus_args::total_q.
+        // Flat extent from the row count and this kernel's Q block; see
+        // fmha_fwd_bf16_opus_args::total_q.
         constexpr int q_block = Traits::Q_TILE_SIZE * Traits::NUM_WARPS;
         kargs.total_q_blocks  = !is_group ? 0
                                 : (a.total_q > 0 ? a.total_q / q_block + a.batch
@@ -213,25 +211,38 @@ inline bool launch_d128(const fmha_fwd_bf16_opus_args& a, hipStream_t stream)
                                : (Traits::GROUP_MODE ? dim3(a.nhead, a.batch, num_q_blk)
                                                      : dim3(a.nhead, num_q_blk, a.batch));
         dim3 block(Traits::BLOCK_SIZE);
-        gqa_d128_kernel<Traits><<<grid, block, 0, stream>>>(kargs);
+        // The sliding window has its own form of this kernel (fmha_fwd_hd128_bf16_opus_swa.h);
+        // everything else stays on the shared one.
+        if constexpr(Traits::LOCAL)
+            gqa_d128_swa_kernel<Traits><<<grid, block, 0, stream>>>(kargs);
+        else
+            gqa_d128_kernel<Traits><<<grid, block, 0, stream>>>(kargs);
         HIP_CALL_LAUNCH(hipGetLastError());
     };
 
-    // causal x group.
+    // causal x group x local. LOCAL implies CAUSAL, so there is no non-causal window.
     if(is_group)
     {
         if(a.causal)
-            launch(opus_gqa_traits<32, 64, 128, 8, true, true>{});
+        {
+            if(is_local)
+                launch(opus_gqa_traits<32, 64, 128, 8, true, true, true>{});
+            else
+                launch(opus_gqa_traits<32, 64, 128, 8, true, true, false>{});
+        }
         else
-            launch(opus_gqa_traits<32, 64, 128, 8, false, true>{});
+            launch(opus_gqa_traits<32, 64, 128, 8, false, true, false>{});
     }
     else if(a.causal)
     {
-        launch(opus_gqa_traits<32, 64, 128, 8, true, false>{});
+        if(is_local)
+            launch(opus_gqa_traits<32, 64, 128, 8, true, false, true>{});
+        else
+            launch(opus_gqa_traits<32, 64, 128, 8, true, false, false>{});
     }
     else
     {
-        launch(opus_gqa_traits<32, 64, 128, 8, false, false>{});
+        launch(opus_gqa_traits<32, 64, 128, 8, false, false, false>{});
     }
     return true;
 }
@@ -356,13 +367,28 @@ inline bool launch_d192_v128(const fmha_fwd_bf16_opus_args& a, hipStream_t strea
 // Returns false when the input is outside what the kernels cover: a GPU other than
 // gfx950, a data type other than bf16, a (hdim_q, hdim_v) other than (128,128) or
 // (192,128), or a kv extent past the 32-bit async-load offset limit. Both head-dim
-// kernels take batch and group / varlen.
+// kernels take batch and group / varlen; only the 128/128 one takes a sliding window.
 inline bool fmha_fwd_bf16_opus_launch(const fmha_fwd_bf16_opus_args& a, hipStream_t stream)
 {
     static const std::string arch_id = get_gpu_arch();
     if((arch_id != "gfx950") || (a.data_type != "bf16"))
     {
         AITER_LOG_WARNING("unsupported condition in opus fwd!!! data_type: " << a.data_type);
+        return false;
+    }
+
+    // A finite left window needs causal: LOCAL implies CAUSAL, so fill_d128_kargs would
+    // otherwise fold the window away and launch full attention.
+    if(a.window_size_left >= 0 && !a.causal)
+    {
+        AITER_LOG_WARNING("opus fwd: window_size_left requires causal");
+        return false;
+    }
+    // The 192/128 forward has no windowed instance and never reads window_size_left, so
+    // refuse a finite window rather than ignore it.
+    if(a.hdim_q == 192 && a.hdim_v == 128 && a.window_size_left >= 0)
+    {
+        AITER_LOG_WARNING("opus fwd: hdim 192/128 has no sliding-window kernel");
         return false;
     }
 

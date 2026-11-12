@@ -3,7 +3,7 @@
 //
 // Torch entry point for the OPUS gfx950 bf16 flash-attention forward kernels.
 // `fmha_fwd_bf16_opus_fwd` validates the tensors and dispatches by head dim:
-//   * (D_QK,D_V) = (128,128) -> gqa_d128_kernel        (batch + group / varlen)
+//   * (D_QK,D_V) = (128,128) -> gqa_d128_kernel        (batch + group / varlen, window)
 //   * (D_QK,D_V) = (192,128) -> gqa_d192_v128_kernel   (batch + group / varlen)
 //
 // This file owns the torch-facing validation and the tensor -> stride extraction only. The
@@ -22,7 +22,8 @@
 
 namespace {
 
-// ─── D_QK=128 / D_V=128 (symmetric) launch — batch + group (varlen). ───
+// ─── D_QK=128 / D_V=128 (symmetric) launch — batch + group (varlen), optional
+//     left-bounded causal window. ───
 void launch_d128(at::Tensor& q,
                  at::Tensor& k,
                  at::Tensor& v,
@@ -35,7 +36,8 @@ void launch_d128(at::Tensor& q,
                  std::optional<at::Tensor>& seqstart_q_pad,
                  std::optional<at::Tensor>& seqstart_k_pad,
                  int max_seqlen_q,
-                 int max_seqlen_k)
+                 int max_seqlen_k,
+                 int window_size_left)
 {
     constexpr int D = 128;
     constexpr int Q_TILE_SIZE = 32, NUM_WARPS = 8;
@@ -52,6 +54,11 @@ void launch_d128(at::Tensor& q,
     args.hdim_v = D;
     args.softmax_scale = softmax_scale;  // <= 0 picks the launcher's 1/sqrt(D) default
     args.causal        = causal;
+    // LOCAL implies CAUSAL in the kernel; the launch layer folds a window >= seqlen_k
+    // back to -1 (plain causal).
+    TORCH_CHECK(window_size_left < 0 || causal,
+                "OPUS D=128: window_size_left >= 0 requires causal");
+    args.window_size_left = window_size_left;
 
     HipDeviceGuard guard(q.device().index());
 
@@ -121,19 +128,9 @@ void launch_d128(at::Tensor& q,
         // by total_q / Q_BLOCK + batch instead: it bounds that sum from above, and being
         // built out of seqstart_q the same way the kernel's lookup is, it is the extent
         // that lookup expects. The surplus -- at most `batch` blocks -- retires in the
-        // kernel. Both terms come from what the caller already handed over on the host,
-        // so this costs nothing.
+        // kernel.
         //
-        // Measured on MI355X over 10 jagged and even shapes at H=8/HK=2 and H=32/HK=8,
-        // against the rectangle the flat grid is bitwise identical and between 0.46x and
-        // 1.20x the time. It wins biggest where the rectangle pads the most and the grid
-        // is too small for that padding to hide behind real work (B=64 jagged at H=8,
-        // 0.46x), and loses on even lengths with few blocks, where the rectangle is
-        // already exact and the bound's overshoot is a large fraction of it (B=64 of 700
-        // at H=32, 1.20x).
-        //
-        // The launcher turns the row count into the axis extent for whichever Q block
-        // size the variant it selects uses, so pass the rows; total_q_blocks stays for
+        // The launcher derives the extent from the row count; total_q_blocks is for
         // callers that fill the args struct directly.
         const long long total_q = q.size(0);
         args.total_q            = static_cast<int>(total_q);
@@ -378,7 +375,8 @@ void fmha_fwd_bf16_opus_fwd(at::Tensor& q,
                             std::optional<at::Tensor> seqstart_q_pad,
                             std::optional<at::Tensor> seqstart_k_pad,
                             int max_seqlen_q,
-                            int max_seqlen_k)
+                            int max_seqlen_k,
+                            int window_size_left)
 {
     TORCH_CHECK(q.is_cuda(), "q must be a GPU tensor");
     TORCH_CHECK(k.device() == q.device() && v.device() == q.device() &&
@@ -395,8 +393,10 @@ void fmha_fwd_bf16_opus_fwd(at::Tensor& q,
     if (D_QK == 128 && D_V == 128) {
         launch_d128(q, k, v, out, causal, softmax_scale, lse,
                     seqstart_q, seqstart_k, seqstart_q_pad, seqstart_k_pad,
-                    max_seqlen_q, max_seqlen_k);
+                    max_seqlen_q, max_seqlen_k, window_size_left);
     } else if (D_QK == 192 && D_V == 128) {
+        TORCH_CHECK(window_size_left < 0,
+                    "OPUS D_QK=192/D_V=128 kernel has no sliding window");
         launch_d192_v128(q, k, v, out, causal, softmax_scale, lse,
                          seqstart_q, seqstart_k, seqstart_q_pad, seqstart_k_pad,
                          max_seqlen_q, max_seqlen_k);

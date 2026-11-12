@@ -529,6 +529,7 @@ __device__ __attribute__((always_inline)) void gqa_d128_impl(opus_gqa_kargs karg
     using namespace opus;
     using namespace gqa_d128;
     using T = opus::remove_cvref_t<Traits>;
+    static_assert(!T::LOCAL, "the sliding window runs on gqa_d128_swa_kernel");
     using D_ATTN = typename T::D_ATTN;
     using D_ACC = typename T::D_ACC;
 
@@ -557,9 +558,8 @@ __device__ __attribute__((always_inline)) void gqa_d128_impl(opus_gqa_kargs karg
         // Q-block on the slowest axis so the shorter groups' empty tail blocks
         // short-circuit together. Every group gets ceil(max_seqlen / q_block) of them.
         //
-        // Flat (total_q_blocks > 0): y carries one block per (group, Q-block) pair that
-        // actually exists, so nothing is launched that will not work. The cost is finding
-        // which group the flat index belongs to.
+        // Flat (total_q_blocks > 0): y lays the groups' blocks end to end, at most one
+        // surplus block per group, and each block finds its group in seqstart_q.
         int g;
         if (kargs.total_q_blocks > 0) {
             const int i = sc(block_id_y());
