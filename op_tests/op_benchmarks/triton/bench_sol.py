@@ -75,10 +75,7 @@ from aiter.ops.mha_v4 import (
     quantize_v_mxfp4_fp6_p,
     quantize_v_mxfp6_fp6_p,
 )
-from aiter.ops.triton.attention.utils import (
-    block_attn_mask_to_ragged_lut,
-    sol_prepare,
-)
+from aiter.ops.triton.attention.utils import sol_prepare
 
 # Wan 2.2 A14B transformer.
 WAN_HEADS = 40
@@ -338,8 +335,9 @@ def time_point(operands, mask, block_tile, jensen, kv_range_tokens, warmup, rep)
 
     sol_prepare owns the mask it returns -- it forces a short tail block onto the
     exact pass, which the approximate branch's constant full-block factor cannot
-    represent -- so the sparse LUT is built from THAT mask, not the one handed in.
-    Otherwise the two kernels would be timed over selections differing by one block.
+    represent -- so the sparse launch reuses the LUT sol_prepare built from THAT mask,
+    not one built from the mask handed in. Otherwise the two kernels would be timed over
+    selections differing by one block.
     """
     recipe = operands["recipe"]
     _, k_quant, v_quant = operands["tensors"][:3]
@@ -354,8 +352,6 @@ def time_point(operands, mask, block_tile, jensen, kv_range_tokens, warmup, rep)
         **operands["prepare_kwargs"],
     )
     used = plan["block_attn_mask"]
-    kv_idx, lut_start, lut_count = block_attn_mask_to_ragged_lut(used)
-    lut_start, lut_count = lut_start.to(torch.int32), lut_count.to(torch.int32)
 
     launch = functools.partial(
         mha_v4_packed,
@@ -365,13 +361,13 @@ def time_point(operands, mask, block_tile, jensen, kv_range_tokens, warmup, rep)
         block_tile=block_tile,
     )
     sparse = functools.partial(
-        launch, kv_block_indices=kv_idx, lut_start=lut_start, lut_count=lut_count
-    )
-    sol_attn = functools.partial(
         launch,
         kv_block_indices=plan["kv_block_indices"],
         lut_start=plan["lut_start"],
         lut_count=plan["lut_count"],
+    )
+    sol_attn = functools.partial(
+        sparse,
         mean_k=plan["mean_k"],
         mean_v=plan["mean_v"],
         block_bitmap=plan["block_bitmap"],
@@ -394,7 +390,7 @@ def time_point(operands, mask, block_tile, jensen, kv_range_tokens, warmup, rep)
         result["jensen_ms"] = triton.testing.do_bench(
             sol_jensen, warmup=warmup, rep=rep
         )
-    del sparse, sol_attn, plan, kv_idx, lut_start, lut_count
+    del sparse, sol_attn, plan
     torch.cuda.empty_cache()
     return result
 
