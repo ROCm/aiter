@@ -33,6 +33,13 @@ def _wait_for_release(release, value):
     return value
 
 
+def _new_tensor_device(gpu):
+    import torch
+
+    torch.cuda.set_device(gpu)
+    return str(torch.zeros(1).device)
+
+
 class FakeAsyncResult:
     """Simulates multiprocessing.AsyncResult for testing polling logic."""
 
@@ -941,25 +948,28 @@ class TestDefaultDevice(unittest.TestCase):
             self.assertIn("default_device", passed, ast.unparse(call))
 
     @unittest.skipUnless(importlib.util.find_spec("torch") is not None, "needs torch")
-    def test_initializer_then_set_device_places_tensors_on_that_gpu(self):
+    def test_pool_worker_creates_tensors_on_its_gpu(self):
         import torch
 
         if not torch.cuda.is_available() or torch.cuda.device_count() < 1:
             self.skipTest("needs a CUDA GPU")
         from unittest import mock
 
+        # GPU 1 when there is one: "cuda" must follow set_device, not pin GPU 0.
         gpu = 1 if torch.cuda.device_count() > 1 else 0
-        previous_gpu = torch.cuda.current_device()
         tuner = importlib.import_module("aiter.utility.mp_tuner")
-        try:
-            with mock.patch.object(tuner, "configure_worker_subprocesses"):
-                tuner._init_task_start_times([], None, "cuda")
-            torch.cuda.set_device(gpu)
-            tensor = torch.zeros(1)
-            self.assertEqual(tensor.device, torch.device("cuda", gpu))
-        finally:
-            torch.set_default_device(None)
-            torch.cuda.set_device(previous_gpu)
+        got = {}
+        with mock.patch.object(tuner, "mp", mp.get_context("spawn")):
+            for default_device in (None, "cuda"):
+                pool = tuner._new_pool(1, None, None, default_device)
+                try:
+                    got[default_device] = pool.apply_async(
+                        _new_tensor_device, (gpu,)
+                    ).get(timeout=300)
+                finally:
+                    pool.terminate()
+                    pool.join()
+        self.assertEqual(got, {None: "cpu", "cuda": f"cuda:{gpu}"})
 
 
 if __name__ == "__main__":
