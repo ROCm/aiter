@@ -1552,17 +1552,14 @@ def test_mha_fwd_fp8_large_head_selection(
 
 @pytest.mark.parametrize("CAUSAL", [True, False])
 def test_mha_varlen_fp8_large_head(CAUSAL: bool, dtype=torch.bfloat16):
-    """Compile fp8_large_head at d256; the Gluon FP8 tests stop at d128."""
+    """Compile fp8_large_head at d256; checks against attention_ref, including non-causal."""
     # flash_attn_varlen_func forwards descales only on backend="gluon".
-    from aiter.ops.triton.attention.mha import _flash_attn_forward
-    from aiter.ops.triton.utils._triton.arch_info import get_arch
-
     if get_arch() != "gfx942":
         pytest.skip("fp8_large_head is only defined for gfx942")
 
     HEAD_SZ = 256
     x = make_varlen_fp8_inputs(2, 512, 1024, 8, 2, HEAD_SZ, dtype)
-    triton_out, _, _, _, _ = _flash_attn_forward(
+    triton_out = _flash_attn_forward(
         x.q_fp8,
         x.k_fp8,
         x.v_fp8,
@@ -1582,7 +1579,7 @@ def test_mha_varlen_fp8_large_head(CAUSAL: bool, dtype=torch.bfloat16):
         descale_q=x.q_descale,
         descale_k=x.k_descale,
         descale_v=x.v_descale,
-    )
+    )[0]
     triton_out = x.output_pad_fn(triton_out)
 
     torch_out = varlen_fp8_reference(x, CAUSAL)
