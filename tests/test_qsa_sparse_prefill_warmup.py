@@ -4,8 +4,9 @@
 """QSA sparse prefill warmup: the query tile a layout gets, the layouts that cover every
 kernel-variant class, and the synthetic selection they run on.
 
-CPU only: the platform and the wide-tile thresholds are injected (gfx950 at 256 CUs and
-gfx942 at 80 CUs), and no kernel runs. Expected values are derived by hand.
+CPU only: the runtime architecture, the platform and the wide-tile thresholds are injected
+(gfx950 at 256 CUs and gfx942 at 80 CUs), so no test reads the host's GPU, and no kernel
+runs. Expected values are derived by hand.
 """
 
 from types import SimpleNamespace
@@ -22,15 +23,15 @@ import aiter.ops.flydsl.qsa_sparse_prefill as op
 from aiter.ops import qsa
 from aiter.ops.flydsl.kernels.qsa import sparse_prefill_prepare as prepare
 
-# union_min_rows, union_min_rows_per_head, first rows of the BQ21 and BQ42 tiles
-# (gfx950: BQ21 from 2048 rows and BQ42 from 4096 at 256 CUs; gfx942 at 80 CUs).
-GFX950 = (1536, 0, {21: 2048, 42: 4096})
-GFX942 = (384, 64, {21: 1680, 42: 3360})
+# runtime architecture, union_min_rows, union_min_rows_per_head, first rows of the BQ21 and
+# BQ42 tiles (gfx950: BQ21 from 2048 rows and BQ42 from 4096 at 256 CUs; gfx942 at 80 CUs).
+GFX950 = ("gfx950", 1536, 0, {21: 2048, 42: 4096})
+GFX942 = ("gfx942", 384, 64, {21: 1680, 42: 3360})
 # Wide tiles that start below the union gate, so the first call with a union plan already
 # takes them: gfx950 at 32 CUs (a partition; 8/21 tiles per CU gives 21 x 32 x 8/21 = 256
 # rows for BQ21 and 512 for BQ42), and a union gate of 3000 rows over the 256-CU tiles.
-GFX950_32_CUS = (1536, 0, {21: 256, 42: 512})
-UNION_ABOVE_WIDE = (3000, 0, {21: 2048, 42: 4096})
+GFX950_32_CUS = ("gfx950", 1536, 0, {21: 256, 42: 512})
+UNION_ABOVE_WIDE = ("gfx950", 3000, 0, {21: 2048, 42: 4096})
 ARCHS = {
     "gfx950": GFX950,
     "gfx942": GFX942,
@@ -42,10 +43,11 @@ ARCHS = {
 @pytest.fixture
 def platform(monkeypatch):
     def inject(arch):
-        union_min_rows, per_head, wide = arch
+        runtime, union_min_rows, per_head, wide = arch
         config = SimpleNamespace(
             union_min_rows=union_min_rows, union_min_rows_per_head=per_head
         )
+        monkeypatch.setattr(op, "get_gfx_runtime", lambda: runtime)
         monkeypatch.setattr(op, "platform", lambda: config)
         monkeypatch.setattr(prepare, "wide_tile_rows", lambda tile: wide[tile])
 

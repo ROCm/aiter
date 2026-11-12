@@ -31,6 +31,8 @@ import tempfile
 
 import torch
 
+from aiter.jit.utils.chip_info import get_gfx_runtime
+
 PAGE, PITCH, DIM = 1568, 19992, 256
 SCALE = DIM**-0.5
 TOPK = 512
@@ -203,7 +205,7 @@ def main():
     if args.child:
         mode, group, wide, cache_dir = args.child
         return child(mode, int(group), bool(int(wide)), cache_dir)
-    arch = torch.cuda.get_device_properties(0).gcnArchName.split(":")[0]
+    arch = get_gfx_runtime()
     if arch != "gfx950":
         print(f"qsa_sparse_prefill_warmup test needs gfx950, got {arch}; skipping")
         return
