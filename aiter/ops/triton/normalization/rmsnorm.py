@@ -71,9 +71,6 @@ def num_programs_fwd(x):
         if block_size(x) > fwd_oversub_max_block_size:
             return num_programs(x)
         return min(x.shape[0], get_num_sms() * fwd_program_oversub)
-    elif get_arch() in ("gfx1250", "gfx1250-strict"):
-        # One 4-warp program per CU leaves HBM underutilized on gfx1250
-        return min(x.shape[0], get_num_sms() * 4)
     else:
         # TODO: retune to account for updated compiler
         return num_programs(x)
@@ -82,7 +79,9 @@ def num_programs_fwd(x):
 def _use_gluon_rmsnorm(x: torch.Tensor, weight: torch.Tensor) -> bool:
     # TDM needs a unit inner stride, 16B-aligned base and row pitch, and a
     # contiguous weight; rows wider than the non-blocked cap stay on Triton.
-    if get_arch() not in ("gfx1250", "gfx1250-strict"):
+    # No Gluon config is shipped for gfx1250-strict.
+    # data_ptr() checks cannot be traced, so compiled graphs use Triton.
+    if get_arch() != "gfx1250" or torch.compiler.is_compiling():
         return False
     es = x.element_size()
     return (

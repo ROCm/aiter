@@ -191,6 +191,51 @@ def test_rmsnorm(M, N, in_dtype_str):
     torch.testing.assert_close(dg_triton, dg_torch, rtol=rtol, atol=atol)
 
 
+@pytest.mark.parametrize("in_dtype_str", ["fp16", "bf16"])
+@pytest.mark.parametrize(
+    "layout",
+    [
+        "padded_row_stride",  # row pitch > N, 16B aligned
+        "unaligned_row_stride",  # row pitch not a multiple of 16B
+        "x_offset",  # x base pointer not 16B aligned
+        "weight_offset",  # weight base pointer not 16B aligned
+    ],
+)
+def test_rmsnorm_non_default_layouts(layout, in_dtype_str):
+    dtype = str_to_torch_dtype[in_dtype_str]
+    M, N = 512, 1024
+    torch.manual_seed(0)
+
+    if layout == "padded_row_stride":
+        x = torch.randn((M, N + 64), dtype=dtype, device="cuda")[:, :N]
+    elif layout == "unaligned_row_stride":
+        x = torch.randn((M, N + 1), dtype=dtype, device="cuda")[:, :N]
+    elif layout == "x_offset":
+        x = torch.randn(M * N + 1, dtype=dtype, device="cuda")[1:].view(M, N)
+    else:
+        x = torch.randn((M, N), dtype=dtype, device="cuda")
+    if layout == "weight_offset":
+        weight = torch.randn(N + 1, dtype=dtype, device="cuda")[1:]
+    else:
+        weight = torch.randn(N, dtype=dtype, device="cuda")
+
+    dy = torch.randn((M, N), dtype=dtype, device="cuda")
+    x.requires_grad_(True)
+    weight.requires_grad_(True)
+
+    y_torch, *_ = run_torch(x, weight, 1e-5)
+    y_triton, *_ = run_triton(x, weight, 1e-5)
+    y_triton.backward(dy, retain_graph=True)
+    dx_triton, dg_triton = x.grad.clone(), weight.grad.clone()
+    x.grad, weight.grad = None, None
+    y_torch.backward(dy, retain_graph=True)
+    dx_torch, dg_torch = x.grad.clone(), weight.grad.clone()
+
+    torch.testing.assert_close(y_triton, y_torch, atol=1e-2, rtol=1e-2)
+    torch.testing.assert_close(dx_triton, dx_torch, atol=1e-2, rtol=1e-2)
+    torch.testing.assert_close(dg_triton, dg_torch, atol=1e-2, rtol=1e-2)
+
+
 @pytest.mark.parametrize("in_dtype_str", ["fp32", "fp16", "bf16"])
 @pytest.mark.parametrize(
     "M, N",
