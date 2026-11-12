@@ -1137,6 +1137,10 @@ def _tune_v41_flash_ep4(config: MegaMoEConfig, ctx: _TuningContext) -> MegaMoECo
                 "mfma_amajor": True,
             },
         )
+    if ctx.mtpr == 16384 and ctx.bucket == 256:
+        # Reduce expert-row padding at ATOM's capacity. The 512-row bucket
+        # keeps SBM64, where narrowing adds weight reads and loses the gain.
+        config = _replace_config(config, stage1={"sort_block_m": 32})
     return config
 
 
