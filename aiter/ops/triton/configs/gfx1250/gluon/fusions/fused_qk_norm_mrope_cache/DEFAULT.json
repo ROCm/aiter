@@ -1,0 +1,10 @@
+{
+    "ROWS_LEQ_32768": {
+        "TDM": false,
+        "num_warps": 4
+    },
+    "any": {
+        "TDM": true,
+        "num_warps": 4
+    }
+}
