@@ -490,20 +490,55 @@ def batched_gemm_a8w8_mxscale_bpreshuffle_fused_quant(
     return y8, y_scale
 
 
+def _gfx950_fused_quant_runs(name: str) -> bool:
+    """Whether the gfx950 fused epilogue can run this flydsl kernel name."""
+    from .flydsl.batched_gemm_a8w8_gfx950 import parse_bmm_kernel_name
+
+    # The runner would set aside a tile that splits a 32-column group.
+    parsed = parse_bmm_kernel_name(name)
+    return parsed is not None and parsed["tile_n"] % 32 == 0
+
+
+def _gfx950_fused_quant_kernel(
+    cfg, g: int, m: int, n: int, k: int, w_scale_block: str, cu_num: int
+) -> str | None:
+    """The bf16 entry's flydsl row when the fused epilogue can run it. Where that
+    row is OPUS or a tile the epilogue cannot run, the shape's flydsl row at the
+    next larger tuned M (else the largest) stands in: the runner's own
+    heuristic tile is far slower there at large M. None when the shape has no
+    usable row."""
+    if (
+        cfg is not None
+        and cfg["libtype"] == "flydsl"
+        and _gfx950_fused_quant_runs(cfg["kernelName"])
+    ):
+        return cfg["kernelName"]
+    rows = sorted(
+        (key[3], row["kernelName"])
+        for key, row in _load_mxscale_bmm_tuned(None, True).items()
+        if key[:3] == ("gfx950", cu_num, g)
+        and key[4:] == (n, k, w_scale_block)
+        and row.get("libtype") == "flydsl"
+        and _gfx950_fused_quant_runs(row["kernelName"])
+    )
+    if not rows:
+        return None
+    return next((name for row_m, name in rows if row_m >= m), rows[-1][1])
+
+
 @functools.lru_cache(maxsize=1024)
 def _fused_quant_tuned_kernel(
     g: int, m: int, n: int, k: int, w_scale_block: str, gfx: str, cu_num: int
 ) -> str | None:
     """The kernelName of the preshuffle table's flydsl row for this shape, the
     row the bf16 entry runs, so both entries share the tuned tile. None (the
-    runner's own choice) when there is no row or the row is not a flydsl one.
+    runner's own choice) when there is no row, the row is not a flydsl one, or
+    it names a compute kernel (no fused quant epilogue; the runner rejects it
+    with ``y_scale_out``). Any other name is passed through as is: a name the
+    flydsl runner does not accept raises there, as it does for the bf16 entry.
 
-    On gfx950 the name must also be a tile the fused epilogue can run (N tile a
-    multiple of 32), else None. On gfx1250 a compute-kernel row gives None (no
-    fused quant epilogue; the runner rejects it with ``y_scale_out``); any other
-    name is passed through as is: a name the flydsl runner does not accept
-    raises there, as it does for the bf16 entry."""
-
+    gfx950 instead filters the rows to tiles its epilogue can run and falls back
+    to a neighbouring tuned M (see :func:`_gfx950_fused_quant_kernel`)."""
     cfg = lookup_mxscale_bmm_config(
         g,
         m,
@@ -514,17 +549,13 @@ def _fused_quant_tuned_kernel(
         gfx=gfx,
         cu_num=cu_num,
     )
+    if gfx == "gfx950":
+        return _gfx950_fused_quant_kernel(cfg, g, m, n, k, w_scale_block, cu_num)
+    from .flydsl.mxfp8_bpreshuffle_gemm_gfx1250 import is_compute_wmma_kernel_name
+
     if cfg is None or cfg["libtype"] != "flydsl":
         return None
     name = cfg["kernelName"]
-    if gfx == "gfx950":
-        from .flydsl.batched_gemm_a8w8_gfx950 import parse_bmm_kernel_name
-
-        # The runner would set aside a tile that splits a 32-column group.
-        parsed = parse_bmm_kernel_name(name)
-        return name if parsed is not None and parsed["tile_n"] % 32 == 0 else None
-    from .flydsl.mxfp8_bpreshuffle_gemm_gfx1250 import is_compute_wmma_kernel_name
-
     return None if is_compute_wmma_kernel_name(name) else name
 
 
