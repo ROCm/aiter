@@ -108,6 +108,15 @@ template <> struct MxDtypeConfig<MxDtype::FP8_E4M3_FNUZ> {
     static constexpr uint32_t even_val_to_add = 0x00080000u;    // 1 << (23 - 3 - 1) = 1 << 19
 };
 
+// Biased exponent of ceil_pow2(|x|), with 0xFF (Inf/NaN) kept: adding the mantissa mask
+// carries into the exponent exactly when the mantissa is nonzero. Same result as
+// `e + (e < 0xFF && mantissa != 0)` for every input, without the compare pair.
+__device__ __forceinline__ uint32_t e8m0_ceil_exponent(uint32_t u32)
+{
+    const uint32_t exponent = ((u32 & 0x7FFFFFFFu) + 0x7FFFFFu) >> 23;
+    return exponent < 0xFFu ? exponent : 0xFFu;
+}
+
 // Generic E8M0 dequant scale computation.
 //
 // Returns the *dequantization* scale as an f32 with a power-of-2 bit
@@ -136,11 +145,8 @@ __device__ __forceinline__ float fp_f32_to_e8m0_scale(float amax)
     if constexpr (rmode == MxScaleRoundMode::RoundUp)
     {
         // ceil_pow2(amax / max_pos): NV / DSv4 / FlashInfer / torchao RCEIL.
-        const uint32_t u32      = __builtin_bit_cast(uint32_t, amax * Cfg::inv_max_pos);
-        uint32_t       exponent = (u32 >> 23) & 0xFFu;
-        if(exponent < 0xFFu && (u32 & 0x7FFFFFu))
-            exponent += 1;
-        return __builtin_bit_cast(float, exponent << 23);
+        const uint32_t u32 = __builtin_bit_cast(uint32_t, amax * Cfg::inv_max_pos);
+        return __builtin_bit_cast(float, e8m0_ceil_exponent(u32) << 23);
     }
     else if constexpr (rmode == MxScaleRoundMode::RoundDown)
     {
@@ -152,11 +158,8 @@ __device__ __forceinline__ float fp_f32_to_e8m0_scale(float amax)
     else if constexpr (rmode == MxScaleRoundMode::Ceil)
     {
         // ceil_pow2(amax) / 2^target_max_pow2: torchao CEIL.
-        const uint32_t u32      = __builtin_bit_cast(uint32_t, amax * Cfg::inv_max_pow2);
-        uint32_t       exponent = (u32 >> 23) & 0xFFu;
-        if(exponent < 0xFFu && (u32 & 0x7FFFFFu))
-            exponent += 1;
-        return __builtin_bit_cast(float, exponent << 23);
+        const uint32_t u32 = __builtin_bit_cast(uint32_t, amax * Cfg::inv_max_pow2);
+        return __builtin_bit_cast(float, e8m0_ceil_exponent(u32) << 23);
     }
     else if constexpr (rmode == MxScaleRoundMode::Even)
     {

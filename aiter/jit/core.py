@@ -162,6 +162,11 @@ AITER_CONFIG_FMOE = os.getenv(
     f"{AITER_ROOT_DIR}/aiter/configs/tuned_fmoe.csv",
 )
 
+AITER_CONFIG_FMOE_SWIGLU_LIMIT = os.getenv(
+    "AITER_CONFIG_FMOE_SWIGLU_LIMIT",
+    f"{AITER_ROOT_DIR}/aiter/configs/tuned_swiglu_limit_fmoe.csv",
+)
+
 AITER_CONFIG_FHMOE = os.getenv(
     "AITER_CONFIG_FHMOE",
     f"{AITER_ROOT_DIR}/aiter/configs/tuned_fhmoe.csv",
@@ -235,6 +240,11 @@ AITER_CONFIG_CONV3D_BF16 = os.getenv(
     f"{AITER_ROOT_DIR}/aiter/configs/bf16_tuned_conv3d.csv",
 )
 
+AITER_CONFIG_MQA_LOGITS = os.getenv(
+    "AITER_CONFIG_MQA_LOGITS",
+    f"{AITER_ROOT_DIR}/aiter/configs/tuned_mqa_logits.csv",
+)
+
 # K5 opt BV tuned config. Per-model tuned rows live under model_configs/
 # (qwen3_5_*_chunk_gdn_h_opt_tuned.csv) and get merged into this canonical file by
 # get_config_file. It ships header-only: with no per-model table present
@@ -265,6 +275,11 @@ AITER_CONFIG_MEGA_MOE_TP = os.getenv(
 AITER_CONFIG_MEGA_MOE_TP_BIGM = os.getenv(
     "AITER_CONFIG_MEGA_MOE_TP_BIGM",
     f"{AITER_ROOT_DIR}/aiter/configs/mega_moe_tp_bigm_tuned.csv",
+)
+
+AITER_CONFIG_PAGED_MQA_LOGITS = os.getenv(
+    "AITER_CONFIG_PAGED_MQA_LOGITS",
+    f"{AITER_ROOT_DIR}/aiter/configs/paged_mqa_logits_tuned.csv",
 )
 
 
@@ -361,6 +376,14 @@ class AITER_CONFIG:
         )
 
     @property
+    def AITER_CONFIG_FMOE_SWIGLU_LIMIT_FILE(self):
+        return self.get_config_file(
+            "AITER_CONFIG_FMOE_SWIGLU_LIMIT",
+            AITER_CONFIG_FMOE_SWIGLU_LIMIT,
+            "tuned_swiglu_limit_fmoe",
+        )
+
+    @property
     def AITER_CONFIG_FHMOE_FILE(self):
         return self.get_config_file(
             "AITER_CONFIG_FHMOE", AITER_CONFIG_FHMOE, "tuned_fhmoe"
@@ -435,6 +458,14 @@ class AITER_CONFIG:
         )
 
     @property
+    def AITER_CONFIG_MQA_LOGITS_FILE(self):
+        return self.get_config_file(
+            "AITER_CONFIG_MQA_LOGITS",
+            AITER_CONFIG_MQA_LOGITS,
+            "tuned_mqa_logits",
+        )
+
+    @property
     def AITER_CONFIG_GDN_K5_OPT_FILE(self):
         return self.get_config_file(
             "AITER_CONFIG_GDN_K5_OPT",
@@ -468,6 +499,14 @@ class AITER_CONFIG:
             "AITER_CONFIG_MEGA_MOE_TP_BIGM",
             AITER_CONFIG_MEGA_MOE_TP_BIGM,
             "mega_moe_tp_bigm_tuned",
+        )
+
+    @property
+    def AITER_CONFIG_PAGED_MQA_LOGITS_FILE(self):
+        return self.get_config_file(
+            "AITER_CONFIG_PAGED_MQA_LOGITS",
+            AITER_CONFIG_PAGED_MQA_LOGITS,
+            "paged_mqa_logits_tuned",
         )
 
     @property
@@ -1359,12 +1398,17 @@ def _build_archs_from_env(detect_gfx) -> list[str]:
     return explicit or [detect_gfx()]
 
 
-def _cluster_launch_target(detect_gfx) -> bool:
-    """True when any targeted arch wants -DAITER_ENABLE_CLUSTER_LAUNCH."""
+def _targets_gfx1250(detect_gfx) -> bool:
+    """True when any targeted arch is gfx1250 or gfx1250-strict."""
     return any(
         arch in ("gfx1250", "gfx1250-strict")
         for arch in _build_archs_from_env(detect_gfx)
     )
+
+
+def _cluster_launch_target(detect_gfx) -> bool:
+    """True when any targeted arch wants -DAITER_ENABLE_CLUSTER_LAUNCH."""
+    return _targets_gfx1250(detect_gfx)
 
 
 def build_module(
@@ -1388,6 +1432,21 @@ def build_module(
     lock_path = f"{bd_dir}/lock_{md_name}"
     startTS = time.perf_counter()
     target_name = f"{md_name}{JIT_LIB_EXT}" if not is_standalone else md_name
+
+    if md_name.startswith("module_mega_mhc_stream_"):
+        # Keep source selection and host dispatch in sync for JIT and prebuild.
+        mhc_gfx1250 = any(
+            arch in ("gfx1250", "gfx1250-strict")
+            for arch in _build_archs_from_env(get_gfx)
+        )
+        if not mhc_gfx1250:
+            srcs = [
+                src for src in srcs if os.path.basename(src) != "mega_mhc_gfx1250.cu"
+            ]
+        flags_extra_hip = [
+            *flags_extra_hip,
+            f"-DAITER_MHC_GFX1250={int(mhc_gfx1250)}",
+        ]
 
     for tp in third_party:
         clone_3rdparty(tp)
@@ -1479,6 +1538,11 @@ def build_module(
         # path was compiled out (AiterAsmKernelFast then rejects them at launch).
         if _cluster_launch_target(get_gfx) and hip_version >= Version("7.0.0"):
             flags_hip += ["-DAITER_ENABLE_CLUSTER_LAUNCH"]
+        # CK's CMakeLists forces the unified ck_tile framework off for any build that
+        # targets gfx1250, which it does not support yet; the JIT bypasses that CMake.
+        # It has to be a whole-TU define so the host and device passes agree.
+        if _targets_gfx1250(get_gfx):
+            flags_hip += ["-DUSE_NEW_UNIFIED_FRAMEWORK=0"]
 
         if not torch_exclude:
             import torch
@@ -1942,17 +2006,6 @@ def _ctypes_call(func, fc_name, md_name):
 
     from ..utility.dtypes import aiter_tensor_t, torch_to_aiter
 
-    # Avoid constructing a Python Stream object on every ctypes invocation.
-    # Keep the public API fallback for torch versions without the private raw
-    # stream getter, and preserve the first tensor's device selection.
-    raw_stream = getattr(torch._C, "_cuda_getCurrentRawStream", None)
-    if raw_stream is None:
-
-        def raw_stream(device_index):
-            return torch.cuda.current_stream(device_index).cuda_stream
-
-    current_device = torch.cuda.current_device
-
     _cache = {}
     _arg_checked = False
     _sig = inspect.signature(func)
@@ -2187,6 +2240,12 @@ def _ctypes_call(func, fc_name, md_name):
             else:  # _ARG_BOOL
                 add_arg(1 if value else 0)
 
+        # The same stream/device getters as the develop pybind path (no Python
+        # Stream object per call), read per call so an AOT dry run can swap
+        # them; the first tensor's device still selects the stream.
+        _, _, raw_stream, current_device = (
+            _pybind_develop_hooks_cache or _pybind_develop_hooks()
+        )
         if tensor_device is None:
             tensor_device = current_device()
         c_args.append(ctypes.c_void_p(raw_stream(tensor_device)))
@@ -2238,8 +2297,8 @@ def _pybind_develop_hooks():
         raw_stream = getattr(torch._C, "_cuda_getCurrentRawStream", None)
         if raw_stream is None:
 
-            def raw_stream(_device_index):
-                return torch.cuda.current_stream().cuda_stream
+            def raw_stream(device_index):
+                return torch.cuda.current_stream(device_index).cuda_stream
 
         _pybind_develop_hooks_cache = (
             torch_to_aiter_pybind,

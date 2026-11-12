@@ -165,6 +165,32 @@ with tp_group.graph_capture() as gc:
 
 ## Important Notes
 
+### Fused All-Reduce One-Stage Limit
+
+Set `AITER_AR_1STAGE_MAX_BYTES` before importing
+`aiter.dist.device_communicators.communicator_cuda` to set the one-stage
+threshold for fused all-reduce + RMSNorm, including the per-token and per-group
+FP8 quantized paths. The threshold is an integer byte count: `512` means
+512 bytes, and `524288` means 512 KiB. The one-stage size check includes the
+threshold (`input.numel() * input.element_size() <= limit`).
+
+When neither name is set, or the selected value is negative, the limit is
+`128 * 7168 * 2 // world_size` bytes for all-reduce + RMSNorm and `128 * 1024`
+bytes for its FP8 quantized paths. Zero excludes nonempty inputs from one-stage
+selection. `AITER_AR_1STAGE=1` or `0` still overrides this size check; other
+dispatch eligibility checks still apply.
+
+The dedicated kernels in `fused_allreduce_rmsnorm_mxfp4_quant` use their own
+shape and size gates, not this limit. Its fallback through
+`fused_allreduce_rmsnorm` does use this limit.
+
+`AITER_AR_1STAGE_MAX_KB` is deprecated. Despite its name, it has always been
+interpreted in bytes. It keeps that behavior and emits a `FutureWarning` when
+used. To preserve an existing limit, replace the old name with
+`AITER_AR_1STAGE_MAX_BYTES` and keep the same value. The new name takes precedence
+when both are set, including when its value is negative. Older AITER versions
+that do not support the new name still need the old name.
+
 ### Mutual Exclusion with Standard Interfaces
 
 Custom groups and standard parallel group interfaces are **mutually exclusive**:
