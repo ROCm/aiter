@@ -158,6 +158,19 @@ def get_GEMM_A16W16_tuned_config(
             None,
         )
         if config is not None:
+            # This new latent-projection row is qualified only at exact M.
+            # Do not let padded lookup replace other shapes' existing ASM
+            # route; continue to the next original padding candidate instead.
+            if (
+                M != padded_M
+                and (gfx, cu_num, padded_M, N, K) == ("gfx950", 256, 16384, 7168, 3584)
+                and not (bias or scaleAB or bpreshuffle)
+                and str(dtype) == str(otype) == "torch.bfloat16"
+                and config["libtype"] == "flydsl"
+                and config["kernelName"]
+                == "flydsl_hgemm_abf16_wbf16_bf16_t256x256x64x2_ks1_w2x4x1_bias0_ktail0_gm4_pht_gfx950"
+            ):
+                continue
             if config["libtype"] == "flydsl":
                 flydsl_config = (
                     _get_flydsl_gemm_kernels().get_flydsl_hgemm_kernel_params(
@@ -172,26 +185,6 @@ def get_GEMM_A16W16_tuned_config(
                         "recognized by the current catalog; falling back to next candidate."
                     )
                     config = None
-            # The exact M128 packed policy now records its effective 5-stage,
-            # 2-partition configuration in the CSV. That row is also borrowed
-            # by M65..127: retain their prior 4-stage/4-partition policy rather
-            # than silently retuning them. Never rewrite an exact tuned row.
-            if (
-                config is not None
-                and config["libtype"] == "flydsl"
-                and (gfx, cu_num, padded_M, N, K) == ("gfx950", 256, 128, 3584, 7168)
-                and 65 <= M < padded_M
-                and not (bias or scaleAB or bpreshuffle)
-                and str(dtype) == str(otype) == "torch.bfloat16"
-                and config["kernelName"]
-                == "flydsl_hgemm_abf16_wbf16_bf16_t64x64x64x5_ks2_w2x2x1_bias0_ktail0_gm0_pft_gfx950"
-            ):
-                config = {
-                    **config,
-                    "solidx": 3787,
-                    "splitK": 4,
-                    "kernelName": config["kernelName"].replace("x5_ks2_", "x4_ks4_"),
-                }
             if config is None:
                 continue
             if config["libtype"] == "opus":
