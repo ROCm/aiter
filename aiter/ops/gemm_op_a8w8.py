@@ -984,7 +984,9 @@ def _splitk_deferrable(XQ: Tensor, WQ: Tensor, dtype, max_m: int):
     m, k = XQ.shape
     n, w_k = WQ.shape
     # A padded-K weight takes the padded-XQ path; leave it to gemm_a8w8_bpreshuffle.
-    if not 0 < m <= max_m or w_k != k or get_gfx() != "gfx1250":
+    # Same arch gate as gemm_a8w8_bpreshuffle_flydsl, so the deferred path runs
+    # exactly where the plain path would launch run_gemm_a8w8_bpreshuffle_gfx1250.
+    if not 0 < m <= max_m or w_k != k or not is_gfx1250_family(get_gfx()):
         return None
     config = get_GEMM_config_with_quant_type(
         m, n, k, dtypes.fp8, AITER_CONFIGS.AITER_CONFIG_GEMM_A8W8_BPRESHUFFLE_FILE
