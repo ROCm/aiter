@@ -22,6 +22,7 @@ scores / softmax / accumulation, bf16 output.
 """
 
 import functools
+import math
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
@@ -54,6 +55,7 @@ from aiter.ops.flydsl.kernels.minimax_m3_sparse_pa_nvfp4_common import (
     pk_f16,
     xlane4,
 )
+from aiter.ops.flydsl.kernels.tensor_shim import _run_compiled
 
 TOPK = 16  # selected blocks per row (one lane per (row, slot): TQ x 16 <= 64 lanes)
 
@@ -437,21 +439,20 @@ def compile_prefill(tq: int = 4, rounds: int = 2, q_lds: bool | None = None):
 # host side
 # ---------------------------------------------------------------------------
 @functools.cache
-def _get_kernel(tq: int, rounds: int):
+def _get_kernel(tq: int, rounds: int, device_index: int):
+    # device_index only keys the cache: the launcher memoises its compiled handle, which
+    # is bound to the device it was compiled on.
     return compile_prefill(tq, rounds)
+
+
+@functools.cache
+def _gfx_arch(device_index: int) -> str:
+    return torch.cuda.get_device_properties(device_index).gcnArchName.split(":")[0]
 
 
 @functools.cache
 def _unit_scale(device_index: int) -> torch.Tensor:
     return torch.ones(1, dtype=torch.float32, device=f"cuda:{device_index}")
-
-
-def _run(exe, *args):
-    cf = getattr(exe, "_cf", None)
-    if cf is None:
-        exe._cf = flyc.compile(exe, *args)
-    else:
-        cf(*args)
 
 
 @functools.cache
@@ -489,7 +490,18 @@ def minimax_m3_sparse_pa_nvfp4_prefill(
     tq: int | None = None,
     rounds: int | None = None,
 ) -> torch.Tensor:
-    """Row i attends to the keys of its ``topk_idx`` blocks up to its position."""
+    """Row i attends to the keys of its ``topk_idx`` blocks up to its position.
+
+    gfx950 only. Every operand must be on ``q``'s device; ``k_scale`` / ``v_scale`` are
+    one positive float32 element each (a device value, not checked) and ``sm_scale``
+    must be finite and positive.
+    """
+    if q.device.type != "cuda":
+        raise ValueError(f"q must be a CUDA tensor, got {q.device}")
+    if _gfx_arch(q.device.index) != "gfx950":
+        raise ValueError(
+            f"NVFP4 sparse PA prefill requires gfx950, got {_gfx_arch(q.device.index)}"
+        )
     rows, num_heads, head_dim = q.shape
     hkv = topk_idx.shape[0]
     if out is None:
@@ -501,13 +513,23 @@ def minimax_m3_sparse_pa_nvfp4_prefill(
     assert topk_idx.shape[-1] == TOPK
     assert q.dtype == torch.bfloat16 and out.dtype == torch.bfloat16
     assert q.is_contiguous() and out.is_contiguous() and out.shape == q.shape
+    # Q and out are addressed with 32-bit byte offsets.
+    assert q.numel() * q.element_size() < 2**31, "q must be below 2 GiB"
+    page_b = 2 * hkv * (BLK * D // 2 + BLK * D // 16)
     assert kv_cache.dtype == torch.uint8 and kv_cache.stride(0) < 2**31
-    assert kv_cache.stride(0) >= 2 * hkv * (BLK * D // 2 + BLK * D // 16)
+    assert (
+        kv_cache.dim() == 2 and kv_cache.stride(1) == 1
+    ), "kv_cache must be 2-D with a unit last stride"
+    assert (
+        kv_cache.stride(0) >= page_b and kv_cache.size(1) >= page_b
+    ), "kv_cache page is smaller than its payload"
     assert topk_idx.dtype == torch.int32 and topk_idx.shape[1] >= rows
     assert topk_idx.stride(2) == 1
     for t in (block_table, row_req_id, row_kv_lens):
         assert t.dtype == torch.int32 and t.stride(-1) == 1
     assert row_req_id.shape[0] >= rows and row_kv_lens.shape[0] >= rows
+    for t in (out, kv_cache, topk_idx, block_table, row_req_id, row_kv_lens):
+        assert t.device == q.device, "all operands must be on q's device"
     dev = q.device.index
     if tq is None:
         tq, rounds = pick_tile(rows, hkv, _cu_count(dev))
@@ -516,10 +538,16 @@ def minimax_m3_sparse_pa_nvfp4_prefill(
     unit = _unit_scale(dev)
     ks = unit if k_scale is None else k_scale
     vs = unit if v_scale is None else v_scale
+    for t in (ks, vs):
+        assert (
+            t.device == q.device and t.dtype == torch.float32 and t.numel() == 1
+        ), "k_scale and v_scale must be one float32 element on q's device"
+    # The softmax runs in scaled units with masked scores at -inf, so it needs c > 0.
     c = float(np.float32(sm_scale) * np.float32(LOG2E))
+    assert math.isfinite(c) and c > 0, "sm_scale must be finite and positive"
     with torch.cuda.device(q.device):
-        _run(
-            _get_kernel(tq, rounds),
+        _run_compiled(
+            _get_kernel(tq, rounds, dev),
             q.data_ptr(),
             kv_cache.data_ptr(),
             topk_idx.data_ptr(),

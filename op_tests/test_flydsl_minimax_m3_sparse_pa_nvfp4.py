@@ -414,22 +414,17 @@ def padding_rows():
 
 
 def refusals():
-    """Arguments the kernel cannot read correctly are refused before launch, each with
+    """Arguments the kernels cannot read correctly are refused before launch, each with
     its own message."""
     bad = 0
     c = make_case([500, 700], [1, 1], 1, 16, seed=5)
     cache, ks = c["cache"], c["k_scale"]
-    cases = [
-        ("splits > MAX_SPLITS", {"splits": 32}, "splits must be"),
-        ("splits 0", {"splits": 0}, "splits must be"),
+    shared = [
         ("strided cache view", {"cache": cache[:, ::2]}, "unit last stride"),
         ("cache too narrow", {"cache": cache[:, :-1]}, "smaller than its payload"),
         ("cpu k_scale", {"k_scale": ks.cpu()}, "k_scale and v_scale"),
         ("fp16 k_scale", {"k_scale": ks.half()}, "k_scale and v_scale"),
         ("empty k_scale", {"k_scale": ks[:0]}, "k_scale and v_scale"),
-        ("short block_table", {"bt": c["bt"][:1]}, "row per request"),
-        ("2-D seq_lens", {"seq_lens": c["seq_lens"][None]}, "seq_lens 1-D"),
-        ("xcds 1", {"xcds": 1}, "xcds must be"),
         ("sm_scale 0", {"sm_scale": 0.0}, "sm_scale"),
         ("sm_scale nan", {"sm_scale": float("nan")}, "sm_scale"),
         ("cpu q", {"q": c["q"].cpu()}, "CUDA"),
@@ -439,25 +434,45 @@ def refusals():
             "2 GiB",
         ),
     ]
-    for name, kw, msg in cases:
-        a = {
-            "q": c["q"], "cache": cache, "sm_scale": SM_SCALE, "k_scale": ks,
-            "v_scale": c["v_scale"], "splits": None, "bt": c["bt"],
-            "seq_lens": c["seq_lens"], "xcds": None, **kw,
-        }  # fmt: skip
-        try:
-            minimax_m3_sparse_pa_nvfp4_decode(
-                a["q"], a["cache"], c["topk"], a["bt"], a["seq_lens"], a["sm_scale"],
-                None, a["k_scale"], a["v_scale"], query_len=1, splits=a["splits"],
-                xcds=a["xcds"],
-            )  # fmt: skip
-        except (AssertionError, ValueError) as e:
-            if msg in str(e):
-                continue
-            print(f"refusal: {name}: wrong message: {e!r}")
-        else:
-            print(f"refusal: {name} was accepted")
-        bad += 1
+    decode_only = [
+        ("splits > MAX_SPLITS", {"splits": 32}, "splits must be"),
+        ("splits 0", {"splits": 0}, "splits must be"),
+        ("short block_table", {"bt": c["bt"][:1]}, "row per request"),
+        ("2-D seq_lens", {"seq_lens": c["seq_lens"][None]}, "seq_lens 1-D"),
+        ("xcds 1", {"xcds": 1}, "xcds must be"),
+    ]
+
+    def decode(a):
+        minimax_m3_sparse_pa_nvfp4_decode(
+            a["q"], a["cache"], c["topk"], a.get("bt", c["bt"]), a.get("seq_lens", c["seq_lens"]),
+            a["sm_scale"], None, a["k_scale"], a["v_scale"], query_len=1,
+            splits=a.get("splits"), xcds=a.get("xcds"),
+        )  # fmt: skip
+
+    def prefill(a):
+        minimax_m3_sparse_pa_nvfp4_prefill(
+            a["q"], a["cache"], c["topk"], c["bt"], c["row_req"], c["row_kv"],
+            a["sm_scale"], None, a["k_scale"], a["v_scale"],
+        )  # fmt: skip
+
+    for kind, call, cases in (
+        ("decode", decode, shared + decode_only),
+        ("prefill", prefill, shared),
+    ):
+        for name, kw, msg in cases:
+            a = {
+                "q": c["q"], "cache": cache, "sm_scale": SM_SCALE, "k_scale": ks,
+                "v_scale": c["v_scale"], **kw,
+            }  # fmt: skip
+            try:
+                call(a)
+            except (AssertionError, ValueError) as e:
+                if msg in str(e):
+                    continue
+                print(f"refusal: {kind} {name}: wrong message: {e!r}")
+            else:
+                print(f"refusal: {kind} {name} was accepted")
+            bad += 1
     decode_call(c, 16)  # the largest split count still launches
     return bad
 
