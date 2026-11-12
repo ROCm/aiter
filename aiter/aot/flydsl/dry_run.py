@@ -122,6 +122,73 @@ def _register_stream_stub() -> None:
 
 
 @contextmanager
+def _mm_dtype_meta() -> Iterator[None]:
+    """Backport mm's out_dtype meta support for older ROCm torch wheels.
+
+    torch 2.9.1 exposes mm.dtype but registers meta_mm(a, b) for it, so
+    an untuned GEMM's torch fallback fails even on FakeTensors. A temporary
+    FakeTensor rule supplies the missing meta implementation; real GEMMs
+    keep their original implementation.
+    """
+    import inspect
+
+    import torch
+    from torch._meta_registrations import meta_mm
+    from torch._prims_common.wrappers import out_wrapper
+    from torch._subclasses.fake_impls import op_implementations_dict
+    from torch._subclasses.fake_tensor import (
+        FakeTensorMode,
+        in_kernel_invocation_manager,
+    )
+    from torch.utils._pytree import tree_flatten
+
+    if (
+        not hasattr(torch.ops.aten.mm, "dtype")
+        or "out_dtype" in inspect.signature(meta_mm).parameters
+    ):
+        yield
+        return
+
+    @out_wrapper(exact_dtype=True)
+    def meta_mm_dtype(a, b, out_dtype=None):
+        # Match torch 2.10's meta_mm, including its shape/dtype checks.
+        torch._check(a.dim() == 2, lambda: "a must be 2D")
+        torch._check(b.dim() == 2, lambda: "b must be 2D")
+        n, k = a.shape
+        kb, p = b.shape
+        torch._check(k == kb, lambda: "a and b must have same reduction dim")
+        if out_dtype is not None:
+            torch._check(
+                out_dtype == a.dtype
+                or (
+                    out_dtype == torch.float32
+                    and a.dtype in (torch.float16, torch.bfloat16)
+                ),
+                lambda: "out_dtype must be the same as input dtype or fp32 for fp16/bf16 inputs",
+            )
+        return a.new_empty((n, p), dtype=a.dtype if out_dtype is None else out_dtype)
+
+    def fake_mm_dtype(fake_mode, func, *args, **kwargs):
+        with in_kernel_invocation_manager(fake_mode):
+            result = meta_mm_dtype(*args, **kwargs)
+        return fake_mode.wrap_meta_outputs_with_default_device_logic(
+            result, func, tree_flatten((args, kwargs))[0], device=None
+        )
+
+    implementations = {
+        torch.ops.aten.mm.dtype: fake_mm_dtype,
+        torch.ops.aten.mm.dtype_out: fake_mm_dtype,
+    }
+    with mock.patch.dict(op_implementations_dict, implementations):
+        try:
+            FakeTensorMode.cache_clear()
+            yield
+        finally:
+            # A cached fake result must not outlive the temporary fake rules.
+            FakeTensorMode.cache_clear()
+
+
+@contextmanager
 def dry_run(
     arch: str, cu_num: int, name: str | None = None, *, python_ops: bool = False
 ) -> Iterator[None]:
@@ -276,5 +343,6 @@ def dry_run(
             if python_ops:
                 previous = module.run_python_ops_for_real(True)
                 stack.callback(module.run_python_ops_for_real, previous)
+        stack.enter_context(_mm_dtype_meta())
         stack.enter_context(FakeTensorMode(allow_non_fake_inputs=True))
         yield
