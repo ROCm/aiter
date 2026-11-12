@@ -5,7 +5,7 @@ import torch
 import triton
 import triton.language as tl
 
-from aiter.ops.triton._triton_kernels.flash_attn_triton_amd.utils import (
+from aiter.ops.triton._triton_kernels.attention.dao_ai.utils import (
     AUTOTUNE,
     DEBUG,
     AutotuneMode,
@@ -1320,8 +1320,7 @@ def _bwd_kernel_fused_atomic_causal(
     max_seqlen_k,
     dropout_mask,
     dropout_p,
-    philox_seed,
-    philox_offset_base,
+    rng_state,
     descale_q_ptr,
     descale_k_ptr,
     descale_v_ptr,
@@ -1339,6 +1338,13 @@ def _bwd_kernel_fused_atomic_causal(
     IS_FP8: tl.constexpr,
     FP8_MAX: tl.constexpr,
 ):
+    # The forward's dropout state, read on the device: no host sync, and capture stays legal.
+    if ENABLE_DROPOUT:
+        philox_seed = tl.load(rng_state)
+        philox_offset_base = tl.load(rng_state + 1)
+    else:
+        philox_seed = 0
+        philox_offset_base = 0
     wid = tl.program_id(0)  # workgoup id: 0, ..., NUM_K_PIDS * BATCH * NUM_K_HEADS - 1
 
     # workgroups get launched first along batch dim, then in head_k dim, and then in seq k block dim
@@ -1642,8 +1648,7 @@ def _bwd_kernel_split_dkdv_causal(
     max_seqlen_k,
     dropout_mask,
     dropout_p,
-    philox_seed,
-    philox_offset_base,
+    rng_state,
     descale_q_ptr,
     descale_k_ptr,
     descale_v_ptr,
@@ -1659,6 +1664,13 @@ def _bwd_kernel_split_dkdv_causal(
     IS_FP8: tl.constexpr,
     FP8_MAX: tl.constexpr,
 ):
+    # The forward's dropout state, read on the device: no host sync, and capture stays legal.
+    if ENABLE_DROPOUT:
+        philox_seed = tl.load(rng_state)
+        philox_offset_base = tl.load(rng_state + 1)
+    else:
+        philox_seed = 0
+        philox_offset_base = 0
     # seq block, batch, head_k
     seq_k_blk_idx = tl.program_id(0)
     batch_idx = tl.program_id(1)
@@ -1943,8 +1955,7 @@ def _bwd_kernel_split_dq_causal(
     max_seqlen_k,
     dropout_mask,
     dropout_p,
-    philox_seed,
-    philox_offset_base,
+    rng_state,
     descale_q_ptr,
     descale_k_ptr,
     descale_v_ptr,
@@ -1960,6 +1971,13 @@ def _bwd_kernel_split_dq_causal(
     IS_FP8: tl.constexpr,
     FP8_MAX: tl.constexpr,
 ):
+    # The forward's dropout state, read on the device: no host sync, and capture stays legal.
+    if ENABLE_DROPOUT:
+        philox_seed = tl.load(rng_state)
+        philox_offset_base = tl.load(rng_state + 1)
+    else:
+        philox_seed = 0
+        philox_offset_base = 0
     seq_q_blk_idx = tl.program_id(0)
     batch_idx = tl.program_id(1)
     head_k_idx = tl.program_id(2)
@@ -2223,8 +2241,7 @@ def _bwd_kernel_fused_atomic_noncausal(
     max_seqlen_k,
     dropout_mask,
     dropout_p,
-    philox_seed,
-    philox_offset,
+    rng_state,
     descale_q_ptr,
     descale_k_ptr,
     descale_v_ptr,
@@ -2242,6 +2259,13 @@ def _bwd_kernel_fused_atomic_noncausal(
     IS_FP8: tl.constexpr,
     FP8_MAX: tl.constexpr,
 ):
+    # The forward's dropout state, read on the device: no host sync, and capture stays legal.
+    if ENABLE_DROPOUT:
+        philox_seed = tl.load(rng_state)
+        philox_offset = tl.load(rng_state + 1)
+    else:
+        philox_seed = 0
+        philox_offset = 0
     # workgroup id
     wid = tl.program_id(0)  # 0, ..., NUM_K_PIDS * BATCH * NUM_K_HEADS - 1
 
@@ -2433,8 +2457,7 @@ def _bwd_kernel_split_dkdv_noncausal(
     max_seqlen_k,
     dropout_mask,
     dropout_p,
-    philox_seed,
-    philox_offset,
+    rng_state,
     descale_q_ptr,
     descale_k_ptr,
     descale_v_ptr,
@@ -2450,6 +2473,13 @@ def _bwd_kernel_split_dkdv_noncausal(
     IS_FP8: tl.constexpr,
     FP8_MAX: tl.constexpr,
 ):
+    # The forward's dropout state, read on the device: no host sync, and capture stays legal.
+    if ENABLE_DROPOUT:
+        philox_seed = tl.load(rng_state)
+        philox_offset = tl.load(rng_state + 1)
+    else:
+        philox_seed = 0
+        philox_offset = 0
     pid = tl.program_id(0)
     bid = tl.program_id(1)
     hkid = tl.program_id(2)
@@ -2626,8 +2656,7 @@ def _bwd_kernel_split_dq_noncausal(
     max_seqlen_k,
     dropout_mask,
     dropout_p,
-    philox_seed,
-    philox_offset_base,
+    rng_state,
     descale_q_ptr,
     descale_k_ptr,
     descale_v_ptr,
@@ -2643,6 +2672,13 @@ def _bwd_kernel_split_dq_noncausal(
     IS_FP8: tl.constexpr,
     FP8_MAX: tl.constexpr,
 ):
+    # The forward's dropout state, read on the device: no host sync, and capture stays legal.
+    if ENABLE_DROPOUT:
+        philox_seed = tl.load(rng_state)
+        philox_offset_base = tl.load(rng_state + 1)
+    else:
+        philox_seed = 0
+        philox_offset_base = 0
     pid = tl.program_id(0)  # seqlen
     bid = tl.program_id(1)  # batch
     hkid = tl.program_id(2)  # head_k
@@ -3405,8 +3441,7 @@ def bwd_kernel_fused_causal(  # grid = (nheads_k, tl.cdiv(max_seqlen_q // BLOCK_
     max_seqlen_k,
     Dropout_mask,
     dropout_p,
-    philox_seed,
-    philox_offset_base,
+    rng_state,
     Alibi_slopes,
     Descale_q,
     Descale_k,
@@ -3434,6 +3469,13 @@ def bwd_kernel_fused_causal(  # grid = (nheads_k, tl.cdiv(max_seqlen_q // BLOCK_
     DEBUG_TRITON_DETAIL: tl.constexpr,
     NUM_XCD: tl.constexpr = 1,
 ):
+    # The forward's dropout state, read on the device: no host sync, and capture stays legal.
+    if ENABLE_DROPOUT:
+        philox_seed = tl.load(rng_state)
+        philox_offset_base = tl.load(rng_state + 1)
+    else:
+        philox_seed = 0
+        philox_offset_base = 0
     # program ids
     hkid = tl.program_id(0)
     pid = tl.program_id(1)
@@ -4039,8 +4081,7 @@ def bwd_kernel_fused_noncausal(
     max_seqlen_k,
     Dropout_mask,
     dropout_p,
-    philox_seed,
-    philox_offset_base,
+    rng_state,
     Alibi_slopes,
     Descale_q,
     Descale_k,
@@ -4068,6 +4109,13 @@ def bwd_kernel_fused_noncausal(
     DEBUG_TRITON_DETAIL: tl.constexpr,
     NUM_XCD: tl.constexpr = 1,
 ):
+    # The forward's dropout state, read on the device: no host sync, and capture stays legal.
+    if ENABLE_DROPOUT:
+        philox_seed = tl.load(rng_state)
+        philox_offset_base = tl.load(rng_state + 1)
+    else:
+        philox_seed = 0
+        philox_offset_base = 0
     # program ids
     hkid = tl.program_id(0)
     pid = tl.program_id(1)
@@ -4435,8 +4483,7 @@ def attention_backward_triton_impl(
     seqused_q: torch.Tensor | None = None,
     seqused_k: torch.Tensor | None = None,
     dropout_p: float = 0.0,
-    philox_seed: int | None = None,
-    philox_offset: int | None = None,
+    rng_state: torch.Tensor | None = None,
     use_exp2: bool = True,
     mode: Literal["fused", "fused_atomic", "split"] = "fused",
     q_descale: torch.Tensor | None = None,
@@ -4466,7 +4513,7 @@ def attention_backward_triton_impl(
     if IS_VARLEN:
         # shape
         total_seqlen_q, nheads_q, head_size_q = q.shape
-        total_seqlen_k, nheads_k, head_size_k = k.shape
+        _total_seqlen_k, nheads_k, head_size_k = k.shape
         _total_seqlen_v, nheads_v, head_size_v = v.shape
         nheads_lse, total_seqlen_lse = softmax_lse.shape
 
@@ -4519,14 +4566,6 @@ def attention_backward_triton_impl(
         assert (
             cu_seqlens_k.dtype == torch.int32
         ), f"cu_seqlens_k must be int32, got {cu_seqlens_k.dtype}"
-        assert cu_seqlens_q[0] == 0, "cu_seqlens_q must start with 0"
-        assert cu_seqlens_k[0] == 0, "cu_seqlens_k must start with 0"
-        assert (
-            cu_seqlens_q[-1] == total_seqlen_q
-        ), f"cu_seqlens_q[-1] {cu_seqlens_q[-1]} != total_seqlen_q {total_seqlen_q}"
-        assert (
-            cu_seqlens_k[-1] == total_seqlen_k
-        ), f"cu_seqlens_k[-1] {cu_seqlens_k[-1]} != total_seqlen_k {total_seqlen_k}"
 
         # set vars
         batch = len(cu_seqlens_q) - 1
@@ -4889,8 +4928,7 @@ def attention_backward_triton_impl(
                 max_seqlen_k,
                 dropout_mask,
                 dropout_p,
-                philox_seed,
-                philox_offset,
+                rng_state,
                 alibi_slopes,
                 descale_q,
                 descale_k,
@@ -4980,8 +5018,7 @@ def attention_backward_triton_impl(
                 max_seqlen_k,
                 dropout_mask,
                 dropout_p,
-                philox_seed,
-                philox_offset,
+                rng_state,
                 alibi_slopes,
                 descale_q,
                 descale_k,
@@ -5080,8 +5117,7 @@ def attention_backward_triton_impl(
                 max_seqlen_k,
                 dropout_mask,
                 dropout_p,
-                philox_seed,
-                philox_offset,
+                rng_state,
                 descale_q,
                 descale_k,
                 descale_v,
@@ -5145,8 +5181,7 @@ def attention_backward_triton_impl(
                 max_seqlen_k,
                 dropout_mask,
                 dropout_p,
-                philox_seed,
-                philox_offset,
+                rng_state,
                 descale_q,
                 descale_k,
                 descale_v,
@@ -5219,8 +5254,7 @@ def attention_backward_triton_impl(
                 max_seqlen_k,
                 dropout_mask,
                 dropout_p,
-                philox_seed,
-                philox_offset,
+                rng_state,
                 descale_q,
                 descale_k,
                 descale_v,
@@ -5284,8 +5318,7 @@ def attention_backward_triton_impl(
                 max_seqlen_k,
                 dropout_mask,
                 dropout_p,
-                philox_seed,
-                philox_offset,
+                rng_state,
                 descale_q,
                 descale_k,
                 descale_v,
@@ -5351,8 +5384,7 @@ def attention_backward_triton_impl(
                 max_seqlen_k,
                 dropout_mask,
                 dropout_p,
-                philox_seed,
-                philox_offset,
+                rng_state,
                 descale_q,
                 descale_k,
                 descale_v,
@@ -5417,8 +5449,7 @@ def attention_backward_triton_impl(
                 max_seqlen_k,
                 dropout_mask,
                 dropout_p,
-                philox_seed,
-                philox_offset,
+                rng_state,
                 descale_q,
                 descale_k,
                 descale_v,
