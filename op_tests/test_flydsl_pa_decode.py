@@ -853,6 +853,33 @@ _COMMON_CASES = [
             "cluster_steps": False,
         },
     ),
+    # Two query tiles take 64-token steps, so these clusters keep
+    # plan-derived tasks rather than 16 step-sized parts.
+    (
+        "cluster2-gqa32",
+        {
+            "group_size": 32,
+            "block_size": 16,
+            "lengths": (512, 0, 1, 300),
+            "max_partitions": 2,
+            "cluster": 2,
+            "cluster_steps": False,
+        },
+    ),
+    # A budget beyond two CTAs per CU grows the grid past the 128-token step
+    # bounds (two CTAs per CU for BF16, four for FP8): plan-derived tasks.
+    (
+        "cluster8-wide-grid",
+        {
+            "group_size": 16,
+            "block_size": 16,
+            "lengths": ((2048,) * 4 + (0, 1, 129, 1000)) * 20,
+            "max_partitions": 8,
+            "budget": 2048,
+            "cluster": 8,
+            "cluster_steps": False,
+        },
+    ),
     (
         "mtp4-g16-page128",
         {
@@ -1040,6 +1067,19 @@ _BF16_CASES = _COMMON_CASES + [
             "lengths": ((4096,) * 3 + (0, 255)) * 4,
             "max_partitions": 16,
             "cluster": 16,
+            "cluster_steps": False,
+        },
+    ),
+    # Plain BF16 V takes 64-token page16 steps: plan-derived tasks.
+    (
+        "cluster2-plain-v",
+        {
+            "group_size": 16,
+            "block_size": 16,
+            "lengths": (512, 0, 1, 300),
+            "max_partitions": 2,
+            "trans_v": False,
+            "cluster": 2,
             "cluster_steps": False,
         },
     ),

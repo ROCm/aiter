@@ -107,6 +107,7 @@ __all__ = [
     "MFMA_MNK",
     "WAVE",
     "compile_pa_decode_tile",
+    "gfx1250_tile_traits",
 ]
 
 # Key by selected specialization, not batch/head/CU scheduling inputs.
@@ -240,62 +241,31 @@ def compile_pa_decode_tile(
         raise NotImplementedError("Non-transposed key cache is not implemented")
     architecture = (architecture or get_gfx_runtime()).split(":", 1)[0]
     if architecture in ("gfx1250", "gfx1250-strict"):
-        if query_splits is None:
-            # Split the measured spilling BF16 specialization into one Q tile
-            # per CTA. Other shapes retain fused queries and their KV reuse.
-            query_splits = (
-                4
-                if kv_dtype == "bf16"
-                and head_dim == 1024
-                and query_group_size == 16
-                and query_length == 4
-                and block_size == 128
-                and trans_v
-                and sliding_window == 0
-                else 1
-            )
-        grid_sequences = (
-            num_seqs
-            if direct_output and num_partitions == 1
-            else (
-                -(-num_seqs // cluster_seqs) * cluster_seqs * cluster_merge
-                if cluster_merge
-                else work_capacity
-            )
-        )
-        grid_ctas = grid_sequences * num_kv_heads * query_splits
         return compile_gfx1250_pa_decode(
-            head_dim=head_dim,
-            query_group_size=query_group_size,
-            block_size=block_size,
-            softmax_scale=softmax_scale,
-            query_dtype=query_dtype,
-            per_token_kv=per_token_kv,
-            query_length=query_length,
-            trans_v=trans_v,
-            sliding_window=sliding_window,
-            compute_dtype=kv_dtype,
-            direct_output=direct_output and num_partitions == 1,
-            query_splits=query_splits,
-            merge_partitions=direct_output and num_partitions > 1,
-            cluster_merge=cluster_merge,
-            cluster_seqs=cluster_seqs,
-            cluster_steps=cluster_steps,
-            cluster_runs=cluster_runs,
-            # Wide page16 stages leave room for two CTAs per CU: larger
-            # grids (sparse prefill) keep narrower stages.
-            small_grid=grid_ctas <= 2 * num_compute_units,
-            one_cta_grid=grid_ctas <= num_compute_units,
-            many_cta_grid=grid_ctas > 4 * num_compute_units,
-            # Two-page FP8 steps pay off with one CTA per CU, or when CTAs
-            # run several tiles; two-CTA grids of one-tile tasks lose overlap.
-            wide_pages=grid_ctas <= num_compute_units
-            or (
-                grid_ctas <= 2 * num_compute_units
-                and max_context_length is not None
-                and num_seqs * -(-max_context_length // KV_COMPUTE_BLOCK)
-                >= 3 * grid_sequences
-            ),
+            gfx1250_tile_traits(
+                head_dim=head_dim,
+                query_group_size=query_group_size,
+                block_size=block_size,
+                num_seqs=num_seqs,
+                num_kv_heads=num_kv_heads,
+                num_compute_units=num_compute_units,
+                work_capacity=work_capacity,
+                num_partitions=num_partitions,
+                softmax_scale=softmax_scale,
+                query_dtype=query_dtype,
+                kv_dtype=kv_dtype,
+                per_token_kv=per_token_kv,
+                query_length=query_length,
+                trans_v=trans_v,
+                query_splits=query_splits,
+                max_context_length=max_context_length,
+                sliding_window=sliding_window,
+                direct_output=direct_output,
+                cluster_merge=cluster_merge,
+                cluster_seqs=cluster_seqs,
+                cluster_steps=cluster_steps,
+                cluster_runs=cluster_runs,
+            )
         )
     if architecture not in ("gfx942", "gfx950"):
         raise NotImplementedError(f"PA decode does not support {architecture}")
@@ -555,32 +525,102 @@ def compile_pa_decode_tile(
     return _PA_DECODE_TILE_CACHE.setdefault(traits.cache_key, compiled)
 
 
-def compile_gfx1250_pa_decode(
+def gfx1250_tile_traits(
     *,
-    head_dim,
-    query_group_size,
-    block_size,
-    softmax_scale,
-    query_dtype,
-    per_token_kv,
-    query_length,
-    trans_v,
-    sliding_window,
-    compute_dtype="fp8",
-    direct_output=False,
-    query_splits=1,
-    merge_partitions=False,
-    cluster_merge=0,
-    cluster_seqs=1,
-    cluster_steps=False,
-    cluster_runs=False,
-    small_grid=False,
-    wide_pages=False,
-    one_cta_grid=False,
-    many_cta_grid=False,
-):
+    head_dim: int,
+    query_group_size: int,
+    block_size: int,
+    num_seqs: int,
+    num_kv_heads: int,
+    num_compute_units: int,
+    work_capacity: int,
+    num_partitions: int = 1,
+    softmax_scale: float | None = None,
+    query_dtype: str = "f16",
+    kv_dtype: str = "fp8",
+    per_token_kv: bool = False,
+    query_length: int = 1,
+    trans_v: bool = True,
+    query_splits: int | None = None,
+    max_context_length: int | None = None,
+    sliding_window: int = 0,
+    direct_output: bool = False,
+    cluster_merge: int = 0,
+    cluster_seqs: int = 1,
+    cluster_steps: bool = False,
+    cluster_runs: bool = False,
+) -> Gfx1250Traits:
+    """Select the gfx1250 tile ``compile_pa_decode_tile`` compiles.
+
+    Arguments are those of ``compile_pa_decode_tile``; host-known grid bounds
+    choose step widths and staging. Selection neither validates nor compiles.
+    """
+    if query_splits is None:
+        # Split the measured spilling BF16 specialization into one Q tile
+        # per CTA. Other shapes retain fused queries and their KV reuse.
+        query_splits = (
+            4
+            if kv_dtype == "bf16"
+            and head_dim == 1024
+            and query_group_size == 16
+            and query_length == 4
+            and block_size == 128
+            and trans_v
+            and sliding_window == 0
+            else 1
+        )
+    grid_sequences = (
+        num_seqs
+        if direct_output and num_partitions == 1
+        else (
+            -(-num_seqs // cluster_seqs) * cluster_seqs * cluster_merge
+            if cluster_merge
+            else work_capacity
+        )
+    )
+    grid_ctas = grid_sequences * num_kv_heads * query_splits
+    one_cta_grid = grid_ctas <= num_compute_units
+    # Two-page FP8 steps pay off with one CTA per CU, or when CTAs run several
+    # tiles; two-CTA grids of one-tile tasks lose overlap.
+    wide_pages = one_cta_grid or (
+        grid_ctas <= 2 * num_compute_units
+        and max_context_length is not None
+        and num_seqs * -(-max_context_length // KV_COMPUTE_BLOCK) >= 3 * grid_sequences
+    )
+    return Gfx1250Traits(
+        head_dim,
+        query_group_size,
+        block_size,
+        head_dim**-0.5 if softmax_scale is None else softmax_scale,
+        query_dtype,
+        per_token_kv,
+        query_length,
+        trans_v,
+        sliding_window,
+        kv_dtype,
+        direct_output and num_partitions == 1,
+        query_splits,
+        direct_output and num_partitions > 1,
+        cluster_merge,
+        # Wide page16 stages leave room for two CTAs per CU: larger grids
+        # (sparse prefill) keep narrower stages.
+        grid_ctas <= 2 * num_compute_units and kv_dtype == "bf16" and block_size == 16,
+        wide_pages and kv_dtype == "fp8" and block_size == 128,
+        # Step-split clusters run 128-token steps, which their runs and
+        # preloaded page ids assume.
+        one_cta_grid and kv_dtype == "bf16" and not cluster_steps,
+        grid_ctas > 4 * num_compute_units and kv_dtype == "fp8" and block_size == 16,
+        cluster_seqs=cluster_seqs if cluster_merge else 1,
+        latency_grid=one_cta_grid,
+        cluster_steps=cluster_steps,
+        cluster_runs=cluster_runs,
+    )
+
+
+def compile_gfx1250_pa_decode(t):
     """Compile a gfx1250 tile kernel; merging partitions writes final output.
 
+    ``t`` holds the ``gfx1250_tile_traits`` selection.
     ``merge_partitions`` plans keep packed partials and count arrivals per
     (sequence, KV head) in the plan's zeroed ``arrival_counters``. A positive
     ``cluster_merge`` P instead launches P CTAs per sequence as one workgroup
@@ -596,58 +636,32 @@ def compile_gfx1250_pa_decode(
     ``merge_partitions`` partial storage must be eight-byte aligned for its
     device-scope atomic accesses; the host wrapper falls back for offset views.
     """
-    if query_splits not in (1, 2, 4) or query_length % query_splits:
+    if t.query_splits not in (1, 2, 4) or t.query_length % t.query_splits:
         raise ValueError("query_splits must be 1, 2, or 4 and divide query_length")
-    t = Gfx1250Traits(
-        head_dim,
-        query_group_size,
-        block_size,
-        head_dim**-0.5 if softmax_scale is None else softmax_scale,
-        query_dtype,
-        per_token_kv,
-        query_length,
-        trans_v,
-        sliding_window,
-        compute_dtype,
-        direct_output,
-        query_splits,
-        merge_partitions,
-        cluster_merge,
-        small_grid and compute_dtype == "bf16" and block_size == 16,
-        wide_pages and compute_dtype == "fp8" and block_size == 128,
-        # Step-split clusters run 128-token steps, which their runs and
-        # preloaded page ids assume.
-        one_cta_grid and compute_dtype == "bf16" and not cluster_steps,
-        many_cta_grid and compute_dtype == "fp8" and block_size == 16,
-        cluster_seqs=cluster_seqs if cluster_merge else 1,
-        latency_grid=one_cta_grid,
-        cluster_steps=cluster_steps,
-        cluster_runs=cluster_runs,
-    )
-    if compute_dtype not in ("fp8", "bf16"):
-        raise ValueError(f"Unsupported gfx1250 PA compute dtype: {compute_dtype}")
-    if t.bf16 and per_token_kv:
+    if t.compute_dtype not in ("fp8", "bf16"):
+        raise ValueError(f"Unsupported gfx1250 PA compute dtype: {t.compute_dtype}")
+    if t.bf16 and t.per_token_kv:
         raise ValueError("BF16 PA decode does not use quantization scales")
-    if merge_partitions and (direct_output or head_dim > MERGE_HEAD_DIM):
+    if t.merge_partitions and (t.direct_output or t.head_dim > MERGE_HEAD_DIM):
         raise ValueError(
             f"merge_partitions excludes direct_output and head_dim > {MERGE_HEAD_DIM}"
         )
-    if cluster_merge and (
-        direct_output
-        or merge_partitions
-        or head_dim > MERGE_HEAD_DIM
-        or not 2 <= cluster_merge <= CLUSTER_PARTITIONS
+    if t.cluster_merge and (
+        t.direct_output
+        or t.merge_partitions
+        or t.head_dim > MERGE_HEAD_DIM
+        or not 2 <= t.cluster_merge <= CLUSTER_PARTITIONS
     ):
         raise ValueError(
             f"cluster_merge must be in [2, {CLUSTER_PARTITIONS}] and excludes other "
             f"output modes and head_dim > {MERGE_HEAD_DIM}"
         )
-    if cluster_steps and not (
-        cluster_merge
-        and CLUSTER_PARTITIONS % cluster_merge == 0
-        and block_size == 16
-        and query_length == 1
-        and sliding_window == 0
+    if t.cluster_steps and not (
+        t.cluster_merge
+        and CLUSTER_PARTITIONS % t.cluster_merge == 0
+        and t.block_size == 16
+        and t.query_length == 1
+        and t.sliding_window == 0
         and t.TOKENS == CLUSTER_STEP_TOKENS
     ):
         raise ValueError(
@@ -668,19 +682,19 @@ def compile_gfx1250_pa_decode(
         buf: fx.Array[fx.Int32, t.total_bytes // 4, 16]
 
     kernel_name = _pa_decode_tile_kernel_name(
-        kv_dtype=compute_dtype,
-        query_dtype=query_dtype,
-        head_dim=head_dim,
-        block_size=block_size,
-        query_group_size=query_group_size,
-        query_length=query_length,
-        per_token_kv=per_token_kv,
-        trans_v=trans_v,
-        sliding_window=sliding_window,
-        query_splits=query_splits,
-        direct_output=direct_output,
-        merge_partitions=merge_partitions,
-        cluster_merge=cluster_merge,
+        kv_dtype=t.compute_dtype,
+        query_dtype=t.query_dtype,
+        head_dim=t.head_dim,
+        block_size=t.block_size,
+        query_group_size=t.query_group_size,
+        query_length=t.query_length,
+        per_token_kv=t.per_token_kv,
+        trans_v=t.trans_v,
+        sliding_window=t.sliding_window,
+        query_splits=t.query_splits,
+        direct_output=t.direct_output,
+        merge_partitions=t.merge_partitions,
+        cluster_merge=t.cluster_merge,
     )
 
     # Every argument that reducer-fed and direct-output kernels read fits in

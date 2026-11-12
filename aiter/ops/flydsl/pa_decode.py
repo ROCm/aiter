@@ -25,6 +25,7 @@ from .kernels.pa_decode_kernel import (
     MERGE_HEAD_DIM,
     MERGE_PARTITIONS,
     compile_pa_decode_tile,
+    gfx1250_tile_traits,
 )
 from .kernels.pa_decode_plan import PADecodePlan
 
@@ -1020,18 +1021,50 @@ def pa_decode(
         and sliding_window == 0
         and max_blocks_per_seq * block_size <= CLUSTER_PARTITIONS * CLUSTER_STEP_TOKENS
     )
-    if (
-        step_split
+    step_cluster = (
+        CLUSTER_PARTITIONS
+        if step_split
         and cluster_seqs == 1
         and num_seqs * num_kv_heads * CLUSTER_PARTITIONS <= num_compute_units
         and num_seqs * CLUSTER_PARTITIONS <= work_plan.capacity
-    ):
-        cluster_merge = CLUSTER_PARTITIONS
+        else cluster_merge
+    )
+    tile_options = {
+        "head_dim": head_dim,
+        "query_group_size": query_group_size,
+        "block_size": int(block_size),
+        "num_seqs": num_seqs,
+        "num_kv_heads": num_kv_heads,
+        "num_compute_units": num_compute_units,
+        "num_partitions": num_partitions,
+        "softmax_scale": softmax_scale,
+        "query_dtype": query_dtype,
+        "kv_dtype": kv_dtype,
+        "per_token_kv": per_token_kv,
+        "query_length": query_length,
+        "trans_v": trans_v,
+        "work_capacity": work_plan.capacity,
+        "max_context_length": schedule_context_length,
+        "sliding_window": sliding_window,
+        "direct_output": direct_output,
+    }
+    # The runs and preloaded page ids assume the tile's 128-token steps. Tiles
+    # that select 64-token steps (two query tiles, plain BF16 V, wider grids)
+    # keep plan-derived clusters.
     cluster_steps = (
         step_split
-        and CLUSTER_PARTITIONS % cluster_merge == 0
-        and num_seqs * cluster_merge <= work_plan.capacity
+        and CLUSTER_PARTITIONS % step_cluster == 0
+        and num_seqs * step_cluster <= work_plan.capacity
+        and gfx1250_tile_traits(
+            **tile_options,
+            cluster_merge=step_cluster,
+            cluster_seqs=cluster_seqs,
+            cluster_steps=True,
+        ).TOKENS
+        == CLUSTER_STEP_TOKENS
     )
+    if cluster_steps:
+        cluster_merge = step_cluster
     # Page128 clusters given a length bound instead give CTA p tiles
     # [p * run, (p + 1) * run), runs splitting the bound evenly, so they too
     # load their first page ids with the context length (decode at 8K, 1-8
@@ -1061,25 +1094,9 @@ def pa_decode(
     with torch.cuda.device(dev):
         compiled = compile_pa_decode_tile(
             architecture=arch,
-            head_dim=head_dim,
-            query_group_size=query_group_size,
-            block_size=int(block_size),
-            num_seqs=num_seqs,
-            num_kv_heads=num_kv_heads,
-            num_compute_units=num_compute_units,
-            num_partitions=num_partitions,
-            softmax_scale=softmax_scale,
-            query_dtype=query_dtype,
-            kv_dtype=kv_dtype,
-            per_token_kv=per_token_kv,
-            query_length=query_length,
-            trans_v=trans_v,
+            **tile_options,
             wide_kv_addressing=wide_kv_addressing,
             kv_buffer_u32=kv_buffer_u32,
-            work_capacity=work_plan.capacity,
-            max_context_length=schedule_context_length,
-            sliding_window=sliding_window,
-            direct_output=direct_output,
             trans_k=trans_k,
             mask_unowned_kv=mask_unowned_kv,
             cluster_merge=cluster_merge,
