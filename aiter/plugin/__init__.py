@@ -397,7 +397,24 @@ def _swap_config_locked() -> _Config:
 
 
 def _config() -> _Config:
-    """The current snapshot, built on first dispatch. Lock-free on the hot path."""
+    """The current snapshot. A plain read, with nothing to trace around.
+
+    Built at import rather than on first dispatch, which is not a performance
+    choice. Building it lazily put a lock acquisition and an ``os.getenv`` on
+    the first dispatch of the process -- and torch.compile cannot trace either,
+    so that first call graph-breaks. A routed op whose first call lands inside
+    a compiled region therefore splits its graph in two, and a framework that
+    allows one backend invocation per compilation (ATOM's ``VllmBackend``) is
+    handed a second one and asserts.
+
+    Measured, with a counting backend: a routed op called with the snapshot
+    unbuilt compiles two graphs, and exactly one once it is built. Nothing else
+    on the dispatch path breaks, so building it eagerly is the whole fix.
+
+    The fallback is kept because `_config_snapshot` is cleared by
+    `_reset_for_testing`, and a test that clears it must not then be the one
+    call that pays for a rebuild inside somebody's graph.
+    """
 
     snapshot = _config_snapshot
     if snapshot is None:
@@ -1408,3 +1425,8 @@ __all__ = [
     "route",
     "status",
 ]
+
+
+# Build the snapshot now, so no dispatch ever pays for it. See _config().
+with _config_lock:
+    _swap_config_locked()
