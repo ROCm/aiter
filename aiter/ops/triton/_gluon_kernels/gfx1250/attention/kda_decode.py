@@ -10,6 +10,7 @@ from triton.language.extra.hip import libdevice
 
 from aiter.ops.triton._gluon_kernels.common.utils import (
     exp_scaled,
+    fast_sigmoid,
     sigmoid,
     softplus,
 )
@@ -328,6 +329,91 @@ def _process_token(
     return a, kv, qv, vv, b
 
 
+@gluon.jit
+def _writeback_decode(
+    q_ptr,
+    k_ptr,
+    v_ptr,
+    g_ptr,
+    beta_ptr,
+    A_log_ptr,
+    dt_bias_ptr,
+    state_ptr,
+    o_ptr,
+    bos,
+    slot,
+    i_h,
+    i_v,
+    stride_q_token: gl.constexpr,
+    stride_k_token: gl.constexpr,
+    stride_v_token: gl.constexpr,
+    stride_g_token: gl.constexpr,
+    stride_beta_token: gl.constexpr,
+    stride_o_token: gl.constexpr,
+    stride_state_slot_rows,
+    lower_bound,
+    scale: gl.constexpr,
+    H: gl.constexpr,
+    K: gl.constexpr,
+    V: gl.constexpr,
+    BV: gl.constexpr,
+    CH: gl.constexpr,
+    SK: gl.constexpr,
+    NUM_WARPS: gl.constexpr,
+):
+    layout: gl.constexpr = _state_layout(
+        True, CH * SK // (32 * NUM_WARPS), K, CH, SK, NUM_WARPS
+    )
+    off_k = gl.arange(0, K, layout=gl.SliceLayout(0, layout))
+    off_v = gl.arange(0, CH, layout=gl.SliceLayout(1, layout))
+    off_s = off_v[:, None] * K + off_k[None, :]
+    tok = bos.to(gl.int64)
+    q_p = q_ptr + tok * stride_q_token + i_h * K
+    k_p = k_ptr + tok * stride_k_token + i_h * K
+    g_p = g_ptr + tok * stride_g_token + i_h * K
+    v_p = v_ptr + tok * stride_v_token + i_h * V + i_v * BV
+    o_p = o_ptr + tok * stride_o_token + i_h * V + i_v * BV
+    b_p = beta_ptr + tok * stride_beta_token + i_h
+    s_p = (
+        state_ptr
+        + (slot.to(gl.int64) * stride_state_slot_rows + i_h * V + i_v * BV) * K
+    )
+    raw = _fetch_token(q_p, k_p, v_p, g_p, b_p, off_k, off_v, False)
+    bias = gl.amd.gfx1250.buffer_load(dt_bias_ptr + i_h * K, off_k)
+    a_log = gl.load(A_log_ptr + i_h)
+    S = gl.amd.gfx1250.buffer_load(s_p, off_s)
+    gl.amd.hint.sched_barrier()
+    a_exp = 0.5 * gl.exp(a_log.to(gl.float32))
+    a, k, q, v, beta = _process_token(
+        raw,
+        a_exp,
+        a_exp * bias.to(gl.float32),
+        lower_bound * 0.7213475204444817,
+        scale,
+        True,
+        True,
+        True,
+        True,
+        False,
+        False,
+    )
+    beta = fast_sigmoid(beta)
+    for c in gl.static_range(BV // CH):
+        if c > 0:
+            v = gl.amd.gfx1250.buffer_load(v_p + c * CH, off_v).to(gl.float32)
+        S = S * a[None, :]
+        err = (v - gl.sum(S * k[None, :], axis=1)) * beta
+        S = S + err[:, None] * k[None, :]
+        # Keep state stores in the write-back path without LDS staging.
+        gl.amd.gfx1250.buffer_store(S, s_p + c * CH * K, off_s)
+        o = gl.sum(S * q[None, :], axis=1)
+        gl.amd.gfx1250.buffer_store(o.to(o_ptr.dtype.element_ty), o_p + c * CH, off_v)
+        if c + 1 < BV // CH:
+            # Load the next disjoint chunk late to reduce live registers.
+            S = gl.amd.gfx1250.buffer_load(s_p + (c + 1) * CH * K, off_s)
+            gl.amd.hint.sched_barrier()
+
+
 _fused_recurrent_kda_packed_decode_repr = make_kernel_repr(
     "fused_recurrent_kda_packed_decode_kernel",
     [
@@ -343,6 +429,8 @@ _fused_recurrent_kda_packed_decode_repr = make_kernel_repr(
         "PAD_SLOT_GUARD",
         "USE_CONV",
         "USE_RMS_GATE",
+        "USE_WRITEBACK_DECODE",
+        "CH",
     ],
 )
 
@@ -416,7 +504,54 @@ def fused_recurrent_kda_packed_decode_kernel(
     USE_CONV: gl.constexpr = False,
     USE_RMS_GATE: gl.constexpr = False,
     TDM_STORE_BUFS: gl.constexpr = 2,
+    USE_WRITEBACK_DECODE: gl.constexpr = False,
+    CH: gl.constexpr = 1,
 ):
+    if USE_WRITEBACK_DECODE:
+        gl.static_assert(IS_VARLEN and IS_CONTINUOUS_BATCHING)
+        gl.static_assert(H == HV and STATE_V_FIRST and INPLACE_FINAL_STATE)
+        gl.static_assert(BV % CH == 0 and (CH * SK) % (32 * NUM_WARPS) == 0)
+        wb_pid = gl.program_id(0)
+        wb_nh = wb_pid // (V // BV)
+        wb_n = wb_nh // H
+        wb_bos = gl.load(cu_seqlens_ptr + wb_n)
+        wb_eos = gl.load(cu_seqlens_ptr + wb_n + 1)
+        wb_slot = gl.load(state_indices_ptr + wb_n * stride_indices_seq)
+        if wb_eos - wb_bos <= 1:
+            if (wb_eos > wb_bos) & (wb_slot >= 0):
+                _writeback_decode(
+                    q_ptr,
+                    k_ptr,
+                    v_ptr,
+                    g_ptr,
+                    beta_ptr,
+                    A_log_ptr,
+                    dt_bias_ptr,
+                    state_ptr,
+                    o_ptr,
+                    wb_bos,
+                    wb_slot,
+                    wb_nh % H,
+                    wb_pid % (V // BV),
+                    stride_q_token,
+                    stride_k_token,
+                    stride_v_token,
+                    stride_g_token,
+                    stride_beta_token,
+                    stride_o_token,
+                    stride_state_slot_rows,
+                    lower_bound,
+                    scale,
+                    H,
+                    K,
+                    V,
+                    BV,
+                    CH,
+                    SK,
+                    NUM_WARPS,
+                )
+            return
+
     gl.static_assert(V % BV == 0, "BV must divide V")
     gl.static_assert(32 % SK == 0, "SK must divide the wave")
     gl.static_assert(K % SK == 0, "SK must divide K")
@@ -996,12 +1131,15 @@ def get_kda_config(
     V: int,
     overrides: dict | None = None,
     fused: bool = False,
+    writeback_decode: bool = False,
 ) -> dict:
     cfg_dir = resolve_config_dir("attention", "KDA_DECODE", backend="gluon")
     tuned = load_config_json(f"{cfg_dir}/DEFAULT.json")
     num_seq_heads = num_seqs * HV
     aligned = K % 32 == 0 and V % 32 == 0
-    if fused:
+    if writeback_decode:
+        bucket = "writeback_decode"
+    elif fused:
         bucket = "fused"
     elif avg_T > 1:
         if aligned and num_seq_heads >= 3072 and V % 128 == 0:

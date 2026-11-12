@@ -65,6 +65,11 @@ def fused_recurrent_kda(
     Per token: S = exp(g_t) * S, then S += beta_t * k_t (x) (v_t - S^T k_t),
     then o_t = S^T q_t. Requires triton >= 3.6.0 on gfx1250.
 
+    The write-back path supports one-token paged decode with 12 heads and
+    K=V=128, BF16 inputs, FP32 state, int32 indices, fused q/k normalization,
+    fused gate and beta sigmoid, and lower_bound=-5. Other calls use the
+    generic path.
+
     Args:
         q: [B, T, H, K] queries
         k: [B, T, H, K] keys
@@ -100,7 +105,10 @@ def fused_recurrent_kda(
             (a, k, err) records per token for replay after verification.
         pad_slot_guard: paged only: state slots <= 0 mark padded sequences
         config: tuning dict (BV, SK, num_warps, num_buffers, use_tdm_store,
-            use_tdm_load, use_tdm_fused_load); None resolves a tuned bucket
+            use_tdm_load, use_tdm_fused_load, use_writeback_decode, CH);
+            None selects the write-back path for supported gfx1250 decode inputs.
+            An explicit config preserves the generic path unless
+            ``use_writeback_decode`` is set. None resolves a tuned bucket
             from ``configs/<arch>/gluon/attention/kda_decode/DEFAULT.json``,
             and omitted keys inherit the resolved bucket's published values.
 
@@ -204,8 +212,85 @@ def fused_recurrent_kda(
         state_ref is not None and state_ref.dtype == torch.bfloat16 and T > 1
     )
     bucket_T = max(avg_T, 2) if bf16_resident else avg_T
+    writeback_decode = (
+        _ARCH == "gfx1250"
+        and (config is None or config.get("use_writeback_decode", False))
+        and B == 1
+        and H == HV == 12
+        and K == V == 128
+        and T == N
+        and cu_seqlens is not None
+        and cu_seqlens.dtype == torch.int32
+        and ssm_state_indices is not None
+        and ssm_state_indices.ndim == 1
+        and ssm_state_indices.dtype == torch.int32
+        and initial_state is not None
+        and initial_state.dtype == torch.float32
+        and state_v_first
+        and inplace_final_state
+        and num_accepted_tokens is None
+        and not cache_state_updates
+        and not pad_slot_guard
+        and not use_conv
+        and not use_rms_gate
+        and use_qk_l2norm_in_kernel
+        and use_gate_in_kernel
+        and use_beta_sigmoid_in_kernel
+        and not allow_neg_eigval
+        and lower_bound == -5.0
+        and scale == K**-0.5
+        and dt_bias is not None
+        and dt_bias.dtype == torch.float32
+        and A_log is not None
+        and A_log.dtype == torch.float32
+        and beta.ndim == 3
+        and beta.stride(-1) == 1
+        and all(x.dtype == torch.bfloat16 for x in (q, k, v, g, beta))
+        and all(x.is_contiguous() for x in (q, k, v))
+        and g.stride(1) == HV * K
+        and initial_state.stride()[1:] == (V * K, K, 1)
+        and initial_state.stride(0) % K == 0
+        and (out is None or out.is_contiguous())
+        and all(
+            x.device == q.device
+            for x in (
+                k,
+                v,
+                g,
+                beta,
+                A_log,
+                dt_bias,
+                initial_state,
+                cu_seqlens,
+                ssm_state_indices,
+            )
+        )
+        and all(x.data_ptr() % 16 == 0 for x in (q, k, v, g, dt_bias, initial_state))
+        and (
+            out is None
+            or (
+                out.device == q.device
+                and out.dtype == v.dtype
+                and out.data_ptr() % 16 == 0
+            )
+        )
+        and (
+            out is None
+            or all(
+                out.untyped_storage().data_ptr() != x.untyped_storage().data_ptr()
+                for x in (q, k, v, g, beta, A_log, dt_bias, initial_state)
+            )
+        )
+    )
     config = get_kda_config(
-        bucket_T, N, HV, K, V, overrides=config, fused=use_conv or use_rms_gate
+        bucket_T,
+        N,
+        HV,
+        K,
+        V,
+        overrides=config,
+        fused=use_conv or use_rms_gate,
+        **({"writeback_decode": writeback_decode} if _ARCH == "gfx1250" else {}),
     )
     BV = config["BV"]
     SK = config["SK"]
@@ -407,6 +492,15 @@ def fused_recurrent_kda(
         USE_CONV=use_conv,
         USE_RMS_GATE=use_rms_gate,
         **({"RESIDENT_STATE": bool(resident_state)} if _ARCH == "gfx950" else {}),
+        **(
+            {
+                "USE_WRITEBACK_DECODE": writeback_decode
+                and config.get("use_writeback_decode", False),
+                "CH": config.get("CH", 1),
+            }
+            if _ARCH in ("gfx1250", "gfx1250-strict")
+            else {}
+        ),
         num_warps=num_warps,
         enable_fp_fusion=True,
         **(
