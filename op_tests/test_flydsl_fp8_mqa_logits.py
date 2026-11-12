@@ -431,7 +431,10 @@ _GFX942_AUTO_VARIANTS = {
 # windows, and long-KV chunks keep the num_heads cap.
 _GFX942_LDS_VARIANTS = {
     (8, 40000, 32): "mfma_r1_w4",
-    (4096, 4096, 32): "mfma_bkv64_r1_w4_lds2",
+    (4095, 4095, 32): "mfma_bkv64_r1_w4_lds2",
+    (4096, 4096, 32): "mfma_bkv64_r2_w4_lds2",
+    (4096, 4096, 64): "mfma_bkv64_r2_w4_lds2",
+    (4096, 4096, 16): "mfma_bkv64_r2_w4_lds2",
     (16380, 16380, 32): "mfma_bkv64_r2_w4_lds2",
     (128, 65536, 32): "mfma_bkv64_r2_w4_lds2",
     (512, 262144, 32): "mfma_bkv64_r4_w4_lds2",
@@ -453,7 +456,16 @@ def verify_lds_variant(s_q, s_k, num_heads):
     return {"gfx": get_gfx(), "variant": variant, "status": "ok"}
 
 
-_LAUNCHER_CONTRACT_SHAPES = [(1, 4096), (7, 20007), (1023, 1023), (8191, 40959)]
+# The last two give the gfx942 LDS variants hundreds of grid.y splits over
+# thousands of KV tiles.
+_LAUNCHER_CONTRACT_SHAPES = [
+    (1, 4096),
+    (7, 20007),
+    (1023, 1023),
+    (8191, 40959),
+    (16, 1572864),
+    (1024, 1048576),
+]
 
 
 @benchmark()
@@ -461,7 +473,8 @@ def verify_launcher_contract(s_q, s_k, num_heads):
     """Host-side launcher contract on the current arch. Launches nothing.
 
     Every variant gets the real seq_len and unpadded inputs (each kernel masks a
-    short last block itself), with no host-side cat/zeros copies.
+    short last block itself), with no host-side cat/zeros copies. The gfx942 LDS
+    variants also get a num_splits whose slice bounds fit in i32.
     """
     fp8 = DTYPE_MAP[_DEFAULT_KV_DTYPES[0]]
     captured, copies = [], []
@@ -492,13 +505,21 @@ def verify_launcher_contract(s_q, s_k, num_heads):
         _fly_mod._run_compiled, _fly_mod._max_blocks_per_cu = real_run, real_bpc
         torch.cat, torch.Tensor.new_zeros = real_cat, real_nz
     (args,) = captured
-    tensors, seq_len_arg = args[:7], args[7]
+    tensors, seq_len_arg, num_splits = args[:7], args[7], args[-2]
     rows_dims = [tensors[i].shape[0] for i in (0, 3, 4, 5, 6)]
     variant = _resolve_variant(None, s_q, s_k, num_heads)
     if copies or seq_len_arg != s_q or any(d != s_q for d in rows_dims):
         raise AssertionError(
             f"{variant}: host copies {copies}, seq_len arg {seq_len_arg}, row dims "
             f"{rows_dims} [s_q={s_q} s_k={s_k} nh={num_heads}]"
+        )
+    tiles = -(-s_k // 64)
+    if variant in _fly_mod._LDS942_VARIANTS and (
+        (tiles + 1) * num_splits * (num_splits + 1) >= 2**31
+    ):
+        raise AssertionError(
+            f"{variant}: num_splits={num_splits} overflows the i32 slice bounds "
+            f"[s_q={s_q} s_k={s_k} nh={num_heads}]"
         )
     assert tuple(out.shape) == (s_q, s_k)
     return {"gfx": get_gfx(), "variant": variant, "status": "ok"}
@@ -733,7 +754,14 @@ _PACKED_SHAPES = [
 ]
 # The subset the default (CI) lane verifies: cheap, and covers the short last
 # block, short packed windows, and the few-row / decode-sized paths.
-_PACKED_CI_SHAPES = [(3, 2730, 2730), (24, 682, 682), (6, 7, 20007), (6, 1, 40001)]
+# The last one reaches hundreds of gfx942 grid.y splits over 24k KV tiles.
+_PACKED_CI_SHAPES = [
+    (3, 2730, 2730),
+    (24, 682, 682),
+    (6, 7, 20007),
+    (6, 1, 40001),
+    (1, 16, 1572864),
+]
 
 
 def _model_set(args):
