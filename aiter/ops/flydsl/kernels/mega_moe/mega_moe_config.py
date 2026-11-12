@@ -1723,6 +1723,33 @@ def _is_v41_flash_ep4(world_size, experts_per_rank, model_dim, inter_dim) -> boo
     return (world_size, experts_per_rank, model_dim, inter_dim) == V41_FLASH_EP4_LAYOUT
 
 
+def tune_large_m_launch_config(
+    config: MegaMoEConfig,
+    tokens: int,
+    *,
+    world_size: int,
+    experts_per_rank: int,
+    model_dim: int,
+    inter_dim: int,
+) -> MegaMoEConfig:
+    """Tune rank-local work without changing the capacity-selected wire protocol.
+
+    At 8192+ input rows, cached W1 loads and groups of 16 GEMM2 m-blocks reduce
+    prefill time. Smaller calls retain streaming W1 and groups of eight. The
+    ranks may have different input row counts: only cache hints and local
+    claim ordering may vary here, never tile geometry or exchanged data.
+    """
+    if tokens >= 8192 and _is_v41_flash_ep4(
+        world_size, experts_per_rank, model_dim, inter_dim
+    ):
+        return replace(
+            config,
+            stage1=replace(config.stage1, b_nt=0),
+            fused_stage2=replace(config.fused_stage2, m_group=16),
+        )
+    return config
+
+
 @cache
 def _fused_config(
     bucket: int,

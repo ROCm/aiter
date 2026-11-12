@@ -53,6 +53,7 @@ from .mega_moe_config import (
     fused_layout_supported,
     large_m_mtprs_for,
     select_fused_config,
+    tune_large_m_launch_config,
 )
 from .mega_moe_fused_gemm import (
     AddrBuffer,
@@ -3420,6 +3421,16 @@ class LargeMRuntime:
         self._active_config = config
         return config
 
+    def _select_launch_config(self, tokens: int) -> MegaMoEConfig:
+        # Tile geometry and producers use the capacity config on every rank.
+        # Only rank-local cache hints and claim ordering depend on input rows.
+        config = tune_large_m_launch_config(
+            self._select_config(self.mtpr), tokens, world_size=self.world_size,
+            experts_per_rank=self.epr, model_dim=self.model_dim, inter_dim=self.inter_dim,
+        )
+        self._active_config = config
+        return config
+
     def _run_fused_stage1(self, x, wts, scales, topk_ids, stream, config: MegaMoEConfig, *, preload=False):
         if stream is None:
             stream = fx.Stream(torch.cuda.current_stream().cuda_stream)
@@ -3488,9 +3499,7 @@ class LargeMRuntime:
     def _run_joint(self, x, scales, wts, topk_ids, run_tokens, stream, slice_output):
         if not 0 <= run_tokens <= self.mtpr:
             raise ValueError(f"run_tokens={run_tokens} outside [0, {self.mtpr}]")
-        # Launch geometry, tile_m and producer counts are part of the
-        # cross-rank wire protocol, so every rank selects the MTPR config.
-        config = self._select_config(self.mtpr)
+        config = self._select_launch_config(run_tokens)
         self._run_fused_stage1(x, wts, scales, topk_ids, stream, config)
         out_tok = self.comb_op.combine_output(self.mtpr)
         return out_tok[:run_tokens] if slice_output else out_tok
@@ -3594,9 +3603,15 @@ class LargeMRuntime:
         )
         wts = torch.empty((rows, self.topk), dtype=torch.float32, device=self.dev)
         topk_ids = torch.empty((rows, self.topk), dtype=torch.int32, device=self.dev)
-        self._run_fused_stage1(
-            x_q, wts, scales, topk_ids, stream, self._select_config(self.mtpr), preload=True
-        )
+        # Both local schedules have the same tensor signatures and wire format.
+        configs = []
+        for tokens in (rows, self.mtpr):
+            config = self._select_launch_config(tokens)
+            if config not in configs:
+                self._run_fused_stage1(
+                    x_q, wts, scales, topk_ids, stream, config, preload=True
+                )
+                configs.append(config)
 
     def forward(self, x_bf16, wts, topk_ids, *, stream=None, slice_output=True):
         run_tokens = check_forward_inputs(

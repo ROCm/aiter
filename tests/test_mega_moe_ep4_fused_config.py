@@ -1,8 +1,14 @@
-"""Small-input tile selection and the protocol shared by uneven EP ranks."""
+"""Fused-route tile selection and the protocol shared by uneven EP ranks."""
+
+from dataclasses import replace
 
 import pytest
 
-from aiter.ops.flydsl.kernels.mega_moe.mega_moe_config import FUSED_TOKEN_BUCKETS, select_fused_config
+from aiter.ops.flydsl.kernels.mega_moe.mega_moe_config import (
+    FUSED_TOKEN_BUCKETS,
+    select_fused_config,
+    tune_large_m_launch_config,
+)
 
 
 FLASH_EP4 = dict(world_size=4, experts_per_rank=96, model_dim=5120, inter_dim=2304)
@@ -43,3 +49,26 @@ def test_mixed_token_buckets_keep_one_small_input_wire_protocol(capacity):
     }
     assert len(protocols) == 1
     assert all(config.stage1.sort_block_m == config.stage2.block_m for config in configs)
+
+
+@pytest.mark.parametrize("capacity", [8192, 16384])
+def test_large_prefill_local_tune_preserves_the_complete_wire_config(capacity):
+    base = select_fused_config(capacity, capacity, **FLASH_EP4)
+    for tokens in (0, 384, 4096, 8191, 8192, capacity):
+        config = tune_large_m_launch_config(base, tokens, **FLASH_EP4)
+        if tokens < 8192:
+            assert config == base
+        else:
+            assert (config.stage1.b_nt, config.fused_stage2.m_group) == (0, 16)
+            restored = replace(
+                config,
+                stage1=replace(config.stage1, b_nt=base.stage1.b_nt),
+                fused_stage2=replace(config.fused_stage2, m_group=base.fused_stage2.m_group),
+            )
+            assert restored == base
+
+
+def test_large_prefill_local_tune_leaves_other_layouts_unchanged():
+    layout = dict(FLASH_EP4, world_size=8, experts_per_rank=48)
+    base = select_fused_config(16384, 16384, **layout)
+    assert tune_large_m_launch_config(base, 16384, **layout) is base
