@@ -40,6 +40,16 @@ from functools import cache, reduce
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
+from aiter.jit.utils.chip_info import get_gfx_runtime, get_lds_capacity_bytes
+from aiter.ops.flydsl.kernels.act import sigmoid_batch, sigmoid_f32
+from aiter.ops.flydsl.kernels.kernels_common import (
+    atomic_add_i32,
+    kernel_signature,
+    ord_signed_f32,
+    uint32_to_int32,
+)
+from aiter.ops.flydsl.kernels.tensor_shim import buf_copy_atom
+from aiter.ops.flydsl.kernels.topk.topk_common import _bounded_row_len
 from flydsl.expr import (
     Float32,
     Int32,
@@ -51,17 +61,6 @@ from flydsl.expr import (
 )
 from flydsl.expr import rocdl as fly_rocdl
 from flydsl.expr.typing import T
-
-from aiter.jit.utils.chip_info import get_gfx_runtime, get_lds_capacity_bytes
-from aiter.ops.flydsl.kernels.act import sigmoid_batch, sigmoid_f32
-from aiter.ops.flydsl.kernels.kernels_common import (
-    atomic_add_i32,
-    kernel_signature,
-    ord_signed_f32,
-    uint32_to_int32,
-)
-from aiter.ops.flydsl.kernels.tensor_shim import buf_copy_atom
-from aiter.ops.flydsl.kernels.topk.topk_common import _bounded_row_len
 
 _VEC = 4
 _BLOCK_THREADS = 512
@@ -204,10 +203,10 @@ def build_topk_per_row_small_k_module(
         raise ValueError("BF16 bias specialization requires sigmoid_bias scoring")
     if score_bf16 and score_mode != "sigmoid_bias":
         raise ValueError("BF16 score specialization requires sigmoid_bias scoring")
-    if wave_size != 64:
-        # The chunk selection is a single i64 ballot over the lanes, so a
-        # wave32 target would need a different mask width throughout.
-        raise ValueError(f"wave size must be 64, got {wave_size}")
+    # ROCm's i64 ballot leaves the high half clear on wave32, so the existing
+    # low/high mask storage and lane shifts are valid on both wave sizes.
+    if wave_size not in (32, 64):
+        raise ValueError(f"wave size must be 32 or 64, got {wave_size}")
     if k < 1 or k > wave_size:
         raise ValueError(f"k must be in [1, {wave_size}] (one chunk per lane), got {k}")
     if n_max < k:
