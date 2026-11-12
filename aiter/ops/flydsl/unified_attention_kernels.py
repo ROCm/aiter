@@ -62,8 +62,13 @@ _FP8_DTYPE = torch.float8_e4m3fn
 # packing one head per group is a no-op, so it keeps the unpacked body.
 _PACKED_BN64_GROUPS = (4, 8, 16)
 
+# Lanes per wave in packed BN64's cu_seqlens_q scan.
+_SCAN_LANES = 64
 
-@lru_cache(maxsize=64)
+
+# Packed BN64 adds batch_chunks and interleaved to the key, so it is several times
+# the base config space; a thrash would retrace (~75 ms per flyc.compile).
+@lru_cache(maxsize=512)
 def _get_kernel(
     num_heads: int,
     num_kv_heads: int,
@@ -73,14 +78,25 @@ def _get_kernel(
     rescale_threshold: float,
     block_m: int,
     packed_bn64: bool = False,
+    batch_chunks: int = 1,
+    interleaved: bool = False,
 ):
     """Cache only build-time specializations, not runtime batch/sequence sizes.
 
     ``packed_bn64`` selects the conventional BN64 body with the GQA group packed
     into M; that body fixes block_m=128 itself, so ``block_m`` is ignored for it.
+    It alone takes ``batch_chunks`` (64-lane cu_seqlens_q scan chunks, at least
+    ceil((num_seqs + 1) / 64)) and ``interleaved`` (rank-major q-block order).
     """
     variant = (
-        {"body_variant": "conventional_bn64", "gqa_pack_m": True} if packed_bn64 else {}
+        {
+            "body_variant": "conventional_bn64",
+            "gqa_pack_m": True,
+            "batch_chunks": batch_chunks,
+            "interleaved": interleaved,
+        }
+        if packed_bn64
+        else {}
     )
     return build_flash_attn_dualwave_swp_fp8_module(
         num_heads=num_heads,
@@ -704,8 +720,19 @@ def flydsl_unified_attention(
     # Everything else keeps one query head per workgroup.
     group = num_query_heads // num_kv_heads
     packed_bn64 = group in _PACKED_BN64_GROUPS
+    bn64_key = {}
+    bn64_args = {}
     if packed_bn64:
         block_m = 128  # fixed by the body; keeps the cache key equal to the AOT job
+        bn64_key = {
+            # cu_seqlens_q has num_seqs + 1 entries, one per scan lane.
+            "batch_chunks": -(-(num_seqs + 1) // _SCAN_LANES),
+            # A batch filling q at max_seqlen_q per sequence is uniform: rank-major order
+            # is longest-first across it. Host ints only; the kernel re-checks, so a
+            # ragged replay of a captured graph stays correct.
+            "interleaved": bool(causal) and q.shape[0] == int(max_seqlen_q) * num_seqs,
+        }
+        bn64_args = {"total_q": int(q.shape[0])}
 
     with torch.cuda.device(q.device.index):
         kernel = _get_kernel(
@@ -717,6 +744,7 @@ def flydsl_unified_attention(
             _fp8_rescale_threshold(max_seqlen_k),
             block_m,
             packed_bn64=packed_bn64,
+            **bn64_key,
         )
         q_flat, out_flat = _as_i8(q).reshape(-1), out.reshape(-1)
         # A reshape copy would leave the caller's output buffer unchanged.
@@ -742,5 +770,6 @@ def flydsl_unified_attention(
             block_table=block_table.reshape(-1),
             block_table_stride=int(block_table.stride(0)),
             stream=torch.cuda.current_stream(q.device),
+            **bn64_args,
         )
     return out

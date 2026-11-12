@@ -194,6 +194,8 @@ def _compile_prefill(job: dict) -> None:
             block_table=block_table.reshape(-1),
             block_table_stride=int(block_table.stride(0)),
             stream=0,
+            # Packed BN64 sizes its grid from the query row count.
+            **({"total_q": total_q} if job["packed_bn64"] else {}),
         )
 
 

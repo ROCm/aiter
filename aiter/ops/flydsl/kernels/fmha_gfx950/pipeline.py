@@ -438,6 +438,9 @@ class DualwaveSwpFp8Traits:
     PAGED_BT_LDS_SIZE: int = 2048
     BODY_VARIANT: str = "default"
     GQA_PACK_M: bool = False
+    # conventional_bn64 compact grid: cu_seqlens_q chunks the sequence scan loads, rank-major slot order.
+    BATCH_CHUNKS: int = 1
+    INTERLEAVED: bool = False
 
 
 def _make_dualwave_swp_fp8_traits(
@@ -462,6 +465,8 @@ def _make_dualwave_swp_fp8_traits(
     out_dtype="bf16",
     body_variant="default",
     gqa_pack_m=False,
+    batch_chunks=1,
+    interleaved=False,
 ):
     """Build gfx950 DUALWAVE_SWP fp8 compile-time layout traits.
 
@@ -477,6 +482,10 @@ def _make_dualwave_swp_fp8_traits(
             )
         block_m = 128
         dualwave_swp_enable_stagger = False
+        if int(batch_chunks) < 1:
+            raise RuntimeError(f"batch_chunks must be >= 1, got {batch_chunks}")
+    elif int(batch_chunks) != 1 or interleaved:
+        raise RuntimeError("batch_chunks/interleaved apply to conventional_bn64 only")
     if head_dim_v is None:
         head_dim_v = head_dim
     if gqa_pack_m:
@@ -659,6 +668,9 @@ def _make_dualwave_swp_fp8_traits(
         OUT_F16=out_dtype == "f16",
         PAGED_BT_LDS_SIZE=paged_bt_lds_size,
         BODY_VARIANT=body_variant,
+        BATCH_CHUNKS=int(batch_chunks),
+        # Rank-major order is a causal longest-first heuristic; non-causal blocks cost the same.
+        INTERLEAVED=bool(interleaved) and bool(causal),
     )
 
 
@@ -675,13 +687,31 @@ def dualwave_fp8_dma_per_iter(traits):
     return 2 * k_instr + 2 * v_instr_min
 
 
+# Outer extent of a mode that never wraps: idx2crd lowers every mode as mod(div(i, stride), shape).
+_UNBOUNDED = 2**31 - 1
+
+
+def _bn64_compact_grid(traits):
+    """conventional_bn64 launches a 1D grid of (slot, KV head) and finds each slot's sequence on device."""
+    return traits.BODY_VARIANT == "conventional_bn64"
+
+
 def _init_dualwave_thread_mapping(ctx):
     """Set block/wave/lane/head indices on a dualwave-style context.
 
     Sets h_idx / q_block_idx / batch_idx / split_idx and the lane decomposition."""
     traits = ctx.traits
     batch_interleave_group = traits.BATCH_INTERLEAVE_GROUP
-    if const_expr(batch_interleave_group > 1):
+    compact = _bn64_compact_grid(traits)
+    if const_expr(compact):
+        # Grid x = Hkv * slot + KV head; init_sequence_lengths maps the slot to (sequence, q-block).
+        head_slot = fx.idx2crd(
+            fx.Int32(fx.block_idx.x),
+            fx.make_layout((traits.NUM_HEADS_KV, _UNBOUNDED), (1, traits.NUM_HEADS_KV)),
+        )
+        ctx.h_idx = fx.Int64(fx.Int32(head_slot[0].unpack()))
+        ctx.slot_i32 = fx.Int32(head_slot[1].unpack())
+    elif const_expr(batch_interleave_group > 1):
         linear_head_batch = fx.Int64(fx.block_idx.x)
         ctx.h_idx = linear_head_batch % traits.NUM_HEADS_Q
         ctx.batch_idx = (
@@ -702,7 +732,7 @@ def _init_dualwave_thread_mapping(ctx):
         ctx.bz_idx = fx.Int64(fx.block_idx.z)
         ctx.batch_idx = ctx.bz_idx // traits.NUM_KV_SPLITS
         ctx.split_idx = ctx.bz_idx % traits.NUM_KV_SPLITS
-    elif const_expr(batch_interleave_group > 1):
+    elif const_expr(batch_interleave_group > 1 or compact):
         ctx.split_idx = None
     else:
         ctx.batch_idx = fx.Int64(fx.block_idx.z)
@@ -730,7 +760,8 @@ def _init_dualwave_thread_mapping(ctx):
     block_q = traits.BLOCK_M
     if const_expr(traits.GQA_PACK_M):
         block_q = traits.BLOCK_M // traits.GQA_GROUP_SIZE
-    ctx.q_start = ctx.q_block_idx * block_q
+    if const_expr(not compact):
+        ctx.q_start = ctx.q_block_idx * block_q
 
     ctx.h_kv_idx = ctx.h_idx % traits.NUM_HEADS_KV
     ctx.group_id = ctx.h_idx // traits.NUM_HEADS_KV
@@ -789,6 +820,7 @@ class DualwaveFp8KernelContext:
         lse_stride_h=None,
         BlockTable=None,
         block_table_stride=None,
+        batch_size=None,
     ):
         if isinstance(traits_or_ctx, DualwaveFp8KernelContext):
             self.__dict__.update(traits_or_ctx.__dict__)
@@ -815,6 +847,7 @@ class DualwaveFp8KernelContext:
         self.lse_stride_h = lse_stride_h
         self.BlockTable = BlockTable
         self.block_table_stride = block_table_stride
+        self.batch_size = batch_size
 
     def init_types_and_constants(self):
         traits = self.traits
@@ -875,9 +908,128 @@ class DualwaveFp8KernelContext:
         traits = self.traits
         self.lane_in_warp = self.tid % traits.WARP_SIZE
 
+    def _init_compact_sequence(self, cuq_div, cuk_div, cu_atom, cu_v1i32):
+        """Map this workgroup's slot to (sequence, q-block) with a wave-wide scan of cu_seqlens_q.
+
+        With c[b] = cu_q[b] - cu_q[0], sequence b owns slots [c[b] // BLOCK_Q + b, c[b + 1] // BLOCK_Q + b + 1):
+        at least ceil(len_b / BLOCK_Q) of them, total_q // BLOCK_Q + B in all, with no max_seqlen_q x B padding.
+        Lane l of chunk c holds cu_q[64 c + l] and seqused_k[64 c + l]; BATCH_CHUNKS >= ceil((B + 1) / 64) so
+        cu_q[B], the last sequence's end, has a lane too. Spare slots map past their sequence's end (no rows).
+        """
+        traits = self.traits
+        block_q = traits.BLOCK_M // traits.GQA_GROUP_SIZE
+        q_shift = fx.Int32(block_q.bit_length() - 1)
+        warp = traits.WARP_SIZE
+        nb = fx.Int32(self.batch_size)
+        slot = self.slot_i32
+        lane = fx.Int32(self.lane)
+        count = fx.Int32(0)
+        n_bad = fx.Int32(0)
+        cu_lanes, kv_lanes = [], []
+        for c in range_constexpr(traits.BATCH_CHUNKS):
+            l_i32 = lane + fx.Int32(c * warp)
+            # Lanes past the batch re-read the last entry rather than run off the tensor.
+            lq = (l_i32 < nb).select(l_i32, nb)
+            lk = (l_i32 < nb).select(l_i32, nb - fx.Int32(1))
+            cu_l = fx.Int32(
+                Vec(
+                    fly.copy_atom_call_ssa(
+                        [cu_v1i32], cu_atom, fx.slice(cuq_div, (None, lq))
+                    ),
+                    (1,),
+                    fx.Int32,
+                )[0]
+            )
+            kv_l = fx.Int32(
+                Vec(
+                    fly.copy_atom_call_ssa(
+                        [cu_v1i32], cu_atom, fx.slice(cuk_div, (None, lk))
+                    ),
+                    (1,),
+                    fx.Int32,
+                )[0]
+            )
+            cu_lanes.append(cu_l)
+            kv_lanes.append(kv_l)
+            if const_expr(c == 0):
+                # Slots count from cu_q[0], which need not be 0. Raw rocdl op: no stable uniform-broadcast API.
+                self.cu_q0 = fx.Int32(rocdl.readfirstlane(T.i32, as_mlir_value(cu_l)))
+            rel = cu_l - self.cu_q0
+            start_l = fx.Int32(fx.arith.shrui(rel, q_shift)) + l_i32
+            hit = (l_i32 < nb) & (start_l <= slot)
+            # Raw rocdl op: no stable wave-vote API. The popcount of starts at or below the slot is b + 1.
+            count = count + fx.Int32(
+                fx.math.ctpop(fx.Int64(rocdl.ballot(T.i64, as_mlir_value(hit))))
+            )
+            if const_expr(traits.INTERLEAVED):
+                bad = (l_i32 <= nb) & (rel != l_i32 * fx.Int32(self.seq_len))
+                # Raw rocdl op: no stable wave-vote API.
+                n_bad = n_bad + fx.Int32(
+                    fx.math.ctpop(fx.Int64(rocdl.ballot(T.i64, as_mlir_value(bad))))
+                )
+        # Raw rocdl op: count is wave-uniform, but LLVM cannot prove it after the ctpop sum.
+        b_i32 = fx.Int32(rocdl.readfirstlane(T.i32, as_mlir_value(count - fx.Int32(1))))
+        if const_expr(traits.INTERLEAVED):
+            # Rank-major (slot = rank * B + b) is global longest-first for a uniform batch. It is only a hint:
+            # a ragged batch (e.g. a CUDA-graph replay) keeps the compact map, which the same grid covers.
+            uniform = n_bad == fx.Int32(0)
+            b_i32 = uniform.select(slot % nb, b_i32)
+
+        def _lane_value(vals, idx):
+            # Raw rocdl op: readlane fetches the owner lane's entry with no second memory round trip.
+            lane_idx = idx & fx.Int32(warp - 1)
+            chunk = fx.Int32(fx.arith.shrui(idx, fx.Int32(warp.bit_length() - 1)))
+            out = fx.Int32(
+                rocdl.readlane(T.i32, as_mlir_value(vals[0]), as_mlir_value(lane_idx))
+            )
+            for c in range_constexpr(1, len(vals)):
+                v = fx.Int32(
+                    rocdl.readlane(
+                        T.i32, as_mlir_value(vals[c]), as_mlir_value(lane_idx)
+                    )
+                )
+                out = (chunk == fx.Int32(c)).select(v, out)
+            return out
+
+        q_base_i32 = _lane_value(cu_lanes, b_i32)
+        self.batch_idx = fx.Int64(b_i32)
+        self.q_tok_base = fx.Index(q_base_i32)
+        self.q_tok_end = fx.Index(_lane_value(cu_lanes, b_i32 + fx.Int32(1)))
+        self.kv_tok_base = fx.Index(0)
+        self.kv_tok_end = fx.Index(_lane_value(kv_lanes, b_i32))
+        self.seqlen_q_v = self.q_tok_end - self.q_tok_base
+        self.seqlen_kv_v = self.kv_tok_end
+        self.seqlen_kv_i32 = fx.Int32(self.seqlen_kv_v)
+
+        rank = slot - (
+            fx.Int32(fx.arith.shrui(q_base_i32 - self.cu_q0, q_shift)) + b_i32
+        )
+        if const_expr(traits.INTERLEAVED):
+            rank = uniform.select(slot // nb, rank)
+        # A sequence's q-blocks run longest-first (causal work grows with the block index, and workgroups
+        # dispatch in id order); ranks past its blocks stay past its end. i32: SALU has no 64-bit ordered compare.
+        seqlen_q_i32 = fx.Int32(self.seqlen_q_v)
+        num_q_blocks = fx.Int32(
+            fx.arith.shrui(seqlen_q_i32 + fx.Int32(block_q - 1), q_shift)
+        )
+        q_block = (rank < num_q_blocks).select(num_q_blocks - fx.Int32(1) - rank, rank)
+        self.q_block_idx = fx.Int64(q_block)
+        self.q_start = fx.Index(q_block * fx.Int32(block_q))
+
     def init_sequence_lengths(self):
         traits = self.traits
-        if const_expr(traits.VARLEN):
+        if const_expr(_bn64_compact_grid(traits)):
+            self._init_compact_sequence(
+                fx.logical_divide(
+                    fx.rocdl.make_buffer_tensor(self.CuSeqQ), fx.make_layout(1, 1)
+                ),
+                fx.logical_divide(
+                    fx.rocdl.make_buffer_tensor(self.CuSeqKv), fx.make_layout(1, 1)
+                ),
+                fx.make_copy_atom(fx.rocdl.BufferCopy32b(), fx.Int32),
+                Vec.make_type(1, fx.Int32),
+            )
+        elif const_expr(traits.VARLEN):
             _cuq_div = fx.logical_divide(
                 fx.rocdl.make_buffer_tensor(self.CuSeqQ), fx.make_layout(1, 1)
             )
@@ -1045,6 +1197,27 @@ class DualwaveFp8KernelContext:
         # fp8 global->LDS DMA uses i8 destination typing; K/V LDS reads are byte-addressed.
         self.lds_ptr_ty = fx.PointerType.get(fx.Int8.ir_type, 2, traits.DMA_BYTES)
 
+    def issue_descale_loads(self):
+        """Issue the three descale loads; at kernel entry they share the sequence lookup's memory round trip."""
+
+        def _load_scale_scalar(tensor):
+            _div = fx.logical_divide(
+                fx.rocdl.make_buffer_tensor(tensor), fx.make_layout(1, 1)
+            )
+            _atom = fx.make_copy_atom(fx.rocdl.BufferCopy32b(), fx.Float32)
+            _v = fly.copy_atom_call_ssa(
+                [Vec.make_type(1, fx.Float32)],
+                _atom,
+                fx.slice(_div, (None, fx.Int32(0))),
+            )
+            return Vec(_v, (1,), fx.Float32)[0]
+
+        self._descales = (
+            _load_scale_scalar(self.QDescale),
+            _load_scale_scalar(self.KDescale),
+            _load_scale_scalar(self.VDescale),
+        )
+
     def init_descale(self):
         def _load_scale_scalar(tensor):
             _div = fx.logical_divide(
@@ -1060,9 +1233,12 @@ class DualwaveFp8KernelContext:
 
         c_log2e_f = fx.Float32(_LOG2E)
         c_sm_scale_log2e = self.softmax_scale * c_log2e_f
-        _qd = _load_scale_scalar(self.QDescale)
-        _kd = _load_scale_scalar(self.KDescale)
-        self.vd_fp8 = _load_scale_scalar(self.VDescale)
+        if const_expr(getattr(self, "_descales", None) is not None):
+            _qd, _kd, self.vd_fp8 = self._descales
+        else:
+            _qd = _load_scale_scalar(self.QDescale)
+            _kd = _load_scale_scalar(self.KDescale)
+            self.vd_fp8 = _load_scale_scalar(self.VDescale)
         # fp8 feeds raw Q/K into the MFMA, so q/k descale * softmax scale multiplies
         # the fp32 logits after QK.
         self.c_logit_scale = c_sm_scale_log2e * (_qd * _kd)
