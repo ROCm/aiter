@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """Edge checks for champions: --check 1 (batch-size boundary), --check 2 (large-logit / EXP_APPROX),
 --check 3 (incumbent packed BN64 compact grid: large batches that reach flydsl, ragged and empty q-sequences
-under both interleaved settings)."""
+under both interleaved settings), --check 4 (packed BN64 scalar page ids: garbage-padded, exact-width and
+too-narrow block tables, empty KV segments)."""
 
 import argparse
 import importlib
@@ -320,8 +321,82 @@ def check3():
             )
 
 
+def _with_table(case, kvs, extra_cols, fill):
+    """Copy of case whose table has extra_cols more columns and every entry past a row's pages set to fill."""
+    bt = case["block_table"]
+    need = torch.tensor([-(-n // 64) for n in kvs], device="cuda").unsqueeze(1)
+    width = max(1, bt.shape[1] + extra_cols)
+    out = torch.full((bt.shape[0], width), fill, device="cuda", dtype=torch.int32)
+    w = min(width, bt.shape[1])
+    cols = torch.arange(w, device="cuda").unsqueeze(0)
+    out[:, :w] = torch.where(cols < need, bt[:, :w], out[:, :w])
+    return dict(case, block_table=out.contiguous())
+
+
+def check4():
+    print("| case | G | causal | layout | pass | NaN | max_err all | atol |")
+    print("|---|---|---|---|---|---|---|---|")
+    shapes = [
+        ("ragged", [93, 80, 71, 60], [157, 100, 90, 700]),
+        ("page_multiple", [64, 128], [1024, 640]),
+        ("empty_kv_mixed", [64, 32, 48], [0, 200, 0]),
+        ("empty_kv_all", [64, 32], [0, 0]),
+    ]
+    tables = [
+        ("exact", 0, None),
+        ("pad_huge", 5, 2**31 - 1),
+        ("pad_neg1", 5, -1),
+    ]
+    for g in (16, 8, 4):
+        for causal in (True, False):
+            for sname, qls, kvs in shapes:
+                case = make_case(qls, kvs, torch.bfloat16, causal=causal, group=g)
+                want = _ref(case, qls, kvs, causal)
+                atol = max(bc.FP8_REL_ERR * want.abs().max().item(), 1e-6)
+                for tname, extra, fill in tables:
+                    c = case if fill is None else _with_table(case, kvs, extra, fill)
+                    # make_case sizes the table to exactly ceil(max_seqlen_k / 64) columns.
+                    assert fill is not None or c["block_table"].shape[1] == max(
+                        1, -(-max(kvs) // 64)
+                    )
+                    for layout in ("linear", "shuffled"):
+                        name = f"{sname}_{tname}"
+                        try:
+                            got = _run_bn64(c, layout, None, g)
+                        except Exception as ex:  # noqa: BLE001
+                            print(
+                                f"| {name} | {g} | {int(causal)} | {layout} | error {type(ex).__name__}: {str(ex)[:100]} ||||"
+                            )
+                            continue
+                        d = torch.nan_to_num((got - want).abs(), nan=float("inf"))
+                        nan = bool(torch.isnan(got).any())
+                        print(
+                            f"| {name} | {g} | {int(causal)} | {layout} | {bool(d.max() <= atol and not nan)} | {nan} | "
+                            f"{d.max().item():.4g} | {atol:.3g} |",
+                            flush=True,
+                        )
+    # Too narrow: one column short of ceil(max_seqlen_k / 64). The router must decline (RuntimeError under
+    # backend="flydsl"), not launch.
+    for g in (16, 8, 4):
+        qls, kvs = [64, 128], [1024, 700]
+        case = make_case(qls, kvs, torch.bfloat16, causal=True, group=g)
+        c = dict(case, block_table=case["block_table"][:, :-1].contiguous())
+        for layout in ("linear", "shuffled"):
+            try:
+                _run_bn64(c, layout, None, g)
+                ok, msg = False, "launched"
+            except RuntimeError as ex:
+                ok, msg = "does not support" in str(ex), str(ex)[:60]
+            except Exception as ex:  # noqa: BLE001
+                ok, msg = False, f"{type(ex).__name__}: {str(ex)[:60]}"
+            print(
+                f"| narrow_declined | {g} | 1 | {layout} | {ok} | - | {msg} | - |",
+                flush=True,
+            )
+
+
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
     ap.add_argument("--check", type=int, required=True)
     a = ap.parse_args()
-    {1: check1, 2: check2, 3: check3}[a.check]()
+    {1: check1, 2: check2, 3: check3, 4: check4}[a.check]()
