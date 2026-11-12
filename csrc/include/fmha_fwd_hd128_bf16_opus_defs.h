@@ -33,6 +33,31 @@ struct opus_gqa_kargs {
     void* __restrict__ ptr_lse;
     int stride_lse_b;
     int stride_lse_h;
+
+    // ── group mode (varlen / packed sequences) ──
+    // Prefix sums (length B+1). *_seqstart_* are real lengths (masking, KV-tile count,
+    // empty-tail short circuit); *_seqstart_*_pad are physical row offsets. A null
+    // ptr_seqstart_q selects batch mode. Only read when the traits' GROUP_MODE is set.
+    const int* ptr_seqstart_q;
+    const int* ptr_seqstart_k;
+    const int* ptr_seqstart_q_pad;
+    const int* ptr_seqstart_k_pad;
+
+    // ── group mode: flattened Q-block axis ──
+    // When > 0, the extent of the Q-block axis: the groups' blocks laid end to end, and
+    // each block inverts seqstart_q to work out which group it belongs to. The value is
+    // therefore fixed by that mapping, not free: see
+    // fmha_fwd_bf16_opus_args::total_q_blocks.
+    //
+    // The default (0) keeps the rectangular grid, where every group is given as many
+    // Q-blocks as the LONGEST group needs and the surplus returns immediately. That costs
+    // nothing when the lengths are close, but one sequence at max_seqlen beside a batch of
+    // ordinary ones multiplies every group's block count: measured at B=8 with seven ~8.4k
+    // sequences plus one at 16,354, it took the workgroup count from 1,184 to 2,048 (+73%)
+    // for 11% more work, and 53% more time.
+    //
+    // 0 means "not supplied" rather than "no blocks".
+    int total_q_blocks;
 };
 
 // Configuration traits for the GQA kernel (tile sizes, data types, vector lengths,
@@ -42,7 +67,8 @@ template<int Q_TILE_SIZE_ = 32,
         int KV_TILE_SIZE_ = 64,
         int D_TILE_SIZE_ = 128,
         int NUM_WARPS_ = 8,
-        bool CAUSAL_ = false>
+        bool CAUSAL_ = false,
+        bool GROUP_MODE_ = false>
 struct opus_gqa_traits {
     static_assert(D_TILE_SIZE_ == 128, "fmha_fwd_hd128_bf16_opus supports D_TILE_SIZE 128 only");
 
@@ -51,6 +77,8 @@ struct opus_gqa_traits {
     static constexpr int D_TILE_SIZE = D_TILE_SIZE_;
     static constexpr int NUM_WARPS = NUM_WARPS_;
     static constexpr bool CAUSAL = CAUSAL_;
+    // Group (varlen) mode: locate sequences via seqstart, not a uniform batch stride.
+    static constexpr bool GROUP_MODE = GROUP_MODE_;
 
     static constexpr int WARP_SIZE = 64; // AMD wavefront size
     static constexpr int BLOCK_SIZE = NUM_WARPS * WARP_SIZE;

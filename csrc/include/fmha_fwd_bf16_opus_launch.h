@@ -63,6 +63,32 @@ struct fmha_fwd_bf16_opus_args
     // Bottom-right aligned when seqlen_q != seqlen_k.
     bool causal = false;
 
+    // Group mode only. Length of the flattened Q-block axis, so the grid no longer gives
+    // every group the longest group's block count. 0 (the default) keeps the rectangular
+    // grid.
+    //
+    // Pass exactly `sum(seqlen_q) / 256 + batch`. This is the grid extent, not a
+    // free-standing block count: the kernel places a block by inverting seqstart_q, which
+    // spaces the groups by that expression, so a shorter grid drops real blocks rather
+    // than merely retiring surplus ones. Note it is NOT sum_g ceil(seqlen_q[g] / 256) --
+    // that sum is smaller whenever the lengths are not multiples of 256, and three groups
+    // of 255 would lose the third group's only block.
+    //
+    // Worth supplying when the group lengths are uneven. The rectangle gives every group
+    // the LONGEST group's block count, so one sequence at max_seqlen drags the whole
+    // batch: at B=8 with seven ~8.4k sequences plus one at 16,354 it cost 73% more
+    // workgroups and 53% more time for 11% more work. When the lengths are close the
+    // rectangle wastes under 10% and this is not worth the per-block scalar lookup.
+    int total_q_blocks = 0;
+
+    // Group mode only. sum(seqlen_q), i.e. the packed Q row count (q.size(0)). Preferred
+    // over total_q_blocks: the Q block size is a property of the kernel variant, not of
+    // the call, so supplying the row count lets the launcher derive the extent from the
+    // variant it launches.
+    //
+    // When this is > 0 it wins over total_q_blocks; both 0 keeps the rectangular grid.
+    int total_q = 0;
+
     std::string data_type = "bf16";
 };
 
@@ -85,23 +111,14 @@ inline float resolve_scale(float softmax_scale, int hdim_q)
     return 1.0f / std::sqrt(static_cast<float>(hdim_q));
 }
 
-// D_QK = D_V = 128 (symmetric), batch mode only.
-inline bool launch_d128(const fmha_fwd_bf16_opus_args& a, hipStream_t stream)
+// Fill the shared fields of a d128 kargs. Returns false if the arguments are
+// inconsistent.
+//
+// Everything variant-specific (the flat-axis extent, the grid, the traits) is left to the
+// caller, which knows its Q block size.
+inline bool fill_d128_kargs(opus_gqa_kargs& kargs, const fmha_fwd_bf16_opus_args& a,
+                            bool& is_group)
 {
-    // A kv extent reaching 2^32 wraps the async-load offset and silently produces wrong
-    // output, so refuse it instead.
-    const int kv_stride_n = (a.stride_k_n > a.stride_v_n ? a.stride_k_n : a.stride_v_n);
-    if(static_cast<long long>(a.seqlen_k) * kv_stride_n * 2LL >= (1LL << 32))
-    {
-        return false;
-    }
-
-    if(a.batch == 0 || a.seqlen_q == 0 || a.nhead == 0)
-    {
-        return true;
-    }
-
-    opus_gqa_kargs kargs{};
     kargs.ptr_q = a.q_ptr;
     kargs.ptr_k = a.k_ptr;
     kargs.ptr_v = a.v_ptr;
@@ -133,23 +150,88 @@ inline bool launch_d128(const fmha_fwd_bf16_opus_args& a, hipStream_t stream)
     kargs.stride_lse_b = a.stride_lse_b;
     kargs.stride_lse_h = a.stride_lse_h;
 
+    // Group / varlen. A null seqstart_q selects batch mode, where these stay null and the
+    // GROUP_MODE branches compile out entirely.
+    is_group = (a.seqstart_q_ptr != nullptr);
+    if(is_group && (!a.seqstart_k_ptr || !a.seqstart_q_pad_ptr || !a.seqstart_k_pad_ptr))
+        return false;
+    kargs.ptr_seqstart_q     = is_group ? a.seqstart_q_ptr : nullptr;
+    kargs.ptr_seqstart_k     = is_group ? a.seqstart_k_ptr : nullptr;
+    kargs.ptr_seqstart_q_pad = is_group ? a.seqstart_q_pad_ptr : nullptr;
+    kargs.ptr_seqstart_k_pad = is_group ? a.seqstart_k_pad_ptr : nullptr;
+    return true;
+}
+
+// Guards shared by both d128 variants. `ok` distinguishes "refuse" from "nothing to do".
+inline bool d128_preflight(const fmha_fwd_bf16_opus_args& a, bool& ok)
+{
+    ok = false;
+    // A kv extent reaching 2^32 wraps the async-load offset and silently produces wrong
+    // output, so refuse it instead.
+    const int kv_stride_n = (a.stride_k_n > a.stride_v_n ? a.stride_k_n : a.stride_v_n);
+    if(static_cast<long long>(a.seqlen_k) * kv_stride_n * 2LL >= (1LL << 32))
+        return false;
+    ok = true;
+    // Nothing to launch, but not an error.
+    return !(a.batch == 0 || a.seqlen_q == 0 || a.nhead == 0);
+}
+
+// D_QK = D_V = 128 (symmetric). Covers batch mode and group / varlen; which one is
+// selected follows from the arguments, see below.
+inline bool launch_d128(const fmha_fwd_bf16_opus_args& a, hipStream_t stream)
+{
+    bool ok = false;
+    if(!d128_preflight(a, ok))
+        return ok;
+
+    opus_gqa_kargs kargs{};
+    bool is_group = false;
+    if(!fill_d128_kargs(kargs, a, is_group))
+        return false;
+
     auto launch = [&](auto traits_tag) {
         using Traits          = decltype(traits_tag);
         const int num_q_tiles = ceil_div(a.seqlen_q, Traits::Q_TILE_SIZE);
         const int num_q_blk   = ceil_div(num_q_tiles, Traits::NUM_WARPS);
-        dim3 grid(a.nhead, num_q_blk, a.batch);
+        // The flat extent follows this variant's Q block size, so derive it here rather
+        // than take the caller's -- see fmha_fwd_bf16_opus_args::total_q.
+        constexpr int q_block = Traits::Q_TILE_SIZE * Traits::NUM_WARPS;
+        kargs.total_q_blocks  = !is_group ? 0
+                                : (a.total_q > 0 ? a.total_q / q_block + a.batch
+                                                 : a.total_q_blocks);
+        // Group mode has two groupings, see opus_gqa_kargs::total_q_blocks.
+        //
+        // Flat: y carries total_q / q_block + batch blocks, the spacing the kernel's
+        // seqstart_q inversion defines. That is at most `batch` over the number that hold
+        // rows -- not sum_g ceil(seqlen_q[g] / q_block), which the host cannot compute
+        // without reading cu_seqlens back off the device. Rectangular: rotated axes
+        // (head=x, group=y, Q-block=z) so the shorter groups' empty tail blocks
+        // short-circuit together; the Q-block extent is the longest group. Batch mode
+        // keeps q-block=y, batch=z.
+        const bool flat = Traits::GROUP_MODE && kargs.total_q_blocks > 0;
+        dim3 grid       = flat ? dim3(a.nhead, kargs.total_q_blocks, 1)
+                               : (Traits::GROUP_MODE ? dim3(a.nhead, a.batch, num_q_blk)
+                                                     : dim3(a.nhead, num_q_blk, a.batch));
         dim3 block(Traits::BLOCK_SIZE);
         gqa_d128_kernel<Traits><<<grid, block, 0, stream>>>(kargs);
         HIP_CALL_LAUNCH(hipGetLastError());
     };
 
-    if(a.causal)
+    // causal x group.
+    if(is_group)
     {
-        launch(opus_gqa_traits<32, 64, 128, 8, true>{});
+        if(a.causal)
+            launch(opus_gqa_traits<32, 64, 128, 8, true, true>{});
+        else
+            launch(opus_gqa_traits<32, 64, 128, 8, false, true>{});
+    }
+    else if(a.causal)
+    {
+        launch(opus_gqa_traits<32, 64, 128, 8, true, false>{});
     }
     else
     {
-        launch(opus_gqa_traits<32, 64, 128, 8, false>{});
+        launch(opus_gqa_traits<32, 64, 128, 8, false, false>{});
     }
     return true;
 }
@@ -271,10 +353,10 @@ inline bool launch_d192_v128(const fmha_fwd_bf16_opus_args& a, hipStream_t strea
 } // namespace fmha_fwd_bf16_opus_detail
 
 // Launches the opus forward kernel that matches the argument head dims on `stream`.
-// Returns false when the input is outside what the kernels cover: a data type other than
-// bf16, a (hdim_q, hdim_v) other than (128,128) or (192,128), group mode asked of the
-// batch-only symmetric kernel, or (for the 128/128 kernel only) a kv extent past the
-// 32-bit async-load offset limit.
+// Returns false when the input is outside what the kernels cover: a GPU other than
+// gfx950, a data type other than bf16, a (hdim_q, hdim_v) other than (128,128) or
+// (192,128), or a kv extent past the 32-bit async-load offset limit. Both head-dim
+// kernels take batch and group / varlen.
 inline bool fmha_fwd_bf16_opus_launch(const fmha_fwd_bf16_opus_args& a, hipStream_t stream)
 {
     static const std::string arch_id = get_gpu_arch();
@@ -284,12 +366,8 @@ inline bool fmha_fwd_bf16_opus_launch(const fmha_fwd_bf16_opus_args& a, hipStrea
         return false;
     }
 
-    const bool is_group = (a.seqstart_q_ptr != nullptr);
-
     if(a.hdim_q == 128 && a.hdim_v == 128)
     {
-        if(is_group)
-            return false;
         return fmha_fwd_bf16_opus_detail::launch_d128(a, stream);
     }
     if(a.hdim_q == 192 && a.hdim_v == 128)

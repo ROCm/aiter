@@ -1370,25 +1370,30 @@ _OPUS_D192_GROUP_CASES = [
 ]
 
 
-@pytest.mark.parametrize("causal", [False, True])
-@pytest.mark.parametrize(
-    "seqlens_q,seqlens_kv,nheads,nheads_k,kv_pad",
-    _OPUS_D192_GROUP_CASES,
-    ids=[
-        f"g{len(a)}_h{h}_hkv{hk}_pad{p}" + ("_emptykv" if 0 in b else "")
-        for (a, b, h, hk, p) in _OPUS_D192_GROUP_CASES
-    ],
-)
-def test_fmha_fwd_bf16_opus_d192_v128_group(
-    seqlens_q, seqlens_kv, nheads, nheads_k, kv_pad, causal
+def _run_opus_group_case(
+    seqlens_q,
+    seqlens_kv,
+    nheads,
+    nheads_k,
+    kv_pad,
+    causal,
+    d_qk,
+    d_v,
+    q_pad=0,
 ):
-    """OPUS D=192 group/varlen forward with LSE, per group against attention_ref."""
-    if get_gfx() != "gfx950":
-        pytest.skip("opus D=192 kernel requires gfx950")
+    """Shared body: OPUS group/varlen forward with LSE, per group vs attention_ref.
+
+    `q_pad` rounds each group's Q rows up to a multiple of it and passes the physical
+    offsets as seqstart_q_pad, the mirror of `kv_pad`. The two exercise different
+    offsets: KV padding only moves where K/V are READ, while Q padding also moves where
+    O and LSE are WRITTEN (q_batch_base / o_batch_base / lse_batch_base all derive from
+    seqstart_q_pad), so a kernel that confused the real and physical Q starts would place
+    every group's output rows wrong and only this covers it.
+    """
     assert len(seqlens_q) == len(seqlens_kv)
 
     torch.manual_seed(0)
-    d_qk, d_v = 192, 128
+    tag = f"opus-d{d_qk}-group"
 
     def _cumsum(lengths):
         return torch.tensor(
@@ -1400,8 +1405,10 @@ def test_fmha_fwd_bf16_opus_d192_v128_group(
     phys_kv = [
         ((s + kv_pad - 1) // kv_pad) * kv_pad if kv_pad else s for s in seqlens_kv
     ]
-    total_q = sum(seqlens_q)
+    phys_q = [((s + q_pad - 1) // q_pad) * q_pad if q_pad else s for s in seqlens_q]
+    total_q = sum(phys_q)
     cu_q = _cumsum(seqlens_q)
+    cu_q_pad = _cumsum(phys_q)
     cu_k = _cumsum(seqlens_kv)
     cu_k_pad = _cumsum(phys_kv)
 
@@ -1413,6 +1420,9 @@ def test_fmha_fwd_bf16_opus_d192_v128_group(
             gap = slice(int(cu_k_pad[g]) + real, int(cu_k_pad[g]) + phys)
             k[gap] = float("nan")
             v[gap] = float("nan")
+    if q_pad:
+        for g, (real, phys) in enumerate(zip(seqlens_q, phys_q)):
+            q[slice(int(cu_q_pad[g]) + real, int(cu_q_pad[g]) + phys)] = float("nan")
 
     with torch.no_grad():
         out, lse = fmha_fwd_bf16_opus_varlen_fwd(
@@ -1423,6 +1433,7 @@ def test_fmha_fwd_bf16_opus_d192_v128_group(
             causal=causal,
             seqstart_q=cu_q,
             seqstart_k=cu_k,
+            seqstart_q_pad=cu_q_pad if q_pad else None,
             seqstart_k_pad=cu_k_pad if kv_pad else None,
             max_seqlen_q=max(seqlens_q),
             max_seqlen_k=max(seqlens_kv),
@@ -1430,14 +1441,24 @@ def test_fmha_fwd_bf16_opus_d192_v128_group(
         )
 
     assert tuple(lse.shape) == (nheads, total_q), f"lse shape {tuple(lse.shape)}"
-    assert not torch.isnan(out).any(), "read into the KV padding gap"
-    assert not torch.isnan(lse).any(), "read into the KV padding gap"
+    # Only the real rows: under Q padding the gap rows of out/lse are never written, so
+    # they still hold whatever torch.empty left there and a blanket check would be noise.
+    for g in range(len(seqlens_q)):
+        rows = slice(int(cu_q_pad[g]), int(cu_q_pad[g]) + seqlens_q[g])
+        assert not torch.isnan(out[rows]).any(), "read into a padding gap"
+        assert not torch.isnan(lse[:, rows]).any(), "read into a padding gap"
 
     max_diff = 0.0
     for g in range(len(seqlens_q)):
-        ql, qh = int(cu_q[g]), int(cu_q[g + 1])
+        ql = int(cu_q_pad[g])  # physical start, real length -- as for K/V below
+        qh = ql + seqlens_q[g]
         kl = int(cu_k_pad[g])  # physical start, real length
         kh = kl + seqlens_kv[g]
+        if seqlens_q[g] == 0:
+            # No query rows, so the group owns no output and there is nothing to
+            # compare. What matters is that it consumed no Q blocks and left the
+            # neighbouring groups' rows alone, which the other groups' checks cover.
+            continue
         if seqlens_kv[g] == 0:
             # Assert the contract exactly rather than through attention_ref, whose
             # degenerate-shape behaviour is its own question.
@@ -1460,9 +1481,258 @@ def test_fmha_fwd_bf16_opus_d192_v128_group(
         max_diff = max(max_diff, diff)
         assert diff <= tol, f"group {g} diff {diff} > tol {tol}"
         opus_check_lse(
-            f"opus-d192-group g{g}", lse[:, ql:qh], opus_ref_lse(qg, kg, causal)[0]
+            f"{tag} g{g}",
+            lse[:, ql:qh],
+            opus_ref_lse(qg, kg, causal)[0],
         )
-    print(f"[opus-d192-group] max diff across groups: {max_diff}")
+    print(f"[{tag}] max diff across groups: {max_diff}")
+
+
+@pytest.mark.parametrize("causal", [False, True])
+@pytest.mark.parametrize(
+    "seqlens_q,seqlens_kv,nheads,nheads_k,kv_pad",
+    _OPUS_D192_GROUP_CASES,
+    ids=[
+        f"g{len(a)}_h{h}_hkv{hk}_pad{p}" + ("_emptykv" if 0 in b else "")
+        for (a, b, h, hk, p) in _OPUS_D192_GROUP_CASES
+    ],
+)
+def test_fmha_fwd_bf16_opus_d192_v128_group(
+    seqlens_q, seqlens_kv, nheads, nheads_k, kv_pad, causal
+):
+    """OPUS D=192 group/varlen forward with LSE, per group against attention_ref."""
+    if get_gfx() != "gfx950":
+        pytest.skip("opus D=192 kernel requires gfx950")
+    _run_opus_group_case(
+        seqlens_q, seqlens_kv, nheads, nheads_k, kv_pad, causal, 192, 128
+    )
+
+
+@pytest.mark.parametrize("causal", [False, True])
+@pytest.mark.parametrize(
+    "seqlens_q,seqlens_kv,nheads,nheads_k,kv_pad",
+    _OPUS_D192_GROUP_CASES,
+    ids=[
+        f"g{len(a)}_h{h}_hkv{hk}_pad{p}" + ("_emptykv" if 0 in b else "")
+        for (a, b, h, hk, p) in _OPUS_D192_GROUP_CASES
+    ],
+)
+def test_fmha_fwd_bf16_opus_d128_group(
+    seqlens_q, seqlens_kv, nheads, nheads_k, kv_pad, causal, monkeypatch
+):
+    """OPUS D=128 group/varlen forward with LSE, per group against attention_ref.
+
+    The same shape matrix as the D=192 test: the two kernels share the group-mode
+    contract (packed THD, KV padding, cross-attention, empty groups), so the cases
+    that pin it down are the same. Env-gated like the dense D=128 path.
+    """
+    if get_gfx() != "gfx950":
+        pytest.skip("opus D=128 kernel requires gfx950")
+    monkeypatch.setenv("AITER_ENABLE_FMHA_OPUS", "1")
+    _run_opus_group_case(
+        seqlens_q, seqlens_kv, nheads, nheads_k, kv_pad, causal, 128, 128
+    )
+
+
+# Longer group-mode shapes for D=128, both mask modes. _OPUS_D192_GROUP_CASES pins the
+# structural edges (empty groups, KV padding, cross-attention, partial tails) but tops out
+# at 1,024 tokens, so none of its cases reach the sequence lengths this kernel is built
+# for, the batch sizes a serving engine produces, or the capacity the request doc states.
+#   (q seqlens, kv seqlens, nheads, nheads_k, kv_pad)
+_OPUS_D128_GROUP_LONG_CASES = [
+    ([8400] * 4, [8400] * 4, 4, 4, 0),  # the request doc's band, uniform
+    ([7500, 9400, 8100, 8900], [7500, 9400, 8100, 8900], 4, 4, 0),  # band, jagged
+    ([8400] * 16, [8400] * 16, 4, 4, 0),  # band at a serving batch
+    ([16354], [16354], 4, 4, 0),  # the stated capacity, B=1
+    ([512] * 7 + [16354], [512] * 7 + [16354], 4, 4, 0),  # one long among short
+    ([2048] * 32, [2048] * 32, 8, 2, 0),  # mid lengths, large batch, GQA
+    ([64] * 64, [64] * 64, 8, 2, 0),  # many tiny groups
+    ([1] * 64, [4096] * 64, 16, 4, 0),  # decode: one query row against a long context
+    ([4096] * 8, [512] * 8, 32, 8, 0),  # cross q>k, GQA 4:1
+    ([512] * 8, [4096] * 8, 16, 1, 0),  # cross q<k, MQA
+    (
+        [3000, 50, 12000, 700],
+        [3000, 50, 12000, 700],
+        8,
+        8,
+        0,
+    ),  # orders of magnitude apart
+    ([9000, 9000], [9000, 9000], 4, 4, 1024),  # long + KV padding
+]
+
+
+@pytest.mark.parametrize("causal", [False, True])
+@pytest.mark.parametrize(
+    "seqlens_q,seqlens_kv,nheads,nheads_k,kv_pad",
+    _OPUS_D128_GROUP_LONG_CASES,
+    ids=[
+        f"g{len(a)}_max{max(a)}_h{h}_hkv{hk}_pad{p}"
+        for (a, b, h, hk, p) in _OPUS_D128_GROUP_LONG_CASES
+    ],
+)
+def test_fmha_fwd_bf16_opus_d128_group_long(
+    seqlens_q, seqlens_kv, nheads, nheads_k, kv_pad, causal, monkeypatch
+):
+    """OPUS D=128 group/varlen at the sequence lengths and batch sizes it is built for.
+
+    Separate from test_fmha_fwd_bf16_opus_d128_group because that one shares its shapes
+    with the D=192 test and stops at 1,024 tokens: nothing there spans more than four
+    Q blocks, so the flat grid's block count, the group lookup and the KV traversal are
+    all exercised only at their smallest.
+    """
+    if get_gfx() != "gfx950":
+        pytest.skip("opus D=128 kernel requires gfx950")
+    monkeypatch.setenv("AITER_ENABLE_FMHA_OPUS", "1")
+    _run_opus_group_case(
+        seqlens_q, seqlens_kv, nheads, nheads_k, kv_pad, causal, 128, 128
+    )
+
+
+# Q-side padding: each group's Q rows rounded up, physical offsets in seqstart_q_pad.
+# The KV-padded cases above only move where K/V are read; this is the only coverage of
+# the offsets that move where O and LSE are WRITTEN.
+#   (q seqlens, kv seqlens, nheads, nheads_k, q_pad)
+_OPUS_D128_GROUP_QPAD_CASES = [
+    ([100, 300], [100, 300], 8, 2, 128),  # pad < one Q block
+    ([257, 513], [257, 513], 4, 4, 256),  # pad == the Q block, partial tails
+    ([1, 1000], [1, 1000], 16, 4, 512),  # pad >> one group's real rows
+    ([512, 0, 512], [512, 512, 512], 8, 2, 256),  # empty query group + padding
+    ([300, 77], [900, 200], 4, 4, 128),  # cross-attention + padding
+]
+
+
+@pytest.mark.parametrize("causal", [False, True])
+@pytest.mark.parametrize(
+    "seqlens_q,seqlens_kv,nheads,nheads_k,q_pad",
+    _OPUS_D128_GROUP_QPAD_CASES,
+    ids=[
+        f"g{len(a)}_qpad{p}_h{h}_hkv{hk}"
+        for (a, b, h, hk, p) in _OPUS_D128_GROUP_QPAD_CASES
+    ],
+)
+def test_fmha_fwd_bf16_opus_d128_group_qpad(
+    seqlens_q,
+    seqlens_kv,
+    nheads,
+    nheads_k,
+    q_pad,
+    causal,
+    monkeypatch,
+):
+    """OPUS D=128 group/varlen with Q-side padding (seqstart_q_pad).
+
+    The kernel derives q_batch_base, o_batch_base and lse_batch_base from seqstart_q_pad
+    but every length and mask bound from seqstart_q. Nothing else covers that split: a
+    kernel that used the real starts for the bases would write every group's rows at the
+    wrong offset, and with no padding the two arrays are equal so the bug would hide.
+    """
+    if get_gfx() != "gfx950":
+        pytest.skip("opus D=128 kernel requires gfx950")
+    monkeypatch.setenv("AITER_ENABLE_FMHA_OPUS", "1")
+    _run_opus_group_case(
+        seqlens_q,
+        seqlens_kv,
+        nheads,
+        nheads_k,
+        kv_pad=0,
+        causal=causal,
+        d_qk=128,
+        d_v=128,
+        q_pad=q_pad,
+    )
+
+
+# ---------------------------------------------------------------------------
+# OPUS varlen dispatch. Everything above calls fmha_fwd_bf16_opus_varlen_fwd
+# directly, which proves the kernel computes the right thing but never executes
+# can_impl_fmha_fwd_bf16_opus_varlen -- the gate that decides whether a call
+# reaches that kernel at all. These go through the public entry point instead,
+# so the conditions the kernel relies on are the ones under test.
+# ---------------------------------------------------------------------------
+
+
+def _opus_varlen_dispatch_record(monkeypatch):
+    """Count calls reaching the OPUS varlen entry point from the public API."""
+    calls = {"n": 0}
+    real = mha_ops.fmha_fwd_bf16_opus_varlen_fwd
+
+    def spy(*args, **kwargs):
+        calls["n"] += 1
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(mha_ops, "fmha_fwd_bf16_opus_varlen_fwd", spy)
+    return calls
+
+
+# (id, enabled, hdim, dtype, causal, window_size, expect_opus)
+_OPUS_VARLEN_DISPATCH_CASES = [
+    ("causal_only", True, 128, "bf16", True, (-1, -1, 0), True),
+    ("no_mask", True, 128, "bf16", False, (-1, -1, 0), True),
+    # The gate's rejections. Each is a shape the kernel has no instance for, so
+    # reaching it would not be a slowdown but a wrong answer or a bad launch.
+    ("env_off", False, 128, "bf16", True, (-1, -1, 0), False),
+    ("causal_window", True, 128, "bf16", True, (128, 0, 0), False),
+    ("hdim64", True, 64, "bf16", True, (-1, -1, 0), False),
+    ("fp16", True, 128, "fp16", True, (-1, -1, 0), False),
+]
+
+
+@pytest.mark.parametrize(
+    "enabled,hdim,dtype_name,causal,window_size,expect_opus",
+    [c[1:] for c in _OPUS_VARLEN_DISPATCH_CASES],
+    ids=[c[0] for c in _OPUS_VARLEN_DISPATCH_CASES],
+)
+def test_flash_attn_varlen_func_opus_dispatch(
+    enabled, hdim, dtype_name, causal, window_size, expect_opus, monkeypatch
+):
+    """The public varlen entry point routes to OPUS exactly when the gate allows it.
+
+    A shape the kernel has no instance for must land on another backend rather than be
+    computed as something else. The negative cases are the point of this test: the
+    positive ones only confirm the shape would otherwise qualify.
+    """
+    if get_gfx() != "gfx950":
+        pytest.skip("opus varlen kernels require gfx950")
+    monkeypatch.setenv("AITER_ENABLE_FMHA_OPUS", "1" if enabled else "0")
+
+    seqlens = [256, 192, 320]
+    nheads, nheads_k = 8, 2
+    max_seqlen = max(seqlens)
+    # Keep the window under max_seqlen_k: the entry point folds a wider one away to -1,
+    # which would turn the windowed cases into plain causal before the gate sees them.
+    assert window_size[0] < max_seqlen
+
+    torch.manual_seed(0)
+    total = sum(seqlens)
+    cu_seqlens = torch.tensor(
+        [0] + list(itertools.accumulate(seqlens)), device="cuda", dtype=torch.int32
+    )
+    dtype = dtypes.bf16 if dtype_name == "bf16" else dtypes.fp16
+    q = torch.randn(total, nheads, hdim, device="cuda", dtype=dtype)
+    k = torch.randn(total, nheads_k, hdim, device="cuda", dtype=dtype)
+    v = torch.randn_like(k)
+
+    calls = _opus_varlen_dispatch_record(monkeypatch)
+    out = aiter.flash_attn_varlen_func(
+        q,
+        k,
+        v,
+        cu_seqlens,
+        cu_seqlens,
+        max_seqlen,
+        max_seqlen,
+        causal=causal,
+        window_size=window_size,
+    )
+
+    assert calls["n"] == (1 if expect_opus else 0), (
+        f"opus varlen entry called {calls['n']} times, expected "
+        f"{1 if expect_opus else 0}"
+    )
+    # Whichever backend took it must still produce a usable answer -- a gate that
+    # rejects a shape is only correct if something else handles it.
+    assert out.shape == (total, nheads, hdim)
+    assert torch.isfinite(out).all()
 
 
 # ---------------------------------------------------------------------------
