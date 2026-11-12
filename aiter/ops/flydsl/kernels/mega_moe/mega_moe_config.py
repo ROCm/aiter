@@ -46,14 +46,16 @@ KIMI_K3_EXPERTS_PER_RANK = 112
 # are tuned in their own right.
 R1_MODEL_DIM, R1_INTER_DIM = 7168, 2048
 V4_MODEL_DIM, V4_INTER_DIM = 7168, 3072
-# EP4 DeepSeek-V4.1-Flash: (world_size, experts_per_rank, model_dim, inter_dim).
+# EP4 / EP2 DeepSeek-V4.1-Flash: (world_size, experts_per_rank, model_dim, inter_dim).
 V41_FLASH_EP4_LAYOUT = (4, 96, 5120, 2304)
+V41_FLASH_EP2_LAYOUT = (2, 192, 5120, 2304)
 # (world_size, model_dim, inter_dim, experts, topk) of the layouts the fused (small- and large-input) kernels
-# serve: EP8 DeepSeek-V4-Pro and EP4 DeepSeek-V4.1-Flash.
+# serve: EP8 DeepSeek-V4-Pro and EP4 / EP2 DeepSeek-V4.1-Flash.
 FUSED_LAYOUTS = frozenset(
     {
         (8, V4_MODEL_DIM, V4_INTER_DIM, 8 * REFERENCE_EXPERTS_PER_RANK, 6),
         (4, 5120, 2304, 4 * 96, 6),
+        (2, 5120, 2304, 2 * 192, 6),
     }
 )
 K3_MODEL_DIM, K3_INTER_DIM = 3584, 3072
@@ -83,6 +85,8 @@ LARGE_M_MTPRS = (1024, 2048, 4096, 8192, 16384)
 # EP4 DeepSeek-V4.1-Flash takes its large-input tune at 8192 and 16384 only: on gfx950 the kernel faults
 # (illegal memory access) at 1024, 2048 and 4096.
 V41_FLASH_EP4_LARGE_M_MTPRS = (8192, 16384)
+# EP2 DeepSeek-V4.1-Flash takes its large-input tune at the capacities it was measured at.
+V41_FLASH_EP2_LARGE_M_MTPRS = (8192, 16384)
 # The fused kernels have no 2-token variant: 2 tokens take the 1-token config.
 FUSED_TOKEN_BUCKETS = tuple(b for b in TOKEN_BUCKETS if b != 2)
 # Below this many rows per rank the staged (or small-input) path is faster than
@@ -255,6 +259,10 @@ class FusedStage1Knobs:
     # Large-input lean parallel plan: a source writes each count word to its destination with this launch's tag in
     # the high half, and every plan wave spins on the words it reads (False: count_done flags + a barrier).
     tag_counts: bool = False
+    # Large-input dispatch with batch_rows: the token-scale reads (presend and payload copy) are bounded by the scale
+    # buffer, so the lanes past a row's scales read nothing (False: their masked loads read 2 GiB past the buffer,
+    # which faults where nothing is mapped there: EP2 at every token count).
+    bounded_scales: bool = False
     # Large-input dispatch with batch_rows: a route's histogram RMW result is its slot in a fixed-size per-expert
     # bucket of the pair order, so the order is complete with the histogram (False: prefix + a cursor RMW pass).
     bucket_pairs: bool = False
@@ -281,6 +289,10 @@ class FusedStage1Knobs:
     # (each reload's vmcnt(0) waits for the stores before it); all rows' LDS reads go first; the 4-lane max uses DPP.
     # Bit 1: SiLU as v_exp_f32 + v_rcp_f32 (no IEEE divide, no exp2 range fix).
     epi_lean: int = 0
+    # Small-input fused kernel: the GEMM bodies stream their weights at any routed-row count; only a hot expert
+    # (skewed routing) picks the cached-weight bodies (False: also from mega_moe_small_m._CACHED_W_MIN_ROWS routed
+    # rows, where the experts span enough m-tiles to reuse their weights).
+    stream_w: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -464,6 +476,8 @@ def large_m_mtprs_for(
     """
     if (world_size, model_dim, inter_dim) == (4, 5120, 2304):
         return V41_FLASH_EP4_LARGE_M_MTPRS
+    if (world_size, model_dim, inter_dim) == (2, 5120, 2304):
+        return V41_FLASH_EP2_LARGE_M_MTPRS
     return LARGE_M_MTPRS
 
 
@@ -1657,8 +1671,31 @@ def _tune_v41_flash_ep4_large(config: MegaMoEConfig) -> MegaMoEConfig:
     )
 
 
-def _is_v41_flash_ep4(world_size, experts_per_rank, model_dim, inter_dim) -> bool:
-    return (world_size, experts_per_rank, model_dim, inter_dim) == V41_FLASH_EP4_LAYOUT
+def _tune_v41_flash_ep2_small(config: MegaMoEConfig, bucket: int) -> MegaMoEConfig:
+    """EP2 DeepSeek-V4.1-Flash small-input kernel (192 experts per rank)."""
+    # The EP4 tune and its launch protocol (dedup rows, local plan, direct done, the tok_done counters and BF16
+    # head rows), with two changes it needs here: 32-row expert tiles at every bucket (8-16 rows an expert at
+    # 256-512 tokens: a 64-row tile would be mostly padding) and 96 producer CTAs (3 64-expert waves of the
+    # EP4 rule leave no consumers).
+    config = _tune_v41_flash_ep4_small(config, bucket)
+    return replace(
+        config,
+        stage1=replace(config.stage1, sort_block_m=32, num_dispatch_cu=96),
+        stage2=replace(config.stage2, block_m=32),
+    )
+
+
+def _tune_v41_flash_ep2_large(config: MegaMoEConfig) -> MegaMoEConfig:
+    """EP2 DeepSeek-V4.1-Flash large-input kernel (192 experts per rank)."""
+    # The EP4 tune with 96 producer CTAs (3 64-expert waves of the EP4 rule are 288, more than the CUs), and its
+    # batched dispatch's token-scale reads bounded by the scale buffer: unbounded, their masked lanes fault on EP2
+    # at every token count.
+    config = _tune_v41_flash_ep4_large(config)
+    return replace(
+        config,
+        stage1=replace(config.stage1, num_dispatch_cu=96),
+        fused_stage1=replace(config.fused_stage1, bounded_scales=True),
+    )
 
 
 @cache
@@ -1670,17 +1707,25 @@ def _fused_config(
     model_dim: int,
     inter_dim: int,
 ) -> MegaMoEConfig:
-    ep4 = _is_v41_flash_ep4(world_size, experts_per_rank, model_dim, inter_dim)
+    layout = (world_size, experts_per_rank, model_dim, inter_dim)
     expert_waves = (experts_per_rank + 63) // 64
     if mtpr in LARGE_M_MTPRS:
         config = _large_m_config(expert_waves)
-        return _tune_v41_flash_ep4_large(config) if ep4 else config
+        if layout == V41_FLASH_EP4_LAYOUT:
+            return _tune_v41_flash_ep4_large(config)
+        if layout == V41_FLASH_EP2_LAYOUT:
+            return _tune_v41_flash_ep2_large(config)
+        return config
     config = MegaMoEConfig(
         stage1=_small_m_stage1(bucket, expert_waves),
         stage2=_small_m_stage2(bucket),
         p2p_quant="none",
     )
-    return _tune_v41_flash_ep4_small(config, bucket) if ep4 else config
+    if layout == V41_FLASH_EP4_LAYOUT:
+        return _tune_v41_flash_ep4_small(config, bucket)
+    if layout == V41_FLASH_EP2_LAYOUT:
+        return _tune_v41_flash_ep2_small(config, bucket)
+    return config
 
 
 def select_fused_config(
@@ -1704,9 +1749,9 @@ def select_fused_config(
         raise ValueError(f"no small- or large-input config for mtpr={mtpr}")
     if not 0 <= tokens <= mtpr:
         raise ValueError(f"tokens={tokens} must be in [0, {mtpr}]")
-    if not 0 < experts_per_rank <= 128:
+    if not 0 < experts_per_rank <= 256:
         raise ValueError(
-            f"experts_per_rank must be in [1, 128], got {experts_per_rank}"
+            f"experts_per_rank must be in [1, 256], got {experts_per_rank}"
         )
     return _fused_config(
         nearest_token_bucket(max(tokens, 1), FUSED_TOKEN_BUCKETS),
