@@ -92,11 +92,13 @@ def test_a_fake_makes_the_op_opaque_and_the_region_one_graph():
         out = model(x)
         print("GRAPHS", len(graphs))
         print("CORRECT", bool(torch.allclose(out, x * 2 + 1)))
+        print("REGISTERED", isinstance(probe, torch._ops.OpOverloadPacket))
         """)
     assert (
         seen.get("GRAPHS") == "1"
     ), f"a registered routed op still compiled into {seen.get('GRAPHS')} graphs"
     assert seen.get("CORRECT") == "True"
+    assert seen.get("REGISTERED") == "True", "the op was not registered at all"
 
 
 def test_an_op_that_writes_through_an_argument_is_still_correct():
@@ -191,8 +193,12 @@ def test_an_op_registration_cannot_describe_stays_exactly_as_it_was():
             return x * 2
 
         x = torch.randn(8, 16)
-        print("NOFAKE_TRACED", not hasattr(no_fake, "_schema"))
-        print("NOANN_TRACED", not hasattr(no_annotation, "_schema"))
+        # `_schema` lives on an OpOverload, not on the packet `route` hands
+        # back, so asking for it answers False either way. The type is what
+        # actually distinguishes a registered op from a Python wrapper.
+        registered = torch._ops.OpOverloadPacket
+        print("NOFAKE_TRACED", not isinstance(no_fake, registered))
+        print("NOANN_TRACED", not isinstance(no_annotation, registered))
         print("NOFAKE_CORRECT", bool(torch.allclose(no_fake(x), x * 2)))
         print("NOANN_CORRECT", bool(torch.allclose(no_annotation(x), x * 2)))
         """)
