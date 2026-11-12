@@ -3,6 +3,7 @@
 """Layout-API MXFP4 MoE GEMM device body (BM32): gemm2 down."""
 
 import flydsl.compiler as flyc
+from flydsl._mlir.dialects import llvm
 import flydsl.expr as fx
 from flydsl.expr import arith as _arith
 from flydsl.expr import const_expr, gpu, range_constexpr, rocdl
@@ -20,6 +21,9 @@ from flydsl.expr.typing import Vector as Vec
 from flydsl.expr.typing import as_ir_value as _raw
 
 from .mxfp4_gemm_common import (
+    _buffer_rsrc,
+    _gep3,
+    _lds_ptr3,
     _e8m0_from_amax,
     _inline_dpp_pair_amax,
     _inline_dpp_quad_amax,
@@ -40,6 +44,33 @@ from .mxfp4_gemm_common import _lds_swizzle_mask as lds_swizzle_mask
 _FP8_E8M0_SHIFT = 7
 
 _G2_EPI_LANES = 32
+
+_SCOPE_CACHE = {}
+
+
+def lds_slot_scopes(n, tag):
+    """n LLVM alias scopes, one per LDS A slot: a read of slot s does not wait
+    for LDS DMAs into the other slots."""
+    from flydsl._mlir import ir
+
+    ctx = ir.Context.current
+    key = (id(ctx), tag, n)
+    if key not in _SCOPE_CACHE:
+        dom = f'#llvm.alias_scope_domain<id = distinct[0]<>, description = "{tag}">'
+        txt = "[" + ", ".join(
+            f"#llvm.alias_scope<id = distinct[{i + 1}]<>, domain = {dom}>"
+            for i in range(n)
+        ) + "]"
+        arr = ir.ArrayAttr(ir.Attribute.parse(txt))
+        scopes = [arr[i] for i in range(n)]
+        _SCOPE_CACHE[key] = [
+            (
+                ir.ArrayAttr.get([scopes[i]]),
+                ir.ArrayAttr.get([scopes[j] for j in range(n) if j != i]),
+            )
+            for i in range(n)
+        ]
+    return _SCOPE_CACHE[key]
 
 
 def bq_view(
@@ -168,6 +199,8 @@ def issue_a_load_lds_dt(
     K_BYTES,
     BM=32,
     resolved_rows=(),
+    scopes=None,
+    dup_tail=False,
 ):
     """A->LDS DMA for one K-tile; gemm2 A is the already-sorted row, OOB-zero via the flat buffer view bounds."""
     lanes_per_row = KH_TILE_A // 16  # 8 (fp4) / 16 (fp8)
@@ -195,8 +228,16 @@ def issue_a_load_lds_dt(
         n_row_groups = rows_per_wave // rows_per_call
     lane_col = (lane % lanes_per_row) * 16
     atom = lds_dma_atom_128()
+    rsrc = _buffer_rsrc(arg_aq, aq_num_records) if const_expr(scopes is not None) else None
 
     def _dma(voffset_bytes, off):
+        if const_expr(scopes is not None):
+            rocdl.raw_ptr_buffer_load_lds(
+                rsrc, _lds_ptr3(s_aq_base, off), fx.Int32(16), voffset_bytes,
+                fx.Int32(0), fx.Int32(0), fx.Int32(0),
+                alias_scopes=scopes[0], noalias_scopes=scopes[1],
+            )
+            return
         v_e = voffset_bytes.shrui(fx.Int32(2))
         fx.copy(
             atom, src[v_e, None], lds_dma_dst(s_aq_base, off, elem_ty=T.i32, align=16)
@@ -223,7 +264,15 @@ def issue_a_load_lds_dt(
         off = fx.Int32(slot * (BM * KH_TILE_A)) + lds_row * KH_TILE_A
         # The byte offset is non-negative and 4-byte aligned; avoid signed-division fixup VGPRs.
         _dma(voffset + kt * KH_TILE_A, off)
-    if const_expr(tail_rows > 0):
+    if const_expr(tail_rows > 0 and dup_tail):
+        n_tail = tail_rows // rows_per_call
+        lds_row = fx.Int32(BM - tail_rows) + (wave % fx.Int32(n_tail)) * rows_per_call
+        mask = lds_swizzle_mask_f8(lds_row + a_lane_row, KH_TILE_A)
+        sorted_row = m_row + lds_row + a_lane_row
+        voffset = (lane_col ^ mask) + sorted_row * K_BYTES
+        off = fx.Int32(slot * (BM * KH_TILE_A)) + lds_row * KH_TILE_A
+        _dma(voffset + kt * KH_TILE_A, off)
+    elif const_expr(tail_rows > 0):
         tail_w0 = 4 - tail_rows // rows_per_call
         if wave >= fx.Int32(tail_w0):
             lds_row = fx.Int32(BM - tail_rows) + (wave - fx.Int32(tail_w0)) * rows_per_call
@@ -291,6 +340,7 @@ def gemm2_body_v2(
     row_limit=None,
     e_in=None,
     prune=False,
+    b_lds=False,
 ):
     # EP32 fork: BM is the number of computed rows (16, 64 or 80), starting at
     # m_row_in inside the BLK-row sort layout. BM=80 covers a full block plus the
@@ -376,6 +426,10 @@ def gemm2_body_v2(
         for _ in range_constexpr(kMChunks)
     ]
 
+    ab_scopes = lds_slot_scopes(7, "ep32_abf") if const_expr(b_lds) else None
+    a_scopes = ab_scopes[:3] if const_expr(b_lds) else None
+    b_scopes = ab_scopes[3:] if const_expr(b_lds) else None
+
     def issue_a_load_lds(slot, kt):
         issue_a_load_lds_dt(
             arg_aq,
@@ -391,7 +445,27 @@ def gemm2_body_v2(
             K_BYTES,
             BM=BM,
             resolved_rows=resolved_input_rows,
+            scopes=a_scopes[slot] if const_expr(b_lds) else None,
+            dup_tail=b_lds,
         )
+
+    def a_slot_probe(slot):
+        # Every wave fences its DMA into this slot before sharing A. The
+        # slot scopes keep future A/B DMAs outside this wait.
+        llvm.load(
+            T.i32, _lds_ptr3(s_aq_base, fx.Int32(slot * slot_bytes)),
+            alignment=4, volatile_=True,
+            alias_scopes=a_scopes[slot][0], noalias_scopes=a_scopes[slot][1],
+        )
+
+    a_rd_bases = {}
+
+    def a_rd_base(k, h):
+        if const_expr((k, h) not in a_rd_bases):
+            mask = lds_swizzle_mask_f8(lane_mod_16, KH_TILE_A)
+            col = (lane_div_16 * 16 + k * 128 + h * 64) ^ mask
+            a_rd_bases[(k, h)] = _lds_ptr3(s_aq_base, lane_mod_16 * KH_TILE_A + col)
+        return a_rd_bases[(k, h)]
 
     def issue_a_ds_read(slot):
         # A ds-read for one slot into a_frags: fp8 -> i32<8:1> (two 128-K halves), fp4 -> i32<4:1>.
@@ -404,24 +478,34 @@ def gemm2_body_v2(
                     col0 = lane_div_16 * 16 + k * 128
                     col_lo = col0 ^ mask
                     col_hi = (col0 + 64) ^ mask
-                    lo = Vec(
-                        lds_vec_load(
-                            s_aq_base,
-                            row_off + col_lo,
+                    if const_expr(b_lds):
+                        # Constant GEP offsets fold into DS instructions;
+                        # avoid keeping one i64 address per slot/row alive.
+                        lo, hi = [Vec(llvm.load(
                             Vec.make_type(2, fx.Int64),
-                            fx.Int64,
-                            align=16,
+                            _gep3(a_rd_base(k, h), slot * slot_bytes + i * 16 * KH_TILE_A),
+                            alignment=16,
+                            alias_scopes=a_scopes[slot][0], noalias_scopes=a_scopes[slot][1],
+                        )) for h in (0, 1)]
+                    else:
+                        lo = Vec(
+                            lds_vec_load(
+                                s_aq_base,
+                                row_off + col_lo,
+                                Vec.make_type(2, fx.Int64),
+                                fx.Int64,
+                                align=16,
+                            )
                         )
-                    )
-                    hi = Vec(
-                        lds_vec_load(
-                            s_aq_base,
-                            row_off + col_hi,
-                            Vec.make_type(2, fx.Int64),
-                            fx.Int64,
-                            align=16,
+                        hi = Vec(
+                            lds_vec_load(
+                                s_aq_base,
+                                row_off + col_hi,
+                                Vec.make_type(2, fx.Int64),
+                                fx.Int64,
+                                align=16,
+                            )
                         )
-                    )
                     a64 = Vec.from_elements([lo[0], lo[1], hi[0], hi[1]], fx.Int64)
                     a_frags[i][k].store(a64.bitcast(fx.Int32))
                 else:
@@ -682,6 +766,7 @@ def gemm2_body_v2(
             reduce_store_cache_modifier=reduce_store_cache_modifier,
             write_limit=write_limit,
             row_limit=row_limit,
+            opaque_tid=b_lds,
             **kw,
         )
 
@@ -806,6 +891,88 @@ def gemm2_body_v2(
                     issued = kt + kStages
                 mfma_cluster(cur_bqf, bs[kt], sa[kt], fx.Int32(kt))
                 cur_bqf, nxt_bqf = nxt_bqf, cur_bqf
+    elif const_expr(b_lds):
+        # Three 10 KiB A slots and three 16 KiB B slots fit two WGs/CU.
+        # A and B are both issued two steps ahead, in that order. Scopes
+        # let current-slot DS reads wait without draining future DMAs.
+        assert BM == 80 and BN == 256 and BK == 128 and aStages == 3
+        KT = K_TILES_MAX
+        B_SLOT = BN * KH_TILE_A // 2
+        b_base = aStages * slot_bytes
+        KB_B = _udiv(K_rt, fx.Int32(2))
+        b_row0 = e * N_OUT_rt + n_block_idx * BN + wave * (BN // 4)
+        b_rsrc = _buffer_rsrc(
+            fx.Int64(arg_bq) + fx.Int64(rocdl.readfirstlane(T.i32, _raw(b_row0))) * fx.Int64(KB_B),
+            fx.Int64(fx.Int32(BN // 4) * KB_B),
+        )
+        lane16 = lane * fx.Int32(16)
+        bsf_slots = [make_scale_fragments(nPairs) for _ in range_constexpr(2)]
+        saf_slots = [make_scale_fragments(kScaleSubBlocks) for _ in range_constexpr(2)]
+        bqf = make_bq_fragments()
+        b_rd_base = _lds_ptr3(s_aq_base, wave * fx.Int32(BN // 4 * 64) + lane16)
+        for k in range_constexpr(kHalves):
+            for h in range_constexpr(2):
+                a_rd_base(k, h)
+
+        def issue_b_dma(t):
+            slot = t % 3
+            for J in range_constexpr(numAccN):
+                off = fx.Int32(b_base + slot * B_SLOT + J * 1024) + wave * fx.Int32(BN // 4 * 64)
+                voff = lane16 + fx.Int32(J * 16) * KB_B + fx.Int32(t * 1024)
+                rocdl.raw_ptr_buffer_load_lds(
+                    b_rsrc, _lds_ptr3(s_aq_base, off), fx.Int32(16), voff,
+                    fx.Int32(0), fx.Int32(0), fx.Int32(0),
+                    alias_scopes=b_scopes[slot][0], noalias_scopes=b_scopes[slot][1],
+                )
+
+        def read_b(t):
+            slot = t % 3
+            for J in range_constexpr(numAccN):
+                v = llvm.load(
+                    T.vec(4, T.i32), _gep3(b_rd_base, b_base + slot * B_SLOT + J * 1024),
+                    alignment=16,
+                    alias_scopes=b_scopes[slot][0], noalias_scopes=b_scopes[slot][1],
+                )
+                bqf[J][0].store(Vec(v))
+
+        def issue_tile(t):
+            if const_expr(t < KT):
+                issue_a_load_lds(t % 3, fx.Int32(t))
+                issue_b_dma(t)
+                if const_expr(t % 2 == 0):
+                    c = t // 2
+                    issue_bscale_into(bsf_slots[c % 2], scale_chunk_tile(fx.Int32(t)))
+                    sa = load_a_scale_tile(fx.Int32(t))
+                    for sub in range_constexpr(kScaleSubBlocks):
+                        saf_slots[c % 2][sub].store(Vec.from_elements([sa[sub]], Int32))
+
+        for t in range_constexpr(2):
+            issue_tile(t)
+        rocdl.sched_barrier(0)
+        for kt in range_constexpr(KT):
+            kt_rt = fx.Int32(kt)
+            slot = kt % 3
+            a_slot_probe(slot)
+            rocdl.sched_barrier(0)
+            rocdl.s_barrier()
+            rocdl.sched_barrier(0)
+            issue_a_ds_read(slot)
+            read_b(kt)
+            rocdl.sched_barrier(0)
+            issue_tile(kt + 2)
+            rocdl.sched_barrier(0)
+            c = kt // 2
+            sa = [Vec(saf_slots[c % 2][sub].load())[0] for sub in range_constexpr(kScaleSubBlocks)]
+            interleave = None
+            if const_expr(kt == KT - 1):
+                rocdl.s_waitcnt(vmcnt=0, lgkmcnt=0)
+                gpu.barrier()
+                interleave = epi_thunks
+            rocdl.sched_barrier(0)
+            rocdl.s_setprio(1)
+            mfma_cluster(bqf, bsf_slots[c % 2], sa, kt_rt, interleave=interleave)
+            rocdl.s_setprio(0)
+            rocdl.sched_barrier(0)
     else:
         KT = K_TILES_MAX
         for i in range_constexpr(kMChunks):
@@ -958,9 +1125,19 @@ def atomic_bf16_epilog(
     reduce_store_cache_modifier=None,
     write_limit=None,
     row_limit=None,
+    opaque_tid=False,
 ):
     if SBM is None:
         SBM = BM
+
+    def opaque_thread_id():
+        # Recompute epilogue lane arithmetic after the K loop rather than
+        # keeping the prologue's address expressions live throughout it.
+        return fx.Int32(llvm.inline_asm(
+            T.i32, [_raw(fx.Int32(gpu.thread_id("x")))],
+            "v_mov_b32 $0, $1", "=v,v", has_side_effects=True,
+        ))
+
     EPI_LANES = _G2_EPI_LANES if g2_epi_lanes is None else int(g2_epi_lanes)
     EPI_ROWS = 256 // EPI_LANES
     M_REPS = BM // EPI_ROWS
@@ -984,7 +1161,7 @@ def atomic_bf16_epilog(
         else None
     )
 
-    tx_i32 = fx.Int32(gpu.thread_id("x"))
+    tx_i32 = opaque_thread_id() if const_expr(opaque_tid and lds_ready) else fx.Int32(gpu.thread_id("x"))
     m_lane = tx_i32 // EPI_LANES
     n_lane = tx_i32 % EPI_LANES
     if reduce_store_cache_modifier is not None and (
@@ -1052,9 +1229,17 @@ def atomic_bf16_epilog(
         if const_expr(emit_thunks is None):
             gpu.barrier()
         if const_expr(g2_bf16_lds):
+            fresh_lane = {}
 
             def _write_i(i, only_j=None):
-                row_base = fx.Int32(i * 16) + lane_div_16 * 4
+                if const_expr(opaque_tid):
+                    if const_expr("lane" not in fresh_lane):
+                        tx = opaque_thread_id()
+                        fresh_lane["lane"] = ((tx % 64) // 16, tx % 16)
+                    ld16, lm16 = fresh_lane["lane"]
+                else:
+                    ld16, lm16 = lane_div_16, lane_mod_16
+                row_base = fx.Int32(i * 16) + ld16 * 4
                 w_row = (
                     None
                     if const_expr(defer_w)
@@ -1066,7 +1251,7 @@ def atomic_bf16_epilog(
                 for J in range_constexpr(numAccN):
                     if const_expr(only_j is not None and J != only_j):
                         continue
-                    col = wave * wave_n + J * 16 + lane_mod_16
+                    col = wave * wave_n + J * 16 + lm16
                     vec = (
                         Vec(accm[i][J].load())
                         if const_expr(emit_thunks is not None)
@@ -1548,11 +1733,12 @@ def compile_gemm2_ep32(
     KH_TILE_A = BK
     ROWS = 80  # every tile runs the 80-row body (see header)
     aStages = 3
-    lds_bytes = max(ROWS * BN * 2, aStages * ROWS * KH_TILE_A)  # bf16 C staging / A slots
+    use_b_lds = not use_nt and INTER_MAX == 3072
+    lds_bytes = max(ROWS * BN * 2, aStages * ROWS * KH_TILE_A + (3 * BN * BK // 2 if use_b_lds else 0))
     WAVES_PER_EU = 2
     name = (
         f"gemm2_ep32_a8w4_hmax{HIDDEN_MAX}_imax{INTER_MAX}_g{GRID_WGS}{f'_sp{SPART}' if SPART else ''}{'_pr' if PRUNE else ''}"
-        f"{'_nt' if use_nt else ''}{'_valid_tokens' if use_valid_token_count else ''}"
+        f"{'_nt' if use_nt else ''}{'_valid_tokens' if use_valid_token_count else ''}{'_blds2' if use_b_lds else ''}"
     )
 
     @fx.struct
@@ -1586,7 +1772,7 @@ def compile_gemm2_ep32(
     ):
         k_bytes = i32_inter
         aq_num = fx.Int64(i32_max_m_blocks) * fx.Int64(BLK) * fx.Int64(k_bytes)
-        for slot in range_constexpr(kStages):
+        for slot in range_constexpr(0 if use_b_lds else kStages):
             issue_a_load_lds_dt(
                 arg_aq,
                 aq_num,
@@ -1653,6 +1839,7 @@ def compile_gemm2_ep32(
             row_limit=ROW_LIMIT,
             e_in=e_cur,
             prune=PRUNE,
+            b_lds=use_b_lds,
         )
 
     @flyc.kernel(name=name, known_block_size=[256, 1, 1])
