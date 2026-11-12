@@ -229,9 +229,6 @@ _LAZY_IMPORTS = {
     "qsa_indexer_block_ids": (".qsa_paged", "qsa_indexer_block_ids"),
     "flydsl_qsa_paged_gqa": (".qsa_paged", "flydsl_qsa_paged_gqa"),
     "qsa_layer": (".qsa_paged", "qsa_layer"),
-    # Aliases kept for one release.
-    "qsa_k1_block_ids": (".qsa_paged", "qsa_indexer_block_ids"),
-    "qsa_k2": (".qsa_paged", "flydsl_qsa_paged_gqa"),
     "sparse_pa_nvfp4_decode": (
         ".kernels.sparse_pa_nvfp4_decode",
         "sparse_pa_nvfp4_decode",
@@ -316,8 +313,6 @@ __all__ = [
     "prepare_gemm_a16wfp4_weight",
     "prepare_pa_decode_plan",
     "qsa_indexer_block_ids",
-    "qsa_k1_block_ids",
-    "qsa_k2",
     "qsa_layer",
     "sparse_pa_nvfp4_decode",
     "sparse_pa_nvfp4_decode_alloc",
