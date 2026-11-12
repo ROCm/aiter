@@ -421,16 +421,6 @@ def build_gemm_a8w4_tdm_task(
                 "ep_quant_bits requires wmma_n_rep % "
                 f"{WN_PER_MX_BLOCK_EP} == 0, got {tile_n // n_warp // 16}"
             )
-    # Match group boundaries to the fixed 256^3 AABB register layout.
-    bank_aligned_groups = bool(
-        (tile_m, tile_n, tile_k, m_warp, n_warp) == (256, 256, 256, 2, 2)
-        and USE_EXPLICIT_VGPR_PARTITION
-        and a_is_fp4
-        and KWS == 2
-        and sched_ds_group > 0
-        and n_acc == 32
-        and ((wmma_m_rep + 1) // 2) * wmma_n_rep == 16
-    )
     output_n_rep = warp_tile_n // 16
     num_waves = m_warp * n_warp
     block = num_waves * k_waves * WAVE
@@ -596,11 +586,8 @@ def build_gemm_a8w4_tdm_task(
     _persistent = f"_pw{persistent_workers}" if persistent_workers else ""
     _drain = "_rolleddrain" if rolled_drain else ""
     _wmma_2x4 = "_wmma2x4_order" if wmma_2x4 else ""
-    _prefence = f"_wmma_in_barrier{wmma_in_barrier}" if wmma_in_barrier != 4 else ""
-    if bank_aligned_groups:
-        _prefence += "_bankgroups"
-    if bank_aligned_groups and ksl0_fence_mma != 8:
-        _prefence += f"_ksl0fence{ksl0_fence_mma}"
+    _prefence = f"_prebarrier{ksl1_prefence_mma}_barrier{wmma_in_barrier}"
+    _prefence += f"_ksl0tail_{ksl0_fence_mma}"
     if a_is_fp4 and KWS > 1 and ksl0_prefix_mma:
         _prefence += f"_ksl0prefix{ksl0_prefix_mma}"
     _prefence += "_ab2"
@@ -1470,7 +1457,7 @@ def build_gemm_a8w4_tdm_task(
         # Small tiles can have n_acc as low as the tail, so clamp it to keep at
         # least one group for the interleaved part.
         FENCE_COVER_MMA = min(
-            ksl0_fence_mma if bank_aligned_groups else 8,
+            ksl0_fence_mma,
             max(0, n_acc - sched_mma_group),
         )
 
