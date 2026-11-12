@@ -139,7 +139,10 @@ def compile_gemm_a16w16_skinny_gfx950(
     block_k: int,
     stages: int,
     k_waves: int,
+    bpreshuffle: bool = False,
 ):
+    if bpreshuffle and (block_n % 16 or k % 32):
+        raise ValueError("AITER BF16 shuffle requires block_n % 16 == K % 32 == 0")
     TA, TN, KC, K_WAVES = block_m, block_n, block_k, k_waves
     # TA = A rows staged; TM = MFMA rows (TA rounded up to 16). MFMA rows in
     # [TA, TM) read other LDS rows, but they only feed C rows >= m, which the
@@ -181,6 +184,8 @@ def compile_gemm_a16w16_skinny_gfx950(
         buf: fx.Array[fx.BFloat16, LDS_ELEMS, 16]
 
     KERNEL_NAME = f"hgemm_bf16_skinny_t{TA}x{TN}x{KC}x{ST}_w1x1x{K_WAVES}"
+    if bpreshuffle:
+        KERNEL_NAME += "_bshuffle"
 
     def mfma(a_fr, b_fr, acc):
         # raw intrinsic: the fragments come straight out of the swizzled LDS
@@ -250,7 +255,16 @@ def compile_gemm_a16w16_skinny_gfx950(
                 g = (r * k + k0 + c * DMA_VEC) * 2
             else:
                 # relative to b_rsrc, which is already based at slab n0
-                g = ((r - TA) * k + k0 + c * DMA_VEC) * 2
+                if const_expr(bpreshuffle):
+                    row, col = r - TA, k0 + c * DMA_VEC
+                    g = (
+                        (row // 16 * (k // 32) + col // 32) * 512
+                        + col % 32 // 8 * 128
+                        + row % 16 * 8
+                        + col % 8
+                    ) * 2
+                else:
+                    g = ((r - TA) * k + k0 + c * DMA_VEC) * 2
             return fx.Int32(g)
 
         vofs = [None] * IPC
@@ -276,7 +290,16 @@ def compile_gemm_a16w16_skinny_gfx950(
                 # have to be unwrapped here.
                 llvm.InlineAsmOp(
                     None,
-                    [lds_p, vofs[i].ir_value(), rsrc, chunk_soff[j].ir_value()],
+                    [
+                        lds_p,
+                        vofs[i].ir_value(),
+                        rsrc,
+                        (
+                            fx.Int32(j * KC * 32)
+                            if const_expr(bpreshuffle and i >= A_INSTS)
+                            else chunk_soff[j]
+                        ).ir_value(),
+                    ],
                     "s_mov_b32 m0, $0\n\tbuffer_load_dwordx4 $1, $2, $3 offen"
                     + cpol
                     + " lds",
@@ -441,6 +464,7 @@ def gemm_a16w16_skinny(
     k_waves: int,
     out: torch.Tensor | None = None,
     stream: torch.cuda.Stream | None = None,
+    bpreshuffle: bool = False,
 ) -> torch.Tensor:
     """out[m, n] = a[m, k] @ b[n, k]^T on the skinny kernel; bf16 only, no bias."""
     if a.dtype != torch.bfloat16 or b.dtype != torch.bfloat16:
@@ -485,6 +509,7 @@ def gemm_a16w16_skinny(
         int(block_k),
         int(stages),
         int(k_waves),
+        bpreshuffle=bpreshuffle,
     )
     launch_stream = (
         torch.cuda.current_stream(device=a.device) if stream is None else stream

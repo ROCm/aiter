@@ -26,7 +26,7 @@ from torch import Tensor
 from aiter import dtypes, gemm_a16w16_asm, hipb_create_extension, hipb_mm, logger
 from aiter.jit.core import AITER_CONFIGS, AITER_LOG_TUNED_CONFIG
 from aiter.jit.utils.build_targets import base_gfx_arch
-from aiter.jit.utils.chip_info import get_cu_num, get_gfx
+from aiter.jit.utils.chip_info import get_cu_num, get_gfx, get_gfx_runtime
 from aiter.jit.utils.torch_guard import torch_compile_guard
 from aiter.ops.gemm_op_common import get_padded_m
 
@@ -130,7 +130,8 @@ def get_GEMM_A16W16_tuned_config(
     cu_num = get_cu_num() if cu_num is None else cu_num
     padded_M = M
     config = None
-    gfx = get_gfx() if gfx is None else gfx
+    if gfx is None:
+        gfx = get_gfx_runtime() if bpreshuffle else get_gfx()
     # A0 bring-up: a gfx1250-strict build has no tuned rows of its own; reuse
     # the gfx1250 family rows for coverage (perf parity is a later follow-up).
     # An exact strict row still wins when one exists; the guard keeps the scan
@@ -166,7 +167,21 @@ def get_GEMM_A16W16_tuned_config(
                 )
                 # None means the tuned CSV names a kernel absent from this
                 # catalog version; it is unrelated to FlyDSL import availability.
-                if flydsl_config is None:
+                if flydsl_config is None or (
+                    bpreshuffle
+                    and (
+                        flydsl_config["policy"] not in ("ft", "sk")
+                        or (
+                            flydsl_config["policy"] == "ft"
+                            and (
+                                flydsl_config["split_k"] != 1
+                                or flydsl_config["k_waves"] != 1
+                            )
+                        )
+                        or gfx != "gfx950"
+                        or str(dtype) != str(dtypes.bf16)
+                    )
+                ):
                     logger.warning(
                         f"FlyDSL kernel '{config['kernelName']}' from tuned config is not "
                         "recognized by the current catalog; falling back to next candidate."
@@ -257,7 +272,8 @@ def get_GEMM_A16W16_config(
     cu_num: int | None = None,
 ):
     cu_num = get_cu_num() if cu_num is None else cu_num
-    gfx = get_gfx() if gfx is None else gfx
+    if gfx is None:
+        gfx = get_gfx_runtime() if bpreshuffle else get_gfx()
     config = get_GEMM_A16W16_tuned_config(
         M, N, K, bias, dtype, otype, scaleAB, bpreshuffle, gfx, cu_num
     )
@@ -418,7 +434,10 @@ def _gemm_a16w16(
             inp_view = A.view(-1, A.size(-1))
             batched = True
         except RuntimeError:
-            return _into(out, F.linear(A, B, bias))
+            if not bpreshuffle:
+                return _into(out, F.linear(A, B, bias))
+            inp_view = A.reshape(-1, A.size(-1))
+            batched = True
     else:
         inp_view = A
         batched = False
@@ -432,7 +451,8 @@ def _gemm_a16w16(
 
     gfx, cu_num = _device_arch_and_cu(inp_view.device)
     if gfx not in SUPPORTED_OPUS_ARCHES:
-        gfx, cu_num = get_gfx(), get_cu_num()
+        gfx = get_gfx_runtime() if bpreshuffle else get_gfx()
+        cu_num = get_cu_num()
     config = get_GEMM_A16W16_config(
         M=m,
         N=n,
@@ -711,6 +731,7 @@ def flydsl_gemm(
         b_non_temporal=flydsl_config["b_non_temporal"],
         policy=policy,
         out_dtype=None if skinny else otype,
+        bpreshuffle=bpreshuffle,
     )
 
     if bias is not None and fused_bias is None:
