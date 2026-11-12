@@ -43,9 +43,10 @@ class DualwaveFp8GemmHelper(DualwaveFp8KernelContext):
         )
 
     def _pack_fp8_i32x8(self, f32_vals):
+        """len(f32_vals) // 4 packed fp8 words (eight for a full P tile)."""
         c0 = llvm.mlir_poison(T.i32)
         words = []
-        for g in range_constexpr(8):
+        for g in range_constexpr(len(f32_vals) // 4):
             base = g * 4
             w = rocdl.cvt_pk_fp8_f32(
                 T.i32,
@@ -189,6 +190,25 @@ class DualwaveFp8GemmHelper(DualwaveFp8KernelContext):
                 ]
             packed = Vec.from_elements(reordered, fx.Int32).ir_value()
         return packed
+
+    def cast_p_fp8_half(self, v_p, half):
+        """Words [4 half, 4 half + 4) of cast_p_fp8_direct's packing, anchored; k_rows_permuted only.
+
+        Packing P in two anchored halves lets a caller place work (the V reads) between them, so half of
+        P's fp32 copy is dead before that work's results land.
+        """
+        lo_partial_list, hi_full = v_p
+        src = hi_full if half else lo_partial_list
+        f32 = []
+        for pks in range_constexpr(self.traits.PV_K_STEPS):
+            f32 += [src[pks * 8 + s] for s in range_constexpr(8)]
+        return Vec(_anchor_i32x8(self._pack_fp8_i32x8(f32)))
+
+    def join_p_fp8_halves(self, lo, hi):
+        return Vec.from_elements(
+            [lo[i] for i in range_constexpr(4)] + [hi[i] for i in range_constexpr(4)],
+            fx.Int32,
+        ).ir_value()
 
     def _pv_fp8_direct(self, p_fp8, v_v, v_o):
         v_o = _anchor_v_o(self.traits, v_o)

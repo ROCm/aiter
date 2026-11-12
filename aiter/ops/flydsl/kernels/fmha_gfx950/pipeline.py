@@ -108,7 +108,7 @@ def _anchor_scalar_f32(x):
 
 
 def _anchor_i32x8(v):
-    """Pin a packed i32x8 operand at the current source position (no-op asm; no stable scheduling anchor)."""
+    """Pin a packed i32 vector operand at the current source position (no-op asm; no stable scheduling anchor)."""
     v_ir = as_mlir_value(v)
     return llvm.inline_asm(v_ir.type, [v_ir], "", "=v,0", has_side_effects=True)
 
