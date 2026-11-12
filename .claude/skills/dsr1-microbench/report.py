@@ -75,9 +75,9 @@ OPS = [
             "seqlens, True, 'randn')"
         ),
         "how": (
-            "asm is fmha_fwd_with_sink_varlen_asm; public is flash_attn_varlen_func, "
-            "the call ATOM makes (the asm kernel plus one torch copy). DSR1 prefill "
-            "never takes FlyDSL, so the UT's FlyDSL candidate is switched off. "
+            "Times are the asm kernel ATOM reaches through flash_attn_varlen_func. "
+            "DSR1 prefill never takes FlyDSL, so the UT's FlyDSL candidate is "
+            "switched off. "
             "ATOM calls it with causal=True; causal=False is only on the "
             "chunked-context paths, which the recipe (prefix caching and chunked "
             "prefill off) never reaches."
@@ -239,11 +239,7 @@ def render(run_dir):
     krows = (
         [("MoE", *k) for k in kernels(moe, "kernel", lambda r: f"bs {r['token']}")]
         + [("MLA decode", *k) for k in kernels(dec, "kernel", lambda r: "")]
-        + [
-            (f"MLA prefill {b}", *k)
-            for b in ("asm", "public")
-            for k in kernels(pre, f"{b} kernel", lambda r: "")
-        ]
+        + [("MLA prefill", *k) for k in kernels(pre, "asm kernel", lambda r: "")]
     )
     out.append("<h3>Kernels</h3>")
     out.append(
@@ -348,13 +344,12 @@ def render(run_dir):
     ]
     if any("seq_len" in r for r in pre):
         cols = [("seq len", lambda r: f"{r['seq_len']:,}", "n")] + cols
-    for b, label in (("asm", "asm"), ("public", "public")):
-        cols += [
-            (f"{label} us", lambda r, b=b: num(r.get(f"{b} us")), "n"),
-            (f"{label} TFLOPS", lambda r, b=b: num(r.get(f"{b} TFLOPS")), "n"),
-        ]
-    cols.append(("asm TB/s", lambda r: num(r.get("asm TB/s"), 2), "n"))
-    cols.append(("Error", lambda r: r.get("err_msg", ""), ""))
+    cols += [
+        ("us", lambda r: num(r.get("asm us")), "n"),
+        ("TFLOPS", lambda r: num(r.get("asm TFLOPS")), "n"),
+        ("TB/s", lambda r: num(r.get("asm TB/s"), 2), "n"),
+        ("Error", lambda r: r.get("err_msg", ""), ""),
+    ]
     out.append(table(cols, pre))
 
     out.append("<h2>Notes</h2><ul>")
