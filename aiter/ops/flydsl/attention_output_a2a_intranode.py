@@ -75,8 +75,10 @@ class AttentionOutputA2AIntraNodeOp:
     activation layout consumed by the following output projection:
 
     - ``e4m3``: BSHD payload with one FP32 descale per 128-wide head vector,
-      byte-identical to aiter's per_1x128 quantizer, also for NaN and infinite
-      inputs.
+      byte-identical to aiter's per_1x128 quantizer for finite, infinite and
+      quiet-NaN inputs. A signalling NaN, which arithmetic never produces, can
+      get a different scale: per_1x128 skips it like a quiet NaN, while here it
+      resets the running maximum it is folded into.
     - ``e4m3_external_scale``: BSHD payload quantized with a caller-provided
       FP32 descale per destination rank, as TorchAO's dynamic per-tensor
       activation quantization does: ``payload = clamp(x / destination_scales[dst])``

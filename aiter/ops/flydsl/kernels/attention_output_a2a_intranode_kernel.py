@@ -16,7 +16,6 @@ from .communication_ops_utils import wave_uniform_i64
 from .quant_utils import emit_f32_to_fp8
 from .tensor_shim import buf_copy_load, buf_copy_store, ptr_buf_tensor
 
-_JIT_CACHE_TAG = "attention_output_a2a_intranode"
 _ROWS_PER_WAVE = 4
 _LANES_PER_ROW = 16
 _VALUES_PER_LANE = 8
@@ -221,8 +220,8 @@ def make_attention_output_a2a_kernel(
                     for index in range_constexpr(_VALUES_PER_LANE)
                 ]
             else:
-                # aiter's per_1x128 quantizer: an amax that ignores NaN, and a clamp
-                # that saturates NaN to -fp8_max as its v_med3_f32 does.
+                # aiter's per_1x128 quantizer: an amax that ignores quiet NaNs, and a
+                # clamp that saturates NaN to -fp8_max as its v_med3_f32 does.
                 amax = fx.Float32(_AMAX_FLOOR)
                 for index in range_constexpr(_VALUES_PER_LANE):
                     amax = fx.maxnumf(amax, fmath.absf(values[index]))
@@ -534,20 +533,6 @@ def make_attention_output_packed_copy_jit(
     completion = make_attention_a2a_completion_kernel(
         rank=rank, npes=npes, spin_timeout_iters=spin_timeout_iters
     )
-    key = (
-        "packed_copy",
-        rank,
-        npes,
-        seq_local,
-        heads_local,
-        head_dim,
-        block_num,
-        warp_num_per_block,
-        arch,
-        codec,
-        spin_timeout_iters,
-        _JIT_CACHE_TAG,
-    )
 
     @flyc.jit
     def launch(
@@ -560,7 +545,6 @@ def make_attention_output_packed_copy_jit(
         addr_xdb_flag: fx.Int64,
         stream: Stream = Stream(None),  # noqa: B008
     ):
-        _ = key
         payload(
             addr_source_payload,
             addr_source_scale,
@@ -610,19 +594,6 @@ def make_attention_output_a2a_jit(
     completion = make_attention_a2a_completion_kernel(
         rank=rank, npes=npes, spin_timeout_iters=spin_timeout_iters
     )
-    key = (
-        rank,
-        npes,
-        seq_local,
-        heads_local,
-        head_dim,
-        block_num,
-        warp_num_per_block,
-        arch,
-        codec,
-        spin_timeout_iters,
-        _JIT_CACHE_TAG,
-    )
 
     @flyc.jit
     def launch(
@@ -635,7 +606,6 @@ def make_attention_output_a2a_jit(
         addr_xdb_flag: fx.Int64,
         stream: Stream = Stream(None),  # noqa: B008
     ):
-        _ = key
         payload(
             addr_input,
             addr_input_scale,

@@ -746,7 +746,7 @@ def _output_worker(rank, world, args):
                 records, world, gfx, args, time.perf_counter() - start
             )
             print(report, flush=True)
-            output = f"/tmp/bench_attention_output_a2a_w{world}.md"
+            output = f"/tmp/bench_attention_a2a_output_w{world}.md"
             with open(output, "w", encoding="utf-8") as handle:
                 handle.write(report + "\n")
             print(f"Wrote {output}", flush=True)
