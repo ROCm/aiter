@@ -18,19 +18,21 @@ Run:
 
 import argparse
 import itertools
+from unittest.mock import patch
 
 import pandas as pd
 import torch
 
 import aiter
 from aiter import dtypes
-from aiter.jit.utils.chip_info import get_gfx
+from aiter.jit.utils.chip_info import get_gfx, get_gfx_runtime
 from aiter.ops.flydsl import flydsl_hgemm
 from aiter.ops.flydsl.gemm_a16w16_band import band_stream_config
 from aiter.ops.flydsl.gemm_kernels import (
     flydsl_hgemm_kernel_name,
     get_flydsl_hgemm_kernel_params,
 )
+from aiter.ops.shuffle import shuffle_weight
 from aiter.test_common import (
     benchmark,
     checkAllclose,
@@ -80,6 +82,11 @@ _TUNED = [
     (32, 2880, 2048, 32, 32, 64, 8, 2, 1, 2, 1, 0, False),
 ]
 _CONCURRENT_COPY_MNK = [(8192, 8192, 128)]
+# GLM-5.3 / K3.1 Pro indexer wq_b: N = 32 heads * 128, K = q_lora_rank.
+_PRESHUFFLE_MNK = [(m, 4096, k) for m in (6, 32, 512) for k in (1536, 2048)] + [
+    (33, 80, 1536),
+    (513, 4112, 2048),
+]
 
 # Skinny ("sk") policy: one workgroup per block_n columns with the full K, which
 # k_waves waves split; no split_k, M/N waves or group_m.
@@ -187,6 +194,118 @@ def _tile_for(m, n, k, policy, split_k):
 def run_torch(a, w, dtype):
     # Reference only: fp32 math, cast back. Not timed, not in the table.
     return torch.mm(a.to(dtypes.fp32), w.t().to(dtypes.fp32)).to(dtype)
+
+
+@benchmark()
+def test_hgemm_preshuffle(m, n, k, dtype):
+    """One AITER weight layout for a native BF16 GEMM and a Mono indexer."""
+    torch.manual_seed(SEED)
+    a = torch.randn(m, k, dtype=dtype, device="cuda") * 0.1
+    raw = torch.randn(n, k, dtype=dtype, device=a.device) * 0.1
+    weight = shuffle_weight(raw)
+    out = torch.full((m, n), float("nan"), dtype=dtype, device=a.device)
+    config = {
+        "block_m": (8 if m <= 8 else 32) if m <= 32 else 128,
+        "block_n": 16 if m <= 32 else 128,
+        "block_k": 64,
+        "stages": 3 if m <= 32 else 2,
+        "m_waves": 1 if m <= 32 else 2,
+        "n_waves": 1 if m <= 32 else 2,
+        "k_waves": 4 if m <= 32 else 1,
+        "policy": "sk" if m <= 32 else "ft",
+    }
+
+    def eager():
+        return flydsl_hgemm(a, weight, out=out, bpreshuffle=True, **config)
+
+    eager()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        eager()
+    a.mul_(0.75)
+    out.fill_(float("nan"))
+    ref = run_torch(a, raw, dtype)
+
+    def replay():
+        graph.replay()
+        return out
+
+    ret = {"gfx": get_gfx_runtime()}
+    flops = 2 * m * n * k
+    nbytes = (m * k + n * k + m * n) * 2
+    for name, fn in {"preshuffle_graph": replay, "preshuffle": eager}.items():
+        actual, us = run_perftest(fn)
+        assert actual.data_ptr() == out.data_ptr()
+        err = checkAllclose(ref.float(), actual.float(), atol=0.003, rtol=0.02)
+        assert err == 0
+        ret.update(
+            {
+                f"{name} us": us,
+                f"{name} TFLOPS": flops / us / 1e6,
+                f"{name} TB/s": nbytes / us / 1e6,
+                f"{name} err": err,
+            }
+        )
+    return ret
+
+
+def check_preshuffle_compiled_dispatch():
+    """A strided 3D input must not send shuffled bytes through F.linear."""
+    from aiter import tuned_gemm as tg
+
+    a = torch.randn(2, 3, 1536, dtype=dtypes.bf16, device="cuda").transpose(0, 1)
+    raw = torch.randn(4096, 1536, dtype=a.dtype, device=a.device) * 0.02
+    weight = torch.nn.Parameter(shuffle_weight(raw), requires_grad=False)
+    weight.is_shuffled = True
+    out = torch.empty(3, 2, 4096, dtype=a.dtype, device=a.device)
+    config = {
+        "block_m": 8,
+        "block_n": 16,
+        "block_k": 64,
+        "stages": 3,
+        "split_k": 1,
+        "m_waves": 1,
+        "n_waves": 1,
+        "k_waves": 4,
+        "group_m": 0,
+        "policy": "sk",
+    }
+    name = flydsl_hgemm_kernel_name(
+        dtype=a.dtype,
+        out_dtype=a.dtype,
+        config=config,
+        has_bias=False,
+        target_gfx="gfx950",
+    )
+
+    def lookup(**kwargs):
+        assert kwargs["bpreshuffle"]
+        return {"libtype": "flydsl", "solidx": 0, "kernelName": name}
+
+    compiled = torch.compile(lambda x, w, y: tg.tgemm.mm(x, w, out=y), fullgraph=True)
+    with patch.object(tg, "get_GEMM_A16W16_config", lookup):
+        compiled(a, weight, out)
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            compiled(a, weight, out)
+        a.neg_()
+        out.fill_(float("nan"))
+        graph.replay()
+        ref = torch.nn.functional.linear(a.float(), raw.float())
+        assert checkAllclose(ref, out.float(), rtol=0.02, atol=0.003) == 0
+    for override in ({"policy": "ht"}, {"split_k": 2}, {"k_waves": 2}):
+        try:
+            flydsl_hgemm(
+                a.reshape(6, 1536),
+                weight,
+                bpreshuffle=True,
+                **({"policy": "ft"} | override),
+            )
+        except ValueError:
+            continue
+        raise AssertionError(
+            f"preshuffle accepted unsupported configuration: {override}"
+        )
 
 
 def _atol_rtol(k, split_k, k_waves, dtype):
@@ -802,8 +921,10 @@ def summarize(title, rows):
 
 
 def main():
-    if get_gfx() not in SUPPORTED_GFX:
-        aiter.logger.warning("flydsl hgemm unsupported on %s; skipping", get_gfx())
+    if get_gfx_runtime() not in SUPPORTED_GFX:
+        aiter.logger.warning(
+            "flydsl hgemm unsupported on %s; skipping", get_gfx_runtime()
+        )
         return
 
     parser = argparse.ArgumentParser(
@@ -830,7 +951,8 @@ def main():
         + _CONCURRENT_COPY_MNK
         + [row[:3] for row in _MEMORY_TILES]
         + _TUNED_MEMORY_MNK
-        + _BAND_MNK,
+        + _BAND_MNK
+        + _PRESHUFFLE_MNK,
         help="""Shape of mnk.
         e.g.:   -s 128,4096,4096
                 --mnk 32,384,7168""",
@@ -844,6 +966,16 @@ def main():
     )
     args = parser.parse_args()
     wanted = set(args.mnk)
+    if get_gfx_runtime() == "gfx950" and dtypes.bf16 in args.dtype:
+        check_preshuffle_compiled_dispatch()
+        summarize(
+            "AITER BF16 preshuffle HGEMM",
+            [
+                test_hgemm_preshuffle(m, n, k, dtypes.bf16)
+                for m, n, k in _PRESHUFFLE_MNK
+                if (m, n, k) in wanted
+            ],
+        )
 
     for dtype in args.dtype:
         rows = []
