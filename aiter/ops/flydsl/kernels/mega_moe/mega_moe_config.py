@@ -1672,24 +1672,42 @@ def _tune_v41_flash_ep4_large(config: MegaMoEConfig) -> MegaMoEConfig:
 
 
 def _tune_v41_flash_ep2_small(config: MegaMoEConfig, bucket: int) -> MegaMoEConfig:
-    """EP2 DeepSeek-V4.1-Flash small-input kernel (192 experts per rank)."""
+    """EP2 DeepSeek-V4.1-Flash small-input kernel (192 experts per rank), measured on gfx950 (MTPR 512; uniform, Zipf
+    and hot-expert routing)."""
     # The EP4 tune and its launch protocol (dedup rows, local plan, direct done, the tok_done counters and BF16
     # head rows), with two changes it needs here: 32-row expert tiles at every bucket (8-16 rows an expert at
     # 256-512 tokens: a 64-row tile would be mostly padding) and 96 producer CTAs (3 64-expert waves of the
-    # EP4 rule leave no consumers).
+    # EP4 rule leave no consumers; 32 to 224 measured within 2%). Below 256 tokens nothing else won under every
+    # routing: tok_done at 8 tokens (-6% uniform, +11% hot) and tile_n 256 at 32-64 (-1..-4% uniform, +6..+14%
+    # hot) stay off, and producers, direct_done, block_n, early GEMM2 and FP8-row thresholds measured within
+    # noise or worse.
     config = _tune_v41_flash_ep4_small(config, bucket)
-    return replace(
-        config,
-        stage1=replace(config.stage1, sort_block_m=32, num_dispatch_cu=96),
-        stage2=replace(config.stage2, block_m=32),
-    )
+    stage1 = replace(config.stage1, sort_block_m=32, num_dispatch_cu=96)
+    stage2 = replace(config.stage2, block_m=32)
+    knobs = config.fused_stage1
+    if bucket in (256, 512):
+        # Half the GEMM1 n-tiles, each streaming a longer W1 slab, and GEMM2's dispatch-table pointers in SGPRs
+        # as up to 128 tokens (the 32-row tiles leave the registers the EP4 64-row tiles spilled): -3% uniform,
+        # -8% Zipf, -12% hot at 256 tokens.
+        stage1 = replace(stage1, tile_n=256)
+        knobs = replace(knobs, g2_uniform=True)
+    if bucket == 512:
+        # The 3072 routed rows of uniform routing pass the cached-weight threshold measured on EP8 / EP4, but
+        # each of the 192 experts has ~16 rows, one m-tile: no other tile rereads its weights, so the GEMM
+        # bodies stream them. A hot expert still takes the cached bodies. With the above: -8% uniform, -3% Zipf,
+        # -3.5% hot.
+        knobs = replace(knobs, stream_w=True)
+    return replace(config, stage1=stage1, stage2=stage2, fused_stage1=knobs)
 
 
 def _tune_v41_flash_ep2_large(config: MegaMoEConfig) -> MegaMoEConfig:
-    """EP2 DeepSeek-V4.1-Flash large-input kernel (192 experts per rank)."""
-    # The EP4 tune with 96 producer CTAs (3 64-expert waves of the EP4 rule are 288, more than the CUs), and its
-    # batched dispatch's token-scale reads bounded by the scale buffer: unbounded, their masked lanes fault on EP2
-    # at every token count.
+    """EP2 DeepSeek-V4.1-Flash large-input kernel (192 experts per rank), measured on gfx950 at MTPR 8192 and 16384."""
+    # The EP4 tune with 96 producer CTAs (3 64-expert waves of the EP4 rule are 288, more than the CUs; 64 to 160
+    # measured within 1.5%), and its batched dispatch's token-scale reads bounded by the scale buffer: unbounded,
+    # their masked lanes fault on EP2 at every token count. The EP4 schedule knobs stay: presend_experts 24
+    # (-2..-6% uniform at 4096-16384 tokens a rank) costs 5..30% under Zipf routing at 3072-6144, early_p 5-6
+    # (-6..-9% at 8192+) costs 3-5% at 3072, and payload_min_blocks, payload_small_*, presend_rows, early_p_mid,
+    # m_group, xcd_chunk and early_k measured within noise or worse.
     config = _tune_v41_flash_ep4_large(config)
     return replace(
         config,

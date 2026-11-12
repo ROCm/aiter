@@ -602,7 +602,7 @@ def test_ep2_route_for_every_max_tokens(mtpr):
 
 # The EP2 V4.1-Flash fused configs (_tune_v41_flash_ep2_small / _large). On a mismatch the assertion shows the
 # current table.
-_EP2_FUSED_DIGEST = "939c581615544b289491b667622b928516bd87af78496b7521c37be4d1c88ca2"
+_EP2_FUSED_DIGEST = "110984e63a479e0864a3b55cbf1308fdfa864c4d750b8689f23a6f5b6f1ad9f6"
 
 
 def test_ep2_fused_configs_unchanged():
