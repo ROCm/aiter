@@ -500,24 +500,29 @@ def test_stage2_reuse_rejects_unqualified_modes(arch, weight_dtype, epilog):
 
 
 def test_stage2_lds_variants_have_distinct_cache_keys():
-    from flydsl.compiler.jit_function import _jit_function_cache_key
-
+    # FlyDSL >= 0.5.0 keys its cache on the traced IR, so the key is taken from
+    # a launch stopped at it (nothing is compiled or run).
+    from aiter.aot.flydsl.dry_run import dry_run
+    from aiter.aot.flydsl.replay import identified_kernels
     from aiter.ops.flydsl.kernels.moe_2stage_a16wmix import compile_gemm2_a16w4_port
 
     keys = []
-    for reuse in (False, True):
-        launcher = compile_gemm2_a16w4_port(
-            BM=32,
-            NE=384,
-            N_OUT=5120,
-            D_INTER=384,
-            TILE_N=256,
-            TILE_K=128,
-            rocm_arch="gfx942",
-            reuse_lds=reuse,
-        )
-        keys.append(_jit_function_cache_key(launcher.func))
-    assert keys[0] != keys[1]
+    with dry_run("gfx942", 304):
+        for reuse in (False, True):
+            launcher = compile_gemm2_a16w4_port(
+                BM=32,
+                NE=384,
+                N_OUT=5120,
+                D_INTER=384,
+                TILE_N=256,
+                TILE_K=128,
+                rocm_arch="gfx942",
+                reuse_lds=reuse,
+            )
+            with identified_kernels() as launched:
+                launcher(0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 0, torch.cuda.current_stream())
+            keys.append(launched)
+    assert keys[0] and keys[1] and keys[0].isdisjoint(keys[1])
 
 
 def _cos_diff(x, y):
