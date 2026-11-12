@@ -7,7 +7,12 @@ from aiter.ops.flydsl.kernels.mega_moe.mega_moe_config import (
     select_mega_moe_config,
 )
 
-FLASH_EP4 = dict(experts_per_rank=96, model_dim=5120, inter_dim=2304, world_size=4)
+FLASH_EP4 = {
+    "experts_per_rank": 96,
+    "model_dim": 5120,
+    "inter_dim": 2304,
+    "world_size": 4,
+}
 
 
 @pytest.mark.parametrize("tokens", [192, 256, 383])

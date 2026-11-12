@@ -469,7 +469,11 @@ def fused_layout_supported(
 
 
 def large_m_mtprs_for(
-    *, world_size: int, model_dim: int, inter_dim: int, experts_per_rank: int | None = None
+    *,
+    world_size: int,
+    model_dim: int,
+    inter_dim: int,
+    experts_per_rank: int | None = None,
 ) -> tuple[int, ...]:
     """Instance capacities the large-input kernel is built for on a FUSED_LAYOUTS layout.
 
@@ -1458,7 +1462,8 @@ def build_mega_moe_bundle_plan(
         large_m=large_m,
         large_m_min_tokens=(
             V41_FLASH_EP4_LARGE_M_MIN_TOKENS
-            if large_m and _is_v41_flash_ep4(world_size, experts_per_rank, model_dim, inter_dim)
+            if large_m
+            and _is_v41_flash_ep4(world_size, experts_per_rank, model_dim, inter_dim)
             else LARGE_M_MIN_TOKENS
         ),
     )
@@ -1780,7 +1785,9 @@ def _fused_config(
     if bucket == 2:
         # Bucket 1's config with 384-column GEMM1 tiles: the EP4 tune's tile_n 128 pays off at one token a rank,
         # but at two a loaded rank's tiles already outnumber the CTAs (384: -3% against 256).
-        config = _fused_config(1, mtpr, world_size, experts_per_rank, model_dim, inter_dim)
+        config = _fused_config(
+            1, mtpr, world_size, experts_per_rank, model_dim, inter_dim
+        )
         return replace(config, stage1=replace(config.stage1, tile_n=384))
     config = MegaMoEConfig(
         stage1=_small_m_stage1(bucket, expert_waves),
@@ -1805,7 +1812,9 @@ def select_fused_config(
     if mtpr <= 0 or mtpr & (mtpr - 1):
         raise ValueError(f"mtpr={mtpr} must be a positive power of two")
     large_mtprs = large_m_mtprs_for(
-        world_size=world_size, model_dim=model_dim, inter_dim=inter_dim,
+        world_size=world_size,
+        model_dim=model_dim,
+        inter_dim=inter_dim,
         experts_per_rank=experts_per_rank,
     )
     if mtpr > SMALL_M_MAX_MTPR and mtpr not in large_mtprs:

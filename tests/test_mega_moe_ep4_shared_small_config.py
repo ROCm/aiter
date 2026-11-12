@@ -7,14 +7,20 @@ from aiter.ops.flydsl.kernels.mega_moe.mega_moe_config import (
     select_fused_config,
 )
 
-
-LAYOUT = dict(world_size=4, model_dim=5120, inter_dim=2304)
+LAYOUT = {"world_size": 4, "model_dim": 5120, "inter_dim": 2304}
 
 
 def test_only_the_target_shared_layout_is_added():
-    args = dict(LAYOUT, arch="gfx950", experts=388, topk=7, quant="a8w4", swiglu_limit=10.0)
+    args = dict(
+        LAYOUT, arch="gfx950", experts=388, topk=7, quant="a8w4", swiglu_limit=10.0
+    )
     assert fused_layout_supported(**args)
-    for patch in ({"experts": 392}, {"topk": 6}, {"quant": "a4w4"}, {"fanout_masks": (1, 2, 4, 8)}):
+    for patch in (
+        {"experts": 392},
+        {"topk": 6},
+        {"quant": "a4w4"},
+        {"fanout_masks": (1, 2, 4, 8)},
+    ):
         assert not fused_layout_supported(**dict(args, **patch))
 
 

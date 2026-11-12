@@ -1237,17 +1237,17 @@ def emit_dispatch_plan(
             inclusive_rows = _wave_inclusive_scan_i32(padded_rows, lane)
             last_lane = min(63, fz_epr - expert_chunk * 64 - 1)
             chunk_total = fx.Int32(fx.rocdl.readlane(T.i32, inclusive_rows, last_lane))
-            return dict(
-                local_expert=local_expert, valid_expert=valid_expert, ge=ge,
-                safe_ge=safe_ge, group_member=group_member,
-                normal_source_counts=normal_source_counts, normal_count=normal_count,
-                group_source_counts=group_source_counts, group_count=group_count,
-                group_num_tiles=group_num_tiles, normal_num_tiles=normal_num_tiles,
-                group_padded_rows=group_padded_rows,
-                normal_padded_rows=normal_padded_rows, padded_rows=padded_rows,
-                inclusive_rows=inclusive_rows, chunk_max=chunk_max,
-                chunk_total=chunk_total,
-            )
+            return {
+                "local_expert": local_expert, "valid_expert": valid_expert, "ge": ge,
+                "safe_ge": safe_ge, "group_member": group_member,
+                "normal_source_counts": normal_source_counts, "normal_count": normal_count,
+                "group_source_counts": group_source_counts, "group_count": group_count,
+                "group_num_tiles": group_num_tiles, "normal_num_tiles": normal_num_tiles,
+                "group_padded_rows": group_padded_rows,
+                "normal_padded_rows": normal_padded_rows, "padded_rows": padded_rows,
+                "inclusive_rows": inclusive_rows, "chunk_max": chunk_max,
+                "chunk_total": chunk_total,
+            }
 
         def plan_store(expert_chunk, c, row_carry):
             """Chunk ``expert_chunk``'s stores; returns its pair-a/b group bases

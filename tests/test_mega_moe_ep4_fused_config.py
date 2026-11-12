@@ -10,11 +10,17 @@ from aiter.ops.flydsl.kernels.mega_moe.mega_moe_config import (
     tune_large_m_launch_config,
 )
 
+FLASH_EP4 = {
+    "world_size": 4,
+    "experts_per_rank": 96,
+    "model_dim": 5120,
+    "inter_dim": 2304,
+}
 
-FLASH_EP4 = dict(world_size=4, experts_per_rank=96, model_dim=5120, inter_dim=2304)
 
-
-@pytest.mark.parametrize("capacity, tokens", [(256, 192), (256, 256), (512, 256), (512, 383)])
+@pytest.mark.parametrize(
+    "capacity, tokens", [(256, 192), (256, 256), (512, 256), (512, 383)]
+)
 def test_ep4_256_bucket_pairs_the_smaller_row_tile_in_both_gemms(capacity, tokens):
     config = select_fused_config(tokens, capacity, **FLASH_EP4)
     assert (config.stage1.sort_block_m, config.stage1.tile_n) == (32, 256)
@@ -44,11 +50,19 @@ def test_mixed_token_buckets_keep_one_small_input_wire_protocol(capacity):
         if tokens <= capacity
     ]
     protocols = {
-        (k.dedup_rows, k.plan_local, bool(k.direct_done), k.tok_counters, k.bf16_head_tokens)
+        (
+            k.dedup_rows,
+            k.plan_local,
+            bool(k.direct_done),
+            k.tok_counters,
+            k.bf16_head_tokens,
+        )
         for k in (config.fused_stage1 for config in configs)
     }
     assert len(protocols) == 1
-    assert all(config.stage1.sort_block_m == config.stage2.block_m for config in configs)
+    assert all(
+        config.stage1.sort_block_m == config.stage2.block_m for config in configs
+    )
 
 
 @pytest.mark.parametrize("capacity", [8192, 16384])
@@ -63,7 +77,9 @@ def test_large_prefill_local_tune_preserves_the_complete_wire_config(capacity):
             restored = replace(
                 config,
                 stage1=replace(config.stage1, b_nt=base.stage1.b_nt),
-                fused_stage2=replace(config.fused_stage2, m_group=base.fused_stage2.m_group),
+                fused_stage2=replace(
+                    config.fused_stage2, m_group=base.fused_stage2.m_group
+                ),
             )
             assert restored == base
 
@@ -74,7 +90,9 @@ def test_large_prefill_local_tune_leaves_other_layouts_unchanged():
     assert tune_large_m_launch_config(base, 16384, **layout) is base
 
 
-@pytest.mark.parametrize("capacity,tokens", [(256, 192), (256, 256), (512, 320), (512, 383)])
+@pytest.mark.parametrize(
+    "capacity,tokens", [(256, 192), (256, 256), (512, 320), (512, 383)]
+)
 def test_cached_gemm1_width_is_local_to_ep4_small_256_bucket(capacity, tokens):
     config = select_fused_config(tokens, capacity, **FLASH_EP4)
     assert config.stage1.tile_n == 256
@@ -84,7 +102,15 @@ def test_cached_gemm1_width_is_local_to_ep4_small_256_bucket(capacity, tokens):
 
 def test_other_fused_profiles_keep_one_gemm1_width():
     for tokens in (1, 2, 4, 16, 64, 128, 191, 384, 512):
-        assert select_fused_config(tokens, 512, **FLASH_EP4).fused_stage1.g1_cached_tile_n == 0
+        assert (
+            select_fused_config(tokens, 512, **FLASH_EP4).fused_stage1.g1_cached_tile_n
+            == 0
+        )
     assert select_fused_config(256, 512).fused_stage1.g1_cached_tile_n == 0
     for capacity in (8192, 16384):
-        assert select_fused_config(256, capacity, **FLASH_EP4).fused_stage1.g1_cached_tile_n == 0
+        assert (
+            select_fused_config(
+                256, capacity, **FLASH_EP4
+            ).fused_stage1.g1_cached_tile_n
+            == 0
+        )
