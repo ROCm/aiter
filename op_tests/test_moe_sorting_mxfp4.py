@@ -1102,9 +1102,20 @@ def _check_fused_moe_inline_sort_pad_rows(tokens=32, valid=29):
     torch.manual_seed(tokens)
     w1, w1_scale = fp4_weight(2 * inter, hidden)
     w2, w2_scale = fp4_weight(hidden, inter)
+
+    def standard_rows(tensor):
+        # .contiguous() is a no-op for a size-1 row whose stride PyTorch ignores.
+        copied = torch.empty_like(tensor, memory_format=torch.contiguous_format).copy_(
+            tensor
+        )
+        assert copied.stride() == (tensor.shape[1], 1)
+        assert copied.data_ptr() != tensor.data_ptr()
+        return copied
+
     if tokens == 1:
         x = torch.randn((hidden, 1), dtype=dtypes.bf16, device="cuda").t()
         assert x.stride() == (1, 1)
+        assert x.is_contiguous() and x.contiguous().data_ptr() == x.data_ptr()
     else:
         x = torch.randn((tokens, hidden + 64), dtype=dtypes.bf16, device="cuda")[
             :, :hidden
@@ -1154,11 +1165,11 @@ def _check_fused_moe_inline_sort_pad_rows(tokens=32, valid=29):
 
         out = run(pad_ids, tokens, count)
         ref = run(topk_ids, valid)
-        contiguous = run(pad_ids, tokens, count, x.contiguous())
+        contiguous = run(pad_ids, tokens, count, standard_rows(x))
         materialized = run(pad_ids, tokens, count, inner_strided)
-        materialized_ref = run(pad_ids, tokens, count, inner_strided.contiguous())
+        materialized_ref = run(pad_ids, tokens, count, standard_rows(inner_strided))
         misaligned_out = run(pad_ids, tokens, count, misaligned)
-        misaligned_ref = run(pad_ids, tokens, count, misaligned.contiguous())
+        misaligned_ref = run(pad_ids, tokens, count, standard_rows(misaligned))
         graph = None
         if tokens == 32:
             graph = torch.cuda.CUDAGraph()
