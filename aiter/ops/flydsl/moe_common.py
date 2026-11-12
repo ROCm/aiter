@@ -13,6 +13,15 @@ DEFAULT_SITUV2_BETA = 4.0
 DEFAULT_SITUV2_LINEAR_BETA = 25.0
 
 
+def _flydsl_stage2_fp8_enabled():
+    return os.environ.get("AITER_FLYDSL_STAGE2_FP8", "0") == "1"
+
+
+def _mxfp4_intermediate_enabled():
+    # Lossy before-sum 4-bit quant of the scatter intermediate (ok for gsm8k, degrades other evals).
+    return os.environ.get("AITER_MXFP4_INTERMEDIATE", "0") == "1"
+
+
 def resolve_swiglu_limit(
     swiglu_limit: "object" = None,
 ) -> "tuple[float | None, str]":

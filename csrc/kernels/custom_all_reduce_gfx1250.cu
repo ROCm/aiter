@@ -108,7 +108,7 @@ int64_t meta_size(int64_t world_size)
 
 static void _all_reduce(fptr_t _fa, void* inp, void* out,
                         int64_t numel, AiterDtype dtype,
-                        bool use_new, bool is_broadcast_reg_outptr)
+                        bool use_new)
 {
     hipStream_t stream = aiter::getCurrentHIPStream();
     auto fa = reinterpret_cast<aiter::CustomAllreduce*>(_fa);
@@ -118,14 +118,14 @@ static void _all_reduce(fptr_t _fa, void* inp, void* out,
         fa->allreduce<opus::fp32_t>(stream,
                              reinterpret_cast<opus::fp32_t*>(inp),
                              reinterpret_cast<opus::fp32_t*>(out),
-                             numel, use_new, is_broadcast_reg_outptr);
+                             numel, use_new);
         break;
     }
     case AITER_DTYPE_fp16: {
         fa->allreduce<opus::fp16_t>(stream,
                                 reinterpret_cast<opus::fp16_t*>(inp),
                                 reinterpret_cast<opus::fp16_t*>(out),
-                                numel, use_new, is_broadcast_reg_outptr);
+                                numel, use_new);
         break;
     }
     case AITER_DTYPE_bf16: {
@@ -286,6 +286,34 @@ void register_graph_buffers(fptr_t _fa,
     fa->register_graph_buffers(per_rank.data());
 }
 
+// ---- Graph buffer registration (IPC handle-based, ROCm >= 7.15) ----
+// Same signatures as the old-arch ops, so IPCBufferPool.flush_graph_buffers
+// drives both.
+
+void get_graph_buffer_ipc_meta(fptr_t _fa, int64_t handle_out, int64_t offset_out)
+{
+    auto fa = reinterpret_cast<aiter::CustomAllreduce*>(_fa);
+    auto [handle_bytes, offsets] = fa->get_graph_buffer_ipc_meta();
+    std::memcpy((void*)handle_out, handle_bytes.data(), handle_bytes.size());
+    std::memcpy((void*)offset_out, offsets.data(), offsets.size() * sizeof(int64_t));
+}
+
+void register_graph_buffers_ipc(fptr_t _fa,
+                                const std::vector<int64_t>& handle_ptrs,
+                                const std::vector<int64_t>& offset_ptrs)
+{
+    auto fa = reinterpret_cast<aiter::CustomAllreduce*>(_fa);
+    int world_size = handle_ptrs.size();
+    std::vector<const void*> handles(world_size);
+    std::vector<const int64_t*> offsets(world_size);
+    for(int i = 0; i < world_size; i++)
+    {
+        handles[i] = (const void*)handle_ptrs[i];
+        offsets[i] = (const int64_t*)offset_ptrs[i];
+    }
+    fa->register_graph_buffers(handles.data(), offsets.data());
+}
+
 // ---- Allgather dispatch helpers ----
 
 static void _all_gather(fptr_t _fa, void* inp, void* out,
@@ -295,17 +323,11 @@ static void _all_gather(fptr_t _fa, void* inp, void* out,
     hipStream_t stream = aiter::getCurrentHIPStream();
     auto fa = reinterpret_cast<aiter::CustomAllreduce*>(_fa);
 
-    // The allgather kernels index their output with int, and that index scales
-    // with world_size. Checked here while numel is still int64_t, which covers
-    // all four kernels plus the narrowing below. Needed because all_gather_reg
-    // and custom_all_gather never consult should_custom_ag.
-    const int64_t out_numel = numel * fa->world_size_;
-    if(out_numel > std::numeric_limits<int>::max())
-        throw std::runtime_error(
-            "gfx1250 allgather: output element count " + std::to_string(out_numel) +
-            " (numel " + std::to_string(numel) + " x world_size " +
-            std::to_string(fa->world_size_) + ") exceeds the int32 index range; "
-            "route this size through should_custom_ag / RCCL instead");
+    // numel stays int64_t down to the launchers. Each checks the int32 index
+    // range of its own kernel (per element for allgather_scalar, per 16-byte
+    // pack for the others; see allgather_packs) before narrowing. Needed
+    // because all_gather_reg and custom_all_gather never consult
+    // should_custom_ag.
 
 #define AG_DISPATCH_DIM0(T)                                         \
     do {                                                            \
@@ -436,6 +458,29 @@ void all_gather(fptr_t _fa,
     void* actual_inp = inp.data_ptr();
     void* actual_out = out.data_ptr();
 
+    // the LL kernel reads the input in place: no registered copy, unless the
+    // gather would overwrite the input before publishing it
+    auto fa                = reinterpret_cast<aiter::CustomAllreduce*>(_fa);
+    const size_t row_bytes = dim != 0 ? last_dim_size * inp.element_size() : data_bytes;
+    if(fa->use_ll_ag(data_bytes, row_bytes))
+    {
+        if(!fa->ll_ag_reads_in_place(actual_inp, actual_out, data_bytes, row_bytes))
+        {
+            if(reg_inp_ptr == 0 || data_bytes > reg_inp_bytes)
+                throw std::runtime_error(
+                    "gfx1250 LL all-gather: the output overlaps a registered input");
+            HIP_CALL(hipMemcpyAsync((void*)reg_inp_ptr, actual_inp, data_bytes,
+                                    hipMemcpyDeviceToDevice, stream));
+            actual_inp = (void*)reg_inp_ptr;
+        }
+        fa->allgather_ll<uint8_t>(stream,
+                                  reinterpret_cast<const uint8_t*>(actual_inp),
+                                  reinterpret_cast<uint8_t*>(actual_out),
+                                  data_bytes,
+                                  row_bytes);
+        return;
+    }
+
     if(reg_inp_ptr != 0)
     {
         if(data_bytes > reg_inp_bytes)
@@ -463,8 +508,6 @@ void all_reduce(fptr_t _fa,
     void* actual_inp = inp.data_ptr();
     void* actual_out = out.data_ptr();
 
-    bool is_broadcast_reg_outptr = (reg_inp_ptr == 0);
-
     auto fa = reinterpret_cast<aiter::CustomAllreduce*>(_fa);
     if(reg_inp_ptr != 0 && !fa->use_ll(data_bytes))
     {
@@ -475,8 +518,7 @@ void all_reduce(fptr_t _fa,
         actual_inp = (void*)reg_inp_ptr;
     }
 
-    _all_reduce(_fa, actual_inp, actual_out, numel, dtype,
-                use_new, is_broadcast_reg_outptr);
+    _all_reduce(_fa, actual_inp, actual_out, numel, dtype, use_new);
 }
 
 // ---- Fused allreduce + RMSNorm ----
@@ -595,6 +637,96 @@ void fused_allreduce_rmsnorm(fptr_t _fa,
     _fused_allreduce_rmsnorm(_fa, inp, res_inp, res_out, out.data_ptr(), w,
                              nullptr, nullptr, eps, reg_ptr, reg_bytes, gemma_norm,
                              use_1stage);
+}
+
+// ---- Lamport one-shot fused allreduce + RMSNorm ----
+
+int64_t lamport_ar_rms_buffer_size(int64_t world_size, int64_t max_bytes)
+{
+    return aiter::lamport_ar_rms_buffer_bytes((int)world_size, max_bytes / 16);
+}
+
+void init_lamport_ar_rms(fptr_t _fa, const std::vector<int64_t>& all_ptrs, int64_t max_bytes)
+{
+    auto fa = reinterpret_cast<aiter::CustomAllreduce*>(_fa);
+    fa->init_lamport_ar_rms(all_ptrs, max_bytes);
+}
+
+void fused_allreduce_rmsnorm_lamport(fptr_t _fa,
+                                     const aiter_tensor_t& inp,
+                                     const aiter_tensor_t& res_inp,
+                                     const aiter_tensor_t& res_out,
+                                     const aiter_tensor_t& out,
+                                     const aiter_tensor_t& w,
+                                     double eps,
+                                     bool gemma_norm)
+{
+    HipDeviceGuard device_guard(inp.device_id);
+    hipStream_t stream = aiter::getCurrentHIPStream();
+    auto fa            = reinterpret_cast<aiter::CustomAllreduce*>(_fa);
+    _validate_fused_allreduce_rmsnorm(inp, res_inp, res_out, w);
+    if(out.numel() != inp.numel() || out.dtype() != inp.dtype() || !out.is_contiguous() ||
+       out.device_id != inp.device_id)
+        throw std::runtime_error(
+            "fused_allreduce_rmsnorm_lamport requires a matching contiguous output");
+    const int hidden   = (int)w.numel();
+    const int64_t rows = inp.numel() / hidden;
+
+#define RUN_LAMPORT_RMS(T)                                                     \
+    fa->fused_allreduce_rmsnorm_lamport<T>(                                    \
+        stream,                                                                \
+        reinterpret_cast<const T*>(inp.data_ptr()),                            \
+        reinterpret_cast<const T*>(res_inp.data_ptr()),                        \
+        reinterpret_cast<T*>(res_out.data_ptr()),                              \
+        reinterpret_cast<T*>(out.data_ptr()),                                  \
+        reinterpret_cast<const T*>(w.data_ptr()),                              \
+        rows,                                                                  \
+        hidden,                                                                \
+        (float)eps,                                                            \
+        gemma_norm)
+
+    switch(inp.dtype())
+    {
+    case AITER_DTYPE_fp16: RUN_LAMPORT_RMS(opus::fp16_t); break;
+    case AITER_DTYPE_bf16: RUN_LAMPORT_RMS(opus::bf16_t); break;
+    default:
+        throw std::runtime_error(
+            "fused_allreduce_rmsnorm_lamport only supports float16 and bfloat16");
+    }
+#undef RUN_LAMPORT_RMS
+}
+
+void allreduce_add_lamport(fptr_t _fa,
+                           const aiter_tensor_t& inp,
+                           const aiter_tensor_t& other,
+                           const aiter_tensor_t& out)
+{
+    HipDeviceGuard device_guard(inp.device_id);
+    hipStream_t stream = aiter::getCurrentHIPStream();
+    auto fa            = reinterpret_cast<aiter::CustomAllreduce*>(_fa);
+    for(const aiter_tensor_t* t : {&other, &out})
+        if(t->numel() != inp.numel() || t->dtype() != inp.dtype() || !t->is_contiguous() ||
+           t->device_id != inp.device_id)
+            throw std::runtime_error(
+                "allreduce_add_lamport requires matching contiguous other and out");
+    if(!inp.is_contiguous())
+        throw std::runtime_error("allreduce_add_lamport requires a contiguous input");
+
+#define RUN_LAMPORT_ADD(T)                                                     \
+    fa->allreduce_add_lamport<T>(stream,                                       \
+                                 reinterpret_cast<const T*>(inp.data_ptr()),   \
+                                 reinterpret_cast<const T*>(other.data_ptr()), \
+                                 reinterpret_cast<T*>(out.data_ptr()),         \
+                                 inp.numel())
+
+    switch(inp.dtype())
+    {
+    case AITER_DTYPE_fp16: RUN_LAMPORT_ADD(opus::fp16_t); break;
+    case AITER_DTYPE_bf16: RUN_LAMPORT_ADD(opus::bf16_t); break;
+    default:
+        throw std::runtime_error("allreduce_add_lamport only supports float16 and bfloat16");
+    }
+#undef RUN_LAMPORT_ADD
 }
 
 void fused_allreduce_rmsnorm_quant(fptr_t _fa,
