@@ -543,31 +543,23 @@ def _tuned_rows_per_libtype(libtypes):
 
 
 def _padded_row_m_limit(r):
-    """First M at which the row's kernel can no longer address A or C, or None."""
-    if r.libtype in ("asm", "flydsl"):
-        out_bytes = 4 if r.outdtype == str(dtypes.fp32) else 2
-        if 2 * r.N * r.K >= 1 << 32:
-            return None
-        return -(-(1 << 32) // max(2 * r.K, out_bytes * r.N))
-    if r.libtype == "opus" and get_gfx() == "gfx950":
-        from csrc.opus_gemm.opus_gemm_common import get_kernel_instance
-
-        inst = get_kernel_instance(
-            "gfx950", "a16w16", int(r.solidx), cu_num=get_cu_num()
-        )
-        if inst is None or inst.is_4g_safe or r.N * r.K >= 1 << 31:
-            return None
-        return -(-(1 << 31) // max(r.K, r.N))
-    return None
+    """First M at which an ASM or FlyDSL row's kernel can no longer address A or
+    C, or None."""
+    if r.libtype not in ("asm", "flydsl") or 2 * r.N * r.K >= 1 << 32:
+        return None
+    out_bytes = 4 if r.outdtype == str(dtypes.fp32) else 2
+    if r.libtype == "asm" and out_bytes == 4 and "256x256" in str(r.kernelName):
+        # fp32 output is written one 256-row tile at a time: only A grows with M.
+        return -(-(1 << 32) // (2 * r.K))
+    return -(-(1 << 32) // max(2 * r.K, out_bytes * r.N))
 
 
 def test_padded_row_kernel_limits():
     """An M = 8192 row is not used where its kernel cannot address the operands.
 
     getPaddedM(gl=1) serves every M > 8192 with the M = 8192 row. ASM and
-    FlyDSL kernels return wrong values or fault once A or C reaches 4 GiB,
-    gfx950 legacy OPUS kids once it reaches 2^31 elements, so the lookup must
-    skip the row there; one M lower it must still use it.
+    FlyDSL kernels return wrong values or fault once A or C reaches 4 GiB, so
+    the lookup must skip the row there; one M lower it must still use it.
     """
     df = pd.read_csv(AITER_CONFIGS.AITER_CONFIG_GEMM_BF16_FILE)
     df = df[

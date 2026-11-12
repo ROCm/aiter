@@ -113,13 +113,22 @@ def _row_kernel_fits_shape(config: dict, M: int, N: int, K: int, dtype, otype) -
     """Whether an ASM or FlyDSL row's kernel can address this M x N x K.
 
     getPaddedM(gl=1) serves every M > 8192 with the M = 8192 row, so a row can
-    meet an M far larger than it was tuned at. These kernels address A, B and
-    C with 32-bit byte offsets and return wrong values or fault from 4 GiB on.
+    meet an M far larger than it was tuned at. These kernels give each operand
+    a buffer descriptor with a 32-bit byte size, so A, B and C must each stay
+    below 4 GiB; past it they return wrong values or fault. The ASM 256x256
+    kernels write fp32 output through one descriptor per 256-row tile.
     """
     if config["libtype"] not in ("asm", "flydsl"):
         return True
     in_bytes, out_bytes = eval(dtype).itemsize, eval(otype).itemsize
-    return max(M * K * in_bytes, N * K * in_bytes, M * N * out_bytes) < 1 << 32
+    out_rows = M
+    if (
+        config["libtype"] == "asm"
+        and out_bytes == 4
+        and "256x256" in str(config.get("kernelName"))
+    ):
+        out_rows = min(M, 256)
+    return max(M * K * in_bytes, N * K * in_bytes, out_rows * N * out_bytes) < 1 << 32
 
 
 def get_GEMM_A16W16_tuned_config(
@@ -206,14 +215,7 @@ def get_GEMM_A16W16_tuned_config(
                             gfx, "a16w16", kid, cu_num=cu_num
                         )
                         name = str(config.get("kernelName", ""))
-                        # gfx950 legacy kids address operands with 32-bit
-                        # element offsets; a padded row can meet a much larger M.
-                        fits = instance is not None and (
-                            gfx != "gfx950"
-                            or instance.is_4g_safe
-                            or max(M * K, N * K, M * N) < 1 << 31
-                        )
-                        if fits and (
+                        if instance is not None and (
                             name in ("", "nan", "None") or name == instance.name
                         ):
                             resolved = resolve_a16w16_tuned_candidate(
