@@ -4,11 +4,8 @@
 
 Experts are partitioned over the EP group (``experts_per_rank = experts // world_size``);
 one persistent launch runs the all-to-all dispatch, the local experts' GEMM1 +
-activation + GEMM2 and the all-to-all combine (top-k weighted sum), replacing the
-multi-launch EP pipeline (``mega_moe/mega_moe_v2.py``). Weights are MXFP4.
-
-Mirrors the :mod:`mega_moe_tp` public surface and keeps MegaMoEV2's constructor /
-forward shapes so the op-test can validate it against MegaMoEV2 and ``ep_reference``.
+activation + GEMM2 and the all-to-all combine (top-k weighted sum). Weights are MXFP4;
+``ep_reference`` is the pure-torch oracle.
 
 * The kernel is persistent (one CTA per CU, CTAs and ranks spin on each other): it
   needs the whole GPU; do not run it next to other kernels / processes.
@@ -60,7 +57,7 @@ class MegaMoeEPConfig:
 class MegaMoeEP:
     """One fused EP MoE layer (see the module docstring)."""
 
-    # MegaMoEV2's flag: -1 / >= experts top-k slots are always skipped, so
+    # -1 / >= experts top-k slots are always skipped, so
     # forward(mask_invalid_slots=...) is accepted and ignored.
     supports_combine_mask = True
 
@@ -76,8 +73,8 @@ class MegaMoeEP:
         device=None,
         weights_preshuffled: bool = False,
     ):
-        """``weights_preshuffled``: w1 / w1_scale / w2 / w2_scale are already in MegaMoEV2's
-        layout (``shuffle_weight_a16w4(., 16, gate_up)`` / ``shuffle_scale_a16w4``) and
+        """``weights_preshuffled``: w1 / w1_scale / w2 / w2_scale are already in the
+        kernel's layout (``shuffle_weight_a16w4(., 16, gate_up)`` / ``shuffle_scale_a16w4``) and
         are bound by pointer (kept alive by the caller); else natural MXFP4, shuffled
         into copies."""
         if not mega_moe_ep_supported():

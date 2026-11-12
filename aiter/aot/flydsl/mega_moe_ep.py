@@ -18,7 +18,7 @@ profiles.
 Rank, world size, the token count and the peer addresses are launch arguments
 of the EP kernel, so one job per profile serves every rank.
 
-Like the MegaMoEV2 replay this one runs in a process of its own, started with
+The replay runs in a process of its own, started with
 ``GPU_ARCHS`` naming gfx950 and ``AITER_AOT_REPLAY=1``. It is skipped when
 ``GPU_ARCHS`` names targets without gfx950.
 
@@ -162,7 +162,7 @@ def _fake_arena(rank, world_size):
 
 def _weights(job: dict, device) -> dict:
     """Expert weights as serving binds them: MXFP4 values with E8M0 scales,
-    already in MegaMoEV2's layout (the layout does not change a kernel)."""
+    already preshuffled (the layout does not change a kernel)."""
     from aiter import dtypes
 
     experts = job["experts_per_rank"]

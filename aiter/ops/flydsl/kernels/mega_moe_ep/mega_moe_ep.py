@@ -19,39 +19,39 @@ from ..tensor_shim import _preload_compiled, _run_compiled
 from .mega_moe_ep_config import (
     EPOCH_SLOT,
     FLAG_INTS,
-    MAX_NPES,
+    MAX_CTAS,
+    MAX_RANKS,
     N_XCD,
-    NCTA_MAX,
-    SB_SHORT_I,
+    SMALL_SHORT_INTER,
     TILE_K,
     a_banks,
     ctrl_ints,
     ep_shape_supported,
     inter_rows,
     mega_moe_ep_consts,
-    sbx_on,
 )
 from .mega_moe_ep_kernel import compile_mega_moe_ep
 
 __all__ = ["LaunchCfg", "MegaMoeEPEngine", "ep_reference"]
 
 LDS_LIMIT = 160 * 1024
-# a4w4 row tile: mt=8 (RG=128: each W tile serves twice the rows) from MT8_MIN
-# tokens, else mt=4.  mt=8 needs the per-echunk inter rebase (kernel_config forces it):
-# without it the K-loop spills.  a8w4 mt=8 needs > 160 KB LDS (only a 2-bank A ring
-# fits), so a8 stays at mt=4.
-MT8_MIN = 768
-# Small-batch kernel variant (LaunchCfg.small) for engines of max_tok_per_rank <= SB_MAX:
-# picked from mtpr, so every rank runs the same variant.  a8w4 row tile mt=2 up to
-# SB_MT2_MAX tokens; mt only shapes the rank-local echunks.
-SB_MAX = 512
-SB_MT2_MAX = 159
-# a4w4 likewise up to SB_MT2_MAX_A4.
-SB_MT2_MAX_A4 = 159
-# SB kernel streams its weights (kernel_config WNT) from SB_WNT_MIN tokens; at
-# inter_dim <= SB_SHORT_I only up to SB_WNT_MAX_SHORT_I.
-SB_WNT_MIN = 2
-SB_WNT_MAX_SHORT_I = 416
+# a4w4 row tile: mt=8 (TILE_M=128: each W tile serves twice the rows) from
+# MT8_MIN_TOKENS tokens, else mt=4.  mt=8 needs the per-echunk inter rebase
+# (kernel_config forces it): without it the K-loop spills.  a8w4 mt=8 needs > 160 KB LDS
+# (only a 2-bank A ring fits), so a8 stays at mt=4.
+MT8_MIN_TOKENS = 768
+# Small-batch kernel variant (LaunchCfg.small) for engines of max_tok_per_rank <=
+# SMALL_MAX_TOKENS: picked from mtpr, so every rank runs the same variant.  a8w4 row
+# tile mt=2 up to SMALL_MT2_MAX tokens; mt only shapes the rank-local echunks.
+SMALL_MAX_TOKENS = 512
+SMALL_MT2_MAX = 159
+# a4w4 likewise up to SMALL_MT2_MAX_A4.
+SMALL_MT2_MAX_A4 = 159
+# small-batch kernel streams its weights (kernel_config STREAM_WEIGHTS) from
+# SMALL_STREAM_MIN tokens; at inter_dim <= SMALL_SHORT_INTER only up to
+# SMALL_STREAM_MAX_SHORT_INTER.
+SMALL_STREAM_MIN = 2
+SMALL_STREAM_MAX_SHORT_INTER = 416
 
 
 def _dequant_expert(weight, scale, rows, cols):
@@ -99,12 +99,12 @@ def ep_reference(
     situ_beta=1.0,
     situ_linear_beta=1.0,
 ):
-    """Pure-torch EP MoE oracle matching MegaMoEV2 numerics: dispatch (all-gather +
+    """Pure-torch EP MoE oracle: dispatch (all-gather +
     route to the expert owner) -> per-local-expert GEMM1 + act + GEMM2 scaled by the
     top-k weight -> combine (all-reduce the partials, keep this rank's rows).
 
     ``ref_weights`` are the *unshuffled* quantized weights
-    ``(w1_q, w1_scale, w2_q, w2_scale)`` as handed to MegaMoEV2 (see
+    ``(w1_q, w1_scale, w2_q, w2_scale)`` (see
     ``test_mega_moe_ep.local_weights``). Collective when torch.distributed is initialized and
     ``world_size > 1``; otherwise a single-process local MoE (all experts local).
     """
@@ -154,12 +154,14 @@ def ep_reference(
 @dataclass(frozen=True)
 class LaunchCfg:
     """One EP kernel variant: row tile 16*mt; ``a8`` MXFP8 activations.  The payload is
-    always received source-indexed (row = rank*mtpr + token, bounded by npes*mtpr)."""
+    always received source-indexed (row = rank*mtpr + token, bounded by n_ranks*mtpr).
+    """
 
     mt: int
     a8: bool = False
-    small: bool = False  # small-batch kernel variant (mtpr <= SB_MAX)
-    wnt: bool = False  # SB: non-temporal weight loads (m >= SB_WNT_MIN)
+    small: bool = False  # small-batch kernel variant (mtpr <= SMALL_MAX_TOKENS)
+    # small-batch only: non-temporal weight loads (m >= SMALL_STREAM_MIN)
+    stream_weights: bool = False
 
 
 class MegaMoeEPEngine:
@@ -215,7 +217,9 @@ class MegaMoeEPEngine:
         self.epr = int(experts // world_size)
         self.K = int(topk)
         self.mtpr = mtpr
-        self.wnt_max = SB_WNT_MAX_SHORT_I if self.I <= SB_SHORT_I else mtpr
+        self.stream_max = (
+            SMALL_STREAM_MAX_SHORT_INTER if self.I <= SMALL_SHORT_INTER else mtpr
+        )
         self.a8 = quant == "a8w4"
         self.act = act
         self.situ = (float(situ_beta), float(situ_linear_beta))
@@ -228,15 +232,15 @@ class MegaMoeEPEngine:
         if device.index is None:
             device = torch.device(device.type, self.rank)
         self.device = device
-        small = mtpr <= SB_MAX
-        tot = self.world_size * mtpr
+        small = mtpr <= SMALL_MAX_TOKENS
+        token_slots = self.world_size * mtpr
         a_row = self.H if self.a8 else self.H // 2
         # kernel_config's 32-bit offset bounds, checked before any compile
         if not (
-            tot * a_row < 2**31
-            and tot < 2**24
+            token_slots * a_row < 2**31
+            and token_slots < 2**24
             and mtpr * self.K * (self.H + self.H // 8) < 2**31
-            and self.epr * tot * 4 < 2**31
+            and self.epr * token_slots * 4 < 2**31
         ):
             raise ValueError(
                 f"max_tok_per_rank={mtpr} x world_size={world_size} overflows the "
@@ -257,8 +261,8 @@ class MegaMoeEPEngine:
         self._bind_weights(w1, w1_scale, w2, w2_scale, weights_preshuffled)
         props = torch.cuda.get_device_properties(self.device)
         self.n_cta = int(props.multi_processor_count)
-        if self.n_cta > NCTA_MAX:
-            raise ValueError(f"{self.n_cta} CUs > NCTA_MAX={NCTA_MAX} (flag sizing)")
+        if self.n_cta > MAX_CTAS:
+            raise ValueError(f"{self.n_cta} CUs > MAX_CTAS={MAX_CTAS} (flag sizing)")
         self.gfx = getattr(props, "gcnArchName", "").split(":")[0]
         if self.gfx != "gfx950":
             raise ValueError(f"fused EP MegaMoE needs gfx950, not {self.gfx}")
@@ -275,23 +279,26 @@ class MegaMoeEPEngine:
                 f"rank={self.rank} world_size={self.world_size} != the group's "
                 f"{arena.rank} / {arena.world_size}"
             )
-        self._payload = arena.reserve("payload", (tot, a_row), torch.uint8)
-        self._pscale = arena.reserve("pscale", (tot, self.H // 32), torch.uint8)
-        self._recv = arena.reserve("recv_le", (tot * self.K,), torch.int32)
-        # combine partials sent fp8 per-8-blockwise (half the a2a traffic): each slot row is
-        # H fp8-e4m3 bytes then H/8 per-8 E8M0 scale bytes (co-located, one buffer).
-        # SBX: two banks by epoch parity (no barrier orders a launch's part stores
-        # after the previous launch's combine on the source).
-        nbank = 2 if sbx_on(self.mtpr <= SB_MAX) else 1
+        self._payload = arena.reserve("payload", (token_slots, a_row), torch.uint8)
+        self._pscale = arena.reserve("pscale", (token_slots, self.H // 32), torch.uint8)
+        self._recv = arena.reserve("recv_expert", (token_slots * self.K,), torch.int32)
+        # combine partials sent fp8 per-8-blockwise (half the a2a traffic): each slot
+        # row is H fp8-e4m3 bytes then H/8 per-8 E8M0 scale bytes (co-located, one
+        # buffer). small-batch: two banks by epoch parity (no barrier orders a launch's
+        # part stores after the previous launch's combine on the source).
+        nbank = 2 if self.mtpr <= SMALL_MAX_TOKENS else 1
         self._part = arena.reserve(
             "part", (nbank * self.mtpr * self.K, self.H + self.H // 8), torch.uint8
         )
         self._flag = arena.reserve("flag", (FLAG_INTS,), torch.int32)
         arena.commit()
         self.arena = arena
-        self._recv.local.fill_(-1)  # SBX: scrubbed words (SBX_INV), never a launch's
+        # small-batch: scrubbed words (SCRUBBED), never a launch's
+        self._recv.local.fill_(-1)
         self.ctrl = torch.zeros(
-            ctrl_ints(tot, self.K, self.epr), dtype=torch.int32, device=self.device
+            ctrl_ints(token_slots, self.K, self.epr),
+            dtype=torch.int32,
+            device=self.device,
         )
         # Epoch starts at 1: the arena ready-flags are zero-initialized and the waits are
         # serial-number ``flag >= epoch`` (wrap-safe ``before``), so epoch 0 would make
@@ -300,42 +307,49 @@ class MegaMoeEPEngine:
         # reads and bumps it) so CUDA-graph replays each get a new one.
         self.ctrl[EPOCH_SLOT] = 1
         # GEMM scratch (local, NOT peer-visible): GEMM1 writes the E8M0-quantized
-        # intermediate (inter / inters), GEMM2 reads it.
+        # intermediate (inter / inter_scale), GEMM2 reads it.
         a_pack = 1 if self.a8 else 2
-        # inter / inters / rowmap / rowidx are indexed by ECHUNK id (0..nch) * RG + row, not
-        # bid: sized for the worst-case routing (inter_rows), so any skew fits.
-        rows_cap = inter_rows(tot, self.K, self.epr)
+        # inter / inter_scale / chunk_payload_row / chunk_recv_slot are indexed by
+        # ECHUNK id (0..nch) * TILE_M + row, not bid: sized for the worst-case routing
+        # (inter_rows), so any skew fits.
+        rows_cap = inter_rows(token_slots, self.K, self.epr)
         self._inter = torch.empty(
             rows_cap * (self.I // a_pack), dtype=torch.uint8, device=self.device
         )
-        self._inters = torch.empty(
+        self._inter_scale = torch.empty(
             rows_cap * (self.I // 32), dtype=torch.uint8, device=self.device
         )
         # Per-echunk GEMM1 A-gather source keys written to global by the gather pass:
-        # rowmap = payload row (recv_slot // topk) for the V2 ATileLoader indexed gather;
-        # rowidx = the full recv_slot (the combine pass recovers route = idx % topk and
-        # the source rank/token from it -- read in a later pass so it cannot stay in the
-        # per-CTA LDS L_RIX). Indexed echunk*RG + r.
-        self._rowmap = torch.empty(rows_cap, dtype=torch.int32, device=self.device)
-        self._rowidx = torch.empty(rows_cap, dtype=torch.int32, device=self.device)
+        # chunk_payload_row = payload row (recv_slot // topk) for the ATileLoader
+        # indexed gather; chunk_recv_slot = the full recv_slot (the combine pass
+        # recovers route = idx % topk and the source rank/token from it -- read in a
+        # later pass so it cannot stay in the per-CTA LDS LDS_GATHER). Indexed
+        # echunk*TILE_M + r.
+        self._chunk_payload_row = torch.empty(
+            rows_cap, dtype=torch.int32, device=self.device
+        )
+        self._chunk_recv_slot = torch.empty(
+            rows_cap, dtype=torch.int32, device=self.device
+        )
         # Balanced-gather tables: the planner's pre-pass assigns each received
-        # (token,route) pair a GLOBAL per-local-expert position (0..R_e-1 rank via _ecnt
-        # atomics) and buckets its recv slot at _rowlist[le*cap + pos] (cap = world*mtpr:
-        # a token routes to an expert at most once). The planner chunks an expert's rows
-        # by position//RG, so every chunk but the expert's last is a full RG-row tile, and
-        # the gather reads it by position. _ecnt is zeroed each forward; the small-batch
-        # kernel uses one EPR block of it per XCD.
-        self._rowlist = torch.empty(
+        # (token,route) pair a GLOBAL per-local-expert position (0..R_e-1 rank via
+        # _expert_count atomics) and buckets its recv slot at _expert_recv_slots[le*cap
+        # + pos] (cap = world*mtpr: a token routes to an expert at most once). The
+        # planner chunks an expert's rows by position//TILE_M, so every chunk but the
+        # expert's last is a full TILE_M-row tile, and the gather reads it by position.
+        # _expert_count is zeroed each forward; the small-batch kernel uses one EPR
+        # block of it per XCD.
+        self._expert_recv_slots = torch.empty(
             self.epr * self.world_size * self.mtpr,
             dtype=torch.int32,
             device=self.device,
         )
-        self._ecnt = torch.zeros(
+        self._expert_count = torch.zeros(
             self.epr * N_XCD, dtype=torch.int32, device=self.device
         )
 
     def _bind_weights(self, w1, w1_scale, w2, w2_scale, preshuffled=False):
-        # Both GEMMs read their weights and E8M0 scales in MegaMoEV2's
+        # Both GEMMs read their weights and E8M0 scales in the
         # shuffle_weight_a16w4 / shuffle_scale_a16w4 B-layout (W1 gate|up interleaved,
         # W2 down-proj), so natural weights (the tests / oracle) are shuffled host-side.
         want = (
@@ -351,7 +365,7 @@ class MegaMoeEPEngine:
                     f"a {n}-byte tensor on {self.device}"
                 )
         if preshuffled:
-            # Already in those layouts (MegaMoEV2's): bound by pointer, not copied; the
+            # Already in those layouts: bound by pointer, not copied; the
             # caller keeps them alive (and may update them in place, e.g. EPLB).
             for t, _ in want:
                 if not t.is_contiguous():
@@ -359,19 +373,19 @@ class MegaMoeEPEngine:
                         f"MegaMoeEP: preshuffled weight {tuple(t.shape)} {t.dtype} is "
                         "not contiguous"
                     )
-            self.w1, self.w1s, self.w2, self.w2s = w1, w1_scale, w2, w2_scale
+            self.w1, self.w1_scale, self.w2, self.w2_scale = w1, w1_scale, w2, w2_scale
             return
         from aiter.ops.shuffle import shuffle_scale_a16w4, shuffle_weight_a16w4
 
         w1 = w1 if w1.is_contiguous() else w1.contiguous()
         self.w1 = shuffle_weight_a16w4(w1, 16, True).contiguous()
-        self.w1s = shuffle_scale_a16w4(
+        self.w1_scale = shuffle_scale_a16w4(
             w1_scale.reshape(-1, self.H // 32).contiguous(), self.epr, True
         ).contiguous()
         # W2 + its scale: the down-proj (gate_up=False) B-layout
         w2 = w2 if w2.is_contiguous() else w2.contiguous()
         self.w2 = shuffle_weight_a16w4(w2, 16, False).contiguous()
-        self.w2s = shuffle_scale_a16w4(
+        self.w2_scale = shuffle_scale_a16w4(
             w2_scale.reshape(-1, self.I // 32).contiguous(), self.epr, False
         ).contiguous()
 
@@ -379,14 +393,14 @@ class MegaMoeEPEngine:
         self._bind_weights(w1, w1_scale, w2, w2_scale, preshuffled)
 
     def _fit_mt(self, m, small):
-        # The V2 pipelined GEMM1 packs rows in pairs (MfmaScaleGU / AScaleLoader use
+        # The pipelined GEMM1 packs rows in pairs (MfmaScaleGU / AScaleLoader use
         # m_repeat//2 scale groups), so the row tile mt (=m_repeat) must be EVEN.
         # The inline-A GEMM stages A with all NT=512 threads (16 B/thread); a smaller A
         # tile (a4 mt=2: 32 x 128 B) has the surplus threads repeat a chunk.
-        if small and m <= (SB_MT2_MAX if self.a8 else SB_MT2_MAX_A4):
+        if small and m <= (SMALL_MT2_MAX if self.a8 else SMALL_MT2_MAX_A4):
             mt = 2
         else:
-            mt = 8 if not self.a8 and m >= MT8_MIN else 4
+            mt = 8 if not self.a8 and m >= MT8_MIN_TOKENS else 4
         if mt % 2:
             raise ValueError(f"mt must be even, got mt={mt}")
         while mt > 4:
@@ -408,22 +422,34 @@ class MegaMoeEPEngine:
     def config(self, m):
         cfg = self._cfgs.get(m)
         if cfg is None:
-            small = self.mtpr <= SB_MAX
+            small = self.mtpr <= SMALL_MAX_TOKENS
             cfg = LaunchCfg(
                 mt=self._fit_mt(m, small),
                 a8=self.a8,
                 small=small,
-                wnt=small and SB_WNT_MIN <= m <= self.wnt_max,
+                stream_weights=small and SMALL_STREAM_MIN <= m <= self.stream_max,
             )
             self._cfgs[m] = cfg
         return cfg
 
     def _variants(self):
-        """Every LaunchCfg a token count in [0, mtpr] selects (mt / wnt only change at the
-        SB_WNT_MIN / wnt_max / SB_MT2 / MT8_MIN bounds)."""
-        th = SB_MT2_MAX if self.a8 else SB_MT2_MAX_A4
-        wx = self.wnt_max
-        ms = {0, 1, SB_WNT_MIN, wx, wx + 1, th, th + 1, MT8_MIN - 1, MT8_MIN, self.mtpr}
+        """Every LaunchCfg a token count in [0, mtpr] selects (mt / stream_weights only
+        change at the SMALL_STREAM_MIN / stream_max / SMALL_MT2_MAX / MT8_MIN_TOKENS
+        bounds)."""
+        th = SMALL_MT2_MAX if self.a8 else SMALL_MT2_MAX_A4
+        wx = self.stream_max
+        ms = {
+            0,
+            1,
+            SMALL_STREAM_MIN,
+            wx,
+            wx + 1,
+            th,
+            th + 1,
+            MT8_MIN_TOKENS - 1,
+            MT8_MIN_TOKENS,
+            self.mtpr,
+        }
         return sorted(
             {self.config(m) for m in ms if 0 <= m <= self.mtpr}, key=lambda c: c.mt
         )
@@ -459,17 +485,17 @@ class MegaMoeEPEngine:
                 I=self.I,
                 TOPK=self.K,
                 MT=cfg.mt,
-                TMAX=self.mtpr * self.world_size,
+                TOKEN_SLOTS=self.mtpr * self.world_size,
                 E=self.E,
                 EPR=self.epr,
-                NPES=self.world_size,
+                N_RANKS=self.world_size,
                 act=self.act,
                 situ_beta=self.situ[0],
                 situ_linear_beta=self.situ[1],
                 swiglu_limit=self.swiglu_limit,
                 a8=cfg.a8,
-                SB=cfg.small,
-                WNT=cfg.wnt,
+                SMALL_BATCH=cfg.small,
+                STREAM_WEIGHTS=cfg.stream_weights,
             )
             self._launchers[cfg] = fn
         return fn
@@ -493,38 +519,39 @@ class MegaMoeEPEngine:
             situ_linear_beta=self.situ[1],
         )
 
-    def _launch_args(self, m, x, xs, ids, wts, out):
+    def _launch_args(self, m, x, x_scale, topk_ids, topk_weights, out):
         """The kernel's positional args (minus stream): weights, local input, output,
-        global ctrl, arena peer bases, arena region offsets, scalars, grid (#CU)."""
-        peers = [int(b) for b in self.arena.base_ptrs]
-        peers += [0] * (MAX_NPES - self.world_size)
+        global ctrl, every rank's arena base, arena region offsets, scalars, grid (#CU).
+        """
+        arena_bases = [int(b) for b in self.arena.base_ptrs]
+        arena_bases += [0] * (MAX_RANKS - self.world_size)
 
         def ptr(t):
             return 0 if t is None else t.data_ptr()
 
         return (
             self.w1.data_ptr(),
-            self.w1s.data_ptr(),
+            self.w1_scale.data_ptr(),
             self.w2.data_ptr(),
-            self.w2s.data_ptr(),
+            self.w2_scale.data_ptr(),
             ptr(x),
-            ptr(xs),
-            ptr(ids),
-            ptr(wts),
+            ptr(x_scale),
+            ptr(topk_ids),
+            ptr(topk_weights),
             ptr(out),
             self.ctrl.data_ptr(),
-            *peers,
+            *arena_bases,
             self._payload.offset,
             self._pscale.offset,
             self._recv.offset,
             self._part.offset,
             self._flag.offset,
             self._inter.data_ptr(),
-            self._inters.data_ptr(),
-            self._rowmap.data_ptr(),
-            self._rowidx.data_ptr(),
-            self._rowlist.data_ptr(),
-            self._ecnt.data_ptr(),
+            self._inter_scale.data_ptr(),
+            self._chunk_payload_row.data_ptr(),
+            self._chunk_recv_slot.data_ptr(),
+            self._expert_recv_slots.data_ptr(),
+            self._expert_count.data_ptr(),
             self.rank,
             self.world_size,
             self.epr,
@@ -577,15 +604,15 @@ class MegaMoeEPEngine:
             if not torch.cuda.is_current_stream_capturing():
                 for t in (x_bf16, wts, topk_ids):
                     t.record_stream(stream)
-        # Dynamic MX quant of the activations (same per-1x32 MX path as MegaMoEV2); the
-        # scales are natural [m, H/32], which dispatch copies verbatim into pscale.  SBX:
-        # sbx_send quantizes the bf16 rows itself (one launch less).  On the kernel stream,
-        # so the launch is ordered after it.
+        # Dynamic MX quant of the activations (per_1x32_mx_quant); the scales are
+        # natural [m, H/32], which dispatch copies verbatim into pscale.  small-batch:
+        # small_send quantizes the bf16 rows itself (one launch less).  On the kernel
+        # stream, so the launch is ordered after it.
         with torch.cuda.stream(stream):
-            if sbx_on(cfg.small):
-                x_q, xs = x_bf16, None
+            if cfg.small:
+                x_q, x_scale = x_bf16, None
             elif run_tokens:
-                x_q, xs = per_1x32_mx_quant(
+                x_q, x_scale = per_1x32_mx_quant(
                     x_bf16, quant_mode="fp8" if self.a8 else "fp4"
                 )
             else:  # HIP rejects the quant's zero grid; the rank still launches (peers wait on it)
@@ -594,7 +621,7 @@ class MegaMoeEPEngine:
                     dtype=torch.uint8,
                     device=self.device,
                 )
-                xs = torch.empty(
+                x_scale = torch.empty(
                     (0, self.H // 32), dtype=torch.uint8, device=self.device
                 )
         # combine_final writes every row of [0, run_tokens); only the unsliced tail needs zeros
@@ -604,22 +631,25 @@ class MegaMoeEPEngine:
             )
             if not slice_output:
                 out[run_tokens:].zero_()
-        # recv_le init (SENTINEL = epr, masked by the planner) on the kernel stream, so it
-        # is ordered before the launch; the kernel's barrier_init orders it cross-rank.
-        # No host sync / dist.barrier -> forward() is a pure stream pipeline.
+        # recv_expert init (SENTINEL = epr, masked by the planner) on the kernel stream,
+        # so it is ordered before the launch; the kernel's barrier_init orders it
+        # cross-rank. No host sync / dist.barrier -> forward() is a pure stream
+        # pipeline.
         with torch.cuda.stream(stream):
-            # SBX: senders write whole routing blocks; sb_bucket re-zeroes its counters
-            if not sbx_on(cfg.small):
+            # small-batch: senders write whole routing blocks; small_bucket re-zeroes
+            # its counters
+            if not cfg.small:
                 self._recv.local.fill_(self.epr)
-                self._ecnt.zero_()  # per-expert position counters for the balanced-gather pre-pass
+                # per-expert position counters for the balanced-gather pre-pass
+                self._expert_count.zero_()
         _run_compiled(
-            fn, *self._launch_args(run_tokens, x_q, xs, topk_ids, wts, out), stream
+            fn, *self._launch_args(run_tokens, x_q, x_scale, topk_ids, wts, out), stream
         )
         return out[:run_tokens] if slice_output else out
 
     __call__ = forward
 
-    # --- sticky error word / lifecycle (same surface as MegaMoeTP) ---
+    # --- sticky error word / lifecycle ---
     def poll_errors(self):
         return int(self.ctrl[0].item())
 
@@ -633,4 +663,4 @@ class MegaMoeEPEngine:
         ep = self.ctrl[EPOCH_SLOT].clone()  # the arena flags hold past epochs
         self.ctrl.zero_()
         self.ctrl[EPOCH_SLOT] = ep
-        self._ecnt.zero_()
+        self._expert_count.zero_()
