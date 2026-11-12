@@ -1102,8 +1102,14 @@ def _check_fused_moe_inline_sort_pad_rows(tokens=32, valid=29):
     torch.manual_seed(tokens)
     w1, w1_scale = fp4_weight(2 * inter, hidden)
     w2, w2_scale = fp4_weight(hidden, inter)
-    x = torch.randn((tokens, hidden + 64), dtype=dtypes.bf16, device="cuda")[:, :hidden]
-    assert not x.is_contiguous()
+    if tokens == 1:
+        x = torch.randn((hidden, 1), dtype=dtypes.bf16, device="cuda").t()
+        assert x.stride() == (1, 1)
+    else:
+        x = torch.randn((tokens, hidden + 64), dtype=dtypes.bf16, device="cuda")[
+            :, :hidden
+        ]
+        assert not x.is_contiguous()
     misaligned = torch.randn((tokens, hidden + 4), dtype=dtypes.bf16, device="cuda")[
         :, :hidden
     ]
