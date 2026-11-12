@@ -5,6 +5,7 @@ import torch
 from torch import Tensor
 
 from ..jit.core import compile_ops
+from ..plugin import route as _route
 from ..utility.dtypes import get_dtype_fp8
 
 
@@ -36,6 +37,7 @@ def _fused_qk_norm_rope_cache_quant_shuffle_hip(
 ) -> None: ...
 
 
+@_route(op="fused_qk_norm_rope_cache_quant_shuffle", version=1)
 def fused_qk_norm_rope_cache_quant_shuffle(
     q: Tensor,
     k: Tensor,
@@ -57,6 +59,50 @@ def fused_qk_norm_rope_cache_quant_shuffle(
     k_scale: Tensor,
     v_scale: Tensor,
 ) -> None:
+    """QK RMSNorm, then RoPE, then write K/V into shuffled paged caches.
+
+    One launch for what is otherwise four passes over the same QKV rows, so
+    the fusion is the point: ``q`` and ``k`` are normalised per head, both are
+    rotated, and the rotated ``k`` with ``v`` is scattered into the paged KV
+    caches -- quantized on the way in unless ``kv_cache_dtype`` is ``"auto"``.
+    The torch equivalent is ``run_torch_qk_norm_rope_cache_quant_shuffle`` in
+    ``op_tests/test_fused_qk_norm_rope_cache_quant.py``, which is what the
+    kernel is compared against.
+
+    Args:
+        q, k, v: token-major QKV, ``[num_tokens, num_heads_* * head_dim]``,
+            or the equivalent 3D views. ``q`` and ``k`` are rewritten IN
+            PLACE with their normalised, rotated values; ``v`` is read.
+        num_heads_q, num_heads_k, num_heads_v, head_dim: the head split of
+            those rows. Passed rather than inferred, so a caller may hand in
+            views of one fused QKV allocation.
+        eps: RMSNorm epsilon, shared by the q and k norms.
+        qw, kw: ``[head_dim]`` RMSNorm weights, one per stream.
+        cos_sin_cache: ``[max_positions, rotary_dim]``, the cos and sin
+            halves concatenated along the last axis. ``rotary_dim`` may be
+            smaller than ``head_dim``; the tail is left unrotated.
+        is_neox_style: NeoX pairing (split halves) rather than GPT-J
+            (interleaved).
+        pos_ids: ``[num_tokens]`` (or ``[3, num_tokens]`` for MRoPE) indices
+            into ``cos_sin_cache``.
+        k_cache: ``[num_blocks, num_heads_k, head_dim // x, page_size, x]``
+            with ``x = 16 // element_size`` -- the shuffled (asm) layout,
+            which is what ``_shuffle`` names. A row-major cache is a
+            different contract, not a flag on this one.
+        v_cache: ``[num_blocks, num_heads_v, head_dim, page_size]``, or the
+            5D shuffled form.
+        slot_mapping: ``[num_tokens]`` destination slot per token. A
+            negative slot skips the cache write for that token; ``q`` and
+            ``k`` are still rewritten.
+        kv_cache_dtype: ``"auto"`` stores at the cache's own dtype and
+            ignores the scales; anything else stores quantized, per token,
+            using ``k_scale`` / ``v_scale``.
+        k_scale, v_scale: ``[num_blocks, page_size]`` cache scales, written
+            on the quantized path and unused when ``kv_cache_dtype`` is
+            ``"auto"``.
+
+    Returns nothing: every result is one of the in-place writes above.
+    """
     _fused_qk_norm_rope_cache_quant_shuffle_hip(
         q,
         k,
