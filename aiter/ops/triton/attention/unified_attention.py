@@ -245,6 +245,36 @@ def _gfx950_gluon_supported(params: _UAParams):
     )
 
 
+def unified_attention_supports_non_causal(backend: str | None = None) -> bool:
+    """Return True if unified_attention can run causal=False on this device.
+
+    Only the gfx950 Gluon kernel runs non-causal attention. The call also needs
+    a config that this kernel supports and no sliding window (see the
+    unified_attention docstring).
+    """
+    if backend is not None and backend.lower() != "gluon":
+        return False
+    return (
+        DEVICE_ARCH == "gfx950"
+        and _unified_attention_kernel_gfx950 is not None
+        and _is_gluon_available()
+    )
+
+
+def _check_non_causal_config(params: _UAParams):
+    """Raise ValueError if the gfx950 Gluon kernel cannot run this causal=False call."""
+    if (
+        not _gfx950_gluon_supported(params)
+        or params.v_cache_dtype != params.kv_cache_dtype
+    ):
+        raise ValueError(
+            "unified_attention: causal=False needs a config that the gfx950 Gluon "
+            "kernel supports: bf16 or fp8 Q, K and V of the same dtype, a "
+            "power-of-two head size <= 256 with equal K and V head sizes, and no "
+            "softcap, ALiBi or query-query bias"
+        )
+
+
 def _gfx950_split_params(params: _UAParams):
     """Size the split by the gluon grid when a sequence spans several query blocks."""
     q_rows = params.max_seqlen_q * params.num_queries_per_kv
@@ -469,7 +499,34 @@ def unified_attention(
     output_gate: torch.Tensor | None = None,
     output_rows: torch.Tensor | None = None,
 ):
-    assert causal, "Only causal attention is supported"
+    """Paged attention for a batch of prefill, decode and verify queries.
+
+    Writes softmax(q @ k^T * softmax_scale) @ v for each query token into out.
+    The keys of sequence i are the first seqused_k[i] tokens in its block_table
+    pages. The query tokens of sequence i are the last tokens of that sequence.
+
+    causal: if True, a query token attends to the keys up to its own position.
+    If False, a query token attends to all keys of its sequence, for example
+    the tokens of a bidirectional draft block in speculative decoding.
+    causal=False has these limits:
+      - It runs only on the gfx950 Gluon kernel (see
+        unified_attention_supports_non_causal).
+      - It needs bf16 or fp8 Q and KV of the same dtype, a power-of-two head
+        size <= 256, and no softcap, ALiBi or query-query bias.
+      - It does not support a sliding window.
+    Other cases raise ValueError. A decode batch (max_seqlen_q == 1) runs the
+    causal kernels, because the result is the same.
+
+    Returns None. The result is in out.
+    """
+    if not causal:
+        if window_size[0] >= 0 or window_size[1] >= 0:
+            raise ValueError(
+                "unified_attention: causal=False does not support a sliding window"
+            )
+        # In a decode batch, each query token attends to all keys in both modes.
+        if int(max_seqlen_q) == 1:
+            causal = True
 
     if backend is None:
         backend = "gluon" if _is_gluon_available() else "triton"
@@ -478,6 +535,11 @@ def unified_attention(
         "triton",
         "gluon",
     ), f"Unknown backend '{backend}', must be 'triton' or 'gluon'"
+    if not causal and not unified_attention_supports_non_causal(backend):
+        raise ValueError(
+            "unified_attention: causal=False runs only on the gfx950 Gluon kernel "
+            f"(arch '{DEVICE_ARCH}', backend '{backend}')"
+        )
     if backend == "gluon":
         assert (
             _is_gluon_available()
@@ -647,6 +709,8 @@ def unified_attention(
         skip_reduce=skip_reduce,
         force_fp8_pv_on_fp4_kv_cache=force_fp8_pv_on_fp4_kv_cache,
     )
+    if not causal:
+        _check_non_causal_config(params)
 
     # if batch contains a prefill
     if use_2d_kernel(params, backend):

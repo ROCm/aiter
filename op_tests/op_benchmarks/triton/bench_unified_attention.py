@@ -424,7 +424,7 @@ def run_benchmark(custom, args):
                 max_seqlen_q=inputs["max_query_len"],
                 max_seqlen_k=inputs["max_kv_len"],
                 softmax_scale=inputs["scale"],
-                causal=True,
+                causal=not args.non_causal,
                 window_size=window_size,
                 block_table=inputs["block_tables"],
                 softcap=0,
@@ -482,6 +482,7 @@ def run_benchmark(custom, args):
                 v_descale=inputs["v_descale"],
                 output_scale=inputs["out_scale"],
                 out_dtype=inputs["output"].dtype,
+                causal=not args.non_causal,
             )
             if any_fp8:
                 atol, rtol = 1.5e-1, 1.5e-1
@@ -511,7 +512,11 @@ def run_benchmark(custom, args):
         for i in range(num_contexts):
             sq = (cu_query_lens[i + 1] - cu_query_lens[i]).item()
             sk = seqlens_k[i].item()
-            if window is None:
+            if args.non_causal:
+                # each query token attends to all sk keys
+                valid = sq * sk
+                kv_read = sk
+            elif window is None:
                 valid = sq * sk - ((sq**2 - sq) / 2)
                 kv_read = sk
             else:
@@ -671,6 +676,12 @@ def parse_args(args: list[str] | None = None) -> argparse.Namespace:
         type=int,
         default=None,
         help="Sliding window size (default: disabled)",
+    )
+    parser.add_argument(
+        "-non_causal",
+        action="store_true",
+        help="causal=False: each query token attends to all keys of its sequence "
+        "(gfx950 Gluon only)",
     )
 
     parser.add_argument(

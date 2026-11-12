@@ -15,6 +15,7 @@ from aiter.ops.triton.attention.unified_attention import (
     _is_gluon_available,
     is_2d_gluon_available,
     unified_attention,
+    unified_attention_supports_non_causal,
 )
 from aiter.ops.triton.utils._triton import arch_info
 from aiter.ops.triton.utils.shuffle import shuffle_scale_batched, shuffle_weight
@@ -2413,3 +2414,275 @@ def test_unified_attn_split_rebalance_reduce_configs_k4v8(
     )
     assert not new[live].isnan().any()
     assert torch.equal(old[live].view(torch.int16), new[live].view(torch.int16))
+
+
+# causal=False (bidirectional draft blocks): gfx950 Gluon kernel only.
+_NON_CAUSAL_SEQ_LENS = [
+    # speculative-decode verify: 8 query tokens for each sequence
+    [(8, 300), (8, 1500), (8, 777), (8, 4000)],
+    [(8, 100 + 93 * i) for i in range(16)],
+    # long context: the 3D split-KV grid
+    [(8, 32768), (4, 16384)],
+    # mixed batch: decode, verify and prefill rows
+    [(1, 1000), (8, 2048), (300, 300), (64, 5000)],
+    # prefill only: each query token attends to all tokens
+    [(512, 512), (100, 100)],
+    [(17, 1100), (3, 64)],
+]
+
+
+def _non_causal_case(seq_lens, num_heads, head_size, block_size, dtype, sinks):
+    """Run causal=False and return (output, reference) as float32."""
+    kv_lens = [kv for _, kv in seq_lens]
+    num_blocks = len(seq_lens) * -(-max(kv_lens) // block_size) + 8
+    (
+        query,
+        key_cache_orig,
+        value_cache_orig,
+        key_cache,
+        value_cache,
+        sink_values,
+        output,
+        cu_query_lens,
+        seqused_k,
+        max_query_len,
+        max_kv_len,
+        scale,
+        window_size,
+        block_tables,
+        _maybe_quant_query,
+        _query_scales,
+        q_descale,
+        k_descale,
+        v_descale,
+        _output_scale,
+    ) = generate_data(
+        seq_lens=seq_lens,
+        num_blocks=num_blocks,
+        block_size=block_size,
+        head_size=head_size,
+        num_heads=num_heads,
+        q_dtype=dtype,
+        kv_dtype=dtype,
+        out_dtype=torch.bfloat16,
+        device="cuda",
+    )
+    sink_values = sink_values if sinks else None
+    unified_attention(
+        q=query,
+        k=key_cache,
+        v=value_cache,
+        out=output,
+        cu_seqlens_q=cu_query_lens,
+        seqused_k=seqused_k,
+        max_seqlen_q=max_query_len,
+        max_seqlen_k=max_kv_len,
+        softmax_scale=scale,
+        causal=False,
+        window_size=window_size,
+        block_table=block_tables,
+        softcap=0,
+        q_descale=q_descale,
+        k_descale=k_descale,
+        v_descale=v_descale,
+        sinks=sink_values,
+        backend="gluon",
+    )
+    ref = ref_paged_attn(
+        query=query,
+        key_cache=key_cache_orig,
+        value_cache=value_cache_orig,
+        query_lens=[q for q, _ in seq_lens],
+        kv_lens=kv_lens,
+        block_tables=block_tables,
+        scale=scale,
+        out_dtype=torch.bfloat16,
+        sinks=sink_values,
+        q_descale=q_descale,
+        k_descale=k_descale,
+        v_descale=v_descale,
+        causal=0,
+    )
+    return output.float(), ref.float()
+
+
+def _assert_non_causal_close(out, ref, dtype):
+    # The fp8 mismatch check below is false for NaN, so check for NaN and inf first.
+    assert torch.isfinite(out).all(), "non-finite values in the output"
+    assert torch.isfinite(ref).all(), "non-finite values in the reference"
+    if dtype.itemsize == 1:
+        # fp8: allow 0.5% of the elements outside the tolerance, as the causal tests
+        atol, rtol = 1.5e-1, 1.5e-1
+        mismatch = (out - ref).abs() > atol + rtol * ref.abs()
+        assert mismatch.float().mean().item() < 0.005, (
+            f"fp8 mismatch fraction {mismatch.float().mean().item():.4%}, "
+            f"max abs diff {(out - ref).abs().max().item()}"
+        )
+    else:
+        torch.testing.assert_close(out, ref, atol=1.5e-2, rtol=1e-2)
+
+
+def _spy_gfx950_gluon(monkeypatch, path):
+    """Count the gfx950 Gluon launches, fail on a Triton launch, force 2D or 3D."""
+    module = sys.modules[unified_attention.__module__]
+    calls = []
+    gluon_launch = module._unified_attention_gfx950
+
+    def spy(*args, **kwargs):
+        calls.append(1)
+        return gluon_launch(*args, **kwargs)
+
+    def triton_launch(*args, **kwargs):
+        raise AssertionError("causal=False must not run a Triton kernel")
+
+    monkeypatch.setattr(module, "_unified_attention_gfx950", spy)
+    monkeypatch.setattr(module, "_unified_attention_2d_triton", triton_launch)
+    monkeypatch.setattr(module, "_unified_attention_3d_triton", triton_launch)
+    if path != "auto":
+        monkeypatch.setattr(
+            module,
+            "use_2d_kernel",
+            lambda params, backend="triton": path == "2d",
+        )
+    return calls
+
+
+@pytest.mark.parametrize("seq_lens", _NON_CAUSAL_SEQ_LENS)
+@pytest.mark.parametrize("num_heads", [(40, 8), (8, 1)])
+@pytest.mark.parametrize("head_size, block_size", [(128, 16), (128, 64), (64, 64)])
+@pytest.mark.parametrize("dtype", [torch.bfloat16, e4m3_dtype])
+@pytest.mark.parametrize("path", ["auto", "2d", "3d"])
+@torch.inference_mode()
+def test_unified_attn_non_causal_gfx950(
+    seq_lens, num_heads, head_size, block_size, dtype, path, monkeypatch
+):
+    if not unified_attention_supports_non_causal():
+        pytest.skip("causal=False runs only on the gfx950 Gluon kernel")
+    calls = _spy_gfx950_gluon(monkeypatch, path)
+    out, ref = _non_causal_case(
+        seq_lens, num_heads, head_size, block_size, dtype, sinks=False
+    )
+    assert calls, "causal=False did not run the gfx950 Gluon kernel"
+    _assert_non_causal_close(out, ref, dtype)
+
+
+@pytest.mark.parametrize(
+    "seq_lens",
+    [_NON_CAUSAL_SEQ_LENS[0], _NON_CAUSAL_SEQ_LENS[2], _NON_CAUSAL_SEQ_LENS[3]],
+)
+@pytest.mark.parametrize("dtype", [torch.bfloat16, e4m3_dtype])
+@torch.inference_mode()
+def test_unified_attn_non_causal_sinks_gfx950(seq_lens, dtype, monkeypatch):
+    if not unified_attention_supports_non_causal():
+        pytest.skip("causal=False runs only on the gfx950 Gluon kernel")
+    calls = _spy_gfx950_gluon(monkeypatch, "auto")
+    out, ref = _non_causal_case(seq_lens, (64, 8), 64, 64, dtype, sinks=True)
+    assert calls, "causal=False did not run the gfx950 Gluon kernel"
+    _assert_non_causal_close(out, ref, dtype)
+
+
+@pytest.mark.parametrize("kv_lens", [[300, 1500, 4000], [32768, 17]])
+@torch.inference_mode()
+def test_unified_attn_non_causal_decode_batch(kv_lens):
+    """A decode batch gives the same result for causal=True and causal=False."""
+    seq_lens = [(1, kv) for kv in kv_lens]
+    data = generate_data(
+        seq_lens=seq_lens,
+        num_blocks=len(seq_lens) * -(-max(kv_lens) // 16) + 8,
+        block_size=16,
+        head_size=128,
+        num_heads=(40, 8),
+        device="cuda",
+    )
+    query, key_cache, value_cache, output = data[0], data[3], data[4], data[6]
+    cu_query_lens, seqused_k, scale, block_tables = data[7], data[8], data[11], data[13]
+    outputs = []
+    for causal in (True, False):
+        out = torch.empty_like(output)
+        unified_attention(
+            q=query,
+            k=key_cache,
+            v=value_cache,
+            out=out,
+            cu_seqlens_q=cu_query_lens,
+            seqused_k=seqused_k,
+            max_seqlen_q=1,
+            max_seqlen_k=max(kv_lens),
+            softmax_scale=scale,
+            causal=causal,
+            window_size=(-1, -1),
+            block_table=block_tables,
+            softcap=0,
+            q_descale=None,
+            k_descale=None,
+            v_descale=None,
+        )
+        outputs.append(out)
+    torch.testing.assert_close(outputs[0], outputs[1], atol=0, rtol=0)
+
+
+@torch.inference_mode()
+def test_unified_attn_non_causal_rejects(monkeypatch):
+    """causal=False raises ValueError for the cases that it does not support."""
+    seq_lens = [(8, 300), (8, 600)]
+    data = generate_data(
+        seq_lens=seq_lens,
+        num_blocks=64,
+        block_size=16,
+        head_size=128,
+        num_heads=(40, 8),
+        device="cuda",
+    )
+    query, key_cache, value_cache, output = data[0], data[3], data[4], data[6]
+    cu_query_lens, seqused_k, block_tables = data[7], data[8], data[13]
+
+    def run(**kwargs):
+        args = {
+            "q": query,
+            "k": key_cache,
+            "v": value_cache,
+            "out": output,
+            "cu_seqlens_q": cu_query_lens,
+            "seqused_k": seqused_k,
+            "max_seqlen_q": 8,
+            "max_seqlen_k": 600,
+            "softmax_scale": 128**-0.5,
+            "causal": False,
+            "window_size": (-1, -1),
+            "block_table": block_tables,
+            "softcap": 0,
+            "q_descale": None,
+            "k_descale": None,
+            "v_descale": None,
+        }
+        args.update(kwargs)
+        unified_attention(**args)
+
+    # A finite left or right window bound, also in a decode batch.
+    for window_size in [(127, 0), (-1, 2)]:
+        with pytest.raises(ValueError, match="sliding window"):
+            run(window_size=window_size)
+    with pytest.raises(ValueError, match="sliding window"):
+        run(window_size=(127, 0), max_seqlen_q=1)
+
+    assert not unified_attention_supports_non_causal(backend="triton")
+    with pytest.raises(ValueError, match="causal=False"):
+        run(backend="triton")
+    if not unified_attention_supports_non_causal():
+        for backend in [None, "gluon"]:
+            with pytest.raises(ValueError, match="causal=False"):
+                run(backend=backend)
+        return
+    with pytest.raises(ValueError, match="causal=False"):
+        run(softcap=30.0)
+    # A V cache dtype that is not the K cache dtype.
+    with pytest.raises(ValueError, match="causal=False"):
+        run(v=value_cache.to(e4m3_dtype))
+
+    # An arch without Gluon support, with backend="gluon": ValueError, not the
+    # AssertionError of the Gluon backend check.
+    module = sys.modules[unified_attention.__module__]
+    monkeypatch.setattr(module, "DEVICE_ARCH", "gfx942")
+    monkeypatch.setattr(module, "_is_gluon_available", lambda: False)
+    with pytest.raises(ValueError, match="gfx950 Gluon"):
+        run(backend="gluon")
