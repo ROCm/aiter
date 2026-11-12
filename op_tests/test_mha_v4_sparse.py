@@ -216,17 +216,23 @@ def _default_kv_tile(q_format=None, v_format=None, mode=MHA_V4_SPARSE_MODE):
     operand-blind query raises. Defaults to the per-tensor FP8 row, which is what most of the
     tests here build, and takes the formats where a test is parametrized over them.
     """
+    return mha_v4_kv_tile(_default_operands(q_format, v_format), mode)
+
+
+def _default_block_tile(q_format=None, v_format=None, mode=MHA_V4_SPARSE_MODE):
+    """The (q_tile, kv_tile) to name to mha_v4_packed for a LUT cut at _default_kv_tile()."""
+    return mha_v4_block_tile(_default_operands(q_format, v_format), mode)
+
+
+def _default_operands(q_format=None, v_format=None):
     q_format = native_fp8_format() if q_format is None else q_format
     v_format = native_fp8_format() if v_format is None else v_format
-    return mha_v4_kv_tile(
-        mha_v4_operands(
-            q_format,
-            q_format,
-            v_format,
-            *scale_modes_for_formats(q_format, q_format, v_format),
-            _v_pack(q_format, v_format),
-        ),
-        mode,
+    return mha_v4_operands(
+        q_format,
+        q_format,
+        v_format,
+        *scale_modes_for_formats(q_format, q_format, v_format),
+        _v_pack(q_format, v_format),
     )
 
 
@@ -274,6 +280,35 @@ def test_mha_v4_packed_rejects_partial_lut():
             AttentionScaleMode.F32_PER_TENSOR,
             AttentionScaleMode.F32_PER_TENSOR,
             kv_block_indices=dummy,
+        )
+
+
+@parametrize("pooled", [False, True], ids=["sparse", "sol"])
+def test_mha_v4_packed_rejects_a_lut_without_its_block_tile(pooled):
+    """A LUT holds block numbers, not their size: read at another KV tile, a 128-key LUT names
+    the wrong 64-key blocks with every index still in range, so no later check can catch it.
+    The geometry has to come from whoever built the LUT, never from a default that moves with
+    the manifest.
+    """
+    dummy = torch.empty(0)
+    lut = {"kv_block_indices": dummy, "lut_start": dummy, "lut_count": dummy}
+    if pooled:
+        lut.update(mean_k=dummy, mean_v=dummy, block_bitmap=dummy)
+    with expect_raises(ValueError, match="pass the block_tile"):
+        mha_v4_packed(
+            dummy,
+            dummy,
+            dummy,
+            dummy,
+            dummy,
+            dummy,
+            AttentionFormat.BF16,
+            AttentionFormat.BF16,
+            AttentionFormat.BF16,
+            AttentionScaleMode.NONE,
+            AttentionScaleMode.NONE,
+            AttentionScaleMode.NONE,
+            **lut,
         )
 
 
@@ -325,6 +360,7 @@ def test_mha_v4_block_mask_without_a_sparse_row_names_the_recipe():
             kv_block_indices=lut,
             lut_start=lut,
             lut_count=lut,
+            block_tile=(256, 64),
         )
 
 
@@ -962,6 +998,7 @@ def _sparse_fp8_launch(q, k, v, block_mask=None):
             "kv_block_indices": indices,
             "lut_start": start,
             "lut_count": count,
+            "block_tile": _default_block_tile(),
         }
     fp8_format = native_fp8_format()
     return mha_v4_packed(
@@ -1267,6 +1304,7 @@ def test_mha_v4_sparse_rejects_empty_kv_block_indices():
             kv_block_indices=torch.zeros(0, dtype=torch.int32, device=device),
             lut_start=torch.zeros(rows, dtype=torch.int32, device=device),
             lut_count=torch.ones(rows, dtype=torch.int32, device=device),
+            block_tile=_default_block_tile(),
         )
 
 
@@ -1351,6 +1389,7 @@ def test_mha_v4_packed_sparse_rejects_per_batch_key_lengths():
             kv_block_indices=torch.zeros(rows, dtype=torch.int32, device=device),
             lut_start=torch.zeros(rows, dtype=torch.int32, device=device),
             lut_count=torch.ones(rows, dtype=torch.int32, device=device),
+            block_tile=_default_block_tile(),
             seqlens_k=torch.full((1,), 128, dtype=torch.int32, device=device),
         )
 
@@ -1383,6 +1422,7 @@ def test_mha_v4_sparse_bf16_rejects_lut_beyond_lds_capacity():
             kv_block_indices=indices,
             lut_start=row,
             lut_count=row,
+            block_tile=_default_block_tile(bf16, bf16),
         )
 
 
@@ -1409,6 +1449,7 @@ def test_mha_v4_sparse_validation_rejects_malformed_lut(mutation, message):
 from op_tests.test_mha_v4_sparse import (
     AttentionFormat,
     AttentionScaleMode,
+    _default_block_tile,
     _default_kv_tile,
     _sparse_fp8_operands,
     _tile_mask,
@@ -1444,6 +1485,7 @@ mha_v4_packed(
     kv_block_indices=indices,
     lut_start=start,
     lut_count=count,
+    block_tile=_default_block_tile(),
 )
 """
     env = {**os.environ, "AITER_MHA_V4_VALIDATE_LUT": "1"}
@@ -2061,6 +2103,7 @@ def _sol_attn_launch(
     k_variance=True.
     """
     recipe = _FP8_SOL_ATTN_RECIPE if recipe is None else recipe
+    block_tile = recipe.block_tile() if block_tile is None else block_tile
     return mha_v4_packed(
         q.quantized,
         k.quantized,
@@ -2725,6 +2768,7 @@ def test_mha_v4_sol_pooled_scales_must_match_the_scale_modes(recipe):
             mean_k=plan["mean_k"],
             mean_v=plan["mean_v"],
             block_bitmap=plan["block_bitmap"],
+            block_tile=recipe.block_tile(),
             v_pack=recipe.v_pack,
             **scales,
         )

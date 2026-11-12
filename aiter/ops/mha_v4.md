@@ -168,7 +168,10 @@ operands being launched; `mha_v4_kv_tile()` without operands raises where the ro
 than returning a tile the mask may not match.
 
 Packed callers pass all or none of the int32 LUT triple: `kv_block_indices`, `lut_start`, and
-`lut_count`, plus `block_tile` for a non-default geometry. LUT/work-table rows are per query head,
+`lut_count`, and with it the `block_tile` the LUT was built for. It is required: a LUT holds block
+numbers, not their size, so one read at another KV tile attends to the wrong keys with every index
+still in range, and a default that moves with the manifest would do exactly that to an old LUT.
+LUT/work-table rows are per query head,
 including under GQA. Dense uses manifest `mode=0`; sorted sparse uses `mode=1` and a separate
 launcher/code object. A row declaring `ragged_kv` accepts a key length that is not a multiple of
 its KV tile; the others refuse it.

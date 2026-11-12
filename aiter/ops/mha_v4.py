@@ -1730,8 +1730,10 @@ def mha_v4_packed(
     packer's records, as sol_prepare() returns them.
 
     block_tile names the (q_tile, kv_tile) geometry the LUT and pooled tensors
-    were built for; it defaults to this call's own operands' geometry, since
-    gfx950's rows no longer agree on the KV tile at a given Q tile. Pass 64x64
+    were built for, and is required with a LUT. A LUT holds block numbers, not
+    their size, so a LUT read at another KV tile attends to the wrong keys with
+    every index still in range; mha_v4_block_tile(mha_v4_operands(...), mode)
+    is the geometry these operands default to elsewhere. Pass 64x64
     to route at a 64-token block with a 64-row query tile as well, which costs
     throughput per token -- the same KV is re-read by four times as many query
     tiles -- and only pays off if the finer blocks drop enough attention mass.
@@ -1803,6 +1805,12 @@ def mha_v4_packed(
         raise ValueError(
             "Sol-Attn MHA v4 needs the ragged LUT triple as well: the pooled pass corrects the "
             "blocks the LUT did not compute exactly, so it has no meaning without one"
+        )
+    if lut is not None and block_tile is None:
+        raise ValueError(
+            "a LUT records block numbers, not how many keys a block spans, so pass the "
+            "block_tile=(q_tile, kv_tile) it was built for; mha_v4_block_tiles() lists the "
+            "geometries these operands have"
         )
     if pooled is None and (mean_k_scale is not None or mean_v_scale is not None):
         raise ValueError(
@@ -1912,17 +1920,13 @@ def mha_v4_packed(
             v_pack,
         )
         mode = MHA_V4_SOL_MODE if pooled is not None else MHA_V4_SPARSE_MODE
-        q_tile, kv_tile = (
-            mha_v4_block_tile(operands, mode)
-            if block_tile is None
-            else tuple(block_tile)
-        )
-        if block_tile is None and kv_tile == 0:
-            raise NotImplementedError(
-                f"block-sparse MHA v4 has no {get_gfx()} row for "
-                f"Q={q_format.name} K={k_format.name} V={v_format.name}"
-            )
+        q_tile, kv_tile = tuple(block_tile)
         if kv_tile <= 0 or mha_v4_kv_tile_for_q_tile(q_tile, operands, mode) != kv_tile:
+            if not mha_v4_block_tiles(operands, mode):
+                raise NotImplementedError(
+                    f"{mode_name} MHA v4 has no {get_gfx()} row for "
+                    f"Q={q_format.name} K={k_format.name} V={v_format.name}"
+                )
             raise ValueError(
                 f"{mode_name} MHA v4 has no {q_tile}x{kv_tile} kernel on this GPU for "
                 f"q={q_format.name} k={k_format.name} v={v_format.name}; those operands have "
