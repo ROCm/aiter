@@ -591,14 +591,12 @@ def _validate_bwd_metadata_values(
 # heads than the reduction serves, explicit fallback tiles, or a scratch that
 # does not fit -- runs the fallback pair: dV/dK owns KV rows, dQ owns query
 # rows, and each single-writer kernel has an independent tuned configuration.
-# CSV tags identify the three kernels.
+# CSV tags identify the two kernels.
 _BWD_KERNEL_DVDK = "dvdk"
 _BWD_KERNEL_DQ = "dq"
-_BWD_KERNEL_FUSED = "fused"
 _BWD_KERNELS = (
     _BWD_KERNEL_DVDK,
     _BWD_KERNEL_DQ,
-    _BWD_KERNEL_FUSED,
 )
 # The only tile the fused kernel is built for: 8 waves give 2 per SIMD inside
 # one barrier domain, and BLOCK_M quantises to 128 (8 waves x MFMA_M 16), so 256
@@ -612,6 +610,11 @@ _BWD_FUSED_TILES = {
 # Fraction of the reachable memory (`_fused_scratch_budget`) the fp32 split-K
 # scratch and its carry may claim; the remainder is torch's allocator slack.
 _BWD_FUSED_MEM_BUDGET = 0.8
+# Fraction of the device's TOTAL memory the scratch and carry may claim however
+# much is free (`_fused_scratch_cap`). On an idle MI300X this keeps the G that
+# the free-memory budget alone picks at N=16384, d=64, B=1024: G=2 at H=4 and
+# G=5 at H=8, so the default timings do not change.
+_BWD_FUSED_SCRATCH_CAP = 0.5
 
 _BWD_CSV_COLUMNS: list[str] = [
     "arch",
@@ -970,7 +973,6 @@ def _resolve_bwd_fused_config(
     num_heads: int,
     head_dim: int,
     hidden_dim: int,
-    batch: int,
     max_seq_len: int,
     causal: bool,
     has_targets: bool,
@@ -988,6 +990,10 @@ def _resolve_bwd_fused_config(
     never uses it. True exists because the default degrades to the fallback pair
     silently, which is how a benchmark ends up timing a kernel it did not ask
     for.
+
+    Under CUDA graph capture the fallback pair runs: the fused path plans its
+    scratch from sequence lengths read back to the host, which a capture
+    cannot do.
     """
     if fused is False:
         return None
@@ -996,22 +1002,18 @@ def _resolve_bwd_fused_config(
         "false",
     ):
         return None
+    if torch.cuda.is_current_stream_capturing():
+        if fused is True:
+            raise RuntimeError(
+                "hstu bwd fused cannot run under CUDA graph capture: it reads "
+                "the sequence lengths back to the host to plan its scratch. "
+                "Use fused=None or fused=False to capture the fallback pair."
+            )
+        return None
 
-    tuned_config = _get_bwd_tuned_config(
-        kernel=_BWD_KERNEL_FUSED,
-        dtype_str=dtype_str,
-        num_heads=num_heads,
-        head_dim=head_dim,
-        hidden_dim=hidden_dim,
-        batch=batch,
-        max_seq_len=max_seq_len,
-        max_attn_len=max_attn_len,
-        contextual_seq_len=contextual_seq_len,
-        has_targets=has_targets,
-    )
-    # A tuned row brings its own tile and has to match the gate anyway; explicit
-    # tiles are the fallback pair's, so any that differ fail the gate below.
-    config = {**_BWD_FUSED_TILES, **tuned_config, **custom_config}
+    # The fused kernel has exactly one tile, so it takes no tuned-CSV rows.
+    # Explicit tiles are the fallback pair's, so any that differ fail the gate.
+    config = {**_BWD_FUSED_TILES, **custom_config}
     arch, num_cus = _device_arch_and_cus(device.index)
     try:
         validate_hstu_attention_bwd(
@@ -1055,6 +1057,19 @@ def _fused_scratch_budget(device: torch.device) -> float:
     return (free + max(releasable, 0)) * _BWD_FUSED_MEM_BUDGET
 
 
+def _fused_scratch_cap(device: torch.device) -> float:
+    """Most bytes the split-K scratch and carry may ever take on `device`.
+
+    AITER_HSTU_BWD_FUSED_SCRATCH_GB sets it in GB (1e9 bytes); otherwise it is
+    `_BWD_FUSED_SCRATCH_CAP` of the device's total memory.
+    """
+    cap_gb = os.environ.get("AITER_HSTU_BWD_FUSED_SCRATCH_GB")
+    if cap_gb:
+        return float(cap_gb) * 1e9
+    total = torch.cuda.get_device_properties(device).total_memory
+    return total * _BWD_FUSED_SCRATCH_CAP
+
+
 def _plan_fused_groups(
     counts: list[int],
     *,
@@ -1078,10 +1093,14 @@ def _plan_fused_groups(
     traffic, which exists only at G > 1 and costs 2*(G-1) passes over L*H*D
     fp32.
 
-    Memory is settled by ATTEMPTING, not by predicting: the estimate below
-    cannot see how the reachable memory is laid out, while the scratch is one
-    large contiguous block. So: estimate, try, and on OOM release the cache and
-    step G up.
+    The footprint is bounded by `_fused_scratch_cap`, a fixed share of the
+    device, so it does not grow with whatever memory happens to be free. If
+    even the largest G exceeds the cap, this raises MemoryError and the
+    dispatch runs the fallback pair.
+
+    Below the cap, memory is settled by ATTEMPTING, not by predicting: the
+    estimate cannot see how the reachable memory is laid out, while the scratch
+    is one large contiguous block. So: estimate, try, and on OOM step G up.
 
     The estimate has to stay on the safe side, because a failed attempt is far
     from free: the allocator first releases every whole cached segment --
@@ -1089,9 +1108,6 @@ def _plan_fused_groups(
     reused -- and the planner then reallocates it, several hundred ms per call
     at deployment sizes. Hence `_fused_scratch_budget` ignores the free pieces
     of partly-used segments.
-
-    `empty_cache()` is deliberately NOT on the fast path. It hands the scratch
-    back to the driver, so the next call could not reuse it.
     """
     n_kv_tiles = len(counts)
     elems = num_heads * head_dim
@@ -1113,11 +1129,21 @@ def _plan_fused_groups(
     if groups != "auto":
         candidates = [int(groups)]
     else:
-        budget = _fused_scratch_budget(device)
+        cap = _fused_scratch_cap(device)
+        budget = min(cap, _fused_scratch_budget(device))
         first = next(
             (g for g in range(1, n_kv_tiles + 1) if _plan(g)[2] <= budget),
-            n_kv_tiles,
+            None,
         )
+        if first is None:
+            smallest = _plan(n_kv_tiles)[2]
+            if smallest > cap:
+                raise MemoryError(
+                    f"hstu bwd fused: the smallest pass needs "
+                    f"{smallest / 1e9:.1f} GB, over the {cap / 1e9:.1f} GB "
+                    f"scratch cap (AITER_HSTU_BWD_FUSED_SCRATCH_GB)"
+                )
+            first = n_kv_tiles
         candidates = list(range(first, n_kv_tiles + 1))
 
     last_error = None
@@ -1131,19 +1157,19 @@ def _plan_fused_groups(
             # clamps row indices to seq_len-1 and, under a window, never
             # reads past a slot. Keep the two in step or restore the memset.
             dq_part = torch.empty(rows, elems, dtype=torch.float32, device=device)
-            dq_carry = (
-                torch.zeros(1, 1, dtype=torch.float32, device=device)
-                if g == 1
-                else torch.zeros(
-                    total_tokens, elems, dtype=torch.float32, device=device
-                )
+            # The carry needs no memset either: pass 0 (`first_pass`) never
+            # reads it and writes every token row before a later pass does.
+            dq_carry = torch.empty(
+                1 if g == 1 else total_tokens,
+                1 if g == 1 else elems,
+                dtype=torch.float32,
+                device=device,
             )
         except torch.cuda.OutOfMemoryError as exc:
+            # The allocator has already released its free cached segments
+            # before raising, so stepping G up is the only thing left to do.
             last_error = str(exc)
-            # Drop a scratch that did fit before the carry did not, then hand
-            # the fragmented cached blocks back to the driver.
             dq_part = dq_carry = None
-            torch.cuda.empty_cache()
             continue
         return g, spans, dq_part, dq_carry
 
@@ -1213,7 +1239,6 @@ def _make_bwd_fused_runners(
             num_heads=num_heads,
             head_dim=head_dim,
             hidden_dim=hidden_dim,
-            batch=batch,
             max_seq_len=N,
             causal=causal,
             has_targets=has_targets,
@@ -1460,13 +1485,20 @@ def flydsl_hstu_attention_bwd(
     gfx942 / bf16 / head_dim == hidden_dim == 64 / no contextual prefix and its
     own tile, and trades a large fp32 split-K scratch for the latency win, so
     `fused_groups` chunks the kv tiles into passes over one reused buffer
-    ("auto" picks the smallest G that fits). Any other shape, explicit tile
-    overrides, or a scratch that does not fit run the fallback pair instead,
-    which computes dV/dK in one kernel and dQ in a second.
+    ("auto" picks the smallest G that fits both the free memory and a cap of
+    half the device's memory, which AITER_HSTU_BWD_FUSED_SCRATCH_GB overrides
+    in GB). Any other shape, explicit tile overrides, or a scratch that does
+    not fit run the fallback pair instead, which computes dV/dK in one kernel
+    and dQ in a second.
 
     `fused` overrides the choice: None picks as above (AITER_HSTU_BWD_FUSED=0
     forces the fallback), True requires the single-pass kernel and raises
     instead of falling back, False always uses the fallback pair.
+
+    The fused path plans its scratch from the sequence lengths, which it copies
+    to the host on every call. The call therefore returns only once the work
+    already queued on the stream has finished, and under CUDA graph capture
+    the default dispatch runs the fallback pair instead.
 
     All work is queued on `stream` (default: the current stream), after the
     work already queued on the current stream. The returned gradients are
@@ -1515,7 +1547,6 @@ def flydsl_hstu_attention_bwd(
         num_heads=num_heads,
         head_dim=head_dim,
         hidden_dim=hidden_dim,
-        batch=batch,
         max_seq_len=N,
         causal=causal,
         has_targets=num_targets is not None,

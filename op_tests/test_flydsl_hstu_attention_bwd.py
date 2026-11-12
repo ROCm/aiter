@@ -25,7 +25,6 @@ fp32 scores, so it is skipped (``err`` empty) for cases where that would not fit
 import argparse
 import csv
 import itertools
-import weakref
 
 import pandas as pd
 import pytest
@@ -1009,7 +1008,6 @@ def test_bwd_fused_gate_reads_the_tensors_device(
         "num_heads": 4,
         "head_dim": 64,
         "hidden_dim": 64,
-        "batch": 32,
         "max_seq_len": 1024,
         "causal": True,
         "has_targets": False,
@@ -1026,40 +1024,94 @@ def test_bwd_fused_gate_reads_the_tensors_device(
 
 
 @requires_fused
-def test_bwd_fused_oom_retry_releases_failed_attempt(monkeypatch):
-    """An OOM on the carry steps G up WITHOUT keeping the failed scratch alive."""
-    real_empty, real_zeros = torch.empty, torch.zeros
-    scratch_refs = []
-    zeros_calls = []
+def test_flydsl_bwd_fused_oom_falls_back(monkeypatch):
+    """A fused scratch that does not fit runs the fallback pair, with correct
+    gradients; an explicit `fused=True` reports the failure instead."""
 
-    def fake_empty(*args, **kwargs):
-        for ref in scratch_refs:
-            assert ref() is None, "the failed attempt's scratch is still alive"
-        out = real_empty(*args, **kwargs)
-        scratch_refs.append(weakref.ref(out))
-        return out
+    def no_memory(*_args, **_kwargs):
+        raise torch.cuda.OutOfMemoryError("synthetic scratch OOM")
 
-    def fake_zeros(*args, **kwargs):
-        zeros_calls.append(args)
-        if len(zeros_calls) == 1:
-            raise torch.cuda.OutOfMemoryError("synthetic carry OOM")
-        return real_zeros(*args, **kwargs)
+    monkeypatch.setattr(hstu_kernels, "_plan_fused_groups", no_memory)
+    b, h, n, d = (_FUSED_CASE[key] for key in ("b", "h", "n", "d"))
+    alpha = 1.0 / d * 10000
+    q, k, v, dout, seq_offsets, num_targets = _fused_inputs(b, h, n, d)
+    args = (n, alpha, q, k, v, dout, seq_offsets, True, num_targets, 0, 0)
+    with pytest.raises(torch.cuda.OutOfMemoryError):
+        flydsl_hstu_attention_bwd(*args, fused=True)
 
-    monkeypatch.setattr(torch.cuda, "mem_get_info", lambda device=None: (1 << 40,) * 2)
-    monkeypatch.setattr(torch, "empty", fake_empty)
-    monkeypatch.setattr(torch, "zeros", fake_zeros)
-    groups, spans, _dq_part, dq_carry = hstu_kernels._plan_fused_groups(
-        [300, 200, 100],
-        block_m=256,
-        num_heads=1,
-        head_dim=64,
-        max_seq_len=768,
-        total_tokens=600,
-        groups="auto",
-        device=torch.device("cuda"),
+    dq_ref, dk_ref, dv_ref = hstu_bwd_reference(
+        n, alpha, q, k, v, seq_offsets, True, num_targets, 0, 0, dout
     )
-    assert groups == 2 and len(spans) == 2
-    assert dq_carry.shape == (600, 64)
+    dq, dk, dv = flydsl_hstu_attention_bwd(*args)
+    assert_grads_close(dq, dk, dv, dq_ref, dk_ref, dv_ref)
+
+
+@requires_fused
+def test_flydsl_bwd_fused_scratch_cap(monkeypatch):
+    """The scratch cap bounds the automatic plan: a cap below the single-pass
+    scratch chunks the kv tiles, and a cap below any pass runs the fallback
+    pair (or raises when the fused kernel is required)."""
+    # Full-length sequences, so every extra pass shrinks the footprint: one
+    # pass holds 4 + 3 + 2 + 1 tiles of rows, four passes 4 plus the carry.
+    n, d = 1024, 64
+    alpha = 1.0 / d * 10000
+    q, k, v, dout, seq_offsets = _inputs_with_lengths([n] * 8, d=d)
+    num_targets = None
+    args = (n, alpha, q, k, v, dout, seq_offsets, True, num_targets, 0, 0)
+
+    single = hstu_kernels._make_bwd_fused_runners(*args, groups=1)
+    single["all"]()
+    expected = [t.clone() for t in single["outputs"]]
+    cap = single["scratch_bytes"] - 1
+    del single
+
+    monkeypatch.setenv("AITER_HSTU_BWD_FUSED_SCRATCH_GB", str(cap / 1e9))
+    capped = hstu_kernels._make_bwd_fused_runners(*args)
+    assert capped["groups"] > 1
+    assert capped["scratch_bytes"] + capped["carry_bytes"] <= cap
+    capped["all"]()
+    for name, got, ref in zip(("dq", "dk", "dv"), capped["outputs"], expected):
+        assert torch.equal(got, ref), f"{name} depends on the scratch cap"
+
+    monkeypatch.setenv("AITER_HSTU_BWD_FUSED_SCRATCH_GB", "1e-9")
+    with pytest.raises(MemoryError, match="scratch cap"):
+        flydsl_hstu_attention_bwd(*args, fused=True)
+    dq_ref, dk_ref, dv_ref = hstu_bwd_reference(
+        n, alpha, q, k, v, seq_offsets, True, num_targets, 0, 0, dout
+    )
+    assert_grads_close(*flydsl_hstu_attention_bwd(*args), dq_ref, dk_ref, dv_ref)
+
+
+@requires_fused
+@pytest.mark.filterwarnings("ignore:The CUDA Graph is empty")
+def test_flydsl_bwd_default_dispatch_is_graph_capturable(monkeypatch):
+    """The default dispatch captures (as the fallback pair) and replays to the
+    eager fallback result; a required fused kernel refuses the capture."""
+    # The opt-in value checks read the metadata on the host, which a capture
+    # cannot do; production runs without them.
+    monkeypatch.delenv("AITER_HSTU_VALIDATE")
+    b, h, n, d = (_FUSED_CASE[key] for key in ("b", "h", "n", "d"))
+    alpha = 1.0 / d * 10000
+    q, k, v, dout, seq_offsets, num_targets = _fused_inputs(b, h, n, d)
+    args = (n, alpha, q, k, v, dout, seq_offsets, True, num_targets, 0, 0)
+    expected = flydsl_hstu_attention_bwd(*args, fused=False)
+    # Warm up outside the capture so no compile or cache build lands in it.
+    flydsl_hstu_attention_bwd(*args)
+    torch.cuda.synchronize()
+
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        got = flydsl_hstu_attention_bwd(*args)
+    graph.replay()
+    torch.cuda.synchronize()
+    for name, g, e in zip(("dq", "dk", "dv"), got, expected):
+        assert torch.equal(g, e), f"captured {name} differs from the fallback pair"
+
+    with (
+        pytest.raises(RuntimeError, match="graph capture"),
+        torch.cuda.graph(torch.cuda.CUDAGraph()),
+    ):
+        flydsl_hstu_attention_bwd(*args, fused=True)
 
 
 @requires_fused
@@ -1142,55 +1194,6 @@ def test_flydsl_bwd_unmeasured_occupancy_uses_fallback():
     )
     dq, dk, dv = flydsl_hstu_attention_bwd(*args, waves_per_eu=4)
     assert_grads_close(dq, dk, dv, dq_ref, dk_ref, dv_ref)
-
-
-def test_fused_scratch_budget_ignores_split_free_blocks(monkeypatch):
-    """Free pieces of partly-used segments do not count toward the scratch.
-
-    Counting them made the planner try a G whose scratch could not be placed;
-    the allocator then released the previous call's reusable scratch before
-    failing, and every call paid a full reallocation.
-    """
-    gib = 1 << 30
-    monkeypatch.setattr(
-        torch.cuda, "mem_get_info", lambda device=None: (10 * gib, 192 * gib)
-    )
-    monkeypatch.setattr(
-        torch.cuda,
-        "memory_stats",
-        lambda device=None: {
-            "reserved_bytes.all.current": 100 * gib,
-            "allocated_bytes.all.current": 30 * gib,
-            "inactive_split_bytes.all.current": 50 * gib,
-        },
-    )
-    budget = hstu_kernels._fused_scratch_budget(torch.device("cuda"))
-    # 10 free + (100 - 30 - 50) whole cached segments.
-    assert budget == pytest.approx(30 * gib * hstu_kernels._BWD_FUSED_MEM_BUDGET)
-
-
-def test_bwd_tuned_csv_accepts_fused_discriminator(tmp_path):
-    """A `fused` row resolves like any other kernel's, independently of dvdk/dq."""
-    path = _write_bwd_csv(
-        tmp_path / "tuned_bwd.csv",
-        [
-            _bwd_row(
-                kernel="fused",
-                head_dim=64,
-                hidden_dim=64,
-                block_m=256,
-                block_n=16,
-                num_waves=8,
-                waves_per_eu=2,
-            )
-        ],
-    )
-
-    config_map = hstu_kernels._bwd_tuned_config_map(path)
-
-    ((_problem_key, kernel),) = config_map.keys()
-    assert kernel == "fused"
-    assert config_map[(_problem_key, kernel)] == hstu_kernels._BWD_FUSED_TILES
 
 
 # --------------------------------------------------------------------------- #

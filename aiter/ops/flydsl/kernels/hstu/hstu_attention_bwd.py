@@ -108,12 +108,6 @@ def phase_barrier():
     rocdl.sched_barrier(0)
 
 
-# NOTE: these are read inside the traced kernel body. FlyDSL's disk cache keys
-# on the kernel function's source text and its closure values -- a module global
-# is NEITHER, so editing one here does NOT invalidate a cached binary. When
-# tuning them, either `rm -rf ~/.flydsl/cache` or set
-# FLYDSL_RUNTIME_ENABLE_CACHE=0.
-#
 # Depth of the rolling LDS operand window, in operand groups.  The MFMA at group
 # `g` consumes the pack read at `g - PREFETCH_W`, so each read has
 # PREFETCH_W * KV_OWNED_SUBTILES MFMAs of cover against the ~130-cycle
@@ -658,7 +652,8 @@ def build_hstu_attention_bwd(
         _dma_atom, _dma_ptr_ty, _rebased_buffer_div = make_lds_dma(DMA_BYTES, elem_type)
         c_stride_n = fx.Int32(stride_qk_n)
         c_dma_elems = fx.Int32(DMA_ELEMS)
-        c_pairs_per_row = fx.Int32(PAIRS_PER_ROW)
+        # DMA pair -> (column pair, tile row); the pairs cover the tile exactly.
+        pair_layout = fx.make_layout((PAIRS_PER_ROW, BLOCK_N), (1, PAIRS_PER_ROW))
 
         def make_dma(tensor, base_byte_off, dst_views, swizzled):
             div = _rebased_buffer_div(
@@ -678,9 +673,9 @@ def build_hstu_attention_bwd(
             last_row_elem = (seq_len - fx.Int32(1)) * c_stride_n
             rowoff, bound = [], []
             for d in range_constexpr(NUM_DMA):
-                pair = grp_tid + fx.Int32(d * GRP_THREADS)
-                row = pair // c_pairs_per_row
-                col = (pair % c_pairs_per_row) * c_dma_elems
+                pair = fx.idx2crd(grp_tid + fx.Int32(d * GRP_THREADS), pair_layout)
+                row = fx.Int32(fx.get_scalar(fx.get_(pair, 1)))
+                col = fx.Int32(fx.get_scalar(fx.get_(pair, 0))) * c_dma_elems
                 gcol = q_swz_col(row, col) if const_expr(swizzled) else col
                 rowoff.append(row * c_stride_n + gcol)
                 bound.append(last_row_elem + gcol)
@@ -718,8 +713,11 @@ def build_hstu_attention_bwd(
         dma_do = make_dma(do, do_base_byte_offset, do_views, True)
 
         # ---- staging duty: LDS -> LDS transpose ----------------------------
-        t_unit_row = grp_tid // fx.Int32(T_QGROUPS)
-        t_unit_qg = grp_tid % fx.Int32(T_QGROUPS)
+        t_unit = fx.idx2crd(
+            grp_tid, fx.make_layout((T_QGROUPS, head_dim), (1, T_QGROUPS))
+        )
+        t_unit_row = fx.Int32(fx.get_scalar(fx.get_(t_unit, 1)))
+        t_unit_qg = fx.Int32(fx.get_scalar(fx.get_(t_unit, 0)))
         t_unit_qbase = t_unit_qg * fx.Int32(MFMA_LANE_K)
         # The unit's transposed row `d` splits into the chunk that owns it and
         # the lane within that chunk -- which is exactly the [g][m][c] address.
@@ -948,8 +946,12 @@ def build_hstu_attention_bwd(
         dq_poff = part_off[fx.Int64(batch_idx * fx.Int32(num_kv_tiles) + kv_tile_idx)]
         # 256 lanes per group, 4 contiguous outputs each.
         dq_gtid = (wave_id % fx.Int32(NUM_WAVES // 2)) * fx.Int32(WARP_SIZE) + _lane
-        dq_frow = dq_gtid // fx.Int32(DQ_LANES_PER_ROW)
-        dq_fvec = dq_gtid % fx.Int32(DQ_LANES_PER_ROW)
+        dq_f = fx.idx2crd(
+            dq_gtid,
+            fx.make_layout((DQ_LANES_PER_ROW, BLOCK_N), (1, DQ_LANES_PER_ROW)),
+        )
+        dq_frow = fx.Int32(fx.get_scalar(fx.get_(dq_f, 1)))
+        dq_fvec = fx.Int32(fx.get_scalar(fx.get_(dq_f, 0)))
         dq_fcol = dq_fvec * fx.Int32(DQ_PER_LANE)
         dq_wbase = is_g0.select(fx.Int32(0), fx.Int32(NUM_WAVES // 2))
         # g1 publishes its group sum to the row g0 will read; g0 reads it. g1

@@ -17,7 +17,6 @@ row has one writer, so accumulation needs no atomics.
 """
 
 import functools
-import os
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
@@ -56,14 +55,8 @@ validate_hstu_attention_bwd_dq = validate_hstu_attention_bwd_fallback
 # exp2/reciprocal work with dA MFMAs without changing the live-state size.
 #
 # On gfx942 at head_dim=64 the late gate measured up to 16% faster on target
-# masks and neutral on plain causal.
-#
-# HSTU_DQ_GATE_LATE forces the placement for every head_dim: "1" defers, any
-# other value (including "true") evaluates the gate in GEMM1. It only affects
-# this fallback dQ kernel, not the fused default. Read once at import, so set it
-# before the process starts; the resolved flag is part of FlyDSL's kernel key.
-# `const_expr` is required below so FlyDSL removes the inactive path.
-_GATE_LATE_ENV = os.environ.get("HSTU_DQ_GATE_LATE")
+# masks and neutral on plain causal. `const_expr` is required below so FlyDSL
+# removes the inactive path.
 _GATE_LATE_MAX_HEAD_DIM = 64
 
 
@@ -128,11 +121,7 @@ def build_hstu_attention_bwd_dq(
     DK_STEPS = hidden_dim // MFMA_DA_K  # dA contraction steps (over hidden d)
     HC_CHUNKS = head_dim // MFMA_M  # dQ accumulator chunks (over head_dim)
 
-    GATE_LATE = (
-        head_dim <= _GATE_LATE_MAX_HEAD_DIM
-        if _GATE_LATE_ENV is None
-        else _GATE_LATE_ENV == "1"
-    )
+    GATE_LATE = head_dim <= _GATE_LATE_MAX_HEAD_DIM
 
     num_q_tiles = (max_seq_len + BLOCK_M - 1) // BLOCK_M
     # `hz` is a flattened (batch, head) index. Its total and per-group ceiling
