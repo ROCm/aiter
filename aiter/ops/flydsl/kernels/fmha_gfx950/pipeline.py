@@ -600,7 +600,9 @@ def _make_dualwave_swp_fp8_traits(
     lds_bytes = lds_kv_total_size * elem_bytes + vt_bf16_total * eb_bf
     if qlds:
         lds_bytes += block_m * head_dim * elem_bytes
-    if paged:
+    # bn64 reads page ids with scalar loads; only the default body stages the table in LDS.
+    paged_bt_lds = paged and body_variant != "conventional_bn64"
+    if paged_bt_lds:
         lds_bytes += paged_bt_lds_size * 4
     if lds_bytes > LDS_BYTES_GFX950:
         raise RuntimeError(
@@ -1047,6 +1049,28 @@ class DualwaveFp8KernelContext:
         self.q_block_idx = fx.Int64(q_block)
         self.q_start = fx.Index(q_block * fx.Int32(block_q))
 
+        # Page ids come from scalar loads, not an LDS-staged table. The descriptor is bounded by the table's
+        # extent; reads stay inside the sequence's row anyway (page_id_smem clamps to [0, t_end - 1]).
+        self.bt_buf = fx.get_iter(
+            fx.rocdl.make_buffer_tensor(self.BlockTable, max_size=False)
+        )
+        self.bt_row_i32 = b_i32 * fx.Int32(self.block_table_stride)
+        # Tile 0's page rides this lookup's round trip; init_tile_bounds zeroes it for an empty segment.
+        self.page0_raw = fx.rocdl.s_buffer_load(self.bt_buf, self.bt_row_i32)
+
+    def page_id_smem(self, tile, lower_clamp=True):
+        """Page of KV tile ``tile`` clamped into [0, t_end - 1]: one s_buffer_load into an SGPR.
+
+        The clamp keeps the read inside the row's valid entries, so table padding is never read. Drop the lower
+        clamp only where tile >= 0 is known.
+        """
+        tile = fx.Int32(tile)
+        last = fx.Int32(self.split_t_end) - fx.Int32(1)
+        clamped = (tile < last).select(tile, last)
+        if const_expr(lower_clamp):
+            clamped = (clamped > fx.Int32(0)).select(clamped, fx.Int32(0))
+        return fx.rocdl.s_buffer_load(self.bt_buf, self.bt_row_i32 + clamped)
+
     def init_sequence_lengths(self):
         traits = self.traits
         if const_expr(_bn64_compact_grid(traits)):
@@ -1162,11 +1186,13 @@ class DualwaveFp8KernelContext:
             )
             self.k_iter = fx.get_iter(self.K)
             self.v_iter = fx.get_iter(self.V)
-            self.block_table_stride_v = fx.Index(self.block_table_stride)
-            self.bt_div = fx.logical_divide(
-                fx.rocdl.make_buffer_tensor(self.BlockTable), fx.make_layout(1, 1)
-            )
-            self.bt_atom = fx.make_copy_atom(fx.rocdl.BufferCopy32b(), fx.Int32)
+            if const_expr(traits.BODY_VARIANT != "conventional_bn64"):
+                # bn64 reads page ids through bt_buf (_init_compact_sequence).
+                self.block_table_stride_v = fx.Index(self.block_table_stride)
+                self.bt_div = fx.logical_divide(
+                    fx.rocdl.make_buffer_tensor(self.BlockTable), fx.make_layout(1, 1)
+                )
+                self.bt_atom = fx.make_copy_atom(fx.rocdl.BufferCopy32b(), fx.Int32)
         else:
             self.k_div = _make_buf_div(self.K, kv_nrec_bytes)
             self.v_div = _make_buf_div(self.V, v_nrec_bytes)
@@ -1352,6 +1378,11 @@ class DualwaveFp8KernelContext:
 
         self.split_t0 = split_t0
         self.split_t_end = split_t_end
+        if const_expr(_bn64_compact_grid(traits)):
+            # An empty segment keeps page 0 (Decision 8): its tile-0 DMA then has an in-range base.
+            self.page0 = (fx.Int32(split_t_end) > fx.Int32(0)).select(
+                self.page0_raw, fx.Int32(0)
+            )
 
     def init_workspace_io(self):
         if const_expr(self.traits.SPLITK):

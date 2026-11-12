@@ -133,7 +133,7 @@ def build_flash_attn_dualwave_swp_fp8_module(
     # fx.Array rejects a length of 0.
     _q_lds_elems = BLOCK_M * HEAD_DIM if traits.QLDS else 16
 
-    if traits.PAGED:
+    if traits.PAGED and traits.BODY_VARIANT != "conventional_bn64":
 
         @fx.struct
         class SharedStorage:
@@ -396,13 +396,12 @@ def build_flash_attn_dualwave_swp_fp8_module(
         t0 = fx.Int64(ctx.split_t0)
         t_end = fx.Int64(ctx.split_t_end)
 
-        kv_gmem_to_lds.load_block_table_to_lds()
-        rocdl.s_waitcnt(vmcnt=0, lgkmcnt=0, expcnt=0)
-        fx.gpu.barrier()
-        page = kv_gmem_to_lds.end_page_ids(kv_gmem_to_lds.begin_page_ids([t0]))[0]
+        # Tile 0's page came with the sequence lookup; each later page is one scalar load ahead of its DMA.
+        page = fx.Int64(ctx.page0)
         # Tile 0's K/V DMAs ahead of Q's global loads: the first barrier's vmcnt(0) waits on the slowest of them.
         kv_gmem_to_lds.load_k(t0 * BN, fx.Int32(0), page)
         kv_gmem_to_lds.load_v(t0 * BN, fx.Int32(0), page)
+        next_page = ctx.page_id_smem(t0 + fx.Int64(1))
         # Q comes straight from global (no LDS stage) so 3 WGs fit per CU.
         ctx.init_q_row()
         q_row = ctx.q_row
@@ -418,7 +417,8 @@ def build_flash_attn_dualwave_swp_fp8_module(
         nsm = softmax_helper.nsm_init()
         l_row = ctx.c_zero_f
         v_o = [ctx.c_zero_v16f32 for _ in range_constexpr(D_CHUNKS)]
-        init_args = [nsm, l_row] + v_o
+        # The next tile's page rides the loop carry as an SGPR.
+        init_args = [nsm, l_row] + v_o + [next_page]
         loop_results = init_args
 
         def _bn64_prio(v):
@@ -529,7 +529,7 @@ def build_flash_attn_dualwave_swp_fp8_module(
             # pf <= t_main < t_end: a real tile, so no prefetch branch. pf < t_main is full; pf == t_main may be
             # partial (or causal-masked) only in its K tail, which the general loop masks, so K skips the tail sentinel.
             pf = j + fx.Int64(1)
-            page = kv_gmem_to_lds.end_page_ids(kv_gmem_to_lds.begin_page_ids([pf]))[0]
+            page = fx.Int64(loop_args[2 + D_CHUNKS])
             kv_gmem_to_lds.load_k(pf * BN, next_buf, page, real_tile=True, full=True)
             kv_gmem_to_lds.load_v(pf * BN, next_buf, page, real_tile=True)
             # As the general loop's prefetch branch: keep the DMA address math out of QK.
@@ -538,10 +538,15 @@ def build_flash_attn_dualwave_swp_fp8_module(
             v_s = gemm_helper.qk(v_k, q_wide)
             # Stands in for the mask branch: the max/exp would otherwise interleave into QK and spill Q.
             rocdl.sched_barrier(0)
+            # The page two tiles ahead after QK, so K's LDS-read waits do not also wait on it; it lands in the
+            # softmax. j + 2 >= 2 needs no lower clamp.
+            pf_page = ctx.page_id_smem(j + fx.Int64(2), lower_clamp=False)
             _bn64_prio(0)
             if const_expr(BN64_MAX_FREE):
-                return _fast_softmax_pv(j, loop_args, buf, v_s, first)
-            return _tile_softmax_pv(j, loop_args, buf, v_s, False)
+                out = _fast_softmax_pv(j, loop_args, buf, v_s, first)
+            else:
+                out = _tile_softmax_pv(j, loop_args, buf, v_s, False)
+            return out + [pf_page]
 
         # Unrolled by two over a unit-step pair counter: t0 is 0 (bn64 has no split-K), so pair halves read the
         # fixed LDS buffers 0 and 1. An odd leftover tile runs the dynamic body once.
@@ -571,11 +576,9 @@ def build_flash_attn_dualwave_swp_fp8_module(
             next_buf = fx.Int32(1) - buf
             _tile_top()
             pf = j + fx.Int64(1)
+            prefetch_page = fx.Int64(loop_args[2 + D_CHUNKS])
             if pf < t_end:
                 prefetch_loader = kv_gmem_to_lds
-                prefetch_page = prefetch_loader.end_page_ids(
-                    prefetch_loader.begin_page_ids([pf])
-                )[0]
                 prefetch_loader.load_k(pf * BN, next_buf, prefetch_page)
                 prefetch_loader.load_v(pf * BN, next_buf, prefetch_page)
             if const_expr(traits.CAUSAL):
@@ -598,8 +601,11 @@ def build_flash_attn_dualwave_swp_fp8_module(
                 hi_vis = None
                 v_k = kv_lds_to_regs.load_k(buf)
                 v_s = gemm_helper.qk(v_k, q_wide)
+            pf_page = ctx.page_id_smem(j + fx.Int64(2), lower_clamp=False)
             _bn64_prio(0)
-            loop_results = yield _tile_softmax_pv(j, loop_args, buf, v_s, True, hi_vis)
+            loop_results = yield _tile_softmax_pv(
+                j, loop_args, buf, v_s, True, hi_vis
+            ) + [pf_page]
         l_row = softmax_helper.finish_half_row_sum(loop_results[1])
         v_o = [loop_results[2 + i] for i in range_constexpr(D_CHUNKS)]
         _bn64_prio(0)
@@ -1128,7 +1134,10 @@ def build_flash_attn_dualwave_swp_fp8_module(
                 )
             if block_table_stride is None:
                 block_table_stride = block_table.stride(0)
-            if block_table_stride < -(-seq_len_kv // traits.BLOCK_N):
+            # bn64's router declines a narrow table (_shapes_ok); the default body stages a row into LDS.
+            if not BN64_SCALAR_SOFTMAX and block_table_stride < -(
+                -seq_len_kv // traits.BLOCK_N
+            ):
                 raise ValueError(
                     "block_table_stride is smaller than the maximum KV page count"
                 )

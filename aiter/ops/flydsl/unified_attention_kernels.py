@@ -325,6 +325,7 @@ def _shapes_ok(
     block_table,
     cu_seqlens_q,
     seqused_k,
+    max_seqlen_k,
     num_kv_heads,
     num_seqs,
     shuffled_kv_cache,
@@ -344,6 +345,11 @@ def _shapes_ok(
     if q.numel() >= _FP8_MAX_FLAT_ELEMS:
         return False
     if block_table.dim() != 2 or block_table.shape[0] < num_seqs:
+        return False
+    # Packed BN64 reads page ids straight from the table, so every KV page needs an entry in its row (the
+    # default body stages the row in LDS and checks the width itself).
+    packed = q.shape[1] // num_kv_heads in _PACKED_BN64_GROUPS
+    if packed and block_table.shape[1] < -(-max_seqlen_k // _PAGE_SIZE):
         return False
     # Metadata is read as flat int32 vectors; the tensor adaptor needs a stride-1 axis.
     for meta in (seqused_k, cu_seqlens_q):
@@ -570,6 +576,7 @@ def _supported(
             block_table,
             cu_seqlens_q,
             seqused_k,
+            max_seqlen_k,
             num_kv_heads,
             num_seqs,
             shuffled_kv_cache,
