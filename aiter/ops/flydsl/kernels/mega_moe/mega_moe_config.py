@@ -480,8 +480,8 @@ def large_m_mtprs_for(
 ) -> tuple[int, ...]:
     """Instance capacities the large-input kernel is built for on a FUSED_LAYOUTS layout.
 
-    EP8 DeepSeek-V4-Pro takes LARGE_M_MTPRS; EP4 DeepSeek-V4.1-Flash takes V41_FLASH_EP4_LARGE_M_MTPRS, the
-    capacities its one tune was measured at (see _tune_v41_flash_ep4_large).
+    EP8 DeepSeek-V4-Pro and EP8 DeepSeek-V4.1-Flash take LARGE_M_MTPRS; EP4 DeepSeek-V4.1-Flash takes
+    V41_FLASH_EP4_LARGE_M_MTPRS, the capacities its one tune was measured at (see _tune_v41_flash_ep4_large).
     """
     if (world_size, model_dim, inter_dim) == (4, 5120, 2304):
         return V41_FLASH_EP4_LARGE_M_MTPRS
@@ -1723,6 +1723,80 @@ def _tune_v41_flash_ep2_large(config: MegaMoEConfig) -> MegaMoEConfig:
     return replace(config, stage1=replace(config.stage1, num_dispatch_cu=96))
 
 
+def _tune_v41_flash_ep8_small(config: MegaMoEConfig, bucket: int) -> MegaMoEConfig:
+    """EP8 DeepSeek-V4.1-Flash small-input kernel (48 experts per rank), measured on gfx950 (8 ranks; uniform,
+    zipf 1.2 and all-to-rank-0 routes; ratios against the V4-Pro EP8 config, every fused knob off).
+
+    The EP4 tune (_tune_v41_flash_ep4_small) carries over: 1.2x at 1-2 tokens, 1.05-1.1x at 4-32 and 128 (1.2-1.3x
+    on skewed routes), 1.02-1.06x at 64 and 256-512. Each of its parts pays at EP8 too: without the dedup rows
+    -3..-5%, without the plan built in every CTA -2..-3%, without the written-through plan -1.5..-2%, without the
+    GEMM2 pointers in SGPRs -1%; without tok_done -5..-7% at 1 token and -3..-5% at 2-4 (so the small-input runtime
+    keeps its own payload and combine buffers, as at EP4); the 1-token GEMM1 knobs -9%, the 1-4 token lean
+    epilogue -1..-4%, the 128-token tile_n 256 -3..-16%.
+    """
+    config = _tune_v41_flash_ep4_small(config, bucket)
+    if bucket == 4:
+        # The 1-token GEMM1 schedule (head pointers in SGPRs, A and W1 two K-steps ahead, one wave a SIMD) at 4
+        # tokens too, whose grid is one CTA a CU as well (-3.5% uniform, -5% zipf, -8% skewed to one rank).
+        return replace(
+            config,
+            stage1=replace(config.stage1, waves_per_eu_hint=1),
+            fused_stage1=replace(
+                config.fused_stage1, head_uniform=True, g1_a_ahead=2, g1_lookahead=2
+            ),
+        )
+    if bucket == 16:
+        # EP4's 256-wide GEMM1 / GEMM2 tiles at 16 tokens: -5% uniform but +14% zipf; keep the 128-wide ones.
+        return replace(
+            config,
+            stage1=replace(config.stage1, tile_n=128),
+            stage2=replace(config.stage2, block_n=128),
+        )
+    if bucket in (32, 64):
+        # Half the GEMM1 n-tiles, as at 128 tokens: each streams a longer W1 slab (-3% uniform, -10..-18%
+        # skewed, neutral zipf).
+        return replace(config, stage1=replace(config.stage1, tile_n=256))
+    if bucket == 512:
+        # Half the CTAs leave GEMM1 for GEMM2 after 12/16 of their XCD's GEMM1 slice instead of 8/16: twice as many
+        # rows an expert as at EP4 keep GEMM1 longer on the critical path (-2.6% uniform, -3.4% zipf).
+        return replace(config, fused_stage2=replace(config.fused_stage2, early_p=12))
+    return config
+
+
+def _tune_v41_flash_ep8_large(config: MegaMoEConfig) -> MegaMoEConfig:
+    """EP8 DeepSeek-V4.1-Flash large-input kernel (48 experts per rank), measured on gfx950 at MTPR 16384 (8 ranks;
+    uniform, zipf 1.2 and all-to-rank-0 routes; ratios against the V4-Pro EP8 config, every fused knob off).
+
+    The EP4 tune (_tune_v41_flash_ep4_large) carries over except its GEMM2 claim order, streamed W1 loads and
+    per-token combine wait: 1.5-1.8x at 513-2048 tokens a rank and 1.15-1.3x at 4096-16384 on uniform routes,
+    1.15-1.6x up to 2048 on zipf routes (0.96-0.97x at 8192-16384, where the GEMM2 m-blocks of the hot experts
+    dominate), 1.1-1.3x on routes skewed to one rank. Each of its parts pays at EP8 too: without the dedup rows
+    -2..-8% (-20% at 513 zipf tokens), the tail tiles -2..-7%, the lean epilogues -5..-7%, the asm A reads -3..-5%.
+    """
+    config = _tune_v41_flash_ep4_large(config)
+    # Twice the rows an expert of EP4 make the hot experts of a skewed launch many GEMM2 m-blocks: claimed XCD-affine
+    # in 8-m-block groups, with half the CTAs leaving GEMM1 early, they run on one XCD's CTAs while the others idle.
+    # One claim counter per work shard instead: +15..+30% at 1024-16384 zipf tokens (-11% at 513) and +13..+37%
+    # skewed to one rank, -2% uniform. W1 loads cached (b_nt 0), as the V4-Pro default: the m-tiles of the larger
+    # experts reread the W1 slab from L2 (+4.5% skewed to one rank, +2% zipf, neutral uniform).
+    # The combine waits for every rank's GEMM2 (comb_tok_wait off): the per-token wait gains 1.5-5% at 513-2048
+    # uniform tokens a rank and under 1.6% from 4096 (the prefill chunks), but a runtime whose ranks can end apart
+    # keeps its own route-major payload, 3.9 GiB more per GPU at MTPR 16384.
+    return replace(
+        config,
+        stage1=replace(config.stage1, b_nt=0),
+        fused_stage2=replace(
+            config.fused_stage2,
+            xcd_chunk=0,
+            m_group=0,
+            early_k=0,
+            early_p_mid=0,
+            early_xcd=False,
+            comb_tok_wait=False,
+        ),
+    )
+
+
 @cache
 def _fused_config(
     bucket: int,
@@ -1740,6 +1814,8 @@ def _fused_config(
             return _tune_v41_flash_ep4_large(config)
         if layout == V41_FLASH_EP2_LAYOUT:
             return _tune_v41_flash_ep2_large(config)
+        if layout == V41_FLASH_EP8_LAYOUT:
+            return _tune_v41_flash_ep8_large(config)
         return config
     config = MegaMoEConfig(
         stage1=_small_m_stage1(bucket, expert_waves),
@@ -1750,6 +1826,8 @@ def _fused_config(
         return _tune_v41_flash_ep4_small(config, bucket)
     if layout == V41_FLASH_EP2_LAYOUT:
         return _tune_v41_flash_ep2_small(config, bucket)
+    if layout == V41_FLASH_EP8_LAYOUT:
+        return _tune_v41_flash_ep8_small(config, bucket)
     return config
 
 

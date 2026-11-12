@@ -478,6 +478,62 @@ def test_ep4_small_m_buckets_share_one_protocol(mtpr):
     assert tok_done_block_n == {256}
 
 
+# The EP8 V4.1-Flash fused configs (_tune_v41_flash_ep8_small / _large). On a mismatch the assertion shows the
+# current table.
+_V41EP8_FUSED_DIGEST = (
+    "39c4cdefb476832a40dfa3278cb2013ce19fb14d78c2b2753254cfefe6255472"
+)
+
+
+def test_v41ep8_fused_configs_unchanged():
+    table = {}
+    for mtpr, tokens in _FUSED_CASES:
+        table[(mtpr, tokens)] = _knob_table(
+            select_fused_config(tokens, mtpr, **V41_FLASH_EP8_SHAPE)
+        )
+    digest = hashlib.sha256(repr(sorted(table.items())).encode()).hexdigest()
+    assert digest == _V41EP8_FUSED_DIGEST, table
+
+
+def test_v41ep8_large_m_capacities():
+    """EP8 V4.1-Flash: every large-input capacity, all with the one tune measured at 16384."""
+    assert large_m_mtprs_for(world_size=8, model_dim=5120, inter_dim=2304) == (
+        LARGE_M_MTPRS
+    )
+    tuned = _knob_table(select_fused_config(16384, 16384, **V41_FLASH_EP8_SHAPE))
+    for mtpr in LARGE_M_MTPRS:
+        for tokens in (0, 1, LARGE_M_MIN_TOKENS, mtpr):
+            assert (
+                _knob_table(select_fused_config(tokens, mtpr, **V41_FLASH_EP8_SHAPE))
+                == tuned
+            ), (mtpr, tokens)
+    with pytest.raises(ValueError):
+        select_fused_config(32768, 32768, **V41_FLASH_EP8_SHAPE)
+
+
+@pytest.mark.parametrize("mtpr", (256, 512))
+def test_v41ep8_small_m_buckets_share_one_protocol(mtpr):
+    """As at EP4: the knobs that change what ranks and launches exchange are the same in every bucket."""
+    protocols = set()
+    for bucket in (b for b in FUSED_TOKEN_BUCKETS if b <= mtpr):
+        config = select_fused_config(bucket, mtpr, **V41_FLASH_EP8_SHAPE)
+        k = config.fused_stage1
+        protocols.add(
+            (
+                k.dedup_rows,
+                k.plan_local,
+                bool(k.direct_done),
+                k.tok_counters,
+                k.bf16_head_tokens,
+            )
+        )
+        assert not k.tok_done or (k.tok_counters and config.stage2.block_n == 256)
+        assert not k.tok_counters or (k.plan_local and k.dedup_rows)
+        # The unrolled A-ahead GEMM1 hung at grid_mult 2 (8 tokens) on gfx950: only grids of one CTA a CU take it.
+        assert k.g1_a_ahead == 1 or config.stage1.grid_mult == 1
+    assert protocols == {(True, True, True, True, 4)}
+
+
 def test_ep4_dispatch_cus_cover_two_expert_waves():
     """96 experts a rank are two 64-expert waves: twice the EP8 producers, capped at 224."""
     for tokens in (1, 4, 8, 16, 32, 64, 128, 256, 512):
@@ -517,7 +573,8 @@ def test_small_m_token_rows_live_in_the_payload_arena(mtpr):
     assert ep4[1] == 96 * (4 * mtpr) + 256 + 4 * mtpr
     assert ep4[1] * ep4[2] <= _TOKEN_REGION_END
     ep8f = rows(8, 5120, 2304)
-    assert ep8f[1] == 48 * (8 * mtpr) + 256
+    # EP8 V4.1-Flash takes EP4's dedup rows: one more row per (source rank, token).
+    assert ep8f[1] == 48 * (8 * mtpr) + 256 + 8 * mtpr
     assert ep8f[1] * ep8f[2] <= _TOKEN_REGION_END
 
 
@@ -537,10 +594,11 @@ def test_route_payload_sharing():
         assert LargeMRuntime.ends_all_ranks(max_tok_per_rank=mtpr, **ep8)
     for mtpr in large_m_mtprs_for(world_size=4, model_dim=5120, inter_dim=2304):
         assert not LargeMRuntime.ends_all_ranks(max_tok_per_rank=mtpr, **ep4)
-    # EP8 V4.1-Flash keeps the all-rank end: no run-ahead knob, shared payload.
+    # EP8 V4.1-Flash takes EP4's tok_done (its small-input runtime keeps its own payload) but not its
+    # comb_tok_wait (the large-input runtime shares the instance's payload arena).
     ep8f = dict(ep8, model_dim=5120, inter_dim=2304)
     for mtpr in DEFAULT_SMALL_M_MTPRS:
-        assert SmallMRuntime.ends_all_ranks(max_tok_per_rank=mtpr, **ep8f)
+        assert not SmallMRuntime.ends_all_ranks(max_tok_per_rank=mtpr, **ep8f)
     for mtpr in large_m_mtprs_for(world_size=8, model_dim=5120, inter_dim=2304):
         assert LargeMRuntime.ends_all_ranks(max_tok_per_rank=mtpr, **ep8f)
 
