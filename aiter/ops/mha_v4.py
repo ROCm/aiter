@@ -26,10 +26,7 @@ from aiter.jit.utils.chip_info import get_gfx
 from aiter.jit.utils.torch_guard import torch_compile_guard
 from aiter.ops.mha_v4_quant import (
     MHA_V4_HD256,
-    MHA_V4_KV_SCALE_LOOKAHEAD_ROWS,
-    MHA_V4_KV_TILE_ROWS,
     MHA_V4_LOG2E,
-    MHA_V4_MXFP4_K_SCALE_SLACK_BYTES,
     mha_v4_q_multiplier,
     mxfp4_k_view,
     mxfp4_v_view,
@@ -738,54 +735,6 @@ def _mha_v4_dense_kv_tile(operands, head_dim: int) -> int:
     return _mha_v4_dense_kv_tile_from_manifest(*operands, head_dim)
 
 
-def _head_major_k_scale(k_descale: Tensor, kv_tile: int) -> Tensor:
-    """Return the E8M0 K scales head-major, as the 64x64 MXFP8 and MXFP4 rows read them.
-
-    The producers write [b, sk, h_kv, 4], one row per token across every head, so a 64-token tile's
-    scales for one head sit on 64 cache lines; at long key lengths each of them misses L2. Head-major
-    puts them on two. The result keeps the logical shape and carries the layout in its strides,
-    which the launcher passes as the descale batch and head strides. Each head's run is padded to
-    whole tiles; the storage behind it covers the slack the launcher demands of MXFP4 K scales.
-    """
-    batch, sequence, heads, blocks = k_descale.shape
-    padded = -(-sequence // kv_tile) * kv_tile
-    slack_rows = (
-        -(-sequence // MHA_V4_KV_TILE_ROWS) * MHA_V4_KV_TILE_ROWS
-        + MHA_V4_KV_SCALE_LOOKAHEAD_ROWS
-        - sequence
-    )
-    image = batch * heads * padded * blocks
-    storage = k_descale.new_empty(
-        (image + slack_rows * heads * blocks + MHA_V4_MXFP4_K_SCALE_SLACK_BYTES,)
-    )
-    head_major = storage[:image].view(batch, heads, padded, blocks)
-    head_major[:, :, :sequence].copy_(k_descale.permute(0, 2, 1, 3))
-    if padded > sequence:
-        head_major[:, :, sequence:].zero_()
-    return head_major[:, :, :sequence].permute(0, 2, 1, 3)
-
-
-def _launch_k_scale(
-    k_descale: Tensor, k_format: int, k_scale_mode: int, kv_tile: int
-) -> Tensor:
-    """The K descale a block-sparse launch hands the kernel: head-major on the 64x64 E8M0 rows.
-
-    Called inside the launch custom ops so it runs eagerly under torch.compile as well. Traced, the
-    relayout would come out of Inductor as an exact-size buffer without the slack the launcher
-    requires behind MXFP4 K scales.
-    """
-    if (
-        kv_tile == 64
-        and k_scale_mode == AttentionScaleMode.E8M0_PER_1X32
-        and (
-            _is_fp8_format(AttentionFormat(k_format))
-            or k_format == AttentionFormat.MXFP4
-        )
-    ):
-        return _head_major_k_scale(k_descale, kv_tile)
-    return k_descale
-
-
 def _is_fp8_format(format: AttentionFormat) -> bool:
     return format in _FP8_FORMATS
 
@@ -1263,7 +1212,7 @@ def _mha_v4_fwd_sparse_launch(
         k,
         v,
         q_descale,
-        _launch_k_scale(k_descale, k_format, k_scale_mode, kv_tile),
+        k_descale,
         v_descale,
         out,
         q_format,
@@ -1464,7 +1413,7 @@ def _mha_v4_fwd_sol_launch(
         k,
         v,
         q_descale,
-        _launch_k_scale(k_descale, k_format, k_scale_mode, kv_tile),
+        k_descale,
         v_descale,
         out,
         q_format,

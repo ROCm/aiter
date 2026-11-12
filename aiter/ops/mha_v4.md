@@ -145,6 +145,14 @@ hd256 MXFP6 reuses the hd128 MXFP6 producers the same way, then byte-gathers eac
 hd128 K/V records into two 64-token hd256 records: K 13,312 bytes (row stride 208) with its K-scale
 tail inside the record, V 12,288 bytes (row stride 192), V scales 1,024 bytes per 128 tokens.
 
+E8M0 Q and K descales are contiguous `[B, S, H, D / 32]`, as the producers write them, and the
+launcher rejects any other strides: no kernel reads a descale's token stride, and most derive every
+scale address from the head counts. The hd128 64x64 sparse and Sol-Attn MXFP8 and MXFP4 rows read
+K scales head-major instead, one run of whole 64-token tiles per `(batch, KV head)`, so the
+launcher relays them out on every call into a zeroed buffer with the same slack; callers always
+pass the producer layout. hd128 MXFP6 K carries its scales inside the K records, and its descale
+is not read.
+
 `AttentionPack.DEFAULT` is the canonical V token order. `AttentionPack.V_FOR_FP6_P` selects the V
 token order that FP6-P and FP4-P consumers require, and a row's packing no longer depends on the
 mode: dense and sparse rows for the same recipe select the same pack. Numeric format and consumer

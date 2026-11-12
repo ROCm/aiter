@@ -442,6 +442,87 @@ void check_scale_backing_storage(const at::Tensor& descale,
                 "zeroed slack");
 }
 
+// The hd128 64x64 sparse and Sol-Attn MXFP8 and MXFP4 objects read K scales head-major: a run of
+// whole KV tiles per (batch, KV head) at the descale batch and head strides, one E8M0 row per
+// token, so a tile's scales are one contiguous span rather than one cache line per token. The
+// producers write [batch, key_length, key_heads, blocks], which every other object reads as is,
+// the hd256 dense rows' 64-token KV tile included.
+bool reads_head_major_k_scale(const fmha_v4_fwdConfig& cfg)
+{
+    const bool fp8_k = cfg.k_format >= format_id(AttentionFormat::Fp8E4M3) &&
+                       cfg.k_format <= format_id(AttentionFormat::Fp8E5M2Fnuz);
+    return cfg.mode != 0 && cfg.hdim_q == 128 && cfg.ts_kv == 64 &&
+           cfg.k_scale_mode == scale_mode_id(AttentionScaleMode::E8M0Per1x32) &&
+           (fp8_k || cfg.k_format == format_id(AttentionFormat::Fp4E2M1));
+}
+
+// One dword per (batch, head, token) of the head-major image, then zeros through the slack: a
+// single launch, so the relayout costs no more launches than the copy it replaces.
+__global__ void head_major_k_scale_kernel(const uint8_t* __restrict__ producer,
+                                          uint32_t* __restrict__ image,
+                                          const int64_t image_dwords,
+                                          const int64_t total_dwords,
+                                          const int64_t sequence,
+                                          const int64_t heads,
+                                          const int64_t padded)
+{
+    const int64_t slot = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    if(slot >= total_dwords)
+        return;
+    uint32_t value      = 0;
+    const int64_t token = slot % padded;
+    if(slot < image_dwords && token < sequence)
+    {
+        const int64_t head_run = slot / padded;
+        const uint8_t* row =
+            producer + ((head_run / heads * sequence + token) * heads + head_run % heads) * 4;
+        value = row[0] | row[1] << 8 | row[2] << 16 | static_cast<uint32_t>(row[3]) << 24;
+    }
+    image[slot] = value;
+}
+
+// The producer-layout K scales relaid out for reads_head_major_k_scale() objects. Each head's
+// run is padded to whole KV tiles, and the image is followed by the slack
+// check_scale_backing_storage() demands of a producer tensor; padding and slack are zeroed,
+// since the kernel's speculative tile gathers read into both.
+at::Tensor head_major_k_scale(const at::Tensor& k_descale, int64_t kv_tile)
+{
+    const int64_t batch    = k_descale.size(0);
+    const int64_t sequence = k_descale.size(1);
+    const int64_t heads    = k_descale.size(2);
+    const int64_t blocks   = k_descale.size(3);
+    TORCH_CHECK(blocks == 4 && k_descale.is_contiguous(),
+                "head-major K scales are built from contiguous hd128 E8M0 rows");
+    const int64_t padded = (sequence + kv_tile - 1) / kv_tile * kv_tile;
+    const int64_t slack_rows =
+        (sequence + kKvScaleTileRows - 1) / kKvScaleTileRows * kKvScaleTileRows +
+        kKvScaleLookaheadRows - sequence;
+    const int64_t image = batch * heads * padded * blocks;
+    const int64_t slack = slack_rows * heads * blocks + kKvScaleTrailingDwordSlack;
+
+    at::Tensor storage           = at::empty({image + slack}, k_descale.options());
+    const int64_t total_dwords   = storage.numel() / 4;
+    constexpr int32_t block_size = 256;
+    const dim3 grid(static_cast<uint32_t>((total_dwords + block_size - 1) / block_size));
+    head_major_k_scale_kernel<<<grid, dim3(block_size), 0, at::hip::getCurrentHIPStream()>>>(
+        k_descale.data_ptr<uint8_t>(),
+        reinterpret_cast<uint32_t*>(storage.data_ptr<uint8_t>()),
+        image / 4,
+        total_dwords,
+        sequence,
+        heads,
+        padded);
+    return storage.narrow(0, 0, image)
+        .view({batch, heads, padded, blocks})
+        .narrow(2, 0, sequence)
+        .permute({0, 2, 1, 3});
+}
+
+// The K descale the selected object reads. The caller keeps it alive until the launch is
+// enqueued: a relayout freed earlier could be handed to a later allocation on the same stream.
+at::Tensor launch_k_scale(const fmha_v4_fwdConfig& cfg, const at::Tensor& k_descale)
+{ return reads_head_major_k_scale(cfg) ? head_major_k_scale(k_descale, cfg.ts_kv) : k_descale; }
+
 void check_mx_v_scale_backing_storage(const fmha_v4_fwdConfig& cfg,
                                       const MhaV4Recipe& recipe,
                                       const at::Tensor& v_descale)
@@ -1144,6 +1225,20 @@ PackedMhaV4Shapes validate_packed_mha_v4(const at::Tensor& q,
             "MX K descale must have shape [batch, key_length, key_heads, ",
             blocks_per_row,
             "]");
+        // No object reads a descale's token stride, and only the head-major K objects read its
+        // batch and head strides -- from the copy head_major_k_scale() makes, not from this tensor.
+        // The rest derive every scale address from the head counts. hd128 MXFP6 K reads its
+        // scales from the packed records instead, so its descale is never dereferenced.
+        TORCH_CHECK(q_descale.is_contiguous(),
+                    "MX Q descale must be contiguous [batch, query_length, query_heads, ",
+                    blocks_per_row,
+                    "], as the aiter.ops.mha_v4_quant producers write it");
+        TORCH_CHECK(
+            k_descale.is_contiguous() ||
+                (recipe.k_format == format_id(AttentionFormat::Fp6E2M3) && shapes.head_dim == 128),
+            "MX K descale must be contiguous [batch, key_length, key_heads, ",
+            blocks_per_row,
+            "], as the aiter.ops.mha_v4_quant producers write it");
         check_scale_backing_storage(q_descale,
                                     shapes.seqlen_q,
                                     shapes.nhead_q,
@@ -1275,13 +1370,14 @@ void fmha_v4_fwd(const at::Tensor& q,
     const auto& cfg =
         find_config(arch, recipe, /*mode=*/0, shapes.head_dim, /*ts_qo=*/0, /*ts_kv=*/0);
 
+    const at::Tensor k_scale = launch_k_scale(cfg, k_descale);
     FmhaV4Kernarg args{};
     populate_dense_kernarg(args,
                            q,
                            k,
                            v,
                            q_descale,
-                           k_descale,
+                           k_scale,
                            v_descale,
                            out,
                            cfg,
@@ -1427,13 +1523,14 @@ void fmha_v4_fwd_sparse(const at::Tensor& q,
     auto work_table       = build_sorted_work_table(
         count, shapes.batch, shapes.nhead_q, q_tiles, order, 1, promote_count(order, kv_tiles));
 
+    const at::Tensor k_scale = launch_k_scale(cfg, k_descale);
     FmhaV4SparseSortedKernarg args{};
     populate_dense_kernarg(args.dense,
                            q,
                            k,
                            v,
                            q_descale,
-                           k_descale,
+                           k_scale,
                            v_descale,
                            out,
                            cfg,
@@ -1774,13 +1871,14 @@ void fmha_v4_fwd_sol(const at::Tensor& q,
                                              promote_count(order, kv_tiles));
     }
 
+    const at::Tensor k_scale = launch_k_scale(cfg, k_descale);
     FmhaV4SolKernarg args{};
     populate_dense_kernarg(args.dense,
                            q,
                            k,
                            v,
                            q_descale,
-                           k_descale,
+                           k_scale,
                            v_descale,
                            out,
                            cfg,

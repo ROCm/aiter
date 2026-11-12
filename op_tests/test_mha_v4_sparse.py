@@ -2866,6 +2866,85 @@ def test_mha_v4_sol_mxfp6_k_reads_its_pooled_scales_from_the_records(
             launch({**plan, name: _restrided(unslacked, plan[name])})
 
 
+_MX_K_SCALE_PARAMS = [
+    param(*p.values, mode, skip=p.skip or get_gfx() != "gfx950", id=f"{p.id}-{mode}")
+    for p in _sol_attn_geometry_params(["mxfp8", "mxfp4_fp6p"])
+    for mode in ("sparse", "sol")
+]
+
+
+def _mx_k_scale_launch(recipe, q, k, v, plan, block_tile, mode):
+    """The plan's selection through the sparse or the Sol-Attn row of an E8M0 K recipe."""
+    if mode == "sol":
+        return _sol_attn_launch(q, k, v, plan, recipe=recipe, block_tile=block_tile)
+    return mha_v4_packed(
+        q.quantized,
+        k.quantized,
+        v.quantized,
+        q.descale,
+        k.descale,
+        v.descale,
+        recipe.qk_format,
+        recipe.qk_format,
+        recipe.v_format,
+        recipe.qk_scale_mode,
+        recipe.qk_scale_mode,
+        recipe.v_scale_mode,
+        kv_block_indices=plan["kv_block_indices"],
+        lut_start=plan["lut_start"],
+        lut_count=plan["lut_count"],
+        block_tile=recipe.block_tile() if block_tile is None else block_tile,
+        v_pack=recipe.v_pack,
+    )
+
+
+@parametrize(("recipe", "block_tile", "mode"), _MX_K_SCALE_PARAMS)
+def test_mha_v4_mx_k_scales_reach_their_own_head(recipe, block_tile, mode):
+    """Every row reads a KV head's E8M0 K scales from that head's slice of the producer layout.
+
+    The 64x64 MXFP8 and MXFP4 objects read them head-major and the rest token-major, from the
+    same caller tensor, so a layout mismatch reads one head's scales as another's. Doubling head
+    1's K scales has to move head 1's output and leave head 0's bit for bit.
+    """
+    heads = 2
+    q, k, v = recipe.operands(sequence_k=8 * recipe.kv_tile(), heads=heads)
+    plan = recipe.prepare(q, k, v, beta=0.4, heads=heads, block_tile=block_tile)
+    baseline = _mx_k_scale_launch(recipe, q, k, v, plan, block_tile, mode)
+    # In place, so an MXFP4 K scale keeps the producer's slack behind it.
+    k.descale[:, :, 1] = (k.descale[:, :, 1].int() + 1).clamp(max=254).to(torch.uint8)
+    bumped = _mx_k_scale_launch(recipe, q, k, v, plan, block_tile, mode)
+    torch.cuda.synchronize()
+
+    assert torch.isfinite(baseline).all()
+    assert torch.equal(
+        bumped[:, :, 0], baseline[:, :, 0]
+    ), "head 1's K scales reached head 0"
+    assert not torch.equal(
+        bumped[:, :, 1], baseline[:, :, 1]
+    ), "head 1's K scales were not read"
+
+
+@parametrize(("recipe", "block_tile", "mode"), _MX_K_SCALE_PARAMS)
+def test_mha_v4_mx_scales_must_be_producer_contiguous(recipe, block_tile, mode):
+    """No object reads a Q or K descale's strides, so a strided scale is refused, not misread.
+
+    A head-major copy has the producer's shape and values, so only the layout check can tell it
+    apart.
+    """
+    heads = 2
+    q, k, v = recipe.operands(sequence_k=8 * recipe.kv_tile(), heads=heads)
+    plan = recipe.prepare(q, k, v, beta=0.4, heads=heads, block_tile=block_tile)
+    operands = {"q": q, "k": k, "v": v}
+    for slot in ("q", "k"):
+        strided = operands[slot].descale.transpose(1, 2).contiguous().transpose(1, 2)
+        assert not strided.is_contiguous()
+        launched = {**operands, slot: operands[slot]._replace(descale=strided)}
+        with expect_raises(
+            RuntimeError, match=f"MX {slot.upper()} descale must be contiguous"
+        ):
+            _mx_k_scale_launch(recipe, *launched.values(), plan, block_tile, mode)
+
+
 def test_mha_v4_sol_rejects_recipes_without_a_manifest_row():
     dummy = torch.empty((1, 256, 1, 128), device="cuda", dtype=torch.bfloat16)
     with expect_raises(NotImplementedError, match="f6f4 and f6f8 recipes only"):
