@@ -41,17 +41,6 @@ parser.add_argument(
 args = parser.parse_args()
 
 
-def _ensure_tuple(value):
-    return value if isinstance(value, tuple) else (value,)
-
-
-args.shape = _ensure_tuple(args.shape)
-args.stride = _ensure_tuple(args.stride)
-if len(args.shape) != len(args.stride):
-    parser.error(
-        f"shape and stride must have the same rank: {args.shape} vs {args.stride}"
-    )
-
 tensor0 = torch.empty_strided(args.shape, args.stride, dtype=dtypes.fp16, device="cuda")
 random_data0 = torch.rand(args.shape)
 tensor0.copy_(random_data0)
