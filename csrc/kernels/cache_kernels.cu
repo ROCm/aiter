@@ -2532,7 +2532,20 @@ template <typename scalar_t, typename cache_t, typename query_t, int KV_LORA, in
           bool COMPUTE_ALL_Q_ROPE = false, bool K_EARLY = (HPT <= 2),
           bool LAT = (HPT == 1)>
 __global__ void fused_qk_rope_concat_and_cache_mla_seg_kernel(
+    // The first 120 bytes of kernel arguments are preloaded into SGPRs; the
+    // rest cost a scalar round trip. Preloaded: what addresses the nope loads,
+    // which the latency path issues before any other load, and the token
+    // divide.
     const scalar_t* __restrict__ q_nope,    // [T, H, KV_LORA]
+    const int64_t q_nope_stride_0, const int64_t q_nope_stride_1,
+    const int num_tokens,
+    const uint32_t tok_magic, // blockIdx.x / num_tokens, see mla_rope_fast_div
+    const int tok_shift,
+    // Every dword argument is preloaded too: one past the preloaded ones
+    // gets a load of its own, which the compiler placed behind a wait on one
+    // path and ahead of the nope loads on another.
+    const int max_position,
+    const int num_heads,
     const scalar_t* __restrict__ q_pe,      // [T, H, PE_DIM]
     const scalar_t* __restrict__ kv_c,      // [T, KV_LORA]
     const scalar_t* __restrict__ k_pe,      // [T, PE_DIM]
@@ -2540,20 +2553,12 @@ __global__ void fused_qk_rope_concat_and_cache_mla_seg_kernel(
     query_t* __restrict__ q_out,            // [T, H, Q_OUT_DIM]
     const int64_t* __restrict__ slot_mapping,
     const int64_t* __restrict__ positions,
-    const scalar_t* __restrict__ cos_cache, // [max_pos, PE_DIM/2]
-    const scalar_t* __restrict__ sin_cache, // [max_pos, PE_DIM/2]
     const float* __restrict__ q_scale,
     const float* __restrict__ k_scale,
-    // Right behind the pointers so that they are among the preloaded kernel
-    // arguments: every block derives its token from them before its first
-    // load, and loaded from the kernarg segment they cost a scalar round trip
-    // ahead of positions[token].
-    const int num_tokens,
-    const uint32_t tok_magic, // blockIdx.x / num_tokens, see mla_rope_fast_div
-    const int tok_shift,
-    const int max_position,
-    const int num_heads,
-    const int64_t q_nope_stride_0, const int64_t q_nope_stride_1,
+    // Not preloaded: both are addressed by positions[token], so their loads
+    // go out with that one.
+    const scalar_t* __restrict__ cos_cache, // [max_pos, PE_DIM/2]
+    const scalar_t* __restrict__ sin_cache, // [max_pos, PE_DIM/2]
     const int64_t q_pe_stride_0,   const int64_t q_pe_stride_1,
     const int64_t q_out_stride_0,  const int64_t q_out_stride_1,
     const int64_t kv_c_stride,
@@ -2616,6 +2621,46 @@ __global__ void fused_qk_rope_concat_and_cache_mla_seg_kernel(
     {
         token_idx = blockIdx.y;
         head_base = blockIdx.x * HPT;
+    }
+
+    // One descriptor over the HPT heads, the head picked by soffset. Each
+    // head needs its own soffset SGPR: a buffer op that reuses an address
+    // register of an in-flight one waits (s_wait_xcnt) for its address
+    // translation, which serializes the cold loads behind TLB misses.
+    // On the latency path the loads need only preloaded arguments, so they
+    // go out ahead of the slot and position loads, not behind their round
+    // trip; the memory clobber keeps those loads from being hoisted above.
+    in_vec_t nope_in[HPT];
+    auto issue_nope = [&]() {
+        auto in_buf = opus::make_gmem<scalar_t>(
+            q_nope + token_idx * q_nope_stride_0 + head_base * q_nope_stride_1,
+            (static_cast<int>((HPT - 1) * q_nope_stride_1) + KV_LORA) * sizeof(scalar_t));
+        int soff[HPT];
+#pragma unroll
+        for(int k = 0; k < HPT; ++k)
+        {
+            soff[k] = static_cast<int>(k * q_nope_stride_1 * sizeof(scalar_t));
+#if defined(__HIP_DEVICE_COMPILE__)
+            if(k > 0)
+                asm volatile("" : "+s"(soff[k]));
+#endif
+        }
+#pragma unroll
+        for(int k = 0; k < HPT; ++k)
+            nope_in[k] = in_buf.template _load<VEC>(
+                static_cast<int>(threadIdx.x * VEC * sizeof(scalar_t)), soff[k]);
+#if defined(__HIP_DEVICE_COMPILE__)
+#pragma unroll
+        for(int k = 1; k < HPT; ++k)
+            asm volatile("" ::"s"(soff[k]));
+#endif
+    };
+    if constexpr(LAT)
+    {
+        issue_nope();
+#if defined(__HIP_DEVICE_COMPILE__)
+        asm volatile("" ::: "memory");
+#endif
     }
 
     // The slot only gates the writes. Every Q load is addressed from
@@ -3106,35 +3151,8 @@ __global__ void fused_qk_rope_concat_and_cache_mla_seg_kernel(
                                   static_cast<int>((HPT - 1) * q_pe_stride_1) + PE_DIM,
                                   pe_chunk, pe_lane);
 
-        // One descriptor over the HPT heads, the head picked by soffset. Each
-        // head needs its own soffset SGPR: a buffer op that reuses an address
-        // register of an in-flight one waits (s_wait_xcnt) for its address
-        // translation, which serializes the cold loads behind TLB misses.
-        in_vec_t nope_in[HPT];
-        {
-            auto in_buf = opus::make_gmem<scalar_t>(
-                q_nope + token_idx * q_nope_stride_0 + head_base * q_nope_stride_1,
-                (static_cast<int>((HPT - 1) * q_nope_stride_1) + KV_LORA) * sizeof(scalar_t));
-            int soff[HPT];
-#pragma unroll
-            for(int k = 0; k < HPT; ++k)
-            {
-                soff[k] = static_cast<int>(k * q_nope_stride_1 * sizeof(scalar_t));
-#if defined(__HIP_DEVICE_COMPILE__)
-                if(k > 0)
-                    asm volatile("" : "+s"(soff[k]));
-#endif
-            }
-#pragma unroll
-            for(int k = 0; k < HPT; ++k)
-                nope_in[k] = in_buf.template _load<VEC>(
-                    static_cast<int>(threadIdx.x * VEC * sizeof(scalar_t)), soff[k]);
-#if defined(__HIP_DEVICE_COMPILE__)
-#pragma unroll
-            for(int k = 1; k < HPT; ++k)
-                asm volatile("" ::"s"(soff[k]));
-#endif
-        }
+        if constexpr(!LAT)
+            issue_nope();
         // A padded token (HPT > 1 returned up front) is dropped the same way,
         // by an out-of-bounds offset: a return here is a branch the compiler
         // may sink the nope load past, which ATT showed it doing.
@@ -5546,13 +5564,15 @@ static void launch_mla_rope_hpt(const MlaRopeHptArgs& a, hipStream_t stream)
                                                          PE_DIM, 0, NEOX, NF, VEC, HPT_, CAQR, \
                                                          KE, LAT_>                             \
         <<<grid, block, lds, stream>>>(                                                        \
-            static_cast<const scalar_t*>(a.q_nope), static_cast<const scalar_t*>(a.q_pe),      \
+            static_cast<const scalar_t*>(a.q_nope), a.q_nope_stride_0, a.q_nope_stride_1,      \
+            a.num_tokens, tok_magic, tok_shift, a.max_position, a.num_heads,                   \
+            static_cast<const scalar_t*>(a.q_pe),                                              \
             static_cast<const scalar_t*>(a.kv_c), static_cast<const scalar_t*>(a.k_pe),        \
             static_cast<cache_t*>(a.kv_cache), static_cast<query_t*>(a.q_out),                 \
-            a.slot_mapping, a.positions, static_cast<const scalar_t*>(a.cos_cache),            \
-            static_cast<const scalar_t*>(a.sin_cache), a.q_scale, a.k_scale, a.num_tokens,     \
-            tok_magic, tok_shift, a.max_position, a.num_heads, a.q_nope_stride_0,              \
-            a.q_nope_stride_1, a.q_pe_stride_0, a.q_pe_stride_1, a.q_out_stride_0,             \
+            a.slot_mapping, a.positions, a.q_scale, a.k_scale,                                 \
+            static_cast<const scalar_t*>(a.cos_cache),                                         \
+            static_cast<const scalar_t*>(a.sin_cache),                                         \
+            a.q_pe_stride_0, a.q_pe_stride_1, a.q_out_stride_0,                                \
             a.q_out_stride_1, a.kv_c_stride, a.k_pe_stride, a.cos_stride0, a.sin_stride0,      \
             a.block_stride, a.entry_stride, a.block_size, bs_magic, bs_shift)
 #define LAUNCH_MLA_ROPE_HPT(NEOX, NF, HPT_, KE, LAT_)                  \
@@ -5986,6 +6006,8 @@ void fused_qk_rope_concat_and_cache_mla_seg(
                                                          HPT_>                            \
         <<<grid, block, tdm_lds_bytes, stream>>>(                                         \
             reinterpret_cast<SCALAR_T*>(q_nope.data_ptr()),                               \
+            q_nope_stride_0, q_nope_stride_1,                                             \
+            0, 0, 0, max_position, num_heads,                                             \
             reinterpret_cast<SCALAR_T*>(q_pe.data_ptr()),                                 \
             reinterpret_cast<SCALAR_T*>(kv_c.data_ptr()),                                 \
             reinterpret_cast<SCALAR_T*>(k_pe.data_ptr()),                                 \
@@ -5993,13 +6015,10 @@ void fused_qk_rope_concat_and_cache_mla_seg(
             reinterpret_cast<opus::fp8_t*>(q_out.data_ptr()),                             \
             reinterpret_cast<int64_t*>(slot_mapping.data_ptr()),                          \
             reinterpret_cast<int64_t*>(positions.data_ptr()),                             \
-            reinterpret_cast<SCALAR_T*>(cos_cache.data_ptr()),                            \
-            reinterpret_cast<SCALAR_T*>(sin_cache.data_ptr()),                            \
             reinterpret_cast<float*>(q_scale.data_ptr()),                                 \
             reinterpret_cast<float*>(k_scale.data_ptr()),                                 \
-            0, 0, 0, max_position,                                                        \
-            num_heads,                                                                    \
-            q_nope_stride_0, q_nope_stride_1,                                             \
+            reinterpret_cast<SCALAR_T*>(cos_cache.data_ptr()),                            \
+            reinterpret_cast<SCALAR_T*>(sin_cache.data_ptr()),                            \
             q_pe_stride_0, q_pe_stride_1,                                                 \
             q_out_stride_0, q_out_stride_1,                                               \
             kv_c_stride, k_pe_stride,                                                     \
