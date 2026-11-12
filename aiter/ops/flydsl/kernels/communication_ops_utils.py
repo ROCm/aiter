@@ -25,7 +25,11 @@ from flydsl.expr import arith, const_expr, range_constexpr
 from flydsl.expr.rocdl import readfirstlane
 from flydsl.expr.typing import T
 
-from aiter.ops.flydsl.kernels import buffer_ops as bo
+from aiter.ops.flydsl.kernels.tensor_shim import (
+    buf_copy_load,
+    buf_copy_store,
+    ptr_buf_tensor,
+)
 
 __all__ = [
     "CACHE_DEVICE",
@@ -41,7 +45,6 @@ __all__ = [
     "atomic_add_workgroup",
     "atomic_or_global_at",
     "buffer_load_i32",
-    "buffer_resource",
     "fence_acquire",
     "fence_agent_acquire",
     "fence_agent_release",
@@ -94,10 +97,6 @@ DIAG_TICKS = 10 * 100_000_000
 TIMEOUT_BIT = -2147483648
 
 
-def buffer_resource(address):
-    return bo.create_buffer_resource_from_addr(address)
-
-
 def tagged_peer_address(base, byte_offset):
     """Return a byte address in an IPC-mapped peer buffer."""
     return base + fx.Int64(byte_offset)
@@ -111,6 +110,7 @@ def tagged_shift(address, byte_offset):
 def _spin_tagged(load_all, pending):
     values = load_all()
     while pending(values):
+        # FlyDSL has no typed sleep API; this wrapper emits s_sleep in the ISA.
         fx.rocdl.s_sleep(1)
         values = load_all()
     return values
@@ -118,6 +118,7 @@ def _spin_tagged(load_all, pending):
 
 def memrealtime():
     """Read the AMD 100 MHz device timer for bounded diagnostics."""
+    # FlyDSL has no timer API; this intrinsic emits s_memrealtime in the ISA.
     return fx.Int64(llvm.call_intrinsic(T.i64, "llvm.amdgcn.s.memrealtime", [], [], []))
 
 
@@ -128,6 +129,7 @@ def _spin_tagged_bounded(load_all, pending, on_timeout, initial_late):
     values = load_all()
     late = initial_late
     while pending(values) & (late == 0):
+        # FlyDSL has no typed sleep API; this wrapper emits s_sleep in the ISA.
         fx.rocdl.s_sleep(1)
         values = load_all()
         late = (memrealtime() - start > DIAG_TICKS).select(fx.Int32(1), fx.Int32(0))
@@ -165,10 +167,13 @@ class TaggedMailbox:
             if isinstance(value, fx.Float32)
             else fx.Int32(value)
         )
-        bo.buffer_store(
-            fx.Vector.from_elements([bits, self.tag], fx.Int32),
-            buffer_resource(address),
+        values = fx.Vector.from_elements([bits, self.tag], fx.Int32)
+        buf_copy_store(
+            ptr_buf_tensor(address, fx.Int32, unit_elems=2, unit_stride=1),
             index * 2,
+            values,
+            fx.Int32,
+            unit_elems=2,
             cache_modifier=CACHE_SYSTEM,
         )
 
@@ -176,10 +181,12 @@ class TaggedMailbox:
         values = []
         for word in words:
             values += [fx.Int32(word), self.tag]
-        bo.buffer_store(
-            fx.Vector.from_elements(values, fx.Int32),
-            buffer_resource(address),
+        buf_copy_store(
+            ptr_buf_tensor(address, fx.Int32, unit_elems=len(values), unit_stride=1),
             index * 2,
+            fx.Vector.from_elements(values, fx.Int32),
+            fx.Int32,
+            unit_elems=len(values),
             cache_modifier=CACHE_SYSTEM,
         )
 
@@ -194,14 +201,14 @@ class TaggedMailbox:
         def load_all():
             words = []
             for address, index, count in specs:
-                loaded = fx.Vector(
-                    bo.buffer_load(
-                        buffer_resource(address),
-                        fx.Int32(index) * 2,
-                        vec_width=2 * count,
-                        dtype=T.i32,
-                        cache_modifier=CACHE_SYSTEM,
-                    )
+                loaded = buf_copy_load(
+                    ptr_buf_tensor(
+                        address, fx.Int32, unit_elems=2 * count, unit_stride=1
+                    ),
+                    fx.Int32(index) * 2,
+                    fx.Int32,
+                    unit_elems=2 * count,
+                    cache_modifier=CACHE_SYSTEM,
                 )
                 words += [loaded[item] for item in range(2 * count)]
             return fx.Vector.from_elements(words, fx.Int32)
@@ -248,12 +255,15 @@ def wait_lds_wave():
 
 def wave_uniform_i32(value):
     """Broadcast an i32 value from the first lane of the wave."""
+    # FlyDSL has no typed broadcast API; prior ISA uses v_readfirstlane_b32.
     return fx.Int32(readfirstlane(T.i32, fx.Int32(value).ir_value()))
 
 
 def wave_uniform_i64(addr):
     v = fx.Uint64(addr)
+    # FlyDSL has no typed broadcast API; prior ISA uses v_readfirstlane_b32.
     lo = readfirstlane(T.i32, fx.Uint32(v))  # low 32 bits
+    # FlyDSL has no typed broadcast API; prior ISA uses v_readfirstlane_b32.
     hi = readfirstlane(T.i32, fx.Uint32(v >> 32))  # high 32 bits (unsigned shift)
     return (fx.Uint64(hi) << 32) | fx.Uint64(lo)
 
@@ -261,11 +271,10 @@ def wave_uniform_i64(addr):
 def buffer_load_i32(address, index, cache_modifier=0):
     """Load one i32 from a raw device address through a buffer resource."""
     return fx.Int32(
-        bo.buffer_load(
-            buffer_resource(address),
+        buf_copy_load(
+            ptr_buf_tensor(address, fx.Int32),
             index,
-            vec_width=1,
-            dtype=T.i32,
+            fx.Int32,
             cache_modifier=cache_modifier,
         )
     )
@@ -273,13 +282,11 @@ def buffer_load_i32(address, index, cache_modifier=0):
 
 def load_i64_from_buffer(address, index):
     """Load a wave-uniform i64 from two adjacent i32 buffer words."""
-    words = fx.Vector(
-        bo.buffer_load(
-            buffer_resource(address),
-            index * 2,
-            vec_width=2,
-            dtype=T.i32,
-        )
+    words = buf_copy_load(
+        ptr_buf_tensor(address, fx.Int32, unit_elems=2, unit_stride=1),
+        index * 2,
+        fx.Int32,
+        unit_elems=2,
     )
     return wave_uniform_i64((fx.Int64(words[1]) << 32) | fx.Int64(fx.Uint32(words[0])))
 

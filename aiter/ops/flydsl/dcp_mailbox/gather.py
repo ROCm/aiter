@@ -16,19 +16,15 @@ import flydsl.compiler as flyc
 import flydsl.expr as fx
 import torch
 import torch.distributed as dist
-from flydsl.expr import const_expr, range_constexpr
-from flydsl.expr.typing import Int32, Int64, T
+from flydsl.expr.typing import Int32, Int64
 
 from aiter.jit.utils.chip_info import get_gfx_runtime
 from aiter.ops.flydsl.dcp_mailbox.combine import (
     _check_debug,
-    _finish,
     _prepare_debug,
-    _push_epoch,
 )
 from aiter.ops.flydsl.dcp_mailbox.common import (
     KernelAbi,
-    bf2_f32,
     epoch_offset,
     pair_layout,
     pair_span,
@@ -38,22 +34,11 @@ from aiter.ops.flydsl.dcp_mailbox.common import (
     peer_bytes as peer_storage_bytes,
 )
 from aiter.ops.flydsl.dcp_mailbox.peer import PeerBuffer
-from aiter.ops.flydsl.kernels import buffer_ops as bo
-from aiter.ops.flydsl.kernels.communication_ops_utils import (
-    CACHE_DEVICE,
-    EPOCH_MASK,
-    TaggedMailbox,
-    buffer_load_i32,
-    buffer_resource,
-    load_i64_from_buffer,
-    tagged_peer_address,
-    tagged_shift,
-    wave_uniform_i32,
+from aiter.ops.flydsl.kernels.dcp_mailbox.gather import (
+    make_kernel as make_gather_kernel,
 )
-from aiter.ops.flydsl.kernels.quant_utils import emit_f32_to_fp8
 
 THREADS = 128
-FP8_MAX = 448.0
 
 _STREAM = fx.Stream(None)
 _BUILDS: dict = {}
@@ -123,137 +108,7 @@ def build(key: GatherBuild):
         f"_g{int(key.debug)}_bt{tile}"
     )
 
-    @flyc.kernel(name=name, known_block_size=[THREADS, 1, 1])
-    def gather(
-        q: Int64,
-        q_sb: Int32,
-        q_sh: Int32,
-        pe: Int64,
-        pe_sb: Int32,
-        pe_sh: Int32,
-        scale: Int64,
-        gq: Int64,
-        peers: Int64,
-        rank: Int32,
-        state: Int64,
-    ):
-        tid = fx.thread_idx.x
-        bid = fx.block_idx.x
-        first_b = (bid // hl) * tile
-        lh = bid % hl
-        e = wave_uniform_i32(buffer_load_i32(state, 0, cache_modifier=CACHE_DEVICE))
-        flip = fx.Int64(e % 2) * half
-        bases = [load_i64_from_buffer(peers, source) for source in range(n)]
-        own = load_i64_from_buffer(peers, rank)
-        epoch_base = epoch_offset(lay)
-        epoch_targets = [
-            tagged_peer_address(peer, epoch_base + rank * 4) for peer in bases
-        ]
-        own_epoch = tagged_peer_address(own, epoch_base)
-        epoch_sources = [
-            tagged_peer_address(own_epoch, source * 4) for source in range(n)
-        ]
-        if const_expr(key.debug):
-            _push_epoch(bid, tid, e, epoch_targets)
-        mb = TaggedMailbox(
-            e & fx.Int32(EPOCH_MASK),
-            debug=key.debug,
-            epoch_addresses=epoch_sources,
-            expected_epoch=e + 1,
-            diagnostic=state,
-        )
-        put_words, poll = mb.put_words, mb.poll
-        to = [
-            tagged_shift(tagged_peer_address(peer, lay["q"][0]), flip) for peer in bases
-        ]
-        mine = tagged_shift(tagged_peer_address(own, lay["q"][0]), flip)
-        j = fx.min(tid, w // 2 - 1) * 2
-        push = key.phase != 2
-        for token_offset in range_constexpr(tile):
-            b = first_b + token_offset
-            if b < key.tokens:
-                slot = (rank * mt + b) * hl + lh
-                if const_expr(push and key.nope > 0):
-                    e0 = j * 4
-                    in_nope = e0 < key.nope
-                    vn = fx.Vector(
-                        bo.buffer_load(
-                            buffer_resource(q),
-                            (b * q_sb + lh * q_sh + fx.min(e0, key.nope - 8)) // 2,
-                            vec_width=4,
-                            dtype=T.i32,
-                        )
-                    )
-                    vp = fx.Vector(
-                        bo.buffer_load(
-                            buffer_resource(pe),
-                            (b * pe_sb + lh * pe_sh + fx.max(e0 - key.nope, 0)) // 2,
-                            vec_width=4,
-                            dtype=T.i32,
-                        )
-                    )
-                    inv = fx.Float32(1.0) / fx.Float32(
-                        bo.buffer_load(
-                            buffer_resource(scale), 0, vec_width=1, dtype=T.f32
-                        )
-                    )
-                    xs = []
-                    for k in range_constexpr(4):
-                        lo, hi = bf2_f32(in_nope.select(vn[k], vp[k]))
-                        xs += [lo, hi]
-                    ys = [
-                        fx.max(
-                            fx.min(x * inv, fx.Float32(FP8_MAX)),
-                            fx.Float32(-FP8_MAX),
-                        )
-                        for x in xs
-                    ]
-                    v = [
-                        emit_f32_to_fp8(ys[0], ys[1])
-                        | (emit_f32_to_fp8(ys[2], ys[3]) << 16),
-                        emit_f32_to_fp8(ys[4], ys[5])
-                        | (emit_f32_to_fp8(ys[6], ys[7]) << 16),
-                    ]
-                if const_expr(push and key.nope == 0):
-                    vw = fx.Vector(
-                        bo.buffer_load(
-                            buffer_resource(q),
-                            b * q_sb + lh * q_sh + j,
-                            vec_width=2,
-                            dtype=T.i32,
-                        )
-                    )
-                    v = [vw[0], vw[1]]
-                if const_expr(push):
-                    for dest in range_constexpr(n):
-                        put_words(to[dest], slot * w + j, [v[0], v[1]])
-                if const_expr(key.phase != 1):
-                    got = poll(
-                        [
-                            (mine, ((src * mt + b) * hl + lh) * w + j, 2)
-                            for src in range(n)
-                        ],
-                        batch=n,
-                    )
-                    for src in range_constexpr(n):
-                        if const_expr(key.fold > 0):
-                            h = src * hl + lh
-                            row = (
-                                (b // key.qlen) * key.fold + h // 16
-                            ) * key.qlen + b % key.qlen
-                            at = (row * 16 + h % 16) * w + j
-                        else:
-                            at = (b * key.pad_heads + src * hl + lh) * w + j
-                        bo.buffer_store(
-                            fx.Vector.from_elements(
-                                [got[src][0], got[src][1]], fx.Int32
-                            ),
-                            buffer_resource(gq),
-                            at,
-                        )
-        if const_expr(key.phase != 1):
-            _finish(tid, state, e, nblk)
-
+    gather = make_gather_kernel(key, name, nblk, lay, half, epoch_offset(lay), THREADS)
     return _jit(key, gather, nblk)
 
 

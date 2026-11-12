@@ -7,7 +7,7 @@
 import torch
 import torch.distributed as dist
 
-from aiter.ops.flydsl.quick_allreduce_int4_ipc import UncachedIpcHeap
+from aiter.ops.flydsl.ipc_heap import UncachedIpcHeap
 
 
 class _DeviceBytes:

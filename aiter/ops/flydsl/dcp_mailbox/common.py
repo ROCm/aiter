@@ -11,8 +11,6 @@ import inspect
 import os
 from dataclasses import dataclass
 
-import flydsl.expr as fx
-
 PAIR_BYTES = 8
 EPOCH_BYTES = 4
 
@@ -74,17 +72,3 @@ class KernelAbi:
         got = _python_params(launcher)
         if got != (*self.names, "stream"):
             raise TypeError(f"launcher parameters {got} != ABI {self.names} + stream")
-
-
-def bf16_pair(lo, hi):
-    return (
-        fx.Vector.from_elements([lo, hi], fx.Float32)
-        .to(fx.BFloat16)
-        .bitcast(fx.Float32)[0]
-    )
-
-
-def bf2_f32(word):
-    return (word << 16).bitcast(fx.Float32), (word & fx.Int32(-65536)).bitcast(
-        fx.Float32
-    )

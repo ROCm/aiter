@@ -15,13 +15,10 @@ import flydsl.compiler as flyc
 import flydsl.expr as fx
 import torch
 import torch.distributed as dist
-from flydsl.expr import const_expr, gpu, range_constexpr
-from flydsl.expr.typing import Int32, Int64, T
+from flydsl.expr.typing import Int32, Int64
 
 from aiter.ops.flydsl.dcp_mailbox.common import (
     KernelAbi,
-    bf2_f32,
-    bf16_pair,
     epoch_offset,
     pair_layout,
     pair_span,
@@ -31,25 +28,11 @@ from aiter.ops.flydsl.dcp_mailbox.common import (
     peer_bytes as peer_storage_bytes,
 )
 from aiter.ops.flydsl.dcp_mailbox.peer import PeerBuffer
-from aiter.ops.flydsl.kernels import buffer_ops as bo
-from aiter.ops.flydsl.kernels.communication_ops_utils import (
-    CACHE_DEVICE,
-    CACHE_SYSTEM,
-    EPOCH_MASK,
-    TaggedMailbox,
-    atomic_add_agent,
-    buffer_load_i32,
-    buffer_resource,
-    load_i64_from_buffer,
-    tagged_peer_address,
-    tagged_shift,
-    wave_uniform_i32,
+from aiter.ops.flydsl.kernels.dcp_mailbox.combine import (
+    make_kernel as make_combine_kernel,
 )
-from aiter.ops.flydsl.kernels.kernels_common import LOG2E
 
 MAX_THREADS = 1024
-NEG_INF = float("-inf")
-POS_INF = float("inf")
 RANK_MASK = (1 << 31) - 1
 _STREAM = fx.Stream(None)
 _BUILDS: dict = {}
@@ -106,127 +89,10 @@ ABI = KernelAbi(
 )
 
 
-def _row_empty(b, seqs, seq_lens, qsl):
-    """Row ``b`` is graph padding, or its request has no KV on this rank."""
-    rows = buffer_load_i32(qsl, seqs)
-    si = fx.Int32(0)
-    for i in range_constexpr(seqs):
-        si = si + (buffer_load_i32(qsl, i + 1) <= b).select(1, 0)
-    si = fx.min(si, seqs - 1)
-    return (b >= rows) | (buffer_load_i32(seq_lens, si) == 0)
-
-
-@flyc.jit
-def _poll_combine(
-    poll,
-    own_lse,
-    own_data,
-    n,
-    mt,
-    hl,
-    words,
-    b,
-    lh,
-    tid,
-    base_e,
-    ret_lse,
-    res,
-    res_sb,
-    res_sh,
-    res_lse,
-):
-    """Poll head ``lh`` of row ``b`` from every rank and store the LSE combine."""
-    j = tid * 2
-    own_slot = [(src * mt + b) * hl + lh for src in range(n)]
-    got = poll(
-        [(own_lse, own_slot[src], 1) for src in range(n)]
-        + [(own_data, own_slot[src] * words + j, 2) for src in range(n)],
-        batch=2 * n,
-    )
-    ls = []
-    for src in range_constexpr(n):
-        v = got[src][0].bitcast(fx.Float32)
-        bad = (v != v) | (v == fx.Float32(POS_INF))  # noqa: PLR0124
-        ls.append(bad.select(fx.Float32(NEG_INF), v))
-    m = ls[0]
-    for src in range_constexpr(1, n):
-        m = fx.max(m, ls[src])
-    m = (m == fx.Float32(NEG_INF)).select(fx.Float32(0.0), m)
-    scale = LOG2E if base_e else 1.0
-    ex = [fx.exp2((ls[src] - m) * fx.Float32(scale)) for src in range(n)]
-    tot = ex[0]
-    for src in range_constexpr(1, n):
-        tot = tot + ex[src]
-    live = tot > fx.Float32(0.0)
-    inv = fx.Float32(1.0) / live.select(tot, fx.Float32(1.0))
-    wt = [live.select(ex[src] * inv, fx.Float32(0.0)) for src in range(n)]
-    acc = [fx.Float32(0.0)] * 4
-    for src in range_constexpr(n):
-        pair = got[n + src]
-        zero = wt[src] == fx.Float32(0.0)
-        for k in range_constexpr(2):
-            lo, hi = bf2_f32(pair[k])
-            acc[2 * k] = acc[2 * k] + zero.select(fx.Float32(0.0), lo * wt[src])
-            acc[2 * k + 1] = acc[2 * k + 1] + zero.select(fx.Float32(0.0), hi * wt[src])
-    bo.buffer_store(
-        fx.Vector.from_elements(
-            [
-                bf16_pair(acc[0], acc[1]).bitcast(fx.Int32),
-                bf16_pair(acc[2], acc[3]).bitcast(fx.Int32),
-            ],
-            fx.Int32,
-        ),
-        buffer_resource(res),
-        (b * res_sb + lh * res_sh) // 2 + j,
-    )
-    if const_expr(ret_lse):  # noqa: SIM102
-        if tid == 0:
-            if const_expr(base_e):
-                g = fx.log(tot) + m
-            else:
-                g = fx.log2(tot) + m
-            bo.buffer_store(fx.Float32(g), buffer_resource(res_lse), b * hl + lh)
-
-
-@flyc.jit
-def _push_epoch(bid, tid, e, targets):
-    """Debug builds publish ``e + 1``, so zero always means never arrived."""
-    for dest in range_constexpr(len(targets)):
-        if (bid == 0) & (tid == dest):
-            bo.buffer_store(
-                e + 1,
-                buffer_resource(targets[dest]),
-                0,
-                cache_modifier=CACHE_SYSTEM,
-            )
-
-
-@flyc.jit
-def _finish(tid, state, e, nblk):
-    """The last CTA advances the epoch for the next launch."""
-    gpu.barrier()
-    if tid == 0:
-        old = atomic_add_agent(state + fx.Int64(4), 1)
-        if old == nblk - 1:
-            bo.buffer_store(
-                fx.Int32(0),
-                buffer_resource(state),
-                1,
-                cache_modifier=CACHE_DEVICE,
-            )
-            bo.buffer_store(
-                (e + 1) & fx.Int32(EPOCH_MASK),
-                buffer_resource(state),
-                0,
-                cache_modifier=CACHE_DEVICE,
-            )
-
-
 def build(key: CombineBuild):
     if key in _BUILDS:
         return _BUILDS[key]
     n, hl, d, mt = key.ranks, key.heads, key.dim, key.max_tokens
-    words = d // 2
     threads = d // 4
     tile = key.token_tile
     nblk = ((key.tokens + tile - 1) // tile) * hl
@@ -238,119 +104,9 @@ def build(key: CombineBuild):
         f"_g{int(key.debug)}_r{int(key.row_mask)}_bt{tile}"
     )
 
-    @flyc.kernel(name=name, known_block_size=[threads, 1, 1])
-    def combine(
-        out: Int64,
-        out_sb: Int32,
-        out_sh: Int32,
-        lse: Int64,
-        lse_sb: Int32,
-        lse_sh: Int32,
-        res: Int64,
-        res_sb: Int32,
-        res_sh: Int32,
-        res_lse: Int64,
-        seq_lens: Int64,
-        qsl: Int64,
-        row_counts: Int64,
-        peers: Int64,
-        rank: Int32,
-        state: Int64,
-    ):
-        tid = fx.thread_idx.x
-        bid = fx.block_idx.x
-        first_b = (bid // hl) * tile
-        lh = bid % hl
-        e = wave_uniform_i32(buffer_load_i32(state, 0, cache_modifier=CACHE_DEVICE))
-        flip = fx.Int64(e % 2) * half
-        bases = [load_i64_from_buffer(peers, source) for source in range(n)]
-        own = load_i64_from_buffer(peers, rank)
-        epoch_base = epoch_offset(lay)
-        epoch_targets = [
-            tagged_peer_address(peer, epoch_base + rank * 4) for peer in bases
-        ]
-        own_epoch = tagged_peer_address(own, epoch_base)
-        epoch_sources = [
-            tagged_peer_address(own_epoch, source * 4) for source in range(n)
-        ]
-        if const_expr(key.debug):
-            _push_epoch(bid, tid, e, epoch_targets)
-        mb = TaggedMailbox(
-            e & fx.Int32(EPOCH_MASK),
-            debug=key.debug,
-            epoch_addresses=epoch_sources,
-            expected_epoch=e + 1,
-            diagnostic=state,
-        )
-        put, put_words, poll = mb.put, mb.put_words, mb.poll
-        data = [
-            tagged_shift(tagged_peer_address(p, lay["data"][0]), flip) for p in bases
-        ]
-        lsep = [
-            tagged_shift(tagged_peer_address(p, lay["lse"][0]), flip) for p in bases
-        ]
-        own_data = tagged_shift(tagged_peer_address(own, lay["data"][0]), flip)
-        own_lse = tagged_shift(tagged_peer_address(own, lay["lse"][0]), flip)
-        j = tid * 2
-        for token_offset in range_constexpr(tile):
-            b = first_b + token_offset
-            if b < key.tokens:
-                slot = (rank * mt + b) * hl + lh
-                ws = [
-                    fx.Vector(
-                        bo.buffer_load(
-                            buffer_resource(out),
-                            (b * out_sb + (dest * hl + lh) * out_sh) // 2 + j,
-                            vec_width=2,
-                            dtype=T.i32,
-                        )
-                    )
-                    for dest in range(n)
-                ]
-                lv = [
-                    fx.Float32(
-                        bo.buffer_load(
-                            buffer_resource(lse),
-                            b * lse_sb + (dest * hl + lh) * lse_sh,
-                            vec_width=1,
-                            dtype=T.f32,
-                        )
-                    )
-                    for dest in range(n)
-                ]
-                for dest in range_constexpr(n):
-                    put_words(data[dest], slot * words + j, [ws[dest][0], ws[dest][1]])
-                if const_expr(key.seqs > 0):
-                    empty = _row_empty(b, key.seqs, seq_lens, qsl)
-                    for dest in range_constexpr(n):
-                        lv[dest] = empty.select(fx.Float32(NEG_INF), lv[dest])
-                if const_expr(key.row_mask):
-                    empty = buffer_load_i32(row_counts, b) == 0
-                    for dest in range_constexpr(n):
-                        lv[dest] = empty.select(fx.Float32(NEG_INF), lv[dest])
-                for dest in range_constexpr(n):
-                    if tid == dest:
-                        put(lsep[dest], slot, lv[dest])
-                _poll_combine(
-                    poll,
-                    own_lse,
-                    own_data,
-                    n,
-                    mt,
-                    hl,
-                    words,
-                    b,
-                    lh,
-                    tid,
-                    key.base_e,
-                    key.ret_lse,
-                    res,
-                    res_sb,
-                    res_sh,
-                    res_lse,
-                )
-        _finish(tid, state, e, nblk)
-
+    combine = make_combine_kernel(
+        key, name, nblk, threads, lay, half, epoch_offset(lay)
+    )
     return _jit(key, combine, nblk, threads)
 
 
