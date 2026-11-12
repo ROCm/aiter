@@ -76,6 +76,12 @@ def sqrtsoftplus_384_topk(
     topk_weights and INT32 topk_ids of [rows, topk] with topk from 1 to 8.
     On gfx1250 the HIP kernel uses this layout only up to 1024 rows.
     """
+    if num_valid_rows is not None and (
+        num_valid_rows.dtype != torch.int32 or num_valid_rows.numel() < 1
+    ):
+        raise ValueError(
+            "num_valid_rows must be an int32 tensor of at least one element"
+        )
     waves, lanes, ept = SQRTSOFTPLUS_384_LAYOUTS[get_arch()]
     topk = topk_ids.shape[1]
     _sqrtsoftplus_384_topk[(gating_output.shape[0],)](

@@ -120,6 +120,20 @@ def test_sqrtsoftplus_384_topk_strided_logits():
     )
 
 
+@pytest.mark.parametrize(
+    "count",
+    [
+        torch.empty(0, dtype=torch.int32),
+        torch.tensor([4], dtype=torch.int64),
+    ],
+    ids=["empty", "int64"],
+)
+def test_sqrtsoftplus_384_topk_rejects_a_bad_row_count(count):
+    logits = torch.randn((8, EXPERTS), dtype=torch.bfloat16, device="cuda")
+    with pytest.raises(ValueError, match="num_valid_rows"):
+        _triton(logits, None, 6, count.cuda())
+
+
 @pytest.mark.parametrize("capturing", [False, True])
 def test_topk_gating_dispatch(monkeypatch, capturing):
     monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: capturing)

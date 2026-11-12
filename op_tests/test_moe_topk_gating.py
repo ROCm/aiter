@@ -26,7 +26,7 @@ import pandas as pd
 import torch
 
 import aiter
-from aiter.jit.utils.chip_info import get_gfx
+from aiter.jit.utils.chip_info import get_gfx, get_gfx_runtime
 from aiter.ops.topk import biased_grouped_topk, biased_grouped_topk_hip
 from aiter.test_common import (
     benchmark,
@@ -556,7 +556,7 @@ def bench_sqrtsoftplus_384(num_tokens, topk, route_scale=1.5):
     run_triton()
     run_hip()
     ret = {
-        "gfx": get_gfx(),
+        "gfx": get_gfx_runtime(),
         "id mismatch": int((triton_ids != hip_ids).sum()),
         "weight bit mismatch": int(
             (triton_weights.view(torch.int32) != hip_weights.view(torch.int32)).sum()
@@ -1168,18 +1168,24 @@ def main():
             SQRTSOFTPLUS_384_LAYOUTS,
         )
 
-        if get_gfx() not in SQRTSOFTPLUS_384_LAYOUTS:
+        gfx = get_gfx_runtime()
+        if gfx not in SQRTSOFTPLUS_384_LAYOUTS:
             raise ValueError(
                 f"softplus-384 requires one of {sorted(SQRTSOFTPLUS_384_LAYOUTS)}"
             )
         # On gfx1250 the HIP kernel uses this layout only up to 1024 rows.
-        max_rows = 1024 if get_gfx().startswith("gfx1250") else max(num_tokens_list)
+        max_rows = 1024 if gfx.startswith("gfx1250") else max(num_tokens_list)
         configs = list(
             itertools.product(
                 [t for t in num_tokens_list if t <= max_rows],
                 [k for k in topk_list if k <= 8],
             )
         )
+        if not configs:
+            raise ValueError(
+                f"softplus-384 has nothing to run on {gfx}: it needs a --num-tokens "
+                f"value of at most {max_rows} and a --topk value from 1 to 8"
+            )
         df = pd.DataFrame([bench_sqrtsoftplus_384(*cfg) for cfg in configs])
         aiter.logger.info(
             "384-expert sqrtsoftplus summary (markdown):\n%s",
