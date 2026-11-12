@@ -90,6 +90,11 @@ FUSED_TOKEN_BUCKETS = TOKEN_BUCKETS
 # Below this many rows per rank the staged (or small-input) path is faster than
 # the large-input kernel, whose geometry is fixed by its capacity.
 LARGE_M_MIN_TOKENS = SMALL_M_MAX_MTPR + 1
+# EP4 V4.1-Flash: the large-input route also serves 384-512 rows, where its dispatch overlaps GEMM1 (XGMI-bound at
+# these rows) and the small-input kernel does not: --layers 4, per-rank, row hint: 384/400/448/512 rows 0.974/0.963/
+# 0.947/0.925 of the small-input route, 0.80-0.83 at 320-512 rows of skewed routing (--route hot --hot-bias 0.1);
+# below 384 the small-input route wins (352 rows: 0.92).
+V41_FLASH_EP4_LARGE_M_MIN_TOKENS = 384
 P2P_QUANT_NONE = "none"
 P2P_QUANT_FP8_BLOCKWISE = "fp8_blockwise_1x32"
 SUPPORTED_P2P_QUANT_MODES = (P2P_QUANT_NONE, P2P_QUANT_FP8_BLOCKWISE)
@@ -394,6 +399,9 @@ class MegaMoEBundlePlan:
     # Fused routes this instance builds: small-input capacities and the large-input kernel.
     small_m_mtprs: tuple[int, ...] = ()
     large_m: bool = False
+    # Rows on the largest EP rank from which a call takes the large-input route (when built), ahead of the small-input
+    # capacities that would also fit it.
+    large_m_min_tokens: int = LARGE_M_MIN_TOKENS
 
     def route_for(
         self, max_tokens: int, *, small_m: bool = True, large_m: bool = True
@@ -405,12 +413,12 @@ class MegaMoEBundlePlan:
         """
         if not 0 <= max_tokens <= self.mtpr:
             raise ValueError(f"max_tokens={max_tokens} must be in [0, {self.mtpr}]")
+        if large_m and self.large_m and max_tokens >= self.large_m_min_tokens:
+            return ROUTE_LARGE_M, self.mtpr
         if small_m:
             for capacity in self.small_m_mtprs:
                 if max_tokens <= capacity:
                     return ROUTE_SMALL_M, capacity
-        if large_m and self.large_m and max_tokens >= LARGE_M_MIN_TOKENS:
-            return ROUTE_LARGE_M, self.mtpr
         return ROUTE_STAGED, self.mtpr
 
     def entry_for_tokens(self, tokens: int) -> MegaMoEBundleEntry:
@@ -1440,6 +1448,11 @@ def build_mega_moe_bundle_plan(
         stage2_variants=tuple(stage2_variants),
         small_m_mtprs=small_m_mtprs_for(mtpr, small_m_mtprs) if small_m_mtprs else (),
         large_m=large_m,
+        large_m_min_tokens=(
+            V41_FLASH_EP4_LARGE_M_MIN_TOKENS
+            if large_m and _is_v41_flash_ep4(world_size, experts_per_rank, model_dim, inter_dim)
+            else LARGE_M_MIN_TOKENS
+        ),
     )
 
 
