@@ -240,22 +240,23 @@ class PaDecodeSchedule:
         partition_workgroups = num_seqs * num_kv_heads * num_partitions
         assert query_length >= 1, f"query_length must be >= 1, got {query_length}"
         split_workgroups = work_capacity * num_kv_heads
+        # KV tiles of the sequences before capacity bounds them; None when the
+        # context bound is unknown.
+        tile_demand = None
         single_tile_plan = False
         if sliding_window == 0 and max_context_length is not None:
             context_tiles = (
                 max_context_length + KV_COMPUTE_BLOCK - 1
             ) // KV_COMPUTE_BLOCK
-            split_workgroups = min(
-                split_workgroups, num_seqs * num_kv_heads * context_tiles
-            )
+            tile_demand = num_seqs * num_kv_heads * context_tiles
+            split_workgroups = min(split_workgroups, tile_demand)
         if sliding_window > 0:
             # Bound the unaligned MTP window union, excluding padding CTAs.
             window_tiles = (
                 sliding_window + query_length - 2 + KV_COMPUTE_BLOCK - 1
             ) // KV_COMPUTE_BLOCK + 1
-            split_workgroups = min(
-                split_workgroups, num_seqs * num_kv_heads * window_tiles
-            )
+            tile_demand = num_seqs * num_kv_heads * window_tiles
+            split_workgroups = min(split_workgroups, tile_demand)
             # For n nonempty sequences, T <= n * window_tiles and the budget
             # leaves >= n * (window_tiles - 1) extras. Prefix apportionment
             # therefore gives each visible tile its own task, even after refresh.
@@ -293,12 +294,24 @@ class PaDecodeSchedule:
             ):
                 query_splits = 2
             elif (
-                "gfx94" in arch
+                ("gfx94" in arch or is_gfx950)
                 and kv_dtype != MXFP4_KV_DTYPE
                 and query_length * query_group_size > MFMA_MNK
                 and (kv_dtype == fx.BFloat16 or head_dim <= 128)
+                # gfx950 per-token FP8 keeps its fused MTP tiles. gfx950 MTP
+                # plans hold capacity to one or two slots per CU whatever the
+                # load, so its FP8 split also bounds the tiles (eight per CU).
+                and (
+                    not is_gfx950
+                    or kv_dtype == fx.BFloat16
+                    or (
+                        not per_token_kv
+                        and tile_demand is not None
+                        and tile_demand <= 8 * num_compute_units
+                    )
+                )
             ):
-                # gfx942 MTP tiles with idle CUs: per-CTA latency dominates,
+                # MTP tiles with idle CUs: per-CTA latency dominates,
                 # so split the query positions over more CTAs (re-reading K/V
                 # from L2). Split FP8 (to D128; D256 measured 0.93-1.05x) into
                 # single-M-tile CTAs while about three fit per CU, else in two
@@ -318,11 +331,13 @@ class PaDecodeSchedule:
                                 else num_compute_units
                             )
                         )
-                        # Four D128 M-tiles hold 360 VGPRs; on busy grids two
-                        # split-major CTAs of two M-tiles share K/V and fit two
-                        # per CU (D192 and two-M-tile rows measured slower).
+                        # Four D128 M-tiles hold 360 VGPRs; on busy gfx942
+                        # grids two split-major CTAs of two M-tiles share K/V
+                        # and fit two per CU (D192 and two-M-tile rows, and
+                        # gfx950, measured slower).
                         or (
-                            head_dim == 128
+                            "gfx94" in arch
+                            and head_dim == 128
                             and query_length * query_group_size >= 4 * MFMA_MNK
                             and split_workgroups > num_compute_units
                         )
@@ -418,14 +433,12 @@ class PaDecodeSchedule:
                 raise NotImplementedError(
                     "MXFP4 PA supports head_dim 128, block 128, one M-tile"
                 )
-        # gfx942: more CTAs than CUs hold work, so occupancy outweighs a
-        # single CTA's latency (V prefetch, STREAM_KV, WAVES_PER_EU_2).
-        gfx942_busy = (
-            "gfx94" in arch and split_workgroups * query_splits > num_compute_units
-        )
+        # More CTAs than CUs hold work, so occupancy outweighs a single CTA's
+        # latency (STREAM_KV; gfx942 V prefetch and WAVES_PER_EU_2).
+        busy_grid = split_workgroups * query_splits > num_compute_units
         # Two waves per SIMD only pay when two CTAs per CU have work.
-        gfx942_two_per_cu = (
-            gfx942_busy and split_workgroups * query_splits >= 2 * num_compute_units
+        two_per_cu = (
+            busy_grid and split_workgroups * query_splits >= 2 * num_compute_units
         )
         # Prefetch supported single-M query tiles independently of grid size.
         prefetch_v = (
@@ -453,13 +466,13 @@ class PaDecodeSchedule:
                         kv_dtype in FP8_KV_DTYPES
                         and head_dim <= 256
                         and (
-                            gfx942_busy
+                            busy_grid
                             or per_token_kv
                             or block_size != 128
                             or not trans_v
                         )
                         and not (
-                            gfx942_busy
+                            busy_grid
                             and per_token_kv
                             and head_dim > 128
                             and block_size == 64
@@ -483,12 +496,23 @@ class PaDecodeSchedule:
                 or (single_tile_plan and split_workgroups <= 2 * num_compute_units)
             )
         )
-        # gfx942 split CTAs launch split-major, so a task's splits dispatch
-        # together instead of after every slot of the previous split. BF16
-        # head-dim splits forced by LDS only gain when tasks are long. Several
-        # KV heads launch head-major on small grids, where the plan's empty
-        # slots otherwise delay every head after the first.
-        split_major = "gfx94" in arch and (
+        # Split CTAs launch split-major, so a task's splits dispatch together
+        # instead of after every slot of the previous split. BF16 head-dim
+        # splits forced by LDS only gain when tasks are long. Several KV heads
+        # launch head-major on small grids, where the plan's empty slots
+        # otherwise delay every head after the first. gfx950 gains only while
+        # at most a quarter of the CUs hold work (on fuller grids slot-major
+        # order ran up to 1.25x faster), and not for BF16 rows past D128
+        # (0.91-0.93x on LDS-forced splits).
+        split_major = (
+            "gfx94" in arch
+            or (
+                is_gfx950
+                and kv_dtype != MXFP4_KV_DTYPE
+                and (kv_dtype in FP8_KV_DTYPES or head_dim <= 128)
+                and split_workgroups <= num_compute_units // 4
+            )
+        ) and (
             (
                 query_splits > 1
                 and (
@@ -503,7 +527,7 @@ class PaDecodeSchedule:
                     )
                 )
             )
-            or (num_kv_heads > 1 and not gfx942_busy)
+            or (num_kv_heads > 1 and not busy_grid)
         )
         cache_key = (
             head_dim,
@@ -527,8 +551,8 @@ class PaDecodeSchedule:
             direct_output,
             # At most one CTA per CU: room for two four-wave groups per CTA.
             split_workgroups * query_splits <= num_compute_units,
-            gfx942_busy,
-            gfx942_two_per_cu,
+            busy_grid,
+            two_per_cu,
             split_major,
             D256_PIPE,
             stage_pages,
@@ -694,8 +718,8 @@ class PaDecodeTraits:
             mask_unowned_kv,
             DIRECT,
             SPARSE_GRID,
-            gfx942_busy,
-            gfx942_two_per_cu,
+            busy_grid,
+            two_per_cu,
             SPLIT_MAJOR,
             D256_PIPE,
             stage_page_capacity,
@@ -899,27 +923,27 @@ class PaDecodeTraits:
         # FP8 also issues the next K from those ids right after QK instead of
         # after the P barrier. BF16's next K is twice the registers and slower.
         PAGE16_EARLY_K = PAGE16_PAGES_FIRST and kv_dtype != fx.BFloat16
-        # gfx942 spills a whole next-tile K prefetch plus the tile's V gather
-        # once a lane's K row reaches STREAM_KV_MTILES_ROW_BYTES; stream K and
-        # V per chunk instead. MTP M-tiles share each streamed chunk. From
-        # STREAM_KV_ROW_BYTES a single M-tile (STREAM_KV_TWO_MTILE_ROW_BYTES
-        # for two) no longer spills but runs at one wave per SIMD; streaming
-        # trades its K prefetch for occupancy, which only pays when more CTAs
-        # than CUs hold work.
+        # A whole next-tile K prefetch plus the tile's V gather spills once a
+        # lane's K row reaches STREAM_KV_MTILES_ROW_BYTES (gfx942 and gfx950);
+        # stream K and V per chunk instead. MTP M-tiles share each streamed
+        # chunk. From STREAM_KV_ROW_BYTES a single M-tile
+        # (STREAM_KV_TWO_MTILE_ROW_BYTES for two) no longer spills but runs at
+        # one wave per SIMD; streaming trades its K prefetch for occupancy,
+        # which only pays when more CTAs than CUs hold work. gfx950's fused
+        # BF16 MTP and head-256 pipes keep their own schedules.
         kv_row_bytes = head_dim * QP_ELEM_BYTES
         STREAM_KV = (
-            not is_gfx950
-            and kv_dtype != MXFP4_KV_DTYPE
+            kv_dtype != MXFP4_KV_DTYPE
             and not MTP4_FUSED
+            and not BF16_MTP_FUSED
+            and not D256_PIPE
             and not prefetch_v
             and (
                 kv_row_bytes >= STREAM_KV_MTILES_ROW_BYTES
-                or (
-                    M_TILES == 1 and gfx942_busy and kv_row_bytes >= STREAM_KV_ROW_BYTES
-                )
+                or (M_TILES == 1 and busy_grid and kv_row_bytes >= STREAM_KV_ROW_BYTES)
                 or (
                     M_TILES == 2
-                    and gfx942_busy
+                    and busy_grid
                     and kv_row_bytes >= STREAM_KV_TWO_MTILE_ROW_BYTES
                 )
             )
@@ -930,7 +954,7 @@ class PaDecodeTraits:
         # without spilling.
         WAVES_PER_EU_2 = (
             not is_gfx950
-            and gfx942_two_per_cu
+            and two_per_cu
             and (
                 (
                     kv_dtype in FP8_KV_DTYPES
@@ -1090,6 +1114,7 @@ class PaDecodeTraits:
             and not single_tile_plan
             and not BF16_MTP_FUSED
             and not MTP4_FUSED
+            and not STREAM_KV
         )
         # Page ids for the task's tiles, one i32 each, staged before the loop.
         # Dual MXFP4 groups stage only their own (alternate) tiles' ids, so
