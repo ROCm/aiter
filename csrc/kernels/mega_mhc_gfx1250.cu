@@ -1885,6 +1885,10 @@ void launch(int body_blocks,
         tail_token0 = body_blocks * BM;
         grid.x      = body_blocks + (blocks - body_blocks) * TAIL::SPLIT;
     }
+    // Cluster launch needs HIP's cluster attributes, which builds without
+    // gfx1250 targets do not get (HIP 7.2.4 headers lack them). Such builds
+    // never reach this launcher; fail loudly if they do.
+#ifdef AITER_ENABLE_CLUSTER_LAUNCH
     hipLaunchAttribute cluster_attr[1];
     cluster_attr[0].id               = hipLaunchAttributeClusterDimension;
     cluster_attr[0].val.clusterDim.x = C::CLUSTER;
@@ -1892,6 +1896,16 @@ void launch(int body_blocks,
     cluster_attr[0].val.clusterDim.z = 1;
     [[maybe_unused]] const hipLaunchConfig_t cluster_config{
         grid, dim3(C::THREADS), 0, stream, cluster_attr, 1};
+#define LAUNCH_CLUSTER(POST, IDENTITY, MX)                                       \
+    HIP_CALL(hipLaunchKernelEx(&cluster_config,                                  \
+                               mega_mhc_cluster_kernel<C, TAIL, POST, IDENTITY, MX>, \
+                               LAUNCH_ARGS))
+#else
+#define LAUNCH_CLUSTER(POST, IDENTITY, MX)                                                \
+    AITER_CHECK(false,                                                                    \
+                "gfx1250 Mega-MHC cluster launch in a build without cluster support; " \
+                "rebuild with AITER_ENABLE_CLUSTER_LAUNCH (gfx1250 target, HIP >= 7.0)")
+#endif
 #define LAUNCH_ARGS                                                                                \
     static_cast<const bf16*>(residual.data_ptr()),                                                 \
         static_cast<const bf16*>(sublayer_out.data_ptr()),                                         \
@@ -1912,9 +1926,7 @@ void launch(int body_blocks,
     do                                                                                       \
     {                                                                                        \
         if constexpr(C::CLUSTER > 1)                                                         \
-            HIP_CALL(hipLaunchKernelEx(&cluster_config,                                      \
-                                       mega_mhc_cluster_kernel<C, TAIL, POST, IDENTITY, MX>, \
-                                       LAUNCH_ARGS));                                        \
+            LAUNCH_CLUSTER(POST, IDENTITY, MX);                                              \
         else                                                                                 \
             mega_mhc_kernel<C, TAIL, POST, IDENTITY, MX>                                     \
                 <<<grid, C::THREADS, 0, stream>>>(LAUNCH_ARGS);                              \
@@ -1944,6 +1956,7 @@ void launch(int body_blocks,
     }
 #undef DISPATCH
 #undef LAUNCH
+#undef LAUNCH_CLUSTER
 #undef LAUNCH_ARGS
     HIP_CALL(hipGetLastError());
 }
