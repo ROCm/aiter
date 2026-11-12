@@ -122,6 +122,9 @@ def _check(wbuf, ibuf, topk, ref, score, name):
         msg=f"{name} routed ids unique and in range",
     )
     kth = score.gather(-1, ref_ri.long()).min(dim=-1, keepdim=True).values
+    # Masked ties sort in any order, which is safe for the weight check: a
+    # routed weight is a function of the score alone (softmax, renormalized
+    # over the same selected scores), so tied experts carry equal weights.
     ref_ids, ref_w = sorted_pairs(mask_boundary_ties(ref_ri, score, kth), ref_rw)
     got_ids, got_w = sorted_pairs(
         mask_boundary_ties(got_ri.to(dtypes.i32), score, kth), got_rw
@@ -301,6 +304,27 @@ def _run_guard_checks():
     )
 
 
+def _run_tie_checks():
+    """Constructed cases for the routed-id comparison: a tie at the k-th score
+    is accepted, a wrong pick and an invalid id are not."""
+    score = torch.tensor([[3.0, 2.0, 2.0, 1.0]])
+    ref = torch.tensor([[0, 1]], dtype=dtypes.i32)
+    kth = score.gather(-1, ref.long()).min(dim=-1, keepdim=True).values
+
+    def masked(ids):
+        return mask_boundary_ties(torch.tensor([ids], dtype=dtypes.i32), score, kth)
+
+    # Expert 2 ties expert 1 at the k-th score, so either pick is correct.
+    assert torch.equal(masked([0, 2]), masked([0, 1])), "tie must be accepted"
+    # Expert 3 scores below the k-th, so picking it is a real mismatch.
+    assert not torch.equal(masked([0, 3]), masked([0, 1])), "wrong pick missed"
+    # Duplicate and out-of-range ids are caught before masking can hide them.
+    ids = torch.tensor([[0, 0], [0, 4], [-1, 0], [0, 1]], dtype=dtypes.i32)
+    assert invalid_id_rows(ids, 4).tolist() == [True, True, True, False]
+
+    aiter.logger.info("tie checks passed: tie accepted, wrong pick and bad ids caught")
+
+
 def main():
     if get_gfx() not in SUPPORTED_GFX:
         aiter.logger.warning(
@@ -349,6 +373,7 @@ def main():
 
     # Negative/guard behaviors (raise or no-op) -- asserts, run in CI too.
     _run_guard_checks()
+    _run_tie_checks()
 
 
 if __name__ == "__main__":
