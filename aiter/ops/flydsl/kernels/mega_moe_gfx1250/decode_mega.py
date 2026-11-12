@@ -517,10 +517,13 @@ def make_decode_mega(
     k_tiles2 = -(-I // int(tile_k2))
     nb1 = min(int(num_buffers), max(1, H // int(tile_k)))
     nb2 = min(int(num_buffers2), max(1, I // int(tile_k2)))
-    if LA and post_mc and k_tiles1 % nb1 and not k_tiles1 % 4:
+    # Debug only: AITER_DMK_LA_DBG bit 0 GEMM1, bit 1 GEMM2, bit 2 the A side.
+    LA_DBG = int(os.environ.get("AITER_DMK_LA_DBG", "7"))
+    if LA and LA_DBG & 1 and post_mc and k_tiles1 % nb1 and not k_tiles1 % 4:
         nb1 = 4
-    LA1 = bool(LA and post_mc and not k_tiles1 % nb1)
-    LA2 = bool(LA and post_mc and DEFER_SC and not k_tiles2 % nb2)
+    LA1 = bool(LA and post_mc and not k_tiles1 % nb1 and LA_DBG & 1)
+    LA2 = bool(LA and post_mc and DEFER_SC and not k_tiles2 % nb2 and LA_DBG & 2)
+    LA_A = bool(LA_DBG & 4)
     # AITER_DMK_EXPECT (needs EARLY): each source sends every destination its
     # route count up front, and CTA 0 plans once its slot counters add up to
     # the sum -- no reserved tally (one device atomic per route wave on one
@@ -534,6 +537,13 @@ def make_decode_mega(
     ROWFLAG = (
         0 if (COMPACT or not EARLY) else int(os.environ.get("AITER_DMK_ROWFLAG", "0"))
     )
+    # AITER_DMK_LEAD_FREE: CTA 0 takes no routes, so its wave 0 polls the
+    # peers as soon as its ticket is in, not after its own rows retired.
+    LEAD_FREE = 0 if COMPACT else int(os.environ.get("AITER_DMK_LEAD_FREE", "0"))
+    # Producer waves, and the most routes one of them takes (ROWFLAG keeps
+    # each route's (destination, row) in LDS until the rows retired).
+    PROD_W = (G - 1) * 4 if LEAD_FREE else G * 4
+    R_MAX = -(-int(max_tok_per_rank) * K // PROD_W)
     knob_sfx = "".join(
         f"_{name}{val}"
         for name, val, default in (
@@ -545,8 +555,10 @@ def make_decode_mega(
             ("pf", PREF_B // 1024, min(256 * 1024, int(tile_n) * (H // 2)) // 1024),
             ("go", GATE_ONCE, 1),
             ("la", LA, 0),
+            ("lad", LA_DBG, 7),
             ("ex", EXPECT, 0),
             ("rf", ROWFLAG, 0),
+            ("lf", LEAD_FREE, 0),
         )
         if val != default
     )
@@ -1660,16 +1672,28 @@ def make_decode_mega(
                     # launch's 16-bit tag in one word.
                     if (bid == fx.Int32(G - 1)) & (wave == fx.Int32(3)):
                         n_all = tok * fx.Int32(K)
+                        # Sized to this step's routes: the unrolled loads run to
+                        # the instance's most routes, and past the ids tensor
+                        # they must read zeros, not the next page.
+                        rsrc_ids_n = create_buffer_resource_from_addr(
+                            addr_ids, num_records_bytes=n_all * fx.Int32(4)
+                        )
                         per_dst = [fx.Int32(0)] * npes
                         for base in range_constexpr(
                             0, int(max_tok_per_rank) * K, 4 * WAVE
                         ):
+                            # One dword per load: a raw buffer access partly
+                            # past num_records reads zeros for all of it.
                             r0 = fx.Int32(base) + lane * fx.Int32(4)
-                            ids4 = fx.Vector(
-                                buffer_load(rsrc_ids, r0, vec_width=4, dtype=T.i32)
-                            )
                             for c in range_constexpr(4):
-                                gid = fx.Int32(ids4[c])
+                                gid = fx.Int32(
+                                    buffer_load(
+                                        rsrc_ids_n,
+                                        r0 + fx.Int32(c),
+                                        vec_width=1,
+                                        dtype=T.i32,
+                                    )
+                                )
                                 ok = (
                                     (r0 + fx.Int32(c) < n_all)
                                     & (gid >= fx.Int32(0))
@@ -1698,8 +1722,26 @@ def make_decode_mega(
                 # parallel. Its lane 0 reserves the destination slot first; the
                 # atomic is in flight across the quant.
                 n_routes = tok * fx.Int32(K)
-                for r in range(wave_gid, n_routes, G * 4):
+                if const_expr(LEAD_FREE):
+                    r_first = fx.Int32(
+                        (bid == fx.Int32(0)).select(n_routes, wave_gid - fx.Int32(4))
+                    )
+                else:
+                    r_first = wave_gid
+                for r in range(r_first, n_routes, PROD_W):
                     n_mine = n_mine + fx.Int32(1)
+                    if const_expr(ROWFLAG):  # noqa: SIM102
+                        # No row (invalid route, or past its expert's slots).
+                        if lane == fx.Int32(0):
+                            comm_ops.store_i32_lds(
+                                fx.Int64(
+                                    ar
+                                    + (wave * fx.Int32(R_MAX) + n_mine - fx.Int32(1))
+                                    * fx.Int32(8)
+                                    + fx.Int32(4)
+                                ),
+                                fx.Int32(-1),
+                            )
                     t = r // fx.Int32(K)
                     gid = fx.Int32(
                         buffer_load(
@@ -1859,16 +1901,26 @@ def make_decode_mega(
                             mask=lane == fx.Int32(0),
                             cache_modifier=SCOPE_SYS,
                         )
-                        if const_expr(ROWFLAG):
-                            # The row and its pair retired at the destination
-                            # (SCOPE_SYS): mark the slot landed.
-                            rocdl.s_wait_storecnt(0)
+                        if const_expr(ROWFLAG):  # noqa: SIM102
+                            # Marked once every row of this wave retired, past
+                            # the reserved signal (see below the loop).
                             if lane == fx.Int32(0):
-                                comm_ops.store_i32_global_system_monotonic(
-                                    peer_va(dst, off_rowmap)
-                                    + fx.Int64(LAND_OFF)
-                                    + fx.Int64(row) * fx.Int64(4),
-                                    gen,
+                                comm_ops.store_i32_lds(
+                                    fx.Int64(
+                                        ar
+                                        + (wave * fx.Int32(R_MAX) + n_mine - fx.Int32(1))
+                                        * fx.Int32(8)
+                                    ),
+                                    dst,
+                                )
+                                comm_ops.store_i32_lds(
+                                    fx.Int64(
+                                        ar
+                                        + (wave * fx.Int32(R_MAX) + n_mine - fx.Int32(1))
+                                        * fx.Int32(8)
+                                        + fx.Int32(4)
+                                    ),
+                                    row,
                                 )
                     if valid & (off >= fx.Int32(CAP)) & (lane == fx.Int32(0)):
                         comm_ops.atomic_add_agent(
@@ -1906,6 +1958,23 @@ def make_decode_mega(
             # ROWFLAG: each route marked its own slot instead.
             rocdl.s_wait_storecnt(0)
             stamp(11)
+            if const_expr(ROWFLAG):
+                # Every row and rowmap pair of this wave retired: mark their
+                # slots landed.
+                rocdl.s_wait_dscnt(0)
+                for j in range(fx.Int32(0), n_mine, 1):
+                    rec = ar + (wave * fx.Int32(R_MAX) + j) * fx.Int32(8)
+                    dst_j = _uniform(fx.Int32(comm_ops.load_i32_lds(fx.Int64(rec))))
+                    row_j = _uniform(
+                        fx.Int32(comm_ops.load_i32_lds(fx.Int64(rec + fx.Int32(4))))
+                    )
+                    if (row_j >= fx.Int32(0)) & (lane == fx.Int32(0)):
+                        comm_ops.store_i32_global_system_monotonic(
+                            peer_va(dst_j, off_rowmap)
+                            + fx.Int64(LAND_OFF)
+                            + fx.Int64(row_j) * fx.Int64(4),
+                            gen,
+                        )
             if const_expr(not ROWFLAG):
                 done_before = fx.Int32(0)
                 if (n_mine > fx.Int32(0)) & (lane == fx.Int32(0)):
@@ -2129,22 +2198,29 @@ def make_decode_mega(
                     "rows": rows_n,
                 }
 
-            def la_plan1():
-                b, _, d = la_next(True)
+            # The A-side verdicts: an i32, or a function the builder calls past
+            # a draining fence (a flag load issued here, compared there). Each
+            # stores the sides for the next item once known. Branches only
+            # return: the AST rewriter turns a branch's assignments into
+            # branch results.
+            def la_deferred(b, ready):
+                def a_fn(b=b, ready=ready):
+                    a = b * fx.Int32(ready().select(fx.Int32(1), fx.Int32(0)))
+                    la_store(b, a)
+                    return a
+
+                return a_fn
+
+            def la_now(b, a):
+                la_store(b, a)
+                return a
+
+            def la_a1(b, d):
+                if const_expr(not LA_A):
+                    return la_now(b, fx.Int32(0))
                 if const_expr(ROWFLAG):
-                    # The next m-tile's rows-landed words, loaded now and
-                    # checked once the builder needs the verdict.
                     pending = rows_pending(d["m_tile"], d["rows"])
-
-                    def a_fn(pending=pending, b=b):
-                        a = b * fx.Int32(
-                            (pending() == fx.Int32(0)).select(fx.Int32(1), fx.Int32(0))
-                        )
-                        la_store(b, a)
-                        return a
-
-                    d["a"] = a_fn
-                    return d
+                    return la_deferred(b, lambda p=pending: p() == fx.Int32(0))
                 if const_expr(COMPACT or EARLY):
                     # A runs ahead once this CTA saw the rows-landed gate,
                     # which this GEMM1 item's own a_ready waited for.
@@ -2153,35 +2229,33 @@ def make_decode_mega(
                             comm_ops.load_i32_lds(fx.Int64(bc + fx.Int32(BC_GATE_R)))
                         )
                     )
-                    a = b * fx.Int32(
-                        (seen != fx.Int32(0)).select(fx.Int32(1), fx.Int32(0))
+                    return la_now(
+                        b,
+                        b
+                        * fx.Int32(
+                            (seen != fx.Int32(0)).select(fx.Int32(1), fx.Int32(0))
+                        ),
                     )
-                else:
-                    a = b
-                la_store(b, a)
-                d["a"] = a
+                return la_now(b, b)
+
+            def la_a2(b, i_n):
+                if const_expr(not LA_A):
+                    return la_now(b, fx.Int32(0))
+                if const_expr(PH & 16):
+                    return la_now(b, b)
+                rdy = _load_i32_dev(
+                    rsrc_ctl, fx.Int32(CTL_G1 + G1_READY) + i_n * fx.Int32(G1_STRIDE)
+                )
+                return la_deferred(b, lambda r=rdy: _uniform(r) == gen)
+
+            def la_plan1():
+                b, _, d = la_next(True)
+                d["a"] = la_a1(b, d)
                 return d
 
             def la_plan2():
                 b, i_n, d = la_next(False)
-                if const_expr(PH & 16):
-                    la_store(b, b)
-                    d["a"] = b
-                    return d
-                # The next m-tile's g1_ready, loaded now and compared only
-                # once the builder needs the verdict (past a draining fence).
-                rdy = _load_i32_dev(
-                    rsrc_ctl, fx.Int32(CTL_G1 + G1_READY) + i_n * fx.Int32(G1_STRIDE)
-                )
-
-                def a_fn(rdy=rdy, b=b):
-                    a = b * fx.Int32(
-                        (_uniform(rdy) == gen).select(fx.Int32(1), fx.Int32(0))
-                    )
-                    la_store(b, a)
-                    return a
-
-                d["a"] = a_fn
+                d["a"] = la_a2(b, i_n)
                 return d
 
             # AITER_DMK_TRACE: per-item phase sums in LDS words past the

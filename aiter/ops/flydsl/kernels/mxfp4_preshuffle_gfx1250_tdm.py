@@ -87,6 +87,9 @@ EXPLICIT_VGPR_PARTITION = int(
     os.environ.get("AITER_FLYDSL_EXPLICIT_VGPR_PARTITION", "0")
 )
 PLANAR_LDS = int(os.environ.get("AITER_FLYDSL_PLANAR_LDS", "0"))
+# Debug only (wrong results): skip each k-tile's LDS reads and WMMAs where the
+# mainloop issues its loads itself, to time the loads alone.
+DBG_NOCOMPUTE = int(os.environ.get("AITER_TDM_DBG_NOCOMPUTE", "0"))
 INTERLEAVED_LDS_LOAD = int(os.environ.get("AITER_FLYDSL_INTERLEAVED_LDS_LOAD", "0"))
 LDS_SOA_LOAD_INTERLEAVE = os.environ.get("LDS_SOA_LOAD_INTERLEAVE")
 if LDS_SOA_LOAD_INTERLEAVE is not None:
@@ -588,6 +591,7 @@ def build_gemm_a8w4_tdm_task(
         f"{_interleaved_lds_load}{_persistent}{_drain}{_malign}{_kwaves}{_cpol}"
         f"{'_dew' if defer_ep_wait else ''}"
         f"{'_la' if lookahead is not None else ''}"
+        f"{'_nocomp' if DBG_NOCOMPUTE else ''}"
     )
 
     # Compile the static path directly, preserving its launch ABI and the
@@ -1252,14 +1256,19 @@ def build_gemm_a8w4_tdm_task(
                 assert (g in a_side) != (g in {waves[1], waves[3]}), (
                     "lookahead needs every wave group to own one side only"
                 )
+        # Trace-time state, written through la_put only: the AST rewriter
+        # turns a branch's assignments into branch results.
         la = {}
+
+        def la_put(key, value):
+            la[key] = value
 
         def la_resolve():
             # A deferred A verdict (a flag load the caller issued in plan)
             # resolves at its first use, past a barrier that drained the load,
             # and outside any per-wave branch so later uses see it.
-            if "a" not in la:
-                la["a"] = fx.Int32(la["a_fn"]())
+            if const_expr("a" not in la):
+                la_put("a", fx.Int32(la["a_fn"]()))
 
         def la_side_ok(g):
             return la["a"] if g in a_side else la["b"]
@@ -1268,11 +1277,11 @@ def build_gemm_a8w4_tdm_task(
             """The next tile from the caller, and its loads."""
             nxt = lookahead[0]["plan"]()
             la.clear()
-            if callable(nxt["a"]):
-                la["a_fn"] = nxt["a"]
+            if const_expr(callable(nxt["a"])):
+                la_put("a_fn", nxt["a"])
             else:
-                la["a"] = fx.Int32(nxt["a"])
-            la["b"] = fx.Int32(nxt["b"])
+                la_put("a", fx.Int32(nxt["a"]))
+            la_put("b", fx.Int32(nxt["b"]))
             blk_m_n = fx.Int64(fx.Int32(nxt["m_tile"]) * tile_m)
             blk_n_n = fx.Int64(fx.Int32(nxt["n_tile"]) * tile_n)
             eb_n = fx.Int64(fx.Int32(nxt["expert"]))
@@ -1285,7 +1294,7 @@ def build_gemm_a8w4_tdm_task(
                 fx.Int32(nxt["rows"]),
                 target_jobs=la_jobs,
             )
-            la["jobs"] = la_jobs
+            la_put("jobs", la_jobs)
 
         def la_issue(stage):
             """The next tile's k-tile ``stage`` into stage buffer ``stage``."""
@@ -1673,6 +1682,10 @@ def build_gemm_a8w4_tdm_task(
             ``jobs`` by wave owner itself; it is unused when ``prefetch_kt`` is
             None.
             """
+            if const_expr(
+                DBG_NOCOMPUTE and prefetch_kt is None and next_stage_buf is None
+            ):
+                return
 
             lds_addr = calc_lds_addr(buf)
             next_stage_lds_addr = (
