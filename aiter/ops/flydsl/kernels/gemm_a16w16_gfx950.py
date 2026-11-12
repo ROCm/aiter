@@ -1925,8 +1925,11 @@ def gemm_a16w16(
         # Per-call storage, allocated on the launch stream. Graph capture owns
         # its allocation; concurrent streams/graphs never share writable scratch.
         # Every valid partial is overwritten, so no initialization launch is needed.
-        with torch.cuda.stream(stream):
+        if stream == torch.cuda.current_stream(device):
             partial = torch.empty((256, 3584), device=device, dtype=torch.float32)
+        else:
+            with torch.cuda.stream(stream):
+                partial = torch.empty((256, 3584), device=device, dtype=torch.float32)
         args = (
             _dynamic_tensor_arg(out, 1),
             _dynamic_tensor_arg(a, 1),
