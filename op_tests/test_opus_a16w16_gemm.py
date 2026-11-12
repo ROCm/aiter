@@ -410,6 +410,42 @@ def test_gfx950_mono_fp32_overwrites_poisoned_output(kid):
     _assert_matches_golden(actual, A, B)
 
 
+@pytest.mark.parametrize(("M", "N"), ((1, 65552), (1448, 16384), (5793, 16384)))
+def test_gfx950_legacy_kid_writes_every_tile(M, N):
+    """The XCD-swizzle tail of the legacy split-barrier pipeline left C tiles
+    unwritten on these grids (columns 65536+ for M=1, N=65552)."""
+    if _runtime_arch() != "gfx950":
+        pytest.skip("requires gfx950 hardware")
+    torch.manual_seed(0x5A1E + M)
+    A = torch.randn((M, 512), device="cuda", dtype=torch.bfloat16)
+    B = torch.randn((N, 512), device="cuda", dtype=torch.bfloat16)
+    Y = torch.full((M, N), float("nan"), device="cuda", dtype=torch.bfloat16)
+    opus_gemm(A, B, Y, family="a16w16", kid=5)
+    torch.cuda.synchronize()
+    assert not torch.isnan(Y).any(), "C tiles left unwritten"
+    _assert_matches_golden(Y, A, B)
+
+
+def test_gfx950_legacy_kid_rejects_2g_element_operand():
+    """Legacy kids form offsets in 32-bit int and must refuse a 2^31-element C;
+    the 4g_safe twin of kid 5 (kid 120) takes the same shape."""
+    if _runtime_arch() != "gfx950":
+        pytest.skip("requires gfx950 hardware")
+    M, N, K = 16384, 131072, 128
+    free, _ = torch.cuda.mem_get_info()
+    if free < 6 << 30:
+        pytest.skip("needs 6 GiB of free GPU memory")
+    torch.manual_seed(0x2031)
+    A = torch.randn((M, K), device="cuda", dtype=torch.bfloat16)
+    B = torch.randn((N, K), device="cuda", dtype=torch.bfloat16)
+    Y = torch.empty((M, N), device="cuda", dtype=torch.bfloat16)
+    with pytest.raises(RuntimeError, match=r"fewer than 2\^31 elements"):
+        opus_gemm(A, B, Y, family="a16w16", kid=5)
+    opus_gemm(A, B, Y, family="a16w16", kid=120)
+    torch.cuda.synchronize()
+    _assert_matches_golden(Y[-256:], A[-256:], B)
+
+
 def test_gfx950_bias_dtype_rules_and_numerics():
     if _runtime_arch() != "gfx950":
         pytest.skip("requires gfx950 hardware")

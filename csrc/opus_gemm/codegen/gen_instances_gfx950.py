@@ -1011,6 +1011,24 @@ def gen_noscale_instance_gfx950(
         "latent K-tail accumulation bug; pass an even K)");
     AITER_CHECK(M >= 1 && N >= 1, "M and N must be >= 1");
 """
+        if not k.is_4g_safe:
+            k_check += """
+    // The legacy pipeline forms batch/row offsets and buffer sizes in 32-bit
+    // int; past 2^31 elements loads wrap and C stores land outside Y.
+    // The 4g_safe kids (same tiles) take 64-bit offsets.
+    {
+        const int64_t a_span = (int64_t)(batch - 1) * XQ.stride(0)
+            + (int64_t)M * XQ.stride(1);
+        const int64_t b_span = (int64_t)(batch - 1) * WQ.stride(0)
+            + (int64_t)N * WQ.stride(1);
+        const int64_t c_span = (int64_t)batch * M * N;
+        AITER_CHECK(a_span < (int64_t{1} << 31) && b_span < (int64_t{1} << 31)
+                && c_span < (int64_t{1} << 31),
+            "legacy a16w16 kid needs fewer than 2^31 elements per operand "
+            "(A=", a_span, " B=", b_span, " C=", c_span,
+            "); use a 4g_safe kid");
+    }
+"""
     else:
         shape_preamble = """
     AITER_CHECK(XQ.dim() == 3 && WQ.dim() == 3 && Y.dim() == 3,
