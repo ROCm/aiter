@@ -923,11 +923,10 @@ def compile_flydsl_moe_stage2(
             use_async_copy=use_async_copy,
             use_global_a=use_global_a,
             cu_num_mul=cu_num_mul,
-            # API parity (reviewer #3): forward `b_nt` and `xcd_swizzle`
-            # from the kernel-name parser. They are accepted as ignored
-            # kwargs on the fp4xfp4 path so callers parsing the
-            # `_bnt{N}` / `_xcd{N}` registry suffixes don't need
-            # per-dtype special cases.
+            # Forward `b_nt` and `xcd_swizzle` from the kernel-name parser
+            # so callers parsing the `_bnt{N}` / `_xcd{N}` registry suffixes
+            # don't need per-dtype special cases. This builder ignores
+            # `b_nt`; `xcd_swizzle` selects the XCD workgroup remap.
             b_nt=b_nt,
             xcd_swizzle=xcd_swizzle,
             model_dim_pad=model_dim_pad,
