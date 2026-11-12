@@ -136,8 +136,8 @@ def test_backward(case):
     o, s = chunk_kimi_delta_attn(
         **leaves, cu_seqlens=cu, output_final_state=True, **opts
     )
-    do = torch.randn(o.shape, device="cuda", generator=gen)
-    ds = torch.randn(s.shape, device="cuda", generator=gen) * 0.1
+    do = torch.randn(o.shape, device="cuda", dtype=torch.float32, generator=gen)
+    ds = torch.randn(s.shape, device="cuda", dtype=torch.float32, generator=gen) * 0.1
     ((o.float() * do).sum() + (s.float() * ds).sum()).backward()
 
     ref = {n: t.detach().float().requires_grad_(True) for n, t in x.items()}

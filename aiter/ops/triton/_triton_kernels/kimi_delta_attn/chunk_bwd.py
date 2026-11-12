@@ -44,42 +44,34 @@ import torch
 import triton
 import triton.language as tl
 
-from aiter.ops.triton._triton_kernels.gated_delta_net.utils import chunk_local_cumsum
+from aiter.ops.triton._triton_kernels.common.l2norm import l2norm_bwd_rows
+from aiter.ops.triton._triton_kernels.common.pid_preprocessing import remap_xcd
 from aiter.ops.triton._triton_kernels.gated_delta_net.utils.index import (
     prepare_chunk_offsets,
 )
 from aiter.ops.triton._triton_kernels.kimi_delta_attn.chunk_delta_attn_utils import (
-    RCP_LN2,
     chunk_delta_attn_tuned_config,
     exp,
     exp2,
     softplus,
 )
+from aiter.ops.triton._triton_kernels.kimi_delta_attn.chunk_fwd import (
+    chunk_delta_attn_fwd_prepare,
+)
 from aiter.ops.triton._triton_kernels.kimi_delta_attn.fast_launch import fast_launch
-from aiter.ops.triton._triton_kernels.kimi_delta_attn.gate import beta_sigmoid_fwd
-from aiter.ops.triton._triton_kernels.kimi_delta_attn.intra_attn import (
-    chunk_delta_attn_fwd_intra,
-)
-from aiter.ops.triton._triton_kernels.kimi_delta_attn.utils.cumsum import (
-    chunk_gate_cumsum,
-)
 from aiter.ops.triton._triton_kernels.kimi_delta_attn.utils.index import (
     prepare_chunk_indices,
 )
-from aiter.ops.triton._triton_kernels.kimi_delta_attn.utils.l2norm import l2norm_fwd
 from aiter.ops.triton.utils._triton import arch_info
-from aiter.ops.triton._triton_kernels.common.pid_preprocessing import remap_xcd
+from aiter.ops.triton.utils._triton.kernel_repr import make_kernel_repr
+
+_dav_repr = make_kernel_repr(
+    "chunk_delta_attn_bwd_kernel_dav",
+    ["V", "BT", "BV", "IS_VARLEN", "COMPUTE_DA", "COMPUTE_DV"],
+)
 
 
-@triton.jit
-def _l2norm_bwd_rows(x, dy, eps):
-    """``dx`` for ``y = x / sqrt(sum(x^2) + eps)`` per row of fp32 ``[rows, D]`` tiles."""
-    rstd = tl.rsqrt(tl.sum(x * x, axis=1) + eps)[:, None]
-    y = x * rstd
-    return dy * rstd - tl.sum(dy * y, axis=1)[:, None] * y * rstd
-
-
-@triton.jit
+@triton.jit(repr=_dav_repr)
 def chunk_delta_attn_bwd_kernel_dav(
     v,
     A,
@@ -419,7 +411,23 @@ def _bwd_dhu_body(
             tl.store(p_dh0, b_dh4.to(p_dh0.dtype.element_ty), mask=m_h4)
 
 
-@triton.jit
+_dhu_repr = make_kernel_repr(
+    "chunk_delta_attn_bwd_kernel_dhu",
+    [
+        "K",
+        "V",
+        "BT",
+        "BV",
+        "USE_INITIAL_STATE",
+        "USE_FINAL_STATE_GRADIENT",
+        "IS_VARLEN",
+        "TRANSPOSE_STATE",
+        "NUM_XCDS",
+    ],
+)
+
+
+@triton.jit(repr=_dhu_repr)
 def chunk_delta_attn_bwd_kernel_dhu(
     qg,
     g,
@@ -515,14 +523,12 @@ def _fwd_h_body(
     """Body of ``chunk_delta_attn_bwd_kernel_fwd_h`` for program ``(i_v, i_nh)``."""
     i_n, i_h = i_nh // H, i_nh % H
     if IS_VARLEN:
-        bos, eos = tl.load(cu_seqlens + i_n).to(tl.int32), tl.load(
-            cu_seqlens + i_n + 1
-        ).to(tl.int32)
-        T = eos - bos
+        bos = tl.load(cu_seqlens + i_n).to(tl.int64)
+        T = (tl.load(cu_seqlens + i_n + 1).to(tl.int64) - bos).to(tl.int32)
         NT = tl.cdiv(T, BT)
         boh = tl.load(chunk_offsets + i_n).to(tl.int32)
     else:
-        bos, eos = i_n * T, i_n * T + T
+        bos = i_n.to(tl.int64) * T
         NT = tl.cdiv(T, BT)
         boh = i_n * NT
 
@@ -590,9 +596,16 @@ def _fwd_h_body(
                 p_h0_4 = h0 + o_k4[:, None] * V + o_v[None, :]
             b_h4 += tl.load(p_h0_4, mask=m_h4, other=0.0).to(tl.float32)
 
+    o_c = tl.arange(0, BT)
     for i_t in range(NT):
-        o_t = i_t * BT + tl.arange(0, BT)
-        m_t = o_t < T
+        # Token offsets scaled by H*K pass int32 at 2**31 / (H*K) tokens, so the
+        # chunk start goes into the int64 pointers and o_c stays chunk-local.
+        t0 = i_t.to(tl.int64) * BT
+        k_t = k + t0 * stride_k
+        w_t = w + t0 * stride_k
+        v_t = v + t0 * stride_v
+        v_new_t = v_new + t0 * stride_v
+        m_t = i_t * BT + o_c < T
         m_tk1 = m_t[:, None] & m_k1[None, :]
         m_tv = m_t[:, None] & m_v[None, :]
 
@@ -607,22 +620,22 @@ def _fwd_h_body(
         if K > 192:
             b_hs4 = b_h4.to(h.dtype.element_ty)
 
-        p_w = w + o_t[:, None] * stride_k + o_k1[None, :]
+        p_w = w_t + o_c[:, None] * stride_k + o_k1[None, :]
         b_w = tl.load(p_w, mask=m_tk1, other=0.0)
         b_v = tl.dot(b_w, b_h1.to(b_w.dtype))
         if K > 64:
-            p_w = w + o_t[:, None] * stride_k + o_k2[None, :]
+            p_w = w_t + o_c[:, None] * stride_k + o_k2[None, :]
             b_w = tl.load(p_w, mask=m_t[:, None] & m_k2[None, :], other=0.0)
             b_v = tl.dot(b_w, b_h2.to(b_w.dtype), acc=b_v)
         if K > 128:
-            p_w = w + o_t[:, None] * stride_k + o_k3[None, :]
+            p_w = w_t + o_c[:, None] * stride_k + o_k3[None, :]
             b_w = tl.load(p_w, mask=m_t[:, None] & m_k3[None, :], other=0.0)
             b_v = tl.dot(b_w, b_h3.to(b_w.dtype), acc=b_v)
         if K > 192:
-            p_w = w + o_t[:, None] * stride_k + o_k4[None, :]
+            p_w = w_t + o_c[:, None] * stride_k + o_k4[None, :]
             b_w = tl.load(p_w, mask=m_t[:, None] & m_k4[None, :], other=0.0)
             b_v = tl.dot(b_w, b_h4.to(b_w.dtype), acc=b_v)
-        p_v = v + o_t[:, None] * stride_v + o_v[None, :]
+        p_v = v_t + o_c[:, None] * stride_v + o_v[None, :]
         b_v = tl.load(p_v, mask=m_tv, other=0.0) - b_v
 
         b_vs = b_v.to(v_new.dtype.element_ty)
@@ -657,19 +670,19 @@ def _fwd_h_body(
             b_h4 *= tl.math.exp2(b_gk_last4)[:, None]
         b_v = b_v.to(k.dtype.element_ty)
 
-        p_k = k + o_k1[:, None] + o_t[None, :] * stride_k
+        p_k = k_t + o_k1[:, None] + o_c[None, :] * stride_k
         b_k = tl.load(p_k, mask=m_k1[:, None] & m_t[None, :], other=0.0)
         b_h1 = tl.dot(b_k, b_v, acc=b_h1)
         if K > 64:
-            p_k = k + o_k2[:, None] + o_t[None, :] * stride_k
+            p_k = k_t + o_k2[:, None] + o_c[None, :] * stride_k
             b_k = tl.load(p_k, mask=m_k2[:, None] & m_t[None, :], other=0.0)
             b_h2 = tl.dot(b_k, b_v, acc=b_h2)
         if K > 128:
-            p_k = k + o_k3[:, None] + o_t[None, :] * stride_k
+            p_k = k_t + o_k3[:, None] + o_c[None, :] * stride_k
             b_k = tl.load(p_k, mask=m_k3[:, None] & m_t[None, :], other=0.0)
             b_h3 = tl.dot(b_k, b_v, acc=b_h3)
         if K > 192:
-            p_k = k + o_k4[:, None] + o_t[None, :] * stride_k
+            p_k = k_t + o_k4[:, None] + o_c[None, :] * stride_k
             b_k = tl.load(p_k, mask=m_k4[:, None] & m_t[None, :], other=0.0)
             b_h4 = tl.dot(b_k, b_v, acc=b_h4)
 
@@ -681,7 +694,7 @@ def _fwd_h_body(
             tl.store(h_t + o_k3[:, None] * V + o_v[None, :], b_hs3, mask=m_h3)
         if K > 192:
             tl.store(h_t + o_k4[:, None] * V + o_v[None, :], b_hs4, mask=m_h4)
-        tl.store(v_new + o_t[:, None] * stride_v + o_v[None, :], b_vs, mask=m_tv)
+        tl.store(v_new_t + o_c[:, None] * stride_v + o_v[None, :], b_vs, mask=m_tv)
 
     if STORE_FINAL_STATE:
         if TRANSPOSE_STATE:
@@ -709,7 +722,22 @@ def _fwd_h_body(
             tl.store(p_ht, b_h4.to(p_ht.dtype.element_ty), mask=m_h4)
 
 
-@triton.jit
+_fwd_h_repr = make_kernel_repr(
+    "chunk_delta_attn_bwd_kernel_fwd_h",
+    [
+        "K",
+        "V",
+        "BT",
+        "BV",
+        "USE_INITIAL_STATE",
+        "STORE_FINAL_STATE",
+        "IS_VARLEN",
+        "TRANSPOSE_STATE",
+    ],
+)
+
+
+@triton.jit(repr=_fwd_h_repr)
 def chunk_delta_attn_bwd_kernel_fwd_h(
     k,
     v,
@@ -766,7 +794,23 @@ def chunk_delta_attn_bwd_kernel_fwd_h(
 # ---------------------------------------------------------------------------
 # Default pipeline: output
 # ---------------------------------------------------------------------------
-@triton.jit
+_fwd_h_dhu_repr = make_kernel_repr(
+    "chunk_delta_attn_bwd_kernel_fwd_h_dhu",
+    [
+        "K",
+        "V",
+        "BT",
+        "BV",
+        "USE_INITIAL_STATE",
+        "USE_FINAL_STATE_GRADIENT",
+        "IS_VARLEN",
+        "TRANSPOSE_STATE",
+        "NUM_XCDS",
+    ],
+)
+
+
+@triton.jit(repr=_fwd_h_dhu_repr)
 def chunk_delta_attn_bwd_kernel_fwd_h_dhu(
     qg,
     g,
@@ -868,7 +912,13 @@ def chunk_delta_attn_bwd_kernel_fwd_h_dhu(
         )
 
 
-@triton.jit
+_wy_dqkg_repr = make_kernel_repr(
+    "chunk_delta_attn_bwd_kernel_wy_dqkg",
+    ["K", "V", "BT", "BK", "BV", "IS_VARLEN"],
+)
+
+
+@triton.jit(repr=_wy_dqkg_repr)
 def chunk_delta_attn_bwd_kernel_wy_dqkg(
     q,
     k,
@@ -1055,7 +1105,25 @@ def chunk_delta_attn_bwd_kernel_wy_dqkg(
     tl.store(p_db, b_db.to(p_db.dtype.element_ty), mask=m_t)
 
 
-@triton.jit
+_intra_repr = make_kernel_repr(
+    "chunk_delta_attn_bwd_kernel_intra",
+    [
+        "K",
+        "BT",
+        "BC",
+        "BK",
+        "NC",
+        "IS_VARLEN",
+        "SAFE_GATE",
+        "NUM_XCDS",
+        "L2NORM_QK",
+        "FINISH_DB",
+        "BETA_SIGMOID",
+    ],
+)
+
+
+@triton.jit(repr=_intra_repr)
 def chunk_delta_attn_bwd_kernel_intra(
     q,
     k,
@@ -1258,7 +1326,7 @@ def chunk_delta_attn_bwd_kernel_intra(
     if L2NORM_QK:
         p_qr = q_raw + o_c[:, None] * (H * K) + o_k[None, :]
         b_qr = tl.load(p_qr, mask=m_ck, other=0.0).to(tl.float32)
-        b_dq2 = _l2norm_bwd_rows(b_qr, b_dq2, eps)
+        b_dq2 = l2norm_bwd_rows(b_qr, b_dq2, eps)
     tl.store(p_dq2, b_dq2.to(p_dq2.dtype.element_ty), mask=m_ck)
     if FINISH_DB:
         b_db += tl.load(db + o_c * HV, mask=m_c, other=0.0)
@@ -1360,13 +1428,19 @@ def chunk_delta_attn_bwd_kernel_intra(
     if L2NORM_QK:
         p_kr = k_raw + o_c[:, None] * (H * K) + o_k[None, :]
         b_kr = tl.load(p_kr, mask=m_ck, other=0.0).to(tl.float32)
-        b_dk2 = _l2norm_bwd_rows(b_kr, b_dk2, eps)
+        b_dk2 = l2norm_bwd_rows(b_kr, b_dk2, eps)
 
     tl.store(p_dk2, b_dk2.to(p_dk2.dtype.element_ty), mask=m_ck)
     tl.store(p_dg2, b_dg2.to(p_dg2.dtype.element_ty), mask=m_ck)
 
 
-@triton.jit
+_gate_cumsum_repr = make_kernel_repr(
+    "chunk_delta_attn_bwd_kernel_gate_cumsum",
+    ["S", "BT", "BS", "IS_VARLEN", "USE_GATE", "HAS_BIAS", "USE_LOWER_BOUND"],
+)
+
+
+@triton.jit(repr=_gate_cumsum_repr)
 def chunk_delta_attn_bwd_kernel_gate_cumsum(
     s,
     g,
@@ -1457,7 +1531,13 @@ def chunk_delta_attn_bwd_kernel_gate_cumsum(
     tl.store(o + offs, b_o.to(o.dtype.element_ty), mask=m_s)
 
 
-@triton.jit
+_l2norm_repr = make_kernel_repr(
+    "chunk_delta_attn_bwd_kernel_l2norm",
+    ["D", "BD", "BT"],
+)
+
+
+@triton.jit(repr=_l2norm_repr)
 def chunk_delta_attn_bwd_kernel_l2norm(
     X,
     DY,
@@ -1475,11 +1555,17 @@ def chunk_delta_attn_bwd_kernel_l2norm(
     mask = (row_idx < T) & (col_idx < D)
     x = tl.load(X + col_idx + D * row_idx, mask=mask, other=0.0).to(tl.float32)
     dy = tl.load(DY + col_idx + D * row_idx, mask=mask, other=0.0).to(tl.float32)
-    dx = _l2norm_bwd_rows(x, dy, eps)
+    dx = l2norm_bwd_rows(x, dy, eps)
     tl.store(DX + col_idx + D * row_idx, dx.to(DX.dtype.element_ty), mask=mask)
 
 
-@triton.jit
+_beta_sigmoid_repr = make_kernel_repr(
+    "chunk_delta_attn_bwd_kernel_beta_sigmoid",
+    ["BLOCK_SIZE"],
+)
+
+
+@triton.jit(repr=_beta_sigmoid_repr)
 def chunk_delta_attn_bwd_kernel_beta_sigmoid(
     x,
     dy,
@@ -1628,45 +1714,25 @@ def _recompute_fwd(
     N = cu_seqlens.numel() - 1 if is_varlen else B
     NT = triton.cdiv(T, BT) if not is_varlen else len(chunk_indices)
 
-    if use_qk_l2norm_in_kernel:
-        q, _ = l2norm_fwd(q)
-        k, _ = l2norm_fwd(k)
-    if use_beta_sigmoid_in_kernel:
-        beta = beta_sigmoid_fwd(beta)
-
-    if use_gate_in_kernel:
-        g_cumsum = chunk_gate_cumsum(
-            g=g,
-            A_log=A_log,
-            chunk_size=BT,
-            scale=RCP_LN2,
-            dt_bias=dt_bias,
-            cu_seqlens=cu_seqlens,
-            chunk_indices=chunk_indices,
-            lower_bound=lower_bound,
-        )
-    else:
-        g_cumsum = chunk_local_cumsum(
-            g=g,
-            chunk_size=BT,
-            scale=RCP_LN2,
-            cu_seqlens=cu_seqlens,
-            chunk_indices=chunk_indices,
-        )
-
     # disable_recompute=True also returns qg = q * exp2(g_cumsum), which dhu
     # reads instead of gating q on its serial chunk chain.
-    w, u, qg, kg, Aqk, Akk = chunk_delta_attn_fwd_intra(
+    q, k, beta, g_cumsum, w, u, qg, kg, Aqk, Akk = chunk_delta_attn_fwd_prepare(
         q=q,
         k=k,
         v=v,
-        gk=g_cumsum,
+        g=g,
         beta=beta,
         scale=scale,
         cu_seqlens=cu_seqlens,
-        chunk_size=BT,
         chunk_indices=chunk_indices,
+        chunk_size=BT,
         safe_gate=safe_gate,
+        lower_bound=lower_bound,
+        use_gate_in_kernel=use_gate_in_kernel,
+        A_log=A_log,
+        dt_bias=dt_bias,
+        use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
+        use_beta_sigmoid_in_kernel=use_beta_sigmoid_in_kernel,
         disable_recompute=True,
     )
 
