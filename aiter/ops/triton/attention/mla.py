@@ -41,6 +41,11 @@ from aiter.ops.triton.utils.config_utils import (
     resolve_config_dir,
     select_leq_config,
 )
+from aiter.ops.triton.utils.fp4_kv import (
+    fp4_kv_row_bytes,
+    fp4_kv_scale_block,
+    fp4_kv_scale_k_width,
+)
 from aiter.ops.triton.utils.types import e4m3_dtype
 
 DEVICE_ARCH = arch_info.get_arch()
@@ -350,7 +355,13 @@ def mla_decode_fwd(
     out_scale=None,
     shuffled_kv_cache: bool = False,
     skip_reduce: bool = False,
+    fp4_kv_format: str = "nvfp4",
 ):
+    """``fp4_kv_format`` names the layout of a packed FP4 (uint8) ``kv_buffer``:
+    "nvfp4", "mxfp4", "mxfp4_b16" or "mxfp4_fp8rope" (see
+    aiter.ops.triton.utils.fp4_kv).
+    An MXFP4 cache takes an FP8 query; "mxfp4_fp8rope" is read by the LDS
+    pipeline only (single-token decode over 128 heads per KV head)."""
     assert causal, "Only causal attention is supported"
     q_dtype = q.dtype
     kv_buffer_dtype = kv_buffer.dtype
@@ -370,7 +381,12 @@ def mla_decode_fwd(
     if kv_buffer_dtype == torch.uint8:
         # A8W4 A4W4
         assert IS_DEVICE_ARCH_GFX12, "FP4 KV cache is only supported on GFX12"
-        KV_CACHE_DTYPE = "nvfp4"
+        KV_CACHE_DTYPE = fp4_kv_format
+        BLOCK_SCALES_SIZE = fp4_kv_scale_block(fp4_kv_format)
+        assert fp4_kv_format == "nvfp4" or QUERY_DTYPE == "fp8", (
+            f"{fp4_kv_format} KV cache supports an FP8 query only, got "
+            f"{QUERY_DTYPE}"
+        )
     elif kv_buffer_dtype == e4m3_dtype:
         KV_CACHE_DTYPE = "fp8"
     else:
@@ -382,19 +398,18 @@ def mla_decode_fwd(
         SCALE_K_WIDTH_LORA = 4
         SCALE_K_WIDTH_ROPE = 4
         if kv_buffer_dtype == torch.uint8:
-            num_blocks, num_kv_heads, block_size, _ = kv_buffer.shape
+            num_blocks, num_kv_heads, block_size, d_cache = kv_buffer.shape
             K_WIDTH = 16
-            SCALE_K_LORA = kv_lora_rank // 16
-            SCALE_K_ROPE = qk_rope_head_dim // 16
-            SCALE_K_WIDTH_LORA = (
-                min(16, triton.next_power_of_2(SCALE_K_LORA))
-                if SCALE_K_LORA >= 4
-                else SCALE_K_LORA
+            expected_d_cache = fp4_kv_row_bytes(
+                kv_lora_rank, qk_rope_head_dim, fp4_kv_format
             )
-            SCALE_K_WIDTH_ROPE = (
-                min(16, triton.next_power_of_2(SCALE_K_ROPE))
-                if SCALE_K_ROPE >= 4
-                else SCALE_K_ROPE
+            assert d_cache == expected_d_cache, (
+                f"{fp4_kv_format} kv_buffer rows must be {expected_d_cache} "
+                f"bytes, got {d_cache}"
+            )
+            SCALE_K_WIDTH_LORA = fp4_kv_scale_k_width(kv_lora_rank // BLOCK_SCALES_SIZE)
+            SCALE_K_WIDTH_ROPE = fp4_kv_scale_k_width(
+                qk_rope_head_dim // BLOCK_SCALES_SIZE
             )
         else:
             num_blocks, num_kv_heads, block_size, _ = kv_buffer.shape
@@ -411,37 +426,59 @@ def mla_decode_fwd(
         kv_lora_rank + qk_rope_head_dim == qk_head_dim
     ), "qk_head_dim must be equal to kv_lora_rank + qk_rope_head_dim"
 
-    MAX_BLOCK_M = 128 if kv_buffer_dtype == e4m3_dtype else 64
-    if num_queries_per_kv <= 16:
-        BLOCK_M = 16
-    else:
-        BLOCK_M = min(triton.next_power_of_2(num_queries_per_kv), MAX_BLOCK_M)
-    BLOCK_Q = BLOCK_M // num_queries_per_kv
-    assert BLOCK_Q >= 1 or (num_queries_per_kv > BLOCK_M)
-    BLOCK_Q = max(BLOCK_Q, 1)
-    NUM_HEAD_BLOCKS = (num_queries_per_kv + BLOCK_M - 1) // BLOCK_M
     cu_count = get_num_sms()
     target_num_prgms = cu_count * 4
     ALL_DECODE = num_tokens_per_seq == 1
-    if ALL_DECODE:
-        total_num_q_blocks = num_seqs * NUM_HEAD_BLOCKS
-    else:
-        total_num_q_blocks = (
-            ((num_tokens_per_seq + BLOCK_Q - 1) // BLOCK_Q) * num_seqs * NUM_HEAD_BLOCKS
-        )
-    num_2d_prgms = total_num_q_blocks * num_kv_heads
-    # if batch contains a prefill
 
-    attn_config, reduce_config = select_3d_config(
-        block_size,
-        max_seqlen_kv,
-        target_num_prgms,
-        num_2d_prgms,
-        q_dtype,
-        kv_buffer_dtype,
-        shuffled_kv_cache,
+    def plan_q_blocks(max_block_m):
+        if num_queries_per_kv <= 16:
+            BLOCK_M = 16
+        else:
+            BLOCK_M = min(triton.next_power_of_2(num_queries_per_kv), max_block_m)
+        BLOCK_Q = BLOCK_M // num_queries_per_kv
+        assert BLOCK_Q >= 1 or (num_queries_per_kv > BLOCK_M)
+        BLOCK_Q = max(BLOCK_Q, 1)
+        NUM_HEAD_BLOCKS = (num_queries_per_kv + BLOCK_M - 1) // BLOCK_M
+        if ALL_DECODE:
+            total_num_q_blocks = num_seqs * NUM_HEAD_BLOCKS
+        else:
+            total_num_q_blocks = (
+                ((num_tokens_per_seq + BLOCK_Q - 1) // BLOCK_Q)
+                * num_seqs
+                * NUM_HEAD_BLOCKS
+            )
+        num_2d_prgms = total_num_q_blocks * num_kv_heads
+        attn_config, reduce_config = select_3d_config(
+            block_size,
+            max_seqlen_kv,
+            target_num_prgms,
+            num_2d_prgms,
+            q_dtype,
+            kv_buffer_dtype,
+            shuffled_kv_cache,
+            BLOCK_M,
+        )
+        return (
+            BLOCK_M,
+            BLOCK_Q,
+            NUM_HEAD_BLOCKS,
+            total_num_q_blocks,
+            attn_config,
+            reduce_config,
+        )
+
+    # An MXFP4 cache tries the LDS pipeline's 128-row blocks first; the FP4
+    # kernel outside it holds 64 rows.
+    MXFP4_KV = KV_CACHE_DTYPE in ("mxfp4", "mxfp4_b16", "mxfp4_fp8rope")
+    MAX_BLOCK_M = 128 if kv_buffer_dtype == e4m3_dtype or MXFP4_KV else 64
+    (
         BLOCK_M,
-    )
+        BLOCK_Q,
+        NUM_HEAD_BLOCKS,
+        total_num_q_blocks,
+        attn_config,
+        reduce_config,
+    ) = plan_q_blocks(MAX_BLOCK_M)
 
     selected_num_segments = attn_config["NUM_SEGMENTS_PER_SEQ"]
     use_lds_pipeline = (
@@ -450,14 +487,18 @@ def mla_decode_fwd(
         and total_num_tokens == num_seqs
         and shuffled_kv_cache
         and QUERY_DTYPE == "fp8"
-        and KV_CACHE_DTYPE == "fp8"
+        and (
+            (KV_CACHE_DTYPE == "fp8" and block_size == 64)
+            or (MXFP4_KV and block_size == 128)
+        )
         and kv_lora_rank == 512
         and qk_rope_head_dim == 64
-        and block_size == 64
         and num_query_heads == 128 * num_kv_heads
         and NUM_HEAD_BLOCKS == 1
         and (
-            selected_num_segments == 1
+            # The MXFP4 pipeline splits sequences into segments as selected.
+            MXFP4_KV
+            or selected_num_segments == 1
             # Zero means unknown, not a short context. Preserve partial-output
             # semantics when skip_reduce requests multiple segments.
             or (not skip_reduce and 0 < max_seqlen_kv <= 3 * block_size)
@@ -473,6 +514,23 @@ def mla_decode_fwd(
         and _fits_int32_offsets(out)
         and _fits_int32_offsets(block_tables)
     )
+    if MXFP4_KV and not use_lds_pipeline:
+        if KV_CACHE_DTYPE == "mxfp4_fp8rope":
+            raise NotImplementedError(
+                "an mxfp4_fp8rope KV cache is read by the gfx1250 LDS pipeline "
+                "only: one query token per sequence, 128 query heads per KV "
+                "head, FP8 query, block size 128"
+            )
+        if BLOCK_M > 64:
+            (
+                BLOCK_M,
+                BLOCK_Q,
+                NUM_HEAD_BLOCKS,
+                total_num_q_blocks,
+                attn_config,
+                reduce_config,
+            ) = plan_q_blocks(64)
+            selected_num_segments = attn_config["NUM_SEGMENTS_PER_SEQ"]
     # The pipelined kernel reads unshuffled pages as tiles of one flat token
     # table. Multi-token decode stays on the non-pipelined kernel: the pipelined
     # epilogue always processes a tile, even in a segment past a query's prefix.
@@ -560,7 +618,7 @@ def mla_decode_fwd(
             <= 256 * 1024
         ), f"tuned config {tuned} exceeds the pipelined kernel's LDS budget"
         selected_num_segments = attn_config["NUM_SEGMENTS_PER_SEQ"]
-    NUM_SEGMENTS = 1 if use_lds_pipeline else selected_num_segments
+    NUM_SEGMENTS = 1 if use_lds_pipeline and not MXFP4_KV else selected_num_segments
     if NUM_SEGMENTS > 1:
         segm_output = torch.empty(
             total_num_tokens,
@@ -591,7 +649,7 @@ def mla_decode_fwd(
 
     if use_lds_pipeline:
         attn_config.update(
-            NUM_SEGMENTS_PER_SEQ=1,
+            NUM_SEGMENTS_PER_SEQ=NUM_SEGMENTS,
             num_warps=4,
             num_stages=4,
             waves_per_eu=1,

@@ -20,15 +20,15 @@ a gather (64 positions mapped onto 32 cached freqs), which the contiguous TDM
 tile load cannot express.
 
 The RoPE rotation (``_get_neox_rotated_x_1D`` / ``_get_gptj_rotated_x_1D``) and the
-NVFP4 quantizer (``_nvfp4_quant_op``) are reused from the Triton ``@triton.jit``
-helpers.
+FP4 quantizer (``_fp4_kv_quant_op``, NVFP4 or MXFP4) are reused from the Triton
+``@triton.jit`` helpers.
 """
 
 import triton.language as tl
 from triton.experimental import gluon
 from triton.experimental.gluon import language as gl
 
-from aiter.ops.triton._triton_kernels.quant.quant import _nvfp4_quant_op
+from aiter.ops.triton._triton_kernels.kv_cache import _fp4_kv_quant_op
 from aiter.ops.triton._triton_kernels.rope.rope import (
     _get_gptj_rotated_x_1D,
     _get_neox_rotated_x_1D,
@@ -128,6 +128,7 @@ def _store_mla_kv_cache(
     SCALE_K_WIDTH_ROPE: gl.constexpr,
     L_NOPE: gl.constexpr,
     L_PE: gl.constexpr,
+    FP4_KV_FORMAT: gl.constexpr = "nvfp4",
 ):
     if SHUFFLED_KV_CACHE:
         if kv_cache_ptr.dtype.element_ty == gl.bfloat16:
@@ -137,16 +138,23 @@ def _store_mla_kv_cache(
             # FP8 E4M3 or packed FP4 E2M1
             K_WIDTH: gl.constexpr = 16
 
+        if FP4_KV_FORMAT == "mxfp4" or FP4_KV_FORMAT == "mxfp4_fp8rope":
+            FP4_QUANT_BLOCK_SIZE: gl.constexpr = 32
+        else:
+            FP4_QUANT_BLOCK_SIZE: gl.constexpr = 16
+        ROPE_FP8: gl.constexpr = FP4_KV_FORMAT == "mxfp4_fp8rope"
+
         if kv_cache_ptr.dtype.element_ty == gl.uint8:
-            NVFP4_QUANT_BLOCK_SIZE: gl.constexpr = 16
-            k_nope, k_nope_scales = _nvfp4_quant_op(
-                k_nope, BLOCK_D_nope, 1, NVFP4_QUANT_BLOCK_SIZE
-            )
-            k_pe, k_pe_scales = _nvfp4_quant_op(
-                k_pe, BLOCK_D_pe, 1, NVFP4_QUANT_BLOCK_SIZE
+            k_nope, k_nope_scales = _fp4_kv_quant_op(
+                k_nope, BLOCK_D_nope, FP4_KV_FORMAT
             )
             BLOCK_D_nope_STORE: gl.constexpr = BLOCK_D_nope // 2
-            BLOCK_D_pe_STORE: gl.constexpr = BLOCK_D_pe // 2
+            if ROPE_FP8:
+                k_pe = k_pe.to(gl.float8e4nv).to(gl.uint8, bitcast=True)
+                BLOCK_D_pe_STORE: gl.constexpr = BLOCK_D_pe
+            else:
+                k_pe, k_pe_scales = _fp4_kv_quant_op(k_pe, BLOCK_D_pe, FP4_KV_FORMAT)
+                BLOCK_D_pe_STORE: gl.constexpr = BLOCK_D_pe // 2
         else:
             BLOCK_D_nope_STORE: gl.constexpr = BLOCK_D_nope
             BLOCK_D_pe_STORE: gl.constexpr = BLOCK_D_pe
@@ -176,7 +184,7 @@ def _store_mla_kv_cache(
         ) * kv_cache_stride_d
 
         if kv_cache_ptr.dtype.element_ty == gl.uint8:
-            nope_scale_offset: gl.constexpr = BLOCK_D_nope // NVFP4_QUANT_BLOCK_SIZE
+            nope_scale_offset: gl.constexpr = BLOCK_D_nope // FP4_QUANT_BLOCK_SIZE
         else:
             nope_scale_offset: gl.constexpr = 0
         kv_cache_pe_offs = (
@@ -199,26 +207,15 @@ def _store_mla_kv_cache(
         )
 
         if kv_cache_ptr.dtype.element_ty == gl.uint8:
-            BLOCK_D_nope_scales: gl.constexpr = BLOCK_D_nope // NVFP4_QUANT_BLOCK_SIZE
-            BLOCK_D_pe_scales: gl.constexpr = BLOCK_D_pe // NVFP4_QUANT_BLOCK_SIZE
+            BLOCK_D_nope_scales: gl.constexpr = BLOCK_D_nope // FP4_QUANT_BLOCK_SIZE
             R_ns: gl.constexpr = BLOCK_D_nope_scales // SCALE_K_WIDTH_NOPE
-            R_ps: gl.constexpr = BLOCK_D_pe_scales // SCALE_K_WIDTH_ROPE
             PARENT_NS: gl.constexpr = _store_blocked_layout(R_ns, SCALE_K_WIDTH_NOPE)
-            PARENT_PS: gl.constexpr = _store_blocked_layout(R_ps, SCALE_K_WIDTH_ROPE)
-
             d_nope_scales_shfl = gl.arange(0, R_ns, layout=gl.SliceLayout(1, PARENT_NS))
-            d_pe_scales_shfl = gl.arange(0, R_ps, layout=gl.SliceLayout(1, PARENT_PS))
             k_nope_width_shfl = gl.arange(
                 0, SCALE_K_WIDTH_NOPE, layout=gl.SliceLayout(0, PARENT_NS)
             )
-            k_pe_width_shfl = gl.arange(
-                0, SCALE_K_WIDTH_ROPE, layout=gl.SliceLayout(0, PARENT_PS)
-            )
             k_nope_scales = gl.convert_layout(
                 gl.reshape(k_nope_scales, [R_ns, SCALE_K_WIDTH_NOPE]), PARENT_NS
-            )
-            k_pe_scales = gl.convert_layout(
-                gl.reshape(k_pe_scales, [R_ps, SCALE_K_WIDTH_ROPE]), PARENT_PS
             )
             pid_sub_blk = pid_blk % 128
             kv_cache_nope_scales_offs = (
@@ -229,30 +226,40 @@ def _store_mla_kv_cache(
                 + (pid_sub_blk // 32) * SCALE_K_WIDTH_NOPE
                 + k_nope_width_shfl[None, :]
             ) * kv_cache_stride_d
-            kv_cache_pe_scales_offs = (
-                BLOCK_SIZE
-                * (BLOCK_D_nope_STORE + BLOCK_D_nope_scales + BLOCK_D_pe_STORE)
-                + (pid_blk // 128) * BLOCK_D_pe_scales * 128
-                + d_pe_scales_shfl[:, None] * SCALE_K_WIDTH_ROPE * 128
-                + (pid_sub_blk % 32) * 4 * SCALE_K_WIDTH_ROPE
-                + (pid_sub_blk // 32) * SCALE_K_WIDTH_ROPE
-                + k_pe_width_shfl[None, :]
-            ) * kv_cache_stride_d
-            e4m3_dtype: gl.constexpr = gl.float8e4nv
             gl.amd.cdna4.buffer_store(
-                k_nope_scales.to(e4m3_dtype).to(
-                    kv_cache_ptr.dtype.element_ty, bitcast=True
-                ),
+                k_nope_scales,
                 ptr=kv_cache_base,
                 offsets=kv_cache_nope_scales_offs.to(gl.int32),
             )
-            gl.amd.cdna4.buffer_store(
-                k_pe_scales.to(e4m3_dtype).to(
-                    kv_cache_ptr.dtype.element_ty, bitcast=True
-                ),
-                ptr=kv_cache_base,
-                offsets=kv_cache_pe_scales_offs.to(gl.int32),
-            )
+            if not ROPE_FP8:
+                BLOCK_D_pe_scales: gl.constexpr = BLOCK_D_pe // FP4_QUANT_BLOCK_SIZE
+                R_ps: gl.constexpr = BLOCK_D_pe_scales // SCALE_K_WIDTH_ROPE
+                PARENT_PS: gl.constexpr = _store_blocked_layout(
+                    R_ps, SCALE_K_WIDTH_ROPE
+                )
+                d_pe_scales_shfl = gl.arange(
+                    0, R_ps, layout=gl.SliceLayout(1, PARENT_PS)
+                )
+                k_pe_width_shfl = gl.arange(
+                    0, SCALE_K_WIDTH_ROPE, layout=gl.SliceLayout(0, PARENT_PS)
+                )
+                k_pe_scales = gl.convert_layout(
+                    gl.reshape(k_pe_scales, [R_ps, SCALE_K_WIDTH_ROPE]), PARENT_PS
+                )
+                kv_cache_pe_scales_offs = (
+                    BLOCK_SIZE
+                    * (BLOCK_D_nope_STORE + BLOCK_D_nope_scales + BLOCK_D_pe_STORE)
+                    + (pid_blk // 128) * BLOCK_D_pe_scales * 128
+                    + d_pe_scales_shfl[:, None] * SCALE_K_WIDTH_ROPE * 128
+                    + (pid_sub_blk % 32) * 4 * SCALE_K_WIDTH_ROPE
+                    + (pid_sub_blk // 32) * SCALE_K_WIDTH_ROPE
+                    + k_pe_width_shfl[None, :]
+                ) * kv_cache_stride_d
+                gl.amd.cdna4.buffer_store(
+                    k_pe_scales,
+                    ptr=kv_cache_base,
+                    offsets=kv_cache_pe_scales_offs.to(gl.int32),
+                )
     else:
         # non-shuffled KV cache
         kv_cache_base = (
@@ -420,6 +427,7 @@ def _fused_qk_rope_cat_and_cache_mla_kernel(
     HAVE_K_SCALE: gl.constexpr = False,
     UPCAST_OPERAND: gl.constexpr = False,
     APPLY_ROPE: gl.constexpr = True,
+    FP4_KV_FORMAT: gl.constexpr = "nvfp4",
 ):
     # Accepted only to keep the signature aligned with the Triton kernel; the
     # TDM cos/sin staging below has no NoPE variant.
@@ -633,6 +641,7 @@ def _fused_qk_rope_cat_and_cache_mla_kernel(
                 SCALE_K_WIDTH_ROPE,
                 L_NOPE,
                 L_PE,
+                FP4_KV_FORMAT,
             )
 
         # OUTPUT block at tail (after the kv-store path): both stores via
@@ -741,6 +750,7 @@ def _fused_qk_rope_cat_and_cache_mla_kernel(
                     SCALE_K_WIDTH_ROPE,
                     L_NOPE,
                     L_PE,
+                    FP4_KV_FORMAT,
                 )
 
 
@@ -1590,6 +1600,7 @@ def _qpe_htile_kernel(
     SCALE_K_WIDTH_ROPE: gl.constexpr = 4,
     HAVE_K_SCALE: gl.constexpr = False,
     UPCAST_OPERAND: gl.constexpr = False,
+    FP4_KV_FORMAT: gl.constexpr = "nvfp4",
 ):
     # 2D tile layout over [BLOCK_H heads, BLOCK_D_pe], and its 1D slices.
     L_T_PE: gl.constexpr = _tile_blocked_layout(BLOCK_H, BLOCK_D_pe)
@@ -1773,5 +1784,6 @@ def _qpe_htile_kernel(
                 SCALE_K_WIDTH_ROPE,
                 L_NOPE_1D,
                 L_PE_1D,
+                FP4_KV_FORMAT,
             )
         gl.amd.gfx1250.tdm.async_wait(0)

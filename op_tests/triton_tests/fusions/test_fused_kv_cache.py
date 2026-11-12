@@ -10,11 +10,12 @@ from aiter.ops.triton.fusions.fused_kv_cache import (
     reshape_and_cache_k4v8,
 )
 from aiter.ops.triton.utils._triton import arch_info
+from aiter.ops.triton.utils.fp4_kv import fp4_kv_row_bytes
 from aiter.ops.triton.utils.types import e4m3_dtype
 from aiter.test_common import checkAllclose
 from op_tests.test_rope import RotateStyle, ref_rope_sbhd_fwd
 from op_tests.triton_tests.attention.test_mla import (
-    dynamic_nvfp4_quant_kv_buffer,
+    dynamic_fp4_quant_kv_buffer,
     shuffle_kv_buffer,
 )
 from op_tests.triton_tests.attention.test_unified_attention import (
@@ -81,12 +82,15 @@ def split_unshuffle_nvfp4_kv_cache(key_or_value_cache):
 @pytest.mark.parametrize("rotate_style", [RotateStyle.GPTJ, RotateStyle.NEOX])
 @pytest.mark.parametrize("reuse_freqs_front_part", [False, True])
 @pytest.mark.parametrize(
-    "cache_dtype, shuffled_kv_cache, block_size",
+    "cache_dtype, shuffled_kv_cache, block_size, fp4_kv_format",
     [
-        (torch.bfloat16, True, 64),
-        (torch.bfloat16, False, 1),
-        (e4m3_dtype, True, 64),
-        (torch.uint8, True, 128),
+        (torch.bfloat16, True, 64, "nvfp4"),
+        (torch.bfloat16, False, 1, "nvfp4"),
+        (e4m3_dtype, True, 64, "nvfp4"),
+        (torch.uint8, True, 128, "nvfp4"),
+        (torch.uint8, True, 128, "mxfp4"),
+        (torch.uint8, True, 128, "mxfp4_b16"),
+        (torch.uint8, True, 128, "mxfp4_fp8rope"),
     ],
 )
 @pytest.mark.parametrize("upcast_operand", [False, True])
@@ -102,6 +106,7 @@ def test_fused_qk_rope_cat_and_cache_mla(
     cache_dtype: bool,
     shuffled_kv_cache: bool,
     block_size: int,
+    fp4_kv_format: str,
     upcast_operand: bool,
 ):
     if cache_dtype == torch.uint8 and DEVICE_ARCH not in ("gfx1250",):
@@ -207,7 +212,9 @@ def test_fused_qk_rope_cat_and_cache_mla(
         torch_kv_cache = torch_kv_cache.reshape(
             num_kv_cahce_tokens // block_size, block_size, KH, D_lora + D_pe
         )
-        torch_kv_cache = dynamic_nvfp4_quant_kv_buffer(torch_kv_cache, D_lora)
+        torch_kv_cache = dynamic_fp4_quant_kv_buffer(
+            torch_kv_cache, D_lora, fp4_kv_format
+        )
     elif shuffled_kv_cache:
         torch_kv_cache = shuffle_kv_buffer(
             torch_kv_cache.reshape(
@@ -239,6 +246,7 @@ def test_fused_qk_rope_cat_and_cache_mla(
             k_pe_out=None,
             shuffled_kv_cache=shuffled_kv_cache,
             upcast_operand=upcast_operand,
+            fp4_kv_format=fp4_kv_format,
         )
     )
 
@@ -251,6 +259,7 @@ def test_fused_qk_rope_cat_and_cache_mla(
         D_lora,
         D_pe,
         dtype,
+        fp4_kv_format=fp4_kv_format,
     )
 
     torch.testing.assert_close(torch_q, triton_q, atol=1e-1, rtol=1e-1)
@@ -260,6 +269,90 @@ def test_fused_qk_rope_cat_and_cache_mla(
         )
         torch.testing.assert_close(torch_zeros, triton_zeros, atol=0.1, rtol=0.1)
     torch.testing.assert_close(torch_k_pe_og_dtype, triton_k_pe, atol=1e-1, rtol=1e-1)
+
+
+@pytest.mark.parametrize("T", [1, 64, 300, 2048])
+@pytest.mark.parametrize(
+    "fp4_kv_format", ["nvfp4", "mxfp4", "mxfp4_b16", "mxfp4_fp8rope"]
+)
+@pytest.mark.parametrize("reuse_freqs_front_part", [False, True])
+def test_fused_qk_rope_cat_and_cache_mla_fp4_q_nope_prestored(
+    T: int, fp4_kv_format: str, reuse_freqs_front_part: bool
+):
+    """The q_nope-prestored writer (the head-tiled gluon kernel on gfx1250, the
+    path BF16-absorb MLA decode takes) must leave the FP4 cache and q_out
+    exactly as the full fused kernel does."""
+    if DEVICE_ARCH not in ("gfx1250",):
+        pytest.skip("FP4 KV cache writer requires GFX1250")
+    torch.manual_seed(0)
+    dtype = torch.bfloat16
+    QH, D_lora, D_pe, block_size, num_tokens = 128, 512, 64, 128, 4096
+    _, _, _, _, _, positions, _, cos, sin = generate_rope_inputs(
+        1,
+        T,
+        1,
+        QH,
+        D_pe,
+        cached=True,
+        reuse_freqs_front_part=reuse_freqs_front_part,
+        nope=False,
+        pos=True,
+        offs=False,
+        two_inputs=True,
+        layout="thd",
+        dtype=dtype,
+    )
+    q = torch.randn((T, QH, D_lora + D_pe), device="cuda").to(dtype)
+    q_nope, q_pe = q.split((D_lora, D_pe), dim=-1)
+    k_lora = (torch.randn((T, 1, D_lora), device="cuda") / 20).to(dtype)
+    k_pe = (torch.randn((T, 1, D_pe), device="cuda") / 20).to(dtype)
+    k_scale = torch.ones((), dtype=torch.float32, device="cuda")
+    slot_mapping = torch.randperm(num_tokens, device="cuda")[:T]
+    row_bytes = fp4_kv_row_bytes(D_lora, D_pe, fp4_kv_format)
+
+    def run(q_nope_prestored):
+        cache = torch.zeros(
+            (num_tokens // block_size, 1, block_size, row_bytes),
+            dtype=torch.uint8,
+            device="cuda",
+        )
+        q_out = torch.zeros((T, QH, D_lora + D_pe), dtype=e4m3_dtype, device="cuda")
+        if q_nope_prestored:
+            q_out[..., :D_lora] = q_nope.to(e4m3_dtype)
+        fused_qk_rope_cat_and_cache_mla(
+            q_nope,
+            q_pe,
+            k_lora,
+            k_pe,
+            cache,
+            slot_mapping,
+            positions,
+            cos,
+            sin,
+            k_scale,
+            False,
+            num_decode_toks_for_zeros=0,
+            apply_scale=True,
+            q_out=q_out,
+            shuffled_kv_cache=True,
+            q_nope_prestored=q_nope_prestored,
+            fp4_kv_format=fp4_kv_format,
+        )
+        return cache, q_out
+
+    ref_cache, ref_q_out = run(False)
+    cache, q_out = run(True)
+    mismatch = (cache != ref_cache).sum().item()
+    assert mismatch == 0, f"{mismatch} cache bytes differ from the full fused kernel"
+    q_out, ref_q_out = q_out.to(torch.float32), ref_q_out.to(torch.float32)
+    torch.testing.assert_close(
+        q_out[..., D_lora:], ref_q_out[..., D_lora:], atol=0, rtol=0
+    )
+    # The prestored q_nope was cast by torch, the reference by the kernel: allow
+    # one E4M3 rounding step between them.
+    torch.testing.assert_close(
+        q_out[..., :D_lora], ref_q_out[..., :D_lora], atol=2**-9, rtol=0.125
+    )
 
 
 @pytest.mark.parametrize("T", [1, 8, 2048])
