@@ -6,6 +6,9 @@ from typing import NamedTuple
 import torch
 import triton
 
+from aiter.ops.triton._triton_kernels.attention.dao_ai.utils import (
+    get_arch,
+)
 from aiter.ops.triton._triton_kernels.attention.unified_attention import (
     attention_output_gate_rows,
     kernel_unified_attention_2d,
@@ -13,7 +16,6 @@ from aiter.ops.triton._triton_kernels.attention.unified_attention import (
     reduce_segments,
     unified_attention_3d_split_rebalance_kernel,
 )
-from aiter.ops.triton._triton_kernels.flash_attn_triton_amd.utils import get_arch
 from aiter.ops.triton.utils._triton import arch_info
 from aiter.ops.triton.utils.common_utils import max_addressable_bytes
 from aiter.ops.triton.utils.device_info import get_num_sms
@@ -1301,6 +1303,9 @@ def _unified_attention_2d_gfx1250(params: _UAParams, output_gate=None):
     assert params.softcap == 0, "Softcap is not supported"
 
     config = get_unified_attention_config("attn_2d", params, backend="gluon")
+    # TDM stores of LDS-staged output can corrupt some gfx1250 decode rows.
+    # Those shapes set USE_TDM_STORE false; every other shape keeps TDM stores.
+    USE_TDM_STORE = config.pop("USE_TDM_STORE", True)
     override = config.pop("FILL_OVERRIDE", None)
     if override and not (params.all_decode or params.spec_decode):
         # Over a long context, a batch the hint shows unevenly loaded runs faster on
@@ -1376,6 +1381,8 @@ def _unified_attention_2d_gfx1250(params: _UAParams, output_gate=None):
     # buffer ops need the tensor to fit a 32-bit offset; gfx1250 loads through TDM
     MAX_INT32 = 2**31 - 1
     USE_STORE_BUFFER_OP = params.out.nelement() * params.out.element_size() <= MAX_INT32
+    if not USE_TDM_STORE:
+        USE_STORE_BUFFER_OP = False  # gl.store, not the CDNA4 buffer_store, on gfx1250
     _unified_attention_kernel_2d_gfx1250[(params.num_kv_heads, total_query_blocks)](
         query_ptr=params.q,
         key_cache_ptr=params.k,
@@ -1428,6 +1435,7 @@ def _unified_attention_2d_gfx1250(params: _UAParams, output_gate=None):
         REMOVE_INDIRECT_ACCESS=False,
         NUM_BUFFERS=num_buffers,
         LOOP_VARIANT=loop_variant,
+        USE_TDM_STORE=USE_TDM_STORE,
         Q_NVFP4=params.q_dtype == torch.uint8,
         KV_NVFP4=kv_nvfp4,
         V_NVFP4=params.v_cache_dtype == torch.uint8,

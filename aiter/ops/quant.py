@@ -71,6 +71,35 @@ def pertoken_quant(
     quant_dtype=dtypes.i8,
     dtypeMax=None,
 ):
+    """Symmetric per-token quantization: one scale per row of ``x``.
+
+    The reduction is over the LAST axis, so "token" means a row however many
+    leading axes ``x`` has -- ``per_block_quant_wrapper`` relies on that,
+    reshaping ``[m, n]`` to ``[-1, blk_n]`` and calling this to get
+    ``per_1x128`` and friends out of the same body.
+
+    Args:
+        x: input of any shape; quantized along the last axis.
+        scale: a precomputed per-token scale ``[..., 1]``. Given, it is used
+            as-is and nothing is reduced -- a caller that already knows the
+            scale (static quant, or a scale shared across a step) skips the
+            amax pass. ``None`` derives it from ``x``.
+        x_scale: optional smoothquant scale multiplied into ``x`` BEFORE the
+            amax. Not the output scale, and not a second name for ``scale``.
+        scale_dtype: dtype the returned scale is cast to.
+        quant_dtype: output dtype; also fixes ``dtypeMax`` when that is None.
+        dtypeMax: the magnitude ``quant_dtype`` is scaled to. Pass it to
+            quantize against a bound other than the dtype's own maximum.
+
+    Returns:
+        ``(y, y_scale)`` -- a new ``quant_dtype`` tensor shaped like ``x``,
+        and the ``scale_dtype`` scale of shape ``[..., 1]``. Nothing is
+        written in place.
+
+    A row whose amax is zero would give a zero scale and a division by it, so
+    that scale is forced to 1: an all-zero row quantizes to zeros rather than
+    to NaN.
+    """
     x = x.to(dtypes.fp32)
     if x_scale is None:
         hidden_states = x

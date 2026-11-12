@@ -20,6 +20,9 @@ from aiter.ops.triton.utils._triton import arch_info
 from aiter.ops.triton.utils.device_info import get_num_sms
 from aiter.ops.triton.utils.shuffle import shuffle_scale_batched, shuffle_weight
 from aiter.ops.triton.utils.types import e4m3_dtype
+from aiter.ops.triton.utils.unified_attention_utils import (
+    get_unified_attention_config,
+)
 from aiter.test_common import checkAllclose
 from op_tests.triton_tests.quant.test_quant_mxfp4 import (
     torch_dynamic_mxfp4_quant,
@@ -2022,6 +2025,229 @@ def test_unified_attn_attn_work_gfx1250(seq_lens, with_hint: bool) -> None:
     )
     assert not output.isnan().any()
     torch.testing.assert_close(output, ref_output, atol=1.5e-2, rtol=1e-2)
+
+
+def test_gfx1250_ua2d_register_store_gate() -> None:
+    """The config flag is the register-store switch. Check it on any machine.
+
+    The lookup uses the wider head, and the output dtype is not an axis, so
+    those shapes follow that entry.
+    """
+    b, f, e, u = torch.bfloat16, torch.float16, e4m3_dtype, torch.uint8
+    # name, q head, v head, G, page, q, kv, out, q len, tdm, tile
+    cases = [
+        ("bf16", 64, 64, 8, 64, b, b, b, 1, False, 64),
+        ("fp16 q/kv", 64, 64, 8, 64, f, f, b, 1, False, 64),
+        ("fp8 q/kv", 64, 64, 8, 64, e, e, b, 1, False, 128),
+        ("bf16 q fp8 kv", 64, 64, 8, 64, b, e, b, 1, False, 64),
+        ("nvfp4 kv", 64, 64, 8, 64, b, u, b, 1, False, 64),
+        ("q head 64 v 32", 64, 32, 8, 64, b, b, b, 1, False, 64),
+        ("q head 32 v 64", 32, 64, 8, 64, b, b, b, 1, False, 64),
+        ("fp8 asymmetric", 64, 32, 8, 64, e, e, b, 1, False, 128),
+        ("fp16 out", 64, 64, 8, 64, b, b, f, 1, False, 64),
+        ("tp2", 64, 64, 4, 64, b, b, b, 1, True, 64),
+        ("page 16", 64, 64, 8, 16, b, b, b, 1, True, 64),
+        ("extend", 64, 64, 8, 64, b, b, b, 128, True, 64),
+    ]
+    for case in cases:
+        name, hq, hv, group, page, q_dtype, kv_dtype, out_dtype, q_len, tdm, tile = case
+        params = SimpleNamespace(
+            head_size=hq,
+            head_size_v=hv,
+            max_seqlen_q=q_len,
+            max_seqlen_k=4096,
+            sliding_window=0,
+            shuffled_kv_cache=True,
+            q_dtype=q_dtype,
+            kv_cache_dtype=kv_dtype,
+            block_size=page,
+            num_queries_per_kv=group,
+            all_decode=q_len == 1,
+            num_2d_prgms=1,
+            num_sms=1,
+            out=SimpleNamespace(dtype=out_dtype),
+        )
+        config = get_unified_attention_config(
+            "attn_2d", params, backend="gluon", arch="gfx1250"
+        )
+        assert config["TILE_SIZE"] == tile, name
+        assert config.pop("USE_TDM_STORE", True) is tdm, name
+
+    rows = [
+        ("bf16", b, b, 64),
+        ("fp16 q/kv", f, f, 64),
+        ("fp8 q/kv", e, e, 128),
+        ("bf16 q fp8 kv", b, e, 64),
+        ("nvfp4 kv", b, u, 64),
+    ]
+
+    def params(group, q_dtype, kv_dtype, window=0, seq_k=4096, shuffled=True):
+        return SimpleNamespace(
+            head_size=64,
+            head_size_v=64,
+            max_seqlen_q=1,
+            max_seqlen_k=seq_k,
+            sliding_window=window,
+            shuffled_kv_cache=shuffled,
+            q_dtype=q_dtype,
+            kv_cache_dtype=kv_dtype,
+            block_size=64,
+            num_queries_per_kv=group,
+            all_decode=True,
+            num_2d_prgms=1,
+            num_sms=1,
+            out=SimpleNamespace(dtype=b),
+        )
+
+    def lookup(p):
+        return get_unified_attention_config(
+            "attn_2d", p, backend="gluon", arch="gfx1250"
+        )
+
+    # The store flag must survive changes to window, KV length, and shuffle axes.
+    for name, qd, kd, tile in rows:
+        for window in (0, 128):
+            for seq_k in (1024, 4096):
+                for shuffled in (False, True):
+                    tag = f"{name} sw={window} sk={seq_k} shuffled={shuffled}"
+                    p = params(8, qd, kd, window, seq_k, shuffled)
+                    cfg = lookup(p)
+                    assert cfg.pop("USE_TDM_STORE", True) is False, tag
+                    assert cfg["TILE_SIZE"] == tile, tag
+
+    # The flagged entries copy the tuning of the entries they replace. The G=4
+    # shape resolves to those entries, so a retune of one of them shows up here.
+    for name, qd, kd, _tile in rows:
+        flagged = lookup(params(8, qd, kd))
+        original = lookup(params(4, qd, kd))
+        assert flagged.pop("USE_TDM_STORE", True) is False, name
+        assert "USE_TDM_STORE" not in original, name
+        assert flagged == original, name
+
+
+@pytest.mark.parametrize("num_seqs", [4, 64])
+@pytest.mark.parametrize(
+    "dtype, shuffled",
+    [
+        (torch.bfloat16, False),
+        (torch.bfloat16, True),
+        (torch.float16, False),
+        (e4m3_dtype, False),
+    ],
+)
+@torch.inference_mode()
+def test_gfx1250_gluon_ua2d_decode_register_store(
+    num_seqs: int, dtype: torch.dtype, shuffled: bool, monkeypatch
+) -> None:
+    """Check public decode routing, both store flags, and numerical results.
+
+    Graph replays must match the eager output bitwise.
+    """
+    if DEVICE_ARCH != "gfx1250":
+        pytest.skip(f"gfx1250 Gluon 2D kernel only, not {DEVICE_ARCH}")
+
+    random.seed(0)
+    seq_lens = [(1, random.randint(1, 4096)) for _ in range(num_seqs)]
+    (
+        query,
+        key_cache_orig,
+        value_cache_orig,
+        key_cache,
+        value_cache,
+        _sinks,
+        output,
+        cu_query_lens,
+        kv_lens,
+        max_query_len,
+        max_kv_len,
+        scale,
+        window_size,
+        block_tables,
+        *_rest,
+    ) = generate_data(
+        seq_lens=seq_lens,
+        num_blocks=num_seqs * 64 + 64,
+        block_size=64,
+        head_size=64,
+        num_heads=(64, 8),
+        sliding_window=128,
+        q_dtype=dtype,
+        kv_dtype=dtype,
+        shuffled_kv_cache=shuffled,
+        use_q_descale=False,
+        use_kv_descale=False,
+        device="cuda",
+    )
+
+    module = sys.modules[unified_attention.__module__]
+    kernel = module._unified_attention_kernel_2d_gfx1250
+    launches = []
+
+    class CheckedLaunch:
+        def __getitem__(self, grid):
+            launch = kernel[grid]
+
+            def checked(**kwargs):
+                assert kwargs["USE_TDM_STORE"] is False
+                assert kwargs["USE_STORE_BUFFER_OP"] is False
+                launches.append(grid)
+                return launch(**kwargs)
+
+            return checked
+
+    monkeypatch.setattr(module, "_unified_attention_kernel_2d_gfx1250", CheckedLaunch())
+
+    def run(out):
+        unified_attention(
+            q=query,
+            k=key_cache,
+            v=value_cache,
+            out=out,
+            cu_seqlens_q=cu_query_lens,
+            seqused_k=kv_lens,
+            max_seqlen_q=max_query_len,
+            max_seqlen_k=max_kv_len,
+            softmax_scale=scale,
+            causal=True,
+            window_size=window_size,
+            block_table=block_tables,
+            softcap=0,
+            q_descale=None,
+            k_descale=None,
+            v_descale=None,
+            sinks=None,
+            shuffled_kv_cache=shuffled,
+            backend="gluon",
+        )
+
+    eager = torch.empty_like(output)
+    run(eager)
+    assert launches, "public wrapper did not launch the gfx1250 Gluon 2D kernel"
+    ref_output = ref_paged_attn(
+        query=query,
+        key_cache=key_cache_orig,
+        value_cache=value_cache_orig,
+        query_lens=[q for q, _ in seq_lens],
+        kv_lens=[k for _, k in seq_lens],
+        block_tables=block_tables,
+        scale=scale,
+        out_dtype=torch.bfloat16,
+        sliding_window=128,
+        soft_cap=None,
+        sinks=None,
+    )
+    atol, rtol = (1.5e-1, 1.5e-1) if dtype == e4m3_dtype else (1.5e-2, 1e-2)
+    torch.testing.assert_close(eager, ref_output, atol=atol, rtol=rtol)
+
+    graph_out = torch.empty_like(output)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        run(graph_out)
+    for replay in range(32):
+        graph_out.zero_()
+        graph.replay()
+        torch.cuda.synchronize()
+        assert torch.equal(graph_out, eager), f"graph replay {replay} differs"
 
 
 @pytest.mark.parametrize("path", ["2d", "3d", "auto"])
