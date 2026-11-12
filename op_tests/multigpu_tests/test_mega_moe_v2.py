@@ -998,6 +998,14 @@ def _run_skewed_route_switch(moe, x, weights, ids, rounds, seed, rank, world):
     _fwd(moe, x, weights, ids)
     _fwd(moe, x, weights, ids)
     _barrier()
+    # The large-M kernels of a layout without fused-knob tuning (V4-Pro EP8) run main's arithmetic and match
+    # it bit-for-bit; a tuned layout (V4.1-Flash EP8) sends other bytes (one row per token and destination,
+    # int8 transport), so there only rows off by a sizable part of their own norm count as corrupted.
+    config = moe._large_m._active_config
+    exact = (config.fused_stage1, config.fused_stage2) == (
+        FusedStage1Knobs(),
+        FusedStage2Knobs(),
+    )
     worst = 0.0
     failures = []
     for round_idx in range(rounds):
@@ -1027,15 +1035,19 @@ def _run_skewed_route_switch(moe, x, weights, ids, rounds, seed, rank, world):
             moe.set_large_m_enabled(True)
         _barrier()
         output = _fwd(moe, x, route_weights, route_ids)[:tokens].float()
-        mismatched = (output != main_output.float()).any(dim=-1).sum().to(torch.int64)
+        diff = output - main_output.float()
+        if exact:
+            bad_rows = diff.ne(0).any(dim=-1)
+        else:
+            bad_rows = diff.norm(dim=-1) > 0.25 * main_output.float().norm(dim=-1)
+        mismatched = bad_rows.sum().to(torch.int64)
         error_sq = torch.sum((output - main_output.float()) ** 2)
         reference_sq = torch.sum(main_output.float() ** 2)
         for value in (mismatched, error_sq, reference_sq):
             dist.all_reduce(value)
         rel_l2 = float(torch.sqrt(error_sq / reference_sq))
         worst = max(worst, rel_l2)
-        # Same kernels and inputs make the large-M path match main bit-for-bit; a stale pair
-        # order corrupts whole rows, sometimes only a few per launch.
+        # A stale pair order corrupts whole rows, sometimes only a few per launch.
         if int(mismatched.item()):
             failures.append(
                 f"round={round_idx} hazard_producers={int(hazard.item())} "
