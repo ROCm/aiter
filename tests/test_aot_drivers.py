@@ -145,8 +145,8 @@ class MegaMoEProductionJobsTest(unittest.TestCase):
         jobs = mega_moe.production_jobs()
         ep4 = [job for job in jobs if job["world_size"] == 4]
         # V4-Pro (3 MTPRs x 3 EPLB profiles x 2 quants x 8 ranks), Kimi-K3
-        # (3 x 2 x 8) and V4.1-Flash EP4 / EP2 (3 MTPRs x 4 / 2 ranks, a8w4 only).
-        self.assertEqual(len(jobs), 144 + 48 + 12 + 6)
+        # (3 x 2 x 8) and V4.1-Flash EP4 / EP2 / EP8 (3 MTPRs x 4 / 2 / 8 ranks, a8w4 only).
+        self.assertEqual(len(jobs), 144 + 48 + 12 + 6 + 24)
         self.assertEqual(
             {(job["mtpr"], job["rank"]) for job in ep4},
             {(mtpr, rank) for mtpr in (128, 8192, 16384) for rank in range(4)},
@@ -212,5 +212,35 @@ class MegaMoEProductionJobsTest(unittest.TestCase):
                 job
                 for job in mega_moe.production_jobs(quants=("a4w4",))
                 if job["world_size"] == 2
+            ]
+        )
+
+    def test_v41_flash_ep8_profile(self):
+        from aiter.aot.flydsl import mega_moe
+
+        jobs = mega_moe.production_jobs()
+        ep8 = [
+            job for job in jobs if job["model_dim"] == 5120 and job["world_size"] == 8
+        ]
+        self.assertEqual(
+            {(job["mtpr"], job["rank"]) for job in ep8},
+            {(mtpr, rank) for mtpr in (128, 8192, 16384) for rank in range(8)},
+        )
+        for job in ep8:
+            self.assertEqual(
+                (
+                    job["quant"],
+                    job["experts_per_rank"],
+                    job["inter_dim"],
+                    job["topk"],
+                ),
+                ("a8w4", 48, 2304, 6),
+            )
+        # Without a8w4 there is no V4.1-Flash EP8 job either.
+        self.assertFalse(
+            [
+                job
+                for job in mega_moe.production_jobs(quants=("a4w4",))
+                if job["model_dim"] == 5120
             ]
         )

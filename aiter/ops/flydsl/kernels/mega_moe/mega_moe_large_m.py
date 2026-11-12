@@ -3151,7 +3151,7 @@ class LargeMRuntime:
             experts=experts, topk=topk, quant=quant, swiglu_limit=float(swiglu_limit),
         ) or max_tok_per_rank not in large_mtprs:
             raise ValueError(
-                "the large-input path requires a fused a8w4 layout on gfx950 (EP8 DeepSeek-V4-Pro or EP4 / EP2 "
+                "the large-input path requires a fused a8w4 layout on gfx950 (EP8 DeepSeek-V4-Pro or EP4 / EP2 / EP8 "
                 "DeepSeek-V4.1-Flash, swiglu_limit=10) and a max_tok_per_rank the layout builds it for "
                 f"({large_mtprs or 'none'})"
             )

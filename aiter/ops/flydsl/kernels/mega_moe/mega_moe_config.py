@@ -55,13 +55,16 @@ V4_MODEL_DIM, V4_INTER_DIM = 7168, 3072
 # EP4 / EP2 DeepSeek-V4.1-Flash: (world_size, experts_per_rank, model_dim, inter_dim).
 V41_FLASH_EP4_LAYOUT = (4, 96, 5120, 2304)
 V41_FLASH_EP2_LAYOUT = (2, 192, 5120, 2304)
+# EP8 DeepSeek-V4.1-Flash: V4-Pro's rank / expert geometry with V4.1-Flash's dims.
+V41_FLASH_EP8_LAYOUT = (8, 48, 5120, 2304)
 # (world_size, model_dim, inter_dim, experts, topk) of the layouts the fused (small- and large-input) kernels
-# serve: EP8 DeepSeek-V4-Pro and EP4 / EP2 DeepSeek-V4.1-Flash.
+# serve: EP8 DeepSeek-V4-Pro and EP4 / EP2 / EP8 DeepSeek-V4.1-Flash.
 FUSED_LAYOUTS = frozenset(
     {
         (8, V4_MODEL_DIM, V4_INTER_DIM, 8 * REFERENCE_EXPERTS_PER_RANK, 6),
         (4, 5120, 2304, 4 * 96, 6),
         (2, 5120, 2304, 2 * 192, 6),
+        (8, 5120, 2304, 8 * 48, 6),
     }
 )
 K3_MODEL_DIM, K3_INTER_DIM = 3584, 3072

@@ -57,6 +57,11 @@ V41_FLASH_EP2 = dict(V41_FLASH_EP4, world_size=2)
 V41_FLASH_EP2_SHAPE = dict(
     world_size=2, experts_per_rank=192, model_dim=5120, inter_dim=2304
 )
+# EP8 DeepSeek-V4.1-Flash: V4-Pro's 48 experts a rank with V4.1-Flash's dims.
+V41_FLASH_EP8 = dict(V4_PRO, model_dim=5120, inter_dim=2304)
+V41_FLASH_EP8_SHAPE = dict(
+    world_size=8, experts_per_rank=48, model_dim=5120, inter_dim=2304
+)
 MTPRS = tuple(b for b in TOKEN_BUCKETS if b >= 16)
 
 
@@ -72,11 +77,16 @@ def test_fused_layout_gate():
     assert fused_layout_supported(**V4_PRO)
     assert fused_layout_supported(**V41_FLASH_EP4)
     assert fused_layout_supported(**V41_FLASH_EP2)
+    assert fused_layout_supported(**V41_FLASH_EP8)
+    assert fused_layout_supported(**{**V41_FLASH_EP4, "world_size": 8})
     assert not fused_layout_supported(**{**V41_FLASH_EP2, "experts": 192})
-    # Each layout is supported whole: no mix of the two shapes.
-    assert not fused_layout_supported(**{**V41_FLASH_EP4, "world_size": 8})
+    # Each layout is supported whole: no mix of the shapes.
     assert not fused_layout_supported(**{**V41_FLASH_EP4, "experts": 768})
+    assert not fused_layout_supported(**{**V41_FLASH_EP8, "experts": 768})
     assert not fused_layout_supported(**{**V41_FLASH_EP4, "inter_dim": 3072})
+    assert not fused_layout_supported(**{**V41_FLASH_EP8, "inter_dim": 3072})
+    assert not fused_layout_supported(**{**V41_FLASH_EP8, "model_dim": 7168})
+    assert not fused_layout_supported(**{**V41_FLASH_EP8, "quant": "a4w4"})
     for field, value in (
         ("arch", "gfx942"),
         ("world_size", 4),
@@ -202,7 +212,7 @@ def test_ep4_route_for_every_max_tokens(mtpr):
         assert plan.route_for(max_tokens, large_m=False)[0] != ROUTE_LARGE_M
 
 
-@pytest.mark.parametrize("layout", ("ep8", "ep4", "ep2"))
+@pytest.mark.parametrize("layout", ("ep8", "ep4", "ep2", "ep8f"))
 def test_large_m_buffers_fit_32bit_offsets(layout):
     """Every large-input capacity keeps its buffer-resource views inside 32-bit offsets and its encodings in
     their bit fields (the kernel and LargeMRuntime raise past them; this pins the margin).
@@ -216,6 +226,7 @@ def test_large_m_buffers_fit_32bit_offsets(layout):
         "ep8": (8, 48, 7168, 3072),
         "ep4": (4, 96, 5120, 2304),
         "ep2": (2, 192, 5120, 2304),
+        "ep8f": (8, 48, 5120, 2304),
     }[layout]
     for mtpr in large_m_mtprs_for(
         world_size=world_size, model_dim=model_dim, inter_dim=inter_dim
@@ -260,6 +271,32 @@ def test_large_m_buffers_fit_32bit_offsets(layout):
                 spec["max_g2_m_blocks"] * (model_dim // spec["BN"]) * spec["BM"] * 16
             )
             assert nbytes < 1 << 31, (layout, mtpr)
+
+
+@pytest.mark.parametrize("mtpr", MTPRS)
+def test_v41ep8_route_for_every_max_tokens(mtpr):
+    """EP8 V4.1-Flash: small-input up to 512 rows a rank, large-input from 513 at its large capacities."""
+    large = large_m_mtprs_for(world_size=8, model_dim=5120, inter_dim=2304)
+    plan = build_mega_moe_bundle_plan(
+        mtpr,
+        experts_per_rank=48,
+        model_dim=5120,
+        inter_dim=2304,
+        world_size=8,
+        small_m_mtprs=DEFAULT_SMALL_M_MTPRS,
+        large_m=mtpr in large,
+    )
+    assert plan.large_m == (mtpr in large)
+    for max_tokens in sorted({0, 1, 256, 257, 512, 513, 768, 1024, mtpr - 1, mtpr}):
+        if not 0 <= max_tokens <= mtpr:
+            continue
+        route, capacity = plan.route_for(max_tokens)
+        if max_tokens <= plan.small_m_mtprs[-1]:
+            assert route == ROUTE_SMALL_M, max_tokens
+        elif plan.large_m:
+            assert (route, capacity) == (ROUTE_LARGE_M, mtpr), max_tokens
+        else:
+            assert (route, capacity) == (ROUTE_STAGED, mtpr), max_tokens
 
 
 def test_large_m_capacity_validated():
@@ -479,6 +516,9 @@ def test_small_m_token_rows_live_in_the_payload_arena(mtpr):
     assert ep8[1] == 48 * (8 * mtpr) + 256
     assert ep4[1] == 96 * (4 * mtpr) + 256 + 4 * mtpr
     assert ep4[1] * ep4[2] <= _TOKEN_REGION_END
+    ep8f = rows(8, 5120, 2304)
+    assert ep8f[1] == 48 * (8 * mtpr) + 256
+    assert ep8f[1] * ep8f[2] <= _TOKEN_REGION_END
 
 
 def test_route_payload_sharing():
@@ -497,6 +537,12 @@ def test_route_payload_sharing():
         assert LargeMRuntime.ends_all_ranks(max_tok_per_rank=mtpr, **ep8)
     for mtpr in large_m_mtprs_for(world_size=4, model_dim=5120, inter_dim=2304):
         assert not LargeMRuntime.ends_all_ranks(max_tok_per_rank=mtpr, **ep4)
+    # EP8 V4.1-Flash keeps the all-rank end: no run-ahead knob, shared payload.
+    ep8f = dict(ep8, model_dim=5120, inter_dim=2304)
+    for mtpr in DEFAULT_SMALL_M_MTPRS:
+        assert SmallMRuntime.ends_all_ranks(max_tok_per_rank=mtpr, **ep8f)
+    for mtpr in large_m_mtprs_for(world_size=8, model_dim=5120, inter_dim=2304):
+        assert LargeMRuntime.ends_all_ranks(max_tok_per_rank=mtpr, **ep8f)
 
 
 @pytest.mark.parametrize("mtpr", (256, 512))
