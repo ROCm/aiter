@@ -5729,6 +5729,46 @@ def fused_moe_2stages(
     )
     if _metadata_transform is not None:
         metadata = _metadata_transform(metadata)
+    if metadata.run_1stage:
+        # metadata.stage1 may be a complete, single-call kernel (e.g.
+        # fused_moe_1stage) rather than a genuine stage1-of-two: its return
+        # value IS the final output, not an intermediate for stage2 to
+        # consume. _fused_moe_impl's own top-level dispatch already knows
+        # this and returns metadata.stage1(...) directly without ever
+        # calling a stage2 (see its own `if metadata.run_1stage:` branch
+        # above in this file). This function must do the same whenever it
+        # is handed, or itself resolves, a run_1stage=True metadata --
+        # unconditionally treating _stage1_call()'s result as an
+        # intermediate either crashes on an argument-convention mismatch
+        # (stage1-of-two and 1-stage kernels take different arguments) or,
+        # worse, silently reruns stage2 over an already-finished result.
+        return _return_output(
+            metadata.stage1(
+                hidden_states,
+                w1,
+                w2,
+                topk,
+                sorted_ids,
+                sorted_weights,
+                sorted_expert_ids,
+                num_valid_ids,
+                moe_out,
+                isG1U1,
+                block_size_M,
+                q_dtype_a=q_dtype_a,
+                q_dtype_w=q_dtype_w,
+                w1_scale=w1_scale,
+                w2_scale=w2_scale,
+                a1_scale=a1_scale,
+                a2_scale=a2_scale,
+                num_local_tokens=num_local_tokens,
+                M=token_num,
+                device=device,
+                doweight_stage1=doweight_stage1,
+                expert_mask=expert_mask,
+            ),
+            output,
+        )
     if (
         getattr(metadata.stage1, "func", metadata.stage1) is _mxfp4_a4w4_stage1_fw
         and metadata.output_aux == AUX_SORT_OPUS
