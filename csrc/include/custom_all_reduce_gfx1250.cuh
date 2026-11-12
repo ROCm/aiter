@@ -534,9 +534,12 @@ __global__ void __launch_bounds__(256, 2) ar_gfx1250_naive_unroll4(
 // There is no end barrier. Peers may still read this rank's shard after this
 // call returns; its only writer is the next two-stage call's stage 1, which
 // waits behind barrier 1 of that call, and no peer reaches that barrier before
-// its stage 2 has completed. The shard, like the input, is published by the
-// completion of the kernel that wrote it, before the next launch on the
-// writer's stream signals the barrier, so both barriers stay relaxed.
+// its stage 2 has completed. For the same reason a drained stream on this rank
+// does not mean the peers are done with its shard: free or unmap the meta
+// buffer only after every rank has synchronized. The shard, like the input, is
+// published by the completion of the kernel that wrote it, before the next
+// launch on the writer's stream signals the barrier, so both barriers stay
+// relaxed.
 // Barriers inside the stages cost more than these one-block launches: an
 // agent-scope release in every block is a cache writeback (global_wb) per
 // block, and a start_sync at the top of every stage-2 block costs as much as
