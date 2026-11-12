@@ -177,6 +177,19 @@ class _Problem:
         )
 
 
+def default_config(token: int) -> str:
+    """Config for a token bucket with no tuned row: the batch-1 kernels at 2
+    tokens, the 16-row split-K decode tiles to 16, the 128-wide ones to 256 and
+    the prefill pipeline above."""
+    if token == 2:
+        return Config(16, 16, 16, False, use_batch1_algorithm=True).to_string()
+    if token <= 16:
+        return Config(16, 16, 16, False).to_string()
+    if token <= 256:
+        return Config(16, 128, 64, False).to_string()
+    return Config(64, 128, 128, True).to_string()
+
+
 def get_tune_space():
     prefill = [(256, 128), (128, 256), (128, 128)]
     configs = [
