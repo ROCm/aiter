@@ -343,3 +343,75 @@ def test_op(
     elif not act_mxfp8 and fused_quant:
         tri_y = (tri_y.float() * quant_static_scale).to(ref_y.dtype)
     assert_close(ref_y, tri_y, maxtol=maxtol, rmstol=rmstol)
+
+
+@pytest.mark.parametrize(
+    "m, n_buf, k_buf, n, k",
+    [
+        # GPT-OSS-120B TP8 GEMM1: partial stripe and k-chunk
+        (16, 1024, 3072, 720, 2880),
+        # GPT-OSS-120B TP8 GEMM2: whole stripes and k-chunks
+        (16, 3072, 512, 2880, 360),
+        # GPT-OSS-120B TP1 GEMM1: partial k-chunk only
+        (16, 6144, 3072, 5760, 2880),
+    ],
+)
+@pytest.mark.parametrize("apply_swiglu", [False, True])
+def test_op_unpadded_scale_swizzle_gfx1250(
+    m, n_buf, k_buf, n, k, apply_swiglu, device="cuda"
+):
+    """GFX1250_SCALE weight scales with unpadded_N / unpadded_K, as vLLM's W4A8
+    MoE passes them: buffers padded to the scale-shuffle tile, zero outside n x k.
+    """
+    if get_arch() != "gfx1250":
+        pytest.skip("GFX1250_SCALE with unpadded sizes is gfx1250-only.")
+    torch.manual_seed(0)
+    n_expts_tot, n_expts_act = 8, 2
+    m, rdata, gindx, sindx = init_routing_data(
+        m, n_expts_tot, n_expts_act, do_gather=True, do_scatter=False, device=device
+    )
+    x, w, bias, _ = init_compute_data(
+        m,
+        n_buf,
+        k_buf,
+        gindx,
+        sindx,
+        n_expts_tot,
+        n_expts_act,
+        torch.float8_e4m3fn,
+        torch.bfloat16,
+        False,
+        device=device,
+    )
+    x = x.to(torch.bfloat16)
+    x[:, k:] = 0
+    w[:, k:, :] = 0
+    w[:, :, n:] = 0
+    bias[:, n:] = 0
+    w_tri, w_scale_tri = downcast_to_mxfp(w, torch.uint8, axis=1)
+    w_ref = upcast_from_mxfp(w_tri, w_scale_tri, torch.bfloat16, axis=1)
+    w_scale_tri = preshuffle_moe_wscale(w_scale_tri)
+    x_static_scale = x.abs().max().float() / 448.0
+    x_tri = downcast_to_static_fp8(x, x_static_scale)
+    ref_y = moe_gemm_torch(x, w_ref, bias, rdata, gindx, None, None, apply_swiglu)
+    tri_y = moe_gemm_a8w4(
+        x_tri,
+        w_tri,
+        None,
+        w_scale_tri,
+        x_static_scale,
+        None,
+        bias,
+        rdata,
+        gindx,
+        None,
+        None,
+        "GFX1250_SCALE",
+        torch.bfloat16,
+        apply_swiglu,
+        unpadded_N=n,
+        unpadded_K=k,
+        backend="gluon",
+    )
+    n_out = n // (2 if apply_swiglu else 1)
+    assert_close(ref_y[:, :n_out], tri_y[:, :n_out], maxtol=4e-1, rmstol=4e-2)
