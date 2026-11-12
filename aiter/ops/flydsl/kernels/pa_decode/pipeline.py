@@ -71,6 +71,10 @@ class PaDecodePipeline:
         gpu.barrier()
         if const_expr(self.traits.kv_dtype != MXFP4_KV_DTYPE):
             v_page_pf0 = self.kv.read_v_pages()
+        if const_expr(self.traits.STREAM_KV):
+            # Streamed tiles stage the next tile's page ids at the tile start;
+            # every wave must have read the first tile's ids before that.
+            gpu.barrier()
         q_ops_all = self.query.load_operands()
         self.softmax.init_mask()
         self.ctx.init_causal_offsets()
