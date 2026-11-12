@@ -97,8 +97,19 @@ class _EpDispatcher:
     def prepare(self, batch: _DispatchBatch, quant_bits: int) -> _ComputeTarget:
         return self._combine.prepare(batch, quant_bits)
 
-    def combine(self, routing: Routing, quant_bits: int, expert_out=None):
-        return self._combine.finish(routing, quant_bits, expert_out)
+    def combine(
+        self, routing: Routing, quant_bits: int, expert_out=None, shared_add=None
+    ):
+        """``shared_add``: bf16 rows added to the combined output. The fused
+        combine adds them inside its reduce; any other stage adds them after."""
+        if shared_add is None:
+            return self._combine.finish(routing, quant_bits, expert_out)
+        if getattr(self._combine, "adds_shared", False):
+            return self._combine.finish(
+                routing, quant_bits, expert_out, shared_add=shared_add
+            )
+        out = self._combine.finish(routing, quant_bits, expert_out)
+        return out + shared_add[: out.shape[0]]
 
     def prefetch(self, topk_ids, recv_token_bound=None) -> None:
         self._dispatch.prefetch(topk_ids, recv_token_bound)

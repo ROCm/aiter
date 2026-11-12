@@ -33,7 +33,7 @@ from aiter.ops.triton.utils.tuned_config_utils import (
 _FWD_FALLBACK = triton.Config({"PRE_LOAD_V": False})
 _BWD_FALLBACK = triton.Config({})
 
-from aiter.ops.triton._triton_kernels.flash_attn_triton_amd.common import (
+from aiter.ops.triton._triton_kernels.attention.dao_ai.common import (
     compute_alibi_block,
 )
 from aiter.ops.triton._triton_kernels.quant.quant_mxfp8 import (
