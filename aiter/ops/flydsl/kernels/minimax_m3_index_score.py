@@ -2211,6 +2211,8 @@ def index_score_supported_nvfp4(
     k_round="e4m3",
 ) -> bool:
     """Metadata-only predicate for `score_flydsl_nvfp4`."""
+    if k_round not in NVFP4_ROUNDINGS:  # None would validate as an MXFP4 cache
+        return False
     return index_score_supported(
         idx_q,
         k_data,
