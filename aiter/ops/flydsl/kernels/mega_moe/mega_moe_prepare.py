@@ -72,11 +72,12 @@ def compile_mega_moe_prepare(
     assert model_dim % 32 == 0
     assert chunk_rows > 0
     assert tile_state_stride > 0
-    parallel_fanout = quant_mode == "fp8" and (npes, epr, topk, model_dim) == (
-        8,
-        48,
-        6,
-        5120,
+    # DeepSeek-V4.1-Flash at EP8 and EP4: derive the next launch's fanout pairs
+    # on every wave (or in the first quant CTA) instead of serially on the
+    # planner wave, which is on prepare's critical path.
+    parallel_fanout = quant_mode == "fp8" and (npes, epr, topk, model_dim) in (
+        (8, 48, 6, 5120),
+        (4, 96, 6, 5120),
     )
     # The first quant CTA may compute next-launch metadata after its finite
     # quant work, but only when the whole grid fits a resident CU cohort.

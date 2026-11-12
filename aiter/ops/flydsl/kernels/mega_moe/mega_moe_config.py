@@ -1111,6 +1111,17 @@ def _tune_v41_flash_ep8(config: MegaMoEConfig, ctx: _TuningContext) -> MegaMoECo
     )
 
 
+def _tune_v41_flash_ep4(config: MegaMoEConfig, ctx: _TuningContext) -> MegaMoEConfig:
+    """DeepSeek-V4.1-Flash at EP4 (96 experts per rank).  Compact decode waits
+    on its payload producers: 128 of them instead of 32 took 9-11% off 1..32
+    rows and 3-4% off 64 (96..192 is a plateau)."""
+    if ctx.apply_fp4 or ctx.world_size != 4 or ctx.fixed_slot:
+        return config
+    if ctx.bucket <= 512:
+        config = _replace_config(config, stage1={"num_dispatch_cu": 128})
+    return config
+
+
 @dataclass(frozen=True, slots=True)
 class NetworkProfile:
     """One tunable network, identified by (experts_per_rank, model_dim, inter_dim).
@@ -1164,6 +1175,7 @@ _NETWORKS = (
         fp4_prelude=True,
     ),
     NetworkProfile("v41_flash_ep8", 48, 5120, 2304, _tune_v41_flash_ep8),
+    NetworkProfile("v41_flash_ep4", 96, 5120, 2304, _tune_v41_flash_ep4),
 )
 
 
