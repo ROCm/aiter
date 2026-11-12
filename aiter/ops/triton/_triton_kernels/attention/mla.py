@@ -660,6 +660,7 @@ _mla_decode_fwd_reduce_kernel_repr = make_kernel_repr(
         "TILE_SIZE",
         "KV_LORA_RANK",
         "NUM_SEGMENTS_PER_SEQ",
+        "SEGMENTS_P2",
         "ALL_DECODE",
     ],
 )
