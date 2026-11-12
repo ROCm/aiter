@@ -207,6 +207,8 @@ void mla_reduce_v1(
         params.stride_h_o           = final_output.stride(-2);
         params.max_splits           = max(dev_prop.multiProcessorCount, num_kv_splits);
         params.num_reduce_tile      = num_reduce_tile;
+        params.max_seqlen_q         = max_seqlen_q;
+        params.num_kv_splits        = num_kv_splits;
         params.output_lse           = output_lse;
         params.use_reduce_final_map = !no_reduce_final_map;
 
