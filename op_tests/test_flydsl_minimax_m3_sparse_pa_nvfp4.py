@@ -27,7 +27,7 @@ import pandas as pd
 import torch
 
 import aiter
-from aiter.jit.utils.chip_info import get_gfx
+from aiter.jit.utils.chip_info import get_gfx_runtime
 from aiter.ops.flydsl.kernels.minimax_m3_sparse_pa_nvfp4_decode import (
     minimax_m3_sparse_pa_nvfp4_decode,
 )
@@ -306,14 +306,14 @@ def check(name, out, ref, tol=REL_L2_TOL):
     err = rel_l2(out, ref)
     mx = (out.double() - ref).abs().max().item()
     ok = err <= tol and bool(torch.isfinite(out.float()).all())
-    checkAllclose(
+    mismatch = checkAllclose(
         ref.float(),
         out.float(),
         rtol=1e-2,
         atol=2e-2 * ref.abs().max().item(),
         msg=f"{name}: ",
     )
-    return ok, err, mx
+    return ok and mismatch == 0, err, mx
 
 
 @benchmark()
@@ -410,6 +410,50 @@ def padding_rows():
     )
     if bad:
         print("padding rows: FAILED")
+    return bad
+
+
+def refusals():
+    """Arguments the kernel cannot read correctly are refused before launch, each with
+    its own message."""
+    bad = 0
+    c = make_case([500, 700], [1, 1], 1, 16, seed=5)
+    cache, ks = c["cache"], c["k_scale"]
+    cases = [
+        ("splits > MAX_SPLITS", {"splits": 32}, "splits must be"),
+        ("splits 0", {"splits": 0}, "splits must be"),
+        ("strided cache view", {"cache": cache[:, ::2]}, "unit last stride"),
+        ("cache too narrow", {"cache": cache[:, :-1]}, "smaller than its payload"),
+        ("cpu k_scale", {"k_scale": ks.cpu()}, "k_scale and v_scale"),
+        ("fp16 k_scale", {"k_scale": ks.half()}, "k_scale and v_scale"),
+        ("empty k_scale", {"k_scale": ks[:0]}, "k_scale and v_scale"),
+        ("sm_scale 0", {"sm_scale": 0.0}, "sm_scale"),
+        ("sm_scale nan", {"sm_scale": float("nan")}, "sm_scale"),
+        ("cpu q", {"q": c["q"].cpu()}, "CUDA"),
+        (
+            "q over 2 GiB",
+            {"q": torch.empty(2**19 + 1, 16, D, dtype=torch.bfloat16, device="cuda")},
+            "2 GiB",
+        ),
+    ]
+    for name, kw, msg in cases:
+        a = {
+            "q": c["q"], "cache": cache, "sm_scale": SM_SCALE, "k_scale": ks,
+            "v_scale": c["v_scale"], "splits": None, **kw,
+        }  # fmt: skip
+        try:
+            minimax_m3_sparse_pa_nvfp4_decode(
+                a["q"], a["cache"], c["topk"], c["bt"], c["seq_lens"], a["sm_scale"],
+                None, a["k_scale"], a["v_scale"], query_len=1, splits=a["splits"],
+            )  # fmt: skip
+        except (AssertionError, ValueError) as e:
+            if msg in str(e):
+                continue
+            print(f"refusal: {name}: wrong message: {e!r}")
+        else:
+            print(f"refusal: {name} was accepted")
+        bad += 1
+    decode_call(c, 16)  # the largest split count still launches
     return bad
 
 
@@ -580,7 +624,7 @@ def main(argv=None):
         "--perf", action="store_true", help="also run the synthetic M3.1 perf sweep"
     )
     args = ap.parse_args(argv)
-    if not torch.cuda.is_available() or get_gfx() != "gfx950":
+    if not torch.cuda.is_available() or get_gfx_runtime() != "gfx950":
         aiter.logger.info("needs gfx950; skipped")
         return 0
     want = lambda n: not args.case or any(s in n for s in args.case)
@@ -606,6 +650,7 @@ def main(argv=None):
     failed += decode_xcd_grid_agree()
     failed += decode_late_v_agree()
     failed += padding_rows()
+    failed += refusals()
     if args.perf:
         perf = [
             test_decode_perf(r, ql, hkv, g, ctx)
