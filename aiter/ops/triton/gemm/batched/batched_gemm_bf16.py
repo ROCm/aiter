@@ -50,7 +50,12 @@ def batched_gemm_bf16(
         XQ (torch.Tensor): Input batch with shape (B, M, K) (BF16 or FP16).
         WQ (torch.Tensor): Weight batch with shape (B, N, K), internally transposed.
         bias (Optional[torch.Tensor]): Bias batch with shape (B, 1, N).
-        dtype (Optional[torch.dtype]): Output datatype (BF16 or FP16).
+        dtype (Optional[torch.dtype]): Output datatype (BF16, FP16, or FP8
+            float8_e4m3fn, float8_e4m3fnuz, float8_e5m2, float8_e5m2fnuz).
+            FP8 is written with no extra output scale. The Triton epilogue
+            casts the fp32 accumulator directly; the gfx1250 gluon epilogue
+            rounds through bf16 first. The caller keeps values inside the
+            chosen FP8 finite range.
         splitK (Optional[int]): Not supported. Must be None.
         YQ (Optional[torch.Tensor]): Pre-allocated output tensor with shape (B, M, N).
         config (Optional[dict]): Kernel tuning parameters.
@@ -67,6 +72,10 @@ def batched_gemm_bf16(
     assert dtype in [
         torch.bfloat16,
         torch.float16,
+        torch.float8_e4m3fn,
+        torch.float8_e4m3fnuz,
+        torch.float8_e5m2,
+        torch.float8_e5m2fnuz,
     ], f"Output {dtype=} is currently not supported in batched_gemm_bf16"
     assert splitK is None, "Currently, there isn't any support for splitK on Triton"
 
