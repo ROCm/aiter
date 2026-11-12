@@ -777,8 +777,7 @@
     "module_moe_nvfp4": {
         "srcs": [
             "f'{AITER_CSRC_DIR}/kernels/nvfp4_moe/moe_nvfp4_entry.cu'",
-            "f'{AITER_CSRC_DIR}/kernels/nvfp4_moe/moe_nvfp4.cu'",
-            "f'{AITER_CSRC_DIR}/pybind/moe_nvfp4_pybind.cu'"
+            "f'{AITER_CSRC_DIR}/kernels/nvfp4_moe/moe_nvfp4.cu'"
         ],
         "flags_extra_cc": [],
         "flags_extra_hip": [

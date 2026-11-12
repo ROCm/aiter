@@ -8,7 +8,7 @@ file. A registry file joins the parts' Instance arrays into the kernel table.
 """
 
 import argparse
-import csv
+import importlib.util
 import os
 import sys
 
@@ -20,7 +20,14 @@ AITER_DIR = (
 )
 DISPATCH_CSV = f"{AITER_DIR}/configs/moe_nvfp4_dispatch.csv"
 sys.path.insert(0, f"{AITER_DIR}/jit/utils")
-from moe_nvfp4_common import CFG_DEFAULTS, default_names, parse_kernel
+from moe_nvfp4_common import CFG_DEFAULTS, parse_kernel
+
+# The dispatch policy (default rule, CSV) lives with the op; torch-free, by path
+_spec = importlib.util.spec_from_file_location(
+    "moe_nvfp4_dispatch", f"{AITER_DIR}/ops/moe_nvfp4_dispatch.py"
+)
+dispatch = importlib.util.module_from_spec(_spec)
+_spec.loader.exec_module(dispatch)
 
 X_ENUM = {"xreg": "X_REG", "xstream": "X_STREAM", "xres": "X_RESIDENT", "xdma": "X_DMA"}
 
@@ -68,12 +75,6 @@ moe_nvfp4_kernels_launch(int kernel, const Params* hp, int grid_x, int grid_y, h
 """
 
 
-def csv_names(path):
-    """Kernels of the dispatch CSV rows, as written."""
-    with open(path, newline="") as f:
-        return [r[s] for r in csv.DictReader(f) for s in ("stage1", "stage2")]
-
-
 def write(path, text):
     with open(path, "w") as f:
         f.write(text)
@@ -114,6 +115,5 @@ if __name__ == "__main__":
     if args.names:
         generate(args.working_path, args.names.split(","), 1)
     else:
-        generate(
-            args.working_path, csv_names(DISPATCH_CSV) + default_names(), args.parts
-        )
+        names = dispatch.csv_names(DISPATCH_CSV) + dispatch.default_names()
+        generate(args.working_path, names, args.parts)

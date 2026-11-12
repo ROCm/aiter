@@ -118,11 +118,10 @@ NONE_WRAPPED_OP = [
     "get_mla_decode_head_plan_v1",
     "mla_metadata_cluster_multiplier_v1",
     "mla_reduce_v1_supports",
-    # Host-side kernel table queries (a str return has no torch schema)
-    "_moe_nvfp4_cfg_name",
+    # Bound once per NVFP4 MoE JIT module (one torch op name for many modules)
+    "_moe_nvfp4_cfg_index",
     "_moe_nvfp4_cfg_field",
     "_moe_nvfp4_cfg_fits",
-    # custom_build_args selects a per-kernel JIT module (no torch schema)
     "_moe_nvfp4_gemm",
 ]
 

@@ -22,6 +22,8 @@ stage-1 kernels that read the bf16 activations and cast them to f16 themselves
 path; f16 activations use f16 stage-1 kernels). Same weights and scale layouts
 as the main path.
 
+Kernel choice: the tuned CSV, else the default rule (moe_nvfp4_dispatch.py).
+
 Usage:
     w = NvFp4MoeWeights(w13, sc13, w2, sc2, g13, g2)  # once per layer
     y = moe_nvfp4(w, x, topk_ids, topk_w)            # per step
@@ -35,10 +37,8 @@ kernels outside the module).
 """
 
 import contextlib
-import csv
 import functools
 import os
-import re
 import threading
 
 import torch
@@ -47,20 +47,24 @@ from torch import Tensor
 from aiter import logger
 
 from ..jit.core import (
+    AITER_CONFIG_MOE_NVFP4,
     AITER_CSRC_DIR,
     AITER_REBUILD,
-    AITER_ROOT_DIR,
+    JIT_LIB_EXT,
+    _needs_arch_rebuild,
+    build_module,
     compile_ops,
-    rm_module,
+    get_args_of_build,
+    get_user_jit_dir,
 )
-from ..jit.utils.chip_info import get_cu_num
+from ..jit.utils.chip_info import get_cu_num, get_gfx_runtime
 from ..jit.utils.moe_nvfp4_common import (
     MAX_SORT_EXPERTS,
     MAX_SORT_ROWS,
-    default_rows,
     parse_kernel,
-    uses_fallback,
+    scale_gs,
 )
+from .moe_nvfp4_dispatch import default_rows, read_dispatch_csv, uses_fallback
 from .moe_sorting_opus import (
     moe_sorting_opus_fwd,
     moe_sorting_opus_get_workspace_size,
@@ -68,42 +72,11 @@ from .moe_sorting_opus import (
 from .shuffle import shuffle_scale_nvfp4_moe, shuffle_weight
 
 MD_NAME = "module_moe_nvfp4"
-# Rows: cu_num,H,I,E,topk,x_dtype,out_dtype,T,stage1,stage2 (dtypes bf16 / f16). A
-# call takes the first row of its exact key and path (uses_fallback of the row T)
-# with T >= its T; above the last row or without rows, the default rule
-# (aiter/jit/utils/moe_nvfp4_common.py). Kernel names: kernel_name in that file
-# (the name is the config; nvfp4_moe_s1_ / nvfp4_moe_s2_ prefix:
-# the stage), _inbf16 stage 1 for bf16 x on the fallback path, _outbf16 stage 2 for
-# bf16 output atomics, _reduce stage 2 (any output dtype) for the top-k reduce. Only
-# the rows of the device's cu_num are used. A kernel outside module_moe_nvfp4 is
-# JIT-built in its own module (_jit_kernel).
-DISPATCH_CSV = os.getenv(
-    "AITER_CONFIG_MOE_NVFP4",
-    f"{AITER_ROOT_DIR}/aiter/configs/moe_nvfp4_dispatch.csv",
-)
 # Largest grid y (one row per sorted block of BM rows) HIP launches.
 MAX_GRID_Y = 65536
 
 
-@compile_ops(MD_NAME, fc_name="moe_nvfp4_num_cfgs", develop=True)
-def _moe_nvfp4_num_cfgs() -> int: ...
-
-
-@compile_ops(MD_NAME, fc_name="moe_nvfp4_cfg_name", develop=True)
-def _moe_nvfp4_cfg_name(i: int) -> str: ...
-
-
-# Field _KERNEL_FIELDS[k] of kernel i
-@compile_ops(MD_NAME, fc_name="moe_nvfp4_cfg_field", develop=True)
-def _moe_nvfp4_cfg_field(i: int, k: int) -> int: ...
-
-
-# Whether kernel i runs reduction length K
-@compile_ops(MD_NAME, fc_name="moe_nvfp4_cfg_fits", develop=True)
-def _moe_nvfp4_cfg_fits(i: int, K: int) -> bool: ...
-
-
-@compile_ops(MD_NAME, fc_name="moe_nvfp4_sort", develop=True)
+@compile_ops(MD_NAME, fc_name="moe_nvfp4_sort", ffi_type="ctypes")
 def _moe_nvfp4_sort(
     x: Tensor,
     x_f16: Tensor,
@@ -120,11 +93,26 @@ def _moe_nvfp4_sort(
 ) -> None: ...
 
 
-@compile_ops(MD_NAME, fc_name="moe_nvfp4_reduce", develop=True)
+@compile_ops(MD_NAME, fc_name="moe_nvfp4_reduce", ffi_type="ctypes")
 def _moe_nvfp4_reduce(ws: Tensor, out: Tensor, topk: int) -> None: ...
 
 
-@compile_ops(MD_NAME, fc_name="moe_nvfp4_gemm", develop=True)
+# The entries below are bound per JIT module by _module_ops: module_moe_nvfp4 or the
+# module of one kernel (_jit_module).
+
+
+# Index of kernel name in the module's kernel table, -1 if it has none
+def _moe_nvfp4_cfg_index(name: str) -> int: ...
+
+
+# Field _KERNEL_FIELDS[k] of kernel i
+def _moe_nvfp4_cfg_field(i: int, k: int) -> int: ...
+
+
+# 1 if kernel i runs reduction length K, else 0
+def _moe_nvfp4_cfg_fits(i: int, K: int) -> int: ...
+
+
 def _moe_nvfp4_gemm(
     kernel: int,
     x: Tensor,
@@ -146,17 +134,25 @@ def _moe_nvfp4_gemm(
 ) -> None: ...
 
 
+@functools.cache
+def _module_ops(md: str) -> dict:
+    """ctypes callers of the per-module entries of JIT module md, by stub name."""
+    stubs = (_moe_nvfp4_cfg_index, _moe_nvfp4_cfg_field, _moe_nvfp4_cfg_fits)
+    stubs += (_moe_nvfp4_gemm,)
+    return {
+        f.__name__: compile_ops(md, fc_name=f.__name__[1:], ffi_type="ctypes")(f)
+        for f in stubs
+    }
+
+
 # Kernel fields read by _moe_nvfp4_cfg_field, in CfgField order (moe_nvfp4_entry.h)
 _KERNEL_FIELDS = (
     "s1", "m_tiles", "n_tiles", "waves", "gs", "inbf16", "outbf16", "reduce"
 )  # fmt: skip
 
 _LOCK = threading.Lock()
-# kernel name -> kernel index and launch fields
-_KERNELS: dict[str, dict] | None = None
-_DEVICES: set[int] = set()
-# DISPATCH_CSV rows (_read_dispatch_csv), loaded by prepare
-_DISPATCH: dict[tuple, tuple] = {}
+# Tuned CSV rows (read_dispatch_csv), loaded by prepare
+_DISPATCH: dict[tuple, tuple] | None = None
 # keys of the default-rule picks already logged by _pick
 _WARNED: set[tuple] = set()
 
@@ -184,115 +180,88 @@ def _gfx950_archs():
             os.environ["GPU_ARCHS"] = archs
 
 
-def _kernel_entry(i: int, build: dict | None = None) -> dict:
-    """Kernel table entry of kernel i of module_moe_nvfp4, or of the module of the
-    custom_build_args build."""
+def _kernel_entry(md: str, name: str) -> dict | None:
+    """Kernel table entry of kernel name in JIT module md (its launch and K-fit
+    callers and launch fields), None if md has no such kernel."""
+    ops = _module_ops(md)
+    with _gfx950_archs():
+        i = ops["_moe_nvfp4_cfg_index"](name)
+    if i < 0:
+        return None
     fields = {
-        f: _moe_nvfp4_cfg_field(i, k, custom_build_args=build)
-        for k, f in enumerate(_KERNEL_FIELDS)
+        f: ops["_moe_nvfp4_cfg_field"](i, k) for k, f in enumerate(_KERNEL_FIELDS)
     }
-    name = _moe_nvfp4_cfg_name(i, custom_build_args=build)
     stage = kernel_stage(name)
     if stage != (1 if fields.pop("s1") else 2):
         raise RuntimeError(f"NVFP4 MoE kernel {name} is built for the other stage")
-    return {"idx": i, "build": build, "name": name, "stage": stage, **fields}
+    return {
+        "idx": i,
+        "md": md,
+        "name": name,
+        "stage": stage,
+        "gemm": ops["_moe_nvfp4_gemm"],
+        "fits": functools.partial(ops["_moe_nvfp4_cfg_fits"], i),
+        **fields,
+    }
 
 
-def _build_kernels() -> dict[str, dict]:
-    with _gfx950_archs():
-        n = _moe_nvfp4_num_cfgs()
-    out = {}
-    for i in range(n):
-        kernel = _kernel_entry(i)
-        if kernel["name"] in out:
-            raise RuntimeError(f"duplicate NVFP4 MoE kernel {kernel['name']}")
-        out[kernel["name"]] = kernel
-    return out
+def _jit_module(name: str) -> str:
+    """JIT module of one kernel outside module_moe_nvfp4 (module_moe_nvfp4 sources,
+    instances of that kernel only), built on first use, then cached on disk."""
+    md = f"module_moe_nvfp4_k_{name}"
+    so = os.path.join(get_user_jit_dir(), f"{md}{JIT_LIB_EXT}")
+    if AITER_REBUILD or not os.path.exists(so) or _needs_arch_rebuild(md):
+        d = get_args_of_build(MD_NAME)
+        gen = f"{AITER_CSRC_DIR}/kernels/nvfp4_moe/gen_instances.py"
+        with _gfx950_archs():
+            build_module(
+                md,
+                d["srcs"],
+                d["flags_extra_cc"],
+                d["flags_extra_hip"],
+                [f"{gen} --working_path {{}} --names {name}"],
+                d["extra_include"],
+                d["extra_ldflags"],
+                d["verbose"],
+                d["is_python_module"],
+                d["is_standalone"],
+                True,
+                d.get("third_party", []),
+            )
+    return md
 
 
 @functools.cache
-def _jit_kernel(name: str) -> dict:
-    """Kernel table entry of a kernel outside module_moe_nvfp4, from its own JIT
-    module (built on first use, then cached on disk)."""
-    parse_kernel(name)  # a bad name: ValueError before any build
-    md = f"module_moe_nvfp4_k_{name}"
-    if AITER_REBUILD:
-        # compile_ops rebuilds only the default module (module_moe_nvfp4)
-        rm_module(md)
-    gen = f"{AITER_CSRC_DIR}/kernels/nvfp4_moe/gen_instances.py"
-    cmd = f"{gen} --working_path {{}} --names {name}"
-    with _gfx950_archs():
-        return _kernel_entry(0, {"md_name": md, "blob_gen_cmd": [cmd]})
+def _main_kernel(name: str) -> dict | None:
+    return _kernel_entry(MD_NAME, name)
 
 
+@functools.cache
 def _kernel(name: str) -> dict:
-    return _KERNELS.get(name) or _jit_kernel(name)
+    """Kernel table entry of a kernel of module_moe_nvfp4, else of its own module."""
+    parse_kernel(name)  # a bad name: ValueError before any build
+    kernel = _main_kernel(name) or _kernel_entry(_jit_module(name), name)
+    if kernel is None:
+        raise RuntimeError(f"NVFP4 MoE: kernel {name} missing from its JIT module")
+    return kernel
 
 
-def _read_dispatch_csv(path: str, cu_num: int) -> dict[tuple, tuple]:
-    """DISPATCH_CSV rows of cu_num: {(H, I, E, topk, x_dtype, out_dtype): ((T,
-    stage-1, stage-2), ...)}. Raises ValueError for a kernel name that does not
-    match the row dtypes and path (_inbf16 stage 1 iff bf16 x on the fallback
-    path; stage 2: _reduce, or _outbf16 iff bf16 output)."""
-    out: dict[tuple, list] = {}
-    with open(path, newline="") as f:
-        for r in csv.DictReader(f):
-            if int(r["cu_num"]) != cu_num:
-                continue
-            key = (int(r["H"]), int(r["I"]), int(r["E"]), int(r["topk"]))
-            key += (r["x_dtype"], r["out_dtype"])
-            t, s1, s2 = int(r["T"]), r["stage1"], r["stage2"]
-            fb = uses_fallback(t, key[3], key[2])
-            ok1 = s1.endswith("_inbf16") == (fb and key[4] == "bf16")
-            atomics = not s2.endswith("_reduce")
-            ok2 = not atomics or s2.endswith("_outbf16") == (key[5] == "bf16")
-            if not (ok1 and ok2):
-                raise ValueError(
-                    f"{path}: {key} T={t}: kernel names do not match the dtypes"
-                    f" and path ({'fallback' if fb else 'main'})"
-                )
-            out.setdefault(key, []).append((t, s1, s2))
-    return {k: tuple(sorted(v)) for k, v in out.items()}
-
-
-def prepare(
-    device: torch.device | int | None = None,
-) -> dict[str, dict]:
-    """Check that ``device`` is gfx950, build/load the module and return the
-    kernel table, keyed by kernel name. Call outside graph capture."""
-    global _KERNELS, _DISPATCH
-    if isinstance(device, torch.device):
-        device = device.index
-    if device is None:
-        device = torch.cuda.current_device()
-    dev = torch.device("cuda", device)
+def prepare(device: torch.device | int | None = None) -> None:
+    """Check that the GPU is gfx950, build/load module_moe_nvfp4 and read the tuned
+    CSV. Call outside graph capture."""
+    global _DISPATCH
     with _LOCK:
-        if dev.index not in _DEVICES:
-            arch = torch.cuda.get_device_properties(dev).gcnArchName.split(":")[0]
-            if arch != "gfx950":
-                raise RuntimeError(f"NVFP4 MoE kernels need gfx950, got {arch}")
-            _DEVICES.add(dev.index)
-        if _KERNELS is None:
-            with torch.cuda.device(dev):
-                kernels = _build_kernels()
-            dispatch = _read_dispatch_csv(DISPATCH_CSV, get_cu_num())
-            for table in dispatch.values():
-                _check_dispatch(table)
-            with torch.cuda.device(dev):
-                # JIT build / load of the fallback path's sort, outside capture
-                moe_sorting_opus_get_workspace_size(1, 1, 1)
-            _DISPATCH = dispatch
-            _KERNELS = kernels
-    return _KERNELS
-
-
-def _check_dispatch(table: tuple) -> None:
-    """Kernel names ([a-z0-9_]) with the stage prefix of their column (rows run as
-    written; a kernel outside the module is JIT-built by _tables)."""
-    for _, c1, c2 in table:
-        for stage, name in ((1, c1), (2, c2)):
-            if not re.fullmatch(r"[a-z0-9_]+", name) or kernel_stage(name) != stage:
-                raise ValueError(f"NVFP4 MoE dispatch: {name!r} is not stage {stage}")
+        if _DISPATCH is not None:
+            return
+        arch = get_gfx_runtime()
+        if arch != "gfx950":
+            raise RuntimeError(f"NVFP4 MoE kernels need gfx950, got {arch}")
+        _kernel_entry(MD_NAME, "")  # JIT build / load (no kernel is named "")
+        dispatch = read_dispatch_csv(AITER_CONFIG_MOE_NVFP4, get_cu_num())
+        with torch.cuda.device(device):
+            # JIT build / load of the fallback path's sort, outside capture
+            moe_sorting_opus_get_workspace_size(1, 1, 1)
+        _DISPATCH = dispatch
 
 
 def _n_group(kernel):
@@ -306,14 +275,12 @@ def _round8(n):
 
 
 def _first_fit(names: list, K: int, N: int):
-    """The first built kernel of names that runs reduction length K and whose N group
-    divides the N / 16 output tiles, else None."""
+    """The first kernel of names in module_moe_nvfp4 that runs reduction length K and
+    whose N group divides the N / 16 output tiles, else None."""
     for n in names:
-        kernel = _KERNELS.get(n)
-        if kernel is None:
-            continue
-        if (N // 16) % _n_group(kernel) == 0 and _moe_nvfp4_cfg_fits(kernel["idx"], K):
-            return n
+        kernel = _main_kernel(n)
+        if kernel and (N // 16) % _n_group(kernel) == 0 and kernel["fits"](K):
+            return kernel
     return None
 
 
@@ -328,50 +295,79 @@ def _check_shape(H: int, I: int) -> None:
         raise ValueError(f"NVFP4 MoE: I={I}: odd I / 128 is supported for 3 only")
 
 
+def _check_row(key: tuple, t: int, kernel1: dict, kernel2: dict) -> None:
+    """Raises ValueError for a tuned CSV row whose kernels cannot run its shape:
+    another BM per stage (one sort serves both), a scale group size other than
+    scale_gs of the stage K (the weight layout), an N group that does not divide
+    the N / 16 output tiles, or a kernel that does not run the stage K."""
+    H, I = key[:2]
+    if kernel1["m_tiles"] != kernel2["m_tiles"]:
+        raise ValueError(
+            f"NVFP4 MoE dispatch {key} token={t}: stage-1 BM"
+            f" {16 * kernel1['m_tiles']} != stage-2 BM {16 * kernel2['m_tiles']}"
+        )
+    for kernel, K, N in ((kernel1, H, I), (kernel2, I, H)):
+        bad = None
+        if kernel["gs"] != scale_gs(K // 128):
+            gs = scale_gs(K // 128)
+            bad = f"scale GS {kernel['gs']}, the K={K} weights have GS {gs}"
+        elif (N // 16) % _n_group(kernel):
+            bad = f"N group {16 * _n_group(kernel)} does not divide N={N}"
+        elif not kernel["fits"](K):
+            bad = f"does not run K={K}"
+        if bad:
+            raise ValueError(
+                f"NVFP4 MoE dispatch {key} token={t}: {kernel['name']}: {bad}"
+            )
+
+
 def _default_table(H: int, I: int, x_dtype: str, out_dtype: str, fallback: bool):
     """default_rows with the first fitting kernel per stage; a row without kernels
     for both stages is dropped."""
     rows = []
     for t, s1, s2 in default_rows(H, I, x_dtype, out_dtype, fallback):
-        c1, c2 = _first_fit(s1, H, I), _first_fit(s2, I, H)
-        if c1 and c2:
-            rows.append((t, _KERNELS[c1], _KERNELS[c2]))
+        kernel1, kernel2 = _first_fit(s1, H, I), _first_fit(s2, I, H)
+        if kernel1 and kernel2:
+            rows.append((t, kernel1, kernel2))
     if not rows:
         raise ValueError(f"NVFP4 MoE: no kernels for I={I}, H={H}")
     return tuple(rows)
 
 
 @functools.cache
-def _tables(H: int, I: int, E: int, topk: int, x_dtype: str, out_dtype: str) -> dict:
+def _tables(H: int, I: int, E: int, topk: int, dtype: str) -> dict:
     """{fallback: (CSV rows, default-rule rows)} of a key, (T, stage-1 kernel,
     stage-2 kernel) rows. Both paths are resolved on the first call of a key. CSV
-    rows: the DISPATCH_CSV rows of the key on the path of their own T."""
+    rows: the tuned CSV rows of the key on the path of their own T (_check_row)."""
     _check_shape(H, I)
+    key = (H, I, E, topk, dtype)
     out = {}
     for fb in (False, True):
         rows = []
-        for t, c1, c2 in _DISPATCH.get((H, I, E, topk, x_dtype, out_dtype), ()):
+        for t, c1, c2 in _DISPATCH.get(key, ()):
             if uses_fallback(t, topk, E) == fb:
-                rows.append((t, _kernel(c1), _kernel(c2)))
-        out[fb] = (tuple(rows), _default_table(H, I, x_dtype, out_dtype, fb))
+                kernel1, kernel2 = _kernel(c1), _kernel(c2)
+                _check_row(key, t, kernel1, kernel2)
+                rows.append((t, kernel1, kernel2))
+        out[fb] = (tuple(rows), _default_table(H, I, dtype, dtype, fb))
     return out
 
 
-def _pick(W, T: int, topk: int, x_dtype: str, fallback: bool) -> tuple[dict, dict]:
+def _pick(W, T: int, topk: int, dtype: str, fallback: bool) -> tuple[dict, dict]:
     """(stage-1, stage-2) kernel table entries: the first CSV row of the path with
     T <= its T, else the first default-rule row with T <= its T, else its last row.
     A default-rule pick is logged once per shape, path and next-power-of-two T."""
-    csv_rows, rule = _tables(W.H, W.I, W.E, topk, x_dtype, x_dtype)[fallback]
+    csv_rows, rule = _tables(W.H, W.I, W.E, topk, dtype)[fallback]
     for t, kernel1, kernel2 in csv_rows:
         if T <= t:
             return kernel1, kernel2
     kernel1, kernel2 = next(((c1, c2) for t, c1, c2 in rule if T <= t), rule[-1][1:])
-    key = (W.H, W.I, W.E, topk, x_dtype, fallback, 1 << (T - 1).bit_length())
+    key = (W.H, W.I, W.E, topk, dtype, fallback, 1 << (T - 1).bit_length())
     if key not in _WARNED:
         _WARNED.add(key)
         logger.warning(
             f"[moe_nvfp4] no tuned row for T={T} (bucket {key[-1]}; H={W.H} I={W.I}"
-            f" E={W.E} topk={topk} x={x_dtype} out={x_dtype}"
+            f" E={W.E} topk={topk} dtype={dtype}"
             f" path={'fallback' if fallback else 'main'}, tuned up to"
             f" T={csv_rows[-1][0] if csv_rows else 'none'}); using default rule:"
             f" s1={kernel1['name']} s2={kernel2['name']}"
@@ -474,26 +470,13 @@ def _fused_moe_nvfp4(req) -> Tensor:
 
 
 def _gemm(kernel, sort, T, topk, E, x, w, w_sc, inv_gs, out, K, ntiles, n_out):
-    """One GEMM stage of kernel on the sorted rows (sort: the sort buffers by name)."""
+    """One GEMM stage of kernel on the sorted rows (sort: the four sort buffers)."""
     BM = 16 * kernel["m_tiles"]
     n = T * topk
-    _moe_nvfp4_gemm(
-        kernel=kernel["idx"],
-        x=x,
-        w=w,
-        w_sc=w_sc,
-        inv_gs=inv_gs,
-        **sort,
-        out=out,
-        T=T,
-        topk=topk,
-        K=K,
-        ntiles=ntiles,
-        n_out=n_out,
-        grid_x=n_out // 16 // _n_group(kernel),
-        grid_y=_round8(min(E, n) + (n + BM - 1) // BM),
-        custom_build_args=kernel["build"],
-    )
+    kernel["gemm"](
+        kernel["idx"], x, w, w_sc, inv_gs, *sort, out, T, topk, K, ntiles, n_out,
+        n_out // 16 // _n_group(kernel), _round8(min(E, n) + (n + BM - 1) // BM),
+    )  # fmt: skip
 
 
 def moe_nvfp4(
@@ -593,12 +576,7 @@ def moe_nvfp4(
             W.E, BM, nblk,
         )  # fmt: skip
         x1 = x_f16 if bf16 else x
-    sort = {
-        "sorted_ids": sorted_ids,
-        "sorted_w": sorted_w,
-        "sorted_eids": sorted_eids,
-        "num_valid": num_valid,
-    }
+    sort = (sorted_ids, sorted_w, sorted_eids, num_valid)
     # stage 1: x [T, H] -> x_inter [T * topk, I], stage 2: x_inter -> acc
     _gemm(kernel1, sort, T, topk, W.E, x1, W.w13, W.s13, W.g13, x_inter,
           K=W.H, ntiles=2 * W.I // 16, n_out=W.I)  # fmt: skip

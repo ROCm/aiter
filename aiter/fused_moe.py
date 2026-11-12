@@ -1631,6 +1631,14 @@ def _fused_moe_impl(
     _validate_output_buffer_no_overlap(output, hidden_states)
     quant_type = quant_remap.get(quant_type, quant_type)
     q_dtype_w = w1.dtype
+    if (w1_global_scale is not None or w2_global_scale is not None) and (
+        q_dtype_w != dtypes.fp4x2 or gate_mode != GateMode.SEPARATED
+    ):
+        raise ValueError(
+            "w1_global_scale / w2_global_scale (NVFP4 MoE) need fp4x2 weights and"
+            f" gate_mode={GateMode.SEPARATED.value!r}, got {q_dtype_w} and"
+            f" {gate_mode.value!r}"
+        )
     q_dtype_a = resolve_activation_dtype(
         quant_type,
         q_dtype_w,
