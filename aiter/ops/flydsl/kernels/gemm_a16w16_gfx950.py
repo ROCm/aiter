@@ -60,6 +60,7 @@ class GemmA16W16Gfx950Param:
     mma_m: fx.Constexpr[int]
     mma_n: fx.Constexpr[int]
     mma_k: fx.Constexpr[int]
+    unroll_lds_ring: fx.Constexpr[bool]
     # derived params
     async_load_bytes: fx.Constexpr[int]
     in_data_bytes: fx.Constexpr[int]
@@ -118,6 +119,7 @@ def make_gemm_a16w16_gfx950_param(
     mma_k: int = 32,
     k_stagger: int = 0,
     b_non_temporal: bool = False,
+    unroll_lds_ring: bool = False,
 ) -> GemmA16W16Gfx950Param:
     if in_dtype_id not in (GEMM_A16W16_DTYPE_BF16, GEMM_A16W16_DTYPE_FP16):
         raise ValueError(f"unsupported in_dtype_id={in_dtype_id}")
@@ -277,6 +279,7 @@ def make_gemm_a16w16_gfx950_param(
             f"covered_k={mma_k_repeat * k_waves * mma_k}"
         )
     return GemmA16W16Gfx950Param(
+        unroll_lds_ring=unroll_lds_ring,
         in_dtype_id=in_dtype_id,
         out_dtype_id=out_dtype_id,
         block_m=block_m,
@@ -324,6 +327,9 @@ def make_gemm_a16w16_gfx950_kernel_name(param: GemmA16W16Gfx950Param):
     b_layout = "t" if param.b_is_transposed else "n"
     name += f"_l{a_layout}{b_layout}"
     name += "_phti" if param.use_half_tile_interleaved else "_pft"
+    # Kernel bodies do not participate in FlyDSL's disk-cache key. Distinguish
+    # the static-ring implementation from previously cached dynamic-ring code.
+    name += "_ring5" if param.unroll_lds_ring else ""
     return name
 
 
@@ -777,7 +783,26 @@ def gemm_a16w16_gfx950_kernel(
     rocdl.sched_barrier(0)
 
     main_loop_end = k_tiles - (stages - 1)
-    for k_tile in range(0, main_loop_end, 1):
+    if const_expr(param.unroll_lds_ring):
+        # Iterate complete LDS-ring cycles with compile-time read/write slots.
+        # This removes per-tile ring-index/address arithmetic without changing
+        # K order, asyncmark groups, wait counts, or the workgroup barriers.
+        full_cycles_end = main_loop_end // stages * stages
+        for cycle in range(0, full_cycles_end, stages):
+            for phase in range_constexpr(stages):
+                write_stage = (phase + stages - 1) % stages
+                rocdl.wait_asyncmark(stages - 2)
+                rocdl.s_barrier()
+                async_load_b_to_lds(cycle + phase + stages - 1, write_stage)
+                async_load_a_to_lds(cycle + phase + stages - 1, write_stage)
+                rocdl.asyncmark()
+                compute_stage(phase, cycle + phase)
+                rocdl.sched_barrier(0)
+        residual_begin = full_cycles_end
+    else:
+        residual_begin = 0
+    # The original loop handles both the residual tiles and untuned policies.
+    for k_tile in range(residual_begin, main_loop_end, 1):
         current_stage = k_tile % stages
         write_stage = (current_stage + stages - 1) % stages
         rocdl.wait_asyncmark(stages - 2)
@@ -1431,12 +1456,41 @@ set_slp_vectorize_once_used(gemm_a16w16_gfx950, False)
 def _gemm_a16w16_gfx950_param_for(items):
     # Building the param struct coerces every field through FlyDSL's typing
     # layer, which costs more host time than the launch itself; it depends
-    # only on the config, so one struct per config serves every M.
+    # only on the config and selected schedule, not on the exact M value.
     return make_gemm_a16w16_gfx950_param(**dict(items))
+
+
+def _use_unrolled_lds_ring(m, n, k, kwargs):
+    # Measured latent-projection specialization, including padded-M consumers.
+    # Short-K consumers of the same tile did not benefit: keep their old code.
+    return (
+        65 <= m <= 128
+        and (n, k) == (7168, 3584)
+        and kwargs.get("in_dtype_id") == GEMM_A16W16_DTYPE_BF16
+        and kwargs.get("out_dtype_id") == GEMM_A16W16_DTYPE_BF16
+        and not kwargs.get("has_bias", False)
+        and not kwargs.get("a_is_transposed", False)
+        and kwargs.get("b_is_transposed", True)
+        and not kwargs.get("use_half_tile_interleaved", False)
+        and not kwargs.get("b_non_temporal", False)
+        and kwargs.get("k_stagger", 0) == 0
+        and kwargs.get("group_m", 0) == 0
+        and kwargs.get("split_k", 1) == 1
+        and kwargs.get("block_m") == 64
+        and kwargs.get("block_n") == 64
+        and kwargs.get("block_k") == 64
+        and kwargs.get("stages") == 5
+        and kwargs.get("m_waves") == 2
+        and kwargs.get("n_waves") == 2
+        and kwargs.get("k_waves", 1) == 1
+    )
 
 
 def make_gemm_a16w16_param_and_validate(m, n, k, kwargs):
     result = None
+    # Include the shape-dependent schedule in the constexpr parameter/cache key.
+    # Do not mutate caller policy dictionaries or expose an unchecked override.
+    kwargs = {**kwargs, "unroll_lds_ring": _use_unrolled_lds_ring(m, n, k, kwargs)}
     try:
         result = _gemm_a16w16_gfx950_param_for(tuple(sorted(kwargs.items())))
     except Exception:  # noqa: BLE001 - invalid policies are filtered here

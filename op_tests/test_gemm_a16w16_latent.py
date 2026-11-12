@@ -156,10 +156,81 @@ def test_latent_gemm(m, n, k, seed):
     return ret
 
 
+def check_ring_specialization():
+    from aiter.ops.flydsl.kernels.gemm_a16w16_gfx950 import (
+        _use_unrolled_lds_ring,
+        make_gemm_a16w16_gfx950_kernel_name,
+        make_gemm_a16w16_param_and_validate,
+    )
+
+    cfg = {
+        "in_dtype_id": 2,
+        "out_dtype_id": 2,
+        "block_m": 64,
+        "block_n": 64,
+        "block_k": 64,
+        "stages": 5,
+        "split_k": 1,
+        "m_waves": 2,
+        "n_waves": 2,
+        "k_waves": 1,
+        "group_m": 0,
+        "use_half_tile_interleaved": False,
+        "a_is_transposed": False,
+        "b_is_transposed": True,
+        "has_bias": False,
+    }
+
+    original = cfg.copy()
+    selected = []
+    for m in range(1, 257):
+        want = 65 <= m <= 128
+        assert _use_unrolled_lds_ring(m, 7168, 3584, cfg) == want
+        param = make_gemm_a16w16_param_and_validate(m, 7168, 3584, cfg)
+        assert param is not None
+        name = make_gemm_a16w16_gfx950_kernel_name(param)
+        assert name.endswith("_ring5") == want
+        selected.append(param)
+    # One specialization per policy, not one binary per exact padded M.
+    assert selected[64] is selected[127]
+    assert selected[63] is selected[128]
+    assert selected[63] is not selected[64]
+    for n, k in ((7168, 512), (7168, 3520), (7160, 3584)):
+        assert not _use_unrolled_lds_ring(128, n, k, cfg)
+    for field, value in (
+        ("in_dtype_id", 3),
+        ("out_dtype_id", 1),
+        ("has_bias", True),
+        ("a_is_transposed", True),
+        ("b_is_transposed", False),
+        ("use_half_tile_interleaved", True),
+        ("b_non_temporal", True),
+        ("k_stagger", 1),
+        ("group_m", 4),
+        ("split_k", 2),
+        ("block_m", 128),
+        ("block_n", 128),
+        ("block_k", 128),
+        ("stages", 7),
+        ("m_waves", 4),
+        ("n_waves", 4),
+        ("k_waves", 2),
+    ):
+        assert not _use_unrolled_lds_ring(128, 7168, 3584, {**cfg, field: value})
+    # A caller-provided override must not broaden the internal specialization.
+    param = make_gemm_a16w16_param_and_validate(
+        128, 7168, 512, {**cfg, "unroll_lds_ring": True}
+    )
+    assert not make_gemm_a16w16_gfx950_kernel_name(param).endswith("_ring5")
+    assert cfg == original
+    aiter.logger.info("LDS-ring shape/config/cache specialization checks passed")
+
+
 def main():
     if get_gfx_runtime() != "gfx950":
         aiter.logger.warning("This tuning qualification targets gfx950; skipping")
         return
+    check_ring_specialization()
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
         "-s", "--mnk", nargs="+", type=aiter.dtypes.str2tuple, default=SHAPES
