@@ -9,7 +9,7 @@ One public entry per KV layout: the name carries the layout (the model version t
 introduced it) and the tensors' dtypes carry the precision, so a new precision of a
 layout is a new dtype case, not a new entry.
 
-* :func:`mla_sparse_prefill`     -- unscaled rows (bf16/fp16): opus.
+* :func:`mla_sparse_prefill`     -- unscaled rows (bf16): opus.
 * :func:`mla_sparse_prefill_v4`  -- v4: NoPE with its E8M0 scales in the row, plus bf16
   RoPE (NoPE fp8): asm on gfx1250 with H == 128 (opus if it declines), else opus.
 * :func:`mla_sparse_prefill_v41` -- v4.1: rows with separate ``[*, 16]`` E8M0 scales
@@ -262,23 +262,29 @@ _MAX_KV_SPLITS = 32
 _ANY_COUNT = tuple(range(2, _MAX_KV_SPLITS + 1))
 # Split counts a gfx1250 v4.1 cluster folds in-kernel.
 _CLUSTER_COUNT = (2, 4, 8, 16)
+# Split counts the gfx1250 v4 16mx1 and fp8 32mx1 fits were measured on.
+_FIT_COUNT = (2, 3, 4, 6, 8, 12, 16)
 
 # (arch, kernel) -> fit over H 16-128, topk 384-4096 and N 8-768 on gfx950, topk 512-4096 and
-# N 8-256 on gfx1250. v41_a8w4_16mx1_16nx4 reuses the v41_a8w8 fit.
+# N 8-512 on gfx1250. v41_a8w4_16mx1_16nx4 reuses the v41_a8w8 fit.
 _KV_SPLIT_FIT = {
     ("gfx950", "v4_a16w16_16mx1_16nx4"): _SplitFit(16, 64, 2, _ANY_COUNT, 90, 0.043),
-    ("gfx950", "v4_a16w16_16mx8_32nx1"): _SplitFit(128, 32, 1, _ANY_COUNT, 0, 0.012),
+    ("gfx950", "v4_a16w16_32mx4_32nx1"): _SplitFit(128, 32, 1, _ANY_COUNT, 150, 0.014),
     ("gfx950", "v4_a8w8_16mx1_16nx4"): _SplitFit(16, 64, 2, _ANY_COUNT, 55, 0.022),
-    ("gfx950", "v4_a8w8_16mx8_32nx1"): _SplitFit(128, 32, 1, _ANY_COUNT, 0, 0.0095),
+    ("gfx950", "v4_a8w8_32mx4_32nx1"): _SplitFit(128, 32, 1, _ANY_COUNT, 150, 0.014),
     ("gfx950", "v41_a8w8_16mx1_16nx4"): _SplitFit(16, 64, 2, _ANY_COUNT, 80, 0.046),
     ("gfx950", "v41_a8w8_16mx4_64nx1"): _SplitFit(64, 64, 1, _ANY_COUNT, 90, 0.025),
     ("gfx950", "v41_a8w4_16mx1_16nx4"): _SplitFit(16, 64, 2, _ANY_COUNT, 80, 0.046),
     ("gfx950", "v41_a8w4_16mx4_64nx1"): _SplitFit(64, 64, 1, _ANY_COUNT, 250, 0.012),
-    ("gfx1250", "v4_a16w16_16mx1_16nx4"): _SplitFit(16, 64, 1, _ANY_COUNT, 0, 0.10),
+    ("gfx1250", "v4_a16w16_16mx1_16nx4"): _SplitFit(16, 64, 1, _FIT_COUNT, 250, 0.08),
     ("gfx1250", "v4_a16w16_32mx1_16nx4"): _SplitFit(32, 64, 1, _ANY_COUNT, 200, 0.06),
     ("gfx1250", "v4_a16w16_16mx4_64nx1"): _SplitFit(64, 64, 1, _ANY_COUNT, 150, 0.06),
-    ("gfx1250", "v4_a8w8_16mx1_16nx4"): _SplitFit(16, 64, 1, _ANY_COUNT, 200, 0.12),
-    ("gfx1250", "v4_a8w8_32mx1_16nx4"): _SplitFit(32, 64, 1, _ANY_COUNT, 200, 0.06),
+    ("gfx1250", "v4_a8w8_16mx1_16nx4"): _SplitFit(
+        16, 64, 2, _FIT_COUNT, 350, 0.06, 1.25
+    ),
+    ("gfx1250", "v4_a8w8_32mx1_16nx4"): _SplitFit(
+        32, 64, 2, _FIT_COUNT, 200, 0.04, 1.25
+    ),
     ("gfx1250", "v4_a8w8_16mx4_64nx1"): _SplitFit(64, 64, 1, _ANY_COUNT, 200, 0.06),
     ("gfx1250", "v41_a8w8_16mx1_16nx4"): _SplitFit(
         16, 64, 2, _CLUSTER_COUNT, 275, 0.03, 1.75
@@ -297,7 +303,7 @@ def _opus_split_fit(gfx: str, kernel: str, h: int) -> _SplitFit:
     elif kernel in ("v41_a8w8", "v41_a8w4"):
         tile = "16mx1_16nx4" if h <= 16 else "16mx4_64nx1"
     else:
-        tile = "16mx1_16nx4" if h <= 32 else "16mx8_32nx1"
+        tile = "16mx1_16nx4" if h <= 32 else "32mx4_32nx1"
     return _KV_SPLIT_FIT[(gfx, f"{kernel}_{tile}")]
 
 
@@ -365,12 +371,8 @@ def _opus_sparse_prefill(
         opus_mla_v4_prefill_a16w16_gfx1250_fwd,
     )
 
-    if q.dtype not in (torch.bfloat16, torch.float16):
-        raise RuntimeError(f"expects fp16/bf16 q, got {q.dtype}")
-    if gfx == "gfx1250" and q.dtype != torch.bfloat16:
-        raise RuntimeError(
-            f"the gfx1250 code object only provides the bf16 variant, got {q.dtype}"
-        )
+    if q.dtype != torch.bfloat16:
+        raise RuntimeError(f"expects bf16 q, got {q.dtype}")
     if unified_kv.dtype != q.dtype:
         raise RuntimeError(
             f"unified_kv dtype mismatch: unified_kv={unified_kv.dtype}, q={q.dtype}"
@@ -646,10 +648,10 @@ def mla_sparse_prefill(
     num_kv_splits: int | None = None,
     backend: str | None = None,
 ) -> torch.Tensor:
-    """MLA sparse prefill over bf16/fp16 Q/KV (D = 512).
+    """MLA sparse prefill over bf16 Q/KV (D = 512).
 
     Args:
-      q:                 ``[T, H, D]`` bf16/fp16 query.
+      q:                 ``[T, H, D]`` bf16 query.
       unified_kv:        ``[total_pages, D]`` prefix source, same dtype as ``q``.
       kv_indices_prefix: ``[total_prefix]`` int32 row indices into
         ``unified_kv``, concatenated per token.
@@ -813,8 +815,56 @@ def _mla_sparse_prefill_v41_fake(
     return torch.empty((t, h, 512), dtype=torch.bfloat16, device=q.device)
 
 
+# Routed below the backend pin, as `mla_sparse_prefill` is. `backend` picks
+# which implementation AITER runs -- a question the dispatcher settles before
+# the op begins. A provider has its own kernel, not a choice of AITER's, so a
+# contract carrying the pin would have it decline every call that passes one.
+#
+# Version 2: v1 was this signature WITH `backend` in it. A v1 provider was
+# built for fifteen arguments and a v2 call offers fourteen, so v1 is not
+# superseded -- the arity check rejecting it is the correct outcome.
+@_route(op="mla_sparse_prefill_v41", version=2)
+def _mla_sparse_prefill_v41_routed(
+    q: torch.Tensor,
+    q_scale: torch.Tensor,
+    unified_kv: torch.Tensor,
+    unified_kv_scale: torch.Tensor,
+    kv_indices_prefix: torch.Tensor,
+    kv_indptr_prefix: torch.Tensor,
+    kv: torch.Tensor,
+    kv_scale: torch.Tensor,
+    kv_indices_extend: torch.Tensor,
+    kv_indptr_extend: torch.Tensor,
+    attn_sink: torch.Tensor | None,
+    softmax_scale: float,
+    out: torch.Tensor | None = None,
+    num_kv_splits: int | None = None,
+) -> torch.Tensor:
+    """MLA v4.1 sparse prefill, below the backend pin.
+
+    Shapes and meanings are those of :func:`mla_sparse_prefill_v41`, minus its
+    ``backend`` argument. ``out`` is written when given and returned either
+    way, so a provider returns what it wrote.
+    """
+    return _opus_sparse_prefill_v41(
+        q,
+        q_scale,
+        unified_kv,
+        unified_kv_scale,
+        kv_indices_prefix,
+        kv_indptr_prefix,
+        kv,
+        kv_scale,
+        kv_indices_extend,
+        kv_indptr_extend,
+        attn_sink,
+        softmax_scale,
+        out,
+        num_kv_splits,
+    )
+
+
 @torch_compile_guard(mutates_args=["out"], gen_fake=_mla_sparse_prefill_v41_fake)
-@_route(op="mla_sparse_prefill_v41", version=1)
 def mla_sparse_prefill_v41(
     q: torch.Tensor,
     q_scale: torch.Tensor,
@@ -867,7 +917,7 @@ def mla_sparse_prefill_v41(
       ``out`` (``[T, H, 512]`` bf16).
     """
     _check_backend("mla_sparse_prefill_v41", backend, ("opus",))
-    return _opus_sparse_prefill_v41(
+    return _mla_sparse_prefill_v41_routed(
         q,
         q_scale,
         unified_kv,
