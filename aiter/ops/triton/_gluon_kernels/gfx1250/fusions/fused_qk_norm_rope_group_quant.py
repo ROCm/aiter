@@ -154,6 +154,7 @@ def fused_qk_norm_rope_group_quant_gfx1250(
     HEADS_PER_PROGRAM: gl.constexpr,
     ROWS_PER_STEP: gl.constexpr,
     cache_modifier: gl.constexpr,
+    COS_NUM_ROWS: gl.constexpr,
     row_layout: gl.constexpr,
     rope_layout: gl.constexpr,
     shared_layout: gl.constexpr,
@@ -185,6 +186,7 @@ def fused_qk_norm_rope_group_quant_gfx1250(
         gl.amd.gfx1250.tdm.async_load(k_desc, [0, 0], k_tile)
         token_offset = gl.full([1, 1], token, gl.int32, layout=rope_layout)
         pos = gl.amd.gfx1250.buffer_load(positions_ptr, token_offset).to(gl.int32)
+        rope_pos = gl.minimum(gl.maximum(pos, 0), COS_NUM_ROWS - 1)
         col = gl.arange(0, HEAD_DIM, layout=gl.SliceLayout(0, row_layout))
         weight = gl.amd.gfx1250.buffer_load(k_weight_ptr, col)[None, :]
         rope_col = gl.arange(0, ROPE_DIM, layout=gl.SliceLayout(0, rope_layout))
@@ -193,7 +195,7 @@ def fused_qk_norm_rope_group_quant_gfx1250(
         rope_weight = rope_weight[None, :]
         # The RoPE rows have only the RoPE columns, so NUM_COLS is ROPE_DIM.
         cos, sin = load_interleaved_cos_sin(
-            cos_ptr, sin_ptr, pos, ROPE_DIM, ROPE_DIM, rope_layout
+            cos_ptr, sin_ptr, rope_pos, ROPE_DIM, ROPE_DIM, rope_layout
         )
         swa_dest_row = gl.load(swa_dest_rows_ptr + token).to(gl.int64)
         batch_id = gl.load(batch_ids_ptr + token)
@@ -243,11 +245,12 @@ def fused_qk_norm_rope_group_quant_gfx1250(
         # Load cos/sin after the TDM loads start. cos/sin wait for the position.
         token_offset = gl.full([1, 1], token, gl.int32, layout=rope_layout)
         pos = gl.amd.gfx1250.buffer_load(positions_ptr, token_offset).to(gl.int32)
+        rope_pos = gl.minimum(gl.maximum(pos, 0), COS_NUM_ROWS - 1)
         nope_ptr = q_nope_ptr + first_row * HEAD_DIM
         rope_ptr = q_rope_ptr + first_row * ROPE_DIM
         # The RoPE rows have only the RoPE columns, so NUM_COLS is ROPE_DIM.
         cos, sin = load_interleaved_cos_sin(
-            cos_ptr, sin_ptr, pos, ROPE_DIM, ROPE_DIM, rope_layout
+            cos_ptr, sin_ptr, rope_pos, ROPE_DIM, ROPE_DIM, rope_layout
         )
         for step in gl.static_range(NUM_STEPS):
             # The TDM loads finish in order. Wait for the rows of this step only.

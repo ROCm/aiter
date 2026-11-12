@@ -109,6 +109,7 @@ def fused_qk_norm_rope_group_quant(
         swa_nope.shape[0],
         EPS=eps,
         NUM_HEADS=num_heads,
+        COS_NUM_ROWS=cos.shape[0],
         **config,
         **get_fused_qk_norm_rope_group_quant_layouts(config["num_warps"]),
     )

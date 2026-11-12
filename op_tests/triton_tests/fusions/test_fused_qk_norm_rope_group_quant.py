@@ -131,3 +131,17 @@ def test_fused_qk_norm_rope_group_quant(num_tokens):
     ref_swa_rope[dest_rows] = k_rope[written]
     torch.testing.assert_close(dequant(inputs["swa_nope"]), ref_swa_nope)
     torch.testing.assert_close(inputs["swa_rope"], ref_swa_rope)
+
+
+def test_fused_qk_norm_rope_group_quant_clamps_rope_position():
+    inputs = make_inputs(1)
+    inputs["positions"].fill_(-134217600)
+    _, q_rope, _, k_rope = fused_qk_norm_rope_group_quant(**inputs)
+
+    ref_inputs = {**inputs, "positions": torch.zeros_like(inputs["positions"])}
+    _, ref_q_rope = torch_ref(inputs["q"], 1.0, ref_inputs)
+    _, ref_k_rope = torch_ref(inputs["kv"], inputs["k_weight"], ref_inputs)
+    torch.testing.assert_close(q_rope.float(), ref_q_rope, atol=1e-2, rtol=1e-2)
+    torch.testing.assert_close(k_rope.float(), ref_k_rope, atol=1e-2, rtol=1e-2)
+    assert torch.count_nonzero(inputs["swa_nope"]) == 0
+    assert torch.count_nonzero(inputs["swa_rope"]) == 0
