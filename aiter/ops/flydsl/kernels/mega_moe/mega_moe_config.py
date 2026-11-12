@@ -84,7 +84,9 @@ LARGE_M_MTPRS = (1024, 2048, 4096, 8192, 16384)
 # (illegal memory access) at 1024, 2048 and 4096.
 V41_FLASH_EP4_LARGE_M_MTPRS = (8192, 16384)
 # The fused kernels have no 2-token variant: 2 tokens take the 1-token config.
-FUSED_TOKEN_BUCKETS = tuple(b for b in TOKEN_BUCKETS if b != 2)
+# Bucket 2 is bucket 1's config (see _fused_config), kept apart so that a bucket-1-only GEMM1 tile width does not
+# reach two-token launches.
+FUSED_TOKEN_BUCKETS = TOKEN_BUCKETS
 # Below this many rows per rank the staged (or small-input) path is faster than
 # the large-input kernel, whose geometry is fixed by its capacity.
 LARGE_M_MIN_TOKENS = SMALL_M_MAX_MTPR + 1
@@ -1549,7 +1551,10 @@ def _tune_v41_flash_ep4_small(config: MegaMoEConfig, bucket: int) -> MegaMoEConf
         # (-2.4%; either alone, or W1 ahead in the rolled loop, is slower).
         return replace(
             config,
-            stage1=replace(config.stage1, b_nt=3, waves_per_eu_hint=1),
+            # tile_n 128: one token a rank fills only ~100 of 256 CUs with 256-column GEMM1 tiles, and a CU streams
+            # W1 at ~40 GB/s (4.3 TB/s over ~108 CUs, against ~6.7 TB/s with all 256 busy): half-width tiles engage
+            # twice the CUs (-6% at 1 token; at 2 tokens a loaded rank's tiles already outnumber the CTAs).
+            stage1=replace(config.stage1, b_nt=3, waves_per_eu_hint=1, tile_n=128),
             fused_stage1=replace(
                 stage1, head_uniform=True, g1_a_ahead=2, g1_lookahead=2
             ),
@@ -1709,6 +1714,11 @@ def _fused_config(
     if mtpr in LARGE_M_MTPRS:
         config = _large_m_config(expert_waves)
         return _tune_v41_flash_ep4_large(config) if ep4 else config
+    if bucket == 2:
+        # Bucket 1's config with bucket 1's base GEMM1 tile width: the EP4 tune's tile_n 128 pays off at one token
+        # a rank, but at two a loaded rank's tiles already outnumber the CTAs.
+        config = _fused_config(1, mtpr, world_size, experts_per_rank, model_dim, inter_dim)
+        return replace(config, stage1=replace(config.stage1, tile_n=_small_m_stage1(1).tile_n))
     config = MegaMoEConfig(
         stage1=_small_m_stage1(bucket, expert_waves),
         stage2=_small_m_stage2(bucket),
