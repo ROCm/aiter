@@ -4861,6 +4861,12 @@ def get_2stage_cfgs(
                     expert, model_dim, inter_dim, use_g1u1, q_dtype_w, dtype
                 )
             ):
+                if not use_g1u1:
+                    raise NotImplementedError(
+                        "Non-gated MoE weights past 4 GiB are not supported on "
+                        "gfx942: the asm 1-stage kernel wraps 32-bit offsets and "
+                        "CK stage 1 assumes gate and up are fused."
+                    )
                 run_1stage = False
                 run_1stage_xbf16 = False
 

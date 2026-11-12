@@ -2543,7 +2543,7 @@ def test_gfx942_asm_1stage_4gib_guard():
     # No q_dtype_w: the weights are in the model dtype (2 bytes).
     assert not fits(256, 7168, 1024, True, None, bf16)
 
-    def run_1stage(token, inter_dim, qtype, w_dtype):
+    def run_1stage(token, inter_dim, qtype, w_dtype, a_dtype=fp8, g1u1=True):
         fm.get_2stage_cfgs.cache_clear()
         try:
             with override_env("AITER_BYPASS_TUNE_CONFIG", "1"):
@@ -2554,10 +2554,10 @@ def test_gfx942_asm_1stage_4gib_guard():
                     256,
                     8,
                     bf16,
-                    fp8,
+                    a_dtype,
                     w_dtype,
                     qtype,
-                    True,
+                    g1u1,
                     aiter.ActivationType.Silu,
                     False,
                     0,
@@ -2568,6 +2568,7 @@ def test_gfx942_asm_1stage_4gib_guard():
 
     host = fm.get_gfx_runtime()
     real_gfx = fm._ASM_FMOE_U32_WEIGHT_OFFSET_GFX
+    assert "gfx942" in real_gfx, "the production guard must cover gfx942"
     cases = (  # (token, quant type): the default heuristic takes asm 1-stage here
         (256, aiter.QuantType.per_Token),
         (256, aiter.QuantType.per_1x128),
@@ -2591,6 +2592,17 @@ def test_gfx942_asm_1stage_4gib_guard():
             # An arch outside the guard keeps the previous dispatch at any size.
             fm._ASM_FMOE_U32_WEIGHT_OFFSET_GFX = ("gfx90a",)
             assert run_1stage(token, 2048, qtype, fp8) == before_big, qtype
+        # Non-gated weights cannot take CK stage 1 (it halves w1.size(1)), so an
+        # oversized one is rejected rather than rerouted.
+        fm._ASM_FMOE_U32_WEIGHT_OFFSET_GFX = (host,)
+        if host == "gfx942":
+            try:
+                run_1stage(1, 2048, aiter.QuantType.No, bf16, bf16, False)
+            except NotImplementedError:
+                pass
+            else:
+                raise AssertionError("oversized non-gated weights must be rejected")
+            assert run_1stage(1, 1024, aiter.QuantType.No, bf16, bf16, False)
     finally:
         fm._ASM_FMOE_U32_WEIGHT_OFFSET_GFX = real_gfx
         fm.get_2stage_cfgs.cache_clear()
