@@ -104,7 +104,9 @@ def _gfx1250_reg_mw_fits(
     and 1024 at topk <= 16) or else to the LDS kernel, which aborts on an FP32
     bias."""
     return (
-        gating_output.shape[1] in _GFX1250_REG_MW_EXPERTS
+        # data_ptr() breaks a Dynamo graph; compiled calls keep the Triton kernel.
+        not torch.compiler.is_compiling()
+        and gating_output.shape[1] in _GFX1250_REG_MW_EXPERTS
         and topk_ids.shape[1] <= _GFX1250_REG_MW_MAX_TOPK
         # Rows and bias are read as 4-element vectors.
         and gating_output.stride(0) % 4 == 0
