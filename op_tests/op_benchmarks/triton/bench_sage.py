@@ -1066,6 +1066,26 @@ def sol_flops_from_lut(
     return exact_flops + total_dense_flops / block_n, total_dense_flops
 
 
+def row_sparse_flops(
+    args: argparse.Namespace,
+    block_lut: tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None,
+    sol_out: dict[str, Any] | None,
+    shape: ShapeSpec,
+) -> float | None:
+    """The useful FLOPs of one timed row, or None when it ran dense.
+
+    A Sol-Attn row is charged for the LUT its plan returned, not the one handed in: the plan forces
+    short tail blocks into the exact pass, and the pooled sweep runs even when that LUT is empty.
+    """
+    if sol_out is not None and "block_lut" in sol_out:
+        return sol_flops_from_lut(args.kernel, sol_out["block_lut"], shape)[0]
+    if block_lut is not None:
+        return sparse_flops_from_lut(
+            args.kernel, block_lut, shape, args.mha4_block_tile
+        )[0]
+    return None
+
+
 def fp8_quantize(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -2162,13 +2182,7 @@ def benchmark_single_case(
         *benchmark_payload_bytes(args, q, k, v),
     )
 
-    sparse_flops = None
-    if sol_out is not None and "block_lut" in sol_out:
-        sparse_flops, _ = sol_flops_from_lut(args.kernel, sol_out["block_lut"], shape)
-    elif block_lut is not None:
-        sparse_flops, _ = sparse_flops_from_lut(
-            args.kernel, block_lut, shape, args.mha4_block_tile
-        )
+    sparse_flops = row_sparse_flops(args, block_lut, sol_out, shape)
 
     if provider == "time(ms)":
         return ms
@@ -2619,16 +2633,19 @@ def run_block_sparse_repetitions(
         ).to(torch.bool)
         lut = block_attn_mask_to_ragged_lut(mask, return_none_if_dense=True)
 
-        fn = make_kernel_runner(args, q, k, v, block_lut=lut, block_mask=mask)
+        sol_out: dict[str, Any] | None = {} if args.kernel in SOL_KERNELS else None
+        fn = make_kernel_runner(
+            args, q, k, v, block_lut=lut, block_mask=mask, sol_out=sol_out
+        )
         ms = triton.testing.do_bench(fn, warmup=args.warmup, rep=args.rep)
         latencies_ms.append(ms)
 
         dense_tflops = (total_flops / (ms * 1e-3)) / 1e12
         tflops_dense.append(dense_tflops)
 
-        sparse_flops, _ = sparse_flops_from_lut(
-            args.kernel, lut, shape, args.mha4_block_tile
-        )
+        sparse_flops = row_sparse_flops(args, lut, sol_out, shape)
+        if sparse_flops is None:
+            sparse_flops = total_flops
         effective_tflops = (sparse_flops / (ms * 1e-3)) / 1e12
         tflops_effective.append(effective_tflops)
 
