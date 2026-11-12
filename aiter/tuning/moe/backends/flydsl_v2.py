@@ -20,21 +20,19 @@ from aiter.ops.flydsl.moe_kernels import (
     get_flydsl_stage2_v2_kernels,
 )
 from aiter.test_common import cosine_diff_compare
-from aiter.utility.fp4_utils import moe_mxfp4_sort
-
-# Lives in csrc/, so the repo root must be on sys.path, as for the tuner itself.
-from csrc.ck_gemm_moe_2stages_codegen.mxfp4_v2_tune_utils import (
+from aiter.tuning.moe.mxfp4_v2_tune_utils import (
     build_v2_inputs as _v2_build_inputs,
 )
-from csrc.ck_gemm_moe_2stages_codegen.mxfp4_v2_tune_utils import (
+from aiter.tuning.moe.mxfp4_v2_tune_utils import (
     gen as _v2_gen,
 )
-from csrc.ck_gemm_moe_2stages_codegen.mxfp4_v2_tune_utils import (
+from aiter.tuning.moe.mxfp4_v2_tune_utils import (
     populate_v2_intermediate_from_ref as _v2_populate_stage2,
 )
-from csrc.ck_gemm_moe_2stages_codegen.mxfp4_v2_tune_utils import (
+from aiter.tuning.moe.mxfp4_v2_tune_utils import (
     v2_stage1_sorted_ref as _v2_stage1_ref,
 )
+from aiter.utility.fp4_utils import moe_mxfp4_sort
 
 
 def generate_v2_stage1_data(
@@ -348,7 +346,7 @@ def gen_flydsl_v2_2stages_task(info, blockMs):
     out_dtype_str = "bf16"
     s1_kernels = get_flydsl_stage1_kernels(adtype, bdtype, out_dtype_str)
 
-    from csrc.ck_gemm_moe_2stages_codegen.mxfp4_v2_tune_utils import (
+    from aiter.tuning.moe.mxfp4_v2_tune_utils import (
         v2_stage1_dequant_cosine_err,
     )
 

@@ -62,9 +62,7 @@ from aiter.tuning.moe.fused_moe import (
     _frame_keeping_watts,
     _mxfp4_search_mode,
 )
-from aiter.utility.dtypes import str2ActivationType, str2Dtype
-from aiter.utility.mp_tuner import _is_accelerator_error
-from csrc.ck_gemm_moe_2stages_codegen.mxfp4_staged_search import (
+from aiter.tuning.moe.mxfp4_staged_search import (
     DEFAULT_SCREEN_TOPK,
     AccumulationMode,
     GEMM2ScreeningKey,
@@ -74,14 +72,16 @@ from csrc.ck_gemm_moe_2stages_codegen.mxfp4_staged_search import (
     screening_shortlist,
     select_reference_producer,
 )
-from csrc.ck_gemm_moe_2stages_codegen.mxfp4_v2_tune_utils import (
+from aiter.tuning.moe.mxfp4_v2_tune_utils import (
     populate_v2_intermediate_from_ref as _v2_populate_stage2,
 )
+from aiter.utility.dtypes import str2ActivationType, str2Dtype
+from aiter.utility.mp_tuner import _is_accelerator_error
 
 if TYPE_CHECKING:
     from types import SimpleNamespace
 
-    from csrc.ck_gemm_moe_2stages_codegen.mxfp4_staged_search import StagedSearchPlan
+    from aiter.tuning.moe.mxfp4_staged_search import StagedSearchPlan
 
 
 def _parse_tuning_type(value):

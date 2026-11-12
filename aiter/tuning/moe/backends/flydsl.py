@@ -26,9 +26,7 @@ from aiter.tuning.moe.compare import (
     run_torch_moe_stage2,
 )
 from aiter.tuning.moe.inputs import generate_data_2stages
-
-# Lives in csrc/, so the repo root must be on sys.path, as for the tuner itself.
-from csrc.ck_gemm_moe_2stages_codegen.mxfp4_v2_tune_utils import (
+from aiter.tuning.moe.mxfp4_v2_tune_utils import (
     v2_stage1_sorted_ref as _v2_stage1_ref,
 )
 

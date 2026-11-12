@@ -20,13 +20,11 @@ from aiter.ops.shuffle import (
     shuffle_weight_a16w4,
 )
 from aiter.tuning.moe.compare import _token_major_to_sorted_routes, run_torch_moe_stage1
-from aiter.utility import fp4_utils
-from aiter.utility.fp4_utils import moe_mxfp4_sort
-
-# Lives in csrc/, so the repo root must be on sys.path, as for the tuner itself.
-from csrc.ck_gemm_moe_2stages_codegen.mxfp4_v2_tune_utils import (
+from aiter.tuning.moe.mxfp4_v2_tune_utils import (
     v2_stage1_sorted_ref as _v2_stage1_ref,
 )
+from aiter.utility import fp4_utils
+from aiter.utility.fp4_utils import moe_mxfp4_sort
 
 TUNE_MOE_EXPERT_BALANCE = (
     os.environ.get("TUNE_MOE_EXPERT_BALANCE", "False").lower() == "true"
