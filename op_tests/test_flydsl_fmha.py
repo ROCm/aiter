@@ -2067,7 +2067,7 @@ def _check_gfx1201_partial_tiles(dtype, seq_q, seq_kv, head_dim, causal):
     _, k, v = _make_qkv(2, seq_kv, 2, head_dim, torch.bfloat16, seed=1)
     if dtype == torch.float8_e4m3fn:
         q, k, v, sq, sk, sv = flydsl_fp8_quant(q, k, v, rotation=False)
-        scales = dict(q_descale=sq, k_descale=sk, v_descale=sv)
+        scales = {"q_descale": sq, "k_descale": sk, "v_descale": sv}
         ref_q, ref_k, ref_v = (
             x.float() * scale for x, scale in zip((q, k, v), (sq, sk, sv))
         )
