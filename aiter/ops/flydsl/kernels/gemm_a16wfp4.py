@@ -35,6 +35,7 @@ from .gemm_a16wfp4_helpers import (
     reduce_dense_k_wave,
     store_dense_bf16,
 )
+from .kernels_common import set_slp_vectorize_once_used
 
 __all__ = ["compile_gemm_a16wfp4"]
 
@@ -86,7 +87,6 @@ def compile_gemm_a16wfp4(
         k_wave=k_wave,
         waves_per_eu=waves_per_eu,
     )
-    cache_tag = traits.cache_key
     block_m = traits.block_m
     n_blocks = traits.n_blocks
     a_lds_stages = traits.a_lds_stages
@@ -103,7 +103,6 @@ def compile_gemm_a16wfp4(
         arg_out: fx.Int64,
         i32_m: fx.Int32,
     ):
-        const_expr(cache_tag)
         lds_raw_ptr = fx.SharedAllocator().allocate(SharedStorage).peek().raw.ptr
         tx = fx.Int32(gpu.thread_id("x"))
         lane = tx % 64
@@ -196,7 +195,6 @@ def compile_gemm_a16wfp4(
         i32_m: fx.Int32,
         stream: fx.Stream,
     ):
-        const_expr(cache_tag)
         grid_m = (i32_m + block_m - 1) // block_m
         kernel(
             arg_a,
@@ -211,4 +209,4 @@ def compile_gemm_a16wfp4(
             stream=stream,
         )
 
-    return launch
+    return set_slp_vectorize_once_used(launch, False)

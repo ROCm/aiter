@@ -4,6 +4,7 @@ on:
   push:
     branches: [main]
   pull_request:
+    # labeled: re-run when adding ci:mi300x for MI300X standard tests or ci:multi-gpu for 8-GPU tests
     types: [opened, synchronize, reopened, ready_for_review, labeled]
     branches: [main]  # Triggers on PRs targeting `main`
 
@@ -18,7 +19,8 @@ concurrency:
   cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
 
 env:
-  GPU_ARCH_LIST: "gfx942;gfx950"
+  GPU_ARCH_LIST: ${{ (github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, 'ci:mi300x') || github.event.label.name == 'ci:mi300x') && 'gfx942;gfx950' || 'gfx950' }}
+  AITER_PREBUILD_CACHE_SUFFIX: ${{ (github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, 'ci:mi300x') || github.event.label.name == 'ci:mi300x') && 'gfx942-gfx950' || 'gfx950' }}
   AITER_WHEEL_ARTIFACT_NAME: aiter-whl-${{ github.run_id }}
   AITER_PREBUILD_MAX_JOBS: "64"
 
@@ -67,14 +69,20 @@ jobs:
           fi
 
           if [ "${EVENT_ACTION}" = "labeled" ]; then
-            echo "run_tests=false" >> "$GITHUB_OUTPUT"
-            if [ "${LABEL_NAME}" = "ci:multi-gpu" ]; then
+            if [ "${LABEL_NAME}" = "ci:mi300x" ]; then
+              echo "run_tests=true" >> "$GITHUB_OUTPUT"
+              echo "run_multigpu_tests=false" >> "$GITHUB_OUTPUT"
+              echo "reason=mi300x_label" >> "$GITHUB_OUTPUT"
+              echo "Aiter MI300X standard tests are required because the ci:mi300x label was added." >> "$GITHUB_STEP_SUMMARY"
+            elif [ "${LABEL_NAME}" = "ci:multi-gpu" ]; then
+              echo "run_tests=false" >> "$GITHUB_OUTPUT"
               echo "run_multigpu_tests=true" >> "$GITHUB_OUTPUT"
               echo "reason=multigpu_label" >> "$GITHUB_OUTPUT"
               echo "Aiter multi-GPU tests are required because a multi-GPU CI label was added." >> "$GITHUB_STEP_SUMMARY"
             else
+              echo "run_tests=false" >> "$GITHUB_OUTPUT"
               echo "run_multigpu_tests=false" >> "$GITHUB_OUTPUT"
-              echo "reason=non_multigpu_label" >> "$GITHUB_OUTPUT"
+              echo "reason=non_aiter_label" >> "$GITHUB_OUTPUT"
               echo "Aiter tests are skipped for label '${LABEL_NAME}'." >> "$GITHUB_STEP_SUMMARY"
             fi
             exit 0
@@ -152,7 +160,7 @@ jobs:
     if: >-
       needs.detect_aiter_test_scope.outputs.run_tests == 'true' ||
       needs.detect_aiter_test_scope.outputs.run_multigpu_tests == 'true'
-    runs-on: build-only-aiter
+    runs-on: ${{ matrix.build_enabled && 'build-only-aiter' || 'ubuntu-latest' }}
     needs: [detect_aiter_test_scope, check-signal, ci_config]
     permissions:
       id-token: write
@@ -178,7 +186,7 @@ jobs:
           SEGMENT_DOWNLOAD_TIMEOUT_MINS: 30
         with:
           path: aiter_wheels
-          key: ${{ runner.os }}-aiter-wheel-${{ github.event.pull_request.head.sha || github.sha }}-py${{ matrix.python_version }}
+          key: ${{ runner.os }}-aiter-wheel-${{ github.event.pull_request.head.sha || github.sha }}-py${{ matrix.python_version }}-${{ env.AITER_PREBUILD_CACHE_SUFFIX }}
 
       - name: Validate restored Aiter wheel cache
         if: ${{ matrix.build_enabled && steps.restore_aiter_wheel.outputs.cache-hit == 'true' }}
@@ -233,11 +241,28 @@ jobs:
           echo "Docker login failed after 3 attempts, continuing anyway"
           exit 0
 
+      - name: Pull Aiter build image
+        if: ${{ matrix.build_enabled && steps.restore_aiter_wheel.outputs.cache-hit != 'true' }}
+        env:
+          DOCKER_IMAGE: ${{ matrix.docker_image }}
+          DOCKER_PULL_MAX_ATTEMPTS: "5"
+          DOCKER_PULL_RETRY_DELAY_SECONDS: "60"
+        run: |
+          set -euo pipefail
+          # Fork PRs intentionally have no registry credentials. Reuse the
+          # runner's pinned image when present; otherwise tolerate transient
+          # registry throttling without retrying the whole wheel build.
+          if docker image inspect "${DOCKER_IMAGE}" >/dev/null 2>&1; then
+            echo "Using locally cached build image: ${DOCKER_IMAGE}"
+          else
+            bash .github/scripts/docker_pull_with_retry.sh "${DOCKER_IMAGE}"
+          fi
+
       - name: Build Aiter wheel in base container
         if: ${{ matrix.build_enabled && steps.restore_aiter_wheel.outputs.cache-hit != 'true' }}
         run: |
           set -euo pipefail
-          docker run --rm \
+          docker run --rm --pull=never \
             --network=host \
             -e AITER_PREBUILD_MAX_JOBS="${{ env.AITER_PREBUILD_MAX_JOBS }}" \
             -e AITER_RUNNER_NAME="${RUNNER_NAME:-unknown}" \
@@ -345,7 +370,7 @@ jobs:
         uses: actions/cache/save@v4
         with:
           path: aiter_wheels
-          key: ${{ runner.os }}-aiter-wheel-${{ github.event.pull_request.head.sha || github.sha }}-py${{ matrix.python_version }}
+          key: ${{ runner.os }}-aiter-wheel-${{ github.event.pull_request.head.sha || github.sha }}-py${{ matrix.python_version }}-${{ env.AITER_PREBUILD_CACHE_SUFFIX }}
 
       - name: Upload wheel as artifact
         if: ${{ matrix.build_enabled }}
@@ -486,6 +511,8 @@ jobs:
     needs: [detect_aiter_test_scope, check-signal, build_aiter_wheels]
     outputs:
       shard_count: 8
+      standard_matrix: ${{ steps.standard_matrix.outputs.matrix }}
+      expected_standard_runners: ${{ steps.standard_matrix.outputs.expected_runners }}
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -494,6 +521,59 @@ jobs:
 
       - name: Split Aiter Tests (8 shards)
         run: ./.github/scripts/split_tests.sh --shards 8 --test-type aiter
+
+      - name: Build standard test matrix
+        id: standard_matrix
+        env:
+          EVENT_ACTION: ${{ github.event.action }}
+          LABEL_NAME: ${{ github.event.label.name }}
+          PR_LABELS: ${{ toJSON(github.event.pull_request.labels.*.name) }}
+        run: |
+          python3 - <<'PY'
+          import json
+          import os
+
+          labels = json.loads(os.environ.get("PR_LABELS") or "[]") or []
+          labeled_event = (
+              os.environ["GITHUB_EVENT_NAME"] == "pull_request"
+              and os.environ.get("EVENT_ACTION") == "labeled"
+          )
+          run_mi35x = not labeled_event
+          run_mi300x = os.environ["GITHUB_REF"] == "refs/heads/main" or (
+              os.environ["GITHUB_EVENT_NAME"] == "pull_request"
+              and (
+                  "ci:mi300x" in labels
+                  or (
+                      os.environ.get("EVENT_ACTION") == "labeled"
+                      and os.environ.get("LABEL_NAME") == "ci:mi300x"
+                  )
+              )
+          )
+
+          runners = []
+          if run_mi35x:
+              runners.append(("linux-aiter-mi35x-1", "MI35X"))
+          if run_mi300x:
+              runners.append(("linux-aiter-oci-mi300x-1", "MI300X"))
+
+          matrix = [
+              {
+                  "runner": runner,
+                  "label": label,
+                  "shard_total": 8,
+                  "shard_idx": shard_idx,
+              }
+              for runner, label in runners
+              for shard_idx in range(8)
+          ]
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as f:
+              print(f"matrix={json.dumps(matrix, separators=(',', ':'))}", file=f)
+              print(
+                  "expected_runners="
+                  + " ".join(runner for runner, _label in runners),
+                  file=f,
+              )
+          PY
 
       - name: Upload test shard lists as artifact
         uses: actions/upload-artifact@v4
@@ -586,7 +666,7 @@ jobs:
   standard:
     if: >-
       needs.detect_aiter_test_scope.outputs.run_tests == 'true' &&
-      github.event.action != 'labeled'
+      (github.event.action != 'labeled' || github.event.label.name == 'ci:mi300x')
     name: Standard Tests (1 GPU)
     needs: [detect_aiter_test_scope, build_aiter_wheels, split_aiter_tests, prepare_triton_wheel, ci_config]
     env:
@@ -595,71 +675,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        include:
-          - runner: linux-aiter-mi35x-1
-            label: MI35X
-            shard_total: 8
-            shard_idx: 0
-          - runner: linux-aiter-mi35x-1
-            label: MI35X
-            shard_total: 8
-            shard_idx: 1
-          - runner: linux-aiter-mi35x-1
-            label: MI35X
-            shard_total: 8
-            shard_idx: 2
-          - runner: linux-aiter-mi35x-1
-            label: MI35X
-            shard_total: 8
-            shard_idx: 3
-          - runner: linux-aiter-mi35x-1
-            label: MI35X
-            shard_total: 8
-            shard_idx: 4
-          - runner: linux-aiter-mi35x-1
-            label: MI35X
-            shard_total: 8
-            shard_idx: 5
-          - runner: linux-aiter-mi35x-1
-            label: MI35X
-            shard_total: 8
-            shard_idx: 6
-          - runner: linux-aiter-mi35x-1
-            label: MI35X
-            shard_total: 8
-            shard_idx: 7
-          - runner: linux-aiter-oci-mi300x-1
-            label: MI300X
-            shard_total: 8
-            shard_idx: 0
-          - runner: linux-aiter-oci-mi300x-1
-            label: MI300X
-            shard_total: 8
-            shard_idx: 1
-          - runner: linux-aiter-oci-mi300x-1
-            label: MI300X
-            shard_total: 8
-            shard_idx: 2
-          - runner: linux-aiter-oci-mi300x-1
-            label: MI300X
-            shard_total: 8
-            shard_idx: 3
-          - runner: linux-aiter-oci-mi300x-1
-            label: MI300X
-            shard_total: 8
-            shard_idx: 4
-          - runner: linux-aiter-oci-mi300x-1
-            label: MI300X
-            shard_total: 8
-            shard_idx: 5
-          - runner: linux-aiter-oci-mi300x-1
-            label: MI300X
-            shard_total: 8
-            shard_idx: 6
-          - runner: linux-aiter-oci-mi300x-1
-            label: MI300X
-            shard_total: 8
-            shard_idx: 7
+        include: ${{ fromJSON(needs.split_aiter_tests.outputs.standard_matrix) }}
     runs-on: ${{ matrix.runner }}
 
     steps:
@@ -726,7 +742,7 @@ jobs:
           SEGMENT_DOWNLOAD_TIMEOUT_MINS: 30
         with:
           path: aiter_wheels
-          key: ${{ runner.os }}-aiter-wheel-${{ github.event.pull_request.head.sha || github.sha }}-py3.12
+          key: ${{ runner.os }}-aiter-wheel-${{ github.event.pull_request.head.sha || github.sha }}-py3.12-${{ env.AITER_PREBUILD_CACHE_SUFFIX }}
 
       - name: Download Aiter wheel artifact
         if: steps.restore_aiter_wheel.outputs.cache-hit != 'true'
@@ -771,8 +787,43 @@ jobs:
           name: ${{ env.TRITON_WHEEL_ARTIFACT_NAME }}
           path: triton_wheels
 
+      - name: Resolve CK submodule SHA
+        id: ck_submodule
+        if: ${{ github.event_name != 'schedule' }}
+        run: |
+          set -euo pipefail
+          ck_path="3rdparty/composable_kernel"
+          ck_sha="$(git ls-tree HEAD "${ck_path}" | awk '{print $3}')"
+          if [ -z "${ck_sha}" ]; then
+            echo "::error::Unable to resolve CK submodule SHA"
+            exit 1
+          fi
+          echo "path=${ck_path}" >> "$GITHUB_OUTPUT"
+          echo "sha=${ck_sha}" >> "$GITHUB_OUTPUT"
+          echo "CK submodule SHA: ${ck_sha}"
+
+      - name: Clear CK submodule checkout
+        if: ${{ github.event_name != 'schedule' }}
+        run: |
+          rm -rf 3rdparty/composable_kernel .git/modules/3rdparty/composable_kernel
+
+      - name: Restore CK submodule cache
+        id: restore_ck_submodule
+        if: ${{ github.event_name != 'schedule' }}
+        continue-on-error: true
+        uses: actions/cache/restore@v4
+        env:
+          SEGMENT_DOWNLOAD_TIMEOUT_MINS: 30
+        with:
+          path: |
+            .git/modules/3rdparty/composable_kernel
+            3rdparty/composable_kernel
+          key: ${{ runner.os }}-ck-submodule-${{ steps.ck_submodule.outputs.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
+          restore-keys: |
+            ${{ runner.os }}-ck-submodule-${{ steps.ck_submodule.outputs.sha }}-
+
       - name: Speedtest after Aiter test cache or artifact download failure
-        if: ${{ always() && startsWith(runner.name, 'linux-aiter-mi35x-1-') && (steps.download_aiter_shards.outcome == 'failure' || steps.restore_aiter_wheel.outcome == 'failure' || steps.retry_aiter_wheel.outcome == 'failure' || steps.restore_triton_wheel.outcome == 'failure' || steps.download_triton_wheel.outcome == 'failure') }}
+        if: ${{ always() && startsWith(runner.name, 'linux-aiter-mi35x-1-') && (steps.download_aiter_shards.outcome == 'failure' || steps.restore_aiter_wheel.outcome == 'failure' || steps.retry_aiter_wheel.outcome == 'failure' || steps.restore_triton_wheel.outcome == 'failure' || steps.download_triton_wheel.outcome == 'failure' || steps.restore_ck_submodule.outcome == 'failure') }}
         continue-on-error: true
         timeout-minutes: 5
         run: |
@@ -848,6 +899,7 @@ jobs:
           fi
 
       - name: Sync CK submodule
+        id: sync_ck_submodule
         run: |
           set -ex
           if [ "${GITHUB_EVENT_NAME}" = "schedule" ]; then
@@ -857,9 +909,34 @@ jobs:
             git submodule update --init --recursive --remote --jobs 4
           else
             echo "Using pinned CK commit..."
-            git submodule sync
-            git submodule update --init --recursive --depth 1 --jobs 4
+            ck_path="3rdparty/composable_kernel"
+            ck_sha="${{ steps.ck_submodule.outputs.sha }}"
+            git submodule sync "${ck_path}"
+            if [ "${{ steps.restore_ck_submodule.outcome }}" = "success" ] && \
+              [ -n "${{ steps.restore_ck_submodule.outputs.cache-hit }}" ] && \
+              git -C "${ck_path}" rev-parse --git-dir >/dev/null 2>&1 && \
+              git -C "${ck_path}" cat-file -e "${ck_sha}^{commit}" >/dev/null 2>&1; then
+              echo "Using restored CK submodule cache for ${ck_sha}"
+              echo "fetched=false" >> "$GITHUB_OUTPUT"
+              git -C "${ck_path}" checkout --detach "${ck_sha}"
+              git -C "${ck_path}" submodule update --init --recursive --depth 1 --jobs 4
+            else
+              echo "CK submodule cache miss or invalid restore; fetching ${ck_sha}"
+              rm -rf "${ck_path}" ".git/modules/${ck_path}"
+              git submodule update --init --recursive --depth 1 --jobs 4 "${ck_path}"
+              echo "fetched=true" >> "$GITHUB_OUTPUT"
+            fi
           fi
+
+      - name: Save CK submodule cache
+        if: ${{ github.event_name != 'schedule' && steps.sync_ck_submodule.outputs.fetched == 'true' }}
+        continue-on-error: true
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            .git/modules/3rdparty/composable_kernel
+            3rdparty/composable_kernel
+          key: ${{ runner.os }}-ck-submodule-${{ steps.ck_submodule.outputs.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
 
       - name: Install Aiter wheel
         run: |
@@ -909,6 +986,14 @@ jobs:
           workspace_jit.mkdir(parents=True, exist_ok=True)
           for kernel in kernels:
               copy2(kernel, workspace_jit / kernel.name)
+
+          # Source imports discover FlyDSL AOT entries under their own jit dir.
+          # Reuse the wheel's cache instead of JIT-compiling the CSV sweep again.
+          installed_cache = installed_jit / "flydsl_cache"
+          workspace_cache = workspace_jit / "flydsl_cache"
+          if installed_cache.is_dir() and not workspace_cache.exists():
+              workspace_cache.symlink_to(installed_cache, target_is_directory=True)
+              print(f"Linked FlyDSL AOT cache from {installed_cache} to {workspace_cache}")
 
           print(
               f"Synced {len(kernels)} prebuilt kernels from {installed_jit} "
@@ -992,10 +1077,10 @@ jobs:
     if: >-
       always() &&
       needs.detect_aiter_test_scope.outputs.run_tests == 'true' &&
-      github.event.action != 'labeled'
+      (github.event.action != 'labeled' || github.event.label.name == 'ci:mi300x')
     name: Standard Test Results
     runs-on: ubuntu-latest
-    needs: [detect_aiter_test_scope, standard]
+    needs: [detect_aiter_test_scope, split_aiter_tests, standard]
     steps:
       - name: Download all test logs
         uses: actions/download-artifact@v8.0.1
@@ -1012,6 +1097,7 @@ jobs:
       - name: Summarize Standard Test Results
         env:
           STANDARD_RESULT: ${{ needs.standard.result }}
+          EXPECTED_RUNNERS: ${{ needs.split_aiter_tests.outputs.expected_standard_runners }}
         run: |
           set -euo pipefail
           echo "Summarizing Standard Test Results..."
@@ -1022,8 +1108,10 @@ jobs:
           } >> "$GITHUB_STEP_SUMMARY"
 
           missing=0
+          read -r -a runners <<< "${EXPECTED_RUNNERS}"
+
           for shard in {0..7}; do
-            for runner in {linux-aiter-mi35x-1,linux-aiter-oci-mi300x-1}; do
+            for runner in "${runners[@]}"; do
               if [ ! -f standard-test-log-${runner}-shard-${shard}/latest_test.log ]; then
                 echo "::warning::Test report for ${runner} shard ${shard} not found."
                 echo "- Missing log: ${runner} shard ${shard}" >> "$GITHUB_STEP_SUMMARY"
@@ -1069,7 +1157,7 @@ jobs:
           SEGMENT_DOWNLOAD_TIMEOUT_MINS: 30
         with:
           path: aiter_wheels
-          key: ${{ runner.os }}-aiter-wheel-${{ github.event.pull_request.head.sha || github.sha }}-py3.12
+          key: ${{ runner.os }}-aiter-wheel-${{ github.event.pull_request.head.sha || github.sha }}-py3.12-${{ env.AITER_PREBUILD_CACHE_SUFFIX }}
 
       - name: Download Aiter wheel artifact
         if: steps.restore_aiter_wheel.outputs.cache-hit != 'true'
@@ -1111,6 +1199,41 @@ jobs:
         with:
           name: ${{ env.TRITON_WHEEL_ARTIFACT_NAME }}
           path: triton_wheels
+
+      - name: Resolve CK submodule SHA
+        id: ck_submodule
+        if: ${{ github.event_name != 'schedule' }}
+        run: |
+          set -euo pipefail
+          ck_path="3rdparty/composable_kernel"
+          ck_sha="$(git ls-tree HEAD "${ck_path}" | awk '{print $3}')"
+          if [ -z "${ck_sha}" ]; then
+            echo "::error::Unable to resolve CK submodule SHA"
+            exit 1
+          fi
+          echo "path=${ck_path}" >> "$GITHUB_OUTPUT"
+          echo "sha=${ck_sha}" >> "$GITHUB_OUTPUT"
+          echo "CK submodule SHA: ${ck_sha}"
+
+      - name: Clear CK submodule checkout
+        if: ${{ github.event_name != 'schedule' }}
+        run: |
+          rm -rf 3rdparty/composable_kernel .git/modules/3rdparty/composable_kernel
+
+      - name: Restore CK submodule cache
+        id: restore_ck_submodule
+        if: ${{ github.event_name != 'schedule' }}
+        continue-on-error: true
+        uses: actions/cache/restore@v4
+        env:
+          SEGMENT_DOWNLOAD_TIMEOUT_MINS: 30
+        with:
+          path: |
+            .git/modules/3rdparty/composable_kernel
+            3rdparty/composable_kernel
+          key: ${{ runner.os }}-ck-submodule-${{ steps.ck_submodule.outputs.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
+          restore-keys: |
+            ${{ runner.os }}-ck-submodule-${{ steps.ck_submodule.outputs.sha }}-
 
       - name: Docker login
         if: ${{ !github.event.pull_request || !github.event.pull_request.head.repo.fork }}
@@ -1170,6 +1293,7 @@ jobs:
           fi
 
       - name: Sync CK submodule
+        id: sync_ck_submodule
         run: |
           set -ex
           if [ "${GITHUB_EVENT_NAME}" = "schedule" ]; then
@@ -1179,9 +1303,32 @@ jobs:
             git submodule update --init --recursive --remote --jobs 4
           else
             echo "Using pinned CK commit..."
-            git submodule sync
-            git submodule update --init --recursive --depth 1 --jobs 4
+            ck_path="3rdparty/composable_kernel"
+            ck_sha="${{ steps.ck_submodule.outputs.sha }}"
+            git submodule sync "${ck_path}"
+            if git -C "${ck_path}" rev-parse --git-dir >/dev/null 2>&1 && \
+              git -C "${ck_path}" cat-file -e "${ck_sha}^{commit}" >/dev/null 2>&1; then
+              echo "Using restored CK submodule cache for ${ck_sha}"
+              echo "fetched=false" >> "$GITHUB_OUTPUT"
+              git -C "${ck_path}" checkout --detach "${ck_sha}"
+              git -C "${ck_path}" submodule update --init --recursive --depth 1 --jobs 4
+            else
+              echo "CK submodule cache miss or invalid restore; fetching ${ck_sha}"
+              rm -rf "${ck_path}" ".git/modules/${ck_path}"
+              git submodule update --init --recursive --depth 1 --jobs 4 "${ck_path}"
+              echo "fetched=true" >> "$GITHUB_OUTPUT"
+            fi
           fi
+
+      - name: Save CK submodule cache
+        if: ${{ github.event_name != 'schedule' && steps.sync_ck_submodule.outputs.fetched == 'true' }}
+        continue-on-error: true
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            .git/modules/3rdparty/composable_kernel
+            3rdparty/composable_kernel
+          key: ${{ runner.os }}-ck-submodule-${{ steps.ck_submodule.outputs.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
 
       - name: Install Aiter wheel
         run: |
@@ -1208,7 +1355,18 @@ jobs:
             pip install tabulate
             pip install '${AITER_WHEEL_PATH}'
             pip show amd-aiter
+            pip install 'amd-mori==1.2.5'
+            pip show amd-mori
           "
+
+      - name: Mori smoke test
+        timeout-minutes: 30
+        run: |
+          set -ex
+          docker exec \
+          -w /workspace \
+          aiter_test \
+          bash -c "set -o pipefail; timeout 25m python3 op_tests/multigpu_tests/test_mori_smoke.py 2>&1 | tee -a latest_test.log"
 
       - name: Sync prebuilt kernels into source tree
         run: |
