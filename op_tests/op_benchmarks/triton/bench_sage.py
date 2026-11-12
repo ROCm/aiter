@@ -2142,7 +2142,10 @@ def benchmark_single_case(
     if args.report_quality:
         current_primary = primary_output(fn())
         current_primary = to_bshd_output_if_needed(current_primary, args)
-        ref_primary = make_reference_output(args, q, k, v, block_attn_mask)
+        # Sol-Attn approximates the blocks it leaves out instead of dropping them, so its
+        # reference is full attention whether the selection was routed or supplied.
+        reference_mask = None if args.kernel in SOL_KERNELS else block_attn_mask
+        ref_primary = make_reference_output(args, q, k, v, reference_mask)
         report_quality_against_reference(args, current_primary, ref_primary)
 
     total_flops = (
