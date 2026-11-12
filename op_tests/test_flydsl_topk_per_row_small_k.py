@@ -18,9 +18,10 @@ order is the order attention accumulates in.
 import argparse
 import itertools
 
-import aiter
 import pandas as pd
 import torch
+
+import aiter
 from aiter import dtypes
 from aiter.jit.utils.chip_info import get_gfx
 from aiter.ops.flydsl.topk.topk_per_row_small_k import (

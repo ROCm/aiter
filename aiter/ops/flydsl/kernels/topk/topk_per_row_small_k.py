@@ -40,16 +40,6 @@ from functools import cache, reduce
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
-from aiter.jit.utils.chip_info import get_gfx_runtime, get_lds_capacity_bytes
-from aiter.ops.flydsl.kernels.act import sigmoid_batch, sigmoid_f32
-from aiter.ops.flydsl.kernels.kernels_common import (
-    atomic_add_i32,
-    kernel_signature,
-    ord_signed_f32,
-    uint32_to_int32,
-)
-from aiter.ops.flydsl.kernels.tensor_shim import buf_copy_atom
-from aiter.ops.flydsl.kernels.topk.topk_common import _bounded_row_len
 from flydsl.expr import (
     Float32,
     Int32,
@@ -61,6 +51,17 @@ from flydsl.expr import (
 )
 from flydsl.expr import rocdl as fly_rocdl
 from flydsl.expr.typing import T
+
+from aiter.jit.utils.chip_info import get_gfx_runtime, get_lds_capacity_bytes
+from aiter.ops.flydsl.kernels.act import sigmoid_batch, sigmoid_f32
+from aiter.ops.flydsl.kernels.kernels_common import (
+    atomic_add_i32,
+    kernel_signature,
+    ord_signed_f32,
+    uint32_to_int32,
+)
+from aiter.ops.flydsl.kernels.tensor_shim import buf_copy_atom
+from aiter.ops.flydsl.kernels.topk.topk_common import _bounded_row_len
 
 _VEC = 4
 _BLOCK_THREADS = 512
