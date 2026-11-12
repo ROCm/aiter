@@ -2,6 +2,7 @@
 # Copyright (c) 2025 FlyDSL Project Contributors
 """Static MegaMoEV2 configuration rules for MI355X."""
 
+import os
 from bisect import bisect_left
 from collections.abc import Callable
 from dataclasses import dataclass, replace
@@ -28,8 +29,13 @@ TOKEN_BUCKETS = (
 FIXED_GRID_MULT_VALUES = (1, 2, 3, 4, 6, 8, 12, 16, 24, 32)
 P2P_FP8_MIN_MTPR = 1024
 # Largest MTPR dispatched fixed-slot (direct expert slots, no count exchange):
-# the MTPR classes up to 128; larger ones take the compact dispatch.
-FIXED_SLOT_MAX_MTPR = 255
+# the MTPR classes up to 128 by default; larger ones take the compact dispatch.
+# AITER_MEGA_FIXED_SLOT_MAX_MTPR raises it: 511 / 1023 / 2047 admit the 256 /
+# 512 / 1024-token capacities, validated on the EP8 V4-Pro layout. Serving
+# recipes set it (the SGLang and ATOM DeepSeek-V4 recipes) and vLLM's
+# DeepSeek-V4 MegaMoE reads FIXED_SLOT_MAX_MTPR, so it stays a public knob.
+# Read once, at import.
+FIXED_SLOT_MAX_MTPR = int(os.environ.get("AITER_MEGA_FIXED_SLOT_MAX_MTPR", "255"))
 MAX_MTPR_CLASS = 32768
 # Source-indexed payload storage cuts the maximum-capacity activation buffer by
 # roughly ``topk``, so every rank at the max-capacity MTPR class uses it
