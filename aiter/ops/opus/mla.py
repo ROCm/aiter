@@ -72,7 +72,7 @@ def opus_mla_decode_supported(fp8: bool, nhead: int, max_seqlen_q: int) -> int:
     """1 if :func:`opus_mla_decode_fwd` has a build for ``nhead`` x ``max_seqlen_q``."""
 
 
-# Flat-row decode (opus_mla_decode_flat.cu); aiter/ops/opus/mla_flat.py drives both.
+# Flat-row decode; aiter/ops/opus/mla_flat.py drives both.
 
 
 @compile_ops(DECODE_MD_NAME, ffi_type="ctypes")

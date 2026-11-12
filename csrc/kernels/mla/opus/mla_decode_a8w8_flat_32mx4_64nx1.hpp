@@ -4,7 +4,7 @@
 
 // MLA decode forward on gfx950, fp8 Q x fp8 KV, 32 rows per wave x 4 waves, full-rate MFMA only.
 //
-// Work items of the flat-row plan (opus_mla_decode_flat.cu): q/o rows are token * H + head, an item
+// Work items of the flat-row plan (opus_mla_decode_fwd.cu): q/o rows are token * H + head, an item
 // covers up to 128 of them (any head count, a request's tokens and heads packed together) and a KV
 // range [kv_start, kv_end) of kv_indices. An item with partial_slot >= 0 writes its normalised bf16
 // O and fp32 LSE to the 128-row partial slot partial_slot; partial_slot -1 writes out / lse
