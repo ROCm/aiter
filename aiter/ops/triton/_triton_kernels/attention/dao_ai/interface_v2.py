@@ -12,7 +12,6 @@ from aiter.ops.triton._triton_kernels.attention.dao_ai.fwd_prefill import (
     attention_forward_prefill_triton_impl,
 )
 from aiter.ops.triton._triton_kernels.attention.dao_ai.utils import (
-    BWD_MODE,
     DEBUG,
     PHILOX_OFFSET,
     PHILOX_SEED,
@@ -299,8 +298,6 @@ def bwd(
             raise ValueError("Alibi can be (nheads,) or (batch_size, nheads).")
 
     # call implementation
-    if DEBUG:
-        print(f"Using Triton implementation in {BWD_MODE} mode")
     attention_backward_triton_impl(
         do=dout,
         q=q,
@@ -325,7 +322,6 @@ def bwd(
         dropout_p=dropout_p,
         rng_state=rng_state,
         use_exp2=USE_EXP2,
-        mode=BWD_MODE,
         window_size_left=window_size_left,
         window_size_right=window_size_right,
     )
@@ -641,8 +637,6 @@ def varlen_bwd(
             raise ValueError("Alibi can be (nheads,) or (batch_size, nheads).")
 
     # call implementation
-    if DEBUG:
-        print(f"Using Triton implementation in {BWD_MODE} mode")
     attention_backward_triton_impl(
         do=dout,
         q=q,
@@ -667,7 +661,6 @@ def varlen_bwd(
         dropout_p=dropout_p,
         rng_state=rng_state,
         use_exp2=USE_EXP2,
-        mode=BWD_MODE,
         window_size_left=window_size_left,
         window_size_right=window_size_right,
     )
