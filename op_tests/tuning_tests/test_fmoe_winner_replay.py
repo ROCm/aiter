@@ -109,9 +109,18 @@ def two_stage(us1, us2, kernel1="s1", kernel2="s2", **row):
 class TestFmoeWinnerReplay(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
+        import pandas as pd
+
+        from aiter import ActivationType, QuantType, dtypes
+        from aiter.fused_moe import AsmMoeMode
         from aiter.tuning.moe import fused_moe
         from csrc.ck_gemm_moe_2stages_codegen import gemm_moe_tune
 
+        cls.ActivationType = ActivationType
+        cls.AsmMoeMode = AsmMoeMode
+        cls.QuantType = QuantType
+        cls.dtypes = dtypes
+        cls.pd = pd
         cls.gemm_moe_tune = gemm_moe_tune
         cls.fused_moe = fused_moe
         cls.shape = cls.make_shape(token=32)
@@ -129,11 +138,11 @@ class TestFmoeWinnerReplay(unittest.TestCase):
             1024,
             8,
             2,
-            m.ActivationType.Silu,
+            cls.ActivationType.Silu,
             bf16,
             q_dtype_a or bf16,
             q_dtype_w or bf16,
-            q_type or m.QuantType.No,
+            q_type or cls.QuantType.No,
             1,
             0,
         )
@@ -210,7 +219,7 @@ class TestFmoeWinnerReplay(unittest.TestCase):
                 out = self.tuner.post_process(list(results), self.args)
             profile_path = configs / "profile_fmoe.csv"
             self.assertTrue(profile_path.exists())
-            self.profile = m.pd.read_csv(profile_path)
+            self.profile = self.pd.read_csv(profile_path)
         return out
 
     def assertTimed(self, expected):
@@ -408,9 +417,8 @@ class TestFmoeWinnerReplay(unittest.TestCase):
     def test_f_fp4_activation_charges_quant_sort_to_unfused_stage1(self):
         from aiter.ops.quant import fused_dynamic_mxfp4_quant_moe_sort
 
-        m = self.gemm_moe_tune
-        fp4 = m.dtypes.fp4x2
-        shape = self.make_shape(32, fp4, fp4, m.QuantType.per_1x32)
+        fp4 = self.dtypes.fp4x2
+        shape = self.make_shape(32, fp4, fp4, self.QuantType.per_1x32)
         timed = [fused_dynamic_mxfp4_quant_moe_sort]
         with self.subTest("the _fp4 stage1 fuses it: 4 + 1 beats 1 + 5 + 1"):
             results = [
@@ -440,9 +448,8 @@ class TestFmoeWinnerReplay(unittest.TestCase):
     def test_f_fp4_quant_sort_cost_follows_block_m(self):
         from aiter.ops.quant import fused_dynamic_mxfp4_quant_moe_sort
 
-        m = self.gemm_moe_tune
-        fp4 = m.dtypes.fp4x2
-        shape = self.make_shape(32, fp4, fp4, m.QuantType.per_1x32)
+        fp4 = self.dtypes.fp4x2
+        shape = self.make_shape(32, fp4, fp4, self.QuantType.per_1x32)
         cost = {32: 2.0, 64: 7.0}
         # bm32: 1 + 2 + 1 = 4 beats bm64: 0.5 + 7 + 1; swapped costs flip it.
         results = [
@@ -463,9 +470,8 @@ class TestFmoeWinnerReplay(unittest.TestCase):
     def test_fp4_quant_sort_block_size_is_at_least_32(self):
         from aiter.ops.quant import fused_dynamic_mxfp4_quant_moe_sort
 
-        m = self.gemm_moe_tune
-        fp4 = m.dtypes.fp4x2
-        shape = self.make_shape(32, fp4, fp4, m.QuantType.per_1x32)
+        fp4 = self.dtypes.fp4x2
+        shape = self.make_shape(32, fp4, fp4, self.QuantType.per_1x32)
         # block_size is max(32, block_m): bm 16 is timed at 32, bm 64 at 64.
         # 1 + 2 + 1 = 4 beats 0.5 + 8 + 1.
         cost = {32: 2.0, 64: 8.0}
@@ -485,8 +491,9 @@ class TestFmoeWinnerReplay(unittest.TestCase):
         self.assertEqual(sizes, [32, 64])
 
     def test_f_fp8_activation_charges_cast_to_unfused_stage1(self):
-        m = self.gemm_moe_tune
-        shape = self.make_shape(32, m.dtypes.fp8, m.dtypes.fp4x2, m.QuantType.per_1x32)
+        shape = self.make_shape(
+            32, self.dtypes.fp8, self.dtypes.fp4x2, self.QuantType.per_1x32
+        )
         with self.subTest("the _fp8 stage1 fuses the cast: 4 + 1 beats 1 + 5 + 1"):
             results = [
                 self.cand("stage1", "s1", 1.0, shape=shape),
@@ -507,9 +514,8 @@ class TestFmoeWinnerReplay(unittest.TestCase):
     def test_f_per_1x128_charges_quant_to_non_xbf16_kernels(self):
         from aiter.ops.quant import per_group_quant_hip
 
-        m = self.gemm_moe_tune
-        fp8 = m.dtypes.fp8
-        shape = self.make_shape(32, fp8, fp8, m.QuantType.per_1x128)
+        fp8 = self.dtypes.fp8
+        shape = self.make_shape(32, fp8, fp8, self.QuantType.per_1x128)
         asm_row = {"kernel2": None, "run_1stage": 1}
         with self.subTest("the xbf16 kernel quantizes its input: 4 beats 1 + 5"):
             results = [
@@ -533,7 +539,7 @@ class TestFmoeWinnerReplay(unittest.TestCase):
             )
 
     def flat_race(self, shape, flat_us=3.0):
-        no_sort = self.gemm_moe_tune.AsmMoeMode.NO_SORT.value
+        no_sort = self.AsmMoeMode.NO_SORT.value
         return [
             self.asm("asm_flat", flat_us, shape=shape, flat=no_sort),
             self.asm("asm_sorted", 1.0, shape=shape),
@@ -542,7 +548,7 @@ class TestFmoeWinnerReplay(unittest.TestCase):
     def test_g_sorted_kernels_pay_moe_sorting(self):
         from aiter.fused_moe import moe_sorting
 
-        no_sort = self.gemm_moe_tune.AsmMoeMode.NO_SORT.value
+        no_sort = self.AsmMoeMode.NO_SORT.value
         asm_row = {"kernel2": None, "run_1stage": 1}
         # The head-to-head only runs for per_1x128, so nothing else is timed.
         with self.subTest("FLAT 3 beats the sorted kernel's 1 + 5"):
@@ -561,7 +567,7 @@ class TestFmoeWinnerReplay(unittest.TestCase):
     def test_g_moe_sorting_cost_follows_block_m(self):
         from aiter.fused_moe import moe_sorting
 
-        no_sort = self.gemm_moe_tune.AsmMoeMode.NO_SORT.value
+        no_sort = self.AsmMoeMode.NO_SORT.value
         cost = {32: 2.0, 64: 7.0}
         # bm32: 1 + 2 = 3 beats bm64: 0.5 + 7 and FLAT 4; swapped costs flip it.
         # moe_sorting(topk_ids, topk_w, expert, model_dim, dtype, block_m)
@@ -587,9 +593,7 @@ class TestFmoeWinnerReplay(unittest.TestCase):
         results = [
             self.asm("asm_sorted_bm16", 1.0, bm=16),
             self.asm("asm_sorted_bm64", 0.5, bm=64),
-            self.asm(
-                "asm_flat", 4.0, bm=16, flat=self.gemm_moe_tune.AsmMoeMode.NO_SORT.value
-            ),
+            self.asm("asm_flat", 4.0, bm=16, flat=self.AsmMoeMode.NO_SORT.value),
         ]
         self.assertWinner(
             results,
@@ -612,10 +616,9 @@ class TestFmoeWinnerReplay(unittest.TestCase):
     def test_g_flat_head_to_head_on_per_1x128(self):
         from aiter.fused_moe import moe_sorting
 
-        m = self.gemm_moe_tune
-        fp8 = m.dtypes.fp8
-        no_sort = m.AsmMoeMode.NO_SORT.value
-        shape = self.make_shape(32, fp8, fp8, m.QuantType.per_1x128)
+        fp8 = self.dtypes.fp8
+        no_sort = self.AsmMoeMode.NO_SORT.value
+        shape = self.make_shape(32, fp8, fp8, self.QuantType.per_1x128)
         timed = [moe_sorting, "_flat_seq", "_nf_seq"]
 
         def e2e(flat_us, sorted_us):
@@ -651,10 +654,9 @@ class TestFmoeWinnerReplay(unittest.TestCase):
     def test_flat_head_to_head_skips_a_two_stage_non_flat(self):
         from aiter.fused_moe import moe_sorting
 
-        m = self.gemm_moe_tune
-        fp8 = m.dtypes.fp8
-        no_sort = m.AsmMoeMode.NO_SORT.value
-        shape = self.make_shape(32, fp8, fp8, m.QuantType.per_1x128)
+        fp8 = self.dtypes.fp8
+        no_sort = self.AsmMoeMode.NO_SORT.value
+        shape = self.make_shape(32, fp8, fp8, self.QuantType.per_1x128)
         # FLAT 1 beats the pair's 1 + sort 5 + 1, but the best non-FLAT is
         # 2-stage, so the head-to-head does not run. If it did, _nf_seq at
         # 1 us would drop FLAT.
@@ -683,10 +685,9 @@ class TestFmoeWinnerReplay(unittest.TestCase):
     def test_flat_head_to_head_failure_keeps_the_additive_winner(self):
         from aiter.fused_moe import moe_sorting
 
-        m = self.gemm_moe_tune
-        fp8 = m.dtypes.fp8
-        no_sort = m.AsmMoeMode.NO_SORT.value
-        shape = self.make_shape(32, fp8, fp8, m.QuantType.per_1x128)
+        fp8 = self.dtypes.fp8
+        no_sort = self.AsmMoeMode.NO_SORT.value
+        shape = self.make_shape(32, fp8, fp8, self.QuantType.per_1x128)
 
         def blow_up(func, args, kwargs):
             if getattr(func, "__name__", "") == "_flat_seq":

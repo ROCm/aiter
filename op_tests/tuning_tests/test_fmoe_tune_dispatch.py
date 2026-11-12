@@ -91,6 +91,8 @@ def _kernel_names(tasks):
 class TestFmoeTuneDispatch(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
+        from aiter import ActivationType, QuantType, dtypes
+        from aiter.fused_moe import AsmMoeMode
         from aiter.tuning.moe import fused_moe
         from aiter.tuning.moe.backends import (
             asm_1stage,
@@ -101,6 +103,10 @@ class TestFmoeTuneDispatch(unittest.TestCase):
         )
         from csrc.ck_gemm_moe_2stages_codegen import gemm_moe_tune
 
+        cls.ActivationType = ActivationType
+        cls.AsmMoeMode = AsmMoeMode
+        cls.QuantType = QuantType
+        cls.dtypes = dtypes
         cls.gemm_moe_tune = gemm_moe_tune
         cls.fused_moe = fused_moe
         cls.backends_common = common
@@ -192,11 +198,11 @@ class TestFmoeTuneDispatch(unittest.TestCase):
             inter_dim,
             8,
             2,
-            m.ActivationType.Silu if act_type is None else act_type,
+            self.ActivationType.Silu if act_type is None else act_type,
             m.torch.bfloat16 if dtype is None else dtype,
-            m.dtypes.fp8 if q_dtype_a is None else q_dtype_a,
-            m.dtypes.fp4x2 if q_dtype_w is None else q_dtype_w,
-            m.QuantType.per_1x32 if q_type is None else q_type,
+            self.dtypes.fp8 if q_dtype_a is None else q_dtype_a,
+            self.dtypes.fp4x2 if q_dtype_w is None else q_dtype_w,
+            self.QuantType.per_1x32 if q_type is None else q_type,
             1,
             doweight_stage1,
         )
@@ -306,7 +312,6 @@ class TestFmoeTuneDispatch(unittest.TestCase):
     def test_opus_stage1_gates_leave_stage2_in_place(self):
         # stage1_supported only guards the stage1 loop. An unsupported
         # activation or doweight_stage1 drops stage1 and keeps every stage2.
-        m = self.gemm_moe_tune
 
         def by_stage(tasks):
             return {
@@ -318,7 +323,7 @@ class TestFmoeTuneDispatch(unittest.TestCase):
         self.assertTrue(base["stage1"])
         self.assertTrue(base["stage2"])
         cases = {
-            "Gelu": self.info(act_type=m.ActivationType.Gelu),
+            "Gelu": self.info(act_type=self.ActivationType.Gelu),
             "doweight_stage1": self.info(doweight_stage1=1),
         }
         for name, info in cases.items():
@@ -356,7 +361,6 @@ class TestFmoeTuneDispatch(unittest.TestCase):
         self.assertNotEqual(stage2(small), stage2(large))
 
     def test_flydsl_stage1_drops_kernels_whose_k_does_not_divide(self):
-        m = self.gemm_moe_tune
         kernels = self.backend_flydsl.get_flydsl_stage1_kernels("fp4", "fp4", "bf16")
 
         def divides(kparams, model_dim):
@@ -392,8 +396,8 @@ class TestFmoeTuneDispatch(unittest.TestCase):
             self.info(
                 model_dim=model_dim,
                 inter_dim=256,
-                q_dtype_a=m.dtypes.fp4x2,
-                q_dtype_w=m.dtypes.fp4x2,
+                q_dtype_a=self.dtypes.fp4x2,
+                q_dtype_w=self.dtypes.fp4x2,
             ),
             BLOCK_MS,
         )
@@ -406,18 +410,16 @@ class TestFmoeTuneDispatch(unittest.TestCase):
         self.assertEqual(leaked, [])
 
     def a16w16(self, **overrides):
-        m = self.gemm_moe_tune
-        bf16 = m.dtypes.bf16
+        bf16 = self.dtypes.bf16
         return self.info(
-            q_dtype_a=bf16, q_dtype_w=bf16, q_type=m.QuantType.No, **overrides
+            q_dtype_a=bf16, q_dtype_w=bf16, q_type=self.QuantType.No, **overrides
         )
 
     def a16w4(self, **overrides):
-        m = self.gemm_moe_tune
         return self.info(
             model_dim=3072,
-            q_dtype_a=m.dtypes.bf16,
-            q_dtype_w=m.dtypes.fp4x2,
+            q_dtype_a=self.dtypes.bf16,
+            q_dtype_w=self.dtypes.fp4x2,
             **overrides,
         )
 
@@ -427,11 +429,10 @@ class TestFmoeTuneDispatch(unittest.TestCase):
         return [t[4][3] for t in tasks if t[0][1] == "stage2"]
 
     def test_flydsl_a16w16_gate(self):
-        m = self.gemm_moe_tune
         gen = self.tuner.gen_flydsl_2stages_task
         self.assertTrue(gen(self.a16w16(), BLOCK_MS))
         cases = {
-            "Gelu": self.a16w16(act_type=m.ActivationType.Gelu),
+            "Gelu": self.a16w16(act_type=self.ActivationType.Gelu),
             "doweight_stage1": self.a16w16(doweight_stage1=1),
             "gfx90a": self.a16w16(gfx="gfx90a"),
         }
@@ -465,13 +466,12 @@ class TestFmoeTuneDispatch(unittest.TestCase):
         self.assertEqual([p for p in params if lds(p) > limit], [])
 
     def test_flydsl_v2_skips_block_m_16(self):
-        m = self.gemm_moe_tune
         tasks = self.tuner.gen_flydsl_v2_2stages_task(
             self.info(
                 model_dim=4096,
                 inter_dim=1024,
-                q_dtype_a=m.dtypes.fp4x2,
-                q_dtype_w=m.dtypes.fp4x2,
+                q_dtype_a=self.dtypes.fp4x2,
+                q_dtype_w=self.dtypes.fp4x2,
             ),
             BLOCK_MS,
         )
@@ -502,13 +502,12 @@ class TestFmoeTuneDispatch(unittest.TestCase):
         # filter, so with inter_dim % 128 != 0 the default mode keeps v2 alone
         # and submits stage1 with no stage2 to pair. TUNE_ONLY="" still
         # pairs other backends.
-        m = self.gemm_moe_tune
         frame = self.untuned(
             token=32,
             model_dim=5120,
             inter_dim=1088,
-            q_dtype_a=str(m.dtypes.fp8),
-            q_dtype_w=str(m.dtypes.fp4x2),
+            q_dtype_a=str(self.dtypes.fp8),
+            q_dtype_w=str(self.dtypes.fp4x2),
             q_type="QuantType.per_1x32",
         )
 
@@ -524,21 +523,22 @@ class TestFmoeTuneDispatch(unittest.TestCase):
 
     def test_ck_rejects_bf16_activation_with_fp4_weights(self):
         # Silu, so the Swiglu + fp4 early return does not hide this one.
-        m = self.gemm_moe_tune
         gen = self.tuner.gen_2stages_task
-        fp4 = m.dtypes.fp4x2
+        fp4 = self.dtypes.fp4x2
         self.assertTrue(gen(self.info(q_dtype_a=fp4, q_dtype_w=fp4), BLOCK_MS))
         self.assertEqual(
-            gen(self.info(q_dtype_a=m.dtypes.bf16, q_dtype_w=fp4), BLOCK_MS), []
+            gen(self.info(q_dtype_a=self.dtypes.bf16, q_dtype_w=fp4), BLOCK_MS), []
         )
 
     def test_exclude_kernels_filters_ck_stage2_only(self):
         # _TUNE_EXCLUDE_KERNEL_PATTERNS is read from the env at import, so the
         # test patches the parsed list.
-        m = self.gemm_moe_tune
-        fp8 = m.dtypes.fp8
+        fp8 = self.dtypes.fp8
         info = self.info(
-            inter_dim=2560, q_dtype_a=fp8, q_dtype_w=fp8, q_type=m.QuantType.per_Token
+            inter_dim=2560,
+            q_dtype_a=fp8,
+            q_dtype_w=fp8,
+            q_type=self.QuantType.per_Token,
         )
 
         def names(patterns):
@@ -569,8 +569,7 @@ class TestFmoeTuneDispatch(unittest.TestCase):
     def test_tune_only_cktile_covers_ck_and_cktile(self):
         # TUNE_ONLY=cktile and OPUS_SKIP_CKTILE gate CK and CK-tile together.
         # Real generators, so this still holds once gen_2stages_task splits.
-        m = self.gemm_moe_tune
-        fp8 = str(m.dtypes.fp8)
+        fp8 = str(self.dtypes.fp8)
         frames = {
             "ck": self.untuned(
                 model_dim=5120,
@@ -583,7 +582,7 @@ class TestFmoeTuneDispatch(unittest.TestCase):
                 model_dim=5120,
                 inter_dim=1152,
                 q_dtype_a=fp8,
-                q_dtype_w=str(m.dtypes.fp4x2),
+                q_dtype_w=str(self.dtypes.fp4x2),
                 q_type="QuantType.per_1x32",
             ),
         }
@@ -618,10 +617,9 @@ class TestFmoeTuneDispatch(unittest.TestCase):
             yield
 
     def test_asm_stage1_reads_the_int8_list_and_honours_exclusion(self):
-        m = self.gemm_moe_tune
-        i8 = m.dtypes.i8
+        i8 = self.dtypes.i8
         info = self.info(
-            inter_dim=2560, q_dtype_a=i8, q_dtype_w=i8, q_type=m.QuantType.per_Token
+            inter_dim=2560, q_dtype_a=i8, q_dtype_w=i8, q_type=self.QuantType.per_Token
         )
         listed = set(
             pd.read_csv(
@@ -649,9 +647,8 @@ class TestFmoeTuneDispatch(unittest.TestCase):
     def test_asm_1stage_per_1x32_keeps_only_post_reduce_at_inter_dim_tile_n(self):
         # per_1x32 has no 1-stage fmoe_func, so only POST_REDUCE kernels run,
         # and only for fp4 activations with inter_dim equal to their tile_n.
-        m = self.gemm_moe_tune
-        fp4 = m.dtypes.fp4x2
-        post_reduce = m.AsmMoeMode.POST_REDUCE.value
+        fp4 = self.dtypes.fp4x2
+        post_reduce = self.AsmMoeMode.POST_REDUCE.value
 
         def tags(**overrides):
             with self.asm_gfx950(self.backend_asm_1stage, pin_gfx=True):
@@ -747,13 +744,13 @@ class TestFmoeTuneDispatch(unittest.TestCase):
         # counts only tuned rows naming a kernel, and never unsupported ones.
         m = self.gemm_moe_tune
         tuner = m.Mxfp4FlydslTuner("mxfp4Fmoe", KEYS, RESULT_LIST, "mxfp4")
-        fp4 = str(m.dtypes.fp4x2)
+        fp4 = str(self.dtypes.fp4x2)
         supported = self.untuned(
-            q_dtype_a=fp4, q_dtype_w=fp4, q_type=str(m.QuantType.per_1x32)
+            q_dtype_a=fp4, q_dtype_w=fp4, q_type=str(self.QuantType.per_1x32)
         )
         shape = supported.iloc[0].to_dict()
         tuned = {"kernelName1": "k1", "kernelName2": "k2"}
-        unsupported = {**shape, "token": 4, "q_type": str(m.QuantType.per_Token)}
+        unsupported = {**shape, "token": 4, "q_type": str(self.QuantType.per_Token)}
         left = self.pre_processed(
             tuner,
             [{**shape, "token": t} for t in (1, 2, 3)] + [unsupported],
