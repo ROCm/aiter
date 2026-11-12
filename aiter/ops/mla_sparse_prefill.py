@@ -588,6 +588,51 @@ def _mla_sparse_prefill_fake(
     return out if out is not None else torch.empty_like(q)
 
 
+# Routed here rather than on either public spelling or on a backend binding.
+# `mla_sparse_prefill` and `pa_sparse_prefill_opus` are two public names for one
+# op and both call this directly, so this is where the op begins. Routing a
+# spelling instead would cover only the callers who happen to use that one, and
+# routing `_opus_sparse_prefill` would name a backend in the contract.
+#
+# `backend=` stays ABOVE this layer on purpose. It selects which implementation
+# AITER would run natively, which is a question the dispatcher answers before
+# the op begins; a provider asked to serve this contract is not offered it and
+# so cannot be asked to honour a pin it has no kernel for.
+@_route(op="mla_sparse_prefill", version=1)
+def _mla_sparse_prefill_routed(
+    q: torch.Tensor,
+    unified_kv: torch.Tensor,
+    kv_indices_prefix: torch.Tensor,
+    kv_indptr_prefix: torch.Tensor,
+    kv: torch.Tensor,
+    kv_indices_extend: torch.Tensor,
+    kv_indptr_extend: torch.Tensor,
+    attn_sink: torch.Tensor | None,
+    softmax_scale: float,
+    out: torch.Tensor | None = None,
+    num_kv_splits: int | None = None,
+) -> torch.Tensor:
+    """MLA sparse prefill over bf16/fp16 Q/KV (D = 512).
+
+    Shapes and meanings are those of :func:`mla_sparse_prefill`, minus its
+    ``backend`` argument. ``out`` is written in place when given and returned
+    either way, so a provider that allocates must still return what it wrote.
+    """
+    return _opus_sparse_prefill(
+        q,
+        unified_kv,
+        kv_indices_prefix,
+        kv_indptr_prefix,
+        kv,
+        kv_indices_extend,
+        kv_indptr_extend,
+        attn_sink,
+        softmax_scale,
+        out,
+        num_kv_splits,
+    )
+
+
 @torch_compile_guard(mutates_args=["out"], gen_fake=_mla_sparse_prefill_fake)
 def mla_sparse_prefill(
     q: torch.Tensor,
@@ -630,7 +675,7 @@ def mla_sparse_prefill(
       ``out``.
     """
     _check_backend("mla_sparse_prefill", backend, ("opus",))
-    return _opus_sparse_prefill(
+    return _mla_sparse_prefill_routed(
         q,
         unified_kv,
         kv_indices_prefix,
