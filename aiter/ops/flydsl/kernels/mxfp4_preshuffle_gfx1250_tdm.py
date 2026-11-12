@@ -93,6 +93,13 @@ if LDS_SOA_LOAD_INTERLEAVE is not None:
     LDS_SOA_LOAD_INTERLEAVE = int(LDS_SOA_LOAD_INTERLEAVE)
 FORCE_1X4_CLUSTER = int(os.environ.get("AITER_FLYDSL_FORCE_1X4_CLUSTER", "0"))
 DISABLE_CLUSTER_SYNC = int(os.environ.get("AITER_FLYDSL_DISABLE_CLUSTER_SYNC", "0"))
+# Output-tile epilogue of the non-scatter path. On gfx1250 the TDM store of the
+# LDS-staged tile (ds_store -> s_wait_dscnt 0 + s_barrier -> TDM store) can ship
+# stale LDS: 16-byte chunks of the B tile last loaded into the aliased stage.
+#   lds  LDS staging, then ds_load and row-contiguous buffer stores (default).
+#   tdm  LDS staging + TDM store.
+#   reg  masked buffer stores straight from the accumulator registers.
+TDM_REGSTORE = os.environ.get("AITER_FLYDSL_TDM_REGSTORE", "lds").strip().lower()
 if EXPLICIT_VGPR_PARTITION not in (0, 1):
     raise ValueError("AITER_FLYDSL_EXPLICIT_VGPR_PARTITION must be 0 or 1")
 if PLANAR_LDS not in (0, 1):
@@ -105,6 +112,8 @@ if FORCE_1X4_CLUSTER not in (0, 1):
     raise ValueError("AITER_FLYDSL_FORCE_1X4_CLUSTER must be 0 or 1")
 if DISABLE_CLUSTER_SYNC not in (0, 1):
     raise ValueError("AITER_FLYDSL_DISABLE_CLUSTER_SYNC must be 0 or 1")
+if TDM_REGSTORE not in ("lds", "tdm", "reg"):
+    raise ValueError("AITER_FLYDSL_TDM_REGSTORE must be lds, tdm or reg")
 
 SUPPORT_EXPLICIT_VGPR_PARTITION = bool(
     EXPLICIT_VGPR_PARTITION and is_fx_set_register_available()
@@ -327,6 +336,14 @@ def build_gemm_a8w4_tdm_task(
     sched_mma_group = iglp_params["mma_group"]
     sched_first_group = iglp_params["mma_first_group"]
     sched_ds_first = iglp_params["ds_first_n"]
+    # Output epilogue (see TDM_REGSTORE). The EP scatter keeps its TDM
+    # gather-store. fp8 stage-1 output is staged row-major even when A is
+    # preshuffled; only the LDS-tile copies (tdm, lds) reproduce that layout.
+    c_store = "tdm" if enable_ep_scatter else TDM_REGSTORE
+    if c_store == "reg" and a_preshuffled and stage1_quant_out and not a_is_fp4:
+        c_store = "tdm"
+    reg_store = c_store == "reg"
+    lds_store = c_store == "lds"
     if enable_ep_scatter:
         if stage1_act != 0:
             raise ValueError("enable_ep_scatter is gemm2-only (stage1_act must be 0)")
@@ -520,6 +537,7 @@ def build_gemm_a8w4_tdm_task(
     _drain = "_rolleddrain" if rolled_drain else ""
     _kwaves = f"_kw{k_waves}" if k_waves > 1 else ""
     _malign = f"_ma{m_align}" if m_align else ""
+    _c_store = {"tdm": "", "reg": "_regst", "lds": "_ldsst"}[c_store]
     _kname = (
         f"mxfp4_tdm_{_afp}{_a_layout}"
         f"_t{tile_m}x{tile_n}x{tile_k}_w{m_warp}x{n_warp}"
@@ -530,6 +548,7 @@ def build_gemm_a8w4_tdm_task(
         f"{_mma_group}{_ds_first}"
         f"{_explicit_vgpr_partition}{_planar_lds}"
         f"{_interleaved_lds_load}{_persistent}{_drain}{_malign}{_kwaves}"
+        f"{_c_store}"
     )
 
     # Compile the static path directly, preserving its launch ABI and the
@@ -2006,6 +2025,34 @@ def build_gemm_a8w4_tdm_task(
             )
             oc = fx.Float16 if out_is_f16 else fx.BFloat16
 
+            # reg / lds output: the same global tile the TDM store writes. Callers
+            # mask rows at or past mn_oob, the TDM store's outer extent; the
+            # resource bounds every store to this tile's rows.
+            c_quant = bool(stage1_quant_out and stage1_act)
+            if const_expr(stage1_act):
+                c_elem_b = 1 if c_quant else 2
+                c_row_b = i32_n // (4 if is_fp4_quant else 2) * c_elem_b
+                c_col_b = blk_n64 // (4 if is_fp4_quant else 2) * c_elem_b
+            else:
+                c_row_b = c_stride * 2
+                c_col_b = c_inner_off * 2
+            if const_expr(a_preshuffled and c_quant):
+                # Whole K32/M16 slabs: 16 rows x 16 bytes per K32 column block.
+                c_base_b = blk_m64 * fx.Int64(c_row_b) + c_col_b * 16
+            else:
+                c_base_b = c_outer_off * fx.Int64(c_row_b) + c_col_b
+            c_rsrc = (
+                create_buffer_resource_from_addr(
+                    fx.Int64(fx.ptrtoint(fx.recast_iter(fx.Int8, arg_c))) + c_base_b,
+                    num_records_bytes=(fx.Int64(c_row_b) * tile_m).ir_value(),
+                )
+                if const_expr(reg_store or lds_store)
+                else None
+            )
+
+            def c_reg_store(data, byte_off, mask=None):
+                buffer_store(data, c_rsrc, byte_off, mask=mask, offset_is_bytes=True)
+
             if const_expr(has_bias):
                 bias_elem = {1: T.bf16, 2: T.f32, 3: T.f16}[has_bias]
                 bias_ptr_type = fx.PointerType.get(
@@ -2068,6 +2115,21 @@ def build_gemm_a8w4_tdm_task(
                             + col % 16
                         )
                     return row * STORE_N + col
+
+                def quant_global_offset(row, col):
+                    # quant_byte_offset with the global row pitch.
+                    if const_expr(a_preshuffled):
+                        return (
+                            (row // 16) * 16 * c_row_b
+                            + (col // 16) * 256
+                            + (row % 16) * 16
+                            + col % 16
+                        )
+                    return row * c_row_b + col
+
+                # A preshuffled store ships whole M16 blocks, padding rows too.
+                def quant_row_mask(row_valid):
+                    return None if const_expr(a_preshuffled) else row_valid
 
                 for wm in range_constexpr(wmma_m_rep):
                     # A 16-row block entirely past this expert's valid rows has its
@@ -2157,16 +2219,28 @@ def build_gemm_a8w4_tdm_task(
                                     )
                                     col_fp4_0 = (wnb + wn0 * 16) // 4 + kgrp * 2
                                     col_fp4_1 = (wnb + wn1 * 16) // 4 + kgrp * 2
-                                    lds_store_b16(
-                                        stC_q_idx,
-                                        quant_byte_offset(row_rel, col_fp4_0),
-                                        packed_i32,
-                                    )
-                                    lds_store_b16(
-                                        stC_q_idx,
-                                        quant_byte_offset(row_rel, col_fp4_1),
-                                        packed_i32 >> fx.Int32(16),
-                                    )
+                                    if const_expr(reg_store):
+                                        c_reg_store(
+                                            fx.Int16(packed_i32),
+                                            quant_global_offset(row_rel, col_fp4_0),
+                                            quant_row_mask(row_valid),
+                                        )
+                                        c_reg_store(
+                                            fx.Int16(packed_i32 >> fx.Int32(16)),
+                                            quant_global_offset(row_rel, col_fp4_1),
+                                            quant_row_mask(row_valid),
+                                        )
+                                    else:
+                                        lds_store_b16(
+                                            stC_q_idx,
+                                            quant_byte_offset(row_rel, col_fp4_0),
+                                            packed_i32,
+                                        )
+                                        lds_store_b16(
+                                            stC_q_idx,
+                                            quant_byte_offset(row_rel, col_fp4_1),
+                                            packed_i32 >> fx.Int32(16),
+                                        )
                             else:
                                 for half in range_constexpr(WN_PER_MX_BLOCK // 2):
                                     src = Vec.from_elements(
@@ -2184,11 +2258,20 @@ def build_gemm_a8w4_tdm_task(
                                         wn = mx_blk * WN_PER_MX_BLOCK + sub_wn
                                         packed_i32 = fx.Vector(packed_v2i32)[sub]
                                         col_fp8 = (wnb + wn * 16 + kgrp * 8) // 2
-                                        lds_store_b32(
-                                            stC_q_idx,
-                                            row_rel * STORE_N + col_fp8,
-                                            Vec.from_elements([packed_i32], fx.Int32),
-                                        )
+                                        if const_expr(reg_store):
+                                            c_reg_store(
+                                                fx.Int32(packed_i32),
+                                                row_rel * c_row_b + col_fp8,
+                                                row_valid,
+                                            )
+                                        else:
+                                            lds_store_b32(
+                                                stC_q_idx,
+                                                row_rel * STORE_N + col_fp8,
+                                                Vec.from_elements(
+                                                    [packed_i32], fx.Int32
+                                                ),
+                                            )
 
                         # All lanes execute the store. Non-owner k-groups use the
                         # buffer instruction's OOB offset and are discarded;
@@ -2356,6 +2439,7 @@ def build_gemm_a8w4_tdm_task(
                 else:
                     for wm in range_constexpr(wmma_m_rep):
                         row_rel = wmb + wm * 16 + lane16
+                        row_ok = row_rel < mn_oob
                         for wn in range_constexpr(output_n_rep):
                             col_rel = wnb + wn * 16 + kgrp * 8
                             acc = _biased_acc(wm, wn, col_rel)
@@ -2381,11 +2465,18 @@ def build_gemm_a8w4_tdm_task(
                                         for p in range_constexpr(4)
                                     ]
                                 hv = Vec.from_elements(act_vals, fx.Float32).to(oc)
-                                lds_store_b64(
-                                    stC_idx,
-                                    (row_rel * STORE_N + col_rel // 2) * 2,
-                                    hv.bitcast(fx.Int32).ir_value(),
-                                )
+                                if const_expr(reg_store):
+                                    c_reg_store(
+                                        hv.bitcast(fx.Int32).ir_value(),
+                                        row_rel * c_row_b + (col_rel // 2) * 2,
+                                        row_ok,
+                                    )
+                                else:
+                                    lds_store_b64(
+                                        stC_idx,
+                                        (row_rel * STORE_N + col_rel // 2) * 2,
+                                        hv.bitcast(fx.Int32).ir_value(),
+                                    )
                             else:
                                 if const_expr(enable_ep_scatter):
                                     # Weight the row BEFORE truncating to bf16; the
@@ -2400,16 +2491,24 @@ def build_gemm_a8w4_tdm_task(
                                         [acc[i] for i in range_constexpr(8)], fx.Float32
                                     ).to(oc)
                                 hv_i32 = hv.bitcast(fx.Int32).ir_value()
-                                lds_store_b128(
-                                    stC_ep_idx,
-                                    (row_rel * STORE_PITCH + col_rel) * 2,
-                                    hv_i32,
-                                )
+                                if const_expr(reg_store):
+                                    c_reg_store(
+                                        hv_i32, row_rel * c_row_b + col_rel * 2, row_ok
+                                    )
+                                else:
+                                    lds_store_b128(
+                                        stC_ep_idx,
+                                        (row_rel * STORE_PITCH + col_rel) * 2,
+                                        hv_i32,
+                                    )
 
             # -- Shared LDS -> global --
             # dscnt-only barrier: the store reads LDS, not the e8m0 scales still
             # in flight, so their storecnt wait moves past the store below.
-            if const_expr(stage1_quant_out and stage1_act):
+            # The register store already wrote the tile; nothing reads LDS.
+            if const_expr(reg_store):
+                pass
+            elif const_expr(stage1_quant_out and stage1_act):
                 rocdl.s_wait_dscnt(0)
                 rocdl.s_barrier_signal(-1)
                 rocdl.s_barrier_wait(-1)
@@ -2520,7 +2619,75 @@ def build_gemm_a8w4_tdm_task(
                     else:
                         issue_scatter_group(group, scatter_vector, vector_pass)
                 tdm_ops.tensor_wait(0)
-            else:
+            elif const_expr(lds_store):
+                # The TDM store's transfer, done by the waves: 16 bytes per lane
+                # with consecutive lanes along a row, so each store instruction
+                # writes whole row segments. Same LDS source, rows and global
+                # bytes as the TDM store below.
+                if const_expr(a_preshuffled and c_quant):
+                    rb_rows, rb_bytes = tile_m // 16, STORE_N * 16
+                    rb_pitch, rb_gpitch = STORE_N * 16, c_row_b * 16
+                    rb_valid = (mn_oob + 15) // 16
+                else:
+                    rb_elem = 1 if c_quant else 2
+                    rb_rows, rb_bytes = tile_m, STORE_N * rb_elem
+                    rb_pitch, rb_gpitch = STORE_PITCH * rb_elem, c_row_b
+                    rb_valid = mn_oob
+                # 16-byte chunks per row and threads are powers of two, so one
+                # divides the other: a pass covers whole rows, or a row takes
+                # whole passes. Lane coordinates are computed once.
+                rb_cpr = rb_bytes // 16
+                rb_threads = num_waves * WAVE
+                assert rb_bytes % 16 == 0 and rb_cpr & (rb_cpr - 1) == 0
+                rb_tid = fx.Int32(wave * WAVE + lane)
+                if const_expr(rb_threads >= rb_cpr):
+                    rb_rpp = rb_threads // rb_cpr
+                    rb_passes = ceildiv(rb_rows, rb_rpp)
+                    rb_row0 = rb_tid >> fx.Int32(rb_cpr.bit_length() - 1)
+                    rb_col = (rb_tid & fx.Int32(rb_cpr - 1)) * 16
+                else:
+                    rb_ppr = rb_cpr // rb_threads
+                    rb_passes = rb_rows * rb_ppr
+                    rb_row0 = rb_tid * 0
+                    rb_col = rb_tid * 16
+                # Lanes past the last row (a pass wider than the tile) read row
+                # 0 instead and store nothing.
+                rb_spill = rb_threads > rb_cpr and rb_passes * rb_rpp > rb_rows
+                rb_lds0 = rb_row0 * rb_pitch + rb_col
+                rb_g0 = rb_row0 * rb_gpitch + rb_col
+
+                def rb_pass(p):
+                    # (row step, byte step) of pass p from the lane's chunk.
+                    if const_expr(rb_threads >= rb_cpr):
+                        return p * rb_rpp, 0
+                    return p // rb_ppr, p % rb_ppr * rb_threads * 16
+
+                RB_BATCH = 16
+                for rb_b in range_constexpr(ceildiv(rb_passes, RB_BATCH)):
+                    rb_lo = rb_b * RB_BATCH
+                    rb_hi = min(rb_passes, rb_lo + RB_BATCH)
+                    rb_vals = []
+                    for rb_p in range_constexpr(rb_lo, rb_hi):
+                        rb_dr, rb_dc = rb_pass(rb_p)
+                        if const_expr(rb_spill):
+                            rb_r = rb_row0 + rb_dr
+                            rb_r = (rb_r < rb_rows).select(rb_r, 0)
+                            rb_lds = rb_r * rb_pitch + rb_col + rb_dc
+                        else:
+                            rb_lds = rb_lds0 + (rb_dr * rb_pitch + rb_dc)
+                        rb_vals.append(lds_load_b128(stC_q_idx, rb_lds))
+                    for rb_p in range_constexpr(rb_lo, rb_hi):
+                        rb_dr, rb_dc = rb_pass(rb_p)
+                        rb_row = rb_row0 + rb_dr
+                        rb_ok = rb_row < rb_valid
+                        if const_expr(rb_spill):
+                            rb_ok = rb_ok & (rb_row < rb_rows)
+                        c_reg_store(
+                            rb_vals[rb_p - rb_lo],
+                            rb_g0 + (rb_dr * rb_gpitch + rb_dc),
+                            rb_ok,
+                        )
+            elif const_expr(not reg_store):
 
                 def store_tile(gt, tile, lds_ptr, lds_row):
                     # A k_waves workgroup's tile belongs to group 0 alone.
