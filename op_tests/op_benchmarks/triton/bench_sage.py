@@ -18,31 +18,35 @@ import torch
 import triton
 
 import aiter
+from aiter.jit.utils.chip_info import get_gfx
 from aiter.ops.mha import (
+    flash_attn_fp8_pertensor_func,
     flash_attn_func,
 )
 from aiter.ops.mha_v4 import (
+    MHA_V4_SPARSE_MODE,
     AttentionFormat,
     AttentionPack,
     AttentionScaleMode,
     mha_v4,
-    mha_v4_kv_tile,
+    mha_v4_block_tile,
+    mha_v4_block_tiles,
+    mha_v4_mx_producers,
+    mha_v4_operands,
     mha_v4_packed,
     native_fp8_format,
     scale_modes_for_formats,
 )
 from aiter.ops.mha_v4_quant import (
+    MHA_V4_HD256,
     mha_v4_q_multiplier,
     mxfp4_k_view,
     mxfp4_v_view,
     mxfp6_k_view,
+    mxfp6_k_view_hd256,
     quantize_fp8,
     quantize_fp8_rotated,
     quantize_int8,
-    quantize_mxfp4_k,
-    quantize_mxfp4_q,
-    quantize_mxfp6_k,
-    quantize_mxfp6_q,
     quantize_mxfp8_k,
     quantize_mxfp8_q,
     quantize_v_fp8,
@@ -51,7 +55,9 @@ from aiter.ops.mha_v4_quant import (
     quantize_v_mxfp6_fp6_p,
     rotate_activation_hd128,
 )
-from aiter.ops.triton._triton_kernels.flash_attn_triton_amd import flash_attn_3
+from aiter.ops.triton._triton_kernels.attention.dao_ai import (
+    flash_attn_3,
+)
 from aiter.ops.triton.attention.fav3_sage import (
     fav3_sage_func,
     fav3_sage_wrapper_func,
@@ -88,10 +94,13 @@ logger = logging.getLogger(__name__)
 
 
 def _production_quantize_mxfp4(query, key, value, softmax_scale):
-    q_fp4, q_scale = quantize_mxfp4_q(query, mha_v4_q_multiplier(softmax_scale))
-    k_raw, k_scale = quantize_mxfp4_k(key)
+    quant_q, quant_k, quant_v = mha_v4_mx_producers(
+        AttentionFormat.MXFP4, query.shape[-1]
+    )
+    q_fp4, q_scale = quant_q(query, mha_v4_q_multiplier(softmax_scale))
+    k_raw, k_scale = quant_k(key)
     k_fp4 = mxfp4_k_view(k_raw, k_scale)
-    v_raw, v_scale = quantize_v_mxfp4_fp6_p(value)
+    v_raw, v_scale = quant_v(value)
     v_fp4 = mxfp4_v_view(v_raw, v_scale, value.shape[1])
     return q_fp4, q_scale, k_fp4, k_scale, v_fp4, v_scale
 
@@ -106,16 +115,20 @@ def _production_quantize_mxfp8(query, key, value, softmax_scale):
 def _production_quantize_mxfp6(
     query, key, value, softmax_scale, v_format=None, fp6_p=False
 ):
-    q_fp6, q_scale = quantize_mxfp6_q(query, mha_v4_q_multiplier(softmax_scale))
-    k_raw, k_scale_raw = quantize_mxfp6_k(key)
-    batch, sequence, heads, _ = key.shape
-    k_fp6, k_scale = mxfp6_k_view(k_raw, k_scale_raw, batch, sequence, heads)
+    batch, sequence, heads, head_dim = key.shape
+    quant_q, quant_k, quant_v_fp6_p = mha_v4_mx_producers(
+        AttentionFormat.MXFP6, head_dim
+    )
+    q_fp6, q_scale = quant_q(query, mha_v4_q_multiplier(softmax_scale))
+    k_raw, k_scale_raw = quant_k(key)
+    k_view = mxfp6_k_view_hd256 if head_dim == MHA_V4_HD256 else mxfp6_k_view
+    k_fp6, k_scale = k_view(k_raw, k_scale_raw, batch, sequence, heads)
     if v_format is None:
         v_quantized, v_scale = quantize_v_fp8(value)
         return q_fp6, q_scale, k_fp6, k_scale, v_quantized, v_scale
 
     if v_format == AttentionFormat.MXFP6:
-        quantize_v = quantize_v_mxfp6_fp6_p if fp6_p else quantize_v_mxfp6
+        quantize_v = quant_v_fp6_p if fp6_p else quantize_v_mxfp6
         return q_fp6, q_scale, k_fp6, k_scale, *quantize_v(value)
     if v_format != AttentionFormat.MXFP4:
         raise ValueError(f"unsupported MXFP6 Q/K V format: {v_format!r}")
@@ -140,6 +153,8 @@ class KernelSpec:
     uses_hadamard: bool = False
     supports_causal: bool = True
     include_in_all: bool = False
+    # Output comes back in --layout; every other runner is handed BSHD and returns BSHD.
+    follows_layout: bool = False
 
 
 def _mha_v4_spec(
@@ -165,15 +180,20 @@ KERNEL_SPECS = {
         quantized=True,
         supports_block_sparse=True,
         uses_hadamard=True,
+        follows_layout=True,
     ),
     "sage_mxfp4": KernelSpec(
         (0.5, 0.5, 1.0),
         quantized=True,
         supports_block_sparse=True,
         uses_hadamard=True,
+        follows_layout=True,
     ),
     "fav3_fp8": KernelSpec((1.0, 1.0, 1.0), quantized=True, uses_hadamard=True),
     "aiter_bf16": KernelSpec((2.0, 2.0, 2.0), include_in_all=True),
+    # FMHA v3 per-tensor FP8, the quantized counterpart to the aiter_bf16 baseline. Select it
+    # explicitly; at d=256 it is the one non-MX row that runs at all.
+    "aiter_fp8": KernelSpec((1.0, 1.0, 1.0), quantized=True),
     "mha4_bf16": _mha_v4_spec(
         (2.0, 2.0, 2.0), quantized=False, supports_block_sparse=True
     ),
@@ -832,11 +852,65 @@ def load_block_mask_from_json(
     return None
 
 
-def kernel_block_sizes(kernel: str) -> tuple[int, int]:
-    # MHA v4's sparse tile is set by its manifest row, not by the Triton configs
-    # below: 256x128 on gfx950 but 256x64 on gfx942.
+def mha4_operands(kernel: str) -> tuple[int, ...]:
+    """The manifest key of the row an mha4_ kernel dispatches to, as make_kernel_runner launches it."""
+    bf16, int8 = AttentionFormat.BF16, AttentionFormat.INT8
+    mxfp6, mxfp4 = AttentionFormat.MXFP6, AttentionFormat.MXFP4
+    fp8 = native_fp8_format()
+    default, fp6_p = AttentionPack.DEFAULT, AttentionPack.V_FOR_FP6_P
+    mxfp8_scale_modes = (
+        AttentionScaleMode.E8M0_PER_1X32,
+        AttentionScaleMode.E8M0_PER_1X32,
+        AttentionScaleMode.F32_PER_TENSOR,
+    )
+    qk_format, v_format, v_pack, scale_modes = {
+        "mha4_bf16": (bf16, bf16, default, None),
+        "mha4_bf16fp8": (bf16, fp8, default, None),
+        "mha4_i8fp8": (int8, fp8, default, None),
+        "mha4_fp8": (fp8, fp8, default, None),
+        "mha4_mxfp8": (fp8, fp8, default, mxfp8_scale_modes),
+        "mha4_f8f6": (fp8, mxfp6, fp6_p, None),
+        "mha4_f6f8": (mxfp6, fp8, default, None),
+        "mha4_mxfp6": (mxfp6, mxfp6, fp6_p, None),
+        "mha4_f6f4": (mxfp6, mxfp4, fp6_p, None),
+        "mha4_mxfp4": (mxfp4, mxfp4, fp6_p, None),
+        "mha4_f4f4": (mxfp4, mxfp4, fp6_p, None),
+    }[kernel]
+    if scale_modes is None:
+        scale_modes = scale_modes_for_formats(qk_format, qk_format, v_format)
+    return mha_v4_operands(qk_format, qk_format, v_format, *scale_modes, v_pack)
+
+
+def parse_block_tile(value: str) -> tuple[int, int]:
+    q_tile, sep, kv_tile = value.lower().partition("x")
+    if not sep or not q_tile.isdigit() or not kv_tile.isdigit():
+        raise argparse.ArgumentTypeError(f"expected QxKV such as 64x64, got {value!r}")
+    return int(q_tile), int(kv_tile)
+
+
+def kernel_block_sizes(
+    kernel: str, block_tile: tuple[int, int] | None = None
+) -> tuple[int, int]:
+    # MHA v4's sparse tile is set by its manifest row, not by the Triton configs below, and the
+    # rows differ per recipe and per arch. block_tile picks one of the recipe's geometries; left
+    # None it is the recipe's default. Other kernels have one geometry and ignore it.
     if kernel.startswith("mha4_"):
-        return 256, mha_v4_kv_tile()
+        operands = mha4_operands(kernel)
+        tiles = mha_v4_block_tiles(operands, MHA_V4_SPARSE_MODE)
+        if not tiles:
+            raise ValueError(f"{kernel} has no block-sparse kernel on {get_gfx()}")
+        tile = (
+            mha_v4_block_tile(operands, MHA_V4_SPARSE_MODE)
+            if block_tile is None
+            else tuple(block_tile)
+        )
+        if tile not in tiles:
+            available = ", ".join(f"{q}x{kv}" for q, kv in tiles)
+            raise ValueError(
+                f"{kernel} has no {tile[0]}x{tile[1]} block-sparse kernel on {get_gfx()}; "
+                f"available: {available}"
+            )
+        return tile
     if kernel == "sage_mxfp4":
         cfg = get_sage_fwd_configs_mxfp4()
     else:
@@ -870,7 +944,7 @@ def build_block_mask(
     loaded_single_mask: LoadedMask | None,
 ) -> torch.Tensor | None:
     if loaded_single_mask is not None:
-        block_m, block_n = kernel_block_sizes(args.kernel)
+        block_m, block_n = kernel_block_sizes(args.kernel, args.mha4_block_tile)
         expected_q_blocks = (shape.n_ctx_q + block_m - 1) // block_m
         expected_kv_blocks = (shape.n_ctx_k + block_n - 1) // block_n
 
@@ -888,7 +962,7 @@ def build_block_mask(
     if args.block_sparsity is None:
         return None
 
-    block_m, block_n = kernel_block_sizes(args.kernel)
+    block_m, block_n = kernel_block_sizes(args.kernel, args.mha4_block_tile)
     num_q_blocks = (shape.n_ctx_q + block_m - 1) // block_m
     num_kv_blocks = (shape.n_ctx_k + block_n - 1) // block_n
 
@@ -909,11 +983,12 @@ def sparse_flops_from_lut(
     kernel: str,
     block_lut: tuple[torch.Tensor, torch.Tensor, torch.Tensor],
     shape: ShapeSpec,
+    block_tile: tuple[int, int] | None = None,
 ) -> tuple[float, float]:
     _, _, lut_count = block_lut
     num_sparse_pairs = lut_count.sum().item()
 
-    block_m, block_n = kernel_block_sizes(kernel)
+    block_m, block_n = kernel_block_sizes(kernel, block_tile)
     num_q_blocks = (shape.n_ctx_q + block_m - 1) // block_m
     num_kv_blocks = (shape.n_ctx_k + block_n - 1) // block_n
     num_dense_pairs = shape.batch * shape.hq * num_q_blocks * num_kv_blocks
@@ -953,11 +1028,15 @@ def cancel_internal_qk_rotation(
     q: torch.Tensor, k: torch.Tensor
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Pre-rotate Q/K so a fused production Hadamard quantizer emits raw-domain Q/K."""
-    q_rotated = torch.empty_like(q)
-    k_rotated = torch.empty_like(k)
-    rotate_activation_hd128(q_rotated, q)
-    rotate_activation_hd128(k_rotated, k)
-    return q_rotated, k_rotated
+
+    def rotate(x: torch.Tensor) -> torch.Tensor:
+        # The hd256 producers rotate each 128-wide half as its own head, so cancel per half.
+        rows = x.reshape(*x.shape[:-2], -1, 128)
+        rotated = torch.empty_like(rows)
+        rotate_activation_hd128(rotated, rows)
+        return rotated.reshape(x.shape)
+
+    return rotate(q), rotate(k)
 
 
 def rotate_qk_blocks(
@@ -1141,6 +1220,10 @@ def make_kernel_runner(
         if block_lut is not None and block_mask is not None
         else {}
     )
+    if args.mha4_block_tile is not None:
+        for sparse in (packed_sparse, raw_sparse):
+            if sparse:
+                sparse["block_tile"] = args.mha4_block_tile
 
     def launch_mha_v4_packed(*tensors, **kwargs):
         return mha_v4_packed(*tensors, **packed_sparse, **kwargs)
@@ -1295,6 +1378,41 @@ def make_kernel_runner(
             dropout_p=0.0,
             causal=args.causal,
             return_attn_probs=False,
+        )
+
+    if args.kernel == "aiter_fp8":
+        # Plain per-tensor FP8, deliberately unrotated: xDiT's AITER_FP8 Hadamard-rotates Q/K,
+        # so these two are not the same preprocessing and their accuracy is not comparable.
+        def _fp8_v3(q, k, v):
+            q_fp8, q_descale = quantize_fp8(q)
+            k_fp8, k_descale = quantize_fp8(k)
+            v_fp8, v_descale = quantize_fp8(v)
+            return flash_attn_fp8_pertensor_func(
+                q_fp8,
+                k_fp8,
+                v_fp8,
+                q_descale=q_descale,
+                k_descale=k_descale,
+                v_descale=v_descale,
+                causal=args.causal,
+                softmax_scale=softmax_scale,
+            )
+
+        if args.e2e:
+            return lambda: _fp8_v3(q_bshd, k_bshd, v_bshd)
+
+        q_fp8, q_descale = quantize_fp8(q_bshd)
+        k_fp8, k_descale = quantize_fp8(k_bshd)
+        v_fp8, v_descale = quantize_fp8(v_bshd)
+        return lambda: flash_attn_fp8_pertensor_func(
+            q_fp8,
+            k_fp8,
+            v_fp8,
+            q_descale=q_descale,
+            k_descale=k_descale,
+            v_descale=v_descale,
+            causal=args.causal,
+            softmax_scale=softmax_scale,
         )
 
     if args.kernel == "mha4_bf16":
@@ -1621,9 +1739,9 @@ def make_kernel_runner(
 
 def to_bshd_output_if_needed(
     out: torch.Tensor,
-    layout: Literal["bshd", "bhsd"],
+    args: argparse.Namespace,
 ) -> torch.Tensor:
-    if layout == "bhsd":
+    if args.layout == "bhsd" and KERNEL_SPECS[args.kernel].follows_layout:
         return out.permute(0, 2, 1, 3).contiguous()
     return out
 
@@ -1724,7 +1842,7 @@ def make_reference_output(
             raise ValueError(
                 "Block sparse comparison currently supports --ref=torch only"
             )
-        block_m, block_n = kernel_block_sizes(args.kernel)
+        block_m, block_n = kernel_block_sizes(args.kernel, args.mha4_block_tile)
         ref_out = attention_ref_block_sparse(
             q_bshd,
             k_bshd,
@@ -1832,7 +1950,7 @@ def benchmark_single_case(
 
     if args.report_quality:
         current_primary = primary_output(fn())
-        current_primary = to_bshd_output_if_needed(current_primary, args.layout)
+        current_primary = to_bshd_output_if_needed(current_primary, args)
         ref_primary = make_reference_output(args, q, k, v, block_attn_mask)
         report_quality_against_reference(args, current_primary, ref_primary)
 
@@ -1852,7 +1970,9 @@ def benchmark_single_case(
 
     sparse_flops = None
     if block_lut is not None:
-        sparse_flops, _ = sparse_flops_from_lut(args.kernel, block_lut, shape)
+        sparse_flops, _ = sparse_flops_from_lut(
+            args.kernel, block_lut, shape, args.mha4_block_tile
+        )
 
     if provider == "time(ms)":
         return ms
@@ -2029,6 +2149,15 @@ def validate_args(args: argparse.Namespace) -> None:
     if sparse_requested and (spec is None or not spec.supports_block_sparse):
         raise ValueError(f"{args.kernel} does not support block-sparse mode")
 
+    if args.mha4_block_tile is not None and not (
+        sparse_requested and args.kernel.startswith("mha4_")
+    ):
+        raise ValueError(
+            "--mha4-block-tile needs block-sparse mode and an mha4_ kernel"
+        )
+    if sparse_requested:
+        kernel_block_sizes(args.kernel, args.mha4_block_tile)
+
     if sparse_requested and args.causal:
         raise ValueError("block-sparse mode supports non-causal attention only")
 
@@ -2144,7 +2273,7 @@ def run_benchmark_captured(
 
 
 def run_benchmark_mask_list(args: argparse.Namespace, masks: list[LoadedMask]) -> None:
-    block_m, block_n = kernel_block_sizes(args.kernel)
+    block_m, block_n = kernel_block_sizes(args.kernel, args.mha4_block_tile)
 
     @triton.testing.perf_report(create_mask_list_config(args, masks))
     def bench_mha_masks(
@@ -2233,7 +2362,7 @@ def run_block_sparse_repetitions(
     q, k, v = layout_preprocess(q, k, v, layout="bhsd", target_layout=args.layout)
 
     shape = infer_shape_spec(q, v, args.layout)
-    block_m, block_n = kernel_block_sizes(args.kernel)
+    block_m, block_n = kernel_block_sizes(args.kernel, args.mha4_block_tile)
     num_q_blocks = (shape.n_ctx_q + block_m - 1) // block_m
     num_kv_blocks = (shape.n_ctx_k + block_n - 1) // block_n
 
@@ -2288,7 +2417,9 @@ def run_block_sparse_repetitions(
         dense_tflops = (total_flops / (ms * 1e-3)) / 1e12
         tflops_dense.append(dense_tflops)
 
-        sparse_flops, _ = sparse_flops_from_lut(args.kernel, lut, shape)
+        sparse_flops, _ = sparse_flops_from_lut(
+            args.kernel, lut, shape, args.mha4_block_tile
+        )
         effective_tflops = (sparse_flops / (ms * 1e-3)) / 1e12
         tflops_effective.append(effective_tflops)
 
@@ -2512,6 +2643,14 @@ def parse_args() -> argparse.Namespace:
         help="JSON file with block masks; takes precedence over --block-sparsity",
     )
     parser.add_argument(
+        "--mha4-block-tile",
+        type=parse_block_tile,
+        default=None,
+        metavar="QxKV",
+        help="Block-sparse geometry for an mha4_ kernel, e.g. 64x64 "
+        "(default: the recipe's own tile)",
+    )
+    parser.add_argument(
         "--n-repetitions",
         type=int,
         default=None,
@@ -2656,7 +2795,7 @@ def benchmark_all_kernel_row(
         ms = triton.testing.do_bench(fn, warmup=args.warmup, rep=args.rep)
         tflops = total_flops / ms * 1e-9
         current_primary = primary_output(fn())
-        current_primary = to_bshd_output_if_needed(current_primary, args.layout)
+        current_primary = to_bshd_output_if_needed(current_primary, args)
         accuracy = compute_accuracy_metrics(current_primary, ref_primary)
         return AllKernelRow(kernel_name, ms, tflops, accuracy)
     finally:

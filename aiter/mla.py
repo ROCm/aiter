@@ -31,6 +31,7 @@ from aiter.ops.attention import (
     _MlaHeadPlanKind,
     mla_ps64_qh128_fp8_asm_fwd,
 )
+from aiter.plugin import route as _route
 
 _FLYDSL_MLA_REDUCE_TARGET_GFX = ("gfx942", "gfx950")
 _FLYDSL_MLA_REDUCE_TARGET_H = 16
@@ -290,7 +291,7 @@ def _fwd_kernel_stage2_asm(
 
 
 @functools.lru_cache
-def get_meta_param(
+def _get_num_kv_splits(
     num_kv_splits,
     bs,
     total_kv,
@@ -379,6 +380,38 @@ def get_meta_param(
                 int(abs(total_kv / bs - max_seqlen_q) // min_block_n) + 1,
             )
 
+    return num_kv_splits
+
+
+def get_meta_param(
+    num_kv_splits,
+    bs,
+    total_kv,
+    nhead,
+    max_seqlen_q,
+    dtype,
+    tg_factor=1,
+    ignore_total_kv=0,
+):
+    """Pick the split count and build the matching uniform split indptr.
+
+    Only the split count is cached: an indptr returned from the cache is
+    captured into a CUDA graph as a bare pointer with no producing kernel, so
+    replay reads recycled storage once the entry is evicted. Eviction is
+    routine, since `total_kv` is part of the key and moves almost every decode
+    step. Rebuilding the indptr per call records `torch.arange` into the graph,
+    so every replay re-initialises the buffer.
+    """
+    num_kv_splits = _get_num_kv_splits(
+        num_kv_splits,
+        bs,
+        total_kv,
+        nhead,
+        max_seqlen_q,
+        dtype,
+        tg_factor,
+        ignore_total_kv,
+    )
     num_kv_splits_indptr = torch.arange(
         0, (bs + 1) * num_kv_splits, num_kv_splits, dtype=torch.int, device="cuda"
     )
@@ -1254,6 +1287,16 @@ def mla_decode_fwd(
             and get_gfx() == "gfx950"
         ):
             mgc = 32
+        # gfx950 fp8 gqa16 qlen1 kernel (a8w8_qh16_qseqlen1) does the same with
+        # SUB_KV=128 tiles.
+        if (
+            nhead == 16
+            and q.dtype == dtypes.fp8
+            and kv_buffer.dtype == dtypes.fp8
+            and max_seqlen_q == 1
+            and get_gfx() == "gfx950"
+        ):
+            mgc = 128
 
         # QH64's BF16 direct-output epilogue does not write LSE. Request FP32
         # partials and merge even a single split when the caller needs LSE.
@@ -2266,6 +2309,7 @@ def mla_prefill_reduce(
 # DSv4 MLA -- additive entry point. Does NOT touch any existing
 #   gqa_ratio=64, sub_Q=64, page_size=1, q_dtype=fp8, kv_dtype=fp8
 # ---------------------------------------------------------------------------
+@_route(op="mla_decode_fwd_v4_nm", version=1)
 def mla_decode_fwd_v4_nm(
     q,  # [total_query_len, num_heads, head_size]   FP8 packed Q+e8m0
     qrope,  # [total_query_len, num_heads, kv_rotary]   BF16
@@ -2632,6 +2676,7 @@ def mla_decode_fwd_v4_nm(
     return logits, attn_lse
 
 
+@_route(op="mla_decode_fwd_v4_nm_ps", version=1)
 def mla_decode_fwd_v4_nm_ps(
     q_packed,  # [N, 128, 512] FP8 packed Q+e8m0
     q_rope,  # [N, 128, 64] BF16
