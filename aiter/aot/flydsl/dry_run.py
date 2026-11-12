@@ -158,6 +158,7 @@ def dry_run(
         )
 
     real_getitem = torch.Tensor.__getitem__
+    real_setitem = torch.Tensor.__setitem__
     real_contiguous = torch.Tensor.contiguous
 
     # A handful of torch's Tensor methods take a device guard in their own
@@ -188,6 +189,21 @@ def dry_run(
             # without the guard.
             return torch.ops.aten.index(tensor, list(items))
         return real_getitem(tensor, index)
+
+    def setitem(tensor, index, value):
+        """``tensor[index] = value``. Under basic indexing it is a copy into
+        the view ``getitem`` answers (e.g. a padded MXFP4 scale's real part),
+        through the op, as ``Tensor.copy_``'s binding takes the guard too."""
+        if not isinstance(tensor, FakeTensor) or tensor.device.type != "cuda":
+            return real_setitem(tensor, index, value)
+        items = index if isinstance(index, tuple) else (index,)
+        if not all(isinstance(item, _VIEW_INDEX) for item in items):
+            return real_setitem(tensor, index, value)
+        view = getitem(tensor, index)
+        if isinstance(value, torch.Tensor):
+            torch.ops.aten.copy_(view, value)
+        else:
+            torch.ops.aten.fill_(view, value)
 
     def contiguous(tensor, memory_format=torch.contiguous_format):
         """``tensor.contiguous()``, whose binding takes the guard only on the
@@ -237,6 +253,7 @@ def dry_run(
             (graph_alloc, "_capture_id", lambda _stream: None),
             (torch.Tensor, "data_ptr", data_ptr),
             (torch.Tensor, "__getitem__", getitem),
+            (torch.Tensor, "__setitem__", setitem),
             (torch.Tensor, "contiguous", contiguous),
             (torch.Tensor, "record_stream", lambda *_a, **_k: None),
             (chip_info, "_detect_native", lambda: [arch]),

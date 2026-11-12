@@ -8,6 +8,7 @@ These run on CPU: each launch happens inside ``dry_run`` and compiles nothing.
 import csv
 import os
 import pathlib
+import subprocess
 import sys
 from types import SimpleNamespace
 from unittest import mock
@@ -128,6 +129,53 @@ def test_the_dry_run_builds_capture_scoped_scratch_without_asking_hip(monkeypatc
         device = torch.device("cuda", 0)
         assert zeros(device) is zeros(device)
     assert calls == [device]
+
+
+def test_the_dry_run_pads_an_mxfp4_scale_with_the_gpus_hidden():
+    """``shuffle_scale_a16w4`` pads a scale whose K/32 is not a multiple of 8
+    with ``padded[:, :k] = scale``. On torch 2.9.1 the bindings of
+    ``__setitem__`` and ``copy_`` take a device guard, which with the GPUs
+    hidden, as a replay process hides them, raises hipErrorNoDevice."""
+    from aiter.aot.flydsl.common import replay_env
+
+    code = (
+        "import torch\n"
+        "from aiter import dtypes\n"
+        "from aiter.aot.flydsl.dry_run import dry_run\n"
+        "from aiter.ops.shuffle import shuffle_scale_a16w4\n"
+        "with dry_run('gfx950', 256):\n"
+        "    scale = torch.empty(2 * 3584, 12, dtype=dtypes.fp8_e8m0, device='cuda')\n"
+        "    assert shuffle_scale_a16w4(scale, 2, False).shape == (2 * 3584, 16)\n"
+        "    scale[0] = 1.0\n"
+    )
+    result = subprocess.run(
+        [sys.executable, "-c", code],
+        cwd=_REPO_ROOT,
+        env=replay_env("gfx950"),
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode == 0, result.stderr[-4000:]
+
+
+def test_the_dry_run_answers_an_assignment_through_an_index(monkeypatch):
+    """torch 2.9.1's guarded ``__setitem__`` binding, simulated so that a torch
+    without the guard runs the stand-in too. The scale shuffles' K padding, the
+    int4 weight packing and MegaMoE's peer pointer table assign this way."""
+
+    def no_gpu(*_args):
+        raise RuntimeError("HIP error: no ROCm-capable device is detected")
+
+    monkeypatch.setattr(torch.Tensor, "__setitem__", no_gpu)
+    with dry_run("gfx950", 256):
+        scale = torch.empty((4, 16), device="cuda", dtype=torch.uint8)
+        scale[:, :12] = torch.empty((4, 12), device="cuda", dtype=torch.uint8)
+        scale[:, 0] = scale[:, 1] | (scale[:, 2] << 4)
+        table = torch.empty(8, device="cuda", dtype=torch.int64)
+        table[3] = 1 << 40
+        assert scale.shape == (4, 16)
+        assert table.shape == (8,)
 
 
 def test_per_arch_replays_get_the_command_line(monkeypatch):
