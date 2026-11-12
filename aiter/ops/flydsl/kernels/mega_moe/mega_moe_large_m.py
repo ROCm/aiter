@@ -1040,12 +1040,13 @@ def emit_dispatch_group(
 def emit_presend(
     *, num_waves, fz_k, fz_epr, fz_mtpr, fz_rank, fz_npes, fz_total_experts, fz_nbytes, fz_n_i32, fz_scale_n_i32,
     fz_enable_scales, addr_disp, addr_in_tok, addr_in_sc, addr_in_idx, i32_cur_tok, worker, workers, payload_epoch,
-    presend_experts, presend_limit=None,
+    presend_experts, presend_limit=None, scale_bound=False,
 ):
 # fmt: on
     """Dedup rows, before the plan: send every token row whose lowest expert at a destination is one of that
     destination's first presend_experts local experts (the first payload round), then stamp its arrival.
     presend_limit: a runtime expert count used in place of presend_experts.
+    scale_bound: the token-scale reads are bounded by the mtpr-row scale buffer (see emit_dispatch_payload).
 
     A dedup row's place (rank * mtpr + token) does not depend on the plan, so the first round's rows cross XGMI while
     the plan runs; that round's payload tasks then send only the route headers.
@@ -1061,6 +1062,7 @@ def emit_presend(
     lane = fx.thread_idx.x & fx.Int32(63)
     warp = fx.Int32(fx.rocdl.readfirstlane(T.i32, fx.thread_idx.x >> fx.Int32(6)))
     r_idx = AddrBuffer(addr_in_idx)
+    r_sc = AddrBuffer(addr_in_sc, fx.Int32(fz_mtpr * fz_scale_n_i32 * 4) if const_expr(scale_bound) else None)
     for item in range(worker * fx.Int32(num_waves) + warp, i32_cur_tok * fx.Int32(fz_npes), workers * fx.Int32(num_waves)):
         token = item // fx.Int32(fz_npes)
         destination = item - token * fx.Int32(fz_npes)
@@ -1076,7 +1078,7 @@ def emit_presend(
             row_values = [load_at(source_rsrc, lane * fx.Int32(4) + fx.Int32(c * 256), fx.Int32, 4)
                 for c in range_constexpr(fz_n_i32 // 256)]
             if const_expr(fz_enable_scales):
-                row_values.append(load_at(AddrBuffer(addr_in_sc), token * fx.Int32(fz_scale_n_i32)
+                row_values.append(load_at(r_sc, token * fx.Int32(fz_scale_n_i32)
                     + lane * fx.Int32(4), fx.Int32, 4, mask=lane * fx.Int32(4) < fx.Int32(fz_scale_n_i32)))
             token_row = fx.Int32(fz_rank * fz_mtpr) + token
             destination_rsrc = AddrBuffer(load_at(AddrBuffer(p_rx), destination, fx.Int64, 1)
@@ -1117,7 +1119,7 @@ def emit_dispatch_payload(
     producer_slot, parity, expected, producers_per_destination, chunks_per_destination, payload_chunk_rows,
     dedup=False, addr_in_idx=None, merge_release=False, skip_payload_ready=False, chunk_release=True,
     batch_rows=False, lds_base_i32=None, presend_experts=0, bucket_pairs=False, presend_limit=None,
-    hoist_peer=False,
+    hoist_peer=False, scale_bound=False,
 ):
 # fmt: on
     """Produce independently publishable expert payloads from a compact plan.
@@ -1141,12 +1143,17 @@ def emit_dispatch_payload(
     hoist_peer: the destination's rows per tile (set before its launch handshake) is read before the plan wait and its
     ready-order flag once after it, instead of after the wait and in every chunk publish (two XGMI reads off the
     first chunk's path).
+
+    scale_bound (batch_rows): the token-scale reads are bounded by the mtpr-row scale buffer. A row's scales take its
+    first lanes; the masked loads of the other lanes move past the buffer bound, which without it is 4 GiB, so they
+    read 2 GiB past the buffer and fault where nothing is mapped there.
     """
     assert merge_release or chunk_release
     assert not presend_experts or batch_rows
     if const_expr(batch_rows):
         assert dedup and payload_chunk_rows <= num_waves * 64 and fz_n_i32 % 256 == 0
         assert not fz_enable_scales or fz_scale_n_i32 % 4 == 0
+        r_sc = AddrBuffer(addr_in_sc, fx.Int32(fz_mtpr * fz_scale_n_i32 * 4) if const_expr(scale_bound) else None)
         send_cnt_addr = fx.Int64(lds_base_i32 + fx.Int32(16))
 
         def _send_slot(i):
@@ -1319,7 +1326,7 @@ def emit_dispatch_payload(
                     row_values = [load_at(source_rsrc, lane * fx.Int32(4) + fx.Int32(c * 256), fx.Int32, 4)
                         for c in range_constexpr(fz_n_i32 // 256)]
                     if const_expr(fz_enable_scales):
-                        row_values.append(load_at(AddrBuffer(addr_in_sc), token * fx.Int32(fz_scale_n_i32)
+                        row_values.append(load_at(r_sc, token * fx.Int32(fz_scale_n_i32)
                             + lane * fx.Int32(4), fx.Int32, 4, mask=lane * fx.Int32(4) < fx.Int32(fz_scale_n_i32)))
                     values.append(row_values)
 
@@ -1837,6 +1844,9 @@ def large_m_kernel_specs(
     if k1.batch_rows:
         assert k1.dedup_rows
         s2_spec += (("disp_batch", 1),)
+    if k1.bounded_scales:
+        assert k1.batch_rows
+        s2_spec += (("disp_sc_bound", 1),)
     if k1.presend_experts:
         assert k1.batch_rows
         s2_spec += (("disp_presend", int(k1.presend_experts)),)
@@ -1980,7 +1990,7 @@ def compile_mega_moe_stage1(
             "disp_no_ready", "g1_one_acq", "disp_no_rel", "g1_a_asm", "g1_as_pack", "g1_epi_lean", "g2_a_uni", "g2_skip_pad", "disp_batch",
             "plan_lean", "plan_tag", "disp_bucket", "disp_presend", "disp_presend_rows", "disp_pmb_small", "g2_m_group", "g2_early", "g2_early_xcd", "g2_nt_single",
             "g2_early_mid", "disp_early_hist", "disp_peer_hoist",
-            "disp_early_clear")
+            "disp_early_clear", "disp_sc_bound")
     }
     # g1_short_rows > 0: a GEMM1 m-tile whose row g1_short_rows is padding (an expert's tail tile) runs a
     # g1_short_rows-row tile; padding sits at the end of an expert's rows, so so does every later row.
@@ -2009,6 +2019,8 @@ def compile_mega_moe_stage1(
     G1_EPI_LEAN = int(_s2.get("g1_epi_lean", 0))
     # disp_batch: with g1_dedup, a payload chunk resolves its routes one per thread, then copies the sent rows.
     DISP_BATCH = bool(_s2.get("disp_batch", 0))
+    # disp_sc_bound: with disp_batch, the token-scale reads are bounded by the scale buffer (emit_dispatch_payload).
+    DISP_SC_BOUND = bool(_s2.get("disp_sc_bound", 0))
     # disp_presend: with disp_batch, the consumer CTAs send the first payload round's token rows before the plan.
     DISP_PRESEND = int(_s2.get("disp_presend", 0))
     # disp_presend_rows: the presend covers disp_presend_rows // tokens experts (between disp_presend and 64).
@@ -2383,7 +2395,7 @@ def compile_mega_moe_stage1(
                     addr_in_tok=addr_in_tok, addr_in_sc=addr_in_sc, addr_in_idx=addr_in_idx, i32_cur_tok=i32_cur_tok,
                     worker=ticket - fx.Int32(dispatch_blocks + 1), workers=fx.Int32(launch_grid_x - 1 - dispatch_blocks),
                     payload_epoch=(payload_expected // fx.Int32(fz_npes)) * fx.Int32(2) - payload_parity,
-                    presend_experts=DISP_PRESEND, presend_limit=presend_limit)
+                    presend_experts=DISP_PRESEND, presend_limit=presend_limit, scale_bound=DISP_SC_BOUND)
                 # fmt: on
 
         if producer:
@@ -2421,7 +2433,7 @@ def compile_mega_moe_stage1(
                     merge_release=DISP_MERGE_REL, skip_payload_ready=DISP_NO_READY, chunk_release=not DISP_NO_REL,
                     batch_rows=DISP_BATCH, lds_base_i32=fx.Int32(fx.ptrtoint(lds.pool.ptr)),
                     presend_experts=DISP_PRESEND, bucket_pairs=DISP_BUCKET, presend_limit=presend_limit,
-                    hoist_peer=DISP_PEER_HOIST,
+                    hoist_peer=DISP_PEER_HOIST, scale_bound=DISP_SC_BOUND,
                 )
         addr_tile_ready = _disp_ptr(DispatchSlot.TILE_READY)
         addr_tile_expected = _disp_ptr(DispatchSlot.TILE_EXPECTED)
@@ -3139,7 +3151,7 @@ class LargeMRuntime:
             experts=experts, topk=topk, quant=quant, swiglu_limit=float(swiglu_limit),
         ) or max_tok_per_rank not in large_mtprs:
             raise ValueError(
-                "the large-input path requires a fused a8w4 layout on gfx950 (EP8 DeepSeek-V4-Pro or EP4 "
+                "the large-input path requires a fused a8w4 layout on gfx950 (EP8 DeepSeek-V4-Pro or EP4 / EP2 "
                 "DeepSeek-V4.1-Flash, swiglu_limit=10) and a max_tok_per_rank the layout builds it for "
                 f"({large_mtprs or 'none'})"
             )

@@ -4,7 +4,7 @@
 
 Every EP rank must take the same route for a call, so the plan's choice may
 depend only on EP-wide inputs (the plan and the call's max_tokens). The
-multi-GPU behaviour of each route (EP8 DeepSeek-V4-Pro, EP4 DeepSeek-V4.1-Flash)
+multi-GPU behaviour of each route (EP8 DeepSeek-V4-Pro, EP4 / EP2 DeepSeek-V4.1-Flash)
 lives in op_tests/multigpu_tests/test_mega_moe_v2.py: --suite size for the
 pinned staged and large-input routes, --suite routes for the instance that
 serves all three.
@@ -52,6 +52,11 @@ V41_FLASH_EP4 = dict(V4_PRO, world_size=4, model_dim=5120, inter_dim=2304, exper
 V41_FLASH_EP4_SHAPE = dict(
     world_size=4, experts_per_rank=96, model_dim=5120, inter_dim=2304
 )
+# EP2 DeepSeek-V4.1-Flash: 192 experts a rank.
+V41_FLASH_EP2 = dict(V41_FLASH_EP4, world_size=2)
+V41_FLASH_EP2_SHAPE = dict(
+    world_size=2, experts_per_rank=192, model_dim=5120, inter_dim=2304
+)
 MTPRS = tuple(b for b in TOKEN_BUCKETS if b >= 16)
 
 
@@ -66,6 +71,8 @@ def _plan(mtpr, *, small=DEFAULT_SMALL_M_MTPRS, large=None):
 def test_fused_layout_gate():
     assert fused_layout_supported(**V4_PRO)
     assert fused_layout_supported(**V41_FLASH_EP4)
+    assert fused_layout_supported(**V41_FLASH_EP2)
+    assert not fused_layout_supported(**{**V41_FLASH_EP2, "experts": 192})
     # Each layout is supported whole: no mix of the two shapes.
     assert not fused_layout_supported(**{**V41_FLASH_EP4, "world_size": 8})
     assert not fused_layout_supported(**{**V41_FLASH_EP4, "experts": 768})
@@ -152,6 +159,21 @@ def test_large_m_capacities_per_layout():
             ), (mtpr, tokens)
     with pytest.raises(ValueError):
         select_fused_config(32768, 32768, **V41_FLASH_EP4_SHAPE)
+    # EP2 V4.1-Flash: 8192 and 16384, one tune.
+    assert large_m_mtprs_for(world_size=2, model_dim=5120, inter_dim=2304) == (
+        8192,
+        16384,
+    )
+    tuned = _knob_table(select_fused_config(8192, 8192, **V41_FLASH_EP2_SHAPE))
+    for mtpr in (8192, 16384):
+        for tokens in (0, 1, LARGE_M_MIN_TOKENS, mtpr):
+            assert (
+                _knob_table(select_fused_config(tokens, mtpr, **V41_FLASH_EP2_SHAPE))
+                == tuned
+            ), (mtpr, tokens)
+    for mtpr in (1024, 2048, 4096, 32768):
+        with pytest.raises(ValueError):
+            select_fused_config(mtpr, mtpr, **V41_FLASH_EP2_SHAPE)
 
 
 @pytest.mark.parametrize("mtpr", MTPRS)
@@ -180,7 +202,7 @@ def test_ep4_route_for_every_max_tokens(mtpr):
         assert plan.route_for(max_tokens, large_m=False)[0] != ROUTE_LARGE_M
 
 
-@pytest.mark.parametrize("layout", ("ep8", "ep4"))
+@pytest.mark.parametrize("layout", ("ep8", "ep4", "ep2"))
 def test_large_m_buffers_fit_32bit_offsets(layout):
     """Every large-input capacity keeps its buffer-resource views inside 32-bit offsets and its encodings in
     their bit fields (the kernel and LargeMRuntime raise past them; this pins the margin).
@@ -190,9 +212,11 @@ def test_large_m_buffers_fit_32bit_offsets(layout):
         large_m_kernel_specs,
     )
 
-    world_size, epr, model_dim, inter_dim = (
-        (8, 48, 7168, 3072) if layout == "ep8" else (4, 96, 5120, 2304)
-    )
+    world_size, epr, model_dim, inter_dim = {
+        "ep8": (8, 48, 7168, 3072),
+        "ep4": (4, 96, 5120, 2304),
+        "ep2": (2, 192, 5120, 2304),
+    }[layout]
     for mtpr in large_m_mtprs_for(
         world_size=world_size, model_dim=model_dim, inter_dim=inter_dim
     ):
@@ -336,6 +360,11 @@ def test_ep8_fused_configs_keep_fused_knobs_off():
         assert config.fused_stage2 == FusedStage2Knobs(), (mtpr, tokens)
 
 
+# Fused knobs added with the EP2 V4.1-Flash tune: they enter the table only when set, so the digests pinned before
+# them stay.
+_EP2_KNOBS = ("stream_w", "bounded_scales")
+
+
 def _knob_table(config):
     return (
         astuple(config.stage1),
@@ -344,6 +373,8 @@ def _knob_table(config):
         tuple(
             (f.name, getattr(config.fused_stage1, f.name))
             for f in fields(FusedStage1Knobs)
+            if f.name not in _EP2_KNOBS
+            or getattr(config.fused_stage1, f.name) != f.default
         ),
         tuple(
             (f.name, getattr(config.fused_stage2, f.name))
@@ -466,3 +497,127 @@ def test_route_payload_sharing():
         assert LargeMRuntime.ends_all_ranks(max_tok_per_rank=mtpr, **ep8)
     for mtpr in large_m_mtprs_for(world_size=4, model_dim=5120, inter_dim=2304):
         assert not LargeMRuntime.ends_all_ranks(max_tok_per_rank=mtpr, **ep4)
+
+
+@pytest.mark.parametrize("mtpr", (256, 512))
+def test_ep2_small_m_buckets_share_one_protocol(mtpr):
+    """EP2 V4.1-Flash: one launch protocol over every bucket, 32-row expert tiles everywhere (8-16 rows an expert
+    at 256-512 tokens), and one GEMM2 block_n over the tok_done buckets."""
+    protocols, tok_done_block_n = set(), set()
+    for bucket in (b for b in FUSED_TOKEN_BUCKETS if b <= mtpr):
+        config = select_fused_config(bucket, mtpr, **V41_FLASH_EP2_SHAPE)
+        k = config.fused_stage1
+        protocols.add(
+            (
+                k.dedup_rows,
+                k.plan_local,
+                bool(k.direct_done),
+                k.tok_counters,
+                k.bf16_head_tokens,
+            )
+        )
+        assert not k.tok_done or k.tok_counters
+        assert not k.tok_counters or (k.plan_local and k.dedup_rows)
+        assert config.stage1.sort_block_m == config.stage2.block_m == 32, bucket
+        # Producers are split evenly over the 2 destinations and leave consumers.
+        assert 0 < config.stage1.num_dispatch_cu < 256, bucket
+        assert config.stage1.num_dispatch_cu % 2 == 0, bucket
+        if k.tok_done:
+            tok_done_block_n.add(config.stage2.block_n)
+    assert protocols == {(True, True, True, True, 4)}
+    assert len(tok_done_block_n) == 1
+
+
+def test_ep2_large_m_config():
+    """EP2 V4.1-Flash large-input kernel: producers below the CU count and split over the 2 destinations, and the
+    batched dispatch's token-scale reads bounded by the scale buffer (they fault otherwise).
+    """
+    for mtpr in (8192, 16384):
+        config = select_fused_config(mtpr, mtpr, **V41_FLASH_EP2_SHAPE)
+        assert 0 < config.stage1.num_dispatch_cu < 256
+        assert config.stage1.num_dispatch_cu % 2 == 0
+        assert config.fused_stage1.batch_rows and config.fused_stage1.bounded_scales
+    # EP4 and EP8 keep their kernels.
+    assert not select_fused_config(
+        8192, 8192, **V41_FLASH_EP4_SHAPE
+    ).fused_stage1.bounded_scales
+    assert not select_fused_config(8192, 8192).fused_stage1.bounded_scales
+
+
+@pytest.mark.parametrize("mtpr", (256, 512))
+def test_ep2_small_m_token_rows_live_in_the_payload_arena(mtpr):
+    from aiter.ops.flydsl.kernels.mega_moe.mega_moe_small_m import (
+        _TOKEN_REGION_END,
+        SmallMRuntime,
+    )
+
+    nvm, rows, row_bytes, _ = SmallMRuntime.payload_capacity(
+        world_size=2,
+        model_dim=5120,
+        inter_dim=2304,
+        experts=384,
+        topk=6,
+        max_tok_per_rank=mtpr,
+    )
+    assert rows == 192 * (2 * mtpr) + 256 + 2 * mtpr
+    assert rows * row_bytes <= _TOKEN_REGION_END
+
+
+def test_ep2_routes_keep_their_own_payload():
+    """The EP2 small- (tok_done) and large-input (comb_tok_wait) runtimes can end before their peer."""
+    from aiter.ops.flydsl.kernels.mega_moe.mega_moe_large_m import LargeMRuntime
+    from aiter.ops.flydsl.kernels.mega_moe.mega_moe_small_m import SmallMRuntime
+
+    ep2 = dict(world_size=2, model_dim=5120, inter_dim=2304, experts=384, topk=6)
+    for mtpr in DEFAULT_SMALL_M_MTPRS:
+        assert not SmallMRuntime.ends_all_ranks(max_tok_per_rank=mtpr, **ep2)
+    for mtpr in large_m_mtprs_for(world_size=2, model_dim=5120, inter_dim=2304):
+        assert not LargeMRuntime.ends_all_ranks(max_tok_per_rank=mtpr, **ep2)
+
+
+@pytest.mark.parametrize("mtpr", MTPRS)
+def test_ep2_route_for_every_max_tokens(mtpr):
+    """EP2 V4.1-Flash: small-input up to 512 rows a rank, large-input from 513 at 8192 and 16384."""
+    plan = build_mega_moe_bundle_plan(
+        mtpr,
+        experts_per_rank=192,
+        model_dim=5120,
+        inter_dim=2304,
+        world_size=2,
+        small_m_mtprs=DEFAULT_SMALL_M_MTPRS,
+        large_m=mtpr in large_m_mtprs_for(world_size=2, model_dim=5120, inter_dim=2304),
+    )
+    assert plan.large_m == (mtpr in (8192, 16384))
+    for max_tokens in sorted({0, 1, 256, 257, 512, 513, 1024, mtpr - 1, mtpr}):
+        if not 0 <= max_tokens <= mtpr:
+            continue
+        route, capacity = plan.route_for(max_tokens)
+        if max_tokens <= plan.small_m_mtprs[-1]:
+            assert route == ROUTE_SMALL_M, max_tokens
+        elif plan.large_m:
+            assert (route, capacity) == (ROUTE_LARGE_M, mtpr), max_tokens
+        else:
+            assert (route, capacity) == (ROUTE_STAGED, mtpr), max_tokens
+
+
+# The EP2 V4.1-Flash fused configs (_tune_v41_flash_ep2_small / _large). On a mismatch the assertion shows the
+# current table.
+_EP2_FUSED_DIGEST = "939c581615544b289491b667622b928516bd87af78496b7521c37be4d1c88ca2"
+
+
+def test_ep2_fused_configs_unchanged():
+    table = {}
+    for mtpr in (256, 512):
+        for tokens in sorted(
+            {t for m, t in _FUSED_CASES if m == mtpr}
+            | {b for b in FUSED_TOKEN_BUCKETS if b <= mtpr}
+        ):
+            table[(mtpr, tokens)] = _knob_table(
+                select_fused_config(tokens, mtpr, **V41_FLASH_EP2_SHAPE)
+            )
+    for mtpr in (8192, 16384):
+        table[(mtpr, mtpr)] = _knob_table(
+            select_fused_config(mtpr, mtpr, **V41_FLASH_EP2_SHAPE)
+        )
+    digest = hashlib.sha256(repr(sorted(table.items())).encode()).hexdigest()
+    assert digest == _EP2_FUSED_DIGEST, table
