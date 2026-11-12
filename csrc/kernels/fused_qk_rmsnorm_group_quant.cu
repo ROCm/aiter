@@ -745,6 +745,9 @@ __global__ void fused_qk_rmsnorm_group_quant_kernel(
     const int out1_unquant_stride = q_out_u_stride;
     const int out2_stride = k_out_stride;
     const int out_res1_stride = q_res_out_stride;
+#if !defined(__gfx1250__)
+    // gfx1250 preloads the leading arguments into SGPRs; forcing the rest here would make the
+    // first row loads wait on their scalar loads.
     if constexpr(MXFP8)
     {
         // Every argument in the first scalar load clause. Fetched where first used, each one
@@ -768,6 +771,7 @@ __global__ void fused_qk_rmsnorm_group_quant_kernel(
                      "s"(int(a.pos64)), "s"(int(a.batch64)), "s"(int(a.cu64)),
                      "s"(int(a.slot64)));
     }
+#endif
 
     static constexpr int32_t load_chunk_bytes =
         sizeof(DTYPE_I) * thread_data_size % 16 == 0 ? 16 : 8;
