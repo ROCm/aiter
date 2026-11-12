@@ -5,31 +5,22 @@ from dataclasses import dataclass, fields
 
 import pytest
 import torch
+import triton
 
 from aiter.ops.shuffle import moe_shuffle_scale, moe_shuffle_weight
-
-# matmul utilities
 from aiter.ops.triton.moe.moe_op_gemm_a8w4 import (
     moe_gemm_a8w4,
     moe_gemm_torch,
 )
-
-# routing utilities
 from aiter.ops.triton.moe.moe_routing.routing import routing
-
-# numerics utilities
 from aiter.ops.triton.moe.quant_moe import (
     downcast_to_mxfp,
     downcast_to_static_fp8,
 )
-
-# target-specific utilities
 from aiter.ops.triton.utils._triton.arch_info import get_arch
 from aiter.ops.triton.utils.shuffle import moe_weight_decode_view, shuffle_scale_moe
 from op_tests.triton_tests.moe.moe_test_utils import assert_close
 from op_tests.triton_tests.utils.mxfp_ref import upcast_from_mxfp
-
-import triton
 
 
 def preshuffle_moe_weight(w: torch.Tensor) -> torch.Tensor:
@@ -369,7 +360,7 @@ def _a8w4_gemm1_swiglu_vs_torch_ref(M, E, E_LOCAL, TOPK, D, I, block_m, in_kerne
 
     g = torch.Generator(device=device).manual_seed(0)
     x = torch.randn(M, D, generator=g, device=device, dtype=torch.bfloat16)
-    vals, ids = torch.topk(torch.randn(M, E, generator=g, device=device), TOPK, dim=-1)
+    vals, ids = torch.topk(torch.randn(M, E, generator=g, dtype=torch.float32, device=device), TOPK, dim=-1)
     ids = ids.to(torch.int32).contiguous()
     wts = torch.softmax(vals, -1).contiguous()
 
@@ -391,11 +382,11 @@ def _a8w4_gemm1_swiglu_vs_torch_ref(M, E, E_LOCAL, TOPK, D, I, block_m, in_kerne
     ref, tok, _ = gemm1_swiglu_torch_ref(xr, w_ref, E_LOCAL, ids, gidx, n, TOPK)
     ref_rq = upcast_fp8(*downcast_to_mxfp(ref.bfloat16(), torch.float8_e4m3fn, axis=-1))
 
-    gemm_kw = dict(
-        swizzle_mx_scale="GFX1250_SCALE", preshuffled=True,
-        out_mx_quant=True, apply_swiglu=True, alpha=1.0, limit=1e4,
-        swiglu_add_residual=False,
-    )
+    gemm_kw = {
+        "swizzle_mx_scale": "GFX1250_SCALE", "preshuffled": True,
+        "out_mx_quant": True, "apply_swiglu": True, "alpha": 1.0, "limit": 1e4,
+        "swiglu_add_residual": False,
+    }
     if in_kernel_gather:
         y, ys = moe_gemm_a8w4(xq, wk, xs, sk, None, None, None, rd, gather_indx=gidx, **gemm_kw)
     else:
