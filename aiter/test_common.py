@@ -253,9 +253,10 @@ def warn_if_unrotatable(func, args, kwargs):
     name = getattr(func, "__qualname__", type(func).__name__)
     if code is not None:
         name = f"{name} ({code.co_filename}:{code.co_firstlineno})"
-    if name in _warned_unrotatable:
+    key = name if code is None else code
+    if key in _warned_unrotatable:
         return
-    _warned_unrotatable.add(name)
+    _warned_unrotatable.add(key)
     logger.warning(
         f"perftest: {name} takes no GPU tensors, so its inputs cannot be rotated "
         "and are timed warm. Pass the tensors as arguments, or num_rotate_args=1 "

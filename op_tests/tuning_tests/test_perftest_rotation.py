@@ -85,6 +85,13 @@ class TestUnrotatableWarning(unittest.TestCase):
         self.assertIn("num_rotate_args=1", logs.output[0])
         self.assertIn("test_perftest_rotation.py", logs.output[0])
 
+    def test_lambda_rebuilt_per_call_warns_once(self):
+        x = torch.ones(2)
+        with self.assertLogs(test_common.logger, "WARNING") as logs:
+            for scale in (1.0, 2.0, 3.0):
+                test_common.warn_if_unrotatable(lambda s=scale: x * s, (), {})
+        self.assertEqual(len(logs.output), 1)
+
     def test_gpu_tensor_arguments_do_not_warn(self):
         with (
             patch.object(test_common, "_device_tensor_bytes", return_value=8),
