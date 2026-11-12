@@ -897,7 +897,9 @@ def sol_prepare(
             unless the matching *_scale argument was given.
         mean_k_scale, mean_v_scale: the pooled operand's own E8M0 scale, same layout as the input
             scale with seqlen_k replaced by num_kv_blocks, or None when the source descale was
-            reused. These go in the mode-2 kernarg's pooled scale slots.
+            reused. These go in the mode-2 kernarg's pooled scale slots, except an MXFP6 K's:
+            its packer also stores the scales inside mean_k's tile records, which is where the
+            kernel reads them, so this image is only the readable copy for the host-side helpers.
         mean_k_var: the per-block population variance of k_quant, in mean_k's dtype and layout,
             when k_variance is set; otherwise None. For an 8-bit K it is stored divided by
             SOL_ATTN_FP8_VAR_DIVISOR, which the kernel undoes, and an int8 K's is e4m3. With
