@@ -100,8 +100,9 @@ def _gfx1250_reg_mw_fits(
 
     Mirrors the gate in front of topk_reg_mw_kernel in biased_grouped_topk
     (csrc/kernels/topk_softmax_kernels_group.cu); keep the two in step. A call
-    admitted here and rejected there falls through to the LDS kernel, which
-    aborts on an FP32 bias at E = 768 and 896."""
+    admitted here and rejected there falls through to topk_reg_kernel (E = 512
+    and 1024 at topk <= 16) or else to the LDS kernel, which aborts on an FP32
+    bias."""
     return (
         gating_output.shape[1] in _GFX1250_REG_MW_EXPERTS
         and topk_ids.shape[1] <= _GFX1250_REG_MW_MAX_TOPK

@@ -389,6 +389,7 @@ def test_grouped_topk_stable(
     topk_group=1,
     bias_dtype=None,
     strided_input=False,
+    ref_experts=None,
 ):
     mode_id = {"biased": 0, "sigmoid": 1, "softmax": 2}[mode]
     pattern_id = {
@@ -531,9 +532,10 @@ def test_grouped_topk_stable(
     else:
         if num_expert_group != 1:
             raise AssertionError("the padded legacy reference needs one expert group")
-        legacy_gating = torch.full((token, expert + 4), -torch.inf, dtype=dtype)
+        legacy_experts = ref_experts or expert + 4
+        legacy_gating = torch.full((token, legacy_experts), -torch.inf, dtype=dtype)
         legacy_gating[:, :expert] = gating
-        legacy_bias = torch.full((expert + 4,), -torch.inf, dtype=dtype)
+        legacy_bias = torch.full((legacy_experts,), -torch.inf, dtype=dtype)
         legacy_bias[:expert] = bias
         legacy_w = make_output(dtypes.fp32)
         legacy_ids = make_output(dtypes.i32)
@@ -1077,9 +1079,7 @@ stable_cases = [
     (1, 256, 8, dtypes.bf16, "softmax", True, "all_nan", False),
     (1, 256, 8, dtypes.bf16, "biased", True, "all_zero_sigmoid", False),
     (1, 256, 8, dtypes.bf16, "sigmoid", False, "all_zero_sigmoid", False),
-    # wave32 topk_reg_kernel with 40 tied candidates, two slots a lane; the
-    # padded reference (E + 4) takes the LDS kernel there.
-    (64, 128, 8, dtypes.bf16, "biased", True, "forty_way_tie", False),
+    # wave32 topk_reg_kernel with 40 tied candidates, two slots a lane.
     (64, 256, 8, dtypes.bf16, "softmax", True, "forty_way_tie", False),
     # wave32 multi-wave register path: E = 128 * waves, topk <= 17 (HERD's
     # top-(K + 1) for K = 16).
@@ -1087,8 +1087,11 @@ stable_cases = [
     (64, 512, 8, dtypes.bf16, "biased", False, "random", True),
     (64, 768, 4, dtypes.bf16, "biased", True, "random", False),
     (64, 1024, 9, dtypes.bf16, "biased", True, "random", False),
+    (64, 896, 1, dtypes.bf16, "biased", True, "random", False),
     (64, 896, 17, dtypes.bf16, "biased", True, "forty_way_tie", False),
     (1, 896, 16, dtypes.bf16, "biased", True, "sixteen_way_tie", False),
+    # The fallback takes one of 880 tied experts.
+    (1, 896, 17, dtypes.bf16, "biased", True, "sixteen_way_tie", False),
     (1, 896, 17, dtypes.bf16, "biased", True, "one_finite", False),
     (1, 896, 16, dtypes.bf16, "biased", True, "all_nan", False),
     (1, 896, 17, dtypes.bf16, "biased", True, "all_zero_sigmoid", False),
@@ -1100,12 +1103,20 @@ fp32_bias_cases = [
     (160, 896, 17, dtypes.bf16, "biased", True, "random", False),
     (64, 256, 8, dtypes.bf16, "biased", True, "forty_way_tie", False),
 ]
+# References padded to 260 experts, which take the LDS kernel at either wave
+# size (E + 4 would take topk_reg_kernel). At E=252 topk_reg_kernel masks its
+# last round.
+ref260_cases = [
+    (64, 128, 8, dtypes.bf16, "biased", True, "forty_way_tie", False),
+    (64, 252, 8, dtypes.bf16, "softmax", True, "random", False),
+]
 df = pd.DataFrame(
     [test_grouped_topk_stable(*case) for case in stable_cases]
     + [
         test_grouped_topk_stable(*case, bias_dtype=dtypes.fp32, strided_input=True)
         for case in fp32_bias_cases
     ]
+    + [test_grouped_topk_stable(*case, ref_experts=260) for case in ref260_cases]
 )
 aiter.logger.info(
     "moeTopkSoftmax_reg_stable summary (markdown):\n%s",

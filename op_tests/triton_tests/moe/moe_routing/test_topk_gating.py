@@ -195,7 +195,8 @@ def test_exact_sigmoid_topk_herd_widths(experts, topk, rows, need_renorm, bias_d
     """The Triton kernel pads K+1 widths to a power of two and masks the
     stores, with a BF16 or an FP32 bias (Kimi-K3's). biased_grouped_topk sends
     these aligned rows to the HIP multi-wave kernel, so the test calls the
-    Triton kernel itself and checks it against the HIP one."""
+    Triton kernel itself, checks it against the HIP one, and then checks that
+    biased_grouped_topk gives the HIP results."""
     torch.manual_seed(experts * topk + rows)
     logits = torch.randn((rows, experts), dtype=torch.bfloat16, device="cuda")
     bias = (torch.randn(experts, device="cuda", dtype=torch.float32) * 0.1).to(
@@ -230,4 +231,14 @@ def test_exact_sigmoid_topk_herd_widths(experts, topk, rows, need_renorm, bias_d
         logits, bias, hip_weights, hip_ids, 1, 1, need_renorm, 2.5, num_valid_rows
     )
     assert torch.equal(ids, hip_ids)
-    torch.testing.assert_close(weights, hip_weights, atol=2e-5, rtol=2e-5)
+    torch.testing.assert_close(weights, hip_weights, atol=1e-6, rtol=1e-6)
+
+    # The public entry sends these rows to the HIP multi-wave kernel.
+    assert topk_ops._gfx1250_reg_mw_fits(logits, bias, weights, ids)
+    topk_ops.biased_grouped_topk(
+        logits, bias, weights, ids, 1, 1, need_renorm, 2.5, num_valid_rows
+    )
+    assert torch.equal(ids, hip_ids)
+    assert torch.equal(weights, hip_weights)
+    assert torch.all(ids_buf[:, topk:] == -7)
+    assert torch.all(weights_buf[:, topk:] == -7.0)
