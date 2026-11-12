@@ -19,9 +19,9 @@ from .gemm_op_mixed_mxfp import _get_device_gfx_cu
 
 # The mxfp6 (E2M3, per-1x32 blockscale) asm gemm shares the a4w4 kernarg ABI.
 # Its packed operand/scale layouts are produced by the helpers below and must
-# match exactly what the `f6gemm_dmabig_kernel_func` kernel consumes.
-_KERNEL_NAME = "f6gemm_dmabig_kernel_func"
-_SAFE_FALLBACK_KERNEL_NAME = "f6gemm_dmabig_swz0_kernel_func"
+# match exactly what the `_ZN5aiter29f6gemm_bf16_per1x32Fp6_dmabigE` kernel consumes.
+_KERNEL_NAME = "_ZN5aiter29f6gemm_bf16_per1x32Fp6_dmabigE"
+_SAFE_FALLBACK_KERNEL_NAME = "_ZN5aiter34f6gemm_bf16_per1x32Fp6_dmabig_swz0E"
 _TILE = 256
 _K_TILE = 128
 _SCALE_GROUP_SIZE = 32
