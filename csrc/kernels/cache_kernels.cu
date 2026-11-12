@@ -2530,7 +2530,7 @@ __global__ void fuse_qk_rope_concat_and_cache_mla_per_head_kernel(
 template <typename scalar_t, typename cache_t, typename query_t, int KV_LORA, int PE_DIM,
           int PAGE_SIZE, bool IS_NEOX, bool NOPE_FIRST, int VEC, int HPT,
           bool COMPUTE_ALL_Q_ROPE = false, bool K_EARLY = (HPT <= 2),
-          bool LAT = (HPT == 1)>
+          bool LAT = (HPT == 1), bool NOPE_EARLY = LAT>
 __global__ void fused_qk_rope_concat_and_cache_mla_seg_kernel(
     // The first 120 bytes of kernel arguments are preloaded into SGPRs; the
     // rest cost a scalar round trip. Preloaded: what addresses the nope loads,
@@ -2627,9 +2627,12 @@ __global__ void fused_qk_rope_concat_and_cache_mla_seg_kernel(
     // head needs its own soffset SGPR: a buffer op that reuses an address
     // register of an in-flight one waits (s_wait_xcnt) for its address
     // translation, which serializes the cold loads behind TLB misses.
-    // On the latency path the loads need only preloaded arguments, so they
-    // go out ahead of the slot and position loads, not behind their round
-    // trip; the memory clobber keeps those loads from being hoisted above.
+    // The loads need only preloaded arguments, so with NOPE_EARLY they go out
+    // ahead of the slot and position loads, not behind their round trip; the
+    // memory clobber keeps those loads from being hoisted above. That pays
+    // with few blocks per CU and costs with many, see
+    // mla_rope_entry_heads_per_block.
+    static_assert(LAT || !NOPE_EARLY);
     in_vec_t nope_in[HPT];
     auto issue_nope = [&]() {
         auto in_buf = opus::make_gmem<scalar_t>(
@@ -2655,7 +2658,7 @@ __global__ void fused_qk_rope_concat_and_cache_mla_seg_kernel(
             asm volatile("" ::"s"(soff[k]));
 #endif
     };
-    if constexpr(LAT)
+    if constexpr(NOPE_EARLY)
     {
         issue_nope();
 #if defined(__HIP_DEVICE_COMPILE__)
@@ -3151,7 +3154,7 @@ __global__ void fused_qk_rope_concat_and_cache_mla_seg_kernel(
                                   static_cast<int>((HPT - 1) * q_pe_stride_1) + PE_DIM,
                                   pe_chunk, pe_lane);
 
-        if constexpr(!LAT)
+        if constexpr(!NOPE_EARLY)
             issue_nope();
         // A padded token (HPT > 1 returned up front) is dropped the same way,
         // by an out-of-bounds offset: a return here is a branch the compiler
@@ -5502,14 +5505,22 @@ static size_t mla_rope_tdm_lds_bytes(int hpt, size_t elem_size)
 // flight (H=24 T=512 3.66 -> 3.16 us, T=768 4.82 -> 4.36 us, H=96 T=128
 // 3.53 -> 3.19 us, H=16 T=768 3.70 -> 3.24 us); past 128 eight heads on the
 // TDM path win by 4-9% (H=24 T=1664 7.82 -> 7.61 us, H=96 T=416 7.64 -> 7.43
-// us).
-static int mla_rope_entry_heads_per_block(int64_t num_tokens, int num_heads, bool& lat)
+// us). Four heads on the latency path issue the Q nope loads before the slot
+// and position round trip up to 48 rows per CU (cold L2, H=96 T=64 2.99 ->
+// 2.82 us, T=48 2.85 -> 2.75 us) and behind it beyond, where issuing them
+// first measured 3% slower (H=96 T=192 4.21 -> 4.32 us); one or two heads
+// always issue them first.
+static int mla_rope_entry_heads_per_block(int64_t num_tokens,
+                                          int num_heads,
+                                          bool& lat,
+                                          bool& nope_early)
 {
     const int64_t per_cu = num_tokens * num_heads / get_num_cu_func();
     int hpt = per_cu < 12 ? 1 : per_cu < 18 ? 2 : per_cu <= 128 ? 4 : 8;
     while(num_heads % hpt != 0)
         hpt >>= 1;
-    lat = hpt == 1 || per_cu <= 128;
+    lat        = hpt == 1 || per_cu <= 128;
+    nope_early = lat && (hpt <= 2 || per_cu <= 48);
     return hpt;
 }
 
@@ -5548,8 +5559,9 @@ static void launch_mla_rope_hpt(const MlaRopeHptArgs& a, hipStream_t stream)
     else
     {
         constexpr int KV_LORA = 512, PE_DIM = 64, VEC = 8;
-        bool lat;
-        const int hpt    = mla_rope_entry_heads_per_block(a.num_tokens, a.num_heads, lat);
+        bool lat, nope_early;
+        const int hpt =
+            mla_rope_entry_heads_per_block(a.num_tokens, a.num_heads, lat, nope_early);
         const size_t lds = lat ? 0 : mla_rope_tdm_lds_bytes(hpt, sizeof(scalar_t));
         uint32_t tok_magic;
         int tok_shift;
@@ -5559,10 +5571,10 @@ static void launch_mla_rope_hpt(const MlaRopeHptArgs& a, hipStream_t stream)
         mla_rope_fast_div(static_cast<uint32_t>(a.block_size), bs_magic, bs_shift);
         const dim3 grid(static_cast<unsigned>(int64_t(a.num_heads / hpt) * a.num_tokens));
         const dim3 block(KV_LORA / VEC);
-#define LAUNCH_MLA_ROPE_HPT_C(NEOX, NF, HPT_, CAQR, KE, LAT_)                                  \
+#define LAUNCH_MLA_ROPE_HPT_C(NEOX, NF, HPT_, CAQR, KE, LAT_, NE)                              \
     aiter::fused_qk_rope_concat_and_cache_mla_seg_kernel<scalar_t, cache_t, query_t, KV_LORA,  \
                                                          PE_DIM, 0, NEOX, NF, VEC, HPT_, CAQR, \
-                                                         KE, LAT_>                             \
+                                                         KE, LAT_, NE>                         \
         <<<grid, block, lds, stream>>>(                                                        \
             static_cast<const scalar_t*>(a.q_nope), a.q_nope_stride_0, a.q_nope_stride_1,      \
             a.num_tokens, tok_magic, tok_shift, a.max_position, a.num_heads,                   \
@@ -5575,31 +5587,33 @@ static void launch_mla_rope_hpt(const MlaRopeHptArgs& a, hipStream_t stream)
             a.q_pe_stride_0, a.q_pe_stride_1, a.q_out_stride_0,                                \
             a.q_out_stride_1, a.kv_c_stride, a.k_pe_stride, a.cos_stride0, a.sin_stride0,      \
             a.block_stride, a.entry_stride, a.block_size, bs_magic, bs_shift)
-#define LAUNCH_MLA_ROPE_HPT(NEOX, NF, HPT_, KE, LAT_)                  \
-    do                                                                 \
-    {                                                                  \
-        if(a.compute_all_q_rope)                                       \
-            LAUNCH_MLA_ROPE_HPT_C(NEOX, NF, HPT_, true, KE, LAT_);     \
-        else                                                           \
-            LAUNCH_MLA_ROPE_HPT_C(NEOX, NF, HPT_, false, KE, LAT_);    \
+#define LAUNCH_MLA_ROPE_HPT(NEOX, NF, HPT_, KE, LAT_, NE)                  \
+    do                                                                     \
+    {                                                                      \
+        if(a.compute_all_q_rope)                                           \
+            LAUNCH_MLA_ROPE_HPT_C(NEOX, NF, HPT_, true, KE, LAT_, NE);     \
+        else                                                               \
+            LAUNCH_MLA_ROPE_HPT_C(NEOX, NF, HPT_, false, KE, LAT_, NE);    \
     } while(0)
-#define LAUNCH_MLA_ROPE_HPT_H(NEOX, NF)                                  \
-    switch(hpt)                                                          \
-    {                                                                    \
-    case 8: LAUNCH_MLA_ROPE_HPT(NEOX, NF, 8, false, false); break;       \
-    case 4:                                                              \
-        if(lat)                                                          \
-            LAUNCH_MLA_ROPE_HPT(NEOX, NF, 4, true, true);                \
-        else                                                             \
-            LAUNCH_MLA_ROPE_HPT(NEOX, NF, 4, false, false);              \
-        break;                                                           \
-    case 2:                                                              \
-        if(lat)                                                          \
-            LAUNCH_MLA_ROPE_HPT(NEOX, NF, 2, true, true);                \
-        else                                                             \
-            LAUNCH_MLA_ROPE_HPT(NEOX, NF, 2, false, false);              \
-        break;                                                           \
-    default: LAUNCH_MLA_ROPE_HPT(NEOX, NF, 1, true, true); break;        \
+#define LAUNCH_MLA_ROPE_HPT_H(NEOX, NF)                                    \
+    switch(hpt)                                                            \
+    {                                                                      \
+    case 8: LAUNCH_MLA_ROPE_HPT(NEOX, NF, 8, false, false, false); break;  \
+    case 4:                                                                \
+        if(nope_early)                                                     \
+            LAUNCH_MLA_ROPE_HPT(NEOX, NF, 4, true, true, true);            \
+        else if(lat)                                                       \
+            LAUNCH_MLA_ROPE_HPT(NEOX, NF, 4, true, true, false);           \
+        else                                                               \
+            LAUNCH_MLA_ROPE_HPT(NEOX, NF, 4, false, false, false);         \
+        break;                                                             \
+    case 2:                                                                \
+        if(lat)                                                            \
+            LAUNCH_MLA_ROPE_HPT(NEOX, NF, 2, true, true, true);            \
+        else                                                               \
+            LAUNCH_MLA_ROPE_HPT(NEOX, NF, 2, false, false, false);         \
+        break;                                                             \
+    default: LAUNCH_MLA_ROPE_HPT(NEOX, NF, 1, true, true, true); break;    \
     }
         if(a.is_neox && a.is_nope_first)
             LAUNCH_MLA_ROPE_HPT_H(true, true)
