@@ -979,7 +979,7 @@ jobs:
 
           if [ -f "/etc/podinfo/gha-render-devices" ]; then
             DEVICE_FLAG=$(cat /etc/podinfo/gha-render-devices)
-            GPU_DOCKER_FLAGS="--device=/dev/kfd $DEVICE_FLAG"
+            GPU_DOCKER_FLAGS="--runtime=amd -e AMD_VISIBLE_DEVICES=all $DEVICE_FLAG"
           else
             DEVICE_FLAG="--device /dev/dri"
             GPU_DOCKER_FLAGS="--device=/dev/kfd $DEVICE_FLAG"
