@@ -360,8 +360,8 @@ def test_ep8_fused_configs_keep_fused_knobs_off():
         assert config.fused_stage2 == FusedStage2Knobs(), (mtpr, tokens)
 
 
-# Fused knobs added with the EP2 V4.1-Flash tune: they enter the table only when set, so the digests pinned before
-# them stay.
+# Fused knobs added with the EP2 V4.1-Flash tune: they enter the table only when set, so a digest pinned before
+# them changes only where a config sets one.
 _EP2_KNOBS = ("stream_w", "bounded_scales")
 
 
@@ -384,9 +384,9 @@ def _knob_table(config):
 
 
 # The EP4 V4.1-Flash fused configs, as ported from 28ee7fcd (its _tune_v41_flash_ep4 on the post-processed
-# small-input configs and on the large-input config at MTPR 8192). On a mismatch the assertion shows the
-# current table.
-_EP4_FUSED_DIGEST = "46b5425e10dcb8ecf68983dee099df3fdb83a2ec4c0008bf44c4e083dafab45e"
+# small-input configs and on the large-input config at MTPR 8192), with the large-input route's token-scale reads
+# bounded (bounded_scales). On a mismatch the assertion shows the current table.
+_EP4_FUSED_DIGEST = "313816b9f3811298205dcabf26ec17d0039329f0ec4c3333a8fe4d86d33cb76a"
 
 
 def test_ep4_fused_configs_unchanged():
@@ -537,11 +537,11 @@ def test_ep2_large_m_config():
         assert 0 < config.stage1.num_dispatch_cu < 256
         assert config.stage1.num_dispatch_cu % 2 == 0
         assert config.fused_stage1.batch_rows and config.fused_stage1.bounded_scales
-    # EP4 and EP8 keep their kernels.
-    assert not select_fused_config(
-        8192, 8192, **V41_FLASH_EP4_SHAPE
-    ).fused_stage1.bounded_scales
-    assert not select_fused_config(8192, 8192).fused_stage1.bounded_scales
+    # EP4 batches its rows too, so its reads are bounded as well; EP8 V4-Pro does not batch them.
+    for mtpr in (8192, 16384):
+        knobs = select_fused_config(mtpr, mtpr, **V41_FLASH_EP4_SHAPE).fused_stage1
+        assert knobs.batch_rows and knobs.bounded_scales
+    assert not select_fused_config(8192, 8192).fused_stage1.batch_rows
 
 
 @pytest.mark.parametrize("mtpr", (256, 512))

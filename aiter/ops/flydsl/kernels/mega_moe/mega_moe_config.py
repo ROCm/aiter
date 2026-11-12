@@ -1618,6 +1618,8 @@ def _tune_v41_flash_ep4_large(config: MegaMoEConfig) -> MegaMoEConfig:
     # The launch head is serial up to the first GEMM1 tile: the producers count their routes before the gate
     # (written through, so group_done needs no L2 writeback), the owner clears its counters while the handshake
     # travels, and producers read the destination's rows per tile / ready order once (-1% at 256 and 512).
+    # The batched dispatch's token-scale reads are bounded by the scale buffer: a masked load reads its lane at
+    # 2 GiB past an unbounded buffer, which faults wherever nothing is mapped there (EP2 at every token count).
     return replace(
         config,
         stage1=replace(config.stage1, b_nt=3),
@@ -1648,6 +1650,7 @@ def _tune_v41_flash_ep4_large(config: MegaMoEConfig) -> MegaMoEConfig:
             early_hist=True,
             early_clear=True,
             peer_hoist=True,
+            bounded_scales=True,
         ),
         fused_stage2=replace(
             config.fused_stage2,
@@ -1703,17 +1706,12 @@ def _tune_v41_flash_ep2_small(config: MegaMoEConfig, bucket: int) -> MegaMoEConf
 def _tune_v41_flash_ep2_large(config: MegaMoEConfig) -> MegaMoEConfig:
     """EP2 DeepSeek-V4.1-Flash large-input kernel (192 experts per rank), measured on gfx950 at MTPR 8192 and 16384."""
     # The EP4 tune with 96 producer CTAs (3 64-expert waves of the EP4 rule are 288, more than the CUs; 64 to 160
-    # measured within 1.5%), and its batched dispatch's token-scale reads bounded by the scale buffer: unbounded,
-    # their masked lanes fault on EP2 at every token count. The EP4 schedule knobs stay: presend_experts 24
+    # measured within 1.5%). The EP4 schedule knobs stay: presend_experts 24
     # (-2..-6% uniform at 4096-16384 tokens a rank) costs 5..30% under Zipf routing at 3072-6144, early_p 5-6
     # (-6..-9% at 8192+) costs 3-5% at 3072, and payload_min_blocks, payload_small_*, presend_rows, early_p_mid,
     # m_group, xcd_chunk and early_k measured within noise or worse.
     config = _tune_v41_flash_ep4_large(config)
-    return replace(
-        config,
-        stage1=replace(config.stage1, num_dispatch_cu=96),
-        fused_stage1=replace(config.fused_stage1, bounded_scales=True),
-    )
+    return replace(config, stage1=replace(config.stage1, num_dispatch_cu=96))
 
 
 @cache
