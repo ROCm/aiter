@@ -5,7 +5,7 @@ from __future__ import annotations
 
 import inspect
 from dataclasses import dataclass
-from typing import Any, ClassVar
+from typing import Any, ClassVar, NamedTuple
 
 import pytest
 
@@ -602,6 +602,263 @@ def test_no_dataclass_field_has_a_default_python_3_11_would_reject():
         f"and `import aiter` fails there: {', '.join(offenders)} -- use "
         "field(default_factory=...)"
     )
+
+
+def test_a_positional_candidate_still_binds_run_to_run():
+    """A new field goes on the end, because providers build this positionally.
+
+    `KernelCandidate` is what every provider constructs, out of tree, with no
+    way for AITER to see the call sites. A field inserted before `run` takes
+    `run`'s argument, and the provider gets an error about a field it never
+    passed. Appending is the only backward-compatible place, and this test is
+    what says so to whoever adds the next one.
+    """
+
+    candidate = plugin.KernelCandidate(
+        "aklr", "kernel-1", "sha256:abc", "experimental", lambda *a, **k: 100
+    )
+
+    assert candidate.run(1, 2) == 100, "the fifth positional argument is run"
+    assert candidate.qualification == "experimental"
+    assert candidate.latency_us is None
+
+
+def test_a_provider_that_reports_nothing_reports_None(monkeypatch):
+    """Not reporting is the default and stays the default.
+
+    Every provider written before this field existed takes this path, and so
+    does every provider that simply has no number for the shape in front of it.
+    """
+
+    provider = _Provider("aklr", _candidate("aklr"))
+    monkeypatch.setattr(
+        plugin, "_entry_points", lambda: (_EntryPoint("aklr", provider),)
+    )
+    plugin.configure(enable=("aklr",), source="test")
+    add = _route_add([])
+
+    assert add(2, 3) == 100
+    assert plugin.last_decision().latency_us is None
+    assert plugin.explain("test.add", 2, 3).decision.latency_us is None
+
+
+def test_a_reported_latency_reaches_every_reader(monkeypatch):
+    """Recorded and handed back unchanged, through the readers that exist.
+
+    No new API: the number rides the Decision, so whatever already reads a
+    Decision reads this too.
+    """
+
+    seen = []
+    plugin.on_decision(seen.append)
+    candidate = plugin.KernelCandidate(
+        provider="aklr",
+        kernel_id="kernel-1",
+        artifact_digest="sha256:abc",
+        latency_us=12.4,
+        run=lambda *args, **kwargs: 100,
+    )
+    provider = _Provider("aklr", candidate)
+    monkeypatch.setattr(
+        plugin, "_entry_points", lambda: (_EntryPoint("aklr", provider),)
+    )
+    plugin.configure(enable=("aklr",), source="test")
+    add = _route_add([])
+
+    assert add(2, 3) == 100
+    assert plugin.last_decision().latency_us == 12.4
+    assert [d.latency_us for d in seen] == [12.4]
+    assert plugin.explain("test.add", 2, 3).decision.latency_us == 12.4, (
+        "explain() is the per-call reader, and the one a future side-by-side "
+        "comparison would be built on: the number must be there without run()"
+    )
+
+
+def test_a_native_route_reports_no_latency(monkeypatch):
+    """Nobody reports for native, so there is nothing to report."""
+
+    _enabled_but_unable(monkeypatch)
+    add = _route_add([])
+
+    assert add(2, 3) == 5
+    assert plugin.last_decision().route == "native"
+    assert plugin.last_decision().latency_us is None
+
+
+@pytest.mark.parametrize("bad", [0, -1.0, float("inf"), float("nan")])
+def test_a_latency_that_cannot_mean_anything_is_refused(bad):
+    """There is one way to say "I do not know", and it is not a number.
+
+    Zero, negative, inf and nan each look like data and carry none. A provider
+    without a number omits the field; anything else would be recorded, handed
+    back, and eventually compared against a real one.
+    """
+
+    with pytest.raises(ValueError, match="latency_us"):
+        plugin.KernelCandidate(
+            provider="aklr",
+            kernel_id="kernel-1",
+            artifact_digest="sha256:abc",
+            latency_us=bad,
+            run=lambda *args, **kwargs: None,
+        )
+
+
+def test_a_reported_latency_does_not_influence_routing(monkeypatch):
+    """Observation, not input. The enable list is still the only preference.
+
+    If this ever became an input, a provider could win by reporting a small
+    number, and the enable list -- the one place that names an owner for the
+    decision -- would stop deciding.
+    """
+
+    def candidate_at(name, latency, result):
+        return plugin.KernelCandidate(
+            provider=name,
+            kernel_id=f"kernel-{name}",
+            artifact_digest="sha256:abc",
+            latency_us=latency,
+            run=lambda *args, **kwargs: result,
+        )
+
+    slow = _Provider("slowpoke", candidate_at("slowpoke", 99999.0, 1))
+    fast = _Provider("speedy", candidate_at("speedy", 1.0, 2))
+    monkeypatch.setattr(
+        plugin,
+        "_entry_points",
+        lambda: (_EntryPoint("speedy", fast), _EntryPoint("slowpoke", slow)),
+    )
+    plugin.configure(enable=("slowpoke", "speedy"), source="test")
+    add = _route_add([])
+
+    assert add(2, 3) == 1, "the enable list decides, not the reported number"
+    assert plugin.last_decision().provider == "slowpoke"
+    assert plugin.last_decision().latency_us == 99999.0
+
+
+class _Workspace(NamedTuple):
+    """Shaped like `MlaV4NmPsWorkspace`: a handle the caller owns and passes in."""
+
+    o_acc: object
+    lse_acc: object
+    desc: object
+
+
+def test_a_caller_owned_workspace_reaches_the_provider_unchanged(monkeypatch):
+    """A contract can carry a workspace, and this is what that has to mean.
+
+    #7240 says a caller-owned handle is supported. Until an op with one was
+    routed that was an assertion nobody had executed, and the question it hides
+    is concrete: dispatch canonicalizes arguments through generated code, so a
+    `NamedTuple` could plausibly arrive rebuilt, flattened into its fields, or
+    copied. Any of those breaks the ownership the pattern exists for -- the
+    provider would be writing into scratch the caller cannot read back.
+
+    It arrives as the same object. `is`, not `==`, is the whole assertion.
+    """
+
+    seen = {}
+
+    @plugin.route(op="test.with_workspace", version=1)
+    def with_workspace(query, keys, workspace, out=None, return_lse=False):
+        return "native"
+
+    class Serving:
+        name = "wsprov"
+        api_versions: ClassVar[set] = {plugin.API_VERSION}
+        op_versions: ClassVar[dict] = {"test.with_workspace": {1}}
+
+        def select(self, op, args, kwargs):
+            seen["select"] = args
+
+            def run(*call_args, **call_kwargs):
+                seen["run"] = call_args
+                return "provider"
+
+            return plugin.KernelCandidate(
+                provider="wsprov",
+                kernel_id="ws-1",
+                artifact_digest="sha256:abc",
+                run=run,
+            )
+
+    monkeypatch.setattr(
+        plugin, "_entry_points", lambda: (_EntryPoint("wsprov", Serving()),)
+    )
+    plugin.configure(enable=("wsprov",), source="test")
+
+    workspace = _Workspace("o_acc", "lse_acc", "desc")
+    assert with_workspace("Q", "K", workspace, out="OUT", return_lse=True) == "provider"
+
+    assert seen["select"][2] is workspace, (
+        "select() received a different object than the caller passed; a "
+        "caller-owned workspace that is rebuilt on the way in is not caller-owned"
+    )
+    assert seen["run"][2] is workspace, "run() received a rebuilt workspace"
+    assert seen["select"][2]._fields == ("o_acc", "lse_acc", "desc"), (
+        "the workspace was flattened or coerced; a provider indexing it by "
+        "field would break"
+    )
+    assert seen["select"][3:] == ("OUT", True), (
+        "defaults past the workspace stopped being canonicalized into "
+        "positional arguments"
+    )
+
+
+def test_a_contract_that_returns_nothing_still_routes(monkeypatch):
+    """Some ops deliver through mutation and return None. Dispatch must not
+    read that as failure.
+
+    `fused_qk_norm_rope_cache_quant_shuffle` is the first routed contract shaped
+    this way: it writes q, k and the KV cache in place and returns nothing. A
+    dispatch that treated a falsy return as "the provider declined" would fall
+    back to native after the provider had already written -- running the work
+    twice, the second time over the first one's output.
+
+    Nothing in dispatch inspects the return value, and this is the test that
+    says so rather than leaving it to be rediscovered.
+    """
+
+    native_calls = []
+
+    @plugin.route(op="test.in_place", version=1)
+    def in_place(destination, source) -> None:
+        native_calls.append("native")
+
+    provider_calls = []
+
+    class Serving:
+        name = "mutprov"
+        api_versions: ClassVar[set] = {plugin.API_VERSION}
+        op_versions: ClassVar[dict] = {"test.in_place": {1}}
+
+        def select(self, op, args, kwargs):
+            def run(destination, source):
+                provider_calls.append("provider")
+                destination.append(source)  # the whole result, in place
+
+            return plugin.KernelCandidate(
+                provider="mutprov",
+                kernel_id="k",
+                artifact_digest="sha256:abc",
+                run=run,
+            )
+
+    monkeypatch.setattr(
+        plugin, "_entry_points", lambda: (_EntryPoint("mutprov", Serving()),)
+    )
+    plugin.configure(enable=("mutprov",), source="test")
+
+    destination = []
+    assert in_place(destination, "written") is None
+    assert destination == ["written"], "the provider's in-place write was lost"
+    assert provider_calls == ["provider"]
+    assert native_calls == [], (
+        "a None return was treated as a decline and the op ran natively as "
+        "well -- the work would be done twice, the second over the first's "
+        "output"
+    )
+    assert plugin.last_decision().route == "provider"
 
 
 def test_routing_one_op_name_twice_is_an_error():
