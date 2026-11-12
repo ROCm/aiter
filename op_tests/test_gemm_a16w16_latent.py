@@ -400,7 +400,7 @@ def check_packed_split_specialization():
         assert _use_packed_split(m, 3584, 7168, cfg) == want
         param = make_gemm_a16w16_param_and_validate(m, 3584, 7168, cfg)
         assert param is not None
-        assert make_gemm_a16w16_gfx950_kernel_name(param).endswith("_ps2r4") == want
+        assert make_gemm_a16w16_gfx950_kernel_name(param).endswith("_ps2r4_ptr") == want
     old = make_gemm_a16w16_param_and_validate(128, 3584, 7168, cfg)
     new = make_gemm_a16w16_param_and_validate(
         128, 3584, 7168, {**cfg, "stages": 5, "split_k": 2}
@@ -432,7 +432,7 @@ def check_packed_split_specialization():
     declined = make_gemm_a16w16_param_and_validate(
         127, 3584, 7168, {**cfg, "packed_split": True}
     )
-    assert not make_gemm_a16w16_gfx950_kernel_name(declined).endswith("_ps2r4")
+    assert not make_gemm_a16w16_gfx950_kernel_name(declined).endswith("_ps2r4_ptr")
     assert cfg == original
     aiter.logger.info("Packed split shape/config/cache specialization checks passed")
 
@@ -538,6 +538,76 @@ def test_packed_split_lifetime(padding, seed):
     return ret
 
 
+def check_packed_pointer_inputs():
+    """Reject invalid pointer launches before invoking any compiled handle."""
+    from unittest.mock import Mock, patch
+
+    import aiter.ops.flydsl.kernels.gemm_a16w16_gfx950 as impl
+
+    cfg = {
+        "block_m": 64,
+        "block_n": 64,
+        "block_k": 64,
+        "stages": 4,
+        "split_k": 4,
+        "m_waves": 2,
+        "n_waves": 2,
+        "k_waves": 1,
+        "group_m": 0,
+        "use_half_tile_interleaved": False,
+    }
+    stream = torch.cuda.current_stream()
+    x = torch.empty((128, 7168), device="cuda", dtype=torch.bfloat16)
+    w = torch.empty((3584, 7168), device="cuda", dtype=torch.bfloat16)
+    out = torch.empty((128, 3584), device="cuda", dtype=torch.bfloat16)
+    cpu_x = torch.empty_like(x, device="cpu")
+    cpu_w = torch.empty_like(w, device="cpu")
+    cpu_out = torch.empty_like(out, device="cpu")
+    unaligned = torch.empty((128 * 7168 + 1,), device="cuda", dtype=x.dtype)[
+        1:
+    ].view_as(x)
+    invalid_unit_stride = torch.empty((128, 2 * 7168), device="cuda", dtype=x.dtype)[
+        :, ::2
+    ]
+
+    # These metadata-only mocks have real device/dtype/address metadata but
+    # illegal strides; no giant GPU allocation or out-of-bounds launch is made.
+    huge_x = Mock(spec=torch.Tensor)
+    huge_x.device, huge_x.dtype, huge_x.ndim = x.device, x.dtype, 2
+    huge_x.shape = x.shape
+    huge_x.data_ptr.return_value = x.data_ptr()
+    huge_x.element_size.return_value = x.element_size()
+    huge_x.stride.side_effect = lambda axis: (1 << 24) if axis == 0 else 1
+
+    wrong_stream = Mock(spec=torch.cuda.Stream)
+    wrong_stream.device = torch.device("cuda", x.device.index + 1)
+    bad_calls = (
+        lambda: impl.gemm_a16w16(
+            cpu_x, cpu_w.T, out=cpu_out, user_kwargs=cfg, stream=stream
+        ),
+        lambda: impl.gemm_a16w16(x, cpu_w.T, out=out, user_kwargs=cfg, stream=stream),
+        lambda: impl.gemm_a16w16(x, w.T, out=cpu_out, user_kwargs=cfg, stream=stream),
+        lambda: impl.gemm_a16w16(x, w.T, out=out, user_kwargs=cfg, stream=wrong_stream),
+        lambda: impl.gemm_a16w16(
+            unaligned, w.T, out=out, user_kwargs=cfg, stream=stream
+        ),
+        lambda: impl.gemm_a16w16(
+            invalid_unit_stride, w.T, out=out, user_kwargs=cfg, stream=stream
+        ),
+        lambda: impl.gemm_a16w16(huge_x, w.T, out=out, user_kwargs=cfg, stream=stream),
+    )
+    with patch.object(impl, "_run_compiled") as launch:
+        for fn in bad_calls:
+            try:
+                fn()
+            except (ValueError, AssertionError):
+                pass
+            else:
+                raise AssertionError("invalid packed pointer input was accepted")
+        launch.assert_not_called()
+    aiter.logger.info("Packed pointer device/layout/span rejection checks passed")
+
+
 def main():
     if get_gfx_runtime() != "gfx950":
         aiter.logger.warning("This tuning qualification targets gfx950; skipping")
@@ -546,6 +616,7 @@ def main():
     check_n_grouped_specialization()
     check_hti_unroll_specialization()
     check_packed_split_specialization()
+    check_packed_pointer_inputs()
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
         "-s", "--mnk", nargs="+", type=aiter.dtypes.str2tuple, default=SHAPES

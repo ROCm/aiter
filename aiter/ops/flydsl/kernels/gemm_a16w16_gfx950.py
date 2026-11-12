@@ -31,6 +31,8 @@ from .kernels_common import run_cached, set_slp_vectorize_once_used
 from .tensor_shim import (
     AITER_FLYDSL_KERNARG_PRELOAD,
     AITER_FLYDSL_KERNARG_PRELOAD_COUNT,
+    _run_compiled,
+    ptr_arg,
 )
 
 GEMM_A16W16_DTYPE_FP32 = 1
@@ -341,7 +343,7 @@ def make_gemm_a16w16_gfx950_kernel_name(param: GemmA16W16Gfx950Param):
     name += "_ring5" if param.unroll_lds_ring else ""
     name += "_ng4sk" if param.n_grouped_loads else ""
     name += "_hti5sk" if param.unroll_hti else ""
-    name += "_ps2r4" if param.packed_split else ""
+    name += "_ps2r4_ptr" if param.packed_split else ""
     return name
 
 
@@ -1536,21 +1538,24 @@ def _reduce_latent_packed_split(partial: fx.Tensor, out: fx.Tensor):
 
 @flyc.jit
 def _latent_packed_split(
-    out: fx.Tensor,
-    a: fx.Tensor,
-    b: fx.Tensor,
-    partial: fx.Tensor,
+    out_ptr: fx.Pointer,
+    a_ptr: fx.Pointer,
+    b_ptr: fx.Pointer,
+    partial_ptr: fx.Pointer,
+    lda: fx.Int32,
+    ldb: fx.Int32,
     param: GemmA16W16Gfx950Param,
-    stream: fx.Stream = fx.Stream(None),  # noqa: B008
+    stream: fx.Stream,
 ):
+    out = fx.make_view(out_ptr, fx.make_layout((128, 3584), (3584, 1)))
+    a = fx.make_view(a_ptr, fx.make_layout((128, 7168), (lda, 1)))
+    b = fx.make_view(b_ptr, fx.make_layout((7168, 3584), (1, ldb)))
+    partial = fx.make_view(partial_ptr, fx.make_layout((256, 3584), (3584, 1)))
     mma = fx.make_tiled_mma(
         fx.make_mma_atom(fx.rocdl.MFMA(16, 16, 32, fx.BFloat16)),
         fx.make_layout((2, 2, 1), (2, 1, 0)),
         fx.make_tile(None, None, fx.make_layout((8, 4), (1, 8))),
     )
-    # Preserve legal padded leading strides. Only logical extents are fixed.
-    lda = fx.Int32(fx.get_scalar(a.stride[0]))
-    ldb = fx.Int32(fx.get_scalar(b.stride[1]))
     gemm_a16w16_gfx950_kernel._known_block_size = [256, 1, 1]
     gemm_a16w16_gfx950_kernel._func.__name__ = make_gemm_a16w16_gfx950_kernel_name(
         param
@@ -1922,6 +1927,17 @@ def gemm_a16w16(
     param = make_gemm_a16w16_param_and_validate(m, n, k, kwargs)
     assert param is not None, "unsupported gemm_a16w16_gfx950 shape/config"
     if param.packed_split:
+        # Raw-pointer dispatch must never accept host memory or a stream on
+        # another device. Rank, dtype, output shape and unit-stride axes have
+        # already been checked above; leading strides remain runtime arguments.
+        if device.type != "cuda" or stream.device != device:
+            raise ValueError("packed GEMM tensors and stream must share a CUDA device")
+        # Check the complete addressed byte spans before passing signed-i32
+        # strides and forming 32-bit buffer offsets in the device kernel.
+        a_span_bytes = ((128 - 1) * a.stride(0) + 7168) * a.element_size()
+        b_span_bytes = ((3584 - 1) * b.stride(1) + 7168) * b.element_size()
+        if max(a_span_bytes, b_span_bytes) > (1 << 31) - 1:
+            raise ValueError("packed GEMM input strides exceed the i32 byte range")
         # Per-call storage, allocated on the launch stream. Graph capture owns
         # its allocation; concurrent streams/graphs never share writable scratch.
         # Every valid partial is overwritten, so no initialization launch is needed.
@@ -1930,20 +1946,22 @@ def gemm_a16w16(
         else:
             with torch.cuda.stream(stream):
                 partial = torch.empty((256, 3584), device=device, dtype=torch.float32)
-        args = (
-            _dynamic_tensor_arg(out, 1),
-            _dynamic_tensor_arg(a, 1),
-            _dynamic_tensor_arg(b, 0),
-            _dynamic_tensor_arg(partial, 1),
-            param,
-            stream,
-        )
-        run_cached(
+        _run_compiled(
             _latent_packed_split,
-            *args,
-            constexpr_param=param,
-            compiler=flyc.compile,
-            dispatch_args=args,
+            ptr_arg(out, fx.BFloat16),
+            ptr_arg(a, fx.BFloat16),
+            ptr_arg(b, fx.BFloat16),
+            ptr_arg(partial, fx.Float32),
+            int(a.stride(0)),
+            int(b.stride(1)),
+            param,
+            fx.Stream(stream),
+            specialization_key=(
+                device.index,
+                a.dtype,
+                out.dtype,
+                param.__cache_signature__(),
+            ),
         )
         return out
     semaphore, signal = get_split_k_buffers(stream, device, split_k)
