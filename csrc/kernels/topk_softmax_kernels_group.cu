@@ -1163,18 +1163,18 @@ __global__ void topk_reg_kernel(DTYPE_I* __restrict__ gating_output,
 // four consecutive experts (one vector load each for logits and bias):
 //
 //   1. sigmoid + bias for the lane's four experts, the lane maximum to LDS;
-//   2. barrier; group g is lane g of every wave (E / 32 experts, as a lane of
-//      topk_reg_kernel), so every wave sorts the same 32 group maxima and
-//      takes the topk-th as the pivot;
+//   2. barrier; group g is lane g of every wave (E / 32 experts), so every
+//      wave sorts the same 32 group maxima and takes the topk-th as the
+//      pivot;
 //   3. elements >= pivot go to LDS as candidate records, one LDS atomic per
 //      wave for the slot base (order is irrelevant: the key is unique);
 //   4. barrier; wave 0 ranks up to 64 records by lane rotations and
 //      renormalizes in rank order. More than 64 take topk wave arg-max
 //      rounds over the whole row.
 //
-// Ids and weights match topk_reg_kernel: the same score key and legacy tie
-// rank order the picks, the same sigmoid expression gives the weights, and the
-// renormalization sums them serially in rank order.
+// The groups only set the pivot. Ids and weights match topk_reg_kernel bit for
+// bit: the same score key and legacy tie rank order the picks, the sigmoid gives
+// the same bits, and the renormalization sums them serially in rank order.
 
 // HIP's math header and opus both offer a templated max/min for unsigned.
 __device__ __forceinline__ uint32_t umax32(uint32_t a, uint32_t b) { return a > b ? a : b; }
@@ -1313,7 +1313,7 @@ __global__ __launch_bounds__(kWaves * 32) void topk_reg_mw_kernel(
     static_assert(kTopKRegCandCap == 2 * W);
     using vec_i = opus::vector_t<typename aiter::hip2opus<DTYPE_I>::type, 4>;
     using vec_b = opus::vector_t<typename aiter::hip2opus<DTYPE_B>::type, 4>;
-    // float_order_key(-INFINITY): a pivot at or below it leaves too few finite scores.
+    // float_order_key(-INFINITY): a pivot at or below it means fewer than topk finite group maxima.
     constexpr uint32_t kNegInfKey = 0x007fffffu;
 
     // Lane maxima as [group][wave]; group g is lane g of every wave.
@@ -2681,8 +2681,8 @@ void biased_grouped_topk(const aiter_tensor_t& gating_output,   // [num_tokens, 
     // from the BF16 logits and the BF16 or FP32 bias.
     // biased_grouped_topk in aiter/ops/topk.py sends rows here when
     // _gfx1250_reg_mw_fits passes, so keep the two gates in step: a row it
-    // admits and this gate rejects falls through to the LDS kernel, which
-    // aborts on an FP32 bias at E = 768 and 896.
+    // admits and this gate rejects falls through to topk_reg_kernel (E = 512
+    // and 1024 at topk <= 16) or else to the LDS kernel, which aborts on an FP32 bias.
     const int mw_waves      = num_experts / 128;
     const bool mw_bias_fp32 = correction_bias.dtype() == AITER_DTYPE_fp32;
     if(get_warp_size_func() == 32 && topk_grp == num_expert_group &&

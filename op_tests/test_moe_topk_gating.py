@@ -25,7 +25,7 @@ import torch
 
 import aiter
 from aiter.jit.utils.chip_info import get_gfx
-from aiter.ops.topk import biased_grouped_topk, biased_grouped_topk_hip
+from aiter.ops.topk import _gfx1250_exact_sigmoid_topk, biased_grouped_topk_hip
 from aiter.test_common import (
     benchmark,
     checkAllclose,
@@ -399,7 +399,7 @@ def bench_topk_sigmoid(num_experts, num_tokens, topk, dtype):
 def bench_biased_grouped_sigmoid(
     num_experts, num_tokens, topk, dtype, renormalize=True, route_scale=1.0
 ):
-    """Compare the gfx1250 caller-owned specialization with its HIP fallback."""
+    """Compare the gfx1250 Triton sigmoid top-k with biased_grouped_topk_hip."""
     torch.random.manual_seed(0)
     gating_output = _make_gating(num_experts, num_tokens, dtype)
     correction_bias = (torch.randn(num_experts) * 0.1).to(torch.bfloat16)
@@ -409,15 +409,15 @@ def bench_biased_grouped_sigmoid(
     hip_ids = torch.empty_like(triton_ids)
 
     def run_triton():
-        biased_grouped_topk(
+        # biased_grouped_topk sends aligned rows to the HIP kernel except at E=900.
+        _gfx1250_exact_sigmoid_topk(
             gating_output,
             correction_bias,
             triton_weights,
             triton_ids,
-            1,
-            1,
             renormalize,
             route_scale,
+            None,
         )
         return triton_weights, triton_ids
 
