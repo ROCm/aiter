@@ -6,18 +6,30 @@
 
 Checks all public entry points, the no-injection final mixer, decode and tiled
 token counts, both norm-weight layouts, and folded/unfolded weights against the
-float32 oracle.
+float32 oracle. Also checks strided injection, direct-K1 extent guards, skinny
+counter reuse across streams and graphs, and invalid up weights. Finished-gate
+seam checks use FP64 references, four seeds, stress fixtures, both tiled K1 paths,
+and exact BF16 combine parity.
 
     python op_tests/test_hc_gated_residual.py
     python op_tests/test_hc_gated_residual.py --tokens 512 4096
 """
 
 import argparse
+import dataclasses
 import sys
+from unittest.mock import patch
 
+import pytest
 import torch
 
-from aiter.jit.utils.chip_info import get_gfx
+from aiter.jit.utils.chip_info import get_gfx, get_gfx_runtime
+from aiter.ops.flydsl.hc_seam import (
+    hc_gated_combine,
+    hc_seam,
+    hc_seam_prepare_weights,
+    hc_seam_prepared,
+)
 from aiter.ops.flydsl.kernels.hyper_connection_gated_residual import (
     flydsl_gr_two_stage_combine,
     flydsl_gr_two_stage_combine_and_mix,
@@ -34,13 +46,44 @@ from aiter.ops.flydsl.kernels.hyper_connection_gated_residual import (
 from aiter.ops.flydsl.kernels.hyper_connection_gated_residual.common import (
     merge_down_inject,
 )
+from aiter.ops.flydsl.kernels.hyper_connection_gated_residual.k1 import (
+    _build_down_deferred_partial_pipe,
+)
+from aiter.ops.flydsl.kernels.hyper_connection_gated_residual.reference import (
+    seam_combine_only_ref,
+    seam_deferred_partials_ref,
+    seam_ref_deferred,
+    seam_ref_fp64,
+    seam_ref_operational,
+)
 from aiter.test_common import checkAllclose
 
 # Model dimensions covered by this test.
 HC, HS, LOWRANK = 4, 2560, 320
 EPS = 1e-6
 
+# SGLang PR #46881 test_hc_seam.py asserts 2e-4 gate error on only 10
+# sampled cases. Operational-vs-FP64 maxima over 208 cases per weight scale
+# are 2.36e-4 (1x) and 3.80e-4 (2x): FP32/FP64 normalization flips BF16(X)
+# boundaries. The approved 1e-3 gives 2.6–4x headroom; real gate bugs are
+# around 1e-1. Mixed retains SGLang's 6e-3, without a mismatch allowance.
+SEAM_MIXED_REL_L2 = 6e-3
+SEAM_GATE_MAX_ABS = 1e-3
+# Formulation allowance for forced-deferred calls against FP64: saturated-gates,
+# M=255, seed 3 gives 1.219e-3 in the deferred three-launch
+# formulation. Default hc_seam dispatch keeps SEAM_GATE_MAX_ABS.
+SEAM_GATE_MAX_ABS_DEFERRED = 1.5e-3
+# Bounds kernel error against its own formulation reference (measured maximum 3.4e-4).
+SEAM_DEFERRED_KERNEL_REL_L2 = 5e-4
+SEAM_SEEDS = (0, 1, 2, 3)
+SEAM_STRESS = ("heavy-norm", "saturated-gates", "near-zero-rms", "stream-scales")
+SEAM_ROWS = (1, 2, 7, 16, 17, 64, 65, 128, 129, 193, 224, 255, 256)
+
+SEAM_UNDER_TEST = hc_seam
+SEAM_COMBINE_UNDER_TEST = hc_gated_combine
+
 _FAILURES = []
+_SEAM_METRICS = []
 
 
 def _check(ref, out, label, atol=0.06, rtol=0.05):
@@ -277,6 +320,44 @@ def _run_w_up_validation():
                 EPS,
             ),
         )
+    inp = _make_inputs(8, seed=31)  # M=8 coverage beyond the M=1 cases above
+    weight = inp["w_up"]
+    invalid = (
+        (weight.float(), ValueError, "w_up must have dtype torch.bfloat16"),
+        (weight.t().contiguous().t(), ValueError, "w_up must be row-major contiguous"),
+        (weight.reshape(-1), ValueError, "w_up must have shape"),
+        (weight[:-1].contiguous(), ValueError, "w_up must have shape"),
+        (weight.cpu(), ValueError, "w_up must be on"),
+    )
+    for fold_w in (False, True):
+        merged = _merged(inp, fold_w)
+        for which in ("combine_and_mix", "mix"):
+            for bad, error_type, message in invalid:
+                args = {**inp, "w_up": bad}
+                if which == "mix":
+                    args.pop("block_output")
+                    args.pop("injection")
+                op = (
+                    flydsl_gr_two_stage_mix
+                    if which == "mix"
+                    else flydsl_gr_two_stage_combine_and_mix
+                )
+                try:
+                    op(
+                        **args,
+                        hc_count=HC,
+                        eps=EPS,
+                        w_down_merged=merged,
+                        fold_w=fold_w,
+                    )
+                except error_type as error:
+                    assert message in str(error), str(error)
+                else:
+                    torch.cuda.synchronize()
+                    raise AssertionError(
+                        f"{which} fold={fold_w} accepted invalid w_up: {message}"
+                    )
+    print("w_up validation passed")
 
 
 def _cmix_call(inp, **overrides):
@@ -371,6 +452,7 @@ def _run_k2_override_limits():
     rrms = torch.ones(tokens, HC, device="cuda")
     norm_weight = torch.zeros(HS, device="cuda").bfloat16()
     w_up = torch.randn(HC * HS, LOWRANK, device="cuda").bfloat16()
+    w_up_il = torch.zeros(160, 4, 16, LOWRANK, device="cuda").bfloat16()
     cases = {
         "threads": {"block_m": 256, "block_n": 64, "m_waves": 8, "n_waves": 4},
         "lds": {"block_m": 256, "block_n": 256, "m_waves": 1, "n_waves": 1},
@@ -383,6 +465,23 @@ def _run_k2_override_limits():
                 lora, r2, rrms, norm_weight, w_up, HC, **cfg
             ),
         )
+    # The register-branch kernel hardcodes hidden=10240, a full-width norm and
+    # lowrank=320; anything else must be rejected rather than read out of bounds.
+    reg = {"block_m": 64, "block_n": 64, "m_waves": 1, "n_waves": 1}
+    full_norm = torch.zeros(HC * HS, device="cuda").bfloat16()
+    bad = {
+        "hidden": (lora, r2[:, :8192].contiguous(), rrms, full_norm[:8192]),
+        "shared_norm": (lora, r2, rrms, norm_weight),
+        "lowrank": (lora[:, :160].contiguous(), r2, rrms, full_norm),
+    }
+    for name, (lo, rr, rm, nw) in bad.items():
+        for mode in ("combined", "separate"):
+            _expect_value_error(
+                f"k2_register_branch[{name},{mode}]",
+                lambda lo=lo, rr=rr, rm=rm, nw=nw, mode=mode: flydsl_up_gate_mix_norm(
+                    lo, rr, rm, nw, w_up_il, HC, branch_mode=mode, **reg
+                ),
+            )
 
 
 def _run_side_stream_pressure():
@@ -619,6 +718,80 @@ def _run_counter_hc_isolation():
     torch.cuda.synchronize()
     for index, (case, result) in enumerate(zip(inputs, outputs)):
         _check_case(case, 4, result, f"counter_stream{index}")
+
+
+def _run_skinny_concurrent_graphs():
+    """HC4 and HC8 skinny on separate streams, eager and under graph replay, M=2 and 8.
+
+    Counter storage is per stream and per hc_count; concurrent launches or
+    replays of both widths must each match the oracle.
+    """
+    for tokens in (2, 8):
+        cases = []
+        for hc_count, seed in ((4, 31), (8, 32)):
+            inp = _make_hc_inputs(tokens, hc_count, seed)
+            merged = merge_gr_two_stage_weight(inp["w_down"], inp["w_inject"], hc_count)
+            merged = fold_norm_weight(merged, inp["norm_weight"], hc_count)
+            ref = gr_combine_and_mix(
+                inp["residual"],
+                inp["block_output"],
+                inp["injection"],
+                inp["norm_weight"],
+                inp["w_down"],
+                inp["w_up"],
+                inp["w_inject"],
+                hc_count,
+                EPS,
+                round_bf16=True,
+            )
+            cases.append((inp, merged, hc_count, ref))
+        streams = (torch.cuda.Stream(), torch.cuda.Stream())
+
+        def launch(case, stream):
+            inp, merged, hc_count, _ = case
+            return flydsl_gr_two_stage_combine_and_mix(
+                inp["residual"],
+                inp["block_output"],
+                inp["injection"],
+                inp["norm_weight"],
+                inp["w_down"],
+                inp["w_up"],
+                inp["w_inject"],
+                hc_count,
+                EPS,
+                w_down_merged=merged,
+                fold_w=True,
+                stream=stream,
+            )
+
+        def verify(outs, label, cases=cases, tokens=tokens):
+            for case, out in zip(cases, outs):
+                r2, x, inj = out
+                r2_ref, x_ref, inj_ref = case[3]
+                tag = f"{label}[HC{case[2]},M={tokens}]"
+                _check(r2_ref.to(r2.dtype), r2, f"{tag} r2", atol=0.05, rtol=0.02)
+                _check(x_ref.to(x.dtype), x, f"{tag} x")
+                _check(inj_ref.to(inj.dtype), inj.contiguous(), f"{tag} inj", atol=0.05)
+
+        for stream in streams:
+            stream.wait_stream(torch.cuda.current_stream())
+        for _ in range(20):
+            outs = [launch(c, s) for c, s in zip(cases, streams)]
+            torch.cuda.synchronize()
+            verify(outs, "skinny_concurrent")
+        graphs, outs = [], []
+        for case, stream in zip(cases, streams):
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph, stream=stream):
+                outs.append(launch(case, stream))
+            graphs.append(graph)
+        for _ in range(20):
+            for graph, stream in zip(graphs, streams):
+                with torch.cuda.stream(stream):
+                    graph.replay()
+            torch.cuda.synchronize()
+            verify(outs, "skinny_graph")
+    print("skinny concurrent HC4/HC8 streams and graph replay passed")
 
 
 def _check_direct_k1(inp, merged, hc_count, r2, packed, label):
@@ -1301,6 +1474,1273 @@ def _run_pad336_merged(tokens):
     )
 
 
+def _run_direct_k1_extent():
+    """Guarded-allocation sentinels for row tails; M=224 is _run_direct_k1_untiled_tokens."""
+    for tokens in (225, 255, 256):
+        inp = _make_inputs(tokens, seed=17)
+        merged = merge_gr_two_stage_weight(inp["w_down"], inp["w_inject"], HC)
+        n_pad = merged.shape[0]
+        # Contract: a token count that is not a multiple of the 32-row
+        # K1 tile needs gemm_pad, and caller buffers span gemm_pad rows.
+        rows = (tokens + 31) // 32 * 32
+        gemm_pad = None if rows == tokens else rows
+        sentinel = 123.0
+        r2_storage = torch.full(
+            (tokens + 64, HC * HS), sentinel, device="cuda", dtype=torch.bfloat16
+        )
+        out_storage = torch.full(
+            (tokens + 64, n_pad), sentinel, device="cuda", dtype=torch.bfloat16
+        )
+        rr_storage = torch.full(
+            (tokens + 64, HC), sentinel, device="cuda", dtype=torch.float32
+        )
+        # Keep an overrun inside a guarded allocation so it is observable without
+        # corrupting unrelated allocator state. The logical partial shape is unchanged.
+        partial_storage = torch.full(
+            (4 * rows + 4 * 64, n_pad), sentinel, device="cuda", dtype=torch.float32
+        )
+        empty = torch.empty
+
+        def guarded_empty(
+            *shape,
+            rows=rows,
+            n_pad=n_pad,
+            partial_storage=partial_storage,
+            empty=empty,
+            **kwargs,
+        ):
+            if shape == (4 * rows, n_pad) and kwargs.get("dtype") == torch.float32:
+                return partial_storage[: 4 * rows]
+            return empty(*shape, **kwargs)
+
+        with patch("torch.empty", guarded_empty):
+            r2, out = flydsl_k1_combine_norm_down(
+                inp["residual"],
+                inp["block_output"],
+                inp["injection"],
+                inp["norm_weight"],
+                merged,
+                LOWRANK,
+                HC,
+                EPS,
+                r2_out=r2_storage[:rows],
+                out=out_storage[:rows],
+                rrms_out=rr_storage[:rows],
+                split_k=4,
+                sk_block_m=64,
+                gemm_pad=gemm_pad,
+            )
+            r2_ref = _ref(inp, "combine")
+            xn = (
+                gr_grouped_rmsnorm(r2_ref, inp["norm_weight"], HC, EPS)
+                .bfloat16()
+                .float()
+            )
+            projection = xn @ merged.float().t()
+            projection[:, :LOWRANK] = torch.nn.functional.silu(
+                projection[:, :LOWRANK] / HC
+            )
+            _check(
+                r2_ref.bfloat16(),
+                r2[:tokens],
+                f"direct K1[M={tokens}] r2",
+                atol=0.05,
+                rtol=0.02,
+            )
+            _check(projection.bfloat16(), out[:tokens], f"direct K1[M={tokens}] packed")
+        torch.cuda.synchronize()
+        assert torch.all(r2_storage[rows:] == sentinel)
+        assert torch.all(out_storage[rows:] == sentinel)
+        assert torch.all(rr_storage[rows:] == sentinel)
+        assert torch.all(
+            partial_storage[4 * rows :] == sentinel
+        ), f"partial overrun at M={tokens}"
+        if gemm_pad is not None:
+            try:
+                flydsl_k1_combine_norm_down(
+                    inp["residual"],
+                    inp["block_output"],
+                    inp["injection"],
+                    inp["norm_weight"],
+                    merged,
+                    LOWRANK,
+                    HC,
+                    EPS,
+                    split_k=4,
+                    sk_block_m=64,
+                )
+            except ValueError as error:
+                assert "multiple of the 32-row K1 tile" in str(error), str(error)
+            else:
+                raise AssertionError(f"M={tokens} accepted without gemm_pad")
+    print("direct K1 extent passed (unaligned rows need gemm_pad)")
+
+
+def _make_seam_inputs(
+    rows, *, combine=True, next_gate=True, seed=0, w_scale=1.0, device="cuda"
+):
+    """Seam-contract inputs: finished FP32 gate_prev in [0, 2]; weights at
+    SGLang's test scales (norm 0.1, down 0.04, up 0.1, inject 0.04) times w_scale."""
+    gen = torch.Generator(device=device).manual_seed(seed * 1000 + rows)
+    hidden = HC * HS
+
+    def _rnd(*shape, std):
+        return (torch.randn(*shape, generator=gen, device=device) * std).bfloat16()
+
+    gate_prev = 2.0 * torch.sigmoid(torch.randn(rows, HC, generator=gen, device=device))
+    return {
+        "y": _rnd(rows, HS, std=1.0) if combine else None,
+        "residual": _rnd(rows, hidden, std=3.0),
+        "gate_prev": gate_prev.contiguous() if combine else None,
+        "norm_weight": _rnd(hidden, std=0.1 * w_scale),
+        "w_down": _rnd(LOWRANK, hidden, std=0.04 * w_scale),
+        "w_up": _rnd(hidden, LOWRANK, std=0.1 * w_scale),
+        "w_inject": _rnd(HC, hidden, std=0.04 * w_scale) if next_gate else None,
+    }
+
+
+def _seam_args(inp):
+    return (
+        inp["y"],
+        inp["residual"],
+        inp["gate_prev"],
+        inp["norm_weight"],
+        inp["w_down"],
+        inp["w_up"],
+        inp["w_inject"],
+        EPS,
+    )
+
+
+def _seam_rel_l2(a, b):
+    a, b = a.double(), b.double()
+    return ((a - b).norm() / b.norm()).item()
+
+
+def _seam_errors(fn, inp, ref_fn=seam_ref_fp64):
+    """Return (mixed rel-L2, gate max-abs or None) of fn against ref_fn."""
+    _, mixed, gate = fn(*_seam_args(inp))
+    _, mixed_ref, gate_ref = ref_fn(*_seam_args(inp))
+    gerr = None
+    if gate_ref is not None:
+        gerr = (gate.double() - gate_ref.double()).abs().max().item()
+    return _seam_rel_l2(mixed, mixed_ref), gerr
+
+
+def _run_seam_case(rows, combine, next_gate, fn=None, *, seed=0, stress=None):
+    fn = fn or SEAM_UNDER_TEST
+    tag = (
+        f"seam[M={rows},combine={int(combine)},gate={int(next_gate)},"
+        f"seed={seed},stress={stress}]"
+    )
+    inp = _make_seam_inputs(rows, combine=combine, next_gate=next_gate, seed=seed)
+    if stress == "heavy-norm":
+        # Sparse affine outliers retain the near-zero typical norm weight.
+        inp["norm_weight"][::257] *= 8
+    elif stress == "saturated-gates":
+        if combine:
+            inp["gate_prev"] = 2 * torch.sigmoid(
+                torch.linspace(-40, 40, rows * HC, device="cuda").view(rows, HC)
+            )
+        if next_gate:
+            inp["w_inject"] *= torch.tensor([0.1, 1, 4, 10], device="cuda").view(HC, 1)
+    elif stress == "near-zero-rms":
+        inp["residual"] *= 1e-5
+        if combine:
+            inp["y"] *= 1e-5
+    elif stress == "stream-scales":
+        inp["residual"] = (
+            (
+                inp["residual"].view(rows, HC, HS)
+                * torch.tensor([0.01, 0.1, 10, 100], device="cuda").view(1, HC, 1)
+            )
+            .bfloat16()
+            .view(rows, HC * HS)
+        )
+    snap = {k: v.clone() for k, v in inp.items() if v is not None}
+    r_new, mixed, gate = fn(*_seam_args(inp))
+    ok = True
+
+    def _fail(msg):
+        nonlocal ok
+        print(f"[FAIL] {tag}: {msg}")
+        ok = False
+
+    if r_new.dtype != torch.bfloat16 or r_new.shape != inp["residual"].shape:
+        _fail(f"residual_new {r_new.dtype} {tuple(r_new.shape)}")
+    if mixed.dtype != torch.bfloat16 or tuple(mixed.shape) != (rows, HS):
+        _fail(f"mixed {mixed.dtype} {tuple(mixed.shape)}")
+    if next_gate:
+        if (
+            gate is None
+            or gate.dtype != torch.float32
+            or tuple(gate.shape) != (rows, HC)
+        ):
+            _fail("gate_next must be FP32 [M,4]")
+    elif gate is not None:
+        _fail("gate_next must be None without w_inject")
+    # No combine returns the input residual object; combine allocates new storage.
+    if combine == (r_new is inp["residual"]):
+        _fail(f"alias contract violated (combine={combine})")
+    for k, v in snap.items():
+        if not torch.equal(v, inp[k]):
+            _fail(f"input {k} was mutated")
+    if not (
+        torch.isfinite(r_new.float()).all() and torch.isfinite(mixed.float()).all()
+    ):
+        _fail("non-finite output")
+    if gate is not None and not (
+        torch.isfinite(gate).all() and gate.min() >= 0 and gate.max() <= 2
+    ):
+        _fail("gate_next outside [0, 2]")
+    # Residual: exactly the combine-only reference (or untouched when no combine).
+    r_exp = (
+        SEAM_COMBINE_UNDER_TEST(inp["y"], inp["residual"], inp["gate_prev"])
+        if combine
+        else inp["residual"]
+    )
+    if not torch.equal(r_new.view(torch.int16), r_exp.view(torch.int16)):
+        _fail("residual_new differs from combine-only reference")
+    if combine:
+        split = fn(
+            *_seam_args({**inp, "residual": r_exp, "y": None, "gate_prev": None})
+        )
+        if _seam_rel_l2(mixed, split[1]) >= SEAM_MIXED_REL_L2:
+            _fail("fused differs from combine-only plus mix-only")
+        if next_gate and (gate - split[2]).abs().max() >= SEAM_GATE_MAX_ABS:
+            _fail("fused gate differs from combine-only plus mix-only")
+    l2, gerr = _seam_errors(fn, inp)
+    from aiter.ops.flydsl.kernels.hyper_connection_gated_residual.tuned import (
+        seam_deferred_default,
+    )
+
+    is_deferred = fn is _deferred_seam or (
+        fn is hc_seam and seam_deferred_default(rows)
+    )
+    _SEAM_METRICS.append((is_deferred, l2, gerr or 0.0))
+    if not (l2 < SEAM_MIXED_REL_L2):
+        _fail(f"mixed rel-L2 {l2:.3e} >= {SEAM_MIXED_REL_L2:.0e}")
+    gate_limit = (
+        SEAM_GATE_MAX_ABS_DEFERRED if fn is _deferred_seam else SEAM_GATE_MAX_ABS
+    )
+    if gerr is not None and not (gerr < gate_limit):
+        _fail(f"gate max-abs {gerr:.3e} >= {gate_limit:.1e}")
+    if not ok and stress is not None:
+        floor_l2, floor_gate = _seam_errors(seam_ref_operational, inp)
+        print(f"[FLOOR] {tag} mixed_l2={floor_l2:.3e} gate_abs={floor_gate}")
+    if is_deferred:
+        deferred_ref = seam_ref_deferred(*_seam_args(inp))
+        kernel_l2 = _seam_rel_l2(mixed, deferred_ref[1])
+        if not (kernel_l2 < SEAM_DEFERRED_KERNEL_REL_L2):
+            _fail(
+                f"mixed rel-L2 vs deferred ref {kernel_l2:.3e} >= "
+                f"{SEAM_DEFERRED_KERNEL_REL_L2:.0e}"
+            )
+    if fn is _deferred_seam:
+        operational = seam_ref_operational(*_seam_args(inp))
+        print(
+            f"deferred-errors M={rows} seed={seed} stress={stress} "
+            f"operational_l2={_seam_rel_l2(mixed, operational[1]):.9g} "
+            f"deferred_l2={_seam_rel_l2(mixed, deferred_ref[1]):.9g} "
+            f"operational_gate={0 if gate is None else (gate - operational[2]).abs().max().item():.9g}"
+        )
+    if ok:
+        print(
+            f"[PASS] {tag} mixed_l2={l2:.2e}"
+            + (f" gate_abs={gerr:.2e}" if gerr is not None else "")
+        )
+    else:
+        _FAILURES.append(tag)
+
+
+def _run_seam_combine_only(rows, fn=None):
+    fn = fn or SEAM_COMBINE_UNDER_TEST
+    tag = f"seam-combine[M={rows}]"
+    inp = _make_seam_inputs(rows, combine=True, next_gate=False)
+    snap = {key: inp[key].clone() for key in ("y", "residual", "gate_prev")}
+    out = fn(inp["y"], inp["residual"], inp["gate_prev"])
+    assert all(torch.equal(value, inp[key]) for key, value in snap.items())
+    ref = seam_combine_only_ref(inp["y"], inp["residual"], inp["gate_prev"])
+    bad = out.dtype != torch.bfloat16 or out.shape != ref.shape
+    mism = (out.view(torch.int16) != ref.view(torch.int16)).float().mean().item()
+    if bad or mism != 0 or out is inp["residual"]:
+        print(f"[FAIL] {tag}: dtype/shape/alias or mismatch frac {mism:.2e}")
+        _FAILURES.append(tag)
+    else:
+        print(f"[PASS] {tag} mismatch_frac={mism:.2e}")
+
+
+def _run_seam_paths_and_views():
+    k1 = flydsl_k1_combine_norm_down
+    for rows in (16, 64, 128, 256):
+        with patch(
+            "aiter.ops.flydsl.hc_seam.flydsl_k1_combine_norm_down",
+            side_effect=lambda *args, **kw: k1(*args, **{**kw, "split_k": 1}),
+        ):
+            for combine in (False, True):
+                for next_gate in (False, True):
+                    _run_seam_case(rows, combine, next_gate)
+    for rows in (1, 64):
+        inp = _make_seam_inputs(rows, seed=19)
+        base = hc_seam(*_seam_args(inp))
+        storage = torch.empty(rows, 8, device="cuda", dtype=torch.float32)
+        storage[:, ::2] = inp["gate_prev"]
+        views = [storage[:, ::2]]
+        for expanded in (
+            inp["gate_prev"][:1].expand(rows, HC),
+            inp["gate_prev"][:, :1].expand(rows, HC),
+        ):
+            assert torch.equal(
+                hc_gated_combine(inp["y"], inp["residual"], expanded),
+                seam_combine_only_ref(inp["y"], inp["residual"], expanded),
+            )
+        if rows == 1:
+            views.append(torch.as_strided(inp["gate_prev"], (1, HC), (99, 1)))
+        for view in views:
+            result = hc_seam(*_seam_args({**inp, "gate_prev": view}))
+            for got, expected in zip(result, base):
+                assert torch.equal(got, expected)
+            assert torch.equal(
+                hc_gated_combine(inp["y"], inp["residual"], view),
+                seam_combine_only_ref(inp["y"], inp["residual"], view),
+            )
+        for next_gate in (False, True):
+            full_inp = {**inp, "w_inject": inp["w_inject"] if next_gate else None}
+            fused = hc_seam(*_seam_args(full_inp))
+            combined = hc_gated_combine(inp["y"], inp["residual"], inp["gate_prev"])
+            separate = hc_seam(
+                *_seam_args(
+                    {**full_inp, "residual": combined, "y": None, "gate_prev": None}
+                )
+            )
+            assert separate[0] is combined
+            assert _seam_rel_l2(fused[1], separate[1]) < SEAM_MIXED_REL_L2
+            if next_gate:
+                assert (fused[2] - separate[2]).abs().max() < SEAM_GATE_MAX_ABS
+    for rows in (16, 64):
+        inp = _make_seam_inputs(rows, seed=23)
+        result = hc_seam(*_seam_args(inp))
+        # A returned finished gate must remain a valid next-combine input.
+        chained = {**inp, "residual": result[0], "gate_prev": result[2]}
+        r_new, _, _ = hc_seam(*_seam_args(chained))
+        assert torch.equal(
+            r_new,
+            seam_combine_only_ref(
+                chained["y"], chained["residual"], chained["gate_prev"]
+            ),
+        )
+        f32_norm = hc_seam(
+            *_seam_args({**inp, "norm_weight": inp["norm_weight"].float()})
+        )
+        for got, expected in zip(f32_norm, result):
+            assert torch.equal(got, expected)
+    inp = _make_seam_inputs(16, seed=31)
+    invalid = (
+        ({"y": None}, ValueError, "both be present"),
+        ({"gate_prev": None}, ValueError, "both be present"),
+        ({"gate_prev": inp["gate_prev"].bfloat16()}, ValueError, "gate_prev"),
+        ({"gate_prev": inp["gate_prev"][:, :3]}, ValueError, "gate_prev"),
+        ({"norm_weight": inp["norm_weight"][:HS]}, ValueError, "norm_w"),
+        ({"w_down": inp["w_down"][:-1]}, ValueError, "w_down"),
+        ({"w_inject": inp["w_inject"].cpu()}, ValueError, "same device"),
+        ({"w_up": inp["w_up"].float()}, ValueError, "w_up"),
+        ({"w_up": inp["w_up"].t().contiguous().t()}, ValueError, "contiguous"),
+    )
+    for changes, error_type, message in invalid:
+        try:
+            hc_seam(*_seam_args({**inp, **changes}))
+        except error_type as error:
+            assert message in str(error)
+        else:
+            raise AssertionError(f"seam accepted invalid input: {message}")
+    print(
+        "seam decoupled paths, FP32 norm, strided gates, chaining and validation passed"
+    )
+
+
+def _fail_prepared(msg):
+    print(f"[FAIL] {msg}")
+
+
+def _bits_equal(a, b):
+    if a is None or b is None:
+        return a is None and b is None
+    return (
+        a.shape == b.shape
+        and torch.equal(
+            a.contiguous().view(torch.int32), b.contiguous().view(torch.int32)
+        )
+        if a.dtype == torch.float32
+        else torch.equal(
+            a.contiguous().view(torch.int16), b.contiguous().view(torch.int16)
+        )
+    )
+
+
+def _prepare(inp):
+    return hc_seam_prepare_weights(
+        inp["norm_weight"], inp["w_down"], inp["w_up"], inp["w_inject"]
+    )
+
+
+def _run_k2_branch_parity():
+    """Both register schedules retain residual/gate bits and prepared row panels."""
+    maximum = 0.0
+    for rows in (1, 16, 65, 224, 255, 256):
+        for combine in (False, True):
+            inp = _make_seam_inputs(rows, combine=combine, next_gate=True)
+            prep = _prepare(inp)
+            unpacked = (
+                prep.w_up_interleaved.permute(1, 0, 2, 3).contiguous().view(10240, 320)
+            )
+            assert torch.equal(unpacked, prep.w_up)
+            snapshot = prep.w_up_interleaved.clone()
+            for deferred in (False, True):
+
+                def call(mode, inp=inp, prep=prep, deferred=deferred):
+                    return hc_seam_prepared(
+                        inp["y"],
+                        inp["residual"],
+                        inp["gate_prev"],
+                        prep,
+                        EPS,
+                        deferred=deferred,
+                        k2_branch_mode=mode,
+                    )
+
+                old = call("branchwise")
+                for mode in ("combined", "separate"):
+                    new = call(mode)
+                    assert _bits_equal(old[0], new[0]) and _bits_equal(old[2], new[2])
+                    diff = (old[1].float() - new[1].float()).abs().max().item()
+                    maximum = max(maximum, diff)
+                    assert _seam_rel_l2(new[1], old[1]) < SEAM_MIXED_REL_L2
+            assert torch.equal(snapshot, prep.w_up_interleaved)
+    print(f"K2 branch parity: max_mixed_abs={maximum:.9g}; residual/gate bit-identical")
+
+
+@pytest.mark.parametrize("rows", (64, 128, 65, 256))
+@pytest.mark.parametrize("variant", ("batch", "structural"))
+def test_deferred_structural_knobs(rows, variant):
+    """Load batching and grid permutations preserve bits, including tail tiles."""
+    if get_gfx_runtime() != "gfx950":
+        pytest.skip("deferred HC seam requires gfx950")
+    inp = _make_seam_inputs(rows, seed=7, combine=True, next_gate=True)
+    prep = _prepare(inp)
+    args = (inp["y"], inp["residual"], inp["gate_prev"], prep, EPS)
+    geometry = {"deferred": True}
+    old = hc_seam_prepared(*args, **geometry)
+    knobs = {"k1_a_batch": 1}
+    if variant != "batch":
+        knobs.update(k1_grid_swap=1, k2_grid_swap=1)
+    new = hc_seam_prepared(*args, **geometry, **knobs)
+    ref = seam_ref_deferred(*_seam_args(inp))
+    assert all(_bits_equal(a, b) for a, b in zip(old, new))
+    assert _bits_equal(new[0], ref[0])
+    mixed_error = _seam_rel_l2(new[1], ref[1])
+    gate_error = (new[2] - ref[2].float()).abs().max().item()
+    assert mixed_error < SEAM_MIXED_REL_L2
+    assert gate_error < SEAM_GATE_MAX_ABS
+    print(
+        f"structural M={rows} variant={variant}: bit-identical; "
+        f"mixed_rel_l2={mixed_error:.9g}; gate_max_abs={gate_error:.9g}"
+    )
+
+
+def test_structural_default_selector_range():
+    from aiter.ops.flydsl.kernels.hyper_connection_gated_residual.tuned import (
+        seam_deferred_structural_default as sel,
+    )
+
+    on = {"k1_a_batch": 1, "k1_grid_swap": 1, "k2_grid_swap": 1}
+    off = dict.fromkeys(on, 0)
+    for rows in (1, 4, 63, 129, 256):
+        assert sel(rows, True, True) == off, rows
+    for rows in (64, 65, 96, 112, 128):
+        assert sel(rows, True, True) == on, rows
+        assert sel(rows, False, True) == off, rows
+        assert sel(rows, True, False) == off, rows
+
+
+@pytest.mark.parametrize("rows", (64, 65, 128, 256))
+def test_structural_default_dispatch(rows):
+    """Default dispatch turns the knobs on in 64..128 only; explicit kwargs win."""
+    if get_gfx_runtime() != "gfx950":
+        pytest.skip("deferred HC seam requires gfx950")
+    import aiter.ops.flydsl.hc_seam as mod
+
+    inp = _make_seam_inputs(rows, seed=7, combine=True, next_gate=True)
+    prep = _prepare(inp)
+    args = (inp["y"], inp["residual"], inp["gate_prev"], prep, EPS)
+
+    def resolved(**kw):
+        seen = {}
+        k1, k2 = mod._build_down_deferred_partial_pipe, mod.flydsl_up_gate_mix_norm
+
+        def k1_spy(**c):
+            seen["k1"] = (c.get("k1_a_batch", 0), c.get("k1_grid_swap", 0))
+            return k1(**c)
+
+        def k2_spy(*a, **c):
+            seen["k2"] = c.get("grid_swap", 0)
+            return k2(*a, **c)
+
+        with (
+            patch.object(mod, "_build_down_deferred_partial_pipe", k1_spy),
+            patch.object(mod, "flydsl_up_gate_mix_norm", k2_spy),
+        ):
+            out = mod.hc_seam_prepared(*args, **kw)
+        return seen, out
+
+    want = 1 if 64 <= rows <= 128 else 0
+    seen, out = resolved()
+    if rows <= 128:
+        assert seen["k1"] == (want, want) and seen["k2"] == want, (rows, seen)
+    else:
+        assert "k1" not in seen, (rows, seen)
+    if rows <= 128:
+        seen, forced = resolved(deferred=True)
+        assert seen["k1"] == (0, 0) and seen["k2"] == 0, (rows, seen)
+        seen, _ = resolved(k1_a_batch=0, k1_grid_swap=0, k2_grid_swap=0)
+        assert seen["k1"] == (0, 0) and seen["k2"] == 0, (rows, seen)
+        assert all(_bits_equal(a, b) for a, b in zip(out, forced))
+    ref = seam_ref_deferred(*_seam_args(inp)) if rows <= 128 else None
+    if ref is not None:
+        assert _bits_equal(out[0], ref[0])
+        assert _seam_rel_l2(out[1], ref[1]) < SEAM_MIXED_REL_L2
+        assert (out[2] - ref[2].float()).abs().max().item() < SEAM_GATE_MAX_ABS
+
+
+def _run_k2_default_schedule():
+    """Default K2 schedule per M: separate through the threshold, else branchwise."""
+    from aiter.ops.flydsl.kernels.hyper_connection_gated_residual.tuned import (
+        SEAM_K2_SEPARATE_MAX_ROWS as T,
+    )
+    from aiter.ops.flydsl.kernels.hyper_connection_gated_residual.tuned import (
+        seam_k2_default,
+    )
+
+    m64 = {"block_m": 32, "block_n": 32, "m_waves": 2, "n_waves": 1, "slp": False}
+    m16 = {"block_m": 16, "block_n": 32, "m_waves": 1, "n_waves": 1, "slp": True}
+    expected = {1: m16, 16: m16, 32: m16, 64: m64, T: m64}
+    for rows, geometry in expected.items():
+        mode, got = seam_k2_default(rows)
+        assert (mode, got) == ("separate", geometry), (rows, mode, got)
+    for rows in (T + 1, 256):
+        assert seam_k2_default(rows) == ("branchwise", {}), rows
+    # End to end: above the deferred range the default call is the four-launch
+    # path and must equal the forced schedule bit for bit. Smaller M dispatches
+    # skinny or deferred, which do not use seam_k2_default.
+    for rows in (129, 256):
+        inp = _make_seam_inputs(rows, combine=True, next_gate=True)
+        prep = _prepare(inp)
+        args = (inp["y"], inp["residual"], inp["gate_prev"], prep, EPS)
+        got = hc_seam_prepared(*args)
+        ref = hc_seam_prepared(*args, k2_branch_mode="branchwise")
+        for a, b in zip(got, ref):
+            assert _bits_equal(a, b), rows
+    # Within the deferred range the default call is the deferred path; the
+    # explicit deferred= control must reproduce it bit for bit.
+    for rows in (64, 96):
+        inp = _make_seam_inputs(rows, combine=True, next_gate=True)
+        prep = _prepare(inp)
+        args = (inp["y"], inp["residual"], inp["gate_prev"], prep, EPS)
+        got = hc_seam_prepared(*args)
+        ref = hc_seam_prepared(*args, deferred=True)
+        for a, b in zip(got, ref):
+            assert _bits_equal(a, b), ("default vs deferred", rows)
+    print(f"K2 default schedule: separate for M<={T}, branchwise above")
+
+
+def _run_merged_width_rejected():
+    """Hand-built 336-row merged weights are rejected before any launch."""
+    inp = _make_seam_inputs(8)
+    prep = dataclasses.replace(
+        _prepare(inp),
+        merged=merge_down_inject(inp["w_down"], inp["w_inject"], 336),
+    )
+    try:
+        hc_seam_prepared(inp["y"], inp["residual"], inp["gate_prev"], prep, EPS)
+    except ValueError as exc:
+        assert "hc_seam_prepare_weights" in str(exc), exc
+    else:
+        raise AssertionError("336-row merged weight was accepted")
+    print("merged-width check: 336-row merged weight rejected")
+
+
+def _run_prepared_weights_validation():
+    """HcSeamPreparedWeights.__post_init__ rejects inconsistent hand-built objects."""
+    inp = _make_seam_inputs(8)
+    prep = _prepare(inp)
+    bad = {
+        "has_next_gate": {"has_next_gate": not prep.has_next_gate},
+        "w_up_interleaved shape": {"w_up_interleaved": prep.w_up_interleaved[:80]},
+        "w_down shape": {"w_down": prep.w_down[:160]},
+        "w_inject shape": {"w_inject": prep.w_inject[:2]},
+        "merged ndim": {"merged": prep.merged.reshape(-1)},
+        "merged columns": {"merged": prep.merged[:, :5120]},
+        "cpu tensor": {"w_down": prep.w_down.cpu()},
+    }
+    for label, kw in bad.items():
+        try:
+            dataclasses.replace(prep, **kw)
+        except ValueError:
+            continue
+        _fail_prepared(f"prepared weights accepted {label}")
+        _FAILURES.append("prepared-weights accepted " + label)
+    for label, kw in (
+        ("valid", {}),
+        (
+            "336-row merged",
+            {"merged": merge_down_inject(inp["w_down"], inp["w_inject"], 336)},
+        ),
+    ):
+        try:
+            dataclasses.replace(prep, **kw)
+        except ValueError as exc:
+            _fail_prepared(f"prepared weights rejected {label}: {exc}")
+            _FAILURES.append("prepared-weights rejected " + label)
+    print("prepared-weights validation passed")
+
+
+def _run_deferred_padded_extent_rejected():
+    """The deferred path needs a 64-multiple padded_extent; raised before launch."""
+    inp = _make_seam_inputs(8)
+    prep = _prepare(inp)
+    for bad in (32, 96 + 16):
+        try:
+            hc_seam_prepared(
+                inp["y"],
+                inp["residual"],
+                inp["gate_prev"],
+                prep,
+                EPS,
+                deferred=True,
+                padded_extent=bad,
+            )
+        except ValueError as exc:
+            assert "multiple of 64" in str(exc), exc
+        else:
+            raise AssertionError(f"deferred padded_extent={bad} was accepted")
+    print("deferred padded_extent check: non-multiples of 64 rejected")
+
+
+def _run_seam_default_paths():
+    for rows in (1, 3, 4, 8, 16, 64, 96, 128, 129, 256):
+        inp = _make_seam_inputs(rows)
+        prep = _prepare(inp)
+        args = (inp["y"], inp["residual"], inp["gate_prev"], prep, EPS)
+        got = hc_seam_prepared(*args)
+        if 4 <= rows <= 128:
+            ref = hc_seam_prepared(*args, deferred=True)
+        elif rows <= 3:
+            ref = hc_seam_prepared(*args, fallback="skinny")
+        else:
+            ref = hc_seam_prepared(*args, k2_branch_mode="branchwise")
+        assert all(_bits_equal(a, b) for a, b in zip(got, ref)), rows
+    print("seam default path boundaries and forced-path parity passed")
+
+
+def _run_seam_prepared():
+    """hc_seam_prepared is bit-identical to hc_seam, reusable, non-mutating."""
+    if get_gfx_runtime() != "gfx950":
+        return
+    shared = _make_seam_inputs(256, combine=True, next_gate=True, seed=0)
+    shared_prep = _prepare(shared)
+    snap = (
+        shared_prep.merged.clone(),
+        shared_prep.norm_w.clone(),
+        shared_prep.w_up.clone(),
+    )
+    for rows in SEAM_ROWS:
+        for combine in (False, True):
+            for next_gate in (False, True):
+                tag = f"seam-prepared[M={rows},combine={int(combine)},gate={int(next_gate)}]"
+                inp = _make_seam_inputs(
+                    rows, combine=combine, next_gate=next_gate, seed=0
+                )
+                ref = hc_seam(*_seam_args(inp))
+                out = hc_seam_prepared(
+                    inp["y"], inp["residual"], inp["gate_prev"], _prepare(inp), EPS
+                )
+                if not all(_bits_equal(a, b) for a, b in zip(ref, out)):
+                    _fail_prepared(f"{tag} differs from hc_seam")
+                    _FAILURES.append(tag)
+                # One shared prepared object across all M values and modes.
+                shared_in = {
+                    **inp,
+                    **{k: shared[k] for k in ("norm_weight", "w_down", "w_up")},
+                }
+                shared_in["w_inject"] = shared["w_inject"] if next_gate else None
+                prep = shared_prep if next_gate else _prepare(shared_in)
+                ref = hc_seam(*_seam_args(shared_in))
+                out = hc_seam_prepared(
+                    inp["y"], inp["residual"], inp["gate_prev"], prep, EPS
+                )
+                if not all(_bits_equal(a, b) for a, b in zip(ref, out)):
+                    _fail_prepared(f"{tag} shared prepared differs from hc_seam")
+                    _FAILURES.append(tag + "-shared")
+    after = (shared_prep.merged, shared_prep.norm_w, shared_prep.w_up)
+    if not all(torch.equal(a, b) for a, b in zip(snap, after)):
+        _fail_prepared("prepared weights were mutated by calls")
+        _FAILURES.append("seam-prepared-mutation")
+    inp = _make_seam_inputs(16, combine=True, next_gate=False)
+    no_inj = _prepare(inp)
+    for label, call, exc in (
+        (
+            "device mismatch",
+            lambda: hc_seam_prepared(
+                inp["y"].cpu(),
+                inp["residual"].cpu(),
+                inp["gate_prev"].cpu(),
+                no_inj,
+                EPS,
+            ),
+            ValueError,
+        ),
+    ):
+        try:
+            call()
+        except exc:
+            pass
+        else:
+            _fail_prepared(f"prepared accepted {label}")
+            _FAILURES.append("seam-prepared-" + label)
+    try:
+        hc_seam_prepare_weights(
+            inp["norm_weight"], inp["w_down"], inp["w_up"], inp["w_down"][:2]
+        )
+    except ValueError:
+        pass
+    else:
+        _fail_prepared("prepare accepted a mis-shaped w_inject_next")
+        _FAILURES.append("prepare accepted a mis-shaped w_inject_next")
+    _, _, gate = hc_seam_prepared(
+        inp["y"], inp["residual"], inp["gate_prev"], no_inj, EPS
+    )
+    if gate is not None or no_inj.has_next_gate:
+        _fail_prepared("prepared without inject returned a next gate")
+        _FAILURES.append("prepared without inject returned a next gate")
+    print("seam prepared-weights equivalence, reuse, immutability, misuse passed")
+
+
+def _run_seam_sentinel_extents(bm1, bm2):
+    """Real-row sentinel guards with K1 row tile bm1 and K2 row tile bm2."""
+    kw = {"k1_row_tile": bm1, "k2_row_tile": bm2}
+    for fallback in ("splitk", "decouple"):
+        for rows in (1, 17, 65, 224):
+            for combine in (False, True):
+                inp = _make_seam_inputs(rows, combine=combine, next_gate=True)
+                prep = _prepare(inp)
+                sentinel = 123.0
+                residual_storage = torch.full(
+                    (rows + 2, HC * HS),
+                    sentinel,
+                    device="cuda",
+                    dtype=torch.bfloat16,
+                )
+                residual_storage[1 : rows + 1].copy_(inp["residual"])
+                inp["residual"] = residual_storage[1 : rows + 1]
+                guards = []
+                empty = torch.empty
+
+                def guarded_empty(
+                    *shape,
+                    rows=rows,
+                    sentinel=sentinel,
+                    guards=guards,
+                    empty=empty,
+                    **kwargs,
+                ):
+                    if shape in ((rows, HC * HS), (rows, HS)):
+                        storage = torch.full(
+                            (rows + 2, shape[1]),
+                            sentinel,
+                            device="cuda",
+                            dtype=kwargs["dtype"],
+                        )
+                        guards.append(storage)
+                        return storage[1 : rows + 1]
+                    return empty(*shape, **kwargs)
+
+                # The next-gate allocation uses Tensor.new_empty, so inject its
+                # guarded real-row destination at the K1 boundary.
+                gate_storage = torch.full(
+                    (rows + 2, HC), sentinel, device="cuda", dtype=torch.float32
+                )
+                k1 = flydsl_k1_combine_norm_down
+
+                def guarded_k1(
+                    *args, k1=k1, gate_storage=gate_storage, rows=rows, **kw
+                ):
+                    return k1(*args, **{**kw, "gate_out": gate_storage[1 : rows + 1]})
+
+                with (
+                    patch("torch.empty", guarded_empty),
+                    patch(
+                        "aiter.ops.flydsl.hc_seam.flydsl_k1_combine_norm_down",
+                        side_effect=guarded_k1,
+                    ),
+                ):
+                    out = hc_seam_prepared(
+                        inp["y"],
+                        inp["residual"],
+                        inp["gate_prev"],
+                        prep,
+                        EPS,
+                        **kw,
+                        fallback=fallback,
+                    )
+                torch.cuda.synchronize()
+                for storage in [residual_storage, gate_storage, *guards]:
+                    assert torch.all(storage[0] == sentinel) and torch.all(
+                        storage[-1] == sentinel
+                    )
+                if not combine:
+                    assert out[0] is inp["residual"]
+                ref = seam_ref_fp64(*_seam_args(inp))
+                assert _seam_rel_l2(out[1], ref[1]) < SEAM_MIXED_REL_L2
+                assert (
+                    gate_storage[1 : rows + 1] - ref[2]
+                ).abs().max() < SEAM_GATE_MAX_ABS
+
+
+def _run_seam_row_tiles():
+    for tile in (16, 32, 64):
+
+        def forced(y, residual, gate, norm, down, up, inject, eps, tile=tile):
+            prep = hc_seam_prepare_weights(norm, down, up, inject)
+            return hc_seam_prepared(y, residual, gate, prep, eps, row_tile=tile)
+
+        for rows in SEAM_ROWS:
+            for combine in (False, True):
+                for next_gate in (False, True):
+                    for seed in SEAM_SEEDS:
+                        _run_seam_case(rows, combine, next_gate, fn=forced, seed=seed)
+                        if rows in (16, 64, 128, 256):
+                            for stress in SEAM_STRESS:
+                                _run_seam_case(
+                                    rows,
+                                    combine,
+                                    next_gate,
+                                    fn=forced,
+                                    seed=seed,
+                                    stress=stress,
+                                )
+        _run_seam_sentinel_extents(tile, tile)
+        print(
+            f"row_tile={tile} forced matrix, split-K/decoupled sentinel extents passed"
+        )
+    for bm1, bm2 in ((16, 32), (32, 16), (32, 64), (64, 32), (16, 64), (64, 16)):
+        _run_seam_sentinel_extents(bm1, bm2)
+    print("mixed BM1 != BM2 sentinel extents passed")
+    inp = _make_seam_inputs(16)
+    try:
+        hc_seam_prepared(
+            inp["y"],
+            inp["residual"],
+            inp["gate_prev"],
+            _prepare(inp),
+            EPS,
+            row_tile=16,
+            k2_n_tile=16,
+            k2_branch_mode="branchwise",
+        )
+    except ValueError as error:
+        assert "vector-work divisibility" in str(error)
+    else:
+        raise AssertionError("BM16/BN16 must fail vector-work validation")
+
+
+def _run_deferred_partials(
+    rows_set=(16, 64, 65, 128, 256),
+    seeds=(0, 1, 2, 3),
+    stresses=(None, *SEAM_STRESS),
+    **geometry,
+):
+    """Private deferred down: chunk/branch numerics and guarded scratch stores."""
+    if get_gfx_runtime() != "gfx950":
+        return
+    import flydsl.compiler as flyc
+    import flydsl.expr as fx
+
+    chunk = geometry.get("chunk_width", 256)
+    bm = geometry.get("block_m", 64)
+    splits = HC * HS // chunk
+    max_stats, max_dot, max_oracle_stats = 0.0, 0.0, 0.0
+    count = 0
+    for rows in rows_set:
+        padded = ((rows + bm - 1) // bm) * bm
+        for combine in (False, True):
+            builder = _build_down_deferred_partial_pipe(has_combine=combine, **geometry)
+            compiled = None
+            for seed in seeds:
+                for stress in stresses:
+                    inp = _make_seam_inputs(
+                        rows, combine=combine, next_gate=False, seed=seed
+                    )
+                    if stress == "heavy-norm":
+                        inp["norm_weight"][::257] *= 8
+                    elif stress == "saturated-gates" and combine:
+                        inp["gate_prev"] = 2 * torch.sigmoid(
+                            torch.linspace(-40, 40, rows * HC, device="cuda").view(
+                                rows, HC
+                            )
+                        )
+                    elif stress == "near-zero-rms":
+                        inp["residual"] *= 1e-5
+                        if combine:
+                            inp["y"] *= 1e-5
+                    elif stress == "stream-scales":
+                        inp["residual"] = (
+                            (
+                                inp["residual"].view(rows, HC, HS)
+                                * torch.tensor(
+                                    [0.01, 0.1, 10, 100], device="cuda"
+                                ).view(1, HC, 1)
+                            )
+                            .bfloat16()
+                            .view(rows, HC * HS)
+                        )
+                    if geometry.get("w_bf16") is False:
+                        inp["norm_weight"] = inp["norm_weight"].float()
+                    r_ref, d_ref, ss_ref = seam_deferred_partials_ref(
+                        inp["y"],
+                        inp["residual"],
+                        inp["gate_prev"],
+                        inp["norm_weight"],
+                        inp["w_down"],
+                        chunk_width=chunk,
+                    )
+                    oracle_ss = (
+                        r_ref.float()
+                        .view(rows, HC, HS // chunk, chunk)
+                        .square()
+                        .sum(-1)
+                        .permute(1, 2, 0)
+                    )
+                    oracle_err = (
+                        ((oracle_ss.double() - ss_ref).abs() / ss_ref.clamp_min(1e-300))
+                        .max()
+                        .item()
+                    )
+                    max_oracle_stats = max(max_oracle_stats, oracle_err)
+                    assert oracle_err <= 1e-5
+                    r_back = torch.full(
+                        (rows + 3, HC * HS), 123, dtype=torch.bfloat16, device="cuda"
+                    )
+                    r_back[:rows].copy_(inp["residual"])
+                    residual = r_back[:rows]
+                    r_snap = r_back.clone()
+                    out_back = torch.full_like(r_back, 117)
+                    p_back = torch.full(
+                        (splits * padded + 3, LOWRANK),
+                        113,
+                        dtype=torch.float32,
+                        device="cuda",
+                    )
+                    p = p_back[: splits * padded]
+                    ss_back = torch.full(
+                        (splits * rows + 17,), 109, dtype=torch.float32, device="cuda"
+                    )
+                    ss = ss_back[: splits * rows]
+                    args = (
+                        residual,
+                        inp["y"] if combine else residual,
+                        inp["gate_prev"] if combine else residual,
+                        inp["norm_weight"],
+                        inp["w_down"],
+                        out_back[:rows],
+                        p,
+                        ss,
+                        fx.Stream(torch.cuda.current_stream().cuda_stream),
+                    )
+                    if compiled is None:
+                        compiled = flyc.compile(builder, *args)
+                    else:
+                        compiled(*args)
+                    torch.cuda.synchronize()
+                    assert torch.equal(r_back, r_snap), "caller residual changed"
+                    if combine:
+                        assert torch.equal(
+                            out_back[:rows], r_ref
+                        ), "BF16 residual parity"
+                    else:
+                        assert torch.all(out_back == 117), "mix-only residual store"
+                    assert torch.all(out_back[rows:] == 117), "residual tail store"
+                    assert torch.all(
+                        p_back[splits * padded :] == 113
+                    ), "partial allocation tail"
+                    assert torch.all(
+                        p.view(splits, padded, LOWRANK)[:, rows:] == 113
+                    ), "partial padded rows"
+                    assert torch.all(ss_back[splits * rows :] == 109), "stat tail store"
+                    got_ss = ss.view(HC, HS // chunk, rows).double()
+                    stat_err = (
+                        ((got_ss - ss_ref).abs() / ss_ref.clamp_min(1e-300))
+                        .max()
+                        .item()
+                    )
+                    branch_ref = ss_ref.sum(1)
+                    branch_err = (
+                        (
+                            (got_ss.sum(1) - branch_ref).abs()
+                            / branch_ref.clamp_min(1e-300)
+                        )
+                        .max()
+                        .item()
+                    )
+                    stat_err = max(stat_err, branch_err)
+                    got_d = p.view(HC, HS // chunk, padded, LOWRANK)[:, :, :rows]
+                    dot_err = _seam_rel_l2(got_d, d_ref)
+                    # Check branch-reduced intermediates too, not only chunk dots.
+                    dot_err = max(dot_err, _seam_rel_l2(got_d.sum(1), d_ref.sum(1)))
+                    assert stat_err <= 1e-5, (rows, combine, seed, stress, stat_err)
+                    assert dot_err <= 1e-4, (rows, combine, seed, stress, dot_err)
+                    max_stats, max_dot = max(max_stats, stat_err), max(max_dot, dot_err)
+                    count += 1
+    print(
+        f"deferred gate: cases={count}, max_stat_rel={max_stats:.9g}, "
+        f"max_dot_rel_l2={max_dot:.9g}, oracle_stat_rel={max_oracle_stats:.9g}; "
+        "residual bit parity and all sentinels passed"
+    )
+    return max_stats, max_dot
+
+
+def _run_deferred_pipeline(
+    rows_set=(64, 65, 128), seeds=(0, 1, 2, 3), stresses=(None, *SEAM_STRESS)
+):
+    """K1 block_k/stages overrides, norm dtype and partial M tiles.
+
+    BK changes the statistics reduction tree; the existing 1e-5 stats and
+    1e-4 dot-relative-L2 gates apply, without requiring default bit identity.
+    """
+    from aiter.ops.flydsl.kernels.hyper_connection_gated_residual.tuned import (
+        seam_deferred_k1_config,
+    )
+
+    for rows in rows_set:
+        for bk, stages in ((64, 3), (128, 2)):
+            cfg = seam_deferred_k1_config(rows)
+            cfg.update(block_k=bk, stages=stages)
+            _run_deferred_partials(
+                rows_set=(rows,), seeds=seeds, stresses=stresses, **cfg
+            )
+        cfg = seam_deferred_k1_config(rows)
+        _run_deferred_partials(
+            rows_set=(rows,), seeds=seeds, stresses=stresses, w_bf16=False, **cfg
+        )
+
+
+def _run_deferred_legality():
+    for chunk in (256, 512, 640, 1280, 2560):
+        _build_down_deferred_partial_pipe(chunk_width=chunk)
+    for bad in (
+        {"chunk_width": 384},
+        {"block_k": 96},
+        {"block_k": 640, "chunk_width": 1280},
+        {"block_m": 48},
+        {"block_n": 96},
+        {"stages": 0},
+        {"m_waves": 0},
+        {"slp": None},
+        {"chunk_width": 256, "stages": 6},
+    ):
+        try:
+            _build_down_deferred_partial_pipe(**bad)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError(f"deferred accepted illegal geometry: {bad}")
+    print(
+        "deferred legality: five chunk values accepted; nine invalid configs rejected"
+    )
+
+
+def _run_deferred_reference():
+    for rows in (16, 64, 65, 128, 256):
+        for combine in (False, True):
+            inp = _make_seam_inputs(rows, combine=combine, next_gate=False)
+            snap = {k: v.clone() for k, v in inp.items() if v is not None}
+            r, dots, ss = seam_deferred_partials_ref(
+                inp["y"],
+                inp["residual"],
+                inp["gate_prev"],
+                inp["norm_weight"],
+                inp["w_down"],
+            )
+            assert dots.shape == (HC, HS // 256, rows, LOWRANK)
+            assert dots.dtype == torch.float32 and ss.dtype == torch.float64
+            assert ss.shape == (HC, HS // 256, rows)
+            assert torch.isfinite(dots).all() and torch.isfinite(ss).all()
+            if combine:
+                assert torch.equal(
+                    r,
+                    seam_combine_only_ref(inp["y"], inp["residual"], inp["gate_prev"]),
+                )
+            else:
+                assert r is inp["residual"]
+            expected = r.double().view(rows, HC, HS).square().sum(-1).t()
+            assert torch.allclose(ss.sum(1), expected, rtol=1e-14, atol=0)
+            assert all(torch.equal(inp[k], v) for k, v in snap.items())
+    print("deferred reference shapes, dtypes, combine parity and nonmutation passed")
+
+
+def _deferred_seam(y, residual, gate, norm, down, up, inject, eps):
+    prep = hc_seam_prepare_weights(norm, down, up, inject)
+    return hc_seam_prepared(y, residual, gate, prep, eps, deferred=True)
+
+
+def _run_deferred_seam():
+    for rows in SEAM_ROWS:
+        for combine in (False, True):
+            for next_gate in (False, True):
+                for seed in SEAM_SEEDS:
+                    for stress in (None, *SEAM_STRESS):
+                        _run_seam_case(
+                            rows,
+                            combine,
+                            next_gate,
+                            fn=_deferred_seam,
+                            seed=seed,
+                            stress=stress,
+                        )
+    # FP32 norm and noncanonical gate strides retain the exact-X gate contract.
+    for rows in (1, 65, 224, 256):
+        inp = _make_seam_inputs(rows)
+        inp["norm_weight"] = inp["norm_weight"].float()
+        inp["gate_prev"] = inp["gate_prev"].t().contiguous().t()
+        prep = _prepare(inp)
+        out = hc_seam_prepared(
+            inp["y"],
+            inp["residual"],
+            inp["gate_prev"],
+            prep,
+            EPS,
+            deferred=True,
+            k2_row_tile=16,
+            padded_extent=320,
+        )
+        ref = seam_ref_deferred(*_seam_args(inp))
+        assert torch.equal(out[0], ref[0])
+        assert _seam_rel_l2(out[1], ref[1]) < SEAM_MIXED_REL_L2
+        assert (out[2] - ref[2]).abs().max() < SEAM_GATE_MAX_ABS
+    inp = _make_seam_inputs(65)
+    prep = _prepare(inp)
+    streams = [torch.cuda.Stream(), torch.cuda.Stream()]
+    graphs, results = [], []
+    torch.cuda.synchronize()
+    for stream in streams:
+        with torch.cuda.stream(stream):
+            hc_seam_prepared(
+                inp["y"], inp["residual"], inp["gate_prev"], prep, EPS, deferred=True
+            )
+        stream.synchronize()
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph, stream=stream):
+            result = hc_seam_prepared(
+                inp["y"], inp["residual"], inp["gate_prev"], prep, EPS, deferred=True
+            )
+        graphs.append(graph)
+        results.append(result)
+    for _ in range(20):
+        for graph, stream in zip(graphs, streams):
+            with torch.cuda.stream(stream):
+                graph.replay()
+    torch.cuda.synchronize()
+    assert all(torch.equal(a, b) for a, b in zip(*results))
+    print("deferred seam FP32 norm, gate views, extent and concurrent graphs passed")
+
+
+def _skinny_seam(y, residual, gate, norm, down, up, inject, eps):
+    prepared = hc_seam_prepare_weights(norm, down, up, inject)
+    return hc_seam_prepared(y, residual, gate, prepared, eps, fallback="skinny")
+
+
+def _run_skinny_seam():
+    for rows in range(1, 9):
+        for combine in (False, True):
+            for next_gate in (False, True):
+                for seed in SEAM_SEEDS:
+                    for stress in (None, *SEAM_STRESS):
+                        _run_seam_case(
+                            rows,
+                            combine,
+                            next_gate,
+                            fn=_skinny_seam,
+                            seed=seed,
+                            stress=stress,
+                        )
+    for rows in (1, 4, 8):
+        inp = _make_seam_inputs(rows)
+        inp["norm_weight"] = inp["norm_weight"].float()
+        inp["gate_prev"] = torch.stack((inp["gate_prev"], inp["gate_prev"]), dim=-1)[
+            ..., 0
+        ]
+        got = _skinny_seam(*_seam_args(inp))
+        ref = seam_ref_fp64(*_seam_args(inp))
+        assert _seam_rel_l2(got[1], ref[1]) < SEAM_MIXED_REL_L2
+        assert (got[2].double() - ref[2]).abs().max() < SEAM_GATE_MAX_ABS
+    streams = (torch.cuda.Stream(), torch.cuda.Stream())
+    graphs, outputs, expected, inputs = [], [], [], []
+    for rows, stream in zip((1, 8), streams):
+        inp = _make_seam_inputs(rows, seed=29)
+        prepared = hc_seam_prepare_weights(
+            inp["norm_weight"], inp["w_down"], inp["w_up"], inp["w_inject"]
+        )
+
+        inputs.append((inp, prepared))
+
+        def launch(inp=inp, prepared=prepared):
+            return hc_seam_prepared(
+                inp["y"],
+                inp["residual"],
+                inp["gate_prev"],
+                prepared,
+                EPS,
+                fallback="skinny",
+            )
+
+        expected.append(launch())
+        stream.wait_stream(torch.cuda.current_stream())
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph, stream=stream):
+            outputs.append(launch())
+        graphs.append(graph)
+    for _ in range(100):
+        for graph, stream in zip(graphs, streams):
+            with torch.cuda.stream(stream):
+                graph.replay()
+        for stream in streams:
+            stream.synchronize()
+        for out, ref in zip(outputs, expected):
+            for actual, want in zip(out, ref):
+                if not torch.equal(actual, want):
+                    _FAILURES.append("skinny seam concurrent graph replay")
+                    return
+    print("skinny seam lifecycle passed")
+
+
+def _run_seam_reference():
+    if get_gfx_runtime() != "gfx950":
+        print("seam requires gfx950; skipping finished-gate fixtures")
+        return
+    for rows in SEAM_ROWS:
+        for combine in (False, True):
+            for next_gate in (False, True):
+                for seed in SEAM_SEEDS:
+                    _run_seam_case(rows, combine, next_gate, seed=seed)
+                    if rows in (16, 64, 128, 256):
+                        for stress in SEAM_STRESS:
+                            _run_seam_case(
+                                rows, combine, next_gate, seed=seed, stress=stress
+                            )
+        _run_seam_combine_only(rows)
+    _run_seam_paths_and_views()
+    _run_seam_prepared()
+    _run_seam_row_tiles()
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="Correctness test for the two-stage HC Gated-Residual op."
@@ -1328,6 +2768,30 @@ def main():
         )
         return 0
 
+    if arch == "gfx950":
+        _run_deferred_legality()
+        _run_deferred_reference()
+        _run_deferred_partials()
+        _run_deferred_pipeline()
+        _run_deferred_seam()
+        _run_k2_branch_parity()
+        _run_k2_default_schedule()
+        _run_seam_default_paths()
+        _run_merged_width_rejected()
+        _run_prepared_weights_validation()
+        _run_deferred_padded_extent_rejected()
+        # Pytest-only knob tests; main() is what CI runs.
+        for rows in (64, 128, 65, 256):
+            for variant in ("batch", "structural"):
+                test_deferred_structural_knobs(rows, variant)
+        test_structural_default_selector_range()
+        for rows in (64, 65, 128, 256):
+            test_structural_default_dispatch(rows)
+    if arch == "gfx950":
+        _run_skinny_seam()
+    _run_seam_reference()
+    _run_direct_k1_extent()
+    _run_w_up_validation()
     for m in args.tokens:
         for fold_w in (False, True):
             _run_combine_and_mix(m, fold_w)
@@ -1346,7 +2810,6 @@ def main():
         _run_direct_k1_untiled_tokens()
     _run_combine(64)
     _run_strided_combine()
-    _run_w_up_validation()
     _run_input_validation()
     _run_zero_tokens()
     _run_k2_override_limits()
@@ -1355,6 +2818,7 @@ def main():
     _run_untuned_hidden()
     _run_counter_hc_isolation()
     _run_counter_cache_bound()
+    _run_skinny_concurrent_graphs()
     _run_wide_stream_lds()
     _run_pipeline_depth()
     _run_stream_dim_validation()
@@ -1395,6 +2859,12 @@ def main():
     ):
         _run_pad336_merged(m)
 
+    for deferred in (False, True):
+        metrics = [x for x in _SEAM_METRICS if x[0] == deferred]
+        if metrics:
+            print(
+                f"seam maxima deferred={deferred}: mixed_rel_l2={max(x[1] for x in metrics):.9g} gate_max_abs={max(x[2] for x in metrics):.9g}"
+            )
     if _FAILURES:
         print(f"\n{len(_FAILURES)} check(s) FAILED: {_FAILURES}")
         return 1

@@ -338,6 +338,150 @@
         "dn_m_waves": 2,
         "dn_n_waves": 1
       }
+    },
+    "seam": {
+      "combine1_next1_n384": {
+        "128": {
+          "k1": {
+            "use_tuned": false,
+            "block_m": 64,
+            "sk_block_m": 64,
+            "dn_block_m": 64,
+            "dn_block_n": 96,
+            "dn_m_waves": 4,
+            "dn_n_waves": 1,
+            "m_waves": 4,
+            "n_waves": 1,
+            "block_k": 64,
+            "stages": 2,
+            "split_k": 32
+          },
+          "k2": {
+            "block_m": 32,
+            "block_n": 16,
+            "m_waves": 1,
+            "n_waves": 1
+          },
+          "_us": 28.454
+        },
+        "192": {
+          "k1": {
+            "use_tuned": false,
+            "block_m": 64,
+            "sk_block_m": 64,
+            "dn_block_m": 64,
+            "dn_block_n": 96,
+            "dn_m_waves": 4,
+            "dn_n_waves": 1,
+            "m_waves": 4,
+            "n_waves": 1,
+            "block_k": 64,
+            "stages": 2,
+            "split_k": 40
+          },
+          "k2": {
+            "block_m": 32,
+            "block_n": 32,
+            "m_waves": 1,
+            "n_waves": 2
+          },
+          "_us": 33.117
+        },
+        "256": {
+          "k1": {
+            "use_tuned": false,
+            "block_m": 64,
+            "sk_block_m": 64,
+            "dn_block_m": 64,
+            "dn_block_n": 192,
+            "dn_m_waves": 2,
+            "dn_n_waves": 2,
+            "m_waves": 2,
+            "n_waves": 2,
+            "block_k": 64,
+            "stages": 2,
+            "split_k": 32
+          },
+          "k2": {
+            "block_m": 64,
+            "block_n": 16,
+            "m_waves": 1,
+            "n_waves": 1
+          },
+          "_us": 36.255
+        }
+      },
+      "combine1_next0_n320": {
+        "128": {
+          "k1": {
+            "use_tuned": false,
+            "block_m": 64,
+            "sk_block_m": 64,
+            "dn_block_m": 64,
+            "dn_block_n": 64,
+            "dn_m_waves": 4,
+            "dn_n_waves": 1,
+            "m_waves": 4,
+            "n_waves": 1,
+            "block_k": 64,
+            "stages": 2,
+            "split_k": 40
+          },
+          "k2": {
+            "block_m": 32,
+            "block_n": 16,
+            "m_waves": 1,
+            "n_waves": 1
+          },
+          "_us": 27.98
+        },
+        "192": {
+          "k1": {
+            "use_tuned": false,
+            "block_m": 64,
+            "sk_block_m": 64,
+            "dn_block_m": 64,
+            "dn_block_n": 64,
+            "dn_m_waves": 4,
+            "dn_n_waves": 1,
+            "m_waves": 4,
+            "n_waves": 1,
+            "block_k": 64,
+            "stages": 2,
+            "split_k": 32
+          },
+          "k2": {
+            "block_m": 64,
+            "block_n": 16,
+            "m_waves": 1,
+            "n_waves": 1
+          },
+          "_us": 31.757
+        },
+        "256": {
+          "k1": {
+            "use_tuned": false,
+            "block_m": 64,
+            "sk_block_m": 64,
+            "dn_block_m": 64,
+            "dn_block_n": 64,
+            "dn_m_waves": 2,
+            "dn_n_waves": 1,
+            "m_waves": 2,
+            "n_waves": 1,
+            "block_k": 64,
+            "stages": 2,
+            "split_k": 32
+          },
+          "k2": {
+            "block_m": 64,
+            "block_n": 16,
+            "m_waves": 1,
+            "n_waves": 1
+          },
+          "_us": 35.923
+        }
+      }
     }
   },
   "gfx942": {

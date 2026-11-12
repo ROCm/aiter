@@ -25,7 +25,7 @@ import torch
 from flydsl.expr import range_constexpr
 from flydsl.expr.typing import T
 
-from aiter.jit.utils.chip_info import get_lds_capacity_bytes
+from aiter.jit.utils.chip_info import get_gfx_runtime, get_lds_capacity_bytes
 from aiter.ops.flydsl.kernels.act import sigmoid_f32
 from aiter.ops.flydsl.kernels.hyper_connection_gated_residual.common import (
     ab_k_perm,
@@ -42,6 +42,7 @@ from aiter.ops.flydsl.kernels.hyper_connection_gated_residual.common import (
 from aiter.ops.flydsl.kernels.hyper_connection_gated_residual.tuned import (
     up_gate_mix_config,
 )
+from aiter.ops.flydsl.kernels.kernels_common import set_slp_vectorize_once_used
 from aiter.ops.flydsl.kernels.tensor_shim import GTensor, _run_compiled
 
 VEC = 8
@@ -108,6 +109,7 @@ def _build_up_gate_mix_norm(
     w_bf16: bool = False,
     _skip_norm: bool = False,
     _skip_gemm: bool = False,
+    bounded_rows: bool = False,
 ):
     """K2: up-GEMM + gated mean that re-forms ``xn`` on-the-fly from ``r2`` +
     ``rrms`` instead of reading a materialized ``xn``.
@@ -131,7 +133,8 @@ def _build_up_gate_mix_norm(
 
     @flyc.kernel(
         name=f"gr_k2_up_gate_mix_norm_hc{hc_count}_hs{stream_dim}_r{lowrank}"
-        f"_bm{block_m}_bn{block_n}{'_wbf16' if w_bf16 else ''}",
+        f"_bm{block_m}_bn{block_n}{'_wbf16' if w_bf16 else ''}"
+        f"{'_br' if bounded_rows else ''}",
         known_block_size=[block_threads, 1, 1],
     )
     def kernel(
@@ -143,6 +146,7 @@ def _build_up_gate_mix_norm(
         block_input: fx.Tensor,  # [M, stream_dim] bf16
     ):
         tid = fx.thread_idx.x
+        real_rows = fx.Int32(fx.get_scalar(r2.shape[0]))
         bid_m = fx.block_idx.x
         bid_c = fx.block_idx.y
 
@@ -231,13 +235,16 @@ def _build_up_gate_mix_norm(
                 )
                 # Match the reference order: normalize in f32, round to bf16,
                 # then widen for the gated-mean multiply.
-                r2_vec = fx.Vector(r2_g.load(g_m * hidden + col, vec_size=VEC)).to(
+                safe_m = g_m
+                if fx.const_expr(bounded_rows):
+                    safe_m = (g_m < real_rows).select(g_m, 0)
+                r2_vec = fx.Vector(r2_g.load(safe_m * hidden + col, vec_size=VEC)).to(
                     fx.Float32
                 )
                 # The diagnostic path omits normalization to isolate its cost.
                 xn_vec = r2_vec
                 if not _skip_norm:
-                    rr = fx.Float32(rrms_g.load(g_m * hc_count + s, vec_size=1))
+                    rr = fx.Float32(rrms_g.load(safe_m * hc_count + s, vec_size=1))
                     wv = []
                     if w_bf16:
                         w8 = fx.Vector(w_g.load(col % w_len, vec_size=VEC)).to(
@@ -272,11 +279,25 @@ def _build_up_gate_mix_norm(
             g_m = bid_m * block_m + local_m
             g_c = c_base + c0
             out_vec = [acc[it][e] * fx.Float32(inv_hc) for e in range_constexpr(VEC)]
-            out_g.store(
-                g_m * stream_dim + g_c,
-                fx.Vector.from_elements(out_vec, dtype=fx.Float32).to(fx.BFloat16),
-                vec_size=VEC,
-            )
+            # The guard lets LLVM sink the epilogue math out of the stream loop
+            # (fewer full vmcnt drains); the seam slices padded rows away anyway.
+            # The bf16 vector must be built inside the guard so it sinks too.
+            if fx.const_expr(bounded_rows):
+                if g_m < real_rows:
+                    dst = out_g
+                    dst.store(
+                        g_m * stream_dim + g_c,
+                        fx.Vector.from_elements(out_vec, dtype=fx.Float32).to(
+                            fx.BFloat16
+                        ),
+                        vec_size=VEC,
+                    )
+            else:
+                out_g.store(
+                    g_m * stream_dim + g_c,
+                    fx.Vector.from_elements(out_vec, dtype=fx.Float32).to(fx.BFloat16),
+                    vec_size=VEC,
+                )
 
     @flyc.jit
     def launch(
@@ -288,7 +309,9 @@ def _build_up_gate_mix_norm(
         block_input: fx.Tensor,
         stream: fx.Stream = fx.Stream(None),  # noqa: B008
     ):
-        tokens = fx.Int32(fx.get_scalar(lora.shape[0]))
+        # Bounded callers size the grid by the real residual rows, so K2 never
+        # launches all-padding row tiles.
+        tokens = fx.Int32(fx.get_scalar(r2.shape[0] if bounded_rows else lora.shape[0]))
         grid_m = (tokens + block_m - 1) // block_m
         kernel(lora, r2, rrms, w, w_up, block_input).launch(
             grid=(fx.Int64(grid_m), n_cblocks, 1),
@@ -314,6 +337,10 @@ def flydsl_up_gate_mix_norm(
     stream: torch.cuda.Stream | None = None,
     _skip_norm: bool = False,
     _skip_gemm: bool = False,
+    branch_mode: str = "branchwise",
+    slp: bool = True,
+    grid_swap: int = 0,
+    bounded_rows: bool = False,
 ) -> torch.Tensor:
     """K2: fused up-GEMM + gated mean that re-forms ``xn`` from ``r2`` + ``rrms``.
 
@@ -321,9 +348,17 @@ def flydsl_up_gate_mix_norm(
     a materialized ``xn``. Returns ``block_input`` [M, stream_dim] bf16, written
     into ``block_input`` when given; it must not overlap any input.
 
-    Stores are not row-masked: ``M`` must be a multiple of the tile height
-    (64 by default, or ``block_m``). Callers with a row tail pad every input to
-    a multiple of 64 rows and slice the result, as the fused op does.
+    By default stores are not row-masked: ``M`` must be a multiple of the tile
+    height (64 by default, or ``block_m``), and callers with a row tail pad every
+    input and slice the result. With ``bounded_rows=True`` the grid and the
+    residual reads and stores use the real row count of ``r2``, so ``lora`` and
+    ``rrms`` may be padded while ``r2`` is not.
+
+    ``branch_mode`` is "branchwise" (LDS-staged branch mean, uses ``w_up``) or
+    "combined"/"separate" (register-only branch GEMMs, which take the
+    16-channel-panel ``w_up``). ``slp`` enables LLVM SLP vectorization for the
+    register-only modes only. ``grid_swap=1`` swaps the grid axes without
+    changing which tile each workgroup computes.
     """
     require_supported_arch()
     # lora may be a strided view of K1's packed [M, lowrank+hc] output (the
@@ -334,13 +369,17 @@ def flydsl_up_gate_mix_norm(
         raise ValueError("lora must be 2-D bf16 with a contiguous inner dimension")
     tokens, lowrank = lora.shape
     dev = lora.device
-    if r2.ndim != 2 or r2.shape[0] != tokens:
+    residual_rows = r2.shape[0] if bounded_rows and r2.ndim == 2 else tokens
+    if r2.ndim != 2 or residual_rows > tokens or r2.shape[0] != residual_rows:
         raise ValueError(f"r2 must be 2-D with {tokens} rows")
     hidden = r2.shape[1]
     stream_dim = check_streams(hidden, hc_count)
-    check_tensor("r2", r2, (tokens, hidden), dev)
+    check_tensor("r2", r2, (residual_rows, hidden), dev)
     check_tensor("rrms", rrms, (tokens, hc_count), dev, dtype=torch.float32)
-    _validate_w_up(w_up, hidden, lowrank, dev)
+    if branch_mode == "branchwise":
+        _validate_w_up(w_up, hidden, lowrank, dev)
+    else:
+        check_tensor("w_up", w_up, (160, 4, 16, 320), dev)
     check_norm_weight(norm_weight, stream_dim, hidden, dev)
     if block_input is not None:
         check_tensor("block_input", block_input, (tokens, stream_dim), dev)
@@ -371,6 +410,10 @@ def flydsl_up_gate_mix_norm(
             n_waves,
             _skip_norm,
             _skip_gemm,
+            branch_mode,
+            slp,
+            grid_swap,
+            bounded_rows,
         )
 
 
@@ -389,6 +432,10 @@ def _up_gate_mix_norm(
     n_waves: int | None = None,
     _skip_norm: bool = False,
     _skip_gemm: bool = False,
+    branch_mode: str = "branchwise",
+    slp: bool = True,
+    grid_swap: int = 0,
+    bounded_rows: bool = False,
 ) -> torch.Tensor:
     """K2 body for validated inputs; ``stream`` is the raw handle of the current stream."""
     tokens, lowrank = lora.shape
@@ -432,27 +479,60 @@ def _up_gate_mix_norm(
             f"tokens={tokens} must be a multiple of block_m={block_m}; pad the "
             "rows to a multiple of 64"
         )
-    err = _k2_tile_error(arch, stream_dim, lowrank, block_m, block_n, m_waves, n_waves)
-    if err is not None:
-        raise ValueError(f"invalid K2 tile {block_m}x{block_n}: {err}")
+    if branch_mode != "branchwise":
+        if (
+            branch_mode not in ("combined", "separate")
+            or block_m % (16 * m_waves)
+            or block_n % (16 * n_waves)
+            or stream_dim % block_n
+            or (branch_mode == "combined" and n_waves != 1)
+            or type(grid_swap) is not int
+            or grid_swap not in (0, 1)
+        ):
+            raise ValueError("illegal register-branch K2 geometry")
+        # The register-branch kernel hardcodes these (10240-wide r2 view, 4
+        # branches, 320-wide A tile, gfx950-only bf16 MFMA atom).
+        if (
+            hc_count != 4
+            or hidden != 10240
+            or lowrank != 320
+            or norm_weight.numel() != hidden
+        ):
+            raise ValueError(
+                "register-branch K2 requires hc_count=4, hidden=10240, "
+                "lowrank=320 and a full-width norm_weight"
+            )
+        if get_gfx_runtime() != "gfx950":
+            raise ValueError("register-branch K2 requires gfx950")
+        launch = _build_up_gate_mix_interleaved(
+            block_m, block_n, m_waves, n_waves, w_bf16, branch_mode, slp, grid_swap
+        )
+        _run_compiled(launch, lora, r2, rrms, w, w_up, block_input, fx.Stream(stream))
+    else:
+        err = _k2_tile_error(
+            arch, stream_dim, lowrank, block_m, block_n, m_waves, n_waves
+        )
+        if err is not None:
+            raise ValueError(f"invalid K2 tile {block_m}x{block_n}: {err}")
 
-    launch = _build_up_gate_mix_norm(
-        hc_count,
-        stream_dim,
-        lowrank,
-        w_len,
-        block_m,
-        block_n,
-        m_waves,
-        n_waves,
-        mma.mma_m,
-        mma.mma_n,
-        mma.mma_k,
-        w_bf16,
-        _skip_norm,
-        _skip_gemm,
-    )
-    _run_compiled(launch, lora, r2, rrms, w, w_up, block_input, fx.Stream(stream))
+        launch = _build_up_gate_mix_norm(
+            hc_count,
+            stream_dim,
+            lowrank,
+            w_len,
+            block_m,
+            block_n,
+            m_waves,
+            n_waves,
+            mma.mma_m,
+            mma.mma_n,
+            mma.mma_k,
+            w_bf16,
+            _skip_norm,
+            _skip_gemm,
+            bounded_rows,
+        )
+        _run_compiled(launch, lora, r2, rrms, w, w_up, block_input, fx.Stream(stream))
     return block_input
 
 
@@ -480,3 +560,164 @@ def _resolve_up_gate_cfg(tuned, tokens, block_m, block_n, m_waves, n_waves):
         if v is not None:
             base[k] = v
     return base["block_m"], base["block_n"], base["m_waves"], base["n_waves"]
+
+
+@lru_cache(maxsize=128)
+def _build_up_gate_mix_interleaved(
+    block_m,
+    block_n,
+    m_waves,
+    n_waves,
+    w_bf16,
+    branch_mode,
+    slp,
+    grid_swap=0,
+):
+    """Register-owned branch mean; prepared 16-channel panels preserve K order.
+
+    Combined N is (channel panel, branch, channel-in-panel). N waves stay
+    within the panel for separate GEMMs; combined uses one N wave so all
+    four branch values for each output remain in the same lane.
+    """
+    if type(grid_swap) is not int or grid_swap not in (0, 1):
+        raise ValueError("K2 grid swap must be in {0,1}")
+    threads = 64 * m_waves * n_waves
+    combined = branch_mode == "combined"
+    full_n = block_n * 4 if combined else block_n
+
+    @flyc.kernel(
+        name=f"gr_k2_interleaved_bm{block_m}_bn{block_n}_w{m_waves}x{n_waves}_{branch_mode}_slp{int(slp)}"
+        f"_wb{int(w_bf16)}" + ("_gs1" if grid_swap else ""),
+        known_block_size=[threads, 1, 1],
+    )
+    def kernel(
+        lora: fx.Tensor,
+        r2: fx.Tensor,
+        rrms: fx.Tensor,
+        w: fx.Tensor,
+        w_up: fx.Tensor,
+        out: fx.Tensor,
+    ):
+        tid = fx.thread_idx.x
+        bm, bc = fx.block_idx.x, fx.block_idx.y
+        if fx.const_expr(grid_swap):
+            # Groups operand-sharing workgroups on one XCD assuming gfx950's 8-XCD
+            # round-robin placement; other XCD counts are correct but may lose L2 reuse.
+            bm, bc = fx.block_idx.y, fx.block_idx.x
+        rows = fx.Int32(fx.get_scalar(r2.shape[0]))
+        mma = fx.make_tiled_mma(
+            fx.make_mma_atom(fx.rocdl.MFMA(16, 16, 32, fx.BFloat16)),
+            fx.make_layout((m_waves, n_waves, 1), (n_waves, 1, 0)),
+            fx.make_tile(None, None, ab_k_perm(32)),
+        )
+        thr = mma.thr_slice(tid)
+        atom = fx.make_copy_atom(fx.rocdl.BufferCopy128b(), fx.BFloat16)
+        ca = fx.make_tiled_copy_A(atom, mma).get_slice(tid)
+        cb = fx.make_tiled_copy_B(atom, mma).get_slice(tid)
+        la = fx.rocdl.make_buffer_tensor(lora, max_size=False)
+        a = fx.zipped_divide(la, (block_m, 320))[None, bm]
+        fa = thr.make_fragment_A(a)
+        fx.copy(atom, ca.partition_S(a), ca.retile(fa))
+        wu = fx.rocdl.make_buffer_tensor(w_up, max_size=False)
+        ob = fx.rocdl.make_buffer_tensor(out, max_size=False)
+        tile = fx.flat_divide(ob, (block_m, block_n))[None, None, bm, bc]
+        coords_m = thr.partition_C(
+            fx.make_view(0, fx.make_layout((block_m, block_n), (1, 0)))
+        )
+        coords_n = thr.partition_C(
+            fx.make_view(0, fx.make_layout((block_m, block_n), (0, 1)))
+        )
+        result = thr.make_fragment_C(tile)
+        count = fx.size(result.shape).unpack()
+        sums = [fx.Float32(0.0) for _ in range_constexpr(count)]
+        residual = fx.make_view(
+            fx.get_iter(r2), fx.make_layout((r2.shape[0], 10240), (10240, 1))
+        )
+        scales = fx.make_view(
+            fx.get_iter(rrms), fx.make_layout((rrms.shape[0], 4), (4, 1))
+        )
+        norm = fx.make_view(fx.get_iter(w), fx.make_layout(10240, 1))
+        per_panel = 4 * (block_m // (16 * m_waves))
+        branch_register_layout = fx.make_layout(
+            ((per_panel, block_n // 16), 4), ((1, 4 * per_panel), per_panel)
+        )
+        if fx.const_expr(combined):
+            bview = fx.make_view(
+                fx.get_iter(wu), fx.make_layout((10240, 320), (320, 1))
+            )
+            b = fx.zipped_divide(bview, (full_n, 320))[None, bc]
+            fb = thr.make_fragment_B(b)
+            fx.copy(atom, cb.partition_S(b), cb.retile(fb))
+            c = thr.make_fragment_C(
+                fx.make_view(
+                    fx.get_iter(ob), fx.make_layout((block_m, full_n), (full_n, 1))
+                )
+            )
+            c.fill(0.0)
+            fx.gemm(mma, c, fa, fb, c, traversal_order=fx.GemmTraversalOrder.KNM)
+        for branch in range_constexpr(4):
+            if fx.const_expr(not combined):
+                # One branch view skips the other branches inside each 16-channel panel.
+                bview = fx.make_view(
+                    fx.add_offset(fx.get_iter(wu), branch * 16 * 320),
+                    fx.make_layout(((16, 160), 320), ((320, 4 * 16 * 320), 1)),
+                )
+                b = fx.zipped_divide(bview, (block_n, 320))[None, bc]
+                fb = thr.make_fragment_B(b)
+                fx.copy(atom, cb.partition_S(b), cb.retile(fb))
+                c = thr.make_fragment_C(tile)
+                c.fill(0.0)
+                fx.gemm(mma, c, fa, fb, c, traversal_order=fx.GemmTraversalOrder.KNM)
+            for i in range_constexpr(count):
+                row = bm * block_m + fx.Int32(fx.get_scalar(coords_m[i]))
+                col = bc * block_n + fx.Int32(fx.get_scalar(coords_n[i]))
+                safe_row = (row < rows).select(row, fx.Int32(0))
+                x = fx.Float32(residual[safe_row, branch * 2560 + col])
+                rs = fx.Float32(scales[safe_row, branch])
+                wn = fx.Float32(norm[branch * 2560 + col])
+                xn = ((x * rs) * (fx.Float32(1.0) + wn)).to(fx.BFloat16).to(fx.Float32)
+                ci = i
+                if fx.const_expr(combined):
+                    ci = fx.get_scalar(
+                        fx.crd2idx(
+                            ((i % per_panel, i // per_panel), branch),
+                            branch_register_layout,
+                        )
+                    )
+                exponent = fx.math.exp2(
+                    c[ci] * fx.Float32(-1.4426950408889634), fastmath="afn"
+                )
+                # arcp alone retains corrected division; fast selects the reciprocal sigmoid form.
+                with fx.arith.fastmath("fast"):
+                    sig = fx.Float32(1.0) / (fx.Float32(1.0) + exponent)
+                sums[i] = sums[i] + sig * xn
+        tile_coords = thr.partition_C(tile)
+        for i in range_constexpr(count):
+            row = bm * block_m + fx.Int32(fx.get_scalar(coords_m[i]))
+            if row < rows:
+                dst = tile_coords
+                dst[i] = (sums[i] * fx.Float32(0.25)).to(fx.BFloat16)
+
+    @flyc.jit
+    def launch(
+        lora: fx.Tensor,
+        r2: fx.Tensor,
+        rrms: fx.Tensor,
+        w: fx.Tensor,
+        w_up: fx.Tensor,
+        out: fx.Tensor,
+        stream: fx.Stream,
+    ):
+        rows = fx.Int32(fx.get_scalar(r2.shape[0]))
+        kernel(lora, r2, rrms, w, w_up, out).launch(
+            grid=(
+                (2560 // block_n, fx.Int64((rows + block_m - 1) // block_m), 1)
+                if fx.const_expr(grid_swap)
+                else (fx.Int64((rows + block_m - 1) // block_m), 2560 // block_n, 1)
+            ),
+            block=(threads, 1, 1),
+            stream=stream,
+        )
+
+    set_slp_vectorize_once_used(launch, slp)
+    return launch

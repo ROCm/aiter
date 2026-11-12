@@ -347,6 +347,437 @@ def _build_down_fused(
 
 
 @lru_cache(maxsize=64)
+def _build_down_finished(
+    hidden: int,
+    n_pad: int,
+    hc_count: int,
+    lowrank: int,
+    m_rows: int,
+    eps: float,
+    inj_stride: int,
+    waves_per_block: int,
+    cols_per_wave: int,
+    m_groups: int = 1,
+    combine: bool = True,
+    w_bf16: bool = False,
+    cta_local: bool = False,
+):
+    stream_dim = hidden // hc_count
+    cols_per_block = cols_per_wave if cta_local else waves_per_block * cols_per_wave
+    per_iter = WAVE * DOWN_VEC
+    assert stream_dim % per_iter == 0, f"stream_dim={stream_dim} % {per_iter}"
+    assert n_pad % cols_per_block == 0
+    # A 16-byte coherent store carries PART_M f32 dots; more rows spill into
+    # consecutive chunks. Repeated r2 reads grow with the chunk count, so this
+    # schedule is restricted to small M.
+    n_chunks = (m_rows + PART_M - 1) // PART_M
+    if cta_local:
+        assert hc_count == waves_per_block == 4
+        assert cols_per_wave == 2 and m_rows == 1 and m_groups <= 3
+
+    @fx.struct
+    class BranchPartials:
+        dots: fx.Array[fx.Float32, hc_count * cols_per_wave * PART_M]
+
+    # Stream-keyed counters advance modulo HC; each slot receives hc arrivals.
+    assert hc_count & (hc_count - 1) == 0, "hc_count must be a power of two"
+    iters = stream_dim // per_iter
+    block_threads = waves_per_block * WAVE
+    log2_wave = int(math.log2(WAVE))
+    inv_hc = 1.0 / hc_count
+    inv_hs = 1.0 / stream_dim
+    total_rows = m_groups * m_rows
+    r2_elems = total_rows * hidden
+    rrms_elems = total_rows * hc_count
+    part_group_elems = hc_count * n_pad * PART_M * n_chunks
+    part_elems = m_groups * part_group_elems
+    packed_elems = total_rows * n_pad
+
+    @flyc.kernel(
+        name=f"gr_skinny_down_hc{hc_count}_h{hidden}_np{n_pad}_m{m_rows}"
+        f"_g{m_groups}_is{inj_stride}_w{waves_per_block}_c{cols_per_wave}"
+        f"_fg1_hc{int(combine)}_wb{int(w_bf16)}"
+        f"_cta{int(cta_local)}",
+        known_block_size=[block_threads, 1, 1],
+    )
+    def kernel(
+        residual: fx.Tensor,  # [m_rows, hidden] bf16
+        block_output: fx.Tensor,  # [m_rows, stream_dim] bf16
+        injection: fx.Tensor,  # [m_rows, hc] f32 finished gates, row stride inj_stride
+        w_dn: fx.Tensor,  # [n_pad, hidden] bf16, norm weight not folded
+        r2_out: fx.Tensor,  # [m_rows, hidden] bf16
+        rrms_out: fx.Tensor,  # [m_rows, hc] f32
+        partial: fx.Tensor,  # [hc, n_pad, PART_M] f32
+        packed: fx.Tensor,  # [m_rows, n_pad] bf16
+        counters: fx.Tensor,  # stream-keyed persistent arrival slots
+        norm: fx.Tensor,
+        gate_out: fx.Tensor,
+    ):
+        tid = fx.thread_idx.x
+        wid = tid // WAVE
+        lane = tid % WAVE
+        is_lane0 = lane == fx.Int32(0)
+        if fx.const_expr(cta_local):
+            # The wave mode is the branch; every wave covers the same column pair.
+            wave_lane = fx.idx2crd(tid, fx.make_layout((hc_count, WAVE), (WAVE, 1)))
+            branch, lane_coord = wave_lane.unpack()
+            wid = fx.Int32(branch)
+            lane = fx.Int32(lane_coord)
+            grp = fx.block_idx.x
+            shared = fx.SharedAllocator().allocate(BranchPartials).peek()
+            local_part = shared.dots.view(
+                fx.make_layout(
+                    (hc_count, cols_per_wave, PART_M),
+                    (cols_per_wave * PART_M, PART_M, 1),
+                )
+            )
+        else:
+            grp = fx.block_idx.x * waves_per_block + wid
+        n0 = grp * cols_per_wave
+        mg = fx.block_idx.y
+        m_base = mg * m_rows
+        s = wid if cta_local else fx.block_idx.z
+
+        res_g = GTensor(residual, T.bf16, (1, r2_elems))
+        y_g = GTensor(block_output, T.bf16, (1, total_rows * stream_dim))
+        w_g = GTensor(w_dn, T.bf16, (1, n_pad * hidden))
+        r2_t = _bounded(r2_out, fx.BFloat16, r2_elems, DOWN_VEC)
+        rrms_t = _bounded(rrms_out, fx.Float32, rrms_elems)
+        if fx.const_expr(not cta_local):
+            part_t = _bounded(partial, fx.Float32, part_elems, PART_M)
+            part_base = fx.Int64(fx.ptrtoint(fx.get_iter(partial)))
+
+        def part_addr(elem_off):
+            return part_base + fx.Int64(elem_off) * fx.Int64(4)
+
+        packed_t = _bounded(packed, fx.BFloat16, packed_elems)
+
+        # Column 0 of each stream writes that stream's r2 and rrms.
+        is_n0 = n0 == fx.Int32(0)
+
+        gate = []
+        for m in range_constexpr(m_rows):
+            gm = m_base + m
+            if fx.const_expr(combine):
+                iv = fx.Float32(
+                    fx.ptr_load(
+                        fx.add_offset(fx.get_iter(injection), gm * inj_stride + s)
+                    )
+                )
+                gate.append(iv)
+            else:
+                gate.append(fx.Float32(0.0))
+
+        # One r2 re-form feeds cols_per_wave weight rows.
+        acc = [
+            [fx.Float32(0.0) for _ in range_constexpr(m_rows)]
+            for _ in range_constexpr(cols_per_wave)
+        ]
+        sq = [fx.Float32(0.0) for _ in range_constexpr(m_rows)]
+        # Occupancy here is bounded by the grid (~1 wave per SIMD), not by
+        # registers, so latency is only hidden if every load is in flight before
+        # the first use. The scheduler won't batch them on its own.
+        ks = [i * per_iter + lane * DOWN_VEC for i in range_constexpr(iters)]
+        w_raw = [
+            [
+                w_g.load((n0 + cc) * hidden + s * stream_dim + ks[i], vec_size=DOWN_VEC)
+                for cc in range_constexpr(cols_per_wave)
+            ]
+            for i in range_constexpr(iters)
+        ]
+        r_raw = [
+            [
+                res_g.load(
+                    (m_base + m) * hidden + s * stream_dim + ks[i],
+                    vec_size=DOWN_VEC,
+                )
+                for m in range_constexpr(m_rows)
+            ]
+            for i in range_constexpr(iters)
+        ]
+        y_raw = [
+            [
+                (
+                    y_g.load((m_base + m) * stream_dim + ks[i], vec_size=DOWN_VEC)
+                    if combine
+                    else r_raw[i][m]
+                )
+                for m in range_constexpr(m_rows)
+            ]
+            for i in range_constexpr(iters)
+        ]
+        combined = []
+        for i in range_constexpr(iters):
+            row_combined = []
+            k = ks[i]
+            for m in range_constexpr(m_rows):
+                gm = m_base + m
+                off = gm * hidden + s * stream_dim + k
+                rv = fx.Vector(r_raw[i][m]).to(fx.Float32)
+                yv = fx.Vector(y_raw[i][m]).to(fx.Float32)
+                comb = [
+                    fx.fma(yv[e], gate[m], rv[e]) for e in range_constexpr(DOWN_VEC)
+                ]
+                cb = fx.Vector.from_elements(comb, dtype=fx.Float32).to(fx.BFloat16)
+                buf_copy_store(
+                    r2_t,
+                    (
+                        is_n0.select(off, fx.Int32(r2_elems))
+                        if combine
+                        else fx.Int32(r2_elems)
+                    ),
+                    cb,
+                    elem=fx.BFloat16,
+                    unit_elems=DOWN_VEC,
+                )
+                cf = cb.to(fx.Float32)
+                row_combined.append(cf)
+                for e in range_constexpr(DOWN_VEC):
+                    sq[m] = sq[m] + cf[e] * cf[e]
+            combined.append(row_combined)
+
+        for sh in range_constexpr(log2_wave):
+            off = WAVE // (2 << sh)
+            for m in range_constexpr(m_rows):
+                sq[m] = sq[m] + fx.gpu.shuffle_xor(sq[m], off, WAVE)
+
+        rstds = []
+        for m in range_constexpr(m_rows):
+            gm = m_base + m
+            rstd = fmath.rsqrt(sq[m] * fx.Float32(inv_hs) + fx.Float32(eps))
+            buf_copy_store(
+                rrms_t,
+                is_n0.select(gm * hc_count + s, fx.Int32(rrms_elems)),
+                rstd,
+                elem=fx.Float32,
+            )
+            rstds.append(rstd)
+        # RMS is now known; reuse the register-resident combined residual.
+        # Both projections consume BF16 X, and inject weights stay ordinary.
+        norm_type = fx.BFloat16 if w_bf16 else fx.Float32
+        norm_view = fx.make_view(
+            fx.get_iter(fx.rocdl.make_buffer_tensor(norm, max_size=False)),
+            fx.make_layout((DOWN_VEC, hidden // DOWN_VEC), (1, DOWN_VEC)),
+        )
+        norm_copy = fx.make_copy_atom(fx.rocdl.BufferCopy128b(), norm_type)
+        norm_reg = fx.make_rmem_tensor(DOWN_VEC, norm_type)
+        for i in range_constexpr(iters):
+            if fx.const_expr(w_bf16):
+                fx.copy(
+                    norm_copy,
+                    norm_view[None, (s * stream_dim + ks[i]) // DOWN_VEC],
+                    norm_reg,
+                )
+                nw = fx.Vector(norm_reg.load()).to(fx.Float32)
+            else:
+                # A 32-bit copy into eight registers fails cast lowering;
+                # scalar stable pointer loads avoid that unsupported form.
+                vals = [
+                    fx.Float32(
+                        fx.ptr_load(
+                            fx.add_offset(fx.get_iter(norm), s * stream_dim + ks[i] + e)
+                        )
+                    )
+                    for e in range_constexpr(DOWN_VEC)
+                ]
+                nw = fx.Vector.from_elements(vals, dtype=fx.Float32)
+            for m in range_constexpr(m_rows):
+                xn = (
+                    ((combined[i][m] * rstds[m]) * (nw + fx.Float32(1.0)))
+                    .to(fx.BFloat16)
+                    .to(fx.Float32)
+                )
+                for cc in range_constexpr(cols_per_wave):
+                    wv = fx.Vector(w_raw[i][cc]).to(fx.Float32)
+                    for e in range_constexpr(DOWN_VEC):
+                        acc[cc][m] = acc[cc][m] + xn[e] * wv[e]
+        for sh in range_constexpr(log2_wave):
+            for cc in range_constexpr(cols_per_wave):
+                for m in range_constexpr(m_rows):
+                    acc[cc][m] = acc[cc][m] + fx.gpu.shuffle_xor(
+                        acc[cc][m], WAVE // (2 << sh), WAVE
+                    )
+        is_lane0 = lane == fx.Int32(0)
+        if fx.const_expr(cta_local):
+            if lane == fx.Int32(0):
+                for cc in range_constexpr(cols_per_wave):
+                    for m in range_constexpr(m_rows):
+                        fx.memref_store(acc[cc][m], local_part, (s, cc, m))
+            # All branch owners publish before wave zero reads any partial.
+            fx.gpu.barrier()
+            writer = (wid == fx.Int32(0)) & (lane == fx.Int32(0))
+        else:
+            # Partials are written with agent-scope AV stores, and the acq_rel
+            # arrival RMW is tagged amdgcn-av:none, so it orders them without L2
+            # maintenance. The partial loads below are raw sc1 buffer loads rather
+            # than AV loads: visibility on that side relies on the gfx942/gfx950
+            # cache policy, not on the LLVM memory model. Only lane 0 arrives and
+            # only lane 0 of the last wave writes, so the lane that acquires is the
+            # lane whose loads reach ``packed``.
+            slot = fx.Int64(fx.ptrtoint(fx.get_iter(counters))) + fx.Int64(
+                (mg * n_pad + grp) * COUNTER_STRIDE
+            ) * fx.Int64(4)
+            arrival = fx.Int32(0)
+            if is_lane0:
+                for cc in range_constexpr(cols_per_wave):
+                    alldots = [acc[cc][m] for m in range_constexpr(m_rows)]
+                    for ch in range_constexpr(n_chunks):
+                        dots = [
+                            alldots[ch * PART_M + mm]
+                            for mm in range_constexpr(min(PART_M, m_rows - ch * PART_M))
+                        ]
+                        for _ in range_constexpr(PART_M - len(dots)):
+                            dots.append(fx.Float32(0.0))
+                        av_store_b128(
+                            part_addr(
+                                mg * part_group_elems
+                                + ((s * n_pad + n0 + cc) * n_chunks + ch) * PART_M
+                            ),
+                            fx.Vector.from_elements(dots, dtype=fx.Float32),
+                        )
+                arrival = fx.Int32(atomic_add_agent_acq_rel_av_none(slot, fx.Int32(1)))
+            is_last = (arrival & fx.Int32(hc_count - 1)) == fx.Int32(hc_count - 1)
+            writer = is_last & is_lane0
+
+        for cc in range_constexpr(cols_per_wave):
+            n = n0 + cc
+            is_lora = n < fx.Int32(lowrank)
+            for ch in range_constexpr(n_chunks):
+                if fx.const_expr(cta_local):
+                    vals = []
+                    for mm in range_constexpr(PART_M):
+                        v = fx.Float32(0.0)
+                        if fx.const_expr(mm < m_rows):
+                            v = fx.Float32(fx.memref_load(local_part, (0, cc, mm)))
+                            for ss in range_constexpr(1, hc_count):
+                                v = v + fx.Float32(
+                                    fx.memref_load(local_part, (ss, cc, mm))
+                                )
+                        vals.append(v)
+                    tot = fx.Vector.from_elements(vals, dtype=fx.Float32)
+                else:
+                    tot = fx.Vector(
+                        buf_copy_load(
+                            part_t,
+                            mg * part_group_elems + (n * n_chunks + ch) * PART_M,
+                            elem=fx.Float32,
+                            unit_elems=PART_M,
+                            cache_modifier=CPOL_AGENT,
+                        )
+                    )
+                    for ss in range_constexpr(1, hc_count):
+                        tot = tot + fx.Vector(
+                            buf_copy_load(
+                                part_t,
+                                mg * part_group_elems
+                                + ((ss * n_pad + n) * n_chunks + ch) * PART_M,
+                                elem=fx.Float32,
+                                unit_elems=PART_M,
+                                cache_modifier=CPOL_AGENT,
+                            )
+                        )
+                for mm in range_constexpr(min(PART_M, m_rows - ch * PART_M)):
+                    m = ch * PART_M + mm
+                    gm = m_base + m
+                    v = tot[mm] * fx.Float32(inv_hc)
+                    out = is_lora.select(v * sigmoid_f32(v), tot[mm])
+                    gate_view = _bounded(gate_out, fx.Float32, total_rows * hc_count)
+                    gate_writer = (
+                        writer
+                        & (n >= fx.Int32(lowrank))
+                        & (n < fx.Int32(lowrank + hc_count))
+                    )
+                    buf_copy_store(
+                        gate_view,
+                        gate_writer.select(
+                            gm * hc_count + n - lowrank,
+                            fx.Int32(total_rows * hc_count),
+                        ),
+                        fx.Float32(2.0) * sigmoid_f32(v),
+                        elem=fx.Float32,
+                    )
+                    buf_copy_store(
+                        packed_t,
+                        writer.select(gm * n_pad + n, fx.Int32(packed_elems)),
+                        out.to(fx.BFloat16),
+                        elem=fx.BFloat16,
+                    )
+
+    @flyc.jit
+    def launch(
+        residual: fx.Tensor,
+        block_output: fx.Tensor,
+        injection: fx.Tensor,
+        w_dn: fx.Tensor,
+        r2_out: fx.Tensor,
+        rrms_out: fx.Tensor,
+        partial: fx.Tensor,
+        packed: fx.Tensor,
+        counters: fx.Tensor,
+        norm: fx.Tensor,
+        gate_out: fx.Tensor,
+        stream: fx.Stream,
+    ):
+        kernel(
+            residual,
+            block_output,
+            injection,
+            w_dn,
+            r2_out,
+            rrms_out,
+            partial,
+            packed,
+            counters,
+            norm,
+            gate_out,
+        ).launch(
+            grid=(n_pad // cols_per_block, m_groups, hc_count),
+            block=(block_threads, 1, 1),
+            stream=stream,
+        )
+
+    @flyc.jit
+    def launch_local(
+        residual: fx.Tensor,
+        block_output: fx.Tensor,
+        injection: fx.Tensor,
+        w_dn: fx.Tensor,
+        r2_out: fx.Tensor,
+        rrms_out: fx.Tensor,
+        packed: fx.Tensor,
+        norm: fx.Tensor,
+        gate_out: fx.Tensor,
+        stream: fx.Stream,
+    ):
+        # Unused legacy arguments alias existing tensors; no global scratch exists.
+        kernel(
+            residual,
+            block_output,
+            injection,
+            w_dn,
+            r2_out,
+            rrms_out,
+            rrms_out,
+            packed,
+            rrms_out,
+            norm,
+            gate_out,
+        ).launch(
+            grid=(n_pad // cols_per_block, m_groups, 1),
+            block=(block_threads, 1, 1),
+            stream=stream,
+        )
+
+    return launch_local if cta_local else launch
+
+
+@lru_cache(maxsize=64)
+def _build_down_cta_local(*args, **kwargs):
+    """HC4 finished-gate decode: branch waves reduce one column pair in LDS."""
+    return _build_down_finished(*args, **kwargs, cta_local=True)
+
+
+@lru_cache(maxsize=64)
 def _build_up_mix_grouped(
     hidden: int,
     hc_count: int,
@@ -717,6 +1148,116 @@ def skinny_chunked_two_kernel(
         partial,
         packed,
         _counters(dev, n_pad, hc_count, stream, m_groups),
+        fxs,
+    )
+    _run_compiled(up, packed, r2, rrms, w, w_up, x, fxs)
+    return r2, x, packed
+
+
+def skinny_chunked_finished(
+    residual: torch.Tensor,
+    block_output: torch.Tensor,
+    injection: torch.Tensor,
+    inj_stride: int,
+    w: torch.Tensor,
+    w_up: torch.Tensor,
+    w_down_merged: torch.Tensor,
+    lowrank: int,
+    hc_count: int,
+    eps: float,
+    stream: int,
+    chunk_m: int = 4,
+    waves_per_block: int = 4,
+    cols_per_wave: int | None = None,
+    combine: bool = True,
+    gate_out: torch.Tensor | None = None,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Run low-prefill GEMV in independent ``chunk_m`` row groups.
+
+    Mapping row groups onto ``grid.y`` bounds each wave's accumulator count and
+    increases parallelism. Groups reread weights to avoid 64-row MMA padding.
+    HC4 M <= 3 uses CTA-local branch reduction with no counters;
+    other geometries use the stream-keyed persistent arrival counters.
+    """
+    tokens, hidden = residual.shape
+    combine = block_output is not None
+    cta_local = (
+        hc_count == 4
+        and 1 <= tokens <= 3
+        and chunk_m == 1
+        and waves_per_block == 4
+        and cols_per_wave == 2
+    )
+    assert tokens % chunk_m == 0
+    m_groups = tokens // chunk_m
+    stream_dim = hidden // hc_count
+    n_pad = w_down_merged.shape[0]
+    dev = residual.device
+    r2 = (
+        torch.empty(tokens, hidden, dtype=torch.bfloat16, device=dev)
+        if combine
+        else residual
+    )
+    rrms = torch.empty(tokens, hc_count, dtype=torch.float32, device=dev)
+    n_chunks = (chunk_m + PART_M - 1) // PART_M
+    partial = (
+        None
+        if cta_local
+        else torch.empty(
+            m_groups,
+            hc_count,
+            n_pad,
+            n_chunks * PART_M,
+            dtype=torch.float32,
+            device=dev,
+        )
+    )
+    packed = torch.empty(tokens, n_pad, dtype=torch.bfloat16, device=dev)
+    x = torch.empty(tokens, stream_dim, dtype=torch.bfloat16, device=dev)
+    if cols_per_wave is None:
+        cols_per_wave = _COLS_PER_WAVE
+    down_builder = _build_down_cta_local if cta_local else _build_down_finished
+    down = down_builder(
+        hidden,
+        n_pad,
+        hc_count,
+        lowrank,
+        chunk_m,
+        float(eps),
+        inj_stride,
+        waves_per_block,
+        cols_per_wave,
+        m_groups,
+        combine=combine,
+        w_bf16=w.dtype == torch.bfloat16,
+    )
+    up = _build_up_mix_grouped(
+        hidden,
+        hc_count,
+        lowrank,
+        w.numel(),
+        chunk_m,
+        n_pad,
+        waves_per_block,
+        m_groups,
+        w.dtype == torch.bfloat16,
+    )
+    fxs = fx.Stream(stream)
+    _run_compiled(
+        down,
+        residual,
+        block_output if combine else residual,
+        injection if combine else residual,
+        w_down_merged,
+        r2,
+        rrms,
+        *(
+            (packed,)
+            if cta_local
+            else (partial, packed, _counters(dev, n_pad, hc_count, stream, m_groups))
+        ),
+        w,
+        gate_out if gate_out is not None else rrms,
         fxs,
     )
     _run_compiled(up, packed, r2, rrms, w, w_up, x, fxs)

@@ -55,6 +55,7 @@ from aiter.ops.flydsl.kernels.hyper_connection_gated_residual.common import (
     stream_scope,
 )
 from aiter.ops.flydsl.kernels.hyper_connection_gated_residual.tuned import k1_plan
+from aiter.ops.flydsl.kernels.kernels_common import set_slp_vectorize_once_used
 from aiter.ops.flydsl.kernels.tensor_shim import GTensor, _run_compiled
 
 WAVE = 64
@@ -80,6 +81,9 @@ def _build_down_norm_pipe(
     fold_w: bool = False,
     w_lds: bool = True,
     _skip_norm: bool = False,
+    w_bf16: bool = False,
+    finished_gate: bool = False,
+    emit_gate: bool = False,
 ):
     """Async-LDS pipelined down+inject GEMM with the norm folded into the A-load.
 
@@ -171,7 +175,10 @@ def _build_down_norm_pipe(
 
     @flyc.kernel(
         name=f"gr_downnormpipe_hc{hc_count}_h{hidden}_n{block_n}_s{silu_cols}"
-        f"_bm{block_m}_bk{block_k}_nw{n_waves}_st{stages}{'' if w_lds else '_wg'}",
+        f"_bm{block_m}_bk{block_k}_nw{n_waves}_st{stages}{'' if w_lds else '_wg'}"
+        # Flag variants are suffixed only when set, so default names stay stable.
+        f"{'_wb' if w_bf16 else ''}{'_fg' if finished_gate else ''}"
+        f"{'_eg' if emit_gate else ''}",
         known_block_size=[block_threads, 1, 1],
     )
     def kernel(
@@ -180,6 +187,7 @@ def _build_down_norm_pipe(
         w: fx.Tensor,  # [w_len] f32
         w_dn: fx.Tensor,  # [block_n, hidden] bf16
         out: fx.Tensor,  # [M, block_n] bf16
+        gate_out: fx.Tensor,  # [M, hc] f32 in finished mode
     ):
         tid = fx.thread_idx.x
         bid_m = fx.block_idx.x
@@ -192,7 +200,7 @@ def _build_down_norm_pipe(
         wdn_buf = fx.rocdl.make_buffer_tensor(w_dn, max_size=True)
         out_buf = fx.rocdl.make_buffer_tensor(out, max_size=True)
         rrms_g = GTensor(rrms, T.f32, (1, hc_count))
-        w_g = GTensor(w, T.f32, (1, w_len))
+        w_g = GTensor(w, T.bf16 if w_bf16 else T.f32, (1, w_len))
 
         @fx.struct
         class Smem:
@@ -303,6 +311,7 @@ def _build_down_norm_pipe(
             # fragment multiply.
             va = frag_A.load().to(fx.Float32)
             scales = []
+            exact_vals = []
             for i in range_constexpr(a_elems):
                 m_i = fx.get_scalar(aRow[i])
                 k_i = fx.get_scalar(aK[i])
@@ -322,8 +331,13 @@ def _build_down_norm_pipe(
                         w_g.load(col % w_len, vec_size=1)
                     )
                     scales.append(rr * onepw)
+                    if const_expr(finished_gate):
+                        exact_vals.append((va[i] * rr) * onepw)
             scale_frag.store(fx.Vector.from_elements(scales, dtype=fx.Float32))
-            frag_A.store((va * scale_frag.load()).to(fx.BFloat16))
+            normalized = va * scale_frag.load()
+            if const_expr(finished_gate):
+                normalized = fx.Vector.from_elements(exact_vals, dtype=fx.Float32)
+            frag_A.store(normalized.to(fx.BFloat16))
 
         def compute_stage(read_stage, kt):
             thr_sA = thr_copy_A.partition_S(
@@ -373,6 +387,13 @@ def _build_down_norm_pipe(
         cCol = thr_mma.partition_C(
             fx.make_view(0, fx.make_layout((block_m, block_n), (0, 1)))
         )
+        cRow = thr_mma.partition_C(
+            fx.make_view(0, fx.make_layout((block_m, block_n), (1, 0)))
+        )
+        if const_expr(emit_gate):
+            gate_view = fx.make_view(
+                fx.get_iter(gate_out), fx.make_layout((m, hc_count), (hc_count, 1))
+            )
         vc = frag_C.load()
         out_vals = []
         for i in range_constexpr(n_elems):
@@ -386,6 +407,18 @@ def _build_down_norm_pipe(
                 # (runtime, since bid_n is a grid index): SiLU below silu_cols,
                 # raw injection logits above.
                 gcol = n_offset + fx.Int32(fx.get_scalar(cCol[i]))
+                if const_expr(emit_gate):  # noqa: SIM102
+                    if (
+                        (gcol >= silu_cols)
+                        & (gcol < silu_cols + hc_count)
+                        & (
+                            block_m_offset + fx.get_scalar(cRow[i])
+                            < fx.get_scalar(gate_out.shape[0])
+                        )
+                    ):
+                        gate_view[
+                            block_m_offset + fx.get_scalar(cRow[i]), gcol - silu_cols
+                        ] = fx.Float32(2.0) * sigmoid_f32(sv)
                 is_lora = gcol < fx.Int32(silu_cols)
                 out_vals.append(is_lora.select(silu_v, raw_v))
         frag_out = fx.make_fragment_like(frag_C, fx.BFloat16)
@@ -405,13 +438,35 @@ def _build_down_norm_pipe(
     ):
         tokens = fx.Int32(fx.get_scalar(r2.shape[0]))
         grid_m = (tokens + block_m - 1) // block_m
-        kernel(r2, rrms, w, w_dn, out).launch(
+        kernel(r2, rrms, w, w_dn, out, out).launch(
             grid=(fx.Int64(grid_m), n_cblocks, 1),
             block=(block_threads, 1, 1),
             stream=stream,
         )
 
-    return launch
+    @flyc.jit
+    def launch_finished(
+        r2: fx.Tensor,
+        rrms: fx.Tensor,
+        w: fx.Tensor,
+        w_dn: fx.Tensor,
+        out: fx.Tensor,
+        gate_out: fx.Tensor,
+        stream: fx.Stream = fx.Stream(None),  # noqa: B008
+    ):
+        kernel(r2, rrms, w, w_dn, out, gate_out).launch(
+            grid=(
+                fx.Int64(
+                    (fx.Int32(fx.get_scalar(out.shape[0])) + block_m - 1) // block_m
+                ),
+                n_cblocks,
+                1,
+            ),
+            block=(block_threads, 1, 1),
+            stream=stream,
+        )
+
+    return launch_finished if finished_gate else launch
 
 
 @lru_cache(maxsize=32)
@@ -432,6 +487,8 @@ def _build_down_norm_partial_pipe(
     mma_k: int,
     fold_w: bool = False,
     w_lds: bool = True,
+    w_bf16: bool = False,
+    finished_gate: bool = False,
 ):
     """Async-LDS pipelined split-K partial.
 
@@ -503,7 +560,8 @@ def _build_down_norm_partial_pipe(
 
     @flyc.kernel(
         name=f"gr_downnormpartpipe_hc{hc_count}_h{hidden}_np{n_pad}_n{block_n}"
-        f"_bm{block_m}_bk{block_k}_sk{split_k}_st{stages}{'' if w_lds else '_wg'}",
+        f"_bm{block_m}_bk{block_k}_sk{split_k}_st{stages}{'' if w_lds else '_wg'}"
+        f"{'_wb' if w_bf16 else ''}{'_fg' if finished_gate else ''}",
         known_block_size=[block_threads, 1, 1],
     )
     def kernel(
@@ -527,7 +585,7 @@ def _build_down_norm_partial_pipe(
         wdn_buf = fx.rocdl.make_buffer_tensor(w_dn, max_size=True)
         part_buf = fx.rocdl.make_buffer_tensor(partial, max_size=True)
         rrms_g = GTensor(rrms, T.f32, (1, hc_count))
-        w_g = GTensor(w, T.f32, (1, w_len))
+        w_g = GTensor(w, T.bf16 if w_bf16 else T.f32, (1, w_len))
 
         @fx.struct
         class Smem:
@@ -639,6 +697,7 @@ def _build_down_norm_partial_pipe(
             # va*scale multiply instead of per-element scalar muls.
             va = frag_A.load().to(fx.Float32)
             scales = []
+            exact_vals = []
             for i in range_constexpr(a_elems):
                 m_i = fx.get_scalar(aRow[i])
                 k_i = fx.get_scalar(aK[i])
@@ -658,8 +717,13 @@ def _build_down_norm_partial_pipe(
                         w_g.load(col % w_len, vec_size=1)
                     )
                     scales.append(rr * onepw)
+                    if const_expr(finished_gate):
+                        exact_vals.append((va[i] * rr) * onepw)
             scale_frag.store(fx.Vector.from_elements(scales, dtype=fx.Float32))
-            frag_A.store((va * scale_frag.load()).to(fx.BFloat16))
+            normalized = va * scale_frag.load()
+            if const_expr(finished_gate):
+                normalized = fx.Vector.from_elements(exact_vals, dtype=fx.Float32)
+            frag_A.store(normalized.to(fx.BFloat16))
 
         def compute_stage(read_stage, gkt):
             thr_sA = thr_copy_A.partition_S(
@@ -724,6 +788,435 @@ def _build_down_norm_partial_pipe(
             stream=stream,
         )
 
+    return launch
+
+
+@lru_cache(maxsize=64)
+def _build_down_deferred_partial_pipe(
+    chunk_width: int = 256,
+    block_m: int = 64,
+    block_n: int = 64,
+    block_k: int = 64,
+    stages: int = 2,
+    m_waves: int = 4,
+    n_waves: int = 1,
+    slp: bool = False,
+    has_combine: bool = True,
+    w_bf16: bool = True,
+    k1_a_batch: int = 0,
+    k1_grid_swap: int = 0,
+):
+    """gfx950 deferred down GEMM partials; no RMS, inject, or reduction.
+
+    Scratch dots are FP32 [4,2560/chunk,P,320] and statistics are FP32
+    [4,2560/chunk,M]. Statistics contain a complete sum of squares for each
+    row/branch/chunk, not a full branch reduction. N tile zero alone writes
+    statistics and R'; mix-only never reads y/gate or writes R'. P is a BM
+    multiple, but only rows below residual.shape[0] are read or stored. Inputs
+    are contiguous BF16 R [M,10240], y [M,2560], Wd [320,10240], full BF16
+    or FP32 norm w [10240], and contiguous FP32 gates [M,4].
+    Scratch is passed flattened as [4*2560/chunk*P,320] and [4*2560/chunk*M].
+    Output allocations must not alias inputs; scratch padding is untouched.
+    """
+    if any(type(v) is not int or v not in (0, 1) for v in (k1_a_batch, k1_grid_swap)):
+        raise ValueError("K1 structural knobs must be in {0,1}")
+    hidden, hs, width = 10240, 2560, 320
+    values = (chunk_width, block_m, block_n, block_k, stages, m_waves, n_waves)
+    if any(type(v) is not int or v <= 0 for v in values):
+        raise ValueError("geometry must contain positive integers")
+    threads = m_waves * n_waves * 64
+    if (
+        chunk_width not in (256, 512, 640, 1280, 2560)
+        or hs % chunk_width
+        or chunk_width % block_k
+        or hs % block_k
+        or block_k % 32
+        or block_k & (block_k - 1)
+        or block_k > 512
+        or block_m not in (16, 32, 64)
+        or block_m % (16 * m_waves)
+        or block_n % (16 * n_waves)
+        or width % block_n
+        or (block_m * block_k) % (threads * 8)
+        or (block_n * block_k) % (threads * 8)
+        or threads % (block_k // 8)
+        or stages < 2
+        or chunk_width // block_k < stages - 1
+    ):
+        raise ValueError("illegal branch-aligned deferred geometry")
+    if any(type(v) is not bool for v in (slp, has_combine, w_bf16)):
+        raise ValueError("SLP, combine and norm dtype must be explicit booleans")
+    k_local = chunk_width // block_k
+    lds_bytes = stages * (block_m + block_n) * block_k * 2 + block_m * k_local * 4
+    if lds_bytes > 163840:
+        raise ValueError("deferred geometry exceeds gfx950 LDS capacity")
+    splits = hidden // chunk_width
+    # Same composed swizzle as the split-K down pipeline, with stable copy atoms.
+    from aiter.ops.flydsl.kernels.gemm_a16w16_gfx950_utils import make_lds_layout
+
+    @flyc.kernel(
+        name=f"gr_downdeferred_bm{block_m}_bn{block_n}_bk{block_k}_ch{chunk_width}"
+        f"_st{stages}_w{m_waves}x{n_waves}_c{int(has_combine)}_slp{int(slp)}"
+        f"_wb{int(w_bf16)}"
+        + ("_ab1" if k1_a_batch else "")
+        + ("_gs1" if k1_grid_swap else ""),
+        known_block_size=[threads, 1, 1],
+    )
+    def kernel(
+        residual: fx.Tensor,
+        y: fx.Tensor,
+        gate: fx.Tensor,
+        w: fx.Tensor,
+        w_dn: fx.Tensor,
+        residual_new: fx.Tensor,
+        partial: fx.Tensor,
+        stats: fx.Tensor,
+    ):
+        tid = fx.thread_idx.x
+        bm = fx.block_idx.x
+        split = fx.block_idx.y
+        bn = fx.block_idx.z
+        if const_expr(k1_grid_swap):
+            # Operand sharers retain a multiple-of-eight workgroup stride, which puts them
+            # on one XCD under gfx950's 8-XCD round-robin placement; other XCD counts stay
+            # correct but may lose the L2 benefit.
+            split, bn, bm = fx.block_idx.x, fx.block_idx.y, fx.block_idx.z
+        m = fx.Int32(fx.get_scalar(residual.shape[0]))
+        padded = fx.Int32(fx.get_scalar(partial.shape[0])) // splits
+        branch = split // (hs // chunk_width)
+        k_base = split * k_local
+        rptr = fx.get_iter(fx.rocdl.make_buffer_tensor(residual))
+        wptr = fx.get_iter(fx.rocdl.make_buffer_tensor(w))
+        bptr = fx.get_iter(fx.rocdl.make_buffer_tensor(w_dn))
+        outptr = fx.get_iter(fx.rocdl.make_buffer_tensor(residual_new))
+        pptr = fx.get_iter(fx.rocdl.make_buffer_tensor(partial))
+        sptr = fx.get_iter(fx.rocdl.make_buffer_tensor(stats))
+
+        @fx.struct
+        class Smem:
+            a: fx.Array[fx.BFloat16, stages * block_m * block_k, 16]
+            b: fx.Array[fx.BFloat16, stages * block_n * block_k, 16]
+            ss: fx.Array[fx.Float32, block_m * k_local, 16]
+
+        smem = fx.SharedAllocator().allocate(Smem).peek()
+        aptr, blds = smem.a.ptr, smem.b.ptr
+        sstats = smem.ss.view(fx.make_layout((block_m, k_local), (k_local, 1)))
+        alayout = make_lds_layout(block_m, block_k)
+        blayout = make_lds_layout(block_n, block_k)
+        mma = fx.make_tiled_mma(
+            fx.make_mma_atom(fx.rocdl.MFMA(16, 16, 32, fx.BFloat16)),
+            fx.make_layout((m_waves, n_waves, 1), (n_waves, 1, 0)),
+            fx.make_tile(None, None, ab_k_perm(32)),
+        )
+        thr_mma = mma.thr_slice(tid)
+        copy128 = fx.make_copy_atom(fx.rocdl.BufferCopy128b(), fx.BFloat16)
+        uni128 = fx.make_copy_atom(fx.UniversalCopy128b(), fx.BFloat16)
+        copy_w = fx.make_copy_atom(
+            fx.rocdl.BufferCopy128b(),
+            fx.BFloat16 if w_bf16 else fx.Float32,
+        )
+        # FP32 norm weights use two legal 128-bit loads below.
+        load_copy = fx.make_tiled_copy_tv(
+            copy128,
+            fx.make_layout(
+                (threads // (block_k // 8), block_k // 8), (block_k // 8, 1)
+            ),
+            fx.make_layout((1, 8), (8, 1)),
+        ).get_slice(tid)
+        local_a = load_copy.partition_S(
+            fx.make_view(0, fx.make_layout((block_m, block_k), (block_k, 1)))
+        )
+        local_b = load_copy.partition_S(
+            fx.make_view(0, fx.make_layout((block_n, block_k), (block_k, 1)))
+        )
+        arows = load_copy.partition_S(
+            fx.make_view(0, fx.make_layout((block_m, block_k), (1, 0)))
+        )
+        acols = load_copy.partition_S(
+            fx.make_view(0, fx.make_layout((block_m, block_k), (0, 1)))
+        )
+        brows = load_copy.partition_S(
+            fx.make_view(0, fx.make_layout((block_n, block_k), (1, 0)))
+        )
+        bcols = load_copy.partition_S(
+            fx.make_view(0, fx.make_layout((block_n, block_k), (0, 1)))
+        )
+        areg = fx.make_fragment_like(local_a, fx.BFloat16)
+        breg = fx.make_fragment_like(local_b, fx.BFloat16)
+        avec_groups = fx.size(areg.shape).unpack() // 8
+        bvec_groups = fx.size(breg.shape).unpack() // 8
+        vec_layout = fx.make_layout(8, 1)
+        tmp = fx.make_rmem_tensor(vec_layout, fx.BFloat16)
+        wtmp = fx.make_rmem_tensor(vec_layout, fx.BFloat16 if w_bf16 else fx.Float32)
+        smem_copy = load_copy
+
+        @flyc.jit
+        def load_a(kt, stage, tmp, wtmp, sstats):
+            vals = []
+            for group in range_constexpr(avec_groups):
+                row_local = fx.get_scalar(arows[group * 8])
+                col_local = fx.get_scalar(acols[group * 8])
+                row = bm * block_m + row_local
+                valid = row < m
+                safe_row = valid.select(row, 0)
+                col = kt * block_k + col_local
+                fx.copy(
+                    copy128,
+                    fx.make_view(rptr + safe_row * hidden + col, vec_layout),
+                    tmp,
+                )
+                rv = tmp.load().to(fx.Float32)
+                combined = rv
+                if const_expr(has_combine):
+                    yptr = fx.get_iter(fx.rocdl.make_buffer_tensor(y))
+                    fx.copy(
+                        copy128,
+                        fx.make_view(yptr + safe_row * hs + col % hs, vec_layout),
+                        tmp,
+                    )
+                    gv = fx.ptr_load(fx.get_iter(gate) + safe_row * 4 + branch)
+                    combined = fx.fma(
+                        tmp.load().to(fx.Float32),
+                        fx.Vector.filled(8, gv, fx.Float32),
+                        rv,
+                    )
+                rounded = combined.to(fx.BFloat16)
+                rf = rounded.to(fx.Float32)
+                if bn == 0:
+                    if const_expr(has_combine):  # noqa: SIM102
+                        if valid:
+                            tmp.store(rounded)
+                            fx.copy(
+                                copy128,
+                                tmp,
+                                fx.make_view(outptr + row * hidden + col, vec_layout),
+                            )
+                    sq = fx.Float32(0.0)
+                    for i in range_constexpr(8):
+                        sq = sq + rf[i] * rf[i]
+                    for shift in range_constexpr(int(math.log2(block_k // 8))):
+                        sq = sq + fx.gpu.shuffle_xor(sq, 1 << shift, 64)
+                    if col_local == 0:
+                        sstats[row_local, kt - k_base] = sq
+                if const_expr(w_bf16):
+                    fx.copy(copy_w, fx.make_view(wptr + col, vec_layout), wtmp)
+                else:
+                    wcopy128 = fx.make_copy_atom(fx.rocdl.BufferCopy128b(), fx.Float32)
+                    w4 = fx.make_rmem_tensor(fx.make_layout(4, 1), fx.Float32)
+                    wvals = []
+                    for half in range_constexpr(2):
+                        fx.copy(
+                            wcopy128,
+                            fx.make_view(wptr + col + half * 4, fx.make_layout(4, 1)),
+                            w4,
+                        )
+                        wvals += [w4.load()[i] for i in range_constexpr(4)]
+                    wtmp.store(fx.Vector.from_elements(wvals, fx.Float32))
+                z = (
+                    rf
+                    * (
+                        wtmp.load().to(fx.Float32)
+                        + fx.Vector.filled(8, 1.0, fx.Float32)
+                    )
+                ).to(fx.BFloat16)
+                vals += [z[i] for i in range_constexpr(8)]
+            areg.store(fx.Vector.from_elements(vals, fx.BFloat16))
+            dst = smem_copy.partition_D(
+                fx.make_view(aptr + stage * block_m * block_k, alayout)
+            )
+            fx.copy(uni128, areg, dst)
+
+        @flyc.jit
+        def load_a_batched(kt, stage, tmp, wtmp, sstats):
+            # Independent buffers keep global loads ahead of the transforms.
+            rbufs, ybufs, wbufs, gvs, meta = [], [], [], [], []
+            for group in range_constexpr(avec_groups):
+                row_local = fx.get_scalar(arows[group * 8])
+                col_local = fx.get_scalar(acols[group * 8])
+                row = bm * block_m + row_local
+                valid = row < m
+                safe_row = valid.select(row, 0)
+                col = kt * block_k + col_local
+                rb = fx.make_rmem_tensor(vec_layout, fx.BFloat16)
+                fx.copy(
+                    copy128,
+                    fx.make_view(rptr + safe_row * hidden + col, vec_layout),
+                    rb,
+                )
+                rbufs.append(rb)
+                if const_expr(has_combine):
+                    yptr = fx.get_iter(fx.rocdl.make_buffer_tensor(y))
+                    yb = fx.make_rmem_tensor(vec_layout, fx.BFloat16)
+                    fx.copy(
+                        copy128,
+                        fx.make_view(yptr + safe_row * hs + col % hs, vec_layout),
+                        yb,
+                    )
+                    ybufs.append(yb)
+                    gvs.append(fx.ptr_load(fx.get_iter(gate) + safe_row * 4 + branch))
+                wb = fx.make_rmem_tensor(
+                    vec_layout, fx.BFloat16 if w_bf16 else fx.Float32
+                )
+                if const_expr(w_bf16):
+                    fx.copy(copy_w, fx.make_view(wptr + col, vec_layout), wb)
+                else:
+                    w4bufs = []
+                    for half in range_constexpr(2):
+                        w4 = fx.make_rmem_tensor(fx.make_layout(4, 1), fx.Float32)
+                        fx.copy(
+                            copy_w,
+                            fx.make_view(wptr + col + half * 4, fx.make_layout(4, 1)),
+                            w4,
+                        )
+                        w4bufs.append(w4)
+                    wb = w4bufs
+                wbufs.append(wb)
+                meta.append((row_local, col_local, row, valid, col))
+            vals = []
+            for group in range_constexpr(avec_groups):
+                row_local, col_local, row, valid, col = meta[group]
+                rv = rbufs[group].load().to(fx.Float32)
+                combined = rv
+                if const_expr(has_combine):
+                    combined = fx.fma(
+                        ybufs[group].load().to(fx.Float32),
+                        fx.Vector.filled(8, gvs[group], fx.Float32),
+                        rv,
+                    )
+                rounded = combined.to(fx.BFloat16)
+                rf = rounded.to(fx.Float32)
+                if bn == 0:
+                    if const_expr(has_combine):  # noqa: SIM102
+                        if valid:
+                            tmp.store(rounded)
+                            fx.copy(
+                                copy128,
+                                tmp,
+                                fx.make_view(outptr + row * hidden + col, vec_layout),
+                            )
+                    sq = fx.Float32(0.0)
+                    for i in range_constexpr(8):
+                        sq = sq + rf[i] * rf[i]
+                    for shift in range_constexpr(int(math.log2(block_k // 8))):
+                        sq = sq + fx.gpu.shuffle_xor(sq, 1 << shift, 64)
+                    if col_local == 0:
+                        sstats[row_local, kt - k_base] = sq
+                if const_expr(w_bf16):
+                    wv = wbufs[group].load().to(fx.Float32)
+                else:
+                    wvals = []
+                    for half in range_constexpr(2):
+                        wvals += [
+                            wbufs[group][half].load()[i] for i in range_constexpr(4)
+                        ]
+                    wv = fx.Vector.from_elements(wvals, fx.Float32)
+                z = (rf * (wv + fx.Vector.filled(8, 1.0, fx.Float32))).to(fx.BFloat16)
+                vals += [z[i] for i in range_constexpr(8)]
+            areg.store(fx.Vector.from_elements(vals, fx.BFloat16))
+            dst = smem_copy.partition_D(
+                fx.make_view(aptr + stage * block_m * block_k, alayout)
+            )
+            fx.copy(uni128, areg, dst)
+
+        def load_b(kt, stage):
+            vals = []
+            for group in range_constexpr(bvec_groups):
+                row = bn * block_n + fx.get_scalar(brows[group * 8])
+                col = kt * block_k + fx.get_scalar(bcols[group * 8])
+                fx.copy(
+                    copy128, fx.make_view(bptr + row * hidden + col, vec_layout), tmp
+                )
+                vals += [tmp.load()[i] for i in range_constexpr(8)]
+            breg.store(fx.Vector.from_elements(vals, fx.BFloat16))
+            dst = smem_copy.partition_D(
+                fx.make_view(blds + stage * block_n * block_k, blayout)
+            )
+            fx.copy(uni128, breg, dst)
+
+        thr_a = fx.make_tiled_copy_A(copy128, mma).get_slice(tid)
+        thr_b = fx.make_tiled_copy_B(copy128, mma).get_slice(tid)
+        fa = thr_mma.make_fragment_A(fx.make_view(aptr, alayout))
+        fb = thr_mma.make_fragment_B(fx.make_view(blds, blayout))
+        far, fbr = thr_a.retile(fa), thr_b.retile(fb)
+        cview = fx.make_view(pptr, fx.make_layout((block_m, block_n), (width, 1)))
+        fc = thr_mma.make_fragment_C(cview)
+        crows = thr_mma.partition_C(
+            fx.make_view(0, fx.make_layout((block_m, block_n), (1, 0)))
+        )
+        ccols = thr_mma.partition_C(
+            fx.make_view(0, fx.make_layout((block_m, block_n), (0, 1)))
+        )
+        fc.fill(0.0)
+        # Register transformation is required before the A panel reaches LDS.
+        # Staging is synchronous: the transform must finish in registers before
+        # the A panel reaches LDS.
+        # Unroll the short chunk loop to avoid carrying ThrCopy through scf.for.
+        for kt in range_constexpr(k_local):
+            stage = kt % stages
+            load_b(k_base + kt, stage)
+            if const_expr(k1_a_batch):
+                load_a_batched(k_base + kt, stage, tmp, wtmp, sstats)
+            else:
+                load_a(k_base + kt, stage, tmp, wtmp, sstats)
+            fx.gpu.barrier()
+            fx.copy(
+                uni128,
+                thr_a.partition_S(
+                    fx.make_view(aptr + stage * block_m * block_k, alayout)
+                ),
+                far,
+            )
+            fx.copy(
+                uni128,
+                thr_b.partition_S(
+                    fx.make_view(blds + stage * block_n * block_k, blayout)
+                ),
+                fbr,
+            )
+            fx.gemm(mma, fc, fa, fb, fc, traversal_order=fx.GemmTraversalOrder.KNM)
+            # Ping-pong panels are not reused until the next iteration's barrier.
+        for i in range_constexpr(fx.size(fc.shape).unpack()):
+            row = bm * block_m + fx.get_scalar(crows[i])
+            col = bn * block_n + fx.get_scalar(ccols[i])
+            if row < m:
+                fx.ptr_store(fc.load()[i], pptr + (split * padded + row) * width + col)
+        if bn == 0:  # noqa: SIM102
+            if tid < block_m:
+                row = bm * block_m + tid
+                sq = fx.Float32(0.0)
+                for kt in range_constexpr(k_local):
+                    sq = sq + sstats[tid, kt]
+                if row < m:
+                    fx.ptr_store(sq, sptr + split * m + row)
+
+    @flyc.jit
+    def launch(
+        residual: fx.Tensor,
+        y: fx.Tensor,
+        gate: fx.Tensor,
+        w: fx.Tensor,
+        w_dn: fx.Tensor,
+        residual_new: fx.Tensor,
+        partial: fx.Tensor,
+        stats: fx.Tensor,
+        stream: fx.Stream = fx.Stream(None),  # noqa: B008
+    ):
+        rows = fx.get_scalar(residual.shape[0])
+        kernel(residual, y, gate, w, w_dn, residual_new, partial, stats).launch(
+            grid=(
+                (splits, width // block_n, fx.Int64((rows + block_m - 1) // block_m))
+                if const_expr(k1_grid_swap)
+                else (
+                    fx.Int64((rows + block_m - 1) // block_m),
+                    splits,
+                    width // block_n,
+                )
+            ),
+            block=(threads, 1, 1),
+            stream=stream,
+        )
+
+    set_slp_vectorize_once_used(launch, slp)
     return launch
 
 
@@ -1014,6 +1507,10 @@ def flydsl_k1k2_skinny_decode(
     split_k_per_stream: int = 2,
     waves_per_block: int = 4,
     stream: torch.cuda.Stream | None = None,
+    *,
+    finished_gate: bool = False,
+    chunk_m: int | None = None,
+    cols_per_wave: int = 2,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
     """MMA-free skinny GEMV two-stage for decode M (combine+RMS -> down GEMV ->
     reduce/SiLU -> up GEMV + gated mean). No 64-row tile padding; ``xn`` never
@@ -1025,12 +1522,34 @@ def flydsl_k1k2_skinny_decode(
     weight here produces silently wrong output (no shape/dtype tripwire catches it).
     The op only routes here when ``fold_w=True``; do not call it directly otherwise.
 
+    ``finished_gate=True`` instead takes unfolded merged weights and FP32 gates,
+    reconstructs BF16 normalized operands and emits a separate FP32 next gate.
+    HC4 M<=3 uses CTA-local branch reduction; other shapes use the shared
+    stream-keyed counter protocol.
+
     Inputs must satisfy :func:`validate_k1_inputs`; the op checks them before
     dispatch. ``block_output=None`` normalizes ``residual`` without a combine.
     """
     require_supported_arch()
     ctx, stream = stream_scope(stream, residual.device)
     with ctx:
+        if finished_gate:
+            return _skinny_finished_decode(
+                residual,
+                block_output,
+                injection,
+                norm_weight,
+                w_up,
+                w_down_merged,
+                lowrank,
+                hc_count,
+                eps,
+                need_inj,
+                waves_per_block,
+                stream,
+                chunk_m,
+                cols_per_wave,
+            )
         return _skinny_decode(
             residual,
             block_output,
@@ -1046,6 +1565,59 @@ def flydsl_k1k2_skinny_decode(
             waves_per_block,
             stream,
         )
+
+
+def _skinny_finished_decode(
+    residual,
+    block_output,
+    injection,
+    norm_weight,
+    w_up,
+    w_down_merged,
+    lowrank,
+    hc_count,
+    eps,
+    need_inj,
+    waves_per_block,
+    stream,
+    chunk_m,
+    cols_per_wave,
+):
+    tokens = residual.shape[0]
+    has_combine = block_output is not None
+    from .skinny import skinny_chunked_finished
+
+    gate_next = (
+        residual.new_empty((tokens, hc_count), dtype=torch.float32)
+        if need_inj
+        else None
+    )
+    r2, x, _ = skinny_chunked_finished(
+        residual,
+        block_output,
+        injection,
+        injection.stride(0) if has_combine and tokens > 1 else hc_count,
+        norm_weight.reshape(-1),
+        w_up,
+        w_down_merged,
+        lowrank,
+        hc_count,
+        eps,
+        stream,
+        chunk_m=(
+            1
+            if hc_count == 4
+            and 1 <= tokens <= 3
+            and waves_per_block == 4
+            and cols_per_wave == 2
+            else chunk_m or (2 if tokens % 2 == 0 else 1)
+        ),
+        waves_per_block=waves_per_block,
+        cols_per_wave=cols_per_wave,
+        combine=has_combine,
+        gate_out=gate_next,
+    )
+    return r2, x, gate_next
 
 
 def _skinny_decode(
@@ -1155,6 +1727,84 @@ def _skinny_decode(
     return r2, x, inj_next
 
 
+@lru_cache(maxsize=32)
+def _build_combine_only(
+    hc_count: int,
+    stream_dim: int,
+    finished_gate: bool = False,
+    inj_row_stride: int | None = None,
+    inj_col_stride: int = 1,
+    block: int = 64,
+    vec: int = 8,
+):
+    """Vectorized combine without norm, stats or inter-thread communication."""
+    assert vec in (2, 4, 8) and block % WAVE == 0
+    tile = block * vec
+    assert stream_dim % tile == 0
+    hidden = hc_count * stream_dim
+    istride = hc_count if inj_row_stride is None else inj_row_stride
+
+    @flyc.kernel(
+        name=f"gr_combine_only_hc{hc_count}_hs{stream_dim}_b{block}_v{vec}"
+        f"{'_fg' if finished_gate else ''}"
+        f"{f'_is{inj_row_stride}_ic{inj_col_stride}' if inj_row_stride is not None or inj_col_stride != 1 else ''}",
+        known_block_size=[block, 1, 1],
+    )
+    def kernel(residual: fx.Tensor, y: fx.Tensor, injection: fx.Tensor, out: fx.Tensor):
+        tid = fx.thread_idx.x
+        chunk = fx.block_idx.x
+        row = fx.block_idx.y
+        branch = fx.block_idx.z
+        layout = fx.make_layout((vec, block), (1, vec))
+        rbase = row * hidden + branch * stream_dim + chunk * tile
+        ybase = row * stream_dim + chunk * tile
+        r = fx.make_view(
+            fx.get_iter(fx.rocdl.make_buffer_tensor(residual)) + rbase, layout
+        )[None, tid]
+        b = fx.make_view(fx.get_iter(fx.rocdl.make_buffer_tensor(y)) + ybase, layout)[
+            None, tid
+        ]
+        dst = fx.make_view(
+            fx.get_iter(fx.rocdl.make_buffer_tensor(out)) + rbase, layout
+        )[None, tid]
+        atom = fx.make_copy_atom(fx.rocdl.BufferCopy(vec * 16), fx.BFloat16)
+        rv = fx.make_fragment_like(r)
+        yv = fx.make_fragment_like(b)
+        fx.copy(atom, r, rv)
+        fx.copy(atom, b, yv)
+        gate = fx.Float32(
+            fx.ptr_load(
+                fx.get_iter(injection) + row * istride + branch * inj_col_stride
+            )
+        )
+        if const_expr(not finished_gate):
+            gate = fx.Float32(2.0) * sigmoid_f32(gate * fx.Float32(1.0 / hc_count))
+        a = rv.load().to(fx.Float32)
+        bval = yv.load().to(fx.Float32)
+        combined = a + bval * gate
+        if const_expr(finished_gate):
+            combined = fx.fma(bval, fx.Vector.filled(vec, gate, fx.Float32), a)
+        rv.store(combined.to(fx.BFloat16))
+        fx.copy(atom, rv, dst)
+
+    @flyc.jit
+    def launch(
+        residual: fx.Tensor,
+        y: fx.Tensor,
+        injection: fx.Tensor,
+        out: fx.Tensor,
+        stream: fx.Stream = fx.Stream(None),  # noqa: B008
+    ):
+        rows = fx.get_scalar(residual.shape[0])
+        kernel(residual, y, injection, out).launch(
+            grid=(stream_dim // tile, fx.Int64(rows), hc_count),
+            block=(block, 1, 1),
+            stream=stream,
+        )
+
+    return launch
+
+
 @lru_cache(maxsize=16)
 def _build_combine_rms(
     hc_count: int,
@@ -1164,6 +1814,7 @@ def _build_combine_rms(
     combine: bool = True,
     write_r2: bool = True,
     write_rrms: bool = True,
+    finished_gate: bool = False,
 ):
     """Prologue for the split-K K1 path: combine + per-stream RMS, emit r2 + rrms.
 
@@ -1192,7 +1843,8 @@ def _build_combine_rms(
         mode_tag = "_norms"
 
     @flyc.kernel(
-        name=f"gr_combine_rms_hc{hc_count}_hs{stream_dim}{stride_tag}{mode_tag}",
+        name=f"gr_combine_rms_hc{hc_count}_hs{stream_dim}{stride_tag}{mode_tag}"
+        f"{'_fg' if finished_gate else ''}",
         known_block_size=[WAVE, 1, 1],
     )
     def kernel(
@@ -1207,16 +1859,16 @@ def _build_combine_rms(
         tid = fx.thread_idx.x
         r = GTensor(residual, T.bf16, (1, hidden))
         y = GTensor(block_output, T.bf16, (1, stream_dim))
-        inj = GTensor(injection, T.bf16, (1, hc_count))
+        inj = GTensor(injection, T.f32 if finished_gate else T.bf16, (1, hc_count))
         r2 = GTensor(r2_out, T.bf16, (1, hidden))
         if const_expr(write_rrms):
             rrms_g = GTensor(rrms_out, T.f32, (1, hc_count))
 
         if const_expr(combine):
-            inj_val = fx.BFloat16(inj.load(tok * istride + stream, vec_size=1)).to(
-                fx.Float32
-            )
-            gate = fx.Float32(2.0) * sigmoid_f32(inj_val * fx.Float32(inv_hc))
+            inj_val = fx.Float32(inj.load(tok * istride + stream, vec_size=1))
+            gate = inj_val
+            if const_expr(not finished_gate):
+                gate = fx.Float32(2.0) * sigmoid_f32(inj_val * fx.Float32(inv_hc))
         row_r = tok * hidden + stream * stream_dim
         row_y = tok * stream_dim
         sq = fx.Float32(0.0)
@@ -1227,6 +1879,8 @@ def _build_combine_rms(
                 rv = fx.Vector(r_raw).to(fx.Float32)
                 yv = fx.Vector(y.load(row_y + off, vec_size=CHUNK)).to(fx.Float32)
                 comb = [rv[i] + yv[i] * gate for i in range_constexpr(CHUNK)]
+                if const_expr(finished_gate):
+                    comb = [fx.fma(yv[i], gate, rv[i]) for i in range_constexpr(CHUNK)]
                 comb_bf16 = fx.Vector.from_elements(comb, dtype=fx.Float32).to(
                     fx.BFloat16
                 )
@@ -1576,6 +2230,8 @@ def flydsl_k1_combine_norm_down(
     gemm_pad: int | None = None,
     use_tuned: bool = True,
     stream: torch.cuda.Stream | None = None,
+    finished_gate: bool = False,
+    gate_out: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Fused K1: combine + grouped-RMSNorm + down.
 
@@ -1594,6 +2250,11 @@ def flydsl_k1_combine_norm_down(
     the raw next-injection logits (slice with
     :func:`~...common.split_down_inject`).
 
+    ``finished_gate=True`` consumes FP32 gates directly, combines with FP32 FMA,
+    and reads full BF16 norm weights without conversion. With ``gate_out``,
+    the FP32 inject dots are finished as ``2*sigmoid(dot/hc_count)`` before
+    packed BF16 truncation. Omit block_output/injection to normalize as-is.
+
     Caller-provided ``r2_out`` (bf16 ``[P, hidden]``), ``out`` (bf16
     ``[P, n_pad]``) and ``rrms_out`` (f32 ``[P, hc_count]``) must be contiguous
     on the input device, where ``P`` is ``gemm_pad`` (default: ``M``), and
@@ -1601,8 +2262,19 @@ def flydsl_k1_combine_norm_down(
     """
     require_supported_arch()
     validate_k1_inputs(
-        residual, block_output, injection, norm_weight, w_dn_merged, lowrank, hc_count
+        residual,
+        block_output,
+        injection,
+        norm_weight,
+        w_dn_merged,
+        lowrank,
+        hc_count,
+        finished_gate=finished_gate,
     )
+    if finished_gate and (fold_w or norm_weight.numel() != residual.shape[1]):
+        raise ValueError(
+            "finished gates require unfolded weights and a full norm weight"
+        )
     tokens, hidden = residual.shape
     if gemm_pad is not None and gemm_pad < tokens:
         raise ValueError(f"gemm_pad={gemm_pad} must be >= tokens={tokens}")
@@ -1617,8 +2289,17 @@ def flydsl_k1_combine_norm_down(
     ):
         if t is not None:
             check_tensor(name, t, shape, dev, dtype=dtype)
+    if gate_out is not None:
+        if not finished_gate:
+            raise ValueError("gate_out requires finished_gate=True")
+        gate_rows = gate_out.shape[0] if gate_out.ndim == 2 else 0
+        if gate_rows not in (tokens, rows):
+            raise ValueError("gate_out rows must match real or padded tokens")
+        check_tensor(
+            "gate_out", gate_out, (gate_rows, hc_count), dev, dtype=torch.float32
+        )
     check_no_overlap(
-        {"r2_out": r2_out, "out": out, "rrms_out": rrms_out},
+        {"r2_out": r2_out, "out": out, "rrms_out": rrms_out, "gate_out": gate_out},
         {
             "residual": residual,
             "block_output": block_output,
@@ -1656,6 +2337,8 @@ def flydsl_k1_combine_norm_down(
             fold_w=fold_w,
             gemm_pad=gemm_pad,
             use_tuned=use_tuned,
+            finished_gate=finished_gate,
+            gate_out=gate_out,
         )
 
 
@@ -1667,6 +2350,7 @@ def validate_k1_inputs(
     w_dn_merged: torch.Tensor,
     lowrank: int,
     hc_count: int,
+    finished_gate: bool = False,
 ) -> None:
     """Shape/dtype/layout contract shared by the skinny and tiled K1 paths.
 
@@ -1687,7 +2371,14 @@ def validate_k1_inputs(
         raise ValueError("block_output and injection must both be given or omitted")
     if block_output is not None:
         check_tensor("block_output", block_output, (tokens, stream_dim), dev)
-        check_tensor("injection", injection, (tokens, hc_count), dev, contiguous=False)
+        check_tensor(
+            "injection",
+            injection,
+            (tokens, hc_count),
+            dev,
+            dtype=torch.float32 if finished_gate else torch.bfloat16,
+            contiguous=False,
+        )
         if injection.stride(-1) != 1:
             raise ValueError("injection must have a contiguous inner dimension")
     check_norm_weight(norm_weight, stream_dim, hidden, dev)
@@ -1747,6 +2438,8 @@ def _k1_combine_norm_down(
     fold_w: bool = False,
     gemm_pad: int | None = None,
     use_tuned: bool = True,
+    finished_gate: bool = False,
+    gate_out: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """K1 body for validated inputs; ``stream`` is the raw handle of the current stream.
 
@@ -1862,7 +2555,8 @@ def _k1_combine_norm_down(
     # The folded down weight already contains (1 + norm_weight), so this tensor
     # is never read by the down GEMM. Avoid launching a bf16->f32 conversion
     # whose result would only be passed through as an unused kernel argument.
-    w = norm_weight if fold_w else norm_weight_f32(norm_weight)
+    w_bf16 = finished_gate and norm_weight.dtype == torch.bfloat16
+    w = norm_weight if fold_w or w_bf16 else norm_weight_f32(norm_weight)
     # Without a combine, the GEMM can read the residual itself unless it needs
     # padded rows past the caller's allocation.
     reuse_residual = not combine and r2_out is None and gemm_tokens == tokens
@@ -1884,6 +2578,7 @@ def _k1_combine_norm_down(
         0 if inj_stride == hc_count else inj_stride,
         combine=combine,
         write_r2=not reuse_residual,
+        finished_gate=finished_gate,
     )
     # The no-combine prologue never reads block_output/injection; any tensor
     # satisfies the launch signature.
@@ -1980,15 +2675,29 @@ def _k1_combine_norm_down(
                 mma.mma_k,
                 fold_w=fold_w,
                 w_lds=sk_w_lds,
+                w_bf16=w_bf16,
+                finished_gate=finished_gate,
             )
         total = gemm_tokens * n_pad
         # f32 buffer loads are at most 128 bits.
         vec = 4 if total % (256 * 4) == 0 else 2
-        reduce = _build_reduce_silu(total, split_k, lowrank, n_pad, hc_count, 256, vec)
+        reduce = _build_reduce_silu(
+            total,
+            split_k,
+            lowrank,
+            n_pad,
+            hc_count,
+            256,
+            vec,
+            finished_gate=finished_gate and gate_out is not None,
+        )
         fx_stream = fx.Stream(stream)
         _run_compiled(prologue, *prologue_args, rrms, fx_stream)
         _run_compiled(part, r2_out, rrms, w, w_dn_merged, partial, fx_stream)
-        _run_compiled(reduce, partial, out, fx_stream)
+        if finished_gate and gate_out is not None:
+            _run_compiled(reduce, partial, out, gate_out, fx_stream)
+        else:
+            _run_compiled(reduce, partial, out, fx_stream)
         return r2_out, out
 
     if use_decouple:
@@ -2040,10 +2749,19 @@ def _k1_combine_norm_down(
             mma.mma_k,
             fold_w=fold_w,
             w_lds=dn_w_lds,
+            w_bf16=w_bf16,
+            finished_gate=finished_gate,
+            emit_gate=finished_gate and gate_out is not None,
         )
         fx_stream = fx.Stream(stream)
         _run_compiled(prologue, *prologue_args, rrms, fx_stream)
-        _run_compiled(downpipe, r2_out, rrms, w, w_dn_merged, out, fx_stream)
+        if finished_gate:
+            gate_dest = gate_out if gate_out is not None else rrms
+            _run_compiled(
+                downpipe, r2_out, rrms, w, w_dn_merged, out, gate_dest, fx_stream
+            )
+        else:
+            _run_compiled(downpipe, r2_out, rrms, w, w_dn_merged, out, fx_stream)
         return r2_out, out
 
     # The two-stage implementation supports only split-K and decoupled plans.
