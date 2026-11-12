@@ -53,6 +53,7 @@ from .mega_moe_config import (
     fused_layout_supported,
     large_m_mtprs_for,
     select_fused_config,
+    tune_large_m_launch_config,
 )
 from .mega_moe_fused_gemm import (
     AddrBuffer,
@@ -1076,8 +1077,11 @@ def emit_presend(
             row_values = [load_at(source_rsrc, lane * fx.Int32(4) + fx.Int32(c * 256), fx.Int32, 4)
                 for c in range_constexpr(fz_n_i32 // 256)]
             if const_expr(fz_enable_scales):
-                row_values.append(load_at(AddrBuffer(addr_in_sc), token * fx.Int32(fz_scale_n_i32)
-                    + lane * fx.Int32(4), fx.Int32, 4, mask=lane * fx.Int32(4) < fx.Int32(fz_scale_n_i32)))
+                # Bounded: load_at moves a masked lane's access ~2 GiB past the base, which faults on an
+                # unbounded descriptor whenever that address is unmapped (the scales are cur_tok <= mtpr rows).
+                row_values.append(load_at(AddrBuffer(addr_in_sc, fz_mtpr * fz_scale_n_i32 * 4),
+                    token * fx.Int32(fz_scale_n_i32) + lane * fx.Int32(4), fx.Int32, 4,
+                    mask=lane * fx.Int32(4) < fx.Int32(fz_scale_n_i32)))
             token_row = fx.Int32(fz_rank * fz_mtpr) + token
             destination_rsrc = AddrBuffer(load_at(AddrBuffer(p_rx), destination, fx.Int64, 1)
                 + fx.Int64(token_row) * fx.Int64(fz_nbytes))
@@ -1319,8 +1323,11 @@ def emit_dispatch_payload(
                     row_values = [load_at(source_rsrc, lane * fx.Int32(4) + fx.Int32(c * 256), fx.Int32, 4)
                         for c in range_constexpr(fz_n_i32 // 256)]
                     if const_expr(fz_enable_scales):
-                        row_values.append(load_at(AddrBuffer(addr_in_sc), token * fx.Int32(fz_scale_n_i32)
-                            + lane * fx.Int32(4), fx.Int32, 4, mask=lane * fx.Int32(4) < fx.Int32(fz_scale_n_i32)))
+                        # Bounded: load_at moves a masked lane's access ~2 GiB past the base, which faults on an
+                        # unbounded descriptor whenever that address is unmapped (the scales are cur_tok <= mtpr rows).
+                        row_values.append(load_at(AddrBuffer(addr_in_sc, fz_mtpr * fz_scale_n_i32 * 4),
+                            token * fx.Int32(fz_scale_n_i32) + lane * fx.Int32(4), fx.Int32, 4,
+                            mask=lane * fx.Int32(4) < fx.Int32(fz_scale_n_i32)))
                     values.append(row_values)
 
                 def _store_row(token, row_values):
@@ -3133,7 +3140,8 @@ class LargeMRuntime:
             raise ValueError(f"experts={experts} must be divisible by world_size={world_size}")
         if max_tok_per_rank <= 0 or max_tok_per_rank & (max_tok_per_rank - 1):
             raise ValueError(f"max_tok_per_rank={max_tok_per_rank} must be a power of two")
-        large_mtprs = large_m_mtprs_for(world_size=world_size, model_dim=model_dim, inter_dim=inter_dim)
+        large_mtprs = large_m_mtprs_for(world_size=world_size, model_dim=model_dim,
+            inter_dim=inter_dim, experts_per_rank=experts // world_size)
         if not fused_layout_supported(
             arch=get_gfx_runtime(), world_size=world_size, model_dim=model_dim, inter_dim=inter_dim,
             experts=experts, topk=topk, quant=quant, swiglu_limit=float(swiglu_limit),
@@ -3414,6 +3422,16 @@ class LargeMRuntime:
         self._active_config = config
         return config
 
+    def _select_launch_config(self, tokens: int) -> MegaMoEConfig:
+        # Tile geometry and producers use the capacity config on every rank.
+        # Only rank-local cache hints and claim ordering depend on input rows.
+        config = tune_large_m_launch_config(
+            self._select_config(self.mtpr), tokens, world_size=self.world_size,
+            experts_per_rank=self.epr, model_dim=self.model_dim, inter_dim=self.inter_dim,
+        )
+        self._active_config = config
+        return config
+
     def _run_fused_stage1(self, x, wts, scales, topk_ids, stream, config: MegaMoEConfig, *, preload=False):
         if stream is None:
             stream = fx.Stream(torch.cuda.current_stream().cuda_stream)
@@ -3482,9 +3500,7 @@ class LargeMRuntime:
     def _run_joint(self, x, scales, wts, topk_ids, run_tokens, stream, slice_output):
         if not 0 <= run_tokens <= self.mtpr:
             raise ValueError(f"run_tokens={run_tokens} outside [0, {self.mtpr}]")
-        # Launch geometry, tile_m and producer counts are part of the
-        # cross-rank wire protocol, so every rank selects the MTPR config.
-        config = self._select_config(self.mtpr)
+        config = self._select_launch_config(run_tokens)
         self._run_fused_stage1(x, wts, scales, topk_ids, stream, config)
         out_tok = self.comb_op.combine_output(self.mtpr)
         return out_tok[:run_tokens] if slice_output else out_tok
@@ -3588,9 +3604,15 @@ class LargeMRuntime:
         )
         wts = torch.empty((rows, self.topk), dtype=torch.float32, device=self.dev)
         topk_ids = torch.empty((rows, self.topk), dtype=torch.int32, device=self.dev)
-        self._run_fused_stage1(
-            x_q, wts, scales, topk_ids, stream, self._select_config(self.mtpr), preload=True
-        )
+        # Both local schedules have the same tensor signatures and wire format.
+        configs = []
+        for tokens in (rows, self.mtpr):
+            config = self._select_launch_config(tokens)
+            if config not in configs:
+                self._run_fused_stage1(
+                    x_q, wts, scales, topk_ids, stream, config, preload=True
+                )
+                configs.append(config)
 
     def forward(self, x_bf16, wts, topk_ids, *, stream=None, slice_output=True):
         run_tokens = check_forward_inputs(

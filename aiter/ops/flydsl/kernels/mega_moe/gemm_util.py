@@ -1236,7 +1236,9 @@ class SiluQuantEpilogue:
         cs_tile_n = self._tile_n // 2
         NLANE = cs_tile_n // 8
         rows_per_iter = self._num_waves * 64 // NLANE
-        assert self._tile_rows % rows_per_iter == 0
+        # tile_n 384 (NLANE 24) leaves lanes past rows_per_iter * NLANE idle and a partial last row pass.
+        ragged = self._num_waves * 64 % NLANE != 0 or self._tile_rows % rows_per_iter != 0
+        assert NLANE % 4 == 0
         mlane = tx // fx.Int32(NLANE)
         nlane = tx % fx.Int32(NLANE)
         # 8-byte groups of the tile's output rows.
@@ -1259,10 +1261,16 @@ class SiluQuantEpilogue:
         gcol = n_tile_base_i32 // fx.Int32(2) - cbase + col0
         col_s = gcol >> fx.Int32(5)
         is_writer = (gcol & fx.Int32(31)) == fx.Int32(0)
-        n_iter = self._tile_rows // rows_per_iter
+        n_iter = (self._tile_rows + rows_per_iter - 1) // rows_per_iter
+
+        def lane_live(mr):
+            live = (fx.Int32(mr * rows_per_iter) + mlane) < fx.Int32(self._tile_rows)
+            return live & (mlane < fx.Int32(rows_per_iter))
 
         def load_row(mr):
             idx = (fx.Int32(mr * rows_per_iter) + mlane) * fx.Int32(cs_tile_n) + col0
+            if const_expr(ragged):
+                idx = lane_live(mr).select(idx, fx.Int32(0))
             f32_iter = fx.recast_iter(fx.Float32, fx.add_offset(cptr, fx.make_int_tuple(idx)))
             return fx.make_view(f32_iter, fx.make_layout(8, 1)).load()
 
@@ -1288,10 +1296,14 @@ class SiluQuantEpilogue:
                 words.append(fx.Int32(rocdl.cvt_pk_fp8_f32(
                     T.i32, v[4 * w + 2] * quant_scale, v[4 * w + 3] * quant_scale, lo, True)))
             valid = fx.Boolean(True) if valid_rows_i32 is None else row < valid_rows_i32
+            if const_expr(ragged):
+                valid = valid & lane_live(mr)
             out_byte = valid.select(row * fx.Int32(self._inter_dim) + gcol, fx.Int32(0x40000000))
             buf_copy_store(out_vec, out_byte // fx.Int32(8), Vec.from_elements(words, fx.Int32), fx.Int32,
                 unit_elems=2, cache_modifier=store_cm)
             writer = is_writer if valid_rows_i32 is None else is_writer & (row < valid_rows_i32)
+            if const_expr(ragged):
+                writer = writer & lane_live(mr)
             d0 = row_g >> fx.Int32(5)
             d1 = (row_g >> fx.Int32(4)) & fx.Int32(1)
             d2 = row_g & fx.Int32(15)

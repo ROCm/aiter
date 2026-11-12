@@ -1111,6 +1111,19 @@ def _routed(moe, x, weights, ids, max_tokens, expect=None):
     return moe.forward(x, weights, ids, max_tokens=max_tokens)[: x.shape[0]]
 
 
+def _small_input_route(moe, max_tokens):
+    """Route of a call the small-input route can serve: at its large-input capacities EP4 V4.1-Flash
+    sends calls of large_m_min_tokens (384) rows and more to the large-input route."""
+    plan = moe._bundle_plan
+    if (
+        plan.large_m
+        and moe._large_m_choice is not False
+        and max_tokens >= plan.large_m_min_tokens
+    ):
+        return ROUTE_LARGE_M
+    return ROUTE_SMALL_M
+
+
 def _staged_forward(moe, x, weights, ids):
     """The staged route of the instance (the accuracy and timing reference)."""
     return moe._forward_route((ROUTE_STAGED, moe.mtpr), x, weights, ids)[: x.shape[0]]
@@ -1201,7 +1214,7 @@ def _check_epoch_wrap_and_zero_rows(moe, bind, case, large_case, device):
         torch.cuda.synchronize()
         _barrier()
         for _ in range(4):
-            out = _routed(moe, xi, wi, ii, mt, ROUTE_SMALL_M)[:real]
+            out = _routed(moe, xi, wi, ii, mt, _small_input_route(moe, mt))[:real]
             mism += int((out != expect[:real]).any(dim=-1).sum().item())
             if large_expect is not None:
                 out = _large_forward(moe, *large_case[:3])[: large_case[4]]
@@ -1319,7 +1332,8 @@ def _routes_accuracy(ctx, args):
                 tpr, rank, ctx.x, ctx.w, ctx.ids, experts, pad
             )
             max_tokens = max(max(tpr), 1)
-            out_g = _routed(moe, xi, wi, ii, max_tokens, ROUTE_SMALL_M).clone()
+            route = _small_input_route(moe, max_tokens)
+            out_g = _routed(moe, xi, wi, ii, max_tokens, route).clone()
             _barrier()
             out_m = _staged_forward(moe, xi, wi, ii).clone()
             _barrier()
@@ -1381,7 +1395,7 @@ def _routes_edges(ctx, args):
             continue
         xi, wi, ii = x[:n].clone(), w[:n].clone(), ids[:n].clone()
         ii[(torch.arange(n, device=device) % 5) < share] = hot
-        out = _routed(moe, xi, wi, ii, n, ROUTE_SMALL_M).clone()
+        out = _routed(moe, xi, wi, ii, n, _small_input_route(moe, n)).clone()
         _barrier()
         rel_ref = _rel_l2(out, _moe_reference(moe, xi, wi, ii, ctx.refw[0]))
         ok = rel_ref < args.rtol and _all_ranks(torch.isfinite(out).all(), device)

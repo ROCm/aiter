@@ -27,6 +27,7 @@ from aiter.ops.flydsl.kernels.mega_moe.mega_moe_config import (  # noqa: E402
     ROUTE_SMALL_M,
     ROUTE_STAGED,
     TOKEN_BUCKETS,
+    V41_FLASH_EP4_LARGE_M_MIN_TOKENS,
     FusedStage1Knobs,
     FusedStage2Knobs,
     build_mega_moe_bundle_plan,
@@ -156,7 +157,8 @@ def test_large_m_capacities_per_layout():
 
 @pytest.mark.parametrize("mtpr", MTPRS)
 def test_ep4_route_for_every_max_tokens(mtpr):
-    """EP4 V4.1-Flash: small-input up to 512 rows a rank, large-input from 513 at its large capacities."""
+    """EP4 V4.1-Flash: small-input up to 512 rows a rank; at its large capacities the large-input route takes
+    every call from V41_FLASH_EP4_LARGE_M_MIN_TOKENS (384) rows."""
     plan = build_mega_moe_bundle_plan(
         mtpr,
         experts_per_rank=96,
@@ -167,11 +169,17 @@ def test_ep4_route_for_every_max_tokens(mtpr):
         large_m=mtpr in large_m_mtprs_for(world_size=4, model_dim=5120, inter_dim=2304),
     )
     assert plan.large_m == (mtpr in (8192, 16384))
-    for max_tokens in sorted({0, 1, 256, 257, 512, 513, 768, 1024, mtpr - 1, mtpr}):
+    small_end = plan.small_m_mtprs[-1]
+    if plan.large_m:
+        assert plan.large_m_min_tokens == V41_FLASH_EP4_LARGE_M_MIN_TOKENS
+        small_end = plan.large_m_min_tokens - 1
+    for max_tokens in sorted(
+        {0, 1, 256, 257, 383, 384, 512, 513, 768, 1024, mtpr - 1, mtpr}
+    ):
         if not 0 <= max_tokens <= mtpr:
             continue
         route, capacity = plan.route_for(max_tokens)
-        if max_tokens <= plan.small_m_mtprs[-1]:
+        if max_tokens <= small_end:
             assert route == ROUTE_SMALL_M, max_tokens
         elif plan.large_m:
             assert (route, capacity) == (ROUTE_LARGE_M, mtpr), max_tokens
@@ -353,9 +361,10 @@ def _knob_table(config):
 
 
 # The EP4 V4.1-Flash fused configs, as ported from 28ee7fcd (its _tune_v41_flash_ep4 on the post-processed
-# small-input configs and on the large-input config at MTPR 8192). On a mismatch the assertion shows the
-# current table.
-_EP4_FUSED_DIGEST = "46b5425e10dcb8ecf68983dee099df3fdb83a2ec4c0008bf44c4e083dafab45e"
+# small-input configs and on the large-input config at MTPR 8192), with the EP4 small-input tile tuning on top
+# (tile_n 128 at 1 token, 384 at 2 and 32-64, the 256-row bucket's 32-row tiles and cached 384-column GEMM1
+# tiles). On a mismatch the assertion shows the current table.
+_EP4_FUSED_DIGEST = "5384102a95b4211f531e3cd30c41bbfaf79f13a5c929dd23b2d50f57e71f7454"
 
 
 def test_ep4_fused_configs_unchanged():

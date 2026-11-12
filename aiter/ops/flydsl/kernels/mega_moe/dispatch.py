@@ -72,6 +72,15 @@ class DispatchSlot(IntEnum):
 
 DISPATCH_TABLE_SIZE = max(DispatchSlot) + 1
 
+# Owner-CTA LDS slots of the two-wave compact plan (emit_dispatch_plan).
+_PLAN_TOTAL0, _PLAN_TOTAL0_READY, _PLAN_TOTAL1, _PLAN_MAX1 = 0, 1, 2, 3
+_PLAN_PAIR_A1, _PLAN_PAIR_B1, _PLAN_CHUNK1_DONE = 4, 5, 6
+_PLAN_SLOTS = 8
+# Wave that builds the global-expert prefix when waves 0 and 1 plan chunks
+# (waves 2.. may be deriving the remote offsets meanwhile).
+_PLAN_PREFIX_WAVE = 6
+_PLAN_SERIAL_WAVE = 64  # no such wave: disables the serial planner branch
+
 
 @flyc.jit
 def _load_fanout_pair(
@@ -335,7 +344,10 @@ def _initialize_section_ready(
     count_stride,
     payload_chunk_rows,
     fz_tile_m,
+    source_counts=None,
 ):
+    """``source_counts``: the per-source counts of ``count_column`` when the
+    caller already holds them (saves ``fz_npes`` uncached loads)."""
     tile_expected = ptr_buf_tensor(addr_tile_expected, fx.Int32)
     base_tile = row_base // fx.Int32(fz_tile_m)
     for tile in range(fx.Int32(0), num_tiles, 1):
@@ -349,12 +361,15 @@ def _initialize_section_ready(
 
     sender_prefix = fx.Int32(0)
     for source in range_constexpr(fz_npes):
-        source_count = buf_copy_load(
-            count_buffer,
-            fx.Int32(source * count_stride) + count_column,
-            fx.Int32,
-            cache_modifier=2,
-        )
+        if const_expr(source_counts is not None):
+            source_count = source_counts[source]
+        else:
+            source_count = buf_copy_load(
+                count_buffer,
+                fx.Int32(source * count_stride) + count_column,
+                fx.Int32,
+                cache_modifier=2,
+            )
         source_active = source_count > fx.Int32(0)
         source_boundary = source_active & (sender_prefix > fx.Int32(0))
         source_boundary = source_boundary & (
@@ -658,8 +673,11 @@ def _derive_allgather_offsets(
     epr,
     total_experts,
     total_segments,
+    wave_base=0,
 ):
-    """Derive this source's remote row offsets from the gathered histogram."""
+    """Derive this source's remote row offsets from the gathered histogram.
+
+    Wave ``wave_base + d`` handles destination ``d``."""
     dispatch_table = ptr_buf_tensor(addr_disp, fx.Int64)
 
     def dp(slot):
@@ -675,8 +693,8 @@ def _derive_allgather_offsets(
     tid = fx.thread_idx.x
     warp = tid >> fx.Int32(6)
     lane = tid & fx.Int32(63)
-    if warp < fx.Int32(npes):
-        destination = warp
+    if (warp >= fx.Int32(wave_base)) & (warp < fx.Int32(wave_base + npes)):
+        destination = warp - fx.Int32(wave_base)
         destination_tile_m_lane = fx.Int32(0)
         if lane == fx.Int32(0):
             destination_ready_rows = ready_rows_table[destination]
@@ -781,6 +799,14 @@ def _derive_allgather_offsets(
             row_carry = row_carry + fx.Int32(
                 fx.rocdl.readlane(T.i32, inclusive_rows, last_lane)
             )
+
+
+@flyc.jit
+def _spin_lds_nonzero(addr_i64):
+    """Spin until the LDS i32 at ``addr_i64`` is nonzero (another wave set it)."""
+    seen = fx.Int32(comm_ops.atomic_add_lds(addr_i64, fx.Int32(0)))
+    while seen == fx.Int32(0):
+        seen = fx.Int32(comm_ops.atomic_add_lds(addr_i64, fx.Int32(0)))
 
 
 @flyc.jit
@@ -959,9 +985,13 @@ def emit_dispatch_plan(
     dispatch_blocks, group_blocks, group_done_slot, group_phase_base, payload_chunk_rows, tile_state_stride,
     parallel_fanout=False,
     defer_fanout_to_quant=False,
+    plan_scratch=None,
 ):
 # fmt: on
-    """Build a destination-owned compact plan in one producer-only CTA."""
+    """Build a destination-owned compact plan in one producer-only CTA.
+
+    ``plan_scratch``: LDS byte address of >= 8 free i32 slots in this CTA; with
+    two expert chunks and enough waves, the chunks are planned on two waves."""
     dispatch_table = ptr_buf_tensor(addr_disp, fx.Int64)
 
     def dp(i):
@@ -1014,6 +1044,14 @@ def emit_dispatch_plan(
     plan_ready_table = ptr_buf_tensor(p_plan_ready, fx.Int64)
     expert_tile_end = ptr_buf_tensor(a_expert_tile_end, fx.Int32)
     max_expert_tiles_buffer = ptr_buf_tensor(a_max_expert_tiles, fx.Int32)
+    parallel_plan = (
+        plan_scratch is not None
+        and (fz_epr + 63) // 64 == 2
+        and num_waves > _PLAN_PREFIX_WAVE
+    )
+    if const_expr(parallel_plan):
+        if tid < fx.Int32(_PLAN_SLOTS):
+            comm_ops.store_i32_lds(plan_scratch + fx.Int64(tid) * 4, fx.Int32(0))
     if tid == fx.Int32(0):
         comm_ops.wait_i32_until_equals(
             a_group_done,
@@ -1092,6 +1130,28 @@ def emit_dispatch_plan(
                 total_segments=total_segments,
             )
 
+    # Waves 2.. are idle while wave 0 plans the local experts and wave 1 builds
+    # the prefix: let them derive the remote row offsets now, from the same
+    # gathered histogram, instead of after the plan.
+    overlap_offsets = num_waves >= 2 + fz_npes and (
+        not parallel_fanout or defer_fanout_to_quant
+    )
+    if const_expr(overlap_offsets):
+        fx.barrier()
+        if warp >= fx.Int32(2):
+            comm_ops.fence_system_acquire()
+            _derive_allgather_offsets(
+                addr_disp,
+                parity,
+                rank=fz_rank,
+                npes=fz_npes,
+                epr=fz_epr,
+                total_experts=fz_total_experts,
+                total_segments=total_segments,
+                wave_base=2,
+            )
+            fx.rocdl.s_waitcnt(vmcnt=0, lgkmcnt=0, expcnt=0)
+
     # COUNT_DONE is observed by wave 0, but all waves read the gathered
     # histogram below. Converge before each wave's system acquire, then
     # distribute independent destination reductions instead of serializing
@@ -1112,7 +1172,255 @@ def emit_dispatch_plan(
         )
         fx.barrier()
 
-    if warp == fx.Int32(0):
+    if const_expr(parallel_plan):
+        # Two waves plan the two 64-expert chunks at once.  Chunk 1 needs only
+        # chunk 0's padded-row total (its row carry), which wave 0 publishes in
+        # LDS as soon as its scan is done; wave 1 hands back its own total, tile
+        # maximum and fanout-pair bases once its stores have completed.
+        (
+            local_fanout_mask,
+            pair_a,
+            pair_b,
+            pair_enabled,
+            canonical_expert,
+        ) = _load_fanout_pair(
+            addr_pair_config,
+            fx.Int32(fz_rank),
+            parity,
+            npes=fz_npes,
+        )
+
+        def plan_scan(expert_chunk):
+            local_expert = fx.Int32(expert_chunk * 64) + lane
+            valid_expert = local_expert < fx.Int32(fz_epr)
+            safe_expert = valid_expert.select(local_expert, fx.Int32(0))
+            ge = fx.Int32(fz_rank * fz_epr) + local_expert
+            safe_ge = fx.Int32(fz_rank * fz_epr) + safe_expert
+            group_member = valid_expert & pair_enabled & (
+                (safe_expert == pair_a) | (safe_expert == pair_b)
+            )
+            normal_source_counts = []
+            normal_count = fx.Int32(0)
+            group_source_counts = []
+            group_count = fx.Int32(0)
+            for source in range_constexpr(fz_npes):
+                source_count = buf_copy_load(
+                    count_matrix,
+                    fx.Int32(source * count_stride) + safe_ge,
+                    fx.Int32,
+                    cache_modifier=2,
+                )
+                source_count = valid_expert.select(source_count, fx.Int32(0))
+                normal_source_counts.append(source_count)
+                normal_count = normal_count + source_count
+                source_group_count = buf_copy_load(
+                    count_matrix,
+                    fx.Int32(source * count_stride + fz_total_experts + fz_rank),
+                    fx.Int32,
+                    cache_modifier=2,
+                )
+                source_group_count = group_member.select(
+                    source_group_count, fx.Int32(0)
+                )
+                group_source_counts.append(source_group_count)
+                group_count = group_count + source_group_count
+            group_num_tiles = (
+                group_count + fx.Int32(fz_tile_m - 1)
+            ) // fx.Int32(fz_tile_m)
+            normal_num_tiles = (
+                normal_count + fx.Int32(fz_tile_m - 1)
+            ) // fx.Int32(fz_tile_m)
+            chunk_max = _wave_reduce_max_i32(group_num_tiles + normal_num_tiles, lane)
+            group_padded_rows = group_num_tiles * fx.Int32(fz_tile_m)
+            normal_padded_rows = normal_num_tiles * fx.Int32(fz_tile_m)
+            padded_rows = group_padded_rows + normal_padded_rows
+            inclusive_rows = _wave_inclusive_scan_i32(padded_rows, lane)
+            last_lane = min(63, fz_epr - expert_chunk * 64 - 1)
+            chunk_total = fx.Int32(fx.rocdl.readlane(T.i32, inclusive_rows, last_lane))
+            return {
+                "local_expert": local_expert, "valid_expert": valid_expert, "ge": ge,
+                "safe_ge": safe_ge, "group_member": group_member,
+                "normal_source_counts": normal_source_counts, "normal_count": normal_count,
+                "group_source_counts": group_source_counts, "group_count": group_count,
+                "group_num_tiles": group_num_tiles, "normal_num_tiles": normal_num_tiles,
+                "group_padded_rows": group_padded_rows,
+                "normal_padded_rows": normal_padded_rows, "padded_rows": padded_rows,
+                "inclusive_rows": inclusive_rows, "chunk_max": chunk_max,
+                "chunk_total": chunk_total,
+            }
+
+        def plan_store(expert_chunk, c, row_carry):
+            """Chunk ``expert_chunk``'s stores; returns its pair-a/b group bases
+            (0 where the pair expert is not in this chunk)."""
+            local_row_base = row_carry + c["inclusive_rows"] - c["padded_rows"]
+            group_row_base = local_row_base
+            normal_row_base = local_row_base + c["group_padded_rows"]
+            valid_expert = c["valid_expert"]
+            local_expert = c["local_expert"]
+            tile_end = expert_tile_end
+            pair_a_base = _wave_reduce_max_i32(
+                (valid_expert & (local_expert == pair_a)).select(
+                    group_row_base, fx.Int32(0)
+                ),
+                lane,
+            )
+            pair_b_base = _wave_reduce_max_i32(
+                (valid_expert & (local_expert == pair_b)).select(
+                    group_row_base, fx.Int32(0)
+                ),
+                lane,
+            )
+            if valid_expert:
+                if c["group_member"]:
+                    _initialize_section_ready(
+                        a_tile_ready,
+                        a_tile_expected,
+                        count_matrix,
+                        fx.Int32(fz_total_experts + fz_rank),
+                        group_row_base,
+                        c["group_num_tiles"],
+                        fz_npes=fz_npes,
+                        count_stride=count_stride,
+                        payload_chunk_rows=payload_chunk_rows,
+                        fz_tile_m=fz_tile_m,
+                        source_counts=c["group_source_counts"],
+                    )
+                _initialize_section_ready(
+                    a_tile_ready,
+                    a_tile_expected,
+                    count_matrix,
+                    c["safe_ge"],
+                    normal_row_base,
+                    c["normal_num_tiles"],
+                    fz_npes=fz_npes,
+                    count_stride=count_stride,
+                    payload_chunk_rows=payload_chunk_rows,
+                    fz_tile_m=fz_tile_m,
+                    source_counts=c["normal_source_counts"],
+                )
+                tile_end[local_expert] = (
+                    local_row_base + c["padded_rows"]
+                ) // fx.Int32(fz_tile_m)
+                _store_expert_metadata(
+                    a_se,
+                    a_trb,
+                    a_tib,
+                    a_sm,
+                    c["ge"],
+                    normal_row_base,
+                    normal_row_base,
+                    c["normal_count"],
+                    c["normal_num_tiles"],
+                    c["normal_padded_rows"],
+                    fz_tile_m=fz_tile_m,
+                    invalid_source=fz_npes * fz_mtpr,
+                )
+            return pair_a_base, pair_b_base
+
+        def scratch(slot):
+            return plan_scratch + fx.Int64(slot * 4)
+
+        def wait_scratch(slot):
+            _spin_lds_nonzero(scratch(slot))
+
+        if warp == fx.Int32(0):
+            num_valid_buffer = ptr_buf_tensor(a_nv, fx.Int32)
+            c0 = plan_scan(0)
+            if lane == fx.Int32(0):
+                comm_ops.store_i32_lds(scratch(_PLAN_TOTAL0), c0["chunk_total"])
+                fx.rocdl.s_waitcnt(lgkmcnt=0)
+                comm_ops.store_i32_lds(scratch(_PLAN_TOTAL0_READY), fx.Int32(1))
+            pair_a_base0, pair_b_base0 = plan_store(0, c0, fx.Int32(0))
+            if lane == fx.Int32(0):
+                wait_scratch(_PLAN_CHUNK1_DONE)
+            comm_ops.wait_lds_wave()
+            total1 = fx.Int32(
+                fx.rocdl.readfirstlane(
+                    T.i32, comm_ops.atomic_add_lds(scratch(_PLAN_TOTAL1), fx.Int32(0))
+                )
+            )
+            max1 = fx.Int32(
+                fx.rocdl.readfirstlane(
+                    T.i32, comm_ops.atomic_add_lds(scratch(_PLAN_MAX1), fx.Int32(0))
+                )
+            )
+            pair_a_base1 = fx.Int32(
+                fx.rocdl.readfirstlane(
+                    T.i32, comm_ops.atomic_add_lds(scratch(_PLAN_PAIR_A1), fx.Int32(0))
+                )
+            )
+            pair_b_base1 = fx.Int32(
+                fx.rocdl.readfirstlane(
+                    T.i32, comm_ops.atomic_add_lds(scratch(_PLAN_PAIR_B1), fx.Int32(0))
+                )
+            )
+            row_carry = c0["chunk_total"] + total1
+            max_expert_tiles = (max1 > c0["chunk_max"]).select(max1, c0["chunk_max"])
+            pair_a_group_base = (pair_a >= fx.Int32(64)).select(pair_a_base1, pair_a_base0)
+            pair_b_group_base = (pair_b >= fx.Int32(64)).select(pair_b_base1, pair_b_base0)
+            group_count_lane = fx.Int32(0)
+            if lane == fx.Int32(0):
+                for source in range_constexpr(fz_npes):
+                    group_count_lane = group_count_lane + buf_copy_load(
+                        count_matrix,
+                        fx.Int32(source * count_stride + fz_total_experts + fz_rank),
+                        fx.Int32,
+                        cache_modifier=2,
+                    )
+            group_count = fx.Int32(fx.rocdl.readfirstlane(T.i32, group_count_lane))
+            group_num_tiles = (
+                group_count + fx.Int32(fz_tile_m - 1)
+            ) // fx.Int32(fz_tile_m)
+            group_padded_rows = group_num_tiles * fx.Int32(fz_tile_m)
+            if (lane == fx.Int32(0)) & pair_enabled:
+                pair_a_ge = fx.Int32(fz_rank * fz_epr) + pair_a
+                pair_b_ge = fx.Int32(fz_rank * fz_epr) + pair_b
+                _store_expert_metadata(
+                    a_se, a_trb, a_tib, a_sm, pair_a_ge,
+                    pair_a_group_base, pair_a_group_base,
+                    group_count, group_num_tiles, group_padded_rows,
+                    fz_tile_m=fz_tile_m, invalid_source=fz_npes * fz_mtpr,
+                )
+                _store_expert_metadata(
+                    a_se, a_trb, a_tib, a_sm, pair_b_ge,
+                    pair_b_group_base, pair_a_group_base,
+                    group_count, group_num_tiles, group_padded_rows,
+                    fz_tile_m=fz_tile_m, invalid_source=fz_npes * fz_mtpr,
+                )
+            if lane == fx.Int32(0):
+                num_valid_buffer[fx.Int32(0)] = row_carry
+                max_expert_tiles_buffer[fx.Int32(0)] = max_expert_tiles
+            fx.rocdl.s_waitcnt(vmcnt=0, lgkmcnt=0, expcnt=0)
+            comm_ops.fence_system_release()
+            for source in range(lane, fz_npes, 64):
+                remote_ready = plan_ready_table[source]
+                ready_index = parity * fx.Int32(fz_npes) + fx.Int32(fz_rank)
+                comm_ops.store_i32_system(remote_ready, ready_index, expected)
+            fx.rocdl.s_waitcnt(vmcnt=0, lgkmcnt=0, expcnt=0)
+        elif warp == fx.Int32(1):
+            c1 = plan_scan(1)
+            if lane == fx.Int32(0):
+                wait_scratch(_PLAN_TOTAL0_READY)
+            comm_ops.wait_lds_wave()
+            carry1 = fx.Int32(
+                fx.rocdl.readfirstlane(
+                    T.i32, comm_ops.atomic_add_lds(scratch(_PLAN_TOTAL0), fx.Int32(0))
+                )
+            )
+            pair_a_base1, pair_b_base1 = plan_store(1, c1, carry1)
+            # Wave 0 publishes PLAN_READY after observing this hand-off: drain
+            # this wave's stores first so its release fence covers them.
+            fx.rocdl.s_waitcnt(vmcnt=0, lgkmcnt=0, expcnt=0)
+            if lane == fx.Int32(0):
+                comm_ops.store_i32_lds(scratch(_PLAN_TOTAL1), c1["chunk_total"])
+                comm_ops.store_i32_lds(scratch(_PLAN_MAX1), c1["chunk_max"])
+                comm_ops.store_i32_lds(scratch(_PLAN_PAIR_A1), pair_a_base1)
+                comm_ops.store_i32_lds(scratch(_PLAN_PAIR_B1), pair_b_base1)
+                fx.rocdl.s_waitcnt(lgkmcnt=0)
+                comm_ops.store_i32_lds(scratch(_PLAN_CHUNK1_DONE), fx.Int32(1))
+    # With the two-wave plan above, this serial planner is not selected (no
+    # wave has that index) and the prefix moves off wave 1.
+    if warp == fx.Int32(_PLAN_SERIAL_WAVE if parallel_plan else 0):
         num_valid_buffer = ptr_buf_tensor(a_nv, fx.Int32)
         row_carry = fx.Int32(0)
         max_expert_tiles = fx.Int32(0)
@@ -1339,7 +1647,7 @@ def emit_dispatch_plan(
             ready_index = parity * fx.Int32(fz_npes) + fx.Int32(fz_rank)
             comm_ops.store_i32_system(remote_ready, ready_index, expected)
         fx.rocdl.s_waitcnt(vmcnt=0, lgkmcnt=0, expcnt=0)
-    elif warp == fx.Int32(1):
+    elif warp == fx.Int32(_PLAN_PREFIX_WAVE if parallel_plan else 1):
         # Build the global-expert exclusive prefix cooperatively.
         pairs_per_lane = (total_segments + 63) // 64
         lane_base = lane * fx.Int32(pairs_per_lane)
@@ -1382,18 +1690,19 @@ def emit_dispatch_plan(
     # Give those warps their own system acquire after the CTA barrier so their
     # COUNT_MATRIX loads cannot reuse lines fetched before the remote peers'
     # histogram stores became visible.
-    comm_ops.fence_system_acquire()
-    _derive_allgather_offsets(
-        addr_disp,
-        parity,
-        rank=fz_rank,
-        npes=fz_npes,
-        epr=fz_epr,
-        total_experts=fz_total_experts,
-        total_segments=total_segments,
-    )
-    fx.rocdl.s_waitcnt(vmcnt=0, lgkmcnt=0, expcnt=0)
-    fx.barrier()
+    if const_expr(not overlap_offsets):
+        comm_ops.fence_system_acquire()
+        _derive_allgather_offsets(
+            addr_disp,
+            parity,
+            rank=fz_rank,
+            npes=fz_npes,
+            epr=fz_epr,
+            total_experts=fz_total_experts,
+            total_segments=total_segments,
+        )
+        fx.rocdl.s_waitcnt(vmcnt=0, lgkmcnt=0, expcnt=0)
+        fx.barrier()
     if tid == fx.Int32(0):
         comm_ops.fence_system_release()
         comm_ops.store_i32_system(a_pair_ready, parity, expected)
@@ -1702,7 +2011,9 @@ def emit_dispatch_payload(
             payload_chunk_rows
         )
         num_chunks = (num_chunks > fx.Int32(0)).select(num_chunks, fx.Int32(1))
-        chunk_active = chunk_id < num_chunks
+        # An empty segment has nothing to copy or publish: skip its release
+        # fence and chunk_done round trip (which would only reset it to 0).
+        chunk_active = (chunk_id < num_chunks) & (source_count > fx.Int32(0))
         chunk_begin = chunk_id * fx.Int32(payload_chunk_rows)
         chunk_limit = chunk_begin + fx.Int32(payload_chunk_rows)
         chunk_end = (source_count < chunk_limit).select(source_count, chunk_limit)
