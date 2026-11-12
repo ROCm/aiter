@@ -51,7 +51,7 @@ QUICK_SKEWS = {
 
 
 class _FakeEngine:
-    """Stand-in for ``OneShotAllReduce`` and ``QuickAllReduceInt4``.
+    """Stand-in for ``OneShotAllReduce`` and ``FlyQuickAllReduce``.
 
     Its constructor is a collective, like the real IPC handle exchange, and it
     raises unless every rank builds the same engine (the constructor kwargs,
@@ -97,8 +97,8 @@ def _build(owner: str, group, rank: int):
     if owner == "oneshot":
         from aiter.dist.device_communicators.custom_all_reduce import (
             CustomAllreduce,
-            _resolve_car_max_size,
             _resolve_car_min_size,
+            _resolve_custom_sizes,
         )
 
         ca = CustomAllreduce.__new__(CustomAllreduce)
@@ -108,7 +108,7 @@ def _build(owner: str, group, rank: int):
         ca.world_size = WORLD
         ca.device = torch.device("cpu")
         ca.fully_connected = True
-        ca._car_max_size = _resolve_car_max_size(128 << 20)
+        ca._car_max_size = _resolve_custom_sizes(False, WORLD, 128 << 20).ar
         ca._car_min_size = _resolve_car_min_size()
         ca._fly_oneshot = None
         ca._fly_window = None
@@ -153,7 +153,7 @@ def _rank(rank: int, port: int, owner: str, env: dict, patches: dict) -> dict:
     )
     group = dist.group.WORLD
     module = car if owner == "oneshot" else qar
-    engine = "OneShotAllReduce" if owner == "oneshot" else "QuickAllReduceInt4"
+    engine = "OneShotAllReduce" if owner == "oneshot" else "FlyQuickAllReduce"
     disagreements = _Disagreements()
     logging.getLogger("aiter").addHandler(disagreements)
     try:

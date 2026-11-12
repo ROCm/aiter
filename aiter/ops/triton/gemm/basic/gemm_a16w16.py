@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
+import os
+
 import torch
 import triton
 
@@ -20,6 +22,7 @@ from aiter.ops.triton._triton_kernels.gemm.basic.gemm_a16w16_persistent import (
 )
 from aiter.ops.triton.utils._triton.arch_info import get_arch
 from aiter.ops.triton.utils.common_utils import deserialize_str, serialize_dict
+from aiter.ops.triton.utils.device_info import get_num_xcds
 from aiter.ops.triton.utils.gemm_config_utils import (
     clamp_num_buffers,
     compute_splitk_params,
@@ -271,6 +274,7 @@ def gemm_a16w16_(
                 SKIP_REDUCE=bool(skip_reduce),
                 NUM_SMS=NUM_WGS,
                 NUM_PID_N=num_pid_n,
+                NUM_XCDS=get_num_xcds(),
                 num_warps=num_warps,
                 num_stages=num_stages,
                 waves_per_eu=waves_per_eu,
@@ -349,6 +353,7 @@ def gemm_a16w16_(
             ADD_BIAS=(bias is not None),
             SKIP_REDUCE=False,
             NUM_WGS=NUM_WGS,
+            NUM_XCDS=get_num_xcds(),
             **config,
         )
 
@@ -361,6 +366,7 @@ def gemm_a16w16_(
         from aiter.ops.triton._gluon_kernels.gfx1250.gemm.basic.gemm_a16w16 import (
             _KERNEL_MAP,
             create_shared_layouts,
+            create_store_layout,
             create_wmma_layouts,
         )
 
@@ -383,6 +389,7 @@ def gemm_a16w16_(
         kernel_type_from_config = config.pop("kernel_type", None)
         if kernel_type_from_config is not None:
             kernel_type = kernel_type_from_config
+        register_store = config.pop("REGISTER_STORE", 0)
 
         BLOCK_M = config["BLOCK_M"]
         BLOCK_N = config["BLOCK_N"]
@@ -446,6 +453,26 @@ def gemm_a16w16_(
 
         grid = (triton.cdiv(M, BLOCK_M) * triton.cdiv(N, BLOCK_N), 1)
 
+        # compute_bound's epilogue, picked by the config entry's "REGISTER_STORE":
+        # 0 = the LDS-staged TDM store (default: entries without the key are unchanged), 1 = register store from the
+        # WMMA layout, 2 = coalesced register store (convert_layout, 16-byte buffer stores). For A/B only,
+        # AITER_GFX1250_A16W16_STORE overrides the entry's value for this (non-persistent gluon compute_bound)
+        # kernel; it must be unset in serving.
+        extra_kwargs = {}
+        if kernel_type == "compute_bound":
+            store_mode = int(
+                os.environ.get("AITER_GFX1250_A16W16_STORE", register_store)
+            )
+            if store_mode not in (0, 1, 2):
+                raise ValueError(
+                    f"REGISTER_STORE / AITER_GFX1250_A16W16_STORE must be 0, 1 or 2, got {store_mode}"
+                )
+            extra_kwargs["REGISTER_STORE"] = store_mode
+            if store_mode == 2:
+                extra_kwargs["STORE_LAYOUT"] = create_store_layout(
+                    BLOCK_N, num_warps, y.element_size() * 8
+                )
+
         _LOGGER.info(
             "GEMM_A16W16 [gluon, non-persistent]: x=%s w=%s",
             x.shape,
@@ -481,6 +508,7 @@ def gemm_a16w16_(
             ADD_BIAS=(bias is not None),
             num_warps=num_warps,
             waves_per_eu=waves_per_eu,
+            **extra_kwargs,
         )
 
         return y
@@ -533,6 +561,7 @@ def gemm_a16w16_(
         ADD_BIAS=(bias is not None),
         SKIP_REDUCE=skip_reduce,
         **config,
+        NUM_XCDS=get_num_xcds(),
     )
 
     if config["NUM_KSPLIT"] > 1:

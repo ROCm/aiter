@@ -1122,30 +1122,63 @@ class TestGfx942CsvTuner(unittest.TestCase):
 
         self.assertEqual(raised.exception.code, 2)
 
-    def test_aot_jobs_cover_tuned_rows_and_the_m_below_them(self):
+    def test_aot_jobs_cover_tuned_rows_and_every_fallback_config(self):
         from aiter.aot.flydsl import gemm as aot
+        from aiter.ops.flydsl.kernels.gemm_a16w16_gfx942 import (
+            ASYNC_FALLBACK_WITNESSES,
+            FALLBACK_WITNESSES,
+        )
 
         table = REPO_ROOT / "aiter/configs/flydsl_gemm_a16w16_gfx942_tuned.csv"
         with table.open(newline="") as handle:
             rows = list(csv.DictReader(handle))
         jobs = aot.parse_csv(str(table))
+        row_jobs = [job for job in jobs if not job.get("fallback")]
+        fallback_jobs = [job for job in jobs if job.get("fallback")]
 
-        self.assertEqual(len(jobs), len(rows))
+        # The runtime matches M exactly, so each row is replayed once, at its M.
+        self.assertEqual(len(row_jobs), len(rows))
         self.assertEqual(
-            {(job["m"], job["n"], job["k"], job["out_dtype"]) for job in jobs},
+            {(job["m"], job["n"], job["k"], job["out_dtype"]) for job in row_jobs},
             {(int(r["M"]), int(r["N"]), int(r["K"]), r["out_dtype"]) for r in rows},
         )
-        # Below a shape's smallest tuned M the runtime takes the cost-model
-        # fallback, so that row has to serve every M down to 1 for replay to
-        # reach those kernels.
-        smallest: dict[tuple, int] = {}
-        for job in jobs:
-            key = (job["n"], job["k"], job["out_dtype"])
-            smallest[key] = min(smallest.get(key, job["m"]), job["m"])
-        for job in jobs:
-            key = (job["n"], job["k"], job["out_dtype"])
-            if job["m"] == smallest[key]:
-                self.assertEqual(job["m_low"], 1)
+        # Every config the fallback can return, in both output dtypes.
+        witnesses = [*FALLBACK_WITNESSES.values(), *ASYNC_FALLBACK_WITNESSES.values()]
+        self.assertEqual(
+            sorted(
+                (job["m"], job["n"], job["k"], job["out_dtype"])
+                for job in fallback_jobs
+            ),
+            sorted(
+                (*shape, dtype) for shape in witnesses for dtype in ("bf16", "fp32")
+            ),
+        )
+        self.assertTrue(all(job["m_low"] is None for job in jobs))
+
+    def test_aot_fallback_jobs_skip_the_tuned_table(self):
+        from aiter.aot.flydsl import gemm as aot
+        from aiter.ops.flydsl import gemm_kernels
+
+        table = REPO_ROOT / "aiter/configs/flydsl_gemm_a16w16_gfx942_tuned.csv"
+        jobs = aot.parse_csv(str(table))
+        seen = []
+
+        def hgemm(*args, **kwargs):
+            seen.append(os.environ.get("AITER_FLYDSL_GEMM_GFX942_SKIP_TABLE"))
+
+        for fallback in (False, True):
+            job = next(job for job in jobs if bool(job.get("fallback")) == fallback)
+            seen.clear()
+            with (
+                mock.patch.object(gemm_kernels, "flydsl_hgemm", side_effect=hgemm),
+                mock.patch.object(
+                    aot, "_empty", side_effect=lambda *shape, dtype: None
+                ),
+                mock.patch.dict(os.environ, clear=False) as env,
+            ):
+                env.pop("AITER_FLYDSL_GEMM_GFX942_SKIP_TABLE", None)
+                aot.replay(job)
+            self.assertEqual(seen, ["1" if fallback else None])
 
     def test_aot_replays_gfx942_rows_through_the_gfx942_caller(self):
         from aiter.aot.flydsl import gemm as aot

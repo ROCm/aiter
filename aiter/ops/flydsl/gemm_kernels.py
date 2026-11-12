@@ -13,9 +13,10 @@ import torch
 from torch import Tensor
 
 from aiter import logger
-from aiter.jit.utils.chip_info import get_gfx, get_gfx_runtime
-from aiter.utility.graph_alloc import persistent_alloc
+from aiter.jit.utils.chip_info import get_gfx
+from aiter.utility.graph_alloc import capture_scoped_cache, persistent_alloc
 
+from .gemm_a16w16_band import band_stream_name_supported, gemm_a16w16_band
 from .gemm_a16w16_gfx1250 import gemm_a16w16 as gemm_a16w16_gfx1250
 from .kernels.gemm_a16w16_gfx942 import gemm_a16w16 as gemm_a16w16_gfx942
 from .kernels.gemm_a16w16_gfx950 import (
@@ -43,7 +44,7 @@ _HGEMM_KERNEL_RE = re.compile(
     r"x(?P<stages>\d+)_ks(?P<split_k>\d+)_"
     r"w(?P<m_waves>\d+)x(?P<n_waves>\d+)x(?P<k_waves>\d+)_"
     r"bias(?P<has_bias>[01])_ktail(?P<has_k_tail>[01])_"
-    r"gm(?P<group_m>\d+)_p(?P<policy>ft|ht|hti|sk)_"
+    r"gm(?P<group_m>\d+)(?:_stg(?P<k_stagger>\d+))?(?P<b_non_temporal>_bnt)?_p(?P<policy>ft|ht|hti|sk|bs)_"
     r"(?P<target_gfx>gfx[0-9a-z]+(?:-[0-9a-z]+)*)$"
 )
 
@@ -83,18 +84,27 @@ def flydsl_hgemm_kernel_name(
             f"Unsupported output dtype {out_dtype_name} for input {dtype_name}"
         )
 
-    if config.get("policy") == SKINNY_POLICY:
-        policy = SKINNY_POLICY
+    if config.get("policy") in (SKINNY_POLICY, "bs"):
+        policy = config["policy"]
     else:
         policy = "ht" if config["use_half_tile_interleaved"] else "ft"
+    k_stagger = config.get("k_stagger", 0)
+    gfx = target_gfx or get_gfx()
+    _validate_k_stagger(k_stagger, gfx, policy)
+    b_non_temporal = config.get("b_non_temporal", False)
+    _validate_b_non_temporal(b_non_temporal, gfx, policy)
+    stagger_suffix = f"_stg{k_stagger}" if k_stagger else ""
+    memory_suffix = "_bnt" if b_non_temporal else ""
     name = (
         f"flydsl_hgemm_a{dtype_name}_w{dtype_name}_{out_dtype_name}_"
         f"t{config['block_m']}x{config['block_n']}x{config['block_k']}"
         f"x{config['stages']}_ks{config['split_k']}_"
         f"w{config['m_waves']}x{config['n_waves']}x{config['k_waves']}_"
-        f"bias{int(has_bias)}_ktail0_gm{config['group_m']}_p{policy}_"
-        f"{target_gfx or get_gfx()}"
+        f"bias{int(has_bias)}_ktail0_gm{config['group_m']}{stagger_suffix}{memory_suffix}_p{policy}_"
+        f"{gfx}"
     )
+    if policy == "bs" and get_flydsl_hgemm_kernel_params(name) is None:
+        raise ValueError("unsupported band-stream kernel configuration")
     return name
 
 
@@ -110,6 +120,12 @@ def get_flydsl_hgemm_kernel_params(name: str) -> dict | None:
     if out_dtype not in (dtype, "fp32"):
         return None
     policy = match.group("policy")
+    k_stagger = int(match.group("k_stagger") or 0)
+    b_non_temporal = match.group("b_non_temporal") is not None
+    if (k_stagger or b_non_temporal) and (
+        match.group("target_gfx") != "gfx950" or policy == SKINNY_POLICY
+    ):
+        return None
     if policy == SKINNY_POLICY and (
         dtype != "bf16"
         or out_dtype != "bf16"
@@ -122,7 +138,7 @@ def get_flydsl_hgemm_kernel_params(name: str) -> dict | None:
     ):
         return None
 
-    return {
+    params = {
         "block_m": int(match.group("block_m")),
         "block_n": int(match.group("block_n")),
         "block_k": int(match.group("block_k")),
@@ -132,6 +148,8 @@ def get_flydsl_hgemm_kernel_params(name: str) -> dict | None:
         "n_waves": int(match.group("n_waves")),
         "k_waves": int(match.group("k_waves")),
         "group_m": int(match.group("group_m")),
+        "k_stagger": k_stagger,
+        "b_non_temporal": b_non_temporal,
         "use_half_tile_interleaved": policy in ("ht", "hti"),
         "policy": policy,
         "has_bias": match.group("has_bias") == "1",
@@ -139,6 +157,24 @@ def get_flydsl_hgemm_kernel_params(name: str) -> dict | None:
         "out_dtype": out_dtype,
         "target_gfx": match.group("target_gfx"),
     }
+
+    if policy == "bs" and not band_stream_name_supported(params):
+        return None
+    return params
+
+
+def _validate_k_stagger(k_stagger, gfx, policy):
+    if not isinstance(k_stagger, int) or isinstance(k_stagger, bool) or k_stagger < 0:
+        raise ValueError("k_stagger must be a non-negative integer")
+    if k_stagger and (gfx != "gfx950" or policy == SKINNY_POLICY):
+        raise ValueError("k_stagger supports gfx950 ft/ht/hti/bs policies only")
+
+
+def _validate_b_non_temporal(value, gfx, policy):
+    if not isinstance(value, bool):
+        raise TypeError("b_non_temporal must be a bool")
+    if value and (gfx != "gfx950" or policy == SKINNY_POLICY):
+        raise ValueError("b_non_temporal supports gfx950 ft/ht/hti/bs policies only")
 
 
 # gfx950 and gfx1250 values of the flydsl_hgemm tile arguments left as None.
@@ -172,6 +208,8 @@ def flydsl_hgemm(
     policy: str = "ft",
     out_dtype: torch.dtype | None = None,
     stream: torch.cuda.Stream | None = None,
+    k_stagger: int = 0,
+    b_non_temporal: bool = False,
 ) -> torch.Tensor:
     """Run the A16W16 kernel for this arch with AITER's ``B[N, K]`` convention.
 
@@ -180,15 +218,30 @@ def flydsl_hgemm(
     ones are passed as ``user_kwargs`` to its ``gemm_a16w16``. Elsewhere they
     take ``_HGEMM_DEFAULT_TILE``. gfx942 has no main-loop unroll variant, so it
     ignores the ``ft``/``ht``/``hti`` policies, and does not support ``bias``.
-    The skinny policy is gfx950 only and is rejected on every other arch.
+    The skinny and band-stream policies are gfx950 only.
 
     On gfx942, a partial tile override keeps unspecified block dimensions,
     wave counts and ``group_m`` from the selected tuned or fallback config.
     Setting a tile or pipeline key resets its pipeline flags and split-K before
     applying the override.
+
+    On gfx950 ft/ht/hti, ``k_stagger`` rotates each workgroup's K traversal
+    by ``(block_idx.x * k_stagger) % partition_k_tiles`` tiles, within its
+    split-K partition. Zero preserves the original traversal. Tune this
+    per shape: spreading concurrent reads can help streaming GEMMs but can
+    hurt cache reuse. Rotation changes floating-point summation order, not
+    accumulation precision or the split-K reduction protocol.
+    ``b_non_temporal`` streams B's async loads with the non-temporal cache
+    hint. It is independent of k_stagger; tune both, since shared B can
+    benefit from caching. Both options default off.
+    ``policy="bs"`` selects the BF16 band-stream decode kernel for the
+    validated 256-CU gfx950 M/N/K and configuration catalog. It requires
+    no bias, split_k=1 and BF16 output. As on the legacy FT path, strided
+    A/B are made contiguous before launch. Other unsupported inputs raise
+    rather than silently selecting a different kernel.
     """
 
-    if policy not in ("ft", "ht", "hti", SKINNY_POLICY):
+    if policy not in ("ft", "ht", "hti", SKINNY_POLICY, "bs"):
         raise ValueError(f"Unsupported FlyDSL HGEMM policy: {policy!r}")
     launch_stream = (
         torch.cuda.current_stream(device=a.device) if stream is None else stream
@@ -211,10 +264,14 @@ def flydsl_hgemm(
         }.items()
         if value is not None
     }
-    gfx = get_gfx_runtime()
+    gfx = get_gfx()
     if policy == SKINNY_POLICY and gfx != "gfx950":
         raise RuntimeError("The FlyDSL skinny HGEMM policy supports gfx950 only")
+    _validate_k_stagger(k_stagger, gfx, policy)
+    _validate_b_non_temporal(b_non_temporal, gfx, policy)
     if gfx == "gfx942":
+        if policy == "bs":
+            raise ValueError("band-stream HGEMM requires gfx950 with 256 CUs")
         return gemm_a16w16_gfx942(
             a,
             b.t(),
@@ -230,6 +287,36 @@ def flydsl_hgemm(
     block_m, block_n, block_k = tile["block_m"], tile["block_n"], tile["block_k"]
     stages, split_k, group_m = tile["stages"], tile["split_k"], tile["group_m"]
     m_waves, n_waves, k_waves = tile["m_waves"], tile["n_waves"], tile["k_waves"]
+    if policy == "bs":
+        # A tuned row can serve strided inputs too. Preserve the legacy
+        # public HGEMM normalization; only the device kernel requires
+        # contiguous A/B. Copies must precede its launch on the same stream.
+        with torch.cuda.stream(launch_stream):
+            if not a.is_contiguous():
+                a = a.contiguous()
+            if not b.is_contiguous():
+                b = b.contiguous()
+        return gemm_a16w16_band(
+            a,
+            b,
+            out,
+            bias,
+            out_dtype,
+            launch_stream,
+            {
+                "block_m": block_m,
+                "block_n": block_n,
+                "block_k": block_k,
+                "stages": stages,
+                "split_k": split_k,
+                "m_waves": m_waves,
+                "n_waves": n_waves,
+                "k_waves": k_waves,
+                "group_m": group_m,
+                "k_stagger": k_stagger,
+                "b_non_temporal": b_non_temporal,
+            },
+        )
     if policy == SKINNY_POLICY:
         if bias is not None or split_k != 1 or m_waves != 1 or n_waves != 1 or group_m:
             raise ValueError(
@@ -290,6 +377,8 @@ def flydsl_hgemm(
         "n_waves": n_waves,
         "k_waves": k_waves,
         "group_m": group_m,
+        "k_stagger": k_stagger,
+        "b_non_temporal": b_non_temporal,
         "use_half_tile_interleaved": policy in ("ht", "hti"),
     }
     return gemm_a16w16(
@@ -334,21 +423,40 @@ PRESHUFFLE_SPLIT_K_WORKSPACE_ELEMS = (
 )
 
 
-@functools.lru_cache(maxsize=128)
+@functools.cache
+def _get_preshuffle_split_workspace(
+    device: torch.device,
+    stream: torch.cuda.Stream,
+) -> Tensor:
+    # Fully overwritten by every launch, so it needs no initialization and is
+    # shared with captures. Never evicted: a captured graph may point at it.
+    with persistent_alloc(device):
+        return torch.empty(
+            PRESHUFFLE_SPLIT_K_WORKSPACE_ELEMS, dtype=torch.float32, device=device
+        )
+
+
+@capture_scoped_cache
+def _get_preshuffle_split_semaphore(
+    device: torch.device,
+    stream: torch.cuda.Stream,
+) -> Tensor:
+    # Safe to reuse: launches on a stream are ordered and the reduction hands
+    # the semaphore back zeroed.
+    with persistent_alloc(device):
+        return torch.zeros(
+            PRESHUFFLE_SPLIT_K_MAX_TILES, dtype=torch.int32, device=device
+        )
+
+
 def _get_preshuffle_split_buffers(
     device: torch.device,
     stream: torch.cuda.Stream,
 ) -> tuple[Tensor, Tensor]:
-    # Safe to reuse: launches on a stream are ordered and the reduction hands
-    # the semaphore back zeroed.
-    with persistent_alloc(device):
-        workspace = torch.empty(
-            PRESHUFFLE_SPLIT_K_WORKSPACE_ELEMS, dtype=torch.float32, device=device
-        )
-        semaphore = torch.zeros(
-            PRESHUFFLE_SPLIT_K_MAX_TILES, dtype=torch.int32, device=device
-        )
-    return workspace, semaphore
+    return (
+        _get_preshuffle_split_workspace(device, stream),
+        _get_preshuffle_split_semaphore(device, stream),
+    )
 
 
 def _check_preshuffle_flat_buffer_capacity(

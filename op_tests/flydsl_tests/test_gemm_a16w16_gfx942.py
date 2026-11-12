@@ -21,7 +21,11 @@ else:
 
 from aiter.jit.utils.chip_info import get_gfx
 from aiter.ops.flydsl.gemm_kernels import flydsl_hgemm
-from aiter.ops.flydsl.kernels.gemm_a16w16_gfx942 import gemm_a16w16
+from aiter.ops.flydsl.kernels.gemm_a16w16_gfx942 import (
+    ASYNC_FALLBACK_WITNESSES,
+    FALLBACK_WITNESSES,
+    gemm_a16w16,
+)
 
 
 def _require_gfx942():
@@ -562,31 +566,9 @@ def _catalog_entry(config):
     return (*(config[key] for key in keys), config.get("k_waves", 1))
 
 
-# One shape that selects each config the fallback can return: the catalogue
-# entries, then the four K=64 async last-resort tiles.
-_FALLBACK_WITNESSES = {
-    (32, 32, 64, 1, 2, 2, 1): (1, 32, 128),
-    (32, 32, 64, 4, 2, 2, 1): (1, 1536, 2048),
-    (32, 32, 128, 8, 2, 2, 1): (1, 32, 2048),
-    (64, 64, 64, 1, 2, 2, 1): (1, 10240, 128),
-    (64, 64, 128, 3, 2, 2, 1): (100, 2560, 2048),
-    (64, 64, 128, 4, 2, 2, 1): (1, 2560, 4096),
-    (64, 128, 64, 1, 2, 2, 1): (100, 10240, 128),
-    (64, 128, 128, 2, 2, 2, 1): (1, 10240, 7168),
-    (64, 128, 128, 4, 2, 2, 1): (1, 7168, 16384),
-    (128, 112, 128, 3, 4, 1, 1): (4095, 336, 4096),
-    (128, 128, 64, 1, 2, 2, 1): (200, 10240, 128),
-    (128, 192, 64, 1, 2, 2, 1): (4095, 1536, 128),
-}
-_ASYNC_WITNESSES = {
-    (32, 32, 64, 1, 2, 2, 1): (20, 20, 64),
-    (32, 64, 64, 1, 2, 2, 1): (20, 50, 64),
-    (64, 32, 64, 1, 2, 2, 1): (50, 20, 64),
-    (64, 64, 64, 1, 2, 2, 1): (50, 50, 64),
-}
 _FALLBACK_LAUNCHES = [
-    *_FALLBACK_WITNESSES.values(),
-    *_ASYNC_WITNESSES.values(),
+    *FALLBACK_WITNESSES.values(),
+    *ASYNC_FALLBACK_WITNESSES.values(),
 ]
 
 
@@ -595,12 +577,12 @@ def test_gfx942_fallback_catalog_entries_are_reachable():
     in the JIT and AOT fan-out."""
     import aiter.ops.flydsl.kernels.gemm_a16w16_gfx942 as g
 
-    assert set(_FALLBACK_WITNESSES) == set(g.FALLBACK_CATALOG)
-    for entry, (m, n, k) in _FALLBACK_WITNESSES.items():
+    assert set(FALLBACK_WITNESSES) == set(g.FALLBACK_CATALOG)
+    for entry, (m, n, k) in FALLBACK_WITNESSES.items():
         config = g.gfx942_fallback_config(m, n, k)
         assert config.get("pingpong"), f"M{m} N{n} K{k} left the catalogue"
         assert _catalog_entry(config) == entry, f"M{m} N{n} K{k}"
-    for entry, (m, n, k) in _ASYNC_WITNESSES.items():
+    for entry, (m, n, k) in ASYNC_FALLBACK_WITNESSES.items():
         config = g.gfx942_fallback_config(m, n, k)
         assert "pingpong" not in config, f"M{m} N{n} K{k} must take the async pipeline"
         assert _catalog_entry(config) == entry, f"M{m} N{n} K{k}"

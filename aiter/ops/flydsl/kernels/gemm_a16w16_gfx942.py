@@ -29,9 +29,11 @@ Configs come from the tuned table (``aiter/configs/flydsl_gemm_a16w16_gfx942_tun
 and fall back to a cost-model search for shapes that are not in it.
 
 Entry points are ``gemm_a16w16`` and ``flydsl_hgemm``; the table is tuned by
-``op_tests/flydsl_tests/tune_gfx942_csv.py``. AOT compiles this kernel directly
-(``aiter.aot.flydsl.gemm``): every tuned-table row plus every config the
-fallback can return. TunedGemm's FlyDSL catalog (``gemm_a16w16_policy``) does
+``op_tests/flydsl_tests/tune_gfx942_csv.py``. AOT (``aiter.aot.flydsl.gemm``)
+replays ``flydsl_hgemm`` at each tuned row's exact M, and at the
+``FALLBACK_WITNESSES`` and ``ASYNC_FALLBACK_WITNESSES`` shapes with the table
+skipped, in bf16 and fp32 output, so every config the fallback can return is
+built. TunedGemm's FlyDSL catalog (``gemm_a16w16_policy``) does
 not cover gfx942: its ``flydsl_hgemm_*`` kernel names cannot encode the
 pipeline flags (``pingpong``, ``buffered_load``, ``direct_store``,
 ``split_k_reduce``).
@@ -51,7 +53,7 @@ import torch
 from flydsl.expr import const_expr, gpu, range_constexpr, rocdl
 
 from aiter.jit.utils.chip_info import get_cu_num, get_gfx_runtime
-from aiter.utility.graph_alloc import persistent_alloc
+from aiter.utility.graph_alloc import capture_scoped_cache, persistent_alloc
 
 from .gemm_a16w16_gfx942_mainloop import (
     GEMM_A16W16_DTYPE_BF16,
@@ -658,8 +660,10 @@ def _check_flat_buffer_capacity(name: str, size: int) -> None:
         )
 
 
-@functools.cache
-def get_split_k_buffers(stream_handle: int, device, split_k, split_k_reduce):
+@capture_scoped_cache
+def get_split_k_buffers(
+    device: torch.device, stream_handle: int, split_k: int, split_k_reduce: bool
+):
     """Split-K tile semaphores and signals, one set per split_k and split_k_reduce.
 
     Also one per stream, since launches on two streams may overlap. Keyed by
@@ -669,8 +673,11 @@ def get_split_k_buffers(stream_handle: int, device, split_k, split_k_reduce):
     Sets (8-12 KB each) are never evicted because a captured CUDA graph keeps
     using their addresses.
 
-    Before graph capture, callers must run the operation once on the capture
-    stream so allocation and the one-time zeroing happen outside the graph.
+    A set first built inside a graph capture records its zeroing into that
+    graph, so it stays private to that capture (``capture_scoped_cache``);
+    sets built eagerly are shared with captures. ``device`` comes first so the
+    cache resolves the capture from the device's current stream, which the
+    caller makes the launch stream.
 
     Zeroed once, never reset by the host. Atomic split-K (``SplitKProtocol``)
     never resets its 64-bit tickets: each launch advances them by split_k,
@@ -719,6 +726,30 @@ FALLBACK_CATALOG = (
     (128, 128, 64, 1, 2, 2, 1),
     (128, 192, 64, 1, 2, 2, 1),
 )
+# One (M, N, K) per config the fallback can return, as a catalogue entry
+# selected by its shape: the catalogue, then the four K=64 async last-resort
+# tiles. AOT replays these shapes to build every fallback kernel, so each one
+# must keep selecting its entry.
+FALLBACK_WITNESSES = {
+    (32, 32, 64, 1, 2, 2, 1): (1, 32, 128),
+    (32, 32, 64, 4, 2, 2, 1): (1, 1536, 2048),
+    (32, 32, 128, 8, 2, 2, 1): (1, 32, 2048),
+    (64, 64, 64, 1, 2, 2, 1): (1, 10240, 128),
+    (64, 64, 128, 3, 2, 2, 1): (100, 2560, 2048),
+    (64, 64, 128, 4, 2, 2, 1): (1, 2560, 4096),
+    (64, 128, 64, 1, 2, 2, 1): (100, 10240, 128),
+    (64, 128, 128, 2, 2, 2, 1): (1, 10240, 7168),
+    (64, 128, 128, 4, 2, 2, 1): (1, 7168, 16384),
+    (128, 112, 128, 3, 4, 1, 1): (4095, 336, 4096),
+    (128, 128, 64, 1, 2, 2, 1): (200, 10240, 128),
+    (128, 192, 64, 1, 2, 2, 1): (4095, 1536, 128),
+}
+ASYNC_FALLBACK_WITNESSES = {
+    (32, 32, 64, 1, 2, 2, 1): (20, 20, 64),
+    (32, 64, 64, 1, 2, 2, 1): (20, 50, 64),
+    (64, 32, 64, 1, 2, 2, 1): (50, 20, 64),
+    (64, 64, 64, 1, 2, 2, 1): (50, 50, 64),
+}
 
 
 def fallback_catalog_configs() -> list[dict]:
@@ -1198,7 +1229,7 @@ def gemm_a16w16(
             else:
                 kernel_out = out
             semaphore, signal = get_split_k_buffers(
-                stream.cuda_stream, device, split_k, split_k_reduce
+                device, stream.cuda_stream, split_k, split_k_reduce
             )
             if split_k_reduce:
                 # Partial tiles of every split; the last split of a tile reduces them.

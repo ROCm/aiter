@@ -7,6 +7,7 @@ from aiter.ops.triton.fusions.fused_kv_cache import (
     fused_qk_rope_cat_and_cache_mla,
     fused_qk_rope_cosine_cache_llama,
     fused_qk_rope_reshape_and_cache,
+    reshape_and_cache_k4v8,
 )
 from aiter.ops.triton.utils._triton import arch_info
 from aiter.ops.triton.utils.types import e4m3_dtype
@@ -1038,3 +1039,409 @@ def test_fused_qk_rope_cosine_cache_llama(
     torch.testing.assert_close(
         torch_value_cache, triton_value_cache, atol=1e-1, rtol=1e-1
     )
+
+
+# ---------------------------------------------------------------------------
+# A8K4V8 cache write: NVFP4 K + FP8 V, both in the shuffled layout the gfx1250
+# unified-attention kernels read.
+# ---------------------------------------------------------------------------
+
+
+def _k4v8_ref_k_cache(k_full_bf16: torch.Tensor) -> torch.Tensor:
+    """NVFP4 K cache [num_blocks, KH, block_size, D // 2 + D // 16] from a bf16
+    [num_blocks, block_size, KH, D] cache, built by the attention tests' builders."""
+    block_size = k_full_bf16.shape[1]
+    if block_size >= 128:
+        return dynamic_nvfp4_quant_kv_cache(k_full_bf16, k_full_bf16)[0]
+    from op_tests.op_benchmarks.triton.bench_unified_attention import (
+        nvfp4_quant_shuffle_cache,
+    )
+
+    return nvfp4_quant_shuffle_cache(k_full_bf16, min(128, block_size))
+
+
+_E2M1_MAGNITUDES = (0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0)
+
+
+def _assert_nvfp4_cache_equal_up_to_ties(got, ref, x_full):
+    """Compare two shuffled NVFP4 caches [num_blocks, KH, block_size, D // 2 + D // 16].
+
+    The e4m3 scales (and everything outside the e2m1 data) must be bit-exact. An e2m1
+    code may differ from the torch reference only by one step at a rounding threshold
+    of the scaled value x / scale: the reference computes x * (1 / (amax / 6)) with
+    IEEE fp32 division, the kernel (_nvfp4_quant_op) uses Triton's fp32 division, which
+    is not correctly rounded, so where x / scale is exactly a threshold (x = amax / 8
+    gives 0.75 for bf16 inputs) the two land one ulp apart and round to the two
+    neighbouring codes. Every such difference is checked to be exactly that case.
+    x_full: the bf16 [num_blocks, block_size, KH, D] cache the reference was built from.
+    """
+    nb, kh, bs, d_cache = got.shape
+    D = d_cache * 16 // 9
+    n_data = bs * D // 2
+    g = got.reshape(nb, kh, -1)
+    r = ref.reshape(nb, kh, -1)
+    assert torch.equal(g[..., n_data:], r[..., n_data:]), "NVFP4 scales differ"
+
+    def unshuffle(c):  # inverse of shuffle_weight(arch="gfx950") on [bs, D // 2]
+        return (
+            c[..., :n_data]
+            .reshape(nb, kh, bs // 16, D // 32, 16, 16)
+            .permute(0, 1, 2, 4, 3, 5)
+            .reshape(nb, kh, bs, D // 2)
+        )
+
+    def nibbles(c):
+        c = unshuffle(c).to(torch.int32)
+        return torch.stack([c & 0xF, c >> 4], dim=-1).reshape(nb, kh, bs, D)
+
+    gn, rn = nibbles(g), nibbles(r)
+    diff = gn != rn
+    n_diff = int(diff.sum())
+    if n_diff == 0:
+        return 0
+    # the scaled value the reference rounded
+    x = x_full.permute(0, 2, 1, 3).float().reshape(nb, kh, bs, D // 16, 16)
+    scale = x.abs().amax(dim=-1, keepdim=True) / 6.0
+    qx = (x * (1.0 / scale)).reshape(nb, kh, bs, D)[diff].abs()
+    mags = torch.tensor(_E2M1_MAGNITUDES, dtype=torch.float32, device=got.device)
+    gm, rm = mags[gn[diff] & 7], mags[rn[diff] & 7]
+    assert torch.equal(gn[diff] & 8, rn[diff] & 8), "NVFP4 sign differs"
+    lo, hi = torch.minimum(gm, rm), torch.maximum(gm, rm)
+    idx_lo = torch.searchsorted(mags, lo)
+    assert torch.equal(mags[(idx_lo + 1).clamp(max=7)], hi), "codes not adjacent"
+    threshold = (lo + hi) / 2
+    assert bool(
+        ((qx - threshold).abs() <= 4 * torch.finfo(torch.float32).eps * threshold).all()
+    ), "NVFP4 code differs away from a rounding threshold"
+    return n_diff
+
+
+def _k4v8_slots(scenario: str, num_blocks: int, block_size: int):
+    """Slot mapping: decode = scattered single tokens (+ one padded -1 slot);
+    prefill = contiguous runs over a random page table, crossing page boundaries,
+    one of them continuing a cached prefix (chunked prefill)."""
+    g = torch.Generator(device="cpu").manual_seed(1)
+    if scenario == "decode":
+        slots = torch.randperm(num_blocks * block_size, generator=g)[:24]
+        slots[5] = -1
+        return slots.to(torch.int64).cuda()
+    pages = torch.randperm(num_blocks, generator=g)
+    runs = [  # (first page index, start position, number of tokens)
+        (0, 0, 2 * block_size + 37),
+        (3, 13, block_size + 20),
+        (5, 0, 5),
+    ]
+    slots = []
+    for p0, start, n in runs:
+        pos = torch.arange(start, start + n)
+        slots.append(pages[p0 + pos // block_size] * block_size + pos % block_size)
+    return torch.cat(slots).to(torch.int64).cuda()
+
+
+def _k4v8_write(T, QH, KH, D, num_blocks, block_size, slot_mapping, seed=0):
+    """Write random K/V at slot_mapping with fused_qk_rope_reshape_and_cache into
+    caches pre-filled with other random content. Returns the written caches and
+    the bf16 / fp8 full caches the reference builders turn into the same bytes."""
+    torch.manual_seed(seed)
+    q, k, _, _, freqs, positions, _, cos, sin = generate_rope_inputs(
+        1,
+        T,
+        KH,
+        QH // KH,
+        D,
+        cached=True,
+        reuse_freqs_front_part=True,
+        nope=False,
+        pos=True,
+        offs=False,
+        two_inputs=True,
+        layout="thd",
+        dtype=torch.bfloat16,
+    )
+    torch.manual_seed(seed)
+    v = torch.randn_like(k)
+    k_scale = torch.ones(1, dtype=torch.float32, device="cuda")  # k_descale = 1
+    v_scale = (v.abs().amax().float() / torch.finfo(e4m3_dtype).max).reshape(1)
+
+    # what was in the cache before this write
+    old_k = torch.randn(
+        (num_blocks, block_size, KH, D), dtype=torch.bfloat16, device="cuda"
+    )
+    old_v = torch.randn(
+        (num_blocks, block_size, KH, D), dtype=torch.bfloat16, device="cuda"
+    ).to(e4m3_dtype)
+    key_cache = _k4v8_ref_k_cache(old_k)
+    value_cache = shuffle_kv_cache(old_v, old_v)[1]
+    assert key_cache.dtype == torch.uint8 and value_cache.dtype == e4m3_dtype
+
+    _, k_out, key_cache, value_cache, _ = fused_qk_rope_reshape_and_cache(
+        q,
+        k,
+        v,
+        key_cache,
+        value_cache,
+        slot_mapping,
+        positions,
+        cos,
+        sin,
+        k_scale,
+        v_scale,
+        is_neox=True,
+        flash_layout=False,
+        apply_scale=True,
+        q_out=torch.empty_like(q),
+        k_out=torch.empty_like(k),
+    )
+
+    # reference full caches: the kernel quantizes the roped bf16 K (k_out) / k_scale,
+    # and V * (1 / v_scale) cast to fp8
+    valid = slot_mapping >= 0
+    slot_t = slot_mapping[valid] // block_size
+    slot_b = slot_mapping[valid] % block_size
+    k_full = old_k.clone()
+    k_full[slot_t, slot_b] = (k_out[valid].float() * (1.0 / k_scale)).to(torch.bfloat16)
+    v_full = old_v.clone()
+    v_full[slot_t, slot_b] = (v[valid].float() * (1.0 / v_scale)).to(e4m3_dtype)
+    return {
+        "q": q,
+        "k": k,
+        "v": v,
+        "k_out": k_out,
+        "positions": positions,
+        "freqs": freqs,
+        "key_cache": key_cache,
+        "value_cache": value_cache,
+        "k_full": k_full,
+        "v_full": v_full,
+        "v_scale": v_scale,
+    }
+
+
+@pytest.mark.parametrize("scenario", ["decode", "prefill"])
+@pytest.mark.parametrize("block_size", [64, 128])
+@pytest.mark.parametrize("D", [64, 128, 256])
+@pytest.mark.parametrize("QH, KH", [(8, 1), (16, 4)])
+def test_fused_qk_rope_reshape_and_cache_k4v8(scenario, block_size, D, QH, KH):
+    if DEVICE_ARCH not in ("gfx1250",):
+        pytest.skip("NVFP4 KV cache is only supported on GFX1250")
+    num_blocks = 8
+    slot_mapping = _k4v8_slots(scenario, num_blocks, block_size)
+    T = slot_mapping.numel()
+    r = _k4v8_write(T, QH, KH, D, num_blocks, block_size, slot_mapping)
+
+    # RoPE itself is covered by test_fused_qk_rope_reshape_and_cache; sanity only
+    ref_k = ref_rope_sbhd_fwd(
+        r["k"].unsqueeze(0),
+        r["freqs"][r["positions"]].squeeze(-2),
+        rotate_style=RotateStyle.NEOX,
+        reuse_freqs_front_part=True,
+        nope_first=False,
+    ).squeeze(0)
+    valid = slot_mapping >= 0  # k_out is only written for valid slots
+    torch.testing.assert_close(r["k_out"][valid], ref_k[valid], atol=1e-1, rtol=1e-1)
+
+    # bit-exact over the whole cache: written rows match the reference builders and
+    # nothing else (other rows, other pages, the other layout part) was touched
+    ref_key_cache = _k4v8_ref_k_cache(r["k_full"])
+    ref_value_cache = shuffle_kv_cache(r["v_full"], r["v_full"])[1]
+    assert r["key_cache"].shape == ref_key_cache.shape
+    assert r["value_cache"].shape == ref_value_cache.shape
+    # V (fp8) is bit-exact; K is bit-exact except e2m1 codes at exact rounding ties
+    assert torch.equal(
+        r["value_cache"].view(torch.uint8), ref_value_cache.view(torch.uint8)
+    ), "FP8 V cache differs"
+    n_ties = _assert_nvfp4_cache_equal_up_to_ties(
+        r["key_cache"], ref_key_cache, r["k_full"]
+    )
+    n_written = int((slot_mapping >= 0).sum()) * KH * D
+    assert n_ties <= n_written // 100, f"{n_ties} tie flips of {n_written} K values"
+
+
+@pytest.mark.parametrize("block_size", [64, 128])
+@pytest.mark.parametrize("QH, KH", [(8, 1), (32, 4)])
+@torch.inference_mode()
+def test_k4v8_cache_write_unified_attention(block_size, QH, KH):
+    """Write an A8K4V8 cache with fused_qk_rope_reshape_and_cache and run
+    unified_attention (FP8 Q, NVFP4 K, FP8 V, shuffled) on it, against
+    ref_paged_attn on the dequantized K and the fp8 V with its descale."""
+    if DEVICE_ARCH not in ("gfx1250",):
+        pytest.skip("A8K4V8 attention is only supported on GFX1250")
+    from aiter.ops.triton.attention.unified_attention import unified_attention
+    from op_tests.op_benchmarks.triton.bench_unified_attention import (
+        nvfp4_quant_dequant,
+        quantize_to_fp8,
+    )
+    from op_tests.triton_tests.attention.test_unified_attention import (
+        ref_paged_attn,
+    )
+
+    D = 128
+    num_blocks = 64
+    seq_lens = [(1, 1328), (7, 523), (64, 300), (1, 37)]  # (query_len, kv_len)
+    max_pages = max((kv + block_size - 1) // block_size for _, kv in seq_lens)
+    g = torch.Generator(device="cpu").manual_seed(2)
+    pages = torch.randperm(num_blocks, generator=g)
+    block_tables = torch.zeros((len(seq_lens), max_pages), dtype=torch.int32)
+    slots, p = [], 0
+    for i, (_, kv) in enumerate(seq_lens):
+        n = (kv + block_size - 1) // block_size
+        block_tables[i, :n] = pages[p : p + n]
+        p += n
+        pos = torch.arange(kv)
+        slots.append(
+            block_tables[i, pos // block_size].long() * block_size + pos % block_size
+        )
+    slot_mapping = torch.cat(slots).cuda()
+    block_tables = block_tables.cuda()
+    T = slot_mapping.numel()
+
+    # the whole KV of every sequence is written by the kernel (prefill-style)
+    r = _k4v8_write(T, QH, KH, D, num_blocks, block_size, slot_mapping, seed=3)
+    _assert_nvfp4_cache_equal_up_to_ties(
+        r["key_cache"], _k4v8_ref_k_cache(r["k_full"]), r["k_full"]
+    )
+    assert torch.equal(
+        r["value_cache"].view(torch.uint8),
+        shuffle_kv_cache(r["v_full"], r["v_full"])[1].view(torch.uint8),
+    )
+
+    query_lens = [s[0] for s in seq_lens]
+    kv_lens = [s[1] for s in seq_lens]
+    query = torch.randn(sum(query_lens), QH, D, dtype=torch.bfloat16, device="cuda")
+    q_fp8, q_descale = quantize_to_fp8(query)
+    cu_q = torch.tensor([0] + query_lens, dtype=torch.int32, device="cuda").cumsum(
+        0, dtype=torch.int32
+    )
+    kv_lens_t = torch.tensor(kv_lens, dtype=torch.int32, device="cuda")
+    k_descale = torch.ones(1, dtype=torch.float32, device="cuda")
+    v_descale = r["v_scale"]
+    scale = D**-0.5
+    out = torch.empty(sum(query_lens), QH, D, dtype=torch.bfloat16, device="cuda")
+    unified_attention(
+        q=q_fp8,
+        k=r["key_cache"],
+        v=r["value_cache"],
+        out=out,
+        cu_seqlens_q=cu_q,
+        max_seqlen_q=max(query_lens),
+        seqused_k=kv_lens_t,
+        max_seqlen_k=max(kv_lens),
+        softmax_scale=scale,
+        causal=True,
+        window_size=(-1, -1),
+        block_table=block_tables,
+        softcap=0,
+        q_descale=q_descale,
+        k_descale=k_descale,
+        v_descale=v_descale,
+        shuffled_kv_cache=True,
+    )
+    ref = ref_paged_attn(
+        query=q_fp8.to(torch.float32) * q_descale,
+        key_cache=nvfp4_quant_dequant(r["k_full"]),
+        value_cache=r["v_full"],
+        query_lens=query_lens,
+        kv_lens=kv_lens,
+        block_tables=block_tables,
+        scale=scale,
+        out_dtype=torch.bfloat16,
+        k_descale=k_descale,
+        v_descale=v_descale,
+    )
+    max_diff = (out.float() - ref.float()).abs().max().item()
+    rel_l2 = ((out.float() - ref.float()).norm() / ref.float().norm()).item()
+    # control: the same attention on a K cache with the pages' rows rotated must miss
+    ref_bad = ref_paged_attn(
+        query=q_fp8.to(torch.float32) * q_descale,
+        key_cache=nvfp4_quant_dequant(r["k_full"]).roll(1, dims=1),
+        value_cache=r["v_full"],
+        query_lens=query_lens,
+        kv_lens=kv_lens,
+        block_tables=block_tables,
+        scale=scale,
+        out_dtype=torch.bfloat16,
+        k_descale=k_descale,
+        v_descale=v_descale,
+    )
+    rel_l2_bad = ((out.float() - ref_bad.float()).norm() / ref.float().norm()).item()
+    print(
+        f"A8K4V8 e2e block_size={block_size} QH={QH} KH={KH}: max|ref|="
+        f"{ref.float().abs().max().item():.4f} max|diff|={max_diff:.5f} "
+        f"rel_l2={rel_l2:.5f} (rows-rotated K control: {rel_l2_bad:.4f})"
+    )
+    assert rel_l2 < 0.05
+    torch.testing.assert_close(out.float(), ref.float(), atol=1.5e-1, rtol=1.5e-1)
+
+
+@pytest.mark.parametrize("scenario", ["decode", "prefill"])
+@pytest.mark.parametrize("block_size", [64, 128])
+@pytest.mark.parametrize("D", [128, 256])
+@pytest.mark.parametrize("KH", [1, 2, 4])
+@pytest.mark.parametrize("packed", [False, True])
+def test_reshape_and_cache_k4v8(scenario, block_size, D, KH, packed):
+    """The write-only A8K4V8 op: bit-exact V and K up to NVFP4 rounding ties against the
+    reference builders over the whole cache, and byte-identical to the cache write of
+    fused_qk_rope_reshape_and_cache given that kernel's own roped K."""
+    if DEVICE_ARCH not in ("gfx1250",):
+        pytest.skip("NVFP4 KV cache is only supported on GFX1250")
+    num_blocks = 8
+    QH = 4 * KH
+    slot_mapping = _k4v8_slots(scenario, num_blocks, block_size)
+    T = slot_mapping.numel()
+    # the fused rope + cache write, as reference bytes and as the source of a roped K
+    r = _k4v8_write(T, QH, KH, D, num_blocks, block_size, slot_mapping, seed=7)
+    k_roped, v = r["k_out"], r["v"]
+    if packed:
+        # strided views into one packed [T, (QH + 2 KH) * D] tensor, as ATOM splits qkv
+        qkv = torch.empty((T, (QH + 2 * KH) * D), dtype=torch.bfloat16, device="cuda")
+        qkv[:, QH * D : (QH + KH) * D] = k_roped.reshape(T, KH * D)
+        qkv[:, (QH + KH) * D :] = v.reshape(T, KH * D)
+        k_in = qkv[:, QH * D : (QH + KH) * D].view(T, KH, D)
+        v_in = qkv[:, (QH + KH) * D :].view(T, KH, D)
+    else:
+        k_in, v_in = k_roped, v
+    k_scale = torch.ones(1, dtype=torch.float32, device="cuda")  # k_descale = 1
+    v_scale = r["v_scale"]
+
+    # 1) the same bytes as the fused rope + cache write: re-writing its rows from its own
+    #    roped K into its output caches must leave every byte as it is
+    key_cache, value_cache = r["key_cache"].clone(), r["value_cache"].clone()
+    reshape_and_cache_k4v8(
+        k_in, v_in, key_cache, value_cache, slot_mapping, k_scale, v_scale
+    )
+    assert torch.equal(
+        key_cache, r["key_cache"]
+    ), "K cache differs from fused_qk_rope_reshape_and_cache"
+    assert torch.equal(
+        value_cache.view(torch.uint8), r["value_cache"].view(torch.uint8)
+    ), "V cache differs from fused_qk_rope_reshape_and_cache"
+
+    # 2) into fresh random caches, against the torch reference builders over the whole cache
+    #    (written rows match, nothing else touched)
+    torch.manual_seed(11)
+    old_k = torch.randn(
+        (num_blocks, block_size, KH, D), dtype=torch.bfloat16, device="cuda"
+    )
+    old_v = torch.randn(
+        (num_blocks, block_size, KH, D), dtype=torch.bfloat16, device="cuda"
+    ).to(e4m3_dtype)
+    key_cache = _k4v8_ref_k_cache(old_k)
+    value_cache = shuffle_kv_cache(old_v, old_v)[1]
+    reshape_and_cache_k4v8(
+        k_in, v_in, key_cache, value_cache, slot_mapping, k_scale, v_scale
+    )
+    valid = slot_mapping >= 0
+    slot_t, slot_b = slot_mapping[valid] // block_size, slot_mapping[valid] % block_size
+    k_full = old_k.clone()
+    k_full[slot_t, slot_b] = k_roped[valid]
+    v_full = old_v.clone()
+    v_full[slot_t, slot_b] = (v[valid].float() * (1.0 / v_scale)).to(e4m3_dtype)
+    ref_value_cache = shuffle_kv_cache(v_full, v_full)[1]
+    assert torch.equal(
+        value_cache.view(torch.uint8), ref_value_cache.view(torch.uint8)
+    ), "FP8 V cache differs from the reference"
+    n_ties = _assert_nvfp4_cache_equal_up_to_ties(
+        key_cache, _k4v8_ref_k_cache(k_full), k_full
+    )
+    n_written = int(valid.sum()) * KH * D
+    assert n_ties <= n_written // 100, f"{n_ties} tie flips of {n_written} K values"

@@ -98,7 +98,9 @@ FAMILIES = [
     ),
     ("AITER_CONFIG_CONV3D_BF16", "bf16_tuned_conv3d"),
     ("AITER_CONFIG_FMOE", "tuned_fmoe"),
+    ("AITER_CONFIG_FMOE_SWIGLU_LIMIT", "tuned_swiglu_limit_fmoe"),
     ("AITER_CONFIG_FHMOE", "tuned_fhmoe"),
+    ("AITER_CONFIG_MQA_LOGITS", "tuned_mqa_logits"),
     ("AITER_CONFIG_GROUPED_FMOE", "tuned_grouped_fmoe"),
     ("AITER_CONFIG_GDN_K5_OPT", "chunk_gdn_h_opt_tuned"),
     ("AITER_CONFIG_PAGED_MQA_LOGITS", "paged_mqa_logits_tuned"),
@@ -477,6 +479,12 @@ class TestConfigShapeCollision(unittest.TestCase):
 
     def test_fmoe(self):
         self._check_family("AITER_CONFIG_FMOE", "tuned_fmoe")
+
+    def test_fmoe_swiglu_limit(self):
+        self._check_family("AITER_CONFIG_FMOE_SWIGLU_LIMIT", "tuned_swiglu_limit_fmoe")
+
+    def test_mqa_logits(self):
+        self._check_family("AITER_CONFIG_MQA_LOGITS", "tuned_mqa_logits")
 
     def test_fhmoe(self):
         merged = self._resolve(
