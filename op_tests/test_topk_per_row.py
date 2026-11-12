@@ -1445,8 +1445,15 @@ def _scratch_harness(width, top_k):
         if stable:
             ok = torch.equal(out.long(), stable_reference(logits, top_k))
         else:
-            want = logits.topk(top_k, dim=-1)[1].sort(dim=-1)[0]
-            ok = torch.equal(out.long().sort(dim=-1)[0], want)
+            ends = torch.full((logits.shape[0],), width, dtype=torch.int32)
+            ok = compare_topk_results(
+                logits,
+                out.long(),
+                logits.topk(top_k, dim=-1)[1],
+                torch.zeros_like(ends),
+                ends,
+                top_k,
+            )
         assert ok, what
 
     return inputs, decode, check
