@@ -3283,7 +3283,8 @@ void fused_qk_norm_rope_cache_pts_quant_shuffle(aiter_tensor_t& qkv,
                                                 int64_t rotary_dim,
                                                 bool v_norm,
                                                 std::optional<aiter_tensor_t> q_out_fp8,
-                                                std::optional<aiter_tensor_t> per_tensor_q_scale)
+                                                std::optional<aiter_tensor_t> per_tensor_q_scale,
+                                                std::optional<aiter_tensor_t> k_out_unquantized)
 {
     AITER_CHECK(qkv.is_contiguous() && qw.is_contiguous() && kw.is_contiguous() &&
                 cos_sin.is_contiguous());
@@ -3299,6 +3300,22 @@ void fused_qk_norm_rope_cache_pts_quant_shuffle(aiter_tensor_t& qkv,
     AITER_CHECK(has_q_out_fp8 == has_q_scale,
                 "q_out_fp8 and per_tensor_q_scale must be provided together");
 
+    AITER_CHECK(num_tokens >= 0 && head_size > 0,
+                "num_tokens must be non-negative and head_size must be positive");
+    const size_t tokens = static_cast<size_t>(num_tokens);
+    const size_t dim    = static_cast<size_t>(head_size);
+    // Element count of a [num_tokens, heads, head_size] output, guarding overflow.
+    auto required_numel = [&](int64_t heads) {
+        AITER_CHECK(heads > 0, "head count must be positive");
+        AITER_CHECK(tokens == 0 ||
+                        static_cast<size_t>(heads) <= std::numeric_limits<size_t>::max() / tokens,
+                    "num_tokens * heads overflows size_t");
+        const size_t token_heads = tokens * static_cast<size_t>(heads);
+        AITER_CHECK(token_heads == 0 || dim <= std::numeric_limits<size_t>::max() / token_heads,
+                    "num_tokens * heads * head_size overflows size_t");
+        return token_heads * dim;
+    };
+
     if(has_q_out_fp8)
     {
         const auto& q_fp8   = *q_out_fp8;
@@ -3310,18 +3327,7 @@ void fused_qk_norm_rope_cache_pts_quant_shuffle(aiter_tensor_t& qkv,
         CHECK_TYPE(q_scale, AITER_DTYPE_fp32);
         AITER_CHECK(q_fp8.device_id == qkv.device_id && q_scale.device_id == qkv.device_id,
                     "q_out_fp8 and per_tensor_q_scale must be on the same GPU as qkv");
-        AITER_CHECK(num_tokens >= 0 && num_heads_q > 0 && head_size > 0,
-                    "num_tokens must be non-negative and num_heads_q/head_size must be positive");
-
-        const size_t tokens = static_cast<size_t>(num_tokens);
-        const size_t heads  = static_cast<size_t>(num_heads_q);
-        const size_t dim    = static_cast<size_t>(head_size);
-        AITER_CHECK(tokens == 0 || heads <= std::numeric_limits<size_t>::max() / tokens,
-                    "num_tokens * num_heads_q overflows size_t");
-        const size_t token_heads = tokens * heads;
-        AITER_CHECK(token_heads == 0 || dim <= std::numeric_limits<size_t>::max() / token_heads,
-                    "num_tokens * num_heads_q * head_size overflows size_t");
-        const size_t required_q_elements = token_heads * dim;
+        const size_t required_q_elements = required_numel(num_heads_q);
         AITER_CHECK(q_fp8.numel() >= required_q_elements,
                     "q_out_fp8 must contain at least ",
                     required_q_elements,
@@ -3332,6 +3338,25 @@ void fused_qk_norm_rope_cache_pts_quant_shuffle(aiter_tensor_t& qkv,
                     q_scale.numel());
         AITER_CHECK(k_cache.dtype() == AITER_DTYPE_fp8,
                     "q_out_fp8 is supported only with an fp8 KV cache");
+    }
+
+    if(k_out_unquantized.has_value())
+    {
+        const auto& k_out_unquantized_ = *k_out_unquantized;
+
+        AITER_CHECK(return_kv, "k_out_unquantized requires return_kv=True");
+        CHECK_INPUT(k_out_unquantized_);
+        CHECK_TYPE(k_out_unquantized_, qkv.dtype());
+        AITER_CHECK(k_out_unquantized_.device_id == qkv.device_id,
+                    "k_out_unquantized must be on the same GPU as qkv");
+        AITER_CHECK(k_cache.dtype() == AITER_DTYPE_fp8,
+                    "k_out_unquantized is supported only with an fp8 KV cache");
+        const size_t required_k_elements = required_numel(num_heads_k);
+        AITER_CHECK(k_out_unquantized_.numel() >= required_k_elements,
+                    "k_out_unquantized must contain at least ",
+                    required_k_elements,
+                    " elements, got ",
+                    k_out_unquantized_.numel());
     }
 
     HipDeviceGuard device_guard(qkv.device_id);
@@ -3357,6 +3382,9 @@ void fused_qk_norm_rope_cache_pts_quant_shuffle(aiter_tensor_t& qkv,
     VLLM_DISPATCH_FLOATING_TYPES_rmTorch(
         qkv_dtype, "fused_qk_norm_rope_cache_pts_quant_shuffle", [&] {
             using T = scalar_t;
+            T* k_out_unquantized_ptr = k_out_unquantized.has_value()
+                                           ? reinterpret_cast<T*>(k_out_unquantized->data_ptr())
+                                           : nullptr;
             if(kv_cache_dtype == qkv_dtype)
             {
                 T* k_out_ptr = (return_kv && k_out.has_value())
@@ -3457,7 +3485,8 @@ void fused_qk_norm_rope_cache_pts_quant_shuffle(aiter_tensor_t& qkv,
                             v_cache_head_stride,
                             v_norm,
                             q_out_fp8_ptr,
-                            per_tensor_q_scale_ptr);
+                            per_tensor_q_scale_ptr,
+                            k_out_unquantized_ptr);
                     }
                     else
                     {
@@ -3511,7 +3540,8 @@ void fused_qk_norm_rope_cache_pts_quant_shuffle(aiter_tensor_t& qkv,
                             v_cache_head_stride,
                             v_norm,
                             q_out_fp8_ptr,
-                            per_tensor_q_scale_ptr);
+                            per_tensor_q_scale_ptr,
+                            k_out_unquantized_ptr);
                     }
                 }
                 else
@@ -5076,7 +5106,7 @@ namespace aiter {
       // in the coarse kernel's dynamic LDS, which only the TDM build allocates, so
       // this is off wherever the ring is off.
       constexpr bool kMergeQScaleStoreOk =
-#if defined(__gfx1250__)
+#if defined(__gfx1250__) || defined(__gfx1250_strict__)
           Q_TDM_DEPTH > 0 && (nope_dim % vec_size_o) == 0
           && (static_cast<int32_t>(nope_vec) + kScaleCarrierSlots) <= WARP_SIZE
           && static_cast<size_t>(kScaleCarrierSlots) * vec_size_o <= kQScaleGatherBytes;
@@ -5128,7 +5158,7 @@ namespace aiter {
       // Per-wave scratch for the e8m0 scale gather, immediately after the TDM
       // ring. Sized and reserved by the launcher (kQScaleGatherBytes).
       [[maybe_unused]] uint16_t* q_scale_lds = nullptr;
-#if defined(__gfx1250__)
+#if defined(__gfx1250__) || defined(__gfx1250_strict__)
       extern __shared__ char fqk_coarse_lds[];
       if constexpr (Q_TDM_DEPTH > 0) {
         const int32_t wave_in_blk = static_cast<int32_t>(threadIdx.x) / WARP_SIZE;
@@ -5249,7 +5279,7 @@ namespace aiter {
         // Ring slot this head reads. Carried out of the block below so the refill
         // site, which runs after the reduce, can hand it to the next head.
         [[maybe_unused]] int32_t q_read_slot = 0;
-#if defined(__gfx1250__)
+#if defined(__gfx1250__) || defined(__gfx1250_strict__)
         if constexpr (Q_TDM_DEPTH > 0) {
           const int32_t slot = q_slot;
           q_read_slot = slot;
@@ -5322,7 +5352,7 @@ namespace aiter {
         const float amax_raw = fmaxf(amax2.x, amax2.y);
         (void)amax_raw;
 
-#if defined(__gfx1250__)
+#if defined(__gfx1250__) || defined(__gfx1250_strict__)
         if constexpr (Q_TDM_DEPTH > 0) {
           // Refill the slot the PREVIOUS head read, not the one just read.
           //
@@ -6635,7 +6665,7 @@ void fused_qk_norm_rope_group_quant(
   //    also keys on H is the likely next refinement, but that needs more shapes
   //    than this change was measured against.
   const std::string gpu_arch = get_gpu_arch();
-  const bool has_tdm = gpu_arch == "gfx1250";
+  const bool has_tdm = (gpu_arch == "gfx1250" || gpu_arch == "gfx1250-strict");
   const int LARGE_PREFILL_THRESHOLD =
       has_tdm ? 16 : 48;  // med -> large (blocks/CU)
   // large -> xlarge at 64 blocks/CU, not 300.
