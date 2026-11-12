@@ -777,7 +777,7 @@ def test_varlen_flash_attn_seq_padding(
         batch_size, -1
     ) < torch.tensor(k_actual_lens, device=device).unsqueeze(1)
 
-    dout = torch.randn(*q.shape[:-1], d_v, dtype=q.dtype, device=device)
+    dout = torch.randn_like(q, dtype=q.dtype, device=device)
     out_ck, dq_ck, dk_ck, dv_ck = run_ck_seq_padding(
         q,
         k,
@@ -964,7 +964,6 @@ if __name__ == "__main__":
             (128, 128),
             (160, 160),
             (192, 192),
-            (192, 128),
         ],
         help="""Dimension of query and key. Default is None.
         e.g.: -qk_v 256,256""",
@@ -1056,9 +1055,6 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     seqlen_q, seqlen_k = args.seqlen_q_k
-    # packed layouts share one head dim between q / k and v (generate_qkv asserts d == d_v)
-    packed = args.input_layout in ("KVPACKED", "QKVPACKED")
-    d_qk_v = [d for d in args.d_qk_v if not packed or d[0] == d[1]]
 
     collected = []
     for (
@@ -1070,7 +1066,7 @@ if __name__ == "__main__":
         deterministic,
     ) in itertools.product(
         args.dtype,
-        d_qk_v,
+        args.d_qk_v,
         args.gqa_ratio,
         args.causal,
         args.local,

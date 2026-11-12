@@ -280,20 +280,29 @@ float fmha_v3_bwd(mha_bwd_args a, const ck_tile::stream_config& s)
     {
         return -1;
     }
+    // The asm kernels take no sink, so d_sink would be left unwritten.
+    if(a.sink_ptr != nullptr || a.d_sink_ptr != nullptr)
+    {
+        return -1;
+    }
     // gfx942 hdim_q 192 (hdim_v 192 or 128): the hd192 / hd192_128 pssk kernels take precedence
-    // over the a32 psskddv ones, which keep hdim_q in (128, 192).  They run dK/dV workgroups
-    // (4 GEMMs, 128 keys each) and dQ workgroups (3 GEMMs, 128 queries each) in one dispatch and
-    // write dq / dk / dv once, so they are a16 rows without dq_acc or post kernel.  They write
-    // dq with q's strides and take lse / d as [b, h, s] in batch mode; other hdim_q 192 calls
-    // keep the requested kernels (psskddv for a32 at hdim_v 192).
-    const bool hd192 = arch_id == "gfx942" && a.hdim_q == 192 && a.stride_dq == a.stride_q &&
-                       a.nhead_stride_dq == a.nhead_stride_q &&
-                       (a.is_group_mode || a.batch == 1 ||
-                        (a.batch_stride_dq == a.batch_stride_q &&
-                         a.batch_stride_lsed == a.nhead_q * a.nhead_stride_lsed));
-    if(hd192)
+    // over the a32 psskddv ones, which keep hdim_q in (128, 192).  These 7-GEMM (g7) kernels run
+    // dK/dV workgroups (4 GEMMs, 128 keys each) and dQ workgroups (3 GEMMs, 128 queries each) in
+    // one dispatch and write dq / dk / dv once, so they are a16 rows without dq_acc or post
+    // kernel.  They write dq with q's strides, whose batch stride only matters in batch mode with
+    // batch > 1.  Other hdim_q 192 calls keep the requested kernels: psskddv for a32 at
+    // hdim_v 192, none for a16, the g7 rows being the only a16 hdim_q 192 ones.
+    const bool gfx942_g7_hd192 =
+        arch_id == "gfx942" && a.hdim_q == 192 && (a.hdim_v == 192 || a.hdim_v == 128) &&
+        a.stride_dq == a.stride_q && a.nhead_stride_dq == a.nhead_stride_q &&
+        (a.is_group_mode || a.batch == 1 || a.batch_stride_dq == a.batch_stride_q);
+    if(gfx942_g7_hd192)
     {
         a.v3_atomic_fp32 = false;
+    }
+    else if(arch_id == "gfx942" && a.hdim_q == 192 && !a.v3_atomic_fp32)
+    {
+        return -1;
     }
 
     // ASM mask type
@@ -381,11 +390,11 @@ float fmha_v3_bwd(mha_bwd_args a, const ck_tile::stream_config& s)
     {
         return -1;
     }
-    // On gfx942, a16 (atomic32=0) has no mask_type=2 (bottom-right causal) kernels,
-    // only mask_type=1 (top-left causal). When seqlen_q == seqlen_k the two masks
+    // On gfx942, the a16 (atomic32=0) hd64 / hd128 kernels have no mask_type=2 (bottom-right
+    // causal), only mask_type=1 (top-left causal). When seqlen_q == seqlen_k the two masks
     // are mathematically equivalent, so we can safely convert 2 → 1 to hit the
     // existing a16 causal kernels. Group mode is left out: there a batch's seqlen_q and
-    // seqlen_k can differ, and the a16 hdim_q 192 group kernels have both masks.
+    // seqlen_k can differ.
     // See config: hsa/gfx942/fmha_v3_bwd/fmha_bwd_dqdkdv.csv
     if(arch_id == "gfx942" && !a.v3_atomic_fp32 && mt == 2 && !a.is_group_mode &&
        a.seqlen_q == a.seqlen_k)
@@ -415,15 +424,6 @@ float fmha_v3_bwd(mha_bwd_args a, const ck_tile::stream_config& s)
                                                                          post_cfgs);
 
     if((pre_kernel == "") || (dqdkdv_kernel == ""))
-    {
-        return -1;
-    }
-    // The gfx942 a16 hdim_q 192 rows are the pssk kernels only, which compute no d_sink.
-    if(arch_id == "gfx942" && a.hdim_q == 192 && !a.v3_atomic_fp32 && !hd192)
-    {
-        return -1;
-    }
-    if(hd192 && (a.sink_ptr != nullptr || a.d_sink_ptr != nullptr))
     {
         return -1;
     }
@@ -516,8 +516,7 @@ float fmha_v3_bwd(mha_bwd_args a, const ck_tile::stream_config& s)
     odo_args.BAs_d           = a.batch_stride_lsed * 4;
     odo_args.Seqs_d          = 1 * 4;
     odo_args.seqlen_q        = a.seqlen_q;
-    // D = rowsum(dO * O) runs over the v head dim; gfx942 192/128 pairs with the hd128 odo
-    odo_args.head_dim        = hd192 ? a.hdim_v : a.hdim_q;
+    odo_args.head_dim        = a.hdim_v;
     odo_args.ptr_qseq_padded = a.seqstart_q_ptr;
     odo_args.ptr_qseq =
         (a.cu_seqlen_q_ptr && a.seqstart_q_ptr) ? a.cu_seqlen_q_ptr : a.seqstart_q_ptr;
@@ -722,8 +721,8 @@ float fmha_v3_bwd(mha_bwd_args a, const ck_tile::stream_config& s)
 #endif
     }
 
-    if(hd192 && a.is_group_mode)
-    { // the hdim_q 192 kernels size their job lists from seqlen_q / seqlen_k
+    if(gfx942_g7_hd192 && a.is_group_mode)
+    { // the g7 kernels size their job lists from seqlen_q / seqlen_k
         dqdkdv_args.seqlen_q = a.max_seqlen_q;
         dqdkdv_args.seqlen_k = a.max_seqlen_k;
     }
@@ -747,7 +746,7 @@ float fmha_v3_bwd(mha_bwd_args a, const ck_tile::stream_config& s)
         { // mask kb
             gdx = (gdx + 1) / 2;
         }
-        if(hd192)
+        if(gfx942_g7_hd192)
         { // ceil(max_seqlen_k / 128) dK/dV + ceil(max_seqlen_q / 128) dQ ranks per (head, batch).
           // Rank-major (nhead_q, batch, ranks) hands the longest jobs out first.  Once one batch
           // alone fills the GPU, batch-major (nhead_q * ranks, batch, 1) keeps the running
