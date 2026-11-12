@@ -136,6 +136,8 @@ def test_exact_sigmoid_topk_matches_torch(
         weights,
         ids,
     )
+    # The unaligned view keeps biased_grouped_topk on the Triton kernel.
+    assert not topk_ops._gfx1250_reg_mw_fits(logits, bias, weights, ids)
     topk_ops.biased_grouped_topk(
         logits,
         bias,
@@ -190,8 +192,10 @@ def test_exact_sigmoid_topk_matches_torch(
     ],
 )
 def test_exact_sigmoid_topk_herd_widths(experts, topk, rows, need_renorm, bias_dtype):
-    """K+1 widths pad their slots to a power of two and mask the stores, and an
-    FP32 bias (Kimi-K3's) takes the same path as a BF16 one."""
+    """The Triton kernel pads K+1 widths to a power of two and masks the
+    stores, with a BF16 or an FP32 bias (Kimi-K3's). biased_grouped_topk sends
+    these aligned rows to the HIP multi-wave kernel, so the test calls the
+    Triton kernel itself and checks it against the HIP one."""
     torch.manual_seed(experts * topk + rows)
     logits = torch.randn((rows, experts), dtype=torch.bfloat16, device="cuda")
     bias = (torch.randn(experts, device="cuda", dtype=torch.float32) * 0.1).to(
@@ -212,17 +216,14 @@ def test_exact_sigmoid_topk_herd_widths(experts, topk, rows, need_renorm, bias_d
     weights, ids = weights_buf[:, :topk], ids_buf[:, :topk]
 
     assert topk_ops._can_use_gfx1250_exact_sigmoid_topk(logits, bias, weights, ids)
-    topk_ops.biased_grouped_topk(
-        logits, bias, weights, ids, 1, 1, need_renorm, 2.5, num_valid_rows
+    topk_ops._gfx1250_exact_sigmoid_topk(
+        logits, bias, weights, ids, need_renorm, 2.5, num_valid_rows
     )
 
     assert torch.equal(ids, expected_ids)
     torch.testing.assert_close(weights, expected_weights, atol=2e-5, rtol=2e-5)
     assert torch.all(ids_buf[:, topk:] == -7)
     assert torch.all(weights_buf[:, topk:] == -7.0)
-    if bias_dtype != logits.dtype:
-        # The wave32 HIP kernel aborts on a bias of another dtype.
-        return
     hip_weights = torch.empty_like(weights)
     hip_ids = torch.empty_like(ids)
     topk_ops.biased_grouped_topk_hip(
