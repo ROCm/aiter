@@ -265,6 +265,19 @@ def _check3_cases():
     for il in (False, True):
         cases.append((f"empty_q_causal_il{int(il)}", eq, ekv, True, 16, il))
     cases.append(("empty_q_noncausal_router", eq, ekv, False, 16, None))
+    # Packed slot starts (prefix sum of ceil(len / BLOCK_Q)): many sequences shorter than BLOCK_Q, and
+    # short/long mixes, across one, two and three scan chunks.
+    for B in (40, 64, 129):
+        rnd = random.Random(1000 + B)
+        sq = [rnd.randint(1, 7) for _ in range(B)]
+        skv = [q + rnd.randint(0, 200) for q in sq]
+        for g in (16, 4):
+            cases.append((f"B{B}_short_q_noncausal_G{g}", sq, skv, False, g, None))
+            cases.append((f"B{B}_short_q_causal_G{g}", sq, skv, True, g, False))
+        mq = [rnd.choice((1, 3, 92, 93, 300)) for _ in range(B)]
+        mkv = [q + rnd.randint(0, 500) for q in mq]
+        cases.append((f"B{B}_mixed_q_causal", mq, mkv, True, 16, False))
+        cases.append((f"B{B}_mixed_q_noncausal_G4", mq, mkv, False, 4, None))
     # Uniform q with ragged KV under forced rank-major: the uniform test passes and rank-major runs.
     cases.append(
         (

@@ -911,10 +911,11 @@ class DualwaveFp8KernelContext:
     def _init_compact_sequence(self, cuq_div, cuk_div, cu_atom, cu_v1i32):
         """Map this workgroup's slot to (sequence, q-block) with a wave-wide scan of cu_seqlens_q.
 
-        With c[b] = cu_q[b] - cu_q[0], sequence b owns slots [c[b] // BLOCK_Q + b, c[b + 1] // BLOCK_Q + b + 1):
-        at least ceil(len_b / BLOCK_Q) of them, total_q // BLOCK_Q + B in all, with no max_seqlen_q x B padding.
-        Lane l of chunk c holds cu_q[64 c + l] and seqused_k[64 c + l]; BATCH_CHUNKS >= ceil((B + 1) / 64) so
-        cu_q[B], the last sequence's end, has a lane too. Spare slots map past their sequence's end (no rows).
+        Sequence b owns slots [start[b], start[b + 1]) with start[b] = sum_{i<b} ceil(len_i / BLOCK_Q): real
+        blocks pack contiguously and the grid's total_q // BLOCK_Q + B slots leave all spares at the tail, so
+        spares do not shift real workgroups across XCDs/CUs. Lane l of chunk c holds cu_q[64 c + l] and
+        seqused_k[64 c + l]; BATCH_CHUNKS >= ceil((B + 1) / 64) so cu_q[B], the last sequence's end, has a lane
+        too. Lane l scans ceil(len_{l-1} / BLOCK_Q) to start[l]; slots past start[B] map past the last end (no rows).
         """
         traits = self.traits
         block_q = traits.BLOCK_M // traits.GQA_GROUP_SIZE
@@ -925,7 +926,8 @@ class DualwaveFp8KernelContext:
         lane = fx.Int32(self.lane)
         count = fx.Int32(0)
         n_bad = fx.Int32(0)
-        cu_lanes, kv_lanes = [], []
+        carry = fx.Int32(0)
+        cu_lanes, kv_lanes, start_lanes = [], [], []
         for c in range_constexpr(traits.BATCH_CHUNKS):
             l_i32 = lane + fx.Int32(c * warp)
             # Lanes past the batch re-read the last entry rather than run off the tensor.
@@ -955,7 +957,38 @@ class DualwaveFp8KernelContext:
                 # Slots count from cu_q[0], which need not be 0. Raw rocdl op: no stable uniform-broadcast API.
                 self.cu_q0 = fx.Int32(rocdl.readfirstlane(T.i32, as_mlir_value(cu_l)))
             rel = cu_l - self.cu_q0
-            start_l = fx.Int32(fx.arith.shrui(rel, q_shift)) + l_i32
+            # Lane l takes cu_q[l - 1]; lane 0 takes the previous chunk's last entry (itself in chunk 0: len 0).
+            if const_expr(c == 0):
+                prev_last = cu_l
+            else:
+                # Raw rocdl op: no stable uniform-broadcast API.
+                prev_last = fx.Int32(
+                    rocdl.readlane(
+                        T.i32,
+                        as_mlir_value(cu_lanes[c - 1]),
+                        as_mlir_value(fx.Int32(warp - 1)),
+                    )
+                )
+            cu_prev = (lane == fx.Int32(0)).select(
+                prev_last, fx.shuffle_up(cu_l, 1, warp)
+            )
+            start_l = fx.Int32(
+                fx.arith.shrui(cu_l - cu_prev + fx.Int32(block_q - 1), q_shift)
+            )
+            # Inclusive log-step scan of the previous sequences' block counts.
+            for k in range_constexpr(warp.bit_length() - 1):
+                off = 1 << k
+                up = fx.shuffle_up(start_l, off, warp)
+                start_l = start_l + (lane >= fx.Int32(off)).select(up, fx.Int32(0))
+            start_l = start_l + carry
+            if const_expr(c + 1 < traits.BATCH_CHUNKS):
+                # Raw rocdl op: no stable uniform-broadcast API. Carries the running start into the next chunk.
+                carry = fx.Int32(
+                    rocdl.readlane(
+                        T.i32, as_mlir_value(start_l), as_mlir_value(fx.Int32(warp - 1))
+                    )
+                )
+            start_lanes.append(start_l)
             hit = (l_i32 < nb) & (start_l <= slot)
             # Raw rocdl op: no stable wave-vote API. The popcount of starts at or below the slot is b + 1.
             count = count + fx.Int32(
@@ -1001,9 +1034,7 @@ class DualwaveFp8KernelContext:
         self.seqlen_kv_v = self.kv_tok_end
         self.seqlen_kv_i32 = fx.Int32(self.seqlen_kv_v)
 
-        rank = slot - (
-            fx.Int32(fx.arith.shrui(q_base_i32 - self.cu_q0, q_shift)) + b_i32
-        )
+        rank = slot - _lane_value(start_lanes, b_i32)
         if const_expr(traits.INTERLEAVED):
             rank = uniform.select(slot // nb, rank)
         # A sequence's q-blocks run longest-first (causal work grows with the block index, and workgroups
