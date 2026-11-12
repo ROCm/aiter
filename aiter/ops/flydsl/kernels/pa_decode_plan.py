@@ -288,6 +288,9 @@ def plan_pa_decode(
     specializes the block size (64--1024), and the window whether it is enabled.
     ``python -m aiter.aot.flydsl.pa_decode_plan`` precompiles every variant.
 
+    ``workgroup_budget=None`` takes twice the CU count; pass
+    ``pa_decode_default_workgroup_budget`` for the shape-aware default.
+
     Lengths include MTP tokens. Positive windows include each query's position;
     nonpositive windows disable them. Plans cover the MTP window union: match
     the window and query length when decoding or refreshing. Dense plans ignore
