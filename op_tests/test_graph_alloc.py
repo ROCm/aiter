@@ -95,7 +95,7 @@ def test_every_cached_scratch_comes_from_the_private_pool():
     sid = s.cuda_stream
     sites = {
         "preshuffle_split_k": _get_preshuffle_split_buffers(dev, s),
-        "a16w16_gfx950": get_split_k_buffers(s, dev, 1),
+        "a16w16_gfx950": get_split_k_buffers(s, dev),
         "a16w16_gfx1250": _split_k_counters(dev, s),
         "mxscale_fused_split_k": _fused_splitk_buffers(dev, sid, 2, 16, 256, 4),
         "a16w16_asm": _get_semaphore_workspace_keyed(dev, sid),
