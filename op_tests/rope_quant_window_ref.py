@@ -59,6 +59,17 @@ def _dequant(q, step):
     return q.view(n, dim).to(torch.bfloat16)
 
 
+def in_ref_steps(x, ref_codes, codes=None):
+    """x [N, dim] in units of the step 2^(ref_code - 127) of each group of 32, with x
+    first dequantized by its own e8m0 codes when given. An MXFP8 output then lands within
+    one e4m3 step of the exact rows in those units whatever code its rounding chose, while
+    a code off by one everywhere doubles or halves it."""
+    shift = 127.0 - ref_codes.view(torch.uint8).float()
+    if codes is not None:
+        shift += codes.view(torch.uint8).float() - 127.0
+    return x.float() * torch.exp2(shift).repeat_interleave(32, dim=-1)
+
+
 def rope_quant_window_ref(
     query,
     kv,

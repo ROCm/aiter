@@ -10,6 +10,7 @@ import random
 import torch
 
 import aiter
+from aiter.jit.utils.chip_info import get_gfx_runtime
 from aiter.test_common import perftest
 from op_tests.rope_quant_window_ref import (
     COS,
@@ -92,6 +93,34 @@ def test_packed_ring_rejected():
     return False
 
 
+def test_bad_kv_args_rejected():
+    """Arguments the kernel cannot honor raise instead of writing the wrong bytes: values
+    without scales (the scale stores would land on the query) and a kv view with a non-unit
+    inner stride (the kernel reads adjacent elements)."""
+    step = Step(5, False)
+    query = torch.zeros(5, 16, D, device=dev, dtype=torch.bfloat16)
+    kv = torch.randn(5, D, device=dev).to(torch.bfloat16)
+    o = sinks("vs", 5, 16)
+    cases = {
+        "values without scales": (kv, {"values": o["v"]}),
+        "scales without values": (kv, {"scales": o["s"]}),
+        "kv inner stride 2": (
+            torch.randn(5, 2 * D, device=dev).to(torch.bfloat16)[:, ::2],
+            {"values": o["v"], "scales": o["s"]},
+        ),
+    }
+    accepted = []
+    for name, (kv_in, kw) in cases.items():
+        q = query.clone()
+        try:
+            flydsl(q, kv_in, step.positions, kw)
+            accepted.append(name)
+        except ValueError:
+            if not torch.equal(q, query):
+                accepted.append(f"{name} (query written)")
+    return accepted
+
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
         formatter_class=argparse.RawTextHelpFormatter, description=__doc__
@@ -103,10 +132,9 @@ if __name__ == "__main__":
     parser.add_argument("--heads", type=int, nargs="*", default=[16, 128])
     parser.add_argument("--mode", type=str, nargs="*", default=MODES, choices=MODES)
     args = parser.parse_args()
-    if aiter.get_gfx() not in ("gfx950", "gfx1250"):
-        aiter.logger.warning(
-            "rope_quant_window unsupported on %s; skipping", aiter.get_gfx()
-        )
+    gfx = get_gfx_runtime()
+    if gfx not in ("gfx950", "gfx1250"):
+        aiter.logger.warning("rope_quant_window unsupported on %s; skipping", gfx)
         raise SystemExit(0)
     random.seed(1)
     torch.manual_seed(1)
@@ -127,6 +155,7 @@ if __name__ == "__main__":
     ]
     if not test_packed_ring_rejected():
         failed.append("packed byte ring accepted")
+    failed += [f"{name} accepted" for name in test_bad_kv_args_rejected()]
     if failed:
         raise SystemExit(f"{len(failed)} cases differ: {failed}")
     aiter.logger.info("rope_quant_window: every case byte exact")

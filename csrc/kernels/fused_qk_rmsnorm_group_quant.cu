@@ -1948,6 +1948,17 @@ static void fused_qk_rmsnorm_group_quant_impl(
     const hipStream_t stream = aiter::getCurrentHIPStream();
     (void)get_num_cu_func();
 
+    if(quant_is_mxfp8)
+    {
+        // MXFP8 quantizes to and decodes OCP e4m3 (max 448, bias 7); gfx942's fp8 is FNUZ.
+        // Cached: get_gpu_arch() re-queries the driver on every call.
+        static const std::string arch = get_gpu_arch();
+        AITER_CHECK(arch == "gfx950" || arch == "gfx1250",
+                    __func__,
+                    " mxfp8 needs OCP fp8 (gfx950 / gfx1250), got ",
+                    arch);
+    }
+
     if(kv_rope_quant)
     {
         AITER_CHECK(quant_is_mxfp8 && !has_residual && !output_unquantized_inp1 && !gemma_norm &&

@@ -78,6 +78,7 @@ def _lds_store_u8(lds_i32, byte_offset, value):
 @lru_cache(maxsize=64)
 def _build(
     *,
+    device,  # cache key only: a compiled handle does not launch on another GPU
     H,
     D,
     RD,
@@ -767,6 +768,14 @@ def rope_quant_window(
         return
     if heads > 0 and not query.is_contiguous():
         raise ValueError("rope_quant_window needs a contiguous query")
+    if (values is None) != (scales is None):
+        raise ValueError("rope_quant_window needs both values and scales, or neither")
+    if kv_half and kv.stride(-1) != 1:
+        raise ValueError("rope_quant_window needs a unit inner stride on kv")
+    if values is not None and (values.stride(-1) != 1 or scales.stride(-1) != 1):
+        raise ValueError(
+            "rope_quant_window needs a unit inner stride on values and scales"
+        )
     arch = _arch()
     wave = 32 if arch == "gfx1250" else 64
     pk8 = arch == "gfx1250"
@@ -829,7 +838,9 @@ def rope_quant_window(
         if step is None
         else (step.batch_ids, step.cu_seqlens_q, step.slots)
     )
+    device = query.device
     launcher = _build(
+        device=device.index,
         H=heads,
         D=dim,
         RD=rope_dim,
@@ -859,33 +870,40 @@ def rope_quant_window(
         t = query if t is None else t
         return flyc.from_c_void_p(fx.Uint8, t.data_ptr())
 
-    _run_compiled(
-        launcher,
-        flyc.from_dlpack(query.view(rows, dim)) if tdm else _dummy_tensor(query.device),
-        rows,
-        tokens,
-        gx_q,
-        ptr(query),
-        ptr(kv if kv_half else None),
-        ptr(cos),
-        ptr(sin),
-        ptr(positions),
-        ptr(qat),
-        ptr(values),
-        ptr(scales),
-        ptr(query_values),
-        ptr(query_scales),
-        ptr(pool),
-        ptr(pool_scale),
-        ptr(index[0]),
-        ptr(index[1]),
-        ptr(index[2]),
-        kv.stride(0) if kv_half else 0,
-        0 if values is None else values.stride(-2),
-        0 if scales is None else scales.stride(-2),
-        0 if pool is None else pool.stride(0) * pool.element_size(),
-        0 if pool_scale is None else pool_scale.stride(0),
-        0 if window is None else int(window.ring_start),
-        gx_q + gx_kv,
-        Stream(torch.cuda.current_stream()),
-    )
+    def launch():
+        _run_compiled(
+            launcher,
+            flyc.from_dlpack(query.view(rows, dim)) if tdm else _dummy_tensor(device),
+            rows,
+            tokens,
+            gx_q,
+            ptr(query),
+            ptr(kv if kv_half else None),
+            ptr(cos),
+            ptr(sin),
+            ptr(positions),
+            ptr(qat),
+            ptr(values),
+            ptr(scales),
+            ptr(query_values),
+            ptr(query_scales),
+            ptr(pool),
+            ptr(pool_scale),
+            ptr(index[0]),
+            ptr(index[1]),
+            ptr(index[2]),
+            kv.stride(0) if kv_half else 0,
+            0 if values is None else values.stride(-2),
+            0 if scales is None else scales.stride(-2),
+            0 if pool is None else pool.stride(0) * pool.element_size(),
+            0 if pool_scale is None else pool_scale.stride(0),
+            0 if window is None else int(window.ring_start),
+            gx_q + gx_kv,
+            Stream(torch.cuda.current_stream()),
+        )
+
+    if device.index == torch.cuda.current_device():
+        launch()
+    else:
+        with torch.cuda.device(device):
+            launch()

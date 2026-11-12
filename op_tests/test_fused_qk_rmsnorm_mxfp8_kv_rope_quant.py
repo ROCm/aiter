@@ -13,8 +13,10 @@ import argparse
 import random
 
 import torch
+import torch.nn.functional as F
 
 import aiter
+from aiter.jit.utils.chip_info import get_gfx_runtime
 from aiter.ops.fused_qk_rmsnorm_group_quant import fused_qk_rmsnorm_mxfp8_kv_rope_quant
 from aiter.ops.triton.quant.fused_mxfp8_quant import fused_dual_rmsnorm_mxfp8_quant
 from aiter.test_common import checkAllclose, perftest
@@ -26,6 +28,7 @@ from op_tests.rope_quant_window_ref import (
     Step,
     byte_diff,
     dev,
+    in_ref_steps,
     rope_quant_window_ref,
     sink_kwargs,
     sinks,
@@ -97,6 +100,18 @@ def test_fused_qk_rmsnorm_mxfp8_kv_rope_quant(mode, tokens, idx64, n1=1536):
             msg=f"{tag} q vs triton",
         )
     )
+    # The mask above drops every group whose code moved; the dequantized q, in triton's
+    # steps, still has to follow the exact normed rows everywhere.
+    q_norm = F.rms_norm(q.float(), (n1,), gq.float(), 1e-6)
+    ratios.append(
+        checkAllclose(
+            in_ref_steps(q_norm, sq_t),
+            in_ref_steps(yq, sq_t, sq),
+            rtol=0.13,
+            atol=2**-8,
+            msg=f"{tag} dequantized q vs torch",
+        )
+    )
     bad = byte_diff(ref, got)
     if max(ratios) > 0.05:
         bad["vs triton"] = max(ratios)
@@ -136,10 +151,10 @@ def test_packed_ring_rejected(n1=1536):
 
 if __name__ == "__main__":
     # The reference and the triton baseline are OCP e4m3fn, as gfx950 / gfx1250 emit.
-    if aiter.get_gfx() not in ("gfx950", "gfx1250"):
+    gfx = get_gfx_runtime()
+    if gfx not in ("gfx950", "gfx1250"):
         aiter.logger.warning(
-            "fused_qk_rmsnorm_mxfp8_kv_rope_quant unsupported on %s; skipping",
-            aiter.get_gfx(),
+            "fused_qk_rmsnorm_mxfp8_kv_rope_quant unsupported on %s; skipping", gfx
         )
         raise SystemExit(0)
     parser = argparse.ArgumentParser(

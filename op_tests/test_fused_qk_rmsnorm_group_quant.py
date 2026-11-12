@@ -10,6 +10,7 @@ import torch.nn.functional as F
 
 import aiter
 from aiter import dtypes
+from aiter.jit.utils.chip_info import get_gfx_runtime
 from aiter.ops.fused_qk_rmsnorm_group_quant import fused_qk_rmsnorm_group_quant
 from aiter.ops.triton.quant.fused_fp8_quant import fused_rms_fp8_group_quant
 from aiter.ops.triton.quant.fused_mxfp4_quant import fused_rms_mxfp4_quant
@@ -85,6 +86,18 @@ def _per_token_group_mxfp8_quant_ref(
     scale = torch.exp2(s.float())
     q = torch.clamp(xg / scale, -448.0, 448.0).to(dtypes.fp8).view(m, n)
     return q, (s + 127).to(torch.uint8).squeeze(-1)
+
+
+def _in_ref_steps(
+    x: torch.Tensor, ref_codes: torch.Tensor, codes: torch.Tensor | None = None
+) -> torch.Tensor:
+    # x in units of the step 2^(ref_code - 127) of each group of 32, first dequantized by
+    # its own e8m0 codes when given: an MXFP8 output lands within one e4m3 step of the exact
+    # rows whatever code its rounding chose, while a code off by one everywhere doubles it.
+    shift = 127.0 - ref_codes.view(torch.uint8).float()
+    if codes is not None:
+        shift += codes.view(torch.uint8).float() - 127.0
+    return x.float() * torch.exp2(shift).repeat_interleave(32, dim=-1)
 
 
 def _to_transposed_scale_layout(scale: torch.Tensor) -> torch.Tensor:
@@ -874,6 +887,15 @@ def test_fused_qk_rmsnorm_mxfp8(
             mask=(sq_r == sq_hip).repeat_interleave(32, dim=1),
             msg=f"check q {name} vs hip, {info}",
         )
+    # The mask above drops every group whose code moved; the dequantized q, in the torch
+    # reference's steps, still has to follow the exact normed rows everywhere.
+    assertAllclose(
+        _in_ref_steps(q_norm, sq_ref),
+        _in_ref_steps(yq_hip, sq_ref, sq_hip),
+        rtol=0.13,
+        atol=2**-8,
+        msg=f"check dequantized q torch vs hip, {info}",
+    )
     assertAllclose(
         yk_ref, yk_hip, rtol=0.02, atol=0.02, msg=f"check k torch vs hip, {info}"
     )
@@ -938,7 +960,7 @@ if __name__ == "__main__":
     if _fp4x2_available:
         l_quant_type = ["fp8", "fp4x2"]
     # The triton MXFP8 baseline emits OCP e4m3fn, as gfx950 / gfx1250 do.
-    if _gfx in ("gfx950", "gfx1250"):
+    if get_gfx_runtime() in ("gfx950", "gfx1250"):
         l_quant_type.append("mxfp8")
     # DeepSeekV2 MLA realistic default:
     # q_lora_rank ~= 1536 (12 * 128), kv_lora_rank ~= 512 (4 * 128), usually n1 > n2.
