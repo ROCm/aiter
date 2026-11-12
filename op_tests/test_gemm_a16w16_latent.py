@@ -608,6 +608,199 @@ def check_packed_pointer_inputs():
     aiter.logger.info("Packed pointer device/layout/span rejection checks passed")
 
 
+@benchmark()
+def test_single_pass_pointer(m, padding, seed):
+    """Runtime strides on the exact-M pointer ABI, without semaphore allocation."""
+    from unittest.mock import patch
+
+    import aiter.ops.flydsl.kernels.gemm_a16w16_gfx950 as impl
+
+    n, k = 7168, 3584
+    torch.manual_seed(seed)
+    cfg = {
+        "block_m": 64,
+        "block_n": 64,
+        "block_k": 64,
+        "stages": 5,
+        "split_k": 1,
+        "m_waves": 2,
+        "n_waves": 2,
+        "k_waves": 1,
+        "group_m": 0,
+        "use_half_tile_interleaved": False,
+    }
+    inputs, halos, outputs = [], [], []
+    for _ in range(2):
+        x = torch.randn((m, k + padding), device="cuda", dtype=torch.bfloat16)
+        w = torch.randn((n, k + 2 * padding), device="cuda", dtype=torch.bfloat16)
+        x = x[:, padding // 2 : padding // 2 + k]
+        w = w[:, padding : padding + k]
+        inputs.append((x, w))
+        halo = torch.full((m * n + 64,), 29.0, device=x.device, dtype=x.dtype)
+        halos.append(halo)
+        outputs.append(halo[32:-32].view(m, n))
+    streams = [torch.cuda.Stream(), torch.cuda.Stream()]
+    graphs = []
+    # Fail if this single-pass path returns to the unused semaphore allocator.
+    # Wrapping compile dispatch checks the pointer ABI/cache key but does not
+    # replace or skip an actual kernel call.
+    with (
+        patch.object(
+            impl,
+            "get_split_k_buffers",
+            side_effect=AssertionError("single-pass workspace requested"),
+        ),
+        patch.object(impl, "_run_compiled", wraps=impl._run_compiled) as dispatch,
+    ):
+        for (x, w), out in zip(inputs, outputs):
+            impl.gemm_a16w16(x, w.T, out=out, user_kwargs=cfg)
+        for stream, (x, w), out in zip(streams, inputs, outputs):
+            stream.wait_stream(torch.cuda.current_stream())
+            assert dispatch.call_args.args[0] is impl._latent_single_pass
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph, stream=stream):
+                for _ in range(4):
+                    impl.gemm_a16w16(x, w.T, out=out, user_kwargs=cfg, stream=stream)
+            stream.synchronize()
+            graphs.append(graph)
+        key = dispatch.call_args.kwargs["specialization_key"]
+        assert key[0] == inputs[0][0].device.index
+        assert key[1:3] == (torch.bfloat16, torch.bfloat16)
+        assert all(
+            c.kwargs["specialization_key"] == key for c in dispatch.call_args_list
+        )
+        for pattern in ("normal", "small", "dyadic"):
+            for x, w in inputs:
+                if pattern == "small":
+                    x.mul_(0.125)
+                    w.mul_(0.125)
+                elif pattern == "dyadic":
+                    x.copy_(torch.randint(-4, 5, x.shape, device=x.device).float() / 16)
+                    w.copy_(torch.randint(-4, 5, w.shape, device=w.device).float() / 16)
+            saved = [(x.clone(), w.clone()) for x, w in inputs]
+            refs = [run_torch(x, w) for x, w in inputs]
+            for stream, graph, out in zip(streams, graphs, outputs):
+                out.fill_(float("nan"))
+                stream.wait_stream(torch.cuda.current_stream())
+                with torch.cuda.stream(stream):
+                    graph.replay()
+                    graph.replay()
+            for stream in streams:
+                stream.synchronize()
+            for (x, w), (sx, sw), ref, out, halo in zip(
+                inputs, saved, refs, outputs, halos
+            ):
+                assert_result(ref, out, "pointer " + pattern)
+                assert torch.equal(x, sx) and torch.equal(w, sw)
+                assert (halo[:32] == 29).all().item()
+                assert (halo[-32:] == 29).all().item()
+    # No patched call is used during timing.
+    ret = {"gfx": get_gfx_runtime()}
+    candidates = {f"graph{i}": graph.replay for i, graph in enumerate(graphs)}
+    for i, (name, fn) in enumerate(candidates.items()):
+        _, us = run_perftest(
+            fn, num_iters=30, num_warmup=5, num_rotate_args=1, use_cuda_event=True
+        )
+        err = assert_result(refs[i], outputs[i], name)
+        us /= 4
+        ret.update(
+            {
+                name + " us": us,
+                name + " TFLOPS": 2 * m * n * k / us / 1e6,
+                name + " TB/s": 2 * (m * k + n * k + m * n) / us / 1e6,
+                name + " err": err,
+            }
+        )
+    return ret
+
+
+def check_single_pass_routing():
+    """Metadata guard tests must never reach a real compiled GPU handle."""
+    from unittest.mock import Mock, patch
+
+    import aiter.ops.flydsl.kernels.gemm_a16w16_gfx950 as impl
+
+    cfg = {
+        "block_m": 64,
+        "block_n": 64,
+        "block_k": 64,
+        "stages": 5,
+        "split_k": 1,
+        "m_waves": 2,
+        "n_waves": 2,
+        "k_waves": 1,
+        "group_m": 0,
+        "use_half_tile_interleaved": False,
+    }
+    stream = torch.cuda.current_stream()
+    x = torch.empty((129, 3584), device="cuda", dtype=torch.bfloat16)
+    w = torch.empty((7168, 3584), device="cuda", dtype=torch.bfloat16)
+    out = torch.empty((129, 7168), device="cuda", dtype=torch.bfloat16)
+    # Intercept at the boundary after host validation; don't time these mocks.
+    with (
+        patch.object(impl, "_run_compiled") as pointer,
+        patch.object(impl, "run_cached") as legacy,
+        patch.object(impl, "get_split_k_buffers", return_value=(x, x)) as workspace,
+        patch.object(impl, "_dynamic_tensor_arg", return_value=None),
+    ):
+        for m in (65, 127, 128, 129):
+            pointer.reset_mock()
+            legacy.reset_mock()
+            workspace.reset_mock()
+            impl.gemm_a16w16(x[:m], w.T, out=out[:m], user_kwargs=cfg, stream=stream)
+            if m == 128:
+                pointer.assert_called_once()
+                assert pointer.call_args.args[0] is impl._latent_single_pass
+                legacy.assert_not_called()
+                workspace.assert_not_called()
+            else:
+                pointer.assert_not_called()
+                legacy.assert_called_once()
+                workspace.assert_called_once()
+
+        huge = Mock(spec=torch.Tensor)
+        huge.device, huge.dtype, huge.ndim, huge.shape = (
+            x.device,
+            x.dtype,
+            2,
+            (128, 3584),
+        )
+        huge.data_ptr.return_value = x.data_ptr()
+        huge.element_size.return_value = x.element_size()
+        huge.stride.side_effect = lambda axis: (1 << 24) if axis == 0 else 1
+        pointer.reset_mock()
+        legacy.reset_mock()
+        impl.gemm_a16w16(huge, w.T, out=out[:128], user_kwargs=cfg, stream=stream)
+        # Oversized spans keep legacy behavior; raw pointer fast path is declined.
+        pointer.assert_not_called()
+        legacy.assert_called_once()
+
+        wrong_stream = Mock(spec=torch.cuda.Stream)
+        wrong_stream.device = torch.device("cuda", x.device.index + 1)
+        cpu_x = torch.empty((128, 3584), dtype=x.dtype, device="cpu")
+        cpu_w = torch.empty((7168, 3584), dtype=w.dtype, device="cpu")
+        cpu_out = torch.empty((128, 7168), dtype=out.dtype, device="cpu")
+        for fn in (
+            lambda: impl.gemm_a16w16(
+                x[:128], w.T, out=out[:128], user_kwargs=cfg, stream=wrong_stream
+            ),
+            lambda: impl.gemm_a16w16(
+                cpu_x, cpu_w.T, out=cpu_out, user_kwargs=cfg, stream=stream
+            ),
+        ):
+            pointer.reset_mock()
+            legacy.reset_mock()
+            try:
+                fn()
+            except (AssertionError, ValueError):
+                pass
+            else:
+                raise AssertionError("invalid single-pass pointer input accepted")
+            pointer.assert_not_called()
+            legacy.assert_not_called()
+    aiter.logger.info("Single-pass pointer routing and device/span guards passed")
+
+
 def main():
     if get_gfx_runtime() != "gfx950":
         aiter.logger.warning("This tuning qualification targets gfx950; skipping")
@@ -617,6 +810,7 @@ def main():
     check_hti_unroll_specialization()
     check_packed_split_specialization()
     check_packed_pointer_inputs()
+    check_single_pass_routing()
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
         "-s", "--mnk", nargs="+", type=aiter.dtypes.str2tuple, default=SHAPES
@@ -641,6 +835,19 @@ def main():
         "Packed split scratch lifetime:\n%s",
         pd.DataFrame(lifetime_rows).to_markdown(index=False),
     )
+
+    pointer_ms = [m for m, n, k in args.mnk if m == 128 and (n, k) == (7168, 3584)]
+    pointer_rows = [
+        test_single_pass_pointer(m, padding, seed)
+        for m, padding, seed in itertools.product(
+            pointer_ms, args.leading_padding, args.seed
+        )
+    ]
+    if pointer_rows:
+        aiter.logger.info(
+            "Single-pass pointer ABI:\n%s",
+            pd.DataFrame(pointer_rows).to_markdown(index=False),
+        )
 
 
 if __name__ == "__main__":

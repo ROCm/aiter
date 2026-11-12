@@ -1516,6 +1516,49 @@ gemm_a16w16_gfx950.compile_hints = {
 set_slp_vectorize_once_used(gemm_a16w16_gfx950, False)
 
 
+@flyc.jit
+def _latent_single_pass(
+    out_ptr: fx.Pointer,
+    a_ptr: fx.Pointer,
+    b_ptr: fx.Pointer,
+    m: fx.Int32,
+    n: fx.Int32,
+    k: fx.Int32,
+    lda: fx.Int32,
+    ldb: fx.Int32,
+    param: GemmA16W16Gfx950Param,
+    stream: fx.Stream,
+):
+    out = fx.make_view(out_ptr, fx.make_layout((m, n), (n, 1)))
+    a = fx.make_view(a_ptr, fx.make_layout((m, k), (lda, 1)))
+    b = fx.make_view(b_ptr, fx.make_layout((k, n), (1, ldb)))
+    # Reuse the full-tile device body. Fixed no-bias/split-K=1 means the
+    # three placeholder A views below are never accessed as auxiliary buffers.
+    mma = fx.make_tiled_mma(
+        fx.make_mma_atom(fx.rocdl.MFMA(16, 16, 32, fx.BFloat16)),
+        fx.make_layout((2, 2, 1), (2, 1, 0)),
+        fx.make_tile(None, None, fx.make_layout((8, 4), (1, 8))),
+    )
+    gemm_a16w16_gfx950_kernel._known_block_size = [256, 1, 1]
+    # Only this pointer launcher gets the ABI suffix. The legacy tensor
+    # launcher and padded-M consumers retain their original kernel names.
+    gemm_a16w16_gfx950_kernel._func.__name__ = (
+        make_gemm_a16w16_gfx950_kernel_name(param) + "_sptr"
+    )
+    gemm_a16w16_gfx950_kernel(
+        out, a, b, a, a, a, m, n, k, fx.Int32(1), k, lda, ldb, mma, param
+    ).launch(
+        grid=((m + 63) // 64 * ((n + 63) // 64), 1, 1),
+        block=(256, 1, 1),
+        stream=stream,
+    )
+
+
+_latent_single_pass.compile_hints = {
+    "llvm_options": dict(gemm_a16w16_gfx950.compile_hints["llvm_options"])
+}
+
+
 @flyc.kernel(known_block_size=[256, 1, 1])
 def _reduce_latent_packed_split(partial: fx.Tensor, out: fx.Tensor):
     # Exact M128/N3584 specialization: every thread owns one column x four rows.
@@ -1964,6 +2007,39 @@ def gemm_a16w16(
             ),
         )
         return out
+    if param.unroll_lds_ring and m == 128:
+        if device.type != "cuda" or stream.device != device:
+            raise ValueError(
+                "single-pass GEMM tensors and stream must share a CUDA device"
+            )
+        a_span_bytes = ((m - 1) * a.stride(0) + k) * a.element_size()
+        b_span_bytes = ((n - 1) * b.stride(1) + k) * b.element_size()
+        # Strides are explicit signed-i32 runtime arguments. Keep the legacy
+        # dispatcher for unusually large spans instead of narrowing its domain.
+        if (
+            min(a.stride(0), b.stride(1)) > 0
+            and max(a_span_bytes, b_span_bytes) <= (1 << 31) - 1
+        ):
+            _run_compiled(
+                _latent_single_pass,
+                ptr_arg(out, fx.BFloat16),
+                ptr_arg(a, fx.BFloat16),
+                ptr_arg(b, fx.BFloat16),
+                int(m),
+                int(n),
+                int(k),
+                int(a.stride(0)),
+                int(b.stride(1)),
+                param,
+                fx.Stream(stream),
+                specialization_key=(
+                    device.index,
+                    a.dtype,
+                    out.dtype,
+                    param.__cache_signature__(),
+                ),
+            )
+            return out
     semaphore, signal = get_split_k_buffers(stream, device, split_k)
     a_arg = _dynamic_tensor_arg(a, 0 if a_is_transposed else 1)
     b_arg = _dynamic_tensor_arg(b, 0 if b_is_transposed else 1)
