@@ -7,7 +7,7 @@ import pytest
 import torch
 
 from aiter import logger
-from aiter.ops.triton._triton_kernels.attention import block_lut
+from aiter.ops.triton.attention import utils as attention_utils
 from aiter.ops.triton.attention.fav3_sage import (
     fav3_sage_func,
     fav3_sage_wrapper_func,
@@ -245,7 +245,7 @@ def test_block_attn_mask_to_ragged_lut_width_follows_config_unless_given(
     monkeypatch, num_kv_blocks, BLOCK_KB, launched
 ):
     """The configured bounds shape only the default width; an explicit BLOCK_KB launches as given."""
-    kernel = block_lut._block_attn_mask_to_lut_kernel
+    kernel = attention_utils._block_attn_mask_to_lut_kernel
     widths = []
 
     class RecordingKernel:
@@ -256,8 +256,12 @@ def test_block_attn_mask_to_ragged_lut_width_follows_config_unless_given(
 
             return launch
 
-    monkeypatch.setattr(block_lut, "_block_attn_mask_to_lut_kernel", RecordingKernel())
-    monkeypatch.setitem(block_lut._BLOCK_KB_BOUNDS, arch_info.get_arch(), (16, 64))
+    monkeypatch.setattr(
+        attention_utils, "_block_attn_mask_to_lut_kernel", RecordingKernel()
+    )
+    monkeypatch.setitem(
+        attention_utils._BLOCK_KB_BOUNDS, arch_info.get_arch(), (16, 64)
+    )
     torch.manual_seed(0)
     block_attn_mask = _random_block_mask((1, 2, 3, num_kv_blocks))
 
