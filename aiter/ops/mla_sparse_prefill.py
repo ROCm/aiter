@@ -9,7 +9,7 @@ One public entry per KV layout: the name carries the layout (the model version t
 introduced it) and the tensors' dtypes carry the precision, so a new precision of a
 layout is a new dtype case, not a new entry.
 
-* :func:`mla_sparse_prefill`     -- unscaled rows (bf16/fp16): opus.
+* :func:`mla_sparse_prefill`     -- unscaled rows (bf16): opus.
 * :func:`mla_sparse_prefill_v4`  -- v4: NoPE with its E8M0 scales in the row, plus bf16
   RoPE (NoPE fp8): asm on gfx1250 with H == 128 (opus if it declines), else opus.
 * :func:`mla_sparse_prefill_v41` -- v4.1: rows with separate ``[*, 16]`` E8M0 scales
@@ -22,15 +22,19 @@ a bad argument raises ValueError.
 
 import functools
 import math
+import struct
+from numbers import Real
 from typing import NamedTuple
 
 import torch
 
 from .. import logger
+from .. import plugin as _plugin
 from ..jit.core import compile_ops
-from ..jit.utils.asm_guard import require_gfx1250_asm
+from ..jit.utils.asm_guard import is_gfx1250_asm_supported, require_gfx1250_asm
 from ..jit.utils.chip_info import get_cu_num, get_gfx_runtime
 from ..jit.utils.torch_guard import torch_compile_guard
+from ..plugin import route as _route
 from ..utility import dtypes
 from .mla_sparse_prefill_v41_asm import _asm_sparse_prefill_v41
 from .opus.mla import (
@@ -262,23 +266,29 @@ _MAX_KV_SPLITS = 32
 _ANY_COUNT = tuple(range(2, _MAX_KV_SPLITS + 1))
 # Split counts a gfx1250 v4.1 cluster folds in-kernel.
 _CLUSTER_COUNT = (2, 4, 8, 16)
+# Split counts the gfx1250 v4 16mx1 and fp8 32mx1 fits were measured on.
+_FIT_COUNT = (2, 3, 4, 6, 8, 12, 16)
 
 # (arch, kernel) -> fit over H 16-128, topk 384-4096 and N 8-768 on gfx950, topk 512-4096 and
-# N 8-256 on gfx1250. v41_a8w4_16mx1_16nx4 reuses the v41_a8w8 fit.
+# N 8-512 on gfx1250. v41_a8w4_16mx1_16nx4 reuses the v41_a8w8 fit.
 _KV_SPLIT_FIT = {
     ("gfx950", "v4_a16w16_16mx1_16nx4"): _SplitFit(16, 64, 2, _ANY_COUNT, 90, 0.043),
-    ("gfx950", "v4_a16w16_16mx8_32nx1"): _SplitFit(128, 32, 1, _ANY_COUNT, 0, 0.012),
+    ("gfx950", "v4_a16w16_32mx4_32nx1"): _SplitFit(128, 32, 1, _ANY_COUNT, 150, 0.014),
     ("gfx950", "v4_a8w8_16mx1_16nx4"): _SplitFit(16, 64, 2, _ANY_COUNT, 55, 0.022),
-    ("gfx950", "v4_a8w8_16mx8_32nx1"): _SplitFit(128, 32, 1, _ANY_COUNT, 0, 0.0095),
+    ("gfx950", "v4_a8w8_32mx4_32nx1"): _SplitFit(128, 32, 1, _ANY_COUNT, 150, 0.014),
     ("gfx950", "v41_a8w8_16mx1_16nx4"): _SplitFit(16, 64, 2, _ANY_COUNT, 80, 0.046),
     ("gfx950", "v41_a8w8_16mx4_64nx1"): _SplitFit(64, 64, 1, _ANY_COUNT, 90, 0.025),
     ("gfx950", "v41_a8w4_16mx1_16nx4"): _SplitFit(16, 64, 2, _ANY_COUNT, 80, 0.046),
     ("gfx950", "v41_a8w4_16mx4_64nx1"): _SplitFit(64, 64, 1, _ANY_COUNT, 250, 0.012),
-    ("gfx1250", "v4_a16w16_16mx1_16nx4"): _SplitFit(16, 64, 1, _ANY_COUNT, 0, 0.10),
+    ("gfx1250", "v4_a16w16_16mx1_16nx4"): _SplitFit(16, 64, 1, _FIT_COUNT, 250, 0.08),
     ("gfx1250", "v4_a16w16_32mx1_16nx4"): _SplitFit(32, 64, 1, _ANY_COUNT, 200, 0.06),
     ("gfx1250", "v4_a16w16_16mx4_64nx1"): _SplitFit(64, 64, 1, _ANY_COUNT, 150, 0.06),
-    ("gfx1250", "v4_a8w8_16mx1_16nx4"): _SplitFit(16, 64, 1, _ANY_COUNT, 200, 0.12),
-    ("gfx1250", "v4_a8w8_32mx1_16nx4"): _SplitFit(32, 64, 1, _ANY_COUNT, 200, 0.06),
+    ("gfx1250", "v4_a8w8_16mx1_16nx4"): _SplitFit(
+        16, 64, 2, _FIT_COUNT, 350, 0.06, 1.25
+    ),
+    ("gfx1250", "v4_a8w8_32mx1_16nx4"): _SplitFit(
+        32, 64, 2, _FIT_COUNT, 200, 0.04, 1.25
+    ),
     ("gfx1250", "v4_a8w8_16mx4_64nx1"): _SplitFit(64, 64, 1, _ANY_COUNT, 200, 0.06),
     ("gfx1250", "v41_a8w8_16mx1_16nx4"): _SplitFit(
         16, 64, 2, _CLUSTER_COUNT, 275, 0.03, 1.75
@@ -300,7 +310,7 @@ def _opus_split_fit(gfx: str, kernel: str, h: int) -> _SplitFit:
     elif kernel in ("v41_a8w8", "v41_a8w4"):
         tile = "16mx1_16nx4" if h <= 16 else "16mx4_64nx1"
     else:
-        tile = "16mx1_16nx4" if h <= 32 else "16mx8_32nx1"
+        tile = "16mx1_16nx4" if h <= 32 else "32mx4_32nx1"
     return _KV_SPLIT_FIT[(gfx, f"{kernel}_{tile}")]
 
 
@@ -372,12 +382,8 @@ def _opus_sparse_prefill(
         opus_mla_v4_prefill_a16w16_gfx1250_fwd,
     )
 
-    if q.dtype not in (torch.bfloat16, torch.float16):
-        raise RuntimeError(f"expects fp16/bf16 q, got {q.dtype}")
-    if gfx == "gfx1250" and q.dtype != torch.bfloat16:
-        raise RuntimeError(
-            f"the gfx1250 code object only provides the bf16 variant, got {q.dtype}"
-        )
+    if q.dtype != torch.bfloat16:
+        raise RuntimeError(f"expects bf16 q, got {q.dtype}")
     if unified_kv.dtype != q.dtype:
         raise RuntimeError(
             f"unified_kv dtype mismatch: unified_kv={unified_kv.dtype}, q={q.dtype}"
@@ -502,6 +508,158 @@ _OPUS_V41_KERNELS = {
 }
 
 
+def _v41_runtime_arch(device: torch.device | str) -> str | None:
+    device = torch.device(device)
+    if device.type != "cuda" or torch.version.hip is None:
+        return None
+    if not torch.cuda.is_available():
+        return None
+    index = torch.cuda.current_device() if device.index is None else device.index
+    if not 0 <= index < torch.cuda.device_count():
+        raise ValueError(f"CUDA device index is out of range: {index}")
+    gfx = torch.cuda.get_device_properties(index).gcnArchName.split(":", 1)[0].lower()
+    if gfx not in ("gfx950", "gfx1250"):
+        return None
+    # Native dispatch currently uses a node-wide cached architecture. Do not
+    # promise support for a different target on a heterogeneous node.
+    return gfx if gfx == get_gfx_runtime() else None
+
+
+def _v41_asm_eligible(gfx, shape, dtypes_, layout, scale):
+    n, h, d = shape
+    (
+        q_dtype,
+        q_scale_dtype,
+        prefix_dtype,
+        prefix_scale_dtype,
+        kv_dtype,
+        kv_scale_dtype,
+    ) = dtypes_
+    return (
+        gfx == "gfx1250"
+        and h == 64
+        and d == 512
+        and n <= 65536
+        and layout == "contiguous"
+        and q_dtype == kv_dtype == dtypes.fp8
+        and q_scale_dtype in _E8M0
+        and kv_scale_dtype in _E8M0
+        and prefix_dtype in (torch.uint8, dtypes.fp4x2)
+        and prefix_scale_dtype in (torch.uint8, dtypes.fp8)
+        and struct.pack("<f", scale) == struct.pack("<f", 1 / math.sqrt(512))
+        and is_gfx1250_asm_supported()
+    )
+
+
+def _v41_opus_eligible(gfx, shape, dtypes_, layout):
+    (
+        q_dtype,
+        q_scale_dtype,
+        prefix_dtype,
+        prefix_scale_dtype,
+        kv_dtype,
+        kv_scale_dtype,
+    ) = dtypes_
+    prefix_dtype = dtypes.fp4x2 if prefix_dtype == torch.uint8 else prefix_dtype
+    entry = _OPUS_V41_KERNELS.get(prefix_dtype)
+    return (
+        gfx in ("gfx950", "gfx1250")
+        and shape[2] == 512
+        and layout in ("contiguous", "row_strided")
+        and q_dtype == kv_dtype == dtypes.fp8
+        and q_scale_dtype in _E8M0
+        and kv_scale_dtype in _E8M0
+        and entry is not None
+        and prefix_scale_dtype in entry[2]
+        and entry[0][gfx == "gfx1250"] is not None
+    )
+
+
+def get_mla_sparse_prefill_v41_backend(
+    device: torch.device | str,
+    q_shape: tuple[int, int, int],
+    *,
+    unified_kv_dtype: torch.dtype,
+    softmax_scale: float = 1 / math.sqrt(512),
+    q_dtype: torch.dtype = dtypes.fp8,
+    q_scale_dtype: torch.dtype = torch.uint8,
+    unified_kv_scale_dtype: torch.dtype = torch.uint8,
+    kv_dtype: torch.dtype = dtypes.fp8,
+    kv_scale_dtype: torch.dtype = torch.uint8,
+    layout: str = "contiguous",
+) -> str | None:
+    """Query the native v4.1 backend before preparing/quantizing Q.
+
+    Returns ``"asm"``, ``"opus"`` or ``None`` when the intended configuration
+    is unsupported. ``q_shape`` is the concrete host shape ``(N, H, D)``;
+    dtypes describe the intended quantized tensors, not the BF16 Q producer.
+    No tensors are allocated, quantized or read, and no kernel is compiled.
+
+    ``layout="contiguous"`` describes separate dense Q/KV/scale arrays.
+    ``"row_strided"`` permits unit last-dimension strides with data bases/row
+    strides aligned to 16 bytes and scales aligned to 4 bytes (including
+    separate views of packed NVFP4 rows). Other layout strings return None.
+    Actual tensor shapes, addresses, CSR, output and split workspaces remain
+    subject to execution-time validation; this query does not catch launch
+    errors or test whether a toolchain can successfully compile a kernel.
+
+    The target must be a live HIP device matching native dispatch's runtime
+    architecture. ASM also observes the existing B0+ runtime gate. Malformed
+    metadata raises rather than being treated as a supported fallback.
+    This query describes AITER's native fallback, not plugin providers that
+    may need the actual prepared tensors to decide whether to serve a call.
+    """
+    if not isinstance(q_shape, (tuple, list)) or len(q_shape) != 3:
+        raise ValueError("q_shape must be (N, H, D)")
+    if any(type(x) is not int for x in q_shape):
+        raise TypeError("q_shape must contain concrete integer dimensions")
+    n, h, d = q_shape
+    if n < 0 or h <= 0 or d <= 0:
+        raise ValueError("q_shape requires N >= 0, H > 0 and D > 0")
+    dtype_spec = (
+        q_dtype,
+        q_scale_dtype,
+        unified_kv_dtype,
+        unified_kv_scale_dtype,
+        kv_dtype,
+        kv_scale_dtype,
+    )
+    if any(not isinstance(dtype, torch.dtype) for dtype in dtype_spec):
+        raise TypeError("quantized dtypes must be torch.dtype values")
+    if not isinstance(layout, str):
+        raise TypeError("layout must be a string")
+    if isinstance(softmax_scale, bool) or not isinstance(softmax_scale, Real):
+        raise TypeError("softmax_scale must be a host number, not a tensor")
+    scale = float(softmax_scale)
+    try:
+        finite_fp32 = math.isfinite(struct.unpack("<f", struct.pack("<f", scale))[0])
+    except (OverflowError, struct.error):
+        finite_fp32 = False
+    if not finite_fp32:
+        raise ValueError("softmax_scale must have a finite FP32 representation")
+    if max(n, h) > 2**31 - 1 or d != 512:
+        return None
+    gfx = _v41_runtime_arch(device)
+    if _v41_asm_eligible(gfx, q_shape, dtype_spec, layout, scale):
+        return "asm"
+    if _v41_opus_eligible(gfx, q_shape, dtype_spec, layout):
+        return "opus"
+    return None
+
+
+def _v41_tensor_layout(q, q_scale, unified_kv, unified_kv_scale, kv, kv_scale):
+    tensors = (q, q_scale, unified_kv, unified_kv_scale, kv, kv_scale)
+    for tensor, alignment in zip(tensors, (16, 4, 16, 4, 16, 4)):
+        if tensor.dim() == 0 or tensor.stride(-1) != 1:
+            return "unsupported"
+        if tensor.data_ptr() % alignment or any(
+            stride * tensor.element_size() % alignment
+            for stride in tensor.stride()[:-1]
+        ):
+            return "unsupported"
+    return "contiguous" if all(t.is_contiguous() for t in tensors) else "row_strided"
+
+
 def _opus_sparse_prefill_v41(
     q,
     q_scale,
@@ -593,6 +751,51 @@ def _mla_sparse_prefill_fake(
     return out if out is not None else torch.empty_like(q)
 
 
+# Routed here rather than on either public spelling or on a backend binding.
+# `mla_sparse_prefill` and `pa_sparse_prefill_opus` are two public names for one
+# op and both call this directly, so this is where the op begins. Routing a
+# spelling instead would cover only the callers who happen to use that one, and
+# routing `_opus_sparse_prefill` would name a backend in the contract.
+#
+# `backend=` stays ABOVE this layer on purpose. It selects which implementation
+# AITER would run natively, which is a question the dispatcher answers before
+# the op begins; a provider asked to serve this contract is not offered it and
+# so cannot be asked to honour a pin it has no kernel for.
+@_route(op="mla_sparse_prefill", version=1)
+def _mla_sparse_prefill_routed(
+    q: torch.Tensor,
+    unified_kv: torch.Tensor,
+    kv_indices_prefix: torch.Tensor,
+    kv_indptr_prefix: torch.Tensor,
+    kv: torch.Tensor,
+    kv_indices_extend: torch.Tensor,
+    kv_indptr_extend: torch.Tensor,
+    attn_sink: torch.Tensor | None,
+    softmax_scale: float,
+    out: torch.Tensor | None = None,
+    num_kv_splits: int | None = None,
+) -> torch.Tensor:
+    """MLA sparse prefill over bf16/fp16 Q/KV (D = 512).
+
+    Shapes and meanings are those of :func:`mla_sparse_prefill`, minus its
+    ``backend`` argument. ``out`` is written in place when given and returned
+    either way, so a provider that allocates must still return what it wrote.
+    """
+    return _opus_sparse_prefill(
+        q,
+        unified_kv,
+        kv_indices_prefix,
+        kv_indptr_prefix,
+        kv,
+        kv_indices_extend,
+        kv_indptr_extend,
+        attn_sink,
+        softmax_scale,
+        out,
+        num_kv_splits,
+    )
+
+
 @torch_compile_guard(mutates_args=["out"], gen_fake=_mla_sparse_prefill_fake)
 def mla_sparse_prefill(
     q: torch.Tensor,
@@ -608,10 +811,10 @@ def mla_sparse_prefill(
     num_kv_splits: int | None = None,
     backend: str | None = None,
 ) -> torch.Tensor:
-    """MLA sparse prefill over bf16/fp16 Q/KV (D = 512).
+    """MLA sparse prefill over bf16 Q/KV (D = 512).
 
     Args:
-      q:                 ``[T, H, D]`` bf16/fp16 query.
+      q:                 ``[T, H, D]`` bf16 query.
       unified_kv:        ``[total_pages, D]`` prefix source, same dtype as ``q``.
       kv_indices_prefix: ``[total_prefix]`` int32 row indices into
         ``unified_kv``, concatenated per token.
@@ -635,7 +838,7 @@ def mla_sparse_prefill(
       ``out``.
     """
     _check_backend("mla_sparse_prefill", backend, ("opus",))
-    return _opus_sparse_prefill(
+    return _mla_sparse_prefill_routed(
         q,
         unified_kv,
         kv_indices_prefix,
@@ -775,6 +978,55 @@ def _mla_sparse_prefill_v41_fake(
     return torch.empty((t, h, 512), dtype=torch.bfloat16, device=q.device)
 
 
+# Routed below the backend pin, as `mla_sparse_prefill` is. `backend` picks
+# which implementation AITER runs -- a question the dispatcher settles before
+# the op begins. A provider has its own kernel, not a choice of AITER's, so a
+# contract carrying the pin would have it decline every call that passes one.
+#
+# Version 2: v1 was this signature WITH `backend` in it. A v1 provider was
+# built for fifteen arguments and a v2 call offers fourteen, so v1 is not
+# superseded -- the arity check rejecting it is the correct outcome.
+@_route(op="mla_sparse_prefill_v41", version=2)
+def _mla_sparse_prefill_v41_routed(
+    q: torch.Tensor,
+    q_scale: torch.Tensor,
+    unified_kv: torch.Tensor,
+    unified_kv_scale: torch.Tensor,
+    kv_indices_prefix: torch.Tensor,
+    kv_indptr_prefix: torch.Tensor,
+    kv: torch.Tensor,
+    kv_scale: torch.Tensor,
+    kv_indices_extend: torch.Tensor,
+    kv_indptr_extend: torch.Tensor,
+    attn_sink: torch.Tensor | None,
+    softmax_scale: float,
+    out: torch.Tensor | None = None,
+    num_kv_splits: int | None = None,
+) -> torch.Tensor:
+    """MLA v4.1 sparse prefill, below the backend pin.
+
+    Shapes and meanings are those of :func:`mla_sparse_prefill_v41`, minus its
+    ``backend`` argument. ``out`` is written when given and returned either
+    way, so a provider returns what it wrote.
+    """
+    return _opus_sparse_prefill_v41(
+        q,
+        q_scale,
+        unified_kv,
+        unified_kv_scale,
+        kv_indices_prefix,
+        kv_indptr_prefix,
+        kv,
+        kv_scale,
+        kv_indices_extend,
+        kv_indptr_extend,
+        attn_sink,
+        softmax_scale,
+        out,
+        num_kv_splits,
+    )
+
+
 @torch_compile_guard(mutates_args=["out"], gen_fake=_mla_sparse_prefill_v41_fake)
 def mla_sparse_prefill_v41(
     q: torch.Tensor,
@@ -833,21 +1085,44 @@ def mla_sparse_prefill_v41(
         Extend rows do not count toward the prefix average. asm fuses reduction
         in the same launch and allocates workspace internally.
       backend:           ``"asm"``, ``"opus"`` or ``None``. Default selects asm
-        for a gfx1250 H64 NVFP4 prefix, otherwise opus.
+        for a supported gfx1250 H64 NVFP4 prefix, otherwise opus. Use
+        :func:`get_mla_sparse_prefill_v41_backend` before quantizing Q to check
+        native eligibility. Explicit backends retain their validation/errors.
+        Enabled plugins are tried first and do not receive this native pin.
 
     Returns:
       ``out`` (``[T, H, 512]`` bf16).
     """
     _check_backend("mla_sparse_prefill_v41", backend, ("asm", "opus"))
-    use_asm = backend == "asm" or (
-        backend is None
-        and q.dim() == 3
-        and q.size(1) == 64
-        and unified_kv.dtype in (torch.uint8, dtypes.fp4x2)
-        and get_gfx_runtime() == "gfx1250"
-    )
-    implementation = _asm_sparse_prefill_v41 if use_asm else _opus_sparse_prefill_v41
-    return implementation(
+
+    def native_fallback(*native_args, **native_kwargs):
+        selected = backend
+        if selected is None:
+            selected = get_mla_sparse_prefill_v41_backend(
+                q.device,
+                tuple(q.shape),
+                unified_kv_dtype=unified_kv.dtype,
+                softmax_scale=softmax_scale,
+                q_dtype=q.dtype,
+                q_scale_dtype=q_scale.dtype,
+                unified_kv_scale_dtype=unified_kv_scale.dtype,
+                kv_dtype=kv.dtype,
+                kv_scale_dtype=kv_scale.dtype,
+                layout=_v41_tensor_layout(
+                    q, q_scale, unified_kv, unified_kv_scale, kv, kv_scale
+                ),
+            )
+            if selected is None:
+                raise RuntimeError(
+                    "mla_sparse_prefill_v41: no native backend supports the "
+                    "requested device, shape, quantized dtypes, layout and scale"
+                )
+        implementation = (
+            _asm_sparse_prefill_v41 if selected == "asm" else _opus_sparse_prefill_v41
+        )
+        return implementation(*native_args, **native_kwargs)
+
+    args = (
         q,
         q_scale,
         unified_kv,
@@ -863,9 +1138,15 @@ def mla_sparse_prefill_v41(
         out,
         num_kv_splits,
     )
+    operation = _mla_sparse_prefill_v41_routed.__aiter_plugin_op__
+    registered = _plugin._routed_ops[operation.name]
+    return _plugin._dispatch(
+        operation, registered.canonicalize, native_fallback, args, {}
+    )
 
 
 __all__ = [
+    "get_mla_sparse_prefill_v41_backend",
     "mla_sparse_prefill",
     "mla_sparse_prefill_fp8_asm",
     "mla_sparse_prefill_fp8_asm_fwd",

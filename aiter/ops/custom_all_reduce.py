@@ -178,6 +178,7 @@ def fused_allreduce_rmsnorm_mxfp4_quant(
     use_1stage: bool,
     bf16_out_ptr: int = 0,
     gemma_norm: bool = False,
+    hadamard_rotate: bool = False,
 ) -> None: ...
 
 
@@ -370,6 +371,46 @@ def fused_allreduce_rmsnorm_quant_gfx1250(
     use_1stage: bool,
     gemma_norm: bool = False,
     bf16_out_ptr: int = 0,
+) -> None: ...
+
+
+# Lamport one-shot fused allreduce + residual + RMSNorm. Every rank allocates a
+# buffer of lamport_ar_rms_buffer_size_gfx1250 bytes, maps all of them, calls
+# init_lamport_ar_rms_gfx1250 once and then barriers across ranks before the
+# first call. max_bytes is the largest input a call takes.
+
+
+@compile_ops(GFX1250_MD_NAME, fc_name="lamport_ar_rms_buffer_size", develop=True)
+def lamport_ar_rms_buffer_size_gfx1250(world_size: int, max_bytes: int) -> int: ...
+
+
+@compile_ops(GFX1250_MD_NAME, fc_name="init_lamport_ar_rms", develop=True)
+def init_lamport_ar_rms_gfx1250(
+    _fa: int, all_ptrs: list[int], max_bytes: int
+) -> None: ...
+
+
+@compile_ops(GFX1250_MD_NAME, fc_name="fused_allreduce_rmsnorm_lamport", develop=True)
+def fused_allreduce_rmsnorm_lamport_gfx1250(
+    _fa: int,
+    inp: torch.Tensor,
+    res_inp: torch.Tensor,
+    res_out: torch.Tensor,
+    out: torch.Tensor,
+    w: torch.Tensor,
+    eps: float,
+    gemma_norm: bool = False,
+) -> None: ...
+
+
+# Lamport one-shot all-reduce of inp + other, on the same inbox as the fused
+# AR + RMSNorm above (init_lamport_ar_rms_gfx1250).
+@compile_ops(GFX1250_MD_NAME, fc_name="allreduce_add_lamport", develop=True)
+def allreduce_add_lamport_gfx1250(
+    _fa: int,
+    inp: torch.Tensor,
+    other: torch.Tensor,
+    out: torch.Tensor,
 ) -> None: ...
 
 

@@ -96,6 +96,9 @@ for file in "${sharded_files[@]}"; do
     # batch gate so they exercise the persistent kernel at every batch size.
     test_cmd=(timeout 60m python3 "$file")
     case "$file" in
+        op_tests/test_flydsl_moe_a16wfp4.py)
+            test_cmd=(timeout 60m python3 -m pytest -q "$file")
+            ;;
         op_tests/test_gemm_a8w8.py)
             # This suite checks correctness across thousands of tuned shapes.
             # Check every shape once; the suite also times one shape per CSV
@@ -109,9 +112,14 @@ for file in "${sharded_files[@]}"; do
             # no tests are collected, so an empty run cannot report success.
             test_cmd=(timeout 60m python3 -m pytest -q "$file")
             ;;
-        op_tests/test_fhmoe.py|op_tests/tuning_tests/test_fhmoe_tuner.py|op_tests/test_graph_alloc.py|op_tests/test_hipb_grouped_gemm.py|op_tests/flydsl_tests/test_gemm2_valid_token_count.py|op_tests/test_mla_sparse_prefill_v41_asm.py)
+        op_tests/test_fhmoe.py|op_tests/tuning_tests/test_fhmoe_tuner.py|op_tests/test_graph_alloc.py|op_tests/test_hipb_grouped_gemm.py|op_tests/flydsl_tests/test_gemm2_valid_token_count.py|op_tests/test_mla_sparse_prefill_v41_asm.py|op_tests/test_mla_sparse_prefill_v41_capability.py)
             # These files contain pytest-style test functions and intentionally
             # have no script entry point; direct execution would only import them.
+            test_cmd=(timeout 60m python3 -m pytest -q "$file")
+            ;;
+        op_tests/test_moe_cktile_stage1_splitk.py)
+            # The standalone benchmark omits selector and expected-error tests.
+            # Use pytest to run these alongside the numerical regression cases.
             test_cmd=(timeout 60m python3 -m pytest -q "$file")
             ;;
         op_tests/test_mla_v4_nm.py)

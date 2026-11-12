@@ -898,7 +898,6 @@ def test_mla_sparse_prefill(prec, n, h, total_pages, total_tokens, topk):
 
 
 # Cover the unsplit cases not exercised by the common BF16/FP8 matrix.
-@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16], ids=["bf16", "fp16"])
 @pytest.mark.parametrize(
     "total_pages,total_tokens,topk",
     [
@@ -906,8 +905,8 @@ def test_mla_sparse_prefill(prec, n, h, total_pages, total_tokens, topk):
         pytest.param(129, 0, 65, id="prefix-only"),
     ],
 )
-def test_opus_csr_boundaries(dtype, total_pages, total_tokens, topk):
-    _check_opus_csr_case(65, 24, total_pages, total_tokens, topk, dtype, 1)
+def test_opus_csr_boundaries(total_pages, total_tokens, topk):
+    _check_opus_csr_case(65, 24, total_pages, total_tokens, topk, torch.bfloat16, 1)
 
 
 def _check_opus_csr_case(
@@ -945,9 +944,8 @@ def _check_opus_csr_case(
     assert torch.isfinite(actual).all()
 
 
-@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16], ids=["bf16", "fp16"])
-def test_opus_csr_without_sink(dtype):
-    _check_opus_csr_case(65, 24, 129, 129, 65, dtype, 1, has_sink=False)
+def test_opus_csr_without_sink():
+    _check_opus_csr_case(65, 24, 129, 129, 65, torch.bfloat16, 1, has_sink=False)
 
 
 @pytest.mark.parametrize("has_sink", [False, True], ids=["no-sink", "lower-sink"])
@@ -983,8 +981,7 @@ def test_opus_csr_negative_logits(has_sink):
     assert err <= _ERR_TOL
 
 
-@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16], ids=["bf16", "fp16"])
-def test_opus_csr_one_key_scale_one(dtype):
+def test_opus_csr_one_key_scale_one():
     if _get_gpu_arch() != "gfx950":
         pytest.skip("the source-compiled OPUS paths require gfx950")
     inputs = _make_inputs(
@@ -993,7 +990,7 @@ def test_opus_csr_one_key_scale_one(dtype):
         d=512,
         total_pages=1,
         total_tokens=0,
-        dtype=dtype,
+        dtype=torch.bfloat16,
         topk=1,
         seed=42,
     )
