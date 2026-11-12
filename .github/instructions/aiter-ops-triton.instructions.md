@@ -169,6 +169,9 @@ In unified attention configs, flag:
 - A change to the `DT` fallback order (`DT_<q>_<k>_<v>`, `DT_<q>_<k>`,
   `DT_<q>_any`, `DT_any_<k>`, `any`) without an update to
   `configs/AGENTS.md#unified-attention` and `aiter/ops/triton/README.md`.
+- A `kv_split` entry with `SPLIT_PROGRAMS_PER_CU` but without the other
+  length-aware `SPLIT_*` keys (see `configs/AGENTS.md#unified-attention`). The
+  split then silently falls back to the uniform one.
 
 ## Configs: Python code
 
