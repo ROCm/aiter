@@ -1239,7 +1239,8 @@ def make_fav3_fp8_runner(
 
 def _mha_v4_packed_sparse_kwargs(
     block_lut: tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None,
-) -> dict[str, torch.Tensor]:
+    block_tile: tuple[int, int],
+) -> dict[str, Any]:
     if block_lut is None:
         return {}
     kv_block_indices, lut_start, lut_count = block_lut
@@ -1247,6 +1248,7 @@ def _mha_v4_packed_sparse_kwargs(
         "kv_block_indices": kv_block_indices,
         "lut_start": lut_start,
         "lut_count": lut_count,
+        "block_tile": block_tile,
     }
 
 
@@ -1275,12 +1277,15 @@ def _sol_packed_kwargs(
     quant_q, quant_k, quant_v, q_descale, k_descale, _ = tensors[:6]
     _, qk_block_scaled, packed_format, v_packed_format = SOL_KERNELS[kernel]
     q_source, k_source, v_source = sources
+    block_tile = kernel_block_sizes(kernel)
 
     plan = sol_prepare(
         q_source if packed_format is not None else quant_q,
         quant_k,
         quant_v,
         beta=beta if block_mask is None else None,
+        BLOCK_M=block_tile[0],
+        BLOCK_N=block_tile[1],
         num_heads=quant_q.shape[2],
         k_scale=k_descale if qk_block_scaled and packed_format is None else None,
         q_scale=q_descale if qk_block_scaled and packed_format is None else None,
@@ -1299,6 +1304,7 @@ def _sol_packed_kwargs(
         "block_bitmap": plan["block_bitmap"],
         "mean_k_scale": plan["mean_k_scale"],
         "mean_v_scale": plan["mean_v_scale"],
+        "block_tile": block_tile,
     }
 
 
@@ -1349,16 +1355,22 @@ def _make_kernel_runner_impl(
     i8fp8_scale_modes = scale_modes_for_formats(
         AttentionFormat.INT8, AttentionFormat.INT8, fp8_format
     )
-    packed_sparse = _mha_v4_packed_sparse_kwargs(block_lut)
+    # The LUT was cut at kernel_block_sizes(), and mha_v4_packed cannot tell a LUT's block size
+    # from its contents, so it is told that same tile.
+    packed_sparse = (
+        _mha_v4_packed_sparse_kwargs(
+            block_lut, kernel_block_sizes(args.kernel, args.mha4_block_tile)
+        )
+        if args.kernel.startswith("mha4_")
+        else {}
+    )
     raw_sparse = (
         {"block_mask": block_mask}
         if block_lut is not None and block_mask is not None
         else {}
     )
-    if args.mha4_block_tile is not None:
-        for sparse in (packed_sparse, raw_sparse):
-            if sparse:
-                sparse["block_tile"] = args.mha4_block_tile
+    if args.mha4_block_tile is not None and raw_sparse:
+        raw_sparse["block_tile"] = args.mha4_block_tile
 
     # A Sol-Attn kernel reuses another row's quantization wholesale and differs only in what is
     # appended to the launch, so the branches below dispatch on the base name.
