@@ -10,7 +10,7 @@ Loop-carried softmax and output values are passed as SSA values, not stored here
 import flydsl.expr as fx
 from flydsl.expr import arith, const_expr, gpu, range_constexpr
 
-from .traits import LOG2E, MFMA_MNK, WAVE
+from .traits import FP8_KV_DTYPES, LOG2E, MFMA_MNK, WAVE
 
 
 class PaDecodeContext:
@@ -72,17 +72,8 @@ class PaDecodeContext:
             self.kv_query % self.traits.query_splits
         ) * self.traits.QUERIES_PER_CTA
         self.n_kv = fx.Int32(gpu.grid_dim.y) // self.traits.query_splits
-        if const_expr(self.traits.batch_first_plan_grid):
-            self.part = fx.Int32(
-                fx.Uint32(gpu.block_id("x")) * fx.Uint32(gpu.grid_dim.z)
-                + fx.Uint32(gpu.block_id("z"))
-            )
-            # Physical x groups packed slots, not sequences.
-            capacity = fx.Int32(fx.Uint32(gpu.grid_dim.x) * fx.Uint32(gpu.grid_dim.z))
-            self.partial_slot = self.kv_h * capacity + self.part
-        else:
-            self.part = fx.Int32(gpu.block_id("x"))
-            self.partial_slot = self.kv_h * fx.Int32(gpu.grid_dim.x) + self.part
+        self.part = fx.Int32(gpu.block_id("x"))
+        self.partial_slot = self.kv_h * fx.Int32(gpu.grid_dim.x) + self.part
 
     def init_query_mapping(self):
         self.rgroup = (
@@ -106,7 +97,9 @@ class PaDecodeContext:
         self.part_end = self.planned_end
 
     def init_scales(self, key_scale, value_scale):
-        if const_expr(self.traits.per_token_kv or self.traits.PV_BF16):
+        if const_expr(
+            self.traits.per_token_kv or self.traits.kv_dtype not in FP8_KV_DTYPES
+        ):
             self.scale_qk = fx.Float32(self.traits.softmax_scale * LOG2E)
         else:
             self.scale_qk = fx.Float32(self.traits.softmax_scale * LOG2E) * fx.Float32(
