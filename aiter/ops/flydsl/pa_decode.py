@@ -600,20 +600,16 @@ def pa_decode(
         ("context_lengths", context_lengths),
         ("block_tables", block_tables),
     )
-    for name, tensor in required_tensors:
+    quant_tensors = (
+        (("quantized_output", quantized_output), ("output_scale", output_scale))
+        if quant_output
+        else ()
+    )
+    for name, tensor in required_tensors + quant_tensors:
         if not isinstance(tensor, torch.Tensor):
             raise TypeError(
                 f"{name} must be a torch.Tensor, got {type(tensor).__name__}"
             )
-    if quant_output:
-        for name, tensor in (
-            ("quantized_output", quantized_output),
-            ("output_scale", output_scale),
-        ):
-            if not isinstance(tensor, torch.Tensor):
-                raise TypeError(
-                    f"{name} must be a torch.Tensor, got {type(tensor).__name__}"
-                )
 
     expected_ranks = (
         ("output", output, (3,)),
@@ -895,22 +891,13 @@ def pa_decode(
         ("value_cache", value_cache),
         ("block_tables", block_tables),
         ("context_lengths", context_lengths),
+        *quant_tensors,
     ):
         if tensor.device != dev:
             raise ValueError(
                 f"{name} must be on the same device as query ({dev}), "
                 f"got {tensor.device}"
             )
-    if quant_output:
-        for name, tensor in (
-            ("quantized_output", quantized_output),
-            ("output_scale", output_scale),
-        ):
-            if tensor.device != dev:
-                raise ValueError(
-                    f"{name} must be on the same device as query ({dev}), "
-                    f"got {tensor.device}"
-                )
     for name, tensor in (
         ("key_cache", key_cache),
         ("value_cache", value_cache),
@@ -1091,7 +1078,6 @@ def pa_decode(
     quant_after_output = quant_output and not (
         one_partition_output or cluster_merge == 8
     )
-    padded_quantized = (quantized_output, output_scale)
     if quant_after_output:
         quant_output = False
         if not store_output:
@@ -1285,7 +1271,6 @@ def pa_decode(
             from ..quant import dynamic_per_token_scaled_quant
 
             rows = output.shape[0]
-            quantized_output, output_scale = padded_quantized
             dynamic_per_token_scaled_quant(
                 quantized_output[:rows].view(rows, -1),
                 output.view(rows, -1),
