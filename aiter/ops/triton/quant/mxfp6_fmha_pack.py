@@ -616,6 +616,42 @@ def _k_lds_src_within(nt: int, total: int, h: int, device):
     return g
 
 
+def fill_fp6_k_scale_tails(buf: "torch.Tensor", scale: "torch.Tensor") -> None:
+    """Write every 128-token tile's 1024B K-scale tail of a flat MXFP6 K buffer, in place.
+
+    buf : contiguous 1D uint8 buffer of [b, h, n_tiles * FP6_K_TILE_BYTES] K tiles, laid out as
+          reorder_fp6_k_lds_order_triton lays them out; trailing slack may follow.
+    scale : contiguous uint8 E8M0 K scales [b, sk, h, 4], the plain image the tails gather from.
+    Each tail is Region A (unshifted) + Region B (pre-shifted +1 byte, so the kernel MFMA op_sel
+    picks dblk1/dblk3 with no runtime shift); rows past sk read as zero.
+    """
+    assert _HAVE_TRITON, "triton/torch unavailable"
+    b, sk, h, groups = scale.shape
+    assert groups == FP6_K_SCALE_VALUES_PER_TOKEN, scale.shape
+    assert scale.dtype == torch.uint8 and scale.is_contiguous(), (
+        scale.dtype,
+        scale.stride(),
+    )
+    assert buf.dim() == 1 and buf.dtype == torch.uint8 and buf.is_contiguous(), (
+        buf.shape,
+        buf.dtype,
+    )
+    assert buf.device == scale.device, (buf.device, scale.device)
+    nt = (sk + _K_TILE_TOKENS - 1) // _K_TILE_TOKENS
+    assert buf.numel() >= b * h * nt * _K_TILE_BYTES, (buf.numel(), b, h, nt)
+    _fill_k_scale_tail_kernel[(b * h * nt,)](
+        scale.view(-1),
+        buf,
+        sk,
+        h,
+        nt,
+        TILE_BYTES=_K_TILE_BYTES,
+        SCALE_TAIL_OFFSET=_K_SCALE_TAIL_OFFSET,
+        BLOCK=1024,
+        num_warps=4,
+    )
+
+
 def reorder_fp6_k_lds_order_triton(
     packed: "torch.Tensor",
     scale: "torch.Tensor",
@@ -684,20 +720,9 @@ def reorder_fp6_k_lds_order_triton(
         BLOCK=BLOCK,
         num_warps=4,
     )
-    # Fill the per-tile 1024B scale tail: Region A (unshifted) + Region B (pre-shifted +1 byte, so
-    # the kernel MFMA op_sel picks dblk1/dblk3 with no runtime shift). The B pre-shift reads 1 byte
-    # past the last token's scale on the final tile -> the +256 buf slack keeps it mapped.
-    _fill_k_scale_tail_kernel[(b * h * nt,)](
-        scale.reshape(-1),
-        buf,
-        sk,
-        h,
-        nt,
-        TILE_BYTES=_K_TILE_BYTES,
-        SCALE_TAIL_OFFSET=_K_SCALE_TAIL_OFFSET,
-        BLOCK=1024,
-        num_warps=4,
-    )
+    # Fill the per-tile 1024B scale tail. The B pre-shift reads 1 byte past the last token's scale
+    # on the final tile -> the +256 buf slack keeps it mapped.
+    fill_fp6_k_scale_tails(buf, scale)
     k_view = buf.as_strided(
         (b, sk, h, _K_PACKED_ROW_BYTES),
         (k_bs, _K_SEQ_STRIDE_BYTES, k_hs, 1),
