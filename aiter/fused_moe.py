@@ -4670,8 +4670,6 @@ def get_2stage_cfgs(
             unsupported = "stage2_scatter"
         elif has_activation_scales:
             unsupported = "prequantized activations"
-        elif has_num_local_tokens:
-            unsupported = "num_local_tokens"
         elif hidden_pad or intermediate_pad:
             unsupported = "hidden/intermediate padding"
         elif gate_mode is not GateMode.SEPARATED:

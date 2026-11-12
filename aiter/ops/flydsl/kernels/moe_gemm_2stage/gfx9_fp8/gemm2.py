@@ -34,6 +34,7 @@ def compile_moe_gemm2(
     swiglu_limit=None,
     down_path="default",
     down_output_padding_bytes=0,
+    has_num_local_tokens=False,
 ):
     TILE_K = 64
     act_quant_type, swiglu_limit = validate_gemm_options(
@@ -47,6 +48,8 @@ def compile_moe_gemm2(
     )
     if alg == "batch1":
         assert K % TILE_K == 0, "batch1 Down requires K divisible by 64"
+    # The sorted algorithms bound the rows in moe_sorting.
+    assert not has_num_local_tokens or alg == "batch1"
     if alg == "prefill_1x4":
         assert K % 64 == 0, f"down prefill requires K to be divisible by 64, got K={K}"
         assert N % 256 == 0, (
@@ -290,6 +293,7 @@ def compile_moe_gemm2(
         p_topk_ids: fx.Pointer,
         p_topk_weights: fx.Pointer,
         p_w_scale: fx.Pointer,
+        p_num_local_tokens: fx.Pointer,
     ):
         tid = gpu.thread_idx.x
         blk_n = gpu.block_idx.x
@@ -306,6 +310,10 @@ def compile_moe_gemm2(
         arg_p_topk_ids = fx.recast_iter(fx.Int32, fxh._as_ptr(p_topk_ids))
         arg_p_topk_weights = fx.recast_iter(fx.Float32, fxh._as_ptr(p_topk_weights))
         expert_id = arg_p_topk_ids[route_idx]
+        if const_expr(has_num_local_tokens):
+            # Rows at and past the count (CUDA-graph padding) run no route.
+            num_rows = fx.recast_iter(fx.Int32, fxh._as_ptr(p_num_local_tokens))[0]
+            expert_id = (fx.Int32(batch_idx) < num_rows).select(expert_id, fx.Int32(-1))
         topk_weight = arg_p_topk_weights[route_idx]
         # Routing gives pad rows expert -1, which sorting would drop.
         if expert_id >= 0:
@@ -752,6 +760,7 @@ def compile_moe_gemm2(
         p_topk_ids: fx.Pointer,
         p_topk_weights: fx.Pointer,
         p_w_scale: fx.Pointer,
+        p_num_local_tokens: fx.Pointer,
         task_num: fx.Int32,
         stream: fx.Stream,
     ):
@@ -759,7 +768,13 @@ def compile_moe_gemm2(
         num_n_blocks = fxh.div_up(N, BLOCK_TILE_SIZE_N)
         batch_size = task_num // TOPK
         moe_2stage_down_batch1(
-            p_input, p_weight, p_output, p_topk_ids, p_topk_weights, p_w_scale
+            p_input,
+            p_weight,
+            p_output,
+            p_topk_ids,
+            p_topk_weights,
+            p_w_scale,
+            p_num_local_tokens,
         ).launch(
             grid=(num_n_blocks, TOPK, batch_size),
             block=(64, 1, 1),
