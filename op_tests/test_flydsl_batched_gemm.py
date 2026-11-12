@@ -112,6 +112,21 @@ COMPUTE_CASES = (
         5120,
         "flydsl_mxfp8_32_bpreshuffle_compute_wmma_t256x256x128_mw2_nw2_nb2_sk1_cm4_cn1",
     ),
+    # 63 / 50 M-tiles: grid.x padded to whole cluster rows
+    (
+        1,
+        15997,
+        1792,
+        5120,
+        "flydsl_mxfp8_32_bpreshuffle_compute_wmma_t256x256x128_mw2_nw2_nb2_sk1_cm4_cn1",
+    ),
+    (
+        8,
+        12716,
+        1024,
+        4096,
+        "flydsl_mxfp8_32_bpreshuffle_compute_wmma_t256x256x128_mw2_nw2_nb2_sk1_cm4_cn2_ps2",
+    ),
 )
 
 

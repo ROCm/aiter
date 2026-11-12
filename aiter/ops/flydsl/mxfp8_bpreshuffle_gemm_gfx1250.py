@@ -229,12 +229,13 @@ def _run_mxfp8_bpreshuffle_gemm_a8_gfx1250(
             f"[FlyDSL gfx1250 mxfp8] N={N} must be a multiple of "
             f"tile_n*cluster_n={tile_n}*{cluster_n}={tile_n * cluster_n}"
         )
-    if not cluster_m_grid_ok(M, tile_m, cluster_m):
+    if not cluster_m_grid_ok(M, tile_m, cluster_m) and not cluster_m_pads(
+        M, tile_m, cluster_m, split_k, compute_bound and w_scale_32x32
+    ):
         raise RuntimeError(
             f"[FlyDSL gfx1250 mxfp8] M={M} gives "
             f"ceil(M/tile_m)={(M + tile_m - 1) // tile_m} M-tiles, which is not a "
-            f"multiple of cluster_m={cluster_m}; grid.x would be padded with "
-            f"workgroups that own no M row and deadlock the cluster"
+            f"multiple of cluster_m={cluster_m}"
         )
     if K % tile_k != 0:
         raise RuntimeError(
@@ -351,7 +352,7 @@ def _run_mxfp8_bpreshuffle_gemm_a8_gfx1250(
     fused = fused_splitk and _fused_splitk_ok(
         tile_m, cluster_m, cluster_n, split_k, compute_bound
     )
-    bounded_m = bool(M % tile_m)
+    bounded_m = fused and bool(M % tile_m)
     if fused:
         # One contiguous plane per split of an output tile, holding only the
         # peer rows -- the local stripe never leaves LDS.  Round M up for the
@@ -536,6 +537,23 @@ def cluster_m_grid_ok(M: int, tile_m: int, cluster_m: int) -> bool:
     return m_blocks % cluster_m == 0
 
 
+_PAD_MIN_M_TILES_PER_CLUSTER_M = 4
+
+
+def cluster_m_pads(
+    M: int, tile_m: int, cluster_m: int, split_k: int, can_pad: bool
+) -> bool:
+    """Whether grid.x is padded to whole cluster rows instead of a cluster_m
+    fallback; padded workgroups load and store zero rows (TDM clamps)."""
+    m_tiles = (M + tile_m - 1) // tile_m
+    return (
+        can_pad
+        and split_k == 1
+        and cluster_m > 1
+        and m_tiles >= _PAD_MIN_M_TILES_PER_CLUSTER_M * cluster_m
+    )
+
+
 def resolve_cluster_m(M: int, tile_m: int, cluster_m: int) -> int | None:
     for cm in range(max(1, int(cluster_m)), 0, -1):
         if cluster_m_grid_ok(M, tile_m, cm):
@@ -557,7 +575,11 @@ def is_compute_wmma_kernel_name(name: str) -> bool:
 
 @functools.lru_cache(maxsize=1024)
 def _resolved_wmma_config(
-    kernel_name: str, true_m: int, allow_cluster_m_fallback: bool, mx32: bool
+    kernel_name: str,
+    true_m: int,
+    allow_cluster_m_fallback: bool,
+    mx32: bool,
+    w_scale_32x32: bool = False,
 ) -> tuple[tuple[str, int | bool], ...]:
     """Parsed kernelName with its cluster_m fitted to M, cached off the hot path."""
     parse = parse_mxfp8_32_wmma_kernel_name if mx32 else parse_wmma_kernel_name
@@ -567,7 +589,13 @@ def _resolved_wmma_config(
         raise ValueError(
             f"[FlyDSL gfx1250 {tag}] unrecognised kernelName: {kernel_name!r}"
         )
-    if allow_cluster_m_fallback:
+    if allow_cluster_m_fallback and not cluster_m_pads(
+        true_m,
+        cfg["tile_m"],
+        cfg["cluster_m"],
+        cfg["split_k"],
+        w_scale_32x32 and is_compute_wmma_kernel_name(kernel_name),
+    ):
         cfg["cluster_m"] = (
             resolve_cluster_m(true_m, cfg["tile_m"], cfg["cluster_m"])
             or cfg["cluster_m"]
@@ -643,7 +671,9 @@ def run_gemm_a8w8_mxfp8_32_bpreshuffle_gfx1250(
     ``w_scale_32x32``; WQ is 16x16 preshuffled. ``batch``: see
     ``_run_mxfp8_bpreshuffle_gemm_a8_gfx1250``.
     """
-    cfg = dict(_resolved_wmma_config(kernel_name, Out.shape[0], True, True))
+    cfg = dict(
+        _resolved_wmma_config(kernel_name, Out.shape[0], True, True, w_scale_32x32)
+    )
     if cfg["a_preshuffle"]:
         raise ValueError(
             f"[FlyDSL gfx1250 mxfp8_32] a_preshuffle is not supported: {kernel_name!r}"
