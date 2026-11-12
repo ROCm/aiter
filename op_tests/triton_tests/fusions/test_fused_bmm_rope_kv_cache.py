@@ -452,11 +452,15 @@ def _assert_fp8_bmm_mla_result(inputs, actual, expected, expected_cache):
         assert result.dtype == reference.dtype
         assert result.device == reference.device
 
+    # FP8 projection outputs may differ from the reference by one e4m3
+    # rounding step (relative spacing 2**-3) where accumulation order moves
+    # a value across a rounding boundary.
+    fp8_output = actual[0].dtype in (torch.float8_e4m3fn, torch.float8_e4m3fnuz)
     torch.testing.assert_close(
         actual[0][..., :512].float(),
         expected[0][..., :512].float(),
         atol=1e-2,
-        rtol=1e-1,
+        rtol=2**-3 if fp8_output else 1e-1,
     )
     torch.testing.assert_close(
         actual[0][..., 512:].float(),
