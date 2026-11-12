@@ -154,7 +154,10 @@ _NATIVE_SCALED_CVT_ARCHS = ("gfx950",)
 # fp4 (i32, 8 nibbles) / fp8 (v2i32, 8 e4m3 bytes), dividing by the e8m0 exponent
 # carried in the f32 scale. We emit them via inline asm so they do not depend on
 # the MLIR rocdl op lowering.
-_PK8_BF16_ARCHS = ("gfx1250",)
+_PK8_BF16_ARCHS = (
+    "gfx1250",
+    "gfx1250-strict",
+)
 
 
 def _arch_has_pk8(arch: str) -> bool:
@@ -1415,11 +1418,6 @@ def build_moe_fused_quant_preshuffle_module(
     L = _quant_layout(feat_dim, quant_mode, wmma_rep)
     if payload_preshuffled and (quant_mode != "fp4" or feat_dim % 128):
         raise ValueError("preshuffled payload requires MXFP4 and K divisible by 128")
-    # Unpack into locals so the @kernel closure captures the quant_mode-derived
-    # scalars (is_fp8, payload geometry, ...). The JIT disk cache keys on the
-    # launch function's source + scalar closure values; if these stayed hidden
-    # inside the ``L`` namespace the fp4 and fp8 variants (same feat_dim/wmma_rep)
-    # would hash to the same key and silently share one binary.
     is_fp8 = L.is_fp8
     use_native = L.use_native
     use_pk8 = L.use_pk8
@@ -2023,6 +2021,29 @@ def build_moe_fused_quant_preshuffle_route_ksplit_module(
     return launch_fused
 
 
+def _token_multidest_live_rows(raw_rows):
+    """One token's destination rows, each DROPPED_ROUTE_ROW (a route to expert
+    -1, e.g. a pad row past the real row count) pointed at one of the token's
+    live rows, and whether it has any live row.
+
+    A repeated destination rewrites the same bytes to the same row, so it needs
+    no branch. A token with no live row is switched off whole, as a token past
+    the end is; its rows are then 0 so every address stays in range.
+    """
+    live = [fx.Int32(row) >= 0 for row in raw_rows]
+    alias = fx.Int32(0)
+    for k in reversed(range(len(raw_rows))):
+        alias = live[k].select(fx.Int32(raw_rows[k]), alias)
+    rows = [
+        fx.Uint32(live[k].select(fx.Int32(raw_rows[k]), alias))
+        for k in range(len(raw_rows))
+    ]
+    any_live = live[0]
+    for flag in live[1:]:
+        any_live = any_live | flag
+    return rows, any_live
+
+
 def _token_multidest_scale_base(
     row, c_rows_per_tile, c_dst_scale_dwords_per_row, c16_i32
 ):
@@ -2251,18 +2272,21 @@ def build_moe_token_multidest_quant_module(
         # bounds check rather than by a branch.
         valid = token < fx.Uint32(token_num)
         token_eff = valid.select(token, fx.Uint32(c0_i32))
-        pay_records = valid.select(fx.Int32(payload_bytes_per_row), c0_i32)
-        # Sign-extended to i64 by the descriptor builder, so stay under 2 GiB.
-        scale_records = valid.select(fx.Int32(_SCALE_RSRC_MAX_BYTES), c0_i32)
         if token0 < fx.Uint32(token_num):
             rows_t = ptr_buf_tensor(topids_to_rows)
             route0 = token_eff * fx.Int32(topk)
             # Scalar loads: the route is wave-uniform, and landing each row in
             # an SGPR is what keeps its destination descriptor uniform too.
-            rows = [
-                fx.Uint32(buf_scalar_load(rows_t, route0 + fx.Int32(k)))
-                for k in range_constexpr(topk)
-            ]
+            rows, any_live = _token_multidest_live_rows(
+                [
+                    fx.Int32(buf_scalar_load(rows_t, route0 + fx.Int32(k)))
+                    for k in range_constexpr(topk)
+                ]
+            )
+            token_live = valid & any_live
+            pay_records = token_live.select(fx.Int32(payload_bytes_per_row), c0_i32)
+            # Sign-extended to i64 by the descriptor builder, so stay under 2 GiB.
+            scale_records = token_live.select(fx.Int32(_SCALE_RSRC_MAX_BYTES), c0_i32)
             scales = [
                 _token_multidest_scale_base(
                     row, c_rows_per_tile, c_dst_scale_dwords_per_row, c16_i32
@@ -2555,18 +2579,21 @@ def build_moe_token_multidest_compact_quant_module(
 
             valid = token < fx.Uint32(token_num)
             token_eff = valid.select(token, fx.Uint32(c0_i32))
-            pay_records = valid.select(fx.Int32(payload_bytes_per_row), c0_i32)
-            scale_records = valid.select(fx.Int32(_SCALE_RSRC_MAX_BYTES), c0_i32)
 
             rows_t = ptr_buf_tensor(topids_to_rows)
             route0 = token_eff * fx.Int32(topk)
-            rows = [
-                fx.Uint32(buf_scalar_load(rows_t, route0 + fx.Int32(k)))
-                for k in range_constexpr(topk)
-            ]
+            rows, any_live = _token_multidest_live_rows(
+                [
+                    fx.Int32(buf_scalar_load(rows_t, route0 + fx.Int32(k)))
+                    for k in range_constexpr(topk)
+                ]
+            )
+            token_live = valid & any_live
+            pay_records = token_live.select(fx.Int32(payload_bytes_per_row), c0_i32)
+            scale_records = token_live.select(fx.Int32(_SCALE_RSRC_MAX_BYTES), c0_i32)
 
             r2t_t = ptr_buf_tensor(row_to_token)
-            write_r2t = fx.Boolean(valid) & (fx.Uint32(lane) == fx.Uint32(c0_i32))
+            write_r2t = fx.Boolean(token_live) & (fx.Uint32(lane) == fx.Uint32(c0_i32))
 
             def _store_r2t():
                 for k in range_constexpr(topk):

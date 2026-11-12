@@ -1,0 +1,36 @@
+{
+    "stacked_decode": {
+        "bf16": {
+            "BMT": 4,
+            "BN": 32,
+            "num_warps": 2,
+            "column_programs": 256
+        },
+        "fp8": {
+            "BMT": 4,
+            "BN": 64,
+            "num_warps": 4,
+            "column_programs": 256
+        },
+        "fp4": {
+            "BMT": 4,
+            "BN": 64,
+            "num_warps": 4,
+            "column_programs": 256
+        }
+    },
+    "gqa_fp8": {
+        "decode": {
+            "BLOCK_N": 32,
+            "num_warps": 4,
+            "num_stages": 2,
+            "waves_per_eu": 0
+        },
+        "prefill": {
+            "BLOCK_N": 32,
+            "num_warps": 2,
+            "num_stages": 2,
+            "waves_per_eu": 0
+        }
+    }
+}

@@ -10,12 +10,12 @@ import torch
 from aiter.jit.utils.chip_info import get_cu_num, get_gfx_runtime
 
 from ..kernels.kernels_common import get_warp_size
-from ..kernels.tensor_shim import _run_compiled
 from ..kernels.topk.radix_topk_one_block import (
     _COMPACT_CAPACITY,
     _MAX_ROW_ELEMENTS,
     build_radix_topk_one_block_module,
 )
+from ..kernels.topk.topk_launch import run_topk_launcher
 from ..kernels.topk.topk_per_row_decode import (
     clear_topk_per_row_decode_workspace_cache,  # noqa: F401 -- public re-export
     launch_topk_per_row_decode,
@@ -29,6 +29,8 @@ from .row_lens import row_len_slot
 # Widths up to this value use the persistent one-workgroup kernel.
 _ONE_WORKGROUP_MAX_ROW_WIDTH = 20_000
 _SHORT_ROWS_1024_THREAD_MAX_ROWS = 256
+# Long rows past this many take 512-thread blocks, two resident per CU.
+_LONG_ROWS_512_THREAD_ARCHES = ("gfx1250",)
 
 
 @lru_cache(maxsize=128)
@@ -155,7 +157,7 @@ def _validate_flydsl_topk_call(
         )
 
 
-_FLYDSL_TOPK_ONE_BLOCK_ARCHES = ("gfx950", "gfx1250")
+_FLYDSL_TOPK_ONE_BLOCK_ARCHES = ("gfx950", "gfx1250", "gfx1250-strict")
 
 
 def _validate_radix_topk_one_block_call(
@@ -385,7 +387,7 @@ def flydsl_top_k_per_row_decode(
             full_rows=full_rows,
             exact_rows=full_rows and one_workgroup_rows_are_exact(width),
         )
-        _run_compiled(
+        run_topk_launcher(
             launcher,
             logits,
             starts,
@@ -474,9 +476,14 @@ def flydsl_radix_topk_one_block(
     wave_size = get_warp_size(arch)
     stream = torch.cuda.current_stream(logits.device)
     short_rows = width <= _COMPACT_CAPACITY
-    block_threads = (
-        1024 if not short_rows or num_rows <= _SHORT_ROWS_1024_THREAD_MAX_ROWS else 256
-    )
+    if num_rows <= _SHORT_ROWS_1024_THREAD_MAX_ROWS:
+        block_threads = 1024
+    elif short_rows:
+        block_threads = 256
+    elif is_decode and arch in _LONG_ROWS_512_THREAD_ARCHES:
+        block_threads = 512
+    else:
+        block_threads = 1024
     launcher = build_radix_topk_one_block_module(
         k,
         block_threads=block_threads,
@@ -488,7 +495,7 @@ def flydsl_radix_topk_one_block(
         arch=arch,
         packed_rows=packed_rows,
     )
-    _run_compiled(
+    run_topk_launcher(
         launcher,
         logits,
         row_starts,
