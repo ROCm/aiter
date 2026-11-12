@@ -17,10 +17,13 @@ from aiter.ops.triton._gluon_kernels.gfx950.attention.sparse_mla_fp8 import (
 )
 from aiter.ops.triton.attention.pa_decode_sparse import (
     _PREFILL_MIN_ROWS,
+    _V4_REC_ALIGNED,
     _as_int32_contiguous_1d,
     _check_epilogue,
     _launch_splits,
+    _pa_decode_sparse_gfx1250_fp8,
     _staged_block_m,
+    _v4_split_aligned,
 )
 from aiter.ops.triton.utils._triton import arch_info
 from aiter.ops.triton.utils.common_utils import max_addressable_bytes
@@ -88,6 +91,10 @@ FP8_ARCHS = ("gfx950",)
 # gfx950-only. Everywhere else they land in its fallback path, which reads a
 # plain grouped fp8 pool rather than these records, so it rejects them on dtype.
 PACKED_ARCHS = ("gfx950",)
+
+# The 640 B aligned DeepSeek-V4 record (fp8_dsv4_mla_640) is read by the gfx1250
+# fp8 driver of pa_decode_sparse, for prefill and decode alike.
+DSV4_640_ARCHS = ("gfx1250", "gfx1250-strict")
 
 
 def _get_config(arch: str | None = None) -> dict:
@@ -303,6 +310,19 @@ def _classify_cache(q, kv, kv_lora_rank, qk_rope_head_dim, kv_scale, what="kv_bu
         raise ValueError(
             f"{what}: a 4-D cache must be [slots, 1, 1, R], got {tuple(kv.shape)}"
         )
+    if (
+        kv.ndim in (2, 3)
+        and kv.element_size() == 1
+        and kv.shape[-1] == _V4_REC_ALIGNED
+        and kv.shape[-1] != d_qk
+    ):
+        # [rows, 640] (the record grid, one row per index) or [nb, block, 640].
+        if kv_scale is not None:
+            raise ValueError(
+                f"{what}: the 640 B DeepSeek-V4 record carries its own scales; "
+                f"kv_scale must be None"
+            )
+        return "fp8_dsv4_mla_640"
     if kv.ndim in (2, 4):
         width = kv.shape[-1]
         if width != d_qk:
@@ -345,10 +365,10 @@ def _check_geometry(fmt, d_qk, kv_lora_rank, qk_rope_head_dim):
             f"kv_lora_rank must be > 0 and qk_rope_head_dim >= 0, got "
             f"{kv_lora_rank} / {qk_rope_head_dim}"
         )
-    if fmt == "fp8_dsv4_mla":
+    if fmt in ("fp8_dsv4_mla", "fp8_dsv4_mla_640"):
         if d_qk != 512:
             raise ValueError(
-                f"fp8_dsv4_mla needs q width 512 (448 nope + 64 rope), got {d_qk}"
+                f"{fmt} needs q width 512 (448 nope + 64 rope), got {d_qk}"
             )
         return
     if fmt == "fp8_g64":
@@ -693,6 +713,115 @@ def _sparse_mla_fwd_gfx950_fp8(
     return out, lse
 
 
+def _forward_dsv4_640(
+    q,
+    kv,
+    kv_indptr,
+    kv_indices,
+    softmax_scale,
+    *,
+    q_rope,
+    kv_splits,
+    skip_reduce,
+    has_invalid,
+    dot_precision,
+    q_scale,
+    out,
+    return_lse,
+    attn_sink,
+    extra_kv,
+    extra_indptr,
+    extra_indices,
+    inv_rope_positions,
+    out_mxfp8,
+):
+    """fp8_dsv4_mla_640 -> the gfx1250 fp8 driver, for prefill and decode alike.
+
+    Prefill and decode are the same kernel: they differ only in the number of
+    query rows, and the split-K heuristic is driven by that count (it settles
+    on one split, the single-pass form, once the rows fill the GPU). So the
+    caller does not say which one it is; kv_splits=1 forces the single pass.
+    """
+    arch = arch_info.get_arch()
+    if arch not in DSV4_640_ARCHS:
+        raise ValueError(
+            f"the 640 B DeepSeek-V4 record (fp8_dsv4_mla_640) is "
+            f"{'/'.join(DSV4_640_ARCHS)}-only, got {arch}"
+        )
+    unsupported = [
+        name
+        for name, asked in (
+            ("dot_precision='fp8'", dot_precision != "bf16"),
+            ("return_lse", return_lse),
+            ("q_scale", q_scale is not None),
+            ("inv_rope_positions", inv_rope_positions is not None),
+            ("out_mxfp8", out_mxfp8 is not None),
+        )
+        if asked
+    ]
+    if unsupported:
+        raise ValueError(
+            f"{', '.join(unsupported)} is not supported for fp8_dsv4_mla_640 yet"
+        )
+    if q_rope is not None:
+        # q is the packed row (fp8 NoPE + its UE8M0 scales) and q_rope its bf16
+        # RoPE half, as the fused DSv4 Q producers emit them.
+        if q.dtype != torch.float8_e4m3fn:
+            raise ValueError(
+                f"with q_rope, q must be the packed float8_e4m3fn row, got {q.dtype}"
+            )
+        if q_rope.dtype != torch.bfloat16 or tuple(q_rope.shape) != (
+            q.shape[0],
+            q.shape[1],
+            64,
+        ):
+            raise ValueError(
+                f"q_rope must be bf16 [{q.shape[0]}, {q.shape[1]}, 64], got "
+                f"{q_rope.dtype} {tuple(q_rope.shape)}"
+            )
+    elif q.dtype != torch.bfloat16:
+        raise ValueError(
+            f"fp8_dsv4_mla_640 takes bf16 q, or the packed fp8 q with q_rope; "
+            f"got {q.dtype} without q_rope"
+        )
+
+    def _split(cache, what):
+        if cache.ndim == 2:  # the record grid: one row per index
+            if cache.stride(-1) != 1 or cache.stride(0) != _V4_REC_ALIGNED:
+                raise ValueError(
+                    f"{what}: a [rows, 640] record grid must be row-contiguous, "
+                    f"got strides {tuple(cache.stride())}"
+                )
+            cache = cache.unsqueeze(1)
+        return _v4_split_aligned(cache)
+
+    kv, kv_rope = _split(kv, "kv_buffer")
+    x_kv = x_rope = None
+    if extra_kv is not None:
+        x_kv, x_rope = _split(extra_kv, "extra_kv")
+        extra_indices = _as_int32_contiguous_1d(extra_indices)
+        extra_indptr = _as_int32_contiguous_1d(extra_indptr)
+    res = _pa_decode_sparse_gfx1250_fp8(
+        q,
+        kv,
+        kv_rope,
+        _as_int32_contiguous_1d(kv_indices),
+        _as_int32_contiguous_1d(kv_indptr),
+        attn_sink,
+        softmax_scale,
+        q_rope=q_rope,
+        extra_cache=x_kv,
+        extra_cache_rope=x_rope,
+        extra_indices=extra_indices,
+        extra_indptr=extra_indptr,
+        kv_splits=kv_splits,
+        has_invalid=has_invalid,
+        skip_reduce=skip_reduce,
+        out=out,
+    )
+    return res if isinstance(res, tuple) else (res, None)
+
+
 def sparse_mla_fwd(
     q: torch.Tensor,
     kv_buffer: torch.Tensor,
@@ -718,6 +847,7 @@ def sparse_mla_fwd(
     inv_rope_positions: torch.Tensor | None = None,
     inv_rope_cos_sin_cache: torch.Tensor | None = None,
     out_mxfp8: tuple[torch.Tensor, torch.Tensor] | None = None,
+    q_rope: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor | None]:
     """Sparse (top-k gathered) MLA attention.
 
@@ -746,6 +876,12 @@ def sparse_mla_fwd(
                        (DeepSeek-V4; vLLM fp8_ds_mla:
                        448 fp8 | 64 bf16 rope + 8 B
                        UE8M0 trailer per block)
+        fp8_dsv4_mla_640  [nb, block, 640] or        None            ignored
+                       [rows, 640] uint8/fp8 (DeepSeek-V4,
+                       gfx1250: 448 fp8 | 14 B UE8M0 |
+                       pad | 64 bf16 rope, every record
+                       128 B aligned; a [rows, 640]
+                       record grid is indexed by row)
 
     Geometry, set by qk_rope_head_dim: separated rope (DeepSeek-V3.2,
     GLM-5.1/5.2), where the query is the latent plus an appended rope and V is
@@ -808,6 +944,13 @@ def sparse_mla_fwd(
             rotated back (inverse GPT-J RoPE) before the store. DeepSeek-V4
             caches only (fp8_dsv4_mla, fp8_g64, the two-loop), whose rope lives
             inside the row, and gfx950's 512-wide fp8_scalar with fp8 dots.
+        q_rope: fp8_dsv4_mla_640 only. [C, H, 64] bf16, the RoPE half of a
+            query that is already packed: q is then the [C, H, 512]
+            float8_e4m3fn row (NoPE with its UE8M0 scales) the fused DSv4 Q
+            producers emit, and no q_scale is taken. Without it q is bf16.
+            The 640 B format serves prefill and decode through the same kernel;
+            the split-K heuristic follows the row count (kv_splits=1 forces the
+            single pass).
         out_mxfp8: (data [C, H * D] e4m3, scale [C, H * D // 32] uint8 E8M0) in
             place of out, for the same caches: the output is stored
             MXFP8-quantized, one scale per 32 lanes, and data viewed as
@@ -844,7 +987,9 @@ def sparse_mla_fwd(
     if has_extra:
         # The SWA-window + top-k two-loop: both segments are block caches the
         # dsv4 decoder reads. A flat main pool would silently drop the extra one.
-        if kv_buffer.ndim != 3 or fmt not in ("fp8_dsv4_mla", "bf16", "fp8_scalar"):
+        if fmt != "fp8_dsv4_mla_640" and (
+            kv_buffer.ndim != 3 or fmt not in ("fp8_dsv4_mla", "bf16", "fp8_scalar")
+        ):
             raise ValueError(
                 "the two-loop needs a 3-D block cache (fp8_dsv4_mla, bf16 or "
                 f"fp8_scalar) as kv_buffer, got {fmt}"
@@ -869,13 +1014,44 @@ def sparse_mla_fwd(
             extra_fmt = _classify_cache(
                 q, extra_kv, kv_lora_rank, qk_rope_head_dim, None, what="extra_kv"
             )
-            if extra_kv.ndim != 3 or extra_fmt not in ("fp8_dsv4_mla", "bf16"):
+            if (fmt == "fp8_dsv4_mla_640") != (extra_fmt == "fp8_dsv4_mla_640"):
+                raise ValueError(
+                    f"kv_buffer is {fmt} but extra_kv is {extra_fmt}; the 640 B "
+                    f"record pairs only with itself"
+                )
+            if extra_fmt != "fp8_dsv4_mla_640" and (
+                extra_kv.ndim != 3 or extra_fmt not in ("fp8_dsv4_mla", "bf16")
+            ):
                 raise ValueError(
                     f"extra_kv must be a 3-D fp8_dsv4_mla or bf16 block cache, got "
                     f"{extra_fmt}"
                 )
         _check_index_stream(
             extra_indptr, extra_indices, num_queries, q.device, what="extra_"
+        )
+    if q_rope is not None and fmt != "fp8_dsv4_mla_640":
+        raise ValueError(f"q_rope (a packed DSv4 q) needs fp8_dsv4_mla_640, got {fmt}")
+    if fmt == "fp8_dsv4_mla_640":
+        return _forward_dsv4_640(
+            q,
+            kv_buffer,
+            kv_indptr,
+            kv_indices,
+            softmax_scale,
+            q_rope=q_rope,
+            kv_splits=kv_splits,
+            skip_reduce=skip_reduce,
+            has_invalid=has_invalid,
+            dot_precision=dot_precision,
+            q_scale=q_scale,
+            out=out,
+            return_lse=return_lse,
+            attn_sink=attn_sink,
+            extra_kv=extra_kv if has_extra else None,
+            extra_indptr=extra_indptr,
+            extra_indices=extra_indices,
+            inv_rope_positions=inv_rope_positions,
+            out_mxfp8=out_mxfp8,
         )
     if fmt in ("fp8_dsv4_mla", "fp8_g64") or (has_extra and fmt != "fp8_scalar"):
         return _forward_paged(
