@@ -25,6 +25,7 @@ fp32 scores, so it is skipped (``err`` empty) for cases where that would not fit
 import argparse
 import csv
 import itertools
+import time
 
 import pandas as pd
 import pytest
@@ -530,9 +531,7 @@ def test_flydsl_bwd_dense_causal_shapes(
 
 requires_fused = pytest.mark.skipif(
     not torch.cuda.is_available()
-    # The tests allocate on "cuda", i.e. the current device.
-    or hstu_kernels._device_arch_and_cus(torch.cuda.current_device())
-    != ("gfx942", 304),
+    or hstu_kernels._fused_arch_and_cus() != ("gfx942", 304),
     reason="hstu bwd fused is validated on the 304-CU gfx942 class only",
 )
 
@@ -799,73 +798,12 @@ def _balance_perm_offsets(aligned):
     return seq_offsets
 
 
-def _clear_balance_perm_cache():
-    hstu_kernels._balance_gather_index.cache_clear()
-    hstu_kernels._identity_perm.cache_clear()
-
-
 @requires_cuda
 @pytest.mark.parametrize("aligned", [True, False])
-def test_balance_perm_cache_is_safe_across_streams(aligned):
-    """A cache miss on a stalled stream is complete before another stream reads.
-
-    The cached gather index (identity perm for unaligned batches) is built on
-    whichever stream misses first. A second stream that read it while the
-    first was still stalled would see whatever the block held before. The
-    stalled stream's free blocks are zero-filled first, so such a read gives a
-    perm full of repeats instead of, by luck, the right one; the reader copies
-    the perm at once, so a premature read is captured.
-    """
-    seq_offsets = _balance_perm_offsets(aligned)
-    batch = seq_offsets.numel() - 1
-    for _ in range(5):
-        _clear_balance_perm_cache()
-        stalled, reader = torch.cuda.Stream(), torch.cuda.Stream()
-        with torch.cuda.stream(stalled):
-            poison = [
-                torch.zeros(batch, dtype=torch.int64, device="cuda") for _ in range(32)
-            ]
-        torch.cuda.synchronize()
-        del poison
-        with torch.cuda.stream(stalled):
-            torch.cuda._sleep(200_000_000)
-            hstu_kernels._build_balance_perm(seq_offsets)
-        with torch.cuda.stream(reader):
-            perm = hstu_kernels._build_balance_perm(seq_offsets).clone()
-        torch.cuda.synchronize()
-        assert sorted(perm.tolist()) == list(range(batch))
-
-
-@requires_cuda
-@pytest.mark.parametrize("aligned", [True, False])
-def test_balance_perm_cache_never_waits_on_the_host(monkeypatch, aligned):
-    """Cold and warm lookups order readers on the device only."""
-    seq_offsets = _balance_perm_offsets(aligned)
-    _clear_balance_perm_cache()
-
-    def host_wait(*_args, **_kwargs):
-        raise AssertionError("the permutation cache waited on the host")
-
-    monkeypatch.setattr(torch.cuda, "synchronize", host_wait)
-    monkeypatch.setattr(torch.cuda.Stream, "synchronize", host_wait)
-    monkeypatch.setattr(torch.cuda.Event, "synchronize", host_wait)
-    monkeypatch.setattr(torch.cuda.Event, "query", host_wait)
-    side = torch.cuda.Stream()
-    with torch.cuda.stream(side):
-        hstu_kernels._build_balance_perm(seq_offsets)
-        hstu_kernels._build_balance_perm(seq_offsets)
-
-
-@requires_cuda
-@pytest.mark.parametrize("warm", [True, False])
-@pytest.mark.parametrize("aligned", [True, False])
-def test_balance_perm_is_graph_capturable(aligned, warm):
-    """The permutation builds under graph capture, cache warm or cold, and
-    replays to the eager result; a cold capture leaves the cache empty."""
+def test_balance_perm_is_graph_capturable(aligned):
+    """The permutation builds under graph capture and replays to the eager result."""
     seq_offsets = _balance_perm_offsets(aligned)
     expected = hstu_kernels._build_balance_perm(seq_offsets).clone()
-    if not warm:
-        _clear_balance_perm_cache()
     torch.cuda.synchronize()
 
     graph = torch.cuda.CUDAGraph()
@@ -874,9 +812,7 @@ def test_balance_perm_is_graph_capturable(aligned, warm):
     graph.replay()
     torch.cuda.synchronize()
     assert torch.equal(perm, expected)
-    if not warm:
-        assert hstu_kernels._balance_gather_index.cache_info().currsize == 0
-        assert hstu_kernels._identity_perm.cache_info().currsize == 0
+    assert sorted(perm.tolist()) == list(range(seq_offsets.numel() - 1))
 
 
 def _inputs_with_lengths(lengths, h=4, d=64, seed=7):
@@ -981,48 +917,6 @@ def test_bwd_fused_gate_requires_validated_device(num_cus):
     validate_hstu_attention_bwd(*args, **tiles, arch="gfx942", num_cus=304)
 
 
-@pytest.mark.parametrize("tensors_cus,expect_fused", [(304, True), (80, False)])
-def test_bwd_fused_gate_reads_the_tensors_device(
-    monkeypatch, tensors_cus, expect_fused
-):
-    """The gate checks the device holding the tensors, not the current one.
-
-    A node can mix gfx942 parts. The tensors' device (index 7) and every
-    other device report different CU counts, and reading the current device
-    directly fails, so only a gate that queries index 7 passes both cases.
-    """
-    other_cus = 80 if tensors_cus == 304 else 304
-
-    def fake(index):
-        return ("gfx942", tensors_cus if index == 7 else other_cus)
-
-    def current_device_read(*_args, **_kwargs):
-        raise AssertionError("the gate read the current device")
-
-    monkeypatch.setattr(hstu_kernels, "_device_arch_and_cus", fake)
-    monkeypatch.setattr(torch.cuda, "get_device_properties", current_device_read)
-    monkeypatch.setattr(torch.cuda, "current_device", current_device_read)
-    kwargs = {
-        "device": torch.device("cuda", 7),
-        "dtype_str": "bf16",
-        "num_heads": 4,
-        "head_dim": 64,
-        "hidden_dim": 64,
-        "max_seq_len": 1024,
-        "causal": True,
-        "has_targets": False,
-        "alpha": 1.0,
-        "max_attn_len": 0,
-        "contextual_seq_len": 0,
-        "custom_config": {},
-    }
-    config = hstu_kernels._resolve_bwd_fused_config(**kwargs, fused=None)
-    assert (config is not None) == expect_fused
-    if not expect_fused:
-        with pytest.raises(ValueError, match="304-CU gfx942 class only"):
-            hstu_kernels._resolve_bwd_fused_config(**kwargs, fused=True)
-
-
 @requires_fused
 def test_flydsl_bwd_fused_oom_falls_back(monkeypatch):
     """A fused scratch that does not fit runs the fallback pair, with correct
@@ -1072,12 +966,54 @@ def test_flydsl_bwd_fused_scratch_cap(monkeypatch):
     capped["all"]()
     for name, got, ref in zip(("dq", "dk", "dv"), capped["outputs"], expected):
         assert torch.equal(got, ref), f"{name} depends on the scratch cap"
+    del capped
+
+    # A cap that only more passes than the ceiling would meet: the automatic
+    # plan does not go past the ceiling, where the fallback pair is faster.
+    ceiling = hstu_kernels._BWD_FUSED_MAX_GROUPS
+    monkeypatch.setattr(hstu_kernels, "_BWD_FUSED_MAX_GROUPS", 1)
+    with pytest.raises(MemoryError, match="1 passes"):
+        flydsl_hstu_attention_bwd(*args, fused=True)
+    monkeypatch.setattr(hstu_kernels, "_BWD_FUSED_MAX_GROUPS", ceiling)
 
     monkeypatch.setenv("AITER_HSTU_BWD_FUSED_SCRATCH_GB", "1e-9")
     with pytest.raises(MemoryError, match="scratch cap"):
         flydsl_hstu_attention_bwd(*args, fused=True)
     dq_ref, dk_ref, dv_ref = hstu_bwd_reference(
         n, alpha, q, k, v, seq_offsets, True, num_targets, 0, 0, dout
+    )
+    assert_grads_close(*flydsl_hstu_attention_bwd(*args), dq_ref, dk_ref, dv_ref)
+
+
+@requires_fused
+def test_flydsl_bwd_fused_reuses_host_plan(monkeypatch):
+    """A repeat call with the same metadata tensors does not wait for queued
+    work, and an in-place change to them is planned afresh, not served stale."""
+    # The opt-in value checks read the metadata on the host on every call.
+    monkeypatch.delenv("AITER_HSTU_VALIDATE")
+    n, d = 1024, 64
+    alpha = 1.0 / d * 10000
+    lengths = [1024, 700, 1, 300, 1024, 64, 513, 900]
+    q, k, v, dout, seq_offsets = _inputs_with_lengths(lengths, d=d)
+    args = (n, alpha, q, k, v, dout, seq_offsets, True, None, 0, 0)
+    flydsl_hstu_attention_bwd(*args)
+    torch.cuda.synchronize()
+
+    torch.cuda._sleep(2_000_000_000)
+    start = time.perf_counter()
+    flydsl_hstu_attention_bwd(*args)
+    waited = time.perf_counter() - start
+    torch.cuda.synchronize()
+    assert waited < 0.25, f"the repeat call waited {waited:.2f} s for the GPU"
+
+    # Same token count, more of it in full-length sequences: the high kv tiles
+    # now serve more rows, so a stale plan would undersize the scratch.
+    longer = [1024, 1024, 1024, 1024, 430, 0, 0, 0]
+    assert sum(longer) == sum(lengths)
+    longer = torch.tensor([0, *longer], device=seq_offsets.device).cumsum(0)
+    seq_offsets.copy_(longer.to(seq_offsets.dtype))
+    dq_ref, dk_ref, dv_ref = hstu_bwd_reference(
+        n, alpha, q, k, v, seq_offsets, True, None, 0, 0, dout
     )
     assert_grads_close(*flydsl_hstu_attention_bwd(*args), dq_ref, dk_ref, dv_ref)
 

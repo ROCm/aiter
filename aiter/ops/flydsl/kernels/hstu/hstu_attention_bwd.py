@@ -13,8 +13,11 @@
 One KV-owned pass computes dV and dK, and also dQ as a PARTIAL over the
 workgroup's KV range. The partials go to a compact fp32 HBM scratch that the
 reduction kernel at the bottom of this module sums. Split-K rather than
-atomics because fp32 atomics are bandwidth-bound far below plain stores on
-gfx942.
+fp32 atomics into one T x H x D accumulator, although atomics would need far
+less memory and no host planning: on MI300X (N=16384, d=64, H=4) the same
+kernel flushing through native `global_atomic_add_f32` measured 26-28% slower
+end to end (B=120: 59.2 vs 46.9 ms; B=1024: 494 vs 388 ms), no faster than
+the fallback pair. gfx942 has no packed fp32 atomic to amortise them.
 
 This is the default backward. Shapes outside `validate_hstu_attention_bwd`, and
 calls whose scratch does not fit, run the `hstu_attention_bwd_fallback_dvdk` +
@@ -1650,6 +1653,7 @@ def build_hstu_attention_bwd_dq_reduce(
     has_targets=False,
     first_pass=True,
     last_pass=True,
+    arch=None,
 ):
     """Sum the dQ partials of kv tiles [tile_lo, tile_hi) into dQ.
 
@@ -1658,7 +1662,9 @@ def build_hstu_attention_bwd_dq_reduce(
     scratch: every pass but the first accumulates into an fp32 carry, and only
     the last converts to bf16.
     """
-    validate_hstu_attention_bwd_dq_reduce(num_heads, head_dim, block_m, dtype_str)
+    validate_hstu_attention_bwd_dq_reduce(
+        num_heads, head_dim, block_m, dtype_str, arch=arch
+    )
     elem_dtype = _dtype_to_elem_type(dtype_str)
     HD = num_heads * head_dim
     ROWS = ROWS_PER_BLOCK

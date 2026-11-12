@@ -8,6 +8,7 @@ from __future__ import annotations
 import csv
 import functools
 import os
+import weakref
 from collections.abc import Callable
 from pathlib import Path
 
@@ -16,7 +17,7 @@ import torch
 from flydsl.runtime.device import get_rocm_arch
 
 from aiter import logger
-from aiter.jit.utils.build_targets import torch_processor_count_to_cu
+from aiter.jit.utils.chip_info import get_cu_num, get_gfx_runtime
 from aiter.ops.flydsl.kernels.hstu.hstu_attention_bwd import (
     balanced_tile_groups,
     build_hstu_attention_bwd,
@@ -615,6 +616,11 @@ _BWD_FUSED_MEM_BUDGET = 0.8
 # the free-memory budget alone picks at N=16384, d=64, B=1024: G=2 at H=4 and
 # G=5 at H=8, so the default timings do not change.
 _BWD_FUSED_SCRATCH_CAP = 0.5
+# Most kv-chunking passes the automatic plan uses. Every pass adds a serialised
+# reduction, and on MI300X (N=16384, d=64) the fused path stops beating the
+# fallback pair between G=16 and G=24 at B=1024 and near G=16 at B=120; up to
+# G=12 it stays at least 5% ahead. Past this, the dispatch runs the pair.
+_BWD_FUSED_MAX_GROUPS = 12
 
 _BWD_CSV_COLUMNS: list[str] = [
     "arch",
@@ -737,92 +743,24 @@ def _get_bwd_tuned_config(
     return _bwd_tuned_config_map().get((problem_key, kernel), {})
 
 
-def _gather_index(B: int, groups: int, device: str) -> torch.Tensor:
-    """Map sorted ranks to grid groups with an alternating-direction deal.
-
-    Alternating the group direction each round distributes long and short
-    sequences across the hardware groups. The mapping depends only on shape.
-    """
-    rank = torch.arange(B, device=device)
-    rnd, pos = rank // groups, rank % groups
-    group = torch.where(rnd % 2 == 0, pos, (groups - 1) - pos)
-    slot = group * (B // groups) + rnd
-    inv = torch.empty_like(rank)
-    inv[slot] = rank
-    return inv
-
-
-def _identity(B: int, device: str) -> torch.Tensor:
-    return torch.arange(B, dtype=torch.int32, device=device)
-
-
-@functools.lru_cache(maxsize=64)
-def _balance_gather_index(
-    B: int, groups: int, device: str
-) -> tuple[torch.Tensor, torch.cuda.Event]:
-    """Cached `_gather_index`."""
-    return _publish_cached(_gather_index(B, groups, device))
-
-
-@functools.lru_cache(maxsize=64)
-def _identity_perm(B: int, device: str) -> tuple[torch.Tensor, torch.cuda.Event]:
-    """Cached identity permutation."""
-    return _publish_cached(_identity(B, device))
-
-
-def _publish_cached(t: torch.Tensor) -> tuple[torch.Tensor, torch.cuda.Event]:
-    """Pair a freshly built cached device tensor with its completion event.
-
-    The cache is shared by every stream, while the producing stream is known
-    only here, so readers order themselves after the build through the event
-    (`_use_cached`) instead of the host waiting for it.
-    """
-    built = torch.cuda.Event()
-    built.record(torch.cuda.current_stream(t.device))
-    return t, built
-
-
-def _use_cached(entry: tuple[torch.Tensor, torch.cuda.Event]) -> torch.Tensor:
-    """Read a cached device tensor on the current stream.
-
-    Waits for the build on the device; waiting on a completed event is cheap.
-    The wait is unconditional because `Event.query()` would invalidate a
-    stream capture. Recording the reader's stream keeps an eviction from
-    recycling the block under a queued reader.
-    """
-    t, built = entry
-    stream = torch.cuda.current_stream(t.device)
-    stream.wait_event(built)
-    t.record_stream(stream)
-    return t
-
-
 def _build_balance_perm(
     seq_offsets: torch.Tensor, groups: int = NUM_GRID_GROUPS
 ) -> torch.Tensor:
     """Balance quadratic sequence work across contiguous grid groups.
 
     Sequences are sorted by length, then dealt across groups in alternating
-    directions. `perm[slot]` is the sequence processed by that grid slot.
-    Unaligned batches use identity order because group boundaries split the deal.
+    directions, so long and short sequences spread across the hardware groups.
+    `perm[slot]` is the sequence processed by that grid slot. Unaligned batches
+    use identity order because group boundaries split the deal.
     """
     lengths = seq_offsets[1:] - seq_offsets[:-1]
     B = int(lengths.numel())
-    device = str(seq_offsets.device)
-    # Under capture the index is built into the graph instead: a cached tensor
-    # made here would hold nothing until the first replay, so an eager call in
-    # between would read unwritten memory.
-    capturing = torch.cuda.is_current_stream_capturing()
     if B % groups != 0:
-        if capturing:
-            return _identity(B, device)
-        return _use_cached(_identity_perm(B, device))
-    order = torch.argsort(lengths, descending=True)  # sequence indices, longest first
-    if capturing:
-        inv = _gather_index(B, groups, device)
-    else:
-        inv = _use_cached(_balance_gather_index(B, groups, device))
-    return order[inv].to(torch.int32)
+        return torch.arange(B, dtype=torch.int32, device=seq_offsets.device)
+    # Row r of the deal is round r, longest first; odd rounds run backwards.
+    deal = torch.argsort(lengths, descending=True).to(torch.int32).view(-1, groups)
+    deal[1::2] = deal[1::2].flip(1)
+    return deal.t().reshape(-1)
 
 
 # Fallbacks trade tile size for wave counts that satisfy K/V and dO DMA divisibility.
@@ -955,20 +893,21 @@ def _compile_bwd_launcher(
 
 
 @functools.cache
-def _device_arch_and_cus(device_index: int) -> tuple[str, int]:
-    """(arch, CU count) of one device.
+def _fused_arch_and_cus() -> tuple[str, int]:
+    """(arch, CU count) for the fused gate, from aiter's chip_info.
 
-    Per device rather than the process-wide arch helpers: a node can mix
-    gfx942 products, e.g. a 304-CU MI300X next to an 80-CU MI308X.
+    `get_cu_num` asserts one CU count per node, so a node mixing gfx942
+    products reports 0 CUs here and the gate keeps it on the fallback pair.
     """
-    props = torch.cuda.get_device_properties(device_index)
-    arch = props.gcnArchName.split(":", 1)[0].lower()
-    return arch, torch_processor_count_to_cu(arch, props.multi_processor_count)
+    try:
+        num_cus = get_cu_num()
+    except (AssertionError, RuntimeError):
+        num_cus = 0
+    return get_gfx_runtime(), num_cus
 
 
 def _resolve_bwd_fused_config(
     *,
-    device: torch.device,
     dtype_str: str,
     num_heads: int,
     head_dim: int,
@@ -1014,7 +953,7 @@ def _resolve_bwd_fused_config(
     # The fused kernel has exactly one tile, so it takes no tuned-CSV rows.
     # Explicit tiles are the fallback pair's, so any that differ fail the gate.
     config = {**_BWD_FUSED_TILES, **custom_config}
-    arch, num_cus = _device_arch_and_cus(device.index)
+    arch, num_cus = _fused_arch_and_cus()
     try:
         validate_hstu_attention_bwd(
             num_heads,
@@ -1095,8 +1034,8 @@ def _plan_fused_groups(
 
     The footprint is bounded by `_fused_scratch_cap`, a fixed share of the
     device, so it does not grow with whatever memory happens to be free. If
-    even the largest G exceeds the cap, this raises MemoryError and the
-    dispatch runs the fallback pair.
+    no G up to `_BWD_FUSED_MAX_GROUPS` fits, this raises MemoryError and the
+    dispatch runs the fallback pair, which beats the fused path from there on.
 
     Below the cap, memory is settled by ATTEMPTING, not by predicting: the
     estimate cannot see how the reachable memory is laid out, while the scratch
@@ -1129,22 +1068,24 @@ def _plan_fused_groups(
     if groups != "auto":
         candidates = [int(groups)]
     else:
+        max_groups = min(n_kv_tiles, _BWD_FUSED_MAX_GROUPS)
         cap = _fused_scratch_cap(device)
         budget = min(cap, _fused_scratch_budget(device))
         first = next(
-            (g for g in range(1, n_kv_tiles + 1) if _plan(g)[2] <= budget),
+            (g for g in range(1, max_groups + 1) if _plan(g)[2] <= budget),
             None,
         )
         if first is None:
-            smallest = _plan(n_kv_tiles)[2]
+            smallest = _plan(max_groups)[2]
             if smallest > cap:
                 raise MemoryError(
-                    f"hstu bwd fused: the smallest pass needs "
+                    f"hstu bwd fused: {max_groups} passes still need "
                     f"{smallest / 1e9:.1f} GB, over the {cap / 1e9:.1f} GB "
-                    f"scratch cap (AITER_HSTU_BWD_FUSED_SCRATCH_GB)"
+                    f"scratch cap (AITER_HSTU_BWD_FUSED_SCRATCH_GB); more "
+                    f"passes would be slower than the fallback pair"
                 )
-            first = n_kv_tiles
-        candidates = list(range(first, n_kv_tiles + 1))
+            first = max_groups
+        candidates = list(range(first, max_groups + 1))
 
     last_error = None
     for g in candidates:
@@ -1178,6 +1119,56 @@ def _plan_fused_groups(
         f"fits -- the smallest pass still needs "
         f"{_plan(candidates[-1])[2] / 1e9:.1f} GB "
         f"({last_error})"
+    )
+
+
+# The fused planner's host copy of the per-tile row counts and the reduction
+# grid, cached so that only the FIRST backward of a training step reads the
+# sequence lengths back. Every HSTU layer of a step shares the same metadata
+# tensors, so later layers queue their work without waiting for the GPU.
+#
+# An entry is valid only for the very tensor objects it was read from, at the
+# version they had then: a weak reference rules out a freed tensor whose
+# address was reused, and the version counter rules out an in-place update.
+# Inference tensors have no version counter, so they are never cached.
+_HOST_PLAN_CACHE: dict[tuple, tuple] = {}
+_HOST_PLAN_CACHE_SIZE = 8
+
+
+def _plan_stamp(t: torch.Tensor | None):
+    return None if t is None else (t.data_ptr(), t._version)
+
+
+def _plan_cacheable(*tensors: torch.Tensor | None) -> bool:
+    return not any(t is not None and t.is_inference() for t in tensors)
+
+
+def _cached_host_plan(key, seq_offsets, num_targets) -> list | None:
+    entry = _HOST_PLAN_CACHE.get(key)
+    if entry is None or not _plan_cacheable(seq_offsets, num_targets):
+        return None
+    so_ref, nt_ref, stamps, host = entry
+    same_targets = num_targets is None if nt_ref is None else nt_ref() is num_targets
+    if (
+        so_ref() is seq_offsets
+        and same_targets
+        and stamps == (_plan_stamp(seq_offsets), _plan_stamp(num_targets))
+    ):
+        return host
+    return None
+
+
+def _store_host_plan(key, seq_offsets, num_targets, host: list) -> None:
+    if not _plan_cacheable(seq_offsets, num_targets):
+        return
+    _HOST_PLAN_CACHE.pop(key, None)
+    while len(_HOST_PLAN_CACHE) >= _HOST_PLAN_CACHE_SIZE:
+        _HOST_PLAN_CACHE.pop(next(iter(_HOST_PLAN_CACHE)))
+    _HOST_PLAN_CACHE[key] = (
+        weakref.ref(seq_offsets),
+        None if num_targets is None else weakref.ref(num_targets),
+        (_plan_stamp(seq_offsets), _plan_stamp(num_targets)),
+        host,
     )
 
 
@@ -1234,7 +1225,6 @@ def _make_bwd_fused_runners(
         # A direct caller asked for this kernel by name, so the gate raises
         # rather than silently handing back the dvdk + dq pair.
         config = _resolve_bwd_fused_config(
-            device=q.device,
             dtype_str=dtype_str,
             num_heads=num_heads,
             head_dim=head_dim,
@@ -1249,7 +1239,7 @@ def _make_bwd_fused_runners(
             fused=True,
         )
 
-    arch, num_cus = _device_arch_and_cus(q.device.index)
+    arch, num_cus = _fused_arch_and_cus()
     fused_launcher = build_hstu_attention_bwd(
         num_heads,
         head_dim,
@@ -1347,7 +1337,11 @@ def _prepare_bwd_fused_runners(
         num_targets=num_targets,
     )
     blocks_per_seq = reduce_blocks_per_seq(so_c)
-    host = torch.cat([rows.sum(0), blocks_per_seq.sum().reshape(1)]).tolist()
+    plan_key = (device.index, block_m, max_seq_len, max_attn_len)
+    host = _cached_host_plan(plan_key, seq_offsets, num_targets)
+    if host is None:
+        host = torch.cat([rows.sum(0), blocks_per_seq.sum().reshape(1)]).tolist()
+        _store_host_plan(plan_key, seq_offsets, num_targets, host)
     counts, n_blocks = host[:-1], host[-1]
 
     if n_blocks == 0:
@@ -1397,6 +1391,7 @@ def _prepare_bwd_fused_runners(
             has_targets=has_targets,
             first_pass=(g == 0),
             last_pass=(g == n_groups - 1),
+            arch=_fused_arch_and_cus()[0],
         )
         for g in range(n_groups)
     ]
@@ -1496,9 +1491,12 @@ def flydsl_hstu_attention_bwd(
     instead of falling back, False always uses the fallback pair.
 
     The fused path plans its scratch from the sequence lengths, which it copies
-    to the host on every call. The call therefore returns only once the work
-    already queued on the stream has finished, and under CUDA graph capture
-    the default dispatch runs the fallback pair instead.
+    to the host the first time it sees a given `seq_offsets` / `num_targets`
+    tensor (and again after any in-place change to them). That call returns
+    only once the work already queued on the stream has finished; later calls
+    with the same tensors, such as the other layers of a training step, do
+    not wait. Under CUDA graph capture the default dispatch runs the fallback
+    pair instead.
 
     All work is queued on `stream` (default: the current stream), after the
     work already queued on the current stream. The returned gradients are
@@ -1542,7 +1540,6 @@ def flydsl_hstu_attention_bwd(
         if value is not None
     }
     fused_config = _resolve_bwd_fused_config(
-        device=q.device,
         dtype_str=dtype_str,
         num_heads=num_heads,
         head_dim=head_dim,
