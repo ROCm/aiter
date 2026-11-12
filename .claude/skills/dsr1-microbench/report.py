@@ -27,6 +27,7 @@ OPS = [
             "in the epilogue; FC2: N=7168, K=2048. 9 x bs routed rows."
         ),
         "dtype": "a4w4 MXFP4 (fp4 A and W, e8m0 scale per 32), bf16 out",
+        "heads": "-",
         "ut": (
             "op_tests/flydsl_tests/test_flydsl_grouped_gemm.py: run_moe('a4w4', "
             "experts=65, topk=9, model_dim=7168, inter_dim=2048, "
@@ -48,6 +49,7 @@ OPS = [
             "Cases with batch x ctx above 32M KV tokens are skipped."
         ),
         "dtype": "Q fp8, KV fp8 (page 64, kv-shuffled), bf16 out",
+        "heads": "128 query heads, 1 KV head (the 576-wide latent all heads share)",
         "ut": (
             "op_tests/test_mla_decode_pagesize64.py: test_mla(bs, ctx, 128, 1, 1, "
             "1, fp8, fp8, 'randn', 'kv_shuffled') -> aiter.mla.mla_decode_fwd"
@@ -62,10 +64,11 @@ OPS = [
         "name": "MLA prefill (MHA)",
         "op": "mla_prefill",
         "shape": (
-            "Causal varlen FMHA, 128 heads, Q/K [T,128,192] (128 nope + 64 "
+            "Causal (is_causal=True) varlen FMHA, Q/K [T,128,192] (128 nope + 64 "
             "RoPE), V [T,128,128]; T tokens packed from equal-length sequences."
         ),
         "dtype": "bf16",
+        "heads": "128 query heads, 128 KV heads (MHA after the kv_b_proj expand)",
         "ut": (
             "op_tests/test_fmha_fwd_with_sink_varlen_asm.py: "
             "test_fmha_fwd_with_sink_varlen_asm_perf(192, 128, 128, 128, "
@@ -74,7 +77,10 @@ OPS = [
         "how": (
             "asm is fmha_fwd_with_sink_varlen_asm; public is flash_attn_varlen_func, "
             "the call ATOM makes (the asm kernel plus one torch copy). DSR1 prefill "
-            "never takes FlyDSL, so the UT's FlyDSL candidate is switched off."
+            "never takes FlyDSL, so the UT's FlyDSL candidate is switched off. "
+            "ATOM calls it with causal=True; causal=False is only on the "
+            "chunked-context paths, which the recipe (prefix caching and chunked "
+            "prefill off) never reaches."
         ),
     },
 ]
@@ -90,6 +96,10 @@ NOTES = [
         "MoE uses the MLPerf Quark MXFP4 weights instead of FP8 128x128 blocks."
     ),
     "Model level: 58 MoE layers (first 3 of 61 are dense) and 61 MLA layers.",
+    (
+        "Heads are per GPU: the recipe runs attention data-parallel (TP4 + DP "
+        "attention), so every GPU computes all 128 heads for its own requests."
+    ),
 ]
 
 CSS = """
@@ -218,6 +228,7 @@ def render(run_dir):
                 ("Operator", lambda o: o["name"], ""),
                 ("--ops", lambda o: o["op"], "c"),
                 ("Shape (per GPU)", lambda o: o["shape"], ""),
+                ("Heads (per GPU)", lambda o: o["heads"], ""),
                 ("Precision", lambda o: o["dtype"], ""),
                 ("Range", lambda o: ranges[o["op"]], ""),
                 ("Cases", lambda o: counts[o["op"]], "n"),
@@ -292,8 +303,9 @@ def render(run_dir):
         )
     )
 
-    out.append(f"<h3>MLA decode ({len(dec)} cases): time in us, rows = batch, ")
-    out.append("columns = context length; '-' = not run</h3>")
+    q_heads = ", ".join(str(h) for h in sorted({r.get("nhead") for r in dec}))
+    out.append(f"<h3>MLA decode ({len(dec)} cases, {q_heads} query heads): ")
+    out.append("time in us, rows = batch, columns = context length; '-' = not run</h3>")
     ctxs = sorted({r["ctx_len"] for r in dec})
     by = {(r["batch"], r["ctx_len"]): r for r in dec}
     grid = [
@@ -315,6 +327,7 @@ def render(run_dir):
             [
                 ("batch", lambda r: f"{r['batch']:,}", "n"),
                 ("ctx", lambda r: f"{r['ctx_len']:,}", "n"),
+                ("q heads", lambda r: r.get("nhead"), "n"),
                 ("us", lambda r: num(r.get("asm us")), "n"),
                 ("TFLOPS", lambda r: num(r.get("asm TFLOPS")), "n"),
                 ("TB/s", lambda r: num(r.get("asm TB/s"), 2), "n"),
@@ -330,6 +343,8 @@ def render(run_dir):
     cols = [
         ("T", lambda r: f"{r['tokens']:,}", "n"),
         ("seqs", lambda r: r.get("num_seqs"), "n"),
+        ("q / kv heads", lambda r: f"{r.get('hq')} / {r.get('hk')}", "n"),
+        ("causal", lambda r: r.get("is_causal"), ""),
     ]
     if any("seq_len" in r for r in pre):
         cols = [("seq len", lambda r: f"{r['seq_len']:,}", "n")] + cols

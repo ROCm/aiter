@@ -45,3 +45,9 @@ visible from inside the container).
   the run used.
 - MLA decode cases above 32M KV tokens (batch x ctx) are skipped by design: they
   do not fit the UT on one GPU.
+- Heads are per GPU. DP attention keeps all 128 query heads on every GPU; decode
+  reads one latent KV head all of them share, prefill is causal (`is_causal=True`,
+  as in ATOM's non-chunked prefill) MHA with 128 KV heads.
+- Prefill times the asm kernel and `flash_attn_varlen_func` (the call ATOM
+  makes). The UT's FlyDSL candidate is switched off: DSR1 never runs it.
+- The MoE sweep starts at bs 4.
