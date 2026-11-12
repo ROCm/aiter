@@ -15,7 +15,8 @@ from aiter.tuning.moe.inputs import (
     generate_opus_sorted_stage2_data,
 )
 
-# Lives in csrc/, so the repo root must be on sys.path, as for the tuner itself.
+# csrc resolves through AITER_META_DIR, which importing aiter puts on sys.path:
+# the repo root in develop mode, aiter_meta/ in a wheel.
 from csrc.opus_moe.opus_moe_common import (
     OPUS_A8W4_GFX950_DECODE_KERNEL_CONTRACT,
     get_opus_a8w4_stage2_kernels,
