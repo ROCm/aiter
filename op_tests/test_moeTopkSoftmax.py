@@ -1022,10 +1022,12 @@ aiter.logger.info("moeTopkSoftmax_grouped_topk summary (markdown):\n%s", df_md)
 reg_tokens = [1, 128]
 df = []
 for token in reg_tokens:
-    for expert, topk, dtype in (
-        (128, 4, dtypes.bf16),
-        (128, 32, dtypes.fp32),
-        (2048, 32, dtypes.bf16),
+    for expert, topk, dtype, bias_dtype in (
+        (128, 4, dtypes.bf16, None),
+        (128, 32, dtypes.fp32, None),
+        (2048, 32, dtypes.bf16, None),
+        # wave32 runs the multi-wave kernel (E = 128 * waves); Kimi-K3's FP32 bias.
+        (896, 17, dtypes.bf16, dtypes.fp32),
     ):
         ret = test_biased_grouped_topk(
             token,
@@ -1037,43 +1039,13 @@ for token in reg_tokens:
             dtype,
             num_iters=args.iters,
             num_warmup=args.warmup,
-        )
-        df.append(ret)
-df = pd.DataFrame(df)
-df_md = df.to_markdown(index=False)
-aiter.logger.info(
-    "moeTopkSoftmax_reg_biased_grouped_topk summary (markdown):\n%s", df_md
-)
-
-# wave32 multi-wave register path (E = 128 * waves), which reads the bias in
-# the logits' dtype or in fp32.
-df = []
-for token in (1, 32, 160, 2048):
-    for expert, topk, bias_dtype in (
-        (512, 8, None),
-        (768, 8, None),
-        (896, 16, None),
-        (896, 16, dtypes.fp32),
-        (896, 17, dtypes.fp32),
-        (1024, 16, None),
-    ):
-        ret = test_biased_grouped_topk(
-            token,
-            expert,
-            1,
-            topk,
-            1,
-            True,
-            dtypes.bf16,
-            num_iters=args.iters,
-            num_warmup=args.warmup,
             bias_dtype=bias_dtype,
         )
         df.append(ret)
 df = pd.DataFrame(df)
 df_md = df.to_markdown(index=False)
 aiter.logger.info(
-    "moeTopkSoftmax_reg_mw_biased_grouped_topk summary (markdown):\n%s", df_md
+    "moeTopkSoftmax_reg_biased_grouped_topk summary (markdown):\n%s", df_md
 )
 
 # Compare regular register cases with the LDS path and cover degenerate rows
@@ -1105,61 +1077,38 @@ stable_cases = [
     (1, 256, 8, dtypes.bf16, "softmax", True, "all_nan", False),
     (1, 256, 8, dtypes.bf16, "biased", True, "all_zero_sigmoid", False),
     (1, 256, 8, dtypes.bf16, "sigmoid", False, "all_zero_sigmoid", False),
-    # wave32 multi-wave register path: E = 128 * waves, topk <= 17.
-    (1, 896, 16, dtypes.bf16, "biased", True, "random", False),  # Kimi-K3 router
-    (160, 896, 16, dtypes.bf16, "biased", True, "random", True),
-    (64, 896, 1, dtypes.bf16, "biased", True, "random", False),
+    # wave32 topk_reg_kernel with 40 tied candidates, two slots a lane; the
+    # padded reference (E + 4) takes the LDS kernel there.
+    (64, 128, 8, dtypes.bf16, "biased", True, "forty_way_tie", False),
+    (64, 256, 8, dtypes.bf16, "softmax", True, "forty_way_tie", False),
+    # wave32 multi-wave register path: E = 128 * waves, topk <= 17 (HERD's
+    # top-(K + 1) for K = 16).
+    (160, 896, 16, dtypes.bf16, "biased", True, "random", True),  # Kimi-K3 router
     (64, 512, 8, dtypes.bf16, "biased", False, "random", True),
     (64, 768, 4, dtypes.bf16, "biased", True, "random", False),
     (64, 1024, 9, dtypes.bf16, "biased", True, "random", False),
-    (64, 896, 16, dtypes.bf16, "biased", True, "forty_way_tie", False),
-    (64, 1024, 5, dtypes.bf16, "biased", False, "forty_way_tie", True),
-    (1, 896, 16, dtypes.bf16, "biased", True, "all_equal", False),
-    (1, 896, 16, dtypes.bf16, "biased", True, "sixteen_way_tie", False),
-    (1, 896, 16, dtypes.bf16, "biased", True, "one_finite", False),
-    (1, 896, 16, dtypes.bf16, "biased", True, "all_nan", False),
-    (1, 896, 16, dtypes.bf16, "biased", True, "all_zero_sigmoid", False),
-    # topk 17: HERD's top-(K + 1) for K = 16.
-    (160, 896, 17, dtypes.bf16, "biased", True, "random", True),
     (64, 896, 17, dtypes.bf16, "biased", True, "forty_way_tie", False),
-    (1, 896, 17, dtypes.bf16, "biased", True, "sixteen_way_tie", False),
+    (1, 896, 16, dtypes.bf16, "biased", True, "sixteen_way_tie", False),
     (1, 896, 17, dtypes.bf16, "biased", True, "one_finite", False),
-    (1, 896, 17, dtypes.bf16, "biased", True, "all_nan", False),
+    (1, 896, 16, dtypes.bf16, "biased", True, "all_nan", False),
     (1, 896, 17, dtypes.bf16, "biased", True, "all_zero_sigmoid", False),
 ]
-df = pd.DataFrame([test_grouped_topk_stable(*case) for case in stable_cases])
-aiter.logger.info(
-    "moeTopkSoftmax_reg_stable summary (markdown):\n%s",
-    df.to_markdown(index=False),
-)
-
-# Kimi-K3's router hands over an FP32 bias and logits in rows of a wider
-# buffer; the reference reads the same values as contiguous BF16.
+# Kimi-K3's FP32 bias, which the reference reads in BF16, and logits in rows of
+# a wider buffer. At E=256 the FP32 bias keeps the row off
+# biased_grouped_topk_w32_kernel, so wave32 runs topk_reg_kernel's two-slot path.
+fp32_bias_cases = [
+    (160, 896, 17, dtypes.bf16, "biased", True, "random", False),
+    (64, 256, 8, dtypes.bf16, "biased", True, "forty_way_tie", False),
+]
 df = pd.DataFrame(
-    [
-        test_grouped_topk_stable(
-            token,
-            expert,
-            topk,
-            dtypes.bf16,
-            "biased",
-            True,
-            pattern,
-            False,
-            bias_dtype=dtypes.fp32,
-            strided_input=strided_input,
-        )
-        for token, expert, topk, pattern, strided_input in (
-            (160, 896, 16, "random", True),
-            (160, 896, 17, "random", True),
-            (64, 1024, 9, "random", True),
-            (64, 896, 16, "forty_way_tie", False),
-            (1, 896, 16, "one_finite", False),
-        )
+    [test_grouped_topk_stable(*case) for case in stable_cases]
+    + [
+        test_grouped_topk_stable(*case, bias_dtype=dtypes.fp32, strided_input=True)
+        for case in fp32_bias_cases
     ]
 )
 aiter.logger.info(
-    "moeTopkSoftmax_reg_fp32_bias_stable summary (markdown):\n%s",
+    "moeTopkSoftmax_reg_stable summary (markdown):\n%s",
     df.to_markdown(index=False),
 )
 

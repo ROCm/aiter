@@ -45,11 +45,12 @@
 
 // EPL = ceil(num_experts / wave size). Instantiating 1..32 dominates
 // module_moe_asm device codegen; keep the shapes this path is meant to hit,
-// fall back to LDS for the rest. Both lists are compiled for every target, so
-// the wave32 one reuses wave64 instantiations only: E=384, 768 and 896 would
+// fall back to LDS for the rest. Both lists are instantiated for every target,
+// so the wave32 one reuses wave64 instantiations only: E=384, 768 and 896 would
 // need 12, 24 and 28 of their own, and aligned BF16 rows of E=768 and 896
-// take topk_reg_mw_kernel. Override by defining AITER_TOPK_REG_LAUNCH_EPLS
-// (wave64) or AITER_TOPK_REG_LAUNCH_EPLS_W32 (wave32) before include.
+// take topk_reg_mw_kernel. Wave32 builds leave the EPLs only wave64 launches
+// empty. Override by defining AITER_TOPK_REG_LAUNCH_EPLS (wave64) or
+// AITER_TOPK_REG_LAUNCH_EPLS_W32 (wave32) before include.
 #ifndef AITER_TOPK_REG_LAUNCH_EPLS
 #define AITER_TOPK_REG_LAUNCH_EPLS(X) \
     X(2)  /* E=128 */                 \
@@ -325,8 +326,9 @@ __inline__ __device__ void warpReduceMax(float& val_o, int& idx)
 constexpr int kLegacyTopKLocalBits      = 5;
 constexpr int kTopKRegMaxExpertsPerLane = 1 << kLegacyTopKLocalBits;
 // Candidates the register path stages before its fallback: one slot per lane
-// on wave64, two on wave32. One per lane on wave32 overflows on ~0.15% of
-// random rows, and each such row adds ~20 us to the whole launch.
+// on wave64, two on wave32. At topk 16, one per lane on wave32 would overflow
+// on up to ~0.16% of random rows (E=1024), and on MI455X each such row adds
+// 25-45 us to the whole launch (E = 512 and 1024).
 constexpr int kTopKRegCandCap = 64;
 
 // Wave64 rank; its low five bits are the wave32 rank (permlanex16 for row_bcast).
@@ -817,6 +819,13 @@ grouped_topk_kernel(DTYPE_I* __restrict__ gating_output,         // [num_tokens,
     }
 }
 
+constexpr bool topk_reg_w32_launches(int epl)
+{
+#define AITER_TOPK_REG_IS_EPL(EPL) epl == (EPL) ||
+    return AITER_TOPK_REG_LAUNCH_EPLS_W32(AITER_TOPK_REG_IS_EPL) false;
+#undef AITER_TOPK_REG_IS_EPL
+}
+
 // Single-group top-k that keeps scores in VGPRs and preserves legacy ordering.
 // For biased sigmoid the output weights are the pre-bias sigmoid (from LDS),
 // not (score - bias).
@@ -845,6 +854,9 @@ __global__ void topk_reg_kernel(DTYPE_I* __restrict__ gating_output,
     static_assert(!(isBiased && isSoftmax), "biased path is sigmoid only");
     static_assert(EXPERTS_PER_LANE <= kTopKRegMaxExpertsPerLane,
                   "legacy tie-rank encoding reserves five local-position bits");
+    // The wave32 dispatch skips this EPL; an empty body saves its codegen.
+    if constexpr(WARP_SIZE == 32 && !topk_reg_w32_launches(EXPERTS_PER_LANE))
+        return;
 
     using cktype_i = typename aiter::hip2opus<DTYPE_I>::type;
     using vec_i    = opus::vector_t<cktype_i, 2>;
@@ -1276,6 +1288,9 @@ __device__ __forceinline__ void wave32_rank_desc_dpp2(const uint64_t (&key)[2], 
 // Top-16 routing plus the extra candidate of HERD's top-(K + 1). The
 // renormalization reads this many lanes on every row.
 constexpr int kTopKRegMwMaxTopK = 17;
+// The two-slot ranking parks every rank past the wave in lane 31, which must
+// stay past topk, and the fallback draws its fillers from ids 0..31.
+static_assert(kTopKRegMwMaxTopK < 32, "lane 31 must not hold a pick");
 
 template <typename DTYPE_I, int kWaves, typename DTYPE_B = DTYPE_I>
 __global__ __launch_bounds__(kWaves * 32) void topk_reg_mw_kernel(
@@ -1335,15 +1350,12 @@ __global__ __launch_bounds__(kWaves * 32) void topk_reg_mw_kernel(
     // topk_reg_kernel rounds the f64 product -C_LOG2E * x to float, and f64
     // runs at 1/32 rate on gfx1250. For 16-bit inputs a hi/lo split fma gives
     // the same sigmoid bits (checked over every bf16 and fp16 value).
+    static_assert(sizeof(DTYPE_I) == 2, "the split fma matches only for 16-bit inputs");
     constexpr float kNegLog2eHi = -static_cast<float>(C_LOG2E);
     constexpr float kNegLog2eLo = static_cast<float>(-C_LOG2E - static_cast<double>(kNegLog2eHi));
 
     auto sigmoid = [](float x) {
-        float t;
-        if constexpr(sizeof(DTYPE_I) == 2)
-            t = __builtin_fmaf(kNegLog2eHi, x, kNegLog2eLo * x);
-        else
-            t = static_cast<float>(-C_LOG2E * x);
+        const float t = __builtin_fmaf(kNegLog2eHi, x, kNegLog2eLo * x);
         return __builtin_amdgcn_rcpf(1.0f + exp2f(t));
     };
     float sig[4];
@@ -1439,21 +1451,18 @@ __global__ __launch_bounds__(kWaves * 32) void topk_reg_mw_kernel(
         // ds_permute reads 0 where nothing lands. Targets wrap mod 32, so
         // ranks past the wave go to lane 31, past topk.
         uint32_t got = 0;
-        // Keep the lambdas: written straight-line, this compiler puts every
+        // Keep the lambda: written straight-line, this compiler puts every
         // rank compare in an SGPR mask, each behind an s_delay_alu stall.
-        auto push = [&](const int(&rank)[2]) {
+        auto rank_and_push = [&] {
+            const uint64_t k64[2] = {(uint64_t(c0.x) << 32) | c0.y, (uint64_t(c1.x) << 32) | c1.y};
+            int rank[2];
+            wave32_rank_desc_dpp2(k64, rank);
             const int d0 = umin32(rank[0], W - 1) * 4, d1 = umin32(rank[1], W - 1) * 4;
             w   = __builtin_bit_cast(float,
                                    __builtin_amdgcn_ds_permute(d0, int(c0.z)) |
                                        __builtin_amdgcn_ds_permute(d1, int(c1.z)));
             got = __builtin_amdgcn_ds_permute(d0, int(c0.y)) |
                   __builtin_amdgcn_ds_permute(d1, int(c1.y));
-        };
-        auto rank_and_push = [&] {
-            const uint64_t k64[2] = {(uint64_t(c0.x) << 32) | c0.y, (uint64_t(c1.x) << 32) | c1.y};
-            int rank[2];
-            wave32_rank_desc_dpp2(k64, rank);
-            push(rank);
         };
         rank_and_push();
         id = int(got & 0xffffu);
@@ -2383,7 +2392,6 @@ biased_grouped_topk_w32_kernel(const DTYPE_I* __restrict__ gating_output, // [nu
         const int reg_lanes        = static_cast<int>(get_warp_size_func());         \
         const int experts_per_lane = (num_experts + reg_lanes - 1) / reg_lanes;      \
         if(topk_grp == num_expert_group &&                                           \
-           (reg_lanes == 64 || reg_lanes == 32) &&                                   \
            (num_experts % 4) == 0 &&                                                 \
            experts_per_lane <= kMaxExpertsPerLane &&                                 \
            topk <= reg_lanes / 2 &&                                                  \
@@ -2671,6 +2679,10 @@ void biased_grouped_topk(const aiter_tensor_t& gating_output,   // [num_tokens, 
     // wave32 without a group filter, E = 128 * waves: a row per workgroup,
     // four experts per lane, read as naturally aligned four-element vectors
     // from the BF16 logits and the BF16 or FP32 bias.
+    // biased_grouped_topk in aiter/ops/topk.py sends rows here when
+    // _gfx1250_reg_mw_fits passes, so keep the two gates in step: a row it
+    // admits and this gate rejects falls through to the LDS kernel, which
+    // aborts on an FP32 bias at E = 768 and 896.
     const int mw_waves      = num_experts / 128;
     const bool mw_bias_fp32 = correction_bias.dtype() == AITER_DTYPE_fp32;
     if(get_warp_size_func() == 32 && topk_grp == num_expert_group &&
