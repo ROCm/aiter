@@ -841,7 +841,7 @@ def _use_direct_fixed_slot(npes, experts_per_rank, max_tokens_per_rank, cap, til
     if tile_m <= 0 or max_tokens_per_rank <= 0:
         return False
     required_cap = ((npes * max_tokens_per_rank + tile_m - 1) // tile_m) * tile_m
-    return (npes, experts_per_rank) in ((8, 48), (4, 96)) and cap == required_cap
+    return (npes, experts_per_rank) in ((8, 48), (4, 96), (4, 97)) and cap == required_cap
 
 
 # fmt: off
@@ -912,7 +912,7 @@ def compile_mega_moe_stage1(
     fz_tile_m = int(sort_block_m)
     assert fz_cap % fz_tile_m == 0, f"fuse_cap({fz_cap}) % tile_m({fz_tile_m}) != 0"
     if not _use_direct_fixed_slot(fz_npes, fz_epr, fz_mtpr, fz_cap, fz_tile_m):
-        raise ValueError("small-input stage1 needs the EP8/48-expert or EP4/96-expert fixed-slot layout")
+        raise ValueError("small-input stage1 needs the EP8/48-expert or EP4/96-97-expert fixed-slot layout")
     fz_total_experts = fz_npes * fz_epr
     # Producers load their route (expert, remote pointers, row, scales, weight) before the epoch gate and
     # quantize the bf16 input row to MXFP8. A producer wave sends pre_rounds routes (one per round) so

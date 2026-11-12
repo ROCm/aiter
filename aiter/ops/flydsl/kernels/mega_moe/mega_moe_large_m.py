@@ -3140,7 +3140,8 @@ class LargeMRuntime:
             raise ValueError(f"experts={experts} must be divisible by world_size={world_size}")
         if max_tok_per_rank <= 0 or max_tok_per_rank & (max_tok_per_rank - 1):
             raise ValueError(f"max_tok_per_rank={max_tok_per_rank} must be a power of two")
-        large_mtprs = large_m_mtprs_for(world_size=world_size, model_dim=model_dim, inter_dim=inter_dim)
+        large_mtprs = large_m_mtprs_for(world_size=world_size, model_dim=model_dim,
+            inter_dim=inter_dim, experts_per_rank=experts // world_size)
         if not fused_layout_supported(
             arch=get_gfx_runtime(), world_size=world_size, model_dim=model_dim, inter_dim=inter_dim,
             experts=experts, topk=topk, quant=quant, swiglu_limit=float(swiglu_limit),

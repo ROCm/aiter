@@ -137,6 +137,7 @@ class MegaMoEV2:
                     world_size=self.world_size,
                     model_dim=self.model_dim,
                     inter_dim=self.inter_dim,
+                    experts_per_rank=self.epr,
                 )
             ),
         )

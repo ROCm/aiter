@@ -48,12 +48,13 @@ R1_MODEL_DIM, R1_INTER_DIM = 7168, 2048
 V4_MODEL_DIM, V4_INTER_DIM = 7168, 3072
 # EP4 DeepSeek-V4.1-Flash: (world_size, experts_per_rank, model_dim, inter_dim).
 V41_FLASH_EP4_LAYOUT = (4, 96, 5120, 2304)
-# (world_size, model_dim, inter_dim, experts, topk) of the layouts the fused (small- and large-input) kernels
-# serve: EP8 DeepSeek-V4-Pro and EP4 DeepSeek-V4.1-Flash.
+# (world_size, model_dim, inter_dim, experts, topk) of the layouts served by SmallM.
+# large_m_mtprs_for() restricts which of them also have a large-input route.
 FUSED_LAYOUTS = frozenset(
     {
         (8, V4_MODEL_DIM, V4_INTER_DIM, 8 * REFERENCE_EXPERTS_PER_RANK, 6),
         (4, 5120, 2304, 4 * 96, 6),
+        (4, 5120, 2304, 4 * 97, 7),
     }
 )
 K3_MODEL_DIM, K3_INTER_DIM = 3584, 3072
@@ -468,14 +469,18 @@ def fused_layout_supported(
 
 
 def large_m_mtprs_for(
-    *, world_size: int, model_dim: int, inter_dim: int
+    *, world_size: int, model_dim: int, inter_dim: int, experts_per_rank: int | None = None
 ) -> tuple[int, ...]:
     """Instance capacities the large-input kernel is built for on a FUSED_LAYOUTS layout.
 
     EP8 DeepSeek-V4-Pro takes LARGE_M_MTPRS; EP4 DeepSeek-V4.1-Flash takes V41_FLASH_EP4_LARGE_M_MTPRS, the
     capacities its one tune was measured at (see _tune_v41_flash_ep4_large).
+    experts_per_rank distinguishes the optional local shared replica, which currently
+    uses staged prefill. Omitting it retains the original layout default.
     """
     if (world_size, model_dim, inter_dim) == (4, 5120, 2304):
+        if experts_per_rank == 97:
+            return ()
         return V41_FLASH_EP4_LARGE_M_MTPRS
     return LARGE_M_MTPRS
 
@@ -1526,7 +1531,7 @@ def _large_m_config(expert_waves: int = 1) -> MegaMoEConfig:
 
 
 def _tune_v41_flash_ep4_small(config: MegaMoEConfig, bucket: int) -> MegaMoEConfig:
-    """EP4 DeepSeek-V4.1-Flash small-input kernel (96 experts per rank), measured on gfx950."""
+    """EP4 V4.1-Flash SmallM with 96 routed experts and an optional local shared replica."""
     # One dispatch row per (token, destination) instead of per route: the XGMI-bound dispatch sends ~45% fewer
     # rows (-3% at 128 tokens, -6% at 512, neutral at 1-32). The plan reaches every CTA in one hop: the plan CTA
     # writes it through to memory and publishes the flag without an L2 writeback, and each CTA waits on the flag
@@ -1764,6 +1769,10 @@ def _fused_config(
     inter_dim: int,
 ) -> MegaMoEConfig:
     ep4 = _is_v41_flash_ep4(world_size, experts_per_rank, model_dim, inter_dim)
+    ep4 = ep4 or (
+        mtpr <= SMALL_M_MAX_MTPR
+        and (world_size, experts_per_rank, model_dim, inter_dim) == (4, 97, 5120, 2304)
+    )
     expert_waves = (experts_per_rank + 63) // 64
     if mtpr in LARGE_M_MTPRS:
         config = _large_m_config(expert_waves)
@@ -1796,7 +1805,8 @@ def select_fused_config(
     if mtpr <= 0 or mtpr & (mtpr - 1):
         raise ValueError(f"mtpr={mtpr} must be a positive power of two")
     large_mtprs = large_m_mtprs_for(
-        world_size=world_size, model_dim=model_dim, inter_dim=inter_dim
+        world_size=world_size, model_dim=model_dim, inter_dim=inter_dim,
+        experts_per_rank=experts_per_rank,
     )
     if mtpr > SMALL_M_MAX_MTPR and mtpr not in large_mtprs:
         raise ValueError(f"no small- or large-input config for mtpr={mtpr}")
