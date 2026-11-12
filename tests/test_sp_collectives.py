@@ -7,6 +7,7 @@ aligned contiguous input, zero padding rows) and computes a layout-revealing
 result; shapes too large to allocate are meta tensors, which the router only
 reads shapes from."""
 
+import pickle
 from types import SimpleNamespace
 
 import pytest
@@ -94,12 +95,13 @@ def _served(router, quick, op, x):
 @pytest.fixture(autouse=True)
 def peers(monkeypatch):
     """The other ranks of the factory's vote: by default they send this rank's
-    window; set ``peers.others`` to what they send instead. ``peers.calls``
-    lists the groups the votes ran over."""
-    state = SimpleNamespace(calls=[], others="same")
+    vote; set ``peers.others`` to what they send instead. ``peers.calls``
+    lists the groups the votes ran over and ``peers.votes`` what this rank sent."""
+    state = SimpleNamespace(calls=[], votes=[], others="same")
 
     def all_gather_object(out, obj, group=None):
         state.calls.append(group)
+        state.votes.append(obj)
         other = obj if state.others == "same" else state.others
         out[:] = [obj] + [other] * (len(out) - 1)
 
@@ -300,13 +302,24 @@ def test_factory_without_a_window_returns_none_after_the_vote_without_compiling(
     assert peers.calls == [quick.group]
 
 
-@pytest.mark.parametrize("others", [None, policy.Window(1 << 30, None)])
+@pytest.mark.parametrize("others", [None, (1 << 30, None)])
 def test_factory_returns_none_when_a_peer_has_another_window(gfx950, peers, others):
     peers.others = others
     quick = FakeQuick()
     assert sp.create_sp_collectives(quick) is None
     assert quick.compiled == []
     assert peers.calls == [quick.group]
+
+
+@pytest.mark.parametrize("arch", ["gfx950", "gfx942"])
+def test_the_vote_is_plain_data(monkeypatch, peers, arch):
+    # A peer unpickles every vote: a Window would import FlyDSL on a rank that has
+    # none, so the vote must not name a class of aiter, with a window or without.
+    monkeypatch.setattr(policy, "detect_arch", lambda: arch)
+    sp.create_sp_collectives(FakeQuick())
+    (vote,) = peers.votes
+    assert vote == ((8 << 20, None) if arch == "gfx950" else None)
+    assert b"aiter" not in pickle.dumps(vote)
 
 
 def test_factory_returns_none_when_the_kernels_cannot_run(gfx950, monkeypatch):

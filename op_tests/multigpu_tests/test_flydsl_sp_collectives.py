@@ -221,7 +221,11 @@ def _run_rank(rank: int, tp: int, init_method: str, factory: bool) -> dict:
     from aiter.ops.flydsl.allreduce_policy import Window, detect_arch
 
     device, gloo = _init_rank(rank, tp, init_method)
-    fly = FlyQuickAllReduce(group=gloo, device=device, rank=rank, world_size=tp)
+    # The single-phase kernels run on the uncached inbox only; "auto" picks the
+    # fine-grained one at TP4 and TP8 on a host whose GPUs are linked by PCIe.
+    fly = FlyQuickAllReduce(
+        group=gloo, device=device, rank=rank, world_size=tp, inbox_memory="uncached"
+    )
     res = {"factory_none": None, "rows": [], "below": None, "graph": None}
     try:
         res["router_expected"] = (detect_arch(), fly.link, tp) == _ROUTER_PLATFORM

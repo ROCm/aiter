@@ -153,10 +153,13 @@ def create_sp_collectives(quick) -> SequenceParallelCollectives | None:
             arch=fly_policy.detect_arch(), link=quick.link, world_size=quick.world_size
         )
     # Every rank votes before any rank returns: one that returned alone would
-    # leave its peers waiting in compile_sp's own vote.
-    windows = [None] * quick.world_size
-    dist.all_gather_object(windows, window, group=quick.group)
-    if windows[0] is None or any(w != windows[0] for w in windows):
+    # leave its peers waiting in compile_sp's own vote. The vote is plain data: a
+    # peer's Window would be unpickled here, which imports FlyDSL again on a rank
+    # that has none and raises instead of returning None.
+    vote = None if window is None else (window.min, window.max)
+    votes = [None] * quick.world_size
+    dist.all_gather_object(votes, vote, group=quick.group)
+    if votes[0] is None or any(v != votes[0] for v in votes):
         return None
     elements = TILE_BYTES // ELEMENT_BYTES
     full = torch.empty(elements, dtype=torch.bfloat16, device=quick.device)
