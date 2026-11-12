@@ -15,6 +15,7 @@ from aiter.jit.utils.torch_guard import torch_compile_guard
 
 from ..jit.core import compile_ops
 from ..jit.utils.chip_info import get_cu_num, get_gfx
+from ..plugin import route as _route
 from ..utility import dtypes, fp4_utils
 from ..utility import mx_types as _mx_types
 from ..utility.mx_types import (
@@ -61,6 +62,7 @@ def get_dtype_max(dtype):
     return dtypeMax
 
 
+@_route(op="pertoken_quant", version=1)
 def pertoken_quant(
     x,
     scale=None,
@@ -69,6 +71,35 @@ def pertoken_quant(
     quant_dtype=dtypes.i8,
     dtypeMax=None,
 ):
+    """Symmetric per-token quantization: one scale per row of ``x``.
+
+    The reduction is over the LAST axis, so "token" means a row however many
+    leading axes ``x`` has -- ``per_block_quant_wrapper`` relies on that,
+    reshaping ``[m, n]`` to ``[-1, blk_n]`` and calling this to get
+    ``per_1x128`` and friends out of the same body.
+
+    Args:
+        x: input of any shape; quantized along the last axis.
+        scale: a precomputed per-token scale ``[..., 1]``. Given, it is used
+            as-is and nothing is reduced -- a caller that already knows the
+            scale (static quant, or a scale shared across a step) skips the
+            amax pass. ``None`` derives it from ``x``.
+        x_scale: optional smoothquant scale multiplied into ``x`` BEFORE the
+            amax. Not the output scale, and not a second name for ``scale``.
+        scale_dtype: dtype the returned scale is cast to.
+        quant_dtype: output dtype; also fixes ``dtypeMax`` when that is None.
+        dtypeMax: the magnitude ``quant_dtype`` is scaled to. Pass it to
+            quantize against a bound other than the dtype's own maximum.
+
+    Returns:
+        ``(y, y_scale)`` -- a new ``quant_dtype`` tensor shaped like ``x``,
+        and the ``scale_dtype`` scale of shape ``[..., 1]``. Nothing is
+        written in place.
+
+    A row whose amax is zero would give a zero scale and a division by it, so
+    that scale is forced to 1: an all-zero row quantizes to zeros rather than
+    to NaN.
+    """
     x = x.to(dtypes.fp32)
     if x_scale is None:
         hidden_states = x
@@ -850,6 +881,10 @@ def dynamic_per_group_scaled_quant(
     scale-load swizzle when ``group_size == 32``, and a plain transpose
     (``(rows, scaleN) -> (scaleN, rows)`` byte layout) for other group
     sizes.
+
+    For MXFP8 (fp8 output, e8m0 scales), NaN elements stay NaN and do not
+    affect the scale. A group holding an Inf gets scale 2^127 (0xFE): its Inf
+    becomes an FP8 NaN and its finite elements are scaled as usual.
 
     Only ``group_size`` in {32, 64, 128} is supported.
 
