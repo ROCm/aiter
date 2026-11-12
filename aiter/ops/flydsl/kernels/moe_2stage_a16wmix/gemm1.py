@@ -69,7 +69,7 @@ def _gemm1_body_a16w4(
     """a16w4/a16wi4/a16w16 (bf16 A x mxfp4/int4/bf16 W) fused stage1 gemm1 body.
 
     A is native bf16 (no A-scale). W is mxfp4/int4 (packed, per-group scale, upconverted
-    in-kernel) or raw bf16. Non-scaled MFMA(16,16,32,bf16) K=32; epilogue SiLU(gate)*up
+    in-kernel), raw bf16 or (the shared expert) MXFP8 e4m3 codes upconverted in-kernel. Non-scaled MFMA(16,16,32,bf16) K=32; epilogue SiLU(gate)*up
     -> bf16 intermediate ``[sorted_size, inter_dim]`` stored by SORTED POSITION.
 
     ``dense=True`` is the shared-expert prologue: one expert and no routing. The A row
@@ -503,6 +503,7 @@ def compile_gemm1_a16w4_port(
     shared_tile_m=None,
     shared_tile_k=None,
     shared_k_wave=None,
+    shared_w_dtype="bf16",
 ):
     """a16w4/a16wi4/a16w16 (bf16 A x mxfp4/int4/bf16 W1) fused stage1 builder.
 
@@ -529,9 +530,13 @@ def compile_gemm1_a16w4_port(
 
     ``shared_tile_n`` adds the optional shared-expert prologue. ``None`` (the default)
     keeps the kernel, its name and its launch signature. With a value, the launch takes
-    two more pointers: ``arg_sh_w`` is the raw bf16 shared W1 ``[2*D_INTER, D_HIDDEN]``
-    in the ``shuffle_weight`` (16, 16) layout, and ``arg_sh_out`` is its bf16
-    ``[n_tokens, D_INTER]`` intermediate. The first ``a16w4_shared_tiles`` program ids
+    three more pointers: ``arg_sh_w`` is the shared W1 ``[2*D_INTER, D_HIDDEN]`` in the
+    ``shuffle_weight`` (16, 16) layout, ``arg_sh_ws`` its scales and ``arg_sh_out`` its
+    bf16 ``[n_tokens, D_INTER]`` intermediate. ``shared_w_dtype="bf16"``: W1 is raw bf16
+    and ``arg_sh_ws`` is not read. ``"fp8"`` (MXFP8, gfx950): W1 is fp8 e4m3 codes and
+    ``arg_sh_ws`` their e8m0 per-1x32 scales in the ``shuffle_scale`` layout; the tiles
+    scale the codes to bf16 in registers (exact) and run the same bf16 MFMAs, so the
+    output is bitwise that of the bf16 W1 upcast. The first ``a16w4_shared_tiles`` program ids
     compute the shared expert for every token with the same activation. The shared tile
     is ``shared_tile_m x shared_tile_n x shared_tile_k`` with ``shared_k_wave``; an
     unset value uses the routed BM, TILE_K or k_wave. The routed tiles follow in their
@@ -626,6 +631,13 @@ def compile_gemm1_a16w4_port(
         SH_TK = shared_tile_k or TILE_K
         SH_KW = shared_k_wave or k_wave
         _sh_step = 16 * (4 // SH_KW)
+        assert shared_w_dtype in (
+            "bf16",
+            "fp8",
+        ), f"shared_w_dtype must be 'bf16' or 'fp8', got {shared_w_dtype!r}"
+        assert (
+            shared_w_dtype == "bf16" or SH_TK % 128 == 0
+        ), f"an fp8 shared_tile_k must be a multiple of 128, got {SH_TK}"
         assert SH_KW in (1, 2, 4), f"shared_k_wave must be 1, 2 or 4, got {SH_KW}"
         assert (
             shared_tile_n % _sh_step == 0 and _INTER % shared_tile_n == 0
@@ -778,13 +790,15 @@ def compile_gemm1_a16w4_port(
 
     SH_TN = shared_tile_n
     SH_NB = _INTER // SH_TN
+    _sh_fp8 = shared_w_dtype == "fp8"
+    _sh_tag = "_mxfp8" if _sh_fp8 else ""
 
     @fx.struct
     class SharedStorageSh:
         raw: fx.Array[fx.Uint8, lds_bytes_shared, 16]
 
     @flyc.kernel(
-        name=f"gemm1_a16w4_port_{name_suffix}_sh{SH_BM}x{SH_TN}x{SH_TK}kw{SH_KW}",
+        name=f"gemm1_a16w4_port_{name_suffix}_sh{SH_BM}x{SH_TN}x{SH_TK}kw{SH_KW}{_sh_tag}",
         known_block_size=[256, 1, 1],
     )
     def gemm1_kernel_shared(
@@ -802,6 +816,7 @@ def compile_gemm1_a16w4_port(
         f32_swiglu_limit: fx.Float32,
         arg_out: fx.Int64,
         arg_sh_w: fx.Int64,
+        arg_sh_ws: fx.Int64,
         arg_sh_out: fx.Int64,
     ):
         lds_raw_ptr = fx.SharedAllocator().allocate(SharedStorageSh).peek().raw.ptr
@@ -848,7 +863,7 @@ def compile_gemm1_a16w4_port(
                 lds_raw_ptr,
                 arg_x,
                 arg_sh_w,
-                arg_sh_w,
+                arg_sh_ws,
                 arg_eids,
                 arg_mind,
                 arg_cumsum,
@@ -867,7 +882,7 @@ def compile_gemm1_a16w4_port(
                 TOPK=TOPK,
                 act=act,
                 b_cache_mod=b_cache_mod,
-                w_dtype="bf16",
+                w_dtype=shared_w_dtype,
                 w_layout="standard",
                 k_wave=SH_KW,
                 activation_bf16=activation_bf16,
@@ -928,6 +943,7 @@ def compile_gemm1_a16w4_port(
         f32_swiglu_limit: fx.Float32,
         arg_out: fx.Int64,
         arg_sh_w: fx.Int64,
+        arg_sh_ws: fx.Int64,
         arg_sh_out: fx.Int64,
         stream: fx.Stream,
     ):
@@ -947,6 +963,7 @@ def compile_gemm1_a16w4_port(
             f32_swiglu_limit,
             arg_out,
             arg_sh_w,
+            arg_sh_ws,
             arg_sh_out,
             value_attrs={"rocdl.waves_per_eu": waves_per_eu} if waves_per_eu else None,
         ).launch(grid=(grid_x, 1, 1), block=(256, 1, 1), stream=stream)

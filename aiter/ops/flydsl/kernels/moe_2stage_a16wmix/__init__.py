@@ -19,12 +19,22 @@ Launch args are raw device pointers (``fx.Int64``); tensors passed as
 ``.data_ptr()``.
 
 Optional shared expert (both stages): a dense expert that every token uses. Its
-weights are raw bf16: ``shared_w1`` ``[2*D_INTER, D_HIDDEN]`` (gate|up) and
-``shared_w2`` ``[D_HIDDEN, D_INTER]``, each preshuffled with
-``shuffle_weight(w, layout=(16, 16))``. ``shared_inter_bf16`` ``[n_tokens, D_INTER]``
-holds its intermediate between the stages. Its tiles take the first program ids. The
-routed tiles and the sort do not change. Stage 2 adds the shared output into
-``flat_out`` at weight 1.0 (atomic epilog). Only gfx950 is validated.
+weights are ``shared_w1`` ``[2*D_INTER, D_HIDDEN]`` (gate|up) and ``shared_w2``
+``[D_HIDDEN, D_INTER]``, each preshuffled with ``shuffle_weight(w, layout=(16, 16))``,
+in one of two formats, chosen by the weight dtype:
+
+  - bf16: raw bf16 weights, no scales.
+  - MXFP8: ``torch.float8_e4m3fn`` codes plus ``shared_w1_scale`` / ``shared_w2_scale``,
+    their e8m0 (uint8) per-1x32 scales ``[N, K/32]`` preshuffled with
+    ``shuffle_scale`` (the routed MXFP4 scale layout). The tiles scale the codes to
+    bf16 in registers (``v_cvt_scalef32_pk_bf16_fp8``; e4m3 x 2^k is exact in bf16) and
+    run the bf16 MFMAs of the bf16 format, so the output is bitwise the bf16 format's
+    on the upcast weights, at half the weight bytes.
+
+``shared_inter_bf16`` ``[n_tokens, D_INTER]`` holds its intermediate between the
+stages. Its tiles take the first program ids. The routed tiles and the sort do not
+change. Stage 2 adds the shared output into ``flat_out`` at weight 1.0 (atomic
+epilog). Only gfx950 is validated.
 """
 
 import torch
@@ -61,22 +71,57 @@ def _shared_kw(shared_tile_n, **tile):
     return {"shared_tile_n": shared_tile_n, **{k: v for k, v in tile.items() if v}}
 
 
+# (name, dtypes) a shared-expert tensor may have
+_BF16 = ("bf16", (torch.bfloat16,))
+_E4M3 = ("float8_e4m3fn", (torch.float8_e4m3fn,))
+_E8M0 = (
+    "uint8 (e8m0)",
+    tuple(
+        t
+        for t in (torch.uint8, getattr(torch, "float8_e8m0fnu", None))
+        if t is not None
+    ),
+)
+
+
+def _shared_scale_bytes(N, K):
+    """Bytes of a ``shuffle_scale`` e8m0 scale of an ``[N, K]`` weight the kernels read."""
+    return N * ((K + 255) // 256) * 8
+
+
+def _shared_weight_args(name, w, scale, N, K):
+    """Return the check entries and the kernel ``shared_w_dtype`` of a shared weight:
+    bf16 (no scale) or MXFP8 (e4m3 codes + e8m0 scale)."""
+    if w.dtype in _E4M3[1]:
+        if scale is None:
+            raise ValueError(f"an fp8 {name} needs {name}_scale (e8m0, shuffle_scale)")
+        entries = {
+            name: (w, N * K, _E4M3),
+            f"{name}_scale": (scale, _shared_scale_bytes(N, K), _E8M0),
+        }
+        return entries, "fp8"
+    if scale is not None:
+        raise ValueError(f"{name}_scale is only for an fp8 (MXFP8) {name}")
+    return {name: (w, N * K, _BF16)}, "bf16"
+
+
 def _check_shared(device, **tensors):
-    """Check the shared-expert inputs; ``tensors`` maps name -> (tensor, min numel)."""
+    """Check the shared-expert inputs; ``tensors`` maps name -> (tensor, min numel,
+    allowed dtypes)."""
     from aiter.jit.utils import chip_info
 
     if chip_info.get_gfx_runtime() != "gfx950":
         raise NotImplementedError("the a16w4 shared expert is validated on gfx950 only")
-    for name, (t, numel) in tensors.items():
+    for name, (t, numel, (want, dtypes)) in tensors.items():
         if (
-            t.dtype != torch.bfloat16
+            t.dtype not in dtypes
             or not t.is_contiguous()
             or t.numel() < numel
             or t.device != device
         ):
             raise ValueError(
-                f"{name} must be a contiguous bf16 tensor of >= {numel} elements on "
-                f"{device}, got {t.dtype} {tuple(t.shape)} on {t.device}"
+                f"{name} must be a contiguous {want} tensor of >= {numel} elements "
+                f"on {device}, got {t.dtype} {tuple(t.shape)} on {t.device}"
             )
 
 
@@ -124,6 +169,7 @@ def flydsl_a16w4_gemm1(
     shared_tile_m=None,
     shared_tile_k=None,
     shared_k_wave=None,
+    shared_w1_scale=None,
 ):
     """a16w4/a16wi4/a16w16 fused stage1: gate+up GEMM + SiLU -> bf16 intermediate.
 
@@ -157,7 +203,8 @@ def flydsl_a16w4_gemm1(
     before this activation. Plain ``silu`` and the default rounding are unchanged.
 
     ``shared_w1`` / ``shared_inter_bf16`` (together): the shared-expert prologue (see
-    the module docstring); ``shared_tile_n`` defaults to ``a16w4_default_shared_tile_n``.
+    the module docstring); bf16 ``shared_w1``, or fp8 e4m3 with ``shared_w1_scale``
+    (MXFP8). ``shared_tile_n`` defaults to ``a16w4_default_shared_tile_n``.
     """
     if k_batch != 1:
         raise NotImplementedError(f"a16w4 gemm1 only supports k_batch=1, got {k_batch}")
@@ -193,14 +240,18 @@ def flydsl_a16w4_gemm1(
 
     shared = shared_w1 is not None or shared_inter_bf16 is not None
     sh_tn = None
+    sh_wd = "bf16"
     shared_tiles = 0
     if shared:
         if shared_w1 is None or shared_inter_bf16 is None:
             raise ValueError("shared_w1 and shared_inter_bf16 must be given together")
+        w_entries, sh_wd = _shared_weight_args(
+            "shared_w1", shared_w1, shared_w1_scale, 2 * D_INTER, D_HIDDEN
+        )
         _check_shared(
             a_bf16.device,
-            shared_w1=(shared_w1, 2 * D_INTER * D_HIDDEN),
-            shared_inter_bf16=(shared_inter_bf16, n_tokens * D_INTER),
+            **w_entries,
+            shared_inter_bf16=(shared_inter_bf16, n_tokens * D_INTER, _BF16),
         )
         sh_tn = shared_tile_n or a16w4_default_shared_tile_n(
             TILE_N, D_INTER, step=16 * (4 // (shared_k_wave or k_wave))
@@ -231,6 +282,7 @@ def flydsl_a16w4_gemm1(
             shared_tile_m=shared_tile_m,
             shared_tile_k=shared_tile_k,
             shared_k_wave=shared_k_wave,
+            shared_w_dtype=sh_wd if sh_wd != "bf16" else None,
         ),
     )
     max_m_blocks = int(sorted_expert_ids.numel())
@@ -250,7 +302,15 @@ def flydsl_a16w4_gemm1(
         raise ValueError(
             f"situ_beta/situ_linear_beta must be > 0, got {_beta!r}/{_lbeta!r}"
         )
-    shared_ptrs = (shared_w1.data_ptr(), shared_inter_bf16.data_ptr()) if shared else ()
+    shared_ptrs = ()
+    if shared:
+        # bf16: the kernel does not read the scale pointer (passed the weight's).
+        sh_scale = shared_w1 if shared_w1_scale is None else shared_w1_scale
+        shared_ptrs = (
+            shared_w1.data_ptr(),
+            sh_scale.data_ptr(),
+            shared_inter_bf16.data_ptr(),
+        )
     _run_compiled(
         launch,
         a_bf16.data_ptr(),
@@ -307,6 +367,7 @@ def flydsl_a16w4_gemm2(
     shared_tile_n=None,
     shared_tile_m=None,
     shared_tile_k=None,
+    shared_w2_scale=None,
 ):
     """a16w4/a16wi4/a16w16 fused stage2 (down-proj). Consumes the bf16 [sorted_size,
     D_INTER] intermediate; scatters routing-weighted bf16 into ``flat_out``.
@@ -323,7 +384,8 @@ def flydsl_a16w4_gemm2(
 
     ``shared_inter_bf16`` / ``shared_w2`` (together, atomic epilog): the shared-expert
     prologue adds ``shared_inter_bf16 [M_logical, D_INTER] @ shared_w2^T`` into every
-    token; ``shared_tile_n`` defaults to ``a16w4_default_shared_tile_n``.
+    token; bf16 ``shared_w2``, or fp8 e4m3 with ``shared_w2_scale`` (MXFP8).
+    ``shared_tile_n`` defaults to ``a16w4_default_shared_tile_n``.
     """
     if k_batch != 1:
         raise NotImplementedError(f"a16w4 gemm2 only supports k_batch=1, got {k_batch}")
@@ -356,16 +418,20 @@ def flydsl_a16w4_gemm2(
     _persist = False if persist is None else bool(persist)
     shared = shared_w2 is not None or shared_inter_bf16 is not None
     sh_tn = None
+    sh_wd = "bf16"
     shared_tiles = 0
     if shared:
         if shared_w2 is None or shared_inter_bf16 is None:
             raise ValueError("shared_w2 and shared_inter_bf16 must be given together")
         if epilog != "atomic":
             raise ValueError("the shared-expert prologue needs epilog='atomic'")
+        w_entries, sh_wd = _shared_weight_args(
+            "shared_w2", shared_w2, shared_w2_scale, D_HIDDEN, D_INTER
+        )
         _check_shared(
             flat_out.device,
-            shared_w2=(shared_w2, D_HIDDEN * D_INTER),
-            shared_inter_bf16=(shared_inter_bf16, int(M_logical) * D_INTER),
+            **w_entries,
+            shared_inter_bf16=(shared_inter_bf16, int(M_logical) * D_INTER, _BF16),
         )
         sh_tn = shared_tile_n or a16w4_default_shared_tile_n(TILE_N, D_HIDDEN, step=64)
         shared_tiles = a16w4_shared_tiles(
@@ -388,7 +454,12 @@ def flydsl_a16w4_gemm2(
         topk=topk,
         reuse_lds=reuse_lds,
         use_valid_token_count=use_valid_token_count,
-        **_shared_kw(sh_tn, shared_tile_m=shared_tile_m, shared_tile_k=shared_tile_k),
+        **_shared_kw(
+            sh_tn,
+            shared_tile_m=shared_tile_m,
+            shared_tile_k=shared_tile_k,
+            shared_w_dtype=sh_wd if sh_wd != "bf16" else None,
+        ),
     )
     grid = gemm2_a16w4_grid(
         BM,
@@ -398,7 +469,14 @@ def flydsl_a16w4_gemm2(
         persist=_persist,
         shared_tiles=shared_tiles,
     )
-    shared_ptrs = (shared_inter_bf16.data_ptr(), shared_w2.data_ptr()) if shared else ()
+    shared_ptrs = ()
+    if shared:
+        sh_scale = shared_w2 if shared_w2_scale is None else shared_w2_scale
+        shared_ptrs = (
+            shared_inter_bf16.data_ptr(),
+            shared_w2.data_ptr(),
+            sh_scale.data_ptr(),
+        )
     _run_compiled(
         launch,
         inter_sorted_bf16.data_ptr(),

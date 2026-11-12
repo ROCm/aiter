@@ -1625,7 +1625,8 @@ def _flydsl_moe_stage1_impl(
     k_wave: int = 1,
     v2_output_layout: bool = False,
     activation_bf16: bool = False,
-    shared_w1_bf16: torch.Tensor | None = None,
+    shared_w1: torch.Tensor | None = None,
+    shared_w1_scale: torch.Tensor | None = None,
     shared_inter_bf16: torch.Tensor | None = None,
     shared_tile: dict | None = None,
     _compile_kernel=compile_flydsl_moe_stage1,
@@ -1702,10 +1703,10 @@ def _flydsl_moe_stage1_impl(
         waves_per_eu if (waves_per_eu is not None and int(waves_per_eu) > 1) else None
     )
     _is_a16w_port = a_dtype == "bf16" and b_dtype in ("fp4", "int4", "bf16")
-    _shared = shared_w1_bf16 is not None or shared_inter_bf16 is not None
+    _shared = shared_w1 is not None or shared_inter_bf16 is not None
     if _shared and not _is_a16w_port:
         raise NotImplementedError(
-            "the bf16 shared expert runs only on the a16w-mix (bf16 activation) "
+            "the shared expert runs only on the a16w-mix (bf16 activation) "
             f"stage-1 kernels, not a_dtype={a_dtype} b_dtype={b_dtype}"
         )
     if _is_a16w_port:
@@ -1750,7 +1751,8 @@ def _flydsl_moe_stage1_impl(
             w_dtype=b_dtype,
             w_layout="standard",
             activation_bf16=activation_bf16,
-            shared_w1=shared_w1_bf16,
+            shared_w1=shared_w1,
+            shared_w1_scale=shared_w1_scale,
             shared_inter_bf16=shared_inter_bf16,
             **_a16w4_shared_tile(shared_tile, 1),
         )
@@ -2112,7 +2114,8 @@ def flydsl_moe_stage1(
     k_wave: int = 1,
     v2_output_layout: bool = False,
     activation_bf16: bool = False,
-    shared_w1_bf16: torch.Tensor | None = None,
+    shared_w1: torch.Tensor | None = None,
+    shared_w1_scale: torch.Tensor | None = None,
     shared_inter_bf16: torch.Tensor | None = None,
     shared_tile: dict | None = None,
 ):
@@ -2173,7 +2176,8 @@ def flydsl_moe_stage1(
         k_wave=k_wave,
         v2_output_layout=v2_output_layout,
         activation_bf16=activation_bf16,
-        shared_w1_bf16=shared_w1_bf16,
+        shared_w1=shared_w1,
+        shared_w1_scale=shared_w1_scale,
         shared_inter_bf16=shared_inter_bf16,
         shared_tile=shared_tile,
     )
@@ -2212,7 +2216,8 @@ def _flydsl_moe_stage2_impl(
     expert_mask: torch.Tensor | None = None,
     topk_ids: torch.Tensor | None = None,
     use_valid_token_count: bool = False,
-    shared_w2_bf16: torch.Tensor | None = None,
+    shared_w2: torch.Tensor | None = None,
+    shared_w2_scale: torch.Tensor | None = None,
     shared_inter_bf16: torch.Tensor | None = None,
     shared_tile: dict | None = None,
     _compile_kernel=compile_flydsl_moe_stage2,
@@ -2220,10 +2225,10 @@ def _flydsl_moe_stage2_impl(
 ) -> torch.Tensor:
     """Run stage2 with injectable compiler and launch-argument builders."""
 
-    _shared = shared_w2_bf16 is not None or shared_inter_bf16 is not None
+    _shared = shared_w2 is not None or shared_inter_bf16 is not None
     if _shared and not (a_dtype == "bf16" and b_dtype in ("fp4", "int4", "bf16")):
         raise NotImplementedError(
-            "the bf16 shared expert runs only on the a16w-mix (bf16 activation) "
+            "the shared expert runs only on the a16w-mix (bf16 activation) "
             f"stage-2 kernels, not a_dtype={a_dtype} b_dtype={b_dtype}"
         )
     if a_dtype == "bf16" and b_dtype in ("fp4", "int4", "bf16"):
@@ -2299,7 +2304,8 @@ def _flydsl_moe_stage2_impl(
             epilog=_epilog,
             use_valid_token_count=use_valid_token_count,
             shared_inter_bf16=shared_inter_bf16,
-            shared_w2=shared_w2_bf16,
+            shared_w2=shared_w2,
+            shared_w2_scale=shared_w2_scale,
             **_a16w4_shared_tile(shared_tile, 2),
         )
         if _epilog == "reduce":
@@ -2553,7 +2559,8 @@ def flydsl_moe_stage2(
     expert_mask: torch.Tensor | None = None,
     topk_ids: torch.Tensor | None = None,
     use_valid_token_count: bool = False,
-    shared_w2_bf16: torch.Tensor | None = None,
+    shared_w2: torch.Tensor | None = None,
+    shared_w2_scale: torch.Tensor | None = None,
     shared_inter_bf16: torch.Tensor | None = None,
     shared_tile: dict | None = None,
 ) -> torch.Tensor:
@@ -2613,7 +2620,8 @@ def flydsl_moe_stage2(
         expert_mask=expert_mask,
         topk_ids=topk_ids,
         use_valid_token_count=use_valid_token_count,
-        shared_w2_bf16=shared_w2_bf16,
+        shared_w2=shared_w2,
+        shared_w2_scale=shared_w2_scale,
         shared_inter_bf16=shared_inter_bf16,
         shared_tile=shared_tile,
     )

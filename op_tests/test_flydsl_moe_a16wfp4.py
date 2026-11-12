@@ -52,6 +52,7 @@ from aiter.ops.flydsl.moe_a16w4_policy import A16W4Tiles, get_a16w4_tuned_tiles
 from aiter.ops.flydsl.moe_common import GateMode
 from aiter.ops.shuffle import (
     pack_int8_to_packed_int4,
+    shuffle_scale,
     shuffle_scale_a16w4,
     shuffle_scale_for_int4,
     shuffle_weight,
@@ -1615,7 +1616,7 @@ def test_stage2_weight_formats(token, tile_m, weight_dtype):
     )
 
 
-# ---- Optional bf16 shared expert in the a16w4 gemm1/gemm2 launches ---------------
+# ---- Optional shared expert (bf16 or MXFP8) in the a16w4 gemm1/gemm2 launches ----
 
 _SHARED_SKIP = pytest.mark.skipif(
     get_gfx_runtime() != "gfx950",
@@ -1694,6 +1695,7 @@ def test_shared_tile_suffix_without_shared_weights(monkeypatch, stage):
     monkeypatch.setattr(kernels, f"compile_gemm{stage}_a16w4_port", capture_build)
     tokens, experts, model_dim, inter_dim, topk = 4, 8, 256, 256, 2
     bf16, u8, i32 = torch.bfloat16, torch.uint8, torch.int32
+    fp8 = torch.float8_e4m3fn
     w1 = torch.empty((experts, 2 * inter_dim, model_dim // 2), dtype=u8)
     w2 = torch.empty((experts, model_dim, inter_dim // 2), dtype=u8)
     sorting = (
@@ -1711,14 +1713,24 @@ def test_shared_tile_suffix_without_shared_weights(monkeypatch, stage):
             "shared_k_wave": 4,
         }
         shared = {
-            "shared_w1_bf16": torch.empty((2 * inter_dim, model_dim), dtype=bf16),
+            "shared_w1": torch.empty((2 * inter_dim, model_dim), dtype=bf16),
+            "shared_inter_bf16": shared_inter,
+        }
+        shared_mx = {
+            "shared_w1": torch.empty((2 * inter_dim, model_dim), dtype=fp8),
+            "shared_w1_scale": torch.empty(2 * inter_dim * model_dim // 32, dtype=u8),
             "shared_inter_bf16": shared_inter,
         }
     else:
         name, suffix = _M3_STAGE2, "_sh64x64x128"
         tile = {"shared_tile_m": 64, "shared_tile_n": 64, "shared_tile_k": 128}
         shared = {
-            "shared_w2_bf16": torch.empty((model_dim, inter_dim), dtype=bf16),
+            "shared_w2": torch.empty((model_dim, inter_dim), dtype=bf16),
+            "shared_inter_bf16": shared_inter,
+        }
+        shared_mx = {
+            "shared_w2": torch.empty((model_dim, inter_dim), dtype=fp8),
+            "shared_w2_scale": torch.empty(model_dim * inter_dim // 32, dtype=u8),
             "shared_inter_bf16": shared_inter,
         }
 
@@ -1758,6 +1770,9 @@ def test_shared_tile_suffix_without_shared_weights(monkeypatch, stage):
     assert not any(key.startswith("shared") for key in routed)
     assert build(name + suffix) == routed
     assert build(name + suffix, **shared) == {**routed, **tile}
+    # MXFP8 shared weights select the fp8 variant of the same tile.
+    mxfp8 = {**routed, **tile, "shared_w_dtype": "fp8"}
+    assert build(name + suffix, **shared_mx) == mxfp8
 
 
 def test_shared_expert_rejects_unsupported_calls(monkeypatch):
@@ -1801,6 +1816,21 @@ def test_shared_expert_rejects_unsupported_calls(monkeypatch):
         gemm1(shared_w1=shared_w1.float(), shared_inter_bf16=shared_inter)
     with pytest.raises(ValueError, match="contiguous bf16"):
         gemm1(shared_w1=shared_w1, shared_inter_bf16=shared_inter[:2])
+    # MXFP8: e4m3 codes need their e8m0 scales, and only they take scales.
+    codes = torch.empty((2 * inter_dim, model_dim), dtype=torch.float8_e4m3fn)
+    scales = torch.empty(2 * inter_dim * model_dim // 32, dtype=torch.uint8)
+    with pytest.raises(ValueError, match="needs shared_w1_scale"):
+        gemm1(shared_w1=codes, shared_inter_bf16=shared_inter)
+    with pytest.raises(ValueError, match="only for an fp8"):
+        gemm1(
+            shared_w1=shared_w1, shared_w1_scale=scales, shared_inter_bf16=shared_inter
+        )
+    with pytest.raises(ValueError, match="contiguous uint8"):
+        gemm1(
+            shared_w1=codes,
+            shared_w1_scale=scales[:-1],
+            shared_inter_bf16=shared_inter,
+        )
 
     g1 = {
         "BM": 16,
@@ -1824,6 +1854,10 @@ def test_shared_expert_rejects_unsupported_calls(monkeypatch):
     }
     with pytest.raises(AssertionError, match="shared_tile_n"):
         kernels.compile_gemm1_a16w4_port(**g1, shared_tile_n=48)
+    with pytest.raises(AssertionError, match="fp8 shared_tile_k"):
+        kernels.compile_gemm1_a16w4_port(
+            **g1, shared_tile_n=64, shared_tile_k=64, shared_w_dtype="fp8"
+        )
     with pytest.raises(AssertionError, match="epilog='atomic'"):
         kernels.compile_gemm2_a16w4_port(
             **g2, shared_tile_n=64, epilog="reduce", topk=2
@@ -1853,6 +1887,48 @@ def _routed_swiglu_reference(hidden, weight1, weight2, routing_ids, routing_weig
     return output
 
 
+def _mxfp8_weight(rows, columns, std, device="cuda"):
+    """A random MXFP8 weight as a checkpoint stores it: e4m3 codes ``[rows, columns]``
+    and e8m0 scales ``[rows, columns / 32]`` (about ``std``), plus its bf16 upcast
+    (exact: an e4m3 value times a power of two is a bf16 value)."""
+    codes = (torch.randn((rows, columns), device=device) * 2.0).to(torch.float8_e4m3fn)
+    exponent = 127 + round(torch.log2(torch.tensor(std / 2.0)).item())
+    scales = torch.randint(
+        exponent - 1, exponent + 2, (rows, columns // 32), device=device
+    ).to(torch.uint8)
+    upcast = codes.float().view(rows, -1, 32) * e8m0_to_f32(scales).unsqueeze(-1)
+    return codes, scales, upcast.view(rows, columns).to(dtypes.bf16)
+
+
+def _shared_weights(shared1, shared2):
+    """The shared-expert kernel arguments of MXFP8 weights ``(codes, scales, upcast)``:
+    bf16 (the exact upcast) and MXFP8 (codes + e8m0 scales), all preshuffled."""
+    out = {}
+    for stage, (codes, scales, upcast) in ((1, shared1), (2, shared2)):
+        out[f"shared_w{stage}"] = shuffle_weight(upcast, layout=(16, 16))
+        out[f"shared_w{stage}_mx"] = shuffle_weight(codes, layout=(16, 16))
+        out[f"shared_w{stage}_scale"] = shuffle_scale(scales)
+    return out
+
+
+def _shared_extra_args(case, shared_dtype, shared_inter):
+    """``_stage1_extra_args`` / ``_stage2_extra_args`` of the shared expert."""
+    if shared_dtype == "mxfp8":
+        extra1 = {
+            "shared_w1": case["shared_w1_mx"],
+            "shared_w1_scale": case["shared_w1_scale"],
+        }
+        extra2 = {
+            "shared_w2": case["shared_w2_mx"],
+            "shared_w2_scale": case["shared_w2_scale"],
+        }
+    else:
+        extra1 = {"shared_w1": case["shared_w1"]}
+        extra2 = {"shared_w2": case["shared_w2"]}
+    extra1["shared_inter_bf16"] = extra2["shared_inter_bf16"] = shared_inter
+    return extra1, extra2
+
+
 def _shared_expert_case(token, model_dim, inter_dim, experts, topk, seed=31):
     torch.manual_seed(seed)
     device = "cuda"
@@ -1865,9 +1941,10 @@ def _shared_expert_case(token, model_dim, inter_dim, experts, topk, seed=31):
     packed2, scales2, reference2 = _pack_mxfp4_reference(weight2.to(dtypes.bf16))
     del weight1, weight2
     packed1.is_shuffled = packed2.is_shuffled = True
-    shared1 = torch.randn((2 * inter_dim, model_dim), device=device) * scale1
-    shared2 = torch.randn((model_dim, inter_dim), device=device) * scale2
-    shared1, shared2 = shared1.to(dtypes.bf16), shared2.to(dtypes.bf16)
+    # MXFP8 shared weights, as the checkpoint holds them; bf16 = their exact upcast.
+    shared_mx1 = _mxfp8_weight(2 * inter_dim, model_dim, scale1)
+    shared_mx2 = _mxfp8_weight(model_dim, inter_dim, scale2)
+    shared1, shared2 = shared_mx1[2], shared_mx2[2]
     routing_ids = (
         torch.randn((token, experts), device=device)
         .topk(topk, dim=-1)
@@ -1885,8 +1962,7 @@ def _shared_expert_case(token, model_dim, inter_dim, experts, topk, seed=31):
         "w1_scale": scales1,
         "w2": packed2,
         "w2_scale": scales2,
-        "shared_w1": shuffle_weight(shared1, layout=(16, 16)),
-        "shared_w2": shuffle_weight(shared2, layout=(16, 16)),
+        **_shared_weights(shared_mx1, shared_mx2),
         "routing_ids": routing_ids,
         "routing_weights": routing_weights,
         "reference_shared_inter": shared_inter,
@@ -1908,11 +1984,13 @@ def _check_moe_output(reference, actual, msg):
 def benchmark_moe_shared_expert(
     token, model_dim, inter_dim, experts, topk, kernel1, kernel2
 ):
-    """Routed A16W4 MoE with and without the fused bf16 shared expert.
+    """Routed A16W4 MoE with and without the fused shared expert (bf16 or MXFP8).
 
     The candidates call fused_moe's FlyDSL stage wrappers, as ``fused_moe_2stages``
     does with ``_stage1_extra_args`` / ``_stage2_extra_args``. The reference is FP32
-    with the MXFP4 weights dequantized and bf16 intermediates.
+    with the MXFP4 weights dequantized and bf16 intermediates. The MXFP8 shared
+    weights are the bf16 ones' exact source, so the shared intermediate of both
+    formats must be bitwise equal.
     """
     from aiter.fused_moe import _flydsl_stage1_wrapper, _flydsl_stage2_wrapper
     from aiter.ops.flydsl.moe_kernels import get_flydsl_kernel_params
@@ -1938,9 +2016,7 @@ def benchmark_moe_shared_expert(
     def run(shared, stage2_name=kernel2):
         extra1 = extra2 = {}
         if shared:
-            extra1 = {"shared_w1_bf16": case["shared_w1"]}
-            extra2 = {"shared_w2_bf16": case["shared_w2"]}
-            extra1["shared_inter_bf16"] = extra2["shared_inter_bf16"] = shared_inter
+            extra1, extra2 = _shared_extra_args(case, shared, shared_inter)
         output.zero_()
         intermediate = _flydsl_stage1_wrapper(
             hidden,
@@ -1980,10 +2056,15 @@ def benchmark_moe_shared_expert(
     persist_name += "_persist" + (shared_tile.group(0) if shared_tile else "")
     assert get_flydsl_kernel_params(persist_name) is not None, persist_name
     candidates = {
-        "routed": (functools.partial(run, False), case["reference_routed"]),
-        "routed+shared": (functools.partial(run, True), case["reference"]),
+        "routed": (functools.partial(run, None), case["reference_routed"]),
+        "routed+shared": (functools.partial(run, "bf16"), case["reference"]),
+        "routed+shared mxfp8": (functools.partial(run, "mxfp8"), case["reference"]),
         "routed+shared persist": (
-            functools.partial(run, True, persist_name),
+            functools.partial(run, "bf16", persist_name),
+            case["reference"],
+        ),
+        "routed+shared mxfp8 persist": (
+            functools.partial(run, "mxfp8", persist_name),
             case["reference"],
         ),
     }
@@ -1996,8 +2077,24 @@ def benchmark_moe_shared_expert(
     routed_bytes = sum(case[k].nbytes for k in ("w1", "w1_scale", "w2", "w2_scale"))
     active = case["routing_ids"].unique().numel()
     nbytes = hidden.nbytes + output.nbytes + routed_bytes * active // experts
-    nbytes += case["shared_w1"].nbytes + case["shared_w2"].nbytes
+    shared_bytes = {
+        "": 0,
+        "bf16": case["shared_w1"].nbytes + case["shared_w2"].nbytes,
+        "mxfp8": sum(
+            case[k].nbytes
+            for k in (
+                "shared_w1_mx",
+                "shared_w1_scale",
+                "shared_w2_mx",
+                "shared_w2_scale",
+            )
+        ),
+    }
+    shared_bf16_inter = None
     for name, (candidate, reference) in candidates.items():
+        shared_dtype = (
+            "" if name == "routed" else "mxfp8" if "mxfp8" in name else "bf16"
+        )
         for initial in (0.0, 17.0):
             output.fill_(initial)
             shared_inter.fill_(float("nan"))
@@ -2021,10 +2118,16 @@ def benchmark_moe_shared_expert(
                 msg=f"{name}: shared intermediate",
             )
             assert shared_error == 0
+            # MXFP8 scales its codes to the bf16 weights exactly: same bits out.
+            if shared_bf16_inter is None:
+                shared_bf16_inter = shared_inter.clone()
+            assert torch.equal(
+                shared_inter.view(torch.int16), shared_bf16_inter.view(torch.int16)
+            ), f"{name}: shared intermediate differs from the bf16 weights'"
         _, latency = run_perftest(candidate, num_rotate_args=1)
         result[f"{name} us"] = latency
         result[f"{name} TFLOPS"] = flops / latency / 1e6
-        result[f"{name} TB/s"] = nbytes / latency / 1e6
+        result[f"{name} TB/s"] = (nbytes + shared_bytes[shared_dtype]) / latency / 1e6
         result[f"{name} err"] = error
     return result
 
@@ -2082,8 +2185,9 @@ def test_moe_shared_expert(
 
 
 @_SHARED_SKIP
+@pytest.mark.parametrize("shared_dtype", ["bf16", "mxfp8"])
 @pytest.mark.parametrize("token", [32, 64])
-def test_moe_shared_expert_m3_tuned_rows(token):
+def test_moe_shared_expert_m3_tuned_rows(token, shared_dtype):
     """The tuned M3.1 ``_sh`` rows through ``fused_moe`` (no shared weights, as
     callers without the feature run them) and through ``fused_moe_2stages`` with
     the shared expert (as the decode path passes it)."""
@@ -2122,6 +2226,7 @@ def test_moe_shared_expert_m3_tuned_rows(token):
     shared_inter = torch.full(
         (token, inter_dim), float("nan"), dtype=hidden.dtype, device="cuda"
     )
+    extra1, extra2 = _shared_extra_args(case, shared_dtype, shared_inter)
     fused = fused_moe_2stages(
         hidden,
         case["w1"],
@@ -2138,17 +2243,156 @@ def test_moe_shared_expert_m3_tuned_rows(token):
         q_dtype_w=case["w1"].dtype,
         topk_ids=case["routing_ids"],
         topk_weights=case["routing_weights"],
-        _stage1_extra_args={
-            "shared_w1_bf16": case["shared_w1"],
-            "shared_inter_bf16": shared_inter,
-        },
-        _stage2_extra_args={
-            "shared_w2_bf16": case["shared_w2"],
-            "shared_inter_bf16": shared_inter,
-        },
+        _stage1_extra_args=extra1,
+        _stage2_extra_args=extra2,
         **common,
     )
-    _check_moe_output(case["reference"], fused, f"fused_moe_2stages M={token}")
+    _check_moe_output(
+        case["reference"], fused, f"fused_moe_2stages {shared_dtype} M={token}"
+    )
+
+
+# MiniMax-M3.1 TP4 decode rows (bf16 activations) of minimax_m3_a16w4_tuned_fmoe.csv.
+_M3_DECODE_TOKENS = [1, 2, 4, 8, 16, 32, 40, 48, 56, 64, 72, 80, 112, 128, 136, 144]
+_M3_DECODE_TOKENS += [152, 160, 168, 256]
+
+
+def _m3_tuned_kernels(token):
+    """kernelName1 / kernelName2 of the shipped MiniMax-M3.1 TP4 bf16 row for ``token``."""
+    path = os.path.join(
+        os.path.dirname(aiter.__file__),
+        "configs",
+        "model_configs",
+        "minimax_m3_a16w4_tuned_fmoe.csv",
+    )
+    table = pd.read_csv(path)
+    row = table[
+        (table.token == token)
+        & (table.model_dim == 6144)
+        & (table.inter_dim == 768)
+        & (table.expert == 128)
+        & (table.topk == 4)
+        & table.kernelName1.astype(str).str.startswith("flydsl_moe1_abf16")
+    ]
+    assert len(row) == 1, f"{len(row)} M3.1 rows for token {token}"
+    return row.kernelName1.iloc[0], row.kernelName2.iloc[0]
+
+
+@pytest.fixture(scope="module")
+def m3_moe_weights():
+    """Random MiniMax-M3.1 TP4 MoE weights: routed MXFP4 bytes and E8M0 scales (their
+    values do not matter here) and an MXFP8 shared expert in both kernel formats."""
+    torch.manual_seed(7)
+    model_dim, inter_dim, experts = 6144, 768, 128
+
+    def randint(low, high, shape):
+        return torch.randint(low, high, shape, device="cuda").to(torch.uint8)
+
+    w1 = randint(0, 256, (experts, 2 * inter_dim, model_dim // 2)).view(dtypes.fp4x2)
+    w2 = randint(0, 256, (experts, model_dim, inter_dim // 2)).view(dtypes.fp4x2)
+    w1.is_shuffled = w2.is_shuffled = True
+    shared = _shared_weights(
+        _mxfp8_weight(2 * inter_dim, model_dim, 3.0 / model_dim**0.5),
+        _mxfp8_weight(model_dim, inter_dim, inter_dim**-0.5),
+    )
+    return {
+        "w1": w1,
+        "w1_scale": randint(118, 122, (w1.numel() // 16,)),
+        "w2": w2,
+        "w2_scale": randint(118, 122, (w2.numel() // 16,)),
+        **shared,
+    }
+
+
+@_SHARED_SKIP
+@pytest.mark.parametrize("token", _M3_DECODE_TOKENS)
+def test_moe_shared_expert_mxfp8_bitwise_m3(m3_moe_weights, token):
+    """MXFP8 shared weights give the bf16 (exact upcast) weights' bits, at the
+    MiniMax-M3.1 TP4 decode rows and their ``_sh`` tiles.
+
+    Stage 1: the shared intermediate and the routed rows are bitwise equal. Stage 2
+    adds every contribution with bf16 atomics in launch order, so it is compared
+    bitwise with the shared expert alone (no routed tiles: one add per element) and
+    within the atomic-order rounding with the routed experts.
+    """
+    from aiter.fused_moe import _flydsl_stage1_wrapper, _flydsl_stage2_wrapper
+    from aiter.ops.flydsl.moe_kernels import get_flydsl_kernel_params
+
+    case = m3_moe_weights
+    model_dim, inter_dim, experts, topk = 6144, 768, 128, 4
+    kernel1, kernel2 = _m3_tuned_kernels(token)
+    block_m = get_flydsl_kernel_params(kernel1)["tile_m"]
+    hidden = torch.randn((token, model_dim), dtype=dtypes.bf16, device="cuda")
+    routing_ids = (
+        torch.randn((token, experts), device="cuda")
+        .topk(topk, dim=-1)
+        .indices.to(torch.int32)
+    )
+    routing_weights = torch.rand((token, topk), device="cuda") * 0.5
+    sorted_ids, sorted_weights, sorted_experts, cumsum, _ = moe_sorting(
+        routing_ids, routing_weights, experts, model_dim, hidden.dtype, block_m
+    )
+    no_routed = torch.zeros_like(cumsum)
+    valid_rows = (sorted_ids.long() & 0x00FFFFFF) < token
+    valid_rows[int(cumsum[0]) :] = False
+
+    results = {}
+    for shared_dtype in ("bf16", "mxfp8"):
+        shared_inter = torch.full(
+            (token, inter_dim), float("nan"), dtype=hidden.dtype, device="cuda"
+        )
+        extra1, extra2 = _shared_extra_args(case, shared_dtype, shared_inter)
+        intermediate = _flydsl_stage1_wrapper(
+            hidden,
+            case["w1"],
+            case["w2"],
+            sorted_ids,
+            sorted_experts,
+            cumsum,
+            None,
+            topk,
+            kernelName=kernel1,
+            activation=ActivationType.Swiglu,
+            w1_scale=case["w1_scale"],
+            swiglu_limit=7.0,
+            **extra1,
+        )
+        outputs = []
+        for valid in (no_routed, cumsum):
+            output = torch.zeros((token, model_dim), dtype=hidden.dtype, device="cuda")
+            _flydsl_stage2_wrapper(
+                intermediate,
+                case["w1"],
+                case["w2"],
+                sorted_ids,
+                sorted_experts,
+                valid,
+                output,
+                topk,
+                kernelName=kernel2,
+                w2_scale=case["w2_scale"],
+                sorted_weights=sorted_weights,
+                block_m=block_m,
+                **extra2,
+            )
+            outputs.append(output)
+        torch.cuda.synchronize()
+        results[shared_dtype] = (
+            shared_inter,
+            intermediate[valid_rows[: intermediate.shape[0]]],
+            *outputs,
+        )
+    bf16, mxfp8 = results["bf16"], results["mxfp8"]
+    names = ("shared intermediate", "routed rows", "stage 2, shared only")
+    for name, ref, out in zip(names, bf16, mxfp8):
+        assert torch.isfinite(ref).all().item(), f"M={token} {name}: not finite"
+        assert torch.equal(
+            ref.view(torch.int16), out.view(torch.int16)
+        ), f"M={token} {name}: MXFP8 differs from bf16"
+    # With the routed experts: equal up to the bf16 rounding of the atomic adds.
+    ref, out = bf16[3].float(), mxfp8[3].float()
+    rms = ref.square().mean().sqrt().item()
+    torch.testing.assert_close(out, ref, rtol=2**-6, atol=rms * 2**-6)
 
 
 def main():

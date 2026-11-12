@@ -2748,7 +2748,8 @@ def _flydsl_stage1_wrapper(
     model_dim_pad: int = 0,
     out_dtype: str | None = None,
     v2_output_layout: bool = False,
-    shared_w1_bf16=None,
+    shared_w1=None,
+    shared_w1_scale=None,
     shared_inter_bf16=None,
     **_kwargs,
 ):
@@ -2805,7 +2806,8 @@ def _flydsl_stage1_wrapper(
         swiglu_limit=swiglu_limit,
         k_wave=parsed.get("k_wave", 1),
         v2_output_layout=v2_output_layout,
-        shared_w1_bf16=shared_w1_bf16,
+        shared_w1=shared_w1,
+        shared_w1_scale=shared_w1_scale,
         shared_inter_bf16=shared_inter_bf16,
         shared_tile=moe_kernels.a16w4_shared_tile_from_params(parsed),
     )
@@ -2831,7 +2833,8 @@ def _flydsl_stage2_wrapper(
     expert_mask=None,
     topk_ids=None,
     use_valid_token_count=False,
-    shared_w2_bf16=None,
+    shared_w2=None,
+    shared_w2_scale=None,
     shared_inter_bf16=None,
     **_kwargs,
 ):
@@ -2891,7 +2894,8 @@ def _flydsl_stage2_wrapper(
         expert_mask=expert_mask,
         topk_ids=topk_ids,
         use_valid_token_count=use_valid_token_count,
-        shared_w2_bf16=shared_w2_bf16,
+        shared_w2=shared_w2,
+        shared_w2_scale=shared_w2_scale,
         shared_inter_bf16=shared_inter_bf16,
         shared_tile=moe_kernels.a16w4_shared_tile_from_params(parsed),
     )

@@ -489,6 +489,7 @@ def compile_gemm2_a16w4_port(
     shared_tile_n=None,
     shared_tile_m=None,
     shared_tile_k=None,
+    shared_w_dtype="bf16",
 ):
     """a16w4/a16wi4/a16w16 (bf16 intermediate A x mxfp4/int4/bf16 W2) stage2 builder.
 
@@ -505,9 +506,12 @@ def compile_gemm2_a16w4_port(
 
     ``shared_tile_n`` adds the optional shared-expert prologue (atomic epilog only).
     ``None`` (the default) keeps the kernel, its name and its launch signature. With a
-    value, the launch takes two more pointers: ``arg_sh_a`` is the bf16 ``[M, D_INTER]``
-    shared intermediate from gemm1, and ``arg_sh_w`` is the raw bf16 shared W2
-    ``[N_OUT, D_INTER]`` in the ``shuffle_weight`` (16, 16) layout. The first
+    value, the launch takes three more pointers: ``arg_sh_a`` is the bf16 ``[M, D_INTER]``
+    shared intermediate from gemm1, ``arg_sh_w`` the shared W2 ``[N_OUT, D_INTER]`` in
+    the ``shuffle_weight`` (16, 16) layout and ``arg_sh_ws`` its scales:
+    ``shared_w_dtype="bf16"`` (raw bf16 W2, ``arg_sh_ws`` not read) or ``"fp8"`` (MXFP8:
+    fp8 e4m3 codes + ``shuffle_scale`` e8m0 scales, scaled to bf16 in registers; the
+    output is bitwise that of the bf16 W2 upcast), as in gemm1. The first
     ``a16w4_shared_tiles`` program ids (work indices when persistent) add the shared
     output into every token at weight 1.0. The routed tiles follow in their usual
     order. The shared tile is ``shared_tile_m x shared_tile_n x shared_tile_k``; an
@@ -584,6 +588,17 @@ def compile_gemm2_a16w4_port(
         ), f"shared_tile_n must divide N_OUT and be a multiple of 64, got {shared_tile_n}"
         SH_BM = shared_tile_m or BM
         SH_TK = shared_tile_k or TILE_K
+        assert shared_w_dtype in (
+            "bf16",
+            "fp8",
+        ), f"shared_w_dtype must be 'bf16' or 'fp8', got {shared_w_dtype!r}"
+        assert (
+            shared_w_dtype == "bf16" or SH_TK % 128 == 0
+        ), f"an fp8 shared_tile_k must be a multiple of 128, got {SH_TK}"
+        # The A-LDS XOR swizzle masks the row with (TILE_K*2/16 - 1).
+        assert (
+            SH_TK & (SH_TK - 1) == 0
+        ), f"shared_tile_k must be a power of two, got {SH_TK}"
         assert SH_BM % 16 == 0, f"shared_tile_m must be a multiple of 16, got {SH_BM}"
         assert (
             D_INTER % SH_TK == 0
@@ -742,6 +757,7 @@ def compile_gemm2_a16w4_port(
 
     SH_TN = shared_tile_n
     SH_NB = N_OUT // SH_TN
+    _sh_tag = "_mxfp8" if shared_w_dtype == "fp8" else ""
     _lds_bytes_sh = max(_lds_bytes, SH_BM * SH_TK * 2 + SH_BM * SH_TN * 4)
 
     @fx.struct
@@ -749,7 +765,7 @@ def compile_gemm2_a16w4_port(
         raw: fx.Array[fx.Uint8, _lds_bytes_sh, 16]
 
     @flyc.kernel(
-        name=f"{_name}_sh{SH_BM}x{SH_TN}x{SH_TK}", known_block_size=[256, 1, 1]
+        name=f"{_name}_sh{SH_BM}x{SH_TN}x{SH_TK}{_sh_tag}", known_block_size=[256, 1, 1]
     )
     def gemm2_kernel_shared(
         arg_a: fx.Int64,
@@ -764,6 +780,7 @@ def compile_gemm2_a16w4_port(
         arg_out: fx.Int64,
         arg_sh_a: fx.Int64,
         arg_sh_w: fx.Int64,
+        arg_sh_ws: fx.Int64,
     ):
         lds_raw_ptr = fx.SharedAllocator().allocate(SharedStorageSh).peek().raw.ptr
         tx_i32 = fx.Int32(gpu.thread_id("x"))
@@ -807,7 +824,7 @@ def compile_gemm2_a16w4_port(
                 lds_raw_ptr,
                 arg_sh_a,
                 arg_sh_w,
-                arg_sh_w,
+                arg_sh_ws,
                 arg_eids,
                 arg_stids,
                 arg_sweights,
@@ -823,7 +840,7 @@ def compile_gemm2_a16w4_port(
                 INTER=_K,
                 NE=1,
                 b_cache_mod=b_cache_mod,
-                w_dtype="bf16",
+                w_dtype=shared_w_dtype,
                 rocm_arch=rocm_arch,
                 dense=True,
                 a_rows=i32_M,
@@ -892,6 +909,7 @@ def compile_gemm2_a16w4_port(
         arg_out: fx.Int64,
         arg_sh_a: fx.Int64,
         arg_sh_w: fx.Int64,
+        arg_sh_ws: fx.Int64,
         stream: fx.Stream,
     ):
         grid_x = fx.Int64(i32_grid)
@@ -908,6 +926,7 @@ def compile_gemm2_a16w4_port(
             arg_out,
             arg_sh_a,
             arg_sh_w,
+            arg_sh_ws,
             value_attrs={"rocdl.waves_per_eu": waves_per_eu} if waves_per_eu else None,
         ).launch(grid=(grid_x, 1, 1), block=(256, 1, 1), stream=stream)
 
