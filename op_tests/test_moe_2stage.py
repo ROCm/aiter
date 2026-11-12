@@ -1128,7 +1128,13 @@ def _effective_gate_mode(q_type, aq_dtype, wq_dtype):
 
 def _effective_swiglu_limit(quant_type, aq_dtype, wq_dtype, swiglu_limit, act_type):
     if (
-        quant_type in (aiter.QuantType.per_1x128, aiter.QuantType.per_128x128)
+        quant_type
+        in (
+            aiter.QuantType.per_1x128,
+            aiter.QuantType.per_128x128,
+            aiter.QuantType.per_Token,
+            aiter.QuantType.per_Tensor,
+        )
         and aq_dtype == wq_dtype == dtypes.fp8
     ):
         # Only SiLU applies the limit here; the torch reference would still
@@ -2640,7 +2646,7 @@ def test_swiglu_limit_guards():
         raises(ValueError, norm, invalid)
     ck, asm = aiter.fused_moe.ck_moe_stage1, aiter.fused_moe.asm_stage1
     kw = {"activation": aiter.ActivationType.Silu, "swiglu_limit": 5.0}
-    q = aiter.QuantType.per_Token
+    q = aiter.QuantType.No
     raises(NotImplementedError, ck, *([None] * 11), quant_type=q, **kw)
     raises(NotImplementedError, asm, *([None] * 9), ksplit=0, **kw)
 
