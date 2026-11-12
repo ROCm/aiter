@@ -687,6 +687,43 @@ def test_gemm_compile_packed_params(m=256, n=512, k=1024, layers=3):
     return rows
 
 
+def test_asm_rejects_4gib_operands(m=16384, k=128, rows_checked=256):
+    """The asm kernels address A, B and out with 32-bit byte offsets.
+
+    A 4 GiB out used to come back partly wrong with no error, so it must raise;
+    an out just below 4 GiB must stay exact.
+    """
+    if get_gfx() not in ("gfx942", "gfx950"):
+        return []
+    n_over = (1 << 32) // (m * 2)
+    n_under = n_over - 256
+    need = 2 * m * n_over + 2 * n_over * k + 4 * rows_checked * n_over * 4
+    if torch.cuda.mem_get_info()[0] < need + (1 << 30):
+        aiter.logger.warning("skip asm 4 GiB check: needs %.1f GiB free", need / 2**30)
+        return []
+
+    x = torch.randn(m, k, dtype=dtypes.bf16, device="cuda")
+    w = torch.randn(n_over, k, dtype=dtypes.bf16, device="cuda")
+    out = torch.full((m, n_over), float("nan"), dtype=dtypes.bf16, device="cuda")
+    try:
+        aiter.gemm_a16w16_asm(x, w, out)
+    except RuntimeError as e:
+        assert "smaller than 4 GiB" in str(e), e
+    else:
+        raise AssertionError(f"asm took a 4 GiB out at {(m, n_over, k)}")
+    rows = [{"case": f"asm out 4 GiB {(m, n_over, k)}", "result": "rejected"}]
+
+    out_under = out.view(-1)[: m * n_under].view(m, n_under)
+    aiter.gemm_a16w16_asm(x, w[:n_under], out_under)
+    ref = F.linear(x[-rows_checked:].float(), w[:n_under].float()).to(dtypes.bf16)
+    err = checkAllclose(
+        ref, out_under[-rows_checked:], msg=f"asm out < 4 GiB {(m, n_under, k)}: "
+    )
+    assert err == 0, f"asm out just below 4 GiB is wrong at {(m, n_under, k)}"
+    rows.append({"case": f"asm out < 4 GiB {(m, n_under, k)}", "result": "exact"})
+    return rows
+
+
 parser = argparse.ArgumentParser(
     formatter_class=argparse.RawTextHelpFormatter,
     description="config input of a16w16_gemm_test",
@@ -696,13 +733,14 @@ parser.add_argument(
     "--test",
     type=str,
     nargs="*",
-    choices=["normal", "skinny", "out", "compile"],
-    default=["normal"],
+    choices=["normal", "skinny", "out", "compile", "asm_4g"],
+    default=["normal", "asm_4g"],
     help="""Select test to run.
-    e.g.: -t normal    # default
+    e.g.: -t normal asm_4g    # default
           or -t skinny
           or -t out    # tgemm.mm(out=) on every backend
-          or -t compile    # torch.compile with weights/biases in one storage""",
+          or -t compile    # torch.compile with weights/biases in one storage
+          or -t asm_4g    # asm rejects operands of 4 GiB""",
 )
 parser.add_argument(
     "-d",
@@ -792,6 +830,8 @@ for test in args.test:
         df += test_gemm_out()
     elif test == "compile":
         df += test_gemm_compile_packed_params()
+    elif test == "asm_4g":
+        df += test_asm_rejects_4gib_operands()
 df = pd.DataFrame(df)
 df_md = df.to_markdown(index=False)
 aiter.logger.info("gemm_a16w16 summary (markdown):\n%s", df_md)

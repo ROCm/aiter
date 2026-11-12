@@ -238,6 +238,21 @@ AITER_CTYPES_DEFINE_ENTRYPOINT_VOID(
     args.is_out_b16                 = (out->dtype() == AITER_DTYPE_bf16) ? 1 : 0;
     args.add_bias                   = bias ? 1 : 0;
 
+    // The kernels address A, B and out with 32-bit byte offsets: at 4 GiB and
+    // beyond they return wrong values without faulting.
+    const uint64_t a_bytes = static_cast<uint64_t>(Mdim) * args.stride_A0;
+    const uint64_t b_bytes = static_cast<uint64_t>(Ndim) * args.stride_B0;
+    const uint64_t c_bytes = static_cast<uint64_t>(Mdim) * args.stride_D0;
+    AITER_CHECK(a_bytes < (1ull << 32) && b_bytes < (1ull << 32) && c_bytes < (1ull << 32),
+                __func__,
+                " A, B and out must each be smaller than 4 GiB; got A=",
+                a_bytes,
+                " B=",
+                b_bytes,
+                " out=",
+                c_bytes,
+                " bytes");
+
     CFG* config_map = &cfg_bf16gemm_fp32bf16;
 
     auto [name, split] = get_heuristic_kernel(
