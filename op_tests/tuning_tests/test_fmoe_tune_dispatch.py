@@ -25,7 +25,7 @@ import pandas as pd
 REPO_ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(REPO_ROOT))
 
-# Same order as the key list in gemm_moe_tune.py's __main__.
+# Same order as the key list in aiter.tuning.moe.fused_moe.main().
 KEYS = [
     "gfx",
     "cu_num",

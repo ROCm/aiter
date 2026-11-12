@@ -91,7 +91,7 @@ def source_changes():
     return status.stdout.strip()
 
 
-# Same order as the key list in gemm_moe_tune.py's __main__.
+# Same order as the key list in aiter.tuning.moe.fused_moe.main().
 KEYS = [
     "gfx",
     "cu_num",
