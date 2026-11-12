@@ -12,8 +12,10 @@ from ..combine import (
 )
 from ..combine import (
     COMBINE_LDS_BUDGET,
+    _make_combine_direct_reduce,
     _make_combine_fused_reduce,
     _make_combine_fused_sync,
+    combine_direct_reduce_blocks,
     combine_reduce_lds_bytes,
 )
 from ..config import _WAVE_SIZE
@@ -144,9 +146,19 @@ class _FusedScatterCombine:
         # Keyed (bits, add_shared): the second variant also adds the shared
         # expert's output in the same pass (see ``finish``).
         self._reduces = {}
+        # The bf16 wire has no scale plane to stage, so it skips LDS and reduces
+        # straight from global memory (see ``_make_combine_direct_reduce``).
         for bits, (toks, chunks) in self._tiles.items():
             lanes = toks * chunks * _COMBINE_CHUNK_ELEMS // 16
             for add_shared in (False, True):
+                if bits == 0:
+                    self._reduces[bits, add_shared] = _make_combine_direct_reduce(
+                        experts_per_token=config.topk,
+                        hidden_dim=config.hidden_dim,
+                        slot_stride_nbytes=config.combine_slot_stride_for(bits),
+                        add_shared=add_shared,
+                    )
+                    continue
                 self._reduces[bits, add_shared] = _make_combine_fused_reduce(
                     experts_per_token=config.topk,
                     hidden_dim=config.hidden_dim,
@@ -215,12 +227,18 @@ class _FusedScatterCombine:
             self.config.rank,
             stream,
         )
+        grid = (
+            (combine_direct_reduce_blocks(self.config.hidden_dim, routing.token_count),)
+            if quant_bits == 0
+            else ()
+        )
         _run_compiled(
             self._reduces[quant_bits, shared_add is not None],
             res.arena.local_ptr("comb_inp"),
             res.combine_output.data_ptr(),
             routing.token_count,
             0 if shared_add is None else shared_add.data_ptr(),
+            *grid,
             stream,
         )
         return res.output(routing.token_count)

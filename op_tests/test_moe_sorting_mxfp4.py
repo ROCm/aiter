@@ -634,6 +634,55 @@ for _qd, _tokens, _bound in itertools.product(
 
 
 # ---------------------------------------------------------------------------
+# Row tails of the scale sort.
+#
+# Each thread reads its part of a scale row in 2- to 16-byte loads. When a row
+# ends inside a load, the last row's final load runs past the end of the scale
+# buffer, and the buffer range check read the dword holding that row's last
+# in-range bytes as 0, so the last route lost its final scales (#7646). Row
+# lengths with 1-3 bytes past a dword in every dispatch bucket, a row shorter
+# than one load (96), and a whole-dword row that ends inside an 8-byte load
+# (1152); both stages; 30000 tokens take the scatter store of the 32-row
+# buckets.
+# ---------------------------------------------------------------------------
+_TAIL_EXPERTS, _TAIL_TOPK = 64, 8
+
+
+def _check_tail_scales(model_dim, tokens, stage):
+    torch.manual_seed(10)
+    ids = torch.rand((tokens, _TAIL_EXPERTS)).topk(_TAIL_TOPK, dim=1).indices
+    sorted_ids, _, _, num_valid, _ = moe_sorting(
+        ids.to(torch.int32), torch.rand((tokens, _TAIL_TOPK)), _TAIL_EXPERTS,
+        model_dim, torch.bfloat16, 32,
+    )  # fmt: skip
+    topk = _TAIL_TOPK if stage == "stage2" else 1
+    # Nonzero bytes, so a scale read as 0 shows.
+    scale = torch.randint(1, 255, (tokens * topk, model_dim // 32), dtype=torch.uint8)
+    ref = run_torch(
+        scale.view(tokens, topk, -1) if topk > 1 else scale.clone(),
+        sorted_ids.clone(), num_valid[0], tokens,
+    )  # fmt: skip
+    out = torch.zeros(
+        ((sorted_ids.shape[0] + 31) // 32 * 32, ((model_dim // 32) + 7) // 8 * 8),
+        dtype=torch.uint8,
+    )
+    aiter.mxfp4_moe_sort_hip(out, scale, sorted_ids, num_valid, tokens, model_dim)
+    tag = f"model_dim={model_dim} tokens={tokens} {stage}"
+    bad = int((out != ref[: out.shape[0]]).sum())
+    assert bad == 0, f"{tag}: {bad} scale bytes differ"
+    aiter.logger.info("scale row tails OK: %s", tag)
+
+
+for _dim, _tokens, _stage in itertools.product(
+    (96, 224, 320, 800, 1152, 1888, 2880, 5824, 7232, 12352),
+    (1, 5, 300),
+    ("stage1", "stage2"),
+):
+    _check_tail_scales(_dim, _tokens, _stage)
+_check_tail_scales(2880, 30000, "stage1")
+
+
+# ---------------------------------------------------------------------------
 # Fused route-sort + MXFP4 activation-quant kernel (gfx950 decode).
 #
 # `mxfp4_moe_sort_quant_fwd` fuses Opus route sorting, BF16->MXFP4 activation
