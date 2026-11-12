@@ -2602,12 +2602,14 @@ def check_nvfp4_tuned_geometry_map(k_round):
     for o in outs[1:]:
         assert torch.equal(torch.isfinite(o), torch.isfinite(outs[0]))
         assert torch.equal(o[torch.isfinite(o)], outs[0][torch.isfinite(o)])
-    try:
-        kernel.score_flydsl_fp4(q, kd, ks, bt, seq, S, H, D**-0.5, mb, work_map=wm_t)
-    except ValueError:
-        return
-    raise AssertionError(
-        "an NVFP4-tuned work map must not be accepted by the MXFP4 scorer"
+    # The MXFP4 scorer, on real MXFP4 views of the same cache, takes the shared map
+    # and refuses the tuned one on the map itself (not on the cache layout).
+    kd4, ks4, _ = fp4_cache_of(cache8)
+    run_fp4(q, kd4, ks4, bt, seq, S, H, mb, work_map=wm_s)
+    expect_value_error(
+        "tuned work map to mxfp4",
+        lambda: run_fp4(q, kd4, ks4, bt, seq, S, H, mb, work_map=wm_t),
+        match="work_map",
     )
 
 
@@ -2799,9 +2801,11 @@ def check_nvfp4_rejections():
     expect_value_error(
         "k_round", run_nvfp4, q, kd, ks, bt, seq, 4, 4, mb, "bf16", match="k_round"
     )
-    assert not kernel.index_score_supported_nvfp4(
-        q, kd, ks, 4, 4, mb, bt, seq_lens=seq, k_round="bf16"
-    )
+    # None would otherwise validate an MXFP4 scale view as an MXFP4 cache.
+    for bad_round, scale in (("bf16", ks), (None, ks4), (None, ks)):
+        assert not kernel.index_score_supported_nvfp4(
+            q, kd, scale, 4, 4, mb, bt, seq_lens=seq, k_round=bad_round
+        )
     for scale in (-1.0, 0.0, float("nan")):
         expect_value_error(
             f"sm_scale={scale}", kernel.score_flydsl_nvfp4,
