@@ -463,7 +463,15 @@ def _run_batch1(
     problem: _Problem,
     activation_str: str,
     swiglu_limit: float | None,
+    num_local_tokens: torch.Tensor | None = None,
 ):
+    if num_local_tokens is not None:
+        # No sort reads the count here: route the rows at and past it to -1
+        # at weight 0, which both kernels skip, as for caller-marked pad rows.
+        rows = torch.arange(topk_ids.shape[0], device=topk_ids.device)
+        keep = (rows < num_local_tokens.view(-1)[:1])[:, None]
+        topk_ids = torch.where(keep, topk_ids, -1)
+        topk_weight = torch.where(keep, topk_weight, 0.0)
     topk_weight = (
         topk_weight if topk_weight.dtype == torch.float32 else topk_weight.float()
     )
@@ -635,9 +643,14 @@ def run_flydsl_moe_gfx942(
     config_string: str,
     swiglu_limit: float | None = None,
 ) -> torch.Tensor:
-    if num_local_tokens is not None:
+    # num_local_tokens: rows at and past it (CUDA-graph padding) run no route
+    # and their output rows are unspecified, as in fused_moe. The sorted paths
+    # hand it to moe_sorting.
+    if num_local_tokens is not None and not (
+        isinstance(num_local_tokens, torch.Tensor) and num_local_tokens.is_cuda
+    ):
         raise NotImplementedError(
-            "gfx942 FlyDSL whole-graph backend does not support num_local_tokens"
+            "gfx942 FlyDSL whole-graph backend takes num_local_tokens as a CUDA tensor"
         )
     for name, tensor in (
         ("hidden_states", hidden_states),
@@ -713,6 +726,7 @@ def run_flydsl_moe_gfx942(
             problem,
             activation_str,
             swiglu_limit,
+            num_local_tokens,
         )
     if 2 <= problem.batch <= 256:
         return _run_decode(
