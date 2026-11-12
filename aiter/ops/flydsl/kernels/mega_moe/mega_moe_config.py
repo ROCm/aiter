@@ -96,6 +96,9 @@ LARGE_M_MTPRS = (1024, 2048, 4096, 8192, 16384)
 V41_FLASH_EP4_LARGE_M_MTPRS = (8192, 16384)
 # EP2 DeepSeek-V4.1-Flash takes its large-input tune at the capacities it was measured at.
 V41_FLASH_EP2_LARGE_M_MTPRS = (8192, 16384)
+# EP8 DeepSeek-V4.1-Flash, whose large-input tune builds on EP4's, likewise: at 1024 it faulted the same way
+# (1 of 2 runs), so 1024, 2048 and 4096 stay staged.
+V41_FLASH_EP8_LARGE_M_MTPRS = (8192, 16384)
 # The fused kernels have no 2-token variant: 2 tokens take the 1-token config.
 FUSED_TOKEN_BUCKETS = tuple(b for b in TOKEN_BUCKETS if b != 2)
 # Below this many rows per rank the staged (or small-input) path is faster than
@@ -480,13 +483,16 @@ def large_m_mtprs_for(
 ) -> tuple[int, ...]:
     """Instance capacities the large-input kernel is built for on a FUSED_LAYOUTS layout.
 
-    EP8 DeepSeek-V4-Pro and EP8 DeepSeek-V4.1-Flash take LARGE_M_MTPRS; EP4 DeepSeek-V4.1-Flash takes
-    V41_FLASH_EP4_LARGE_M_MTPRS, the capacities its one tune was measured at (see _tune_v41_flash_ep4_large).
+    EP8 DeepSeek-V4-Pro takes LARGE_M_MTPRS; EP4 DeepSeek-V4.1-Flash takes V41_FLASH_EP4_LARGE_M_MTPRS, the
+    capacities its one tune was measured at (see _tune_v41_flash_ep4_large), EP2 DeepSeek-V4.1-Flash
+    V41_FLASH_EP2_LARGE_M_MTPRS and EP8 DeepSeek-V4.1-Flash V41_FLASH_EP8_LARGE_M_MTPRS (see their tunes).
     """
     if (world_size, model_dim, inter_dim) == (4, 5120, 2304):
         return V41_FLASH_EP4_LARGE_M_MTPRS
     if (world_size, model_dim, inter_dim) == (2, 5120, 2304):
         return V41_FLASH_EP2_LARGE_M_MTPRS
+    if (world_size, model_dim, inter_dim) == (8, 5120, 2304):
+        return V41_FLASH_EP8_LARGE_M_MTPRS
     return LARGE_M_MTPRS
 
 
@@ -1765,7 +1771,8 @@ def _tune_v41_flash_ep8_small(config: MegaMoEConfig, bucket: int) -> MegaMoEConf
 
 def _tune_v41_flash_ep8_large(config: MegaMoEConfig) -> MegaMoEConfig:
     """EP8 DeepSeek-V4.1-Flash large-input kernel (48 experts per rank), measured on gfx950 at MTPR 16384 (8 ranks;
-    uniform, zipf 1.2 and all-to-rank-0 routes; ratios against the V4-Pro EP8 config, every fused knob off).
+    uniform, zipf 1.2 and all-to-rank-0 routes; ratios against the V4-Pro EP8 config, every fused knob off). It serves
+    8192 and 16384 (V41_FLASH_EP8_LARGE_M_MTPRS) unchanged, as the EP4 tune.
 
     The EP4 tune (_tune_v41_flash_ep4_large) carries over except its GEMM2 claim order, streamed W1 loads and
     per-token combine wait: 1.5-1.8x at 513-2048 tokens a rank and 1.15-1.3x at 4096-16384 on uniform routes,
