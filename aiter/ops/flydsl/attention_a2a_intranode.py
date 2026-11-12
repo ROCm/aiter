@@ -95,9 +95,16 @@ def _scale_padding_size(role, codec, role_sequence, valid_kv_len, heads_local):
         MHA_V4_KV_TILE_ROWS,
         MHA_V4_MXFP4_K_SCALE_SLACK_BYTES,
         MHA_V4_MXFP4_V_SCALE_SLACK_BYTES,
+        MHA_V4_QUERY_TILE_ROWS,
     )
 
-    # Q scales are unpadded since #6841; the gather clamps via buffer descriptor num_records.
+    # The ASM Q-scale gather is unguarded over a whole 256-row query tile, and the
+    # mha_v4 launcher requires that backing (see mha_v4_quant.query_block_scale).
+    if role == 0 and codec in ("mxfp4", "mxfp6", "mxfp8"):
+        rounded = (
+            (role_sequence + MHA_V4_QUERY_TILE_ROWS - 1) // MHA_V4_QUERY_TILE_ROWS
+        ) * MHA_V4_QUERY_TILE_ROWS
+        return (rounded - role_sequence) * heads_local * 4
     if role == 1 and codec == "mxfp4":
         rounded = (
             (valid_kv_len + MHA_V4_KV_TILE_ROWS - 1) // MHA_V4_KV_TILE_ROWS

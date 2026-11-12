@@ -33,6 +33,7 @@ from aiter.test_common import (
     benchmark,
     checkAllclose,
     perftest,
+    run_perftest,
 )
 
 logger = logging.getLogger("aiter")
@@ -999,8 +1000,177 @@ def _fused_ar_gemma_rmsnorm_quant_case(
     }
 
 
+@benchmark()
+def _test_prefill_quant_case(rank, shape, dtype, gemma_norm):
+    """Cover both sides of the row-grid cap with distinct partials per rank."""
+    tp = get_tp_group()
+    group = tp.device_group
+    m, n = shape
+    torch.manual_seed(2026)
+    residual = torch.randn(shape, dtype=dtype, device="cuda")
+    weight = torch.randn(n, dtype=dtype, device="cuda") * 0.1
+    torch.manual_seed(4100 + rank)
+    x = torch.randn(shape, dtype=dtype, device="cuda") * 0.1
+    # Sum in rank order, round AR to the input dtype, then add residual in FP32.
+    partials = [torch.empty_like(x) for _ in range(tp.world_size)]
+    dist.all_gather(partials, x, group=group)
+    reduced = partials[0].float()
+    for partial in partials[1:]:
+        reduced = reduced + partial.float()
+    value = reduced.to(dtype).float() + residual.float()
+    ref_residual = value.to(dtype)
+    ref = (
+        value
+        * torch.rsqrt(value.square().mean(-1, keepdim=True) + 1e-6)
+        * (weight.float() + int(gemma_norm))
+    ).to(dtype)
+
+    candidates = {
+        "norm": lambda: tensor_model_parallel_fused_allreduce_rmsnorm(
+            x, residual, weight, 1e-6, prefill_support=True, gemma_norm=gemma_norm
+        ),
+        "quant": lambda: tensor_model_parallel_fused_allreduce_rmsnorm_quant(
+            x,
+            residual,
+            weight,
+            1e-6,
+            prefill_support=True,
+            quant_type="per_token",
+            gemma_norm=gemma_norm,
+            emit_bf16=True,
+        ),
+    }
+    ret = {}
+    norm_output = None
+    retained = []
+    for name, fn in candidates.items():
+        eager = fn()
+        torch.cuda.synchronize()
+        tp.barrier()
+        graph = torch.cuda.CUDAGraph()
+        with graph_capture() as gc, torch.cuda.graph(graph, stream=gc.stream):
+            output = fn()
+        retained.append((graph, output))
+        graph.replay()
+        torch.cuda.synchronize()
+        for actual, expected in zip(output, eager):
+            assert torch.equal(actual.view(torch.uint8), expected.view(torch.uint8))
+        assert torch.equal(output[1], ref_residual), "AR/residual rounding changed"
+        if name == "norm":
+            norm_output = output[0]
+            actual = norm_output.float()
+            rtol, atol = 1e-2, 1e-2
+        else:
+            q, _, scale, mirror = output
+            # Quantization must use the same T-rounded norm as the split path.
+            assert torch.equal(mirror, norm_output)
+            qref, sref = aiter.get_hip_quant(aiter.QuantType.per_Token)(
+                norm_output, quant_dtype=dtypes.fp8
+            )
+            assert torch.equal(q.view(torch.uint8), qref.view(torch.uint8))
+            assert torch.equal(scale, sref)
+            actual = q.float() * scale
+            rtol, atol = 5e-2, 5e-2
+        err = checkAllclose(
+            ref.float(),
+            actual,
+            rtol=rtol,
+            atol=atol,
+            tol_err_ratio=0,
+            msg=f"prefill {name}: {shape=} {dtype=} {gemma_norm=} {rank=}",
+        )
+        # All ranks must agree, not merely be close to the reference.
+        for tensor in output:
+            bits = tensor.view(torch.uint8).contiguous()
+            copies = [torch.empty_like(bits) for _ in range(tp.world_size)]
+            dist.all_gather(copies, bits, group=group)
+            assert all(torch.equal(bits, peer) for peer in copies)
+        tp.barrier()
+        _, us = run_perftest(
+            graph.replay, num_iters=11, num_warmup=2, num_rotate_args=1
+        )
+        # Logical per-rank element operations/bytes, excluding sync traffic.
+        flops = (tp.world_size + 6 + int(gemma_norm)) * m * n + 2 * m
+        nbytes = ((tp.world_size + 2) * m * n + n) * x.element_size()
+        if name == "quant":
+            flops += 3 * m * n
+            nbytes += m * n * (1 + x.element_size()) + 4 * m
+        else:
+            nbytes += m * n * x.element_size()
+        ret[f"{name} us"] = us
+        ret[f"{name} TFLOPS"] = flops / us / 1e6
+        ret[f"{name} TB/s"] = nbytes / us / 1e6
+        ret[f"{name} err"] = err
+    barrier_before_teardown()
+    # Keep captured peer allocations alive until every rank finishes replaying.
+    del retained
+    return ret
+
+
+def _prefill_quant_worker(rank, shapes, distributed_init_method):
+    torch.cuda.set_device(rank)
+    set_custom_all_reduce(True)
+    init_distributed_environment(
+        world_size=4, rank=rank, distributed_init_method=distributed_init_method
+    )
+    ensure_model_parallel_initialized(4, 1)
+    try:
+        group = get_tp_group().device_group
+        dist.all_reduce(torch.zeros(1, device="cuda"), group=group)
+        ca = get_tp_group().device_communicator.ca_comm
+        assert ca is not None and not ca.disabled
+        rows = []
+        for shape, dtype, gemma in itertools.product(
+            shapes, (torch.float16, torch.bfloat16), (False, True)
+        ):
+            rows.append(_test_prefill_quant_case(rank, shape, dtype, gemma))
+        logger.info(
+            "fused AR prefill quant summary (rank %d):\n%s",
+            rank,
+            pd.DataFrame(rows).to_markdown(index=False),
+        )
+        return rows
+    finally:
+        if dist.is_initialized():
+            barrier_before_teardown()
+            destroy_model_parallel()
+            destroy_distributed_environment()
+
+
+def _run_prefill_quant_regression(shapes):
+    init_method = get_distributed_init_method(get_ip(), get_open_port())
+    with Pool(processes=4) as pool:
+        jobs = [
+            pool.apply_async(_prefill_quant_worker, (rank, shapes, init_method))
+            for rank in range(4)
+        ]
+        return [job.get() for job in jobs]
+
+
 try:
     import pytest
+
+    def test_prefill_quant_tp4():
+        from aiter.jit.utils.chip_info import get_gfx
+
+        if torch.cuda.device_count() < 4:
+            pytest.skip("requires >= 4 GPUs")
+        if get_gfx() != "gfx1250":
+            pytest.skip("gfx1250 two-stage AR quant regression")
+        # MiniMax-M3 has hidden_size=6144; M is the actual prefill row count.
+        # Include grid-cap boundaries, a partial wave, and one-stage controls.
+        _run_prefill_quant_regression(
+            [
+                (12, 6144),
+                (511, 6144),
+                (512, 6144),
+                (513, 6144),
+                (2517, 6144),
+                (513, 6176),
+                (513, 6160),
+                (2048, 8192),
+            ]
+        )
 
     @pytest.mark.parametrize(
         "x_pad_to_multiple,input_strided,residual_strided",
