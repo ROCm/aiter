@@ -1658,32 +1658,43 @@ def build_gemm_a8w4_tdm_task(
             wait_fn=None,
             pre_fence_mma=0,
             fence_mma=0,
-            reverse_mma=False,
         ):
             """Compute one k128 while optionally loading the next LDS slot."""
             reuse_cur_rmem = load_nxt_fn is not None and next_rmem is cur_rmem
-            # Adjacent k128 steps meet on the same accumulator bank. The
-            # physical placement stays fixed; only the independent C-tile
-            # visitation order changes.
-            first_rows = BACK if reverse_mma else FRONT
-            second_rows = FRONT if reverse_mma else BACK
+            first_rows = FRONT
+            second_rows = BACK
             # These ranges emit real WMMAs, not scheduling hints. Never clamp
             # invalid counts: doing so can skip or repeat accumulator updates.
             assert isinstance(pre_fence_mma, int) and pre_fence_mma >= 0
             assert isinstance(fence_mma, int) and fence_mma >= 0
             assert pre_fence_mma + fence_mma <= len(first_rows) * wmma_n_rep
-            first_a = cur_rmem.a[front_wm:] if reverse_mma else cur_rmem.a[:front_wm]
-            second_a = cur_rmem.a[:front_wm] if reverse_mma else cur_rmem.a[front_wm:]
-            if const_expr(pre_fence_mma > 0):
+            first_a = cur_rmem.a[:front_wm]
+            second_a = cur_rmem.a[front_wm:]
+
+            def emit_mma_range(start, end):
+                # Keep scale loads local to each phase and preserve the separate
+                # half-tile orders.
                 sa_k, sb_k = cur_rmem.sa.load(), cur_rmem.sb.load()
-                mma_rows(
-                    first_rows,
-                    first_a,
-                    cur_rmem.b,
-                    sa_k,
-                    sb_k,
-                    end_mma=pre_fence_mma,
-                )
+                first_mma = len(first_rows) * wmma_n_rep
+                for half in range_constexpr(2):
+                    rows = first_rows if half == 0 else second_rows
+                    act = first_a if half == 0 else second_a
+                    offset = 0 if half == 0 else first_mma
+                    begin = max(0, start - offset)
+                    stop = min(end - offset, len(rows) * wmma_n_rep)
+                    if const_expr(begin < stop):
+                        mma_rows(
+                            rows,
+                            act,
+                            cur_rmem.b,
+                            sa_k,
+                            sb_k,
+                            start_mma=begin,
+                            end_mma=stop,
+                        )
+
+            if const_expr(pre_fence_mma > 0):
+                emit_mma_range(0, pre_fence_mma)
                 # Close the prefix region before the pipeline fence. The
                 # suffix hints must not count these WMMAs a second time.
                 rocdl.sched_mfma(pre_fence_mma)
@@ -1693,67 +1704,27 @@ def build_gemm_a8w4_tdm_task(
                 # that issue_fn recycles. Retire those reads before all waves
                 # rendezvous at the REUSE fence; waiting at the MMA is too late.
                 rocdl.s_wait_dscnt(0)
-            has_wait = wait_fn is not None or num_outstanding_tdm is not None
-            split_barrier = has_wait and (
-                fence_mma > 0
-                or (wait_fn is not None and (bank_aligned_groups or raw_drain))
-            )
-            if const_expr(has_wait):
+            has_barrier = wait_fn is not None or num_outstanding_tdm is not None
+            if const_expr(has_barrier):
                 if const_expr(wait_fn is not None):
                     wait_fn()
                 else:
                     tdm_ops.tensor_wait(num_outstanding_tdm)
-                if const_expr(split_barrier):
-                    rocdl.s_barrier_signal(-1)
-                else:
-                    # Generic paths still need the compiler's memory fence.
-                    workgroup_barrier()
+                # TDM readiness is handled above; LDS reuse waits before signal.
+                # No global-memory publication is required by this rendezvous.
+                rocdl.s_barrier_signal(-1)
             if const_expr(fence_mma > 0):
                 rocdl.sched_barrier(0)
-                sa_k, sb_k = cur_rmem.sa.load(), cur_rmem.sb.load()
-                mma_rows(
-                    first_rows,
-                    first_a,
-                    cur_rmem.b,
-                    sa_k,
-                    sb_k,
-                    start_mma=pre_fence_mma,
-                    end_mma=pre_fence_mma + fence_mma,
-                )
+                emit_mma_range(pre_fence_mma, pre_fence_mma + fence_mma)
                 rocdl.sched_mfma(fence_mma)
                 rocdl.sched_barrier(0)
-            if const_expr(split_barrier):
+            if const_expr(has_barrier):
                 rocdl.s_barrier_wait(-1)
             if const_expr(issue_fn is not None):
                 issue_fn()
             if const_expr(load_nxt_fn is not None and not reuse_cur_rmem):
                 load_nxt_fn()
-            sa_k, sb_k = cur_rmem.sa.load(), cur_rmem.sb.load()
-
-            def compute_range(start, end):
-                front_mma = front_wm * wmma_n_rep
-                if const_expr(start < front_mma):
-                    mma_rows(
-                        first_rows,
-                        first_a,
-                        cur_rmem.b,
-                        sa_k,
-                        sb_k,
-                        start_mma=start,
-                        end_mma=min(end, front_mma),
-                    )
-                if const_expr(end > front_mma):
-                    mma_rows(
-                        second_rows,
-                        second_a,
-                        cur_rmem.b,
-                        sa_k,
-                        sb_k,
-                        start_mma=max(0, start - front_mma),
-                        end_mma=end - front_mma,
-                    )
-
-            compute_range(pre_fence_mma + fence_mma, n_acc)
+            emit_mma_range(pre_fence_mma + fence_mma, n_acc)
             if const_expr(reuse_cur_rmem):
                 load_nxt_fn()
 
@@ -1904,7 +1875,6 @@ def build_gemm_a8w4_tdm_task(
                     wait_fn=(next_stage_wait_fn if const_expr(carries) else None),
                     pre_fence_mma=pre_fence_mma,
                     fence_mma=fence_mma,
-                    reverse_mma=bank_aligned_groups and ksl == 1,
                 )
                 # Prefix and in-fence WMMAs have their own regions. Keep all
                 # DS/TDM hints here, but omit both sets of issued WMMAs.
