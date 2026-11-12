@@ -295,7 +295,9 @@ and times `reduce_scatter` and `all_gather`. It takes `--tp` and `-s` but no
 GPUs (the factory and the platform window, payloads below the window, CUDA graph
 replay) and on 4 (a router built over an engine, with a window that admits every
 size): accuracy against the exact result, bit identity with the engine on an
-input padded by the test, and zero padding rows. It takes `--tp`.
+input padded by the test, and zero padding rows. It then times the router, the
+engine on an input padded by the test and RCCL on those shapes, and prints a
+markdown summary. It takes `--tp`.
 `tests/test_sp_collectives.py` checks the routing and padding rules on the CPU.
 
 A test fails if the arch is not supported, or if a world size that you name
