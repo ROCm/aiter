@@ -71,18 +71,23 @@ def _as_bool(value, default: bool) -> bool:
     return str(value).strip() in _TRUTHY_ENV
 
 
-def _as_int(value, default: int | None) -> int | None:
-    # The tuner rewrites its frame through pandas' ``astype(str)``, so a blank
-    # cell can come back as the literal "nan"; read those as unset like _cell.
-    # The model_configs/ merge goes through pandas, which stores an int column
-    # with blank cells as float; accept such integral floats, reject the rest.
-    text = "" if value is None else str(value).strip()
+@functools.lru_cache(maxsize=128)
+def _parse_config_int(text: str) -> int | None:
+    """Parse immutable CSV text once; missing cells defer to each call's default."""
+    text = text.strip()
     if text == "" or text.lower() in ("nan", "none"):
-        return default
+        return None
     number = float(text)
     if not number.is_integer():
         raise ValueError(f"expected an integer config value, got {text!r}")
     return int(number)
+
+
+def _as_int(value, default: int | None) -> int | None:
+    # Read/stringify on every call, so changed rows or mutable scalar-like
+    # objects are observed. Cache only strings, never a row, Tensor or default.
+    parsed = _parse_config_int("" if value is None else str(value))
+    return default if parsed is None else parsed
 
 
 def _dtype_name(dtype) -> str:
@@ -415,18 +420,44 @@ def _use_fused_quant_preshuffle(
     """Can this call take the compact quant + scale-rebuild path?
 
     The caller sizes token-indexed buffers on the answer, so it needs it up front
-    rather than letting the launch decide.
+    rather than letting the launch decide. Automatic FP4 compact selection also
+    waits until the direct quantizer no longer needs K-splitting for occupancy;
+    a valid explicit minimum-token override retains the old selection.
     """
     from aiter.ops.flydsl.kernels.moe_fused_route_quant_scatter import (
         fused_quant_preshuffle_supported,
+        token_multidest_ksplit,
     )
     from aiter.ops.flydsl.moe_kernels import token_multidest_eligible
 
-    return (
+    supported = (
         token_num >= _compact_scale_min_tokens(wmma_rep)
         and token_multidest_eligible(token_num, topk)
         and fused_quant_preshuffle_supported(model_dim, wmma_rep, quant_mode)
     )
+
+    if not supported:
+        return False
+    # FP8 graph measurements do not show a consistent benefit from this
+    # policy; preserve its existing compact-selection behavior.
+    if quant_mode != "fp4":
+        return True
+    # A valid explicit threshold is a tuning override, not an automatic
+    # policy choice. Keep its existing power to force compact scales.
+    threshold = os.environ.get("AITER_FLYDSL_COMPACT_SCALE_MIN_TOKENS")
+    if threshold is not None:
+        try:
+            int(threshold)
+        except ValueError:
+            threshold = None  # The threshold helper already warned.
+        else:
+            return True
+
+    # Compact quant has one unsplit warp per token and adds a scale-rebuild
+    # launch. While the direct quantizer still splits K to fill its grid,
+    # retain that parallelism instead of switching to the unsplit pair.
+    # Larger grids keep the existing compact policy and coalesced scale writes.
+    return token_multidest_ksplit(model_dim, wmma_rep, quant_mode, token_num) == 1
 
 
 @functools.cache
@@ -783,6 +814,23 @@ def _grouped_a8w4_tdm_moe(
         tile_n, n_warp, tile_k, tile_n2, n_warp2, tile_k2 = fitted
     wmma_rep = get_wmma_m_rep(tile_m, tile_n, m_warp, n_warp, "gemm1")
     wmma_rep2 = get_wmma_m_rep(tile_m2, tile_n2, m_warp2, n_warp2, "gemm2")
+    # Whether the A1 quant would take the compact-scale pair: the TP route
+    # gates and the quant dispatch below all ask, so evaluate it once a call.
+    _compact_quant_pair_memo = []
+
+    def _compact_quant_pair() -> bool:
+        if not _compact_quant_pair_memo:
+            _compact_quant_pair_memo.append(
+                _use_fused_quant_preshuffle(
+                    model_dim,
+                    wmma_rep,
+                    "fp4" if data_format == "fp4" else "fp8",
+                    token_num,
+                    topk,
+                )
+            )
+        return _compact_quant_pair_memo[0]
+
     _align_m = max(tile_m, tile_m2)
     # Both GEMMs walk the same contiguous layout, each with its own tile height,
     # so every expert must start on a row that is a multiple of both. Aligning to
@@ -847,6 +895,38 @@ def _grouped_a8w4_tdm_moe(
         and token_num * topk <= _FUSED_ROUTE_PSUM_MAX_NUMEL
         and int(E) <= _FUSED_ROUTE_PSUM_MAX_EXPERTS
     )
+    # The prefill route below keeps a persistent counter it can only allocate
+    # outside graph capture. Every eager TP call allocates it, whatever its
+    # size (decode warm-up and the memory-profile run come before any capture),
+    # so a token graph recorded before any eager prefill still records the
+    # self-cleaning route rather than the filled-scratch fallback. Once it
+    # exists this is one dict lookup.
+    if not herd_topk and not _compact and not _is_ep and not enable_ep_scatter:
+        tp_route_state_buffer(E, device)
+    # Larger TP batches (prefill): one route launch, whose last workgroup
+    # builds masked_m/starts/psum, and the token-multidest A1 quant resolves
+    # each route's row. This replaces the counter fill, route and psum-remap
+    # launches; the compact-scale quant and other A1 paths keep them.
+    _route_in_quant = None
+    if (
+        not herd_topk
+        and not _compact
+        and not _is_ep
+        and not enable_ep_scatter
+        and not _fused_tp_route
+        and _tp_route_quant_takes_route(
+            hidden_states,
+            data_format=data_format,
+            a_preshuffled=a_preshuffled,
+            model_dim=model_dim,
+            wmma_rep=wmma_rep,
+            token_num=token_num,
+            topk=topk,
+            experts=E,
+            compact_quant_pair=_compact_quant_pair,
+        )
+    ):
+        _route_in_quant = tp_prefill_route_psum(topk_ids, E, _align_m)
     if _compact:
         _masked_m = stage2_scatter.compact_masked_m
         topids_to_rows = None
@@ -931,6 +1011,8 @@ def _grouped_a8w4_tdm_moe(
                 ep_rowmap=ep_rowmap,
                 contiguous_expert_mask=_direct_ep_mask,
             )
+    elif _route_in_quant is not None:
+        _masked_m, topids_to_rows, _, _ = _route_in_quant
     elif not _fused_tp_route:
         _fuse_ep_route_quant = False
         if herd_topk:
@@ -989,6 +1071,8 @@ def _grouped_a8w4_tdm_moe(
         _masked_m, topids_to_rows, psum = fused_route_psum_remap(
             topk_ids, E, max_m, _align_m
         )
+    elif _route_in_quant is not None:
+        psum = _route_in_quant[2]
     elif _fuse_psum_quant:
         # The remapper's scan and ep_rowmap scatter ride the quant kernel:
         # every workgroup re-derives the (E,) prefix in LDS, so this launch
@@ -1131,9 +1215,7 @@ def _grouped_a8w4_tdm_moe(
         and not _prequantized
         and not a_preshuffled
         and _ep_nvr is None
-        and _use_fused_quant_preshuffle(
-            model_dim, wmma_rep, _quant_mode, token_num, topk
-        )
+        and _compact_quant_pair()
     )
     _compact_ascale_buf = None
     _row_to_token = _apre_row_to_token
@@ -1178,6 +1260,9 @@ def _grouped_a8w4_tdm_moe(
             slot_stride=int(stage2_scatter.max_tokens_per_rank) * int(topk),
         )
     else:
+        _route_rows = (
+            torch.empty_like(topids_to_rows) if _route_in_quant is not None else None
+        )
         a1_payload, a1_scale = flydsl_moe_fused_quant_preshuffle(
             hidden_states.reshape(1, token_num, _src_width),
             1,
@@ -1194,7 +1279,13 @@ def _grouped_a8w4_tdm_moe(
             ep_psum_params=ep_psum_params,
             row_major_scale=_row_major_a1,
             payload_preshuffled=a_preshuffled,
+            route_starts=None if _route_in_quant is None else _route_in_quant[3],
+            route_expert_bits=tp_route_expert_bits(E),
+            route_rows_out=_route_rows,
         )
+        if _route_rows is not None:
+            # The gather-reduce reads the rows the quant resolved.
+            topids_to_rows = _route_rows
         if _compact_ascale:
             a1_scale = flydsl_moe_scatter_preshuffle_scale(
                 _compact_ascale_buf,
@@ -2088,6 +2179,125 @@ def fused_route_psum_remap(
     return masked_m, topids_to_rows.view(token_num, topk), psum
 
 
+_TP_ROUTE_STATE_CACHE: dict[tuple[int, str], torch.Tensor] = {}
+
+
+def tp_route_state_buffer(E: int, device) -> torch.Tensor | None:
+    """Persistent ``(E + 1,)`` int32 TP route counts plus a ticket word.
+
+    ``moe_route_lds_psum_sc`` zeroes it at the end of every launch, so route
+    launches issued in order on one stream start from zero without a fill.
+    Allocated (zeroed) by the first eager TP grouped-MoE call of any size; a
+    capture that finds none gets None, so no allocation is recorded into the
+    graph (the route then uses a filled scratch counter).
+    """
+    key = (int(E), str(device))
+    buf = _TP_ROUTE_STATE_CACHE.get(key)
+    if buf is None:
+        if torch.cuda.is_current_stream_capturing():
+            return None
+        buf = torch.zeros(int(E) + 1, dtype=torch.int32, device=device)
+        _TP_ROUTE_STATE_CACHE[key] = buf
+    return buf
+
+
+def tp_route_expert_bits(E: int) -> int:
+    from aiter.ops.flydsl.kernels.moe_route_maps import (
+        tp_route_expert_bits as _bits,
+    )
+
+    return _bits(int(E))
+
+
+@functools.cache
+def _get_compiled_route_lds_psum(experts: int, self_clean: bool):
+    from aiter.ops.flydsl.kernels.moe_route_maps import (
+        build_moe_topids_to_rows_lds_psum_module,
+    )
+
+    return build_moe_topids_to_rows_lds_psum_module(int(experts), bool(self_clean))
+
+
+def _tp_route_quant_takes_route(
+    hidden_states,
+    *,
+    data_format,
+    a_preshuffled,
+    model_dim,
+    wmma_rep,
+    token_num,
+    topk,
+    experts,
+    compact_quant_pair=None,
+) -> bool:
+    """Whether the A1 quant is the token-multidest launch that can place rows.
+
+    Mirrors the quant dispatch: bf16 activations (not prequantized), no
+    A-preshuffle, and not the compact-scale pair, which needs a row -> token
+    map from the psum remap. ``compact_quant_pair`` is the caller's
+    once-a-call ``_use_fused_quant_preshuffle`` answer, as a callable.
+    """
+    from aiter.ops.flydsl.kernels.moe_route_maps import TP_ROUTE_PSUM_MAX_EXPERTS
+    from aiter.ops.flydsl.moe_kernels import (
+        token_multidest_eligible,
+        token_multidest_quant_enabled,
+    )
+
+    if int(experts) > TP_ROUTE_PSUM_MAX_EXPERTS or a_preshuffled:
+        return False
+    # A prequantized payload takes the scatter-only quant; with a bf16
+    # activation the dispatch ignores a1_scale.
+    if hidden_states.dtype != torch.bfloat16:
+        return False
+    if not token_multidest_quant_enabled():
+        return False
+    if not token_multidest_eligible(token_num, topk):
+        return False
+    if compact_quant_pair is not None:
+        return not compact_quant_pair()
+    quant_mode = "fp4" if data_format == "fp4" else "fp8"
+    return not _use_fused_quant_preshuffle(
+        model_dim, wmma_rep, quant_mode, token_num, topk
+    )
+
+
+def tp_prefill_route_psum(topk_ids: torch.Tensor, experts: int, tile_m: int):
+    """One route launch that also writes masked_m, starts and psum.
+
+    Rows come back as ``(slot << tp_route_expert_bits(E)) | expert`` for
+    ``flydsl_moe_fused_quant_preshuffle(route_starts=...)``. Returns
+    ``(masked_m, rows, psum, starts)``. The counter is the self-cleaning
+    persistent one, or a filled scratch one on first use under capture.
+    """
+    device = topk_ids.device
+    token_num, topk = topk_ids.shape
+    numel = token_num * topk
+    experts = int(experts)
+    state = tp_route_state_buffer(experts, device)
+    self_clean = state is not None
+    if not self_clean:
+        state = torch.zeros(experts + 1, dtype=torch.int32, device=device)
+    rows = torch.empty(numel, dtype=torch.int32, device=device)
+    masked_m = torch.empty(experts, dtype=torch.int32, device=device)
+    starts = torch.empty(experts, dtype=torch.int32, device=device)
+    psum = torch.empty(experts, dtype=torch.int32, device=device)
+    grid = (numel + 255) // 256
+    _run_compiled(
+        _get_compiled_route_lds_psum(experts, self_clean),
+        ptr_arg(topk_ids.to(torch.int32).reshape(-1)),
+        ptr_arg(state),
+        ptr_arg(rows),
+        ptr_arg(masked_m),
+        ptr_arg(starts),
+        ptr_arg(psum),
+        int(numel),
+        int(tile_m),
+        int(grid),
+        current_stream_arg(),
+    )
+    return masked_m, rows.view(token_num, topk), psum, starts
+
+
 def contiguous_psum(masked_m: torch.Tensor, experts: int, tile_m: int):
     """Tile-aligned exclusive prefix sum over per-expert counts."""
     device = masked_m.device
@@ -2147,20 +2357,15 @@ def contiguous_psum_remap(
     # Only remap the valid routes; dead-tail rows are unwritten and must not be
     # used as a row index. Default (no truncation) covers every route.
     if num_valid_routes is None:
-        # A 0-element tensor has data_ptr() == 0; the kernel reads that null
-        # pointer as "no truncation".
-        num_valid_routes_i32 = torch.empty(0, dtype=torch.int32, device=device)
+        # A null pointer means no truncation; no Tensor storage is needed.
+        num_valid_routes_i32 = None
     else:
         num_valid_routes_i32 = (
             num_valid_routes.reshape(-1)[:1]
             .to(device=device, dtype=torch.int32)
             .contiguous()
         )
-    row_to_token_i32 = (
-        row_to_token.reshape(-1)
-        if row_to_token is not None
-        else torch.empty(0, dtype=torch.int32, device=device)
-    )
+    row_to_token_i32 = row_to_token.reshape(-1) if row_to_token is not None else None
     if ep_scatter_params is not None:
         launch = _get_compiled_contiguous_psum_remap_ep()
         # ep_rowmap sentinel fill was done by the route kernel (g2l_lds),
@@ -2293,9 +2498,8 @@ def flydsl_moe_gather_reduce(
     # Skip dead-tail output tokens whose route map is unwritten. Default (no
     # truncation) processes every token.
     if num_valid_tokens is None:
-        # A 0-element tensor has data_ptr() == 0; the kernel reads that null
-        # pointer as "no truncation".
-        num_valid_tokens_i32 = torch.empty(0, dtype=torch.int32, device=device)
+        # A null pointer means no truncation; no Tensor storage is needed.
+        num_valid_tokens_i32 = None
     else:
         num_valid_tokens_i32 = (
             num_valid_tokens.reshape(-1)[:1]

@@ -2717,9 +2717,8 @@ def flydsl_moe_topids_to_rows(
             * int(topk)
         ).contiguous()
     else:
-        # Null pointer (0-element tensor -> data_ptr() == 0); the kernels read
-        # null as "no truncation".
-        num_valid_routes = torch.empty(0, dtype=torch.int32, device=device)
+        # Kernels read a null pointer as "no truncation".
+        num_valid_routes = None
 
     if expert_mask is not None:
         # Fused single-block path: build LUT + zero counter + route in one kernel.
@@ -2762,11 +2761,7 @@ def flydsl_moe_topids_to_rows(
             os.environ.get("AITER_FLYDSL_ROUTE_G2L_LDS", "1") in ("1", "true", "True")
             and int(E) <= MAX_ROUTE_BUCKETS
         )
-        _ep_rowmap_ptr = (
-            ep_rowmap.reshape(-1)
-            if ep_rowmap is not None
-            else torch.empty(0, dtype=torch.int32, device=device)
-        )
+        _ep_rowmap_ptr = ep_rowmap.reshape(-1) if ep_rowmap is not None else None
         _ep_rowmap_cap = ep_rowmap.shape[0] if ep_rowmap is not None else 0
         # Only the LDS launcher takes the ep_rowmap (ptr, cap) tail and fuses its
         # (-1, 0) sentinel fill (fire-and-forget stores, no standalone .fill_()).
@@ -3324,6 +3319,21 @@ _TOKEN_MULTIDEST_MIN_TOKENS = 64
 _TOKEN_MULTIDEST_MAX_TOPK = 8
 
 
+@functools.cache
+def token_multidest_quant_enabled() -> bool:
+    """AITER_FLYDSL_TOKEN_MULTIDEST_QUANT (default on), read once per process.
+
+    The quant dispatch and the TP route gates that must agree with it ask on
+    every MoE call; a test that changes the variable calls
+    ``token_multidest_quant_enabled.cache_clear()``.
+    """
+    return os.environ.get("AITER_FLYDSL_TOKEN_MULTIDEST_QUANT", "1") in (
+        "1",
+        "true",
+        "True",
+    )
+
+
 def token_multidest_eligible(token_num: int, topk: int) -> bool:
     """Whether the routing takes the token-multidest quant path.
 
@@ -3367,6 +3377,7 @@ def _get_compiled_token_multidest_quant(
     quant_mode: str,
     tdm_hidden_chunks: int = 4,
     ksplit: int = 1,
+    route_expert_bits: int = 0,
 ):
     from aiter.ops.flydsl.kernels.moe_fused_route_quant_scatter import (
         build_moe_token_multidest_quant_module,
@@ -3379,6 +3390,7 @@ def _get_compiled_token_multidest_quant(
         quant_mode=quant_mode,
         tdm_hidden_chunks=tdm_hidden_chunks,
         ksplit=ksplit,
+        route_expert_bits=route_expert_bits,
     )
 
 
@@ -3450,14 +3462,12 @@ def _get_compiled_fused_quant_preshuffle_route_ksplit(
 def _routeks_ep_psum_args(device, ep_psum_params: dict | None):
     """Extra routeks operands: live EP psum fusion, or compile-away dummies."""
     if ep_psum_params is None:
-        empty_i32 = torch.empty(0, dtype=torch.int32, device=device)
-        empty_bf16 = torch.empty(0, dtype=torch.bfloat16, device=device)
         return (
-            ptr_arg(empty_i32),
-            ptr_arg(empty_i32),
-            ptr_arg(empty_bf16),
-            ptr_arg(empty_i32),
-            ptr_arg(empty_i32),
+            ptr_arg(None),
+            ptr_arg(None),
+            ptr_arg(None),
+            ptr_arg(None),
+            ptr_arg(None),
             0,
             1,
             1,
@@ -3507,6 +3517,13 @@ def flydsl_moe_fused_quant_preshuffle(
     # row_major_ascale=1. Unsupported with A-preshuffled payloads or quantization.
     row_major_scale: bool = False,
     payload_preshuffled: bool = False,
+    # TP prefill route resolved here (token-multidest path only): rows are
+    # ``(slot << route_expert_bits) | expert`` from ``moe_route_lds_psum``, the
+    # destination is ``route_starts[expert] + slot``, and the resolved rows are
+    # written to ``route_rows_out`` (same shape as ``topids_to_rows``).
+    route_starts: torch.Tensor | None = None,
+    route_expert_bits: int = 0,
+    route_rows_out: torch.Tensor | None = None,
 ):
     """Fused grouped quant + e8m0 scale-preshuffle.
 
@@ -3522,6 +3539,8 @@ def flydsl_moe_fused_quant_preshuffle(
         )
     if payload_preshuffled and row_major_scale:
         raise ValueError("A-preshuffled payload requires M16K4 scales")
+    if route_starts is not None and topids_to_rows is None:
+        raise ValueError("route_starts needs topids_to_rows")
     # A quantizing EP dispatch (fp8 or fp4) already put the payload and its e8m0
     # row on the wire: nothing left to convert, only scatter + preshuffle.
     prequantized = prequantized_scale is not None
@@ -3596,9 +3615,9 @@ def flydsl_moe_fused_quant_preshuffle(
     if skip_padding:
         masked_m = masked_m.to(device=device, dtype=torch.int32).reshape(-1)
     else:
-        # Unused by the kernel (skip_padding=False); a tiny dummy keeps the launch
-        # signature uniform without allocating per-row scratch.
-        masked_m = torch.empty(max(E, 1), dtype=torch.int32, device=device)
+        # Unread when skip_padding=False (and in non-remapping route branches).
+        # Keep the pointer ABI without allocating another unused tensor.
+        masked_m = out_payload
 
     from aiter.ops.flydsl.kernels.kernels_common import get_warp_size
 
@@ -3641,9 +3660,21 @@ def flydsl_moe_fused_quant_preshuffle(
             and num_valid_routes is None
             and 1 < int(source_topk) <= _TOKEN_MULTIDEST_MAX_TOPK
             and token_num >= _TOKEN_MULTIDEST_MIN_TOKENS
-            and os.environ.get("AITER_FLYDSL_TOKEN_MULTIDEST_QUANT", "1")
-            in ("1", "true", "True")
+            and token_multidest_quant_enabled()
         )
+        # Checked before any launch: every other branch reads topids_to_rows
+        # as final rows and would ignore the (slot, expert) encoding.
+        route_in_quant = route_starts is not None
+        if route_in_quant and (
+            not use_token_multidest
+            or row_to_token is not None
+            or route_rows_out is None
+            or route_expert_bits <= 0
+        ):
+            raise ValueError(
+                "route_starts needs the token-multidest quant without a "
+                "row_to_token map, route_rows_out and route_expert_bits"
+            )
         if use_token_multidest and row_to_token is not None:
             from aiter.ops.flydsl.kernels.moe_fused_route_quant_scatter import (
                 token_multidest_tdm_chunks,
@@ -3688,6 +3719,7 @@ def flydsl_moe_fused_quant_preshuffle(
                     feat_dim, wmma_rep, quant_mode, md_ksplit
                 ),
                 ksplit=md_ksplit,
+                route_expert_bits=int(route_expert_bits) if route_in_quant else 0,
             )
             token_grid = (token_num + warps_per_block - 1) // warps_per_block
             _dispatch_compiled(
@@ -3698,6 +3730,8 @@ def flydsl_moe_fused_quant_preshuffle(
                 ptr_arg(topids_to_rows_i32),
                 token_num,
                 token_grid,
+                ptr_arg(route_starts.reshape(-1) if route_in_quant else None),
+                ptr_arg(route_rows_out.reshape(-1) if route_in_quant else None),
                 current_stream_arg(),
             )
             return out_payload, out_scale
@@ -3783,8 +3817,7 @@ def flydsl_moe_fused_quant_preshuffle(
         # padding rows of the dispatch buffer and are not gathered/quantized. When
         # not provided, pass a null pointer (0-element tensor -> data_ptr() == 0).
         if num_valid_routes is None:
-            num_valid_routes_i32 = torch.empty(0, dtype=torch.int32, device=device)
-            assert num_valid_routes_i32.data_ptr() == 0, "expected a null data_ptr"
+            num_valid_routes_i32 = None
         else:
             num_valid_routes_i32 = (
                 num_valid_routes.reshape(-1)[:1].to(device=device, dtype=torch.int32)
