@@ -12,6 +12,8 @@ Usage:
   python test_moe_topk_gating.py --section ties,eplb
   python test_moe_topk_gating.py --section biased-sigmoid --num-experts 896 \
       --num-tokens 1,8,32,128 --topk 16 --dtype bf16
+  python test_moe_topk_gating.py --section softplus-384 --num-tokens 1,64,1024 \
+      --topk 6,8
 """
 
 import argparse
@@ -514,6 +516,55 @@ def bench_topk_softplus(
         ret[f"{name} TB/s"] = nbytes / us / 1e6
         ret[f"{name} err"] = n_mism / num_tokens
         ret[f"{name} max_weight_err"] = _max_weight_error(w, ids, w_torch, i_torch)
+    return ret
+
+
+@benchmark()
+def bench_sqrtsoftplus_384(num_tokens, topk, route_scale=1.5):
+    """Compare the Triton 384-expert sqrtsoftplus top-k with the HIP kernel,
+    both in a CUDA graph. The Triton result must be bit-identical."""
+    from aiter.ops.topk import topk_gating_fwd
+    from aiter.ops.triton.moe.moe_routing.topk_gating import sqrtsoftplus_384_topk
+
+    torch.random.manual_seed(0)
+    num_experts = 384
+    gating_output = _make_gating(num_experts, num_tokens, torch.bfloat16)
+    bias = torch.randn(num_experts, dtype=torch.float32, device="cuda") * 0.1
+    triton_weights = torch.empty((num_tokens, topk), dtype=torch.float32)
+    triton_ids = torch.empty((num_tokens, topk), dtype=torch.int32)
+    hip_weights = torch.empty_like(triton_weights)
+    hip_ids = torch.empty_like(triton_ids)
+
+    def run_triton():
+        sqrtsoftplus_384_topk(
+            gating_output, bias, triton_weights, triton_ids, route_scale
+        )
+        return triton_weights, triton_ids
+
+    def run_hip():
+        topk_gating_fwd(
+            hip_weights,
+            hip_ids,
+            gating_output,
+            bias,
+            True,
+            route_scale,
+            "sqrtsoftplus",
+        )
+        return hip_weights, hip_ids
+
+    run_triton()
+    run_hip()
+    ret = {
+        "gfx": get_gfx(),
+        "id mismatch": int((triton_ids != hip_ids).sum()),
+        "weight bit mismatch": int(
+            (triton_weights.view(torch.int32) != hip_weights.view(torch.int32)).sum()
+        ),
+    }
+    for name, fn in {"triton": run_triton, "hip": run_hip}.items():
+        _, us = run_perftest(fn, testGraph=True)
+        ret[f"{name} graph us"] = us
     return ret
 
 
@@ -1027,8 +1078,8 @@ def main():
             "pad-rows",
         ],
         help="Comma-separated list of sections to run: "
-        "sigmoid,biased-sigmoid,softplus,softmax,nan,ties,eplb,shared,pad-rows "
-        "(default: all except biased-sigmoid). "
+        "sigmoid,biased-sigmoid,softplus,softplus-384,softmax,nan,ties,eplb,shared,"
+        "pad-rows (default: all except biased-sigmoid and softplus-384). "
         "Sigmoid, softplus and softmax are named after score functions; nan, ties, "
         "eplb and pad-rows "
         "each sweep all score functions. --score-func is a deprecated alias.",
@@ -1110,6 +1161,35 @@ def main():
             print(f"\nERROR: {len(errors)} softplus config(s) had errors!")
             print(errors.to_string(index=False))
             failed_sections.append("softplus")
+
+    # -- 384-expert sqrtsoftplus: Triton versus HIP ------------------------
+    if "softplus-384" in sections:
+        from aiter.ops.triton.moe.moe_routing.topk_gating import (
+            SQRTSOFTPLUS_384_LAYOUTS,
+        )
+
+        if get_gfx() not in SQRTSOFTPLUS_384_LAYOUTS:
+            raise ValueError(
+                f"softplus-384 requires one of {sorted(SQRTSOFTPLUS_384_LAYOUTS)}"
+            )
+        # On gfx1250 the HIP kernel uses this layout only up to 1024 rows.
+        max_rows = 1024 if get_gfx().startswith("gfx1250") else max(num_tokens_list)
+        configs = list(
+            itertools.product(
+                [t for t in num_tokens_list if t <= max_rows],
+                [k for k in topk_list if k <= 8],
+            )
+        )
+        df = pd.DataFrame([bench_sqrtsoftplus_384(*cfg) for cfg in configs])
+        aiter.logger.info(
+            "384-expert sqrtsoftplus summary (markdown):\n%s",
+            df.to_markdown(index=False),
+        )
+        errors = df[(df["id mismatch"] != 0) | (df["weight bit mismatch"] != 0)]
+        if len(errors) > 0:
+            print(f"\nERROR: {len(errors)} softplus-384 config(s) mismatched HIP!")
+            print(errors.to_string(index=False))
+            failed_sections.append("softplus-384")
 
     # -- topk_softmax: topk_gating (fused) vs topk_softmax (vLLM) --------
     if "softmax" in sections:
