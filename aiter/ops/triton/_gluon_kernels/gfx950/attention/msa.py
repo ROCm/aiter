@@ -100,7 +100,7 @@ def _v_view(vb):
 
 _msa_gfx950_gluon_kernel_repr = make_kernel_repr(
     "msa_gfx950_gluon_kernel",
-    ['BLOCK_M', 'SPLITS', 'DECODE_QL', 'QT', 'KV_LDS', 'TOPK', 'NUM_HEADS', 'NUM_WARPS'],
+    ['BLOCK_M', 'NSEG', 'DECODE_QL', 'QT', 'KV_LDS', 'TOPK', 'NUM_HEADS', 'NUM_WARPS'],
 )
 
 
@@ -122,9 +122,11 @@ def msa_gfx950_gluon_kernel(
     out_ptr,
     part_o_ptr,
     part_ml_ptr,
+    seg_count_ptr,  # int32 [Hkv, groups]: the program's page count (segment 0 writes it)
     v_scale_ptr,
     qk_scale_log2,
     num_rows,
+    seg_pages,  # pages a segment covers (split rebalance)
     stride_page,
     stride_head,
     stride_tk_h,
@@ -135,7 +137,7 @@ def msa_gfx950_gluon_kernel(
     NUM_HEADS: gl.constexpr,
     TOPK: gl.constexpr,
     BLOCK_M: gl.constexpr,
-    SPLITS: gl.constexpr,
+    NSEG: gl.constexpr,
     DECODE_QL: gl.constexpr,
     QT: gl.constexpr,
     P_SCALE: gl.constexpr,
@@ -150,6 +152,14 @@ def msa_gfx950_gluon_kernel(
 
     Warps split the keys for QK and the head dim for PV, so each warp loads
     only its own K columns and V columns of a page.
+
+    Split rebalance (as PR 7421's): segment sid covers pages
+    [sid * seg_pages, (sid + 1) * seg_pages) of the program's compacted page
+    list, so every live segment does the same work and a row (group) with more
+    valid pages gets more segments; segments past its list exit with nothing to
+    do. NSEG = 1 writes the output; otherwise segments write partials that
+    msa_gfx950_gluon_reduce_split_rebalance_kernel merges, reading only the
+    live ones (segment 0 records the page count).
 
     The two BLOCK_Q cases differ only in where the pages come from and how
     rows are masked:
@@ -263,11 +273,8 @@ def msa_gfx950_gluon_kernel(
         else:
             pos = gl.load(query_pos_ptr + grp)
             req = gl.load(query_req_ptr + grp).to(gl.int64)
-        PER: gl.constexpr = TOPK // SPLITS
-        jj = gl.arange(0, PER, layout=VEC)
-        blks = gl.load(
-            topk_ptr + g * stride_tk_h + grp.to(gl.int64) * stride_tk_t + sid * PER + jj
-        )
+        jj = gl.arange(0, TOPK, layout=VEC)
+        blks = gl.load(topk_ptr + g * stride_tk_h + grp.to(gl.int64) * stride_tk_t + jj)
         valid = (blks >= 0) & (blks * PAGE <= pos)
         pages = gl.load(
             block_table_ptr + req * stride_bt + gl.where(valid, blks, 0), mask=valid, other=0
@@ -280,18 +287,21 @@ def msa_gfx950_gluon_kernel(
             gl.associative_scan(safe.to(gl.int32), 0, _add) - 1,
             gl.where(diag, n_safe, -1),
         )
-        n_iter = n_safe + gl.sum(diag.to(gl.int32), axis=0)
-        b_cur, p_cur = _nth_valid(rank, blks, pages, 0, n_iter)
-        b_nxt, p_nxt = _nth_valid(rank, blks, pages, 1, n_iter)
+        n_pages = n_safe + gl.sum(diag.to(gl.int32), axis=0)
+        # this segment: compacted picks [j0, j_end)
+        j0 = sid * seg_pages
+        j_end = gl.minimum(n_pages, j0 + seg_pages)
+        n_iter = gl.maximum(j_end - j0, 0)
+        b_cur, p_cur = _nth_valid(rank, blks, pages, j0, j_end)
+        b_nxt, p_nxt = _nth_valid(rank, blks, pages, j0 + 1, j_end)
     else:
-        # A row group: this split's share [u0, u1) of the group's page union.
+        # A row group: this segment's pages [u0, u1) of the group's page union.
         ubase = (g * gl.num_programs(0) + grp).to(gl.int64)
         row_t = gl.arange(0, BLOCK_M, layout=ROW) // HG
         row_pos = gl.load(pos_ptr + r0 + row_t, mask=(r0 + row_t) < num_rows, other=-1)
-        count = gl.load(count_ptr + ubase)
-        chunk = (count + SPLITS - 1) // SPLITS
-        u0 = sid * chunk
-        u1 = gl.minimum(count, u0 + chunk)
+        n_pages = gl.load(count_ptr + ubase)
+        u0 = sid * seg_pages
+        u1 = gl.minimum(n_pages, u0 + seg_pages)
         last = gl.maximum(u1 - 1, 0)
         uq = uniq_ptr + ubase * C
         tb = tokblk_ptr + ubase * C * BLOCK_Q + row_t
@@ -317,7 +327,7 @@ def msa_gfx950_gluon_kernel(
     for j in range(n_iter):
         # Issue step j + 1's loads (and step j + 2's page id) before step j's math.
         if BLOCK_Q == 1:
-            b_nxt2, p_nxt2 = _nth_valid(rank, blks, pages, j + 2, n_iter)
+            b_nxt2, p_nxt2 = _nth_valid(rank, blks, pages, j0 + j + 2, j_end)
         else:
             p_nxt2 = _page_at(uq, u0 + j + 2, u1, last)
             rb_n = gl.load(tb + gl.minimum(u0 + j + 1, last) * BLOCK_Q)
@@ -341,7 +351,7 @@ def msa_gfx950_gluon_kernel(
         if QT == 2:
             s = gl.amd.cdna4.mfma_scaled(q_lo, qs_lo, "e4m3", k_c, ks_c, "e2m1", s)
         if BLOCK_Q == 1:
-            if j == n_safe:  # the diagonal block: mask the keys after pos
+            if j0 + j == n_safe:  # the diagonal block: mask the keys after pos
                 s = gl.where((b_cur * PAGE + tok_n <= pos)[None, :], s, float("-inf"))
             # every visited block has a visible key: the max is finite after step 0
             m_new = gl.maximum(m_i, gl.max(s, axis=1) * qk_scale_log2)
@@ -385,7 +395,8 @@ def msa_gfx950_gluon_kernel(
     om = gl.arange(0, BLOCK_M, layout=ROW)[:, None]
     od = gl.arange(0, D, layout=COL)[None, :]
     o_row = r0 + om // HG
-    if SPLITS == 1:
+    pair = (g * gl.num_programs(0) + grp).to(gl.int64)
+    if NSEG == 1:
         v_scale = gl.load(v_scale_ptr)
         inv_l = gl.where(l_i > 0, v_scale / l_i, 0.0)
         o_ptrs = out_ptr + o_row.to(gl.int64) * stride_ot + (g * HG + om % HG) * stride_oh + od
@@ -394,11 +405,85 @@ def msa_gfx950_gluon_kernel(
         else:
             gl.store(o_ptrs, (acc * inv_l[:, None]).to(gl.bfloat16), mask=o_row < num_rows)
     else:
-        part = (g * gl.num_programs(0) + grp).to(gl.int64) * SPLITS + sid
-        gl.store(part_o_ptr + part * (BLOCK_M * D) + om * D + od, acc)
-        mm = gl.arange(0, BLOCK_M, layout=ROW)
-        gl.store(part_ml_ptr + part * (BLOCK_M * 2) + mm * 2, m_i)
-        gl.store(part_ml_ptr + part * (BLOCK_M * 2) + mm * 2 + 1, l_i)
+        if sid == 0:
+            gl.store(seg_count_ptr + pair, n_pages)
+        if n_iter > 0:  # a live segment: its partial (O, max, sum)
+            part = pair * NSEG + sid
+            gl.store(part_o_ptr + part * (BLOCK_M * D) + om * D + od, acc)
+            mm = gl.arange(0, BLOCK_M, layout=ROW)
+            gl.store(part_ml_ptr + part * (BLOCK_M * 2) + mm * 2, m_i)
+            gl.store(part_ml_ptr + part * (BLOCK_M * 2) + mm * 2 + 1, l_i)
+
+
+
+
+_msa_gfx950_gluon_reduce_split_rebalance_kernel_repr = make_kernel_repr(
+    "msa_gfx950_gluon_reduce_split_rebalance_kernel",
+    ['BLOCK_M', 'NSEG', 'NUM_WARPS'],
+)
+
+
+@gluon.jit(repr=_msa_gfx950_gluon_reduce_split_rebalance_kernel_repr)
+def msa_gfx950_gluon_reduce_split_rebalance_kernel(
+    part_o_ptr,  # fp32 [Hkv, groups, NSEG, BLOCK_M, D]
+    part_ml_ptr,  # fp32 [Hkv, groups, NSEG, BLOCK_M, 2] (running max, sum)
+    seg_count_ptr,  # int32 [Hkv, groups]: pages of each program's list
+    out_ptr,
+    v_scale_ptr,
+    num_rows,
+    seg_pages,
+    stride_ot,
+    stride_oh,
+    BLOCK_M: gl.constexpr,
+    NSEG: gl.constexpr,
+    NUM_WARPS: gl.constexpr,
+):
+    """The split-rebalance reduce of msa_gfx950_gluon_kernel: one program per
+    (row group, KV head) merges its live segments, cdiv(pages, seg_pages) of
+    them, in segment order (deterministic) with the next segment's partial in
+    flight; segments past a short list were never written and are not read.
+    Row m of a group is query row grp * BLOCK_M / 16 + m // 16, head
+    g * 16 + m % 16; a row group with no pages gives zeros."""
+    L: gl.constexpr = gl.BlockedLayout([1, 8], [4, 16], [NUM_WARPS, 1], [1, 0])
+    R: gl.constexpr = gl.SliceLayout(1, L)
+    grp = gl.program_id(0)
+    g = gl.program_id(1)
+    pair = (g * gl.num_programs(0) + grp).to(gl.int64)
+    live = (gl.load(seg_count_ptr + pair) + seg_pages - 1) // seg_pages
+    om = gl.arange(0, BLOCK_M, layout=R)
+    od = gl.arange(0, D, layout=gl.SliceLayout(0, L))[None, :]
+    o_offs = om[:, None] * D + od
+    base0 = pair * NSEG
+    m_n = gl.load(part_ml_ptr + base0 * (BLOCK_M * 2) + om * 2, mask=(om >= 0) & (live > 0), other=float("-inf"))
+    l_n = gl.load(part_ml_ptr + base0 * (BLOCK_M * 2) + om * 2 + 1, mask=(om >= 0) & (live > 0), other=0.0)
+    o_n = gl.load(part_o_ptr + base0 * (BLOCK_M * D) + o_offs, mask=(o_offs >= 0) & (live > 0), other=0.0)
+    m_t = gl.full([BLOCK_M], float("-inf"), gl.float32, R)
+    l_t = gl.zeros([BLOCK_M], gl.float32, R)
+    acc = gl.zeros([BLOCK_M, D], gl.float32, L)
+    for sgm in range(live):
+        m_s = m_n
+        l_s = l_n
+        o_s = o_n
+        nxt = base0 + gl.minimum(sgm + 1, NSEG - 1)
+        ok = sgm + 1 < live
+        m_n = gl.load(part_ml_ptr + nxt * (BLOCK_M * 2) + om * 2, mask=(om >= 0) & ok, other=float("-inf"))
+        l_n = gl.load(part_ml_ptr + nxt * (BLOCK_M * 2) + om * 2 + 1, mask=(om >= 0) & ok, other=0.0)
+        o_n = gl.load(part_o_ptr + nxt * (BLOCK_M * D) + o_offs, mask=(o_offs >= 0) & ok, other=0.0)
+        m_new = gl.maximum(m_t, m_s)
+        m_use = gl.where(m_new == float("-inf"), 0.0, m_new)
+        a = gl.exp2(m_t - m_use)
+        b = gl.exp2(m_s - m_use)
+        acc = acc * a[:, None] + o_s * b[:, None]
+        l_t = l_t * a + l_s * b
+        m_t = m_new
+    v_scale = gl.load(v_scale_ptr)
+    inv_l = gl.where(l_t > 0, v_scale / l_t, 0.0)
+    row = grp * (BLOCK_M // HG) + om // HG
+    gl.store(
+        out_ptr + row.to(gl.int64)[:, None] * stride_ot + (g * HG + om % HG)[:, None] * stride_oh + od,
+        (acc * inv_l[:, None]).to(gl.bfloat16),
+        mask=(row < num_rows)[:, None],
+    )
 
 
 V4_BYTES = gl.constexpr(128 * 128 // 2)

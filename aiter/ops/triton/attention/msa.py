@@ -32,7 +32,7 @@ from aiter.ops.triton._triton_kernels.attention.msa import (
     V_BYTES,
     msa_gfx950_triton_kernel,
     msa_k4v8_store_kernel,
-    msa_merge_kernel,
+    msa_reduce_kernel,
     msa_q_mxfp8_kernel,
     msa_union_kernel,
     RECORD4_BYTES,
@@ -364,6 +364,15 @@ def msa_fwd(
     return out
 
 
+def msa_seg_pages(programs: int, topk: int, max_pages: int, cus: int, min_pages: int = 4) -> int:
+    """Split-rebalance segment size: the batch's pages (each program's list
+    taken at its top-k) over ~2 waves of CUs, rounded down to a power of two
+    (so segments divide a full list evenly), clamped to [min_pages, max_pages]."""
+    want = max(1, triton.cdiv(programs * topk, 2 * cus))
+    want = 1 << (want.bit_length() - 1)
+    return max(min(want, max_pages), min(min_pages, max_pages))
+
+
 def msa_gluon_splits(programs: int, topk: int, cus: int, min_pages: int = 4) -> int:
     """Split each program's page union until the grid covers about two waves,
     keeping at least min_pages of a top-k's worth of pages per split (the
@@ -386,6 +395,7 @@ def _gluon_fwd(
     kv_lds = _KV_LDS if kv_lds is None else kv_lds
     from aiter.ops.triton._gluon_kernels.gfx950.attention.msa import (
         msa_gfx950_gluon_kernel,
+        msa_gfx950_gluon_reduce_split_rebalance_kernel,
     )
 
     if q_mode not in ("mxfp8", "mxfp8x2") or not p_fp8:
@@ -445,14 +455,19 @@ def _gluon_fwd(
     vs = _scale_tensor(v_scale, dev)
     block_q = block_m // hg
     groups = triton.cdiv(rows, block_q)
-    if kv_splits is None:
-        kv_splits = (
-            msa_gluon_splits(groups * num_kv_heads, n_topk, _cus(dev)) if decode else 1
-        )
-    if kv_splits < 1 or kv_splits & (kv_splits - 1):
-        raise ValueError("kv_splits must be a power of two")
-    if block_q == 1 and n_topk % kv_splits:
-        raise ValueError("kv_splits must divide TOPK at block_m = 16")
+    # Split rebalance: every segment covers seg_pages of its program's page list
+    # (a row's valid picks, or a row group's union), so a list with more pages
+    # gets more segments. kv_splits, when given, splits the longest list that many
+    # ways; otherwise decode sizes segments for ~2 waves of CUs (>= 4 pages each)
+    # and prefill runs one segment per program.
+    max_pages = n_topk * block_q
+    if kv_splits is not None:
+        if kv_splits < 1:
+            raise ValueError("kv_splits must be positive")
+        seg_pages = triton.cdiv(max_pages, kv_splits)
+    else:
+        seg_pages = msa_seg_pages(groups * num_kv_heads, n_topk, max_pages, _cus(dev)) if decode else max_pages
+    nseg = triton.cdiv(max_pages, seg_pages)
     if block_q > 1:
         # the rows' page union, each page once per row group
         c = block_q * n_topk
@@ -470,27 +485,30 @@ def _gluon_fwd(
         )  # fmt: skip
     else:
         uniq = count = tokblk = pos = topk  # unused at block_m = 16
-    if kv_splits > 1:
-        n = num_kv_heads * groups * kv_splits
+    if nseg > 1:
+        n = num_kv_heads * groups * nseg
         part_o = torch.empty((n, block_m, HEAD_DIM), dtype=torch.float32, device=dev)
         part_ml = torch.empty((n, block_m, 2), dtype=torch.float32, device=dev)
+        seg_count = torch.empty((num_kv_heads * groups,), dtype=torch.int32, device=dev)
     else:
         part_o = part_ml = out
-    msa_gfx950_gluon_kernel[(groups, num_kv_heads, kv_splits)](
+        seg_count = topk  # unused
+    msa_gfx950_gluon_kernel[(groups, num_kv_heads, nseg)](
         q8, qs, kv_cache, kv_cache.view(_FP8), topk, block_table,
         seq_lens if decode else query_req, query_req if not decode else seq_lens,
         query_pos if not decode else seq_lens, uniq, count, tokblk, pos, out,
-        part_o, part_ml, vs, sm_scale * 1.4426950408889634, rows,
+        part_o, part_ml, seg_count, vs, sm_scale * 1.4426950408889634, rows, seg_pages,
         kv_cache.stride(0), kv_cache.stride(1), topk.stride(0), topk.stride(1),
         block_table.stride(0), out.stride(0), out.stride(1),
-        NUM_HEADS=num_heads, TOPK=n_topk, BLOCK_M=block_m, SPLITS=kv_splits,
+        NUM_HEADS=num_heads, TOPK=n_topk, BLOCK_M=block_m, NSEG=nseg,
         DECODE_QL=dql if decode else 0, QT=qt, P_SCALE=P_SCALE,
         NUM_WARPS=num_warps, KV_LDS=kv_lds, num_warps=num_warps,
     )  # fmt: skip
-    if kv_splits > 1:
-        msa_merge_kernel[(groups, num_kv_heads)](
-            part_o, part_ml, out, vs, rows, out.stride(0), out.stride(1),
-            BLOCK_M=block_m, HG=hg, D=HEAD_DIM, SPLITS=kv_splits, num_warps=4,
+    if nseg > 1:
+        msa_gfx950_gluon_reduce_split_rebalance_kernel[(groups, num_kv_heads)](
+            part_o, part_ml, seg_count, out, vs, rows, seg_pages,
+            out.stride(0), out.stride(1), BLOCK_M=block_m, NSEG=nseg, NUM_WARPS=4,
+            num_warps=4,
         )  # fmt: skip
     return out
 
@@ -613,7 +631,7 @@ def _k4v4_fwd(
         DECODE_QL=dql if decode else 0, num_warps=4,
     )  # fmt: skip
     if kv_splits > 1:
-        msa_merge_kernel[(rows, num_kv_heads)](
+        msa_reduce_kernel[(rows, num_kv_heads)](
             part_o, part_ml, out, vs, rows, out.stride(0), out.stride(1),
             BLOCK_M=16, HG=hg, D=HEAD_DIM, SPLITS=kv_splits, num_warps=4,
         )  # fmt: skip
@@ -639,7 +657,7 @@ def _k4v4_fwd(
     )  # fmt: skip
     if kv_splits > 1:
         ones = torch.ones(1, dtype=torch.float32, device=dev)
-        msa_merge_kernel[(rows, num_kv_heads)](
+        msa_reduce_kernel[(rows, num_kv_heads)](
             part_o, part_ml, out, ones, rows, out.stride(0), out.stride(1),
             BLOCK_M=16, HG=hg, D=HEAD_DIM, SPLITS=kv_splits, num_warps=4,
         )  # fmt: skip

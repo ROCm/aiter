@@ -410,14 +410,14 @@ def msa_q_mxfp8_kernel(
         )
 
 
-_msa_merge_kernel_repr = make_kernel_repr(
-    "msa_merge_kernel",
+_msa_reduce_kernel_repr = make_kernel_repr(
+    "msa_reduce_kernel",
     ['BLOCK_M', 'SPLITS'],
 )
 
 
-@triton.jit(repr=_msa_merge_kernel_repr)
-def msa_merge_kernel(
+@triton.jit(repr=_msa_reduce_kernel_repr)
+def msa_reduce_kernel(
     part_o_ptr,  # fp32 [Hkv, groups, SPLITS, BLOCK_M, D]
     part_ml_ptr,  # fp32 [Hkv, groups, SPLITS, BLOCK_M, 2]
     out_ptr,
