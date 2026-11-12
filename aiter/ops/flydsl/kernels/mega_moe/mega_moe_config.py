@@ -523,7 +523,8 @@ def _select_fixed_stage1(bucket: int) -> Stage1Config:
     grid_mult = max(1, bucket // 4) if bucket <= 16 else 3
     return Stage1Config(
         sort_block_m=32,
-        tile_n=256 if bucket <= 8 else 128,
+        # tile_n 384 (12 n-tiles) at 32-64 tokens: -2.7% against 128.
+        tile_n=256 if bucket <= 8 else 384 if bucket in (32, 64) else 128,
         num_waves=4,
         grid_mult=grid_mult,
         num_dispatch_cu=_fixed_dispatch_cu(bucket),
@@ -1457,7 +1458,8 @@ def _small_m_stage1(bucket: int, expert_waves: int = 1) -> Stage1Config:
     grid_mult = max(1, bucket // 4) if bucket <= 16 else 3
     return Stage1Config(
         sort_block_m=64 if bucket >= SMALL_M_BM64_MIN_BUCKET else 32,
-        tile_n=256 if bucket <= 8 else 128,
+        # tile_n 384 (12 n-tiles) at 32-64 tokens: -2.7% against 128.
+        tile_n=256 if bucket <= 8 else 384 if bucket in (32, 64) else 128,
         num_waves=4,
         grid_mult=grid_mult,
         # A layout with more than 64 experts a rank gives every 64-expert wave its own producers.
@@ -1474,7 +1476,7 @@ def _small_m_stage2(bucket: int) -> Stage2Config:
     # GEMM2 runs in the kernel's own grid (never persistent) with NT B loads.
     return Stage2Config(
         block_m=64 if bucket >= SMALL_M_BM64_MIN_BUCKET else 32,
-        block_n=256 if bucket in (1, 4, 64) or bucket >= 128 else 128,
+        block_n=256 if bucket in (1, 4, 32, 64) or bucket >= 128 else 128,
         persist=False,
         persist_cu=0,
         use_nt=True,
@@ -1715,10 +1717,10 @@ def _fused_config(
         config = _large_m_config(expert_waves)
         return _tune_v41_flash_ep4_large(config) if ep4 else config
     if bucket == 2:
-        # Bucket 1's config with bucket 1's base GEMM1 tile width: the EP4 tune's tile_n 128 pays off at one token
-        # a rank, but at two a loaded rank's tiles already outnumber the CTAs.
+        # Bucket 1's config with 384-column GEMM1 tiles: the EP4 tune's tile_n 128 pays off at one token a rank,
+        # but at two a loaded rank's tiles already outnumber the CTAs (384: -3% against 256).
         config = _fused_config(1, mtpr, world_size, experts_per_rank, model_dim, inter_dim)
-        return replace(config, stage1=replace(config.stage1, tile_n=_small_m_stage1(1).tile_n))
+        return replace(config, stage1=replace(config.stage1, tile_n=384))
     config = MegaMoEConfig(
         stage1=_small_m_stage1(bucket, expert_waves),
         stage2=_small_m_stage2(bucket),
