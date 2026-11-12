@@ -261,13 +261,18 @@ def fused_dual_rmsnorm_mxfp8_quant(
 
     ``yq``, ``sq`` and ``yk`` are pre-allocated output buffers, and passing
     any of them bypasses routing. The reason is a schema one rather than a
-    policy one: this function RETURNS the buffers it was given, so an op
-    registered over the full signature would return one of its own
-    arguments. A custom op's schema says its results do not alias its
-    inputs, `register_fake` may not hand an argument back, and `opcheck`
-    rejects it -- so the out-param form cannot be a routed contract at all.
-    Leaving the buffers out keeps the contract honest: every tensor the
-    routed form returns is one it allocated.
+    policy one: this function RETURNS the buffers it was given, while the
+    schema a custom op is registered under declares that its results do not
+    alias its inputs. `opcheck` reports the contradiction, and under compile
+    both ways of resolving it are wrong. Measured: a fake that allocates
+    leaves the caller's buffer UNWRITTEN while still returning the right
+    value -- no error, stale buffer, and nothing says so. A fake that hands
+    the argument back happens to work, but only by asserting the aliasing
+    its own schema denies.
+
+    Leaving the buffers out of the contract removes the contradiction
+    instead of picking a side of it: every tensor the routed form returns is
+    one it allocated.
 
     A provider therefore serves the allocating form only. The buffered form
     runs AITER's own Triton kernel, which is what it asked for by naming the
