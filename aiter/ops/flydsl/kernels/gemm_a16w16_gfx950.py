@@ -343,7 +343,7 @@ def make_gemm_a16w16_gfx950_kernel_name(param: GemmA16W16Gfx950Param):
     name += "_ring5ab" if param.unroll_lds_ring else ""
     name += "_ng4sk" if param.n_grouped_loads else ""
     name += "_hti5sk" if param.unroll_hti else ""
-    name += "_ps2r4_ptr" if param.packed_split else ""
+    name += "_ps2r4_grid4_ptr" if param.packed_split else ""
     return name
 
 
@@ -605,11 +605,22 @@ def gemm_a16w16_gfx950_kernel(
     k_wave_idx = tid // threads_per_k_slice
     num_pid_m = (m + block_m - 1) // block_m
     num_pid_n = (n + block_n - 1) // block_n
-    block_swizzle = BlockSwizzle(
-        NUM_XCDS=8, NUM_PIDS_THRESHOLD=256, GROUP_M=param.group_m
-    )
-    bid_m, bid_n = block_swizzle.swizzle(num_pid_m, num_pid_n, fx.block_idx.x)
-    ks_idx = fx.block_idx.y
+    if const_expr(param.packed_split):
+        # Exact 2(M) x 56(N) x 2(K) task set in a one-dimensional grid.
+        # Four-way task interleaving changes only workgroup placement, not
+        # either partition's K order or its FP32 scratch ownership. The
+        # generic swizzle otherwise keeps this small grid in plain M/N order.
+        pid = fx.block_idx.x
+        mapped = pid % 4 * 56 + pid // 4
+        ks_idx = mapped % 2
+        bid_m = mapped // 2 % 2
+        bid_n = mapped // 4 % 56
+    else:
+        block_swizzle = BlockSwizzle(
+            NUM_XCDS=8, NUM_PIDS_THRESHOLD=256, GROUP_M=param.group_m
+        )
+        bid_m, bid_n = block_swizzle.swizzle(num_pid_m, num_pid_n, fx.block_idx.x)
+        ks_idx = fx.block_idx.y
     ks_begin = ks_idx * working_k
     ks_end = ks_begin + working_k
     ks_end = (ks_end < k).select(ks_end, k)
@@ -1645,7 +1656,7 @@ def _latent_packed_split(
         ldb,
         mma,
         param,
-    ).launch(grid=(2 * 56, 2, 1), block=(256, 1, 1), stream=stream)
+    ).launch(grid=(224, 1, 1), block=(256, 1, 1), stream=stream)
     _reduce_latent_packed_split(partial, out).launch(
         grid=(448, 1, 1), block=(256, 1, 1), stream=stream
     )

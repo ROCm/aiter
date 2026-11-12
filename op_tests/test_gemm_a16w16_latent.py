@@ -400,7 +400,10 @@ def check_packed_split_specialization():
         assert _use_packed_split(m, 3584, 7168, cfg) == want
         param = make_gemm_a16w16_param_and_validate(m, 3584, 7168, cfg)
         assert param is not None
-        assert make_gemm_a16w16_gfx950_kernel_name(param).endswith("_ps2r4_ptr") == want
+        assert (
+            make_gemm_a16w16_gfx950_kernel_name(param).endswith("_ps2r4_grid4_ptr")
+            == want
+        )
     old = make_gemm_a16w16_param_and_validate(128, 3584, 7168, cfg)
     new = make_gemm_a16w16_param_and_validate(
         128, 3584, 7168, {**cfg, "stages": 5, "split_k": 2}
@@ -432,8 +435,17 @@ def check_packed_split_specialization():
     declined = make_gemm_a16w16_param_and_validate(
         127, 3584, 7168, {**cfg, "packed_split": True}
     )
-    assert not make_gemm_a16w16_gfx950_kernel_name(declined).endswith("_ps2r4_ptr")
+    assert not make_gemm_a16w16_gfx950_kernel_name(declined).endswith(
+        "_ps2r4_grid4_ptr"
+    )
     assert cfg == original
+    # The exact packed launch has 224 tasks, covering every (split, M, N)
+    # tile once. No counter/shared scratch lifetime depends on launch order.
+    tasks = set()
+    for pid in range(224):
+        mapped = pid % 4 * 56 + pid // 4
+        tasks.add((mapped % 2, mapped // 2 % 2, mapped // 4 % 56))
+    assert tasks == set(itertools.product(range(2), range(2), range(56)))
     aiter.logger.info("Packed split shape/config/cache specialization checks passed")
 
 
