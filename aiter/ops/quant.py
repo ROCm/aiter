@@ -15,6 +15,7 @@ from aiter.jit.utils.torch_guard import torch_compile_guard
 
 from ..jit.core import compile_ops
 from ..jit.utils.chip_info import get_cu_num, get_gfx
+from ..plugin import route as _route
 from ..utility import dtypes, fp4_utils
 from ..utility import mx_types as _mx_types
 from ..utility.mx_types import (
@@ -61,6 +62,7 @@ def get_dtype_max(dtype):
     return dtypeMax
 
 
+@_route(op="pertoken_quant", version=1)
 def pertoken_quant(
     x,
     scale=None,
@@ -69,6 +71,35 @@ def pertoken_quant(
     quant_dtype=dtypes.i8,
     dtypeMax=None,
 ):
+    """Symmetric per-token quantization: one scale per row of ``x``.
+
+    The reduction is over the LAST axis, so "token" means a row however many
+    leading axes ``x`` has -- ``per_block_quant_wrapper`` relies on that,
+    reshaping ``[m, n]`` to ``[-1, blk_n]`` and calling this to get
+    ``per_1x128`` and friends out of the same body.
+
+    Args:
+        x: input of any shape; quantized along the last axis.
+        scale: a precomputed per-token scale ``[..., 1]``. Given, it is used
+            as-is and nothing is reduced -- a caller that already knows the
+            scale (static quant, or a scale shared across a step) skips the
+            amax pass. ``None`` derives it from ``x``.
+        x_scale: optional smoothquant scale multiplied into ``x`` BEFORE the
+            amax. Not the output scale, and not a second name for ``scale``.
+        scale_dtype: dtype the returned scale is cast to.
+        quant_dtype: output dtype; also fixes ``dtypeMax`` when that is None.
+        dtypeMax: the magnitude ``quant_dtype`` is scaled to. Pass it to
+            quantize against a bound other than the dtype's own maximum.
+
+    Returns:
+        ``(y, y_scale)`` -- a new ``quant_dtype`` tensor shaped like ``x``,
+        and the ``scale_dtype`` scale of shape ``[..., 1]``. Nothing is
+        written in place.
+
+    A row whose amax is zero would give a zero scale and a division by it, so
+    that scale is forced to 1: an all-zero row quantizes to zeros rather than
+    to NaN.
+    """
     x = x.to(dtypes.fp32)
     if x_scale is None:
         hidden_states = x
@@ -518,6 +549,7 @@ def per_1x32_mx_quant_hip(
     num_rows_factor=1,
     scale_type=None,
     scale_layout_m32k4: bool = False,
+    hadamard_rotate=False,
 ):
     """1x32 per-group MX dynamic quant (HIP).
 
@@ -543,16 +575,27 @@ def per_1x32_mx_quant_hip(
     pad rows 0x7F, ``shuffle`` ignored, ``n % 128 == 0``. fp8 output takes this
     layout through ``per_group_quant_hip(scale_layout_m32k4=True)``.
 
+    ``hadamard_rotate=True`` (fp4x2 only) quantizes ``x`` rotated per group,
+    i.e. ``x.view(m, n // 32, 32) @ (scipy.linalg.hadamard(32) / sqrt(32))``
+    computed in fp32 and rounded to ``x.dtype``. The rotation is orthogonal, so
+    a weight rotated the same way gives ``(x H)(w H)^T = x w^T``.
+
     The legacy ``per_1x32_f4_quant_hip`` is kept as a thin wrapper for
     backward compatibility.
     """
     m, n = x.shape
     assert n % 32 == 0, f"n={n} must be divisible by 32"
+    assert (
+        not hadamard_rotate or quant_dtype == dtypes.fp4x2
+    ), "hadamard_rotate is fp4x2-only"
     device = x.device
     if scale_layout_m32k4:
         assert (
             quant_dtype == dtypes.fp4x2 and num_rows is None and scale is None
         ), "scale_layout_m32k4 here needs fp4x2 output, no num_rows and no static scale"
+        assert (
+            not hadamard_rotate
+        ), "hadamard_rotate does not support scale_layout_m32k4"
         scale = torch.empty(
             ((m + 31) // 32 * 32, n // 32), dtype=torch.uint8, device=device
         ).view(dtypes.fp8_e8m0)
@@ -638,6 +681,7 @@ def per_1x32_mx_quant_hip(
         shuffle_scale=shuffle,
         num_rows=num_rows,
         num_rows_factor=num_rows_factor,
+        hadamard_rotate=hadamard_rotate,
     )
     return y, scale
 
@@ -649,6 +693,7 @@ def per_1x32_f4_quant_hip(
     shuffle=False,
     num_rows: torch.Tensor | None = None,
     num_rows_factor=1,
+    hadamard_rotate=False,
 ):
     """Backward-compat fp4-only wrapper around :func:`per_1x32_mx_quant_hip`.
 
@@ -667,6 +712,7 @@ def per_1x32_f4_quant_hip(
         shuffle=shuffle,
         num_rows=num_rows,
         num_rows_factor=num_rows_factor,
+        hadamard_rotate=hadamard_rotate,
     )
 
 
@@ -820,6 +866,7 @@ def dynamic_per_group_scaled_quant(
     num_rows: torch.Tensor | None = None,
     num_rows_factor: int = 1,
     scale_layout_m32k4: bool = False,
+    hadamard_rotate: bool = False,
 ) -> None:
     """Dtype-aware per-group dynamic quant.
 
@@ -835,6 +882,10 @@ def dynamic_per_group_scaled_quant(
     (``(rows, scaleN) -> (scaleN, rows)`` byte layout) for other group
     sizes.
 
+    For MXFP8 (fp8 output, e8m0 scales), NaN elements stay NaN and do not
+    affect the scale. A group holding an Inf gets scale 2^127 (0xFE): its Inf
+    becomes an FP8 NaN and its finite elements are scaled as usual.
+
     Only ``group_size`` in {32, 64, 128} is supported.
 
     ``scale_layout_m32k4=True`` (fp8 or fp4x2 output, e8m0 scale, ``group_size == 32``)
@@ -842,6 +893,10 @@ def dynamic_per_group_scaled_quant(
     i.e. the bytes of :func:`aiter.ops.shuffle.shuffle_mxfp8fp4_scale`:
     ``scales`` must hold ``(pad32(M), K // 32)`` bytes, the pad rows are written
     as 0x7F, and ``shuffle_scale`` is ignored.
+
+    ``hadamard_rotate=True`` (fp4x2 output, ``group_size == 32``) rotates each
+    group by the normalized 32-point Sylvester Hadamard matrix before
+    quantizing it; see :func:`per_1x32_mx_quant_hip`.
     """
 
 
@@ -1378,7 +1433,7 @@ def _rope_rotate_activation_fp4quant(
     positions: torch.Tensor,
     rope_dim: int,
     group_size: int = 32,
-    shuffle_scale: bool = True,
+    scale_layout: str = "none",
     do_rotate_act: bool = True,
     round_rope: bool = False,
 ) -> None:
@@ -1428,17 +1483,24 @@ def rope_rotate_activation(
     rope_dim: int,
     out_scale: torch.Tensor | None = None,
     group_size: int | None = None,
-    shuffle_scale: bool = True,
+    scale_layout: str | bool | None = None,
     do_rotate_act: bool = True,
     round_rope: bool = False,
+    *,
+    shuffle_scale: bool | None = None,
 ) -> None:
     """Apply GPT-J style (interleaved) RoPE to trailing ``rope_dim``, then
     Hadamard-rotate, dispatching on ``out.dtype``:
 
     - bf16/fp16 ``out``: plain rope+hadamard in place (``scale`` ignored).
     - ``fp4x2`` ``out``: FP4-quantize into packed ``out`` + e8m0 ``scale``
-      (``scale`` required; ``group_size`` defaults to 32). ``shuffle_scale``
-      selects the dsv4 preshuffled scale layout.
+      (``scale`` required; ``group_size`` defaults to 32). ``scale_layout``
+      selects ``"none"`` (natural rows), ``"flydsl"`` (dsv4 preshuffle), or
+      ``"opus"`` (gfx950 scales [T, 2, 32, H/16], requiring H=32 or 64,
+      D=128, group_size=32). Omitting it preserves the legacy FlyDSL layout.
+      The legacy ``shuffle_scale`` keyword and positional bool are accepted:
+      True selects ``"flydsl"``, False selects ``"none"``. Do not supply both
+      ``scale_layout`` and ``shuffle_scale``.
     - ``fp8`` ``out``: per-(row, 1xGROUP) fp8-quantize into ``out`` + fp32
       ``scale`` (``scale`` required; ``group_size`` defaults to 128).
 
@@ -1449,6 +1511,20 @@ def rope_rotate_activation(
     """
     if out.dtype == dtypes.fp4x2:
         assert out_scale is not None, "fp4 rope_rotate_activation requires `out_scale`"
+        if shuffle_scale is not None:
+            if scale_layout is not None:
+                raise ValueError("pass only one of scale_layout and shuffle_scale")
+            if not isinstance(shuffle_scale, bool):
+                raise TypeError("shuffle_scale must be a bool")
+            scale_layout = shuffle_scale
+        if scale_layout is None:
+            scale_layout = "flydsl"
+        elif isinstance(scale_layout, bool):
+            scale_layout = "flydsl" if scale_layout else "none"
+        if scale_layout not in ("none", "flydsl", "opus"):
+            raise ValueError(
+                f"scale_layout must be none|flydsl|opus, got {scale_layout!r}"
+            )
         _rope_rotate_activation_fp4quant(
             out,
             out_scale,
@@ -1458,7 +1534,7 @@ def rope_rotate_activation(
             positions,
             rope_dim,
             group_size=32 if group_size is None else group_size,
-            shuffle_scale=shuffle_scale,
+            scale_layout=scale_layout,
             do_rotate_act=do_rotate_act,
             round_rope=round_rope,
         )

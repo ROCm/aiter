@@ -12,6 +12,7 @@ import torch
 import aiter
 from aiter import dtypes
 from aiter.jit.utils.chip_info import get_gfx
+from aiter.ops.attention import get_mla_decode_shape_support
 from aiter.test_common import benchmark, checkAllclose, run_perftest
 
 torch.set_default_device("cuda")
@@ -53,6 +54,13 @@ MLA_V12_DEFAULT_CHUNK = 4096
 
 # Every card the MLA metadata planner is built and validated for.
 SUPPORTED_GFX = ["gfx942", "gfx950"]
+
+# Non-uniform batches (uni_seqlen_qo=-1). gfx942 has no bf16 persistent kernel
+# for 96 heads, so the planner folds each request into 96 / 16 pseudo-batches
+# while qo_indptr keeps one entry per request. A trailing 0 is a CUDA-graph
+# padding row; 7 decode tokens plus one is the Kimi-K3 TP8/DCP8 tail shape.
+DEFAULT_QO_LENS = [(1, 1, 1, 1, 1, 1, 1, 0), (2, 1, 3), (2, 2, 2, 0), (4, 4, 4, 0)]
+DEFAULT_QO_NHEADS = [16, 96]
 
 
 def kimi_nhead(tp: int) -> int:
@@ -113,6 +121,8 @@ def build_decode_inputs(batch_size, ctx_len, dtype, kvtype, nhead, *, jitter, se
         "kv_indptr": kv_indptr,
         "kv_last_page_lens": kv_last_page_lens,
         "nhead": nhead,
+        "max_seqlen_qo": MAX_SEQLEN_QO,
+        "uni_seqlen_qo": UNI_SEQLEN_QO,
     }
     out_meta = {
         "work_meta_data": (work_meta_data_size, work_meta_data_type),
@@ -149,8 +159,8 @@ def call_metadata(inputs, outs, dtype, kvtype):
         outs["reduce_partial_map"],
         page_size=PAGE_SIZE,
         kv_granularity=KV_GRANULARITY,
-        max_seqlen_qo=MAX_SEQLEN_QO,
-        uni_seqlen_qo=UNI_SEQLEN_QO,
+        max_seqlen_qo=inputs["max_seqlen_qo"],
+        uni_seqlen_qo=inputs["uni_seqlen_qo"],
         fast_mode=True,
         max_split_per_batch=MAX_SPLIT_PER_BATCH,
         dtype_q_nope=dtype,
@@ -243,6 +253,45 @@ def compare_metadata(golden, test):
     return ok, details, num_works, num_groups, num_partial
 
 
+def planner_nbytes(golden, batch_size, num_works, num_groups, num_partial):
+    # The planner does no floating-point at all, so TFLOPS would be a column of
+    # zeros. Bytes are the metric that means something here: it reads three
+    # per-batch indptrs and writes the work/reduce descriptors, and the GB/s
+    # column against a card that does TB/s is the whole diagnosis -- this kernel
+    # is bound by a single-lane scan, not by traffic.
+    wis = golden["work_info_set"]
+    work_bytes = wis.element_size() * (wis[0].numel() if wis.dim() > 1 else 1)
+    return (
+        3 * (batch_size + 1) * 4  # qo_indptr, kv_indptr, kv_last_page_lens
+        + num_works * work_bytes  # work_info_set
+        + (batch_size + 1) * 4  # reduce_indptr
+        + num_groups * 2 * 4  # reduce_final_map, split tiles only
+        + num_partial * 4  # reduce_partial_map, one entry per partial fragment
+    )
+
+
+def time_planners(inputs, out_meta, dtype, kvtype, num_iters, nbytes, ret):
+    """Time both planners into ``ret`` and return their us by name."""
+    # The serial planner is both the reference and a kernel under test: it is
+    # what runs today whenever the parallel path bails out, so it is timed.
+    candidates = {"serial": "0", "parallel": "1"}
+    us = {}
+    for name, env in candidates.items():
+        os.environ[_PARALLEL_ENV] = env
+        _, us[name] = run_perftest(
+            call_metadata,
+            inputs,
+            alloc_outputs(out_meta),
+            dtype,
+            kvtype,
+            num_iters=num_iters,
+        )
+        ret[f"{name} us"] = round(us[name], 3)
+        ret[f"{name} GB/s"] = round(nbytes / us[name] / 1e3, 2)
+    os.environ.pop(_PARALLEL_ENV, None)
+    return us
+
+
 @benchmark()
 def test_metadata(
     batch_size, ctx_len, dtype, kvtype, nhead, jitter, seed, num_iters, batch_chunk=0
@@ -264,24 +313,7 @@ def test_metadata(
     if not ok:
         print(f"  [MISMATCH] bs={batch_size} ctx={ctx_len} nhead={nhead}: {mism}")
 
-    # The planner does no floating-point at all, so TFLOPS would be a column of
-    # zeros. Bytes are the metric that means something here: it reads three
-    # per-batch indptrs and writes the work/reduce descriptors, and the GB/s
-    # column against a card that does TB/s is the whole diagnosis -- this kernel
-    # is bound by a single-lane scan, not by traffic.
-    wis = golden["work_info_set"]
-    work_bytes = wis.element_size() * (wis[0].numel() if wis.dim() > 1 else 1)
-    nbytes = (
-        3 * (batch_size + 1) * 4  # qo_indptr, kv_indptr, kv_last_page_lens
-        + num_works * work_bytes  # work_info_set
-        + (batch_size + 1) * 4  # reduce_indptr
-        + num_groups * 2 * 4  # reduce_final_map, split tiles only
-        + num_partial * 4  # reduce_partial_map, one entry per partial fragment
-    )
-
-    # The serial planner is both the reference and a kernel under test: it is
-    # what runs today whenever the parallel path bails out, so it is timed.
-    candidates = {"serial": "0", "parallel": "1"}
+    nbytes = planner_nbytes(golden, batch_size, num_works, num_groups, num_partial)
 
     ret = {
         "gfx": get_gfx(),
@@ -289,20 +321,7 @@ def test_metadata(
         "num_works": num_works,
         "num_split_groups": num_groups,
     }
-    us = {}
-    for name, env in candidates.items():
-        os.environ[_PARALLEL_ENV] = env
-        _, us[name] = run_perftest(
-            call_metadata,
-            inputs,
-            alloc_outputs(out_meta),
-            dtype,
-            kvtype,
-            num_iters=num_iters,
-        )
-        ret[f"{name} us"] = round(us[name], 3)
-        ret[f"{name} GB/s"] = round(nbytes / us[name] / 1e3, 2)
-    os.environ.pop(_PARALLEL_ENV, None)
+    us = time_planners(inputs, out_meta, dtype, kvtype, num_iters, nbytes, ret)
 
     # Only the parallel path can diverge; serial is the reference it is checked
     # against, so its err is 0 by construction and would be a noise column.
@@ -311,6 +330,142 @@ def test_metadata(
     ret["speedup"] = (
         round(us["serial"] / us["parallel"], 3) if us["parallel"] else float("nan")
     )
+    return ret
+
+
+def bf16_fold_ratio(nhead):
+    """Host mirror of the bf16 head fold in get_mla_metadata_v1_2_device."""
+    if get_gfx() == "gfx942" and nhead != 16:
+        return nhead // 16
+    return 1
+
+
+def build_nonuniform_inputs(qo_lens, nhead, dtype, kvtype):
+    kv_lens = [0 if qo_len == 0 else 32 + 16 * i for i, qo_len in enumerate(qo_lens)]
+    qo_indptr = torch.zeros(len(qo_lens) + 1, dtype=torch.int32, device="cuda")
+    qo_indptr[1:] = torch.tensor(qo_lens, dtype=torch.int32, device="cuda").cumsum(0)
+    kv_indptr = torch.zeros(len(qo_lens) + 1, dtype=torch.int32, device="cuda")
+    kv_indptr[1:] = torch.tensor(kv_lens, dtype=torch.int32, device="cuda").cumsum(0)
+
+    names = (
+        "work_meta_data",
+        "work_indptr",
+        "work_info_set",
+        "reduce_indptr",
+        "reduce_final_map",
+        "reduce_partial_map",
+    )
+    info = aiter.get_mla_metadata_info_v1(
+        len(qo_lens),
+        max(qo_lens),
+        nhead,
+        dtype,
+        kvtype,
+        is_sparse=False,
+        fast_mode=True,
+    )
+    inputs = {
+        "qo_indptr": qo_indptr,
+        "kv_indptr": kv_indptr,
+        "kv_last_page_lens": torch.ones(len(qo_lens), dtype=torch.int32, device="cuda"),
+        "nhead": nhead,
+        "max_seqlen_qo": max(qo_lens),
+        "uni_seqlen_qo": -1,
+    }
+    return inputs, dict(zip(names, info))
+
+
+def folded_qo_range_errors(outs, qo_lens, ratio):
+    """
+    Check every work's [qo_start, qo_end) against the folded Q layout, where
+    pseudo-batch ``b * ratio + g`` owns rows ``(indptr[b] * ratio + g * len_b)``
+    onward. Each non-empty pseudo-batch must be covered exactly, and no range
+    may run past the folded Q tensor.
+    """
+    begins = [0]
+    for qo_len in qo_lens:
+        begins.append(begins[-1] + qo_len)
+    spans = [
+        (begins[b] * ratio + g * qo_len, begins[b] * ratio + (g + 1) * qo_len)
+        for b, qo_len in enumerate(qo_lens)
+        for g in range(ratio)
+    ]
+    total_rows = begins[-1] * ratio
+    pieces = {span: [] for span in spans if span[1] > span[0]}
+
+    num_works = int(outs["work_indptr"][-1].item())
+    work_info = outs["work_info_set"].view(-1, 8)
+    if not 0 < num_works <= work_info.shape[0]:
+        return [f"{num_works} works for a {work_info.shape[0]}-entry work_info_set"]
+
+    errors = []
+    for row in work_info[:num_works].tolist():
+        qo_start, qo_end = row[2], row[3]
+        if not 0 <= qo_start <= qo_end <= total_rows:
+            errors.append(f"[{qo_start}, {qo_end}) is outside {total_rows} Q rows")
+            continue
+        if qo_start == qo_end:
+            continue
+        owners = [s for s in pieces if s[0] <= qo_start and qo_end <= s[1]]
+        if len(owners) != 1:
+            errors.append(f"[{qo_start}, {qo_end}) spans pseudo-batches {owners}")
+            continue
+        pieces[owners[0]].append((qo_start, qo_end))
+
+    for span, covered in pieces.items():
+        merged = []
+        for start, end in sorted(covered):
+            if merged and start <= merged[-1][1]:
+                merged[-1] = (merged[-1][0], max(merged[-1][1], end))
+            else:
+                merged.append((start, end))
+        if merged != [span]:
+            errors.append(f"pseudo-batch {span} covered by {merged}")
+    return errors
+
+
+def nonempty_works(outs):
+    num_works = int(outs["work_indptr"][-1].item())
+    works = outs["work_info_set"].view(-1, 8)[:num_works]
+    return works[works[:, 3] > works[:, 2]]
+
+
+@benchmark()
+def test_nonuniform_metadata(qo_lens, nhead, dtype, kvtype, num_iters):
+    inputs, out_meta = build_nonuniform_inputs(qo_lens, nhead, dtype, kvtype)
+
+    golden = run_path(inputs, out_meta, dtype, kvtype, use_parallel=False)
+    parallel = run_path(inputs, out_meta, dtype, kvtype, use_parallel=True)
+    _, mism, num_works, num_groups, num_partial = compare_metadata(golden, parallel)
+    # The serial planner gives an empty request one zero-length work and the
+    # parallel planner skips it, so only the works that carry queries must agree.
+    del mism["work_indptr"]
+    works_g, works_p = nonempty_works(golden), nonempty_works(parallel)
+    mism["work_info_set"] = (
+        checkAllclose(works_g, works_p, rtol=0, atol=0, tol_err_ratio=0, printLog=False)
+        if works_g.shape == works_p.shape
+        else 1.0
+    )
+    ok = all(v == 0 for v in mism.values())
+    ratio = bf16_fold_ratio(nhead)
+    errors = folded_qo_range_errors(golden, qo_lens, ratio)
+
+    if not ok:
+        print(f"  [MISMATCH] qo_lens={qo_lens} nhead={nhead}: {mism}")
+    for error in errors:
+        print(f"  [QO RANGE] qo_lens={qo_lens} nhead={nhead}: {error}")
+
+    nbytes = planner_nbytes(golden, len(qo_lens), num_works, num_groups, num_partial)
+    ret = {
+        "gfx": get_gfx(),
+        "fold": ratio,
+        "num_works": num_works,
+        "num_split_groups": num_groups,
+    }
+    time_planners(inputs, out_meta, dtype, kvtype, num_iters, nbytes, ret)
+    ret["parallel err"] = max(mism.values()) if mism else 0
+    ret["qo range err"] = len(errors)
+    ret["match"] = ok and not errors
     return ret
 
 
@@ -411,6 +566,82 @@ def test_intra_batch_kv_coverage():
     )
 
 
+def plan_mtp_decode(qlens, kv_lens, nhead, dtype, uni_seqlen_qo, cp_rr):
+    """fast_mode plan for a decode batch with qlens[b] query tokens per request."""
+    batch_size, max_qlen = len(qlens), max(qlens)
+    qo_indptr = torch.tensor([0, *itertools.accumulate(qlens)], dtype=torch.int32)
+    kv_indptr = torch.tensor([0, *itertools.accumulate(kv_lens)], dtype=torch.int32)
+    info = aiter.get_mla_metadata_info_v1(
+        batch_size, max_qlen, nhead, dtype, dtype, is_sparse=False, fast_mode=True
+    )
+    names = ("work_meta_data", "work_indptr", "work_info_set")
+    names += ("reduce_indptr", "reduce_final_map", "reduce_partial_map")
+    outs = {name: torch.zeros(size, dtype=t) for name, (size, t) in zip(names, info)}
+    aiter.get_mla_metadata_v1(
+        qo_indptr,
+        kv_indptr,
+        torch.ones(batch_size, dtype=torch.int32),
+        nhead // KIMI_NHEAD_KV,
+        KIMI_NHEAD_KV,
+        IS_CAUSAL,
+        outs["work_meta_data"],
+        outs["work_info_set"],
+        outs["work_indptr"],
+        outs["reduce_indptr"],
+        outs["reduce_final_map"],
+        outs["reduce_partial_map"],
+        page_size=PAGE_SIZE,
+        kv_granularity=KV_GRANULARITY,
+        max_seqlen_qo=max_qlen,
+        uni_seqlen_qo=uni_seqlen_qo,
+        fast_mode=True,
+        max_split_per_batch=-1,
+        is_cp_round_robin=cp_rr,
+        dtype_q_nope=dtype,
+        dtype_kv_nope=dtype,
+    )
+    torch.cuda.synchronize()
+    # work_meta_data holds the buffers' addresses, which differ between calls.
+    outs.pop("work_meta_data")
+    return outs
+
+
+def check_varlen_qo_matches_uniform():
+    """uni_seqlen_qo=-1 on a batch whose query lengths are all equal must plan
+    exactly what uni_seqlen_qo=qlen plans: the varlen path only reads the same
+    lengths from qo_indptr instead of the constant.
+
+    Returns the number of shapes compared and the ones whose plans differ.
+    """
+    ran, bad = 0, []
+    for nhead, dtype, qlen, batch_size, cp_rr in itertools.product(
+        (96, 128), (dtypes.fp8, dtypes.bf16), (3, 5, 6), (1, 8, 33, 128), (0, 1)
+    ):
+        s = get_mla_decode_shape_support(nhead, qlen, dtype, dtype)
+        if not (s.natively_supported and s.native and s.kernel_num_heads == nhead):
+            continue
+        rng = random.Random(batch_size)
+        kv_lens = [rng.randint(64, 16384) for _ in range(batch_size)]
+        qlens = [qlen] * batch_size
+        uniform = plan_mtp_decode(qlens, kv_lens, nhead, dtype, qlen, bool(cp_rr))
+        varlen = plan_mtp_decode(qlens, kv_lens, nhead, dtype, -1, bool(cp_rr))
+        ran += 1
+        if any(not torch.equal(uniform[k], varlen[k]) for k in uniform):
+            bad.append((nhead, str(dtype), qlen, batch_size, cp_rr))
+    return ran, bad
+
+
+def test_varlen_qo_matches_uniform():
+    if get_gfx() not in SUPPORTED_GFX:
+        return
+    ran, bad = check_varlen_qo_matches_uniform()
+    assert ran, "no native multi-token decode shape on this card"
+    assert not bad, (
+        f"uni_seqlen_qo=-1 plans differ from uni_seqlen_qo=qlen for "
+        f"(nhead, dtype, qlen, batch, cp_rr) in {bad}"
+    )
+
+
 def main():
     if get_gfx() not in SUPPORTED_GFX:
         aiter.logger.warning(
@@ -466,6 +697,22 @@ def main():
         help="Planner chunk ceilings to sweep; 0 leaves the built-in one. A value\n"
         "below it forces the runtime-chunk kernel, which is what gfx942 runs.",
     )
+    parser.add_argument(
+        "-q",
+        "--qo-lens",
+        type=dtypes.str2tuple,
+        nargs="*",
+        default=DEFAULT_QO_LENS,
+        help="Per-request query lengths for the non-uniform bf16 sweep.\n"
+        "e.g.: -q 2,1,3 4,4,4,0",
+    )
+    parser.add_argument(
+        "--qo-nhead",
+        type=int,
+        nargs="*",
+        default=DEFAULT_QO_NHEADS,
+        help="q-heads for the non-uniform bf16 sweep (96 folds on gfx942).",
+    )
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--num-iters", type=int, default=101)
     args = parser.parse_args()
@@ -507,13 +754,30 @@ def main():
         "mla metadata planner summary (markdown):\n%s", df.to_markdown(index=False)
     )
 
+    # The fold is a bf16 decision on gfx942, so this sweep pins bf16.
+    nonuniform_rows = [
+        test_nonuniform_metadata(
+            qo_lens, qo_nhead, dtypes.bf16, dtypes.bf16, args.num_iters
+        )
+        for qo_nhead, qo_lens in itertools.product(args.qo_nhead, args.qo_lens)
+    ]
+    if nonuniform_rows:
+        aiter.logger.info(
+            "mla metadata non-uniform qo summary (markdown):\n%s",
+            pd.DataFrame(nonuniform_rows).to_markdown(index=False),
+        )
+
     assert rows, (
         "the sweep ran no shapes -- an empty axis would otherwise report a pass "
         "without comparing anything"
     )
     assert all_match, "parallel MLA metadata planner diverged from serial reference"
+    assert all(
+        row["match"] for row in nonuniform_rows
+    ), "non-uniform MLA metadata left the folded Q layout or diverged across planners"
 
     test_intra_batch_kv_coverage()
+    test_varlen_qo_matches_uniform()
 
 
 if __name__ == "__main__":

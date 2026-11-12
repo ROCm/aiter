@@ -4,6 +4,7 @@
 import math
 
 from aiter.jit.core import compile_ops
+from aiter.jit.utils.chip_info import get_cu_num
 
 
 @compile_ops(
@@ -32,6 +33,11 @@ def _score_decode_raw(
     head_dim: int,
     num_idx_heads: int,
     num_waves: int,
+    kv_fmt: int,
+    page_stride: int,
+    q_tiles: int,
+    req_xor_mask: int,
+    fill_shift: int,
 ) -> None: ...
 
 
@@ -61,6 +67,39 @@ def _score_prefill_raw(
     num_idx_heads: int,
     num_waves: int,
     q_tiles: int,
+) -> None: ...
+
+
+@compile_ops(
+    "module_msa_sparse_attention",
+    fc_name="pa_sparse_block_score_prefill_nvfp4",
+    ffi_type="ctypes",
+)
+def _score_prefill_nvfp4_raw(
+    q_idx: int,
+    key_cache_idx: int,
+    score: int,
+    block_table: int,
+    cu_seqlens_q: int,
+    seq_lens: int,
+    num_reqs: int,
+    num_q_groups: int,
+    block_table_stride: int,
+    score_head_stride: int,
+    score_num_stride: int,
+    num_chunks: int,
+    chunk_blocks: int,
+    init_blocks: int,
+    local_blocks: int,
+    page_stride: int,
+    num_idx_heads: int,
+    wave_tiles: int,
+    store_pages: int,
+    group_xor: int,
+    req_rot: int,
+    xcds: int,
+    req_chunks: int,
+    grid_chunks: int,
 ) -> None: ...
 
 
@@ -161,8 +200,19 @@ SCORE_MAX_WORKGROUPS = 16384
 # Only consulted on a partitioned block axis; see _score_split.
 SCORE_MIN_WORKGROUPS = 2048
 
+# nvfp4 decode grid: at most this many workgroups, unless that leaves a
+# workgroup more than _SCORE_DECODE_MAX_WG_BLOCKS blocks of the bound.
+_SCORE_DECODE_MAX_WORKGROUPS = 4096
+_SCORE_DECODE_MAX_WG_BLOCKS = 16
+
+# fill_shift that keeps the bound's split (see _decode_fill_shift).
+_DECODE_FILL_OFF = 31
+
 # Columns of the MFMA, each holding one (token, head) pair.
 SCORE_MFMA_COLS = 16
+
+# Query tiles one nvfp4 decode wave scores per read of the keys.
+_SCORE_DECODE_MAX_Q_TILES = 2
 
 # Ceiling on the pages one chunk of the ragged kernel's block axis covers. Only a
 # ceiling: the size itself is derived below, since a fixed 16 collapses the grid
@@ -180,6 +230,53 @@ SCORE_PREFILL_GROUPS_PER_BLOCK = 64
 SCORE_MAX_Q_TILES = 4
 
 SCORE_PREFILL_MAX_Q_TILES = 4
+
+# Index key formats (kKvFp8 / kKvNvfp4). A uint8 key cache holds nvfp4 pages.
+KV_FMT_FP8 = 0
+KV_FMT_NVFP4 = 1
+
+# Block size and head dim of nvfp4 pages.
+NVFP4_BLOCK_SIZE = 128
+NVFP4_HEAD_DIM = 128
+
+NVFP4_INDEX_HEADS = (1, 2, 4)
+
+# nvfp4 prefill plan (_score_prefill_nvfp4_plan). A workgroup uses 38 KiB of
+# LDS, so at most 4 fit on one CU.
+_NVFP4_PREFILL_TARGET_WG_PER_CU = 2.75
+_NVFP4_PREFILL_MAX_CHUNK_BLOCKS = 8
+_NVFP4_PREFILL_BATCH_WG_PER_CU = 32
+_NVFP4_PREFILL_BATCH_CHUNKS = 128
+_NVFP4_PREFILL_WIDE_MIN_KEYS = 32768
+_NVFP4_PREFILL_WIDE_MIN_WORK = 80 << 20
+_NVFP4_PREFILL_WIDE_MIN_BATCH_WORK = 480 << 20
+_NVFP4_PREFILL_NT2_MAX_WORK = 48 << 20
+_NVFP4_PREFILL_XOR_ROT_MIN_REQS = 3
+_NVFP4_PREFILL_XOR_ROT_MAX_QUERY_LEN = 8192
+# One request: the XCD order needs, per row of (max query groups,
+# min prefix / query len), a long enough prefix.
+_NVFP4_PREFILL_XCD_RULES = ((14, 4), (20, 8))
+
+
+def nvfp4_page_bytes(block_size: int, head_dim: int) -> int:
+    """Bytes of one nvfp4 page: packed e2m1 values, then one e4m3 scale per
+    16 values."""
+    return block_size * head_dim // 2 + block_size * head_dim // 16
+
+
+def _num_xcds() -> int:
+    # Imported here: aiter.ops.triton is not loaded at aiter import time.
+    from aiter.ops.triton.utils.device_info import get_num_xcds
+
+    return get_num_xcds()
+
+
+def _decode_q_tiles(num_tiles: int, num_reqs: int) -> int:
+    """Query tiles per nvfp4 decode wave. One request keeps one tile: the
+    longer wave costs more at short context than it saves at long context."""
+    if num_reqs < 2:
+        return 1
+    return min(_SCORE_DECODE_MAX_Q_TILES, num_tiles)
 
 
 def _pow2_floor(n: int) -> int:
@@ -258,6 +355,35 @@ def _score_split(max_blk: int, num_reqs: int, sharded: bool = False) -> tuple[in
     return max(1, min(chunks, SCORE_MAX_WORKGROUPS // max(1, num_reqs))), waves
 
 
+def _score_split_decode_nvfp4(
+    max_blk: int, num_reqs: int, sharded: bool = False
+) -> tuple[int, int]:
+    """_score_split capped at _SCORE_DECODE_MAX_WORKGROUPS workgroups, but at
+    most _SCORE_DECODE_MAX_WG_BLOCKS blocks of the bound per workgroup."""
+    chunks, waves = _score_split(max_blk, num_reqs, sharded)
+    cap = max(
+        _SCORE_DECODE_MAX_WORKGROUPS // max(1, num_reqs),
+        math.ceil(max_blk / _SCORE_DECODE_MAX_WG_BLOCKS),
+    )
+    return max(1, min(chunks, cap)), waves
+
+
+def _decode_fill_shift(num_reqs: int) -> int:
+    """log2(CUs per request), rounded up.
+
+    A short context gets one block per chunk from the bound-sized split, so
+    most waves idle. decode_prologue widens such chunks to nblk >> fill_shift
+    blocks, at most one per wave, which keeps about one workgroup per CU.
+    """
+    return (-(-get_cu_num() // max(1, num_reqs)) - 1).bit_length()
+
+
+def _decode_req_xor_mask(num_reqs: int) -> int:
+    """XOR mask of the request index (kDecodeReqXorShift). It spreads a long
+    request's chunks over the XCDs; mask + 1 divides num_reqs."""
+    return min(num_reqs & -num_reqs, _pow2_floor(_num_xcds())) - 1
+
+
 def _tokens_per_tile(num_idx_heads: int) -> int:
     """Query tokens one ragged-pass workgroup covers. The MFMA's columns hold one
     (token, head) pair each, so this is what the heads leave behind."""
@@ -306,33 +432,199 @@ def _score_split_prefill(max_blk: int, num_groups: int) -> tuple[int, int]:
     return max(1, math.ceil(max_blk / blocks)), blocks
 
 
+def _score_split_prefill_nvfp4(max_blk: int, num_groups: int) -> tuple[int, int]:
+    """Chunk count and size along the block axis for the nvfp4 prefill kernel:
+    the largest power-of-two chunk up to _NVFP4_PREFILL_MAX_CHUNK_BLOCKS that
+    keeps _prefill_nvfp4_target_workgroups() workgroups."""
+    target = _prefill_nvfp4_target_workgroups()
+    blocks = 1
+    while (
+        blocks < _NVFP4_PREFILL_MAX_CHUNK_BLOCKS
+        and num_groups * math.ceil(max_blk / (2 * blocks)) >= target
+    ):
+        blocks *= 2
+    cap = max(1, SCORE_MAX_WORKGROUPS // max(1, num_groups))
+    blocks = max(blocks, _pow2_ceil(math.ceil(max_blk / cap)))
+    return max(1, math.ceil(max_blk / blocks)), blocks
+
+
+def _prefill_nvfp4_group_rows(wave_tiles: int) -> int:
+    """Query rows of one nvfp4 prefill workgroup (kGroupTokens at H=1): 4 waves
+    of wave_tiles MFMA tiles."""
+    return SCORE_WAVES * SCORE_MFMA_COLS * wave_tiles
+
+
+def _prefill_nvfp4_target_workgroups() -> int:
+    return int(get_cu_num() * _NVFP4_PREFILL_TARGET_WG_PER_CU)
+
+
+def _prefill_nvfp4_req_chunks(num_groups: int) -> int:
+    """Chunks per request that reach the target workgroup count."""
+    return -(-_prefill_nvfp4_target_workgroups() // max(1, num_groups))
+
+
+def _prefill_nvfp4_grid_chunks(max_blk: int, num_groups: int, num_chunks: int) -> int:
+    """Block-axis grid size of the nvfp4 prefill kernel with several requests.
+
+    The kernel repeats the chunk rule on each request's own length, so a short
+    request takes at most 2 * (req_chunks - 1) smaller chunks. The grid is
+    capped at _NVFP4_PREFILL_BATCH_WG_PER_CU workgroups per CU, but keeps at
+    least _NVFP4_PREFILL_BATCH_CHUNKS chunks.
+    """
+    batch_wg = get_cu_num() * _NVFP4_PREFILL_BATCH_WG_PER_CU
+    cap = max(_NVFP4_PREFILL_BATCH_CHUNKS, batch_wg // max(1, num_groups))
+    small = 2 * (_prefill_nvfp4_req_chunks(num_groups) - 1)
+    return max(min(num_chunks, cap), min(max_blk, small))
+
+
+def _prefill_nvfp4_order(
+    num_reqs: int,
+    num_q_groups: int,
+    chunk_blocks: int,
+    max_blk: int,
+    max_query_len: int,
+    total_q: int,
+    wave_tiles: int,
+) -> tuple[int, int, int, int]:
+    """``(store_pages, group_xor, req_rot, xcds)`` of the nvfp4 prefill kernel
+    (see nvfp4_prefill_args).
+
+    When groups x requests is a multiple of the XCD count, the plain order puts
+    every chunk of a request on one XCD; the rotated and XOR orders spread them.
+    """
+    xcds = _num_xcds()
+    if num_reqs == 1:
+        if wave_tiles != 8:
+            return 1, 0, 0, 0
+        prefix = max_blk * NVFP4_BLOCK_SIZE - max_query_len
+        if any(
+            num_q_groups <= groups and prefix >= ratio * max_query_len
+            for groups, ratio in _NVFP4_PREFILL_XCD_RULES
+        ):
+            return 2, 0, 0, xcds
+        return (2 if chunk_blocks >= 2 else 1), 0, 0, 0
+    if (num_q_groups * num_reqs) % xcds:
+        return 1, 0, 0, 0
+    if total_q >= num_reqs * max_query_len:
+        return 1, 0, int(wave_tiles == 8), 0
+    xor_groups = min(num_q_groups & -num_q_groups, _pow2_floor(xcds))
+    if (
+        num_reqs >= _NVFP4_PREFILL_XOR_ROT_MIN_REQS
+        and max_query_len <= _NVFP4_PREFILL_XOR_ROT_MAX_QUERY_LEN
+        and (
+            (wave_tiles == 8 and xor_groups >= 2)
+            or (wave_tiles == 4 and xor_groups >= 4)
+        )
+    ):
+        return 1, xor_groups - 1, 1, 0
+    return 1, 0, 1, 0
+
+
+def _prefill_nvfp4_wave_tiles(
+    num_reqs: int, max_query_len: int, max_blk: int, total_q: int
+) -> int:
+    """Query tiles of 16 rows per wave of the nvfp4 prefill kernel: 8, 4 or 2.
+
+    8 tiles stage each page once for 512 rows and pay off only with long keys
+    and enough query rows; otherwise 2 tiles while the query fits one 2-tile
+    group or up to _NVFP4_PREFILL_NT2_MAX_WORK, and 4 above it.
+    """
+    keys = max_blk * NVFP4_BLOCK_SIZE
+    work = max_query_len * keys
+    short = max_query_len <= _prefill_nvfp4_group_rows(2)
+    if not short and keys >= _NVFP4_PREFILL_WIDE_MIN_KEYS:
+        if num_reqs == 1:
+            wide = work >= _NVFP4_PREFILL_WIDE_MIN_WORK
+        else:
+            groups = math.ceil(max_query_len / _prefill_nvfp4_group_rows(8))
+            wide = total_q >= num_reqs * max_query_len or (
+                (groups * num_reqs) % _num_xcds() == 0
+                and total_q * keys >= _NVFP4_PREFILL_WIDE_MIN_BATCH_WORK
+            )
+        if wide:
+            return 8
+    if short or work <= _NVFP4_PREFILL_NT2_MAX_WORK:
+        return 2
+    return 4
+
+
+def _score_prefill_nvfp4_plan(
+    num_reqs: int,
+    max_query_len: int,
+    max_blk: int,
+    total_q: int,
+    num_heads: int = 1,
+) -> tuple[int, int, int, int, tuple[int, int, int, int]]:
+    """``(wave_tiles, num_q_groups, num_chunks, chunk_blocks, order)`` of the
+    nvfp4 prefill kernel, order from _prefill_nvfp4_order. Each (token, head)
+    pair is one query row."""
+    max_query_len *= num_heads
+    total_q *= num_heads
+    wave_tiles = _prefill_nvfp4_wave_tiles(num_reqs, max_query_len, max_blk, total_q)
+    wave_tiles = max(wave_tiles, num_heads)
+    num_q_groups = math.ceil(max_query_len / _prefill_nvfp4_group_rows(wave_tiles))
+    num_chunks, chunk_blocks = _score_split_prefill_nvfp4(
+        max_blk, num_q_groups * num_reqs
+    )
+    order = _prefill_nvfp4_order(
+        num_reqs,
+        num_q_groups,
+        chunk_blocks,
+        max_blk,
+        max_query_len,
+        total_q,
+        wave_tiles,
+    )
+    return wave_tiles, num_q_groups, num_chunks, chunk_blocks, order
+
+
 def _check_score_tensors(q_idx, key_cache_idx, score):
     """Shared dtype/layout contract of both scoring passes.
 
-    Returns ``(total_q, num_idx_heads, head_dim, block_size)``.
+    fp8 keys are ``[num_pages, block_size, head_dim]`` in q's dtype. A uint8
+    key cache is ``[num_pages, >= page_bytes]``: one nvfp4 page of
+    NVFP4_BLOCK_SIZE tokens at the start of each row.
+
+    Returns ``(kv_fmt, total_q, num_idx_heads, head_dim, block_size,
+    page_stride)``.
     """
     import torch
 
-    if q_idx.dtype not in (torch.float8_e4m3fn, torch.float8_e4m3fnuz):
-        raise ValueError(f"q_idx must be fp8 e4m3, got {q_idx.dtype}")
-    if key_cache_idx.dtype != q_idx.dtype:
-        raise ValueError(
-            f"dtype mismatch: key_cache_idx={key_cache_idx.dtype}, q_idx={q_idx.dtype}"
-        )
+    total_q, num_idx_heads, head_dim = q_idx.shape
+    if key_cache_idx.dtype == torch.uint8:
+        kv_fmt, block_size = KV_FMT_NVFP4, NVFP4_BLOCK_SIZE
+        # Keys are decoded to OCP e4m3.
+        if q_idx.dtype != torch.float8_e4m3fn:
+            raise ValueError(f"nvfp4 keys need float8_e4m3fn q_idx, got {q_idx.dtype}")
+        if head_dim != NVFP4_HEAD_DIM:
+            raise ValueError(f"nvfp4 keys need head_dim {NVFP4_HEAD_DIM}")
+        page_stride = key_cache_idx.stride(0)
+        page_bytes = nvfp4_page_bytes(block_size, head_dim)
+        if key_cache_idx.dim() != 2 or key_cache_idx.size(1) < page_bytes:
+            raise ValueError(
+                f"nvfp4 key_cache_idx must be [num_pages, >= {page_bytes}], "
+                f"got {tuple(key_cache_idx.shape)}"
+            )
+    else:
+        kv_fmt, block_size, page_stride = KV_FMT_FP8, key_cache_idx.size(1), 0
+        if q_idx.dtype not in (torch.float8_e4m3fn, torch.float8_e4m3fnuz):
+            raise ValueError(f"q_idx must be fp8 e4m3, got {q_idx.dtype}")
+        if key_cache_idx.dtype != q_idx.dtype:
+            raise ValueError(
+                f"dtype mismatch: key_cache_idx={key_cache_idx.dtype}, "
+                f"q_idx={q_idx.dtype}"
+            )
+        if key_cache_idx.size(2) != head_dim:
+            raise ValueError("key_cache_idx head dim must match q_idx")
     if score.dtype != torch.float32:
         raise ValueError(f"score must be fp32, got {score.dtype}")
     if not (q_idx.is_contiguous() and key_cache_idx.is_contiguous()):
         raise ValueError("q_idx and key_cache_idx must be contiguous")
     if score.stride(2) != 1:
         raise ValueError("score must be contiguous along the block axis")
-
-    total_q, num_idx_heads, head_dim = q_idx.shape
-    block_size = key_cache_idx.size(1)
-    if key_cache_idx.size(2) != head_dim:
-        raise ValueError("key_cache_idx head dim must match q_idx")
     if score.size(0) != num_idx_heads or score.size(1) != total_q:
         raise ValueError("score must be [num_idx_heads, total_q, S]")
-    return total_q, num_idx_heads, head_dim, block_size
+    return kv_fmt, total_q, num_idx_heads, head_dim, block_size, page_stride
 
 
 def _launch_score_decode(
@@ -353,15 +645,20 @@ def _launch_score_decode(
     num_idx_heads: int,
     head_dim: int,
     block_size: int,
+    kv_fmt: int = KV_FMT_FP8,
+    page_stride: int = 0,
+    q_tiles: int = 1,
+    req_xor_mask: int = 0,
+    fill_shift: int = _DECODE_FILL_OFF,
 ):
     """Launch the uniform-row score kernel.
 
     Rows are laid out from ``query_len`` alone, so there is no ``cu_seqlens_q``
     to pass.
 
-    ``num_q_tiles`` counts the tiles the grid covers; the kernel folds one tile
-    per wave, so a grid sized for a different count would leave the tail of the
-    query axis unscored.
+    ``num_q_tiles`` counts the groups of ``q_tiles`` tiles the grid covers; the
+    kernel folds ``q_tiles`` tiles per wave, so a grid sized for a different
+    count would leave the tail of the query axis unscored.
     """
     _score_decode_raw(
         _ptr(q_idx),
@@ -384,6 +681,11 @@ def _launch_score_decode(
         head_dim,
         num_idx_heads,
         num_waves,
+        kv_fmt,
+        page_stride,
+        q_tiles,
+        req_xor_mask,
+        fill_shift,
     )
     return score
 
@@ -465,9 +767,13 @@ def pa_sparse_block_score_decode(
     LDS. ``pa_sparse_block_score_prefill`` computes the same scores without the
     length limit; this one is the faster path when the limit holds.
 
+    With nvfp4 keys a wave scores up to ``_SCORE_DECODE_MAX_Q_TILES`` tiles per
+    read of the keys, and longer rows add workgroups along the query axis.
+
     Args:
         q_idx: ``[num_reqs * query_len, num_idx_heads, head_dim]`` fp8 e4m3, contiguous.
-        key_cache_idx: ``[num_pages, block_size, head_dim]`` fp8 e4m3, contiguous.
+        key_cache_idx: ``[num_pages, block_size, head_dim]`` fp8 e4m3, contiguous,
+            or uint8 nvfp4 pages (see ``_check_score_tensors``).
         score: ``[num_idx_heads, num_reqs * query_len, S]`` fp32, written in place.
             Blocks past ``cdiv(seq_len, block_size)`` are left untouched, so
             pre-fill with ``-inf``. ``S`` indexes this rank's shard, so it spans
@@ -478,8 +784,8 @@ def pa_sparse_block_score_decode(
             selection via sentinel scores. Resolved against the global block id,
             so a shard holds whichever of them the round-robin gave it and
             nothing has to be re-forced after the scores are exchanged.
-        query_len: query tokens per request; ``num_idx_heads * query_len`` must
-            fit the MFMA's 16 columns.
+        query_len: query tokens per request; with fp8 keys
+            ``num_idx_heads * query_len`` must fit the MFMA's 16 columns.
         max_seq_len: upper bound on the context, required. The chunk and wave
             counts the grid is built from come from this and never from
             ``seq_lens``: reading the live lengths would move the grid between
@@ -495,15 +801,21 @@ def pa_sparse_block_score_decode(
             the scores a shard produces are the ones a whole-axis pass would
             have put in those positions.
     """
-    total_q, num_idx_heads, head_dim, block_size = _check_score_tensors(
-        q_idx, key_cache_idx, score
+    kv_fmt, total_q, num_idx_heads, head_dim, block_size, page_stride = (
+        _check_score_tensors(q_idx, key_cache_idx, score)
     )
     if total_q % query_len != 0:
         raise ValueError(
             f"q_idx rows {total_q} not a multiple of query_len {query_len}"
         )
     num_reqs = total_q // query_len
-    if num_idx_heads * query_len > SCORE_MFMA_COLS:
+    if kv_fmt == KV_FMT_NVFP4:
+        if num_idx_heads not in NVFP4_INDEX_HEADS:
+            raise ValueError(
+                f"nvfp4 is built for {NVFP4_INDEX_HEADS} index heads, "
+                f"got {num_idx_heads}"
+            )
+    elif num_idx_heads * query_len > SCORE_MFMA_COLS:
         raise ValueError(
             f"num_idx_heads * query_len = {num_idx_heads * query_len} exceeds the "
             f"{SCORE_MFMA_COLS} MFMA columns"
@@ -527,8 +839,15 @@ def pa_sparse_block_score_decode(
             f"score's block axis is {score.size(2)} but this rank's shard of "
             f"max_seq_len={max_seq_len} spans {local_blk} blocks"
         )
+    num_tiles = math.ceil(query_len / _tokens_per_tile(num_idx_heads))
+    split, q_tiles, req_xor_mask, fill_shift = _score_split, 1, 0, _DECODE_FILL_OFF
+    if kv_fmt == KV_FMT_NVFP4:
+        split = _score_split_decode_nvfp4
+        q_tiles = _decode_q_tiles(num_tiles, num_reqs)
+        req_xor_mask = _decode_req_xor_mask(num_reqs)
+        fill_shift = _decode_fill_shift(num_reqs)
     # The split divides this rank's own blocks, not the whole context's.
-    num_chunks, num_waves = _score_split(local_blk, num_reqs, sharded=world > 1)
+    num_chunks, num_waves = split(local_blk, num_reqs, sharded=world > 1)
 
     return _launch_score_decode(
         q_idx,
@@ -537,7 +856,7 @@ def pa_sparse_block_score_decode(
         block_table,
         seq_lens,
         num_reqs=num_reqs,
-        num_q_tiles=math.ceil(query_len / _tokens_per_tile(num_idx_heads)),
+        num_q_tiles=math.ceil(num_tiles / q_tiles),
         num_chunks=num_chunks,
         num_waves=num_waves,
         init_blocks=init_blocks,
@@ -548,6 +867,11 @@ def pa_sparse_block_score_decode(
         num_idx_heads=num_idx_heads,
         head_dim=head_dim,
         block_size=block_size,
+        kv_fmt=kv_fmt,
+        page_stride=page_stride,
+        q_tiles=q_tiles,
+        req_xor_mask=req_xor_mask,
+        fill_shift=fill_shift,
     )
 
 
@@ -577,9 +901,12 @@ def pa_sparse_block_score_prefill(
     ``q_tiles * num_waves`` tiles of tokens and stages the block range once for
     all of them rather than each wave reading it again.
 
+    nvfp4 keys go to pa_sparse_block_score_prefill_nvfp4.
+
     Args:
         q_idx: ``[total_q, num_idx_heads, head_dim]`` fp8 e4m3, contiguous.
-        key_cache_idx: ``[num_pages, block_size, head_dim]`` fp8 e4m3, contiguous.
+        key_cache_idx: ``[num_pages, block_size, head_dim]`` fp8 e4m3, contiguous,
+            or uint8 nvfp4 pages (see ``_check_score_tensors``).
         score: ``[num_idx_heads, total_q, S]`` fp32, written in place. Blocks a
             row cannot see are left untouched, so pre-fill with ``-inf`` unless
             the consumer bounds each row itself (``pa_sparse_block_topk`` does).
@@ -600,10 +927,16 @@ def pa_sparse_block_score_prefill(
             is safe and costs only what the grid ceiling in
             ``_score_split_prefill`` does not already trim.
     """
-    total_q, num_idx_heads, head_dim, block_size = _check_score_tensors(
-        q_idx, key_cache_idx, score
+    kv_fmt, total_q, num_idx_heads, head_dim, block_size, page_stride = (
+        _check_score_tensors(q_idx, key_cache_idx, score)
     )
-    if num_idx_heads > SCORE_MFMA_COLS:
+    if kv_fmt == KV_FMT_NVFP4:
+        if num_idx_heads not in NVFP4_INDEX_HEADS:
+            raise ValueError(
+                f"nvfp4 is built for {NVFP4_INDEX_HEADS} index heads, "
+                f"got {num_idx_heads}"
+            )
+    elif num_idx_heads > SCORE_MFMA_COLS:
         raise ValueError(
             f"num_idx_heads {num_idx_heads} exceeds the {SCORE_MFMA_COLS} MFMA columns"
         )
@@ -625,6 +958,47 @@ def pa_sparse_block_score_prefill(
             "pass max_seq_len so the block-axis split is fixed at capture "
             "rather than read from seq_lens"
         )
+
+    if kv_fmt == KV_FMT_NVFP4:
+        max_blk = math.ceil(max_seq_len / block_size)
+        wave_tiles, num_q_groups, num_chunks, chunk_blocks, order = (
+            _score_prefill_nvfp4_plan(
+                num_reqs, max_query_len, max_blk, total_q, num_idx_heads
+            )
+        )
+        store_pages, group_xor, req_rot, xcds = order
+        req_chunks, grid_chunks = 0, num_chunks
+        if num_reqs > 1:
+            groups = num_q_groups * num_reqs
+            req_chunks = _prefill_nvfp4_req_chunks(groups)
+            grid_chunks = _prefill_nvfp4_grid_chunks(max_blk, groups, num_chunks)
+        _score_prefill_nvfp4_raw(
+            _ptr(q_idx),
+            _ptr(key_cache_idx),
+            _ptr(score),
+            _ptr(block_table),
+            _ptr(cu_seqlens_q),
+            _ptr(seq_lens),
+            num_reqs,
+            num_q_groups,
+            block_table.stride(0),
+            score.stride(0),
+            score.stride(1),
+            num_chunks,
+            chunk_blocks,
+            init_blocks,
+            local_blocks,
+            page_stride,
+            num_idx_heads,
+            wave_tiles,
+            store_pages,
+            group_xor,
+            req_rot,
+            xcds,
+            req_chunks,
+            grid_chunks,
+        )
+        return score
 
     num_tiles = math.ceil(max_query_len / _tokens_per_tile(num_idx_heads))
     num_waves = SCORE_WAVES
