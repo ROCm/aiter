@@ -30,6 +30,7 @@ from dataclasses import dataclass, field, replace
 from functools import wraps
 from importlib import metadata
 from inspect import Parameter, Signature, signature
+from math import isfinite
 from threading import RLock
 from types import MappingProxyType
 from typing import Any, ParamSpec, Protocol, TypeVar, cast
@@ -70,7 +71,25 @@ class Op:
 
 @dataclass(frozen=True, slots=True)
 class KernelCandidate:
-    """An immutable identity and entry point for one provider kernel."""
+    """An immutable identity and entry point for one provider kernel.
+
+    ``latency_us`` is optional, self-reported, and answers one question:
+
+        for *this call*, how long does this kernel take, in microseconds?
+
+    It is not a tuning result for some other shape. AITER labels what it
+    records with the conditions of the call the candidate was offered for, so a
+    number measured elsewhere arrives wearing conditions it was never measured
+    under -- worse than no number, because it looks sourced. A provider with
+    nothing for the shape in front of it omits the field rather than
+    extrapolating; omission is how to say "I do not know", which is why zero, a
+    negative, ``inf`` and ``nan`` are refused rather than recorded.
+
+    It never influences routing. Preference is the enable list, which names an
+    owner for that decision; a number a provider picks for itself must not be
+    able to outrank it. AITER records it, hands it back, and does nothing else
+    with it.
+    """
 
     provider: str
     kernel_id: str
@@ -79,12 +98,25 @@ class KernelCandidate:
     # evidence reference, not that a provider must have one to serve.
     qualification: str | None = None
     run: Callable[..., Any] = field(repr=False, compare=False, default=None)
+    # Appended, never inserted: a provider may build this positionally, and
+    # anything before `run` would silently take its argument. See the docstring
+    # for what the number means -- that is where a provider author reads it.
+    latency_us: float | None = None
 
     def __post_init__(self) -> None:
         identity = (self.provider, self.kernel_id, self.artifact_digest)
         if not all(identity) or not callable(self.run):
             raise ValueError(
                 "candidate identity must be complete and run must be callable"
+            )
+        # Each of these looks like data and carries none, and would be recorded,
+        # handed back, and eventually compared against a real number.
+        if self.latency_us is not None and not (
+            isfinite(self.latency_us) and self.latency_us > 0
+        ):
+            raise ValueError(
+                f"latency_us must be a positive finite number of microseconds, "
+                f"or omitted entirely; got {self.latency_us!r}"
             )
 
 
@@ -97,7 +129,11 @@ class KernelProvider(Protocol):
     """
 
     name: str
-    op_versions: Mapping[str, Collection[int]]
+    # Either a mapping of op name to the contract versions served, or just the
+    # op names, which means whichever version is current. Most providers have
+    # nothing to say about versions and should not have to say it; the ones that
+    # span a contract change say so explicitly.
+    op_versions: Mapping[str, Collection[int]] | Collection[str]
 
     # Declare ``api_versions`` -- every provider API version this provider
     # supports -- so one wheel can cover several AITER releases. ``api_version``
@@ -129,6 +165,10 @@ class Decision:
     artifact_digest: str | None = None
     qualification: str | None = None
     config_source: str | None = None
+    # Appended for the same reason as on KernelCandidate. What the selected
+    # candidate reported, unchanged; None on a native route, where there is no
+    # candidate to report one.
+    latency_us: float | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -223,12 +263,22 @@ class Explanation:
 
 
 _routed_ops: dict[str, _RoutedOp] = {}
+# Ops routed by importing aiter belong to the process, not to whichever test
+# runs first; see _reset_for_testing.
+_imported_routes: dict[str, _RoutedOp] | None = None
 _decision_counts: Counter[tuple[str, str, str, str | None]] = Counter()
 _decision_callbacks: list[Callable[[Decision], None]] = []
 _silenced_callbacks: set[int] = set()
 _warned: set[tuple[Any, ...]] = set()
+# (id(run), op name) -> the run itself when it takes the contract, False when
+# it does not. Holding the callable keeps its id from being reused by another
+# object after a collection. See _accepts_contract.
+_checked_runs: dict[tuple[int, str], Any] = {}
+_PROBE = object()
 _callback_errors = 0
 _route_log: dict[str, tuple[int, tuple[str, str | None, str | None]]] = {}
+# What an op was doing before anything was recorded for it. See _log_route_change.
+_UNROUTED = ("native", None, None)
 _skipped_providers: tuple[_SkippedProvider, ...] = ()
 _provider_records: tuple[_ProviderRecord, ...] | None = None
 # Reentrant, and discovery runs outside it: both guard against a provider
@@ -247,8 +297,25 @@ _last_decision: ContextVar[Decision | None] = ContextVar(
 
 
 def last_decision() -> Decision | None:
-    """Return the last routing decision in the current execution context."""
+    """The last routing decision in this execution context, or ``None``.
 
+    ``None`` whenever no provider can serve -- under ``AITER_PLUGINS=0`` and
+    while no provider is enabled. Dispatch records nothing in either state, and
+    whatever was recorded before it was entered describes a world that no longer
+    holds. Answering with it would be worse than answering with nothing, because
+    nothing about it says it is stale: a framework that calls
+    ``configure(enable=())`` to turn routing off would still read back the
+    provider route from before the call.
+
+    The check is here rather than on the dispatch path on purpose. Both states
+    exist to cost nothing, and clearing the record on every call would tax a few
+    million of them to make a handful of reads correct; this way the read pays,
+    and reads are rare.
+    """
+
+    snapshot = _config_snapshot
+    if snapshot is not None and (snapshot.kill_switch or not snapshot.enabled):
+        return None
     return _last_decision.get()
 
 
@@ -330,7 +397,24 @@ def _swap_config_locked() -> _Config:
 
 
 def _config() -> _Config:
-    """The current snapshot, built on first dispatch. Lock-free on the hot path."""
+    """The current snapshot. A plain read, with nothing to trace around.
+
+    Built at import rather than on first dispatch, which is not a performance
+    choice. Building it lazily put a lock acquisition and an ``os.getenv`` on
+    the first dispatch of the process -- and torch.compile cannot trace either,
+    so that first call graph-breaks. A routed op whose first call lands inside
+    a compiled region therefore splits its graph in two, and a framework that
+    allows one backend invocation per compilation (ATOM's ``VllmBackend``) is
+    handed a second one and asserts.
+
+    Measured, with a counting backend: a routed op called with the snapshot
+    unbuilt compiles two graphs, and exactly one once it is built. Nothing else
+    on the dispatch path breaks, so building it eagerly is the whole fix.
+
+    The fallback is kept because `_config_snapshot` is cleared by
+    `_reset_for_testing`, and a test that clears it must not then be the one
+    call that pays for a rebuild inside somebody's graph.
+    """
 
     snapshot = _config_snapshot
     if snapshot is None:
@@ -339,13 +423,95 @@ def _config() -> _Config:
     return snapshot
 
 
+_CUSTOM_OP_NAMESPACE = "aiter_routed"
+_custom_op_library: Any = None
+
+
+def _as_custom_op(
+    op: str,
+    native: Callable[..., Any],
+    routed: Callable[..., Any],
+    fake: Callable[..., Any] | None,
+) -> Callable[..., Any] | None:
+    """Register ``routed`` as a torch custom op, or return None to stay as is.
+
+    torch.compile traces through a Python wrapper, so a routed op puts this
+    module's dispatch inside the caller's graph -- and anything in it that
+    Dynamo cannot trace splits that graph. A registered custom op is one
+    opaque node instead: nothing in here can reach the caller's graph at all.
+
+    ``mutates_args="unknown"`` rather than a per-op list, for a reason that
+    is about who has to be right rather than about measured breakage. A list
+    has to be correct for every routed op, including ops added later by
+    people who did not read this, and an under-declaration is undefined
+    behaviour rather than an error -- so being wrong about it is both easy
+    and quiet. "unknown" says every argument may be written, which is never
+    wrong about any op, only conservative about all of them: it costs
+    optimisation, not correctness.
+
+    Honesty about what was measured: an op that writes through an argument
+    gives the same answer under inductor whether it declares "unknown" or
+    declares nothing, so the permissive option was not observed to break
+    anything here. That is not a reason to take it. It is a reason not to
+    claim this choice prevents a failure that has been seen.
+
+    What was measured is the part that matters: such an op compiles to one
+    graph and returns exactly what the eager path does, with the compiled
+    region reading the written buffer afterwards.
+
+    Returning None is a real outcome, not a failure path. An op with no fake,
+    with an unannotated parameter, or with an argument no schema can express
+    stays exactly as it is today -- traced, and no worse than before this
+    existed. That is what makes this safe to apply to every op at once:
+    nothing regresses, and an op becomes protected the day it acquires what
+    registration needs.
+    """
+
+    if fake is None:
+        return None
+    try:
+        import torch
+        from torch.library import Library, infer_schema, register_fake
+    except Exception:  # noqa: BLE001 -- see below; import must never fail here
+        return None
+
+    try:
+        schema = infer_schema(native, mutates_args="unknown")
+    except Exception as error:  # noqa: BLE001 -- degrade on anything
+        logger.debug("plugin: %s stays traced, no schema: %s", op, error)
+        return None
+
+    name = op.replace(".", "_")
+    try:
+        global _custom_op_library
+        if _custom_op_library is None:
+            _custom_op_library = Library(_CUSTOM_OP_NAMESPACE, "FRAGMENT")
+        _custom_op_library.define(f"{name}{schema}")
+        for backend in ("CPU", "CUDA"):
+            _custom_op_library.impl(name, routed, backend)
+        register_fake(f"{_CUSTOM_OP_NAMESPACE}::{name}", fake)
+    except Exception as error:  # noqa: BLE001 -- degrade on anything
+        logger.debug("plugin: %s stays traced, registration failed: %s", op, error)
+        return None
+
+    entry = getattr(torch.ops, _CUSTOM_OP_NAMESPACE)
+    bound = getattr(entry, name)
+    bound.__aiter_plugin_op__ = routed.__aiter_plugin_op__
+    return bound
+
+
 def route(
     *,
     op: str,
-    version: int,
+    version: int = 1,
     supersedes: Mapping[int, str] = MappingProxyType({}),
+    fake: Callable[..., Any] | None = None,
 ) -> Callable[[Callable[_P, _R]], Callable[_P, _R]]:
     """Route an AITER op through a compatible provider before its native path.
+
+    ``version`` defaults to 1 and is worth writing only once it has moved: an
+    op whose contract has never changed says nothing about versions, and the
+    number appears exactly where it carries information.
 
     ``supersedes`` maps an older ``op_version`` still accepted for this contract
     to the release that stops accepting it. AITER owns the contract, so only
@@ -374,7 +540,8 @@ def route(
             return _dispatch(operation, canonicalize, native, args, kwargs)
 
         routed.__aiter_plugin_op__ = operation
-        return routed
+        opaque = _as_custom_op(op, native, routed, fake)
+        return opaque if opaque is not None else routed
 
     return decorate
 
@@ -387,10 +554,22 @@ def _dispatch(
     kwargs: dict[str, Any],
 ) -> _R:
     config = _config()
-    if config.kill_switch:
-        # The feature is off, so there is nothing to observe and no Decision is
-        # recorded. Everything an operator would ask afterwards is still
-        # answerable from status() and explain(), which compute on demand.
+    if config.kill_switch or not config.enabled:
+        # Two ways of saying the same thing: no provider can possibly serve this
+        # call. The kill switch says so for the process; an empty enable list
+        # says so because no framework has called configure(). Neither can
+        # produce a provider route, so dispatch spends nothing deciding it --
+        # and nothing recording the decision, which is the expensive half: a
+        # frozen Decision costs more to build than the rest of the path.
+        #
+        # The cost of this shortcut is that these calls record no Decision, so
+        # last_decision() and decision_counts() stay empty. That is the same
+        # trade the kill switch already makes, and it is the right one here:
+        # on the day this merges every caller is in this state, so the whole
+        # cost would be paid by people who get nothing back for it. What an
+        # operator actually asks -- is anything enabled, who is installed, what
+        # would this call do -- is still answered on demand by status() and
+        # explain().
         return native(*args, **kwargs)
 
     eligible = _eligible(op, config)
@@ -451,6 +630,7 @@ def _selected(op: Op, candidate: KernelCandidate, config: _Config) -> Decision:
         kernel_id=candidate.kernel_id,
         artifact_digest=candidate.artifact_digest,
         qualification=candidate.qualification,
+        latency_us=candidate.latency_us,
         config_source=config.source,
     )
 
@@ -499,18 +679,28 @@ def _log_route_change(
     Within one generation the route is a deterministic function of the call
     arguments; call-to-call variation is provider behaviour, visible in
     ``decision_counts()``, and is not an audit event.
+
+    An op with no entry yet was running native: dispatch records nothing until a
+    provider is enabled, so ``_UNROUTED`` is what it was doing before, not an
+    unknown. Saying so turns the one change an operator most wants to see -- the
+    moment a framework takes an op over -- into an audit line instead of a
+    silent first baseline. A first decision that is native with nobody named
+    matches ``_UNROUTED`` and stays silent; one that names a provider does not,
+    and should not -- "aklr was asked and did not serve" is the line an operator
+    goes looking for when an enabled provider seems to do nothing.
     """
 
     previous = _route_log.get(decision.op.name)
     if previous is not None and previous[0] == generation:
         return
     current = (decision.route, decision.provider, kernel_id)
-    if previous is not None and previous[1] != current:
+    before = previous[1] if previous is not None else _UNROUTED
+    if before != current:
         logger.info(
             "Route for %s changed at config generation %s: %s -> %s",
             decision.op.name,
             generation,
-            previous[1],
+            before,
             current,
         )
     _route_log[decision.op.name] = (generation, current)
@@ -693,6 +883,40 @@ def _explained(
     )
 
 
+def _accepts_contract(run: Callable[..., Any], routed: _RoutedOp) -> bool:
+    """Whether ``run`` can take the shape dispatch is about to hand it.
+
+    A declared op version says a provider believes it implements this contract.
+    This checks it, which is the cheaper half of the same guarantee: a provider
+    built against an older shape is caught here even if it declared the current
+    version, or declared no version at all.
+
+    It catches shape, not meaning. A contract whose parameters are unchanged but
+    whose semantics moved is exactly what the version number is for, and nothing
+    here can see it.
+
+    Checked once per callable and remembered, so the hot path pays a dict
+    lookup. A ``*args, **kwargs`` forwarder binds anything and passes, which is
+    correct: it genuinely accepts the call.
+    """
+
+    positional, keyword_only = [], []
+    for parameter in routed.contract.parameters.values():
+        if parameter.kind is parameter.KEYWORD_ONLY:
+            keyword_only.append(parameter.name)
+        elif parameter.kind not in (parameter.VAR_POSITIONAL, parameter.VAR_KEYWORD):
+            positional.append(parameter.name)
+    try:
+        signature(run).bind(
+            *([_PROBE] * len(positional)), **{n: _PROBE for n in keyword_only}
+        )
+        return True
+    except TypeError:
+        return False
+    except Exception:  # noqa: BLE001 - a builtin has no signature to read
+        return True  # cannot be checked is not the same as wrong
+
+
 def _ask_provider(
     record: _ProviderRecord,
     op: Op,
@@ -724,6 +948,26 @@ def _ask_provider(
             getattr(candidate, "provider", type(candidate).__name__),
         )
         return None, "invalid-candidate"
+
+    # Checked once per (run, op) and remembered; the hot path is one lookup.
+    run = candidate.run
+    key = (id(run), op.name)
+    checked = _checked_runs.get(key)
+    if checked is None:
+        routed = _routed_ops.get(op.name)
+        checked = run if routed is None or _accepts_contract(run, routed) else False
+        _checked_runs[key] = checked
+    if checked is False:
+        # Handing it the call anyway is the failure worth preventing: the
+        # argument counts can line up by accident and an input is written as
+        # though it were an output, silently.
+        logger.warning(
+            "Provider %s offered %s for %s, which does not take this contract",
+            record.name,
+            candidate.kernel_id,
+            op.name,
+        )
+        return None, "contract-mismatch"
     return candidate, None
 
 
@@ -959,7 +1203,13 @@ def _matched_version(
     """
 
     try:
-        declared = frozenset(record.provider.op_versions.get(op.name, ()))
+        served = record.provider.op_versions
+        if isinstance(served, Mapping):
+            declared = frozenset(served.get(op.name, ()))
+        elif op.name in served:
+            declared = frozenset({op.version})  # named without a version
+        else:
+            return None
     except Exception as error:  # noqa: BLE001 - providers are an isolation boundary
         logger.warning("Provider %s has invalid op_versions: %s", record.name, error)
         return None
@@ -1130,12 +1380,20 @@ def _entry_points() -> Sequence[metadata.EntryPoint]:
 
 def _reset_for_testing() -> None:
     global _provider_records, _config_snapshot, _eligible_cache, _framework_default
-    global _skipped_providers, _callback_errors
+    global _skipped_providers, _callback_errors, _imported_routes
+    if _imported_routes is None:
+        # Captured the first time this runs, which is before any test has
+        # routed an op of its own: everything here was registered by importing
+        # aiter. Clearing those would make status() and explain() report the
+        # production ops as unrouted for every test after the first.
+        _imported_routes = dict(_routed_ops)
     _routed_ops.clear()
+    _routed_ops.update(_imported_routes)
     _decision_counts.clear()
     _decision_callbacks.clear()
     _silenced_callbacks.clear()
     _warned.clear()
+    _checked_runs.clear()
     _route_log.clear()
     _callback_errors = 0
     with _provider_lock:
@@ -1167,3 +1425,8 @@ __all__ = [
     "route",
     "status",
 ]
+
+
+# Build the snapshot now, so no dispatch ever pays for it. See _config().
+with _config_lock:
+    _swap_config_locked()

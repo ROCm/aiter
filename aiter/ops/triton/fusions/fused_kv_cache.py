@@ -64,6 +64,7 @@ def fused_qk_rope_cat_and_cache_mla_fake_tensor(
     shuffled_kv_cache: bool = False,
     upcast_operand: bool = False,
     q_nope_prestored: bool = False,
+    seg_page_size: int = 0,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     b, qh, d_nope = q_nope.shape
     _, _, d_pe = q_pe.shape
@@ -124,6 +125,7 @@ def fused_qk_rope_cat_and_cache_mla(
     shuffled_kv_cache: bool = False,
     upcast_operand: bool = False,
     q_nope_prestored: bool = False,
+    seg_page_size: int = 0,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """
     Perform RoPE on q_pe and k_pe and concat q_nope with q_pe and k_nope with k_pe along the last dimension
@@ -149,6 +151,10 @@ def fused_qk_rope_cat_and_cache_mla(
       ``q_out`` is not None, a single KV head (KH==1, i.e. MLA), and the
       gfx1250 pure-decode MLA path; q_pe/KV results are bit-identical to the
       full path.
+    - seg_page_size: When > 0 (gfx1250 only, KH == 1), kv_cache is written as
+      seg-packed pages of that many tokens, each [tokens x D1 nope | tokens x
+      D2 rope], the layout of the gfx1250 asm MLA decode kernel. q_out may then
+      be a strided view of a padded buffer.
 
     Models without a rotary embedding use fused_qk_cat_and_cache_mla instead.
 
@@ -191,6 +197,7 @@ def fused_qk_rope_cat_and_cache_mla(
         shuffled_kv_cache,
         upcast_operand,
         q_nope_prestored,
+        seg_page_size,
     )
 
 
@@ -320,9 +327,26 @@ def _cat_and_cache_mla(
     shuffled_kv_cache: bool,
     upcast_operand: bool,
     q_nope_prestored: bool = False,
+    seg_page_size: int = 0,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """Shared launch for both entry points; pos=cos=sin=None is the NoPE form."""
     apply_rope = cos is not None
+    if seg_page_size > 0:
+        assert (
+            DEVICE_ARCH in ("gfx1250", "gfx1250-strict") and apply_rope
+        ), "seg-packed KV pages are only written by the gfx1250 gluon rope kernel"
+        assert not shuffled_kv_cache, "seg-packed and shuffled KV layouts are exclusive"
+        assert (
+            kv_cache.dim() == 3 and kv_cache.shape[1] == 1
+        ), "seg-packed KV pages need a (tokens, 1, D) single-head kv_cache"
+        # The writer packs nope then rope with element offsets from the page
+        # base, so a token stride larger than D stores past the view.
+        assert (
+            kv_cache.is_contiguous()
+        ), "seg-packed pages need a contiguous (tokens, 1, D) kv_cache"
+        assert (
+            kv_cache.shape[0] % seg_page_size == 0
+        ), "seg-packed kv_cache must hold whole pages"
 
     b, qh, d_nope = q_nope.shape
     b2, qh2, d_pe = q_pe.shape
@@ -500,14 +524,17 @@ def _cat_and_cache_mla(
             SCALE_K_WIDTH_ROPE=SCALE_K_WIDTH_ROPE,
             HAVE_K_SCALE=(k_scale is not None and apply_scale),
             UPCAST_OPERAND=upcast_operand,
+            SEG_PAGE_SIZE=seg_page_size,
             num_warps=1,
         )
         return q_out, decode_q_pe_out, k_pe_out, q_nope_zeros_out
 
     n_pid = b * qh + (b_slot - b) * kh
     grid = (n_pid, 1, 1)
+    extra_kernel_kwargs = {}
     if DEVICE_ARCH in ("gfx1250", "gfx1250-strict"):
         _kernel = gluon_fused_qk_rope_cat_and_cache_mla_kernel
+        extra_kernel_kwargs["SEG_PAGE_SIZE"] = seg_page_size
     else:
         _kernel = triton_fused_qk_rope_cat_and_cache_mla_kernel
 
@@ -565,6 +592,7 @@ def _cat_and_cache_mla(
         UPCAST_OPERAND=upcast_operand,
         APPLY_ROPE=apply_rope,
         num_warps=1,
+        **extra_kernel_kwargs,
     )
 
     return q_out, decode_q_pe_out, k_pe_out, q_nope_zeros_out
@@ -605,6 +633,14 @@ def fused_qk_rope_reshape_and_cache(
     - else:
     -     key_cache: shape (T_cache, KH, D // x, block_size, x).
     -     value_cache: shape (T_cache, KH, D, block_size).
+    - KV cache dtype uint8 (NVFP4, always the shuffled layout; block_size 64, 128 or a multiple of 128):
+    -     key_cache: shape (T_cache, KH, block_size, D // 2 + D // 16).
+    -     value_cache: same as key_cache (NVFP4 V), or, for A8K4V8 (NVFP4 K, FP8 V),
+    -         FP8 (e4m3) in the shuffled layout (T_cache, KH, block_size // 16, D, 16).
+    -     A8K4V8 is selected by the dtypes (uint8 key_cache, FP8 value_cache). K is
+    -     NVFP4-quantized per 16 values after dividing by k_scale; V is divided by
+    -     v_scale and cast to FP8, so the attention side reads it with v_descale = v_scale
+    -     and k_descale = 1 (pass k_scale=None or 1).
     - slot_mapping: shape (T_slot, ).
 
     T is the number of decode tokens, T_cache * block_size is the max number of tokens of kv_cache
@@ -642,13 +678,29 @@ def fused_qk_rope_reshape_and_cache(
     SCALE_K_WIDTH = 4
     x_cache = 8
     value_shuffle_layout = False
+    # A8K4V8: NVFP4 K, FP8 V
+    k4v8 = kv_cache_dtype == torch.uint8 and value_cache.dtype != torch.uint8
     max_embd_pos = cos.shape[0]
     d_freq = cos.shape[-1]
     if kv_cache_dtype == torch.uint8:
         # always shuffled
         t_cache, kh_cache, block_size, d_cache = key_cache.shape
-        t_cache_v, vh_cache, block_size_v, d_cache_v = value_cache.shape
+        if k4v8:
+            assert value_cache.dtype == e4m3_dtype and value_cache.ndim == 5, (
+                "A8K4V8 (uint8 key_cache) needs an FP8 value_cache in the shuffled layout "
+                f"(T_cache, KH, block_size // 16, D, 16), got {value_cache.dtype} {tuple(value_cache.shape)}"
+            )
+            t_cache_v, vh_cache, slot_chunk_v, d_cache_v, x_cache = value_cache.shape
+            assert x_cache == 16 // value_cache.element_size()
+            block_size_v = slot_chunk_v * x_cache
+            value_shuffle_layout = True
+        else:
+            t_cache_v, vh_cache, block_size_v, d_cache_v = value_cache.shape
         assert block_size == block_size_v
+        # the scales are preshuffled in min(128, page)-row groups, the data in 16-row tiles
+        assert block_size >= 64 and (
+            block_size <= 128 or block_size % 128 == 0
+        ), f"NVFP4 KV cache needs block_size 64, 128 or a multiple of 128, got {block_size}"
         SCALE_K = dk // 16
         SCALE_K_WIDTH = (
             min(16, triton.next_power_of_2(SCALE_K)) if SCALE_K >= 4 else SCALE_K
@@ -688,9 +740,12 @@ def fused_qk_rope_reshape_and_cache(
     ), "Number of tokens should be identical for key_cache, and value_cache"
     if kv_cache_dtype == torch.uint8:
         assert d == dk == dv, "D dimension should be identical for q, k, and v"
-        assert (
-            d_cache == d_cache_v
-        ), "D dimension should be identical for key_cache and value_cache"
+        if k4v8:
+            assert d_cache_v == dv, "D dimension of the FP8 value_cache should be dv"
+        else:
+            assert (
+                d_cache == d_cache_v
+            ), "D dimension should be identical for key_cache and value_cache"
         assert (
             dk // 2 + dk // 16 == d_cache
         ), "D dimension of key_cache should be (dk // 2 + dk // 16) for FP4 KV cache"
@@ -744,12 +799,20 @@ def fused_qk_rope_reshape_and_cache(
         value_cache_stride_t = value_cache.stride(0)
         value_cache_stride_h = value_cache.stride(1)
         value_cache_stride_d = value_cache.stride(3)
-        value_cache_stride_b = value_cache.stride(2)
-        value_cache_stride_slot_chunk = 0
-        value_cache_stride_x = 0
-        assert (
-            key_cache_stride_d == value_cache_stride_d == 1
-        ), "The stride of the last dimension of key_cache and value_cache must be 1"
+        if k4v8:
+            value_cache_stride_b = 0
+            value_cache_stride_slot_chunk = value_cache.stride(2)
+            value_cache_stride_x = value_cache.stride(4)
+            assert (
+                key_cache_stride_d == 1
+            ), "The stride of the last dimension of key_cache must be 1"
+        else:
+            value_cache_stride_b = value_cache.stride(2)
+            value_cache_stride_slot_chunk = 0
+            value_cache_stride_x = 0
+            assert (
+                key_cache_stride_d == value_cache_stride_d == 1
+            ), "The stride of the last dimension of key_cache and value_cache must be 1"
     elif value_shuffle_layout:
         key_cache_stride_t = key_cache.stride(0)
         key_cache_stride_h = key_cache.stride(1)
@@ -814,6 +877,8 @@ def fused_qk_rope_reshape_and_cache(
         _extra_args = {
             "BLOCK_H": BLOCK_H,
             "KH_BLOCK": max(1, BLOCK_H // (qh // kh)),
+            # NVFP4 scale preshuffle group (rows), as the attention kernels unshuffle it
+            "SCALE_PRESHUFFLE": min(128, block_size),
         }
     grid = (n_pid, 1, 1)
     _kernel[grid](
@@ -864,7 +929,7 @@ def fused_qk_rope_reshape_and_cache(
         BLOCK_D_pe=d,
         BLOCK_D_HALF_pe=d // 2,
         BLOCK_SIZE=block_size,
-        X_SIZE=x_cache if not flash_layout else 0,
+        X_SIZE=x_cache if (not flash_layout or k4v8) else 0,
         SCALE_K_WIDTH=SCALE_K_WIDTH,
         FLASH_LAYOUT=flash_layout,
         VALUE_SHUFFLE_LAYOUT=value_shuffle_layout,
@@ -880,6 +945,104 @@ def fused_qk_rope_reshape_and_cache(
     if zeros_out is not None:
         return q_out, k_out, key_cache, value_cache, zeros_out
     return q_out, k_out, key_cache, value_cache
+
+
+def reshape_and_cache_k4v8(
+    k: torch.Tensor,
+    v: torch.Tensor,
+    key_cache: torch.Tensor,
+    value_cache: torch.Tensor,
+    slot_mapping: torch.Tensor,
+    k_scale: torch.Tensor | None = None,
+    v_scale: torch.Tensor | None = None,
+) -> None:
+    """Write K and V into an A8K4V8 KV cache (NVFP4 K, FP8 V), in place: the cache write of
+    ``fused_qk_rope_reshape_and_cache`` for that format, without the RoPE, for callers whose
+    K is already normed and roped (e.g. Qwen3.5's fused Q/K norm + MRoPE).
+
+    - k, v: (T, KH, D), any strides (e.g. views into a packed qkv).
+    - key_cache: uint8 (T_cache, KH, block_size, D // 2 + D // 16): e2m1 pairs shuffled in
+      (16, 16) tiles, then the e4m3 per-16 scales preshuffled in min(128, block_size)-row groups.
+    - value_cache: FP8 e4m3 (T_cache, KH, block_size // 16, D, 16), the shuffled layout.
+    - slot_mapping: (T_slot >= T,) int, page * block_size + row; negative slots are skipped.
+    - k_scale / v_scale: optional 1-element fp32. K is quantized from K / k_scale and V stored as
+      V / v_scale; the attention side then reads k_descale = k_scale (pass None: 1) and
+      v_descale = v_scale.
+    block_size 64, 128 or a multiple of 128; D a power of 2, >= 64.
+    """
+    from aiter.ops.triton._triton_kernels.fusions.fused_kv_cache import (
+        _reshape_and_cache_k4v8_kernel,
+    )
+
+    t, kh, d = k.shape
+    assert v.shape == (t, kh, d), f"v {tuple(v.shape)} must match k {tuple(k.shape)}"
+    assert key_cache.dtype == torch.uint8 and key_cache.ndim == 4, (
+        f"A8K4V8 key_cache must be uint8 (T_cache, KH, block_size, D // 2 + D // 16), "
+        f"got {key_cache.dtype} {tuple(key_cache.shape)}"
+    )
+    assert value_cache.dtype == e4m3_dtype and value_cache.ndim == 5, (
+        f"A8K4V8 value_cache must be FP8 (T_cache, KH, block_size // 16, D, 16), "
+        f"got {value_cache.dtype} {tuple(value_cache.shape)}"
+    )
+    t_cache, kh_cache, block_size, d_cache = key_cache.shape
+    t_cache_v, kh_cache_v, slot_chunk_v, d_v, x_size = value_cache.shape
+    assert (
+        x_size == 16 // value_cache.element_size()
+        and slot_chunk_v * x_size == block_size
+    )
+    assert t_cache == t_cache_v and kh == kh_cache == kh_cache_v and d_v == d
+    assert d >= 64 and d == triton.next_power_of_2(
+        d
+    ), f"head size {d} must be a power of 2 >= 64"
+    assert (
+        d_cache == d // 2 + d // 16
+    ), f"key_cache last dim {d_cache} != {d // 2 + d // 16}"
+    assert block_size >= 64 and (
+        block_size <= 128 or block_size % 128 == 0
+    ), f"NVFP4 KV cache needs block_size 64, 128 or a multiple of 128, got {block_size}"
+    assert key_cache.stride(3) == 1, "key_cache's last dim must be contiguous"
+    (t_slot,) = slot_mapping.shape
+    assert t <= t_slot, f"{t=} tokens but {t_slot=} slots"
+    _LOGGER.info(
+        "RESHAPE_AND_CACHE_K4V8: k=%s v=%s key_cache=%s value_cache=%s",
+        tuple(k.shape),
+        tuple(v.shape),
+        tuple(key_cache.shape),
+        tuple(value_cache.shape),
+    )
+    if t == 0:
+        return
+    scale_k = d // 16
+    _reshape_and_cache_k4v8_kernel[(t * kh,)](
+        k,
+        v,
+        key_cache,
+        value_cache,
+        slot_mapping,
+        k_scale,
+        v_scale,
+        *k.stride(),
+        *v.stride(),
+        key_cache.stride(0),
+        key_cache.stride(1),
+        key_cache.stride(3),
+        value_cache.stride(0),
+        value_cache.stride(1),
+        value_cache.stride(3),
+        value_cache.stride(4),
+        value_cache.stride(2),
+        KH=kh,
+        BLOCK_D=d,
+        BLOCK_SIZE=block_size,
+        X_SIZE=x_size,
+        SCALE_K_WIDTH=(
+            min(16, triton.next_power_of_2(scale_k)) if scale_k >= 4 else scale_k
+        ),
+        SCALE_PRESHUFFLE=min(128, block_size),
+        HAVE_K_SCALE=k_scale is not None,
+        HAVE_V_SCALE=v_scale is not None,
+        num_warps=1,
+    )
 
 
 def fused_qk_rope_cosine_cache_llama(
