@@ -362,6 +362,10 @@ class PaDecodePipeline:
             and not self.traits.FP8_MTP4_PAGES_AHEAD
         ):
             v_page_pf0 = self.kv.read_v_pages()
+        if const_expr(self.traits.STREAM_KV):
+            # Streamed tiles stage the next tile's page ids at the tile start;
+            # every wave must have read the first tile's ids before that.
+            gpu.barrier()
         q_ops_all = (
             None
             if const_expr(self.traits.FP8_MTP4_Q_LDS)
