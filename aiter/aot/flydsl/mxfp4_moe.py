@@ -121,13 +121,11 @@ def parse_csv(
     ``swiglu_limit`` defaults to AITER_MXFP4_TUNE_SWIGLU_LIMIT, else the
     activation default.
     """
-    from aiter.fused_moe import (
-        _flydsl_stage2_fp8_enabled,
-        _mxfp4_intermediate_enabled,
-    )
     from aiter.ops.flydsl.moe_common import (
         DEFAULT_SITUV2_BETA,
         DEFAULT_SITUV2_LINEAR_BETA,
+        _flydsl_stage2_fp8_enabled,
+        _mxfp4_intermediate_enabled,
         resolve_swiglu_limit,
     )
     from aiter.ops.flydsl.mxfp4_gemm2_kernels import _epilog_of
