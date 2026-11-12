@@ -162,6 +162,11 @@ AITER_CONFIG_FMOE = os.getenv(
     f"{AITER_ROOT_DIR}/aiter/configs/tuned_fmoe.csv",
 )
 
+AITER_CONFIG_FMOE_SWIGLU_LIMIT = os.getenv(
+    "AITER_CONFIG_FMOE_SWIGLU_LIMIT",
+    f"{AITER_ROOT_DIR}/aiter/configs/tuned_swiglu_limit_fmoe.csv",
+)
+
 AITER_CONFIG_FHMOE = os.getenv(
     "AITER_CONFIG_FHMOE",
     f"{AITER_ROOT_DIR}/aiter/configs/tuned_fhmoe.csv",
@@ -368,6 +373,14 @@ class AITER_CONFIG:
     def AITER_CONFIG_FMOE_FILE(self):
         return self.get_config_file(
             "AITER_CONFIG_FMOE", AITER_CONFIG_FMOE, "tuned_fmoe"
+        )
+
+    @property
+    def AITER_CONFIG_FMOE_SWIGLU_LIMIT_FILE(self):
+        return self.get_config_file(
+            "AITER_CONFIG_FMOE_SWIGLU_LIMIT",
+            AITER_CONFIG_FMOE_SWIGLU_LIMIT,
+            "tuned_swiglu_limit_fmoe",
         )
 
     @property
