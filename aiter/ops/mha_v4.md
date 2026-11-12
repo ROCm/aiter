@@ -207,11 +207,16 @@ kernel, so pool at `mha_v4_block_tile()`'s answer.
 
 Pooled scales: a per-tensor or per-channel descale survives pooling over the sequence, so BF16,
 BF16/FP8, FP8, and INT8/FP8 leave `mean_k_scale` and `mean_v_scale` unset. An E8M0 1x32 operand
-pools in dequantized space and is requantized, so its pooled scale must be passed: an MX Q/K
-recipe (including MXFP8) passes `mean_k_scale`, and an MX V recipe passes `mean_v_scale`. The
-requirement is checked against the scale modes, because an unset slot means "read the source
-scale", not "error". MXFP6/FP8's V descale is per channel, so it passes `mean_k_scale` only. MX
-operands are not element addressable, so name them in `k_packed_format` / `v_packed_format` and
+pools in dequantized space and is requantized, so its pooled scale must be passed: an MXFP4 or
+MXFP8 K passes `mean_k_scale`, and an MX V recipe passes `mean_v_scale`. The requirement is
+checked against the scale modes, because an unset slot means "read the source scale", not
+"error". An MXFP6 K is the exception: its packer stores each 128-token tile's scales inside the
+tile's record, and the kernel reads the pooled scales from `mean_k`'s and `mean_k_var`'s records,
+so the launch ignores `mean_k_scale` and `mean_k_var_scale` there and checks instead that
+`mean_k` and `mean_k_var` are views of whole records with the packer's 256-byte slack behind
+them. `sol_prepare()` still returns those scale images, which `sol_jensen_cap()` and
+`sol_tilt_planes()` work from. MXFP6/FP8's V descale is per channel, so it passes no pooled scale
+at all. MX operands are not element addressable, so name them in `k_packed_format` / `v_packed_format` and
 pass the pre-quantization tensors as `k_source` / `v_source`; FP6-P V rows take `mxfp4_fp6_p` or
 `mxfp6_fp6_p`, and MXFP6/FP8's FP8 V needs neither. A pooled V keeps V's 128-token packing
 whatever the KV tile, so at 64x64 its scale image covers the pooled rows rounded up to 128.

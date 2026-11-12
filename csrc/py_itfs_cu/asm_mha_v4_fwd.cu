@@ -189,7 +189,9 @@ static_assert(offsetof(FmhaV4SparseSortedKernarg, ptr_work_table) == 0x2D0);
 // lets the pooled K/V reuse the source descale outright. An E8M0 1x32 scale does vary per token, so
 // those recipes have to pool in dequantized space and requantize, which produces scales of its own
 // that the approximate pass must read instead of K's or V's. Recipes that do not need them leave
-// these slots NULL and keep reading the source scales.
+// these slots NULL and keep reading the source scales. MXFP6 K is the exception among E8M0 Ks:
+// its packer stores every tile's scales inside the tile's own record, so its rows read the pooled
+// scales through mean_k and never touch 0x390 or its strides.
 //
 // A row that declares `jensen` over a K that is not E8M0, whose K-scale slot is therefore idle,
 // reads that slot and its three strides as the optional per-block K variance instead: NULL there
@@ -199,7 +201,8 @@ static_assert(offsetof(FmhaV4SparseSortedKernarg, ptr_work_table) == 0x2D0);
 //
 // An E8M0 K has no idle scale slot and no single unit for a variance, so its jensen row reads the
 // dequantized variance quantized the way mean_k is: codes at 0x420 with mean_k's strides, E8M0
-// scales at 0x430 with mean_k_scale's. NULL codes is the uncorrected pass, as above.
+// scales at 0x430 with mean_k_scale's. An MXFP6 K's variance carries its scales inline as mean_k
+// does, so its rows read 0x420 alone. NULL codes is the uncorrected pass, as above.
 //
 // A row that declares `sorted` also reads ptr_work_table at 0x410: non-NULL, the grid is 1-D and
 // each workgroup takes its (q_tile, head, batch) from the table, heaviest LUT row first; NULL is
@@ -461,6 +464,47 @@ void check_mx_v_scale_backing_storage(const fmha_v4_fwdConfig& cfg,
                 backed,
                 " are backed; allocate it with the aiter.ops.mha_v4_quant producers, which reserve "
                 "zeroed slack");
+}
+
+// The hd128 MXFP6 K packer writes each 128-token tile as one record of codes followed by that
+// tile's E8M0 scales, and the kernels read both from the record. So an MXFP6 K operand has to be a
+// view of such records: a tensor of the right shape with any other backing hands them codes from
+// the wrong rows and scales from whatever follows. The last record's scale read runs past it, into
+// the zeroed slack the packer reserves after the buffer. Mirrors FP6_K_TILE_BYTES and
+// FP6_K_BUFFER_SLACK_BYTES in aiter.ops.triton.quant.mxfp6_fmha_pack.
+constexpr int64_t kMxfp6KTileRows    = 128;
+constexpr int64_t kMxfp6KTileBytes   = 17408;
+constexpr int64_t kMxfp6KRowStride   = kMxfp6KTileBytes / kMxfp6KTileRows;
+constexpr int64_t kMxfp6KBufferSlack = 256;
+
+void check_mxfp6_k_record_storage(const at::Tensor& packed, int64_t rows, const char* name)
+{
+    const int64_t records = (rows + kMxfp6KTileRows - 1) / kMxfp6KTileRows;
+    TORCH_CHECK(packed.stride(3) == 1 && packed.stride(1) == kMxfp6KRowStride &&
+                    packed.stride(2) % kMxfp6KTileBytes == 0 &&
+                    packed.stride(2) >= records * kMxfp6KTileBytes && packed.stride(0) >= 0,
+                name,
+                " must be a view of an MXFP6 K packer buffer: whole ",
+                kMxfp6KTileBytes,
+                "-byte tile records with a ",
+                kMxfp6KRowStride,
+                "-byte row stride, at least ",
+                records,
+                " per head; got strides ",
+                packed.strides());
+    const int64_t required = (packed.size(0) - 1) * packed.stride(0) +
+                             (packed.size(2) - 1) * packed.stride(2) + records * kMxfp6KTileBytes +
+                             kMxfp6KBufferSlack;
+    const int64_t backed   = static_cast<int64_t>(packed.storage().nbytes()) -
+                             packed.storage_offset() * packed.element_size();
+    TORCH_CHECK(backed >= required,
+                name,
+                " needs ",
+                required,
+                " mapped bytes for its tile records and the slack the last scale read runs into, "
+                "but only ",
+                backed,
+                " are backed; pool it with sol_prepare() or pack it with quantize_mxfp6_k");
 }
 
 // Every stride and extent below occupies a 32-bit kernarg slot. Truncating one would not fault; it
@@ -1527,10 +1571,9 @@ void fmha_v4_fwd_sol(const at::Tensor& q,
                 "kv_block_indices must be non-empty; the sparse kernels dereference the row base "
                 "even for a row that selects no KV block");
 
-    // The pooled tensors are K and V with seqlen -> num_kv_blocks, in the SOURCE quantized dtype,
-    // so the approximate pass reuses q/k/v_descale unchanged. That identity is what keeps the
-    // per-tensor recipes free; a block-granular scale mode would need its own pooled scales, which
-    // is why only per-tensor rows carry a mode-2 manifest entry today.
+    // The pooled tensors are K and V with seqlen -> num_kv_blocks, in the SOURCE quantized dtype
+    // and packing. A per-tensor or per-channel descale survives pooling, so those recipes reuse
+    // q/k/v_descale unchanged; the E8M0 ones bring pooled scales of their own, checked below.
     TORCH_CHECK(mean_k.is_cuda() && mean_v.is_cuda() && block_bitmap.is_cuda(),
                 "Sol-Attn pooled tensors and bitmap must be GPU tensors");
     TORCH_CHECK(mean_k.device() == q.device() && mean_v.device() == q.device() &&
@@ -1568,19 +1611,28 @@ void fmha_v4_fwd_sol(const at::Tensor& q,
                 "]");
     TORCH_CHECK(block_bitmap.is_contiguous(), "block_bitmap must be contiguous");
 
-    // Whether an operand needs a pooled scale is decided by its scale mode, not by the caller: an
-    // E8M0 1x32 scale varies along the axis pooling reduces, so that operand had to be pooled in
-    // dequantized space and requantized, and the approximate pass must read the scale that came out
-    // of that rather than the source one. Anything that does not vary along the sequence axis
-    // survives pooling untouched, so passing a pooled scale for it would describe a read the kernel
-    // never performs.
-    const bool k_needs_pooled_scale =
-        k_scale_mode == scale_mode_id(AttentionScaleMode::E8M0Per1x32);
+    // Whether an operand needs a pooled scale is decided by its scale mode and packing, not by the
+    // caller: an E8M0 1x32 scale varies along the axis pooling reduces, so that operand had to be
+    // pooled in dequantized space and requantized, and the approximate pass must read the scale
+    // that came out of that rather than the source one. Anything that does not vary along the
+    // sequence axis survives pooling untouched, so passing a pooled scale for it would describe a
+    // read the kernel never performs. An MXFP6 K is the exception: its packer puts the requantized
+    // scales inside mean_k's tile records, which is where its rows read them, so what has to be
+    // right there is mean_k's backing. Its separate scale image is the readable copy that
+    // sol_jensen_cap and sol_tilt_planes work from; the launch accepts it and ignores it.
+    const bool k_block_scaled  = k_scale_mode == scale_mode_id(AttentionScaleMode::E8M0Per1x32);
+    const bool k_scales_inline = k_block_scaled && k_format == format_id(AttentionFormat::Fp6E2M3);
+    const bool k_needs_pooled_scale = k_block_scaled && !k_scales_inline;
     const bool v_needs_pooled_scale =
         v_scale_mode == scale_mode_id(AttentionScaleMode::E8M0Per1x32);
-    TORCH_CHECK(mean_k_scale.has_value() == k_needs_pooled_scale,
-                "Sol-Attn needs mean_k_scale exactly when K's scale mode is E8M0_PER_1X32; K's is ",
+    TORCH_CHECK(k_scales_inline || mean_k_scale.has_value() == k_needs_pooled_scale,
+                "Sol-Attn needs mean_k_scale exactly when K's scale mode is E8M0_PER_1X32 and K "
+                "is not MXFP6; K's scale mode is ",
                 k_scale_mode);
+    if(k_scales_inline)
+    {
+        check_mxfp6_k_record_storage(mean_k, bitmap_groups * blocks_per_tile, "mean_k");
+    }
     TORCH_CHECK(mean_v_scale.has_value() == v_needs_pooled_scale,
                 "Sol-Attn needs mean_v_scale exactly when V's scale mode is E8M0_PER_1X32; V's is ",
                 v_scale_mode);
@@ -1659,6 +1711,16 @@ void fmha_v4_fwd_sol(const at::Tensor& q,
                         "mean_k_var_scale must be a uint8 E8M0 tensor");
             TORCH_CHECK(vs.sizes() == ks.sizes() && vs.strides() == ks.strides(),
                         "mean_k_var_scale must have mean_k_scale's shape and strides");
+        }
+        else if(k_scales_inline)
+        {
+            // Packed like mean_k, scales inline, and read through mean_k's addressing from its own
+            // base alone, so mean_k_var_scale is ignored as mean_k_scale is.
+            TORCH_CHECK(kvar.scalar_type() == mean_k.scalar_type(),
+                        "mean_k_var must have mean_k's dtype");
+            TORCH_CHECK(kvar.strides() == mean_k.strides(),
+                        "mean_k_var must have mean_k's strides");
+            check_mxfp6_k_record_storage(kvar, bitmap_groups * blocks_per_tile, "mean_k_var");
         }
         else
         {
@@ -1761,7 +1823,7 @@ void fmha_v4_fwd_sol(const at::Tensor& q,
     // Left NULL for the per-tensor recipes, which is what keeps their scale reads on the source
     // image. s_mean_v_scale_* stay unset on purpose: no recipe reads them, since the packed V-scale
     // image needs only a base pointer.
-    if(mean_k_scale.has_value())
+    if(k_needs_pooled_scale)
     {
         const auto& ks                  = mean_k_scale.value();
         args.ptr_mean_k_scale.value     = ks.data_ptr();
@@ -1773,10 +1835,13 @@ void fmha_v4_fwd_sol(const at::Tensor& q,
     {
         args.ptr_mean_v_scale.value = mean_v_scale.value().data_ptr();
     }
-    if(mean_k_var_scale.has_value())
+    if(mean_k_var.has_value() && k_block_scaled)
     {
-        args.ptr_mean_k_var.value       = mean_k_var.value().data_ptr();
-        args.ptr_mean_k_var_scale.value = mean_k_var_scale.value().data_ptr();
+        args.ptr_mean_k_var.value = mean_k_var.value().data_ptr();
+        if(k_needs_pooled_scale)
+        {
+            args.ptr_mean_k_var_scale.value = mean_k_var_scale.value().data_ptr();
+        }
     }
     else if(mean_k_var.has_value())
     {

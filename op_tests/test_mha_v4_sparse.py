@@ -1623,6 +1623,12 @@ class _SolAttnRecipe(NamedTuple):
         return self.v_scale_mode == AttentionScaleMode.E8M0_PER_1X32
 
     @property
+    def k_scales_inline(self) -> bool:
+        """An MXFP6 K's packer stores every tile's scales inside the tile's record, which is where
+        the kernel reads them, so the launch ignores its separate pooled scale image."""
+        return self.qk_format == AttentionFormat.MXFP6
+
+    @property
     def v_packed(self) -> str | None:
         if self.v_packed_format is not None:
             return self.v_packed_format
@@ -2691,7 +2697,9 @@ def test_mha_v4_sol_reads_the_pooled_scale_it_was_given():
 def test_mha_v4_sol_pooled_scales_must_match_the_scale_modes(recipe):
     """Which operands need a pooled scale follows from the scale modes, so it is not the caller's
     to choose: supplying one for a per-tensor operand describes a read the kernel never does, and
-    omitting one for a block-granular operand leaves it reading unpooled exponents.
+    omitting one for a block-granular operand leaves it reading unpooled exponents. An MXFP6 K
+    reads its pooled scales from mean_k's records instead, so its slot is neither required nor
+    read; test_mha_v4_sol_mxfp6_k_reads_its_pooled_scales_from_the_records covers it.
     """
     heads = 2
     q, k, v = recipe.operands(sequence_k=8 * recipe.kv_tile(), heads=heads)
@@ -2727,11 +2735,91 @@ def test_mha_v4_sol_pooled_scales_must_match_the_scale_modes(recipe):
     # one the plan filled, or to supply one the plan left empty.
     correct = {slot: plan[slot] for slot in ("mean_k_scale", "mean_v_scale")}
     for slot, value in correct.items():
+        if slot == "mean_k_scale" and recipe.k_scales_inline:
+            continue
         wrong = dict(correct)
         wrong[slot] = None if value is not None else plan["mean_k"]
         with expect_raises(RuntimeError, match=slot):
             launch(**wrong)
             torch.cuda.synchronize()
+
+
+def _uint8_storage(x):
+    """x's whole allocation as a flat uint8 tensor."""
+    storage = torch.empty(0, dtype=torch.uint8, device=x.device)
+    storage.set_(x.untyped_storage(), 0, (x.untyped_storage().nbytes(),))
+    return storage
+
+
+def _restrided(backing, like):
+    """`like`'s view, rebuilt over another flat uint8 allocation."""
+    return backing.as_strided(like.shape, like.stride(), like.storage_offset())
+
+
+@parametrize(
+    ("recipe", "block_tile"),
+    [
+        param(*p.values, skip=p.skip or get_gfx() != "gfx950", id=p.id)
+        for p in _sol_attn_geometry_params(
+            [r.id for r in _SOL_ATTN_RECIPES if r.k_scales_inline]
+        )
+    ],
+)
+def test_mha_v4_sol_mxfp6_k_reads_its_pooled_scales_from_the_records(
+    recipe, block_tile
+):
+    """An MXFP6 K's rows read the pooled scales from each tile record of mean_k and mean_k_var.
+
+    So the separate scale images change nothing, while the scales inside the records do, and a
+    mean_k or mean_k_var of the right shape over any other backing is refused rather than read
+    out of place. The Jensen term is on throughout, so the variance's own slot is exercised too.
+    """
+    from aiter.ops.triton.quant import mxfp6_fmha_pack as fp6
+
+    heads = 2
+    q, k, v = recipe.operands(sequence_k=8 * recipe.kv_tile(), heads=heads)
+    plan = recipe.prepare(
+        q, k, v, beta=0.4, heads=heads, block_tile=block_tile, k_variance=True
+    )
+    launch = functools.partial(
+        _sol_attn_launch, q, k, v, recipe=recipe, block_tile=block_tile, jensen=True
+    )
+    baseline = launch(plan)
+    torch.cuda.synchronize()
+    assert torch.isfinite(baseline).all()
+
+    def bumped(scale):
+        return (scale.int() + 1).clamp(max=255).to(torch.uint8)
+
+    for scales in (
+        {"mean_k_scale": None, "mean_k_var_scale": None},
+        {
+            "mean_k_scale": bumped(plan["mean_k_scale"]),
+            "mean_k_var_scale": bumped(plan["mean_k_var_scale"]),
+        },
+    ):
+        assert torch.equal(launch({**plan, **scales}), baseline)
+
+    for name in ("mean_k", "mean_k_var"):
+        storage = _uint8_storage(plan[name])
+        records = storage.numel() // fp6.FP6_K_TILE_BYTES
+        tails = storage.clone()
+        tail = tails[: records * fp6.FP6_K_TILE_BYTES].view(records, -1)
+        tail[:, fp6._K_SCALE_TAIL_OFFSET :] = bumped(
+            tail[:, fp6._K_SCALE_TAIL_OFFSET :]
+        )
+        perturbed = launch({**plan, name: _restrided(tails, plan[name])})
+        torch.cuda.synchronize()
+        assert not torch.equal(
+            perturbed, baseline
+        ), f"{name}'s record scales are not read"
+
+        # A plain copy is the right shape and dtype; only its backing is wrong.
+        with expect_raises(RuntimeError, match=f"{name} must"):
+            launch({**plan, name: plan[name].contiguous()})
+        unslacked = storage[: storage.numel() - fp6.FP6_K_BUFFER_SLACK_BYTES].clone()
+        with expect_raises(RuntimeError, match=f"{name} needs"):
+            launch({**plan, name: _restrided(unslacked, plan[name])})
 
 
 def test_mha_v4_sol_rejects_recipes_without_a_manifest_row():

@@ -1723,7 +1723,11 @@ def mha_v4_packed(
     pooled-only softmax over every block instead of to a zero tile.
     A block-granular operand also needs its pooled scale (mean_k_scale,
     mean_v_scale), which sol_prepare() returns for exactly the operands
-    whose source scale could not survive pooling.
+    whose source scale could not survive pooling. An MXFP6 K is the
+    exception: the kernel reads its pooled scales from inside mean_k's and
+    mean_k_var's tile records, so mean_k_scale and mean_k_var_scale are
+    optional and ignored there, and mean_k / mean_k_var must be views of the
+    packer's records, as sol_prepare() returns them.
 
     block_tile names the (q_tile, kv_tile) geometry the LUT and pooled tensors
     were built for; it defaults to this call's own operands' geometry, since
