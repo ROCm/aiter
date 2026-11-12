@@ -464,11 +464,13 @@ def _plan_counts(a_running, lane, fz_epr, fz_cap, fz_tile_m, count_cm=0):
     return chunks, total_tiles, routed_rows, max_count, overflow_count, no_overflow
 
 
-def _plan_flag(no_overflow, total_tiles, hot_expert, routed_rows, fz_tile_m):
+def _plan_flag(no_overflow, total_tiles, hot_expert, routed_rows, fz_tile_m, fz_npes, fz_epr):
     """Low 32 bits of the plan word: num_valid, plus the row-count bits of _PLAN_CACHED_W_BIT /
     _PLAN_FP8_ROWS_BIT."""
     nv_flag = no_overflow.select(total_tiles * fx.Int32(fz_tile_m), fx.Int32(0))
-    cached_min = _CACHED_W_MIN_ROWS if fz_tile_m <= 32 else _CACHED_W_MIN_ROWS_M64
+    # The 64-row m-tile bound was measured on the EP4 V4.1-Flash layouts; other layouts keep the 32-row one.
+    m64_bound = fz_tile_m > 32 and (fz_npes, fz_epr) in ((4, 96), (4, 97))
+    cached_min = _CACHED_W_MIN_ROWS_M64 if m64_bound else _CACHED_W_MIN_ROWS
     nv_flag = nv_flag | (hot_expert | (routed_rows >= fx.Int32(cached_min))).select(
         fx.Int32(1 << _PLAN_CACHED_W_BIT), fx.Int32(0)
     )
@@ -548,7 +550,7 @@ def emit_direct_fixed_slot_finalize(
         if const_expr(not plan_wt):
             comm_ops.fence_system_release()
         if lane == fx.Int32(0):
-            nv_flag = _plan_flag(no_overflow, total_tiles, hot_expert, routed_rows, fz_tile_m)
+            nv_flag = _plan_flag(no_overflow, total_tiles, hot_expert, routed_rows, fz_tile_m, fz_npes, fz_epr)
             comm_ops.store_i64_global_system(
                 plan_nv[0], (fx.Int64(plan_nv[1]) << fx.Int64(32)) | fx.Int64(nv_flag))
     fx.barrier()
@@ -1309,7 +1311,7 @@ def compile_mega_moe_stage1(
                 fx.ptr_store(safe_count, lds_typed_ptr(plan_tab_base + fx.Int32(plan_chunks * 256) + slot, T.i32,
                     align=4))
             hot_expert = max_count >= fx.Int32(_HOT_EXPERT_MIN_ROWS)
-            return _plan_flag(no_overflow, total_tiles, hot_expert, routed_rows, fz_tile_m)
+            return _plan_flag(no_overflow, total_tiles, hot_expert, routed_rows, fz_tile_m, fz_npes, fz_epr)
         if tid == fx.Int32(0):
             xcd = fx.Int32(comm_ops.hw_xcc_id()) & fx.Int32(7)
             # The owner reset the counters before opening the gate: the first work fetch overlaps the plan wait.
