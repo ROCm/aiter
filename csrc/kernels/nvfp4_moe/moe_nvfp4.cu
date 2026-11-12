@@ -49,8 +49,10 @@ void moe_nvfp4_sort(const aiter_tensor_t& x,
     AITER_CHECK(x_f16.dtype() == AITER_DTYPE_fp16 &&
                     ((bf16 && x_f16.numel() == x.numel()) || x_f16.numel() == 0),
                 "x_f16 must be f16 [T, H] for bf16 x (empty: no cast)");
-    AITER_CHECK(out.dtype() == x.dtype() && out.numel() == x.numel(),
-                "out must be [T, H] of the x dtype");
+    AITER_CHECK(out.is_contiguous() && (out.numel() == 0 || (out.numel() == x.numel() &&
+                                                             (out.dtype() == x.dtype() ||
+                                                              out.dtype() == AITER_DTYPE_fp32))),
+                "out must be empty or [T, H] of the x dtype or fp32");
     AITER_CHECK(topk_ids.dtype() == AITER_DTYPE_i32 && topk_ids.dim() == 2 &&
                     topk_ids.is_contiguous() && topk_ids.size(0) == x.size(0),
                 "topk_ids must be contiguous int32 [T, topk]");
@@ -65,6 +67,7 @@ void moe_nvfp4_sort(const aiter_tensor_t& x,
     const int rc             = moe_nvfp4_entry_sort(x.data_ptr(),
                                                     x_f16.numel() ? x_f16.data_ptr() : nullptr,
                                                     out.data_ptr(),
+                                                    (int)(out.numel() * out.element_size() / 16),
                                                     topk_ids.data_ptr(),
                                                     topk_w.data_ptr(),
                                                     sorted_ids.data_ptr(),
@@ -79,6 +82,26 @@ void moe_nvfp4_sort(const aiter_tensor_t& x,
                                                     (int)nblk,
                                                     stream);
     AITER_CHECK(rc == 0, "moe_nvfp4 sort failed: ", rc);
+}
+
+void moe_nvfp4_reduce(const aiter_tensor_t& ws, aiter_tensor_t& out, int64_t topk)
+{
+    const bool bf16 = out.dtype() == AITER_DTYPE_bf16;
+    AITER_CHECK((bf16 || out.dtype() == AITER_DTYPE_fp16) && out.dim() == 2 &&
+                    out.is_contiguous() && out.size(1) % 8 == 0,
+                "out must be contiguous bf16 or f16 [T, H], H a multiple of 8");
+    AITER_CHECK(ws.dtype() == AITER_DTYPE_fp32 && ws.is_contiguous() && topk > 0 &&
+                    ws.numel() == out.numel() * (size_t)topk,
+                "ws must be contiguous fp32 [T * topk, H]");
+    HipDeviceGuard device_guard(out.device_id);
+    const int rc = moe_nvfp4_entry_reduce(ws.data_ptr(),
+                                          out.data_ptr(),
+                                          (int)out.size(0),
+                                          (int)out.size(1),
+                                          (int)topk,
+                                          bf16,
+                                          aiter::getCurrentHIPStream());
+    AITER_CHECK(rc == 0, "moe_nvfp4 reduce failed: ", rc);
 }
 
 void moe_nvfp4_gemm(int64_t kernel,
@@ -105,7 +128,7 @@ void moe_nvfp4_gemm(int64_t kernel,
     AITER_CHECK(inv_gs.dtype() == AITER_DTYPE_fp32 && inv_gs.is_contiguous(),
                 "inv_gs must be contiguous fp32");
     // stage 1 reads bf16 x iff _inbf16 (else f16), stage 2 writes bf16 out iff _outbf16 (else
-    // the f32 workspace of f16 output)
+    // f32: the workspace of f16 output, or the [T * topk, H] rows of _reduce)
     const bool s1            = moe_nvfp4_cfg_field(kernel, CFG_S1) != 0;
     const aiter_tensor_t& io = s1 ? x : out;
     const bool io_bf16       = moe_nvfp4_cfg_field(kernel, s1 ? CFG_INBF16 : CFG_OUTBF16) != 0;

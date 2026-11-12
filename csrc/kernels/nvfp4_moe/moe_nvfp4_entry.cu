@@ -1,13 +1,15 @@
 // SPDX-License-Identifier: MIT
 // Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 //
-// Wraps the struct-based launchers of the MiniMax-M3 NVFP4 MoE kernels (the fused
-// sort, moe_nvfp4_sort.hip, and the generated kernel table, gen_instances.py) in
-// pointer/scalar entry points, so the aiter_tensor_t layer (moe_nvfp4.cu) never needs
-// the kernel file's Params / PrepParams layouts. This TU includes no aiter or ck_tile
-// header on purpose: the kernel file defines short macros (DEV, KERNEL, ...) and vector
+// Wraps the struct-based launchers of the MiniMax-M3 NVFP4 MoE kernels (the
+// fused sort, moe_nvfp4_sort.hip, the top-k reduce, moe_nvfp4_reduce.hip, and
+// the generated kernel table, gen_instances.py) in pointer/scalar entry points,
+// so the aiter_tensor_t layer (moe_nvfp4.cu) never needs the kernel file's
+// Params / PrepParams layouts. This TU includes no aiter or ck_tile header on
+// purpose: the kernel file defines short macros (DEV, KERNEL, ...) and vector
 // typedefs that are not meant to share a TU with them.
 #include "moe_nvfp4_kernels.hip"
+#include "moe_nvfp4_reduce.hip"
 #include "moe_nvfp4_sort.hip"
 
 #include "moe_nvfp4_entry.h"
@@ -23,6 +25,7 @@ int moe_nvfp4_entry_cfg_fits(int i, int K) { return moe_nvfp4_kernels_cfg_fits(i
 int moe_nvfp4_entry_sort(const void* x,
                          void* x_f16,
                          void* out,
+                         int out_vecs,
                          const void* ids,
                          const void* w,
                          void* sorted_ids,
@@ -40,7 +43,7 @@ int moe_nvfp4_entry_sort(const void* x,
     PrepParams p{};
     p.x           = (const uint16_t*)x;
     p.x_f16       = (uint8_t*)x_f16;
-    p.out         = (uint16_t*)out;
+    p.out         = (uint8_t*)out;
     p.ids         = (const int*)ids;
     p.w           = (const float*)w;
     p.sorted_ids  = (int*)sorted_ids;
@@ -53,7 +56,14 @@ int moe_nvfp4_entry_sort(const void* x,
     p.E           = E;
     p.BM          = BM;
     p.nblk        = nblk;
+    p.out_vecs    = out_vecs;
     return moe_nvfp4_kernels_sort(&p, stream);
+}
+
+int moe_nvfp4_entry_reduce(
+    const void* ws, void* out, int T, int H, int topk, int bf16, hipStream_t stream)
+{
+    return moe_nvfp4_kernels_reduce((const float*)ws, out, T, H, topk, bf16, stream);
 }
 
 int moe_nvfp4_entry_gemm(int kernel,

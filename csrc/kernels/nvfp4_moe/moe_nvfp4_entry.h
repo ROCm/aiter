@@ -19,6 +19,7 @@ enum CfgField
     CFG_GS,
     CFG_INBF16,
     CFG_OUTBF16,
+    CFG_REDUCE,
     CFG_NUM_FIELDS
 };
 
@@ -30,6 +31,7 @@ int moe_nvfp4_entry_cfg_fits(int i, int K);
 int moe_nvfp4_entry_sort(const void* x,
                          void* x_f16,
                          void* out,
+                         int out_vecs,
                          const void* ids,
                          const void* w,
                          void* sorted_ids,
@@ -43,6 +45,8 @@ int moe_nvfp4_entry_sort(const void* x,
                          int BM,
                          int nblk,
                          hipStream_t stream);
+int moe_nvfp4_entry_reduce(
+    const void* ws, void* out, int T, int H, int topk, int bf16, hipStream_t stream);
 int moe_nvfp4_entry_gemm(int kernel,
                          const void* x,
                          const void* w,

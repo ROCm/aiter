@@ -5,10 +5,13 @@
 The kernels (csrc/kernels/nvfp4_moe/moe_nvfp4_kernels.hip) decode NVFP4 weights
 to f16 in registers (exact), apply the E4M3 block scale and the per-expert
 global multiplier, and run f16 MFMA on f16 or bf16 -> f16 activations (no
-activation quant). Three launches per MoE: fused sort + cast + output zeroing,
-stage 1 (gate/up + SwiGLU-OAI), stage 2 (down, weighted atomic reduce into the
-output, so results are not bitwise deterministic). f16 x: stage 2 reduces into
-a zeroed f32 workspace, cast to the f16 output once (two more launches). The
+activation quant). Launches per MoE: fused sort + cast + zeroing, stage 1
+(gate/up + SwiGLU-OAI), stage 2 (down, weighted sum over the top-k slots). The
+stage-2 kernel selects the sum: atomics into the zeroed output (bf16 output,
+_outbf16 kernels) or into a zeroed f32 workspace cast to the f16 output once
+(one more launch), both not bitwise deterministic; or (_reduce kernels, any
+output dtype) plain f32 stores of each (token, slot) row and a top-k reduce
+kernel that sums them in slot order (deterministic, no zeroing). The
 E4M3 scales of each weight tensor are stored once, grouped by GS K-tiles
 (scale_gs of its K).
 
@@ -71,8 +74,9 @@ MD_NAME = "module_moe_nvfp4"
 # (aiter/jit/utils/moe_nvfp4_common.py). Kernel names: kernel_name in that file
 # (the name is the config; nvfp4_moe_s1_ / nvfp4_moe_s2_ prefix:
 # the stage), _inbf16 stage 1 for bf16 x on the fallback path, _outbf16 stage 2 for
-# bf16 output. Only the rows of the device's cu_num are used. A kernel outside
-# module_moe_nvfp4 is JIT-built in its own module (_jit_kernel).
+# bf16 output atomics, _reduce stage 2 (any output dtype) for the top-k reduce. Only
+# the rows of the device's cu_num are used. A kernel outside module_moe_nvfp4 is
+# JIT-built in its own module (_jit_kernel).
 DISPATCH_CSV = os.getenv(
     "AITER_CONFIG_MOE_NVFP4",
     f"{AITER_ROOT_DIR}/aiter/configs/moe_nvfp4_dispatch.csv",
@@ -116,6 +120,10 @@ def _moe_nvfp4_sort(
 ) -> None: ...
 
 
+@compile_ops(MD_NAME, fc_name="moe_nvfp4_reduce", develop=True)
+def _moe_nvfp4_reduce(ws: Tensor, out: Tensor, topk: int) -> None: ...
+
+
 @compile_ops(MD_NAME, fc_name="moe_nvfp4_gemm", develop=True)
 def _moe_nvfp4_gemm(
     kernel: int,
@@ -139,7 +147,9 @@ def _moe_nvfp4_gemm(
 
 
 # Kernel fields read by _moe_nvfp4_cfg_field, in CfgField order (moe_nvfp4_entry.h)
-_KERNEL_FIELDS = ("s1", "m_tiles", "n_tiles", "waves", "gs", "inbf16", "outbf16")
+_KERNEL_FIELDS = (
+    "s1", "m_tiles", "n_tiles", "waves", "gs", "inbf16", "outbf16", "reduce"
+)  # fmt: skip
 
 _LOCK = threading.Lock()
 # kernel name -> kernel index and launch fields
@@ -223,7 +233,7 @@ def _read_dispatch_csv(path: str, cu_num: int) -> dict[tuple, tuple]:
     """DISPATCH_CSV rows of cu_num: {(H, I, E, topk, x_dtype, out_dtype): ((T,
     stage-1, stage-2), ...)}. Raises ValueError for a kernel name that does not
     match the row dtypes and path (_inbf16 stage 1 iff bf16 x on the fallback
-    path, _outbf16 stage 2 iff bf16 output)."""
+    path; stage 2: _reduce, or _outbf16 iff bf16 output)."""
     out: dict[tuple, list] = {}
     with open(path, newline="") as f:
         for r in csv.DictReader(f):
@@ -234,7 +244,8 @@ def _read_dispatch_csv(path: str, cu_num: int) -> dict[tuple, tuple]:
             t, s1, s2 = int(r["T"]), r["stage1"], r["stage2"]
             fb = uses_fallback(t, key[3], key[2])
             ok1 = s1.endswith("_inbf16") == (fb and key[4] == "bf16")
-            ok2 = s2.endswith("_outbf16") == (key[5] == "bf16")
+            atomics = not s2.endswith("_reduce")
+            ok2 = not atomics or s2.endswith("_outbf16") == (key[5] == "bf16")
             if not (ok1 and ok2):
                 raise ValueError(
                     f"{path}: {key} T={t}: kernel names do not match the dtypes"
@@ -510,8 +521,8 @@ def moe_nvfp4(
             of the sorted ids), fallback=False for a shape the fused sort cannot
             take, a shape without default-rule kernels, or a shape over the
             kernel limits (32-bit byte offsets: T * H and T * topk * I
-            below 2^30, T * H below 2^29 for f16 x; at most MAX_GRID_Y sorted
-            blocks).
+            below 2^30, T * H below 2^29 for f16 x with stage-2 atomics; at
+            most MAX_GRID_Y sorted blocks).
     """
     T, H = x.shape
     topk = topk_ids.shape[1]
@@ -535,13 +546,23 @@ def moe_nvfp4(
     x = x.contiguous()
     n = T * topk
     nblk = min(W.E, n) + (n + BM - 1) // BM
-    # 32-bit byte offsets of both stages' X and the f32 output, grid y (sorted blocks)
+    reduce = kernel2["reduce"]
+    # 32-bit byte offsets of both stages' X and the stage-2 atomics target (_reduce
+    # rows: 64-bit), grid y (sorted blocks)
     if (
-        max(T * H * (1 if bf16 else 2), n * W.I) * 2 >= 1 << 31
+        max(T * H * (1 if bf16 or reduce else 2), n * W.I) * 2 >= 1 << 31
         or _round8(nblk) > MAX_GRID_Y
     ):
         raise ValueError(f"NVFP4 MoE: T={T} topk={topk} exceeds the kernel limits")
     out = torch.empty(T, H, dtype=x.dtype, device=dev)
+    # stage-2 target: the (token, slot) f32 rows of the top-k reduce, the bf16 output
+    # (atomics) or an f32 workspace (f16 output: f16 atomics overflow on partial sums)
+    if reduce:
+        acc = torch.empty(n, H, dtype=torch.float32, device=dev)
+    else:
+        acc = out if bf16 else torch.empty(T, H, dtype=torch.float32, device=dev)
+    # zeroed by the sort (atomics targets only)
+    zero = torch.empty(T, 0, dtype=x.dtype, device=dev) if reduce else acc
     x_inter = torch.empty(n, W.I, dtype=torch.float16, device=dev)
     ids = topk_ids.to(torch.int32).contiguous()
     tw = topk_w.float().contiguous()
@@ -556,7 +577,7 @@ def moe_nvfp4(
         ws_bytes = moe_sorting_opus_get_workspace_size(T, W.E, topk, 0, dev.index)
         ws = torch.empty(ws_bytes, dtype=torch.uint8, device=dev) if ws_bytes else None
         moe_sorting_opus_fwd(
-            ids, tw, sorted_ids, sorted_w, sorted_eids, num_valid, out, W.E, BM,
+            ids, tw, sorted_ids, sorted_w, sorted_eids, num_valid, zero, W.E, BM,
             None, None, ws, 0,
         )  # fmt: skip
         x1 = x
@@ -565,10 +586,10 @@ def moe_nvfp4(
         sorted_w = torch.empty(nblk * BM, dtype=torch.float32, device=dev)
         sorted_eids = torch.empty(_round8(nblk), dtype=torch.int32, device=dev)
         num_valid = torch.empty(1, dtype=torch.int32, device=dev)
-        # f16 x: the sort only zeroes the output (empty x_f16)
+        # f16 x: no cast (empty x_f16)
         x_f16 = torch.empty(T * H if bf16 else 0, dtype=torch.float16, device=dev)
         _moe_nvfp4_sort(
-            x, x_f16, out, ids, tw, sorted_ids, sorted_w, sorted_eids, num_valid,
+            x, x_f16, zero, ids, tw, sorted_ids, sorted_w, sorted_eids, num_valid,
             W.E, BM, nblk,
         )  # fmt: skip
         x1 = x_f16 if bf16 else x
@@ -578,11 +599,12 @@ def moe_nvfp4(
         "sorted_eids": sorted_eids,
         "num_valid": num_valid,
     }
-    # stage 1: x [T, H] -> x_inter [T * topk, I], stage 2: x_inter -> out [T, H]
+    # stage 1: x [T, H] -> x_inter [T * topk, I], stage 2: x_inter -> acc
     _gemm(kernel1, sort, T, topk, W.E, x1, W.w13, W.s13, W.g13, x_inter,
           K=W.H, ntiles=2 * W.I // 16, n_out=W.I)  # fmt: skip
-    # f16 x: the expert sum in f32 (f16 atomics overflow on partial sums)
-    acc = out if bf16 else torch.zeros(T, H, dtype=torch.float32, device=dev)
     _gemm(kernel2, sort, T, topk, W.E, x_inter, W.w2, W.s2, W.g2, acc,
           K=W.I, ntiles=W.H // 16, n_out=W.H)  # fmt: skip
+    if reduce:
+        _moe_nvfp4_reduce(acc, out, topk)
+        return out
     return out if bf16 else out.copy_(acc)

@@ -4,9 +4,10 @@
 
 Covers moe_nvfp4 and the fused_moe path (w1/w2_global_scale) on the MiniMax-M3.1
 shapes (TP4 / TP8, E 128, topk 4), the main path and the fallback (T 2048), bf16
-and f16 activations, expert contributions that cancel beyond the f16 range, a
-dispatch CSV (AITER_CONFIG_MOE_NVFP4) naming a kernel outside the prebuilt module
-(per-kernel JIT) and the fused_moe errors.
+and f16 activations, the stage-2 top-k sum by atomics and by the reduce kernel
+(_reduce), expert contributions that cancel beyond the f16 range, a dispatch CSV
+(AITER_CONFIG_MOE_NVFP4) naming a kernel outside the prebuilt module (per-kernel
+JIT) and the fused_moe errors.
 """
 
 import os
@@ -19,6 +20,7 @@ import torch
 from aiter import ActivationType, NvFp4MoeWeights, dtypes, moe_nvfp4, uses_fallback
 from aiter.fused_moe import fused_moe
 from aiter.jit.utils.chip_info import get_cu_num, get_gfx
+from aiter.jit.utils.moe_nvfp4_common import reduce_twin
 from aiter.ops.shuffle import shuffle_scale_nvfp4_moe, shuffle_weight
 from aiter.utility.fp4_utils import mxfp4_to_f32
 
@@ -130,11 +132,36 @@ def test_moe_nvfp4(shape, T, dtype):
         assert err < TOL, f"{name} I={I} T={T} {dtype}: relF {err:.2e}"
 
 
+@pytest.mark.parametrize("T", [1024, 2048])
+def test_reduce_bf16(shape, T, monkeypatch):
+    """bf16 output through the _reduce twin of the picked (atomics) stage-2 kernel:
+    accuracy and a bitwise-repeatable result."""
+    from aiter.ops import moe_nvfp4 as op
+
+    I, raw, W, _ = shape
+    pick = op._pick
+
+    def reduce_pick(*args):
+        kernel1, kernel2 = pick(*args)
+        return kernel1, op._kernel(reduce_twin(kernel2["name"]))
+
+    monkeypatch.setattr(op, "_pick", reduce_pick)
+    kernel2 = op._pick(W, T, TOPK, "bf16", uses_fallback(T, TOPK, E))[1]
+    assert kernel2["reduce"] and kernel2["build"] is None, kernel2["name"]
+    x, tid, tw = _inputs(T, torch.bfloat16, seed=T)
+    out = moe_nvfp4(W, x, tid, tw)
+    err = _relf(out, _reference(x, raw, tid, tw))
+    assert err < TOL, f"I={I} T={T}: relF {err:.2e}"
+    assert torch.equal(out, moe_nvfp4(W, x, tid, tw))
+
+
+@pytest.mark.parametrize("T", [1, 16])
 @pytest.mark.parametrize("fallback", [False, True])
 @pytest.mark.parametrize("dtype", DTYPES)
-def test_cancellation(dtype, fallback):
+def test_cancellation(dtype, fallback, T):
     """Two experts with opposite down weights: each contribution (+-86016) is above
-    the f16 range, their sum is 0 (f16 x: no inf - inf in the output atomics)."""
+    the f16 range, their sum is 0 (f16 x: no inf - inf in the output atomics, T 1,
+    or in the top-k reduce, T 16: default-rule _reduce)."""
     I, E2 = SHAPES["tp8"], 2
 
     def full(v, *s):
@@ -147,9 +174,9 @@ def test_cancellation(dtype, fallback):
         w2, full(0x38, E2, H, I // 16),
         torch.ones(E2, 2, device="cuda"), torch.full((E2,), 8.0, device="cuda"),
     )  # fmt: skip
-    x = torch.ones(1, H, dtype=dtype, device="cuda")
-    tid = torch.tensor([[0, 1]], dtype=torch.int32, device="cuda")
-    tw = torch.full((1, 2), 0.5, device="cuda")
+    x = torch.ones(T, H, dtype=dtype, device="cuda")
+    tid = torch.tensor([[0, 1]], dtype=torch.int32, device="cuda").repeat(T, 1)
+    tw = torch.full((T, 2), 0.5, device="cuda")
     out = moe_nvfp4(W, x, tid, tw, fallback=fallback)
     assert out.dtype == dtype and (out == 0).all(), out.float().abs().max()
 

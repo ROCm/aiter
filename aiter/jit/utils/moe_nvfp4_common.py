@@ -31,13 +31,14 @@ CFG_DEFAULTS = {
     "staged": False,
     "occ": 1,
     "outbf16": False,
+    "reduce": False,
 }
 _NAME_RE = re.compile(
     r"nvfp4_moe_s([12])_([1-9]\d*)x([1-9]\d*)_(xreg|xstream|xres|xdma)((?:_\w+)?)"
 )
 _TOKEN_RE = re.compile(r"([a-z]+)([1-9]\d*)(?:x([1-9]\d*))?")  # word number [x number]
 _NUM_TOKENS = ("ksplit", "waves", "xbuf", "gs", "occ")
-_FLAGS = ("upfront", "tight", "xcdremap", "staged", "inbf16", "outbf16")
+_FLAGS = ("upfront", "tight", "xcdremap", "staged", "inbf16", "outbf16", "reduce")
 
 
 def kernel_name(c: dict) -> str:
@@ -60,7 +61,7 @@ def kernel_name(c: dict) -> str:
     t += [f for f in ("upfront", "tight") if c[f]]
     if c["occ"] > 1:
         t.append(f"occ{c['occ']}")
-    t += [f for f in ("xcdremap", "staged", "inbf16", "outbf16") if c[f]]
+    t += [f for f in ("xcdremap", "staged", "inbf16", "outbf16", "reduce") if c[f]]
     return "_".join(t)
 
 
@@ -130,6 +131,12 @@ def outbf16(name: str) -> str:
     return name if name.endswith("_outbf16") else name + "_outbf16"
 
 
+def reduce_twin(name: str) -> str:
+    """Top-k reduce (_reduce) build of a stage-2 kernel (any output dtype)."""
+    name = name.removesuffix("_outbf16")
+    return name if name.endswith("_reduce") else name + "_reduce"
+
+
 def default_rows(H: int, I: int, x_dtype: str, out_dtype: str, fb: bool) -> tuple:
     """Default rule: ((T, [stage-1 names], [stage-2 names]), ...); moe_nvfp4 takes
     the first name of a list that fits the shape and drops a row without one.
@@ -138,7 +145,8 @@ def default_rows(H: int, I: int, x_dtype: str, out_dtype: str, fb: bool) -> tupl
     kernels. Fallback path: _inbf16 stage 1 for bf16 x, and on GS-6 stage-1 scales
     a 16-wave 32x512 stage-1 tile above T 1024 (3 N blocks: half the X loads and
     casts per token; 0.93-0.98x of the 32x256 kernel at T 4096-16384). Stage 2
-    reads f16 x_inter; _outbf16 for bf16 output.
+    reads f16 x_inter; _outbf16 for bf16 output; f16 output: _reduce above T 8
+    (f32 atomics: 1.02-1.05x of it up to T 8, 1.07-1.9x from T 256-512).
     """
     kt2 = I // 128
     g1, g2 = GS_SFX[scale_gs(H // 128)], GS_SFX[scale_gs(kt2)]
@@ -167,6 +175,8 @@ def default_rows(H: int, I: int, x_dtype: str, out_dtype: str, fb: bool) -> tupl
             s1 = [inbf16_twin(n) for n in s1]
         if out_dtype == "bf16":
             s2 = [outbf16(n) for n in s2]
+        elif t > 8:
+            s2 = [reduce_twin(n) for n in s2]
         out.append((t, s1, s2))
     return tuple(out)
 

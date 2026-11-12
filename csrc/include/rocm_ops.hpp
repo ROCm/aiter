@@ -2956,6 +2956,11 @@ namespace py = pybind11;
           py::arg("num_experts"),                                                          \
           py::arg("block_m"),                                                              \
           py::arg("nblk"));                                                                \
+    m.def("moe_nvfp4_reduce",                                                              \
+          &aiter::moe_nvfp4_reduce,                                                        \
+          py::arg("ws"),                                                                   \
+          py::arg("out"),                                                                  \
+          py::arg("topk"));                                                                \
     m.def("moe_nvfp4_gemm",                                                                \
           &aiter::moe_nvfp4_gemm,                                                          \
           py::arg("kernel"),                                                               \

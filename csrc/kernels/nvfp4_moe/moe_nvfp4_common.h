@@ -39,7 +39,9 @@ struct Params
     const float* sorted_w;
     const int* sorted_eids;
     const int* num_valid;
-    uint8_t* out; // stage1: x_inter f16 [T*topk, I]; stage2: f32 (Cfg::outbf16: bf16) [T, H]
+    // stage1: x_inter f16 [T*topk, I]; stage2: f32 [T, H] (Cfg::outbf16: bf16, Cfg::reduce:
+    // f32 [T*topk, H])
+    uint8_t* out;
     int T, topk;
     int K;      // reduction length
     int ntiles; // weight row tiles per expert (stage1: 2I/16, stage2: H/16)
@@ -79,7 +81,8 @@ struct Cfg
     bool xcdremap     = false; // XCD remap of the block order (+ row-contiguous X DMA lanes)
     bool staged       = false; // stage 2: route weights early, all C reads before the atomics
     int occ           = 1;     // waves per EU hint
-    bool outbf16      = false; // stage 2: bf16 output (else f32 workspace)
+    bool outbf16      = false; // stage 2: bf16 output atomics (else f32 workspace atomics)
+    bool reduce       = false; // stage 2: f32 [T*topk, H] rows, plain stores (moe_nvfp4_reduce)
 };
 
 // Field combinations the kernels implement. Names are checked by parse_kernel
@@ -103,6 +106,9 @@ constexpr bool cfg_valid(const Cfg& c)
         return false;
     // bf16 output only in stage 2 (stage 1 writes f16 x_inter)
     if(c.outbf16 && c.s1)
+        return false;
+    // reduce rows: stage 2, f32
+    if(c.reduce && (c.s1 || c.outbf16))
         return false;
     return true;
 }
@@ -596,7 +602,8 @@ DEV void read_route_weights(float (&rw)[MT], const Params& p, int e, int mblk, i
 }
 
 // Stage 2: acc * route weight -> the wave's LDS C rows (c_lds), wave-local transpose, then bf16 x2
-// atomics (C.outbf16) or two f32 atomics per column pair (f32 workspace of f16 output): one
+// atomics (C.outbf16), two f32 atomics per column pair (f32 workspace of f16 output) or (C.reduce)
+// an f32 pair store to the (token, slot) row of the [T*topk, H] reduce workspace: one
 // instruction covers 64 consecutive column pairs of 64 / (8 NT) rows instead of 16 rows x 16 B.
 // C.staged: every C value and row token of the wave is read before the first atomic. Other NT
 // (not 1, 2, 4 or 8k): an instruction covers the largest divisor of the 8 NT column pairs that
@@ -625,11 +632,15 @@ DEV void s2_epilogue(const Params& p,
     constexpr int ROW_STEPS  = 16 * MA / INST_ROWS;
     constexpr int COL_STEPS  = COL_PAIRS / INST_PAIRS;
     static_assert(16 % INST_ROWS == 0, "the rows of an instruction are in one 16-row tile");
-    int out_token[C.m_tiles]; // token of row 16 m + lane_col, -1: padding (no store)
+    // token (C.reduce: token * topk + slot) of row 16 m + lane_col, -1: padding (no store)
+    int out_token[C.m_tiles];
 #pragma unroll
     for(int m = 0; m < MA; m++)
     {
-        out_token[m] = rt.valid[m] ? rt.token[m] : -1;
+        if constexpr(C.reduce)
+            out_token[m] = rt.valid[m] ? rt.token[m] * p.topk + rt.slot[m] : -1;
+        else
+            out_token[m] = rt.valid[m] ? rt.token[m] : -1;
 #pragma unroll
         for(int j = 0; j < NT; j++)
             *(v4f*)(c_lds + (16 * m + w.lane_col) * C_STRIDE + 16 * j + 4 * w.lane_group) =
@@ -638,7 +649,7 @@ DEV void s2_epilogue(const Params& p,
     __syncwarp(); // lanes read C rows written by other lanes of the wave
     const int col_pair = w.lane % INST_PAIRS;
     const int n_begin  = (w.nblock * C.waves + w.wave_n) * NT * 16;
-    // packed: bf16 x2 (C.outbf16), else the f32 pair (f32 workspace of f16 output)
+    // packed: bf16 x2 (C.outbf16), else the f32 pair
     using Packed = std::conditional_t<C.outbf16, int, float2>;
     int row_token[ROW_STEPS];
     Packed packed[ROW_STEPS][COL_STEPS];
@@ -668,7 +679,9 @@ DEV void s2_epilogue(const Params& p,
             {
                 const uint32_t col = n_begin + 2 * (col_pair + h * INST_PAIRS);
                 const uint32_t idx = (uint32_t)row_token[r] * p.n_out + col;
-                if constexpr(C.outbf16)
+                if constexpr(C.reduce)
+                    *(float2*)(p.out + ((size_t)row_token[r] * p.n_out + col) * 4) = packed[r][h];
+                else if constexpr(C.outbf16)
                     __builtin_amdgcn_global_atomic_fadd_v2bf16(
                         (v2bf*)(p.out + idx * 2), __builtin_bit_cast(v2bf, packed[r][h]));
                 else

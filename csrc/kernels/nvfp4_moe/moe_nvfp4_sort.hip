@@ -6,11 +6,12 @@
 
 // ---------------------------------------------------------------- fused prep
 // One launch replaces moe_sorting + activation cast: block 0 sorts the routing (one
-// workgroup), blocks 1.. zero the output for the stage2 atomics and cast X (bf16) to f16
+// workgroup), blocks 1.. zero the buffer of the stage2 atomics (out_vecs 16 B vectors: bf16
+// output, the f32 workspace of f16 output; 0 for Cfg::reduce) and cast X (bf16) to f16
 // (x_f16 null: no cast, for f16 X or _inbf16 stage-1 kernels). Sorted layout matches the gemm
 // kernels: per expert, ceil(count / BM) blocks of BM entries (token | slot << 24, padding
 // token = T).
-// Cast blocks: all SORT_THREADS lanes, 8 elements per lane (one 16 B load / zero / store); the
+// Cast blocks: all SORT_THREADS lanes, one 16 B vector per lane (zero, 8 X elements); the
 // f16 X store is non-temporal (gives stage1 2-4% of layer time back at M384-768).
 constexpr int SORT_THREADS     = 1024;
 constexpr int SORT_PER_THREAD  = 4; // T * topk <= 4096
@@ -22,14 +23,14 @@ struct PrepParams
 {
     const uint16_t* x;
     uint8_t* x_f16;
-    uint16_t* out;
+    uint8_t* out;
     const int* ids;
     const float* w;
     int* sorted_ids;
     float* sorted_w;
     int* sorted_eids;
     int* num_valid;
-    int T, H, topk, E, BM, nblk;
+    int T, H, topk, E, BM, nblk, out_vecs;
 };
 
 __global__ __launch_bounds__(SORT_THREADS) void nvfp4_moe_sort_cast(PrepParams p)
@@ -38,10 +39,9 @@ __global__ __launch_bounds__(SORT_THREADS) void nvfp4_moe_sort_cast(PrepParams p
     if(blockIdx.x > 0)
     {
         const int vec = (blockIdx.x - 1) * SORT_THREADS + tid;
-        if(vec >= p.T * p.H / 8)
-            return;
-        ((v4i*)p.out)[vec] = v4i{0, 0, 0, 0};
-        if(p.x_f16)
+        if(vec < p.out_vecs)
+            ((v4i*)p.out)[vec] = v4i{0, 0, 0, 0};
+        if(p.x_f16 && vec < p.T * p.H / 8)
             __builtin_nontemporal_store(cast_bf16x8_f16(((const v4i*)p.x)[vec]),
                                         (v4i*)p.x_f16 + vec);
         return;
@@ -141,8 +141,10 @@ extern "C" int moe_nvfp4_kernels_sort(const PrepParams* hp, hipStream_t stream)
     const PrepParams p = *hp;
     if(p.T * p.topk > SORT_THREADS * SORT_PER_THREAD || p.E > SORT_MAX_EXPERTS)
         return -2;
-    // one 8-element vector per cast lane
-    const int n_cast_blocks = (p.T * p.H / 8 + SORT_THREADS - 1) / SORT_THREADS;
+    // one 16 B vector (8 X elements) per cast lane
+    const int cast_vecs     = p.x_f16 ? p.T * p.H / 8 : 0;
+    const int n_vecs        = p.out_vecs > cast_vecs ? p.out_vecs : cast_vecs;
+    const int n_cast_blocks = (n_vecs + SORT_THREADS - 1) / SORT_THREADS;
     hipLaunchKernelGGL(
         nvfp4_moe_sort_cast, dim3(1 + n_cast_blocks), dim3(SORT_THREADS), 0, stream, p);
     return (int)hipGetLastError();

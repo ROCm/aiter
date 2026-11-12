@@ -55,6 +55,7 @@ extern "C" void moe_nvfp4_kernels_cfg_info(int i, int* out)
     out[CFG_GS]      = c.gs;
     out[CFG_INBF16]  = c.inbf16;
     out[CFG_OUTBF16] = c.outbf16;
+    out[CFG_REDUCE]  = c.reduce;
 }}
 extern "C" int moe_nvfp4_kernels_cfg_fits(int i, int K) {{ return g_instances[i]->fits(K); }}
 extern "C" int
