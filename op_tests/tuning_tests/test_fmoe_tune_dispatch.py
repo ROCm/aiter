@@ -852,7 +852,7 @@ class TestFmoeTuneDispatch(unittest.TestCase):
                 self.assertNotIn("watts", plain.columns)
 
     def test_mxfp4_finalist_stays_inside_the_latency_band(self):
-        m = self.gemm_moe_tune
+        from aiter.tuning.moe import mxfp4
 
         def cand(name, us, err):
             return {
@@ -866,7 +866,7 @@ class TestFmoeTuneDispatch(unittest.TestCase):
         close = cand("close", 100.5, 0.01)  # 0.5% from the fastest, inside 1%
         far = cand("far", 102.0, 0.0)  # 2% out, but the most accurate
         self.assertEqual(
-            m._select_mxfp4_finalist([far, fast, close])["kernelName1"], "close"
+            mxfp4._select_mxfp4_finalist([far, fast, close])["kernelName1"], "close"
         )
         percent = {
             "kernelName1": "pct",
@@ -875,13 +875,15 @@ class TestFmoeTuneDispatch(unittest.TestCase):
             "err1": "1.0%",
         }
         raw = cand("raw", 100.0, 0.02)
-        self.assertEqual(m._select_mxfp4_finalist([raw, percent])["kernelName1"], "pct")
-        finalists = m._select_mxfp4_performance_finalists([far, fast, close], 1)
+        self.assertEqual(
+            mxfp4._select_mxfp4_finalist([raw, percent])["kernelName1"], "pct"
+        )
+        finalists = mxfp4._select_mxfp4_performance_finalists([far, fast, close], 1)
         self.assertEqual(finalists[0]["kernelName1"], "fast")
         # far is outside the band, so promotion is what keeps its accuracy.
-        promoted = m._select_mxfp4_accuracy_promotion([fast, close, far], finalists)
+        promoted = mxfp4._select_mxfp4_accuracy_promotion([fast, close, far], finalists)
         self.assertEqual(promoted["kernelName1"], "far")
-        self.assertIsNone(m._select_mxfp4_accuracy_promotion([fast], finalists))
+        self.assertIsNone(mxfp4._select_mxfp4_accuracy_promotion([fast], finalists))
 
     def test_result_to_csv_tag_rules_differ_between_fmoe_and_mxfp4(self):
         # The runtime skips only flydsl_fallback rows (fused_moe.py). FmoeTuner
