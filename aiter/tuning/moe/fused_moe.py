@@ -1038,6 +1038,7 @@ class FmoeTuner(TunerCommon):
                 verbose=args.verbose,
                 policy=self.policy_for(args),
                 final_timing=True,
+                default_device="cuda",
             )
 
         # Identify failed cases
@@ -2193,6 +2194,7 @@ class FmoeTuner(TunerCommon):
 
 
 def main():
+    torch.set_default_device("cuda")
     key = [
         "gfx",
         "cu_num",

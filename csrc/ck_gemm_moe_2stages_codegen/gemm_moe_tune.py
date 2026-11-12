@@ -7,7 +7,6 @@ from aiter.tuning.moe.fused_moe import FmoeTuner, main
 from aiter.tuning.moe.grouped import GroupedFmoeTuner
 from aiter.tuning.moe.mxfp4 import Mxfp4FlydslTuner
 
-torch.set_default_device("cuda")
 torch.int4 = getattr(torch, "int4", torch.uint32)
 
 __all__ = ["FmoeTuner", "GroupedFmoeTuner", "Mxfp4FlydslTuner", "main"]

@@ -159,6 +159,7 @@ class TestFmoeTuneDispatch(unittest.TestCase):
 
         def fake_mp(tasks, *args, **kwargs):
             got["tasks"] = list(tasks)
+            got["default_device"] = kwargs.get("default_device")
             return []
 
         cleaned = {k: v for k, v in os.environ.items() if k not in _TUNER_ENV}
@@ -173,6 +174,8 @@ class TestFmoeTuneDispatch(unittest.TestCase):
             for name in GENERATORS:
                 stack.enter_context(mock.patch.object(self.tuner, name, make(name)))
             out = self.tuner.tune(frame, None, self.args)
+        if "default_device" in got:
+            self.assertEqual(got["default_device"], "cuda")
         return out, calls, got
 
     def info(
@@ -678,6 +681,7 @@ class TestFmoeTuneDispatch(unittest.TestCase):
 
         def fake_mp(tasks, *args, **kwargs):
             got["tasks"] = list(tasks)
+            got["default_device"] = kwargs.get("default_device")
             return []
 
         cleaned = {k: v for k, v in os.environ.items() if k not in _TUNER_ENV}
@@ -692,6 +696,8 @@ class TestFmoeTuneDispatch(unittest.TestCase):
             contextlib.redirect_stdout(io.StringIO()),
         ):
             self.tuner.tune(frame, None, self.args)
+        if "default_device" in got:
+            self.assertEqual(got["default_device"], "cuda")
         return got.get("tasks", [])
 
     def pre_processed(self, tuner, untuned_rows, tuned_rows):

@@ -2078,6 +2078,7 @@ def _mxfp4_tune_shape_worker(payload):
     keys, row, args, gpu = payload
     try:
         torch.cuda.set_device(gpu)
+        torch.set_default_device("cuda")
         tuner = Mxfp4FlydslTuner.__new__(Mxfp4FlydslTuner)
         tuner.keys = keys
         row["gfx"], row["cu_num"] = tuner._runtime_device_identity(gpu)
