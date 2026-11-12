@@ -191,7 +191,7 @@ def check_ring_specialization():
         param = make_gemm_a16w16_param_and_validate(m, 7168, 3584, cfg)
         assert param is not None
         name = make_gemm_a16w16_gfx950_kernel_name(param)
-        assert name.endswith("_ring5") == want
+        assert name.endswith("_ring5ab") == want
         selected.append(param)
     # One specialization per policy, not one binary per exact padded M.
     assert selected[64] is selected[127]
@@ -223,7 +223,7 @@ def check_ring_specialization():
     param = make_gemm_a16w16_param_and_validate(
         128, 7168, 512, {**cfg, "unroll_lds_ring": True}
     )
-    assert not make_gemm_a16w16_gfx950_kernel_name(param).endswith("_ring5")
+    assert not make_gemm_a16w16_gfx950_kernel_name(param).endswith("_ring5ab")
     assert cfg == original
     aiter.logger.info("LDS-ring shape/config/cache specialization checks passed")
 

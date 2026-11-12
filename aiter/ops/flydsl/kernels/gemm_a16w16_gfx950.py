@@ -340,7 +340,7 @@ def make_gemm_a16w16_gfx950_kernel_name(param: GemmA16W16Gfx950Param):
     name += "_phti" if param.use_half_tile_interleaved else "_pft"
     # Kernel bodies do not participate in FlyDSL's disk-cache key. Distinguish
     # the static-ring implementation from previously cached dynamic-ring code.
-    name += "_ring5" if param.unroll_lds_ring else ""
+    name += "_ring5ab" if param.unroll_lds_ring else ""
     name += "_ng4sk" if param.n_grouped_loads else ""
     name += "_hti5sk" if param.unroll_hti else ""
     name += "_ps2r4_ptr" if param.packed_split else ""
@@ -777,32 +777,58 @@ def gemm_a16w16_gfx950_kernel(
             fx.make_view(smem_b + read_stage * block_n * block_k, b_lds_layout)
         )
 
-        def compute_k_chunk(block_k_iter):
-            frag_A_chunk = frag_A[None, None, block_k_iter]
-            fx.copy(
-                b_s2r_copy_atom,
-                thr_sB_s2r[None, None, block_k_iter],
-                frag_B_retile[None, None, block_k_iter],
-            )
-            fx.copy(
-                a_s2r_copy_atom,
-                thr_sA_s2r[None, None, block_k_iter],
-                frag_A_retile[None, None, block_k_iter],
-            )
+        if const_expr(param.unroll_lds_ring):
+            # Keep both K32 operand fragments live before expanding the K64
+            # GEMM. A-then-B loads with KMN traversal improve this small-M
+            # policy's LDS/MFMA schedule. Each output still accumulates K0 then
+            # K1; the outer K-tile order and all pipeline waits are unchanged.
+            for kk in range_constexpr(block_k // param.mma_k):
+                fx.copy(
+                    a_s2r_copy_atom,
+                    thr_sA_s2r[None, None, kk],
+                    frag_A_retile[None, None, kk],
+                )
+                fx.copy(
+                    b_s2r_copy_atom,
+                    thr_sB_s2r[None, None, kk],
+                    frag_B_retile[None, None, kk],
+                )
             fx.gemm(
                 tiled_mma,
                 frag_C,
-                frag_A_chunk,
-                frag_B[None, None, block_k_iter],
+                frag_A,
+                frag_B,
                 frag_C,
-                traversal_order=fx.GemmTraversalOrder.KNM,
+                traversal_order=fx.GemmTraversalOrder.KMN,
             )
+        else:
 
-        for k_slice in range_constexpr(k_waves):
-            if k_wave_idx == k_slice:
-                for block_k_iter in range_constexpr(k_mma_iters_per_wave):
-                    k_iter = k_slice * k_mma_iters_per_wave + block_k_iter
-                    compute_k_chunk(k_iter)
+            def compute_k_chunk(block_k_iter):
+                frag_A_chunk = frag_A[None, None, block_k_iter]
+                fx.copy(
+                    b_s2r_copy_atom,
+                    thr_sB_s2r[None, None, block_k_iter],
+                    frag_B_retile[None, None, block_k_iter],
+                )
+                fx.copy(
+                    a_s2r_copy_atom,
+                    thr_sA_s2r[None, None, block_k_iter],
+                    frag_A_retile[None, None, block_k_iter],
+                )
+                fx.gemm(
+                    tiled_mma,
+                    frag_C,
+                    frag_A_chunk,
+                    frag_B[None, None, block_k_iter],
+                    frag_C,
+                    traversal_order=fx.GemmTraversalOrder.KNM,
+                )
+
+            for k_slice in range_constexpr(k_waves):
+                if k_wave_idx == k_slice:
+                    for block_k_iter in range_constexpr(k_mma_iters_per_wave):
+                        k_iter = k_slice * k_mma_iters_per_wave + block_k_iter
+                        compute_k_chunk(k_iter)
 
     # Prime the staged LDS pipeline: preload the first `stages - 1` K tiles
     # before entering the main loop that overlaps async loads with compute.
