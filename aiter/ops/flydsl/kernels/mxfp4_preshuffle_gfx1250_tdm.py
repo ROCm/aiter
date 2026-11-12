@@ -321,6 +321,9 @@ def build_gemm_a8w4_tdm_task(
     # Keep the experiment switch as an override while normal dispatch obtains
     # both cluster dimensions from the tuned configuration.
     cluster_m = 1 if FORCE_1X4_CLUSTER else cluster_m
+    # full_cluster is derived from the unpadded tile map, so a tile m_align
+    # skips would leave its M peers waiting in cluster_sync().
+    assert not (m_align and cluster_m > 1), "m_align requires cluster_m=1"
     iglp_params = IGLP_PARAMS["a4w4" if a_is_fp4 else "a8w4"][
         "prefill" if tile_m == 256 and tile_n == 256 and tile_k == 256 else "default"
     ]
@@ -1768,11 +1771,13 @@ def build_gemm_a8w4_tdm_task(
                                         cluster_sync()
 
                     dispatch_wave_job(steady_post)
+                    if const_expr(item_hooks is not None):
+                        item_hooks[0]["drain_start"]()
                     for j in range_constexpr(num_buffers):
                         kt = n_steady + j
                         buf = kt % num_buffers
                         has_next = next_stage_on and j + 1 < num_buffers
-                        pipeline_fence(
+                        stage_fence(
                             outstanding=TDM_PER
                             * max(0, num_buffers - 1 - j - (1 if has_next else 0))
                         )
