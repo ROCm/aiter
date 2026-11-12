@@ -710,7 +710,7 @@ def flydsl_gemm(
         k_stagger=flydsl_config["k_stagger"],
         b_non_temporal=flydsl_config["b_non_temporal"],
         policy=policy,
-        out_dtype=None if skinny else otype,
+        out_dtype=otype,
     )
 
     if bias is not None and fused_bias is None:

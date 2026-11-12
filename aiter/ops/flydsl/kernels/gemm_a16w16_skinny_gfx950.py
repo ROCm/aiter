@@ -3,7 +3,7 @@
 
 """Skinny A16W16 GEMM for gfx950 (the FlyDSL HGEMM ``sk`` policy).
 
-    C[m, n] = A[m, k] @ B[n, k]^T,  bf16 in and out, fp32 accumulate, m <= block_m
+    C[m, n] = A[m, k] @ B[n, k]^T, bf16 inputs, bf16/fp32 output, m <= block_m
 
 A decode GEMM multiplies a few rows of A against a weight it reads exactly once,
 so streaming the weight is the whole cost and any cross-workgroup reduction is
@@ -17,9 +17,9 @@ ring filled by global->LDS DMA (``buffer_load ... lds``, 16 bytes per lane, so
 every instruction covers whole 128-byte lines; XOR-swizzled per 16-byte chunk)
 and multiplies them with 16x16x32 MFMAs. The ring is wave-private, so the K loop
 has no workgroup barrier: ``vmcnt`` alone orders a stage's DMA before its reads.
-The ``k_waves`` fp32 partials are summed once through LDS and stored once as
-bf16. Rows of A at or above m read as zero and rows of C at or above m are
-dropped, both by the buffer-descriptor bounds, so one compiled kernel serves
+The ``k_waves`` fp32 partials are summed once through LDS and stored once in
+the output dtype. Rows of A at or above m read as zero. Rows of C at or
+above m are dropped, both by the buffer-descriptor bounds, so one compiled kernel serves
 every m up to ``block_m``.
 
 Fixed choices, each measured faster than its alternative on MI355X when the
@@ -139,7 +139,12 @@ def compile_gemm_a16w16_skinny_gfx950(
     block_k: int,
     stages: int,
     k_waves: int,
+    out_dtype: torch.dtype = torch.bfloat16,
 ):
+    if out_dtype not in (torch.bfloat16, torch.float32):
+        raise ValueError("skinny HGEMM output must be bf16 or fp32")
+    out_type = fx.Float32 if out_dtype == torch.float32 else fx.BFloat16
+    out_bytes = 4 if out_dtype == torch.float32 else 2
     TA, TN, KC, K_WAVES = block_m, block_n, block_k, k_waves
     # TA = A rows staged; TM = MFMA rows (TA rounded up to 16). MFMA rows in
     # [TA, TM) read other LDS rows, but they only feed C rows >= m, which the
@@ -180,7 +185,8 @@ def compile_gemm_a16w16_skinny_gfx950(
     class SkinnyLdsShared:
         buf: fx.Array[fx.BFloat16, LDS_ELEMS, 16]
 
-    KERNEL_NAME = f"hgemm_bf16_skinny_t{TA}x{TN}x{KC}x{ST}_w1x1x{K_WAVES}"
+    out_suffix = "_fp32c" if out_dtype == torch.float32 else ""
+    KERNEL_NAME = f"hgemm_bf16_skinny{out_suffix}_t{TA}x{TN}x{KC}x{ST}_w1x1x{K_WAVES}"
 
     def mfma(a_fr, b_fr, acc):
         # raw intrinsic: the fragments come straight out of the swizzled LDS
@@ -196,7 +202,7 @@ def compile_gemm_a16w16_skinny_gfx950(
     ):
         acc_init = fx.Vector.filled(4, 0.0, fx.Float32)
         a_bytes = fx.Int64(m) * (k * 2)
-        c_bytes = fx.Int64(m) * (n * 2)
+        c_bytes = fx.Int64(m) * (n * out_bytes)
         a_rsrc = buffer_ops.create_buffer_resource_from_addr(
             fx.Int64(ptrtoint(A)), num_records_bytes=a_bytes
         )
@@ -366,7 +372,7 @@ def compile_gemm_a16w16_skinny_gfx950(
                             result_type=fx.Vector.make_type(4, fx.Float32),
                         )
                         tot = v if const_expr(w == 0) else tot + v
-                    out_v = tot.to(fx.BFloat16)
+                    out_v = tot.to(out_type)
                     c_off = fx.Int32((mf_s * 16 + rr) * n + n0 + cg * 4)
                     buffer_ops.buffer_store(out_v, c_rsrc, c_off)
 
@@ -400,9 +406,16 @@ def compile_gemm_a16w16_skinny_gfx950(
                     result_type=fx.Vector.make_type(DMA_VEC, fx.Float32),
                 )
                 tot = v if const_expr(w == 0) else tot + v
-            out_v = tot.to(fx.BFloat16)
             c_off = fx.Int32(r * n + n0 + c)
-            buffer_ops.buffer_store(out_v, c_rsrc, c_off)
+            if const_expr(out_bytes == 4):
+                # Buffer stores are at most 128 bits. Keep the FP32 sum intact.
+                for start in range_constexpr(0, DMA_VEC, 4):
+                    out_v = fx.Vector.from_elements(
+                        [tot[start + i] for i in range_constexpr(4)], fx.Float32
+                    )
+                    buffer_ops.buffer_store(out_v, c_rsrc, c_off + start)
+            else:
+                buffer_ops.buffer_store(tot.to(out_type), c_rsrc, c_off)
 
     @flyc.jit
     def launch_skinny_kernel(
@@ -441,8 +454,13 @@ def gemm_a16w16_skinny(
     k_waves: int,
     out: torch.Tensor | None = None,
     stream: torch.cuda.Stream | None = None,
+    out_dtype: torch.dtype | None = None,
 ) -> torch.Tensor:
-    """out[m, n] = a[m, k] @ b[n, k]^T on the skinny kernel; bf16 only, no bias."""
+    """Compute a[m,k] @ b[n,k].T from BF16 inputs, without bias.
+
+    Output is BF16 by default, or FP32 when requested. A supplied out buffer
+    sets the dtype when out_dtype is None. M must not exceed block_m.
+    """
     if a.dtype != torch.bfloat16 or b.dtype != torch.bfloat16:
         raise ValueError(f"skinny HGEMM supports bf16 only, got {a.dtype} x {b.dtype}")
     if a.dim() != 2 or b.dim() != 2 or a.shape[1] != b.shape[1]:
@@ -466,16 +484,25 @@ def gemm_a16w16_skinny(
         a = a.contiguous()
     if not b.is_contiguous():
         b = b.contiguous()
+    if out_dtype is None:
+        out_dtype = a.dtype if out is None else out.dtype
+    if out_dtype not in (torch.bfloat16, torch.float32):
+        raise ValueError("skinny HGEMM output must be bf16 or fp32")
+    # The epilogue's buffer-store byte offset is a signed i32.
+    if ((block_m + 15) // 16 * 16) * n * (4 if out_dtype == torch.float32 else 2) > (
+        1 << 31
+    ) - 1:
+        raise ValueError("skinny HGEMM output exceeds the signed byte-offset range")
     if out is None:
-        out = torch.empty((m, n), dtype=torch.bfloat16, device=a.device)
+        out = torch.empty((m, n), dtype=out_dtype, device=a.device)
     elif (
         out.shape != (m, n)
-        or out.dtype != torch.bfloat16
+        or out.dtype != out_dtype
         or not out.is_contiguous()
         or out.device != a.device
     ):
         raise ValueError(
-            f"out must be a contiguous bf16 [{m}, {n}] tensor on {a.device}"
+            f"out must be a contiguous {out_dtype} [{m}, {n}] tensor on {a.device}"
         )
     exe = compile_gemm_a16w16_skinny_gfx950(
         int(n),
@@ -485,10 +512,13 @@ def gemm_a16w16_skinny(
         int(block_k),
         int(stages),
         int(k_waves),
+        out_dtype,
     )
     launch_stream = (
         torch.cuda.current_stream(device=a.device) if stream is None else stream
     )
+    if launch_stream.device != a.device:
+        raise ValueError("stream must be on the input device")
     _run_compiled(
         exe, ptr_arg(out), ptr_arg(a), ptr_arg(b), int(m), fx.Stream(launch_stream)
     )
