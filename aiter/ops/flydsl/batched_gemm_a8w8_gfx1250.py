@@ -94,14 +94,23 @@ def parse_bmm_kernel_name(name: str) -> dict[str, int] | None:
     return cfg
 
 
-def parse_bmm_mx32_kernel_name(name: str) -> dict[str, int] | None:
-    """Parse a batched mxfp8_32 kernelName, or ``None`` if it is not one."""
+@functools.lru_cache(maxsize=1024)
+def _parse_bmm_mx32_kernel_name_cached(name: str) -> dict[str, int] | None:
     match = _BMM_MX32_KERNEL_NAME_RE.fullmatch(name)
     if match is None:
         return None
     cfg = {key: int(value) for key, value in match.groupdict().items()}
     cfg["preload"] = 0
     return cfg
+
+
+def parse_bmm_mx32_kernel_name(name: str) -> dict[str, int] | None:
+    """Parse a batched mxfp8_32 kernelName, or ``None`` if it is not one.
+
+    Every launch parses its kernel name, so the regex result is cached per name;
+    each caller gets its own copy of the dict."""
+    cfg = _parse_bmm_mx32_kernel_name_cached(name)
+    return None if cfg is None else dict(cfg)
 
 
 def bmm_kernel_name(
@@ -235,7 +244,7 @@ def pick_bmm_kernel_name(b: int, m: int, n: int, k: int) -> str:
 
 
 @functools.lru_cache(maxsize=1024)
-def pick_bmm_mx32_kernel_name(
+def _pick_bmm_mx32_kernel_name_exact(
     b: int, m: int, n: int, k: int, w_scale_32x32: bool = False
 ) -> str:
     """Heuristic batched mxfp8_32 config for a shape with no tuned row."""
@@ -285,11 +294,86 @@ def pick_bmm_mx32_kernel_name(
     )
 
 
+@functools.cache
+def _mx32_m_class_params() -> tuple[tuple[tuple[int, int | None], ...], bool]:
+    """How M enters ``_pick_bmm_mx32_kernel_name_exact``.
+
+    The pick reads M only through ``bmm_candidates`` -> ``kernel_fits_shape``
+    on the non-compute, split-K 1, 1x1-cluster instances (M parity when an
+    instance preshuffles A; ``ceil(M / tile_m)`` against ``_MAX_M_BLOCKS`` when
+    ``tile_m < _LARGE_M_TILE_MIN``) and through its rank (``ceil(M / tile_m)``).
+    So ``ceil(M / tile_m)`` per candidate tile_m -- saturated just past the
+    block limit where that limit already rejects the tile -- plus the parity
+    when it matters, determines the pick. Returns
+    ``((tile_m, saturation or None), ...), parity_matters``.
+    """
+    from .gemm_tune.flydsl_gemm_mxfp8_128_bpreshuffle_wmma_common import (
+        _LARGE_M_TILE_MIN,
+        _MAX_M_BLOCKS,
+        is_compute_kernel,
+        kernels_list,
+    )
+
+    tiles = set()
+    parity = False
+    for ki in kernels_list.values():
+        if is_compute_kernel(ki) or ki.split_k != 1:
+            continue
+        if ki.cluster_m != 1 or ki.cluster_n != 1:
+            continue
+        tiles.add(ki.tile_m)
+        parity = parity or bool(ki.a_preshuffle)
+    params = tuple(
+        (tm, _MAX_M_BLOCKS + 1 if tm < _LARGE_M_TILE_MIN else None)
+        for tm in sorted(tiles)
+    )
+    return params, parity
+
+
+# (b, n, k, w_scale_32x32, M class) -> kernel name. Prefill hands the GEMM a new
+# M nearly every step; keying the heuristic on the M class instead of the exact
+# M turns those into hits (a few hundred classes per weight shape vs. every M).
+_MX32_PICK_BY_M_CLASS: dict = {}
+
+
+def pick_bmm_mx32_kernel_name(
+    b: int, m: int, n: int, k: int, w_scale_32x32: bool = False
+) -> str:
+    """Heuristic batched mxfp8_32 config for a shape with no tuned row.
+
+    Same answer as ``_pick_bmm_mx32_kernel_name_exact(b, m, n, k, w_scale_32x32)``,
+    memoised per M class (see ``_mx32_m_class_params``)."""
+    params, parity = _mx32_m_class_params()
+    m_class = tuple(
+        (-(-m // tm) if sat is None else min(-(-m // tm), sat)) for tm, sat in params
+    )
+    key = (b, n, k, bool(w_scale_32x32), m_class, (m & 1) if parity else 0, m > 0)
+    name = _MX32_PICK_BY_M_CLASS.get(key)
+    if name is None:
+        name = _pick_bmm_mx32_kernel_name_exact(b, m, n, k, w_scale_32x32)
+        _MX32_PICK_BY_M_CLASS[key] = name
+    return name
+
+
+def _pick_bmm_mx32_cache_clear() -> None:
+    _MX32_PICK_BY_M_CLASS.clear()
+    _pick_bmm_mx32_kernel_name_exact.cache_clear()
+    _mx32_m_class_params.cache_clear()
+
+
+pick_bmm_mx32_kernel_name.cache_clear = _pick_bmm_mx32_cache_clear
+
+
 def _check_bmm_operands(
-    tag: str, XQ: Tensor, WQ: Tensor, Out: Tensor
+    tag: str, XQ: Tensor, WQ: Tensor, Out: Tensor, fused_fp8_out: bool = False
 ) -> tuple[int, int, int, int, str]:
-    """Shared operand checks of the batched runners; returns (m, b, n, k, out)."""
-    if get_gfx() != "gfx1250":
+    """Shared operand checks of the batched runners; returns (m, b, n, k, out).
+
+    ``fused_fp8_out``: the GEMM quantizes its C tile to e4m3 in the epilogue, so
+    ``Out`` is a 1-byte fp8 buffer. The C staging is still bf16 (what the quant
+    reads), so the returned out name stays ``bf16``.
+    """
+    if get_gfx() not in ("gfx1250", "gfx1250-strict"):
         raise RuntimeError(
             f"[FlyDSL gfx1250 bmm] batched {tag} requires gfx1250, got {get_gfx()}"
         )
@@ -312,12 +396,20 @@ def _check_bmm_operands(
         )
     if XQ.element_size() != 1 or WQ.element_size() != 1:
         raise RuntimeError("[FlyDSL gfx1250 bmm] XQ/WQ must be 1-byte fp8 storage")
-    out_dtype = _OUT_DTYPE_NAME.get(Out.dtype)
-    if out_dtype is None:
-        raise RuntimeError(
-            f"[FlyDSL gfx1250 bmm] unsupported out dtype {Out.dtype}; expected "
-            "bf16/fp16"
-        )
+    if fused_fp8_out:
+        if Out.element_size() != 1:
+            raise RuntimeError(
+                "[FlyDSL gfx1250 bmm] fused fp8 Out must be 1-byte e4m3 storage, "
+                f"got {Out.dtype}"
+            )
+        out_dtype = "bf16"  # C staging dtype; the epilogue quantizes it to e4m3
+    else:
+        out_dtype = _OUT_DTYPE_NAME.get(Out.dtype)
+        if out_dtype is None:
+            raise RuntimeError(
+                f"[FlyDSL gfx1250 bmm] unsupported out dtype {Out.dtype}; expected "
+                "bf16/fp16"
+            )
     if XQ.stride() != (b * k, k, 1):
         raise RuntimeError(
             f"[FlyDSL gfx1250 bmm] XQ must be contiguous [M,B,K], got strides "
@@ -341,13 +433,30 @@ def run_bmm_a8w8_mxfp8_32_gfx1250(
     Out: Tensor,
     kernel_name: str | None = None,
     w_scale_32x32: bool = False,
+    y_scale_out: Tensor | None = None,
 ) -> Tensor:
     """Run the batched mxfp8_32 GEMM; writes into ``Out`` and returns it.
 
     ``w_scale_32x32`` selects the raw ``[B, N//32, K//32]`` block scale; else
     w_scale is the n32k4-shuffled 1x32 ``[B, N, K//32]`` (see module doc).
+
+    ``y_scale_out``: when given, the GEMM quantizes its bf16 C tile to e4m3 in
+    the epilogue instead of writing bf16 -- ``Out`` is then the e4m3 ``[M,B,N]``
+    buffer and ``y_scale_out`` the row-major ``[M, (B*N)//32]`` e8m0 scale, the
+    ``(x, x_scale)`` pair a downstream native-quant GEMM reads. Bit-matches a
+    standalone ATOM ``quantize_fp8`` of the bf16 output.
     """
-    m, b, n, k, out_dtype = _check_bmm_operands("mxfp8_32", XQ, WQ, Out)
+    fused = y_scale_out is not None
+    m, b, n, k, out_dtype = _check_bmm_operands(
+        "mxfp8_32", XQ, WQ, Out, fused_fp8_out=fused
+    )
+    if fused:
+        gn32 = b * n // 32
+        if y_scale_out.element_size() != 1 or y_scale_out.numel() != m * gn32:
+            raise RuntimeError(
+                f"[FlyDSL gfx1250 bmm] y_scale_out must be {m * gn32} e8m0 bytes "
+                f"([M, (B*N)//32]), got {tuple(y_scale_out.shape)} {y_scale_out.dtype}"
+            )
     _lazy_import()
     if n % 32 or k % MX32_BLOCK_K:
         raise RuntimeError(
@@ -410,6 +519,7 @@ def run_bmm_a8w8_mxfp8_32_gfx1250(
         False,  # a_scale_preshuffled
         bool(w_scale_32x32),
         k_tail,
+        fused,  # fuse_quant_out
     )
     # Cached CompiledFunction per constexpr set; see _run_compiled.
     _run_compiled(
@@ -445,6 +555,8 @@ def run_bmm_a8w8_mxfp8_32_gfx1250(
         False,  # a_scale_preshuffled
         bool(w_scale_32x32),
         k_tail,
+        _ptr_arg(y_scale_out) if fused else _ptr_arg(Out),  # arg_scale_out
+        fused,  # fuse_quant_out
         specialization_key=bmm_spec,
     )
     return Out
