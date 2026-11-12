@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: MIT
-# Copyright (C) 2026-2026, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
 
 """Loads tuning configs for unified attention.
 
