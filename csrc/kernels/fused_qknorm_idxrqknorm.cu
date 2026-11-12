@@ -1398,6 +1398,16 @@ static void fused_qknorm_idxrqknorm_impl(
                     reinterpret_cast<uintptr_t>(kv_cache_k->data_ptr()) % 4 == 0,
                 "nvfp4 kv_cache_k and kv_cache_v must be the same uint8 "
                 "[num_pages, 2 * num_kv_heads * 9216] pages (4 B aligned)");
+            // A page stride below the page size (e.g. an expanded view, stride 0) would alias
+            // distinct pages.
+            AITER_CHECK(kv_cache_k->size(0) <= 1 || kv_cache_k->stride(0) >= kv_cache_k->size(1),
+                        "nvfp4 kv_cache page stride must be at least the page size");
+            // The launch runs on qkv's device and reads these through raw pointers.
+            AITER_CHECK(kv_cache_k->device_id == qkv.device_id &&
+                            k_scale->device_id == qkv.device_id &&
+                            v_scale->device_id == qkv.device_id &&
+                            (!process_index || index_cache->device_id == qkv.device_id),
+                        "nvfp4 kv_cache, k_scale, v_scale and index_cache must be on qkv's device");
             k_s_block = kv_cache_k->stride(0);
             v_s_block = k_s_block;
             if(process_index)
