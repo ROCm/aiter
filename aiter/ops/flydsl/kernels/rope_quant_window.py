@@ -739,6 +739,118 @@ def _arch():
     return arch
 
 
+_INDEX_DTYPES = (torch.int32, torch.int64)
+_ZEROS = {}
+
+
+def _request0(t, n):
+    """t, or zeros of its dtype if it has fewer than n entries. A padding row reads request
+    0's cu_seqlens_q / slots without a branch and then drops them; an all-padding step has
+    no request 0 to read."""
+    if t.numel() >= n:
+        return t
+    key = (t.device, t.dtype)
+    if key not in _ZEROS:
+        _ZEROS[key] = torch.zeros(2, device=t.device, dtype=t.dtype)
+    return _ZEROS[key]
+
+
+def _check_operands(
+    query, kv, cos, sin, positions, rope_dim, qat, values, scales, ring, query_fp8
+):
+    """Reject what the kernel would misread or overrun: it takes raw pointers, reads
+    BF16 rows of ``D`` and writes every sink but the strided kv-side rows densely."""
+    tokens, heads, dim = query.shape
+
+    def need(ok, what):
+        if not ok:
+            raise ValueError(f"rope_quant_window: {what}")
+
+    def dense(t, dtype, shape):
+        """t has the dtype (or, for an int, the element size), shape and dense layout."""
+        ok_type = (
+            t.dtype == dtype
+            if isinstance(dtype, torch.dtype)
+            else t.element_size() == dtype
+        )
+        return ok_type and tuple(t.shape) == shape and t.is_contiguous()
+
+    def rows(t, size, shape):
+        """t is [tokens, n] of the element size with a unit inner stride, any row stride."""
+        return (
+            t.element_size() == size and tuple(t.shape) == shape and t.stride(-1) == 1
+        )
+
+    operands = [query, cos, sin, positions]
+    need(query.dtype == torch.bfloat16, "query must be bf16")
+    need(heads == 0 or query.is_contiguous(), "query must be contiguous")
+    need(
+        0 < rope_dim <= dim and rope_dim % 8 == 0,
+        "rope_dim must be a multiple of 8 in (0, D]",
+    )
+    for name, t in (("cos", cos), ("sin", sin)):
+        need(
+            t.dtype == torch.bfloat16
+            and t.dim() == 2
+            and t.shape[1] == rope_dim // 2
+            and t.is_contiguous(),
+            f"{name} must be a contiguous bf16 [positions, rope_dim / 2] table",
+        )
+    need(
+        positions.dtype in _INDEX_DTYPES
+        and dense(positions, positions.dtype, (tokens,)),
+        "positions must be a contiguous int32 / int64 [tokens]",
+    )
+    if kv is not None:
+        need(
+            kv.dtype == torch.bfloat16
+            and tuple(kv.shape) == (tokens, dim)
+            and kv.stride(-1) == 1,
+            "kv must be bf16 [tokens, D] with a unit inner stride",
+        )
+        operands.append(kv)
+    if qat is not None:
+        need(
+            dense(qat, torch.bfloat16, (tokens, dim)),
+            "qat must be a contiguous bf16 [tokens, D]",
+        )
+        operands.append(qat)
+    need(
+        (values is None) == (scales is None), "needs both values and scales, or neither"
+    )
+    if values is not None:
+        need(
+            rows(values, 1, (tokens, dim)) and rows(scales, 1, (tokens, dim // 32)),
+            "values / scales must be 1-byte [tokens, D] / [tokens, D / 32] rows "
+            "with a unit inner stride",
+        )
+        operands += [values, scales]
+    if query_fp8 is not None:
+        qv, qs = query_fp8
+        need(
+            dense(qv, 1, (tokens, heads, dim))
+            and dense(qs, 1, (tokens, heads, dim // 32)),
+            "query_fp8 must be contiguous 1-byte [T, H, D] / [T, H, D / 32]",
+        )
+        operands += [qv, qs]
+    if ring is not None:
+        pool, step, _ = ring
+        index = (step.batch_ids, step.cu_seqlens_q, step.slots)
+        need(
+            all(
+                t.dtype in _INDEX_DTYPES and t.dim() == 1 and t.is_contiguous()
+                for t in index
+            )
+            and tuple(step.batch_ids.shape) == (tokens,),
+            "batch_ids [tokens] / cu_seqlens_q / slots must be contiguous int32 / int64",
+        )
+        operands += [*index, *(pool if isinstance(pool, tuple) else (pool,))]
+    need(
+        all(t.device == query.device for t in operands),
+        "every operand must be on the query's device",
+    )
+
+
 def rope_quant_window(
     query,
     kv,
@@ -766,16 +878,19 @@ def rope_quant_window(
     kv_half = ring is not None or qat is not None or values is not None
     if tokens == 0 or (heads == 0 and not kv_half):
         return
-    if heads > 0 and not query.is_contiguous():
-        raise ValueError("rope_quant_window needs a contiguous query")
-    if (values is None) != (scales is None):
-        raise ValueError("rope_quant_window needs both values and scales, or neither")
-    if kv_half and kv.stride(-1) != 1:
-        raise ValueError("rope_quant_window needs a unit inner stride on kv")
-    if values is not None and (values.stride(-1) != 1 or scales.stride(-1) != 1):
-        raise ValueError(
-            "rope_quant_window needs a unit inner stride on values and scales"
-        )
+    _check_operands(
+        query,
+        kv if kv_half else None,
+        cos,
+        sin,
+        positions,
+        rope_dim,
+        qat,
+        values,
+        scales,
+        ring,
+        query_fp8,
+    )
     arch = _arch()
     wave = 32 if arch == "gfx1250" else 64
     pk8 = arch == "gfx1250"
@@ -786,7 +901,14 @@ def rope_quant_window(
         else QUERY_FP8 if query_fp8 is not None else QUERY_ROTATE
     )
     rows = tokens * heads
-    tdm = pk8 and query_mode == QUERY_FP8 and rows >= TDM_MIN_ROWS
+    # TDM gives each lane 16 contiguous values of a row, and the NoPE part whole ones.
+    tdm = (
+        pk8
+        and query_mode == QUERY_FP8
+        and rows >= TDM_MIN_ROWS
+        and dim == 16 * wave
+        and (dim - rope_dim) % 16 == 0
+    )
     if tdm:
         K, CT, W = TDM_DENSE if rows >= TDM_DENSE_ROWS else TDM_SPARSE
         R = 1
@@ -836,7 +958,11 @@ def rope_quant_window(
     index = (
         (None, None, None)
         if step is None
-        else (step.batch_ids, step.cu_seqlens_q, step.slots)
+        else (
+            step.batch_ids,
+            _request0(step.cu_seqlens_q, 2),
+            _request0(step.slots, 1),
+        )
     )
     device = query.device
     launcher = _build(

@@ -14,9 +14,13 @@ from aiter.jit.utils.chip_info import get_gfx_runtime
 from aiter.test_common import perftest
 from op_tests.rope_quant_window_ref import (
     COS,
+    E8,
+    FP8,
     RD,
+    SENTINEL,
     SIN,
     D,
+    PaddingStep,
     Step,
     byte_diff,
     dev,
@@ -48,8 +52,8 @@ def flydsl(query, kv, positions, kw):
 run_flydsl = perftest()(flydsl)
 
 
-def test_flydsl_rope_quant_window(mode, tokens, heads, idx64):
-    step = Step(tokens, idx64)
+def test_flydsl_rope_quant_window(mode, tokens, heads, idx64, padding=False):
+    step = PaddingStep(tokens, idx64) if padding else Step(tokens, idx64)
     query = with_zeros(
         (torch.randn(tokens, heads, D, device=dev) * 3).to(torch.bfloat16)
     )
@@ -59,21 +63,25 @@ def test_flydsl_rope_quant_window(mode, tokens, heads, idx64):
         (torch.randn(tokens, width, device=dev) * 3).to(torch.bfloat16)
     )
     kv = kv_full[:, 32 : 32 + D] if tokens % 2 else kv_full
-    ref, got = sinks(mode, tokens, heads), sinks(mode, tokens, heads)
+    ref = sinks(mode, tokens, heads)
     ref["query"] = query.clone()
-    kw_ref, kw_got = sink_kwargs(ref, step), sink_kwargs(got, step)
+    kw_ref = sink_kwargs(ref, step)
     has_kv = any(k in kw_ref for k in ("ring", "values", "qat"))
     rope_quant_window_ref(
         ref["query"], kv if has_kv else None, step.positions, rope_dim=RD, **kw_ref
     )
-    # The rotate mode works in place, so the timed calls run on a scratch copy and one call
-    # on a fresh copy gives the bytes.
-    _, us = run_flydsl(query.clone(), kv if has_kv else None, step.positions, kw_got)
+    # The timed calls write scratch sinks and a scratch query (the rotate mode works in
+    # place); one call on fresh ones gives the bytes, so none can come from a timed call.
+    scratch = sink_kwargs(sinks(mode, tokens, heads), step)
+    _, us = run_flydsl(query.clone(), kv if has_kv else None, step.positions, scratch)
+    got = sinks(mode, tokens, heads)
     got["query"] = query.clone()
-    flydsl(got["query"], kv if has_kv else None, step.positions, kw_got)
+    flydsl(got["query"], kv if has_kv else None, step.positions, sink_kwargs(got, step))
     torch.cuda.synchronize()
     bad = byte_diff(ref, got)
-    tag = f"{mode} T={tokens} H={heads} idx64={idx64}"
+    tag = (
+        f"{mode} T={tokens} H={heads} idx64={idx64}{' all-padding' if padding else ''}"
+    )
     result = f"\033[31mbytes differ {bad}\033[0m" if bad else "byte exact"
     aiter.logger.info("[result] %s | %.2f us | vs reference: %s", tag, us, result)
     return not bad
@@ -93,10 +101,44 @@ def test_packed_ring_rejected():
     return False
 
 
+def test_tdm_gate_wide_rows(tokens=4096, heads=128, dim=1024):
+    """Enough query rows for the gfx1250 TDM path, but rows wider than it takes: the rows
+    path has to run them instead."""
+    step = Step(tokens, False)
+    query = (torch.randn(tokens, heads, dim, device=dev) * 3).to(torch.bfloat16)
+    fp8 = [
+        (
+            torch.zeros(tokens, heads, dim, device=dev, dtype=torch.uint8),
+            torch.zeros(tokens, heads, dim // 32, device=dev, dtype=torch.uint8),
+        )
+        for _ in range(2)
+    ]
+    for v, s in fp8:
+        v.fill_(SENTINEL)
+        s.fill_(SENTINEL)
+    ref, got = [(v.view(FP8), s.view(E8)) for v, s in fp8]
+    rope_quant_window_ref(query, None, step.positions, rope_dim=RD, query_fp8=ref)
+    flydsl(query, None, step.positions, {"query_fp8": got})
+    torch.cuda.synchronize()
+    bad = sum(
+        int((r.view(torch.uint8) != g.view(torch.uint8)).sum())
+        for r, g in zip(ref, got)
+    )
+    aiter.logger.info(
+        "[result] qfp8 T=%d H=%d D=%d | vs reference: %s",
+        tokens,
+        heads,
+        dim,
+        f"\033[31mbytes differ {bad}\033[0m" if bad else "byte exact",
+    )
+    return not bad
+
+
 def test_bad_kv_args_rejected():
-    """Arguments the kernel cannot honor raise instead of writing the wrong bytes: values
-    without scales (the scale stores would land on the query) and a kv view with a non-unit
-    inner stride (the kernel reads adjacent elements)."""
+    """Arguments the kernel cannot honor raise instead of writing the wrong bytes: it takes
+    raw pointers, so a missing scales (the scale stores would land on the query), a kv of the
+    wrong width, dtype or inner stride, and a strided dense sink would all be misread or
+    overrun."""
     step = Step(5, False)
     query = torch.zeros(5, 16, D, device=dev, dtype=torch.bfloat16)
     kv = torch.randn(5, D, device=dev).to(torch.bfloat16)
@@ -107,6 +149,21 @@ def test_bad_kv_args_rejected():
         "kv inner stride 2": (
             torch.randn(5, 2 * D, device=dev).to(torch.bfloat16)[:, ::2],
             {"values": o["v"], "scales": o["s"]},
+        ),
+        "kv narrower than D": (kv[:, : D // 2], {"values": o["v"], "scales": o["s"]}),
+        "fp32 kv": (kv.float(), {"values": o["v"], "scales": o["s"]}),
+        "strided qat": (
+            kv,
+            {"qat": torch.zeros(5, 2 * D, device=dev, dtype=torch.bfloat16)[:, ::2]},
+        ),
+        "strided query_fp8": (
+            None,
+            {
+                "query_fp8": (
+                    torch.zeros(5, 16, 2 * D, device=dev, dtype=torch.uint8)[..., ::2],
+                    torch.zeros(5, 16, D // 32, device=dev, dtype=torch.uint8),
+                )
+            },
         ),
     }
     accepted = []
@@ -153,6 +210,19 @@ if __name__ == "__main__":
         for mode in ("rows", "qat+vs", "ringp", "ringps")
         if not test_flydsl_rope_quant_window(mode, 37, 0, False)
     ]
+    # An all-padding step: the ring is untouched and its metadata never read.
+    failed += [
+        f"{mode} T=5 H={heads} all-padding"
+        for mode, heads in (
+            ("qfp8+ringp", 16),
+            ("rot+ringh", 16),
+            ("rot+ringps", 16),
+            ("qat+vs+ringp", 0),
+        )
+        for idx64 in (False, True)
+        if not test_flydsl_rope_quant_window(mode, 5, heads, idx64, padding=True)
+    ]
+    failed += [] if test_tdm_gate_wide_rows() else ["wide-row TDM gate"]
     if not test_packed_ring_rejected():
         failed.append("packed byte ring accepted")
     failed += [f"{name} accepted" for name in test_bad_kv_args_rejected()]

@@ -25,6 +25,7 @@ from op_tests.rope_quant_window_ref import (
     RD,
     SIN,
     D,
+    PaddingStep,
     Step,
     byte_diff,
     dev,
@@ -57,8 +58,10 @@ def run_hip(q, gq, kv, gk, positions, kv_out, kw):
     )
 
 
-def test_fused_qk_rmsnorm_mxfp8_kv_rope_quant(mode, tokens, idx64, n1=1536):
-    step = Step(tokens, idx64)
+def test_fused_qk_rmsnorm_mxfp8_kv_rope_quant(
+    mode, tokens, idx64, n1=1536, padding=False
+):
+    step = PaddingStep(tokens, idx64) if padding else Step(tokens, idx64)
     # q and kv are adjacent slices of one projection, as in the model.
     qkv = with_zeros((torch.randn(tokens, n1 + D, device=dev) * 3).to(torch.bfloat16))
     q, kv = torch.split(qkv, [n1, D], dim=1)
@@ -79,7 +82,7 @@ def test_fused_qk_rmsnorm_mxfp8_kv_rope_quant(mode, tokens, idx64, n1=1536):
     sq_t = sq_t.view(torch.uint8)
     torch.cuda.synchronize()
 
-    tag = f"{mode} T={tokens} idx64={idx64}"
+    tag = f"{mode} T={tokens} idx64={idx64}{' all-padding' if padding else ''}"
     ratios = [
         checkAllclose(
             yk_t, kv_out, rtol=0.02, atol=0.02, msg=f"{tag} kv_out vs triton"
@@ -174,6 +177,17 @@ if __name__ == "__main__":
         for tokens in args.token
         for idx64 in (False, True)
         if not test_fused_qk_rmsnorm_mxfp8_kv_rope_quant(mode, tokens, idx64)
+    ]
+    # An all-padding step: the ring is untouched and its metadata never read. 1025 rows
+    # take the wave kernel.
+    failed += [
+        f"{mode} T={tokens} idx64={idx64} all-padding"
+        for mode in ("ringp", "ringh", "qat+vs+ringp")
+        for tokens in (5, 1025)
+        for idx64 in (False, True)
+        if not test_fused_qk_rmsnorm_mxfp8_kv_rope_quant(
+            mode, tokens, idx64, padding=True
+        )
     ]
     if not test_packed_ring_rejected():
         failed.append("packed byte ring accepted")

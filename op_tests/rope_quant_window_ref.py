@@ -16,6 +16,7 @@ from aiter import dtypes
 FP8 = dtypes.fp8
 E8 = torch.float8_e8m0fnu
 D, RD, MAXPOS, RING = 512, 64, 65536, 8
+SENTINEL = 0x5A
 dev = "cuda"
 
 
@@ -160,6 +161,17 @@ class Step:
         self.positions = pos.to(dev, dt)
 
 
+class PaddingStep:
+    """A step of padding rows only: no request, so cu_seqlens_q is [0] and slots is empty."""
+
+    def __init__(self, tokens, idx64):
+        dt = torch.int64 if idx64 else torch.int32
+        self.batch_ids = torch.full((tokens,), -1, device=dev, dtype=torch.int32)
+        self.cu_seqlens_q = torch.zeros(1, device=dev, dtype=dt)
+        self.slots = torch.zeros(0, device=dev, dtype=dt)
+        self.positions = torch.randint(0, 3000, (tokens,), device=dev).to(dt)
+
+
 def window(start=4096, ring_stride=RING, run_rows=RING):
     """Ring geometry in rows: position p of a slot lands on run p // ring_stride, row
     p % ring_stride of it, runs run_rows apart."""
@@ -200,6 +212,11 @@ def sinks(mode, tokens, heads):
         o["s"] = torch.zeros(tokens, D // 32, device=dev, dtype=E8)
     if "qat" in mode:
         o["qat"] = torch.zeros(tokens, D, device=dev, dtype=torch.bfloat16)
+    # A nonzero sentinel, the same in the reference's sinks, so a store that never lands
+    # shows even where the right byte is 0; rows nobody writes still match.
+    for k, t in o.items():
+        if k != "w":
+            t.view(torch.uint8).fill_(SENTINEL)
     return o
 
 

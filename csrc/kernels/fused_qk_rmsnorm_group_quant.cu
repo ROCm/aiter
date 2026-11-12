@@ -150,14 +150,14 @@ __device__ __forceinline__ KvRopePrefetch<TDS> kv_rope_prefetch(
         p.sin = *reinterpret_cast<const pairs_t*>(a.sin + t);
     }
     p.ring_row = -1;
-    if(a.pool != nullptr && active)
+    // A padding row owns no request, so its request's metadata is not read: an all-padding
+    // step has none. The batch is uniform over the row, and both loads wait for it anyway.
+    if(a.pool != nullptr && active && idx.batch >= 0)
     {
-        // A padding row owns no request, and a row the ring has scrolled past has nowhere to
-        // land; the second also keeps two tokens of one request off the same row. Both loads
-        // go out at once, on request 0 for a padding row, and the test only selects.
-        const int64_t live = idx.batch < 0 ? 0 : idx.batch;
-        const int64_t end = kv_load_index(a.cu, live + 1, a.cu64);
-        const int64_t slot = kv_load_index(a.slots, live, a.slot64);
+        // A row the ring has scrolled past has nowhere to land; this also keeps two tokens of
+        // one request off the same row.
+        const int64_t end = kv_load_index(a.cu, idx.batch + 1, a.cu64);
+        const int64_t slot = kv_load_index(a.slots, idx.batch, a.slot64);
         // A live token's position and the ring's sizes are non-negative and fit in 32 bits;
         // 64-bit division is a long software sequence.
         const uint32_t ring_pos =
@@ -166,7 +166,7 @@ __device__ __forceinline__ KvRopePrefetch<TDS> kv_rope_prefetch(
         const int64_t row = slot * a.slot_rows + a.ring_start +
                             static_cast<int64_t>(ring_pos / stride) * a.run_rows +
                             ring_pos % stride;
-        p.ring_row = idx.batch >= 0 && token >= end - a.ring_slots ? row : -1;
+        p.ring_row = token >= end - a.ring_slots ? row : -1;
     }
     return p;
 }
