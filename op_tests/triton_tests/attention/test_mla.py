@@ -984,48 +984,62 @@ def test_mla_decode_fwd_unshuffled_tuned_h64(
 
 
 @pytest.mark.parametrize(
-    "batch_size, max_seqlen_kv, expect_tuned",
+    "num_query_heads, batch_size, max_seqlen_kv, expect_tuned",
     [
         # B=1 at KV <= 16384 has an empty entry on purpose: the untuned path won.
-        (1, 9216, False),
-        (4, 9216, True),
-        (32, 9216, True),
-        (128, 9216, True),
-        (8, 32768, True),
-        (32, 32768, True),
-        (64, 32768, True),
-        (32, 65536, True),
-        (64, 131072, True),
+        (8, 1, 9216, False),
+        (8, 4, 9216, True),
+        (8, 32, 9216, True),
+        (8, 128, 9216, True),
+        (8, 8, 32768, True),
+        (8, 32, 32768, True),
+        (8, 64, 32768, True),
+        (8, 32, 65536, True),
+        (8, 64, 131072, True),
         # No bucket covers these: they get the H_LEQ_8 entry.
-        (136, 9216, True),
-        (32, 262144, True),
+        (8, 136, 9216, True),
+        (8, 32, 262144, True),
+        # H < 8 uses the same entries: SPLIT_FP8 stays on, ROWSPLIT is dropped.
+        (4, 32, 32768, True),
+        (4, 136, 9216, True),
     ],
 )
 @torch.inference_mode()
 def test_mla_decode_fwd_unshuffled_tuned_tp8_bf16(
-    monkeypatch, batch_size, max_seqlen_kv, expect_tuned
+    monkeypatch, num_query_heads, batch_size, max_seqlen_kv, expect_tuned
 ):
-    """TP8 entries (H=8, bf16 query, fp8 KV) of the bf16_fp8 group. The launch
-    uses the entry's warps, stages, split count, partial dtype, EARLY_PRIME,
-    SPLIT_FP8 and ROWSPLIT, and an empty entry keeps the untuned path."""
+    """TP8 entries (H <= 8, bf16 query, fp8 KV) of the bf16_fp8 group. The
+    launch uses the entry's warps, stages, split count, partial dtype,
+    EARLY_PRIME and SPLIT_FP8. ROWSPLIT applies only with 8 heads, and an empty
+    entry keeps the untuned path."""
     if DEVICE_ARCH != "gfx1250":
         pytest.skip("unshuffled LDS pipeline requires gfx1250")
 
     import aiter.ops.triton.attention.mla as mla_module
 
     entry = mla_module._tuned_decode_config(
-        "pipelined_unshuffled", "bf16", "fp8", 8, batch_size, max_seqlen_kv
+        "pipelined_unshuffled",
+        "bf16",
+        "fp8",
+        num_query_heads,
+        batch_size,
+        max_seqlen_kv,
     )
     assert bool(entry) == expect_tuned, entry
+    if num_query_heads < 8:
+        # Else this case does not cover split-FP8 without ROWSPLIT.
+        assert entry.get("SPLIT_FP8"), entry
     grid, kwargs, num_pages, _, ref_args = _run_tuned_unshuffled_decode(
-        monkeypatch, 8, batch_size, max_seqlen_kv, fp8_query=False
+        monkeypatch, num_query_heads, batch_size, max_seqlen_kv, fp8_query=False
     )
     assert kwargs.get("XCHG_MODE", 0) == 0
     if entry:
         for key in ("num_warps", "num_stages", "waves_per_eu"):
             assert kwargs[key] == entry[key], (key, kwargs[key], entry[key])
-        for key in ("Q_FROM_LDS", "EARLY_PRIME", "SPLIT_FP8", "ROWSPLIT"):
+        for key in ("Q_FROM_LDS", "EARLY_PRIME", "SPLIT_FP8"):
             assert kwargs.get(key, 0) == entry.get(key, 0), (key, kwargs, entry)
+        rowsplit = entry.get("ROWSPLIT", 0) if num_query_heads == 8 else 0
+        assert kwargs.get("ROWSPLIT", 0) == rowsplit, (kwargs, entry)
     if "NPOT_SPLITS" in entry:
         # NPOT_SPLITS: the measured count, without power-of-2 rounding.
         assert grid[2] == min(entry["NPOT_SPLITS"], num_pages)
@@ -1034,7 +1048,9 @@ def test_mla_decode_fwd_unshuffled_tuned_tp8_bf16(
     if grid[2] > 1:
         partial_dtype = torch.bfloat16 if entry.get("PARTIAL_BF16") else torch.float32
         assert kwargs["segm_output_ptr"].dtype == partial_dtype
-    _check_tuned_unshuffled_output(ref_args, "mla_decode_fwd tuned TP8 bf16 output")
+    _check_tuned_unshuffled_output(
+        ref_args, f"mla_decode_fwd tuned TP8 bf16 output, H={num_query_heads}"
+    )
 
 
 @pytest.mark.parametrize("batch_size", [1])
