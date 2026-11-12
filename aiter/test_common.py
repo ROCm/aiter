@@ -1,8 +1,10 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
+import atexit
 import copy
 import multiprocessing as mp
 import os
+import sys
 from functools import wraps
 
 import numpy as np
@@ -450,6 +452,73 @@ def get_trace_perf(prof, num_iters, warm_iter=1):
 
 _CATASTROPHIC_REL_THRESHOLD = 0.5
 
+_STRICT_ALLCLOSE_ENV = "AITER_STRICT_ALLCLOSE"
+
+
+def _strict_allclose_default():
+    """Per-file opt-in that turns ``checkAllclose`` verdicts into test failures.
+
+    The variable holds a comma-separated list of test file names, so a file can
+    be gated as soon as its tolerances are known to be right, without waiting
+    for the rest of the suite. ``1`` enables every file at once, which is useful
+    for surveying but not for gating: on a recent green run that would have
+    turned 13 of 17 shards red, and 79% of what it raised was in files whose own
+    accuracy criterion had already passed.
+
+    The runner invokes each test as ``python3 op_tests/test_x.py``, so argv[0]
+    names the file under test without having to inspect the stack.
+
+    Read at call time rather than import time so a single test can set it.
+    """
+    value = os.environ.get(_STRICT_ALLCLOSE_ENV, "").strip()
+    if not value:
+        return False
+    if value == "1":
+        return True
+    current = os.path.basename(sys.argv[0])
+    return any(
+        current == os.path.basename(name.strip())
+        for name in value.split(",")
+        if name.strip()
+    )
+
+
+_strict_failures = []
+
+
+def _record_strict_failure(message):
+    """Log a strict failure now and fail the process once, at exit.
+
+    Raising at the first mismatch would skip the rest of a file that loops over
+    shapes and dtypes: CI would report one failure per run, the test's own
+    summary table would never print, and a survey of how much fails today would
+    undercount. Collecting instead means one run shows everything.
+
+    An explicit ``strict=True`` at a call site still raises immediately -- that
+    is an assertion the test author wrote, and it should behave like one.
+    """
+    logger.error(f"[strict] {message}")
+    _strict_failures.append(message)
+
+
+@atexit.register
+def _fail_on_recorded_strict_failures():
+    """Turn collected strict failures into a non-zero exit.
+
+    ``sys.exit`` and ``raise SystemExit`` do not work here: inside an atexit
+    handler both leave the exit code at 0. ``os._exit`` is the only thing that
+    sets it, and it skips buffer flushing, so flush first.
+    """
+    if not _strict_failures:
+        return
+    total = len(_strict_failures)
+    logger.error(f"[strict] {total} comparison(s) failed:")
+    for message in _strict_failures:
+        logger.error(f"[strict]   {message}")
+    sys.stdout.flush()
+    sys.stderr.flush()
+    os._exit(1)
+
 
 def _relmag_catastrophic(actual_max_delta, b):
     """Relative-magnitude catastrophic heuristic.
@@ -529,7 +598,40 @@ def checkAllclose(
     max_abs_delta=None,
     catastrophic_check=False,
     mask=None,
+    strict=None,
 ):
+    """``strict`` raises on the same mismatch this function already reports as
+    ``failed!``, instead of only logging it. ``None`` defers to
+    ``AITER_STRICT_ALLCLOSE``.
+
+    With ``printLog=False`` -- the tuner's ranking path, which needs the ratio
+    back rather than an exception -- the mismatch raise does not happen, for an
+    explicit ``strict=True`` as much as for the environment default. The
+    non-finite rejection below does still apply there, because it runs before
+    that early return.
+
+    Strict mode also rejects NaN and Inf regardless of ``tol_err_ratio``.
+    Neither is reliably visible to a ratio gate: on a 524,288-element MoE
+    output, 5% of the tensor can be NaN and still sit inside the default 0.05
+    allowance, and matching Infs compare equal under ``torch.isclose`` so they
+    produce no mismatch to count in the first place.
+
+    An explicit ``strict=True`` raises at the call site. The environment opt-in
+    instead collects failures and fails the process at exit, so a file that
+    loops over shapes reports all of them in one run rather than stopping at
+    the first.
+    """
+    # An explicit argument is an assertion the test author wrote, so it raises
+    # where it stands. The environment opt-in defers; see _record_strict_failure.
+    strict_raises = strict is not None
+    if strict is None:
+        strict = printLog and _strict_allclose_default()
+
+    def _strict_fail(message):
+        if strict_raises:
+            raise AssertionError(message)
+        _record_strict_failure(message)
+
     isClose = torch.isclose(a, b, rtol=rtol, atol=atol)
     # mask (bool, broadcastable to a/b): True = compare, False = ignore.
     # Error ratio is taken over the checked elements only.
@@ -548,6 +650,18 @@ def checkAllclose(
             return 0
     else:
         denom = a.numel()
+
+    # Checked before the all-close branch: torch.isclose(inf, inf) is True, so a
+    # tensor of matching Infs never reaches the mismatch path at all.
+    if strict:
+        finite = torch.isfinite(a) & torch.isfinite(b)
+        if mask is not None:
+            finite = finite | ~mask
+        if not finite.all():
+            _strict_fail(
+                f"{msg}non-finite values in the comparison "
+                f"({int((~finite).sum().item())} of {denom} elements)"
+            )
 
     if isClose.all():
         if printLog:
@@ -625,6 +739,11 @@ def checkAllclose(
             raise AssertionError(
                 f"{msg}catastrophic error: max abs delta {actual_max_delta:.4f}, "
                 f"{percent:.1%} ({num} of {denom}) elements mismatch"
+            )
+        if strict and percent > tol_err_ratio:
+            _strict_fail(
+                f"{msg}{percent:.1%} ({num} of {denom}) elements exceed "
+                f"{atol=} {rtol=}, max abs delta {actual_max_delta:.4f}"
             )
         return percent
 
