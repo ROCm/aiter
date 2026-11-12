@@ -9,7 +9,7 @@ One public entry per KV layout: the name carries the layout (the model version t
 introduced it) and the tensors' dtypes carry the precision, so a new precision of a
 layout is a new dtype case, not a new entry.
 
-* :func:`mla_sparse_prefill`     -- unscaled rows (bf16/fp16): opus.
+* :func:`mla_sparse_prefill`     -- unscaled rows (bf16): opus.
 * :func:`mla_sparse_prefill_v4`  -- v4: NoPE with its E8M0 scales in the row, plus bf16
   RoPE (NoPE fp8): asm on gfx1250 with H == 128 (opus if it declines), else opus.
 * :func:`mla_sparse_prefill_v41` -- v4.1: rows with separate ``[*, 16]`` E8M0 scales
@@ -267,9 +267,9 @@ _CLUSTER_COUNT = (2, 4, 8, 16)
 # N 8-256 on gfx1250. v41_a8w4_16mx1_16nx4 reuses the v41_a8w8 fit.
 _KV_SPLIT_FIT = {
     ("gfx950", "v4_a16w16_16mx1_16nx4"): _SplitFit(16, 64, 2, _ANY_COUNT, 90, 0.043),
-    ("gfx950", "v4_a16w16_16mx8_32nx1"): _SplitFit(128, 32, 1, _ANY_COUNT, 0, 0.012),
+    ("gfx950", "v4_a16w16_32mx4_32nx1"): _SplitFit(128, 32, 1, _ANY_COUNT, 150, 0.014),
     ("gfx950", "v4_a8w8_16mx1_16nx4"): _SplitFit(16, 64, 2, _ANY_COUNT, 55, 0.022),
-    ("gfx950", "v4_a8w8_16mx8_32nx1"): _SplitFit(128, 32, 1, _ANY_COUNT, 0, 0.0095),
+    ("gfx950", "v4_a8w8_32mx4_32nx1"): _SplitFit(128, 32, 1, _ANY_COUNT, 150, 0.014),
     ("gfx950", "v41_a8w8_16mx1_16nx4"): _SplitFit(16, 64, 2, _ANY_COUNT, 80, 0.046),
     ("gfx950", "v41_a8w8_16mx4_64nx1"): _SplitFit(64, 64, 1, _ANY_COUNT, 90, 0.025),
     ("gfx950", "v41_a8w4_16mx1_16nx4"): _SplitFit(16, 64, 2, _ANY_COUNT, 80, 0.046),
@@ -297,7 +297,7 @@ def _opus_split_fit(gfx: str, kernel: str, h: int) -> _SplitFit:
     elif kernel in ("v41_a8w8", "v41_a8w4"):
         tile = "16mx1_16nx4" if h <= 16 else "16mx4_64nx1"
     else:
-        tile = "16mx1_16nx4" if h <= 32 else "16mx8_32nx1"
+        tile = "16mx1_16nx4" if h <= 32 else "32mx4_32nx1"
     return _KV_SPLIT_FIT[(gfx, f"{kernel}_{tile}")]
 
 
@@ -365,12 +365,8 @@ def _opus_sparse_prefill(
         opus_mla_v4_prefill_a16w16_gfx1250_fwd,
     )
 
-    if q.dtype not in (torch.bfloat16, torch.float16):
-        raise RuntimeError(f"expects fp16/bf16 q, got {q.dtype}")
-    if gfx == "gfx1250" and q.dtype != torch.bfloat16:
-        raise RuntimeError(
-            f"the gfx1250 code object only provides the bf16 variant, got {q.dtype}"
-        )
+    if q.dtype != torch.bfloat16:
+        raise RuntimeError(f"expects bf16 q, got {q.dtype}")
     if unified_kv.dtype != q.dtype:
         raise RuntimeError(
             f"unified_kv dtype mismatch: unified_kv={unified_kv.dtype}, q={q.dtype}"
@@ -601,10 +597,10 @@ def mla_sparse_prefill(
     num_kv_splits: int | None = None,
     backend: str | None = None,
 ) -> torch.Tensor:
-    """MLA sparse prefill over bf16/fp16 Q/KV (D = 512).
+    """MLA sparse prefill over bf16 Q/KV (D = 512).
 
     Args:
-      q:                 ``[T, H, D]`` bf16/fp16 query.
+      q:                 ``[T, H, D]`` bf16 query.
       unified_kv:        ``[total_pages, D]`` prefix source, same dtype as ``q``.
       kv_indices_prefix: ``[total_prefix]`` int32 row indices into
         ``unified_kv``, concatenated per token.
