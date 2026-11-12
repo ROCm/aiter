@@ -21,6 +21,7 @@ f16, scores / softmax / accumulation are fp32, the output is bf16.
 
 import ctypes
 import functools
+import math
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
@@ -60,6 +61,7 @@ from aiter.ops.flydsl.kernels.minimax_m3_sparse_pa_nvfp4_common import (
     pk_f16,
     xlane4,
 )
+from aiter.ops.flydsl.kernels.tensor_shim import _run_compiled
 
 # Cache-policy bit of buffer loads: non-temporal (streaming). The K data is read once, so it
 # streams; V stays cacheable (measured faster than streaming both).
@@ -627,8 +629,15 @@ def compile_decode(
 # host side
 # ---------------------------------------------------------------------------
 @functools.cache
-def _get_kernel(splits: int, topk: int, xcds: int, late_v: bool):
+def _get_kernel(splits: int, topk: int, xcds: int, late_v: bool, device_index: int):
+    # device_index only keys the cache: the launcher memoises its compiled handle, which
+    # is bound to the device it was compiled on.
     return compile_decode(splits, topk, xcds, late_v)
+
+
+@functools.cache
+def _gfx_arch(device_index: int) -> str:
+    return torch.cuda.get_device_properties(device_index).gcnArchName.split(":")[0]
 
 
 @functools.cache
@@ -643,20 +652,14 @@ def _unit_scale(device_index: int) -> torch.Tensor:
 
 @functools.cache
 def _split_buffers(device_index: int):
-    """Split partials and tickets; allocated on first use, so warm up before capture."""
+    """Split partials and tickets, one set per device; allocated on first use, so warm up
+    before capture. Launches that split a row share them, so they must not overlap on
+    different streams of one device (see ``minimax_m3_sparse_pa_nvfp4_decode``)."""
     dev = f"cuda:{device_index}"
     part = torch.empty(
         (MAX_SPLIT_ROWS + 1) * MAX_SPLITS * 64 * PART_F, dtype=torch.float32, device=dev
     )
     return part, torch.zeros(MAX_SPLIT_ROWS + 1, dtype=torch.int32, device=dev)
-
-
-def _run(exe, *args):
-    cf = getattr(exe, "_cf", None)
-    if cf is None:
-        exe._cf = flyc.compile(exe, *args)
-    else:
-        cf(*args)
 
 
 _HIP_ATTR_NUM_XCCS = 10018
@@ -724,7 +727,21 @@ def minimax_m3_sparse_pa_nvfp4_decode(
     late_v: bool | None = None,
 ) -> torch.Tensor:
     """Row i is query token i % query_len of request i // query_len and attends to
-    the keys of its ``topk_idx`` blocks up to its position."""
+    the keys of its ``topk_idx`` blocks up to its position.
+
+    gfx950 only. Every operand must be on ``q``'s device; ``k_scale`` / ``v_scale`` are
+    one positive float32 element each (a device value, not checked) and ``sm_scale``
+    must be finite and positive. One launch in flight per device: the split partials and
+    arrival counters are one shared buffer per device, so two launches must not overlap
+    on different streams of the same GPU (launches on one stream, and graph replays, are
+    serialized).
+    """
+    if q.device.type != "cuda":
+        raise ValueError(f"q must be a CUDA tensor, got {q.device}")
+    if _gfx_arch(q.device.index) != "gfx950":
+        raise ValueError(
+            f"NVFP4 sparse PA decode requires gfx950, got {_gfx_arch(q.device.index)}"
+        )
     rows, num_heads, head_dim = q.shape
     hkv = topk_idx.shape[0]
     topk = topk_idx.shape[-1]
@@ -736,18 +753,29 @@ def minimax_m3_sparse_pa_nvfp4_decode(
     assert head_dim == D and group * hkv == num_heads and group in (8, 16)
     assert q.dtype == torch.bfloat16 and out.dtype == torch.bfloat16
     assert q.is_contiguous() and out.is_contiguous() and out.shape == q.shape
+    # Q and out are addressed with 32-bit byte offsets.
+    assert q.numel() * q.element_size() < 2**31, "q must be below 2 GiB"
+    page_b = 2 * hkv * (BLK * D // 2 + BLK * D // 16)
     assert kv_cache.dtype == torch.uint8 and kv_cache.stride(0) < 2**31
-    assert kv_cache.stride(0) >= 2 * hkv * (BLK * D // 2 + BLK * D // 16)
+    assert (
+        kv_cache.dim() == 2 and kv_cache.stride(1) == 1
+    ), "kv_cache must be 2-D with a unit last stride"
+    assert (
+        kv_cache.stride(0) >= page_b and kv_cache.size(1) >= page_b
+    ), "kv_cache page is smaller than its payload"
     assert topk_idx.dtype == torch.int32 and topk_idx.shape[1] >= rows
     assert topk_idx.stride(2) == 1
     for t in (block_table, seq_lens):
         assert t.dtype == torch.int32 and t.stride(-1) == 1
     assert rows == seq_lens.shape[0] * query_len
+    for t in (out, kv_cache, topk_idx, block_table, seq_lens):
+        assert t.device == q.device, "all operands must be on q's device"
     dev = q.device.index
     if splits is None:
         splits = 1
         if rows * hkv <= MAX_SPLIT_ROWS:
             splits = decode_splits(rows * hkv, topk, _cu_count(dev))
+    assert 1 <= splits <= MAX_SPLITS, f"splits must be in [1, {MAX_SPLITS}]"
     assert splits == 1 or rows * hkv <= MAX_SPLIT_ROWS
     if xcds is None:
         # The XCD-aware 1-D grid only pays when splits of a row must share an L2; with one
@@ -759,15 +787,21 @@ def minimax_m3_sparse_pa_nvfp4_decode(
     unit = _unit_scale(dev)
     ks = unit if k_scale is None else k_scale
     vs = unit if v_scale is None else v_scale
+    for t in (ks, vs):
+        assert (
+            t.device == q.device and t.dtype == torch.float32 and t.numel() == 1
+        ), "k_scale and v_scale must be one float32 element on q's device"
+    # The softmax runs in scaled units with masked scores at -inf, so it needs c > 0.
     c = float(np.float32(sm_scale) * np.float32(LOG2E))
+    assert math.isfinite(c) and c > 0, "sm_scale must be finite and positive"
     reqs = seq_lens.shape[0]
     if xcds:
         grid_x = -(-(rows * hkv) // xcds) * xcds * splits
     else:
         grid_x = rows
     with torch.cuda.device(q.device):
-        _run(
-            _get_kernel(splits, topk, xcds, late_v),
+        _run_compiled(
+            _get_kernel(splits, topk, xcds, late_v, dev),
             q.data_ptr(),
             kv_cache.data_ptr(),
             topk_idx.data_ptr(),
