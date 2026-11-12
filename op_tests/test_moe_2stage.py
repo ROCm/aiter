@@ -967,12 +967,58 @@ def _row_to_kwargs(row):
     }
 
 
+# vLLM stores the MoE intermediate width rounded up to this and passes the
+# zero-filled tail as intermediate_pad.
+_STORED_INTER_ALIGN = 128
+# 160, 256, 320 and 512 minus this are not multiples of the 160, 128/256, 160/320
+# and 256 tiles tuned at those widths.
+_STORED_ROW_PAD = 64
+
+
+def _iter_padded_flat_cases(row, kwargs, kernel_name1, seen_stored_rows):
+    """Rerun a FLAT/EMSORT MXFP4 row with a non-zero intermediate_pad.
+
+    A row tuned at the logical width is called with the stored layout and must be
+    found by the logical-width retry. A row tuned at the stored width is called
+    with a pad that leaves the logical width off the tile grid; its grid rounds up
+    into the zero pad. Both must dispatch the row's kernel.
+    """
+    flat = row.get("flat", 0)
+    if not (
+        kernel_name1.startswith("_ZN5aiter")
+        and pd.notna(flat)
+        and int(flat) in (AsmMoeMode.NO_SORT, AsmMoeMode.EMSORT)
+        and kwargs["WQDType"] == dtypes.fp4x2
+        and kwargs["actType"] in (aiter.ActivationType.Silu, aiter.ActivationType.Gelu)
+    ):
+        return
+    inter_dim = kwargs["inter_dim"]
+    stored = -(-inter_dim // _STORED_INTER_ALIGN) * _STORED_INTER_ALIGN
+    if stored != inter_dim:
+        yield {
+            **kwargs,
+            "inter_dim": stored,
+            "intermediate_pad": stored - inter_dim,
+            "expected_kernel1": kernel_name1,
+        }
+    # One stored-width case per kernel and shape keeps the large shapes cheap.
+    key = (kernel_name1, kwargs["model_dim"], inter_dim)
+    if inter_dim > _STORED_ROW_PAD and key not in seen_stored_rows:
+        seen_stored_rows.add(key)
+        yield {
+            **kwargs,
+            "intermediate_pad": _STORED_ROW_PAD,
+            "expected_kernel1": kernel_name1,
+        }
+
+
 def _iter_csv_cases():
     """Yield FlyDSL/Opus and SwiGLU OAI asm FLAT cases from every selected model CSV."""
     cu = get_cu_num()
     merged_csv = AITER_CONFIGS.AITER_CONFIG_FMOE_FILE
     df_csv = pd.read_csv(merged_csv)
     rows = df_csv[df_csv["cu_num"] == cu]
+    seen_stored_rows = set()
     for _, row in rows.iterrows():
         tag = row.get("_tag", "")
         if pd.notna(tag) and str(tag).strip():
@@ -1074,10 +1120,15 @@ def _iter_csv_cases():
             kwargs["disable_stage2_bias"] = True
             kwargs["check_aot_cache"] = False
             kwargs["expected_kernel1"] = kernel_name1
-        yield kwargs, {
+        extras = {
             "kernelName1": kernel_name1,
             "kernelName2": kernel_name2,
         }
+        yield kwargs, extras
+        for padded_kwargs in _iter_padded_flat_cases(
+            row, kwargs, kernel_name1, seen_stored_rows
+        ):
+            yield padded_kwargs, extras
 
 
 _PER1X32_BF16_FP4 = (aiter.QuantType.per_1x32, dtypes.bf16, dtypes.fp4x2)

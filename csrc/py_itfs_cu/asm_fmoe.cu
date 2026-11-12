@@ -77,6 +77,15 @@ enum class AsmMoeMode : int
     POST_REDUCE = 3,
 };
 
+// FLAT (NO_SORT) and EMSORT grids cover the logical width rounded up to whole
+// sub_GU tiles. The columns past the logical width are zero pad, so the result
+// is exact as long as the rounded width stays within the stored one.
+static int flat_grid_inter_dim(int stored_inter_dim, int intermediate_pad, int sub_GU)
+{
+    const int logical = stored_inter_dim - intermediate_pad;
+    return (logical + sub_GU - 1) / sub_GU * sub_GU;
+}
+
 class FMoeKernel
 {
     private:
@@ -145,21 +154,23 @@ class FMoeKernel
         uint32_t sub_GU     = this->sub_GU;
         // FLAT (NO_SORT) and EMSORT take the gate->up half offset and the w1/w2
         // strides from args.inter_dim, so they keep the stored width while their
-        // grid (and EMSORT's ps_deno slice count) covers only the logical columns.
-        // A tile straddling that boundary would read pad rows, or the up half when
-        // unpadded. POST_REDUCE and host-sorted kernels run over the stored width;
-        // the zero-filled pad adds 0.
+        // grid (and EMSORT's ps_deno slice count) covers the logical columns rounded
+        // up to whole tiles. A tile past the stored width would read the up half.
+        // POST_REDUCE and host-sorted kernels run over the stored width; the
+        // zero-filled pad adds 0.
         const bool logical_grid = this->flat_mode == AsmMoeMode::NO_SORT ||
                                   this->flat_mode == AsmMoeMode::EMSORT;
         const int grid_inter_dim =
-            logical_grid ? inter_dim - intermediate_pad : inter_dim;
+            logical_grid ? flat_grid_inter_dim(inter_dim, intermediate_pad, sub_GU)
+                         : inter_dim;
         if(logical_grid)
         {
-            AITER_CHECK(grid_inter_dim > 0 && grid_inter_dim % sub_GU == 0,
+            AITER_CHECK(grid_inter_dim > 0 && grid_inter_dim <= inter_dim,
                         __func__,
                         ": ",
                         this->name,
-                        " needs inter_dim - intermediate_pad divisible by sub_GU; got inter_dim=",
+                        " needs inter_dim - intermediate_pad rounded up to sub_GU within "
+                        "inter_dim; got inter_dim=",
                         inter_dim,
                         ", intermediate_pad=",
                         intermediate_pad,
@@ -304,8 +315,7 @@ class FMoeKernel
             const int emsort_tgs = static_cast<int>(args.total_tgs);
             AITER_CHECK(gdx > 0 && (emsort_tgs % gdx) == 0,
                         __func__,
-                        ": EMSORT requires total_tgs divisible by "
-                        "(inter_dim - intermediate_pad)/sub_GU; got total_tgs=",
+                        ": EMSORT requires total_tgs divisible by the slice count; got total_tgs=",
                         emsort_tgs,
                         ", slices=",
                         gdx);
@@ -382,13 +392,13 @@ static bool ps_grid_fits(const CFG::mapped_type& cfg, int inter_dim)
                               cfg.tg_num_perCU * static_cast<int>(get_num_cu_func());
 }
 
-// FLAT and EMSORT rows launch over the logical width (see launch_kernel).
-// POST_REDUCE keeps the stored width.
+// Mirrors launch_kernel: FLAT and EMSORT rows launch over the rounded logical
+// width, POST_REDUCE keeps the stored width.
 static int grid_inter_dim(const CFG::mapped_type& cfg, int inter_dim, int intermediate_pad)
 {
     if(cfg.flat == static_cast<int>(AsmMoeMode::NO_SORT) ||
        cfg.flat == static_cast<int>(AsmMoeMode::EMSORT))
-        return inter_dim - intermediate_pad;
+        return flat_grid_inter_dim(inter_dim, intermediate_pad, cfg.subGU_n);
     return inter_dim;
 }
 
@@ -403,7 +413,7 @@ static bool kernel_fits(const CFG::mapped_type& cfg,
                         int intermediate_pad = 0)
 {
     const int inter_dim = grid_inter_dim(cfg, stored_inter_dim, intermediate_pad);
-    if(cfg.smf != smf || inter_dim % cfg.subGU_n != 0 ||
+    if(cfg.smf != smf || inter_dim > stored_inter_dim || inter_dim % cfg.subGU_n != 0 ||
        model_dim % std::max(cfg.dim_align, 1) != 0 || model_dim < cfg.dim_min ||
        !ps_grid_fits(cfg, inter_dim))
         return false;
