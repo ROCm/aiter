@@ -1466,16 +1466,16 @@ def test_fmha_fwd_bf16_opus_d192_v128_group(
 
 
 # ---------------------------------------------------------------------------
-# Paged-KV varlen forward (block_table): on gfx942 / gfx950 bf16 is taken by the
-# fmha_v3 ASM path, so fp16 is the case that exercises the CK paged-KV split-KV
-# kernels built by cmdGenFunc_mha_varlen_fwd.
+# Paged-KV varlen forward (block_table) on the CK split-KV kernels built by
+# cmdGenFunc_mha_varlen_fwd. fp16 only: on gfx942 / gfx950 a bf16 call with these
+# arguments is taken by the fmha_v3 ASM path instead.
 # ---------------------------------------------------------------------------
 
 
 @pytest.mark.parametrize("return_lse", [False, True])
 @pytest.mark.parametrize("causal", [False, True])
-@pytest.mark.parametrize("dtype", [dtypes.fp16, dtypes.bf16])
-def test_flash_attn_varlen_func_paged_kv(dtype, causal, return_lse):
+def test_flash_attn_varlen_func_paged_kv(causal, return_lse):
+    dtype = dtypes.fp16
     if not get_gfx().startswith("gfx9"):
         pytest.skip("CK paged-KV varlen kernels are generated for gfx9 targets only")
     torch.manual_seed(0)
