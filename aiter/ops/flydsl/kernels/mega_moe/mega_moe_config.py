@@ -1571,6 +1571,14 @@ def _tune_v41_flash_ep4_small(config: MegaMoEConfig, bucket: int) -> MegaMoEConf
     if bucket == 128:
         # Half the GEMM1 n-tiles of tile_n 128: each streams a longer W1 slab (-4%).
         return replace(config, stage1=replace(config.stage1, tile_n=256))
+    if bucket == 256:
+        # EP4 has twice as many local experts as EP8: keep 32-row tiles at
+        # this bucket and give each GEMM1 tile a wider weight slab.
+        return replace(
+            config,
+            stage1=replace(config.stage1, sort_block_m=32, tile_n=256),
+            stage2=replace(config.stage2, block_m=32),
+        )
     if bucket == 512:
         # Half the CTAs leave GEMM1 for GEMM2 after a claim past half their XCD's GEMM1 slice: the XGMI-bound
         # GEMM2 scatter starts while GEMM1 still runs (-2.7%; a quarter: +1.1%, neutral to +1.2% at 128 tokens).
