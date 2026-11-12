@@ -240,18 +240,24 @@ KERNEL_SPECS = {
     ),
 }
 
-# The four deployed Sol-Attn (mode 2) rows, each mapped to the kernel whose
+# One Sol-Attn (mode 2) kernel per mha4_ recipe, each mapped to the kernel whose
 # quantization it reuses, plus what its pooled operands need: whether Q and K carry
 # E8M0 1x32 scales, which routing has to apply to Q and pooling has to give K a pooled
 # copy of, and the packed formats K and V are stored in when their codes cannot be
-# pooled directly.
+# pooled directly. Q is packed exactly when K is, since the two share a format.
 #
-# The all-MXFP4 mode-2 row consumes the FP6-P V order, so its pooled V has to be
-# packed in that order too.
+# Every FP6-P row consumes the FP6-P V order, so its pooled V has to be packed in that
+# order too.
 SOL_KERNELS: dict[str, tuple[str, bool, str | None, str | None]] = {
-    "mha4_fp8_sol": ("mha4_fp8", False, None, None),
+    "mha4_bf16_sol": ("mha4_bf16", False, None, None),
+    "mha4_bf16fp8_sol": ("mha4_bf16fp8", False, None, None),
     "mha4_i8fp8_sol": ("mha4_i8fp8", False, None, None),
     "mha4_mxfp8_sol": ("mha4_mxfp8", True, None, None),
+    "mha4_fp8_sol": ("mha4_fp8", False, None, None),
+    "mha4_f8f6_sol": ("mha4_f8f6", False, None, "mxfp6_fp6_p"),
+    "mha4_f6f8_sol": ("mha4_f6f8", True, "mxfp6", None),
+    "mha4_mxfp6_sol": ("mha4_mxfp6", True, "mxfp6", "mxfp6_fp6_p"),
+    "mha4_f6f4_sol": ("mha4_f6f4", True, "mxfp6", "mxfp4_fp6_p"),
     "mha4_mxfp4_sol": ("mha4_mxfp4", True, "mxfp4", "mxfp4_fp6_p"),
 }
 
@@ -1310,7 +1316,7 @@ def _sol_packed_kwargs(
         k_scale=k_descale if qk_block_scaled and packed_format is None else None,
         q_scale=q_descale if qk_block_scaled and packed_format is None else None,
         k_source=k_source if packed_format is not None else None,
-        v_source=v_source if packed_format is not None else None,
+        v_source=v_source if v_packed_format is not None else None,
         k_packed_format=packed_format,
         v_packed_format=v_packed_format,
         block_attn_mask=block_mask,
@@ -1619,6 +1625,24 @@ def _make_kernel_runner_impl(
         )
 
     if base_kernel == "mha4_bf16":
+        if sol_kernel is not None:
+            # The NONE scale modes leave the descale slots unread, so any tensor holds them.
+            bf16_scale_modes = scale_modes_for_formats(
+                AttentionFormat.BF16, AttentionFormat.BF16, AttentionFormat.BF16
+            )
+            return lambda: launch_mha_v4_packed(
+                q_bshd,
+                k_bshd,
+                v_bshd,
+                q_bshd,
+                k_bshd,
+                v_bshd,
+                AttentionFormat.BF16,
+                AttentionFormat.BF16,
+                AttentionFormat.BF16,
+                *bf16_scale_modes,
+                softmax_scale=softmax_scale,
+            )
         return lambda: launch_mha_v4(
             q_bshd,
             k_bshd,
