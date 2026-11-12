@@ -2412,6 +2412,66 @@ def test_pa_decode_two_page_steps_keep_page_scales(block_size, case, device):
     )
 
 
+@pytest.mark.parametrize(
+    "block_size,heads,query_length,dim,length",
+    [
+        # Two-page steps: 128 tokens of page16 pages, or two page128 pages.
+        pytest.param(16, 16, 1, 128, 128, id="page16-two-page"),
+        pytest.param(128, 16, 1, 128, 256, id="page128-two-page"),
+        # One-page steps of two query tiles, and of unpacked D64 tiles.
+        pytest.param(16, 32, 1, 128, 128, id="page16-two-tiles"),
+        pytest.param(128, 32, 1, 128, 256, id="page128-two-tiles"),
+        pytest.param(64, 16, 1, 64, 256, id="d64-page64"),
+        # Four MTP query tiles in wave pairs.
+        pytest.param(128, 16, 4, 128, 256, id="mtp4-wave-pairs"),
+    ],
+)
+def test_pa_decode_value_factor_below_floor(
+    block_size, heads, query_length, dim, length, device
+):
+    """gfx1250 FP8 V factors below the 1e-20 floor of P normalization.
+
+    Uniform logits, cached V = 1 and per-token V scales of 2.24e-18 give a V
+    factor of 5e-21, so P normalized by the floor is 224, exact in E4M3. Each
+    step's rescale, the half merge and the epilogue must use the floored
+    factor too, or every one of them halves the output.
+    """
+    if get_gfx_runtime() != "gfx1250":
+        pytest.skip("the floored V factor is gfx1250 FP8 pipeline arithmetic")
+    pa = importlib.import_module("aiter.ops.flydsl.pa_decode")
+    fp8, x, value_scale = torch.float8_e4m3fn, 16, 2.24e-18
+    pages = length // block_size
+    query = torch.zeros(query_length, heads, dim, dtype=torch.bfloat16, device=device)
+    query[..., 0] = 1.0
+    key_cache = torch.zeros(pages, 1, dim // x, block_size, x, device=device).to(fp8)
+    value_cache = torch.ones(pages, 1, block_size // x, dim, x, device=device).to(fp8)
+    context = torch.tensor([length], dtype=torch.int32, device=device)
+    output = torch.full_like(query, float("nan"))
+    pa.pa_decode(
+        output,
+        query,
+        key_cache,
+        value_cache,
+        context,
+        torch.arange(pages, dtype=torch.int32, device=device)[None],
+        dim**-0.5,
+        query_length,
+        compute_type=fp8,
+        key_scale=torch.ones(pages, 1, block_size, 1, device=device),
+        value_scale=torch.full((pages, 1, block_size, 1), value_scale, device=device),
+        work_plan=pa.plan_pa_decode(
+            context, 1, max_partitions=1, query_length=query_length
+        ),
+        max_context_length=length,
+    )
+    torch.testing.assert_close(
+        output.double(),
+        torch.full(output.shape, value_scale, dtype=torch.float64, device=device),
+        rtol=0.02,
+        atol=0,
+    )
+
+
 def test_pa_decode_tile_without_context_bound(device):
     """Kernel selection takes the documented max_context_length=None default.
 

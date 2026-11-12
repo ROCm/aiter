@@ -1440,7 +1440,9 @@ class Gfx1250WavePipeline:
             # Empty planned tails carry no new mass. Keep the prior scale
             # so their zero V contribution preserves the output.
             vfactor = (vfactor > 0.0).select(vfactor, fx.Float32(state[-1]))
-            vnorm = fx.Float32(rcp_f32(fx.maxnumf(vfactor, fx.Float32(1e-20))))
+            # P normalization and output restoration share the floored factor.
+            vfactor = fx.maxnumf(vfactor, fx.Float32(1e-20))
+            vnorm = fx.Float32(rcp_f32(vfactor))
         else:
             value_scale = fx.recast_iter(fx.Float32, ctx.value_scale_ptr)
             vfactor = fx.Float32(value_scale[0]) * fx.Float32(1.0 / t.FP8_MAX)
@@ -1566,7 +1568,7 @@ class Gfx1250WavePipeline:
             tile_sum = pairs[0][0] + pairs[0][1]
             tile_sum = tile_sum + tile_sum.shuffle_xor(16, t.WAVE)
             if const_expr(fused):
-                tile_sum = tile_sum * fx.maxnumf(vfactor, fx.Float32(1e-20))
+                tile_sum = tile_sum * vfactor
             pieces = []
             for i in range_constexpr(4):
                 if const_expr(fused):
@@ -1954,13 +1956,13 @@ class Gfx1250Pipeline:
                     factor = vmax * fx.Float32(1.0 / t.FP8_MAX)
                     # Empty planned tails carry no new mass. Keep the prior
                     # scale so their zero V contribution preserves the output.
-                    factors.append((factor > 0.0).select(factor, fx.Float32(state[-1])))
+                    factor = (factor > 0.0).select(factor, fx.Float32(state[-1]))
+                    # P normalization, the half merge and the epilogue share
+                    # the floored factor.
+                    factors.append(fx.maxnumf(factor, fx.Float32(1e-20)))
                 # The accumulator factor is chosen once the halves' softmax
                 # weights are known; see below.
-                norms = [
-                    fx.Float32(rcp_f32(fx.maxnumf(f, fx.Float32(1e-20))))
-                    for f in factors
-                ]
+                norms = [fx.Float32(rcp_f32(f)) for f in factors]
                 half_vnorm = (ctx.warp < 2).select(norms[0], norms[1])
             elif const_expr(t.per_token_kv):
                 # Every wave reduces the tile's scales, avoiding a CTA barrier.
@@ -1984,7 +1986,10 @@ class Gfx1250Pipeline:
                     # Empty planned tails carry no new mass. Keep the prior
                     # scale so their zero V contribution preserves the output.
                     vfactor = (vfactor > 0.0).select(vfactor, fx.Float32(state[-1]))
-                vnorm = fx.Float32(rcp_f32(fx.maxnumf(vfactor, fx.Float32(1e-20))))
+                # P normalization and output restoration share the floored
+                # factor.
+                vfactor = fx.maxnumf(vfactor, fx.Float32(1e-20))
+                vnorm = fx.Float32(rcp_f32(vfactor))
             elif const_expr(not t.bf16):
                 vs = fx.recast_iter(fx.Float32, ctx.value_scale_ptr)
                 vfactor = fx.Float32(vs[0]) * fx.Float32(1.0 / t.FP8_MAX)
@@ -2151,9 +2156,7 @@ class Gfx1250Pipeline:
                             half_weights[0] * factors[0]
                         )
                         vfactor = larger.select(factors[1], factors[0])
-                        vnorm = fx.Float32(
-                            rcp_f32(fx.maxnumf(vfactor, fx.Float32(1e-20)))
-                        )
+                        vnorm = fx.Float32(rcp_f32(vfactor))
                         # Weight each factor before dividing: the products are
                         # at most the chosen one, so no ratio overflows.
                         half_coeffs = [
