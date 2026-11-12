@@ -447,7 +447,7 @@ def build_moe_topids_to_rows_lds_psum_module(n_buckets: int, self_clean: bool):
                 ptr_buf_tensor(masked_m)[tid] = m
                 ptr_buf_tensor(starts)[tid] = start
                 ptr_buf_tensor(psum)[tid] = start + m
-            if const_expr(self_clean):
+            if const_expr(self_clean):  # noqa: SIM102 - constexpr guard
                 if tid == 0:
                     fx.atomic_xchg(
                         _i32_ptr(counter) + n_buckets, fx.Int32(0), syncscope="agent"

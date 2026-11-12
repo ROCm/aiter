@@ -3539,6 +3539,8 @@ def flydsl_moe_fused_quant_preshuffle(
         )
     if payload_preshuffled and row_major_scale:
         raise ValueError("A-preshuffled payload requires M16K4 scales")
+    if route_starts is not None and topids_to_rows is None:
+        raise ValueError("route_starts needs topids_to_rows")
     # A quantizing EP dispatch (fp8 or fp4) already put the payload and its e8m0
     # row on the wire: nothing left to convert, only scatter + preshuffle.
     prequantized = prequantized_scale is not None
@@ -3660,6 +3662,19 @@ def flydsl_moe_fused_quant_preshuffle(
             and token_num >= _TOKEN_MULTIDEST_MIN_TOKENS
             and token_multidest_quant_enabled()
         )
+        # Checked before any launch: every other branch reads topids_to_rows
+        # as final rows and would ignore the (slot, expert) encoding.
+        route_in_quant = route_starts is not None
+        if route_in_quant and (
+            not use_token_multidest
+            or row_to_token is not None
+            or route_rows_out is None
+            or route_expert_bits <= 0
+        ):
+            raise ValueError(
+                "route_starts needs the token-multidest quant without a "
+                "row_to_token map, route_rows_out and route_expert_bits"
+            )
         if use_token_multidest and row_to_token is not None:
             from aiter.ops.flydsl.kernels.moe_fused_route_quant_scatter import (
                 token_multidest_tdm_chunks,
@@ -3686,17 +3701,6 @@ def flydsl_moe_fused_quant_preshuffle(
                 current_stream_arg(),
             )
             return out_payload, out_scale
-        route_in_quant = route_starts is not None
-        if route_in_quant and (
-            not use_token_multidest
-            or row_to_token is not None
-            or route_rows_out is None
-            or route_expert_bits <= 0
-        ):
-            raise ValueError(
-                "route_starts needs the token-multidest quant without a "
-                "row_to_token map, route_rows_out and route_expert_bits"
-            )
         if use_token_multidest:
             from aiter.ops.flydsl.kernels.moe_fused_route_quant_scatter import (
                 token_multidest_ksplit,
