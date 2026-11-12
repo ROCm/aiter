@@ -1119,6 +1119,24 @@ def _tune_v41_flash_ep4(config: MegaMoEConfig, ctx: _TuningContext) -> MegaMoECo
         return config
     if ctx.bucket <= 512:
         config = _replace_config(config, stage1={"num_dispatch_cu": 128})
+    # GEMM1 at 1..4 rows is K-step-latency bound (halving K cut its tail from
+    # ~35 to ~21 us at bs=1).  Non-temporal B loads at bucket 1 (the base keeps
+    # them off there, and bucket 2 inherits bucket 1's base) took 5.6% off; at
+    # 2 and 4 rows the bucket-8 geometry, whose async A copy keeps the scales
+    # and B one step ahead, took 3.5% and 2.6%.
+    if ctx.bucket == 1:
+        config = _replace_config(config, stage1={"b_nt": 3})
+    elif ctx.bucket in (2, 4):
+        config = _replace_config(
+            config,
+            stage1={
+                "b_nt": 3,
+                "tile_n": 512,
+                "num_waves": 8,
+                "async_a_copy": True,
+                "mfma_amajor": True,
+            },
+        )
     return config
 
 
