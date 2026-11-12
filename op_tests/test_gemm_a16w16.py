@@ -688,7 +688,7 @@ def test_gemm_compile_packed_params(m=256, n=512, k=1024, layers=3):
 
 
 def test_asm_rejects_4gib_operands(m=16384, k=128, rows_checked=256):
-    """The asm kernels address A, B and out with 32-bit byte offsets.
+    """The asm kernels give each operand a buffer descriptor with a 32-bit size.
 
     A 4 GiB out used to come back partly wrong with no error, so it must raise;
     an out just below 4 GiB must stay exact.
@@ -697,7 +697,7 @@ def test_asm_rejects_4gib_operands(m=16384, k=128, rows_checked=256):
         return []
     n_over = (1 << 32) // (m * 2)
     n_under = n_over - 256
-    need = 2 * m * n_over + 2 * n_over * k + 4 * rows_checked * n_over * 4
+    need = 4 * m * n_over + 4 * n_over * k + 4 * rows_checked * n_over * 4
     if torch.cuda.mem_get_info()[0] < need + (1 << 30):
         aiter.logger.warning("skip asm 4 GiB check: needs %.1f GiB free", need / 2**30)
         return []
@@ -721,6 +721,24 @@ def test_asm_rejects_4gib_operands(m=16384, k=128, rows_checked=256):
     )
     assert err == 0, f"asm out just below 4 GiB is wrong at {(m, n_under, k)}"
     rows.append({"case": f"asm out < 4 GiB {(m, n_under, k)}", "result": "exact"})
+    if get_gfx() != "gfx950":
+        return rows
+
+    # The 256x256 kernels store fp32 output one 256-row tile at a time, so
+    # only that tile must stay below 4 GiB.
+    del out, out_under
+    n_fp32 = (1 << 32) // (m * 4) + 256
+    out = torch.full((m, n_fp32), float("nan"), dtype=dtypes.fp32, device="cuda")
+    w = torch.randn(n_fp32, k, dtype=dtypes.bf16, device="cuda")
+    aiter.gemm_a16w16_asm(x, w, out, kernelName="_ZN5aiter24bf16gemm_bf16_tn_256x256E")
+    ref = F.linear(x[-rows_checked:].float(), w.float())
+    err = checkAllclose(
+        ref, out[-rows_checked:], msg=f"asm 256x256 fp32 out > 4 GiB {(m, n_fp32, k)}: "
+    )
+    assert err == 0, f"asm 256x256 fp32 out above 4 GiB is wrong at {(m, n_fp32, k)}"
+    rows.append(
+        {"case": f"asm 256x256 fp32 out > 4 GiB {(m, n_fp32, k)}", "result": "exact"}
+    )
     return rows
 
 

@@ -238,27 +238,34 @@ AITER_CTYPES_DEFINE_ENTRYPOINT_VOID(
     args.is_out_b16                 = (out->dtype() == AITER_DTYPE_bf16) ? 1 : 0;
     args.add_bias                   = bias ? 1 : 0;
 
-    // The kernels address A, B and out with 32-bit byte offsets: at 4 GiB and
-    // beyond they return wrong values without faulting.
-    const uint64_t a_bytes = static_cast<uint64_t>(Mdim) * args.stride_A0;
-    const uint64_t b_bytes = static_cast<uint64_t>(Ndim) * args.stride_B0;
-    const uint64_t c_bytes = static_cast<uint64_t>(Mdim) * args.stride_D0;
-    AITER_CHECK(a_bytes < (1ull << 32) && b_bytes < (1ull << 32) && c_bytes < (1ull << 32),
-                __func__,
-                " A, B and out must each be smaller than 4 GiB; got A=",
-                a_bytes,
-                " B=",
-                b_bytes,
-                " out=",
-                c_bytes,
-                " bytes");
-
     CFG* config_map = &cfg_bf16gemm_fp32bf16;
 
     auto [name, split] = get_heuristic_kernel(
         Mdim, Ndim, Kdim, config_map, arch_id, bpreshuffle, args.add_bias, splitK, kernelName);
     args.splitk              = split;
     AiterAsmKernel* impl_ptr = get_or_load_kernel(name, config_map, SUBM, SUBN);
+
+    // Each operand's buffer descriptor holds its size in bytes in a 32-bit
+    // field, so it must cover less than 4 GiB; past that the kernels return
+    // wrong values without faulting. The 256x256 kernels write fp32 output
+    // through one descriptor per 256-row tile; every other descriptor covers
+    // the whole operand.
+    const uint64_t a_bytes  = static_cast<uint64_t>(Mdim) * args.stride_A0;
+    const uint64_t b_bytes  = static_cast<uint64_t>(Ndim) * args.stride_B0;
+    const bool out_per_tile = !args.is_out_b16 && SUBM == 256 && SUBN == 256;
+    const uint64_t out_bytes =
+        static_cast<uint64_t>(out_per_tile ? std::min(Mdim, 256) : Mdim) * args.stride_D0;
+    AITER_CHECK(a_bytes < (1ull << 32) && b_bytes < (1ull << 32) && out_bytes < (1ull << 32),
+                __func__,
+                " ",
+                name,
+                ": A, B and out must each be smaller than 4 GiB; got A=",
+                a_bytes,
+                " B=",
+                b_bytes,
+                out_per_tile ? " out (one 256-row tile)=" : " out=",
+                out_bytes,
+                " bytes");
 
     int gdx = (Ndim + SUBN - 1) / SUBN;
     int gdy = (Mdim + SUBM - 1) / SUBM;
