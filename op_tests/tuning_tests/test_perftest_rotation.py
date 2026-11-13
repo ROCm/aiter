@@ -148,6 +148,21 @@ class TestPerftestCopiesStartAsPassed(unittest.TestCase):
                 data, _ = timed(func)(x, out)
                 self.assertIs(data, out)
 
+    def test_nan_in_a_never_written_half_survives(self):
+        def func(x, out):
+            n = out.numel() // 2
+            out[:n] = x[:n] + 1
+            return out
+
+        for num in (0, 1, 3):
+            with self.subTest(num_rotate_args=num):
+                x = torch.ones(16, device="cuda")
+                out = torch.full_like(x, float("nan"))
+                timed = perftest(num_iters=5, num_warmup=2, num_rotate_args=num)
+                data, _ = timed(func)(x, out)
+                self.assertFalse(torch.isnan(data[:8]).any())
+                self.assertTrue(torch.isnan(data[8:]).all())
+
 
 @unittest.skipUnless(torch.cuda.is_available(), "needs a GPU")
 class TestPerftestUnrotatableWarning(unittest.TestCase):
