@@ -21,29 +21,29 @@ from .base_device_communicator import All2AllManagerBase, DeviceCommunicatorBase
 _GLUON_AR_MAX_BYTES = 8 << 20
 # The plain Gluon all-reduce is faster than the custom all-reduce and RCCL up to 4 MiB.
 _GLUON_PLAIN_AR_MAX_BYTES = 4 << 20
-# The plain Gluon all-reduce also does the residual add, RMSNorm and per-token FP8 of
-# hidden 6144 (all_reduce_rmsnorm) up to this many tokens. AITER_GLUON_AR_NORM=0
-# turns it off.
+# The plain Gluon all-reduce also does the residual add, RMSNorm and per-token FP8
+# (all_reduce_rmsnorm) up to this many tokens. AITER_GLUON_AR_NORM=0 turns it off.
 # TP4 graph replay: faster than the split path at every measured size, 1 to 256.
 _GLUON_AR_NORM_MAX_TOKENS = int(os.environ.get("AITER_GLUON_AR_NORM_MAX_TOKENS", "256"))
-_GLUON_AR_NORM_HIDDEN = 6144
 
 should_nccl_symm_mem_allreduce = False
 _SUPPORTED_ALL2ALL_MANAGER_BACKENDS = ("flydsl", "mori", "mori_v2")
 
 
 def _use_gluon_ar_norm(comm, input_, res_inp_, weight_) -> bool:
-    """True if all_reduce_rmsnorm gives the bits of the plain Gluon all-reduce
+    """True if all_reduce_rmsnorm can take the place of the plain Gluon all-reduce
     followed by the HIP add_rmsnorm or add_rmsnorm_quant(round_before_quant=True)."""
     if not getattr(comm, "gluon_ar_norm", False) or comm.gluon_ar_plain is None:
         return False
+    from aiter.ops.triton.comms.all_reduce import norm_waves
+
     return (
         input_.dim() == 2
-        and input_.shape[1] == _GLUON_AR_NORM_HIDDEN
+        and norm_waves(input_.shape[1]) > 0
         and 0 < input_.shape[0] <= _GLUON_AR_NORM_MAX_TOKENS
         and input_.dtype == res_inp_.dtype == weight_.dtype == torch.bfloat16
         and res_inp_.shape == input_.shape
-        and weight_.shape == (_GLUON_AR_NORM_HIDDEN,)
+        and weight_.shape == input_.shape[1:]
         and input_.is_contiguous()
         and res_inp_.is_contiguous()
         and weight_.is_contiguous()

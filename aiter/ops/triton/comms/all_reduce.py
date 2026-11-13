@@ -16,11 +16,15 @@ _LINES = 64  # lines of a chunk: 2 for each lane of one wave
 _MAXIT = 20_000_000  # poll limit, some seconds: a peer can still be compiling
 _PROGRAMS = 2048  # receivers: more polling receivers can fill the GPU
 _POOLS = {}  # the IPC pool of each inbox, by its address: the pool owns the inbox
-# all_reduce_rmsnorm: the hidden size whose rows are 8 waves of 2 chunks, as the 8 waves
-# of add_rmsnorm_quant_kernel<256, 24>, so that the results have the same bits.
-NORM_HIDDEN = 6144
-_NORM_WAVES = 8
-_NORM_SEND = 8  # chunks of a NORM sender program, one a wave: faster than 1
+
+
+def norm_waves(hidden: int) -> int:
+    """The waves of an all_reduce_rmsnorm program for rows of hidden values, 2 chunks
+    a wave, or 0 if it does not support hidden. Hidden 6144 is 8 waves, as the 8
+    waves of add_rmsnorm_quant_kernel<256, 24>, so that the results have the same bits.
+    """
+    waves = triton.next_power_of_2(triton.cdiv(hidden, 12 * _LINES))
+    return waves if hidden > 0 and hidden % 8 == 0 and waves <= 32 else 0
 
 
 def all_reduce_init(group, max_bytes):
@@ -112,7 +116,6 @@ def all_reduce(x: torch.Tensor, group, inboxes, calls) -> torch.Tensor:
         HIDDEN=0,
         GEMMA=False,
         EPS=0.0,
-        SEND=1,
         num_warps=1,
     )
     return y
@@ -132,14 +135,17 @@ def all_reduce_rmsnorm(
     """
     Returns RMSNorm(residual_out) and residual_out = all_reduce(x) + residual over
     the 4 ranks of ``group`` on gfx1250, with one launch of the all-reduce kernel.
-    The bits are those of ``all_reduce`` followed by ``aiter.add_rmsnorm`` (or by
-    ``aiter.add_rmsnorm_quant(..., round_before_quant=True)`` with quant), for finite
-    values that are not fp32 subnormals. All ranks must make the same calls in the
-    same order. HIP graphs are supported.
+    For hidden 6144, the bits are those of ``all_reduce`` followed by
+    ``aiter.add_rmsnorm`` (or ``aiter.add_rmsnorm_quant(..., round_before_quant=True)``
+    with quant), for finite values that are not fp32 subnormals; other sizes add the
+    squares in another order. All ranks must make the same calls in the same order.
+    HIP graphs are supported.
 
     Args:
-        x, residual (torch.Tensor): Contiguous bf16 (tokens, 6144), 16-byte aligned.
-        weight (torch.Tensor): Contiguous bf16 (6144,). With gemma, the norm uses
+        x, residual (torch.Tensor): Contiguous bf16 (tokens, hidden), 16-byte
+            aligned, with norm_waves(hidden) > 0: hidden is a multiple of 8, at most
+            24576.
+        weight (torch.Tensor): Contiguous bf16 (hidden,). With gemma, the norm uses
             1 + weight.
         eps (float): The epsilon of the norm. Each value compiles a kernel.
         quant (bool): Return out as per-token FP8 (float8_e4m3fn) and also its fp32
@@ -151,15 +157,16 @@ def all_reduce_rmsnorm(
         poll times out, the results are wrong and calls[-1] is more than 0.
     """
     tokens, hidden = x.shape
-    assert hidden == NORM_HIDDEN and tokens > 0
+    waves = norm_waves(hidden)
+    assert waves and tokens > 0
     assert x.dtype == residual.dtype == weight.dtype == torch.bfloat16
     assert residual.shape == x.shape and weight.shape == (hidden,)
     assert x.is_contiguous() and residual.is_contiguous() and weight.is_contiguous()
     for t in (x, residual, weight):
         assert t.data_ptr() % 16 == 0
     chunks = (calls.numel() - 1) // 2
-    n = x.numel()
-    num_chunks = n // (6 * _LINES)  # rows are whole chunks
+    # A row is whole chunks; its last chunk can be partial.
+    num_chunks = tokens * triton.cdiv(hidden, 6 * _LINES)
     assert num_chunks <= chunks
 
     _LOGGER.info("ALL_REDUCE_RMSNORM [gluon]: x=%s quant=%s", x.shape, quant)
@@ -171,13 +178,13 @@ def all_reduce_rmsnorm(
     else:
         out = torch.empty_like(x)
         scale = residual_out  # not used without quant
-    _all_reduce_kernel[(num_chunks // _NORM_SEND + tokens,)](
+    _all_reduce_kernel[(triton.cdiv(num_chunks, waves) + tokens,)](
         x,
         residual_out,
         inboxes,
         calls,
         calls[-1:],
-        n,
+        x.numel(),
         tokens,
         residual,
         weight,
@@ -188,11 +195,10 @@ def all_reduce_rmsnorm(
         SLOT=4 * _LINES * chunks,
         MAXIT=_MAXIT,
         NORM=2 if quant else 1,
-        HIDDEN=NORM_HIDDEN,
+        HIDDEN=hidden,
         GEMMA=bool(gemma),
         EPS=float(eps),
-        SEND=_NORM_SEND,
-        num_warps=_NORM_WAVES,
+        num_warps=waves,
         # No fma: the HIP kernel rounds each square before it adds it.
         enable_fp_fusion=False,
     )

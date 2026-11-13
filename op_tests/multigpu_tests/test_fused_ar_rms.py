@@ -1470,6 +1470,7 @@ try:
             has_old_arch_fused_kernels=False,
             can_fuse_ar_rms=lambda *args: True,
             should_fuse_ar_rms=lambda *args: False,
+            should_lamport_ar_rms=lambda *args: False,
             should_custom_ar=lambda *args: True,
         )
         return SimpleNamespace(
@@ -1484,7 +1485,7 @@ try:
             gluon_ar_norm=rows,
             _ar_quant_max_bytes=-1,
             _ar_quant_no_prefill_max_bytes=-1,
-            _ar_1stage_max_kb=-1,
+            _ar_1stage_max_bytes=-1,
             _ar_1stage_override=None,
             all_reduce=Mock(return_value=x),
             fused_allreduce_rmsnorm=Mock(return_value=(x, x)),
@@ -1497,7 +1498,8 @@ try:
             ("one_token", True),
             ("max_tokens", True),
             ("too_many_tokens", False),
-            ("hidden_4096", False),
+            ("hidden_4096", True),
+            ("hidden_32768", False),
             ("rows_off", False),
             ("gluon_off", False),
             ("residual_strided", False),
@@ -1508,13 +1510,13 @@ try:
     )
     def test_gluon_ar_norm_quant_dispatch(case, expected):
         """all_reduce_rmsnorm takes the gfx1250 LL quant path (the plain Gluon
-        all-reduce + add_rmsnorm_quant(round_before_quant=True)) only for hidden
-        6144, up to 256 tokens. Else that path stays as it is."""
+        all-reduce + add_rmsnorm_quant(round_before_quant=True)) only for the hidden
+        sizes of norm_waves, up to 256 tokens. Else that path stays as it is."""
         from unittest.mock import Mock, patch
 
         from aiter.dist.device_communicators import communicator_cuda as cc
 
-        n = 4096 if case == "hidden_4096" else 6144
+        n = int(case[7:]) if case.startswith("hidden_") else 6144
         m = {"one_token": 1, "max_tokens": 256, "too_many_tokens": 257}.get(case, 16)
         comm = _gluon_ar_norm_comm(m, n, rows=case != "rows_off")
         if case == "gluon_off":
@@ -1553,7 +1555,7 @@ try:
             assert args[3:7] == (1e-6, True, True, "group"), case
             assert args[7:] == ("inboxes", "calls"), case
             assert not split.called and not comm.all_reduce.called, case
-        if case in ("too_many_tokens", "hidden_4096", "rows_off", "misaligned"):
+        if case in ("too_many_tokens", "hidden_32768", "rows_off", "misaligned"):
             # The LL quant path: plain all-reduce + add_rmsnorm_quant.
             assert split.called and comm.all_reduce.called, case
         if case in ("residual_strided", "weight_strided", "mirror"):
@@ -1565,7 +1567,8 @@ try:
             ("eligible", True),
             ("one_token", True),
             ("too_many_tokens", False),
-            ("hidden_4096", False),
+            ("hidden_4096", True),
+            ("hidden_6148", False),
             ("rows_off", False),
             ("pad", False),
             ("residual_strided", False),
@@ -1578,7 +1581,7 @@ try:
 
         from aiter.dist.device_communicators import communicator_cuda as cc
 
-        n = 4096 if case == "hidden_4096" else 6144
+        n = int(case[7:]) if case.startswith("hidden_") else 6144
         m = {"one_token": 1, "too_many_tokens": 257}.get(case, 16)
         comm = _gluon_ar_norm_comm(m, n, rows=case != "rows_off")
         x = torch.zeros((m, n), dtype=torch.bfloat16)
@@ -1604,7 +1607,7 @@ try:
             assert not split.called and not comm.all_reduce.called, case
         else:
             assert comm.all_reduce.called, case
-        if case in ("too_many_tokens", "hidden_4096", "rows_off"):
+        if case in ("too_many_tokens", "hidden_6148", "rows_off"):
             assert split.called, case
 
     @pytest.mark.parametrize("world_size", [2, 4])
