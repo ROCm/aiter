@@ -23,6 +23,7 @@ def reduce_segments_gluon(
     seq_lens_ptr,  # [num_seqs]
     num_query_heads,
     out_scale_ptr,  # float32 or None
+    segm_tiles_ptr,  # [1] int32 tiles a KV segment covers (split rebalance), or None
     output_stride_0,
     output_stride_1,
     H: gl.constexpr,
@@ -39,7 +40,10 @@ def reduce_segments_gluon(
 
     # all-decode: each sequence has exactly one query token, so seq_idx == token
     seq_len = gl.load(seq_lens_ptr + token)
-    tiles_per_segment = (seq_len + S * TILE_SIZE - 1) // (S * TILE_SIZE)
+    if segm_tiles_ptr is not None:
+        tiles_per_segment = gl.load(segm_tiles_ptr)
+    else:
+        tiles_per_segment = (seq_len + S * TILE_SIZE - 1) // (S * TILE_SIZE)
     denom = tiles_per_segment * TILE_SIZE
     act_num_segments = (seq_len + denom - 1) // denom
 
@@ -115,4 +119,193 @@ def reduce_segments_gluon(
     o_mask = (offs_d[None, :] < D) & (offs_h[:, None] < num_query_heads)
     gl.amd.gfx1250.buffer_store(
         acc.to(output_ptr.dtype.element_ty), output_ptr, o_offs, mask=o_mask
+    )
+
+
+@gluon.jit
+def reduce_segments_split_rebalance_gluon(
+    output_ptr,  # [num_rows, num_query_heads, D]
+    segm_output_ptr,  # [num_tokens, H, S, D] fp32
+    segm_max_ptr,  # [num_tokens, H, S] fp32 (log2 domain)
+    segm_expsum_ptr,  # [num_tokens, H, S] fp32
+    seq_lens_ptr,  # [num_seqs]
+    num_seqs,
+    segm_tiles_ptr,  # [1] int32 tiles a KV segment covers (split rebalance), or None
+    out_scale_ptr,  # float32 or None
+    gate_ptr,  # [num_tokens, H * D] output gate (out * sigmoid(gate)), or None
+    gate_stride_0,
+    rows_ptr,  # [num_rows] output row r is query token rows[r], or None
+    output_stride_0,
+    output_stride_1,
+    H: gl.constexpr,
+    S: gl.constexpr,
+    D: gl.constexpr,
+    TILE_SIZE: gl.constexpr,
+    SEQLEN_Q: gl.constexpr,  # every sequence holds SEQLEN_Q query tokens
+    SB: gl.constexpr,  # segments a merge step adds
+    CHUNK: gl.constexpr,  # segments a pass holds in LDS (a multiple of SB)
+    SPEC: gl.constexpr,  # segments loaded before the context length: 0, CHUNK / 2, CHUNK
+    NUM_WARPS: gl.constexpr,
+    IS_FP8_OUT: gl.constexpr,
+    FP8_MIN: gl.constexpr,
+    FP8_MAX: gl.constexpr,
+):
+    """Split rebalance reduce: the split-KV reduce of gfx1250 decode / spec-decode
+    verify under the split rebalance (128-256 KV segments a sequence in the grid, of
+    which only the live ones are read).
+
+    One program merges one (query token, head) over all D. The sequence is the token
+    over SEQLEN_Q (no search over cu_seqlens_q). All loads are in flight in one round
+    trip: up to CHUNK live segments' [D] partials and their maxima go to LDS by TDM at
+    once (the leading SPEC of them speculatively, before the context length is known;
+    the rest clipped to the live segments), with the [S] statistics and the output
+    gate alongside. The merge then reads LDS only, in steps of SB segments, in segment
+    order; a context of more than CHUNK live segments takes one more round trip a
+    CHUNK. Same math as the Triton reduce_segments (another fp32 summation order):
+    out = sum_s o_s * 2^(m_s - M) / sum_s l_s * 2^(m_s - M), M = max_s m_s.
+    The output does not depend on CHUNK, SPEC or NUM_WARPS (bitwise), only on SB.
+    """
+    pid_r = gl.program_id(0)
+    head = gl.program_id(1)
+    if rows_ptr is not None:
+        token = gl.load(rows_ptr + pid_r).to(gl.int32)
+    else:
+        token = pid_r
+
+    # [SB, D] step tile: the head dim across lanes and warps, the segments in-thread
+    VEC: gl.constexpr = D // (32 * NUM_WARPS)
+    BLK: gl.constexpr = gl.BlockedLayout([SB, VEC], [1, 32], [1, NUM_WARPS], [1, 0])
+    L_S: gl.constexpr = gl.SliceLayout(1, BLK)  # [SB], every thread holds all SB
+    L_D: gl.constexpr = gl.SliceLayout(0, BLK)  # [D]
+    # the [S] statistics in a one-warp layout (any other warps hold copies), so that
+    # the expsum adds up in the same order whatever NUM_WARPS
+    STAT: gl.constexpr = gl.BlockedLayout([max(1, S // 32)], [32], [NUM_WARPS], [0])
+    SMEM2: gl.constexpr = gl.SwizzledSharedLayout(1, 1, 1, order=[1, 0])
+    SMEM1: gl.constexpr = gl.SwizzledSharedLayout(1, 1, 1, order=[0])
+    NG: gl.constexpr = CHUNK // SB
+    # a pass lands in LDS as two TDM boxes of HALF segments, NSPEC of them speculative
+    HALF: gl.constexpr = CHUNK // 2
+    NSPEC: gl.constexpr = SPEC // HALF
+
+    seq_idx = gl.minimum(token // SEQLEN_Q, num_seqs - 1)
+    seq_len = gl.load(seq_lens_ptr + seq_idx)
+    if segm_tiles_ptr is not None:
+        tiles_per_segment = gl.load(segm_tiles_ptr)
+    else:
+        tiles_per_segment = (seq_len + S * TILE_SIZE - 1) // (S * TILE_SIZE)
+
+    offs_d = gl.arange(0, D, layout=L_D)
+    offs_s = gl.arange(0, SB, layout=L_S)
+    offs_all = gl.arange(0, S, layout=STAT)
+    stat_off = token * (H * S) + head * S
+    o_base = segm_output_ptr + token.to(gl.int64) * (H * S * D) + head * (S * D)
+    m_base = segm_max_ptr + stat_off
+    e_base = segm_expsum_ptr + stat_off
+
+    if gate_ptr is not None:
+        gate = gl.load(
+            gate_ptr + token.to(gl.int64) * gate_stride_0 + head * D + offs_d
+        )
+    o_smem = gl.allocate_shared_memory(
+        segm_output_ptr.dtype.element_ty, [2, HALF, D], SMEM2
+    )
+    m_smem = gl.allocate_shared_memory(segm_max_ptr.dtype.element_ty, [2, HALF], SMEM1)
+    if NSPEC > 0:
+        # speculative: in bounds of the [S] slab whatever the context; the dead
+        # segments among them are masked in the merge
+        o_spec = gl.amd.gfx1250.tdm.make_tensor_descriptor(
+            o_base, [S, D], [D, 1], [HALF, D], SMEM2
+        )
+        m_spec = gl.amd.gfx1250.tdm.make_tensor_descriptor(
+            m_base, [S], [1], [HALF], SMEM1
+        )
+        for p in gl.static_range(NSPEC):
+            gl.amd.gfx1250.tdm.async_load(o_spec, [p * HALF, 0], o_smem.index(p))
+            gl.amd.gfx1250.tdm.async_load(m_spec, [p * HALF], m_smem.index(p))
+    segm_max = gl.amd.gfx1250.buffer_load(m_base, offs_all)
+    segm_expsum = gl.amd.gfx1250.buffer_load(e_base, offs_all)
+    # nothing that needs the context length (or the tiles per segment) above here:
+    # the compiler would wait for them before it issues the speculative loads
+    gl.amd.hint.sched_barrier()
+
+    # (clamped: a zero-length context, or a context past the grid, still ends the
+    # loops below on the grid's segments)
+    span = gl.maximum(tiles_per_segment, 1) * TILE_SIZE
+    num_segments = gl.minimum((seq_len + span - 1) // span, S)
+    num_steps = (num_segments + SB - 1) // SB
+    # the rest of the first pass and any further ones, clipped to the live segments
+    o_live = gl.amd.gfx1250.tdm.make_tensor_descriptor(
+        o_base, [num_segments, D], [D, 1], [HALF, D], SMEM2
+    )
+    m_live = gl.amd.gfx1250.tdm.make_tensor_descriptor(
+        m_base, [num_segments], [1], [HALF], SMEM1
+    )
+    if num_segments > SPEC:
+        # (not issued at all when the speculative boxes hold every live segment: the
+        # merge then waits for no load that had to wait for the context length)
+        for p in gl.static_range(NSPEC, 2):
+            gl.amd.gfx1250.tdm.async_load(o_live, [p * HALF, 0], o_smem.index(p))
+            gl.amd.gfx1250.tdm.async_load(m_live, [p * HALF], m_smem.index(p))
+
+    if gate_ptr is not None:
+        # Qwen3-Next / Qwen3.5 output gate, rounded as the unfused ops. The opaque move
+        # keeps its load in flight with the others (the compiler would sink the load
+        # past the merge loop, to its use).
+        gate = (1 / (1 + gl.exp(-gate.to(gl.float32)))).to(gate.dtype).to(gl.float32)
+        gate = gl.inline_asm_elementwise(
+            "v_mov_b32 $0, $1", "=v,v", [gate], dtype=gl.float32, is_pure=False, pack=1
+        )
+
+    live = offs_all < num_segments
+    segm_max = gl.where(live, segm_max, float("-inf"))
+    segm_expsum = gl.where(live, segm_expsum, 0.0)
+    overall_max = gl.max(segm_max, axis=0)
+    overall_expsum = gl.sum(segm_expsum * gl.exp2(segm_max - overall_max), axis=0)
+
+    # the merge steps' [SB, D] / [SB] views of the pass in LDS
+    o_steps = o_smem.reinterpret(shape=[NG, SB, D], layout=SMEM2)
+    m_steps = m_smem.reinterpret(shape=[NG, SB], layout=SMEM1)
+    acc = gl.zeros([D], gl.float32, layout=L_D)
+    for c in range((num_segments + CHUNK - 1) // CHUNK):
+        if c > 0:
+            # contexts of more than CHUNK segments: one more round trip a CHUNK
+            if NUM_WARPS > 1:
+                gl.barrier()
+            for p in gl.static_range(2):
+                gl.amd.gfx1250.tdm.async_load(
+                    o_live, [c * CHUNK + p * HALF, 0], o_smem.index(p)
+                )
+                gl.amd.gfx1250.tdm.async_load(
+                    m_live, [c * CHUNK + p * HALF], m_smem.index(p)
+                )
+        gl.amd.gfx1250.tdm.async_wait(0)
+        if NUM_WARPS > 1:
+            gl.barrier()
+        for g in range(gl.minimum(NG, num_steps - c * NG)):
+            segs = (c * NG + g) * SB + offs_s
+            live_s = segs < num_segments
+            o = gl.where(live_s[:, None], o_steps.index(g).load(BLK), 0.0)
+            m = gl.where(live_s, m_steps.index(g).load(L_S), float("-inf"))
+            w = gl.exp2(m - overall_max)
+            acc += gl.sum(o * w[:, None], axis=0)
+    # no TDM write may land in LDS after the workgroup is gone (a zero-length context
+    # runs no pass, so nothing above waited for the speculative boxes)
+    gl.amd.gfx1250.tdm.async_wait(0)
+
+    acc = gl.where(overall_expsum == 0.0, gl.full_like(acc, 0.0), acc / overall_expsum)
+    if out_scale_ptr is not None:
+        acc = acc * (1.0 / gl.load(out_scale_ptr))
+    if IS_FP8_OUT:
+        acc = gl.clamp(acc, FP8_MIN, FP8_MAX)
+
+    out_ty: gl.constexpr = output_ptr.dtype.element_ty
+    result = acc.to(out_ty)
+    if gate_ptr is not None:
+        result = (result.to(gl.float32) * gate).to(out_ty)
+    gl.store(
+        output_ptr
+        + pid_r.to(gl.int64) * output_stride_0
+        + head * output_stride_1
+        + offs_d,
+        result,
     )

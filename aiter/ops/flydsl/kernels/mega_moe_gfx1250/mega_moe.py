@@ -315,6 +315,8 @@ class MegaMoEGfx1250:
         combine_quant: str | None = None,
         combine_wire: str | None = None,
         recv_counter_is_zero: bool = False,
+        shared_add: torch.Tensor | None = None,
+        shared_ready: torch.cuda.Event | None = None,
     ) -> torch.Tensor:
         """Run one MoE layer: dispatch, its expert GEMM, then combine.
 
@@ -342,6 +344,12 @@ class MegaMoEGfx1250:
 
         ``recv_counter_is_zero`` is accepted and ignored: the dispatch
         overwrites the received count, so there is no reset to skip.
+
+        ``shared_add`` (bf16 ``[tokens, hidden]``, e.g. the shared expert's
+        output) is added to the result by the combine itself, so the caller
+        needs no separate add. ``shared_ready``, when given, is waited on by
+        the current stream just before the combine: its producer may run on a
+        side stream beside the dispatch and the expert GEMMs.
         """
         if combine_wire is not None:
             if combine_quant is not None:
@@ -404,7 +412,9 @@ class MegaMoEGfx1250:
         )
         if isinstance(disp, _CompactDispatch):
             disp.fusion.finish(s1f)
-        return ep.combine(batch.routing, quant_bits, expert_out)
+        if shared_ready is not None:
+            torch.cuda.current_stream().wait_event(shared_ready)
+        return ep.combine(batch.routing, quant_bits, expert_out, shared_add=shared_add)
 
     __call__ = forward
 
