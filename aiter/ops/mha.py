@@ -592,6 +592,17 @@ def _fmha_fwd_with_sink_asm(
 ) -> None: ...
 
 
+def _fmha_fwd_asm_sink(
+    sink: Tensor | None, qk_head_dim: int, q_head_num: int, device: torch.device
+) -> Tensor | None:
+    """The gfx1250 D64 kernels are built with a per-head sink (ENABLE_SINK=1) and
+    always read it.  Without a caller sink they get -inf, whose softmax term
+    exp(-inf) = 0 leaves plain attention."""
+    if sink is not None or qk_head_dim != 64:
+        return sink
+    return torch.full((q_head_num,), float("-inf"), dtype=torch.float32, device=device)
+
+
 def fmha_fwd_with_sink_asm(
     q: Tensor,
     k: Tensor,
@@ -609,15 +620,17 @@ def fmha_fwd_with_sink_asm(
       * `sink` is passed through verbatim — it is the value the kernel
         consumes directly (no host-side scaling). It is optional: pass `None`
         for no sink. Whether the kernel reads it is decided inside the `.co`
-        (ENABLE_SINK). When provided it must be a 1-D fp32 tensor of shape
-        [q_head_num].
+        (ENABLE_SINK); the D64 kernels always do, so for them `None` becomes
+        a -inf sink (no sink term). When provided it must be a 1-D fp32
+        tensor of shape [q_head_num].
       * The kernel always accesses `ptr_LSE`, so an LSE buffer is always
         allocated even when `return_lse=False`; in that case the contents are
         undefined and callers should ignore the returned `lse`.
     """
     require_gfx1250_asm("fmha_fwd_with_sink_asm")
-    batch, q_seq_len, q_head_num, _qk_head_dim = q.shape
+    batch, q_seq_len, q_head_num, qk_head_dim = q.shape
     v_head_dim = v.size(3)
+    sink = _fmha_fwd_asm_sink(sink, qk_head_dim, q_head_num, q.device)
 
     if out is None:
         out = torch.empty(
@@ -697,7 +710,9 @@ def fmha_fwd_with_sink_varlen_asm(
         supplied, e.g. flash_attn_varlen convention) -- it sets the launch tile
         count; the kernel early-exits tiles beyond each batch's actual length.
       * `sink` is passed through verbatim (the value the kernel consumes
-        directly, no host-side scaling); optional. Allocation is caller-side.
+        directly, no host-side scaling); optional. Allocation is caller-side,
+        except that D64 (whose kernels always read it) gets a -inf sink for
+        `None`.
       * The kernel always accesses `ptr_LSE`, so an LSE buffer is always
         allocated even when `return_lse=False`; in that case ignore the result.
     """
@@ -708,8 +723,9 @@ def fmha_fwd_with_sink_varlen_asm(
     cu_seqlens_q = cu_seqlens_q.to(torch.int32).contiguous()
     cu_seqlens_k = cu_seqlens_k.to(torch.int32).contiguous()
 
-    total_q, q_head_num, _qk_head_dim = q.shape
+    total_q, q_head_num, qk_head_dim = q.shape
     v_head_dim = v.size(2)
+    sink = _fmha_fwd_asm_sink(sink, qk_head_dim, q_head_num, q.device)
 
     if out is None:
         out = torch.empty(
@@ -968,8 +984,9 @@ def _select_gfx1250_fmha_fwd_varlen_asm(
             strided = False
         else:
             return 0
-        # Sink logits: the D64 binaries always read the sink buffer (a null one
-        # would be dereferenced); the D128 / D192x128 / D256 binaries never read it.
+        # Sink logits: the D64 binaries always read the sink buffer (the wrapper
+        # gives them a -inf one when sink is None, but only callers with a sink are
+        # sent here); the D128 / D192x128 / D256 binaries never read it.
         if (sink_ptr is not None) != (hdim_q == 64):
             return 0
         kind = _GFX1250_VARLEN_ASM_BF16
@@ -2281,12 +2298,9 @@ def _flash_attn_forward(
         #
         #   D64 kernels (`_rxy_sink`) compile ENABLE_SINK=1 -- the kernel
         #   ALWAYS reads SINK and adds `exp((sink - max) * scale)` to the
-        #   softmax denominator.  There is no "skip sink" mode on this binary,
-        #   so calling it with sink_ptr=None now forwards a null pointer to the
-        #   kernel (the wrapper no longer raises / zero-fills), which the D64
-        #   binary would dereference.  To preserve flash_attn_func's documented
-        #   `sink_ptr is None` semantics we keep requiring an explicit sink for
-        #   D64 here and fall back to CK otherwise.
+        #   softmax denominator.  fmha_fwd_with_sink_asm gives it a -inf sink
+        #   (no sink term) when sink is None, but this router still sends only
+        #   callers with a sink here; D64 without one falls back to CK.
         #
         #   D256 kernels compile ENABLE_SINK=0 like D128, and take only the
         #   strides `_can_impl_fmha_fwd_asm_d256_strides` accepts.
@@ -4656,6 +4670,85 @@ def mha_batch_prefill_func(
         result.append(S_dmask)
 
     return result[0] if len(result) == 1 else tuple(result)
+
+
+def mha_paged_fwd_prefill(
+    q,
+    k,
+    v,
+    qo_indptr,
+    kv_indptr,
+    kv_page_indices,
+    kv_last_page_lens,
+    max_seqlen_q=None,
+    max_seqlen_k=None,
+    softmax_scale=None,
+    causal=False,
+    window_size=(-1, -1),
+    return_lse=False,
+    out=None,
+    sink=None,
+):
+    """Forward prefill against a PAGED K/V cache.
+
+    ``k``/``v`` are the page pool -- ``[num_blocks, page_size, nheads_k, hdim]``, or
+    ``[num_blocks, nheads_k, hdim]`` at page size 1. ``qo_indptr`` carries this batch's
+    query token offsets; ``kv_indptr`` is a cumulative PAGE count (not tokens) into
+    ``kv_page_indices``, and ``kv_last_page_lens`` gives each request's fill of its
+    last page.
+
+    Routes to the gfx1250 FlyDSL kernel when it can serve the configuration, and falls
+    back to ``mha_batch_prefill_func`` (CK) otherwise. A separate entry rather than a
+    hook inside ``mha_batch_prefill_func``: that one has no backend fan-out and its
+    signature carries CK-only options (kv_block_descale, logits_soft_cap, the vLLM 2-D
+    block_table) that the FlyDSL path does not implement.
+    """
+    if _FLYDSL_AVAILABLE and (len(window_size) < 3 or window_size[2] == 0):
+        from .flydsl.fmha_kernels import flydsl_flash_attn_paged_fwd
+
+        _flydsl_result = flydsl_flash_attn_paged_fwd(
+            q,
+            k,
+            v,
+            qo_indptr,
+            kv_indptr,
+            kv_page_indices,
+            kv_last_page_lens=kv_last_page_lens,
+            max_seqlen_q=max_seqlen_q,
+            max_seqlen_k=max_seqlen_k,
+            softmax_scale=softmax_scale,
+            causal=causal,
+            window_size=window_size,
+            return_lse=return_lse,
+            out=out,
+            sink=sink,
+        )
+        if _flydsl_result is not None:
+            return _flydsl_result
+
+    if max_seqlen_q is None or max_seqlen_k is None:
+        raise ValueError(
+            "max_seqlen_q/max_seqlen_k are required for the CK fallback; the FlyDSL "
+            "path declined this configuration"
+        )
+    return mha_batch_prefill_func(
+        q,
+        k,
+        v,
+        qo_indptr,
+        kv_indptr,
+        kv_page_indices,
+        max_seqlen_q,
+        max_seqlen_k,
+        softmax_scale=softmax_scale,
+        causal=causal,
+        window_size=window_size,
+        return_lse=return_lse,
+        out=out,
+        kv_last_page_lens=kv_last_page_lens,
+        sink_size=int(window_size[2]) if len(window_size) > 2 else 0,
+        sink_ptr=sink,
+    )
 
 
 def flash_attn_fp8_pertensor_func(

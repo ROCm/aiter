@@ -15,7 +15,7 @@ import math
 import torch
 import triton
 
-from aiter.ops.triton._triton_kernels.flash_attn_triton_amd.utils import FP8_ARCHS
+from aiter.ops.triton._triton_kernels.attention.dao_ai.utils import FP8_ARCHS
 from aiter.ops.triton.attention.block_scale_fp8_attention import (
     attn_fwd,
     get_padded_headsize,
