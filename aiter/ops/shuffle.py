@@ -506,3 +506,21 @@ def shuffle_scale_for_int4(scale: torch.Tensor, group_size: int = 32) -> torch.T
         return scale.view(E, G // 2, 2, N).permute(0, 1, 3, 2).contiguous()
 
     return scale.contiguous()
+
+
+def moe_shuffle_weight_iod(
+    weight: torch.Tensor,
+    weight_scale: torch.Tensor,
+    experts_cnt: int | None = None,
+    gate_up: bool = False,
+):
+    """IOD placement (ROCm/aiter#7332) is not in this branch: a no-op returning
+    None, as it is when ``AITER_MOE_LOC`` is unset. Keeps callers importable."""
+    import os
+
+    if (os.environ.get("AITER_MOE_LOC", "0").strip() or "0") != "0":
+        raise RuntimeError(
+            "AITER_MOE_LOC needs IOD placement (ROCm/aiter#7332), which this branch does not carry"
+        )
+    return None
+
