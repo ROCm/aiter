@@ -1,4 +1,9 @@
-# Pre-compiled gfx1250 kernels (`.co`)
+# Pre-compiled kernels (`.co`)
+
+Two independent families live here: the gfx1250 4-wave CO kids (most of this
+file) and the gfx950 a16w16 4-wave kids ([below](#gfx950-a16w16-4-wave-kids)).
+
+## gfx1250
 
 Device code for the three 4-wave kid families, built ahead of time instead of by
 the aiter JIT:
@@ -378,3 +383,61 @@ early by `kid_rejects_shape` — no buffer resource, every tail clamped by the D
 so no M/N/K alignment applies. Naming only one of them there once cost the `wl`
 family every shape whose `N` fell outside an unrelated gfx942 whitelist; see
 issue 4 in [`KNOWN_ISSUES.md`](KNOWN_ISSUES.md).
+
+## gfx950 a16w16 4-wave kids
+
+bf16 `C = A * B^T` for all four layouts (NT / NN / TT / TN), pipeline
+[`opus_gemm_pipeline_a16w16_4wave_gfx950.cuh`](../include/gfx950/opus_gemm_pipeline_a16w16_4wave_gfx950.cuh),
+traits/kargs at the end of
+[`opus_gemm_traits_a16w16_gfx950.cuh`](../include/gfx950/opus_gemm_traits_a16w16_gfx950.cuh).
+Built offline because the large tiles pin registers with
+`[[clang::amdgpu_pin_agpr]]`, and because the release ROCm clang schedules the
+M/N-contiguous (`ds_read_b64_tr_b16`) paths 1.5-2x slower. The host launchers,
+dispatch tables and tuned-CSV schema come from the ordinary JIT codegen
+(`codegen/gen_instances_gfx950.py:gen_a16w16_4wave_instance`), which emits no
+device TU for these kids.
+
+| kid | tag | launcher | tiles (`B_M x B_N`, `B_K` 64) |
+|---|---|---|---|
+| 1000-1007 | `a16w16_4wave` | direct ABI; bias fused in the kernel; `split_k` 0/1; needs `N % 8 == 0` | 256x256, 256x128, 128x256, 128x128, 256x64, 64x256, 128x64, 64x128 |
+| 1008-1015 | `a16w16_4wave_ws` | workspace ABI; fp32 partials `[split][batch][pM][pN]` + `splitk_reduce_kernel` (bias folded there); `split_k` clamped to `(K/64)/2`; any `N` | same order |
+
+Tiles larger than 128x128 pin their registers (1 WG/CU), the others leave them to
+the allocator (2 WG/CU) -- the traits defaults. Every kid needs `K % 64 == 0`,
+`K >= 128`, leading dimensions and batch strides that are multiples of 8
+elements, and 16-byte aligned operands; `M`/`N` are otherwise arbitrary.
+
+**Layouts are not part of the kid.** One kid carries one image per layout (and
+per bias variant for the direct tag) and the launcher picks it from the tensor
+strides: logical `XQ [batch, M, K]` with `stride(2) == 1` is K-contiguous
+(`A_T = 0`, pitch `stride(1)`), with `stride(1) == 1` it is stored `[K, M]`
+(`A_T = 1`, pitch `stride(2)`); the same for `WQ [batch, N, K]`. So a tuned CSV
+row (`solidx` = kid, `splitK`) serves every layout.
+
+```
+gen_co/
+├── co_kernels_gfx950.json   # kid -> (tag, tile); read by opus_gemm_common.py and build_co.py
+└── gfx950/
+    ├── <kid symbol>_<nt|nn|tt|tn>[_bias].co   # 96 images, bare amdhsa ELF   (tracked)
+    ├── build_info.json                        # compiler, flags, per-image metadata (tracked)
+    └── asm/                                   # .s / .dis listings, .gitignored
+```
+
+The `.co` stem equals the `extern "C"` entry inside it; the entry carries the
+traits' `__launch_bounds__` and calls `gemm_a16w16_4wave_body<Traits>`. Its
+kernarg is `opus_gemm_a16w16_4wave_kargs_gfx950` (96 bytes). The runtime loader is
+[`include/gfx950/opus_co_launch_gfx950.cuh`](../include/gfx950/opus_co_launch_gfx950.cuh)
+(`$OPUS_GEN_CO_DIR/gfx950/`). A kid whose images are not all on disk is dropped
+from the registry, like a gfx1250 CO kid.
+
+Rebuild (needs an LLVM with `[[clang::amdgpu_pin_agpr]]`):
+
+```sh
+python3 csrc/opus_gemm/gen_co/build_co.py --arch gfx950 \
+    --llvm-bin /path/to/amdgpu-pin-llvm/bin --fail-on-spill
+```
+
+The builder checks per image: kernarg size 96, LDS equal to the traits'
+`LDS_BYTES`, ELF processor gfx950, no undefined symbols, and (with
+`--fail-on-spill`) zero VGPR/SGPR spills; it records VGPR/AGPR/SGPR counts and
+the SHA256 in `build_info.json`. `--kids` rebuilds a subset in place.

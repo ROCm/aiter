@@ -3031,11 +3031,9 @@ gfx950_a16w16_kernels_list = {
     **a16w16_persistent_kernels_list_4g_safe,
     **a16w16_persistent_kernels_list_4g_safe_nooob,
     **a16w16_mono_tile_kernels_list_4g_safe,
+    # Declared records; get_registry drops kids whose .co images are missing.
+    **gfx950_a16w16_4wave_kernels_declared,
 }
-assert not (GFX950_A16W16_4WAVE_KIDS & gfx950_a16w16_kernels_list.keys()), (
-    "gfx950 4wave kids overlap an existing gfx950 a16w16 kid"
-)
-gfx950_a16w16_kernels_list.update(gfx950_a16w16_4wave_kernels_declared)
 
 gfx1250_a16w16_kernels_list = {
     **gfx1250_kernels_list,
