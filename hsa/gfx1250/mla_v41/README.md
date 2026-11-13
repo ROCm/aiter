@@ -17,9 +17,3 @@ Q/SWA use FP8 with E8M0 scales, CSA uses NVFP4 with E4M3 scales, and output is B
 - Code object `fused_mla_a8w4_qh64_1tg_16mx4_64nx1_sparse_np_v41.co`.
 - Symbol `fused_mla_a8w4_qh64_1tg_16mx4_64nx1_sparse_np_v41`; 120-byte arguments, 327680-byte static LDS.
 - CO SHA256: `ab4c3201944a87bd17e57ca8d9674a9e5318ca96ccfbf6f2fde0c14a429f59c4`.
-
-The v_end code object uses a 16 KiB aligned kernel entry (`.p2align 14`).
-The `.text` section and its executable `PT_LOAD` segment require at least
-16 KiB alignment. Preserve this alignment when rebuilding the code object;
-it removes the measured address-dependent slowdown at the tested placements.
-The instruction bytes, kernel ABI, and launch configuration are unchanged.
