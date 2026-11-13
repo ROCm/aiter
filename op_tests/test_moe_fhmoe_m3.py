@@ -242,7 +242,7 @@ def capture_route_rows(store):
     orig = MK._run_moe_reduction
 
     def spy(target, out, token_num, topk, model_dim, *a, **k):
-        store.append(target[: token_num * topk].view(token_num, topk, model_dim).clone())
+        store.append(target.reshape(-1)[: token_num * topk * model_dim].view(token_num, topk, model_dim).clone())
         return orig(target, out, token_num, topk, model_dim, *a, **k)
 
     MK._run_moe_reduction = spy
@@ -292,13 +292,15 @@ def rel_l2(a, ref):
 
 
 def ulp_stats(a, b):
-    """% of differing bf16 elements and the max distance in bf16 ulps (ordered-int metric)."""
+    """% of differing bf16 elements and the max distance in bf16 ulps (ordered-int metric) over |b| >= 1e-2
+    (elements near zero, e.g. the all-zero / denormal P0 rows, make ulp distances meaningless)."""
     ia = a.contiguous().view(torch.int16).int()
     ib = b.contiguous().view(torch.int16).int()
     oa = torch.where(ia < 0, -(ia & 0x7FFF), ia)
     ob = torch.where(ib < 0, -(ib & 0x7FFF), ib)
     d = (oa - ob).abs()
-    return float((d > 0).float().mean() * 100), int(d.max())
+    big = b.float().abs() >= 1e-2
+    return float((d > 0).float().mean() * 100), int(d[big].max()) if big.any() else 0
 
 
 def atom_shared(raw: RawM3, xq, xs):
