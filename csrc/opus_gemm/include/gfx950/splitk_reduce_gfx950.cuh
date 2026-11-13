@@ -118,9 +118,12 @@ __global__ void splitk_reduce_kernel(
         #pragma unroll
         for (int t = 0; t < VEC; ++t) bias_fp32[t] = 0.0f;
         const D_BIAS* bias_base_ptr = bias + b * bias_stride_batch;
+        // Range checks are per dword: round the size up to whole dwords, or the
+        // last bf16 of an odd N (sharing its dword with the element past the end)
+        // reads back as 0.
         auto g_bias = opus::make_gmem(bias_base_ptr,
-                        (unsigned int)((bias_stride_batch ? bias_stride_batch : N)
-                                       * sizeof(D_BIAS)));
+                        (unsigned int)(((bias_stride_batch ? bias_stride_batch : N)
+                                        * sizeof(D_BIAS) + 3) & ~size_t(3)));
         // Load VEC bias elements as groups of 4 (buffer_load_dwordx4 for
         // fp32; buffer_load_b64 pairs for bf16 -- opus::load handles both).
         #pragma unroll
