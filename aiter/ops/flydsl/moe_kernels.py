@@ -1218,13 +1218,18 @@ def _run_moe_reduction(
         )
     else:
         X = target.view(token_num, topk, model_dim)
-    if use_mask:
-        em = expert_mask.to(torch.int32).contiguous()
-        tk = topk_ids.to(torch.int32).contiguous()
-    else:
-        # Placeholders; kernel ignores them when use_mask=False (and for fp8).
-        em = torch.empty(0, device=out.device, dtype=torch.int32)
-        tk = torch.empty(0, device=out.device, dtype=torch.int32)
+    # Without an expert mask, topk_ids still drops padded (negative) slots.
+    mask_ids = topk_ids is not None
+    em = (
+        expert_mask.to(torch.int32).contiguous()
+        if use_mask
+        else torch.empty(0, device=out.device, dtype=torch.int32)
+    )
+    tk = (
+        topk_ids.to(torch.int32).contiguous()
+        if mask_ids
+        else torch.empty(0, device=out.device, dtype=torch.int32)
+    )
     # Set when stage2 deferred the route-weight multiply to this reduction.
     use_weight = topk_weights is not None
     tw = (
@@ -1240,7 +1245,7 @@ def _run_moe_reduction(
         topk=topk,
         model_dim=model_dim,
         dtype_str=_reduce_dtype_str,
-        use_mask=use_mask,
+        use_mask=mask_ids,
         num_experts=num_experts,
         out_dtype_str=out_dtype_str,
         use_weight=use_weight,

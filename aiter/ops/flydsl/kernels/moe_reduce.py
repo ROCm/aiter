@@ -4,7 +4,9 @@
 """MoE topk-reduction kernel (FlyDSL, layout API).
 
 ``Y[t, d] = sum_k X[t, k, d]``, optionally gated by the EP validity mask
-(``valid[t,k] = expert_mask[topk_ids[t,k]] != 0``). Epilogue of stage2
+(``valid[t,k] = expert_mask[topk_ids[t,k]] != 0``). With ``topk_ids`` but no mask
+(``num_experts=0``) only negative ids are dropped: stage 2 never writes the rows of
+padded slots. Epilogue of stage2
 ``mode="reduce"``, shared by every dtype's reduce path. Build a per-shape launcher
 with ``compile_moe_reduction`` (cached); the kernel's compile-time params are
 ``Constexpr`` so flyc specializes per shape/dtype.
@@ -180,10 +182,10 @@ def _moe_reduction_body(
             if const_expr(use_mask):
                 idx = tk_ptr[k]
                 idx_valid = idx >= fx.Int32(0)
-                safe_idx = idx_valid.select(idx, fx.Int32(0))
-                vk = (idx_valid & (em_ptr[safe_idx] != fx.Int32(0))).select(
-                    vk, fx.full(V, 0.0, fx.Float32)
-                )
+                if const_expr(num_experts > 0):
+                    safe_idx = idx_valid.select(idx, fx.Int32(0))
+                    idx_valid = idx_valid & (em_ptr[safe_idx] != fx.Int32(0))
+                vk = idx_valid.select(vk, fx.full(V, 0.0, fx.Float32))
             acc = acc + vk
         ofrag = fx.make_fragment_like(p_dst)
         fx.memref_store_vec(acc.to(out_numeric), ofrag)

@@ -5943,18 +5943,17 @@ def fused_moe_2stages(
         extra_stage1_args["situ_linear_beta"] = (
             25.0 if linear_beta is None else float(linear_beta)
         )
-    # EP: forward expert_mask + topk_ids to the flydsl stage2 wrapper so it can
-    # switch to reduce mode and fuse the validity gather in compile_moe_reduction.
-    if (
-        stage2_func
-        in (
-            _flydsl_stage2_wrapper,
-            _flydsl_v2_stage2_wrapper,
-        )
-        and expert_mask is not None
+    # Forward topk_ids to the flydsl stage2 wrapper: the reduce epilogue drops
+    # padded (negative id) slots, whose route rows stage 2 never writes. EP also
+    # forwards expert_mask so it can switch to reduce mode and fuse the validity
+    # gather in compile_moe_reduction.
+    if stage2_func in (
+        _flydsl_stage2_wrapper,
+        _flydsl_v2_stage2_wrapper,
     ):
-        extra_stage2_args["expert_mask"] = expert_mask
         extra_stage2_args["topk_ids"] = topk_ids
+        if expert_mask is not None:
+            extra_stage2_args["expert_mask"] = expert_mask
     stage2_keywords = getattr(metadata.stage2, "keywords", None) or {}
     uses_flydsl_v2_stage2 = stage2_func is _flydsl_v2_stage2_wrapper or (
         stage2_func is _mxfp4_a4w4_stage2_fw

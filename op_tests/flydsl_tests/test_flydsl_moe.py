@@ -361,6 +361,48 @@ def test_flydsl_stage2_fp8_ep_reduction():
     torch.testing.assert_close(out, torch.full_like(out, 3.0))
 
 
+@pytest.mark.parametrize("is_fp8", [False, True])
+@_SKIP_GFX950_FLYDSL
+def test_flydsl_stage2_reduction_drops_padded_slots(is_fp8):
+    from aiter.ops.flydsl.kernels.mxfp4_gemm_common import fp8out_row_bytes
+    from aiter.ops.flydsl.moe_kernels import _run_moe_reduction
+
+    token, topk, model_dim = 3, 4, 128
+    topk_ids = torch.arange(topk, dtype=torch.int32, device="cuda").repeat(token, 1)
+    topk_ids[1, 2:] = -1
+    topk_ids[2, :] = -1
+    pad = (topk_ids < 0).view(-1)
+    if is_fp8:
+        target = torch.empty(
+            (token * topk, fp8out_row_bytes(model_dim)),
+            dtype=torch.uint8,
+            device="cuda",
+        )
+        target[:, :model_dim] = torch.tensor(
+            [2.0], dtype=dtypes.fp8, device="cuda"
+        ).view(torch.uint8)
+        target[:, model_dim:] = 127  # E8M0 scale 1.0
+        target[pad, model_dim:] = 0xFF  # E8M0 NaN: unwritten rows
+    else:
+        target = torch.full(
+            (token * topk, model_dim), 2.0, dtype=torch.bfloat16, device="cuda"
+        )
+        target[pad] = float("nan")
+    out = torch.empty((token, model_dim), dtype=torch.bfloat16, device="cuda")
+
+    _run_moe_reduction(
+        target.view(-1) if not is_fp8 else target,
+        out,
+        token,
+        topk,
+        model_dim,
+        topk_ids=topk_ids,
+        is_fp8=is_fp8,
+    )
+    expected = 2.0 * (topk_ids >= 0).sum(dim=1, keepdim=True).to(torch.bfloat16)
+    torch.testing.assert_close(out, expected.expand_as(out))
+
+
 @pytest.mark.parametrize("inter_dim", [256, 384, 640])
 @_SKIP_GFX950_FLYDSL
 def test_flydsl_e2e_a8w4_gui(inter_dim):
