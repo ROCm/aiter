@@ -14,7 +14,7 @@
     {
       "a_t": false,
       "b_t": true,
-      "co_sha256": "943ecf1b828a10456f6d6e4342ce37a0497e76877425ad8c6888d1d68ec7cb14",
+      "co_sha256": "f1d08848c3c2093ef0e67c6c5c15e400c2275cfe9465549dfbe2670b79bcc198",
       "device_flags": [],
       "elf_flags": 1359,
       "elf_machine": 224,
@@ -41,7 +41,7 @@
     {
       "a_t": false,
       "b_t": false,
-      "co_sha256": "6563cf11642a56f91b463a560426adb79f5016023cfbd663df54fc3b9ec838f2",
+      "co_sha256": "a815c3fef6e50ada108a7d337b2c3e37a771feb1a11faf92c83200041d481cb5",
       "device_flags": [],
       "elf_flags": 1359,
       "elf_machine": 224,
@@ -68,7 +68,7 @@
     {
       "a_t": true,
       "b_t": true,
-      "co_sha256": "f98cd9f31bbed2a9e0a666f8471ecf34da82e56e6c6d8b31b6256837a4151ba6",
+      "co_sha256": "87ea5df9615a8871d34d74b7d7c2e474ca3adfe24dd03db37fafdfa563ab7cc0",
       "device_flags": [],
       "elf_flags": 1359,
       "elf_machine": 224,
@@ -95,7 +95,7 @@
     {
       "a_t": true,
       "b_t": false,
-      "co_sha256": "74df0307b97c77e855f774bba516f53a4eff96cb857c07263b47af5edd5fc834",
+      "co_sha256": "18ff698c89a97197ea5943f7cf51e6971737799ad5035042f30f1b449f9d15cd",
       "device_flags": [],
       "elf_flags": 1359,
       "elf_machine": 224,
@@ -106,7 +106,7 @@
       "kid": 1000,
       "layout": "tt",
       "offload_arch": "gfx950",
-      "sgpr_count": 73,
+      "sgpr_count": 74,
       "sgpr_spill_count": 0,
       "splitk": false,
       "symbol": "opus_gemm_gfx950_4wave_256x256x256x64_2x2_16x16x32_0x0x0_tt",
@@ -122,7 +122,7 @@
     {
       "a_t": false,
       "b_t": true,
-      "co_sha256": "3f1d35af5762481cf36a83ff27583b6b6bb08c3debdd16069e73b47b7c406889",
+      "co_sha256": "61583200e469bd9fe306d7ad98b1370ee0a547277d89ba5329d9daf0bb83b0d5",
       "device_flags": [],
       "elf_flags": 1359,
       "elf_machine": 224,
@@ -133,7 +133,7 @@
       "kid": 1001,
       "layout": "nn",
       "offload_arch": "gfx950",
-      "sgpr_count": 63,
+      "sgpr_count": 64,
       "sgpr_spill_count": 0,
       "splitk": false,
       "symbol": "opus_gemm_gfx950_4wave_256x256x128x64_2x2_16x16x32_0x0x0_nn",
@@ -149,7 +149,7 @@
     {
       "a_t": false,
       "b_t": false,
-      "co_sha256": "63789aacbd702c4ae449dfe1c624f2346ac235fe9d784de0676b720826ef8af9",
+      "co_sha256": "941fe8291309bebadb17169ece8366cde8d4969d1592c4dd065521eebc5fae1d",
       "device_flags": [],
       "elf_flags": 1359,
       "elf_machine": 224,
@@ -176,7 +176,7 @@
     {
       "a_t": true,
       "b_t": true,
-      "co_sha256": "285eed21107b018979262b56b23fcfa91b4ac8f3bf7d032db5784f30dfe0e810",
+      "co_sha256": "22c1e1164ad4c219ed9b220fcb2fe7fdaafd6e95e5fd06e2d996953a8478da1e",
       "device_flags": [],
       "elf_flags": 1359,
       "elf_machine": 224,
@@ -197,13 +197,13 @@
         64
       ],
       "undefined_symbols": [],
-      "vgpr_count": 392,
+      "vgpr_count": 396,
       "vgpr_spill_count": 0
     },
     {
       "a_t": true,
       "b_t": false,
-      "co_sha256": "ac061c0d727701f8da6ef50078e28cab5ddbfe973e97fc0264bc77b24c5df175",
+      "co_sha256": "b0e021643f0709a49e203a486ef0e8421ebeb1d2611158e52e50c19c02a1fb93",
       "device_flags": [],
       "elf_flags": 1359,
       "elf_machine": 224,
@@ -214,7 +214,7 @@
       "kid": 1001,
       "layout": "tt",
       "offload_arch": "gfx950",
-      "sgpr_count": 65,
+      "sgpr_count": 66,
       "sgpr_spill_count": 0,
       "splitk": false,
       "symbol": "opus_gemm_gfx950_4wave_256x256x128x64_2x2_16x16x32_0x0x0_tt",
@@ -224,13 +224,13 @@
         64
       ],
       "undefined_symbols": [],
-      "vgpr_count": 392,
+      "vgpr_count": 396,
       "vgpr_spill_count": 0
     },
     {
       "a_t": false,
       "b_t": true,
-      "co_sha256": "7e3f77c2f16b398b2fdc17850ca1594e41620700525840738563dba24cb3e63d",
+      "co_sha256": "af5e8cf5f40508d5dd5e6f4ecce97a6a0b933c98e9030817de97ed99cfae2e59",
       "device_flags": [],
       "elf_flags": 1359,
       "elf_machine": 224,
@@ -241,7 +241,7 @@
       "kid": 1002,
       "layout": "nn",
       "offload_arch": "gfx950",
-      "sgpr_count": 63,
+      "sgpr_count": 64,
       "sgpr_spill_count": 0,
       "splitk": false,
       "symbol": "opus_gemm_gfx950_4wave_256x128x256x64_2x2_16x16x32_0x0x0_nn",
@@ -251,13 +251,13 @@
         64
       ],
       "undefined_symbols": [],
-      "vgpr_count": 388,
+      "vgpr_count": 392,
       "vgpr_spill_count": 0
     },
     {
       "a_t": false,
       "b_t": false,
-      "co_sha256": "2c1da0ab11f0ce966668eb5e3b54301847066346b4935bf0730b89bff4bbd3dc",
+      "co_sha256": "a653d2992175aa58ea3adfdd78a21fb46787ed20e68aac57f88e7268e0a6d8d0",
       "device_flags": [],
       "elf_flags": 1359,
       "elf_machine": 224,
@@ -284,7 +284,7 @@
     {
       "a_t": true,
       "b_t": true,
-      "co_sha256": "752e1c4598af53b59a2a3d741bfb73c7e3ab46108f01cdfa7333d4bad8621182",
+      "co_sha256": "645a52f04809f6a340431f221d3239dfefdcfc53dac1ed4aee0462e72b0c4edc",
       "device_flags": [],
       "elf_flags": 1359,
       "elf_machine": 224,
@@ -305,13 +305,13 @@
         64
       ],
       "undefined_symbols": [],
-      "vgpr_count": 388,
+      "vgpr_count": 392,
       "vgpr_spill_count": 0
     },
     {
       "a_t": true,
       "b_t": false,
-      "co_sha256": "af271d1347eb2b64cc7edfe0da86f2eaab18304419ae924201c65017f3c2cbee",
+      "co_sha256": "43140448772f62c064ccf14f5840f5fd4253122d707f05a44e5d01aeec265353",
       "device_flags": [],
       "elf_flags": 1359,
       "elf_machine": 224,
@@ -322,7 +322,7 @@
       "kid": 1002,
       "layout": "tt",
       "offload_arch": "gfx950",
-      "sgpr_count": 65,
+      "sgpr_count": 66,
       "sgpr_spill_count": 0,
       "splitk": false,
       "symbol": "opus_gemm_gfx950_4wave_256x128x256x64_2x2_16x16x32_0x0x0_tt",
@@ -332,13 +332,13 @@
         64
       ],
       "undefined_symbols": [],
-      "vgpr_count": 388,
+      "vgpr_count": 392,
       "vgpr_spill_count": 0
     },
     {
       "a_t": false,
       "b_t": true,
-      "co_sha256": "eb259c83cf6b050efa20fa4a605eea3a4dfce0501b92140092972d5c21968f2e",
+      "co_sha256": "e546c5bf1d3c8c6ee94ef415f3cb9ed89ef86e0943046471e1ba62e2dd0815b3",
       "device_flags": [],
       "elf_flags": 1359,
       "elf_machine": 224,
@@ -359,13 +359,13 @@
         64
       ],
       "undefined_symbols": [],
-      "vgpr_count": 170,
+      "vgpr_count": 176,
       "vgpr_spill_count": 0
     },
     {
       "a_t": false,
       "b_t": false,
-      "co_sha256": "2ef438c794395b551253bf50bd34b2267e26d8fd42e8ed5d821858b92b6eb82e",
+      "co_sha256": "57e59fd993cd550de15e139c7d80805a1829624013f78088e36fb57324276314",
       "device_flags": [],
       "elf_flags": 1359,
       "elf_machine": 224,
@@ -392,7 +392,7 @@
     {
       "a_t": true,
       "b_t": true,
-      "co_sha256": "1a1027f46c5172f846fede658ca92fbffdfa4b1673e16b4b684ae4a690aa9669",
+      "co_sha256": "974866d45667a322e6c376003d7014ae5a303360bddeb50e12968b3146ff6067",
       "device_flags": [],
       "elf_flags": 1359,
       "elf_machine": 224,
@@ -413,13 +413,13 @@
         64
       ],
       "undefined_symbols": [],
-      "vgpr_count": 168,
+      "vgpr_count": 170,
       "vgpr_spill_count": 0
     },
     {
       "a_t": true,
       "b_t": false,
-      "co_sha256": "81d1b71bba1a698a88cfc8decd3893ea85287164cdb48bd37d9bf487566d3613",
+      "co_sha256": "b5d1e24d6718949f232b0de8d886e69a6dd6829b1d10d7d3e5652996fa4ac5e2",
       "device_flags": [],
       "elf_flags": 1359,
       "elf_machine": 224,
@@ -430,7 +430,7 @@
       "kid": 1003,
       "layout": "tt",
       "offload_arch": "gfx950",
-      "sgpr_count": 57,
+      "sgpr_count": 58,
       "sgpr_spill_count": 0,
       "splitk": false,
       "symbol": "opus_gemm_gfx950_4wave_256x128x128x64_2x2_16x16x32_0x0x0_tt",
@@ -446,7 +446,7 @@
     {
       "a_t": false,
       "b_t": true,
-      "co_sha256": "efa1be738d3b7e3f3cc91a4f9b71a1b669b0d6641a36b4a46d78d233ad2cdfab",
+      "co_sha256": "d068367d405cffbce9b48a4eb11cd17538a7e9a58713be76270298d7ceacdf86",
       "device_flags": [],
       "elf_flags": 1359,
       "elf_machine": 224,
@@ -457,7 +457,7 @@
       "kid": 1004,
       "layout": "nn",
       "offload_arch": "gfx950",
-      "sgpr_count": 59,
+      "sgpr_count": 60,
       "sgpr_spill_count": 0,
       "splitk": false,
       "symbol": "opus_gemm_gfx950_4wave_256x256x64x64_2x2_16x16x32_0x0x0_nn",
@@ -473,7 +473,7 @@
     {
       "a_t": false,
       "b_t": false,
-      "co_sha256": "925a72eee91b9a6cd336287b6c188198a5a7cfb8f515a6c8dbe3e186ba721560",
+      "co_sha256": "3f48a0220f343d615afd047608bb421c0f5ec7629f42db2b6fcc159458cda672",
       "device_flags": [],
       "elf_flags": 1359,
       "elf_machine": 224,
@@ -500,7 +500,7 @@
     {
       "a_t": true,
       "b_t": true,
-      "co_sha256": "5afda12137e20129ee77d14cd187ac7565e7b7998cc562ad4dadeef36d66fd8b",
+      "co_sha256": "8639ca557027a099839911c3256d79d8e9c733d5016704b576ff961eb90a6e3f",
       "device_flags": [],
       "elf_flags": 1359,
       "elf_machine": 224,
@@ -527,7 +527,7 @@
     {
       "a_t": true,
       "b_t": false,
-      "co_sha256": "ea79d6f10c3cfc696fe2e9cd943d94aa5233849244a89116915525d9302d84b3",
+      "co_sha256": "c2d7133ec633bd2807a69a120d1a9c21ca513973fbdd37f5698752b933ade9d6",
       "device_flags": [],
       "elf_flags": 1359,
       "elf_machine": 224,
@@ -538,7 +538,7 @@
       "kid": 1004,
       "layout": "tt",
       "offload_arch": "gfx950",
-      "sgpr_count": 60,
+      "sgpr_count": 59,
       "sgpr_spill_count": 0,
       "splitk": false,
       "symbol": "opus_gemm_gfx950_4wave_256x256x64x64_2x2_16x16x32_0x0x0_tt",
@@ -548,13 +548,13 @@
         64
       ],
       "undefined_symbols": [],
-      "vgpr_count": 178,
+      "vgpr_count": 176,
       "vgpr_spill_count": 0
     },
     {
       "a_t": false,
       "b_t": true,
-      "co_sha256": "2c37d30bf03b45657c19f241ceec9be7d848ff9cb993e094ca8b4188a90c3399",
+      "co_sha256": "0c220f1c99986f6fc1fbea78cccc45dacf8b9633c62c68359b76615dde26466a",
       "device_flags": [],
       "elf_flags": 1359,
       "elf_machine": 224,
@@ -565,7 +565,7 @@
       "kid": 1005,
       "layout": "nn",
       "offload_arch": "gfx950",
-      "sgpr_count": 58,
+      "sgpr_count": 59,
       "sgpr_spill_count": 0,
       "splitk": false,
       "symbol": "opus_gemm_gfx950_4wave_256x64x256x64_2x2_16x16x32_0x0x0_nn",
@@ -575,13 +575,13 @@
         64
       ],
       "undefined_symbols": [],
-      "vgpr_count": 180,
+      "vgpr_count": 182,
       "vgpr_spill_count": 0
     },
     {
       "a_t": false,
       "b_t": false,
-      "co_sha256": "1bb441226c5745e42f7cadc2ee1d1b9115834da330b573c510edcda4333b390a",
+      "co_sha256": "a5d26f21611e6147e7607b26daa1cc6a4a1e564d3687a304c9a43e303ba43763",
       "device_flags": [],
       "elf_flags": 1359,
       "elf_machine": 224,
@@ -608,7 +608,7 @@
     {
       "a_t": true,
       "b_t": true,
-      "co_sha256": "73511f84740e7bd124b0e68007b7a1ec6db4bed8cbb1eb2592d2c8e720742068",
+      "co_sha256": "bb7419738c5505ebfee96dab16e136617e3baecdd2a22c648bf2c344c73291c4",
       "device_flags": [],
       "elf_flags": 1359,
       "elf_machine": 224,
@@ -619,7 +619,7 @@
       "kid": 1005,
       "layout": "tn",
       "offload_arch": "gfx950",
-      "sgpr_count": 59,
+      "sgpr_count": 60,
       "sgpr_spill_count": 0,
       "splitk": false,
       "symbol": "opus_gemm_gfx950_4wave_256x64x256x64_2x2_16x16x32_0x0x0_tn",
@@ -635,7 +635,7 @@
     {
       "a_t": true,
       "b_t": false,
-      "co_sha256": "2dbb98a75617669bb6ca41809257c484ec8f4d42dc443af762f31aa21aceed5f",
+      "co_sha256": "bc9144f5f79c1f5f3f4363c1aca34283b4c815c04bb6884cd5fd9648392c2dd9",
       "device_flags": [],
       "elf_flags": 1359,
       "elf_machine": 224,
@@ -646,7 +646,7 @@
       "kid": 1005,
       "layout": "tt",
       "offload_arch": "gfx950",
-      "sgpr_count": 60,
+      "sgpr_count": 62,
       "sgpr_spill_count": 0,
       "splitk": false,
       "symbol": "opus_gemm_gfx950_4wave_256x64x256x64_2x2_16x16x32_0x0x0_tt",
@@ -656,13 +656,13 @@
         64
       ],
       "undefined_symbols": [],
-      "vgpr_count": 182,
+      "vgpr_count": 184,
       "vgpr_spill_count": 0
     },
     {
       "a_t": false,
       "b_t": true,
-      "co_sha256": "2a17cb201ae5ec2911206fdd3487e8e9f986ef360730771e54b876670c61496e",
+      "co_sha256": "fd0bfc346b4235978a8e61fa3dd44d4a5b6b26406968c0dc3bd7e52190b729d2",
       "device_flags": [],
       "elf_flags": 1359,
       "elf_machine": 224,
@@ -673,7 +673,7 @@
       "kid": 1006,
       "layout": "nn",
       "offload_arch": "gfx950",
-      "sgpr_count": 51,
+      "sgpr_count": 52,
       "sgpr_spill_count": 0,
       "splitk": false,
       "symbol": "opus_gemm_gfx950_4wave_256x128x64x64_2x2_16x16x32_0x0x0_nn",
@@ -683,13 +683,13 @@
         64
       ],
       "undefined_symbols": [],
-      "vgpr_count": 104,
+      "vgpr_count": 100,
       "vgpr_spill_count": 0
     },
     {
       "a_t": false,
       "b_t": false,
-      "co_sha256": "0f93beeebfeee2a9ea998bb40e63950dd1450e2fbcfb73818fb24af5c8f59f0f",
+      "co_sha256": "801b7a58c8bd534787e9ee6f11d03a0558a22aa345d61f219560fe98a4de127a",
       "device_flags": [],
       "elf_flags": 1359,
       "elf_machine": 224,
@@ -716,7 +716,7 @@
     {
       "a_t": true,
       "b_t": true,
-      "co_sha256": "88e346a7f10d740795e7840a1081fe897cd9a653f2522b2ca2ac70b410e31ec4",
+      "co_sha256": "67a86a54699bff7ba5b03ffc238cbcb4f69898253c00ea40ef308a6f9b8153ed",
       "device_flags": [],
       "elf_flags": 1359,
       "elf_machine": 224,
@@ -743,7 +743,7 @@
     {
       "a_t": true,
       "b_t": false,
-      "co_sha256": "e1403163a42b00f4e19f49c623b8a99b2e5985439a248b0dd864865dc15ff73c",
+      "co_sha256": "fc669cfd8cc7a3b007c2aeae5a7c70b74a5bab27b214f6d48509b066a86b7f01",
       "device_flags": [],
       "elf_flags": 1359,
       "elf_machine": 224,
@@ -754,7 +754,7 @@
       "kid": 1006,
       "layout": "tt",
       "offload_arch": "gfx950",
-      "sgpr_count": 52,
+      "sgpr_count": 51,
       "sgpr_spill_count": 0,
       "splitk": false,
       "symbol": "opus_gemm_gfx950_4wave_256x128x64x64_2x2_16x16x32_0x0x0_tt",
@@ -764,13 +764,13 @@
         64
       ],
       "undefined_symbols": [],
-      "vgpr_count": 110,
+      "vgpr_count": 108,
       "vgpr_spill_count": 0
     },
     {
       "a_t": false,
       "b_t": true,
-      "co_sha256": "e07f073d02c16e2910adc251639c556aa2a862030660f40956c37fa74548f2c7",
+      "co_sha256": "cd95d538043e7e78d17d8c158611a0e36f15abccd08cac469a0647147fcec712",
       "device_flags": [],
       "elf_flags": 1359,
       "elf_machine": 224,
@@ -781,7 +781,7 @@
       "kid": 1007,
       "layout": "nn",
       "offload_arch": "gfx950",
-      "sgpr_count": 50,
+      "sgpr_count": 51,
       "sgpr_spill_count": 0,
       "splitk": false,
       "symbol": "opus_gemm_gfx950_4wave_256x64x128x64_2x2_16x16x32_0x0x0_nn",
@@ -797,7 +797,7 @@
     {
       "a_t": false,
       "b_t": false,
-      "co_sha256": "c58163d3cca15b16700ac9058ef2e04fce9e04a79dcc51fe2581280c1873490b",
+      "co_sha256": "d8e4ca54084c6b69a0708feaac270bc7baca61841f97b5898b6f622dbf1ec2c3",
       "device_flags": [],
       "elf_flags": 1359,
       "elf_machine": 224,
@@ -824,7 +824,7 @@
     {
       "a_t": true,
       "b_t": true,
-      "co_sha256": "572567630eda69f6758e6e9dc58e8ca235a722c7b8cbab816f3f2e1b53b06136",
+      "co_sha256": "ac0ba256b7b261ff2848b24747c28c778bec7024ac0a6e57259fe6362d6e7562",
       "device_flags": [],
       "elf_flags": 1359,
       "elf_machine": 224,
@@ -835,7 +835,7 @@
       "kid": 1007,
       "layout": "tn",
       "offload_arch": "gfx950",
-      "sgpr_count": 51,
+      "sgpr_count": 52,
       "sgpr_spill_count": 0,
       "splitk": false,
       "symbol": "opus_gemm_gfx950_4wave_256x64x128x64_2x2_16x16x32_0x0x0_tn",
@@ -851,7 +851,7 @@
     {
       "a_t": true,
       "b_t": false,
-      "co_sha256": "c92739c3ee23c4bf7a6a6c2619bf5c54fde3192d84624e14fce1c6f21e3fa3bb",
+      "co_sha256": "5d7b6e2a204e259386fab530affbe3ae6b8c8e5311664b43a419c910a7c2cd24",
       "device_flags": [],
       "elf_flags": 1359,
       "elf_machine": 224,
@@ -862,7 +862,7 @@
       "kid": 1007,
       "layout": "tt",
       "offload_arch": "gfx950",
-      "sgpr_count": 52,
+      "sgpr_count": 54,
       "sgpr_spill_count": 0,
       "splitk": false,
       "symbol": "opus_gemm_gfx950_4wave_256x64x128x64_2x2_16x16x32_0x0x0_tt",
@@ -872,13 +872,13 @@
         64
       ],
       "undefined_symbols": [],
-      "vgpr_count": 100,
+      "vgpr_count": 104,
       "vgpr_spill_count": 0
     },
     {
       "a_t": false,
       "b_t": true,
-      "co_sha256": "35f989821a43ba8366d273f9a1eaf2b6b1ca991493e44b30bc1617d6192b9566",
+      "co_sha256": "17738dcb67beecfaf3f6953e3ac600f64a274f67b7a580de15feb0aa15c454f1",
       "device_flags": [],
       "elf_flags": 1359,
       "elf_machine": 224,
@@ -905,7 +905,7 @@
     {
       "a_t": false,
       "b_t": false,
-      "co_sha256": "4b3ff8a0767b99c4cb9906b0df083264c5785eb9f78f2e9170ebe0aa8c44494f",
+      "co_sha256": "930c3d35f5a2a1940d08f9ad5736b010ba5a7f6b8515d642cfd065ac93ef6801",
       "device_flags": [],
       "elf_flags": 1359,
       "elf_machine": 224,
@@ -932,7 +932,7 @@
     {
       "a_t": true,
       "b_t": true,
-      "co_sha256": "75f98fad7d60a4c28574fecb3fd0e1e4f8ca2e691b548b016dfb2779b27cf12d",
+      "co_sha256": "731264bcb559e28ce868674d64c82651fe0fd44c7866907a2c698eb08529e314",
       "device_flags": [],
       "elf_flags": 1359,
       "elf_machine": 224,
@@ -959,7 +959,7 @@
     {
       "a_t": true,
       "b_t": false,
-      "co_sha256": "9fc9ff7679efa3d18496829286727bd8e5dcdd03650cf6923faec522ef491157",
+      "co_sha256": "060081f70731f00ea29db9513355ce2f8a61d136ae2551d40599051829b12a01",
       "device_flags": [],
       "elf_flags": 1359,
       "elf_machine": 224,
@@ -970,7 +970,7 @@
       "kid": 1008,
       "layout": "tt",
       "offload_arch": "gfx950",
-      "sgpr_count": 72,
+      "sgpr_count": 73,
       "sgpr_spill_count": 0,
       "splitk": true,
       "symbol": "opus_gemm_gfx950_splitk_4wave_ws_256x256x256x64_2x2_16x16x32_0x0x0_tt",
@@ -980,13 +980,13 @@
         64
       ],
       "undefined_symbols": [],
-      "vgpr_count": 424,
+      "vgpr_count": 436,
       "vgpr_spill_count": 0
     },
     {
       "a_t": false,
       "b_t": true,
-      "co_sha256": "04a6227acecbd6bf8c7a16c27eabd55f8f2707d6b4c33704a40d68732ebd27d0",
+      "co_sha256": "4cdb7c7e4c5fdf91947277340186cc5f25eb7a318bf836ed5ff42dda5a569380",
       "device_flags": [],
       "elf_flags": 1359,
       "elf_machine": 224,
@@ -997,7 +997,7 @@
       "kid": 1009,
       "layout": "nn",
       "offload_arch": "gfx950",
-      "sgpr_count": 63,
+      "sgpr_count": 64,
       "sgpr_spill_count": 0,
       "splitk": true,
       "symbol": "opus_gemm_gfx950_splitk_4wave_ws_256x256x128x64_2x2_16x16x32_0x0x0_nn",
@@ -1013,7 +1013,7 @@
     {
       "a_t": false,
       "b_t": false,
-      "co_sha256": "6eb8c3950020f7932dc75e5afe4d99d066f171f4ec3e3b7bff9c25935ae3a99a",
+      "co_sha256": "853946dad0cb39b4c406b8bc83929d248523d5d8cfca214a593a3f412cf1b534",
       "device_flags": [],
       "elf_flags": 1359,
       "elf_machine": 224,
@@ -1040,7 +1040,7 @@
     {
       "a_t": true,
       "b_t": true,
-      "co_sha256": "fa506f01ff2f8318e08ce546c41dc39da26dd12c243d5a9e42ce1fe7244dff4a",
+      "co_sha256": "e060eff612afb21b7f60fc1a949648fc7c8ae6aa4b246ca399d12597a7035790",
       "device_flags": [],
       "elf_flags": 1359,
       "elf_machine": 224,
@@ -1061,13 +1061,13 @@
         64
       ],
       "undefined_symbols": [],
-      "vgpr_count": 384,
+      "vgpr_count": 396,
       "vgpr_spill_count": 0
     },
     {
       "a_t": true,
       "b_t": false,
-      "co_sha256": "3510e3f8d53f4ce5dfcb117fde3d7aba1814a8f72e4ce36c62b9962e92ff5db9",
+      "co_sha256": "240ea3e4ea34263520b6e858b01c70cd943552699c96ab8d8243d961208ec6da",
       "device_flags": [],
       "elf_flags": 1359,
       "elf_machine": 224,
@@ -1078,7 +1078,7 @@
       "kid": 1009,
       "layout": "tt",
       "offload_arch": "gfx950",
-      "sgpr_count": 65,
+      "sgpr_count": 66,
       "sgpr_spill_count": 0,
       "splitk": true,
       "symbol": "opus_gemm_gfx950_splitk_4wave_ws_256x256x128x64_2x2_16x16x32_0x0x0_tt",
@@ -1088,13 +1088,13 @@
         64
       ],
       "undefined_symbols": [],
-      "vgpr_count": 388,
+      "vgpr_count": 396,
       "vgpr_spill_count": 0
     },
     {
       "a_t": false,
       "b_t": true,
-      "co_sha256": "5fa03a655e436d09fdf91748e674b943d73c6aa2f87bbcf088ebaecf5c461191",
+      "co_sha256": "cf225df68d0fcbc464e312b9ef2bb462820aa2cccfab31e4181a29f3aad65f84",
       "device_flags": [],
       "elf_flags": 1359,
       "elf_machine": 224,
@@ -1105,7 +1105,7 @@
       "kid": 1010,
       "layout": "nn",
       "offload_arch": "gfx950",
-      "sgpr_count": 63,
+      "sgpr_count": 64,
       "sgpr_spill_count": 0,
       "splitk": true,
       "symbol": "opus_gemm_gfx950_splitk_4wave_ws_256x128x256x64_2x2_16x16x32_0x0x0_nn",
@@ -1121,7 +1121,7 @@
     {
       "a_t": false,
       "b_t": false,
-      "co_sha256": "373457f3c45b10e2bfa3d30391861861fcb88accaedcf9b087b4f16e6eb64338",
+      "co_sha256": "d0a3edaa78be6f7d2da1629e4a04a2e673210152192cd6c1668a1a7d4bb88382",
       "device_flags": [],
       "elf_flags": 1359,
       "elf_machine": 224,
@@ -1148,7 +1148,7 @@
     {
       "a_t": true,
       "b_t": true,
-      "co_sha256": "15e77a8a4dc0f9ed7d0408b1ab8eb597c68ec7428dbbabb833e4f4575c3f1116",
+      "co_sha256": "34b28cb95e3dd763ad3fcf5724a56560c3b56fe13e03660ec959763b28d20bd7",
       "device_flags": [],
       "elf_flags": 1359,
       "elf_machine": 224,
@@ -1169,13 +1169,13 @@
         64
       ],
       "undefined_symbols": [],
-      "vgpr_count": 380,
+      "vgpr_count": 384,
       "vgpr_spill_count": 0
     },
     {
       "a_t": true,
       "b_t": false,
-      "co_sha256": "5b2906e9e4de625fb4ad78408c8882cfb07f7f416926a40bf27f11e1dddcdad8",
+      "co_sha256": "8792b67851ade0bed8b5faa1a40f2a7ffb8ce18631957322648749c990e8b8d3",
       "device_flags": [],
       "elf_flags": 1359,
       "elf_machine": 224,
@@ -1186,7 +1186,7 @@
       "kid": 1010,
       "layout": "tt",
       "offload_arch": "gfx950",
-      "sgpr_count": 65,
+      "sgpr_count": 66,
       "sgpr_spill_count": 0,
       "splitk": true,
       "symbol": "opus_gemm_gfx950_splitk_4wave_ws_256x128x256x64_2x2_16x16x32_0x0x0_tt",
@@ -1196,13 +1196,13 @@
         64
       ],
       "undefined_symbols": [],
-      "vgpr_count": 376,
+      "vgpr_count": 380,
       "vgpr_spill_count": 0
     },
     {
       "a_t": false,
       "b_t": true,
-      "co_sha256": "73ed4d22f59e3da02c12cca72f6604626f379ed045b45e8f79025cc5b8b23ca9",
+      "co_sha256": "1b323dd5344d7365b94f133b36cad801b85fa6f6f683b844a468b96916ff1a04",
       "device_flags": [],
       "elf_flags": 1359,
       "elf_machine": 224,
@@ -1223,13 +1223,13 @@
         64
       ],
       "undefined_symbols": [],
-      "vgpr_count": 152,
+      "vgpr_count": 156,
       "vgpr_spill_count": 0
     },
     {
       "a_t": false,
       "b_t": false,
-      "co_sha256": "1d9f69e0a3981864f8059fbcca5d9d0c510da248c870c298ecb36f4f4a99dad8",
+      "co_sha256": "869ce0b95da067e358c981df09034447b25f873175753843cba95f9463b1f990",
       "device_flags": [],
       "elf_flags": 1359,
       "elf_machine": 224,
@@ -1256,7 +1256,7 @@
     {
       "a_t": true,
       "b_t": true,
-      "co_sha256": "ff02c06be2d398e7142b4b2fe06c3d705caf0294d435b3197896e7db1bb8d6c7",
+      "co_sha256": "e09540af51229c4f7c4a18dcd20cb4f3728e3e55edcf67804217676a0b448611",
       "device_flags": [],
       "elf_flags": 1359,
       "elf_machine": 224,
@@ -1277,13 +1277,13 @@
         64
       ],
       "undefined_symbols": [],
-      "vgpr_count": 150,
+      "vgpr_count": 156,
       "vgpr_spill_count": 0
     },
     {
       "a_t": true,
       "b_t": false,
-      "co_sha256": "386b3f16cc5b4c84233043414e681021e1148db799b0bfff199d2299e932209f",
+      "co_sha256": "1b2602b18e25351cb3600c6b8a03b87cd63d917733752b66c361be125f050d16",
       "device_flags": [],
       "elf_flags": 1359,
       "elf_machine": 224,
@@ -1294,7 +1294,7 @@
       "kid": 1011,
       "layout": "tt",
       "offload_arch": "gfx950",
-      "sgpr_count": 57,
+      "sgpr_count": 58,
       "sgpr_spill_count": 0,
       "splitk": true,
       "symbol": "opus_gemm_gfx950_splitk_4wave_ws_256x128x128x64_2x2_16x16x32_0x0x0_tt",
@@ -1304,13 +1304,13 @@
         64
       ],
       "undefined_symbols": [],
-      "vgpr_count": 154,
+      "vgpr_count": 156,
       "vgpr_spill_count": 0
     },
     {
       "a_t": false,
       "b_t": true,
-      "co_sha256": "7cd9ab04043057d2eddd4663988d829fcc764c70d0da1bff777b6c427bfb79ae",
+      "co_sha256": "2fc82a00c453ba5085f67c0e56d7f240a375c12de1bf93d51ea0691afd4bcac9",
       "device_flags": [],
       "elf_flags": 1359,
       "elf_machine": 224,
@@ -1321,7 +1321,7 @@
       "kid": 1012,
       "layout": "nn",
       "offload_arch": "gfx950",
-      "sgpr_count": 59,
+      "sgpr_count": 60,
       "sgpr_spill_count": 0,
       "splitk": true,
       "symbol": "opus_gemm_gfx950_splitk_4wave_ws_256x256x64x64_2x2_16x16x32_0x0x0_nn",
@@ -1331,13 +1331,13 @@
         64
       ],
       "undefined_symbols": [],
-      "vgpr_count": 172,
+      "vgpr_count": 170,
       "vgpr_spill_count": 0
     },
     {
       "a_t": false,
       "b_t": false,
-      "co_sha256": "05d2e80ad4c15cfb7a53f9713843ce9c7495aa5876eaa81c11125ada6dd1c108",
+      "co_sha256": "3a321c43974fcdbe036ddb1abf93a0e6fce3a49c2e50bc81b024a93d7c5f4aa9",
       "device_flags": [],
       "elf_flags": 1359,
       "elf_machine": 224,
@@ -1364,7 +1364,7 @@
     {
       "a_t": true,
       "b_t": true,
-      "co_sha256": "548a19e25249ca17959665d8271a569167d6499d258fd0c123769a610db70fdd",
+      "co_sha256": "6670b26ce75ffadcd5acbc5c4f6f4d3e49fdfe3f067f10c1c6d405cbd8f7a10d",
       "device_flags": [],
       "elf_flags": 1359,
       "elf_machine": 224,
@@ -1385,13 +1385,13 @@
         64
       ],
       "undefined_symbols": [],
-      "vgpr_count": 164,
+      "vgpr_count": 176,
       "vgpr_spill_count": 0
     },
     {
       "a_t": true,
       "b_t": false,
-      "co_sha256": "3811f575845d5ff43aebda21ee42fa0e8d69ce4c89983b768050e8b224ca6fbf",
+      "co_sha256": "a9b984f527d58ce31a774832f8777a0404607d4785493cb0aafe05463e8bc616",
       "device_flags": [],
       "elf_flags": 1359,
       "elf_machine": 224,
@@ -1402,7 +1402,7 @@
       "kid": 1012,
       "layout": "tt",
       "offload_arch": "gfx950",
-      "sgpr_count": 60,
+      "sgpr_count": 59,
       "sgpr_spill_count": 0,
       "splitk": true,
       "symbol": "opus_gemm_gfx950_splitk_4wave_ws_256x256x64x64_2x2_16x16x32_0x0x0_tt",
@@ -1412,13 +1412,13 @@
         64
       ],
       "undefined_symbols": [],
-      "vgpr_count": 168,
+      "vgpr_count": 174,
       "vgpr_spill_count": 0
     },
     {
       "a_t": false,
       "b_t": true,
-      "co_sha256": "05411a2141b8bb5ce6f2ff5d001049f6ae488859086bfddd0eaf86e0b0d5d249",
+      "co_sha256": "ec43a15a8a0cc2762287818e24841a5c032d8750ecc8e889b14411172276dc9c",
       "device_flags": [],
       "elf_flags": 1359,
       "elf_machine": 224,
@@ -1429,7 +1429,7 @@
       "kid": 1013,
       "layout": "nn",
       "offload_arch": "gfx950",
-      "sgpr_count": 58,
+      "sgpr_count": 59,
       "sgpr_spill_count": 0,
       "splitk": true,
       "symbol": "opus_gemm_gfx950_splitk_4wave_ws_256x64x256x64_2x2_16x16x32_0x0x0_nn",
@@ -1445,7 +1445,7 @@
     {
       "a_t": false,
       "b_t": false,
-      "co_sha256": "2ee63be6f2b0e5d347c952c530ac0929ed217f48c6077b1ff46bf00d891ef327",
+      "co_sha256": "c496bec579c5589e2b80971047607a39066098e19414d51f9dfa477b5e02aa41",
       "device_flags": [],
       "elf_flags": 1359,
       "elf_machine": 224,
@@ -1472,7 +1472,7 @@
     {
       "a_t": true,
       "b_t": true,
-      "co_sha256": "72672f290bdc5eefe7a676455ce8e56bc7fc67abff50d858ed568ac43475c105",
+      "co_sha256": "0b7eb6acee417117706d5bccc97cab88247f503f1a6783e35c29a01833c1a200",
       "device_flags": [],
       "elf_flags": 1359,
       "elf_machine": 224,
@@ -1483,7 +1483,7 @@
       "kid": 1013,
       "layout": "tn",
       "offload_arch": "gfx950",
-      "sgpr_count": 60,
+      "sgpr_count": 61,
       "sgpr_spill_count": 0,
       "splitk": true,
       "symbol": "opus_gemm_gfx950_splitk_4wave_ws_256x64x256x64_2x2_16x16x32_0x0x0_tn",
@@ -1493,13 +1493,13 @@
         64
       ],
       "undefined_symbols": [],
-      "vgpr_count": 168,
+      "vgpr_count": 176,
       "vgpr_spill_count": 0
     },
     {
       "a_t": true,
       "b_t": false,
-      "co_sha256": "b6ca88d09e3cedb185395d27175c416b58ae9a4a78d792e4eed096bcb151dd35",
+      "co_sha256": "d3f00b441658dac1be1c4877046834402c821004433bc1b66e3fadf598a530f0",
       "device_flags": [],
       "elf_flags": 1359,
       "elf_machine": 224,
@@ -1510,7 +1510,7 @@
       "kid": 1013,
       "layout": "tt",
       "offload_arch": "gfx950",
-      "sgpr_count": 60,
+      "sgpr_count": 62,
       "sgpr_spill_count": 0,
       "splitk": true,
       "symbol": "opus_gemm_gfx950_splitk_4wave_ws_256x64x256x64_2x2_16x16x32_0x0x0_tt",
@@ -1526,7 +1526,7 @@
     {
       "a_t": false,
       "b_t": true,
-      "co_sha256": "91cb02880fd124eb651ab6fcf47b2326e5fb6a0f73114285528c614f4474a44c",
+      "co_sha256": "55fe0def2bf93c3989db33ccc595531df84708a46a7ab627cd87562537b95748",
       "device_flags": [],
       "elf_flags": 1359,
       "elf_machine": 224,
@@ -1537,7 +1537,7 @@
       "kid": 1014,
       "layout": "nn",
       "offload_arch": "gfx950",
-      "sgpr_count": 51,
+      "sgpr_count": 52,
       "sgpr_spill_count": 0,
       "splitk": true,
       "symbol": "opus_gemm_gfx950_splitk_4wave_ws_256x128x64x64_2x2_16x16x32_0x0x0_nn",
@@ -1547,13 +1547,13 @@
         64
       ],
       "undefined_symbols": [],
-      "vgpr_count": 104,
+      "vgpr_count": 100,
       "vgpr_spill_count": 0
     },
     {
       "a_t": false,
       "b_t": false,
-      "co_sha256": "d63244b7af8a286a0268eff30c92e8a4561ddbe3d79f5977512fecff2f5f09b0",
+      "co_sha256": "3f946b6e3c1d0fe1bee797e3536db2bc9239eb541323c218e46f905cf376630c",
       "device_flags": [],
       "elf_flags": 1359,
       "elf_machine": 224,
@@ -1580,7 +1580,7 @@
     {
       "a_t": true,
       "b_t": true,
-      "co_sha256": "b7b066e66b68734e2a0c0973b523ad4cc55a1bf2008bf70e64aafb9415b44e0f",
+      "co_sha256": "0465e33b7496dc883e95aa43ca47fa26d57a06a6bfa4c9c3414aaf9c25b94f75",
       "device_flags": [],
       "elf_flags": 1359,
       "elf_machine": 224,
@@ -1601,13 +1601,13 @@
         64
       ],
       "undefined_symbols": [],
-      "vgpr_count": 98,
+      "vgpr_count": 102,
       "vgpr_spill_count": 0
     },
     {
       "a_t": true,
       "b_t": false,
-      "co_sha256": "86d303d109be53a4fc46d99162348372ca7e1c3a1f0ad060aca87a8028d391c2",
+      "co_sha256": "ed3ee09f792875ab9d4e9d7ad29bd6e2653e2443101d4fe2cbff6f5bb3ef7b63",
       "device_flags": [],
       "elf_flags": 1359,
       "elf_machine": 224,
@@ -1618,7 +1618,7 @@
       "kid": 1014,
       "layout": "tt",
       "offload_arch": "gfx950",
-      "sgpr_count": 52,
+      "sgpr_count": 51,
       "sgpr_spill_count": 0,
       "splitk": true,
       "symbol": "opus_gemm_gfx950_splitk_4wave_ws_256x128x64x64_2x2_16x16x32_0x0x0_tt",
@@ -1628,13 +1628,13 @@
         64
       ],
       "undefined_symbols": [],
-      "vgpr_count": 100,
+      "vgpr_count": 106,
       "vgpr_spill_count": 0
     },
     {
       "a_t": false,
       "b_t": true,
-      "co_sha256": "f6df310070053f406d66b02a47c444d7e34a5f66e728f36a70be921c53547147",
+      "co_sha256": "aef4ce622479d05b4878e813515686be45b0ad62ac40e9d62165ce6999c52caf",
       "device_flags": [],
       "elf_flags": 1359,
       "elf_machine": 224,
@@ -1645,7 +1645,7 @@
       "kid": 1015,
       "layout": "nn",
       "offload_arch": "gfx950",
-      "sgpr_count": 50,
+      "sgpr_count": 51,
       "sgpr_spill_count": 0,
       "splitk": true,
       "symbol": "opus_gemm_gfx950_splitk_4wave_ws_256x64x128x64_2x2_16x16x32_0x0x0_nn",
@@ -1655,13 +1655,13 @@
         64
       ],
       "undefined_symbols": [],
-      "vgpr_count": 100,
+      "vgpr_count": 102,
       "vgpr_spill_count": 0
     },
     {
       "a_t": false,
       "b_t": false,
-      "co_sha256": "8067822656be62ced7d9644fd00a05dbf2ec957453b8e2ebb2c161b6a994117e",
+      "co_sha256": "918e19ab27628781bfbd36a69251d0a60e908aa54c043710cfad58f1e566bf7c",
       "device_flags": [],
       "elf_flags": 1359,
       "elf_machine": 224,
@@ -1688,7 +1688,7 @@
     {
       "a_t": true,
       "b_t": true,
-      "co_sha256": "5efe221cd1d8fbd2b77b7a4bfa67b11bf80478ca38d994104cfad9a3122803ba",
+      "co_sha256": "297000f036928a7b919b46d4b9ba1013b734948873617884b3e2af229222176d",
       "device_flags": [],
       "elf_flags": 1359,
       "elf_machine": 224,
@@ -1699,7 +1699,7 @@
       "kid": 1015,
       "layout": "tn",
       "offload_arch": "gfx950",
-      "sgpr_count": 52,
+      "sgpr_count": 53,
       "sgpr_spill_count": 0,
       "splitk": true,
       "symbol": "opus_gemm_gfx950_splitk_4wave_ws_256x64x128x64_2x2_16x16x32_0x0x0_tn",
@@ -1709,13 +1709,13 @@
         64
       ],
       "undefined_symbols": [],
-      "vgpr_count": 96,
+      "vgpr_count": 102,
       "vgpr_spill_count": 0
     },
     {
       "a_t": true,
       "b_t": false,
-      "co_sha256": "b2c24451ad38ea2be7b6c8bee9983c4f4aeb92ff4994a0606c55f516f2385836",
+      "co_sha256": "714fd86876f8ddad1b68751c67915081f5eb3785b69039e9ac67ad74b7dd08b8",
       "device_flags": [],
       "elf_flags": 1359,
       "elf_machine": 224,
@@ -1726,7 +1726,7 @@
       "kid": 1015,
       "layout": "tt",
       "offload_arch": "gfx950",
-      "sgpr_count": 52,
+      "sgpr_count": 54,
       "sgpr_spill_count": 0,
       "splitk": true,
       "symbol": "opus_gemm_gfx950_splitk_4wave_ws_256x64x128x64_2x2_16x16x32_0x0x0_tt",
