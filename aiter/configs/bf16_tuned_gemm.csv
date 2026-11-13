@@ -602,3 +602,4 @@ gfx942,228,8192,6144,3072,False,torch.bfloat16,torch.float32,False,False,opus,0,
 gfx942,228,16384,6144,2048,False,torch.bfloat16,torch.float32,False,False,opus,0,0,1333.1938,opus_gemm_gfx942_512x128x128x64_2x4_16x16x16_0x0x0,0.0,309.27,220.22
 gfx942,228,16384,6144,3072,False,torch.bfloat16,torch.float32,False,False,opus,0,0,2571.2854,opus_gemm_gfx942_512x128x128x64_2x4_16x16x16_0x0x0,0.0,240.53,132.13
 gfx942,228,128,50016,6144,False,torch.bfloat16,torch.float32,False,False,opus,4,1,409.2382,opus_gemm_gfx942_splitk_legacy_512x128x128x64_2x4_16x16x16_0x0x0,0.0,192.23,1536.94
+gfx950,256,128,7168,12288,False,torch.bfloat16,torch.bfloat16,False,False,flydsl,0,4,49.1180,flydsl_hgemm_abf16_wbf16_fp32_t128x128x64x4_ks4_w2x4x1_bias0_ktail0_gm0_bnt_pft_gfx950,0.0,459.07,3687.89

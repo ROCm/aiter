@@ -1222,233 +1222,6 @@ def check_tdm_contracts(dtype):
         )
 
 
-# Requested standalone benchmark shape, not inferred from a model or TP degree.
-_FP32_WORKSPACE_MNK = [(128, 7168, 12288)]
-
-
-def _workspace_check(ref, out, label):
-    err = checkAllclose(
-        ref.float(),
-        out.float(),
-        rtol=0.01,
-        atol=0.01,
-        tol_err_ratio=0,
-        msg=label,
-    )
-    assert torch.isfinite(out).all() and err == 0, (label, err)
-    return err
-
-
-def check_hgemm_fp32_workspace_contract():
-    """Reject unsupported calls before any kernel or output modification."""
-    from unittest.mock import patch
-
-    from aiter.ops.flydsl import flydsl_hgemm_fp32_workspace
-    from aiter.ops.flydsl import gemm_a16w16_fp32_workspace as module
-
-    m, n, k = _FP32_WORKSPACE_MNK[0]
-    a = torch.empty((m, k), device="cuda", dtype=dtypes.bf16)
-    w = torch.empty((n, k), device=a.device, dtype=a.dtype)
-    out = torch.full((m, n), 23, device=a.device, dtype=a.dtype)
-    scratch = torch.full((m, n), 29, device=a.device, dtype=dtypes.fp32)
-    normal = [a, w, out, scratch]
-
-    def reject(tensors, **kwargs):
-        with patch.object(module, "flydsl_hgemm") as launch:
-            try:
-                flydsl_hgemm_fp32_workspace(*tensors, **kwargs)
-            except (ValueError, TypeError, RuntimeError):
-                pass
-            else:
-                raise AssertionError("unsupported workspace call accepted")
-            launch.assert_not_called()
-        assert bool((out == 23).all() & (scratch == 29).all())
-
-    reject([None, w, out, scratch])
-    reject(normal, stream=object())
-    w.is_shuffled = True
-    try:
-        reject(normal)
-    finally:
-        del w.is_shuffled
-    reject([a[:127], w, out, scratch])
-    reject([a, w[:, : k - 8], out, scratch])
-    for slot, t in enumerate(normal):
-        for invalid in (
-            torch.empty(t.shape, device="cpu", dtype=t.dtype),
-            torch.empty(t.shape, device=t.device, dtype=dtypes.fp16),
-            torch.empty(
-                (*t.shape[:-1], t.shape[-1] * 2), device=t.device, dtype=t.dtype
-            )[..., ::2],
-            torch.empty(t.numel() + 1, device=t.device, dtype=t.dtype)[1:].view(
-                t.shape
-            ),
-            torch._neg_view(t),
-        ):
-            values = normal.copy()
-            values[slot] = invalid
-            reject(values)
-    reject([a.detach().requires_grad_(), w, out, scratch])
-    reject([a, w, a.flatten()[: m * n].view(m, n), scratch])
-    reject([a, w, out, w.flatten()[: 2 * m * n].view(dtypes.fp32).view(m, n)])
-    reject([a, w, scratch.view(dtypes.bf16).flatten()[: m * n].view(m, n), scratch])
-    with patch.object(module, "get_gfx_runtime", return_value="gfx942"):
-        reject(normal)
-    with patch.object(module, "get_cu_num", return_value=128):
-        reject(normal)
-    with patch.object(torch, "are_deterministic_algorithms_enabled", return_value=True):
-        reject(normal)
-    aiter.logger.info("FP32-workspace metadata/overlap/determinism rejection PASS")
-
-
-def check_hgemm_fp32_workspace_streams():
-    """Two explicitly ordered streams/graphs, each with its own scratch."""
-    from aiter.ops.flydsl import flydsl_hgemm_fp32_workspace
-
-    m, n, k = _FP32_WORKSPACE_MNK[0]
-    jobs = []
-    for stream in (torch.cuda.Stream(), torch.cuda.Stream()):
-        with torch.cuda.stream(stream):
-            a = torch.randn((m, k), device=stream.device, dtype=dtypes.bf16)
-            w = torch.randn((n, k), device=stream.device, dtype=dtypes.bf16)
-            out = torch.empty((m, n), device=stream.device, dtype=dtypes.bf16)
-            scratch = torch.empty((m, n), device=stream.device, dtype=dtypes.fp32)
-            flydsl_hgemm_fp32_workspace(a, w, out, scratch, stream=stream)
-        stream.synchronize()
-        graph = torch.cuda.CUDAGraph()
-        with torch.cuda.graph(graph, stream=stream):
-            flydsl_hgemm_fp32_workspace(a, w, out, scratch, stream=stream)
-        jobs.append((stream, graph, a, w, out, scratch))
-    # Explicit stream passed while another stream is current: the copy
-    # must not escape to the caller stream before the FP32 GEMM completes.
-    caller = torch.cuda.current_stream()
-    for stream, _, a, w, out, scratch in jobs:
-        a.normal_()
-        w.normal_()
-        out.fill_(float("nan"))
-        stream.wait_stream(caller)
-        flydsl_hgemm_fp32_workspace(a, w, out, scratch, stream=stream)
-        caller.wait_stream(stream)
-        _workspace_check(run_torch(a, w, dtypes.bf16), out, "explicit stream")
-    # Model data produced on caller above must be ready before stream replay.
-    for stream, *_ in jobs:
-        stream.wait_stream(caller)
-    for _ in range(2):
-        for stream, graph, a, w, out, _ in jobs:
-            with torch.cuda.stream(stream):
-                a.normal_()
-                w.normal_()
-                out.fill_(float("nan"))
-                graph.replay()
-        torch.cuda.synchronize()
-        for _, _, a, w, out, _ in jobs:
-            _workspace_check(run_torch(a, w, dtypes.bf16), out, "independent stream")
-
-
-@benchmark()
-def test_hgemm_fp32_workspace(m, n, k, rotate, seed):
-    """Full path: rotating A/W/C, one explicitly reused FP32 scratch buffer."""
-    from aiter.ops.flydsl import flydsl_hgemm_fp32_workspace
-
-    torch.manual_seed(seed)
-    torch.backends.cuda.matmul.allow_tf32 = False
-    buffers, canaries = [], []
-    for _ in range(rotate):
-        a = torch.randn((m, k), device="cuda", dtype=dtypes.bf16)
-        w = torch.randn((n, k), device=a.device, dtype=a.dtype)
-        storage = torch.full((m * n + 128,), 23, device=a.device, dtype=a.dtype)
-        buffers.append((a, w, storage[64:-64].view(m, n)))
-        canaries.append(storage)
-    scratch_storage = torch.full(
-        (m * n + 128,), 29, device=buffers[0][0].device, dtype=dtypes.fp32
-    )
-    scratch = scratch_storage[64:-64].view(m, n)
-    # Comparator is the previous unquantized split1 FlyDSL implementation.
-    # No version-dependent hipBLASLt solution IDs in the CI correctness test.
-    candidates = {
-        "split1": lambda a, w, o: flydsl_hgemm(
-            a,
-            w,
-            out=o,
-            block_m=64,
-            block_n=64,
-            block_k=64,
-            stages=6,
-            m_waves=2,
-            n_waves=2,
-            split_k=1,
-        ),
-        "fp32_workspace": lambda a, w, o: flydsl_hgemm_fp32_workspace(a, w, o, scratch),
-    }
-    nodes = 128
-    graphs = {}
-    for name, fn in candidates.items():
-        for tensors in buffers:
-            assert fn(*tensors).data_ptr() == tensors[2].data_ptr()
-        torch.cuda.synchronize()
-        g = torch.cuda.CUDAGraph()
-        with torch.cuda.graph(g):
-            for i in range(nodes):
-                fn(*buffers[i % rotate])
-        graphs[name] = g
-    # Validate all slots after changing A AND W, not just the last replay output.
-    errors = dict.fromkeys(candidates, 0.0)
-    for _ in range(2):
-        for a, w, out in buffers:
-            a.normal_()
-            w.normal_()
-        refs = [run_torch(a, w, dtypes.bf16) for a, w, _ in buffers]
-        for name, g in graphs.items():
-            for _, _, out in buffers:
-                out.fill_(float("nan"))
-            g.replay()
-            torch.cuda.synchronize()
-            for ref, (_, _, out) in zip(refs, buffers):
-                errors[name] = max(errors[name], _workspace_check(ref, out, name))
-            assert all(
-                bool((x[:64] == 23).all() & (x[-64:] == 23).all()) for x in canaries
-            )
-            assert bool(
-                (scratch_storage[:64] == 29).all() & (scratch_storage[-64:] == 29).all()
-            )
-    # Constant-but-distinct K partitions test initialization and contribution;
-    # random checks above remain the numerical oracle.
-    for part in range(-1, 4):
-        for a, w, out in buffers:
-            a.zero_()
-            w.zero_()
-            out.fill_(float("nan"))
-            if part >= 0:
-                a[:, part * (k // 4) : (part + 1) * (k // 4)].fill_(0.5)
-                w[:, part * (k // 4) : (part + 1) * (k // 4)].fill_(0.25)
-        for g in graphs.values():
-            g.replay()
-            torch.cuda.synchronize()
-            expected = 0 if part < 0 else (k // 4) * 0.125
-            assert all(bool((out == expected).all()) for _, _, out in buffers)
-    for a, w, _ in buffers:
-        a.normal_()
-        w.normal_()
-    ret = {"gfx": get_gfx_runtime(), "nodes": nodes}
-    for name, g in graphs.items():
-
-        def replay(graph=g):
-            graph.replay()
-            return buffers[-1][2]
-
-        _, us = run_perftest(
-            replay, num_rotate_args=1, num_iters=12, num_warmup=3, use_cuda_event=True
-        )
-        us /= nodes
-        ret[f"{name} us"] = us
-        ret[f"{name} TFLOPS"] = 2 * m * n * k / us / 1e6
-        # Logical A/W/C throughput, NOT measured HBM traffic. Atomic scratch
-        # traffic/cache reuse is deliberately not guessed.
-        ret[f"{name} TB/s"] = 2 * (m * k + n * k + m * n) / us / 1e6
-        ret[f"{name} err"] = errors[name]
-    return ret
-
-
 def summarize(title, rows):
     df = pd.DataFrame(rows)
     if df.empty:
@@ -1492,7 +1265,6 @@ def main():
                 + [row[:3] for row in _MEMORY_TILES]
                 + _TUNED_MEMORY_MNK
                 + _BAND_MNK
-                + _FP32_WORKSPACE_MNK
             )
         ),
         help="""Shape of mnk.
@@ -1518,10 +1290,6 @@ def main():
     parser.add_argument(
         "--stages", nargs="*", type=int, choices=range(2, 10), default=[2]
     )
-    parser.add_argument(
-        "--rotate", type=int, nargs="+", choices=[1, 16], default=[1, 16]
-    )
-    parser.add_argument("--seed", type=int, nargs="+", default=[7101])
     args = parser.parse_args()
     if get_gfx_runtime() == "gfx1250":
         for dtype in args.dtype:
@@ -1550,23 +1318,6 @@ def main():
         return
     torch.set_default_device("cuda")
     wanted = set(args.mnk)
-    if (128, 7168, 12288) in wanted and dtypes.bf16 in args.dtype:
-        from aiter.jit.utils.chip_info import get_cu_num
-
-        if get_cu_num() == 256:
-            check_hgemm_fp32_workspace_contract()
-            check_hgemm_fp32_workspace_streams()
-            summarize(
-                "FP32-workspace HGEMM (TB/s = logical A/W/C bytes; full two-kernel time)",
-                [
-                    test_hgemm_fp32_workspace(m, n, k, rotate, seed)
-                    for (m, n, k), rotate, seed in itertools.product(
-                        _FP32_WORKSPACE_MNK, args.rotate, args.seed
-                    )
-                ],
-            )
-        else:
-            aiter.logger.warning("FP32-workspace configuration requires 256 CUs")
 
     for dtype in args.dtype:
         rows = []

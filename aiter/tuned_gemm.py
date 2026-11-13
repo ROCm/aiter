@@ -164,6 +164,16 @@ def get_GEMM_A16W16_tuned_config(
                         config["kernelName"]
                     )
                 )
+                # A BF16 row naming an FP32 kernel selects GEMM + conversion.
+                # Do not extend a measured compound policy through M padding.
+                if (
+                    flydsl_config is not None
+                    and flydsl_config["out_dtype"] == "fp32"
+                    and otype == str(dtypes.bf16)
+                    and padded_M != M
+                ):
+                    config = None
+                    continue
                 # None means the tuned CSV names a kernel absent from this
                 # catalog version; it is unrelated to FlyDSL import availability.
                 if flydsl_config is None:
@@ -675,11 +685,55 @@ def flydsl_gemm(
     config: dict | None = None,
     out: Tensor | None = None,
 ):
+    flydsl_gemm_kernels = _get_flydsl_gemm_kernels()
+    flydsl_config = _flydsl_hgemm_kernel_params(config["kernelName"])
+    fp32_workspace = (
+        inp.dtype == dtypes.bf16
+        and otype == dtypes.bf16
+        and flydsl_config["out_dtype"] == "fp32"
+    )
+    if fp32_workspace and (
+        bias is not None
+        or scale_a is not None
+        or scale_b is not None
+        or scale_c is not None
+        or bpreshuffle
+        or torch.are_deterministic_algorithms_enabled()
+        or any(
+            t.layout != torch.strided
+            or not t.is_contiguous()
+            or t.is_conj()
+            or t.is_neg()
+            or t.requires_grad
+            or t.data_ptr() % 16
+            for t in (inp, weights) + (() if out is None else (out,))
+        )
+    ):
+        return torch_gemm(
+            inp,
+            weights,
+            solidx,
+            bias,
+            otype,
+            scale_a,
+            scale_b,
+            scale_c,
+            bpreshuffle,
+            config,
+            out,
+        )
     assert (
         scale_a is None and scale_b is None and scale_c is None
     ), "FlyDSL hgemm does not support scaling yet."
-    flydsl_gemm_kernels = _get_flydsl_gemm_kernels()
-    flydsl_config = _flydsl_hgemm_kernel_params(config["kernelName"])
+    # Local scratch follows the current stream/graph allocator lifetime.
+    # The complete FP32 GEMM and BF16 conversion are part of this call.
+    kernel_out = (
+        torch.empty(
+            (inp.shape[0], weights.shape[0]), device=inp.device, dtype=dtypes.fp32
+        )
+        if fp32_workspace
+        else out
+    )
     skinny = flydsl_config["policy"] == flydsl_gemm_kernels.SKINNY_POLICY
     fused_bias = None
     if (
@@ -696,7 +750,7 @@ def flydsl_gemm(
     result = flydsl_gemm_kernels.flydsl_hgemm(
         inp,
         weights,
-        out=out,
+        out=kernel_out,
         bias=fused_bias,
         block_m=flydsl_config["block_m"],
         block_n=flydsl_config["block_n"],
@@ -710,8 +764,10 @@ def flydsl_gemm(
         k_stagger=flydsl_config["k_stagger"],
         b_non_temporal=flydsl_config["b_non_temporal"],
         policy=policy,
-        out_dtype=None if skinny else otype,
+        out_dtype=dtypes.fp32 if fp32_workspace else (None if skinny else otype),
     )
+    if fp32_workspace:
+        return result.to(otype) if out is None else out.copy_(result)
 
     if bias is not None and fused_bias is None:
         # Into the caller's buffer it can only be added in place, at its dtype.
