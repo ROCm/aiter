@@ -24,8 +24,10 @@ def test_moe_sorting_opus_host_dispatch_boundaries():
     if get_gfx() == "gfx942":
         device_id = torch.cuda.current_device()
         expect_multi = {
-            (128, 8): False,
-            (129, 8): True,
+            (63, 8): False,
+            (64, 8): True,
+            (63, 16): False,
+            (64, 16): True,
             (32, 32): False,
             (33, 32): True,
             (16, 64): False,
@@ -130,6 +132,39 @@ def test_moe_sorting_opus_workspace_switches_arch_policy():
         )
     finally:
         torch.cuda.set_device(original)
+
+
+def test_moe_sorting_opus_rejects_short_workspace():
+    """A multi-phase sort without enough workspace raises instead of faulting."""
+    token, E, topk = 1, 257, 9
+    topk_ids = torch.arange(topk, dtype=dtypes.i32).repeat(token, 1)
+    topk_weights = torch.rand((token, topk), dtype=dtypes.fp32)
+    sorted_ids, sorted_weights, sorted_expert_ids, num_valid_ids = (
+        run_torch_moe_sorting(topk_ids, topk_weights, E)
+    )
+    moe_buf = torch.empty((token, 128), dtype=dtypes.bf16)
+    ws_size = aiter.moe_sorting_opus_get_workspace_size(token, E, topk, 2)
+    for workspace in (None, torch.empty(ws_size - 1, dtype=torch.uint8)):
+        try:
+            aiter.moe_sorting_opus_fwd(
+                topk_ids,
+                topk_weights,
+                sorted_ids,
+                sorted_weights,
+                sorted_expert_ids,
+                num_valid_ids,
+                moe_buf,
+                E,
+                BLOCK_SIZE_M,
+                None,
+                None,
+                workspace,
+                2,
+            )
+        except RuntimeError as e:
+            assert "workspace" in str(e), e
+        else:
+            raise AssertionError("moe_sorting_opus_fwd ran without enough workspace")
 
 
 def _device_arch(device_id: int) -> str:
@@ -957,6 +992,7 @@ def main():
     test_moe_sorting_opus_host_dispatch_boundaries()
     test_moe_sorting_opus_workspace_uses_explicit_device()
     test_moe_sorting_opus_workspace_switches_arch_policy()
+    test_moe_sorting_opus_rejects_short_workspace()
     for dtype in args.dtype:
         test_moe_sorting_opus_aux_outputs(dtype, args.model_dim)
         test_moe_sorting_opus_local_ids_large_expert_auto(dtype, args.model_dim)

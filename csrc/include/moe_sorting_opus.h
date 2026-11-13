@@ -1492,9 +1492,9 @@ moe_sorting_auto_is_oneshot(int tokens_, int num_experts_, int device_id_ = -1)
         return false;
 
     const moe_sorting_arch arch = moe_sorting_device_arch(device_id_);
-    // gfx942 crossover: one-shot wins only while its tokens x experts LDS table is small.
+    // gfx942 crossover measured on MI325X with block_m 16.
     if(arch == moe_sorting_arch::gfx942)
-        return (tokens_ + 7) / 8 * 8 * num_experts_ <= 1024;
+        return tokens_ < 64 && (tokens_ + 7) / 8 * 8 * num_experts_ <= 1024;
 
     // gfx950 crossover measured with E=128..255 at M>=17, E=256/257 at M>=8,
     // E=384 at M<8 and E=385 at all M.
