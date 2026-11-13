@@ -2,7 +2,9 @@
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
 
 """Check how AITER_CUSTOM_{AR,AG,RS}_MAX_SIZE size the custom allreduce input
-pool and route each collective between the custom kernels and RCCL.
+pool and route each collective between the custom kernels and RCCL, and the
+gfx1250 plain all-reduce default that applies while AITER_CUSTOM_AR_MAX_SIZE is
+unset.
 
 Single process, no process group: the resolver is a pure function and the size
 gates only read attributes the constructor sets.
@@ -19,6 +21,7 @@ import torch
 from aiter.dist.device_communicators.custom_all_reduce import (
     CustomAllreduce,
     _resolve_custom_sizes,
+    _resolve_plain_ar_max_size,
 )
 
 MiB = 1 << 20
@@ -161,6 +164,51 @@ def test_bad_values_fall_back_to_defaults():
     assert s.pool == GiB, s
 
 
+def ll_ar_max_bytes(ws):
+    """max(kLLArMaxBytes, ar2sMaxBytes(ws)), as the gfx1250 binding returns."""
+    return 8 * MiB if ws in (4, 8) else 4 * MiB
+
+
+def plain_max(gfx1250=True, ws=4, ll_max=ll_ar_max_bytes, **env):
+    s = resolve(gfx1250, ws=ws, **env)
+    return _resolve_plain_ar_max_size(gfx1250, ws, s, ll_max if gfx1250 else None)
+
+
+def test_gfx1250_plain_ar_default_only_when_env_unset():
+    # Unset: the measured RCCL crossover, at TP2, TP4 and TP8.
+    assert plain_max(ws=2) == 4 * MiB
+    assert plain_max(ws=4) == 4 * MiB
+    assert plain_max(ws=8) == 8 * MiB
+    assert plain_max(ws=6) == 64 * MiB
+    # A value that does not parse counts as unset.
+    assert plain_max(ws=8, AR_MAX="abc") == 8 * MiB
+    # Set: the value keeps its meaning, above or below the default.
+    for ws in (2, 4, 6, 8):
+        for v in (64 * MiB, 6 * MiB, MiB, 0):
+            assert plain_max(ws=ws, AR_MAX=v) == v, (ws, v)
+    # gfx9 keeps the AR cutoff.
+    assert plain_max(gfx1250=False, ws=8) == 64 * MiB
+    # Never above what the LL kernels take, nor above the AR cutoff.
+    assert plain_max(ws=8, ll_max=lambda ws: 2 * MiB) == 2 * MiB
+    assert plain_max(ws=8, max_size=4 * MiB) == 4 * MiB
+
+
+def test_gfx1250_plain_ar_gate():
+    def u8(n):
+        return torch.empty(n, dtype=torch.uint8)
+
+    for ws, cut in ((2, 4 * MiB), (4, 4 * MiB), (8, 8 * MiB)):
+        ca = _stub(ws=ws)
+        assert ca.should_custom_plain_ar(u8(cut)), ws
+        assert not ca.should_custom_plain_ar(u8(cut + 16)), ws
+        # The fused paths keep should_custom_ar and its 64 MiB default.
+        assert ca.should_custom_ar(u8(cut + 16)) and ca.should_custom_ar(u8(64 * MiB))
+        ca = _stub(ws=ws, AR_MAX=64 * MiB)
+        assert ca.should_custom_plain_ar(u8(64 * MiB)), ws
+    ca = _stub(ws=6)
+    assert ca.should_custom_plain_ar(u8(64 * MiB))
+
+
 def _stub(gfx1250=True, ws=4, min_size=0, **env):
     """A CustomAllreduce with only what the size gates read."""
     ca = CustomAllreduce.__new__(CustomAllreduce)
@@ -172,6 +220,9 @@ def _stub(gfx1250=True, ws=4, min_size=0, **env):
     ca.max_size = s.pool
     ca._car_max_size = s.ar
     ca._car_prefill_max_size = s.ar_prefill
+    ca._plain_ar_max_size = _resolve_plain_ar_max_size(
+        gfx1250, ws, s, ll_ar_max_bytes if gfx1250 else None
+    )
     ca._cag_max_size = s.ag
     ca._crs_max_size = s.rs
     ca._car_min_size = min_size
