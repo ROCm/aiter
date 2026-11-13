@@ -306,6 +306,20 @@ def compile_tile_kernel(block_size, softmax_scale):
 
         # Each wave's DMA share of a tile: K8 K and V8 V loads of 16 bytes a lane,
         # TILE_LOADS in all (its vmcnt).
+        #
+        # The pipeline waits with vmcnt(TILE_LOADS) or vmcnt(2 * TILE_LOADS): the
+        # newest one or two tiles' shares stay in flight and every older share has
+        # landed in LDS. That holds because a wave's vector-memory operations
+        # decrement vmcnt in issue order (CDNA4 ISA guide, section 4.4: "Memory
+        # reads and writes return in the order they were issued, including mixing
+        # reads and writes"), and an LDS-DMA load decrements it once its data is in
+        # LDS (LLVM's SIInsertWaitcnts waits for gfx950 LDS DMA the same way, with
+        # partial vmcnt). FLAT-encoded instructions can complete out of order
+        # (section 10.2.1), so the task's work-info, query-map and reduce-info loads
+        # and its ticket atomic drain with vmcnt(0) before the first DMA or after
+        # the last wait; keep any other such access out of the tile loop. The
+        # counter is per wave, so each wave waits for its own share and the
+        # s_barrier after the wait releases a stage once every wave has.
         K8 = TILE * K_CPR // WAVE // NWAVES
         V8 = TILE * V_CPR // WAVE // NWAVES
         assert K8 * WAVE * NWAVES == TILE * K_CPR and V8 * WAVE * NWAVES == TILE * V_CPR

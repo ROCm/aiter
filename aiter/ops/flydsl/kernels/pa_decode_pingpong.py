@@ -155,9 +155,9 @@ def compile_pa_decode_pingpong(
     K_STAGE = TILE * K_ROW
     V_STAGE = TILE * V_ROW
     STAGE = K_STAGE + V_STAGE
-    # LDS DMAs may land out of issue order, so a partial vmcnt wait does not
-    # cover the oldest tile. Waves form ISSUERS groups that take turns per
-    # tile; a group's previous tile is its only one in flight when it waits.
+    # Waves form ISSUERS groups that take turns per tile; a group's previous
+    # tile is its only one in flight when it waits, so vmcnt(0) covers exactly
+    # that tile.
     ISSUERS = 2 if stagger else stages - 1
     LEAD = stages - 1
     GROUP_WAVES = NWAVES // ISSUERS
