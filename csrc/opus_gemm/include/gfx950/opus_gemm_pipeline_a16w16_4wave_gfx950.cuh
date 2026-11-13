@@ -14,7 +14,9 @@
 //   * Operands: a K-contiguous operand ([rows, K]) is copied with a 16-byte slot XOR swizzle and
 //     read with ds_read_b128; an M/N-contiguous one ([K, rows]) is copied row-wise with a 32-byte
 //     window swizzle and read with ds_read_b64_tr_b16 (4 per operand).
-//   * A operands live in a[0:63], B operands in a[64:127], C in a[128:255] + v[128:...] (pinned).
+//   * PIN: A operands live in a[0:63], B operands in a[64:127], C in a[128:255] + v[128:...] (pinned;
+//     needed by the large tiles). PIN = false leaves registers to the allocator (small tiles: fewer
+//     registers -> WG_PER_CU workgroups per CU) and builds with stock ROCm clang.
 //   * C (bf16, + optional bias) is written back through LDS (image rows padded by 8), one quadrant at a
 //     time. Split-K: each split writes its fp32 partial tile into the workspace of
 //     splitk_reduce_gfx950.cuh, whose reduce kernel produces C.
@@ -24,8 +26,11 @@
 
 #ifdef __HIP_DEVICE_COMPILE__
 #if defined(__gfx950__)
-#if !__has_cpp_attribute(clang::amdgpu_pin_agpr)
-#error "opus_gemm_pipeline_a16w16_4wave_gfx950.cuh needs the AGPR-pinning toolchain ([[clang::amdgpu_pin_agpr]])"
+// PIN instances need the AGPR-pinning toolchain; PIN = false instances build with stock ROCm clang.
+#if __has_cpp_attribute(clang::amdgpu_pin_agpr)
+#define OPUS_A16W16_4WAVE_HAS_PIN 1
+#else
+#define OPUS_A16W16_4WAVE_HAS_PIN 0
 #endif
 
 namespace opus_a16w16_4wave {
@@ -169,8 +174,8 @@ using chunk16_t = opus::vector_t<opus::i32_t, 4>;
 using op8_t = opus::vector_t<opus::i32_t, 8>;
 
 // 2 MFMAs 16x16x32 on one fragment: K-step s is registers 4 s .. 4 s + 3 of the operands.
-// C_REG >= 0: accumulator pinned at a[C_REG]; C_REG <= -2: at v[-C_REG - 2].
-template<int C_REG, class MMA, class CF>
+// PIN: C_REG >= 0: accumulator pinned at a[C_REG]; C_REG <= -2: at v[-C_REG - 2]. Else left to the allocator.
+template<bool PIN, int C_REG, class MMA, class CF>
 __device__ inline void mma_bf16(MMA& mma, const op8_t& a8, const op8_t& b8, CF& c) {
     (void)mma;
     using base_mma = typename opus::remove_cvref_t<MMA>::MMA;
@@ -179,10 +184,16 @@ __device__ inline void mma_bf16(MMA& mma, const op8_t& a8, const op8_t& b8, CF& 
         constexpr int s = decltype(s_)::value;
         const bf16x8 a = __builtin_bit_cast(bf16x8, chunk16_t{a8[4 * s], a8[4 * s + 1], a8[4 * s + 2], a8[4 * s + 3]});
         const bf16x8 b = __builtin_bit_cast(bf16x8, chunk16_t{b8[4 * s], b8[4 * s + 1], b8[4 * s + 2], b8[4 * s + 3]});
-        if constexpr (C_REG >= 0) {
-            [[clang::amdgpu_pin_agpr(C_REG)]] c = base_mma{}(a, b, c);
+        if constexpr (!PIN) {
+            c = base_mma{}(a, b, c);
         } else {
-            [[clang::amdgpu_pin_vgpr(-C_REG - 2)]] c = base_mma{}(a, b, c);
+#if OPUS_A16W16_4WAVE_HAS_PIN
+            if constexpr (C_REG >= 0) {
+                [[clang::amdgpu_pin_agpr(C_REG)]] c = base_mma{}(a, b, c);
+            } else {
+                [[clang::amdgpu_pin_vgpr(-C_REG - 2)]] c = base_mma{}(a, b, c);
+            }
+#endif
         }
     });
 }
@@ -213,7 +224,7 @@ __device__ inline P uniform_ptr(P ptr) {
 // Kernel (definition visible on both passes; the host pass only needs the stub)
 // ============================================================================
 template<typename Traits>
-__global__ __launch_bounds__(Traits::BLOCK_SIZE, 1) void gemm_a16w16_4wave_kernel(opus_gemm_a16w16_4wave_kargs_gfx950 kargs) {
+__global__ __launch_bounds__(Traits::BLOCK_SIZE, Traits::WG_PER_CU) void gemm_a16w16_4wave_kernel(opus_gemm_a16w16_4wave_kargs_gfx950 kargs) {
 #ifdef __HIP_DEVICE_COMPILE__
 #if defined(__gfx950__)
     using namespace opus;
@@ -224,6 +235,7 @@ __global__ __launch_bounds__(Traits::BLOCK_SIZE, 1) void gemm_a16w16_4wave_kerne
     using D_OUT = typename T::D_OUT;    // bf16 C, or fp32 partial sums (SPLITK)
     using D_BIAS = typename T::D_BIAS;
     using D_AB = opus::u8_t;            // operands are addressed in bytes
+    static_assert(!T::PIN || OPUS_A16W16_4WAVE_HAS_PIN, "PIN instances need the AGPR-pinning toolchain ([[clang::amdgpu_pin_agpr]])");
 
     // Workgroup -> (tile, split): splits of one tile are adjacent (as the aiter flatmm split-K kernels).
     const int num_tiles_n = ceil_div(kargs.n, T::B_N);
@@ -349,7 +361,13 @@ __global__ __launch_bounds__(Traits::BLOCK_SIZE, 1) void gemm_a16w16_4wave_kerne
             constexpr int agpr = decltype(agpr_)::value + e.value * 8;
             const auto c0 = __builtin_bit_cast(chunk16_t, load<T::VEC_A>(sm_, r_offs[e.value] + s_ofs));
             const auto c1 = __builtin_bit_cast(chunk16_t, load<T::VEC_A>(sm_, r_offs[e.value] + s_ofs + c1_delta));
-            [[clang::amdgpu_pin_agpr(agpr)]] v[e.value] = __builtin_shufflevector(c0, c1, 0, 1, 2, 3, 4, 5, 6, 7);
+            if constexpr (!T::PIN) {
+                v[e.value] = __builtin_shufflevector(c0, c1, 0, 1, 2, 3, 4, 5, 6, 7);
+            } else {
+#if OPUS_A16W16_4WAVE_HAS_PIN
+                [[clang::amdgpu_pin_agpr(agpr)]] v[e.value] = __builtin_shufflevector(c0, c1, 0, 1, 2, 3, 4, 5, 6, 7);
+#endif
+            }
         });
     };
     // M/N-contiguous: operand e (rows e * 32 + wave * 16 + r -> 32-byte window 2 e + wave), K-step s, pass h
@@ -381,7 +399,13 @@ __global__ __launch_bounds__(Traits::BLOCK_SIZE, 1) void gemm_a16w16_4wave_kerne
             const i32x2_t q0 = tr16(sm_, b0 + o), q1 = tr16(sm_, b1 + o);
             const i32x2_t q2 = tr16(sm_, b0 + o + 32 * W), q3 = tr16(sm_, b1 + o + 32 * W);
             const chunk16_t c0 = __builtin_shufflevector(q0, q1, 0, 1, 2, 3), c1 = __builtin_shufflevector(q2, q3, 0, 1, 2, 3);
-            [[clang::amdgpu_pin_agpr(agpr)]] v[e.value] = __builtin_shufflevector(c0, c1, 0, 1, 2, 3, 4, 5, 6, 7);
+            if constexpr (!T::PIN) {
+                v[e.value] = __builtin_shufflevector(c0, c1, 0, 1, 2, 3, 4, 5, 6, 7);
+            } else {
+#if OPUS_A16W16_4WAVE_HAS_PIN
+                [[clang::amdgpu_pin_agpr(agpr)]] v[e.value] = __builtin_shufflevector(c0, c1, 0, 1, 2, 3, 4, 5, 6, 7);
+#endif
+            }
         });
     };
     auto load_a = [&](auto& sm_, auto half_) {
@@ -410,7 +434,7 @@ __global__ __launch_bounds__(Traits::BLOCK_SIZE, 1) void gemm_a16w16_4wave_kerne
         constexpr int hm = decltype(hm_)::value, hn = decltype(hn_)::value;
         opus::static_for<frags>([&](auto i) {
             constexpr int m = decltype(i)::value / T::E_N, n = decltype(i)::value % T::E_N;
-            mma_bf16<c_reg<T, hm, hn, m, n>()>(mma16, v_a[hm][m], v_b[hn][n], v_c[hm][hn][m * T::E_N + n]);
+            mma_bf16<T::PIN, c_reg<T, hm, hn, m, n>()>(mma16, v_a[hm][m], v_b[hn][n], v_c[hm][hn][m * T::E_N + n]);
         });
     };
 

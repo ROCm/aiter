@@ -783,7 +783,11 @@ struct opus_gemm_mono_tile_kargs_gfx950 {
 template<int B_M_, int B_N_,
          bool A_T_, bool B_T_,
          bool SPLITK_ = false,
-         bool HAS_BIAS_ = false>
+         bool HAS_BIAS_ = false,
+         // Large tiles (> 128 x 128) pin operands / C to fixed AGPR / VGPR ranges (they need every register);
+         // small tiles leave registers to the allocator (~100-200 registers -> 2 workgroups per CU).
+         bool PIN_ = (B_M_ * B_N_ > 128 * 128),
+         int WG_PER_CU_ = (B_M_ * B_N_ > 128 * 128) ? 1 : 2>   // launch_bounds occupancy hint
 struct opus_gemm_a16w16_4wave_traits_gfx950 {
     using D_A = opus::bf16_t;
     using D_B = opus::bf16_t;
@@ -793,6 +797,8 @@ struct opus_gemm_a16w16_4wave_traits_gfx950 {
     static constexpr bool B_T = B_T_;
     static constexpr bool SPLITK = SPLITK_;
     static constexpr bool HAS_BIAS = HAS_BIAS_;
+    static constexpr bool PIN = PIN_;
+    static constexpr int WG_PER_CU = WG_PER_CU_;
     // Written by the kernel: C itself, or (SPLITK) fp32 partial sums into the workspace.
     using D_OUT = std::conditional_t<SPLITK, opus::fp32_t, D_C>;
     using D_BIAS = D_C;                                                   // bf16 bias [N] (aiter convention: matches C)
