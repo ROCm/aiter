@@ -3619,6 +3619,17 @@ def _flydsl_v2_stage2_wrapper(
             # leaves their per-route slots unwritten. Zero them before the
             # masked reduction to prevent speculative loads of stale NaN data.
             target.zero_()
+    if (
+        cfg.get("ep32", False) and (bm, bn, bk, sbm) == (80, 256, 128, 80)
+        and (model_dim_runtime, inter_dim, num_experts) == (3584, 3072, 28)
+        and epilog == "atomic" and not cfg["use_nt"] and bias2 is None
+        and expert_mask is not None and topk_ids is not None and reverse_sorted is not None
+    ):
+        from aiter.ops.flydsl.ep32_native80 import dispatch
+        return dispatch(_mxfp4_scale_u8(inter_states), _mxfp4_scale_u8(a2_scale),
+            _mxfp4_scale_u8(w2), _mxfp4_scale_u8(w2_scale), sorted_expert_ids,
+            num_valid_ids, sorted_token_ids, sorted_weights, reverse_sorted, expert_mask,
+            topk_ids, out, token_num, max_sorted, use_valid_token_count)
     mxfp4_moe_gemm2(
         inter_sorted_quant=_mxfp4_scale_u8(inter_states),
         inter_sorted_shuffled_scale=_mxfp4_scale_u8(a2_scale),

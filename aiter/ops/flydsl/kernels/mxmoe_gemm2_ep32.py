@@ -921,7 +921,9 @@ def gemm2_body_v2(
                 voff = lane16 + fx.Int32(J * 16) * KB_B + fx.Int32(t * 1024)
                 rocdl.raw_ptr_buffer_load_lds(
                     b_rsrc, _lds_ptr3(s_aq_base, off), fx.Int32(16), voff,
-                    fx.Int32(0), fx.Int32(0), fx.Int32(0),
+                    # One-pass B stream: NT; A keeps temporal allocation. aux is
+                    # an attribute: FlyDSL 0.5.0 discards an fx.Int32 value here.
+                    fx.Int32(0), fx.Int32(0), 2,
                     alias_scopes=b_scopes[slot][0], noalias_scopes=b_scopes[slot][1],
                 )
 
@@ -1738,7 +1740,7 @@ def compile_gemm2_ep32(
     WAVES_PER_EU = 2
     name = (
         f"gemm2_ep32_a8w4_hmax{HIDDEN_MAX}_imax{INTER_MAX}_g{GRID_WGS}{f'_sp{SPART}' if SPART else ''}{'_pr' if PRUNE else ''}"
-        f"{'_nt' if use_nt else ''}{'_valid_tokens' if use_valid_token_count else ''}{'_blds2' if use_b_lds else ''}"
+        f"{'_nt' if use_nt else ''}{'_valid_tokens' if use_valid_token_count else ''}{'_blds2_bnt' if use_b_lds else ''}"
     )
 
     @fx.struct
