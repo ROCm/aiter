@@ -48,7 +48,7 @@ def _warn_tile_override(axis: str, inter_dim: int, requested: int, resolved: int
 
 
 _SUFFIX_RE = re.compile(
-    r"(?:_kw(?P<kw>\d+))?(?P<fp4>_fp4)?(?P<fp8>_fp8)?(?:_sbm(?P<sbm>\d+))?$"
+    r"(?:_kw(?P<kw>\d+))?(?P<shl>_shl)?(?P<fp4>_fp4)?(?P<fp8>_fp8)?(?:_sbm(?P<sbm>\d+))?$"
 )
 
 
@@ -191,7 +191,7 @@ def resolve_flydsl_stage1_tile_n(inter_dim: int, tile_n: int) -> int:
 def get_flydsl_kernel_params(name: str) -> dict | None:
     """Lookup kernel params by name.
 
-    Strips ``_kw{N}`` / ``_fp4`` / ``_fp8`` / ``_sbm{N}`` suffixes transparently.
+    Strips ``_kw{N}`` / ``_shl`` (FHMoE shallow shared body) / ``_fp4`` / ``_fp8`` / ``_sbm{N}`` suffixes transparently.
     """
     params = _KERNEL_PARAMS.get(name)
     if params is not None:
@@ -204,6 +204,8 @@ def get_flydsl_kernel_params(name: str) -> dict | None:
             extra: dict = {}
             if m.group("kw") is not None:
                 extra["k_wave"] = int(m.group("kw"))
+            if m.group("shl"):
+                extra["shared_shallow"] = True
             if m.group("fp4"):
                 extra["out_dtype"] = "fp4"
             if m.group("fp8"):
@@ -318,6 +320,11 @@ def get_flydsl_stage1_kernels(
                                             "xcd_swizzle": xcd,
                                             "k_wave": kw,
                                         }
+                                        if a_dtype == "fp8":  # a8 on the separated (GGUU) layout: no _gui
+                                            kernels[name.replace("_gui", "")] = {
+                                                **kernels[name],
+                                                "gate_mode": "separated",
+                                            }
     return kernels
 
 

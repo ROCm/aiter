@@ -1211,7 +1211,7 @@ def fused_moe(
         fhmoe_quant_dtype_a = (
             dtypes.fp8 if GateMode(gate_mode) == GateMode.INTERLEAVE else dtypes.fp4x2
         )
-        if quant_dtype_a is not None and quant_dtype_a != fhmoe_quant_dtype_a:
+        if quant_dtype_a not in (None, fhmoe_quant_dtype_a, dtypes.fp8):
             unsupported.append("quant_dtype_a")
         if quant_dtype_a2 is not None:
             unsupported.append("quant_dtype_a2")
@@ -1269,6 +1269,7 @@ def fused_moe(
             shared_expert_id=shared_expert_id,
             clamp_shared=clamp_shared,
             output=output,
+            quant_dtype_a=quant_dtype_a,
         )
     if not block_size_M:
         block_size_M = -1
@@ -3533,7 +3534,8 @@ def _flydsl_mxfp4_layout_is_compatible(q_dtype_a, gate_mode, gate_up_interleave=
             gate_up_interleave is True and gate_mode == GateMode.INTERLEAVE
         )
     return (
-        q_dtype_a in (dtypes.bf16, dtypes.fp4x2) and gate_mode == GateMode.SEPARATED
+        q_dtype_a in (dtypes.bf16, dtypes.fp4x2, dtypes.fp8)
+        and gate_mode == GateMode.SEPARATED
     ) or (q_dtype_a == dtypes.fp8 and gate_mode == GateMode.INTERLEAVE)
 
 

@@ -275,6 +275,7 @@ def _flydsl_fhmoe_stage1_wrapper(
         v2_output_layout=v2_output_layout,
         shared_expert_id=shared_expert_id,
         clamp_shared=clamp_shared,
+        shared_shallow=parsed.get("shared_shallow", False),
     )
 
 
@@ -903,6 +904,7 @@ def fhmoe_fake(
     output: torch.Tensor | None = None,
     # Model semantic forwarded by fused_moe; False leaves shared SiLU unclamped.
     clamp_shared: bool = True,
+    quant_dtype_a: torch.dtype | None = None,
 ) -> torch.Tensor:
     del (
         w1,
@@ -930,6 +932,7 @@ def fhmoe_fake(
         shared_w2_scale,
         shared_expert_id,
         clamp_shared,
+        quant_dtype_a,
     )
     if output is not None:
         return output
@@ -973,6 +976,7 @@ def _fhmoe_impl(
     output: torch.Tensor | None = None,
     # Keep this schema default aligned with fused_moe's public API.
     clamp_shared: bool = True,
+    quant_dtype_a: torch.dtype | None = None,
 ) -> torch.Tensor:
     from aiter.fused_moe import _fused_moe_impl
 
@@ -998,6 +1002,8 @@ def _fhmoe_impl(
         bias2,
     )
     q_dtype_a = dtypes.fp8 if gate_mode_enum == GateMode.INTERLEAVE else dtypes.fp4x2
+    if quant_dtype_a == dtypes.fp8:  # a8 on the separated layout (one MXFP8 xn for routed and shared)
+        q_dtype_a = dtypes.fp8
     if not clamp_shared and w1.dtype != dtypes.fp8:
         raise ValueError(
             "clamp_shared=False requires MXFP8 routed weights; "
@@ -1129,6 +1135,7 @@ def fhmoe_(
     output: torch.Tensor | None = None,
     # Keep this schema default aligned with fused_moe's public API.
     clamp_shared: bool = True,
+    quant_dtype_a: torch.dtype | None = None,
 ) -> torch.Tensor:
     return _fhmoe_impl(
         hidden_states=hidden_states,
@@ -1161,6 +1168,7 @@ def fhmoe_(
         shared_expert_id=shared_expert_id,
         output=output,
         clamp_shared=clamp_shared,
+        quant_dtype_a=quant_dtype_a,
     )
 
 
