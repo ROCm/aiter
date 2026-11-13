@@ -10,12 +10,15 @@ routed weights x2.0 (routed_scaling_factor folded into the routing weights), sha
 Variants (``-v``):
   a8: GateMode.INTERLEAVE (GUGU routed w13), MXFP8 activations: routed a8w4, shared a8w8.
   a4: GateMode.SEPARATED  (GGUU routed w13), MXFP4 activations: routed a4w4, shared a4w8.
+  a8s: GateMode.SEPARATED (GGUU routed w13), MXFP8 activations: routed a8w4, shared a8w8.
 
 Gates (exact, reduce mode = AITER_FLYDSL_FORCE_REDUCE=1):
   P0  prequantised-xn input == bf16-xn input (a8), routed [:128] view bytes == E=128 shuffle
   G1  FHMoE route rows [n,5,H][:, :4] == routed-only E=128/top-4 route rows (same kernels)
   G2  FHMoE reduce output == bf16(sum_s f32(route_row_s)) in slot order
   G5  reduce output repeatable (4 runs); atomic run-to-run max abs reported
+  GA  atomic (shipping) output within (topk+1) bf16 ulp of sum|route rows| of the reduce output, 4 runs;
+      a8/a8s also bf16-xn-in vs prequantised-xn-in under the same bound (atomic P0)
 Report only: G3 shared slot vs ATOM's dense MXFP8 MLP (if ATOM importable), G4 final vs
 bf16(bf16(2 r) + s), rel L2 vs an f64 reference.
 """
@@ -42,8 +45,8 @@ H, INTER, E, TOPK = 6144, 768, 128, 4
 SID = E  # shared expert id = dummy routed row
 RSF, LIMIT, ALPHA = 2.0, 7.0, 1.702
 FP4 = dtypes.fp4x2
-GATE = {"a8": "interleave", "a4": "separated"}
-QA = {"a8": dtypes.fp8, "a4": FP4}
+GATE = {"a8": "interleave", "a4": "separated", "a8s": "separated"}
+QA = {"a8": dtypes.fp8, "a4": FP4, "a8s": dtypes.fp8}
 
 
 # ------------------------------------------------------------------ weights
@@ -181,6 +184,7 @@ def reduce_mode(on):
 def fh_call(variant, L: LayerM3, x, w5, ids5, xs=None):
     """FHMoE: routed + shared, one call. xs = e8m0 scales of a prequantised MXFP8 x (a8 only)."""
     kw = dict(a1_scale=xs) if xs is not None else {}
+    kw.update(quant_dtype_a=QA[variant]) if variant == "a8s" else None
     return fused_moe(x, L.w1, L.w2, w5, ids5, activation=ActivationType.Swiglu, quant_type=QuantType.per_1x32,
                      w1_scale=L.w1s, w2_scale=L.w2s, swiglu_limit=LIMIT, gate_mode=GATE[variant], dtype=dtypes.bf16,
                      shared_w1=L.sw1, shared_w2=L.sw2, shared_w1_scale=L.ss1, shared_w2_scale=L.ss2,
@@ -202,7 +206,8 @@ def fh_row(variant, n):
 
     df = pd.read_csv(_fhmoe_config_file())
     df = df[(df.model_dim == H) & (df.inter_dim == INTER) & (df.expert == E + 1) & (df.topk == TOPK + 1)
-            & (df.q_dtype_a == str(QA[variant])) & (df.token == get_padded_M(n))]
+            & (df.q_dtype_a == str(QA[variant])) & (df.gate_mode == f"GateMode.{GATE[variant].upper()}")
+            & (df.token == get_padded_M(n))]
     assert len(df) == 1, f"expected one M3.1 {variant} row for n={n}, got {len(df)}"
     return df.iloc[0]
 
@@ -286,6 +291,11 @@ def ref64(raw: RawM3, x, w, ids):
     return routed, shared
 
 
+def _bf16_ulp(v):
+    """bf16 ulp of |v| (f32 tensor): 2^(floor(log2|v|) - 7), at least the smallest normal's ulp."""
+    return torch.exp2(torch.floor(torch.log2(v.clamp_min(2.0**-126))) - 7)
+
+
 def rel_l2(a, ref):
     a, ref = a.double(), ref.double()
     return float(((a - ref).pow(2).sum() / ref.pow(2).sum()).sqrt())
@@ -365,9 +375,10 @@ def test_fhmoe_m3(n, seed, variant):
         x[3, :32] = torch.tensor([4.0] + [1.0] * 31)
     w, ids, w5, ids5 = make_routing(n, seed)
     xq = xs = None
-    if variant == "a8":
+    a8 = variant.startswith("a8")
+    if a8:
         xq, xs = quant_x8(x)
-    xin = xq if variant == "a8" else x
+    xin = xq if a8 else x
     ret = {"gfx": get_gfx()}
     row = fh_row(variant, n)
     kn1, kn2 = row["kernelName1"], row["kernelName2"]
@@ -382,7 +393,7 @@ def test_fhmoe_m3(n, seed, variant):
         w1, w2, w1s, w2s = L.routed128()
         with pinned_routed_row(variant, n, kn1, kn2), capture_route_rows(rows_r):
             r_only = routed_call(variant, w1, w2, w1s, w2s, xin, w * RSF, ids, xs)
-        if variant == "a8":
+        if a8:
             out_bf16_in = fh_call(variant, L, x, w5, ids5)
     torch.cuda.synchronize()
     fh_rows = rows_fh[-1]
@@ -392,7 +403,7 @@ def test_fhmoe_m3(n, seed, variant):
         acc = acc + fh_rows[:, k].float()
     ret["G2 combine bit-exact"] = bool(torch.equal(out_r, acc.to(dtypes.bf16)))
     ret["G5 reduce repeatable"] = all(torch.equal(out_r, r) for r in reps)
-    if variant == "a8":
+    if a8:
         ret["P0 xq-in == bf16-in"] = bool(torch.equal(out_r, out_bf16_in))
 
     # ---- atomic mode: run-to-run spread
@@ -400,14 +411,24 @@ def test_fhmoe_m3(n, seed, variant):
         outs_a = [fh_call(variant, L, xin, w5, ids5, xs) for _ in range(4)]
     ret["atomic r2r max abs"] = max(float((o.float() - outs_a[0].float()).abs().max()) for o in outs_a)
     ret["atomic vs reduce max abs"] = float((outs_a[0].float() - out_r.float()).abs().max())
+    # bf16 atomics round each of the topk+1 partial sums once: bound by (topk+1) ulp of sum|rows| (+ subnormal floor)
+    bound = (TOPK + 1) * _bf16_ulp(fh_rows.float().abs().sum(1)) + 1e-30
+    ratio = lambda o, r: float(((o.float() - r.float()).abs() / bound).max())
+    ret["atomic |a-r|/bound max"] = max(ratio(o, out_r) for o in outs_a)
+    ret["GA atomic within bound"] = ret["atomic |a-r|/bound max"] <= 1.0
+    if a8:
+        with reduce_mode(False):
+            a_bf16 = fh_call(variant, L, x, w5, ids5)
+        ret["GA P0 atomic bf16-in vs xq-in within bound"] = ratio(a_bf16, outs_a[0]) <= 2.0  # two atomic runs
 
     # ---- report-only numerics
     routed64, shared64 = ref64(raw, x, w, ids)
     total64 = RSF * routed64 + shared64
     ret["relL2 FH vs f64"] = rel_l2(out_r, total64)
+    ret["relL2 FH atomic vs f64"] = rel_l2(outs_a[0], total64)
     ret["relL2 shared slot vs f64"] = rel_l2(fh_rows[:, TOPK], shared64)
     ret["relL2 routed (2r) vs f64"] = rel_l2(acc - fh_rows[:, TOPK].float(), RSF * routed64)
-    xq8, xs8 = (xq, xs) if variant == "a8" else quant_x8(x)
+    xq8, xs8 = (xq, xs) if a8 else quant_x8(x)
     s_atom = atom_shared(raw, xq8, xs8)
     if s_atom is not None:
         pct, mu = ulp_stats(fh_rows[:, TOPK], s_atom)
@@ -435,7 +456,7 @@ def main():
     parser = argparse.ArgumentParser(formatter_class=argparse.RawTextHelpFormatter, description=__doc__)
     parser.add_argument("-n", "--tokens", type=int, nargs="*", default=[1, 4, 16, 32, 64, 96, 128, 192, 256])
     parser.add_argument("--seeds", type=int, nargs="*", default=[0, 1])
-    parser.add_argument("-v", "--variant", nargs="*", default=["a8", "a4"], choices=["a8", "a4"])
+    parser.add_argument("-v", "--variant", nargs="*", default=["a8", "a4"], choices=["a8", "a4", "a8s"])
     args = parser.parse_args()
     df = pd.DataFrame([test_p0_layout(v) for v in args.variant])
     aiter.logger.info("FHMoE M3.1 layout byte checks (markdown):\n%s", df.to_markdown(index=False))
