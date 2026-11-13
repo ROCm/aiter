@@ -67,6 +67,9 @@ _XCD_SWIZZLE = (0, 4)  # L2-rasterization XCD swizzle group size (0=off)
 MAX_SPLIT_K = 32
 _SPLIT_K = tuple(range(1, MAX_SPLIT_K + 1))
 _SPLITK_MAX_TMP_BYTES = 1 << 32
+# The kernel reads all of A through one buffer descriptor with a 32-bit byte
+# size (B and C are addressed per tile), so A must be smaller than 4 GiB.
+A_BUFFER_LIMIT_BYTES = 1 << 32
 _GFX950_CU_NUM = 256
 _WAVES_PER_WG = 4  # max N-waves the kernel splits a tile into
 _MFMA_N = 16  # the scaled-MFMA emits 16 N-cols
@@ -367,6 +370,8 @@ def fits_shape(
     The scale blocks / layouts are the kernel's (see SCALE_LAYOUTS), always named
     by the caller. A row-layout operand's scale panel must fit LDS next to A."""
     if K % 128 != 0:
+        return False
+    if M * (K // 2 if ki.a_dtype == "fp4" else K) >= A_BUFFER_LIMIT_BYTES:
         return False
     row_row = (a_scale_layout, b_scale_layout) == ("row", "row")
     # An odd chunk count over one (tile_m 48: three 16-row chunks; tile_n 192:

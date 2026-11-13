@@ -47,6 +47,10 @@ from .kernels.kernels_common import ceildiv
 from .kernels.tensor_shim import _compile_and_run, check_e8m0, ptr_arg
 
 BMM_MFMA_NAME_PREFIX = "flydsl_bmm_mxfp8_mfma"
+# XQ [M, B, K] interleaves the batches, and the kernel reads each batch's rows
+# through one buffer descriptor with a 32-bit byte size, spanning
+# (M - 1) * B * K + K bytes; that span must stay below 4 GiB.
+A_BUFFER_LIMIT_BYTES = 1 << 32
 
 _BMM_KERNEL_NAME_RE = re.compile(
     rf"^{re.escape(BMM_MFMA_NAME_PREFIX)}"
@@ -390,6 +394,13 @@ def run_bmm_a8w8_mxfp8_gfx950(
     )
     if m == 0:
         return Out
+    a_span = (m - 1) * b * k + k
+    if a_span >= A_BUFFER_LIMIT_BYTES:
+        raise RuntimeError(
+            f"[FlyDSL gfx950 bmm] XQ must span less than 4 GiB per batch (the "
+            f"kernel addresses it with 32-bit offsets); got {a_span} bytes for "
+            f"M={m}, B={b}, K={k}"
+        )
 
     if kernel_name and _launch_config(kernel_name) is None:
         _warn_unrecognised(kernel_name)
