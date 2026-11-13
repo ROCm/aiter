@@ -2158,20 +2158,23 @@ class Gfx1250Pipeline:
                     ]
                     p_max = (ctx.warp < 2).select(safe_half[0], safe_half[1])
                     if const_expr(t.per_token_kv):
-                        # The accumulator takes the factor of the half with the
-                        # larger weighted factor: its contribution keeps a ratio
-                        # of one, and only a negligible half can underflow.
-                        larger = half_weights[1] * factors[1] > (
-                            half_weights[0] * factors[0]
-                        )
-                        vfactor = larger.select(factors[1], factors[0])
-                        vnorm = fx.Float32(rcp_f32(vfactor))
-                        # Weight each factor before dividing: the products are
-                        # at most the chosen one, so no ratio overflows.
-                        half_coeffs = [
-                            half_weights[h] * factors[h] * vnorm
-                            for h in range_constexpr(2)
+                        # The accumulator takes the factor of the largest
+                        # weighted factor among the two halves and the history
+                        # (corr times its factor): that term keeps a ratio of
+                        # one, every other coefficient, the history's included,
+                        # is at most one, and only a negligible term can
+                        # underflow.
+                        weighted = [
+                            half_weights[h] * factors[h] for h in range_constexpr(2)
                         ]
+                        larger = weighted[1] > weighted[0]
+                        vfactor = larger.select(factors[1], factors[0])
+                        history = corr * fx.Float32(state[-1])
+                        vfactor = (
+                            history > larger.select(weighted[1], weighted[0])
+                        ).select(fx.Float32(state[-1]), vfactor)
+                        vnorm = fx.Float32(rcp_f32(vfactor))
+                        half_coeffs = [weighted[h] * vnorm for h in range_constexpr(2)]
                     else:
                         half_coeffs = half_weights
                 probs = fx.Vector(
