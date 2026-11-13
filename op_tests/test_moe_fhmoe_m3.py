@@ -535,7 +535,9 @@ def test_fhmoe_m3(n, seed, variant):
             out_r = fh_call(variant, L, xin, w5, ids5, xs)
         reps = [fh_call(variant, L, xin, w5, ids5, xs) for _ in range(3)]
         w1, w2, w1s, w2s = L.routed128()
-        with pinned_routed_row(variant, n, kn1, kn2), capture_route_rows(rows_r):
+        with pinned_routed_row(
+            variant, n, kn1, kn2, int(row["block_m"])
+        ), capture_route_rows(rows_r):
             r_only = routed_call(variant, w1, w2, w1s, w2s, xin, w * RSF, ids, xs)
         if a8:
             out_bf16_in = fh_call(variant, L, x, w5, ids5)
