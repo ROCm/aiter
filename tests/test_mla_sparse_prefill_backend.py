@@ -25,6 +25,8 @@ from op_tests.test_mla_sparse_prefill import (
 )
 
 _SCALE = 1.0 / math.sqrt(512)
+# The fewest query rows backend=None sends to triton (``backend``'s docstring).
+_MIN_ROWS = 512
 
 
 def _require_triton_backend():
@@ -32,10 +34,11 @@ def _require_triton_backend():
         pytest.skip("the triton backend needs gfx950 and Triton >= 3.6")
 
 
-def _triton_inputs(h=32):
-    """A one-source call the triton backend serves at H = h, with a sink."""
+def _triton_inputs(h=32, n=_MIN_ROWS):
+    """A one-source call of n rows the triton backend serves at H = h, with a
+    sink."""
     return _make_inputs(
-        n=256,
+        n=n,
         h=h,
         d=512,
         total_pages=2048,
@@ -69,16 +72,18 @@ def test_triton_backend(n, h, total_pages, topk):
 
 
 @pytest.mark.parametrize("h", [32, 64])
-@pytest.mark.parametrize("has_sink", [False, True], ids=["no-sink", "sink"])
-def test_default_backend_gfx950(has_sink, h):
-    """backend=None runs triton for a sink-free H=32 or 64 call with one source,
-    else opus."""
+@pytest.mark.parametrize("case", ["no-sink", "sink", "short"])
+def test_default_backend_gfx950(case, h):
+    """backend=None runs triton for a sink-free H=32 call with one source and at
+    least _TRITON_MIN_ROWS query rows, else opus: with a sink, with one row fewer
+    ("short") or at H=64."""
     _require_triton_backend()
-    inputs = _triton_inputs(h)
-    if not has_sink:
+    inputs = _triton_inputs(h, _MIN_ROWS - 1 if case == "short" else _MIN_ROWS)
+    if case != "sink":
         inputs["attn_sink"] = None
+    triton = case == "no-sink" and h == 32
     expected = mla_sparse_prefill(
-        **inputs, softmax_scale=_SCALE, backend="opus" if has_sink else "triton"
+        **inputs, softmax_scale=_SCALE, backend="triton" if triton else "opus"
     )
     assert torch.equal(mla_sparse_prefill(**inputs, softmax_scale=_SCALE), expected)
 

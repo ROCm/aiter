@@ -10,7 +10,7 @@ introduced it) and the tensors' dtypes carry the precision, so a new precision o
 layout is a new dtype case, not a new entry.
 
 * :func:`mla_sparse_prefill`     -- unscaled rows (bf16): triton on gfx950 for sink-free
-  calls with H == 32 or 64, one source and at least 64 query rows, else opus.
+  calls with H == 32, one source and at least 512 query rows, else opus.
 * :func:`mla_sparse_prefill_v4`  -- v4: NoPE with its E8M0 scales in the row, plus bf16
   RoPE (NoPE fp8): asm on gfx1250 with H == 128 (opus if it declines), else opus.
 * :func:`mla_sparse_prefill_v41` -- v4.1: rows with separate ``[*, 16]`` E8M0 scales
@@ -735,9 +735,11 @@ def _opus_sparse_prefill_v41(
 # triton (gfx950)
 # ---------------------------------------------------------------------------
 
-# backend=None keeps calls with fewer query rows on opus: the single-pass kernel
-# runs one program per query row and 32 heads, while opus splits each row's keys.
-_TRITON_MIN_ROWS = 64
+# backend=None takes the single-pass kernel where it beat opus on MI355X: H=32
+# from 512 query rows. With fewer rows it runs one program per row and 32 heads,
+# while opus splits each row's keys; at H=64 opus is faster.
+_TRITON_DEFAULT_HEADS = (32,)
+_TRITON_MIN_ROWS = 512
 
 
 @functools.cache
@@ -774,10 +776,12 @@ def _triton_unsupported(q, unified_kv, kv_indices_extend, out, num_kv_splits):
 
 
 def _use_triton(q, unified_kv, kv_indices_extend, attn_sink, out, num_kv_splits):
-    """backend=None takes triton for a call it serves without a sink and with at
-    least _TRITON_MIN_ROWS query rows."""
+    """backend=None takes triton for a call it serves with H in
+    _TRITON_DEFAULT_HEADS, without a sink and with at least _TRITON_MIN_ROWS
+    query rows."""
     return (
         attn_sink is None
+        and q.size(1) in _TRITON_DEFAULT_HEADS
         and q.size(0) >= _TRITON_MIN_ROWS
         and _triton_unsupported(q, unified_kv, kv_indices_extend, out, num_kv_splits)
         is None
@@ -935,10 +939,10 @@ def mla_sparse_prefill(
         on gfx950: bf16, H = 32 or 64, a 2-D ``unified_kv``, unit inner strides
         on ``q`` and ``unified_kv``, an empty ``kv_indices_extend``, no split-K
         and ``out`` ``None`` or contiguous; other calls raise RuntimeError.
-        ``None`` takes it for such calls without a sink and with at least 64
-        query rows, else opus, which it also takes where ``pa_prefill_sparse``
-        cannot be imported. Enabled plugins are tried first and do not receive
-        this native pin.
+        ``None`` takes it for such calls with H = 32, without a sink and with at
+        least 512 query rows, else opus, which it also takes where
+        ``pa_prefill_sparse`` cannot be imported. Enabled plugins are tried
+        first and do not receive this native pin.
 
     Returns:
       ``out``.
