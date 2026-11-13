@@ -25,7 +25,7 @@ import torch
 
 import aiter
 from aiter import dtypes
-from aiter.jit.utils.chip_info import get_gfx
+from aiter.jit.utils.chip_info import get_gfx, get_gfx_runtime
 from aiter.ops.flydsl.gather_kv_b_proj import (
     gather_kv_b_proj_flydsl,
     gather_kv_b_proj_flydsl_fp8_supported,
@@ -118,6 +118,10 @@ _SKIP = pytest.mark.skipif(
 _SKIP_GFX1250 = pytest.mark.skipif(
     get_gfx() != "gfx1250",
     reason="gfx1250 FlyDSL required",
+)
+_SKIP_FP8_OUT = pytest.mark.skipif(
+    get_gfx_runtime() not in ("gfx950", "gfx1250"),
+    reason="gfx950 or gfx1250 FlyDSL required",
 )
 
 
@@ -297,12 +301,13 @@ def _check_output(case):
 
 
 @_SKIP_GFX1250
+@_OUTPUT_DTYPES
 @pytest.mark.parametrize(
     "num_tokens,n_heads,alloc",
     [(257, 12, 320), (512, 96, None), (2048, 96, 2176), (4096, 96, None)],
 )
-def test_gather_kv_b_proj_flydsl_gfx1250_ptpc(num_tokens, n_heads, alloc):
-    case = _make_case(num_tokens, n_heads, alloc=alloc)
+def test_gather_kv_b_proj_flydsl_gfx1250_ptpc(num_tokens, n_heads, alloc, output_dtype):
+    case = _make_case(num_tokens, n_heads, alloc=alloc, output_dtype=output_dtype)
     case["k_scale"] = torch.tensor(1.0)
     weight = shuffle_weight(case["weight"], layout=(16, 16))
     assert gather_kv_b_proj_flydsl_supported(
@@ -318,8 +323,8 @@ def test_gather_kv_b_proj_flydsl_gfx1250_ptpc(num_tokens, n_heads, alloc):
     _run_flydsl(case)
     _check_output(case)
     if alloc is not None:
-        assert torch.isnan(case["k_prefix"][num_tokens:]).all()
-        assert torch.isnan(case["v_prefix"][num_tokens:]).all()
+        assert torch.isnan(case["k_prefix"][num_tokens:].float()).all()
+        assert torch.isnan(case["v_prefix"][num_tokens:].float()).all()
 
 
 @_SKIP
@@ -725,7 +730,7 @@ def _bench(num_tokens, n_heads, dims):
     return us_tri, us_fly, tflops, out_gb
 
 
-@_SKIP
+@_SKIP_FP8_OUT
 @pytest.mark.parametrize(
     "descale,projection",
     [(0.37, 7.029999732971191), (0.73, 78.83999633789062)],
@@ -758,7 +763,7 @@ def test_fp8_reciprocal_rounding(descale, projection):
         )
 
 
-@_SKIP
+@_SKIP_FP8_OUT
 @pytest.mark.parametrize("zero", [False, True])
 def test_fp8_saturation_and_zero(zero):
     case = _make_case(259, 12, k_scale_value=2.0, output_dtype=torch.float8_e4m3fn)
@@ -782,7 +787,7 @@ def test_fp8_saturation_and_zero(zero):
             assert (actual.abs() == 448).any()
 
 
-@_SKIP
+@_SKIP_FP8_OUT
 @pytest.mark.parametrize(
     "invalid",
     ["missing", "shape", "dtype", "device", "mixed_outputs", "bf16_scales", "strided"],
@@ -818,7 +823,7 @@ def test_fp8_output_validation(invalid):
         _run_flydsl(case, k_out_scale=ks, v_out_scale=vs)
 
 
-@_SKIP
+@_SKIP_FP8_OUT
 def test_fp8_graph_replay_uses_current_scales():
     case = _make_case(257, 12, output_dtype=torch.float8_e4m3fn)
     _run_flydsl(case)

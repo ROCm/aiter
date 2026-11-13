@@ -44,10 +44,20 @@ PYBIND11_MODULE(AITER_EXTENSION_NAME, m)
           py::arg("_fa"), py::arg("inp"), py::arg("out"),
           py::arg("unroll"), py::arg("threads"), py::arg("blocks"),
           py::arg("reg_inp_ptr"), py::arg("reg_inp_bytes"));
+    m.def("lamport_ar_rms_buffer_size", &aiter::lamport_ar_rms_buffer_size,
+          py::arg("world_size"), py::arg("max_bytes"));
+    m.def("init_lamport_ar_rms", &aiter::init_lamport_ar_rms,
+          py::arg("_fa"), py::arg("all_ptrs"), py::arg("max_bytes"));
+    m.def("fused_allreduce_rmsnorm_lamport", &aiter::fused_allreduce_rmsnorm_lamport,
+          py::arg("_fa"), py::arg("inp"), py::arg("res_inp"), py::arg("res_out"),
+          py::arg("out"), py::arg("w"), py::arg("eps"), py::arg("gemma_norm") = false);
+    m.def("allreduce_add_lamport", &aiter::allreduce_add_lamport,
+          py::arg("_fa"), py::arg("inp"), py::arg("other"), py::arg("out"));
     m.def("dispose", &aiter::dispose, py::arg("_fa"));
     // Default is the max world size, so callers that omit it get a buffer safe
     // for every supported world size.
     m.def("meta_size", &aiter::meta_size, py::arg("world_size") = 8);
+    m.def("ll_ar_max_bytes", &aiter::ll_ar_max_bytes, py::arg("world_size"));
     m.def("register_input_buffer", &aiter::register_input_buffer,
           py::arg("_fa"), py::arg("self_ptr"), py::arg("all_ptrs"));
     m.def("register_output_buffer", &aiter::register_output_buffer,
@@ -63,6 +73,10 @@ PYBIND11_MODULE(AITER_EXTENSION_NAME, m)
           py::arg("_fa"), py::arg("ptrs_out"));
     m.def("register_graph_buffers", &aiter::register_graph_buffers,
           py::arg("_fa"), py::arg("ptrs_per_rank"));
+    m.def("get_graph_buffer_ipc_meta", &aiter::get_graph_buffer_ipc_meta,
+          py::arg("_fa"), py::arg("handle_out"), py::arg("offset_out"));
+    m.def("register_graph_buffers_ipc", &aiter::register_graph_buffers_ipc,
+          py::arg("_fa"), py::arg("handle_ptrs"), py::arg("offset_ptrs"));
     m.def("start_sync_latency", &aiter::start_sync_latency,
           py::arg("_fa"), py::arg("blocks"));
     m.def("end_sync_latency", &aiter::end_sync_latency,
