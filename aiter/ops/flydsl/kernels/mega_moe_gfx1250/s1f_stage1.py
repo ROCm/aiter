@@ -92,6 +92,7 @@ from . import tdm_prims as TDM
 from .compact_plan import (
     PLAN_RUN_ROWS,
     RUN_HDR_RUNS,
+    S1F_SHARED_FIRST,
     compact_run_capacity,
     compact_run_header_dwords,
     compact_tile_capacity,
@@ -141,8 +142,16 @@ MB_REC_B = 128
 MB_SM_B = 128
 #: Rows of a flag tile, the plan's tile: the unit of the producer's pieces,
 #: of tile_info and of the per-source flags, whatever the GEMM1 tile_m (a
-#: multiple of it). A piece then has at most FLAG_M / run_rows = 8 runs.
+#: multiple of it; a smaller tile_m is its own flag tile, see s1f_flag_m).
+#: A piece then has at most FLAG_M / run_rows = 8 runs.
 FLAG_M = 64
+
+
+def s1f_flag_m(tile_m: int) -> int:
+    """Flag tile rows for a GEMM1 tile: FLAG_M, or the whole tile below it."""
+    return min(int(tile_m), FLAG_M)
+
+
 #: Run block a W1 claim covers. A piece (<= FLAG_M rows of one (dest, tile))
 #: has at most FLAG_M / run_rows = 8 runs, so a block of >= 8 runs always holds
 #: a piece start; the claimer owns the pieces that START in its block and
@@ -200,9 +209,12 @@ def s1f_ctl_words(*, npes: int, tile_cap: int) -> int:
 #: 156.3 (2); 4096 P64 313.7, P48 314.0, P80 313.9 (2).
 #: Runs per claim: the tpr <= 1024 bucket uses 2 (was 8), from DSV4.1-Flash
 #: DEP4 on MI455X, MLPerf Endpoints agentic c512 (end to end, with the rest of
-#: the S1F defaults: +2.1% gen tok/s/GPU over S1F off).
+#: the S1F defaults: +2.1% gen tok/s/GPU over S1F off). The tpr <= 2048
+#: bucket uses 2 (was 8): DSV4.1-Flash EP4 zipf 0.2, tpr 1152 per layer
+#: rb2 296.5, rb4 299.0, rb8 301.0, rb16 304.7 us (2 runs each); rb1 298.2
+#: against rb8 300.2 in a second pair.
 S1F_PRODUCERS = (64, 64, 64, 64)
-S1F_BLOCK_RUNS = (4, 2, 8, 8)
+S1F_BLOCK_RUNS = (4, 2, 2, 8)
 
 
 def _tpr_bucket(tokens_per_rank: int) -> int:
@@ -610,10 +622,11 @@ def make_s1f_stage1(
     run_hdr = compact_run_header_dwords(npes=npes, experts_per_rank=epr)
     run_cap = compact_run_capacity(max_routes=max_routes)
     # tile_info words and flags are per flag tile, GEMM1 items per m-tile.
-    tile_cap = compact_tile_capacity(compact_cap=compact_cap, tile_m=FLAG_M)
+    FM = s1f_flag_m(tile_m)
+    tile_cap = compact_tile_capacity(compact_cap=compact_cap, tile_m=FM)
     m_cap = compact_tile_capacity(compact_cap=compact_cap, tile_m=tile_m)
-    SUB = int(tile_m) // FLAG_M
-    FSH = FLAG_M.bit_length() - 1
+    SUB = int(tile_m) // FM
+    FSH = FM.bit_length() - 1
     SPAN = int(workers if ticket_span is None else ticket_span)
     if SPAN % int(workers):
         raise ValueError(f"ticket_span={SPAN} is not a multiple of workers={workers}")
@@ -625,6 +638,7 @@ def make_s1f_stage1(
     G = int(workers)
     P = int(producers)
     GM = int(group_m)
+    SHARED_FIRST = S1F_SHARED_FIRST if S1F_SHARED_FIRST < epr else 0
     N1 = 2 * int(inter_dim)
     assert N1 % tile_n == 0
     NT = N1 // tile_n
@@ -633,10 +647,10 @@ def make_s1f_stage1(
             f"an item code packs the n-tile in {_ITEM_N_BITS} bits, got {NT} n-tiles"
         )
     B1 = GM * NT
-    # Runs per W1 claim. A piece has at most FLAG_M / R = 8 runs, and W1 reads
+    # Runs per W1 claim. A piece has at most FM / R runs, and W1 reads
     # 31 - RBK runs past its block to find where its last piece ends.
     RBK = int(block_runs)
-    assert 1 <= RBK and RBK + FLAG_M // R <= WAVE - 1, RBK
+    assert 1 <= RBK and RBK + FM // R <= WAVE - 1, RBK
     assert int(producers) < int(workers)
     # Storer w owns the ring slots s % 2 == w and blocks on its oldest
     # store only with all of them in flight (at most 3 TDM ops per wave):
@@ -651,9 +665,9 @@ def make_s1f_stage1(
         raise ValueError("the producer gathers with 16-bit token indices")
     if R != 8 or npes > 16:
         raise ValueError("the producer is laid out for 8-row runs")
-    if int(tile_m) % FLAG_M or not 1 <= SUB <= 4:
+    if FM % R or FM & (FM - 1) or int(tile_m) % FM or not 1 <= SUB <= 4:
         raise ValueError(
-            f"GEMM1 tile_m={tile_m} must be 1 to 4 flag tiles of {FLAG_M} rows"
+            f"GEMM1 tile_m={tile_m} must be 1 to 4 flag tiles of {FM} rows"
         )
     if SUB > 1 and not POLL:
         raise ValueError(
@@ -728,6 +742,7 @@ def make_s1f_stage1(
         f32_swiglu_limit: fx.Float32,
         stream: fx.Stream,
     ):
+        g1_buffers = min(num_buffers, max(1, model_dim // tile_k))
         lds_holder = [None]
         ready_holder = [None]
         meta_holder = [None]
@@ -740,7 +755,7 @@ def make_s1f_stage1(
             m_warp=1,
             n_warp=4,
             out_is_f16=0,
-            num_buffers=min(num_buffers, max(1, model_dim // tile_k)),
+            num_buffers=g1_buffers,
             a_is_fp4=1,
             n_experts=epr,
             stage1_act=stage1_act,
@@ -774,7 +789,8 @@ def make_s1f_stage1(
             tile_meta=meta_holder,
             item_hooks=hooks_holder,
             raw_drain=True,
-            defer_c_wait=True,
+            # Needs the mid-loop fence the GEMM body only has above 32 rows.
+            defer_c_wait=tile_m > 32 and g1_buffers > 2,
             tdm_snop=True,
         )
         if block != 4 * WAVE:
@@ -796,6 +812,7 @@ def make_s1f_stage1(
             f"s1f_stage1_p{P}_w{G}_gm{GM}_r{R}d{D}s{S}_ps{POLL_SLEEP}"
             + f"_mb{RBK}i{MB_ST_INFL}l{MB_LD_INFL}"
             + f"_poll{POLL}"
+            + (f"_sf{SHARED_FIRST}" if SHARED_FIRST else "")
             + (f"_ts{SPAN}" if SPAN != G else "")
             + f"_{g1_name}"
         )
@@ -1552,6 +1569,23 @@ def make_s1f_stage1(
             m_tiles = fx.Int32(
                 (m_tiles > fx.Int32(m_cap)).select(fx.Int32(m_cap), m_tiles)
             )
+            if const_expr(SHARED_FIRST):
+                # First m-tile of the last SHARED_FIRST local experts: expert
+                # starts are tile-aligned, so it is the end of the expert
+                # before them, rounded up.
+                rows_pre = fx.Int32(
+                    buffer_load(
+                        rsrc_psum_s,
+                        fx.Int32(epr - 1 - SHARED_FIRST),
+                        vec_width=1,
+                        is_scalar=True,
+                    )
+                )
+                rows_pre = fx.Int32(
+                    (rows_pre < fx.Int32(0)).select(fx.Int32(0), rows_pre)
+                )
+                m_sh = (rows_pre + fx.Int32(tile_m - 1)) // fx.Int32(tile_m)
+                m_sh = fx.Int32((m_sh >= m_tiles).select(fx.Int32(0), m_sh))
             rsrc_tinfo = create_buffer_resource_from_addr(
                 addr_tile_src, num_records_bytes=4 * tile_cap
             )
@@ -1629,9 +1663,12 @@ def make_s1f_stage1(
                     (k == groups - fx.Int32(1)).select(gs_last, fx.Int32(GM))
                 )
                 rq = r // gsz
-                return (
-                    (k * fx.Int32(GM) + r - rq * gsz) << fx.Int32(_ITEM_N_BITS)
-                ) | rq
+                m_q = k * fx.Int32(GM) + r - rq * gsz
+                if const_expr(SHARED_FIRST):
+                    # Rotated to start at the shared experts' m-tiles.
+                    m_q = m_q + m_sh
+                    m_q = fx.Int32((m_q >= m_tiles).select(m_q - m_tiles, m_q))
+                return (m_q << fx.Int32(_ITEM_N_BITS)) | rq
 
             def q_head_bytes(xq):
                 return (fx.Int32(CTL_HEAD) + par * fx.Int32(32)) * fx.Int32(4)
