@@ -566,6 +566,77 @@ class TestGfx950ExtendedHgemm(unittest.TestCase):
             impl.make_gemm_a16w16_gfx950_param(**cfg)
 
 
+class TestExactLargeUpSchedule(unittest.TestCase):
+    def test_exact_policy_guard_and_full_k_coverage(self):
+        from aiter.ops.flydsl.kernels.gemm_a16w16_gfx950 import (
+            _use_n_grouped_loads,
+            make_gemm_a16w16_gfx950_kernel_name,
+            make_gemm_a16w16_param_and_validate,
+        )
+
+        cfg = {
+            "block_m": 256,
+            "block_n": 256,
+            "block_k": 64,
+            "stages": 2,
+            "m_waves": 2,
+            "n_waves": 4,
+            "k_waves": 1,
+            "split_k": 1,
+            "group_m": 4,
+            "use_half_tile_interleaved": True,
+            "in_dtype_id": 2,
+            "out_dtype_id": 2,
+            "a_is_transposed": False,
+            "b_is_transposed": True,
+            "has_bias": False,
+        }
+
+        for shape in (
+            (16384, 7168, 3584),
+            (16383, 7168, 3584),
+            (16385, 7168, 3584),
+            (128, 7168, 3584),
+            (16384, 3584, 7168),
+            (16384, 7168, 3712),
+        ):
+            want = shape == (16384, 7168, 3584)
+            self.assertEqual(_use_n_grouped_loads(*shape, cfg), want)
+            p = make_gemm_a16w16_param_and_validate(*shape, cfg)
+            self.assertIsNotNone(p)
+            self.assertEqual(
+                make_gemm_a16w16_gfx950_kernel_name(p).endswith("_ng4sk_u9lg"),
+                want,
+            )
+        for key, value in (
+            ("has_bias", True),
+            ("out_dtype_id", 1),
+            ("split_k", 2),
+            ("k_stagger", 1),
+            ("b_non_temporal", True),
+            ("group_m", 2),
+            ("n_waves", 2),
+            ("block_k", 128),
+            ("streamk_blocks", 256),
+        ):
+            self.assertFalse(
+                _use_n_grouped_loads(16384, 7168, 3584, {**cfg, key: value})
+            )
+        self.assertIsNone(make_gemm_a16w16_param_and_validate(16384, 7168, 3648, cfg))
+        # 54 main-loop tiles and two drain tiles, no skipped/duplicated K.
+        sequence = [
+            cycle + 2 * period + half
+            for cycle in range(0, 54, 18)
+            for period in range(9)
+            for half in range(2)
+        ] + [54, 55]
+        self.assertEqual(sequence, list(range(56)))
+        p = make_gemm_a16w16_param_and_validate(
+            16383, 7168, 3584, {**cfg, "n_grouped_loads": True}
+        )
+        self.assertFalse(p.n_grouped_loads)
+
+
 class TestWaveSpecializedConfig(unittest.TestCase):
     def test_valid_geometry_and_limits(self):
         from aiter.ops.flydsl.gemm_a16w16_ws import _validate_ws_config

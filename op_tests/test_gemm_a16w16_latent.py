@@ -30,7 +30,8 @@ from aiter.tuned_gemm import gemm_a16w16, gemm_a16w16_out
 
 # Small-M CSV policies are unchanged. The new large-M row is exact-only.
 # Both large projections have exact-shape implementation specializations.
-# Their ragged-M boundaries keep the corresponding original device code.
+# Exact large-up also unrolls nine two-tile periods and waits for LDS in
+# its C-only tail. Ragged-M boundaries keep original device code.
 SHAPES = (
     (128, 7168, 3584),
     (16384, 3584, 7168),
@@ -417,7 +418,9 @@ def check_n_grouped_specialization():
         assert _use_n_grouped_loads(m, n, k, cfg) == want
         param = make_gemm_a16w16_param_and_validate(m, n, k, cfg)
         assert param is not None
-        assert make_gemm_a16w16_gfx950_kernel_name(param).endswith("_ng4sk") == want
+        assert (
+            make_gemm_a16w16_gfx950_kernel_name(param).endswith("_ng4sk_u9lg") == want
+        )
     for field, value in (
         ("in_dtype_id", 3),
         ("out_dtype_id", 1),
@@ -444,7 +447,7 @@ def check_n_grouped_specialization():
         16383, 7168, 3584, {**cfg, "n_grouped_loads": True}
     )
     assert selected is not declined
-    assert not make_gemm_a16w16_gfx950_kernel_name(declined).endswith("_ng4sk")
+    assert not make_gemm_a16w16_gfx950_kernel_name(declined).endswith("_ng4sk_u9lg")
     assert cfg == original
     aiter.logger.info("N-grouped shape/config/cache specialization checks passed")
 
@@ -520,11 +523,53 @@ def check_hti_unroll_specialization():
     aiter.logger.info("HTI period shape/config/cache specialization checks passed")
 
 
+def check_large_up_k_tile_coverage():
+    """Exact dyadic probes isolate each unroll boundary and the two-tile drain."""
+    m, n, k = 16384, 7168, 3584
+    x = torch.zeros((m, k), device="cuda", dtype=torch.bfloat16)
+    w = torch.zeros((n, k), device=x.device, dtype=x.dtype)
+    storage = torch.full((m * n + 64,), 29.0, device=x.device, dtype=x.dtype)
+    out = storage[32:-32].view(m, n)
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph, stream=stream):
+        gemm_a16w16_out(x, w, out)
+    stream.synchronize()
+
+    # One active K tile at a time catches omissions and duplicate execution.
+    # Both 32-element K halves and the end of each of the three 18-tile cycles
+    # are exercised, separately from the two-tile drain.
+    for tile in (0, 1, 16, 17, 18, 19, 34, 35, 36, 37, 52, 53, 54, 55):
+        for kk in (0, 32, 63):
+            x.zero_()
+            w.zero_()
+            index = tile * 64 + kk
+            x[:, index] = 0.5
+            x[::2, index] = -0.5
+            w[:, index] = 0.25
+            w[::3, index] = -0.25
+            out.fill_(float("nan"))
+            stream.wait_stream(torch.cuda.current_stream())
+            with torch.cuda.stream(stream):
+                graph.replay()
+            stream.synchronize()
+            # No GEMM reference is needed for a single nonzero K coordinate.
+            expected = (x[:, index, None].float() * w[None, :, index].float()).to(
+                x.dtype
+            )
+            assert torch.equal(out, expected), (tile, kk)
+            assert (storage[:32] == 29).all() and (storage[-32:] == 29).all()
+            del expected
+    aiter.logger.info("Large-up unroll boundaries and final K drain: PASS")
+
+
 def main():
     if get_gfx_runtime() != "gfx950":
         aiter.logger.warning("This tuning qualification targets gfx950; skipping")
         return
     check_n_grouped_specialization()
+    check_large_up_k_tile_coverage()
     check_hti_unroll_specialization()
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(

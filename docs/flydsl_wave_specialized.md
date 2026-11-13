@@ -1,5 +1,7 @@
 # Experimental gfx950 BF16 wave-specialized GEMM
 
+> The WS candidates remain explicit-only. The new default-path improvement is HTI, not WS: see [large-up follow-up](flydsl_large_up_followup.md).
+
 > Current follow-up: the graph-only CSV promotion was reverted at71976a2
 > because rotation regressed. All WS configurations remain explicit-only.
 > The cold-input investigation and six-process before/after microsecond

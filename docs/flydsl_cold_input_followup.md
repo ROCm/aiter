@@ -1,5 +1,7 @@
 # Reject regressing WS promotion; continue cold-input optimization
 
+> Current continuation: a separately qualified exact large-up HTI improvement is now described in [large-up follow-up](flydsl_large_up_followup.md). The rejected small-up candidates below remain unselected.
+
 ## Deployment correction
 
 Commit71976a2 reverts8e0a68b in full. The small-up model CSV, dispatcher and

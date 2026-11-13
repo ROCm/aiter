@@ -382,7 +382,7 @@ def make_gemm_a16w16_gfx950_kernel_name(param: GemmA16W16Gfx950Param):
     name += "_phti" if param.use_half_tile_interleaved else "_pft"
     # Kernel bodies do not participate in FlyDSL's disk-cache key. Distinguish
     # the specialized HTI implementations from their original schedules.
-    name += "_ng4sk" if param.n_grouped_loads else ""
+    name += "_ng4sk_u9lg" if param.n_grouped_loads else ""
     name += "_hti5sk" if param.unroll_hti else ""
     name += "_initring4" if param.split_init_ring else ""
     if (param.mma_m, param.mma_n, param.mma_k) != (16, 16, 32):
@@ -1493,10 +1493,15 @@ def gemm_a16w16_hti_gfx950_kernel(
     wait_vmcnt_and_barrier(half_ldg_b_iters + half_ldg_a_iters)
 
     main_loop_end = k_tiles - 2
-    # Five two-tile periods cover ten K tiles; 110 steady-state tiles are
-    # exactly eleven such iterations. The existing last-two-tile drain is kept.
-    # Other policies expand one period, retaining their original loop.
-    hti_periods = 5 if const_expr(param.unroll_hti) else 1
+    # Exact down: 110 steady-state tiles / 10 = 11 iterations.
+    # Exact up: 54 steady-state tiles / 18 = 3 iterations.
+    # Both retain the same ordered MFMA/DMA/barrier sequence and two-tile
+    # drain. These flags are derived from exact shape/policy, not user options.
+    hti_periods = (
+        9
+        if const_expr(param.n_grouped_loads)
+        else 5 if const_expr(param.unroll_hti) else 1
+    )
     for cycle in range(0, main_loop_end, 2 * hti_periods):
         for period in range_constexpr(hti_periods):
             k_tile = cycle + period * 2
@@ -1602,13 +1607,25 @@ def gemm_a16w16_hti_gfx950_kernel(
         store_half_tile_to_global(1, 0)
         store_half_tile_to_global(1, 1)
     else:
-        wait_vmcnt_and_barrier(0)
+
+        def finish_c_lds():
+            if const_expr(param.n_grouped_loads):
+                # Exact large-up only. The drain has completed every A/B DMA
+                # before the final K tile's MFMA. This C-only phase needs LDS
+                # writes/reads to retire, not disjoint global output stores.
+                # Retain the rendezvous and explicit LDS completion wait.
+                rocdl.s_waitcnt(lgkmcnt=0)
+                rocdl.s_barrier()
+            else:
+                wait_vmcnt_and_barrier(0)
+
+        finish_c_lds()
         store_half_tile_to_global(0, 0)
         store_half_tile_to_global(0, 1)
-        wait_vmcnt_and_barrier(0)
+        finish_c_lds()
         store_half_tile_to_lds(1, 0, c10)
         store_half_tile_to_lds(1, 1, c11)
-        wait_vmcnt_and_barrier(0)
+        finish_c_lds()
         store_half_tile_to_global(1, 0)
         store_half_tile_to_global(1, 1)
 
