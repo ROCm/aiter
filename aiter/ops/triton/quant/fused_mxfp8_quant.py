@@ -712,9 +712,15 @@ def fused_deepseek_v4_compress_norm_rope_store(
 ) -> None:
     """Shared triton launcher for the fused compress+norm+RoPE+insert path.
 
-    Picks one of the three kernels in this module based on ``head_dim`` and
-    ``use_fp4_cache``. Identical launch signature for all three.
+    Picks the sparse-attention compressor for ``head_dim`` 512. There is no
+    fp4 compressor kernel yet, so ``use_fp4_cache`` is rejected rather than
+    silently writing fp8 records into an fp4 cache.
     """
+    if use_fp4_cache:
+        raise NotImplementedError(
+            "use_fp4_cache is not implemented for the DeepSeek-V4 compressor; "
+            "only the fp8 record is written"
+        )
     if head_dim != 512:
         # Only the sparse-attn compressor was ported. The indexer variants
         # (head_dim 128, plain and mxfp4) still live in vLLM behind its
