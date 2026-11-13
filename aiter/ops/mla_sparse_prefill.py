@@ -9,7 +9,8 @@ One public entry per KV layout: the name carries the layout (the model version t
 introduced it) and the tensors' dtypes carry the precision, so a new precision of a
 layout is a new dtype case, not a new entry.
 
-* :func:`mla_sparse_prefill`     -- unscaled rows (bf16): opus.
+* :func:`mla_sparse_prefill`     -- unscaled rows (bf16): triton on gfx950 for sink-free
+  calls with H == 32, one source and at least 512 query rows, else opus.
 * :func:`mla_sparse_prefill_v4`  -- v4: NoPE with its E8M0 scales in the row, plus bf16
   RoPE (NoPE fp8): asm on gfx1250 with H == 128 (opus if it declines), else opus.
 * :func:`mla_sparse_prefill_v41` -- v4.1: rows with separate ``[*, 16]`` E8M0 scales
@@ -21,6 +22,7 @@ a bad argument raises ValueError.
 """
 
 import functools
+import importlib
 import math
 import struct
 from numbers import Real
@@ -730,6 +732,98 @@ def _opus_sparse_prefill_v41(
 
 
 # ---------------------------------------------------------------------------
+# triton (gfx950)
+# ---------------------------------------------------------------------------
+
+# backend=None takes the single-pass kernel where it beat opus on MI355X: H=32
+# from 512 query rows. With fewer rows it runs one program per row and 32 heads,
+# while opus splits each row's keys; at H=64 opus is faster.
+_TRITON_DEFAULT_HEADS = (32,)
+_TRITON_MIN_ROWS = 512
+
+
+@functools.cache
+def _pa_prefill_sparse_module():
+    """pa_prefill_sparse's module, or the ImportError that kept it from loading
+    (its gluon kernels need a Triton with gluon), logged once."""
+    try:
+        return importlib.import_module(
+            ".triton.attention.pa_prefill_sparse", __package__
+        )
+    except ImportError as e:
+        logger.info(f"mla_sparse_prefill: the triton backend is unavailable: {e}")
+        return e
+
+
+def _triton_unsupported(q, unified_kv, kv_indices_extend, out, num_kv_splits):
+    """Why the triton backend cannot serve the call, or None: its own contract,
+    then what pa_prefill_sparse's single-pass kernel serves."""
+    gfx = get_gfx_runtime()
+    if gfx != "gfx950":
+        return f"serves gfx950 only, got {gfx}"
+    if kv_indices_extend.numel():
+        return "reads unified_kv only: kv_indices_extend must be empty"
+    if num_kv_splits not in (None, 1):
+        return "has no split-K"
+    if out is not None and (
+        out.shape != q.shape or out.dtype != q.dtype or not out.is_contiguous()
+    ):
+        return "needs out None or contiguous with q's shape and dtype"
+    pa = _pa_prefill_sparse_module()
+    if isinstance(pa, ImportError):
+        return f"cannot import pa_prefill_sparse: {pa}"
+    return pa._single_pass_unsupported(q, unified_kv, has_invalid=False)
+
+
+def _use_triton(q, unified_kv, kv_indices_extend, attn_sink, out, num_kv_splits):
+    """backend=None takes triton for a call it serves with H in
+    _TRITON_DEFAULT_HEADS, without a sink and with at least _TRITON_MIN_ROWS
+    query rows."""
+    return (
+        attn_sink is None
+        and q.size(1) in _TRITON_DEFAULT_HEADS
+        and q.size(0) >= _TRITON_MIN_ROWS
+        and _triton_unsupported(q, unified_kv, kv_indices_extend, out, num_kv_splits)
+        is None
+    )
+
+
+@functools.cache
+def _log_triton() -> None:
+    logger.info("mla_sparse_prefill: using the triton backend (pa_prefill_sparse)")
+
+
+def _triton_sparse_prefill(
+    q,
+    unified_kv,
+    kv_indices_prefix,
+    kv_indptr_prefix,
+    kv_indices_extend,
+    attn_sink,
+    softmax_scale,
+    out,
+    num_kv_splits,
+):
+    reason = _triton_unsupported(q, unified_kv, kv_indices_extend, out, num_kv_splits)
+    if reason is not None:
+        raise RuntimeError(f"the triton backend {reason}")
+    _log_triton()
+    return _pa_prefill_sparse_module().pa_prefill_sparse(
+        q,
+        unified_kv,
+        kv_indices_prefix,
+        kv_indptr_prefix,
+        None,
+        None,
+        None,
+        attn_sink,
+        softmax_scale,
+        has_invalid=False,
+        out=out,
+    )
+
+
+# ---------------------------------------------------------------------------
 # Public entries
 # ---------------------------------------------------------------------------
 
@@ -760,14 +854,15 @@ def _mla_sparse_prefill_fake(
 
 # Routed here rather than on either public spelling or on a backend binding.
 # `mla_sparse_prefill` and `pa_sparse_prefill_opus` are two public names for one
-# op and both call this directly, so this is where the op begins. Routing a
+# op: the second calls this directly and the first dispatches the same op with a
+# native fallback that picks the backend, so this is where the op begins. Routing a
 # spelling instead would cover only the callers who happen to use that one, and
 # routing `_opus_sparse_prefill` would name a backend in the contract.
 #
 # `backend=` stays ABOVE this layer on purpose. It selects which implementation
-# AITER would run natively, which is a question the dispatcher answers before
-# the op begins; a provider asked to serve this contract is not offered it and
-# so cannot be asked to honour a pin it has no kernel for.
+# AITER runs natively once no provider has served the call; a provider asked to
+# serve this contract is not offered it and so cannot be asked to honour a pin
+# it has no kernel for.
 @_route(op="mla_sparse_prefill", version=1)
 def _mla_sparse_prefill_routed(
     q: torch.Tensor,
@@ -839,13 +934,42 @@ def mla_sparse_prefill(
       num_kv_splits:     split each token's keys over this many workgroups and
         fold them in a second launch: 1 to 32. ``None`` picks it from the
         token, head and key counts.
-      backend:           ``"opus"`` or ``None``.
+      backend:           ``"opus"``, ``"triton"`` or ``None``. ``"triton"`` is
+        :func:`aiter.ops.triton.attention.pa_prefill_sparse.pa_prefill_sparse`
+        on gfx950: bf16, H = 32 or 64, a 2-D ``unified_kv``, unit inner strides
+        on ``q`` and ``unified_kv``, an empty ``kv_indices_extend``, no split-K
+        and ``out`` ``None`` or contiguous; other calls raise RuntimeError.
+        ``None`` takes it for such calls with H = 32, without a sink and with at
+        least 512 query rows, else opus, which it also takes where
+        ``pa_prefill_sparse`` cannot be imported. Enabled plugins are tried
+        first and do not receive this native pin.
 
     Returns:
       ``out``.
     """
-    _check_backend("mla_sparse_prefill", backend, ("opus",))
-    return _mla_sparse_prefill_routed(
+    _check_backend("mla_sparse_prefill", backend, ("opus", "triton"))
+
+    def native_fallback(*native_args, **native_kwargs):
+        if backend == "triton" or (
+            backend is None
+            and _use_triton(
+                q, unified_kv, kv_indices_extend, attn_sink, out, num_kv_splits
+            )
+        ):
+            return _triton_sparse_prefill(
+                q,
+                unified_kv,
+                kv_indices_prefix,
+                kv_indptr_prefix,
+                kv_indices_extend,
+                attn_sink,
+                softmax_scale,
+                out,
+                num_kv_splits,
+            )
+        return _opus_sparse_prefill(*native_args, **native_kwargs)
+
+    args = (
         q,
         unified_kv,
         kv_indices_prefix,
@@ -857,6 +981,11 @@ def mla_sparse_prefill(
         softmax_scale,
         out,
         num_kv_splits,
+    )
+    operation = _mla_sparse_prefill_routed.__aiter_plugin_op__
+    registered = _plugin._routed_ops[operation.name]
+    return _plugin._dispatch(
+        operation, registered.canonicalize, native_fallback, args, {}
     )
 
 

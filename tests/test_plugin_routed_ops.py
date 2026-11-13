@@ -185,11 +185,10 @@ def _sparse_prefill_args(tokens=2, heads=1, dim=512):
 def test_sparse_prefill_serves_through_either_public_spelling(monkeypatch):
     """`mla_sparse_prefill` and `pa_sparse_prefill_opus` are one op.
 
-    They take the same arguments and forward them unchanged to the same
-    implementation; the second name differs only by pinning the backend the
-    first one would have chosen anyway. Routing their convergence point is
-    what makes a provider reach the callers who use the backend-named
-    spelling -- which, on the DSV4.1 prefill path, is all of them.
+    They take the same arguments and reach the same routed op; the second
+    name differs only by pinning the native backend to opus. Routing their
+    convergence point is what makes a provider reach the callers who use the
+    backend-named spelling -- which, on the DSV4.1 prefill path, is all of them.
     """
 
     from aiter.ops.mla_sparse_prefill import mla_sparse_prefill
@@ -212,13 +211,16 @@ def test_sparse_prefill_serves_through_either_public_spelling(monkeypatch):
     assert provider.select_calls == 2
 
 
-def test_the_backend_pin_is_not_part_of_the_sparse_prefill_contract(monkeypatch):
+@pytest.mark.parametrize("backend", ["opus", "triton"])
+def test_the_backend_pin_is_not_part_of_the_sparse_prefill_contract(
+    monkeypatch, backend
+):
     """`backend=` is answered above the routed layer, so it never reaches a provider.
 
     A provider serving this contract has one kernel, not a choice of AITER's;
     being handed a pin it cannot satisfy would leave it declining every call
-    from the spelling that pins. The dispatcher settles the native backend
-    first and the op begins below that.
+    from the spelling that pins. The pin selects only the native fallback,
+    which runs when no provider serves the call.
     """
 
     from aiter.ops.mla_sparse_prefill import mla_sparse_prefill
@@ -231,7 +233,7 @@ def test_the_backend_pin_is_not_part_of_the_sparse_prefill_contract(monkeypatch)
         plugin, "_entry_points", lambda: (_EntryPoint("aklr", provider),)
     )
 
-    result = mla_sparse_prefill(**_sparse_prefill_args(), backend="opus")
+    result = mla_sparse_prefill(**_sparse_prefill_args(), backend=backend)
 
     assert plugin.last_decision().route == "provider"
     assert torch.equal(result, served)

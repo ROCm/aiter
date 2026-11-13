@@ -25,15 +25,19 @@ The ``prec`` axis picks both the input format and the backends that run:
   The generator's 288-byte rows are separated into contiguous data and scales
   outside the timed call for the fixed-stride gfx1250 code object.
 
-``triton`` is the ``pa_prefill_sparse`` dispatcher, which on gfx1250 reaches a
-gluon kernel that takes both KV sources natively. The v4 ``asm`` needs
-``H_Q == 128``; the v4.1 ``asm`` needs ``H_Q == 64``. Both asm variants and
-triton are gfx1250-only here and drop out of the sweep elsewhere.
+``triton`` is the ``pa_prefill_sparse`` dispatcher. On gfx1250 it runs as is, a
+gluon kernel that takes both KV sources natively. On gfx950 it runs as
+``mla_sparse_prefill(backend="triton")``, which serves ``H_Q`` 32 and 64 with no
+extend rows (``--window 0``). The v4 ``asm`` needs ``H_Q == 128``; the v4.1
+``asm`` needs ``H_Q == 64``; both are gfx1250-only. Each drops out of the sweep
+elsewhere.
 
 Example CLI usage::
 
     PYTHONPATH=. python3 op_tests/test_mla_sparse_prefill.py
     PYTHONPATH=. python3 op_tests/test_mla_sparse_prefill.py --topk 512 --window 128 0
+    PYTHONPATH=. python3 op_tests/test_mla_sparse_prefill.py --prec bf16 \\
+        --backend opus triton --h_q 32 64 --window 0
     PYTHONPATH=. python3 op_tests/test_mla_sparse_prefill.py --backend opus \\
         -n 1024 --h_q 128 --prec v4_fp8 --no-verify
     PYTHONPATH=. python3 op_tests/test_mla_sparse_prefill.py --backend opus asm \\
@@ -640,8 +644,9 @@ _ASM_HEADS = 128
 # The fused V4.1 code object covers all 64 heads of one query per workgroup.
 _ASM_V41_HEADS = 64
 
-# Only gfx1250's pa_prefill_sparse reads a second KV source; the rest reject it.
-_TRITON_ARCHS = ("gfx1250",) if pa_prefill_sparse is not None else ()
+# gfx1250's pa_prefill_sparse reads both KV sources and runs as is. gfx950's reads
+# unified_kv alone and runs as mla_sparse_prefill's triton backend.
+_TRITON_ARCHS = ("gfx950", "gfx1250") if pa_prefill_sparse is not None else ()
 
 # Mismatch ratio allowed per backend; same as test_pa_decode_sparse.py.
 _ERR_TOL = 0.01
@@ -817,18 +822,35 @@ def run_mla_sparse_prefill(
                     ),
                 )
             )
-        if "triton" in wanted and _get_gpu_arch() in _TRITON_ARCHS:
-            # These CSRs never hold -1; the wrapper's default guess costs ~1.5x.
-            candidates.append(
-                (
-                    "triton",
-                    lambda: pa_prefill_sparse(
-                        **kernel_inputs,
-                        softmax_scale=softmax_scale,
-                        has_invalid=False,
-                    ),
+        arch = _get_gpu_arch()
+        if "triton" in wanted and arch in _TRITON_ARCHS:
+            if arch == "gfx1250":
+                # These CSRs never hold -1; the wrapper's default guess costs ~1.5x.
+                candidates.append(
+                    (
+                        "triton",
+                        lambda: pa_prefill_sparse(
+                            **kernel_inputs,
+                            softmax_scale=softmax_scale,
+                            has_invalid=False,
+                        ),
+                    )
                 )
-            )
+            elif (
+                h in (32, 64)
+                and not kernel_inputs["kv_indices_extend"].numel()
+                and num_kv_splits in (None, 1)
+            ):
+                candidates.append(
+                    (
+                        "triton",
+                        lambda: mla_sparse_prefill(
+                            **kernel_inputs,
+                            softmax_scale=softmax_scale,
+                            backend="triton",
+                        ),
+                    )
+                )
 
     if not candidates:
         return None
