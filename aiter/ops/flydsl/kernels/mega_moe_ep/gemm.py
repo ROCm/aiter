@@ -389,8 +389,8 @@ def build_gemm(kc: KernelCtx) -> dict:
                 out_row = row_g * i32(inter_row_bytes)
                 s_row = row_g * i32(inter_scols)
                 c0, c1 = cnj[0][v], cnj[1][v]
-                a0 = fx.max(c0, fx.Float32(0.0) - c0)
-                a1 = fx.max(c1, fx.Float32(0.0) - c1)
+                a0 = fx.absf(c0)
+                a1 = fx.absf(c1)
                 m = fx.max(a0, a1)
                 # quad xor1, xor2, then 8- / 16-lane mirrors: every lane of the 16-lane
                 # row ends with the row max (VALU DPP, no ds_swizzle round trip)
@@ -402,7 +402,7 @@ def build_gemm(kc: KernelCtx) -> dict:
                     F32_SIGN_EXP_MASK
                 )
                 _e = (max_rounded >> i32(F32_MANTISSA_BITS)) - i32(elem_emax)
-                e8 = (_e > i32(0)).select(_e, i32(0))
+                e8 = fx.max(_e, i32(0))
                 # this group's first global col
                 gbase = i32(n_tile) * i32(inter_cols) + cbase
                 # All lanes of the group hold the same reduced e8 -> redundant scale store

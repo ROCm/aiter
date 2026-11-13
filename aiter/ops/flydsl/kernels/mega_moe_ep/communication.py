@@ -106,7 +106,7 @@ def _quantize_group8(v8):
     """8 f32 (list or vector) -> (E8M0 exponent, 2 i32 words = 8 fp8-e4m3), one per-8 scale."""
     local_max = fx.Float32(1e-10)
     for i in range_constexpr(8):
-        local_max = fx.max(local_max, fx.max(v8[i], fx.Float32(0.0) - v8[i]))
+        local_max = fx.max(local_max, fx.absf(v8[i]))
     e8m0, scale = _e8m0_scale(local_max)
     w0 = rocdl.cvt_pk_fp8_f32(T.i32, v8[0] * scale, v8[1] * scale, fx.Int32(0), 0)
     w0 = rocdl.cvt_pk_fp8_f32(T.i32, v8[2] * scale, v8[3] * scale, w0, 1)
@@ -123,7 +123,7 @@ def _mx_e8m0(amax, fp8):
     mantissa = working & fx.Int32(0x7FFFFF)
     exponent = (working >> fx.Int32(23)) & fx.Int32(0xFF)
     e8m0 = (mantissa != fx.Int32(0)).select(exponent + fx.Int32(1), exponent)
-    return (e8m0 > fx.Int32(255)).select(fx.Int32(255), e8m0)
+    return fx.min(e8m0, fx.Int32(255))
 
 
 def _mx_pack(v, e8m0, fp8):
@@ -264,7 +264,7 @@ def build_communication(kc: KernelCtx) -> dict:
             # two levels (the XCD's CTAs, then one per XCD): 256 arrivals on one counter
             # serialize
             nblk = i32(gpu.grid_dim.x)
-            x = i32(gpu.block_id("x")) % i32(N_XCD)
+            x = fx.block_idx.x % i32(N_XCD)
             xa = ctrl_at(a, i32(GRID_BAR_XCD_COUNT) + x)
             # each counter reset must land before the generation that lets a CTA re-arrive
             if g_add_agent(xa, i32(1)) == (nblk - i32(1) - x) // i32(N_XCD):
@@ -309,7 +309,7 @@ def build_communication(kc: KernelCtx) -> dict:
         storm."""
         parity = a["epoch"] & i32(1)
         n_ranks = a["n_ranks"]
-        if (i32(gpu.block_id("x")) == i32(0)) & (tid < n_ranks):  # lane p -> peer p
+        if (fx.block_idx.x == i32(0)) & (tid < n_ranks):  # lane p -> peer p
             init_arrive(a, tid, parity, n_ranks)
         if tid == i32(0):
             spin_sys_ge(
@@ -358,7 +358,7 @@ def build_communication(kc: KernelCtx) -> dict:
         nblk = i32(gpu.grid_dim.x)
         r_topk_ids = rsrc(a["topk_ids"], m * i32(TOPK) * i32(4))
         lane = tid % i32(64)
-        sender = i32(gpu.block_id("x")) * i32(NW) + tid // i32(64)  # virtual sender
+        sender = fx.block_idx.x * i32(NW) + tid // i32(64)  # virtual sender
         n_senders = nblk * i32(NW)
         # one (token, route) per LANE, so a wave keeps 64 remote stores in flight per step.
         # The buffer resource must be wave-uniform (rsrc readfirstlanes the base), so each
@@ -381,7 +381,7 @@ def build_communication(kc: KernelCtx) -> dict:
                 # for valid routes later, and combine_wait expects m*TOPK*COMBINE_UNITS
                 # units.
                 combine_arrive(a, rank, parity, i32(COMBINE_UNITS))
-        if (i32(gpu.block_id("x")) == i32(0)) & (tid < n_ranks):
+        if (fx.block_idx.x == i32(0)) & (tid < n_ranks):
             # this rank's m (owner p's routing window from it), before the META arrival
             g_st_sys(peer_flag(a, tid, FLAG_SRC_TOKENS, parity, rank), m)
         wait_vm(0)  # drain routing stores before signalling META-ready
@@ -391,7 +391,7 @@ def build_communication(kc: KernelCtx) -> dict:
         # serialize.  LDS_GATHER is free until the gather.
         if tid == i32(0):
             lds_st(L, LDS_GATHER, i32(0))
-            x = i32(gpu.block_id("x")) % i32(N_XCD)
+            x = fx.block_idx.x % i32(N_XCD)
             xa = ctrl_at(a, i32(META_XCD_COUNT) + x)
             if g_add_agent(xa, i32(1)) == (nblk - i32(1) - x) // i32(N_XCD):
                 g_st_sys(xa, i32(0))
@@ -718,7 +718,7 @@ def build_communication(kc: KernelCtx) -> dict:
             a["n_ranks"],
         )
         nblk = i32(gpu.grid_dim.x)
-        bid = i32(gpu.block_id("x"))
+        bid = fx.block_idx.x
         d = bid % n_ranks
         k = bid // n_ranks
         nk = (nblk - i32(1) - d) // n_ranks + i32(1)
@@ -777,7 +777,7 @@ def build_communication(kc: KernelCtx) -> dict:
                     v = bf16x8_to_f32(raw[2 * p]) + bf16x8_to_f32(raw[2 * p + 1])
                     row_max = fx.Float32(1e-10)
                     for x in v:
-                        row_max = fx.max(row_max, fx.max(x, fx.Float32(0.0) - x))
+                        row_max = fx.max(row_max, fx.absf(x))
                     e8 = _mx_e8m0(fx.max(row_max, row_max.shuffle_xor(i32(1), c64)), a8)
                     words = _mx_pack(v, e8, a8)
                     pay = (
@@ -934,7 +934,7 @@ def build_communication(kc: KernelCtx) -> dict:
         # one per-rank combine barrier: wait until all m*TOPK*COMBINE_UNITS partial
         # units of this rank's tokens have been scattered back (one counter, no
         # per-token flags).
-        if (i32(gpu.block_id("x")) == i32(0)) & (tid == i32(0)):
+        if (fx.block_idx.x == i32(0)) & (tid == i32(0)):
             # the next launch's counter: past this launch's META / header wait every peer
             # finished the previous launch, and none arrives for the next one before it
             # sees this rank's next META
@@ -944,7 +944,7 @@ def build_communication(kc: KernelCtx) -> dict:
         elif tid == i32(0):
             combine_wait(a, parity)
         gpu.barrier()
-        for t_ in range(i32(gpu.block_id("x")), m, nblk):
+        for t_ in range(fx.block_idx.x, m, nblk):
             t = i32(t_)
             for g_ in range(tid, i32(HV), i32(NT)):
                 g = i32(g_)

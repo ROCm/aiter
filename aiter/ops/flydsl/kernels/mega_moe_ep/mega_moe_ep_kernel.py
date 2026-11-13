@@ -151,7 +151,7 @@ def compile_mega_moe_ep(
         n_ranks, epr, mtpr = i32(N_RANKS), i32(EPR), i32(TOKEN_SLOTS // N_RANKS)
         a.update(n_ranks=n_ranks, epr=epr, mtpr=mtpr)
         a["epoch"] = uni(g_ld_sys(fx.Int64(ctrl) + fx.Int64(EPOCH_SLOT * 4)))
-        tid = fx.Int32(gpu.thread_id("x"))
+        tid = fx.thread_idx.x
         assert name
         lds = fx.SharedAllocator().allocate(Shared).peek()
         L = uni(fx.Int32(fx.ptrtoint(lds.buf.ptr)))

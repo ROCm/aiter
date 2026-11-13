@@ -167,7 +167,7 @@ def build_schedule(kc: KernelCtx) -> dict:
         wait_vm(0)
         cta_barrier(L, tid)
         if tid == i32(0):
-            x = i32(gpu.block_id("x")) % i32(N_XCD)
+            x = fx.block_idx.x % i32(N_XCD)
             ca = ctrl_at(a, i32(GRID_BAR_XCD_COUNT) + x)
             ga = ctrl_at(a, i32(GRID_BAR_XCD_GEN) + x)
             cx = (i32(gpu.grid_dim.x) - i32(1) - x) // i32(N_XCD) + i32(1)
@@ -427,7 +427,7 @@ def build_schedule(kc: KernelCtx) -> dict:
         ordered by (payload round le % PAYLOAD_ROUNDS, expert), so every XCD starts on
         the earliest-sent rows."""
         if tid < i32(64):
-            x = i32(gpu.block_id("x")) % i32(N_XCD)
+            x = fx.block_idx.x % i32(N_XCD)
             nact = lds_ld_i32(L, LDS_CTRL + CTL_N_ACTIVE * 4)
             R = LANE_SLOTS
             js = _lane_groups(tid)
@@ -511,7 +511,7 @@ def build_schedule(kc: KernelCtx) -> dict:
         cap = a["n_ranks"] * a["mtpr"]
         r_expert_slots = rsrc(a["expert_recv_slots"], i32(EPR) * cap * i32(4))
         expert_count = fx.Int64(a["expert_count"])
-        base = i32(gpu.block_id("x")) * i32(NT) + tid
+        base = fx.block_idx.x * i32(NT) + tid
         grid_stride = i32(gpu.grid_dim.x) * i32(NT)
         # wave-uniform trip count (full waves for the match ballots); each group of
         # same-expert lanes takes one atomic of its size at its lowest lane
@@ -659,7 +659,7 @@ def build_schedule(kc: KernelCtx) -> dict:
         (expert_count + x*EPR) and publish it straight to chunk_recv_slot /
         chunk_payload_row, then zero the partial chunks' pad rows.  Readers are the
         XCD's own GEMM tiles (xcd_barrier)."""
-        bid = i32(gpu.block_id("x"))
+        bid = fx.block_idx.x
         x = bid % i32(N_XCD)
         cx = (i32(gpu.grid_dim.x) - i32(1) - x) // i32(N_XCD) + i32(1)
         k0 = (bid // i32(N_XCD)) * i32(NT) + tid
@@ -1000,7 +1000,7 @@ def build_schedule(kc: KernelCtx) -> dict:
 
     @flyc.jit
     def _tile_queue(L, tid, a, nch, nblk):
-        x = i32(gpu.block_id("x")) % i32(N_XCD)
+        x = fx.block_idx.x % i32(N_XCD)
         if tid == i32(0):
             g_or_agent(
                 ctrl_at(a, i32(XCC_OFFSETS)),
@@ -1010,7 +1010,7 @@ def build_schedule(kc: KernelCtx) -> dict:
             # the first SENDERS_PER_XCD CTAs of each XCD send the remaining rounds, then
             # join
             ns = fx.min(i32(SENDERS_PER_XCD * N_XCD), nblk)
-            bid = i32(gpu.block_id("x"))
+            bid = fx.block_idx.x
             n_ranks = a["n_ranks"]
             if bid < ns:
                 # sender bid: owner bid % n_ranks (+ its deferred up-front rounds)
@@ -1165,7 +1165,7 @@ def build_schedule(kc: KernelCtx) -> dict:
                 L,
                 tid,
                 a,
-                i32(gpu.block_id("x")),
+                fx.block_idx.x,
                 i32(gpu.grid_dim.x),
                 i32(0),
                 _upfront_rounds(a),
@@ -1200,7 +1200,7 @@ def build_schedule(kc: KernelCtx) -> dict:
             grid_barrier(a, tid)
             cta_barrier(L, tid)
             # every CTA has read it
-            if (i32(gpu.block_id("x")) == i32(0)) & (tid == i32(0)):
+            if (fx.block_idx.x == i32(0)) & (tid == i32(0)):
                 _epoch_bump(a)
         plan(L, tid, a)
         nch = lds_ld_i32(L, LDS_CTRL + CTL_N_CHUNKS * 4)
@@ -1212,27 +1212,25 @@ def build_schedule(kc: KernelCtx) -> dict:
         #     GEMM1's A-gather) to global.
         if const_expr(SMALL_BATCH):
             a["use_local"] = _small_use_local(L, tid, a, nch)
-            x_lo, x_hi = _xcd_chunks(L, nch, i32(gpu.block_id("x")) % i32(N_XCD), a)
+            x_lo, x_hi = _xcd_chunks(L, nch, fx.block_idx.x % i32(N_XCD), a)
             if a["use_local"]:
                 small_local(L, tid, a, x_lo, x_hi)
             else:
                 small_bucket(L, tid, a, x_lo, x_hi)
                 xcd_barrier(L, tid, a)
                 # the XCD's position atomics returned: re-zero
-                if i32(gpu.block_id("x")) < i32(N_XCD):
+                if fx.block_idx.x < i32(N_XCD):
                     for e_ in range(tid, i32(EPR), i32(NT)):
                         g_st_sys(
                             fx.Int64(a["expert_count"])
-                            + fx.Int64(
-                                (i32(gpu.block_id("x")) * i32(EPR) + i32(e_)) * i32(4)
-                            ),
+                            + fx.Int64((fx.block_idx.x * i32(EPR) + i32(e_)) * i32(4)),
                             i32(0),
                         )
         else:
             # XCD x gathers its tile-queue echunks (_xcd_chunks)
-            gx = i32(gpu.block_id("x")) % i32(N_XCD)
+            gx = fx.block_idx.x % i32(N_XCD)
             x_lo, g_hi = _xcd_chunks(L, nch, gx, a)
-            g_lo = x_lo + i32(gpu.block_id("x")) // i32(N_XCD)
+            g_lo = x_lo + fx.block_idx.x // i32(N_XCD)
             g_st = (nblk - i32(1) - gx) // i32(N_XCD) + i32(1)
             for ei_ in range(g_lo, g_hi, g_st):
                 ei = i32(ei_)
