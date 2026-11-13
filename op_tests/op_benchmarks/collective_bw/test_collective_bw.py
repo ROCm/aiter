@@ -21,6 +21,7 @@ for _path in (str(_HERE), str(_HERE.parents[2])):
 
 import patterns
 import tb_text
+from roof_settings import DEFAULT, RoofSettings
 
 from aiter.ops.flydsl.comm_traffic import (
     Pattern,
@@ -202,7 +203,7 @@ def test_candidates_sweep_widths_and_schedules():
     for a pipelined op only, fused."""
     ar = _two_shot(4, 1 << 24, ring=False)
     labels = [c.label for c in patterns.candidates(ar)]
-    widths = ["own", *(f"w{w}" for w in patterns.WAVE_SWEEP)]
+    widths = ["own", *(f"w{w}" for w in DEFAULT.wave_sweep)]
     assert labels == [f"{s} {w}" for w in widths for s in ("serial", "fused")]
     a2a = _a2a_trio(4, 12_124_160)
     labels = [c.label for c in patterns.candidates(a2a)]
@@ -234,7 +235,7 @@ def test_rccl_traffic_is_unquantized_and_op_independent():
     assert labels == {
         f"{s} w{w} {m}"
         for s in ("serial", "fused")
-        for w in patterns.WAVE_SWEEP
+        for w in DEFAULT.wave_sweep
         for m in "UFG"
     }
     lap = next(c for c in patterns.rccl_candidates(rt) if c.label == "serial w32 G")
@@ -268,11 +269,15 @@ def test_roofline_takes_fastest_candidate():
     roofline.tb_text.run = fake_run
     try:
         # Any executable will do: the run itself is faked.
-        rl = roofline.Roofline(sys.executable, iters=1, warmup=0)
+        rl = roofline.Roofline(sys.executable, RoofSettings(iterations=1, warmups=0))
         roof = rl.measure([ar])[ar]
         n_lines = sum(len(c) for c in calls)
         assert roof.label == "fused w64"
         assert math.isclose(roof.us, 0.9 * 2 * 1e3)
+        # Every candidate's time is kept, in candidate order.
+        labels = [c.label for c in patterns.candidates(ar)]
+        assert [label for label, _us in roof.candidates] == labels
+        assert min(us for _l, us in roof.candidates) == roof.us
         # Serial laps are identical lines: run once, counted twice.
         distinct = {t.line for c in patterns.candidates(ar) for t in c.tests}
         assert n_lines == len(distinct)
@@ -281,6 +286,93 @@ def test_roofline_takes_fastest_candidate():
         assert rl.measure([ar])[ar] == roof and not calls
     finally:
         roofline.tb_text.run = real
+
+
+def test_settings_reach_every_test():
+    """Iterations, extra env and the sweep come from ``RoofSettings``; the
+    method's own settings are fixed."""
+    s = RoofSettings(iterations=7, warmups=1, wave_sweep=(48,), env=(("X", "1"),))
+    ar = _two_shot(4, 1 << 24, ring=False)
+    cands = patterns.candidates(ar, s)
+    labels = [c.label for c in cands]
+    assert labels == ["serial own", "fused own", "serial w48", "fused w48"]
+    rccl = patterns.rccl_candidates(patterns.rccl_traffic(ar), s)
+    for test in (t for c in cands + rccl for t in c.tests):
+        env = dict(test.env)
+        assert env["NUM_ITERATIONS"] == "7" and env["NUM_WARMUPS"] == "1"
+        assert env["X"] == "1" and "ALWAYS_VALIDATE" not in env
+        assert env["GFX_SE_TYPE"] == "1" and env["NUM_SUBITERATIONS"] == "1"
+    # The RCCL block comes from the settings too.
+    s4 = RoofSettings(rccl_waves_per_workgroup=2, rccl_mems=(PeerMem.FINE,))
+    rccl = patterns.rccl_candidates(patterns.rccl_traffic(ar), s4)
+    assert {dict(t.env)["GFX_BLOCK_SIZE"] for c in rccl for t in c.tests} == {"128"}
+    assert {c.label.split()[-1] for c in rccl} == {"F"}
+
+
+def test_cli_overrides_settings():
+    import argparse
+
+    import report
+
+    parser = argparse.ArgumentParser()
+    report.add_args(parser)
+    assert report.settings_from(parser.parse_args([])) == DEFAULT
+    args = parser.parse_args(["--tb-iters", "5"])
+    assert report.settings_from(args) == RoofSettings(iterations=5)
+
+
+def test_dump_writes_runnable_configs():
+    """Every candidate of every roof gets a .cfg that runs as is, and the
+    index lists them with their times and marks the roof."""
+    import tempfile
+
+    import tb_dump
+    from measure import Record
+    from roofline import Roof
+
+    ar = _two_shot(4, 1 << 24, ring=False, ratio=0.28125)
+    records = [
+        Record("1024x7168", "fly_mesh", 50.0, "graph", ar),
+        Record("1024x7168", "rccl", 100.0, "graph", ar),
+    ]
+    cands = patterns.candidates(ar)
+    times = tuple((c.label, 10.0 + i) for i, c in enumerate(cands))
+    roofs = {ar: Roof(12.0, (12.0,), cands[2].label, times)}
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp) / "out.tb"
+        (root / "1024x7168").mkdir(parents=True)
+        (root / tb_dump.MARKER).touch()
+        (root / "stale.cfg").write_text("old")
+        index = tb_dump.write(root, records, DEFAULT, roofs, {})
+        assert not (root / "stale.cfg").exists()
+        op_dir = root / "1024x7168" / "fly_mesh"
+        assert sorted(f.stem for f in op_dir.glob("*.cfg")) == sorted(
+            tb_dump.slug(c.label) for c in cands
+        )
+        text = (op_dir / "serial_w16.cfg").read_text().splitlines()
+        title = "1024x7168 / op fly_mesh / serial w16"
+        assert text[0] == f"## collective_bw roof candidate: {title}"
+        assert text[1] == "## measured: 12.000 us (the roof)"
+        run = next(line for line in text if "TransferBench serial_w16.cfg" in line)
+        assert "NUM_SUBITERATIONS=1" in run and "NUM_ITERATIONS=20" in run
+        # Serial laps: two tests in one file, each counted once.
+        tests = [line for line in text if line.startswith("-")]
+        assert tests == [t.line for t in cands[2].tests] and len(tests) == 2
+        rccl = patterns.rccl_candidates(patterns.rccl_traffic(ar))
+        assert len(list((root / "1024x7168" / "rccl").glob("*.cfg"))) == len(rccl)
+        rows = [r for r in index.read_text().splitlines() if r.startswith("| 1024")]
+        assert len(rows) == len(cands) + len(rccl)
+        assert "| serial w16 | 12.000 | **roof** |" in rows[2]
+        rccl_cfg = root / "1024x7168" / "rccl" / "fused_w64_U.cfg"
+        assert "not measured" in rccl_cfg.read_text()
+
+
+def test_dump_default_dir():
+    import tb_dump
+
+    assert tb_dump.default_dir("a/b/tp4.md", None) == Path("a/b/tp4.tb")
+    assert tb_dump.default_dir(None, "x.csv") == Path("x.tb")
+    assert tb_dump.default_dir(None, None) == Path("collective_bw_tb")
 
 
 def test_find_binary_respects_env(tmp_path=None):

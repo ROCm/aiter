@@ -25,10 +25,12 @@ from __future__ import annotations
 import csv
 import math
 import sys
+from dataclasses import replace
 from pathlib import Path
 
 from measure import RCCL, Record
 from patterns import busbw_factor, fabric_bytes_per_rank, rccl_traffic
+from roof_settings import DEFAULT, RoofSettings
 from roofline import Roof
 
 COLUMNS = (
@@ -128,9 +130,11 @@ def markdown(rows: list[dict]) -> str:
     return "\n".join(lines)
 
 
-def provenance(roofline, extra: list[str] = ()) -> list[str]:
+def provenance(
+    roofline, extra: list[str] = (), *, settings: RoofSettings = DEFAULT, configs=None
+) -> list[str]:
     """Header lines: what changes the numbers. *roofline* is None when the
-    roof was skipped on request."""
+    roof was skipped on request. *configs* is the TransferBench config index."""
     import os
 
     if roofline is None:
@@ -138,12 +142,13 @@ def provenance(roofline, extra: list[str] = ()) -> list[str]:
     elif roofline.available:
         tb = (
             f"TransferBench {roofline.version} at {roofline.binary}, "
-            f"{roofline.iters} iterations, {roofline.warmup} warmup"
+            f"{settings.iterations} iterations, {settings.warmups} warmup"
         )
     else:
         tb = "TransferBench not found: no roofline"
     return [
         f"- roofline: {tb}",
+        *([f"- TransferBench configs: {configs}"] if configs else []),
         f"- HIP_VISIBLE_DEVICES: {os.environ.get('HIP_VISIBLE_DEVICES', '(unset)')}",
         *extra,
         f"- command: {' '.join(sys.argv)}",
@@ -159,8 +164,24 @@ def add_args(parser) -> None:
         metavar="PATH",
         help="TransferBench binary (default $TRANSFERBENCH, PATH)",
     )
-    parser.add_argument("--tb-iters", type=int, default=20)
-    parser.add_argument("--tb-warmup", type=int, default=3)
+    parser.add_argument(
+        "--tb-iters",
+        type=int,
+        default=None,
+        help=f"TransferBench iterations (default {DEFAULT.iterations})",
+    )
+    parser.add_argument(
+        "--tb-warmup",
+        type=int,
+        default=None,
+        help=f"TransferBench warmups (default {DEFAULT.warmups})",
+    )
+    parser.add_argument(
+        "--tb-dir",
+        metavar="DIR",
+        help="where to write every roof's TransferBench configs (always written;\n"
+        "default: next to --report as <report>.tb/, else ./collective_bw_tb)",
+    )
     parser.add_argument(
         "--no-roof",
         action="store_true",
@@ -169,31 +190,15 @@ def add_args(parser) -> None:
     parser.add_argument(
         "--tb-dry-run",
         action="store_true",
-        help="print the TransferBench configs (env + lines) of every roof instead\n"
-        "of running them; paste into the stock binary to reproduce a roof",
+        help="write the TransferBench configs of every roof (see --tb-dir)\n"
+        "without running them",
     )
 
 
-def dry_run(records: list[Record]) -> str:
-    """The TransferBench invocations each roof would run, as shell snippets:
-    every candidate of the op roofs and the RCCL roofs. A roof is the fastest
-    candidate, and a candidate's time is the sum of its tests' times."""
-    import patterns
-
-    out = []
-    for traffic in dict.fromkeys(r.traffic for r in records if r.impl != RCCL):
-        cases = ", ".join(sorted({r.case for r in records if r.traffic == traffic}))
-        for kind, cands in (
-            ("op", patterns.candidates(traffic)),
-            ("rccl", patterns.rccl_candidates(patterns.rccl_traffic(traffic))),
-        ):
-            for cand in cands:
-                out.append(f"# {cases}: {kind} roof candidate {cand.label!r}")
-                for i, test in enumerate(cand.tests):
-                    env = " ".join(f"{k}={v}" for k, v in test.env)
-                    out.append(f"# test {i}, x{test.repeat}: {env} TransferBench <cfg>")
-                    out.append(test.line)
-    return "\n".join(out)
+def settings_from(args) -> RoofSettings:
+    """``RoofSettings`` with the command line's overrides."""
+    over = {"iterations": args.tb_iters, "warmups": args.tb_warmup}
+    return replace(DEFAULT, **{k: v for k, v in over.items() if v is not None})
 
 
 def finish(
@@ -201,20 +206,22 @@ def finish(
 ) -> list[dict]:
     """Roofs for *records* (run while no rank holds the GPUs), graded rows,
     and the report. Returns the rows."""
+    import tb_dump
     from roofline import Roofline
 
-    if args.tb_dry_run:
-        print(dry_run(records), flush=True)
-        args.no_roof = True
+    settings = settings_from(args)
     roofline, roofs, rccl_roofs = None, {}, {}
-    if not args.no_roof:
-        roofline = Roofline(args.tb_bin, iters=args.tb_iters, warmup=args.tb_warmup)
+    if not (args.no_roof or args.tb_dry_run):
+        roofline = Roofline(args.tb_bin, settings)
         roofs = roofline.measure(r.traffic for r in records if r.impl != RCCL)
         rccl_roofs = roofline.measure_rccl(r.traffic for r in records if r.impl == RCCL)
+    tb_dir = Path(args.tb_dir or tb_dump.default_dir(args.report, args.csv))
+    configs = tb_dump.write(tb_dir, records, settings, roofs, rccl_roofs, roofline)
+    print(f"TransferBench configs: {configs}", flush=True)
     rows = grade(records, roofs, rccl_roofs)
     write(
         rows,
-        provenance(roofline, list(header)),
+        provenance(roofline, list(header), settings=settings, configs=configs),
         title,
         md=args.report,
         csv_path=args.csv,

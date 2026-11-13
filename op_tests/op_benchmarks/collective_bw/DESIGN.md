@@ -44,9 +44,11 @@ module; the op's pattern is never changed; exact sizes only.
  op_tests/op_benchmarks/collective_bw/     (flat sibling modules, no package)
    measure.py   Timer protocol, FnTimer, Record, measure(), gather(), spawn()
    rccl.py      RcclBaseline: RcclCalls -> one thunk (torch.distributed or PyNccl)
-   patterns.py  Traffic -> TransferBench config lines + env; busbw factor (pure, no GPU)
+   roof_settings.py  RoofSettings: every tunable TransferBench setting, one dataclass
+   patterns.py  Traffic -> roof candidates (config lines + env); busbw factor (pure, no GPU)
    tb_text.py   find + run stock TransferBench, parse stdout (only TB-aware module)
-   roofline.py  Roofline.measure(traffics) -> {traffic: Roof}
+   roofline.py  Roofline(binary, settings).measure(traffics) -> {traffic: Roof}
+   tb_dump.py   write every candidate as a runnable .cfg + README.md index
    report.py    grade(), markdown / CSV, shared CLI options, finish(), --tb-dry-run
    test_collective_bw.py       GPU-free tests (patterns, byte accounting, parser, grading)
    testdata/transferbench_v1.71.02.txt   captured output the parser is checked against
@@ -55,7 +57,7 @@ module; the op's pattern is never changed; exact sizes only.
 
  flow:  spawn ranks --> per rank: build op, timer = script's timer
                         measure(op thunk + RCCL thunk) --> gather (slowest rank)
-        join (GPUs idle) --> roofline: one TB run per distinct Traffic --> report
+        join (GPUs idle) --> roofline: each distinct TB test once --> configs + report
 ```
 
 ## 2. The op's self-description (in aiter)
@@ -173,10 +175,17 @@ PULL_ALL  rank i, each j:                               ({mem}{j} G{i} G{i} w ch
 PUSH_NEXT rank i:                                       (G{i} G{i} {mem}{i+1} w chunk)  x repeat
 ```
 
-The environment is set per invocation: `GFX_SE_TYPE=1` (sub-executor = one wave),
-`GFX_BLOCK_SIZE=64*waves_per_workgroup`, `USE_SINGLE_STREAM=1`,
-`NUM_SUBITERATIONS=1` (section 4.2), `USE_HIP_EVENTS=1` and
-`ALWAYS_VALIDATE=-1`. Phases with different block sizes need separate invocations.
+Every test carries its full environment (`patterns.env()`):
+- fixed by the method (`patterns.FIXED_ENV`): `GFX_SE_TYPE=1` (sub-executor =
+  one wave; the wave split depends on it) and `NUM_SUBITERATIONS=1` (section 4.2);
+- from the op: `GFX_BLOCK_SIZE=64*waves_per_workgroup`;
+- from `RoofSettings` (`roof_settings.py`): `NUM_ITERATIONS`, `NUM_WARMUPS` and
+  further env (`USE_HIP_EVENTS=1`, `ALWAYS_VALIDATE=-1`). The settings also
+  hold the width sweep, the RCCL block and memory types, and the timeout.
+  `--tb-iters` / `--tb-warmup` override them.
+
+`tb_text` adds only what its parser needs (`OUTPUT_TO_CSV=0`, `HIDE_ENV=1`).
+Tests with different environments need separate invocations.
 
 A test's time is its slowest transfer, timed inside the kernel (the
 `Transfer` rows: first wave's start to last wave's stop, averaged over the
@@ -298,6 +307,23 @@ The table has one row per (case, op):
 
 `case | op | timing | roof us | op us | op eff | op busbw | op wire GB/s | rccl roof us | rccl us | rccl eff | rccl busbw | op spread us | variant | roof cfg | rccl roof cfg`
 
+**TransferBench configs.** Every run, measured or not, writes every
+candidate of every roof as a `.cfg` that runs as is with the stock binary
+(`tb_dump.py`), into `--tb-dir` (default: `<report>.tb/` next to the report):
+
+```
+<report>.tb/README.md                       every candidate, its time, the roof marked
+<report>.tb/<case>/<op>/<candidate>.cfg     e.g. 16384x7168/fly_mesh/fused_w64.cfg
+<report>.tb/<case>/rccl/<candidate>.cfg     e.g. 16384x7168/rccl/serial_w64_U.cfg
+```
+
+Each file starts with `##` lines (TransferBench echoes them) naming the
+candidate and its measured time, then the command with its environment, then
+one config line per test with its `repeat`. A candidate whose tests need
+different block sizes is split into `<candidate>.<i>.cfg`. A rerun clears a
+directory it wrote (marker `.collective_bw_tb`), so no stale files remain.
+`--tb-dry-run` writes the files without running TransferBench.
+
 It is preceded by a provenance header (device, link, NUMA map, `HIP_VISIBLE_DEVICES`,
 TB version and path, timing method, command).
 
@@ -306,14 +332,17 @@ TB version and path, timing method, command).
 1. **Done.**
    - `comm_traffic.py` and the two `traffic()` methods (no behavior change);
      the quick all-reduce declares `pipelined=True`.
-   - patterns, tb_text, roofline, report (`--tb-dry-run` prints every candidate).
-   - `test_collective_bw.py`, 12 GPU-free tests:
+   - roof_settings, patterns, tb_text, roofline, tb_dump, report; the configs
+     of every roof are written on every run (`--tb-dir`).
+   - `test_collective_bw.py`, 16 GPU-free tests:
      - fabric bytes equal `busbw factor * logical * wire ratio` for A2A, mesh and ring;
      - wave split and exact config text;
      - fused tests carry every lap's bytes; candidate sets for pipelined and
        non-pipelined traffic;
      - the RCCL traffic is bf16, op-independent and in the busbw convention;
      - the roofline picks the fastest candidate and runs each test once;
+     - settings reach every test, and the CLI overrides them;
+     - the config dump: one runnable file per candidate, the index, cleanup;
      - the parser on captured v1.71.02 output (MI350P, PCIe);
      - the grading formulas.
    - Both thin scripts run at TP2/4/8 on MI350X. `torch.distributed`
@@ -340,6 +369,10 @@ TB version and path, timing method, command).
   type; RCCL's tries all three.
 - RCCL is graded against its own bf16 roof (`rccl eff`), which depends only
   on its calls, not on the op.
+- The tunable TransferBench settings live in one dataclass (`RoofSettings`);
+  the config lines are generated from the op's `traffic()`, not stored,
+  because they follow the op's runtime choices (size tier, codec, grid, inbox
+  memory). Every run writes them out for review and reproduction.
 - Attention A2A is graded per trio.
 - Existing scripts stay unchanged. The thin scripts reuse their helpers and live
   in `op_tests/op_benchmarks/collective_bw/`.

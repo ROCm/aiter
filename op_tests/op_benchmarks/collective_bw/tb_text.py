@@ -31,12 +31,9 @@ _RVS_PATHS = ("/opt/rocm/bin/TransferBench", "/opt/rocm/libexec/rvs/TransferBenc
 # Versions whose output the parser has been checked against (testdata/).
 KNOWN_VERSIONS = ("1.71",)
 
-# Settings every run uses, on top of each test's own environment.
-BASE_ENV = {
-    "USE_HIP_EVENTS": "1",
-    # Validation walks every element on the host, which costs far more than
-    # the transfers.
-    "ALWAYS_VALIDATE": "-1",
+# The output format the parser reads, on top of each test's own environment
+# (the roof settings are in ``roof_settings``).
+PARSER_ENV = {
     "OUTPUT_TO_CSV": "0",
     "HIDE_ENV": "1",
 }
@@ -140,19 +137,17 @@ def run(
     lines: list[str],
     env: dict[str, str],
     *,
-    iters: int,
-    warmup: int,
     timeout: float = 900.0,
 ) -> tuple[list[TestResult], str]:
-    """Run *lines* as one config file. Returns the tests and the version.
+    """Run *lines* as one config file with *env* (iterations included).
+    Returns the tests and the version.
 
     Raises RuntimeError if TransferBench fails or the number of parsed tests
     does not match the number of lines.
     """
     full_env = dict(os.environ)
-    full_env.update(BASE_ENV)
     full_env.update(env)
-    full_env.update({"NUM_ITERATIONS": str(iters), "NUM_WARMUPS": str(warmup)})
+    full_env.update(PARSER_ENV)
     with tempfile.NamedTemporaryFile(
         "w", suffix=".cfg", prefix="collective_bw_", delete=False
     ) as fh:

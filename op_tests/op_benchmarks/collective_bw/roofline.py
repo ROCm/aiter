@@ -28,6 +28,7 @@ from dataclasses import dataclass
 
 import patterns
 import tb_text
+from roof_settings import DEFAULT, RoofSettings
 
 from aiter.ops.flydsl.comm_traffic import Traffic
 
@@ -39,6 +40,8 @@ class Roof:
     us: float  # whole call, the fastest candidate
     phase_us: tuple[float, ...]  # that candidate, per test, repeat included
     label: str = ""  # that candidate's label
+    # Every candidate's (label, us), in candidate order.
+    candidates: tuple[tuple[str, float], ...] = ()
 
 
 class Roofline:
@@ -48,13 +51,10 @@ class Roofline:
     def __init__(
         self,
         binary: str | None = None,
-        *,
-        iters: int = 20,
-        warmup: int = 3,
-        timeout: float = 900.0,
+        settings: RoofSettings = DEFAULT,
     ):
         self.binary = tb_text.find_binary(binary)
-        self.iters, self.warmup, self.timeout = iters, warmup, timeout
+        self.settings = settings
         self.version: str | None = None
         self._roofs: dict[tuple[str, Traffic], Roof] = {}
         if self.binary is None:
@@ -72,12 +72,14 @@ class Roofline:
     def measure(self, traffics: Iterable[Traffic]) -> dict[Traffic, Roof]:
         """The op roofs of *traffics*."""
         wanted = list(dict.fromkeys(traffics))
-        return self._solve("op", {t: patterns.candidates(t) for t in wanted})
+        s = self.settings
+        return self._solve("op", {t: patterns.candidates(t, s) for t in wanted})
 
     def measure_rccl(self, traffics: Iterable[Traffic]) -> dict[Traffic, Roof]:
         """The RCCL roofs of *traffics*, keyed by ``patterns.rccl_traffic``."""
         wanted = list(dict.fromkeys(patterns.rccl_traffic(t) for t in traffics))
-        return self._solve("rccl", {t: patterns.rccl_candidates(t) for t in wanted})
+        s = self.settings
+        return self._solve("rccl", {t: patterns.rccl_candidates(t, s) for t in wanted})
 
     def _solve(self, kind: str, specs: dict[Traffic, list]) -> dict[Traffic, Roof]:
         """The fastest candidate of each traffic in *specs*. *kind* keeps
@@ -98,20 +100,22 @@ class Roofline:
         for env, group in by_env.items():
             lines = list(dict.fromkeys(t.line for t in group))
             results, self.version = tb_text.run(
-                self.binary,
-                lines,
-                dict(env),
-                iters=self.iters,
-                warmup=self.warmup,
-                timeout=self.timeout,
+                self.binary, lines, dict(env), timeout=self.settings.timeout_s
             )
             for line, res in zip(lines, results):
                 ms[(line, env)] = res.kernel_ms
         for key, cands in todo.items():
-            best = None
-            for c in cands:
-                us = tuple(ms[(t.line, t.env)] * 1e3 * t.repeat for t in c.tests)
-                if best is None or sum(us) < best.us:
-                    best = Roof(us=sum(us), phase_us=us, label=c.label)
-            self._roofs[key] = best
+            per_test = [
+                tuple(ms[(t.line, t.env)] * 1e3 * t.repeat for t in c.tests)
+                for c in cands
+            ]
+            i = min(range(len(cands)), key=lambda k: sum(per_test[k]))
+            self._roofs[key] = Roof(
+                us=sum(per_test[i]),
+                phase_us=per_test[i],
+                label=cands[i].label,
+                candidates=tuple(
+                    (c.label, sum(us)) for c, us in zip(cands, per_test)
+                ),
+            )
         return {t: self._roofs[(kind, t)] for t in specs}
