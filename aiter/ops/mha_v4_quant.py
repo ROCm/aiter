@@ -325,7 +325,9 @@ def k_smooth_mean(k: Tensor, sample_rows: int, min_common: float) -> Tensor:
         ),
     )
     partial = k.new_empty((batch * heads, chunks, head_dim + 1), dtype=torch.float32)
-    _k_smooth_mean_hip(mean, partial, k, sample_rows, min_common)
+    # The develop bridge passes the current device's stream; make that K's device.
+    with torch.cuda.device(k.device):
+        _k_smooth_mean_hip(mean, partial, k, sample_rows, min_common)
     return mean
 
 

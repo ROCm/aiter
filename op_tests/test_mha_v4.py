@@ -803,6 +803,23 @@ def test_mha_v4_k_smooth_mean_matches_reference(
 
 
 @skipif(
+    get_gfx() not in ("gfx942", "gfx950") or torch.cuda.device_count() < 2,
+    reason="gfx942/gfx950 MHA v4 K smoothing on two devices",
+)
+def test_mha_v4_k_smooth_mean_runs_on_k_device():
+    """K on another device than the current one, which has a side stream current."""
+    torch.manual_seed(5)
+    k = torch.randn((1, 2048, 4, 128), device="cuda:1").to(torch.bfloat16)
+    expected = _k_smooth_mean_reference(k)
+    with torch.cuda.device(0), torch.cuda.stream(torch.cuda.Stream(0)):
+        actual = _k_mean(k, _RawRecipeKind.FP8)
+    torch.cuda.synchronize(0)
+    torch.cuda.synchronize(1)
+    assert actual.device == k.device
+    torch.testing.assert_close(actual, expected, rtol=1e-5, atol=1e-5)
+
+
+@skipif(
     get_gfx() not in ("gfx942", "gfx950"),
     reason="gfx942/gfx950 FP8 recipe validation",
 )
