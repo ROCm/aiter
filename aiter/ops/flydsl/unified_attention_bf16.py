@@ -19,6 +19,7 @@ Graph capture: the first call of a geometry on a stream must run uncaptured to
 allocate its workspace. Each call, captured or not, records a GPU plan refresh
 from ``seqused_k``, so lengths may change between replays up to the captured
 ``max_seqlen_k``. Calls and replays sharing a workspace must not overlap.
+Workspaces and compiled kernels persist until ``release_flydsl_resources``.
 
 The optimized varlen specialization is additionally limited to the global page-128,
 HKV=1, direct-output plan with ``max_seqlen_k >= 4096``. Set
@@ -35,7 +36,11 @@ import torch
 
 from aiter import logger
 
-__all__ = ["flydsl_decline_reason", "unified_attention_flydsl"]
+__all__ = [
+    "flydsl_decline_reason",
+    "release_flydsl_resources",
+    "unified_attention_flydsl",
+]
 
 _HEAD_DIM = 192
 _VALUE_DIM = 128
@@ -336,9 +341,38 @@ def _common_decline(
 # One grow-only backing allocation per device, stream and geometry. Calls take
 # exact-sized views. Growth during capture is impossible, so a captured call
 # needs an uncaptured warmup of at least its batch. Replaced allocations that a
-# graph captured stay referenced so replays keep valid pointers.
+# graph captured stay referenced so replays keep valid pointers. Nothing here
+# knows when a graph or stream dies, so only release_flydsl_resources frees them.
 _WORKSPACES: dict = {}
 _COLD_CAPTURE_WARNED: set = set()
+
+
+def release_flydsl_resources() -> None:
+    """Free the workspaces and compiled kernels FlyDSL unified attention keeps.
+
+    Workspaces (including allocations pinned for captured graphs) and compiled
+    kernels otherwise live for the whole process. Call only once no CUDA graph
+    that captured a FlyDSL unified-attention call will replay again: replays read
+    the freed workspaces, and dropping a compiled kernel unloads its HIP module.
+    The next call allocates and compiles again, so capture once more needs an
+    uncaptured warmup.
+    """
+    import sys
+
+    _WORKSPACES.clear()
+    _COLD_CAPTURE_WARNED.clear()
+    for name, factories in (
+        (f"{__package__}.kernels.pa_decode_pingpong", ("compile_pa_decode_pingpong",)),
+        (
+            f"{__package__}.unified_attention_varlen",
+            ("compile_tile_kernel", "compile_plan", "compile_tail_reduce"),
+        ),
+    ):
+        # A module not yet imported has compiled nothing.
+        module = sys.modules.get(name)
+        if module is not None:
+            for factory in factories:
+                getattr(module, factory).cache_clear()
 
 
 def _plan_capacity(num_seqs, num_kv_heads, num_cu):

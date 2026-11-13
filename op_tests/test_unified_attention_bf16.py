@@ -13,8 +13,9 @@ pytest.importorskip("flydsl")
 import aiter.ops.triton.attention.unified_attention as triton_ua
 from aiter.ops.flydsl import unified_attention_bf16 as flydsl_ua
 from aiter.ops.flydsl import unified_attention_varlen
+from aiter.ops.flydsl.kernels.pa_decode_pingpong import compile_pa_decode_pingpong
 from aiter.ops.flydsl.kernels.pa_decode_plan import build_query_block_map
-from aiter.ops.unified_attention import unified_attention
+from aiter.ops.unified_attention import release_flydsl_resources, unified_attention
 
 pytestmark = pytest.mark.skipif(
     not torch.cuda.is_available() or get_gfx_runtime() != "gfx950",
@@ -238,12 +239,30 @@ def test_flydsl_decode_batches_above_512(route_spy):
 def test_shrinking_batch_reuses_workspace(route_spy):
     """A batch that fills the CUs (one task per block, no partials) followed by a
     smaller one on the same workspace, which needs the partial buffers."""
-    flydsl_ua._WORKSPACES.clear()
+    release_flydsl_resources()
     for batch in (300, 64):
         lengths = (4097, 129, 64) * (batch // 3) + (300,) * (batch % 3)
         q, k, v, out, cu, used, table = _inputs(lengths, 128, qlen=1)
         _call(q, k, v, out, cu, used, table, qlen=1, backend="flydsl")
         _check(out, _reference(q, k, v, used, table, 1))
+    assert route_spy == ["flydsl", "flydsl"]
+
+
+def test_release_frees_workspaces_and_kernels(route_spy):
+    q, k, v, out, cu, used, table = _inputs((4097, 129, 300), 64, qlen=1)
+    release_flydsl_resources()
+    torch.cuda.synchronize()
+    baseline = torch.cuda.memory_allocated()
+    _call(q, k, v, out, cu, used, table, qlen=1, backend="flydsl")
+    torch.cuda.synchronize()
+    assert torch.cuda.memory_allocated() > baseline
+    release_flydsl_resources()
+    assert torch.cuda.memory_allocated() == baseline
+    assert flydsl_ua._WORKSPACES == {}
+    assert compile_pa_decode_pingpong.cache_info().currsize == 0
+    out.zero_()
+    _call(q, k, v, out, cu, used, table, qlen=1, backend="flydsl")
+    _check(out, _reference(q, k, v, used, table, 1))
     assert route_spy == ["flydsl", "flydsl"]
 
 
@@ -584,7 +603,7 @@ def test_graph_replay_follows_new_lengths(page):
 
 
 def test_cold_capture_raises_for_explicit_flydsl():
-    flydsl_ua._WORKSPACES.clear()
+    release_flydsl_resources()
     q, k, v, out, cu, used, table = _inputs((300, 129), 64)
     stream = torch.cuda.Stream()
     graph = torch.cuda.CUDAGraph()
