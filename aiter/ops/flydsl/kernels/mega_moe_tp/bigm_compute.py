@@ -465,7 +465,15 @@ class MegaMoeTPBigM:
         _run_compiled(launch, *args)
 
     def moe(
-        self, x, topk_weights, topk_ids, out=None, tail=None, local=False, gather=False
+        self,
+        x,
+        topk_weights,
+        topk_ids,
+        out=None,
+        tail=None,
+        local=False,
+        gather=False,
+        full=None,
     ):
         """The MoE of every rank's tokens (ag_rs): x [m, H] bf16 (this rank's rows, global
         rows rank * m + i), topk_weights f32 / topk_ids int32 [m, K1] (the shared expert E in
@@ -505,7 +513,11 @@ class MegaMoeTPBigM:
             )
         if mp == m:
             if gather:
-                ya = self._moe(x, topk_weights, topk_ids, None, None, local, gather)
+                # full: (x, topk_weights, topk_ids) of the replicated batch [tp * m] (ar):
+                # every rank quantizes every row itself, no input / routing gather
+                ya = self._moe(
+                    x, topk_weights, topk_ids, None, None, local, gather, full
+                )
                 if out is not None:
                     _kcopy(out, ya)
                 return ya if out is None else out
@@ -559,8 +571,8 @@ class MegaMoeTPBigM:
         """the kernel variant (compile_bigm_kernel's tailq) of a moe() call"""
         return 3 if gather else 0 if not tail else 2 if local else 1
 
-    def _io_launch(self, m, tailq):
-        """the kernel of m (a multiple of PAD) local rows"""
+    def _io_launch(self, m, tailq, xl=False):
+        """the kernel of m (a multiple of PAD) local rows (xl: from the replicated batch)"""
         T = m * self.tp
         eps, gemma, lim = self.cfg
         w_, opts = self._plan(T)
@@ -582,6 +594,7 @@ class MegaMoeTPBigM:
             act=self.act,
             situ_beta=self.situ[0],
             situ_linear_beta=self.situ[1],
+            xl=xl,
         )
 
     def io_rows_per_kernel(self, lo, hi):
@@ -610,7 +623,9 @@ class MegaMoeTPBigM:
             _bigm_cached(launch, (0,) * (n - 1) + (torch.cuda.current_stream(),))
         dist.barrier(group=self.sd.group)
 
-    def _moe(self, x, topk_weights, topk_ids, out, tail, local, gather=False):
+    def _moe(
+        self, x, topk_weights, topk_ids, out, tail, local, gather=False, full=None
+    ):
         """moe() of m (a multiple of PAD) rows"""
         m = x.shape[0]
         T = m * self.tp
@@ -622,7 +637,11 @@ class MegaMoeTPBigM:
             res_in, res_out, norm_w = tail
         else:
             res_in, res_out, norm_w = x, self.resout, x
-        launch = self._io_launch(m, self.tailq(tail is not None, local, gather))
+        tq = self.tailq(tail is not None, local, gather)
+        xl = full is not None and tq == 3
+        launch = self._io_launch(m, tq, xl)
+        if xl:  # (the kernel reads rank r's rows at r * m)
+            x, topk_weights, topk_ids = full
         chunks = self._chunks(T)  # (first: it may grow the unit table)
         self.ctrl[:BIGM_CTRL_INTS].zero_()
         self._run(

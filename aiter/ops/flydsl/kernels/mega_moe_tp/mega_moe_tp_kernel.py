@@ -109,6 +109,7 @@ from .mega_moe_tp_config import (
     SRT as SRT0,
 )
 from .schedule import build_schedule
+from .smallm import build_smallm
 
 __all__ = ["compile_bigm_kernel", "compile_mega_moe_tp"]
 
@@ -147,6 +148,12 @@ def compile_mega_moe_tp(
     tn_local: bool = False,
     lbpf: bool = False,
     lbp: int = 0,
+    sm: bool = False,
+    ar2: bool = False,
+    a16: bool = False,
+    nsk: int = 0,
+    xd: bool = False,
+    alq: bool = False,
 ):
     """Build the launcher of one (shape, variant) instance; LaunchCfg (host) picks them.
 
@@ -160,7 +167,8 @@ def compile_mega_moe_tp(
     ll_rs: LL ReduceScatter packets; ll_route: LL route rows too.
     comm_bf16: bf16 (not MXFP8) ReduceScatter / all-reduce partials (no LL).
     ag8: all-reduce whose second hop carries MXFP8 rows (else bf16).
-    a8: activations as MXFP8 (E4M3 + E8M0 per 32) instead of MXFP4.
+    a8: activations as MXFP8 (E4M3 + E8M0 per 32) instead of MXFP4. a16: bf16 activations as
+        two MXFP8 terms (hi + residual lo; the bf16 accuracy at fp8 x fp4 MFMA rate).
     lb: (rch = 16 * MT) large batches in two phases without partial sums:
         GEMM1 units (row chunk x inter piece) export their quantized intermediate; GEMM2
         units (column group x row chunk) take the full inter dim and are claimed by
@@ -171,11 +179,16 @@ def compile_mega_moe_tp(
         once final, becomes res_out[r] = y[r] + res_in[r] and the per-token FP8 quant of
         GemmaRMSNorm(res_out[r]; w, tn_eps) (RMSNorm unless tn_gemma), gathered by every
         rank into qall / sall; tn 2: the bf16 normed rows too (qall after the FP8 rows).
+    sm: (ll_rs, ll_route, not lb) the small-M schedule (smallm.py). ar2: (ar, LL route rows)
+        the two-shot all-reduce (reduce-scatter, then the owners' y rows to every rank)
+        instead of the one-shot one.
     """
     kc = kernel_config(**locals())
     kc.add(build_communication(kc))
     kc.add(build_gemm(kc))
     kc.add(build_schedule(kc))
+    if kc.SM:
+        kc.add(build_smallm(kc))
     AG8, ARLL, DLL, L_CTL, L_RING, LBPF = kc.get("AG8 ARLL DLL L_CTL L_RING LBPF")
     LDS_BYTES, MLL, NCHA, TN, TPC = kc.get("LDS_BYTES MLL NCHA TN TPC")
     a_loader, ag8_convert, ag_send = kc.get("a_loader ag8_convert ag_send")
@@ -184,6 +197,7 @@ def compile_mega_moe_tp(
     compute_units, const_expr, ctrl_at = kc.get("compute_units const_expr ctrl_at")
     (TNL,) = kc.get("TNL")
     _drop_stale, _dyn_zero, fin_key = kc.get("_drop_stale _dyn_zero fin_key")
+    (sm_zero_next,) = kc.get("sm_zero_next")
     fin_owned, fin_split, finish = kc.get("fin_owned fin_split finish")
     init_lds, layout_tag, lb_finish = kc.get("init_lds layout_tag lb_finish")
     lb_g2_prefetch, name, peer_rs = kc.get("lb_g2_prefetch name peer_rs")
@@ -193,6 +207,7 @@ def compile_mega_moe_tp(
 
     TN_V = H // 8
     TN_IT = ceildiv(TN_V, NTT)
+    (ag_ready_all,) = kc.get("ag_ready_all")
 
     @flyc.jit
     def blk_red(L, tid, v, op, slot):
@@ -375,10 +390,13 @@ def compile_mega_moe_tp(
     def roles(L, tid, a, epoch):
         if tid < i32(NT):
             compute_units(L, tid, a)
+            if const_expr(DLL):
+                push_dll(L, tid, a, 4 + tid // 64)
             comm_help(L, tid, a, epoch)
         else:
             if tid < i32(NT + 64):
                 ag_send(L, tid % i32(64), a)
+                ag_ready_all(L, tid % i32(64), a, epoch)
                 if const_expr(DLL):
                     push_dll(L, tid, a)
                     comm_wave(L, tid, a, epoch)
@@ -396,6 +414,8 @@ def compile_mega_moe_tp(
                 if const_expr(DLL):
                     if tid < i32(NT + 192):
                         zero_masked(L, tid % i32(64), a, 0, 1)
+                        if const_expr(kc.SM):
+                            kc.sm_g2_runs(L, tid, a)
                         push_dll(L, tid, a, 2)
                     else:
                         push_dll(L, tid, a, 3)
@@ -461,6 +481,7 @@ def compile_mega_moe_tp(
         epoch = lds_ld_i32(L, L_CTL + C_EPOCH * 4)
         a["epoch"] = epoch
         _drop_stale(tid, a)
+        sm_zero_next(tid, a)
         if (tid == i32(0)) & (i32(gpu.block_id("x")) == i32(0)):
             g_st_sys(claim_addr(a, 1), i32(0))
         if const_expr(ar):
@@ -596,6 +617,7 @@ def compile_bigm_kernel(
     act: str = "swiglu",
     situ_beta: float = 1.0,
     situ_linear_beta: float = 1.0,
+    xl: bool = False,
 ):
     """act: the units' activation ("swiglu", "silu", "situv2" with situ_beta / situ_linear_beta);
     E < 1024 routed experts (+ the last one, counted apart: a fused shared expert, or the last
@@ -609,12 +631,14 @@ def compile_bigm_kernel(
     """
     assert H % 256 == 0 and 0 < E < 1024 and K <= 64
     assert act in ("swiglu", "silu", "situv2")
+    assert not xl or tailq == 3
     assert (
         ZQ * (K + 1) <= 64
     )  # (the topk sums' route validity: one wave ballot an item)
     RG = UNIT_ROWS  # (one CTA of NW waves per CU)
     K1, NE = K + 1, E + 1
     HV = H // 8  # 16 B (8 bf16) columns of a row
+    P16 = ceildiv(H // 16, NT)  # (YD) 16-column iterations of a row
     # row iterations per thread (the last one partial unless NT | HV)
     PIT = ceildiv(HV, NT)
     # per-expert ctrl / LDS entries (one thread per expert, NEB rounds of NT)
@@ -684,6 +708,12 @@ def compile_bigm_kernel(
         PPC[QQ] = PPC[QS] = 0
     if tailq == 3:
         PPC[QS] = 0
+    # (ar) XL: the host passes the replicated batch (x / ids / tw of every rank's rows, rank
+    # r's at r * m): every rank quantizes every row itself -- no input / routing gather, the
+    # plan and the units wait for nothing on the wire
+    XL = bool(xl)
+    if XL:
+        PPC[QX] = PPC[QXS] = PPC[QID] = 0
     ZX = 16  # io: rows per input item (quant + routing copy)
     EPL = ceildiv(E, 64)  # experts per lane of the plan's wave
     # int8 rows of the attention / MoE-output RS: one fp32 scale per 32 values
@@ -803,9 +833,10 @@ def compile_bigm_kernel(
 
     name = (
         f"bigm_kernel_h{H}_i{I}_e{E}k{K}_tp{tp}_c{C}_rg{RG}_{fb(eps)}{'g' if gemma else 'r'}"
-        + f"_v34_t{tailq}_c1h{NSBA}_o{ORD}s{NSB}a{UA}d{RQD}r{R8}w{SXW}e{E4}b{BS2}"
+        + f"_v38_t{tailq}_c1h{NSBA}_o{ORD}s{NSB}a{UA}d{RQD}r{R8}w{SXW}e{E4}b{BS2}"
         + f"n{NAB}q{SRT}"
         + ("_eb" if EB else "")
+        + ("_xl" if XL else "")
         + ("_yg8" if YG8 else "")
         + ("" if act == "swiglu" else f"_{act}{fb(swiglu_limit)}")
         + (f"_b{fb(situ_beta)}_{fb(situ_linear_beta)}" if act == "situv2" else "")
@@ -1163,7 +1194,7 @@ def compile_bigm_kernel(
 
         def cnt(kind, s_):
             if const_expr(kind == P_RB):  # the input rows (item_rx)
-                return s_ // i32(ZX)
+                return (i32(tp) * s_ if XL else s_) // i32(ZX)
             if const_expr(kind == P_RF):
                 return s_ // i32(ZQ)
             if const_expr(kind in (P_S1, P_S3)):
@@ -1264,8 +1295,13 @@ def compile_bigm_kernel(
             rq, rqs = rsrc(wp("xq")), rsrc(wp("xs"))
             i0 = jx * i32(ZX)
             # first row of the item in x (xs0) / in the window (ws0)
-            xs0 = o + i0
-            ws0 = B + rank * s + i0
+            if const_expr(XL):  # (every rank's rows)
+                pr = i0 // s
+                xs0 = pr * m + o + (i0 - pr * s)
+                ws0 = B + i0
+            else:
+                xs0 = o + i0
+                ws0 = B + rank * s + i0
             ld = [
                 [
                     bld(
@@ -1317,23 +1353,25 @@ def compile_bigm_kernel(
                             AUX_SYS,
                         )
             done_last(k, P_RB, cnt(P_RB, s))
-            sa = s // i32(NSBA)
-            bh = i0 // sa
-            if done_at(  # noqa: SIM102 - preserve FlyDSL branches
-                sbh(k, 1, bh), sa // i32(ZX)
-            ):
-                if tid == i32(0):
-                    post_c(k, bh)
+            if const_expr(not XL):  # (XL: no input gather)
+                sa = s // i32(NSBA)
+                bh = i0 // sa
+                if done_at(  # noqa: SIM102 - preserve FlyDSL branches
+                    sbh(k, 1, bh), sa // i32(ZX)
+                ):
+                    if tid == i32(0):
+                        post_c(k, bh)
 
         @flyc.jit
         def item_s1(k, j):
             tid = own_tid()
             o, s = chunk(k)
             B = i32(tp) * o
-            if const_expr(SXW):
+            if const_expr(SXW and not XL):
                 wait_puts(QX, NSBA, k)
                 wait_puts(QXS, NSBA, k)
-            wait_puts(QID, 2 * NSBA, k)
+            if const_expr(not XL):
+                wait_puts(QID, 2 * NSBA, k)
             wait_ph(k, P_RB, cnt(P_RB, s))  # own rows' routing copied into the window
             for b_ in range_constexpr(NEB):
                 if tid + i32(b_ * NT) < i32(NE):
@@ -1679,7 +1717,7 @@ def compile_bigm_kernel(
             B = i32(tp) * o
             wait_ph(k, P_S3, cnt(P_S3, s))
             if const_expr(
-                not SXW
+                not SXW and not XL
             ):  # the plan only waited for the routing: the rows now
                 wait_puts(QX, NSBA, k)
                 wait_puts(QXS, NSBA, k)
@@ -2107,15 +2145,48 @@ def compile_bigm_kernel(
                 wait_at(sbc(k, 1, b), sb // i32(ZQ))
             else:
                 wait_puts_n(QQ, k * i32(NSB) + b + i32(1))
+            # 16 columns a thread: one 16 B code load + one scale load (the 8-column int8 row
+            # loads -- 8 B codes + a scale -- were issue-bound, 2 small loads per 8 columns)
             rq = rsrc(wp("q"))
+            lds = []
             for ii in range_constexpr(ZQ):
                 g = p * m + o + i0 + i32(ii)
-                for kk in range_constexpr(PIT):
-                    c = col(tid, kk)
-                    v = i8_rows_val(i8_rows_ld(rq, g, c))
-                    bst(
-                        pack_bf16x8(v), r_yout, (g * i32(H) + c * i32(8)) * i32(2), 0, 0
+                for kk in range_constexpr(P16):
+                    c16 = fx.min(tid + i32(kk * NT), i32(H // 16 - 1))
+                    lds.append(
+                        (
+                            fx.Vector(
+                                bld(rq, g * i32(RB) + c16 * i32(16), 0, V4I, CAUX)
+                            ),
+                            fx.Int32(
+                                bld(
+                                    rq,
+                                    g * i32(RB) + i32(SCO) + (c16 // i32(2)) * i32(4),
+                                    0,
+                                    T.i32,
+                                    CAUX,
+                                )
+                            ),
+                        )
                     )
+            for ii in range_constexpr(ZQ):
+                g = p * m + o + i0 + i32(ii)
+                for kk in range_constexpr(P16):
+                    c16 = fx.min(tid + i32(kk * NT), i32(H // 16 - 1))
+                    d, sc = lds[ii * P16 + kk]
+                    scf = sc.bitcast(fx.Float32)
+                    v = []
+                    for q in range_constexpr(4):
+                        v += i8x4_unpack(fx.Int32(d[q]), scf)
+                    if tid + i32(kk * NT) < i32(H // 16):
+                        for h in range_constexpr(2):
+                            bst(
+                                pack_bf16x8(v[8 * h : 8 * h + 8]),
+                                r_yout,
+                                (g * i32(H) + c16 * i32(16) + i32(8 * h)) * i32(2),
+                                0,
+                                0,
+                            )
 
         @flyc.jit
         def item_gw():
