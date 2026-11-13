@@ -1539,7 +1539,8 @@ namespace py = pybind11;
           py::arg("dispatch_policy")   = 0,            \
           py::arg("local_topk_ids")    = std::nullopt, \
           py::arg("m_indices")         = std::nullopt, \
-          py::arg("reverse_sorted")    = std::nullopt); \
+          py::arg("reverse_sorted")    = std::nullopt, \
+          py::arg("expert_info")       = std::nullopt); \
     m.def("mxfp4_moe_sort_quant_fwd",                  \
           &mxfp4_moe_sort_quant_fwd,                   \
           py::arg("hidden_states"),                    \

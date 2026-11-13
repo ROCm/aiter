@@ -694,6 +694,18 @@ def _moe_sorting_impl(
             if ws_size > 0
             else None
         )
+        # The expert-stationary GEMM2 (AITER_MXFP4_G2_ES) takes its expert table from the
+        # multi-phase sort: rows [first sorted row, tokens, expert, 0] by descending tokens.
+        expert_info = (
+            torch.empty((num_experts + 1, 4), dtype=dtypes.i32, device=device)
+            if ws_size > 0
+            and expert_mask is None
+            and not output_aux
+            and os.environ.get("AITER_MXFP4_G2_ES", "0") == "1"
+            else None
+        )
+        if expert_info is not None:
+            sorted_expert_ids.aiter_expert_info = expert_info
         aiter.moe_sorting_opus_fwd(
             topk_ids,
             topk_weights,
@@ -711,6 +723,7 @@ def _moe_sorting_impl(
             local_topk_ids,
             aux_m_indices,
             aux_reverse_sorted,
+            expert_info,
         )
     else:
         aiter.moe_sorting_fwd(

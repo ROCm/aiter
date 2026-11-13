@@ -27,7 +27,8 @@ void moe_sorting_opus_fwd(aiter_tensor_t& topk_ids,
                           int dispatch_policy                             = 0,
                           std::optional<aiter_tensor_t> local_topk_ids   = std::nullopt,
                           std::optional<aiter_tensor_t> m_indices        = std::nullopt,
-                          std::optional<aiter_tensor_t> reverse_sorted   = std::nullopt);
+                          std::optional<aiter_tensor_t> reverse_sorted   = std::nullopt,
+                          std::optional<aiter_tensor_t> expert_info      = std::nullopt);
 
 // Narrow gfx950 decode helper. It fuses route sorting, BF16->MXFP4 activation
 // quantization and routed-output zeroing for H=4096, block_m=32 batches of
@@ -468,7 +469,10 @@ struct MoeSortingHostArgs
     // Besides, we require inter_dim to be multiple of 16 byte(make sure when alloc ws for fmoe)
     opus::index_t moe_buf_interm_dim; // p_moe_buf interm_dim
     opus::index_t moe_buf_elem_bytes; // p_moe_buf byte size(8bit, 16bit, 32bit, etc.)
-
+    // optional [num_experts + 1, 4] i32 (multi-phase path only, nullptr = not emitted):
+    // rows [first sorted row, tokens, expert, 0] by descending tokens (ties by expert id),
+    // then [experts with tokens, 0, 0, 0].
+    void* p_expert_info = nullptr;
 };
 
 template <typename Problem_>
@@ -2832,6 +2836,9 @@ struct MoeSortingMultiPhaseKernel_P23
         // dispatch_policy=1 (that single kernel) purely to get these two arrays.
         void* p_m_indices;      // [total_padded] sorted slot -> token id (pad = tokens)
         void* p_reverse_sorted; // [token*topk] (token, slot) -> sorted slot
+        // Optional expert table (MoeSortingHostArgs::p_expert_info), written by the
+        // workgroup right after the experts' ones.
+        void* p_expert_info;
 
         opus::index_t tokens;
         opus::index_t num_experts;
@@ -2869,6 +2876,7 @@ struct MoeSortingMultiPhaseKernel_P23
 
         k.p_m_indices      = h.p_m_indices;
         k.p_reverse_sorted = h.p_reverse_sorted;
+        k.p_expert_info    = h.p_expert_info;
 
         k.tokens         = h.tokens;
         k.num_experts    = h.num_experts;
@@ -2896,7 +2904,8 @@ struct MoeSortingMultiPhaseKernel_P23
 
     OPUS_H static constexpr auto GridSize(const Hargs& h)
     {
-        return dim3(h.num_experts + get_num_cu() * OCCUPANCY);
+        return dim3(h.num_experts + (h.p_expert_info != nullptr ? 1 : 0) +
+                    get_num_cu() * OCCUPANCY);
     }
 
     OPUS_H static constexpr auto BlockSize(const Hargs&) { return dim3(kBlockSize); }
@@ -2907,7 +2916,106 @@ struct MoeSortingMultiPhaseKernel_P23
         const auto smem_23 =
             impl::moe_sorting_get_smem_size_p23(h.num_experts, h.p_local_topk_ids != nullptr);
         const auto smem_sf = kBlockSize * 4 * sizeof(IndexType);
-        return max(smem_23, smem_sf);
+        // expert table (write_expert_info)
+        const auto smem_ei = h.p_expert_info != nullptr
+                                 ? expert_info_smem_elems(h.num_experts) *
+                                       static_cast<opus::index_t>(sizeof(IndexType))
+                                 : 0;
+        return max(max(smem_23, smem_sf), smem_ei);
+    }
+
+    // Expert table scratch in smem (IndexType units): after the cumsum section's header,
+    // cumsum and local ids come kExpertInfoBuckets bucket counts, the experts' positions in
+    // their buckets, the per-wave sums and the number of experts with tokens.
+    static constexpr opus::index_t kExpertInfoBuckets = 1024; // 4 per thread
+
+    OPUS_H_D static constexpr opus::index_t expert_info_smem_offset(opus::index_t num_experts)
+    {
+        return 4 + 2 * kBlockSize / opus::get_warp_size() + 2 * num_experts + 1;
+    }
+
+    OPUS_H_D static constexpr opus::index_t expert_info_smem_elems(opus::index_t num_experts)
+    {
+        return expert_info_smem_offset(num_experts) + kExpertInfoBuckets + num_experts +
+               kBlockSize / opus::get_warp_size() + 1;
+    }
+
+    // The workgroup after the experts' ones: the experts' [first row, tokens, expert, 0] rows
+    // by descending tokens, then [experts with tokens, 0, 0, 0]. A counting sort over the token
+    // counts (counts past the last bucket share it); within a bucket the order is the atomics'
+    // arrival order, which only this workgroup sees. Runs after the cumsum loop, so the first
+    // rows sit in p_expert_cumsum_smem.
+    OPUS_D static void write_expert_info(const Kargs& kargs, char* smem)
+    {
+        constexpr opus::index_t kWaves = kBlockSize / opus::get_warp_size();
+        constexpr opus::index_t kB     = kExpertInfoBuckets;
+        static_assert(kB == 4 * kBlockSize);
+        const opus::index_t ne          = kargs.num_experts;
+        IndexType* s                    = reinterpret_cast<IndexType*>(smem);
+        IndexType* p_expert_cumsum_smem = s + 4 + 2 * kWaves;
+        IndexType* hist                 = s + expert_info_smem_offset(ne); // [kB]
+        IndexType* pos                  = hist + kB;                       // [ne]
+        IndexType* wsum                 = pos + ne;                        // [kWaves + 1]
+        const IndexType* p_cnt = reinterpret_cast<const IndexType*>(kargs.p_expert_cumsum);
+        const IndexType* p_local_expert_mask =
+            static_cast<const IndexType*>(kargs.p_local_expert_mask);
+        IndexType* p_info = reinterpret_cast<IndexType*>(kargs.p_expert_info);
+        auto count        = [&](opus::index_t e) {
+            IndexType c = p_cnt[e];
+            if constexpr(Problem::LocalExpertMasking)
+                c = p_local_expert_mask[e] ? c : 0;
+            return c;
+        };
+        // Ascending key = descending tokens.
+        auto key = [&](IndexType c) { return kB - 1 - min(c, static_cast<IndexType>(kB - 1)); };
+
+        for(opus::index_t i = threadIdx.x; i < kB; i += kBlockSize)
+            hist[i] = 0;
+        if(threadIdx.x == 0)
+            wsum[kWaves] = 0;
+        __syncthreads();
+        IndexType active = 0;
+        for(opus::index_t e = threadIdx.x; e < ne; e += kBlockSize)
+        {
+            const IndexType c = count(e);
+            pos[e]            = atomicAdd(&hist[key(c)], 1);
+            active += c > 0 ? 1 : 0;
+        }
+        atomicAdd(&wsum[kWaves], active);
+        __syncthreads();
+
+        // Exclusive prefix sum of the buckets: thread t owns buckets 4t .. 4t + 3.
+        const opus::index_t lane_id = threadIdx.x % opus::get_warp_size();
+        const opus::index_t wave_id = threadIdx.x / opus::get_warp_size();
+        IndexType h[4];
+        opus::static_for<4>([&](auto i) { h[i.value] = hist[4 * threadIdx.x + i.value]; });
+        const IndexType local = h[0] + h[1] + h[2] + h[3];
+        IndexType incl        = local;
+        impl::moe_sorting_wave_cumsum<IndexType, opus::get_warp_size()>(incl);
+        if(lane_id == opus::get_warp_size() - 1)
+            wsum[wave_id] = incl;
+        __syncthreads();
+        IndexType start = incl - local;
+        for(opus::index_t w = 0; w < wave_id; w++)
+            start += wsum[w];
+        opus::static_for<4>([&](auto i) {
+            hist[4 * threadIdx.x + i.value] = start;
+            start += h[i.value];
+        });
+        __syncthreads();
+
+        using row_t = opus::vector_t<IndexType, 4>;
+        for(opus::index_t e = threadIdx.x; e < ne; e += kBlockSize)
+        {
+            const IndexType c = count(e);
+            row_t row{p_expert_cumsum_smem[e], c, static_cast<IndexType>(e), 0};
+            reinterpret_cast<row_t*>(p_info)[hist[key(c)] + pos[e]] = row;
+        }
+        if(threadIdx.x == 0)
+        {
+            row_t total{wsum[kWaves], 0, 0, 0};
+            reinterpret_cast<row_t*>(p_info)[ne] = total;
+        }
     }
 
     // reduce single pixel within a wave
@@ -2924,14 +3032,16 @@ struct MoeSortingMultiPhaseKernel_P23
             }
         }();
 
-        if(static_cast<opus::index_t>(blockIdx.x) >= kargs.num_experts)
+        const opus::index_t n_info = kargs.p_expert_info != nullptr ? 1 : 0;
+        const bool info_block      = n_info && blockIdx.x == kargs.num_experts;
+        if(static_cast<opus::index_t>(blockIdx.x) >= kargs.num_experts && !info_block)
         {
             impl::moe_buf_set_zero_kernel_2d<kBlockSize>(kargs.p_moe_buf,
                                                          tokens,
                                                          kargs.moe_buf_interm_dim,
                                                          kargs.moe_buf_elem_bytes,
-                                                         blockIdx.x - kargs.num_experts,
-                                                         gridDim.x - kargs.num_experts);
+                                                         blockIdx.x - kargs.num_experts - n_info,
+                                                         gridDim.x - kargs.num_experts - n_info);
             return;
         }
 
@@ -3090,6 +3200,11 @@ struct MoeSortingMultiPhaseKernel_P23
         }
 
         __syncthreads();
+        if(info_block)
+        {
+            write_expert_info(kargs, smem);
+            return;
+        }
         if(kargs.p_local_topk_ids != nullptr && blockIdx.x == 0)
         {
             const IndexType* p_topk_ids = static_cast<const IndexType*>(kargs.p_topk_ids);

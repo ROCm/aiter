@@ -31,7 +31,8 @@ void moe_sorting_opus_fwd(aiter_tensor_t& topk_ids,
                           int dispatch_policy,
                           std::optional<aiter_tensor_t> local_topk_ids,
                           std::optional<aiter_tensor_t> m_indices,
-                          std::optional<aiter_tensor_t> reverse_sorted)
+                          std::optional<aiter_tensor_t> reverse_sorted,
+                          std::optional<aiter_tensor_t> expert_info)
 {
     AITER_CHECK(topk_weights.dtype() == AITER_DTYPE_fp32,
                 "topk_weights must be FP32 (float32)");
@@ -64,6 +65,18 @@ void moe_sorting_opus_fwd(aiter_tensor_t& topk_ids,
                     "reverse_sorted must be a contiguous int32 buffer for tokens * topk routes");
     }
 
+    if(expert_info.has_value())
+    {
+        auto& info = expert_info.value();
+        AITER_CHECK(info.dtype() == AITER_DTYPE_i32 && info.is_contiguous() &&
+                        info.numel() >= static_cast<int64_t>(num_experts + 1) * 4,
+                    "expert_info must be a contiguous int32 buffer of (num_experts + 1) x 4");
+        // Only the multi-phase kernels (the ones with a workspace) emit it.
+        AITER_CHECK(moe_sorting_opus_get_workspace_size(
+                        num_tokens, num_experts, topk, dispatch_policy, topk_ids.device_id) != 0,
+                    "expert_info needs the multi-phase sort (non-zero workspace)");
+    }
+
     void* ws_ptr = workspace.has_value() ? workspace.value().data_ptr() : nullptr;
 
     moe_sorting_opus(
@@ -92,7 +105,8 @@ void moe_sorting_opus_fwd(aiter_tensor_t& topk_ids,
          num_experts,
          topk,
          static_cast<int>(moe_buf.size(-1)),
-         static_cast<int>(moe_buf.element_size())},
+         static_cast<int>(moe_buf.element_size()),
+         expert_info.has_value() ? expert_info.value().data_ptr() : nullptr},
         {stream});
 }
 
