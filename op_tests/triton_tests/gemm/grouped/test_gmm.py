@@ -17,6 +17,7 @@ import torch
 from torch import Tensor
 
 # AITER: Triton kernel wrappers
+import aiter.ops.triton.gemm.grouped.gmm as gmm_module
 from aiter.ops.triton.gemm.grouped.gmm import (
     gmm as triton_gmm,
 )
@@ -433,6 +434,14 @@ def test_gmm_gluon_rejects_unsupported_options():
         triton_gmm(lhs, rhs, group_sizes[0], grid_dim=8, backend="gluon")
     with pytest.raises(AssertionError, match="work stealing"):
         triton_gmm(lhs, rhs, group_sizes[0], work_stealing=True, backend="gluon")
+
+
+def test_gmm_gluon_rejects_other_archs(monkeypatch):
+    # Runs on any arch: the gate fires before any config is loaded.
+    monkeypatch.setattr(gmm_module, "get_arch", lambda: "gfx950")
+    lhs, rhs, group_sizes, _, _ = gen_gmm_tensors(32, 16, 8, 4, 1)
+    with pytest.raises(AssertionError, match="Gluon backend requires"):
+        triton_gmm(lhs, rhs, group_sizes[0], backend="gluon")
 
 
 # TGMM unit tests.

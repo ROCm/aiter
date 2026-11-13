@@ -23,6 +23,7 @@ from aiter.ops.triton._triton_kernels.gemm.grouped.gmm import (
     tgmm_non_persistent_kernel,
     tgmm_persistent_kernel,
 )
+from aiter.ops.triton.utils._triton.arch_info import get_arch
 from aiter.ops.triton.utils.config_utils import load_config_json, resolve_config_dir
 from aiter.ops.triton.utils.device_info import get_num_sms, get_num_xcds
 
@@ -43,6 +44,19 @@ from aiter.ops.triton.utils.gmm_common import (
 
 # GMM PyTorch wrapper.
 # ------------------------------------------------------------------------------
+
+_GLUON_SUPPORTED_ARCHS = (
+    "gfx1250",
+    "gfx1250-strict",
+)
+
+
+def _is_gluon_available():
+    """Check if the gluon backend is available for the current GPU architecture."""
+    try:
+        return any(supported in get_arch() for supported in _GLUON_SUPPORTED_ARCHS)
+    except Exception:  # noqa: BLE001
+        return False
 
 
 # Per-(device, stream) cache for the work stealing tile counter. A single `int32`
@@ -297,6 +311,9 @@ def gmm(
     trans_rhs, _ = get_gmm_transposition(lhs, rhs, out)
 
     if backend == "gluon":
+        assert (
+            _is_gluon_available()
+        ), f"Gluon backend requires one of {_GLUON_SUPPORTED_ARCHS}, got '{get_arch()}'"
         assert not work_stealing, "Gluon GMM does not support work stealing."
         assert (
             grid_dim is None
