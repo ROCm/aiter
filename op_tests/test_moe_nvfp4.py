@@ -7,8 +7,8 @@ shapes (TP4 / TP8, E 128, topk 4), the main path and the fallback (T 2048, E 640
 bf16 and f16 activations, the stage-2 top-k sum by atomics and by the reduce
 kernel (_reduce), expert contributions that cancel beyond the f16 range, a dispatch
 CSV (AITER_CONFIG_MOE_NVFP4) naming a kernel outside the prebuilt module
-(per-kernel JIT), CSV rows whose kernels cannot run their shape and the fused_moe
-errors.
+(per-kernel JIT), CSV rows whose kernels cannot run their shape, the fused_moe
+errors and a caller output buffer.
 """
 
 import os
@@ -131,6 +131,24 @@ def test_moe_nvfp4(shape, T, dtype):
         assert torch.isfinite(out).all(), name
         err = _relf(out, ref)
         assert err < TOL, f"{name} I={I} T={T} {dtype}: relF {err:.2e}"
+
+
+@pytest.mark.parametrize("dtype", DTYPES)
+@pytest.mark.parametrize("T", [1, 16, 2048])
+def test_out(shape, T, dtype):
+    """Caller output (NaN-filled) on the main path (T 1, 16) and the fallback
+    (T 2048): fully written (atomics targets zeroed); a bad out raises."""
+    I, raw, W, _ = shape
+    x, tid, tw = _inputs(T, dtype, seed=T + 1)
+    buf = torch.full((T, H), float("nan"), dtype=dtype, device="cuda")
+    assert moe_nvfp4(W, x, tid, tw, out=buf) is buf
+    assert torch.isfinite(buf).all()
+    err = _relf(buf, _reference(x, raw, tid, tw))
+    assert err < TOL, f"I={I} T={T} {dtype}: relF {err:.2e}"
+    strided = torch.empty(T, 2 * H, dtype=dtype, device="cuda")[:, ::2]
+    for bad in (buf[:, :-1], strided, buf.float()):
+        with pytest.raises(ValueError, match="out must be"):
+            moe_nvfp4(W, x, tid, tw, out=bad)
 
 
 @pytest.mark.parametrize("dtype", DTYPES)

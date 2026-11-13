@@ -485,6 +485,7 @@ def moe_nvfp4(
     topk_ids: Tensor,
     topk_w: Tensor,
     fallback: bool | None = None,
+    out: Tensor | None = None,
 ) -> Tensor:
     """Routed-expert sum (no routed scaling).
 
@@ -495,12 +496,15 @@ def moe_nvfp4(
         topk_w: [T, topk] routing weights (any float dtype).
         fallback: None: the fallback path iff uses_fallback(T, topk, E); True /
             False: force it on / off.
+        out: contiguous [T, H] output in the x dtype on the x device, not
+            overlapping x; allocated if None.
 
     Returns:
-        [T, H] in the x dtype.
+        [T, H] in the x dtype (out if given).
 
     Raises:
-        ValueError: x not bf16 or f16 [T, W.H], topk above 127 (the slot field
+        ValueError: out not a contiguous [T, H] tensor of the x dtype and
+            device, x not bf16 or f16 [T, W.H], topk above 127 (the slot field
             of the sorted ids), fallback=False for a shape the fused sort cannot
             take, a shape without default-rule kernels, or a shape over the
             kernel limits (32-bit byte offsets: T * H and T * topk * I
@@ -537,7 +541,17 @@ def moe_nvfp4(
         or _round8(nblk) > MAX_GRID_Y
     ):
         raise ValueError(f"NVFP4 MoE: T={T} topk={topk} exceeds the kernel limits")
-    out = torch.empty(T, H, dtype=x.dtype, device=dev)
+    if out is None:
+        out = torch.empty(T, H, dtype=x.dtype, device=dev)
+    elif (
+        out.shape != (T, H)
+        or out.dtype != x.dtype
+        or out.device != dev
+        or not out.is_contiguous()
+    ):
+        raise ValueError(
+            f"NVFP4 MoE: out must be a contiguous {x.dtype} [{T}, {H}] on {dev}"
+        )
     # stage-2 target: the (token, slot) f32 rows of the top-k reduce, the bf16 output
     # (atomics) or an f32 workspace (f16 output: f16 atomics overflow on partial sums)
     if reduce:
