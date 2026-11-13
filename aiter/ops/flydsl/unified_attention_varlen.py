@@ -5,13 +5,13 @@
 
 out[t, h] = softmax_j(scale * q[t, h] . k[j, h // 16]) @ v[j, h // 16], causal
 bottom-right per sequence. bf16 q/k/v/out, Q/K head dim 192, V/out head dim 128,
-16 query heads per KV head, a linear KV cache [blocks, page, kv_heads, dim] of
-128-token pages. The router selects it for one KV head on a 256-CU device when
+16 query heads on one KV head, a linear KV cache [blocks, page, 1, dim] of
+128-token pages. The router selects it on a 256-CU device when
 the batch has at least one query block per task slot, so every block runs as
 exactly one task and writes ``out`` directly.
 
 Each sequence's queries split into blocks of _QUERY_BLOCK (16): 16 queries x 16
-heads = 256 rows of one KV head. A call launches, in order:
+heads = 256 rows. A call launches, in order:
 
 1. the query map (``pa_decode_plan.build_query_block_map``): the blocks, longest
    context first;
@@ -155,7 +155,7 @@ def opaque(x):
 
 # --- tile kernel ----------------------------------------------------------------
 #
-# One CTA owns a task's query block (256 rows of one KV head) and streams 64-token
+# One CTA owns a task's query block (256 rows) and streams 64-token
 # K/V tiles into an LDS ring by async DMA. Wave w owns rows [32 w, 32 w + 32) as
 # M = 2 16-row tiles and all 64 tokens of each tile. Waves 0-3 and 4-7 form two
 # groups, one wave of each per SIMD, that run one phase apart (see stagger_step).
@@ -235,13 +235,10 @@ def compile_tile_kernel(block_size, softmax_scale):
         end: fx.Int32,
         context: fx.Int32,
         slot: fx.Int32,
-        work_capacity: fx.Int32,
         out_ptr: fx.Pointer,
         reduce_ptr: fx.Pointer,
-        n_kv,
     ):
         """One task: query block seq against KV tiles [start, end) * TILES_PER_PLAN."""
-        kv_h = fx.Int32(fx.block_idx.y)
         tid = fx.Int32(fx.thread_idx.x)
         warp = uniform(tid // WAVE)
         lane = tid % WAVE
@@ -275,8 +272,7 @@ def compile_tile_kernel(block_size, softmax_scale):
                 q_idx = queries[m]
                 q_idx = (q_idx < valid).select(q_idx, valid - 1)
                 q_row = first_row + q_idx
-                head = kv_h * GQA + l16
-                row_elem = q_row * stride_q_row + head * stride_q_head + g * 8
+                row_elem = q_row * stride_q_row + l16 * stride_q_head + g * 8
                 ops_m = []
                 for kk in range_constexpr(KK):
                     fx.copy(
@@ -291,8 +287,6 @@ def compile_tile_kernel(block_size, softmax_scale):
         k_base = buf_base_i64(key_cache_ptr)
         v_base = buf_base_i64(value_cache_ptr)
         bt = ptr_buf_tensor(block_tables_ptr, fx.Int32)
-        k_tok_bytes = n_kv * K_ROW
-        v_tok_bytes = n_kv * V_ROW
 
         t_begin = start * TILES_PER_PLAN
         ctx_tiles = (context + (TILE - 1)) // TILE
@@ -344,26 +338,19 @@ def compile_tile_kernel(block_size, softmax_scale):
                 offs.append(tok * tok_bytes + ((pos % cpr) ^ swizzle(tok)) * 16)
             return offs
 
-        k_voff = dma_offsets(K8, K_CPR, k_tok_bytes, k_swizzle)
-        v_voff = dma_offsets(V8, V_CPR, v_tok_bytes, v_swizzle)
+        k_voff = dma_offsets(K8, K_CPR, K_ROW, k_swizzle)
+        v_voff = dma_offsets(V8, V_CPR, V_ROW, v_swizzle)
 
         page_shift = (block_size // TILE).bit_length() - 1
-        k_page_bytes = uniform(n_kv * (block_size * K_ROW))
-        v_page_bytes = uniform(n_kv * (block_size * V_ROW))
 
         def zext(x):
             return fx.Int64(x) & fx.Int64(0xFFFFFFFF)
 
         TPP = block_size // TILE  # tiles per page
-        # Per task, for the loop's DMA: the head's row inside a page folded into the
-        # K/V bases, each load's LDS offset within a stage (so its m0 is one add),
-        # and the DMA bound. A lane's offset is row * n_kv * ROW + chunk, so the
-        # bound is rows * n_kv * ROW with rows = clamp(lim - tok0, 0, TILE);
-        # lim = min(context, t_end * TILE) also empties tiles past t_end.
-        nkr = uniform(n_kv * K_ROW)
-        nvr = uniform(n_kv * V_ROW)
-        kb = uniform64(k_base + zext(kv_h * K_ROW))
-        vb = uniform64(v_base + zext(kv_h * V_ROW))
+        # Per task, for the loop's DMA: each load's LDS offset within a stage (so
+        # its m0 is one add) and the DMA bound. A lane's offset is row * ROW + chunk
+        # (one KV head), so the bound is rows * ROW with rows = clamp(lim - tok0, 0,
+        # TILE); lim = min(context, t_end * TILE) also empties tiles past t_end.
         lds8_k = [
             uniform(fx.Int32(K_BASE + (warp * K8 + j) * (WAVE * 16)))
             for j in range_constexpr(K8)
@@ -373,8 +360,6 @@ def compile_tile_kernel(block_size, softmax_scale):
             for j in range_constexpr(V8)
         ]
         lim = uniform((context < t_end * TILE).select(context, t_end * TILE))
-        step_k = uniform(nkr * TILE)
-        step_v = uniform(nvr * TILE)
 
         def raw_rsrc(addr, nrec):
             """V# from its four words, without make_buffer_rsrc's stride mask on the
@@ -429,19 +414,19 @@ def compile_tile_kernel(block_size, softmax_scale):
             rows = lim - tile * TILE
             rows = (rows < TILE).select(rows, TILE)
 
-            def operand_loads(base, nkvrow, voffs, copies, step_b, lds8, stage_off):
+            def operand_loads(base, row, voffs, copies, lds8, stage_off):
                 # Clamped at 0 after the multiply: a min/max pair on rows becomes a
                 # VALU v_med3.
-                nrec = rows * nkvrow
+                nrec = rows * row
                 nrec = uniform((nrec > 0).select(nrec, 0))
-                rs = raw_rsrc(uniform64(base + zext(ptile) * zext(step_b)), nrec)
+                rs = raw_rsrc(uniform64(base + zext(ptile) * (row * TILE)), nrec)
                 for j in range_constexpr(copies):
                     loads.append(
                         lambda j=j: load_kv_tile(rs, stage_off + lds8[j], voffs[j])
                     )
 
-            operand_loads(kb, nkr, k_voff, K8, step_k, lds8_k, stage * K_STRIDE)
-            operand_loads(vb, nvr, v_voff, V8, step_v, lds8_v, stage * V_STRIDE)
+            operand_loads(k_base, K_ROW, k_voff, K8, lds8_k, stage * K_STRIDE)
+            operand_loads(v_base, V_ROW, v_voff, V8, lds8_v, stage * V_STRIDE)
             return loads
 
         def kv_tile_loads(tile, stage, ok):
@@ -449,14 +434,14 @@ def compile_tile_kernel(block_size, softmax_scale):
             table index is clamped and the loads read nothing."""
             phys = load_phys(tile)
             tok0 = tile * TILE
-            row_idx = (tok0 & (block_size - 1)) * n_kv + kv_h
+            row_idx = tok0 & (block_size - 1)
             left = context - tok0
-            rows_m1 = ((left < TILE).select(left, TILE) - 1) * n_kv
+            rows_m1 = (left < TILE).select(left, TILE) - 1
             loads = []
 
-            def operand_loads(base, page_bytes, row, voffs, copies, lds_off):
+            def operand_loads(base, row, voffs, copies, lds_off):
                 addr = uniform64(
-                    base + zext(phys) * zext(page_bytes) + zext(row_idx * row)
+                    base + zext(phys) * (block_size * row) + zext(row_idx * row)
                 )
                 nrec = uniform(ok.select(rows_m1 * row + row, 0))
                 rs = fx.rocdl.get_buffer_rsrc(
@@ -469,12 +454,8 @@ def compile_tile_kernel(block_size, softmax_scale):
                         )
                     )
 
-            operand_loads(
-                k_base, k_page_bytes, K_ROW, k_voff, K8, K_BASE + stage * K_STRIDE
-            )
-            operand_loads(
-                v_base, v_page_bytes, V_ROW, v_voff, V8, V_BASE + stage * V_STRIDE
-            )
+            operand_loads(k_base, K_ROW, k_voff, K8, K_BASE + stage * K_STRIDE)
+            operand_loads(v_base, V_ROW, v_voff, V8, V_BASE + stage * V_STRIDE)
             return loads
 
         for s in range_constexpr(STAGES - 1):
@@ -848,7 +829,7 @@ def compile_tile_kernel(block_size, softmax_scale):
                 for m in range_constexpr(M)
             ]
 
-            partial = kv_h * work_capacity + slot
+            partial = slot
             rinfo = fx.ptr_load(
                 fx.add_offset(fx.recast_iter(fx.Int32, reduce_ptr), seq * 2),
                 result_type=fx.Vector.make_type(2, fx.Int32),
@@ -866,7 +847,7 @@ def compile_tile_kernel(block_size, softmax_scale):
                 num_records_bytes=part_bytes(ROWS * DV * 4),
             )
             # The block's valid query rows of out; padded rows drop.
-            row_bytes = n_kv * (GQA * DV * 2)
+            row_bytes = GQA * DV * 2
             dout = ptr_buf_tensor(
                 uniform64(
                     buf_base_i64(out_ptr) + fx.Int64(first_row) * fx.Int64(row_bytes)
@@ -913,8 +894,8 @@ def compile_tile_kernel(block_size, softmax_scale):
                         pmax[row] = fx.Float32(mm * fx.Float32(1.0 / LOG2E))
                         psum[row] = fx.Float32(lt)
                     else:
-                        # Row of query q, head h in out [tokens, KV heads * GQA, DV].
-                        drow = (queries[m] * n_kv + kv_h) * GQA + l16
+                        # Row of query q, head h in out [tokens, GQA, DV].
+                        drow = queries[m] * GQA + l16
                         # Pack each 16-column block to bf16 (2 dwords a lane), then one
                         # v_permlane16_swap per dword pair of blocks (2k, 2k + 1) gives
                         # every lane 8 adjacent columns, so each dwordx4 store writes 64
@@ -1044,11 +1025,10 @@ def compile_tile_kernel(block_size, softmax_scale):
         out_ptr: fx.Pointer,
         reduce_ptr: fx.Pointer,
         ticket_ptr: fx.Pointer,
-        num_kv_heads: fx.Int32,
         n_ctas: fx.Int32,
     ):
         # Persistent CTAs: CTA b runs task b, then takes tickets (an atomic counter
-        # per KV head, zeroed by the plan) for tasks n_ctas, n_ctas + 1, ..., so
+        # zeroed by the plan) for tasks n_ctas, n_ctas + 1, ..., so
         # tasks still start in plan order (longest first) on whichever CTA frees up
         # first. The ticket reaches the other waves through the last LDS word of
         # stage 3, which the next task's DMA writes only after its prologue barriers.
@@ -1061,12 +1041,9 @@ def compile_tile_kernel(block_size, softmax_scale):
             shared_ptr(fx.Int32), fx.add_offset(lds, fx.make_int_tuple(total_bytes - 4))
         )
         work = fx.recast_iter(fx.Int32, work_info_ptr)
-        tick = fx.add_offset(
-            fx.recast_iter(fx.Int32, ticket_ptr), fx.Int32(fx.block_idx.y)
-        )
-        # Kernel arguments rather than grid_dim, which calls __ockl_get_num_groups (a
+        tick = fx.recast_iter(fx.Int32, ticket_ptr)
+        # A kernel argument rather than grid_dim, which calls __ockl_get_num_groups (a
         # real call, here inside the task loop, that pins registers across it).
-        n_kv = uniform(num_kv_heads)
         n_ctas = uniform(n_ctas)
         tid0 = fx.Int32(fx.thread_idx.x) == 0
         slot = uniform(fx.block_idx.x)
@@ -1096,10 +1073,8 @@ def compile_tile_kernel(block_size, softmax_scale):
                     end,
                     fx.Int32(task[3]),
                     slot,
-                    work_capacity,
                     out_ptr,
                     reduce_ptr,
-                    n_kv,
                 )
             if tid0:
                 t = fx.atomic_add(tick, fx.Int32(1), syncscope=fx.rocdl.SyncScope.Agent)
@@ -1123,7 +1098,6 @@ def compile_tile_kernel(block_size, softmax_scale):
         block_tables: fx.Pointer,
         out: fx.Pointer,
         max_blocks_per_seq: fx.Int32,
-        num_kv_heads: fx.Int32,
         stride_q_row: fx.Int32,
         stride_q_head: fx.Int32,
         work_info: fx.Pointer,
@@ -1152,7 +1126,6 @@ def compile_tile_kernel(block_size, softmax_scale):
             out,
             reduce_info,
             ticket,
-            num_kv_heads,
             n_ctas,
             # Packed FP32 softmax VALU stalls behind the sibling wave's MFMAs; with
             # it, 40-47 more SGPR spills and 13x the output error. 0.5.0's
@@ -1163,9 +1136,7 @@ def compile_tile_kernel(block_size, softmax_scale):
                     '#llvm.target_features<["-packed-fp32-ops"]>'
                 )
             },
-        ).launch(
-            grid=(n_ctas, num_kv_heads, 1), block=(NWAVES * WAVE, 1, 1), stream=stream
-        )
+        ).launch(grid=(n_ctas, 1, 1), block=(NWAVES * WAVE, 1, 1), stream=stream)
 
     pa_decode_pingpong_launch.compile_hints.update(waves_per_eu=2, fastmath="contract")
     # iterative-ilp re-schedules for latency.
@@ -1380,7 +1351,7 @@ def compile_plan(max_batch, threads):
 def compile_tail_reduce():
     """Merge the FP32 partials of each split block into its bf16 rows of out.
 
-    One 64-thread CTA per (block, KV head, row); lane p owns partition p's
+    One 64-thread CTA per (block, row); lane p owns partition p's
     statistics, and each lane reduces two adjacent output columns. Blocks with one
     task were stored by the tile kernel and are skipped.
     """
@@ -1401,19 +1372,15 @@ def compile_tail_reduce():
         max_logits_ptr: fx.Pointer,
         logits_ptr: fx.Pointer,
         stride_output_len: fx.Int32,
-        stride_output_kv_head: fx.Int32,
         stride_output_group_size: fx.Int32,
-        stride_exp_sums_head: fx.Int32,
         stride_exp_sums_part: fx.Int32,
-        stride_logits_head: fx.Int32,
         stride_logits_part: fx.Int32,
         stride_logits_group: fx.Int32,
         reduce_info_ptr: fx.Pointer,
         query_map_ptr: fx.Pointer,
     ):
         batch_idx = fx.block_idx.x
-        kv_head_idx = fx.block_idx.y
-        row_idx = fx.block_idx.z
+        row_idx = fx.block_idx.y
         unit = fx.thread_idx.x
         exp_sums = fx.recast_iter(fx.Float32, exp_sums_ptr)
         max_logits = fx.recast_iter(fx.Float32, max_logits_ptr)
@@ -1428,10 +1395,8 @@ def compile_tail_reduce():
         first_row = fx.Int32(qmap[batch_idx * 4])
         valid_rows = fx.Int32(qmap[batch_idx * 4 + 2])
         row_elem = (
-            (first_row + query_idx) * stride_output_len
-            + kv_head_idx * stride_output_kv_head
-            + group_idx * stride_output_group_size
-        )
+            first_row + query_idx
+        ) * stride_output_len + group_idx * stride_output_group_size
         first_part = fx.Int32(reduce_info[batch_idx * 2])
         part_count = fx.Int32(reduce_info[batch_idx * 2 + 1])
         # Padded query rows get an empty resource: their stores are dropped.
@@ -1448,11 +1413,7 @@ def compile_tail_reduce():
         # zero-fills partitions past the live count.
         logits = ptr_buf_tensor(
             buf_base_i64(logits_ptr)
-            + (
-                fx.Int64(first_part) * fx.Int64(stride_logits_part)
-                + fx.Int64(kv_head_idx) * fx.Int64(stride_logits_head)
-            )
-            * 4,
+            + fx.Int64(first_part) * fx.Int64(stride_logits_part) * 4,
             fx.Float32,
             unit_elems=elems,
             unit_stride=1,
@@ -1465,7 +1426,6 @@ def compile_tail_reduce():
             live = lane < part_count
             offset = (
                 first_part * stride_exp_sums_part
-                + kv_head_idx * stride_exp_sums_head
                 + live.select(lane, fx.Int32(0)) * stride_exp_sums_part
                 + row_idx
             )
@@ -1514,15 +1474,11 @@ def compile_tail_reduce():
         max_logits: fx.Pointer,
         logits: fx.Pointer,
         stride_output_len: fx.Int32,
-        stride_output_kv_head: fx.Int32,
         stride_output_group_size: fx.Int32,
-        stride_exp_sums_head: fx.Int32,
         stride_exp_sums_part: fx.Int32,
-        stride_logits_head: fx.Int32,
         stride_logits_part: fx.Int32,
         stride_logits_group: fx.Int32,
         blocks: fx.Int32,
-        num_kv_heads: fx.Int32,
         reduce_info: fx.Pointer,
         query_map: fx.Pointer,
         stream: fx.Stream,
@@ -1533,17 +1489,14 @@ def compile_tail_reduce():
             max_logits,
             logits,
             stride_output_len,
-            stride_output_kv_head,
             stride_output_group_size,
-            stride_exp_sums_head,
             stride_exp_sums_part,
-            stride_logits_head,
             stride_logits_part,
             stride_logits_group,
             reduce_info,
             query_map,
         ).launch(
-            grid=(blocks, num_kv_heads, _QUERY_BLOCK * _GQA),
+            grid=(blocks, _QUERY_BLOCK * _GQA, 1),
             block=(threads, 1, 1),
             stream=stream,
         )
@@ -1600,6 +1553,8 @@ def run(
     q, k, v, out, cu_seqlens_q, seqused_k, block_table, softmax_scale, workspace, num_cu
 ):
     """Launch the specialization on caller-owned, graph-stable workspace."""
+    if k.shape[2] != 1 or q.shape[1] != _GQA:
+        raise RuntimeError("the optimized varlen kernel takes one KV head")
     spec = workspace_requirements(q.shape[0], seqused_k.numel(), num_cu)
     if spec is None:
         raise RuntimeError("the optimized varlen kernel requires a direct-output plan")
@@ -1661,7 +1616,6 @@ def run(
         ptr_arg(block_table, fx.Int32),
         ptr_arg(out, fx.BFloat16),
         int(block_table.shape[1]),
-        1,
         int(q.stride(0)),
         int(q.stride(1)),
         ptr_arg(work_info, fx.Int32),
@@ -1681,15 +1635,11 @@ def run(
         ptr_arg(pmax, fx.Float32),
         flyc.from_c_void_p(fx.Float32, pout_addr),
         out.stride(0),
-        _GQA * out.stride(1),
         out.stride(1),
-        capacity * rows,
         rows,
-        capacity * slot_elems,
         slot_elems,
         _VALUE_DIM,
         blocks,
-        1,
         ptr_arg(reduce_info[tail_lo:], fx.Int32),
         ptr_arg(query_map[tail_lo:], fx.Int32),
         stream,

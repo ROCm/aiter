@@ -14,7 +14,10 @@ import aiter.ops.triton.attention.unified_attention as triton_ua
 from aiter.ops.flydsl import unified_attention_bf16 as flydsl_ua
 from aiter.ops.flydsl import unified_attention_varlen
 from aiter.ops.flydsl.kernels.pa_decode_pingpong import compile_pa_decode_pingpong
-from aiter.ops.flydsl.kernels.pa_decode_plan import build_query_block_map
+from aiter.ops.flydsl.kernels.pa_decode_plan import (
+    build_query_block_map,
+    compile_query_block_map,
+)
 from aiter.ops.unified_attention import release_flydsl_resources, unified_attention
 
 pytestmark = pytest.mark.skipif(
@@ -256,10 +259,12 @@ def test_release_frees_workspaces_and_kernels(route_spy):
     _call(q, k, v, out, cu, used, table, qlen=1, backend="flydsl")
     torch.cuda.synchronize()
     assert torch.cuda.memory_allocated() > baseline
+    assert compile_query_block_map.cache_info().currsize > 0
     release_flydsl_resources()
     assert torch.cuda.memory_allocated() == baseline
     assert flydsl_ua._WORKSPACES == {}
     assert compile_pa_decode_pingpong.cache_info().currsize == 0
+    assert compile_query_block_map.cache_info().currsize == 0
     out.zero_()
     _call(q, k, v, out, cu, used, table, qlen=1, backend="flydsl")
     _check(out, _reference(q, k, v, used, table, 1))
@@ -579,8 +584,10 @@ def test_varlen_optimized_tail_reduction_matches_reference(prefix, parts, route_
 
 
 @pytest.mark.skipif(torch.cuda.device_count() < 2, reason="needs two GPUs")
-def test_routes_run_on_each_device_in_turn(route_spy):
-    # The same geometries on cuda:0 then cuda:1 reuse each launcher.
+@pytest.mark.parametrize("set_current", [True, False], ids=["current", "cuda0-current"])
+def test_routes_run_on_each_device_in_turn(set_current, route_spy):
+    # The same geometries on cuda:0 then cuda:1 reuse each launcher, whether or
+    # not the caller made the tensors' device current.
     cases = [
         ("flydsl", lambda: _inputs((300, 4097), 64), {}),
         ("flydsl", lambda: _inputs((300, 4097), 64), {"window_size": WINDOW}),
@@ -591,20 +598,23 @@ def test_routes_run_on_each_device_in_turn(route_spy):
         for i in range(2)
     ):
         cases.append(("optimized", lambda: _ragged_inputs((8192,), (8192,), 128), {}))
+    torch.cuda.set_device(0)
     for device in range(2):
-        with torch.cuda.device(device):
-            for route, make, kw in cases:
-                route_spy.clear()
+        for route, make, kw in cases:
+            route_spy.clear()
+            with torch.cuda.device(device):
                 q, k, v, out, cu, used, table = make()
-                qlen = int((cu[1:] - cu[:-1]).max())
+            qlen = int((cu[1:] - cu[:-1]).max())
+            with torch.cuda.device(device if set_current else 0):
                 _call(q, k, v, out, cu, used, table, qlen=qlen, backend="flydsl", **kw)
-                torch.cuda.synchronize()
-                assert route_spy == [route]
-                window = WINDOW[0] + 1 if "window_size" in kw else 0
+            torch.cuda.synchronize(device)
+            assert route_spy == [route]
+            window = WINDOW[0] + 1 if "window_size" in kw else 0
+            with torch.cuda.device(device):
                 ref = _reference(
                     q, k, v, used, table, cu_seqlens_q=cu.cpu(), window=window
                 )
-                _check(out, ref)
+            _check(out, ref)
 
 
 def test_disabled_by_environment(monkeypatch, route_spy):

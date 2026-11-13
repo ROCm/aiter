@@ -355,14 +355,18 @@ _COLD_CAPTURE_WARNED: set = set()
 
 
 def release_flydsl_resources() -> None:
-    """Free the workspaces and compiled kernels FlyDSL unified attention keeps.
+    """Free the workspaces and the kernels only FlyDSL unified attention compiles.
 
     Workspaces (including allocations pinned for captured graphs) and compiled
-    kernels otherwise live for the whole process. Call only once no CUDA graph
-    that captured a FlyDSL unified-attention call will replay again: replays read
-    the freed workspaces, and dropping a compiled kernel unloads its HIP module.
-    The next call allocates and compiles again, so capture once more needs an
-    uncaptured warmup.
+    kernels otherwise live for the whole process. The PA decode planner and
+    reducer (``compile_pa_decode_plan``, ``compile_pa_decode_ps_reduce``) are
+    shared with ``pa_decode`` and stay cached.
+
+    Call only once no CUDA graph that captured a FlyDSL unified-attention call
+    will replay again: replays read the freed workspaces, and dropping a compiled
+    kernel unloads its HIP module. Do not call it concurrently with a
+    unified-attention call on any thread or stream. The next call allocates and
+    compiles again, so capture once more needs an uncaptured warmup.
     """
     import sys
 
@@ -370,6 +374,7 @@ def release_flydsl_resources() -> None:
     _COLD_CAPTURE_WARNED.clear()
     for name, factories in (
         (f"{__package__}.kernels.pa_decode_pingpong", ("compile_pa_decode_pingpong",)),
+        (f"{__package__}.kernels.pa_decode_plan", ("compile_query_block_map",)),
         (
             f"{__package__}.unified_attention_varlen",
             ("compile_tile_kernel", "compile_plan", "compile_tail_reduce"),
@@ -484,29 +489,30 @@ def _unified_attention_varlen_optimized(
     if spec is None:
         return None
     need, _, _, _ = spec
-    workspace = _workspace(
-        q,
-        "varlen_optimized",
-        need,
-        f"{seqused_k.numel()} sequences, {q.shape[0]} query tokens",
-        explicit,
-    )
-    if workspace is None:
-        return None
-    if torch.cuda.is_current_stream_capturing():
-        workspace["captured"] = True
-    return unified_attention_varlen.run(
-        q,
-        k,
-        v,
-        out,
-        cu_seqlens_q,
-        seqused_k,
-        block_table,
-        softmax_scale,
-        workspace,
-        num_cu,
-    )
+    with torch.cuda.device(q.device):
+        workspace = _workspace(
+            q,
+            "varlen_optimized",
+            need,
+            f"{seqused_k.numel()} sequences, {q.shape[0]} query tokens",
+            explicit,
+        )
+        if workspace is None:
+            return None
+        if torch.cuda.is_current_stream_capturing():
+            workspace["captured"] = True
+        return unified_attention_varlen.run(
+            q,
+            k,
+            v,
+            out,
+            cu_seqlens_q,
+            seqused_k,
+            block_table,
+            softmax_scale,
+            workspace,
+            num_cu,
+        )
 
 
 def _unified_attention_varlen(
@@ -922,9 +928,9 @@ def unified_attention_flydsl(
             block_table,
             explicit,
         )
-    # Main's shared PA decode uses its native vectorized K/V layout. Reuse the
-    # query-mapped ping-pong path for this route's linear cache; uniform batches
-    # are a strict subset of its varlen plan.
+    # pa_decode takes the vectorized rank-5 K/V layout, not this linear cache, so
+    # uniform batches run the varlen ping-pong path with one query block per
+    # sequence.
     return _unified_attention_varlen(
         q,
         k,

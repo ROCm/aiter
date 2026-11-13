@@ -164,9 +164,10 @@ def unified_attention(
 
 
 def release_flydsl_resources():
-    """Free FlyDSL's process-lifetime workspaces and compiled kernels.
+    """Free FlyDSL unified attention's workspaces and the kernels only it compiles.
 
-    Only once no captured CUDA graph containing a FlyDSL call will replay; see
+    Only once no captured CUDA graph containing a FlyDSL call will replay, and
+    never concurrently with a call; see
     ``aiter.ops.flydsl.unified_attention_bf16.release_flydsl_resources``.
     """
     import sys
