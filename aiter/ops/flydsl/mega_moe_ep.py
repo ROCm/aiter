@@ -32,9 +32,9 @@ __all__ = ["MegaMoeEP", "MegaMoeEPConfig", "ep_reference", "mega_moe_ep_supporte
 def mega_moe_ep_supported(gfx: str | None = None) -> bool:
     """Whether this device has the kernel (gfx950)."""
     if gfx is None:
-        from aiter.jit.utils.chip_info import get_gfx
+        from aiter.jit.utils.chip_info import get_gfx_runtime
 
-        gfx = get_gfx()
+        gfx = get_gfx_runtime()
     return gfx == "gfx950"
 
 
@@ -136,8 +136,12 @@ class MegaMoeEP:
     def set_weights(
         self, *, w1, w1_scale, w2, w2_scale, preshuffled: bool = False
     ) -> None:
-        """Run the next forwards on another layer's weights of the same shape
-        (``preshuffled``: as in the constructor)."""
+        """Run the next forwards on another layer's weights of the same shape.
+
+        Binds by pointer, so the weights must be in the kernel layout
+        (``preshuffled=True``, as in the constructor) and stay alive while a forward
+        or a graph captured after this call can read them; natural weights are
+        refused. A graph captured before keeps the weights it was captured with."""
         self.engine.set_weights(w1, w1_scale, w2, w2_scale, preshuffled)
 
     def error_flag(self):

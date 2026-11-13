@@ -61,13 +61,14 @@ def _dequant_expert(weight, scale, rows, cols):
     return values * scales.repeat_interleave(32, dim=-1)
 
 
-def _all_gather_variable(tensor, token_counts=None):
-    """All-gather rows across ranks with per-rank variable counts (pad, gather, trim)."""
-    world = dist.get_world_size()
+def _all_gather_variable(tensor, token_counts=None, group=None):
+    """All-gather rows across the ranks of ``group`` with per-rank variable counts
+    (pad, gather, trim)."""
+    world = dist.get_world_size(group=group)
     if token_counts is None:
         local = torch.tensor(tensor.shape[0], dtype=torch.int64, device=tensor.device)
         counts = [torch.empty_like(local) for _ in range(world)]
-        dist.all_gather(counts, local)
+        dist.all_gather(counts, local, group=group)
         token_counts = [int(c.item()) for c in counts]
     max_count = max(token_counts)
     if tensor.shape[0] < max_count:
@@ -78,7 +79,7 @@ def _all_gather_variable(tensor, token_counts=None):
         )
         tensor = torch.cat((tensor, padding))
     gathered = [torch.empty_like(tensor) for _ in range(world)]
-    dist.all_gather(gathered, tensor)
+    dist.all_gather(gathered, tensor, group=group)
     return torch.cat([v[:c] for v, c in zip(gathered, token_counts)]), token_counts
 
 
@@ -98,6 +99,7 @@ def ep_reference(
     act="silu",
     situ_beta=1.0,
     situ_linear_beta=1.0,
+    group=None,
 ):
     """Pure-torch EP MoE oracle: dispatch (all-gather +
     route to the expert owner) -> per-local-expert GEMM1 + act + GEMM2 scaled by the
@@ -105,14 +107,15 @@ def ep_reference(
 
     ``ref_weights`` are the *unshuffled* quantized weights
     ``(w1_q, w1_scale, w2_q, w2_scale)`` (see
-    ``test_mega_moe_ep.local_weights``). Collective when torch.distributed is initialized and
+    ``test_mega_moe_ep.local_weights``). Collective over the EP ``group`` (``rank`` /
+    ``world_size`` are its rank / size) when torch.distributed is initialized and
     ``world_size > 1``; otherwise a single-process local MoE (all experts local).
     """
     distributed = world_size > 1 and dist.is_available() and dist.is_initialized()
     if distributed:
-        x_all, token_counts = _all_gather_variable(x)
-        weights_all, _ = _all_gather_variable(route_weights, token_counts)
-        ids_all, _ = _all_gather_variable(ids, token_counts)
+        x_all, token_counts = _all_gather_variable(x, group=group)
+        weights_all, _ = _all_gather_variable(route_weights, token_counts, group)
+        ids_all, _ = _all_gather_variable(ids, token_counts, group)
     else:
         x_all, weights_all, ids_all = x, route_weights, ids
         token_counts = [x.shape[0]]
@@ -145,7 +148,7 @@ def ep_reference(
         out = (hidden @ w2.T) * weights_all[rows, slots, None]
         partial.index_add_(0, rows, out)
     if distributed:
-        dist.all_reduce(partial)
+        dist.all_reduce(partial, group=group)
         start = sum(token_counts[:rank])
         return partial[start : start + x.shape[0]]
     return partial
@@ -388,9 +391,20 @@ class MegaMoeEPEngine:
         self.w2_scale = shuffle_scale_a16w4(
             w2_scale.reshape(-1, self.I // 32).contiguous(), self.epr, False
         ).contiguous()
+        # Live as long as the instance: a graph captured with them keeps their
+        # pointers after set_weights binds other weights.
+        self._construction_weights = (self.w1, self.w1_scale, self.w2, self.w2_scale)
 
     def set_weights(self, w1, w1_scale, w2, w2_scale, preshuffled=False):
-        self._bind_weights(w1, w1_scale, w2, w2_scale, preshuffled)
+        # Launches and captured graphs keep the bound pointers, so a shuffled copy
+        # made here would be freed while a graph still reads it.
+        if not preshuffled:
+            raise ValueError(
+                "MegaMoeEP.set_weights binds by pointer: pass the weights in the "
+                "kernel layout (shuffle_weight_a16w4 / shuffle_scale_a16w4) with "
+                "preshuffled=True and keep them alive"
+            )
+        self._bind_weights(w1, w1_scale, w2, w2_scale, preshuffled=True)
 
     def _fit_mt(self, m, small):
         # The pipelined GEMM1 packs rows in pairs (MfmaScaleGU / AScaleLoader use
@@ -461,19 +475,20 @@ class MegaMoeEPEngine:
         forward() runs this on its first call (must not be under CUDA graph capture)."""
         if self._armed:
             return
-        if torch.cuda.is_current_stream_capturing():
-            raise RuntimeError(
-                "MegaMoeEP: first forward inside CUDA graph capture; call prepare() "
-                "(or run forward eagerly) first"
-            )
-        stream = torch.cuda.current_stream()
-        for cfg in self._variants():
-            _preload_compiled(
-                self._launcher(cfg),
-                *self._launch_args(0, None, None, None, None, None),
-                stream,
-            )
-        torch.cuda.synchronize(self.device)
+        with torch.cuda.device(self.device):
+            if torch.cuda.is_current_stream_capturing():
+                raise RuntimeError(
+                    "MegaMoeEP: first forward inside CUDA graph capture; call "
+                    "prepare() (or run forward eagerly) first"
+                )
+            stream = torch.cuda.current_stream(self.device)
+            for cfg in self._variants():
+                _preload_compiled(
+                    self._launcher(cfg),
+                    *self._launch_args(0, None, None, None, None, None),
+                    stream,
+                )
+            torch.cuda.synchronize(self.device)
         self.arena.barrier()
         self._armed = True
 
@@ -517,6 +532,7 @@ class MegaMoeEPEngine:
             act=self.act,
             situ_beta=self.situ[0],
             situ_linear_beta=self.situ[1],
+            group=self.group,
         )
 
     def _launch_args(self, m, x, x_scale, topk_ids, topk_weights, out):
@@ -590,11 +606,20 @@ class MegaMoeEPEngine:
             )
         if any(t.device != self.device for t in (x_bf16, wts, topk_ids)):
             raise ValueError(f"x_bf16, wts and topk_ids must be on {self.device}")
+        if stream is not None and stream.device != self.device:
+            raise ValueError(f"stream is on {stream.device}, not {self.device}")
         del mask_invalid_slots  # -1 / >= experts top-k slots are always skipped in-kernel
         self.prepare()
+        with torch.cuda.device(self.device):
+            return self._forward(x_bf16, wts, topk_ids, stream, slice_output)
+
+    __call__ = forward
+
+    def _forward(self, x_bf16, wts, topk_ids, stream, slice_output):
+        run_tokens = int(x_bf16.shape[0])
         cfg = self.config(run_tokens)
         fn = self._launcher(cfg)
-        cur = torch.cuda.current_stream()
+        cur = torch.cuda.current_stream(self.device)
         if stream is None:
             stream = cur
         elif stream != cur:
@@ -646,8 +671,6 @@ class MegaMoeEPEngine:
             fn, *self._launch_args(run_tokens, x_q, x_scale, topk_ids, wts, out), stream
         )
         return out[:run_tokens] if slice_output else out
-
-    __call__ = forward
 
     # --- sticky error word / lifecycle ---
     def poll_errors(self):
