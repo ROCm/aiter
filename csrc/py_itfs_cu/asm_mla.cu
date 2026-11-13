@@ -602,6 +602,15 @@ MlaAsmDecodeCfg mla_asm_decode_config(const std::string& arch_id,
     if(c.status != MlaAsmStatus::Ok)
         return c;
 
+    if(arch_id == "gfx950" && q_type == "bf16" && kv_type == "bf16" &&
+       gqa_ratio == 32 && max_seqlen_q == 4 && page_size == 1 &&
+       !persistent && !causal && !has_cprr)
+    {
+        c.qseqlen = 4;
+        c.causal  = 0;
+        c.sub_q   = 128;
+    }
+
     c.kernel = try_get_heuristic_kernel_mla(q_type,
                                             kv_type,
                                             c.gqa,
@@ -1502,7 +1511,9 @@ AITER_CTYPES_DEFINE_ENTRYPOINT_VOID(
                               persistent,
                               causal != 0,
                               lse != nullptr,
-                              g_kv_indptr != nullptr && g_kv_indptr->data_ptr() != nullptr);
+                              g_kv_indptr != nullptr && g_kv_indptr->data_ptr() != nullptr,
+                              kv_shuffled != 0,
+                              page_size);
     AITER_CHECK(dcfg.status != MlaAsmStatus::RemapReject, __func__, dcfg.reason);
     AITER_CHECK(
         dcfg.max_q_x_kv_split == 0 || kv_split == 1 ||

@@ -1221,8 +1221,21 @@ def mla_decode_fwd(
 
     io_transformed = False
     qseqlen_folded = False
+    heads_as_queries = False
 
     if not persistent_mode:
+        heads_as_queries = (
+            nhead == 128
+            and nhead_kv == 1
+            and max_seqlen_q == 1
+            and page_size == 1
+            and q.dtype == dtypes.bf16
+            and kv_buffer.dtype == dtypes.bf16
+            and g_kv_indptr is None
+            and cp_world_size == 1
+            and cp_rank == 0
+            and get_gfx() == "gfx950"
+        )
         if kv_shuffled_flag:
             if num_kv_splits is None:
                 if total_kv == 0:
@@ -1248,6 +1261,14 @@ def mla_decode_fwd(
             num_kv_splits, num_kv_splits_indptr = get_meta_param(
                 num_kv_splits, bs, total_kv, nhead, max_seqlen_q, q.dtype
             )
+        if heads_as_queries:
+            q = q.view(total_s * 4, 32, qk_head_dim)
+            o = o.view(total_s * 4, 32, v_head_dim)
+            qo_indptr = qo_indptr * 4
+            total_s *= 4
+            nhead = 32
+            max_seqlen_q = 4
+            causal = False
         mgc = (
             64
             if nhead in [8, 16]
@@ -1283,7 +1304,10 @@ def mla_decode_fwd(
             nhead == 32
             and q.dtype == dtypes.bf16
             and kv_buffer.dtype == dtypes.bf16
-            and max_seqlen_q == 1
+            and (
+                max_seqlen_q == 1
+                or (max_seqlen_q == 4 and page_size == 1 and not causal)
+            )
             and get_gfx() == "gfx950"
         ):
             mgc = 32
@@ -1410,6 +1434,11 @@ def mla_decode_fwd(
                 )
             )
         ):
+            if heads_as_queries:
+                return (
+                    logits.view(ori_total_s, 1, ori_nhead, v_head_dim),
+                    final_lse.view(ori_total_s, ori_nhead) if return_lse else None,
+                )
             lse = final_lse if return_lse else attn_lse
             return logits.view(total_s, nhead, v_head_dim), lse
 
@@ -1687,6 +1716,15 @@ def mla_decode_fwd(
             o,
             final_lse,
         )
+
+    if heads_as_queries:
+        logits = (
+            logits.view(ori_total_s, 4, num_kv_splits, 32, v_head_dim)
+            .permute(0, 2, 1, 3, 4)
+            .reshape(ori_total_s, num_kv_splits, ori_nhead, v_head_dim)
+        )
+        if final_lse is not None:
+            final_lse = final_lse.view(ori_total_s, ori_nhead)
 
     if io_transformed:
         if return_logits:

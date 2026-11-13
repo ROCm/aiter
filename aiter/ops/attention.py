@@ -2163,6 +2163,23 @@ def _get_mla_decode_shape_support_cached(
     asm_heads = (
         p.kernel_num_heads if persistent and backend is MlaBackend.ASM else num_heads
     )
+    heads_as_queries = (
+        arch == "gfx950"
+        and q_type == "bf16"
+        and kv_type == "bf16"
+        and num_heads == 128
+        and max_seqlen_qo == 1
+        and page_size == 1
+        and not persistent
+        and cp_world_size == 1
+        and not cp_round_robin
+    )
+    asm_qlen = max_seqlen_qo
+    asm_causal = causal
+    if heads_as_queries:
+        asm_heads = 32
+        asm_qlen = 4
+        asm_causal = False
     asm_status, asm_kernel = MlaAsmStatus.NOT_ASM, None
     # Stage 1 picks its cprr kernel from g_kv_indptr, PS1 from cp_world_size > 1.
     cprr = cp_round_robin if backend is MlaBackend.ASM else cp_world_size > 1
@@ -2175,9 +2192,9 @@ def _get_mla_decode_shape_support_cached(
                     kv_type,
                     asm_heads,
                     1,
-                    max_seqlen_qo,
+                    asm_qlen,
                     persistent,
-                    causal,
+                    asm_causal,
                     return_lse,
                     cprr,
                     page_size,
@@ -2279,11 +2296,16 @@ def _get_mla_decode_shape_support_cached(
         flydsl_ps1=flydsl_ps1,
         planner=planner,
         planner_accepts=planner_accepts,
-        natively_supported=p.natively_supported,
-        fold_factor=p.qk_batch_ratio,
-        seqlen_fold=p.seqlen_fold,
-        native=p.natively_supported and p.qk_batch_ratio == 1 and p.seqlen_fold == 1,
-        kernel_num_heads=p.kernel_num_heads,
+        natively_supported=p.natively_supported and not heads_as_queries,
+        fold_factor=1 if heads_as_queries else p.qk_batch_ratio,
+        seqlen_fold=4 if heads_as_queries else p.seqlen_fold,
+        native=(
+            not heads_as_queries
+            and p.natively_supported
+            and p.qk_batch_ratio == 1
+            and p.seqlen_fold == 1
+        ),
+        kernel_num_heads=32 if heads_as_queries else p.kernel_num_heads,
         reduce_supported=p.reduce_supported,
         backend=backend,
         asm_status=asm_status,
@@ -2330,6 +2352,8 @@ def get_mla_decode_shape_support(
     mla_decode_fwd runs gfx950 bf16 16-head single-token decode non-persistent
     at batch >= AITER_MLA_DECODE_PERSISTENT_MAX_BATCH; persistent=False
     describes that route.
+    Non-persistent gfx950 BF16 QH128/Q1 with page_size=1 and no context
+    parallelism is folded into QH32/Q4 with the causal mask disabled.
     arch=None uses the current device's arch; an explicit arch needs no device,
     but asm availability is only known for arches compiled into the build.
     enable_experimental and flydsl_ps1 default to the AITER_ENABLE_EXPERIMENTAL
