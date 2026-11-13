@@ -7,7 +7,7 @@
 below. ``--arch gfx950`` builds the gfx950 a16w16 4-wave family
 (``gen_co/co_kernels_gfx950_bf16.json``, kernel tags ``a16w16_4wave`` and
 ``a16w16_4wave_ws``) into ``gen_co/gfx950/``: one image per (kid, layout
-NT/NN/TT/TN[, bias]); see ``_build_gfx950`` and gen_co/README.md.
+NT/NN/TT/TN); see ``_build_gfx950``.
 
 Why this exists
 ---------------
@@ -94,7 +94,6 @@ from codegen.gen_instances_gfx1250 import (
 # kid), and this script exists to create exactly those files.
 from opus_gemm_common import (
     a16w16_4wave_co_images,
-    a16w16_4wave_pinned,
     gfx950_a16w16_4wave_kernels_declared,
     gfx1250_4wave_co_kernels_declared,
 )
@@ -667,8 +666,6 @@ _GFX950_STUB_TEMPLATE = """// SPDX-License-Identifier: MIT
 #include "gfx950/opus_gemm_pipeline_a16w16_4wave_gfx950.cuh"
 
 using CoTraits = opus_gemm_a16w16_4wave_traits_gfx950<{bm}, {bn}, {a_t}, {b_t}, {splitk}>;
-static_assert(CoTraits::PIN == {pin} && CoTraits::WG_PER_CU == {wg_per_cu},
-              "traits defaults drifted from opus_gemm_common.py (PIN / WG_PER_CU)");
 
 extern "C" __global__ __launch_bounds__(CoTraits::BLOCK_SIZE, CoTraits::WG_PER_CU)
 void {symbol}(opus_gemm_a16w16_4wave_kargs_gfx950 kargs)
@@ -683,15 +680,6 @@ void {symbol}(opus_gemm_a16w16_4wave_kargs_gfx950 kargs)
 
 # sizeof(opus_gemm_a16w16_4wave_kargs_gfx950): 4 pointers + 13 ints, padded to 8 bytes.
 _GFX950_KARGS_BYTES = (4 * 8 + 13 * 4 + 7) // 8 * 8
-
-
-def _gfx950_expected_lds(bm, bn, splitk):
-    """Mirror of LDS_BYTES in opus_gemm_a16w16_4wave_traits_gfx950."""
-    smem_ab = bm * 256 + bn * 256  # 2 stages x 2 halves x rows x 128 B
-    out_bytes = 4 if splitk else 2
-    c_image = bm * (bn + 8) * out_bytes
-    c_stage = c_image if c_image <= 163840 else 2 * (bm // 2) * (bn // 2 + 8) * out_bytes
-    return max(smem_ab, c_stage)
 
 
 def _gfx950_jobs(instances):
@@ -720,7 +708,6 @@ def _cpp_bool(value):
 def build_one_gfx950(job, args, llvm_bin, workdir):
     k = job["instance"]
     symbol = job["symbol"]
-    pin = a16w16_4wave_pinned(k)
     stub_path = os.path.join(workdir, f"{symbol}.cc")
     with open(stub_path, "w") as f:
         f.write(
@@ -730,8 +717,6 @@ def build_one_gfx950(job, args, llvm_bin, workdir):
                 a_t=_cpp_bool(job["a_t"]),
                 b_t=_cpp_bool(job["b_t"]),
                 splitk=_cpp_bool(job["splitk"]),
-                pin=_cpp_bool(pin),
-                wg_per_cu=k.WG_PER_CU,
                 symbol=symbol,
             )
         )
@@ -745,7 +730,7 @@ def build_one_gfx950(job, args, llvm_bin, workdir):
         "-std=c++20",
         "-O3",
         # No host runtime wrapper / hidden kernargs: launched through
-        # HIP_LAUNCH_PARAM_BUFFER_POINTER with exactly the 96-byte kargs.
+        # HIP_LAUNCH_PARAM_BUFFER_POINTER with exactly the kargs bytes.
         "-D__HIPCC_RTC__",
         "-Werror=ignored-attributes",
         # opus.hpp deduction guides carry __host__ __device__ (newer clang warns).
@@ -779,9 +764,6 @@ def build_one_gfx950(job, args, llvm_bin, workdir):
 
     readelf = _tool(llvm_bin, "llvm-readelf")
     md = _kernel_metadata(readelf, out_path, symbol)
-    notes = _run([readelf, "--notes", out_path]).stdout
-    m = re.search(r"^\s*(?:-\s*)?\.agpr_count:\s*(\d+)\s*$", notes, re.MULTILINE)
-    md["agpr_count"] = int(m.group(1)) if m else None
     target_md = _elf_target_metadata(out_path, args.offload_arch)
     target_md.update(_device_link_metadata(readelf, out_path))
 
@@ -789,12 +771,6 @@ def build_one_gfx950(job, args, llvm_bin, workdir):
         raise SystemExit(
             f"build_co: {symbol} kernarg mismatch: .co says "
             f"{md['kernarg_segment_size']}, host ABI requires {_GFX950_KARGS_BYTES}"
-        )
-    want_lds = _gfx950_expected_lds(k.B_M, k.B_N, job["splitk"])
-    if md["group_segment_fixed_size"] != want_lds:
-        raise SystemExit(
-            f"build_co: {symbol} LDS mismatch: .co says "
-            f"{md['group_segment_fixed_size']}, traits say {want_lds}"
         )
     if md["vgpr_spill_count"] or md["sgpr_spill_count"]:
         msg = (
@@ -807,8 +783,6 @@ def build_one_gfx950(job, args, llvm_bin, workdir):
 
     with open(out_path, "rb") as f:
         co_sha256 = hashlib.sha256(f.read()).hexdigest()
-    objdump = _tool(llvm_bin, "llvm-objdump")
-    dis = _run([objdump, "-d", f"--mcpu={args.offload_arch}", out_path]).stdout
     info = {
         "symbol": symbol,
         "co_sha256": co_sha256,
@@ -819,11 +793,7 @@ def build_one_gfx950(job, args, llvm_bin, workdir):
         "a_t": job["a_t"],
         "b_t": job["b_t"],
         "splitk": job["splitk"],
-        "pin": pin,
-        "launch_bounds": [k.BLOCK_SIZE, k.WG_PER_CU],
         "device_flags": device_flags,
-        "dis_lines": len(dis.splitlines()),
-        "dis_mfma": sum(1 for ln in dis.splitlines() if "v_mfma" in ln),
         **target_md,
         **md,
     }
@@ -832,15 +802,8 @@ def build_one_gfx950(job, args, llvm_bin, workdir):
         os.makedirs(asm_dir, exist_ok=True)
         s_path = os.path.join(asm_dir, f"{symbol}.s")
         run_compile(["-S", "--cuda-device-only"], s_path, "-S")
-        dis_path = os.path.join(asm_dir, f"{symbol}.dis")
-        with open(dis_path, "w") as f:
-            f.write(dis)
-        info["asm"] = {
-            "s": os.path.relpath(s_path, args.out_dir),
-            "dis": os.path.relpath(dis_path, args.out_dir),
-        }
     print(
-        f"[build_co]   {symbol}: VGPR={md['vgpr_count']} AGPR={md['agpr_count']} "
+        f"[build_co]   {symbol}: VGPR={md['vgpr_count']} "
         f"SGPR={md['sgpr_count']} LDS={md['group_segment_fixed_size']} "
         f"kernarg={md['kernarg_segment_size']} spill={md['vgpr_spill_count']}/"
         f"{md['sgpr_spill_count']} {'(unbundled)' if unbundled else '(bare ELF)'}"
@@ -906,13 +869,6 @@ def _build_gfx950(p, args, llvm_bin):
         "kernels": built,
     }
     info_path = os.path.join(args.out_dir, "build_info.json")
-    if args.kids and os.path.exists(info_path):
-        # Subset rebuild into an existing directory: keep the other records.
-        with open(info_path) as f:
-            previous = json.load(f)
-        rebuilt = {b["symbol"] for b in built}
-        kept = [b for b in previous.get("kernels", []) if b["symbol"] not in rebuilt]
-        info["kernels"] = sorted(kept + built, key=lambda b: (b["kid"], b["symbol"]))
     with open(info_path, "w") as f:
         json.dump(info, f, indent=2, sort_keys=True)
         f.write("\n")

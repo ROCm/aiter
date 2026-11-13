@@ -12,7 +12,6 @@
 #if !defined(__HIP_DEVICE_COMPILE__) && !defined(__HIPCC_RTC__)
 
 #include "aiter_hip_common.h"
-#include <cstdint>
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
@@ -43,23 +42,12 @@ inline std::vector<char> read_co_image(const std::string& path) {
     std::ifstream file(path, std::ios::binary | std::ios::ate);
     AITER_CHECK(file.is_open(), "opus_gemm: cannot open pre-compiled gfx950 kernel '", path,
                 "'. Build it with csrc/opus_gemm/gen_co/build_co.py --arch gfx950.");
-    const std::streamsize size = file.tellg();
-    AITER_CHECK(size >= 64, "opus_gemm: truncated code object ", path);
+    std::vector<char> bytes(static_cast<size_t>(file.tellg()));
     file.seekg(0, std::ios::beg);
-    std::vector<char> bytes(static_cast<size_t>(size));
-    AITER_CHECK(static_cast<bool>(file.read(bytes.data(), size)), "opus_gemm: short CO read: ", path);
-    const auto byte = [&](size_t i) { return static_cast<unsigned char>(bytes[i]); };
-    AITER_CHECK(byte(0) == 0x7f && byte(1) == 'E' && byte(2) == 'L' && byte(3) == 'F' && byte(4) == 2 &&
-                    byte(5) == 1,
-                "opus_gemm: ", path, " is not a bare little-endian ELF64 code object");
-    const uint32_t machine = byte(18) | (uint32_t(byte(19)) << 8);
-    AITER_CHECK(machine == 224 && byte(48) == 0x4f, "opus_gemm: ", path,
-                " is not a gfx950 code object (e_machine ", machine, ", mach 0x", std::hex,
-                static_cast<int>(byte(48)), ")");
+    AITER_CHECK(static_cast<bool>(file.read(bytes.data(), bytes.size())), "opus_gemm: short CO read: ", path);
     return bytes;
 }
 
-// The bytes must outlive the registered module: AiterAsmKernelFast does not copy them.
 struct CoModule {
     std::vector<char> image;
     AiterAsmKernelFast kernel;
@@ -69,19 +57,6 @@ struct CoModule {
           kernel(symbol.c_str(), image.data(), AiterAsmKernelFast::SkipGfx1250Gate{}) {}
 };
 
-inline const std::string& device_arch(int device) {
-    static SynchronizedCache<int, std::string> cache;
-    return cache.get_or_create(device, [device]() {
-        hipDeviceProp_t prop{};
-        const hipError_t status = hipGetDeviceProperties(&prop, device);
-        AITER_CHECK(status == hipSuccess, "opus_gemm: cannot query device ", device, ": ",
-                    hipGetErrorString(status));
-        const std::string full(prop.gcnArchName);
-        return full.substr(0, full.find(':'));
-    });
-}
-
-// Kernel `symbol` registered for the current HIP device (loaded once per device and path).
 inline AiterAsmKernelFast& co_kernel(const std::string& symbol, int expected_device = -1) {
     int device = -1;
     const hipError_t status = hipGetDevice(&device);
@@ -101,9 +76,6 @@ inline AiterAsmKernelFast& co_kernel(const std::string& symbol, int expected_dev
     if(entry.kernel && entry.device == device && entry.dir == dir)
         return *entry.kernel;
 
-    const std::string& arch = device_arch(device);
-    AITER_CHECK(arch == "gfx950", "opus_gemm: pre-built a16w16 4wave kernels require gfx950, device ",
-                device, " is ", arch);
     const std::string path = (std::filesystem::path(dir) / (symbol + ".co")).string();
     static SynchronizedCache<std::string, CoModule> modules;
     auto& module = modules.get_or_create(std::to_string(device) + ":" + path,

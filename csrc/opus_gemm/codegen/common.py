@@ -35,10 +35,6 @@ _A16W16_CO_TAGS = (
     "a16w16_4wave_wl_co",
     "a16w16_4wave_wlr_co",
 )
-_A16W16_4WAVE_GFX950_TAGS = (
-    "a16w16_4wave",
-    "a16w16_4wave_ws",
-)
 _A16W16_TAGS = (
     "a16w16",
     "a16w16_flatmm",
@@ -55,9 +51,9 @@ _A16W16_TAGS = (
     # Pre-built gfx1250 device images. Their generated host launchers reuse the
     # ordinary five-argument non-workspace exact-kid ABI.
     *_A16W16_CO_TAGS,
-    # Pre-built gfx950 4-wave images (gen_co/gfx950): direct five-argument and
-    # fp32 split-K workspace launchers.
-    *_A16W16_4WAVE_GFX950_TAGS,
+    # Pre-built gfx950 4-wave images (gen_co/gfx950): direct / split-K workspace.
+    "a16w16_4wave",
+    "a16w16_4wave_ws",
 ) + _GFX942_A16W16_TAGS
 
 EMIT_REGISTRY = {}

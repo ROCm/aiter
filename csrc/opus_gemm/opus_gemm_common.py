@@ -2871,11 +2871,6 @@ CO_KERNELS_GFX950_JSON = os.path.join(
 A16W16_4WAVE_LAYOUTS = ("nt", "nn", "tt", "tn")  # image index = A_T * 2 + B_T
 
 
-def a16w16_4wave_pinned(instance) -> bool:
-    """Traits default: tiles larger than 128x128 pin registers (1 WG/CU)."""
-    return instance.B_M * instance.B_N > 128 * 128
-
-
 def _a16w16_4wave_gfx950(tag, bm, bn):
     workspace = tag == "a16w16_4wave_ws"
     return OpusGemmInstance(

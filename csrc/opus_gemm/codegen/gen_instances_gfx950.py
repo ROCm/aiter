@@ -3215,7 +3215,7 @@ void
     int splitK)
 {
     static_assert(std::is_same<D_C, @HOST_DTYPE@>::value,
-        "@NAME@: @HOST_DTYPE_WHY@");
+        "@NAME@: wrong launch specialization (Y is bf16)");
     constexpr int B_M = @B_M@;
     constexpr int B_N = @B_N@;
     constexpr int B_K = 64;
@@ -3386,12 +3386,6 @@ def gen_a16w16_4wave_instance(
             "@WS_PARAM@", "\n    aiter_tensor_t &workspace," if workspace else ""
         )
         .replace("@HOST_DTYPE@", "fp32_t" if workspace else "bf16_t")
-        .replace(
-            "@HOST_DTYPE_WHY@",
-            "workspace launchers use the fp32 launch specialization (Y is bf16)"
-            if workspace
-            else "the direct launcher writes bf16 Y",
-        )
         .replace(
             "@BIAS_HOST_VALIDATE@",
             BIAS_HOST_VALIDATE
