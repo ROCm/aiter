@@ -172,6 +172,31 @@ __device__ inline D lane_swap_max32(D x) {
     return max(std::bit_cast<D>(r[0]), std::bit_cast<D>(r[1]));
 }
 
+// A CSR segment of the token's KV rows.
+struct kv_segment {
+    const void* kv_nope;
+    const void* kv_rope;
+    const int* indices;
+    int len;
+};
+
+template<class T, class A>
+__device__ inline auto kv_segments(const A& args, int q_token_idx) {
+    const opus_mla_v4_prefill_fp8_kargs& kargs = opus_mla_prefill_base(args);
+    const int pre_begin = kargs.kv_indptr_prefix[q_token_idx];
+    const int ext_begin = kargs.kv_indptr_extend[q_token_idx];
+    opus_mla_prefill_split_rows rows{0, kargs.kv_indptr_prefix[q_token_idx + 1] - pre_begin,
+                                     0, kargs.kv_indptr_extend[q_token_idx + 1] - ext_begin};
+    if constexpr (T::SPLIT)
+        rows = opus_mla_prefill_split_rows_of<T::KV_TILE_SIZE>(rows.prefix_len, rows.extend_len,
+                                                               args.split.num_splits, opus::block_id_z());
+    struct { kv_segment pre, ext; } seg{
+        {kargs.unified_kv_nope_ptr, kargs.unified_kv_rope_ptr, kargs.kv_indices_prefix + pre_begin + rows.prefix_begin,
+         rows.prefix_len},
+        {kargs.kv_nope_ptr, kargs.kv_rope_ptr, kargs.kv_indices_extend + ext_begin + rows.extend_begin, rows.extend_len}};
+    return seg;
+}
+
 } // namespace opus_mla_v4_prefill_a8w8_32mx4_32nx1
 
 // Traits::kargs_type: the unsplit kernel arguments, or their opus_mla_prefill_split_kargs for split-K.
@@ -224,54 +249,47 @@ __device__ inline void opus_mla_v4_prefill_a8w8_32mx4_32nx1_fwd(typename Traits:
     D_ACC l_row = D_ACC(0.0f);
 
     // ---- one stream of KV tiles: prefix, then extend; a split takes its share of them ----
-    int pbeg = kargs.kv_indptr_prefix[tok];
-    int plen = kargs.kv_indptr_prefix[tok + 1] - pbeg;
-    int ebeg = kargs.kv_indptr_extend[tok];
-    int elen = kargs.kv_indptr_extend[tok + 1] - ebeg;
-    if constexpr (T::SPLIT) {
-        const auto rows = opus_mla_prefill_split_rows_of<TILE>(plen, elen, args.split.num_splits, block_id_z());
-        pbeg += rows.prefix_begin;
-        plen = rows.prefix_len;
-        ebeg += rows.extend_begin;
-        elen = rows.extend_len;
-    }
-    const int PT = ceil_div(plen, TILE);
-    const int NT = PT + ceil_div(elen, TILE);
+    const auto [pre, ext] = kv_segments<T>(args, tok);
+    const int pre_tiles    = ceil_div(pre.len, TILE);
+    const int num_kv_tiles = pre_tiles + ceil_div(ext.len, TILE);
+    // In stream rows: tile u is rows u * TILE + [0, TILE) of seg(u), whose rows end at its len. Rows and tiles past the
+    // end repeat the last row (masked), so every stage issues the same VMEM and the vmcnt waits stay static. Selects:
+    // a branch lets the compiler sink the QK-step work past it.
+    kv_segment ext_rows = ext;
+    ext_rows.indices -= pre_tiles * TILE;
+    ext_rows.len     += pre_tiles * TILE;
+    const int ext_tile0 = ext.len > 0 ? pre_tiles : numeric_limits<int>::max();
+    auto seg = [&](int u) { return u >= ext_tile0 ? ext_rows : pre; };
 
     const lane_offs lo = make_lane_offs<T>(warp_id, lane_id);
     const int dma_row = 4 * (lane_id / 8) + warp_id;
     const int dma_col = ((lane_id % 8) * 16) ^ k_swz(lane_id / 8);
     auto* v_lds = (OPUS_LDS_ADDR char*)vsm;
 
-    // Page and DMA cursors switch to the extend segment at tile PT. Rows and tiles past the end repeat the last
-    // one (masked), so every stage issues the same VMEM and the vmcnt waits stay static.
-    const int switch_u = plen > 0 && elen > 0 ? PT : -1;
-    const int* pg_idx = plen > 0 ? kargs.kv_indices_prefix + pbeg : kargs.kv_indices_extend + ebeg;
-    int pg_lim = (plen > 0 ? plen : elen) - 1;
-    int pg_row = dma_row;
-    int pg_u = 0;
-    auto next_page = [&] {
-        if (__builtin_expect(pg_u == switch_u, 0)) {
-            pg_idx = kargs.kv_indices_extend + ebeg;
-            pg_lim = elen - 1;
-            pg_row = dma_row;
-        }
-        const int page = pg_idx[min(pg_row, pg_lim)];
-        pg_row += TILE;
-        ++pg_u;
-        return page;
+    // The page index of tile u: scalar selection, then the per-lane load.
+    const int* pg_ptr;
+    int pg_lim, pg_base;
+    auto page_prep = [&](int u) {
+        const kv_segment sg = seg(u);
+        pg_ptr  = sg.indices;
+        pg_lim  = sg.len - 1;
+        pg_base = u * TILE;
     };
-    const char* dma_nope = reinterpret_cast<const char*>(plen > 0 ? kargs.unified_kv_nope_ptr : kargs.kv_nope_ptr);
-    const char* dma_rope = reinterpret_cast<const char*>(plen > 0 ? kargs.unified_kv_rope_ptr : kargs.kv_rope_ptr);
-    int dma_u = 0;
-    auto issue_dma = [&](int page, int slot_off) {
-        if (__builtin_expect(dma_u == switch_u, 0)) {
-            dma_nope = reinterpret_cast<const char*>(kargs.kv_nope_ptr);
-            dma_rope = reinterpret_cast<const char*>(kargs.kv_rope_ptr);
-        }
-        ++dma_u;
-        const char* src_n = dma_nope + static_cast<int64_t>(page) * kargs.stride_kv_nope_page + dma_col;
-        const char* src_r = dma_rope + static_cast<int64_t>(page) * kargs.stride_kv_rope_page * static_cast<int>(sizeof(D_ROPE)) + dma_col;
+    auto page_load = [&] {
+        const int row = min(dma_row + pg_base, pg_lim);
+        return *reinterpret_cast<const int*>(reinterpret_cast<const char*>(pg_ptr) + static_cast<u32_t>(row) * 4u);
+    };
+    auto next_page = [&](int u) {
+        page_prep(u);
+        return page_load();
+    };
+    // DMA of tile u.
+    auto issue_dma = [&](int page, int slot_off, int u) {
+        const kv_segment sg = seg(u);
+        const char* src_n = reinterpret_cast<const char*>(sg.kv_nope) + static_cast<int64_t>(page) * kargs.stride_kv_nope_page
+                          + dma_col;
+        const char* src_r = reinterpret_cast<const char*>(sg.kv_rope)
+                          + static_cast<int64_t>(page) * kargs.stride_kv_rope_page * static_cast<int>(sizeof(D_ROPE)) + dma_col;
         char* kb = ksm + slot_off + warp_id * T::smem_brick;
         static_for<T::smem_d_rpt_nope>([&](auto id) {
             constexpr int G = id.value * 128;
@@ -280,9 +298,6 @@ __device__ inline void opus_mla_v4_prefill_a8w8_32mx4_32nx1_fwd(typename Traits:
         dma16<0>(src_r, kb + T::smem_k_nope_bytes);
     };
     constexpr int DMA_OPS = T::smem_d_rpt_nope + 1;
-    // The tail tile of each segment, or -1 if it is full.
-    const int p_tail = plen % TILE ? PT - 1 : -1;
-    const int e_tail = elen % TILE ? NT - 1 : -1;
 
     // ---- Q: global -> AGPR (pinned) ----
     const int head_rel = warp_id * T::Q_TILE_SIZE + i32;
@@ -440,8 +455,8 @@ __device__ inline void opus_mla_v4_prefill_a8w8_32mx4_32nx1_fwd(typename Traits:
     constexpr int SM_MAX_OPS = ACC<T> / 2;
     constexpr int SM_OPS     = SM_MAX_OPS + 2 + ACC<T> + 1;
     auto softmax_load = [&](int t) {
-        if (__builtin_expect(t == p_tail || t == e_tail, 0)) {
-            const int valid_rows = t == p_tail ? plen % TILE : elen % TILE;
+        const int valid_rows = seg(t).len - t * TILE;
+        if (__builtin_expect(valid_rows < TILE, 0)) {
             static_for<4>([&](auto b) {
                 const int rel = valid_rows - 1 - b.value * 8 - g * 4;
                 static_for<4>([&](auto r) {
@@ -570,7 +585,7 @@ __device__ inline void opus_mla_v4_prefill_a8w8_32mx4_32nx1_fwd(typename Traits:
     constexpr int X1_K    = SM_SPAN + 1;   // PV_rest MFMA after X1
     // Q goes out behind the first page indices (vmcnt retires in order), so waiting for them does not wait for Q.
     // No keys: zero output (split: zero partials, empty m / l). Returning early keeps O out of a join RA spills at.
-    if (NT == 0) {
+    if (num_kv_tiles == 0) {
         if constexpr (T::SPLIT) {
             const auto& split = args.split;
             const int64_t row = opus_mla_prefill_split_row(split, tok, block_id_z(), kargs.H, h_block_start);
@@ -596,30 +611,30 @@ __device__ inline void opus_mla_v4_prefill_a8w8_32mx4_32nx1_fwd(typename Traits:
     {
         constexpr int KS = T::smem_k_bytes;
         int pages[A + 1];
-        pages[0] = next_page();
-        pages[1] = next_page();
+        pages[0] = next_page(0);
+        pages[1] = next_page(1);
         __builtin_amdgcn_sched_barrier(0);
         load_q();
         __builtin_amdgcn_sched_barrier(0);
         static_for<A>([&](auto k) {
-            if constexpr (k.value + 2 <= A) pages[k.value + 2] = next_page();
-            issue_dma(pages[k.value], k.value * KS);
+            if constexpr (k.value + 2 <= A) pages[k.value + 2] = next_page(k.value + 2);
+            issue_dma(pages[k.value], k.value * KS, k.value);
         });
         // DMA(0) landed
         s_waitcnt_vmcnt(number<(A - 1) * DMA_OPS>{});
         __builtin_amdgcn_s_barrier();
 
         int ks_off = 0;
+        // page_after is loaded at the stage start, so it has landed when the loop carries it over.
         int page_next = pages[A], page_after;
-        // Issued at the stage start, so it has landed when the loop carries it over.
-        auto issue_page = [&] { page_after = next_page(); };
-        auto issue_dma_next = [&] {
-            issue_dma(page_next, ks_off == 0 ? A * KS : ks_off - KS);
+        auto issue_dma_next = [&](int t) {
+            issue_dma(page_next, ks_off == 0 ? A * KS : ks_off - KS, t + A);
             page_next = page_after;
         };
         auto stage = [&](int t, auto has_qk, auto has_pv) {
             constexpr bool QK = decltype(has_qk)::value;
             constexpr bool PV = decltype(has_pv)::value;
+            t = __builtin_amdgcn_readfirstlane(t);
             pin_all_o();
             if constexpr (PV) {
                 pin_vv();
@@ -629,11 +644,12 @@ __device__ inline void opus_mla_v4_prefill_a8w8_32mx4_32nx1_fwd(typename Traits:
             if constexpr (PV) {
                 pv_head([&](auto vi) {
                     if constexpr (QK && vi.value < QK_ISSUE) qk_issue(ksm + ks_off, vi);
-                    if constexpr (QK && vi.value == QK_ISSUE) issue_page();
+                    if constexpr (QK && vi.value == QK_ISSUE - 1) page_prep(t + A + 1);
+                    if constexpr (QK && vi.value == QK_ISSUE) page_after = page_load();
                 });
             } else {
                 static_for<QK_ISSUE>([&](auto i) { qk_issue(ksm + ks_off, i); });
-                issue_page();
+                page_after = next_page(t + A + 1);
             }
             if constexpr (QK) {
                 qk_steps(ksm + ks_off, [&](auto st) {
@@ -669,7 +685,7 @@ __device__ inline void opus_mla_v4_prefill_a8w8_32mx4_32nx1_fwd(typename Traits:
                         if constexpr (K >= SM_SPAN + 3 && K < SM_SPAN + 3 + PV_STEPS<T>) write_p(number<K - SM_SPAN - 3>{});
                         if constexpr (K == SM_SPAN + 3 + PV_STEPS<T>) write_fac();
                         if constexpr (K == SM_SPAN + 6) l_update();
-                        if constexpr (K == DMA_K) issue_dma_next();
+                        if constexpr (K == DMA_K) issue_dma_next(t);
                     }
                 });
                 if constexpr (QK) static_for<V_LAG>([&](auto i) { read_v(number<NV - V_LAG + i.value>{}); });
@@ -681,7 +697,7 @@ __device__ inline void opus_mla_v4_prefill_a8w8_32mx4_32nx1_fwd(typename Traits:
                 write_fac();
                 static_for<NV>([&](auto vi) { read_v(vi); });
                 l_update();
-                issue_dma_next();
+                issue_dma_next(t);
             }
             if constexpr (QK) {
                 s_waitcnt_lgkmcnt(0_I);
@@ -693,8 +709,8 @@ __device__ inline void opus_mla_v4_prefill_a8w8_32mx4_32nx1_fwd(typename Traits:
             ks_off = ks_off == A * KS ? 0 : ks_off + KS;
         };
         stage(0, true_type{}, false_type{});
-        for (int t = 1; t < NT; ++t) stage(t, true_type{}, true_type{});
-        stage(NT, false_type{}, true_type{});
+        for (int t = 1; t < num_kv_tiles; ++t) stage(t, true_type{}, true_type{});
+        stage(num_kv_tiles, false_type{}, true_type{});
         s_waitcnt_vmcnt(0_I);
     }
 
