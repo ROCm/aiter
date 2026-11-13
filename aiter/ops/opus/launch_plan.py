@@ -35,7 +35,8 @@ _GFX1250_CO_TAGS = frozenset(
 )
 # A16W16 kernels other than the 4g_safe and gfx1250 CO ones form operand
 # offsets in 32-bit int and give each operand one buffer descriptor with a
-# 32-bit size, so A, B and C must each stay below 4 GiB. Their split-K reduce
+# 32-bit size, so A, B and C must each stay below 4 GiB (the gfx950
+# split-barrier kernels limit C to 2^31 elements instead). Their split-K reduce
 # kernels read the whole workspace through one such descriptor as well; the
 # gfx1250 fused split-K kernel addresses its workspace per tile instead.
 _A16W16_BUFFER_LIMIT_BYTES = 1 << 32
@@ -337,17 +338,26 @@ def _build_a16w16_launch_plan(
     )
     if buffer_limited:
         c_elem_bytes = 2 if canonical_output_dtype(output_dtype) == "bf16_t" else 4
-        operand_bytes = {
-            "A": batch * M * K * 2,
-            "B": batch * N * K * 2,
-            "C": batch * M * N * c_elem_bytes,
+        c_limit = _A16W16_BUFFER_LIMIT_BYTES // c_elem_bytes
+        if registry_arch == GFX950 and instance.kernel_tag == "a16w16":
+            # These kernels give C no descriptor size and move its base by
+            # row * stride_c in int, so C is limited in elements, not bytes.
+            c_limit = 1 << 31
+        operand_limits = {
+            "A": (batch * M * K, _A16W16_BUFFER_LIMIT_BYTES // 2),
+            "B": (batch * N * K, _A16W16_BUFFER_LIMIT_BYTES // 2),
+            "C": (batch * M * N, c_limit),
         }
-        if max(operand_bytes.values()) >= _A16W16_BUFFER_LIMIT_BYTES:
+        over = [
+            f"{name}={elems} (limit {limit})"
+            for name, (elems, limit) in operand_limits.items()
+            if elems >= limit
+        ]
+        if over:
             raise ValueError(
-                f"OPUS kid {resolved_kid} uses 32-bit operand offsets, so A, B "
-                "and C must each be smaller than 4 GiB; got "
-                + ", ".join(f"{k}={v}" for k, v in operand_bytes.items())
-                + " bytes (4g_safe kids have no such limit)"
+                f"OPUS kid {resolved_kid} uses 32-bit operand offsets and cannot "
+                f"address {', '.join(over)} elements (4g_safe kids have no "
+                "such limit)"
             )
     if instance.max_m is not None and M > instance.max_m:
         raise ValueError(

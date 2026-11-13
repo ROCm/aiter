@@ -577,7 +577,7 @@ def test_a16w16_launch_plan_refuses_4gib_operands_without_4g_safe(arch):
                 **_a16_policy_args(arch, M, N, K), kid=kid, split_k=0
             )
         except ValueError as exc:
-            return "A, B and C must each be smaller than 4 GiB" in str(exc)
+            return "uses 32-bit operand offsets" in str(exc)
         return False
 
     cu_num = _a16_policy_args(arch, 1, 1, 1)["cu_num"]
@@ -599,6 +599,32 @@ def test_a16w16_launch_plan_refuses_4gib_operands_without_4g_safe(arch):
         for shape in below:
             assert not size_error(kid, *shape), (kid, shape)
     assert limited > 0
+
+
+def test_gfx950_fp32_output_limit_follows_c_addressing():
+    """Persistent (30) and mono-tile (92) kids size C's descriptor in bytes and
+    left tiles unwritten at a 4 GiB fp32 C. Split-barrier kids (5, 102) offset
+    C in int elements and computed an 8 GiB fp32 C (2^31 elements) correctly,
+    so their fp32 limit is 2^31 elements."""
+    from aiter.ops.opus.launch_plan import _build_a16w16_launch_plan
+
+    def refused(kid, N):
+        args = _a16_policy_args("gfx950", 16384, N, 128)
+        args["output_dtype"] = torch.float32
+        try:
+            _build_a16w16_launch_plan(**args, kid=kid, split_k=0)
+        except ValueError as exc:
+            assert "uses 32-bit operand offsets" in str(exc)
+            return True
+        return False
+
+    for kid in (30, 92):
+        assert not refused(kid, 65280)
+        assert refused(kid, 65536)
+    for kid in (5, 102):
+        assert not refused(kid, 65536)
+        assert not refused(kid, 130816)
+        assert refused(kid, 131072)
 
 
 def test_gfx950_split_k_kid_refuses_4gib_workspace():
@@ -650,7 +676,7 @@ def test_gfx950_kid_without_4g_safe_rejects_4gib_output():
     A = torch.randn((M, K), device="cuda", dtype=torch.bfloat16)
     B = torch.randn((N, K), device="cuda", dtype=torch.bfloat16)
     Y = torch.empty((M, N), device="cuda", dtype=torch.bfloat16)
-    with pytest.raises(ValueError, match="smaller than 4 GiB"):
+    with pytest.raises(ValueError, match="32-bit operand offsets"):
         opus_gemm(A, B, Y, family="a16w16", kid=5)
     opus_gemm(A, B, Y, family="a16w16", kid=120)
     torch.cuda.synchronize()
