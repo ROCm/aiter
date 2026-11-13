@@ -26,10 +26,17 @@ from .gfx1250_cluster import compute_mcast_masks
 from .kernels_common import format_kernel_name
 from .mxfp8_sched_hints_gfx1250 import (
     ENABLE_ASM_PIPE,
+    ENABLE_LOAD_FIRST,
+    ENABLE_PIN_B128,
+    ENABLE_PIN_SCALE,
     ENABLE_SCHED_VGPR,
+    ENABLE_SHORT_BEAT,
+    SA_PANEL_CLASS0,
     pin_a_frag,
     pin_acc_vec,
     pin_b_frag,
+    pin_frag_b128,
+    pin_scale_word,
 )
 from .splitk_fused_epilogue_gfx1250 import emit_fused_splitk_epilogue
 from .tensor_shim import (
@@ -128,8 +135,14 @@ def launch_gemm_a8w8_256x256(
     KPAIR = 1 if num_buffers == 4 and tile_n == 256 else 2
     UNROLL = KPAIR * num_buffers
     SUPER_K = tile_k * KPAIR
+    # Short-K (class 0): SA_PANEL_CLASS0 widens the A-scale panel; stages>1
+    # disables c_relocate. Default 4. Mid/long K keep fat panel (8/4/1).
     SA_PANEL_STAGES = (
-        (8 if num_buffers == 2 else 4 if num_buffers == 3 else 1)
+        (
+            SA_PANEL_CLASS0
+            if k_tiles_class == 0 and num_buffers == 2
+            else (8 if num_buffers == 2 else 4 if num_buffers == 3 else 1)
+        )
         if mx32 and not a_scale_preshuffled
         else 1
     )
@@ -701,7 +714,9 @@ def launch_gemm_a8w8_256x256(
                 _planar_base(PLANAR_A_BASE, STAGE_A, slot) + a_byte + par * a_par_step
             )
             stage_b_addr.append(
-                _planar_base(PLANAR_B_BASE, STAGE_B, slot) + b_byte + par * PACK_TK * 16
+                _planar_base(PLANAR_B_BASE, STAGE_B, slot)
+                + b_byte
+                + par * PACK_TK * 16
             )
             # A's K blocks are whole rows apart, B's are single bytes apart.
             sc_par_a = (
@@ -727,9 +742,15 @@ def launch_gemm_a8w8_256x256(
         DS_PER_FRAG = 4  # ds_load_b128 per 16-dword fragment
         # Soft-pipe WAR: non-mx 256 / half=4 / short-K (class 0) only.
         # mx32 gemm-request short-K (e.g. K=1280) measures faster on plain
-        # `_quad`; ASM_PIPE beats / WAR both regress there. Mid/long K keep
-        # a4w4 hints via ASM_PIPE_ACTIVE (class >= 1).
+        # `_quad`; full ASM_PIPE WAR regresses there. Mid/long K keep a4w4
+        # hints via ASM_PIPE_ACTIVE. SHORT_BEAT optionally adds light beats
+        # on class 0 without enabling WAR.
         ASM_PIPE_ACTIVE = const_expr(ENABLE_ASM_PIPE and k_tiles_class > 0)
+        SHORT_BEAT = const_expr(
+            ENABLE_SHORT_BEAT and ENABLE_ASM_PIPE and k_tiles_class == 0
+        )
+        BEAT_ACTIVE = const_expr(ASM_PIPE_ACTIVE or SHORT_BEAT)
+        LOAD_FIRST = const_expr(ENABLE_LOAD_FIRST)
         WAR_SCHED = const_expr(
             tile_m == 256
             and half_m == 4
@@ -774,12 +795,13 @@ def launch_gemm_a8w8_256x256(
 
         def _stage_load_frag(kind, stage, idx):
             addr, row, span = _frag_geom(kind, stage)
-            return _join(
-                [
-                    Vec(lds_load_b128(addr, idx * row + span * j))
-                    for j in range_constexpr(DS_PER_FRAG)
-                ]
-            )
+            parts = []
+            for j in range_constexpr(DS_PER_FRAG):
+                v = Vec(lds_load_b128(addr, idx * row + span * j))
+                if const_expr(ENABLE_PIN_B128):
+                    v = pin_frag_b128(v, kind, idx, j)
+                parts.append(v)
+            return _join(parts)
 
         def _bcast_byte(word, sel):
             """E8M0 byte -> all four bytes of an i32, so the atom's scale opsel is a no-op.
@@ -835,23 +857,20 @@ def launch_gemm_a8w8_256x256(
             for sm in range_constexpr(N_SA):
 
                 def _go_sa(sm=sm):
-                    seed_sa[sm].store(
-                        Vec.from_elements(
-                            [_stage_load_sa_raw(stage, sm, sa_super)],
-                            fx.Int32,
-                        )
-                    )
+                    # Optional pin of scale *load result* (not LDS address).
+                    w = _stage_load_sa_raw(stage, sm, sa_super)
+                    if const_expr(ENABLE_PIN_SCALE):
+                        w = pin_scale_word(w, sm)
+                    seed_sa[sm].store(Vec.from_elements([w], fx.Int32))
 
                 head.append(_go_sa)
             for sn in range_constexpr(N_SB):
 
                 def _go_sb(sn=sn):
-                    seed_sb[sn].store(
-                        Vec.from_elements(
-                            [_stage_load_sb_raw(stage, sn)],
-                            fx.Int32,
-                        )
-                    )
+                    w = _stage_load_sb_raw(stage, sn)
+                    if const_expr(ENABLE_PIN_SCALE):
+                        w = pin_scale_word(w, N_SA + sn)
+                    seed_sb[sn].store(Vec.from_elements([w], fx.Int32))
 
                 head.append(_go_sb)
             a_thunks, b_thunks = [], []
@@ -950,32 +969,47 @@ def launch_gemm_a8w8_256x256(
             ):
                 if const_expr(pre is not None):
                     pre()
-                # a4w4: delimit the quadrant as one sched region.
-                if const_expr(ASM_PIPE_ACTIVE):
+                # a4w4 / short-beat: delimit the quadrant as one sched region.
+                if const_expr(BEAT_ACTIVE):
                     rocdl.sched_barrier(0)
                 lead_positions = sorted(produce)
                 n_lead = len(lead_positions)
                 last = const_expr(lead_positions[-1] if n_lead else -1)
                 for pos in range_constexpr(half_m * half_n):
-                    _mma_block_range(
-                        wm0,
-                        wn0,
-                        act,
-                        wt,
-                        sa_k,
-                        sb_k,
-                        pos,
-                        1,
-                        n_fast,
-                    )
-                    if const_expr(pos in produce):
-                        produce[pos]()
-                        # Per-producer ASM beat so RA sees 1 WMMA : 4 ds_load
-                        # locally, not only at the closing hint.
-                        if const_expr(ASM_PIPE_ACTIVE):
-                            _asm_beat()
+                    do_load = const_expr(pos in produce)
+
+                    def _do_mma():
+                        _mma_block_range(
+                            wm0,
+                            wn0,
+                            act,
+                            wt,
+                            sa_k,
+                            sb_k,
+                            pos,
+                            1,
+                            n_fast,
+                        )
+
+                    def _do_load():
+                        if const_expr(do_load):
+                            produce[pos]()
+                            # Per-producer beat: 1 WMMA : 4 ds_load locally so
+                            # LLVM is less likely to emit va_vdst(0) between them.
+                            if const_expr(BEAT_ACTIVE):
+                                _asm_beat()
+
+                    # Default: MMA then load (hide load behind next MMA).
+                    # LOAD_FIRST: issue ds_load before this slot's WMMA — can
+                    # remove WMMA→DS va_vdst(0) adjacency (A/B measured).
+                    if const_expr(LOAD_FIRST):
+                        _do_load()
+                        _do_mma()
+                    else:
+                        _do_mma()
+                        _do_load()
                     if const_expr(pos == last and n_lead):
-                        if const_expr(ASM_PIPE_ACTIVE):
+                        if const_expr(BEAT_ACTIVE):
                             _asm_sched_hint(max(0, n_lead - 1))
                         else:
                             for _ in range_constexpr(2 * n_lead):
@@ -996,14 +1030,15 @@ def launch_gemm_a8w8_256x256(
                 parts = {}
 
                 def _load(i, j):
-                    parts.setdefault(i, []).append(
-                        Vec(
-                            lds_load_b128(
-                                addr,
-                                (half * n + i) * row + span * j,
-                            )
+                    v = Vec(
+                        lds_load_b128(
+                            addr,
+                            (half * n + i) * row + span * j,
                         )
                     )
+                    if const_expr(ENABLE_PIN_B128):
+                        v = pin_frag_b128(v, kind, i, j)
+                    parts.setdefault(i, []).append(v)
                     if const_expr(j == DS_PER_FRAG - 1):
                         nxt[key][i] = _rmem(
                             16, _join(parts[i]), kind=kind, slot=i
@@ -1083,7 +1118,10 @@ def launch_gemm_a8w8_256x256(
                     parts = []
 
                     def _one(j):
-                        parts.append(Vec(lds_load_b128(addr, idx * row + span * j)))
+                        v = Vec(lds_load_b128(addr, idx * row + span * j))
+                        if const_expr(ENABLE_PIN_B128):
+                            v = pin_frag_b128(v, kind, idx, j)
+                        parts.append(v)
                         if const_expr(j == DS_PER_FRAG - 1):
                             dest(_join(parts))
 
@@ -1118,17 +1156,15 @@ def launch_gemm_a8w8_256x256(
                 def _seed_scales():
                     sa_next = sa_super + int(stage % KPAIR == KPAIR - 1)
                     for sm in range_constexpr(N_SA):
-                        seed_sa[sm].store(
-                            Vec.from_elements(
-                                [_stage_load_sa_raw(next_stage, sm, sa_next)], fx.Int32
-                            )
-                        )
+                        w = _stage_load_sa_raw(next_stage, sm, sa_next)
+                        if const_expr(ENABLE_PIN_SCALE):
+                            w = pin_scale_word(w, sm)
+                        seed_sa[sm].store(Vec.from_elements([w], fx.Int32))
                     for sn in range_constexpr(N_SB):
-                        seed_sb[sn].store(
-                            Vec.from_elements(
-                                [_stage_load_sb_raw(next_stage, sn)], fx.Int32
-                            )
-                        )
+                        w = _stage_load_sb_raw(next_stage, sn)
+                        if const_expr(ENABLE_PIN_SCALE):
+                            w = pin_scale_word(w, N_SA + sn)
+                        seed_sb[sn].store(Vec.from_elements([w], fx.Int32))
 
                 def _spread(thunks, lo, hi):
                     out = {}
