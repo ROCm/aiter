@@ -35,4 +35,34 @@ void kda_replayssm_decode(aiter_tensor_t& o,
                           bool use_lower_bound,
                           float lower_bound);
 
+// The same step fused with the width-4 short convolution + SiLU that produces q, k and v (Kimi-K3's causal_conv1d
+// update on the speculative-decoding path): x is the mixed [T, 2 * H * K + HV * V] bf16 input, conv_state the
+// [lines, dim, >= 2 + max_query_len] bf16 window (read at conv_state_indices_in, num_accepted_tokens - 1; rewritten
+// at conv_state_indices), conv_weight [dim, 4] fp32. Requires H == HV.
+void kda_replayssm_decode_conv(aiter_tensor_t& o,
+                               aiter_tensor_t& ckpt,
+                               aiter_tensor_t& buf_k,
+                               aiter_tensor_t& buf_u,
+                               aiter_tensor_t& buf_g,
+                               aiter_tensor_t& conv_state,
+                               const aiter_tensor_t& x,
+                               const aiter_tensor_t& conv_weight,
+                               const aiter_tensor_t& conv_state_indices,
+                               const aiter_tensor_t& conv_state_indices_in,
+                               const aiter_tensor_t& num_accepted_tokens,
+                               const aiter_tensor_t& a,
+                               const aiter_tensor_t& b,
+                               const aiter_tensor_t& A_log,
+                               const aiter_tensor_t& dt_bias,
+                               const aiter_tensor_t& write_pos,
+                               const aiter_tensor_t& slot_idx,
+                               const aiter_tensor_t& cu_seqlens,
+                               int H,
+                               int HV,
+                               int max_query_len,
+                               float scale,
+                               bool use_qk_l2norm,
+                               bool use_lower_bound,
+                               float lower_bound);
+
 } // namespace aiter

@@ -16,6 +16,8 @@ from aiter.test_common import run_perftest
 
 from aiter.ops.kda_replayssm import (
     kda_replayssm_decode,
+    kda_replayssm_decode_conv,
+    kda_replayssm_decode_conv_supported,
     kda_replayssm_decode_supported,
 )
 
@@ -213,6 +215,184 @@ def test_kda_replayssm_decode_no_l2norm(l2norm):
     close("ckpt", got["ckpt"], ck_ref, 1e-4, 1e-4)
 
 
+def conv_reference(x, conv_state, w, idx, idx_in, n_acc, cu):
+    """Width-4 speculative causal conv + SiLU (causal_conv1d_update with num_accepted_tokens): y [T, dim] rounded to
+    bf16 as the unfused path's q/k/v tensors are, and the conv state after the call."""
+    st = conv_state.clone()
+    y = torch.zeros(x.shape, dtype=torch.float32, device=DEV)
+    cu = cu.tolist()
+    for n in range(len(cu) - 1):
+        bos, T = cu[n], cu[n + 1] - cu[n]
+        si, so = int(idx_in[n]), int(idx[n])
+        if T == 0 or si < 0:
+            continue
+        off = int(n_acc[n]) - 1
+        hist = conv_state[si, :, off : off + 3].float()  # [dim, 3]
+        xs = x[bos : bos + T].float().t()  # [dim, T]
+        win = torch.cat([hist, xs], dim=1)
+        for t in range(T):
+            acc = (win[:, t : t + 4] * w).sum(-1)
+            y[bos + t] = (acc / (1 + torch.exp(-acc))).to(torch.bfloat16).float()
+        st[so, :, : 2 + T] = torch.cat([hist[:, 1:3], xs], dim=1).to(st.dtype)
+    return y, st
+
+
+@pytest.mark.parametrize("N", [1, 3, 8, 32])
+@pytest.mark.parametrize("T", [1, 2, 5, 8])
+@pytest.mark.parametrize("gdtype", [torch.float32, torch.bfloat16])
+@pytest.mark.parametrize("state_layout", ["dim_major", "token_major"])
+def test_kda_replayssm_decode_conv(N, T, gdtype, state_layout):
+    """conv + ReplaySSM fused vs the torch conv reference feeding the ReplaySSM reference: output, checkpoint,
+    records and the rewritten conv state (dim-major [lines, dim, len] or a token-major buffer seen transposed).
+    """
+    H = HV = 12
+    dim = 3 * H * K
+    d = make_inputs(
+        N, T, H, HV, 16, gdtype, seed=N * 17 + T, ragged=N >= 8, pad_slot=N == 8
+    )
+    g = torch.Generator(device=DEV).manual_seed(N + 100 * T)
+    T_tot, S = d["q"].shape[1], d["ckpt"].shape[0]
+    x = torch.randn(T_tot, dim, device=DEV, generator=g).to(torch.bfloat16)
+    w = torch.randn(dim, 4, device=DEV, generator=g) * 0.3
+    slen = 2 + T
+    if state_layout == "dim_major":
+        cs = torch.randn(S, dim, slen, device=DEV, generator=g).to(torch.bfloat16)
+    else:
+        cs = torch.randn(S, slen, dim, device=DEV, generator=g).to(torch.bfloat16)
+        cs = cs.transpose(1, 2)
+    idx = d["slot_idx"]
+    n_acc = torch.randint(1, T + 1, (N,), device=DEV, generator=g, dtype=torch.int32)
+    assert kda_replayssm_decode_conv_supported(
+        x,
+        cs,
+        w,
+        H,
+        d["ckpt"],
+        d["buf_k"],
+        d["buf_u"],
+        d["buf_g"],
+        d["A_log"],
+        d["dt_bias"],
+        T,
+    )
+    y, cs_ref = conv_reference(x, cs, w, idx, idx, n_acc, d["cu_seqlens"])
+    qkv = {
+        "q": y[:, : H * K].reshape(1, T_tot, H, K).to(torch.bfloat16),
+        "k": y[:, H * K : 2 * H * K].reshape(1, T_tot, H, K).to(torch.bfloat16),
+        "v": y[:, 2 * H * K :].reshape(1, T_tot, HV, V).to(torch.bfloat16),
+    }
+    o_ref, ck_ref, bk_ref, bu_ref, bg_ref = reference(dict(d, **qkv), H, HV, True, -5.0)
+    state = {x_: d[x_].clone() for x_ in ("ckpt", "buf_k", "buf_u", "buf_g")}
+    cs_got = (
+        cs.clone()
+        if state_layout == "dim_major"
+        else cs.transpose(1, 2).clone().transpose(1, 2)
+    )
+    o = kda_replayssm_decode_conv(
+        x,
+        cs_got,
+        w,
+        idx,
+        n_acc,
+        d["a"],
+        d["b"],
+        d["A_log"],
+        d["dt_bias"],
+        state["ckpt"],
+        state["buf_k"],
+        state["buf_u"],
+        state["buf_g"],
+        d["write_pos"],
+        d["slot_idx"],
+        d["cu_seqlens"],
+        T,
+        H,
+        use_qk_l2norm_in_kernel=True,
+        lower_bound=-5.0,
+    )
+    live = torch.zeros(T_tot, dtype=torch.bool, device=DEV)
+    cu = d["cu_seqlens"].tolist()
+    for n in range(len(cu) - 1):
+        if int(idx[n]) >= 0:
+            live[cu[n] : cu[n + 1]] = True
+    scale = float(o_ref.abs().max())
+    close("o", o[live], o_ref[live], 2e-2 * scale, 3e-2)
+    close("ckpt", state["ckpt"], ck_ref, 1e-4, 1e-4)
+    close("buf_k", state["buf_k"], bk_ref, 2e-2, 2e-2)
+    close(
+        "buf_u", state["buf_u"], bu_ref, 2e-2 * float(bu_ref.float().abs().max()), 3e-2
+    )
+    close(
+        "buf_g", state["buf_g"], bg_ref, 1e-5 if gdtype == torch.float32 else 1e-2, 1e-2
+    )
+    assert torch.equal(cs_got, cs_ref), "conv state"
+
+
+def test_kda_replayssm_decode_conv_strided_indices():
+    """Kimi-K3 hands the conv slots over as column 0 of its [batch, window] slot table: strided index views give
+    bitwise the same result as contiguous ones (and a forked read slot, conv_state_indices_in, is honoured).
+    """
+    H, N, T = 12, 8, 5
+    dim = 3 * H * K
+    d = make_inputs(N, T, H, H, 16, torch.float32, seed=5)
+    g = torch.Generator(device=DEV).manual_seed(3)
+    T_tot, S = d["q"].shape[1], d["ckpt"].shape[0]
+    x = torch.randn(T_tot, 4 * dim, device=DEV, generator=g).to(torch.bfloat16)[:, :dim]
+    w = torch.randn(dim, 4, device=DEV, generator=g) * 0.3
+    cs = (
+        torch.randn(S, 2 + T, dim, device=DEV, generator=g)
+        .to(torch.bfloat16)
+        .transpose(1, 2)
+    )
+    idx = d["slot_idx"]
+    idx_in = idx.clone()
+    idx_in[3] = int(
+        torch.nonzero(torch.isin(torch.arange(S, device=DEV), idx, invert=True))[0]
+    )
+    n_acc = torch.randint(1, T + 1, (N,), device=DEV, generator=g, dtype=torch.int32)
+    table = torch.full((N, T), -7, dtype=torch.int32, device=DEV)
+    table_in = table.clone()
+    table_acc = table.clone()
+    table[:, 0], table_in[:, 0], table_acc[:, 0] = idx, idx_in, n_acc
+
+    def call(i, i_in, acc):
+        st = {x_: d[x_].clone() for x_ in ("ckpt", "buf_k", "buf_u", "buf_g")}
+        c = cs.transpose(1, 2).clone().transpose(1, 2)
+        o = kda_replayssm_decode_conv(
+            x,
+            c,
+            w,
+            i,
+            acc,
+            d["a"],
+            d["b"],
+            d["A_log"],
+            d["dt_bias"],
+            st["ckpt"],
+            st["buf_k"],
+            st["buf_u"],
+            st["buf_g"],
+            d["write_pos"],
+            d["slot_idx"],
+            d["cu_seqlens"],
+            T,
+            H,
+            conv_state_indices_in=i_in,
+            use_qk_l2norm_in_kernel=True,
+            lower_bound=-5.0,
+        )
+        return o, c, st
+
+    o_s, c_s, st_s = call(table[:, 0], table_in[:, 0], table_acc[:, 0])
+    o_c, c_c, st_c = call(idx, idx_in, n_acc)
+    assert not table[:, 0].is_contiguous()
+    assert torch.equal(o_s, o_c) and torch.equal(c_s, c_c)
+    for x_ in st_s:
+        assert torch.equal(st_s[x_], st_c[x_]), x_
+    _, cs_ref = conv_reference(x, cs, w, idx, idx_in, n_acc, d["cu_seqlens"])
+    assert torch.equal(c_c, cs_ref), "conv state with a forked read slot"
+
+
 def bench(N_list=(8, 32, 110), T=5, HV=12, cap=16):
     rows = []
     for N in N_list:
@@ -242,10 +422,40 @@ def bench(N_list=(8, 32, 110), T=5, HV=12, cap=16):
             + N * HV * cap * (2 * K + V + 4 * K)
             + N * T * HV * (2 * K + V + K) * 2
         )
-        rows.append((N, T, HV, us, nbytes / us / 1e3))
-    print(f"{'N':>4} {'T':>2} {'HV':>3} {'us':>9} {'GB/s':>8}")
-    for n_req, n_tok, n_heads, us, gbs in rows:
-        print(f"{n_req:>4} {n_tok:>2} {n_heads:>3} {us:9.2f} {gbs:8.1f}")
+        # the conv-fused entry point on the same state: x is the mixed q|k|v input, every request resumes at the end
+        # of a fully accepted window
+        dim = 3 * HV * K
+        x = torch.randn(d["q"].shape[1], dim, device=DEV).to(torch.bfloat16)
+        w = torch.randn(dim, 4, device=DEV) * 0.3
+        cs = torch.randn(d["ckpt"].shape[0], dim, 2 + T, device=DEV).to(torch.bfloat16)
+        n_acc = torch.full((N,), T, dtype=torch.int32, device=DEV)
+        _, us_conv = run_perftest(
+            kda_replayssm_decode_conv,
+            x,
+            cs,
+            w,
+            d["slot_idx"],
+            n_acc,
+            d["a"],
+            d["b"],
+            d["A_log"],
+            d["dt_bias"],
+            d["ckpt"],
+            d["buf_k"],
+            d["buf_u"],
+            d["buf_g"],
+            d["write_pos"],
+            d["slot_idx"],
+            d["cu_seqlens"],
+            T,
+            HV,
+            use_qk_l2norm_in_kernel=True,
+            lower_bound=-5.0,
+        )
+        rows.append((N, T, HV, us, nbytes / us / 1e3, us_conv))
+    print(f"{'N':>4} {'T':>2} {'HV':>3} {'us':>9} {'GB/s':>8} {'conv+ us':>9}")
+    for n_req, n_tok, n_heads, us, gbs, us_conv in rows:
+        print(f"{n_req:>4} {n_tok:>2} {n_heads:>3} {us:9.2f} {gbs:8.1f} {us_conv:9.2f}")
 
 
 if __name__ == "__main__":

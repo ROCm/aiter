@@ -26,6 +26,14 @@
 // transactions (s_wait_xcnt) before EXEC changes, so predicated loads/stores would each cost a memory round trip.
 // The staging barrier also orders every record read before any record write, so a flush (which rewrites the
 // records from position 0) cannot race another thread's replay.
+//
+// kda_replayssm_decode_conv (CONV != 0) also runs the short convolution that produces q, k and v on the
+// speculative-decoding path (causal_conv1d_update with num_accepted_tokens: width 4, SiLU, the state window read at
+// num_accepted - 1 and rewritten as [hist_1, hist_2, x_0 .. x_{T-1}]).  In the staging phase three waves load the
+// mixed q | k | v input and the state window, each lane CC adjacent channels of one of q, k, v, convolve them in fp32
+// (rounded to bf16, as the unfused path stores q, k, v) into LDS and write the new window; after one more LDS barrier
+// q and k are normalised from LDS as above.  q, k and v never go through global memory.  H == HV, so each block owns
+// its head's q, k and v channels and no two blocks touch the same state channels.
 #include "aiter_hip_common.h"
 #include "aiter_stream.h"
 #include "aiter_tensor.h"
@@ -133,7 +141,6 @@ KDA_DEVI float sum16(float x)
     return x;
 }
 KDA_DEVI float fast_rcp(float x) { return __builtin_amdgcn_rcpf(x); }
-
 struct Params
 {
     const uint16_t* q;
@@ -161,16 +168,63 @@ struct Params
     int HV;
     int64_t s_ck_slot, s_bk_slot, s_bk_pos, s_bk_hv, s_bu_slot, s_bu_pos, s_bu_hv, s_bg_slot, s_bg_pos, s_bg_hv;
     int64_t s_a_tok, s_b_tok; // token strides of the gate input and beta (column views of a wider buffer allowed)
+    // fused short convolution (CONV): q/k/v come from a width-4 causal conv + SiLU over the mixed q|k|v input, whose
+    // speculative-decoding state window ([line, dim, state_len] bf16) is read at num_accepted - 1 and rewritten
+    const uint16_t* x;           // [T, 2 * kdim + HV * V] bf16
+    uint16_t* conv_state;        // [lines, 2 * kdim + HV * V, >= 2 + max_query_len] bf16
+    const float* conv_w;         // [2 * kdim + HV * V, 4] fp32
+    const int* conv_idx;         // [N] write side (strided: Kimi-K3 passes column 0 of its slot table)
+    const int* conv_idx_in;      // [N] read side (== conv_idx unless a forked state is resumed)
+    const int* num_accepted;     // [N] tokens of the previous window that were accepted (>= 1)
+    int64_t s_x_tok, s_cs_line, s_cs_dim, s_cs_tok, s_cidx, s_cidx_in, s_nacc;
+    int kdim;                    // channels of q (and of k) in x: H * K
 };
 
-template <int RPT, typename GT>
+KDA_DEVI float bf_round(float x) { return __uint_as_float(((uint32_t)f2bf(x)) << 16); }
+// CC adjacent bf16 channels moved as one word (CC = 4: 8 bytes, CC = 2: 4 bytes); c is a compile-time index
+template <int CC>
+struct BfVec;
+template <>
+struct BfVec<4>
+{
+    using T = uint2;
+    KDA_DEVI static float get(const T& w, int c)
+    {
+        const uint32_t u = c < 2 ? w.x : w.y;
+        return (c & 1) ? bf_hi(u) : bf_lo(u);
+    }
+    KDA_DEVI static uint16_t raw(const T& w, int c)
+    {
+        const uint32_t u = c < 2 ? w.x : w.y;
+        return (uint16_t)((c & 1) ? u >> 16 : u);
+    }
+    KDA_DEVI static void st_lds(float* p, const float* f)
+    {
+        *reinterpret_cast<float4*>(p) = make_float4(f[0], f[1], f[2], f[3]);
+    }
+};
+template <>
+struct BfVec<2>
+{
+    using T = uint32_t;
+    KDA_DEVI static float get(const T& w, int c) { return (c & 1) ? bf_hi(w) : bf_lo(w); }
+    KDA_DEVI static uint16_t raw(const T& w, int c) { return (uint16_t)((c & 1) ? w >> 16 : w); }
+    KDA_DEVI static void st_lds(float* p, const float* f)
+    {
+        *reinterpret_cast<float2*>(p) = make_float2(f[0], f[1]);
+    }
+};
+
+// CONV: 0 = q, k, v given; 1 = fused short convolution, conv state with unit channel stride (vector access);
+// 2 = fused short convolution, any conv-state strides (per-channel access)
+template <int RPT, typename GT, int CONV>
 __global__ void __launch_bounds__(4 * VD / RPT) kda_replayssm_decode_kernel(const Params p)
 {
     constexpr int NT  = 4 * VD / RPT;
     constexpr int RPP = NT / 16; // staging rows per pass (16 threads x 8 elements per 128-element row)
     __shared__ float s_q[MAXT][KD], s_k[MAXT][KD], s_v[MAXT][VD]; // q (normalized, scaled), k (normalized), v
     __shared__ float s_g[MAXT][KD], s_e[MAXT][KD];                // gates g and e^g
-    __shared__ float s_o[MAXT][VD], s_u[MAXT][VD];                // outputs and u records, written back at the end
+    __shared__ float s_o[MAXT][VD], s_u[MAXT][VD]; // outputs and u records (CONV: first the raw conv q and k rows)
     __shared__ float s_beta[MAXT];                                // sigmoid(b)
     __shared__ float s_rk[MAXCAP][KD], s_ru[MAXCAP][VD], s_re[MAXCAP][KD]; // records: k, u, e^g
 
@@ -190,6 +244,15 @@ __global__ void __launch_bounds__(4 * VD / RPT) kda_replayssm_decode_kernel(cons
     const int64_t slot = p.slot_idx[n];
     if(slot < 0)
         return;
+    int64_t cs_in = 0, cs_out = 0, cs_off = 0;
+    if constexpr(CONV != 0)
+    {
+        cs_in  = p.conv_idx_in[n * p.s_cidx_in];
+        cs_out = p.conv_idx[n * p.s_cidx];
+        if(cs_in < 0)
+            return; // padded entry, as the conv kernel skips it
+        cs_off = p.num_accepted[n * p.s_nacc] - 1;
+    }
     // the prefill sentinel -1 means "no records": fold nothing, append from 0
     const int h           = min(max(p.write_pos[slot], 0), MAXCAP);
     const bool do_flush   = h + 2 * p.max_query_len > p.cap;
@@ -213,9 +276,64 @@ __global__ void __launch_bounds__(4 * VD / RPT) kda_replayssm_decode_kernel(cons
             trow[i]           = t;
             const int64_t tok = bos + t;
             wa[i] = *reinterpret_cast<const uint4*>(p.a + tok * p.s_a_tok + hv * KD + col);
-            wq[i] = *reinterpret_cast<const uint4*>(p.q + (tok * p.H + ih) * KD + col);
-            wk[i] = *reinterpret_cast<const uint4*>(p.k + (tok * p.H + ih) * KD + col);
-            wv[i] = *reinterpret_cast<const uint4*>(p.v + (tok * HV + hv) * VD + col);
+            if constexpr(CONV == 0)
+            {
+                wq[i] = *reinterpret_cast<const uint4*>(p.q + (tok * p.H + ih) * KD + col);
+                wk[i] = *reinterpret_cast<const uint4*>(p.k + (tok * p.H + ih) * KD + col);
+                wv[i] = *reinterpret_cast<const uint4*>(p.v + (tok * HV + hv) * VD + col);
+            }
+        }
+        // CONV: lanes [0, 3 * KD / CC) -- three whole waves -- own CC adjacent channels of this head's q, k or v: the
+        // step's inputs (one word per token), the 3-token history window at num_accepted - 1 and 4 taps per channel.
+        // Raw words only: nothing is unpacked before the record and checkpoint loads below are issued.
+        constexpr int CC  = RPT;     // channels per conv lane
+        constexpr int CPG = KD / CC; // conv lanes per q / k / v group (a multiple of the wave size)
+        using BV          = BfVec<CC>;
+        using CV          = typename BV::T;
+        CV c_x[MAXT], c_hv[3];
+        uint16_t c_hs[3][CC];
+        float c_w[CC][4];
+        int64_t c_ch           = 0;
+        int cgrp               = 0;
+        const bool conv_thread = CONV != 0 && __builtin_amdgcn_readfirstlane(tid) < 3 * CPG;
+        if constexpr(CONV != 0)
+        {
+            if(conv_thread)
+            {
+                cgrp = __builtin_amdgcn_readfirstlane(tid) / CPG; // wave-uniform
+                c_ch = (cgrp == 0   ? (int64_t)ih * KD
+                        : cgrp == 1 ? (int64_t)p.kdim + (int64_t)ih * KD
+                                    : 2 * (int64_t)p.kdim + (int64_t)hv * VD) +
+                       (tid & (CPG - 1)) * CC;
+                const uint16_t* xr = p.x + (int64_t)bos * p.s_x_tok + c_ch;
+#pragma unroll
+                for(int t = 0; t < MAXT; ++t)
+                    if(t < T) // T is block-uniform: a scalar branch
+                        c_x[t] = *reinterpret_cast<const CV*>(xr + t * p.s_x_tok);
+                const uint16_t* hr = p.conv_state + cs_in * p.s_cs_line + c_ch * p.s_cs_dim + cs_off * p.s_cs_tok;
+#pragma unroll
+                for(int j = 0; j < 3; ++j)
+                {
+                    if constexpr(CONV == 1)
+                        c_hv[j] = *reinterpret_cast<const CV*>(hr + j * p.s_cs_tok);
+                    else
+                    {
+#pragma unroll
+                        for(int c = 0; c < CC; ++c)
+                            c_hs[j][c] = hr[c * p.s_cs_dim + j * p.s_cs_tok];
+                    }
+                }
+                const float4* w4 = reinterpret_cast<const float4*>(p.conv_w + c_ch * 4);
+#pragma unroll
+                for(int c = 0; c < CC; ++c)
+                {
+                    const float4 w = w4[c];
+                    c_w[c][0]      = w.x;
+                    c_w[c][1]      = w.y;
+                    c_w[c][2]      = w.z;
+                    c_w[c][3]      = w.w;
+                }
+            }
         }
         float xg[JP][8];
         uint4 xk[JP], xu[JP];
@@ -271,33 +389,144 @@ __global__ void __launch_bounds__(4 * VD / RPT) kda_replayssm_decode_kernel(cons
             const int t = trow[i];
             st8(&s_g[t][col], g);
             st8(&s_e[t][col], e);
-            float fq[8], fk[8];
-            unpack8(wq[i], fq);
-            unpack8(wk[i], fk);
-            float iq = p.scale, ik = 1.f;
-            if(p.use_l2norm)
+            if constexpr(CONV == 0)
             {
-                // the row's 16 threads hold its 128 elements: one DPP-row reduction per norm
-                float sq = 0.f, sk = 0.f;
+                float fq[8], fk[8];
+                unpack8(wq[i], fq);
+                unpack8(wk[i], fk);
+                float iq = p.scale, ik = 1.f;
+                if(p.use_l2norm)
+                {
+                    // the row's 16 threads hold its 128 elements: one DPP-row reduction per norm
+                    float sq = 0.f, sk = 0.f;
+#pragma unroll
+                    for(int c = 0; c < 8; ++c)
+                    {
+                        sq = fmaf(fq[c], fq[c], sq);
+                        sk = fmaf(fk[c], fk[c], sk);
+                    }
+                    iq *= rsqrtf(sum16(sq) + 1e-6f);
+                    ik = rsqrtf(sum16(sk) + 1e-6f);
+                }
 #pragma unroll
                 for(int c = 0; c < 8; ++c)
                 {
-                    sq = fmaf(fq[c], fq[c], sq);
-                    sk = fmaf(fk[c], fk[c], sk);
+                    fq[c] *= iq;
+                    fk[c] *= ik;
                 }
-                iq *= rsqrtf(sum16(sq) + 1e-6f);
-                ik = rsqrtf(sum16(sk) + 1e-6f);
+                st8(&s_q[t][col], fq);
+                st8(&s_k[t][col], fk);
+                unpack8(wv[i], f);
+                st8(&s_v[t][col], f);
             }
-#pragma unroll
-            for(int c = 0; c < 8; ++c)
+        }
+        if constexpr(CONV != 0)
+        {
+            if(conv_thread)
             {
-                fq[c] *= iq;
-                fk[c] *= ik;
+                // per channel y_t = silu(w0 x_{t-3} + w1 x_{t-2} + w2 x_{t-1} + w3 x_t), accumulated in the
+                // conv kernel's order and rounded to bf16 as the unfused path's q / k / v tensors are
+                float hw[3][CC];
+#pragma unroll
+                for(int j = 0; j < 3; ++j)
+#pragma unroll
+                    for(int c = 0; c < CC; ++c)
+                        hw[j][c] = CONV == 1 ? BV::get(c_hv[j], c) : __uint_as_float(((uint32_t)c_hs[j][c]) << 16);
+                float(*dst)[KD] = cgrp == 0 ? s_o : cgrp == 1 ? s_u : s_v;
+                const int cl    = (tid & (CPG - 1)) * CC;
+#pragma unroll
+                for(int t = 0; t < MAXT; ++t)
+                {
+                    if(t < T)
+                    {
+                        float y[CC];
+#pragma unroll
+                        for(int c = 0; c < CC; ++c)
+                        {
+                            const float xt = BV::get(c_x[t], c);
+                            float acc      = hw[0][c] * c_w[c][0];
+                            acc            = fmaf(hw[1][c], c_w[c][1], acc);
+                            acc            = fmaf(hw[2][c], c_w[c][2], acc);
+                            acc            = fmaf(xt, c_w[c][3], acc);
+                            hw[0][c]       = hw[1][c];
+                            hw[1][c]       = hw[2][c];
+                            hw[2][c]       = xt;
+                            y[c]           = bf_round(acc / (1.f + __expf(-acc)));
+                        }
+                        BV::st_lds(&dst[t][cl], y);
+                    }
+                }
+                // the new window [hist_1, hist_2, x_0 .. x_{T-1}] at the write line, raw words
+                uint16_t* sto = p.conv_state + cs_out * p.s_cs_line + c_ch * p.s_cs_dim;
+                if constexpr(CONV == 1)
+                {
+                    *reinterpret_cast<CV*>(sto)              = c_hv[1];
+                    *reinterpret_cast<CV*>(sto + p.s_cs_tok) = c_hv[2];
+#pragma unroll
+                    for(int t = 0; t < MAXT; ++t)
+                        if(t < T)
+                            *reinterpret_cast<CV*>(sto + (2 + t) * p.s_cs_tok) = c_x[t];
+                }
+                else
+                {
+#pragma unroll
+                    for(int c = 0; c < CC; ++c)
+                    {
+                        sto[c * p.s_cs_dim]              = c_hs[1][c];
+                        sto[c * p.s_cs_dim + p.s_cs_tok] = c_hs[2][c];
+                    }
+#pragma unroll
+                    for(int t = 0; t < MAXT; ++t)
+                        if(t < T)
+#pragma unroll
+                            for(int c = 0; c < CC; ++c)
+                                sto[c * p.s_cs_dim + (2 + t) * p.s_cs_tok] = BV::raw(c_x[t], c);
+                }
             }
-            st8(&s_q[t][col], fq);
-            st8(&s_k[t][col], fk);
-            unpack8(wv[i], f);
-            st8(&s_v[t][col], f);
+            __syncthreads();
+            // q/k norms from the conv outputs: 16 threads per row again; clamped duplicate rows write identical
+            // values into s_q/s_k (the raw rows stay in s_o/s_u, which phase 3 overwrites only after the barrier)
+#pragma unroll
+            for(int i = 0; i < TP; ++i)
+            {
+                const int t = trow[i];
+                float fq[8], fk[8];
+#pragma unroll
+                for(int m = 0; m < 2; ++m)
+                {
+                    const float4 rq = reinterpret_cast<const float4*>(&s_o[t][col])[m];
+                    const float4 rk = reinterpret_cast<const float4*>(&s_u[t][col])[m];
+                    fq[4 * m + 0]   = rq.x;
+                    fq[4 * m + 1]   = rq.y;
+                    fq[4 * m + 2]   = rq.z;
+                    fq[4 * m + 3]   = rq.w;
+                    fk[4 * m + 0]   = rk.x;
+                    fk[4 * m + 1]   = rk.y;
+                    fk[4 * m + 2]   = rk.z;
+                    fk[4 * m + 3]   = rk.w;
+                }
+                float iq = p.scale, ik = 1.f;
+                if(p.use_l2norm)
+                {
+                    float sq = 0.f, sk = 0.f;
+#pragma unroll
+                    for(int c = 0; c < 8; ++c)
+                    {
+                        sq = fmaf(fq[c], fq[c], sq);
+                        sk = fmaf(fk[c], fk[c], sk);
+                    }
+                    iq *= rsqrtf(sum16(sq) + 1e-6f);
+                    ik = rsqrtf(sum16(sk) + 1e-6f);
+                }
+#pragma unroll
+                for(int c = 0; c < 8; ++c)
+                {
+                    fq[c] *= iq;
+                    fk[c] *= ik;
+                }
+                st8(&s_q[t][col], fq);
+                st8(&s_k[t][col], fk);
+            }
         }
         s_beta[tid & (MAXT - 1)] = fast_rcp(1.f + __expf(-__uint_as_float(((uint32_t)rb) << 16)));
 #pragma unroll
@@ -486,46 +715,35 @@ static int device_warp_size(int dev)
     return cached[dev];
 }
 
-} // namespace kda_replayssm
-
-void kda_replayssm_decode(aiter_tensor_t& o,
-                          aiter_tensor_t& ckpt,
-                          aiter_tensor_t& buf_k,
-                          aiter_tensor_t& buf_u,
-                          aiter_tensor_t& buf_g,
-                          const aiter_tensor_t& q,
-                          const aiter_tensor_t& k,
-                          const aiter_tensor_t& v,
-                          const aiter_tensor_t& a,
-                          const aiter_tensor_t& b,
-                          const aiter_tensor_t& A_log,
-                          const aiter_tensor_t& dt_bias,
-                          const aiter_tensor_t& write_pos,
-                          const aiter_tensor_t& slot_idx,
-                          const aiter_tensor_t& cu_seqlens,
-                          int max_query_len,
-                          float scale,
-                          bool use_qk_l2norm,
-                          bool use_lower_bound,
-                          float lower_bound)
+// Checks and Params shared by both entry points: the state (checkpoint, records), gate/beta and the indices.
+static void fill_state(Params& prm,
+                       aiter_tensor_t& ckpt,
+                       aiter_tensor_t& buf_k,
+                       aiter_tensor_t& buf_u,
+                       aiter_tensor_t& buf_g,
+                       const aiter_tensor_t& a,
+                       const aiter_tensor_t& b,
+                       const aiter_tensor_t& A_log,
+                       const aiter_tensor_t& dt_bias,
+                       const aiter_tensor_t& write_pos,
+                       const aiter_tensor_t& slot_idx,
+                       const aiter_tensor_t& cu_seqlens,
+                       int64_t H,
+                       int64_t HV,
+                       int max_query_len,
+                       float scale,
+                       bool use_qk_l2norm,
+                       bool use_lower_bound,
+                       float lower_bound)
 {
-    using namespace kda_replayssm;
-    const int64_t K   = q.size(-1);
-    const int64_t H   = q.size(-2);
-    const int64_t V   = v.size(-1);
-    const int64_t HV  = v.size(-2);
     const int64_t cap = buf_k.size(-2);
-    const int64_t N   = cu_seqlens.numel() - 1;
-    AITER_CHECK(K == KD && V == VD, "kda_replayssm_decode: head dims must be 128, got K=", K, " V=", V);
     AITER_CHECK(H > 0 && HV % H == 0, "kda_replayssm_decode: HV=", HV, " must be a multiple of H=", H);
     AITER_CHECK(max_query_len >= 1 && max_query_len <= MAXT,
                 "kda_replayssm_decode: max_query_len must be in [1, ", MAXT, "], got ", max_query_len);
     AITER_CHECK(cap <= MAXCAP && cap >= 2 * max_query_len,
                 "kda_replayssm_decode: cache_len must be in [2 * max_query_len, ", MAXCAP, "], got ", cap);
-    AITER_CHECK(q.dtype() == AITER_DTYPE_bf16 && k.dtype() == AITER_DTYPE_bf16 && v.dtype() == AITER_DTYPE_bf16 &&
-                    a.dtype() == AITER_DTYPE_bf16 && b.dtype() == AITER_DTYPE_bf16 &&
-                    o.dtype() == AITER_DTYPE_bf16,
-                "kda_replayssm_decode: q, k, v, a, b and o must be bf16");
+    AITER_CHECK(a.dtype() == AITER_DTYPE_bf16 && b.dtype() == AITER_DTYPE_bf16,
+                "kda_replayssm_decode: a and b must be bf16");
     AITER_CHECK(ckpt.dtype() == AITER_DTYPE_fp32 && A_log.dtype() == AITER_DTYPE_fp32 &&
                     dt_bias.dtype() == AITER_DTYPE_fp32,
                 "kda_replayssm_decode: ckpt, A_log and dt_bias must be fp32");
@@ -535,32 +753,22 @@ void kda_replayssm_decode(aiter_tensor_t& o,
     AITER_CHECK(write_pos.dtype() == AITER_DTYPE_i32 && slot_idx.dtype() == AITER_DTYPE_i32 &&
                     cu_seqlens.dtype() == AITER_DTYPE_i32,
                 "kda_replayssm_decode: write_pos, slot_idx and cu_seqlens must be int32");
-    AITER_CHECK(q.is_contiguous() && k.is_contiguous() && v.is_contiguous() && o.is_contiguous(),
-                "kda_replayssm_decode: q, k, v and o must be contiguous");
     // a and b may be column views of a wider buffer (Kimi-K3's beta is): only each token's row must be dense
-    AITER_CHECK(a.stride(-1) == 1 && a.stride(-2) == K && (a.stride(-3) * 2) % 16 == 0 && b.stride(-1) == 1,
+    AITER_CHECK(a.stride(-1) == 1 && a.stride(-2) == KD && (a.stride(-3) * 2) % 16 == 0 && b.stride(-1) == 1,
                 "kda_replayssm_decode: a needs dense, 16-byte aligned token rows and b unit head stride");
-    AITER_CHECK(ckpt.stride(-1) == 1 && ckpt.stride(-2) == K && ckpt.stride(-3) == V * K,
+    AITER_CHECK(ckpt.stride(-1) == 1 && ckpt.stride(-2) == KD && ckpt.stride(-3) == VD * KD,
                 "kda_replayssm_decode: ckpt must be [slot, HV, V, K] with contiguous heads");
     AITER_CHECK(buf_k.stride(-1) == 1 && buf_u.stride(-1) == 1 && buf_g.stride(-1) == 1 &&
                     buf_k.stride(-2) % 8 == 0 && buf_u.stride(-2) % 8 == 0 && buf_g.stride(-2) % 8 == 0,
                 "kda_replayssm_decode: record buffers must be [slot, HV, cache_len, D] with unit stride");
-    const aiter_tensor_t* aligned[] = {&q, &k, &v, &a, &o, &dt_bias, &ckpt, &buf_k, &buf_u, &buf_g};
+    const aiter_tensor_t* aligned[] = {&a, &dt_bias, &ckpt, &buf_k, &buf_u, &buf_g};
     for(const aiter_tensor_t* t : aligned)
         AITER_CHECK(reinterpret_cast<uintptr_t>(t->data_ptr()) % 16 == 0,
                     "kda_replayssm_decode: tensors must be 16-byte aligned");
-    if(N <= 0 || HV <= 0)
-        return;
-
-    Params prm;
-    prm.q               = static_cast<const uint16_t*>(q.data_ptr());
-    prm.k               = static_cast<const uint16_t*>(k.data_ptr());
-    prm.v               = static_cast<const uint16_t*>(v.data_ptr());
     prm.a               = static_cast<const uint16_t*>(a.data_ptr());
     prm.b               = static_cast<const uint16_t*>(b.data_ptr());
     prm.A_log           = static_cast<const float*>(A_log.data_ptr());
     prm.dt_bias         = static_cast<const float*>(dt_bias.data_ptr());
-    prm.o               = static_cast<uint16_t*>(o.data_ptr());
     prm.ckpt            = static_cast<float*>(ckpt.data_ptr());
     prm.buf_k           = static_cast<uint16_t*>(buf_k.data_ptr());
     prm.buf_u           = static_cast<uint16_t*>(buf_u.data_ptr());
@@ -588,29 +796,166 @@ void kda_replayssm_decode(aiter_tensor_t& o,
     prm.s_bg_pos        = buf_g.stride(2);
     prm.s_a_tok         = a.stride(-3);
     prm.s_b_tok         = b.stride(-2);
+}
 
-    HipDeviceGuard device_guard(q.device_id);
+template <int R, typename G>
+static void launch_rows(const Params& prm, dim3 grid, hipStream_t stream, int conv)
+{
+    const dim3 block(4 * VD / R);
+    if(conv == 0)
+        kda_replayssm_decode_kernel<R, G, 0><<<grid, block, 0, stream>>>(prm);
+    else if(conv == 1)
+        kda_replayssm_decode_kernel<R, G, 1><<<grid, block, 0, stream>>>(prm);
+    else
+        kda_replayssm_decode_kernel<R, G, 2><<<grid, block, 0, stream>>>(prm);
+}
+
+static void launch(const Params& prm, int64_t N, int64_t HV, bool g_fp32, int conv, int dev)
+{
+    if(N <= 0 || HV <= 0)
+        return;
+    HipDeviceGuard device_guard(dev);
     const hipStream_t stream = aiter::getCurrentHIPStream();
     const dim3 grid((unsigned)(N * HV));
-    const bool g_fp32 = buf_g.dtype() == AITER_DTYPE_fp32;
     // 4 V rows per lane on wave32 parts (gfx1250: best at every batch measured); 2 rows per lane on wave64 parts,
     // where the 128-thread block is only two waves
-    const int rpt = device_warp_size(q.device_id) == 32 ? 4 : 2;
-    if(rpt == 4)
+    if(device_warp_size(dev) == 32)
     {
         if(g_fp32)
-            kda_replayssm_decode_kernel<4, float><<<grid, dim3(4 * VD / 4), 0, stream>>>(prm);
+            launch_rows<4, float>(prm, grid, stream, conv);
         else
-            kda_replayssm_decode_kernel<4, uint16_t><<<grid, dim3(4 * VD / 4), 0, stream>>>(prm);
+            launch_rows<4, uint16_t>(prm, grid, stream, conv);
     }
     else
     {
         if(g_fp32)
-            kda_replayssm_decode_kernel<2, float><<<grid, dim3(4 * VD / 2), 0, stream>>>(prm);
+            launch_rows<2, float>(prm, grid, stream, conv);
         else
-            kda_replayssm_decode_kernel<2, uint16_t><<<grid, dim3(4 * VD / 2), 0, stream>>>(prm);
+            launch_rows<2, uint16_t>(prm, grid, stream, conv);
     }
     HIP_CALL(hipGetLastError());
+}
+} // namespace kda_replayssm
+
+void kda_replayssm_decode(aiter_tensor_t& o,
+                          aiter_tensor_t& ckpt,
+                          aiter_tensor_t& buf_k,
+                          aiter_tensor_t& buf_u,
+                          aiter_tensor_t& buf_g,
+                          const aiter_tensor_t& q,
+                          const aiter_tensor_t& k,
+                          const aiter_tensor_t& v,
+                          const aiter_tensor_t& a,
+                          const aiter_tensor_t& b,
+                          const aiter_tensor_t& A_log,
+                          const aiter_tensor_t& dt_bias,
+                          const aiter_tensor_t& write_pos,
+                          const aiter_tensor_t& slot_idx,
+                          const aiter_tensor_t& cu_seqlens,
+                          int max_query_len,
+                          float scale,
+                          bool use_qk_l2norm,
+                          bool use_lower_bound,
+                          float lower_bound)
+{
+    using namespace kda_replayssm;
+    const int64_t K  = q.size(-1);
+    const int64_t H  = q.size(-2);
+    const int64_t V  = v.size(-1);
+    const int64_t HV = v.size(-2);
+    AITER_CHECK(K == KD && V == VD, "kda_replayssm_decode: head dims must be 128, got K=", K, " V=", V);
+    AITER_CHECK(q.dtype() == AITER_DTYPE_bf16 && k.dtype() == AITER_DTYPE_bf16 && v.dtype() == AITER_DTYPE_bf16 &&
+                    o.dtype() == AITER_DTYPE_bf16,
+                "kda_replayssm_decode: q, k, v and o must be bf16");
+    AITER_CHECK(q.is_contiguous() && k.is_contiguous() && v.is_contiguous() && o.is_contiguous(),
+                "kda_replayssm_decode: q, k, v and o must be contiguous");
+    const aiter_tensor_t* aligned[] = {&q, &k, &v, &o};
+    for(const aiter_tensor_t* t : aligned)
+        AITER_CHECK(reinterpret_cast<uintptr_t>(t->data_ptr()) % 16 == 0,
+                    "kda_replayssm_decode: tensors must be 16-byte aligned");
+    Params prm{};
+    fill_state(prm, ckpt, buf_k, buf_u, buf_g, a, b, A_log, dt_bias, write_pos, slot_idx, cu_seqlens, H, HV,
+               max_query_len, scale, use_qk_l2norm, use_lower_bound, lower_bound);
+    prm.q = static_cast<const uint16_t*>(q.data_ptr());
+    prm.k = static_cast<const uint16_t*>(k.data_ptr());
+    prm.v = static_cast<const uint16_t*>(v.data_ptr());
+    prm.o = static_cast<uint16_t*>(o.data_ptr());
+    launch(prm, cu_seqlens.numel() - 1, HV, buf_g.dtype() == AITER_DTYPE_fp32, 0, q.device_id);
+}
+
+void kda_replayssm_decode_conv(aiter_tensor_t& o,
+                               aiter_tensor_t& ckpt,
+                               aiter_tensor_t& buf_k,
+                               aiter_tensor_t& buf_u,
+                               aiter_tensor_t& buf_g,
+                               aiter_tensor_t& conv_state,
+                               const aiter_tensor_t& x,
+                               const aiter_tensor_t& conv_weight,
+                               const aiter_tensor_t& conv_state_indices,
+                               const aiter_tensor_t& conv_state_indices_in,
+                               const aiter_tensor_t& num_accepted_tokens,
+                               const aiter_tensor_t& a,
+                               const aiter_tensor_t& b,
+                               const aiter_tensor_t& A_log,
+                               const aiter_tensor_t& dt_bias,
+                               const aiter_tensor_t& write_pos,
+                               const aiter_tensor_t& slot_idx,
+                               const aiter_tensor_t& cu_seqlens,
+                               int H,
+                               int HV,
+                               int max_query_len,
+                               float scale,
+                               bool use_qk_l2norm,
+                               bool use_lower_bound,
+                               float lower_bound)
+{
+    using namespace kda_replayssm;
+    const int64_t dim  = x.size(-1);
+    const int64_t kdim = (int64_t)H * KD;
+    AITER_CHECK(H == HV, "kda_replayssm_decode_conv: needs H == HV (shared q/k channels would race on the conv state)");
+    AITER_CHECK(dim == 2 * kdim + (int64_t)HV * VD,
+                "kda_replayssm_decode_conv: x has ", dim, " channels, expected 2 * H * 128 + HV * 128");
+    AITER_CHECK(x.dtype() == AITER_DTYPE_bf16 && x.stride(-1) == 1 && x.stride(-2) % 4 == 0 &&
+                    reinterpret_cast<uintptr_t>(x.data_ptr()) % 8 == 0,
+                "kda_replayssm_decode_conv: x must be bf16 rows, 8-byte aligned, row stride a multiple of 4");
+    AITER_CHECK(conv_weight.dtype() == AITER_DTYPE_fp32 && conv_weight.size(-1) == 4 && conv_weight.size(0) == dim &&
+                    conv_weight.is_contiguous() && reinterpret_cast<uintptr_t>(conv_weight.data_ptr()) % 16 == 0,
+                "kda_replayssm_decode_conv: conv_weight must be a contiguous fp32 [dim, 4]");
+    AITER_CHECK(conv_state.dtype() == AITER_DTYPE_bf16 && conv_state.size(1) == dim &&
+                    conv_state.size(2) >= 3 + max_query_len - 1,
+                "kda_replayssm_decode_conv: conv_state must be bf16 [lines, dim, >= 2 + max_query_len]");
+    const int64_t N = cu_seqlens.numel() - 1;
+    AITER_CHECK(conv_state_indices.dtype() == AITER_DTYPE_i32 && conv_state_indices_in.dtype() == AITER_DTYPE_i32 &&
+                    num_accepted_tokens.dtype() == AITER_DTYPE_i32,
+                "kda_replayssm_decode_conv: conv indices and num_accepted_tokens must be int32");
+    AITER_CHECK(conv_state_indices.numel() >= N && conv_state_indices_in.numel() >= N &&
+                    num_accepted_tokens.numel() >= N,
+                "kda_replayssm_decode_conv: conv indices and num_accepted_tokens need one entry per request");
+    AITER_CHECK(o.dtype() == AITER_DTYPE_bf16 && o.is_contiguous() &&
+                    reinterpret_cast<uintptr_t>(o.data_ptr()) % 16 == 0,
+                "kda_replayssm_decode_conv: o must be a contiguous bf16 [T, HV, V]");
+    Params prm{};
+    fill_state(prm, ckpt, buf_k, buf_u, buf_g, a, b, A_log, dt_bias, write_pos, slot_idx, cu_seqlens, H, HV,
+               max_query_len, scale, use_qk_l2norm, use_lower_bound, lower_bound);
+    prm.o            = static_cast<uint16_t*>(o.data_ptr());
+    prm.x            = static_cast<const uint16_t*>(x.data_ptr());
+    prm.conv_state   = static_cast<uint16_t*>(conv_state.data_ptr());
+    prm.conv_w       = static_cast<const float*>(conv_weight.data_ptr());
+    prm.conv_idx     = static_cast<const int*>(conv_state_indices.data_ptr());
+    prm.conv_idx_in  = static_cast<const int*>(conv_state_indices_in.data_ptr());
+    prm.num_accepted = static_cast<const int*>(num_accepted_tokens.data_ptr());
+    prm.s_x_tok      = x.stride(-2);
+    prm.s_cs_line    = conv_state.stride(0);
+    prm.s_cs_dim     = conv_state.stride(1);
+    prm.s_cs_tok     = conv_state.stride(2);
+    prm.s_cidx       = conv_state_indices.stride(0);
+    prm.s_cidx_in    = conv_state_indices_in.stride(0);
+    prm.s_nacc       = num_accepted_tokens.stride(0);
+    prm.kdim         = (int)kdim;
+    // unit channel stride (ATOM / vLLM keep the window token-major): one word per lane and token, else per channel
+    const bool cs_vec = conv_state.stride(1) == 1 && conv_state.stride(2) % 4 == 0 && conv_state.stride(0) % 4 == 0 &&
+                        reinterpret_cast<uintptr_t>(conv_state.data_ptr()) % 8 == 0;
+    launch(prm, N, HV, buf_g.dtype() == AITER_DTYPE_fp32, cs_vec ? 1 : 2, x.device_id);
 }
 
 } // namespace aiter
