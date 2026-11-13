@@ -602,15 +602,6 @@ MlaAsmDecodeCfg mla_asm_decode_config(const std::string& arch_id,
     if(c.status != MlaAsmStatus::Ok)
         return c;
 
-    if(arch_id == "gfx950" && q_type == "bf16" && kv_type == "bf16" &&
-       gqa_ratio == 32 && max_seqlen_q == 4 && page_size == 1 &&
-       !persistent && !causal && !has_cprr)
-    {
-        c.qseqlen = 4;
-        c.causal  = 0;
-        c.sub_q   = 128;
-    }
-
     c.kernel = try_get_heuristic_kernel_mla(q_type,
                                             kv_type,
                                             c.gqa,
@@ -626,6 +617,36 @@ MlaAsmDecodeCfg mla_asm_decode_config(const std::string& arch_id,
                                             kv_shuffled ? 1 : 0);
     if(!c.kernel.empty())
         return c;
+    if(!persistent && !has_cprr && !kv_shuffled && page_size == 1 &&
+       (max_seqlen_q == 1 || !causal))
+    {
+        for(const auto& entry : cfg_mla_asm)
+        {
+            if(entry.first.find(arch_id) != 0)
+                continue;
+            const auto& cfg = entry.second;
+            if(cfg.qType != q_type || cfg.kvType != kv_type || cfg.ps != 0 ||
+               cfg.prefill != 0 || cfg.causal != 0 || cfg.lse != 0 || cfg.cprr != 0 ||
+               cfg.page_size != 0 || cfg.kv_shuffled != 0 || cfg.Gqa <= 0 || cfg.qSeqLen <= 0)
+                continue;
+            const bool exact_shape = cfg.Gqa == gqa_ratio && cfg.qSeqLen == max_seqlen_q;
+            const bool folded_shape = max_seqlen_q == 1 && cfg.Gqa < gqa_ratio &&
+                                      gqa_ratio % cfg.Gqa == 0 &&
+                                      cfg.qSeqLen == gqa_ratio / cfg.Gqa;
+            if(!exact_shape && !folded_shape)
+                continue;
+            if(!c.kernel.empty() && cfg.Gqa <= c.gqa)
+                continue;
+            c.gqa     = cfg.Gqa;
+            c.qseqlen = cfg.qSeqLen;
+            c.causal  = cfg.causal;
+            c.sub_q   = cfg.Gqa * cfg.qSeqLen;
+            c.s_mqa   = c.sub_q;
+            c.kernel  = entry.first;
+        }
+        if(!c.kernel.empty())
+            return c;
+    }
     bool arch_built = false;
     for(const auto& el : cfg_mla_asm)
         arch_built = arch_built || el.first.find(arch_id) == 0;
@@ -1515,6 +1536,9 @@ AITER_CTYPES_DEFINE_ENTRYPOINT_VOID(
                               kv_shuffled != 0,
                               page_size);
     AITER_CHECK(dcfg.status != MlaAsmStatus::RemapReject, __func__, dcfg.reason);
+    AITER_CHECK(persistent || dcfg.status != MlaAsmStatus::Ok ||
+                    dcfg.gqa == num_heads / num_kv_heads,
+                __func__, ": head folding is required; use aiter.mla.mla_decode_fwd");
     AITER_CHECK(
         dcfg.max_q_x_kv_split == 0 || kv_split == 1 ||
             (int64_t)Q->size(0) * kv_split <= dcfg.max_q_x_kv_split,

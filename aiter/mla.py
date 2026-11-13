@@ -16,7 +16,7 @@ import aiter
 from aiter import dtypes
 from aiter.jit.core import is_experimental_enabled
 from aiter.jit.utils.asm_guard import require_gfx1250_asm
-from aiter.jit.utils.chip_info import get_cu_num, get_gfx
+from aiter.jit.utils.chip_info import get_cu_num, get_gfx, get_gfx_runtime
 from aiter.ops.asm.asm_utils import get_gfx_from_device
 from aiter.ops.asm.mla_decode_v4 import (
     is_mla_v4_fused_eligible,
@@ -26,6 +26,7 @@ from aiter.ops.asm.mla_decode_v4 import (
     mla_v4_fused_slot_f32,
 )
 from aiter.ops.attention import (
+    _mla_decode_asm_head_layout,
     _mla_decode_launch_plan,
     _MlaBackendId,
     _MlaHeadPlanKind,
@@ -1224,18 +1225,24 @@ def mla_decode_fwd(
     heads_as_queries = False
 
     if not persistent_mode:
-        heads_as_queries = (
-            nhead == 128
+        asm_heads, asm_qlen = nhead, max_seqlen_q
+        if (
+            not kv_shuffled_flag
             and nhead_kv == 1
             and max_seqlen_q == 1
-            and page_size == 1
-            and q.dtype == dtypes.bf16
-            and kv_buffer.dtype == dtypes.bf16
             and g_kv_indptr is None
             and cp_world_size == 1
             and cp_rank == 0
-            and get_gfx() == "gfx950"
-        )
+        ):
+            asm_heads, asm_qlen = _mla_decode_asm_head_layout(
+                nhead,
+                max_seqlen_q,
+                q.dtype,
+                kv_buffer.dtype,
+                get_gfx_runtime(),
+                page_size,
+            )
+        heads_as_queries = asm_heads != nhead
         if kv_shuffled_flag:
             if num_kv_splits is None:
                 if total_kv == 0:
@@ -1262,12 +1269,13 @@ def mla_decode_fwd(
                 num_kv_splits, bs, total_kv, nhead, max_seqlen_q, q.dtype
             )
         if heads_as_queries:
-            q = q.view(total_s * 4, 32, qk_head_dim)
-            o = o.view(total_s * 4, 32, v_head_dim)
-            qo_indptr = qo_indptr * 4
-            total_s *= 4
-            nhead = 32
-            max_seqlen_q = 4
+            head_fold = nhead // asm_heads
+            q = q.view(total_s * head_fold, asm_heads, qk_head_dim)
+            o = o.view(total_s * head_fold, asm_heads, v_head_dim)
+            qo_indptr = qo_indptr * head_fold
+            total_s *= head_fold
+            nhead = asm_heads
+            max_seqlen_q = asm_qlen
             causal = False
         mgc = (
             64
@@ -1308,7 +1316,7 @@ def mla_decode_fwd(
                 max_seqlen_q == 1
                 or (max_seqlen_q == 4 and page_size == 1 and not causal)
             )
-            and get_gfx() == "gfx950"
+            and get_gfx_runtime() == "gfx950"
         ):
             mgc = 32
         # gfx950 fp8 gqa16 qlen1 kernel (a8w8_qh16_qseqlen1) does the same with
@@ -1719,7 +1727,7 @@ def mla_decode_fwd(
 
     if heads_as_queries:
         logits = (
-            logits.view(ori_total_s, 4, num_kv_splits, 32, v_head_dim)
+            logits.view(ori_total_s, head_fold, num_kv_splits, nhead, v_head_dim)
             .permute(0, 2, 1, 3, 4)
             .reshape(ori_total_s, num_kv_splits, ori_nhead, v_head_dim)
         )
