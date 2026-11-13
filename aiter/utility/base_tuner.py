@@ -2,6 +2,7 @@
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
 import argparse
+import math
 import os
 import shutil
 import sys
@@ -528,11 +529,56 @@ class TunerCommon:
         merge_df.to_csv(new_file_path, index=False)
         return new_file_path
 
+    # Columns of an untuned shape list that name a quantization dtype.
+    _QUANT_DTYPE_COLS: ClassVar[tuple[str, ...]] = ("q_dtype_a", "q_dtype_w")
+
+    @staticmethod
+    def _resolve_fp8_name(value):
+        """Map a 'torch.float8_e4m3*' cell onto the arch-native e4m3 encoding.
+
+        Only one e4m3 encoding exists per chip (gfx942 e4m3fnuz, gfx950 OCP
+        e4m3fn), so a shape list naming the other one describes an unrunnable
+        configuration rather than a distinct problem; left alone it aborts with
+        "Unsupported dtype" or is silently skipped by the tuners that require
+        q_dtype_w == dtypes.fp8.
+
+        Resolved by name lookup rather than eval(): these cells come from CSV
+        files whose path is caller-supplied, and eval() would turn the tuner
+        into a code-execution sink. Anything that is not a recognised e4m3
+        dtype name is returned untouched.
+        """
+        if not isinstance(value, str):
+            return value
+        name = value.strip()
+        if not name.startswith("torch.float8_e4m3"):
+            return value
+        dtype = getattr(torch, name[len("torch.") :], None)
+        if dtype is None:
+            return value
+        return str(dtypes.normalize_fp8_dtype(dtype))
+
+    def _normalize_fp8_columns(self, untunedf):
+        """Resolve the fp8 flavor of every quant-dtype column in a shape list.
+
+        Applied on ingest, in the shared loader, so that every tuner family
+        benefits -- a8w8, a8w8_bpreshuffle, blockscale, batched and fmoe alike.
+        Normalizing here rather than at point of use also keeps the shape keys,
+        the tuned rows we emit and the tuner's own tuned/untuned bookkeeping all
+        agreeing on one dtype; applied late, a tuned row lands as e4m3fnuz while
+        the untuned frame still says e4m3fn and the shape is reported as never
+        tuned.
+        """
+        for col in self._QUANT_DTYPE_COLS:
+            if col in untunedf.columns:
+                untunedf[col] = untunedf[col].map(self._resolve_fp8_name)
+        return untunedf
+
     def get_untuned_gemm_list(self, untuned_gemm_file):
         assert os.path.exists(
             untuned_gemm_file
         ), f"Not exist untuned file: {untuned_gemm_file}"
         untunedf = _read_csv(untuned_gemm_file)
+        untunedf = self._normalize_fp8_columns(untunedf)
         filtered_df = untunedf.drop_duplicates().reset_index(drop=True)
         return filtered_df
 
@@ -779,13 +825,18 @@ class TunerCommon:
 
         for info_key, time_list in grouped_results:
             tol_err_ratio = args.errRatio
-            sorted_time = sorted(time_list, key=lambda x: policy.rank(x[1], x[3]))
+            # Drop invalid candidates before sorting: a NaN timing makes every
+            # comparison False, so sorting first leaves the list out of order.
+            valid_time = [
+                (info_ex, us, max_err_ratio, watts)
+                for info_ex, us, max_err_ratio, watts in time_list
+                if max_err_ratio <= tol_err_ratio and math.isfinite(us) and us > 0
+            ]
             filtered_time = [
                 (info_ex, round(us, 4), max_err_ratio, watts)
-                for info_ex, us, max_err_ratio, watts in sorted_time
-                if max_err_ratio <= tol_err_ratio
-                and us != self.INVALID_TIME
-                and us != self.INF_TIME
+                for info_ex, us, max_err_ratio, watts in sorted(
+                    valid_time, key=lambda x: policy.rank(x[1], x[3])
+                )
             ]
             if len(filtered_time) == 0:
                 logger.error(
@@ -803,7 +854,7 @@ class TunerCommon:
             if not best_config:
                 logger.info(f"No kernel can be used for {info_key}")
                 best_config = [
-                    TuneResult((info_key, *sorted_time[0][0]), self.INVALID_TIME, 1.0)
+                    TuneResult((info_key, *time_list[0][0]), self.INVALID_TIME, 1.0)
                 ]
             bestConfigs.extend(best_config)
         resultdf = policy.attach_columns(self.result_to_df(bestConfigs), bestConfigs)
@@ -1902,7 +1953,7 @@ class GemmCommonTuner(TunerCommon):
         ### bpes: (inbpe, w_bpe, outbpe)
         ### gemm flops,bw
         info, time, _err_ratio = results
-        if time == -1:
+        if not math.isfinite(time) or time <= 0:
             return 0, 0
         if len(info[0]) >= 5:  # gfx-aware key: (gfx, cu_num, m, n, k, ...)
             _gfx, _cu_num, m, n, k, *_rest = info[0]
@@ -1961,29 +2012,23 @@ class GemmCommonTuner(TunerCommon):
     def result_to_csv(self, resultdf, file, concat=False):
         """post process of tuning results"""
         old_df = self.get_tuned_gemm_list(file)
+        numeric_us = pd.to_numeric(resultdf["us"], errors="coerce")
+        valid_time = numeric_us.gt(0) & numeric_us.map(math.isfinite)
         self.failed = pd.concat(
             [
                 self.failed,
-                resultdf[
-                    (resultdf["us"] == self.INVALID_TIME)
-                    | (resultdf["us"] == self.INF_TIME)
-                ],
+                resultdf[~valid_time],
             ],
             ignore_index=True,
         )
         self.success = pd.concat(
             [
                 self.success,
-                resultdf[
-                    (resultdf["us"] != self.INVALID_TIME)
-                    & (resultdf["us"] != self.INF_TIME)
-                ],
+                resultdf[valid_time],
             ],
             ignore_index=True,
         )
-        update_tunedf = resultdf[
-            (resultdf["us"] != self.INVALID_TIME) & (resultdf["us"] != self.INF_TIME)
-        ]  # self.success
+        update_tunedf = resultdf[valid_time]  # self.success
         if not concat:
             resultdf = self.update_tunedf(old_df, update_tunedf)
         else:

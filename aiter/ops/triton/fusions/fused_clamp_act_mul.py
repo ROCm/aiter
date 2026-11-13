@@ -25,6 +25,9 @@ _GLUON_SUPPORTED_ARCHS = (
     "gfx1250-strict",
 )
 _CONFIG_NAME = "FUSED_CLAMP_ACT_MUL"
+# The half width (N // 2) must be a positive multiple of this. Callers that
+# gate on it read it from here.
+N_HALF_MULTIPLE = 32
 
 
 def _is_gluon_available() -> bool:
@@ -133,7 +136,9 @@ def fused_clamp_act_mul(
         out if no quant, otherwise (out, scale).
 
     Constraints:
-        N must be a power of two, at least 128, and a multiple of 128.
+        N // 2 must be a positive multiple of N_HALF_MULTIPLE (32). When
+        quantizing, a last group that N // 2 does not fill is scaled over its
+        real columns.
     """
 
     # setup inputs
@@ -216,8 +221,12 @@ def fused_clamp_act_mul(
         else:
             assert out.shape == (M, n_half)
 
-    assert n_half >= 128
-    assert n_half % 128 == 0
+    # Both kernels read the columns past n_half within their power-of-two tile
+    # as zero, so a last quant group that straddles n_half takes its scale over
+    # its real columns only.
+    assert (
+        n_half >= N_HALF_MULTIPLE and n_half % N_HALF_MULTIPLE == 0
+    ), f"n_half ({n_half}) must be a multiple of {N_HALF_MULTIPLE}"
 
     # default block width is the whole row, can change at config
     BLOCK_SIZE_N = triton.next_power_of_2(n_half)
@@ -288,6 +297,11 @@ def fused_clamp_act_mul(
         BLOCK_SIZE_N = config["BLOCK_SIZE_N"]
         num_warps = config["num_warps"]
         waves_per_eu = config["waves_per_eu"]
+
+        if not HAS_QUANT:
+            # The kernel shapes its scale tile by the group even when it
+            # writes no scale, so the group has to fit in the N tile.
+            quant_block_size = min(quant_block_size, BLOCK_SIZE_N)
 
         # ensure quant block can be safely applied to N tile
         assert BLOCK_SIZE_N % quant_block_size == 0, (
