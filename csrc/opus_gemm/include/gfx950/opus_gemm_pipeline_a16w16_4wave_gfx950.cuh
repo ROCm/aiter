@@ -15,7 +15,9 @@
 //     read with ds_read_b128; an M/N-contiguous one ([K, rows]) is copied row-wise with a 32-byte
 //     window swizzle and read with ds_read_b64_tr_b16 (4 per operand).
 //   * A operands live in a[0:63], B operands in a[64:127], C in a[128:255] + v[128:...] (pinned).
-//   * C is written back through LDS (bf16 image, rows padded by 8), one quadrant at a time.
+//   * C (bf16, + optional bias) is written back through LDS (image rows padded by 8), one quadrant at a
+//     time. Split-K: each split writes its fp32 partial tile into the workspace of
+//     splitk_reduce_gfx950.cuh, whose reduce kernel produces C.
 #pragma once
 
 #include "opus_gemm_traits_a16w16_gfx950.cuh"
@@ -219,7 +221,7 @@ __global__ __launch_bounds__(Traits::BLOCK_SIZE, 1) void gemm_a16w16_4wave_kerne
     using T = opus::remove_cvref_t<Traits>;
     using D_C = typename T::D_C;
     using D_ACC = typename T::D_ACC;
-    using D_OUT = typename T::D_OUT;    // D_C, or fp32 partial sums (SPLITK)
+    using D_OUT = typename T::D_OUT;    // bf16 C, or fp32 partial sums (SPLITK)
     using D_BIAS = typename T::D_BIAS;
     using D_AB = opus::u8_t;            // operands are addressed in bytes
 
