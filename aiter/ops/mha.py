@@ -893,6 +893,40 @@ def fmha_fwd_fp8_varlen_asm(
         softmax_scale = q.size(-1) ** (-0.5)
     cu_seqlens_q = cu_seqlens_q.to(torch.int32).contiguous()
     cu_seqlens_k = cu_seqlens_k.to(torch.int32).contiguous()
+    # A non-causal call whose grid would leave most CUs idle runs as S contiguous key parts
+    # of one varlen batch, merged by LSE (aiter/ops/fmha_fp8_split_kv.py); same (out, lse).
+    if not is_causal:
+        from aiter.ops.fmha_fp8_split_kv import (
+            can_split,
+            fmha_fwd_fp8_varlen_asm_split,
+            split_factor,
+        )
+
+        parts = split_factor(
+            cu_seqlens_q.numel() - 1,
+            q.shape[1],
+            max_seqlen_q,
+            max_seqlen_k,
+            False,
+            q.device,
+        )
+        if parts > 1 and can_split(q):
+            return fmha_fwd_fp8_varlen_asm_split(
+                _fmha_fwd_fp8_varlen_asm,
+                q,
+                k,
+                v,
+                q_descale,
+                k_descale,
+                v_descale,
+                cu_seqlens_q,
+                cu_seqlens_k,
+                max_seqlen_q,
+                max_seqlen_k,
+                softmax_scale,
+                parts,
+                out=out,
+            )
 
     total_q, q_head_num, _qk_head_dim = q.shape
     v_head_dim = v.size(2)
