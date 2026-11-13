@@ -19,6 +19,7 @@ import ctypes
 import functools
 import os
 import pickle
+from collections.abc import Callable
 from contextlib import contextmanager
 from typing import Any, ClassVar, NamedTuple
 
@@ -46,11 +47,13 @@ from .rocm_version import get_rocm_version
 # checked at import time.
 try:
     from aiter.ops.flydsl import allreduce_policy as fly_policy
+    from aiter.ops.flydsl.allreduce_host_shared import eligible_payload_bytes
     from aiter.ops.flydsl.one_shot_allreduce import OneShotAllReduce
 
     _FLY_IMPORT_OK = True
 except Exception:  # noqa: BLE001
     fly_policy = None
+    eligible_payload_bytes = None
     OneShotAllReduce = None
     _FLY_IMPORT_OK = False
 
@@ -243,6 +246,68 @@ _IPC_MIN_ROCM = (7, 14)
 # custom_all_reduce_gfx1250.cuh).
 _GFX1250_LL_MAX_BYTES = 4 * 1024 * 1024
 
+# gfx1250 plain all-reduce cutoff (bytes) per world size while
+# AITER_CUSTOM_AR_MAX_SIZE is unset: CudaCommunicator.all_reduce runs the custom
+# kernels up to it and RCCL above it. It is about where RCCL overtakes the LL
+# kernels, MI455X, bf16 in a CUDA graph, us an all-reduce:
+# - TP2, one tray: the one-shot is level with RCCL at 4.19 MB (16.0 vs 15.3);
+#   past 4 MiB the pull takes 26.6 at 4.59 MB, RCCL 21.9.
+# - TP4, one tray: the two-shot leads at 4.59 MB (22.2 vs 24.1), RCCL from
+#   5.73 MB (25.8 vs 26.2).
+# - TP8, two trays: the two-shot leads up to 8.39 MB (39.2 vs 43.7); past
+#   8 MiB the pull takes 405 at 14.68 MB, RCCL 55.
+# It never exceeds what the LL kernels take (ll_ar_max_bytes). Other world
+# sizes, and the fused AR + RMSNorm paths, keep _car_max_size. See
+# CustomAllreduce.should_custom_plain_ar.
+_GFX1250_PLAIN_AR_MAX_SIZE = {
+    2: 4 * 1024 * 1024,
+    4: 4 * 1024 * 1024,
+    8: 8 * 1024 * 1024,
+}
+
+# Largest input the gfx1250 Lamport one-shot fused AR + RMSNorm takes, per world
+# size; it also sizes the per-rank inbox (3 x world_size x this, so 96 MiB at
+# both TP2 and TP4). Above it fused_allreduce_rmsnorm keeps the LL all-reduce +
+# RMSNorm / barrier fused kernel route. Timed on 4x gfx1250 (CUDA graphs, bf16,
+# hidden 2048-8192) against that route: TP2 1.2-2.4x up to 16 MiB but only
+# 1.04-1.07x at 28-57 MiB; TP4 1.27-1.86x up to 8 MiB, 0.95-1.2x at 14-16 MiB.
+# TP6/TP8 are not measured and stay off unless the env var below sets a size.
+_LAMPORT_AR_RMS_MAX_BYTES = {2: 16 * 1024 * 1024, 4: 8 * 1024 * 1024}
+_LAMPORT_AR_RMS_MAX_SIZE_ENV = "AITER_CUSTOM_AR_LAMPORT_RMS_MAX_SIZE"
+# Each rank owns 16B packs of whole waves of 32 (kLamportWave).
+_LAMPORT_AR_RMS_GRAIN = 512
+# hidden must be whole waves of 16B packs and a row at most one 1024-thread
+# block (kLamportRowMaxThreads), in elements of a 2-byte dtype.
+_LAMPORT_AR_RMS_HIDDEN_GRAIN = 256
+_LAMPORT_AR_RMS_MAX_HIDDEN = 8192
+
+
+def _resolve_lamport_ar_rms_max_size(world_size: int) -> int:
+    """Lamport fused AR + RMSNorm size cap (bytes) for this world size.
+
+    ``AITER_CUSTOM_AR_LAMPORT_RMS_MAX_SIZE`` overrides the measured default for
+    every world size; 0 turns the path off. The value is rounded down to whole
+    waves of packs. It must be the same on every rank.
+    """
+    default = _LAMPORT_AR_RMS_MAX_BYTES.get(world_size, 0)
+    raw = os.environ.get(_LAMPORT_AR_RMS_MAX_SIZE_ENV, "").strip()
+    if raw == "":
+        return default
+    try:
+        v = int(raw)
+    except ValueError:
+        v = -1
+    if v < 0:
+        logger.warning(
+            "%s=%r is not a non-negative integer; using default %d bytes.",
+            _LAMPORT_AR_RMS_MAX_SIZE_ENV,
+            raw,
+            default,
+        )
+        return default
+    return v // _LAMPORT_AR_RMS_GRAIN * _LAMPORT_AR_RMS_GRAIN
+
+
 # Max input bytes custom_all_reduce_residual fuses, per (arch, TP); None = no
 # limit. Larger inputs and unlisted pairs fall back to all-reduce + add.
 # Timed end to end on CUDA graphs on MI300X (gfx942) and MI355X (gfx950).
@@ -380,6 +445,8 @@ class _CustomSizes(NamedTuple):
     ar_prefill: int
     ag: int
     rs: int
+    # Whether AITER_CUSTOM_AR_MAX_SIZE set ar.
+    ar_set: bool = False
 
 
 def _resolve_custom_sizes(
@@ -457,7 +524,27 @@ def _resolve_custom_sizes(
     for name, v in requested:
         if v == 0:
             logger.info("%s=0: that op always falls back to RCCL.", name)
-    return _CustomSizes(pool, ar, ar_prefill, ag, rs)
+    return _CustomSizes(pool, ar, ar_prefill, ag, rs, ar_set)
+
+
+def _resolve_plain_ar_max_size(
+    is_gfx1250: bool,
+    world_size: int,
+    sizes: _CustomSizes,
+    ll_ar_max_bytes: Callable[[int], int] | None,
+) -> int:
+    """Cutoff (bytes) for plain all-reduce, i.e. CudaCommunicator.all_reduce.
+
+    ``sizes.ar``, except on gfx1250 at a world size listed in
+    _GFX1250_PLAIN_AR_MAX_SIZE with AITER_CUSTOM_AR_MAX_SIZE unset. There it is
+    the listed size, capped at ``ll_ar_max_bytes(world_size)``, the largest
+    input the LL kernels take. Nothing here depends on the rank, so every rank
+    takes the same path.
+    """
+    default = _GFX1250_PLAIN_AR_MAX_SIZE.get(world_size)
+    if not is_gfx1250 or sizes.ar_set or default is None:
+        return sizes.ar
+    return min(sizes.ar, default, ll_ar_max_bytes(world_size))
 
 
 def _resolve_car_min_size() -> int:
@@ -1230,6 +1317,8 @@ class CustomAllreduce:
         self._register_for_capturing_requested = False
         self._register_for_capturing_opt_out = False
         self._is_gfx1250 = _is_gfx1250  # kernel dimension (arch)
+        # Lamport fused AR + RMSNorm size cap; 0 until its inbox is set up.
+        self._lamport_max_bytes = 0
         self._use_vmm = _use_vmm  # transport dimension (arch + ROCm version)
         self._use_symm_mem = _use_symm_mem  # torch.symm_mem transport (mori backend)
         self._select_ops()
@@ -1393,15 +1482,22 @@ class CustomAllreduce:
         self.max_size = sizes.pool
         self._car_max_size = sizes.ar
         self._car_prefill_max_size = sizes.ar_prefill
+        self._plain_ar_max_size = _resolve_plain_ar_max_size(
+            self._is_gfx1250,
+            world_size,
+            sizes,
+            ops.ll_ar_max_bytes_gfx1250 if self._is_gfx1250 else None,
+        )
         self._cag_max_size = sizes.ag
         self._crs_max_size = sizes.rs
         logger.info(
             "Custom allreduce rank %d: input pool %d bytes; cutoffs AR %d "
-            "(prefill %d), AG %d, RS %d bytes.",
+            "(prefill %d, plain %d), AG %d, RS %d bytes.",
             rank,
             sizes.pool,
             sizes.ar,
             sizes.ar_prefill,
+            self._plain_ar_max_size,
             sizes.ag,
             sizes.rs,
         )
@@ -1892,9 +1988,52 @@ class CustomAllreduce:
             [h.data_ptr() for h in handles],
             offsets,
         )
-        if not self._is_gfx1250:
+        if self._is_gfx1250:
+            self._init_lamport_ar_rms(world_size)
+        else:
             self._initLamport(world_size)
 
+    # TODO: the lamport init is one per arch, each with one lamport op for now:
+    #   gfx9    -> _initLamport          lamport all_reduce
+    #   gfx1250 -> _init_lamport_ar_rms  lamport fused AR + RMSNorm
+    # gfx9 is getting lamport AR + RMSNorm and gfx1250 lamport all_reduce, so
+    # each arch's init will set up both ops. Keeping one init per arch is fine
+    # (memory type, IPC mapping and C++ state already differ per arch), as is
+    # sharing one init. Either way, when the second op lands on an arch:
+    #   - both ops create the pool "lamport" today: give the second op its own
+    #     key, or let both ops share one inbox,
+    #   - keep each op's on/off and size switch, agreed across ranks:
+    #     AITER_CUSTOM_AR_DISABLE_LAMPORT / self.lamport_enabled for all_reduce,
+    #     AITER_CUSTOM_AR_LAMPORT_RMS_MAX_SIZE / self._lamport_max_bytes for
+    #     AR + RMSNorm,
+    #   - name the init after the arch, not the op.
+    def _init_lamport_ar_rms(self, world_size: int):
+        """Set up the Lamport fused AR + RMSNorm inbox (IPC transport only).
+
+        Cached memory: polling it measured 0.3-1.5 us faster than uncached.
+        """
+        max_bytes = _resolve_lamport_ar_rms_max_size(world_size)
+        if max_bytes <= 0:
+            return
+        _COARSE_GRAIN = 2 * 1024 * 1024
+        size = ops.lamport_ar_rms_buffer_size_gfx1250(world_size, max_bytes)
+        size = (size + _COARSE_GRAIN - 1) // _COARSE_GRAIN * _COARSE_GRAIN
+        self._pool.create("lamport", size, raw_cached=True)
+        ptrs = self._pool.open_peer_buffers("lamport")
+        ops.init_lamport_ar_rms_gfx1250(self._ptr, ptrs, max_bytes)
+        # every rank's 0xff memset must land before any rank's first push
+        dist.barrier(group=self.group)
+        self._lamport_max_bytes = max_bytes
+        logger.info(
+            "Custom allreduce gfx1250 Lamport fused AR + RMSNorm: up to %d bytes "
+            "(inbox %d bytes per rank)",
+            max_bytes,
+            size,
+        )
+
+    # TODO: the gfx9 lamport init, lamport all_reduce only for now; it also
+    # sets up lamport AR + RMSNorm once gfx9 has it, see the TODO above
+    # _init_lamport_ar_rms.
     def _initLamport(self, world_size: int):
         """Set up the lamport one-shot / two-shot path of all_reduce.
 
@@ -2140,22 +2279,28 @@ class CustomAllreduce:
             return False
         if open_fp8_quant or not use_new:
             return False
-        if inp.dtype is not torch.bfloat16:
-            return False
-        if not inp.is_contiguous():
-            return False
-        if inp.data_ptr() % 16:
-            return False
-        if inp.device.index != self.device.index:
-            return False
-        nbytes = inp.numel() * inp.element_size()
-        if nbytes > fly_policy.MAX_PAYLOAD_BYTES:
+        nbytes = eligible_payload_bytes(inp, device=self.device)
+        if nbytes is None:
             return False
         return self._fly_window.contains(nbytes)
 
     def should_custom_ar(self, inp: torch.Tensor, prefill_support: bool = False):
         return self._fits_custom_ar_size(inp, prefill_support) and is_weak_contiguous(
             inp
+        )
+
+    def should_custom_plain_ar(
+        self, inp: torch.Tensor, prefill_support: bool = False
+    ) -> bool:
+        """should_custom_ar for plain all-reduce (CudaCommunicator.all_reduce).
+
+        On gfx1250 with AITER_CUSTOM_AR_MAX_SIZE unset, inputs above the
+        measured RCCL crossover go to RCCL (_resolve_plain_ar_max_size). The
+        fused paths keep should_custom_ar.
+        """
+        return (
+            self.should_custom_ar(inp, prefill_support)
+            and inp.numel() * inp.element_size() <= self._plain_ar_max_size
         )
 
     def can_fuse_ar_rms(
@@ -2187,6 +2332,88 @@ class CustomAllreduce:
             not self._is_gfx1250
             or inp.numel() * inp.element_size() > _GFX1250_LL_MAX_BYTES
         )
+
+    def should_lamport_ar_rms(
+        self,
+        inp: torch.Tensor,
+        res_inp: torch.Tensor,
+        w: torch.Tensor,
+        out_hidden_dim: int,
+    ) -> bool:
+        """Whether lamport_fused_ar_rms takes this call (gfx1250, IPC transport).
+
+        Depends only on shapes, dtypes and the size cap, so every rank decides
+        the same; the kernel waits for its peers, a rank taking another path
+        would hang them.
+        """
+        if self.disabled or self._lamport_max_bytes <= 0:
+            return False
+        hidden = w.numel()
+        nbytes = inp.numel() * inp.element_size()
+        return (
+            inp.dtype in (torch.float16, torch.bfloat16)
+            and res_inp.dtype == w.dtype == inp.dtype
+            and inp.is_contiguous()
+            and res_inp.is_contiguous()
+            and w.is_contiguous()
+            and inp.shape[-1] == res_inp.shape[-1] == hidden == out_hidden_dim
+            and res_inp.numel() == inp.numel()
+            and hidden % _LAMPORT_AR_RMS_HIDDEN_GRAIN == 0
+            and hidden <= _LAMPORT_AR_RMS_MAX_HIDDEN
+            and 0 < nbytes <= self._lamport_max_bytes
+        )
+
+    def lamport_fused_ar_rms(
+        self,
+        inp: torch.Tensor,
+        res_inp: torch.Tensor,
+        w: torch.Tensor,
+        eps: float,
+        gemma_norm: bool = False,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Lamport one-shot all-reduce + residual add + RMSNorm.
+
+        Returns (out, residual_out), bit for bit those of fused_ar_rms. Needs
+        no registered input, so it runs the same eager, in warmup and in a
+        captured graph. Check should_lamport_ar_rms first.
+        """
+        out = torch.empty_like(inp)
+        res_out = torch.empty_like(inp)
+        ops.fused_allreduce_rmsnorm_lamport_gfx1250(
+            self._ptr, inp, res_inp, res_out, out, w, eps, gemma_norm
+        )
+        return out, res_out
+
+    def should_lamport_ar_add(self, inp: torch.Tensor, other: torch.Tensor) -> bool:
+        """Whether lamport_ar_add takes this call (gfx1250, IPC transport).
+
+        Shapes, dtypes and the size cap only, so every rank decides the same;
+        the kernel waits for its peers, a rank taking another path would hang
+        them.
+        """
+        if self.disabled or self._lamport_max_bytes <= 0:
+            return False
+        nbytes = inp.numel() * inp.element_size()
+        return (
+            inp.dtype in (torch.float16, torch.bfloat16)
+            and other.dtype == inp.dtype
+            and other.shape == inp.shape
+            and inp.is_contiguous()
+            and other.is_contiguous()
+            and inp.data_ptr() % 16 == 0
+            and other.data_ptr() % 16 == 0
+            and nbytes % 16 == 0
+            and 0 < nbytes <= self._lamport_max_bytes
+        )
+
+    def lamport_ar_add(self, inp: torch.Tensor, other: torch.Tensor) -> torch.Tensor:
+        """Lamport one-shot all-reduce of inp + other on the AR + RMSNorm inbox,
+        with the bits of all-reducing the materialized sum. Needs no registered
+        input, so it runs the same eager and in a captured graph. Check
+        should_lamport_ar_add first."""
+        out = torch.empty_like(inp)
+        ops.allreduce_add_lamport_gfx1250(self._ptr, inp, other, out)
+        return out
 
     def should_fuse_ar_residual(self, inp: torch.Tensor) -> bool:
         """Whether custom_all_reduce_residual beats all-reduce + add here."""
@@ -3434,6 +3661,11 @@ class CustomAllreduce:
         # Free the meta + input (max_size) buffers deterministically
         # instead of leaving them for GC to reclaim via IPCBuffer.__del__.
         pool = getattr(self, "_pool", None)
+        if pool is not None and hasattr(pool, "close_peer_buffers"):
+            try:
+                pool.close_peer_buffers()  # the Lamport inboxes of the peers
+            except (OSError, RuntimeError):
+                pass
         if pool is not None and hasattr(pool, "close"):
             pool.close()
 

@@ -30,6 +30,7 @@ from dataclasses import dataclass, field, replace
 from functools import wraps
 from importlib import metadata
 from inspect import Parameter, Signature, signature
+from math import isfinite
 from threading import RLock
 from types import MappingProxyType
 from typing import Any, ParamSpec, Protocol, TypeVar, cast
@@ -70,7 +71,25 @@ class Op:
 
 @dataclass(frozen=True, slots=True)
 class KernelCandidate:
-    """An immutable identity and entry point for one provider kernel."""
+    """An immutable identity and entry point for one provider kernel.
+
+    ``latency_us`` is optional, self-reported, and answers one question:
+
+        for *this call*, how long does this kernel take, in microseconds?
+
+    It is not a tuning result for some other shape. AITER labels what it
+    records with the conditions of the call the candidate was offered for, so a
+    number measured elsewhere arrives wearing conditions it was never measured
+    under -- worse than no number, because it looks sourced. A provider with
+    nothing for the shape in front of it omits the field rather than
+    extrapolating; omission is how to say "I do not know", which is why zero, a
+    negative, ``inf`` and ``nan`` are refused rather than recorded.
+
+    It never influences routing. Preference is the enable list, which names an
+    owner for that decision; a number a provider picks for itself must not be
+    able to outrank it. AITER records it, hands it back, and does nothing else
+    with it.
+    """
 
     provider: str
     kernel_id: str
@@ -79,12 +98,25 @@ class KernelCandidate:
     # evidence reference, not that a provider must have one to serve.
     qualification: str | None = None
     run: Callable[..., Any] = field(repr=False, compare=False, default=None)
+    # Appended, never inserted: a provider may build this positionally, and
+    # anything before `run` would silently take its argument. See the docstring
+    # for what the number means -- that is where a provider author reads it.
+    latency_us: float | None = None
 
     def __post_init__(self) -> None:
         identity = (self.provider, self.kernel_id, self.artifact_digest)
         if not all(identity) or not callable(self.run):
             raise ValueError(
                 "candidate identity must be complete and run must be callable"
+            )
+        # Each of these looks like data and carries none, and would be recorded,
+        # handed back, and eventually compared against a real number.
+        if self.latency_us is not None and not (
+            isfinite(self.latency_us) and self.latency_us > 0
+        ):
+            raise ValueError(
+                f"latency_us must be a positive finite number of microseconds, "
+                f"or omitted entirely; got {self.latency_us!r}"
             )
 
 
@@ -133,6 +165,10 @@ class Decision:
     artifact_digest: str | None = None
     qualification: str | None = None
     config_source: str | None = None
+    # Appended for the same reason as on KernelCandidate. What the selected
+    # candidate reported, unchanged; None on a native route, where there is no
+    # candidate to report one.
+    latency_us: float | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -361,7 +397,24 @@ def _swap_config_locked() -> _Config:
 
 
 def _config() -> _Config:
-    """The current snapshot, built on first dispatch. Lock-free on the hot path."""
+    """The current snapshot. A plain read, with nothing to trace around.
+
+    Built at import rather than on first dispatch, which is not a performance
+    choice. Building it lazily put a lock acquisition and an ``os.getenv`` on
+    the first dispatch of the process -- and torch.compile cannot trace either,
+    so that first call graph-breaks. A routed op whose first call lands inside
+    a compiled region therefore splits its graph in two, and a framework that
+    allows one backend invocation per compilation (ATOM's ``VllmBackend``) is
+    handed a second one and asserts.
+
+    Measured, with a counting backend: a routed op called with the snapshot
+    unbuilt compiles two graphs, and exactly one once it is built. Nothing else
+    on the dispatch path breaks, so building it eagerly is the whole fix.
+
+    The fallback is kept because `_config_snapshot` is cleared by
+    `_reset_for_testing`, and a test that clears it must not then be the one
+    call that pays for a rebuild inside somebody's graph.
+    """
 
     snapshot = _config_snapshot
     if snapshot is None:
@@ -370,11 +423,101 @@ def _config() -> _Config:
     return snapshot
 
 
+_CUSTOM_OP_NAMESPACE = "aiter_routed"
+_custom_op_library: Any = None
+
+
+def _as_custom_op(
+    op: str,
+    native: Callable[..., Any],
+    routed: Callable[..., Any],
+    fake: Callable[..., Any] | None,
+    mutates_args: list[str] | str = "unknown",
+) -> Callable[..., Any] | None:
+    """Register ``routed`` as a torch custom op, or return None to stay as is.
+
+    torch.compile traces through a Python wrapper, so a routed op puts this
+    module's dispatch inside the caller's graph -- and anything in it that
+    Dynamo cannot trace splits that graph. A registered custom op is one
+    opaque node instead: nothing in here can reach the caller's graph at all.
+
+    ``mutates_args="unknown"`` rather than a per-op list, for a reason that
+    is about who has to be right rather than about measured breakage. A list
+    has to be correct for every routed op, including ops added later by
+    people who did not read this, and an under-declaration is undefined
+    behaviour rather than an error -- so being wrong about it is both easy
+    and quiet. "unknown" says every argument may be written, which is never
+    wrong about any op, only conservative about all of them: it costs
+    optimisation, not correctness.
+
+    There is one measured exception to "only costs optimisation": inductor
+    wraps an op with any mutable argument in an ``auto_functionalized_v2``
+    node, and torch 2.10's post-grad decompose can fail to remove it,
+    asserting the graph still holds the wrapper. An op whose semantics are
+    provably pure may pass an explicit ``mutates_args`` list (identical to
+    ``torch_compile_guard``'s knob) so the schema is functional and that
+    wrapping never happens. The declaration must be true for the op as
+    written, not for what the caller intended -- an under-declared list is
+    the undefined behaviour above.
+
+    Honesty about what was measured: an op that writes through an argument
+    gives the same answer under inductor whether it declares "unknown" or
+    declares nothing, so the permissive option was not observed to break
+    anything here. That is not a reason to take it. It is a reason not to
+    claim this choice prevents a failure that has been seen.
+
+    What was measured is the part that matters: such an op compiles to one
+    graph and returns exactly what the eager path does, with the compiled
+    region reading the written buffer afterwards.
+
+    Returning None is a real outcome, not a failure path. An op with no fake,
+    with an unannotated parameter, or with an argument no schema can express
+    stays exactly as it is today -- traced, and no worse than before this
+    existed. That is what makes this safe to apply to every op at once:
+    nothing regresses, and an op becomes protected the day it acquires what
+    registration needs.
+    """
+
+    if fake is None:
+        return None
+    try:
+        import torch
+        from torch.library import Library, infer_schema, register_fake
+    except Exception:  # noqa: BLE001 -- see below; import must never fail here
+        return None
+
+    try:
+        schema = infer_schema(native, mutates_args=mutates_args)
+    except Exception as error:  # noqa: BLE001 -- degrade on anything
+        logger.debug("plugin: %s stays traced, no schema: %s", op, error)
+        return None
+
+    name = op.replace(".", "_")
+    try:
+        global _custom_op_library
+        if _custom_op_library is None:
+            _custom_op_library = Library(_CUSTOM_OP_NAMESPACE, "FRAGMENT")
+        _custom_op_library.define(f"{name}{schema}")
+        for backend in ("CPU", "CUDA"):
+            _custom_op_library.impl(name, routed, backend)
+        register_fake(f"{_CUSTOM_OP_NAMESPACE}::{name}", fake)
+    except Exception as error:  # noqa: BLE001 -- degrade on anything
+        logger.debug("plugin: %s stays traced, registration failed: %s", op, error)
+        return None
+
+    entry = getattr(torch.ops, _CUSTOM_OP_NAMESPACE)
+    bound = getattr(entry, name)
+    bound.__aiter_plugin_op__ = routed.__aiter_plugin_op__
+    return bound
+
+
 def route(
     *,
     op: str,
     version: int = 1,
     supersedes: Mapping[int, str] = MappingProxyType({}),
+    fake: Callable[..., Any] | None = None,
+    mutates_args: list[str] | str = "unknown",
 ) -> Callable[[Callable[_P, _R]], Callable[_P, _R]]:
     """Route an AITER op through a compatible provider before its native path.
 
@@ -387,6 +530,13 @@ def route(
     AITER can say that a provider written against the older version is still
     acceptable for calls on this one; declaring it here makes that assertion
     explicit and dated rather than implied.
+
+    ``mutates_args`` overrides the conservative default only for ops whose
+    mutation semantics are actually known. See ``_as_custom_op``: the default
+    "unknown" costs nothing worse than an ``auto_functionalized_v2`` wrap that
+    inductor may fail to decompose, while a declared list that lies is
+    undefined behaviour -- so pass ``[]`` only when the op genuinely writes
+    through no argument.
     """
 
     operation = Op(op, version)
@@ -409,7 +559,8 @@ def route(
             return _dispatch(operation, canonicalize, native, args, kwargs)
 
         routed.__aiter_plugin_op__ = operation
-        return routed
+        opaque = _as_custom_op(op, native, routed, fake, mutates_args)
+        return opaque if opaque is not None else routed
 
     return decorate
 
@@ -498,6 +649,7 @@ def _selected(op: Op, candidate: KernelCandidate, config: _Config) -> Decision:
         kernel_id=candidate.kernel_id,
         artifact_digest=candidate.artifact_digest,
         qualification=candidate.qualification,
+        latency_us=candidate.latency_us,
         config_source=config.source,
     )
 
@@ -1292,3 +1444,8 @@ __all__ = [
     "route",
     "status",
 ]
+
+
+# Build the snapshot now, so no dispatch ever pays for it. See _config().
+with _config_lock:
+    _swap_config_locked()
