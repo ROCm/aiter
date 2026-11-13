@@ -32,6 +32,13 @@ _GFX1250_FUSED_SPLITK_TAG = "a16w16_clusterlaunch_tdm_splitk_fuse"
 _GFX1250_CO_TAGS = frozenset(
     {"a16w16_4wave_co", "a16w16_4wave_wl_co", "a16w16_4wave_wlr_co"}
 )
+# gfx950 a16w16 4-wave (pre-built .co): direct and fp32 split-K workspace kids.
+# Keep in step with _A16W16_4WAVE_GFX950_TAGS in csrc/opus_gemm/opus_gemm_common.py.
+_GFX950_4WAVE_TAG = "a16w16_4wave"
+_GFX950_4WAVE_WS_TAG = "a16w16_4wave_ws"
+GFX950_4WAVE_TAGS = frozenset({_GFX950_4WAVE_TAG, _GFX950_4WAVE_WS_TAG})
+_GFX950_4WAVE_B_K = 64
+_UINT32_MAX = (1 << 32) - 1
 
 
 @dataclass(frozen=True)
@@ -77,6 +84,14 @@ def _supports_a16w16_shape(
 
     if instance.kernel_tag == "a16w16_mono_tile":
         return N % instance.B_N == 0 and K % instance.B_K == 0
+
+    if instance.kernel_tag in GFX950_4WAVE_TAGS:
+        # K tiles of 64, at least 2 per split. The direct kernel stores C rows
+        # in 16-byte vectors, so it needs N % 8 == 0 (contiguous bf16 Y); the
+        # workspace kids write Y through the reducer and take any M and N.
+        if instance.kernel_tag == _GFX950_4WAVE_TAG and N % 8 != 0:
+            return False
+        return K % _GFX950_4WAVE_B_K == 0 and K >= 2 * _GFX950_4WAVE_B_K
 
     if not instance.has_oob:
         return M % instance.B_M == 0 and N % instance.B_N == 0
@@ -162,6 +177,11 @@ def _plan_gfx950_split_k(
             break
         abi_split_k -= 1
     return abi_split_k
+
+
+def _plan_gfx950_4wave_split_k(*, K: int, requested: int) -> int:
+    """Mirror of the 4wave workspace launcher clamp: >= 2 K tiles per split."""
+    return min(max(1, requested), (K // _GFX950_4WAVE_B_K) // 2)
 
 
 def _plan_gfx1250_split_k(
@@ -336,6 +356,12 @@ def _build_a16w16_launch_plan(
             f"gfx1250 CO kid {resolved_kid} does not support split-K; "
             f"got split_k={requested_split_k}"
         )
+    if instance.kernel_tag == _GFX950_4WAVE_TAG and requested_split_k > 1:
+        raise ValueError(
+            f"gfx950 4wave kid {resolved_kid} is the direct launcher and does "
+            f"not support split-K (got split_k={requested_split_k}); use an "
+            "a16w16_4wave_ws kid"
+        )
     if (
         registry_arch == GFX942
         and needs_workspace
@@ -385,6 +411,8 @@ def _build_a16w16_launch_plan(
                 cu_num=cu_num,
                 requested=requested_split_k,
             )
+        elif instance.kernel_tag == _GFX950_4WAVE_WS_TAG:
+            abi_split_k = _plan_gfx950_4wave_split_k(K=K, requested=requested_split_k)
         elif registry_arch == GFX950:
             abi_split_k = _plan_gfx950_split_k(
                 instance,
@@ -419,6 +447,23 @@ def _build_a16w16_launch_plan(
         M=M,
         N=N,
     )
+    if instance.kernel_tag in GFX950_4WAVE_TAGS:
+        # 32-bit offsets in the 4wave kernel (Y) and the reduce (workspace
+        # buffer resource); mirrored by the generated launcher's checks.
+        if batch * M * N > 2**31 - 1:
+            raise ValueError(
+                f"gfx950 4wave kid {resolved_kid}: Y exceeds 2^31 elements "
+                f"(batch={batch}, M={M}, N={N})"
+            )
+        if workspace_spec is not None:
+            workspace_bytes = 4
+            for extent in workspace_spec.shape:
+                workspace_bytes *= extent
+            if workspace_bytes > _UINT32_MAX:
+                raise ValueError(
+                    f"gfx950 4wave kid {resolved_kid}: fp32 workspace "
+                    f"{workspace_spec.shape} exceeds 4 GiB"
+                )
     return A16W16LaunchPlan(
         registry_arch=registry_arch,
         resolved_kid=resolved_kid,

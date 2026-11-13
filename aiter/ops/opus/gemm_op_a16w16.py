@@ -7,11 +7,11 @@ from functools import lru_cache
 import torch
 
 from aiter import logger
-from csrc.opus_gemm.opus_gemm_common import OpusGemmInstance
+from csrc.opus_gemm.opus_gemm_common import OpusGemmInstance, get_kernel_instance
 
 from ...jit.core import compile_ops
 from ._arch import _device_arch_and_cu
-from .launch_plan import _get_cached_a16w16_launch_plan
+from .launch_plan import GFX950_4WAVE_TAGS, _get_cached_a16w16_launch_plan
 
 # ---- Low-level A16W16 backend --------------------------------------------
 
@@ -81,12 +81,12 @@ def _launch_a16w16_backend(
         )
 
 
-def _check_a16w16_launch_layout(
+def _check_a16w16_launch_shapes(
     XQ: torch.Tensor,
     WQ: torch.Tensor,
     Y: torch.Tensor,
 ) -> None:
-    """Validate launcher-required 3D shapes and physical strides."""
+    """Validate launcher-required 3D shapes."""
     for name, tensor in (("XQ", XQ), ("WQ", WQ), ("Y", Y)):
         if tensor.dim() != 3:
             raise ValueError(
@@ -111,6 +111,17 @@ def _check_a16w16_launch_layout(
             "opus_gemm_a16w16_launch: Y shape mismatch "
             f"(got {tuple(Y.shape)}, expected {expected_y})"
         )
+
+
+def _check_a16w16_launch_layout(
+    XQ: torch.Tensor,
+    WQ: torch.Tensor,
+    Y: torch.Tensor,
+) -> None:
+    """Validate launcher-required 3D shapes and physical strides."""
+    _check_a16w16_launch_shapes(XQ, WQ, Y)
+    batch, M, K = XQ.shape
+    N = WQ.shape[1]
 
     # XQ/WQ allow padded rows but require contiguous K and dense batches.
     for name, tensor, rows in (("XQ", XQ, M), ("WQ", WQ, N)):
@@ -141,6 +152,91 @@ def _check_a16w16_launch_layout(
         )
 
 
+def _check_a16w16_4wave_layout(
+    XQ: torch.Tensor,
+    WQ: torch.Tensor,
+    Y: torch.Tensor,
+) -> None:
+    """Validate the stride contract of the gfx950 a16w16 4-wave kids.
+
+    Each operand is either K-contiguous (``stride[2] == 1``: NT storage, row
+    pitch ``stride[1] >= K``) or M/N-contiguous (``stride[1] == 1``: stored
+    ``[K, rows]`` with row pitch ``stride[2] >= rows``). The launcher detects the
+    layout from these strides (NT/NN/TT/TN images); leading dimensions and
+    batch strides must be multiples of 8 elements. Y must be contiguous.
+    Mirrors the generated C++ launcher, which re-checks everything.
+    """
+    _check_a16w16_launch_shapes(XQ, WQ, Y)
+    batch, M, K = XQ.shape
+    N = WQ.shape[1]
+    for name, tensor, rows, minor in (("XQ", XQ, M, "M"), ("WQ", WQ, N, "N")):
+        stride_batch, stride_row, stride_k = tensor.stride()
+        if stride_k == 1 and (rows == 1 or stride_row >= K):
+            ld = K if rows == 1 else stride_row
+        elif stride_row == 1 and stride_k >= rows:
+            ld = stride_k
+        else:
+            raise NotImplementedError(
+                f"opus_gemm_a16w16_launch (4wave kid): {name} must be "
+                f"K-contiguous (stride[2]==1, stride[1]>=K) or {minor}-contiguous "
+                f"(stride[1]==1, stride[2]>={minor}); got {name}.stride()="
+                f"{tuple(tensor.stride())}, {name}.shape={tuple(tensor.shape)}"
+            )
+        batch_stride = stride_batch if batch != 1 else 0
+        if ld % 8 or batch_stride % 8 or batch_stride < 0:
+            raise NotImplementedError(
+                f"opus_gemm_a16w16_launch (4wave kid): {name} leading dimension "
+                f"({ld}) and batch stride ({batch_stride}) must be non-negative "
+                "multiples of 8 elements"
+            )
+        if tensor.data_ptr() % 16:
+            raise NotImplementedError(
+                f"opus_gemm_a16w16_launch (4wave kid): {name} must be 16-byte aligned"
+            )
+    expected_y_stride = (M * N, N, 1)
+    if Y.stride() != expected_y_stride and not (
+        batch == 1 and Y.stride()[1:] == (N, 1)
+    ):
+        raise NotImplementedError(
+            "opus_gemm_a16w16_launch: Y must have contiguous strides "
+            f"{expected_y_stride} (got {tuple(Y.stride())}, "
+            f"Y.shape={tuple(Y.shape)}). "
+            "Materialize with `Y = Y.contiguous()`."
+        )
+
+
+@lru_cache(maxsize=1024)
+def _kid_takes_mn_major_operands(arch: str, cu_num: int, kid: int) -> bool:
+    """Whether exact kid ``kid`` detects its operand layout from strides."""
+    try:
+        instance = get_kernel_instance(arch, "a16w16", int(kid), cu_num=cu_num)
+    except (TypeError, ValueError):
+        return False
+    return instance is not None and instance.kernel_tag in GFX950_4WAVE_TAGS
+
+
+def _check_a16w16_kid_layout(
+    XQ: torch.Tensor,
+    WQ: torch.Tensor,
+    Y: torch.Tensor,
+    *,
+    kid: int,
+    arch: str,
+    cu_num: int,
+) -> None:
+    """Kid-aware layout check: 4-wave kids also take M/N-contiguous operands."""
+    try:
+        _check_a16w16_launch_layout(XQ, WQ, Y)
+    except NotImplementedError:
+        if not _kid_takes_mn_major_operands(arch, cu_num, kid):
+            raise
+        _check_a16w16_4wave_layout(XQ, WQ, Y)
+        return
+    if _kid_takes_mn_major_operands(arch, cu_num, kid):
+        # K-contiguous inputs still need 8-element pitches and 16-byte bases.
+        _check_a16w16_4wave_layout(XQ, WQ, Y)
+
+
 def _execute_a16w16(
     XQ: torch.Tensor,
     WQ: torch.Tensor,
@@ -155,7 +251,7 @@ def _execute_a16w16(
     instance: OpusGemmInstance | None = None,
 ) -> torch.Tensor:
     """Validate, plan, and launch one exact 3D A16W16 operation."""
-    _check_a16w16_launch_layout(XQ, WQ, Y)
+    _check_a16w16_launch_shapes(XQ, WQ, Y)
     batch, M, K = XQ.shape
     N = Y.shape[2]
 
@@ -172,6 +268,7 @@ def _execute_a16w16(
         arch, cu_num = route_arch, route_cu_num
     else:
         arch, cu_num = _device_arch_and_cu(XQ.device)
+    _check_a16w16_kid_layout(XQ, WQ, Y, kid=int(kid), arch=arch, cu_num=cu_num)
 
     plan = _get_cached_a16w16_launch_plan(
         arch,
@@ -367,7 +464,18 @@ def _prepare_shape_driven_a16w16(
 
     XQ = A.unsqueeze(0) if is_gemm else A
     WQ = B.unsqueeze(0) if B.dim() == 2 else B
-    _check_a16w16_launch_layout(XQ, WQ, Y)
+    try:
+        _check_a16w16_launch_layout(XQ, WQ, Y)
+    except NotImplementedError:
+        # M/N-contiguous operands are accepted by the gfx950 4-wave kids; the
+        # kid-aware check in _execute_a16w16 rejects them for every other kid.
+        try:
+            _check_a16w16_4wave_layout(XQ, WQ, Y)
+        except NotImplementedError:
+            pass
+        else:
+            return XQ, WQ, Y, is_gemm
+        raise
     if bias is not None:
         if not isinstance(bias, torch.Tensor):
             raise TypeError("gemm_a16w16_opus bias must be a Tensor")

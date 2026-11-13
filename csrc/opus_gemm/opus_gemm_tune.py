@@ -104,6 +104,8 @@ GFX1250_CO_TOP_CLUSTERS = 6
 _A16W16_CO_TAGS = frozenset(
     {"a16w16_4wave_co", "a16w16_4wave_wl_co", "a16w16_4wave_wlr_co"}
 )
+# gfx950 pre-built 4-wave kids (keep in step with opus_gemm_common.py).
+_A16W16_4WAVE_GFX950_TAGS = frozenset({"a16w16_4wave", "a16w16_4wave_ws"})
 
 # Tune-time host helpers (defined here, not in opus_gemm_common.py).
 
@@ -428,7 +430,7 @@ def candidate_splitK(M: int, N: int, K: int, batch: int, cu_num: int, k_inst):
     range. We compute the same per-slice budget the host reject uses and
     silently drop any split_k that would push workspace past 4 GiB.
     """
-    if k_inst.kernel_tag in _A16W16_CO_TAGS:
+    if k_inst.kernel_tag in _A16W16_CO_TAGS or k_inst.kernel_tag == "a16w16_4wave":
         return [0]
 
     if k_inst.kernel_tag == "a16w16_clusterlaunch_tdm_splitk_fuse":
@@ -447,6 +449,8 @@ def candidate_splitK(M: int, N: int, K: int, batch: int, cu_num: int, k_inst):
         "a16w16_clusterlaunch_tdm_splitk_ws",
     ):
         pfk = 1
+    elif k_inst.kernel_tag == "a16w16_4wave_ws":
+        pfk = 2  # each split needs >= 2 K tiles of 64
     else:
         pfk = _flatmm_splitk_pfk(k_inst)
 
@@ -547,6 +551,21 @@ def kid_rejects_shape(k_inst, M, N, K):
     # split-K buffer, and support M/N/K tails. Their scalar extents remain int.
     if k_inst.kernel_tag in _A16W16_CO_TAGS:
         return M < 1 or N < 1 or K < 1
+
+    # gfx950 4-wave: K tiles of 64 (>= 2), any M/N; 32-bit byte offsets.
+    if k_inst.kernel_tag in _A16W16_4WAVE_GFX950_TAGS:
+        _INT32_MAX = (1 << 31) - 1
+        return (
+            M < 1
+            or N < 1
+            or K % 64 != 0
+            or K < 128
+            or M * K * 2 > _INT32_MAX
+            or N * K * 2 > _INT32_MAX
+            or M * N > _INT32_MAX
+            # direct kernel: 16-byte C row stores
+            or (k_inst.kernel_tag == "a16w16_4wave" and N % 8 != 0)
+        )
 
     # 4 GiB buffer-resource filter. Legacy a16w16 kids build a single
     # AMDGPU buffer-resource per tensor (A/B/C), whose `num_records` field
