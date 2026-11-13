@@ -1595,7 +1595,7 @@ __launch_bounds__(Traits::kNumThreads) __global__
 
 // Whether a launch takes kn_mla_reduce_v1_wave_head: wave32, 512-wide heads,
 // decode / verify tile shapes. AITER_MLA_REDUCE_WAVE_HEAD=0 keeps
-// kn_mla_reduce_v1, =1 drops the parallelism heuristic; read once.
+// kn_mla_reduce_v1, =1 drops the parallelism and tile-shape heuristics; read once.
 template <typename Traits>
 bool mla_reduce_use_wave_head(const MlaReduceKernelV1Params& params,
                               const hipDeviceProp_t& dev_prop,
@@ -1618,7 +1618,12 @@ bool mla_reduce_use_wave_head(const MlaReduceKernelV1Params& params,
     // on the live tiles.
     const bool enough_waves = int64_t(params.num_reduce_tile) * Traits::kNumWaves >=
                               int64_t(num_cu) * Traits::kMinWavesPerCu;
-    return can_run && ((env == 1) || enough_waves);
+    // Tiles of several rows (the decode planner cuts a multi-token query of
+    // up to 64 heads that way) keep kn_mla_reduce_v1: in decode they come
+    // few, with many splits each, which the table size above does not show,
+    // and one wave walking rows and splits back to back is slower there.
+    const bool single_row_tiles = (Traits::kNumHeadQ * 2 > 128) || (params.max_seqlen_q == 1);
+    return can_run && ((env == 1) || (enough_waves && single_row_tiles));
 }
 
 // Whether a launch takes kn_mla_reduce_v1_wide. AITER_MLA_REDUCE_WIDE=0 keeps
