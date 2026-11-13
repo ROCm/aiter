@@ -15,7 +15,7 @@ import torch
 
 from aiter import dtypes, per_tensor_quant, pertoken_quant
 from aiter.jit.utils.chip_info import get_gfx_runtime
-from aiter.ops.quant import per_1x32_f4_quant
+from aiter.ops.quant import dynamic_per_token_scaled_quant, per_1x32_f4_quant
 from aiter.test_common import checkAllclose
 from aiter.utility import fp4_utils
 
@@ -784,7 +784,7 @@ def _short_bound_pool(*, device):
 
 
 _COMMON_CASES = [
-    ("decode", {"block_size": 16, "max_partitions": 1}),
+    ("decode", {"block_size": 16, "max_partitions": 1, "quant": True}),
     (
         "window",
         {
@@ -824,6 +824,35 @@ _COMMON_CASES = [
             "max_partitions": 8,
             "capture": True,
             "cluster": 8,
+            "quant": True,
+        },
+    ),
+    # FP8-output clusters with ragged rows (GQA 6 over 4 CTAs, D64) and with
+    # several rows per wave (GQA 32 over 2); single tasks pad an M-tile or
+    # span two.
+    (
+        "g6-d64-cluster4",
+        {
+            "group_size": 6,
+            "head_dim": 64,
+            "block_size": 16,
+            "lengths": (1024,) * 3 + (0, 1, 300),
+            "window": 600,
+            "max_partitions": 4,
+            "cluster": 4,
+            "quant": True,
+        },
+    ),
+    (
+        "g32-d256-page128-cluster2",
+        {
+            "group_size": 32,
+            "head_dim": 256,
+            "block_size": 128,
+            "lengths": (512,) * 3 + (0, 200),
+            "max_partitions": 2,
+            "cluster": 2,
+            "quant": True,
         },
     ),
     (
@@ -873,14 +902,14 @@ _FP8_CASES = _COMMON_CASES + [
     ),
     (
         "default-cap",
-        {"group_size": 16, "block_size": 128, "max_partitions": None},
+        {"group_size": 16, "block_size": 128, "max_partitions": None, "quant": True},
     ),
     # Four 16-row query tiles at D128 give each gfx1250 wave its own tile.
     # Varied token magnitudes make a misplaced per-token scale fail; rows past
     # one page run unmasked interior pages (two-token rows exceed FP8 P error).
     (
         "mtp4-g16-page128-direct",
-        {"query_length": 4, "group_size": 16, "block_size": 128},
+        {"query_length": 4, "group_size": 16, "block_size": 128, "quant": True},
     ),
     (
         "mtp4-g16-page128-varied",
@@ -919,7 +948,13 @@ _FP8_CASES = _COMMON_CASES + [
     # 60 rows pad the last wave's tile; GQA 8 puts two queries in each tile.
     (
         "mtp5-g12-page128",
-        {"query_length": 5, "group_size": 12, "block_size": 128, "max_partitions": 7},
+        {
+            "query_length": 5,
+            "group_size": 12,
+            "block_size": 128,
+            "max_partitions": 7,
+            "quant": True,
+        },
     ),
     ("mtp8-g8-page128", {"query_length": 8, "block_size": 128, "max_partitions": 7}),
 ]
@@ -973,7 +1008,7 @@ _BF16_CASES = _COMMON_CASES + [
     # one slot per sequence merges the long rows' tasks across replays.
     (
         "mtp4-g16-page128-direct",
-        {"query_length": 4, "group_size": 16, "block_size": 128},
+        {"query_length": 4, "group_size": 16, "block_size": 128, "quant": True},
     ),
     (
         "mtp4-g16-page128-cluster",
@@ -983,6 +1018,7 @@ _BF16_CASES = _COMMON_CASES + [
             "group_size": 16,
             "block_size": 128,
             "max_partitions": 7,
+            "quant": True,
         },
     ),
     (
@@ -995,6 +1031,7 @@ _BF16_CASES = _COMMON_CASES + [
             "max_partitions": 4,
             "budget": 1,
             "capture": True,
+            "quant": True,
         },
     ),
     (
@@ -1723,6 +1760,7 @@ def test_pa_decode(case, device, monkeypatch):
             "ref_mean_min": None,
             "variants": False,
             "cluster": None,
+            "quant": False,
         },
         **case,
     )
@@ -1917,13 +1955,14 @@ def test_pa_decode(case, device, monkeypatch):
             ),
         }
 
-    def launch():
+    def launch(**quant):
         pa.pa_decode(
             output,
             *arguments,
             work_plan=None if case["plan_free"] else plan,
             **options,
             **workspace,
+            **quant,
         )
 
     def check(out=None):
@@ -2004,6 +2043,8 @@ def test_pa_decode(case, device, monkeypatch):
         assert (padded[:, query.shape[1] :] == 7.0).all()
     if case["kv_dtype"] != "mxfp4":
         _check_pipe_policy(pa, case, arch, compile_kwargs)
+    if case["quant"] and arch == "gfx1250":
+        _check_quant_output(launch, query, output, compile_kwargs, case["capture"])
     if case["capture"]:
         # Compile/allocate before capture; replay must observe changed query data.
         capture_stream = torch.cuda.Stream()
@@ -2019,6 +2060,66 @@ def test_pa_decode(case, device, monkeypatch):
             output.fill_(float("nan"))
             graph.replay()
             check()
+
+
+def _check_quant_output(launch, query, output, compile_kwargs, capture, pad=3):
+    """The FP8 output equals PA's output and the standalone per-token quant bit
+    for bit, eagerly and in graph replays; poisoned outputs show every row is
+    written, padded rows included. One KV head's direct and cluster outputs
+    quantize in the tile kernel; other plans fall back to the standalone quant.
+    """
+    plain = compile_kwargs[-1]
+    fused = plain["num_kv_heads"] == 1 and (
+        plain["cluster_merge"] > 0
+        or (plain["direct_output"] and plain["num_partitions"] == 1)
+    )
+    rows = output.shape[0]
+    fp8 = torch.empty(
+        (rows + pad, *output.shape[1:]), dtype=dtypes.fp8, device=output.device
+    )
+    scale = torch.empty(rows + pad, 1, device=output.device)
+
+    def run(store_output):
+        output.fill_(float("nan"))
+        fp8.view(torch.uint8).fill_(0x7F)
+        scale.fill_(float("nan"))
+        launch(
+            quantized_output=fp8,
+            output_scale=scale,
+            store_output=store_output,
+            quantized_pad_rows=pad,
+        )
+
+    def check(store_output):
+        stored = output.clone()
+        launch()
+        ref_fp8, ref_scale = torch.empty_like(fp8[:rows]), torch.empty_like(
+            scale[:rows]
+        )
+        dynamic_per_token_scaled_quant(
+            ref_fp8.view(rows, -1), output.view(rows, -1), ref_scale
+        )
+        assert torch.equal(stored, output) if store_output else stored.isnan().all()
+        assert torch.equal(fp8[:rows].view(torch.uint8), ref_fp8.view(torch.uint8))
+        assert torch.equal(scale[:rows], ref_scale)
+        assert (fp8[rows:].view(torch.uint8) == 0).all() and (scale[rows:] == 1).all()
+
+    for store_output in (True, False):
+        run(store_output)
+        assert compile_kwargs[-1].get("quant_output", False) == fused
+        check(store_output)
+    if capture:
+        stream = torch.cuda.Stream()
+        stream.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(stream):
+            run(False)
+        torch.cuda.current_stream().wait_stream(stream)
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph, stream=stream):
+            run(False)
+        query.neg_()
+        graph.replay()
+        check(False)
 
 
 def _poison_unowned(cache, scale, owned, fill):

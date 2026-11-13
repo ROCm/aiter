@@ -31,6 +31,56 @@ from .traits import (
 )
 
 
+def _store_quantized(ctx, mem, merge, final, state_stride=None, scale=None):
+    """Write a single task's final rows with the FP8 output (gfx1250).
+
+    With ``state_stride`` each wave holds a D slice of every 16-row M-tile;
+    without, one tile per wave and all of D. ``scale`` is the packed V factor
+    that ``final`` still carries.
+    """
+    t = ctx.traits
+    if state_stride is None:
+        layout = [
+            (ctx.warp * 16, 0, [(d * 16, 2 + d) for d in range(t.head_dim // 16)])
+        ]
+    else:
+        layout = [
+            (
+                m * 16,
+                m * state_stride,
+                [
+                    (vh * 64 + ctx.warp * 16, m * state_stride + 2 + vh)
+                    for vh in range(t.head_dim // 64)
+                ],
+            )
+            for m in range(t.m_tiles)
+        ]
+    tiles = []
+    for row, stats, chunks in layout:
+        denom = final[stats + 1]
+        inv = fx.Float32(rcp_f32((denom > 0.0).select(denom, fx.Float32(1.0))))
+        norm = fx.Vector.from_elements(
+            [fx.Float32(inv if scale is None else inv * scale)], dtype=fx.Float32
+        ).broadcast_to(8)
+        row = row + ctx.lane16
+        tiles.append(
+            (
+                row,
+                [(final[i] * norm).to(t.q_dtype) for _, i in chunks],
+                [merge.output_offset(row, d + ctx.half * 8) for d, _ in chunks],
+            )
+        )
+    ctx.quant.store_cta(
+        mem,
+        ctx.planned_seq,
+        ctx.lane,
+        fx.Int32(0) if state_stride is None else ctx.warp,
+        1 if state_stride is None else t.NWARP,
+        tiles,
+        fx.recast_iter(t.q_dtype, ctx.output_ptr if t.merged_output else ctx.pout_ptr),
+    )
+
+
 class PaDecodePipeline:
     def __init__(self, ctx):
         self.ctx = ctx
@@ -1485,6 +1535,8 @@ class Gfx1250Bf16Pipeline:
         slot = fx.Int64(ctx.kv_h) * fx.Int64(ctx.capacity) + fx.Int64(ctx.task_slot)
 
         def store(direct):
+            if const_expr(direct and t.quant_output):
+                return _store_quantized(ctx, self.mem, self.merge, final, state_stride)
             # Direct stores write final rows; other tasks store packed partials.
             pout = fx.recast_iter(
                 t.q_dtype,
@@ -1864,6 +1916,8 @@ class Gfx1250Bf16WavePipeline:
         inv = fx.Float32(rcp_f32((denom > 0.0).select(denom, fx.Float32(1.0))))
 
         def store(direct):
+            if const_expr(direct and t.quant_output):
+                return _store_quantized(ctx, self.mem, self.merge, final)
             # Direct stores write final rows; other tasks store packed partials.
             pout = fx.recast_iter(
                 t.q_dtype,
@@ -2187,6 +2241,10 @@ class Gfx1250WavePipeline:
         inv = fx.Float32(rcp_f32((denom > 0.0).select(denom, fx.Float32(1.0))))
 
         def store(direct):
+            if const_expr(direct and t.quant_output):
+                return _store_quantized(
+                    ctx, self.mem, self.merge, final, scale=final[-1]
+                )
             # Direct stores write final rows; other tasks store packed partials.
             pout = fx.recast_iter(
                 t.q_dtype,
@@ -2627,6 +2685,15 @@ class Gfx1250Pipeline:
         slot = fx.Int64(ctx.kv_h) * fx.Int64(ctx.capacity) + fx.Int64(ctx.task_slot)
 
         def store(direct):
+            if const_expr(direct and t.quant_output):
+                return _store_quantized(
+                    ctx,
+                    self.mem,
+                    self.merge,
+                    final,
+                    state_stride,
+                    final[-1] if t.packed_lds else None,
+                )
             # Direct stores write final rows; other tasks store packed partials.
             pout = fx.recast_iter(
                 t.q_dtype,
