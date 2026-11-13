@@ -1753,10 +1753,10 @@ def test_mha_v4_kv_splits_auto_cost_model_compiles():
     torch.manual_seed(62)
     # 30 heads x 9 query tiles is 270 work-groups, past one wave of gfx950's 256 CUs.
     q = torch.randn((1, 2304, 30, 128), device="cuda", dtype=torch.bfloat16)
-    k = torch.randn_like(q)
-    v = torch.randn_like(q)
+    k = torch.randn((1, 8192, 30, 128), device="cuda", dtype=torch.bfloat16)
+    v = torch.randn_like(k)
     bf16 = (AttentionFormat.BF16,) * 3
-    assert mha_v4_kv_splits(1, 2304, 30, 2304, q.device, ragged=True) > 1
+    assert mha_v4_kv_splits(1, 2304, 30, 8192, q.device, ragged=True) > 1
 
     eager = mha_v4(q, k, v, *bf16, kv_splits="auto")
     compiled = torch.compile(mha_v4, fullgraph=True)(q, k, v, *bf16, kv_splits="auto")

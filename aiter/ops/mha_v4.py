@@ -2142,14 +2142,12 @@ def mha_v4_kv_splits(
         most = min(
             _MHA_V4_MAX_AUTO_KV_SPLITS, key_length // _MHA_V4_MIN_KV_SPLIT_TOKENS
         )
-        candidates = [
-            n
-            for n in range(1, max(most, 1) + 1)
-            if key_length % n == 0 or (ragged and batch == 1)
-        ]
         rows = batch * query_length * query_heads
-
-        def cost(n):
+        best, best_cost = 1, None
+        # A plain loop: Dynamo cannot trace min() with a key function under fullgraph.
+        for n in range(1, max(most, 1) + 1):
+            if key_length % n and not (ragged and batch == 1):
+                continue
             rounds, tail = divmod(work_groups * n, cus)
             if tail:
                 rounds += (
@@ -2158,9 +2156,10 @@ def mha_v4_kv_splits(
                 )
             longest = key_length - (n - 1) * (key_length // n)
             merge = _MHA_V4_MERGE_KEYS_PER_ROW * n * rows if n > 1 else 0.0
-            return rounds * longest + merge
-
-        return min(candidates, key=cost)
+            cost = rounds * longest + merge
+            if best_cost is None or cost < best_cost:
+                best, best_cost = n, cost
+        return best
     most = min(cus // work_groups, key_length // _MHA_V4_MIN_KV_SPLIT_TOKENS)
     for splits in range(most, 1, -1):
         if key_length % splits == 0:
