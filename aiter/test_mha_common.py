@@ -806,11 +806,16 @@ def attention_ref_with_tol(q, k, v, do, is_fp8=False, **kwargs):
     return out, (dq, dk, dv), fwd_tol, bwd_tols
 
 
-def opus_ref_lse(q, k, causal, budget=1 << 23):
+def opus_ref_lse(q, k, causal, budget=1 << 23, window_size_left=-1):
     """fp32 logsumexp of the scaled scores, bottom-right causal, GQA-aware.
 
     attention_ref downcasts its lse to the input dtype, too coarse to check against.
     Chunked over query rows (`budget` score elements) to bound peak memory.
+
+    `window_size_left` >= 0 also bounds the mask on the left, so a query at KV
+    coordinate j keeps keys [j - window_size_left, j]. It needs `causal`, matching the
+    kernels that implement it. Rows whose window selects no key get -inf, like rows
+    that see no keys at all.
     """
     batch, seqlen_q, nheads, d = q.shape
     seqlen_k, nheads_k = k.shape[1], k.shape[2]
@@ -830,6 +835,10 @@ def opus_ref_lse(q, k, causal, budget=1 << 23):
         if causal:
             row = torch.arange(lo, hi, device=q.device)[:, None]
             scores = scores.masked_fill(col > row + off, float("-inf"))
+            if window_size_left >= 0:
+                scores = scores.masked_fill(
+                    col < row + off - window_size_left, float("-inf")
+                )
         lse[:, :, lo:hi] = torch.logsumexp(scores, dim=-1).reshape(
             batch, nheads, hi - lo
         )
