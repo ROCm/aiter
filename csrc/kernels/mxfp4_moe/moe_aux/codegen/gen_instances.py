@@ -70,6 +70,7 @@ SHAPES = [
     (289, 4096, 1024, 9),  # GLM-5.3-Flash TP=2 shared-expert variant
     (289, 4096, 512, 9),  # GLM-5.3-Flash TP=4 shared-expert variant
     (289, 4096, 256, 9),  # GLM-5.3-Flash TP=8 shared-expert variant
+    (64, 4096, 4096, 2),  # Muse Spark Open 816B TP=4 + EP=4 (64 local experts)
 ]
 
 
