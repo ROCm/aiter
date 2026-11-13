@@ -210,6 +210,8 @@ def test_gemm_a16_w16_layout(M: int, N: int, K: int, layout, backend, kernel_typ
     "M, N, K, num_buffers",
     [
         (257, 2048, 7168, None),  # tuned bucket, partial cluster tile
+        (257, 1024, 7168, None),  # tuned bucket for N=1024
+        (257, 384, 7168, None),  # tuned bucket for N=384
         (300, 2112, 7000, 9),  # partial M and N tiles, odd K-tile count, K tail
         (512, 2048, 128, 9),  # short K: stages past K read zeros
         (512, 2048, 7168, 8),  # even NUM_BUFFERS
