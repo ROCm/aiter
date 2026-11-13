@@ -234,7 +234,9 @@ class PaDecodeSchedule:
             )
         if kv_dtype == MXFP4_KV_DTYPE:
             if arch != "gfx950":
-                raise ValueError(f"MXFP4 PA decode requires gfx950; got {arch}")
+                raise ValueError(
+                    f"MXFP4 PA decode requires gfx950 or gfx1250; got {arch}"
+                )
             if query_dtype not in (fx.BFloat16, fx.Float8E4M3FN):
                 raise ValueError("MXFP4 KV requires a BF16 or FP8 query")
             if per_token_kv:
@@ -1114,11 +1116,23 @@ class Gfx1250Traits:
     merge_partitions: bool = False
     # Workgroups per sequence cluster that merges its partitions; 0 disables.
     cluster_merge: int = 0
+    # MXFP4 without a plan: ``work`` holds context lengths, CTA s runs sequence
+    # s whole and stores its final rows.
+    plan_free: bool = False
 
     WAVE = 32
     NWARP = 4
     BLOCK_THREADS = NWARP * WAVE
     FP8_MAX = 448.0
+    # MXFP4 merge scratch: per wave a [16 rows][MXFP4_O_STRIDE] f32 output tile
+    # (the row pad keeps the lane-per-row b128 stores bank-conflict free), then
+    # per-wave row maxima and sums.
+    MXFP4_O_STRIDE = 132
+    MXFP4_O_BYTES = 16 * MXFP4_O_STRIDE * 4
+
+    @property
+    def mxfp4(self):
+        return self.compute_dtype == "mxfp4"
 
     @property
     def merged_output(self):
@@ -1212,7 +1226,7 @@ class Gfx1250Traits:
         # page16 and windowed attention retain 64-token chunks.
         # A one-token window does not amortize resident operand setup.
         return (
-            not self.bf16
+            self.compute_dtype == "fp8"
             and self.head_dim in (128, 256)
             and self.block_size >= 16
             and self.sliding_window != 1
@@ -1229,7 +1243,7 @@ class Gfx1250Traits:
         # Multiple query tiles reuse packed chunks and K128 WMMA without
         # fetching K/V again for each query tile.
         return (
-            not self.bf16
+            self.compute_dtype == "fp8"
             and self.head_dim in (128, 256)
             and self.block_size >= 16
             and (self.m_tiles == 1 or self.fp8_multi_tile)
@@ -1323,7 +1337,14 @@ class Gfx1250Traits:
 
     @property
     def total_bytes(self):
+        if self.mxfp4:
+            # Only the wave merge after the tile loop uses LDS.
+            return self.mxfp4_stats_offset + 2 * self.NWARP * 16 * 4
         return self.stats_offset + 576
+
+    @property
+    def mxfp4_stats_offset(self):
+        return self.NWARP * self.MXFP4_O_BYTES
 
     @property
     def use_tdm(self):
@@ -1343,4 +1364,5 @@ class Gfx1250Traits:
 
     @property
     def q_dtype(self):
-        return fx.BFloat16 if self.query_dtype == "bf16" else fx.Float16
+        # The output's element type: MXFP4 writes bf16 for e4m3 queries too.
+        return fx.BFloat16 if self.query_dtype == "bf16" or self.mxfp4 else fx.Float16

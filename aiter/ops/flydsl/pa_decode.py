@@ -7,7 +7,7 @@ Cache layouts are logical, not preshuffled. K/V use E4M3 FNUZ on gfx942 and
 OCP on gfx950/gfx1250. See ``kernels.pa_decode_kernel`` for Q/P quantization and
 MFMA/WMMA specialization details. Native BF16 uses unscaled, 8-element packed
 K/V caches. gfx1250 also accepts FP16 queries and plain BF16 V caches. MXFP4 K/V
-(e2m1 data, e8m0 scale per 32 elements) run on gfx950, see ``pa_decode``.
+(e2m1 data, e8m0 scale per 32 elements) run on gfx950 and gfx1250, see ``pa_decode``.
 """
 
 import flydsl.compiler as flyc
@@ -227,9 +227,11 @@ def _pa_decode_mxfp4(
     work_plan,
     max_context_length,
 ):
-    """MXFP4 K/V on gfx950: ``kv_dtype=dtypes.fp4x2`` of the shared tile kernel."""
-    if get_gfx_runtime() != "gfx950":
-        raise NotImplementedError("MXFP4 pa_decode supports gfx950")
+    """MXFP4 K/V on gfx950 and gfx1250: ``kv_dtype=dtypes.fp4x2`` of the tile kernel."""
+    arch = get_gfx_runtime()
+    gfx1250 = arch in ("gfx1250", "gfx1250-strict")
+    if arch != "gfx950" and not gfx1250:
+        raise NotImplementedError("MXFP4 pa_decode supports gfx950 and gfx1250")
     # fp4x2 data and fp8_e8m0 scale views are the same bytes as uint8 ones.
     k_data, v_data, k_scale, v_scale = (
         (
@@ -264,6 +266,9 @@ def _pa_decode_mxfp4(
             "MXFP4 pa_decode needs 16 B query and output row/head strides and a "
             "contiguous head_dim axis"
         )
+    if gfx1250 and (query.data_ptr() % 16 or output.data_ptr() % 16):
+        # gfx1250 loads query rows and stores output rows in 16 B units.
+        raise ValueError("MXFP4 pa_decode needs 16 B aligned query and output")
     # The kernel adds row and head offsets in i32 (query bytes, output elements);
     # keep the end of the last head_dim chunk within 2**31 - 1 bytes for both.
     for name, t in (("query", query), ("output", output)):
@@ -339,6 +344,21 @@ def _pa_decode_mxfp4(
     # One task per sequence needs neither the plan nor the reducer.
     direct = work_plan is None or (work_plan.max_partitions == 1 and same_strides)
     capacity = num_seqs if direct else work_plan.capacity
+    num_compute_units = torch.cuda.get_device_properties(dev).multi_processor_count
+    # As for FP8/BF16 on gfx1250: sequences of at most P <= CLUSTER_PARTITIONS
+    # tasks merge within a cluster of P CTAs instead of the reducer, while the
+    # clusters stay resident (15 per 16 CUs).
+    partitions = 1 if direct else min(work_plan.max_partitions, capacity)
+    cluster_merge = (
+        partitions
+        if gfx1250
+        and same_strides
+        and 2 <= partitions <= CLUSTER_PARTITIONS
+        and num_seqs * partitions
+        <= max(capacity, -(-2 * num_compute_units // num_kv_heads))
+        and num_seqs * num_kv_heads <= num_compute_units * 15 // 16
+        else 0
+    )
     with torch.cuda.device(dev):
         compiled = compile_pa_decode_tile(
             head_dim=head_dim,
@@ -346,9 +366,7 @@ def _pa_decode_mxfp4(
             block_size=128,
             num_seqs=num_seqs,
             num_kv_heads=num_kv_heads,
-            num_compute_units=torch.cuda.get_device_properties(
-                dev
-            ).multi_processor_count,
+            num_compute_units=num_compute_units,
             num_partitions=1 if direct else work_plan.max_partitions,
             softmax_scale=softmax_scale,
             query_dtype=query.dtype,
@@ -356,6 +374,7 @@ def _pa_decode_mxfp4(
             work_capacity=capacity,
             max_context_length=schedule_context_length,
             direct_output=direct,
+            cluster_merge=cluster_merge,
         )
     pmax = psum = pout = output
     if not direct:
@@ -381,8 +400,7 @@ def _pa_decode_mxfp4(
         pmax, psum, pout = scratch
     with torch.cuda.device(dev):
         stream = torch.cuda.current_stream(dev)
-        _run_compiled(
-            compiled["launch"],
+        operands = (
             ptr_arg(pmax, fx.Float32),
             ptr_arg(psum, fx.Float32),
             ptr_arg(pout, torch_to_fx_dtype(pout.dtype)),
@@ -392,16 +410,47 @@ def _pa_decode_mxfp4(
             ptr_arg(block_tables, fx.Int32),
             ptr_arg(k_scale, fx.Float8E8M0FNU),
             ptr_arg(v_scale, fx.Float8E8M0FNU),
-            max_blocks_per_seq,
-            num_seqs,
-            num_kv_heads,
-            *page_head_strides,
-            query.stride(0),
-            query.stride(1),
-            ptr_arg(context_lengths if direct else work_plan.work_info, fx.Int32),
-            capacity,
-            stream,
         )
+        work_info = ptr_arg(
+            context_lengths if direct else work_plan.work_info, fx.Int32
+        )
+        if gfx1250:
+            _run_compiled(
+                compiled["launch"],
+                *operands,
+                max_blocks_per_seq,
+                num_seqs,
+                num_kv_heads,
+                *page_head_strides,
+                query.stride(0),
+                query.stride(1),
+                work_info,
+                capacity,
+                ptr_arg(output, torch_to_fx_dtype(output.dtype)),
+                (
+                    flyc.from_c_void_p(fx.Int32, 0)
+                    if direct
+                    else ptr_arg(work_plan.reduce_info, fx.Int32)
+                ),
+                flyc.from_c_void_p(fx.Int32, 0),
+                stream,
+            )
+            if cluster_merge:
+                return
+        else:
+            _run_compiled(
+                compiled["launch"],
+                *operands,
+                max_blocks_per_seq,
+                num_seqs,
+                num_kv_heads,
+                *page_head_strides,
+                query.stride(0),
+                query.stride(1),
+                work_info,
+                capacity,
+                stream,
+            )
         if direct:
             return
         output_5d = output.reshape(num_seqs, 1, num_kv_heads, group, head_dim)
@@ -504,7 +553,7 @@ def pa_decode(
     Each contributes once, independently of the window; -inf disables it and
     +inf suppresses the head's output.
 
-    MXFP4 K/V (gfx950): ``key_cache``/``value_cache`` are data views
+    MXFP4 K/V (gfx950, gfx1250): ``key_cache``/``value_cache`` are data views
     [pages, kv_heads, 128, 64] (``dtypes.fp4x2`` or uint8) and
     ``key_scale``/``value_scale`` e8m0 views [pages, kv_heads, 128, 4]
     (``dtypes.fp8_e8m0`` or uint8) of the same pages (the four share page and head
@@ -519,10 +568,12 @@ def pa_decode(
     infinity even when the normalized output is finite. ``work_plan=None`` is accepted for MXFP4 only: one task per sequence
     writes its row directly (the output needs the query's row and head strides,
     a context-0 row is zero-filled) and nothing is specialized on ``num_seqs``; a
-    plan with ``max_partitions == 1`` is served the same way. A task may span at
-    most 4096 pages in ``max_context_length``: pass a smaller one otherwise. A
-    real context longer than that bound is still fully attended (up to 2**19
-    tokens a task, the bound of the fixed PV shift, unchecked on the GPU).
+    plan with ``max_partitions == 1`` is served the same way. On gfx950 a task
+    may span at most 4096 pages in ``max_context_length``: pass a smaller one
+    otherwise. A real context longer than that bound is still fully attended (up
+    to 2**19 tokens a task, the bound of the fixed PV shift, unchecked on the
+    GPU). gfx1250 reads page ids from the block table, without that bound, and
+    needs 16 B aligned query and output base pointers.
 
     Refresh ``work_plan`` on the current stream after changing lengths. Its
     max_partitions is bounded by device CUs. Match sliding_window and, for

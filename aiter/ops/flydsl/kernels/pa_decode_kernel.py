@@ -28,10 +28,12 @@ with resident Q and fused PV accumulation; D256 is limited to 32 query rows.
 Page16 BF16 caches at these dimensions retain vector-8 packing in LDS while
 using the 64-token pipeline.
 
-MXFP4 K/V (``kv_dtype=dtypes.fp4x2``, gfx950, head_dim 128, page 128, one query token a
-row) share this scaffolding and have their own tile: QK is one scaled MFMA (fp4 K x
-e4m3 Q), V is widened to bf16 through wave-private LDS. A wave owns 64 tokens of the
-tile and all dims, so the tile loop has no barrier; the waves merge once after it.
+MXFP4 K/V (``kv_dtype=dtypes.fp4x2``, gfx950/gfx1250, head_dim 128, page 128, one
+query token a row) share this scaffolding and have their own tile: QK is one scaled
+MFMA/WMMA (fp4 K x e4m3 Q). gfx950 widens V to bf16 through wave-private LDS; gfx1250
+dequantizes V with the scaled WMMA against fp4 identity blocks, which leaves it
+transposed in registers for the bf16 PV WMMA. A wave owns 64 tokens of the tile and
+all dims, so the tile loop has no barrier; the waves merge once after it.
 
 Logical layouts (not preshuffled):
 
@@ -74,6 +76,7 @@ from .pa_decode.op_merge import (
 from .pa_decode.pipeline import (
     Gfx1250Bf16Pipeline,
     Gfx1250Bf16WavePipeline,
+    Gfx1250Mxfp4Pipeline,
     Gfx1250Pipeline,
     Gfx1250WavePipeline,
     PaDecodePipeline,
@@ -221,9 +224,9 @@ def compile_pa_decode_tile(
     Planned gfx950 BF16 D128 output uses slot-rebased buffer stores when the
     slot's byte span fits signed i32, retaining the dtype's 2-byte alignment.
 
-    ``direct_output`` (gfx950, MXFP4): no plan -- ``work_info`` is the int32 context
-    lengths -- one task per sequence, the output written directly with the query's
-    row/head strides (an empty row is zero-filled). FP8/BF16 on gfx942/gfx950 accept it
+    ``direct_output`` (MXFP4, gfx950 and gfx1250): no plan -- ``work_info`` is the
+    int32 context lengths -- one task per sequence, the output written directly with
+    the query's row/head strides (an empty row is zero-filled). FP8/BF16 on gfx942/gfx950 accept it
     with a one-partition plan (capacity equal to the batch): ``pmax`` carries the
     plan's ``reduce_info``, slot s runs packed task s and zero-fills sequence s
     when it owns no task, and ``pout`` is the output.
@@ -257,6 +260,24 @@ def compile_pa_decode_tile(
     architecture = (architecture or get_gfx_runtime()).split(":", 1)[0]
     if architecture in ("gfx1250", "gfx1250-strict"):
         kv_fx, query_fx = pa_fx_dtypes(kv_dtype, query_dtype)
+        if kv_fx == MXFP4_KV_DTYPE:
+            if query_fx not in (fx.BFloat16, fx.Float8E4M3FN):
+                raise ValueError("MXFP4 KV requires a BF16 or FP8 query")
+            # direct_output is the plan-free form: one task per sequence.
+            return compile_gfx1250_pa_decode(
+                head_dim=head_dim,
+                query_group_size=query_group_size,
+                block_size=block_size,
+                softmax_scale=softmax_scale,
+                query_dtype=_dtype_tag(query_fx),
+                per_token_kv=per_token_kv,
+                query_length=query_length,
+                trans_v=trans_v,
+                sliding_window=sliding_window,
+                compute_dtype="mxfp4",
+                plan_free=direct_output,
+                cluster_merge=cluster_merge,
+            )
         if query_fx not in (fx.Float16, fx.BFloat16) or kv_fx not in (
             fx.Float8E4M3FN,
             fx.BFloat16,
@@ -746,6 +767,7 @@ def compile_gfx1250_pa_decode(
     query_splits=1,
     merge_partitions=False,
     cluster_merge=0,
+    plan_free=False,
 ):
     """Compile a gfx1250 tile kernel; merging partitions writes final output.
 
@@ -758,6 +780,12 @@ def compile_gfx1250_pa_decode(
     and empty sequences clear their rows.
     ``merge_partitions`` partial storage must be eight-byte aligned for its
     device-scope atomic accesses; the host wrapper falls back for offset views.
+
+    ``compute_dtype="mxfp4"`` (``Gfx1250Mxfp4Pipeline``) takes E2M1 K/V data and
+    E8M0 scale views, head_dim 128, page 128, one query token and at most 16
+    rows, and writes packed partials for the reducer or a cluster merge;
+    ``plan_free`` instead reads ``work`` as the context lengths, runs sequence
+    s whole in CTA s and stores its final rows (an empty sequence's are zeroed).
     """
     if query_splits not in (1, 2, 4) or query_length % query_splits:
         raise ValueError("query_splits must be 1, 2, or 4 and divide query_length")
@@ -776,9 +804,31 @@ def compile_gfx1250_pa_decode(
         query_splits,
         merge_partitions,
         cluster_merge,
+        plan_free,
     )
-    if compute_dtype not in ("fp8", "bf16"):
+    if compute_dtype not in ("fp8", "bf16", "mxfp4"):
         raise ValueError(f"Unsupported gfx1250 PA compute dtype: {compute_dtype}")
+    if plan_free and not t.mxfp4:
+        raise ValueError("plan_free requires MXFP4 KV")
+    if t.mxfp4 and not (
+        head_dim == 128
+        and block_size == 128
+        and query_length == 1
+        and 1 <= query_group_size <= 16
+        and query_dtype in ("bf16", "fp8")
+        and not per_token_kv
+        and sliding_window == 0
+        and query_splits == 1
+        and not (direct_output or merge_partitions)
+        and not (plan_free and cluster_merge)
+    ):
+        raise NotImplementedError(
+            "gfx1250 MXFP4 PA decode supports head_dim 128, block 128, one query "
+            "token, 1..16 query heads per KV head, a bf16 or e4m3 query, no "
+            "window, and reducer, cluster-merged or plan-free output"
+        )
+    if query_dtype == "fp8" and not t.mxfp4:
+        raise ValueError("An FP8 query needs MXFP4 KV")
     if t.bf16 and per_token_kv:
         raise ValueError("BF16 PA decode does not use quantization scales")
     if merge_partitions and (direct_output or head_dim > MERGE_HEAD_DIM):
@@ -817,7 +867,7 @@ def compile_gfx1250_pa_decode(
         trans_v=trans_v,
         sliding_window=sliding_window,
         query_splits=query_splits,
-        direct_output=direct_output,
+        direct_output=direct_output or plan_free,
         merge_partitions=merge_partitions,
         cluster_merge=cluster_merge,
     )
@@ -889,10 +939,20 @@ def compile_gfx1250_pa_decode(
             # A trailing empty sequence's start can equal capacity. Its dummy
             # task read must stay in bounds even though no compute consumes it.
             task_slot = (count > 0).select(fx.Int32(info[task_slot * 2]), fx.Int32(0))
-        task = fx.ptr_load(
-            fx.add_offset(fx.recast_iter(fx.Int32, work), task_slot * 4),
-            result_type=fx.Vector.make_type(4, fx.Int32),
-        )
+        if const_expr(t.plan_free):
+            # CTA s runs sequence s: all tiles of its context length.
+            context = fx.Int32(fx.recast_iter(fx.Int32, work)[task_slot])
+            task = [
+                task_slot,
+                fx.Int32(0),
+                (context + (KV_COMPUTE_BLOCK - 1)) // KV_COMPUTE_BLOCK,
+                context,
+            ]
+        else:
+            task = fx.ptr_load(
+                fx.add_offset(fx.recast_iter(fx.Int32, work), task_slot * 4),
+                result_type=fx.Vector.make_type(4, fx.Int32),
+            )
         active = fx.Int32(task[1]) < fx.Int32(task[2])
         if const_expr(t.direct_output):
             active = count > 0
@@ -940,7 +1000,11 @@ def compile_gfx1250_pa_decode(
             if const_expr(t.cluster_merge):
                 ctx.task_count = count
                 ctx.output_ptr = output
-            if const_expr(t.bf16_wave_query_tiles):
+            if const_expr(t.plan_free):
+                ctx.output_ptr = output
+            if const_expr(t.mxfp4):
+                Gfx1250Mxfp4Pipeline(ctx).run()
+            elif const_expr(t.bf16_wave_query_tiles):
                 Gfx1250Bf16WavePipeline(ctx).run()
             elif const_expr(t.bf16_page128_packed):
                 Gfx1250Bf16Pipeline(ctx).run()
@@ -950,6 +1014,8 @@ def compile_gfx1250_pa_decode(
                 Gfx1250Pipeline(ctx).run()
         elif const_expr(t.direct_output):
             zero_output(gpu.block_id("x"), pout)
+        elif const_expr(t.plan_free):
+            zero_output(task_slot, output)
         if const_expr(t.merge_partitions):
             # Empty sequences own no task. Capacity >= batch gives each one the
             # CTA at its index, which clears its rows.
@@ -993,7 +1059,7 @@ def compile_gfx1250_pa_decode(
         stream: fx.Stream,
     ):
         grid_x = capacity
-        if const_expr(t.direct_output):
+        if const_expr(t.direct_output or t.plan_free):
             grid_x = sequences
         if const_expr(t.cluster_merge):
             grid_x = sequences * t.cluster_merge

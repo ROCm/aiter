@@ -173,6 +173,31 @@ class PaDecodeGemm:
 
 
 class Gfx1250Gemm:
+    # V_WMMA_SCALE_F32_16X16X128_F8F6F4 operand formats.
+    FMT_E4M3, FMT_E2M1 = 0, 4
+
+    @staticmethod
+    def mma_mx(a, b, scale_a, scale_b, fmt_b):
+        """One scaled 16x16x128 WMMA from zero: A is E2M1 (8 dwords a lane), B is
+        E4M3 (16 dwords) or E2M1 (8 dwords). Lane (r, h) holds row/column r, K bytes
+        [16 h, +16) and [32 + 16 h, +16) of a 64-byte E2M1 row (a 128-byte E4M3 row
+        keeps the half-wave's alternating 16-byte chunks). Lanes 0-15 supply the
+        scales: byte b of row/column r's dword is the E8M0 of K 32 b .. 32 b + 31."""
+        # Raw op, as in ``mma``: operands are register vectors, while the
+        # WMMAScale atom's fx.gemm takes rmem tensors.
+        return fx.Vector(
+            fx.rocdl.wmma_scale_f32_16x16x128_f8f6f4(
+                fx.Vector.make_type(8, fx.Float32),
+                a,
+                b,
+                fx.Vector.filled(8, 0.0, fx.Float32),
+                scale_a,
+                scale_b,
+                fmtA=Gfx1250Gemm.FMT_E2M1,
+                fmtB=fmt_b,
+            )
+        )
+
     @staticmethod
     def mma(a, b, acc, k, bf16=False):
         if const_expr(bf16):

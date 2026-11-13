@@ -1198,9 +1198,9 @@ _PIPE_CASES = [
         },
     ),
 ]
-# MXFP4 K/V on gfx950: head_dim 128, page 128, one query token a row, an e4m3 or a
-# bf16 query. Plan-free runs one task per row; unequal 32-element blocks make a
-# block/scale mix-up visible.
+# MXFP4 K/V on gfx950/gfx1250: head_dim 128, page 128, one query token a row, an
+# e4m3 or a bf16 query. Plan-free runs one task per row; unequal 32-element blocks
+# make a block/scale mix-up visible.
 _E4M3 = torch.float8_e4m3fn
 _MXFP4_SWEEP = (1, 15, 16, 17, 127, 128, 129, 255, 256, 257, 511, 2047, 2048)
 _MXFP4_BASE = {
@@ -1727,8 +1727,10 @@ def test_pa_decode(case, device, monkeypatch):
         **case,
     )
     arch = get_gfx_runtime()
-    if case["kv_dtype"] == "mxfp4" and arch != "gfx950":
-        pytest.skip("MXFP4 pa_decode runs on gfx950")
+    if case["kv_dtype"] == "mxfp4" and arch not in ("gfx950", "gfx1250"):
+        pytest.skip("MXFP4 pa_decode runs on gfx950 and gfx1250")
+    if case.get("invalid_input") == "oversized-task" and arch == "gfx1250":
+        pytest.skip("gfx1250 MXFP4 reads page ids from the table; no staging bound")
     if (
         arch != "gfx1250"
         and case["kv_dtype"] == "bf16"
@@ -2061,13 +2063,15 @@ def test_pa_decode_unowned_kv_rows(
     image); P is zero there but 0 * NaN is NaN in PV.
     ``mask_unowned_kv=False`` skips the masking and matches it on clean input.
     """
-    if get_gfx_runtime() == "gfx1250":
-        pytest.skip("gfx1250 pipelines still require finite unowned V rows")
+    if get_gfx_runtime() == "gfx1250" and kv != "mxfp4":
+        pytest.skip("gfx1250 FP8/BF16 pipelines still require finite unowned V rows")
     if kv == "mxfp4" and (
-        get_gfx_runtime() != "gfx950"
+        get_gfx_runtime() not in ("gfx950", "gfx1250")
         or (block_size, query_length, head_dim) != (128, 1, 128)
     ):
-        pytest.skip("MXFP4 pa_decode: gfx950, page 128, head_dim 128, one query token")
+        pytest.skip(
+            "MXFP4 pa_decode: gfx950/gfx1250, page 128, head_dim 128, one query token"
+        )
     pa = importlib.import_module("aiter.ops.flydsl.pa_decode")
     torch.manual_seed(0)
     lengths = tuple(max(n, query_length) for n in (1, 17, 255, 257, 1000))
