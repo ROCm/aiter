@@ -795,7 +795,8 @@ def build_schedule(kc: KernelCtx) -> dict:
         did the agent-atomic scan of recv_expert) -- so plan reads only EPR ints instead
         of re-scanning the whole n_ranks x m x topk routing window (which otherwise
         contends for HBM with the overlapped payload a2a).  The grid_barrier before this
-        publishes expert_count."""
+        publishes expert_count.  The small-batch kernel takes the counts from its own
+        LDS scan (small_count) instead."""
         r_expert_count = rsrc(
             fx.Int64(a["expert_count"]), i32(EPR * BUCKET_COUNTERS) * i32(4)
         )
@@ -1184,7 +1185,7 @@ def build_schedule(kc: KernelCtx) -> dict:
         a["window_offsets"] = source_windows(a)
         # balanced-gather pre-pass: assign global per-expert positions, then a true
         # cross-CTA barrier (the scan is distributed) publishes expert_recv_slots to
-        # every CTA. All of assign_positions / plan / PASS0-gather read only the routing
+        # every CTA. All of assign_positions / plan / the gather read only the routing
         # (recv_expert), so they run NOW -- overlapping the big payload a2a still in
         # flight -- and each GEMM1 tile waits for its expert's payload just before it
         # needs it.
@@ -1206,7 +1207,7 @@ def build_schedule(kc: KernelCtx) -> dict:
         nblk = i32(gpu.grid_dim.x)
         r_payload_row = rsrc(a["chunk_payload_row"])
         r_recv_slot = rsrc(a["chunk_recv_slot"])
-        # --- PASS 0 (gather): walk this CTA's echunks, publish per-row recv-slot
+        # --- gather: walk this CTA's echunks, publish per-row recv-slot
         #     (chunk_recv_slot, for combine) + payload-row (chunk_payload_row, for
         #     GEMM1's A-gather) to global.
         if const_expr(SMALL_BATCH):
@@ -1255,10 +1256,9 @@ def build_schedule(kc: KernelCtx) -> dict:
         # GEMM tiles read only their own XCD's gather (small-batch: synced above)
         if const_expr(not SMALL_BATCH):
             xcd_barrier(L, tid, a)
-        # payload wait: only NOW does the kernel need the dispatched activation (GEMM1's
-        # A-gather). The planning + gather above overlapped the payload a2a, so this spin
-        # is short (payload mostly landed). After it, the rows for every echunk are live.
-        # (Large kernel: per expert, in the tile queue.)
+        # small-batch payload wait: only NOW does the kernel need the dispatched
+        # activation (GEMM1's A-gather), and the planning + gather above overlapped the
+        # payload a2a.  The large kernel waits per expert in the tile queue instead.
         if const_expr(SMALL_BATCH):
             small_wait(tid, a, FLAG_SMALL_PAYLOAD, ERR_DISPATCH)
         cta_barrier(L, tid)

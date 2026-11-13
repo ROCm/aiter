@@ -319,11 +319,11 @@ class MegaMoeEPEngine:
         self._inter_scale = torch.empty(
             rows_cap * (self.I // 32), dtype=torch.uint8, device=self.device
         )
-        # Per-echunk GEMM1 A-gather source keys written to global by the gather pass:
+        # Per-echunk GEMM1 A-gather source keys written to global by the gather:
         # chunk_payload_row = payload row (recv_slot // topk) for the ATileLoader
-        # indexed gather; chunk_recv_slot = the full recv_slot (the combine pass
-        # recovers route = idx % topk and the source rank/token from it -- read in a
-        # later pass so it cannot stay in the per-CTA LDS LDS_GATHER). Indexed
+        # indexed gather; chunk_recv_slot = the full recv_slot (the GEMM2 combine
+        # scatter recovers route = idx % topk and the source rank/token from it -- read
+        # by other CTAs' tiles, so it cannot stay in the per-CTA LDS_GATHER). Indexed
         # echunk*TILE_M + r.
         self._chunk_payload_row = torch.empty(
             rows_cap, dtype=torch.int32, device=self.device

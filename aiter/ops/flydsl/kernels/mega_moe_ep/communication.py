@@ -9,7 +9,10 @@ Peer / arena resource builders, the sticky error word and the readiness flags:
   expert-owner rank's arrival counter; the last arriver zeroes the counter and stamps
   the paired ready flag with the launch epoch. The owner's compute waves
   ``dispatch_wait_meta`` (spin until the ready flag reaches the epoch, wrap-safe).
-* ``combine_*`` -- the mirror for GEMM2 partials scattered back to the source rank.
+* ``payload_*`` -- the senders count each local expert's landed routes into the
+  owner's ``FLAG_PAYLOAD_COUNT``; a GEMM1 tile waits its expert's count.
+* ``combine_*`` -- GEMM2 tiles add their landed partial units to the source rank's
+  combine counter; the source waits it to reach m*TOPK*COMBINE_UNITS.
 
 The device code reaches arena peers through ``peer_rsrc`` / ``own_rsrc`` (raw buffer
 resources at ``peer_base + off_region``).
@@ -113,8 +116,8 @@ def _quantize_group8(v8):
 
 
 def _mx_e8m0(amax, fp8):
-    """mega_moe.quant's 1x32 MX scale (per_1x32_mx_quant, bit-identical) of a group's
-    abs max (folded from 1e-10)."""
+    """1x32 MX scale (bit-identical to per_1x32_mx_quant) of a group's abs max (folded
+    from 1e-10)."""
     inv = 0x3B124925 if fp8 else 0x3E2AAAAB  # 1 / max_pos (448 / 6)
     working = (amax * fx.Int32(inv).bitcast(fx.Float32)).bitcast(fx.Int32)
     mantissa = working & fx.Int32(0x7FFFFF)
@@ -244,7 +247,7 @@ def build_communication(kc: KernelCtx) -> dict:
                 rocdl.s_sleep(2)
                 cur = g_ld_sys(addr)
 
-    # --- device grid barrier (all CTAs of THIS rank, between GEMM passes) --------
+    # --- device grid barrier (all CTAs of THIS rank, after the position pre-pass) ---
     @flyc.jit
     def grid_barrier(a, tid):
         """Cross-CTA handshake over all ``grid_dim.x`` CTAs of this rank's GPU, via an
@@ -337,8 +340,8 @@ def build_communication(kc: KernelCtx) -> dict:
     @flyc.jit
     def dispatch_route_all(L, tid, a):
         """Scatter each local (token, route)'s local expert id to its expert-owner
-        rank's ``recv_expert``, indexed by ``source_key = rank*mtpr + token`` (bounded
-        by n_ranks*mtpr, overflow-proof), then signal ``dispatch_arrive_meta``: the
+        rank's ``recv_expert`` slot ``source_key*topk + route`` (``source_key =
+        rank*mtpr + token``, bounded by n_ranks*mtpr, overflow-proof), then signal ``dispatch_arrive_meta``: the
         owner plans (assign_positions / plan / gather, all routing-only) while the
         payload (payload_send) is still in flight.  The top-k weights stay at the source
         (applied in combine_final).  All NW waves of a CTA send (wave w of CTA b is

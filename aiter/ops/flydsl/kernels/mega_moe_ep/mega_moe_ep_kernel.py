@@ -10,8 +10,8 @@ One persistent CTA per CU (grid=#CU, block=512 = 8 waves, all of them compute).
   combine_final, cross-rank waits
 * ``gemm.build_gemm``               -> the inline-A GEMM1 / GEMM2 (+ fused combine)
 
-``compute_units`` runs the a2a dispatch, the planner, the GEMM passes and the combine
-scatter; the finish phase does the source-side top-k weighted sum (combine_final).
+``compute_units`` runs the a2a dispatch, the planner and the GEMM tile queue (with the
+combine scatter); the finish phase does the source-side top-k weighted sum (combine_final).
 """
 
 from __future__ import annotations
@@ -171,7 +171,7 @@ def compile_mega_moe_ep(
         a["arena_bases"] = arena_bases
         a["own_arena"] = fx.Int64(own_arena)
         a["recv_expert"] = fx.Int64(own_arena) + off_recv  # own received-routing region
-        # dynamic-planner scan bound (indexed recv)
+        # recv_expert slots: TOPK per source key (rank*mtpr + token)
         a["n_recv"] = n_ranks * mtpr * i32(TOPK)
         if const_expr(SMALL_BATCH):  # this launch's part bank
             a["off_part"] = off_part + fx.Int64(a["epoch"] & i32(1)) * fx.Int64(

@@ -69,9 +69,9 @@ class _LdsView:
 
 
 def _lds_byte_ptr(L, off):
-    """Byte-typed LDS pointer at ``L + off`` (gemm_util atoms address A/A-scale in
-    bytes; ``AS2RLoader._load_16b`` offsets the raw ``.ptr`` by a byte count, so the
-    element type must be ``i8``).  Uses the MLIR type ``T.i8`` -- NOT the fx class."""
+    """Byte-typed LDS pointer at ``L + off`` (the gemm_util atoms and ``_ALdsReader``
+    offset the raw ``.ptr`` by byte counts, so the element type must be ``i8``).  Uses
+    the MLIR type ``T.i8`` -- NOT the fx class."""
     pt = fx.PointerType.get(T.i8, address_space=fx.AddressSpace.Shared, alignment=16)
     return fx.inttoptr(pt, uni(i32(L) + i32(off)))
 
@@ -92,6 +92,21 @@ def _opaque_v(v):
             T.i32, [as_ir_value(i32(v))], "v_mov_b32 $0, $1", "=v,v"
         ).result
     )
+
+
+def _dpp_quad_perm(l0, l1, l2, l3):
+    """DPP ``quad_perm`` control: lane j of every 4-lane quad reads its lane ``l_j``."""
+    return l0 | l1 << 2 | l2 << 4 | l3 << 6
+
+
+DPP_XOR1 = _dpp_quad_perm(1, 0, 3, 2)  # lane ^ 1
+DPP_XOR2 = _dpp_quad_perm(2, 3, 0, 1)  # lane ^ 2
+DPP_ROW_HALF_MIRROR = 0x141  # lane i of each 8 reads lane 7 - i
+DPP_ROW_MIRROR = 0x140  # lane i of the 16-lane row reads lane 15 - i
+
+F32_MANTISSA_BITS = 23
+F32_MANTISSA_HALF = 1 << (F32_MANTISSA_BITS - 1)
+F32_SIGN_EXP_MASK = 0xFF800000
 
 
 def _dpp_f32(x, ctrl):
@@ -282,6 +297,8 @@ def build_gemm(kc: KernelCtx) -> dict:
         return i32(0) if INTER_REBASE else e * i32(TILE_M)
 
     a_dtype = "fp8" if a8 else "fp4"
+    # largest exponent of an element: fp8-e4m3 448 = 1.75 * 2^8, fp4-e2m1 6 = 1.5 * 2^2
+    elem_emax = 8 if a8 else 2
     n_per_wave = TILE_N // NW  # GEMM1 output cols per wave of one n-tile
     inter_cols = TILE_N // 2  # intermediate cols produced by one n-tile
     N_ACC = M_REPEAT * NUM_ACC_N
@@ -377,10 +394,14 @@ def build_gemm(kc: KernelCtx) -> dict:
                 m = fx.max(a0, a1)
                 # quad xor1, xor2, then 8- / 16-lane mirrors: every lane of the 16-lane
                 # row ends with the row max (VALU DPP, no ds_swizzle round trip)
-                for ctrl in (0xB1, 0x4E, 0x141, 0x140):
+                for ctrl in (DPP_XOR1, DPP_XOR2, DPP_ROW_HALF_MIRROR, DPP_ROW_MIRROR):
                     m = fx.max(m, _dpp_f32(m, ctrl))
-                max_rounded = (m.bitcast(fx.Int32) + i32(0x400000)) & i32(0xFF800000)
-                _e = (max_rounded >> i32(23)) - i32(8 if a8 else 2)
+                # the max's biased f32 exponent, +1 from 1.5 * 2^e up (mantissa >= 0.5
+                # carries into the exponent)
+                max_rounded = (m.bitcast(fx.Int32) + i32(F32_MANTISSA_HALF)) & i32(
+                    F32_SIGN_EXP_MASK
+                )
+                _e = (max_rounded >> i32(F32_MANTISSA_BITS)) - i32(elem_emax)
                 e8 = (_e > i32(0)).select(_e, i32(0))
                 # this group's first global col
                 gbase = i32(n_tile) * i32(inter_cols) + cbase
@@ -396,7 +417,7 @@ def build_gemm(kc: KernelCtx) -> dict:
                 for nj in range_constexpr(gui_n):
                     cv = cnj[nj][v]
                     # neighbour col (l16 ^ 1)
-                    cvn = _dpp_f32(cv, 0xB1)
+                    cvn = _dpp_f32(cv, DPP_XOR1)
                     # the even col's value of this 2-col byte
                     first = even.select(cv, cvn)
                     second = even.select(cvn, cv)  # the odd col's value
@@ -427,7 +448,7 @@ def build_gemm(kc: KernelCtx) -> dict:
     def gemm1(L, tid, a, expert, e, nt_lo, nt_hi, rows, pre_epi=None):
         """Inline-A GEMM1: the compute waves stage each A K-tile into an LDS bank ring
         THEMSELVES (``ATileLoader`` with ``total_threads=NT=512``) and read it back via
-        ``AS2RLoader``, syncing with the hardware block barrier (all 8 waves are compute).
+        ``_ALdsReader``, syncing with the hardware block barrier (all 8 waves are compute).
         Multi-banking + the 2 MFMA waves/SIMD hide the A-load + barrier latency."""
         payload_row_rsrc = ptr_buf_tensor(fx.Int64(a["chunk_payload_row"]), fx.Int32)
         payload = _global_byte_tensor(

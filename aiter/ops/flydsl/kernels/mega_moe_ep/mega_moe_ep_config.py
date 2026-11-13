@@ -3,9 +3,9 @@
 """Compile-time layout, shape limits and the per-instance ``KernelCtx`` of the fused
 EP MegaMoE kernel.
 
-The epoch-flag arena carries the *dispatch* / *combine* readiness epochs (an
-all-to-all scatter completes a receive tile; a combine partial lands back at the
-source).  The in-kernel planner (``schedule.build_schedule``) works over this rank's
+The epoch-flag arena carries the cross-rank readiness: the dispatch routing (one
+ready epoch per owner rank), the payload (landed routes per local expert) and the
+combine (partial units landed back at the source).  The in-kernel planner (``schedule.build_schedule``) works over this rank's
 ``EPR`` *local* experts and the ``(token, expert)`` pairs this rank received.
 """
 
@@ -84,23 +84,23 @@ TILE_N = 512
 # inter_rows().
 
 
-def max_chunks(tmax: int, topk: int, rg: int, epr: int) -> int:
+def max_chunks(token_slots: int, topk: int, tile_m: int, epr: int) -> int:
     """Worst-case echunk count of one launch: every received (token, route) pair --
-    at most ``tmax * topk`` (all ranks routing to this one) -- in ``rg``-row chunks,
-    plus one partial chunk per local expert."""
-    return ceildiv(tmax * topk, rg) + epr
+    at most ``token_slots * topk`` (all ranks routing to this one) -- in
+    ``tile_m``-row chunks, plus one partial chunk per local expert."""
+    return ceildiv(token_slots * topk, tile_m) + epr
 
 
-def inter_rows(tmax: int, topk: int, epr: int, rg_max: int = 128) -> int:
+def inter_rows(token_slots: int, topk: int, epr: int, tile_m_max: int = 128) -> int:
     """Worst-case rows of the per-echunk scratch (inter / inter_scale /
     chunk_payload_row / chunk_recv_slot): every received pair plus each local expert's
     partial last chunk at the largest TILE_M."""
-    return tmax * topk + epr * rg_max
+    return token_slots * topk + epr * tile_m_max
 
 
-def ctrl_ints(tmax: int, topk: int, epr: int, rg_min: int = 32) -> int:
-    """ctrl ints covering GEMM1_DONE / GEMM2_DONE of any row tile >= ``rg_min``."""
-    return GEMM1_DONE + 2 * max_chunks(tmax, topk, rg_min, epr)
+def ctrl_ints(token_slots: int, topk: int, epr: int, tile_m_min: int = 32) -> int:
+    """ctrl ints covering GEMM1_DONE / GEMM2_DONE of any row tile >= ``tile_m_min``."""
+    return GEMM1_DONE + 2 * max_chunks(token_slots, topk, tile_m_min, epr)
 
 
 # Epoch-flag arena: ints in the symmetric arena ``off_flag`` region. Two banks selected
@@ -122,8 +122,8 @@ FLAG_COMBINE_COUNT = FLAG_SRC_TOKENS + 2 * MAX_CTAS
 #                                        each rank)
 FLAG_INIT = FLAG_COMBINE_COUNT + 2 * MAX_CTAS
 FLAG_INIT_COUNT = FLAG_INIT + 2 * MAX_CTAS
-# FLAG_ROUTING_READY + parity*MAX_CTAS + tile    dispatch META (routing-only) ready
-# (epoch) -- FLAG_ROUTING_COUNT + parity*MAX_CTAS + tile    its arrival counter. The
+# FLAG_ROUTING_READY + parity*MAX_CTAS + 0    dispatch META (routing-only) ready
+# (epoch) -- FLAG_ROUTING_COUNT + parity*MAX_CTAS + 0    its arrival counter. The
 # routing (recv_expert) is scattered + signalled BEFORE the payload so the owner plans
 # (assign_positions / plan / gather, all routing-only) while the big payload a2a is
 # still in flight.
@@ -163,7 +163,8 @@ FLAG_INTS = FLAG_SMALL_DONE + MAX_RANKS
 CTRL_ERR = 0
 ERR_DISPATCH, ERR_COMPUTE, ERR_COMBINE = 1, 2, 4
 # Device grid-barrier slots (agent-scope counter + generation in the local ctrl tensor;
-# the multi-pass GEMM syncs ALL CTAs of this rank between passes). Self-resetting like
+# the large kernel syncs ALL CTAs of this rank once, after the position pre-pass, to
+# publish expert_count / expert_recv_slots to plan). Self-resetting like
 # the LDS cta_barrier: the last arriver zeroes the counter and bumps the generation.
 # Zeroed once at engine init; the generation grows monotonically (wrap-safe == compare).
 GRID_BAR_COUNT, GRID_BAR_GEN = 16, 17
@@ -176,7 +177,8 @@ GRID_BAR_XCD_COUNT, GRID_BAR_XCD_GEN = 48, 56
 # (self-resetting).
 META_XCD_COUNT, META_RANK_COUNT = 18, 26
 # Launch epoch (device-side, so a captured CUDA graph replays with a fresh one): every
-# CTA reads it at entry; CTA 0 bumps it once the plan grid barrier shows all have.
+# CTA reads it at entry; the large kernel's CTA 0 bumps it once the pre-pass grid
+# barrier shows all have, the small-batch kernel's last CTA out of the tile queue.
 EPOCH_SLOT = 27
 # Per-echunk tile counters: each GEMM1 / GEMM2 tile of an echunk adds 1 once its slice
 # of inter / part is written, so a GEMM2 tile waits only its own echunk's N_TILES GEMM1
@@ -208,7 +210,7 @@ assert EPOCH_SLOT < XCC_OFFSETS < QUEUE_NEXT
 # token's local experts on that owner is g, so expert le is complete after round le %
 # PAYLOAD_ROUNDS, about one expert per owner XCD per round -- each counting its landed
 # routes into the owner's FLAG_PAYLOAD_COUNT[le]. Every CTA sends the first rounds with
-# the routing (before plan: the plan's grid barriers would wait on any CTA still
+# the routing (before plan: the pre-pass grid barrier would wait on any CTA still
 # sending), then SENDERS_PER_XCD CTAs per XCD send the rest while the others start the
 # tile queue.  The queue walks the XCD's experts in send-round order, and a GEMM1 tile
 # waits its expert's count. The up-front rounds are picked per launch from m:
@@ -217,7 +219,7 @@ assert EPOCH_SLOT < XCC_OFFSETS < QUEUE_NEXT
 # hot round saturates does not hold back the other owners' later rounds.  Owners taking
 # over HOT_OWNER_PCT % of a strided token sample's round-0 sends -- except the sample's
 # most-loaded owner -- skip the up-front rounds (they would stall every CTA ahead of the
-# plan's grid barrier on that owner's ingress); their senders send those rounds first.
+# pre-pass grid barrier on that owner's ingress); their senders send those rounds first.
 # Deferring the most-loaded owner too would leave its senders alone on the busiest
 # ingress.
 SENDERS_PER_XCD = 4
@@ -263,7 +265,7 @@ def a_banks(SMALL_BATCH):
 # LDS control slots (ints at ``LDS_CTRL``; see schedule.py): the cta_barrier generation
 # barrier and the dynamic plan's bookkeeping.
 CTL_BAR_COUNT, CTL_BAR_GEN = 0, 1  # compute-wave LDS generation barrier
-CTL_N_ACTIVE, CTL_N_CHUNKS = 2, 3  # #active experts, #units
+CTL_N_ACTIVE, CTL_N_CHUNKS = 2, 3  # #active experts, #echunks
 CTL_PREV_COUNT = 4  # old value of this CTA's last echunk-counter add (tid0 -> waves)
 CTL_QUEUE_INDEX = 5  # the tile index tid0 pulled from the XCD queue (tid0 -> waves)
 CTL_WALK_START = 6  # the expert-major walk's start group (in echunks from chunk_lo)
@@ -290,8 +292,8 @@ def ep_shape_supported(
 def mega_moe_ep_consts(
     H: int, I: int, MT: int, EPR: int, a8: bool = False, SMALL_BATCH: bool = False
 ) -> dict:
-    """Per-instance LDS layout (bytes): one row tile's activation + E8M0 scale +
-    intermediate staging, plus the dynamic planner's tables (active-expert bitmap /
+    """Per-instance LDS layout (bytes): the GEMM A ring, one row tile's E8M0 A-scale and
+    the GEMM2 cshuffle C-tile, plus the dynamic planner's tables (active-expert bitmap /
     dense list, per-local-expert counts, chunk table, wave-prefix scratch, control)."""
     TILE_M = MT * 16  # rows per GEMM tile (sort_block_m)
     BITMAP_WORDS = ceildiv(EPR, 32)  # 32-bit words of the active-local-expert bitmap
@@ -346,7 +348,7 @@ def mega_moe_ep_consts(
     # EPR + 3 must fit in a byte.
     c["CHUNK_GROUP_WORDS"] = 2048 if EPR <= 252 else 0
     c["LDS_CHUNK_GROUP"] = take(c["CHUNK_GROUP_WORDS"] * 4)
-    # gathered source_key (payload row) list of one unit chunk
+    # gathered recv slots (source_key*topk + route) of one echunk
     c["LDS_GATHER"] = take(TILE_M * 4)
     c["LDS_CTRL"] = take(CTL_INTS * 4)  # control slots (CTL_* above)
     # large kernel (HOT_SPLIT): this XCD's echunk range + segments

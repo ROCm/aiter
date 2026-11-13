@@ -54,12 +54,12 @@ from aiter.aot.flydsl.common import (
 from aiter.aot.flydsl.mega_moe import ARCH, DEVICE_NAME, NUM_CU
 from aiter_worker_limits import adopt_legacy_max_jobs
 
-# Serving builds a decode-capacity instance next to the full one (ATOM's
-# _EP_SB_MTPR, SGLang's SGLANG_AMD_FLYDSL_MEGA_MOE_DECODE_MTPR).
+# Serving builds a decode-capacity instance (512 tokens per rank, the small-batch
+# kernel) next to the full one.
 DEFAULT_MTPRS = (512, 8192)
 DEFAULT_QUANTS = ("a8w4", "a4w4")
 WORLD_SIZE = 8
-# DeepSeek-V4-Pro: r0, r32 and r64 redundant experts, as in mega_moe.py.
+# DeepSeek-V4-Pro: r0, r32 and r64 redundant experts.
 DEFAULT_EXPERTS_PER_RANKS = (48, 52, 56)
 TOPK = 6
 MODEL_DIM = 7168
