@@ -5506,11 +5506,19 @@ static size_t mla_rope_tdm_lds_bytes(int hpt, size_t elem_size)
     return size_t(2) * (hpt * 256 + std::min(hpt, 4) * 64) * elem_size;
 }
 
-// Heads per block and the latency-path (LAT, always with K early) variant on
-// the flat head-group-major grid of the per-entry layout, fit on gfx1250
-// (H=16/24/32/48/96/128, T=1..4096) against the (token, head) rows per CU:
-// one head below 12, two on the latency path below 18, four on the latency
-// path up to 128, eight on the TDM path beyond; one head is always LAT.
+// Heads per block on the flat head-group-major grid of the PAGE_SIZE == 0
+// per-entry layout. PAGE_SIZE > 0 uses mla_rope_heads_per_block instead.
+//
+// The gfx1250/gfx950 tuning first selects HPT from the (token, head) rows per
+// CU: [0, 12) -> 1, [12, 18) -> 2, [18, 128] -> 4, and (128, inf) -> 8.
+// HPT is then repeatedly halved until it divides num_heads. LAT is selected
+// for final HPT == 1 or rows/CU <= 128. NOPE_EARLY is selected on LAT when
+// final HPT <= 2 or rows/CU <= 48; every LAT form also has K_EARLY.
+//
+// These ranges were fit on gfx1250 (H=16/24/32/48/96/128, T=1..4096) and
+// checked on gfx950 at H=96 T=48/64. Other architectures retain the previous
+// selection ([0,32] -> 1, (32,80] -> 2, (80,160] -> 4, then 8), K_EARLY
+// through 48 rows/CU, and do not select the new LAT/NOPE_EARLY forms.
 // Between 12 and 18 the latency path's second head per block beats one head
 // (CUDA graph, H=24 T=128 2.03 -> 1.88 us, T=160 2.22 -> 1.99 us); below 12
 // it is 1-4% slower. From 18 to 128 four heads on the latency path beat both
@@ -5525,14 +5533,21 @@ static size_t mla_rope_tdm_lds_bytes(int hpt, size_t elem_size)
 // always issue them first.
 static int mla_rope_entry_heads_per_block(int64_t num_tokens,
                                           int num_heads,
+                                          bool& k_early,
                                           bool& lat,
                                           bool& nope_early)
 {
     const int64_t per_cu = num_tokens * num_heads / get_num_cu_func();
-    int hpt = per_cu < 12 ? 1 : per_cu < 18 ? 2 : per_cu <= 128 ? 4 : 8;
+    const std::string arch = get_gpu_arch();
+    const bool tuned_arch =
+        arch == "gfx1250" || arch == "gfx1250-strict" || arch == "gfx950";
+    int hpt = tuned_arch
+                  ? (per_cu < 12 ? 1 : per_cu < 18 ? 2 : per_cu <= 128 ? 4 : 8)
+                  : (per_cu <= 32 ? 1 : per_cu <= 80 ? 2 : per_cu <= 160 ? 4 : 8);
     while(num_heads % hpt != 0)
         hpt >>= 1;
-    lat        = hpt == 1 || per_cu <= 128;
+    k_early = hpt == 1 || per_cu <= (tuned_arch ? 128 : 48);
+    lat = tuned_arch && (hpt == 1 || per_cu <= 128);
     nope_early = lat && (hpt <= 2 || per_cu <= 48);
     return hpt;
 }
@@ -5572,9 +5587,9 @@ static void launch_mla_rope_hpt(const MlaRopeHptArgs& a, hipStream_t stream)
     else
     {
         constexpr int KV_LORA = 512, PE_DIM = 64, VEC = 8;
-        bool lat, nope_early;
-        const int hpt =
-            mla_rope_entry_heads_per_block(a.num_tokens, a.num_heads, lat, nope_early);
+        bool k_early, lat, nope_early;
+        const int hpt = mla_rope_entry_heads_per_block(
+            a.num_tokens, a.num_heads, k_early, lat, nope_early);
         const size_t lds = lat ? 0 : mla_rope_tdm_lds_bytes(hpt, sizeof(scalar_t));
         uint32_t tok_magic;
         int tok_shift;
@@ -5619,16 +5634,27 @@ static void launch_mla_rope_hpt(const MlaRopeHptArgs& a, hipStream_t stream)
             LAUNCH_MLA_ROPE_HPT(NEOX, NF, 4, true, true, true);            \
         else if(lat)                                                       \
             LAUNCH_MLA_ROPE_HPT(NEOX, NF, 4, true, true, false);           \
+        else if(k_early)                                                   \
+            LAUNCH_MLA_ROPE_HPT(NEOX, NF, 4, true, false, false);          \
         else                                                               \
             LAUNCH_MLA_ROPE_HPT(NEOX, NF, 4, false, false, false);         \
         break;                                                             \
     case 2:                                                                \
-        if(lat)                                                            \
+        if(nope_early)                                                     \
             LAUNCH_MLA_ROPE_HPT(NEOX, NF, 2, true, true, true);            \
+        else if(lat)                                                       \
+            LAUNCH_MLA_ROPE_HPT(NEOX, NF, 2, true, true, false);           \
+        else if(k_early)                                                   \
+            LAUNCH_MLA_ROPE_HPT(NEOX, NF, 2, true, false, false);          \
         else                                                               \
             LAUNCH_MLA_ROPE_HPT(NEOX, NF, 2, false, false, false);         \
         break;                                                             \
-    default: LAUNCH_MLA_ROPE_HPT(NEOX, NF, 1, true, true, true); break;    \
+    default:                                                               \
+        if(lat)                                                            \
+            LAUNCH_MLA_ROPE_HPT(NEOX, NF, 1, true, true, true);            \
+        else                                                               \
+            LAUNCH_MLA_ROPE_HPT(NEOX, NF, 1, true, false, false);          \
+        break;                                                             \
     }                                                                      \
     }
         // Without a rotation the NEOX and GPT-J layouts are the same.
