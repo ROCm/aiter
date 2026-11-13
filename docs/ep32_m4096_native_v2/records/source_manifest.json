@@ -20,8 +20,8 @@
     },
     {
       "path": "aiter/ops/flydsl/kernels/mxmoe_gemm2_ep32_bm80var.py",
-      "worktree_sha256": "93bd48b7bd8e541625de88cb659351672650ebf8ea21820989792278f49b5dc4",
-      "git_content_sha256": "93bd48b7bd8e541625de88cb659351672650ebf8ea21820989792278f49b5dc4"
+      "worktree_sha256": "276344f2eff3a562185beca52158062a3576a2d68bdcb0929ab9edd521299502",
+      "git_content_sha256": "276344f2eff3a562185beca52158062a3576a2d68bdcb0929ab9edd521299502"
     },
     {
       "path": "aiter/ops/flydsl/kernels/mxmoe_gemm2_ep32_bm80base.py",
@@ -49,6 +49,8 @@
       "git_content_sha256": "7f825191f374be6c4573645dfb4b244c42215a3fb88d1bf7943260df32572043"
     }
   ],
-  "gpu_validation_new_candidates": false,
-  "code_commit": "b0b61ad96f28b8b782c854d8c893e8ef5be70ae0"
+  "gpu_validation_new_candidates": true,
+  "pre_nt_code_commit": "b0b61ad96f28b8b782c854d8c893e8ef5be70ae0",
+  "validated_parent_before_nt": "fa961eb6224f069c8f4d7e800a4ddcb6f4567af1",
+  "validated_candidate": "GEMM2 native FP32 output NT only; other candidates remain unvalidated"
 }

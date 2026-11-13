@@ -1,0 +1,14 @@
+{
+  "routes": 2046,
+  "sorted_rows": 2240,
+  "replays": 3,
+  "one_two_route_bit_exact": true,
+  "all_28_experts_bit_exact": true,
+  "all_output_written": true,
+  "capture": "/root/workspace/workflow_34/moonshot_ep32_moe_v2/cx/g2continuity/nt_check_20261113_023336_hip1",
+  "native_output_nt": true,
+  "kernel_sha256": "276344f2eff3a562185beca52158062a3576a2d68bdcb0929ab9edd521299502",
+  "repeated_default_dispatch_replays": 3,
+  "repeated_default_dispatch_bit_exact_le2": true,
+  "repeated_default_dispatch_output_finite": true
+}

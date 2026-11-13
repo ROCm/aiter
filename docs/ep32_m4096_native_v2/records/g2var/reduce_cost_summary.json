@@ -1,0 +1,33 @@
+{
+  "capture": "/root/workspace/workflow_34/moonshot_ep32_moe_v2/cx/g2var/amd_pair_20261112_220328_hip5",
+  "protocol": "same-process alternating BM80 atomic/native; 30 samples each; G1 B-scale NT enabled on both",
+  "busy_definition": "sum of all selected GPU kernel durations",
+  "span_definition": "first selected kernel start to last selected kernel end; includes GPU kernel gaps; not CPU-entry-to-return latency",
+  "atomic": {
+    "fc1_us": 68.2805,
+    "fc2_us": 39.7205,
+    "fc1_fc2_us": 108.001,
+    "reduce_us": 0.0,
+    "prepare_us": 35.6,
+    "busy_us": 143.961,
+    "span_us": 304.62300000000005
+  },
+  "native_reduce": {
+    "fc1_us": 67.94,
+    "fc2_us": 34.8205,
+    "fc1_fc2_us": 102.92099999999999,
+    "reduce_us": 25.28,
+    "prepare_us": 35.5,
+    "busy_us": 163.621,
+    "span_us": 324.483
+  },
+  "delta_native_minus_atomic": {
+    "fc1_us": -0.3405000000000058,
+    "fc2_us": -4.899999999999999,
+    "fc1_fc2_us": -5.0800000000000125,
+    "reduce_us": 25.28,
+    "prepare_us": -0.10000000000000142,
+    "busy_us": 19.659999999999997,
+    "span_us": 19.859999999999957
+  }
+}

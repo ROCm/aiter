@@ -793,7 +793,8 @@ def gemm2_body_v2(
             out_ptr = global_typed_ptr(arg_out, T.f32, align=16)
             out_view = fx.Tensor(fx.make_view(out_ptr, fx.make_layout((1, 1), (1, 1))))
             out_buf = fx.rocdl.make_buffer_tensor(out_view, max_size=True)
-            store = fx.make_copy_atom(fx.rocdl.BufferCopy128b(), Float32)
+            # CDNA4 NT store changes cache replacement only; waits stay intact.
+            store = fx.make_copy_atom(fx.rocdl.BufferCopy128b(2), Float32)
             n16 = _udiv(N_OUT_rt, fx.Int32(16))
             live_cols = fx.Int32(BN) if const_expr(n_live is None) else n_live
             if wave * fx.Int32(CPW) < live_cols:
@@ -1845,7 +1846,7 @@ def compile_gemm2_ep32(
         f"{'_nt' if use_nt else ''}{'_valid_tokens' if use_valid_token_count else ''}{'_blds2' if use_b_lds else ''}{'_bm80' if BM == 80 else ''}{'_bnt' if B_NT else ''}{'_nativef32' if NATIVE_C else ('_store128' if REDUCE else '')}"
     )
 
-    name += f'_bn{BN}w{NW}_bs{BSTAGES}' + ('_var384x8_512' if VARWIDTH else '')
+    name += f'_cnt_bn{BN}w{NW}_bs{BSTAGES}' + ('_var384x8_512' if VARWIDTH else '')
 
     @fx.struct
     class SharedStorage:
