@@ -12,7 +12,6 @@ import argparse
 
 import pytest
 import torch
-from aiter.test_common import run_perftest
 
 from aiter.ops.kda_replayssm import (
     kda_replayssm_decode,
@@ -20,6 +19,7 @@ from aiter.ops.kda_replayssm import (
     kda_replayssm_decode_conv_supported,
     kda_replayssm_decode_supported,
 )
+from aiter.test_common import run_perftest
 
 DEV = "cuda"
 K = V = 128
