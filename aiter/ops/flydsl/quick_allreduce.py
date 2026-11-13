@@ -35,21 +35,6 @@ from flydsl.expr.typing import Float32, Int32, Int64, Stream
 
 from aiter.jit.utils.chip_info import get_lds_capacity_bytes
 
-from .allreduce_host_shared import (
-    _cuda_index,
-    _resolve_inbox_flags,
-    _StEngine,
-    _validate_ipc_process_group,
-    check_build_outside_capture,
-    check_fused_aliasing,
-    check_launch_outside_capture,
-    check_payload,
-    check_world_size,
-    kernel_symbol,
-    payload_probes,
-    preload_launcher,
-    require_arch,
-)
 from .allreduce_policy import (
     AG_CODECS,
     MESH_CODECS,
@@ -69,6 +54,21 @@ from .allreduce_policy import (
     resolve_link,
     ring_st_ladder,
     select_rung,
+)
+from .comm_collectives_host_shared import (
+    _cuda_index,
+    _StEngine,
+    _validate_ipc_process_group,
+    check_build_outside_capture,
+    check_fused_aliasing,
+    check_launch_outside_capture,
+    check_payload,
+    check_world_size,
+    kernel_symbol,
+    payload_probes,
+    preload_launcher,
+    require_arch,
+    resolve_inbox_flags,
 )
 from .kernels.comm.quick_allreduce_fusions import (
     mxfp4_scale_shape,
@@ -334,7 +334,7 @@ class FlyQuickAllReduce:
             ladder = algo.st_ladder(world_size=world_size, link=link, arch=arch)
         if not ladder:
             raise ValueError("ladder must have at least one rung")
-        inbox_flags, resolved_inbox = _resolve_inbox_flags(
+        inbox_flags, resolved_inbox = resolve_inbox_flags(
             inbox_memory, world_size, link
         )
         self._device_index = _cuda_index(device, owner="FlyQuickAllReduce")
@@ -800,7 +800,7 @@ class FlyQuickAllReduceRMSNorm:
         if grid_cap is not None and int(grid_cap) < 1:
             raise ValueError(f"grid_cap must be positive, got {grid_cap}")
 
-        inbox_flags, resolved_inbox = _resolve_inbox_flags(
+        inbox_flags, resolved_inbox = resolve_inbox_flags(
             inbox_memory, world_size, link
         )
         self._device_index = _cuda_index(device, owner="FlyQuickAllReduceRMSNorm")

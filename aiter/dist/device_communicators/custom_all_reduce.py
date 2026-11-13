@@ -48,7 +48,7 @@ from .rocm_version import get_rocm_version
 # checked at import time.
 try:
     from aiter.ops.flydsl import allreduce_policy as fly_policy
-    from aiter.ops.flydsl.allreduce_host_shared import eligible_payload_bytes
+    from aiter.ops.flydsl.comm_collectives_host_shared import eligible_payload_bytes
     from aiter.ops.flydsl.one_shot_allreduce import OneShotAllReduce
 
     _FLY_IMPORT_OK = True

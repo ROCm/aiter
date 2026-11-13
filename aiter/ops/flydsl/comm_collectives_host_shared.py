@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
 
-"""Shared assets for all-reduce host wrappers."""
+"""Shared assets for the FlyDSL communication host wrappers."""
 
 import ctypes
 import logging
@@ -19,7 +19,7 @@ from .allreduce_policy import (
     default_inbox_memory,
     resolve_link,
 )
-from .ipc_heap import UncachedIpcHeap
+from .ipc_heap import IpcHeap
 from .kernels.tensor_shim import _preload_compiled
 
 logger = logging.getLogger("aiter")
@@ -38,22 +38,33 @@ def _cuda_index(device, *, owner: str) -> int:
     return int(device)
 
 
-def _resolve_inbox_flags(
+def resolve_inbox_flags(
     mode: str, world_size: int, link: str | None = None
 ) -> tuple[int, str]:
     """(hipExtMallocWithFlags mode, resolved name) for an ``inbox_memory``.
 
-    ``"auto"`` resolves to ``default_inbox_memory``.
+    ``"auto"`` resolves to ``default_inbox_memory``. If ``"auto"`` cannot
+    tell the link (unreadable KFD topology and ``AITER_FLY_AR_LINK`` unset), it
+    falls back to ``uncached``, the memory the op used before the choice
+    existed, and logs a warning.
     """
     if mode not in INBOX_MEMORY_MODES:
         raise ValueError(
             f"inbox_memory must be one of {INBOX_MEMORY_MODES}, got {mode!r}"
         )
     if mode == "auto":
-        mode = default_inbox_memory(world_size, resolve_link(link))
+        if int(world_size) != 2:
+            try:
+                link = resolve_link(link)
+            except ValueError as exc:
+                if link is not None:
+                    raise
+                logger.warning("inbox_memory='auto': %s Falling back to uncached.", exc)
+                link = "xgmi"
+        mode = default_inbox_memory(world_size, link)
     flags = {
-        "uncached": UncachedIpcHeap._HIP_DEVICE_MALLOC_UNCACHED,
-        "finegrained": UncachedIpcHeap._HIP_DEVICE_MALLOC_FINEGRAINED,
+        "uncached": IpcHeap._HIP_DEVICE_MALLOC_UNCACHED,
+        "finegrained": IpcHeap._HIP_DEVICE_MALLOC_FINEGRAINED,
     }[mode]
     return flags, mode
 
@@ -97,15 +108,15 @@ class _StEngine:
         try:
             # The inbox is the only allocation peers write into, so it is the
             # only one whose memory type matters for fabric throughput.
-            self._buf_ptr = UncachedIpcHeap.alloc(
+            self._buf_ptr = IpcHeap.alloc(
                 self.buf_bytes, inbox_flags, fill=spec.get("inbox_fill", 0)
             )
-            my_meta = (UncachedIpcHeap.get_mem_handle_bytes(self._buf_ptr), 0)
+            my_meta = (IpcHeap.get_mem_handle_bytes(self._buf_ptr), 0)
         except Exception as e:  # noqa: BLE001
             error = e
             my_meta = (None, 0)
         try:
-            all_meta = UncachedIpcHeap.gather_object_list_via_broadcast(group, my_meta)
+            all_meta = IpcHeap.gather_object_list_via_broadcast(group, my_meta)
         except Exception:
             self.close()
             raise
@@ -135,7 +146,7 @@ class _StEngine:
             if r == rank:
                 peer_ptrs[r] = self._buf_ptr + off
             else:
-                base = int(UncachedIpcHeap.open_mem_handle(bytes(handle)))
+                base = int(IpcHeap.open_mem_handle(bytes(handle)))
                 self._peer_bases[r] = base
                 peer_ptrs[r] = base + off
 
@@ -153,15 +164,15 @@ class _StEngine:
         xchg_bytes = int(self.spec.get("xchg_bytes", 0))
         xchg_off = (peer_bytes + color_bytes + 127) // 128 * 128
         meta_bytes = xchg_off + xchg_bytes if xchg_bytes else peer_bytes + color_bytes
-        self._meta_ptr = UncachedIpcHeap.alloc_uncached(meta_bytes)
+        self._meta_ptr = IpcHeap.alloc_uncached(meta_bytes)
         self._gpu_peer_ptrs = self._meta_ptr
         self._colors = self._meta_ptr + peer_bytes
-        UncachedIpcHeap.copy_host_to_device(
+        IpcHeap.copy_host_to_device(
             self._gpu_peer_ptrs,
             (ctypes.c_int64 * world_size)(*peer_ptrs),
             peer_bytes,
         )
-        UncachedIpcHeap.copy_host_to_device(
+        IpcHeap.copy_host_to_device(
             self._colors,
             (ctypes.c_int32 * self.grid)(*([1] * self.grid)),
             color_bytes,
@@ -173,13 +184,13 @@ class _StEngine:
         for b in self._peer_bases:
             if b is not None:
                 try:
-                    UncachedIpcHeap.close_mem_handle(int(b))
+                    IpcHeap.close_mem_handle(int(b))
                 except RuntimeError:
                     pass
         self._peer_bases = []
         if self._meta_ptr:
             try:
-                UncachedIpcHeap.free_device_mem(self._meta_ptr)
+                IpcHeap.free_device_mem(self._meta_ptr)
             except RuntimeError:
                 pass
             self._meta_ptr = None
@@ -188,7 +199,7 @@ class _StEngine:
             self._xchg = 0
         if self._buf_ptr:
             try:
-                UncachedIpcHeap.free_device_mem(self._buf_ptr)
+                IpcHeap.free_device_mem(self._buf_ptr)
             except RuntimeError:
                 pass
             self._buf_ptr = None
