@@ -44,6 +44,7 @@ import pandas as pd
 import torch
 
 import aiter
+from aiter.benchmark_reporting import print_json_table
 from aiter.jit.utils.build_targets import base_gfx_arch
 from aiter.jit.utils.chip_info import get_gfx
 from aiter.ops.opus import pa_mqa_logits_mxfp4 as M
@@ -1104,6 +1105,8 @@ def test_semantics(model, check):
 def summarize(name, rows):
     df = pd.DataFrame(rows)
     aiter.logger.info("%s summary (markdown):\n%s", name, df.to_markdown(index=False))
+    # One JSON line a table, which benchmark drivers (op_tests/bench_*) collect.
+    print_json_table(name, df)
     return df
 
 
