@@ -729,6 +729,35 @@ void allreduce_add_lamport(fptr_t _fa,
 #undef RUN_LAMPORT_ADD
 }
 
+void allreduce_lamport(fptr_t _fa,
+                       const aiter_tensor_t& inp,
+                       const aiter_tensor_t& out,
+                       bool two_shot)
+{
+    HipDeviceGuard device_guard(inp.device_id);
+    hipStream_t stream = aiter::getCurrentHIPStream();
+    auto fa            = reinterpret_cast<aiter::CustomAllreduce*>(_fa);
+    if(out.numel() != inp.numel() || out.dtype() != inp.dtype() || !out.is_contiguous() ||
+       out.device_id != inp.device_id || !inp.is_contiguous())
+        throw std::runtime_error(
+            "allreduce_lamport requires a contiguous input and a matching contiguous out");
+
+#define RUN_LAMPORT_AR(T)                                                      \
+    fa->allreduce_lamport<T>(stream,                                           \
+                             reinterpret_cast<const T*>(inp.data_ptr()),       \
+                             reinterpret_cast<T*>(out.data_ptr()),             \
+                             inp.numel(),                                      \
+                             two_shot)
+
+    switch(inp.dtype())
+    {
+    case AITER_DTYPE_fp16: RUN_LAMPORT_AR(opus::fp16_t); break;
+    case AITER_DTYPE_bf16: RUN_LAMPORT_AR(opus::bf16_t); break;
+    default: throw std::runtime_error("allreduce_lamport only supports float16 and bfloat16");
+    }
+#undef RUN_LAMPORT_AR
+}
+
 void all_gather_lamport(fptr_t _fa,
                         const aiter_tensor_t& inp,
                         const aiter_tensor_t& out,

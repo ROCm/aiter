@@ -414,6 +414,17 @@ def allreduce_add_lamport_gfx1250(
 ) -> None: ...
 
 
+# Lamport all-reduce of inp, on the same inbox as the fused AR + RMSNorm above:
+# one-shot, or with two_shot a reduce-scatter and an all-gather (fp16/bf16).
+@compile_ops(GFX1250_MD_NAME, fc_name="allreduce_lamport", develop=True)
+def allreduce_lamport_gfx1250(
+    _fa: int,
+    inp: torch.Tensor,
+    out: torch.Tensor,
+    two_shot: bool,
+) -> None: ...
+
+
 # Lamport one-shot all-gather, on the same inbox as the fused AR + RMSNorm
 # above. An input the kernel cannot read in place (unaligned, or overlapping out)
 # is copied into the registered buffer at reg_inp_ptr first. Bit for bit, except

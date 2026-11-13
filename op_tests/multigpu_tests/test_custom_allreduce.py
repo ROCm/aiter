@@ -415,9 +415,20 @@ def test_allreduce_ll_gfx1250_mixed_size_regression(tp_size, iterations=1000):
     # lines. Check every round so the early stale reads are not skipped.
     if not _is_gfx1250():
         return
-    _run_mixed_size_regression(
-        tp_size, _LL_GFX1250_MIXED_SIZES, iterations, "gfx1250 LL", 1
-    )
+    # bf16 up to the Lamport range takes the Lamport kernels; with the Lamport
+    # cap at 0 (inherited by the spawned ranks) these sizes stay on LL
+    env = "AITER_CUSTOM_AR_LAMPORT_RMS_MAX_SIZE"
+    saved = os.environ.get(env)
+    os.environ[env] = "0"
+    try:
+        _run_mixed_size_regression(
+            tp_size, _LL_GFX1250_MIXED_SIZES, iterations, "gfx1250 LL", 1
+        )
+    finally:
+        if saved is None:
+            os.environ.pop(env, None)
+        else:
+            os.environ[env] = saved
 
 
 def _run_mixed_size_regression(tp_size, sizes, iterations, name, check_every):
