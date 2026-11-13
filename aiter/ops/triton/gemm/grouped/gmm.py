@@ -194,8 +194,8 @@ def gmm(
     """
     Perform Group Matrix Multiplication (GMM): out = lhs @ rhs + bias
 
-    backend="gluon" (gfx1250 only, no work stealing) runs a TDM/WMMA Gluon kernel; `config`
-    then takes BLOCK_M/BLOCK_N/BLOCK_K/NUM_BUFFERS/num_warps/waves_per_eu.
+    backend="gluon" (gfx1250 only, no work stealing, no grid_dim) runs a TDM/WMMA Gluon kernel;
+    `config` then takes BLOCK_M/BLOCK_N/BLOCK_K/NUM_BUFFERS/num_warps/waves_per_eu.
 
     lhs rows are divided into G groups. Each group of lhs rows is matrix multiplied with a plane of
     rhs 3D tensor and then stored in a slice of out. In PyTorch parlance, it can be implemented as
@@ -298,6 +298,9 @@ def gmm(
 
     if backend == "gluon":
         assert not work_stealing, "Gluon GMM does not support work stealing."
+        assert (
+            grid_dim is None
+        ), "Gluon GMM launches one program per tile and does not support grid_dim."
         return _gmm_gluon(lhs, rhs, group_sizes, bias, out, trans_rhs, config)
     assert backend == "triton", f"Unknown GMM backend {backend}."
 

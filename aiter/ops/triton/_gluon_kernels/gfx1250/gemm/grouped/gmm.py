@@ -8,6 +8,22 @@ from aiter.ops.triton._gluon_kernels.gfx1250.gemm.basic.gemm_a16w16 import (  # 
     create_shared_layouts,
     create_wmma_layouts,
 )
+from aiter.ops.triton.utils._triton.kernel_repr import make_kernel_repr
+
+_gmm_gfx1250_kernel_repr = make_kernel_repr(
+    "_gmm_gfx1250_kernel",
+    [
+        "G",
+        "BLOCK_M",
+        "BLOCK_N",
+        "BLOCK_K",
+        "NUM_BUFFERS",
+        "LAYOUT",
+        "ADD_BIAS",
+        "num_warps",
+        "waves_per_eu",
+    ],
+)
 
 
 @gluon.jit
@@ -56,7 +72,7 @@ def _read_operands(
     return cur_a, cur_b
 
 
-@gluon.jit
+@gluon.jit(repr=_gmm_gfx1250_kernel_repr)
 def _gmm_gfx1250_kernel(
     a_ptr,
     b_ptr,
