@@ -70,6 +70,8 @@ from .comm_collectives_host_shared import (
     require_arch,
     resolve_inbox_flags,
 )
+from .comm_traffic import Pattern, PeerMem, Phase, RcclCall, Traffic
+from .kernels.comm.quick_allreduce_codec import codecs_for_block
 from .kernels.comm.quick_allreduce_fusions import (
     mxfp4_scale_shape,
     quick_reduce_padded_row_block_options,
@@ -621,6 +623,40 @@ class FlyQuickAllReduce:
         eng = self._by_cfg[cfg]
         grid_x = self._grid_x(num_tiles, eng.super_tile, eng.grid)
         return f"{kernel_symbol(eng.launch)}/grid_x{grid_x}"
+
+    def traffic(self, nbytes: int) -> Traffic:
+        """The peer traffic of an *nbytes* all-reduce, for bandwidth rooflines.
+
+        The engine is chosen as ``allreduce`` would choose it. Both schedules
+        are two laps in one launch, reduce-scatter and then all-gather, and
+        each lap is one phase. Each tile sends ``ATOMS / N`` rank-tiles per
+        destination per lap, in that lap's codec. The mesh pushes them to
+        every peer. The ring pushes them to the next rank, ``N - 1`` times.
+        """
+        cfg, num_tiles = self._pick_cfg(int(nbytes))
+        eng = self._by_cfg[cfg]
+        codecs = codecs_for_block(eng.block)
+        per_pair_tiles = num_tiles * (ATOMS // self.world_size)
+        ring = self.algorithm == "ring"
+
+        def lap(codec: str) -> Phase:
+            return Phase(
+                pattern=Pattern.PUSH_NEXT if ring else Pattern.PUSH_ALL,
+                chunk_bytes=per_pair_tiles * codecs[codec].rank_tile_bytes,
+                include_self=False,
+                repeat=self.world_size - 1 if ring else 1,
+                peer_mem=PeerMem(self.inbox_memory),
+                workgroups=self._grid_x(num_tiles, eng.super_tile, eng.grid),
+                waves_per_workgroup=eng.block // WAVE,
+            )
+
+        return Traffic(
+            world_size=self.world_size,
+            collective="all_reduce",
+            logical_bytes=int(nbytes),
+            phases=(lap(self.rs_codec), lap(self.ag_codec)),
+            rccl=(RcclCall("all_reduce", int(nbytes), "bf16"),),
+        )
 
     def is_beneficial(self, nbytes: int) -> bool:
         """Whether *nbytes* is large enough for this kernel to be worth using.

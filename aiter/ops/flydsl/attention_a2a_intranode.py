@@ -23,6 +23,7 @@ from aiter.ops.mha_v4_quant import (
 )
 
 from .comm_collectives_host_shared import resolve_inbox_flags
+from .comm_traffic import Pattern, PeerMem, Phase, RcclCall, Traffic
 from .communication_ops_host_utils import make_symmetric_heap
 from .kernels.attention_a2a_intranode_kernel import (
     _transport_bytes,
@@ -866,6 +867,46 @@ class AttentionA2AIntraNodeOp:
             self._epoch += 1
             return self.outputs_sets[parity]
         return packed_result
+
+    def traffic(self) -> Traffic:
+        """The peer traffic of one Q/K/V trio, for bandwidth rooflines.
+
+        Each role is one push-to-all phase. Every rank writes a ``1/N`` chunk
+        of its input into every rank's receive buffer, its own included. The
+        chunk is the role's receive payload plus its delivered scales, divided
+        by ``N``. Packed payload buffers can carry tile slack, so the chunk can
+        slightly overstate the bytes a packed role moves. The geometry is the
+        role kernel's grid. The reuse barrier, the amax pre-exchange and the
+        local dequant move no payload between GPUs and are left out.
+        """
+        world_size = self._jit_kwargs[0]["npes"]
+        peer_mem = PeerMem(self.inbox_memory)
+        phases = []
+        for role, kwargs in enumerate(self._jit_kwargs):
+            payload = self.outputs_sets[0][role]
+            wire = payload.numel() * payload.element_size()
+            if self.quant:
+                scale = self.scales_sets[0][role]
+                wire += scale.numel() * scale.element_size()
+            phases.append(
+                Phase(
+                    pattern=Pattern.PUSH_ALL,
+                    chunk_bytes=-(-wire // world_size),
+                    include_self=True,
+                    repeat=1,
+                    peer_mem=peer_mem,
+                    workgroups=kwargs["block_num"],
+                    waves_per_workgroup=kwargs["warp_num_per_block"],
+                )
+            )
+        role_bytes = math.prod(self.shape) * torch.empty((), dtype=self.dtype).itemsize
+        return Traffic(
+            world_size=world_size,
+            collective="all_to_all",
+            logical_bytes=3 * role_bytes,
+            phases=tuple(phases),
+            rccl=(RcclCall("all_to_all", role_bytes, "bf16"),) * 3,
+        )
 
     def close(self):
         """Collective: every rank calls it after its last submit. The op is
