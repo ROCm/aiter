@@ -871,6 +871,20 @@ def fused_deepseek_v4_compress_norm_rope_store_two_stage(
 # =============================================================================
 
 
+# Split insert, MI355X sweep (16 q / 1 kv / 4 index_q heads, graph replay, us):
+#   T = 1..64     4 q programs per token 13.0-13.7 (one program 17.3-18.1)
+#   T = 128..512  2 q programs 13.7-15.4 (one program 17.9-19.7)
+#   T >= 2048     1 q program, as fast as one program; more only add overhead
+# One warp per program throughout. DSpark decode has 8 rows per request, so a
+# c=32 decode step is T = 8..256.
+_INSERT_SPLIT_WARPS = 1
+_INSERT_LAUNCH = None
+
+
+def _insert_q_programs(T: int) -> int:
+    return 4 if T <= 64 else 2 if T <= 1024 else 1
+
+
 def fused_minimax_m3_norm_rope_quant_insert(
     qkv: torch.Tensor,
     q_norm_weight: torch.Tensor,
@@ -895,6 +909,7 @@ def fused_minimax_m3_norm_rope_quant_insert(
     q_scale_out: torch.Tensor | None = None,
     index_q_out: torch.Tensor | None = None,
     num_warps: int | None = None,
+    q_programs: int | None = None,
 ):
     """MiniMax-M3 sparse-attention pre-processing in one launch.
 
@@ -915,6 +930,10 @@ def fused_minimax_m3_norm_rope_quant_insert(
       index_q  -> index_q_out: e4m3 [T, num_index_heads * 128] of bf16(index_q)
       index_k  -> index_cache: NVFP4 uint8 [pages, 128, 72] (128 x 64 B e2m1,
                   then 128 x 8 B e4m3 scales); index_slot_mapping < 0 skips
+
+    q_programs: programs per token for q (a power of two dividing num_heads);
+    index_q, index_k and k / v then each get their own program, so none of
+    them waits for q. 0: one program per token does everything.
 
     Returns (q_out, q_scale_out or None, index_q_out).
     """
@@ -954,11 +973,26 @@ def fused_minimax_m3_norm_rope_quant_insert(
     if T == 0:
         return q_out, q_scale_out, index_q_out
     qs = q_scale_out if out_quant else q_out
+    qg = _insert_q_programs(T) if q_programs is None else q_programs
+    if qg and (qg & (qg - 1) or nq % qg):
+        raise ValueError("q_programs must be a power of two dividing num_heads")
     if num_warps is None:
-        # one program per token: a single warp keeps more tokens in flight
-        # (gfx950: 209 vs 445 us at T = 32768); four help only small decode T
-        num_warps = 4 if T <= 256 else 1
-    fused_minimax_m3_norm_rope_quant_insert_kernel[(T,)](
+        if qg:
+            num_warps = _INSERT_SPLIT_WARPS
+        else:
+            # one program per token: a single warp keeps more tokens in flight
+            # (gfx950: 209 vs 445 us at T = 32768); four help only small decode T
+            num_warps = 4 if T <= 256 else 1
+    grid = (T, qg + 3) if qg else (T,)
+    global _INSERT_LAUNCH
+    if _INSERT_LAUNCH is None:
+        from aiter.ops.triton.utils._triton.fast_launch import FastLaunch
+
+        # cached CompiledKernel launches: JITFunction.run's per-call argument
+        # specialization cost more host time than the launch itself
+        _INSERT_LAUNCH = FastLaunch(fused_minimax_m3_norm_rope_quant_insert_kernel)
+    _INSERT_LAUNCH(
+        grid,
         qkv,
         q_norm_weight,
         k_norm_weight,
@@ -992,6 +1026,8 @@ def fused_minimax_m3_norm_rope_quant_insert(
         PAGE=PAGE,
         OUT_QUANT=out_quant,
         OUT_QUANT_FORMAT=out_quant_format,
+        QG=qg,
+        QH=nq // qg if qg else nq,
         num_warps=num_warps,
     )
     return q_out, q_scale_out if out_quant else None, index_q_out

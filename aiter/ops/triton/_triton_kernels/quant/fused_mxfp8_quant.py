@@ -1442,9 +1442,19 @@ def fused_minimax_m3_norm_rope_quant_insert_kernel(
     PAGE: tl.constexpr,
     OUT_QUANT: tl.constexpr,
     OUT_QUANT_FORMAT: tl.constexpr,
+    QG: tl.constexpr,
+    QH: tl.constexpr,
 ):
     """One token: [q (NQ) | k (NKV) | v (NKV) | index_q (NIQ) | index_k (1)] of
-    its qkv row. qkv is read only. Negative slots skip their cache."""
+    its qkv row. qkv is read only. Negative slots skip their cache.
+
+    QG = 0: one program per token does all of it (grid (T,)). QG > 0: grid
+    (T, QG + 3), program_id(1) the role, so no part waits for another:
+      [0, QG)  q heads [role * QH, role * QH + QH), QH = NQ / QG
+      QG       index_q
+      QG + 1   index_k
+      QG + 2   k / v
+    Each head's arithmetic is the same either way (bit-identical results)."""
     tl.static_assert(OUT_QUANT_FORMAT == "mxfp8", "OUT_QUANT_FORMAT must be 'mxfp8'")
     K_BYTES: tl.constexpr = PAGE * D // 2  # k4v8 record: K data, then K scales,
     KS_BYTES: tl.constexpr = PAGE * D // 32  # then V
@@ -1452,34 +1462,49 @@ def fused_minimax_m3_norm_rope_quant_insert_kernel(
     row = qkv_ptr + t * stride_qkv
     cs_row = cos_sin_ptr + tl.load(pos_ptr + t).to(tl.int64) * stride_cs
     d = tl.arange(0, D)[None, :]
+    if QG > 0:
+        role = tl.program_id(1)
+        do_q = role < QG
+        h0 = role * QH
+        do_iq = role == QG
+        do_ik = role == QG + 1
+        do_kv = role == QG + 2
+    else:
+        do_q = True
+        h0 = 0
+        do_iq = True
+        do_ik = True
+        do_kv = True
 
     # q: bf16, or MXFP8 (E8M0 per 32) of the bf16-rounded q.
-    q = _m3_norm_rope(row, 0, NQ, q_norm_ptr, cs_row, eps, D, ROT).to(tl.bfloat16)
-    hq = tl.arange(0, NQ)[:, None]
-    if OUT_QUANT:
-        g3 = q.to(tl.float32).reshape(NQ, D // 32, 32)
-        sc, qs = _mxfp8_quant_op(g3, QUANT_AXIS=2)
-        q8 = (g3 * qs).reshape(NQ, D).to(q_out_ptr.dtype.element_ty)
-        tl.store(q_out_ptr + t * stride_q_out + hq * D + d, q8)
-        gq = tl.arange(0, D // 32)[None, :]
-        tl.store(
-            q_scale_ptr + t * stride_q_scale + hq * (D // 32) + gq,
-            sc.reshape(NQ, D // 32),
-        )
-    else:
-        tl.store(q_out_ptr + t * stride_q_out + hq * D + d, q)
+    if do_q:
+        q = _m3_norm_rope(row, h0, QH, q_norm_ptr, cs_row, eps, D, ROT).to(tl.bfloat16)
+        hq = h0 + tl.arange(0, QH)[:, None]
+        if OUT_QUANT:
+            g3 = q.to(tl.float32).reshape(QH, D // 32, 32)
+            sc, qs = _mxfp8_quant_op(g3, QUANT_AXIS=2)
+            q8 = (g3 * qs).reshape(QH, D).to(q_out_ptr.dtype.element_ty)
+            tl.store(q_out_ptr + t * stride_q_out + hq * D + d, q8)
+            gq = tl.arange(0, D // 32)[None, :]
+            tl.store(
+                q_scale_ptr + t * stride_q_scale + hq * (D // 32) + gq,
+                sc.reshape(QH, D // 32),
+            )
+        else:
+            tl.store(q_out_ptr + t * stride_q_out + hq * D + d, q)
 
     # index_q: E4M3(bf16(index_q)), unit scale.
-    iq = _m3_norm_rope(row, NQ + 2 * NKV, NIQ, iq_norm_ptr, cs_row, eps, D, ROT)
-    iq = tl.clamp(iq.to(tl.bfloat16).to(tl.float32), -448.0, 448.0)
-    hi = tl.arange(0, NIQ)[:, None]
-    tl.store(
-        iq_out_ptr + t * stride_iq_out + hi * D + d, iq.to(iq_out_ptr.dtype.element_ty)
-    )
+    if do_iq:
+        iq = _m3_norm_rope(row, NQ + 2 * NKV, NIQ, iq_norm_ptr, cs_row, eps, D, ROT)
+        iq = tl.clamp(iq.to(tl.bfloat16).to(tl.float32), -448.0, 448.0)
+        hi = tl.arange(0, NIQ)[:, None]
+        tl.store(
+            iq_out_ptr + t * stride_iq_out + hi * D + d, iq.to(iq_out_ptr.dtype.element_ty)
+        )
 
     # index_k: NVFP4 (unit global scale) into [128 x 64 B data | 128 x 8 B scales].
     islot = tl.load(islot_ptr + t)
-    if islot >= 0:
+    if do_ik and islot >= 0:
         ik = _m3_norm_rope(row, NQ + 2 * NKV + NIQ, 1, ik_norm_ptr, cs_row, eps, D, ROT)
         g16 = ik.to(tl.bfloat16).to(tl.float32).reshape(D // 16, 16)
         # vLLM's NVFP4 index insert: scale = e4m3(min(amax * RN(1/6), 448)),
@@ -1501,7 +1526,7 @@ def fused_minimax_m3_norm_rope_quant_insert_kernel(
 
     # k / v: the k4v8 record of each KV head.
     slot = tl.load(slot_ptr + t)
-    if slot >= 0:
+    if do_kv and slot >= 0:
         page = (slot // PAGE).to(tl.int64)
         tp = (slot % PAGE).to(tl.int32)
         hk = tl.arange(0, NKV)[:, None]

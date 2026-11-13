@@ -465,14 +465,14 @@ def msa_reduce_kernel(
     )
 
 
-_msa_union_kernel_repr = make_kernel_repr(
-    "msa_union_kernel",
+_msa_sort_topk_kernel_repr = make_kernel_repr(
+    "msa_sort_topk_kernel",
     ['TQ', 'TOPK', 'DECODE_QL'],
 )
 
 
-@triton.jit(repr=_msa_union_kernel_repr)
-def msa_union_kernel(
+@triton.jit(repr=_msa_sort_topk_kernel_repr)
+def msa_sort_topk_kernel(
     topk_ptr,
     block_table_ptr,
     seq_lens_ptr,
@@ -490,7 +490,7 @@ def msa_union_kernel(
     TQ: tl.constexpr,
     DECODE_QL: tl.constexpr,
 ):
-    """The union of the pages TQ consecutive query rows selected (one KV head),
+    """The sort_topk of the pages TQ consecutive query rows selected (one KV head),
     for the Gluon MSA walk; C = TQ * TOPK. DECODE_QL > 0: row r is query
     r % DECODE_QL of request r // DECODE_QL at seq_len - DECODE_QL + r % DECODE_QL;
     0: query_req / query_pos give them (prefill)."""
@@ -520,7 +520,7 @@ def msa_union_kernel(
         block_table_ptr + req * stride_bt + tl.where(valid, blk, 0), mask=valid, other=-1
     )
     # Dedup by sorting (page, candidate) keys: a run of one page is contiguous,
-    # its head starts a new union slot. O(C log^2 C), no [C, C] compare.
+    # its head starts a new sort_topk slot. O(C log^2 C), no [C, C] compare.
     BIG: tl.constexpr = 0x7FFFFFFFFFFFFFFF
     key = tl.where(valid, page.to(tl.int64) * 256 + c, BIG)
     srt = tl.sort(key)

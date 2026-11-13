@@ -34,7 +34,7 @@ from aiter.ops.triton._triton_kernels.attention.msa import (
     msa_k4v8_store_kernel,
     msa_reduce_kernel,
     msa_q_mxfp8_kernel,
-    msa_union_kernel,
+    msa_sort_topk_kernel,
     RECORD4_BYTES,
     V4_BYTES,
     V4S_BYTES,
@@ -228,7 +228,10 @@ def msa_fwd(
     q_scale: torch.Tensor | None = None,
     block_m: int | None = None,
     kv_format: str = "k4v8",
-) -> torch.Tensor:
+    sort_topk: tuple | None = None,
+    use_atomic_add: bool = False,
+    out_mxfp8: tuple | None = None,
+) -> torch.Tensor | tuple:
     """MSA over a k4v8 cache.
 
     q            [rows, kv_heads * HG, 128] bf16 (HG query heads per KV head)
@@ -255,6 +258,19 @@ def msa_fwd(
     [rows, H * 128] or [rows, H, 128] with E8M0 q_scale [rows, H * 4], e.g.
     from fused_minimax_m3_norm_rope_quant_insert(out_quant=True)), and
     block_m: rows per program, BLOCK_M = 16 * (query rows), 16..128.
+    sort_topk: (gluon, block_m > 16) the row groups' sort_topk already built,
+    (uniq, count, tokblk, pos) as fused_m3_index_topk_prefill_indices_sort_topk
+    returns it for block_q = block_m // 16; skips the msa_sort_topk_kernel
+    pre-pass. A row group's sort_topk is its rows' valid top-k picks merged into
+    one page list, deduplicated and sorted by page (uniq[:count]), with each
+    row's block on each listed page (tokblk, -1 if the row did not pick it).
+    use_atomic_add: (gluon k4v8) when a program's pages are split into
+    segments, the last segment program to arrive (a global atomic ticket)
+    merges them, instead of a separate reduce launch; same result, bit for bit.
+    Ignored when nothing is split.
+    out_mxfp8: (gluon k4v8) (e4m3 [rows, H * 128], uint8 E8M0 [rows, H * 4]):
+    write the output there as o_proj's MXFP8 input instead of bf16 into out,
+    bit-exact with vLLM's mxfp8_e4m3_quantize of the bf16 output; returns it.
     workspace: the split partials and arrival counters, grown on demand and
     reused across calls (a module-level one per device by default). Size it
     with msa_workspace() before CUDA graph capture.
@@ -272,7 +288,8 @@ def msa_fwd(
         return _gluon_fwd(
             q, q_scale, kv_cache, topk, block_table, sm_scale, v_scale, seq_lens,
             decode_query_len, query_req, query_pos, out, kv_splits, q_mode, p_fp8,
-            block_m, num_warps,
+            block_m, num_warps, sort_topk=sort_topk, use_atomic_add=use_atomic_add,
+            out_mxfp8=out_mxfp8,
         )  # fmt: skip
     rows, num_heads, head_dim = q.shape
     num_kv_heads = kv_cache.shape[1]
@@ -374,7 +391,7 @@ def msa_seg_pages(programs: int, topk: int, max_pages: int, cus: int, min_pages:
 
 
 def msa_gluon_splits(programs: int, topk: int, cus: int, min_pages: int = 4) -> int:
-    """Split each program's page union until the grid covers about two waves,
+    """Split each program's page sort_topk until the grid covers about two waves,
     keeping at least min_pages of a top-k's worth of pages per split (the
     merge costs a [BLOCK_M, 128] fp32 partial per split)."""
     splits = 1
@@ -383,21 +400,64 @@ def msa_gluon_splits(programs: int, topk: int, cus: int, min_pages: int = 4) -> 
     return splits
 
 
+_FAST = {}
+
+
+def _fast(fn):
+    """The FastLaunch of a kernel: cached CompiledKernel launches, without
+    JITFunction.run's per-call argument specialization (host time)."""
+    fl = _FAST.get(fn)
+    if fl is None:
+        from aiter.ops.triton.utils._triton.fast_launch import FastLaunch
+
+        fl = _FAST[fn] = FastLaunch(fn)
+    return fl
+
+
 # k4v8 Gluon K / V loading: registers (default) or async copy into LDS.
 _KV_LDS = __import__("os").getenv("AITER_MSA_KV_LDS", "0") == "1"
 
 
-def _gluon_fwd(
-    q, q_scale, kv_cache, topk, block_table, sm_scale, v_scale, seq_lens, dql,
-    query_req, query_pos, out, kv_splits, q_mode, p_fp8, block_m, num_warps,
-    kv_lds=None,
-):  # fmt: skip
-    kv_lds = _KV_LDS if kv_lds is None else kv_lds
-    from aiter.ops.triton._gluon_kernels.gfx950.attention.msa import (
-        msa_gfx950_gluon_kernel,
-        msa_gfx950_gluon_reduce_split_rebalance_kernel,
-    )
+_PLANS: dict = {}
+_GWS: dict = {}  # (device, stream, name) -> grow-only int32 / fp32 workspace
+_GWS_RETIRED: list = []  # replaced workspaces, kept alive for captured graphs
+_FP8_VIEWS: dict = {}  # (data_ptr, shape) -> the k4v8 cache's fp8 view
 
+
+def _gws(dev, stream, name, numel, dtype, zero=False):
+    """A grow-only workspace per (device, stream): calls on one stream run in
+    order, so the layers share it; another stream (e.g. a DBO micro-batch)
+    gets its own. zero: zeroed when (re)allocated (arrival counters)."""
+    key = (dev, stream, name)
+    buf = _GWS.get(key)
+    if buf is None or buf.numel() < numel:
+        if buf is not None:
+            # Never free a replaced buffer: CUDA graphs captured earlier keep
+            # its address and would otherwise write into reused memory.
+            _GWS_RETIRED.append(buf)
+        n = max(numel, 0 if buf is None else 2 * buf.numel())
+        buf = (torch.zeros if zero else torch.empty)(n, dtype=dtype, device=dev)
+        _GWS[key] = buf
+    return buf[:numel]
+
+
+def _fp8_view(kv_cache):
+    key = (kv_cache.data_ptr(), kv_cache.shape)
+    v = _FP8_VIEWS.get(key)
+    if v is None:
+        if len(_FP8_VIEWS) > 64:
+            _FP8_VIEWS.clear()
+        v = _FP8_VIEWS[key] = kv_cache.view(_FP8)
+    return v
+
+
+def _gluon_plan(
+    q, q_scale, kv_cache, topk, block_table, seq_lens, dql, query_req, query_pos,
+    kv_splits, q_mode, p_fp8, block_m, num_warps, kv_lds, sort_topk, use_atomic_add,
+    out_mxfp8,
+):  # fmt: skip
+    """Validation and every size of a _gluon_fwd call that depends only on its
+    shapes / flags (cached per signature by _gluon_fwd)."""
     if q_mode not in ("mxfp8", "mxfp8x2") or not p_fp8:
         raise ValueError("the gluon backend runs q_mode 'mxfp8' or 'mxfp8x2' with fp8 P")
     rows = q.shape[0]
@@ -414,12 +474,12 @@ def _gluon_fwd(
         # MXFP8 Q as the insert writes it: one term, unscaled.
         if q_mode != "mxfp8" or q.dtype != _FP8:
             raise ValueError("q_scale takes an e4m3 q with q_mode='mxfp8'")
-        num_heads = q.numel() // (rows * HEAD_DIM)
+        num_heads = q.numel() // (rows * HEAD_DIM) if rows else (q.shape[-1] // HEAD_DIM)
         q8 = q.reshape(rows, num_heads * HEAD_DIM)
         qs = q_scale.reshape(rows, num_heads * HEAD_DIM // 32)
         if q8.stride(1) != 1 or qs.stride(1) != 1:
             raise ValueError("MXFP8 q and q_scale rows must be contiguous")
-        if q8.stride(0) != num_heads * HEAD_DIM or qs.stride(0) != num_heads * HEAD_DIM // 32:
+        if rows and (q8.stride(0) != num_heads * HEAD_DIM or qs.stride(0) != num_heads * HEAD_DIM // 32):
             raise ValueError("MXFP8 q and q_scale must be dense [rows, ...]")
         qt = 1
     else:
@@ -427,36 +487,20 @@ def _gluon_fwd(
             raise ValueError("q must be bf16 [rows, H, 128] (or MXFP8 with q_scale)")
         num_heads = q.shape[1]
         qt = 2 if q_mode == "mxfp8x2" else 1
-        q8 = torch.empty((rows, num_heads, qt, HEAD_DIM), dtype=_FP8, device=q.device)
-        qs = torch.empty(
-            (rows, num_heads, qt, HEAD_DIM // 32), dtype=torch.uint8, device=q.device
-        )
-        pairs = rows * num_heads
-        if pairs:
-            msa_q_mxfp8_kernel[(triton.cdiv(pairs, 64),)](
-                q, q8, qs, 1.0, pairs, num_heads, q.stride(0), q.stride(1),
-                D=HEAD_DIM, QT=qt, BLOCK=64, num_warps=4,
-            )  # fmt: skip
     hg = num_heads // num_kv_heads
     if hg != 16 or num_heads % num_kv_heads:
         raise ValueError("the gluon backend needs 16 query heads per KV head")
-    if out is None:
-        out = torch.empty((rows, num_heads, HEAD_DIM), dtype=torch.bfloat16, device=q.device)
-    if rows == 0:
-        return out
     if block_m is None:
-        # Decode: one query row per program (no union pre-pass); on real top-k
+        # Decode: one query row per program (no sort_topk pre-pass); on real top-k
         # selections (AgentX dumps) neighbouring DSpark rows share only ~10 of
-        # 16 pages. Prefill: 2 rows, whose page union is ~1.66x shared.
+        # 16 pages. Prefill: 2 rows, whose page sort_topk is ~1.66x shared.
         block_m = 16 if decode else 32
     if block_m not in (16, 32, 64, 128):
         raise ValueError("block_m must be 16, 32, 64 or 128")
-    dev = q.device
-    vs = _scale_tensor(v_scale, dev)
     block_q = block_m // hg
     groups = triton.cdiv(rows, block_q)
     # Split rebalance: every segment covers seg_pages of its program's page list
-    # (a row's valid picks, or a row group's union), so a list with more pages
+    # (a row's valid picks, or a row group's sort_topk), so a list with more pages
     # gets more segments. kv_splits, when given, splits the longest list that many
     # ways; otherwise decode sizes segments for ~2 waves of CUs (>= 4 pages each)
     # and prefill runs one segment per program.
@@ -466,51 +510,158 @@ def _gluon_fwd(
             raise ValueError("kv_splits must be positive")
         seg_pages = triton.cdiv(max_pages, kv_splits)
     else:
-        seg_pages = msa_seg_pages(groups * num_kv_heads, n_topk, max_pages, _cus(dev)) if decode else max_pages
+        seg_pages = (
+            msa_seg_pages(groups * num_kv_heads, n_topk, max_pages, _cus(q.device))
+            if decode
+            else max_pages
+        )
     nseg = triton.cdiv(max_pages, seg_pages)
-    if block_q > 1:
-        # the rows' page union, each page once per row group
-        c = block_q * n_topk
-        uniq = torch.empty((num_kv_heads, groups, c), dtype=torch.int32, device=dev)
-        count = torch.empty((num_kv_heads, groups), dtype=torch.int32, device=dev)
-        tokblk = torch.empty((num_kv_heads, groups, c, block_q), dtype=torch.int32, device=dev)
-        pos = torch.empty((groups * block_q,), dtype=torch.int32, device=dev)
-        msa_union_kernel[(groups, num_kv_heads)](
+    c = block_q * n_topk
+    if block_q > 1 and sort_topk is not None:
+        uniq, count, tokblk, pos = sort_topk
+        if (uniq.shape != (num_kv_heads, groups, c) or count.shape != (num_kv_heads, groups)
+                or tokblk.shape != (num_kv_heads, groups, c, block_q)
+                or pos.numel() < groups * block_q):  # fmt: skip
+            raise ValueError(f"sort_topk does not match block_m = {block_m}")
+    atomic = bool(use_atomic_add) and nseg > 1  # ignored without a split
+    if out_mxfp8 is not None:
+        mxq, mxs = out_mxfp8
+        if (mxq.dtype != _FP8 or mxs.dtype != torch.uint8 or mxq.shape[0] < rows
+                or mxq.shape[-1] != num_heads * HEAD_DIM or mxs.shape[-1] != num_heads * HEAD_DIM // 32
+                or mxq.stride(-1) != 1 or mxs.stride(-1) != 1):  # fmt: skip
+            raise ValueError("out_mxfp8 must be (e4m3 [rows, H * 128], uint8 [rows, H * 4]), rows contiguous")
+    return dict(
+        rows=rows, num_kv_heads=num_kv_heads, decode=decode, n_topk=n_topk, num_heads=num_heads,
+        qt=qt, hg=hg, block_m=block_m, block_q=block_q, groups=groups, seg_pages=seg_pages,
+        nseg=nseg, c=c, atomic=atomic, out_mx=out_mxfp8 is not None,
+        main_kw=dict(
+            NUM_HEADS=num_heads, TOPK=n_topk, BLOCK_M=block_m, NSEG=nseg, ATOMIC=atomic,
+            OUT_MX=out_mxfp8 is not None, DECODE_QL=dql if decode else 0, QT=qt, P_SCALE=P_SCALE,
+            NUM_WARPS=num_warps, KV_LDS=kv_lds, num_warps=num_warps,
+        ),
+        reduce_kw=dict(BLOCK_M=block_m, NSEG=nseg, NUM_WARPS=4, OUT_MX=out_mxfp8 is not None, num_warps=4),
+        sort_kw=dict(TOPK=n_topk, TQ=block_q, DECODE_QL=dql if decode else 0, num_warps=4),
+    )  # fmt: skip
+
+
+def _gluon_fwd(
+    q, q_scale, kv_cache, topk, block_table, sm_scale, v_scale, seq_lens, dql,
+    query_req, query_pos, out, kv_splits, q_mode, p_fp8, block_m, num_warps,
+    kv_lds=None, sort_topk=None, use_atomic_add=False, out_mxfp8=None,
+):  # fmt: skip
+    """The Gluon k4v8 MSA call. Validation and sizes come from a plan cached
+    per shape signature; a call then only binds its pointers, takes its
+    workspaces and launches (FastLaunch)."""
+    from aiter.ops.triton._gluon_kernels.gfx950.attention.msa import (
+        msa_gfx950_gluon_kernel,
+        msa_gfx950_gluon_reduce_split_rebalance_kernel,
+    )
+
+    kv_lds = _KV_LDS if kv_lds is None else kv_lds
+    dev = q.device
+    key = (
+        q.shape, q.stride(), q.dtype, None if q_scale is None else q_scale.stride(),
+        kv_cache.shape, topk.shape, topk.stride(), topk.dtype, seq_lens is None, dql,
+        block_m, kv_splits, q_mode, p_fp8, num_warps, kv_lds, sort_topk is None,
+        bool(use_atomic_add), None if out_mxfp8 is None else (out_mxfp8[0].stride(), out_mxfp8[1].stride()),
+        dev,
+    )  # fmt: skip
+    plan = _PLANS.get(key)
+    if plan is None:
+        if len(_PLANS) > 4096:
+            _PLANS.clear()
+        plan = _PLANS[key] = _gluon_plan(
+            q, q_scale, kv_cache, topk, block_table, seq_lens, dql, query_req, query_pos,
+            kv_splits, q_mode, p_fp8, block_m, num_warps, kv_lds, sort_topk, use_atomic_add,
+            out_mxfp8,
+        )  # fmt: skip
+    rows = plan["rows"]
+    num_heads = plan["num_heads"]
+    if q_scale is not None:
+        q8, qs = q, q_scale  # dense rows (validated by the plan): the kernel takes the pointers
+    else:
+        qt = plan["qt"]
+        q8 = torch.empty((rows, num_heads, qt, HEAD_DIM), dtype=_FP8, device=dev)
+        qs = torch.empty((rows, num_heads, qt, HEAD_DIM // 32), dtype=torch.uint8, device=dev)
+        pairs = rows * num_heads
+        if pairs:
+            msa_q_mxfp8_kernel[(triton.cdiv(pairs, 64),)](
+                q, q8, qs, 1.0, pairs, num_heads, q.stride(0), q.stride(1),
+                D=HEAD_DIM, QT=qt, BLOCK=64, num_warps=4,
+            )  # fmt: skip
+    if out is None:
+        # with out_mxfp8 the bf16 output is not written: no buffer for it
+        out = (
+            torch.empty((rows, num_heads, HEAD_DIM), dtype=torch.bfloat16, device=dev)
+            if out_mxfp8 is None
+            else out_mxfp8[0]  # dummy, unused
+        )
+    if rows == 0:
+        return out if out_mxfp8 is None else out_mxfp8
+    vs = (
+        v_scale
+        if isinstance(v_scale, torch.Tensor) and v_scale.dtype == torch.float32 and v_scale.device == dev
+        else _scale_tensor(v_scale, dev)
+    )
+    num_kv_heads, groups, nseg = plan["num_kv_heads"], plan["groups"], plan["nseg"]
+    block_m, block_q, seg_pages = plan["block_m"], plan["block_q"], plan["seg_pages"]
+    decode = plan["decode"]
+    st = torch.cuda.current_stream(dev).cuda_stream
+    if block_q > 1 and sort_topk is not None:
+        uniq, count, tokblk, pos = sort_topk  # built by the producer (fused prefill top-k)
+    elif block_q > 1:
+        # the rows' page sort_topk, each page once per row group
+        c = plan["c"]
+        n = num_kv_heads * groups
+        uniq = _gws(dev, st, "uniq", n * c, torch.int32)
+        count = _gws(dev, st, "count", n, torch.int32)
+        tokblk = _gws(dev, st, "tokblk", n * c * block_q, torch.int32)
+        pos = _gws(dev, st, "pos", groups * block_q, torch.int32)
+        _fast(msa_sort_topk_kernel)(
+            (groups, num_kv_heads),
             topk, block_table,
             seq_lens if decode else query_req, query_req if not decode else seq_lens,
             query_pos if not decode else seq_lens,
             uniq, count, tokblk, pos, rows,
             topk.stride(0), topk.stride(1), block_table.stride(0),
-            TOPK=n_topk, TQ=block_q, DECODE_QL=dql if decode else 0, num_warps=4,
+            **plan["sort_kw"],
         )  # fmt: skip
     else:
         uniq = count = tokblk = pos = topk  # unused at block_m = 16
     if nseg > 1:
         n = num_kv_heads * groups * nseg
-        part_o = torch.empty((n, block_m, HEAD_DIM), dtype=torch.float32, device=dev)
-        part_ml = torch.empty((n, block_m, 2), dtype=torch.float32, device=dev)
-        seg_count = torch.empty((num_kv_heads * groups,), dtype=torch.int32, device=dev)
+        part_o = _gws(dev, st, "part_o", n * block_m * HEAD_DIM, torch.float32)
+        part_ml = _gws(dev, st, "part_ml", n * block_m * 2, torch.float32)
+        seg_count = _gws(dev, st, "seg_count", num_kv_heads * groups, torch.int32)
     else:
-        part_o = part_ml = out
-        seg_count = topk  # unused
-    msa_gfx950_gluon_kernel[(groups, num_kv_heads, nseg)](
-        q8, qs, kv_cache, kv_cache.view(_FP8), topk, block_table,
+        part_o = part_ml = seg_count = topk  # unused
+    atomic = plan["atomic"]
+    counter = _gws(dev, st, "counter", num_kv_heads * groups, torch.int32, zero=True) if atomic else topk
+    if out_mxfp8 is not None:
+        mxq, mxs = out_mxfp8
+        mx_args = (mxq, mxs, mxq.stride(0), mxs.stride(0))
+        ost = (0, 0)
+    else:
+        mx_args = (out, out, 0, 0)  # unused
+        ost = (out.stride(0), out.stride(1))
+    _fast(msa_gfx950_gluon_kernel)(
+        (groups, num_kv_heads, nseg),
+        q8, qs, kv_cache, _fp8_view(kv_cache), topk, block_table,
         seq_lens if decode else query_req, query_req if not decode else seq_lens,
         query_pos if not decode else seq_lens, uniq, count, tokblk, pos, out,
-        part_o, part_ml, seg_count, vs, sm_scale * 1.4426950408889634, rows, seg_pages,
+        part_o, part_ml, seg_count, counter, mx_args[0], mx_args[1], vs,
+        sm_scale * 1.4426950408889634, rows, seg_pages,
         kv_cache.stride(0), kv_cache.stride(1), topk.stride(0), topk.stride(1),
-        block_table.stride(0), out.stride(0), out.stride(1),
-        NUM_HEADS=num_heads, TOPK=n_topk, BLOCK_M=block_m, NSEG=nseg,
-        DECODE_QL=dql if decode else 0, QT=qt, P_SCALE=P_SCALE,
-        NUM_WARPS=num_warps, KV_LDS=kv_lds, num_warps=num_warps,
+        block_table.stride(0), ost[0], ost[1], mx_args[2], mx_args[3],
+        **plan["main_kw"],
     )  # fmt: skip
-    if nseg > 1:
-        msa_gfx950_gluon_reduce_split_rebalance_kernel[(groups, num_kv_heads)](
-            part_o, part_ml, seg_count, out, vs, rows, seg_pages,
-            out.stride(0), out.stride(1), BLOCK_M=block_m, NSEG=nseg, NUM_WARPS=4,
-            num_warps=4,
+    if nseg > 1 and not atomic:
+        _fast(msa_gfx950_gluon_reduce_split_rebalance_kernel)(
+            (groups, num_kv_heads),
+            part_o, part_ml, seg_count, out, mx_args[0], mx_args[1], vs, rows, seg_pages,
+            ost[0], ost[1], mx_args[2], mx_args[3], **plan["reduce_kw"],
         )  # fmt: skip
-    return out
+    return out if out_mxfp8 is None else out_mxfp8
 
 
 # ----------------------------------------------------------------- k4v4 cache
