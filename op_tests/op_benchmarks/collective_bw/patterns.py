@@ -2,48 +2,86 @@
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
 """``Traffic`` -> TransferBench tests. Pure Python, no GPU.
 
-Each ``Phase`` becomes one TransferBench test (one config line in advanced
-mode, ``-N (SRC EXE DST SUBEXECS BYTES) ...``). Rank r is TransferBench GPU r:
-both the ranks and TransferBench enumerate the devices ``HIP_VISIBLE_DEVICES``
-leaves visible.
+A roof is the fastest of a few *candidates*. A candidate is one way to replay
+the traffic: a list of TransferBench tests (one config line each, advanced
+mode, ``-N (SRC EXE DST SUBEXECS BYTES) ...``) whose times add up. Rank r is
+TransferBench GPU r: both the ranks and TransferBench enumerate the devices
+``HIP_VISIBLE_DEVICES`` leaves visible.
 
-The phase's launch geometry is reproduced with warp-sized sub-executors
-(``GFX_SE_TYPE=1``). The kernel's waves are split evenly over the transfers
-each GPU executes, and ``GFX_BLOCK_SIZE`` packs them into workgroups of the
-op's width.
+What a candidate may vary:
 
-A memory location on another GPU, and the executing GPU's own destination
-buffer in a push, take the op's peer memory type. A push's source and a pull's
-destination are ordinary device memory (``G``), as the op's input and output
-are.
+* **Waves per transfer.** Sub-executors are single waves (``GFX_SE_TYPE=1``),
+  packed into workgroups of the op's width (``GFX_BLOCK_SIZE``). The op's own
+  grid split evenly over its transfers is one candidate (``own``). It is not
+  the only one: an op wave also packs, quantizes and reduces, so the op's
+  grid can be far wider than a copy kernel needs, and a copy kernel that wide
+  oversubscribes the links and runs *slower* (a 1365-wave transfer is ~25%
+  slower than a 64-wave one on MI350X). ``WAVE_SWEEP`` adds fixed widths.
+* **Schedule.** ``serial`` runs every phase as its own test and adds them.
+  ``fused`` (``Traffic.pipelined`` only) streams every phase's bytes in one
+  test, as a kernel that overlaps its laps can.
+* **Memory** (RCCL roofs only). The op's roof writes peers' buffers in the
+  op's own memory type. RCCL's internals are not modelled, so its roof tries
+  every memory type.
+
+Every test is **one pass per launch** (``NUM_SUBITERATIONS=1``), timed inside
+the kernel (``tb_text.TestResult.kernel_ms``). Sub-iterations would rewrite
+the same buffer within one launch, and in cacheable memory (``G``, ``F``)
+the writer's L2 absorbs every pass after the first once the buffer fits in
+it: nothing crosses the link, and the time falls as ``1 / NUM_SUBITERATIONS``
+(a 7.3 MB TP2 lap at 10 sub-iterations "ran" at ~280 GB/s over one ~64 GB/s
+xGMI link). One pass ends with each wave's ``__threadfence_system()``, which
+writes its dirty lines back before the wave's stop timestamp, so cacheable
+and uncached memory are timed alike and the memory type's real cost shows
+(a large INT4 lap is ~20% slower into ``G``/``F`` than into ``U``). The
+in-kernel time leaves the host launch out but keeps the wave ramp and the
+final fence, which an op also pays once per call. No RCCL candidate pulls
+instead of pushing: remote reads can be served from cache across launches.
+
+A push's source and a pull's destination are ordinary device memory
+(``G``), as the op's input and output are.
 """
 
 from __future__ import annotations
 
-import math
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 from aiter.ops.flydsl.comm_traffic import Pattern, PeerMem, Phase, Traffic
 
 # TransferBench memory-type letters.
 TB_MEM = {PeerMem.COARSE: "G", PeerMem.FINE: "F", PeerMem.UNCACHED: "U"}
 
-# Each timed iteration loops this many bytes per GPU at least, inside one
-# launch (NUM_SUBITERATIONS), so launch cost is amortized away.
-SUBITER_TARGET_BYTES = 64 << 20
-MAX_SUBITERATIONS = 256
-
 WAVE = 64
+
+# Fixed waves-per-transfer widths every roof also tries, besides the op's own.
+WAVE_SWEEP = (16, 32, 64, 128, 256)
+
+# The RCCL roof: bf16 bytes, the bandwidth-optimal all-pairs push, a
+# 256-thread block (RCCL's own) and every memory type.
+RCCL_WAVES_PER_WORKGROUP = 4
+RCCL_MEMS = (PeerMem.UNCACHED, PeerMem.FINE, PeerMem.COARSE)
+
+# (src, exe, dst, bytes): one transfer.
+Flow = tuple[str, str, str, int]
 
 
 @dataclass(frozen=True)
 class TbTest:
     """One TransferBench test: a config line, the environment it needs, and
-    how many times its time counts toward the phase (``Phase.repeat``)."""
+    how many times its time counts toward the roof (``Phase.repeat``)."""
 
     line: str
     env: tuple[tuple[str, str], ...]
     repeat: int
+
+
+@dataclass(frozen=True)
+class Candidate:
+    """One way to replay a traffic. Its time is the sum over ``tests`` of
+    ``repeat`` x the slowest executor."""
+
+    label: str
+    tests: tuple[TbTest, ...]
 
 
 def round4(nbytes: int) -> int:
@@ -72,36 +110,141 @@ def transfers(phase: Phase, world_size: int) -> list[tuple[str, str, str]]:
     return out
 
 
+def _flows(phase: Phase, world_size: int, *, laps: int = 1) -> list[Flow]:
+    nbytes = phase.chunk_bytes * laps
+    return [(s, e, d, nbytes) for s, e, d in transfers(phase, world_size)]
+
+
+def _fused_flows(traffic: Traffic) -> list[Flow]:
+    """Every phase's bytes (``repeat`` included) as one set of concurrent
+    transfers. Phases that use the same link in the same direction share a
+    transfer, carrying the sum of their bytes."""
+    merged: dict[tuple[str, str, str], int] = {}
+    for p in traffic.phases:
+        for s, e, d, nbytes in _flows(p, traffic.world_size, laps=p.repeat):
+            merged[(s, e, d)] = merged.get((s, e, d), 0) + nbytes
+    return [(*k, v) for k, v in merged.items()]
+
+
 def waves_per_transfer(phase: Phase, world_size: int) -> int:
-    """The phase's waves split evenly over the transfers each GPU executes."""
+    """The phase's own waves split evenly over the transfers each GPU executes."""
     per_gpu = len(transfers(phase, world_size)) // world_size
     return max(1, phase.workgroups * phase.waves_per_workgroup // per_gpu)
 
 
-def subiterations(phase: Phase, world_size: int) -> int:
-    per_gpu = len(transfers(phase, world_size)) // world_size
-    moved = per_gpu * round4(phase.chunk_bytes)
-    return max(1, min(MAX_SUBITERATIONS, math.ceil(SUBITER_TARGET_BYTES / moved)))
-
-
-def tb_test(phase: Phase, world_size: int) -> TbTest:
-    nbytes = round4(phase.chunk_bytes)
-    w = waves_per_transfer(phase, world_size)
-    body = " ".join(
-        f"({s} {e} {d} {w} {nbytes})" for s, e, d in transfers(phase, world_size)
-    )
-    count = len(transfers(phase, world_size))
+def _test(
+    flows: list[Flow], world_size: int, waves: int, block_waves: int, repeat: int
+) -> TbTest:
+    body = " ".join(f"({s} {e} {d} {waves} {round4(b)})" for s, e, d, b in flows)
     env = (
         ("GFX_SE_TYPE", "1"),
-        ("GFX_BLOCK_SIZE", str(WAVE * phase.waves_per_workgroup)),
-        ("NUM_SUBITERATIONS", str(subiterations(phase, world_size))),
+        ("GFX_BLOCK_SIZE", str(WAVE * block_waves)),
+        ("NUM_SUBITERATIONS", "1"),
     )
-    return TbTest(line=f"-{count} {body}", env=env, repeat=phase.repeat)
+    return TbTest(line=f"-{len(flows)} {body}", env=env, repeat=repeat)
 
 
-def tb_tests(traffic: Traffic) -> list[TbTest]:
-    """One test per phase, in phase order."""
-    return [tb_test(p, traffic.world_size) for p in traffic.phases]
+def tb_test(phase: Phase, world_size: int, waves: int | None = None) -> TbTest:
+    """One phase as one test, at *waves* per transfer (default: the op's own
+    grid split over the transfers)."""
+    w = waves_per_transfer(phase, world_size) if waves is None else waves
+    return _test(
+        _flows(phase, world_size),
+        world_size,
+        w,
+        phase.waves_per_workgroup,
+        phase.repeat,
+    )
+
+
+def _candidates(traffic: Traffic, *, own: bool, tag: str = "") -> list[Candidate]:
+    n = traffic.world_size
+    phases = traffic.phases
+    block = phases[0].waves_per_workgroup
+    fuse = traffic.pipelined and len(phases) > 1
+    fused = _fused_flows(traffic) if fuse else []
+    widths: list[int | None] = [None] if own else []
+    widths += list(WAVE_SWEEP)
+    out = []
+    for w in widths:
+        name = "own" if w is None else f"w{w}"
+        serial = tuple(tb_test(p, n, w) for p in phases)
+        out.append(Candidate(f"serial {name}{tag}", serial))
+        if fuse:
+            # One launch: the grid's waves over all of the fused transfers.
+            fw = w
+            if fw is None:
+                total = phases[0].workgroups * phases[0].waves_per_workgroup
+                fw = max(1, total * n // len(fused))
+            fused_test = _test(fused, n, fw, block, 1)
+            out.append(Candidate(f"fused {name}{tag}", (fused_test,)))
+    return out
+
+
+def candidates(traffic: Traffic) -> list[Candidate]:
+    """The op's roof candidates: the op's own pattern and memory, at its own
+    geometry and at ``WAVE_SWEEP``, serial and (pipelined ops) fused. The
+    first is the op's own replay, phase by phase."""
+    return _candidates(traffic, own=True)
+
+
+def rccl_traffic(traffic: Traffic) -> Traffic:
+    """The data movement of *traffic*'s RCCL calls, unquantized, as RCCL
+    would do it at best: all-pairs, every peer at once.
+
+    An all-reduce is a reduce-scatter and an all-gather of ``nbytes / N`` per
+    peer, pipelined in one launch, so each rank sends ``2(N-1)/N`` x
+    ``nbytes``: the busbw convention. An all-to-all sends ``nbytes / N`` to
+    every rank, its own included. Calls run one after another.
+
+    The memory and grid here are placeholders; ``rccl_candidates`` sweeps
+    them.
+    Depends only on the RCCL calls and the world size, so every op of a case
+    gets the same RCCL roof.
+    """
+    n = traffic.world_size
+    phases = []
+    pipelined = False
+    for call in traffic.rccl:
+        chunk = -(-call.nbytes // n)
+        if call.collective == "all_reduce":
+            lap = _rccl_phase(chunk, include_self=False)
+            phases += [lap, lap]
+            pipelined = len(traffic.rccl) == 1
+        else:
+            phases.append(_rccl_phase(chunk, include_self=True))
+    total = sum(c.nbytes for c in traffic.rccl)
+    return Traffic(
+        world_size=n,
+        collective=traffic.collective,
+        logical_bytes=total,
+        phases=tuple(phases),
+        rccl=traffic.rccl,
+        pipelined=pipelined,
+    )
+
+
+def _rccl_phase(chunk: int, *, include_self: bool) -> Phase:
+    return Phase(
+        pattern=Pattern.PUSH_ALL,
+        chunk_bytes=chunk,
+        include_self=include_self,
+        repeat=1,
+        peer_mem=RCCL_MEMS[0],
+        workgroups=1,
+        waves_per_workgroup=RCCL_WAVES_PER_WORKGROUP,
+    )
+
+
+def rccl_candidates(rccl: Traffic) -> list[Candidate]:
+    """An ``rccl_traffic``'s roof candidates: ``WAVE_SWEEP`` x serial/fused
+    x every memory type."""
+    out = []
+    for mem in RCCL_MEMS:
+        phases = tuple(replace(p, peer_mem=mem) for p in rccl.phases)
+        tag = f" {TB_MEM[mem]}"
+        out += _candidates(replace(rccl, phases=phases), own=False, tag=tag)
+    return out
 
 
 def busbw_factor(collective: str, world_size: int) -> float:

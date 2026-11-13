@@ -1,9 +1,24 @@
-# Collective bandwidth roofline: design (v2, implemented)
+# Collective bandwidth roofline: design (v3, implemented)
 
-Grades a FlyDSL collective, and RCCL doing the same operation, against a
-TransferBench roofline. The roofline is the time the stock TransferBench needs to
-move the same bytes, in the op's own pattern, into the op's own memory type,
-with the op's own launch geometry.
+Grades a FlyDSL collective, and RCCL doing the same operation, against
+TransferBench rooflines. The op's roof is the fastest time the stock
+TransferBench needs to move the op's bytes in the op's own pattern. RCCL gets
+its own roof for its own (unquantized) bytes.
+
+Changes from v2 (iteration 4), after v2 reported all-reduce eff up to 1.26
+and no RCCL efficiency:
+- **RCCL has its own roof.** v2 graded RCCL against the op's roof, which moves
+  the op's INT4 wire bytes (0.28x of bf16), so RCCL looked 3-7x worse than it
+  is. `rccl_traffic()` derives RCCL's bf16 data movement from `Traffic.rccl`
+  alone; the report shows `rccl roof us` and `rccl eff`.
+- **The roof is the best of a few candidates** (section 4), not one replay:
+  the op's own grid and fixed copy widths (`WAVE_SWEEP`), lap after lap and,
+  for ops that overlap their laps (`Traffic.pipelined`), fused into one test.
+  The winner is shown in `roof cfg` / `rccl roof cfg`.
+- **One pass per launch, timed inside the kernel** (section 4.2). Repeated
+  sub-iterations let cacheable peer memory (`G`, `F`) absorb the writes in
+  L2; one pass ends with a fence that writes them back, so the roof can use
+  the op's own memory type and the RCCL roof can try every type.
 
 Changes from v1 (iteration 3):
 - **The ops describe themselves.** A small `traffic()` method on
@@ -17,7 +32,7 @@ Changes from v1 (iteration 3):
 - **Attention A2A is graded per Q/K/V trio only.**
 
 Unchanged: TransferBench is an optional runtime binary, parsed in its own
-module; there is no optimization over patterns, memory or grid; exact sizes only.
+module; the op's pattern is never changed; exact sizes only.
 
 ## 1. Architecture
 
@@ -82,7 +97,7 @@ class Traffic:
 
 Only phases that move payload between GPUs are listed. The reuse barrier, the
 amax pre-exchange and the local dequant are left out: they carry no payload
-across the fabric, and the roof amortizes launches anyway.
+across the fabric, and the roof's in-kernel timing leaves launches out anyway.
 
 ### 2.1 `AttentionA2AIntraNodeOp.traffic()`: the trio
 
@@ -146,9 +161,11 @@ RCCL thunks use plain `torch.distributed` on the script's device group:
 
 ## 4. Patterns: `Traffic` -> TransferBench
 
-Each phase is one TransferBench test. The phase's waves are split evenly over the
-transfers each GPU executes: `w = workgroups * waves_per_workgroup / T`, where T is
-the number of transfers per GPU (N or N-1 for `*_ALL`, 1 for ring hops).
+A roof is the fastest of several *candidates*; a candidate is a list of
+TransferBench tests whose times add up. In the op's own replay (candidate
+`serial own`), each phase is one test, and the phase's waves are split evenly
+over the transfers each GPU executes: `w = workgroups * waves_per_workgroup / T`,
+where T is the number of transfers per GPU (N or N-1 for `*_ALL`, 1 for ring hops).
 
 ```
 PUSH_ALL  rank i, each j (j != i unless include_self):  (G{i} G{i} {mem}{j} w chunk)
@@ -158,10 +175,97 @@ PUSH_NEXT rank i:                                       (G{i} G{i} {mem}{i+1} w 
 
 The environment is set per invocation: `GFX_SE_TYPE=1` (sub-executor = one wave),
 `GFX_BLOCK_SIZE=64*waves_per_workgroup`, `USE_SINGLE_STREAM=1`,
-`NUM_SUBITERATIONS=k` (amortizes the launch), `USE_HIP_EVENTS=1` and
+`NUM_SUBITERATIONS=1` (section 4.2), `USE_HIP_EVENTS=1` and
 `ALWAYS_VALIDATE=-1`. Phases with different block sizes need separate invocations.
 
-`roof_us(traffic)` is the sum over phases of `repeat * slowest executor time per sub-iteration`.
+A test's time is its slowest transfer, timed inside the kernel (the
+`Transfer` rows: first wave's start to last wave's stop, averaged over the
+iterations). A candidate's time is the sum over its tests of `repeat` x that;
+`roof_us` is the smallest candidate. Each distinct test runs once, however
+many candidates share it.
+
+### 4.1 Candidates
+
+| knob | op roof | RCCL roof |
+|---|---|---|
+| bytes, pattern | the op's `Traffic` (wire format) | `rccl_traffic()`: bf16 all-pairs push. AR = RS + AG of `nbytes/N` per peer (`2(N-1)/N` x nbytes sent, the busbw convention); A2A = `nbytes/N` to every rank, self included, one phase per call |
+| waves per transfer | `own` (as above) and `WAVE_SWEEP` = 16..256 | `WAVE_SWEEP` |
+| block | the op's | 256 threads |
+| schedule | `serial`; plus `fused` if `pipelined` | same (a single AR call is pipelined) |
+| peer memory | the op's | `U`, `F`, `G` |
+
+`fused` streams every phase's bytes in one test: transfers on the same link
+and direction merge and carry the sum (mesh: RS + AG per peer; ring:
+`(RS + AG) x (N-1)` on the next hop). It is the roof of a kernel that
+overlaps its laps, as the quick all-reduce does tile by tile.
+
+Measured on MI350X (8 GPUs, xGMI), INT4 quick AR, 16384x7168, roof in us
+(event-timed, uncached, before section 4.2's change; the ranking holds):
+
+| TP | v2 roof (serial own) | serial, best width | fused, best width | op |
+|---|---:|---:|---:|---:|
+| 2 | 1284 | 1191 (w32) | 1188 (w32) | 1276 |
+| 4 | 852 | 650 (w16) | 666 (w256) | 674 |
+| 8 | 422 | 339 (w64) | 341 (w64) | 408 |
+
+The op's grid is the main error: an op wave also packs and reduces, so the
+op runs far more waves than a copy kernel needs, and a copy kernel that wide
+oversubscribes the links (TP4: 1365 waves per transfer is 30% slower than
+16). Fusing matters for small messages (TP8, 64 tokens: 2.9 -> 1.7 us) and
+not for large ones, where one lap already saturates the links.
+
+### 4.2 One pass per launch, timed in the kernel
+
+TransferBench's copy kernel loops over its sub-iterations with no fence in
+between; each wave runs `__threadfence_system()` once, after the last pass,
+then takes its stop timestamp. With `G` or `F` peer memory, once the buffer
+fits in the L2 the writing waves span, every pass after the first rewrites
+dirty lines in L2 and nothing crosses the link. The time then falls as
+`1 / NUM_SUBITERATIONS`. Uncached (`U`) writes bypass L2 and always cross:
+
+| TP2, 1024x7168 bf16 lap (7.3 MB), 64 waves, us | sub 10, event | sub 1, event | sub 1, in-kernel |
+|---|---:|---:|---:|
+| `G` | 28.4 | 150.5 | 149.3 |
+| `F` | 28.7 | 150.2 | 149.2 |
+| `U` | 132.0 | 135.6 | 134.3 |
+
+One xGMI direction carries ~55 GB/s, so 7.3 MB cannot take under ~130 us.
+TransferBench has no option to flush between sub-iterations, so every test
+runs one pass per launch: the fence at its end writes the dirty lines back
+before the stop timestamp, and the next launch starts clean. The HIP-event
+executor time would then include the launch, so the roof reads the
+in-kernel `Transfer` rows instead (`tb_text.TestResult.kernel_ms`).
+
+Consequences:
+- The roof writes peers' buffers in **the op's own memory type**, and the
+  type's real cost shows. Into `G`/`F`, a 16384x7168 INT4 TP4 lap takes 398
+  us vs 330 us into `U`, and an A2A TP8 role 51 vs 37 us.
+- For large messages nothing else changes: `U` one-pass in-kernel matches
+  `U` with many sub-iterations within 1-2%.
+- For small messages the roof keeps the per-pass fixed cost: the wave ramp
+  and the final fence, which an op also pays once per call, but not the host
+  launch. A TP8 64-token bf16 lap takes 8.7 us in one pass vs 2.6 us when
+  streamed. The roof is "one copy-kernel call", not steady-state streaming.
+- A test's time is the slowest *transfer*, not the executor's span over all
+  of its transfers, which TransferBench does not print in-kernel. The
+  transfers of one GPU run in one launch and start together, so the
+  difference is the start skew between them, and the roof errs fast.
+- Pulls are left out of the RCCL roof: remote reads can be served from
+  cache across launches (a 0.9 MB TP2 pull "ran" at ~620 GB/s with
+  sub-iterations).
+
+### 4.3 What the roof is not
+
+It is the best of a stock copy kernel, not the link's peak. RCCL beats it
+for large bf16 all-reduces (`rccl eff` 1.07-1.22 at 1024 and 16384 tokens).
+No TransferBench executor gets past ~58 GB/s per xGMI direction on one link:
+not GFX or SDMA, push or pull, any memory type, width, unroll, temporal hint
+or block size, nor zero-filled data. RCCL sustains 64.8 GB/s over the same
+link (TP2, 16384x7168), and PyNccl times it identically. Read `rccl eff > 1`
+as "RCCL's copy loop beats TransferBench's", not as a bug. The candidates use
+TransferBench's default kernel (`GFX_SE_TYPE=1`, default unroll); the best
+knob settings found by hand are ~8% faster for large bf16, which would narrow
+but not close the gap.
 
 **Worked example.** Attention A2A, `wan2.2` bf16, TP8, xGMI. The Q phase is
 `chunk = 12,124,160 / 8 = 1,515,520 B`, with 128 x 8 waves over 8 destinations,
@@ -171,9 +275,9 @@ so 128 waves each. GPU 0's part:
 (G0 G0 U0 128 1515520) (G0 G0 U1 128 1515520) ... (G0 G0 U7 128 1515520)
 ```
 
-Quick AR mesh, INT4, TP8: two tests, RS and then AG, each `(G{i} G{i} U{j} w c)`
-for j != i. They are summed, which makes it a soft ceiling because the kernel can
-overlap its laps (KB 60/02 section 10.3).
+Quick AR mesh, INT4, TP8: `serial` is two tests, RS and then AG, each
+`(G{i} G{i} U{j} w c)` for j != i, summed; `fused` is one test of
+`(G{i} G{i} U{j} w 2c)`. The kernel overlaps its laps (KB 60/02 section 10.3).
 
 ## 5. Metrics and report
 
@@ -186,30 +290,38 @@ From the slowest rank's `t`:
 | wire GB/s | fabric bytes / t (op rows only) |
 | roof us | `roof_us(op traffic)`, blank if TransferBench is absent |
 | op eff | `roof us / op us` |
-| rccl vs op roof | `roof us / rccl us`. Same bytes and fabric, but RCCL uses its own pattern and memory |
+| rccl roof us | `roof_us(rccl_traffic(op traffic))`: RCCL's bf16 bytes |
+| rccl eff | `rccl roof us / rccl us` |
+| roof cfg, rccl roof cfg | the winning candidate, e.g. `fused w64` |
 
-The table has one row per case:
+The table has one row per (case, op):
 
-`case | timing | roof us | op us | op eff | op busbw | op wire GB/s | rccl us | rccl busbw | rccl vs op roof`
+`case | op | timing | roof us | op us | op eff | op busbw | op wire GB/s | rccl roof us | rccl us | rccl eff | rccl busbw | op spread us | variant | roof cfg | rccl roof cfg`
 
 It is preceded by a provenance header (device, link, NUMA map, `HIP_VISIBLE_DEVICES`,
 TB version and path, timing method, command).
 
 ## 6. Status
 
-1. **Done, no GPU needed.**
-   - `comm_traffic.py` and the two `traffic()` methods (no behavior change).
-   - patterns, tb_text, roofline, report (`--tb-dry-run` prints the configs).
-   - `test_collective_bw.py`, 8 tests:
+1. **Done.**
+   - `comm_traffic.py` and the two `traffic()` methods (no behavior change);
+     the quick all-reduce declares `pipelined=True`.
+   - patterns, tb_text, roofline, report (`--tb-dry-run` prints every candidate).
+   - `test_collective_bw.py`, 12 GPU-free tests:
      - fabric bytes equal `busbw factor * logical * wire ratio` for A2A, mesh and ring;
      - wave split and exact config text;
+     - fused tests carry every lap's bytes; candidate sets for pipelined and
+       non-pipelined traffic;
+     - the RCCL traffic is bf16, op-independent and in the busbw convention;
+     - the roofline picks the fastest candidate and runs each test once;
      - the parser on captured v1.71.02 output (MI350P, PCIe);
      - the grading formulas.
-2. **Pending GPU.**
-   - Run both thin scripts at TP4 (GPUs 4-7).
-   - Check that `torch.distributed` all-reduce captures under `fab.capture`. If
-     not, make `--rccl-backend pynccl` the default for the AR script.
+   - Both thin scripts run at TP2/4/8 on MI350X. `torch.distributed`
+     all-reduce captures under `fab.capture`: PyNccl gives the same time.
+2. **Pending.**
    - Check `traffic()` on live ops against the existing scripts' wire-byte figures.
+   - Optionally sweep TransferBench's kernel knobs (`GFX_SE_TYPE=0`, unroll)
+     in the candidates: ~8% faster roofs for large bf16 (section 4.3).
 3. **Later.** `OneShotAllReduce.traffic()`, `FlyQuickAllToAll`.
 
 ## 7. Decisions
@@ -219,12 +331,15 @@ TB version and path, timing method, command).
 - Timing is injected by the scripts, and RCCL is timed with the same timer.
   The AR script falls back to PyNccl (`--rccl-backend pynccl`) if
   `torch.distributed` does not capture.
-- The roof replays the op's pattern, memory type and grid, at exact sizes.
-  Only phases that move payload between GPUs count: no barrier, amax exchange or
-  dequant.
-- The two laps of a two-shot all-reduce are timed as separate TransferBench
-  tests and summed, so the roof is a soft ceiling where the kernel overlaps them.
-- RCCL rows show `op roof / rccl us`.
+- The roof replays the op's pattern at exact sizes, and takes the fastest of
+  the op's own grid and a few fixed copy widths, serial or (pipelined ops)
+  fused. Only phases that move payload between GPUs count: no barrier, amax
+  exchange or dequant.
+- Roofs run one pass per launch and are timed in the kernel, so cacheable
+  memory cannot absorb the writes in L2. The op's roof uses its own memory
+  type; RCCL's tries all three.
+- RCCL is graded against its own bf16 roof (`rccl eff`), which depends only
+  on its calls, not on the op.
 - Attention A2A is graded per trio.
 - Existing scripts stay unchanged. The thin scripts reuse their helpers and live
   in `op_tests/op_benchmarks/collective_bw/`.

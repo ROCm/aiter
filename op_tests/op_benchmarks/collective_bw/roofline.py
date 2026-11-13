@@ -1,14 +1,22 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
-"""The TransferBench roofline of an op's ``Traffic``.
+"""The TransferBench rooflines of an op's ``Traffic`` and of its RCCL calls.
 
-The roof of a call is the time TransferBench needs to move the same bytes, in
-the op's own pattern, into the op's own memory type, with the op's own launch
-geometry. Each phase is run as its own test and the phase times are summed, so
-the roof does not see any overlap between phases that the op may get. The
-roof is optimistic in every other way: it has no handshakes, no quantization
-or layout work, no cross-GPU ordering, and its launch cost is amortized over
-sub-iterations.
+The op's roof is the fastest way TransferBench finds to move the op's bytes,
+in the op's own pattern and memory type: at the op's own grid or at a fixed
+copy width, lap after lap or (for an op that overlaps its laps) all at once.
+See ``patterns`` for the candidates. The roof is optimistic in every other
+way: it has no handshakes, no quantization or layout work, no cross-GPU
+ordering, and it is timed inside the kernel, so the host launch is left out.
+
+The RCCL roof moves RCCL's own bytes (unquantized, ``patterns.rccl_traffic``)
+and also tries every memory type, as RCCL's internals are not modelled.
+
+Both are the best of a stock copy kernel, not the link's physical peak. A
+library with a better copy loop can beat them: RCCL's bf16 all-reduce does by
+~10% at large sizes on MI350X, where no TransferBench executor (GFX or DMA,
+push or pull, any memory type, width or unroll) gets past ~58 GB/s per xGMI
+direction while RCCL sustains ~65 GB/s.
 """
 
 from __future__ import annotations
@@ -28,8 +36,9 @@ logger = logging.getLogger("aiter")
 
 @dataclass(frozen=True)
 class Roof:
-    us: float  # whole call
-    phase_us: tuple[float, ...]  # per phase, repeat included
+    us: float  # whole call, the fastest candidate
+    phase_us: tuple[float, ...]  # that candidate, per test, repeat included
+    label: str = ""  # that candidate's label
 
 
 class Roofline:
@@ -47,7 +56,7 @@ class Roofline:
         self.binary = tb_text.find_binary(binary)
         self.iters, self.warmup, self.timeout = iters, warmup, timeout
         self.version: str | None = None
-        self._roofs: dict[Traffic, Roof] = {}
+        self._roofs: dict[tuple[str, Traffic], Roof] = {}
         if self.binary is None:
             logger.warning(
                 "TransferBench not found ($%s, PATH): no roofline. Build it from "
@@ -61,32 +70,48 @@ class Roofline:
         return self.binary is not None
 
     def measure(self, traffics: Iterable[Traffic]) -> dict[Traffic, Roof]:
-        """Roofs of *traffics*. TransferBench runs once per distinct
-        environment (block size, sub-iterations) over all phases that share it."""
+        """The op roofs of *traffics*."""
         wanted = list(dict.fromkeys(traffics))
+        return self._solve("op", {t: patterns.candidates(t) for t in wanted})
+
+    def measure_rccl(self, traffics: Iterable[Traffic]) -> dict[Traffic, Roof]:
+        """The RCCL roofs of *traffics*, keyed by ``patterns.rccl_traffic``."""
+        wanted = list(dict.fromkeys(patterns.rccl_traffic(t) for t in traffics))
+        return self._solve("rccl", {t: patterns.rccl_candidates(t) for t in wanted})
+
+    def _solve(self, kind: str, specs: dict[Traffic, list]) -> dict[Traffic, Roof]:
+        """The fastest candidate of each traffic in *specs*. *kind* keeps
+        the op and RCCL roofs of one traffic apart in the cache."""
         if not self.available:
             return {}
-        todo = [t for t in wanted if t not in self._roofs]
-        by_env: dict[tuple, list[tuple[Traffic, int, patterns.TbTest]]] = defaultdict(
-            list
-        )
-        for traffic in todo:
-            for i, test in enumerate(patterns.tb_tests(traffic)):
-                by_env[test.env].append((traffic, i, test))
-        phase_us: dict[Traffic, list[float]] = {
-            t: [float("nan")] * len(t.phases) for t in todo
+        todo = {
+            (kind, t): c for t, c in specs.items() if (kind, t) not in self._roofs
         }
-        for env, entries in by_env.items():
+        # Each distinct test runs once, and TransferBench once per environment.
+        tests = list(
+            dict.fromkeys(t for cands in todo.values() for c in cands for t in c.tests)
+        )
+        by_env: dict[tuple, list[patterns.TbTest]] = defaultdict(list)
+        for test in tests:
+            by_env[test.env].append(test)
+        ms: dict[tuple[str, tuple], float] = {}
+        for env, group in by_env.items():
+            lines = list(dict.fromkeys(t.line for t in group))
             results, self.version = tb_text.run(
                 self.binary,
-                [test.line for _t, _i, test in entries],
+                lines,
                 dict(env),
                 iters=self.iters,
                 warmup=self.warmup,
                 timeout=self.timeout,
             )
-            for (traffic, i, test), res in zip(entries, results):
-                phase_us[traffic][i] = res.slowest_ms * 1e3 * test.repeat
-        for traffic, us in phase_us.items():
-            self._roofs[traffic] = Roof(us=sum(us), phase_us=tuple(us))
-        return {t: self._roofs[t] for t in wanted}
+            for line, res in zip(lines, results):
+                ms[(line, env)] = res.kernel_ms
+        for key, cands in todo.items():
+            best = None
+            for c in cands:
+                us = tuple(ms[(t.line, t.env)] * 1e3 * t.repeat for t in c.tests)
+                if best is None or sum(us) < best.us:
+                    best = Roof(us=sum(us), phase_us=us, label=c.label)
+            self._roofs[key] = best
+        return {t: self._roofs[(kind, t)] for t in specs}

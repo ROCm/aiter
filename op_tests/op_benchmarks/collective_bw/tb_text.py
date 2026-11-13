@@ -48,22 +48,41 @@ _EXEC_RE = re.compile(
     rf"Executor:\s+(?:Rank\s+\d+\s+)?(\S+)\s+(\d+){_SEP}([\d.]+)\s*GB/s"
     rf"{_SEP}([\d.]+)\s*ms{_SEP}(\d+)\s*bytes"
 )
+_XFER_RE = re.compile(
+    rf"^\s*Transfer\s+(\d+){_SEP}([\d.]+)\s*GB/s{_SEP}([\d.]+)\s*ms{_SEP}(\d+)\s*bytes"
+)
 _ERR_RE = re.compile(r"^\s*\[ERROR\]\s*(.*)", re.MULTILINE)
 
 
 @dataclass
 class TestResult:
-    """One TransferBench test: milliseconds per executor, per sub-iteration."""
+    """One TransferBench test, in milliseconds per sub-iteration.
+
+    ``exec_ms`` is per executor, HIP-event timed: it includes the launch.
+    ``xfer_ms`` is per transfer, timed inside the kernel from the first wave's
+    start to the last wave's stop. A wave stops after its
+    ``__threadfence_system()``, so the time includes writing back whatever
+    the transfer left dirty in L2, but not the launch.
+    """
 
     num: int
     exec_ms: dict[str, float] = field(default_factory=dict)
+    xfer_ms: dict[int, float] = field(default_factory=dict)
 
     @property
     def slowest_ms(self) -> float:
-        """The executor a collective would wait on."""
+        """The executor a collective would wait on, launch included."""
         if not self.exec_ms:
             return math.nan
         return max(self.exec_ms.values())
+
+    @property
+    def kernel_ms(self) -> float:
+        """The slowest transfer, in-kernel. A transfer is all of one GPU's
+        traffic to one peer; the transfers of a GPU run in one launch."""
+        if not self.xfer_ms:
+            return math.nan
+        return max(self.xfer_ms.values())
 
 
 def find_binary(explicit: str | None = None) -> str | None:
@@ -106,6 +125,12 @@ def parse(text: str) -> list[TestResult]:
             name = f"{m.group(1)} {int(m.group(2))}"
             tests[-1].exec_ms[name] = _duration_ms(
                 float(m.group(3)), float(m.group(4)), int(m.group(5))
+            )
+            continue
+        m = _XFER_RE.match(line)
+        if m and tests:
+            tests[-1].xfer_ms[int(m.group(1))] = _duration_ms(
+                float(m.group(2)), float(m.group(3)), int(m.group(4))
             )
     return tests
 
@@ -158,7 +183,7 @@ def run(
             ", ".join(KNOWN_VERSIONS),
         )
     tests = parse(out)
-    if len(tests) != len(lines) or any(not t.exec_ms for t in tests):
+    if len(tests) != len(lines) or any(not (t.exec_ms and t.xfer_ms) for t in tests):
         raise RuntimeError(
             f"TransferBench {ver}: parsed {len(tests)} test(s) for {len(lines)} "
             "config line(s); the output format may have changed"

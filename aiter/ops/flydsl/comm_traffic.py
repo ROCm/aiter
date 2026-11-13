@@ -96,6 +96,12 @@ class Traffic:
     ``logical_bytes`` is the per-rank payload in the caller's dtype: the input
     size of an all-reduce, or the send-buffer size of an all-to-all.
     ``collective`` selects the bus-bandwidth convention.
+
+    ``pipelined`` says the phases run in one launch, with the same grid, and
+    the kernel overlaps them (a tile starts its next lap while others are
+    still in the previous one). A roof may then stream all their bytes at
+    once instead of lap after lap. Phases from separate launches leave it
+    ``False``.
     """
 
     world_size: int
@@ -103,9 +109,14 @@ class Traffic:
     logical_bytes: int
     phases: tuple[Phase, ...]
     rccl: tuple[RcclCall, ...]
+    pipelined: bool = False
 
     def __post_init__(self):
         if self.collective not in COLLECTIVES:
             raise ValueError(f"collective must be one of {COLLECTIVES}, got {self}")
         if self.world_size < 2 or not self.phases:
             raise ValueError(f"Traffic needs world_size >= 2 and phases, got {self}")
+        if self.pipelined and len(
+            {(p.workgroups, p.waves_per_workgroup) for p in self.phases}
+        ) != 1:
+            raise ValueError(f"pipelined phases share one launch grid, got {self}")

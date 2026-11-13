@@ -632,6 +632,8 @@ class FlyQuickAllReduce:
         each lap is one phase. Each tile sends ``ATOMS / N`` rank-tiles per
         destination per lap, in that lap's codec. The mesh pushes them to
         every peer. The ring pushes them to the next rank, ``N - 1`` times.
+        The laps are ``pipelined``: tiles move through them independently, so
+        the all-gather of one tile overlaps the reduce-scatter of another.
         """
         cfg, num_tiles = self._pick_cfg(int(nbytes))
         eng = self._by_cfg[cfg]
@@ -656,6 +658,7 @@ class FlyQuickAllReduce:
             logical_bytes=int(nbytes),
             phases=(lap(self.rs_codec), lap(self.ag_codec)),
             rccl=(RcclCall("all_reduce", int(nbytes), "bf16"),),
+            pipelined=True,
         )
 
     def is_beneficial(self, nbytes: int) -> bool:

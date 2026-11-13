@@ -8,9 +8,16 @@ Per op row:
   factor: ``(N-1)/N`` for all-to-all and ``2(N-1)/N`` for all-reduce.
 * ``wire GB/s`` is the bytes the op sent to other GPUs (wire format,
   ``fabric_bytes_per_rank``) over ``us``.
-* ``eff`` is ``roof us / us``: 1.0 is the TransferBench roof.
-* ``rccl vs roof`` is ``roof us / rccl us``, against the *op's* roof: the same
-  bytes and fabric, but RCCL runs its own pattern and memory type.
+* ``op eff`` is ``roof us / op us``: 1.0 is the op's TransferBench roof, which
+  moves the op's own (wire-format) bytes in its pattern and memory type.
+* ``rccl eff`` is ``rccl roof us / rccl us``. RCCL gets its own roof, because
+  it moves different bytes: bf16, not the op's quantized wire format
+  (``patterns.rccl_traffic``).
+* ``roof cfg`` / ``rccl roof cfg`` name the candidate that set each roof.
+
+Both roofs are a stock copy kernel's best, not the link's peak, so an
+implementation with a better copy loop can reach an eff above 1.0 (see
+``roofline``).
 """
 
 from __future__ import annotations
@@ -21,7 +28,7 @@ import sys
 from pathlib import Path
 
 from measure import RCCL, Record
-from patterns import busbw_factor, fabric_bytes_per_rank
+from patterns import busbw_factor, fabric_bytes_per_rank, rccl_traffic
 from roofline import Roof
 
 COLUMNS = (
@@ -33,21 +40,30 @@ COLUMNS = (
     "op eff",
     "op busbw GB/s",
     "op wire GB/s",
+    "rccl roof us",
     "rccl us",
+    "rccl eff",
     "rccl busbw GB/s",
-    "rccl vs roof",
     "op spread us",
     "variant",
+    "roof cfg",
+    "rccl roof cfg",
 )
+
+_TEXT_COLUMNS = ("case", "op", "timing", "variant", "roof cfg", "rccl roof cfg")
 
 
 def _gbps(nbytes: float, us: float) -> float:
     return nbytes / us / 1e3 if us > 0 else math.nan
 
 
-def grade(records: list[Record], roofs: dict) -> list[dict]:
+def grade(
+    records: list[Record], roofs: dict, rccl_roofs: dict | None = None
+) -> list[dict]:
     """One row per (case, op). RCCL's columns repeat on every op row of
-    its case."""
+    its case. *roofs* is keyed by the op traffic, *rccl_roofs* by
+    ``rccl_traffic`` of it."""
+    rccl_roofs = rccl_roofs or {}
     rccl = {r.case: r for r in records if r.impl == RCCL}
     rows = []
     for r in records:
@@ -58,6 +74,10 @@ def grade(records: list[Record], roofs: dict) -> list[dict]:
         roof: Roof | None = roofs.get(t)
         roof_us = roof.us if roof else math.nan
         base = rccl.get(r.case)
+        rroof: Roof | None = (
+            rccl_roofs.get(rccl_traffic(base.traffic)) if base else None
+        )
+        rroof_us = rroof.us if rroof else math.nan
         rows.append(
             {
                 "case": r.case,
@@ -68,15 +88,18 @@ def grade(records: list[Record], roofs: dict) -> list[dict]:
                 "op eff": roof_us / r.us,
                 "op busbw GB/s": _gbps(t.logical_bytes, r.us) * factor,
                 "op wire GB/s": _gbps(fabric_bytes_per_rank(t), r.us),
+                "rccl roof us": rroof_us,
                 "rccl us": base.us if base else math.nan,
+                "rccl eff": rroof_us / base.us if base else math.nan,
                 "rccl busbw GB/s": (
                     _gbps(base.traffic.logical_bytes, base.us) * factor
                     if base
                     else math.nan
                 ),
-                "rccl vs roof": roof_us / base.us if base else math.nan,
                 "op spread us": r.spread_us,
                 "variant": r.variant or "",
+                "roof cfg": roof.label if roof else "",
+                "rccl roof cfg": rroof.label if rroof else "",
             }
         )
     return rows
@@ -95,7 +118,7 @@ def markdown(rows: list[dict]) -> str:
         "| " + " | ".join(COLUMNS) + " |",
         "|"
         + "|".join(
-            "---" if c in ("case", "op", "timing", "variant") else "---:"
+            "---" if c in _TEXT_COLUMNS else "---:"
             for c in COLUMNS
         )
         + "|",
@@ -152,17 +175,24 @@ def add_args(parser) -> None:
 
 
 def dry_run(records: list[Record]) -> str:
-    """The TransferBench invocations each roof would run, as shell snippets."""
+    """The TransferBench invocations each roof would run, as shell snippets:
+    every candidate of the op roofs and the RCCL roofs. A roof is the fastest
+    candidate, and a candidate's time is the sum of its tests' times."""
     import patterns
 
     out = []
     for traffic in dict.fromkeys(r.traffic for r in records if r.impl != RCCL):
-        cases = sorted({r.case for r in records if r.traffic == traffic})
-        out.append(f"# {', '.join(cases)}")
-        for i, test in enumerate(patterns.tb_tests(traffic)):
-            env = " ".join(f"{k}={v}" for k, v in test.env)
-            out.append(f"# phase {i}, x{test.repeat}: {env} TransferBench <cfg>")
-            out.append(test.line)
+        cases = ", ".join(sorted({r.case for r in records if r.traffic == traffic}))
+        for kind, cands in (
+            ("op", patterns.candidates(traffic)),
+            ("rccl", patterns.rccl_candidates(patterns.rccl_traffic(traffic))),
+        ):
+            for cand in cands:
+                out.append(f"# {cases}: {kind} roof candidate {cand.label!r}")
+                for i, test in enumerate(cand.tests):
+                    env = " ".join(f"{k}={v}" for k, v in test.env)
+                    out.append(f"# test {i}, x{test.repeat}: {env} TransferBench <cfg>")
+                    out.append(test.line)
     return "\n".join(out)
 
 
@@ -176,11 +206,12 @@ def finish(
     if args.tb_dry_run:
         print(dry_run(records), flush=True)
         args.no_roof = True
-    roofline, roofs = None, {}
+    roofline, roofs, rccl_roofs = None, {}, {}
     if not args.no_roof:
         roofline = Roofline(args.tb_bin, iters=args.tb_iters, warmup=args.tb_warmup)
         roofs = roofline.measure(r.traffic for r in records if r.impl != RCCL)
-    rows = grade(records, roofs)
+        rccl_roofs = roofline.measure_rccl(r.traffic for r in records if r.impl == RCCL)
+    rows = grade(records, roofs, rccl_roofs)
     write(
         rows,
         provenance(roofline, list(header)),
