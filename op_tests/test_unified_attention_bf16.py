@@ -267,7 +267,11 @@ def test_release_frees_workspaces_and_kernels(route_spy):
 
 
 @pytest.mark.parametrize("page", [64, 128])
-@pytest.mark.parametrize("sinks", [False, True], ids=["no-sinks", "sinks"])
+@pytest.mark.parametrize(
+    "sinks",
+    [None, torch.float32, torch.bfloat16, torch.float16],
+    ids=["no-sinks", "sinks-fp32", "sinks-bf16", "sinks-fp16"],
+)
 @pytest.mark.parametrize(
     "query_lengths,lengths",
     [
@@ -280,7 +284,7 @@ def test_sliding_window_matches_reference(
     page, sinks, query_lengths, lengths, route_spy
 ):
     q, k, v, out, cu, used, table = _ragged_inputs(query_lengths, lengths, page)
-    sink = torch.randn(HQ, device="cuda") * 2 if sinks else None
+    sink = None if sinks is None else (torch.randn(HQ, device="cuda") * 2).to(sinks)
     _call(
         q,
         k,
@@ -539,6 +543,41 @@ def test_varlen_optimized_matches_reference(query_lengths, lengths, route_spy):
     _check(out, _reference(q, k, v, used, table, cu_seqlens_q=cu.cpu()))
 
 
+@pytest.mark.parametrize(
+    "prefix,parts",
+    # One 8192-query prefill: its shortest blocks (the tail) see prefix + 16..2048
+    # keys, which is 24..31 plan tiles (3 tasks each) or 33..40 (4, the cap).
+    [pytest.param(23 * 256, 3, id="3-way"), pytest.param(32 * 256, 4, id="4-way")],
+)
+def test_varlen_optimized_tail_reduction_matches_reference(prefix, parts, route_spy):
+    if torch.cuda.get_device_properties(0).multi_processor_count != 256:
+        pytest.skip("the optimized varlen kernel runs on 256-CU parts")
+    qlen = 8192
+    q, k, v, out, cu, used, table = _ragged_inputs((qlen,), (prefix + qlen,), 128)
+    release_flydsl_resources()
+    _call(q, k, v, out, cu, used, table, qlen=qlen, backend="flydsl")
+    assert route_spy == ["optimized"]
+
+    # The plan's per-block task counts, longest block first.
+    (workspace,) = [
+        state["current"]
+        for key, state in flydsl_ua._WORKSPACES.items()
+        if key[2] == "varlen_optimized"
+    ]
+    blocks = qlen // unified_attention_varlen._QUERY_BLOCK
+    counts = workspace["reduce_info"][: 2 * blocks].view(blocks, 2)[:, 1].tolist()
+    uav = unified_attention_varlen
+    tail = uav.TAIL_ROWS
+    keys = [prefix + uav._QUERY_BLOCK * (i + 1) for i in range(blocks)]
+    tiles = sorted((-(-n // 256) for n in keys), reverse=True)
+    expected = [1] * (blocks - tail) + [
+        max(1, min(t // uav.TAIL_MIN_PIECE, uav.TAIL_SPLIT)) for t in tiles[-tail:]
+    ]
+    assert counts == expected
+    assert set(counts[-tail:]) == {parts}
+    _check(out, _reference(q, k, v, used, table, cu_seqlens_q=cu.cpu()))
+
+
 @pytest.mark.skipif(torch.cuda.device_count() < 2, reason="needs two GPUs")
 def test_routes_run_on_each_device_in_turn(route_spy):
     # The same geometries on cuda:0 then cuda:1 reuse each launcher.
@@ -660,12 +699,13 @@ def test_varlen_optimized_graph_replay_follows_new_lengths():
         )
 
     with torch.cuda.stream(stream):
-        call()
+        call()  # An 8192-key prefix: every tail block splits four ways.
     stream.synchronize()
+    _check(out, _reference(q, k, v, used, table, qlen))
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph, stream=stream):
         call()
-    for context in (qlen, qlen + 4000):
+    for context in (2 * qlen, qlen, qlen + 4000):
         used.fill_(context)
         q.normal_()
         out.fill_(float("nan"))
