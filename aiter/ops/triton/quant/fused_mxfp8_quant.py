@@ -8,12 +8,17 @@ from aiter.ops.triton._triton_kernels.quant.fused_mxfp8_quant import (
     _fused_dual_rmsnorm_mxfp8_quant_kernel,
     _fused_flatten_mxfp8_quant_kernel,
     _fused_rms_mxfp8_kernel,
+    _k3_mla_640_gather_kernel,
+    _k3_mla_640_pack_kernel,
 )
 
 __all__ = [
     "fused_dual_rmsnorm_mxfp8_quant",
     "fused_flatten_mxfp8_quant",
     "fused_rms_mxfp8_quant",
+    "k3_mla_640_concat_and_cache",
+    "k3_mla_640_cp_gather_and_upconvert",
+    "k3_mla_640_q_pack",
 ]
 
 _QUANT_BLOCK_SIZE = 32
@@ -215,3 +220,166 @@ def fused_flatten_mxfp8_quant(
     )
 
     return out, out_scales
+
+
+K3_MLA_640_REC = 640
+K3_MLA_640_NOPE = 512
+K3_MLA_640_ROPE = 64
+
+
+def _k3_mla_640_cache(cache: torch.Tensor, what: str = "kv_cache") -> torch.Tensor:
+    """The cache as uint8 [num_blocks, block_size, 640]. It may be a strided view
+    into a packed block row; a flat [rows, 640] grid is the same with page size 1."""
+    if cache.ndim == 2:
+        cache = cache.unsqueeze(1)
+    if (
+        cache.ndim != 3
+        or cache.element_size() != 1
+        or cache.shape[2] != K3_MLA_640_REC
+        or cache.stride(2) != 1
+        or cache.stride(1) != K3_MLA_640_REC
+        or cache.stride(0) % K3_MLA_640_REC
+        or cache.stride(0) < cache.shape[1] * K3_MLA_640_REC
+    ):
+        raise ValueError(
+            f"{what} must be 1-byte [num_blocks, block_size, 640] or [rows, 640] "
+            f"with contiguous records and a block stride that is a multiple of "
+            f"640, got {tuple(cache.shape)} {cache.dtype} strides {cache.stride()}"
+        )
+    return cache.view(torch.uint8)
+
+
+def _k3_rows(x: torch.Tensor, rows: int, width: int, what: str) -> torch.Tensor:
+    """bf16 [rows, width] with unit inner stride (a view whenever x allows it)."""
+    if x.dtype != torch.bfloat16 or x.numel() != rows * width:
+        raise ValueError(
+            f"{what} must be bf16 with {rows} x {width} elements, got "
+            f"{x.dtype} {tuple(x.shape)}"
+        )
+    x = x.reshape(rows, width)
+    return x if x.stride(1) == 1 else x.contiguous()
+
+
+def k3_mla_640_concat_and_cache(
+    kv_c: torch.Tensor,
+    k_pe: torch.Tensor,
+    kv_cache: torch.Tensor,
+    slot_mapping: torch.Tensor,
+) -> None:
+    """Quantize and write fp8_k3_mla_640 records (the call shape of vLLM
+    ops.concat_and_cache_mla).
+
+    kv_c [T, 512] and k_pe [T, 64] (rope already applied) are bf16; token t goes
+    to slot_mapping[t] = block * block_size + pos, a negative slot is skipped.
+    """
+    cache = _k3_mla_640_cache(kv_cache)
+    T = slot_mapping.shape[0]
+    if T == 0:
+        return
+    nope = _k3_rows(kv_c, T, K3_MLA_640_NOPE, "kv_c")
+    rope = _k3_rows(k_pe, T, K3_MLA_640_ROPE, "k_pe")
+    _k3_mla_640_pack_kernel[(T,)](
+        nope,
+        rope,
+        slot_mapping.to(torch.int64).contiguous(),
+        cache,
+        nope.stride(0),
+        rope.stride(0),
+        cache.stride(0),
+        BLOCK_SIZE=cache.shape[1],
+        HAS_SLOTS=True,
+        num_warps=1,
+    )
+
+
+def k3_mla_640_q_pack(
+    q_nope: torch.Tensor, q_pe: torch.Tensor, out: torch.Tensor | None = None
+) -> torch.Tensor:
+    """bf16 q_nope [..., 512] and q_pe [..., 64] -> uint8 [..., 640], one
+    fp8_k3_mla_640 record per (token, head): what sparse_mla_fwd reads as q."""
+    lead = q_nope.shape[:-1]
+    rows = q_nope.numel() // K3_MLA_640_NOPE
+    nope = _k3_rows(q_nope, rows, K3_MLA_640_NOPE, "q_nope")
+    rope = _k3_rows(q_pe, rows, K3_MLA_640_ROPE, "q_pe")
+    if out is None:
+        out = torch.empty(
+            (*lead, K3_MLA_640_REC), dtype=torch.uint8, device=q_nope.device
+        )
+    elif (
+        out.shape != (*lead, K3_MLA_640_REC)
+        or out.dtype != torch.uint8
+        or not out.is_contiguous()
+    ):
+        raise ValueError(
+            f"out must be contiguous uint8 {(*lead, K3_MLA_640_REC)}, got "
+            f"{out.dtype} {tuple(out.shape)}"
+        )
+    if rows:
+        _k3_mla_640_pack_kernel[(rows,)](
+            nope,
+            rope,
+            out,
+            out,
+            nope.stride(0),
+            rope.stride(0),
+            K3_MLA_640_REC,
+            BLOCK_SIZE=1,
+            HAS_SLOTS=False,
+            num_warps=1,
+        )
+    return out
+
+
+def k3_mla_640_cp_gather_and_upconvert(
+    src_cache: torch.Tensor,
+    dst: torch.Tensor,
+    block_table: torch.Tensor,
+    workspace_starts: torch.Tensor,
+    batch_size: int,
+    seq_starts: torch.Tensor | None = None,
+) -> None:
+    """Gather fp8_k3_mla_640 records and dequantize them to bf16 (the signature
+    of vLLM ops.cp_gather_and_upconvert_fp8_kv_cache).
+
+    Request r fills dst rows [workspace_starts[r], workspace_starts[r + 1]) (the
+    last one up to dst.shape[0]) with its tokens from position seq_starts[r]
+    (0 without it) on, token p read from block block_table[r, p // block_size].
+
+    Args:
+        src_cache: uint8 [num_blocks, block_size, 640].
+        dst: bf16 [total_tokens, 576] workspace: 512 nope | 64 rope.
+        block_table: int32 [num_reqs, max_blocks].
+        workspace_starts: int32 [num_reqs].
+        batch_size: num_reqs.
+        seq_starts: optional int32 [num_reqs].
+    """
+    cache = _k3_mla_640_cache(src_cache, "src_cache")
+    width = K3_MLA_640_NOPE + K3_MLA_640_ROPE
+    if dst.dtype != torch.bfloat16 or dst.ndim != 2 or dst.shape[1] != width:
+        raise ValueError(f"dst must be bf16 [total_tokens, {width}]")
+    if dst.stride(1) != 1 or block_table.ndim != 2 or block_table.stride(1) != 1:
+        raise ValueError("dst and block_table must be contiguous along their rows")
+    for name, t in (
+        ("block_table", block_table),
+        ("workspace_starts", workspace_starts),
+        ("seq_starts", seq_starts),
+    ):
+        if t is not None and (t.dtype != torch.int32 or t.stride(-1) != 1):
+            raise ValueError(f"{name} must be int32 with unit stride, got {t.dtype}")
+    if dst.shape[0] == 0 or batch_size == 0:
+        return
+    has_seq_starts = seq_starts is not None
+    _k3_mla_640_gather_kernel[(dst.shape[0],)](
+        cache,
+        dst,
+        block_table,
+        workspace_starts,
+        seq_starts if has_seq_starts else workspace_starts,
+        batch_size,
+        cache.stride(0),
+        block_table.stride(0),
+        dst.stride(0),
+        BLOCK_SIZE=cache.shape[1],
+        HAS_SEQ_STARTS=has_seq_starts,
+        num_warps=1,
+    )

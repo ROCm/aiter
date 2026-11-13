@@ -288,3 +288,84 @@ def _fused_flatten_mxfp8_quant_kernel(
         scale_flat,
         mask=block_scale_offs < n2_groups,
     )
+
+
+
+@triton.jit
+def _k3_mla_640_pack_kernel(
+    nope_ptr,
+    rope_ptr,
+    slot_ptr,
+    dst_ptr,
+    stride_nope,
+    stride_rope,
+    blk_stride,
+    BLOCK_SIZE: tl.constexpr,
+    HAS_SLOTS: tl.constexpr,
+    NOPE: tl.constexpr = 512,
+    ROPE: tl.constexpr = 64,
+    REC: tl.constexpr = 640,
+):
+    """One program per row: quantize NoPE and RoPE, write one record."""
+    row = tl.program_id(0).to(tl.int64)
+    slot = row
+    if HAS_SLOTS:
+        slot = tl.load(slot_ptr + row)
+        if slot < 0:
+            return
+    dst = dst_ptr + (slot // BLOCK_SIZE) * blk_stride + (slot % BLOCK_SIZE) * REC
+    c = tl.arange(0, ROPE)
+    g = tl.arange(0, NOPE // ROPE)
+    off = g[:, None] * ROPE + c[None, :]
+    x = tl.load(nope_ptr + row * stride_nope + off).to(tl.float32)
+    e, inv = _mxfp8_quant_op(x, QUANT_AXIS=1)
+    tl.store(dst + off, (x * inv).to(tl.float8e4nv).to(tl.uint8, bitcast=True))
+    tl.store(
+        dst + NOPE + ROPE + g[:, None] * 2 + tl.arange(0, 2)[None, :],
+        tl.broadcast_to(e, (NOPE // ROPE, 2)),
+    )
+    r = tl.load(rope_ptr + row * stride_rope + c).to(tl.float32)
+    er, inv_r = _mxfp8_quant_op(r, QUANT_AXIS=0)
+    tl.store(dst + NOPE + c, (r * inv_r).to(tl.float8e4nv).to(tl.uint8, bitcast=True))
+    n_sc: tl.constexpr = 2 * NOPE // ROPE
+    tail = tl.where(c < n_sc + 2, tl.broadcast_to(er, (ROPE,)), 0).to(tl.uint8)
+    tl.store(dst + NOPE + ROPE + c, tail, mask=c >= n_sc)
+
+
+@triton.jit
+def _k3_mla_640_gather_kernel(
+    src_ptr,
+    dst_ptr,
+    block_table_ptr,
+    starts_ptr,
+    seq_starts_ptr,
+    num_reqs,
+    blk_stride,
+    bt_stride,
+    dst_stride,
+    BLOCK_SIZE: tl.constexpr,
+    HAS_SEQ_STARTS: tl.constexpr,
+    NOPE: tl.constexpr = 512,
+    ROPE: tl.constexpr = 64,
+    REC: tl.constexpr = 640,
+):
+    """One program per output row: find its request, dequantize one record."""
+    o = tl.program_id(0)
+    req = 0
+    for i in range(1, num_reqs):
+        req += (tl.load(starts_ptr + i) <= o).to(tl.int32)
+    pos = o - tl.load(starts_ptr + req)
+    if HAS_SEQ_STARTS:
+        pos += tl.load(seq_starts_ptr + req)
+    blk = tl.load(block_table_ptr + req * bt_stride + pos // BLOCK_SIZE).to(tl.int64)
+    src = src_ptr + blk * blk_stride + (pos % BLOCK_SIZE) * REC
+    dst = dst_ptr + o.to(tl.int64) * dst_stride
+    c = tl.arange(0, ROPE)
+    g = tl.arange(0, NOPE // ROPE)
+    off = g[:, None] * ROPE + c[None, :]
+    sc = tl.exp2(tl.load(src + NOPE + ROPE + 2 * g).to(tl.float32) - 127.0)
+    x = tl.load(src + off).to(tl.float8e4nv, bitcast=True).to(tl.float32)
+    tl.store(dst + off, (x * sc[:, None]).to(dst_ptr.dtype.element_ty))
+    sr = tl.exp2(tl.load(src + NOPE + ROPE + 2 * NOPE // ROPE).to(tl.float32) - 127.0)
+    r = tl.load(src + NOPE + c).to(tl.float8e4nv, bitcast=True).to(tl.float32)
+    tl.store(dst + NOPE + c, (r * sr).to(dst_ptr.dtype.element_ty))
