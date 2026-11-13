@@ -307,6 +307,8 @@ def build_flash_attn_func_module(
         # memory accesses in FlyDSL's buffer-view/copy API. ``unit_stride=1``
         # permits a wide access at each dword/byte index used by this layout.
         q_buf = ptr_buf_tensor(Q, fx.Int32, unit_elems=2, unit_stride=1)
+        k_buf = ptr_buf_tensor(K, fx.Int32, unit_elems=4, unit_stride=1)
+        v_buf = ptr_buf_tensor(V, fx.Int32, unit_elems=4, unit_stride=1)
         o_buf = ptr_buf_tensor(O, elem_dtype, unit_elems=8, unit_stride=1)
         # Per-tensor descales are one-element device tensors produced upstream.
         # Load them in the prologue without a host `.item()` synchronization.
@@ -379,27 +381,34 @@ def build_flash_attn_func_module(
             token = batch_idx * seq_len_v + token_idx
             return token * STRIDE_TOKEN + head_idx * HEAD_DIM + col
 
-        # Per-batch V# bounds zero-fill partial tiles and the pipelined V
-        # prefetch. They cannot read a following batch or past the allocation.
-        kv_batch_bytes = seq_len_kv_v * fx.Uint64(STRIDE_TOKEN)
-        kv_batch_offset = fx.Int64(batch_idx * kv_batch_bytes)
-        k_buf = ptr_buf_tensor(
-            buf_base_i64(K) + kv_batch_offset,
-            fx.Int32,
-            unit_elems=4,
-            unit_stride=1,
-            num_records_bytes=kv_batch_bytes,
-        )
-        v_buf = ptr_buf_tensor(
-            buf_base_i64(V) + kv_batch_offset,
-            fx.Int32,
-            unit_elems=4,
-            unit_stride=1,
-            num_records_bytes=kv_batch_bytes,
-        )
+        # Aligned K/V tiles keep the original descriptors and batch offsets.
+        # The final V prefetch already wraps to tile zero in both paths.
+        if const_expr(TAIL_MASK):
+            # Per-batch V# bounds zero-fill partial tiles and the pipelined V
+            # prefetch. They cannot read a following batch or past the allocation.
+            kv_batch_bytes = seq_len_kv_v * fx.Uint64(STRIDE_TOKEN)
+            kv_batch_offset = fx.Int64(batch_idx * kv_batch_bytes)
+            k_buf = ptr_buf_tensor(
+                buf_base_i64(K) + kv_batch_offset,
+                fx.Int32,
+                unit_elems=4,
+                unit_stride=1,
+                num_records_bytes=kv_batch_bytes,
+            )
+            v_buf = ptr_buf_tensor(
+                buf_base_i64(V) + kv_batch_offset,
+                fx.Int32,
+                unit_elems=4,
+                unit_stride=1,
+                num_records_bytes=kv_batch_bytes,
+            )
 
         def kv_global_idx(token_idx, col):
-            return token_idx * STRIDE_TOKEN + head_idx * HEAD_DIM + col
+            token = batch_idx * seq_len_kv_v + token_idx
+            index = token * STRIDE_TOKEN + head_idx * HEAD_DIM + col
+            if const_expr(TAIL_MASK):
+                index = token_idx * STRIDE_TOKEN + head_idx * HEAD_DIM + col
+            return index
 
         def _store_output_vec(base_idx, val):
             buf_copy_store(
