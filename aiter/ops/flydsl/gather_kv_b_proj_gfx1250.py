@@ -43,12 +43,15 @@ def _run_projection(
     n_heads: int,
     m: int,
     cluster_n: int,
+    k_out_scale: Tensor | None = None,
+    v_out_scale: Tensor | None = None,
 ) -> None:
     """Launch the fixed-width indexed MLA WMMA kernel."""
     launch_projection, ptr_arg, fx, run_compiled = _projection_runtime()
 
     scale_is_ptr = activation_scale.device.type != "cpu"
     scale_ptr = activation_scale if scale_is_ptr else cache
+    output_fp8 = k_out_scale is not None
     args = (
         ptr_arg(k_out),
         ptr_arg(v_out),
@@ -60,9 +63,12 @@ def _run_projection(
         cache.shape[0],
         m,
         0.0 if scale_is_ptr else float(activation_scale),
+        # BF16 never reads the descale pointers.
+        ptr_arg(k_out_scale if output_fp8 else cache),
+        ptr_arg(v_out_scale if output_fp8 else cache),
         fx.Stream(torch.cuda.current_stream(device=cache.device)),
     )
-    projection_spec = (n_heads, int(scale_is_ptr), cluster_n)
+    projection_spec = (n_heads, int(scale_is_ptr), cluster_n, int(output_fp8))
     run_compiled(
         launch_projection,
         *args,
@@ -114,8 +120,11 @@ def unsupported_reason(
         return f"kv_proj_scale must have {weight_n} per-output-row elements"
     if kv_proj_scale.dtype != torch.float32 or not kv_proj_scale.is_contiguous():
         return "kv_proj_scale must be contiguous float32"
-    if k_prefix.dtype != torch.bfloat16 or v_prefix.dtype != torch.bfloat16:
-        return "outputs must both be bfloat16"
+    if (
+        k_prefix.dtype not in (torch.bfloat16, torch.float8_e4m3fn)
+        or v_prefix.dtype != k_prefix.dtype
+    ):
+        return "outputs must both be bfloat16 or float8_e4m3fn"
     if not k_prefix.is_contiguous() or not v_prefix.is_contiguous():
         return "outputs must be contiguous"
     tensors = (kv_proj_weight, kv_proj_scale, k_prefix, v_prefix)
@@ -138,6 +147,8 @@ def gather_kv_b_proj_flydsl_gfx1250(
     num_tokens: int | None = None,
     weight_preshuffle: bool = True,
     shuffled_kv_cache: bool = False,
+    k_out_scale: Tensor | None = None,
+    v_out_scale: Tensor | None = None,
 ) -> None:
     """Use the dedicated gfx1250 FlyDSL WMMA path for 128+128 MLA prefixes."""
     if not weight_preshuffle:
@@ -179,4 +190,6 @@ def gather_kv_b_proj_flydsl_gfx1250(
         k_prefix.shape[1],
         m,
         cluster_n=_cluster_n(m, k_prefix.shape[1]),
+        k_out_scale=k_out_scale,
+        v_out_scale=v_out_scale,
     )

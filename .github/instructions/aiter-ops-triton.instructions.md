@@ -52,10 +52,10 @@ breaks and how to fix it. The author can be new to these rules.
   helper that only another kernel calls can stay with that kernel.
 - Flag a kernel path under `_triton_kernels/` or `_gluon_kernels/<arch>/` that
   is different from the folder of its wrapper. The kernel folder has the name
-  of the wrapper folder: `normalization/`, not `norm/`. Do not flag the old
-  `_triton_kernels/flash_attn_triton_amd/` folder (used by
-  `attention/mha.py`). A kernel that wrappers in several folders use stays
-  with the wrapper that owns it, or goes in `_triton_kernels/common/`.
+  of the wrapper folder: `normalization/`, not `norm/`. The FlashAttention
+  kernels now live under `_triton_kernels/attention/dao_ai/`. A kernel that
+  wrappers in several folders use stays with the wrapper that owns it, or
+  goes in `_triton_kernels/common/`.
 - Flag a new `@triton.jit` device helper that kernels in several folders use,
   when it is not in `_triton_kernels/common/`. Examples:
   `common/activation.py`, `common/pid_preprocessing.py`. Do not put such a
@@ -158,6 +158,17 @@ In MOE dispatch tables, flag:
   value.
 - Triton keys (`BLOCK_SIZE_N`, `num_stages`) in a Gluon file, or Gluon keys
   (`block_n`, `num_buffers`, `persistent_iters`) in a Triton file.
+
+In unified attention configs, flag:
+
+- A table without an `"any"` entry.
+- A dtype tag that is not `bf16`, `fp8` or `nvfp4`. fp16 uses `bf16`.
+- A three-dtype key (`DT_<q>_<k>_<v>`) with `any` in it, or with the same V
+  and K tags. The loader tries a three-dtype key only when the V cache dtype
+  is not the K cache dtype, and only with exact tags.
+- A change to the `DT` fallback order (`DT_<q>_<k>_<v>`, `DT_<q>_<k>`,
+  `DT_<q>_any`, `DT_any_<k>`, `any`) without an update to
+  `configs/AGENTS.md#unified-attention` and `aiter/ops/triton/README.md`.
 
 ## Configs: Python code
 
@@ -281,7 +292,7 @@ All weight and scale shuffles are in `utils/shuffle.py`. Flag:
   - `gemm/basic/gemm_a8w8.py` → `gemm/basic/test_gemm_a8w8.py`
   - `moe/moe_routing/routing.py` → `moe/moe_routing/test_moe_routing.py`
   - `attention/mha.py` → `attention/test_mha.py`, also if its kernels are in
-    `flash_attn_triton_amd/`
+    `_triton_kernels/attention/dao_ai/`
   - flat wrappers (`topk.py`, `softmax.py`) → the `triton_tests/` root
   - `utils/` helpers → `triton_tests/utils/`
 
