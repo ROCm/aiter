@@ -42,6 +42,11 @@ Run from the aiter repo root so `op_tests/` siblings import cleanly:
     python op_tests/bench_gfx1250_combo.py --dsv4 --ops mori_ep   # MORI EPv2 dispatch/combine
     python op_tests/bench_gfx1250_combo.py --dsv4 --ops mega_moe  # base + Mega, 4 GPUs
 
+    # DeepSeek-V4.1 operators at the DSv4.1 workload's shapes.
+    python op_tests/bench_gfx1250_combo.py --dsv41                # all DSv4.1 ops
+    python op_tests/bench_gfx1250_combo.py --dsv41 --ops score_qk_fp4  # MXFP4 paged MQA logits (OPUS):
+                                                                  # ratio-2 full layers + candidate layers
+
     # DeepSeek-R1 MLPerf operators, one rank of TP4 + DP attention + EP4.
     python op_tests/bench_gfx1250_combo.py --dsr1                 # all DSR1 ops
     python op_tests/bench_gfx1250_combo.py --dsr1 --ops moe       # MoE FC1/FC2 (a4w4, shared expert fused)
@@ -76,9 +81,9 @@ same thing to every op:
                     smaller M stays out because of a UT bug; see DSV4_OPS.
     mla_v4_prefill  1024..16384, the DSv4 prefill chunk. 65536 faults; see
                     _MLA_PREFILL_TOKENS.
-    score_qk_fp4    16, 128, 512, a subset of score_qk's tiers. The axis is
-                    the decode batch (sequences) of its MTP 1 and MTP 4 cases;
-                    its prefill cases are fixed; see _SCORE_QK_FP4_TOKENS.
+    score_qk_fp4    none: one fixed case a scenario (prefill, and decode at
+                    two MTP depths), each the fastest of a realistic sweep;
+                    see _SCORE_QK_FP4_CASES.
     --dsr1 moe,     per-GPU decode batch up to 16384, plus 1536, the recipe's
     mla_decode      max_num_seqs; MoE starts at 4, MLA decode at 1. See
                     _DSR1_MOE_BATCH and _DSR1_BATCH.
@@ -127,10 +132,11 @@ Operators whose underlying UT has no configurable initializer print an explicit
 notice when these flags are supplied; the setting is never silently claimed.
 The current passthrough matrix is:
 
-    DATA + SCALE + seed   moe, gemm, f8gemm, a8w8_blockscale, score_qk_fp4
+    DATA + SCALE + seed   moe, gemm, f8gemm, a8w8_blockscale
     DATA + seed           a16w16, mega_moe, mori_ep, mhc, qk_norm,
                           inverse_rope, score_qk, mla_v4_decode, mla_v4_prefill
     DATA mapping only     mha (norm -> randn, constant -> const0.25)
+    none                  score_qk_fp4 (its UT draws its own inputs)
 
 ``--scale-init`` is reported as not applicable for operators without a scale
 operand.
@@ -504,19 +510,81 @@ _SCORE_QK_KV_LENGTHS = (
     ("16K/4K average", "4608"),
     ("32K/16K average", "10240"),
 )
-# score_qk_fp4 is the MXFP4 OPUS kernel for the same op. Its decode sweep is a
-# subset of score_qk's batch tiers and KV lengths, so each row has a score_qk
-# counterpart, at MTP 1 and MTP 4; a decode launch scores batch * mtp query rows.
-# The tiers are a small batch, the one both MTPs peak at, and a large one; the
-# 384-column KV is left out, as a launch that short times the launch, not the
-# kernel. The prefill cases are DSv4's CSA ones (fresh, and chunked on committed
-# KV), 16384 rows over 1/2/4 sequences, and do not follow AITER_BENCH_TOKENS.
-# The two sides are kept to about the same number of rows.
-_SCORE_QK_FP4_TOKENS = _tokens((16, 128, 512))
-_SCORE_QK_FP4_DECODE_KV = ("4608", "10240")
-_SCORE_QK_FP4_PREFILL_BATCH = ("1", "2", "4")
-# Compressed committed-KV columns of the chunked prefill.
-_SCORE_QK_FP4_PREFILL_CTX = ("10000", "25000")
+
+
+# score_qk_fp4 is the MXFP4 OPUS kernel for the same op, timed through its public
+# API as the model calls it (op_tests/test_pa_mqa_logits_mxfp4_opus.py: the op
+# picks its kernel; V4 decode passes one schedule a forward, built outside the
+# timing; prefill and V4.1 pass none). --dsv4 runs V4 (64 heads, CSA ratio 4);
+# --dsv41 runs V4.1's ratio-2 full layers (2, 8, 14) and its candidate layers,
+# which score each row against its own 2048 picked pages. One case a scenario --
+# prefill, and decode at MTP 1 and 4 (V4) or 1 and 6 (V4.1, its DSpark verify
+# depth), MTP being the rows a sequence -- the fastest of a sweep over this
+# file's DSv4 workloads: decode at score_qk's 16K/4K and 32K/16K average contexts
+# (18432 and 40960 raw tokens, which the UT compresses by the layer's ratio) and
+# batch 16..1024; prefill as 16384 rows, fresh 1K..16K chunks and a 32K input's
+# second 16K chunk. Fastest is by TB/s at MTP 1, one row a sequence leaving the
+# launch memory-bound, and by TFLOPS elsewhere. Swept on gfx1250, 2026-11-13. It
+# does not follow AITER_BENCH_TOKENS.
+def _score_qk_fp4_model(model):
+    # Only V4.1's full layers take a ratio; V4 is CSA 4, the candidate layers 1.
+    return ["-m", model, *(("--ratio", "2") if model == "v41-full" else ())]
+
+
+def _score_qk_fp4_decode(model, mtp, batch, ctx):
+    return [
+        *_score_qk_fp4_model(model),
+        *("--modes", "decode", "--mtp", str(mtp), "-b", str(batch), "-c", str(ctx)),
+    ]
+
+
+def _score_qk_fp4_prefill(model, qlen, ctx):
+    return [
+        *_score_qk_fp4_model(model),
+        *("--modes", "prefill", "-q", str(qlen), "-c", str(ctx)),
+    ]
+
+
+_SCORE_QK_FP4_CASES = {
+    # The sweep's best (gfx1250, us / TFLOPS / TB/s) beside each case.
+    "dsv4": (
+        # 232.3 us, 7100 TFLOPS
+        ("v4 prefill", _score_qk_fp4_prefill("v4", 16384, 32768)),
+        # 60.3 us, 12.60 TB/s
+        ("v4 decode MTP 1", _score_qk_fp4_decode("v4", 1, 1024, 40960)),
+        # 127.3 us, 5397 TFLOPS
+        ("v4 decode MTP 4", _score_qk_fp4_decode("v4", 4, 1024, 40960)),
+    ),
+    "dsv41": (
+        # 238.3 us, 6920 TFLOPS
+        ("v4.1 full layer prefill", _score_qk_fp4_prefill("v41-full", 16384, 32768)),
+        # 130.3 us, 11.60 TB/s
+        (
+            "v4.1 full layer decode MTP 1",
+            _score_qk_fp4_decode("v41-full", 1, 1024, 40960),
+        ),
+        # 213.8 us, 4821 TFLOPS
+        (
+            "v4.1 full layer decode MTP 6",
+            _score_qk_fp4_decode("v41-full", 6, 1024, 40960),
+        ),
+        # 386.6 us, 4251 TFLOPS
+        (
+            "v4.1 candidate layer prefill",
+            _score_qk_fp4_prefill("v41-cand", 16384, 32768),
+        ),
+        # 83.9 us, 14.42 TB/s
+        (
+            "v4.1 candidate layer decode MTP 1",
+            _score_qk_fp4_decode("v41-cand", 1, 1024, 18432),
+        ),
+        # 286.0 us, 2883 TFLOPS
+        (
+            "v4.1 candidate layer decode MTP 6",
+            _score_qk_fp4_decode("v41-cand", 6, 1024, 18432),
+        ),
+    ),
+}
 # Was unset, which let the UT sweep its own 27-value default down to M=1. Two
 # reasons to set it. First, M here is the token count of one step, so the small
 # end of that default is decode batch and the large end is prefill chunk. This
@@ -1913,58 +1981,40 @@ def run_score_qk(args):
         )
 
 
-def run_score_qk_fp4(args):
-    """Run DSv4 MXFP4 paged MQA logits (OPUS): CSA prefill and MTP 1/4 decode.
+def _score_qk_fp4_tables(scenario):
+    """The child's table named for its scenario: the UT names a table for the model and mode
+    alone, so a suite's two decode cases would share a name. Profiler kernels are attached
+    first, while the name still matches (as _mla_v4_ep_tables does)."""
 
-    Every row runs each kernel instance the arch compiled (qlen4_kv64,
-    qlen1_kv64) as a candidate column set; perf tables only (no corner sweep).
+    def extract(lines):
+        tables = []
+        for table, profiles in _profiled_json_tables(lines):
+            _attach_kernel_profiles(table, profiles)
+            table["name"] = f"score_qk_fp4 {scenario}"
+            tables.append(json.dumps(table))
+        return tables
+
+    return extract
+
+
+def run_score_qk_fp4(args):
+    """Run MXFP4 paged MQA logits (OPUS) for the suite's model, one case a scenario.
+
+    --dsv4 runs V4; --dsv41 runs V4.1's ratio-2 full layers and its candidate
+    layers (--ops score_qk_fp4 elsewhere runs V4). Perf tables only, no
+    semantics sweep; see _SCORE_QK_FP4_CASES.
     """
+    _unsupported_init(args, "score_qk_fp4")
     repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-    init_pairs = _init_pairs(args, defaults=(("norm", "auto"),))
-    base_cmd = [
-        sys.executable,
-        "op_tests/test_pa_mqa_logits_mxfp4_opus.py",
-        "--data-init",
-        *(data for data, _ in init_pairs),
-        "--scale-init",
-        *(scale for _, scale in init_pairs),
-        "--seed",
-        str(args.seed),
-    ]
-    _run_child(
-        "score_qk_fp4 (CSA prefill, fresh + chunked, 16384 rows)",
-        [
-            *base_cmd,
-            "--modes",
-            "fresh",
-            "chunked",
-            "-b",
-            *_SCORE_QK_FP4_PREFILL_BATCH,
-            "-c",
-            *_SCORE_QK_FP4_PREFILL_CTX,
-        ],
-        cwd=repo_root,
-        extract=_json_tables,
-        structured=True,
-    )
-    _run_child(
-        "score_qk_fp4 (decode, MTP 1/4)",
-        [
-            *base_cmd,
-            "--modes",
-            "decode",
-            "--mtp",
-            "1",
-            "4",
-            "--decode-batch",
-            *map(str, _SCORE_QK_FP4_TOKENS),
-            "-c",
-            *_SCORE_QK_FP4_DECODE_KV,
-        ],
-        cwd=repo_root,
-        extract=_json_tables,
-        structured=True,
-    )
+    suite = args.suite if args.suite in _SCORE_QK_FP4_CASES else "dsv4"
+    for scenario, case in _SCORE_QK_FP4_CASES[suite]:
+        _run_child(
+            f"score_qk_fp4 ({scenario})",
+            [sys.executable, "op_tests/test_pa_mqa_logits_mxfp4_opus.py", *case],
+            cwd=repo_root,
+            extract=_score_qk_fp4_tables(scenario),
+            structured=True,
+        )
 
 
 def run_mori_ep(args):
@@ -2643,6 +2693,8 @@ DSV4_OPS = [
     "score_qk",
     "score_qk_fp4",
 ]
+# MQA logits only for now: the other DSv4.1 operators are not on gfx1250 yet.
+DSV41_OPS = ["score_qk_fp4"]
 DSR1_OPS = ["moe", "mla_decode", "mla_prefill"]
 
 
@@ -2677,6 +2729,14 @@ def main():
         help=(
             "run the DeepSeek-V4 fixed-shape suite "
             f"(default ops: {', '.join(DSV4_OPS)})"
+        ),
+    )
+    suite.add_argument(
+        "--dsv41",
+        action="store_true",
+        help=(
+            "run the DeepSeek-V4.1 fixed-shape suite "
+            f"(default ops: {', '.join(DSV41_OPS)})"
         ),
     )
     suite.add_argument(
@@ -2810,8 +2870,14 @@ def main():
         smi_output_path = None
         os.environ.pop("AITER_SMI_MONITOR", None)
 
-    args.suite = "dsv4" if args.dsv4 else "dsr1" if args.dsr1 else "perf"
-    default_ops = {"dsv4": DSV4_OPS, "dsr1": DSR1_OPS}.get(args.suite, PERF_OPS)
+    args.suite = (
+        "dsv4"
+        if args.dsv4
+        else "dsv41" if args.dsv41 else "dsr1" if args.dsr1 else "perf"
+    )
+    default_ops = {"dsv4": DSV4_OPS, "dsv41": DSV41_OPS, "dsr1": DSR1_OPS}.get(
+        args.suite, PERF_OPS
+    )
     # --ops selects from every op, not just the suite's defaults: an op pulled
     # out of the defaults because it is broken on this arch still has to be
     # runnable by name to check whether a newer image fixed it. argparse already
