@@ -2812,6 +2812,7 @@ def _mla_decode_fwd_kernel_non_pipelined(
     QUERY_DTYPE: gl.constexpr = "bf16",  # str: "bf16" | "fp8"
     KV_CACHE_DTYPE: gl.constexpr = "bf16",  # str: "bf16" | "fp8"
     BLOCK_SCALES_SIZE: gl.constexpr = 4,  # int
+    PAGES_PER_BLOCK: gl.constexpr = 1,  # int
 ):
     assert not SHUFFLED_KV_CACHE
     # Non-shuffled KV cache only supports bf16/fp8 query: nvfp4 query requires a
@@ -3051,11 +3052,20 @@ def _mla_decode_fwd_kernel_non_pipelined(
         segm_idx * tiles_per_segment,
         min((segm_idx + 1) * tiles_per_segment, num_tiles),
     ):
-        physical_block_idx = gl.load(block_tables_ptr_shifted + j).to(gl.int64)
-
-        kv_offset = (
-            physical_block_idx * stride_kv_buffer_0 + kv_head_idx * stride_kv_buffer_2
-        )
+        if PAGES_PER_BLOCK == 1:
+            physical_block_idx = gl.load(block_tables_ptr_shifted + j).to(gl.int64)
+            kv_offset = (
+                physical_block_idx * stride_kv_buffer_0
+                + kv_head_idx * stride_kv_buffer_2
+            )
+        else:
+            page_idx = gl.load(block_tables_ptr_shifted + j)
+            kv_offset = (
+                (page_idx // PAGES_PER_BLOCK).to(gl.int64) * stride_kv_buffer_0
+                + (page_idx % PAGES_PER_BLOCK).to(gl.int64)
+                * (TILE_SIZE * stride_kv_buffer_1)
+                + kv_head_idx * stride_kv_buffer_2
+            )
 
         kv_lora_offset = (
             kv_offset

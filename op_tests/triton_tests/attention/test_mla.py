@@ -880,3 +880,187 @@ def test_mla_decode_fwd_lds_pipeline_eligibility(
         assert isinstance(result, tuple) and len(result) == 3
     else:
         assert result is output
+
+
+def _strided_block_cache(blocks, row_stride, num_rows=None, first_row=0):
+    """Copy contiguous cache blocks [n, block_size, 1, D] into rows
+    first_row.. of a [num_rows, row_stride] buffer filled with NaN bytes and
+    return the [n, block_size, 1, D] strided view onto them (vLLM's packed
+    multi-layer block row)."""
+    n, block_size, num_kv_heads, head_dim = blocks.shape
+    block_elems = block_size * num_kv_heads * head_dim
+    assert row_stride >= block_elems
+    num_rows = n + first_row if num_rows is None else num_rows
+    flat = torch.full(
+        (num_rows * row_stride,), 0xFF, dtype=torch.uint8, device=blocks.device
+    ).view(blocks.dtype)
+    view = flat.as_strided(
+        blocks.shape,
+        (row_stride, num_kv_heads * head_dim, head_dim, 1),
+        first_row * row_stride,
+    )
+    view.copy_(blocks)
+    return view
+
+
+def _paged_decode_inputs(
+    batch_size, ctx_lens, q_len, num_query_heads, num_cache_blocks, block_size
+):
+    kv_lora_rank, qk_rope_head_dim, page = 512, 64, 64
+    head_dim = kv_lora_rank + qk_rope_head_dim
+    pages_per_block = block_size // page
+    seq_lens = torch.tensor([c + q_len for c in ctx_lens], dtype=torch.int32)
+    cu_seqlens_q = torch.arange(0, (batch_size + 1) * q_len, q_len, dtype=torch.int32)
+    max_seqlen = int(seq_lens.max())
+    max_blocks = (max_seqlen + block_size - 1) // block_size
+    assert batch_size * max_blocks <= num_cache_blocks
+    blocks = torch.randperm(num_cache_blocks, dtype=torch.int32)
+    blocks = blocks[: batch_size * max_blocks].view(batch_size, max_blocks)
+    page_table = (
+        blocks[:, :, None] * pages_per_block
+        + torch.arange(pages_per_block, dtype=torch.int32)
+    ).view(batch_size, -1)
+    kv = (
+        torch.randn(num_cache_blocks, block_size, 1, head_dim, dtype=torch.bfloat16)
+        .clamp_(-4, 4)
+        .to(e4m3_dtype)
+    )
+    q = (
+        torch.randn(batch_size * q_len, num_query_heads, head_dim, dtype=torch.bfloat16)
+        .clamp_(-4, 4)
+        .to(e4m3_dtype)
+    )
+    q_descale = torch.tensor([0.05], dtype=torch.float32)
+    kv_descale = torch.tensor([0.07], dtype=torch.float32)
+    return dict(
+        q=q,
+        kv=kv,
+        page_table=page_table,
+        seq_lens=seq_lens,
+        cu_seqlens_q=cu_seqlens_q,
+        max_seqlen=max_seqlen,
+        q_descale=q_descale,
+        kv_descale=kv_descale,
+        kv_lora_rank=kv_lora_rank,
+        qk_rope_head_dim=qk_rope_head_dim,
+        pages_per_block=pages_per_block,
+        page=page,
+    )
+
+
+def _run_paged_decode(inp, kv_buffer, pages_per_block):
+    q = inp["q"]
+    out = torch.empty(
+        q.shape[0], q.shape[1], inp["kv_lora_rank"], dtype=torch.bfloat16
+    ).fill_(float("nan"))
+    kwargs = {} if pages_per_block == 1 else {"pages_per_block": pages_per_block}
+    mla_decode_fwd(
+        q,
+        kv_buffer,
+        out,
+        inp["cu_seqlens_q"],
+        inp["seq_lens"],
+        inp["max_seqlen"],
+        inp["page_table"],
+        1.0 / (q.shape[-1] ** 0.5),
+        inp["kv_lora_rank"],
+        inp["qk_rope_head_dim"],
+        True,
+        inp["q_descale"],
+        inp["kv_descale"],
+        **kwargs,
+    )
+    return out
+
+
+@pytest.mark.parametrize("block_size", [2048, 1024])
+@pytest.mark.parametrize("q_len", [1, 8])
+@pytest.mark.parametrize("num_query_heads", [24, 96])
+@pytest.mark.parametrize(
+    "ctx_lens", [[1, 777, 4100, 131064], [64 * 1024 - 8], [2047, 2048, 2049]]
+)
+@pytest.mark.parametrize("row_gap", [5 * 576 + 64, 8])
+@torch.inference_mode()
+def test_mla_decode_fwd_strided_blocks(
+    block_size, q_len, num_query_heads, ctx_lens, row_gap
+):
+    if DEVICE_ARCH != "gfx1250":
+        pytest.skip("pages_per_block is gfx1250 only")
+    torch.manual_seed(0)
+    batch_size = len(ctx_lens)
+    max_blocks = (max(ctx_lens) + q_len + block_size - 1) // block_size
+    inp = _paged_decode_inputs(
+        batch_size,
+        ctx_lens,
+        q_len,
+        num_query_heads,
+        batch_size * max_blocks + 3,
+        block_size,
+    )
+    kv, page, ppb = inp["kv"], inp["page"], inp["pages_per_block"]
+    head_dim = kv.shape[-1]
+
+    contig = kv.view(-1, page, 1, head_dim)
+    ref = _run_paged_decode(inp, contig, 1)
+
+    strided = _strided_block_cache(kv, block_size * head_dim + row_gap)
+    assert strided.stride(0) != block_size * head_dim
+    with pytest.raises(RuntimeError):
+        strided.view(-1, page, 1, head_dim)
+    out = _run_paged_decode(inp, strided, ppb)
+
+    assert torch.isfinite(ref.float()).all()
+    torch.testing.assert_close(out, ref, atol=0, rtol=0)
+
+    if max(ctx_lens) <= 8192 and num_query_heads == 24:
+        golden = torch_mla_extend(
+            inp["q"],
+            kv,
+            inp["cu_seqlens_q"],
+            inp["seq_lens"],
+            inp["page_table"][:, ::ppb] // ppb,
+            inp["kv_lora_rank"],
+            1.0 / (head_dim**0.5),
+            q_descale=inp["q_descale"],
+            kv_descale=inp["kv_descale"],
+        )
+        assert (
+            checkAllclose(
+                out, golden, atol=1.5e-1, rtol=1.5e-1, tol_err_ratio=0.01, msg="strided"
+            )
+            <= 0.01
+        )
+
+
+@pytest.mark.parametrize("q_len", [1, 8])
+@torch.inference_mode()
+def test_mla_decode_fwd_strided_blocks_over_4gb(q_len):
+    if DEVICE_ARCH != "gfx1250":
+        pytest.skip("pages_per_block is gfx1250 only")
+    block_size, head_dim = 2048, 576
+    row_stride = 3 * block_size * head_dim + 5 * 576 + 64
+    num_rows = (2**32 + 2**30) // row_stride + 1
+    torch.cuda.empty_cache()
+    if torch.cuda.mem_get_info()[0] < num_rows * row_stride + 2**31:
+        pytest.skip("needs ~7 GiB free")
+    torch.manual_seed(0)
+    ctx_lens = [40 * 1024, 30 * 1024 + 17]
+    used = 2 * ((max(ctx_lens) + q_len + block_size - 1) // block_size)
+    inp = _paged_decode_inputs(2, ctx_lens, q_len, 96, used, block_size)
+    kv, page, ppb = inp["kv"], inp["page"], inp["pages_per_block"]
+
+    ref = _run_paged_decode(inp, kv.view(-1, page, 1, head_dim), 1)
+
+    first_row = num_rows - used
+    assert first_row * row_stride > 2**31
+    assert (num_rows - 1) * row_stride + block_size * head_dim > 2**32
+    flat = torch.full((num_rows * row_stride,), 0xFF, dtype=torch.uint8).view(
+        kv.dtype
+    )
+    big = flat.as_strided(
+        (num_rows, block_size, 1, head_dim), (row_stride, head_dim, head_dim, 1)
+    )
+    big[first_row:].copy_(kv)
+    inp["page_table"] = inp["page_table"] + first_row * ppb
+    out = _run_paged_decode(inp, big, ppb)
+    torch.testing.assert_close(out, ref, atol=0, rtol=0)

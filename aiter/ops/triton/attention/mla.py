@@ -290,7 +290,13 @@ def mla_decode_fwd(
     out_scale=None,
     shuffled_kv_cache: bool = False,
     skip_reduce: bool = False,
+    pages_per_block: int = 1,
 ):
+    """pages_per_block > 1: kv_buffer is [num_blocks, block_size, num_kv_heads,
+    head_dim] whose blocks may sit at any stride(0) (e.g. a strided view into a
+    packed allocation) and block_tables holds page ids
+    block * pages_per_block + i of block_size // pages_per_block-token pages.
+    Non-shuffled gfx1250 cache only."""
     assert causal, "Only causal attention is supported"
     q_dtype = q.dtype
     kv_buffer_dtype = kv_buffer.dtype
@@ -342,6 +348,14 @@ def mla_decode_fwd(
     else:
         num_blocks, block_size, num_kv_heads, _ = kv_buffer.shape
         K_WIDTH = 16 if kv_buffer_dtype == e4m3_dtype else 8
+
+    page_kwargs = {}
+    if pages_per_block != 1:
+        assert IS_DEVICE_ARCH_GFX12 and not shuffled_kv_cache
+        assert pages_per_block > 1 and block_size % pages_per_block == 0
+        block_size //= pages_per_block
+        num_blocks *= pages_per_block
+        page_kwargs["PAGES_PER_BLOCK"] = pages_per_block
 
     num_seqs = len(seqused_k)
     num_tokens_per_seq = total_num_tokens // num_seqs
@@ -508,6 +522,7 @@ def mla_decode_fwd(
             KV_CACHE_DTYPE=KV_CACHE_DTYPE,
             BLOCK_SCALES_SIZE=BLOCK_SCALES_SIZE,
             NUM_HEAD_BLOCKS=NUM_HEAD_BLOCKS,
+            **page_kwargs,
             **attn_config,
         )
     else:
