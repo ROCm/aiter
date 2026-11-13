@@ -48,6 +48,8 @@ so what follows is the map, not the manual.**
 | `perf_claims.txt` | every number claimed, and which name no baseline | a signed delta and a `before \| after` table already carry theirs |
 | `struct_abi.txt` | structs whose pinned layout this diff shifts | the assertions exist to force a code-object rebuild |
 | `comment_only.txt` | the non-prose lines of a comment-dominated diff | 7963 lines that reduce to none (aiter#4062) |
+| `size.txt` | the PR's size against the reviewability bar (1000 lines / 15 files) | a 2000-line PR reviewed as if it fit in one pass |
+| `reviewers.txt` | this PR's reviewers + the changed paths' authors — the Step 7.8 routing roster | a design question routed to someone who has never touched the code |
 | `evidence.txt` | how a removed guard is handled on head — **only written when a guard or signature changed** | prose telling you to grep was read and not acted on (#5143) |
 
 A `SKIPPED:` artifact means that axis was **not checked** — say so rather than reading
@@ -306,7 +308,7 @@ If 3+ table signs OR any structural check above fires: note "elevated AI code ri
 After the rule checklist, read the diff as a domain expert:
 - Does the approach make sense given the hardware constraints?
 - Are there correctness concerns not caught by the rules above?
-- LDS limits: gfx942 = 64KB, gfx950 = 64KB per CU. gfx1250 (RDNA4) has 320KB LDS per CU but `ds_read`/`ds_write` immediate offset is only 16-bit (max 65535 = 64KB). If LDS allocation exceeds 64KB on gfx1250, the compiler uses VGPRs for the LDS address → VGPR spill → perf regression or compile failure. Real example (PR#4031): reviewer caught OPUS kernel on gfx1250 would hit this.
+- LDS limits: take the per-arch capacity from `aiter.jit.utils.chip_info.get_lds_capacity_bytes()` (gfx942 64 KiB, gfx950 160 KiB, gfx1250 320 KiB) instead of restating it, and recompute a kernel's footprint with every term (`@fx.union` members alias: the maximum, not the sum). gfx1250's `ds_read`/`ds_write` immediate offset is only 16-bit (max 65535), so an allocation over 64 KiB there moves the LDS address into VGPRs → VGPR spill → perf regression or compile failure. Real example (PR#4031): reviewer caught OPUS kernel on gfx1250 would hit this.
 - For new Triton kernels: BLOCK_SIZE choices, num_warps, num_stages — are they reasonable for MI300X? Large BLOCK_SIZE can push LDS over limit causing test failures (Real example: PR#3808, 10 LDS-exhaustion failures in Triton batched GEMM configs).
 - `.contiguous()` before kernel calls when tensor may have non-standard strides?
 - For mixed FP8 dtype paths (fn vs fnuz): gfx942 KV cache is fnuz by default, but Q quantization may emit fn (e.g., DSv4 Flash fused indexer). A kernel handling mixed fn/fnuz inputs needs explicit dtype dispatch — silent dtype mismatch compiles but produces wrong values. Real example (PR#3913): reviewer asked "why is there a mixed FN/FNUZ path?" and asked for `if arch == "gfx942":` guard on the fnuz *conversion* path.
@@ -338,6 +340,42 @@ One line per finding in `$WORK/independent.txt`: `SURVIVED|KILLED -- what they o
 killed finding comes off the card. With no such reader, write `NONE AVAILABLE -- <reason>`
 and put `not independently refuted` on the review line. `rules.md` § Refutation has why.
 
+## Step 7.8 — Design Assessment
+
+**The one judgment this skill does not make: whether the design is right.** Every step
+above checks the diff against a rule, and rules are local — they catch a wrong line, not a
+wrong plan. Route that judgment to a person instead of making it: the routing is
+mechanically checkable, the judgment is not.
+
+Write two lines into `$WORK/design.txt`, then mirror them on the card's header block:
+
+```
+DESIGN: <the decision that, once made, explains the rest of the diff> | NONE -- <the existing pattern this change sits inside> | SPLIT -- <the natural seams>
+HUMAN: recommend <person> review <the question only they can answer> | N/A -- <reason>
+```
+
+- `DESIGN:` names the choice — a cache layout, a dispatch order, a data format. `NONE --
+  <reason>` is for a diff that sits inside an existing pattern and decides nothing; the
+  reason names that pattern, and a bare `NONE` is a skipped step.
+- `HUMAN:` routes the decision to a person from `$WORK/reviewers.txt` — this PR's reviewers
+  plus the authors who last touched the changed paths, never the PR's own author. The
+  question names the decision and this PR. `N/A -- <reason>` only when the design is `NONE`
+  or the roster is empty.
+- **Size bar:** the header carries `Size: N lines / M files` (from `$WORK/size.txt`; the
+  gate recomputes it from the PR metadata). Past **1000 lines or 15 files** a review
+  degrades from reading to sampling — the Size line says `over the review bar` and
+  `DESIGN:` becomes `SPLIT -- <the natural seams>`: over the bar the split is not a
+  judgment to weigh, it is the recommendation — the worker's only judgment is where the
+  seams fall, and the `HUMAN:` line routes the design question as in any other review.
+  ghstack makes a stacked split cheap; recommend it rather than complain about the size.
+- A lean concern with a concrete case is an ordinary finding; a taste is not. "This
+  abstraction has one implementation" with file:line is a Step 5/7 finding — "over-engineered"
+  with no case goes nowhere: not into a finding, not into the design lines.
+
+Step 8's `design` gate checks the routing, not the judgment: the lines exist in both
+places, the size is the PR's real size, the person is on the roster and not the author, the
+question names this PR, and an over-bar PR carries a split.
+
 ---
 
 ## Step 8 — Verdict
@@ -364,8 +402,8 @@ happen; go back to it rather than reporting.**
   exit 1
 }
 
-# Then write the card to $WORK/card.md and run the last two gates against it. The four gates
-# above check that the work happened; this one checks that the card reports THAT work.
+# Then write the card to $WORK/card.md and run the remaining gates against it. The four gates
+# above check that the work happened; the card gate checks that the card reports THAT work.
 "$SKILLS_ROOT/review-pr/triage.py" card "$WORK/card.md" "$WORK/verdicts.txt" \
   "$WORK/ai_diagnostic.txt" "$WORK/answers.txt" "$WORK/pr.diff" "$WORK/late_findings.txt" || {
   echo "a finding in the card is not nailed down — fix or drop it before reporting" >&2
@@ -376,6 +414,9 @@ happen; go back to it rather than reporting.**
 "$SKILLS_ROOT/review-pr/triage.py" independent "$WORK/independent.txt" "$WORK/card.md" \
   || { echo "a finding was never put to a reader who had not seen the reasoning" >&2
        exit 1; }
+"$SKILLS_ROOT/review-pr/triage.py" design "$WORK/design.txt" "$WORK/card.md" \
+  "$WORK/reviewers.txt" "$WORK/pr_meta.json" "$WORK/pr.diff" \
+  || { echo "the design judgment was not routed — Step 7.8" >&2; exit 1; }
 ```
 
 `answers` names a Step 2 or Step 7.5 question left unanswered (`UNANSWERED`) or answered
@@ -396,7 +437,10 @@ the card — no finding anchored in no changed file, no rule no verdict marked `
 naming neither a value nor two identifiers — and nothing `FIRE` quietly off it: report it,
 change the verdict, or write `-- not reported: <reason>`. `refutations` requires that you
 tried to kill each finding; `independent` requires that someone who had not seen your
-reasoning tried too, or that the card admits nobody did.
+reasoning tried too, or that the card admits nobody did. `design` requires that the one
+judgment this skill does not make was routed: the two lines exist in both places, the size
+is the PR's real size, the person is on the roster and not the author, and an over-bar PR
+carries a split.
 
 Write the card to `$WORK/card.md` before running the gate — a missing file is a hard
 failure, because not writing it was the cheapest way past this check. Whether a finding is
@@ -437,6 +481,7 @@ failure, because not writing it was the cheapest way past this check. Whether a 
     - In this tier the line is advisory in both directions: a slower hand-measured number is not a gate, and `MEASURED` is not clearance — one run on a shared box is weak evidence, so report the sample count with it.
   - Never label a hand-run number `(deterministic)`, and never soften a `stages.perf` `fail`
     into `(advisory)`. The label is the reader's only signal for whether a reproducer exists.
+- **The Size, Design and Human lines are status lines, not findings.** They ride the header block with Review/Validation/Perf, never as findings — the 5-finding cap must not be able to evict them, and the refutation steps do not put them on trial. `Design (advisory)` tells the reader the design judgment was routed to the `Human:` line, not made here.
 - The review line is always advisory. `🔴 HIGH RISK` requests human attention; it is not a merge gate. A deterministic `Validation: BLOCK` may gate because its reproducer is in the report.
 
 ```
@@ -449,6 +494,9 @@ Validation (deterministic): [PASS/NEEDS_WORK/BLOCK/INCONCLUSIVE — target, exac
 Perf (deterministic): [REGRESSION | NO REGRESSION — median_ratio N on <worst_column> over N rows, threshold T]
   ...or, when the report carries no usable stages.perf, this line instead:
 Perf (advisory): [MEASURED — shapes, base vs head with units, delta, sample count | N/A — no runtime surface changed | NOT RUN — reason]
+Size: [N lines / M files | N lines / M files — over the review bar]
+Design (advisory): [the decision | NONE — reason | SPLIT — the natural seams]
+Human: [recommend <person> review <question> | N/A — reason]
 
 🔴 [specific finding — what, where, why it matters]
 ⚠️ [specific finding]
@@ -491,7 +539,7 @@ When a human reviewer catches something real that this skill missed:
 
 The skill grows from real review history, not hypothetical patterns.
 
-**Nothing new goes in this file.** SKILL.md is budgeted at 500 lines and holds only the
+**Nothing new goes in this file.** SKILL.md is budgeted at 550 lines and holds only the
 prose every review needs, with no code fence over 30 lines. That budget exists because this file went 487 → 632 → 1372 lines in
 under two months while its instruction content barely moved: at 1210 lines, 825 were shell
 and 299 were prose. Conditional content goes in `rules.md` and reaches the reviewer through

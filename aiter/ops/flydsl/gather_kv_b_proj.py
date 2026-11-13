@@ -496,6 +496,8 @@ def gather_kv_b_proj_flydsl(
             num_tokens=num_tokens,
             weight_preshuffle=weight_preshuffle,
             shuffled_kv_cache=shuffled_kv_cache,
+            k_out_scale=k_out_scale,
+            v_out_scale=v_out_scale,
         )
 
     output_fp8 = k_prefix.dtype == torch.float8_e4m3fn

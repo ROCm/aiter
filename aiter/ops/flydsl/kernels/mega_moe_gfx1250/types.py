@@ -10,12 +10,23 @@ import torch
 
 # The MX combine wire, shared by the gemm2 scatter epilogue that writes it
 # (mxfp4_preshuffle_gfx1250_tdm.py) and the reduce that reads it (combine.py).
-# A slot is a payload plane of hidden fp8 bytes -- or half that many fp4 bytes --
-# followed by a scale plane of hidden/COMBINE_SCALE_BLOCK e8m0 bytes.
+# A slot is hidden/COMBINE_CHUNK chunks, each its fp8 or fp4 payload and then a
+# COMBINE_SCALE_LINE line that starts with its e8m0 scales, one per
+# COMBINE_SCALE_BLOCK features. The scales get a whole line because a remote
+# write covering part of a cache line costs far more than its bytes.
 #
-# Both plane bases stay cache-line aligned -- the payload plane is a multiple of
-# 128 bytes and the slot stride is a power of two -- and that must not slip.
+# Chunks start cache-line aligned and the slot stride is a power of two; that
+# must not slip. 256 is the smallest chunk whose payload is whole lines on every
+# wire (fp4 128B, fp8 256B, bf16 512B) and whose scales are a whole dword.
 COMBINE_SCALE_BLOCK = 32
+COMBINE_CHUNK = 256
+COMBINE_SCALE_LINE = 128
+
+
+def combine_chunk_bytes(quant_bits: int) -> int:
+    """Wire bytes of one chunk: its payload, then its scale line."""
+    return COMBINE_CHUNK * quant_bits // 8 + COMBINE_SCALE_LINE
+
 
 _DTYPE_INFO = {
     torch.int8: ("|i1", 1, None),
@@ -73,6 +84,10 @@ class Stage2ScatterContext:
     world_size: int
     source_token_map: torch.Tensor
     compact_layout: bool = False
+    # Compact dispatch shipped one row per token per peer. The grouped GEMM
+    # scatters those rows into expert order before GEMM1, then clears this flag
+    # so GEMM1 does a contiguous load.
+    compact_row_gather: bool = False
     compact_masked_m: torch.Tensor | None = None
     compact_psum: torch.Tensor | None = None
     compact_ep_rowmap: torch.Tensor | None = None
@@ -103,6 +118,8 @@ class Stage2ScatterContext:
             raise ValueError(
                 f"combine_quant_bits must be 0, 8 or 4, got {self.combine_quant_bits}"
             )
+        if self.compact_row_gather and not self.compact_layout:
+            raise ValueError("compact_row_gather requires compact_layout")
         if self.arena_handle < 0:
             raise ValueError("arena_handle must be non-negative")
         if self.combine_input_offset < 0:

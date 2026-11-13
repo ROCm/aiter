@@ -66,6 +66,7 @@ def _gemm1_body(
     arg_aqout,
     arg_ascaleout,
     arg_hidden,
+    i32_hidden_row_stride_bytes,
     arg_bias,
     bx_i32,
     lane,
@@ -176,7 +177,9 @@ def _gemm1_body(
     ascale_dma_atom4 = fx.make_copy_atom(fx.rocdl.BufferCopyLDS32b(), fx.Int32)
 
     if const_expr(inline_quant):
-        hidden_num = fx.Int64(i32_ntok * fx.Int32(K * 2))
+        hidden_num = fx.Int64(
+            (i32_ntok - fx.Int32(1)) * i32_hidden_row_stride_bytes + fx.Int32(K * 2)
+        )
         hidden_tiles = _global_i32_buffer_tiles(arg_hidden, hidden_num, 4)
         hidden_copy_atom = fx.make_copy_atom(fx.rocdl.BufferCopy128b(), fx.Int32)
 
@@ -695,7 +698,7 @@ def _gemm1_body(
 
     def inline_quant_load_kt(B128_IDX, kt, row_token):
         v_voff = (
-            row_token * fx.Int32(K * 2)
+            row_token * i32_hidden_row_stride_bytes
             + lane_shr2_and3 * fx.Int32(64)
             + lib * fx.Int32(16)
         )
@@ -1671,10 +1674,8 @@ def compile_gemm1_a4w4_port(
     #
     # situ_beta / situ_linear_beta / swiglu_limit are deliberately absent: they
     # are floats, so they would make ugly symbols, and they cannot collide.
-    # FlyDSL's disk cache is not keyed on this symbol name -- the key is a hash
-    # over the launcher source, its dependency sources, and every scalar closure
-    # value reachable from it (see jit_function._jit_function_cache_key /
-    # _collect_closure_scalar_vals), and gemm1_kernel closes over all three.
+    # FlyDSL's disk cache is not keyed on this symbol name but on the traced IR,
+    # where all three are constants.
     gu_tag = "il" if interleave else "sep"
     name_suffix = (
         f"{a_dtype}_h{D_HIDDEN}_i{D_INTER}_ne{NE}_bm{BM}_{variant_tag}_{gu_tag}"
@@ -1722,6 +1723,7 @@ def compile_gemm1_a4w4_port(
         arg_aqout: fx.Int64,
         arg_ascaleout: fx.Int64,
         arg_hidden: fx.Int64,
+        i32_hidden_row_stride_bytes: fx.Int32,
         arg_bias: fx.Int64,
     ):
         lds_raw_ptr = fx.SharedAllocator().allocate(SharedStorage).peek().raw.ptr
@@ -1769,6 +1771,7 @@ def compile_gemm1_a4w4_port(
                 arg_aqout,
                 arg_ascaleout,
                 arg_hidden,
+                i32_hidden_row_stride_bytes,
                 arg_bias,
                 tile,
                 lane,
@@ -1813,6 +1816,7 @@ def compile_gemm1_a4w4_port(
         arg_aqout: fx.Int64,
         arg_ascaleout: fx.Int64,
         arg_hidden: fx.Int64,
+        i32_hidden_row_stride_bytes: fx.Int32,
         arg_bias: fx.Int64,
         stream: fx.Stream,
     ):
@@ -1829,6 +1833,7 @@ def compile_gemm1_a4w4_port(
             arg_aqout,
             arg_ascaleout,
             arg_hidden,
+            i32_hidden_row_stride_bytes,
             arg_bias,
         ).launch(
             grid=(grid_x, 1, 1),
