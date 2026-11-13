@@ -671,6 +671,8 @@ def bench_mlp_single_weight_init(
             swizzle_mx_scale=swizzle_mx_scale2,
             preshuffle_weights=preshuffle,
             backend=backend,
+            # routing slot per sorted row, for the optional atomic top-k combine
+            topk_tok=gather_indx,
         )
 
     y2 = layer2()
