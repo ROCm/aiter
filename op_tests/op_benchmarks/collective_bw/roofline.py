@@ -44,6 +44,22 @@ class Roof:
     candidates: tuple[tuple[str, float], ...] = ()
 
 
+@dataclass(frozen=True)
+class Peak:
+    """A fabric peak: what one rank can send to other GPUs per second, with
+    every rank sending at once (``patterns.peak_traffic``)."""
+
+    world_size: int
+    kind: str  # patterns.PEAK_KINDS
+    gbps: float  # per-rank egress, GB/s
+    peers: int  # links one rank sends over
+    roof: Roof  # the probe's fastest candidate
+
+    @property
+    def per_link_gbps(self) -> float:
+        return self.gbps / self.peers
+
+
 class Roofline:
     """Measures and remembers roofs. ``available`` is False when no
     TransferBench binary was found; ``measure`` then returns nothing."""
@@ -80,6 +96,27 @@ class Roofline:
         wanted = list(dict.fromkeys(patterns.rccl_traffic(t) for t in traffics))
         s = self.settings
         return self._solve("rccl", {t: patterns.rccl_candidates(t, s) for t in wanted})
+
+    def measure_peaks(self, world_size: int) -> dict[str, Peak]:
+        """The fabric peaks of *world_size* ranks, by ``patterns.PEAK_KINDS``.
+        Empty when TransferBench is absent."""
+        s = self.settings
+        probes = {
+            kind: patterns.peak_traffic(world_size, kind, s)
+            for kind in patterns.PEAK_KINDS
+        }
+        roofs = self._solve(
+            "peak", {t: patterns.sweep_candidates(t, s) for t in probes.values()}
+        )
+        peaks = {}
+        for kind, t in probes.items():
+            if t not in roofs:
+                continue
+            sent = patterns.fabric_bytes_per_rank(t)
+            peers = sent // s.peak_bytes_per_peer
+            gbps = sent / roofs[t].us / 1e3
+            peaks[kind] = Peak(world_size, kind, gbps, peers, roofs[t])
+        return peaks
 
     def _solve(self, kind: str, specs: dict[Traffic, list]) -> dict[Traffic, Roof]:
         """The fastest candidate of each traffic in *specs*. *kind* keeps

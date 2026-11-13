@@ -3,7 +3,11 @@
 Grades a FlyDSL collective, and RCCL doing the same operation, against
 TransferBench rooflines. The op's roof is the fastest time the stock
 TransferBench needs to move the op's bytes in the op's own pattern. RCCL gets
-its own roof for its own (unquantized) bytes.
+its own roof for its own (unquantized) bytes. Separately, every
+implementation's per-rank wire rate is set against the fabric's per-rank peak
+(section 5.1), which answers: given the link, the collective and the number
+of ranks, what bandwidth per rank is possible, and how close does each
+implementation get?
 
 Changes from v2 (iteration 4), after v2 reported all-reduce eff up to 1.26
 and no RCCL efficiency:
@@ -47,7 +51,8 @@ module; the op's pattern is never changed; exact sizes only.
    roof_settings.py  RoofSettings: every tunable TransferBench setting, one dataclass
    patterns.py  Traffic -> roof candidates (config lines + env); busbw factor (pure, no GPU)
    tb_text.py   find + run stock TransferBench, parse stdout (only TB-aware module)
-   roofline.py  Roofline(binary, settings).measure(traffics) -> {traffic: Roof}
+   roofline.py  Roofline(binary, settings).measure(traffics) -> {traffic: Roof};
+                measure_peaks(N) -> per-rank fabric peaks
    tb_dump.py   write every candidate as a runnable .cfg + README.md index
    report.py    grade(), markdown / CSV, shared CLI options, finish(), --tb-dry-run
    test_collective_bw.py       GPU-free tests (patterns, byte accounting, parser, grading)
@@ -296,7 +301,8 @@ From the slowest rank's `t`:
 |---|---|
 | algbw | `logical_bytes / t` |
 | busbw | `algbw * factor` (rccl-tests convention) |
-| wire GB/s | fabric bytes / t (op rows only) |
+| wire GB/s | bytes one rank sends to other GPUs / t: the op's wire format, RCCL's bf16 |
+| wire/peak | `wire GB/s` / the all-peers fabric peak (section 5.1) |
 | roof us | `roof_us(op traffic)`, blank if TransferBench is absent |
 | op eff | `roof us / op us` |
 | rccl roof us | `roof_us(rccl_traffic(op traffic))`: RCCL's bf16 bytes |
@@ -305,7 +311,13 @@ From the slowest rank's `t`:
 
 The table has one row per (case, op):
 
-`case | op | timing | roof us | op us | op eff | op busbw | op wire GB/s | rccl roof us | rccl us | rccl eff | rccl busbw | op spread us | variant | roof cfg | rccl roof cfg`
+`case | op | timing | roof us | op us | op eff | op busbw | op wire GB/s | op wire/peak | rccl roof us | rccl us | rccl eff | rccl busbw | rccl wire GB/s | rccl wire/peak | op spread us | variant | roof cfg | rccl roof cfg`
+
+`eff` and `wire/peak` answer different questions. `eff` is implementation
+efficiency: the op against a copy kernel making the *same moves* (its
+pattern, bytes, memory). `wire/peak` is fabric use: how busy the op keeps
+the rank's links, against one peak shared by every implementation. A ring op
+can have a high `eff` while using one link of N - 1.
 
 **TransferBench configs.** Every run, measured or not, writes every
 candidate of every roof as a `.cfg` that runs as is with the stock binary
@@ -325,7 +337,53 @@ directory it wrote (marker `.collective_bw_tb`), so no stale files remain.
 `--tb-dry-run` writes the files without running TransferBench.
 
 It is preceded by a provenance header (device, link, NUMA map, `HIP_VISIBLE_DEVICES`,
-TB version and path, timing method, command).
+TB version and path, timing method, the peaks of section 5.1, command).
+
+### 5.1 Per-rank bandwidth vs peak
+
+The question: given the interconnect, the collective and N, what is the
+bandwidth per rank at best, and how close does an implementation get?
+
+- **Metric: wire bytes per rank per second.** The bytes one rank sends to
+  other GPUs per call (`fabric_bytes_per_rank`) over the slowest rank's time.
+  For an unquantized collective on a bandwidth-optimal schedule this is the
+  rccl-tests busbw. Collectives are symmetric, so every rank's rate is the
+  same; the slowest rank's time sets it.
+- **Peak per rank, P(link, N).** Depends on the hardware and N only, never on
+  an op. Measured on every run (`Roofline.measure_peaks`, configs in
+  `<report>.tb/peak/`): every rank pushes `RoofSettings.peak_bytes_per_peer`
+  (64 MiB, enough to saturate) at once to
+  - `all_peers`: every other rank. The headline P: on an xGMI mesh this
+    uses all N - 1 links of a rank.
+  - `one_peer`: the next rank only. What a single ring can use.
+
+  Both sweep widths and memory types (`patterns.sweep_candidates`).
+- **Two more references.** `best known`: the highest per-rank wire rate in
+  the run, P included; TransferBench is not a ceiling (section 4.3), RCCL
+  beats it. `nominal`: an optional datasheet rate per link (`--link-gbps`,
+  `RoofSettings.link_gbps`) times the links a rank uses (N - 1 on xGMI, 1
+  on PCIe).
+- **Max means the large-message plateau.** The summary takes each
+  implementation's largest message and shows its `wire MB per rank`, so a
+  shape that is too small to saturate is visible.
+- **Quantized ops** get both: `wire/peak` (fabric use) and `busbw/peak`
+  (logical rate, can exceed 1).
+
+The report ends with one row per implementation:
+
+`link | collective | ranks | impl | case | wire MB per rank | wire GB/s per rank | wire/peak | wire/best known | wire/nominal | busbw GB/s | busbw/peak`
+
+Measured on MI350X, xGMI, 16384x7168 all-reduce (peaks repeat within 0.3%
+across runs):
+
+| N | P all peers (per link) | P one peer | FlyDSL INT4 wire, /P, /best | RCCL wire, /P | FlyDSL busbw/P |
+|---|---:|---:|---:|---:|---:|
+| 2 | 55.6 (55.6) | 55.6 | 51.7, 0.93, 0.80 | 64.8, 1.17 | 3.3 |
+| 4 | 152.3 (50.8) | 57.5 | 147.0, 0.97, 0.79 | 185.7, 1.22 | 3.4 |
+| 8 | 335.1 (47.9) | 56.5 | 282.0, 0.84, 0.67 | 420.5, 1.26 | 3.0 |
+
+A link carries ~18% more alone than when all links of a rank are busy
+(TP8: 56.5 vs 47.9 GB/s).
 
 ## 6. Status
 
@@ -334,7 +392,7 @@ TB version and path, timing method, command).
      the quick all-reduce declares `pipelined=True`.
    - roof_settings, patterns, tb_text, roofline, tb_dump, report; the configs
      of every roof are written on every run (`--tb-dir`).
-   - `test_collective_bw.py`, 16 GPU-free tests:
+   - `test_collective_bw.py`, 19 GPU-free tests:
      - fabric bytes equal `busbw factor * logical * wire ratio` for A2A, mesh and ring;
      - wave split and exact config text;
      - fused tests carry every lap's bytes; candidate sets for pipelined and
@@ -343,6 +401,7 @@ TB version and path, timing method, command).
      - the roofline picks the fastest candidate and runs each test once;
      - settings reach every test, and the CLI overrides them;
      - the config dump: one runnable file per candidate, the index, cleanup;
+     - the peak probes, `measure_peaks`, and the per-rank summary;
      - the parser on captured v1.71.02 output (MI350P, PCIe);
      - the grading formulas.
    - Both thin scripts run at TP2/4/8 on MI350X. `torch.distributed`
@@ -369,6 +428,9 @@ TB version and path, timing method, command).
   type; RCCL's tries all three.
 - RCCL is graded against its own bf16 roof (`rccl eff`), which depends only
   on its calls, not on the op.
+- Fabric use is graded against one per-rank peak per (link, N), measured by
+  TransferBench on every run, next to the best rate seen and an optional
+  datasheet rate; it is separate from `eff`.
 - The tunable TransferBench settings live in one dataclass (`RoofSettings`);
   the config lines are generated from the op's `traffic()`, not stored,
   because they follow the op's runtime choices (size tier, codec, grid, inbox

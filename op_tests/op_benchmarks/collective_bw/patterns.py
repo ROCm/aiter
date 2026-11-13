@@ -250,23 +250,66 @@ def _rccl_phase(chunk: int, *, include_self: bool) -> Phase:
     )
 
 
-def rccl_candidates(
-    rccl: Traffic, settings: RoofSettings = DEFAULT
+def sweep_candidates(
+    traffic: Traffic, settings: RoofSettings = DEFAULT
 ) -> list[Candidate]:
-    """An ``rccl_traffic``'s roof candidates: ``settings.wave_sweep`` x
-    serial/fused x ``settings.rccl_mems``, in workgroups of
+    """Candidates for traffic no op dictates the geometry or memory of (the
+    RCCL roof, the fabric peak): ``settings.wave_sweep`` x serial/fused x
+    ``settings.rccl_mems``, in workgroups of
     ``settings.rccl_waves_per_workgroup`` waves."""
     out = []
     block = settings.rccl_waves_per_workgroup
     for mem in settings.rccl_mems:
         phases = tuple(
-            replace(p, peer_mem=mem, waves_per_workgroup=block) for p in rccl.phases
+            replace(p, peer_mem=mem, waves_per_workgroup=block)
+            for p in traffic.phases
         )
         tag = f" {TB_MEM[mem]}"
         out += _candidates(
-            replace(rccl, phases=phases), settings, own=False, tag=tag
+            replace(traffic, phases=phases), settings, own=False, tag=tag
         )
     return out
+
+
+def rccl_candidates(
+    rccl: Traffic, settings: RoofSettings = DEFAULT
+) -> list[Candidate]:
+    """An ``rccl_traffic``'s roof candidates (``sweep_candidates``)."""
+    return sweep_candidates(rccl, settings)
+
+
+# The fabric-peak probes: who sends to whom.
+PEAK_KINDS = {
+    "all_peers": Pattern.PUSH_ALL,  # every rank to every other rank at once
+    "one_peer": Pattern.PUSH_NEXT,  # every rank to the next one (a single ring)
+}
+
+
+def peak_traffic(
+    world_size: int, kind: str, settings: RoofSettings = DEFAULT
+) -> Traffic:
+    """A fabric-peak probe: every rank pushes ``settings.peak_bytes_per_peer``
+    to every other rank (``all_peers``) or to the next rank only
+    (``one_peer``), all ranks at once. Its per-rank egress bandwidth is the
+    peak an op with that link usage can reach. Measured with
+    ``sweep_candidates``."""
+    phase = Phase(
+        pattern=PEAK_KINDS[kind],
+        chunk_bytes=settings.peak_bytes_per_peer,
+        include_self=False,
+        repeat=1,
+        peer_mem=PeerMem.UNCACHED,
+        workgroups=1,
+        waves_per_workgroup=1,
+    )
+    peers = world_size - 1 if kind == "all_peers" else 1
+    return Traffic(
+        world_size=world_size,
+        collective="all_to_all",
+        logical_bytes=peers * settings.peak_bytes_per_peer,
+        phases=(phase,),
+        rccl=(),
+    )
 
 
 def busbw_factor(collective: str, world_size: int) -> float:

@@ -7,6 +7,7 @@ Every run writes them, whether TransferBench ran or not::
     <dir>/README.md                       index: every candidate, its time, the roof
     <dir>/<case>/<op>/<candidate>.cfg     the op's roof candidates
     <dir>/<case>/rccl/<candidate>.cfg     the RCCL roof candidates
+    <dir>/peak/<kind>/<candidate>.cfg     the fabric-peak probes
 
 Each ``.cfg`` runs as is with the stock binary; its header has the
 environment and the command. A candidate whose tests need different
@@ -113,10 +114,13 @@ def write(
     roofs: dict,
     rccl_roofs: dict,
     roofline=None,
+    *,
+    peaks: dict | None = None,
 ) -> Path:
-    """Write the configs of every op and RCCL roof of *records* under
-    *root*, with the measured times where *roofs* / *rccl_roofs* have them.
-    Returns the index path."""
+    """Write the configs of every op and RCCL roof of *records*, and of the
+    fabric-peak probes, under *root*, with the measured times where *roofs*
+    / *rccl_roofs* / *peaks* have them. Returns the index path."""
+    peaks = peaks or {}
     root = Path(root)
     _prepare(root)
     rows = []
@@ -143,6 +147,19 @@ def write(
             patterns.rccl_candidates(rt, settings),
             rccl_roofs.get(rt),
         )
+    if records:
+        n = records[0].traffic.world_size
+        for kind in patterns.PEAK_KINDS:
+            probe = patterns.peak_traffic(n, kind, settings)
+            pk = peaks.get(kind)
+            rows += _write_roof(
+                root,
+                Path("peak") / kind,
+                "-",
+                f"peak {kind}",
+                patterns.sweep_candidates(probe, settings),
+                pk.roof if pk else None,
+            )
     index = root / "README.md"
     index.write_text(_index(rows, settings, roofline))
     return index

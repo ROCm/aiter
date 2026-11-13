@@ -317,8 +317,8 @@ def test_cli_overrides_settings():
     parser = argparse.ArgumentParser()
     report.add_args(parser)
     assert report.settings_from(parser.parse_args([])) == DEFAULT
-    args = parser.parse_args(["--tb-iters", "5"])
-    assert report.settings_from(args) == RoofSettings(iterations=5)
+    args = parser.parse_args(["--tb-iters", "5", "--link-gbps", "64"])
+    assert report.settings_from(args) == RoofSettings(iterations=5, link_gbps=64.0)
 
 
 def test_dump_writes_runnable_configs():
@@ -365,6 +365,9 @@ def test_dump_writes_runnable_configs():
         assert "| serial w16 | 12.000 | **roof** |" in rows[2]
         rccl_cfg = root / "1024x7168" / "rccl" / "fused_w64_U.cfg"
         assert "not measured" in rccl_cfg.read_text()
+        # The fabric-peak probes are written too.
+        for kind in patterns.PEAK_KINDS:
+            assert len(list((root / "peak" / kind).glob("*.cfg"))) == 15
 
 
 def test_dump_default_dir():
@@ -373,6 +376,98 @@ def test_dump_default_dir():
     assert tb_dump.default_dir("a/b/tp4.md", None) == Path("a/b/tp4.tb")
     assert tb_dump.default_dir(None, "x.csv") == Path("x.tb")
     assert tb_dump.default_dir(None, None) == Path("collective_bw_tb")
+
+
+def test_peak_probes():
+    """All-peers pushes the probe size to every other rank, one-peer to the
+    next rank only; both sweep widths and memory types."""
+    s = RoofSettings(peak_bytes_per_peer=1 << 20)
+    allp = patterns.peak_traffic(4, "all_peers", s)
+    one = patterns.peak_traffic(4, "one_peer", s)
+    assert patterns.fabric_bytes_per_rank(allp) == 3 << 20
+    assert patterns.fabric_bytes_per_rank(one) == 1 << 20
+    cands = patterns.sweep_candidates(allp, s)
+    assert len(cands) == len(s.wave_sweep) * len(s.rccl_mems)
+    line = next(c for c in cands if c.label == "serial w64 G").tests[0].line
+    assert line.startswith(f"-12 (G0 G0 G1 64 {1 << 20}) (G0 G0 G2 64 ")
+    line = patterns.sweep_candidates(one, s)[0].tests[0].line
+    assert line.startswith(f"-4 (G0 G0 U1 16 {1 << 20}) (G1 G1 U2 16 ")
+
+
+def test_measure_peaks():
+    """Peak GB/s is the probe's per-rank egress over its fastest candidate."""
+    import roofline
+
+    def fake_run(binary, lines, env, **kw):
+        # 1 ms per test, 2 ms for 256-wave ones.
+        out = []
+        for line in lines:
+            ms = 2.0 if " 256 " in line else 1.0
+            out.append(tb_text.TestResult(len(out) + 1, {"GPU 0": ms}, {0: ms}))
+        return out, "1.71.02"
+
+    s = RoofSettings(peak_bytes_per_peer=1_000_000)
+    real = roofline.tb_text.run
+    roofline.tb_text.run = fake_run
+    try:
+        peaks = roofline.Roofline(sys.executable, s).measure_peaks(8)
+    finally:
+        roofline.tb_text.run = real
+    assert set(peaks) == set(patterns.PEAK_KINDS)
+    allp, one = peaks["all_peers"], peaks["one_peer"]
+    assert allp.peers == 7 and one.peers == 1
+    assert math.isclose(allp.gbps, 7.0) and math.isclose(allp.per_link_gbps, 1.0)
+    assert math.isclose(one.gbps, 1.0)
+    assert "w256" not in allp.roof.label
+
+
+def test_summary_against_peaks():
+    """Per implementation at its largest message: wire rate over the fabric
+    peak, the best known rate and the nominal rate; busbw over the peak."""
+    import report
+    from measure import Record
+    from roofline import Peak, Roof
+
+    n = 4
+    small, big = 1 << 20, 1 << 24
+    t_small = _two_shot(n, small, ring=False, ratio=0.28125)
+    t_big = _two_shot(n, big, ring=False, ratio=0.28125)
+    records = [
+        Record("s", "fly", 10.0, "graph", t_small),
+        Record("s", "rccl", 20.0, "graph", t_small),
+        Record("b", "fly", 100.0, "graph", t_big),
+        Record("b", "rccl", 200.0, "graph", t_big),
+    ]
+    peak = Peak(n, "all_peers", 150.0, 3, Roof(1.0, (1.0,), "serial w64 U"))
+    peaks = {"all_peers": peak}
+    s = RoofSettings(link_gbps=64.0)
+    rows = report.summary(records, peaks, "xgmi", s)
+    fly, rccl = rows
+    assert fly["case"] == "b" and rccl["case"] == "b"
+    fly_wire = patterns.fabric_bytes_per_rank(t_big) / 100.0 / 1e3
+    rccl_wire = 1.5 * big / 200.0 / 1e3  # bf16, 2(N-1)/N
+    assert math.isclose(fly["wire GB/s per rank"], fly_wire)
+    assert math.isclose(rccl["wire GB/s per rank"], rccl_wire)
+    assert math.isclose(fly["wire/peak"], fly_wire / 150.0)
+    assert math.isclose(fly["wire/nominal"], fly_wire / (3 * 64.0))
+    best, where = report.best_known(records, peaks)
+    assert best == max(150.0, rccl_wire, fly_wire)
+    assert math.isclose(fly["wire/best known"], fly_wire / best)
+    assert math.isclose(fly["busbw/peak"], 1.5 * big / 100.0 / 1e3 / 150.0)
+    # The same per-rank peak is in every graded row.
+    (_, row) = report.grade(records, {}, {}, 150.0)
+    assert math.isclose(row["op wire/peak"], fly_wire / 150.0)
+    assert math.isclose(row["rccl wire/peak"], rccl_wire / 150.0)
+    # Nominal: N - 1 links on xGMI, one on PCIe, none when unknown.
+    assert report.nominal_gbps("xgmi", 8, s) == 7 * 64.0
+    assert report.nominal_gbps("pcie", 8, s) == 64.0
+    assert math.isnan(report.nominal_gbps("unknown", 8, s))
+    assert math.isnan(report.nominal_gbps("xgmi", 8, DEFAULT))
+    lines = report.peak_lines(records, peaks, "xgmi", s)
+    assert lines[0] == "- link: xgmi, 4 ranks"
+    assert "150.0 GB/s (50.0 per link" in lines[1]
+    assert "not measured" in lines[2]
+    assert "nominal per rank: 192.0 GB/s" in lines[-1]
 
 
 def test_find_binary_respects_env(tmp_path=None):
