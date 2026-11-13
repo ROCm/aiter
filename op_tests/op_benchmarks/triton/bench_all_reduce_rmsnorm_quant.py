@@ -1,8 +1,8 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
 """Gluon all-reduce + add + RMSNorm against RCCL + add_rmsnorm, CAR + add_rmsnorm
-and the aiter fused CAR on 4 gfx1250 GPUs. gluon_fp8_token has the per-token quant.
-The time is the slowest rank, in a HIP graph."""
+and the aiter fused CAR on 4 gfx1250 GPUs. The time is the slowest rank, in a HIP
+graph."""
 
 import multiprocessing as mp
 
