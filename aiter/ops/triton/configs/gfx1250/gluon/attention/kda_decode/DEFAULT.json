@@ -1,4 +1,12 @@
 {
+  "writeback_decode": {
+    "BV": 32,
+    "CH": 16,
+    "SK": 16,
+    "num_warps": 2,
+    "num_buffers": 1,
+    "use_writeback_decode": true
+  },
   "fused": {
     "BV": 128,
     "SK": 16,
