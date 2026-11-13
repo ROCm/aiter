@@ -35,6 +35,10 @@ The one-shot window may overlap the mesh and the ring windows:
 ``QuickAllReduce`` runs before ``CustomAllreduce``, and with quantization on,
 the mesh and the ring take their payloads first.
 
+``SP_INT4_WINDOWS`` is the same kind of decision for the INT4 sequence-parallel
+reduce-scatter / all-gather: one ``Window`` per ``(arch, link, world_size)``, and
+no row means those collectives do not run INT4 there.
+
 ``resolve_family_policy`` gives the policy for a given rank: the table row for the
 host's arch and link, with the ``AITER_FLY_AR_<ALG>_{MIN,MAX}_BYTES``
 overrides applied.
@@ -396,6 +400,31 @@ def _index(rows):
 
 
 _POLICY_BY_KEY = _index(FAMILY_POLICIES)
+
+
+# Level 1b: sequence-parallel windows
+# ===================================
+#
+# The payload sizes at which the INT4 sequence-parallel reduce-scatter and
+# all-gather (``aiter.dist.device_communicators.sp_collectives``) replace the
+# caller's exact collective, keyed ``(arch, link, world_size)``. The payload is
+# the full ``[world_size * rows, H]`` tensor (the reduce-scatter input, the
+# all-gather output), without the padding to whole tiles; ``min`` is inclusive
+# and ``max`` exclusive, as above. A missing row disables them. There is no
+# environment override.
+#
+#   gfx950 / xGMI / TP2  [8 MiB, inf) -- the lower bound the INT4 path was
+#       checked against end to end (GSM8K) on MI355X TP2. Below it the INT4
+#       crossover has not been swept and the accuracy has not been signed off.
+SP_INT4_WINDOWS: dict[tuple[str, str, int], Window] = {
+    ("gfx950", "xgmi", 2): Window(8 * MiB, None),
+}
+
+
+def sp_int4_window(*, arch: str | None, link: str, world_size: int) -> Window | None:
+    """The INT4 sequence-parallel window of *(arch, link, world_size)*, or None
+    when this platform has none."""
+    return SP_INT4_WINDOWS.get((arch, link, int(world_size)))
 
 
 # Level 2: configuration ladders
