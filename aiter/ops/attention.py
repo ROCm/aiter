@@ -2401,6 +2401,46 @@ get_mla_decode_shape_support.cache_clear = (  # type: ignore[attr-defined]
     _get_mla_decode_shape_support_cached.cache_clear
 )
 
+# Q head counts the MLA decode kernels are built for; a query can be padded up
+# to one of them.
+_MLA_DECODE_KERNEL_HEAD_COUNTS = (16, 32, 64, 96, 128)
+
+
+def get_mla_decode_num_heads(
+    num_heads: int,
+    max_seqlen_qo: int,
+    q_dtype: torch.dtype,
+    kv_dtype: torch.dtype,
+    **kwargs,
+) -> int | None:
+    """The fewest Q heads, at least num_heads, that mla_decode_fwd runs for a decode.
+
+    For a caller that can pad its query heads (a DCP gather pads with zeros):
+    num_heads itself and each kernel head count above it are tried in order,
+    each through get_mla_decode_shape_support with the same arguments, and the
+    first that runs is returned. A head count runs when its kernel is known to
+    exist (supported is True), or when it takes a JIT route that has no
+    availability table and no asm (supported is None). A folded PS1 route, a
+    head count the planner or reducer rejects, and an asm route whose table
+    has no kernel or could not be queried do not run. None when no head count
+    up to 128 runs.
+
+    kwargs are get_mla_decode_shape_support's keywords and describe the call
+    the caller will make, e.g. return_lse, cp_world_size and cp_round_robin
+    for a DCP decode.
+    """
+    for heads in sorted(
+        {num_heads, *(n for n in _MLA_DECODE_KERNEL_HEAD_COUNTS if n > num_heads)}
+    ):
+        s = get_mla_decode_shape_support(
+            heads, max_seqlen_qo, q_dtype, kv_dtype, **kwargs
+        )
+        if s.supported or (
+            s.supported is None and s.asm_status is MlaAsmStatus.NOT_ASM
+        ):
+            return heads
+    return None
+
 
 @compile_ops("module_mla_metadata")
 def mla_metadata_cluster_multiplier_v1(

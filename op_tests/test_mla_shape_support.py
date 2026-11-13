@@ -19,6 +19,7 @@ from aiter.ops.attention import (
     _mla_decode_head_plan,
     _mla_decode_launch_plan,
     decode_update_mla_metadata_v1,
+    get_mla_decode_num_heads,
     get_mla_decode_shape_support,
     mla_decode_asm_query,
 )
@@ -213,6 +214,50 @@ def test_gfx1250_flydsl_ps1_backend(monkeypatch):
     assert support(128, 1, flydsl_ps1=True).backend is MlaBackend.FLYDSL_PS1
     s = support(64, 1, flydsl_ps1=True, fast_mode=False)
     assert (s.backend, s.fold_factor, s.supported) == (MlaBackend.FLYDSL_PS1, 4, False)
+
+
+def test_decode_num_heads(monkeypatch):
+    monkeypatch.delenv("AITER_MLA_DECODE_PS1_ASM", raising=False)
+    bf16 = torch.bfloat16
+
+    def heads(n, msq, **kw):
+        # A gfx1250 DCP decode: round-robin KV shards, LSE for the merge.
+        return get_mla_decode_num_heads(
+            *(n, msq, bf16, bf16),
+            arch="gfx1250",
+            enable_experimental=False,
+            flydsl_ps1=True,
+            return_lse=True,
+            cp_world_size=8,
+            cp_round_robin=True,
+            **kw,
+        )
+
+    # A head count that runs is kept; one that does not pads to the next that
+    # does: 16 heads take a multi-token query on PS1 only up to qlen 4, 32/64
+    # up to qlen 8 as several qo tiles, 96 at any qlen.
+    assert [heads(16, q) for q in (1, 4, 5)] == [16, 16, 32]
+    assert [heads(64, q) for q in (2, 8, 9)] == [64, 64, 96]
+    assert heads(65, 1) == 96
+    # A folded PS1 route does not run: fast_mode=False folds 64 heads by 4 and
+    # 96 by 6, so the first unfolded count is 128.
+    assert heads(64, 1, fast_mode=False) == 128
+    # Every count it returns is one the shape query says runs.
+    for n, q in itertools.product((1, 16, 33, 64, 96), (1, 3, 8)):
+        h = heads(n, q)
+        s = get_mla_decode_shape_support(
+            h,
+            q,
+            bf16,
+            bf16,
+            arch="gfx1250",
+            enable_experimental=False,
+            flydsl_ps1=True,
+            return_lse=True,
+            cp_world_size=8,
+            cp_round_robin=True,
+        )
+        assert h >= n and s.supported is not False, (n, q, h, s.reasons)
 
 
 def test_ps1_asm_cprr_kernel(monkeypatch):
