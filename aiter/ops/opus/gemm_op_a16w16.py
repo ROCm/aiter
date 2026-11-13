@@ -381,6 +381,150 @@ def _launch_a16w16_bmm(
     )
 
 
+
+# ---------------------------------------------------------------------------
+# Direction APIs (NT / NN / TT / TN) of the gfx950 4-wave kids
+# ---------------------------------------------------------------------------
+# Logical XQ [M,K] / WQ [N,K] (or batch-first [B,M,K] / [B,N,K]); the physical
+# direction is expressed by the strides, as in the MXFP8 blockscale direction
+# APIs:
+#   NT: XQ (K,1)  WQ (K,1)      NN: XQ (K,1)  WQ (1,N)
+#   TT: XQ (1,M)  WQ (K,1)      TN: XQ (1,M)  WQ (1,N)
+# One 4-wave kid carries every direction (the launcher picks the image from the
+# strides), so the API checks that the tensors match its direction and that the
+# kid can take them; the tuned CSV stays direction-agnostic (kid + splitK).
+_A16W16_DIRECTIONS = {
+    "NT": (False, False),
+    "NN": (False, True),
+    "TT": (True, False),
+    "TN": (True, True),
+}
+
+
+def _a16w16_operand_transposed(tensor: torch.Tensor, rows: int, K: int) -> bool | None:
+    """True if stored [K, rows] (rows contiguous), False if [rows, K], None if
+    either reading is valid (rows == 1)."""
+    stride_row, stride_k = tensor.stride()[-2:]
+    if rows == 1:
+        return None
+    if stride_k == 1 and stride_row >= K:
+        return False
+    if stride_row == 1 and stride_k >= rows:
+        return True
+    raise ValueError(
+        f"opus_gemm_a16w16: operand strides {tuple(tensor.stride())} are neither "
+        f"K-contiguous nor row-contiguous for shape {tuple(tensor.shape)}"
+    )
+
+
+def _launch_a16w16_direction(
+    XQ: torch.Tensor,
+    WQ: torch.Tensor,
+    Y: torch.Tensor,
+    bias: torch.Tensor | None,
+    *,
+    kid: int,
+    split_k: int,
+    workspace: torch.Tensor | None,
+    _direction: str,
+) -> torch.Tensor:
+    if XQ.dim() not in (2, 3) or XQ.dim() != WQ.dim() or XQ.dim() != Y.dim():
+        raise ValueError(
+            f"opus_gemm_a16w16_{_direction.lower()} expects 2D XQ/WQ/Y or "
+            "batch-first 3D XQ/WQ/Y"
+        )
+    M, K = XQ.shape[-2:]
+    N = WQ.shape[-2]
+    a_t, b_t = _A16W16_DIRECTIONS[_direction]
+    got = (
+        _a16w16_operand_transposed(XQ, M, K),
+        _a16w16_operand_transposed(WQ, N, K),
+    )
+    if (got[0] is not None and got[0] != a_t) or (got[1] is not None and got[1] != b_t):
+        want_x = "(1,M)" if a_t else "(K,1)"
+        want_w = "(1,N)" if b_t else "(K,1)"
+        raise ValueError(
+            f"opus_gemm_a16w16_{_direction.lower()} expects XQ strides {want_x} and "
+            f"WQ strides {want_w} (last two dims); got XQ.stride()="
+            f"{tuple(XQ.stride())}, WQ.stride()={tuple(WQ.stride())}"
+        )
+    if _direction != "NT":
+        arch, cu_num = _device_arch_and_cu(XQ.device)
+        if not _kid_takes_mn_major_operands(arch, cu_num, int(kid)):
+            raise ValueError(
+                f"opus_gemm_a16w16_{_direction.lower()} needs a gfx950 a16w16 4-wave "
+                f"kid (tags {sorted(GFX950_4WAVE_TAGS)}); kid {kid} only takes NT"
+            )
+    launch = _launch_a16w16_gemm if XQ.dim() == 2 else _launch_a16w16_bmm
+    return launch(XQ, WQ, Y, bias, kid=kid, split_k=split_k, workspace=workspace)
+
+
+def opus_gemm_a16w16_nt(
+    XQ: torch.Tensor,
+    WQ: torch.Tensor,
+    Y: torch.Tensor,
+    bias: torch.Tensor | None = None,
+    *,
+    kid: int,
+    split_k: int = 0,
+    workspace: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """A16W16 NT: XQ [M,K] strides (K,1), WQ [N,K] strides (K,1)."""
+    return _launch_a16w16_direction(
+        XQ, WQ, Y, bias, kid=kid, split_k=split_k, workspace=workspace, _direction="NT"
+    )
+
+
+def opus_gemm_a16w16_nn(
+    XQ: torch.Tensor,
+    WQ: torch.Tensor,
+    Y: torch.Tensor,
+    bias: torch.Tensor | None = None,
+    *,
+    kid: int,
+    split_k: int = 0,
+    workspace: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """A16W16 NN: XQ [M,K] strides (K,1), WQ the [N,K] view of a [K,N] weight
+    (strides (1,N)); 4-wave kids only."""
+    return _launch_a16w16_direction(
+        XQ, WQ, Y, bias, kid=kid, split_k=split_k, workspace=workspace, _direction="NN"
+    )
+
+
+def opus_gemm_a16w16_tt(
+    XQ: torch.Tensor,
+    WQ: torch.Tensor,
+    Y: torch.Tensor,
+    bias: torch.Tensor | None = None,
+    *,
+    kid: int,
+    split_k: int = 0,
+    workspace: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """A16W16 TT: XQ the [M,K] view of a [K,M] activation (strides (1,M)),
+    WQ [N,K] strides (K,1); 4-wave kids only."""
+    return _launch_a16w16_direction(
+        XQ, WQ, Y, bias, kid=kid, split_k=split_k, workspace=workspace, _direction="TT"
+    )
+
+
+def opus_gemm_a16w16_tn(
+    XQ: torch.Tensor,
+    WQ: torch.Tensor,
+    Y: torch.Tensor,
+    bias: torch.Tensor | None = None,
+    *,
+    kid: int,
+    split_k: int = 0,
+    workspace: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """A16W16 TN: XQ strides (1,M), WQ strides (1,N) (views of [K,M] / [K,N]
+    storage); 4-wave kids only."""
+    return _launch_a16w16_direction(
+        XQ, WQ, Y, bias, kid=kid, split_k=split_k, workspace=workspace, _direction="TN"
+    )
+
 def opus_gemm_a16w16_tune(
     XQ: torch.Tensor,
     WQ: torch.Tensor,
@@ -591,4 +735,11 @@ def gemm_a16w16_opus(
     return _launch_a16w16_bmm(XQ, WQ, Y, kid=kid, bias=bias, split_k=split_k)
 
 
-__all__ = ["gemm_a16w16_opus", "opus_gemm_a16w16_tune"]
+__all__ = [
+    "gemm_a16w16_opus",
+    "opus_gemm_a16w16_nn",
+    "opus_gemm_a16w16_nt",
+    "opus_gemm_a16w16_tn",
+    "opus_gemm_a16w16_tt",
+    "opus_gemm_a16w16_tune",
+]
