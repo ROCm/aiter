@@ -34,11 +34,10 @@ import flydsl.compiler as flyc
 import flydsl.expr as fx
 from flydsl._mlir import ir
 from flydsl._mlir.dialects import llvm as _llvm
-from flydsl.expr import arith
+from flydsl.expr import range_constexpr
 from flydsl.expr.typing import T
 
-from .buffer_ops import buffer_store, create_buffer_resource_from_addr
-from .tensor_shim import _run_compiled
+from .tensor_shim import _run_compiled, buf_copy_store, ptr_arg, ptr_buf_tensor
 
 PROBERS = 8
 NGRAN = 16
@@ -62,17 +61,20 @@ def launch_rotation():
     which the probe's phase absorbs. Read from HW_ID2, it is the same for every
     workgroup of a launch.
     """
-    imm = arith.unwrap(fx.Int32(_HW_ID2_QUEUE_PIPE))
+    # Raw: neither fx nor the ROCDL dialect of the pinned FlyDSL has s_getreg.
+    imm = fx.Int32(_HW_ID2_QUEUE_PIPE).ir_value()
     v = fx.Int32(_llvm.call_intrinsic(T.i32, "llvm.amdgcn.s.getreg", [imm], [], []))
-    return (fx.Int32(4) - (v >> fx.Int32(4)) - (v << fx.Int32(2))) & fx.Int32(7)
+    return (fx.Int32(4) - (v >> 4) - (v << 2)) & 7
 
 
 def _timed_load(addr):
     """Realtime ticks around one global load at ``addr`` (i64), waited in place."""
+    # Raw: the pinned FlyDSL has no realtime-counter read, and only one asm block
+    # keeps the load and both waits between the two reads.
     res = ir.Type.parse("!llvm.struct<(i64, i64, i32)>")
     r = _llvm.inline_asm(
         res,
-        [arith.unwrap(fx.Int64(addr))],
+        [addr.ir_value()],
         "s_sendmsg_rtn_b64 $0, sendmsg(MSG_RTN_GET_REALTIME)\n"
         "s_wait_kmcnt 0\n"
         "global_load_b32 $2, $3, off\n"
@@ -84,13 +86,13 @@ def _timed_load(addr):
     )
     t0 = fx.Int64(_llvm.extractvalue(T.i64, r, [0]))
     t1 = fx.Int64(_llvm.extractvalue(T.i64, r, [1]))
-    return fx.Int32(arith.trunci(T.i32, arith.unwrap(t1 - t0)))
+    return (t1 - t0).to(fx.Int32)
 
 
 @flyc.jit
 def _launch_probe(
     base: fx.Int64,
-    lat: fx.Int64,
+    lat: fx.Pointer,
     npg: fx.Int32,
     line: fx.Int32,
     win0: fx.Int32,
@@ -100,44 +102,31 @@ def _launch_probe(
     # The cache key follows only this body's globals, not the kernel's below.
     _ = launch_rotation
 
+    # ``base`` is an address, not a tensor: the windows may read allocation bytes
+    # outside the probed tensor.
     @flyc.kernel(name="iod_loc_probe", known_block_size=[32, 1, 1])
     def kernel(
         base: fx.Int64,
-        lat: fx.Int64,
+        lat: fx.Pointer,
         npg: fx.Int32,
         line: fx.Int32,
         win0: fx.Int32,
         win1: fx.Int32,
     ):
-        bid = fx.Int32(fx.block_idx.x)
-        tid = fx.Int32(fx.thread_idx.x)
-        if tid == fx.Int32(0):
-            rsrc = create_buffer_resource_from_addr(arith.unwrap(lat))
+        bid = fx.block_idx.x
+        tid = fx.thread_idx.x
+        if tid == 0:
+            out = ptr_buf_tensor(lat, fx.Int32)
             # A 128 B line per (pass, prober): cold, and never shared.
-            slot = (line * fx.Int32(PROBERS) + bid) & fx.Int32(127)
-            lo = fx.Int64(slot) * fx.Int64(128)
+            slot = (line * PROBERS + bid) & 127
+            lo = fx.Int64(slot) * 128
             for p in range(fx.Int32(0), npg, fx.Int32(1)):
-                win = (p == fx.Int32(0)).select(
-                    win0, (p == npg - fx.Int32(1)).select(win1, fx.Int32(0))
-                )
-                for g in range(fx.Int32(0), fx.Int32(NGRAN), fx.Int32(1)):
-                    off = (
-                        (fx.Int64(p) << fx.Int64(21))
-                        + fx.Int64(win)
-                        + fx.Int64(g) * fx.Int64(16384)
-                        + lo
-                    )
-                    t = _timed_load(base + off)
-                    buffer_store(
-                        arith.unwrap(t),
-                        rsrc,
-                        arith.unwrap((bid * npg + p) * fx.Int32(NGRAN) + g),
-                    )
-            buffer_store(
-                arith.unwrap(launch_rotation()),
-                rsrc,
-                arith.unwrap(fx.Int32(PROBERS * NGRAN) * npg + bid),
-            )
+                win = (p == 0).select(win0, (p == npg - 1).select(win1, fx.Int32(0)))
+                page = base + (fx.Int64(p) << 21) + fx.Int64(win) + lo
+                for g in range_constexpr(NGRAN):
+                    t = _timed_load(page + g * 16384)
+                    buf_copy_store(out, (bid * npg + p) * NGRAN + g, t)
+            buf_copy_store(out, PROBERS * NGRAN * npg + bid, launch_rotation())
 
     kernel(base, lat, npg, line, win0, win1).launch(
         grid=(PROBERS, 1, 1), block=(32, 1, 1), stream=stream
@@ -211,7 +200,7 @@ def probe_phase(buf: torch.Tensor, npass: int = 4, span=None):
         _run_compiled(
             _launch_probe,
             base,
-            lat.data_ptr(),
+            ptr_arg(lat),
             npg,
             line,
             win0,
