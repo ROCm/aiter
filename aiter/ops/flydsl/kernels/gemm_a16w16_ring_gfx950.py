@@ -3,27 +3,28 @@
 
 """Dense BF16/FP16 GEMM for gfx950 at one wave per SIMD: C[M, N] = A[M, K] @ W[N, K].T.
 
-Four waves of 64x96 per 128x192x64 tile (a 256-CU grid at M=16384, N=384 has exactly one tile per CU),
-fed by an S-stage direct-to-LDS ring with one barrier per K tile. Each K tile is two 32-wide MFMA chunks;
-a chunk's MFMAs run under the LDS reads of the next chunk and under half of a later tile's DMA, placed by a
-sched_group_barrier plan derived from the tile's instruction counts:
+Four waves of 64x96 per 128x192x64 tile (a 256-CU grid at M=16384, N=384 has exactly one tile per
+CU), fed by an S-stage direct-to-LDS ring with one barrier per K tile. Each K tile is two 32-wide
+MFMA chunks; a chunk's MFMAs run under the LDS reads of the next chunk and under half of a later
+tile's DMA, placed by a sched_group_barrier plan derived from the tile's instruction counts:
 
-- tile t's DMA starts right after tile t-S's barrier, when its stage is free, and finishes in the first
-  chunk of tile t-S+1, so ten DMA issues spread over two chunks instead of bunching behind one (a lone
-  wave stalls on every DMA issue the memory path cannot take yet);
-- LDS reads go first in each chunk: without alias information a DMA cannot be scheduled above an earlier
-  LDS read, and a plan that asks for it is dropped as a whole;
-- the K tile reaches the DMA through the buffer's scalar offset, so the loop has no address VALU.
+- tile t's DMA starts right after tile t-S's barrier, when its stage is free, and finishes in the
+  first chunk of tile t-S+1, so the DMA issues spread over two chunks instead of bunching behind
+  one (a lone wave stalls on every DMA issue the memory path cannot take yet);
+- LDS reads go first in each chunk: without alias information a DMA cannot be scheduled above an
+  earlier LDS read, and a plan that asks for it is dropped as a whole.
 
 N and K are compile-time constants; M is dynamic. There is no split-K, bias or fp32 output.
+
+``rocdl.sched_barrier`` and ``rocdl.s_barrier`` are not in FlyDSL 0.5.0's stable exports. The only
+stable barrier, ``fx.gpu.barrier``, adds release/acquire fences, which the pipeline's raw barriers
+avoid.
 """
 
 import functools
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
-import torch
-from flydsl._mlir import ir
 from flydsl.expr import const_expr, gpu, range_constexpr, rocdl
 
 from .gemm_a16w16_gfx950 import (
@@ -34,12 +35,11 @@ from .gemm_a16w16_gfx950 import (
     make_gemm_ab_load_context,
 )
 from .gemm_a16w16_gfx950_utils import (
-    GFX950_DMA_BYTES,
     BlockSwizzle,
     get_wave_lds_offset,
     swizzled_col_idx,
 )
-from .kernels_common import run_cached, set_slp_vectorize_once_used
+from .kernels_common import set_slp_vectorize_once_used
 from .tensor_shim import (
     AITER_FLYDSL_KERNARG_PRELOAD,
     AITER_FLYDSL_KERNARG_PRELOAD_COUNT,
@@ -53,7 +53,8 @@ RING_TILE = {
     "m_waves": 2,
     "n_waves": 2,
 }
-# Of each chunk's MFMA slots, the LDS reads take the first READ_SPAN_8THS / 8; the DMA issues share the rest.
+# Of each chunk's MFMA slots, the LDS reads take the first READ_SPAN_8THS / 8 and the DMA issues
+# share the rest (4 measured best of 2, 3, 4, 6 and 8 at 16384x384x5120).
 READ_SPAN_8THS = 4
 
 
@@ -87,18 +88,12 @@ class GemmA16W16RingParam:
     ldg_b_iters: fx.Constexpr[int]
 
 
-def ring_config_error(n, k, block_m, block_n, block_k, stages, m_waves, n_waves):
-    """None when the ring kernel supports this N, K and tile, else the reason."""
+def ring_tile_error(block_m, block_n, block_k, stages, m_waves, n_waves):
+    """None when the ring kernel supports this tile on any N and K it accepts, else the reason."""
     if block_k != 64:
         return "block_k must be 64 (two 32-wide MFMA chunks per K tile)"
     if stages < 2:
         return "stages must be at least 2"
-    if k % block_k or k // block_k < stages + 1:
-        return (
-            f"K={k} must be a multiple of {block_k} with at least {stages + 1} K tiles"
-        )
-    if n % 8:
-        return f"N={n} must be a multiple of 8"
     try:
         make_gemm_a16w16_gfx950_param(
             GEMM_A16W16_DTYPE_BF16,
@@ -116,6 +111,17 @@ def ring_config_error(n, k, block_m, block_n, block_k, stages, m_waves, n_waves)
     return None
 
 
+def ring_shape_error(n, k, block_k, stages):
+    """None when N and K fit the ring pipeline, else the reason."""
+    if k % block_k or k // block_k < stages + 1:
+        return (
+            f"K={k} must be a multiple of {block_k} with at least {stages + 1} K tiles"
+        )
+    if n % 8:
+        return f"N={n} must be a multiple of 8"
+    return None
+
+
 @functools.cache
 def make_gemm_a16w16_ring_param(
     in_dtype_id: int,
@@ -129,7 +135,9 @@ def make_gemm_a16w16_ring_param(
     n_waves: int,
     group_m: int,
 ) -> GemmA16W16RingParam:
-    error = ring_config_error(n, k, block_m, block_n, block_k, stages, m_waves, n_waves)
+    error = ring_tile_error(
+        block_m, block_n, block_k, stages, m_waves, n_waves
+    ) or ring_shape_error(n, k, block_k, stages)
     if error is not None:
         raise ValueError(f"unsupported gemm_a16w16_ring configuration: {error}")
     base = make_gemm_a16w16_gfx950_param(
@@ -178,8 +186,7 @@ def make_gemm_a16w16_ring_kernel_name(param: GemmA16W16RingParam):
     )
 
 
-@flyc.kernel
-def gemm_a16w16_ring_gfx950_kernel(
+def gemm_a16w16_ring_gfx950_body(
     out: fx.Tensor,
     a: fx.Tensor,
     b: fx.Tensor,
@@ -195,8 +202,7 @@ def gemm_a16w16_ring_gfx950_kernel(
     stages = param.stages
     block_threads = param.block_threads
     vec = param.cshuffle_r2g_vec_size
-    elem_bytes = param.in_data_bytes
-    dma_vec = param.async_load_bytes // elem_bytes
+    dma_vec = param.async_load_bytes // param.in_data_bytes
     k_tiles = k // block_k
     wave_m = block_m // param.m_waves // param.mma_m
     wave_n = block_n // param.n_waves // param.mma_n
@@ -255,16 +261,24 @@ def gemm_a16w16_ring_gfx950_kernel(
     frag_C.fill(0.0)
 
     wave_lds_offset = (
-        fx.Int32(get_wave_lds_offset(tid, param.async_load_bytes)) // elem_bytes
+        fx.Int32(get_wave_lds_offset(tid, param.async_load_bytes))
+        // param.in_data_bytes
     )
-    # (LDS base, global buffer, LDS layout, tile rows, row bound, first row, DMA issues): B's issues first.
+    dma_layout = fx.make_layout(dma_vec, 1)
+    # (LDS base, global buffer, LDS layout, tile rows, row bound, first row, DMA issues): B first.
     operands = (
         (smem_b, b_buf, b_lds_layout, block_n, n, block_n_offset, param.ldg_b_iters),
         (smem_a, a_buf, a_lds_layout, block_m, m, block_m_offset, param.ldg_a_iters),
     )
 
     def dma(k_tile, stage, lo, hi):
-        """DMA issues [lo, hi) of one K tile into an LDS stage."""
+        """DMA issues [lo, hi) of one K tile into an LDS stage.
+
+        The direct-to-LDS copy writes lane i's 16 bytes at the wave's LDS base + 16 i, so the
+        lane -> (row, column) map is the linear one of `async_load_to_lds`: the row is the global
+        thread id over the threads per row, and the XOR swizzle moves the global column instead.
+        Rows past the tensor (a partial M or N tile) read row 0; their results are never stored.
+        """
         slot = 0
         for lds_base, buf, lds_layout, rows, bound, row_offset, iters in operands:
             for i in range_constexpr(iters):
@@ -274,21 +288,19 @@ def gemm_a16w16_ring_gfx950_kernel(
                     col = gtid % param.ldg_x_threads * dma_vec
                     grow = row_offset + row
                     grow = (grow < bound).select(grow, 0)
-                    col = swizzled_col_idx(row, col, lds_layout, block_k)
+                    gk = k_tile * block_k + swizzled_col_idx(
+                        row, col, lds_layout, block_k
+                    )
                     lds_ptr = (
                         lds_base
                         + stage * rows * block_k
                         + wave_lds_offset
                         + i * block_threads * dma_vec
                     )
-                    rocdl.raw_ptr_buffer_load_async_lds(
-                        fx.rocdl.get_buffer_rsrc(fx.get_iter(buf)),
-                        fx.to_llvm_ptr(lds_ptr),
-                        fx.Int32(GFX950_DMA_BYTES).ir_value(),
-                        fx.Int32((grow * k + col) * elem_bytes).ir_value(),
-                        fx.Int32(k_tile * block_k * elem_bytes).ir_value(),
-                        fx.Int32(0).ir_value(),
-                        aux=ir.IntegerAttr.get(ir.IntegerType.get_signless(32), 0),
+                    fx.copy(
+                        ctx.async_g2s_copy_atom,
+                        fx.make_view(fx.get_iter(buf) + grow * k + gk, dma_layout),
+                        fx.make_view(lds_ptr, dma_layout),
                     )
                 slot += 1
 
@@ -394,6 +406,8 @@ def gemm_a16w16_ring_gfx950_kernel(
         sC[fx.get_scalar(thr_cRow[i]), fx.get_scalar(thr_cCol[i])] = frag_C_out[i]
     gpu.barrier()
 
+    # Row-major vectors of `vec` elements, consecutive threads along a row, as the generic gfx950
+    # kernel stores C; N % vec == 0, so the bounds test covers whole vectors.
     x_threads = block_n // vec
     vectors = block_m * block_n // vec
     for i in range_constexpr((vectors + block_threads - 1) // block_threads):
@@ -440,9 +454,11 @@ def gemm_a16w16_ring_gfx950(
     )
     num_pid_m = (m + param.block_m - 1) // param.block_m
     num_pid_n = (param.n + param.block_n - 1) // param.block_n
-    kernel = gemm_a16w16_ring_gfx950_kernel
-    kernel._known_block_size = [param.block_threads, 1, 1]
-    kernel._func.__name__ = make_gemm_a16w16_ring_kernel_name(param)
+    kernel = flyc.kernel(
+        gemm_a16w16_ring_gfx950_body,
+        name=make_gemm_a16w16_ring_kernel_name(param),
+        known_block_size=[param.block_threads, 1, 1],
+    )
     kernel(out, a, b, m, tiled_mma, param).launch(
         grid=(num_pid_m * num_pid_n, 1, 1),
         block=(param.block_threads, 1, 1),
@@ -457,65 +473,3 @@ gemm_a16w16_ring_gfx950.compile_hints = {
     },
 }
 set_slp_vectorize_once_used(gemm_a16w16_ring_gfx950, False)
-
-
-def gemm_a16w16_ring(
-    a: torch.Tensor,
-    w: torch.Tensor,
-    out: torch.Tensor | None = None,
-    *,
-    block_m: int = RING_TILE["block_m"],
-    block_n: int = RING_TILE["block_n"],
-    block_k: int = RING_TILE["block_k"],
-    stages: int = RING_TILE["stages"],
-    m_waves: int = RING_TILE["m_waves"],
-    n_waves: int = RING_TILE["n_waves"],
-    group_m: int = 1,
-    stream: torch.cuda.Stream | None = None,
-) -> torch.Tensor:
-    """C[M, N] = A[M, K] @ W[N, K].T for contiguous BF16 or FP16 A and W; C has the input dtype.
-
-    K must be a multiple of 64 with at least ``stages + 1`` K tiles and N a multiple of 8. Each
-    distinct (N, K, tile) compiles its own kernel.
-    """
-    if a.dtype not in (torch.bfloat16, torch.float16) or w.dtype != a.dtype:
-        raise ValueError("A and W must both be bfloat16 or both float16")
-    if a.ndim != 2 or w.ndim != 2 or not a.is_contiguous() or not w.is_contiguous():
-        raise ValueError("A and W must be contiguous 2-D tensors")
-    for t in (a, w):
-        if t.data_ptr() % GFX950_DMA_BYTES:
-            raise ValueError("A and W must be 16-byte aligned")
-    m, k = a.shape
-    n = w.shape[0]
-    if w.shape[1] != k:
-        raise ValueError(f"shape mismatch: A {tuple(a.shape)}, W {tuple(w.shape)}")
-    if out is None:
-        out = torch.empty((m, n), dtype=a.dtype, device=a.device)
-    elif out.shape != (m, n) or out.dtype != a.dtype or not out.is_contiguous():
-        raise ValueError("out must be a contiguous [M, N] tensor of the input dtype")
-    if m == 0:
-        return out
-    in_dtype_id = (
-        GEMM_A16W16_DTYPE_FP16 if a.dtype is torch.float16 else GEMM_A16W16_DTYPE_BF16
-    )
-    param = make_gemm_a16w16_ring_param(
-        in_dtype_id, n, k, block_m, block_n, block_k, stages, m_waves, n_waves, group_m
-    )
-    if stream is None:
-        stream = torch.cuda.current_stream(a.device)
-    # The kernel reads B as a logical [K, N]: W[N, K] is its column-major form.
-    dispatch_args = (
-        flyc.from_dlpack(out).mark_layout_dynamic(leading_dim=1),
-        flyc.from_dlpack(a).mark_layout_dynamic(leading_dim=1),
-        flyc.from_dlpack(w.t()).mark_layout_dynamic(leading_dim=0),
-        param,
-        stream,
-    )
-    run_cached(
-        gemm_a16w16_ring_gfx950,
-        *dispatch_args,
-        constexpr_param=param,
-        compiler=flyc.compile,
-        dispatch_args=dispatch_args,
-    )
-    return out

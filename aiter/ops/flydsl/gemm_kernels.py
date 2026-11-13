@@ -18,11 +18,12 @@ from aiter.utility.graph_alloc import capture_scoped_cache, persistent_alloc
 
 from .gemm_a16w16_band import band_stream_name_supported, gemm_a16w16_band
 from .gemm_a16w16_gfx1250 import gemm_a16w16 as gemm_a16w16_gfx1250
+from .gemm_a16w16_ring import gemm_a16w16_ring
 from .kernels.gemm_a16w16_gfx950 import (
     SPLIT_K_SEMAPHORE_MAX_LEN,
     gemm_a16w16,
 )
-from .kernels.gemm_a16w16_ring_gfx950 import gemm_a16w16_ring, ring_config_error
+from .kernels.gemm_a16w16_ring_gfx950 import ring_tile_error
 from .kernels.gemm_a16w16_skinny_gfx950 import gemm_a16w16_skinny
 from .kernels.tensor_shim import _run_compiled
 
@@ -140,14 +141,6 @@ def get_flydsl_hgemm_kernel_params(name: str) -> dict | None:
         match.group("target_gfx") != "gfx950" or policy in (SKINNY_POLICY, RING_POLICY)
     ):
         return None
-    if policy == RING_POLICY and (
-        out_dtype != dtype
-        or match.group("split_k") != "1"
-        or match.group("k_waves") != "1"
-        or match.group("has_bias") != "0"
-        or match.group("target_gfx") != "gfx950"
-    ):
-        return None
     if policy == SKINNY_POLICY and (
         dtype != "bf16"
         or out_dtype != "bf16"
@@ -222,11 +215,12 @@ def get_flydsl_hgemm_kernel_params(name: str) -> dict | None:
     if policy == "bs" and not band_stream_name_supported(params):
         return None
     if policy == RING_POLICY and (
-        params["block_k"] != 64
-        or params["stages"] < 2
-        or ring_config_error(
-            512,
-            64 * (params["stages"] + 1),
+        out_dtype != dtype
+        or params["split_k"] != 1
+        or params["k_waves"] != 1
+        or params["has_bias"]
+        or params["target_gfx"] != "gfx950"
+        or ring_tile_error(
             params["block_m"],
             params["block_n"],
             params["block_k"],

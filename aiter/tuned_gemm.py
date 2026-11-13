@@ -680,18 +680,21 @@ def flydsl_gemm(
     ), "FlyDSL hgemm does not support scaling yet."
     flydsl_gemm_kernels = _get_flydsl_gemm_kernels()
     flydsl_config = _flydsl_hgemm_kernel_params(config["kernelName"])
-    skinny = flydsl_config["policy"] == flydsl_gemm_kernels.SKINNY_POLICY
+    # Skinny and ring kernels write only their input dtype and take no bias.
+    input_dtype_only = flydsl_config["policy"] in (
+        flydsl_gemm_kernels.SKINNY_POLICY,
+        flydsl_gemm_kernels.RING_POLICY,
+    )
     fused_bias = None
     if (
-        not skinny
+        not input_dtype_only
         and bias is not None
         and (otype is None or otype == inp.dtype)
         and bias.dtype == inp.dtype
     ):
         fused_bias = bias
-    if skinny or flydsl_config["policy"] in (
+    if input_dtype_only or flydsl_config["policy"] in (
         "bs",
-        flydsl_gemm_kernels.RING_POLICY,
         *flydsl_gemm_kernels.TDM_POLICIES,
     ):
         policy = flydsl_config["policy"]
@@ -714,7 +717,7 @@ def flydsl_gemm(
         k_stagger=flydsl_config["k_stagger"],
         b_non_temporal=flydsl_config["b_non_temporal"],
         policy=policy,
-        out_dtype=None if skinny else otype,
+        out_dtype=None if input_dtype_only else otype,
     )
 
     if bias is not None and fused_bias is None:
