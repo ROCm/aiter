@@ -3514,6 +3514,20 @@ def _stage2_scratch(slot, shape, dtype, device):
     return buf[:nbytes].view(dtype).view(shape)
 
 
+# Nontemporal loads speed up the FP8 route-row reduction only once the route
+# buffer outgrows the cache; on smaller buffers they are slower on gfx950.
+_STAGE2_FP8_REDUCE_STREAMING_MIN_MIB = int(
+    os.environ.get("AITER_FLYDSL_STAGE2_FP8_REDUCE_STREAMING_MIN_MIB", "192")
+)
+
+
+def _use_streaming_reduce_loads(route_out_nbytes: int, is_fp8_route: bool) -> bool:
+    """Whether the stage2 reduction reads its route rows with nontemporal loads."""
+    if not is_fp8_route:
+        return False
+    return route_out_nbytes > _STAGE2_FP8_REDUCE_STREAMING_MIN_MIB * 2**20
+
+
 def _flydsl_v2_stage2_wrapper(
     inter_states,
     w1,
@@ -3712,6 +3726,7 @@ def _flydsl_v2_stage2_wrapper(
             topk_weights=topk_weights if _defer_w else None,
             fp8_scale_blk=_fp8_scale_blk,
             fp8_pitch_align=_fp8_pitch_align,
+            streaming_loads=_use_streaming_reduce_loads(target.nbytes, _s2_fp8_inter),
         )
     return out
 
