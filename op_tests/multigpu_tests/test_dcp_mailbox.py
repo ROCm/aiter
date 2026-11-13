@@ -4,6 +4,7 @@
 """Eight ranks: FlyDSL DCP mailbox LSE combine and query gather."""
 
 import os
+import random
 import time
 import warnings
 
@@ -42,6 +43,26 @@ def _reference(parts, lses, base_e):
     w = exp(lse - g)
     w = torch.where(torch.isnan(w), 0.0, w)
     return (stacked * w[..., None]).sum(0).to(torch.bfloat16), g
+
+
+def _gathered_reference(out, lse, rank, world, hl, base_e):
+    """This rank's expected combine of every rank's ``out`` / ``lse``."""
+    go = [torch.empty_like(out) for _ in range(world)]
+    gl = [torch.empty_like(lse) for _ in range(world)]
+    dist.all_gather(go, out)
+    dist.all_gather(gl, lse)
+    sl = slice(rank * hl, (rank + 1) * hl)
+    return _reference([g[:, sl] for g in go], [g[:, sl] for g in gl], base_e)
+
+
+def _assert_rearmed(ws, group):
+    """Every mailbox word a launch wrote was reset to the sentinel in it."""
+    torch.cuda.synchronize()
+    dist.barrier(group=group.cpu_group)
+    lay = peer_layout(ws.ranks, ws.max_tokens, ws.heads, ws.dim)
+    region = ws.peers.bytes[: epoch_offset(lay)]
+    stale = int((region != 0xFF).sum().item())
+    assert stale == 0, f"{stale} mailbox bytes were not reset to the sentinel"
 
 
 def _row_empty(tokens, seq_lens, qsl):
@@ -135,6 +156,7 @@ def worker(rank, world, tokens):
                     assert "output device" in str(error)
                 else:
                     raise AssertionError("CPU row_counts must be rejected")
+            _assert_rearmed(cws, group)
             cws.close()
 
         dim = 512
@@ -242,6 +264,109 @@ def worker(rank, world, tokens):
         else:
             raise AssertionError("BF16 dim 576 gather must be rejected")
         bad_gws.close()
+
+        # Payloads equal to the sentinel (a 0xFFFF bf16 half, an all-ones fp32
+        # LSE) must still land. The debug build turns a lost one into a timeout.
+        nan_ws = CombineWorkspace(
+            group, torch.device("cuda"), hl, 128, max_tokens, debug=True
+        )
+        nan_out = torch.randn(
+            tokens, world * hl, 128, device="cuda", dtype=torch.bfloat16, generator=gen
+        )
+        nan_lse = torch.randn(
+            tokens, world * hl, device="cuda", dtype=torch.float32, generator=gen
+        )
+        nan_out.view(torch.int16)[0, :, 3] = -1
+        nan_out.view(torch.int16)[tokens - 1, ::2, 64:66] = -1
+        nan_lse.view(torch.int32)[tokens // 2, rank::world] = -1
+        for _ in range(3):
+            got = dcp_lse_combine(nan_ws, nan_out, nan_lse)
+            torch.cuda.synchronize()
+            exp, _ = _gathered_reference(nan_out, nan_lse, rank, world, hl, True)
+            torch.testing.assert_close(
+                got.float(), exp.float(), rtol=1e-2, atol=1e-2, equal_nan=True
+            )
+        _assert_rearmed(nan_ws, group)
+        nan_ws.close()
+
+        # One build serves every token count with the same tile, eager and in
+        # graphs replayed in any order, and leaves its mailbox all sentinel.
+        runtime_ws = CombineWorkspace(group, torch.device("cuda"), hl, 128, max_tokens)
+        counts = sorted({1, max(1, tokens // 3), tokens})
+        inputs = {
+            count: (
+                torch.randn(
+                    count,
+                    world * hl,
+                    128,
+                    device="cuda",
+                    dtype=torch.bfloat16,
+                    generator=gen,
+                ),
+                torch.randn(
+                    count,
+                    world * hl,
+                    device="cuda",
+                    dtype=torch.float32,
+                    generator=gen,
+                ),
+            )
+            for count in counts
+        }
+        expected = {
+            count: _gathered_reference(*inputs[count], rank, world, hl, True)[0]
+            for count in counts
+        }
+        for count in counts + counts[::-1]:
+            got = dcp_lse_combine(runtime_ws, *inputs[count])
+            torch.testing.assert_close(got, expected[count], rtol=1e-2, atol=1e-2)
+        graphs, results = {}, {}
+        for count in counts:
+            graphs[count] = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graphs[count]):
+                results[count] = dcp_lse_combine(runtime_ws, *inputs[count])
+        for count in counts * 2 + counts[::-1]:
+            graphs[count].replay()
+            torch.cuda.synchronize()
+            torch.testing.assert_close(
+                results[count], expected[count], rtol=1e-2, atol=1e-2
+            )
+        _assert_rearmed(runtime_ws, group)
+
+        # Rank skew: one rank, the same on all of them, sleeps before each launch
+        # while its peers run ahead into the next parity. The debug build turns a
+        # rearm that a peer's next write overtook into a timeout, not a hang.
+        skew = random.Random(tokens)
+        skew_ws = CombineWorkspace(
+            group, torch.device("cuda"), hl, 128, max_tokens, debug=True
+        )
+        skew_in = inputs[counts[-1]]
+        for _ in range(8):
+            # Draw on every rank so all of them stay on the same sequence.
+            sleeper, cycles = skew.randrange(world), skew.choice((200_000, 2_000_000))
+            if rank == sleeper:
+                torch.cuda._sleep(cycles)
+            got = dcp_lse_combine(skew_ws, *skew_in)
+            torch.testing.assert_close(got, expected[counts[-1]], rtol=1e-2, atol=1e-2)
+        _assert_rearmed(skew_ws, group)
+        skew_ws.close()
+        for _ in range(8):
+            count = skew.choice(counts)
+            # Draw on every rank so all of them stay on the same sequence.
+            sleeper, cycles = skew.randrange(world), skew.choice((200_000, 2_000_000))
+            if rank == sleeper:
+                torch.cuda._sleep(cycles)
+            graphs[count].replay()
+        torch.cuda.synchronize()
+        for count in counts:
+            graphs[count].replay()
+            torch.cuda.synchronize()
+            torch.testing.assert_close(
+                results[count], expected[count], rtol=1e-2, atol=1e-2
+            )
+        _assert_rearmed(runtime_ws, group)
+        del graphs
+        runtime_ws.close()
 
         graph_ws = CombineWorkspace(
             group, torch.device("cuda"), hl, 128, max_tokens, debug=True
