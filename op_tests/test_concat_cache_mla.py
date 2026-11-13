@@ -606,7 +606,7 @@ def test_fused_rope_concat_and_cache_mla(
                 q_pe,
                 kv_c,
                 k_pe,
-                kv_i.squeeze(1),
+                kv_i.squeeze(2),
                 q_i,
                 slot_mapping,
                 scale,
