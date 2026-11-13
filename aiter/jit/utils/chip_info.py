@@ -96,19 +96,16 @@ def get_gfx():
 
 
 if __package__:
-    from .lds_capacity import _LDS_CAPACITY_BYTES as _LDS_CAPACITY_BYTES
+    from . import lds_capacity as _lds_capacity
 else:
-    from lds_capacity import _LDS_CAPACITY_BYTES as _LDS_CAPACITY_BYTES
+    import lds_capacity as _lds_capacity
+
+_LDS_CAPACITY_BYTES = _lds_capacity._LDS_CAPACITY_BYTES
 
 
 def get_lds_capacity_bytes(gfx: str | None = None) -> int:
     """Return the architectural LDS capacity for one workgroup."""
-    if __package__:
-        from .lds_capacity import get_lds_capacity_bytes as capacity
-    else:
-        from lds_capacity import get_lds_capacity_bytes as capacity
-
-    return capacity(gfx or get_gfx())
+    return _lds_capacity.get_lds_capacity_bytes(gfx or get_gfx())
 
 
 @functools.lru_cache(maxsize=1)

@@ -4,12 +4,12 @@
 
 import ast
 import builtins
-from contextlib import contextmanager
-from pathlib import Path
 import runpy
 import sys
-from types import ModuleType
 import unittest
+from contextlib import contextmanager
+from pathlib import Path
+from types import ModuleType
 from unittest import mock
 
 UTILS = Path(__file__).resolve().parents[1] / "aiter" / "jit" / "utils"
@@ -25,9 +25,14 @@ def isolated_wrapper(package):
         if (isinstance(node, ast.FunctionDef) and node.name == "get_lds_capacity_bytes")
         or (
             isinstance(node, ast.If)
+            and isinstance(node.test, ast.Name)
+            and node.test.id == "__package__"
+        )
+        or (
+            isinstance(node, ast.Assign)
             and any(
-                isinstance(child, ast.ImportFrom) and child.module == "lds_capacity"
-                for child in ast.walk(node)
+                isinstance(target, ast.Name) and target.id == "_LDS_CAPACITY_BYTES"
+                for target in node.targets
             )
         )
     ]
@@ -43,7 +48,7 @@ def isolated_wrapper(package):
             sys.modules["lds_capacity"] = None
             sys.modules.pop(f"{package}.lds_capacity", None)
         with mock.patch.object(sys, "path", [str(UTILS), *sys.path]):
-            exec(code, namespace)
+            exec(code, namespace)  # noqa: S102 -- Executes only checked-in regression source.
             yield namespace["get_lds_capacity_bytes"], get_gfx
 
 
@@ -56,7 +61,7 @@ class LdsCapacityTest(unittest.TestCase):
         with mock.patch.object(
             builtins, "__import__", side_effect=ImportError("imports forbidden")
         ):
-            exec(code, namespace)
+            exec(code, namespace)  # noqa: S102 -- Executes only checked-in regression source.
         self.assertEqual(namespace["get_lds_capacity_bytes"]("gfx1250-strict"), 327680)
 
     def test_capacities_and_target_normalization(self):
