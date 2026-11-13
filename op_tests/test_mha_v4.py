@@ -16,6 +16,7 @@ import time
 import pandas as pd
 import torch
 import torch._dynamo
+import torch._dynamo.testing
 
 import aiter
 import aiter.ops.mha_v4 as mha_v4_module
@@ -1763,6 +1764,32 @@ def test_mha_v4_kv_splits_auto_cost_model_compiles():
     torch.cuda.synchronize()
 
     assert torch.equal(eager, compiled)
+
+
+@skipif(get_gfx() != "gfx950", reason="gfx950 MHA v4 LSE")
+def test_mha_v4_kv_splits_auto_compiles_once_for_a_dynamic_sequence():
+    """Auto under a dynamic sequence: one graph for every length, each split as eager picks.
+
+    A DiT's sequence follows its prompt, so a compiled model sees many key lengths. Traced, the
+    pick and the range lengths guard on the length, and the pick's arithmetic on its symbolic
+    size breaks the graph.
+    """
+    torch._dynamo.reset()
+    torch.manual_seed(63)
+    bf16 = (AttentionFormat.BF16,) * 3
+    counter = torch._dynamo.testing.CompileCounterWithBackend("inductor")
+    compiled = torch.compile(mha_v4, backend=counter, fullgraph=True, dynamic=True)
+    picks = set()
+    # Around one wave of 3-head work-groups, where the pick and its divisibility change.
+    for length in (21890, 21891, 22006, 22016, 17794, 4352):
+        q = torch.randn((1, length, 3, 128), device="cuda", dtype=torch.bfloat16)
+        k = torch.randn_like(q)
+        v = torch.randn_like(q)
+        picks.add(mha_v4_kv_splits(1, length, 3, length, q.device, ragged=True))
+        eager = mha_v4(q, k, v, *bf16, kv_splits="auto")
+        assert torch.equal(eager, compiled(q, k, v, *bf16, kv_splits="auto")), length
+    assert len(picks) > 1
+    assert counter.frame_count == 1
 
 
 @skipif(get_gfx() != "gfx950", reason="gfx950 LSE")
