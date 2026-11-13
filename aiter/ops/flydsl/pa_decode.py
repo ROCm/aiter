@@ -226,8 +226,14 @@ def _pa_decode_mxfp4(
     temporary_output,
     work_plan,
     max_context_length,
+    query_length=1,
+    sliding_window=0,
 ):
-    """MXFP4 K/V on gfx950 and gfx1250: ``kv_dtype=dtypes.fp4x2`` of the tile kernel."""
+    """MXFP4 K/V on gfx950 and gfx1250: ``kv_dtype=dtypes.fp4x2`` of the tile kernel.
+
+    gfx1250 also takes MTP query lengths and sliding windows; gfx950 callers
+    refuse both before this point.
+    """
     arch = get_gfx_runtime()
     gfx1250 = arch in ("gfx1250", "gfx1250-strict")
     if arch != "gfx950" and not gfx1250:
@@ -243,7 +249,8 @@ def _pa_decode_mxfp4(
         for t in (k_data, v_data, k_scale, v_scale)
     )
     dev = query.device
-    num_seqs, num_q_heads, head_dim = query.shape
+    num_seqs = context_lengths.shape[0]
+    _, num_q_heads, head_dim = query.shape
     num_kv_heads = k_data.shape[1]
     group = num_q_heads // num_kv_heads
     if head_dim != 128 or num_q_heads % num_kv_heads or group > 16:
@@ -314,11 +321,12 @@ def _pa_decode_mxfp4(
             raise ValueError(f"{name} base pointer must be {align} B aligned")
     if block_tables.dtype != torch.int32 or context_lengths.dtype != torch.int32:
         raise TypeError("block_tables and context_lengths must be int32")
-    if context_lengths.shape[0] != num_seqs or block_tables.shape[0] != num_seqs:
+    if query.shape[0] != num_seqs * query_length or block_tables.shape[0] != num_seqs:
         raise ValueError(
-            f"query.shape[0] ({num_seqs}) must match context_lengths.shape[0] "
-            f"({context_lengths.shape[0]}) and block_tables.shape[0] "
-            f"({block_tables.shape[0]})"
+            f"query.shape[0] ({query.shape[0]}) must match context_lengths.shape[0] "
+            f"* query_length ({num_seqs} * {query_length}) and "
+            f"block_tables.shape[0] ({block_tables.shape[0]}) must match "
+            f"{num_seqs}"
         )
     for name, t in (
         ("block_tables", block_tables),
@@ -339,8 +347,10 @@ def _pa_decode_mxfp4(
         raise ValueError("without a work_plan the output needs the query's strides")
     if work_plan is not None:
         work_plan.validate(num_seqs, num_kv_heads, dev)
-        if work_plan.sliding_window:
+        if work_plan.sliding_window != sliding_window:
             raise ValueError("sliding_window must match work_plan.sliding_window")
+        if sliding_window > 0 and work_plan.query_length != query_length:
+            raise ValueError("query_length must match work_plan.query_length")
     # One task per sequence needs neither the plan nor the reducer.
     direct = work_plan is None or (work_plan.max_partitions == 1 and same_strides)
     capacity = num_seqs if direct else work_plan.capacity
@@ -371,6 +381,10 @@ def _pa_decode_mxfp4(
             softmax_scale=softmax_scale,
             query_dtype=query.dtype,
             kv_dtype=dtypes.fp4x2,
+            # MXFP4 KV is per-token KV: each row carries its own e8m0 scales.
+            per_token_kv=True,
+            query_length=query_length,
+            sliding_window=sliding_window,
             work_capacity=capacity,
             max_context_length=schedule_context_length,
             direct_output=direct,
@@ -378,7 +392,7 @@ def _pa_decode_mxfp4(
         )
     pmax = psum = pout = output
     if not direct:
-        shape = (num_kv_heads, capacity, group)
+        shape = (num_kv_heads, capacity, query_length * group)
         scratch = []
         for name, t, expected, dtype in (
             ("max_logits", max_logits, shape, torch.float32),
@@ -453,7 +467,9 @@ def _pa_decode_mxfp4(
             )
         if direct:
             return
-        output_5d = output.reshape(num_seqs, 1, num_kv_heads, group, head_dim)
+        output_5d = output.reshape(
+            num_seqs, query_length, num_kv_heads, group, head_dim
+        )
         launch_pa_decode_ps_reduce(
             output_5d,
             psum,
@@ -466,7 +482,7 @@ def _pa_decode_mxfp4(
             pout.stride(0),
             pout.stride(1),
             pout.stride(2),
-            query_seq_len=1,
+            query_seq_len=query_length,
             query_group_size=group,
             head_size=head_dim,
             # Not bounded by max_context_length: a task may own more tokens than it.
@@ -557,23 +573,30 @@ def pa_decode(
     [pages, kv_heads, 128, 64] (``dtypes.fp4x2`` or uint8) and
     ``key_scale``/``value_scale`` e8m0 views [pages, kv_heads, 128, 4]
     (``dtypes.fp8_e8m0`` or uint8) of the same pages (the four share page and head
-    byte strides, multiples of 16). ``query`` is float8_e4m3fn, used as stored, or
-    bf16, quantized to e4m3 per head row in the kernel; ``output`` is bf16.
-    Supported: head_dim 128, block size 128, ``query_length`` 1, at most 16 query
-    heads per KV head. Refused: other block sizes, head dims and output dtypes,
-    sliding windows and sinks (``mask_unowned_kv`` has no effect: tokens past the
-    context are always masked). Scale bytes 0 and 255 are not supported in valid
-    rows. V is staged as bf16, so a V element above the bf16 maximum (3.39e38: e8m0
-    byte 254 with an e2m1 magnitude of 2 or more, byte 253 with 4 or more) widens to
-    infinity even when the normalized output is finite. ``work_plan=None`` is accepted for MXFP4 only: one task per sequence
-    writes its row directly (the output needs the query's row and head strides,
-    a context-0 row is zero-filled) and nothing is specialized on ``num_seqs``; a
-    plan with ``max_partitions == 1`` is served the same way. On gfx950 a task
-    may span at most 4096 pages in ``max_context_length``: pass a smaller one
-    otherwise. A real context longer than that bound is still fully attended (up
-    to 2**19 tokens a task, the bound of the fixed PV shift, unchecked on the
-    GPU). gfx1250 reads page ids from the block table, without that bound, and
-    needs 16 B aligned query and output base pointers.
+    byte strides, multiples of 16). MXFP4 KV is per-token KV: those e8m0 bytes are
+    each row's scales. Its kernels are requested with ``per_token_kv=True`` and,
+    on gfx950 and gfx1250 alike, read only those bytes (no f32 per-token tensors).
+    ``query`` is float8_e4m3fn, used as stored, or bf16, quantized to e4m3 per
+    head row in the kernel; ``output`` is bf16. Supported: head_dim 128, block size
+    128, at most 16 query heads per KV head. gfx950 takes ``query_length`` 1 and no
+    sliding window; gfx1250 also takes MTP query lengths and sliding windows, with
+    at most 64 query rows (query positions / query splits times GQA heads) a CTA:
+    it splits the positions so that a CTA keeps at most 32 rows by default.
+    Refused: other block sizes, head dims and output dtypes, and sinks
+    (``mask_unowned_kv`` has no effect: tokens past the context are always masked).
+    Scale bytes 0 and 255 are not supported in valid rows. V is widened to bf16,
+    so a V element above the bf16 maximum (3.39e38: e8m0 byte 254 with an e2m1
+    magnitude of 2 or more, byte 253 with 4 or more) widens to infinity even when
+    the normalized output is finite. ``work_plan=None`` is accepted for MXFP4
+    only: one task per sequence writes its rows directly (the output needs the
+    query's row and head strides, a context-0 row is zero-filled) and nothing is
+    specialized on ``num_seqs``; a plan with ``max_partitions == 1`` is served
+    the same way. On gfx950 a task may span at most 4096 pages in
+    ``max_context_length``: pass a smaller one otherwise. A real context longer
+    than that bound is still fully attended (up to 2**19 tokens a task, the bound
+    of the fixed PV shift, unchecked on the GPU). gfx1250 reads page ids from the
+    block table, without that bound, and needs 16 B aligned query and output base
+    pointers.
 
     Refresh ``work_plan`` on the current stream after changing lengths. Its
     max_partitions is bounded by device CUs. Match sliding_window and, for
@@ -654,14 +677,16 @@ def pa_decode(
             )
 
     if mxfp4:
-        if query_length != 1:
-            raise NotImplementedError(
-                f"MXFP4 KV supports query_length 1, got {query_length}"
-            )
-        if sliding_window:
-            raise NotImplementedError(
-                f"MXFP4 KV supports no sliding window, got sliding_window={sliding_window}"
-            )
+        if get_gfx_runtime() not in ("gfx1250", "gfx1250-strict"):
+            if query_length != 1:
+                raise NotImplementedError(
+                    f"MXFP4 KV supports query_length 1, got {query_length}"
+                )
+            if sliding_window:
+                raise NotImplementedError(
+                    "MXFP4 KV supports no sliding window, "
+                    f"got sliding_window={sliding_window}"
+                )
         if sinks is not None:
             raise NotImplementedError("MXFP4 KV supports no sinks, got sinks")
         if compute_type not in (None, torch.uint8, dtypes.fp4x2):
@@ -684,6 +709,8 @@ def pa_decode(
             temporary_output,
             work_plan,
             max_context_length,
+            query_length,
+            sliding_window,
         )
 
     trans_k = key_cache.dim() == 5

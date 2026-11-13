@@ -28,12 +28,13 @@ with resident Q and fused PV accumulation; D256 is limited to 32 query rows.
 Page16 BF16 caches at these dimensions retain vector-8 packing in LDS while
 using the 64-token pipeline.
 
-MXFP4 K/V (``kv_dtype=dtypes.fp4x2``, gfx950/gfx1250, head_dim 128, page 128, one
-query token a row) share this scaffolding and have their own tile: QK is one scaled
-MFMA/WMMA (fp4 K x e4m3 Q). gfx950 widens V to bf16 through wave-private LDS; gfx1250
-dequantizes V with the scaled WMMA against fp4 identity blocks, which leaves it
-transposed in registers for the bf16 PV WMMA. A wave owns 64 tokens of the tile and
-all dims, so the tile loop has no barrier; the waves merge once after it.
+MXFP4 K/V (``kv_dtype=dtypes.fp4x2``, per-token KV, gfx950/gfx1250, head_dim 128, page
+128; one query token on gfx950, MTP and sliding windows on gfx1250) share this
+scaffolding and have their own tile: QK is one scaled MFMA/WMMA (fp4 K x e4m3 Q). gfx950
+widens V to bf16 through wave-private LDS; gfx1250 dequantizes V with the scaled WMMA
+against fp4 identity blocks, which leaves it transposed in registers for the bf16 PV
+WMMA. A wave owns 64 tokens of the tile and all dims, so the tile loop has no barrier;
+the waves merge once after it.
 
 Logical layouts (not preshuffled):
 
@@ -112,6 +113,11 @@ __all__ = [
     "WAVE",
     "compile_pa_decode_tile",
 ]
+
+# gfx1250 MXFP4: query rows (positions x GQA heads) a CTA keeps in registers by
+# default, and at most.
+MXFP4_GFX1250_ROWS = 32
+MXFP4_GFX1250_MAX_ROWS = 64
 
 # Key by selected specialization, not batch/head/CU scheduling inputs.
 _PA_DECODE_TILE_CACHE = {}
@@ -263,18 +269,36 @@ def compile_pa_decode_tile(
         if kv_fx == MXFP4_KV_DTYPE:
             if query_fx not in (fx.BFloat16, fx.Float8E4M3FN):
                 raise ValueError("MXFP4 KV requires a BF16 or FP8 query")
-            # direct_output is the plan-free form: one task per sequence.
+            if query_splits is None:
+                # Each 16-row M-tile adds its Q, scores and outputs to the
+                # registers; split MTP positions until a CTA holds at most two.
+                # Its M-tiles share the tile's V dequantization.
+                query_splits = next(
+                    (
+                        splits
+                        for splits in (1, 2, 4)
+                        if query_length % splits == 0
+                        and query_length // splits * query_group_size
+                        <= MXFP4_GFX1250_ROWS
+                    ),
+                    max(s for s in (1, 2, 4) if query_length % s == 0),
+                )
+            # direct_output is the plan-free form: one task per sequence. MXFP4
+            # KV is per-token KV, its e8m0 bytes being each row's scales; as on
+            # gfx950 (PaDecodeTraits.create), the kernel keeps the f32 per-token
+            # scale path off, so either per_token_kv selects the same kernel.
             return compile_gfx1250_pa_decode(
                 head_dim=head_dim,
                 query_group_size=query_group_size,
                 block_size=block_size,
                 softmax_scale=softmax_scale,
                 query_dtype=_dtype_tag(query_fx),
-                per_token_kv=per_token_kv,
+                per_token_kv=False,
                 query_length=query_length,
                 trans_v=trans_v,
-                sliding_window=sliding_window,
+                sliding_window=max(sliding_window, 0),
                 compute_dtype="mxfp4",
+                query_splits=query_splits,
                 plan_free=direct_output,
                 cluster_merge=cluster_merge,
             )
@@ -782,8 +806,9 @@ def compile_gfx1250_pa_decode(
     device-scope atomic accesses; the host wrapper falls back for offset views.
 
     ``compute_dtype="mxfp4"`` (``Gfx1250Mxfp4Pipeline``) takes E2M1 K/V data and
-    E8M0 scale views, head_dim 128, page 128, one query token and at most 16
-    rows, and writes packed partials for the reducer or a cluster merge;
+    E8M0 scale views (per-token KV), head_dim 128, page 128, MTP, sliding windows
+    and at most 64 rows a CTA, and writes packed partials for the reducer or a
+    cluster merge;
     ``plan_free`` instead reads ``work`` as the context lengths, runs sequence
     s whole in CTA s and stores its final rows (an empty sequence's are zeroed).
     """
@@ -813,19 +838,19 @@ def compile_gfx1250_pa_decode(
     if t.mxfp4 and not (
         head_dim == 128
         and block_size == 128
-        and query_length == 1
         and 1 <= query_group_size <= 16
+        and t.rows <= MXFP4_GFX1250_MAX_ROWS
         and query_dtype in ("bf16", "fp8")
         and not per_token_kv
-        and sliding_window == 0
-        and query_splits == 1
         and not (direct_output or merge_partitions)
         and not (plan_free and cluster_merge)
     ):
         raise NotImplementedError(
-            "gfx1250 MXFP4 PA decode supports head_dim 128, block 128, one query "
-            "token, 1..16 query heads per KV head, a bf16 or e4m3 query, no "
-            "window, and reducer, cluster-merged or plan-free output"
+            "gfx1250 MXFP4 PA decode supports head_dim 128, block 128, 1..16 query "
+            f"heads per KV head, at most {MXFP4_GFX1250_MAX_ROWS} query rows a CTA "
+            "(query positions / query_splits x heads), a bf16 or e4m3 query, its "
+            "in-cache e8m0 scales (no f32 per-token tensors) and reducer, "
+            "cluster-merged or plan-free output"
         )
     if query_dtype == "fp8" and not t.mxfp4:
         raise ValueError("An FP8 query needs MXFP4 KV")
@@ -940,11 +965,17 @@ def compile_gfx1250_pa_decode(
             # task read must stay in bounds even though no compute consumes it.
             task_slot = (count > 0).select(fx.Int32(info[task_slot * 2]), fx.Int32(0))
         if const_expr(t.plan_free):
-            # CTA s runs sequence s: all tiles of its context length.
+            # CTA s runs sequence s: the tiles its query positions can see.
             context = fx.Int32(fx.recast_iter(fx.Int32, work)[task_slot])
+            first_tile = fx.Int32(0)
+            if const_expr(t.sliding_window > 0):
+                first_visible = context - t.query_length + 1 - t.sliding_window
+                first_tile = (first_visible > 0).select(
+                    first_visible // KV_COMPUTE_BLOCK, fx.Int32(0)
+                )
             task = [
                 task_slot,
-                fx.Int32(0),
+                first_tile,
                 (context + (KV_COMPUTE_BLOCK - 1)) // KV_COMPUTE_BLOCK,
                 context,
             ]

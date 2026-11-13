@@ -239,8 +239,9 @@ class PaDecodeSchedule:
                 )
             if query_dtype not in (fx.BFloat16, fx.Float8E4M3FN):
                 raise ValueError("MXFP4 KV requires a BF16 or FP8 query")
-            if per_token_kv:
-                raise ValueError("MXFP4 KV scales are in the cache, not per token")
+            # MXFP4 KV is per-token KV: each cache row carries its own e8m0
+            # scales, so every MXFP4 schedule is a per-token one.
+            per_token_kv = True
         elif kv_dtype == fx.BFloat16:
             if arch not in BF16_KV_SUPPORTED_ARCHS:
                 raise ValueError(
@@ -599,7 +600,10 @@ class PaDecodeTraits:
         _num_partitions = cache_key.num_partitions
         softmax_scale = cache_key.softmax_scale
         query_dtype = cache_key.query_dtype
-        per_token_kv = cache_key.per_token_kv
+        # The flag below drives the f32 per-token scale tensors and their LDS
+        # buffers. MXFP4's per-token scales are the e8m0 bytes it loads with
+        # its rows, so its kernel keeps that machinery off.
+        per_token_kv = cache_key.per_token_kv and cache_key.kv_dtype != MXFP4_KV_DTYPE
         query_length = cache_key.query_length
         trans_v = cache_key.trans_v
         wide_kv_addressing = cache_key.wide_kv_addressing
@@ -1124,9 +1128,9 @@ class Gfx1250Traits:
     NWARP = 4
     BLOCK_THREADS = NWARP * WAVE
     FP8_MAX = 448.0
-    # MXFP4 merge scratch: per wave a [16 rows][MXFP4_O_STRIDE] f32 output tile
-    # (the row pad keeps the lane-per-row b128 stores bank-conflict free), then
-    # per-wave row maxima and sums.
+    # MXFP4 merge scratch: per wave and M-tile a [16 rows][MXFP4_O_STRIDE] f32
+    # output tile (the row pad keeps the lane-per-row b128 stores bank-conflict
+    # free), then per-wave row maxima and sums.
     MXFP4_O_STRIDE = 132
     MXFP4_O_BYTES = 16 * MXFP4_O_STRIDE * 4
 
@@ -1339,12 +1343,12 @@ class Gfx1250Traits:
     def total_bytes(self):
         if self.mxfp4:
             # Only the wave merge after the tile loop uses LDS.
-            return self.mxfp4_stats_offset + 2 * self.NWARP * 16 * 4
+            return self.mxfp4_stats_offset + 2 * self.NWARP * self.m_tiles * 16 * 4
         return self.stats_offset + 576
 
     @property
     def mxfp4_stats_offset(self):
-        return self.NWARP * self.MXFP4_O_BYTES
+        return self.NWARP * self.m_tiles * self.MXFP4_O_BYTES
 
     @property
     def use_tdm(self):
