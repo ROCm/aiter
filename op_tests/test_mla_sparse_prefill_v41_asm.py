@@ -35,13 +35,14 @@ def _requires_gfx1250():
         pytest.skip("the fused V4.1 A8W4 CO requires gfx1250")
 
 
-def _case(n=2, csa_rows=65, swa_rows=128, *, no_sink=False):
+def _case(n=2, csa_rows=65, swa_rows=128, *, no_sink=False, window=None):
     data = _make_inputs_v41(
         n,
         64,
         csa_rows,
         swa_rows,
         topk=0,
+        window=window,
         prefix_fp4=True,
         seed=0,
     )
@@ -104,6 +105,33 @@ def test_explicit_splits(splits, csa_rows, swa_rows):
 def test_pool_and_tile_boundaries(splits, n, csa_rows, swa_rows):
     # N=65 covers SWA's 64/65 boundary with causal CSR.
     inputs, expected = _case(n, csa_rows, swa_rows)
+    _check(_invoke(inputs, splits), expected)
+
+
+@pytest.mark.parametrize("splits", [1, 4, 16])
+@pytest.mark.parametrize(
+    "n,csa_rows,window",
+    [
+        (129, 65, 0),
+        (129, 0, 128),
+        (129, 65, 128),
+        (257, 65, 128),
+        (129, 65, 1000),
+    ],
+)
+def test_sliding_window(splits, n, csa_rows, window):
+    inputs, expected = _case(n, csa_rows, n, window=window)
+    indptr = inputs["kv_indptr_extend"].tolist()
+    indices = inputs["kv_indices_extend"].tolist()
+    if window == 0:
+        assert indptr == [0] * (n + 1) and indices == []
+    else:
+        assert indices[indptr[0] : indptr[1]] == [0]
+        # Check the advancing row IDs independently of the numerical reference,
+        # which consumes the generated CSR too. N=257 also crosses the next window.
+        for token in (127, 128, n - 1):
+            rows = indices[indptr[token] : indptr[token + 1]]
+            assert rows == list(range(max(0, token + 1 - window), token + 1))
     _check(_invoke(inputs, splits), expected)
 
 
