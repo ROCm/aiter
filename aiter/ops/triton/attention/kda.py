@@ -122,7 +122,7 @@ def fused_recurrent_kda(
     """
 
     if (
-        _ARCH == "gfx1250"
+        _ARCH in ("gfx1250", "gfx1250-strict")
         and config is None
         and not _LOG_INFO
         and state_v_first is not False
@@ -248,7 +248,7 @@ def fused_recurrent_kda(
     )
     bucket_T = max(avg_T, 2) if bf16_resident else avg_T
     writeback_decode = (
-        _ARCH == "gfx1250"
+        _ARCH in ("gfx1250", "gfx1250-strict")
         and (config is None or config.get("use_writeback_decode", False))
         and B == 1
         and H == HV == 12
@@ -325,7 +325,11 @@ def fused_recurrent_kda(
         V,
         overrides=config,
         fused=use_conv or use_rms_gate,
-        **({"writeback_decode": writeback_decode} if _ARCH == "gfx1250" else {}),
+        **(
+            {"writeback_decode": writeback_decode}
+            if _ARCH in ("gfx1250", "gfx1250-strict")
+            else {}
+        ),
     )
     BV = config["BV"]
     SK = config["SK"]

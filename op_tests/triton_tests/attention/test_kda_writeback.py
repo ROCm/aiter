@@ -7,7 +7,9 @@ import torch
 from aiter.ops.triton.attention import kda
 from aiter.ops.triton.utils._triton.arch_info import get_arch
 
-pytestmark = pytest.mark.skipif(get_arch() != "gfx1250", reason="gfx1250 only")
+pytestmark = pytest.mark.skipif(
+    get_arch() not in ("gfx1250", "gfx1250-strict"), reason="gfx1250 only"
+)
 
 
 def make_writeback_inputs(tokens, padded=False):

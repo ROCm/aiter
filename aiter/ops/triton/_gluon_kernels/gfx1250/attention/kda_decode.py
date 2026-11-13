@@ -1447,7 +1447,10 @@ def get_kda_config(
     fused: bool = False,
     writeback_decode: bool = False,
 ) -> dict:
-    cfg_dir = resolve_config_dir("attention", "KDA_DECODE", backend="gluon")
+    # Both compiler targets use this kernel's gfx1250 configuration tree.
+    cfg_dir = resolve_config_dir(
+        "attention", "KDA_DECODE", backend="gluon", arch="gfx1250"
+    )
     tuned = load_config_json(f"{cfg_dir}/DEFAULT.json")
     num_seq_heads = num_seqs * HV
     aligned = K % 32 == 0 and V % 32 == 0
