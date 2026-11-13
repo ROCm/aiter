@@ -520,6 +520,35 @@ def test_varlen_optimized_matches_reference(query_lengths, lengths, route_spy):
     _check(out, _reference(q, k, v, used, table, cu_seqlens_q=cu.cpu()))
 
 
+@pytest.mark.skipif(torch.cuda.device_count() < 2, reason="needs two GPUs")
+def test_routes_run_on_each_device_in_turn(route_spy):
+    # The same geometries on cuda:0 then cuda:1 reuse each launcher.
+    cases = [
+        ("flydsl", lambda: _inputs((300, 4097), 64), {}),
+        ("flydsl", lambda: _inputs((300, 4097), 64), {"window_size": WINDOW}),
+        ("flydsl", lambda: _ragged_inputs((40, 1, 7), (16384, 4097, 2048), 64), {}),
+    ]
+    if all(
+        torch.cuda.get_device_properties(i).multi_processor_count == 256
+        for i in range(2)
+    ):
+        cases.append(("optimized", lambda: _ragged_inputs((8192,), (8192,), 128), {}))
+    for device in range(2):
+        with torch.cuda.device(device):
+            for route, make, kw in cases:
+                route_spy.clear()
+                q, k, v, out, cu, used, table = make()
+                qlen = int((cu[1:] - cu[:-1]).max())
+                _call(q, k, v, out, cu, used, table, qlen=qlen, backend="flydsl", **kw)
+                torch.cuda.synchronize()
+                assert route_spy == [route]
+                window = WINDOW[0] + 1 if "window_size" in kw else 0
+                ref = _reference(
+                    q, k, v, used, table, cu_seqlens_q=cu.cpu(), window=window
+                )
+                _check(out, ref)
+
+
 def test_disabled_by_environment(monkeypatch, route_spy):
     monkeypatch.setenv("AITER_UNIFIED_ATTN_FLYDSL", "0")
     q, k, v, out, cu, used, table = _inputs((300, 129), 64)
