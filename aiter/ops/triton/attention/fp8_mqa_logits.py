@@ -102,8 +102,8 @@ def fp8_mqa_logits(
     cu_starts,
     cu_ends,
     clean_logits=True,
-    out=None,
-    out_offsets=None,
+    out: torch.Tensor | None = None,
+    out_offsets: torch.Tensor | None = None,
 ):
     """
     This function computes the logits to be used by a topk function for sparse attention.
@@ -123,13 +123,16 @@ def fp8_mqa_logits(
                   ValueError.
     out_offsets: optional contiguous [seq_len] int32 or int64 on Q.device. Row i
                   writes its scores for keys [cu_starts[i], cu_ends[i]) from
-                  element out_offsets[i] of out. The rows must not overlap.
-                  Other elements of out are not written; clean_logits has no
-                  effect.
+                  element out_offsets[i] of out, so out must hold
+                  out_offsets[i] + min(cu_ends[i], seq_len_kv) - max(cu_starts[i], 0)
+                  elements. The wrapper does not check this (it needs a host
+                  sync). The rows must not overlap. Other elements of out are
+                  not written; clean_logits has no effect.
 
     Returns:
     logits:      out, or an allocated [seq_len, seq_len_kv] float32 tensor. Only
-                  with clean_logits, values outside each row's range are -inf.
+                  with clean_logits and not in packed mode, values outside each
+                  row's range are -inf.
     """
 
     seq_len, num_heads, head_size = Q.shape
@@ -137,7 +140,7 @@ def fp8_mqa_logits(
     # TODO: Currently assuming num_heads and head_size is power of 2.
     assert num_heads & (num_heads - 1) == 0, "num q. heads should be power of 2."
     assert head_size & (head_size - 1) == 0, "head size should be power of 2."
-    # Initialize with -inf because of causal masking
+    # An allocated output pads each row to 256 columns.
     aligned_size = 256
     seq_len_kv_aligned = (seq_len_kv + aligned_size - 1) // aligned_size * aligned_size
     packed = out_offsets is not None
@@ -175,7 +178,7 @@ def fp8_mqa_logits(
             raise ValueError(f"out is on {out.device}, Q on {Q.device}")
         if clean_logits:
             out.fill_(-float("inf"))
-    elif clean_logits:
+    elif clean_logits:  # -inf outside each row's causal range
         logits = torch.full(
             (seq_len, seq_len_kv_aligned),
             fill_value=-float("inf"),
@@ -330,7 +333,7 @@ def fp8_mqa_logits(
                 m_chunk = mfma_nonk_dim
             else:
                 m_chunk = 0
-            # Relax the store masking if we don't have to provide clean logits
+            # Relax the store masking without clean logits; packed rows need exact masks
             relaxed_store = 0 if clean_logits or packed else 1
             other = {
                 "USE_PADDED_SHARED_LAYOUT": ASYNC_COPY_SUPPORTS_DISTRIBUTED,

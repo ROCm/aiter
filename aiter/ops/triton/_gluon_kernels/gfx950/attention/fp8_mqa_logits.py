@@ -900,8 +900,8 @@ def _gluon_fp8_mqa_logits_kernel(
     weights_ptr,  # fp32   [seq_len, NUM_HEADS]
     cu_start_ptr,  # int32  [seq_len]
     cu_end_ptr,  # int32  [seq_len]
-    logits_ptr,  # fp32   [seq_len, seq_len_kv]
-    out_offsets_ptr,
+    logits_ptr,  # fp32   [seq_len, seq_len_kv]; flat when PACKED
+    out_offsets_ptr,  # int32/int64 [seq_len]: each row's start when PACKED
     seq_len: gl.int32,
     seq_len_kv: gl.int32,
     num_kv_splits: gl.int32,  # runtime value to remove unexpected compilations

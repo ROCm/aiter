@@ -339,7 +339,9 @@ def test_fp8_mqa_logits_refuses_a_malformed_buffer(bad: str, message: str) -> No
         fp8_mqa_logits(q_fp8, kv_fp8, scales, weights, ks, ke, False, out=buffers[bad])
 
 
-@pytest.mark.parametrize("rows,keys", [(9, 1025), (4097, 1025), (9, 65539)])
+@pytest.mark.parametrize(
+    "rows,keys", [(9, 1025), (4097, 1025), (9, 65539), (1019, 40000)]
+)
 @pytest.mark.parametrize("heads", [32, 64])
 @pytest.mark.parametrize("clean_logits", [False, True])
 @pytest.mark.parametrize("offset_dtype", [torch.int32, torch.int64])
@@ -427,6 +429,7 @@ def test_fp8_mqa_logits_packed_empty_rows(rows):
         ("offset_device", "out_offsets must be contiguous"),
     ],
 )
+@torch.inference_mode()
 def test_fp8_mqa_logits_rejects_malformed_packed_output(bad, message):
     q = torch.empty(4, 32, 128, device="cuda", dtype=e4m3_type)
     kv = torch.empty(73, 128, device="cuda", dtype=e4m3_type)
