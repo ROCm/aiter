@@ -721,7 +721,10 @@ using {k.name}_Traits = {traits_name}<{k.BLOCK_SIZE},
     constexpr int NUM_XCD = {cg.num_xcd};
     const int num_tiles_m = (M + {k.B_M} - 1) / {k.B_M};
     const int num_tiles_n = (N + {k.B_N} - 1) / {k.B_N};
-    int split_m = std::max(1, (NUM_CU + num_tiles_n - 1) / num_tiles_n);
+    // The kernel's __launch_bounds__ keeps two workgroups resident per CU.
+    constexpr int WG_PER_CU = 2;
+    const int target_wgs = NUM_CU * WG_PER_CU;
+    int split_m = std::max(1, (target_wgs + num_tiles_n - 1) / num_tiles_n);
     while (split_m < num_tiles_m && (num_tiles_m % split_m) != 0) split_m++;
     if (split_m > num_tiles_m) split_m = num_tiles_m;
     const int m_per_wg = num_tiles_m / split_m;
