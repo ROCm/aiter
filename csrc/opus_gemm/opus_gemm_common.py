@@ -24,6 +24,10 @@ def base_gfx_arch(gfx: str) -> str:
 _A16W16_CO_TAGS = frozenset(
     {"a16w16_4wave_co", "a16w16_4wave_wl_co", "a16w16_4wave_wlr_co"}
 )
+# gfx950 a16w16 4-wave family: device code pre-built offline (gen_co/gfx950),
+# host launchers JIT-built. a16w16_4wave is the direct launcher, a16w16_4wave_ws
+# the fp32 split-K workspace + reduce launcher.
+_A16W16_4WAVE_GFX950_TAGS = frozenset({"a16w16_4wave", "a16w16_4wave_ws"})
 
 # Legacy cache policy = traits default for split-barrier & persistent a16w16 (see
 # opus_gemm_traits_a16w16_gfx950.cuh).
@@ -2857,6 +2861,149 @@ assert not (GFX1250_4WAVE_CO_KIDS & _GFX1250_PRE_CO_KIDS), (
     "gfx1250 CO kids overlap an existing gfx1250 family"
 )
 
+# ---- gfx950 a16w16 4-wave family (pre-built .co device images) ----------
+# gen_co/co_kernels_gfx950.json lists the exact kids (tile + tag); the images of
+# one kid (every layout, and bias/no-bias for the direct tag) are derived from
+# its symbol by a16w16_4wave_co_images(). A separate JSON keeps these records
+# out of the gfx1250 loader above and vice versa.
+CO_KERNELS_GFX950_JSON = os.path.join(
+    os.path.dirname(__file__), "gen_co", "co_kernels_gfx950.json"
+)
+# Layout image suffixes; index = A_T * 2 + B_T (A_T: XQ stored [K, M], B_T: WQ
+# stored [K, N]). Keep in step with the launcher emitted by
+# codegen/gen_instances_gfx950.py:gen_a16w16_4wave_instance.
+A16W16_4WAVE_LAYOUTS = ("nt", "nn", "tt", "tn")
+# B_M, B_N in {64, 128, 256} except 64x64 (traits: 2 halves x 2 waves x E x 16).
+_A16W16_4WAVE_TILES = frozenset(
+    (bm, bn) for bm in (64, 128, 256) for bn in (64, 128, 256) if bm * bn > 64 * 64
+)
+
+
+def a16w16_4wave_pinned(instance) -> bool:
+    """Traits default: tiles larger than 128x128 pin registers (1 WG/CU)."""
+    return instance.B_M * instance.B_N > 128 * 128
+
+
+def _a16w16_4wave_gfx950(tag, bm, bn):
+    workspace = tag == "a16w16_4wave_ws"
+    return OpusGemmInstance(
+        256,
+        bm,
+        bn,
+        64,
+        2,
+        2,
+        16,
+        16,
+        32,
+        8,
+        8,
+        4,
+        0,
+        0,
+        0,
+        tag,
+        # The workspace launcher is the <fp32_t> host specialization of the
+        # workspace ABI; both launchers write bf16 Y only.
+        ["fp32_t"] if workspace else ["bf16_t"],
+        WG_PER_CU=1 if bm * bn > 128 * 128 else 2,
+        arch_prefix="gfx950",
+        # "splitk_" keeps the reduce-TU arch detection in gen_instances.py
+        # (opus_gemm_<arch>_splitk_) working for the workspace kids.
+        name_tag="splitk_4wave_ws" if workspace else "4wave",
+        splitk_workspace_dtype="fp32_t" if workspace else None,
+    )
+
+
+def a16w16_4wave_co_images(instance):
+    """Return [(layout, has_bias, symbol)] of every image one kid launches."""
+    variants = (False, True) if instance.kernel_tag == "a16w16_4wave" else (False,)
+    return [
+        (layout, bias, f"{instance.name}_{layout}{'_bias' if bias else ''}")
+        for layout in A16W16_4WAVE_LAYOUTS
+        for bias in variants
+    ]
+
+
+def a16w16_4wave_co_image_paths(instance, json_path=None):
+    root = os.path.dirname(json_path or CO_KERNELS_GFX950_JSON)
+    return [
+        os.path.join(root, "gfx950", f"{symbol}.co")
+        for _layout, _bias, symbol in a16w16_4wave_co_images(instance)
+    ]
+
+
+def _a16w16_4wave_images_present(instance) -> bool:
+    return all(os.path.isfile(path) for path in a16w16_4wave_co_image_paths(instance))
+
+
+def _load_a16w16_4wave_gfx950(path, require_image=True):
+    """Load the gfx950 4-wave kid records, dropping kids with missing images."""
+    if not os.path.exists(path):
+        return {}
+
+    import json
+
+    with open(path) as stream:
+        document = json.load(stream)
+
+    instances = {}
+    seen_names = {}
+    missing = []
+    for arch, entries in document.items():
+        if arch.startswith("_"):
+            continue
+        if arch != "gfx950":
+            raise ValueError(f"{path}: unsupported arch section {arch!r}")
+        for entry in entries:
+            kid = entry["kid"]
+            tag = entry["tag"]
+            if tag not in _A16W16_4WAVE_GFX950_TAGS:
+                raise ValueError(f"unsupported 4wave kernel tag {tag!r} for kid {kid}")
+            if type(kid) is not int or kid < 0:
+                raise ValueError(f"invalid local 4wave kid {kid!r}")
+            bm, bn = entry["tile"]
+            if (bm, bn) not in _A16W16_4WAVE_TILES:
+                raise ValueError(f"4wave kid {kid}: unsupported tile {bm}x{bn}")
+            assert kid not in instances, f"duplicate 4wave kid {kid} in {path}"
+            instance = _a16w16_4wave_gfx950(tag, bm, bn)
+            assert instance.name not in seen_names, (
+                f"4wave kids {seen_names[instance.name]} and {kid} generate the "
+                f"same symbol {instance.name!r}"
+            )
+            seen_names[instance.name] = kid
+            if require_image and not _a16w16_4wave_images_present(instance):
+                missing.append((kid, instance.name))
+                continue
+            instances[kid] = instance
+
+    if missing:
+        preview = ", ".join(f"{kid} ({name})" for kid, name in missing[:5])
+        suffix = f", ... and {len(missing) - 5} more" if len(missing) > 5 else ""
+        print(
+            f"[opus] {len(missing)} gfx950 4wave kid(s) dropped -- .co images not "
+            f"found under {os.path.join(os.path.dirname(path), 'gfx950')}: "
+            f"{preview}{suffix}. Build them with "
+            "csrc/opus_gemm/gen_co/build_co.py --arch gfx950.",
+            file=sys.stderr,
+        )
+    return instances
+
+
+# Declared records (the offline builder creates their images) ...
+gfx950_a16w16_4wave_kernels_declared = _load_a16w16_4wave_gfx950(
+    CO_KERNELS_GFX950_JSON, require_image=False
+)
+# ... and the subset whose images exist. The registry carries the declared
+# records; get_registry / get_kernel_instance filter on image presence at call
+# time (as for the gfx1250 CO kids), so building images needs no re-import.
+gfx950_a16w16_4wave_kernels_list = {
+    kid: instance
+    for kid, instance in gfx950_a16w16_4wave_kernels_declared.items()
+    if _a16w16_4wave_images_present(instance)
+}
+GFX950_A16W16_4WAVE_KIDS = frozenset(gfx950_a16w16_4wave_kernels_declared)
+
 # Flatten the eight BMM launcher tags into the same canonical exact-kid
 # registry used by every other OPUS family.
 a8w8_mxscale_bmm_kernels_list = {
@@ -2885,6 +3032,10 @@ gfx950_a16w16_kernels_list = {
     **a16w16_persistent_kernels_list_4g_safe_nooob,
     **a16w16_mono_tile_kernels_list_4g_safe,
 }
+assert not (GFX950_A16W16_4WAVE_KIDS & gfx950_a16w16_kernels_list.keys()), (
+    "gfx950 4wave kids overlap an existing gfx950 a16w16 kid"
+)
+gfx950_a16w16_kernels_list.update(gfx950_a16w16_4wave_kernels_declared)
 
 gfx1250_a16w16_kernels_list = {
     **gfx1250_kernels_list,
@@ -2980,6 +3131,13 @@ def get_registry(family: str, gfx: str, cu_num: int) -> dict[int, object]:
             if instance.kernel_tag not in _A16W16_CO_TAGS
             or os.path.isfile(co_image_path(CO_KERNELS_JSON, instance))
         }
+    if family == "a16w16" and gfx == "gfx950":
+        return {
+            kid: instance
+            for kid, instance in records.items()
+            if instance.kernel_tag not in _A16W16_4WAVE_GFX950_TAGS
+            or _a16w16_4wave_images_present(instance)
+        }
     return records
 
 
@@ -3029,8 +3187,11 @@ def _in_group(name, family, instance):
         return {
             "SPLITK_KIDS": workspace,
             "NON_SPLITK_KIDS": not workspace,
-            "BIAS_AWARE_KIDS": workspace or instance.kernel_tag == "a16w16",
+            "BIAS_AWARE_KIDS": workspace
+            or instance.kernel_tag in ("a16w16", "a16w16_4wave"),
             "GFX1250_4WAVE_CO_KIDS": instance.kernel_tag in _A16W16_CO_TAGS,
+            "GFX950_A16W16_4WAVE_KIDS": instance.kernel_tag
+            in _A16W16_4WAVE_GFX950_TAGS,
             "SPLITK_4G_SAFE_KIDS": workspace and instance.is_4g_safe,
             "NON_SPLITK_4G_SAFE_KIDS": not workspace and instance.is_4g_safe,
             "FOUR_G_SAFE_KIDS": instance.is_4g_safe,
@@ -3088,7 +3249,7 @@ DEFAULT_COMPILED_KIDS_GFX950 = frozenset(
         30,
         76,  # persistent (256, 256, 64)
     }
-)
+) | GFX950_A16W16_4WAVE_KIDS  # host-only launchers (device code is pre-built)
 
 DEFAULT_COMPILED_KIDS_GFX942 = frozenset(
     {
@@ -3176,6 +3337,8 @@ OPUS_KERNEL_TAGS_BY_ARCH_FAMILY = {
                 "a16w16_flatmm_splitk",
                 "a16w16_mono_tile",
                 "a16w16_persistent",
+                "a16w16_4wave",
+                "a16w16_4wave_ws",
             }
         ),
         "a8w8": frozenset({"a8w8"}),
@@ -3315,10 +3478,12 @@ def get_kernel_instance(
         # specialization in ``output_dtypes`` is not the Y dtype contract.
         if family == "a16w16" and instance.splitk_workspace_dtype is not None:
             # The current gfx942 BF16-workspace reducer is exact-N and writes
-            # BF16 only.  Other A16 workspace reducers support BF16/FP32 Y.
+            # BF16 only; the gfx950 4wave launchers write BF16 only.  Other
+            # A16 workspace reducers support BF16/FP32 Y.
             allowed = (
                 {"bf16_t"}
-                if arch == "gfx942" and instance.splitk_workspace_dtype == "bf16_t"
+                if (arch == "gfx942" and instance.splitk_workspace_dtype == "bf16_t")
+                or instance.kernel_tag in _A16W16_4WAVE_GFX950_TAGS
                 else {"bf16_t", "fp32_t"}
             )
             output_compatible = dtype in allowed
@@ -3333,6 +3498,12 @@ def get_kernel_instance(
         and arch == "gfx1250"
         and instance.kernel_tag in _A16W16_CO_TAGS
         and not os.path.isfile(co_image_path(CO_KERNELS_JSON, instance))
+    ):
+        return None
+    if (
+        family == "a16w16"
+        and instance.kernel_tag in _A16W16_4WAVE_GFX950_TAGS
+        and not _a16w16_4wave_images_present(instance)
     ):
         return None
     return instance
