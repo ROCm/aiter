@@ -2,8 +2,7 @@
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
 """Run the stock TransferBench binary and parse its text output.
 
-This is the only module that knows TransferBench exists. TransferBench is not
-an aiter dependency. It is an optional binary found at run time
+TransferBench is an optional binary found at run time
 (``$TRANSFERBENCH``, then ``PATH``, then the ROCmValidationSuite paths), and
 callers treat its absence as "no roofline" rather than as an error.
 
@@ -83,9 +82,7 @@ def find_binary(explicit: str | None = None) -> str | None:
 
 
 def _duration_ms(gbps: float, ms: float, nbytes: int) -> float:
-    """The row's duration. ``ms`` is printed with three decimals, so it is
-    useless at small sizes. Bytes over bandwidth is exact to the bandwidth's
-    precision, which is printed with more digits."""
+    """The row's duration."""
     if gbps > 0.0 and nbytes > 0:
         return nbytes / 1e6 / gbps
     return ms if ms > 0.0 else math.nan

@@ -9,8 +9,6 @@ the roof does not see any overlap between phases that the op may get. The
 roof is optimistic in every other way: it has no handshakes, no quantization
 or layout work, no cross-GPU ordering, and its launch cost is amortized over
 sub-iterations.
-
-Run it only while no benchmark process holds the GPUs.
 """
 
 from __future__ import annotations
