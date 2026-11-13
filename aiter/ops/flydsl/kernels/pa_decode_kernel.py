@@ -223,7 +223,10 @@ def compile_pa_decode_tile(
 
     ``direct_output`` (gfx950, MXFP4): no plan -- ``work_info`` is the int32 context
     lengths -- one task per sequence, the output written directly with the query's
-    row/head strides (an empty row is zero-filled).
+    row/head strides (an empty row is zero-filled). FP8/BF16 on gfx942/gfx950 accept it
+    with a one-partition plan (capacity equal to the batch): ``pmax`` carries the
+    plan's ``reduce_info``, slot s runs packed task s and zero-fills sequence s
+    when it owns no task, and ``pout`` is the output.
     ``work_capacity`` is a positive host integer matching the work plan.
     Positive ``sliding_window`` includes the query token.
     Plans cover the MTP window union; scores are masked per query row.
@@ -330,7 +333,22 @@ def compile_pa_decode_tile(
 
     @fx.struct
     class SharedStorage:
-        buf: fx.Array[fx.Int32, traits.total_bytes // 4, 16]
+        buf: fx.Array[
+            fx.Int32,
+            (
+                max(
+                    2 * traits.GROUP_LDS_BYTES,
+                    # Dual-group merge: (O, m, l) per group-1 lane.
+                    traits.BLOCK_THREADS
+                    * (traits.VHE_CHUNKS * traits.OP_ELEMS + 2)
+                    * 4,
+                )
+                if traits.DUAL_GROUP
+                else traits.total_bytes
+            )
+            // 4,
+            16,
+        ]
 
     @flyc.jit
     def _pa_decode_tile_task(
@@ -395,10 +413,10 @@ def compile_pa_decode_tile(
         stage_pages=(
             traits.stage_page_capacity if traits.kv_dtype == MXFP4_KV_DTYPE else 0
         ),
-    )
+    ) + ("_dual" if traits.DUAL_GROUP else "")
 
-    @flyc.kernel(name=kernel_name, known_block_size=(traits.BLOCK_THREADS, 1, 1))
-    def pa_decode_tile_kernel(
+    @flyc.jit
+    def _pa_decode_tile_body(
         pmax_ptr: fx.Pointer,
         psum_ptr: fx.Pointer,
         pout_ptr: fx.Pointer,
@@ -439,11 +457,59 @@ def compile_pa_decode_tile(
                 context,
             )
 
+        def _zero_rows(seq):
+            """Zero this CTA's query rows of ``seq`` in the final output."""
+            tid = fx.Int32(gpu.thread_id("x"))
+            row_units = traits.head_dim // 8
+            kv_query = fx.Int32(gpu.block_id("x" if traits.SPLIT_MAJOR else "y"))
+            kv_h = kv_query // traits.query_splits
+            first_row = (
+                (kv_query % traits.query_splits)
+                * traits.QUERIES_PER_CTA
+                * traits.query_group_size
+            )
+            out = fx.recast_iter(traits.OUT_DTYPE, pout_ptr)
+            for it in range_constexpr(
+                -(-traits.CTA_ROWS * row_units // traits.CTA_THREADS)
+            ):
+                unit = tid + it * traits.CTA_THREADS
+                if unit < traits.CTA_ROWS * row_units:
+                    row = first_row + unit // row_units
+                    query_pos = row // traits.query_group_size
+                    head = kv_h * traits.query_group_size + (
+                        row - query_pos * traits.query_group_size
+                    )
+                    offset = (
+                        (seq * traits.query_length + query_pos) * stride_q_row
+                        + head * stride_q_head
+                        + unit % row_units * 8
+                    )
+                    fx.ptr_store(
+                        fx.full(8, 0.0, traits.OUT_DTYPE), fx.add_offset(out, offset)
+                    )
+
         # Skip cleared padding records: no scratch writes or Q loads.
         # This CTA-uniform guard keeps every task barrier convergent.
         slot = fx.Int32(gpu.block_id("y" if traits.SPLIT_MAJOR else "x"))
         work = fx.recast_iter(fx.Int32, work_info_ptr)
-        if const_expr(traits.DIRECT):
+        if const_expr(traits.DIRECT and traits.kv_dtype != MXFP4_KV_DTYPE):
+            # One-partition plan, capacity == batch: slot s runs packed task s
+            # (any sequence's) and zeroes sequence s when it owns no task, as
+            # the reducer would; pmax carries reduce_info. Both loads issue
+            # together.
+            task = fx.ptr_load(
+                fx.add_offset(work, slot * 4),
+                result_type=fx.Vector.make_type(4, fx.Int32),
+            )
+            info = fx.recast_iter(fx.Int32, pmax_ptr)
+            count = fx.Int32(fx.ptr_load(fx.add_offset(info, slot * 2 + 1)))
+            start = fx.Int32(task[1])
+            end = fx.Int32(task[2])
+            if start < end:
+                _run_task(fx.Int32(task[0]), start, end, fx.Int32(task[3]))
+            if count == 0:
+                _zero_rows(slot)
+        elif const_expr(traits.DIRECT):
             # One task per sequence, no plan: ``work_info`` is the context lengths.
             context = fx.Int32(fx.ptr_load(fx.add_offset(work, slot)))
             # Page ids past the staged window come from the block table.
@@ -475,6 +541,129 @@ def compile_pa_decode_tile(
             if start < end:
                 _run_task(fx.Int32(task[0]), start, end, fx.Int32(task[3]))
 
+    if architecture == "gfx950":
+        # Lead with what the task prologue reads first, so it fits the 14
+        # dwords that preload into user SGPRs: the task record, the page ids,
+        # Q, and pmax (reduce_info on one-partition plans). K/V and scale
+        # pointers are first used after the page ids arrive.
+        @flyc.kernel(name=kernel_name, known_block_size=(traits.CTA_THREADS, 1, 1))
+        def pa_decode_tile_kernel(
+            work_info_ptr: fx.Pointer,
+            block_tables_ptr: fx.Pointer,
+            query_ptr: fx.Pointer,
+            max_blocks_per_seq: fx.Int32,
+            num_sequences: fx.Int32,
+            stride_q_row: fx.Int32,
+            stride_q_head: fx.Int32,
+            pmax_ptr: fx.Pointer,
+            key_cache_ptr: fx.Pointer,
+            value_cache_ptr: fx.Pointer,
+            key_scale_ptr: fx.Pointer,
+            value_scale_ptr: fx.Pointer,
+            stride_ks_block: fx.Int32,
+            stride_ks_head: fx.Int32,
+            psum_ptr: fx.Pointer,
+            pout_ptr: fx.Pointer,
+        ):
+            _pa_decode_tile_body(
+                pmax_ptr,
+                psum_ptr,
+                pout_ptr,
+                query_ptr,
+                key_cache_ptr,
+                value_cache_ptr,
+                block_tables_ptr,
+                key_scale_ptr,
+                value_scale_ptr,
+                max_blocks_per_seq,
+                stride_ks_block,
+                stride_ks_head,
+                stride_q_row,
+                stride_q_head,
+                work_info_ptr,
+                num_sequences,
+            )
+
+        def _tile_args(
+            pmax,
+            psum,
+            pout,
+            query,
+            key_cache,
+            value_cache,
+            block_tables,
+            key_scale,
+            value_scale,
+            max_blocks_per_seq,
+            stride_ks_block,
+            stride_ks_head,
+            stride_q_row,
+            stride_q_head,
+            work_info,
+            num_seqs,
+        ):
+            return (
+                work_info,
+                block_tables,
+                query,
+                max_blocks_per_seq,
+                num_seqs,
+                stride_q_row,
+                stride_q_head,
+                pmax,
+                key_cache,
+                value_cache,
+                key_scale,
+                value_scale,
+                stride_ks_block,
+                stride_ks_head,
+                psum,
+                pout,
+            )
+
+    else:
+
+        @flyc.kernel(name=kernel_name, known_block_size=(traits.CTA_THREADS, 1, 1))
+        def pa_decode_tile_kernel(
+            pmax_ptr: fx.Pointer,
+            psum_ptr: fx.Pointer,
+            pout_ptr: fx.Pointer,
+            query_ptr: fx.Pointer,
+            key_cache_ptr: fx.Pointer,
+            value_cache_ptr: fx.Pointer,
+            block_tables_ptr: fx.Pointer,
+            key_scale_ptr: fx.Pointer,
+            value_scale_ptr: fx.Pointer,
+            max_blocks_per_seq: fx.Int32,
+            stride_ks_block: fx.Int32,
+            stride_ks_head: fx.Int32,
+            stride_q_row: fx.Int32,
+            stride_q_head: fx.Int32,
+            work_info_ptr: fx.Pointer,
+            num_sequences: fx.Int32,
+        ):
+            _pa_decode_tile_body(
+                pmax_ptr,
+                psum_ptr,
+                pout_ptr,
+                query_ptr,
+                key_cache_ptr,
+                value_cache_ptr,
+                block_tables_ptr,
+                key_scale_ptr,
+                value_scale_ptr,
+                max_blocks_per_seq,
+                stride_ks_block,
+                stride_ks_head,
+                stride_q_row,
+                stride_q_head,
+                work_info_ptr,
+                num_sequences,
+            )
+
+        def _tile_args(*args):
+            return args
+
     @flyc.jit
     def pa_decode_tile_launch(
         pmax: fx.Pointer,
@@ -500,33 +689,43 @@ def compile_pa_decode_tile(
         # Ambient contract permits FMAs; explicit per-op fastmath still wins.
         with CompilationContext.compile_hints({"fastmath": "contract"}):
             pa_decode_tile_kernel(
-                pmax,
-                psum,
-                pout,
-                query,
-                key_cache,
-                value_cache,
-                block_tables,
-                key_scale,
-                value_scale,
-                max_blocks_per_seq,
-                stride_ks_block,
-                stride_ks_head,
-                stride_q_row,
-                stride_q_head,
-                work_info,
-                num_seqs,
+                *_tile_args(
+                    pmax,
+                    psum,
+                    pout,
+                    query,
+                    key_cache,
+                    value_cache,
+                    block_tables,
+                    key_scale,
+                    value_scale,
+                    max_blocks_per_seq,
+                    stride_ks_block,
+                    stride_ks_head,
+                    stride_q_row,
+                    stride_q_head,
+                    work_info,
+                    num_seqs,
+                )
             ).launch(
                 grid=(
                     (num_kv_heads * traits.query_splits, work_capacity, 1)
                     if traits.SPLIT_MAJOR
                     else (work_capacity, num_kv_heads * traits.query_splits, 1)
                 ),
-                block=(traits.BLOCK_THREADS, 1, 1),
+                block=(traits.CTA_THREADS, 1, 1),
                 stream=stream,
             )
 
-    if traits.WAVES_PER_EU_2:
+    if architecture == "gfx950":
+        # The leading arguments preload into the free user SGPRs (14 dwords on
+        # gfx950), so the task skips a kernarg round trip.
+        pa_decode_tile_launch.compile_hints["llvm_options"] = {
+            "amdgpu-kernarg-preload": AITER_FLYDSL_KERNARG_PRELOAD,
+            "amdgpu-kernarg-preload-count": min(16, AITER_FLYDSL_KERNARG_PRELOAD_COUNT),
+        }
+    if traits.FP8_MTP4_LEAN or traits.WAVES_PER_EU_2:
+        # Two CTAs per CU: hold the allocator to 256 registers per wave.
         pa_decode_tile_launch.compile_hints["waves_per_eu"] = 2
     compiled = {
         "launch": pa_decode_tile_launch,

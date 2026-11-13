@@ -14,6 +14,7 @@ from flydsl.expr import const_expr, gpu, range_constexpr
 from flydsl.expr.rocdl import tdm_ops
 from flydsl.expr.typing import ReductionOp
 
+from ..tensor_shim import buf_base_i64
 from ..utils import rcp_f32
 from .op_epilog import PaDecodeEpilogue
 from .op_gemm import Gfx1250Gemm, PaDecodeGemm
@@ -48,6 +49,279 @@ class PaDecodePipeline:
     @flyc.jit
     def run(self):
         """Initialize resources in load order, then compute and store one CTA."""
+        if const_expr(self.traits.BF16_MTP_FUSED):
+            self.run_bf16_fused()
+        else:
+            self.run_generic()
+
+    @flyc.jit
+    def run_bf16_fused(self):
+        """Q, then tile-0 K and V, then tile-1 page ids: in-order vmcnt waits
+        for an earlier group never drain a later one."""
+        self.ctx.init_thread_mapping()
+        self.epilogue.init_outputs()
+        self.kv.init_loaders()
+        # V is consumed once and last (PV): stream it, keep K's lines cacheable.
+        self.kv._v_load_vector = self.bf16_nt_loader(self.ctx.value_cache_ptr)
+        self.query.init_loaders()
+        self.ctx.init_query_mapping()
+        q_units = self.bf16_q_prefetch()
+        self.ctx.init_context_length()
+        self.kv.init_page_table()
+        self.ctx.init_partition_bounds()
+        self.lds.allocate()
+        # The kernel runs a task only when part_start < part_end.
+        pages0 = self.tile_pages(self.ctx.part_start)
+        k_pf0 = self.kv.load_k_from_pages(
+            fx.Vector.from_elements([pages0[0]], dtype=fx.Int32)
+        )
+        v_pf0 = []
+        for vh in range_constexpr(self.traits.VHE_CHUNKS):
+            v_pf0.extend(
+                self.kv.load_v(fx.Vector.from_elements([pages0[1]], dtype=fx.Int32), vh)
+            )
+        pages1 = self.tile_pages(self.ctx.part_start + 1)
+        self.ctx.init_scales(None, None)
+        self.bf16_stage_q(q_units)
+        gpu.barrier()
+        self.softmax.init_mask()
+        self.ctx.init_causal_offsets()
+        o_zero = fx.full(self.traits.OP_ELEMS, 0.0, fx.Float32)
+        init_state = [k_pf0, pages1]
+        for _m in range_constexpr(self.traits.M_TILES):
+            init_state.extend(
+                [o_zero] * self.traits.VHE_CHUNKS + [self.ctx.NEG_INF, self.ctx.ZERO_F]
+            )
+        init_state.append(fx.Vector.from_elements(v_pf0, dtype=fx.Int64))
+        # The task's last tile is peeled: it carries the V tail mask and
+        # issues no next-tile loads, so the loop body has no branches.
+        for loop_i, ostate in range(
+            self.ctx.part_start, self.ctx.part_end - 1, 1, init=init_state
+        ):
+            next_state = self.bf16_fused_tile(ostate, fx.Int32(loop_i), False)
+            results = yield next_state
+        o_final = self.bf16_fused_tile(results, self.ctx.part_end - 1, True)
+        self.epilogue.store(o_final)
+
+    def bf16_nt_loader(self, tensor_ptr):
+        """Nontemporal 16-byte loads at BF16 element ``elem_idx``."""
+        base = buf_base_i64(tensor_ptr)
+        ptr_ty = fx.PointerType.get(
+            fx.Int32.ir_type, address_space=fx.AddressSpace.Global, alignment=16
+        )
+
+        def _load(elem_idx):
+            ptr = fx.Pointer(fx.inttoptr(ptr_ty, base + fx.Int64(elem_idx) * 2))
+            return fx.generic_load(ptr, dtype=fx.Int32, count=4, nontemporal=True)
+
+        return _load
+
+    def tile_pages(self, tt):
+        """[page of this warp's K chunk, page of this rgroup's V run] of tile tt.
+
+        Past the context the table load is pinned to page 0, which a tile
+        never consumes.
+        """
+        base_page = tt * (KV_COMPUTE_BLOCK // self.traits.block_size)
+        k_page = self.kv.load_pages(
+            base_page
+            + (self.ctx.warp * self.traits.TOK_PER_WARP) // self.traits.block_size
+        )
+        v_page = self.kv.load_pages(
+            base_page
+            + (self.ctx.rgroup * self.traits.TOK_PER_WARP) // self.traits.block_size
+        )
+        return fx.Vector.from_elements([k_page, v_page], dtype=fx.Int32)
+
+    def bf16_q_prefetch(self):
+        # Full M-tiles load Q ahead of the K/V bursts; a padded tile loads late.
+        q_units = []
+        for m in range_constexpr(self.traits.M_TILES):
+            if const_expr((m + 1) * MFMA_MNK <= self.traits.CTA_ROWS):
+                flat_idx = m * MFMA_MNK + self.ctx.qh_local
+                qi = flat_idx // self.traits.query_group_size
+                gs_head = flat_idx - qi * self.traits.query_group_size
+                q_units.append(self.query.load_row(qi, gs_head))
+            else:
+                q_units.append(None)
+        return q_units
+
+    @flyc.jit
+    def bf16_stage_q(self, q_units):
+        """Stage Q rows at Q_ROW_BYTES, zero-filling rows past CTA_ROWS."""
+        t = self.traits
+        for m in range_constexpr(t.M_TILES):
+            flat_idx = m * MFMA_MNK + self.ctx.qh_local
+            row_off = flat_idx * t.Q_ROW_BYTES + self.ctx.lane16 * (
+                t.QCHUNK * t.QP_ELEM_BYTES
+            )
+            if const_expr((m + 1) * MFMA_MNK <= t.CTA_ROWS):
+                for u in range_constexpr(t.N_QLOADS):
+                    self.lds.store(
+                        row_off + u * t.QLOAD_UNIT * 2, fx.BFloat16, q_units[m][u]
+                    )
+            elif flat_idx < t.CTA_ROWS:
+                qi = flat_idx // t.query_group_size
+                gs_head = flat_idx - qi * t.query_group_size
+                units = self.query.load_row(qi, gs_head)
+                for u in range_constexpr(t.N_QLOADS):
+                    self.lds.store(
+                        row_off + u * t.QLOAD_UNIT * 2, fx.BFloat16, units[u]
+                    )
+            else:
+                for u in range_constexpr(t.N_QLOADS):
+                    self.lds.store(
+                        row_off + u * t.QLOAD_UNIT * 2,
+                        fx.BFloat16,
+                        fx.full(t.QLOAD_UNIT, 0.0, fx.BFloat16),
+                    )
+
+    def bf16_q_ops(self, m):
+        """One M-tile's QK B operands in PaDecodeKVLoader.load_k_chunk's order."""
+        t = self.traits
+        ops = []
+        for qkhe in range_constexpr(t.QKHE_LOOP):
+            he_idx = qkhe * t.RGROUP_QUARTERS + self.ctx.rgroup
+            # Volatile: a reread must not merge with (and extend the live
+            # range of) an earlier chunk group's Q operands.
+            chunk = fx.generic_load(
+                self.lds.pointer(
+                    (m * MFMA_MNK + self.ctx.lane16) * t.Q_ROW_BYTES
+                    + he_idx * t.QK_CHUNK_ELEMS * t.QP_ELEM_BYTES,
+                    fx.Int64,
+                ),
+                dtype=fx.Int64,
+                count=4,
+                volatile=True,
+            )
+            for qkr in range_constexpr(4):
+                ops.append(chunk[qkr])
+        return ops
+
+    def bf16_pv(self, ostate, m, v_cur, corr, last, v_masks, tile_valid, v_next):
+        """O_m = O_m * corr + P_m V; with ``v_next`` (a list), each retired V
+        chunk is refilled with the next tile's V right after its last MFMA."""
+        t = self.traits
+        l_new = ostate[t.l_slot(m)] * corr + self.softmax.fused_row_sum(m)
+        p_ops = self.lds.load(
+            self.softmax.p_offset(m)
+            + self.ctx.lane16 * t.SP_ROW_BYTES
+            + self.ctx.rgroup * t.TOK_PER_WARP * t.QP_ELEM_BYTES,
+            fx.Int64,
+            t.NVOPS,
+        )
+        corr_b = fx.full(t.OP_ELEMS, corr, fx.Float32)
+        o_acc = []
+        for vh in range_constexpr(t.VHE_CHUNKS):
+            if const_expr(last and m == 0):
+                v_cur[vh] = self.kv.mask_v_chunk(v_cur[vh], v_masks, tile_valid)
+            o_acc.append(
+                self.gemm.pv_bf16_k32(
+                    v_cur[vh], p_ops, ostate[t.o_slot(m, vh)] * corr_b
+                )
+            )
+            if const_expr(v_next is not None):
+                v_next[0].extend(self.kv.load_v(v_next[1], vh))
+        return o_acc, l_new
+
+    @flyc.jit
+    def bf16_fused_tile(self, ostate, tt, last):
+        """QK -> max barrier -> P of the first half of the M-tiles -> barrier ->
+        their PV overlapping the second half's P -> barrier -> its PV.
+
+        ``last`` peels the task's final tile: it masks V rows past the context
+        and issues no next-tile loads. Other tiles issue next K as scores die
+        and next V while the final M-tile's PV retires the current V.
+        """
+        t = self.traits
+        k_cur = ostate[t.K_SLOT]
+        pages_next = ostate[t.V_SLOT]
+        v_carried = ostate[t.V_DATA_SLOT]
+        v_cur = [
+            [v_carried[vh * t.NVOPS + i] for i in range_constexpr(t.NVOPS)]
+            for vh in range_constexpr(t.VHE_CHUNKS)
+        ]
+        tile_valid = self.ctx.context_len - tt * KV_COMPUTE_BLOCK
+
+        # K chunk groups outer: each K chunk dies after its last M-tile.
+        frags = [[None] * t.NCHUNK for _m in range_constexpr(t.M_TILES)]
+        for g in range_constexpr(t.NCHUNK // t.QK_AGROUP):
+            for m in range_constexpr(t.M_TILES):
+                q_ops = self.bf16_q_ops(m)
+                for j in range_constexpr(t.QK_AGROUP):
+                    a = g * t.QK_AGROUP + j
+                    frags[m][a] = self.gemm.qk_bf16_k32(k_cur, q_ops, a)
+        masked_saved = self.softmax.fused_scores(frags, tile_valid)
+        for m in range_constexpr(t.M_TILES):
+            self.softmax.fused_stage_max(masked_saved[m], m)
+        gpu.barrier()
+
+        half = t.M_TILES // 2
+        m_new = [None] * t.M_TILES
+        corr = [None] * t.M_TILES
+        for m in range_constexpr(half):
+            m_new[m], corr[m] = self.softmax.pack_fused_bf16(
+                masked_saved[m], m, ostate[t.m_slot(m)]
+            )
+        k_flat = []
+        k_page = fx.Int32(pages_next[0])
+        if const_expr(not last):
+            # The first half's scores are dead: start next K.
+            for a in range_constexpr(t.NCHUNK // 2):
+                k_flat.extend(self.kv.load_k_chunk(k_page, a))
+        gpu.barrier()
+
+        v_masks = self.kv.tail_masks(tile_valid) if const_expr(last) else None
+        o_res = [None] * t.M_TILES
+        l_res = [None] * t.M_TILES
+        # Published PV MFMAs overlap the second half's exp/pack VALU.
+        for i in range_constexpr(t.M_TILES - half):
+            if const_expr(i < half):
+                o_res[i], l_res[i] = self.bf16_pv(
+                    ostate, i, v_cur, corr[i], last, v_masks, tile_valid, None
+                )
+            m_new[half + i], corr[half + i] = self.softmax.pack_fused_bf16(
+                masked_saved[half + i], half + i, ostate[t.m_slot(half + i)]
+            )
+        next_pages = pages_next
+        if const_expr(not last):
+            for a in range_constexpr(t.NCHUNK // 2, t.NCHUNK):
+                k_flat.extend(self.kv.load_k_chunk(k_page, a))
+        gpu.barrier()
+
+        v_next = []
+        for m in range_constexpr(half, t.M_TILES):
+            refill = None
+            if const_expr(not last and m == t.M_TILES - 1):
+                # Ahead of V on vmcnt: next K's wait never drains V.
+                next_pages = self.tile_pages(tt + 2)
+                refill = (
+                    v_next,
+                    fx.Vector.from_elements([pages_next[1]], dtype=fx.Int32),
+                )
+            o_res[m], l_res[m] = self.bf16_pv(
+                ostate, m, v_cur, corr[m], last, v_masks, tile_valid, refill
+            )
+
+        next_state = [
+            (
+                k_cur
+                if const_expr(last)
+                else fx.Vector.from_elements(k_flat, dtype=fx.Int64)
+            ),
+            next_pages,
+        ]
+        for m in range_constexpr(t.M_TILES):
+            next_state.extend([*o_res[m], m_new[m], l_res[m]])
+        if const_expr(last):
+            next_state.append(v_carried)
+        else:
+            next_state.append(fx.Vector.from_elements(v_next, dtype=fx.Int64))
+        return next_state
+
+    @flyc.jit
+    def run_generic(self):
+        """Initialize resources in load order, then compute and store one CTA."""
         self.ctx.init_thread_mapping()
         self.epilogue.init_outputs()
         self.kv.init_loaders()
@@ -58,37 +332,155 @@ class PaDecodePipeline:
         self.ctx.init_context_length()
         self.kv.init_page_table()
         self.ctx.init_partition_bounds()
-        self.lds.allocate()
+        self.lds.allocate(self.ctx.group)
         self.kv.init_scale_loaders()
         if const_expr(self.traits.stage_page_capacity):
             self.kv.stage_page_ids()
             gpu.barrier()
-        k_pf0 = self.kv.prefetch_first()
-        if const_expr(self.traits.kv_dtype == MXFP4_KV_DTYPE):
-            v_page_pf0 = self.kv.mxfp4_prefetch("v")
-        self.ctx.init_scales(self.kv.key_scale, self.kv.value_scale)
-        self.query.stage(q_units_prefetched)
+        pages1 = None
+        if const_expr(self.traits.FP8_MTP4_PAGES_AHEAD):
+            k_pf0, v_page_pf0, pages1, scale_stores = self.fp8_mtp4_prefetch()
+            self.ctx.init_scales(self.kv.key_scale, self.kv.value_scale)
+            self.query.stage(q_units_prefetched)
+            self.kv.store_scales(scale_stores)
+        elif const_expr(self.traits.FP8_SCALES_AFTER_Q):
+            # Scale LDS stores wait on vmcnt behind K: issue them after Q
+            # staging, so every Q row quantizes while K is in flight.
+            k_pf0, scale_stores = self.kv.prefetch_first_scales_deferred()
+            self.ctx.init_scales(self.kv.key_scale, self.kv.value_scale)
+            self.query.stage(q_units_prefetched)
+            self.kv.store_scales(scale_stores)
+        else:
+            k_pf0 = self.kv.prefetch_first()
+            if const_expr(self.traits.kv_dtype == MXFP4_KV_DTYPE):
+                v_page_pf0 = self.kv.mxfp4_prefetch("v")
+            self.ctx.init_scales(self.kv.key_scale, self.kv.value_scale)
+            self.query.stage(q_units_prefetched)
         gpu.barrier()
-        if const_expr(self.traits.kv_dtype != MXFP4_KV_DTYPE):
+        if const_expr(
+            self.traits.kv_dtype != MXFP4_KV_DTYPE
+            and not self.traits.FP8_MTP4_PAGES_AHEAD
+        ):
             v_page_pf0 = self.kv.read_v_pages()
         if const_expr(self.traits.STREAM_KV):
             # Streamed tiles stage the next tile's page ids at the tile start;
             # every wave must have read the first tile's ids before that.
             gpu.barrier()
-        q_ops_all = self.query.load_operands()
+        q_ops_all = (
+            None
+            if const_expr(self.traits.FP8_MTP4_Q_LDS)
+            else self.query.load_operands()
+        )
         self.softmax.init_mask()
         self.ctx.init_causal_offsets()
-        o_final = self.mainloop(k_pf0, v_page_pf0, q_ops_all)
-        if const_expr(self.traits.kv_dtype == MXFP4_KV_DTYPE):
+        o_final = self.mainloop(k_pf0, v_page_pf0, q_ops_all, pages1)
+        if const_expr(
+            (self.traits.kv_dtype == MXFP4_KV_DTYPE) and self.traits.DUAL_GROUP
+        ):
+            # Lane-wise (O, max, sum) merge, then group 0's four-wave merge;
+            # its barrier passes once group 1's waves have ended.
+            o_final = self.merge_groups(o_final)
+            if self.ctx.group == 0:
+                self.epilogue.store_mxfp4(o_final)
+        elif const_expr(self.traits.kv_dtype == MXFP4_KV_DTYPE):
             self.epilogue.store_mxfp4(o_final)
+        elif const_expr(self.traits.DUAL_GROUP):
+            o_final = self.merge_groups(o_final)
+            if self.ctx.group == 0:
+                self.epilogue.store(o_final)
         else:
             self.epilogue.store(o_final)
 
+    def publish_group_state(self, o_final, slot):
+        """Write this lane's (O, m, l) at byte ``slot`` of the whole allocation."""
+        t = self.traits
+        for vh in range_constexpr(t.VHE_CHUNKS):
+            fx.ptr_store(
+                o_final[t.o_slot(0, vh)],
+                self.lds.root_pointer(slot + vh * t.OP_ELEMS * 4, fx.Float32),
+            )
+        fx.ptr_store(
+            fx.Vector.from_elements(
+                [o_final[t.m_slot(0)], o_final[t.l_slot(0)]], dtype=fx.Float32
+            ),
+            self.lds.root_pointer(slot + t.VHE_CHUNKS * t.OP_ELEMS * 4, fx.Float32),
+        )
+
     @flyc.jit
-    def mainloop(self, k_pf0, v_page_pf0, q_ops_all):
-        """Carry prefetch operands and online-softmax state between KV tiles."""
+    def merge_groups(self, o_final):
+        """Fold dual group 1's online-softmax state into group 0's.
+
+        Lanes of both groups hold the same rows and head dims. After a barrier
+        retires every tile's LDS use, group 1 publishes (O, m, l) per lane over
+        the whole allocation; group 0 rescales both to the shared maximum.
+        """
+        t = self.traits
+        n = t.VHE_CHUNKS * t.OP_ELEMS
+        slot = self.ctx.tid * ((n + 2) * 4)
+        gpu.barrier()
+        if self.ctx.group == 1:
+            self.publish_group_state(o_final, slot)
+        gpu.barrier()
+        ml = fx.ptr_load(
+            self.lds.root_pointer(slot + n * 4, fx.Float32),
+            result_type=fx.Vector.make_type(2, fx.Float32),
+        )
+        m0 = o_final[t.m_slot(0)]
+        m1 = fx.Float32(ml[0])
+        m = fx.maxnumf(m0, m1)
+        safe = (m > self.ctx.NEG_INF).select(m, self.ctx.ZERO_F)
+        a0 = fx.Float32(fx.exp2(m0 - safe, fastmath="fast"))
+        a1 = fx.Float32(fx.exp2(m1 - safe, fastmath="fast"))
+        merged = list(o_final)
+        a0_b = fx.full(t.OP_ELEMS, a0, fx.Float32)
+        a1_b = fx.full(t.OP_ELEMS, a1, fx.Float32)
+        for vh in range_constexpr(t.VHE_CHUNKS):
+            o1 = fx.ptr_load(
+                self.lds.root_pointer(slot + vh * t.OP_ELEMS * 4, fx.Float32),
+                result_type=fx.Vector.make_type(t.OP_ELEMS, fx.Float32),
+            )
+            merged[t.o_slot(0, vh)] = (
+                o_final[t.o_slot(0, vh)] * a0_b + fx.Vector(o1) * a1_b
+            )
+        merged[t.m_slot(0)] = m
+        merged[t.l_slot(0)] = o_final[t.l_slot(0)] * a0 + fx.Float32(ml[1]) * a1
+        if const_expr(t.kv_dtype == MXFP4_KV_DTYPE):
+            # The MXFP4 store merges its waves through LDS that overlaps the
+            # merge slots: every lane reads its slot first.
+            gpu.barrier()
+        return merged
+
+    def fp8_mtp4_prefetch(self):
+        """First tile's scales and K, then the next tile's page ids.
+
+        The scales lead on vmcnt, so their LDS stores (after Q staging) do
+        not drain K. V issues after the barrier (V with K delays QK).
+        """
+        pages0 = self.tile_pages(self.ctx.part_start)
+        k_page0 = fx.Vector.from_elements([pages0[0]], dtype=fx.Int32)
+        scale_stores = self.kv.stage_scales(
+            k_page0,
+            self.kv.scale_buffer_offset(fx.Int32(self.ctx.part_start)),
+            self.ctx.part_start,
+            defer=True,
+        )
+        k_pf0 = self.kv.load_k_from_pages(k_page0)
+        pages1 = self.tile_pages(self.ctx.part_start + 1)
+        v_page0 = fx.Vector.from_elements([pages0[1]], dtype=fx.Int32)
+        return k_pf0, v_page0, pages1, scale_stores
+
+    @flyc.jit
+    def mainloop(self, k_pf0, v_page_pf0, q_ops_all, pages_next=None):
+        """Carry prefetch operands and online-softmax state between KV tiles.
+
+        ``pages_next`` (FP8_MTP4_PAGES_AHEAD) replaces the carried V page ids
+        with the next tile's K/V page ids.
+        """
         o_zero = fx.full(self.traits.OP_ELEMS, 0.0, fx.Float32)
-        init_state = [k_pf0, v_page_pf0]
+        init_state = [
+            k_pf0,
+            v_page_pf0 if const_expr(pages_next is None) else pages_next,
+        ]
         for _m in range_constexpr(self.traits.M_TILES):
             init_state.extend(
                 [o_zero] * self.traits.VHE_CHUNKS + [self.ctx.NEG_INF, self.ctx.ZERO_F]
@@ -110,6 +502,25 @@ class PaDecodePipeline:
             o_final = self.tile(
                 init_state, fx.Int32(self.ctx.part_start), multi_query, q_ops_all, True
             )
+        elif const_expr(self.traits.DUAL_GROUP):
+            # Group tiles part_start + 2j; only the peeled last one can hold
+            # the task's tail or lie past it.
+            for loop_j, ostate in range(0, self.ctx.dual_iters - 1, 1, init=init_state):
+                next_state = self.tile(
+                    ostate,
+                    self.ctx.part_start + fx.Int32(loop_j) * 2,
+                    multi_query,
+                    q_ops_all,
+                    False,
+                )
+                results = yield next_state
+            o_final = self.tile(
+                results,
+                self.ctx.part_start + 2 * (self.ctx.dual_iters - 1),
+                multi_query,
+                q_ops_all,
+                True,
+            )
         else:
             # Only a sequence's last tile reads rows past its context, so the
             # loop leaves out the V tail mask and the task's last tile is
@@ -122,13 +533,25 @@ class PaDecodePipeline:
                 )
                 results = yield next_state
             o_final = self.tile(
-                results, self.ctx.part_end - 1, multi_query, q_ops_all, True
+                results,
+                self.ctx.part_end - 1,
+                multi_query,
+                q_ops_all,
+                True,
+                has_next=not (
+                    self.traits.DECODE_LAST_V_AFTER_QK
+                    or self.traits.FP8_LOOP_SCALES_LATE
+                    or self.traits.FP8_MTP4_PAGES_AHEAD
+                ),
             )
         return o_final
 
     @flyc.jit
-    def tile(self, ostate, tt, multi_query, q_ops_all, mask_tail):
-        """Run one KV tile; ``mask_tail`` emits the V mask for rows past the context."""
+    def tile(self, ostate, tt, multi_query, q_ops_all, mask_tail, has_next=True):
+        """Run one KV tile; ``mask_tail`` emits the V mask for rows past the context.
+
+        ``has_next=False`` marks the task's last tile: it emits no next-tile loads.
+        """
         k_cur = ostate[
             self.traits.K_SLOT
         ]  # this tile's prefetched K, as one (NCHUNK*N_SUBCHUNKS,) i64 vector
@@ -142,7 +565,7 @@ class PaDecodePipeline:
         ):
             fx.rocdl.iglp_opt(0)
 
-        tt1 = tt + 1
+        tt1 = tt + (2 if const_expr(self.traits.DUAL_GROUP) else 1)
 
         cur_kv_buf = self.kv.scale_buffer_offset(tt)
 
@@ -160,6 +583,11 @@ class PaDecodePipeline:
         if const_expr(self.traits.per_token_kv):
             scale_bounds = self.softmax.scale_mask(tile_valid, window_left)
 
+        # Next page ids go ahead of this tile's V (PAGE16_PAGES_FIRST). Past
+        # the task they read masked ids, which only the guarded staging sees.
+        pages_ahead = None
+        if const_expr(self.traits.PAGE16_PAGES_FIRST and has_next):
+            pages_ahead = self.kv.load_tile_pages(tt1)
         # The next tile's page ids lead this tile's V loads on the in-order
         # vmcnt chain, so waiting for them does not also wait for V.
         pages_early = None
@@ -228,6 +656,7 @@ class PaDecodePipeline:
                 q_scale_vec,
                 q_ops_all,
                 mask_tail,
+                has_next,
                 pages_early,
             )
         if const_expr(self.traits.kv_dtype == MXFP4_KV_DTYPE):
@@ -248,6 +677,8 @@ class PaDecodePipeline:
             q_ops_all,
             q_scale_vec,
             mask_tail,
+            has_next,
+            pages_ahead,
             pages_early,
         )
 
@@ -266,11 +697,14 @@ class PaDecodePipeline:
         q_scale_vec,
         q_ops_all,
         mask_tail,
+        has_next=True,
         pages_early=None,
     ):
         """Publish all query maxima together, then consume shared K/V per query."""
         next_state = [None, None]
         masked_chunks_saved = [None] * self.traits.M_TILES
+        # FP8_MTP4_PAGES_AHEAD: v_page_cur holds the next tile's page ids.
+        pages_ahead = self.traits.FP8_MTP4_PAGES_AHEAD
 
         # Reread V scales after Phase A to reduce peak register liveness.
         k_scale_shared = None
@@ -285,8 +719,20 @@ class PaDecodePipeline:
                 for a in range_constexpr(self.traits.NCHUNK)
             ]
 
+        row_scales = [None] * self.traits.M_TILES
+        lane_maxes = [None] * self.traits.M_TILES
+        q_ops_tile = None
+        if const_expr(self.traits.FP8_MTP4_Q_LDS):
+            # One LDS round trip for every M-tile; each dies after its QK.
+            q_ops_tile = [
+                self.query.load_operands_m(m)
+                for m in range_constexpr(self.traits.M_TILES)
+            ]
         for m in range_constexpr(self.traits.M_TILES):
-            frag_Ss = self.gemm.qk(k_cur, q_ops_all, m)
+            if const_expr(self.traits.FP8_MTP4_Q_LDS):
+                frag_Ss = self.gemm.qk(k_cur, q_ops_tile[m], 0)
+            else:
+                frag_Ss = self.gemm.qk(k_cur, q_ops_all, m)
 
             scale = (
                 self.ctx.scale_qk
@@ -297,19 +743,40 @@ class PaDecodePipeline:
                 frag_Ss, scale, k_scale_shared, tile_valid, window_left, m
             )
 
-            self.softmax.stage_row_max(
-                masked_chunks, self.softmax.lmax_offset(m), scale, True
-            )
+            if const_expr(self.traits.FP8_MTP4_LEAN):
+                # Unscaled row max. A zero-Q row has scale 0 and all-zero
+                # scores: scale 1 keeps them, and -inf * 0 never occurs.
+                lane_maxes[m] = self.softmax.lane_row_max(masked_chunks)
+                row_scales[m] = (scale > self.ctx.ZERO_F).select(scale, fx.Float32(1.0))
+            else:
+                self.softmax.stage_row_max(
+                    masked_chunks, self.softmax.lmax_offset(m), scale, True
+                )
 
             masked_chunks_saved[m] = masked_chunks
 
+        if const_expr(self.traits.FP8_MTP4_LEAN):
+            self.softmax.stage_max4(lane_maxes)
         # Publish next pages/scales with the Phase A barrier.
         k_next = (
             fx.full(self.traits.NCHUNK * self.traits.N_SUBCHUNKS, 0, fx.Int64)
             if const_expr(self.traits.MTP4_FUSED)
             else k_cur
         )
-        if const_expr(not self.traits.single_tile_plan) and tt1 < self.ctx.part_end:
+        next_scale_stores = None
+        pages_after = v_page_cur
+        if const_expr(pages_ahead):
+            if const_expr(has_next):
+                # Page ids are in registers: the next scales issue without a
+                # wait and land in LDS before the second barrier.
+                next_scale_stores = self.kv.stage_scales(
+                    fx.Vector.from_elements([v_page_cur[0]], dtype=fx.Int32),
+                    self.kv.scale_buffer_offset(tt1),
+                    tt1,
+                    defer=True,
+                )
+                pages_after = self.tile_pages(tt1 + 1)
+        elif const_expr(not self.traits.single_tile_plan) and tt1 < self.ctx.part_end:
             if const_expr(self.traits.MTP4_FUSED):
                 # Defer K until P packing releases saved score registers.
                 phys_vec1 = self.kv.fetch_v_pages(tt1)
@@ -334,9 +801,13 @@ class PaDecodePipeline:
         gpu.barrier()
 
         v_page_next = v_page_cur
-        if const_expr(not self.traits.single_tile_plan) and tt1 < self.ctx.part_end:
-            v_page_next = self.kv.read_v_pages()
-        next_state[self.traits.V_SLOT] = v_page_next
+        if const_expr(pages_ahead):
+            v_page_next = fx.Vector.from_elements([v_page_cur[1]], dtype=fx.Int32)
+            next_state[self.traits.V_SLOT] = pages_after
+        else:
+            if const_expr(not self.traits.single_tile_plan) and tt1 < self.ctx.part_end:
+                v_page_next = self.kv.read_v_pages()
+            next_state[self.traits.V_SLOT] = v_page_next
 
         # Large M-tile groups reread scale chunks to bound VGPR liveness.
         v_scale_shared = None
@@ -355,18 +826,31 @@ class PaDecodePipeline:
                 ]
             # V-scale normalization is shared by all query rows.
             v_max_scaled, norm_factor_b = self.softmax.v_scale_normalization()
-
-            # Private P/Lsum slots share one barrier without overwrite races.
-            m_new_saved = self.softmax.pack_fused(
-                masked_chunks_saved, ostate, cur_kv_buf, norm_factor_b
-            )
+            if const_expr(self.traits.FP8_MTP4_LEAN):
+                m_new_saved = self.softmax.pack_fused_lean(
+                    masked_chunks_saved, ostate, cur_kv_buf, norm_factor_b, row_scales
+                )
+            else:
+                # Private P/Lsum slots share one barrier without overwrite races.
+                m_new_saved = self.softmax.pack_fused(
+                    masked_chunks_saved, ostate, cur_kv_buf, norm_factor_b
+                )
             if const_expr(not self.traits.MTP4_PREFETCH_V and self.traits.trans_v):
                 # Overlap current V with next K and the P barrier.
                 v_vh_shared = [
                     self.kv.load_v(v_page_cur, vh)
                     for vh in range_constexpr(self.traits.VHE_CHUNKS)
                 ]
-            if const_expr(not self.traits.single_tile_plan) and tt1 < self.ctx.part_end:
+            if const_expr(pages_ahead):
+                if const_expr(has_next):
+                    k_next = self.kv.load_k_from_pages(
+                        fx.Vector.from_elements([v_page_cur[0]], dtype=fx.Int32)
+                    )
+                    # Behind next K on vmcnt; read after this barrier.
+                    self.kv.store_scales(next_scale_stores)
+            elif (
+                const_expr(not self.traits.single_tile_plan) and tt1 < self.ctx.part_end
+            ):
                 # Saved scores are dead; next K can overlap the P barrier/PV.
                 k_next = self.kv.load_k_from_pages(self.kv.read_k_pages())
             next_state[self.traits.K_SLOT] = k_next
@@ -431,7 +915,12 @@ class PaDecodePipeline:
                     ):
                         # Reuse the dead V chunk while the final PV finishes.
                         v_next_chunk = fx.full(self.traits.NVOPS, 0, fx.Int64)
-                        if (
+                        if const_expr(pages_ahead):
+                            if const_expr(has_next):
+                                v_next_chunk = fx.Vector.from_elements(
+                                    self.kv.load_v(v_page_next, vh), dtype=fx.Int64
+                                )
+                        elif (
                             const_expr(not self.traits.single_tile_plan)
                             and tt1 < self.ctx.part_end
                         ):
@@ -697,6 +1186,8 @@ class PaDecodePipeline:
         q_ops_all,
         q_scale_vec,
         mask_tail,
+        has_next=True,
+        pages_ahead=None,
         pages_early=None,
     ):
         """Overlap QK, page/scale prefetch and PV for up to two padded query tiles.
@@ -734,10 +1225,29 @@ class PaDecodePipeline:
                 self.gemm.qk(k_cur, q_ops_all, m)
                 for m in range_constexpr(self.traits.M_TILES)
             ]
-        if (
-            const_expr(not self.traits.single_tile_plan and not self.traits.STREAM_KV)
-            and tt1 < self.ctx.part_end
-        ):
+        v_after_qk = self.traits.DECODE_LAST_V_AFTER_QK and not has_next
+        if const_expr(v_after_qk):
+            # No next K to load: issue V behind QK so its latency overlaps
+            # the softmax barriers.
+            v_vh_shared = [
+                self.kv.load_v(v_page_cur, vh)
+                for vh in range_constexpr(self.traits.VHE_CHUNKS)
+            ]
+        late_scales = self.traits.FP8_LOOP_SCALES_LATE and has_next
+        scale_stores = None
+        if const_expr(late_scales):
+            # Loop tiles always have a next tile.
+            k_next, next_pages = self.kv.load_k(tt1)
+            self.kv.fetch_v_pages(tt1)
+            scale_stores = self.kv.stage_scales(
+                next_pages, self.kv.scale_buffer_offset(tt1), tt1, defer=True
+            )
+        if const_expr(
+            has_next
+            and not late_scales
+            and not self.traits.single_tile_plan
+            and not self.traits.STREAM_KV
+        ) and (tt1 < self.ctx.part_end):
             if const_expr(self.traits.PAGES_EARLY):
                 phys_vec1 = self.kv.pin_warp_pages(pages_early)
                 self.kv.stage_v_pages(phys_vec1)
@@ -757,6 +1267,10 @@ class PaDecodePipeline:
                     )
                 if const_expr(not self.traits.PAGE16_VPIPE):
                     k_next = self.kv.load_k_from_pages(phys_vec1)
+            elif const_expr(pages_ahead is not None):
+                self.kv.stage_v_pages(pages_ahead)
+                if const_expr(self.traits.PAGE16_EARLY_K):
+                    k_next = self.kv.load_k_from_pages(pages_ahead)
             else:
                 k_next, phys_vec1 = self.kv.load_k(tt1)
                 self.kv.fetch_v_pages(tt1)
@@ -773,6 +1287,14 @@ class PaDecodePipeline:
         scales = []
         masked_chunks = []
         v_scale_vecs = None
+        # Single-query head-256 decode without a window: only the task's
+        # peeled last tile can hold tokens past the context, so interior tiles
+        # skip the score mask. (On the page-16 V pipe the masks are free.)
+        score_mask = mask_tail or not (
+            self.traits.D256_PIPE
+            and self.traits.query_length == 1
+            and self.traits.sliding_window == 0
+        )
         for m in range_constexpr(self.traits.M_TILES):
             if const_expr(self.traits.kv_dtype == fx.BFloat16):
                 scale = self.ctx.scale_qk
@@ -784,12 +1306,23 @@ class PaDecodePipeline:
                 )
             scales.append(scale)
             chunks, v_scale_vecs = self.softmax.single_scores(
-                frag_Ss[m], scale, tile_valid, window_left, cur_kv_buf, scale_bounds, m
+                frag_Ss[m],
+                scale,
+                tile_valid,
+                window_left,
+                cur_kv_buf,
+                scale_bounds,
+                m,
+                score_mask,
             )
             masked_chunks.append(chunks)
         gpu.barrier()
         v_page_next = v_page_cur
-        if const_expr(not self.traits.single_tile_plan) and tt1 < self.ctx.part_end:
+        if const_expr(late_scales):
+            v_page_next = self.kv.read_v_pages()
+        if const_expr(
+            has_next and not late_scales and not self.traits.single_tile_plan
+        ) and (tt1 < self.ctx.part_end):
             v_page_next = self.kv.read_v_pages()
         next_state[self.traits.V_SLOT] = v_page_next
         v_max_scaled = None
@@ -807,13 +1340,18 @@ class PaDecodePipeline:
                 cur_kv_buf,
                 norm_factor_b,
                 m,
+                score_mask,
             )
             m_new.append(m_new_m)
             corr_reg.append(corr_m)
         gpu.barrier()
-        if const_expr(self.traits.PAGE16_VPIPE):  # noqa: SIM102
+        if const_expr(  # noqa: SIM102
+            self.traits.PAGE16_VPIPE and not self.traits.PAGE16_EARLY_K
+        ):
             # Next K can now overlap P reads/PV.
-            if const_expr(not self.traits.single_tile_plan) and tt1 < self.ctx.part_end:
+            if const_expr(has_next and not self.traits.single_tile_plan) and (
+                tt1 < self.ctx.part_end
+            ):
                 k_next = self.kv.load_k_from_pages(self.kv.read_k_pages())
         next_state[self.traits.K_SLOT] = k_next
         l_new = []
@@ -864,7 +1402,7 @@ class PaDecodePipeline:
                 )
                 fx.rocdl.sched_barrier(0)
         else:
-            if const_expr(self.traits.prefetch_v):
+            if const_expr(self.traits.prefetch_v or v_after_qk):
                 v_vh_batch = v_vh_shared
             else:
                 v_vh_batch = [
@@ -893,6 +1431,9 @@ class PaDecodePipeline:
                         if const_expr(self.traits.single_tile_plan)
                         else o_acc[m][vh] * corr_b[m] + op
                     )
+        if const_expr(late_scales):
+            # The next tile reads only its own wave's scale slots.
+            self.kv.store_scales(scale_stores)
         for m in range_constexpr(self.traits.M_TILES):
             next_state.extend([*o_acc[m], m_new[m], l_new[m]])
         return next_state

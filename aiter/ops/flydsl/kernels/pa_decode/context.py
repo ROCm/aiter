@@ -63,6 +63,12 @@ class PaDecodeContext:
     def init_thread_mapping(self):
         """Resolve the physical grid to a sequence, KV head and partial slot."""
         self.tid = fx.Int32(gpu.thread_id("x"))
+        self.group = None
+        if const_expr(self.traits.DUAL_GROUP):
+            # Two four-wave groups: everything below works on the group-local
+            # thread id; ``group`` picks the tile parity and the LDS copy.
+            self.group = self.tid // self.traits.BLOCK_THREADS
+            self.tid = self.tid - self.group * self.traits.BLOCK_THREADS
         self.warp = self.tid // WAVE  # 0..NWARP-1
         self.lane = self.tid - self.warp * WAVE  # 0..63
         self.seq = self.planned_seq
@@ -97,6 +103,12 @@ class PaDecodeContext:
         ) // self.traits.block_size  # pages this sequence really owns
         self.part_start = self.planned_start
         self.part_end = self.planned_end
+        if const_expr(self.traits.DUAL_GROUP):
+            # Group g walks tiles planned_start + g, + 2, ...; both groups run
+            # the same iteration count (group 1's last may lie past the task,
+            # fully masked) so their CTA barriers pair up.
+            self.dual_iters = (self.planned_end - self.planned_start + 1) // 2
+            self.part_start = self.planned_start + self.group
 
     def init_scales(self, key_scale, value_scale):
         if const_expr(
