@@ -193,6 +193,13 @@ def test_gfx1250_flydsl_ps1_backend(monkeypatch):
     assert support(32, 4, flydsl_ps1=True).backend is MlaBackend.FLYDSL_PS1
     assert support(32, 4, flydsl_ps1=True).fold_factor == 1
     assert support(16, 5, flydsl_ps1=True).backend is MlaBackend.ASM
+    # Past 128 rows, 32/64 heads take the query as several planner qo tiles
+    # (64 x 4 -> two 2-row tiles) up to qlen 8, unfolded and on FlyDSL JIT (no
+    # code object at those head counts); qlen 9 is past the kernel's bound.
+    for n, q in ((64, 3), (64, 4), (64, 8), (32, 5), (32, 8)):
+        s = support(n, q, flydsl_ps1=True)
+        assert (s.backend, s.fold_factor) == (MlaBackend.FLYDSL_PS1, 1), (n, q)
+    assert support(64, 9, flydsl_ps1=True).backend is MlaBackend.ASM
     bf16 = torch.bfloat16
     for n in (64, 128):
         s = get_mla_decode_shape_support(
