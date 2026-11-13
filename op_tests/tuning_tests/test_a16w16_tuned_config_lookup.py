@@ -225,8 +225,8 @@ class TestSplitInitRingScope(unittest.TestCase):
                 )
 
 
-class TestLatentSmallUpCsv(unittest.TestCase):
-    def test_up_m128_csv_selects_counter_ws(self):
+class TestLatentSmallUpUnchanged(unittest.TestCase):
+    def test_up_m128_csv_is_original(self):
         path = (
             Path(__file__).resolve().parents[2]
             / "aiter/configs/model_configs/kimik3_bf16_tuned_gemm.csv"
@@ -263,142 +263,12 @@ class TestLatentSmallUpCsv(unittest.TestCase):
         self.assertEqual(len(rows), 1)
         self.assertEqual(
             (rows[0]["libtype"], rows[0]["solidx"], rows[0]["splitK"]),
-            ("flydsl", "0", "1"),
+            ("flydsl", "2787", "1"),
         )
         self.assertEqual(
             rows[0]["kernelName"],
-            "flydsl_hgemm_ws_abf16_wbf16_bf16_t64x64x128x3_ks1_p2_w2x2_pf1_ch1_gfx950",
+            "flydsl_hgemm_abf16_wbf16_bf16_t64x64x64x7_ks1_w4x2x1_bias0_ktail0_gm0_pft_gfx950",
         )
-
-    def test_ws_name_roundtrip_and_invalid_variants(self):
-        import aiter.ops.flydsl.gemm_kernels as kernels
-
-        name = kernels.WS_UP_M128_KERNEL_NAME
-        params = kernels.get_flydsl_hgemm_kernel_params(name)
-        self.assertEqual(
-            kernels.flydsl_hgemm_kernel_name(
-                dtype=torch.bfloat16,
-                out_dtype=torch.bfloat16,
-                config=params,
-                has_bias=False,
-                target_gfx="gfx950",
-            ),
-            name,
-        )
-        for old, new in (
-            ("ch1", "ch0"),
-            ("p2_", "p4_"),
-            ("ks1", "ks2"),
-            ("gfx950", "gfx942"),
-            ("x128x3", "x128x2"),
-        ):
-            self.assertIsNone(
-                kernels.get_flydsl_hgemm_kernel_params(name.replace(old, new))
-            )
-        for field, value in (
-            ("block_k", 64),
-            ("producer_waves", True),
-            ("counter_handshake", 1),
-            ("prefetch", False),
-        ):
-            with self.assertRaises(ValueError):
-                kernels.flydsl_hgemm_kernel_name(
-                    dtype=torch.bfloat16,
-                    out_dtype=torch.bfloat16,
-                    config={**params, field: value},
-                    has_bias=False,
-                    target_gfx="gfx950",
-                )
-
-    def test_ws_csv_only_exact_m_and_compatible_keys(self):
-        import aiter.ops.flydsl.gemm_kernels as kernels
-
-        key = ("gfx950", 256, 128, 7168, 3584, False, BF16, BF16, False, False)
-        row = {
-            "libtype": "flydsl",
-            "solidx": 0,
-            "splitK": 1,
-            "kernelName": kernels.WS_UP_M128_KERNEL_NAME,
-        }
-        with (
-            mock.patch.object(tuned, "get_GEMM_A16W16_config_", lambda: {key: row}),
-            mock.patch.object(tuned, "get_padded_m", lambda *_: 128),
-        ):
-            for m in (1, 64, 65, 127, 128, 129):
-                actual = tuned.get_GEMM_A16W16_tuned_config(
-                    m,
-                    7168,
-                    3584,
-                    False,
-                    BF16,
-                    BF16,
-                    gfx="gfx950",
-                    cu_num=256,
-                )
-                self.assertEqual(
-                    actual["kernelName"],
-                    (
-                        kernels.WS_UP_M128_KERNEL_NAME
-                        if m == 128
-                        else kernels.WS_UP_M128_LEGACY_KERNEL_NAME
-                    ),
-                )
-            for index, value in (
-                (0, "gfx942"),
-                (1, 304),
-                (3, 3584),
-                (5, True),
-                (6, "torch.float16"),
-                (7, "torch.float32"),
-                (8, True),
-                (9, True),
-            ):
-                bad_key = list(key)
-                bad_key[index] = value
-                with mock.patch.object(
-                    tuned,
-                    "get_GEMM_A16W16_config_",
-                    lambda bad_key=tuple(bad_key): {bad_key: row},
-                ):
-                    gfx, cu, m, n, k, bias, dtype, outdtype, scale, shuffle = bad_key
-                    self.assertIsNone(
-                        tuned.get_GEMM_A16W16_tuned_config(
-                            m,
-                            n,
-                            k,
-                            bias,
-                            dtype,
-                            outdtype,
-                            scale,
-                            shuffle,
-                            gfx=gfx,
-                            cu_num=cu,
-                        )
-                    )
-        self.assertEqual(row["kernelName"], kernels.WS_UP_M128_KERNEL_NAME)
-
-    def test_ws_ineligible_layout_uses_original_policy(self):
-        import aiter.ops.flydsl.gemm_kernels as kernels
-
-        a = torch.empty((2, 8), dtype=torch.bfloat16)
-        b = torch.empty((8, 8), dtype=a.dtype)
-        out = torch.empty((2, 8), dtype=a.dtype)
-        with (
-            mock.patch.object(kernels, "flydsl_hgemm", return_value=out) as legacy,
-            mock.patch.object(tuned, "_flydsl_ws_launcher") as ws,
-        ):
-            result = tuned.flydsl_gemm(
-                a,
-                b,
-                0,
-                out=out,
-                otype=a.dtype,
-                config={"kernelName": kernels.WS_UP_M128_KERNEL_NAME},
-            )
-            self.assertIs(result, out)
-            ws.assert_not_called()
-            self.assertEqual(legacy.call_args.kwargs["block_k"], 64)
-            self.assertEqual(legacy.call_args.kwargs["stages"], 7)
 
 
 class TestExactLatentLargeCsv(unittest.TestCase):
@@ -1001,7 +871,7 @@ class TestLegacyFlydslHgemmConfigs(unittest.TestCase):
         seen = set()
         for path, row in self._rows():
             name = row["kernelName"]
-            if name in seen or "_stg" in name or "_bnt_" in name or "hgemm_ws_" in name:
+            if name in seen or "_stg" in name or "_bnt_" in name:
                 continue
             seen.add(name)
             params = kernels.get_flydsl_hgemm_kernel_params(name)
