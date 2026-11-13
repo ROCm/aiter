@@ -257,15 +257,13 @@ def test_fp8_mqa_logits_nonzero_cu_start(
 )
 @pytest.mark.parametrize("num_heads", [32, 64])
 @pytest.mark.parametrize("clean_logits", [True, False])
+@pytest.mark.parametrize("layout", ["aligned", "tight", "offset"])
 @torch.inference_mode()
 def test_fp8_mqa_logits_into_caller_buffer(
-    s_q: int, s_k: int, num_heads: int, clean_logits: bool
+    s_q: int, s_k: int, num_heads: int, clean_logits: bool, layout: str
 ) -> None:
-    """With `logits=`, the scores land in the caller's view -- bit-identical to
-    the allocating path inside each row's range, -inf outside it with
-    clean_logits -- and nothing past a row's seq_len_kv columns or past the
-    view is written. Without clean_logits the rest of a row is unspecified:
-    a two-row tile walks both rows' ranges."""
+    """`out=` gets the allocating path's scores in each row's range and writes
+    nothing past seq_len_kv columns or outside the view."""
     torch.manual_seed(0)
     head_dim = 128
     q = torch.randn(s_q, num_heads, head_dim, device="cuda", dtype=torch.bfloat16)
@@ -278,11 +276,23 @@ def test_fp8_mqa_logits_into_caller_buffer(
     q_fp8 = q.to(e4m3_type)
     expected = fp8_mqa_logits(q_fp8, kv_fp8, scales, weights, ks, ke, True)
 
-    pitch = (s_k + 255) // 256 * 256
-    plane = torch.full((s_q * pitch + 4096,), float("nan"), device="cuda")
-    view = plane[: s_q * pitch].view(s_q, pitch)[:, :s_k]
+    aligned = (s_k + 255) // 256 * 256
+    pitch, offset = {
+        "aligned": (aligned, 0),
+        "tight": (s_k, 0),
+        "offset": (aligned + 17, 37),
+    }[layout]
+    guard = 4096
+    plane = torch.full(
+        (offset + s_q * pitch + guard,),
+        float("nan"),
+        device="cuda",
+        dtype=torch.float32,
+    )
+    rows = plane[offset : offset + s_q * pitch].view(s_q, pitch)
+    view = rows[:, :s_k]
     logits = fp8_mqa_logits(
-        q_fp8, kv_fp8, scales, weights, ks, ke, clean_logits, logits=view
+        q_fp8, kv_fp8, scales, weights, ks, ke, clean_logits, out=view
     )
     assert logits.data_ptr() == view.data_ptr()
     cols = torch.arange(s_k, device="cuda")
@@ -290,33 +300,43 @@ def test_fp8_mqa_logits_into_caller_buffer(
     assert torch.equal(logits[inside], expected[inside])
     if clean_logits:
         assert torch.isneginf(logits[~inside]).all()
-    assert torch.isnan(plane[s_q * pitch :]).all()
-    assert torch.isnan(plane[: s_q * pitch].view(s_q, pitch)[:, s_k:]).all()
+    assert torch.isnan(plane[:offset]).all()
+    assert torch.isnan(plane[offset + s_q * pitch :]).all()
+    assert torch.isnan(rows[:, s_k:]).all()
 
 
-@pytest.mark.parametrize("bad", ["shape", "pitch", "column_stride", "dtype"])
+@pytest.mark.parametrize(
+    "bad, message",
+    [
+        ("shape", r"out must be \["),
+        ("pitch", "unit column stride and a row stride"),
+        ("column_stride", "unit column stride and a row stride"),
+        ("dtype", "2-D float32"),
+        ("device", "out is on cpu"),
+    ],
+)
 @torch.inference_mode()
-def test_fp8_mqa_logits_refuses_a_malformed_buffer(bad: str) -> None:
+def test_fp8_mqa_logits_refuses_a_malformed_buffer(bad: str, message: str) -> None:
     s_q, s_k, num_heads, head_dim = 4, 300, 32, 128
-    q_fp8 = torch.randn(s_q, num_heads, head_dim, device="cuda").to(e4m3_type)
+    q_fp8 = torch.randn(
+        s_q, num_heads, head_dim, device="cuda", dtype=torch.float32
+    ).to(e4m3_type)
     kv_fp8, scales = per_custom_dims_cast_to_fp8(
         torch.randn(s_k, head_dim, device="cuda", dtype=torch.bfloat16), (0,), False
     )
     weights = torch.randn(s_q, num_heads, device="cuda", dtype=torch.float32)
     ks = torch.zeros(s_q, dtype=torch.int, device="cuda")
     ke = torch.full((s_q,), s_k, dtype=torch.int, device="cuda")
+    f32 = {"device": "cuda", "dtype": torch.float32}
     buffers = {
-        "shape": torch.empty(s_q, s_k + 256, device="cuda")[:, : s_k - 1],
-        "pitch": torch.empty(s_q * s_k, device="cuda").as_strided(
-            (s_q, s_k), (s_k - 1, 1)
-        ),
-        "column_stride": torch.empty(s_k, s_q, device="cuda").t(),
+        "shape": torch.empty(s_q, s_k + 256, **f32)[:, : s_k - 1],
+        "pitch": torch.empty(s_q * s_k, **f32).as_strided((s_q, s_k), (s_k - 1, 1)),
+        "column_stride": torch.empty(s_k, s_q, **f32).t(),
         "dtype": torch.empty(s_q, s_k, device="cuda", dtype=torch.float16),
+        "device": torch.empty(s_q, s_k, device="cpu", dtype=torch.float32),
     }
-    with pytest.raises(ValueError):
-        fp8_mqa_logits(
-            q_fp8, kv_fp8, scales, weights, ks, ke, False, logits=buffers[bad]
-        )
+    with pytest.raises(ValueError, match=message):
+        fp8_mqa_logits(q_fp8, kv_fp8, scales, weights, ks, ke, False, out=buffers[bad])
 
 
 @pytest.mark.parametrize("rows,keys", [(9, 1025), (4097, 1025), (9, 65539)])
@@ -359,7 +379,7 @@ def test_fp8_mqa_logits_packed(rows, keys, heads, clean_logits, offset_dtype):
         starts,
         ends,
         clean_logits=clean_logits,
-        logits=packed,
+        out=packed,
         out_offsets=offsets,
     )
     assert actual is packed
@@ -387,7 +407,7 @@ def test_fp8_mqa_logits_packed_empty_rows(rows):
     packed = torch.full((19,), float("nan"), device="cuda", dtype=torch.float32)
     assert (
         fp8_mqa_logits(
-            q, kv, scales, weights, bounds, bounds, logits=packed, out_offsets=bounds
+            q, kv, scales, weights, bounds, bounds, out=packed, out_offsets=bounds
         )
         is packed
     )
@@ -395,19 +415,19 @@ def test_fp8_mqa_logits_packed_empty_rows(rows):
 
 
 @pytest.mark.parametrize(
-    "bad",
+    "bad, message",
     [
-        "missing",
-        "rank",
-        "dtype",
-        "stride",
-        "offset_dtype",
-        "offset_shape",
-        "offset_stride",
-        "offset_device",
+        ("missing", "requires a 1-D float32 out"),
+        ("rank", "requires a 1-D float32 out"),
+        ("dtype", "requires a 1-D float32 out"),
+        ("stride", "packed out must be contiguous"),
+        ("offset_dtype", "out_offsets must be contiguous"),
+        ("offset_shape", "out_offsets must be contiguous"),
+        ("offset_stride", "out_offsets must be contiguous"),
+        ("offset_device", "out_offsets must be contiguous"),
     ],
 )
-def test_fp8_mqa_logits_rejects_malformed_packed_output(bad):
+def test_fp8_mqa_logits_rejects_malformed_packed_output(bad, message):
     q = torch.empty(4, 32, 128, device="cuda", dtype=e4m3_type)
     kv = torch.empty(73, 128, device="cuda", dtype=e4m3_type)
     scales = torch.ones(73, device="cuda", dtype=torch.float32)
@@ -431,7 +451,7 @@ def test_fp8_mqa_logits_rejects_malformed_packed_output(bad):
         offsets = torch.zeros(8, device="cuda", dtype=torch.int32)[::2]
     else:
         offsets = torch.zeros(4, device="cpu", dtype=torch.int32)
-    with pytest.raises(ValueError):
+    with pytest.raises(ValueError, match=message):
         fp8_mqa_logits(
-            q, kv, scales, weights, bounds, bounds, logits=packed, out_offsets=offsets
+            q, kv, scales, weights, bounds, bounds, out=packed, out_offsets=offsets
         )

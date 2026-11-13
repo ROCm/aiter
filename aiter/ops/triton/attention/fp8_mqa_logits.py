@@ -102,7 +102,7 @@ def fp8_mqa_logits(
     cu_starts,
     cu_ends,
     clean_logits=True,
-    logits=None,
+    out=None,
     out_offsets=None,
 ):
     """
@@ -117,27 +117,19 @@ def fp8_mqa_logits(
     clean_logits: bool. If True, positions outside [cu_starts[i], cu_ends[i]) in row i
                   are explicitly written as -inf. If False those positions are
                   unspecified.
-    logits:      optional caller-owned output, [seq_len, seq_len_kv] float32 with a
-                  unit column stride and a row stride of at least seq_len_kv (for
-                  example a view of a persistent workspace). Only the first
-                  seq_len_kv columns of each row are written; outside
-                  [cu_starts[i], cu_ends[i]) they hold unspecified values unless
-                  clean_logits. When None, a buffer is allocated per call; its
-                  size follows seq_len_kv, so a caller whose key count grows call
-                  after call (a long chunked prefill) should pass one instead of
-                  making the caching allocator reserve a new, slightly larger
-                  block every time.
-    out_offsets: optional contiguous [seq_len] int32 or int64 row offsets, on
-                  Q.device. When set, logits must be a contiguous 1-D float32
-                  buffer. Row i writes its visible keys from out_offsets[i].
-                  The caller must provide disjoint intervals that fit logits.
-                  Offsets are in elements. Bounds are clamped to the key range.
-                  Only visible scores are written; padding stays unchanged and
-                  clean_logits has no effect. No alignment is required.
+    out:         optional output on Q.device: [seq_len, seq_len_kv] float32, unit
+                  column stride, row stride of at least seq_len_kv. With
+                  out_offsets: a contiguous 1-D float32 buffer. A mismatch raises
+                  ValueError.
+    out_offsets: optional contiguous [seq_len] int32 or int64 on Q.device. Row i
+                  writes its scores for keys [cu_starts[i], cu_ends[i]) from
+                  element out_offsets[i] of out. The rows must not overlap.
+                  Other elements of out are not written; clean_logits has no
+                  effect.
 
     Returns:
-    logits:      The supplied output, or an allocated [seq_len, seq_len_kv]
-                  float32 tensor. Packed output is flat.
+    logits:      out, or an allocated [seq_len, seq_len_kv] float32 tensor. Only
+                  with clean_logits, values outside each row's range are -inf.
     """
 
     seq_len, num_heads, head_size = Q.shape
@@ -149,11 +141,12 @@ def fp8_mqa_logits(
     aligned_size = 256
     seq_len_kv_aligned = (seq_len_kv + aligned_size - 1) // aligned_size * aligned_size
     packed = out_offsets is not None
+    logits = out
     if packed:
-        if logits is None or logits.dtype != torch.float32 or logits.dim() != 1:
-            raise ValueError("out_offsets requires a 1-D float32 logits buffer")
-        if logits.stride(0) != 1 or logits.device != Q.device:
-            raise ValueError("packed logits must be contiguous and on Q.device")
+        if out is None or out.dtype != torch.float32 or out.dim() != 1:
+            raise ValueError("out_offsets requires a 1-D float32 out buffer")
+        if out.stride(0) != 1 or out.device != Q.device:
+            raise ValueError("packed out must be contiguous and on Q.device")
         if (
             out_offsets.dtype not in (torch.int32, torch.int64)
             or tuple(out_offsets.shape) != (seq_len,)
@@ -163,25 +156,25 @@ def fp8_mqa_logits(
             raise ValueError(
                 "out_offsets must be contiguous [seq_len] int32 or int64 on Q.device"
             )
-    elif logits is not None:
-        if logits.dtype != torch.float32 or logits.dim() != 2:
+    elif out is not None:
+        if out.dtype != torch.float32 or out.dim() != 2:
             raise ValueError(
-                f"logits must be a 2-D float32 tensor, got {logits.dtype} "
-                f"with {logits.dim()} dims"
+                f"out must be a 2-D float32 tensor, got {out.dtype} "
+                f"with {out.dim()} dims"
             )
-        if tuple(logits.shape) != (seq_len, seq_len_kv):
+        if tuple(out.shape) != (seq_len, seq_len_kv):
             raise ValueError(
-                f"logits must be [{seq_len}, {seq_len_kv}], got {tuple(logits.shape)}"
+                f"out must be [{seq_len}, {seq_len_kv}], got {tuple(out.shape)}"
             )
-        if logits.stride(1) != 1 or (seq_len > 1 and logits.stride(0) < seq_len_kv):
+        if out.stride(1) != 1 or (seq_len > 1 and out.stride(0) < seq_len_kv):
             raise ValueError(
-                "logits needs a unit column stride and a row stride of at least "
-                f"seq_len_kv={seq_len_kv}, got strides {logits.stride()}"
+                "out needs a unit column stride and a row stride of at least "
+                f"seq_len_kv={seq_len_kv}, got strides {out.stride()}"
             )
-        if logits.device != Q.device:
-            raise ValueError(f"logits is on {logits.device}, Q on {Q.device}")
+        if out.device != Q.device:
+            raise ValueError(f"out is on {out.device}, Q on {Q.device}")
         if clean_logits:
-            logits.fill_(-float("inf"))
+            out.fill_(-float("inf"))
     elif clean_logits:
         logits = torch.full(
             (seq_len, seq_len_kv_aligned),

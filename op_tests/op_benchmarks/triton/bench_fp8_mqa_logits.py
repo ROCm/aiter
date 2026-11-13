@@ -111,7 +111,7 @@ def run_benchmark(args):
             logits, offsets = None, None
             if layout == "packed":
                 spans = (visible + 63) // 64 * 64
-                offsets = spans.cumsum(0, dtype=torch.int32) - spans
+                offsets = spans.cumsum(0, dtype=torch.int64) - spans
                 capacity = batch_size * sum(
                     (length + 63) // 64 * 64
                     for length in range(seq_kv_l - seq_q_l + 1, seq_kv_l + 1)
@@ -136,7 +136,7 @@ def run_benchmark(args):
                     "weights",
                     "cu_starts",
                     "cu_ends",
-                    "logits",
+                    "out",
                     "out_offsets",
                 ]
             ],
