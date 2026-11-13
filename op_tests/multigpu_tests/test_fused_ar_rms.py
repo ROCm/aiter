@@ -1329,6 +1329,7 @@ try:
         comm = SimpleNamespace(
             ca_comm=ca,
             qr_comm=SimpleNamespace(disabled=case != "quick_reduce"),
+            world_size=4,
             _ar_quant_max_bytes=-1,
             _ar_quant_no_prefill_max_bytes=-1,
             all_reduce=Mock(return_value=x),
@@ -1338,6 +1339,9 @@ try:
         with patch("aiter.add_rmsnorm_quant") as fused, patch(
             "aiter.dist.device_communicators.communicator_cuda.get_hip_quant",
             return_value=quant,
+        ), patch(
+            "aiter.dist.device_communicators.communicator_cuda.get_gfx",
+            return_value="gfx950",
         ):
             CudaCommunicator.fused_allreduce_rmsnorm_quant(
                 comm, x, residual, weight, 1e-6, emit_bf16=case == "mirror"
@@ -1345,6 +1349,266 @@ try:
             assert fused.called == expected
             assert comm.all_reduce.called == expected
             assert comm.fused_allreduce_rmsnorm.called == (not expected)
+
+    @pytest.mark.parametrize(
+        "case,gfx,world_size,qr_disabled,at_qr_min,expect_fused_epilogue,expect_qr",
+        [
+            ("gfx1250_tp4_small_qr_on", "gfx1250", 4, False, False, True, False),
+            ("gfx1250_tp4_large_qr_on", "gfx1250", 4, False, True, False, True),
+            ("gfx1250_tp4_small_qr_off", "gfx1250", 4, True, False, True, False),
+            ("gfx1250_tp2_small_qr_on", "gfx1250", 2, False, False, False, False),
+            ("gfx950_tp4_small_qr_on", "gfx950", 4, False, False, False, False),
+        ],
+    )
+    def test_ll_quant_quick_reduce_dispatch(
+        case,
+        gfx,
+        world_size,
+        qr_disabled,
+        at_qr_min,
+        expect_fused_epilogue,
+        expect_qr,
+    ):
+        from types import SimpleNamespace
+        from unittest.mock import Mock, patch
+
+        from aiter.dist.device_communicators.communicator_cuda import CudaCommunicator
+        from aiter.dist.device_communicators.quick_all_reduce import (
+            QuickAllReduce,
+            QuickReduceRegime,
+        )
+
+        n = 6144
+        row_bytes = n * torch.empty((), dtype=torch.bfloat16).element_size()
+        qr_min_bytes = QuickAllReduce._GFX1250_MIN_SIZE[world_size]
+        m = (qr_min_bytes + row_bytes - 1) // row_bytes if at_qr_min else 16
+        x = torch.zeros((m, n), dtype=torch.bfloat16)
+        residual = torch.zeros_like(x)
+        weight = torch.ones(n, dtype=torch.bfloat16)
+
+        # Exercise the production QR predicate without initializing a GPU
+        # communicator. Its class-owned threshold remains the single source of
+        # truth for this CPU dispatch test.
+        qr = object.__new__(QuickAllReduce)
+        qr.disabled = qr_disabled
+        qr._is_gfx1250 = gfx == "gfx1250"
+        qr.world_size = world_size
+        qr.qr_max_size = 512 * 1024 * 1024
+        qr._route_selection_logged = True
+        qr.use_fp16_kernels = True
+        qr.qr_quant_level = QuickReduceRegime.INT4
+        qr.quick_all_reduce = Mock(return_value=x)
+
+        ca = SimpleNamespace(
+            disabled=False,
+            has_old_arch_fused_kernels=False,
+            can_fuse_ar_rms=lambda *args: True,
+            # Keep the large-message custom fused kernel out of this policy
+            # test so it isolates the QR-vs-LL-epilogue decision.
+            should_fuse_ar_rms=lambda *args: False,
+            should_custom_ar=lambda *args: True,
+            custom_all_reduce=Mock(return_value=x),
+        )
+        comm = SimpleNamespace(
+            ca_comm=ca,
+            qr_comm=qr,
+            world_size=world_size,
+            gluon_ar_plain=None,
+            symm_mem_comm=None,
+            pynccl_comm=None,
+            device_group=None,
+            _ar_quant_max_bytes=-1,
+            _ar_quant_no_prefill_max_bytes=-1,
+        )
+
+        def all_reduce(inp, prefill_support=False):
+            return CudaCommunicator.all_reduce(
+                comm, inp, prefill_support=prefill_support
+            )
+
+        comm.all_reduce = Mock(side_effect=all_reduce)
+
+        def fallback(
+            inp,
+            res_inp,
+            _weight,
+            _eps,
+            prefill_support=False,
+            **_kwargs,
+        ):
+            return comm.all_reduce(inp, prefill_support=prefill_support), res_inp
+
+        comm.fused_allreduce_rmsnorm = Mock(side_effect=fallback)
+        quant = Mock(return_value=(torch.empty_like(x), torch.ones((m, 1))))
+
+        assert qr.should_quick_allreduce(x) == expect_qr, case
+        with patch("aiter.add_rmsnorm_quant") as fused, patch(
+            "aiter.dist.device_communicators.communicator_cuda.get_hip_quant",
+            return_value=quant,
+        ), patch(
+            "aiter.dist.device_communicators.communicator_cuda.get_gfx",
+            return_value=gfx,
+        ):
+            CudaCommunicator.fused_allreduce_rmsnorm_quant(
+                comm, x, residual, weight, 1e-6
+            )
+
+        assert fused.called == expect_fused_epilogue, case
+        assert comm.fused_allreduce_rmsnorm.called == (not expect_fused_epilogue), case
+        assert qr.quick_all_reduce.called == expect_qr, case
+        assert ca.custom_all_reduce.called == (not expect_qr), case
+
+    def _gluon_ar_norm_comm(m, n, rows=True, dtype=torch.bfloat16):
+        """A gfx1250 TP4 communicator on the CPU whose all-reduce is the plain Gluon
+        all-reduce. Only transport and capabilities are mocks."""
+        from types import SimpleNamespace
+        from unittest.mock import Mock
+
+        x = torch.zeros((m, n), dtype=dtype, device="cpu")
+        ca = SimpleNamespace(
+            disabled=False,
+            has_old_arch_fused_kernels=False,
+            can_fuse_ar_rms=lambda *args: True,
+            should_fuse_ar_rms=lambda *args: False,
+            should_lamport_ar_rms=lambda *args: False,
+            should_custom_ar=lambda *args: True,
+        )
+        return SimpleNamespace(
+            ca_comm=ca,
+            qr_comm=SimpleNamespace(
+                disabled=False, should_quick_allreduce=lambda inp: False
+            ),
+            world_size=4,
+            cpu_group="group",
+            gluon_ar=None,
+            gluon_ar_plain=("inboxes", "calls"),
+            gluon_ar_norm=rows,
+            _ar_quant_max_bytes=-1,
+            _ar_quant_no_prefill_max_bytes=-1,
+            _ar_1stage_max_bytes=-1,
+            _ar_1stage_override=None,
+            all_reduce=Mock(return_value=x),
+            fused_allreduce_rmsnorm=Mock(return_value=(x, x)),
+        )
+
+    @pytest.mark.parametrize(
+        "case,expected",
+        [
+            ("eligible", True),
+            ("one_token", True),
+            ("max_tokens", True),
+            ("too_many_tokens", False),
+            ("hidden_4096", True),
+            ("hidden_32768", False),
+            ("rows_off", False),
+            ("gluon_off", False),
+            ("residual_strided", False),
+            ("weight_strided", False),
+            ("misaligned", False),
+            ("mirror", False),
+        ],
+    )
+    def test_gluon_ar_norm_quant_dispatch(case, expected):
+        """all_reduce_rmsnorm takes the gfx1250 LL quant path (the plain Gluon
+        all-reduce + add_rmsnorm_quant(round_before_quant=True)) only for the hidden
+        sizes of norm_waves, up to 256 tokens. Else that path stays as it is."""
+        from unittest.mock import Mock, patch
+
+        from aiter.dist.device_communicators import communicator_cuda as cc
+
+        n = int(case[7:]) if case.startswith("hidden_") else 6144
+        m = {"one_token": 1, "max_tokens": 256, "too_many_tokens": 257}.get(case, 16)
+        comm = _gluon_ar_norm_comm(m, n, rows=case != "rows_off")
+        if case == "gluon_off":
+            comm.gluon_ar_plain = None
+        x = torch.zeros((m, n), dtype=torch.bfloat16)
+        residual = torch.zeros_like(x)
+        weight = torch.ones(n, dtype=torch.bfloat16)
+        if case == "residual_strided":
+            residual = torch.zeros((m, 2 * n), dtype=torch.bfloat16)[:, ::2]
+        if case == "weight_strided":
+            weight = torch.ones(2 * n, dtype=torch.bfloat16)[::2]
+        if case == "misaligned":
+            x = torch.zeros(m * n + 1, dtype=torch.bfloat16)[1:].view(m, n)
+        q = torch.empty((m, n), dtype=torch.float8_e4m3fn)
+        epilogue = Mock(return_value=(q, residual, torch.ones((m, 1))))
+        quant = Mock(return_value=(q, torch.ones((m, 1))))
+        with patch(
+            "aiter.ops.triton.comms.all_reduce.all_reduce_rmsnorm", epilogue
+        ), patch("aiter.add_rmsnorm_quant") as split, patch.object(
+            cc, "get_hip_quant", return_value=quant
+        ), patch.object(
+            cc, "get_gfx", return_value="gfx1250"
+        ):
+            cc.CudaCommunicator.fused_allreduce_rmsnorm_quant(
+                comm,
+                x,
+                residual,
+                weight,
+                1e-6,
+                emit_bf16=case == "mirror",
+                gemma_norm=True,
+            )
+        assert epilogue.called == expected, case
+        if expected:
+            args = epilogue.call_args.args
+            assert args[3:7] == (1e-6, True, True, "group"), case
+            assert args[7:] == ("inboxes", "calls"), case
+            assert not split.called and not comm.all_reduce.called, case
+        if case in ("too_many_tokens", "hidden_32768", "rows_off", "misaligned"):
+            # The LL quant path: plain all-reduce + add_rmsnorm_quant.
+            assert split.called and comm.all_reduce.called, case
+        if case in ("residual_strided", "weight_strided", "mirror"):
+            assert comm.fused_allreduce_rmsnorm.called, case
+
+    @pytest.mark.parametrize(
+        "case,expected",
+        [
+            ("eligible", True),
+            ("one_token", True),
+            ("too_many_tokens", False),
+            ("hidden_4096", True),
+            ("hidden_6148", False),
+            ("rows_off", False),
+            ("pad", False),
+            ("residual_strided", False),
+        ],
+    )
+    def test_gluon_ar_norm_dispatch(case, expected):
+        """all_reduce_rmsnorm takes the place of the plain Gluon all-reduce +
+        rmsnorm2d_fwd_with_add fallback only. The other paths stay as they are."""
+        from unittest.mock import Mock, patch
+
+        from aiter.dist.device_communicators import communicator_cuda as cc
+
+        n = int(case[7:]) if case.startswith("hidden_") else 6144
+        m = {"one_token": 1, "too_many_tokens": 257}.get(case, 16)
+        comm = _gluon_ar_norm_comm(m, n, rows=case != "rows_off")
+        x = torch.zeros((m, n), dtype=torch.bfloat16)
+        residual = torch.zeros_like(x)
+        if case == "residual_strided":
+            residual = torch.zeros((m, 2 * n), dtype=torch.bfloat16)[:, ::2]
+        weight = torch.ones(n, dtype=torch.bfloat16)
+        epilogue = Mock(return_value=(x, residual))
+        pad = 256 if case == "pad" else 0
+        with patch(
+            "aiter.ops.triton.comms.all_reduce.all_reduce_rmsnorm", epilogue
+        ), patch("aiter.rmsnorm2d_fwd_with_add") as split, patch(
+            "aiter.ops.triton.normalization.fused_add_rmsnorm_pad.fused_add_rmsnorm_pad",
+            return_value=(x, residual),
+        ):
+            cc.CudaCommunicator.fused_allreduce_rmsnorm(
+                comm, x, residual, weight, 1e-6, x_pad_to_multiple=pad, gemma_norm=True
+            )
+        assert epilogue.called == expected, case
+        if expected:
+            args = epilogue.call_args.args
+            assert args[3:7] == (1e-6, True, False, "group"), case
+            assert not split.called and not comm.all_reduce.called, case
+        else:
+            assert comm.all_reduce.called, case
+        if case in ("too_many_tokens", "hidden_6148", "rows_off"):
+            assert split.called, case
 
     @pytest.mark.parametrize("world_size", [2, 4])
     def test_ll_quant_epilogue(world_size):
