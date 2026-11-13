@@ -232,6 +232,7 @@ def build_gemm_a8w4_tdm_task(
     defer_c_wait=0,
     tdm_snop=0,
     k_waves=1,
+    out_preshuffled=None,
 ):
     """Build the grouped contiguous-M a8w4 TDM GEMM tile body (``gemm_task``).
 
@@ -366,7 +367,11 @@ def build_gemm_a8w4_tdm_task(
     wmma_n_rep = warp_tile_n // WMMA_N
     n_acc = wmma_m_rep * wmma_n_rep
     is_prefill = tile_m == tile_n == tile_k == 256
-    USE_EXPLICIT_VGPR_PARTITION = bool(is_prefill and callable(sched_vgpr))
+    # The pinned map (v256-v511 operands, v512-v767 accumulators) is laid out
+    # for the 2x2 wave grid; a 1x4 grid's 128x64 wave tile overflows it.
+    USE_EXPLICIT_VGPR_PARTITION = bool(
+        is_prefill and callable(sched_vgpr) and m_warp == n_warp == 2
+    )
     # Only fixed high-VGPR placement needs the relaxed occupancy target.
     # Attach it per kernel; a launcher-wide hint also changes ordinary tiles.
     kernel_attrs = {"rocdl.waves_per_eu": "1"} if USE_EXPLICIT_VGPR_PARTITION else {}
@@ -559,7 +564,13 @@ def build_gemm_a8w4_tdm_task(
         ), "stage1 quant requires complete four-WMMA N groups"
 
     _afp = "fp4" if a_is_fp4 else "fp8"
+    # The fp4 stage-1 output layout; defaults to the A input's.
+    if out_preshuffled is None:
+        out_preshuffled = a_preshuffled
+    out_preshuffled = bool(out_preshuffled and stage1_quant_out and stage1_act)
     _a_layout = "_apre" if a_preshuffled else ""
+    if out_preshuffled != bool(a_preshuffled and stage1_quant_out and stage1_act):
+        _a_layout += "_cpre" if out_preshuffled else "_crm"
     _act = f"_act{stage1_act}" if stage1_act else ""
     _qout = f"_q{stage1_quant_out}r{quant_wmma_rep}" if stage1_quant_out else ""
     assert has_bias in (0, 1, 2, 3), "has_bias: 0 none, 1 bf16, 2 fp32, 3 fp16"
@@ -2309,7 +2320,7 @@ def build_gemm_a8w4_tdm_task(
                 N_MX_BLKS = output_n_rep // WN_PER_MX_BLOCK
 
                 def quant_byte_offset(row, col):
-                    if const_expr(a_preshuffled):
+                    if const_expr(out_preshuffled):
                         # TDM reads dense LDS tiles. Stage each K32 slab as
                         # contiguous M16 x 16B, without row padding.
                         return (
@@ -2794,7 +2805,7 @@ def build_gemm_a8w4_tdm_task(
                 else:
                     oc_store = oc
                     c_iter = fx.recast_iter(oc, arg_c)
-                if const_expr(a_preshuffled and stage1_quant_out and stage1_act):
+                if const_expr(out_preshuffled):
                     # M is allocated in complete M16 blocks. The final block's
                     # padding rows are unused, so transfer whole K32/M16 slabs.
                     c_off_rt = blk_m64 * fx.Int64(out_stride) + out_col_off * 16
