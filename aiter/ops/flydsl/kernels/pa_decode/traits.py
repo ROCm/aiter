@@ -464,6 +464,17 @@ class PaDecodeSchedule:
         gfx942_two_per_cu = (
             gfx942_busy and split_workgroups * query_splits >= 2 * num_compute_units
         )
+        # gfx942 one-partition decode on sparse grids walks each task in two
+        # tile groups per CTA (DUAL_GROUP, mirrored from create()).
+        gfx942_dual_group = (
+            "gfx94" in arch
+            and (direct_output or num_partitions == 1)
+            and split_workgroups * query_splits <= num_compute_units
+            and query_length == 1
+            and sliding_window == 0
+            and head_dim == 128
+            and not single_tile_plan
+        )
         # Prefetch supported single-M query tiles independently of grid size.
         prefetch_v = (
             D256_PIPE
@@ -502,8 +513,12 @@ class PaDecodeSchedule:
                             and block_size == 64
                         )
                     )
+                    # BF16 page16 dual-group decode ran 0.97x with it.
                     or (
-                        kv_dtype == fx.BFloat16 and block_size == 16 and head_dim <= 128
+                        kv_dtype == fx.BFloat16
+                        and block_size == 16
+                        and head_dim <= 128
+                        and not gfx942_dual_group
                     )
                 )
             )
