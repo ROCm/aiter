@@ -1011,8 +1011,7 @@ __device__ auto data_to_per_row_scale(const DTYPE_I* __restrict__ input,
     float row_scale = std::is_same_v<DTYPE_O, opus::fp4_t>
                           ? aiter::fp4_f32_to_e8m0_scale(absMax)
                           : absMax * inverted_DTYPE_MAX;
-    // Return the row vector by value: a pointer to the local vec_cur would dangle after return
-    // (UB; miscompiled by the ROCm 10.3 toolchain on gfx1201 -> garbage fp8 output).
+    // Return the row vector by value. A pointer to the local vec_cur dangles after return.
     return std::make_tuple(row_scale, vec_cur);
 }
 
@@ -1301,7 +1300,7 @@ smooth_data_to_per_row_scale(const DTYPE_I* __restrict__ input,
     float row_scale = std::is_same_v<DTYPE_O, opus::fp4_t>
                           ? aiter::fp4_f32_to_e8m0_scale(absMax)
                           : absMax * inverted_DTYPE_MAX;
-    // Return by value (see data_to_per_row_scale): &smscale_cur would dangle after return.
+    // Return by value. A pointer to the local smscale_cur dangles after return.
     return std::make_tuple(row_scale, smscale_cur);
 }
 
