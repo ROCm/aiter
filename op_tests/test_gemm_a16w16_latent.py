@@ -4,7 +4,8 @@
 """BF16 latent-projection GEMMs: caller buffers and changed graph inputs.
 
 The two exact M16384 projections and down-M128 have specialized schedules.
-Up-M128 and non-target padded-M consumers keep their original paths.
+Up-M128 selects the counter WS kernel through its model CSV for contiguous
+aligned inputs; non-target padded-M consumers retain the original kernel.
 Down-M128 retains the original four-way BF16 atomic arithmetic, but publishes
 output initialization before input prefetch and unrolls the LDS ring. Its
 exact-shape pointer launcher reuses the existing split-K synchronization.
@@ -28,7 +29,7 @@ from aiter.jit.utils.chip_info import get_gfx_runtime
 from aiter.test_common import benchmark, checkAllclose, run_perftest
 from aiter.tuned_gemm import gemm_a16w16, gemm_a16w16_out
 
-# Small-M CSV policies are unchanged. The new large-M row is exact-only.
+# Up-M128 WS and the new large-M row are exact-only CSV selections.
 # Both large projections have exact-shape implementation specializations.
 # Their ragged-M boundaries keep the corresponding original device code.
 SHAPES = (
@@ -60,6 +61,79 @@ def assert_result(expected, actual, label):
     )
     assert error == 0, (label, error)
     return error
+
+
+def check_up_m128_csv_dispatch():
+    """Prove the real CSV selects WS, with legacy padded/layout fallbacks."""
+    from unittest.mock import patch
+
+    import aiter.ops.flydsl.gemm_kernels as kernels
+    import aiter.tuned_gemm as tuned
+
+    torch.manual_seed(2911)
+    dtype = torch.bfloat16
+    cfg = tuned.get_GEMM_A16W16_config(
+        128,
+        7168,
+        3584,
+        False,
+        str(dtype),
+        str(dtype),
+        gfx="gfx950",
+        cu_num=256,
+    )
+    assert cfg["kernelName"] == kernels.WS_UP_M128_KERNEL_NAME
+    real_ws = tuned._flydsl_ws_launcher(cfg["kernelName"])
+    a = torch.randn((128, 3584), device="cuda", dtype=dtype)
+    b = torch.randn((7168, 3584), device=a.device, dtype=dtype)
+    out = torch.empty((128, 7168), device=a.device, dtype=dtype)
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    # Cold capture exercises CSV selection, JIT and current-stream launch.
+    graph = torch.cuda.CUDAGraph()
+    with (
+        patch.object(tuned, "_flydsl_ws_launcher", return_value=real_ws) as ws,
+        patch.object(kernels, "flydsl_hgemm", wraps=kernels.flydsl_hgemm) as old,
+    ):
+        with torch.cuda.graph(graph, stream=stream):
+            gemm_a16w16_out(a, b, out)
+        stream.synchronize()
+        assert ws.call_count >= 1
+        old.assert_not_called()
+    for _ in range(3):
+        a.normal_()
+        b.normal_()
+        expected = run_torch(a, b)
+        out.fill_(float("nan"))
+        stream.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(stream):
+            graph.replay()
+        stream.synchronize()
+        assert_result(expected, out, "CSV WS modified-input graph")
+
+    for case in ("padded_m", "row_padding", "k_stride"):
+        if case == "padded_m":
+            x, w = a[:127], b
+        elif case == "row_padding":
+            x = torch.randn((128, 3600), device=a.device, dtype=dtype)[:, :3584]
+            w = b
+        else:
+            x = torch.randn((128, 7168), device=a.device, dtype=dtype)[:, ::2]
+            w = b
+        expected = run_torch(x, w)
+        target = torch.empty_like(expected)
+        with (
+            patch.object(tuned, "_flydsl_ws_launcher") as ws,
+            patch.object(kernels, "flydsl_hgemm", wraps=kernels.flydsl_hgemm) as old,
+        ):
+            gemm_a16w16_out(x, w, target)
+            torch.cuda.synchronize()
+            ws.assert_not_called()
+            assert old.call_count == 1
+            assert old.call_args.kwargs["block_k"] == 64
+            assert old.call_args.kwargs["stages"] == 7
+        assert_result(expected, target, "CSV legacy " + case)
+    aiter.logger.info("CSV WS exact dispatch and legacy fallbacks: PASS")
 
 
 @benchmark()
@@ -524,6 +598,7 @@ def main():
     if get_gfx_runtime() != "gfx950":
         aiter.logger.warning("This tuning qualification targets gfx950; skipping")
         return
+    check_up_m128_csv_dispatch()
     check_n_grouped_specialization()
     check_hti_unroll_specialization()
     parser = argparse.ArgumentParser(description=__doc__)

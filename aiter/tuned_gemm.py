@@ -177,6 +177,22 @@ def get_GEMM_A16W16_tuned_config(
                         config["kernelName"]
                     )
                 )
+                if flydsl_config is not None and flydsl_config["policy"] == "ws":
+                    # A replacement of the M128 row must not change the old
+                    # padded-M selections. Return that row's original kernel,
+                    # rather than dropping it and falling through to ASM.
+                    if (
+                        (gfx, cu_num, padded_M, N, K)
+                        != ("gfx950", 256, 128, 7168, 3584)
+                        or bias
+                        or scaleAB
+                        or bpreshuffle
+                        or str(dtype) != "torch.bfloat16"
+                        or str(otype) != "torch.bfloat16"
+                    ):
+                        continue
+                    if M != 128:
+                        config = _ws_up_m128_legacy_config(config)
                 # None means the tuned CSV names a kernel absent from this
                 # catalog version; it is unrelated to FlyDSL import availability.
                 if flydsl_config is None:
@@ -675,6 +691,45 @@ def _flydsl_hgemm_kernel_params(kernel_name: str) -> dict | None:
     return _get_flydsl_gemm_kernels().get_flydsl_hgemm_kernel_params(kernel_name)
 
 
+def _ws_up_m128_legacy_config(config):
+    """Original model CSV row, retained for unqualified padded/layout cases."""
+    return {
+        **config,
+        "kernelName": _get_flydsl_gemm_kernels().WS_UP_M128_LEGACY_KERNEL_NAME,
+        "solidx": 2787,
+        "splitK": 1,
+        "us": 19.5768,
+        "err_ratio": 0.0,
+        "tflops": 335.94,
+        "bw": 2765.15,
+    }
+
+
+@functools.cache
+def _flydsl_ws_launcher(kernel_name):
+    from aiter.ops.flydsl.gemm_a16w16_ws import gemm_a16w16_wave_specialized
+
+    config = _flydsl_hgemm_kernel_params(kernel_name)
+    return functools.partial(
+        gemm_a16w16_wave_specialized,
+        **{
+            key: config[key]
+            for key in (
+                "block_m",
+                "block_n",
+                "block_k",
+                "stages",
+                "split_k",
+                "m_waves",
+                "n_waves",
+                "producer_waves",
+                "prefetch",
+                "counter_handshake",
+            )
+        },
+    )
+
+
 @functools.cache
 def _flydsl_extended_launcher(kernel_name):
     config = _flydsl_hgemm_kernel_params(kernel_name)
@@ -706,6 +761,48 @@ def flydsl_gemm(
     ), "FlyDSL hgemm does not support scaling yet."
     flydsl_gemm_kernels = _get_flydsl_gemm_kernels()
     flydsl_config = _flydsl_hgemm_kernel_params(config["kernelName"])
+    if flydsl_config["policy"] == "ws":
+        # CSV qualification covers contiguous inputs at exactly this shape.
+        # Keep legacy normalization/output handling for all other layouts,
+        # including contiguous views whose storage offset is DMA-unaligned.
+        eligible = (
+            inp.shape == (128, 3584)
+            and weights.shape == (7168, 3584)
+            and inp.dtype == weights.dtype == torch.bfloat16
+            and inp.device.type == "cuda"
+            and weights.device == inp.device
+            and inp.is_contiguous()
+            and weights.is_contiguous()
+            and inp.data_ptr() % 16 == 0
+            and weights.data_ptr() % 16 == 0
+            and bias is None
+            and otype in (None, torch.bfloat16)
+            and not bpreshuffle
+            and (
+                out is None
+                or (
+                    out.is_contiguous()
+                    and out.data_ptr() % 8 == 0
+                    and out.dtype == torch.bfloat16
+                    and out.device == inp.device
+                )
+            )
+        )
+        if eligible:
+            return _flydsl_ws_launcher(config["kernelName"])(inp, weights, out=out)
+        return flydsl_gemm(
+            inp,
+            weights,
+            solidx,
+            bias,
+            otype,
+            scale_a,
+            scale_b,
+            scale_c,
+            bpreshuffle,
+            config=_ws_up_m128_legacy_config(config),
+            out=out,
+        )
     skinny = flydsl_config["policy"] == flydsl_gemm_kernels.SKINNY_POLICY
     fused_bias = None
     if (

@@ -1,9 +1,11 @@
 # Experimental gfx950 BF16 wave-specialized GEMM
 
-This is an **explicit experimental path**, not a replacement for
-`flydsl_hgemm` or tuned GEMM dispatch. It implements dedicated loader and
+Most configurations remain an **explicit experimental path**. One exact
+M128 up-projection model CSV row now selects the counter variant for measured
+graph latency gains, with a documented rotation-mode regression; see
+[CSV before/after results](flydsl_ws_csv_results.md). It implements dedicated loader and
 compute waves on gfx950. It does not port NVIDIA TMA/WGMMA or dynamically
-redistribute registers. No existing CSV row selects this function.
+redistribute registers. All other CSV rows keep their previous kernels.
 
     from aiter.ops.flydsl import gemm_a16w16_wave_specialized
 

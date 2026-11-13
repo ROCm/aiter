@@ -49,6 +49,39 @@ _HGEMM_KERNEL_RE = re.compile(
     r"(?P<target_gfx>gfx[0-9a-z]+(?:-[0-9a-z]+)*)$"
 )
 
+# The first CSV-qualified WS candidate is deliberately a finite catalog entry.
+# New WS geometries remain explicit API experiments until separately qualified.
+WS_UP_M128_KERNEL_NAME = (
+    "flydsl_hgemm_ws_abf16_wbf16_bf16_t64x64x128x3_ks1_" "p2_w2x2_pf1_ch1_gfx950"
+)
+WS_UP_M128_LEGACY_KERNEL_NAME = (
+    "flydsl_hgemm_abf16_wbf16_bf16_t64x64x64x7_ks1_"
+    "w4x2x1_bias0_ktail0_gm0_pft_gfx950"
+)
+_WS_UP_M128_CONFIG = {
+    "block_m": 64,
+    "block_n": 64,
+    "block_k": 128,
+    "stages": 3,
+    "split_k": 1,
+    "m_waves": 2,
+    "n_waves": 2,
+    "k_waves": 1,
+    "group_m": 0,
+    "k_stagger": 0,
+    "b_non_temporal": False,
+    "use_half_tile_interleaved": False,
+    "policy": "ws",
+    "producer_waves": 2,
+    "prefetch": True,
+    "counter_handshake": True,
+    "has_bias": False,
+    "dtype": "bf16",
+    "out_dtype": "bf16",
+    "target_gfx": "gfx950",
+}
+
+
 # The skinny policy (kernels/gemm_a16w16_skinny_gfx950.py) reuses the HGEMM name
 # fields: t<block_m>x<block_n>x<block_k>x<stages> is its tile and LDS ring depth,
 # w1x1x<k_waves> the waves splitting K inside a workgroup. It has no split-K,
@@ -84,6 +117,26 @@ def flydsl_hgemm_kernel_name(
         raise ValueError(
             f"Unsupported output dtype {out_dtype_name} for input {dtype_name}"
         )
+
+    if config.get("policy") == "ws":
+        expected = _WS_UP_M128_CONFIG
+        if (
+            dtype_name != "bf16"
+            or out_dtype_name != "bf16"
+            or has_bias
+            or (target_gfx or get_gfx()) != "gfx950"
+            or any(
+                config.get(key, value) != value
+                or type(config.get(key, value)) is not type(value)
+                for key, value in expected.items()
+                if key not in ("dtype", "out_dtype", "has_bias", "target_gfx")
+            )
+            or any(
+                key in config for key in ("mma_m", "mma_n", "mma_k", "streamk_blocks")
+            )
+        ):
+            raise ValueError("unsupported CSV WS configuration")
+        return WS_UP_M128_KERNEL_NAME
 
     if config.get("policy") in (SKINNY_POLICY, "bs"):
         policy = config["policy"]
@@ -132,6 +185,9 @@ def flydsl_hgemm_kernel_name(
 
 def get_flydsl_hgemm_kernel_params(name: str) -> dict | None:
     """Parse a tuned FlyDSL HGEMM kernel name into the current config schema."""
+
+    if name == WS_UP_M128_KERNEL_NAME:
+        return dict(_WS_UP_M128_CONFIG)
 
     match = _HGEMM_KERNEL_RE.fullmatch(name)
     if match is None or match.group("has_k_tail") != "0":
