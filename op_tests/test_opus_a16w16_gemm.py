@@ -613,7 +613,11 @@ def test_gfx950_split_k_kid_refuses_4gib_workspace():
 
     assert plan(16384, 16128, 1024, 4).abi_split_k == 4
     assert plan(8192, 16128, 2048, 8).abi_split_k == 8
-    for shape in ((16384, 16384, 1024, 4), (8192, 16384, 2048, 8), (16384, 130816, 256, 1)):
+    for shape in (
+        (16384, 16384, 1024, 4),
+        (8192, 16384, 2048, 8),
+        (16384, 130816, 256, 1),
+    ):
         with pytest.raises(ValueError, match="workspace.*smaller than 4 GiB"):
             plan(*shape)
 
