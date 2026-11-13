@@ -130,16 +130,8 @@ def _next_pow2(n):
     return 1 << (n - 1).bit_length()
 
 
-_PADDED_M_TIERS = [32768, 131072]
-
-
 def _get_padded_m(m):
-    if m < _PADDED_M_TIERS[0]:
-        return _next_pow2(m)
-    for tier in reversed(_PADDED_M_TIERS):
-        if m >= tier:
-            return tier
-    return _PADDED_M_TIERS[0]
+    return min(_next_pow2(m), 131072)
 
 
 @functools.lru_cache(maxsize=1024)
@@ -209,18 +201,32 @@ def _find_grouped_config(
             pass
         return value
 
+    max_token = 0
+
     def _matches(row, *, require_cu_num: bool):
+        nonlocal max_token
         for k, v in keys.items():
-            if k == "cu_num" and not require_cu_num:
+            if k == "token" or (k == "cu_num" and not require_cu_num):
                 continue
             cell = _cell(row, k)
             if cell and cell != v:
                 return False
-        return True
+        token = _cell(row, "token")
+        if token.isdigit():
+            max_token = max(max_token, int(token))
+        return not token or token == keys["token"]
 
-    matches = [row for row in rows if _matches(row, require_cu_num=True)]
-    if not matches:
-        matches = [row for row in rows if _matches(row, require_cu_num=False)]
+    def _find_matches():
+        matches = [row for row in rows if _matches(row, require_cu_num=True)]
+        if not matches:
+            matches = [row for row in rows if _matches(row, require_cu_num=False)]
+        return matches
+
+    matches = _find_matches()
+    if not matches and 0 < max_token < token_num:
+        # Cap lookup at the largest compatible tuned token, not gaps.
+        keys["token"] = str(max_token)
+        matches = _find_matches()
     # A row that names ep_fused explicitly was tuned for that path, so it wins
     # over an otherwise equal row that serves both. Measuring the fused path
     # needs a live multi-rank arena for GEMM2's scatter epilogue, so its tuning
