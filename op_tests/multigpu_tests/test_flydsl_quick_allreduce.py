@@ -35,11 +35,11 @@ sweep ends in a markdown table:
 * ``test_quick_allreduce_relay`` -- the TP2 mesh with relay devices set, checked
   against a direct engine on the same inputs. A default run adds these rows
   only on xGMI, when four GPUs are visible and this arch has relay defaults.
-  The direct TP2 rows always run. Relay rows run eager; a block-512 and a
-  block-256 shape also run captured into a CUDA graph, replayed with the inputs
-  refilled between replays. A block-64 row with every block relaying, eager
-  and graph, makes each block re-read its bounce slots, which catches a relay
-  acquire that no longer empties L1.
+  The direct TP2 rows always run. Relay rows run eager; 2.5 and 80 MiB shapes
+  also run captured into a CUDA graph, replayed with the inputs refilled
+  between replays. A block-64 row with every block relaying, eager and graph,
+  makes each block re-read its bounce slots, which catches a relay acquire that
+  no longer empties L1.
 * ``test_quick_allreduce_setup_failure`` -- at TP2, one rank fails the inbox
   allocation or the peer-handle open while the engines are built. Every rank
   must raise, none may hang in an exchange, and a clean engine must build
@@ -340,10 +340,10 @@ RELAY_CALLS = 4
 # Relays for the TP pair on devices 0 and 1.
 DEFAULT_RELAY = (2, 3)
 DEFAULT_RELAY_FRACTION = (3, 8)
-# (tokens, hidden, codec). Sizes: a few blocks at block 256, the block-512 rung
-# below one wave of tiles, a payload whose last tile is partial, a multiple of
-# the tile at 80 MiB, and the largest the TP2 mesh serves. The lossless wire
-# runs the two that exercise the offsets hardest.
+# (tokens, hidden, codec). Sizes: a single tile, 10 MiB (partial persistent
+# grid on gfx950's g512 block-256 rung; above 4 MiB on two-rung ladders), a
+# payload whose last tile is partial, a full-grid multiple at 80 MiB, and 120
+# MiB. The lossless wire runs the two that exercise the offsets hardest.
 RELAY_CASES = (
     (8, 1024, "int4"),
     (1024, 5120, "int4"),
@@ -355,8 +355,9 @@ RELAY_CASES = (
     (1024, 5120, "int5"),
     (1024, 5120, "int6"),
 )
-# The default relay rows that also run under CUDA-graph replay: 80 MiB is on
-# the block-512 rung (from 4 MiB), 2.5 MiB on the block-256 rung.
+# The default relay rows that also run under CUDA-graph replay: 80 MiB (full
+# g512 grid on gfx950; block-512 rung on gfx942) and 2.5 MiB (80 tiles at
+# block-256).
 RELAY_GRAPH_CASES = ((8192, 5120, "int4"), (256, 5120, "int4"))
 # (tokens, hidden, codec, block, grid_cap): 16 tiles of 8 KiB over 8 blocks, all
 # relaying, so every block reads its bounce slots twice with too little traffic

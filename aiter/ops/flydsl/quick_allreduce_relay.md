@@ -116,33 +116,40 @@ kernel than the tables below, so only the comparison carries over. `den` above
 
 ### Speedup and cutoff
 
-One pair, CUDA-graph replay, INT4, hidden 5120, relay fraction 3/8, the four
-GPUs in use otherwise idle. Each time is the median over three repeats of the
-slower rank's mean per replay; ranges are over two runs in separate processes.
+One pair on the shipping `gfx950` TP2 mesh ladder (`super_tile=1`,
+`grid_cap=512`, `block=256`, INT4 with E5M2 group scales, `FlyDSL 0.5.0`),
+CUDA-graph replay, hidden 5120, relay fraction 3/8, the four GPUs in use
+otherwise idle. Each time is the median over repeats of the slower rank's mean
+per replay; ranges are over two runs in separate processes (five repeats per
+run at 120 MiB, three at 5–80 MiB).
 
 | MiB | tokens | direct µs | relay µs | speedup |
 | --: | --: | --: | --: | --: |
-| 5 | 512 | 38.7-38.8 | 29.1-29.3 | 1.32-1.33x |
-| 10 | 1024 | 69.7-70.0 | 51.0-51.9 | 1.34-1.37x |
-| 20 | 2048 | 124.3-124.9 | 86.7-86.8 | 1.43-1.44x |
-| 40 | 4096 | 235.3-235.9 | 158.6-158.7 | 1.48-1.49x |
-| 80 | 8192 | 462.2-462.7 | 304.5-306.2 | 1.51-1.52x |
-| 120 | 12288 | 688.9-689.9 | 450.2-452.1 | 1.53x |
+| 5 | 512 | 35.8-35.9 | 26.0-26.1 | 1.37-1.38x |
+| 10 | 1024 | 64.9-65.0 | 44.1-44.3 | 1.47x |
+| 20 | 2048 | 122.3-122.5 | 83.5 | 1.46-1.47x |
+| 40 | 4096 | 235.2-235.6 | 152.9-153.0 | 1.54x |
+| 80 | 8192 | 461.9-462.2 | 296.6-297.1 | 1.55-1.56x |
+| 120 | 12288 | 686.9-689.9 | 439.6-441.8 | 1.56x |
 
-Below 5 MiB the relay is 1.23-1.24x at 2.5 MiB and 1.07-1.08x at 480 KiB,
-breaks even near 0.23 MiB, and loses about 3% at 0.16 MiB and below (one run
-below 0.47 MiB). The 480 KiB cutoff sits inside the winning range.
+Below 5 MiB the relay is 1.23-1.27x at 2.5 MiB and 1.06-1.08x at 480 KiB,
+breaks even near 0.23 MiB (1.01x), and loses about 3% at 0.16 MiB (0.97x). The
+480 KiB cutoff sits inside the winning range.
 
 ### Fraction
 
-In that one-pair sweep, 1/2 is 1.4-6% faster than 3/8 from 20 MiB up (1.60x at
-80 MiB) and 1-7% slower at 2.5-10 MiB. From 0.47 MiB up, 1/4 and 5/8 never beat
-3/8; below that, 1/4 is slightly ahead of it.
+In that one-pair sweep, 1/2 is faster than 3/8 from 20 MiB up (1.49-1.50x at
+20 MiB, 1.65-1.66x at 40 MiB, 1.78-1.79x at 80 MiB, and 1.84-1.85x at 120 MiB)
+and 1-5% slower at 5-10 MiB. In an earlier sweep over 1/4 through 5/8 (on the
+pre-#5555 two-rung `grid_cap=128` ladder, where 3/8 was 1.51-1.52x and 1/2 was
+1.60x at 80 MiB), 1/4 and 5/8 never beat 3/8 from 0.47 MiB up; below that, 1/4
+was slightly ahead of it.
 
-Under two-pair contention (pair A relaying through pair B's GPUs, three runs per
-fraction, interleaved), 1/2 and 3/8 are within run-to-run spread at 2.5 and
-10 MiB with the relay GPUs idle, and at 80 MiB A's relay all-reduce takes
-288.8-289.9 µs at 1/2 against 310.4-313.4 µs at 3/8. The cost to B's work is:
+Under two-pair contention on that two-rung `grid_cap=128` ladder (pair A
+relaying through pair B's GPUs, three runs per fraction, interleaved), 1/2 and
+3/8 were within run-to-run spread at 2.5 and 10 MiB with the relay GPUs idle,
+and at 80 MiB A's relay all-reduce took 288.8-289.9 µs at 1/2 against
+310.4-313.4 µs at 3/8. The cost to B's work was:
 
 | B's work | MiB | at 3/8 | at 1/2 |
 | :-- | --: | --: | --: |
@@ -160,7 +167,7 @@ slowdown at 2.5 and 10 MiB (1.3 times at 80 MiB).
 ### One relay for both directions
 
 Pair on GPUs 0 and 1, relays on 2 and 3, CUDA-graph replay, INT4, two runs in
-separate processes.
+separate processes (measured on the pre-#5555 two-rung `grid_cap=128` ladder).
 
 | MiB | 2,3 at 3/8 | 2,2 at 3/8 | 3,3 at 3/8 | 2,3 at 1/2 | 2,2 at 1/2 |
 | --: | --: | --: | --: | --: | --: |
@@ -189,8 +196,9 @@ processes' ~490 MB on one GPU.
 
 ## Other measurements (3/8)
 
-Two-pair contention harness, current kernel. This harness times the 80 MiB
-relay at 311-313 µs, against 305-306 µs in the one-pair sweep above.
+Two-pair contention harness (measured on the pre-#5555 two-rung `grid_cap=128`
+ladder, where the harness timed the 80 MiB relay at 311-313 µs against
+305-306 µs in that ladder's one-pair sweep).
 
 - **Direct all-reduce on the relay GPUs.** B's own direct all-reduce while A
   relays through it is unchanged at 2.5 and 80 MiB and about 1% slower at
@@ -199,17 +207,19 @@ relay at 311-313 µs, against 305-306 µs in the one-pair sweep above.
   80 MiB all-reduce; 8192 tokens). Direct: 2780-2786 µs. Relaying through idle
   GPUs: 2473-2489 µs (0.89x the time). Both pairs relaying through each other:
   2482-2493 µs for A and 2466-2475 µs for B.
-- **Memory.** At INT4 a rank allocates 13.6 MiB for relaying: two bounces on a
-  relay GPU and the two relay engines' inboxes on its own GPU, half each.
+- **Memory.** At INT4 on `gfx950` (`super_tile=1`, `grid_cap=512`, `block=256`),
+  a rank allocates 18.3 MiB (18.27 MiB) for relaying: its incoming bounce on a
+  relay GPU and the relay engine's inbox on its own GPU, half each (13.6 MiB on
+  a two-rung `grid_cap=128` `block=256`/`512` ladder).
 - **Memory on the relay GPU.** Each TP process's first allocation on a relay
   GPU, its bounce, makes HIP set up that device in the process, which charges
   about 490 MB there. It stays charged until the process exits, after the
-  bounce is freed, and amd-smi lists no process for it. With both directions
-  through one relay, that GPU's used VRAM went from 286 to 1288 MB, of which
-  14.3 MB is the two bounces. Opening a bounce that a process on the relay GPU
-  allocated, and writing through it, charged nothing there, so a
-  `relay_provider` whose bounces come from the relay GPU's own worker would
-  cost that GPU only the bounce bytes.
+  bounce is freed, and amd-smi lists no process for it. On the two-rung
+  `grid_cap=128` ladder with both directions through one relay, that GPU's used
+  VRAM went from 286 to 1288 MB, of which 14.3 MB was the two ranks' bounces.
+  Opening a bounce that a process on the relay GPU allocated, and writing
+  through it, charged nothing there, so a `relay_provider` whose bounces come
+  from the relay GPU's own worker would cost that GPU only the bounce bytes.
 
 ## Not measured
 
@@ -227,6 +237,8 @@ relay at 311-313 µs, against 305-306 µs in the one-pair sweep above.
 rows on an xGMI host with four or more GPUs, through devices 2 and 3 when the
 arch has relay defaults; on an xGMI arch without defaults, pass `--relay 2,3`.
 The rows check bit identity against the direct engine, eager and under graph
-replay, on the block-256 and block-512 rungs, the cutoff walk around 480 KiB,
-and the block-64 reuse row. The wires default to INT4 and FP16; add
-`--relay-codec int4 int5 int6 fp16` for all four.
+replay, at 2.5 and 80 MiB (spanning partial and full persistent grids on
+`gfx950`'s `block=256`, `grid_cap=512` rung, and both `block=256`/`512` rungs
+on two-rung ladders), the cutoff walk around 480 KiB, and the block-64 reuse
+row. The wires default to INT4 and FP16; add `--relay-codec int4 int5 int6 fp16`
+for all four.
