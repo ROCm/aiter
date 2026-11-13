@@ -1292,6 +1292,49 @@ def test_flydsl_kda_decode_rejects_unsupported_state_dtype(
         _run_kda_api(fused_f_b, f_a, f_b_weight, inputs)
 
 
+def _to_device_preserving_strides(tensor: torch.Tensor, device) -> torch.Tensor:
+    moved = torch.empty_strided(
+        tensor.shape, tensor.stride(), dtype=tensor.dtype, device=device
+    )
+    moved.copy_(tensor)
+    return moved
+
+
+@_requires_kda
+@pytest.mark.skipif(torch.cuda.device_count() < 2, reason="needs two GPUs")
+@pytest.mark.parametrize("fused_f_b", [False, True])
+def test_flydsl_kda_decode_runs_on_a_second_gpu(fused_f_b: bool) -> None:
+    """A launcher built on cuda:0 must not serve cuda:1: its compiled handle is
+    bound to the GPU it was built on."""
+    f_a, f_b_weight, base_inputs = _make_kda_fb_inputs(batch=8)
+    first_inputs = _copy_kda_inputs(base_inputs)
+    first = _run_kda_api(fused_f_b, f_a, f_b_weight, first_inputs)
+    torch.cuda.synchronize(0)
+
+    second_device = torch.device("cuda", 1)
+    second_inputs = KdaInputs(
+        **{
+            name: _to_device_preserving_strides(
+                getattr(base_inputs, name), second_device
+            )
+            for name in KdaInputs.__dataclass_fields__
+        }
+    )
+    second = _run_kda_api(
+        fused_f_b,
+        _to_device_preserving_strides(f_a, second_device),
+        _to_device_preserving_strides(f_b_weight, second_device),
+        second_inputs,
+    )
+    torch.cuda.synchronize(1)
+
+    assert second.device == second_device
+    torch.testing.assert_close(second.cpu(), first.cpu(), rtol=0, atol=0)
+    torch.testing.assert_close(
+        second_inputs.state.cpu(), first_inputs.state.cpu(), rtol=0, atol=0
+    )
+
+
 @_requires_kda
 def test_flydsl_kda_decode_advertises_state_dtypes() -> None:
     expected = (torch.float32, torch.bfloat16)

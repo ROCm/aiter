@@ -1385,9 +1385,16 @@ def _kda_vector_sum(vec):
 # normal use (sized like the GDR decode caches above).
 @functools.lru_cache(maxsize=1024)
 def create_kda_decode_kernel(
-    norm_eps: float, lower_bound: float, fuse_f_b: bool, state_dtype: str
+    norm_eps: float,
+    lower_bound: float,
+    fuse_f_b: bool,
+    state_dtype: str,
+    device_index: int = 0,
 ):
     """Build the fixed BF16 KDA decode specialization (gfx942/gfx950).
+
+    ``device_index`` only keys the cache: a compiled handle launches on the GPU it
+    was built on, so each GPU gets its own launcher.
 
     With ``fuse_f_b``, the kernel computes the head-local ``f_b`` projection
     instead of reading a precomputed raw gate from global memory.
