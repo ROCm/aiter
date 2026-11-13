@@ -128,10 +128,17 @@ and launches them; every FlyDSL launch is compiled into the cache instead.
   `gemm_a8w8_blockscale_bpreshuffle` with e8m0 scales,
   `batched_gemm_a8w8_mxscale_bpreshuffle`, `gemm_a16w16` and `gemm_a4w4`.
   A row tuned at M also serves the M down to the previous tuned M
-  of its shape. On gfx1250 (`SCAN_ARCHS`) every one of those M is identified
-  first: replayed with each FlyDSL launch stopped at its cache key, so nothing
-  compiles. Then one M per set of kernels the row's own replay did not build
-  is replayed for real, reported as `[SCAN]`. Bisecting between the two ends
+  of its shape. On gfx1250 (`SCAN_ARCHS`) those M are identified first:
+  replayed with each FlyDSL launch stopped at its cache key, so nothing
+  compiles. Not every M is identified, only those `scan_sizes` names, where
+  the runtime's choice can change: on each piece of the range where the
+  padded-M lookup finds the same row, the first `lcm(1..cluster_m)` M-tile
+  counts of the kernel of each row it finds and the last (each ragged, at the
+  other parity, and full); where it finds none (a sparse table), every size
+  class the untuned-shape heuristics tell apart; and every power of two
+  (about 15K M instead of 2.27M for the default tables, and the same kernels
+  as identifying every M). Then one M per set of kernels the
+  row's own replay did not build is replayed for real, reported as `[SCAN]`. Bisecting between the two ends
   would miss kernels there, since the gfx1250 GEMMs fit cluster_m to the
   number of M tiles and specialize a ragged last tile: M=5120 and M=6144 can
   request one kernel and M=5632 another. Rows of other archs are replayed at
@@ -409,11 +416,14 @@ python op_tests/test_moe_2stage.py
   is refreshed to the right version.
 - **`ReplayHookBroken`, or an `AttributeError` on `JitFunction`, after a FlyDSL
   upgrade**: the replay learns each launch's cache key by hooking two private
-  methods of FlyDSL's `JitFunction`, `_compile_or_execute` and
-  `_build_full_cache_key` (`replay.requested_kernels`). A release that renames
+  names of FlyDSL's `jit_function` module, `JitFunction._compile_or_execute`
+  and `_artifact_cache_key` (`replay.requested_kernels`). A release that renames
   either fails every replay with an `AttributeError`; one whose launches stop
-  deriving their key in `_build_full_cache_key` fails them with
-  `ReplayHookBroken`. Update `requested_kernels` for that release.
+  deriving their key in `_artifact_cache_key` fails them with
+  `ReplayHookBroken`. A scan (`SCAN_ARCHS`) also hooks `JitFunction._trace` and
+  its `convert_to_jit_arguments` / `get_ir_types`, to trace each distinct
+  launch once (`replay._trace_identity`). Update `requested_kernels` for that
+  release.
 - **Worker OOM / killed (exitcode -9)**: abnormal exits are auto-retried
   (`AITER_FLYDSL_AOT_MAX_RETRIES`) and the default worker count is already
   bounded by the shared CPU and memory policy. If it still happens,
