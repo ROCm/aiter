@@ -8,6 +8,7 @@ reference and the main path (uneven, idle, padded ranks), per-layer weight
 rebinding with interleaved main calls, CUDA graph replay, and paired timing.
 
     AITER_MEGA_SMALL_M=1 torchrun --nproc-per-node 8 test_mega_moe_small_m.py
+    AITER_MEGA_SMALL_M=1 torchrun --nproc-per-node 8 test_mega_moe_small_m.py --network kimi_k26
     # against a same-MTPR main path, timing only:
     AITER_MEGA_SMALL_M=1 torchrun --nproc-per-node 8 test_mega_moe_small_m.py \
         --mtpr 256 --time-only --time-bs 140,168,196,224,252
@@ -36,6 +37,8 @@ from test_mega_moe_v2 import (
 
 from aiter.jit.utils.chip_info import get_gfx
 from aiter.ops.flydsl.kernels.mega_moe import MegaMoEV2
+
+SMALL_M_NETWORKS = ("v4_pro", "kimi_k26")
 
 
 def _rel_l2(out, ref):
@@ -118,7 +121,7 @@ def _check_epoch_wrap_and_zero_rows(moe, bind, case, large_case, device):
 
 def run(args):
     rank, world, device = _setup_dist()
-    net = NETWORKS["v4_pro"]
+    net = NETWORKS[args.network]
     experts, topk = net["experts"], net["topk"]
     local_experts = experts // world
     try:
@@ -153,7 +156,7 @@ def run(args):
         large_m = moe._large_m is not None
         if rank == 0:
             print(
-                f"[SETUP] mtpr={moe.mtpr} small_m_mtpr={moe.small_m_mtpr} large_m={large_m} world={world}",
+                f"[SETUP] network={args.network} mtpr={moe.mtpr} small_m_mtpr={moe.small_m_mtpr} large_m={large_m} world={world}",
                 flush=True,
             )
 
@@ -552,6 +555,12 @@ def main():
         print(f"[SKIP] the small- and large-input paths need gfx950, got {get_gfx()}")
         return
     p = argparse.ArgumentParser()
+    p.add_argument(
+        "--network",
+        choices=SMALL_M_NETWORKS,
+        default="v4_pro",
+        help="network shape (the FUSED_PATH_SHAPES the small-input path supports)",
+    )
     p.add_argument("--mtpr", type=int, default=8192)
     p.add_argument("--slots", type=int, default=61)
     p.add_argument("--seed", type=int, default=7)
