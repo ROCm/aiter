@@ -90,6 +90,7 @@ from .mega_moe_tp_config import (
     P_S3,
     P_U,
     P_UB,
+    P_YD,
     QE,
     QID,
     QQ,
@@ -97,13 +98,15 @@ from .mega_moe_tp_config import (
     QUEUES,
     QX,
     QXS,
-    SRT,
     TN_MAX,
     UNIT_ROWS,
     UQ,
     ZQ,
     i8_row_bytes,
     kernel_config,
+)
+from .mega_moe_tp_config import (
+    SRT as SRT0,
 )
 from .schedule import build_schedule
 
@@ -591,8 +594,12 @@ def compile_bigm_kernel(
     opts: tuple = (),
     tailq: int = 1,
     act: str = "swiglu",
+    situ_beta: float = 1.0,
+    situ_linear_beta: float = 1.0,
 ):
-    """act: the units' activation ("swiglu", "silu"); E < 512 routed experts (+ the shared one).
+    """act: the units' activation ("swiglu", "silu", "situv2" with situ_beta / situ_linear_beta);
+    E < 1024 routed experts (+ the last one, counted apart: a fused shared expert, or the last
+    routed one).
     tailq: 0 no tail, 1 the tail with the q gather, 2 the local tail (this rank's q rows),
     3 no tail, y of every rank's rows (bf16, the "q" region: the y gather of the ar mode).
     The MoE interface (MegaMoeTP.forward, ag_rs): the caller's normed own rows x [m, H] and their
@@ -600,7 +607,8 @@ def compile_bigm_kernel(
     MoE output (y), and with tailq res_out = y + res_in, the next-layer norm + FP8 rows of every
     rank (q gather).
     """
-    assert H % 256 == 0 and 0 < E < 512 and K <= 64 and act in ("swiglu", "silu")
+    assert H % 256 == 0 and 0 < E < 1024 and K <= 64
+    assert act in ("swiglu", "silu", "situv2")
     RG = UNIT_ROWS  # (one CTA of NW waves per CU)
     K1, NE = K + 1, E + 1
     HV = H // 8  # 16 B (8 bf16) columns of a row
@@ -612,7 +620,10 @@ def compile_bigm_kernel(
     if NE <= 256:
         XST, CC_CNT, CC_OFF, CC_FILL = 256, C_ECNT, C_OFF, C_FILL
     else:
-        XST, CC_CNT, CC_OFF, CC_FILL = 512, C_XW, C_XW + 8 * 512, C_XW + 16 * 512
+        XST = 512 if NE <= 512 else 1024
+        CC_CNT, CC_OFF, CC_FILL = C_XW, C_XW + 8 * XST, C_XW + 16 * XST
+    # NE > 512 (Kimi K3.1's 896): the plan's per-expert scans as loops (unrolled: NE x NEB code)
+    DYNE = NE > 512
 
     od = dict(opts)  # tuned AITER_BIGM_* options (configs/mega_moe_tp_bigm_tuned.csv)
 
@@ -642,6 +653,14 @@ def compile_bigm_kernel(
     R8 = int(_opt("AITER_BIGM_R8", "0"))
     # MoE-output RS rows as int4 (+ bf16 scale per 32)
     E4 = int(_opt("AITER_BIGM_E4", "0"))
+    # E rows in bf16 (comm_dtype "bf16": the reduce-scatter unquantized; over E4 / int8)
+    EB = int(_opt("AITER_BIGM_EB", "0"))
+    # (ar, tailq 3) the y gather as int8 rows + f32 scale per 32 (RB bytes, not 2 H), every
+    # rank's rows then dequantized into yout by the YD items
+    YG8 = int(_opt("AITER_BIGM_YG8", "0")) if tailq == 3 else 0
+    # tokens per sort item (S1 counts / S3 route lists): many routes per token (Kimi K3.1's 16)
+    # take more per item: fewer items, fewer atomics on each expert's fill counter
+    SRT = SRT0 if K1 <= 9 else 128
     # SXW 0: the routing plan waits only for the gathered routing; units wait for the gathered rows
     SXW = int(_opt("AITER_BIGM_SXW", "1"))
     # topk sum: token pipeline depth (0: ZQ, a batch: every load first). bf16 route rows of many
@@ -660,16 +679,35 @@ def compile_bigm_kernel(
     # int8 rows of the attention / MoE-output RS: one fp32 scale per 32 values
     RB = i8_row_bytes(H)
     SCO = H
-    lay, unit_body = build_bigm_unit(H, I, K1, RG, NAB, BST, BS2, act, swiglu_limit, R8)
+    YRB = RB if YG8 else 2 * H  # bytes of a gathered y row (ar)
+    lay, unit_body = build_bigm_unit(
+        H,
+        I,
+        K1,
+        RG,
+        NAB,
+        BST,
+        BS2,
+        act,
+        swiglu_limit,
+        R8,
+        (situ_beta, situ_linear_beta),
+    )
     # row-phase / plan scratch after the unit's LDS (also reused ranges)
     LBASE = lay["BYTES"]
     LSC = LBASE  # 64 B scratch for block reductions (NW x 4 words)
     LT = LBASE + 64  # ticket broadcast
-    LH = LBASE + 128  # [NE] histogram / ranks
+    # the plan scratch (S1 / S2 / S3 items only): after the unit's LDS, or over it (a unit's
+    # LDS is dead between items) when a deep A ring leaves no room
+    NSCR = 8 * NES + max(4 * SRT * K1, 64 + 4 * max(NE, 64 * EPL)) + 64
+    LTID = LBASE + 128
+    LH = LTID + 4 * NT  # [NE] histogram / ranks
+    if LH + NSCR > 160 * 1024:
+        assert NSCR <= LBASE, (NSCR, LBASE)
+        LH = 0
     LB2 = LH + 4 * NES  # [NE] bases
     LP = LB2 + 4 * NES  # [SRT * K1] route positions of a sort item ([NE] plan scratch)
-    LTID = LP + max(4 * SRT * K1, 64 + 4 * max(NE, 64 * EPL)) + 64
-    LDS_BYTES = LTID + 4 * NT  # [NT] each thread's id (own_tid)
+    LDS_BYTES = max(LTID + 4 * NT, LH + NSCR)  # LTID: [NT] each thread's id (own_tid)
     assert LDS_BYTES <= 160 * 1024, LDS_BYTES
 
     def cpart(kk):  # row iteration kk is the partial last one
@@ -737,6 +775,16 @@ def compile_bigm_kernel(
             ORDER += [(k, P_RQ)]
         ORDER += [(C - 1, P_RF)]
         ORDER += [(k, P_UB) for k in range(C)]  # empty: U(k) takes every unit slot
+    # (YG8) chunk k's YD after chunk k+1's RF (its peers' y puts landed by then), the last at
+    # the end (right after chunk k's RF measured 400-600 us slower at M3.1 ar 32k: CTAs spin
+    # on YD ahead of other work)
+    if YG8:
+        o2 = []
+        for k_, kd in ORDER:
+            o2.append((k_, kd))
+            if kd == P_RF and k_ >= 1:
+                o2.append((k_ - 1, P_YD))
+        ORDER = o2 + [(C - 1, P_YD)]
     USPLIT = ORD == 4
 
     def fb(v):
@@ -745,7 +793,11 @@ def compile_bigm_kernel(
     name = (
         f"bigm_kernel_h{H}_i{I}_e{E}k{K}_tp{tp}_c{C}_rg{RG}_{fb(eps)}{'g' if gemma else 'r'}"
         + f"_v23_t{tailq}_c1h{NSBA}_o{ORD}s{NSB}a{UA}d{RQD}r{R8}w{SXW}e{E4}b{BS2}"
+        + f"n{NAB}q{SRT}"
+        + ("_eb" if EB else "")
+        + ("_yg8" if YG8 else "")
         + ("" if act == "swiglu" else f"_{act}{fb(swiglu_limit)}")
+        + (f"_b{fb(situ_beta)}_{fb(situ_linear_beta)}" if act == "situv2" else "")
     )
 
     Shared = fx.struct(
@@ -794,10 +846,12 @@ def compile_bigm_kernel(
         )
 
     # E (MoE-output RS) rows: int8 + f32 scale per 32 (RB bytes), or E4: int4 + bf16 scale per 32
-    # (QuickReduce INT4's code: ATOM's MoE-output reduce-scatter)
-    RBE = (H // 2 + H // 16) if E4 else RB
+    # (QuickReduce INT4's code: ATOM's MoE-output reduce-scatter), or EB: bf16 (2 H bytes)
+    RBE = 2 * H if EB else (H // 2 + H // 16) if E4 else RB
 
     def e_ld(rx, row, p):
+        if const_expr(EB):
+            return bld(rx, row * i32(RBE) + p * i32(16), 0, V4I, CAUX)
         if const_expr(E4):
             d = fx.Int32(bld(rx, row * i32(RBE) + p * i32(4), 0, T.i32, CAUX))
             sb = fx.Int32(
@@ -813,6 +867,8 @@ def compile_bigm_kernel(
         return i8_rows_ld(rx, row, p)
 
     def e_val(ld):
+        if const_expr(EB):
+            return bf16x8_to_f32(ld)
         if const_expr(E4):
             d, sb = ld
             return i4x8_unpack(d, (sb << i32(16)).bitcast(fx.Float32))
@@ -820,7 +876,9 @@ def compile_bigm_kernel(
 
     @flyc.jit
     def e_store(f, rd, drow, p, lane):
-        if const_expr(E4):
+        if const_expr(EB):
+            bst(pack_bf16x8(f), rd, drow * i32(RBE) + p * i32(16), 0, AUX_SYS)
+        elif const_expr(E4):
             am = amax(f)
             am = am.maximumf(am.shuffle_xor(i32(1), i32(64)))
             am = am.maximumf(am.shuffle_xor(i32(2), i32(64)))
@@ -1192,11 +1250,14 @@ def compile_bigm_kernel(
             jx = il(j, cnt(P_RB, s))
             rq, rqs = rsrc(wp("xq")), rsrc(wp("xs"))
             i0 = jx * i32(ZX)
+            # first row of the item in x (xs0) / in the window (ws0)
+            xs0 = o + i0
+            ws0 = B + rank * s + i0
             ld = [
                 [
                     bld(
                         r_xin,
-                        ((o + i0 + i32(ii)) * i32(H) + col(tid, kk) * i32(8)) * i32(2),
+                        ((xs0 + i32(ii)) * i32(H) + col(tid, kk) * i32(8)) * i32(2),
                         0,
                         T.vec(4, T.i32),
                     )
@@ -1206,8 +1267,8 @@ def compile_bigm_kernel(
             ]
             if tid < i32(ZX * K1):
                 rr_ = tid // i32(K1)
-                src = (o + i0 + rr_) * i32(K1) + (tid - rr_ * i32(K1))
-                dst = (B + rank * s + i0) * i32(K1) + tid
+                src = (xs0 + rr_) * i32(K1) + (tid - rr_ * i32(K1))
+                dst = ws0 * i32(K1) + tid
                 bst(
                     fx.Int32(bld(r_ids, src * i32(4), 0, T.i32)),
                     rsrc(wp("ids")),
@@ -1223,7 +1284,7 @@ def compile_bigm_kernel(
                     AUX_SYS,
                 )
             for ii in range_constexpr(ZX):
-                row0 = B + rank * s + i0 + i32(ii)
+                row0 = ws0 + i32(ii)
                 for kk in range_constexpr(PIT):
                     p = col(tid, kk)
                     y = bf16x8_to_f32(ld[ii][kk])
@@ -1300,13 +1361,16 @@ def compile_bigm_kernel(
                         ),
                     )
             gpu.barrier()
-            accs = [i32(0)] * NEB
-            for e_ in range_constexpr(NE - 1):
-                v = lds_ld_i32(L, i32(LH + 4 * e_))
-                for b_ in range_constexpr(NEB):
-                    accs[b_] = accs[b_] + (i32(e_) < tid + i32(b_ * NT)).select(
-                        v, i32(0)
-                    )
+            if const_expr(DYNE):
+                accs = s2_prefix(tid)
+            else:
+                accs = [i32(0)] * NEB
+                for e_ in range_constexpr(NE - 1):
+                    v = lds_ld_i32(L, i32(LH + 4 * e_))
+                    for b_ in range_constexpr(NEB):
+                        accs[b_] = accs[b_] + (i32(e_) < tid + i32(b_ * NT)).select(
+                            v, i32(0)
+                        )
             for b_ in range_constexpr(NEB):
                 e = tid + i32(b_ * NT)
                 if e < i32(NE):
@@ -1315,6 +1379,78 @@ def compile_bigm_kernel(
             gpu.barrier()
             s2_greedy(k)
             done_last(k, P_S2, i32(1))
+
+        @flyc.jit
+        def s2_prefix(tid):
+            """(DYNE) each thread's experts' route-list offsets: the exclusive prefix of the
+            counts in LH, over 64-expert blocks (one LDS load per lane, then readlane)
+            """
+            accs = [i32(0)] * NEB
+            lane = tid % i32(64)
+            for g_ in range(i32(0), i32(ceildiv(NE, 64)), i32(1)):
+                e0 = i32(g_) * i32(64)
+                vl = (e0 + lane < i32(NE)).select(
+                    lds_ld_i32(L, i32(LH) + fx.min(e0 + lane, i32(NE - 1)) * i32(4)),
+                    i32(0),
+                )
+                for i_ in range_constexpr(64):
+                    v = i32(rocdl.readlane(T.i32, vl, i32(i_)))
+                    for b_ in range_constexpr(NEB):
+                        accs[b_] = accs[b_] + (
+                            e0 + i32(i_) < tid + i32(b_ * NT)
+                        ).select(v, i32(0))
+            return accs
+
+        @flyc.jit
+        def s2_greedy_dyn(tid):
+            """(DYNE) s2_greedy's wave-0 queue assignment as loops over 64-expert blocks (one
+            LDS load per lane, then the block's experts in order through readlane), the same
+            choices: the spread experts' first g, every other expert's (queue, first slot) to
+            LEQ[e] (lane 0, the values wave-uniform); the queue loads to LP"""
+            LEQ = LP + 64
+            lane = tid % i32(64)
+            ns = (lds_ld_i32(L, i32(LH + 4 * E)) + i32(RG - 1)) // i32(RG)
+            g_ = uni(ns)
+
+            def nus(g):  # the units of experts 64 g + lane (0 past E)
+                e = g * i32(64) + lane
+                c = lds_ld_i32(L, i32(LH) + fx.min(e, i32(E - 1)) * i32(4))
+                return (e < i32(E)).select((c + i32(RG - 1)) // i32(RG), i32(0))
+
+            for gg in range(i32(0), i32(EPL), i32(1)):
+                nuv = nus(i32(gg))
+                for i_ in range_constexpr(64):
+                    e = i32(gg) * i32(64) + i32(i_)
+                    nu = i32(rocdl.readlane(T.i32, nuv, i32(i_)))
+                    sp = nu > i32(UQ)
+                    if (tid == i32(0)) & sp:
+                        lds_st(L, i32(LEQ) + e * i32(4), g_ | i32(-(1 << 31)))
+                    g_ = g_ + sp.select(nu, i32(0))
+            ky = [
+                ((g_ - i32(x) + i32(7)) // i32(8)) * i32(8) + i32(x) for x in range(8)
+            ]
+            for gg in range(i32(0), i32(EPL), i32(1)):
+                nuv = nus(i32(gg))
+                for i_ in range_constexpr(64):
+                    e = i32(gg) * i32(64) + i32(i_)
+                    nu = i32(rocdl.readlane(T.i32, nuv, i32(i_)))
+                    sp = nu > i32(UQ)
+                    nu8 = sp.select(i32(0), nu * i32(8))
+                    m_ = fx.min(
+                        fx.min(fx.min(ky[0], ky[1]), fx.min(ky[2], ky[3])),
+                        fx.min(fx.min(ky[4], ky[5]), fx.min(ky[6], ky[7])),
+                    )
+                    if (tid == i32(0)) & (sp == fx.Boolean(False)) & (e < i32(E)):
+                        lds_st(
+                            L,
+                            i32(LEQ) + e * i32(4),
+                            (m_ & i32(7)) | ((m_ >> i32(3)) << i32(8)),
+                        )
+                    for x in range_constexpr(8):
+                        ky[x] = ky[x] + (ky[x] == m_).select(nu8, i32(0))
+            if tid == i32(0):
+                for x in range_constexpr(8):
+                    lds_st(L, i32(LP + 4 * x), ky[x] >> i32(3))
 
         @flyc.jit
         def s2_greedy(k):
@@ -1339,49 +1475,53 @@ def compile_bigm_kernel(
             # unique per queue, so the least-loaded (lowest on ties) queue is the one whose key is
             # the minimum; each expert's (queue, first slot) is kept by lane e % 64
             # (a spread expert's entry: bit 31 | its first g)
-            if tid < i32(64):
-                nuv = [
-                    (
-                        lds_ld_i32(L, i32(LH) + (tid + i32(64 * j)) * i32(4))
-                        + i32(RG - 1)
-                    )
-                    // i32(RG)
-                    for j in range(EPL)
-                ]
-                g_ = uni(ns)
-                qb = [i32(0)] * EPL
-                for e_ in range_constexpr(E):
-                    nu = i32(rocdl.readlane(T.i32, nuv[e_ // 64], i32(e_ % 64)))
-                    sp = nu > i32(UQ)
-                    qb[e_ // 64] = ((tid == i32(e_ % 64)) & sp).select(
-                        g_ | i32(-(1 << 31)), qb[e_ // 64]
-                    )
-                    g_ = g_ + sp.select(nu, i32(0))
-                ky = [
-                    ((g_ - i32(x) + i32(7)) // i32(8)) * i32(8) + i32(x)
-                    for x in range(8)
-                ]
-                for e_ in range_constexpr(E):
-                    nu = i32(rocdl.readlane(T.i32, nuv[e_ // 64], i32(e_ % 64)))
-                    sp = nu > i32(UQ)
-                    nu8 = sp.select(i32(0), nu * i32(8))
-                    m_ = fx.min(
-                        fx.min(fx.min(ky[0], ky[1]), fx.min(ky[2], ky[3])),
-                        fx.min(fx.min(ky[4], ky[5]), fx.min(ky[6], ky[7])),
-                    )
-                    qb[e_ // 64] = (tid == i32(e_ % 64)).select(
-                        sp.select(
-                            qb[e_ // 64], (m_ & i32(7)) | ((m_ >> i32(3)) << i32(8))
-                        ),
-                        qb[e_ // 64],
-                    )
-                    for x in range_constexpr(8):
-                        ky[x] = ky[x] + (ky[x] == m_).select(nu8, i32(0))
-                for j in range_constexpr(EPL):
-                    lds_st(L, i32(LEQ) + (tid + i32(64 * j)) * i32(4), qb[j])
-                if tid == i32(0):
-                    for x in range_constexpr(8):
-                        lds_st(L, i32(LP + 4 * x), ky[x] >> i32(3))
+            if const_expr(DYNE):
+                if tid < i32(64):
+                    s2_greedy_dyn(tid)
+            else:
+                if tid < i32(64):
+                    nuv = [
+                        (
+                            lds_ld_i32(L, i32(LH) + (tid + i32(64 * j)) * i32(4))
+                            + i32(RG - 1)
+                        )
+                        // i32(RG)
+                        for j in range(EPL)
+                    ]
+                    g_ = uni(ns)
+                    qb = [i32(0)] * EPL
+                    for e_ in range_constexpr(E):
+                        nu = i32(rocdl.readlane(T.i32, nuv[e_ // 64], i32(e_ % 64)))
+                        sp = nu > i32(UQ)
+                        qb[e_ // 64] = ((tid == i32(e_ % 64)) & sp).select(
+                            g_ | i32(-(1 << 31)), qb[e_ // 64]
+                        )
+                        g_ = g_ + sp.select(nu, i32(0))
+                    ky = [
+                        ((g_ - i32(x) + i32(7)) // i32(8)) * i32(8) + i32(x)
+                        for x in range(8)
+                    ]
+                    for e_ in range_constexpr(E):
+                        nu = i32(rocdl.readlane(T.i32, nuv[e_ // 64], i32(e_ % 64)))
+                        sp = nu > i32(UQ)
+                        nu8 = sp.select(i32(0), nu * i32(8))
+                        m_ = fx.min(
+                            fx.min(fx.min(ky[0], ky[1]), fx.min(ky[2], ky[3])),
+                            fx.min(fx.min(ky[4], ky[5]), fx.min(ky[6], ky[7])),
+                        )
+                        qb[e_ // 64] = (tid == i32(e_ % 64)).select(
+                            sp.select(
+                                qb[e_ // 64], (m_ & i32(7)) | ((m_ >> i32(3)) << i32(8))
+                            ),
+                            qb[e_ // 64],
+                        )
+                        for x in range_constexpr(8):
+                            ky[x] = ky[x] + (ky[x] == m_).select(nu8, i32(0))
+                    for j in range_constexpr(EPL):
+                        lds_st(L, i32(LEQ) + (tid + i32(64 * j)) * i32(4), qb[j])
+                    if tid == i32(0):
+                        for x in range_constexpr(8):
+                            lds_st(L, i32(LP + 4 * x), ky[x] >> i32(3))
             gpu.barrier()
             for b_ in range_constexpr(
                 ceildiv(E, NT)
@@ -1451,8 +1591,8 @@ def compile_bigm_kernel(
             gpu.barrier()
             for b_ in range_constexpr(NEB):
                 e = tid + i32(b_ * NT)
-                if e < i32(NE):
-                    c = lds_ld_i32(L, i32(LH) + e * i32(4))
+                c = lds_ld_i32(L, i32(LH) + fx.min(e, i32(NE - 1)) * i32(4))
+                if (e < i32(NE)) & (c > i32(0)):  # (experts with routes in this item)
                     base = fx.Int32(
                         atomic_add_agent(ca(i32(CC_FILL) + k * i32(XST) + e), c)
                     )
@@ -1860,7 +2000,11 @@ def compile_bigm_kernel(
                             rv, B + i32(src_) * s + i, col(tid, kk)
                         ),
                     )
-                    if const_expr(tailq == 3):
+                    if const_expr(tailq == 3 and YG8):
+                        i8_row_store(
+                            f, ryg, rank * m + o + i, col(tid, kk), tid % i32(64)
+                        )
+                    elif const_expr(tailq == 3):
                         bst(
                             pack_bf16x8(f),
                             ryg,
@@ -1882,13 +2026,39 @@ def compile_bigm_kernel(
                                 put(
                                     i32(p_),
                                     "q",
-                                    g0 * i32(H * 2),
+                                    g0 * i32(YRB),
                                     "q",
-                                    g0 * i32(H * 2),
-                                    sb * i32(H * 2),
+                                    g0 * i32(YRB),
+                                    sb * i32(YRB),
                                     QQ,
                                 )
                         give_turn(QQ, tn)
+
+        @flyc.jit
+        def item_yd(k, j):
+            """(YG8) ZQ gathered y rows of chunk k (rank p's, its sub-block b): once in (p this
+            rank: its RF items done; else p's puts of the sub-block landed), int8 -> bf16 yout
+            """
+            tid = own_tid()
+            o, s = chunk(k)
+            sb = s // i32(NSB)
+            r0 = il(j, cnt(P_YD, s)) * i32(ZQ)
+            p = r0 // s
+            i0 = r0 - p * s
+            b = i0 // sb
+            if p == rank:
+                wait_at(sbc(k, 1, b), sb // i32(ZQ))
+            else:
+                wait_puts_n(QQ, k * i32(NSB) + b + i32(1))
+            rq = rsrc(wp("q"))
+            for ii in range_constexpr(ZQ):
+                g = p * m + o + i0 + i32(ii)
+                for kk in range_constexpr(PIT):
+                    c = col(tid, kk)
+                    v = i8_rows_val(i8_rows_ld(rq, g, c))
+                    bst(
+                        pack_bf16x8(v), r_yout, (g * i32(H) + c * i32(8)) * i32(2), 0, 0
+                    )
 
         @flyc.jit
         def item_gw():
@@ -1949,6 +2119,8 @@ def compile_bigm_kernel(
                 item_rq(k_r, jj)
             elif kind_r == i32(P_RF):
                 rf_item(k_r, jj)
+            elif kind_r == i32(P_YD):
+                item_yd(k_r, jj)
             if t == gw_lo:
                 item_gw()
             gpu.barrier()

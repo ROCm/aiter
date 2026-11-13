@@ -382,6 +382,8 @@ QUEUES = (QE, QX, QQ, QXS, QS, QID)
 # phase kinds (per chunk), in item order within a chunk (their done-counter slots; 0 and 2
 # unused)
 P_RB, P_S1, P_S2, P_S3, P_U, P_RQ, P_RF, P_UB = 1, 3, 4, 5, 6, 7, 8, 9
+# (ar, YG8) the y gather's int8 rows of every rank -> the bf16 output
+P_YD = 10
 NKIND = 16  # done-counter slots per chunk
 ZQ = 4  # rows per RQ / RF item
 SRT = 32  # tokens per sort item
@@ -400,8 +402,9 @@ C_FILL = 8192  # [chunk][NE] routes listed so far
 C_UN = 10240  # [chunk][8] units of each XCD (32 apart)
 C_SB = 13312  # [chunk][RQ, RF][sub-block] done items, 8 apart
 C_SBH = 18432  # [chunk][-, RB][head sub-block] done items, 8 apart
-C_XW = 28928  # NE > 256: C_ECNT / C_OFF / C_FILL here instead, [chunk][NE] 512 apart
-BIGM_CTRL_INTS = C_XW + 3 * 8 * 512
+# NE > 256: C_ECNT / C_OFF / C_FILL here instead, [chunk][NE] 512 apart (NE > 512: 1024 apart)
+C_XW = 28928
+BIGM_CTRL_INTS = C_XW + 3 * 8 * 1024
 C_ERR = BIGM_CTRL_INTS  # sticky watchdog word after the per-launch ctrl block (not zeroed per launch)
 
 CMAX = 7  # chunks per launch (ctrl layout)

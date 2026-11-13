@@ -163,10 +163,11 @@ class MegaMoeTP:
         # the shapes the big-M kernel takes: H % 256, < 512 routed experts (+ the last one,
         # counted apart), topk - 1 <= 64, inter % 128 (else the small engine)
         big_ok = (
-            cfg.activation in (ActivationType.Swiglu, ActivationType.Silu)
+            cfg.activation
+            in (ActivationType.Swiglu, ActivationType.Silu, ActivationType.Situv2)
             and cfg.act_dtype == "fp4"
             and cfg.model_dim % 256 == 0
-            and 0 < cfg.experts - 1 < 512
+            and 0 < cfg.experts - 1 < 1024
             and cfg.topk - 1 <= 64
             and cfg.inter_dim % 128 == 0
         )
@@ -190,8 +191,9 @@ class MegaMoeTP:
         small_max = cfg.max_local_tokens
         if self.bigm_m and cfg.max_local_tokens >= self.bigm_m:
             small_max = self.bigm_m - 1
-        # default threshold: the small engine holds what it can, big-M takes the rest
-        fit = (big_ok and bmin is None) or cfg.fit_max_local
+        # the small engine holds what it can, big-M takes the rest (an explicit
+        # bigm_min_tokens above the small engine's capacity: lowered to it, below)
+        fit = (big_ok and bmin != 0) or cfg.fit_max_local
         self.engine = MegaMoeTPEngine(
             rank=cfg.rank,
             world_size=cfg.world_size,
@@ -211,7 +213,8 @@ class MegaMoeTP:
             ),
             swiglu_limit=cfg.swiglu_limit,
             comm_mode=cfg.comm_mode,
-            comm_dtype=cfg.comm_dtype,
+            # ("int8": the big-M kernel's; the small engine runs its accurate bf16 path)
+            comm_dtype="bf16" if cfg.comm_dtype == "int8" else cfg.comm_dtype,
             ar_gather=cfg.ar_gather,
             schedule=cfg.schedule,
             act_dtype=cfg.act_dtype,
@@ -229,8 +232,9 @@ class MegaMoeTP:
             device=device,
             fit_max_local=fit,
         )
-        if big_ok and bmin is None and self.engine.mmax < cfg.max_local_tokens:
-            self.bigm_m = self.engine.mmax + 1
+        if big_ok and bmin != 0 and self.engine.mmax < small_max:
+            lim = self.engine.mmax + 1
+            self.bigm_m = min(self.bigm_m, lim) if self.bigm_m else lim
 
     def forward(
         self,
@@ -349,8 +353,28 @@ class MegaMoeTP:
                 device=a["device"],
                 act=cfg.activation.name.lower(),
                 ygather=cfg.comm_mode == "ar",
-                # comm_dtype "bf16" (the accurate mode): bf16 route rows (MXFP8 otherwise)
-                opts={"AITER_BIGM_R8": "0"} if cfg.comm_dtype == "bf16" else None,
+                situ=(
+                    cfg.beta if cfg.beta is not None else 1.0,
+                    cfg.linear_beta if cfg.linear_beta is not None else 1.0,
+                ),
+                # comm_dtype "bf16" (the accurate mode): bf16 route rows (MXFP8 otherwise) and a
+                # bf16 reduce-scatter (int8 / int4 otherwise)
+                opts=(
+                    {"AITER_BIGM_R8": "0", "AITER_BIGM_EB": "1", "AITER_BIGM_E4": "0"}
+                    if cfg.comm_dtype == "bf16"
+                    # "int8": bf16 route rows, the reduce-scatter (and the ar y gather) as int8
+                    # rows + an f32 scale per 32 (deterministic)
+                    else (
+                        {
+                            "AITER_BIGM_R8": "0",
+                            "AITER_BIGM_EB": "0",
+                            "AITER_BIGM_E4": "0",
+                            "AITER_BIGM_YG8": "1",
+                        }
+                        if cfg.comm_dtype == "int8"
+                        else None
+                    )
+                ),
             )
         return self._bigm
 

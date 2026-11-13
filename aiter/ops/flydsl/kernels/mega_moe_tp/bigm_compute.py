@@ -129,13 +129,15 @@ class MegaMoeTPBigM:
         opts=None,
         act="swiglu",
         ygather=False,
+        situ=(1.0, 1.0),
     ):
         self.H, self.I, self.E, self.K = hidden, inter, experts, topk
         self.K1, self.NE = topk + 1, experts + 1
         self.tp = dist.get_world_size(group)
         self.rank = dist.get_rank(group)
         self.Tmax = max_tokens
-        self.act = act  # the units' activation ("swiglu", "silu")
+        self.act = act  # the units' activation ("swiglu", "silu", "situv2")
+        self.situ = (float(situ[0]), float(situ[1]))  # (situv2) beta, linear beta
         self.ygather = bool(ygather)  # moe(gather=True): the "q" region holds bf16 rows
         self._plans = {}
         self.cfg = (float(eps), bool(gemma), float(swiglu_limit))
@@ -147,7 +149,8 @@ class MegaMoeTPBigM:
             w2_scale.view(torch.uint8),
         )
         H, T, K1, tp = hidden, max_tokens, self.K1, self.tp
-        RB = i8_row_bytes(H)
+        # the E (reduce-scatter) rows: int8 + scales, or bf16 (AITER_BIGM_EB, comm_dtype bf16)
+        RB = 2 * H if dict(self.opts).get("AITER_BIGM_EB") == "1" else i8_row_bytes(H)
         # the kernel's 32-bit offsets into these regions (the route rows: per chunk, _chunks)
         for what, n in (("E rows", T * RB), ("y gather rows", T * H * 2)):
             if n >= 1 << 31:
@@ -164,6 +167,13 @@ class MegaMoeTPBigM:
             "q": T * H * (2 if self.ygather else 1),
             "qs": T * 4,
         }
+        # (ar, YG8: the y gather as int8 rows) every rank's dequantized rows land here
+        self.yg8 = self.ygather and dict(self.opts).get("AITER_BIGM_YG8") == "1"
+        self.ygout = (
+            torch.empty((T, H), dtype=torch.bfloat16, device=device)
+            if self.yg8
+            else None
+        )
         sd = self.sd = SdmaComm(group=group, num_queues=NQ, device=device)
         for r_ in self.REGIONS:
             sd.reserve(r_, sizes[r_])
@@ -215,13 +225,15 @@ class MegaMoeTPBigM:
         self.nab = self._nab()
 
     def _nab(self):
-        """the deepest A ring (dividing the GEMM1 chunk count) whose LDS (+ the kernel's
-        row-phase scratch, < 4 KiB) fits a CU"""
+        """the A ring depth (dividing the GEMM1 chunk count) whose LDS (+ the kernel's
+        persistent scratch, < 2 KiB; the plan scratch may reuse the unit's) fits a CU: 4,
+        else the deepest (below 4 nothing is in flight at the chunk wait: H 3584 -> 7)
+        """
         kch = self.H // 256
-        for n in (4, 3, 2):
+        for n in (4, 7, 6, 5, 3, 2):
             if (
                 kch % n == 0
-                and bigm_lds(UNIT_ROWS, n, self.I)["BYTES"] + 4096 <= LDS_LIMIT
+                and bigm_lds(UNIT_ROWS, n, self.I)["BYTES"] + 2048 <= LDS_LIMIT
             ):
                 return n
         raise ValueError(
@@ -360,7 +372,15 @@ class MegaMoeTPBigM:
                 "tp": self.tp,
             }
             path = AITER_CONFIGS.AITER_CONFIG_MEGA_MOE_TP_BIGM_FILE
-            tu = nearest(tuned_rows(path, key, "tokens"), T, clamp=True)
+            # rows of this comm mode (column "mode": ar / ag_rs), else the mode-less ones
+            mode = "ar" if self.ygather else "ag_rs"
+            tu = nearest(
+                tuned_rows(path, {**key, "mode": mode}, "tokens"), T, clamp=True
+            )
+            if tu is None:
+                tu = nearest(
+                    tuned_rows(path, {**key, "mode": ""}, "tokens"), T, clamp=True
+                )
             if tu is not None:
                 w = [int(x) for x in tu["chunks"].split(",")]
                 opts = (kv.split("=", 1) for kv in tu.get("opts", "").split(";") if kv)
@@ -392,8 +412,12 @@ class MegaMoeTPBigM:
         sizes = tuple(self._split(m))
         c = self.chunks_t.get(T)
         if c is None:
-            # the kernel's 32-bit offsets of a chunk's route rows (rows * H bf16)
-            if self.tp * max(sizes) * self.K1 * self.H * 2 >= 1 << 31:
+            # the kernel's 32-bit (unsigned buffer) offsets of a chunk's route rows (rows * H
+            # bf16; R8: the scales' offset is halved signed: 2 GiB)
+            lim = 1 << (
+                31 if dict(self._plan(T)[1]).get("AITER_BIGM_R8") == "1" else 32
+            )
+            if self.tp * max(sizes) * self.K1 * self.H * 2 >= lim:
                 raise ValueError(
                     f"MegaMoeTP big-M: chunks {sizes} of {T} tokens: a chunk's route rows "
                     "exceed 32-bit offsets (more chunks: the tuned csv)"
@@ -556,6 +580,8 @@ class MegaMoeTPBigM:
             opts=opts,
             tailq=tailq,
             act=self.act,
+            situ_beta=self.situ[0],
+            situ_linear_beta=self.situ[1],
         )
 
     def io_rows_per_kernel(self, lo, hi):
@@ -590,6 +616,8 @@ class MegaMoeTPBigM:
         T = m * self.tp
         w1, w1s, w2, w2s = self.w
         y = self.normed[:m] if out is None else out
+        if gather and self.yg8:
+            y = self.ygout[:T]
         if tail is not None:
             res_in, res_out, norm_w = tail
         else:
@@ -632,6 +660,8 @@ class MegaMoeTPBigM:
         )
         self._cpar ^= 1  # (the next launch reads what this one's GW wrote)
         if gather:
+            if self.yg8:
+                return y
             return self.sd.view("q", (T, self.H), torch.bfloat16)
         if tail is None:
             return y

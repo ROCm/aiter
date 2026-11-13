@@ -783,7 +783,9 @@ def bigm_lds(RG, NAB, I):
     return c
 
 
-def build_bigm_unit(H, I, TOPK, RG, NAB, BST, BS2, act, swiglu_limit, R8):
+def build_bigm_unit(
+    H, I, TOPK, RG, NAB, BST, BS2, act, swiglu_limit, R8, situ=(1.0, 1.0)
+):
     """The fused unit device function: unit_body(L, tid, e, r0, rows, rr, rwt, rx, rxs, w1,
     w2, rws1, rws2, r_routes, oob): rows rr / rwt[r0 : r0 + rows] (route index, weight) of expert
     e -> route rows wt * GEMM2(act(GEMM1(A[route // TOPK]))) stored at route * H (bf16).
@@ -839,7 +841,14 @@ def build_bigm_unit(H, I, TOPK, RG, NAB, BST, BS2, act, swiglu_limit, R8):
     WAIT2 = [_wait2(kk) for kk in range(KS2)]
 
     def act_batch(gs, us):
-        return _activation_mul_batch(gs, us, act=act, swiglu_limit=swiglu_limit)
+        return _activation_mul_batch(
+            gs,
+            us,
+            act=act,
+            swiglu_limit=swiglu_limit,
+            situ_beta=situ[0],
+            situ_linear_beta=situ[1],
+        )
 
     @flyc.jit
     def part_fill(L, tid, r0, rows, rr, rwt):
