@@ -371,6 +371,9 @@ def refusals():
         ("cpu k_scale", {"k_scale": ks.cpu()}, "k_scale and v_scale"),
         ("fp16 k_scale", {"k_scale": ks.half()}, "k_scale and v_scale"),
         ("empty k_scale", {"k_scale": ks[:0]}, "k_scale and v_scale"),
+        ("short block_table", {"bt": c["bt"][:1]}, "row per request"),
+        ("2-D seq_lens", {"seq_lens": c["seq_lens"][None]}, "seq_lens 1-D"),
+        ("xcds 1", {"xcds": 1}, "xcds must be"),
         ("sm_scale 0", {"sm_scale": 0.0}, "sm_scale"),
         ("sm_scale nan", {"sm_scale": float("nan")}, "sm_scale"),
         ("cpu q", {"q": c["q"].cpu()}, "CUDA"),
@@ -383,12 +386,14 @@ def refusals():
     for name, kw, msg in cases:
         a = {
             "q": c["q"], "cache": cache, "sm_scale": SM_SCALE, "k_scale": ks,
-            "v_scale": c["v_scale"], "splits": None, **kw,
+            "v_scale": c["v_scale"], "splits": None, "bt": c["bt"],
+            "seq_lens": c["seq_lens"], "xcds": None, **kw,
         }  # fmt: skip
         try:
             minimax_m3_sparse_pa_nvfp4_decode(
-                a["q"], a["cache"], c["topk"], c["bt"], c["seq_lens"], a["sm_scale"],
+                a["q"], a["cache"], c["topk"], a["bt"], a["seq_lens"], a["sm_scale"],
                 None, a["k_scale"], a["v_scale"], query_len=1, splits=a["splits"],
+                xcds=a["xcds"],
             )  # fmt: skip
         except (AssertionError, ValueError) as e:
             if msg in str(e):
@@ -534,7 +539,7 @@ def main(argv=None):
         ]
         df = pd.DataFrame(perf)
         aiter.logger.info("decode perf:\n%s", df.to_markdown(index=False))
-        failed += int((df["err"] > REL_L2_TOL).sum())
+        failed += int((~(df["err"] <= REL_L2_TOL)).sum())  # a NaN err fails too
     print("FAILED" if failed else "PASSED", failed)
     return 1 if failed else 0
 
