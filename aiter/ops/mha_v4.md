@@ -184,8 +184,14 @@ including under GQA. Dense uses manifest `mode=0`; sorted sparse uses `mode=1` a
 launcher/code object. A row declaring `ragged_kv` accepts a key length that is not a multiple of
 its KV tile; the others refuse it.
 
+Each LUT row lists distinct KV blocks in ascending order, as `block_attn_mask_to_ragged_lut`
+builds it. The kernels stage a row in a region sized for the key length's blocks, so a row that
+repeats a block can overrun it, and they finish at the partial last block, so a block listed after
+it is never visited.
+
 An empty sparse row is valid and writes a zero output tile. Set `AITER_MHA_V4_VALIDATE_LUT=1` for
-device-side start/count/index validation; it synchronizes and is disabled by default.
+device-side validation of each row's start, count and indices, including that they ascend; it
+synchronizes and is disabled by default.
 
 Dense and sparse code objects may use different reduction schedules. Compare their outputs with a
 strict numerical tolerance or cosine threshold, not bit equality. Comparisons between two launches

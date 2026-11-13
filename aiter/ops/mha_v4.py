@@ -1653,6 +1653,9 @@ def mha_v4_packed(
     nonstandard K layouts are validated before launch; output is BF16 BSHD.
     Pass the ragged LUT triple to select the sorted-sparse row; omit all three
     tensors for dense. The work table is built inside the sparse custom op.
+    Each LUT row lists distinct KV blocks in ascending order, as
+    block_attn_mask_to_ragged_lut() builds it: the kernels stage a row in a region
+    sized for the key length's blocks, and stop at the partial last block.
     With ``return_lse`` the call returns ``(out, lse)``, where ``lse`` is FP32
     ``[batch, heads, Sq]`` holding ``ln(sum exp(s - max)) + max`` over the scores the
     kernel actually computed, i.e. the QUANTIZED scores. Its error tracks the row max at

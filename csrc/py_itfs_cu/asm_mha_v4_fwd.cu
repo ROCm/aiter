@@ -882,6 +882,8 @@ enum LutError : int32_t
     kLutNegative   = 1 << 0,
     kLutOverrun    = 1 << 1,
     kLutIndexRange = 1 << 2,
+    kLutCountRange = 1 << 3,
+    kLutUnordered  = 1 << 4,
 };
 
 __global__ void validate_lut_kernel(const int32_t* __restrict__ lut_start,
@@ -910,6 +912,16 @@ __global__ void validate_lut_kernel(const int32_t* __restrict__ lut_start,
         atomicOr(error, kLutOverrun);
         return;
     }
+    // check_lut_capacity bounds kv_tiles by the row's LUT region, so this is what keeps a row that
+    // repeats indices from overrunning the region it is staged in.
+    if(count > kv_tiles)
+    {
+        atomicOr(error, kLutCountRange);
+        return;
+    }
+    // The kernels finish the first block at or past the partial last one as the masked tail and
+    // stop, so a row must also be ascending: a block listed after it is never visited.
+    int32_t previous = -1;
     for(int32_t i = 0; i < count; ++i)
     {
         const int32_t block = kv_block_indices[start + i];
@@ -918,6 +930,12 @@ __global__ void validate_lut_kernel(const int32_t* __restrict__ lut_start,
             atomicOr(error, kLutIndexRange);
             return;
         }
+        if(block <= previous)
+        {
+            atomicOr(error, kLutUnordered);
+            return;
+        }
+        previous = block;
     }
 }
 
@@ -958,6 +976,14 @@ void validate_lut_contents(const at::Tensor& kv_block_indices,
                 "MHA v4 sparse LUT has a KV block index outside [0, ",
                 kv_tiles,
                 ")");
+    TORCH_CHECK(!(flags & kLutCountRange),
+                "MHA v4 sparse LUT has a lut_count above the key length's ",
+                kv_tiles,
+                " KV blocks");
+    TORCH_CHECK(!(flags & kLutUnordered),
+                "MHA v4 sparse LUT has a row whose KV block indices are not strictly ascending; "
+                "each row lists distinct blocks in order, as block_attn_mask_to_ragged_lut builds "
+                "it");
 }
 
 void populate_dense_kernarg(FmhaV4Kernarg& args,

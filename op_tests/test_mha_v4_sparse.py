@@ -1441,11 +1441,30 @@ def test_mha_v4_sparse_bf16_rejects_lut_beyond_lds_capacity():
             "negative",
             id="negative_start",
         ),
+        param(
+            "indices = torch.zeros(kv_tiles + 1, device='cuda', dtype=torch.int32); "
+            "start.zero_(); count.fill_(kv_tiles + 1)",
+            "above the key length",
+            id="count_above_kv_tiles",
+        ),
+        param(
+            "indices = torch.zeros(2, device='cuda', dtype=torch.int32); "
+            "start.zero_(); count.fill_(2)",
+            "strictly ascending",
+            id="duplicate_index",
+        ),
+        param(
+            "indices = torch.tensor([1, 0], device='cuda', dtype=torch.int32); "
+            "start.zero_(); count.fill_(2)",
+            "strictly ascending",
+            id="descending_indices",
+        ),
     ],
 )
 def test_mha_v4_sparse_validation_rejects_malformed_lut(mutation, message):
     """Enable opt-in validation before AITER loads, without slowing the parent test process."""
     probe = f"""
+import torch
 from op_tests.test_mha_v4_sparse import (
     AttentionFormat,
     AttentionScaleMode,
