@@ -197,25 +197,25 @@ step scans -- input + output/2 -- after CSA's 4x KV compression:
     32K in / 16K out -> (32768 + 8192) / 4 = 10240
 
 The DSv4 ``mla_v4_decode`` entry runs both serving paths without requiring a
-separate EP/TP selector. The EP result uses ``test_pa_sparse_prefill.py`` at
+separate EP/TP selector. The EP result uses ``test_mla_sparse_prefill.py`` at
 H=128 and N=512 for the CSA/HCA KV pools. The TP result keeps the
 ``test_mla_v4_kargpreld.py`` asm-vs-Triton decode sweep. TP currently retains
 the shipped H=128 kernel coverage; the model-local H=32 path is not enabled by
 the kargpreld test/dispatcher yet.
 
-The DSv4 ``mla_v4_prefill`` op runs twelve performance cases at H=128 and
-D=512: compressed prefix-pool rows 4096/16384, crossed with topk 0/1024/2048,
-crossed with fp8/bf16. The current chunk remains uncompressed:
+The DSv4 ``mla_v4_prefill`` op runs eighteen performance cases at H=128 and
+D=512: compressed prefix-pool rows 4096/16384, crossed with topk 0/512/1024,
+crossed with v4_fp8/v41_fp8/bf16. The current chunk remains uncompressed:
 
-    python3 op_tests/test_pa_sparse_prefill.py \
+    python3 op_tests/test_mla_sparse_prefill.py \
       -n <token sweep> --h_q 128 -d 512 \
-      --total_pages 4096 16384 --total_tokens <token sweep> \
-      --prec fp8 bf16 --topk 0 1024 2048 --no-verify
+      --total_pages 4096 16384 --window 128 \
+      --prec v4_fp8 v41_fp8 bf16 --topk 0 512 1024 --no-verify
 
-The UT compares the backends it has for each precision -- opus and asm on fp8,
-opus and triton on bf16 -- so one run covers both precisions and all three
-backends. --topk is the rows each token draws from each range; 0 takes the
-whole pool, which is what the removed --mode dense did.
+The UT compares the backends it has for each precision -- opus and asm on
+v4_fp8, opus on v41_fp8, opus and triton on bf16 -- so one run covers all
+precisions and all three backends. --topk is the prefix rows each token draws;
+0 takes the whole pool.
 
 The ``inverse_rope`` op runs the TP1 and TP4 attention-output shapes (-b is
 (n_local_heads, n_local_groups); 128,16 and 32,4 are V4-Pro at TP1 and TP4):
@@ -806,30 +806,15 @@ _MLA_V4_DSV4_SHAPES = [
 ]
 # EP uses the sparse-prefill test path at the model's unsharded H=128. These
 # are the CSA/HCA KV pools from the decode workload; the group label remains in
-# the result even where a KV length overlaps the TP kargpreld sweep.
+# the result even where a KV length overlaps the TP kargpreld sweep. The last
+# field is the pool's --topk.
 _MLA_V4_EP_HEADS = 128
 _MLA_V4_EP_BATCH = 512
 _MLA_V4_EP_KV_GROUPS = (
-    ("CSA", (384, 448, 512, 583, 640, 1024)),
-    ("HCA", (136, 138, 140, 142, 144)),
+    ("CSA", (384, 448, 512, 583, 640, 1024), (512, 1024)),
+    ("HCA", (136, 138, 140, 142, 144), (0,)),
 )
-
-_MLA_V4_EP_KEEP = [
-    "scenario",
-    "kv_group",
-    "prec",
-    "mode",
-    "h",
-    "n",
-    "kv_seq_lens",
-    "total_tokens",
-    "opus us",
-    "opus TFLOPS",
-    "asm us",
-    "asm TFLOPS",
-    "opus/asm",
-    "kernel",
-]
+_MLA_V4_SWA_WINDOW = 128
 
 _MLA_V4_COMPARE_KEEP = [
     "scenario",
@@ -2063,18 +2048,15 @@ raise SystemExit(1 if combo._FAILURES else 0)
 """
 
 
-def _mla_v4_ep_tables(lines):
+def _mla_v4_ep_tables(lines, name, group):
     """Label the sparse-prefill child rows as the MLA decode EP result."""
-    page_groups = {
-        page: group for group, pages in _MLA_V4_EP_KV_GROUPS for page in pages
-    }
     tables = []
     for table, profiles in _profiled_json_tables(lines):
         # Match profiler blocks while the table still has the child test's
         # original name.  The generic structured-child path cannot associate
         # them after this extractor relabels the table as MLA decode [EP].
         _attach_kernel_profiles(table, profiles)
-        table["name"] = "mla_v4 decode [EP] (fp8 sparse prefill, opus vs asm)"
+        table["name"] = name
         rows = []
         for row in table["rows"]:
             mapped = {}
@@ -2085,13 +2067,7 @@ def _mla_v4_ep_tables(lines):
                     mapped["kv_seq_lens"] = value
                 else:
                     mapped[key] = value
-            rows.append(
-                {
-                    "scenario": "EP",
-                    "kv_group": page_groups.get(row.get("total_pages")),
-                    **mapped,
-                }
-            )
+            rows.append({"scenario": "EP", "kv_group": group, **mapped})
         table["rows"] = rows
         tables.append(json.dumps(table))
     return tables
@@ -2101,38 +2077,44 @@ def run_mla_v4_decode(args):
     """Run the existing EP and TP tests serially in separate child processes."""
     _unused_scale_init(args, "mla_v4_decode")
     repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-    ep_pages = [ctx for _, contexts in _MLA_V4_EP_KV_GROUPS for ctx in contexts]
-    _run_child(
-        "mla_v4 decode [EP] (fp8 sparse prefill, opus vs asm)",
-        [
-            sys.executable,
-            "op_tests/test_pa_sparse_prefill.py",
-            "-n",
-            str(_MLA_V4_EP_BATCH),
-            "--h_q",
-            str(_MLA_V4_EP_HEADS),
-            "-d",
-            "512",
-            "--total_pages",
-            *map(str, ep_pages),
-            "--total_tokens",
-            str(_MLA_V4_EP_BATCH),
-            "--prec",
-            "fp8",
-            "--backend",
-            "opus",
-            "asm",
-            "--no-verify",
-            "--seed",
-            str(args.seed),
-            "--data-init",
-            *(args.data_init or ["norm"]),
-        ],
-        cwd=repo_root,
-        extract=_mla_v4_ep_tables,
-        kernels=False,
-        structured=True,
-    )
+    for group, kv_seq_lens, topks in _MLA_V4_EP_KV_GROUPS:
+        name = f"mla_v4 decode [EP] {group} (fp8 sparse prefill, opus vs asm)"
+        _run_child(
+            name,
+            [
+                sys.executable,
+                "op_tests/test_mla_sparse_prefill.py",
+                "-n",
+                str(_MLA_V4_EP_BATCH),
+                "--h_q",
+                str(_MLA_V4_EP_HEADS),
+                "-d",
+                "512",
+                "--total_pages",
+                *map(str, kv_seq_lens),
+                "--topk",
+                *map(str, topks),
+                "--window",
+                str(_MLA_V4_SWA_WINDOW),
+                "--prec",
+                "v4_fp8",
+                "v41_fp8",
+                "--backend",
+                "opus",
+                "asm",
+                "--no-verify",
+                "--seed",
+                str(args.seed),
+                "--data-init",
+                *(args.data_init or ["norm"]),
+            ],
+            cwd=repo_root,
+            extract=lambda lines, name=name, group=group: _mla_v4_ep_tables(
+                lines, name, group
+            ),
+            kernels=False,
+            structured=True,
+        )
 
     tp_args = json.dumps(
         {
@@ -2154,87 +2136,10 @@ def run_mla_v4_decode(args):
     )
 
 
-def _run_mla_v4_decode_ep(args):
-    """Run the EP sparse-attention path over the CSA/HCA KV pools."""
-    try:
-        with _silence():
-            import test_pa_sparse_prefill as mla_v4_ep_mod
-    except Exception as exc:  # noqa: BLE001 - TP should still run if EP import fails
-        reason = f"{type(exc).__name__}: {exc}"
-        _print_table(
-            "mla_v4 decode [EP] (fp8 sparse prefill, opus vs asm)",
-            [{"scenario": "EP", "err_msg": reason}],
-        )
-        _note_failure("mla_v4_decode [EP]", reason)
-        return
-
-    if args.data_init is not None:
-        print(
-            "[data init] mla_v4_decode [EP]: test_pa_sparse_prefill.py uses "
-            "its native initializer; --data-init still applies to the TP result",
-            flush=True,
-        )
-
-    rows = []
-    with _silence():
-        for group, kv_seq_lens in _MLA_V4_EP_KV_GROUPS:
-            for ctx in kv_seq_lens:
-                box = []
-                row = {
-                    "scenario": "EP",
-                    "kv_group": group,
-                    "kv_seq_lens": ctx,
-                }
-                try:
-                    with _smi_case(
-                        f"mla_v4_decode/scenario=EP/group={group}/"
-                        f"heads={_MLA_V4_EP_HEADS}/batch={_MLA_V4_EP_BATCH}/"
-                        f"ctx={ctx}/data=native/seed={args.seed}"
-                    ), _capture() as box:
-                        result = mla_v4_ep_mod.run_pa_sparse_prefill(
-                            n=_MLA_V4_EP_BATCH,
-                            h=_MLA_V4_EP_HEADS,
-                            d=512,
-                            total_pages=ctx,
-                            total_tokens=_MLA_V4_EP_BATCH,
-                            prec="fp8",
-                            mode="sparse",
-                            backends=("opus", "asm"),
-                            seed=args.seed,
-                            verify=False,
-                            bench=True,
-                        )
-                    if result is None:
-                        row["err_msg"] = "no supported EP backend"
-                    else:
-                        row.update(result)
-                        if (
-                            row.get("opus us") is not None
-                            and row.get("asm us") is not None
-                        ):
-                            row["opus/asm"] = _perf_ratio(row["opus us"], row["asm us"])
-                except (RuntimeError, AssertionError, ValueError) as exc:
-                    msg = str(exc).splitlines()[0] if str(exc) else type(exc).__name__
-                    row["err_msg"] = msg
-                if box:
-                    _attach_kernel_profiles(
-                        {"rows": [row]}, _profile_kernel_blocks(box[0].splitlines())
-                    )
-                rows.append(row)
-
-    _print_table(
-        "mla_v4 decode [EP] (fp8 sparse prefill, opus vs asm)",
-        rows,
-        keep=_MLA_V4_EP_KEEP,
-    )
-
-
 def _run_mla_v4_decode_tp(args):
     """Run the existing kargpreld asm/Triton MLA decode comparison."""
     try:
         # This test sets torch's process-wide default device to CUDA at import.
-        # Import it only after the EP sparse-prefill block has completed, since
-        # that test intentionally builds its random CSR indices with a CPU RNG.
         with _silence():
             import test_mla_v4_kargpreld as mla_v4_kargpreld_mod
     except Exception as exc:  # noqa: BLE001 - report a TP-local import failure
@@ -2378,7 +2283,7 @@ def run_inverse_rope(args):
 
 
 def run_mla_v4_prefill(args):
-    """Run DSv4 prefill across two precisions, pools and topk budgets."""
+    """Run DSv4 prefill across three precisions, pools and topk budgets."""
     _unused_scale_init(args, "mla_v4_prefill")
     data_inits = args.data_init or ["norm"]
 
@@ -2387,7 +2292,7 @@ def run_mla_v4_prefill(args):
             label,
             [
                 sys.executable,
-                "op_tests/test_pa_sparse_prefill.py",
+                "op_tests/test_mla_sparse_prefill.py",
                 "-n",
                 str(tokens),
                 "--h_q",
@@ -2396,15 +2301,15 @@ def run_mla_v4_prefill(args):
                 "512",
                 "--total_pages",
                 *map(str, pages),
-                "--total_tokens",
-                str(tokens),
                 "--prec",
                 *precs,
-                # bf16 takes the single-tensor Q/K/V/O kernel; only fp8 has an
-                # asm candidate, so the bf16 rows compare opus against triton
+                # bf16 takes the single-tensor Q/K/V/O kernel; only v4_fp8 has
+                # an asm candidate, so the bf16 rows compare opus against triton
                 # and leave the asm columns empty.
                 "--topk",
                 *topks,
+                "--window",
+                str(_MLA_V4_SWA_WINDOW),
                 "--backend",
                 *backends,
                 "--no-verify",
@@ -2422,13 +2327,14 @@ def run_mla_v4_prefill(args):
         run_case(
             tokens,
             (4096, 16384),
-            ("fp8", "bf16"),
-            # #5805 replaced --mode with --topk: 0 takes the whole pool (the
-            # old dense mode), 1024/2048 are the UT's sparse defaults.
-            ("0", "1024", "2048"),
+            ("v4_fp8", "v41_fp8", "bf16"),
+            # 0 takes the whole pool; 512/1024 are DSv4 index_topk on V4-Flash
+            # and V4-Pro.
+            ("0", "512", "1024"),
             ("opus", "asm", "triton"),
             data_inits,
-            f"mla_v4 prefill (M={tokens}, prec=fp8/bf16, pages=4096/16384)",
+            f"mla_v4 prefill (M={tokens}, prec=v4_fp8/v41_fp8/bf16, "
+            "pages=4096/16384)",
         )
 
 
