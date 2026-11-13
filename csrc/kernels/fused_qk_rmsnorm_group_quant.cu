@@ -27,7 +27,8 @@ template <typename DTYPE_I,
           bool GEMMA_NORM = false,
           bool NO_QUANT = false,
           bool PER_TOKEN_QUANT = false,
-          bool interleave = false>
+          bool interleave = false,
+          bool E8M0_SCALE = false>
 __global__ void fused_qk_rmsnorm_group_quant_kernel(
     DTYPE_O* __restrict__ q_out_quantized,
     void* __restrict__ q_out_scale,
@@ -95,6 +96,8 @@ __global__ void fused_qk_rmsnorm_group_quant_kernel(
         (1.0f / static_cast<float>(opus::finfo<DTYPE_O>::max()));
     static_assert(!PER_TOKEN_QUANT || !std::is_same_v<DTYPE_O, opus::fp4_t>,
                   "per-token quant only supports fp8 output");
+    static_assert(!E8M0_SCALE || (std::is_same_v<DTYPE_O, opus::fp8_t> && !PER_TOKEN_QUANT),
+                  "E8M0 scales are for fp8 group quant");
 
     int idx = blockIdx.x;
     if(idx >= m)
@@ -250,6 +253,15 @@ __global__ void fused_qk_rmsnorm_group_quant_kernel(
 
         if constexpr(!NO_QUANT)
         {
+            if constexpr(E8M0_SCALE)
+            {
+                // Quantize the DTYPE_I values the unquantized kernel would store, so the
+                // result matches it + per_group_quant_hip(scale_type=fp8_e8m0) byte for byte.
+                for(int i = 0; i < thread_data_size; ++i)
+                {
+                    thread_data_f[i] = opus::cast<float>(opus::cast<DTYPE_I>(thread_data_f[i]));
+                }
+            }
             float thread_max = row_active ? 1e-10f : 0.0f;
             if(row_active)
             {
@@ -289,15 +301,30 @@ __global__ void fused_qk_rmsnorm_group_quant_kernel(
             {
                 constexpr int reduce_thread_size = ReduceThreadSize;
                 float max = multithread_reduce_max_dpp<ReduceThreadSize>(thread_max);
-                quant_scale = std::is_same_v<DTYPE_O, opus::fp4_t>
-                    ? aiter::fp4_f32_to_e8m0_scale(max)
-                    : max * inverted_dtype_max;
+                if constexpr(E8M0_SCALE)
+                {
+                    // per_group_quant_hip's rule: amax capped as on gfx1250, RoundUp E8M0.
+                    constexpr aiter::MxDtype kMxDtype =
+#if defined(__gfx942__)
+                        aiter::MxDtype::FP8_E4M3_FNUZ;
+#else
+                        aiter::MxDtype::FP8_E4M3;
+#endif
+                    quant_scale = aiter::fp_f32_to_e8m0_scale<aiter::kDefaultMxScaleRoundMode, kMxDtype>(
+                        fminf(max, static_cast<float>(opus::finfo<DTYPE_O>::max()) * 0x1.0p119f));
+                }
+                else
+                {
+                    quant_scale = std::is_same_v<DTYPE_O, opus::fp4_t>
+                        ? aiter::fp4_f32_to_e8m0_scale(max)
+                        : max * inverted_dtype_max;
+                }
                 if((tid % reduce_thread_size == 0) && ((tid * thread_data_size) < n1))
                 {
                     int g = tid / reduce_thread_size;
                     int64_t scale_idx = static_cast<int64_t>(idx) * out1_scale_row_stride +
                                         static_cast<int64_t>(g) * out1_scale_col_stride;
-                    if constexpr(std::is_same_v<DTYPE_O, opus::fp4_t>)
+                    if constexpr(std::is_same_v<DTYPE_O, opus::fp4_t> || E8M0_SCALE)
                     {
                         auto* scale_exp = reinterpret_cast<uint8_t*>(out1_scale);
                         uint8_t exponent =
@@ -425,7 +452,7 @@ __global__ void fused_qk_rmsnorm_group_quant_kernel(
     }
 }
 
-#define FUSED_RMSNORM_QUANT_KERNEL_IMPL_(DTYPE_O, BlockSize, thread_data_size, ReduceThreadSize, ADD_RESIDUAL, OUTPUT_UNQUANT, GEMMA_NORM_V, NO_QUANT_V, PER_TOKEN_QUANT_V, interleave) \
+#define FUSED_RMSNORM_QUANT_KERNEL_IMPL_(DTYPE_O, BlockSize, thread_data_size, ReduceThreadSize, ADD_RESIDUAL, OUTPUT_UNQUANT, GEMMA_NORM_V, NO_QUANT_V, PER_TOKEN_QUANT_V, interleave, E8M0_V) \
     AITER_DISPATCH_FLOATING16_TYPES_rmTorch(inp1.dtype(), "fused_qk_rmsnorm_group_quant_kernel", [&] {                             \
         using DTYPE_I = typename aiter::hip2opus<scalar_t>::type;                                                                 \
         using DTYPE_OO = DTYPE_O;                                                                                                 \
@@ -441,7 +468,8 @@ __global__ void fused_qk_rmsnorm_group_quant_kernel(
                                          GEMMA_NORM_V,                                                                            \
                                          NO_QUANT_V,                                                                              \
                                          PER_TOKEN_QUANT_V,                                                                       \
-                                         interleave><<<grid, block, 0, stream>>>(                                                \
+                                         interleave,                                                                              \
+                                         E8M0_V><<<grid, block, 0, stream>>>(                                                    \
             reinterpret_cast<DTYPE_OO*>(out1_quantized.data_ptr()),                                                              \
             out1_scale.data_ptr(),                                                                                                \
             reinterpret_cast<DTYPE_I*>(out1_unquantized.data_ptr()),                                                             \
@@ -470,7 +498,7 @@ __global__ void fused_qk_rmsnorm_group_quant_kernel(
     });
 
 #define FUSED_RMSNORM_GROUP_QUANT_KERNEL_IMPL_(DTYPE_O, BlockSize, thread_data_size, ReduceThreadSize, ADD_RESIDUAL, OUTPUT_UNQUANT, GEMMA_NORM_V, NO_QUANT_V, interleave) \
-    FUSED_RMSNORM_QUANT_KERNEL_IMPL_(DTYPE_O, BlockSize, thread_data_size, ReduceThreadSize, ADD_RESIDUAL, OUTPUT_UNQUANT, GEMMA_NORM_V, NO_QUANT_V, false, interleave)
+    FUSED_RMSNORM_QUANT_KERNEL_IMPL_(DTYPE_O, BlockSize, thread_data_size, ReduceThreadSize, ADD_RESIDUAL, OUTPUT_UNQUANT, GEMMA_NORM_V, NO_QUANT_V, false, interleave, false)
 
 #define FUSED_RMSNORM_GROUP_QUANT_DISPATCH(DTYPE_O, BlockSize, thread_data_size, ReduceThreadSize, ADD_RESIDUAL, OUTPUT_UNQUANT, GEMMA_NORM_V, NO_QUANT_V) \
     FUSED_RMSNORM_GROUP_QUANT_KERNEL_IMPL_(DTYPE_O, BlockSize, thread_data_size, ReduceThreadSize, ADD_RESIDUAL, OUTPUT_UNQUANT, GEMMA_NORM_V, NO_QUANT_V, false)
@@ -508,8 +536,12 @@ __global__ void fused_qk_rmsnorm_group_quant_kernel(
 #define FUSED_RMSNORM_FP8_GROUP_QUANT_DISPATCH(BlockSize, thread_data_size, ReduceThreadSize, ADD_RESIDUAL, OUTPUT_UNQUANT, GEMMA_NORM_V, NO_QUANT_V) \
     FUSED_RMSNORM_GROUP_QUANT_RUNTIME_DISPATCH(BlockSize, thread_data_size, ReduceThreadSize, ADD_RESIDUAL, OUTPUT_UNQUANT, GEMMA_NORM_V, NO_QUANT_V)
 
+// E8M0 scales: interleave off, as the group-quant variants.
+#define FUSED_RMSNORM_FP8_E8M0_GROUP_QUANT_DISPATCH(BlockSize, thread_data_size, ReduceThreadSize, ADD_RESIDUAL, OUTPUT_UNQUANT, GEMMA_NORM_V, NO_QUANT_V) \
+    FUSED_RMSNORM_QUANT_KERNEL_IMPL_(opus::fp8_t, BlockSize, thread_data_size, ReduceThreadSize, ADD_RESIDUAL, OUTPUT_UNQUANT, GEMMA_NORM_V, NO_QUANT_V, false, false, true)
+
 #define FUSED_RMSNORM_FP8_PER_TOKEN_QUANT_DISPATCH(BlockSize, thread_data_size, ADD_RESIDUAL, OUTPUT_UNQUANT, GEMMA_NORM_V) \
-    FUSED_RMSNORM_QUANT_KERNEL_IMPL_(opus::fp8_t, BlockSize, thread_data_size, 1, ADD_RESIDUAL, OUTPUT_UNQUANT, GEMMA_NORM_V, false, true, true)
+    FUSED_RMSNORM_QUANT_KERNEL_IMPL_(opus::fp8_t, BlockSize, thread_data_size, 1, ADD_RESIDUAL, OUTPUT_UNQUANT, GEMMA_NORM_V, false, true, true, false)
 
 #define DISPATCH_RESIDUAL_UNQUANT_(MACRO, BS, TDS, RTS)                                       \
     do                                                                                         \
@@ -715,6 +747,7 @@ void fused_qk_rmsnorm_group_quant(
     // In no-quant mode the placeholder DTYPE_O is fp8 (kernel won't dereference quant outputs/scale).
     bool quant_is_fp8 = true;
     bool quant_is_fp4 = false;
+    bool quant_e8m0 = false;
     int out1_scale_row_stride = 0;
     int out1_scale_col_stride = 0;
 
@@ -815,9 +848,12 @@ void fused_qk_rmsnorm_group_quant(
         }
         if(quant_is_fp8)
         {
-            AITER_CHECK(out1_scale.dtype() == AITER_DTYPE_fp32,
+            quant_e8m0 = !per_token_quant && (out1_scale.dtype() == AITER_DTYPE_fp8_e8m0 ||
+                                              out1_scale.dtype() == AITER_DTYPE_u8);
+            AITER_CHECK(quant_e8m0 || out1_scale.dtype() == AITER_DTYPE_fp32,
                         __func__,
-                        " q_out_scale dtype must be float32 for fp8 path");
+                        " q_out_scale dtype must be float32, or fp8_e8m0 / uint8 for group quant,"
+                        " for the fp8 path");
         }
         else
         {
@@ -1017,6 +1053,35 @@ void fused_qk_rmsnorm_group_quant(
         else
         {
             DISPATCH_RESIDUAL_UNQUANT_PER_TOKEN_(FUSED_RMSNORM_FP8_PER_TOKEN_QUANT_DISPATCH, 256, 32);
+        }
+    }
+    else if(quant_e8m0)
+    {
+        // The unquantized kernel's (BlockSize, thread_data_size) per width, so the norm
+        // reduces in the same order and the bf16 values quantized are the ones it stores.
+        AITER_CHECK(max_n <= 4096 || max_n > 6144,
+                    __func__,
+                    " E8M0 group quant does not support 4096 < n <= 6144, got ",
+                    max_n);
+        if(max_n <= 512)
+        {
+            DISPATCH_REDUCE_THREAD_SIZE_(FUSED_RMSNORM_FP8_E8M0_GROUP_QUANT_DISPATCH, 64, 8);
+        }
+        else if(max_n <= 1024)
+        {
+            DISPATCH_REDUCE_THREAD_SIZE_(FUSED_RMSNORM_FP8_E8M0_GROUP_QUANT_DISPATCH, 128, 8);
+        }
+        else if(max_n <= 2048)
+        {
+            DISPATCH_REDUCE_THREAD_SIZE_(FUSED_RMSNORM_FP8_E8M0_GROUP_QUANT_DISPATCH, 256, 8);
+        }
+        else if(max_n <= 4096)
+        {
+            DISPATCH_REDUCE_THREAD_SIZE_(FUSED_RMSNORM_FP8_E8M0_GROUP_QUANT_DISPATCH, 256, 16);
+        }
+        else
+        {
+            DISPATCH_REDUCE_THREAD_SIZE_(FUSED_RMSNORM_FP8_E8M0_GROUP_QUANT_DISPATCH, 256, 32);
         }
     }
     else
