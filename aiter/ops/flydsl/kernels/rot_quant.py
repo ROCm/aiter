@@ -387,22 +387,12 @@ def flydsl_rot_quant_moe_sort(
         raise ValueError(f"x has {M} rows, expected token_num={token_num}")
     # The fused kernel quantizes a token once per route, so past this much work
     # one rotation pass plus mxfp4_moe_sort_fwd is faster (MI350X, E=128,
-    # topk 4 and 8, K=2048-7168, every rotation size). When K // 32 is not a
-    # multiple of 4 that path also pads the scales (#7646), and the crossover
-    # moves about 8x higher (K=2880).
-    if M * topk * K > (1 << 24 if (K // MX_GROUP) % 4 else 1 << 21):
+    # topk 4 and 8, K=2048-7168, every rotation size).
+    if M * topk * K > 1 << 21:
         from aiter.ops.quant import mxfp4_moe_sort_fwd
 
         xq, xs = flydsl_rot_quant(x, rotation_size=rotation_size)
-        # mxfp4_moe_sort_fwd drops the last token's final scales when K // 32
-        # is not a multiple of 4 (#7646); the extra zero columns avoid that and
-        # land in the output's padding columns. Drop this once #7653 is in.
-        pad = -(K // MX_GROUP) % 4
-        if pad:
-            xs = torch.nn.functional.pad(xs.view(torch.uint8), (0, pad))
-            xs = xs.view(dtypes.fp8_e8m0)
-        cols = K + pad * MX_GROUP
-        return xq, mxfp4_moe_sort_fwd(xs, sorted_ids, num_valid_ids, M, cols)
+        return xq, mxfp4_moe_sort_fwd(xs, sorted_ids, num_valid_ids, M, K)
 
     xq = torch.empty((M, K // 2), dtype=dtypes.fp4x2, device=x.device)
     sorted_rows = sorted_ids.shape[0]
