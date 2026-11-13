@@ -30,6 +30,7 @@ if _base_version < _MIN_FLYDSL_VERSION:
     )
 
 _LAZY_IMPORTS = {
+    "flydsl_gemm_a16w16_tdm": (".gemm_a16w16_tdm", "gemm_a16w16_tdm"),
     "FP8_MQA_LOGITS_DEFAULT_VARIANT": (
         ".fp8_mqa_logits_kernels",
         "DEFAULT_VARIANT",
