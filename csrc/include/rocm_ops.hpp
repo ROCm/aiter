@@ -1817,6 +1817,30 @@ namespace py = pybind11;
           py::arg("packed_scale"),                                       \
           py::arg("round_mode") = 1);
 
+#define KDA_REPLAYSSM_DECODE_PYBIND                \
+    m.def("kda_replayssm_decode",              \
+          &aiter::kda_replayssm_decode,        \
+          py::arg("o"),                         \
+          py::arg("ckpt"),                      \
+          py::arg("buf_k"),                     \
+          py::arg("buf_u"),                     \
+          py::arg("buf_g"),                     \
+          py::arg("q"),                         \
+          py::arg("k"),                         \
+          py::arg("v"),                         \
+          py::arg("a"),                         \
+          py::arg("b"),                         \
+          py::arg("A_log"),                     \
+          py::arg("dt_bias"),                   \
+          py::arg("write_pos"),                 \
+          py::arg("slot_idx"),                  \
+          py::arg("cu_seqlens"),                \
+          py::arg("max_query_len"),             \
+          py::arg("scale"),                     \
+          py::arg("use_qk_l2norm"),             \
+          py::arg("use_lower_bound"),           \
+          py::arg("lower_bound"));
+
 #define DSV4_ROTATE_QUANT_PYBIND                                                             \
     m.def("rotate_activation_fp4quant",                                                      \
           &aiter::rotate_activation_fp4quant,                                                \
