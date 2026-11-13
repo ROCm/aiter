@@ -174,6 +174,15 @@ def _parse_flydsl_v2_gemm2_kernel_cached(name):
     m = _FLYDSL_V2_GEMM2_RE.match(name or "")
     if not m:
         return None
+    if m.group("ldspa") and (
+        m.group("a") != "fp4"
+        or m.group("out") != "bf16"
+        or m.group("epilog") != "scatter"
+    ):
+        # get_flydsl_stage2_v2_kernels makes _ldspa only for these; others are untested.
+        raise ValueError(
+            f"{name}: _ldspa needs an fp4 activation, a bf16 output and the scatter epilogue"
+        )
     return {
         "a_dtype": m.group("a"),
         "b_dtype": m.group("b"),

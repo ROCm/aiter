@@ -498,6 +498,36 @@ def test_flydsl_v2_stage2_scatter_ldspa(token, model_dim, inter_dim, tile_n, til
     _check_close(d["ref"], outs[base + "_ldspa"].float(), f"scatter_ldspa_t{token}")
 
 
+def test_ldspa_kernel_names_match_the_generator():
+    """_ldspa names parse only where get_flydsl_stage2_v2_kernels makes them."""
+    from aiter.ops.flydsl.moe_kernels import get_flydsl_stage2_v2_kernels
+    from aiter.ops.flydsl.mxfp4_kname import parse_flydsl_v2_gemm2_kernel
+
+    made = []
+    for a_dtype, b_dtype in (("fp4", "fp4"), ("fp8", "fp4"), ("fp8", "fp8")):
+        for out_dtype in ("bf16", "fp4"):
+            for block_m in (16, 32, 64, 128):
+                made += get_flydsl_stage2_v2_kernels(
+                    a_dtype, b_dtype, out_dtype, block_m, 6144, 768
+                )
+    ldspa = [name for name in made if name.endswith("_ldspa")]
+    assert ldspa
+    for name in ldspa:
+        parsed = parse_flydsl_v2_gemm2_kernel(name)
+        assert parsed["scatter_lds_pairs"] and parsed["a_dtype"] == "fp4", name
+        assert (
+            parse_flydsl_v2_gemm2_kernel(name[: -len("_ldspa")])["scatter_lds_pairs"]
+            is False
+        )
+    for name in (
+        "flydsl_moe2_layout_afp8_wfp4_bf16_t128x256x256_scatter_sbm128_ldspa",
+        "flydsl_moe2_layout_afp4_wfp4_fp4_t128x256x256_scatter_sbm128_ldspa",
+        "flydsl_moe2_layout_afp4_wfp4_bf16_t128x256x256_atomic_sbm128_ldspa",
+    ):
+        with pytest.raises(ValueError, match="_ldspa needs"):
+            parse_flydsl_v2_gemm2_kernel(name)
+
+
 @_SKIP_GFX950_FLYDSL
 def test_flydsl_stage2_fp8_ep_reduction():
     from aiter.ops.flydsl.kernels.mxfp4_gemm_common import fp8out_row_bytes
