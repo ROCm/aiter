@@ -2910,7 +2910,8 @@ def _a16w16_4wave_gfx950(tag, bm, bn):
         arch_prefix="gfx950",
         # "splitk_" keeps the reduce-TU arch detection in gen_instances.py
         # (opus_gemm_<arch>_splitk_) working for the workspace kids.
-        name_tag="splitk_4wave_ws" if workspace else "4wave",
+        # dtype in the name (other dtypes of the 4-wave family may follow).
+        name_tag="splitk_4wave_bf16_ws" if workspace else "4wave_bf16",
         splitk_workspace_dtype="fp32_t" if workspace else None,
     )
 

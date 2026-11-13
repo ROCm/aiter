@@ -1,6 +1,6 @@
 {
   "_comment": [
-    "gfx950 a16w16 4-wave family (bf16 x bf16 -> bf16, C = A * B^T, all four layouts).",
+    "gfx950 a16w16 4-wave family (bf16 x bf16 -> bf16, C = A * B^T, all four layouts); kernel names carry 'bf16'.",
     "READ BY BOTH: opus_gemm_common.py (kid table -> host-only JIT launchers) and",
     "gen_co/build_co.py --arch gfx950 (offline .co images, AGPR-pinning LLVM).",
     "",
