@@ -566,6 +566,54 @@ class TestGfx950ExtendedHgemm(unittest.TestCase):
             impl.make_gemm_a16w16_gfx950_param(**cfg)
 
 
+class TestWaveSpecializedConfig(unittest.TestCase):
+    def test_valid_geometry_and_limits(self):
+        from aiter.ops.flydsl.gemm_a16w16_ws import _validate_ws_config
+
+        base = (64, 64, 128, 3, 2, 2, 2, 1, True)
+        self.assertEqual(_validate_ws_config(*base), base[:-1])
+        for index, value in (
+            (0, 63),
+            (1, 63),
+            (2, 32),
+            (3, 1),
+            (3, 6),
+            (4, 0),
+            (4, 3),
+            (4, True),
+            (5, 3),
+            (7, 0),
+            (7, 17),
+            (8, 1),
+        ):
+            args = list(base)
+            args[index] = value
+            with self.subTest(index=index, value=value), self.assertRaises(ValueError):
+                _validate_ws_config(*args)
+        with self.assertRaisesRegex(ValueError, "LDS"):
+            _validate_ws_config(256, 256, 128, 5, 4, 2, 4, 1, False)
+
+    def test_dma_coverage_and_sequence_generations(self):
+        # Each physical packet belongs to one producer lane; each consumer
+        # must release a slot before the next generation reuses it.
+        for bm, bn, bk, pr in ((64, 64, 64, 1), (32, 64, 128, 2), (256, 128, 64, 4)):
+            for size in (bm * bk, bn * bk):
+                offsets = [
+                    (p * 64 + lane + i * pr * 64) * 8
+                    for i in range(size // (pr * 64 * 8))
+                    for p in range(pr)
+                    for lane in range(64)
+                ]
+                self.assertEqual(sorted(offsets), list(range(0, size, 8)))
+            for stages in (2, 3, 4, 5):
+                for tiles in (1, 2, 3, 7, 28, 112):
+                    last = [0] * stages
+                    for tile in range(tiles):
+                        slot, gen = tile % stages, tile // stages
+                        self.assertEqual(last[slot], gen)
+                        last[slot] = gen + 1
+
+
 class TestGfx1250FlydslCandidates(unittest.TestCase):
     """GemmA16W16Tuner's FlyDSL candidates on gfx1250, with the device mocked."""
 

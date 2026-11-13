@@ -1157,6 +1157,225 @@ def check_streamk_rejects():
         launch.assert_not_called()
 
 
+# Explicit experimental WS cases. No tuned lookup or default calls this path.
+# (M,N,K,BM,BN,BK,stages,load waves,M compute waves,N compute waves,split,prefetch)
+_WS_CASES = (
+    (64, 64, 64, 64, 64, 64, 3, 1, 2, 2, 1, True),
+    (65, 120, 320, 64, 64, 64, 3, 1, 2, 2, 1, True),
+    (65, 120, 896, 64, 64, 64, 4, 2, 2, 2, 2, True),
+    (17, 36, 1024, 32, 64, 128, 3, 2, 1, 2, 4, False),
+    (128, 3584, 7168, 64, 64, 128, 3, 2, 2, 2, 2, True),
+    (128, 7168, 3584, 64, 64, 128, 3, 2, 2, 2, 1, True),
+    (16384, 3584, 7168, 256, 128, 64, 3, 2, 4, 2, 1, True),
+    (16384, 7168, 3584, 128, 256, 64, 3, 2, 2, 4, 1, True),
+)
+
+
+@benchmark()
+def test_hgemm_wave_specialized(
+    m, n, k, bm, bn, bk, stages, producers, wm, wn, split, prefetch
+):
+    """Wave-role handoff, wraparound, private scratch and explicit-stream calls."""
+    from unittest.mock import patch
+
+    import aiter.ops.flydsl.gemm_a16w16_ws as ws_module
+    from aiter.ops.flydsl import gemm_a16w16_wave_specialized as ws
+
+    torch.manual_seed(2721)
+    # Nonzero aligned offset, row padding and exact logical K.
+    ax = torch.randn((m, k + 32), device="cuda", dtype=dtypes.bf16)
+    bw = torch.randn((n, k + 32), device=ax.device, dtype=ax.dtype)
+    a, w = ax[:, 8 : 8 + k], bw[:, 8 : 8 + k]
+    save_halos = (
+        ax[:, :8].clone(),
+        ax[:, 8 + k :].clone(),
+        bw[:, :8].clone(),
+        bw[:, 8 + k :].clone(),
+    )
+    halos = [
+        torch.full((m * n + 64,), 23.0, device=a.device, dtype=a.dtype)
+        for _ in range(2)
+    ]
+    outs = [h[32:-32].view(m, n) for h in halos]
+    cfg = {
+        "block_m": bm,
+        "block_n": bn,
+        "block_k": bk,
+        "stages": stages,
+        "producer_waves": producers,
+        "m_waves": wm,
+        "n_waves": wn,
+        "split_k": split,
+        "prefetch": prefetch,
+    }
+    streams = [torch.cuda.Stream(), torch.cuda.Stream()]
+    graphs = []
+    workspace_halos = []
+    real_empty = torch.empty
+
+    def guarded_empty(shape, **kw):
+        if (
+            isinstance(shape, tuple)
+            and len(shape) == 3
+            and kw.get("dtype") == torch.float32
+        ):
+            assert torch.cuda.current_stream(a.device) in streams
+            size = shape[0] * shape[1] * shape[2]
+            mem = real_empty((size + 64,), **kw)
+            mem.fill_(31.0)
+            workspace_halos.append(mem)
+            return mem[32:-32].view(shape)
+        return real_empty(shape, **kw)
+
+    with patch.object(ws_module.torch, "empty", side_effect=guarded_empty):
+        for st, o in zip(streams, outs):
+            st.wait_stream(torch.cuda.current_stream())
+            g = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(g, stream=st):
+                ws(a, w, out=o, stream=st, **cfg)
+                ws(a, w, out=o, stream=st, **cfg)
+            st.synchronize()
+            graphs.append(g)
+    if split > 1:
+        assert len(workspace_halos) >= 4
+        assert len({v.data_ptr() for v in workspace_halos}) == len(workspace_halos)
+    for rep in range(6):
+        if rep % 3 == 0:
+            a.normal_()
+            w.normal_()
+        elif rep % 3 == 1:
+            a.mul_(0.125)
+            w.mul_(0.125)
+        else:
+            a.copy_((torch.randint(-4, 5, a.shape, device=a.device).float()) / 16)
+            w.copy_((torch.randint(-4, 5, w.shape, device=w.device).float()) / 16)
+        saved = (a.clone(), w.clone())
+        expected = run_torch(a, w, dtypes.bf16)
+        for o, st, g in zip(outs, streams, graphs):
+            o.fill_(float("nan"))
+            st.wait_stream(torch.cuda.current_stream())
+            with torch.cuda.stream(st):
+                g.replay()
+                g.replay()
+        # Calls made while the ambient stream differs from the launch stream.
+        for st, o in zip(streams, outs):
+            ws(a, w, out=o, stream=st, **cfg)
+        pressure = torch.empty((4, 256, 256), device=a.device, dtype=torch.float32)
+        for st, o, h in zip(streams, outs, halos):
+            st.synchronize()
+            err = checkAllclose(
+                expected.float(),
+                o.float(),
+                atol=0.01,
+                rtol=0.01,
+                tol_err_ratio=0,
+                printLog=False,
+            )
+            assert err == 0, (m, n, k, rep, err)
+            assert (h[:32] == 23).all() and (h[-32:] == 23).all()
+        assert torch.equal(outs[0], outs[1])
+        assert torch.equal(a, saved[0]) and torch.equal(w, saved[1])
+        for h in workspace_halos:
+            assert (h[:32] == 31).all() and (h[-32:] == 31).all()
+        del pressure
+    for h, saved in zip(
+        (ax[:, :8], ax[:, 8 + k :], bw[:, :8], bw[:, 8 + k :]), save_halos
+    ):
+        assert torch.equal(h, saved)
+    result = ws(a, w, **cfg)
+    assert (
+        checkAllclose(
+            expected.float(),
+            result.float(),
+            atol=0.01,
+            rtol=0.01,
+            tol_err_ratio=0,
+            printLog=False,
+        )
+        == 0
+    )
+    ret = {"gfx": get_gfx_runtime()}
+    candidates = {
+        "public": lambda: ws(a, w, out=outs[0], **cfg),
+        "graph2": graphs[0].replay,
+    }
+    for name, fn in candidates.items():
+        _, us = run_perftest(
+            fn, num_warmup=3, num_iters=10, num_rotate_args=1, use_cuda_event=True
+        )
+        torch.cuda.synchronize()
+        if name == "graph2":
+            us /= 2
+        err = checkAllclose(
+            expected.float(),
+            outs[0].float(),
+            atol=0.01,
+            rtol=0.01,
+            tol_err_ratio=0,
+            printLog=False,
+        )
+        assert err == 0
+        ret.update(
+            {
+                name + " us": us,
+                name + " TFLOPS": 2 * m * n * k / us / 1e6,
+                name + " TB/s": 2 * (m * k + n * k + m * n) / us / 1e6,
+                name + " err": err,
+            }
+        )
+    return ret
+
+
+def check_wave_specialized_rejects():
+    from unittest.mock import Mock, patch
+
+    import aiter.ops.flydsl.gemm_a16w16_ws as module
+
+    ws = module.gemm_a16w16_wave_specialized
+    x = torch.empty((64, 256), device="cuda", dtype=dtypes.bf16)
+    w = torch.empty((64, 256), device=x.device, dtype=x.dtype)
+    o = torch.empty((64, 64), device=x.device, dtype=x.dtype)
+    wrong = Mock(spec=torch.cuda.Stream)
+    wrong.device = torch.device("cuda", x.device.index + 1)
+    huge = Mock(spec=torch.Tensor)
+    huge.ndim, huge.shape, huge.device, huge.dtype = 2, x.shape, x.device, x.dtype
+    huge.stride.side_effect = lambda i: 1 << 26 if i == 0 else 1
+    huge.data_ptr.return_value = x.data_ptr()
+    calls = [
+        lambda: ws(x, w, out=o, stream=wrong),
+        lambda: ws(x.cpu(), w.cpu()),
+        lambda: ws(x, w.cpu(), out=o),
+        lambda: ws(x, w, out=o.cpu()),
+        lambda: ws(x.half(), w.half()),
+        lambda: ws(x[:, ::2], w[:, ::2]),
+        lambda: ws(x, w, out=o.T),
+        lambda: ws(huge, w, out=o),
+        lambda: ws(x[:, :248], w[:, :248]),
+        lambda: ws(x, w, out=o, split_k=3),
+    ]
+    for field, value in (
+        ("producer_waves", 0),
+        ("producer_waves", 3),
+        ("producer_waves", True),
+        ("m_waves", 3),
+        ("block_k", 32),
+        ("stages", 1),
+        ("stages", 6),
+        ("prefetch", 1),
+        ("split_k", 17),
+    ):
+        calls.append(lambda field=field, value=value: ws(x, w, out=o, **{field: value}))
+    with patch.object(module, "_run_compiled") as launch:
+        for i, fn in enumerate(calls):
+            try:
+                fn()
+            except (ValueError, AssertionError):
+                pass
+            else:
+                raise AssertionError(f"invalid WS input accepted: {i}")
+        launch.assert_not_called()
+
+
 def summarize(title, rows):
     df = pd.DataFrame(rows)
     if df.empty:
@@ -1197,7 +1416,8 @@ def main():
         + [row[:3] for row in _MEMORY_TILES]
         + _TUNED_MEMORY_MNK
         + _BAND_MNK
-        + [row[:3] for row in _EXTENDED_TILES],
+        + [row[:3] for row in _EXTENDED_TILES]
+        + [row[:3] for row in _WS_CASES],
         help="""Shape of mnk.
         e.g.:   -s 128,4096,4096
                 --mnk 32,384,7168""",
@@ -1280,6 +1500,16 @@ def main():
             ],
         )
         check_streamk_rejects()
+    if any(row[:3] in wanted for row in _WS_CASES):
+        summarize(
+            "experimental wave-specialized HGEMM",
+            [
+                test_hgemm_wave_specialized(*row)
+                for row in _WS_CASES
+                if row[:3] in wanted
+            ],
+        )
+        check_wave_specialized_rejects()
     check_band_rejects()
     check_hgemm_memory_options()
     check_skinny_rejects()

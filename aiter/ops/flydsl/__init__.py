@@ -85,6 +85,7 @@ _LAZY_IMPORTS = {
     ),
     "flydsl_gemm_a16wfp4": (".gemm_a16wfp4", "flydsl_gemm_a16wfp4"),
     "flydsl_hgemm": (".gemm_kernels", "flydsl_hgemm"),
+    "gemm_a16w16_wave_specialized": (".gemm_a16w16_ws", "gemm_a16w16_wave_specialized"),
     "flydsl_hstu_attention": (
         ".hstu_attention",
         "flydsl_hstu_attention",
