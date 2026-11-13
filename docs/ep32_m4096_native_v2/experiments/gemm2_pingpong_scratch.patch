@@ -1,0 +1,16 @@
+diff --git a/aiter/ops/flydsl/ep32_native80.py b/aiter/ops/flydsl/ep32_native80.py
+--- a/aiter/ops/flydsl/ep32_native80.py
++++ b/aiter/ops/flydsl/ep32_native80.py
+@@ -29,8 +29,10 @@
+     if native:
+         key=(out.device,torch.cuda.current_stream(out.device).cuda_stream,max_sorted)
+         if key not in _buffers:
+-            _buffers[key]=torch.empty((max_sorted,3584),dtype=torch.float32,device=out.device)
+-        target=_buffers[key]
++            _buffers[key]=([torch.empty((max_sorted,3584),dtype=torch.float32,device=out.device) for _ in range(2)],0)
++        pair,index=_buffers[key]
++        target=pair[index]
++        _buffers[key]=(pair,1-index)
+     matmul(aq,ascale,bq,bscale,eids,cumsum,stids,weights,target,n_tokens,max_sorted,valid,native)
+     if native:
+         ep32_native_reduce(target,reverse,weights,mask,ids,cumsum,out)

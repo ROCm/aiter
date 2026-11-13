@@ -1,0 +1,154 @@
+diff --git a/aiter/ops/flydsl/kernels/mxfp4_gemm1_ep32.py b/aiter/ops/flydsl/kernels/mxfp4_gemm1_ep32.py
+--- a/aiter/ops/flydsl/kernels/mxfp4_gemm1_ep32.py
++++ b/aiter/ops/flydsl/kernels/mxfp4_gemm1_ep32.py
+@@ -224,7 +224,7 @@
+     lane_div_8 = lane // fx.Int32(8)
+     lane_mod_8 = lane % fx.Int32(8)
+
+-    aq_num_records = fx.Int64(i32_ntok * fx.Int32(A_ROW_BYTES))
++    aq_num_records = fx.Int64(i32_total_m_blocks) * fx.Int64(80 * A_ROW_BYTES)
+     _asc_per_mb = max(BM // 32, 1) * kAS_per_chunk_dw * 4
+     ascale_num = fx.Int64(i32_total_m_blocks) * fx.Int64(_asc_per_mb)
+     if const_expr(sbm80):
+@@ -259,45 +259,13 @@
+     # epilogue. s_aq/lds_acc start at lds_raw_ptr; s_asc follows at
+     # +kAStages*BM*KH_TILE.
+
++    # Sorted-A experiment: addresses are contiguous; no token gather.
+     cached_actual_row = []
+-    cached_row_inline = None
+-    if const_expr(inline_quant):
+-        rcls = wave_n * fx.Int32(4) + lane_div_16
+-        cached_row_inline = _global_i32_at(arg_mind, m_row + rcls)
+-    elif const_expr(num_waves == 2):
+-        for load_group in range_constexpr(2):
+-            idx = (
+-                m_row
+-                + wave_n * fx.Int32(BM // 2)
+-                + fx.Int32(load_group * 8)
+-                + lane_div_8
+-            )
+-            cached_actual_row.append(_global_i32_at(arg_mind, idx))
+-    else:
+-        for sub in range_constexpr(kSubBlocks):
+-            idx = m_row + wave_n * fx.Int32(BM // 4) + fx.Int32(sub * 8) + lane_div_8
+-            actual_row = _global_i32_at(arg_mind, idx)
+-            if const_expr(a_dtype == "fp8" and BM >= 64):
+-                cached_actual_row.append(
+-                    [
+-                        fx.Int32(
+-                            rocdl.ds_bpermute(
+-                                T.i32,
+-                                (lane_div_16 + fx.Int32(row_group * 4)) * fx.Int32(32),
+-                                as_ir_value(actual_row),
+-                            )
+-                        )
+-                        for row_group in range_constexpr(2)
+-                    ]
+-                )
+-            else:
+-                cached_actual_row.append(actual_row)
+-    tail_row = None
+-    if const_expr(NCH > kMChunks):
+-        # Tail chunk rows BM..BM+15: wave w DMAs rows BM+4w..BM+4w+3.
+-        tail_row = _global_i32_at(
+-            arg_mind, m_row + fx.Int32(BM) + wave_n * fx.Int32(4) + lane_div_16
+-        )
++    for sub in range_constexpr(kSubBlocks):
++        cached_actual_row.append([m_row + wave_n * fx.Int32(BM // 4)
++            + fx.Int32(sub * 8 + row_group * 4) + lane_div_16
++            for row_group in range_constexpr(2)])
++    tail_row = m_row + fx.Int32(BM) + wave_n * fx.Int32(4) + lane_div_16
+
+     N0_HALF = N_OUT // 32
+     b_load_s_base = []
+@@ -1813,7 +1781,7 @@
+         32 * (BN + ACC_LDS_PAD_DW) * 4,
+     )
+
+-    variant_tag = "nt" if use_nt else "cached"
++    variant_tag = "nt_asorted" if use_nt else "cached_asorted"
+     name_suffix = f"h{D_HIDDEN}_i{D_INTER}_ne{NE}_bm{sort_block_m}_{variant_tag}_{act}{'_fs' if fast_situ else ''}"
+     if enable_bias:
+         name_suffix += "_bias"
+diff --git a/aiter/ops/flydsl/mxfp4_gemm1_kernels.py b/aiter/ops/flydsl/mxfp4_gemm1_kernels.py
+--- a/aiter/ops/flydsl/mxfp4_gemm1_kernels.py
++++ b/aiter/ops/flydsl/mxfp4_gemm1_kernels.py
+@@ -288,6 +288,10 @@
+         k_wave,
+         ep32,
+     )
++    if ep32:
++        assert (BM,D_HIDDEN,D_INTER,NE,n_tokens) == (80,3584,3072,28,4096), 'sorted-A experiment only supports this bench shape'
++        from .ep32_sorted_a import prepare
++        a_quant = prepare(a_quant,m_indices,cumsum_tensor,n_tokens)
+     grid = gemm1_grid(n_tokens, BM, NE=NE, TOPK=topk, INTER=D_INTER, BN=BN)
+     _moe_kernels._run_compiled(
+         launch,
+diff --git a/aiter/ops/flydsl/ep32_sorted_a.py b/aiter/ops/flydsl/ep32_sorted_a.py
+new file mode 100644
+--- /dev/null
++++ b/aiter/ops/flydsl/ep32_sorted_a.py
+@@ -0,0 +1,14 @@
++"""Experimental sorted FP8 payload for the single EP32/M4096 GEMM1 shape."""
++import torch
++from .kernels.ep32_sorted_a import compile_sorted_a
++from .kernels.tensor_shim import _run_compiled, ptr_arg
++
++
++def prepare(a, mind, valid, n_tokens):
++    from aiter.fused_moe import _stage2_scratch
++    assert a.shape == (4096, 3584) and n_tokens == 4096
++    rows = ((mind.numel() + 79) // 80) * 80
++    target = _stage2_scratch("g1_sorted_a", (rows, 3584), torch.uint8, a.device)
++    _run_compiled(compile_sorted_a(a.device), ptr_arg(a), ptr_arg(mind),
++        ptr_arg(valid), ptr_arg(target), n_tokens, torch.cuda.current_stream(a.device))
++    return target
+diff --git a/aiter/ops/flydsl/kernels/ep32_sorted_a.py b/aiter/ops/flydsl/kernels/ep32_sorted_a.py
+new file mode 100644
+--- /dev/null
++++ b/aiter/ops/flydsl/kernels/ep32_sorted_a.py
+@@ -0,0 +1,43 @@
++"""Prepare only filled EP32 sorted rows, preserving the original FP8 codes."""
++from functools import cache
++import flydsl.compiler as flyc
++import flydsl.expr as fx
++from flydsl.expr import range_constexpr
++from flydsl.expr.typing import T
++from .mxfp4_gemm_common import global_typed_ptr
++
++
++@flyc.kernel(name="ep32_prepare_sorted_a_fp8", known_block_size=[256, 1, 1])
++def sorted_a_kernel(a: fx.Pointer, mind: fx.Pointer, valid: fx.Pointer,
++                    out: fx.Pointer, n_tokens: fx.Int32):
++    tx = fx.thread_idx.x
++    ids = global_typed_ptr(fx.ptrtoint(mind), T.i32)
++    count = global_typed_ptr(fx.ptrtoint(valid), T.i32)
++    src = global_typed_ptr(fx.ptrtoint(a), T.i32, align=16)
++    dst = global_typed_ptr(fx.ptrtoint(out), T.i32, align=16)
++    src = fx.rocdl.make_buffer_tensor(fx.Tensor(fx.make_view(src, fx.make_layout((1, 1), (1, 1)))), max_size=True)
++    dst = fx.rocdl.make_buffer_tensor(fx.Tensor(fx.make_view(dst, fx.make_layout((1, 1), (1, 1)))), max_size=True)
++    copy = fx.make_copy_atom(fx.rocdl.BufferCopy128b(), fx.Int32)
++    # Each wave copies four complete rows; its 16-lane subgroups copy 256B.
++    for block in range(fx.block_idx.x, (count[0] + 15) // 16, fx.Int32(512)):
++        row = block * 16 + tx // 16
++        if row < count[0]:
++            token = ids[row]
++            legal = (token >= 0) & (token < n_tokens)
++            for part in range_constexpr(14):
++                col_dw = (part * 16 + tx % 16) * 4
++                frag = fx.make_rmem_tensor(4, fx.Int32)
++                frag.store(fx.full(4, 0, fx.Int32))
++                if legal:
++                    fx.copy(copy, src[None, token * 896 + col_dw], frag)
++                fx.copy(copy, frag, dst[None, row * 896 + col_dw])
++
++
++@cache
++def compile_sorted_a(device):
++    @flyc.jit
++    def launch(a: fx.Pointer, mind: fx.Pointer, valid: fx.Pointer,
++               out: fx.Pointer, n_tokens: fx.Int32, stream: fx.Stream):
++        sorted_a_kernel(a, mind, valid, out, n_tokens).launch(
++            grid=(512, 1, 1), block=(256, 1, 1), stream=stream)
++    return launch

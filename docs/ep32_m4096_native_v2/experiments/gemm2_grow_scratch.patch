@@ -1,0 +1,24 @@
+diff --git a/aiter/ops/flydsl/ep32_native80.py b/aiter/ops/flydsl/ep32_native80.py
+--- a/aiter/ops/flydsl/ep32_native80.py
++++ b/aiter/ops/flydsl/ep32_native80.py
+@@ -15,7 +15,6 @@
+         GRID_WGS=512,use_valid_token_count=valid,
+         **({'REDUCE':True,'NATIVE_C':True} if native else {}))
+
+-_buffers={}
+ def matmul(aq,ascale,bq,bscale,eids,cumsum,stids,weights,target,n_tokens,max_sorted,valid,native):
+     mb=(max_sorted+79)//80
+     exe=_kernel(target.device,bool(valid),bool(native))
+@@ -27,10 +26,8 @@
+     native=os.environ.get('EP32_G2_NATIVE','1')=='1' if native is None else native
+     target=out
+     if native:
+-        key=(out.device,torch.cuda.current_stream(out.device).cuda_stream,max_sorted)
+-        if key not in _buffers:
+-            _buffers[key]=torch.empty((max_sorted,3584),dtype=torch.float32,device=out.device)
+-        target=_buffers[key]
++        from aiter.fused_moe import _stage2_scratch
++        target=_stage2_scratch('target',(max_sorted,3584),torch.float32,out.device)
+     matmul(aq,ascale,bq,bscale,eids,cumsum,stids,weights,target,n_tokens,max_sorted,valid,native)
+     if native:
+         ep32_native_reduce(target,reverse,weights,mask,ids,cumsum,out)

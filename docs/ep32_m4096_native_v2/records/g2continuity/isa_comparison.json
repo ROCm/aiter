@@ -1,0 +1,19 @@
+{
+  "instructions": 2679,
+  "nt_stores_added": 20,
+  "only_store_nt_changed": true,
+  "resources": {
+    ".amdhsa_next_free_vgpr": [
+      "256"
+    ],
+    ".amdhsa_next_free_sgpr": [
+      "96"
+    ],
+    ".amdhsa_group_segment_fixed_size": [
+      "161792"
+    ],
+    ".amdhsa_private_segment_fixed_size": [
+      "0"
+    ]
+  }
+}

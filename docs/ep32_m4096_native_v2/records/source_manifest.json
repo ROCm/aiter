@@ -1,0 +1,54 @@
+{
+  "base_commit": "2ee6af1df6897f240098388b9e915c44dccb789a",
+  "bench_sha256": "aafe3e8553c4948b665432a678e07afbb5fa7b031262896ee9f57fca80fe0bf1",
+  "note": "CSV follows repository text/eol=lf; recorded GPU-capture worktree had CRLF. Row values and kernel sources are unchanged.",
+  "default_sources": [
+    {
+      "path": "aiter/configs/model_configs/kimik3_a8w4_ep32_fmoe_mxmoe_g1g2ep32.csv",
+      "worktree_sha256": "3027f9fac62625b92b90725f46582459decada4b8e32673326dc1f16dc0fc4b3",
+      "git_content_sha256": "366ff6a27427027efa300f22b2e2a3d4e8446b142b34cd353145d4d4a0d31498"
+    },
+    {
+      "path": "aiter/ops/flydsl/kernels/mxfp4_gemm1_ep32.py",
+      "worktree_sha256": "869c54100f9e976bc0fbb632dd12cf534babae90acfe9905aa08bdf860c3bc7f",
+      "git_content_sha256": "869c54100f9e976bc0fbb632dd12cf534babae90acfe9905aa08bdf860c3bc7f"
+    },
+    {
+      "path": "aiter/ops/flydsl/kernels/mxmoe_gemm2_ep32.py",
+      "worktree_sha256": "273bd0bc65417d828bf0a2f9a50f6bd2e5bd2f939ee9f1d2727131a277f6e94b",
+      "git_content_sha256": "273bd0bc65417d828bf0a2f9a50f6bd2e5bd2f939ee9f1d2727131a277f6e94b"
+    },
+    {
+      "path": "aiter/ops/flydsl/kernels/mxmoe_gemm2_ep32_bm80var.py",
+      "worktree_sha256": "93bd48b7bd8e541625de88cb659351672650ebf8ea21820989792278f49b5dc4",
+      "git_content_sha256": "93bd48b7bd8e541625de88cb659351672650ebf8ea21820989792278f49b5dc4"
+    },
+    {
+      "path": "aiter/ops/flydsl/kernels/mxmoe_gemm2_ep32_bm80base.py",
+      "worktree_sha256": "ba37f80bc4da49915bfe253a8e7d45d9de3eb816222df872157d2b9eacc123b6",
+      "git_content_sha256": "ba37f80bc4da49915bfe253a8e7d45d9de3eb816222df872157d2b9eacc123b6"
+    },
+    {
+      "path": "aiter/ops/flydsl/kernels/mxmoe_reduce_ep32.py",
+      "worktree_sha256": "c5385132f5108aaecb74a0842fc2b70d2904c4c77fd9924b11bc4fe0878f0503",
+      "git_content_sha256": "c5385132f5108aaecb74a0842fc2b70d2904c4c77fd9924b11bc4fe0878f0503"
+    },
+    {
+      "path": "aiter/ops/flydsl/ep32_native80.py",
+      "worktree_sha256": "981ec515988c57489e6535c9de5bf5bb5cdf0e866d79d135a4c3493677940b29",
+      "git_content_sha256": "981ec515988c57489e6535c9de5bf5bb5cdf0e866d79d135a4c3493677940b29"
+    },
+    {
+      "path": "aiter/ops/flydsl/mxmoe_native_reduce.py",
+      "worktree_sha256": "0b891f84a5bb1d91f8c9ef7a9055457796079dd1457de2704e03ab317a2d1749",
+      "git_content_sha256": "0b891f84a5bb1d91f8c9ef7a9055457796079dd1457de2704e03ab317a2d1749"
+    },
+    {
+      "path": "aiter/fused_moe.py",
+      "worktree_sha256": "7f825191f374be6c4573645dfb4b244c42215a3fb88d1bf7943260df32572043",
+      "git_content_sha256": "7f825191f374be6c4573645dfb4b244c42215a3fb88d1bf7943260df32572043"
+    }
+  ],
+  "gpu_validation_new_candidates": false,
+  "code_commit": "b0b61ad96f28b8b782c854d8c893e8ef5be70ae0"
+}

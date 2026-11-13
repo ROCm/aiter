@@ -1,0 +1,58 @@
+{
+  "baseline": {
+    ".amdhsa_next_free_vgpr": [
+      "152"
+    ],
+    ".amdhsa_next_free_sgpr": [
+      "96"
+    ],
+    ".amdhsa_group_segment_fixed_size": [
+      "51712"
+    ],
+    ".amdhsa_private_segment_fixed_size": [
+      "0"
+    ],
+    "instructions": 3642,
+    "ds_bpermute": 4,
+    "buffer_load_lds": 82,
+    "mfma": 560
+  },
+  "sorted": {
+    ".amdhsa_next_free_vgpr": [
+      "160"
+    ],
+    ".amdhsa_next_free_sgpr": [
+      "96"
+    ],
+    ".amdhsa_group_segment_fixed_size": [
+      "51712"
+    ],
+    ".amdhsa_private_segment_fixed_size": [
+      "0"
+    ],
+    "instructions": 3625,
+    "ds_bpermute": 0,
+    "buffer_load_lds": 82,
+    "mfma": 560
+  },
+  "pack": {
+    ".amdhsa_next_free_vgpr": [
+      "28"
+    ],
+    ".amdhsa_next_free_sgpr": [
+      "24"
+    ],
+    ".amdhsa_group_segment_fixed_size": [
+      "0"
+    ],
+    ".amdhsa_private_segment_fixed_size": [
+      "0"
+    ],
+    "instructions": 231
+  },
+  "occupancy_bound": {
+    "three_wg_lds": 155136,
+    "gfx950_lds_capacity": 163840,
+    "sorted_three_wave_vgpr": 480
+  }
+}

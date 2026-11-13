@@ -1,0 +1,13 @@
+{
+  "baseline": {
+    "kernel": "93bd48b7bd8e541625de88cb659351672650ebf8ea21820989792278f49b5dc4",
+    "wrapper": "981ec515988c57489e6535c9de5bf5bb5cdf0e866d79d135a4c3493677940b29"
+  },
+  "variants": {
+    "baseline_kernel.py": "93bd48b7bd8e541625de88cb659351672650ebf8ea21820989792278f49b5dc4",
+    "baseline_wrapper.py": "981ec515988c57489e6535c9de5bf5bb5cdf0e866d79d135a4c3493677940b29",
+    "grow_wrapper.py": "450361cc67a076fb5bc8cf6ed9f06912d767c924ec7c1891048d00e651feaf14",
+    "nt_kernel.py": "276344f2eff3a562185beca52158062a3576a2d68bdcb0929ab9edd521299502",
+    "pingpong_wrapper.py": "5d2fb2c4d2d61f5646241480e0dfdee7079eb41d336f3738800d66828b90167e"
+  }
+}
