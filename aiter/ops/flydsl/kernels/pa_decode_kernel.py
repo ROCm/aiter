@@ -461,7 +461,7 @@ def compile_pa_decode_tile(
             """Zero this CTA's query rows of ``seq`` in the final output."""
             tid = fx.Int32(gpu.thread_id("x"))
             row_units = traits.head_dim // 8
-            kv_query = fx.Int32(gpu.block_id("y"))
+            kv_query = fx.Int32(gpu.block_id("x" if traits.SPLIT_MAJOR else "y"))
             kv_h = kv_query // traits.query_splits
             first_row = (
                 (kv_query % traits.query_splits)
@@ -490,7 +490,7 @@ def compile_pa_decode_tile(
 
         # Skip cleared padding records: no scratch writes or Q loads.
         # This CTA-uniform guard keeps every task barrier convergent.
-        slot = fx.Int32(gpu.block_id("x"))
+        slot = fx.Int32(gpu.block_id("y" if traits.SPLIT_MAJOR else "x"))
         work = fx.recast_iter(fx.Int32, work_info_ptr)
         if const_expr(traits.DIRECT and traits.kv_dtype != MXFP4_KV_DTYPE):
             # One-partition plan, capacity == batch: slot s runs packed task s
@@ -708,7 +708,11 @@ def compile_pa_decode_tile(
                     num_seqs,
                 )
             ).launch(
-                grid=(work_capacity, num_kv_heads * traits.query_splits, 1),
+                grid=(
+                    (num_kv_heads * traits.query_splits, work_capacity, 1)
+                    if traits.SPLIT_MAJOR
+                    else (work_capacity, num_kv_heads * traits.query_splits, 1)
+                ),
                 block=(traits.CTA_THREADS, 1, 1),
                 stream=stream,
             )
@@ -720,7 +724,7 @@ def compile_pa_decode_tile(
             "amdgpu-kernarg-preload": AITER_FLYDSL_KERNARG_PRELOAD,
             "amdgpu-kernarg-preload-count": min(16, AITER_FLYDSL_KERNARG_PRELOAD_COUNT),
         }
-    if traits.FP8_MTP4_LEAN:
+    if traits.FP8_MTP4_LEAN or traits.WAVES_PER_EU_2:
         # Two CTAs per CU: hold the allocator to 256 registers per wave.
         pa_decode_tile_launch.compile_hints["waves_per_eu"] = 2
     compiled = {
