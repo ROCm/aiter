@@ -117,5 +117,19 @@
   "source": "aiter/ops/gemm_fusion/sp_qkv/op.py",
   "supersedes": [],
   "version": 1
+ },
+ "top_k_per_row_decode": {
+  "fingerprint": "254392f1c1ad0fcb",
+  "signature": "logits:positional:torch.Tensor, next_n:positional:int, seqLens:positional:torch.Tensor, indices:positional:torch.Tensor, numRows:positional:int, stride0:positional:int, stride1:positional:int, k:positional:int=2048, stable:positional:bool=False, values:positional:torch.Tensor | None=None, row_starts:keyword-only:torch.Tensor | None=None, plane_width:keyword-only:int | None=None, -> None",
+  "source": "aiter/ops/topk.py",
+  "supersedes": [],
+  "version": 1
+ },
+ "topk_gating": {
+  "fingerprint": "b6325c278faa3184",
+  "signature": "topk_weights:positional:torch.Tensor, topk_indices:positional:torch.Tensor, gating_output:positional:torch.Tensor, correction_bias:positional:torch.Tensor | None=None, need_renorm:positional:bool=True, routed_scaling_factor:positional:float=1.0, score_func:positional:str='sqrtsoftplus', num_shared_experts:positional:int=0, num_valid_rows:positional:torch.Tensor | None=None, -> None",
+  "source": "aiter/ops/topk.py",
+  "supersedes": [],
+  "version": 1
  }
 }
