@@ -465,7 +465,15 @@ def rmsnorm2d_fwd(
     return _rms_norm_fwd_dispatch(input, weight, epsilon, use_model_sensitive_rmsnorm)
 
 
-@_route(op="rmsnorm_with_add", version=1)
+def _rmsnorm_with_add_fake(*args, **kwargs) -> None:
+    """Every result of this op is one of its in-place writes -- ``out`` and
+    ``residual_out`` -- so a trace of it produces nothing. The fake is what
+    lets `route` register the op, which keeps the plugin's dispatch out of a
+    caller's compiled graph."""
+    return
+
+
+@_route(op="rmsnorm_with_add", version=1, fake=_rmsnorm_with_add_fake)
 @torch_compile_guard(
     mutates_args=["out", "residual_out"], gen_fake=lambda *a, **k: None
 )

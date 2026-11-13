@@ -146,6 +146,7 @@ def flydsl_grouped_gemm_a8w4_masked(
     a_scale_row_stride_bytes=0,
     persistent_workers=0,
     rolled_drain=0,
+    gemm_stage=None,
     m_align=0,
     k_waves=1,
 ):
@@ -215,8 +216,10 @@ def flydsl_grouped_gemm_a8w4_masked(
         out_dtype = fx.Uint8
     n_tiles = (N + tile_n - 1) // tile_n
     cluster_n = _select_cluster_n(n_tiles, cluster_n)
-    cluster_m = _select_cluster_m(cluster_m, cluster_n, stage1_act)
-    stage = 1 if stage1_act else 2
+    stage = (1 if stage1_act else 2) if gemm_stage is None else gemm_stage
+    if stage not in (1, 2):
+        raise ValueError("gemm_stage must be 1 or 2")
+    cluster_m = _select_cluster_m(cluster_m, cluster_n, stage == 1)
     persistent_workers = int(
         os.environ.get(
             f"AITER_FLYDSL_PERSISTENT_WORKERS{stage}",
