@@ -784,13 +784,14 @@ def bigm_lds(RG, NAB, I):
 
 
 def build_bigm_unit(
-    H, I, TOPK, RG, NAB, BST, BS2, act, swiglu_limit, R8, situ=(1.0, 1.0)
+    H, I, TOPK, RG, NAB, BST, BS2, act, swiglu_limit, R8, situ=(1.0, 1.0), raux=0
 ):
     """The fused unit device function: unit_body(L, tid, e, r0, rows, rr, rwt, rx, rxs, w1,
     w2, rws1, rws2, r_routes, oob): rows rr / rwt[r0 : r0 + rows] (route index, weight) of expert
     e -> route rows wt * GEMM2(act(GEMM1(A[route // TOPK]))) stored at route * H (bf16).
     R8: route rows as MXFP8 (e4m3 + one e8m0 scale per 32 columns): codes [rows][H] at r_routes,
     scales [rows][H / 32] after them (at oob / 2: oob = the route count * H * 2).
+    raux: the route rows' store cache policy (AUX_SYS: write-through).
     Returns (LDS layout, unit_body)."""
     assert RG % 16 == 0 and RG <= 128 and H % 256 == 0 and I % 128 == 0
     MTE = RG // 16  # 16-row tiles (every wave computes every row of the unit)
@@ -946,6 +947,29 @@ def build_bigm_unit(
             b.append(fx.Int32(bld(rws1, vso, su, T.i32)))
             return b
 
+        def g1_step(acc, bq, c, k, cur, nbuf, nk):
+            # k-step k of chunk c (compile time) from the fragments cur = (A tiles, scales)
+            # read during the previous step; the next step's (buffer nbuf, k-step nk) read
+            # here, one tile's after each tile's MFMAs (the LDS reads under the MFMAs)
+            sgw, suw = bq[4 * KCK], bq[4 * KCK + 1]
+            kp = (c * KCK + k) % 2  # the global k-step's half of the scale word
+            sc = [
+                (x >> i32(8 * (kp * 2 + h))) & i32(0xFF)
+                for x in (sgw, suw)
+                for h in (0, 1)
+            ]
+            afs, sas = cur
+            nafs, nsas = [], []
+            for m in range_constexpr(MTE):
+                for t in range_constexpr(4):
+                    j = (t // 2) * 2 * MTE + m * 2 + t % 2
+                    acc[j] = mfma(bq[k * 4 + t], afs[m], acc[j], sc[t], sas[m])
+                nafs.append(a_frag_m(nbuf, m, nk))
+                nsas.append(a_scale_m(nbuf, m, nk))
+                rocdl.sched_mfma(4)
+                rocdl.sched_dsrd(2)
+            return acc, (nafs, nsas)
+
         def g1_chunk(acc, bq, buf, c):
             # c: the chunk (compile time)
             sgw, suw = bq[4 * KCK], bq[4 * KCK + 1]
@@ -1013,7 +1037,20 @@ def build_bigm_unit(
             else:
                 for _ in range_constexpr(NA):
                     bld(rx, lane * i32(16), 0, V4I)
-        init = [zero] * (4 * MTE) + [v for b in bpre for v in b]
+        # software pipelined: each k-step's MFMAs interleaved with the next k-step's A tile /
+        # scale reads; a chunk's refill and the barrier of the next chunk's A (every wave's DMA
+        # landed) before its last k-step, so that step reads the next chunk's first tiles (the
+        # next pass's at the end of a pass: the A ring runs on over the passes)
+        rocdl.sched_barrier(0)
+        wait_vm(WAIT1)
+        gpu.barrier()
+        rocdl.sched_barrier(0)
+        f0 = (
+            [a_frag_m(0, m, 0) for m in range(MTE)],
+            [a_scale_m(0, m, 0) for m in range(MTE)],
+        )
+        NFR = 2 * MTE
+        init = [zero] * (4 * MTE) + [v for b in bpre for v in b] + f0[0] + f0[1]
         phi = i32(PASSES)
         for p_, stt in range(i32(0), phi, i32(1), init=init):
             p = i32(p_)
@@ -1021,26 +1058,37 @@ def build_bigm_unit(
             ring = [
                 list(stt[4 * MTE + s * NB : 4 * MTE + (s + 1) * NB]) for s in range(BST)
             ]
+            fo = 4 * MTE + BST * NB
+            cur = (list(stt[fo : fo + MTE]), list(stt[fo + MTE : fo + NFR]))
             for c in range_constexpr(KCH):
-                rocdl.sched_barrier(0)
-                wait_vm(WAIT1)
-                gpu.barrier()
-                # nothing crosses the chunk barrier: the A ring reads after every wave's DMA landed
-                # (else the scheduler may hoist them above s_barrier: a race)
-                rocdl.sched_barrier(0)
-                acc = g1_chunk(acc, ring[c % BST], c % NAB, c)
-                # refill: B of step c + BST (next pass past the end; the last pass
-                # reloads its own chunks: harmless, keeps the counts static)
-                cn = c + BST
-                pn = p + i32(cn // KCH)
-                pn = (pn < phi).select(pn, phi - i32(1))
-                ring[cn % BST] = issue_b(pn, i32(cn % KCH))
-                issue_a(i32((c + NAB - 1) % KCH), (c + NAB - 1) % NAB)
+                bq = ring[c % BST]
+                for k in range_constexpr(KCK):
+                    if const_expr(k == KCK - 1):
+                        # refill: B of step c + BST (next pass past the end; the last pass
+                        # reloads its own chunks: harmless, keeps the counts static)
+                        cn = c + BST
+                        pn = p + i32(cn // KCH)
+                        pn = (pn < phi).select(pn, phi - i32(1))
+                        ring[cn % BST] = issue_b(pn, i32(cn % KCH))
+                        issue_a(i32((c + NAB - 1) % KCH), (c + NAB - 1) % NAB)
+                        # the next chunk's A in every wave's LDS (nothing crosses the barrier:
+                        # else the scheduler may hoist its reads above s_barrier: a race)
+                        rocdl.sched_barrier(0)
+                        wait_vm(WAIT1)
+                        gpu.barrier()
+                        rocdl.sched_barrier(0)
+                        nbuf, nk = (c + 1) % NAB, 0
+                    else:
+                        nbuf, nk = c % NAB, k + 1
+                    acc, cur = g1_step(acc, bq, c, k, cur, nbuf, nk)
             act_store(acc, p)
             # (the yield's value binding is FlyDSL's loop-carried form)
-            res = yield [zero] * (4 * MTE) + [  # noqa: F841
-                v for s in range(BST) for v in ring[s]
-            ]
+            res = yield (  # noqa: F841
+                [zero] * (4 * MTE)
+                + [v for s in range(BST) for v in ring[s]]
+                + cur[0]
+                + cur[1]
+            )
         wait_vm(0)
         wait_lgkm0()  # the intermediate's LDS writes land before other waves read them
         gpu.barrier()
@@ -1091,6 +1139,19 @@ def build_bigm_unit(
                     lds_ld_i32(L, i32(LRIX) + Rc * i32(4)),
                 )
             )
+        # bf16 route rows through a per-wave LDS staging tile ([RG][64] bf16 in the A ring,
+        # idle in GEMM2): each store then writes 8 rows x a whole 128 B row segment (16 rows x
+        # 64 B halves straight from the MFMA layout cost ~20% of GEMM2 at Kimi K3.1)
+        STG = not R8 and NAB * RBA * RG >= NW * RG * 128
+        if const_expr(STG):
+            stg = i32(LA) + w * i32(RG * 128)
+            row_meta2 = []
+            for j in range_constexpr(RG // 8):
+                R = i32(j * 8) + lane // i32(8)
+                ok = R < rows
+                row_meta2.append(
+                    (ok, lds_ld_i32(L, i32(LRIX) + ok.select(R, i32(0)) * i32(4)))
+                )
 
         def epi2(acc, gi):
             # route rows of group gi (rows past the unit's: stores dropped, counts kept)
@@ -1124,10 +1185,47 @@ def build_bigm_unit(
                         r_routes,
                         ok.select(rix * i32(H) + n0 + q4 * i32(16), oob),
                         0,
-                        0,
+                        raux,
                     )
                     soff = oob // i32(2) + rix * i32(H // 32) + n0 // i32(32)
-                    bst(sc, r_routes, (ok & (q4 == i32(0))).select(soff, oob), 0, 0)
+                    bst(sc, r_routes, (ok & (q4 == i32(0))).select(soff, oob), 0, raux)
+            elif const_expr(STG):
+                # [row][8 x 16 B column chunks], chunk c at (c ^ (row & 7)) (no bank conflicts)
+                for m in range_constexpr(MTE):
+                    ok, wt, rix = row_meta[m]
+                    row = i32(m * 16) + lane % i32(16)
+                    for t in range_constexpr(4):
+                        av = fx.Vector(acc[m * 4 + t])
+                        v2 = fx.Vector.from_elements(
+                            [
+                                pack_bf16x2(
+                                    fx.Float32(av[2 * h]) * wt,
+                                    fx.Float32(av[2 * h + 1]) * wt,
+                                )
+                                for h in range(2)
+                            ],
+                            fx.Int32,
+                        )
+                        c = i32(t * 2) + q4 // i32(2)
+                        off = row * i32(128) + (c ^ (row & i32(7))) * i32(16)
+                        lds_st(L, stg + off + (q4 % i32(2)) * i32(8), v2, align=8)
+                c = lane % i32(8)
+                for j in range_constexpr(RG // 8):
+                    ok, rix = row_meta2[j]
+                    row = i32(j * 8) + lane // i32(8)
+                    v = lds_ld(
+                        L,
+                        stg + row * i32(128) + (c ^ (row & i32(7))) * i32(16),
+                        V4I,
+                        16,
+                    )
+                    bst(
+                        v,
+                        r_routes,
+                        ok.select((rix * i32(H) + n0 + c * i32(8)) * i32(2), oob),
+                        0,
+                        raux,
+                    )
             else:
                 for m in range_constexpr(MTE):
                     ok, wt, rix = row_meta[m]
@@ -1157,7 +1255,7 @@ def build_bigm_unit(
                             r_routes,
                             ok.select((rix * i32(H) + col) * i32(2), oob),
                             0,
-                            0,
+                            raux,
                         )
 
         # prologue = the steady issue order of the BS2 steps before (0, 0): their B2 loads,
