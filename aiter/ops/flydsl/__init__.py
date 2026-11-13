@@ -30,6 +30,7 @@ if _base_version < _MIN_FLYDSL_VERSION:
     )
 
 _LAZY_IMPORTS = {
+    "flydsl_gemm_a16w16_tdm": (".gemm_a16w16_tdm", "gemm_a16w16_tdm"),
     "FP8_MQA_LOGITS_DEFAULT_VARIANT": (
         ".fp8_mqa_logits_kernels",
         "DEFAULT_VARIANT",
@@ -38,9 +39,12 @@ _LAZY_IMPORTS = {
         ".fp8_mqa_logits_kernels",
         "KERNEL_VARIANTS",
     ),
+    "FlyQuickAllReduce": (".quick_allreduce", "FlyQuickAllReduce"),
+    # Old name of FlyQuickAllReduce, kept for vLLM's _aiter_ops.py. Remove it
+    # once vLLM imports FlyQuickAllReduce.
+    "QuickAllReduceInt4": (".quick_allreduce", "FlyQuickAllReduce"),
     "OneShotAllReduce": (".one_shot_allreduce", "OneShotAllReduce"),
     "DenseGemmConfig": (".gemm_a16wfp4", "DenseGemmConfig"),
-    "QuickAllReduceInt4": (".quick_allreduce_int4", "QuickAllReduceInt4"),
     "PreshuffledA16WFP4Weight": (
         ".gemm_a16wfp4",
         "PreshuffledA16WFP4Weight",
@@ -127,6 +131,11 @@ _LAZY_IMPORTS = {
         ".kernels.qk_norm_rope_quant",
         "flydsl_qk_norm_rope_quant",
     ),
+    "CombineWorkspace": (".dcp_mailbox", "CombineWorkspace"),
+    "GatherWorkspace": (".dcp_mailbox", "GatherWorkspace"),
+    "dcp_lse_combine": (".dcp_mailbox", "dcp_lse_combine"),
+    "dcp_quant_query_gather": (".dcp_mailbox", "dcp_quant_query_gather"),
+    "dcp_query_gather": (".dcp_mailbox", "dcp_query_gather"),
     "gather_kv_b_proj_flydsl": (
         ".gather_kv_b_proj",
         "gather_kv_b_proj_flydsl",
@@ -196,14 +205,20 @@ _LAZY_IMPORTS = {
 __all__ = [
     "FP8_MQA_LOGITS_DEFAULT_VARIANT",
     "FP8_MQA_LOGITS_VARIANTS",
+    "CombineWorkspace",
     "DenseGemmConfig",
+    "FlyQuickAllReduce",
     "Fp4MqaPlan",
     "GateMode",
+    "GatherWorkspace",
     "OneShotAllReduce",
     "PreshuffledA16WFP4Weight",
     "QuickAllReduceInt4",
     "a16wfp4_shape_supported",
     "compute_varqlen_windows",
+    "dcp_lse_combine",
+    "dcp_quant_query_gather",
+    "dcp_query_gather",
     "flydsl_conv_implicit",
     "flydsl_flash_attn_fp8_func",
     "flydsl_flash_attn_fp8_supported",
