@@ -25,9 +25,14 @@ Lamport results must match an fp32 rank-order sum bit for bit ("err" is the
 mismatching fraction, 0 expected); "orig err" is checkAllclose's at bf16
 tolerance. Every case also injects the 0xffff sentinel bit pattern on one rank,
 which must not hang and must come out as NaN.
+
+Each case logs one PASS / FAIL line, judged on the worst rank, and the run
+fails if any case does. The ranks log only warnings and errors unless
+AITER_LOG_LEVEL is set.
 """
 
 import argparse
+import logging
 import os
 from multiprocessing import Pool, freeze_support, set_start_method
 
@@ -66,6 +71,8 @@ CAPTURE_PATHS = ["registered", "copy_in"]
 SENTINEL = -1  # 0xffff as int16
 CALLS_PER_GRAPH = 10
 GRAPH_REPLAYS = 20
+# checkAllclose's default tol_err_ratio: the mismatch fraction it still accepts
+ALLCLOSE_TOL = 0.05
 
 
 def oneShotMaxBytes():
@@ -136,6 +143,18 @@ def bitErr(out, ref):
         return 1.0
     bad = out[~nan_mask].view(torch.int16) != ref[~nan_mask].view(torch.int16)
     return bad.sum().item() / max(bad.numel(), 1)
+
+
+class GraphKeeper(list):
+    """The (graph, out) pairs timeGraph keeps alive, with a short repr.
+
+    @benchmark formats every argument of testLamportAllReduce, even when the
+    log level drops the message. A plain list would format every output tensor
+    captured so far, on every call and every rank.
+    """
+
+    def __repr__(self):
+        return f"<{len(self)} captured graphs>"
 
 
 def timeGraph(fn, graphs):
@@ -274,7 +293,30 @@ def checkUnalignedInput(ca, tp, rank, dtype):
     return max(errs)
 
 
+def caseErrors(row):
+    """The failing err columns of one summary row, as {column: err}.
+
+    Lamport kernels must be bitwise exact (0). "orig err", and "lamport err"
+    where the dispatch is not lamport (kernel "orig"), are checkAllclose ratios.
+    Empty cells are candidates that do not run on that case.
+    """
+    bad = {}
+    for col, err in row.items():
+        if not col.endswith(" err") or pd.isna(err):
+            continue
+        allclose = col == "orig err" or (
+            col == "lamport err" and row["kernel"] == "orig"
+        )
+        if err > (ALLCLOSE_TOL if allclose else 0):
+            bad[col] = err
+    return bad
+
+
 def worker(tp, rank, shapes, dtype, lamport, init_method):
+    # @benchmark logs every call's arguments at INFO, on every rank; main()
+    # logs one line per case instead
+    if "AITER_LOG_LEVEL" not in os.environ:
+        aiter.logger.setLevel(logging.WARNING)
     if lamport:
         os.environ.pop(DISABLE_LAMPORT_ENV, None)
     else:
@@ -292,7 +334,7 @@ def worker(tp, rank, shapes, dtype, lamport, init_method):
 
     resize_err = checkSizeChanges(ca, tp, rank, dtype) if lamport else None
     unaligned_err = checkUnalignedInput(ca, tp, rank, dtype) if lamport else None
-    graphs = []
+    graphs = GraphKeeper()
     rows = []
     for path in CAPTURE_PATHS:
         # copy_in: a host opt-out of the registered capture path
@@ -405,6 +447,7 @@ def main():
     args = parser.parse_args()
 
     keys = ["tp", "m", "n", "dtype", "path"]
+    failed = []
     for dtype in args.dtype:
         df = []
         for tp in args.tp:
@@ -423,8 +466,24 @@ def main():
         df["KB"] = df["m"] * df["n"] * dtype.itemsize // 1024
         lead = keys + ["KB", "gfx", "kernel"]
         df = df[lead + [c for c in df.columns if c not in lead]]
+        for row in df.to_dict("records"):
+            case = (
+                f"tp{row['tp']} {str(dtype).removeprefix('torch.')} "
+                f"{row['m']}x{row['n']} ({row['KB']} KB) {row['path']} "
+                f"kernel={row['kernel']}"
+            )
+            bad = caseErrors(row)
+            if bad:
+                failed.append(f"{case}: {bad}")
+                aiter.logger.error("FAIL %s: %s", case, bad)
+            else:
+                aiter.logger.info("PASS %s", case)
         aiter.logger.info(
             "lamport all-reduce summary (markdown):\n%s", df.to_markdown(index=False)
+        )
+    if failed:
+        raise AssertionError(
+            f"{len(failed)} lamport all-reduce case(s) failed:\n" + "\n".join(failed)
         )
 
 
