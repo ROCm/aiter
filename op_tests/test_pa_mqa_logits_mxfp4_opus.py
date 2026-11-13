@@ -5,21 +5,30 @@
 correctness.
 
     python3 op_tests/test_pa_mqa_logits_mxfp4_opus.py                    # every table
-    python3 op_tests/test_pa_mqa_logits_mxfp4_opus.py --modes decode -m v41 -b 1 64 --mtp 6
+    python3 op_tests/test_pa_mqa_logits_mxfp4_opus.py --modes decode -m v41-full -b 1 64 --mtp 6
     python3 op_tests/test_pa_mqa_logits_mxfp4_opus.py --modes semantics --checks edges graph
+    python3 op_tests/test_pa_mqa_logits_mxfp4_opus.py --all-kernels --modes decode -m v4 -b 64
 
 Models (``-m``): ``v4`` (DeepSeek-V4, 64 index heads, compression ratio 4, 64-row pages, one a
-table entry), ``v41`` (V4.1 full layers, 32 heads, 8-row pages, a table entry a 128-token PAGE
-of them, ratio ``--ratio``) and ``cand`` (V4.1 candidate layers: every row its own sequence and
+table entry), ``v41-full`` (V4.1 full layers, 32 heads, 8-row pages, a table entry a 128-token PAGE
+of them, ratio ``--ratio``) and ``v41-cand`` (V4.1 candidate layers: every row its own sequence and
 its own table of 8-row pages).
 
-``decode`` / ``prefill``: every registered instance that takes the model, in every schedule mode it
-compiles (``table``: a schedule built once outside the timing, as V4 builds one a forward;
-``internal``: no schedule, built in the call; ``free`` / ``prefill``: schedule-free, the in-kernel
-assignment timed), against an f64-GEMM reference on sampled rows; ``default`` names the
-config's own choice. Prefill shapes are 16384 rows (ATOM's batched-token budget).
+Every table calls the public API as the model does: ``mqa_logits_mxfp4_config`` from the call's
+bounds alone, so the op picks the kernel instance and schedule mode, and a schedule only where the
+model builds one -- V4 decode, one a forward that its indexer layers share, built outside the
+timing; prefill and V4.1 build none. ``--all-kernels`` (kernel development) runs every registered
+instance that takes the case instead, in every schedule mode it compiles.
 
-``semantics`` (``--checks``), each against the reference on every instance and mode:
+``decode`` / ``prefill``: ``us`` / ``TFLOPS`` / ``TB/s``, and ``err`` against an f64-GEMM reference
+on sampled rows. Prefill shapes are 16384 rows (ATOM's batched-token budget). With
+``--all-kernels``, those columns per ``<instance>:<mode>`` (``table``: a schedule built once
+outside the timing; ``internal``: no schedule, built in the call; ``free`` / ``prefill``:
+schedule-free, the in-kernel assignment timed), ``default`` naming the config's own choice.
+Each table is also printed as one JSON line, which benchmark drivers collect.
+
+``semantics`` (``--checks``), each against the reference (with ``--all-kernels``, on every instance
+and mode, every mode bit for bit its instance's ``table``):
   rows     every row of small shapes, NaN where an E8M0 is 0xFF, nothing written outside a
            window, past ``out``'s guard bands or to an input; the flat out (``out_offsets``)
            equal to the plane bit for bit
@@ -68,8 +77,10 @@ CANDIDATE_BLOCKS = 2048
 TILE = 64
 PREFILL_ROWS = 16384
 SAMPLE_ROWS = 16  # rows checked against the reference in a perf shape
+# --all-kernels: every instance x schedule mode, not the API's own choice
+ALL_KERNELS = False
 REL_TOL = 1e-5  # of the largest finite |logit|; a misrouted E8M0 moves cells by 2x
-MODEL_HEADS = {"v4": 64, "v41": 32, "cand": 32}
+MODEL_HEADS = {"v4": 64, "v41-full": 32, "v41-cand": 32}
 
 _E2M1_MAGNITUDES = (0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0)
 E2M1 = _E2M1_MAGNITUDES + tuple(
@@ -410,17 +421,30 @@ def launch_scheduled(case: Case, cfg, out, schedule):
     return launch(case, cfg, out, schedule=schedule)
 
 
+def builds_schedule(case: Case):
+    """Whether the model passes a schedule: V4 decode builds one a forward, which its 30 indexer
+    layers share; prefill and V4.1 (three full or four candidate layers) build none."""
+    return case.heads == MODEL_HEADS["v4"] and case.rows.max_qlen <= M._DECODE_MAX_QLEN
+
+
 def ways(case: Case):
-    """{name: (cfg, build a schedule?)}: every registered instance that takes the case, in every
-    mode it compiles -- Table from a schedule, Table from the internal schedule (an instance
-    without a schedule-free mode), Free, Prefill."""
+    """{name: (cfg, build a schedule?)}: the public API as the model calls it (``api``: the config
+    from the bounds alone, a schedule where the model builds one), or with --all-kernels every
+    registered instance that takes the case, in every mode it compiles -- Table from a schedule,
+    Table from the internal schedule (an instance without a schedule-free mode), Free, Prefill.
+    Empty when no instance takes the case."""
     entry_rows = case.page_size * case.pages_per_block
     out = {}
     if not takes(case):
         return out
-    for inst in M._instances(torch.device("cuda", torch.cuda.current_device())):
-        if inst.heads != case.heads or not inst.reads(entry_rows):
-            continue
+    insts = [
+        inst
+        for inst in M._instances(torch.device("cuda", torch.cuda.current_device()))
+        if inst.heads == case.heads and inst.reads(entry_rows)
+    ]
+    if not ALL_KERNELS:
+        return {"api": (config(case), builds_schedule(case))} if insts else out
+    for inst in insts:
         cfg = config(case, _instance=inst.id, _mode="table")
         out[f"{inst.name}:table"] = (cfg, True)
         modes = [m for m in ("free", "prefill") if inst.has(M._MODE_NAMES[m])]
@@ -478,7 +502,7 @@ def row_errors(got, ref):
 
 # == decode / prefill: perf of every way, checked on sampled rows ===================================
 def model_rows(model, ratio, label, ctx, rows_per_seq):
-    if model == "cand":
+    if model == "v41-cand":
         return candidate_layer(label, ctx, rows_per_seq)
     return full_layer(label, ctx, rows_per_seq, 4 if model == "v4" else ratio)
 
@@ -509,11 +533,15 @@ def run_ways(model, rows: Rows):
         keys * (D // 2 + D // 32) + n * heads * (D // 2 + D // 32 + 2) + row_keys * 4
     )
 
-    ret = {"gfx": get_gfx(), "rows": n, "default": default_way(case)}
+    ret = {"gfx": get_gfx(), "rows": n}
+    if ALL_KERNELS:
+        ret["default"] = default_way(case)
+    else:
+        ret["schedule"] = builds_schedule(case)
     # Preallocated, as the model passes it.
     out = torch.empty(n, rows.width, dtype=torch.float32)
     for name, (cfg, build) in ways(case).items():
-        # V4 builds the schedule once a forward, outside the layers.
+        # Built once a forward, outside the layers (and the timing), as V4 does.
         schedule = schedule_for(cfg, case, build)
         out.fill_(float("-inf"))
         # Positional, so run_perftest's per-rotation deepcopy of the arguments keeps the schedule
@@ -529,10 +557,11 @@ def run_ways(model, rows: Rows):
         if not all(bool(torch.isneginf(t).all()) for t in tails):
             aiter.logger.error("%s %s: wrote past a row's window", rows.label, name)
             err = 1.0
-        ret[f"{name} us"] = us
-        ret[f"{name} TFLOPS"] = flops / us / 1e6
-        ret[f"{name} TB/s"] = nbytes / us / 1e6
-        ret[f"{name} err"] = err
+        col = f"{name} " if ALL_KERNELS else ""
+        ret[f"{col}us"] = us
+        ret[f"{col}TFLOPS"] = flops / us / 1e6
+        ret[f"{col}TB/s"] = nbytes / us / 1e6
+        ret[f"{col}err"] = err
     return ret
 
 
@@ -585,51 +614,64 @@ def rows_shapes(model):
             if rows.pages_per_block * PAGE_ROWS == TILE:
                 out.append((rows, False, nan))
         return out
-    if model == "v41":
+    if model == "v41-full":
         return [
             (rows, False, nan)
             for rows, nan in [
                 (
-                    full_layer("v41 dec r2 ragged", [2048, 1500, 777], [6, 4, 1], 2),
-                    False,
-                ),
-                (
                     full_layer(
-                        "v41 dec r1 mtp1", [3000, 2048, 777, 70], [1, 1, 1, 1], 1
-                    ),
-                    False,
-                ),
-                (full_layer("v41 dec r1", [3000, 2048], [6, 6], 1), False),
-                (
-                    full_layer(
-                        "v41 dec r2 tiers", [2048, 1500, 777, 3000], [2, 3, 4, 8], 2
+                        "v41-full dec r2 ragged", [2048, 1500, 777], [6, 4, 1], 2
                     ),
                     False,
                 ),
                 (
                     full_layer(
-                        "v41 dec r2 258 seqs", [512] * 258, [4] * 256 + [2, 6], 2
+                        "v41-full dec r1 mtp1", [3000, 2048, 777, 70], [1, 1, 1, 1], 1
                     ),
                     False,
                 ),
-                (full_layer("v41 dec r1 short", [70], [6], 1), False),
-                (full_layer("v41 pre r2 fresh 300", [300], [300], 2), False),
-                (full_layer("v41 pre r1 chunk 200@1000", [1200], [200], 1), False),
-                (full_layer("v41 mixed r1", [5000, 100, 2600], [6, 37, 1], 1), False),
-                (full_layer("v41 nan dec r2", [2048, 1500, 777], [6, 4, 1], 2), True),
-                (full_layer("v41 nan pre r1 200@1000", [1200], [200], 1), True),
+                (full_layer("v41-full dec r1", [3000, 2048], [6, 6], 1), False),
+                (
+                    full_layer(
+                        "v41-full dec r2 tiers",
+                        [2048, 1500, 777, 3000],
+                        [2, 3, 4, 8],
+                        2,
+                    ),
+                    False,
+                ),
+                (
+                    full_layer(
+                        "v41-full dec r2 258 seqs", [512] * 258, [4] * 256 + [2, 6], 2
+                    ),
+                    False,
+                ),
+                (full_layer("v41-full dec r1 short", [70], [6], 1), False),
+                (full_layer("v41-full pre r2 fresh 300", [300], [300], 2), False),
+                (full_layer("v41-full pre r1 chunk 200@1000", [1200], [200], 1), False),
+                (
+                    full_layer("v41-full mixed r1", [5000, 100, 2600], [6, 37, 1], 1),
+                    False,
+                ),
+                (
+                    full_layer("v41-full nan dec r2", [2048, 1500, 777], [6, 4, 1], 2),
+                    True,
+                ),
+                (full_layer("v41-full nan pre r1 200@1000", [1200], [200], 1), True),
             ]
         ]
     return [
         (rows, False, nan)
         for rows, nan in [
-            (candidate_layer("cand bs2 ctx20K", [20000, 17000], [6, 6]), False),
-            (candidate_layer("cand short 3K", [3000], [6]), False),
+            (candidate_layer("v41-cand bs2 ctx20K", [20000, 17000], [6, 6]), False),
+            (candidate_layer("v41-cand short 3K", [3000], [6]), False),
             (
-                candidate_layer("cand ragged 40K", [40000, 18000, 70000], [6, 2, 1]),
+                candidate_layer(
+                    "v41-cand ragged 40K", [40000, 18000, 70000], [6, 2, 1]
+                ),
                 False,
             ),
-            (candidate_layer("cand nan bs2", [20000, 17000], [6, 6]), True),
+            (candidate_layer("v41-cand nan bs2", [20000, 17000], [6, 6]), True),
         ]
     ]
 
@@ -692,10 +734,10 @@ def check_rows(model):
                 bad.append("out's guard bands written")
             if flat is not None and not bool(torch.isnan(flat[total:]).all()):
                 bad.append("the flat out's guard written")
-            inst, mode = name.split(":")
+            inst, _, mode = name.partition(":")
             if mode == "table":
                 table_out[inst] = out.clone()
-            elif not torch.equal(
+            elif inst in table_out and not torch.equal(
                 out.view(torch.int32), table_out[inst].view(torch.int32)
             ):
                 bad.append(f"differs from {inst}:table bit for bit")
@@ -710,8 +752,8 @@ def edge_case(model):
     what it carries. Two rows a full-layer sequence, so the multi-row instances take it too.
     """
     heads, n = MODEL_HEADS[model], 9
-    if model == "cand":
-        rows = candidate_layer("cand edges", [3000] * n, [1] * n)
+    if model == "v41-cand":
+        rows = candidate_layer("v41-cand edges", [3000] * n, [1] * n)
     else:
         rows = full_layer(
             f"{model} edges", [3000] * n, [2] * n, 4 if model == "v4" else 2
@@ -786,8 +828,8 @@ def check_edges(model):
 
 
 def band_rows(model):
-    if model == "cand":
-        return candidate_layer("cand bands", [20000, 17000, 9000], [6, 6, 6])
+    if model == "v41-cand":
+        return candidate_layer("v41-cand bands", [20000, 17000, 9000], [6, 6, 6])
     return full_layer(
         f"{model} bands", [3000, 1700, 2600], [300, 180, 260], 4 if model == "v4" else 2
     )
@@ -828,8 +870,8 @@ def check_bands(model, band=97):
 def check_padding(model, pad_rows=7):
     """Rows past query_start_loc[-1] (a CUDAGraph bucket's padding, with garbage windows) and empty
     sequences around every real one: the padding untouched, every real row right."""
-    if model == "cand":
-        real = candidate_layer("cand padding", [9000, 5000, 7000], [6, 6, 6])
+    if model == "v41-cand":
+        real = candidate_layer("v41-cand padding", [9000, 5000, 7000], [6, 6, 6])
     else:
         real = full_layer(
             f"{model} padding", [3000, 2000, 2600], [4, 2, 3], 4 if model == "v4" else 2
@@ -880,13 +922,13 @@ def check_pool(model, straddle=1 << 20):
     if model == "v4":
         real = full_layer("v4 pool", [9000, 1500, 777], [4, 3, 1], 4)
         shapes = [(real, True), (real, False)]
-    elif model == "v41":
+    elif model == "v41-full":
         shapes = [
-            (full_layer("v41 pool r2", [2048, 1500, 777], [6, 4, 1], 2), False),
-            (full_layer("v41 pool r1", [3000, 2048], [6, 6], 1), False),
+            (full_layer("v41-full pool r2", [2048, 1500, 777], [6, 4, 1], 2), False),
+            (full_layer("v41-full pool r1", [3000, 2048], [6, 6], 1), False),
         ]
     else:
-        shapes = [(candidate_layer("cand pool", [20000, 17000], [6, 6]), False)]
+        shapes = [(candidate_layer("v41-cand pool", [20000, 17000], [6, 6]), False)]
     results = []
     for rows, page64 in shapes:
         case = make_case(rows, MODEL_HEADS[model], page64=page64)
@@ -934,8 +976,8 @@ def check_pool(model, straddle=1 << 20):
 def check_graph(model):
     """Schedule + launch captured once, replayed on new contents of the same tensors (new q, new
     and shorter windows) == the same call made eagerly."""
-    if model == "cand":
-        rows = candidate_layer("cand graph", [20000, 17000], [6, 6])
+    if model == "v41-cand":
+        rows = candidate_layer("v41-cand graph", [20000, 17000], [6, 6])
     else:
         rows = full_layer(
             f"{model} graph", [9000, 1500, 777], [4, 3, 1], 4 if model == "v4" else 2
@@ -1130,16 +1172,16 @@ def main():
         "-m",
         "--model",
         nargs="*",
-        default=["v4", "v41", "cand"],
+        default=list(MODEL_HEADS),
         choices=list(MODEL_HEADS),
-        help="v4 (64 heads), v41 / cand (32 heads)",
+        help="v4 (64 heads), v41-full / v41-cand (32 heads)",
     )
     parser.add_argument(
         "--ratio",
         type=int,
         nargs="*",
         default=[2, 1],
-        help="V4.1 full layers' compression ratio (V4 is 4; cand ignores it)",
+        help="v41-full: the compression ratio (v4 is 4; v41-cand ignores it)",
     )
     parser.add_argument(
         "-b",
@@ -1179,10 +1221,16 @@ def main():
         choices=list(SEMANTIC_CHECKS),
         help="semantics: which checks",
     )
+    parser.add_argument(
+        "--all-kernels",
+        action="store_true",
+        help="kernel development: every registered instance x schedule mode, not the API's choice",
+    )
     args = parser.parse_args()
+    globals()["ALL_KERNELS"] = args.all_kernels
 
     def ratios(model):
-        return [4] if model == "v4" else [1] if model == "cand" else args.ratio
+        return [4] if model == "v4" else [1] if model == "v41-cand" else args.ratio
 
     failed = False
     for model in args.model:
@@ -1196,7 +1244,7 @@ def main():
                     )
                 ],
             )
-            failed |= bool((df.filter(like=" err") > 0).any().any())
+            failed |= bool((df.filter(regex=r"(^| )err$") > 0).any().any())
         if "prefill" in args.modes:
             df = summarize(
                 f"mqa_logits_mxfp4 {model} prefill",
@@ -1207,7 +1255,7 @@ def main():
                     )
                 ],
             )
-            failed |= bool((df.filter(like=" err") > 0).any().any())
+            failed |= bool((df.filter(regex=r"(^| )err$") > 0).any().any())
     if "semantics" in args.modes:
         df = summarize(
             "mqa_logits_mxfp4 semantics",
