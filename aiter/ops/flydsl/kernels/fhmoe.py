@@ -44,6 +44,7 @@ def compile_mixed_fhmoe_gemm1(
     v2_output_layout: bool = False,
     shared_expert_id: int,
     clamp_shared: bool = True,
+    shared_shallow: bool = False,
 ):
     """Compile a stage1 kernel with an FP8 shared expert."""
     if shared_expert_id != experts - 1:
@@ -80,6 +81,7 @@ def compile_mixed_fhmoe_gemm1(
         v2_output_layout=v2_output_layout,
         shared_expert_id=shared_expert_id,
         clamp_shared=clamp_shared,
+        shared_shallow=shared_shallow,
     )
 
 

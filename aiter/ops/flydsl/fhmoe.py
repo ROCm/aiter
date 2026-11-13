@@ -45,6 +45,7 @@ def compile_flydsl_fhmoe_stage1(
     v2_output_layout: bool = False,
     shared_expert_id: int = -1,
     clamp_shared: bool = True,
+    shared_shallow: bool = False,
 ):
     """Compile the heterogeneous stage1 kernel."""
     from .kernels.fhmoe import compile_mixed_fhmoe_gemm1
@@ -87,6 +88,7 @@ def compile_flydsl_fhmoe_stage1(
         v2_output_layout=v2_output_layout,
         shared_expert_id=shared_expert_id,
         clamp_shared=clamp_shared,
+        shared_shallow=shared_shallow,
     )
 
 
@@ -305,6 +307,7 @@ def flydsl_fhmoe_stage1(
     shared_w1_scale: torch.Tensor,
     shared_expert_id: int,
     clamp_shared: bool = True,
+    shared_shallow: bool = False,
 ):
     """Run stage1 with MXFP4/MXFP8 routed and separately stored FP8 shared weights."""
     if b_dtype == "fp8" and gate_mode != "interleave":
@@ -329,6 +332,7 @@ def flydsl_fhmoe_stage1(
         compile_flydsl_fhmoe_stage1,
         shared_expert_id=shared_expert_id,
         clamp_shared=clamp_shared,
+        shared_shallow=shared_shallow,
     )
     build_mx_args = functools.partial(
         _s1_args_fhmoe,

@@ -48,6 +48,7 @@ def _buffer_load_vec(
     elem_bytes,
     offset_in_bytes,
     cache_modifier=0,
+    soffset_bytes=None,
 ):
     """Load vec_elems elements via buffer_load dwordx[1,2,4] + bitcast."""
     elem_size = int(elem_bytes)
@@ -67,6 +68,7 @@ def _buffer_load_vec(
         vec_width=vec_width,
         dtype=T.i32,
         cache_modifier=cache_modifier,
+        soffset_bytes=soffset_bytes,
     )
     if vec_width == 1:
         i32_vec = fx.Vector.from_elements([i32_val], fx.Numeric.from_ir_type(T.i32))
