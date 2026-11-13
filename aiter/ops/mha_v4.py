@@ -354,6 +354,14 @@ _K_SMOOTH_SAMPLE_ROWS = 2048
 # Fewest keys kv_splits="auto" gives a split. A dense work-group spends ~8 us before its first key
 # and ~0.02 us per key at full occupancy, so a much shorter range is mostly overhead.
 _MHA_V4_MIN_KV_SPLIT_TOKENS = 512
+# The cost model kv_splits="auto" uses past half a wave, fit on MI355X BF16 (graph replay, 22
+# DiT shapes); its picks are within 1.1% of the best measured count on 50. A round with only
+# some CUs busy costs this floor of a full one plus its fill times the rest.
+_MHA_V4_PARTIAL_ROUND_FLOOR = 0.40
+# The merge per split and output row of one head, in keys of a work-group's KV loop.
+_MHA_V4_MERGE_KEYS_PER_ROW = 0.00645
+# The merge unrolls over the count, and no measured shape gained past 6.
+_MHA_V4_MAX_AUTO_KV_SPLITS = 16
 
 
 def native_fp8_format() -> AttentionFormat:
@@ -2116,16 +2124,44 @@ def mha_v4_kv_splits(
     sequence with few heads leaves most CUs idle: [1, 4352, 3] fills 51 of MI355X's 256.
     The CU count is the device's own, so each SKU and partition mode gets its own split.
     Splitting the keys into n ranges folded into the batch multiplies the grid by n at the cost
-    of a merge pass. This takes the largest n that divides the key length, still fits the grid
-    in one wave and leaves each range at least _MHA_V4_MIN_KV_SPLIT_TOKENS keys; a grid that
-    already fills the GPU gets 1, since further splits only add work-groups and merge traffic.
-    Only with no such divisor, at batch 1 and when `ragged` (operands whose dense row takes
-    per-batch key lengths), does it take the largest n that fits and let the last range take
-    the remainder.
+    of a merge pass. A grid of at most half a wave takes the largest n that divides the key
+    length, still fits the grid in one wave and leaves each range at least
+    _MHA_V4_MIN_KV_SPLIT_TOKENS keys. Only with no such divisor, at batch 1 and when `ragged`
+    (operands whose dense row takes per-batch key lengths), does it take the largest n that fits
+    and let the last range take the remainder.
+
+    A larger grid ends on a partly busy round, which costs nearly a full one: [1, 21890, 3]
+    is 258 work-groups, two rounds for 1.01 rounds of work. Splitting shrinks that last round,
+    so these grids take the n with the least modelled time: rounds (the last one at
+    _MHA_V4_PARTIAL_ROUND_FLOOR plus its fill) times the keys of the longest range, plus the
+    merge. The same divisor and ragged rules decide which n are candidates.
     """
-    work_groups = batch * query_heads * -(-query_length // _MHA_V4_Q_TILE)
+    work_groups = max(batch * query_heads * -(-query_length // _MHA_V4_Q_TILE), 1)
     cus = torch.cuda.get_device_properties(device).multi_processor_count
-    most = min(cus // max(work_groups, 1), key_length // _MHA_V4_MIN_KV_SPLIT_TOKENS)
+    if 2 * work_groups > cus:
+        most = min(
+            _MHA_V4_MAX_AUTO_KV_SPLITS, key_length // _MHA_V4_MIN_KV_SPLIT_TOKENS
+        )
+        candidates = [
+            n
+            for n in range(1, max(most, 1) + 1)
+            if key_length % n == 0 or (ragged and batch == 1)
+        ]
+        rows = batch * query_length * query_heads
+
+        def cost(n):
+            rounds, tail = divmod(work_groups * n, cus)
+            if tail:
+                rounds += (
+                    _MHA_V4_PARTIAL_ROUND_FLOOR
+                    + (1 - _MHA_V4_PARTIAL_ROUND_FLOOR) * tail / cus
+                )
+            longest = key_length - (n - 1) * (key_length // n)
+            merge = _MHA_V4_MERGE_KEYS_PER_ROW * n * rows if n > 1 else 0.0
+            return rounds * longest + merge
+
+        return min(candidates, key=cost)
+    most = min(cus // work_groups, key_length // _MHA_V4_MIN_KV_SPLIT_TOKENS)
     for splits in range(most, 1, -1):
         if key_length % splits == 0:
             return splits
