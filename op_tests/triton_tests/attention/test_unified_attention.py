@@ -389,12 +389,9 @@ def ref_paged_attn(
 
 
 def _assert_request_rel_l2(output, ref_output, seq_lens, bound=2e-2):
-    """Bound each request's relative L2 error against the reference.
-
-    Long-KV outputs are small, so a fixed atol would pass all-zero rows.
-    gfx950 measures ~0.0025; one dropped 64-token KV tile gives ~0.06.
-    A zero-length request (a padded slot) must give zero rows.
-    """
+    """Bound each request's relative L2 error, and require zero rows for a
+    zero-length request. A fixed atol would pass the small rows of a long-KV
+    output, while one dropped 64-token KV tile gives ~0.06 against ~0.0025."""
     start = 0
     for q_len, kv_len in seq_lens:
         out_rows = output[start : start + q_len].float()
