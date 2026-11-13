@@ -271,6 +271,7 @@ def _packed_qk_width(q_format: AttentionFormat, head_dim: int) -> int:
 # (Q/K format, V format) pairs with a head-dim 256 object. All are dense-only.
 _HD256_QV = frozenset(
     {
+        (AttentionFormat.BF16, AttentionFormat.BF16),
         (AttentionFormat.MXFP4, AttentionFormat.MXFP4),
         (AttentionFormat.MXFP6, AttentionFormat.MXFP6),
     }
@@ -292,8 +293,8 @@ def _check_head_dim(
         )
     if (q_format, v_format) not in _HD256_QV:
         raise ValueError(
-            f"{operation} head dimension 256 is all-MXFP4 or all-MXFP6 only, got "
-            f"{q_format.name} Q/K with {v_format.name} V"
+            f"{operation} head dimension 256 is all-BF16, all-MXFP4 or all-MXFP6 only, "
+            f"got {q_format.name} Q/K with {v_format.name} V"
         )
     if sparse:
         raise ValueError(f"{operation} head dimension 256 is dense-only")
