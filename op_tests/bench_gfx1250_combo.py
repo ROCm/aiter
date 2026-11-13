@@ -283,6 +283,9 @@ os.environ.setdefault("ENABLE_CK", "0")
 os.environ.setdefault("AITER_USE_GROUPED_GEMM", "1")
 os.environ.setdefault("AITER_GROUPED_DEBUG", "0")
 os.environ.setdefault("FLYDSL_DUMP_IR", "1")
+# Needed at import for the log format the kernel-table parser reads; in-process
+# cases turn it off while they time (see _ut_timing).
+_LOG_MORE_FROM_CALLER = "AITER_LOG_MORE" in os.environ
 os.environ.setdefault("AITER_LOG_MORE", "1")
 # Kernel names are recovered from the INFO-level profiler tables printed by
 # child UTs.  Pin the default before importing pytest-aware test packages,
@@ -1441,7 +1444,7 @@ def run_moe(args):
             if shared and not native_shared
             else contextlib.nullcontext()
         )
-        with _smi_case(label), _capture() as box, routing:
+        with _smi_case(label), _capture() as box, routing, _ut_timing():
             moe_mod.set_data_format(fmt)
             metrics = moe_mod.run_moe(
                 fmt,
@@ -2486,6 +2489,37 @@ def _attach_backend_kernels(row, backends, profiles):
 
 
 @contextlib.contextmanager
+def _ut_timing():
+    """Time a case as the UT does on its own.
+
+    With AITER_LOG_MORE=1, perftest also runs num_iters cuda.Event iterations
+    before the profiled ones. Keep it on only inside get_trace_perf, which
+    prints the kernel table after timing. A value the caller set is kept.
+    """
+    if _LOG_MORE_FROM_CALLER:
+        yield
+        return
+    from aiter import test_common
+
+    orig = test_common.get_trace_perf
+
+    def get_trace_perf(*args, **kwargs):
+        os.environ["AITER_LOG_MORE"] = "1"
+        try:
+            return orig(*args, **kwargs)
+        finally:
+            os.environ["AITER_LOG_MORE"] = "0"
+
+    test_common.get_trace_perf = get_trace_perf
+    os.environ["AITER_LOG_MORE"] = "0"
+    try:
+        yield
+    finally:
+        test_common.get_trace_perf = orig
+        os.environ["AITER_LOG_MORE"] = "1"
+
+
+@contextlib.contextmanager
 def _fp32_kv_once(mod):
     """Upcast the reference KV once per case instead of once per sequence.
 
@@ -2515,7 +2549,7 @@ def run_mla_decode(args):
         return
     fp8 = mod.dtypes.fp8
     rows = []
-    with _silence(), torch.device("cuda"), _fp32_kv_once(mod):
+    with _silence(), torch.device("cuda"), _fp32_kv_once(mod), _ut_timing():
         for batch, ctx, init in itertools.product(
             _DSR1_BATCH, _DSR1_MLA_DECODE_CTX, inits
         ):
@@ -2568,7 +2602,7 @@ def run_mla_prefill(args):
     if mod is None:
         return
     rows = []
-    with _silence(), torch.device("cuda"), _without_flydsl_fmha(mod):
+    with _silence(), torch.device("cuda"), _without_flydsl_fmha(mod), _ut_timing():
         for (scenario, seq, seqlens), init in itertools.product(
             _dsr1_prefill_cases(), inits
         ):

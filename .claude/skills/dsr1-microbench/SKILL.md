@@ -35,6 +35,10 @@ visible from inside the container).
 
 - `status.txt` exit code 0 and the header's failed-case count 0 mean every case
   ran; MLA decode also checks each case against the UT's fp32 reference (`err`).
+- Each case is timed as its UT times it alone: 2 warm-up and 101 profiled
+  iterations. `AITER_LOG_MORE` is on only while aiter prints the kernel table
+  after timing. Earlier runs also ran 101 untimed iterations just before timing,
+  so do not compare their numbers with newer ones.
 - MoE GB/s is the grouped-GEMM UT's own effective-bandwidth model. Report it as
   is; do not patch it here.
 - MoE runs the plain grouped GEMM (`fused_moe` -> `grouped_moe_gfx1250`). The S1F
