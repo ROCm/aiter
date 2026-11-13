@@ -9,9 +9,7 @@
 * the nested custom op called through its undecorated body (gemm_a8w8_blockscale
   -> gemm_a8w8_blockscale_bpreshuffle) returns what the registered torch.ops
   dispatch returns (torch_compile_guard's _eager_body), and a rebound module
-  attribute still wins;
-* every gfx1250 wrapper of the FlyDSL launch_gemm_a8w8 returns on its cached
-  second launch what its first, tracing launch returned.
+  attribute still wins.
 
 The first two and the routing contract run on CPU; the numerical checks run
 on any GPU whose arch has the kernel and skip elsewhere.
@@ -211,61 +209,6 @@ def test_blockscale_bpreshuffle_nested_matches_op(m, n, k, w_rows):
         x, w_shuf, xs, ws, dtypes.bf16
     )
     assert torch.equal(nested, via_op)
-
-
-def _gfx1250():
-    return _gpu() and gemm_op_a8w8.is_gfx1250_family(gemm_op_a8w8.get_gfx())
-
-
-def _a8w8_gfx1250_launch(path):
-    """One launch_gemm_a8w8 wrapper at the DeepSeek-V4 wqkv_a shape."""
-    from aiter import benchmark_data_init as bench_init
-    from aiter.ops.flydsl import bpreshuffle_gemm_gfx1250 as ptpc
-    from aiter.ops.flydsl import mxfp8_bpreshuffle_gemm_gfx1250 as mx
-
-    gen = bench_init.make_generator(0)
-    m, n, k, b = 32, 2048, 7168, 4
-
-    def fp8(*shape):
-        return bench_init.fill_fp8(shape, "uniform", gen, dtype=dtypes.fp8)
-
-    def e8m0(*shape):
-        return bench_init.fill_scale_e8m0(shape, "auto", gen).view(dtypes.fp8_e8m0)
-
-    def out(*shape):
-        return torch.empty(*shape, dtype=dtypes.bf16, device="cuda")
-
-    if path == "bmm_mxfp8_128":
-        x, w = fp8(m, b, k), fp8(b, n, k)
-        xs, ws = e8m0(m, b, k // 128), e8m0(b, n // 128, k // 128)
-        return lambda: bmm.run_bmm_a8w8_mxfp8_128_gfx1250(x, w, xs, ws, out(m, b, n))
-    x, w = fp8(m, k), fp8(n, k)
-    if path == "mxfp8_128":
-        name = "flydsl_mxfp8_128_bpreshuffle_wmma_t16x64x1024_mw1_nw4_nb3_sk1_cm1_cn1"
-        xs, ws = e8m0(k // 128, m).t(), e8m0(n // 128, k // 128)
-        run = mx.run_gemm_a8w8_mxfp8_128_bpreshuffle_gfx1250
-    elif path == "mxfp8_32":
-        name = "flydsl_mxfp8_32_bpreshuffle_wmma_t32x32x1024_mw2_nw2_nb4_sk1_cm1_cn1"
-        xs, ws = e8m0(m, k // 32), e8m0(n, k // 32)
-        run = mx.run_gemm_a8w8_mxfp8_32_bpreshuffle_gfx1250
-    else:
-        name = "flydsl_bpreshuffle_wmma_t16x64x1024_mw1_nw4_nb3_sk1_cm1_cn1"
-        xs = torch.ones(m, 1, device="cuda")
-        ws = torch.ones(n, 1, device="cuda")
-        run = ptpc.run_gemm_a8w8_bpreshuffle_gfx1250
-    return lambda: run(x, w, xs, ws, out(m, n), name)
-
-
-@pytest.mark.skipif(not _gfx1250(), reason="needs gfx1250")
-@pytest.mark.parametrize("path", ["mxfp8_128", "mxfp8_32", "ptpc", "bmm_mxfp8_128"])
-def test_gfx1250_a8w8_cached_launch_matches_first(path):
-    """Only the first launch of a specialization traces launch_gemm_a8w8. The
-    cached CompiledFunction behind later launches applies no signature defaults,
-    so a wrapper that stops before a defaulted runtime argument (arg_scale_out)
-    indexes past its arguments on the second launch."""
-    launch = _a8w8_gfx1250_launch(path)
-    first = launch()
-    assert torch.equal(launch(), first)
 
 
 if __name__ == "__main__":

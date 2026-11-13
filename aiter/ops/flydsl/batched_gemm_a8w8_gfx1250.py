@@ -663,7 +663,7 @@ def run_bmm_a8w8_mxfp8_128_gfx1250(
         False,  # a_scale_preshuffled
         False,  # b_scale_32x32
         False,  # k_tail
-        _ptr_arg(Out),  # arg_scale_out (runtime), unread without fuse_quant_out
+        _ptr_arg(Out),  # arg_scale_out
         specialization_key=bmm_spec,
     )
     return Out
