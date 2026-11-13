@@ -238,6 +238,10 @@ def compile_pa_decode_plan(max_batch, threads, windowed, balanced=False):
     return launch
 
 
+# Query-map CTAs per launch at most; each recomputes the batch's block ends.
+_QUERY_MAP_MAX_CTAS = 1024
+
+
 @cache
 def compile_query_block_map(max_batch, threads, query_block, longest_first=False):
     """Split varlen queries into blocks of ``query_block`` in sequence order.
@@ -247,10 +251,14 @@ def compile_query_block_map(max_batch, threads, query_block, longest_first=False
     block get no queries and no context. Batch and capacity are runtime values.
 
     ``longest_first`` orders live blocks by context, longest first, ties in
-    sequence order (a stable descending sort); each block's position costs one
-    pass over the batch.
+    sequence order (a stable descending sort). A block's position is a count
+    over the batch, which one wave splits across its lanes; without it each
+    thread maps one slot. Every CTA scans the batch's block ends into LDS, then
+    takes a grid-strided share of the slots.
     """
     scan_blocks = fx.coop.BlockScan[fx.Int32, threads]
+    wave = 64
+    waves = threads // wave
 
     @fx.struct
     class EndStorage:
@@ -273,8 +281,10 @@ def compile_query_block_map(max_batch, threads, query_block, longest_first=False
         batch: fx.Int32,
         capacity: fx.Int32,
         num_tokens: fx.Int32,
+        num_ctas: fx.Int32,
     ):
         tid = fx.thread_idx.x
+        cta = fx.Int32(fx.block_idx.x)
         cu = ptr_buf_tensor(cu_seqlens_ptr)
         lengths = ptr_buf_tensor(lengths_ptr)
         query_map = ptr_buf_tensor(map_ptr)
@@ -300,8 +310,9 @@ def compile_query_block_map(max_batch, threads, query_block, longest_first=False
                 storage.lengths[seq] = lengths[seq]
         fx.gpu.barrier()
 
-        def rank_of(seq, block, num_blocks):
-            """Blocks sorting before (seq, block): longer, or as long and earlier.
+        def rank_of(seq, block, num_blocks, first, step):
+            """This lane's share (sequences first, first + step, ...) of the blocks
+            sorting before (seq, block): longer, or as long and earlier.
 
             Ordering keys ignore num_tokens truncation and the clamp at zero:
             block b of n has key offset + b_end with b_end = b + 1 blocks of
@@ -313,7 +324,7 @@ def compile_query_block_map(max_batch, threads, query_block, longest_first=False
                 storage.lengths[seq], offset + (block + 1) * query_block
             )
             rank = fx.Int32(0)
-            for other in range(0, batch):
+            for other in range(first, batch, step):
                 prev = block_ends[fx.max(other - 1, 0)]
                 blocks = block_ends[other] - (other > 0).select(prev, fx.Int32(0))
                 gap = key - storage.offsets[other]
@@ -332,38 +343,60 @@ def compile_query_block_map(max_batch, threads, query_block, longest_first=False
                 rank = rank + (live & (other < seq)).select(ties, fx.Int32(0))
             return rank
 
-        last_row = fx.max(num_tokens - 1, 0)
-        total_blocks = block_ends[batch - 1]
-        for slot in range(tid, capacity, threads):
-            seq = fx.Int32(-1)
-            for bit in fx.range_constexpr(lookup_bits - 1, -1, -1):
-                candidate = seq + (1 << bit)
-                if candidate < batch:  # noqa: SIM102 -- guard the LDS read
-                    if block_ends[candidate] <= slot:
-                        seq = candidate
-            live = slot < total_blocks
-            seq = fx.min(seq + 1, batch - 1)
-            first_block = fx.Int32(0)
-            if seq > 0:
-                first_block = block_ends[seq - 1]
-            query0 = cu[seq]
-            seq_queries = cu[seq + 1] - query0
-            first = (slot - first_block) * query_block
-            row = query0 + first
-            valid = fx.min(fx.min(seq_queries - first, num_tokens - row), query_block)
-            valid = live.select(fx.max(valid, 0), 0)
-            ctx = fx.max(lengths[seq] - seq_queries + first + valid, 0)
-            dest = slot
-            if fx.const_expr(longest_first):
-                # Dead slots keep their place after every live block.
-                block = slot - first_block
-                rank = rank_of(seq, block, block_ends[seq] - first_block)
-                dest = live.select(rank, slot)
-            query_map[dest * 4] = fx.min(fx.max(row, 0), last_row)
-            query_map[dest * 4 + 1] = seq
-            query_map[dest * 4 + 2] = valid
-            query_map[dest * 4 + 3] = fx.Int32(0)
-            contexts[dest] = live.select(ctx, 0)
+        def write_map(query_map, contexts, slot_first, slot_step):
+            last_row = fx.max(num_tokens - 1, 0)
+            total_blocks = block_ends[batch - 1]
+            for slot in range(slot_first, capacity, slot_step):
+                seq = fx.Int32(-1)
+                for bit in fx.range_constexpr(lookup_bits - 1, -1, -1):
+                    candidate = seq + (1 << bit)
+                    if candidate < batch:  # noqa: SIM102 -- guard the LDS read
+                        if block_ends[candidate] <= slot:
+                            seq = candidate
+                live = slot < total_blocks
+                seq = fx.min(seq + 1, batch - 1)
+                first_block = fx.Int32(0)
+                if seq > 0:
+                    first_block = block_ends[seq - 1]
+                query0 = cu[seq]
+                seq_queries = cu[seq + 1] - query0
+                first = (slot - first_block) * query_block
+                row = query0 + first
+                valid = fx.min(
+                    fx.min(seq_queries - first, num_tokens - row), query_block
+                )
+                valid = live.select(fx.max(valid, 0), 0)
+                ctx = fx.max(lengths[seq] - seq_queries + first + valid, 0)
+                dest = slot
+                if fx.const_expr(longest_first):
+                    # The slot is wave-uniform: every lane stores the same record.
+                    lane = fx.Int32(tid) % wave
+                    block = slot - first_block
+                    rank = rank_of(
+                        seq, block, block_ends[seq] - first_block, lane, wave
+                    )
+                    rank = fx.coop.warp_reduce(rank, fx.ReductionOp.ADD)
+                    # Dead slots keep their place after every live block.
+                    dest = live.select(rank, slot)
+                query_map[dest * 4] = fx.min(fx.max(row, 0), last_row)
+                query_map[dest * 4 + 1] = seq
+                query_map[dest * 4 + 2] = valid
+                query_map[dest * 4 + 3] = fx.Int32(0)
+                contexts[dest] = live.select(ctx, 0)
+
+        # Captured tensors written under a runtime branch would become branch
+        # state: pass them in.
+        if fx.const_expr(longest_first):
+            write_map(
+                query_map,
+                contexts,
+                cta * waves + fx.Int32(tid) // wave,
+                num_ctas * waves,
+            )
+        else:
+            write_map(
+                query_map, contexts, cta * threads + fx.Int32(tid), num_ctas * threads
+            )
 
     @flyc.jit
     def launch(
@@ -374,11 +407,19 @@ def compile_query_block_map(max_batch, threads, query_block, longest_first=False
         batch: fx.Int32,
         capacity: fx.Int32,
         num_tokens: fx.Int32,
+        num_ctas: fx.Int32,
         stream: fx.Stream,
     ):
         query_block_map_kernel(
-            cu_seqlens, lengths, query_map, contexts, batch, capacity, num_tokens
-        ).launch(grid=(1, 1, 1), block=(threads, 1, 1), stream=stream)
+            cu_seqlens,
+            lengths,
+            query_map,
+            contexts,
+            batch,
+            capacity,
+            num_tokens,
+            num_ctas,
+        ).launch(grid=(num_ctas, 1, 1), block=(threads, 1, 1), stream=stream)
 
     return launch
 
@@ -394,8 +435,12 @@ def build_query_block_map(
 ):
     """Fill ``query_map`` [capacity, 4] and ``contexts`` [capacity] on the GPU."""
     batch = seqused_k.numel()
+    capacity = query_map.shape[0]
     max_batch = 1 << (batch - 1).bit_length()
-    launch = compile_query_block_map(max_batch, 1024, query_block, longest_first)
+    threads = 1024
+    per_cta = threads // 64 if longest_first else threads
+    num_ctas = max(1, min(-(-capacity // per_cta), _QUERY_MAP_MAX_CTAS))
+    launch = compile_query_block_map(max_batch, threads, query_block, longest_first)
     _run_compiled(
         launch,
         ptr_arg(cu_seqlens_q, fx.Int32),
@@ -403,8 +448,9 @@ def build_query_block_map(
         ptr_arg(query_map, fx.Int32),
         ptr_arg(contexts, fx.Int32),
         batch,
-        query_map.shape[0],
+        capacity,
         num_tokens,
+        num_ctas,
         torch.cuda.current_stream(seqused_k.device),
     )
 
@@ -550,7 +596,6 @@ def plan_pa_decode(
     # so buckets ignore it. Clip the last bucket so rounding up cannot reject a
     # batch that fits LDS.
     lds_max_batch = _lds_max_batch(shared_memory_per_block)
-    max_batch = min(lds_max_batch, 1 << (batch - 1).bit_length())
     if max_partitions is None:
         max_partitions = num_compute_units if plan is None else plan.max_partitions
     if not 1 <= max_partitions <= num_compute_units:
@@ -600,25 +645,47 @@ def plan_pa_decode(
         if sliding_window > 0 and query_length != plan.query_length:
             raise ValueError("query_length must match the reused plan")
     plan.validate(batch, num_kv_heads, dev)
-    # The first visible token is length - window. Clamping to int32 keeps
-    # every visible range, since no length exceeds it.
-    window = min(query_length - 1 + sliding_window, 2**31 - 1) if sliding_window else 0
     with torch.cuda.device(dev):
-        launch = compile_pa_decode_plan(
-            max_batch,
-            _block_threads(plan.capacity),
-            sliding_window > 0,
+        refresh_plan(
+            plan,
+            context_lengths,
+            lds_max_batch,
             properties.gcnArchName.split(":", 1)[0] in ("gfx942", "gfx950"),
-        )
-        _run_compiled(
-            launch,
-            ptr_arg(context_lengths, fx.Int32),
-            ptr_arg(plan.work_info, fx.Int32),
-            ptr_arg(plan.reduce_info, fx.Int32),
-            batch,
-            plan.capacity,
-            plan.max_partitions,
-            window,
             torch.cuda.current_stream(dev),
         )
     return plan
+
+
+def refresh_plan(plan, context_lengths, lds_max_batch, balanced, stream):
+    """Launch ``plan``'s refresh from ``context_lengths`` on ``stream``, unchecked.
+
+    For callers that build a valid plan per call: ``plan_pa_decode`` without its
+    validation. ``lds_max_batch`` is ``_lds_max_batch`` of the device's LDS bytes
+    and ``balanced`` its gfx942/gfx950 split; the current device must own the
+    tensors.
+    """
+    batch = context_lengths.numel()
+    # The first visible token is length - window. Clamping to int32 keeps
+    # every visible range, since no length exceeds it.
+    window = (
+        min(plan.query_length - 1 + plan.sliding_window, 2**31 - 1)
+        if plan.sliding_window
+        else 0
+    )
+    launch = compile_pa_decode_plan(
+        min(lds_max_batch, 1 << (batch - 1).bit_length()),
+        _block_threads(plan.capacity),
+        plan.sliding_window > 0,
+        balanced,
+    )
+    _run_compiled(
+        launch,
+        ptr_arg(context_lengths, fx.Int32),
+        ptr_arg(plan.work_info, fx.Int32),
+        ptr_arg(plan.reduce_info, fx.Int32),
+        batch,
+        plan.capacity,
+        plan.max_partitions,
+        window,
+        stream,
+    )

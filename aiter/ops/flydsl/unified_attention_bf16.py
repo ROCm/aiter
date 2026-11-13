@@ -28,6 +28,7 @@ kernel while leaving other FlyDSL routes enabled.
 
 from __future__ import annotations
 
+import functools
 import os
 
 import torch
@@ -43,10 +44,11 @@ _PAGE_SIZES = (64, 128)
 _MAX_QUERY_LENGTH = 8
 _MAX_BATCH = 4096
 # Queries per varlen pseudo-sequence.
-_QUERY_BLOCK = int(os.environ.get("PP_VL_QB", "16"))
+_QUERY_BLOCK = 16
 # Queries per windowed varlen block: the kernel's two-CTAs-per-CU layout.
-_WINDOW_QUERY_BLOCK = int(os.environ.get("PP_WIN_QB", "8"))
-# Varlen pseudo-sequences the planner's LDS holds on gfx950 (160 KiB).
+_WINDOW_QUERY_BLOCK = 8
+_GFX950_LDS_BYTES = 160 * 1024
+# Varlen pseudo-sequences the planner's LDS holds on gfx950.
 _MAX_PSEUDO_SEQS = 40000
 
 
@@ -73,14 +75,17 @@ def _varlen_enabled() -> bool:
 
 
 def _varlen_optimized_enabled() -> bool:
-    return (
-        os.environ.get("AITER_UNIFIED_ATTN_FLYDSL_VARLEN_OPTIMIZED", "1") != "0"
-    )
+    return os.environ.get("AITER_UNIFIED_ATTN_FLYDSL_VARLEN_OPTIMIZED", "1") != "0"
 
 
 def _pseudo_capacity(num_tokens, num_seqs, block=_QUERY_BLOCK):
     # Sequence i has ceil(q_i / b) <= q_i / b + (b - 1) / b query blocks.
     return -(-num_tokens // block) + num_seqs
+
+
+@functools.cache
+def _num_cu(device_index: int) -> int:
+    return torch.cuda.get_device_properties(device_index).multi_processor_count
 
 
 def _arch() -> str | None:
@@ -205,19 +210,19 @@ def _route(
         1 <= query_length <= _MAX_QUERY_LENGTH and num_tokens == num_seqs * query_length
     )
     windowed = bool(_sliding_window(window_size))
-    if uniform:
-        return ("window" if windowed else "uniform"), None
-    if not _varlen_enabled():
-        return None, (
-            "non-uniform or > 8 query lengths are disabled by "
-            "AITER_UNIFIED_ATTN_FLYDSL_VARLEN=0"
-        )
-    if sinks is not None and not windowed:
-        return (
-            None,
-            "sinks without a sliding window require a uniform query length of 1..8",
-        )
-    if (
+    if not uniform:
+        if not _varlen_enabled():
+            return None, (
+                "non-uniform or > 8 query lengths are disabled by "
+                "AITER_UNIFIED_ATTN_FLYDSL_VARLEN=0"
+            )
+        if sinks is not None and not windowed:
+            return (
+                None,
+                "sinks without a sliding window require a uniform query length of 1..8",
+            )
+    # Every route but the uniform window one reads query rows from cu_seqlens_q.
+    if not (uniform and windowed) and (
         cu_seqlens_q is None
         or cu_seqlens_q.dtype != torch.int32
         or not cu_seqlens_q.is_contiguous()
@@ -225,6 +230,8 @@ def _route(
         or cu_seqlens_q.shape != (num_seqs + 1,)
     ):
         return None, "cu_seqlens_q must be a contiguous int32 [num_seqs + 1] tensor"
+    if uniform:
+        return ("window" if windowed else "uniform"), None
     if query_length < 1:
         return None, f"requires max_seqlen_q >= 1, got {query_length}"
     if not windowed and _pseudo_capacity(num_tokens, num_seqs) > _MAX_PSEUDO_SEQS:
@@ -346,7 +353,7 @@ def _workspace(q, route, need, describe, explicit):
     state = _WORKSPACES.get(key)
     current = None if state is None else state["current"]
     if current is not None and all(
-        current[n].numel() >= c for n, (c, _) in need.items()
+        n in current and current[n].numel() >= c for n, (c, _) in need.items()
     ):
         return current
     if torch.cuda.is_current_stream_capturing():
@@ -360,13 +367,18 @@ def _workspace(q, route, need, describe, explicit):
             _COLD_CAPTURE_WARNED.add(key)
             logger.warning(f"[FlyDSL] {message}; falling back to Triton/Gluon")
         return None
-    # Round up so a growing batch reallocates a logarithmic number of times.
-    sizes = {n: 1 << max(c - 1, 1).bit_length() for n, (c, _) in need.items()}
-    if current is not None:
-        sizes = {n: max(s, current[n].numel()) for n, s in sizes.items()}
-    replacement = {"captured": False}
-    for name, (_, dtype) in need.items():
-        replacement[name] = torch.empty(sizes[name], dtype=dtype, device=q.device)
+    # Buffers that fit are kept, others grow, rounded up so a growing batch
+    # reallocates a logarithmic number of times. Buffers this call does not
+    # need (another plan of the same route) are kept for later calls.
+    replacement = {} if current is None else dict(current)
+    replacement["captured"] = False
+    for name, (count, dtype) in need.items():
+        old = replacement.get(name)
+        if old is None or old.numel() < count:
+            size = 1 << max(count - 1, 1).bit_length()
+            if old is not None:
+                size = max(size, old.numel())
+            replacement[name] = torch.empty(size, dtype=dtype, device=q.device)
     if state is None:
         _WORKSPACES[key] = {"current": replacement, "pinned": []}
     else:
@@ -385,54 +397,10 @@ def _partial_need(num_kv_heads, capacity, rows):
     }
 
 
-def _build_query_map(
-    cu_seqlens_q,
-    seqused_k,
-    num_tokens,
-    query_map,
-    context_lengths,
-    query_block=_QUERY_BLOCK,
-):
-    """Fill pseudo-sequence rows (first query row, sequence, valid queries, 0).
-
-    Each sequence's queries split into ``query_block`` rows; block b of a
-    sequence with q queries and k KV tokens sees k - q + query_block * b +
-    valid tokens. Rows past the
-    last block get no queries and no context. Rows are sorted by context,
-    longest first, so the longest tasks start first. Queries at or past
-    ``num_tokens`` are dropped, so offsets beyond q never address memory.
-    """
-    capacity = query_map.shape[0]
-    dev = cu_seqlens_q.device
-    query_lengths = (cu_seqlens_q[1:] - cu_seqlens_q[:-1]).long()
-    blocks = (query_lengths + (query_block - 1)) // query_block
-    block_ends = torch.cumsum(blocks, 0)
-    pseudo = torch.arange(capacity, device=dev)
-    seq = torch.searchsorted(block_ends, pseudo, right=True)
-    live = seq < blocks.numel()
-    seq = seq.clamp_(max=blocks.numel() - 1)
-    first = (pseudo - (block_ends[seq] - blocks[seq])) * query_block
-    row = cu_seqlens_q[seq].long() + first
-    valid = torch.minimum(query_lengths[seq] - first, num_tokens - row)
-    valid = torch.where(live, valid.clamp(0, query_block), 0)
-    context = torch.where(
-        live, seqused_k[seq].long() - query_lengths[seq] + first + valid, 0
-    ).clamp_(min=0)
-    order = torch.argsort(context, descending=True, stable=True)
-    rows = torch.stack(
-        (row.clamp(0, max(num_tokens - 1, 0)), seq, valid, torch.zeros_like(seq)), 1
-    )
-    query_map.copy_(rows[order])
-    context_lengths.copy_(context[order])
-
-
 def _varlen_optimized_eligible(q, k, out, max_seqlen_k):
-    """Whether the reviewed direct-output specialization is an exact match.
-
-    This deliberately adds restrictions beyond the general FlyDSL route.  In
-    particular, HKV=1 avoids the reviewed multi-KV partial-buffer issue, and
-    page 128 plus a long, splittable context keeps the specialization on its measured
-    MiMo hot path.  Every miss continues through the existing varlen kernel.
+    """Whether the optimized varlen specialization (``unified_attention_varlen``)
+    covers this call: one KV head, page 128, a context of at least 4096 tokens
+    and a contiguous ``out``. Every miss runs the generic varlen kernel.
     """
     if not _varlen_optimized_enabled():
         return False
@@ -442,14 +410,11 @@ def _varlen_optimized_eligible(q, k, out, max_seqlen_k):
 
 
 def _use_varlen_optimized(q, k, out, num_seqs, max_seqlen_k, num_cu):
-    if not _varlen_enabled() or not _varlen_optimized_eligible(
-        q, k, out, max_seqlen_k
-    ):
+    if not _varlen_enabled() or not _varlen_optimized_eligible(q, k, out, max_seqlen_k):
         return False
-    # The reviewed schedule and XCD topology target the full 256-CU MI355X.
-    # Preserve the generic implementation on harvested/other gfx950 parts and
-    # when callers deliberately alter the baseline planner capacity.
-    if num_cu != 256 or int(os.environ.get("PP_VL_EXTRA", "0")) != 0:
+    # The specialization's schedule is tuned for the full 256-CU MI355X; other
+    # gfx950 parts keep the generic kernel.
+    if num_cu != 256:
         return False
     pseudo = _pseudo_capacity(q.shape[0], num_seqs)
     return _plan_capacity(pseudo, 1, num_cu) == pseudo
@@ -519,9 +484,14 @@ def _unified_attention_varlen(
     import flydsl.expr as fx
 
     from .kernels.pa_decode_pingpong import compile_pa_decode_pingpong
-    from .kernels.pa_decode_plan import build_query_block_map
+    from .kernels.pa_decode_plan import (
+        PADecodePlan,
+        _lds_max_batch,
+        build_query_block_map,
+        refresh_plan,
+    )
     from .kernels.tensor_shim import _run_compiled, ptr_arg
-    from .pa_decode import PADecodePlan, launch_pa_decode_ps_reduce, plan_pa_decode
+    from .pa_decode import launch_pa_decode_ps_reduce
 
     num_tokens = q.shape[0]
     num_seqs = seqused_k.numel()
@@ -531,9 +501,8 @@ def _unified_attention_varlen(
     pseudo = _pseudo_capacity(num_tokens, num_seqs, query_block)
     dev = q.device
     with torch.cuda.device(dev):
-        num_cu = torch.cuda.get_device_properties(dev).multi_processor_count
+        num_cu = _num_cu(dev.index)
         capacity = _plan_capacity(pseudo, num_kv_heads, num_cu)
-        capacity += int(os.environ.get("PP_VL_EXTRA", "0"))
         # With a slot per pseudo-sequence the batch already fills the CUs:
         # one task each, written straight to out, and no reducer.
         direct = capacity == pseudo and out.stride() == (
@@ -545,9 +514,7 @@ def _unified_attention_varlen(
         # task plus the slots beyond the live rows, of which there are at least
         # ceil(tokens / b).
         max_partitions = (
-            1
-            if direct
-            else min(num_cu, capacity - -(-num_tokens // query_block) + 1)
+            1 if direct else min(num_cu, capacity - -(-num_tokens // query_block) + 1)
         )
         need = {
             "query_map": (pseudo * 4, torch.int32),
@@ -559,10 +526,10 @@ def _unified_attention_varlen(
         workspace = _workspace(
             q,
             (
-                "varlen_direct" if direct else "varlen"
-            )
-            if query_block == _QUERY_BLOCK
-            else f"uniform_varlen_{query_block}",
+                ("varlen_direct" if direct else "varlen")
+                if query_block == _QUERY_BLOCK
+                else f"uniform_varlen_{query_block}"
+            ),
             need,
             f"{num_seqs} sequences, {num_tokens} query tokens",
             explicit,
@@ -573,27 +540,15 @@ def _unified_attention_varlen(
             workspace["captured"] = True
         query_map = workspace["query_map"][: pseudo * 4].view(pseudo, 4)
         context_lengths = workspace["context_lengths"][:pseudo]
-        # The kernel's ordering is one pass over the batch per row; above this
-        # it is slower than the torch sort.
-        if pseudo * num_seqs <= 1 << 19:
-            build_query_block_map(
-                cu_seqlens_q,
-                seqused_k,
-                num_tokens,
-                query_block,
-                query_map,
-                context_lengths,
-                longest_first=True,
-            )
-        else:
-            _build_query_map(
-                cu_seqlens_q,
-                seqused_k,
-                num_tokens,
-                query_map,
-                context_lengths,
-                query_block,
-            )
+        build_query_block_map(
+            cu_seqlens_q,
+            seqused_k,
+            num_tokens,
+            query_block,
+            query_map,
+            context_lengths,
+            longest_first=True,
+        )
         plan = PADecodePlan(
             work_info=workspace["work_info"][: capacity * 4].view(capacity, 4),
             reduce_info=workspace["reduce_info"][: pseudo * 2].view(pseudo, 2),
@@ -602,8 +557,10 @@ def _unified_attention_varlen(
             query_length=query_block,
             max_batch_size=pseudo,
         )
-        plan_pa_decode(
-            context_lengths, num_kv_heads, query_length=query_block, plan=plan
+        stream = torch.cuda.current_stream(dev)
+        # The plan is valid by construction, so skip plan_pa_decode's checks.
+        refresh_plan(
+            plan, context_lengths, _lds_max_batch(_GFX950_LDS_BYTES), True, stream
         )
         no_scale = flyc.from_c_void_p(fx.Float32, 0)
         if direct:
@@ -628,15 +585,11 @@ def _unified_attention_varlen(
             query_length=query_block,
             block_size=k.shape[1],
             softmax_scale=float(softmax_scale),
-            # Longest-first tasks balance best one per CTA: pairing gives the
-            # first CTAs the two longest (15-60% slower on prefill steps).
-            pair_ctas=0,
             varlen=True,
             direct_output=direct,
         )
-        stream = torch.cuda.current_stream(dev)
         _run_compiled(
-            compiled["launch"],
+            compiled,
             *partials,
             ptr_arg(q, fx.BFloat16),
             ptr_arg(k, fx.BFloat16),
@@ -682,9 +635,7 @@ def _unified_attention_varlen(
             query_seq_len=query_block,
             query_group_size=group,
             head_size=_VALUE_DIM,
-            max_partitions=max(
-                1, min(max_partitions, -(-int(max_seqlen_k) // 256))
-            ),
+            max_partitions=max(1, min(max_partitions, -(-int(max_seqlen_k) // 256))),
             stream=stream,
             reduce_info=plan.reduce_info,
             query_map=query_map,
@@ -726,7 +677,7 @@ def _unified_attention_window(
     group = q.shape[1] // num_kv_heads
     dev = q.device
     with torch.cuda.device(dev):
-        num_cu = torch.cuda.get_device_properties(dev).multi_processor_count
+        num_cu = _num_cu(dev.index)
         cta_queries = query_length
         if query_length is None:
             pseudo = _pseudo_capacity(num_tokens, num_seqs, _WINDOW_QUERY_BLOCK)
@@ -759,7 +710,7 @@ def _unified_attention_window(
         else:
             # A CTA's fixed latency dwarfs a window's few tiles: spread each
             # sequence's queries over CTAs while they fit the CUs.
-            cta_queries = int(os.environ.get("PP_WIN_Q", "0")) or next(
+            cta_queries = next(
                 d
                 for d in range(1, query_length + 1)
                 if query_length % d == 0
@@ -792,7 +743,7 @@ def _unified_attention_window(
                 ],
             )
         _run_compiled(
-            compiled["launch"],
+            compiled,
             ptr_arg(out, fx.BFloat16),
             ptr_arg(q, fx.BFloat16),
             ptr_arg(k, fx.BFloat16),
@@ -839,10 +790,11 @@ def unified_attention_flydsl(
 ) -> torch.Tensor | None:
     """Run a validated configuration and return ``out``, else return None.
 
-    When q has ``num_seqs * max_seqlen_q`` tokens and ``max_seqlen_q`` <= 8,
-    ``cu_seqlens_q`` must equal ``arange(num_seqs + 1) * max_seqlen_q``: query
-    rows are then taken from the tensor shapes. Otherwise ``cu_seqlens_q`` is
-    read on the GPU and must cover q. ``seqused_k`` holds KV lengths including
+    ``cu_seqlens_q`` is read on the GPU and must cover q. When q has
+    ``num_seqs * max_seqlen_q`` tokens and ``max_seqlen_q`` <= 8 it must equal
+    ``arange(num_seqs + 1) * max_seqlen_q``; with a sliding window those rows
+    are then taken from the tensor shapes and ``cu_seqlens_q`` is not read.
+    ``seqused_k`` holds KV lengths including
     the query tokens, as for Triton; each must be at least its query count.
     With ``explicit``, a declined configuration or an unprepared graph capture
     raises RuntimeError naming the cause instead of returning None.
@@ -895,10 +847,7 @@ def unified_attention_flydsl(
             explicit,
         )
     if route == "varlen":
-        with torch.cuda.device(q.device):
-            num_cu = torch.cuda.get_device_properties(
-                q.device
-            ).multi_processor_count
+        num_cu = _num_cu(q.device.index)
         if _use_varlen_optimized(
             q,
             k,

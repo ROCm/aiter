@@ -7,18 +7,16 @@ from functools import lru_cache
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
-from flydsl._mlir import ir
-from flydsl._mlir.dialects import rocdl as mlir_rocdl
 
 from aiter.jit.utils.chip_info import get_gfx_runtime
 
-from .buffer_ops import create_buffer_resource_from_addr
 from .tensor_shim import (
     _FX_ELEM,
     AITER_FLYDSL_KERNARG_PRELOAD,
     AITER_FLYDSL_KERNARG_PRELOAD_COUNT,
     buf_base_i64,
     buf_copy_load,
+    buf_copy_store,
     ptr_buf_tensor,
 )
 from .utils import rcp_f32, udiv_const, urem_const
@@ -267,8 +265,10 @@ def compile_pa_decode_ps_reduce(
                 + group_idx * stride_output_group_size
             )
             # Padded query rows get an empty resource: their stores are dropped.
-            output_rs = create_buffer_resource_from_addr(
+            output_rows = ptr_buf_tensor(
                 buf_base_i64(output_ptr) + fx.Int64(row_elem) * out_bytes,
+                output_dtype,
+                unit_elems=elems,
                 num_records_bytes=fx.Int64(
                     (query_idx < valid_rows).select(
                         fx.Int32(head_size * out_bytes), zero_i
@@ -346,12 +346,12 @@ def compile_pa_decode_ps_reduce(
 
         def _store(acc, unit):
             if fx.const_expr(query_map):
-                mlir_rocdl.raw_ptr_buffer_store(
-                    acc.to(output_dtype).ir_value(),
-                    output_rs,
-                    fx.Int32(unit * (elems * out_bytes)).ir_value(),
-                    zero_i.ir_value(),
-                    aux=ir.IntegerAttr.get(ir.IntegerType.get_signless(32), 0),
+                buf_copy_store(
+                    output_rows,
+                    unit,
+                    acc.to(output_dtype),
+                    output_dtype,
+                    unit_elems=elems,
                 )
                 return
             # Output rows need only element alignment, so pairs store scalars.
