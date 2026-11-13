@@ -3056,7 +3056,8 @@ def _mxfp4_a4w4_stage1(
 
     from aiter.ops.flydsl.mxfp4_gemm1_kernels import flydsl_mxfp4_gemm1
 
-    _xcd1 = _parse_mxfp4_g1_kname(kernelName1).get("xcd_swizzle", 0)
+    _p1 = _parse_mxfp4_g1_kname(kernelName1)
+    _xcd1 = _p1.get("xcd_swizzle", 0)
     flydsl_mxfp4_gemm1(
         a_quant=a_quant,
         a_scale_sorted_shuffled=a_scale_sorted_shuffled,
@@ -3091,6 +3092,7 @@ def _mxfp4_a4w4_stage1(
         bias=bias1,
         num_waves=num_waves,
         k_wave=k_wave,
+        ep32=_p1.get("ep32", False),
     )
     return inter_sorted_quant, inter_sorted_shuffled_scale
 
@@ -3649,6 +3651,7 @@ def _flydsl_v2_stage2_wrapper(
         is_ep=expert_mask is not None,
         out_scale=target_scale,
         use_valid_token_count=use_valid_token_count,
+        ep32=cfg.get("ep32", False),
     )
     if _s2_fp4_scatter:
         aiter.mxfp4_moe_scatter_reduce_q(

@@ -2,6 +2,7 @@
 # Copyright (C) 2025-2026 FlyDSL Project Contributors
 """Compile + launch dispatch for the layout-API MXFP4 MoE gemm (BM32, opus-sort); a4w4/a8w4 entry point."""
 
+import functools
 import os
 
 import flydsl.compiler as flyc
@@ -789,6 +790,19 @@ def get_g2(
     return launch
 
 
+@functools.cache
+def get_g2_ep32(use_nt, HIDDEN_MAX, INTER_MAX, use_valid_token_count, grid_wgs):
+    from .mxmoe_gemm2_ep32 import compile_gemm2_ep32
+
+    return compile_gemm2_ep32(
+        use_nt=bool(use_nt),
+        HIDDEN_MAX=HIDDEN_MAX,
+        INTER_MAX=INTER_MAX,
+        use_valid_token_count=use_valid_token_count,
+        GRID_WGS=grid_wgs,
+    )
+
+
 def mxfp4_moe_gemm2(
     *,
     inter_sorted_quant,
@@ -826,6 +840,7 @@ def mxfp4_moe_gemm2(
     is_ep=False,
     out_scale=None,
     use_valid_token_count=False,
+    ep32=False,
 ):
     """Stage-2 down-proj gemm for unpadded dimensions.
 
@@ -897,6 +912,40 @@ def mxfp4_moe_gemm2(
             bias = bias.to(torch.float32)
         if not bias.is_contiguous():
             bias = bias.contiguous()
+    if ep32:
+        # Dedicated EP32 A8W4 kernel (mxmoe_gemm2_ep32.py): fixed persistent grid.
+        if (BM, BN, BK, SBM, a_dtype, b_dtype, epilog, persist, out_dtype) != (
+            64, 256, 128, 64, "fp8", "fp4", "atomic", False, "bf16"
+        ) or bias is not None:
+            raise NotImplementedError(
+                "gemm2 ep32 supports only BM64/BN256/BK128 sbm64 A8W4 atomic bf16 "
+                "without bias"
+            )
+        launch = get_g2_ep32(
+            use_nt, HIDDEN_MAX, D_INTER, bool(use_valid_token_count), 2 * get_cu_num()
+        )
+        max_m_blocks = (max_sorted + BM - 1) // BM
+        run_compiled(
+            launch,
+            inter_sorted_quant.data_ptr(),
+            inter_sorted_shuffled_scale.data_ptr(),
+            w2_u8.data_ptr(),
+            w2_scale_u8.data_ptr(),
+            sorted_expert_ids.data_ptr(),
+            cumsum_tensor.data_ptr(),
+            sorted_token_ids.data_ptr(),
+            sorted_weights.data_ptr(),
+            out.data_ptr(),
+            M_logical,
+            max_m_blocks,
+            max_m_blocks,
+            D_INTER,
+            D_HIDDEN,
+            out.data_ptr(),
+            out.data_ptr(),
+            torch.cuda.current_stream() if stream is None else stream,
+        )
+        return out
     g2_prefetch_ids = (
         (BM, BN, BK) == (128, 256, 128)
         and a_dtype == b_dtype == "fp4"
