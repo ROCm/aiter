@@ -177,6 +177,7 @@ else:
     from .ops.inverse_rope_group_quant import *
     from .ops.groupnorm import *
     from .ops.mhc import *
+    from .ops.mega_mhc import *
     from .ops.causal_conv1d_update import *
     from .ops.fused_split_gdr_update import *
     from .ops.gdr_decode_packed_bf16 import *
@@ -211,3 +212,17 @@ try:
 except (ImportError, AttributeError):
     # Iris or triton not available, skip import
     IRIS_COMM_AVAILABLE = False
+
+
+def __getattr__(name: str):
+    """Lazy public exports that must not run at ``import aiter`` time.
+
+    ``sp_qkv_fused`` is the neutral SP4 QKV contract.  Resolving it here keeps
+    ``import aiter`` from eagerly importing the ops package path; the op itself
+    imports only the routing interface.
+    """
+    if name == "sp_qkv_fused":
+        from aiter.ops.gemm_fusion.sp_qkv.op import sp_qkv_fused
+
+        return sp_qkv_fused
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

@@ -44,7 +44,7 @@ sentinel until the data of a peer arrives. The reader polls its slot until no
 
 The mesh is a two-shot all-reduce: a reduce-scatter lap, then an all-gather
 lap. In each lap, each rank pushes to all `N-1` peers. Both laps use the same
-wire format. The default is INT4 with one E4M3 scale for each group of 16
+wire format. The default is INT4 with one E5M2 scale for each group of 16
 values. INT5 and INT6 use the same scale and add more bits for each value. FP16
 sends the values without quantization and is used in testing.
 
@@ -59,13 +59,13 @@ This is better on PCIe, where each GPU has one shared x16 uplink.
 | Item | Mesh | Ring |
 |---|---|---|
 | Quantizations in the reduce-scatter lap | 1 | `N-1`, one at each hop |
-| Default reduce-scatter codec | INT4 | INT4, INT6 at TP8 |
+| Default reduce-scatter codec | INT4 | INT4 at TP2, INT6 from TP4 |
 | Writers for each inbox slot | `N-1` peers | 1, the ring predecessor |
 | LDS staging (TP8, block 256) | Packets for all destinations, 9216 B with INT4 | Packet for one destination, 1664 B with INT6 |
 
 The ring quantizes the running partial sum again at each hop. The maximum
 absolute value of the partial sum increases with each hop. For this reason,
-the ring needs INT6 on the reduce-scatter lap at TP8. The all-gather lap sends
+the ring needs INT6 on the reduce-scatter lap from TP4. The all-gather lap sends
 the received bytes without a change, so it adds only one quantization.
 
 After the all-gather, every rank holds the same bits. Each rank decodes every
@@ -75,9 +75,10 @@ its own chunk from the packet that it sent.
 ### Accuracy limits
 
 The mesh and the ring do all arithmetic in packed fp16, for every wire format,
-so large values can saturate or clip, and NaN and Inf become finite values.
-The limits are in the "Limitations" section of the `quick_allreduce_codec.py`
-docstring.
+so large values saturate at 65504, and NaN and Inf become finite values. The
+limits are in the "Limitations" section of the `quick_allreduce_codec.py`
+docstring. `SCALE_CODEC_TAG` is part of every kernel's launch name: bump it
+when the codec changes, or a warm FlyDSL cache keeps loading old binaries.
 
 ## Inbox memory
 
@@ -123,8 +124,19 @@ levels:
    windows do not overlap. The one-shot is exact and runs in both modes. With quantization on, the mesh/ring takes those payloads first.
 2. Which configuration of that algorithm runs. Each algorithm has a tuning
    ladder for each arch, link type and world size: `ONESHOT_LADDER`,
-   `MESH_ST_LADDER` and `RING_ST_LADDER`.
-
+   `MESH_ST_LADDER` and `RING_ST_LADDER`. The fused add+RMSNorm has its own ladder,
+   `MESH_NORM_LADDER`, because its epilogue wants a different grid than the
+   plain all-reduce. A platform without a row there uses its `MESH_ST_LADDER`.
+   Pass the row widths the fused call will use in the constructor's
+   `rmsnorm_hidden`. The constructor then builds the fused engines and compiles
+   and loads every fused binary of each width, so the first fused call can be
+   inside a HIP graph capture. The RMSNorm epsilon is a launch argument, so it 
+   does not select a binary.
+   `compile_rmsnorm(hidden)` does the same after construction, on every rank.
+   The fused epilogue reduces a row inside one workgroup, so a tile must hold
+   whole rows. A row that never divides the default 8-atom tile, such as
+   hidden 6144, runs on a 12-atom tile (`tile_atoms_for`). That tile splits
+   only across TP 2 and 4, and its engines have their own IPC inbox.
 
 ## Environment variables
 
@@ -177,8 +189,7 @@ is not.
 * `none` or `inf` sets no upper limit. Only the `MAX` variables accept it.
 * A maximum of `0` disables the algorithm. A minimum that is equal to the
   maximum also disables it.
-* If an algorithm has no window in the table, a variable creates one. The
-  other bound is then `0` for the minimum, or no upper limit for the maximum.
+* A variable cannot enable an algorithm that has no window in the table.
 * If a value is not valid, the code logs a warning and uses the value from the
   table.
 * If the mesh and the ring windows overlap after the change, the code logs a
@@ -288,6 +299,15 @@ for its own rank in registers. That part does not go through the inbox.
 A host class builds one engine for each different config in its ladder. Each
 engine exchanges IPC handles with all ranks. All ranks must build the same
 engines in the same order. If they do not, the processes deadlock.
+
+Each rank works out what to build on its own, from its environment
+(`AITER_FLY_AR*`, `AITER_CUSTOM_AR_{MIN,MAX}_SIZE`,
+`AITER_QUICK_REDUCE_QUANTIZATION`), its arch and its link, so ranks can
+disagree. Before any engine is built, `CustomAllreduce` and `QuickAllReduce`
+gather every rank's plan over the CPU group
+(`flydsl_utils.all_ranks_agree_on_plan`). They build only if all plans match,
+otherwise FlyDSL collectives are off on every rank. The vote runs even when 
+FlyDSL is off, because a rank that skipped it would leave its peers waiting.
 
 ### The mesh and the ring are persistent kernels
 

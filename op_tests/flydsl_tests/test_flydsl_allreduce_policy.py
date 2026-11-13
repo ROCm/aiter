@@ -16,11 +16,11 @@ from unittest import mock
 import pytest
 import torch
 
-from aiter.dist.device_communicators.custom_all_reduce import (
-    CustomAllreduce,
+from aiter.dist.device_communicators.custom_all_reduce import CustomAllreduce
+from aiter.dist.device_communicators.quick_all_reduce import (
+    QuickAllReduce,
     is_weak_contiguous,
 )
-from aiter.dist.device_communicators.quick_all_reduce import QuickAllReduce
 from aiter.ops.flydsl import allreduce_host_shared as H
 from aiter.ops.flydsl import allreduce_policy as P
 from aiter.ops.flydsl.allreduce_host_shared import eligible_payload_bytes
@@ -29,6 +29,7 @@ from aiter.ops.flydsl.allreduce_policy import (
     AllReduceAlgorithm,
     FamilyPolicy,
     Window,
+    mesh_norm_ladder,
     mesh_st_ladder,
     oneshot_ladder,
     ring_st_ladder,
@@ -159,10 +160,17 @@ def test_exact_mode_runs_only_the_one_shot(cell):
     assert row.algorithms(quantized=False) in ((), (ONESHOT,))
 
 
-def test_every_platform_has_one_ladder_per_algorithm():
-    keys = sorted((a, link, ws) for link, ws, a in CELLS)
-    for table in (P.ONESHOT_LADDER, P.MESH_ST_LADDER, P.RING_ST_LADDER):
-        assert sorted(table) == keys
+@pytest.mark.parametrize("alg", list(AllReduceAlgorithm))
+def test_ladders_match_the_windows(alg):
+    """An algorithm has a ladder exactly on the platforms whose policy gives it
+    a window. Without one, dispatch would route payloads to an engine that
+    cannot be built."""
+    windowed = sorted(
+        (arch, link, ws)
+        for link, ws, arch in CELLS
+        if _row(link, ws, arch).window(alg, quantized=True) is not None
+    )
+    assert sorted(P.LADDERS[alg]) == windowed
 
 
 @pytest.mark.parametrize("cell", CELLS)
@@ -175,10 +183,13 @@ def test_ladders_are_well_formed(cell):
     """
     link, ws, arch = cell
     kw = {"world_size": ws, "link": link, "arch": arch}
-    for name, rungs, valid_st in (
+    two_shot = [
         ("mesh", mesh_st_ladder(**kw), SUPER_TILES),
-        ("ring", ring_st_ladder(**kw), RING_SUPER_TILES),
-    ):
+        ("mesh_norm", mesh_norm_ladder(**kw), SUPER_TILES),
+    ]
+    if _row(*cell).window(RING, quantized=True) is not None:
+        two_shot.append(("ring", ring_st_ladder(**kw), RING_SUPER_TILES))
+    for name, rungs, valid_st in two_shot:
         assert rungs, name
         assert rungs[0].min_bytes == 0, name
         floors = [r.min_bytes for r in rungs]
@@ -199,9 +210,20 @@ def test_ladders_are_well_formed(cell):
         assert r.block in SUPPORTED_BLOCKS, r
 
 
+def test_norm_ladder_rows_are_mesh_platforms():
+    """A fused RMSNorm row is where the mesh runs, and a platform without one
+    runs the fused RMSNorm on its mesh ladder."""
+    mesh = P.LADDERS[MESH]
+    assert set(P.MESH_NORM_LADDER) <= set(mesh)
+    for arch, link, ws in mesh:
+        kw = {"world_size": ws, "link": link, "arch": arch}
+        want = P.MESH_NORM_LADDER.get((arch, link, ws), mesh[(arch, link, ws)])
+        assert mesh_norm_ladder(**kw) == want
+
+
 def test_ladder_lookup_rejects_unknown_keys():
     """No fallback rungs: an unknown platform raises."""
-    for ladder in (oneshot_ladder, mesh_st_ladder, ring_st_ladder):
+    for ladder in (oneshot_ladder, mesh_st_ladder, mesh_norm_ladder, ring_st_ladder):
         with pytest.raises(P.NoPolicyError):
             ladder(world_size=4, link="pcie", arch="gfx942")
         with pytest.raises(ValueError):
@@ -433,16 +455,25 @@ def test_unreadable_topology_needs_the_link_variable():
     P._probe_link.cache_clear()
 
 
-def test_override_enables_a_disabled_algorithm():
-    """gfx950/xGMI has no ring. Overriding its window creates one, with the
-    other bound unbounded."""
-    with _env(
-        AITER_FLY_AR_MESH_MAX_BYTES=str(512 << 20),
-        AITER_FLY_AR_RING_MIN_BYTES=str(512 << 20),
+@pytest.mark.parametrize("cell", [("xgmi", ws, "gfx950") for ws in WORLDS])
+def test_override_cannot_enable_an_algorithm_without_a_ladder(cell):
+    """gfx950/xGMI has no ring, and no ring ladder to build one from. An
+    override that would open a ring window is ignored, with a warning."""
+    link, ws, _arch = cell
+    table = _row(*cell)
+    with (
+        _env(
+            AITER_FLY_AR_MESH_MAX_BYTES=str(512 << 20),
+            AITER_FLY_AR_RING_MIN_BYTES=str(512 << 20),
+        ),
+        mock.patch.object(P.logger, "warning") as warning,
     ):
-        p = _resolve("xgmi", 4)
-        assert p.window(RING, quantized=True) == Window(512 << 20, None)
-        assert p.select(1 << 30, quantized=True) == RING
+        p = _resolve(link, ws)
+    assert p.window(RING, quantized=True) is None
+    assert p.mesh == Window(table.mesh.min, 512 << 20)
+    assert p.select(1 << 30, quantized=True) is None
+    warning.assert_called_once()
+    assert warning.call_args.args[1] == "RING"
 
 
 def test_equal_bounds_disable():
@@ -491,8 +522,9 @@ def _full_storage_transpose(nbytes: int) -> torch.Tensor:
     """A bf16 view that is weakly but not strictly contiguous.
 
     The transpose of a whole contiguous allocation covers its storage exactly,
-    so ``is_weak_contiguous`` accepts it while ``Tensor.is_contiguous()`` does
-    not -- the gap the FlyDSL selectors have to close.
+    so quick-reduce's ``is_weak_contiguous`` accepts it while
+    ``Tensor.is_contiguous()`` does not -- the gap the FlyDSL selectors have to
+    close.
     """
     cols = 64
     rows = nbytes // (cols * 2)
@@ -504,10 +536,12 @@ def _full_storage_transpose(nbytes: int) -> torch.Tensor:
 def test_selectors_reject_non_contiguous():
     """Both FlyDSL selectors decline a weakly-contiguous view.
 
-    ``CustomAllreduce`` admits weakly-contiguous tensors, but both FlyDSL
+    ``QuickAllReduce`` admits weakly-contiguous tensors, but both FlyDSL
     engines require strict contiguity and raise otherwise. Once dispatch has
     picked FlyDSL the exception replaces the fallback, so the selectors must
-    decline these tensors themselves. Each selector is run against a stand-in
+    decline these tensors themselves. ``CustomAllreduce`` now admits only
+    strictly contiguous tensors, so its selector is checked as a guard: the
+    one-shot must not rely on the caller's check. Each selector is run against a stand-in
     ``self`` (the fields it reads), so no process group or GPU is needed. The
     contiguous copy of the same payload is accepted, which shows the refusal
     comes from contiguity rather than from size, dtype or alignment.

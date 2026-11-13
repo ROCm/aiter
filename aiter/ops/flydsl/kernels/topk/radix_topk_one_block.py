@@ -25,7 +25,7 @@ _KEY_BITS = 32
 _LONG_RADIX_DEFAULT = ((12, 10, 10), _PASS1_HISTOGRAM_REPLICAS)
 _LONG_RADIX_BY_ARCH = {
     "gfx950": ((14, 10, 8), 1),
-    "gfx1250": ((13, 13, 6), 1),
+    "gfx1250": ((13, 13, 6), 2),
 }
 _SHORT_RADIX_BITS = (11, 10, 11)
 _SHORT_RADIX_SHIFTS = (
@@ -44,8 +44,16 @@ _ONE_BLOCK_LDS_BUDGET_BYTES = {
     "gfx950": 78 * 1024,
     "gfx1250": 158 * 1024,
 }
+# A 512-thread block on these arches: two of them resident per CU, each with
+# half the budget above.
+_HALF_BLOCK_LDS_BUDGET_BYTES = {
+    "gfx1250": 78 * 1024,
+}
 _STABLE_INDEX_SORT_MIN_ROW_LEN = 1 << 15
 _STABLE_COMPACT_SORT_MIN_ROW_LEN = 48 * 1024
+# Arches whose streaming rows always take the index sort: there it beats the
+# ordered re-scan of the row at every length past the cached capacity.
+_STABLE_SORT_ALL_STREAMING_ROWS = ("gfx1250",)
 
 _FIRST_ABOVE = 0
 _FIRST_THRESHOLD = 1
@@ -122,16 +130,26 @@ def build_radix_topk_one_block_body(
     full_key_vector_steps = (
         (_COMPACT_CAPACITY // _VEC) + block_threads - 1
     ) // block_threads
+    half_block = block_threads == 512 and arch in _HALF_BLOCK_LDS_BUDGET_BYTES
     stable_sort_enabled = (
-        stable and not short_rows and block_threads == 1024 and k <= 2048
+        stable
+        and not short_rows
+        and (block_threads == 1024 or half_block)
+        and k <= 2048
     )
-    # Keep the crossover for a full-row gather followed by index sorting.
-    stable_sort_min_row_len = _STABLE_INDEX_SORT_MIN_ROW_LEN * (2 if k > 1024 else 1)
-    # Cached output uses a fixed 48K crossover on every architecture. Preserve
-    # existing configurations whose crossover is already lower.
-    stable_compact_sort_min_row_len = min(
-        stable_sort_min_row_len, _STABLE_COMPACT_SORT_MIN_ROW_LEN
-    )
+    if arch in _STABLE_SORT_ALL_STREAMING_ROWS:
+        # Rows up to the cached capacity never reach the streaming path.
+        stable_sort_min_row_len = stable_compact_sort_min_row_len = 0
+    else:
+        # Keep the crossover for a full-row gather followed by index sorting.
+        stable_sort_min_row_len = _STABLE_INDEX_SORT_MIN_ROW_LEN * (
+            2 if k > 1024 else 1
+        )
+        # Cached output uses a fixed 48K crossover on every architecture.
+        # Preserve existing configurations whose crossover is already lower.
+        stable_compact_sort_min_row_len = min(
+            stable_sort_min_row_len, _STABLE_COMPACT_SORT_MIN_ROW_LEN
+        )
     stable_sort_capacity = 1 << (k - 1).bit_length() if stable_sort_enabled else 1
     stable_sort_items_per_thread = (
         stable_sort_capacity + block_threads - 1
@@ -153,7 +171,11 @@ def build_radix_topk_one_block_body(
     # Writer and readers of the candidate columns are all gated on this.
     candidate_columns_used = not stable or stable_sort_enabled
     candidate_entry_bytes = 4 + (4 if candidate_columns_used else 0)
-    lds_budget_bytes = _ONE_BLOCK_LDS_BUDGET_BYTES.get(arch, 0)
+    lds_budget_bytes = (
+        _HALF_BLOCK_LDS_BUDGET_BYTES[arch]
+        if half_block
+        else _ONE_BLOCK_LDS_BUDGET_BYTES.get(arch, 0)
+    )
 
     spare_bytes = (
         lds_budget_bytes - histogram_bytes - stable_stage_bytes - scratch_bytes
@@ -1403,14 +1425,19 @@ def build_radix_topk_one_block_module(
     wave_size: int,
     arch: str = "",
     packed_rows: bool = False,
+    full_rows: bool = False,
 ):
     """Build a prefill/decode kernel specialized for the row-length bounds.
 
     packed_rows (decode only): row r is read from element row_starts[r] of
     the input's first row, while reported indices stay relative to that start.
 
+    full_rows (decode only): every row is `width` long and row_ends is not read.
+
     See build_radix_topk_one_block_body for the selector parameters.
     """
+    if full_rows and not is_decode:
+        raise ValueError("full_rows is a decode-mode build; prefill reads both ends")
     shared_storage, run_one_block_body = build_radix_topk_one_block_body(
         k,
         block_threads,
@@ -1428,6 +1455,7 @@ def build_radix_topk_one_block_module(
             f"_{row_variant}_k{k}_b{block_threads}_w{wave_size}"
             f"_v{int(write_values)}_s{int(stable)}"
             f"{'_packed' if packed_rows else ''}"
+            f"{'_full' if full_rows else ''}"
         ),
         known_block_size=[block_threads, 1, 1],
     )
@@ -1443,7 +1471,7 @@ def build_radix_topk_one_block_module(
         row = fx.Int32(fx.block_idx.x)
         if const_expr(is_decode):
             row_start = fx.Int32(0)
-            row_end = _row_length(row, row_ends, width, next_n)
+            row_end = _row_length(row, row_ends, width, next_n, full_rows)
         else:
             row_start = row_starts[row]
             row_end = row_ends[row]

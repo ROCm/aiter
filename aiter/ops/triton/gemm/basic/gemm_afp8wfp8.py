@@ -18,27 +18,33 @@ from aiter.ops.triton._triton_kernels.gemm.basic.gemm_afp8wfp8 import (
     _get_config,
 )
 from aiter.ops.triton.utils._triton.arch_info import get_arch
+from aiter.ops.triton.utils.device_info import get_num_xcds
+from aiter.ops.triton.utils.gemm_config_utils import clamp_num_buffers
 from aiter.ops.triton.utils.logger import AiterTritonLogger
-from aiter.utility.graph_alloc import ROUTES_INSIDE_CAPTURE, persistent_alloc
+from aiter.utility.graph_alloc import (
+    ROUTES_INSIDE_CAPTURE,
+    capture_scoped_cache,
+    persistent_alloc,
+)
 
 # One arrival counter per output tile of a fused split-K launch.
 _SPLIT_COUNTERS = 1 << 16
-_split_counters_by_stream: dict[tuple[torch.device, int], torch.Tensor] = {}
+
+
+@capture_scoped_cache
+def _split_counters_keyed(device: torch.device, stream_id: int) -> torch.Tensor:
+    with persistent_alloc(device):
+        return torch.zeros(_SPLIT_COUNTERS, dtype=torch.int32, device=device)
 
 
 def _split_counters(device: torch.device) -> torch.Tensor | None:
     """Zeroed arrival counters per (device, stream), as for the a16w16 split-K
     semaphores; kernels re-zero what they use. None when a stream's first use
     falls inside a capture that cannot allocate outside the graph pool."""
-    key = (device, torch.cuda.current_stream(device).cuda_stream)
-    counters = _split_counters_by_stream.get(key)
-    if counters is None:
-        if not ROUTES_INSIDE_CAPTURE and torch.cuda.is_current_stream_capturing():
-            return None
-        with persistent_alloc(device):
-            counters = torch.zeros(_SPLIT_COUNTERS, dtype=torch.int32, device=device)
-        _split_counters_by_stream[key] = counters
-    return counters
+    stream_id = torch.cuda.current_stream(device).cuda_stream
+    if not ROUTES_INSIDE_CAPTURE and torch.cuda.is_current_stream_capturing():
+        return _split_counters_keyed.eager_cached(device, stream_id)
+    return _split_counters_keyed(device, stream_id)
 
 
 def _split_k_partition(k: int, splits: int, step: int) -> tuple[int, int]:
@@ -62,7 +68,10 @@ def _fused_workspace(y, tiles, splits, block_m, block_n):
 
 _LOGGER = AiterTritonLogger()
 
-_GLUON_SUPPORTED_ARCHS = ("gfx1250",)
+_GLUON_SUPPORTED_ARCHS = (
+    "gfx1250",
+    "gfx1250-strict",
+)
 
 
 def _is_gluon_available():
@@ -306,6 +315,7 @@ def gemm_afp8wfp8(
             ws_ptr=partials,
             cnt_ptr=counters,
             cache_modifier=launch["cache_modifier"],
+            NUM_XCDS=get_num_xcds(),
             **scales,
             **launch_options,
         )
@@ -488,11 +498,10 @@ def gemm_afp8wfp8_preshuffle(
             kernel_type,
         )
 
-        # Shape-derived clamp, not a tuning default: the pipeline computes
-        # NUM_BUFFERS - 1 tiles outside the main loop, so the depth cannot
-        # exceed the K-tile count of a single split.
+        # The pipeline computes NUM_BUFFERS - 1 tiles outside the main loop. It
+        # uses at least 2 buffers.
         num_k_iter = triton.cdiv(config["SPLITK_BLOCK_SIZE"], config["BLOCK_SIZE_K"])
-        num_buffers = max(2, min(config["NUM_BUFFERS"], num_k_iter + 1))
+        num_buffers = max(2, clamp_num_buffers(config["NUM_BUFFERS"], num_k_iter))
 
         # warp_bases mirrors the a8w8 blockscale gluon wrapper: warp 0 walks N,
         # the remaining log2(num_warps // 2) warps walk M.
@@ -577,6 +586,7 @@ def gemm_afp8wfp8_preshuffle(
             w_scales.stride(1),
             A_SCALE_K_GROUP=x_scale_group_size,
             **config,
+            NUM_XCDS=get_num_xcds(),
         )
 
     if config["NUM_KSPLIT"] > 1:

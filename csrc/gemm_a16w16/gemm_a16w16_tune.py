@@ -23,7 +23,7 @@ import torch.nn.functional as F
 import aiter
 from aiter import dtypes, logger
 from aiter.jit.core import AITER_CONFIG_GEMM_BF16, get_asm_dir
-from aiter.jit.utils.chip_info import get_cu_num, get_gfx
+from aiter.jit.utils.chip_info import get_cu_num, get_gfx, get_gfx_runtime
 from aiter.ops.flydsl.gemm_a16w16_policy import (
     get_flydsl_a16w16_configs,
 )
@@ -32,6 +32,7 @@ from aiter.ops.flydsl.gemm_kernels import (
     flydsl_hgemm_kernel_name,
 )
 from aiter.ops.gemm_op_a16w16 import ASM_SPLITK_MAX_GRID
+from aiter.ops.opus._arch import _device_arch_and_cu
 from aiter.ops.triton.gemm.basic.gemm_a16w16 import gemm_a16w16 as triton_gemm_a16w16
 from aiter.utility.base_tuner import GemmCommonTuner
 from aiter.utility.mp_tuner import mp_tuner
@@ -45,14 +46,13 @@ try:
     _opus_csrc = os.path.join(os.path.dirname(__file__), "../opus_gemm")
     if _opus_csrc not in sys.path:
         sys.path.insert(0, os.path.abspath(_opus_csrc))
-    from opus_gemm_common import (
-        SPLITK_KIDS as _opus_splitk_kids,
-    )
-    from opus_gemm_common import (
-        kernels_list as _opus_kernels_list,
-    )
+    from opus_gemm_common import get_registry as _opus_get_registry
     from opus_gemm_tune import (
         _ensure_kids_compiled as _opus_ensure_kids_compiled,
+    )
+    from opus_gemm_tune import (
+        _tune_arch,
+        _tune_cu,
     )
     from opus_gemm_tune import (
         candidate_kids_for_shape as _opus_candidate_kids_for_shape,
@@ -69,11 +69,11 @@ try:
 
     from aiter.ops.opus import opus_gemm as _opus_gemm
 
-    _opus_all_kernels = dict(_opus_kernels_list)
+    _opus_tune_identity = (_tune_arch, _tune_cu)
 except Exception as _opus_exc:  # noqa: BLE001
     _opus_gemm = None
-    _opus_all_kernels = None
-    _opus_splitk_kids = frozenset()
+    _opus_tune_identity = None
+    _opus_get_registry = None
     _opus_candidate_kids_for_shape = None
     _opus_kid_rejects_shape = None
     _opus_kid_rejects_bias = None
@@ -207,6 +207,7 @@ def run_opus_gemm_bf16(inp, weight, out, bias=None, kid=0, splitK=0):
         weight,
         out,
         bias=bias,
+        family="a16w16",
         kid=kid,
         split_k=splitK,
     )
@@ -306,7 +307,11 @@ def run_flydsl_gemm_bf16(
         k_waves=config["k_waves"],
         stages=config["stages"],
         group_m=config["group_m"],
-        policy="ht" if config["use_half_tile_interleaved"] else "ft",
+        k_stagger=config.get("k_stagger", 0),
+        b_non_temporal=config.get("b_non_temporal", False),
+        policy=config.get(
+            "policy", "ht" if config["use_half_tile_interleaved"] else "ft"
+        ),
         out_dtype=otype,
     )
     if bias is not None and fused_bias is None:
@@ -328,21 +333,22 @@ def get_flydsl_bf16_catalog(
     k: int,
     out_dtype: torch.dtype,
     has_bias: bool,
+    in_dtype: torch.dtype = torch.bfloat16,
 ):
     if flydsl_hgemm_kernel_name is None:
         return []
-    fused_bias = bool(has_bias and out_dtype == torch.bfloat16)
+    fused_bias = bool(has_bias and out_dtype == in_dtype)
     configs = get_flydsl_a16w16_configs(
         m,
         n,
         k,
-        torch.bfloat16,
+        in_dtype,
         out_dtype,
         fused_bias,
     )
     kernels = {
         flydsl_hgemm_kernel_name(
-            dtype=torch.bfloat16,
+            dtype=in_dtype,
             out_dtype=out_dtype,
             config=config,
             has_bias=fused_bias,
@@ -407,6 +413,9 @@ def libtype_list(string):
 
 
 class GemmA16W16Tuner(GemmCommonTuner):
+    def get_gfx(self):
+        return _device_arch_and_cu(torch.cuda.current_device())[0]
+
     ARG_DEFAULTS: ClassVar[dict[str, Any]] = {
         **GemmCommonTuner.ARG_DEFAULTS,
         "tune_file": f"{AITER_CONFIG_GEMM_BF16}",
@@ -685,19 +694,22 @@ class GemmA16W16Tuner(GemmCommonTuner):
         if scaleAB or indtype != dtypes.bf16:
             return []
         M, N, K = info_keys[2], info_keys[3], info_keys[4]
-        cu_num = get_cu_num()
+        gfx, cu_num = info_keys[0], int(info_keys[1])
+        if (gfx, cu_num) != _opus_tune_identity:
+            raise ValueError("Opus task namespace disagrees with the tuner catalog")
+        kernels = _opus_get_registry("a16w16", gfx, cu_num)
         rtol, atol = _default_tol(outdtype)
         cand_kids = _opus_candidate_kids_for_shape(M, N, K, has_bias, cu_num)
         tasks = []
         for kid in sorted(cand_kids):
-            k_inst = _opus_all_kernels.get(kid)
+            k_inst = kernels.get(kid)
             if k_inst is None:
                 continue
             if _opus_kid_rejects_shape(k_inst, M, N, K):
                 continue
             if _opus_kid_rejects_bias(k_inst, has_bias):
                 continue
-            if kid in _opus_splitk_kids:
+            if k_inst.splitk_workspace_dtype is not None:
                 splitK_range = _opus_candidate_splitK(M, N, K, 1, cu_num, k_inst)
             else:
                 splitK_range = [0]
@@ -732,11 +744,14 @@ class GemmA16W16Tuner(GemmCommonTuner):
     def _get_flydsl_tasks(
         self, info_keys, has_bias, indtype, outdtype, scaleAB, is_shuffle, run_kwargs
     ):
-        if scaleAB or is_shuffle or indtype != dtypes.bf16:
+        supported_dtype = indtype == dtypes.bf16 or (
+            get_gfx_runtime() == "gfx1250" and indtype == dtypes.fp16
+        )
+        if scaleAB or is_shuffle or not supported_dtype:
             return []
         M, N, K = (int(info_keys[2]), int(info_keys[3]), int(info_keys[4]))
         rtol, atol = _default_tol(outdtype)
-        flydsl_catalog = get_flydsl_bf16_catalog(M, N, K, outdtype, has_bias)
+        flydsl_catalog = get_flydsl_bf16_catalog(M, N, K, outdtype, has_bias, indtype)
         tasks = []
         for solidx, kernel_name, config in flydsl_catalog:
             info = (
@@ -891,19 +906,24 @@ class GemmA16W16Tuner(GemmCommonTuner):
             verbose=args.verbose,
             rtol=rtol,
             atol=atol,
+            policy=self.policy_for(args),
         )
         rets = gemmobj.run_solutions()
         gemmobj.cleanup()
 
         result = []
-        for info, us, err_ratio in rets:
+        from aiter.utility.tune_result import TuneResult
+
+        for el in rets:
+            info, us, err_ratio = el
             shape_tuple, solidx, splitK, kernelName, libtype, bpreshuffle = info
             keys_10 = (gfx, cu_num) + shape_tuple
             result.append(
-                (
+                TuneResult(
                     (keys_10, solidx, splitK, kernelName, libtype, bpreshuffle),
                     us,
                     err_ratio,
+                    getattr(el, "watts", float("nan")),
                 )
             )
         return result
@@ -922,6 +942,7 @@ class GemmA16W16Tuner(GemmCommonTuner):
         task = []
         tasks_data = []
         hipblaslt_rets = []
+        opus_kids = set()
 
         for i in range(len(untunedf)):
             ds = untunedf.loc[i, :]
@@ -967,13 +988,7 @@ class GemmA16W16Tuner(GemmCommonTuner):
                 task.extend(self._get_triton_tasks(*common))
             if "all" in libtype or "opus" in libtype:
                 opus_tasks = self._get_opus_tasks(*common)
-                if opus_tasks and _opus_ensure_kids_compiled is not None:
-                    opus_kids = {t[0][1] for t in opus_tasks}
-                    if _opus_ensure_kids_compiled(opus_kids):
-                        logger.info(
-                            f"opus subset-compile: expanded sidecar to cover "
-                            f"{len(opus_kids)} candidate kids"
-                        )
+                opus_kids.update(t[0][1] for t in opus_tasks)
                 task.extend(opus_tasks)
 
             shape_kernel_nums = len(task) - prev_count
@@ -981,6 +996,16 @@ class GemmA16W16Tuner(GemmCommonTuner):
 
             if with_hipblaslt and ("all" in libtype or "hipblaslt" in libtype):
                 hipblaslt_rets.extend(self._run_hipblaslt(ds, args))
+
+        if (
+            opus_kids
+            and _opus_ensure_kids_compiled is not None
+            and _opus_ensure_kids_compiled(opus_kids)
+        ):
+            logger.info(
+                f"opus subset-compile: prepared module for "
+                f"{len(opus_kids)} candidate kids"
+            )
 
         ret = []
         if task:
@@ -1013,25 +1038,26 @@ class GemmA16W16Tuner(GemmCommonTuner):
                     kernelName = "None"
             tflops, bw = self.calculate(el)
             key_dict = dict(zip(self.keys, keys))
+            metrics = {
+                "libtype": [libtype],
+                "solidx": [kernelId],
+                "splitK": [splitK],
+                "us": [time],
+                "kernelName": [kernelName],
+                "err_ratio": [err_ratio],
+                "tflops": [tflops],
+                "bw": [bw],
+            }
+            extra, watt_text = self.policy.result_metrics(el, tflops)
+            metrics.update(extra)
             if len(results) == self.topk:
                 print(
                     f"Tuning result for {str(key_dict).strip('{}')} is "
                     f"libtype={libtype} kernelId={kernelId} {kernelName} "
                     f"splitK={splitK}, {time}us, err_ratio={err_ratio}, "
-                    f"tflops={tflops} TFLOPS, bw={bw} GB/s"
+                    f"tflops={tflops} TFLOPS, bw={bw} GB/s{watt_text}"
                 )
-            key_dict.update(
-                {
-                    "libtype": [libtype],
-                    "solidx": [kernelId],
-                    "splitK": [splitK],
-                    "us": [time],
-                    "kernelName": [kernelName],
-                    "err_ratio": [err_ratio],
-                    "tflops": [tflops],
-                    "bw": [bw],
-                }
-            )
+            key_dict.update(metrics)
             rows.append(key_dict)
         # Build the frame once. Concatenating per row is O(n^2) in both time and
         # allocation: with -o2 (profile of every candidate) a 42-shape x ~600

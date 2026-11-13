@@ -4,8 +4,7 @@
 """Every tuned decision of the FlyDSL all-reduce: which kernel runs a payload,
 and in which configuration.
 
-Kernels
-=======
+**Kernels**
 
 * **one-shot** (``OneShotAllReduce``) -- one round, no grid-wide barrier, wire
   volume ``(N-1)*S``. Exact: fp32 accumulate, one bf16 rounding.
@@ -17,8 +16,7 @@ Kernels
 
 The decisions come in two levels.
 
-Level 1: which algorithm
-========================
+**Level 1: which algorithm**
 
 ``FAMILY_POLICIES`` has one ``FamilyPolicy`` per ``(arch, link,
 world_size)``. A policy has one ``Window`` of payload sizes per algorithm
@@ -41,14 +39,14 @@ the mesh and the ring take their payloads first.
 host's arch and link, with the ``AITER_FLY_AR_<ALG>_{MIN,MAX}_BYTES``
 overrides applied.
 
-Level 2: which configuration
-============================
+**Level 2: which configuration**
 
 Each algorithm has a tuning ladder per ``(arch, link, world_size)``:
 ``ONESHOT_LADDER``, ``MESH_ST_LADDER`` and ``RING_ST_LADDER``. A ladder is a
 tuple of rungs in ascending ``min_bytes`` order, and a payload runs on the last
 rung whose ``min_bytes`` is at most its size (``select_rung``). The host builds
-one engine per rung.
+one engine per rung. The mesh algorithm's fused add+RMSNorm path has its own ladder,
+``MESH_NORM_LADDER``, and runs on the plain mesh ladder where that has no row.
 """
 
 from __future__ import annotations
@@ -329,8 +327,8 @@ FAMILY_POLICIES: tuple[FamilyPolicy, ...] = (
         arch="gfx950",
         link="xgmi",
         world_size=2,
-        oneshot=Window(0, 3 * MiB),
-        mesh=Window(448 * KiB, None),
+        oneshot=Window(0, 4 * MiB),
+        mesh=Window(512 * KiB, None),
         ring=None,
     ),
     FamilyPolicy(
@@ -338,7 +336,7 @@ FAMILY_POLICIES: tuple[FamilyPolicy, ...] = (
         link="xgmi",
         world_size=4,
         oneshot=Window(0, 160 * KiB),
-        mesh=Window(960 * KiB, None),
+        mesh=Window(384 * KiB, None),
         ring=None,
     ),
     FamilyPolicy(
@@ -346,7 +344,7 @@ FAMILY_POLICIES: tuple[FamilyPolicy, ...] = (
         link="xgmi",
         world_size=8,
         oneshot=Window(0, 96 * KiB),
-        mesh=Window(1600 * KiB, None),
+        mesh=Window(384 * KiB, None),
         ring=None,
     ),
     # --- gfx950 (MI350P) / PCIe ----------------------------------------------
@@ -423,15 +421,11 @@ ONESHOT_LADDER: dict[tuple[str, str, int], tuple[OneShotRung, ...]] = {
         OneShotRung(min_bytes=0, atoms=1, grid_cap=128, fanout="peer", block=128),
     ),
     # --- gfx950 (MI355X) / xGMI ----------------------------------------------
-    # TODO: measured on gfx942; tune on gfx950.
     ("gfx950", "xgmi", 2): (
-        OneShotRung(min_bytes=0, atoms=1, grid_cap=128, fanout="peer", block=128),
-        OneShotRung(
-            min_bytes=256 * KiB, atoms=1, grid_cap=128, fanout="peer", block=256
-        ),
+        OneShotRung(min_bytes=0, atoms=1, grid_cap=128, fanout="peer", block=256),
     ),
     ("gfx950", "xgmi", 4): (
-        OneShotRung(min_bytes=0, atoms=1, grid_cap=128, fanout="peer", block=256),
+        OneShotRung(min_bytes=0, atoms=1, grid_cap=128, fanout="peer", block=128),
     ),
     ("gfx950", "xgmi", 8): (
         OneShotRung(min_bytes=0, atoms=1, grid_cap=128, fanout="peer", block=128),
@@ -471,19 +465,14 @@ MESH_ST_LADDER: dict[tuple[str, str, int], tuple[TwoShotRung, ...]] = {
         TwoShotRung(min_bytes=6 * MiB, super_tile=8, grid_cap=128, block=512),
     ),
     # --- gfx950 (MI355X) / xGMI ----------------------------------------------
-    # TODO: measured on gfx942; tune on gfx950.
     ("gfx950", "xgmi", 2): (
-        TwoShotRung(min_bytes=0, super_tile=1, grid_cap=128, block=256),
-        TwoShotRung(min_bytes=4 * MiB, super_tile=1, grid_cap=128, block=512),
+        TwoShotRung(min_bytes=0, super_tile=1, grid_cap=512, block=256),
     ),
     ("gfx950", "xgmi", 4): (
-        TwoShotRung(min_bytes=0, super_tile=8, grid_cap=128, block=256),
-        TwoShotRung(min_bytes=4 * MiB, super_tile=1, grid_cap=128, block=512),
+        TwoShotRung(min_bytes=0, super_tile=1, grid_cap=1024, block=256),
     ),
     ("gfx950", "xgmi", 8): (
-        TwoShotRung(min_bytes=0, super_tile=1, grid_cap=128, block=256),
-        TwoShotRung(min_bytes=4 * MiB, super_tile=1, grid_cap=128, block=512),
-        TwoShotRung(min_bytes=6 * MiB, super_tile=8, grid_cap=128, block=512),
+        TwoShotRung(min_bytes=0, super_tile=8, grid_cap=384, block=256),
     ),
     # --- gfx950 (MI350P) / PCIe ----------------------------------------------
     ("gfx950", "pcie", 2): (
@@ -499,8 +488,24 @@ MESH_ST_LADDER: dict[tuple[str, str, int], tuple[TwoShotRung, ...]] = {
     ),
 }
 
+# Mesh with the fused add+RMSNorm epilogue, ``TwoShotRung``. Every rank
+# normalises the whole payload in the all-gather lap.
+# A platform with no row runs on its mesh ladder.
+#
+#   xGMI  gfx950
+#           TP8: ST=1 b256 cap1024 over the whole window, at hidden 4096
+#           and 8192, with or without MXFP4. TP2 and TP4 have no row: their mesh
+#           rung is also the best fused one.
+MESH_NORM_LADDER: dict[tuple[str, str, int], tuple[TwoShotRung, ...]] = {
+    # --- gfx950 (MI355X) / xGMI ----------------------------------------------
+    ("gfx950", "xgmi", 8): (
+        TwoShotRung(min_bytes=0, super_tile=1, grid_cap=1024, block=256),
+    ),
+}
+
 # Ring, ``TwoShotRung``. The ring publishes ``2(N-1)`` times per super-tile, so
-# a larger payload wants a larger super-tile.
+# a larger payload wants a larger super-tile. Only the platforms whose policy
+# rings have a row: gfx950/xGMI and gfx950/PCIe at TP2 never use ring algorithm.
 RING_ST_LADDER: dict[tuple[str, str, int], tuple[TwoShotRung, ...]] = {
     # --- gfx942 (MI300X) / xGMI ----------------------------------------------
     ("gfx942", "xgmi", 2): (
@@ -516,31 +521,21 @@ RING_ST_LADDER: dict[tuple[str, str, int], tuple[TwoShotRung, ...]] = {
         TwoShotRung(min_bytes=0, super_tile=16, grid_cap=128, block=256),
         TwoShotRung(min_bytes=48 * MiB, super_tile=32, grid_cap=128, block=256),
     ),
-    # --- gfx950 (MI355X) / xGMI ----------------------------------------------
-    # TODO: measured on gfx942; tune on gfx950.
-    ("gfx950", "xgmi", 2): (
-        TwoShotRung(min_bytes=0, super_tile=8, grid_cap=128, block=256),
-        TwoShotRung(min_bytes=24 * MiB, super_tile=16, grid_cap=128, block=256),
-    ),
-    ("gfx950", "xgmi", 4): (
-        TwoShotRung(min_bytes=0, super_tile=8, grid_cap=128, block=256),
-        TwoShotRung(min_bytes=24 * MiB, super_tile=16, grid_cap=128, block=256),
-        TwoShotRung(min_bytes=48 * MiB, super_tile=32, grid_cap=128, block=256),
-    ),
-    ("gfx950", "xgmi", 8): (
-        TwoShotRung(min_bytes=0, super_tile=16, grid_cap=128, block=256),
-        TwoShotRung(min_bytes=48 * MiB, super_tile=32, grid_cap=128, block=256),
-    ),
     # --- gfx950 (MI350P) / PCIe ----------------------------------------------
-    ("gfx950", "pcie", 2): (
-        TwoShotRung(min_bytes=0, super_tile=16, grid_cap=128, block=512),
-    ),
     ("gfx950", "pcie", 4): (
         TwoShotRung(min_bytes=0, super_tile=32, grid_cap=128, block=512),
     ),
     ("gfx950", "pcie", 8): (
         TwoShotRung(min_bytes=0, super_tile=32, grid_cap=128, block=512),
     ),
+}
+
+# The ladder table of each algorithm. A table has a row exactly where the
+# policy table gives its algorithm a window.
+LADDERS: dict[AllReduceAlgorithm, dict] = {
+    AllReduceAlgorithm.OneShot: ONESHOT_LADDER,
+    AllReduceAlgorithm.TwoShotMesh: MESH_ST_LADDER,
+    AllReduceAlgorithm.TwoShotRing: RING_ST_LADDER,
 }
 
 
@@ -569,6 +564,25 @@ def mesh_st_ladder(
     return _ladder(MESH_ST_LADDER, "mesh", arch, link, world_size)
 
 
+def mesh_norm_ladder(
+    *,
+    world_size: int,
+    link: str,
+    arch: str | None = None,
+    mesh: tuple[TwoShotRung, ...] | None = None,
+) -> tuple[TwoShotRung, ...]:
+    """The rungs of the mesh's fused add+RMSNorm for *(arch, link,
+    world_size)*: its row in ``MESH_NORM_LADDER``, or where there is none the
+    mesh ladder, *mesh* if given. *arch* defaults to this host's."""
+    arch = detect_arch() if arch is None else arch
+    rungs = MESH_NORM_LADDER.get((arch, link, int(world_size)))
+    if rungs is not None:
+        return rungs
+    if mesh is not None:
+        return mesh
+    return mesh_st_ladder(world_size=world_size, link=link, arch=arch)
+
+
 def ring_st_ladder(
     *, world_size: int, link: str, arch: str | None = None
 ) -> tuple[TwoShotRung, ...]:
@@ -585,8 +599,12 @@ MIN_BATCH_BLOCKS = 32
 # World size from which the ring's reduce-scatter lap defaults to INT6, to
 # clear the 18 dB SQNR floor the schedules are held to. The ring requantizes
 # the running partial at every hop, and the partial's extremum grows with the
-# contributions folded in, so unlike the mesh its error grows with N.
-RS_INT6_MIN_WORLD = 8
+# contributions folded in, so unlike the mesh its error grows with N. With the
+# E5M2 group scale an all-INT4 ring reaches 17.9 dB at TP4 (E4M3: 18.3), under
+# the floor, so INT6 starts at TP4. On PCIe that is up to 26/18 of the
+# reduce-scatter bytes at TP4; a precision-preserving scale (per-slice
+# E4M3/E5M2) would let it move back to TP8.
+RS_INT6_MIN_WORLD = 4
 
 # Default ``min_bytes`` of a ``FlyQuickAllReduce`` built directly, outside the
 # dispatchers: the payload below which its ``allreduce`` refuses to run. The
@@ -655,7 +673,12 @@ def _override(window: Window | None, lo, hi) -> Window | None:
 
 
 def apply_env_overrides(policy: FamilyPolicy) -> FamilyPolicy:
-    """*policy* with the ``AITER_FLY_AR_<ALG>_{MIN,MAX}_BYTES`` overrides."""
+    """*policy* with the ``AITER_FLY_AR_<ALG>_{MIN,MAX}_BYTES`` overrides.
+
+    An override can move a window and enable an algorithm, but only where
+    the algorithm has a ladder for the platform. Elsewhere the override is
+    ignored.
+    """
 
     bounds = {
         alg: (
@@ -664,12 +687,25 @@ def apply_env_overrides(policy: FamilyPolicy) -> FamilyPolicy:
         )
         for alg, infix in _WINDOW_ENV.items()
     }
-    return dataclasses.replace(
-        policy,
-        oneshot=_override(policy.oneshot, *bounds[AllReduceAlgorithm.OneShot]),
-        mesh=_override(policy.mesh, *bounds[AllReduceAlgorithm.TwoShotMesh]),
-        ring=_override(policy.ring, *bounds[AllReduceAlgorithm.TwoShotRing]),
-    )
+    key = (policy.arch, policy.link, policy.world_size)
+    windows = {}
+    for alg, field in (
+        (AllReduceAlgorithm.OneShot, "oneshot"),
+        (AllReduceAlgorithm.TwoShotMesh, "mesh"),
+        (AllReduceAlgorithm.TwoShotRing, "ring"),
+    ):
+        window = _override(getattr(policy, field), *bounds[alg])
+        if window is not None and not window.is_empty and key not in LADDERS[alg]:
+            logger.warning(
+                "AITER_FLY_AR_%s_{MIN,MAX}_BYTES ignored: the %s has no tuned "
+                "configuration on %s/%s/TP%d.",
+                _WINDOW_ENV[alg],
+                alg.value,
+                *key,
+            )
+            window = getattr(policy, field)
+        windows[field] = window
+    return dataclasses.replace(policy, **windows)
 
 
 def enabled() -> bool:

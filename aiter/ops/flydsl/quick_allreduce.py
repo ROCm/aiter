@@ -11,7 +11,7 @@ they are named for the topology of each lap instead:
 * ``"ring"`` 2(N-1) single-destination hops.
 
 Super-tile ST∈{1,8} on the mesh, ST∈{1,8,16,32} on the ring. INT4 nibble,
-INT5 nibble+1-bit plane, or INT6 bit-plane pair, all with group-16 E4M3
+INT5 nibble+1-bit plane, or INT6 bit-plane pair, all with group-16 E5M2
 scales. INT5 is mesh-only. Payload HBM is bf16.
 
 The kernel configuration comes from a tuning ladder of ``TwoShotRung``, keyed
@@ -27,7 +27,7 @@ from dataclasses import dataclass
 
 import torch
 import torch.distributed as dist
-from flydsl.expr.typing import Int32, Int64, Stream
+from flydsl.expr.typing import Float32, Int32, Int64, Stream
 
 from aiter.jit.utils.chip_info import get_lds_capacity_bytes
 
@@ -39,7 +39,9 @@ from .allreduce_host_shared import (
     check_payload,
     check_world_size,
     kernel_symbol,
+    launcher_loaded,
     payload_probes,
+    preload_launcher,
     require_arch,
 )
 from .allreduce_policy import (
@@ -50,6 +52,7 @@ from .allreduce_policy import (
     RS_INT6_MIN_WORLD,
     SUPPORTED_BLOCKS,
     TwoShotRung,
+    mesh_norm_ladder,
     mesh_st_ladder,
     resolve_link,
     ring_st_ladder,
@@ -57,12 +60,13 @@ from .allreduce_policy import (
 )
 from .ipc_heap import UncachedIpcHeap
 from .kernels.comm.allreduce_shared import (
-    ATOMS,
     BLOCK,
     WORLD,
     has_release_fence,
 )
 from .kernels.comm.quick_allreduce_mesh import (
+    DEFAULT_ATOMS,
+    DEFAULT_DIVISOR,
     MESH_CODECS,
     MESH_RELAY_DEFAULTS,
     SUPER_TILES,
@@ -70,8 +74,10 @@ from .kernels.comm.quick_allreduce_mesh import (
     clamp_grid_cap,
     latency_max_tiles,
     make_quick_allreduce_mesh_kernel,
+    max_payload_bytes,
+    mesh_lds_bytes,
     mxfp4_scale_shape,
-    rmsnorm_hidden_supported,
+    tile_atoms_for,
 )
 from .kernels.comm.quick_allreduce_mesh import (
     relay_tile_fraction as _tile_fraction,
@@ -82,13 +88,39 @@ from .kernels.comm.quick_allreduce_ring import (
     RS_CODECS,
     make_quick_allreduce_ring_kernel,
 )
-from .kernels.tensor_shim import _preload_compiled, _run_compiled
+from .kernels.tensor_shim import _run_compiled
 from .quick_allreduce_relay import InGroupRelayProvider, RelayProvider
 
 logger = logging.getLogger("aiter")
 
 # Largest payload ``check_payload`` accepts, rounded down to its alignment.
 _MAX_PAYLOAD = MAX_PAYLOAD_BYTES - MAX_PAYLOAD_BYTES % PAYLOAD_ALIGN_BYTES
+
+# The sum is restored in fp16 before the bf16 store, by scaling each group's
+# dequant step (group scale * 1/bias) by the divisor. With the E5M2 group
+# scale every fp16 extremum fits at divisor 1, so the divisor is opt-in and the
+# scale range no longer sets these bounds. The smallest step is 2**-15 (INT4
+# and INT6 alike, see Codec.scale_min_e5); at DIVISOR_MIN it is restored as
+# 2**-19, an fp16 subnormal that still holds the 2-bit mantissa exactly
+# (subnormal spacing 2**-24). Inputs are divided by the divisor before the
+# first pack, so restored values keep the input's magnitude at DIVISOR_MAX.
+DIVISOR_MIN = 2.0**-4
+DIVISOR_MAX = 128.0
+
+
+def _check_divisor(divisor: float) -> float:
+    """One shared positive divisor. ``1`` disables the scaling."""
+    msg = (
+        f"FlyQuickAllReduce divisor must be a finite float in "
+        f"[{DIVISOR_MIN:g}, {DIVISOR_MAX:g}], got {divisor!r}"
+    )
+    try:
+        value = float(divisor)
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise ValueError(msg) from exc
+    if not math.isfinite(value) or not DIVISOR_MIN <= value <= DIVISOR_MAX:
+        raise ValueError(msg)
+    return value
 
 
 @dataclass(frozen=True)
@@ -102,10 +134,17 @@ class _Algorithm:
     ag_codecs: tuple[str, ...]
     # ``(*, world_size, link, arch) -> (TwoShotRung, ...)``: the tuning ladder.
     st_ladder: Callable[..., tuple[TwoShotRung, ...]]
+    # ``(*, world_size, link, arch, mesh) -> (TwoShotRung, ...)``: the ladder
+    # of the fused add+RMSNorm, *mesh* where it has no tuned row; ``None`` for
+    # a schedule without one.
+    norm_ladder: Callable[..., tuple[TwoShotRung, ...]] | None = None
     # Trailing ``Int64`` kernel arguments before the grid size: the fused
-    # RMSNorm's residual, residual_out, weight, MXFP4 out and scale pointers.
-    # Plain launches pass zeros.
+    # RMSNorm's residual, residual_out, weight, MXFP4 out and scale pointers,
+    # then its ``Float32`` epsilon. Plain launches pass zeros. A schedule
+    # without the fused RMSNorm has none of them.
     norm_ptr_args: int = 0
+    # Whether the kernel takes the shared ``divisor`` as its last argument.
+    has_divisor: bool = False
     # Mesh carries one format on both laps. The ring may differ.
     single_codec: bool = False
 
@@ -151,7 +190,9 @@ ALGORITHMS = {
         rs_codecs=MESH_CODECS,
         ag_codecs=MESH_CODECS,
         st_ladder=mesh_st_ladder,
+        norm_ladder=mesh_norm_ladder,
         norm_ptr_args=NORM_PTR_ARGS,
+        has_divisor=True,
         single_codec=True,
     ),
     "ring": _Algorithm(
@@ -171,7 +212,7 @@ def _resolve_codecs(algo, world_size, rs_codec, ag_codec):
 
     ``None`` means "not specified", and the caller is expected to pass it
     whenever it wants the schedule's own default rather than a pinned wire
-    format. That distinction matters at TP8, where the ring's reduce-scatter
+    format. That distinction matters from TP4, where the ring's reduce-scatter
     lap defaults to INT6: an explicit ``rs_codec="int4"`` there is a real
     downgrade, not a restatement of the default.
 
@@ -181,7 +222,7 @@ def _resolve_codecs(algo, world_size, rs_codec, ag_codec):
     The mesh is single-codec: ``rs_codec`` and ``ag_codec`` follow each other,
     so give either one and the other takes the same value, and giving two
     different values raises. It stays on INT4 unless a caller names another
-    format, so TP8's INT6 reduce-scatter default does not leak into it.
+    format, so the ring's INT6 reduce-scatter default does not leak into it.
     """
     if algo.single_codec:
         if rs_codec is not None and ag_codec is not None and rs_codec != ag_codec:
@@ -268,8 +309,12 @@ class FlyQuickAllReduce:
 
     ``link`` selects the tuning ladder and is detected from the KFD topology
     when not given. ``ladder`` replaces the tuning ladder of the policy, for
-    tests that run other configurations. Both schedules specialise their
+    tests that run other configurations, and ``norm_ladder`` does the same for
+    the fused add+RMSNorm of the mesh algorithm. Both schedules specialise their
     binary to this rank, so the JIT symbol carries an ``_r<n>_`` field.
+
+    ``rmsnorm_hidden`` lists the row widths ``allreduce_rmsnorm`` will be
+    called with.
 
     ``relay_devices=(r01, r10)`` routes a fraction of each call's blocks through
     other GPUs of the node, the relay for rank0→rank1 and the one for
@@ -295,6 +340,8 @@ class FlyQuickAllReduce:
         ag_codec: str | None = None,
         link: str | None = None,
         ladder: tuple[TwoShotRung, ...] | None = None,
+        norm_ladder: tuple[TwoShotRung, ...] | None = None,
+        rmsnorm_hidden: tuple[int, ...] = (),
         relay_devices: tuple[int, int] | None = None,
         relay_fraction: tuple[int, int] | None = None,
         relay_min_bytes: int | None = None,
@@ -324,6 +371,14 @@ class FlyQuickAllReduce:
             ladder = algo.st_ladder(world_size=world_size, link=link, arch=arch)
         if not ladder:
             raise ValueError("ladder must have at least one rung")
+        if norm_ladder is None and algo.norm_ladder is not None:
+            # Untuned, the fused RMSNorm runs on this object's own ladder, so a
+            # ``ladder`` override reaches it too.
+            norm_ladder = algo.norm_ladder(
+                world_size=world_size, link=link, arch=arch, mesh=ladder
+            )
+        if norm_ladder is not None and not norm_ladder:
+            raise ValueError("norm_ladder must have at least one rung")
         inbox_flags, resolved_inbox = _resolve_inbox_flags(
             inbox_memory, world_size, link
         )
@@ -355,39 +410,24 @@ class FlyQuickAllReduce:
         if self.min_bytes < 0:
             raise ValueError(f"min_bytes must be non-negative, got {self.min_bytes}")
 
-        # One engine per distinct ``(super_tile, block)``, keyed that way in
-        # ``_by_cfg``. Each ``block`` also gets an ST=1 engine: _pick_cfg falls
-        # back to it when a payload has fewer tiles than the chosen super-tile,
-        # and the fallback has to share the rung's block -- a different tile
-        # size would change the tile count it was picked for. Engines are built
-        # in a fixed order because each does its own IPC handle exchange, which
-        # is a collective -- ranks disagreeing on the order would deadlock.
-        #
-        # The rungs go in first so an ST=1 that the ladder *sites* keeps its own
-        # cap. Only then is the fallback filled in, and at the smallest cap
-        # among its rungs rather than at the global default: the fallback fires
-        # only when a payload has fewer tiles than the super-tile it would
-        # otherwise take, so ``_grid_x`` there is bounded by that super-tile
-        # (<= 32) with a release fence, and by the chosen rung's own cap without
-        # one -- under 128 either way. Seeding it with the 1216 default instead
-        # built a 194 MiB inbox to launch at most 32 blocks into, and did it on
-        # every object ever constructed.
-        caps = {}
-        for r in ladder:
-            caps.setdefault((r.super_tile, r.block), r.grid_cap)
-        for b in {b for _st, b in list(caps)}:
-            caps.setdefault((1, b), min(c for (_st, cb), c in caps.items() if cb == b))
-        # The fused RMSNorm cannot run at a block whose atom is wider than a
-        # row (hidden=2048 needs BLOCK), and a ladder may use wider blocks only.
-        # An ST=1 engine at BLOCK is a ~2 MiB inbox, so the mesh always has one.
-        if algo.name == "mesh" and all(b != BLOCK for _st, b in caps):
-            caps[(1, BLOCK)] = min(caps.values())
         self._ladder = ladder
+        self._norm_ladder = norm_ladder
+        self._arch = arch
+        self._cu_count = cu_count
+        self._lds_capacity = lds_capacity
+        self._inbox_flags = inbox_flags
+        self._caps = self._engine_caps(ladder)
         self._by_cfg = {}
-        # Per engine, the arguments that rebuild its kernel, for the fused
-        # RMSNorm builds that ``norm_launch`` adds on first use.
+        # Per engine, the arguments that rebuild its kernel.
         self._build_kw = {}
+        # The fused RMSNorm's engines and their arguments, keyed by tile width
+        # and then like ``_by_cfg``, built by ``compile_rmsnorm``, and the
+        # fused builds ``norm_launch`` adds to them on first use.
+        self._norm_by_atoms = {}
+        self._norm_build_kw = {}
         self._norm_launch = {}
+        # Row widths whose fused builds are all compiled and loaded.
+        self._rmsnorm_hidden = set()
         self._relay_by_cfg = {}
         self._relay_bounces = []
         self.relay_devices = None
@@ -405,76 +445,11 @@ class FlyQuickAllReduce:
             )
 
         try:
-            with torch.cuda.device(self._device_index):
-                for key in sorted(caps):
-                    st, b = key
-                    # A persistent kernel deadlocks if it launches more workgroups
-                    # than fit, and the ranks have to agree on the number: take the
-                    # minimum across the group so a heterogeneous node converges.
-                    grid = clamp_grid_cap(
-                        caps[key],
-                        arch=arch,
-                        world_size=self.world_size,
-                        super_tile=st,
-                        cu_count=cu_count,
-                        block=b,
-                    )
-                    shared_grid = torch.tensor(grid, dtype=torch.int64)
-                    dist.all_reduce(shared_grid, op=dist.ReduceOp.MIN, group=group)
-                    build_kw = {
-                        "world_size": self.world_size,
-                        "rank": self.rank,
-                        "super_tile": st,
-                        "grid": int(shared_grid.item()),
-                        "inbox_memory": resolved_inbox,
-                        "rs_codec": rs_codec,
-                        "ag_codec": ag_codec,
-                        "block": b,
-                    }
-                    spec = algo.build(**build_kw)
-                    self._build_kw[key] = build_kw
-                    if spec["lds_bytes"] > lds_capacity:
-                        raise ValueError(
-                            f"{algorithm} (rs_codec={rs_codec}, ag_codec={ag_codec}) "
-                            f"at block={b} needs "
-                            f"{spec['lds_bytes']} B of LDS, over the "
-                            f"{lds_capacity} B {arch} has"
-                        )
-                    self._by_cfg[key] = _StEngine(
-                        spec=spec,
-                        group=self.group,
-                        rank=self.rank,
-                        world_size=self.world_size,
-                        inbox_flags=inbox_flags,
-                    )
-                if self.relay_devices is not None:
-                    # A relay engine shares its direct twin's grid, and each owns
-                    # its inbox and bounce: a rank can start a call on one while
-                    # its peer is still reading the other's.
-                    reachable = set(self.cfgs_for(self.relay_min_bytes, _MAX_PAYLOAD))
-                    for key in sorted(self._by_cfg):
-                        if key not in reachable:
-                            continue
-                        spec = algo.build(
-                            **self._build_kw[key], relay=self.relay_fraction
-                        )
-                        bounce = provider.open(
-                            group=self.group,
-                            rank=self.rank,
-                            device=self._device_index,
-                            relay_out=self.relay_devices[self.rank],
-                            relay_in=self.relay_devices[1 - self.rank],
-                            nbytes=spec["bounce_bytes"],
-                        )
-                        self._relay_bounces.append(bounce)
-                        self._relay_by_cfg[key] = _StEngine(
-                            spec=spec,
-                            group=self.group,
-                            rank=self.rank,
-                            world_size=self.world_size,
-                            inbox_flags=inbox_flags,
-                            extra_ptrs=(bounce.out_ptr, bounce.in_ptr),
-                        )
+            self._build_engines(self._caps, self._by_cfg, self._build_kw)
+            if self.relay_devices is not None:
+                self._build_relay_engines(provider)
+            for hidden in sorted({int(h) for h in rmsnorm_hidden}):
+                self.compile_rmsnorm(hidden)
         except Exception:
             self.close()
             raise
@@ -567,6 +542,146 @@ class FlyQuickAllReduce:
         self.relay_fraction = own[3]
         self.relay_min_bytes = own[4]
 
+    def _build_relay_engines(self, provider: RelayProvider) -> None:
+        # A relay engine shares its direct twin's grid, and each owns its inbox
+        # and bounce: a rank can start a call on one while its peer is still
+        # reading the other's.
+        with torch.cuda.device(self._device_index):
+            reachable = set(self.cfgs_for(self.relay_min_bytes, _MAX_PAYLOAD))
+            for key in sorted(self._by_cfg):
+                if key not in reachable:
+                    continue
+                spec = self._algo.build(
+                    **self._build_kw[key], relay=self.relay_fraction
+                )
+                bounce = provider.open(
+                    group=self.group,
+                    rank=self.rank,
+                    device=self._device_index,
+                    relay_out=self.relay_devices[self.rank],
+                    relay_in=self.relay_devices[1 - self.rank],
+                    nbytes=spec["bounce_bytes"],
+                )
+                self._relay_bounces.append(bounce)
+                self._relay_by_cfg[key] = _StEngine(
+                    spec=spec,
+                    group=self.group,
+                    rank=self.rank,
+                    world_size=self.world_size,
+                    inbox_flags=self._inbox_flags,
+                    extra_ptrs=(bounce.out_ptr, bounce.in_ptr),
+                )
+
+    @staticmethod
+    def _engine_caps(ladder) -> dict[tuple[int, int], int]:
+        """The grid cap of each engine *ladder* needs, keyed
+        ``(super_tile, block)``.
+
+        One engine per distinct ``(super_tile, block)``. Each ``block`` also
+        gets an ST=1 engine: _select_cfg falls back to it when a payload has
+        fewer tiles than the chosen super-tile, and the fallback has to share
+        the rung's block -- a different tile size would change the tile count
+        it was picked for.
+
+        The rungs go in first so an ST=1 that the ladder *sites* keeps its own
+        cap. Only then is the fallback filled in, and at the smallest cap
+        among its rungs rather than at the global default: the fallback fires
+        only when a payload has fewer tiles than the super-tile it would
+        otherwise take, so ``_grid_x`` there is bounded by that super-tile
+        (<= 32) with a release fence, and by the chosen rung's own cap without
+        one -- under 128 either way. Seeding it with the 1216 default instead
+        built a 194 MiB inbox to launch at most 32 blocks into, and did it on
+        every object ever constructed.
+        """
+        caps = {}
+        for r in ladder:
+            caps.setdefault((r.super_tile, r.block), r.grid_cap)
+        for b in {b for _st, b in list(caps)}:
+            caps.setdefault((1, b), min(c for (_st, cb), c in caps.items() if cb == b))
+        return caps
+
+    def _build_engines(
+        self, caps, engines, build_kws, tile_atoms: int = DEFAULT_ATOMS
+    ) -> None:
+        """Build an engine for each entry of *caps* into *engines*, and the
+        arguments that rebuild its kernel into *build_kws*. *tile_atoms*
+        other than the default is the fused RMSNorm's wide tile (mesh only).
+
+        Collective: each engine does its own IPC handle exchange, so the
+        engines are built in a fixed order -- ranks disagreeing on the order
+        would deadlock.
+        """
+        with torch.cuda.device(self._device_index):
+            for key in sorted(caps):
+                st, b = key
+                # A persistent kernel deadlocks if it launches more workgroups
+                # than fit, and the ranks have to agree on the number: take the
+                # minimum across the group so a heterogeneous node converges.
+                grid = clamp_grid_cap(
+                    caps[key],
+                    arch=self._arch,
+                    world_size=self.world_size,
+                    super_tile=st,
+                    cu_count=self._cu_count,
+                    block=b,
+                )
+                if self.algorithm == "mesh":
+                    grid = min(grid, self._lds_resident_grid(b, tile_atoms))
+                shared_grid = torch.tensor(grid, dtype=torch.int64)
+                dist.all_reduce(shared_grid, op=dist.ReduceOp.MIN, group=self.group)
+                build_kw = {
+                    "world_size": self.world_size,
+                    "rank": self.rank,
+                    "super_tile": st,
+                    "grid": int(shared_grid.item()),
+                    "inbox_memory": self.inbox_memory,
+                    "rs_codec": self.rs_codec,
+                    "ag_codec": self.ag_codec,
+                    "block": b,
+                }
+                if tile_atoms != DEFAULT_ATOMS:
+                    build_kw["tile_atoms"] = tile_atoms
+                spec = self._algo.build(**build_kw)
+                if spec["lds_bytes"] > self._lds_capacity:
+                    raise ValueError(
+                        f"{self.algorithm} (rs_codec={self.rs_codec}, "
+                        f"ag_codec={self.ag_codec}) at block={b} needs "
+                        f"{spec['lds_bytes']} B of LDS, over the "
+                        f"{self._lds_capacity} B {self._arch} has"
+                    )
+                build_kws[key] = build_kw
+                engines[key] = _StEngine(
+                    spec=spec,
+                    group=self.group,
+                    rank=self.rank,
+                    world_size=self.world_size,
+                    inbox_flags=self._inbox_flags,
+                )
+
+    def _lds_resident_grid(self, block: int, tile_atoms: int) -> int:
+        """Largest persistent mesh grid whose workgroups all fit in the CUs' LDS,
+        counting the fused RMSNorm's partial sums so one bound serves both
+        builds. ``clamp_grid_cap``'s residency table only counts VGPRs."""
+        wg_lds = mesh_lds_bytes(
+            world_size=self.world_size,
+            block=block,
+            codec=self.rs_codec,
+            tile_atoms=tile_atoms,
+            fuse_norm=True,
+        )
+        per_cu = max(1, self._lds_capacity // wg_lds)
+        # A multiple of 8 keeps the flag prefix 64 B aligned at every TP size.
+        return max(8, (per_cu * self._cu_count) // 8 * 8)
+
+    def _engines(self) -> list[_StEngine]:
+        """Every engine this object holds, each once: the fused RMSNorm
+        shares those it has in common with the plain all-reduce."""
+        by_id = {}
+        for engines in (self._by_cfg, *self._norm_by_atoms.values()):
+            for eng in engines.values():
+                by_id.setdefault(id(eng), eng)
+        return list(by_id.values())
+
     @property
     def inbox_bytes(self) -> int:
         """IPC inbox bytes this object holds on *this* rank, across every rung.
@@ -578,51 +693,46 @@ class FlyQuickAllReduce:
         large on its own and a sweep holding several tuning variants live at
         once is the realistic way to exhaust a device.
         """
-        return sum(eng.buf_bytes for eng in self._by_cfg.values())
+        return sum(eng.buf_bytes for eng in self._engines())
 
     @property
     def relay_bytes(self) -> int:
-        """Device bytes this rank holds for relaying, on top of ``inbox_bytes``:
-        its incoming bounce on each relay engine, and those engines' inboxes."""
+        """Device bytes this rank holds for relaying: its incoming bounce on
+        each relay engine, and those engines' inboxes."""
         return sum(b.nbytes for b in self._relay_bounces) + sum(
             eng.buf_bytes for eng in self._relay_by_cfg.values()
         )
 
-    def _ladder_cfg(self, live_bytes: int) -> tuple[int, int]:
-        """``(super_tile, block)`` the ladder assigns to *live_bytes*.
-
-        Publishes per rank are ``num_tiles / ST * 2(N-1)`` and cost a full L2
-        writeback each, so a bigger payload wants a bigger ST -- but ST also
-        divides the block count, so it cannot simply be maximised. The rungs
-        and the measurements behind them are in ``MESH_ST_LADDER`` and
-        ``RING_ST_LADDER``.
-        """
-        rung = select_rung(self._ladder, live_bytes)
-        return (rung.super_tile, rung.block)
-
     @staticmethod
-    def _num_tiles(live_bytes: int, block: int) -> int:
-        tile_bytes = int(block) * ATOMS * 16
+    def _num_tiles(live_bytes: int, block: int, tile_atoms: int = DEFAULT_ATOMS) -> int:
+        tile_bytes = int(block) * int(tile_atoms) * 16
         return max(1, (live_bytes + tile_bytes - 1) // tile_bytes)
 
-    def _pick_cfg(self, live_bytes: int) -> tuple[tuple[int, int], int]:
-        """Engine key for a *live_bytes* payload, and its tile count.
+    def _select_cfg(
+        self, ladder, engines, live_bytes: int, tile_atoms: int = DEFAULT_ATOMS
+    ) -> tuple[tuple[int, int], int]:
+        """Key in *engines*, built for *ladder*, of a *live_bytes* payload,
+        and its tile count.
 
         The ladder chooses the rung, which fixes the block and so the tile
         count; the tile count then only has to confirm there is a whole
         super-tile to take, falling back to the same block's ST=1 engine when
         there is not.
         """
-
-        want, b = self._ladder_cfg(live_bytes)
-        num_tiles = self._num_tiles(live_bytes, b)
+        rung = select_rung(ladder, live_bytes)
+        want, b = rung.super_tile, rung.block
+        num_tiles = self._num_tiles(live_bytes, b, tile_atoms)
         if want == 1:
             st = 1
         elif self._batch_publishes:
             st = want if num_tiles >= want else 1
         else:
-            st = want if num_tiles > self._by_cfg[(want, b)].grid else 1
+            st = want if num_tiles > engines[(want, b)].grid else 1
         return (st, b), num_tiles
+
+    def _pick_cfg(self, live_bytes: int) -> tuple[tuple[int, int], int]:
+        """``_by_cfg`` key for a *live_bytes* payload, and its tile count."""
+        return self._select_cfg(self._ladder, self._by_cfg, live_bytes)
 
     def _grid_x(self, num_tiles: int, super_tile: int, grid: int) -> int:
         """Blocks to launch for *num_tiles* tiles under *super_tile*.
@@ -678,6 +788,8 @@ class FlyQuickAllReduce:
         live_bytes,
         num_tiles,
         norm_ptrs=None,
+        norm_eps: float = 0.0,
+        divisor: float = DEFAULT_DIVISOR,
     ):
         if stream is None:
             stream = Stream(torch.cuda.current_stream(self._device_index))
@@ -692,7 +804,9 @@ class FlyQuickAllReduce:
             Int64(int(eng._gpu_peer_ptrs)),
             Int64(int(eng._colors)),
             *(Int64(p) for p in self._norm_ptrs(norm_ptrs)),
+            *((Float32(norm_eps),) if self._algo.norm_ptr_args else ()),
             Int32(self._grid_x(num_tiles, eng.super_tile, eng.grid)),
+            *((Float32(divisor),) if self._algo.has_divisor else ()),
             stream,
         )
 
@@ -712,6 +826,8 @@ class FlyQuickAllReduce:
         live_bytes: int,
         launch=None,
         norm_ptrs=None,
+        norm_eps: float = 0.0,
+        divisor: float = DEFAULT_DIVISOR,
     ) -> None:
         num_tiles = max(1, (live_bytes + eng.tile_bytes - 1) // eng.tile_bytes)
         args = self._launch_args(
@@ -722,6 +838,8 @@ class FlyQuickAllReduce:
             live_bytes=live_bytes,
             num_tiles=num_tiles,
             norm_ptrs=norm_ptrs,
+            norm_eps=norm_eps,
+            divisor=divisor,
         )
         # A launch may still be using the raw HIP allocations when Python drops
         # the communicator. Keep cleanup conservative even if launch raises.
@@ -737,7 +855,8 @@ class FlyQuickAllReduce:
         return [key for key in self._by_cfg if key in picked]
 
     def preload(self, *, payload_range=None) -> None:
-        """JIT-compile engine binaries without launching any of them.
+        """JIT-compile engine binaries and load them onto the device, without
+        launching any of them.
 
         ``payload_range=(lo, hi)`` takes only the binaries ``allreduce`` would
         run for a payload of ``lo..hi`` bytes (inclusive); ``None`` takes every
@@ -745,10 +864,8 @@ class FlyQuickAllReduce:
         dispatcher routes only its own window here, so the rest never run.
 
         Local to this rank, not a collective. ``QuickAllReduce`` calls it once
-        at init, via ``preload_fly_engines``, to keep JIT compiles out of CUDA
-        graph capture; the op tests call it before timing or correctness
-        checks begin. The HIP module load still happens on each binary's first
-        launch.
+        at init, via ``preload_fly_engines``, to keep JIT compiles and module
+        loads out of HIP graph capture.
         """
         keys = self._by_cfg if payload_range is None else self.cfgs_for(*payload_range)
         engines = [self._by_cfg[key] for key in keys]
@@ -761,46 +878,54 @@ class FlyQuickAllReduce:
                 for key in self.cfgs_for(max(lo, self.relay_min_bytes or 0), hi)
                 if key in self._relay_by_cfg
             ]
-        for eng in engines:
-            args = self._launch_args(eng, 0, 0, None, live_bytes=0, num_tiles=0)
-            _preload_compiled(eng.launch, *args)
+        with torch.cuda.device(self._device_index):
+            for eng in engines:
+                args = self._launch_args(eng, 0, 0, None, live_bytes=0, num_tiles=0)
+                preload_launcher(eng.launch, *args)
 
-    def norm_launch(self, cfg, hidden, eps, gemma_norm, latency=False, mxfp4=False):
-        """Fused add+RMSNorm variant of engine *cfg*; shares its inbox and colors."""
-        key = (cfg, int(hidden), float(eps), bool(gemma_norm), bool(latency), mxfp4)
+    def norm_launch(self, cfg, hidden, gemma_norm, latency=False, mxfp4=False):
+        """Fused add+RMSNorm variant of the fused RMSNorm's engine *cfg* at
+        *hidden*'s tile width; shares its inbox and colors."""
+        key = (cfg, int(hidden), bool(gemma_norm), bool(latency), bool(mxfp4))
         launch = self._norm_launch.get(key)
         if launch is None:
             launch = self._algo.build(
-                **self._build_kw[cfg],
+                **self._norm_build_kw[self._tile_atoms(hidden)][cfg],
                 norm_hidden=key[1],
-                norm_eps=key[2],
-                gemma_norm=key[3],
-                norm_latency=key[4],
-                norm_mxfp4=key[5],
+                gemma_norm=key[2],
+                norm_latency=key[3],
+                norm_mxfp4=key[4],
             )["launch"]
             self._norm_launch[key] = launch
         return launch
 
-    @staticmethod
-    def supports_rmsnorm(hidden: int, nbytes: int) -> bool:
+    def _tile_atoms(self, hidden: int) -> int | None:
+        """Tile width of the fused RMSNorm at *hidden*, ``None`` if no block
+        holds the row.
+        """
+        for b in SUPPORTED_BLOCKS:
+            tile_atoms = tile_atoms_for(hidden, self.world_size, b)
+            if tile_atoms is not None:
+                return tile_atoms
+        return None
+
+    def supports_rmsnorm(self, hidden: int, nbytes: int) -> bool:
         """Whether ``allreduce_rmsnorm`` can take this row width and payload."""
         # Atom byte offsets travel in the signed 32-bit soffset.
-        return (
-            any(rmsnorm_hidden_supported(hidden, b) for b in SUPPORTED_BLOCKS)
-            and nbytes < 1 << 31
-        )
+        limits = [
+            max_payload_bytes(tile_atoms, b)
+            for b in SUPPORTED_BLOCKS
+            if (tile_atoms := tile_atoms_for(hidden, self.world_size, b)) is not None
+        ]
+        return bool(limits) and int(nbytes) <= min(limits)
 
     @staticmethod
     def mxfp4_scale_shape(rows: int, hidden: int) -> tuple[int, int]:
         """Shape of the e8m0 ``mxfp4_scale`` buffer for ``rows x hidden``."""
         return mxfp4_scale_shape(rows, hidden)
 
-    def _norm_cfg(self, live_bytes: int, hidden: int) -> tuple[tuple[int, int], int]:
-        """Engine key and tile count for a fused-norm payload.
-
-        The ladder's pick, unless its block cannot hold a *hidden*-wide row, in
-        which case the ST=1 engine of the narrowest block that can.
-        """
+    def _check_norm_schedule(self) -> None:
+        """Raise unless this object's schedule has the fused RMSNorm."""
         if self.algorithm != "mesh" or (self.rs_codec, self.ag_codec) != (
             "int4",
             "int4",
@@ -810,89 +935,138 @@ class FlyQuickAllReduce:
                 f"{self.algorithm!r} with rs_codec={self.rs_codec!r}, "
                 f"ag_codec={self.ag_codec!r}"
             )
+
+    def _check_norm(self, live_bytes: int, hidden: int) -> None:
+        """Raise unless the fused RMSNorm can take *hidden* and *live_bytes*."""
+        self._check_norm_schedule()
         if not self.supports_rmsnorm(hidden, live_bytes):
             raise ValueError(
                 "fused RMSNorm needs a row that fits whole atoms in a tile "
-                f"and a payload under 2 GiB, got hidden={hidden}, "
-                f"{live_bytes} bytes"
+                "split across the ranks, and a payload whose atom offsets fit "
+                f"the signed 32-bit soffset, got hidden={hidden}, "
+                f"{live_bytes} bytes at world_size={self.world_size}"
             )
-        cfg, num_tiles = self._pick_cfg(live_bytes)
-        if rmsnorm_hidden_supported(hidden, cfg[1]):
-            return cfg, num_tiles
-        blocks = sorted(
-            b for (_st, b) in self._by_cfg if rmsnorm_hidden_supported(hidden, b)
-        )
+
+    def compile_rmsnorm(self, hidden: int) -> None:
+        """Eager-JIT and preload every fused build ``allreduce_rmsnorm`` can pick
+        for hidden, without launching any.
+
+        Collective the first time, when it builds the engines: every rank calls
+        it, outside CUDA graph capture. The constructor calls it for each width
+        in ``rmsnorm_hidden``, and the first eager ``allreduce_rmsnorm`` at an
+        unprepared width does too.
+
+        Args:
+            hidden: row width; 2048, 4096, 8192 or 16384, or 6144 at
+                world_size 2 or 4.
+        """
+        hidden = int(hidden)
+        if hidden in self._rmsnorm_hidden:
+            return
+        self._check_norm(hidden * 2, hidden)
+        if torch.cuda.is_current_stream_capturing():
+            raise RuntimeError(
+                f"FlyQuickAllReduce: the fused RMSNorm at hidden={hidden} is "
+                "not prepared, and preparing it builds IPC engines and compiles "
+                "kernels, which cannot run under CUDA graph capture; pass "
+                f"rmsnorm_hidden=({hidden},) to the constructor, or call "
+                f"compile_rmsnorm({hidden}) on every rank before the capture"
+            )
+        self._build_norm_engines(hidden)
+        # Raises if no engine has a block that holds the row.
+        self._norm_cfg(hidden * 2, hidden)
+        variants = [
+            (gemma_norm, mxfp4)
+            for gemma_norm in (False, True)
+            for mxfp4 in ((False, True) if self.supports_mxfp4 else (False,))
+        ]
+        with torch.cuda.device(self._device_index):
+            for cfg, eng in self._norm_by_atoms[self._tile_atoms(hidden)].items():
+                if tile_atoms_for(hidden, self.world_size, cfg[1]) is None:
+                    continue
+                args = self._launch_args(
+                    eng, 0, 0, None, live_bytes=0, num_tiles=0, norm_ptrs=()
+                )
+                for latency in (True, False) if cfg == (1, BLOCK) else (False,):
+                    for gemma_norm, mxfp4 in variants:
+                        launch = self.norm_launch(
+                            cfg, hidden, gemma_norm, latency, mxfp4
+                        )
+                        preload_launcher(launch, *args)
+        self._rmsnorm_hidden.add(hidden)
+
+    def _build_norm_engines(self, hidden: int) -> None:
+        """Build the engines of the fused add+RMSNorm at *hidden*'s tile
+        width that are not built yet, those of its ladder in
+        ``MESH_NORM_LADDER``. Collective, as the constructor is.
+
+        At the default width an engine whose configuration the plain
+        all-reduce already has is shared, not built again.
+        """
+        tile_atoms = self._tile_atoms(hidden)
+        caps = self._engine_caps(self._norm_ladder)
+        if tile_atoms == DEFAULT_ATOMS:
+            # The fused RMSNorm cannot run at a block whose atom is wider
+            # than a row.
+            if all(b != BLOCK for _st, b in caps):
+                caps[(1, BLOCK)] = min(caps.values())
+            shared = [key for key, cap in caps.items() if self._caps.get(key) == cap]
+        else:
+            fits = [
+                b
+                for b in SUPPORTED_BLOCKS
+                if tile_atoms_for(hidden, self.world_size, b) == tile_atoms
+            ]
+            wide = {key: cap for key, cap in caps.items() if key[1] in fits}
+            if not wide:
+                wide[(1, BLOCK if BLOCK in fits else fits[0])] = min(caps.values())
+            caps, shared = wide, []
+        engines = self._norm_by_atoms.setdefault(tile_atoms, {})
+        build_kws = self._norm_build_kw.setdefault(tile_atoms, {})
+        for key in shared:
+            engines.setdefault(key, self._by_cfg[key])
+            build_kws.setdefault(key, self._build_kw[key])
+        built, built_kws = {}, {}
+        try:
+            self._build_engines(
+                {key: cap for key, cap in caps.items() if key not in engines},
+                built,
+                built_kws,
+                tile_atoms=tile_atoms,
+            )
+        except Exception:
+            for eng in built.values():
+                eng.close()
+            raise
+        engines.update(built)
+        build_kws.update(built_kws)
+
+    def _norm_cfg(self, live_bytes: int, hidden: int) -> tuple[tuple[int, int], int]:
+        """Key in the fused RMSNorm's engines at *hidden*'s tile width, and
+        tile count, for a fused-norm payload.
+
+        The fused RMSNorm ladder's pick, unless its block cannot hold a
+        hidden-wide row, in which case the ST=1 engine of the narrowest block
+        that can. Needs ``compile_rmsnorm``.
+        """
+        self._check_norm(live_bytes, hidden)
+        tile_atoms = self._tile_atoms(hidden)
+        engines = self._norm_by_atoms.get(tile_atoms)
+        if not engines:
+            raise RuntimeError("the fused RMSNorm needs compile_rmsnorm first")
+
+        def _holds(b):
+            return tile_atoms_for(hidden, self.world_size, b) is not None
+
+        # A wide tile has no engines at the blocks that cannot hold the row.
+        if _holds(select_rung(self._norm_ladder, live_bytes).block):
+            return self._select_cfg(self._norm_ladder, engines, live_bytes, tile_atoms)
+        blocks = sorted(b for (_st, b) in engines if _holds(b))
         if not blocks:
             raise ValueError(
                 f"no engine of this object has a block that supports hidden={hidden}"
             )
-        return (1, blocks[0]), self._num_tiles(live_bytes, blocks[0])
-
-    def compile_rmsnorm(
-        self,
-        hidden: int,
-        eps: float,
-        *,
-        gemma_norm: bool = False,
-        mxfp4: bool = False,
-        stream=None,
-    ) -> None:
-        """Eager-JIT every fused build ``allreduce_rmsnorm`` can pick for ``hidden``.
-
-        Without this the first ``allreduce_rmsnorm`` call of each build pays its
-        FlyDSL compile: the low-latency and the occupancy-pinned build of an
-        ST=1 engine, and the pinned build of an ST>1 engine, are separate
-        binaries. Each is launched once on a zero one-row payload, so every rank
-        must call this with the same arguments.
-
-        Args:
-            hidden: row width; see ``supports_rmsnorm``.
-            eps: RMSNorm epsilon of the calls to warm.
-            gemma_norm: warm the ``1 + weight`` builds.
-            mxfp4: warm the ``allreduce_rmsnorm_mxfp4`` builds (gfx950).
-            stream: ``None`` uses the current PyTorch stream on this device.
-        """
-        live_bytes = int(hidden) * 2
-        self._norm_cfg(live_bytes, hidden)  # validates
-        if mxfp4 and not self.supports_mxfp4:
-            raise RuntimeError("fused MXFP4 quant needs gfx950")
-        dev = torch.device("cuda", self._device_index)
-        inp, out, residual, residual_out, weight = (
-            torch.zeros(hidden, dtype=torch.bfloat16, device=dev) for _ in range(5)
-        )
-        mxfp4_bufs = ()
-        if mxfp4:
-            mxfp4_bufs = (
-                torch.empty(hidden // 2, dtype=torch.uint8, device=dev),
-                torch.empty(
-                    mxfp4_scale_shape(1, hidden), dtype=torch.uint8, device=dev
-                ),
-            )
-        norm_ptrs = (
-            int(residual.data_ptr()),
-            int(residual_out.data_ptr()),
-            int(weight.data_ptr()),
-            *(int(t.data_ptr()) for t in mxfp4_bufs),
-        )
-        for cfg, eng in self._by_cfg.items():
-            if not rmsnorm_hidden_supported(hidden, cfg[1]):
-                continue
-            st, b = cfg
-            for latency in (True, False) if (st, b) == (1, BLOCK) else (False,):
-                self._launch_eng(
-                    eng,
-                    inp,
-                    out,
-                    stream,
-                    live_bytes=live_bytes,
-                    launch=self.norm_launch(
-                        cfg, hidden, eps, gemma_norm, latency, mxfp4
-                    ),
-                    norm_ptrs=norm_ptrs,
-                )
-        # The dummy tensors go out of scope here; the launches may be on a
-        # stream other than the one that allocated them.
-        torch.cuda.synchronize(self._device_index)
+        return (1, blocks[0]), self._num_tiles(live_bytes, blocks[0], tile_atoms)
 
     def allreduce_rmsnorm(
         self,
@@ -912,11 +1086,17 @@ class FlyQuickAllReduce:
         ``out = rmsnorm(residual_out, eps) * w`` with ``w = weight`` or
         ``1 + weight`` when ``gemma_norm``.
 
+        Runs on the engines of ``MESH_NORM_LADDER``. A call may be inside a
+        CUDA graph capture, the first one included, if *hidden* is prepared:
+        given in the constructor's ``rmsnorm_hidden``, or by an earlier
+        ``compile_rmsnorm`` or eager call. An eager call prepares it, which is
+        a collective the first time.
+
         Args:
             inp: this rank's bf16 partial sum, ``rows x hidden`` elements.
             residual: bf16 residual, same number of elements as ``inp``.
             weight: bf16 RMSNorm weight of ``hidden`` elements; hidden must
-                be 2048, 4096, 8192 or 16384.
+                be 2048, 4096, 8192 or 16384, or 6144 at world_size 2 or 4.
             eps: RMSNorm epsilon.
             out: bf16 output for the normed rows, same size as ``inp``.
             residual_out: bf16 output for ``allreduce(inp) + residual``; may
@@ -984,7 +1164,7 @@ class FlyQuickAllReduce:
             inp, out, device_index=self._device_index, owner="FlyQuickAllReduce"
         )
         hidden = int(weight.numel())
-        cfg, num_tiles = self._norm_cfg(live_bytes, hidden)
+        self._check_norm(live_bytes, hidden)
         if int(inp.numel()) % hidden != 0:
             raise ValueError("numel must be a multiple of hidden")
         for name, t in (
@@ -1034,21 +1214,28 @@ class FlyQuickAllReduce:
                 if not t.is_contiguous() or t.numel() < nbytes:
                     raise ValueError(f"{name} must be contiguous with {nbytes} bytes")
             mxfp4_ptrs = (int(mxfp4[0].data_ptr()), int(mxfp4[1].data_ptr()))
-        eng = self._by_cfg[cfg]
+        self.compile_rmsnorm(hidden)
+        cfg, num_tiles = self._norm_cfg(live_bytes, hidden)
+        eng = self._norm_by_atoms[self._tile_atoms(hidden)][cfg]
         # One tile per workgroup at <= 2 workgroups per CU: occupancy is
         # free, so take the low-latency build.
         latency = cfg == (1, BLOCK) and num_tiles <= min(
             eng.grid, self._latency_max_tiles
         )
+        launch = self.norm_launch(cfg, hidden, gemma_norm, latency, mxfp4 is not None)
+        if torch.cuda.is_current_stream_capturing() and not launcher_loaded(launch):
+            raise RuntimeError(
+                f"FlyQuickAllReduce: fused build {kernel_symbol(launch)} is not "
+                "loaded, and loading it cannot run under CUDA graph capture"
+            )
         self._launch_eng(
             eng,
             inp,
             out,
             stream,
             live_bytes=live_bytes,
-            launch=self.norm_launch(
-                cfg, hidden, eps, gemma_norm, latency, mxfp4 is not None
-            ),
+            launch=launch,
+            norm_eps=float(eps),
             norm_ptrs=(
                 int(residual.data_ptr()),
                 int(residual_out.data_ptr()),
@@ -1058,19 +1245,26 @@ class FlyQuickAllReduce:
         )
 
     def close(self):
-        engines = getattr(self, "_by_cfg", None)
-        if not engines:
+        norm_by_atoms = getattr(self, "_norm_by_atoms", None) or {}
+        relay_engines = getattr(self, "_relay_by_cfg", None) or {}
+        relay_bounces = getattr(self, "_relay_bounces", None) or ()
+        if (
+            not getattr(self, "_by_cfg", None)
+            and not any(norm_by_atoms.values())
+            and not relay_engines
+            and not relay_bounces
+        ):
             return
         with torch.cuda.device(self._device_index):
             if getattr(self, "_has_launched", False):
                 torch.cuda.synchronize(self._device_index)
                 self._has_launched = False
-            relay_engines = getattr(self, "_relay_by_cfg", {})
-            for eng in (*engines.values(), *relay_engines.values()):
+            for eng in (*self._engines(), *relay_engines.values()):
                 eng.close()
-            engines.clear()
+            self._by_cfg.clear()
+            norm_by_atoms.clear()
             relay_engines.clear()
-            for bounce in getattr(self, "_relay_bounces", ()):
+            for bounce in relay_bounces:
                 try:
                     bounce.close()
                 except RuntimeError:
@@ -1099,11 +1293,30 @@ class FlyQuickAllReduce:
         """
         return int(nbytes) >= self.min_bytes
 
-    def allreduce(self, inp, out, stream=None):
+    def _check_divisor_supported(self, divisor: float) -> None:
+        """A divisor other than 1 needs the mesh schedule's INT4 wire format."""
+        if divisor != DEFAULT_DIVISOR and (
+            not self._algo.has_divisor or "int4" not in (self.rs_codec, self.ag_codec)
+        ):
+            raise ValueError(
+                "FlyQuickAllReduce divisor is only supported by the mesh "
+                f"algorithm with the int4 codec, got algorithm={self.algorithm!r}, "
+                f"rs_codec={self.rs_codec!r}, ag_codec={self.ag_codec!r}"
+            )
+
+    def allreduce(self, inp, out, stream=None, divisor: float = DEFAULT_DIVISOR):
         """Two-shot all-reduce into ``out``, in this engine's wire codecs.
 
         ``stream=None`` uses the current PyTorch stream on this device.
+        ``divisor`` defaults to 1, which leaves the result unchanged.
+        Loaded values are divided by it before the first pack, and the
+        finished sum is multiplied by it once. Every rank must pass the same
+        divisor; this is not checked, and a mismatch silently gives each rank
+        a different result. Only the mesh schedule with the INT4 codec takes
+        a divisor other than 1.
         """
+        divisor = _check_divisor(divisor)
+        self._check_divisor_supported(divisor)
         live_bytes = check_payload(
             inp, out, device_index=self._device_index, owner="FlyQuickAllReduce"
         )
@@ -1117,4 +1330,11 @@ class FlyQuickAllReduce:
                 "to override."
             )
         eng, _num_tiles = self._pick_engine(live_bytes)
-        self._launch_eng(eng, inp, out, stream, live_bytes=live_bytes)
+        self._launch_eng(
+            eng,
+            inp,
+            out,
+            stream,
+            live_bytes=live_bytes,
+            divisor=divisor,
+        )

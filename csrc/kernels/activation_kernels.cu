@@ -15,6 +15,7 @@
 #include "aiter_stream.h"
 #include "aiter_dispatch.h"
 #include "mx_quant_utils.h"
+#include "quant_amax_floor.h"
 #include <hip/hip_bf16.h>
 #include "rocprim/rocprim.hpp"
 
@@ -619,7 +620,7 @@ __global__ void act_and_mul_quant_kernel(
         }
     }
 
-    float thread_max = 1e-10f;
+    float thread_max = aiter::kAmaxFloor;
 #pragma unroll
     for(int i = 0; i < VEC_SIZE_I; i += 2)
     {
@@ -680,7 +681,7 @@ __global__ void act_and_mul_quant_kernel(
 
 __device__ __forceinline__ float situv2_bf16_mul_lo(uint32_t packed, float scale)
 {
-#if defined(__gfx1250__)
+#if defined(__gfx1250__) || defined(__gfx1250_strict__)
     float out;
     asm("v_fma_mix_f32_bf16 %0, %1, %2, neg(0) op_sel_hi:[1,0,0]"
         : "=v"(out)
@@ -693,7 +694,7 @@ __device__ __forceinline__ float situv2_bf16_mul_lo(uint32_t packed, float scale
 
 __device__ __forceinline__ float situv2_bf16_mul_hi(uint32_t packed, float scale)
 {
-#if defined(__gfx1250__)
+#if defined(__gfx1250__) || defined(__gfx1250_strict__)
     float out;
     asm("v_fma_mix_f32_bf16 %0, %1, %2, neg(0) "
         "op_sel:[1,0,0] op_sel_hi:[1,0,0]"
