@@ -28,7 +28,13 @@ from pathlib import Path
 
 _HERE = Path(__file__).resolve().parent
 _REPO = _HERE.parents[2]
-for _path in (str(_HERE), str(_REPO), str(_REPO / "op_tests" / "multigpu_tests")):
+_COLLECTIVE_BW = _HERE.parent / "collective_bw"
+for _path in (
+    str(_HERE),
+    str(_COLLECTIVE_BW),
+    str(_REPO),
+    str(_REPO / "op_tests" / "multigpu_tests"),
+):
     if _path not in sys.path:
         sys.path.insert(0, _path)
 

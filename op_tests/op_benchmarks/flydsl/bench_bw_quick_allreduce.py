@@ -3,7 +3,7 @@
 """Bandwidth roofline: FlyDSL quick all-reduce (mesh, ring) and RCCL.
 
     HIP_VISIBLE_DEVICES=4,5,6,7 python3 \\
-        op_tests/op_benchmarks/collective_bw/bench_bw_quick_allreduce.py -tp 4
+        op_tests/op_benchmarks/flydsl/bench_bw_quick_allreduce.py -tp 4
 
 The setup (process group, engines, inputs) and the timing are the ones
 ``op_tests/multigpu_tests/test_flydsl_quick_allreduce.py`` uses in its bench
@@ -23,7 +23,13 @@ from pathlib import Path
 
 _HERE = Path(__file__).resolve().parent
 _REPO = _HERE.parents[2]
-for _path in (str(_HERE), str(_REPO), str(_REPO / "op_tests" / "multigpu_tests")):
+_COLLECTIVE_BW = _HERE.parent / "collective_bw"
+for _path in (
+    str(_HERE),
+    str(_COLLECTIVE_BW),
+    str(_REPO),
+    str(_REPO / "op_tests" / "multigpu_tests"),
+):
     if _path not in sys.path:
         sys.path.insert(0, _path)
 
@@ -40,6 +46,7 @@ def _worker(
     import flydsl_allreduce_bench as fab
     import test_flydsl_quick_allreduce as qt
     import torch
+    from aiter.ops.flydsl.allreduce_policy import NoPolicyError
     from measure import FnTimer, gather, measure
     from rccl import RcclBaseline
 
@@ -48,10 +55,18 @@ def _worker(
     tp_group = qt._init_dist(rank, world_size, init_method, hip=False)
     gloo = tp_group.cpu_group
     # Built in a fixed order: each engine's IPC exchange is a collective.
-    engines = {
-        f"fly_{a}": qt._engine(rank, world_size, gloo, device, {"algorithm": a})
-        for a in algorithms
-    }
+    # The policy lookup is deterministic, so every rank skips the same algorithms.
+    engines = {}
+    for a in algorithms:
+        try:
+            engines[f"fly_{a}"] = qt._engine(
+                rank, world_size, gloo, device, {"algorithm": a}
+            )
+        except NoPolicyError as e:
+            if rank == 0:
+                print(f"skipping {a}: {e}", flush=True)
+    if not engines:
+        raise RuntimeError("no requested algorithm has a policy for this platform")
     if rccl_backend == "torch":
         rccl = RcclBaseline(device=device, group=tp_group.device_group)
     else:
