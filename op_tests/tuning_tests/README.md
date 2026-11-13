@@ -18,7 +18,7 @@ Minimal test suite for validating the aiter tuning infrastructure.
 | `test_fmoe_tune_dispatch.py` | 1 | No | `FmoeTuner.tune()` generator dispatch, opus/FlyDSL shape filters, grouped and MXFP4 candidate selection, `result_to_csv` |
 | `test_fmoe_e2e_tune.py` | 1 | No | FlyDSL gfx942 `--e2e_tune` on stubbed timings: configs tried per shape, a failed config never wins, the winner must beat the baseline, whole-MoE TFLOPS and bandwidth, existing rows kept unless replaced |
 | `test_fmoe_calculate.py` | 1 | No | `FmoeTuner.calculate` TFLOPS and bandwidth: first GEMM for stage1, second GEMM for stage2, whole MoE for any other stage, `(0, 0)` for an invalid time |
-| `test_fmoe_candidate_snapshot.py` | 1 | No | Candidates `FmoeTuner.tune()` submits against a snapshot taken on the base commit (`AITER_FMOE_CANDIDATE_SNAPSHOT`); skipped without it |
+| `test_fmoe_candidate_snapshot.py` | 1 | Yes (no kernel timing) | Reads the real GPU architecture and compares candidates against the matching architecture entry in a base-commit snapshot (`AITER_FMOE_CANDIDATE_SNAPSHOT`). Record each entry on a node of that architecture; skipped without the snapshot. |
 | `test_tune_pipeline.py` | 2 | Yes | End-to-end: run each tuner on small shapes (mp=1 + mp=default), verify output CSV; `--compare --update_improved`; `AITER_ONLINE_TUNE` e2e |
 | `test_asm_splitk_guard.py` | 1 | No | `GemmTuner.asm_gemm_all_solutions` SplitK semaphore grid guard |
 | `test_run_config.py` | 2 | Yes | Run --run_config on ALL existing tuned CSVs (configs + model_configs) |
