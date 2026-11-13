@@ -141,31 +141,6 @@ def _check_a16w16_launch_layout(
         )
 
 
-# NT / NN / TT / TN: _launch_a16w16_gemm / _bmm pick the layout from the operand strides
-# (batch-first XQ [B,M,K] / WQ [B,N,K]): NT runs _execute_a16w16 (every kid), NN / TT / TN run their copy that
-# needs a kid whose launcher takes M/N-contiguous operands (gfx950 4-wave, which loads that layout's image).
-#   NT: XQ (K,1)  WQ (K,1)      NN: XQ (K,1)  WQ (1,N)
-#   TT: XQ (1,M)  WQ (K,1)      TN: XQ (1,M)  WQ (1,N)
-def _a16w16_operand_transposed(tensor: torch.Tensor) -> bool:
-    """True if the [.., rows, K] operand is stored [K, rows] (rows contiguous)."""
-    rows, K = tensor.shape[-2:]
-    stride_row, stride_k = tensor.stride()[-2:]
-    return rows > 1 and stride_row == 1 and not (stride_k == 1 and stride_row >= K)
-
-
-def _require_layout_kid(layout, XQ, *, kid, instance, route_arch, route_cu_num):
-    if instance is None:
-        arch, cu_num = route_arch, route_cu_num
-        if arch is None or cu_num is None:
-            arch, cu_num = _device_arch_and_cu(XQ.device)
-        instance = get_kernel_instance(arch, "a16w16", int(kid), cu_num=cu_num)
-    if instance is None or instance.kernel_tag not in GFX950_4WAVE_TAGS:
-        raise NotImplementedError(
-            f"opus_gemm_a16w16_launch: {layout} operands need a gfx950 a16w16 4-wave kid "
-            f"(tags {sorted(GFX950_4WAVE_TAGS)}); kid {kid} takes K-contiguous XQ/WQ only"
-        )
-
-
 def _execute_a16w16(
     XQ: torch.Tensor,
     WQ: torch.Tensor,
@@ -179,295 +154,116 @@ def _execute_a16w16(
     route_cu_num: int | None = None,
     instance: OpusGemmInstance | None = None,
 ) -> torch.Tensor:
-    """Validate, plan, and launch one exact 3D A16W16 operation."""
+    """Plan and launch one exact 3D A16W16 operation (layout checked by _execute_a16w16_<layout>)."""
+    batch, M, K = XQ.shape
+    N = Y.shape[2]
+
+    use_gfx950_caller_workspace_fast_path = (
+        route_arch == "gfx950"
+        and route_cu_num is not None
+        and workspace is not None
+        and split_k > 0
+        and instance is not None
+        and instance.splitk_workspace_dtype is not None
+    )
+    if use_gfx950_caller_workspace_fast_path:
+        # Reuse the dispatcher's actual device identity for local-kid lookup.
+        arch, cu_num = route_arch, route_cu_num
+    else:
+        arch, cu_num = _device_arch_and_cu(XQ.device)
+
+    plan = _get_cached_a16w16_launch_plan(
+        arch,
+        M,
+        N,
+        K,
+        batch,
+        cu_num,
+        bias is not None,
+        XQ.dtype,
+        Y.dtype,
+        int(kid),
+        int(split_k),
+    )
+    workspace_spec = plan.workspace_spec
+    if use_gfx950_caller_workspace_fast_path and workspace_spec is None:
+        raise RuntimeError(
+            f"OPUS gfx950 kid {plan.resolved_kid} unexpectedly has no "
+            "caller-workspace plan"
+        )
+    if workspace_spec is None:
+        if workspace is not None:
+            raise ValueError(
+                "opus_gemm_a16w16_launch: "
+                f"kid {plan.resolved_kid} does not use an external workspace"
+            )
+    elif workspace is None:
+        workspace = torch.empty(
+            workspace_spec.shape,
+            dtype=workspace_spec.dtype,
+            device=XQ.device,
+        )
+
+    _launch_a16w16_backend(
+        XQ,
+        WQ,
+        Y,
+        bias,
+        workspace,
+        plan.resolved_kid,
+        plan.abi_split_k,
+    )
+    return Y
+
+
+# NT / NN / TT / TN: _launch_a16w16_gemm / _bmm pick the layout from the operand strides (batch-first
+# XQ [B,M,K] / WQ [B,N,K]); each _execute_a16w16_<layout> checks its contract, then runs _execute_a16w16.
+# NN / TT / TN need a kid whose launcher takes M/N-contiguous operands (gfx950 4-wave; it loads that
+# layout's image and checks the strides).
+#   NT: XQ (K,1)  WQ (K,1)      NN: XQ (K,1)  WQ (1,N)
+#   TT: XQ (1,M)  WQ (K,1)      TN: XQ (1,M)  WQ (1,N)
+def _a16w16_operand_transposed(tensor: torch.Tensor) -> bool:
+    """True if the [.., rows, K] operand is stored [K, rows] (rows contiguous)."""
+    rows, K = tensor.shape[-2:]
+    stride_row, stride_k = tensor.stride()[-2:]
+    return rows > 1 and stride_row == 1 and not (stride_k == 1 and stride_row >= K)
+
+
+def _require_layout_kid(layout, XQ, *, kid, instance=None, route_arch=None, route_cu_num=None, **_):
+    if instance is None:
+        arch, cu_num = route_arch, route_cu_num
+        if arch is None or cu_num is None:
+            arch, cu_num = _device_arch_and_cu(XQ.device)
+        instance = get_kernel_instance(arch, "a16w16", int(kid), cu_num=cu_num)
+    if instance is None or instance.kernel_tag not in GFX950_4WAVE_TAGS:
+        raise NotImplementedError(
+            f"opus_gemm_a16w16_launch: {layout} operands need a gfx950 a16w16 4-wave kid "
+            f"(tags {sorted(GFX950_4WAVE_TAGS)}); kid {kid} takes K-contiguous XQ/WQ only"
+        )
+
+
+def _execute_a16w16_nt(XQ, WQ, Y, bias=None, **kwargs):
+    """NT: XQ stored [M,K], WQ stored [N,K]; every kid."""
     _check_a16w16_launch_layout(XQ, WQ, Y)
-    batch, M, K = XQ.shape
-    N = Y.shape[2]
-
-    use_gfx950_caller_workspace_fast_path = (
-        route_arch == "gfx950"
-        and route_cu_num is not None
-        and workspace is not None
-        and split_k > 0
-        and instance is not None
-        and instance.splitk_workspace_dtype is not None
-    )
-    if use_gfx950_caller_workspace_fast_path:
-        # Reuse the dispatcher's actual device identity for local-kid lookup.
-        arch, cu_num = route_arch, route_cu_num
-    else:
-        arch, cu_num = _device_arch_and_cu(XQ.device)
-
-    plan = _get_cached_a16w16_launch_plan(
-        arch,
-        M,
-        N,
-        K,
-        batch,
-        cu_num,
-        bias is not None,
-        XQ.dtype,
-        Y.dtype,
-        int(kid),
-        int(split_k),
-    )
-    workspace_spec = plan.workspace_spec
-    if use_gfx950_caller_workspace_fast_path and workspace_spec is None:
-        raise RuntimeError(
-            f"OPUS gfx950 kid {plan.resolved_kid} unexpectedly has no "
-            "caller-workspace plan"
-        )
-    if workspace_spec is None:
-        if workspace is not None:
-            raise ValueError(
-                "opus_gemm_a16w16_launch: "
-                f"kid {plan.resolved_kid} does not use an external workspace"
-            )
-    elif workspace is None:
-        workspace = torch.empty(
-            workspace_spec.shape,
-            dtype=workspace_spec.dtype,
-            device=XQ.device,
-        )
-
-    _launch_a16w16_backend(
-        XQ,
-        WQ,
-        Y,
-        bias,
-        workspace,
-        plan.resolved_kid,
-        plan.abi_split_k,
-    )
-    return Y
+    return _execute_a16w16(XQ, WQ, Y, bias, **kwargs)
 
 
-def _execute_a16w16_nn(
-    XQ: torch.Tensor,
-    WQ: torch.Tensor,
-    Y: torch.Tensor,
-    bias: torch.Tensor | None = None,
-    *,
-    kid: int,
-    split_k: int = 0,
-    workspace: torch.Tensor | None = None,
-    route_arch: str | None = None,
-    route_cu_num: int | None = None,
-    instance: OpusGemmInstance | None = None,
-) -> torch.Tensor:
+def _execute_a16w16_nn(XQ, WQ, Y, bias=None, **kwargs):
     """NN: XQ stored [M,K], WQ the [N,K] view of a [K,N] weight."""
-    _require_layout_kid("NN", XQ, kid=kid, instance=instance, route_arch=route_arch, route_cu_num=route_cu_num)
-    batch, M, K = XQ.shape
-    N = Y.shape[2]
-
-    use_gfx950_caller_workspace_fast_path = (
-        route_arch == "gfx950"
-        and route_cu_num is not None
-        and workspace is not None
-        and split_k > 0
-        and instance is not None
-        and instance.splitk_workspace_dtype is not None
-    )
-    if use_gfx950_caller_workspace_fast_path:
-        # Reuse the dispatcher's actual device identity for local-kid lookup.
-        arch, cu_num = route_arch, route_cu_num
-    else:
-        arch, cu_num = _device_arch_and_cu(XQ.device)
-
-    plan = _get_cached_a16w16_launch_plan(
-        arch,
-        M,
-        N,
-        K,
-        batch,
-        cu_num,
-        bias is not None,
-        XQ.dtype,
-        Y.dtype,
-        int(kid),
-        int(split_k),
-    )
-    workspace_spec = plan.workspace_spec
-    if use_gfx950_caller_workspace_fast_path and workspace_spec is None:
-        raise RuntimeError(
-            f"OPUS gfx950 kid {plan.resolved_kid} unexpectedly has no "
-            "caller-workspace plan"
-        )
-    if workspace_spec is None:
-        if workspace is not None:
-            raise ValueError(
-                "opus_gemm_a16w16_launch: "
-                f"kid {plan.resolved_kid} does not use an external workspace"
-            )
-    elif workspace is None:
-        workspace = torch.empty(
-            workspace_spec.shape,
-            dtype=workspace_spec.dtype,
-            device=XQ.device,
-        )
-
-    _launch_a16w16_backend(
-        XQ,
-        WQ,
-        Y,
-        bias,
-        workspace,
-        plan.resolved_kid,
-        plan.abi_split_k,
-    )
-    return Y
+    _require_layout_kid("NN", XQ, **kwargs)
+    return _execute_a16w16(XQ, WQ, Y, bias, **kwargs)
 
 
-def _execute_a16w16_tt(
-    XQ: torch.Tensor,
-    WQ: torch.Tensor,
-    Y: torch.Tensor,
-    bias: torch.Tensor | None = None,
-    *,
-    kid: int,
-    split_k: int = 0,
-    workspace: torch.Tensor | None = None,
-    route_arch: str | None = None,
-    route_cu_num: int | None = None,
-    instance: OpusGemmInstance | None = None,
-) -> torch.Tensor:
+def _execute_a16w16_tt(XQ, WQ, Y, bias=None, **kwargs):
     """TT: XQ the [M,K] view of a [K,M] activation, WQ stored [N,K]."""
-    _require_layout_kid("TT", XQ, kid=kid, instance=instance, route_arch=route_arch, route_cu_num=route_cu_num)
-    batch, M, K = XQ.shape
-    N = Y.shape[2]
-
-    use_gfx950_caller_workspace_fast_path = (
-        route_arch == "gfx950"
-        and route_cu_num is not None
-        and workspace is not None
-        and split_k > 0
-        and instance is not None
-        and instance.splitk_workspace_dtype is not None
-    )
-    if use_gfx950_caller_workspace_fast_path:
-        # Reuse the dispatcher's actual device identity for local-kid lookup.
-        arch, cu_num = route_arch, route_cu_num
-    else:
-        arch, cu_num = _device_arch_and_cu(XQ.device)
-
-    plan = _get_cached_a16w16_launch_plan(
-        arch,
-        M,
-        N,
-        K,
-        batch,
-        cu_num,
-        bias is not None,
-        XQ.dtype,
-        Y.dtype,
-        int(kid),
-        int(split_k),
-    )
-    workspace_spec = plan.workspace_spec
-    if use_gfx950_caller_workspace_fast_path and workspace_spec is None:
-        raise RuntimeError(
-            f"OPUS gfx950 kid {plan.resolved_kid} unexpectedly has no "
-            "caller-workspace plan"
-        )
-    if workspace_spec is None:
-        if workspace is not None:
-            raise ValueError(
-                "opus_gemm_a16w16_launch: "
-                f"kid {plan.resolved_kid} does not use an external workspace"
-            )
-    elif workspace is None:
-        workspace = torch.empty(
-            workspace_spec.shape,
-            dtype=workspace_spec.dtype,
-            device=XQ.device,
-        )
-
-    _launch_a16w16_backend(
-        XQ,
-        WQ,
-        Y,
-        bias,
-        workspace,
-        plan.resolved_kid,
-        plan.abi_split_k,
-    )
-    return Y
+    _require_layout_kid("TT", XQ, **kwargs)
+    return _execute_a16w16(XQ, WQ, Y, bias, **kwargs)
 
 
-def _execute_a16w16_tn(
-    XQ: torch.Tensor,
-    WQ: torch.Tensor,
-    Y: torch.Tensor,
-    bias: torch.Tensor | None = None,
-    *,
-    kid: int,
-    split_k: int = 0,
-    workspace: torch.Tensor | None = None,
-    route_arch: str | None = None,
-    route_cu_num: int | None = None,
-    instance: OpusGemmInstance | None = None,
-) -> torch.Tensor:
+def _execute_a16w16_tn(XQ, WQ, Y, bias=None, **kwargs):
     """TN: XQ / WQ views of [K,M] / [K,N] storage."""
-    _require_layout_kid("TN", XQ, kid=kid, instance=instance, route_arch=route_arch, route_cu_num=route_cu_num)
-    batch, M, K = XQ.shape
-    N = Y.shape[2]
-
-    use_gfx950_caller_workspace_fast_path = (
-        route_arch == "gfx950"
-        and route_cu_num is not None
-        and workspace is not None
-        and split_k > 0
-        and instance is not None
-        and instance.splitk_workspace_dtype is not None
-    )
-    if use_gfx950_caller_workspace_fast_path:
-        # Reuse the dispatcher's actual device identity for local-kid lookup.
-        arch, cu_num = route_arch, route_cu_num
-    else:
-        arch, cu_num = _device_arch_and_cu(XQ.device)
-
-    plan = _get_cached_a16w16_launch_plan(
-        arch,
-        M,
-        N,
-        K,
-        batch,
-        cu_num,
-        bias is not None,
-        XQ.dtype,
-        Y.dtype,
-        int(kid),
-        int(split_k),
-    )
-    workspace_spec = plan.workspace_spec
-    if use_gfx950_caller_workspace_fast_path and workspace_spec is None:
-        raise RuntimeError(
-            f"OPUS gfx950 kid {plan.resolved_kid} unexpectedly has no "
-            "caller-workspace plan"
-        )
-    if workspace_spec is None:
-        if workspace is not None:
-            raise ValueError(
-                "opus_gemm_a16w16_launch: "
-                f"kid {plan.resolved_kid} does not use an external workspace"
-            )
-    elif workspace is None:
-        workspace = torch.empty(
-            workspace_spec.shape,
-            dtype=workspace_spec.dtype,
-            device=XQ.device,
-        )
-
-    _launch_a16w16_backend(
-        XQ,
-        WQ,
-        Y,
-        bias,
-        workspace,
-        plan.resolved_kid,
-        plan.abi_split_k,
-    )
-    return Y
+    _require_layout_kid("TN", XQ, **kwargs)
+    return _execute_a16w16(XQ, WQ, Y, bias, **kwargs)
 
 
 def _launch_a16w16_gemm(
@@ -490,8 +286,8 @@ def _launch_a16w16_gemm(
             "batch-first 3D tensors"
         )
     execute = (
-        (_execute_a16w16, _execute_a16w16_nn),   # NT, NN
-        (_execute_a16w16_tt, _execute_a16w16_tn),  # TT, TN
+        (_execute_a16w16_nt, _execute_a16w16_nn),
+        (_execute_a16w16_tt, _execute_a16w16_tn),
     )[_a16w16_operand_transposed(XQ)][_a16w16_operand_transposed(WQ)]
     execute(
         XQ.unsqueeze(0),
@@ -528,8 +324,8 @@ def _launch_a16w16_bmm(
             "opus_gemm for logical 2D tensors"
         )
     execute = (
-        (_execute_a16w16, _execute_a16w16_nn),   # NT, NN
-        (_execute_a16w16_tt, _execute_a16w16_tn),  # TT, TN
+        (_execute_a16w16_nt, _execute_a16w16_nn),
+        (_execute_a16w16_tt, _execute_a16w16_tn),
     )[_a16w16_operand_transposed(XQ)][_a16w16_operand_transposed(WQ)]
     return execute(
         XQ,
