@@ -19,6 +19,11 @@ Graph capture: the first call of a geometry on a stream must run uncaptured to
 allocate its workspace. Each call, captured or not, records a GPU plan refresh
 from ``seqused_k``, so lengths may change between replays up to the captured
 ``max_seqlen_k``. Calls and replays sharing a workspace must not overlap.
+
+The optimized varlen specialization is additionally limited to the global page-128,
+HKV=1, direct-output plan with ``max_seqlen_k >= 4096``. Set
+``AITER_UNIFIED_ATTN_FLYDSL_VARLEN_OPTIMIZED=0`` to retain the prior varlen
+kernel while leaving other FlyDSL routes enabled.
 """
 
 from __future__ import annotations
@@ -65,6 +70,12 @@ def _swa_enabled() -> bool:
 
 def _varlen_enabled() -> bool:
     return os.environ.get("AITER_UNIFIED_ATTN_FLYDSL_VARLEN", "1") != "0"
+
+
+def _varlen_optimized_enabled() -> bool:
+    return (
+        os.environ.get("AITER_UNIFIED_ATTN_FLYDSL_VARLEN_OPTIMIZED", "1") != "0"
+    )
 
 
 def _pseudo_capacity(num_tokens, num_seqs, block=_QUERY_BLOCK):
@@ -405,6 +416,82 @@ def _build_query_map(cu_seqlens_q, seqused_k, num_tokens, query_map, context_len
     )
     query_map.copy_(rows[order])
     context_lengths.copy_(context[order])
+
+
+def _varlen_optimized_eligible(q, k, out, max_seqlen_k):
+    """Whether the reviewed direct-output specialization is an exact match.
+
+    This deliberately adds restrictions beyond the general FlyDSL route.  In
+    particular, HKV=1 avoids the reviewed multi-KV partial-buffer issue, and
+    page 128 plus a long, splittable context keeps the specialization on its measured
+    MiMo hot path.  Every miss continues through the existing varlen kernel.
+    """
+    if not _varlen_optimized_enabled():
+        return False
+    if k.shape[1] != 128 or k.shape[2] != 1 or int(max_seqlen_k) < 4096:
+        return False
+    return out.stride() == (q.shape[1] * _VALUE_DIM, _VALUE_DIM, 1)
+
+
+def _use_varlen_optimized(q, k, out, num_seqs, max_seqlen_k, num_cu):
+    if not _varlen_enabled() or not _varlen_optimized_eligible(
+        q, k, out, max_seqlen_k
+    ):
+        return False
+    # The reviewed schedule and XCD topology target the full 256-CU MI355X.
+    # Preserve the generic implementation on harvested/other gfx950 parts and
+    # when callers deliberately alter the baseline planner capacity.
+    if num_cu != 256 or int(os.environ.get("PP_VL_EXTRA", "0")) != 0:
+        return False
+    pseudo = _pseudo_capacity(q.shape[0], num_seqs)
+    return _plan_capacity(pseudo, 1, num_cu) == pseudo
+
+
+def _unified_attention_varlen_optimized(
+    q,
+    k,
+    v,
+    out,
+    cu_seqlens_q,
+    seqused_k,
+    softmax_scale,
+    block_table,
+    num_cu,
+    explicit,
+):
+    from . import unified_attention_varlen
+
+    spec = unified_attention_varlen.workspace_requirements(
+        q.shape[0],
+        seqused_k.numel(),
+        num_cu,
+    )
+    if spec is None:
+        return None
+    need, _, _, _ = spec
+    workspace = _workspace(
+        q,
+        "varlen_optimized",
+        need,
+        f"{seqused_k.numel()} sequences, {q.shape[0]} query tokens",
+        explicit,
+    )
+    if workspace is None:
+        return None
+    if torch.cuda.is_current_stream_capturing():
+        workspace["captured"] = True
+    return unified_attention_varlen.run(
+        q,
+        k,
+        v,
+        out,
+        cu_seqlens_q,
+        seqused_k,
+        block_table,
+        softmax_scale,
+        workspace,
+        num_cu,
+    )
 
 
 def _unified_attention_varlen(
@@ -790,6 +877,30 @@ def unified_attention_flydsl(
             explicit,
         )
     if route == "varlen":
+        with torch.cuda.device(q.device):
+            num_cu = torch.cuda.get_device_properties(
+                q.device
+            ).multi_processor_count
+        if _use_varlen_optimized(
+            q,
+            k,
+            out,
+            seqused_k.numel(),
+            max_seqlen_k,
+            num_cu,
+        ):
+            return _unified_attention_varlen_optimized(
+                q,
+                k,
+                v,
+                out,
+                cu_seqlens_q,
+                seqused_k,
+                softmax_scale,
+                block_table,
+                num_cu,
+                explicit,
+            )
         return _unified_attention_varlen(
             q,
             k,

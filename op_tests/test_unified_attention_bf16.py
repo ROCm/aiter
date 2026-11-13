@@ -13,6 +13,7 @@ pytest.importorskip("flydsl")
 import aiter.ops.flydsl.pa_decode as pa
 import aiter.ops.triton.attention.unified_attention as triton_ua
 from aiter.ops.flydsl import unified_attention_bf16 as flydsl_ua
+from aiter.ops.flydsl import unified_attention_varlen
 from aiter.ops.unified_attention import unified_attention
 
 pytestmark = pytest.mark.skipif(
@@ -48,7 +49,20 @@ def _inputs(lengths, page, *, qlen=QLEN, hkv=HKV, shared_page=False, seed=0):
     return q, k, v, out, cu_seqlens_q, seqused_k, table
 
 
-def _call(q, k, v, out, cu, seqused_k, table, *, qlen=QLEN, backend=None, **kw):
+def _call(
+    q,
+    k,
+    v,
+    out,
+    cu,
+    seqused_k,
+    table,
+    *,
+    qlen=QLEN,
+    max_k=None,
+    backend=None,
+    **kw,
+):
     options = {
         "causal": True,
         "window_size": (-1, -1),
@@ -66,7 +80,7 @@ def _call(q, k, v, out, cu, seqused_k, table, *, qlen=QLEN, backend=None, **kw):
         cu,
         qlen,
         seqused_k,
-        int(seqused_k.max().item()),
+        int(seqused_k.max().item()) if max_k is None else max_k,
         D**-0.5,
         options.pop("causal"),
         options.pop("window_size"),
@@ -250,6 +264,67 @@ def test_ragged_disabled_by_environment(monkeypatch, route_spy):
     assert route_spy == ["triton"]
 
 
+def test_varlen_optimized_route_is_narrow(monkeypatch):
+    q = torch.empty((8192, HQ, D), dtype=torch.bfloat16)
+    k = torch.empty((1, 128, 1, D), dtype=torch.bfloat16)
+    out = torch.empty((8192, HQ, DV), dtype=torch.bfloat16)
+    eligible = flydsl_ua._use_varlen_optimized
+
+    assert eligible(q, k, out, 1, 8192, 256)
+    assert not eligible(q, k[:, :64], out, 1, 8192, 256)
+    assert not eligible(q, k.expand(1, 128, 2, D), out, 1, 8192, 256)
+    assert not eligible(q, k, out, 1, 4095, 256)
+    assert not eligible(q[:16], k, out[:16], 1, 8192, 256)
+    assert not eligible(q, k, out, 1, 8192, 255)
+
+    monkeypatch.setenv("AITER_UNIFIED_ATTN_FLYDSL_VARLEN_OPTIMIZED", "0")
+    assert not eligible(q, k, out, 1, 8192, 256)
+    monkeypatch.setenv("AITER_UNIFIED_ATTN_FLYDSL_VARLEN_OPTIMIZED", "1")
+    monkeypatch.setenv("PP_VL_EXTRA", "1")
+    assert not eligible(q, k, out, 1, 8192, 256)
+    monkeypatch.delenv("PP_VL_EXTRA")
+    monkeypatch.setenv("AITER_UNIFIED_ATTN_FLYDSL_VARLEN", "0")
+    assert not eligible(q, k, out, 1, 8192, 256)
+
+
+def test_varlen_optimized_workspace_covers_tail_plan():
+    spec = unified_attention_varlen.workspace_requirements(8192, 1, 256)
+    assert spec is not None
+    need, pseudo, capacity, tail_lo = spec
+    assert capacity > pseudo
+    assert 0 <= tail_lo < pseudo
+    assert need["ticket"] == (1, torch.int32)
+    assert need["work_info"] == (capacity * 4, torch.int32)
+    assert need["reduce_info"] == (pseudo * 2, torch.int32)
+    assert need["tail_max_logits"][1] == torch.float32
+    assert need["tail_exp_sums"][1] == torch.float32
+    assert need["tail_output"][1] == torch.float32
+
+
+def test_varlen_optimized_dispatch_and_kill_switch(monkeypatch):
+    qlen = 8192
+    args = _inputs((qlen,), 128, qlen=qlen)
+    calls = []
+
+    def optimized(*call_args, **kwargs):
+        calls.append("optimized")
+        return call_args[3]
+
+    def baseline(*call_args, **kwargs):
+        calls.append("baseline")
+        return call_args[3]
+
+    monkeypatch.setattr(flydsl_ua, "_unified_attention_varlen_optimized", optimized)
+    monkeypatch.setattr(flydsl_ua, "_unified_attention_varlen", baseline)
+    _call(*args, qlen=qlen, backend="flydsl")
+    assert calls == ["optimized"]
+
+    calls.clear()
+    monkeypatch.setenv("AITER_UNIFIED_ATTN_FLYDSL_VARLEN_OPTIMIZED", "0")
+    _call(*args, qlen=qlen, backend="flydsl")
+    assert calls == ["baseline"]
+
+
 def test_disabled_by_environment(monkeypatch, route_spy):
     monkeypatch.setenv("AITER_UNIFIED_ATTN_FLYDSL", "0")
     q, k, v, out, cu, used, table = _inputs((300, 129), 64)
@@ -382,3 +457,37 @@ def test_ragged_graph_replay_follows_new_offsets(page):
         torch.cuda.synchronize()
         assert torch.cuda.memory_allocated() == allocated
         _check(out, _reference(q, k, v, used, table, cu_seqlens_q=offsets))
+
+
+def test_varlen_optimized_graph_replay_does_not_allocate():
+    qlen = 8192
+    q, k, v, out, cu, used, table = _inputs((qlen,), 128, qlen=qlen)
+    stream = torch.cuda.Stream()
+
+    def call():
+        _call(
+            q,
+            k,
+            v,
+            out,
+            cu,
+            used,
+            table,
+            qlen=qlen,
+            max_k=qlen,
+            backend="flydsl",
+        )
+
+    with torch.cuda.stream(stream):
+        call()
+    stream.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph, stream=stream):
+        call()
+
+    out.fill_(float("nan"))
+    allocated = torch.cuda.memory_allocated()
+    graph.replay()
+    torch.cuda.synchronize()
+    assert torch.cuda.memory_allocated() == allocated
+    assert torch.isfinite(out).all()
