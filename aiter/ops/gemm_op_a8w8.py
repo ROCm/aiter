@@ -1453,15 +1453,15 @@ def _flydsl_mxfp8_fallback_kernel(
     want_tm = min(256, max(16, 1 << (m - 1).bit_length()))
     compute = [ki for ki in fits if is_compute_kernel(ki)]
     if compute:
-        # Prefer denser clusters and persistent multi-N tiles. Fewer LDS
-        # buffers (nb2 over nb4) consistently wins on gfx1250 compute_wmma
-        # gemm-request shapes — more buffers inflate the K-pipeline.
+        # Prefer denser clusters. Fewer LDS buffers (nb2 over nb4) and
+        # non-persistent grids win on gfx1250 compute_wmma gemm-request
+        # shapes — extra buffers / ps>1 inflate the K / N pipeline.
         return min(
             compute,
             key=lambda x: (
                 abs(x.tile_m - want_tm),
                 -(x.cluster_m * x.cluster_n),
-                -x.persistent_n_tiles,
+                x.persistent_n_tiles,
                 x.split_k,
                 -x.tile_n,
                 x.num_buffers,
