@@ -446,12 +446,10 @@ def build_gemm_gfx1250(
                     )
                     for ni in range_constexpr(n_steps)
                 ]
-                rocdl.sched_barrier(0)
                 for mi in range_constexpr(m_steps):
                     a_fragment = load_fragment(
                         shared_a, a_stage_size, stage, wave_row + mi * mma_m, ki * mma_k
                     )
-                    rocdl.sched_barrier(0)
                     for ni in range_constexpr(n_steps):
                         acc = accumulators[mi * n_steps + ni]
                         fx.gemm(mma, acc, a_fragment, b_fragments[ni], acc)
