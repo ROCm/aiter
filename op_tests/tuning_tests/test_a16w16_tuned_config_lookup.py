@@ -249,6 +249,248 @@ class TestExactLatentLargeCsv(unittest.TestCase):
         self.assertEqual(row, saved)
 
 
+class TestGfx950ExtendedHgemm(unittest.TestCase):
+    def test_names_and_declined_combinations(self):
+        from aiter.ops.flydsl.gemm_kernels import (
+            flydsl_hgemm_kernel_name,
+            get_flydsl_hgemm_kernel_params,
+        )
+
+        base = {
+            "block_m": 64,
+            "block_n": 64,
+            "block_k": 64,
+            "stages": 3,
+            "split_k": 1,
+            "m_waves": 2,
+            "n_waves": 2,
+            "k_waves": 1,
+            "group_m": 0,
+            "use_half_tile_interleaved": False,
+        }
+
+        def name(
+            config,
+            gfx="gfx950",
+            dtype=torch.bfloat16,
+            out_dtype=torch.bfloat16,
+            bias=False,
+        ):
+            return flydsl_hgemm_kernel_name(
+                config=config,
+                target_gfx=gfx,
+                dtype=dtype,
+                out_dtype=out_dtype,
+                has_bias=bias,
+            )
+
+        old = name(base)
+        self.assertEqual(
+            old,
+            "flydsl_hgemm_abf16_wbf16_bf16_t64x64x64x3_ks1_w2x2x1_bias0_ktail0_gm0_pft_gfx950",
+        )
+        self.assertNotIn("mma_m", get_flydsl_hgemm_kernel_params(old))
+        self.assertNotIn("streamk_blocks", get_flydsl_hgemm_kernel_params(old))
+        for extension in (
+            {"mma_m": 32, "mma_n": 32, "mma_k": 16},
+            {"streamk_blocks": 7},
+            {"mma_m": 32, "mma_n": 32, "mma_k": 16, "streamk_blocks": 13},
+        ):
+            config = {**base, **extension}
+            parsed = get_flydsl_hgemm_kernel_params(name(config))
+            self.assertEqual({key: parsed[key] for key in config}, config)
+        for cfg, kw in (
+            ({**base, "mma_m": 32, "mma_n": 32, "mma_k": 16, "k_waves": 2}, {}),
+            ({**base, "mma_m": 32, "mma_n": 32, "mma_k": 16}, {"gfx": "gfx1250"}),
+            (
+                {**base, "mma_m": 32, "mma_n": 32, "mma_k": 16},
+                {"dtype": torch.float16, "out_dtype": torch.float16},
+            ),
+            ({**base, "mma_m": 16.0}, {}),
+            ({**base, "streamk_blocks": True}, {}),
+            ({**base, "streamk_blocks": -1}, {}),
+            ({**base, "streamk_blocks": 1025}, {}),
+            ({**base, "streamk_blocks": 7, "split_k": 2}, {}),
+            ({**base, "streamk_blocks": 7, "k_waves": 2}, {}),
+            ({**base, "streamk_blocks": 7, "group_m": 4}, {}),
+            ({**base, "streamk_blocks": 7, "k_stagger": 1}, {}),
+            ({**base, "streamk_blocks": 7, "b_non_temporal": True}, {}),
+            ({**base, "streamk_blocks": 7}, {"bias": True}),
+            ({**base, "streamk_blocks": 7}, {"out_dtype": torch.float32}),
+            ({**base, "streamk_blocks": 7, "policy": "sk"}, {}),
+            ({**base, "streamk_blocks": 7, "use_half_tile_interleaved": True}, {}),
+        ):
+            with (
+                self.subTest(config=cfg, kw=kw),
+                self.assertRaises((ValueError, TypeError)),
+            ):
+                name(cfg, **kw)
+        for bad in (
+            old.replace("_pft", "_mi16x16x32_pft"),
+            old.replace("_pft", "_mi32x32x32_pft"),
+            old.replace("_pft", "_skg0_pft"),
+            old.replace("_pft", "_skg1025_pft"),
+            old.replace("_pft", "_mi32x32x16_pht"),
+        ):
+            self.assertIsNone(get_flydsl_hgemm_kernel_params(bad))
+
+    def test_balanced_interval_and_slot_bound(self):
+        # The device inverts floor(w*total/workers). No duplicate or missing
+        # K tiles; each output tile's participants occupy contiguous slots.
+        for tiles in (1, 2, 3, 7, 8, 32, 112):
+            for kt in (1, 2, 3, 5, 14, 28):
+                total = tiles * kt
+                for workers in sorted(
+                    {1, min(7, total), min(13, total), min(224, total), total}
+                ):
+                    slots = (workers + tiles - 1) // tiles + 1
+                    cover = [0] * total
+                    participants = [[] for _ in range(tiles)]
+                    for w in range(workers):
+                        begin = w * total // workers
+                        end = (w + 1) * total // workers
+                        for i in range(begin, end):
+                            cover[i] += 1
+                        for tile in range(begin // kt, (end - 1) // kt + 1):
+                            participants[tile].append(w)
+                    self.assertEqual(set(cover), {1})
+                    for tile, ps in enumerate(participants):
+                        first = ((tile * kt + 1) * workers - 1) // total
+                        last = ((tile + 1) * kt * workers - 1) // total
+                        self.assertEqual(ps, list(range(first, last + 1)))
+                        self.assertLessEqual(len(ps), slots)
+
+    def test_extra_candidates_validated_and_appended(self):
+        import aiter.ops.flydsl.kernels.gemm_a16w16_gfx950 as impl
+        from aiter.ops.flydsl import gemm_a16w16_policy as policy
+
+        with mock.patch.object(impl, "get_rocm_arch", return_value="gfx950"):
+            cs = policy._gfx950_extended_configs(
+                128, 3584, 7168, torch.bfloat16, torch.bfloat16, False
+            )
+        self.assertTrue(any(c["block_n"] == 112 for c in cs))
+        self.assertTrue(any(c["block_n"] == 224 for c in cs))
+        self.assertTrue(any(c.get("mma_m") == 32 for c in cs))
+        self.assertTrue(any(c.get("streamk_blocks") for c in cs))
+        self.assertEqual(len(cs), len({tuple(sorted(c.items())) for c in cs}))
+        self.assertEqual(
+            policy._gfx950_extended_configs(
+                129, 3584, 7168, torch.bfloat16, torch.bfloat16, False
+            ),
+            [],
+        )
+        self.assertEqual(
+            policy._gfx950_extended_configs(
+                128, 3584, 7168, torch.float16, torch.float16, False
+            ),
+            [],
+        )
+        with mock.patch.object(impl, "get_rocm_arch", return_value="gfx950"):
+            for bias, outdtype in ((True, torch.bfloat16), (False, torch.float32)):
+                cs = policy._gfx950_extended_configs(
+                    128, 3584, 7168, torch.bfloat16, outdtype, bias
+                )
+                self.assertFalse(any(c.get("streamk_blocks") for c in cs))
+
+    def test_invalid_types_rejected_after_cache_warmup(self):
+        import aiter.ops.flydsl.kernels.gemm_a16w16_gfx950 as impl
+
+        cfg = {
+            "block_m": 64,
+            "block_n": 64,
+            "block_k": 64,
+            "stages": 3,
+            "split_k": 1,
+            "m_waves": 2,
+            "n_waves": 2,
+            "k_waves": 1,
+            "group_m": 0,
+            "use_half_tile_interleaved": False,
+            "in_dtype_id": 2,
+            "out_dtype_id": 2,
+            "streamk_blocks": 1,
+            "mma_m": 16,
+            "mma_n": 16,
+            "mma_k": 32,
+        }
+        with mock.patch.object(impl, "get_rocm_arch", return_value="gfx950"):
+            self.assertIsNotNone(
+                impl.make_gemm_a16w16_param_and_validate(128, 256, 256, cfg)
+            )
+            for field, value in (
+                ("streamk_blocks", True),
+                ("streamk_blocks", 1.0),
+                ("mma_m", 16.0),
+                ("mma_n", 16.0),
+                ("mma_k", 32.0),
+            ):
+                with self.subTest(field=field, value=value):
+                    self.assertIsNone(
+                        impl.make_gemm_a16w16_param_and_validate(
+                            128, 256, 256, {**cfg, field: value}
+                        )
+                    )
+
+    def test_extended_k_layout_rejects(self):
+        import aiter.ops.flydsl.kernels.gemm_a16w16_gfx950 as impl
+
+        cfg = {
+            "block_m": 64,
+            "block_n": 64,
+            "block_k": 32,
+            "stages": 2,
+            "split_k": 1,
+            "m_waves": 1,
+            "n_waves": 1,
+            "k_waves": 1,
+            "group_m": 0,
+            "use_half_tile_interleaved": False,
+            "in_dtype_id": 2,
+            "out_dtype_id": 2,
+        }
+        with mock.patch.object(impl, "get_rocm_arch", return_value="gfx950"):
+            for ext in ({"streamk_blocks": 4}, {"mma_m": 32, "mma_n": 32, "mma_k": 16}):
+                with self.assertRaisesRegex(ValueError, "block_k divisible by 64"):
+                    impl.make_gemm_a16w16_gfx950_param(**cfg, **ext)
+
+    def test_stream_bounds_and_arch_reject(self):
+        import aiter.ops.flydsl.kernels.gemm_a16w16_gfx950 as impl
+
+        cfg = {
+            "block_m": 64,
+            "block_n": 64,
+            "block_k": 64,
+            "stages": 3,
+            "split_k": 1,
+            "m_waves": 2,
+            "n_waves": 2,
+            "k_waves": 1,
+            "group_m": 0,
+            "use_half_tile_interleaved": False,
+            "in_dtype_id": 2,
+            "out_dtype_id": 2,
+            "streamk_blocks": 7,
+        }
+        with mock.patch.object(impl, "get_rocm_arch", return_value="gfx950"):
+            self.assertIsNotNone(
+                impl.make_gemm_a16w16_param_and_validate(128, 256, 64, cfg)
+            )
+            for m, n, k in (
+                (0, 256, 64),
+                (64, 64, 64),
+                (128, 256, 72),
+                (65536, 65536, 7168),
+            ):
+                self.assertIsNone(
+                    impl.make_gemm_a16w16_param_and_validate(m, n, k, cfg)
+                )
+        with (
+            mock.patch.object(impl, "get_rocm_arch", return_value="gfx942"),
+            self.assertRaises(ValueError),
+        ):
+            impl.make_gemm_a16w16_gfx950_param(**cfg)
+
+
 class TestGfx1250FlydslCandidates(unittest.TestCase):
     """GemmA16W16Tuner's FlyDSL candidates on gfx1250, with the device mocked."""
 
@@ -381,6 +623,7 @@ class TestGfx950FlydslMemoryCandidates(unittest.TestCase):
             ),
             mock.patch.object(policy, "skinny_config_error", return_value=None),
             mock.patch.object(policy, "band_stream_config", return_value=None),
+            mock.patch.object(policy, "_gfx950_extended_configs", return_value=[]),
         ):
             configs = policy.get_flydsl_a16w16_configs(
                 112, 18432, 1536, torch.bfloat16, torch.bfloat16, False

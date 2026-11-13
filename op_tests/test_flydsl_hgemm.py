@@ -24,7 +24,7 @@ import torch
 
 import aiter
 from aiter import dtypes
-from aiter.jit.utils.chip_info import get_gfx
+from aiter.jit.utils.chip_info import get_gfx, get_gfx_runtime
 from aiter.ops.flydsl import flydsl_hgemm
 from aiter.ops.flydsl.gemm_a16w16_band import band_stream_config
 from aiter.ops.flydsl.gemm_kernels import (
@@ -36,8 +36,6 @@ from aiter.test_common import (
     checkAllclose,
     run_perftest,
 )
-
-torch.set_default_device("cuda")
 
 # Public wrapper currently supports gfx950 only. Positive allow-list: an unknown
 # new card must not silently run an unbuilt kernel.
@@ -794,6 +792,371 @@ def check_hgemm_memory_options():
     aiter.logger.info("hgemm memory-option names and rejection checks passed")
 
 
+# (M,N,K, panel-N, MFMA-M, Stream-K workers). No tuned CSVs are modified.
+# Cover direct output, partial joins, persistent multi-tile workers and short
+# prologues. N120/M65 exercises both edge guards; 224-wide panel has an N tail.
+_EXTENDED_TILES = (
+    (128, 256, 256, 64, 32, 0),
+    (65, 120, 320, 64, 32, 0),
+    (65, 232, 320, 112, 16, 0),
+    (128, 448, 512, 224, 16, 0),
+    (128, 256, 256, 64, 16, 1),
+    (128, 256, 256, 64, 16, 8),
+    (128, 256, 256, 64, 16, 13),
+    (65, 120, 320, 64, 16, 7),
+    (65, 120, 320, 64, 32, 7),
+    (128, 256, 64, 64, 16, 7),
+    (128, 256, 256, 64, 32, 32),
+    (65, 232, 320, 224, 16, 7),
+    (128, 3584, 7168, 64, 16, 224),
+    (128, 7168, 3584, 64, 32, 256),
+)
+
+
+@benchmark()
+def test_hgemm_extended(m, n, k, panel_n, mma_m, workers):
+    """Opt-in extensions: strict numerics, guards, padded strides and replay."""
+    import statistics
+    from unittest.mock import patch
+
+    import aiter.ops.flydsl.kernels.gemm_a16w16_gfx950 as impl
+
+    torch.manual_seed(2407)
+    cfg = {
+        "block_m": 64,
+        "block_n": panel_n,
+        "block_k": 64,
+        "stages": 3,
+        "split_k": 1,
+        "m_waves": 2,
+        "n_waves": 1 if panel_n == 112 else 2,
+        "k_waves": 1,
+        "group_m": 0,
+        "policy": "ft",
+    }
+    if mma_m == 32:
+        cfg.update(mma_m=32, mma_n=32, mma_k=16)
+    if workers:
+        cfg["streamk_blocks"] = workers
+    # Padding tests the direct NT kernel's runtime strides. Public wrapper
+    # also tested below (it intentionally makes A/B contiguous).
+    xs = torch.randn((m, k + 16), device="cuda", dtype=dtypes.bf16)
+    ws = torch.randn((n, k + 32), device="cuda", dtype=dtypes.bf16)
+    a, w = xs[:, 8 : 8 + k], ws[:, 16 : 16 + k]
+    halos = [
+        torch.full((m * n + 64,), 23.0, device=a.device, dtype=a.dtype)
+        for _ in range(2)
+    ]
+    outs = [x[32:-32].view(m, n) for x in halos]
+    streams = [torch.cuda.Stream() for _ in outs]
+    direct_cfg = {key: value for key, value in cfg.items() if key != "policy"}
+    direct_cfg["use_half_tile_interleaved"] = False
+
+    def direct(out, stream):
+        return impl.gemm_a16w16(a, w.T, out=out, user_kwargs=direct_cfg, stream=stream)
+
+    def verify(ref, out):
+        err = checkAllclose(
+            ref.float(),
+            out.float(),
+            rtol=0.01,
+            atol=0.01,
+            tol_err_ratio=0,
+            printLog=False,
+        )
+        assert err == 0, (m, n, k, panel_n, mma_m, workers, err)
+        return err
+
+    # Add redzones to internal workspace. Each captured call has a distinct
+    # allocation; replay must execute the counter initialization anew.
+    workspaces = []
+    real_empty, real_zeros = torch.empty, torch.zeros
+
+    def guarded(factory, value):
+        def alloc(shape, **kw):
+            if (
+                isinstance(shape, tuple)
+                and len(shape) == 1
+                and kw.get("dtype") in (torch.float32, torch.int32)
+            ):
+                mem = real_empty((shape[0] + 64,), **kw)
+                mem.fill_(value)
+                view = mem[32:-32]
+                if factory is real_zeros:
+                    view.zero_()
+                workspaces.append((mem, value))
+                return view
+            return factory(shape, **kw)
+
+        return alloc
+
+    graphs = []
+    with (
+        patch.object(impl.torch, "empty", guarded(real_empty, 31)),
+        patch.object(impl.torch, "zeros", guarded(real_zeros, 37)),
+    ):
+        for stream, out in zip(streams, outs):
+            stream.wait_stream(torch.cuda.current_stream())
+            # First use can compile under graph capture; use distinct streams.
+            g = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(g, stream=stream):
+                direct(out, stream)
+                direct(out, stream)
+            stream.synchronize()
+            graphs.append(g)
+
+    for step in range(6):
+        if step % 3 == 0:
+            a.normal_()
+            w.normal_()
+        elif step % 3 == 1:
+            a.mul_(0.125)
+            w.mul_(0.125)
+        else:
+            a.copy_(torch.randint(-4, 5, a.shape, device=a.device).float() / 16)
+            w.copy_(torch.randint(-4, 5, w.shape, device=w.device).float() / 16)
+        saved = (a.clone(), w.clone())
+        ref = run_torch(a, w, a.dtype)
+        for out, stream, graph in zip(outs, streams, graphs):
+            out.fill_(float("nan"))
+            stream.wait_stream(torch.cuda.current_stream())
+            with torch.cuda.stream(stream):
+                graph.replay()
+                graph.replay()
+        for stream, out, halo in zip(streams, outs, halos):
+            stream.synchronize()
+            verify(ref, out)
+            assert (halo[:32] == 23).all() and (halo[-32:] == 23).all()
+        assert torch.equal(
+            outs[0], outs[1]
+        ), "fixed partition order must be deterministic"
+        assert torch.equal(a, saved[0]) and torch.equal(w, saved[1])
+        for mem, value in workspaces:
+            assert (mem[:32] == value).all() and (mem[-32:] == value).all()
+    if workers:
+        assert workspaces, "Stream-K must own initialized per-call workspaces"
+
+    # Public/API coverage uses regular allocators and includes workspace init.
+    out = outs[0]
+    name = flydsl_hgemm_kernel_name(
+        dtype=a.dtype,
+        out_dtype=a.dtype,
+        config={**cfg, "use_half_tile_interleaved": False},
+        has_bias=False,
+        target_gfx="gfx950",
+    )
+    parsed = get_flydsl_hgemm_kernel_params(name)
+    assert parsed is not None
+    for key in ("mma_m", "mma_n", "mma_k", "streamk_blocks"):
+        if key in cfg:
+            assert parsed[key] == cfg[key]
+    public = lambda: flydsl_hgemm(a, w, out=out, **cfg)
+    public()
+    torch.cuda.synchronize()
+    verify(ref, out)
+    explicit_stream = streams[0]
+    explicit_stream.wait_stream(torch.cuda.current_stream())
+    flydsl_hgemm(a, w, out=out, stream=explicit_stream, **cfg)
+    explicit_stream.synchronize()
+    verify(ref, out)
+    ret = {"gfx": get_gfx_runtime()}
+    candidates = {"public": public, "direct_graph2": graphs[0].replay}
+    for label, fn in candidates.items():
+        times = []
+        for _ in range(3):
+            _, us = run_perftest(
+                fn, num_iters=10, num_warmup=3, num_rotate_args=1, use_cuda_event=True
+            )
+            torch.cuda.synchronize()
+            verify(ref, out)
+            times.append(us / (2 if label == "direct_graph2" else 1))
+        us = statistics.median(times)
+        ret.update(
+            {
+                label + " us": us,
+                label + " TFLOPS": 2 * m * n * k / us / 1e6,
+                label + " TB/s": 2 * (m * k + n * k + m * n) / us / 1e6,
+                label + " err": 0.0,
+            }
+        )
+    return ret
+
+
+@benchmark()
+def test_hgemm_mfma32_modes(out_dtype, bias_enabled, split_k, k_waves):
+    """MFMA32 uses the existing FT output/bias and local/global reductions."""
+    m, n, k = 65, 120, 512
+    torch.manual_seed(2411)
+    a = torch.randn(m, k, device="cuda", dtype=dtypes.bf16)
+    w = torch.randn(n, k, device=a.device, dtype=a.dtype)
+    bias = torch.randn(n, device=a.device, dtype=a.dtype) if bias_enabled else None
+    if split_k > 1 and out_dtype == dtypes.bf16:
+        # BF16 atomic output keeps its existing precision contract. Use exact
+        # dyadic sparse products, not a relaxed random-reference threshold.
+        a.zero_()
+        for start in range(0, k, k // split_k):
+            a[:, start : start + 4] = 0.0625
+        w.copy_((torch.randint(0, 2, w.shape, device=w.device) * 2 - 1).float() / 16)
+        if bias is not None:
+            bias.zero_()
+    ref = a.float() @ w.float().T
+    if bias is not None:
+        ref += bias.float()
+    ref = ref.to(out_dtype)
+    halo = torch.full((m * n + 64,), 23.0, device=a.device, dtype=out_dtype)
+    out = halo[32:-32].view(m, n)
+    cfg = {
+        "block_m": 64,
+        "block_n": 64,
+        "block_k": 64,
+        "stages": 3,
+        "split_k": split_k,
+        "m_waves": 2,
+        "n_waves": 2,
+        "k_waves": k_waves,
+        "group_m": 0,
+        "policy": "ft",
+        "mma_m": 32,
+        "mma_n": 32,
+        "mma_k": 16,
+        "out_dtype": out_dtype,
+    }
+
+    def call():
+        return flydsl_hgemm(a, w, out=out, bias=bias, **cfg)
+
+    out.fill_(float("nan"))
+    result = call()
+    torch.cuda.synchronize()
+    err = checkAllclose(
+        ref.float(), result.float(), atol=0.01, rtol=0.01, tol_err_ratio=0
+    )
+    assert err == 0
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        call()
+        call()
+    a.neg_()
+    ref = a.float() @ w.float().T
+    if bias is not None:
+        ref += bias.float()
+    ref = ref.to(out_dtype)
+    out.fill_(float("nan"))
+    graph.replay()
+    torch.cuda.synchronize()
+    err = checkAllclose(ref.float(), out.float(), atol=0.01, rtol=0.01, tol_err_ratio=0)
+    assert err == 0
+    ret = {"gfx": get_gfx_runtime()}
+    candidates = {"public": call, "graph2": graph.replay}
+    for name, fn in candidates.items():
+        _, us = run_perftest(
+            fn, num_iters=10, num_warmup=3, num_rotate_args=1, use_cuda_event=True
+        )
+        us /= 2 if name == "graph2" else 1
+        err = checkAllclose(
+            ref.float(), out.float(), atol=0.01, rtol=0.01, tol_err_ratio=0
+        )
+        assert err == 0
+        assert (halo[:32] == 23).all() and (halo[-32:] == 23).all()
+        ret.update(
+            {
+                name + " us": us,
+                name + " TFLOPS": 2 * m * n * k / us / 1e6,
+                name + " TB/s": 2 * (m * k + n * k + m * n) / us / 1e6,
+                name + " err": err,
+            }
+        )
+    return ret
+
+
+def check_streamk_rejects():
+    from unittest.mock import Mock, patch
+
+    import aiter.ops.flydsl.kernels.gemm_a16w16_gfx950 as impl
+
+    x = torch.empty((65, 320), device="cuda", dtype=dtypes.bf16)
+    w = torch.empty((120, 320), device=x.device, dtype=x.dtype)
+    out = torch.empty((65, 120), device=x.device, dtype=x.dtype)
+    cfg = {
+        "block_m": 64,
+        "block_n": 64,
+        "block_k": 64,
+        "stages": 3,
+        "split_k": 1,
+        "m_waves": 2,
+        "n_waves": 2,
+        "k_waves": 1,
+        "group_m": 0,
+        "use_half_tile_interleaved": False,
+        "streamk_blocks": 7,
+    }
+    stream = torch.cuda.current_stream()
+    wrong_stream = Mock(spec=torch.cuda.Stream)
+    wrong_stream.device = torch.device("cuda", x.device.index + 1)
+    huge = Mock(spec=torch.Tensor)
+    huge.device, huge.dtype, huge.ndim, huge.shape = x.device, x.dtype, 2, x.shape
+    huge.data_ptr.return_value = x.data_ptr()
+    huge.element_size.return_value = 2
+    huge.stride.side_effect = lambda dim: 1 << 25 if dim == 0 else 1
+    bad = [
+        lambda: flydsl_hgemm(
+            x,
+            w,
+            out=out,
+            block_m=64,
+            block_n=64,
+            block_k=64,
+            stages=3,
+            mma_m=32,
+            mma_n=32,
+            mma_k=16,
+            k_waves=2,
+        ),
+        lambda: impl.gemm_a16w16(x, w.T, out=out, user_kwargs=cfg, stream=wrong_stream),
+        lambda: impl.gemm_a16w16(
+            x.cpu(), w.cpu().T, out=out.cpu(), user_kwargs=cfg, stream=stream
+        ),
+        lambda: impl.gemm_a16w16(huge, w.T, out=out, user_kwargs=cfg, stream=stream),
+        lambda: impl.gemm_a16w16(
+            x[:, ::2], w[:, ::2].T, out=out, user_kwargs=cfg, stream=stream
+        ),
+        lambda: impl.gemm_a16w16(
+            x, w.T, out=out.float(), user_kwargs=cfg, stream=stream
+        ),
+        lambda: impl.gemm_a16w16(
+            x,
+            w.T,
+            out=out,
+            bias=torch.zeros(120, device=x.device, dtype=x.dtype),
+            user_kwargs=cfg,
+            stream=stream,
+        ),
+    ]
+    for field, value in (
+        ("split_k", 2),
+        ("k_waves", 2),
+        ("group_m", 4),
+        ("streamk_blocks", -1),
+        ("streamk_blocks", True),
+        ("streamk_blocks", 1025),
+        ("use_half_tile_interleaved", True),
+    ):
+        bad.append(
+            lambda field=field, value=value: impl.gemm_a16w16(
+                x, w.T, out=out, user_kwargs={**cfg, field: value}, stream=stream
+            )
+        )
+    with patch.object(impl, "_run_compiled") as launch:
+        for index, fn in enumerate(bad):
+            try:
+                fn()
+            except (ValueError, RuntimeError, AssertionError):
+                pass
+            else:
+                raise AssertionError(f"invalid Stream-K call {index} reached dispatch")
+        launch.assert_not_called()
+
+
 def summarize(title, rows):
     df = pd.DataFrame(rows)
     if df.empty:
@@ -802,10 +1165,13 @@ def summarize(title, rows):
 
 
 def main():
-    if get_gfx() not in SUPPORTED_GFX:
-        aiter.logger.warning("flydsl hgemm unsupported on %s; skipping", get_gfx())
+    if get_gfx_runtime() not in SUPPORTED_GFX:
+        aiter.logger.warning(
+            "flydsl hgemm unsupported on %s; skipping", get_gfx_runtime()
+        )
         return
 
+    torch.set_default_device("cuda")
     parser = argparse.ArgumentParser(
         formatter_class=argparse.RawTextHelpFormatter,
         description="config input of test",
@@ -830,7 +1196,8 @@ def main():
         + _CONCURRENT_COPY_MNK
         + [row[:3] for row in _MEMORY_TILES]
         + _TUNED_MEMORY_MNK
-        + _BAND_MNK,
+        + _BAND_MNK
+        + [row[:3] for row in _EXTENDED_TILES],
         help="""Shape of mnk.
         e.g.:   -s 128,4096,4096
                 --mnk 32,384,7168""",
@@ -898,6 +1265,21 @@ def main():
             )
         ],
     )
+    summarize(
+        "extended HGEMM candidates (not selected defaults)",
+        [test_hgemm_extended(*row) for row in _EXTENDED_TILES if row[:3] in wanted],
+    )
+    if any(row[:3] in wanted for row in _EXTENDED_TILES):
+        summarize(
+            "MFMA32 output and reduction modes",
+            [
+                test_hgemm_mfma32_modes(od, bias, sk, kw)
+                for od, bias, sk, kw in itertools.product(
+                    (dtypes.bf16, dtypes.fp32), (False, True), (1, 2), (1,)
+                )
+            ],
+        )
+        check_streamk_rejects()
     check_band_rejects()
     check_hgemm_memory_options()
     check_skinny_rejects()

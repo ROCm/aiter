@@ -675,6 +675,19 @@ def _flydsl_hgemm_kernel_params(kernel_name: str) -> dict | None:
     return _get_flydsl_gemm_kernels().get_flydsl_hgemm_kernel_params(kernel_name)
 
 
+@functools.cache
+def _flydsl_extended_launcher(kernel_name):
+    config = _flydsl_hgemm_kernel_params(kernel_name)
+    return functools.partial(
+        _get_flydsl_gemm_kernels().flydsl_hgemm,
+        **{
+            key: config[key]
+            for key in ("mma_m", "mma_n", "mma_k", "streamk_blocks")
+            if key in config
+        },
+    )
+
+
 def flydsl_gemm(
     inp: Tensor,
     weights: Tensor,
@@ -706,7 +719,10 @@ def flydsl_gemm(
         policy = flydsl_config["policy"]
     else:
         policy = "ht" if flydsl_config["use_half_tile_interleaved"] else "ft"
-    result = flydsl_gemm_kernels.flydsl_hgemm(
+    launcher = flydsl_gemm_kernels.flydsl_hgemm
+    if "mma_m" in flydsl_config or "streamk_blocks" in flydsl_config:
+        launcher = _flydsl_extended_launcher(config["kernelName"])
+    result = launcher(
         inp,
         weights,
         out=out,
