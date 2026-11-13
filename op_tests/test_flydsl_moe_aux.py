@@ -35,6 +35,7 @@ from aiter.ops.flydsl.grouped_moe_gfx1250 import (
     _build_g2l_lut,
     _grouped_a8w4_preshuffle_e8m0_scale,
 )
+from aiter.ops.flydsl.herd_topk import herd_route_psum
 from aiter.ops.flydsl.kernels.moe_contiguous_psum import (
     build_moe_contiguous_psum_module,
     build_moe_contiguous_psum_remap_ep_module,
@@ -43,6 +44,7 @@ from aiter.ops.flydsl.kernels.moe_contiguous_psum import (
 )
 from aiter.ops.flydsl.kernels.moe_g2l_lut import build_moe_g2l_lut_module
 from aiter.ops.flydsl.kernels.moe_gather_reduce import build_moe_gather_reduce_module
+from aiter.ops.flydsl.kernels.moe_herd_route_psum import HERD_ROUTE_BLOCK
 from aiter.ops.flydsl.kernels.moe_route_maps import (
     DROPPED_ROUTE_ROW,
     build_moe_route_g2l_fused_module,
@@ -118,6 +120,23 @@ def run_torch_scatter_copy(src, dst, dst_src):
     keep = dst_src >= 0
     out[keep] = src[dst_src[keep].long()]
     return out
+
+
+def run_torch_herd_drop(cand_ids, cand_scores, E, scale):
+    tokens, kp1 = cand_ids.shape
+    pop = torch.bincount(cand_ids.reshape(-1).long(), minlength=E)
+    order = torch.argsort(cand_ids, dim=1)
+    ids, scores = cand_ids.gather(1, order), cand_scores.gather(1, order)
+    cp = pop[ids.long()]
+    least = cp == cp.min(1, keepdim=True).values
+    s = torch.where(least, scores, torch.full_like(scores, float("inf")))
+    least &= s == s.min(1, keepdim=True).values
+    cols = torch.arange(kp1).expand(tokens, kp1)
+    drop = torch.where(least, cols, torch.full_like(cols, kp1)).min(1).values
+    keep = cols != drop[:, None]
+    kept_ids = ids[keep].reshape(tokens, kp1 - 1)
+    kept = scores[keep].reshape(tokens, kp1 - 1)
+    return kept_ids, kept / kept.sum(1, keepdim=True).clamp_min(1e-20) * scale
 
 
 def run_torch_gather_reduce(grouped, rmap, w, dtype):
@@ -822,17 +841,32 @@ def test_route_maps(numel, E, topk, max_m):
     return ret
 
 
+def _decode_topk_ids(tokens, E, topk):
+    """Decode routing with a fused shared expert: each token picks topk-1
+    distinct routed experts from [0, E-1) and always routes to expert E-1."""
+    routed = torch.rand(tokens, E - 1).topk(topk - 1, dim=1).indices
+    shared = torch.full((tokens, 1), E - 1, dtype=routed.dtype)
+    return torch.cat([routed, shared], dim=1).to(I32).contiguous()
+
+
 @benchmark()
-def test_route_psum_fused(numel, E, tile_m):
+def test_route_psum_fused(numel, E, tile_m, topk=0):
     """Single-workgroup route + LDS atomic + psum + remap, all in one launch.
 
     Collapses what test_topids_to_rows and test_contiguous_psum cover separately,
     so the checks are the union: exact masked_m/starts/psum against the torch
     prefix sum, and the row invariants against the *contiguous* bands it emits.
+
+    With ``topk`` set, routing is decode-shaped (``_decode_topk_ids``) and max_m
+    is the TP grouped path's.
     """
     launch = build_moe_route_psum_fused_module()
-    max_m = max(512, 4 * numel // E)
-    topk_ids = torch.randint(0, E, (numel,), dtype=I32)
+    if topk:
+        topk_ids = _decode_topk_ids(numel // topk, E, topk).reshape(-1)
+        max_m = max(tile_m, (numel + tile_m - 1) // tile_m * tile_m)
+    else:
+        max_m = max(512, 4 * numel // E)
+        topk_ids = torch.randint(0, E, (numel,), dtype=I32)
     counts = torch.bincount(topk_ids.long(), minlength=E).to(I32)
     assert max_m > int(counts.max()), "max_m too small for this shape"
     ref_starts, ref_psum, _ = run_torch_psum(counts, tile_m)
@@ -881,6 +915,65 @@ def test_route_psum_fused(numel, E, tile_m):
         assert bool(
             ((r >= lo) & (r < lo + counts.cpu().long()[ids])).all()
         ), f"{name}: row outside its expert's contiguous band"
+        assert len(set(r.tolist())) == numel, f"{name}: rows not a bijection"
+        ret[f"{name} us"] = us
+        ret[f"{name} TB/s"] = nbytes / us / 1e6
+        ret[f"{name} err"] = err
+    return ret
+
+
+@benchmark()
+def test_herd_route_psum(tokens, E, topk, tile_m):
+    """HERD drop + route + tile-aligned psum + row remap in one workgroup, on
+    the Top-(K+1) candidates the gfx1250 grouped MoE takes with herd_topk=K."""
+    kp1 = topk + 1
+    scale = 2.5
+    cand_ids = torch.rand(tokens, E).topk(kp1, dim=1).indices.to(I32)
+    cand_scores = torch.rand(tokens, kp1, dtype=torch.float32)
+    kept_ids, kept_w = run_torch_herd_drop(cand_ids, cand_scores, E, scale)
+    counts = torch.bincount(kept_ids.reshape(-1).long(), minlength=E).to(I32)
+    ref_starts, ref_psum, _ = run_torch_psum(counts, tile_m)
+
+    # herd_route_psum allocates its outputs, as the grouped MoE calls it; each
+    # candidate keeps the ones its last call (or graph capture) wrote.
+    outs = {}
+
+    def call(name):
+        def fn():
+            outs[name] = herd_route_psum(cand_scores, cand_ids, E, tile_m, scale)
+
+        return fn
+
+    numel = tokens * topk
+    nbytes = tokens * kp1 * 2 * 4 + numel * 3 * 4 + E * 2 * 4
+    ret = {"gfx": get_gfx()}
+    candidates = {"eager": call("eager"), "cudagraph": _graph_runner(call("cudagraph"))}
+    for name, run in candidates.items():
+        _, us = run_perftest(run)
+        gw, ids_out, masked, rows, psum = outs[name]
+        err = checkAllclose(
+            counts.float(), masked.float(), rtol=0, atol=0, msg=f"{name}: masked_m"
+        )
+        checkAllclose(
+            ref_starts.float(),
+            (psum - masked).float(),
+            rtol=0,
+            atol=0,
+            msg=f"{name}: starts",
+        )
+        checkAllclose(
+            ref_psum.float(), psum.float(), rtol=0, atol=0, msg=f"{name}: psum"
+        )
+        checkAllclose(
+            kept_ids.float(), ids_out.float(), rtol=0, atol=0, msg=f"{name}: topk_ids"
+        )
+        checkAllclose(kept_w, gw, rtol=1e-6, atol=1e-6, msg=f"{name}: topk_weights")
+        r = rows.reshape(-1).cpu().long()
+        ids = kept_ids.reshape(-1).cpu().long()
+        lo = ref_starts.cpu().long()[ids]
+        assert bool(
+            ((r >= lo) & (r < lo + counts.cpu().long()[ids])).all()
+        ), f"{name}: row outside its kept expert's contiguous band"
         assert len(set(r.tolist())) == numel, f"{name}: rows not a bijection"
         ret[f"{name} us"] = us
         ret[f"{name} TB/s"] = nbytes / us / 1e6
@@ -1192,6 +1285,43 @@ def main():
             )
         ],
     )
+    # MiniMax-M3 TP decode: 128 routed + 1 fused shared expert, top-5.
+    summarize(
+        "moe_route_psum_fused (M3 decode)",
+        [test_route_psum_fused(t * 5, 129, 64, topk=5) for t in (1, 4, 16)],
+    )
+    # The HERD route stages HERD_ROUTE_BLOCK rows of candidates in LDS, sized
+    # for gfx1250, the one arch whose grouped MoE launches it.
+    if get_gfx() == "gfx1250":
+        summarize(
+            "moe_herd_route_psum",
+            [
+                test_herd_route_psum(t, E, tk, tm)
+                for t, E, tk, tm in itertools.product(
+                    [t for t in args.tokens if t <= HERD_ROUTE_BLOCK] + [128],
+                    [e for e in args.experts if e <= HERD_ROUTE_BLOCK] + [256],
+                    args.topk + [6],
+                    args.tile_m,
+                )
+                if tk + 1 <= E
+            ],
+        )
+        # Kimi-K3 TP decode: Top-17 candidates over 896 experts, 16 routes kept.
+        summarize(
+            "moe_herd_route_psum (Kimi-K3 decode)",
+            [
+                test_herd_route_psum(t, 896, 16, tm)
+                for t, tm in itertools.product(
+                    [16, 128, 512, HERD_ROUTE_BLOCK], args.tile_m
+                )
+            ],
+        )
+    else:
+        aiter.logger.warning(
+            "%s: skipping moe_herd_route_psum, which only the gfx1250 grouped "
+            "MoE launches",
+            get_gfx(),
+        )
     summarize(
         "moe_route_g2l_fused",
         [

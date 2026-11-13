@@ -14,23 +14,32 @@ and the extend range is causal.
 
 The ``prec`` axis picks both the input format and the backends that run:
 
-* ``bf16`` -- single ``D=512`` Q/K/V/O tensor (``mla_sparse_prefill``): ``opus``,
+* ``bf16``    -- single ``D=512`` Q/K/V/O tensor (``mla_sparse_prefill``): ``opus``,
   ``triton``.
-* ``v4``   -- v4 split NoPE-fp8 / RoPE-bf16 inputs (``mla_sparse_prefill_v4``):
+* ``v4_fp8``  -- v4 split NoPE-fp8 / RoPE-bf16 inputs (``mla_sparse_prefill_v4``):
   ``opus``, ``asm``.
-* ``v41``  -- MLA v4.1: 512 e4m3 rows with separate E8M0 scales
-  (``mla_sparse_prefill_v41``): ``opus``, gfx950 only.
+* ``v41_fp8`` -- MLA v4.1: 512 e4m3 rows with separate E8M0 scales
+  (``mla_sparse_prefill_v41``): ``opus``.
+* ``v41_fp4`` -- ``v41_fp8`` with an NVFP4 prefix source: 512 e2m1 and 32 e4m3
+  scales: ``opus`` on gfx950, fused ``asm`` on gfx1250 with ``H_Q == 64``.
+  The generator's 288-byte rows are separated into contiguous data and scales
+  outside the timed call for the fixed-stride gfx1250 code object.
 
 ``triton`` is the ``pa_prefill_sparse`` dispatcher, which on gfx1250 reaches a
-gluon kernel that takes both KV sources natively. ``asm`` needs ``H_Q == 128``.
-Both are gfx1250-only here and drop out of the sweep elsewhere.
+gluon kernel that takes both KV sources natively. The v4 ``asm`` needs
+``H_Q == 128``; the v4.1 ``asm`` needs ``H_Q == 64``. Both asm variants and
+triton are gfx1250-only here and drop out of the sweep elsewhere.
 
 Example CLI usage::
 
     PYTHONPATH=. python3 op_tests/test_mla_sparse_prefill.py
     PYTHONPATH=. python3 op_tests/test_mla_sparse_prefill.py --topk 256 2048
     PYTHONPATH=. python3 op_tests/test_mla_sparse_prefill.py --backend opus \\
-        -n 1024 --h_q 128 --prec v4 --no-verify
+        -n 1024 --h_q 128 --prec v4_fp8 --no-verify
+    PYTHONPATH=. python3 op_tests/test_mla_sparse_prefill.py --backend opus asm \\
+        --prec v41_fp8 v41_fp4 --h_q 64 -n 96 192 384 768 1536 2048 3072 4096 \\
+        --total_pages 65536 1048576 --topk 512 1024 --total_tokens 128 \\
+        --num_kv_splits 1
 """
 
 from __future__ import annotations
@@ -52,11 +61,14 @@ from aiter.ops.mla_sparse_prefill import (
     mla_sparse_prefill_v4,
     mla_sparse_prefill_v41,
 )
+from aiter.ops.mla_sparse_prefill_v41_asm import _auto_v41_asm_splits
 from aiter.test_common import (
     benchmark,
     checkAllclose,
     perftest,
 )
+from aiter.utility import dtypes
+from aiter.utility.fp4_utils import f32_to_mxfp4, mxfp4_to_f32
 
 try:
     from aiter.ops.triton.attention.pa_prefill_sparse import pa_prefill_sparse
@@ -485,6 +497,20 @@ def _make_inputs_fp8(
 
 _V41_D = 512
 _V41_D_SCALE = _V41_D // _FP8_BLK
+_NVFP4_BLK = 16
+
+
+def _quantize_nvfp4_rows(real: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    """``[R, 512]`` reals -> (``[R, 288]`` uint8 NVFP4 rows, 256 e2m1 pairs then 32 e4m3
+    scales, the dequantized fp32 ``[R, 512]``)."""
+    r, nblk = real.shape[0], _V41_D // _NVFP4_BLK
+    blk = real.reshape(r, nblk, _NVFP4_BLK).to(torch.float32)
+    scale = (blk.abs().amax(dim=-1) / 6.0).clamp(2.0**-9, 448.0).to(torch.float8_e4m3fn)
+    s = scale.to(torch.float32).unsqueeze(-1)
+    q = f32_to_mxfp4((blk / s).reshape(r, _V41_D)).view(torch.uint8)
+    deq = (mxfp4_to_f32(q).reshape(r, nblk, _NVFP4_BLK) * s).reshape(r, _V41_D)
+    rows = torch.cat([q, scale.view(torch.uint8)], dim=-1)
+    return rows, deq
 
 
 def _make_inputs_v41(
@@ -497,20 +523,29 @@ def _make_inputs_v41(
     device: torch.device | str = "cuda",
     seed: int = 0,
     data_init: str = "norm",
+    prefix_fp4: bool = False,
 ) -> dict:
-    """:func:`_make_inputs_fp8` for v41: e4m3 rows with ``[rows, 16]`` E8M0 scales."""
+    """:func:`_make_inputs_fp8` for v41: e4m3 rows with ``[rows, 16]`` E8M0 scales, or
+    with ``prefix_fp4`` NVFP4 prefix rows as views of :func:`_quantize_nvfp4_rows`."""
     device = torch.device(device)
     gen = make_generator(seed, device=device)
 
+    def _real(rows: int):
+        return fill((rows, _V41_D), data_init, gen, dtype=torch.float32, device=device)
+
     def _stream(rows: int):
-        real = fill((rows, _V41_D), data_init, gen, dtype=torch.float32, device=device)
-        return _quantize_e8m0_blocks(real * 0.5)
+        return _quantize_e8m0_blocks(_real(rows) * 0.5)
 
     q, q_scale, q_fp32 = _stream(n * h)
     q = q.reshape(n, h, _V41_D)
     q_scale = q_scale.reshape(n, h, _V41_D_SCALE)
     q_fp32 = q_fp32.reshape(n, h, _V41_D)
-    ukv, ukv_scale, ukv_fp32 = _stream(total_pages)
+    if prefix_fp4:
+        rows, ukv_fp32 = _quantize_nvfp4_rows(_real(total_pages) * 0.5)
+        ukv = rows[:, : _V41_D // 2].view(dtypes.fp4x2)
+        ukv_scale = rows[:, _V41_D // 2 :].view(torch.float8_e4m3fn)
+    else:
+        ukv, ukv_scale, ukv_fp32 = _stream(total_pages)
     kv, kv_scale, kv_fp32 = _stream(total_tokens)
 
     attn_sink = fill((h,), data_init, gen, dtype=torch.float32, device=device) * 0.25
@@ -522,7 +557,7 @@ def _make_inputs_v41(
         n, total_tokens, topk, causal=True, device=device, seed=seed * 2 + 2
     )
 
-    # 0xFF is NaN both as e4m3 and as E8M0.
+    # 0xFF is NaN both as e4m3 and as E8M0; an NVFP4 row is NaN through its scales.
     _poison_unreferenced(total_pages, ix_p, nope=ukv)
     _poison_unreferenced(total_pages, ix_p, nope=ukv_scale)
     _poison_unreferenced(total_tokens, ix_e, nope=kv)
@@ -562,12 +597,15 @@ _BACKENDS = ("opus", "asm", "triton")
 
 _PREC_BACKENDS = {
     "bf16": ("opus", "triton"),
-    "v4": ("opus", "asm"),
-    "v41": ("opus",),
+    "v4_fp8": ("opus", "asm"),
+    "v41_fp8": ("opus",),
+    "v41_fp4": ("opus", "asm"),
 }
 
 # Baked into the asm code object; its Q address math needs gridDim.y == 1.
 _ASM_HEADS = 128
+# The fused V4.1 code object covers all 64 heads of one query per workgroup.
+_ASM_V41_HEADS = 64
 
 # Only gfx1250's pa_prefill_sparse reads a second KV source; the rest reject it.
 _TRITON_ARCHS = ("gfx1250",) if pa_prefill_sparse is not None else ()
@@ -591,7 +629,7 @@ def _profile_func(target_func, *, backend: str):
 # ---------------------------------------------------------------------------
 
 
-_PRECS = ("bf16", "v4", "v41")
+_PRECS = ("bf16", "v4_fp8", "v41_fp8", "v41_fp4")
 _PREC_TO_DTYPE = {"bf16": torch.bfloat16}
 
 _RTOL = 1e-2
@@ -635,7 +673,7 @@ def run_mla_sparse_prefill(
     # Lambdas, not partials: @perftest() deep-copies args, cloning bound tensors.
     candidates: list = []
 
-    if prec == "v41":
+    if prec in ("v41_fp8", "v41_fp4"):
         data = _make_inputs_v41(
             n,
             h,
@@ -644,10 +682,11 @@ def run_mla_sparse_prefill(
             topk=topk,
             seed=seed,
             data_init=data_init,
+            prefix_fp4=prec == "v41_fp4",
         )
         kernel_inputs = data["kernel"]
         ref_fn, ref_inputs = _ref_mla_sparse_prefill_fp8, data["ref"]
-        if "opus" in wanted and _get_gpu_arch() == "gfx950":
+        if "opus" in wanted and (prec == "v41_fp8" or _get_gpu_arch() == "gfx950"):
             candidates.append(
                 (
                     "opus",
@@ -659,7 +698,31 @@ def run_mla_sparse_prefill(
                     ),
                 )
             )
-    elif prec == "v4":
+        if (
+            prec == "v41_fp4"
+            and "asm" in wanted
+            and h == _ASM_V41_HEADS
+            and _get_gpu_arch() == "gfx1250"
+        ):
+            # Prepare separate CSA data/scale buffers before kernel timing.
+            asm_inputs = dict(kernel_inputs)
+            for key in ("unified_kv", "unified_kv_scale"):
+                tensor = asm_inputs[key]
+                asm_inputs[key] = (
+                    tensor.view(torch.uint8).contiguous().view(tensor.dtype)
+                )
+            candidates.append(
+                (
+                    "asm",
+                    lambda: mla_sparse_prefill_v41(
+                        **asm_inputs,
+                        softmax_scale=softmax_scale,
+                        num_kv_splits=num_kv_splits,
+                        backend="asm",
+                    ),
+                )
+            )
+    elif prec == "v4_fp8":
         data = _make_inputs_fp8(
             n,
             h,
@@ -765,11 +828,26 @@ def run_mla_sparse_prefill(
             row[f"{name} us"] = round(float(lat_us), 2)
             row[f"{name} TFLOPS"] = round(float(tflops), 2)
             if name == "asm":
-                # Effective Q/KV reads + BF16 output writes. Packed NoPE
-                # includes scales/padding; KV is shared by K/V and all heads.
-                # Count each CSR entry, without adjusting for cache reuse.
-                bytes_per_row = _FP8_D_NOPE_PADDED + _FP8_D_ROPE * 2
-                nbytes = (n * h + total_nnz) * bytes_per_row + n * h * d * 2
+                # Effective Q/KV reads + BF16 output writes; KV is shared by
+                # K/V and all heads. Count each CSR entry without adjusting
+                # for cache reuse or adding internal partial-workspace traffic.
+                if prec == "v41_fp4":
+                    prefix_nnz = kernel_inputs["kv_indices_prefix"].numel()
+                    extend_nnz = kernel_inputs["kv_indices_extend"].numel()
+                    nbytes = (
+                        (n * h + extend_nnz) * (_V41_D + _V41_D_SCALE)
+                        + prefix_nnz * (_V41_D // 2 + _V41_D // _NVFP4_BLK)
+                        + n * h * d * 2
+                    )
+                    row["asm split"] = (
+                        _auto_v41_asm_splits(n, total_nnz, prefix_nnz=prefix_nnz)
+                        if num_kv_splits is None
+                        else num_kv_splits
+                    )
+                else:
+                    # V4 packs its NoPE scales/padding into the 512-byte row.
+                    bytes_per_row = _FP8_D_NOPE_PADDED + _FP8_D_ROPE * 2
+                    nbytes = (n * h + total_nnz) * bytes_per_row + n * h * d * 2
                 tbps = nbytes / max(lat_us * 1e-6, 1e-12) / 1e12
                 row["asm TB/s"] = round(float(tbps), 2)
 
@@ -781,12 +859,13 @@ def run_mla_sparse_prefill(
 # ---------------------------------------------------------------------------
 
 
-_PYTEST_PRECS = ["bf16", "v4", "v41"]
+_PYTEST_PRECS = ["bf16", "v4_fp8", "v41_fp8", "v41_fp4"]
 
 # topk rides in the case instead of being its own axis: crossed with the shapes,
 # most combinations would collapse onto the same whole-pool budget.
 _PYTEST_CASES = [
     # (N, H, total_pages, total_tokens, topk)
+    (32, 8, 256, 64, 160),
     (64, 16, 256, 256, 100),
     (128, 24, 512, 128, 64),
     (256, 32, 1024, 256, 192),
@@ -818,6 +897,116 @@ def test_mla_sparse_prefill(prec, n, h, total_pages, total_tokens, topk):
     )
 
 
+# Cover the unsplit cases not exercised by the common BF16/FP8 matrix.
+@pytest.mark.parametrize(
+    "total_pages,total_tokens,topk",
+    [
+        pytest.param(0, 129, 65, id="extend-only"),
+        pytest.param(129, 0, 65, id="prefix-only"),
+    ],
+)
+def test_opus_csr_boundaries(total_pages, total_tokens, topk):
+    _check_opus_csr_case(65, 24, total_pages, total_tokens, topk, torch.bfloat16, 1)
+
+
+def _check_opus_csr_case(
+    n, h, total_pages, total_tokens, topk, dtype, num_kv_splits, has_sink=True
+):
+    if _get_gpu_arch() != "gfx950":
+        pytest.skip("the source-compiled OPUS paths require gfx950")
+    inputs = _make_inputs(
+        n=n,
+        h=h,
+        d=512,
+        total_pages=total_pages,
+        total_tokens=total_tokens,
+        dtype=dtype,
+        topk=topk,
+        seed=42,
+    )
+    softmax_scale = 1.0 / math.sqrt(512)
+    if not has_sink:
+        # An explicit -inf sink contributes zero to the unchanged FP32 reference.
+        inputs["attn_sink"].fill_(-math.inf)
+    expected = _ref_mla_sparse_prefill(**inputs, softmax_scale=softmax_scale)
+    if not has_sink:
+        inputs["attn_sink"] = None
+    actual = mla_sparse_prefill(
+        **inputs,
+        softmax_scale=softmax_scale,
+        num_kv_splits=num_kv_splits,
+        backend="opus",
+    )
+    err = checkAllclose(
+        actual, expected, rtol=_RTOL, atol=_ATOL, tol_err_ratio=_ERR_TOL
+    )
+    assert err <= _ERR_TOL
+    assert torch.isfinite(actual).all()
+
+
+def test_opus_csr_without_sink():
+    _check_opus_csr_case(65, 24, 129, 129, 65, torch.bfloat16, 1, has_sink=False)
+
+
+@pytest.mark.parametrize("has_sink", [False, True], ids=["no-sink", "lower-sink"])
+def test_opus_csr_negative_logits(has_sink):
+    if _get_gpu_arch() != "gfx950":
+        pytest.skip("the source-compiled OPUS paths require gfx950")
+    inputs = _make_inputs(
+        n=1,
+        h=16,
+        d=512,
+        total_pages=1,
+        total_tokens=0,
+        dtype=torch.bfloat16,
+        topk=1,
+        seed=42,
+    )
+    inputs["q"].zero_()
+    inputs["q"][..., 0] = 2.0**60
+    # Make a zero-output defect visible in every element under the native oracle.
+    inputs["unified_kv"].fill_(-(2.0**60))
+    inputs["attn_sink"].fill_(-(2.0**125) if has_sink else -math.inf)
+    scale = 1.0 / math.sqrt(512)
+    expected = _ref_mla_sparse_prefill(**inputs, softmax_scale=scale)
+    if not has_sink:
+        inputs["attn_sink"] = None
+    actual = mla_sparse_prefill(
+        **inputs, softmax_scale=scale, num_kv_splits=1, backend="opus"
+    )
+    assert torch.isfinite(actual).all()
+    err = checkAllclose(
+        actual, expected, rtol=_RTOL, atol=_ATOL, tol_err_ratio=_ERR_TOL
+    )
+    assert err <= _ERR_TOL
+
+
+def test_opus_csr_one_key_scale_one():
+    if _get_gpu_arch() != "gfx950":
+        pytest.skip("the source-compiled OPUS paths require gfx950")
+    inputs = _make_inputs(
+        n=1,
+        h=24,
+        d=512,
+        total_pages=1,
+        total_tokens=0,
+        dtype=torch.bfloat16,
+        topk=1,
+        seed=42,
+    )
+    inputs["attn_sink"].fill_(-math.inf)
+    expected = _ref_mla_sparse_prefill(**inputs, softmax_scale=1.0)
+    inputs["attn_sink"] = None
+    actual = mla_sparse_prefill(
+        **inputs, softmax_scale=1.0, num_kv_splits=1, backend="opus"
+    )
+    assert torch.isfinite(actual).all()
+    err = checkAllclose(
+        actual, expected, rtol=_RTOL, atol=_ATOL, tol_err_ratio=_ERR_TOL
+    )
+    assert err <= _ERR_TOL
+
+
 # ---------------------------------------------------------------------------
 # CLI (mirrors test_batch_prefill.py style).
 # ---------------------------------------------------------------------------
@@ -845,7 +1034,7 @@ parser.add_argument(
     default=[16, 32, 64, 128],
     help=(
         "number of query heads H_Q (default: [16, 32, 64, 128]).\n"
-        f"asm is built for H_Q={_ASM_HEADS} only and drops out elsewhere."
+        f"v4 asm needs H_Q={_ASM_HEADS}; v41_fp4 asm needs H_Q={_ASM_V41_HEADS}."
     ),
 )
 parser.add_argument(
@@ -882,10 +1071,12 @@ parser.add_argument(
     default=list(_PRECS),
     choices=list(_PRECS),
     help=(
-        "precision(s) to sweep (default: [bf16, v4, v41]).\n"
-        "  bf16: single-tensor Q/K/V/O kernel      -> opus, triton\n"
-        "  v4  : split NoPE-fp8 / RoPE-bf16 kernel -> opus, asm\n"
-        "  v41 : e4m3 rows + E8M0 scales (MLA v4.1) -> opus (gfx950)"
+        "precision(s) to sweep (default: [bf16, v4_fp8, v41_fp8, v41_fp4]).\n"
+        "  bf16   : single-tensor Q/K/V/O kernel           -> opus, triton\n"
+        "  v4_fp8 : split NoPE-fp8 / RoPE-bf16 kernel      -> opus, asm\n"
+        "  v41_fp8: e4m3 rows + E8M0 scales (MLA v4.1)     -> opus\n"
+        "  v41_fp4: v41_fp8 with an NVFP4 prefix source    -> "
+        "opus (gfx950), asm (gfx1250 H64)"
     ),
 )
 parser.add_argument(
@@ -924,7 +1115,10 @@ parser.add_argument(
     type=lambda s: None if s == "auto" else int(s),
     nargs="+",
     default=[None],
-    help="OPUS split-K counts: auto (the op's own choice) or 1 to 32 (default: auto)",
+    help=(
+        "split-K counts: opus auto or 1..32; v41_fp4 asm shape-based auto or 1..16 "
+        "(default: auto). v4 asm has no split-K."
+    ),
 )
 
 
