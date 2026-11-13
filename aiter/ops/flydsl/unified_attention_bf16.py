@@ -385,11 +385,19 @@ def _partial_need(num_kv_heads, capacity, rows):
     }
 
 
-def _build_query_map(cu_seqlens_q, seqused_k, num_tokens, query_map, context_lengths):
+def _build_query_map(
+    cu_seqlens_q,
+    seqused_k,
+    num_tokens,
+    query_map,
+    context_lengths,
+    query_block=_QUERY_BLOCK,
+):
     """Fill pseudo-sequence rows (first query row, sequence, valid queries, 0).
 
-    Each sequence's queries split into blocks of 8; block b of a sequence with
-    q queries and k KV tokens sees k - q + 8 b + valid tokens. Rows past the
+    Each sequence's queries split into ``query_block`` rows; block b of a
+    sequence with q queries and k KV tokens sees k - q + query_block * b +
+    valid tokens. Rows past the
     last block get no queries and no context. Rows are sorted by context,
     longest first, so the longest tasks start first. Queries at or past
     ``num_tokens`` are dropped, so offsets beyond q never address memory.
@@ -397,16 +405,16 @@ def _build_query_map(cu_seqlens_q, seqused_k, num_tokens, query_map, context_len
     capacity = query_map.shape[0]
     dev = cu_seqlens_q.device
     query_lengths = (cu_seqlens_q[1:] - cu_seqlens_q[:-1]).long()
-    blocks = (query_lengths + (_QUERY_BLOCK - 1)) // _QUERY_BLOCK
+    blocks = (query_lengths + (query_block - 1)) // query_block
     block_ends = torch.cumsum(blocks, 0)
     pseudo = torch.arange(capacity, device=dev)
     seq = torch.searchsorted(block_ends, pseudo, right=True)
     live = seq < blocks.numel()
     seq = seq.clamp_(max=blocks.numel() - 1)
-    first = (pseudo - (block_ends[seq] - blocks[seq])) * _QUERY_BLOCK
+    first = (pseudo - (block_ends[seq] - blocks[seq])) * query_block
     row = cu_seqlens_q[seq].long() + first
     valid = torch.minimum(query_lengths[seq] - first, num_tokens - row)
-    valid = torch.where(live, valid.clamp(0, _QUERY_BLOCK), 0)
+    valid = torch.where(live, valid.clamp(0, query_block), 0)
     context = torch.where(
         live, seqused_k[seq].long() - query_lengths[seq] + first + valid, 0
     ).clamp_(min=0)
@@ -505,6 +513,7 @@ def _unified_attention_varlen(
     softmax_scale,
     block_table,
     explicit,
+    query_block=_QUERY_BLOCK,
 ):
     import flydsl.compiler as flyc
     import flydsl.expr as fx
@@ -518,8 +527,8 @@ def _unified_attention_varlen(
     num_seqs = seqused_k.numel()
     num_kv_heads = k.shape[2]
     group = q.shape[1] // num_kv_heads
-    rows = _QUERY_BLOCK * group
-    pseudo = _pseudo_capacity(num_tokens, num_seqs)
+    rows = query_block * group
+    pseudo = _pseudo_capacity(num_tokens, num_seqs, query_block)
     dev = q.device
     with torch.cuda.device(dev):
         num_cu = torch.cuda.get_device_properties(dev).multi_processor_count
@@ -538,7 +547,7 @@ def _unified_attention_varlen(
         max_partitions = (
             1
             if direct
-            else min(num_cu, capacity - -(-num_tokens // _QUERY_BLOCK) + 1)
+            else min(num_cu, capacity - -(-num_tokens // query_block) + 1)
         )
         need = {
             "query_map": (pseudo * 4, torch.int32),
@@ -549,7 +558,11 @@ def _unified_attention_varlen(
         }
         workspace = _workspace(
             q,
-            "varlen_direct" if direct else "varlen",
+            (
+                "varlen_direct" if direct else "varlen"
+            )
+            if query_block == _QUERY_BLOCK
+            else f"uniform_varlen_{query_block}",
             need,
             f"{num_seqs} sequences, {num_tokens} query tokens",
             explicit,
@@ -567,25 +580,30 @@ def _unified_attention_varlen(
                 cu_seqlens_q,
                 seqused_k,
                 num_tokens,
-                _QUERY_BLOCK,
+                query_block,
                 query_map,
                 context_lengths,
                 longest_first=True,
             )
         else:
             _build_query_map(
-                cu_seqlens_q, seqused_k, num_tokens, query_map, context_lengths
+                cu_seqlens_q,
+                seqused_k,
+                num_tokens,
+                query_map,
+                context_lengths,
+                query_block,
             )
         plan = PADecodePlan(
             work_info=workspace["work_info"][: capacity * 4].view(capacity, 4),
             reduce_info=workspace["reduce_info"][: pseudo * 2].view(pseudo, 2),
             num_kv_heads=num_kv_heads,
             max_partitions=max_partitions,
-            query_length=_QUERY_BLOCK,
+            query_length=query_block,
             max_batch_size=pseudo,
         )
         plan_pa_decode(
-            context_lengths, num_kv_heads, query_length=_QUERY_BLOCK, plan=plan
+            context_lengths, num_kv_heads, query_length=query_block, plan=plan
         )
         no_scale = flyc.from_c_void_p(fx.Float32, 0)
         if direct:
@@ -607,7 +625,7 @@ def _unified_attention_varlen(
             head_dim=_HEAD_DIM,
             value_dim=_VALUE_DIM,
             query_group_size=group,
-            query_length=_QUERY_BLOCK,
+            query_length=query_block,
             block_size=k.shape[1],
             softmax_scale=float(softmax_scale),
             # Longest-first tasks balance best one per CTA: pairing gives the
@@ -661,7 +679,7 @@ def _unified_attention_varlen(
             pout.stride(0),
             pout.stride(1),
             pout.stride(2),
-            query_seq_len=_QUERY_BLOCK,
+            query_seq_len=query_block,
             query_group_size=group,
             head_size=_VALUE_DIM,
             max_partitions=max(
@@ -913,68 +931,19 @@ def unified_attention_flydsl(
             block_table,
             explicit,
         )
-    from .pa_decode import PADecodePlan, pa_decode, plan_pa_decode
-
-    num_seqs = seqused_k.numel()
-    num_kv_heads = k.shape[2]
-    query_length = int(max_seqlen_q)
-    group = q.shape[1] // num_kv_heads
-    sliding_window = _sliding_window(window_size)
-    with torch.cuda.device(q.device):
-        num_cu = torch.cuda.get_device_properties(q.device).multi_processor_count
-        capacity = _plan_capacity(num_seqs, num_kv_heads, num_cu)
-        need = {
-            "work_info": (capacity * 4, torch.int32),
-            "reduce_info": (num_seqs * 2, torch.int32),
-            **_partial_need(num_kv_heads, capacity, query_length * group),
-        }
-        workspace = _workspace(
-            q,
-            "uniform",
-            need,
-            f"{num_seqs} sequences, query length {query_length}",
-            explicit,
-        )
-        if workspace is None:
-            return None
-        if torch.cuda.is_current_stream_capturing():
-            workspace["captured"] = True
-        shape = (num_kv_heads, capacity, query_length * group)
-        scalars = shape[0] * shape[1] * shape[2]
-        plan = PADecodePlan(
-            work_info=workspace["work_info"][: capacity * 4].view(capacity, 4),
-            reduce_info=workspace["reduce_info"][: num_seqs * 2].view(num_seqs, 2),
-            num_kv_heads=num_kv_heads,
-            max_partitions=num_cu,
-            sliding_window=sliding_window,
-            query_length=query_length,
-        )
-        # Every call records the refresh, so captured graphs follow new lengths.
-        plan_pa_decode(
-            seqused_k,
-            num_kv_heads,
-            sliding_window=sliding_window,
-            query_length=query_length,
-            plan=plan,
-        )
-        pa_decode(
-            out,
-            q,
-            k,
-            v,
-            seqused_k,
-            block_table,
-            float(softmax_scale),
-            query_length,
-            sinks=sinks,
-            sliding_window=sliding_window,
-            work_plan=plan,
-            max_context_length=int(max_seqlen_k),
-            exp_sums=workspace["exp_sums"][:scalars].view(shape),
-            max_logits=workspace["max_logits"][:scalars].view(shape),
-            temporary_output=workspace["temporary_output"][: scalars * _VALUE_DIM].view(
-                *shape, _VALUE_DIM
-            ),
-            kv_layout="linear",
-        )
-    return out
+    # Main's shared PA decode uses its native vectorized K/V layout. Reuse the
+    # query-mapped ping-pong path for this route's linear cache; uniform batches
+    # are a strict subset of its varlen plan.
+    return _unified_attention_varlen(
+        q,
+        k,
+        v,
+        out,
+        cu_seqlens_q,
+        seqused_k,
+        max_seqlen_k,
+        softmax_scale,
+        block_table,
+        explicit,
+        query_block=int(max_seqlen_q),
+    )

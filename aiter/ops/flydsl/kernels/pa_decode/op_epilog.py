@@ -10,7 +10,14 @@ from flydsl.expr.typing import ReductionOp
 
 from ..tensor_shim import buf_base_i64, buf_copy_store, ptr_buf_tensor
 from ..utils import rcp_f32
-from .traits import LOG2E, MFMA_MNK, MXFP4_P_EXP_SHIFT, MXFP4_V_BF16_CHUNK_BYTES, WAVE
+from .traits import (
+    FP8_KV_DTYPES,
+    LOG2E,
+    MFMA_MNK,
+    MXFP4_P_EXP_SHIFT,
+    MXFP4_V_BF16_CHUNK_BYTES,
+    WAVE,
+)
 
 
 class PaDecodeEpilogue:
@@ -22,25 +29,20 @@ class PaDecodeEpilogue:
     def init_outputs(self):
         self.pmax = fx.recast_iter(fx.Float32, self.ctx.pmax_ptr)
         self.psum = fx.recast_iter(fx.Float32, self.ctx.psum_ptr)
-        self.pout = fx.recast_iter(self.traits.Q_DTYPE, self.ctx.pout_ptr)
+        self.pout = fx.recast_iter(self.traits.OUT_DTYPE, self.ctx.pout_ptr)
         if const_expr(self.traits.buffer_plan_output):
             # Widen before multiplying: packed storage can exceed 2 GiB.
-            if const_expr(self.traits.batch_first_plan_grid):
-                pout_slot = fx.Int64(self.ctx.kv_h) * fx.Int64(
-                    gpu.grid_dim.x
-                ) * fx.Int64(gpu.grid_dim.z) + fx.Int64(self.ctx.part)
-            else:
-                pout_slot = fx.Int64(self.ctx.kv_h) * fx.Int64(
-                    gpu.grid_dim.x
-                ) + fx.Int64(self.ctx.part)
-            pout_slot_bytes = self.traits.TOTAL_ROWS * self.traits.value_dim * 2
+            pout_slot = fx.Int64(self.ctx.kv_h) * fx.Int64(gpu.grid_dim.x) + fx.Int64(
+                self.ctx.part
+            )
+            pout_slot_bytes = self.traits.TOTAL_ROWS * self.traits.head_dim * 2
             pout_base = buf_base_i64(self.ctx.pout_ptr) + pout_slot * fx.Int64(
                 pout_slot_bytes
             )
             self.pout_buffer = ptr_buf_tensor(
                 pout_base,
-                self.traits.Q_DTYPE,
-                n=self.traits.TOTAL_ROWS * self.traits.value_dim,
+                self.traits.OUT_DTYPE,
+                n=self.traits.TOTAL_ROWS * self.traits.head_dim,
                 unit_elems=self.traits.OP_ELEMS,
                 # BF16 views may be only 2-byte aligned, even for 8-byte stores.
                 unit_stride=1,
@@ -48,8 +50,8 @@ class PaDecodeEpilogue:
             )
 
     def _emit(self, o_norm, sub, global_row):
-        if const_expr(self.traits.DIRECT):
-            # One task per row: the output has the query's strides (query_length 1).
+        if const_expr(self.traits.DIRECT and self.traits.query_length == 1):
+            # One task per row: the output has the query's strides.
             head = self.ctx.kv_h * self.traits.query_group_size + global_row
             offset = (
                 self.ctx.seq * self.ctx.stride_q_row
@@ -57,22 +59,33 @@ class PaDecodeEpilogue:
                 + sub * self.traits.OP_ELEMS
             )
             fx.ptr_store(o_norm, fx.add_offset(self.pout, offset))
+        elif const_expr(self.traits.DIRECT):
+            # Query positions are flattened into the CTA's rows.
+            query_pos = global_row // self.traits.query_group_size
+            head = self.ctx.kv_h * self.traits.query_group_size + (
+                global_row - query_pos * self.traits.query_group_size
+            )
+            offset = (
+                (self.ctx.seq * self.traits.query_length + query_pos)
+                * self.ctx.stride_q_row
+                + head * self.ctx.stride_q_head
+                + sub * self.traits.OP_ELEMS
+            )
+            fx.ptr_store(o_norm, fx.add_offset(self.pout, offset))
         elif const_expr(self.traits.buffer_plan_output):
             # Row guards keep the full 8-byte store within this slot.
-            pout_offset = (
-                global_row * self.traits.value_dim + sub * self.traits.OP_ELEMS
-            )
+            pout_offset = global_row * self.traits.head_dim + sub * self.traits.OP_ELEMS
             buf_copy_store(
                 self.pout_buffer,
                 pout_offset,
                 o_norm,
-                elem=self.traits.Q_DTYPE,
+                elem=self.traits.OUT_DTYPE,
                 unit_elems=self.traits.OP_ELEMS,
                 cache_modifier=0,
             )
         else:
             base = self.ctx.partial_slot * self.traits.TOTAL_ROWS + global_row
-            pout_offset = base * self.traits.value_dim + sub * self.traits.OP_ELEMS
+            pout_offset = base * self.traits.head_dim + sub * self.traits.OP_ELEMS
             fx.ptr_store(o_norm, fx.add_offset(self.pout, pout_offset))
 
     @flyc.jit
@@ -81,7 +94,6 @@ class PaDecodeEpilogue:
         pmax = self.pmax
         psum = self.psum
         # Each lane stores four head-dim values for one query row.
-        inv_fp8 = fx.Float32(1.0 / self.traits.FP8_MAX)
         for m in range_constexpr(self.traits.M_TILES):
             # Flat (mtp, gqa) query-row for this lane.
             row = m * MFMA_MNK + self.ctx.lane16
@@ -89,15 +101,18 @@ class PaDecodeEpilogue:
             l_row = o_final[self.traits.l_slot(m)]
             safe_l = (l_row > self.ctx.ZERO_F).select(l_row, fx.Float32(1.0))
             inv_l = fx.Float32(rcp_f32(safe_l))
-            if const_expr(self.traits.per_token_kv or self.traits.PV_BF16):
+            if const_expr(
+                self.traits.per_token_kv or self.traits.kv_dtype not in FP8_KV_DTYPES
+            ):
                 o_scale = inv_l
             else:
+                inv_fp8 = fx.Float32(1.0 / self.traits.FP8_MAX)
                 o_scale = inv_l * (self.ctx.v_scale_f * inv_fp8)
             o_scale_b = fx.full(self.traits.OP_ELEMS, o_scale, fx.Float32)
 
             for vh in range_constexpr(self.traits.VHE_CHUNKS):
                 o_slot = self.traits.o_slot(m, vh)
-                o_norm = (o_final[o_slot] * o_scale_b).to(self.traits.Q_DTYPE)
+                o_norm = (o_final[o_slot] * o_scale_b).to(self.traits.OUT_DTYPE)
                 head_base = (
                     vh * (self.traits.NWARP * MFMA_MNK)
                     + self.ctx.warp * MFMA_MNK
@@ -107,14 +122,15 @@ class PaDecodeEpilogue:
                 if row < self.traits.CTA_ROWS:
                     self._emit(o_norm, sub, global_row)
 
-            if self.ctx.warp == 0 and self.ctx.rgroup == 0:
-                base = self.ctx.partial_slot * self.traits.TOTAL_ROWS + global_row
-                if row < self.traits.CTA_ROWS:
-                    # The shared reducer expects maxima in natural-log units.
-                    pmax[base] = o_final[self.traits.m_slot(m)] * fx.Float32(
-                        1.0 / LOG2E
-                    )
-                    psum[base] = l_row
+            if const_expr(not self.traits.DIRECT):  # noqa: SIM102
+                if self.ctx.warp == 0 and self.ctx.rgroup == 0:
+                    base = self.ctx.partial_slot * self.traits.TOTAL_ROWS + global_row
+                    if row < self.traits.CTA_ROWS:
+                        # The shared reducer expects maxima in natural-log units.
+                        pmax[base] = o_final[self.traits.m_slot(m)] * fx.Float32(
+                            1.0 / LOG2E
+                        )
+                        psum[base] = l_row
 
     @flyc.jit
     def store_mxfp4(self, o_final):
@@ -184,13 +200,13 @@ class PaDecodeEpilogue:
             # it here, after the normalization (the row's max token has p = 1, so
             # h_sum >= 1).
             inv = inv * fx.Float32(2.0**MXFP4_P_EXP_SHIFT)
-            o_norm = (o * fx.full(8, inv, fx.Float32)).to(self.traits.Q_DTYPE)
+            o_norm = (o * fx.full(8, inv, fx.Float32)).to(self.traits.OUT_DTYPE)
             global_row = self.ctx.query_begin * self.traits.query_group_size + row
             for half in range_constexpr(2):
                 self._emit(
                     fx.Vector.from_elements(
                         [o_norm[half * 4 + i] for i in range_constexpr(4)],
-                        dtype=self.traits.Q_DTYPE,
+                        dtype=self.traits.OUT_DTYPE,
                     ),
                     dim8 * 2 + half,
                     global_row,

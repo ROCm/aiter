@@ -34,18 +34,32 @@ from .kernels.pa_decode_reduce import (
     SPLIT_PARTITIONS,
     compile_pa_decode_ps_reduce,
 )
-from .kernels.tensor_shim import _run_compiled, get_dtype_str, ptr_arg
+from .kernels.tensor_shim import (
+    _run_compiled,
+    get_dtype_str,
+    ptr_arg,
+    torch_to_fx_dtype,
+)
+
+_CONSTANT_SCALES: dict[tuple[torch.device, float], torch.Tensor] = {}
 
 
-def _flydsl_pointer_dtype(dtype: torch.dtype):
-    return {
-        torch.float32: fx.Float32,
-        torch.float16: fx.Float16,
-        torch.bfloat16: fx.BFloat16,
-        torch.float8_e4m3fn: fx.Float8E4M3FN,
-        torch.float8_e4m3fnuz: fx.Float8E4M3FNUZ,
-        torch.int32: fx.Int32,
-    }[dtype]
+def _constant_scale(device: torch.device, value: float) -> torch.Tensor:
+    """One-element float32 scale, kept per (device, value) once built eagerly.
+
+    Building it per call adds a fill or host copy to every call and to every
+    captured CUDA graph: two extra dispatches per scalar-scale FP8 call. A
+    scale first built during graph capture is not cached: its fill has not run
+    yet, and its memory belongs to that graph's pool.
+    """
+    key = (device, value)
+    scale = _CONSTANT_SCALES.get(key)
+    if scale is None:
+        scale = torch.full((1,), value, dtype=torch.float32, device=device)
+        if not torch.cuda.is_current_stream_capturing() and len(_CONSTANT_SCALES) < 64:
+            torch.cuda.current_stream(device).synchronize()  # readable from any stream
+            _CONSTANT_SCALES[key] = scale
+    return scale
 
 
 def launch_pa_decode_ps_reduce(
@@ -74,8 +88,7 @@ def launch_pa_decode_ps_reduce(
 ) -> None:
     """Reduce packed partials; every sequence has at most ``max_partitions``.
 
-    ``query_map`` (int32 [batch, 4]) places each sequence's query rows; see
-    ``compile_pa_decode_ps_reduce``.
+    ``query_map`` (int32 [batch, 4]) places each sequence's query rows.
     """
     props = torch.cuda.get_device_properties(output.device)
     if max_partitions > props.multi_processor_count:
@@ -173,16 +186,16 @@ def launch_pa_decode_ps_reduce(
         query_map=query_map is not None,
     )
     sink_ptr = (
-        flyc.from_c_void_p(_flydsl_pointer_dtype(output.dtype), 0)
+        flyc.from_c_void_p(torch_to_fx_dtype(output.dtype), 0)
         if sink_token is None
-        else ptr_arg(sink_token, _flydsl_pointer_dtype(sink_token.dtype))
+        else ptr_arg(sink_token, torch_to_fx_dtype(sink_token.dtype))
     )
     _run_compiled(
         compiled["launch" if query_map is None else "launch_varlen"],
-        ptr_arg(output, _flydsl_pointer_dtype(output.dtype)),
+        ptr_arg(output, torch_to_fx_dtype(output.dtype)),
         ptr_arg(exp_sums, fx.Float32),
         ptr_arg(max_logits, fx.Float32),
-        ptr_arg(logits, _flydsl_pointer_dtype(logits.dtype)),
+        ptr_arg(logits, torch_to_fx_dtype(logits.dtype)),
         sink_ptr,
         stride_output_bs,
         stride_output_len,
@@ -220,7 +233,7 @@ def _pa_decode_mxfp4(
     work_plan,
     max_context_length,
 ):
-    """MXFP4 K/V on gfx950: ``kv_dtype="mxfp4"`` of the shared tile kernel."""
+    """MXFP4 K/V on gfx950: ``kv_dtype=dtypes.fp4x2`` of the shared tile kernel."""
     if get_gfx_runtime() != "gfx950":
         raise NotImplementedError("MXFP4 pa_decode supports gfx950")
     # fp4x2 data and fp8_e8m0 scale views are the same bytes as uint8 ones.
@@ -344,8 +357,8 @@ def _pa_decode_mxfp4(
             ).multi_processor_count,
             num_partitions=1 if direct else work_plan.max_partitions,
             softmax_scale=softmax_scale,
-            query_dtype="fp8" if query.dtype == torch.float8_e4m3fn else "bf16",
-            kv_dtype="mxfp4",
+            query_dtype=query.dtype,
+            kv_dtype=dtypes.fp4x2,
             work_capacity=capacity,
             max_context_length=schedule_context_length,
             direct_output=direct,
@@ -378,8 +391,8 @@ def _pa_decode_mxfp4(
             compiled["launch"],
             ptr_arg(pmax, fx.Float32),
             ptr_arg(psum, fx.Float32),
-            ptr_arg(pout, _flydsl_pointer_dtype(pout.dtype)),
-            ptr_arg(query, _flydsl_pointer_dtype(query.dtype)),
+            ptr_arg(pout, torch_to_fx_dtype(pout.dtype)),
+            ptr_arg(query, torch_to_fx_dtype(query.dtype)),
             ptr_arg(k_data, fx.Float4E2M1FN),
             ptr_arg(v_data, fx.Float4E2M1FN),
             ptr_arg(block_tables, fx.Int32),
@@ -421,10 +434,10 @@ def _pa_decode_mxfp4(
 
 
 def pa_decode(
-    output: torch.Tensor,  # [num_seqs * query_length, num_query_heads, value_head_size]
+    output: torch.Tensor,  # [num_seqs * query_length, num_query_heads, head_size]
     query: torch.Tensor,  # [num_seqs * query_length, num_query_heads, head_size]
     key_cache: torch.Tensor,  # [num_blocks, num_kv_heads, head_size // x, kv_block_size, x]
-    value_cache: torch.Tensor,  # [num_blocks, num_kv_heads, value_head_size, kv_block_size] or [num_blocks, num_kv_heads, kv_block_size // x, value_head_size, x]
+    value_cache: torch.Tensor,  # [num_blocks, num_kv_heads, head_size, kv_block_size] or [num_blocks, num_kv_heads, kv_block_size // x, head_size, x]
     context_lengths: torch.Tensor,  # [num_seqs]
     block_tables: torch.Tensor,  # [num_seqs, max_num_blocks_per_seq]
     softmax_scale: float,
@@ -437,20 +450,18 @@ def pa_decode(
     value_scale: torch.Tensor = None,  # [num_blocks, num_kv_heads, kv_block_size, 1]
     exp_sums: torch.Tensor = None,  # [num_kv_heads, capacity, query_length * query_group_size]
     max_logits: torch.Tensor = None,  # [num_kv_heads, capacity, query_length * query_group_size]
-    temporary_output: torch.Tensor = None,  # [num_kv_heads, capacity, query_length * query_group_size, value_head_size]
+    temporary_output: torch.Tensor = None,  # [num_kv_heads, capacity, query_length * query_group_size, head_size]
     alibi_slopes: torch.Tensor = None,
     sinks: torch.Tensor = None,
     sliding_window: int = 0,
     work_plan: PADecodePlan | None = None,
     max_context_length: int | None = None,
     mask_unowned_kv: bool = True,
-    kv_layout: str = "vectorized",
 ) -> None:
     """Decode FP8 or BF16 K/V using 256-token compute tiles.
 
-    Supports page sizes 16/64/128. On gfx942/gfx950, BF16 and FP8 head
-    dimensions are multiples of 64 up to 1024. gfx1250 supports 64 and
-    multiples of 128 up to 1024.
+    Supports page sizes 16/64/128. BF16 head dimensions are multiples of 64
+    up to 1024; FP8 supports 64 and multiples of 128 up to 1024.
     K/V scales are [1] or [num_blocks, num_kv_heads, block_size, 1].
     A non-transposed 4D key cache is not implemented.
 
@@ -467,9 +478,8 @@ def pa_decode(
     gfx942/gfx950 BF16 automatically splits query positions to keep each CTA
     within 64 KiB of LDS; a single query's GQA rows must fit that limit. gfx1250
     splits BF16 D1024/G16/MTP4 with transposed page128 caches and full attention
-    into separate query CTAs. Q/K and V/output head dimensions normally match.
-    gfx942/gfx950 also support Q/K192-V128 with scalar or per-token FP8 KV
-    or native BF16 KV for full attention or any positive sliding window.
+    into separate query CTAs. Q/K and V/output
+    head dimensions must match.
     ALiBi and externally quantized queries are unsupported.
 
     MTP lengths include the query tokens and use dense causal masking.
@@ -483,9 +493,9 @@ def pa_decode(
     the device CU count for the gfx950 head-256 pipe shapes and twice that
     otherwise; ``tune=True`` forces a search during preparation.
     Decode and graph replay use the explicit plan without accessing autotune. Set its
-    partition cap with ``plan_pa_decode(max_partitions=...)``. On gfx1250, when
-    sinks are absent and query/output strides match, a cap of one writes output
-    directly. So do plans with one task slot per sequence (capacity equal to
+    partition cap with ``plan_pa_decode(max_partitions=...)``. On gfx950 and
+    gfx1250, when sinks are absent and query/output strides match, a cap of one
+    writes output directly, without the reducer. On gfx1250, so do plans with one task slot per sequence (capacity equal to
     the batch, at most 8 partitions per sequence, head_dim <= 512): sequences
     that still own several tasks merge them in the tile kernel using the plan's
     arrival counters when partial scratch is eight-byte aligned. Otherwise,
@@ -539,11 +549,6 @@ def pa_decode(
     any bytes, including NaN. False skips that masking (slightly faster on
     tiny boundary-tile-only calls); the caller must then keep those bytes and
     scales finite. gfx1250 ignores it and always requires finite bytes.
-
-    ``kv_layout="linear"`` (gfx950, BF16 K/V) takes contiguous
-    [num_blocks, block_size, num_kv_heads, head_size] key and
-    [num_blocks, block_size, num_kv_heads, value_head_size] value caches, the
-    unified-attention layout, at block sizes 16, 64 or 128.
 
     GPU lengths and table entries are not checked. Callers must ensure
     0 <= context_lengths[i] <= block_tables.shape[1] * block_size and used
@@ -603,14 +608,7 @@ def pa_decode(
                 f"{name} must be {expected}, got shape {tuple(tensor.shape)}"
             )
 
-    if kv_layout not in ("vectorized", "linear"):
-        raise ValueError(
-            f"kv_layout must be 'vectorized' or 'linear', got {kv_layout!r}"
-        )
-    linear_kv = kv_layout == "linear"
     if mxfp4:
-        if linear_kv:
-            raise NotImplementedError("MXFP4 KV supports only its packed page layout")
         if query_length != 1:
             raise NotImplementedError(
                 f"MXFP4 KV supports query_length 1, got {query_length}"
@@ -643,12 +641,7 @@ def pa_decode(
             max_context_length,
         )
 
-    if linear_kv and (key_cache.dim(), value_cache.dim()) != (4, 4):
-        raise ValueError(
-            "linear key_cache and value_cache must be 4D "
-            "[num_blocks, block_size, num_kv_heads, dim]"
-        )
-    trans_k = linear_kv or key_cache.dim() == 5
+    trans_k = key_cache.dim() == 5
     if not trans_k:
         raise NotImplementedError("Non-transposed key cache is not implemented")
 
@@ -663,26 +656,19 @@ def pa_decode(
             f"query.shape[0] ({total_q_rows}) must equal "
             f"context_lengths.shape[0] * query_length ({num_seqs} * {query_length})"
         )
-    if output.shape[:2] != query.shape[:2]:
+    if output.shape != query.shape:
         raise ValueError(
-            f"output token/head shape {tuple(output.shape[:2])} must match "
-            f"query token/head shape {tuple(query.shape[:2])}"
+            f"output shape {tuple(output.shape)} must match "
+            f"query shape {tuple(query.shape)}"
         )
-    value_dim = output.shape[-1]
-    asymmetric_value = value_dim != head_dim
     if block_tables.shape[0] != num_seqs:
         raise ValueError(
             f"block_tables.shape[0] ({block_tables.shape[0]}) must match "
             f"context_lengths.shape[0] ({num_seqs})"
         )
 
-    trans_v = linear_kv or value_cache.dim() == 5
-    if linear_kv:
-        num_blocks, block_size, num_kv_heads, key_dim = key_cache.shape
-    else:
-        num_blocks, num_kv_heads, num_hgroups, block_size, hgroup_width = (
-            key_cache.shape
-        )
+    trans_v = value_cache.dim() == 5
+    num_blocks, num_kv_heads, num_hgroups, block_size, hgroup_width = key_cache.shape
     if num_kv_heads < 1:
         raise ValueError(
             f"key_cache must contain at least one KV head, got {num_kv_heads}"
@@ -694,7 +680,6 @@ def pa_decode(
             f"pa_decode only supports gfx942, gfx950 and gfx1250, got {arch}"
         )
     is_bf16_kv = key_cache.dtype == torch.bfloat16
-    kv_dtype = "bf16" if is_bf16_kv else "fp8"
     expected_kv_dtype = torch.bfloat16 if is_bf16_kv else dtypes.fp8
     compute_type = key_cache.dtype if compute_type is None else compute_type
     if compute_type != expected_kv_dtype:
@@ -703,35 +688,27 @@ def pa_decode(
             f"on {arch}, got {compute_type}"
         )
     vector_width = 8 if is_bf16_kv else 16
-    if linear_kv and not (is_bf16_kv and arch == "gfx950"):
-        raise NotImplementedError("linear KV layout requires BF16 K/V on gfx950")
 
-    # Enforce the tile geometry and the reducer's 1024-thread limit.
+    # Enforce tile Q-load constraints and the reducer's 1024-thread limit.
+    q_chunk = head_dim // 16
     if not (
         64 <= head_dim <= 1024
         and head_dim % 64 == 0
         and (
-            arch not in ("gfx1250", "gfx1250-strict")
-            or head_dim == 64
-            or head_dim % 128 == 0
+            (is_bf16_kv and arch not in ("gfx1250", "gfx1250-strict"))
+            or q_chunk <= 8
+            or q_chunk % 8 == 0
         )
     ):
         raise NotImplementedError(
             f"pa_decode does not support head_dim={head_dim}; supported values "
             + (
-                "are multiples of 64 in [64, 1024] on gfx942/gfx950"
-                if arch not in ("gfx1250", "gfx1250-strict")
-                else "are 64 and multiples of 128 in [128, 1024] on gfx1250"
+                "are multiples of 64 in [64, 1024] for BF16 KV"
+                if is_bf16_kv and arch not in ("gfx1250", "gfx1250-strict")
+                else "are 64 and multiples of 128 in [128, 1024]"
             )
         )
-    if linear_kv:
-        if key_dim != head_dim:
-            raise ValueError(
-                "linear key_cache shape must be "
-                "[num_blocks, block_size, num_kv_heads, head_dim], "
-                f"got {tuple(key_cache.shape)} for head_dim={head_dim}"
-            )
-    elif num_hgroups != head_dim // vector_width or hgroup_width != vector_width:
+    if num_hgroups != head_dim // vector_width or hgroup_width != vector_width:
         raise ValueError(
             "key_cache shape must be "
             f"[num_blocks, num_kv_heads, head_dim // {vector_width}, "
@@ -745,34 +722,25 @@ def pa_decode(
 
     if is_bf16_kv and arch not in ("gfx1250", "gfx1250-strict") and not trans_v:
         raise ValueError("BF16 KV requires the vectorized 5D value_cache layout")
-    if linear_kv:
-        v_num_blocks, v_block_size, v_num_kv_heads, v_head_dim = value_cache.shape
-        if v_head_dim != value_dim or v_block_size != block_size:
-            raise ValueError(
-                "linear value_cache shape must be "
-                "[num_blocks, block_size, num_kv_heads, value_dim], "
-                f"got {tuple(value_cache.shape)} for block_size={block_size}, "
-                f"value_dim={value_dim}"
-            )
-    elif trans_v:
+    if trans_v:
         v_num_blocks, v_num_kv_heads = value_cache.shape[:2]
-        expected_v_tail = (block_size // vector_width, value_dim, vector_width)
+        expected_v_tail = (block_size // vector_width, head_dim, vector_width)
         if tuple(value_cache.shape[2:]) != expected_v_tail:
             raise ValueError(
                 "transposed value_cache shape must be "
                 f"[num_blocks, num_kv_heads, block_size // {vector_width}, "
-                f"value_dim, {vector_width}], "
+                f"head_dim, {vector_width}], "
                 f"got {tuple(value_cache.shape)} for block_size={block_size}, "
-                f"value_dim={value_dim}"
+                f"head_dim={head_dim}"
             )
     else:
         v_num_blocks, v_num_kv_heads, v_head_dim, v_block_size = value_cache.shape
-        if v_head_dim != value_dim or v_block_size != block_size:
+        if v_head_dim != head_dim or v_block_size != block_size:
             raise ValueError(
                 "value_cache shape must be "
-                "[num_blocks, num_kv_heads, value_dim, block_size], "
+                "[num_blocks, num_kv_heads, head_dim, block_size], "
                 f"got {tuple(value_cache.shape)} for block_size={block_size}, "
-                f"value_dim={value_dim}"
+                f"head_dim={head_dim}"
             )
     # Packed V is a shifted view and may span fewer blocks than K.
     if v_num_blocks > num_blocks:
@@ -797,11 +765,7 @@ def pa_decode(
         raise TypeError(f"context_lengths must be int32, got {context_lengths.dtype}")
     query_group_size = num_q_heads // num_kv_heads
     max_blocks_per_seq = block_tables.shape[1]
-    if query.dtype == torch.bfloat16:
-        query_dtype = "bf16"
-    elif query.dtype == torch.float16:
-        query_dtype = "f16"
-    else:
+    if query.dtype not in (torch.bfloat16, torch.float16):
         raise TypeError(f"pa_decode only supports f16/bf16 query, got {query.dtype}")
     if (
         is_bf16_kv
@@ -872,9 +836,9 @@ def pa_decode(
 
     def normalize_scale(scale, name):
         if scale is None:
-            return torch.ones(1, dtype=torch.float32, device=dev)
+            return _constant_scale(dev, 1.0)
         if not isinstance(scale, torch.Tensor):
-            return torch.tensor([float(scale)], dtype=torch.float32, device=dev)
+            return _constant_scale(dev, float(scale))
         if scale.numel() == 1:
             return scale.reshape(1)
         if scale.dim() == 4:
@@ -969,12 +933,6 @@ def pa_decode(
         raise ValueError("sliding_window must match work_plan.sliding_window")
     if sliding_window > 0 and work_plan.query_length != query_length:
         raise ValueError("query_length must match work_plan.query_length")
-    if asymmetric_value and not (
-        arch in ("gfx942", "gfx950") and head_dim == 192 and value_dim == 128
-    ):
-        raise NotImplementedError(
-            "asymmetric value width requires gfx942/gfx950 Q/K192-V128"
-        )
     num_partitions = work_plan.max_partitions
     pmax = max_logits
     psum = exp_sums
@@ -997,7 +955,14 @@ def pa_decode(
     # CTA. That merge costs two device-scope round trips (sparse decode 64
     # rows: 17.7 us vs 10.3 us for tile plus reducer), so wider plans merge
     # within workgroup clusters instead.
+    # gfx942/gfx950 one-partition plans (capacity == batch) store final rows
+    # from the tile kernel too, without the reducer launch.
     direct_output = (
+        arch in ("gfx942", "gfx950")
+        and num_partitions == 1
+        and sinks is None
+        and output.stride() == query.stride()
+    ) or (
         arch in ("gfx1250", "gfx1250-strict")
         and sinks is None
         and output.stride() == query.stride()
@@ -1053,7 +1018,6 @@ def pa_decode(
         compiled = compile_pa_decode_tile(
             architecture=arch,
             head_dim=head_dim,
-            value_dim=value_dim,
             query_group_size=query_group_size,
             block_size=int(block_size),
             num_seqs=num_seqs,
@@ -1061,8 +1025,8 @@ def pa_decode(
             num_compute_units=num_compute_units,
             num_partitions=num_partitions,
             softmax_scale=softmax_scale,
-            query_dtype=query_dtype,
-            kv_dtype=kv_dtype,
+            query_dtype=query.dtype,
+            kv_dtype=expected_kv_dtype,
             per_token_kv=per_token_kv,
             query_length=query_length,
             trans_v=trans_v,
@@ -1075,7 +1039,6 @@ def pa_decode(
             trans_k=trans_k,
             mask_unowned_kv=mask_unowned_kv,
             cluster_merge=cluster_merge,
-            linear_kv=linear_kv,
         )
 
     total_rows = query_length * query_group_size
@@ -1086,7 +1049,7 @@ def pa_decode(
         psum = torch.empty(*expected_scalar_shape, dtype=torch.float32, device=dev)
     if pout is None:
         pout = torch.empty(
-            *expected_scalar_shape, value_dim, dtype=output.dtype, device=dev
+            *expected_scalar_shape, head_dim, dtype=output.dtype, device=dev
         )
     for name, tensor in (
         ("max_logits", pmax),
@@ -1105,7 +1068,7 @@ def pa_decode(
         raise ValueError(
             f"exp_sums shape {tuple(psum.shape)} != {expected_scalar_shape}"
         )
-    expected_output_shape = (*expected_scalar_shape, value_dim)
+    expected_output_shape = (*expected_scalar_shape, head_dim)
     if pout.shape != expected_output_shape:
         raise ValueError(
             f"temporary_output shape {tuple(pout.shape)} != {expected_output_shape}"
@@ -1135,7 +1098,7 @@ def pa_decode(
     if arch in ("gfx1250", "gfx1250-strict"):
         merged = direct_output and not one_partition_output
         merge_args = (
-            ptr_arg(output, _flydsl_pointer_dtype(output.dtype)),
+            ptr_arg(output, torch_to_fx_dtype(output.dtype)),
             ptr_arg(work_plan.reduce_info, fx.Int32),
             (
                 ptr_arg(work_plan.arrival_counters, fx.Int32)
@@ -1155,11 +1118,11 @@ def pa_decode(
             ptr_arg(psum, fx.Float32),
             ptr_arg(
                 output if one_partition_output else pout,
-                _flydsl_pointer_dtype(pout.dtype),
+                torch_to_fx_dtype(pout.dtype),
             ),
-            ptr_arg(query, _flydsl_pointer_dtype(query.dtype)),
-            ptr_arg(key_cache, _flydsl_pointer_dtype(key_cache.dtype)),
-            ptr_arg(value_cache, _flydsl_pointer_dtype(value_cache.dtype)),
+            ptr_arg(query, torch_to_fx_dtype(query.dtype)),
+            ptr_arg(key_cache, torch_to_fx_dtype(key_cache.dtype)),
+            ptr_arg(value_cache, torch_to_fx_dtype(value_cache.dtype)),
             ptr_arg(block_tables, fx.Int32),
             (
                 flyc.from_c_void_p(fx.Float32, 0)
@@ -1181,14 +1144,12 @@ def pa_decode(
             ptr_arg(work_plan.work_info, fx.Int32),
             work_plan.capacity,
             *merge_args,
-            # Uniform query rows: the query map is unread.
-            *((ptr_arg(work_plan.work_info, fx.Int32),) if "query_map" in compiled else ()),
             s,
         )
         if direct_output or cluster_merge:
             return
         output_5d = output.reshape(
-            num_seqs, query_length, num_kv_heads, query_group_size, value_dim
+            num_seqs, query_length, num_kv_heads, query_group_size, head_dim
         )
         launch_pa_decode_ps_reduce(
             output_5d,
@@ -1207,7 +1168,7 @@ def pa_decode(
             pout.stride(2),
             query_seq_len=query_length,
             query_group_size=query_group_size,
-            head_size=value_dim,
+            head_size=head_dim,
             max_partitions=max_partitions,
             stream=s,
             reduce_info=work_plan.reduce_info,

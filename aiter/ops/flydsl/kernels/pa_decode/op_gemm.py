@@ -5,6 +5,7 @@
 
 import flydsl.expr as fx
 from flydsl._mlir import ir
+from flydsl._mlir.dialects import llvm
 from flydsl.expr import const_expr, range_constexpr
 from flydsl.expr.typing import T
 
@@ -15,28 +16,12 @@ UNIT_E8M0_SCALES = 0x7F7F7F7F
 
 
 class PaDecodeGemm:
-    def __init__(self, traits, policy):
+    def __init__(self, traits):
         self.traits = traits
-        self.policy = policy
 
     def mfma(self, a_ops, b_ops, a_base, b_base, k_packs, acc):
         if const_expr(self.traits.PV_BF16):
-            wide = k_packs // 2 if const_expr(self.traits.WIDE_BF16_MFMA) else 0
-            for inst in range_constexpr(wide):
-                # Both operands take lane group l // 16 for the K index, so
-                # pairing the same two packs in A and B permutes K consistently.
-                a_pack = fx.Vector.from_elements(
-                    [a_ops[a_base + 2 * inst], a_ops[a_base + 2 * inst + 1]],
-                    dtype=fx.Int64,
-                ).bitcast(fx.BFloat16)
-                b_pack = fx.Vector.from_elements(
-                    [b_ops[b_base + 2 * inst], b_ops[b_base + 2 * inst + 1]],
-                    dtype=fx.Int64,
-                ).bitcast(fx.BFloat16)
-                acc = fx.rocdl.mfma_f32_16x16x32_bf16(
-                    T.f32x4, [a_pack, b_pack, acc, 0, 0, 0]
-                )
-            for pack in range_constexpr(2 * wide, k_packs):
+            for pack in range_constexpr(k_packs):
                 # Keep four BF16 values packed in i64 through the pipeline,
                 # exposing the instruction's i16x4 operands only here.
                 a_pack = fx.Vector.from_elements(
@@ -48,9 +33,7 @@ class PaDecodeGemm:
                 acc = fx.rocdl.mfma_f32_16x16x16bf16_1k(
                     T.f32x4, [a_pack, b_pack, acc, 0, 0, 0]
                 )
-        elif const_expr(
-            self.traits.WIDE_FP8_MFMA and k_packs % self.traits.PACKS_PER_MFMA == 0
-        ):
+        elif const_expr(self.traits.WIDE_FP8_MFMA):
             for inst in range_constexpr(k_packs // self.traits.PACKS_PER_MFMA):
                 a_pack = fx.Vector.from_elements(
                     [
@@ -88,41 +71,69 @@ class PaDecodeGemm:
                 )
         return acc
 
+    def mfma_bf16_k32(self, a_ops, b_ops, a_base, b_base, k_packs, acc):
+        """gfx950 K32 BF16 MFMA over pairs of K16 packs.
+
+        A and B pair the same two packs, so the shared K permutation leaves the
+        dot product unchanged and halves the MFMA count.
+        """
+        for inst in range_constexpr(k_packs // 2):
+            a_pack = fx.Vector.from_elements(
+                [a_ops[a_base + 2 * inst], a_ops[a_base + 2 * inst + 1]],
+                dtype=fx.Int64,
+            ).bitcast(fx.BFloat16)
+            b_pack = fx.Vector.from_elements(
+                [b_ops[b_base + 2 * inst], b_ops[b_base + 2 * inst + 1]],
+                dtype=fx.Int64,
+            ).bitcast(fx.BFloat16)
+            acc = fx.rocdl.mfma_f32_16x16x32_bf16(
+                T.f32x4, [a_pack, b_pack, acc, 0, 0, 0]
+            )
+        return acc
+
+    def qk_bf16_k32(self, k_ops, q_ops, a):
+        """Scores of K chunk ``a`` against one M-tile's N_SUBCHUNKS Q packs."""
+        acc = fx.full(MFMA_ACC_ELEMS, 0.0, fx.Float32)
+        acc = self.mfma_bf16_k32(
+            k_ops,
+            q_ops,
+            a * self.traits.N_SUBCHUNKS,
+            0,
+            self.traits.N_SUBCHUNKS,
+            acc,
+        )
+        return fx.Vector(acc)
+
+    def pv_bf16_k32(self, v_ops, p_ops, acc):
+        """Accumulate PV into ``acc`` (the rescaled running output)."""
+        return fx.Vector(self.mfma_bf16_k32(v_ops, p_ops, 0, 0, self.traits.NVOPS, acc))
+
     def fp8_words(self, vf32):
         n = vf32.shape[0]
         words = []
         for i in range_constexpr(n // 4):
             b = i * 4
-            lo = fx.rocdl.cvt_pk_fp8_f32(T.i32, vf32[b], vf32[b + 1], 0, False)
+            # The second conversion writes the high half, so on gfx950 the
+            # first one's old word is undef rather than a zeroed register.
+            old = llvm.mlir_undef(T.i32) if const_expr(self.traits.IS_GFX950) else 0
+            lo = fx.rocdl.cvt_pk_fp8_f32(T.i32, vf32[b], vf32[b + 1], old, False)
             words.append(
                 fx.rocdl.cvt_pk_fp8_f32(T.i32, vf32[b + 2], vf32[b + 3], lo, True)
             )
         return fx.Vector.from_elements(words, dtype=fx.Int32)
 
-    def fp8_residual(self, scaled, word):
-        # Retain probability-packing error in a second FP8 term. Its magnitude
-        # is at most 16 (OCP) or 8 (FNUZ); scaling by 16 fits either format.
-        lo = fx.Vector(fx.rocdl.cvt_pk_f32_fp8(T.f32x2, word, False))
-        hi = fx.Vector(fx.rocdl.cvt_pk_f32_fp8(T.f32x2, word, True))
-        rounded = fx.Vector.from_elements(
-            [lo[0], lo[1], hi[0], hi[1]], dtype=fx.Float32
-        )
-        # gfx942 unpacks native FNUZ values; no transport-scale correction.
-        return self.fp8_words((scaled - rounded) * fx.full(4, 16.0, fx.Float32))
-
     def qk(self, k_ops, q_ops, m):
         frag_Ss = []
         for a in range_constexpr(self.traits.NCHUNK):
             acc = fx.full(MFMA_ACC_ELEMS, 0.0, fx.Float32)
-            if const_expr(a < self.policy.qk_chunks):
-                acc = self.mfma(
-                    k_ops,
-                    q_ops,
-                    a * self.traits.N_SUBCHUNKS,
-                    m * self.traits.N_SUBCHUNKS,
-                    self.traits.N_SUBCHUNKS,
-                    acc,
-                )
+            acc = self.mfma(
+                k_ops,
+                q_ops,
+                a * self.traits.N_SUBCHUNKS,
+                m * self.traits.N_SUBCHUNKS,
+                self.traits.N_SUBCHUNKS,
+                acc,
+            )
             frag_Ss.append(fx.Vector(acc))
         return frag_Ss
 
@@ -155,13 +166,9 @@ class PaDecodeGemm:
             frag_Ss.append(fx.Vector(acc))
         return frag_Ss
 
-    def pv(self, v_ops, p_ops, residual_ops=None):
-        k_packs = self.policy.pv_packs
+    def pv(self, v_ops, p_ops):
         acc = fx.full(MFMA_ACC_ELEMS, 0.0, fx.Float32)
-        if const_expr(residual_ops is not None):
-            acc = self.mfma(v_ops, residual_ops, 0, 0, k_packs, acc)
-            acc = fx.Vector(acc) * fx.full(MFMA_ACC_ELEMS, 1.0 / 16, fx.Float32)
-        acc = self.mfma(v_ops, p_ops, 0, 0, k_packs, acc)
+        acc = self.mfma(v_ops, p_ops, 0, 0, self.traits.NVOPS, acc)
         return fx.Vector(acc)
 
 
