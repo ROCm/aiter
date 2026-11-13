@@ -207,7 +207,9 @@ def get_flydsl_kernel_params(name: str) -> dict | None:
             if m.group("fp4"):
                 extra["out_dtype"] = "fp4"
             if m.group("fp8"):
-                extra["out_dtype"] = "fp8"
+                # Stage 2 reduces the FP8 route rows back to out_dtype.
+                key = "route_out_dtype" if params.get("stage") == 2 else "out_dtype"
+                extra[key] = "fp8"
             if m.group("sbm") is not None:
                 extra["sort_block_m"] = int(m.group("sbm"))
             return {**params, **extra}
@@ -436,6 +438,9 @@ def get_flydsl_stage2_v2_kernels(
                     else ("atomic", "reduce")
                 )
                 for epilog in epilogs:
+                    # out_dtype is the route-row dtype; only reduce has route rows.
+                    if out_dtype == "fp8" and epilog != "reduce":
+                        continue
                     if epilog == "scatter" and out_dtype != "bf16":
                         continue
                     for use_nt in (True, False):
@@ -2171,10 +2176,23 @@ def _flydsl_moe_stage2_impl(
     expert_mask: torch.Tensor | None = None,
     topk_ids: torch.Tensor | None = None,
     use_valid_token_count: bool = False,
+    fp8_route_out: bool = False,
     _compile_kernel=compile_flydsl_moe_stage2,
     _build_mx_args=_s2_args_fp4,
 ) -> torch.Tensor:
     """Run stage2 with injectable compiler and launch-argument builders."""
+
+    if fp8_route_out and (
+        mode != "reduce"
+        or return_per_slot
+        or a_dtype == "bf16"
+        or b_dtype not in ("fp4", "fp8")
+    ):
+        raise ValueError(
+            "FP8 route output requires a reduce-mode stage2 kernel with "
+            f"fp4/fp8 weights, got mode={mode!r} a_dtype={a_dtype!r} "
+            f"b_dtype={b_dtype!r} return_per_slot={return_per_slot}"
+        )
 
     if a_dtype == "bf16" and b_dtype in ("fp4", "int4", "bf16"):
         # a16w-mix down-proj (a16w4 mxfp4 / a16wi4 int4 / a16w16 bf16). Default
@@ -2354,7 +2372,7 @@ def _flydsl_moe_stage2_impl(
         (not accumulate)
         and (not return_per_slot)
         and use_mx_gemm
-        and os.environ.get("AITER_FLYDSL_STAGE2_FP8", "0") == "1"
+        and (fp8_route_out or os.environ.get("AITER_FLYDSL_STAGE2_FP8", "0") == "1")
     )
     _s2_gemm_out_dtype = "fp8" if _s2_fp8_inter else out_dtype
 
@@ -2500,6 +2518,7 @@ def flydsl_moe_stage2(
     expert_mask: torch.Tensor | None = None,
     topk_ids: torch.Tensor | None = None,
     use_valid_token_count: bool = False,
+    fp8_route_out: bool = False,
 ) -> torch.Tensor:
     """Down-projection GEMM (MOE stage2). Supports atomic/reduce modes.
 
@@ -2524,6 +2543,11 @@ def flydsl_moe_stage2(
 
     use_valid_token_count: atomic a16w-mix only; bound scatter rows by
         num_valid_ids[1] (the sort's real token count) when out is padded.
+
+    fp8_route_out: reduce mode with fp4/fp8 weights only; write the per-route
+        rows as FP8 with e8m0 scales (the ``_fp8`` kernel-name suffix). The
+        AITER_FLYDSL_STAGE2_FP8=1 override enables this for every eligible
+        kernel.
     """
     return _flydsl_moe_stage2_impl(
         inter_states=inter_states,
@@ -2557,6 +2581,7 @@ def flydsl_moe_stage2(
         expert_mask=expert_mask,
         topk_ids=topk_ids,
         use_valid_token_count=use_valid_token_count,
+        fp8_route_out=fp8_route_out,
     )
 
 

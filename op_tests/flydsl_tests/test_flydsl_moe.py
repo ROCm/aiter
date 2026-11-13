@@ -273,26 +273,103 @@ def test_flydsl_stage2_a8w4_fp8_route_out(tile_n, monkeypatch):
     assert rel < 0.05, f"fp8 route-out tile_n={tile_n}: rel err {rel:.3e}"
 
 
-@pytest.mark.parametrize("block_m", [16, 32, 64, 128])
-@pytest.mark.parametrize(
-    ("inter_dim", "tile_k"),
-    [
-        pytest.param(384, 128, id="bk128"),
-        pytest.param(512, 256, id="bk256"),
-    ],
-)
-@_SKIP_GFX950_FLYDSL
-def test_flydsl_v2_stage2_a8w4_full_tile(block_m, inter_dim, tile_k):
-    from aiter.ops.flydsl.kernels.mxmoe_dispatcher import mxfp4_moe_gemm2
+def test_flydsl_stage2_fp8_route_out_kernel_names(monkeypatch):
+    import functools
 
+    from aiter.fused_moe import (
+        _flydsl_stage2_wrapper,
+        _flydsl_v2_stage2_fp8_route_out,
+        _stage2_uses_fp8_route_output,
+    )
+    from aiter.ops.flydsl.moe_kernels import (
+        get_flydsl_kernel_params,
+        get_flydsl_stage2_v2_kernels,
+    )
+    from aiter.ops.flydsl.mxfp4_kname import parse_flydsl_v2_gemm2_kernel
+
+    monkeypatch.delenv("AITER_FLYDSL_STAGE2_FP8", raising=False)
+    v1 = "flydsl_moe2_afp8_wfp4_bf16_t32x128x256_reduce"
+    p = get_flydsl_kernel_params(f"{v1}_fp8_sbm64")
+    assert (p["out_dtype"], p["route_out_dtype"], p["sort_block_m"]) == (
+        "bf16",
+        "fp8",
+        64,
+    )
+    s1 = get_flydsl_kernel_params("flydsl_moe1_afp8_wfp4_bf16_t32x128x256_w3_gui_fp8")
+    assert s1["out_dtype"] == "fp8" and "route_out_dtype" not in s1
+
+    def stage2(name):
+        return functools.partial(_flydsl_stage2_wrapper, kernelName=name)
+
+    assert _stage2_uses_fp8_route_output(stage2(f"{v1}_fp8"))
+    assert not _stage2_uses_fp8_route_output(stage2(f"{v1}_fp8"), return_per_slot=True)
+    assert not _stage2_uses_fp8_route_output(stage2(v1))
+    assert _stage2_uses_fp8_route_output(stage2(v1), stage2_fp8=True)
+
+    v2 = get_flydsl_stage2_v2_kernels(
+        "fp8", "fp4", "fp8", 64, model_dim=5120, inter_dim=640
+    )
+    assert v2 and {kp["epilog"] for kp in v2.values()} == {"reduce"}
+    fp8_name = next(iter(v2))
+    bf16_name = fp8_name.replace("_wfp4_fp8_", "_wfp4_bf16_")
+    atomic_name = bf16_name.replace("_reduce", "_atomic")
+    assert _flydsl_v2_stage2_fp8_route_out(parse_flydsl_v2_gemm2_kernel(fp8_name))
+    assert not _flydsl_v2_stage2_fp8_route_out(parse_flydsl_v2_gemm2_kernel(bf16_name))
+    monkeypatch.setenv("AITER_FLYDSL_STAGE2_FP8", "1")
+    assert _flydsl_v2_stage2_fp8_route_out(parse_flydsl_v2_gemm2_kernel(bf16_name))
+    assert not _flydsl_v2_stage2_fp8_route_out(
+        parse_flydsl_v2_gemm2_kernel(atomic_name)
+    )
+
+
+@pytest.mark.parametrize("tile_n", [128, 256])
+@_SKIP_GFX950_FLYDSL
+def test_flydsl_stage2_fp8_route_out_name(tile_n, monkeypatch):
+    from aiter.fused_moe import _flydsl_stage2_wrapper
+
+    token, model_dim, inter_dim, E, topk, block_m = 64, 512, 256, 8, 2, 32
+    data = _generate_a8w4_gui_data(token, model_dim, inter_dim, E, topk, block_m)
+    base = f"flydsl_moe2_afp8_wfp4_bf16_t{block_m}x{tile_n}x256_reduce"
+
+    def run(name):
+        return _flydsl_stage2_wrapper(
+            data["a2_q"],
+            None,
+            data["w2_shuf"],
+            data["sorted_ids"],
+            data["sorted_expert_ids"],
+            data["num_valid_ids"],
+            None,
+            topk,
+            kernelName=name,
+            w2_scale=data["w2_scale_shuf"],
+            a2_scale=data["a2_scale_sort"],
+            sorted_weights=data["sorted_weights"],
+            block_m=block_m,
+            inter_dim_pad=data["inter_pad"],
+        )
+
+    monkeypatch.delenv("AITER_FLYDSL_STAGE2_FP8", raising=False)
+    out_bf16 = run(base)
+    out_named = run(f"{base}_fp8")
+    monkeypatch.setenv("AITER_FLYDSL_STAGE2_FP8", "1")
+    out_env = run(base)
+    torch.cuda.synchronize()
+    assert torch.equal(out_named, out_env)
+    assert not torch.equal(out_named, out_bf16)
+    _check_close(data["ref_stage2"], out_named, f"stage2_fp8_route_out_name_n{tile_n}")
+
+
+def _generate_v2_stage2_data(block_m, model_dim, inter_dim, topk_weights=None):
     torch.manual_seed(123)
     torch.cuda.manual_seed(123)
-    token, model_dim, E, topk = block_m, 128, 1, 1
+    token, E, topk = block_m, 1, 1
     a2 = torch.randn((token, topk, inter_dim), dtype=torch.bfloat16, device="cuda") / 4
     w1 = torch.zeros((E, inter_dim * 2, model_dim), dtype=torch.bfloat16, device="cuda")
     w2 = torch.randn((E, model_dim, inter_dim), dtype=torch.bfloat16, device="cuda") / 4
     topk_ids = torch.zeros((token, topk), dtype=torch.int32, device="cuda")
-    topk_weights = torch.ones((token, topk), dtype=torch.float32, device="cuda")
+    if topk_weights is None:
+        topk_weights = torch.ones((token, topk), dtype=torch.float32, device="cuda")
     sorted_ids, sorted_weights, sorted_expert_ids, num_valid_ids, _ = moe_sorting(
         topk_ids, topk_weights, E, model_dim, torch.bfloat16, block_m
     )
@@ -323,33 +400,105 @@ def test_flydsl_v2_stage2_a8w4_full_tile(block_m, inter_dim, tile_k):
     )
 
     a2_sorted = a2_q.reshape(token * topk, inter_dim)
-    a2_scale_sorted = mxfp4_moe_sort_fwd(
-        a2_scale,
-        sorted_ids=sorted_ids,
-        num_valid_ids=num_valid_ids,
-        token_num=token,
-        cols=inter_dim,
-    )
-    w2_shuffled = shuffle_weight_a16w4(w2_q, 16, False)
-    w2_scale_shuffled = shuffle_scale_a16w4(w2_scale, E, False)
-    out = torch.zeros((token, model_dim), dtype=torch.bfloat16, device="cuda")
+    return {
+        "ref": ref,
+        "token": token,
+        "E": E,
+        "topk": topk,
+        "topk_weights": topk_weights,
+        "a2_sorted": a2_sorted,
+        "a2_scale_sorted": mxfp4_moe_sort_fwd(
+            a2_scale,
+            sorted_ids=sorted_ids,
+            num_valid_ids=num_valid_ids,
+            token_num=token,
+            cols=inter_dim,
+        ),
+        "w2_shuffled": shuffle_weight_a16w4(w2_q, 16, False),
+        "w2_scale_shuffled": shuffle_scale_a16w4(w2_scale, E, False),
+        "sorted_ids": sorted_ids,
+        "sorted_weights": sorted_weights,
+        "sorted_expert_ids": sorted_expert_ids,
+        "num_valid_ids": num_valid_ids,
+    }
+
+
+@_SKIP_GFX950_FLYDSL
+def test_flydsl_v2_stage2_fp8_route_out_name(monkeypatch):
+    from aiter.fused_moe import _flydsl_v2_stage2_wrapper
+
+    block_m, model_dim, inter_dim = 32, 256, 512
+    topk_weights = torch.rand((block_m, 1), dtype=torch.float32, device="cuda") + 0.5
+    d = _generate_v2_stage2_data(block_m, model_dim, inter_dim, topk_weights)
+
+    def run(out_dtype):
+        out = torch.empty((d["token"], model_dim), dtype=torch.bfloat16, device="cuda")
+        return _flydsl_v2_stage2_wrapper(
+            d["a2_sorted"],
+            None,
+            d["w2_shuffled"],
+            d["sorted_ids"],
+            d["sorted_expert_ids"],
+            d["num_valid_ids"],
+            out,
+            d["topk"],
+            kernelName=(
+                f"flydsl_moe2_layout_afp8_wfp4_{out_dtype}_"
+                f"t{block_m}x128x256_reduce_sbm{block_m}"
+            ),
+            model_dim=model_dim,
+            inter_dim=inter_dim,
+            num_experts=d["E"],
+            w2_scale=d["w2_scale_shuffled"],
+            a2_scale=d["a2_scale_sorted"],
+            sorted_weights=d["sorted_weights"],
+            block_m=block_m,
+            topk_weights=d["topk_weights"],
+        )
+
+    monkeypatch.delenv("AITER_FLYDSL_STAGE2_FP8", raising=False)
+    out_bf16 = run("bf16")
+    out_named = run("fp8")
+    monkeypatch.setenv("AITER_FLYDSL_STAGE2_FP8", "1")
+    out_env = run("bf16")
+    torch.cuda.synchronize()
+    assert torch.equal(out_named, out_env)
+    assert not torch.equal(out_named, out_bf16)
+    _check_close(d["ref"].float(), out_named.float(), "v2_stage2_fp8_route_out_name")
+
+
+@pytest.mark.parametrize("block_m", [16, 32, 64, 128])
+@pytest.mark.parametrize(
+    ("inter_dim", "tile_k"),
+    [
+        pytest.param(384, 128, id="bk128"),
+        pytest.param(512, 256, id="bk256"),
+    ],
+)
+@_SKIP_GFX950_FLYDSL
+def test_flydsl_v2_stage2_a8w4_full_tile(block_m, inter_dim, tile_k):
+    from aiter.ops.flydsl.kernels.mxmoe_dispatcher import mxfp4_moe_gemm2
+
+    model_dim = 128
+    d = _generate_v2_stage2_data(block_m, model_dim, inter_dim)
+    out = torch.zeros((d["token"], model_dim), dtype=torch.bfloat16, device="cuda")
 
     mxfp4_moe_gemm2(
-        inter_sorted_quant=a2_sorted,
-        inter_sorted_shuffled_scale=a2_scale_sorted,
-        w2_u8=w2_shuffled,
-        w2_scale_u8=w2_scale_shuffled,
-        sorted_expert_ids=sorted_expert_ids,
-        cumsum_tensor=num_valid_ids,
-        sorted_token_ids=sorted_ids,
-        sorted_weights=sorted_weights,
+        inter_sorted_quant=d["a2_sorted"],
+        inter_sorted_shuffled_scale=d["a2_scale_sorted"],
+        w2_u8=d["w2_shuffled"],
+        w2_scale_u8=d["w2_scale_shuffled"],
+        sorted_expert_ids=d["sorted_expert_ids"],
+        cumsum_tensor=d["num_valid_ids"],
+        sorted_token_ids=d["sorted_ids"],
+        sorted_weights=d["sorted_weights"],
         out=out,
-        M_logical=token,
-        max_sorted=a2_sorted.shape[0],
-        NE=E,
+        M_logical=d["token"],
+        max_sorted=d["a2_sorted"].shape[0],
+        NE=d["E"],
         D_HIDDEN=model_dim,
         D_INTER=inter_dim,
-        topk=topk,
+        topk=d["topk"],
         BM=block_m,
         BN=128,
         BK=tile_k,
@@ -361,7 +510,7 @@ def test_flydsl_v2_stage2_a8w4_full_tile(block_m, inter_dim, tile_k):
     )
     torch.cuda.synchronize()
     _check_close(
-        ref.float(),
+        d["ref"].float(),
         out.float(),
         f"v2_stage2_a8w4_bm{block_m}_bk{tile_k}",
     )

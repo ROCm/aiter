@@ -706,6 +706,7 @@ class FmoeTuner(TunerCommon):
     SUPPORTS_POWER_SELECT = True
     swiglu_limit = None
     swiglu_limit_tag = ""
+    flydsl_stage2_fp8 = False
 
     ARG_DEFAULTS: ClassVar[dict[str, Any]] = {
         **TunerCommon.ARG_DEFAULTS,
@@ -769,9 +770,28 @@ class FmoeTuner(TunerCommon):
             "2-stage candidates can clamp; results are tagged in a _tag column "
             "and must go to a separate tuned file (-o).",
         )
+        self.parser.add_argument(
+            "--flydsl-stage2-fp8",
+            action="store_true",
+            required=False,
+            help="Also tune FlyDSL reduce stage-2 candidates that write FP8 route "
+            "rows (v1 '_fp8' suffix, v2 'fp8' out field). Tuned rows select FP8 "
+            "per kernel name, without AITER_FLYDSL_STAGE2_FP8.",
+        )
 
     def parse_args(self) -> argparse.Namespace:
         args = super().parse_args()
+        self.flydsl_stage2_fp8 = args.flydsl_stage2_fp8
+        if self.flydsl_stage2_fp8:
+            if args.grouped_gemm or args.mxfp4_flydsl:
+                self.parser.error(
+                    "--flydsl-stage2-fp8 is only supported by the default fmoe tuner"
+                )
+            if os.environ.get("AITER_FLYDSL_STAGE2_FP8", "0") == "1":
+                self.parser.error(
+                    "--flydsl-stage2-fp8 times BF16 and FP8 route rows separately; "
+                    "unset AITER_FLYDSL_STAGE2_FP8"
+                )
         try:
             self.swiglu_limit = normalize_swiglu_limit(args.swiglu_limit)
         except ValueError as exc:
@@ -1265,6 +1285,7 @@ class FmoeTuner(TunerCommon):
             b_nt=kparams.get("b_nt", 0),
             xcd_swizzle=kparams.get("xcd_swizzle", 0),
             bias=bias,
+            fp8_route_out=kparams.get("route_out_dtype") == "fp8",
         )
 
     @staticmethod
@@ -1421,6 +1442,7 @@ class FmoeTuner(TunerCommon):
             "cumsum": v["cumsum"],
             "sti": v["sti"],
             "swt": v["swt"],
+            "topk_w": d["topk_weights"],
             "n": v["n"],
             "max_sorted": v["max_sorted"],
             "ref2": d["ref2_quantized"] if b_dtype == "fp8" else d["ref2"],
@@ -1436,6 +1458,7 @@ class FmoeTuner(TunerCommon):
         cumsum,
         sti,
         swt,
+        topk_w,
         n,
         max_sorted,
         ref2,
@@ -1445,6 +1468,11 @@ class FmoeTuner(TunerCommon):
         topk,
         kparams,
     ):
+        from aiter.ops.flydsl.kernels.mxfp4_gemm_common import (
+            FP8OUT_PITCH_ALIGN,
+            fp8out_row_bytes,
+            fp8out_scale_blk,
+        )
         from aiter.ops.flydsl.kernels.mxmoe_dispatcher import mxfp4_moe_gemm2
 
         token = ref2.shape[0]
@@ -1455,12 +1483,27 @@ class FmoeTuner(TunerCommon):
                 f"epilog='scatter' supports only tile_m=128, got {bm_s2}"
             )
         sbm = kparams["sort_block_m"]
+        route_fp8 = kparams.get("out_dtype") == "fp8"
         out = torch.empty((token, model_dim), dtype=dtypes.bf16, device=isq.device)
-        inter = (
-            torch.empty((token, topk, model_dim), dtype=dtypes.bf16, device=isq.device)
-            if epilog == "reduce"
-            else None
-        )
+        if route_fp8:
+            inter = torch.empty(
+                (
+                    token * topk,
+                    fp8out_row_bytes(
+                        model_dim,
+                        scale_blk=fp8out_scale_blk(model_dim),
+                        pitch_align=FP8OUT_PITCH_ALIGN,
+                    ),
+                ),
+                dtype=torch.uint8,
+                device=isq.device,
+            )
+        elif epilog == "reduce":
+            inter = torch.empty(
+                (token, topk, model_dim), dtype=dtypes.bf16, device=isq.device
+            )
+        else:
+            inter = None
         flat = (
             torch.empty((max_sorted, model_dim), dtype=dtypes.bf16, device=isq.device)
             if epilog == "scatter"
@@ -1497,6 +1540,7 @@ class FmoeTuner(TunerCommon):
             SBM=sbm,
             persist=kparams["persist"],
             n_sorted_padded=n,
+            out_dtype="fp8" if route_fp8 else "bf16",
         )
         if epilog == "scatter":
             n_valid = int(n)
@@ -1523,7 +1567,15 @@ class FmoeTuner(TunerCommon):
         if epilog == "reduce":
             from aiter.ops.flydsl.moe_kernels import _run_moe_reduction
 
-            _run_moe_reduction(inter, out, token, topk, model_dim)
+            _run_moe_reduction(
+                inter,
+                out,
+                token,
+                topk,
+                model_dim,
+                is_fp8=route_fp8,
+                topk_weights=topk_w if route_fp8 else None,
+            )
         return out
 
     @staticmethod
@@ -3974,6 +4026,14 @@ class FmoeTuner(TunerCommon):
             flydsl_s2_kernels = get_flydsl_stage2_kernels(
                 a_dtype_str, b_dtype_str, out_dtype_str
             )
+            if self.flydsl_stage2_fp8 and a_dtype_str in ("fp8", "fp4"):
+                flydsl_s2_kernels.update(
+                    {
+                        f"{kname}_fp8": {**kparams, "route_out_dtype": "fp8"}
+                        for kname, kparams in flydsl_s2_kernels.items()
+                        if kparams["mode"] == "reduce"
+                    }
+                )
 
         for blockM in blockMs:
             # 16 included: a16w4/a8w4 emit t16 names, s1_tile_m drops the rest.
@@ -4420,14 +4480,26 @@ class FmoeTuner(TunerCommon):
                     )
                 )
             # ---- v2 stage2 tasks ----
-            for kn2, kp in get_flydsl_stage2_v2_kernels(
+            s2_kernels = get_flydsl_stage2_v2_kernels(
                 adtype,
                 bdtype,
                 "bf16",
                 blockM,
                 model_dim=model_dim,
                 inter_dim=inter_dim,
-            ).items():
+            )
+            if self.flydsl_stage2_fp8:
+                s2_kernels.update(
+                    get_flydsl_stage2_v2_kernels(
+                        adtype,
+                        bdtype,
+                        "fp8",
+                        blockM,
+                        model_dim=model_dim,
+                        inter_dim=inter_dim,
+                    )
+                )
+            for kn2, kp in s2_kernels.items():
                 kp = {**kp, "a_dtype": adtype}
                 # flat=0, v2=1
                 tasks.append(
@@ -4456,6 +4528,7 @@ class FmoeTuner(TunerCommon):
                                 "cumsum",
                                 "sti",
                                 "swt",
+                                "topk_w",
                                 "n",
                                 "max_sorted",
                                 "ref2",

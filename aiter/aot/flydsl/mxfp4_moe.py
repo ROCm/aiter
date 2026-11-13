@@ -260,7 +260,8 @@ def parse_csv(
                 bm = v2_g2["tile_m"]
                 out_dtype = (
                     "fp8"
-                    if v2_g2["epilog"] == "reduce" and stage2_fp8_route_out
+                    if v2_g2["epilog"] == "reduce"
+                    and (stage2_fp8_route_out or v2_g2["out_dtype"] == "fp8")
                     else "bf16"
                 )
                 count_options = (
