@@ -8,9 +8,8 @@ top-4 routed + the shared expert as id 128 (top-5), Swiglu (alpha 1.702, limit 7
 routed weights x2.0 (routed_scaling_factor folded into the routing weights), shared 1.0.
 
 Variants (``-v``):
-  a8: GateMode.INTERLEAVE (GUGU routed w13), MXFP8 activations: routed a8w4, shared a8w8.
   a4: GateMode.SEPARATED  (GGUU routed w13), MXFP4 activations: routed a4w4, shared a4w8.
-  a8s: GateMode.SEPARATED (GGUU routed w13), MXFP8 activations: routed a8w4, shared a8w8.
+  a8: GateMode.SEPARATED  (GGUU routed w13), MXFP8 activations: routed a8w4, shared a8w8.
 
 Gates (exact, reduce mode = AITER_FLYDSL_FORCE_REDUCE=1):
   P0  prequantised-xn input == bf16-xn input (a8), routed [:128] view bytes == E=128 shuffle
@@ -18,7 +17,7 @@ Gates (exact, reduce mode = AITER_FLYDSL_FORCE_REDUCE=1):
   G2  FHMoE reduce output == bf16(sum_s f32(route_row_s)) in slot order
   G5  reduce output repeatable (4 runs); atomic run-to-run max abs reported
   GA  atomic (shipping) output within (topk+1) bf16 ulp of sum|route rows| of the reduce output, 4 runs;
-      a8/a8s also bf16-xn-in vs prequantised-xn-in under the same bound (atomic P0)
+      a8 also bf16-xn-in vs prequantised-xn-in under the same bound (atomic P0)
 Report only: G3 shared slot vs ATOM's dense MXFP8 MLP (if ATOM importable), G4 final vs
 bf16(bf16(2 r) + s), rel L2 vs an f64 reference.
 """
@@ -45,8 +44,8 @@ H, INTER, E, TOPK = 6144, 768, 128, 4
 SID = E  # shared expert id = dummy routed row
 RSF, LIMIT, ALPHA = 2.0, 7.0, 1.702
 FP4 = dtypes.fp4x2
-GATE = {"a8": "interleave", "a4": "separated", "a8s": "separated"}
-QA = {"a8": dtypes.fp8, "a4": FP4, "a8s": dtypes.fp8}
+GATE = {"a8": "separated", "a4": "separated"}
+QA = {"a8": dtypes.fp8, "a4": FP4}
 
 
 # ------------------------------------------------------------------ weights
@@ -104,7 +103,7 @@ class LayerM3:
     """
 
     def __init__(self, raw: RawM3, variant: str):
-        gu = variant == "a8"
+        gu = GATE[variant] == "interleave"
         e = E + 1
         self.w1 = _mark(moe_shuffle_weight(raw.w1.view(FP4), experts_cnt=e, is_guinterleave=gu, gate_up=True), gu)
         self.w2 = _mark(moe_shuffle_weight(raw.w2.view(FP4), experts_cnt=e, is_guinterleave=gu, gate_up=False), gu)
@@ -184,10 +183,9 @@ def reduce_mode(on):
 def fh_call(variant, L: LayerM3, x, w5, ids5, xs=None):
     """FHMoE: routed + shared, one call. xs = e8m0 scales of a prequantised MXFP8 x (a8 only)."""
     kw = dict(a1_scale=xs) if xs is not None else {}
-    kw.update(quant_dtype_a=QA[variant]) if variant == "a8s" else None
     return fused_moe(x, L.w1, L.w2, w5, ids5, activation=ActivationType.Swiglu, quant_type=QuantType.per_1x32,
-                     w1_scale=L.w1s, w2_scale=L.w2s, swiglu_limit=LIMIT, gate_mode=GATE[variant], dtype=dtypes.bf16,
-                     shared_w1=L.sw1, shared_w2=L.sw2, shared_w1_scale=L.ss1, shared_w2_scale=L.ss2,
+                     w1_scale=L.w1s, w2_scale=L.w2s, swiglu_limit=LIMIT, gate_mode=GATE[variant], quant_dtype_a=QA[variant],
+                     dtype=dtypes.bf16, shared_w1=L.sw1, shared_w2=L.sw2, shared_w1_scale=L.ss1, shared_w2_scale=L.ss2,
                      shared_expert_id=SID, **kw)
 
 
@@ -346,7 +344,7 @@ def test_p0_layout(variant):
     """Byte checks: 129-expert tensors viewed [:128] == the E=128 shuffle (what mono / a 128-expert consumer binds);
     a4 shared weight == ATOM's preshuffled dense-MLP weight (zero-copy candidate)."""
     raw, L = _layers(variant)
-    gu = variant == "a8"
+    gu = GATE[variant] == "interleave"
     w1, w2, w1s, w2s = L.routed128()
     r1 = moe_shuffle_weight(raw.w1[:E].view(FP4), experts_cnt=E, is_guinterleave=gu, gate_up=True)
     r2 = moe_shuffle_weight(raw.w2[:E].view(FP4), experts_cnt=E, is_guinterleave=gu, gate_up=False)
@@ -375,7 +373,7 @@ def test_fhmoe_m3(n, seed, variant):
         x[3, :32] = torch.tensor([4.0] + [1.0] * 31)
     w, ids, w5, ids5 = make_routing(n, seed)
     xq = xs = None
-    a8 = variant.startswith("a8")
+    a8 = variant == "a8"
     if a8:
         xq, xs = quant_x8(x)
     xin = xq if a8 else x
@@ -456,7 +454,7 @@ def main():
     parser = argparse.ArgumentParser(formatter_class=argparse.RawTextHelpFormatter, description=__doc__)
     parser.add_argument("-n", "--tokens", type=int, nargs="*", default=[1, 4, 16, 32, 64, 96, 128, 192, 256])
     parser.add_argument("--seeds", type=int, nargs="*", default=[0, 1])
-    parser.add_argument("-v", "--variant", nargs="*", default=["a8", "a4"], choices=["a8", "a4", "a8s"])
+    parser.add_argument("-v", "--variant", nargs="*", default=["a8", "a4"], choices=["a8", "a4"])
     args = parser.parse_args()
     df = pd.DataFrame([test_p0_layout(v) for v in args.variant])
     aiter.logger.info("FHMoE M3.1 layout byte checks (markdown):\n%s", df.to_markdown(index=False))
