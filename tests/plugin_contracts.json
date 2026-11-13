@@ -41,6 +41,20 @@
   "supersedes": [],
   "version": 1
  },
+ "mhc_post": {
+  "fingerprint": "2bc5023c8a38ba47",
+  "signature": "out:positional:torch.Tensor, x:positional:torch.Tensor, residual:positional:torch.Tensor, post_layer_mix:positional:torch.Tensor, comb_res_mix:positional:torch.Tensor, store_nt:positional:int=-1, res_preshuffle:positional:bool=False, -> None",
+  "source": "aiter/ops/mhc.py",
+  "supersedes": [],
+  "version": 1
+ },
+ "mhc_pre": {
+  "fingerprint": "6c084f59b1883f48",
+  "signature": "residual:positional:torch.Tensor, fn:positional:torch.Tensor, hc_scale:positional:torch.Tensor, hc_base:positional:torch.Tensor, rms_eps:positional:float=1e-06, hc_pre_eps:positional:float=1e-06, hc_sinkhorn_eps:positional:float=1e-06, hc_post_mult_value:positional:float=1.0, sinkhorn_repeat:positional:int=20, norm_weight:positional:torch.Tensor | None=None, norm_eps:positional:float=1e-06, large_m_splitk:positional:bool=False, w_preshuffle_bf16:positional:int=0, res_preshuffle:positional:bool=False, -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]",
+  "source": "aiter/ops/mhc.py",
+  "supersedes": [],
+  "version": 1
+ },
  "mla_decode_fwd_v4_nm": {
   "fingerprint": "da501459c91a356a",
   "signature": "q:positional, qrope:positional, kv_buffer:positional, kvrope:positional, output:positional, qo_indptr:positional, kv_indptr:positional, kv_page_indices:positional, max_seqlen_q:positional, sink:keyword-only, split_indptr:keyword-only=None, sm_scale:keyword-only=None, out_16_nosplit:keyword-only=0, num_kv_splits:keyword-only=None, logits:keyword-only=None, attn_lse:keyword-only=None, kv_last_page_lens:keyword-only=None",
@@ -87,6 +101,13 @@
   "fingerprint": "5256b167078255dd",
   "signature": "Q:positional:torch.Tensor, K:positional:torch.Tensor, V:positional:torch.Tensor, output:positional:torch.Tensor, max_qlen:positional:int, qo_indptr:positional:torch.Tensor, kv_indptr:positional:torch.Tensor, kv_indices:positional:torch.Tensor, context_lens:positional:torch.Tensor, work_indptr:positional:torch.Tensor, work_info:positional:torch.Tensor, reduce_indptr:positional:torch.Tensor, reduce_final_map:positional:torch.Tensor, reduce_partial_map:positional:torch.Tensor, K_QScale:positional:torch.Tensor | None=None, V_QScale:positional:torch.Tensor | None=None, softmax_scale:positional:float | None=None, mask:positional:int=0, quant_type:positional:QuantType=QuantType.per_Token, high_precision:positional:int=1, reduce_waves:positional:int=0, return_lse:positional:bool=True, -> tuple[torch.Tensor, torch.Tensor | None]",
   "source": "aiter/ops/attention.py",
+  "supersedes": [],
+  "version": 1
+ },
+ "per_group_quant": {
+  "fingerprint": "6c00cb7bcfc0e0b5",
+  "signature": "x:positional:Tensor, scale:positional:Tensor | None=None, quant_dtype:positional:torch.dtype=dtypes.i8, group_size:positional:int=128, transpose_scale:positional:bool=False, num_rows:positional:'torch.Tensor | None'=None, num_rows_factor:positional:int=1, scale_type:positional:torch.dtype=dtypes.fp32, scale_layout_m32k4:positional:bool=False, -> 'tuple[Tensor, Tensor]'",
+  "source": "aiter/ops/quant.py",
   "supersedes": [],
   "version": 1
  },
