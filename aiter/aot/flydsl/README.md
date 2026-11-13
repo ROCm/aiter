@@ -305,6 +305,9 @@ Set the same output switches before tuning, AOT and production:
 `AITER_MXFP4_INTERMEDIATE=1` selects packed FP4 scatter output for BM128,
 BN128/BN256 without bias. With both enabled, reduce uses FP8 and scatter uses
 FP4. Bias scatter retains BF16. Each switch is enabled only by the value `1`.
+`AITER_FLYDSL_STAGE2_FP8=1` also moves fp4/fp8 atomic tiles to reduce; adding
+`AITER_FLYDSL_STAGE2_FP8_KEEP_ATOMIC=1` keeps them atomic (BF16), so only tiles
+tuned for reduce use FP8 route output.
 
 ```bash
 # Standalone compilation of a separately tuned limit-5, both-switches CSV.

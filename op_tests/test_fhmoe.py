@@ -1768,6 +1768,17 @@ def test_flydsl_stage2_classification_covers_plain_and_fhmoe_wrappers(
     assert not fused_moe_module._stage2_runtime_uses_route_reduce(fp8_stage2, 1, 6144)
     monkeypatch.setenv("AITER_FLYDSL_STAGE2_FP8", "1")
     assert fused_moe_module._stage2_runtime_uses_route_reduce(fp8_stage2, 1, 6144)
+    monkeypatch.setenv("AITER_FLYDSL_STAGE2_FP8_KEEP_ATOMIC", "1")
+    assert not fused_moe_module._stage2_runtime_uses_route_reduce(fp8_stage2, 1, 6144)
+    fp8_reduce_stage2 = functools.partial(
+        fused_moe_module._flydsl_stage2_wrapper,
+        kernelName="flydsl_moe2_afp8_wfp8_bf16_t32x128x128_reduce",
+    )
+    assert fused_moe_module._stage2_runtime_uses_route_reduce(
+        fp8_reduce_stage2, 1, 6144
+    )
+    assert fused_moe_module._stage2_uses_fp8_route_output(fp8_reduce_stage2)
+    monkeypatch.delenv("AITER_FLYDSL_STAGE2_FP8_KEEP_ATOMIC")
     bf16_route_bytes = 50000 * 9 * 6144 * 2
     fp8_route_bytes = fused_moe_module._flydsl_route_output_nbytes(
         fp8_stage2,
