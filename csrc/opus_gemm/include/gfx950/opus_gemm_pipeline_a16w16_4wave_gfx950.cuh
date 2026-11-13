@@ -221,10 +221,12 @@ __device__ inline P uniform_ptr(P ptr) {
 #endif // __HIP_DEVICE_COMPILE__
 
 // ============================================================================
-// Kernel (definition visible on both passes; the host pass only needs the stub)
+// Kernel body. A __device__ function so that both the templated __global__ below and
+// the extern "C" entry points of the offline-built code objects (gen_co/build_co.py,
+// --arch gfx950) can wrap it; the entry carries the launch bounds.
 // ============================================================================
 template<typename Traits>
-__global__ __launch_bounds__(Traits::BLOCK_SIZE, Traits::WG_PER_CU) void gemm_a16w16_4wave_kernel(opus_gemm_a16w16_4wave_kargs_gfx950 kargs) {
+__device__ __forceinline__ void gemm_a16w16_4wave_body(const opus_gemm_a16w16_4wave_kargs_gfx950& kargs) {
 #ifdef __HIP_DEVICE_COMPILE__
 #if defined(__gfx950__)
     using namespace opus;
@@ -631,4 +633,10 @@ __global__ __launch_bounds__(Traits::BLOCK_SIZE, Traits::WG_PER_CU) void gemm_a1
     store_quadrant(v_c[1][1], number<1>{}, number<1>{});
 #endif // __gfx950__
 #endif // __HIP_DEVICE_COMPILE__
+}
+
+// Kernel (definition visible on both passes; the host pass only needs the stub)
+template<typename Traits>
+__global__ __launch_bounds__(Traits::BLOCK_SIZE, Traits::WG_PER_CU) void gemm_a16w16_4wave_kernel(opus_gemm_a16w16_4wave_kargs_gfx950 kargs) {
+    gemm_a16w16_4wave_body<Traits>(kargs);
 }
