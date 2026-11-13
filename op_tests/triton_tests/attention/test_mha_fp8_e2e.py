@@ -160,12 +160,14 @@ def generate_mha_varlen_fp8_inputs(
         torch.randn(
             (tq + pad, heads, D_NOPE + D_PE), dtype=torch.float32, device=device
         )
+        * 0.5
     )
     k, k_scale = quant_fp8(
         torch.randn((tk, heads, D_NOPE + D_PE), dtype=torch.float32, device=device)
+        * 0.5
     )
     v, v_scale = quant_fp8(
-        torch.randn((tk, heads, D_V), dtype=torch.float32, device=device)
+        torch.randn((tk, heads, D_V), dtype=torch.float32, device=device) * 0.5
     )
     q_scale, k_scale, v_scale = (s.reshape(1) for s in (q_scale, k_scale, v_scale))
     out = torch.full((tq + pad, heads, D_V), 7.0, dtype=torch.bfloat16, device=device)
