@@ -3584,7 +3584,7 @@ template <typename Op,
           bool NopeFirst,
           bool StrideDXEq1,
           bool StrideDYEq1,
-          int32_t VecPairs = 1,
+          int32_t VecPairs  = 1,
           bool DoubleBuffer = true,
           typename scalar_t,
           typename scalar_f_t,
@@ -3610,10 +3610,14 @@ __launch_bounds__(256, 8) __global__ void kn_entry_2c_sbhd_cached_indirect_inpla
     const int32_t stride_y_d,
     const int32_t size_s,
     const int32_t threads_per_sb,
-    const int32_t total_sb)
+    const int32_t total_sb,
+    const int32_t heads_per_tile,
+    const int32_t head_tiles)
 {
     const int32_t global_tid  = blockIdx.x * 256 + threadIdx.x;
-    const int32_t sb_idx      = global_tid / threads_per_sb;
+    const int32_t work_idx    = global_tid / threads_per_sb;
+    const int32_t head_tile   = work_idx % head_tiles;
+    const int32_t sb_idx      = work_idx / head_tiles;
     const int32_t d_chunk_idx = global_tid % threads_per_sb;
     if(sb_idx >= total_sb)
         return;
@@ -3625,8 +3629,12 @@ __launch_bounds__(256, 8) __global__ void kn_entry_2c_sbhd_cached_indirect_inpla
 
     if((pos >= 0) && (pos < max_position))
     {
-        const int32_t offset_x = sid * stride_x_s + bid * stride_x_b;
-        const int32_t offset_y = sid * stride_y_s + bid * stride_y_b;
+        const int32_t head_start = head_tile * heads_per_tile;
+        const int32_t tile_h_x   = min(heads_per_tile, max(0, size_h_x - head_start));
+        const int32_t tile_h_y   = min(heads_per_tile, max(0, size_h_y - head_start));
+        const int32_t offset_x   = sid * stride_x_s + bid * stride_x_b + head_start * stride_x_h;
+        const int32_t offset_y   = sid * stride_y_s + bid * stride_y_b +
+                                   (head_start < size_h_y ? head_start * stride_y_h : 0);
         const int64_t offset_f = pos * size_f;
 
         Op::template apply_2c<RotateStyle,
@@ -3638,31 +3646,31 @@ __launch_bounds__(256, 8) __global__ void kn_entry_2c_sbhd_cached_indirect_inpla
                               StrideDXEq1,
                               StrideDYEq1,
                               VecPairs,
-                          DoubleBuffer>(p_inout_x,
-                                        p_inout_y,
-                                        p_inout_x,
-                                        p_inout_y,
-                                        (int32_t)offset_x,
-                                        (int32_t)offset_y,
-                                        (int32_t)offset_x,
-                                        (int32_t)offset_y,
-                                        p_cos,
-                                        p_sin,
-                                        (int32_t)offset_f,
-                                        size_h_x,
-                                        size_h_y,
-                                        size_d,
-                                        size_f,
-                                        stride_x_h,
-                                        stride_x_d,
-                                        stride_y_h,
-                                        stride_y_d,
-                                        stride_x_h,
-                                        stride_x_d,
-                                        stride_y_h,
-                                        stride_y_d,
-                                        d_chunk_idx,
-                                        threads_per_sb);
+                              DoubleBuffer>(p_inout_x,
+                                            p_inout_y,
+                                            p_inout_x,
+                                            p_inout_y,
+                                            (int32_t)offset_x,
+                                            (int32_t)offset_y,
+                                            (int32_t)offset_x,
+                                            (int32_t)offset_y,
+                                            p_cos,
+                                            p_sin,
+                                            (int32_t)offset_f,
+                                            tile_h_x,
+                                            tile_h_y,
+                                            size_d,
+                                            size_f,
+                                            stride_x_h,
+                                            stride_x_d,
+                                            stride_y_h,
+                                            stride_y_d,
+                                            stride_x_h,
+                                            stride_x_d,
+                                            stride_y_h,
+                                            stride_y_d,
+                                            d_chunk_idx,
+                                            threads_per_sb);
     }
 }
 
@@ -4519,15 +4527,9 @@ std::tuple<dim3, dim3, int32_t, int32_t> get_grid_config(const int32_t size_s_h,
     // VP selection depends on rotate style (benchmarked on gfx942):
     //   NEOX: VP=2 always wins (8-15% over VP=1, VP=4 always worst)
     //   GPTJ: VP=4 wins at saturated workloads, VP=1 is catastrophically slow (2-3x)
-    // gfx1250 uses wave32, where GPTJ VP=2 provides more memory-level parallelism.
     // VP>1 requires contiguous d-dimension (stride_d==1) for vectorized buffer ops.
     constexpr int32_t preferred_vp = (RotateStyle == 1) ? 4 : 2; // GPTJ=1 -> VP=4, NEOX=0 -> VP=2
     int32_t vec_pairs              = stride_d_eq_1 ? preferred_vp : 1;
-    if constexpr(RotateStyle == 1)
-    {
-        if(warp_size == 32)
-            vec_pairs = min(vec_pairs, 2);
-    }
 
     while(vec_pairs > 1 && (size_half_r % vec_pairs != 0))
         vec_pairs >>= 1;
@@ -5529,6 +5531,12 @@ void dispatch_2c_sbhd_cached_indirect(scalar_t* __restrict__ p_output_x,
             size_s, 1, size_b, size_f, all_stride_d_eq_1);
     const int32_t total_sb = size_s * size_b;
     const bool double_buffer = (min(size_h_x, size_h_y) <= 32);
+    const int32_t max_heads  = max(size_h_x, size_h_y);
+    const int32_t heads_per_tile =
+        (get_warp_size_func() == 32 && max_heads >= 128) ? 64 : max_heads;
+    const int32_t head_tiles    = (max_heads + heads_per_tile - 1) / heads_per_tile;
+    const int32_t tiled_threads = total_sb * head_tiles * threads_per_sb;
+    const dim3 tiled_grid((tiled_threads + block.x - 1) / block.x);
 
     LAUNCH_KERNEL_VEC_PAIRS(
         vec_pairs,
@@ -5556,27 +5564,29 @@ void dispatch_2c_sbhd_cached_indirect(scalar_t* __restrict__ p_output_x,
                                                          Stride1Eq1,
                                                          VP,
                                                          DB>
-                <<<grid, block, 0, stream>>>(p_output_x,
-                                             p_output_y,
-                                             p_cos,
-                                             p_sin,
-                                             p_indirect_buffer,
-                                             max_position,
-                                             size_h_x,
-                                             size_h_y,
-                                             size_d,
-                                             size_f,
-                                             stride_ix_s,
-                                             stride_ix_b,
-                                             stride_ix_h,
-                                             stride_ix_d,
-                                             stride_iy_s,
-                                             stride_iy_b,
-                                             stride_iy_h,
-                                             stride_iy_d,
-                                             size_s,
-                                             threads_per_sb,
-                                             total_sb);
+                    <<<tiled_grid, block, 0, stream>>>(p_output_x,
+                                                       p_output_y,
+                                                       p_cos,
+                                                       p_sin,
+                                                       p_indirect_buffer,
+                                                       max_position,
+                                                       size_h_x,
+                                                       size_h_y,
+                                                       size_d,
+                                                       size_f,
+                                                       stride_ix_s,
+                                                       stride_ix_b,
+                                                       stride_ix_h,
+                                                       stride_ix_d,
+                                                       stride_iy_s,
+                                                       stride_iy_b,
+                                                       stride_iy_h,
+                                                       stride_iy_d,
+                                                       size_s,
+                                                       threads_per_sb,
+                                                       total_sb,
+                                                       heads_per_tile,
+                                                       head_tiles);
             }
             else
             {
@@ -5592,27 +5602,29 @@ void dispatch_2c_sbhd_cached_indirect(scalar_t* __restrict__ p_output_x,
                                                              Stride1Eq1,
                                                              VP,
                                                              DB>
-                    <<<grid, block, 0, stream>>>(p_output_x,
-                                                 p_output_y,
-                                                 p_cos,
-                                                 p_sin,
-                                                 p_indirect_buffer,
-                                                 max_position,
-                                                 size_h_x,
-                                                 size_h_y,
-                                                 size_d,
-                                                 size_f,
-                                                 stride_ix_s,
-                                                 stride_ix_b,
-                                                 stride_ix_h,
-                                                 stride_ix_d,
-                                                 stride_iy_s,
-                                                 stride_iy_b,
-                                                 stride_iy_h,
-                                                 stride_iy_d,
-                                                 size_s,
-                                                 threads_per_sb,
-                                                 total_sb););
+                    <<<tiled_grid, block, 0, stream>>>(p_output_x,
+                                                       p_output_y,
+                                                       p_cos,
+                                                       p_sin,
+                                                       p_indirect_buffer,
+                                                       max_position,
+                                                       size_h_x,
+                                                       size_h_y,
+                                                       size_d,
+                                                       size_f,
+                                                       stride_ix_s,
+                                                       stride_ix_b,
+                                                       stride_ix_h,
+                                                       stride_ix_d,
+                                                       stride_iy_s,
+                                                       stride_iy_b,
+                                                       stride_iy_h,
+                                                       stride_iy_d,
+                                                       size_s,
+                                                       threads_per_sb,
+                                                       total_sb,
+                                                       heads_per_tile,
+                                                       head_tiles););
             }
         } else {
             if constexpr(AllStrideDEq1)

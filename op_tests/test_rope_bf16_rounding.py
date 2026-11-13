@@ -47,8 +47,9 @@ def _rope_reference(x, cos, sin, positions, neox):
 
 
 @pytest.mark.parametrize("neox", [False, True])
-def test_cached_positions_2c_bf16_rounding(neox):
-    tokens, query_heads, head_size = 13, 128, 64
+@pytest.mark.parametrize("query_heads", [128, 256])
+def test_cached_positions_2c_bf16_rounding(neox, query_heads):
+    tokens, head_size = 13, 64
     query = _deterministic_bf16((1, tokens, query_heads, head_size), 509, 37.0)
     key = _deterministic_bf16((1, tokens, 1, head_size), 383, 29.0)
     positions = torch.tensor(
