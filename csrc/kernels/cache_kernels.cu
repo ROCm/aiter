@@ -5689,16 +5689,30 @@ void fused_qk_concat_and_cache_mla(
     bool is_nope_first,
     bool compute_all_q)
 {
+  AITER_CHECK(slot_mapping.dim() == 1, "slot_mapping must be one-dimensional");
   const int num_tokens = slot_mapping.size(0);
+  AITER_CHECK(q_nope.dim() == 3 && q_pe.dim() == 3 && q_out.dim() == 3,
+              "q_nope, q_pe and q_out must be three-dimensional");
+  AITER_CHECK((kv_c.dim() == 2 || kv_c.dim() == 3) && kv_c.dim() == k_pe.dim(),
+              "kv_c and k_pe must both be two- or three-dimensional");
+  AITER_CHECK(kv_cache.dim() == 3, "kv_cache must be three-dimensional");
+
   const int kv_lora_rank = kv_c.size(-1);
   const int pe_dim = k_pe.size(-1);
   const int block_size = kv_cache.size(1);
   const int num_heads = q_nope.size(1);
   const int qk_lora_rank = q_nope.size(-1);
+  const auto in_dt = kv_c.dtype();
 
   AITER_CHECK(q_nope.dim() == q_pe.dim());
   AITER_CHECK(q_nope.size(1) == q_pe.size(1));
   AITER_CHECK(q_out.size(2) == qk_lora_rank + pe_dim);
+  AITER_CHECK(q_nope.size(0) >= num_tokens && q_pe.size(0) >= num_tokens &&
+                  kv_c.size(0) >= num_tokens && k_pe.size(0) >= num_tokens &&
+                  q_out.size(0) >= num_tokens,
+              "Q/K inputs and q_out must have at least slot_mapping.size(0) rows");
+  AITER_CHECK(q_out.size(1) >= num_heads,
+              "q_out must have at least q_nope.size(1) heads");
   AITER_CHECK(kv_lora_rank == qk_lora_rank,
               "kv_lora_rank and qk_lora_rank must be the same");
   AITER_CHECK(kv_c.stride(-1) == 1, "kv_c stride(-1) must be equal to 1");
@@ -5724,12 +5738,15 @@ void fused_qk_concat_and_cache_mla(
                 "q_out data type is not supported");
   AITER_CHECK(kv_cache_dtype != "auto" || q_out_type != "fp8",
               "kv cache data type is auto and q_out data type is fp8, which is not supported");
+  AITER_CHECK(kv_cache_dtype != "auto" || kv_cache.dtype() == in_dt,
+              "non-fp8 kv_cache dtype must match the input dtype");
+  AITER_CHECK(q_out_type != "auto" || q_out.dtype() == in_dt,
+              "non-fp8 q_out dtype must match the input dtype");
 
   const bool one_kv_head =
       (kv_c.dim() == 2 && k_pe.dim() == 2) ||
       (kv_c.dim() == 3 && k_pe.dim() == 3 && kv_c.size(1) == 1 &&
        k_pe.size(1) == 1);
-  const auto in_dt = kv_c.dtype();
   auto al16 = [](const aiter_tensor_t& t) {
     return reinterpret_cast<uintptr_t>(t.data_ptr()) % 16 == 0;
   };
@@ -5750,7 +5767,8 @@ void fused_qk_concat_and_cache_mla(
       (in_dt == AITER_DTYPE_bf16 || in_dt == AITER_DTYPE_fp16) &&
       q_nope.dtype() == in_dt && q_pe.dtype() == in_dt &&
       k_pe.dtype() == in_dt && q_nope.stride(-1) == 1 &&
-      q_pe.stride(-1) == 1 && q_out.stride(-1) == 1 && strides_ok &&
+      q_pe.stride(-1) == 1 && q_out.stride(-1) == 1 &&
+      kv_cache.stride(-1) == 1 && strides_ok &&
       al16(q_nope) && al16(q_pe) && al16(kv_c) && al16(k_pe) &&
       al16(q_out) && al16(kv_cache) && num_tokens > 0 &&
       static_cast<int64_t>(num_tokens) * num_heads < (int64_t(1) << 31) &&
