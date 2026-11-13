@@ -37,10 +37,6 @@ namespace opus_a16w16_4wave {
 
 using opus::operator""_I;
 
-// Layouts per direction (NT / NN / TT / TN) and operand: g = global -> LDS copy, s = LDS chunk of the copy,
-// r = LDS -> registers. A K-contiguous operand ([rows, K]) is read with ds_read_b128 (16-byte slot XOR in
-// the layouts); an M/N-contiguous one ([K, rows]) with ds_read_b64_tr_b16 (32-byte window swizzle, mn_swz).
-
 // 32-byte window swizzle: LDS 16-byte slot t of k row k holds global window (t / 2) ^ mn_swz<E>(k); the 8
 // rows of one TR16 pass (k = 8 g + 4 h + b) then land on 8 distinct 32-byte slots of the 256-byte bank
 // period. mn_swz<E> only uses k % (64 / E).
@@ -59,24 +55,40 @@ __device__ inline int mn_r_xor(int lane_id, int wave, int e, int h) {
     return ((window ^ mn_swz<E>(k)) - window) * 32;
 }
 
+// Which operand a builder serves: A uses E_M / HALF_B_M and reads with wave_m, B uses E_N / HALF_B_N and
+// reads with wave_n (all from the traits, so they follow the tile).
+enum { OPERAND_A = 0, OPERAND_B = 1 };
+
+// Each operand takes one of two paths, picked by its own storage:
+//   _nt: K-contiguous   (A [M, K], B [N, K]): ds_read_b128, 16-byte slot XOR in the layouts
+//   _tn: M/N-contiguous (A [K, M], B [K, N]): ds_read_b64_tr_b16, 32-byte window swizzle (mn_swz)
+//          A      B
+//   NT   _nt    _nt
+//   NN   _nt    _tn
+//   TT   _tn    _nt
+//   TN   _tn    _tn
+// g = global -> LDS copy, s = LDS chunk of the copy, r = LDS -> registers.
+
 // ============================================================================
-// NT: A [M, K], B [N, K]. Both operands K-contiguous and symmetric: one set of builders, A with
-// (HALF_B_M / E_M, wave_m, wave_n), B with (HALF_B_N / E_N, wave_n, wave_m).
+// K-contiguous operand (_nt): [rows, K], 128 bytes per row and K tile
 // ============================================================================
 // global -> LDS: one wave issue copies 8 rows x 128 bytes; lane l writes LDS slot l % 8 of row l / 8 and fetches
-// K slot (l % 8) ^ x ^ (wave_m << 2) of it (x = row in the chunk).
-template<class T, int HALF_ROWS>
+// K slot (l % 8) ^ x ^ (wave_x << 2) of it (x = row in the chunk). wave_x / wave_y = wave_m / wave_n for A,
+// wave_n / wave_m for B.
+template<class T, int OP>
 __device__ inline auto make_layout_g_nt(int lane_id, int wave_id_m, int wave_id_n, int stride) {
+    constexpr int E = OP == OPERAND_A ? T::E_M : T::E_N;               // issues per wave
+    const int wave_x = OP == OPERAND_A ? wave_id_m : wave_id_n;
+    const int wave_y = OP == OPERAND_A ? wave_id_n : wave_id_m;
     constexpr int threads_k = T::B_K_BYTES / T::VEC_A;                 // 8
-    constexpr int threads_m_per_block = T::BLOCK_SIZE / threads_k;     // 32
     constexpr int threads_m_per_wave = T::WARP_SIZE / threads_k;       // 8
-    static_assert(threads_k == T::B_K / T::VEC_A_ELEMS);
+    static_assert(threads_k == T::B_K / T::VEC_A_ELEMS && T::BLOCK_SIZE / threads_k == 32);
 
     constexpr auto shape = opus::make_tuple(
-        opus::number<HALF_ROWS / threads_m_per_block>{},               // y issue
-        opus::number<T::T_N>{},                                        // p wave_n
+        opus::number<E>{},                                             // y issue
+        opus::number<T::T_N>{},                                        // p wave_y
         opus::number<threads_m_per_wave>{},                            // p lane / 8
-        opus::number<T::T_M>{},                                        // p wave_m
+        opus::number<T::T_M>{},                                        // p wave_x
         opus::number<threads_k>{},                                     // p lane % 8
         opus::number<T::VEC_A>{});                                     // y 16 bytes
     constexpr auto dim = opus::make_tuple(
@@ -85,18 +97,21 @@ __device__ inline auto make_layout_g_nt(int lane_id, int wave_id_m, int wave_id_
     return opus::make_layout<T::VEC_A>(
         shape,
         opus::unfold_x_stride(dim, shape, opus::tuple{stride, 1_I}),
-        opus::unfold_p_coord(dim, opus::tuple{wave_id_n, lane_id / threads_k, wave_id_m,
-                             (lane_id % threads_k) ^ (((lane_id / threads_k) ^ (wave_id_m << 2)) & 7)}));
+        opus::unfold_p_coord(dim, opus::tuple{wave_y, lane_id / threads_k, wave_x,
+                             (lane_id % threads_k) ^ (((lane_id / threads_k) ^ (wave_x << 2)) & 7)}));
 }
-// LDS: chunk (wave_n * 2 + wave_m) * E + issue.
-template<class T, int HALF_ROWS>
+
+// LDS: chunk (wave_y * 2 + wave_x) * E + issue (a wave's E issues are adjacent).
+template<class T, int OP>
 __device__ inline auto make_layout_s_nt(int wave_id_m, int wave_id_n) {
+    constexpr int E = OP == OPERAND_A ? T::E_M : T::E_N;
+    const int wave_x = OP == OPERAND_A ? wave_id_m : wave_id_n;
+    const int wave_y = OP == OPERAND_A ? wave_id_n : wave_id_m;
     static_assert(T::smem_sub_a == T::WARP_SIZE / (T::B_K_BYTES / T::VEC_A), "one wave issue = one chunk");
-    constexpr int E = HALF_ROWS / T::smem_sub_a / T::NUM_WAVES;
     constexpr auto shape = opus::make_tuple(
         opus::number<E>{},                                             // y issue
-        opus::number<T::T_N>{},                                        // p wave_n
-        opus::number<T::T_M>{},                                        // p wave_m
+        opus::number<T::T_N>{},                                        // p wave_y
+        opus::number<T::T_M>{},                                        // p wave_x
         opus::number<T::VEC_A>{});                                     // y 16 bytes
     constexpr auto dim = opus::make_tuple(
         opus::make_tuple(opus::y_dim{}, opus::p_dim{}, opus::p_dim{}),
@@ -105,11 +120,15 @@ __device__ inline auto make_layout_s_nt(int wave_id_m, int wave_id_n) {
         shape,
         opus::make_tuple(opus::number<T::smem_linear_wave_a>{}, opus::number<2 * E * T::smem_linear_wave_a>{},
                          opus::number<E * T::smem_linear_wave_a>{}, 1_I),
-        opus::unfold_p_coord(dim, opus::tuple{wave_id_n, wave_id_m}));
+        opus::unfold_p_coord(dim, opus::tuple{wave_y, wave_x}));
 }
-// LDS -> registers: 2 x ds_read_b128 per operand (chunk 1 = c1_delta away).
-template<class T, int E>
-__device__ inline auto make_layout_r_nt(int lane_id, int wave_id) {
+
+// LDS -> registers: lane (row r = lane % 16, group g = lane / 16) reads 2 chunks of 16 bytes at bytes 64 c + 16 g
+// of its 128-byte row (K-step c of the two 16x16x32 MFMAs); chunk c = 1 is c1_delta away (the swizzle flips bit 2).
+template<class T, int OP>
+__device__ inline auto make_layout_r_nt(int lane_id, int wave_id_m, int wave_id_n) {
+    constexpr int E = OP == OPERAND_A ? T::E_M : T::E_N;               // operands (16-row repeats) per wave
+    const int wave = OP == OPERAND_A ? wave_id_m : wave_id_n;
     static_assert(T::smem_sub_a * T::T_M == T::W_M && T::T_M == 2);
     static_assert(T::WARP_SIZE / T::W_M * T::E_C * T::VEC_A == T::B_K_BYTES);
     constexpr auto shape = opus::make_tuple(
@@ -129,263 +148,18 @@ __device__ inline auto make_layout_r_nt(int lane_id, int wave_id) {
         opus::make_tuple(opus::number<T::smem_linear_wave_a>{}, opus::number<2 * E * T::smem_linear_wave_a>{},
                          opus::number<E * T::smem_linear_wave_a>{}, opus::number<T::B_K_BYTES>{},
                          opus::number<T::B_K_BYTES / T::E_C>{}, opus::number<T::VEC_A>{}, 1_I),
-        opus::unfold_p_coord(dim, opus::tuple{wave_id, lane_r % T::T_M, lane_r / T::T_M, 0_I,
+        opus::unfold_p_coord(dim, opus::tuple{wave, lane_r % T::T_M, lane_r / T::T_M, 0_I,
                              (lane_id / T::W_M) ^ (((lane_r / T::T_M) ^ ((lane_r % T::T_M) << 2)) & 7)}));
 }
 
 // ============================================================================
-// NN: A [M, K], B [K, N]
+// M/N-contiguous operand (_tn): [K, rows], half tile = 64 k rows x W = 64 E bytes, LDS row k at k W
 // ============================================================================
-// A [M, K] global -> LDS: one wave issue copies 8 rows x 128 bytes; lane l writes LDS slot l % 8 of row l / 8
-// and fetches K slot (l % 8) ^ x ^ (wave_m << 2) of it (x = row in the chunk).
-template<class T>
-__device__ inline auto make_layout_ga_nn(int lane_id, int wave_id_m, int wave_id_n, int stride_a) {
-    constexpr int threads_k = T::B_K_BYTES / T::VEC_A;                 // 8
-    constexpr int threads_m_per_block = T::BLOCK_SIZE / threads_k;     // 32
-    constexpr int threads_m_per_wave = T::WARP_SIZE / threads_k;       // 8
-    static_assert(threads_k == T::B_K / T::VEC_A_ELEMS);
-
-    constexpr auto shape = opus::make_tuple(
-        opus::number<T::HALF_B_M / threads_m_per_block>{},               // y issue
-        opus::number<T::T_N>{},                                        // p wave_n
-        opus::number<threads_m_per_wave>{},                            // p lane / 8
-        opus::number<T::T_M>{},                                        // p wave_m
-        opus::number<threads_k>{},                                     // p lane % 8
-        opus::number<T::VEC_A>{});                                     // y 16 bytes
-    constexpr auto dim = opus::make_tuple(
-        opus::make_tuple(opus::y_dim{}, opus::p_dim{}, opus::p_dim{}, opus::p_dim{}),
-        opus::make_tuple(opus::p_dim{}, opus::y_dim{}));
-    return opus::make_layout<T::VEC_A>(
-        shape,
-        opus::unfold_x_stride(dim, shape, opus::tuple{stride_a, 1_I}),
-        opus::unfold_p_coord(dim, opus::tuple{wave_id_n, lane_id / threads_k, wave_id_m,
-                             (lane_id % threads_k) ^ (((lane_id / threads_k) ^ (wave_id_m << 2)) & 7)}));
-}
-// A [M, K] LDS: chunk (wave_n * 2 + wave_m) * E_M + issue.
-template<class T>
-__device__ inline auto make_layout_sa_nn(int wave_id_m, int wave_id_n) {
-    static_assert(T::smem_sub_a == T::WARP_SIZE / (T::B_K_BYTES / T::VEC_A), "one wave issue = one chunk");
-    constexpr int E = T::HALF_B_M / T::smem_sub_a / T::NUM_WAVES;
-    constexpr auto shape = opus::make_tuple(
-        opus::number<E>{},                                             // y issue
-        opus::number<T::T_N>{},                                        // p wave_n
-        opus::number<T::T_M>{},                                        // p wave_m
-        opus::number<T::VEC_A>{});                                     // y 16 bytes
-    constexpr auto dim = opus::make_tuple(
-        opus::make_tuple(opus::y_dim{}, opus::p_dim{}, opus::p_dim{}),
-        opus::make_tuple(opus::y_dim{}));
-    return opus::make_layout(
-        shape,
-        opus::make_tuple(opus::number<T::smem_linear_wave_a>{}, opus::number<2 * E * T::smem_linear_wave_a>{},
-                         opus::number<E * T::smem_linear_wave_a>{}, 1_I),
-        opus::unfold_p_coord(dim, opus::tuple{wave_id_n, wave_id_m}));
-}
-// A [M, K] LDS -> registers: 2 x ds_read_b128 per operand (chunk 1 = c1_delta away).
-template<class T>
-__device__ inline auto make_layout_ra_nn(int lane_id, int wave_id_m) {
-    static_assert(T::smem_sub_a * T::T_M == T::W_M && T::T_M == 2);
-    static_assert(T::WARP_SIZE / T::W_M * T::E_C * T::VEC_A == T::B_K_BYTES);
-    constexpr auto shape = opus::make_tuple(
-        opus::number<T::E_M>{},                                             // y repeat
-        opus::number<T::T_M>{},                                        // p wave
-        opus::number<T::T_M>{},                                        // p r % 2
-        opus::number<T::W_M / T::T_M>{},                               // p r / 2
-        opus::number<T::E_C>{},                                        // p chunk, fixed to 0
-        opus::number<T::WARP_SIZE / T::W_M>{},                         // p g
-        opus::number<T::VEC_A>{});                                     // y 16 bytes
-    constexpr auto dim = opus::make_tuple(
-        opus::make_tuple(opus::y_dim{}, opus::p_dim{}, opus::p_dim{}),
-        opus::make_tuple(opus::p_dim{}, opus::p_dim{}, opus::p_dim{}, opus::y_dim{}));
-    const int lane_r = lane_id % T::W_M;
-    return opus::make_layout<T::VEC_A>(
-        shape,
-        opus::make_tuple(opus::number<T::smem_linear_wave_a>{}, opus::number<2 * T::E_M * T::smem_linear_wave_a>{},
-                         opus::number<T::E_M * T::smem_linear_wave_a>{}, opus::number<T::B_K_BYTES>{},
-                         opus::number<T::B_K_BYTES / T::E_C>{}, opus::number<T::VEC_A>{}, 1_I),
-        opus::unfold_p_coord(dim, opus::tuple{wave_id_m, lane_r % T::T_M, lane_r / T::T_M, 0_I,
-                             (lane_id / T::W_M) ^ (((lane_r / T::T_M) ^ ((lane_r % T::T_M) << 2)) & 7)}));
-}
-// B [K, N] global -> LDS: issue i of wave w = 2 wave_m + wave_n copies k rows (64 / E_N) i + (16 / E_N) w + kr;
-// the window coordinate carries the swizzle.
-template<class T>
-__device__ inline auto make_layout_gb_nn(int lane_id, int wave_id_m, int wave_id_n, int stride_b) {
-    constexpr int RPI = 16 / T::E_N;                                        // k rows per issue
-    const int kr = lane_id / (4 * T::E_N), t = lane_id % (4 * T::E_N);
-    const int window = (t >> 1) ^ mn_swz<T::E_N>(RPI * (wave_id_m * 2 + wave_id_n) + kr);
-    constexpr auto shape = opus::make_tuple(
-        opus::number<T::E_N>{},                                             // y issue
-        opus::number<T::T_M>{},                                        // p wave_m
-        opus::number<T::T_N>{},                                        // p wave_n
-        opus::number<RPI>{},                                           // p k row of the issue
-        opus::number<2 * T::E_N>{},                                         // p 32-byte window (swizzled)
-        opus::number<2>{},                                             // p 16-byte half
-        opus::number<16>{});                                           // y 16 bytes
-    constexpr auto dim = opus::make_tuple(opus::make_tuple(
-        opus::y_dim{}, opus::p_dim{}, opus::p_dim{}, opus::p_dim{}, opus::p_dim{}, opus::p_dim{}, opus::y_dim{}));
-    return opus::make_layout<16>(
-        shape,
-        opus::make_tuple(4 * RPI * stride_b, 2 * RPI * stride_b, RPI * stride_b, stride_b, 32_I, 16_I, 1_I),
-        opus::unfold_p_coord(dim, opus::tuple{wave_id_m, wave_id_n, kr, window, t & 1}));
-}
-// B [K, N] LDS: issue i of wave w -> 1 KB chunk 4 i + w.
-template<class T>
-__device__ inline auto make_layout_sb_nn(int wave_id_m, int wave_id_n) {
-    constexpr auto shape = opus::make_tuple(
-        opus::number<T::E_N>{}, opus::number<T::T_M>{}, opus::number<T::T_N>{}, opus::number<16>{});
-    constexpr auto dim = opus::make_tuple(opus::make_tuple(opus::y_dim{}, opus::p_dim{}, opus::p_dim{}, opus::y_dim{}));
-    return opus::make_layout(
-        shape,
-        opus::make_tuple(opus::number<4 * 1024>{}, opus::number<2 * 1024>{}, opus::number<1024>{}, 1_I),
-        opus::unfold_p_coord(dim, opus::tuple{wave_id_m, wave_id_n}));
-}
-// B [K, N] LDS -> registers (ds_read_b64_tr_b16), linear; the swizzle is added by mn_r_xor.
-template<class T>
-__device__ inline auto make_layout_rb_nn(int lane_id, int wave_id_n) {
-    constexpr int W = 64 * T::E_N;
-    constexpr auto shape = opus::make_tuple(
-        opus::number<T::E_N>{}, opus::number<2>{}, opus::number<2>{},       // y operand e, K-step s, pass h
-        opus::number<2>{},                                             // p wave_id_n (window 2 e + wave_id_n)
-        opus::number<4>{}, opus::number<4>{}, opus::number<4>{},       // p g, b, lane % 4
-        opus::number<8>{});                                            // y 8 bytes
-    constexpr auto dim = opus::make_tuple(opus::make_tuple(
-        opus::y_dim{}, opus::y_dim{}, opus::y_dim{}, opus::p_dim{}, opus::p_dim{}, opus::p_dim{}, opus::p_dim{}, opus::y_dim{}));
-    return opus::make_layout<8>(
-        shape,
-        opus::make_tuple(opus::number<64>{}, opus::number<32 * W>{}, opus::number<4 * W>{}, opus::number<32>{},
-                         opus::number<8 * W>{}, opus::number<W>{}, opus::number<8>{}, 1_I),
-        opus::unfold_p_coord(dim, opus::tuple{wave_id_n, lane_id / 16, (lane_id % 16) / 4, lane_id % 4}));
-}
-
-// ============================================================================
-// TT: A [K, M], B [N, K]
-// ============================================================================
-// A [K, M] global -> LDS: issue i of wave w = 2 wave_m + wave_n copies k rows (64 / E_M) i + (16 / E_M) w + kr;
-// the window coordinate carries the swizzle.
-template<class T>
-__device__ inline auto make_layout_ga_tt(int lane_id, int wave_id_m, int wave_id_n, int stride_a) {
-    constexpr int RPI = 16 / T::E_M;                                        // k rows per issue
-    const int kr = lane_id / (4 * T::E_M), t = lane_id % (4 * T::E_M);
-    const int window = (t >> 1) ^ mn_swz<T::E_M>(RPI * (wave_id_m * 2 + wave_id_n) + kr);
-    constexpr auto shape = opus::make_tuple(
-        opus::number<T::E_M>{},                                             // y issue
-        opus::number<T::T_M>{},                                        // p wave_m
-        opus::number<T::T_N>{},                                        // p wave_n
-        opus::number<RPI>{},                                           // p k row of the issue
-        opus::number<2 * T::E_M>{},                                         // p 32-byte window (swizzled)
-        opus::number<2>{},                                             // p 16-byte half
-        opus::number<16>{});                                           // y 16 bytes
-    constexpr auto dim = opus::make_tuple(opus::make_tuple(
-        opus::y_dim{}, opus::p_dim{}, opus::p_dim{}, opus::p_dim{}, opus::p_dim{}, opus::p_dim{}, opus::y_dim{}));
-    return opus::make_layout<16>(
-        shape,
-        opus::make_tuple(4 * RPI * stride_a, 2 * RPI * stride_a, RPI * stride_a, stride_a, 32_I, 16_I, 1_I),
-        opus::unfold_p_coord(dim, opus::tuple{wave_id_m, wave_id_n, kr, window, t & 1}));
-}
-// A [K, M] LDS: issue i of wave w -> 1 KB chunk 4 i + w.
-template<class T>
-__device__ inline auto make_layout_sa_tt(int wave_id_m, int wave_id_n) {
-    constexpr auto shape = opus::make_tuple(
-        opus::number<T::E_M>{}, opus::number<T::T_M>{}, opus::number<T::T_N>{}, opus::number<16>{});
-    constexpr auto dim = opus::make_tuple(opus::make_tuple(opus::y_dim{}, opus::p_dim{}, opus::p_dim{}, opus::y_dim{}));
-    return opus::make_layout(
-        shape,
-        opus::make_tuple(opus::number<4 * 1024>{}, opus::number<2 * 1024>{}, opus::number<1024>{}, 1_I),
-        opus::unfold_p_coord(dim, opus::tuple{wave_id_m, wave_id_n}));
-}
-// A [K, M] LDS -> registers (ds_read_b64_tr_b16), linear; the swizzle is added by mn_r_xor.
-template<class T>
-__device__ inline auto make_layout_ra_tt(int lane_id, int wave_id_m) {
-    constexpr int W = 64 * T::E_M;
-    constexpr auto shape = opus::make_tuple(
-        opus::number<T::E_M>{}, opus::number<2>{}, opus::number<2>{},       // y operand e, K-step s, pass h
-        opus::number<2>{},                                             // p wave_id_m (window 2 e + wave_id_m)
-        opus::number<4>{}, opus::number<4>{}, opus::number<4>{},       // p g, b, lane % 4
-        opus::number<8>{});                                            // y 8 bytes
-    constexpr auto dim = opus::make_tuple(opus::make_tuple(
-        opus::y_dim{}, opus::y_dim{}, opus::y_dim{}, opus::p_dim{}, opus::p_dim{}, opus::p_dim{}, opus::p_dim{}, opus::y_dim{}));
-    return opus::make_layout<8>(
-        shape,
-        opus::make_tuple(opus::number<64>{}, opus::number<32 * W>{}, opus::number<4 * W>{}, opus::number<32>{},
-                         opus::number<8 * W>{}, opus::number<W>{}, opus::number<8>{}, 1_I),
-        opus::unfold_p_coord(dim, opus::tuple{wave_id_m, lane_id / 16, (lane_id % 16) / 4, lane_id % 4}));
-}
-// B [N, K] global -> LDS: A's [M, K] copy with the wave roles swapped.
-template<class T>
-__device__ inline auto make_layout_gb_tt(int lane_id, int wave_id_m, int wave_id_n, int stride_b) {
-    constexpr int threads_k = T::B_K_BYTES / T::VEC_A;                 // 8
-    constexpr int threads_m_per_block = T::BLOCK_SIZE / threads_k;     // 32
-    constexpr int threads_m_per_wave = T::WARP_SIZE / threads_k;       // 8
-    static_assert(threads_k == T::B_K / T::VEC_A_ELEMS);
-
-    constexpr auto shape = opus::make_tuple(
-        opus::number<T::HALF_B_N / threads_m_per_block>{},               // y issue
-        opus::number<T::T_N>{},                                        // p wave_n
-        opus::number<threads_m_per_wave>{},                            // p lane / 8
-        opus::number<T::T_M>{},                                        // p wave_m
-        opus::number<threads_k>{},                                     // p lane % 8
-        opus::number<T::VEC_A>{});                                     // y 16 bytes
-    constexpr auto dim = opus::make_tuple(
-        opus::make_tuple(opus::y_dim{}, opus::p_dim{}, opus::p_dim{}, opus::p_dim{}),
-        opus::make_tuple(opus::p_dim{}, opus::y_dim{}));
-    return opus::make_layout<T::VEC_A>(
-        shape,
-        opus::unfold_x_stride(dim, shape, opus::tuple{stride_b, 1_I}),
-        opus::unfold_p_coord(dim, opus::tuple{wave_id_m, lane_id / threads_k, wave_id_n,
-                             (lane_id % threads_k) ^ (((lane_id / threads_k) ^ (wave_id_n << 2)) & 7)}));
-}
-// B [N, K] LDS: chunk (wave_m * 2 + wave_n) * E_N + issue.
-template<class T>
-__device__ inline auto make_layout_sb_tt(int wave_id_m, int wave_id_n) {
-    static_assert(T::smem_sub_a == T::WARP_SIZE / (T::B_K_BYTES / T::VEC_A), "one wave issue = one chunk");
-    constexpr int E = T::HALF_B_N / T::smem_sub_a / T::NUM_WAVES;
-    constexpr auto shape = opus::make_tuple(
-        opus::number<E>{},                                             // y issue
-        opus::number<T::T_N>{},                                        // p wave_n
-        opus::number<T::T_M>{},                                        // p wave_m
-        opus::number<T::VEC_A>{});                                     // y 16 bytes
-    constexpr auto dim = opus::make_tuple(
-        opus::make_tuple(opus::y_dim{}, opus::p_dim{}, opus::p_dim{}),
-        opus::make_tuple(opus::y_dim{}));
-    return opus::make_layout(
-        shape,
-        opus::make_tuple(opus::number<T::smem_linear_wave_a>{}, opus::number<2 * E * T::smem_linear_wave_a>{},
-                         opus::number<E * T::smem_linear_wave_a>{}, 1_I),
-        opus::unfold_p_coord(dim, opus::tuple{wave_id_m, wave_id_n}));
-}
-// B [N, K] LDS -> registers: 2 x ds_read_b128 per operand.
-template<class T>
-__device__ inline auto make_layout_rb_tt(int lane_id, int wave_id_n) {
-    static_assert(T::smem_sub_a * T::T_M == T::W_M && T::T_M == 2);
-    static_assert(T::WARP_SIZE / T::W_M * T::E_C * T::VEC_A == T::B_K_BYTES);
-    constexpr auto shape = opus::make_tuple(
-        opus::number<T::E_N>{},                                             // y repeat
-        opus::number<T::T_M>{},                                        // p wave
-        opus::number<T::T_M>{},                                        // p r % 2
-        opus::number<T::W_M / T::T_M>{},                               // p r / 2
-        opus::number<T::E_C>{},                                        // p chunk, fixed to 0
-        opus::number<T::WARP_SIZE / T::W_M>{},                         // p g
-        opus::number<T::VEC_A>{});                                     // y 16 bytes
-    constexpr auto dim = opus::make_tuple(
-        opus::make_tuple(opus::y_dim{}, opus::p_dim{}, opus::p_dim{}),
-        opus::make_tuple(opus::p_dim{}, opus::p_dim{}, opus::p_dim{}, opus::y_dim{}));
-    const int lane_r = lane_id % T::W_M;
-    return opus::make_layout<T::VEC_A>(
-        shape,
-        opus::make_tuple(opus::number<T::smem_linear_wave_a>{}, opus::number<2 * T::E_N * T::smem_linear_wave_a>{},
-                         opus::number<T::E_N * T::smem_linear_wave_a>{}, opus::number<T::B_K_BYTES>{},
-                         opus::number<T::B_K_BYTES / T::E_C>{}, opus::number<T::VEC_A>{}, 1_I),
-        opus::unfold_p_coord(dim, opus::tuple{wave_id_n, lane_r % T::T_M, lane_r / T::T_M, 0_I,
-                             (lane_id / T::W_M) ^ (((lane_r / T::T_M) ^ ((lane_r % T::T_M) << 2)) & 7)}));
-}
-
-// ============================================================================
-// TN: A [K, M], B [K, N]. Both operands M/N-contiguous and symmetric: one set of builders, A with E_M (reads:
-// wave_m), B with E_N (reads: wave_n).
-// ============================================================================
-// global -> LDS: issue i of wave w = 2 wave_m + wave_n copies k rows (64 / E) i + (16 / E) w + kr; the window
-// coordinate carries the swizzle.
-template<class T, int E>
+// global -> LDS: issue i of wave w = 2 wave_m + wave_n copies k rows (64 / E) i + (16 / E) w + kr (one 1 KB chunk:
+// lane = kr * 4E + 16-byte slot t); the window coordinate carries the swizzle (lane / wave only).
+template<class T, int OP>
 __device__ inline auto make_layout_g_tn(int lane_id, int wave_id_m, int wave_id_n, int stride) {
+    constexpr int E = OP == OPERAND_A ? T::E_M : T::E_N;
     constexpr int RPI = 16 / E;                                        // k rows per issue
     const int kr = lane_id / (4 * E), t = lane_id % (4 * E);
     const int window = (t >> 1) ^ mn_swz<E>(RPI * (wave_id_m * 2 + wave_id_n) + kr);
@@ -404,9 +178,11 @@ __device__ inline auto make_layout_g_tn(int lane_id, int wave_id_m, int wave_id_
         opus::make_tuple(4 * RPI * stride, 2 * RPI * stride, RPI * stride, stride, 32_I, 16_I, 1_I),
         opus::unfold_p_coord(dim, opus::tuple{wave_id_m, wave_id_n, kr, window, t & 1}));
 }
+
 // LDS: issue i of wave w -> 1 KB chunk 4 i + w.
-template<class T, int E>
+template<class T, int OP>
 __device__ inline auto make_layout_s_tn(int wave_id_m, int wave_id_n) {
+    constexpr int E = OP == OPERAND_A ? T::E_M : T::E_N;
     constexpr auto shape = opus::make_tuple(
         opus::number<E>{}, opus::number<T::T_M>{}, opus::number<T::T_N>{}, opus::number<16>{});
     constexpr auto dim = opus::make_tuple(opus::make_tuple(opus::y_dim{}, opus::p_dim{}, opus::p_dim{}, opus::y_dim{}));
@@ -415,9 +191,14 @@ __device__ inline auto make_layout_s_tn(int wave_id_m, int wave_id_n) {
         opus::make_tuple(opus::number<4 * 1024>{}, opus::number<2 * 1024>{}, opus::number<1024>{}, 1_I),
         opus::unfold_p_coord(dim, opus::tuple{wave_id_m, wave_id_n}));
 }
-// LDS -> registers (ds_read_b64_tr_b16), linear; the swizzle is added by mn_r_xor.
-template<class T, int E>
-__device__ inline auto make_layout_r_tn(int lane_id, int wave) {
+
+// LDS -> registers (ds_read_b64_tr_b16, 8 bytes per lane), linear part: operand e, K-step s, pass h read k row
+// 32 s + 8 g + 4 h + b (g = lane / 16, b = (lane % 16) / 4), window 2 e + wave, bytes (lane % 4) * 8. The swizzle is
+// added per (e, h) by mn_r_xor.
+template<class T, int OP>
+__device__ inline auto make_layout_r_tn(int lane_id, int wave_id_m, int wave_id_n) {
+    constexpr int E = OP == OPERAND_A ? T::E_M : T::E_N;
+    const int wave = OP == OPERAND_A ? wave_id_m : wave_id_n;
     constexpr int W = 64 * E;
     constexpr auto shape = opus::make_tuple(
         opus::number<E>{}, opus::number<2>{}, opus::number<2>{},       // y operand e, K-step s, pass h
@@ -570,37 +351,31 @@ __device__ __forceinline__ void gemm_a16w16_4wave_body(const opus_gemm_a16w16_4w
         : reinterpret_cast<D_OUT*>(kargs.ptr_c) + batch_id * kargs.stride_c_batch + row * out_stride + col;
     auto g_c = make_gmem(out_ptr, __builtin_amdgcn_readfirstlane(static_cast<unsigned int>(c_m_rem * out_stride * sizeof(D_OUT))));
 
-    // A / B layouts of this direction.
-    auto by_layout = [&](auto nt, auto nn, auto tt, auto tn) {
-        if constexpr (!T::A_T && !T::B_T) return nt();
-        else if constexpr (!T::A_T && T::B_T) return nn();
-        else if constexpr (T::A_T && !T::B_T) return tt();
-        else return tn();
-    };
-    const auto u_ga = by_layout([&] { return make_layout_g_nt<T, T::HALF_B_M>(lane_id, wave_id_m, wave_id_n, stride_a); },
-                                [&] { return make_layout_ga_nn<T>(lane_id, wave_id_m, wave_id_n, stride_a); },
-                                [&] { return make_layout_ga_tt<T>(lane_id, wave_id_m, wave_id_n, stride_a); },
-                                [&] { return make_layout_g_tn<T, T::E_M>(lane_id, wave_id_m, wave_id_n, stride_a); });
-    const auto u_sa = by_layout([&] { return make_layout_s_nt<T, T::HALF_B_M>(wave_id_m, wave_id_n); },
-                                [&] { return make_layout_sa_nn<T>(wave_id_m, wave_id_n); },
-                                [&] { return make_layout_sa_tt<T>(wave_id_m, wave_id_n); },
-                                [&] { return make_layout_s_tn<T, T::E_M>(wave_id_m, wave_id_n); });
-    const auto u_ra = by_layout([&] { return make_layout_r_nt<T, T::E_M>(lane_id, wave_id_m); },
-                                [&] { return make_layout_ra_nn<T>(lane_id, wave_id_m); },
-                                [&] { return make_layout_ra_tt<T>(lane_id, wave_id_m); },
-                                [&] { return make_layout_r_tn<T, T::E_M>(lane_id, wave_id_m); });
-    const auto u_gb = by_layout([&] { return make_layout_g_nt<T, T::HALF_B_N>(lane_id, wave_id_n, wave_id_m, stride_b); },
-                                [&] { return make_layout_gb_nn<T>(lane_id, wave_id_m, wave_id_n, stride_b); },
-                                [&] { return make_layout_gb_tt<T>(lane_id, wave_id_m, wave_id_n, stride_b); },
-                                [&] { return make_layout_g_tn<T, T::E_N>(lane_id, wave_id_m, wave_id_n, stride_b); });
-    const auto u_sb = by_layout([&] { return make_layout_s_nt<T, T::HALF_B_N>(wave_id_n, wave_id_m); },
-                                [&] { return make_layout_sb_nn<T>(wave_id_m, wave_id_n); },
-                                [&] { return make_layout_sb_tt<T>(wave_id_m, wave_id_n); },
-                                [&] { return make_layout_s_tn<T, T::E_N>(wave_id_m, wave_id_n); });
-    const auto u_rb = by_layout([&] { return make_layout_r_nt<T, T::E_N>(lane_id, wave_id_n); },
-                                [&] { return make_layout_rb_nn<T>(lane_id, wave_id_n); },
-                                [&] { return make_layout_rb_tt<T>(lane_id, wave_id_n); },
-                                [&] { return make_layout_r_tn<T, T::E_N>(lane_id, wave_id_n); });
+    // A / B layouts: each operand takes the _nt (K-contiguous) or _tn (M/N-contiguous) builders (table above).
+    const auto u_ga = [&] {
+        if constexpr (T::A_T) return make_layout_g_tn<T, OPERAND_A>(lane_id, wave_id_m, wave_id_n, stride_a);
+        else return make_layout_g_nt<T, OPERAND_A>(lane_id, wave_id_m, wave_id_n, stride_a);
+    }();
+    const auto u_sa = [&] {
+        if constexpr (T::A_T) return make_layout_s_tn<T, OPERAND_A>(wave_id_m, wave_id_n);
+        else return make_layout_s_nt<T, OPERAND_A>(wave_id_m, wave_id_n);
+    }();
+    const auto u_ra = [&] {
+        if constexpr (T::A_T) return make_layout_r_tn<T, OPERAND_A>(lane_id, wave_id_m, wave_id_n);
+        else return make_layout_r_nt<T, OPERAND_A>(lane_id, wave_id_m, wave_id_n);
+    }();
+    const auto u_gb = [&] {
+        if constexpr (T::B_T) return make_layout_g_tn<T, OPERAND_B>(lane_id, wave_id_m, wave_id_n, stride_b);
+        else return make_layout_g_nt<T, OPERAND_B>(lane_id, wave_id_m, wave_id_n, stride_b);
+    }();
+    const auto u_sb = [&] {
+        if constexpr (T::B_T) return make_layout_s_tn<T, OPERAND_B>(wave_id_m, wave_id_n);
+        else return make_layout_s_nt<T, OPERAND_B>(wave_id_m, wave_id_n);
+    }();
+    const auto u_rb = [&] {
+        if constexpr (T::B_T) return make_layout_r_tn<T, OPERAND_B>(lane_id, wave_id_m, wave_id_n);
+        else return make_layout_r_nt<T, OPERAND_B>(lane_id, wave_id_m, wave_id_n);
+    }();
 
     constexpr int smem_a_elem = T::smem_m_rep * (T::smem_linear_wave_a + T::smem_padding);   // one half, bytes
     constexpr int smem_b_elem = T::smem_n_rep * (T::smem_linear_wave_b + T::smem_padding);
