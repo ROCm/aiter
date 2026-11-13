@@ -229,6 +229,16 @@ def gemm_afp4wfp4_(
             config["BLOCK_SIZE_K"] = triton.next_power_of_2(2 * K)
             config["SPLITK_BLOCK_SIZE"] = 2 * K
             config["NUM_KSPLIT"] = 1
+        # A masked K tail that the pipeline loads in its prologue (no more K tiles than
+        # num_stages) can race on gfx950 (Triton 3.8): wrong, timing-dependent results.
+        # Run that K loop unpipelined.
+        elif (
+            config["NUM_KSPLIT"] == 1
+            and K % (config["BLOCK_SIZE_K"] // 2)
+            and triton.cdiv(2 * K, config["BLOCK_SIZE_K"])
+            <= config.get("num_stages", 2)
+        ):
+            config["num_stages"] = 1
         config["BLOCK_SIZE_K"] = max(config["BLOCK_SIZE_K"], 128)
 
     return_y_pp = config["NUM_KSPLIT"] > 1 and skip_reduce
