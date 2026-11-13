@@ -476,6 +476,63 @@ def test_stage2_rejects_oversized_lds(block_m, tile_n, required):
         )
 
 
+def test_default_shared_tile_n_bounds():
+    from aiter.ops.flydsl.kernels.moe_2stage_a16wmix import (
+        a16w4_default_shared_tile_n,
+    )
+
+    # MiniMax-M3.1 TP4: stage-1 N 768 (step 32 at k_wave 2), stage-2 N 6144 (step 64).
+    assert a16w4_default_shared_tile_n(128, 768, step=32) == 32
+    assert a16w4_default_shared_tile_n(256, 6144, step=64) == 64
+    # tile_n / 4 (64) is above N: the search starts at N.
+    assert a16w4_default_shared_tile_n(256, 32, step=32) == 32
+    # 64 does not divide 160: the search goes up to the next divisor.
+    assert a16w4_default_shared_tile_n(256, 160, step=32) == 160
+    for n in (0, 48, 100):
+        with pytest.raises(ValueError, match="positive multiple of 32"):
+            a16w4_default_shared_tile_n(256, n, step=32)
+
+
+def test_stage1_shared_rejects_oversized_lds():
+    from aiter.ops.flydsl.kernels.moe_2stage_a16wmix import compile_gemm1_a16w4_port
+
+    # 1 K-wave x 2 stages x 256 rows x 512 K x 2 bytes.
+    with pytest.raises(NotImplementedError, match="requires 524288 LDS bytes"):
+        compile_gemm1_a16w4_port(
+            BM=16,
+            D_HIDDEN=6144,
+            D_INTER=768,
+            NE=128,
+            TOPK=4,
+            TILE_N=128,
+            TILE_K=256,
+            rocm_arch="gfx950",
+            shared_tile_n=64,
+            shared_tile_m=256,
+            shared_tile_k=512,
+            shared_k_wave=1,
+        )
+
+
+def test_stage2_shared_rejects_oversized_lds():
+    from aiter.ops.flydsl.kernels.moe_2stage_a16wmix import compile_gemm2_a16w4_port
+
+    # 256 x 256 bf16 A tile + 256 x 512 fp32 accumulator tile.
+    with pytest.raises(NotImplementedError, match="requires 655360 LDS bytes"):
+        compile_gemm2_a16w4_port(
+            BM=16,
+            NE=128,
+            N_OUT=6144,
+            D_INTER=768,
+            TILE_N=256,
+            TILE_K=128,
+            rocm_arch="gfx950",
+            shared_tile_n=512,
+            shared_tile_m=256,
+            shared_tile_k=256,
+        )
+
+
 @pytest.mark.parametrize(
     "arch,weight_dtype,epilog",
     [

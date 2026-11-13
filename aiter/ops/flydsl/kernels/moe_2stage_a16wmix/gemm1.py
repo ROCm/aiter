@@ -471,9 +471,15 @@ def a16w4_default_shared_tile_n(tile_n, N, *, step):
 
     A bf16 W tile has 4x the bytes of an MXFP4 tile at the same N. The default is
     tile_n / 4, rounded down to a multiple of ``step`` (the smallest N that the body
-    supports) and then up to a divisor of N.
+    supports), at most N, and then up to a divisor of N. N must be a positive
+    multiple of ``step``.
     """
-    tn = max(step, (tile_n // 4) // step * step)
+    if N <= 0 or N % step:
+        raise ValueError(
+            f"the shared-expert N must be a positive multiple of {step}, got {N}"
+        )
+    # Start at most at N, so that the search ends at N in the worst case.
+    tn = min(N, max(step, (tile_n // 4) // step * step))
     while N % tn:
         tn += step
     return tn
@@ -653,6 +659,14 @@ def compile_gemm1_a16w4_port(
             _sh_acc = (shared_tile_n // (4 // SH_KW)) // 16 * (SH_BM // 16)
             _sh_lds = max(_sh_lds, 4 * _sh_acc * 64 * 4 * 4)
         lds_bytes_shared = max(lds_bytes, _sh_lds)
+        from aiter.jit.utils.chip_info import get_lds_capacity_bytes
+
+        lds_capacity = get_lds_capacity_bytes(str(rocm_arch))
+        if lds_bytes_shared > lds_capacity:
+            raise NotImplementedError(
+                f"a16w4 gemm1 with the shared expert requires {lds_bytes_shared} LDS "
+                f"bytes, exceeding {rocm_arch} capacity {lds_capacity}"
+            )
 
     @fx.struct
     class SharedStorage:

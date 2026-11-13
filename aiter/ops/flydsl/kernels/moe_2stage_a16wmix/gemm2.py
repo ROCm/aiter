@@ -759,6 +759,14 @@ def compile_gemm2_a16w4_port(
     SH_NB = N_OUT // SH_TN
     _sh_tag = "_mxfp8" if shared_w_dtype == "fp8" else ""
     _lds_bytes_sh = max(_lds_bytes, SH_BM * SH_TK * 2 + SH_BM * SH_TN * 4)
+    from aiter.jit.utils.chip_info import get_lds_capacity_bytes
+
+    lds_capacity = get_lds_capacity_bytes(str(rocm_arch))
+    if _lds_bytes_sh > lds_capacity:
+        raise NotImplementedError(
+            f"a16w4 gemm2 with the shared expert requires {_lds_bytes_sh} LDS bytes, "
+            f"exceeding {rocm_arch} capacity {lds_capacity}"
+        )
 
     @fx.struct
     class SharedStorageSh:
