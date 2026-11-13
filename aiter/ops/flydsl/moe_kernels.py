@@ -122,28 +122,13 @@ def resolve_flydsl_stage2_mode(
     *,
     force_reduce: bool | None = None,
     stage2_fp8: bool | None = None,
-    stage2_fp8_keep_atomic: bool | None = None,
 ) -> str:
-    """Resolve runtime reduce overrides shared by sorting and stage 2.
-
-    ``AITER_FLYDSL_STAGE2_FP8=1`` moves fp4/fp8 atomic tiles to reduce so that
-    every tile uses FP8 route rows. With ``AITER_FLYDSL_STAGE2_FP8_KEEP_ATOMIC=1``
-    atomic tiles stay atomic (BF16) and only tiles already in reduce use FP8.
-    """
+    """Resolve runtime reduce overrides shared by sorting and stage 2."""
     if force_reduce is None:
         force_reduce = os.environ.get("AITER_FLYDSL_FORCE_REDUCE", "0") == "1"
     if stage2_fp8 is None:
         stage2_fp8 = os.environ.get("AITER_FLYDSL_STAGE2_FP8", "0") == "1"
-    if stage2_fp8_keep_atomic is None:
-        stage2_fp8_keep_atomic = (
-            os.environ.get("AITER_FLYDSL_STAGE2_FP8_KEEP_ATOMIC", "0") == "1"
-        )
-    fp8_reduce = (
-        stage2_fp8
-        and not stage2_fp8_keep_atomic
-        and b_dtype in ("fp4", "fp8")
-        and not return_per_slot
-    )
+    fp8_reduce = stage2_fp8 and b_dtype in ("fp4", "fp8") and not return_per_slot
     if force_reduce or fp8_reduce:
         return "reduce"
     if (
