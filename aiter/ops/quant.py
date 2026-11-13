@@ -479,7 +479,37 @@ SCALE_LAYOUT_M32K4_SUPPORTED = True
 # `per_group_quant_hip` would put a backend-named function into a contract
 # providers implement against. `rmsnorm` sits the same way, below its two
 # public names.
-@_route(op="per_group_quant", version=1)
+def _per_group_quant_fake(
+    x: Tensor,
+    scale: Tensor | None = None,
+    quant_dtype: torch.dtype = dtypes.i8,
+    group_size: int = 128,
+    transpose_scale: bool = False,
+    num_rows: "torch.Tensor | None" = None,
+    num_rows_factor: int = 1,
+    scale_type: torch.dtype = dtypes.fp32,
+    scale_layout_m32k4: bool = False,
+) -> "tuple[Tensor, Tensor]":
+    """Shapes only -- both results are freshly allocated here, so neither
+    aliases an argument and registration has nothing to declare about them.
+
+    ``transpose_scale`` shuffles the scale's contents inside the kernel and
+    does not move its shape, so it does not appear below; the scale is
+    allocated to the same shape either way.
+    """
+    shape = x.shape
+    y = torch.empty(shape, dtype=quant_dtype, device=x.device)
+    if scale_layout_m32k4:
+        m = x.numel() // shape[-1]
+        return y, torch.empty(
+            ((m + 31) // 32 * 32, shape[-1] // 32), dtype=scale_type, device=x.device
+        )
+    return y, torch.empty(
+        (*shape[:-1], shape[-1] // group_size), dtype=scale_type, device=x.device
+    )
+
+
+@_route(op="per_group_quant", version=1, fake=_per_group_quant_fake)
 def _per_group_quant_routed(
     x: Tensor,
     scale: Tensor | None = None,
