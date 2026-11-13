@@ -8,36 +8,73 @@ import sys
 
 
 def _check_triton_conflicts():
-    """Remove triton variants that conflict with amd-triton."""
+    """Remove triton variants that conflict with amd-triton / amd-triton-kernels."""
     import importlib.metadata
 
-    conflicts = ["triton", "pytorch-triton", "pytorch-triton-rocm", "triton-rocm"]
+    triton_conflicts = [
+        "triton",
+        "pytorch-triton",
+        "pytorch-triton-rocm",
+        "triton-rocm",
+    ]
+    kernels_conflicts = ["triton-kernels"]
     found = []
-    for pkg in conflicts:
+    for pkg in triton_conflicts:
         try:
             importlib.metadata.version(pkg)
             found.append(pkg)
         except importlib.metadata.PackageNotFoundError:
             pass
-    if found:
+    found_kernels = []
+    for pkg in kernels_conflicts:
+        try:
+            importlib.metadata.version(pkg)
+            found_kernels.append(pkg)
+        except importlib.metadata.PackageNotFoundError:
+            pass
+    if found or found_kernels:
+        all_found = found + found_kernels
         print(
-            f"[aiter] Conflicting triton package(s) detected: {', '.join(found)}. "
-            "Removing and reinstalling amd-triton..."
+            f"[aiter] Conflicting package(s) detected: {', '.join(all_found)}. "
+            "Removing and reinstalling amd-triton / amd-triton-kernels..."
         )
-        for pkg in found:
+        for pkg in all_found:
             subprocess.call(
                 [sys.executable, "-m", "pip", "uninstall", "-y", pkg],
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
             )
-        subprocess.call(
-            [sys.executable, "-m", "pip", "install", "--force-reinstall", "--no-deps", "amd-triton"],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-        )
+        if found:
+            subprocess.call(
+                [
+                    sys.executable,
+                    "-m",
+                    "pip",
+                    "install",
+                    "--force-reinstall",
+                    "--no-deps",
+                    "amd-triton",
+                ],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+        if found_kernels:
+            subprocess.call(
+                [
+                    sys.executable,
+                    "-m",
+                    "pip",
+                    "install",
+                    "--force-reinstall",
+                    "--no-deps",
+                    "amd-triton-kernels",
+                ],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
         raise RuntimeError(
-            f"[aiter] Removed conflicting packages: {', '.join(found)} "
-            "and reinstalled amd-triton. Please restart Python."
+            f"[aiter] Removed conflicting packages: {', '.join(all_found)} "
+            "and reinstalled amd-triton / amd-triton-kernels. Please restart Python."
         )
 
 
