@@ -39,7 +39,11 @@ IS_WINDOWS = sys.platform == "win32"
 # flydsl publishes Linux-only wheels.
 FLYDSL_REQUIRES = [] if IS_WINDOWS else [FLYDSL_VERSION]
 AITER_USE_SYSTEM_TRITON = int(os.environ.get("AITER_USE_SYSTEM_TRITON", "0"))
-TRITON_REQUIRES = [] if IS_WINDOWS or AITER_USE_SYSTEM_TRITON else [TRITON_VERSION, TRITON_KERNELS_VERSION]
+TRITON_REQUIRES = (
+    []
+    if IS_WINDOWS or AITER_USE_SYSTEM_TRITON
+    else [TRITON_VERSION, TRITON_KERNELS_VERSION]
+)
 # Single skip-C++/HIP-build gate.
 AITER_TRITON_ONLY = os.environ.get("AITER_TRITON_ONLY", "0") == "1"
 
@@ -91,18 +95,24 @@ if not AITER_TRITON_ONLY and not IS_WINDOWS and is_develop_mode():
         )
 
 
-_TRITON_CONFLICTS = ["amd-triton", "triton", "pytorch-triton", "pytorch-triton-rocm", "triton-rocm"]
+_TRITON_CONFLICTS = [
+    "amd-triton",
+    "triton",
+    "pytorch-triton",
+    "pytorch-triton-rocm",
+    "triton-rocm",
+]
 
 
 def _uninstall_triton_conflicts():
     for pkg in _TRITON_CONFLICTS:
-        subprocess.call(  # noqa: S603
+        subprocess.call(
             [sys.executable, "-m", "pip", "uninstall", "-y", pkg],
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
         )
     for pkg in ["amd-triton-kernels", "triton-kernels"]:
-        subprocess.call(  # noqa: S603
+        subprocess.call(
             [sys.executable, "-m", "pip", "uninstall", "-y", pkg],
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
@@ -124,7 +134,13 @@ def _torch_version_below(min_version):
 def _is_triton_installed():
     from importlib.metadata import version as pkg_version
 
-    for pkg in ["amd-triton", "triton", "pytorch-triton", "pytorch-triton-rocm", "triton-rocm"]:
+    for pkg in [
+        "amd-triton",
+        "triton",
+        "pytorch-triton",
+        "pytorch-triton-rocm",
+        "triton-rocm",
+    ]:
         try:
             return pkg, pkg_version(pkg)
         except Exception:  # noqa: BLE001,S110
@@ -169,7 +185,9 @@ elif not AITER_USE_SYSTEM_TRITON and not IS_WINDOWS:
                     [sys.executable, "-m", "pip", "install", pkg_spec]
                 )
             except Exception:  # noqa: BLE001
-                print(f"[aiter] Skipping {pkg_name} install (will be handled by install_requires)")
+                print(
+                    f"[aiter] Skipping {pkg_name} install (will be handled by install_requires)"
+                )
 
 
 def write_install_mode():
