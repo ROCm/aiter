@@ -412,8 +412,8 @@ def test_fhmoe_m3(n, seed, variant):
     # bf16 atomics round each of the topk+1 partial sums once: bound by (topk+1) ulp of sum|rows| (+ subnormal floor)
     bound = (TOPK + 1) * _bf16_ulp(fh_rows.float().abs().sum(1)) + 1e-30
     ratio = lambda o, r: float(((o.float() - r.float()).abs() / bound).max())
-    ret["atomic |a-r|/bound max"] = max(ratio(o, out_r) for o in outs_a)
-    ret["GA atomic within bound"] = ret["atomic |a-r|/bound max"] <= 1.0
+    ret["atomic max abs(a-r)/bound"] = max(ratio(o, out_r) for o in outs_a)
+    ret["GA atomic within bound"] = ret["atomic max abs(a-r)/bound"] <= 1.0
     if a8:
         with reduce_mode(False):
             a_bf16 = fh_call(variant, L, x, w5, ids5)
