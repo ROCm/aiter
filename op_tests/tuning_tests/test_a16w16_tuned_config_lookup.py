@@ -572,6 +572,10 @@ class TestWaveSpecializedConfig(unittest.TestCase):
 
         base = (64, 64, 128, 3, 2, 2, 2, 1, True)
         self.assertEqual(_validate_ws_config(*base), base[:-1])
+        self.assertEqual(_validate_ws_config(*base, counter_handshake=True), base[:-1])
+        for value in (1, None, "true"):
+            with self.assertRaises(ValueError):
+                _validate_ws_config(*base, counter_handshake=value)
         for index, value in (
             (0, 63),
             (1, 63),
@@ -612,6 +616,50 @@ class TestWaveSpecializedConfig(unittest.TestCase):
                         slot, gen = tile % stages, tile // stages
                         self.assertEqual(last[slot], gen)
                         last[slot] = gen + 1
+
+    def test_cumulative_counter_interleavings(self):
+        # A randomized abstract scheduler checks the cumulative thresholds,
+        # not GPU memory ordering (covered separately by GPU replay tests).
+        import random
+
+        for stages in (2, 3, 4, 5):
+            for producers, consumers in ((1, 2), (2, 4), (4, 8)):
+                for seed in range(8):
+                    rng = random.Random(seed)
+                    tiles = 31
+                    ready, released = [0] * stages, [0] * stages
+                    prod, cons = [0] * producers, [0] * consumers
+                    writes, reads = set(), set()
+                    while min(cons) < tiles:
+                        runnable = []
+                        for p, tile in enumerate(prod):
+                            slot, gen = tile % stages, tile // stages
+                            if tile < tiles and released[slot] >= gen * consumers:
+                                runnable.append(("produce", p, tile))
+                        for c, tile in enumerate(cons):
+                            slot, gen = tile % stages, tile // stages
+                            if tile < tiles and ready[slot] >= (gen + 1) * producers:
+                                runnable.append(("consume", c, tile))
+                        self.assertTrue(runnable, "protocol deadlocked")
+                        role, wave, tile = rng.choice(runnable)
+                        slot = tile % stages
+                        if role == "produce":
+                            if tile >= stages:
+                                for c in range(consumers):
+                                    self.assertIn((tile - stages, c), reads)
+                            self.assertNotIn((tile, wave), writes)
+                            writes.add((tile, wave))
+                            ready[slot] += 1
+                            prod[wave] += 1
+                        else:
+                            for p in range(producers):
+                                self.assertIn((tile, p), writes)
+                            self.assertNotIn((tile, wave), reads)
+                            reads.add((tile, wave))
+                            released[slot] += 1
+                            cons[wave] += 1
+                    self.assertEqual(len(writes), tiles * producers)
+                    self.assertEqual(len(reads), tiles * consumers)
 
 
 class TestGfx1250FlydslCandidates(unittest.TestCase):

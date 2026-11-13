@@ -1162,6 +1162,9 @@ def check_streamk_rejects():
 _WS_CASES = (
     (64, 64, 64, 64, 64, 64, 3, 1, 2, 2, 1, True),
     (65, 120, 320, 64, 64, 64, 3, 1, 2, 2, 1, True),
+    (65, 120, 4096, 64, 64, 64, 2, 1, 2, 2, 1, True),
+    (65, 120, 5120, 64, 64, 64, 5, 2, 2, 2, 1, True),
+    (65, 120, 5120, 64, 64, 64, 3, 4, 2, 4, 1, True),
     (65, 120, 896, 64, 64, 64, 4, 2, 2, 2, 2, True),
     (17, 36, 1024, 32, 64, 128, 3, 2, 1, 2, 4, False),
     (128, 3584, 7168, 64, 64, 128, 3, 2, 2, 2, 2, True),
@@ -1173,7 +1176,19 @@ _WS_CASES = (
 
 @benchmark()
 def test_hgemm_wave_specialized(
-    m, n, k, bm, bn, bk, stages, producers, wm, wn, split, prefetch
+    m,
+    n,
+    k,
+    bm,
+    bn,
+    bk,
+    stages,
+    producers,
+    wm,
+    wn,
+    split,
+    prefetch,
+    counter_handshake=False,
 ):
     """Wave-role handoff, wraparound, private scratch and explicit-stream calls."""
     from unittest.mock import patch
@@ -1207,6 +1222,7 @@ def test_hgemm_wave_specialized(
         "n_waves": wn,
         "split_k": split,
         "prefetch": prefetch,
+        "counter_handshake": counter_handshake,
     }
     streams = [torch.cuda.Stream(), torch.cuda.Stream()]
     graphs = []
@@ -1294,7 +1310,10 @@ def test_hgemm_wave_specialized(
         )
         == 0
     )
-    ret = {"gfx": get_gfx_runtime()}
+    if counter_handshake:
+        control = ws(a, w, **{**cfg, "counter_handshake": False})
+        assert torch.equal(result, control), "handshake changed arithmetic"
+    ret = {"gfx": get_gfx_runtime(), "counter_handshake": counter_handshake}
     candidates = {
         "public": lambda: ws(a, w, out=outs[0], **cfg),
         "graph2": graphs[0].replay,
@@ -1362,6 +1381,8 @@ def check_wave_specialized_rejects():
         ("stages", 1),
         ("stages", 6),
         ("prefetch", 1),
+        ("counter_handshake", 1),
+        ("counter_handshake", "true"),
         ("split_k", 17),
     ):
         calls.append(lambda field=field, value=value: ws(x, w, out=o, **{field: value}))
@@ -1504,9 +1525,10 @@ def main():
         summarize(
             "experimental wave-specialized HGEMM",
             [
-                test_hgemm_wave_specialized(*row)
+                test_hgemm_wave_specialized(*row, counter_handshake=counter)
                 for row in _WS_CASES
                 if row[:3] in wanted
+                for counter in (False, True)
             ],
         )
         check_wave_specialized_rejects()

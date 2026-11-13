@@ -21,6 +21,7 @@ def _validate_ws_config(
     n_waves,
     split_k,
     prefetch,
+    counter_handshake=False,
 ):
     params = (
         block_m,
@@ -45,8 +46,8 @@ def _validate_ws_config(
         or block_n % (n_waves * 16)
     ):
         raise ValueError("unsupported WS tile/wave configuration")
-    if type(prefetch) is not bool:
-        raise ValueError("prefetch must be bool")
+    if type(prefetch) is not bool or type(counter_handshake) is not bool:
+        raise ValueError("prefetch and counter_handshake must be bool")
     loaders = producer_waves * 64
     if block_m * block_k % (loaders * 8) or block_n * block_k % (loaders * 8):
         raise ValueError("loader waves must exactly cover the DMA tiles")
@@ -56,7 +57,7 @@ def _validate_ws_config(
         raise ValueError("too many outstanding DMA operations per loader")
     lds = (
         stages * (block_m + block_n) * block_k * 2
-        + stages * (producer_waves + m_waves * n_waves) * 4
+        + stages * (2 if counter_handshake else producer_waves + m_waves * n_waves) * 4
     )
     if lds > 163840:
         raise ValueError("WS LDS capacity exceeded")
@@ -77,12 +78,15 @@ def gemm_a16w16_wave_specialized(
     n_waves=2,
     split_k=1,
     prefetch=False,
+    counter_handshake=False,
     stream=None,
 ):
     """BF16 A[M,K] @ weight[N,K]. Explicit path: never selected by old CSVs.
 
     Split-K uses per-call FP32 partials and a separate deterministic reduction.
     Initialization of ring state is inside each workgroup; no global counters.
+    counter_handshake=True coalesces per-wave flags into cumulative LDS counters.
+    It is experimental and does not imply a speedup over the default GEMM path.
     """
     from .kernels.gemm_a16w16_ws_gfx950 import build_ws
 
@@ -98,6 +102,7 @@ def gemm_a16w16_wave_specialized(
         n_waves,
         split_k,
         prefetch,
+        counter_handshake,
     )
     if (
         a.ndim != 2
@@ -153,7 +158,7 @@ def gemm_a16w16_wave_specialized(
             if split_k > 1
             else out
         )
-        exe = build_ws(*params, prefetch)
+        exe = build_ws(*params, prefetch, counter_handshake)
         _run_compiled(
             exe,
             ptr_arg(out, fx.BFloat16),

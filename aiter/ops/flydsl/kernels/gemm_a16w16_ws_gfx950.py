@@ -4,8 +4,10 @@
 """Experimental BF16 wave-specialized GEMM; no default dispatch uses this path.
 
 Loader waves own disjoint physical LDS stripes. Each ring slot has one ready
-sequence per loader and one released sequence per compute wave. The initial
-and final barriers involve the entire workgroup; the role loops never do.
+sequence per loader and one released sequence per compute wave by default.
+The opt-in counter protocol replaces those arrays with two cumulative counters
+per slot. Neither protocol resets a live slot. The initial and final barriers
+involve the entire workgroup; the role loops never do.
 """
 
 import functools
@@ -43,10 +45,23 @@ def _wait_sequence(ptr: fx.Pointer, want: fx.Int32):
 
 
 @functools.cache
-def build_ws(bm, bn, bk, stages, producer_waves, wm, wn, splits, prefetch):
+def build_ws(
+    bm,
+    bn,
+    bk,
+    stages,
+    producer_waves,
+    wm,
+    wn,
+    splits,
+    prefetch,
+    counter_handshake=False,
+):
     """Build a private launcher for one validated geometry, not a tensor cache."""
     producers = producer_waves
     consumers = wm * wn
+    ready_count = stages if counter_handshake else stages * producers
+    released_count = stages if counter_handshake else stages * consumers
     threads = (producers + consumers) * 64
     load_threads = producers * 64
     load_a_iters = bm * bk // (load_threads * 8)
@@ -81,15 +96,15 @@ def build_ws(bm, bn, bk, stages, producer_waves, wm, wn, splits, prefetch):
         class Shared:
             a: fx.Array[fx.BFloat16, stages * bm * bk, 16]
             b: fx.Array[fx.BFloat16, stages * bn * bk, 16]
-            ready: fx.Array[fx.Int32, stages * producers, 4]
-            released: fx.Array[fx.Int32, stages * consumers, 4]
+            ready: fx.Array[fx.Int32, ready_count, 4]
+            released: fx.Array[fx.Int32, released_count, 4]
 
         mem = fx.SharedAllocator().allocate(Shared)
         sa, sb = mem.a.peek().ptr, mem.b.peek().ptr
         ready, released = mem.ready.peek().ptr, mem.released.peek().ptr
-        for i in range(tid, stages * producers, threads):
+        for i in range(tid, ready_count, threads):
             fx.ptr_store(fx.Int32(0), ready + i)
-        for i in range(tid, stages * consumers, threads):
+        for i in range(tid, released_count, threads):
             fx.ptr_store(fx.Int32(0), released + i)
         gpu.barrier()
 
@@ -109,8 +124,11 @@ def build_ws(bm, bn, bk, stages, producer_waves, wm, wn, splits, prefetch):
             def issue(tile):
                 slot = tile % stages
                 generation = tile // stages
-                for c in range_constexpr(consumers):
-                    _wait_sequence(released + slot * consumers + c, generation)
+                if fx.const_expr(counter_handshake):
+                    _wait_sequence(released + slot, generation * consumers)
+                else:
+                    for c in range_constexpr(consumers):
+                        _wait_sequence(released + slot * consumers + c, generation)
                 # Every lane of this producer wave issues an eight-BF16 DMA.
                 # The intrinsic's LDS address is wave-uniform; hardware supplies
                 # the lane displacement. Physical stripes cover each tile once.
@@ -155,12 +173,22 @@ def build_ws(bm, bn, bk, stages, producer_waves, wm, wn, splits, prefetch):
                     syncscope=rocdl.SyncScope.Workgroup,
                 )
                 if lane == 0:
-                    fx.generic_store(
-                        ready + slot * producers + wave,
-                        generation + 1,
-                        memory_order=fx.AtomicOrdering.Release,
-                        syncscope=rocdl.SyncScope.Workgroup,
-                    )
+                    if fx.const_expr(counter_handshake):
+                        # Each producer contributes once. The acquire of the
+                        # cumulative threshold observes all producer releases.
+                        fx.atomic_add(
+                            ready + slot,
+                            fx.Int32(1),
+                            ordering=fx.AtomicOrdering.Release,
+                            syncscope=rocdl.SyncScope.Workgroup,
+                        )
+                    else:
+                        fx.generic_store(
+                            ready + slot * producers + wave,
+                            generation + 1,
+                            memory_order=fx.AtomicOrdering.Release,
+                            syncscope=rocdl.SyncScope.Workgroup,
+                        )
 
             depth = stages - 1
             if fx.const_expr(prefetch):
@@ -223,8 +251,11 @@ def build_ws(bm, bn, bk, stages, producer_waves, wm, wn, splits, prefetch):
             for tile in range(k_tiles):
                 slot = tile % stages
                 generation = tile // stages
-                for p in range_constexpr(producers):
-                    _wait_sequence(ready + slot * producers + p, generation + 1)
+                if fx.const_expr(counter_handshake):
+                    _wait_sequence(ready + slot, (generation + 1) * producers)
+                else:
+                    for p in range_constexpr(producers):
+                        _wait_sequence(ready + slot * producers + p, generation + 1)
                 compute_slot(slot)
                 # Register-fed MFMA no longer reads LDS once ds reads retire.
                 # Release from all lanes before this wave's leader frees a slot.
@@ -234,12 +265,23 @@ def build_ws(bm, bn, bk, stages, producer_waves, wm, wn, splits, prefetch):
                     syncscope=rocdl.SyncScope.Workgroup,
                 )
                 if lane == 0:
-                    fx.generic_store(
-                        released + slot * consumers + cwave,
-                        generation + 1,
-                        memory_order=fx.AtomicOrdering.Release,
-                        syncscope=rocdl.SyncScope.Workgroup,
-                    )
+                    if fx.const_expr(counter_handshake):
+                        # A slot cannot be overwritten until every compute wave
+                        # has retired its reads. Counts grow across generations;
+                        # no reset races with a producer or a slower consumer.
+                        fx.atomic_add(
+                            released + slot,
+                            fx.Int32(1),
+                            ordering=fx.AtomicOrdering.Release,
+                            syncscope=rocdl.SyncScope.Workgroup,
+                        )
+                    else:
+                        fx.generic_store(
+                            released + slot * consumers + cwave,
+                            generation + 1,
+                            memory_order=fx.AtomicOrdering.Release,
+                            syncscope=rocdl.SyncScope.Workgroup,
+                        )
             rows = thr.partition_C(fx.make_view(0, fx.make_layout((bm, bn), (1, 0))))
             cols = thr.partition_C(fx.make_view(0, fx.make_layout((bm, bn), (0, 1))))
             for i in range_constexpr(fx.size(fc.shape).unpack()):
@@ -285,7 +327,7 @@ def build_ws(bm, bn, bk, stages, producer_waves, wm, wn, splits, prefetch):
         stream: fx.Stream,
     ):
         ws_kernel._known_block_size = [threads, 1, 1]
-        ws_kernel._func.__name__ = f"hgemm_ws_v2_{bm}_{bn}_{bk}_s{stages}_p{producers}_c{wm}x{wn}_sk{splits}_pf{int(prefetch)}"
+        ws_kernel._func.__name__ = f"hgemm_ws_v3_{bm}_{bn}_{bk}_s{stages}_p{producers}_c{wm}x{wn}_sk{splits}_pf{int(prefetch)}_ch{int(counter_handshake)}"
         ws_kernel(op, ap, bp, pp, m, n, k, lda, ldb).launch(
             grid=(((m + bm - 1) // bm) * ((n + bn - 1) // bn), splits, 1),
             block=(threads, 1, 1),
