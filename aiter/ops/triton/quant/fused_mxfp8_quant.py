@@ -219,7 +219,7 @@ def _fused_dual_rmsnorm_mxfp8_quant_routed(
     """Fused dual RMSNorm in a single Triton launch.
 
     - Q side: RMSNorm(q, q_weight, eps_q) -> MXFP8 (FP8 e4m3fn + uint8 e8m0 1x32).
-    - K side: RMSNorm(k, k_weight, eps_k) -> bf16.
+    - K side: RMSNorm(k, k_weight, eps_k) -> same dtype as k (bf16 or fp16).
 
     Replaces the CK `fused_qk_rmsnorm_group_quant` kernel for the MXFP8 GEMM
     path on V4 (Task #77): one launch instead of two (fused_rms_mxfp8_quant +
@@ -235,7 +235,8 @@ def _fused_dual_rmsnorm_mxfp8_quant_routed(
         amax_floor: floor of each Q group's amax (0: none).
 
     Returns:
-        yq (M, KQ) fp8 e4m3fn, sq (M, KQ // 32) uint8 e8m0, yk (M, KK) bf16.
+        yq (M, KQ) fp8 e4m3fn, sq (M, KQ // 32) uint8 e8m0,
+        yk (M, KK) same dtype as `k` (bf16 or fp16) — providers must match this.
     """
     return _fused_dual_rmsnorm_mxfp8_quant_native(
         q, k, q_weight, k_weight, eps_q, eps_k, None, None, None, amax_floor
