@@ -177,7 +177,7 @@ def _block_varied(shape, k):
 
     ``rand()/10`` (non-negative, near-uniform) is what let the shipped
     local kids 64/65
-    tileN COM_REP_N>1 kernels pass this test at ~0.7 rel while silently
+    tileN COM_REP_N>1 kernels pass this test at ~0.007 rel while silently
     transposing output column groups: a pure column permutation over symmetric
     positive columns barely moves any element, and the collapsed single block
     scale hides scale-application bugs. Signed data makes swapped columns
@@ -379,7 +379,7 @@ _TILEN_REGRESSION_CASES = (
     ((2, 16, 128, 1024), (64, 65)),
     ((2, 100, 128, 1024), (85, 86, 87)),
 )
-_TILEN_REGRESSION_ERR_TOL = 0.3
+_TILEN_REGRESSION_ERR_TOL = 0.003
 
 
 def check_tilen_column_map():
@@ -469,7 +469,7 @@ def check_tilen_column_map():
 # from drifting into each other.
 _MX32_GROUP = 32
 _MX32_SHAPE = (2, 128, 256, 4096)  # G, M, N, K
-_MX32_ERR_TOL = 0.3
+_MX32_ERR_TOL = 0.003
 _MX32_KIDS = tuple(
     sorted(
         kid
@@ -731,7 +731,7 @@ def check_wave1_group128():
                 split_k=int(split),
             )
             torch.cuda.synchronize()
-            torch.testing.assert_close(out, ref, rtol=0.2, atol=0.3)
+            torch.testing.assert_close(out, ref, rtol=0.02, atol=0.03)
             checks += 1
     return checks
 
@@ -790,7 +790,7 @@ _ALIGN_MS = [1, 17, 48, 64, 96, 127, 128, 129, 200, 255, 256, 512]
 _ALIGN_G = 2
 # (N, K) candidates: the second entry serves the k1024-only pipeline kids.
 _ALIGN_SHAPES = [(1024, 4096), (1024, 1024)]
-_ALIGN_ERR_TOL = 0.3  # e8m0 quant floor is ~0.14; same gate the tuner uses
+_ALIGN_ERR_TOL = 0.003  # e8m0 quant floor is ~0.0014; same gate the tuner uses
 
 
 def _align_kids():
