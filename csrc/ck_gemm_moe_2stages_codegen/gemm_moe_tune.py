@@ -3,6 +3,7 @@
 
 import argparse
 import functools
+import hashlib
 import math
 import os
 import re
@@ -127,6 +128,7 @@ if TYPE_CHECKING:
     from types import SimpleNamespace
 
     from csrc.ck_gemm_moe_2stages_codegen.mxfp4_staged_search import StagedSearchPlan
+from csrc.ck_gemm_moe_2stages_codegen import mxfp4_v2_tune_utils as _v2u
 from csrc.ck_gemm_moe_2stages_codegen.mxfp4_v2_tune_utils import (
     v2_stage1_sorted_ref as _v2_stage1_ref,
 )
@@ -161,6 +163,250 @@ def _is_tune_excluded_kernel(kernel_name) -> bool:
     """True if ``kernel_name`` matches any excluded-kernel pattern."""
     name = str(kernel_name or "")
     return any(pat in name for pat in _TUNE_EXCLUDE_KERNEL_PATTERNS)
+
+
+def _balanced_topk_ids(token, global_e, topk, seed, device):
+    """Balanced routing of amd_moe_bench_share/bench_moe.py make_input().
+
+    Tokens take ``topk`` experts at a time from a stream of random permutations
+    of the ``global_e`` experts, so every token picks distinct experts and the
+    global expert loads differ by at most one. When ``global_e % topk == 0``
+    the ids equal the bench's for the same ``seed``; otherwise a token spanning
+    two permutations takes the rest of one and the first experts of the next
+    that it does not already hold.
+    """
+    if topk > global_e:
+        raise ValueError(f"topk={topk} exceeds the {global_e} global experts")
+    text = f"routes|{seed}|{global_e}|{topk}|{token}"
+    digest = hashlib.sha256(text.encode()).digest()[:8]
+    route_seed = int.from_bytes(digest, "little") & ((1 << 63) - 1)
+    gen = torch.Generator(device=device).manual_seed(route_seed)
+    ids = torch.empty((token, topk), dtype=dtypes.i32, device=device)
+    slots = torch.arange(topk, device=device)[None, :]
+    carry = slots.new_empty(0)
+    start = 0
+    while start < token:
+        perm = torch.randperm(global_e, generator=gen, device=device)
+        if carry.numel():
+            held = torch.isin(perm, carry)
+            perm = torch.cat((perm[~held], perm[held]))
+            head = topk - carry.numel()
+            ids[start] = torch.cat((carry, perm[:head]))
+            perm = perm[head:]
+            start += 1
+        count = min(perm.numel() // topk, token - start)
+        block = perm[: count * topk].reshape(count, topk)
+        offsets = torch.randint(0, topk, (count, 1), generator=gen, device=device)
+        ids[start : start + count] = torch.gather(block, 1, (slots + offsets) % topk)
+        start += count
+        carry = perm[count * topk :]
+    return ids
+
+
+def _ep_route(inp, expert, topk, ep, seed=0):
+    """Routing of EP rank 0 after dispatch.
+
+    ``inp.shape[0]`` is the dispatch buffer row count, which equals the global
+    source token count. The source tokens route over the ``expert * ep`` global
+    experts as amd_moe_bench_share/bench_moe.py does (_balanced_topk_ids, route
+    weights 1/topk), and rank 0 owns global experts [0, expert). As in
+    op_tests/test_moe_ep.py --ep-mode real, the tokens that own at least one
+    local expert fill the first ``total_recv`` rows, and the remaining rows are
+    dead padding skipped through ``num_local_tokens``.
+    The routing depends only on the row count and ``seed``.
+    """
+    device = inp.device
+    token = inp.shape[0]
+    global_e = expert * ep
+    # One extra masked slot, so moe_sorting sees the runtime's global expert count.
+    expert_mask = torch.zeros(global_e + 1, dtype=dtypes.i32, device=device)
+    expert_mask[:expert] = 1
+    src_ids = _balanced_topk_ids(token, global_e, topk, seed, device)
+    recv = expert_mask[src_ids.long()].bool().any(dim=1)
+    total_recv = int(recv.sum().item())
+    # Padding routes to the masked slot; id 0 would be rank 0's local expert 0.
+    topk_ids = torch.full_like(src_ids, global_e)
+    topk_ids[:total_recv] = src_ids[recv]
+    topk_weights = torch.zeros((token, topk), dtype=dtypes.fp32, device=device)
+    topk_weights[:total_recv] = 1.0 / topk
+    is_local = expert_mask[topk_ids.long()].bool()
+    local_topk_ids = torch.where(is_local, topk_ids, -1)
+    num_local_tokens = torch.tensor([total_recv], dtype=dtypes.i32, device=device)
+    return topk_weights, topk_ids, local_topk_ids, expert_mask, num_local_tokens
+
+
+def _ep_route_stats(token, expert, topk, ep, seed):
+    """(total_recv, local_routes, active_experts) of _ep_route for ``seed``."""
+    inp = torch.empty((token, 16), dtype=dtypes.bf16)
+    _, _, local_topk_ids, _, num_local_tokens = _ep_route(inp, expert, topk, ep, seed)
+    local = local_topk_ids[local_topk_ids >= 0]
+    return (
+        int(num_local_tokens.item()),
+        int(local.numel()),
+        int(torch.unique(local).numel()),
+    )
+
+
+def _v2_gen_ep(
+    token,
+    model_dim,
+    inter_dim,
+    E,
+    topk,
+    ep,
+    ep_seed=0,
+    adtype="fp8",
+    b_dtype="fp4",
+    activation=ActivationType.Silu,
+    situ_beta=DEFAULT_SITUV2_BETA,
+    situ_linear_beta=DEFAULT_SITUV2_LINEAR_BETA,
+):
+    """mxfp4_v2_tune_utils.gen() with EP routing (see _ep_route).
+
+    Builds only the fields the flydslv2 tasks read. ``topk_ids`` holds global
+    expert ids for the sort; the torch references use ``local_topk_ids``, where
+    remote routes and padding rows are -1.
+    """
+    torch.manual_seed(0)
+    inp = torch.randn((token, model_dim), dtype=dtypes.bf16) / 10
+    w1 = torch.randn((E, inter_dim * 2, model_dim), dtype=dtypes.bf16) / 10
+    w2 = torch.randn((E, model_dim, inter_dim), dtype=dtypes.bf16) / 10
+    topk_weights, topk_ids, local_topk_ids, expert_mask, num_local_tokens = _ep_route(
+        inp, E, topk, ep, ep_seed
+    )
+
+    w1_qt, w1_scale = _v2u.quant_w(w1, b_dtype)
+    w2_qt, w2_scale = _v2u.quant_w(w2, b_dtype)
+    a1_qt, a1_scale = _v2u.quant_a(inp, adtype)
+
+    a_deq = _v2u._a_deq(a1_qt, a1_scale, token, model_dim, adtype)
+    w1_deq = (
+        _v2u.dequant_w(w1_qt, w1_scale, b_dtype, E * inter_dim * 2, model_dim)
+        .view(E, inter_dim * 2, model_dim)
+        .to(dtypes.bf16)
+    )
+    w2_deq = (
+        _v2u.dequant_w(w2_qt, w2_scale, b_dtype, E * model_dim, inter_dim)
+        .view(E, model_dim, inter_dim)
+        .to(dtypes.bf16)
+    )
+    ref1 = torch_moe_stage1(
+        a_deq,
+        w1_deq,
+        w2_deq,
+        topk_weights,
+        local_topk_ids,
+        dtype=dtypes.bf16,
+        activation=activation,
+        quant_type=QuantType.No,
+        doweight=False,
+        situ_beta=situ_beta,
+        situ_linear_beta=situ_linear_beta,
+    )
+    ref2 = torch_moe_stage2(
+        ref1,
+        w1_deq,
+        w2_deq,
+        topk_weights,
+        local_topk_ids,
+        dtype=dtypes.bf16,
+        quant_type=QuantType.No,
+        doweight=True,
+    )
+    ref2_quantized = None
+    if b_dtype == "fp8":
+        a2_ref_q, a2_ref_scale = _v2u.quant_a(
+            ref1.contiguous().view(token * topk, inter_dim), adtype
+        )
+        a2_ref_deq = _v2u._a_deq(
+            a2_ref_q, a2_ref_scale, token * topk, inter_dim, adtype
+        ).view(token, topk, inter_dim)
+        ref2_quantized = torch_moe_stage2(
+            a2_ref_deq,
+            w1_deq,
+            w2_deq,
+            topk_weights,
+            local_topk_ids,
+            dtype=dtypes.bf16,
+            quant_type=QuantType.No,
+            doweight=True,
+        )
+
+    if b_dtype == "fp8":
+        w1_qt_shuf = shuffle_weight_a16w4(w1_qt, 16, True)
+        w1_scale_shuf = shuffle_scale_a16w4(w1_scale, E, True)
+        w2_qt_shuf = shuffle_weight_a16w4(w2_qt, 16, False)
+        w2_scale_shuf = fp4_utils.e8m0_shuffle(w2_scale)
+    else:
+        w1_qt_shuf, w1_scale_shuf = _v2u._baseline_w1_shuffle(
+            w1_qt, w1_scale, E, adtype
+        )
+        w2_qt_shuf = _v2u._mxfp4_shuffle_weight_a16w4(w2_qt, gate_up=False)
+        w2_scale_shuf = _v2u._mxfp4_shuffle_scale_a16w4(w2_scale, E, gate_up=False)
+    return {
+        "ref1": ref1,
+        "ref2": ref2,
+        "ref2_quantized": ref2_quantized,
+        "topk_ids": topk_ids,
+        "topk_weights": topk_weights,
+        "local_topk_ids": local_topk_ids,
+        "expert_mask": expert_mask,
+        "num_local_tokens": num_local_tokens,
+        "a1_qt": a1_qt,
+        "a1_scale": a1_scale,
+        "inp": inp,
+        "base": {
+            "w1_qt_shuf": w1_qt_shuf,
+            "w1_scale_shuf": w1_scale_shuf,
+            "w2_qt_shuf": w2_qt_shuf,
+            "w2_scale_shuf": w2_scale_shuf,
+        },
+        "adtype": adtype,
+        "stage2_adtype": adtype,
+        "b_dtype": b_dtype,
+    }
+
+
+def _v2_build_inputs_ep(d, model_dim, inter_dim, BM_S1):
+    """mxfp4_v2_tune_utils.build_v2_inputs() for _v2_gen_ep data.
+
+    Sorts through the runtime moe_sorting with the global expert count,
+    expert_mask and num_local_tokens, as fused_moe does under EP, so the
+    sorted buffers (and hence the GEMM grids) match the runtime sizes.
+    """
+    sti, swt, sei, cumsum, _ = moe_sorting(
+        d["topk_ids"],
+        d["topk_weights"],
+        d["expert_mask"].numel(),
+        model_dim,
+        dtypes.bf16,
+        BM_S1,
+        d["expert_mask"],
+        d["num_local_tokens"],
+    )
+    torch.cuda.synchronize()
+    max_sorted = sti.shape[0]
+    inter_cols = inter_dim if d["stage2_adtype"] == "fp8" else inter_dim // 2
+    isq = torch.zeros((max_sorted, inter_cols), dtype=torch.uint8)
+    isc_cols = inter_dim // 32
+    isr = (
+        (((max_sorted * ((2 * inter_dim) // 64) * 4) + isc_cols - 1) // isc_cols + 31)
+        // 32
+        * 32
+    )
+    iss = torch.zeros((isr, isc_cols), dtype=torch.uint8)
+    return {
+        "w2u8": _v2u._u8v(d["base"]["w2_qt_shuf"]),
+        "w2sc": _v2u._u8v(d["base"]["w2_scale_shuf"]),
+        "sei": sei,
+        "cumsum": cumsum,
+        "sti": sti,
+        "swt": swt,
+        "isq": isq,
+        "iss": iss,
+        "n": int(cumsum[0].item()),
+        "max_sorted": max_sorted,
+    }
 
 
 def _all_finite(tensor: torch.Tensor) -> bool:
@@ -745,7 +991,7 @@ class FmoeTuner(TunerCommon):
             "--mxfp4-flydsl",
             action="store_true",
             required=False,
-            help="Tune the FlyDSL mxfp4 a4w4 port as a coupled (g1, g2) unit instead of the normal fmoe tuner.",
+            help="Tune FlyDSL MXFP4 A4W4/A8W4 as a coupled (g1, g2) pipeline.",
         )
         self.parser.add_argument(
             "--mxfp4-search-mode",
@@ -768,6 +1014,26 @@ class FmoeTuner(TunerCommon):
             help="Tune FP8 per_1x128 SiLU MoE with this gate/up clamp. Only CK "
             "2-stage candidates can clamp; results are tagged in a _tag column "
             "and must go to a separate tuned file (-o).",
+        )
+        self.parser.add_argument(
+            "--ep-size",
+            type=int,
+            default=0,
+            help="Tune every row on EP data: token is the dispatch buffer row "
+            "count (global tokens), expert the local expert count; routes span "
+            "expert * ep-size global experts with the balanced routing of "
+            "amd_moe_bench_share/bench_moe.py, and only rank 0's local routes "
+            "are computed, laid out as op_tests/test_moe_ep.py --ep-mode real "
+            "does. Tunes flydslv2 only, or with --mxfp4-flydsl MXMOE GEMM1 "
+            "with atomic/reduce layout GEMM2. 0 (default) keeps the dense data.",
+        )
+        self.parser.add_argument(
+            "--ep-seed",
+            type=int,
+            default=0,
+            help="With --ep-size: routing seed, as bench_moe.py --seed. With "
+            "the same seed, global expert count, topk and token, the routes "
+            "equal the bench's when the global expert count is a multiple of topk.",
         )
 
     def parse_args(self) -> argparse.Namespace:
@@ -797,6 +1063,17 @@ class FmoeTuner(TunerCommon):
                 )
             if "_tag" not in self.columns:
                 self.columns = self.columns + ["_tag"]
+        args.ep_size = getattr(args, "ep_size", 0)
+        args.ep_seed = getattr(args, "ep_seed", 0)
+        if args.ep_size < 0:
+            self.parser.error("--ep-size must be >= 0")
+        if args.ep_seed and not args.ep_size:
+            self.parser.error("--ep-seed requires --ep-size")
+        if args.ep_size and (args.grouped_gemm or args.e2e_tune):
+            self.parser.error(
+                "--ep-size applies to the default fmoe tuner and --mxfp4-flydsl "
+                "only, not --grouped-gemm / --e2e_tune"
+            )
         if getattr(args, "fast_scan", False) and not self.SUPPORTS_FAST_SCAN:
             self.parser.error("--fast-scan requires --mxfp4-flydsl")
         if not hasattr(args, "fast_scan"):
@@ -1278,6 +1555,8 @@ class FmoeTuner(TunerCommon):
         adtype,
         b_dtype,
         act_type,
+        ep=0,
+        ep_seed=0,
         device="cuda",
     ):
         # Build the SAME inputs the runtime v2 gemm1 path consumes:
@@ -1288,20 +1567,39 @@ class FmoeTuner(TunerCommon):
         # Generate on the GPU: the CPU fp4 packing of E x 2I x H weights takes
         # tens of minutes per shape at E=385.
         with torch.device(device):
-            d = _v2_gen(
-                token,
-                model_dim,
-                inter_dim,
-                expert,
-                topk,
-                blockM,
-                adtype=adtype,
-                b_dtype=b_dtype,
-                activation=act_type,
-                situ_beta=DEFAULT_SITUV2_BETA,
-                situ_linear_beta=DEFAULT_SITUV2_LINEAR_BETA,
-            )
-        v = _v2_build_inputs(d, token, model_dim, inter_dim, expert, topk, blockM)
+            if ep:
+                d = _v2_gen_ep(
+                    token,
+                    model_dim,
+                    inter_dim,
+                    expert,
+                    topk,
+                    ep,
+                    ep_seed,
+                    adtype=adtype,
+                    b_dtype=b_dtype,
+                    activation=act_type,
+                    situ_beta=DEFAULT_SITUV2_BETA,
+                    situ_linear_beta=DEFAULT_SITUV2_LINEAR_BETA,
+                )
+            else:
+                d = _v2_gen(
+                    token,
+                    model_dim,
+                    inter_dim,
+                    expert,
+                    topk,
+                    blockM,
+                    adtype=adtype,
+                    b_dtype=b_dtype,
+                    activation=act_type,
+                    situ_beta=DEFAULT_SITUV2_BETA,
+                    situ_linear_beta=DEFAULT_SITUV2_LINEAR_BETA,
+                )
+        if ep:
+            v = _v2_build_inputs_ep(d, model_dim, inter_dim, blockM)
+        else:
+            v = _v2_build_inputs(d, token, model_dim, inter_dim, expert, topk, blockM)
         # Precompute the sorted A-scale here so it is NOT timed in the run func.
         a1_scale_sort = moe_mxfp4_sort(
             d["a1_scale"][:token, :].view(token, 1, -1),
@@ -1327,7 +1625,7 @@ class FmoeTuner(TunerCommon):
             "isq": v["isq"],
             "n": v["n"],
             "ref1": d["ref1"],
-            "topk_ids": d["topk_ids"],
+            "topk_ids": d["local_topk_ids"] if ep else d["topk_ids"],
         }
 
     @staticmethod
@@ -1395,22 +1693,41 @@ class FmoeTuner(TunerCommon):
         adtype,
         b_dtype,
         act_type,
+        ep=0,
+        ep_seed=0,
         device="cuda",
     ):
-        d = _v2_gen(
-            token,
-            model_dim,
-            inter_dim,
-            expert,
-            topk,
-            blockM,
-            adtype=adtype,
-            b_dtype=b_dtype,
-            activation=act_type,
-            situ_beta=DEFAULT_SITUV2_BETA,
-            situ_linear_beta=DEFAULT_SITUV2_LINEAR_BETA,
-        )
-        v = _v2_build_inputs(d, token, model_dim, inter_dim, expert, topk, blockM)
+        if ep:
+            d = _v2_gen_ep(
+                token,
+                model_dim,
+                inter_dim,
+                expert,
+                topk,
+                ep,
+                ep_seed,
+                adtype=adtype,
+                b_dtype=b_dtype,
+                activation=act_type,
+                situ_beta=DEFAULT_SITUV2_BETA,
+                situ_linear_beta=DEFAULT_SITUV2_LINEAR_BETA,
+            )
+            v = _v2_build_inputs_ep(d, model_dim, inter_dim, blockM)
+        else:
+            d = _v2_gen(
+                token,
+                model_dim,
+                inter_dim,
+                expert,
+                topk,
+                blockM,
+                adtype=adtype,
+                b_dtype=b_dtype,
+                activation=act_type,
+                situ_beta=DEFAULT_SITUV2_BETA,
+                situ_linear_beta=DEFAULT_SITUV2_LINEAR_BETA,
+            )
+            v = _v2_build_inputs(d, token, model_dim, inter_dim, expert, topk, blockM)
         _v2_populate_stage2(d, v, token, topk, blockM)
         return {
             "isq": v["isq"],
@@ -1424,6 +1741,8 @@ class FmoeTuner(TunerCommon):
             "n": v["n"],
             "max_sorted": v["max_sorted"],
             "ref2": d["ref2_quantized"] if b_dtype == "fp8" else d["ref2"],
+            "expert_mask": d["expert_mask"] if ep else None,
+            "topk_ids": d["topk_ids"] if ep else None,
         }
 
     @staticmethod
@@ -1439,6 +1758,8 @@ class FmoeTuner(TunerCommon):
         n,
         max_sorted,
         ref2,
+        expert_mask,
+        topk_ids,
         model_dim,
         inter_dim,
         expert,
@@ -1447,6 +1768,7 @@ class FmoeTuner(TunerCommon):
     ):
         from aiter.ops.flydsl.kernels.mxmoe_dispatcher import mxfp4_moe_gemm2
 
+        is_ep = expert_mask is not None
         token = ref2.shape[0]
         epilog = kparams["epilog"]
         bm_s2 = kparams["tile_m"]
@@ -1471,6 +1793,9 @@ class FmoeTuner(TunerCommon):
         )
         if epilog != "reduce":
             out.zero_()
+        elif is_ep:
+            # As _flydsl_v2_stage2_wrapper: EP leaves remote-route slots unwritten.
+            inter.zero_()
         mxfp4_moe_gemm2(
             inter_sorted_quant=isq,
             inter_sorted_shuffled_scale=iss,
@@ -1496,7 +1821,11 @@ class FmoeTuner(TunerCommon):
             epilog=epilog,
             SBM=sbm,
             persist=kparams["persist"],
-            n_sorted_padded=n,
+            # The runtime EP call passes no padded count, so the grid is the
+            # M_logical * topk upper bound rather than the valid sorted rows.
+            n_sorted_padded=None if is_ep else n,
+            is_ep=is_ep,
+            use_valid_token_count=is_ep,
         )
         if epilog == "scatter":
             n_valid = int(n)
@@ -1523,7 +1852,15 @@ class FmoeTuner(TunerCommon):
         if epilog == "reduce":
             from aiter.ops.flydsl.moe_kernels import _run_moe_reduction
 
-            _run_moe_reduction(inter, out, token, topk, model_dim)
+            _run_moe_reduction(
+                inter,
+                out,
+                token,
+                topk,
+                model_dim,
+                expert_mask=expert_mask,
+                topk_ids=topk_ids,
+            )
         return out
 
     @staticmethod
@@ -4292,7 +4629,7 @@ class FmoeTuner(TunerCommon):
 
         return tasks_flydsl
 
-    def gen_flydsl_v2_2stages_task(self, info, blockMs):
+    def gen_flydsl_v2_2stages_task(self, info, blockMs, ep=0, ep_seed=0):
         tasks = []
         (
             _gfx,
@@ -4381,6 +4718,8 @@ class FmoeTuner(TunerCommon):
                             adtype,
                             bdtype,
                             act_type,
+                            ep,
+                            ep_seed,
                         ),
                         FmoeTuner.run_flydsl_v2_stage1_out,
                         (
@@ -4444,6 +4783,8 @@ class FmoeTuner(TunerCommon):
                             adtype,
                             bdtype,
                             act_type,
+                            ep,
+                            ep_seed,
                         ),
                         FmoeTuner.run_flydsl_v2_stage2_out,
                         (
@@ -4459,6 +4800,8 @@ class FmoeTuner(TunerCommon):
                                 "n",
                                 "max_sorted",
                                 "ref2",
+                                "expert_mask",
+                                "topk_ids",
                             ],
                             model_dim,
                             inter_dim,
@@ -5474,6 +5817,29 @@ class FmoeTuner(TunerCommon):
                 use_g1u1,
                 doweight_stage1,
             )
+            ep = args.ep_size
+            if ep:
+                if token < ep or token % ep:
+                    print(
+                        f"[ep] skip token={token}: EP{ep} dispatch buffer rows "
+                        f"are a positive multiple of {ep}"
+                    )
+                    continue
+                ep_seed = args.ep_seed
+                recv, routes, active = _ep_route_stats(token, expert, topk, ep, ep_seed)
+                print(
+                    f"[ep] token={token} seed={ep_seed}: total_recv={recv} "
+                    f"local_routes={routes} active_experts={active}/{expert}"
+                )
+                # Runtime EP rejects Opus stage2 configs (and the other families'
+                # EP paths are not modeled here), so EP mode tunes flydslv2 only.
+                ep_tasks = self.gen_flydsl_v2_2stages_task(info, blockMs, ep, ep_seed)
+                print(
+                    f"[ep] ep_size={ep}: {len(ep_tasks)} flydslv2 tasks, "
+                    f"TUNE_ONLY/OPUS_ONLY ignored"
+                )
+                tasks_ck.extend(ep_tasks)
+                continue
             _opus_only = os.environ.get("OPUS_ONLY", "0") == "1"
             # TUNE_ONLY: comma-list subset gate to isolate sources, e.g.
             #   TUNE_ONLY=flydsl  -> only gen_flydsl_2stages_task
@@ -7122,11 +7488,11 @@ class GroupedFmoeTuner(FmoeTuner):
 
 
 class Mxfp4FlydslTuner(FmoeTuner):
-    """Tune the FlyDSL mxfp4 a4w4 *port* (flydsl_mxmoe_g{1,2}_a4w4_*) as one coupled
-    unit.
+    """Tune FlyDSL A4W4/A8W4 as one coupled GEMM1/GEMM2 pipeline.
 
-    By default, prune GEMM1 using M_est = ceil(token * topk / expert) and screen
-    the pruned stages (staged search); with --fast-scan and no explicit mode,
+    By default, prune A4W4 GEMM1 using M_est (estimated rows per expert, see
+    _m_est) and screen the pruned stages (staged search); A8W4 keeps every
+    GEMM1 variant. With --fast-scan and no explicit mode,
     every pruned pair is scanned instead. Pruning reduces candidate evaluation
     work and is expected to shorten tuning wall time; the actual speedup has not
     been measured. Kernel performance and winner retention on unseen shapes
@@ -7228,6 +7594,8 @@ class Mxfp4FlydslTuner(FmoeTuner):
         args = super().parse_args()
         self._require_distinct_input_output(args)
         self._configuration = self._capture_configuration()
+        self._configuration["ep_size"] = args.ep_size
+        self._configuration["ep_seed"] = args.ep_seed
         args.mxfp4_configuration = self._configuration
         return args
 
@@ -7241,12 +7609,16 @@ class Mxfp4FlydslTuner(FmoeTuner):
     ) -> "str | None":
         for field, expected in (
             ("dtype", dtypes.bf16),
-            ("q_dtype_a", dtypes.fp4x2),
             ("q_dtype_w", dtypes.fp4x2),
             ("q_type", QuantType.per_1x32),
         ):
             if str(row.get(field)) != str(expected):
                 return f"{field} must be {expected}, got {row.get(field)!r}"
+        if str(row.get("q_dtype_a")) not in (
+            str(dtypes.fp4x2),
+            str(torch.float8_e4m3fn),
+        ):
+            return f"q_dtype_a must be MXFP4 or MXFP8, got {row.get('q_dtype_a')!r}"
         for field, allowed in (
             ("use_g1u1", ("1", "1.0", "true")),
             ("doweight_stage1", ("0", "0.0", "false")),
@@ -7261,11 +7633,12 @@ class Mxfp4FlydslTuner(FmoeTuner):
             and self._invocation_configuration()["swiglu_limit"] is not None
         ):
             return "MXMOE cannot apply a configured swiglu_limit to Situv2"
-        gate = row.get("gate_mode", "separated")
+        expected_gate = "interleave" if self._row_a_dtype(row) == "fp8" else "separated"
+        gate = row.get("gate_mode", expected_gate)
         if pd.isna(gate) or str(gate).strip() == "":
-            gate = "separated"
-        if str(gate).rsplit(".", 1)[-1].lower() != "separated":
-            return f"gate_mode must be separated, got {gate!r}"
+            gate = expected_gate
+        if str(gate).rsplit(".", 1)[-1].lower() != expected_gate:
+            return f"gate_mode must be {expected_gate}, got {gate!r}"
         for field in ("token", "model_dim", "inter_dim", "expert", "topk"):
             try:
                 value = int(row.get(field, 0))
@@ -7274,9 +7647,22 @@ class Mxfp4FlydslTuner(FmoeTuner):
             except (TypeError, ValueError, OverflowError):
                 pass
             return f"{field} must be a positive integer, got {row.get(field)!r}"
-        if int(row["topk"]) > int(row["expert"]):
+        ep = self._ep_size()
+        if ep and int(row["token"]) % ep:
+            return f"EP{ep} dispatch buffer rows must be a multiple of {ep}"
+        if not ep and int(row["topk"]) > int(row["expert"]):
             return "topk must not exceed expert count"
         return None
+
+    def _ep_size(self) -> int:
+        return int(self._invocation_configuration().get("ep_size", 0) or 0)
+
+    def _ep_routing(self, row: "Mapping[str, object]") -> "tuple[int, int]":
+        """(ep, seed) of the row's EP routing sample; (0, 0) for dense data."""
+        ep = self._ep_size()
+        if not ep:
+            return 0, 0
+        return ep, int(self._invocation_configuration().get("ep_seed", 0) or 0)
 
     @staticmethod
     def _names_kernel(tunedf: "pd.DataFrame") -> "pd.Series":
@@ -7436,7 +7822,6 @@ class Mxfp4FlydslTuner(FmoeTuner):
         # flydsl_mxmoe_g1_a{4,8}w4_<BM>x<BN>x<BK>[_f16in][_hpf][_nt][_fp8out]
         #   [_situv2|_swiglu][_kw<n>][_xcd<n>][_w2];
         # token order must match _parse_mxfp4_g1_kname in mxfp4_kname.py.
-        # The tuner only enumerates A4W4; A8W4 names serve the coupled tests.
         if prefetch_hidden and not inline_quant:
             raise ValueError("hidden prefetch requires inline quantization")
         a_bits = 8 if a_dtype == "fp8" else 4
@@ -7474,11 +7859,14 @@ class Mxfp4FlydslTuner(FmoeTuner):
     # Below this M_est, staged search validates every pruned pair, unscreened.
     _STAGED_SMALL_BATCH_M_EST = 4
 
-    @staticmethod
-    def _m_est(row: dict[str, Any]) -> int:
-        """Estimated tokens per expert: ceil(token * topk / expert)."""
+    def _m_est(self, row: dict[str, Any]) -> int:
+        """Estimated tokens per expert: ceil(token * topk / expert), or under EP
+        ceil(local_routes / expert) of the row's routing sample."""
         ne = int(row["expert"])
-        return (int(row["token"]) * int(row["topk"]) + ne - 1) // ne
+        token, topk = int(row["token"]), int(row["topk"])
+        ep, seed = self._ep_routing(row)
+        routes = _ep_route_stats(token, ne, topk, ep, seed)[1] if ep else token * topk
+        return (routes + ne - 1) // ne
 
     @staticmethod
     def _g1_matches_m_est(g1: dict[str, Any], m_est: int) -> bool:
@@ -7510,8 +7898,13 @@ class Mxfp4FlydslTuner(FmoeTuner):
         ne, h, e = int(row["expert"]), int(row["model_dim"]), int(row["inter_dim"])
         topk = int(row["topk"])
         act = self._row_act(row)
+        a_dtype = self._row_a_dtype(row)
         out = []
-        for bm, use_nt, inline_quant in sorted(MXFP4_G1_VARIANTS["fp4"]):
+        for bm, use_nt, inline_quant in sorted(MXFP4_G1_VARIANTS[a_dtype]):
+            # BM16 FP8 (native scale layout) is not validated with this tuner's
+            # A8W4 pairing, densely or under EP.
+            if a_dtype == "fp8" and bm == 16:
+                continue
             for bn in self._G1_BN:
                 for num_waves in self._G1_NUM_WAVES:
                     for k_wave in self._G1_K_WAVE:
@@ -7529,6 +7922,8 @@ class Mxfp4FlydslTuner(FmoeTuner):
                                         use_nt=use_nt,
                                         inline_quant=inline_quant,
                                         prefetch_hidden=hpf,
+                                        a_dtype=a_dtype,
+                                        out_dtype=a_dtype,
                                         act=act,
                                         situ_beta=DEFAULT_SITUV2_BETA,
                                         situ_linear_beta=DEFAULT_SITUV2_LINEAR_BETA,
@@ -7550,9 +7945,12 @@ class Mxfp4FlydslTuner(FmoeTuner):
                                         "k_wave": k_wave,
                                         "xcd_swizzle": xcd,
                                         "num_waves": num_waves,
+                                        "a_dtype": a_dtype,
+                                        "out_dtype": a_dtype,
                                     }
                                 )
-        if full_search:
+        # The M_est rules hand M_est < 4 to BM16 only, which A8W4 skips above.
+        if full_search or a_dtype == "fp8":
             return out
         m_est = self._m_est(row)
         kept = [g1 for g1 in out if self._g1_matches_m_est(g1, m_est)]
@@ -7567,6 +7965,10 @@ class Mxfp4FlydslTuner(FmoeTuner):
                 flush=True,
             )
         return kept
+
+    @staticmethod
+    def _row_a_dtype(row):
+        return "fp8" if str(row.get("q_dtype_a")) == str(torch.float8_e4m3fn) else "fp4"
 
     @staticmethod
     def _row_act(row):
@@ -7626,18 +8028,19 @@ class Mxfp4FlydslTuner(FmoeTuner):
         self, row: dict[str, Any], full_search: bool = False
     ) -> list[dict[str, Any]]:
         cands = []
+        ep = self._ep_size()
         for g1 in self._g1_variants(row, full_search=full_search):
             bm = g1["bm"]
             kn1 = self._g1_kname(**g1)
-            # a4w4 pairs flydsl_mxmoe_g1_* with flydsl_moe2_layout_* only. The
-            # native flydsl_mxmoe_g2_a4w4_* family is deliberately not proposed:
+            # Both precisions pair flydsl_mxmoe_g1_* with flydsl_moe2_layout_*.
+            # The native flydsl_mxmoe_g2_a4w4_* family is deliberately not proposed:
             # its BK=256 contraction requires D_INTER % 256 == 0, so it cannot
             # serve inter_dim like 384, and the layout family covers the same
             # tile space with the sort_block_m contract the port's intermediate
             # needs. Only native SBM==tile_m==bm variants are used; re-tiling
             # (tile_m < bm) is not supported by that layout.
             for kn2v, kp in get_flydsl_stage2_v2_kernels(
-                "fp4",
+                g1["out_dtype"],
                 "fp4",
                 "bf16",
                 bm,
@@ -7645,6 +8048,11 @@ class Mxfp4FlydslTuner(FmoeTuner):
                 inter_dim=int(row["inter_dim"]),
             ).items():
                 if kp["tile_m"] != bm:
+                    continue
+                # Under EP the runtime keeps a scatter GEMM2 only if a
+                # scatter_reduce instance covers (model_dim, topk), and the EP
+                # topk key carries the masked column on top of the tuned one.
+                if ep and kp["epilog"] == "scatter":
                     continue
                 cands.append(self._candidate_row(row, bm, kn1, kn2v))
         return cands
@@ -7657,8 +8065,25 @@ class Mxfp4FlydslTuner(FmoeTuner):
             row, self._candidate_rows(row, full_search=False)
         )
 
+    def _case(self, row: "Mapping[str, object]", dtype=dtypes.bf16) -> dict:
+        """_prepare_case for ``row``: its activation precision and EP routing."""
+        ep, ep_seed = self._ep_routing(row)
+        return self._prepare_case(
+            int(row["token"]),
+            int(row["model_dim"]),
+            int(row["inter_dim"]),
+            int(row["expert"]),
+            int(row["topk"]),
+            dtype,
+            a_dtype=self._row_a_dtype(row),
+            ep=ep,
+            ep_seed=ep_seed,
+        )
+
     @staticmethod
-    def _prepare_case(token, model_dim, inter_dim, expert, topk, dtype, a_dtype="fp4"):
+    def _prepare_case(
+        token, model_dim, inter_dim, expert, topk, dtype, a_dtype="fp4", ep=0, ep_seed=0
+    ):
         data = FmoeTuner.generate_data(
             token,
             model_dim,
@@ -7682,6 +8107,17 @@ class Mxfp4FlydslTuner(FmoeTuner):
                 scale_type=dtypes.fp8_e8m0,
                 shuffle=False,
             )
+        if ep:
+            # topk_ids hold global expert ids for the sort; the reference reads
+            # local_topk_ids, where remote routes and dead-tail rows are -1.
+            (
+                data["topk_weights"],
+                data["topk_ids"],
+                data["local_topk_ids"],
+                data["expert_mask"],
+                data["num_local_tokens"],
+            ) = _ep_route(data["input"], expert, topk, ep, ep_seed)
+            data["valid_rows"] = int(data["num_local_tokens"].item())
         # True a4w4 runs the SEPARATED gate/up layout (gemm1 interleave=False),
         # so prepare weights/scales with is_guinterleave=False; a8w4 runs the
         # interleaved layout (is_guinterleave=True). Feeding either layout to
@@ -7714,6 +8150,65 @@ class Mxfp4FlydslTuner(FmoeTuner):
     )
 
     @staticmethod
+    def _sort(data, ne, h, dtype, block_m, atomic):
+        """moe_sorting as fused_moe runs it, including EP's global expert count,
+        expert_mask and num_local_tokens."""
+        expert_mask = data.get("expert_mask")
+        return moe_sorting(
+            data["topk_ids"],
+            data["topk_weights"],
+            ne if expert_mask is None else expert_mask.numel(),
+            h,
+            dtype,
+            block_size=block_m,
+            expert_mask=expert_mask,
+            num_local_tokens=data.get("num_local_tokens"),
+            accumulate=atomic,
+            output_aux="opus",
+        )
+
+    @staticmethod
+    def _prequant(data, sorting, a_dtype, block_m, topk):
+        """The fused Opus prequant fused_moe_2stages runs ahead of GEMM1."""
+        sti, sw, _sei, nvi, *_rest = sorting
+        expert_mask = data.get("expert_mask")
+        quant = (
+            aiter.fused_dynamic_mxfp8_quant_moe_sort
+            if a_dtype == "fp8"
+            else aiter.fused_dynamic_mxfp4_quant_moe_sort
+        )
+        return quant(
+            input=data["input"],
+            sorted_ids=sti,
+            num_valid_ids=nvi,
+            token_num=data["input"].shape[0],
+            topk=topk,
+            block_size=block_m,
+            num_rows=data.get("num_local_tokens"),
+            sorted_weights=sw,
+            num_experts_upper_bound=(
+                data["w1_a16"].shape[0] if expert_mask is None else expert_mask.numel()
+            ),
+        )
+
+    @staticmethod
+    def _stage2_ep_args(data):
+        """EP keywords fused_moe_2stages hands the layout GEMM2; without them the
+        reduce epilog sums unwritten remote-route slots."""
+        if data.get("expert_mask") is None:
+            return {}
+        return {
+            "expert_mask": data["expert_mask"],
+            "topk_ids": data["topk_ids"],
+            "use_valid_token_count": True,
+        }
+
+    @staticmethod
+    def _valid_rows(data, out):
+        """Rows the accuracy gate compares; EP leaves the dead tail unwritten."""
+        return out[: data["valid_rows"]] if "valid_rows" in data else out
+
+    @staticmethod
     def _port_e2e(data, kn1, kn2, topk, ne, h, dtype, swiglu_limit=None):
         # kn2 may name either gemm2 family (path B or native mxmoe).
         _g2 = parse_g2_kname_any(kn2)
@@ -7730,16 +8225,8 @@ class Mxfp4FlydslTuner(FmoeTuner):
             _g2["BM"] == BM
         ), f"block_m mismatch between {kn1!r} (BM={BM}) and {kn2!r} (BM={_g2['BM']})"
         M = data["input"].shape[0]
-        sti, sw, sei, nvi, moe_buf, m_indices, reverse_sorted = moe_sorting(
-            data["topk_ids"],
-            data["topk_weights"],
-            ne,
-            h,
-            dtype,
-            block_size=BM,
-            accumulate=atomic,
-            output_aux="opus",
-        )
+        sorting = Mxfp4FlydslTuner._sort(data, ne, h, dtype, BM, atomic)
+        sti, sw, sei, nvi, moe_buf, m_indices, reverse_sorted = sorting
         moe_out = moe_buf if moe_buf.numel() else torch.empty((M, h), dtype=dtype)
         stage1_input = data["input"]
         stage1_scale = None
@@ -7747,20 +8234,8 @@ class Mxfp4FlydslTuner(FmoeTuner):
         # BM16 quantizes inline; the other variants consume the fused Opus
         # prequant output in their GEMM1 activation precision.
         if BM != 16:
-            quant = (
-                aiter.fused_dynamic_mxfp8_quant_moe_sort
-                if p1["a_dtype"] == "fp8"
-                else aiter.fused_dynamic_mxfp4_quant_moe_sort
-            )
-            stage1_input, stage1_scale = quant(
-                input=data["input"],
-                sorted_ids=sti,
-                num_valid_ids=nvi,
-                token_num=M,
-                topk=topk,
-                block_size=BM,
-                sorted_weights=sw,
-                num_experts_upper_bound=ne,
+            stage1_input, stage1_scale = Mxfp4FlydslTuner._prequant(
+                data, sorting, p1["a_dtype"], BM, topk
             )
         inter_q, inter_s = _mxfp4_a4w4_stage1_fw(
             stage1_input,
@@ -7787,7 +8262,7 @@ class Mxfp4FlydslTuner(FmoeTuner):
             ),
             swiglu_limit=swiglu_limit,
         )
-        return _mxfp4_a4w4_stage2_fw(
+        out = _mxfp4_a4w4_stage2_fw(
             inter_q,
             data["w1_a16"],
             data["w2_a16"],
@@ -7803,16 +8278,19 @@ class Mxfp4FlydslTuner(FmoeTuner):
             topk_weights=data["topk_weights"],
             kernelName2=kn2,
             reverse_sorted=reverse_sorted,
+            **Mxfp4FlydslTuner._stage2_ep_args(data),
         )
+        return Mxfp4FlydslTuner._valid_rows(data, out)
 
     @staticmethod
     def _torch_ref(data, topk, dtype, activation, swiglu_limit=None):
+        topk_ids = data.get("local_topk_ids", data["topk_ids"])
         ref1 = FmoeTuner.run_torch_moe_stage1(
             data["a1_qt"],
             data["w1_qt"],
             data["w2_qt"],
             data["topk_weights"],
-            data["topk_ids"],
+            topk_ids,
             data["a1_scale"],
             data["w1_scale"],
             dtype=dtype,
@@ -7822,18 +8300,19 @@ class Mxfp4FlydslTuner(FmoeTuner):
             topk=topk,
             swiglu_limit=swiglu_limit,
         )
-        return FmoeTuner.run_torch_moe_stage2(
+        ref = FmoeTuner.run_torch_moe_stage2(
             ref1,
             data["w1_qt"],
             data["w2_qt"],
             data["topk_weights"],
-            data["topk_ids"],
+            topk_ids,
             a2_scale=None,
             w2_scale=data["w2_scale"],
             dtype=dtype,
             quant_type=QuantType.per_1x32,
             doweight_stage1=False,
         )
+        return Mxfp4FlydslTuner._valid_rows(data, ref)
 
     def _run_candidate(
         self,
@@ -7850,8 +8329,8 @@ class Mxfp4FlydslTuner(FmoeTuner):
         whose time does not pick the winner."""
         from aiter.test_common import run_perftest
 
-        ne, h, e = int(row["expert"]), int(row["model_dim"]), int(row["inter_dim"])
-        token, topk = int(row["token"]), int(row["topk"])
+        ne, h = int(row["expert"]), int(row["model_dim"])
+        topk = int(row["topk"])
         dtype = dtypes.bf16
         kn1, kn2 = candidate["kernelName1"], candidate["kernelName2"]
         activation = {
@@ -7875,7 +8354,7 @@ class Mxfp4FlydslTuner(FmoeTuner):
                 if observed is not None:
                     previously_observed_errors.append(observed)
         if data is None:
-            data = self._prepare_case(token, h, e, ne, topk, dtype)
+            data = self._case(row, dtype)
         requested_warmup = int(args.warmup if num_warmup is None else num_warmup)
         measured_iters = int(args.iters if num_iters is None else num_iters)
 
@@ -7937,11 +8416,12 @@ class Mxfp4FlydslTuner(FmoeTuner):
             timed_warmup = requested_warmup
         # run_perftest rotates deep copies of its arguments, sized from the
         # positional tensors; anything a closure captures is never copied.
+        # The small EP routing fields (expert_mask, ...) stay shared.
         inputs = self._PORT_E2E_INPUTS
 
         def timed_pipeline(*tensors):
             return self._port_e2e(
-                dict(zip(inputs, tensors)),
+                {**data, **dict(zip(inputs, tensors))},
                 kn1,
                 kn2,
                 topk,
@@ -8075,18 +8555,14 @@ class Mxfp4FlydslTuner(FmoeTuner):
     def _prepare_screening_case(
         self, row: dict[str, Any], block_m: int, atomic: bool
     ) -> tuple[dict[str, Any], tuple[torch.Tensor, ...]]:
-        ne, h, e = int(row["expert"]), int(row["model_dim"]), int(row["inter_dim"])
-        token, topk = int(row["token"]), int(row["topk"])
-        data = self._prepare_case(token, h, e, ne, topk, dtypes.bf16)
-        sorting = moe_sorting(
-            data["topk_ids"],
-            data["topk_weights"],
-            ne,
-            h,
+        data = self._case(row)
+        sorting = self._sort(
+            data,
+            int(row["expert"]),
+            int(row["model_dim"]),
             dtypes.bf16,
-            block_size=block_m,
-            accumulate=atomic,
-            output_aux="opus",
+            block_m,
+            atomic,
         )
         return data, sorting
 
@@ -8105,25 +8581,19 @@ class Mxfp4FlydslTuner(FmoeTuner):
 
         cfg = _parse_mxfp4_g1_kname(kn1)
         bm = cfg["BM"]
-        sti, sw, sei, nvi, moe_buf, m_indices, _reverse_sorted = sorting
+        sti, _sw, sei, nvi, moe_buf, m_indices, _reverse_sorted = sorting
         stage1_input, stage1_scale = data["input"], None
         if bm == 16:
             if stage1_input.dtype != dtypes.bf16:
                 raise ValueError("GEMM1 BM16 inline quantization requires BF16 input")
         else:
-            stage1_input, stage1_scale = aiter.fused_dynamic_mxfp4_quant_moe_sort(
-                input=stage1_input,
-                sorted_ids=sti,
-                num_valid_ids=nvi,
-                token_num=stage1_input.shape[0],
-                topk=topk,
-                block_size=bm,
-                sorted_weights=sw,
-                num_experts_upper_bound=data["w1_a16"].shape[0],
+            stage1_input, stage1_scale = Mxfp4FlydslTuner._prequant(
+                data, sorting, cfg["a_dtype"], bm, topk
             )
-            if stage1_input.dtype != dtypes.fp4x2 or stage1_scale is None:
+            a_dtype = dtypes.fp8 if cfg["a_dtype"] == "fp8" else dtypes.fp4x2
+            if stage1_input.dtype != a_dtype or stage1_scale is None:
                 raise ValueError(
-                    f"GEMM1 BM{bm} requires fused-prequantized FP4 input and scales"
+                    f"GEMM1 BM{bm} requires fused-prequantized {a_dtype} input and scales"
                 )
         situ_beta = DEFAULT_SITUV2_BETA if cfg["act"] == "situv2" else 1.0
         situ_linear_beta = DEFAULT_SITUV2_LINEAR_BETA if cfg["act"] == "situv2" else 1.0
@@ -8141,6 +8611,7 @@ class Mxfp4FlydslTuner(FmoeTuner):
             a1_scale=stage1_scale,
             w1_scale=data["w1s_a16"],
             kernelName1=kn1,
+            interleave=cfg["a_dtype"] == "fp8",
             m_indices=m_indices,
             moe_buf=moe_buf,
             situ_beta=situ_beta,
@@ -8178,7 +8649,7 @@ class Mxfp4FlydslTuner(FmoeTuner):
             xcd_swizzle=cfg["xcd_swizzle"],
             num_waves=cfg["num_waves"],
             k_wave=cfg["k_wave"],
-            interleave=False,
+            interleave=cfg["a_dtype"] == "fp8",
             a_dtype=cfg["a_dtype"],
             out_dtype=cfg["out_dtype"],
             native_scale_layout=bm == 16,
@@ -8224,6 +8695,7 @@ class Mxfp4FlydslTuner(FmoeTuner):
         sti, sw, sei, nvi, moe_buf, _m_indices, reverse_sorted = sorting
         out = moe_buf if moe_buf.numel() else torch.empty_like(data["input"])
         w1 = data["w1_a16"]
+        ep_args = Mxfp4FlydslTuner._stage2_ep_args(data)
 
         def launch(
             inter_q: torch.Tensor,
@@ -8257,6 +8729,7 @@ class Mxfp4FlydslTuner(FmoeTuner):
                 topk_weights=topk_weights,
                 kernelName2=kn2,
                 reverse_sorted=reverse_sorted,
+                **ep_args,
             )
 
         tensors = (
@@ -8313,12 +8786,13 @@ class Mxfp4FlydslTuner(FmoeTuner):
             "swiglu": ActivationType.Swiglu,
             "situv2": ActivationType.Situv2,
         }[self._row_act(row)]
+        topk_ids = data.get("local_topk_ids", data["topk_ids"])
         ref1 = FmoeTuner.run_torch_moe_stage1(
             data["a1_qt"],
             data["w1_qt"],
             data["w2_qt"],
             data["topk_weights"],
-            data["topk_ids"],
+            topk_ids,
             data["a1_scale"],
             data["w1_scale"],
             dtype=dtypes.bf16,
@@ -8337,7 +8811,11 @@ class Mxfp4FlydslTuner(FmoeTuner):
         }
         # Build the GEMM2 input from the Torch reference, not a GEMM1 kernel.
         _v2_populate_stage2(
-            {"ref1": ref1, "adtype": "fp4"}, intermediate, token, topk, cfg["BM"]
+            {"ref1": ref1, "adtype": self._row_a_dtype(row)},
+            intermediate,
+            token,
+            topk,
+            cfg["BM"],
         )
         launch, tensors = self._gemm2_screening_call(
             data, sorting, intermediate["isq"], intermediate["iss"], kn2, topk
@@ -8348,7 +8826,7 @@ class Mxfp4FlydslTuner(FmoeTuner):
             data["w1_qt"],
             data["w2_qt"],
             data["topk_weights"],
-            data["topk_ids"],
+            topk_ids,
             a2_scale=None,
             w2_scale=data["w2_scale"],
             dtype=dtypes.bf16,
@@ -8356,20 +8834,23 @@ class Mxfp4FlydslTuner(FmoeTuner):
             doweight_stage1=False,
         )
         return self._check_reference_output(
-            ref, out, float(args.errRatio), f"reference consumer[{kn2}]"
+            self._valid_rows(data, ref),
+            self._valid_rows(data, out),
+            float(args.errRatio),
+            f"reference consumer[{kn2}]",
         )
 
     def _check_reference_pair(
         self, row: dict[str, Any], kn1: str, kn2: str, args: Any
     ) -> bool:
-        ne, h, e = int(row["expert"]), int(row["model_dim"]), int(row["inter_dim"])
-        token, topk = int(row["token"]), int(row["topk"])
+        ne, h = int(row["expert"]), int(row["model_dim"])
+        topk = int(row["topk"])
         activation = {
             "silu": ActivationType.Silu,
             "swiglu": ActivationType.Swiglu,
             "situv2": ActivationType.Situv2,
         }[self._row_act(row)]
-        data = self._prepare_case(token, h, e, ne, topk, dtypes.bf16)
+        data = self._case(row)
         out = self._port_e2e(
             data,
             kn1,
@@ -8697,14 +9178,7 @@ class Mxfp4FlydslTuner(FmoeTuner):
         scan_reference = None
         if fast_scan:
             self._precompile_candidates(row, candidates)
-            scan_data = self._prepare_case(
-                int(row["token"]),
-                int(row["model_dim"]),
-                int(row["inter_dim"]),
-                int(row["expert"]),
-                int(row["topk"]),
-                dtypes.bf16,
-            )
+            scan_data = self._case(row)
             activation = {
                 "situv2": ActivationType.Situv2,
                 "swiglu": ActivationType.Swiglu,
@@ -9294,7 +9768,7 @@ if __name__ == "__main__":
         )
     elif use_mxfp4_flydsl:
         tuner = Mxfp4FlydslTuner(
-            "mxfp4FlydslTuner", key, resultList, "mxfp4 a4w4 flydsl port fmoe tuner"
+            "mxfp4FlydslTuner", key, resultList, "mxfp4 A4W4/A8W4 FlyDSL MoE tuner"
         )
     else:
         tuner = FmoeTuner("fmoeTuner", key, resultList + ["nt"], "fmoe tuner")
