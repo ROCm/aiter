@@ -265,7 +265,7 @@ def test_fused_qk_rope_cat_and_cache_mla(
 def test_fused_qk_rope_cat_and_cache_mla_int64_offsets(T: int, QH: int):
     # q_out row offsets (T * QH * 576) and transposed q_nope head offsets
     # ((QH - 1) * T * 512) both pass 2**31 - 1 in one launch.
-    if DEVICE_ARCH == "gfx1250":
+    if DEVICE_ARCH in ("gfx1250", "gfx1250-strict"):
         pytest.skip("gfx1250 runs the gluon kernel")
     if torch.cuda.get_device_properties(0).total_memory < 32 * 1024**3:
         pytest.skip("Needs 32 GiB of device memory")
