@@ -89,6 +89,8 @@ def _mma_tensor(storage):
 _TDM_MAX_PAD_INTERVAL_BYTES = 1024
 
 PLANAR_LDS = int(os.environ.get("AITER_FLYDSL_PLANAR_LDS", "0"))
+#: Let a persistent bf16 EP scatter defer its final TDM wait (defer_c_wait).
+_EP_DEFER_C_WAIT = os.environ.get("AITER_FLYDSL_EP_DEFER_C_WAIT", "1") == "1"
 INTERLEAVED_LDS_LOAD = os.environ.get("AITER_FLYDSL_INTERLEAVED_LDS_LOAD")
 if INTERLEAVED_LDS_LOAD is not None:
     INTERLEAVED_LDS_LOAD = int(INTERLEAVED_LDS_LOAD)
@@ -282,6 +284,8 @@ def build_gemm_a8w4_tdm_task(
       retire in issue order and the prologue writes only its first
       ``prologue_stages`` stages; ``gpu.barrier`` waits storecnt). The caller
       must drain tensorcnt and storecnt before reusing the arena or exiting.
+      A persistent bf16 EP scatter turns it on by itself when the scatter
+      rows fit the last stage; the persistent launcher then drains.
     - ``tdm_snop``: ``s_nop 0`` after every TDM issue, so no branch or label
       directly follows one (a gfx1250 TDM hazard).
     """
@@ -544,14 +548,33 @@ def build_gemm_a8w4_tdm_task(
         if _mid_compute
         else num_buffers
     )
-    C_EP_OFF = 0
-    # fp4 stage-1 output staging (tile_m x tile_n/4 B): the last pipeline stage
-    # with defer_c_wait, so the next tile's prologue cannot overwrite it.
-    C_Q_OFF = (num_buffers - 1) * PITCH if defer_c_wait else 0
+    # With defer_c_wait the output is staged in the last pipeline stage, which
+    # the next tile's prologue does not write: tile_m x tile_n/4 B of fp4 for
+    # stage 1, the padded bf16 scatter rows for stage 2. A persistent bf16 EP
+    # scatter defers on its own whenever its rows fit there: the remote
+    # gather-store then retires under the next tile's prologue instead of
+    # stalling every wave (DSV4.1-Flash EP4 tpr 512: GEMM2 57.4 -> 54.9 us).
+    if (
+        _EP_DEFER_C_WAIT
+        and enable_ep_scatter
+        and not ep_quant_bits
+        and persistent_workers
+        and _mid_compute
+        and not planar_lds_on
+        and not tdm_as_in_prologue
+        and k_waves == 1
+        and _pro_stages <= num_buffers - 1
+        and num_buffers * PITCH - PITCH + C_STORE_B <= ARENA_B
+    ):
+        defer_c_wait = 1
+    _defer_off = (num_buffers - 1) * PITCH if defer_c_wait else 0
+    C_EP_OFF = _defer_off if enable_ep_scatter else 0
+    C_Q_OFF = 0 if enable_ep_scatter else _defer_off
     if defer_c_wait:
         assert not planar_lds_on and not tdm_as_in_prologue and _mid_compute
-        assert _pro_stages * PITCH <= C_Q_OFF, "C staging overlaps the prologue"
-        assert C_Q_OFF + tile_m * (tile_n // 4) <= ARENA_B, "C staging past arena"
+        assert _pro_stages * PITCH <= _defer_off, "C staging overlaps the prologue"
+        _c_bytes = C_STORE_B if enable_ep_scatter else tile_m * (tile_n // 4)
+        assert _defer_off + _c_bytes <= ARENA_B, "C staging past arena"
 
     # Quant epilogue compile-time constants.
     QUANT_ROWS_PER_TILE = quant_wmma_rep * 16
@@ -607,6 +630,7 @@ def build_gemm_a8w4_tdm_task(
     _prefence += "_ab2"
     _kwaves = f"_kw{k_waves}" if k_waves > 1 else ""
     _malign = f"_ma{m_align}" if m_align else ""
+    _malign += "_dcw" if (defer_c_wait and enable_ep_scatter) else ""
     _kname = (
         f"mxfp4_tdm_{_afp}{_a_layout}"
         f"_t{tile_m}x{tile_n}x{tile_k}_w{m_warp}x{n_warp}"
@@ -2781,7 +2805,10 @@ def build_gemm_a8w4_tdm_task(
                             issue_scatter_group(group, scatter_vector, vector_pass)
                     else:
                         issue_scatter_group(group, scatter_vector, vector_pass)
-                tdm_ops.tensor_wait(0)
+                # defer_c_wait: the next tile's first fence (or the drain after the
+                # persistent loop) retires the gather-stores, which complete in order.
+                if const_expr(not defer_c_wait):
+                    tdm_ops.tensor_wait(0)
             else:
 
                 def store_tile(gt, tile, lds_ptr, lds_row):
@@ -2868,6 +2895,7 @@ def build_gemm_a8w4_tdm_task(
         "prologue_stages": _pro_stages,
         "c_ep_off": C_EP_OFF,
         "c_q_off": C_Q_OFF,
+        "defer_c_wait": int(bool(defer_c_wait)),
     }
     return gemm_task, block, _kname, cluster_m, layout
 
@@ -3044,6 +3072,8 @@ def launch_gemm_a8w4_tdm(
             tasks = ceildiv(rows, tile_m) * ceildiv(i32_n, tile_n)
             for task_id in range(fx.block_idx.x, tasks, persistent_workers):
                 run_task(task_id, rows)
+            if const_expr(layout["defer_c_wait"]):
+                tdm_ops.tensor_wait(0)
         else:
             run_task(fx.block_idx.x, i32_m)
 
