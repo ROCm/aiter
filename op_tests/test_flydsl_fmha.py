@@ -143,6 +143,18 @@ def _make_qkv(
         (1, 1024, 24, 128),
         # Head dimension 64 uses the 128x64 tile.
         (1, 2048, 16, 64),
+        # head_dim % 8 == 0: padded to 16 columns inside the kernel.
+        # PixArt / DiT-XL / Lumina-Next (72), SD1.5 (40, 80), HunyuanDiT (88),
+        # Sana cross-attention (112), and small head dims.
+        (1, 1024, 16, 72),
+        (2, 1024, 8, 40),
+        (2, 1000, 8, 80),
+        (1, 777, 16, 88),
+        (1, 1024, 20, 112),
+        (1, 512, 4, 8),
+        (1, 512, 4, 16),
+        (1, 512, 4, 24),
+        (1, 512, 8, 48),
     ],
 )
 def test_flydsl_fmha_correctness_bf16(batch, seq_len, num_heads, head_dim):
@@ -165,9 +177,43 @@ def test_flydsl_fmha_correctness_bf16(batch, seq_len, num_heads, head_dim):
 
 @_gfx1201_only
 def test_flydsl_fmha_rejects_unsupported_head_dim():
-    q = torch.randn(1, 256, 8, 48, dtype=torch.bfloat16, device="cuda")
+    q = torch.randn(1, 256, 8, 36, dtype=torch.bfloat16, device="cuda")
     with pytest.raises(ValueError, match="head_dim"):
         flydsl_flash_attn_func(q, q.clone(), q.clone())
+
+
+@_gfx1201_only
+@pytest.mark.parametrize(
+    "seq_q,seq_kv,head_dim,causal",
+    [
+        # Cross-attention with padded head_dim and KV tail masking.
+        (1000, 333, 72, False),
+        (4096, 77, 40, False),
+        (1024, 300, 112, False),
+        # Causal self-attention with padded head_dim.
+        (1000, 1000, 40, True),
+        (2048, 2048, 88, True),
+    ],
+)
+def test_flydsl_fmha_padded_head_dim_cross_and_causal(seq_q, seq_kv, head_dim, causal):
+    g = torch.Generator(device="cuda").manual_seed(0)
+    q = torch.randn(
+        2, seq_q, 8, head_dim, generator=g, dtype=torch.bfloat16, device="cuda"
+    )
+    k = torch.randn(
+        2, seq_kv, 8, head_dim, generator=g, dtype=torch.bfloat16, device="cuda"
+    )
+    v = torch.randn(
+        2, seq_kv, 8, head_dim, generator=g, dtype=torch.bfloat16, device="cuda"
+    )
+    out = flydsl_flash_attn_func(q, k, v, causal=causal)
+    ref = _ref_sdpa_bshd(q, k, v, causal=causal)
+    assert out.shape == ref.shape
+    cos = F.cosine_similarity(
+        out.float().reshape(-1, head_dim), ref.float().reshape(-1, head_dim), dim=1
+    )
+    assert cos.min().item() > 0.99, f"min_cos={cos.min().item():.6f}"
+    assert cos.mean().item() > 0.999, f"mean_cos={cos.mean().item():.6f}"
 
 
 @_gfx1201_only
