@@ -3373,9 +3373,8 @@ def gen_a16w16_4wave_instance(
 
     workspace = k.kernel_tag == "a16w16_4wave_ws"
     images = a16w16_4wave_co_images(k)
-    # The launcher indexes kImages by layout.
-    expected = [(layout, False) for layout in ("nt", "nn", "tt", "tn")]
-    assert [(layout, bias) for layout, bias, _ in images] == expected, images
+    # The launcher indexes kImages by layout (A_T * 2 + B_T).
+    assert [layout for layout, _ in images] == ["nt", "nn", "tt", "tn"], images
     if workspace and k.splitk_workspace_dtype != "fp32_t":
         raise ValueError(f"{k.name}: the 4wave workspace kid needs fp32_t storage")
 
@@ -3402,7 +3401,7 @@ def gen_a16w16_4wave_instance(
             '        "use an a16w16_4wave_ws kid (the split-K reduce adds it, split_k 1 included)");',
         )
         .replace("@NUM_IMAGES@", str(len(images)))
-        .replace("@IMAGES@", ", ".join(f'"{symbol}"' for _, _, symbol in images))
+        .replace("@IMAGES@", ", ".join(f'"{symbol}"' for _, symbol in images))
         .replace("@TRAITS_HEADER@", traits_header)
         .replace("@B_M@", str(k.B_M))
         .replace("@B_N@", str(k.B_N))

@@ -698,7 +698,7 @@ def _gfx950_jobs(instances):
     jobs = []
     for kid, k in instances:
         splitk = k.kernel_tag == "a16w16_4wave_ws"
-        for layout, bias, symbol in a16w16_4wave_co_images(k):
+        for layout, symbol in a16w16_4wave_co_images(k):
             jobs.append(
                 {
                     "kid": kid,
@@ -707,7 +707,6 @@ def _gfx950_jobs(instances):
                     "a_t": layout in ("tt", "tn"),
                     "b_t": layout in ("nn", "tn"),
                     "splitk": splitk,
-                    "bias": bias,
                     "symbol": symbol,
                 }
             )
@@ -820,7 +819,6 @@ def build_one_gfx950(job, args, llvm_bin, workdir):
         "a_t": job["a_t"],
         "b_t": job["b_t"],
         "splitk": job["splitk"],
-        "has_bias": job["bias"],
         "pin": pin,
         "launch_bounds": [k.BLOCK_SIZE, k.WG_PER_CU],
         "device_flags": device_flags,
