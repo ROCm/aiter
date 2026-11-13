@@ -162,14 +162,26 @@ __device__ __forceinline__ float sentinel(const out_t& o, int r, int blk, float 
 
 __device__ __forceinline__ float pmax32(float a, float b)
 {
+#if !defined(__HIP_DEVICE_COMPILE__) || defined(__gfx950__)
     auto r = __builtin_amdgcn_permlane32_swap(__float_as_uint(a), __float_as_uint(b), false, false);
     return fmaxf(__uint_as_float(r[0]), __uint_as_float(r[1]));
+#else
+    // The entry point rejects non-gfx950 devices. Keep a device stub so this
+    // gfx950-only source can still be included in multi-arch wheels.
+    __builtin_trap();
+    return -INFINITY;
+#endif
 }
 
 __device__ __forceinline__ float pmax16(float a, float b)
 {
+#if !defined(__HIP_DEVICE_COMPILE__) || defined(__gfx950__)
     auto r = __builtin_amdgcn_permlane16_swap(__float_as_uint(a), __float_as_uint(b), false, false);
     return fmaxf(__uint_as_float(r[0]), __uint_as_float(r[1]));
+#else
+    __builtin_trap();
+    return -INFINITY;
+#endif
 }
 
 // tmax[NT] (per lane: max over its 4 tokens) -> w[kOut], lane L of w[k]
