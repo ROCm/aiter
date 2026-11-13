@@ -23,9 +23,8 @@ from aiter.ops.triton._triton_kernels.gemm.grouped.gmm import (
     tgmm_non_persistent_kernel,
     tgmm_persistent_kernel,
 )
-from aiter.ops.triton.utils.device_info import get_num_sms, get_num_xcds
-
 from aiter.ops.triton.utils.config_utils import load_config_json, resolve_config_dir
+from aiter.ops.triton.utils.device_info import get_num_sms, get_num_xcds
 
 # AITER: GMM utility functions
 from aiter.ops.triton.utils.gmm_common import (
