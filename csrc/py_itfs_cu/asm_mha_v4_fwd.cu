@@ -318,6 +318,9 @@ const fmha_v4_fwdConfig& find_config(const std::string& arch,
 
 // E8M0 scale gathers are unguarded global loads: they address every row of the tile they are
 // running, plus MXFP4 K's two-tile producer lead, so the final tiles read past the logical rows.
+// Q scales are the exception: the dense objects bound their gather with a buffer descriptor, so
+// only the gfx950 sorted-sparse objects, which predate that, need Q backed to a whole 256-row tile.
+// A dense call may pass an exact-size Q scale, such as an all-to-all output.
 constexpr int64_t kMxScaleBlockElements     = 32;
 constexpr int64_t kQueryScaleTileRows       = 256;
 // The PRODUCER tile, which is 128 tokens whatever KV tile the kernel itself runs.
@@ -957,14 +960,6 @@ PackedMhaV4Shapes validate_packed_mha_v4(const at::Tensor& q,
             "MX K descale must have shape [batch, key_length, key_heads, ",
             blocks_per_row,
             "]");
-        check_scale_backing_storage(q_descale,
-                                    shapes.seqlen_q,
-                                    shapes.nhead_q,
-                                    blocks_per_row,
-                                    kQueryScaleTileRows,
-                                    0,
-                                    0,
-                                    "Q");
         if(recipe.k_format == format_id(AttentionFormat::Fp4E2M1))
         {
             check_scale_backing_storage(k_descale,
@@ -1180,6 +1175,15 @@ void fmha_v4_fwd_sparse(const at::Tensor& q,
 
     const auto arch = get_gpu_arch();
     const auto& cfg = find_config(arch, recipe, /*mode=*/1, shapes.head_dim, q_tile, kv_tile);
+    if(recipe.q_scale_mode == scale_mode_id(AttentionScaleMode::E8M0Per1x32))
+        check_scale_backing_storage(q_descale,
+                                    shapes.seqlen_q,
+                                    shapes.nhead_q,
+                                    shapes.head_dim / kMxScaleBlockElements,
+                                    kQueryScaleTileRows,
+                                    0,
+                                    0,
+                                    "Q");
     check_mx_v_scale_backing_storage(cfg, recipe, v_descale);
     TORCH_CHECK(cfg.ragged_kv != 0 || shapes.seqlen_k % cfg.ts_kv == 0,
                 "sorted-sparse MHA v4 row ",

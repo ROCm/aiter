@@ -30,6 +30,7 @@ from aiter.ops.mha_v4 import (
     _RawRecipeKind,
     _resolve_raw_recipe,
     mha_v4,
+    mha_v4_block_tile,
     mha_v4_kv_splits,
     mha_v4_kv_tile,
     mha_v4_operands,
@@ -1863,13 +1864,10 @@ def test_mha_v4_packed_rejects_overlapping_lse_views():
 
 @skipif(get_gfx() != "gfx950", reason="gfx950 MXFP8 validation")
 def test_mha_v4_packed_accepts_mxfp8_scale_recipe():
+    """At their logical size: the dense objects bound their scale gathers, so a caller-built Q
+    scale such as an all-to-all output needs no tile padding."""
     q = torch.zeros((1, 128, 2, 128), device="cuda", dtype=torch.float8_e4m3fn)
-    # The launcher requires Q-scale backing for the whole 256-row query tile, so back the view
-    # with those rows.
-    scale_storage = torch.ones(
-        MHA_V4_QUERY_TILE_ROWS * 2 * 4, device="cuda", dtype=torch.uint8
-    )
-    qk_scale = scale_storage[: 128 * 2 * 4].view(1, 128, 2, 4)
+    qk_scale = torch.ones((1, 128, 2, 4), device="cuda", dtype=torch.uint8)
     v_scale = torch.ones(1, device="cuda", dtype=torch.float32)
     mha_v4_packed(
         q,
@@ -1885,6 +1883,55 @@ def test_mha_v4_packed_accepts_mxfp8_scale_recipe():
         AttentionScaleMode.E8M0_PER_1X32,
         AttentionScaleMode.F32_PER_TENSOR,
     )
+
+
+@skipif(get_gfx() != "gfx950", reason="gfx950 MXFP8 validation")
+def test_mha_v4_packed_sparse_mx_q_scales_need_the_whole_query_tile():
+    """The gfx950 sorted-sparse objects gather Q scales over the whole 256-row tile unbounded, so
+    the sparse launch refuses the logical-size scale the dense one takes, and runs once the
+    storage backs the tile."""
+    heads, sequence = 2, 128
+    q = torch.zeros((1, sequence, heads, 128), device="cuda", dtype=torch.float8_e4m3fn)
+    v_scale = torch.ones(1, device="cuda", dtype=torch.float32)
+    formats = (AttentionFormat.FP8,) * 3
+    scale_modes = (
+        AttentionScaleMode.E8M0_PER_1X32,
+        AttentionScaleMode.E8M0_PER_1X32,
+        AttentionScaleMode.F32_PER_TENSOR,
+    )
+    q_tile, kv_tile = mha_v4_block_tile(
+        mha_v4_operands(*formats, *scale_modes), MHA_V4_SPARSE_MODE
+    )
+    mask = torch.ones(
+        (1, heads, -(-sequence // q_tile), -(-sequence // kv_tile)),
+        device="cuda",
+        dtype=torch.bool,
+    )
+    indices, start, count = block_attn_mask_to_ragged_lut(mask)
+
+    def launch(qk_scale):
+        mha_v4_packed(
+            q,
+            q,
+            q,
+            qk_scale,
+            qk_scale,
+            v_scale,
+            *formats,
+            *scale_modes,
+            kv_block_indices=indices,
+            lut_start=start,
+            lut_count=count,
+            block_tile=(q_tile, kv_tile),
+        )
+        torch.cuda.synchronize()
+
+    with expect_raises(RuntimeError, match="MX Q descale needs"):
+        launch(torch.ones((1, sequence, heads, 4), device="cuda", dtype=torch.uint8))
+    storage = torch.ones(
+        MHA_V4_QUERY_TILE_ROWS * heads * 4, device="cuda", dtype=torch.uint8
+    )
+    launch(storage[: sequence * heads * 4].view(1, sequence, heads, 4))
 
 
 @skipif(get_gfx() != "gfx950", reason="gfx950 MHA v4 validation")
