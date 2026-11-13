@@ -9,23 +9,23 @@
 #define SPARSE_BLOCK_SIZE 128
 #define SPARSE_TOPK 16
 #define SPARSE_PAGES_PER_BLOCK 8
-#define SPARSE_DECODE_QTILES 1
 #define SPARSE_DECODE_PREFETCH 8
-#define SPARSE_DECODE_NONTEMPORAL false
+#define SPARSE_DECODE_NONTEMPORAL true // nvfp4 only
 #define SPARSE_PREFILL_WAVES 4
 
 // rank/world are the round-robin block shard the pass scores, global = local *
 // world + rank. world == 1 scores every block, which is the non-partitioned
 // case and is bit-identical to having no shard at all.
-#define SPARSE_SCORE_DECODE_PARAMS                                                            \
-    const uint8_t *q_idx, const uint8_t *key_cache_idx, float *score, const int *block_table, \
-        const int *seq_lens, int num_reqs, int num_q_tiles, int block_table_stride,           \
-        int score_head_stride, int score_num_stride, int num_chunks, int init_blocks,         \
-        int local_blocks, int query_len, int rank, int world, hipStream_t stream
+#define SPARSE_SCORE_DECODE_PARAMS                                                               \
+    const uint8_t *q_idx, const uint8_t *key_cache_idx, float *score, const int *block_table,    \
+        const int *seq_lens, int num_reqs, int num_q_tiles, int block_table_stride,              \
+        int score_head_stride, int score_num_stride, int num_chunks, int init_blocks,            \
+        int local_blocks, int query_len, int rank, int world, int page_stride, int req_xor_mask, \
+        int fill_shift, hipStream_t stream
 #define SPARSE_SCORE_DECODE_ARGS                                                                   \
     q_idx, key_cache_idx, score, block_table, seq_lens, num_reqs, num_q_tiles, block_table_stride, \
         score_head_stride, score_num_stride, num_chunks, init_blocks, local_blocks, query_len,     \
-        rank, world, stream
+        rank, world, page_stride, req_xor_mask, fill_shift, stream
 
 // chunk_blocks is the pages one chunk covers and num_chunks is how many of them
 // the longest reach needs, so the two multiply out to that reach.
@@ -80,7 +80,8 @@ namespace sparse_attn {
 // Launch scoring & topk kernels.
 // ---------------------------------------------------------------------------
 
-template <int H, int Waves>
+// num_q_tiles counts groups of QTiles query tiles.
+template <int KvFmt, int H, int QTiles, int Waves>
 void launch_score_decode(SPARSE_SCORE_DECODE_PARAMS)
 {
     // Query-tile groups on x, requests on y, the block-range split on z.
@@ -91,23 +92,26 @@ void launch_score_decode(SPARSE_SCORE_DECODE_PARAMS)
                                  SPARSE_HEAD_DIM,
                                  H,
                                  Waves,
-                                 SPARSE_DECODE_QTILES,
+                                 QTiles,
                                  SPARSE_DECODE_PREFETCH,
-                                 SPARSE_DECODE_NONTEMPORAL>
-        <<<grid, block, 0, stream>>>(q_idx,
-                                     key_cache_idx,
-                                     score,
-                                     block_table,
-                                     seq_lens,
-                                     block_table_stride,
-                                     score_head_stride,
-                                     score_num_stride,
-                                     num_chunks,
-                                     init_blocks,
-                                     local_blocks,
-                                     query_len,
-                                     rank,
-                                     world);
+                                 SPARSE_DECODE_NONTEMPORAL,
+                                 KvFmt><<<grid, block, 0, stream>>>(q_idx,
+                                                                    key_cache_idx,
+                                                                    score,
+                                                                    block_table,
+                                                                    seq_lens,
+                                                                    block_table_stride,
+                                                                    score_head_stride,
+                                                                    score_num_stride,
+                                                                    num_chunks,
+                                                                    init_blocks,
+                                                                    local_blocks,
+                                                                    query_len,
+                                                                    rank,
+                                                                    world,
+                                                                    page_stride,
+                                                                    req_xor_mask,
+                                                                    fill_shift);
 }
 
 template <int H, int QTiles>
@@ -217,18 +221,19 @@ void launch_topk_cp(SPARSE_TOPK_CP_PARAMS)
 // ---------------------------------------------------------------------------
 // Per-variant launchers
 // ---------------------------------------------------------------------------
-#define SPARSE_DECODE_FN(H, W) sparse_score_decode_h##H##_w##W
+#define SPARSE_DECODE_FN(K, H, Q, W) sparse_score_decode_k##K##_h##H##_q##Q##_w##W
 #define SPARSE_PREFILL_FN(H, Q) sparse_score_prefill_h##H##_q##Q
 #define SPARSE_TOPK_FN(S, W) sparse_topk_s##S##_w##W
 
-#define SPARSE_DECODE_DECLARE(H, W) void SPARSE_DECODE_FN(H, W)(SPARSE_SCORE_DECODE_PARAMS);
+#define SPARSE_DECODE_DECLARE(K, H, Q, W) \
+    void SPARSE_DECODE_FN(K, H, Q, W)(SPARSE_SCORE_DECODE_PARAMS);
 #define SPARSE_PREFILL_DECLARE(H, Q) void SPARSE_PREFILL_FN(H, Q)(SPARSE_SCORE_PREFILL_PARAMS);
 #define SPARSE_TOPK_DECLARE(S, W) void SPARSE_TOPK_FN(S, W)(SPARSE_TOPK_PARAMS);
 
-#define SPARSE_DECODE_DEFINE(H, W)                           \
-    void SPARSE_DECODE_FN(H, W)(SPARSE_SCORE_DECODE_PARAMS)  \
-    {                                                        \
-        launch_score_decode<H, W>(SPARSE_SCORE_DECODE_ARGS); \
+#define SPARSE_DECODE_DEFINE(K, H, Q, W)                           \
+    void SPARSE_DECODE_FN(K, H, Q, W)(SPARSE_SCORE_DECODE_PARAMS)  \
+    {                                                              \
+        launch_score_decode<K, H, Q, W>(SPARSE_SCORE_DECODE_ARGS); \
     }
 #define SPARSE_PREFILL_DEFINE(H, Q)                            \
     void SPARSE_PREFILL_FN(H, Q)(SPARSE_SCORE_PREFILL_PARAMS)  \
@@ -248,16 +253,24 @@ void launch_topk_cp(SPARSE_TOPK_CP_PARAMS)
 // ---------------------------------------------------------------------------
 // scoring & topk kernel instantiation configuration tables
 // ---------------------------------------------------------------------------
-// (index heads, waves)
+// (kv format, index heads, query tiles, waves)
+// K: kKvFp8 / kKvNvfp4. fp8 keys build one query tile only.
 // H is the heads one score pass covers, and the MFMA's 16 columns hold one
-// (query token, index head) pair each, so H * query_len must fit 16. H=4 is
-// what context partitioning needs: every rank scores every index head over its
-// own block shard, so the pass sees the model's whole head count rather than
-// the per-rank one the tensor-parallel split leaves behind.
-#define SPARSE_DECODE_TABLE(F) \
-    F(1, 1) F(1, 2) F(1, 4) F(2, 1) F(2, 2) F(2, 4) F(4, 1) F(4, 2) F(4, 4)
+// (query token, index head) pair each per query tile. H=4 is what context
+// partitioning needs: every rank scores every index head over its own block
+// shard, so the pass sees the model's whole head count rather than the
+// per-rank one the tensor-parallel split leaves behind.
+// clang-format off
+#define SPARSE_DECODE_TABLE_KQ(F, K, Q)                                        \
+    F(K, 1, Q, 1) F(K, 1, Q, 2) F(K, 1, Q, 4)                                  \
+    F(K, 2, Q, 1) F(K, 2, Q, 2) F(K, 2, Q, 4)                                  \
+    F(K, 4, Q, 1) F(K, 4, Q, 2) F(K, 4, Q, 4)
+// clang-format on
+#define SPARSE_DECODE_TABLE_Q1(F) SPARSE_DECODE_TABLE_KQ(F, 0, 1) SPARSE_DECODE_TABLE_KQ(F, 1, 1)
+#define SPARSE_DECODE_TABLE_Q2(F) SPARSE_DECODE_TABLE_KQ(F, 1, 2)
+#define SPARSE_DECODE_TABLE(F) SPARSE_DECODE_TABLE_Q1(F) SPARSE_DECODE_TABLE_Q2(F)
 
-// (index heads, query tiles)
+// (index heads, query tiles); fp8 keys only.
 #define SPARSE_PREFILL_TABLE(F) F(1, 1) F(1, 2) F(1, 4) F(2, 1) F(2, 2) F(2, 4)
 
 // (slots, waves)
@@ -283,6 +296,27 @@ namespace aiter {
 namespace sparse_attn {
 SPARSE_DECODE_TABLE(SPARSE_DECODE_DECLARE)
 SPARSE_PREFILL_TABLE(SPARSE_PREFILL_DECLARE)
+// nvfp4 prefill: 1, 2 or 4 index heads, 4 waves x 16 * wave_tiles query rows
+// (token, head) per workgroup.
+struct nvfp4_prefill_args
+{
+    int page_stride;   // bytes between pages
+    int num_idx_heads; // 1, 2 or 4
+    int wave_tiles;    // 2 (heads <= 2), 4 or 8; >= num_idx_heads
+    int store_pages;   // pages per score store: 1, or 2 with wave_tiles 8
+    // Workgroup order. xcds > 0: 1D grid, each of the xcds XCDs takes a
+    // contiguous share of the work. Else the 3D grid, with the group index
+    // XORed with key & group_xor and, if req_rot, the request index rotated
+    // by key, where key = chunk >> 2. 0 turns each off.
+    int group_xor;
+    int req_rot;
+    int xcds;
+    // req_chunks > 0: each request sizes its chunks from its own block count;
+    // grid_chunks is then the block-axis grid size.
+    int req_chunks;
+    int grid_chunks;
+};
+void sparse_score_prefill_nvfp4(SPARSE_SCORE_PREFILL_PARAMS, const nvfp4_prefill_args& a);
 SPARSE_TOPK_TABLE(SPARSE_TOPK_DECLARE)
 SPARSE_TOPK_CP_TABLE(SPARSE_TOPK_CP_DECLARE)
 } // namespace sparse_attn
