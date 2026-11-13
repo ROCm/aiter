@@ -1,13 +1,15 @@
 """
 Benchmark for the fused MLA BMM + RoPE + concat + KV-cache write kernels
 (fused_fp4_bmm_rope_cat_and_cache_mla and fused_fp8_bmm_rope_cat_and_cache_mla).
+
+The default uses rotating-buffer graph timing. Explicit graph/eager modes retain
+the fixed-buffer diagnostic timing used before the rotating-buffer conversion.
 """
 
 import functools
 
 import torch
 import triton
-
 from aiter.ops.triton.fusions.fused_bmm_rope_kv_cache import (
     fused_fp4_bmm_rope_cat_and_cache_mla,
     fused_fp8_bmm_rope_cat_and_cache_mla,
@@ -134,13 +136,14 @@ def _generate_pool_inputs(
 
 
 def bench_fused_bmm_rope_kv_cache_fn(bencher, T, QH, KH, metric, args):
-    dtype = torch.bfloat16
     # Default BMM shape (N x K), from the unit tests: fp4 512 x 128, fp8 128 x 512.
     test_n, test_k = (512, 128) if args.bmm == "fp4" else (128, 512)
     kv_lora_rank = args.kv_lora_rank or test_n
     nope_dim = args.qk_nope_dim or test_k
     rope_dim = args.rope_dim
     cache_dtype = str_to_torch_dtype[args.cache_dtype]
+    q_out_dtype = str_to_torch_dtype[args.q_out_dtype]
+    num_decode = T if args.num_decode_toks is None else args.num_decode_toks
 
     _p_gen = functools.partial(
         _generate_pool_inputs,
@@ -154,25 +157,42 @@ def bench_fused_bmm_rope_kv_cache_fn(bencher, T, QH, KH, metric, args):
         cache_dtype,
         args.reuse_freqs_front_part,
     )
-    rot_bufs = bencher.build_pool([_p_gen], [_OUT_VAL_KEYS])
-    kv_cache = rot_bufs[0]["kv_cache"]
+    if args.timing == "rotating-graph":
+        rot_bufs = bencher.build_pool([_p_gen], [_OUT_VAL_KEYS])
+        kv_cache = rot_bufs[0]["kv_cache"]
+    else:
+        torch.manual_seed(0)
+        fixed_inputs = dict(zip(_OUT_VAL_KEYS, _p_gen()))
+        kv_cache = fixed_inputs["kv_cache"]
 
     if args.bmm == "fp4":
         kernel_fn = functools.partial(
             fused_fp4_bmm_rope_cat_and_cache_mla,
             is_neox=args.neox,
-            num_decode_toks_for_zeros=T,
+            q_out_dtype=q_out_dtype,
+            num_decode_toks_for_zeros=num_decode,
         )
     else:
         kernel_fn = functools.partial(
             fused_fp8_bmm_rope_cat_and_cache_mla,
             group_size=128,
             is_neox=args.neox,
-            q_out_dtype=dtype,
-            num_decode_toks_for_zeros=T,
+            q_out_dtype=q_out_dtype,
+            num_decode_toks_for_zeros=num_decode,
         )
 
-    ms = bencher.bench(kernel_fn)
+    if args.timing == "rotating-graph":
+        ms = bencher.bench(kernel_fn)
+    else:
+        fn = functools.partial(kernel_fn, **fixed_inputs)
+        # The fixed-buffer graph helper uses a new stream. Wait for input writes.
+        torch.cuda.synchronize()
+        if args.timing == "graph":
+            ms = triton.testing.do_bench_cudagraph(fn, rep=args.rep)
+        else:
+            ms = triton.testing.do_bench(
+                fn, warmup=25, rep=args.rep, return_mode="mean"
+            )
     if metric == "time":
         return ms
     if metric == "throughput":
@@ -187,7 +207,10 @@ def bench_fused_bmm_rope_kv_cache_fn(bencher, T, QH, KH, metric, args):
     else:
         w_bytes = QH * kv_lora_rank * nope_dim
     q_bytes = T * QH * (nope_dim + rope_dim) * elem
-    q_out_bytes = T * QH * (kv_lora_rank + rope_dim + rope_dim + kv_lora_rank) * elem
+    q_out_bytes = (
+        T * QH * (kv_lora_rank + rope_dim) * (torch.finfo(q_out_dtype).bits // 8)
+        + num_decode * QH * (rope_dim + kv_lora_rank) * elem
+    )
     k_bytes = T * KH * (kv_lora_rank + 2 * rope_dim) * elem
     cache_bytes = T * KH * (kv_lora_rank + rope_dim) * kv_cache.element_size()
     mem = w_bytes + q_bytes + q_out_bytes + k_bytes + cache_bytes
@@ -196,6 +219,9 @@ def bench_fused_bmm_rope_kv_cache_fn(bencher, T, QH, KH, metric, args):
 
 def run_benchmark(args):
     units = {"time": "ms", "throughput": "TFLOPS", "bandwidth": "GB/s"}
+    timing_label = (
+        "rotating-graph" if args.timing == "rotating-graph" else f"fixed-{args.timing}"
+    )
     benchmark = triton.testing.Benchmark(
         x_names=["T", "QH", "KH"],
         x_vals=get_benchmark_shapes(args),
@@ -203,11 +229,19 @@ def run_benchmark(args):
         line_vals=[args.metric],
         line_names=[args.metric],
         ylabel=units[args.metric],
-        plot_name=f"{get_caller_name_no_ext()}_{args.bmm}",
+        plot_name=(
+            f"{get_caller_name_no_ext()}_{args.bmm}_{args.q_out_dtype}"
+            f"_decode-{args.num_decode_toks if args.num_decode_toks is not None else 'T'}"
+            f"_{timing_label}"
+        ),
         args={},
     )
-    bencher = RotatingBufferBench.from_dict(
-        {**get_rot_bufs_kwargs(args), **get_do_bench_graph_kwargs(args)}
+    bencher = (
+        RotatingBufferBench.from_dict(
+            {**get_rot_bufs_kwargs(args), **get_do_bench_graph_kwargs(args)}
+        )
+        if args.timing == "rotating-graph"
+        else None
     )
 
     @triton.testing.perf_report([benchmark])
@@ -275,6 +309,26 @@ def parse_args(args: list[str] | None = None):
         help="KV cache dtype",
     )
     parser.add_argument(
+        "--q-out-dtype",
+        type=str,
+        default="bf16",
+        choices=["bf16", "fp8e4m3"],
+        help="Concatenated query output dtype",
+    )
+    parser.add_argument(
+        "--num-decode-toks",
+        type=int,
+        default=None,
+        help="Number of decode outputs; unset: T, 0: no decode outputs",
+    )
+    parser.add_argument(
+        "--timing",
+        choices=["rotating-graph", "graph", "eager"],
+        default="rotating-graph",
+        help="rotating-graph uses --graph-* and --rot-bufs-* controls; graph/eager "
+        "retain fixed-buffer diagnostic timing with --rep and ignore those controls",
+    )
+    parser.add_argument(
         "--neox", action="store_true", default=False, help="NeoX-style RoPE"
     )
     parser.add_argument(
@@ -287,8 +341,8 @@ def parse_args(args: list[str] | None = None):
         "--rep",
         type=positive_int,
         default=20,
-        help="Unused: RotatingBufferBench.bench's replay count is a fixed "
-        "constant, not an adaptive rep target. Kept for CLI compatibility.",
+        help="Measurement budget in ms for fixed-buffer graph/eager diagnostics; "
+        "unused for rotating-graph (use --graph-* controls)",
     )
     parser.add_argument(
         "-print_vgpr",
@@ -303,6 +357,10 @@ def parse_args(args: list[str] | None = None):
         help="Write performance results to CSV file",
     )
     parsed_args = parser.parse_args(args=args)
+    if parsed_args.num_decode_toks is not None and not (
+        0 <= parsed_args.num_decode_toks <= min(parsed_args.T)
+    ):
+        parser.error("--num-decode-toks must be between 0 and each T")
     for name in ("rope_dim", "kv_lora_rank"):
         if (getattr(parsed_args, name) or 2) < 2:
             parser.error(f"--{name.replace('_', '-')} must be >= 2")
