@@ -88,7 +88,10 @@ def _situv2_4_25_mul_batch(gs, us):
 #     by one step on the M=4096 dump); it is kept but off.
 # Output layout matches the generic kernel;
 # padding rows hold zeros (or are left unwritten for folded tail blocks).
-EP32_G1_VARIANTS = {(64, True, False), (64, False, False)}
+EP32_G1_VARIANTS = {
+    (64, True, False), (64, False, False),
+    (80, True, False), (80, False, False),
+}
 
 
 def gemm1_grid(n_tokens, BM, *, NE, TOPK, INTER, BN=256):
@@ -146,7 +149,12 @@ def _gemm1_body(
     khalf_loop=False,
     epi32=False,
     fast_situ=False,
+    sbm80=False,
 ):
+    # sbm80: the sort block is 80 rows (BM=64 body + 16-row tail chunk, one tile per
+    # block). Blocks start at 80*b, i.e. at the second 16-row half of a 32-row scale
+    # chunk for odd b: A-scale words are realigned by one half and the output
+    # scales are written per 16-row half.
     # active_chunks: compile-time number of leading 16-row chunks that hold real
     # rows (None = all). Chunks past it are padding: their A loads, LDS reads,
     # MFMAs and activation are skipped and they emit zeros.
@@ -209,7 +217,7 @@ def _gemm1_body(
     n_block_idx = bx_i32 % fx.Int32(NUM_N_BLOCKS)
     m_block_idx = bx_i32 // fx.Int32(NUM_N_BLOCKS)
     e = rocdl.readfirstlane(T.i32, as_ir_value(_global_i32_at(arg_eids, m_block_idx)))
-    m_row = m_block_idx * fx.Int32(BM)
+    m_row = m_block_idx * fx.Int32(80 if sbm80 else BM)
 
     lane_div_16 = lane // fx.Int32(16)
     lane_mod_16 = lane % fx.Int32(16)
@@ -219,6 +227,10 @@ def _gemm1_body(
     aq_num_records = fx.Int64(i32_ntok * fx.Int32(A_ROW_BYTES))
     _asc_per_mb = max(BM // 32, 1) * kAS_per_chunk_dw * 4
     ascale_num = fx.Int64(i32_total_m_blocks) * fx.Int64(_asc_per_mb)
+    if const_expr(sbm80):
+        ascale_num = fx.Int64(
+            (i32_total_m_blocks * fx.Int32(80) + fx.Int32(31)) // fx.Int32(32)
+        ) * fx.Int64(kAS_per_chunk_dw * 4)
 
     bq_tiles = _global_i32_buffer_tiles(arg_bq, BQ_BYTES, 4)
     bq_copy_atom = fx.make_copy_atom(fx.rocdl.BufferCopy128b(b_aux), fx.Int32)
@@ -748,6 +760,20 @@ def _gemm1_body(
                 + lane_mod_16
             )
             out.append(as_ir_value(_global_i32_load(asc_i32_tiles, lds_dw)))
+        if const_expr(sbm80):
+            # Odd block: 16-row chunk ci is half (1+ci)%2 of loaded word (1+ci)//2.
+            # Rebuild words so byte (khalf, ci%2) of word ci//2 holds it, as for
+            # an aligned block: v[s] = (w[s].b1, w[s+1].b0, w[s].b3, w[s+1].b2).
+            odd = ((m_row >> fx.Int32(4)) & fx.Int32(1)) == fx.Int32(1)
+            w = [fx.Int32(x) for x in out]
+            res = []
+            for s_i in range_constexpr(len(w)):
+                nxt = w[s_i + 1] if s_i + 1 < len(w) else w[s_i]
+                v = ((w[s_i] >> fx.Int32(8)) & fx.Int32(0x00FF00FF)) | (
+                    (nxt << fx.Int32(8)) & fx.Int32(-16711936)
+                )
+                res.append(as_ir_value(odd.select(v, w[s_i])))
+            out = res
         return out
 
     lib = lane & fx.Int32(3)
@@ -1538,7 +1564,7 @@ def _gemm1_body(
         num_scale_chunks = (
             i32_total_m_blocks
             if native_scale_layout
-            else (i32_total_m_blocks * fx.Int32(BM) + fx.Int32(31)) // fx.Int32(32)
+            else (i32_total_m_blocks * fx.Int32(80 if sbm80 else BM) + fx.Int32(31)) // fx.Int32(32)
         )
         ascaleout_layout = fx.make_layout(
             (num_scale_chunks, 2, 4, 16), (OUT_AS_PER_CHUNK_DW, 64, 16, 1)
@@ -1596,6 +1622,23 @@ def _gemm1_body(
                         scales_per_mr[0],
                         fx.Int8,
                     )
+            elif const_expr(sbm80):
+                g16 = m_row >> fx.Int32(4)
+                for sub in (range((NCH + 1) // 2) if subs is None else subs):
+                    for ci in (sub * 2, sub * 2 + 1):
+                        if const_expr(ci < NCH):
+                            g = g16 + fx.Int32(ci)
+                            dword_off = _layout_idx(
+                                ascaleout_layout, g >> fx.Int32(1), ku, scale_wave_grp, m_lane
+                            )
+                            _scalar_store(
+                                ascaleout_i8_tiles,
+                                dword_off * fx.Int32(4)
+                                + ikxdl * fx.Int32(2)
+                                + (g & fx.Int32(1)),
+                                scales_per_mr[ci],
+                                fx.Int8,
+                            )
             elif const_expr(num_waves == 2):
                 chunk = m_block_idx
                 row_half = m_lane >> fx.Int32(4)
@@ -1727,12 +1770,17 @@ def compile_gemm1_ep32(
         xcd_swizzle,
     ) != ("fp8", "fp8", 256, 256, True, 4, 1, False, False, 0):
         raise AssertionError(
-            "gemm1 ep32 supports BM64 BN256 BK256 A8 FP8-out interleaved gate/up, "
+            "gemm1 ep32 supports BM64/BM80 BN256 BK256 A8 FP8-out interleaved gate/up, "
             "4 waves, k_wave 1, no inline quant / xcd swizzle; got "
             f"BM={BM} use_nt={use_nt} inline_quant={inline_quant} a={a_dtype} "
             f"out={out_dtype} BN={BN} BK={BK} interleave={interleave} "
             f"num_waves={num_waves} k_wave={k_wave} xcd_swizzle={xcd_swizzle}"
         )
+    # BM=80: 80-row sort blocks, one tile per block (64-row body + 16-row tail).
+    sort_block_m = BM
+    sbm80 = BM == 80
+    if sbm80:
+        BM = 64
     if act not in ("silu", "swiglu", "situv2"):
         raise AssertionError(f"act must be 'silu', 'swiglu', or 'situv2', got {act!r}")
     if act == "situv2" and (situ_beta <= 0.0 or situ_linear_beta <= 0.0):
@@ -1766,7 +1814,7 @@ def compile_gemm1_ep32(
     )
 
     variant_tag = "nt" if use_nt else "cached"
-    name_suffix = f"h{D_HIDDEN}_i{D_INTER}_ne{NE}_bm{BM}_{variant_tag}_{act}{'_fs' if fast_situ else ''}"
+    name_suffix = f"h{D_HIDDEN}_i{D_INTER}_ne{NE}_bm{sort_block_m}_{variant_tag}_{act}{'_fs' if fast_situ else ''}"
     if enable_bias:
         name_suffix += "_bias"
 
@@ -2093,6 +2141,84 @@ def compile_gemm1_ep32(
                         active_chunks=None,
                     )
 
+    @flyc.kernel(
+        name=f"gemm1_ep32_a8w4_{name_suffix}",
+        known_block_size=[block_threads, 1, 1],
+    )
+    def gemm1_kernel80(
+        arg_aq: fx.Int64,
+        arg_ascale: fx.Int64,
+        arg_bq: fx.Int64,
+        arg_bscale: fx.Int64,
+        arg_eids: fx.Int64,
+        arg_cumsum: fx.Int64,
+        arg_mind: fx.Int64,
+        i32_ntok: fx.Int32,
+        arg_aqout: fx.Int64,
+        arg_ascaleout: fx.Int64,
+        arg_hidden: fx.Int64,
+        arg_bias: fx.Int64,
+    ):
+        # 80-row sort blocks: every block is one 80-row tile; the (block, N) list
+        # is cut into one contiguous run per XCD (as in the BM64 kernel).
+        lds_raw_ptr = fx.SharedAllocator().allocate(SharedStorage).peek().raw.ptr
+        tx_i32 = fx.thread_idx.x
+        bx_i32 = fx.block_idx.x
+        lane = tx_i32 % 64
+        wave = rocdl.readfirstlane(T.i32, tx_i32 // 64)
+        total_m_blocks = _global_i32_at(arg_cumsum, fx.Int32(0)) // fx.Int32(80)
+        bound = total_m_blocks * fx.Int32(NUM_N_BLOCKS)
+        if bx_i32 < bound:
+            cq = _udiv(bound, 8)
+            cr = _umod(bound, 8)
+            xc = _umod(bx_i32, 8)
+            tile = xc * cq + (xc < cr).select(xc, cr) + _udiv(bx_i32, 8)
+            _gemm1_body(
+                lds_raw_ptr,
+                arg_aq,
+                arg_ascale,
+                arg_bq,
+                arg_bscale,
+                arg_eids,
+                arg_mind,
+                arg_aqout,
+                arg_ascaleout,
+                arg_hidden,
+                arg_bias,
+                tile,
+                lane,
+                wave,
+                use_nt,
+                i32_ntok,
+                total_m_blocks,
+                BM=BM,
+                BN=BN,
+                BK=BK,
+                inline_quant=inline_quant,
+                prefetch_hidden=prefetch_hidden,
+                a_dtype=a_dtype,
+                out_dtype=out_dtype,
+                act=act,
+                situ_beta=situ_beta,
+                situ_linear_beta=situ_linear_beta,
+                swiglu_limit=swiglu_limit,
+                enable_bias=enable_bias,
+                K=D_HIDDEN,
+                N_OUT=N_OUT,
+                NE=NE,
+                interleave=interleave,
+                native_scale_layout=native_scale_layout,
+                num_waves=num_waves,
+                k_wave=k_wave,
+                epi_splits=epi_splits,
+                k_stages=k_stages,
+                khalf_loop=khalf_loop,
+                epi32=epi32,
+                fast_situ=fast_situ,
+                active_chunks=5,
+                sbm80=True,
+            )
+
     @flyc.jit
     def launch_gemm1(
         arg_aq: fx.Int64,
@@ -2111,7 +2237,7 @@ def compile_gemm1_ep32(
         stream: fx.Stream,
     ):
         grid_x = fx.Int64(i32_grid)
-        gemm1_kernel(
+        (gemm1_kernel80 if const_expr(sbm80) else gemm1_kernel)(
             arg_aq,
             arg_ascale,
             arg_bq,
