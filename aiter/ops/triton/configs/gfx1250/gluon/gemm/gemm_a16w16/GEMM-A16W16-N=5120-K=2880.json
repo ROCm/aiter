@@ -94,30 +94,28 @@
         "waves_per_eu": 1
     },
     "M_LEQ_2048": {
+        "B2B_WMMA": 0,
+        "BLOCK_K": 64,
         "BLOCK_M": 256,
         "BLOCK_N": 256,
-        "BLOCK_K": 64,
-        "NUM_BUFFERS": 2,
+        "GROUP_SIZE_M": 0,
+        "NUM_BUFFERS": 4,
+        "kernel_type": "compute_bound",
+        "num_ctas": 1,
         "num_warps": 4,
-        "kernel_type": "bandwidth_bound",
-        "waves_per_eu": 0,
-        "num_ctas": 4,
-        "GROUP_SIZE_M": 2,
-        "B2B_WMMA": 1,
-        "TDM_STORE": 1
+        "waves_per_eu": 1
     },
     "M_LEQ_4096": {
         "BLOCK_M": 512,
-        "BLOCK_N": 1024,
+        "BLOCK_N": 512,
         "BLOCK_K": 64,
-        "NUM_BUFFERS": 3,
+        "NUM_BUFFERS": 5,
         "num_warps": 4,
-        "kernel_type": "bandwidth_bound",
-        "waves_per_eu": 2,
-        "num_ctas": 16,
-        "GROUP_SIZE_M": 0,
-        "B2B_WMMA": 1,
-        "TDM_STORE": 1
+        "kernel_type": "compute_bound",
+        "waves_per_eu": 0,
+        "num_ctas": 8,
+        "GROUP_SIZE_M": 8,
+        "B2B_WMMA": 1
     },
     "M_LEQ_8192": {
         "BLOCK_M": 512,

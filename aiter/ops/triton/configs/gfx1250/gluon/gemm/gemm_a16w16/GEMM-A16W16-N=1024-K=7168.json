@@ -32,17 +32,17 @@
         "kernel_type": "compute_bound"
     },
     "M_LEQ_64": {
-        "BLOCK_M": 16,
-        "BLOCK_N": 256,
-        "BLOCK_K": 512,
-        "NUM_BUFFERS": 3,
-        "num_warps": 2,
-        "kernel_type": "bandwidth_bound",
-        "waves_per_eu": 1,
-        "num_ctas": 4,
-        "GROUP_SIZE_M": 0,
         "B2B_WMMA": 1,
-        "TDM_STORE": 0
+        "BLOCK_K": 512,
+        "BLOCK_M": 64,
+        "BLOCK_N": 64,
+        "GROUP_SIZE_M": 0,
+        "NUM_BUFFERS": 8,
+        "SLICED_K": 1,
+        "kernel_type": "compute_bound",
+        "num_ctas": 16,
+        "num_warps": 4,
+        "waves_per_eu": 1
     },
     "M_LEQ_128": {
         "BLOCK_M": 32,
