@@ -31,8 +31,6 @@ from .kernels_common import run_cached, set_slp_vectorize_once_used
 from .tensor_shim import (
     AITER_FLYDSL_KERNARG_PRELOAD,
     AITER_FLYDSL_KERNARG_PRELOAD_COUNT,
-    _run_compiled,
-    ptr_arg,
 )
 
 GEMM_A16W16_DTYPE_FP32 = 1
@@ -62,11 +60,6 @@ class GemmA16W16Gfx950Param:
     mma_m: fx.Constexpr[int]
     mma_n: fx.Constexpr[int]
     mma_k: fx.Constexpr[int]
-    streamk_blocks: fx.Constexpr[int]
-    split_init_ring: fx.Constexpr[bool]
-    unroll_hti: fx.Constexpr[bool]
-    n_grouped_loads: fx.Constexpr[bool]
-    bank_swizzle_343: fx.Constexpr[bool]
     # derived params
     async_load_bytes: fx.Constexpr[int]
     in_data_bytes: fx.Constexpr[int]
@@ -125,11 +118,6 @@ def make_gemm_a16w16_gfx950_param(
     mma_k: int = 32,
     k_stagger: int = 0,
     b_non_temporal: bool = False,
-    n_grouped_loads: bool = False,
-    unroll_hti: bool = False,
-    streamk_blocks: int = 0,
-    split_init_ring: bool = False,
-    bank_swizzle_343: bool = False,
 ) -> GemmA16W16Gfx950Param:
     if in_dtype_id not in (GEMM_A16W16_DTYPE_BF16, GEMM_A16W16_DTYPE_FP16):
         raise ValueError(f"unsupported in_dtype_id={in_dtype_id}")
@@ -141,48 +129,8 @@ def make_gemm_a16w16_gfx950_param(
         raise ValueError(
             "block_m, block_n, block_k, stages, and split_k must be positive"
         )
-    if any(
-        not isinstance(v, int) or isinstance(v, bool) for v in (mma_m, mma_n, mma_k)
-    ):
-        raise ValueError("MFMA dimensions must be integers")
-    if (mma_m, mma_n, mma_k) not in ((16, 16, 32), (32, 32, 16)):
-        raise ValueError("supported MFMA shapes are 16x16x32 and 32x32x16")
-    if (mma_m, mma_n, mma_k) == (32, 32, 16) and (
-        in_dtype_id != GEMM_A16W16_DTYPE_BF16
-        or use_half_tile_interleaved
-        or a_is_transposed
-        or not b_is_transposed
-        or k_waves != 1
-    ):
-        raise ValueError(
-            "MFMA32 currently supports BF16 NT full-tile with k_waves=1 only"
-        )
-    if (
-        not isinstance(streamk_blocks, int)
-        or isinstance(streamk_blocks, bool)
-        or not 0 <= streamk_blocks <= 1024
-    ):
-        raise ValueError("streamk_blocks must be an integer in [0, 1024]")
-    if streamk_blocks and (
-        in_dtype_id != GEMM_A16W16_DTYPE_BF16
-        or out_dtype_id != GEMM_A16W16_DTYPE_BF16
-        or use_half_tile_interleaved
-        or a_is_transposed
-        or not b_is_transposed
-        or has_bias
-        or split_k != 1
-        or k_waves != 1
-        or group_m
-        or k_stagger
-        or b_non_temporal
-    ):
-        raise ValueError(
-            "Stream-K requires unscaled BF16 NT full-tile, split_k=k_waves=1, group_m=0, no bias/stagger/cache hint"
-        )
-    if (streamk_blocks or mma_m == 32) and block_k % 64:
-        raise ValueError(
-            "MFMA32/Stream-K require block_k divisible by 64 for the current LDS swizzle"
-        )
+    if (mma_m, mma_n, mma_k) != (16, 16, 32):
+        raise ValueError("the gfx950 layout kernel currently requires mma=16x16x32")
     if stages < 2:
         raise ValueError("stages must be at least 2 for the staged LDS pipeline")
     if m_waves <= 0 or n_waves <= 0 or k_waves <= 0:
@@ -234,8 +182,6 @@ def make_gemm_a16w16_gfx950_param(
         "gfx942": 65536,
         "gfx950": 163840,
     }
-    if arch != "gfx950" and ((mma_m, mma_n, mma_k) != (16, 16, 32) or streamk_blocks):
-        raise ValueError("MFMA32 and Stream-K extensions require gfx950")
     smem_capacity = SMEM_CAPACITY_MAP[arch]
     if smem_bytes > smem_capacity:
         raise ValueError(
@@ -331,11 +277,6 @@ def make_gemm_a16w16_gfx950_param(
             f"covered_k={mma_k_repeat * k_waves * mma_k}"
         )
     return GemmA16W16Gfx950Param(
-        split_init_ring=split_init_ring,
-        streamk_blocks=streamk_blocks,
-        n_grouped_loads=n_grouped_loads,
-        bank_swizzle_343=bank_swizzle_343,
-        unroll_hti=unroll_hti,
         in_dtype_id=in_dtype_id,
         out_dtype_id=out_dtype_id,
         block_m=block_m,
@@ -383,36 +324,10 @@ def make_gemm_a16w16_gfx950_kernel_name(param: GemmA16W16Gfx950Param):
     b_layout = "t" if param.b_is_transposed else "n"
     name += f"_l{a_layout}{b_layout}"
     name += "_phti" if param.use_half_tile_interleaved else "_pft"
-    # Kernel bodies do not participate in FlyDSL's disk-cache key. Distinguish
-    # the specialized HTI implementations from their original schedules.
-    name += "_ng4sk_u9lg" if param.n_grouped_loads else ""
-    name += "_hti5sk" if param.unroll_hti else ""
-    name += "_initring4" if param.split_init_ring else ""
-    name += "_sw343" if param.bank_swizzle_343 else ""
-    if (param.mma_m, param.mma_n, param.mma_k) != (16, 16, 32):
-        name += f"_mi{param.mma_m}x{param.mma_n}x{param.mma_k}"
-    if param.streamk_blocks:
-        name += f"_skg{param.streamk_blocks}_v1"
     return name
 
 
-def make_gemm_ab_lds_layouts(
-    rows_a, rows_b, block_k, a_is_transposed, b_is_transposed, bank_swizzle_343=False
-):
-    if const_expr(bank_swizzle_343):
-        # gfx950 ds_read_b128 executes in non-contiguous lane phases.
-        # For the qualified BK128 MFMA16 NT geometry, XOR K[6:4] with
-        # row[2:0], keeping each 8-BF16 DMA packet contiguous in its row.
-        # Unlike Swizzle(3,3,3), this avoids two-way phase-bank conflicts.
-        swizzle = fx.static(fx.SwizzleType.get(3, 4, 3))
-        return (
-            fx.make_composed_layout(
-                swizzle, fx.make_ordered_layout((rows_a, block_k), (1, 0))
-            ),
-            fx.make_composed_layout(
-                swizzle, fx.make_ordered_layout((rows_b, block_k), (1, 0))
-            ),
-        )
+def make_gemm_ab_lds_layouts(rows_a, rows_b, block_k, a_is_transposed, b_is_transposed):
     a_lds_layout = (
         make_transposed_lds_layout(rows_a, block_k)
         if const_expr(a_is_transposed)
@@ -520,21 +435,7 @@ def async_load_to_lds(
         src = fx.make_view(tile.src_base + global_offset, g2s_copy_layout)
         dst = fx.make_view(lds_ptr, g2s_copy_layout)
         rocdl.sched_barrier(0)
-        if const_expr(param.n_grouped_loads or param.unroll_hti):
-            # The NT specialization uses a lane-varying row/K-local offset and
-            # a wave-uniform K-tile offset. The copy atom scales soffset from
-            # elements to bytes; keeping K in SGPRs avoids repeated VALU address
-            # updates before each DMA. Async groups and cache policy are unchanged.
-            k_offset = context.ks_begin + tile.k_tile * block_k
-            vector_offset = (
-                safe_global_outer_idx * tile.leading_stride
-                + swizzled_col_idx(
-                    outer_local_idx, k_local_idx, tile.lds_layout, block_k
-                )
-            )
-            src = fx.make_view(tile.src_base + vector_offset, g2s_copy_layout)
-            fx.copy(context.async_g2s_copy_atom, src, dst, soffset=fx.Int32(k_offset))
-        elif const_expr(tile.non_temporal):
+        if const_expr(tile.non_temporal):
             # The async copy atom has no cache-policy operand. Keep the raw
             # load async too, so the existing asyncmark/wait_asyncmark groups
             # still track its completion. src_base is the buffer origin;
@@ -612,8 +513,8 @@ def write_cshuffle_vec_to_global(
         fx.ptr_store(c_vec, fx.get_iter(out) + global_offset)
 
 
-@flyc.jit
-def _gemm_a16w16_ft_device(
+@flyc.kernel
+def gemm_a16w16_gfx950_kernel(
     out: fx.Tensor,
     a: fx.Tensor,
     b: fx.Tensor,
@@ -629,13 +530,6 @@ def _gemm_a16w16_ft_device(
     b_leading_stride: fx.Int32,
     tiled_mma: fx.TiledMma,
     param: GemmA16W16Gfx950Param,
-    stream_segment: fx.Constexpr[bool],
-    tile_id: fx.Int32,
-    begin_k: fx.Int32,
-    count_k: fx.Int32,
-    first_worker: fx.Int32,
-    last_worker: fx.Int32,
-    slots: fx.Constexpr[int],
 ):
     is_split_k = param.is_split_k
     is_slice_k = param.k_waves > 1
@@ -675,22 +569,15 @@ def _gemm_a16w16_ft_device(
     k_wave_idx = tid // threads_per_k_slice
     num_pid_m = (m + block_m - 1) // block_m
     num_pid_n = (n + block_n - 1) // block_n
-    if const_expr(stream_segment):
-        bid_m = tile_id // num_pid_n
-        bid_n = tile_id % num_pid_n
-        ks_idx = fx.Int32(0)
-        ks_begin = begin_k * block_k
-        k_tiles = count_k
-    else:
-        block_swizzle = BlockSwizzle(
-            NUM_XCDS=8, NUM_PIDS_THRESHOLD=256, GROUP_M=param.group_m
-        )
-        bid_m, bid_n = block_swizzle.swizzle(num_pid_m, num_pid_n, fx.block_idx.x)
-        ks_idx = fx.block_idx.y
-        ks_begin = ks_idx * working_k
-        ks_end = ks_begin + working_k
-        ks_end = (ks_end < k).select(ks_end, k)
-        k_tiles = (ks_end - ks_begin) // block_k
+    block_swizzle = BlockSwizzle(
+        NUM_XCDS=8, NUM_PIDS_THRESHOLD=256, GROUP_M=param.group_m
+    )
+    bid_m, bid_n = block_swizzle.swizzle(num_pid_m, num_pid_n, fx.block_idx.x)
+    ks_idx = fx.block_idx.y
+    ks_begin = ks_idx * working_k
+    ks_end = ks_begin + working_k
+    ks_end = (ks_end < k).select(ks_end, k)
+    k_tiles = (ks_end - ks_begin) // block_k
     if const_expr(param.k_stagger > 0):
         # Rotate only the global K loads, never the LDS ring index. The
         # actual partition length also handles a shorter final split.
@@ -765,7 +652,6 @@ def _gemm_a16w16_ft_device(
         block_k,
         param.a_is_transposed,
         param.b_is_transposed,
-        param.bank_swizzle_343,
     )
     c_lds_layout = fx.make_layout((block_m, block_n), (block_n, 1))
 
@@ -878,299 +764,132 @@ def _gemm_a16w16_ft_device(
                     k_iter = k_slice * k_mma_iters_per_wave + block_k_iter
                     compute_k_chunk(k_iter)
 
-    def run_pipeline():
-        # Prime the staged LDS pipeline: preload the first `stages - 1` K tiles
-        # before entering the main loop that overlaps async loads with compute.
-        if const_expr(param.split_init_ring):
-            # Retire output initialization before issuing A/B DMA. Otherwise
-            # the owner's vmcnt(0) publication also drains its first prefetches.
-            splitk_protocol.zero_c()
-            expected_signal = splitk_protocol.take_ticket(split_k)
-            splitk_protocol.publish(expected_signal)
-        for stage in range_constexpr(stages - 1):
-            async_load_b_to_lds(stage, stage)
-            async_load_a_to_lds(stage, stage)
-            rocdl.asyncmark()
-        if const_expr(is_split_k and not param.split_init_ring):
-            splitk_protocol.zero_c()
-            expected_signal = splitk_protocol.take_ticket(split_k)
-            splitk_protocol.publish(expected_signal)
+    # Prime the staged LDS pipeline: preload the first `stages - 1` K tiles
+    # before entering the main loop that overlaps async loads with compute.
+    for stage in range_constexpr(stages - 1):
+        async_load_b_to_lds(stage, stage)
+        async_load_a_to_lds(stage, stage)
+        rocdl.asyncmark()
+    if const_expr(is_split_k):
+        splitk_protocol.zero_c()
+        expected_signal = splitk_protocol.take_ticket(split_k)
+        splitk_protocol.publish(expected_signal)
+    rocdl.sched_barrier(0)
+
+    main_loop_end = k_tiles - (stages - 1)
+    for k_tile in range(0, main_loop_end, 1):
+        current_stage = k_tile % stages
+        write_stage = (current_stage + stages - 1) % stages
+        rocdl.wait_asyncmark(stages - 2)
+        rocdl.s_barrier()
+        async_load_b_to_lds(k_tile + (stages - 1), write_stage)
+        async_load_a_to_lds(k_tile + (stages - 1), write_stage)
+        rocdl.asyncmark()
+        compute_stage(current_stage, k_tile)
         rocdl.sched_barrier(0)
 
-        main_loop_end = k_tiles - (stages - 1)
-        if const_expr(param.split_init_ring):
-            # Static slots, same K order, async groups, waits and barriers.
-            cycles_end = main_loop_end // stages * stages
-            for cycle in range(0, cycles_end, stages):
-                for phase in range_constexpr(stages):
-                    rocdl.wait_asyncmark(stages - 2)
-                    rocdl.s_barrier()
-                    async_load_b_to_lds(
-                        cycle + phase + (stages - 1), (phase + stages - 1) % stages
-                    )
-                    async_load_a_to_lds(
-                        cycle + phase + (stages - 1), (phase + stages - 1) % stages
-                    )
-                    rocdl.asyncmark()
-                    compute_stage(phase, cycle + phase)
-                    rocdl.sched_barrier(0)
+    current_stage = main_loop_end % stages
+    for s in range_constexpr(0, stages - 1):
+        rocdl.wait_asyncmark(stages - 2 - s)
+        rocdl.s_barrier()
+        compute_stage(current_stage, main_loop_end + s)
+        current_stage = (current_stage + 1) % stages
 
-        else:
-            cycles_end = 0
-        for k_tile in range(cycles_end, main_loop_end, 1):
-            current_stage = k_tile % stages
-            write_stage = (current_stage + stages - 1) % stages
-            rocdl.wait_asyncmark(stages - 2)
-            rocdl.s_barrier()
-            async_load_b_to_lds(k_tile + (stages - 1), write_stage)
-            async_load_a_to_lds(k_tile + (stages - 1), write_stage)
-            rocdl.asyncmark()
-            compute_stage(current_stage, k_tile)
-            rocdl.sched_barrier(0)
+    frag_C_out = fx.make_fragment_like(frag_C, global_output_dtype)
+    frag_C_out.store(frag_C.load().to(global_output_dtype))
 
-        current_stage = main_loop_end % stages
-        for s in range_constexpr(0, stages - 1):
-            rocdl.wait_asyncmark(stages - 2 - s)
-            rocdl.s_barrier()
-            compute_stage(current_stage, main_loop_end + s)
-            current_stage = (current_stage + 1) % stages
+    gpu.barrier()
+    for i in range_constexpr(fx.size(frag_C_out.shape).unpack()):
+        row = fx.get_scalar(thr_mma_cRow[i])
+        col = fx.get_scalar(thr_mma_cCol[i])
+        sC_write[row, col] = frag_C_out[i]
 
-        if const_expr(is_split_k):
-            return expected_signal
-        return fx.Int32(0)
-
-    if const_expr(stream_segment):
-        if k_tiles < stages - 1:
-            # A Stream-K interval can end with fewer tiles than the prologue.
-            # No speculative K load is permitted beyond that interval.
-            for tile in range(k_tiles):
-                async_load_b_to_lds(tile, 0)
-                async_load_a_to_lds(tile, 0)
-                rocdl.asyncmark()
-                rocdl.wait_asyncmark(0)
-                gpu.barrier()
-                compute_stage(0, tile)
-                gpu.barrier()
-        else:
-            run_pipeline()
+    if const_expr(is_split_k):
+        splitk_protocol.wait_until_initialized(expected_signal)
     else:
-        expected_signal = run_pipeline()
+        gpu.barrier()
 
-    if const_expr(stream_segment):
-        # No spinning: each worker publishes once per intersected output tile.
-        # Complete tiles bypass scratch, while the last publisher reduces all
-        # FP32 partials in worker/K order and rounds to BF16 exactly once.
-        participants = last_worker - first_worker + 1
-        worker = fx.block_idx.x
-        if participants == 1:
-            for i in range_constexpr(fx.size(frag_C.shape).unpack()):
-                row = fx.get_scalar(thr_mma_cRow[i]) + block_m_offset
-                col = fx.get_scalar(thr_mma_cCol[i]) + block_n_offset
-                if (row < m) and (col < n):
-                    fx.ptr_store(
-                        frag_C[i].to(fx.BFloat16), fx.get_iter(out) + row * n + col
-                    )
-        else:
-            scratch = fx.get_iter(semaphore)
-            tile_elems = block_m * block_n
-            for i in range_constexpr(fx.size(frag_C.shape).unpack() // 4):
-                row = fx.get_scalar(thr_mma_cRow[4 * i])
-                col = fx.get_scalar(thr_mma_cCol[4 * i])
-                off = (
-                    (tile_id * slots + worker - first_worker) * tile_elems
-                    + row // 4 * block_n * 4
-                    + col * 4
-                )
-                vals = fx.Vector.from_elements(
-                    [frag_C[4 * i + j] for j in range_constexpr(4)], fx.Float32
-                )
-                fx.ptr_store(vals, scratch + off)
-            # Every lane releases its writes before the leader's publication.
-            # Use standard agent-scope fences/RMW, not an architecture-specific
-            # cache-policy shortcut. LDS/barriers transfer the ticket to peers.
-            fx.memory_fence(
-                ordering=fx.AtomicOrdering.Release, syncscope=fx.rocdl.SyncScope.Agent
-            )
-            gpu.barrier()
-            ticket = fx.recast_iter(fx.Int32, smem_c)
-            counter = fx.get_iter(signal) + tile_id
-            if tid == 0:
-                arrived = fx.atomic_add(
-                    counter,
-                    fx.Int32(1),
-                    ordering=fx.AtomicOrdering.AcqRel,
-                    syncscope=fx.rocdl.SyncScope.Agent,
-                )
-                fx.ptr_store(arrived, ticket)
-            gpu.barrier()
-            arrived = fx.ptr_load(ticket)
-            if arrived == participants - 1:
-                fx.memory_fence(
-                    ordering=fx.AtomicOrdering.Acquire,
-                    syncscope=fx.rocdl.SyncScope.Agent,
-                )
-                for i in range_constexpr(fx.size(frag_C.shape).unpack() // 4):
-                    row = fx.get_scalar(thr_mma_cRow[4 * i])
-                    col = fx.get_scalar(thr_mma_cCol[4 * i])
-                    off = (
-                        tile_id * slots * tile_elems + row // 4 * block_n * 4 + col * 4
-                    )
-                    acc = fx.ptr_load(
-                        scratch + off, result_type=fx.Vector.make_type(4, fx.Float32)
-                    )
-                    for part in range(1, participants):
-                        acc = acc + fx.ptr_load(
-                            scratch + off + part * tile_elems,
-                            result_type=fx.Vector.make_type(4, fx.Float32),
+    cshuffle_r2g_x_threads = block_n // cshuffle_r2g_vec_size
+    cshuffle_vectors = block_m * block_n // cshuffle_r2g_vec_size
+    cshuffle_iters = (cshuffle_vectors + block_threads - 1) // block_threads
+    lane_contig_atomics = is_split_k
+    if const_expr(lane_contig_atomics):
+        # Split-K: lanes walk consecutive output elements (one fp32, or one bf16/fp16
+        # pair for the packed atomics), so each wave-level atomic covers whole 64 B
+        # lines (16 lanes per line) and the memory-side read-modify-write runs once per
+        # line per instruction. The vec-per-lane mapping below would touch 16 lines with
+        # 4 lanes each and pay four passes per line.
+        atom_elems = 1 if param.out_dtype_id == GEMM_A16W16_DTYPE_FP32 else 2
+        wave_idx = tid // GFX950_WAVE_SIZE
+        lane_idx = tid % GFX950_WAVE_SIZE
+        tile_elems = block_m * block_n
+        for i in range_constexpr(cshuffle_iters):
+            chunk = (
+                block_threads * i + wave_idx * GFX950_WAVE_SIZE
+            ) * cshuffle_r2g_vec_size
+            for j in range_constexpr(cshuffle_r2g_vec_size // atom_elems):
+                elem_idx = chunk + (j * GFX950_WAVE_SIZE + lane_idx) * atom_elems
+                if elem_idx < tile_elems:
+                    local_row = elem_idx // block_n
+                    local_col = elem_idx % block_n
+                    global_row = block_m_offset + local_row
+                    global_col = block_n_offset + local_col
+                    if (global_row < m) and (global_col < n):
+                        c_val = fx.ptr_load(
+                            smem_c + elem_idx,
+                            result_type=fx.Vector.make_type(
+                                atom_elems, global_output_dtype
+                            ),
                         )
-                    vals = acc.to(fx.BFloat16)
-                    for j in range_constexpr(4):
-                        gr = block_m_offset + row + j
-                        gc = block_n_offset + col
-                        if (gr < m) and (gc < n):
-                            fx.ptr_store(vals[j], fx.get_iter(out) + gr * n + gc)
-        # All lanes finish using the union before the next persistent tile.
-        gpu.barrier()
-    else:
-        frag_C_out = fx.make_fragment_like(frag_C, global_output_dtype)
-        frag_C_out.store(frag_C.load().to(global_output_dtype))
-
-        gpu.barrier()
-        for i in range_constexpr(fx.size(frag_C_out.shape).unpack()):
-            row = fx.get_scalar(thr_mma_cRow[i])
-            col = fx.get_scalar(thr_mma_cCol[i])
-            sC_write[row, col] = frag_C_out[i]
-
-        if const_expr(is_split_k):
-            splitk_protocol.wait_until_initialized(expected_signal)
-        else:
-            gpu.barrier()
-
-        cshuffle_r2g_x_threads = block_n // cshuffle_r2g_vec_size
-        cshuffle_vectors = block_m * block_n // cshuffle_r2g_vec_size
-        cshuffle_iters = (cshuffle_vectors + block_threads - 1) // block_threads
-        lane_contig_atomics = is_split_k
-        if const_expr(lane_contig_atomics):
-            # Split-K: lanes walk consecutive output elements (one fp32, or one bf16/fp16
-            # pair for the packed atomics), so each wave-level atomic covers whole 64 B
-            # lines (16 lanes per line) and the memory-side read-modify-write runs once per
-            # line per instruction. The vec-per-lane mapping below would touch 16 lines with
-            # 4 lanes each and pay four passes per line.
-            atom_elems = 1 if param.out_dtype_id == GEMM_A16W16_DTYPE_FP32 else 2
-            wave_idx = tid // GFX950_WAVE_SIZE
-            lane_idx = tid % GFX950_WAVE_SIZE
-            tile_elems = block_m * block_n
-            for i in range_constexpr(cshuffle_iters):
-                chunk = (
-                    block_threads * i + wave_idx * GFX950_WAVE_SIZE
-                ) * cshuffle_r2g_vec_size
-                for j in range_constexpr(cshuffle_r2g_vec_size // atom_elems):
-                    elem_idx = chunk + (j * GFX950_WAVE_SIZE + lane_idx) * atom_elems
-                    if elem_idx < tile_elems:
-                        local_row = elem_idx // block_n
-                        local_col = elem_idx % block_n
-                        global_row = block_m_offset + local_row
-                        global_col = block_n_offset + local_col
-                        if (global_row < m) and (global_col < n):
-                            c_val = fx.ptr_load(
-                                smem_c + elem_idx,
+                        for k_slice in range_constexpr(1, k_waves):
+                            c_val = c_val + fx.ptr_load(
+                                smem_c + k_slice * tile_elems + elem_idx,
                                 result_type=fx.Vector.make_type(
                                     atom_elems, global_output_dtype
                                 ),
                             )
-                            for k_slice in range_constexpr(1, k_waves):
-                                c_val = c_val + fx.ptr_load(
-                                    smem_c + k_slice * tile_elems + elem_idx,
-                                    result_type=fx.Vector.make_type(
-                                        atom_elems, global_output_dtype
-                                    ),
-                                )
-                            write_cshuffle_vec_to_global(
-                                out,
-                                out_buf,
-                                global_row * n + global_col,
-                                c_val,
-                                is_split_k,
-                                param.out_dtype_id == GEMM_A16W16_DTYPE_FP32,
-                            )
-        for i in range_constexpr(0 if lane_contig_atomics else cshuffle_iters):
-            vector_idx = block_threads * i + tid
-            if vector_idx < cshuffle_vectors:
-                local_row = vector_idx // cshuffle_r2g_x_threads
-                local_col = vector_idx % cshuffle_r2g_x_threads * cshuffle_r2g_vec_size
-                global_row = block_m_offset + local_row
-                global_col = block_n_offset + local_col
-                if (global_row < m) and (global_col < n):
-                    c_vec = fx.ptr_load(
-                        smem_c + local_row * block_n + local_col,
+                        write_cshuffle_vec_to_global(
+                            out,
+                            out_buf,
+                            global_row * n + global_col,
+                            c_val,
+                            is_split_k,
+                            param.out_dtype_id == GEMM_A16W16_DTYPE_FP32,
+                        )
+    for i in range_constexpr(0 if lane_contig_atomics else cshuffle_iters):
+        vector_idx = block_threads * i + tid
+        if vector_idx < cshuffle_vectors:
+            local_row = vector_idx // cshuffle_r2g_x_threads
+            local_col = vector_idx % cshuffle_r2g_x_threads * cshuffle_r2g_vec_size
+            global_row = block_m_offset + local_row
+            global_col = block_n_offset + local_col
+            if (global_row < m) and (global_col < n):
+                c_vec = fx.ptr_load(
+                    smem_c + local_row * block_n + local_col,
+                    result_type=fx.Vector.make_type(
+                        cshuffle_r2g_vec_size, global_output_dtype
+                    ),
+                )
+                for k_slice in range_constexpr(1, k_waves):
+                    peer_c_vec = fx.ptr_load(
+                        smem_c
+                        + k_slice * block_m * block_n
+                        + local_row * block_n
+                        + local_col,
                         result_type=fx.Vector.make_type(
                             cshuffle_r2g_vec_size, global_output_dtype
                         ),
                     )
-                    for k_slice in range_constexpr(1, k_waves):
-                        peer_c_vec = fx.ptr_load(
-                            smem_c
-                            + k_slice * block_m * block_n
-                            + local_row * block_n
-                            + local_col,
-                            result_type=fx.Vector.make_type(
-                                cshuffle_r2g_vec_size, global_output_dtype
-                            ),
-                        )
-                        c_vec = c_vec + peer_c_vec
-                    global_offset = global_row * n + global_col
-                    write_cshuffle_vec_to_global(
-                        out,
-                        out_buf,
-                        global_offset,
-                        c_vec,
-                        is_split_k,
-                        param.out_dtype_id == GEMM_A16W16_DTYPE_FP32,
-                    )
-
-
-@flyc.kernel
-def gemm_a16w16_gfx950_kernel(
-    out: fx.Tensor,
-    a: fx.Tensor,
-    b: fx.Tensor,
-    bias: fx.Tensor,
-    semaphore: fx.Tensor,
-    signal: fx.Tensor,
-    m: fx.Int32,
-    n: fx.Int32,
-    k: fx.Int32,
-    split_k: fx.Int32,
-    working_k: fx.Int32,
-    a_leading_stride: fx.Int32,
-    b_leading_stride: fx.Int32,
-    tiled_mma: fx.TiledMma,
-    param: GemmA16W16Gfx950Param,
-):
-    _gemm_a16w16_ft_device(
-        out,
-        a,
-        b,
-        bias,
-        semaphore,
-        signal,
-        m,
-        n,
-        k,
-        split_k,
-        working_k,
-        a_leading_stride,
-        b_leading_stride,
-        tiled_mma,
-        param,
-        False,
-        fx.Int32(0),
-        fx.Int32(0),
-        fx.Int32(0),
-        fx.Int32(0),
-        fx.Int32(0),
-        1,
-    )
+                    c_vec = c_vec + peer_c_vec
+                global_offset = global_row * n + global_col
+                write_cshuffle_vec_to_global(
+                    out,
+                    out_buf,
+                    global_offset,
+                    c_vec,
+                    is_split_k,
+                    param.out_dtype_id == GEMM_A16W16_DTYPE_FP32,
+                )
 
 
 @flyc.kernel
@@ -1230,21 +949,12 @@ def gemm_a16w16_hti_gfx950_kernel(
     block_swizzle = BlockSwizzle(
         NUM_XCDS=8, NUM_PIDS_THRESHOLD=256, GROUP_M=param.group_m
     )
-    if const_expr(param.n_grouped_loads):
-        # Reuse the existing XCD-aware bijection with transposed tile axes:
-        # groups of four N tiles improve A reuse for this projection.
-        bid_n, bid_m = block_swizzle.swizzle(num_pid_n, num_pid_m, fx.block_idx.x)
-    else:
-        bid_m, bid_n = block_swizzle.swizzle(num_pid_m, num_pid_n, fx.block_idx.x)
+    bid_m, bid_n = block_swizzle.swizzle(num_pid_m, num_pid_n, fx.block_idx.x)
     ks_idx = fx.block_idx.y
     ks_begin = ks_idx * working_k
     ks_end = ks_begin + working_k
     ks_end = (ks_end < k).select(ks_end, k)
-    if const_expr(param.unroll_hti):
-        # The validated specialization has K7168, block_k64 and no split-K.
-        k_tiles = 112
-    else:
-        k_tiles = (ks_end - ks_begin) // block_k
+    k_tiles = (ks_end - ks_begin) // block_k
     if const_expr(param.k_stagger > 0):
         # Rotate only the global K loads, never the LDS ring index. The
         # actual partition length also handles a shorter final split.
@@ -1514,61 +1224,50 @@ def gemm_a16w16_hti_gfx950_kernel(
     wait_vmcnt_and_barrier(half_ldg_b_iters + half_ldg_a_iters)
 
     main_loop_end = k_tiles - 2
-    # Exact down: 110 steady-state tiles / 10 = 11 iterations.
-    # Exact up: 54 steady-state tiles / 18 = 3 iterations.
-    # Both retain the same ordered MFMA/DMA/barrier sequence and two-tile
-    # drain. These flags are derived from exact shape/policy, not user options.
-    hti_periods = (
-        9
-        if const_expr(param.n_grouped_loads)
-        else 5 if const_expr(param.unroll_hti) else 1
-    )
-    for cycle in range(0, main_loop_end, 2 * hti_periods):
-        for period in range_constexpr(hti_periods):
-            k_tile = cycle + period * 2
-            next_k_tile = k_tile + 2
-            # 0
-            b0 = load_b_fragment(0, 0)
-            a0 = load_a_fragment(0, 0)
-            async_load_a_to_lds(1, k_tile + 1, 1)
-            rocdl.s_barrier()
-            consume(c00, a0, b0, True)
-            rocdl.s_barrier()
-            b1 = load_b_fragment(1, 0)
-            async_load_b_to_lds(0, next_k_tile, 0)
-            rocdl.s_barrier()
-            consume(c01, a0, b1, True)
-            rocdl.s_barrier()
-            a1 = load_a_fragment(1, 0)
-            async_load_a_to_lds(0, next_k_tile, 0)
-            rocdl.s_barrier()
-            consume(c10, a1, b0, True)
-            rocdl.s_barrier()
-            b0 = load_b_fragment(0, 1)
-            async_load_b_to_lds(1, next_k_tile, 0)
-            wait_vmcnt_and_barrier(2 * half_ldg_b_iters + half_ldg_a_iters)
-            consume(c11, a1, b1, True)
-            rocdl.s_barrier()
-            # 1
-            a0 = load_a_fragment(0, 1)
-            async_load_a_to_lds(1, next_k_tile, 0)
-            rocdl.s_barrier()
-            consume(c00, a0, b0, True)
-            rocdl.s_barrier()
-            b1 = load_b_fragment(1, 1)
-            async_load_b_to_lds(0, next_k_tile + 1, 1)
-            rocdl.s_barrier()
-            consume(c01, a0, b1, True)
-            rocdl.s_barrier()
-            a1 = load_a_fragment(1, 1)
-            async_load_a_to_lds(0, next_k_tile + 1, 1)
-            rocdl.s_barrier()
-            consume(c10, a1, b0, True)
-            rocdl.s_barrier()
-            async_load_b_to_lds(1, next_k_tile + 1, 1)
-            wait_vmcnt_and_barrier(half_ldg_b_iters + half_ldg_a_iters)
-            consume(c11, a1, b1, True)
-            rocdl.s_barrier()
+    for k_tile in range(0, main_loop_end, 2):
+        next_k_tile = k_tile + 2
+        # 0
+        b0 = load_b_fragment(0, 0)
+        a0 = load_a_fragment(0, 0)
+        async_load_a_to_lds(1, k_tile + 1, 1)
+        rocdl.s_barrier()
+        consume(c00, a0, b0, True)
+        rocdl.s_barrier()
+        b1 = load_b_fragment(1, 0)
+        async_load_b_to_lds(0, next_k_tile, 0)
+        rocdl.s_barrier()
+        consume(c01, a0, b1, True)
+        rocdl.s_barrier()
+        a1 = load_a_fragment(1, 0)
+        async_load_a_to_lds(0, next_k_tile, 0)
+        rocdl.s_barrier()
+        consume(c10, a1, b0, True)
+        rocdl.s_barrier()
+        b0 = load_b_fragment(0, 1)
+        async_load_b_to_lds(1, next_k_tile, 0)
+        wait_vmcnt_and_barrier(2 * half_ldg_b_iters + half_ldg_a_iters)
+        consume(c11, a1, b1, True)
+        rocdl.s_barrier()
+        # 1
+        a0 = load_a_fragment(0, 1)
+        async_load_a_to_lds(1, next_k_tile, 0)
+        rocdl.s_barrier()
+        consume(c00, a0, b0, True)
+        rocdl.s_barrier()
+        b1 = load_b_fragment(1, 1)
+        async_load_b_to_lds(0, next_k_tile + 1, 1)
+        rocdl.s_barrier()
+        consume(c01, a0, b1, True)
+        rocdl.s_barrier()
+        a1 = load_a_fragment(1, 1)
+        async_load_a_to_lds(0, next_k_tile + 1, 1)
+        rocdl.s_barrier()
+        consume(c10, a1, b0, True)
+        rocdl.s_barrier()
+        async_load_b_to_lds(1, next_k_tile + 1, 1)
+        wait_vmcnt_and_barrier(half_ldg_b_iters + half_ldg_a_iters)
+        consume(c11, a1, b1, True)
+        rocdl.s_barrier()
 
     k_tile = main_loop_end
     # 0
@@ -1628,25 +1327,13 @@ def gemm_a16w16_hti_gfx950_kernel(
         store_half_tile_to_global(1, 0)
         store_half_tile_to_global(1, 1)
     else:
-
-        def finish_c_lds():
-            if const_expr(param.n_grouped_loads):
-                # Exact large-up only. The drain has completed every A/B DMA
-                # before the final K tile's MFMA. This C-only phase needs LDS
-                # writes/reads to retire, not disjoint global output stores.
-                # Retain the rendezvous and explicit LDS completion wait.
-                rocdl.s_waitcnt(lgkmcnt=0)
-                rocdl.s_barrier()
-            else:
-                wait_vmcnt_and_barrier(0)
-
-        finish_c_lds()
+        wait_vmcnt_and_barrier(0)
         store_half_tile_to_global(0, 0)
         store_half_tile_to_global(0, 1)
-        finish_c_lds()
+        wait_vmcnt_and_barrier(0)
         store_half_tile_to_lds(1, 0, c10)
         store_half_tile_to_lds(1, 1, c11)
-        finish_c_lds()
+        wait_vmcnt_and_barrier(0)
         store_half_tile_to_global(1, 0)
         store_half_tile_to_global(1, 1)
 
@@ -1740,289 +1427,23 @@ gemm_a16w16_gfx950.compile_hints = {
 set_slp_vectorize_once_used(gemm_a16w16_gfx950, False)
 
 
-@flyc.jit
-def _split_init_ring_ptr(
-    op: fx.Pointer,
-    ap: fx.Pointer,
-    bp: fx.Pointer,
-    sp: fx.Pointer,
-    fp: fx.Pointer,
-    m: fx.Int32,
-    n: fx.Int32,
-    k: fx.Int32,
-    lda: fx.Int32,
-    ldb: fx.Int32,
-    split_k: fx.Int32,
-    param: GemmA16W16Gfx950Param,
-    stream: fx.Stream,
-):
-    out = fx.make_view(op, fx.make_layout((m, n), (n, 1)))
-    a = fx.make_view(ap, fx.make_layout((m, k), (lda, 1)))
-    b = fx.make_view(bp, fx.make_layout((k, n), (1, ldb)))
-    sem = fx.make_view(sp, fx.make_layout(SPLIT_K_SEMAPHORE_MAX_LEN, 1))
-    sig = fx.make_view(fp, fx.make_layout(SPLIT_K_SEMAPHORE_MAX_LEN, 1))
-    mma = fx.make_tiled_mma(
-        fx.make_mma_atom(fx.rocdl.MFMA(16, 16, 32, fx.BFloat16)),
-        fx.make_layout((2, 2, 1), (2, 1, 0)),
-        fx.make_tile(None, None, fx.make_layout((8, 4), (1, 8))),
-    )
-    working_k = (k + split_k - 1) // split_k
-    working_k = (working_k + 7) // 8 * 8
-    gemm_a16w16_gfx950_kernel._known_block_size = [256, 1, 1]
-    gemm_a16w16_gfx950_kernel._func.__name__ = (
-        make_gemm_a16w16_gfx950_kernel_name(param) + "_ptr"
-    )
-    gemm_a16w16_gfx950_kernel(
-        out, a, b, a, sem, sig, m, n, k, split_k, working_k, lda, ldb, mma, param
-    ).launch(
-        grid=(((m + 63) // 64) * ((n + 63) // 64), split_k, 1),
-        block=(256, 1, 1),
-        stream=stream,
-    )
-
-
-_split_init_ring_ptr.compile_hints = gemm_a16w16_gfx950.compile_hints
-set_slp_vectorize_once_used(_split_init_ring_ptr, False)
-
-
-@flyc.kernel
-def _streamk_gemm_kernel(
-    out: fx.Tensor,
-    a: fx.Tensor,
-    b: fx.Tensor,
-    partial: fx.Tensor,
-    counters: fx.Tensor,
-    m: fx.Int32,
-    n: fx.Int32,
-    k: fx.Int32,
-    lda: fx.Int32,
-    ldb: fx.Int32,
-    mma: fx.TiledMma,
-    param: GemmA16W16Gfx950Param,
-    slots: fx.Constexpr[int],
-):
-    nt = (n + param.block_n - 1) // param.block_n
-    tiles = ((m + param.block_m - 1) // param.block_m) * nt
-    kt = k // param.block_k
-    total = tiles * kt
-    workers = param.streamk_blocks
-    wid = fx.block_idx.x
-    begin = wid * total // workers
-    end = (wid + 1) * total // workers
-    cursor = begin
-    while cursor < end:
-        tile = cursor // kt
-        stop = ((tile + 1) * kt < end).select((tile + 1) * kt, end)
-        # Inverse of floor(wid*total/workers), including uneven partitions.
-        first = ((tile * kt + 1) * workers - 1) // total
-        last = ((tile + 1) * kt * workers - 1) // total
-        _gemm_a16w16_ft_device(
-            out,
-            a,
-            b,
-            a,
-            partial,
-            counters,
-            m,
-            n,
-            k,
-            fx.Int32(1),
-            k,
-            lda,
-            ldb,
-            mma,
-            param,
-            True,
-            tile,
-            cursor - tile * kt,
-            stop - cursor,
-            first,
-            last,
-            slots,
-        )
-        cursor = stop
-
-
-@flyc.jit
-def _streamk_gemm(
-    out: fx.Tensor,
-    a: fx.Tensor,
-    b: fx.Tensor,
-    partial: fx.Tensor,
-    counters: fx.Tensor,
-    param: GemmA16W16Gfx950Param,
-    slots: fx.Constexpr[int],
-    stream: fx.Stream,
-):
-    m = fx.Int32(fx.get_scalar(a.shape[0]))
-    k = fx.Int32(fx.get_scalar(a.shape[1]))
-    n = fx.Int32(fx.get_scalar(b.shape[1]))
-    lda = fx.Int32(fx.get_scalar(a.stride[0]))
-    ldb = fx.Int32(fx.get_scalar(b.stride[1]))
-    group_k = param.mma_k // 4
-    mma = fx.make_tiled_mma(
-        fx.make_mma_atom(
-            fx.rocdl.MFMA(param.mma_m, param.mma_n, param.mma_k, fx.BFloat16)
-        ),
-        fx.make_layout((param.m_waves, param.n_waves, 1), (param.n_waves, 1, 0)),
-        fx.make_tile(None, None, fx.make_layout((group_k, 4), (1, group_k))),
-    )
-    _streamk_gemm_kernel._known_block_size = [param.block_threads, 1, 1]
-    _streamk_gemm_kernel._func.__name__ = make_gemm_a16w16_gfx950_kernel_name(param)
-    _streamk_gemm_kernel(
-        out, a, b, partial, counters, m, n, k, lda, ldb, mma, param, slots
-    ).launch(
-        grid=(param.streamk_blocks, 1, 1),
-        block=(param.block_threads, 1, 1),
-        stream=stream,
-    )
-
-
-_streamk_gemm.compile_hints = gemm_a16w16_gfx950.compile_hints
-set_slp_vectorize_once_used(_streamk_gemm, False)
-
-
 @functools.cache
-def _gemm_a16w16_gfx950_param_for(items, split_init_shape=False):
+def _gemm_a16w16_gfx950_param_for(items):
     # Building the param struct coerces every field through FlyDSL's typing
     # layer, which costs more host time than the launch itself; it depends
-    # only on the config and selected schedule, not on the exact M value.
-    config = dict(items)
-    if split_init_shape:
-        config["split_init_ring"] = _use_split_init_ring(128, 3584, 7168, config)
-    return make_gemm_a16w16_gfx950_param(**config)
-
-
-def _is_latent_hti_policy(kwargs):
-    return (
-        kwargs.get("streamk_blocks", 0) == 0
-        and (kwargs.get("mma_m", 16), kwargs.get("mma_n", 16), kwargs.get("mma_k", 32))
-        == (16, 16, 32)
-        and kwargs.get("in_dtype_id") == GEMM_A16W16_DTYPE_BF16
-        and kwargs.get("out_dtype_id") == GEMM_A16W16_DTYPE_BF16
-        and not kwargs.get("has_bias", False)
-        and not kwargs.get("a_is_transposed", False)
-        and kwargs.get("b_is_transposed", True)
-        and kwargs.get("use_half_tile_interleaved", False)
-        and not kwargs.get("b_non_temporal", False)
-        and kwargs.get("k_stagger", 0) == 0
-        and kwargs.get("group_m", 0) == 4
-        and kwargs.get("split_k", 1) == 1
-        and kwargs.get("block_m") == 256
-        and kwargs.get("block_n") == 256
-        and kwargs.get("block_k") == 64
-        and kwargs.get("stages") == 2
-        and kwargs.get("m_waves") == 2
-        and kwargs.get("n_waves") == 4
-        and kwargs.get("k_waves", 1) == 1
-    )
-
-
-def _use_n_grouped_loads(m, n, k, kwargs):
-    # Only the measured full-M up projection; padded-M consumers keep old code.
-    return (m, n, k) == (16384, 7168, 3584) and _is_latent_hti_policy(kwargs)
-
-
-def _use_unrolled_hti(m, n, k, kwargs):
-    # This exact down projection has 112 K tiles, including a two-tile drain.
-    return (m, n, k) == (16384, 3584, 7168) and _is_latent_hti_policy(kwargs)
-
-
-def _use_split_init_ring(m, n, k, kwargs):
-    # Preserve all padded-M consumers and all other explicit configurations.
-    return (
-        (m, n, k) == (128, 3584, 7168)
-        and kwargs.get("in_dtype_id") == GEMM_A16W16_DTYPE_BF16
-        and kwargs.get("out_dtype_id") == GEMM_A16W16_DTYPE_BF16
-        and not kwargs.get("has_bias", False)
-        and not kwargs.get("a_is_transposed", False)
-        and kwargs.get("b_is_transposed", True)
-        and not kwargs.get("use_half_tile_interleaved", False)
-        and not kwargs.get("b_non_temporal", False)
-        and kwargs.get("k_stagger", 0) == 0
-        and kwargs.get("streamk_blocks", 0) == 0
-        and (kwargs.get("mma_m", 16), kwargs.get("mma_n", 16), kwargs.get("mma_k", 32))
-        == (16, 16, 32)
-        and (kwargs.get("block_m"), kwargs.get("block_n"), kwargs.get("block_k"))
-        == (64, 64, 64)
-        and (kwargs.get("stages"), kwargs.get("split_k")) == (4, 4)
-        and (kwargs.get("m_waves"), kwargs.get("n_waves"), kwargs.get("k_waves", 1))
-        == (2, 2, 1)
-        and kwargs.get("group_m", 0) == 0
-    )
-
-
-def _use_bank_swizzle_343(m, n, k, kwargs):
-    # Finite qualification: do not silently change other explicit BK128 GEMMs.
-    return (
-        (m, n, k) == (128, 7168, 3584)
-        and kwargs.get("in_dtype_id") == GEMM_A16W16_DTYPE_BF16
-        and kwargs.get("out_dtype_id") == GEMM_A16W16_DTYPE_BF16
-        and not kwargs.get("has_bias", False)
-        and not kwargs.get("a_is_transposed", False)
-        and kwargs.get("b_is_transposed", True)
-        and not kwargs.get("use_half_tile_interleaved", False)
-        and not kwargs.get("b_non_temporal", False)
-        and kwargs.get("k_stagger", 0) == 0
-        and kwargs.get("streamk_blocks", 0) == 0
-        and (kwargs.get("mma_m", 16), kwargs.get("mma_n", 16), kwargs.get("mma_k", 32))
-        == (16, 16, 32)
-        and (kwargs.get("block_m"), kwargs.get("block_n"), kwargs.get("block_k"))
-        == (64, 64, 128)
-        and (kwargs.get("stages"), kwargs.get("split_k")) == (3, 1)
-        and (kwargs.get("m_waves"), kwargs.get("n_waves"), kwargs.get("k_waves", 1))
-        == (2, 4, 1)
-        and kwargs.get("group_m", 0) == 0
-    )
+    # only on the config, so one struct per config serves every M.
+    return make_gemm_a16w16_gfx950_param(**dict(items))
 
 
 def make_gemm_a16w16_param_and_validate(m, n, k, kwargs):
-    # Python caches compare True == 1 and 16.0 == 16. Validate the new
-    # fields before looking up a previously built constexpr parameter.
-    if type(kwargs.get("streamk_blocks", 0)) is not int or any(
-        type(kwargs.get(key, default)) is not int
-        for key, default in zip(("mma_m", "mma_n", "mma_k"), (16, 16, 32))
-    ):
-        return None
     result = None
-    # Include the shape-dependent schedule in the constexpr parameter/cache key.
-    # Do not mutate caller policy dictionaries or expose an unchecked override.
-    kwargs = {
-        **kwargs,
-        "n_grouped_loads": _use_n_grouped_loads(m, n, k, kwargs),
-        "unroll_hti": _use_unrolled_hti(m, n, k, kwargs),
-        "bank_swizzle_343": _use_bank_swizzle_343(m, n, k, kwargs),
-    }
-    # Never accept the internal schedule flag from a caller. Only the
-    # exact-shape cache entry can derive it from a validated configuration.
-    kwargs.pop("split_init_ring", None)
     try:
-        if (m, n, k) == (128, 3584, 7168):
-            result = _gemm_a16w16_gfx950_param_for(
-                tuple(sorted(kwargs.items())), split_init_shape=True
-            )
-        else:
-            result = _gemm_a16w16_gfx950_param_for(tuple(sorted(kwargs.items())))
+        result = _gemm_a16w16_gfx950_param_for(tuple(sorted(kwargs.items())))
     except Exception:  # noqa: BLE001 - invalid policies are filtered here
         return None
     split_k = kwargs.get("split_k", 1)
-    if result.streamk_blocks:
-        tiles = ((m + result.block_m - 1) // result.block_m) * (
-            (n + result.block_n - 1) // result.block_n
-        )
-        kt = k // result.block_k
-        slots = (result.streamk_blocks + tiles - 1) // tiles + 1 if tiles else 0
-        if (
-            min(m, n, k) <= 0
-            or k % result.block_k
-            or result.streamk_blocks > tiles * kt
-            or tiles * kt * result.streamk_blocks >= (1 << 31)
-            or tiles * slots * result.block_m * result.block_n * 4 >= (1 << 31)
-        ):
-            return None
     try:
-        if not result.streamk_blocks:
-            assert_no_k_tail(k, kwargs)
+        assert_no_k_tail(k, kwargs)
     except AssertionError:
         return None
     cshuffle_r2g_vec_size = result.cshuffle_r2g_vec_size
@@ -2242,8 +1663,7 @@ def gemm_a16w16(
     )
     kwargs["has_bias"] = bias is not None
     split_k = kwargs["split_k"]
-    if not kwargs.get("streamk_blocks", 0):
-        assert_no_k_tail(k, kwargs)
+    assert_no_k_tail(k, kwargs)
 
     if bias is not None:
         assert bias.shape[0] == n
@@ -2251,94 +1671,6 @@ def gemm_a16w16(
 
     param = make_gemm_a16w16_param_and_validate(m, n, k, kwargs)
     assert param is not None, "unsupported gemm_a16w16_gfx950 shape/config"
-    if param.streamk_blocks:
-        if device.type != "cuda" or stream.device != device:
-            raise ValueError("Stream-K tensors and stream must share a CUDA device")
-        a_span = ((m - 1) * a.stride(0) + k) * a.element_size()
-        b_span = ((n - 1) * b.stride(1) + k) * b.element_size()
-        if max(a_span, b_span, m * n * out.element_size()) >= (1 << 31):
-            raise ValueError("Stream-K addressed spans must fit signed i32 bytes")
-        tiles = ((m + param.block_m - 1) // param.block_m) * (
-            (n + param.block_n - 1) // param.block_n
-        )
-        slots = (param.streamk_blocks + tiles - 1) // tiles + 1
-        # Per-invocation storage on the launch stream. Captured invocations
-        # own independent allocations. Counters are initialized on every call,
-        # including graph replay; the initialization kernel is part of timing.
-        with torch.cuda.stream(stream):
-            partial = torch.empty(
-                (tiles * slots * param.block_m * param.block_n,),
-                device=device,
-                dtype=torch.float32,
-            )
-            counters = torch.zeros((tiles,), device=device, dtype=torch.int32)
-            args = (
-                _dynamic_tensor_arg(out, 1),
-                _dynamic_tensor_arg(a, 1),
-                _dynamic_tensor_arg(b, 0),
-                flyc.from_dlpack(partial),
-                flyc.from_dlpack(counters),
-                param,
-                slots,
-                stream,
-            )
-            _run_compiled(
-                _streamk_gemm,
-                *args,
-                specialization_key=(
-                    device.index,
-                    a.dtype,
-                    out.dtype,
-                    tuple(a.shape),
-                    tuple(a.stride()),
-                    tuple(b.shape),
-                    tuple(b.stride()),
-                    param.__cache_signature__(),
-                    slots,
-                ),
-            )
-        return out
-    if param.split_init_ring:
-        # Exact no-bias BF16 NT policy only; ranks, shapes, layouts and DMA
-        # alignment were checked above. Scalars/strides stay runtime inputs
-        # so this launcher preserves the validated device schedule.
-        if device.type != "cuda" or stream.device != device:
-            raise ValueError("split GEMM tensors and stream must share a CUDA device")
-        a_span = ((m - 1) * a.stride(0) + k) * a.element_size()
-        b_span = ((n - 1) * b.stride(1) + k) * b.element_size()
-        # Large spans keep the legacy tensor launcher rather than narrowing
-        # its domain. The fast pointer ABI requires signed-i32 offsets.
-        if max(a_span, b_span) <= (1 << 31) - 1:
-            # A first eager use after cold capture may allocate new counters.
-            # Initialize those on the launch stream, not the ambient stream.
-            if stream == torch.cuda.current_stream(device):
-                semaphore, signal = get_split_k_buffers(stream, device, split_k)
-            else:
-                with torch.cuda.stream(stream):
-                    semaphore, signal = get_split_k_buffers(stream, device, split_k)
-            _run_compiled(
-                _split_init_ring_ptr,
-                ptr_arg(out, fx.BFloat16),
-                ptr_arg(a, fx.BFloat16),
-                ptr_arg(b, fx.BFloat16),
-                ptr_arg(semaphore, fx.Int64),
-                ptr_arg(signal, fx.Int32),
-                m,
-                n,
-                k,
-                int(a.stride(0)),
-                int(b.stride(1)),
-                split_k,
-                param,
-                fx.Stream(stream),
-                specialization_key=(
-                    device.index,
-                    a.dtype,
-                    out.dtype,
-                    param.__cache_signature__(),
-                ),
-            )
-            return out
     semaphore, signal = get_split_k_buffers(stream, device, split_k)
     a_arg = _dynamic_tensor_arg(a, 0 if a_is_transposed else 1)
     b_arg = _dynamic_tensor_arg(b, 0 if b_is_transposed else 1)

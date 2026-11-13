@@ -43,9 +43,7 @@ _HGEMM_KERNEL_RE = re.compile(
     r"x(?P<stages>\d+)_ks(?P<split_k>\d+)_"
     r"w(?P<m_waves>\d+)x(?P<n_waves>\d+)x(?P<k_waves>\d+)_"
     r"bias(?P<has_bias>[01])_ktail(?P<has_k_tail>[01])_"
-    r"gm(?P<group_m>\d+)(?:_stg(?P<k_stagger>\d+))?(?P<b_non_temporal>_bnt)?"
-    r"(?:_mi(?P<mma_m>\d+)x(?P<mma_n>\d+)x(?P<mma_k>\d+))?"
-    r"(?:_skg(?P<streamk_blocks>\d+))?_p(?P<policy>ft|ht|hti|sk|bs)_"
+    r"gm(?P<group_m>\d+)(?:_stg(?P<k_stagger>\d+))?(?P<b_non_temporal>_bnt)?_p(?P<policy>ft|ht|hti|sk|bs)_"
     r"(?P<target_gfx>gfx[0-9a-z]+(?:-[0-9a-z]+)*)$"
 )
 
@@ -94,27 +92,6 @@ def flydsl_hgemm_kernel_name(
     _validate_k_stagger(k_stagger, gfx, policy)
     b_non_temporal = config.get("b_non_temporal", False)
     _validate_b_non_temporal(b_non_temporal, gfx, policy)
-    mma = tuple(
-        config.get(key, default)
-        for key, default in zip(("mma_m", "mma_n", "mma_k"), (16, 16, 32))
-    )
-    blocks = config.get("streamk_blocks", 0)
-    _validate_extended_policy(
-        mma,
-        blocks,
-        gfx,
-        policy,
-        dtype_name,
-        out_dtype_name,
-        has_bias,
-        config.get("split_k", 1),
-        config.get("k_waves", 1),
-        config.get("group_m", 0),
-        k_stagger,
-        b_non_temporal,
-    )
-    mma_suffix = "" if mma == (16, 16, 32) else f"_mi{mma[0]}x{mma[1]}x{mma[2]}"
-    stream_suffix = f"_skg{blocks}" if blocks else ""
     stagger_suffix = f"_stg{k_stagger}" if k_stagger else ""
     memory_suffix = "_bnt" if b_non_temporal else ""
     name = (
@@ -122,7 +99,7 @@ def flydsl_hgemm_kernel_name(
         f"t{config['block_m']}x{config['block_n']}x{config['block_k']}"
         f"x{config['stages']}_ks{config['split_k']}_"
         f"w{config['m_waves']}x{config['n_waves']}x{config['k_waves']}_"
-        f"bias{int(has_bias)}_ktail0_gm{config['group_m']}{stagger_suffix}{memory_suffix}{mma_suffix}{stream_suffix}_p{policy}_"
+        f"bias{int(has_bias)}_ktail0_gm{config['group_m']}{stagger_suffix}{memory_suffix}_p{policy}_"
         f"{gfx}"
     )
     if policy == "bs" and get_flydsl_hgemm_kernel_params(name) is None:
@@ -180,82 +157,9 @@ def get_flydsl_hgemm_kernel_params(name: str) -> dict | None:
         "target_gfx": match.group("target_gfx"),
     }
 
-    mma = tuple(
-        int(match.group(key)) if match.group(key) is not None else default
-        for key, default in zip(("mma_m", "mma_n", "mma_k"), (16, 16, 32))
-    )
-    blocks = int(match.group("streamk_blocks") or 0)
-    try:
-        _validate_extended_policy(
-            mma,
-            blocks,
-            params["target_gfx"],
-            policy,
-            dtype,
-            out_dtype,
-            params["has_bias"],
-            params["split_k"],
-            params["k_waves"],
-            params["group_m"],
-            k_stagger,
-            b_non_temporal,
-        )
-    except (ValueError, TypeError):
-        return None
-    if match.group("mma_m") is not None:
-        if mma == (16, 16, 32):
-            return None  # Keep a single canonical name for legacy policies.
-        params.update(zip(("mma_m", "mma_n", "mma_k"), mma))
-    if match.group("streamk_blocks") is not None:
-        if not blocks:
-            return None
-        params["streamk_blocks"] = blocks
     if policy == "bs" and not band_stream_name_supported(params):
         return None
     return params
-
-
-def _validate_extended_policy(
-    mma,
-    blocks,
-    gfx,
-    policy,
-    dtype,
-    out_dtype,
-    has_bias,
-    split_k,
-    k_waves,
-    group_m,
-    stagger,
-    nt,
-):
-    if any(not isinstance(v, int) or isinstance(v, bool) for v in mma):
-        raise ValueError("MFMA dimensions must be integers")
-    if mma not in ((16, 16, 32), (32, 32, 16)):
-        raise ValueError("unsupported MFMA shape")
-    if (
-        not isinstance(blocks, int)
-        or isinstance(blocks, bool)
-        or not 0 <= blocks <= 1024
-    ):
-        raise ValueError("streamk_blocks must be an integer in [0, 1024]")
-    if mma != (16, 16, 32) and (
-        gfx != "gfx950" or policy != "ft" or dtype != "bf16" or k_waves != 1
-    ):
-        raise ValueError("MFMA32 requires gfx950 BF16 full-tile with k_waves=1")
-    if blocks and (
-        gfx != "gfx950"
-        or policy != "ft"
-        or dtype != "bf16"
-        or out_dtype != "bf16"
-        or has_bias
-        or split_k != 1
-        or k_waves != 1
-        or group_m
-        or stagger
-        or nt
-    ):
-        raise ValueError("unsupported Stream-K feature combination")
 
 
 def _validate_k_stagger(k_stagger, gfx, policy):
@@ -291,10 +195,6 @@ def flydsl_hgemm(
     stream: torch.cuda.Stream | None = None,
     k_stagger: int = 0,
     b_non_temporal: bool = False,
-    mma_m: int = 16,
-    mma_n: int = 16,
-    mma_k: int = 32,
-    streamk_blocks: int = 0,
 ) -> torch.Tensor:
     """Run the A16W16 kernel with AITER's ``B[N, K]`` convention.
 
@@ -307,14 +207,6 @@ def flydsl_hgemm(
     ``b_non_temporal`` streams B's async loads with the non-temporal cache
     hint. It is independent of k_stagger; tune both, since shared B can
     benefit from caching. Both options default off.
-    ``mma_m=32, mma_n=32, mma_k=16`` selects the BF16 NT full-tile
-    MFMA32 implementation with ``k_waves=1``. Legacy MFMA16 remains the default.
-    ``streamk_blocks>0`` explicitly selects a balanced persistent K schedule
-    with FP32 partials and last-publisher reduction. It requires BF16 output,
-    no bias, split_k=k_waves=1, group_m=0 and no memory hints. Each invocation
-    allocates its own scratch and initializes counters on the launch stream;
-    this initialization and allocation are part of the end-to-end cost.
-    Neither extension is selected automatically by existing CSV entries.
     ``policy="bs"`` selects the BF16 band-stream decode kernel for the
     validated 256-CU gfx950 M/N/K and configuration catalog. It requires
     no bias, split_k=1 and BF16 output. As on the legacy FT path, strided
@@ -331,28 +223,6 @@ def flydsl_hgemm(
         raise ValueError(f"`stream` must be on {a.device}, got {launch_stream.device}")
 
     gfx = get_gfx()
-    if (
-        (mma_m, mma_n, mma_k) != (16, 16, 32)
-        or streamk_blocks != 0
-        or type(streamk_blocks) is not int
-        or type(mma_m) is not int
-        or type(mma_n) is not int
-        or type(mma_k) is not int
-    ):
-        _validate_extended_policy(
-            (mma_m, mma_n, mma_k),
-            streamk_blocks,
-            gfx,
-            policy,
-            _normalize_dtype_name(a.dtype),
-            _normalize_dtype_name(out_dtype or a.dtype),
-            bias is not None,
-            split_k,
-            k_waves,
-            group_m,
-            k_stagger,
-            b_non_temporal,
-        )
     _validate_k_stagger(k_stagger, gfx, policy)
     _validate_b_non_temporal(b_non_temporal, gfx, policy)
     if policy == "bs":
@@ -430,23 +300,12 @@ def flydsl_hgemm(
             "The FlyDSL A16W16 kernel currently supports gfx950 and gfx1250 only"
         )
 
-    if streamk_blocks or (mma_m, mma_n, mma_k) != (16, 16, 32):
-        # Copies feeding an explicit-stream extension must also be allocated
-        # and enqueued on that stream (including allocator lifetime tracking).
-        with torch.cuda.stream(launch_stream):
-            if not a.is_contiguous():
-                a = a.contiguous()
-            if not b.is_contiguous():
-                b = b.contiguous()
-            if bias is not None and not bias.is_contiguous():
-                bias = bias.contiguous()
-    else:
-        if not a.is_contiguous():
-            a = a.contiguous()
-        if not b.is_contiguous():
-            b = b.contiguous()
-        if bias is not None and not bias.is_contiguous():
-            bias = bias.contiguous()
+    if not a.is_contiguous():
+        a = a.contiguous()
+    if not b.is_contiguous():
+        b = b.contiguous()
+    if bias is not None and not bias.is_contiguous():
+        bias = bias.contiguous()
 
     user_kwargs = {
         "block_m": block_m,
@@ -462,10 +321,6 @@ def flydsl_hgemm(
         "b_non_temporal": b_non_temporal,
         "use_half_tile_interleaved": policy in ("ht", "hti"),
     }
-    if (mma_m, mma_n, mma_k) != (16, 16, 32):
-        user_kwargs.update(mma_m=mma_m, mma_n=mma_n, mma_k=mma_k)
-    if streamk_blocks:
-        user_kwargs["streamk_blocks"] = streamk_blocks
     return gemm_a16w16(
         a,
         b.t(),

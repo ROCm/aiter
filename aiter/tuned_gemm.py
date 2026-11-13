@@ -158,41 +158,6 @@ def get_GEMM_A16W16_tuned_config(
             None,
         )
         if config is not None:
-            # This new latent-projection row is qualified only at exact M.
-            # Do not let padded lookup replace other shapes' existing ASM
-            # route; continue to the next original padding candidate instead.
-            if (
-                M != padded_M
-                and (gfx, cu_num, padded_M, N, K) == ("gfx950", 256, 16384, 7168, 3584)
-                and not (bias or scaleAB or bpreshuffle)
-                and str(dtype) == str(otype) == "torch.bfloat16"
-                and config["libtype"] == "flydsl"
-                and config["kernelName"]
-                == "flydsl_hgemm_abf16_wbf16_bf16_t256x256x64x2_ks1_w2x4x1_bias0_ktail0_gm4_pht_gfx950"
-            ):
-                continue
-            if (
-                M != padded_M
-                and (gfx, cu_num, padded_M, N, K) == ("gfx950", 256, 128, 7168, 3584)
-                and not (bias or scaleAB or bpreshuffle)
-                and str(dtype) == str(otype) == "torch.bfloat16"
-                and config["libtype"] == "flydsl"
-                and config["kernelName"]
-                == "flydsl_hgemm_abf16_wbf16_bf16_t64x64x128x3_ks1_w2x4x1_bias0_ktail0_gm0_pft_gfx950"
-            ):
-                # This row formerly supplied the BK64 policy to padded-M
-                # callers. Preserve it instead of falling through to a
-                # different backend when only exact M128 is retuned.
-                config = {
-                    **config,
-                    "kernelName": "flydsl_hgemm_abf16_wbf16_bf16_t64x64x64x7_ks1_w4x2x1_bias0_ktail0_gm0_pft_gfx950",
-                    "solidx": 2787,
-                    "splitK": 1,
-                    "us": 19.5768,
-                    "err_ratio": 0.0,
-                    "tflops": 335.94,
-                    "bw": 2765.15,
-                }
             if config["libtype"] == "flydsl":
                 flydsl_config = (
                     _get_flydsl_gemm_kernels().get_flydsl_hgemm_kernel_params(
@@ -697,19 +662,6 @@ def _flydsl_hgemm_kernel_params(kernel_name: str) -> dict | None:
     return _get_flydsl_gemm_kernels().get_flydsl_hgemm_kernel_params(kernel_name)
 
 
-@functools.cache
-def _flydsl_extended_launcher(kernel_name):
-    config = _flydsl_hgemm_kernel_params(kernel_name)
-    return functools.partial(
-        _get_flydsl_gemm_kernels().flydsl_hgemm,
-        **{
-            key: config[key]
-            for key in ("mma_m", "mma_n", "mma_k", "streamk_blocks")
-            if key in config
-        },
-    )
-
-
 def flydsl_gemm(
     inp: Tensor,
     weights: Tensor,
@@ -741,10 +693,7 @@ def flydsl_gemm(
         policy = flydsl_config["policy"]
     else:
         policy = "ht" if flydsl_config["use_half_tile_interleaved"] else "ft"
-    launcher = flydsl_gemm_kernels.flydsl_hgemm
-    if "mma_m" in flydsl_config or "streamk_blocks" in flydsl_config:
-        launcher = _flydsl_extended_launcher(config["kernelName"])
-    result = launcher(
+    result = flydsl_gemm_kernels.flydsl_hgemm(
         inp,
         weights,
         out=out,
