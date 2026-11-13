@@ -245,6 +245,62 @@ def test_gemm(dtype, M, N, K):
     return ret
 
 
+def _quant_rows(rows, k, chunk=65536):
+    """Random MXFP4 rows, quantized in chunks so no bf16 copy of the whole
+    tensor is needed. Returns data, plain scales and shuffled scales."""
+    quant_func = aiter.get_triton_quant(aiter.QuantType.per_1x32)
+    q, s, s_sh = [], [], []
+    for r0 in range(0, rows, chunk):
+        t = torch.randn((min(chunk, rows - r0), k), dtype=dtypes.bf16)
+        _, scales = quant_func(t, shuffle=False)
+        tq, scales_sh = quant_func(t, shuffle=True)
+        q.append(tq)
+        s.append(scales.view(torch.uint8)[: t.shape[0]])
+        s_sh.append(scales_sh[: t.shape[0]])
+    return torch.cat(q), torch.cat(s), torch.cat(s_sh)
+
+
+def check_asm_4gib():
+    """The 256x256 asm kernel returned wrong output, with no error, once A, B
+    or out reached 4 GiB, and the heuristic picked it at these shapes. The
+    heuristic and an explicit 256x256 request must both be exact there.
+    """
+    kernel_256x256 = "_ZN5aiter42f4gemm_bf16_per1x32Fp4_BpreShuffle_256x256E"
+    # (M, N, K, rows checked): out of 4.01 GiB, then A of exactly 4 GiB.
+    for m, n, k, rows_checked in (
+        (20192, 106496, 512, 256),
+        (1 << 20, 256, 8192, None),
+    ):
+        need = m * k // 2 + n * k // 2 + 2 * m * n + (2 << 30)
+        if torch.cuda.mem_get_info()[0] < need:
+            aiter.logger.warning(
+                "skip a4w4 asm 4 GiB check: needs %.1f GiB free", need / 2**30
+            )
+            continue
+        rows_checked = rows_checked or m
+        x, x_scales, x_scales_shuffle = _quant_rows(m, k)
+        w, w_scales, w_scales_shuffle = _quant_rows(n, k)
+        wshuffle = shuffle_weight(w, layout=(16, 16))
+        out = torch.empty((m, n), dtype=dtypes.bf16)
+        for name in ("", kernel_256x256):
+            out.fill_(float("nan"))
+            aiter.gemm_a4w4_asm(
+                x, wshuffle, x_scales_shuffle, w_scales_shuffle, out, name
+            )
+            for r0 in range(0, rows_checked, 65536):
+                r1 = min(rows_checked, r0 + 65536)
+                ref = run_torch(x[r0:r1], w, x_scales[r0:r1], w_scales, dtypes.bf16)
+                err = checkAllclose(
+                    ref.float(),
+                    out[r0:r1].float(),
+                    msg=f"a4w4 asm {name or 'heuristic'} at 4 GiB {(m, n, k)} rows {r0}-{r1}: ",
+                )
+                assert (
+                    err == 0
+                ), f"a4w4 asm {name or 'heuristic'} is wrong at {(m, n, k)}"
+        del x, w, wshuffle, out
+
+
 def tuned_shapes():
     """CSV-selected preshuffle shapes on gfx950; all tuned shapes on gfx1250."""
     gfx950 = get_gfx() == "gfx950"
@@ -411,6 +467,8 @@ def main():
         for m, n, k in shapes:
             ret = test_gemm(dtype, m, n, k)
             df.append(ret)
+    if not gfx1250:
+        check_asm_4gib()
     df = pd.DataFrame(df)
     df_md = df.to_markdown(index=False)
     aiter.logger.info("gemm_a4w4 summary (markdown):\n%s", df_md)

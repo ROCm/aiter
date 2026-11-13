@@ -84,6 +84,7 @@ std::tuple<std::string, int> get_heuristic_kernel(int M,
                                                   std::string arch_id,
                                                   int log2_k_split,
                                                   int bpreshuffle,
+                                                  bool skip_256x256,
                                                   CFG* cfgs)
 {
     hipDevice_t dev;
@@ -105,6 +106,8 @@ std::tuple<std::string, int> get_heuristic_kernel(int M,
         if(el.first.find(arch_id) != 0)
             continue;
         const auto& cfg = el.second;
+        if(skip_256x256 && cfg.tile_M == 256 && cfg.tile_N == 256)
+            continue;
         if(cfg.bpreshuffle == bpreshuffle_en &&
            (cfg.splitK >= log2_k_split_en))
         {
@@ -144,7 +147,10 @@ std::tuple<std::string, int> get_heuristic_kernel(int M,
         }
     }
 
-    AITER_CHECK(selectedKernelName != "", __func__, ": cannot get heuristic kernel!");
+    AITER_CHECK(selectedKernelName != "",
+                __func__,
+                ": cannot get heuristic kernel!",
+                skip_256x256 ? " (256x256 kernels cannot take A, B or out of 4 GiB or more)" : "");
     int log2_result = 0;
     while(selectedsplitK >>= 1)
         ++log2_result;
@@ -201,14 +207,14 @@ AITER_CTYPES_DEFINE_ENTRYPOINT_VOID(
     const HipDeviceGuard device_guard(A->device_id);
 
     CFG* config_map = get_cfg(A->dtype(), out->dtype());
-    using DictKey   = std::tuple<int, int, int, int, int>;
+    using DictKey   = std::tuple<int, int, int, int, int, bool>;
     struct SimpleHash
     {
         size_t operator()(const DictKey& key) const
         {
-            const auto& [m, n, k, log2, shuffle] = key;
+            const auto& [m, n, k, log2, shuffle, skip] = key;
             return std::hash<int>()(m) ^ std::hash<int>()(n) ^ std::hash<int>()(k) ^
-                   std::hash<int>()(log2) ^ std::hash<int>()(shuffle);
+                   std::hash<int>()(log2) ^ std::hash<int>()(shuffle) ^ std::hash<bool>()(skip);
         }
     };
     static SynchronizedCache<DictKey, std::tuple<std::string, int>, SimpleHash>
@@ -221,13 +227,33 @@ AITER_CTYPES_DEFINE_ENTRYPOINT_VOID(
     std::string arch_id = get_gpu_arch();
     std::string kname   = (kernelName && kernelName[0] != 0) ? (arch_id + kernelName) : "";
 
+    // The 256x256 kernels size their A, B and out buffer descriptors in bytes,
+    // a 32-bit field. At 4 GiB or more the size wraps and the kernels read or
+    // write the wrong elements without a fault; the other tiles are exact there.
+    const uint64_t a_bytes   = static_cast<uint64_t>(Mdim) * A->stride(0) * A->element_size();
+    const uint64_t b_bytes   = static_cast<uint64_t>(Ndim) * B->stride(0) * B->element_size();
+    const uint64_t out_bytes = static_cast<uint64_t>(Mdim) * args.stride_C0 * out->element_size();
+    const bool skip_256x256 =
+        a_bytes >= (1ull << 32) || b_bytes >= (1ull << 32) || out_bytes >= (1ull << 32);
+    if(skip_256x256 && !kname.empty())
+    {
+        auto it = config_map->find(kname);
+        if(it != config_map->end() && it->second.tile_M == 256 && it->second.tile_N == 256)
+        {
+            AITER_LOG_WARNING(kernelName << " cannot take A, B or out of 4 GiB or more (A="
+                                         << a_bytes << " B=" << b_bytes << " out=" << out_bytes
+                                         << " bytes); using the heuristic kernel");
+            kname.clear();
+        }
+    }
+
     int selectedksplit = (log2_k_split >= 0) ? log2_k_split : 0;
     if(kname.empty())
     {
         std::tie(kname, selectedksplit) = heuristic_kernel_dict.get_or_create(
-            DictKey(Mdim, Ndim, Kdim, log2_k_split, bpreshuffle), [&]() {
+            DictKey(Mdim, Ndim, Kdim, log2_k_split, bpreshuffle, skip_256x256), [&]() {
                 return get_heuristic_kernel(
-                    Mdim, Ndim, Kdim, arch_id, log2_k_split, bpreshuffle, config_map);
+                    Mdim, Ndim, Kdim, arch_id, log2_k_split, bpreshuffle, skip_256x256, config_map);
             });
     }
 
