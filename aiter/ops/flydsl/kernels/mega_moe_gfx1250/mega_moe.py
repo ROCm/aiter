@@ -16,6 +16,7 @@ import torch
 
 from aiter import ActivationType, QuantType, dtypes
 from aiter.fused_moe import fused_moe
+from aiter.jit.utils.build_targets import is_gfx1250_family
 from aiter.jit.utils.chip_info import get_gfx
 from aiter.ops.flydsl.moe_common import GateMode
 
@@ -59,8 +60,10 @@ __all__ = [
 
 def _require_gfx1250():
     gfx = get_gfx()
-    if gfx != "gfx1250":
-        raise RuntimeError(f"MegaMoEGfx1250 requires gfx1250, got {gfx}")
+    # gfx1250-strict (MI450 A0) shares the gfx1250 MegaMoE kernel family. Accept
+    # the family here; exact identity is enforced for build/cache/.co elsewhere.
+    if not is_gfx1250_family(gfx):
+        raise RuntimeError(f"MegaMoEGfx1250 requires the gfx1250 family, got {gfx}")
 
 
 def _alias(owner: str, name: str) -> property:
@@ -312,6 +315,8 @@ class MegaMoEGfx1250:
         combine_quant: str | None = None,
         combine_wire: str | None = None,
         recv_counter_is_zero: bool = False,
+        shared_add: torch.Tensor | None = None,
+        shared_ready: torch.cuda.Event | None = None,
     ) -> torch.Tensor:
         """Run one MoE layer: dispatch, its expert GEMM, then combine.
 
@@ -339,6 +344,12 @@ class MegaMoEGfx1250:
 
         ``recv_counter_is_zero`` is accepted and ignored: the dispatch
         overwrites the received count, so there is no reset to skip.
+
+        ``shared_add`` (bf16 ``[tokens, hidden]``, e.g. the shared expert's
+        output) is added to the result by the combine itself, so the caller
+        needs no separate add. ``shared_ready``, when given, is waited on by
+        the current stream just before the combine: its producer may run on a
+        side stream beside the dispatch and the expert GEMMs.
         """
         if combine_wire is not None:
             if combine_quant is not None:
@@ -382,7 +393,13 @@ class MegaMoEGfx1250:
         )
         target = ep.prepare(batch, quant_bits)
         if hook is not None and target.scatter is not None:
-            target.scatter = dataclasses.replace(target.scatter, stage1_gemm1=hook)
+            # The grouped GEMM reads the hook off dispatch_context (the same
+            # scatter object on the compact path), so swap both: replacing
+            # target.scatter alone leaves the probe / stage-1 hook unreachable.
+            hooked = dataclasses.replace(target.scatter, stage1_gemm1=hook)
+            if target.dispatch_context is target.scatter:
+                target.dispatch_context = hooked
+            target.scatter = hooked
         expert_out = self._compute(
             batch,
             target,
@@ -397,7 +414,9 @@ class MegaMoEGfx1250:
         )
         if isinstance(disp, _CompactDispatch):
             disp.fusion.finish(s1f)
-        return ep.combine(batch.routing, quant_bits, expert_out)
+        if shared_ready is not None:
+            torch.cuda.current_stream().wait_event(shared_ready)
+        return ep.combine(batch.routing, quant_bits, expert_out, shared_add=shared_add)
 
     __call__ = forward
 

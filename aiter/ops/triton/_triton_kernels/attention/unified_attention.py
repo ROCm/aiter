@@ -52,6 +52,18 @@ def find_seq_idx(
     return left - 1
 
 
+@triton.jit
+def split_window_tiles(seq_len, query_len, TILE_SIZE, SLIDING_WINDOW: tl.constexpr):
+    """First tile and tile count a sliding-window split carves for one sequence.
+
+    No row sees a key before row 0's first, seq_len - query_len - SLIDING_WINDOW
+    + 1, so the split covers only [tile_lo, cdiv(seq_len, TILE_SIZE)). The 3d
+    kernels and reduce_segments must carve alike.
+    """
+    tile_lo = tl.maximum(seq_len - query_len - SLIDING_WINDOW + 1, 0) // TILE_SIZE
+    return tile_lo, cdiv_fn(seq_len, TILE_SIZE) - tile_lo
+
+
 _kernel_unified_attention_2d_repr = make_kernel_repr(
     "kernel_unified_attention_2d",
     [
@@ -356,7 +368,7 @@ def kernel_unified_attention_2d(
                 is_query_key = key_rel_pos >= 0 and key_rel_pos < qq_bias_stride_0
                 qq_bias = tl.load(
                     qq_bias_row_ptrs + key_rel_pos[None, :],
-                    mask=is_query_key[None, :],
+                    mask=query_mask_0[:, None] & is_query_key[None, :],
                     other=0.0,
                 )
                 S += qq_bias * RCP_LN2
@@ -494,7 +506,8 @@ def kernel_unified_attention_2d(
             is_query_key = key_rel_pos >= 0 and key_rel_pos < qq_bias_stride_0
             qq_bias = tl.load(
                 qq_bias_row_ptrs + key_rel_pos[None, :],
-                mask=is_query_key[None, :],  # avoid OOB for context keys
+                # avoid OOB for context keys and for padded query rows
+                mask=query_mask_0[:, None] & is_query_key[None, :],
                 other=0.0,
             )
             # prescale w. RCP_LN2 for later exp2
@@ -668,9 +681,17 @@ def kernel_unified_attention_3d(
 
     # number of segments for this particular sequence
     num_segments = NUM_SEGMENTS_PER_SEQ
-    tiles_per_segment = cdiv_fn(seq_len, num_segments * TILE_SIZE)
+    if SLIDING_WINDOW > 0:
+        tile_lo, window_tiles = split_window_tiles(
+            seq_len, cur_batch_query_len, TILE_SIZE, SLIDING_WINDOW
+        )
+        tiles_per_segment = cdiv_fn(window_tiles, num_segments)
+        segm_tile_start = tile_lo + segm_idx * tiles_per_segment
+    else:
+        tiles_per_segment = cdiv_fn(seq_len, num_segments * TILE_SIZE)
+        segm_tile_start = segm_idx * tiles_per_segment
 
-    if segm_idx * tiles_per_segment * TILE_SIZE >= seq_len:
+    if segm_tile_start * TILE_SIZE >= seq_len:
         return
 
     offs_m = tl.arange(0, BLOCK_M)
@@ -700,7 +721,10 @@ def kernel_unified_attention_3d(
         v_dim_mask = offs_vd < V_HEAD_SIZE
     else:
         v_dim_mask = tl.full((1,), 1, dtype=tl.int1)
-    query_mask_0 = query_pos < cur_batch_query_len
+    # Rows past BLOCK_Q tokens belong to the next q block, which stores them.
+    query_mask_0 = (query_pos < cur_batch_query_len) & (
+        offs_m // num_queries_per_kv < BLOCK_Q
+    )
     query_mask_1 = query_offset_1 < num_query_heads
 
     # Q : (BLOCK_M, HEAD_SIZE_PADDED)
@@ -786,8 +810,8 @@ def kernel_unified_attention_3d(
 
     # iterate through tiles within current segment
     for j in range(
-        segm_idx * tiles_per_segment,
-        min((segm_idx + 1) * tiles_per_segment, num_tiles),
+        segm_tile_start,
+        min(segm_tile_start + tiles_per_segment, num_tiles),
     ):
         seq_offset = j * TILE_SIZE + offs_t
         if TILE_SIZE == BLOCK_SIZE:
@@ -909,7 +933,8 @@ def kernel_unified_attention_3d(
             is_query_key = key_rel_pos >= 0 and key_rel_pos < qq_bias_stride_0
             qq_bias = tl.load(
                 qq_bias_row_ptrs + key_rel_pos[None, :],
-                mask=is_query_key[None, :],  # avoid OOB for context keys
+                # avoid OOB for context keys and for padded query rows
+                mask=query_mask_0[:, None] & is_query_key[None, :],
                 other=0.0,
             )
             # prescale w. RCP_LN2 for later exp2
@@ -994,6 +1019,7 @@ def reduce_segments(
     num_seqs,  # int
     num_query_heads: tl.constexpr,  # int
     out_scale_ptr,  # float32
+    segm_tiles_ptr,  # [1] int32 tiles a KV segment covers (split rebalance), or None
     output_stride_0: tl.int64,  # int
     output_stride_1: tl.int64,  # int, should be equal to head_size
     block_table_stride: tl.int64,  # int
@@ -1009,8 +1035,20 @@ def reduce_segments(
     FP8_MAX: tl.constexpr = float8_info.max,
     SEGMENT_BLOCK: tl.constexpr = 0,  # segments per merge step, 0 = all at once
     BLOCK_D: tl.constexpr = 0,  # head-dim slice per program (grid axis 2), 0 = all
+    SLIDING_WINDOW: tl.constexpr = 0,  # int, the producer's; carves its window
+    # Epilogue (Qwen3-Next / Qwen3.5 attention output gate): out * sigmoid(gate),
+    # gate [num_tokens, num_query_heads * V_HEAD_SIZE], rounded as the unfused ops.
+    # (None without the gate: a constexpr, so the ungated kernel keeps its arguments)
+    gate_ptr=None,
+    gate_stride_0=None,
+    # Output row r is query token rows[r] (only those rows are reduced), or None.
+    rows_ptr=None,
 ):
-    query_token_idx = tl.program_id(0)
+    out_row_idx = tl.program_id(0)
+    if rows_ptr is not None:
+        query_token_idx = tl.load(rows_ptr + out_row_idx).to(tl.int32)
+    else:
+        query_token_idx = out_row_idx
     query_head_idx = tl.program_id(1)
 
     out_scale = None
@@ -1026,10 +1064,25 @@ def reduce_segments(
 
     # number of segments for this particular sequence
     num_segments = NUM_SEGMENTS_PER_SEQ
-    tiles_per_segment = cdiv_fn(seq_len, num_segments * TILE_SIZE)
-
-    # create masks for subsequent loads
-    act_num_segments = cdiv_fn(seq_len, tiles_per_segment * TILE_SIZE)
+    if segm_tiles_ptr is not None:
+        # gfx1250 split rebalance: every segment covers the same number of tiles
+        tiles_per_segment = tl.load(segm_tiles_ptr)
+        # create masks for subsequent loads
+        act_num_segments = cdiv_fn(seq_len, tiles_per_segment * TILE_SIZE)
+    elif SLIDING_WINDOW > 0:
+        query_len = tl.load(query_start_len_ptr + seq_idx + 1) - tl.load(
+            query_start_len_ptr + seq_idx
+        )
+        _, window_tiles = split_window_tiles(
+            seq_len, query_len, TILE_SIZE, SLIDING_WINDOW
+        )
+        tiles_per_segment = cdiv_fn(window_tiles, num_segments)
+        # create masks for subsequent loads
+        act_num_segments = cdiv_fn(window_tiles, tiles_per_segment)
+    else:
+        tiles_per_segment = cdiv_fn(seq_len, num_segments * TILE_SIZE)
+        # create masks for subsequent loads
+        act_num_segments = cdiv_fn(seq_len, tiles_per_segment * TILE_SIZE)
     single_tile: tl.constexpr = (
         SEGMENT_BLOCK == 0 or SEGMENT_BLOCK >= NUM_SEGMENTS_PER_SEQ
     )
@@ -1050,6 +1103,17 @@ def reduce_segments(
         v_dim_mask = offs_vd < V_HEAD_SIZE
     else:
         v_dim_mask = tl.full((1,), 1, dtype=tl.int1)
+
+    if gate_ptr is not None:
+        # issued before the segment loads, so its latency hides under them
+        gate = tl.load(
+            gate_ptr
+            + query_token_idx.to(tl.int64) * gate_stride_0
+            + query_head_idx * V_HEAD_SIZE
+            + offs_vd,
+            mask=v_dim_mask,
+            other=0.0,
+        )
 
     if single_tile:
         # load segment maxima
@@ -1138,12 +1202,91 @@ def reduce_segments(
     if output_ptr.type.element_ty.is_fp8():
         acc = tl.clamp(acc, FP8_MIN, FP8_MAX)
 
+    result = acc.to(output_ptr.type.element_ty)
+    if gate_ptr is not None:
+        gate = tl.sigmoid(gate.to(tl.float32)).to(gate.dtype).to(tl.float32)
+        result = (result.to(tl.float32) * gate).to(output_ptr.type.element_ty)
+
     # write result
     output_offset = (
-        query_token_idx * output_stride_0 + query_head_idx * output_stride_1 + offs_vd
+        out_row_idx * output_stride_0 + query_head_idx * output_stride_1 + offs_vd
     )
     tl.store(
         output_ptr + output_offset,
-        acc.to(output_ptr.type.element_ty),
+        result,
         mask=v_dim_mask,
     )
+
+
+@triton.jit
+def attention_output_gate_rows(
+    out_ptr,  # [num_rows, width]
+    x_ptr,  # [num_tokens, width] (row stride x_stride_0)
+    gate_ptr,  # [num_tokens, width] (row stride gate_stride_0), or None
+    rows_ptr,  # [num_rows] (out row r is token rows[r]), or None
+    x_stride_0: tl.int64,
+    gate_stride_0: tl.int64,
+    out_stride_0: tl.int64,
+    WIDTH: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    """The epilogue of reduce_segments for attention that ends without it (2d, or 3d
+    with one segment): out[r] = x[rows[r]] * sigmoid(gate[rows[r]])."""
+    out_row = tl.program_id(0)
+    token = out_row.to(tl.int64)
+    if rows_ptr is not None:
+        token = tl.load(rows_ptr + out_row).to(tl.int64)
+    cols = tl.program_id(1) * BLOCK + tl.arange(0, BLOCK)
+    mask = cols < WIDTH
+    x = tl.load(x_ptr + token * x_stride_0 + cols, mask=mask)
+    if gate_ptr is not None:
+        gate = tl.load(gate_ptr + token * gate_stride_0 + cols, mask=mask)
+        gate = tl.sigmoid(gate.to(tl.float32)).to(gate.dtype).to(tl.float32)
+        x = (x.to(tl.float32) * gate).to(out_ptr.type.element_ty)
+    tl.store(out_ptr + out_row.to(tl.int64) * out_stride_0 + cols, x, mask=mask)
+
+
+@triton.jit
+def _floor_div_pos(a, b: tl.constexpr):
+    """`a // b` rounded toward minus infinity (torch's integer `//`) for b > 0.
+
+    Triton's integer division truncates like C, which differs only for a < 0."""
+    q = a // b
+    return q - ((q * b != a) & (a < 0)).to(q.dtype)
+
+
+@triton.jit
+def unified_attention_3d_split_rebalance_kernel(
+    seqused_k_ptr,  # [num_seqs]
+    segm_tiles_ptr,  # [1] int32, out
+    num_seqs,
+    stride_seqused_k,
+    num_kv_heads,
+    TILE_SIZE: tl.constexpr,
+    PROGRAMS: tl.constexpr,
+    MIN_TILES: tl.constexpr,
+    MAX_TILES: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    """The gfx1250 split rebalance's tiles per segment, in one program.
+
+    The same integer arithmetic as the torch expression it replaces, so the
+    result is bitwise the same for every input:
+      clamp(floor((sum_i floor((seqused_k[i] + TILE_SIZE - 1) / TILE_SIZE)
+                   * num_kv_heads + PROGRAMS - 1) / PROGRAMS),
+            MIN_TILES, MAX_TILES) as int32.
+    The per-sequence tile count is in seqused_k's own dtype; the sum, the head
+    product and the division by PROGRAMS are int64, as torch's integer `sum`
+    promotes.
+    """
+    acc = tl.zeros([BLOCK], dtype=tl.int64)
+    for start in range(0, num_seqs, BLOCK):
+        offs = start + tl.arange(0, BLOCK)
+        s = tl.load(
+            seqused_k_ptr + offs * stride_seqused_k, mask=offs < num_seqs, other=0
+        )
+        acc += _floor_div_pos(s + (TILE_SIZE - 1), TILE_SIZE).to(tl.int64)
+    want = tl.sum(acc, axis=0) * num_kv_heads
+    want = _floor_div_pos(want + (PROGRAMS - 1), PROGRAMS)
+    want = tl.minimum(tl.maximum(want, MIN_TILES), MAX_TILES)
+    tl.store(segm_tiles_ptr, want.to(tl.int32))

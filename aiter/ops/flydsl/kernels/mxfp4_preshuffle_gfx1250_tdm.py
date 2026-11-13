@@ -3,7 +3,6 @@
 
 """Grouped contiguous-M A8W4 preshuffle MoE GEMM for gfx1250 (TDM pipeline)."""
 
-import math
 import os
 from collections import namedtuple
 
@@ -12,7 +11,6 @@ import flydsl.expr as fx
 from flydsl._mlir.dialects import llvm as llvm_dialect
 from flydsl.expr import const_expr, range_constexpr, rocdl, tdm_ops
 from flydsl.expr.arith import _to_raw as _raw
-from flydsl.expr.rocdl import cluster
 from flydsl.expr.typing import Constexpr, T
 from flydsl.expr.typing import Vector as Vec
 
@@ -34,7 +32,12 @@ from .mega_moe_gfx1250.tdm_gather_shim import (
     make_tensor_gather_descriptor,
     tensor_store_gather,
 )
-from .mega_moe_gfx1250.types import COMBINE_SCALE_BLOCK
+from .mega_moe_gfx1250.types import (
+    COMBINE_CHUNK,
+    COMBINE_SCALE_BLOCK,
+    COMBINE_SCALE_LINE,
+    combine_chunk_bytes,
+)
 from .quant_utils import (
     emit_amax_e8m0_native_scale,
     emit_cvt_scalef32_pk8_fp4_bf16,
@@ -47,72 +50,118 @@ from .tensor_shim import (
     AITER_FLYDSL_MOE_EXPERT_SCHEDULING_MODE,
 )
 
-
-def is_fx_set_register_available():
-    """Return whether this FlyDSL build supports explicit register placement."""
-    return callable(getattr(fx, "set_register", None))
+# FlyDSL 0.5 moved the register-placement API into rocdl.experimental.
+sched_vgpr = getattr(getattr(rocdl, "experimental", rocdl), "sched_vgpr", None)
 
 
-TDM_DESCRIPTOR_VERSION = 1
-IGLP_PARAMS = {
-    "a8w4": {
-        "default": {"mma_group": 10, "mma_first_group": 10, "ds_first_n": 0},
-        "prefill": {"mma_group": 15, "mma_first_group": 14, "ds_first_n": 15},
-    },
-    "a4w4": {
-        "default": {"mma_group": 10, "mma_first_group": 10, "ds_first_n": 0},
-        "prefill": {"mma_group": 11, "mma_first_group": 13, "ds_first_n": 16},
-    },
-}
-# Prefill means tile_m == tile_n == tile_k == 256 for either data format.
-for _format_params in IGLP_PARAMS.values():
-    for _params in _format_params.values():
-        for _name in _params:
-            _env_name = "AITER_FLYDSL_" + _name.upper()
-            _value = os.environ.get(_env_name)
-            if _value is not None:
-                _value = int(_value)
-                _minimum = 0 if _name == "ds_first_n" else 1
-                if _value < _minimum:
-                    raise ValueError(f"{_env_name} must be >= {_minimum}")
-                _params[_name] = _value
+def place_vgpr(storage, start):
+    """Pin SSA consumers without competing constraints on writes."""
 
-EXPLICIT_VGPR_PARTITION = int(
-    os.environ.get("AITER_FLYDSL_EXPLICIT_VGPR_PARTITION", "0")
-)
+    # Keep the adapter in this helper's source for recursive JIT hashing.
+    class ScheduledVgprStorage:
+        """Register memory whose loads use strict VGPR placement."""
+
+        def __init__(self, storage, start):
+            self.storage = storage
+            self.start = start
+
+        def load(self):
+            return Vec(sched_vgpr(self.storage.load(), self.start, soft=False))
+
+        def store(self, value):
+            return self.storage.store(value)
+
+        def as_tensor(self):
+            # Tensor-based MMA consumes the original tensor handle.
+            self.storage.store(self.load())
+            return self.storage
+
+    return ScheduledVgprStorage(storage, start)
+
+
+def _mma_tensor(storage):
+    """Expose pinned rmem to the tensor-based MMA API."""
+    return storage.as_tensor() if hasattr(storage, "as_tensor") else storage
+
+
+# computePadEncoding keeps log2(dwords) - 1 in three bits, so a padded LDS
+# row cannot declare an interval wider than this.
+_TDM_MAX_PAD_INTERVAL_BYTES = 1024
+
 PLANAR_LDS = int(os.environ.get("AITER_FLYDSL_PLANAR_LDS", "0"))
-INTERLEAVED_LDS_LOAD = int(os.environ.get("AITER_FLYDSL_INTERLEAVED_LDS_LOAD", "0"))
-LDS_SOA_LOAD_INTERLEAVE = os.environ.get("LDS_SOA_LOAD_INTERLEAVE")
-if LDS_SOA_LOAD_INTERLEAVE is not None:
-    LDS_SOA_LOAD_INTERLEAVE = int(LDS_SOA_LOAD_INTERLEAVE)
-FORCE_1X4_CLUSTER = int(os.environ.get("AITER_FLYDSL_FORCE_1X4_CLUSTER", "0"))
-DISABLE_CLUSTER_SYNC = int(os.environ.get("AITER_FLYDSL_DISABLE_CLUSTER_SYNC", "0"))
-if EXPLICIT_VGPR_PARTITION not in (0, 1):
-    raise ValueError("AITER_FLYDSL_EXPLICIT_VGPR_PARTITION must be 0 or 1")
+INTERLEAVED_LDS_LOAD = os.environ.get("AITER_FLYDSL_INTERLEAVED_LDS_LOAD")
+if INTERLEAVED_LDS_LOAD is not None:
+    INTERLEAVED_LDS_LOAD = int(INTERLEAVED_LDS_LOAD)
 if PLANAR_LDS not in (0, 1):
     raise ValueError("AITER_FLYDSL_PLANAR_LDS must be 0 or 1")
-if INTERLEAVED_LDS_LOAD not in (0, 1):
+if INTERLEAVED_LDS_LOAD not in (None, 0, 1):
     raise ValueError("AITER_FLYDSL_INTERLEAVED_LDS_LOAD must be 0 or 1")
-if LDS_SOA_LOAD_INTERLEAVE not in (None, 0, 1):
-    raise ValueError("LDS_SOA_LOAD_INTERLEAVE must be 0 or 1")
-if FORCE_1X4_CLUSTER not in (0, 1):
-    raise ValueError("AITER_FLYDSL_FORCE_1X4_CLUSTER must be 0 or 1")
-if DISABLE_CLUSTER_SYNC not in (0, 1):
-    raise ValueError("AITER_FLYDSL_DISABLE_CLUSTER_SYNC must be 0 or 1")
 
-SUPPORT_EXPLICIT_VGPR_PARTITION = bool(
-    EXPLICIT_VGPR_PARTITION and is_fx_set_register_available()
-)
+# K256 order: prefix/barrier WMMAs -> ds_first_group -> mma_first_group
+# -> ds_group -> (mma_group -> ds_group)* -> remainder -> ksl0_fence_mma.
+# Counts group existing instructions; they do not add computation.
+# Prefill means tile_m == tile_n == tile_k == 256. An omitted
+# mma_first_group uses mma_group; ds_first_group=0 skips the leading DS group.
+HYPER_PARAMS = {
+    "a8w4": {
+        "default": {
+            "mma_group": 10,
+            "ds_first_group": 0,
+            "ds_group": 0,
+            "wmma_2x4": False,
+            "tdm_early_timeout": False,
+            "ksl0_prefix_mma": 0,
+            "ksl0_fence_mma": 8,
+            "ksl1_prefence_mma": 4,
+            "wmma_in_barrier": 4,
+        },
+        "prefill": {
+            "mma_group": 15,
+            "ds_first_group": 0,
+            "ds_group": 0,
+            "wmma_2x4": False,
+            "tdm_early_timeout": True,
+            "ksl0_prefix_mma": 0,
+            "ksl0_fence_mma": 8,
+            "ksl1_prefence_mma": 4,
+            "wmma_in_barrier": 4,
+        },
+    },
+    "a4w4": {
+        "default": {
+            "mma_group": 10,
+            "ds_first_group": 0,
+            "ds_group": 0,
+            "wmma_2x4": False,
+            "tdm_early_timeout": False,
+            "ksl0_prefix_mma": 0,
+            "ksl0_fence_mma": 8,
+            "ksl1_prefence_mma": 4,
+            "wmma_in_barrier": 4,
+        },
+        "prefill": {
+            "mma_group": 2,
+            "mma_first_group": 2,
+            "wmma_2x4": True,
+            "tdm_early_timeout": True,
+            "ds_first_group": 0,
+            "ds_group": 3,
+            "ksl0_prefix_mma": 2,
+            "ksl0_fence_mma": 4,
+            "ksl1_prefence_mma": 4,
+            "wmma_in_barrier": 4,
+        },
+    },
+}
 
-# MXFP8 combine wire format (``ep_quant_bits``): a slot holds two planes, N
-# payload bytes followed by N/32 e8m0 scale bytes. The block is 32 elements,
-# fixed rather than tied to tile_n so the wire does not drift with the GEMM
-# tuning table.
+# MX combine wire format (``ep_quant_bits``): see mega_moe_gfx1250/types.py.
+# The block is 32 elements, fixed rather than tied to tile_n so the wire does
+# not drift with the GEMM tuning table.
 #
-# Both plane bases stay cache-line aligned -- N is a multiple of 128 and the slot
-# stride is a power of two -- and that must not slip: an earlier 272-byte chunk
-# pitch started every row mid-line and cost 123us/layer at 16k tokens/rank
-# despite moving 41% fewer bytes.
+# Every remote write must cover whole cache lines, and that must not slip: an
+# earlier 272-byte chunk pitch started every row mid-line and cost 123us/layer
+# at 16k tokens/rank despite moving 41% fewer bytes, and writing a tile row's
+# 8 scale bytes into a shared scale plane cost up to 7% end to end.
 EP_SCALE_BLOCK = COMBINE_SCALE_BLOCK
 # GEMM2 has no activation, so one acc holds 8 f32 -> 2 wn subtiles per lane give
 # 16 values, and the two kgrp halves merge into the full 32-element MX block.
@@ -132,8 +181,8 @@ def _pack_bytes_i32(byte_vals):
 
 
 # The staging loop emits one e8m0 per WN_PER_MX_BLOCK_EP subtiles of 16 columns
-# and the wire reads one per EP_SCALE_BLOCK columns; drift and the scale plane
-# silently describes the wrong columns.
+# and the wire reads one per EP_SCALE_BLOCK columns; drift and the scales
+# silently describe the wrong columns.
 assert WN_PER_MX_BLOCK_EP * 16 == EP_SCALE_BLOCK
 
 
@@ -182,6 +231,7 @@ def build_gemm_a8w4_tdm_task(
     raw_drain=0,
     defer_c_wait=0,
     tdm_snop=0,
+    k_waves=1,
 ):
     """Build the grouped contiguous-M a8w4 TDM GEMM tile body (``gemm_task``).
 
@@ -210,8 +260,9 @@ def build_gemm_a8w4_tdm_task(
     - ``tile_meta`` (S1F, explicit_tile): a one-element list the caller fills
       with ``(expert, rows)`` (wave-uniform i32) before calling the body: the
       tile's expert and its valid rows (``min(tile_m, expert end - blk_m)``).
-      Replaces the psum reads (has_work, expert bisect, mn_oob), i.e. 10
-      dependent global loads per tile; the caller only names populated tiles.
+      Replaces the psum reads (has_work, expert lookup, mn_oob), i.e. three
+      dependent rounds of global loads per tile; the caller only names
+      populated tiles.
     - ``item_hooks`` (S1F): a one-element list holding a dict of callables the
       body calls on every wave: ``drain_start`` after the steady k-loop,
       before the drain fences; ``epi_start`` after the drain's last fence,
@@ -252,18 +303,13 @@ def build_gemm_a8w4_tdm_task(
             enable_ep_scatter and ep_quant_bits
         ), "persistent EP scatter requires an unquantized combine wire"
     # Resolve per-row settings before specializing the layout and cache key.
-    lds_soa_load_interleave_on = (
-        lds_soa_load_interleave
-        if LDS_SOA_LOAD_INTERLEAVE is None
-        else LDS_SOA_LOAD_INTERLEAVE
-    )
-    assert lds_soa_load_interleave_on in (
-        0,
-        1,
-    ), "lds_soa_load_interleave must be 0 or 1"
-    planar_lds_on = int(bool(PLANAR_LDS or lds_soa_load_interleave_on))
+    assert lds_soa_load_interleave in (0, 1), "lds_soa_load_interleave must be 0 or 1"
+    planar_lds_on = int(bool(PLANAR_LDS or lds_soa_load_interleave))
+    # An explicit interleave setting overrides the CSV, including zero.
     interleaved_lds_load_on = int(
-        bool(INTERLEAVED_LDS_LOAD or lds_soa_load_interleave_on)
+        lds_soa_load_interleave
+        if INTERLEAVED_LDS_LOAD is None
+        else INTERLEAVED_LDS_LOAD
     )
     WMMA_M = 16
     WMMA_N = 32 if a_is_fp4 else 16
@@ -271,73 +317,87 @@ def build_gemm_a8w4_tdm_task(
     WAVE = 32
     PACK_TK = tile_k // 2
     KWS = tile_k // WMMA_K
-    if K % WMMA_K or tile_k % WMMA_K:
-        raise ValueError(f"K={K} and tile_k={tile_k} must be multiples of {WMMA_K}")
+    # K may end on half a k128 (K % 128 == 64, e.g. 576 = 4 x 128 + 64): the
+    # weights stay unpadded and only the scales are laid out per whole k128.
+    K_HALF_STEP = WMMA_K // 2
+    if K % K_HALF_STEP or tile_k % WMMA_K:
+        raise ValueError(
+            f"K={K} must be a multiple of {K_HALF_STEP} and tile_k={tile_k} "
+            f"a multiple of {WMMA_K}"
+        )
+    K128 = ceildiv(K, WMMA_K)
+    if K % WMMA_K and (a_preshuffled or row_major_ascale):
+        raise ValueError(f"K={K} with a half k128 tail needs the M16K4 A layout")
+    if K % WMMA_K and tile_k != WMMA_K:
+        # Only the single-k128 tile is validated on the half k128 tail; a wider
+        # tile has faulted there, so reject it rather than risk a GPU hang.
+        raise ValueError(f"K={K} with a half k128 tail needs tile_k={WMMA_K}")
     # A K that tile_k does not divide ends on a ragged tile of KWS_TAIL k128
     # steps. Its TDM loads clamp the inner extent there, so the bytes past the
-    # row end are zero-filled instead of read, and its compute stops early.
+    # row end are zero-filled instead of read, and its compute stops early. A
+    # half k128 tail computes its last k128 on that zero fill.
     K_TILES = ceildiv(K, tile_k)
-    KWS_TAIL = (K - (K_TILES - 1) * tile_k) // WMMA_K
-    HAS_K_TAIL = KWS_TAIL != KWS
+    K_TAIL = K - (K_TILES - 1) * tile_k
+    KWS_TAIL = ceildiv(K_TAIL, WMMA_K)
+    HAS_K_TAIL = K_TAIL != tile_k
+    # Intra-workgroup split-K: k_waves wave groups of m_warp x n_warp waves each
+    # run the whole pipeline on their own contiguous K slice and LDS arena, then
+    # reduce their accumulators through LDS. It adds waves, not workgroups, so
+    # a decode tile's serial K loop shortens without a global round trip.
+    if k_waves > 1:
+        if K_TILES % k_waves or K % tile_k:
+            raise ValueError(f"k_waves={k_waves} must divide K tiles of K={K}/{tile_k}")
+        if persistent_workers or cluster_m > 1 or cluster_n > 1:
+            raise ValueError("k_waves needs a plain (non-persistent, unclustered) grid")
+        if enable_ep_scatter or tdm_as_in_prologue:
+            raise ValueError("k_waves does not support EP scatter or the As prologue")
+        K_TILES = K_TILES // k_waves
     # Double buffering is sufficient: the carry reads the other LDS buffer
     # before the post-compute barrier permits reusing the current buffer.
     next_stage_on = 1 if (next_stage_prefetch and num_buffers >= 2) else 0
     assert rolled_drain in (0, 1), "rolled_drain must be 0 or 1"
     rolled_drain = bool(rolled_drain)
-    # Keep the experiment switch as an override while normal dispatch obtains
-    # both cluster dimensions from the tuned configuration.
-    cluster_m = 1 if FORCE_1X4_CLUSTER else cluster_m
-    iglp_params = IGLP_PARAMS["a4w4" if a_is_fp4 else "a8w4"][
-        "prefill" if tile_m == 256 and tile_n == 256 and tile_k == 256 else "default"
+    warp_tile_m = tile_m // m_warp
+    warp_tile_n = tile_n // n_warp
+    wmma_m_rep = warp_tile_m // WMMA_M
+    wmma_n_rep = warp_tile_n // WMMA_N
+    n_acc = wmma_m_rep * wmma_n_rep
+    is_prefill = tile_m == tile_n == tile_k == 256
+    USE_EXPLICIT_VGPR_PARTITION = bool(is_prefill and callable(sched_vgpr))
+    # Only fixed high-VGPR placement needs the relaxed occupancy target.
+    # Attach it per kernel; a launcher-wide hint also changes ordinary tiles.
+    kernel_attrs = {"rocdl.waves_per_eu": "1"} if USE_EXPLICIT_VGPR_PARTITION else {}
+    hyper_params = HYPER_PARAMS["a4w4" if a_is_fp4 else "a8w4"][
+        "prefill" if is_prefill else "default"
     ]
-    sched_mma_group = iglp_params["mma_group"]
-    sched_first_group = iglp_params["mma_first_group"]
-    sched_ds_first = iglp_params["ds_first_n"]
-    cache_tag = (
-        K,
-        tile_m,
-        tile_n,
-        tile_k,
-        m_warp,
-        n_warp,
-        out_is_f16,
-        num_buffers,
-        a_is_fp4,
-        a_preshuffled,
-        n_experts,
-        stage1_act,
-        has_bias,
-        TDM_DESCRIPTOR_VERSION,
-        stage1_quant_out,
-        quant_wmma_rep,
-        cluster_n,
-        cluster_m,
-        DISABLE_CLUSTER_SYNC,
-        next_stage_on,
-        num_waves_per_tensor_tdm,
-        tdm_as_in_prologue,
-        tdm_b_th,
-        enable_ep_scatter,
-        ep_arena_handle,
-        ep_combine_input_offset,
-        ep_slot_stride_bytes,
-        ep_destination_stride,
-        ep_world_size,
-        sched_mma_group,
-        sched_first_group,
-        sched_ds_first,
-        SUPPORT_EXPLICIT_VGPR_PARTITION,
-        planar_lds_on,
-        interleaved_lds_load_on,
-        row_major_ascale,
-        a_row_stride_bytes,
-        a_scale_row_stride_bytes,
-        ep_quant_bits,
-        persistent_workers,
-        rolled_drain,
-        m_align,
+    sched_mma_group = hyper_params["mma_group"]
+    sched_first_group = hyper_params.get("mma_first_group", sched_mma_group)
+    sched_ds_first = hyper_params["ds_first_group"]
+    sched_ds_group = hyper_params["ds_group"] if a_is_fp4 and KWS > 1 else 0
+    tdm_early_timeout = hyper_params["tdm_early_timeout"]
+    ksl0_prefix_mma = hyper_params["ksl0_prefix_mma"]
+    ksl0_fence_mma = hyper_params["ksl0_fence_mma"]
+    ksl1_prefence_mma = hyper_params["ksl1_prefence_mma"]
+    wmma_in_barrier = hyper_params["wmma_in_barrier"]
+    # Resolve applicability here; k_step validates the actual WMMA ranges.
+    ksl0_prefix_mma = ksl0_prefix_mma if a_is_fp4 and KWS > 1 else 0
+    ksl1_prefence_mma = ksl1_prefence_mma if a_is_fp4 and KWS == 2 else 0
+    wmma_in_barrier = wmma_in_barrier if a_is_fp4 and KWS == 2 else 0
+    if not is_prefill:
+        # The shared defaults also serve small tiles with fewer accumulators.
+        prefix_capacity = ((wmma_m_rep + 1) // 2) * wmma_n_rep
+        if ksl1_prefence_mma > prefix_capacity:
+            ksl1_prefence_mma = 0
+        if ksl1_prefence_mma + wmma_in_barrier > prefix_capacity:
+            wmma_in_barrier = 0
+    # The hardware WMMA axes are N32 x M16 in this transposed GEMM.
+    # Group two N fragments and four M fragments into a 64x64 output block.
+    wmma_2x4 = bool(
+        hyper_params["wmma_2x4"]
+        and a_is_fp4
+        and tile_m == tile_n == tile_k == 256
+        and m_warp == n_warp == 2
     )
-    _ = cache_tag
     if enable_ep_scatter:
         if stage1_act != 0:
             raise ValueError("enable_ep_scatter is gemm2-only (stage1_act must be 0)")
@@ -348,27 +408,22 @@ def build_gemm_a8w4_tdm_task(
     if ep_quant_bits:
         if not enable_ep_scatter:
             raise ValueError("ep_quant_bits requires enable_ep_scatter")
-        # A tile row must hold whole scale blocks, else its slice of the scale
-        # plane is not a whole number of bytes. 256 rather than EP_SCALE_BLOCK so
-        # each plane's slice also starts on a cache line: on the fp4 wire the
-        # payload row is tile_n/2 bytes, so only a multiple of 256 keeps that a
-        # multiple of 128. The tuning table only emits tile_n2 in {256, 512}, but
-        # env overrides (*_N2) bypass it.
-        if tile_n % 256 != 0:
-            raise ValueError(f"ep_quant_bits requires tile_n % 256 == 0, got {tile_n}")
+        # A tile row must be whole wire chunks, and a warp's columns must sit in
+        # one chunk for the staging offsets. The tuning table only emits tile_n2
+        # in {256, 512}, but env overrides (*_N2) bypass it.
+        if tile_n % COMBINE_CHUNK or COMBINE_CHUNK % (tile_n // n_warp):
+            raise ValueError(
+                f"ep_quant_bits requires tile_n and warp tiles aligned to "
+                f"{COMBINE_CHUNK} columns, got tile_n={tile_n}, n_warp={n_warp}"
+            )
         if (tile_n // n_warp // 16) % WN_PER_MX_BLOCK_EP != 0:
             raise ValueError(
                 "ep_quant_bits requires wmma_n_rep % "
                 f"{WN_PER_MX_BLOCK_EP} == 0, got {tile_n // n_warp // 16}"
             )
-    warp_tile_m = tile_m // m_warp
-    warp_tile_n = tile_n // n_warp
-    wmma_m_rep = warp_tile_m // WMMA_M
-    wmma_n_rep = warp_tile_n // WMMA_N
-    n_acc = wmma_m_rep * wmma_n_rep
     output_n_rep = warp_tile_n // 16
     num_waves = m_warp * n_warp
-    block = num_waves * WAVE
+    block = num_waves * k_waves * WAVE
     SCATTER_GROUP_ROWS = 8
     SCATTER_PASSES_PER_VECTOR = WAVE // SCATTER_GROUP_ROWS
     scatter_groups = (tile_m + SCATTER_GROUP_ROWS - 1) // SCATTER_GROUP_ROWS
@@ -396,8 +451,8 @@ def build_gemm_a8w4_tdm_task(
     AS_KSTEPS = tile_k // 128
     AS_INNER = AS_KSTEPS * wmma_m_rep * 16
     AS_SUPERS = m_warp
-    AS_FULL_KDW = K // 128
-    AS_FULL_INNER = (K // 128) * wmma_m_rep * 16
+    AS_FULL_KDW = K128
+    AS_FULL_INNER = K128 * wmma_m_rep * 16
     # A-scale LDS: one outer row is one wave's M tile, and its inner
     # (k128, wm, lane16) layout gives each WMMA scale operand a contiguous
     # 16-dword block -- which is why the global buffer has to arrive already
@@ -441,27 +496,39 @@ def build_gemm_a8w4_tdm_task(
     # multiple of 32B.  Consecutive rows then rotate by four banks and spread a
     # wave32 b128 write uniformly to its intrinsic two-bank-cycle floor.
     # Ternaries, not if/else: @flyc.jit does not let branch-local names escape.
-    # Quantized rows are payload bytes, not bf16 elements, and their scale plane
-    # is staged in a second region sitting right behind the payload one.
+    # Quantized rows are wire bytes, scale lines included, staged exactly as the
+    # scatter sends them.
     def _lds_pitch(nbytes):
         p = ((nbytes + 15) // 16) * 16
         return p + (16 if p % 32 == 0 else 0)
 
-    C_ROW_BYTES = tile_n * ep_quant_bits // 8 if ep_quant_bits else tile_n * 2
-    EP_SCALE_ROW_BYTES = tile_n // EP_SCALE_BLOCK
+    EP_CHUNK_BYTES = combine_chunk_bytes(ep_quant_bits)
+    EP_CHUNK_PAYLOAD_BYTES = COMBINE_CHUNK * ep_quant_bits // 8
+    C_ROW_BYTES = (
+        tile_n // COMBINE_CHUNK * EP_CHUNK_BYTES if ep_quant_bits else tile_n * 2
+    )
     _lds_row_bytes = _lds_pitch(C_ROW_BYTES)
-    _lds_scale_row_bytes = _lds_pitch(EP_SCALE_ROW_BYTES) if ep_quant_bits else 0
-    _ep_scale_lds_off = tile_m * _lds_row_bytes
     c_lds_pad_elems = (_lds_row_bytes - C_ROW_BYTES) // 2 if enable_ep_scatter else 0
     store_pad = c_lds_pad_elems if enable_ep_scatter else 16
     C_STORE_B = (
-        ((_ep_scale_lds_off + tile_m * _lds_scale_row_bytes + 127) // 128) * 128
+        ((tile_m * _lds_row_bytes + 127) // 128) * 128
         if ep_quant_bits
         else ((tile_m * (tile_n + store_pad) * 2 + 127) // 128) * 128
     )
     AS_FULL_OFF = INPUT_LDS_B
     AS_FULL_B = ceildiv(AS_SUPERS * AS_FULL_INNER * 4, 128) * 128
     ARENA_B = max(AS_FULL_OFF + (AS_FULL_B if tdm_as_in_prologue else 0), C_STORE_B)
+    # Each k_waves group gets its own arena, which also holds its partial
+    # accumulators (one f32 dword4 per lane per chunk) for the final reduction.
+    K_PARTIAL_B = (
+        ((tile_m // m_warp) // 16)
+        * ((tile_n // n_warp) // (32 if a_is_fp4 else 16))
+        * ((32 if a_is_fp4 else 16) // 2)
+        * 4
+        * num_waves
+        * WAVE
+    )
+    GROUP_ARENA_B = ceildiv(max(ARENA_B, K_PARTIAL_B), 512) * 512
     # Stages the mainloop issues before its first fence (mirrors run_mainloop).
     _mid_compute = not (tile_m <= 32 or num_buffers <= 2)
     _pro_stages = (
@@ -496,7 +563,6 @@ def build_gemm_a8w4_tdm_task(
     _bias = {0: "", 1: "_bias", 2: "_biasf32", 3: "_biasf16"}[has_bias]
     _grouped = f"_e{n_experts}" if n_experts > 0 else ""
     _cl = f"_cluster{cluster_m}x{cluster_n}" if cluster_m > 1 or cluster_n > 1 else ""
-    _cluster_sync = "_nosync" if (cluster_m > 1 and DISABLE_CLUSTER_SYNC) else ""
     # Marked when on, so the baseline keeps its original symbol.
     _next_stage = "_prefetch" if next_stage_on else ""
     _as_prologue = "_asprol" if tdm_as_in_prologue else ""
@@ -511,23 +577,35 @@ def build_gemm_a8w4_tdm_task(
         else f"_mg{sched_first_group}x{sched_mma_group}"
     )
     _ds_first = f"_dsfirst{sched_ds_first}" if sched_ds_first else ""
-    _explicit_vgpr_partition = "_regpart" if SUPPORT_EXPLICIT_VGPR_PARTITION else ""
+    _ds_group = f"_dsgroup{sched_ds_group}" if sched_ds_group else ""
+    _ds_wait = "_fencewait" if sched_ds_group else ""
+    _explicit_vgpr_partition = "_regpart" if USE_EXPLICIT_VGPR_PARTITION else ""
     _planar_lds = "_planarlds" if planar_lds_on else ""
     _interleaved_lds_load = "_interleavelds" if interleaved_lds_load_on else ""
     _epq = f"_epq{ep_quant_bits}" if ep_quant_bits else ""
     _persistent = f"_pw{persistent_workers}" if persistent_workers else ""
     _drain = "_rolleddrain" if rolled_drain else ""
+    _wmma_2x4 = "_wmma2x4_order" if wmma_2x4 else ""
+    _prefence = f"_prebarrier{ksl1_prefence_mma}_barrier{wmma_in_barrier}"
+    _prefence += f"_ksl0tail_{ksl0_fence_mma}"
+    if a_is_fp4 and KWS > 1 and ksl0_prefix_mma:
+        _prefence += f"_ksl0prefix{ksl0_prefix_mma}"
+    _prefence += "_ab2"
+    _kwaves = f"_kw{k_waves}" if k_waves > 1 else ""
     _malign = f"_ma{m_align}" if m_align else ""
     _kname = (
         f"mxfp4_tdm_{_afp}{_a_layout}"
         f"_t{tile_m}x{tile_n}x{tile_k}_w{m_warp}x{n_warp}"
         f"_b{num_buffers}_K{K}"
-        f"{_grouped}{_act}{_bias}{_qout}{_cl}{_cluster_sync}"
+        f"{_grouped}{_act}{_bias}{_qout}{_cl}"
         f"{_next_stage}{_as_prologue}"
         f"{_b_tdm_th}{_waves_per_tensor}{_ep}{_epq}"
-        f"{_mma_group}{_ds_first}"
+        f"{_mma_group}{_ds_first}{_ds_group}{_ds_wait}"
         f"{_explicit_vgpr_partition}{_planar_lds}"
-        f"{_interleaved_lds_load}{_persistent}{_drain}{_malign}"
+        f"{_interleaved_lds_load}{_persistent}{_drain}"
+        f"_et{int(tdm_early_timeout)}{_wmma_2x4}"
+        f"{_prefence}_earlyacc"
+        f"{_malign}{_kwaves}"
     )
 
     # Compile the static path directly, preserving its launch ABI and the
@@ -561,11 +639,18 @@ def build_gemm_a8w4_tdm_task(
     ):
         A_KROW = K // A_PACK
         Kp16 = (K // 2) * 16
-        K4 = K // 4
+        # Scale dwords per 32-row B super-row: one per k128, padded K included.
+        K4 = K128 * 32
 
         tid = fx.thread_idx.x
         bid_x = task_id if persistent_workers else fx.block_idx.x
         wave = rocdl.readfirstlane(T.i32, tid // WAVE)
+        k_group = 0
+        if const_expr(k_waves > 1):
+            # Group 0 holds hardware waves 0..num_waves-1, so the group-0 epilogue
+            # sees the same wave ids as an unsplit workgroup.
+            k_group = wave // num_waves
+            wave = wave % num_waves
         lane = tid % WAVE
         lane16 = lane % 16
         kgrp = lane // 16
@@ -614,7 +699,7 @@ def build_gemm_a8w4_tdm_task(
 
         # The host launches a CUDAGraph-safe worst-case M grid.  The final psum
         # entry is the end of the last expert's valid rows, so reject the padded
-        # tail before paying for the dependent expert bisect.  blk_m is shared
+        # tail before paying for the expert lookup.  blk_m is shared
         # by every workgroup in a cluster, making this predicate cluster-uniform.
         i32_ptr = fx.PointerType.get(
             elem_ty=fx.Int32.ir_type, address_space=fx.AddressSpace.Global, alignment=4
@@ -626,28 +711,36 @@ def build_gemm_a8w4_tdm_task(
             has_work = True
             expert = fx.Int32(tile_meta[0][0])
         else:
-            has_work = blk_m < tile_map[n_experts - 1]
+            valid_rows = tile_map[n_experts - 1]
+            has_work = blk_m < valid_rows
 
-            # In-kernel bisect: find the expert owning this valid M-tile.  Seed
-            # the result with the padding sentinel so it remains defined
-            # outside the dynamic branch and the existing main-body guard
-            # stays valid.
+            # In-kernel bisect: find the expert owning this valid M-tile.  Seed the
+            # result with the padding sentinel so it remains defined outside the
+            # dynamic branch and the existing main-body guard stays valid.
             expert = blk_m * 0 + n_experts
             if has_work:
-                lo, hi = blk_m * 0, blk_m * 0 + n_experts
-                for _ in range_constexpr(
-                    max(1, math.ceil(math.log2(max(2, n_experts))) + 1)
-                ):
-                    mid = (lo + hi) >> 1
-                    mid_clamped = (mid < n_experts - 1).select(mid, n_experts - 1)
-                    go_right = tile_map[mid_clamped] <= blk_m
-                    lo = go_right.select(mid + 1, lo)
-                    hi = go_right.select(hi, mid)
-                expert = lo
+                # psum is sorted, so the owning expert is the count of experts
+                # ending at or before blk_m. Every lane loads a strided slice in
+                # one round trip instead of a dependent log2(E) bisect.
+                psum_hits = fx.Int32(0)
+                for i in range_constexpr(ceildiv(n_experts, WAVE)):
+                    e_idx = lane + i * WAVE
+                    if const_expr((i + 1) * WAVE <= n_experts):
+                        end_e = tile_map[e_idx]
+                        psum_hits = psum_hits + (end_e <= blk_m).select(1, 0)
+                    else:
+                        e_ok = e_idx < n_experts
+                        end_e = tile_map[e_ok.select(e_idx, n_experts - 1)]
+                        psum_hits = psum_hits + (e_ok & (end_e <= blk_m)).select(1, 0)
+                for sh in range_constexpr(int.bit_length(WAVE) - 1):
+                    psum_hits = psum_hits + psum_hits.shuffle_xor(
+                        fx.Int32(1 << sh), fx.Int32(WAVE)
+                    )
+                expert = rocdl.readfirstlane(T.i32, psum_hits)
         if const_expr(m_align):
             # tile_map holds unpadded expert ends while experts start on
             # m_align boundaries; a tile narrower than m_align can start in the
-            # previous expert's padding, which the bisect hands to this expert.
+            # previous expert's padding, which the lookup hands to this expert.
             prev = (expert > 0).select(expert - 1, 0)
             start = (tile_map[prev] + (m_align - 1)) // m_align * m_align
             start = (expert > 0).select(start, 0)
@@ -661,9 +754,7 @@ def build_gemm_a8w4_tdm_task(
         # row stride is not K bytes and the scale row stride is not K/128 dwords.
         A_GROW = a_row_stride_bytes if a_row_stride_bytes else A_KROW
         # row-major: scale dwords per M row
-        SA_GROW = (
-            a_scale_row_stride_bytes // 4 if a_scale_row_stride_bytes else K // 128
-        )
+        SA_GROW = a_scale_row_stride_bytes // 4 if a_scale_row_stride_bytes else K128
 
         c_outer_off, c_inner_off, c_stride = blk_m64, blk_n64, i32_n
         SB_OUTER_STRIDE = K4
@@ -679,14 +770,12 @@ def build_gemm_a8w4_tdm_task(
             )
 
         b_mcast_mask = None
-        full_cluster = None
         if const_expr(cluster_m > 1):
             # Intersect this expert's contiguous M-tile interval with the
             # physical M rows. This produces H x cluster_n logical subclusters:
             # A multicasts across each row, while B multicasts down each column.
             cluster_first_m = m_unit * cluster_m
             valid_m_tiles = (tile_map[n_experts - 1] + tile_m - 1) // tile_m
-            full_cluster = cluster_first_m + cluster_m <= valid_m_tiles
             prev_expert = (expert > 0).select(expert - 1, 0)
             prev_expert = (prev_expert < n_experts).select(prev_expert, n_experts - 1)
             first_m = (expert > 0).select(
@@ -699,32 +788,45 @@ def build_gemm_a8w4_tdm_task(
             for mi in range_constexpr(cluster_m):
                 peer_m = cluster_first_m + mi
                 same_expert = (peer_m >= first_m) & (peer_m < end_m)
-                column_mask = column_mask | same_expert.select(1 << (mi * cluster_n), 0)
-                group_size = group_size + same_expert.select(1, 0)
+                column_mask = column_mask | same_expert.select(
+                    fx.Int32(1 << (mi * cluster_n)), fx.Int32(0)
+                )
+                group_size = group_size + same_expert.select(fx.Int32(1), fx.Int32(0))
             # A partial M-tail retains four independent copies of the current
             # 1x4 A protocol.  Disable B multicast there so sentinel rows can
             # take the existing early exit without entering a cluster barrier.
             # A one-row expert subgroup is also the current 1x4 fallback: A
             # broadcasts across N and B remains an ordinary per-WG load.
-            use_b_mcast = full_cluster & (group_size > 1)
+            # Preserve the existing sync policy while restoring eligible B multicast.
+            b_cluster_full = cluster_first_m + cluster_m <= valid_m_tiles
+            use_b_mcast = b_cluster_full & (group_size > 1)
             b_mcast_mask = use_b_mcast.select(column_mask << local_n, 0)
-
-        def cluster_sync():
-            cluster.cluster_barrier()
 
         if const_expr(lds_base is not None):
             # The enclosing kernel owns the only SharedAllocator.
             base_ptr = lds_base[0]
         else:
             # static=False (one dyn-shared base) only where a second region is
-            # needed, so the non-scatter path keeps its per-leaf static
-            # allocation.
+            # needed, so the non-scatter path keeps its per-leaf static allocation.
             _smem = (
                 fx.SharedAllocator(static=False)
                 if const_expr(enable_ep_scatter)
                 else fx.SharedAllocator(static=True)
             )
-            base_ptr = _smem.allocate(ARENA_B)._ptr
+            base_ptr = _smem.allocate(
+                GROUP_ARENA_B * k_waves if k_waves > 1 else ARENA_B
+            )._ptr
+            if const_expr(k_waves > 1):
+                # Rebuild the pointer so the group offset keeps its 16-B alignment;
+                # plain pointer arithmetic drops it, which the bf16 epilogue rejects.
+                base_ptr = fx.inttoptr(
+                    fx.PointerType.get(
+                        elem_ty=fx.Int8.ir_type,
+                        address_space=fx.AddressSpace.Shared,
+                        alignment=16,
+                    ),
+                    fx.Int32(fx.ptrtoint(base_ptr)) + k_group * GROUP_ARENA_B,
+                )
 
         def ptr_to_idx(p):
             return fx.Index(fx.ptrtoint(p))
@@ -763,13 +865,20 @@ def build_gemm_a8w4_tdm_task(
             addr = fx.Int32(lds_base_idx) + fx.Int32(byte_offset)
             fx.ptr_store(fx.Int16(data), fx.inttoptr(i16_lds_ptr_ty, addr))
 
-        def make_tdm_store(gt, outer, stride):
-            return fx.rocdl.make_tdm_atom(
+        def tiled_store(gt, tile, lds_ptr, lds_row):
+            atom, coord = fx.rocdl.cdna5.make_tiled_tdm_atom(
+                fx.rocdl.TensorStore(),
                 gt,
-                [outer, None],
-                strides=[stride, None],
+                fx.make_layout(tile, (lds_row, 1)),
+                tile,
                 num_warps=num_waves,
             )
+            blk = fx.zipped_divide(coord, tile)[None, (0, None)]
+            box = tensor_view(lds_ptr, (tile, 1), ((lds_row, 1), tile[0] * lds_row))
+            ts, tg = fx.rocdl.cdna5.tdm_partition(
+                atom, wave, fx.make_layout(num_waves, 1), box, blk
+            )
+            fx.copy(atom, ts[None, 0], tg[None, 0])
 
         gA_base = fx.recast_iter(fx.Int8, arg_a)
         gB_base = fx.recast_iter(fx.Int8, arg_b)
@@ -833,15 +942,14 @@ def build_gemm_a8w4_tdm_task(
             waves = [wave_groups[i % len(wave_groups)] for i in range(4)]
             # Number of rotating A/B/A-scale/B-scale loads issued by each wave.
             TDM_PER = 4 * num_waves_per_tensor_tdm // num_waves
-        nw = 1
         base_i32 = fx.recast_iter(p32_shared, base_ptr)
 
-        # Waves in one ``wv`` differ only in runtime atom state, so the whole list
+        # Waves in one ``wv`` differ only in which share of the tile they issue,
+        # which the atom's own warp distribution decides, so the whole list
         # collapses to one atom: ``wv`` is the smallest unit needing its own code.
         Job = namedtuple(
             "Job",
-            "atom gt on_i32 lds_off lds_stage lds_row inner outer k_adv waves "
-            "tail_ext",
+            "atom blk on_i32 lds_off lds_stage lds_row inner outer waves nw",
         )
         jobs = []
         as_prologue_jobs = []
@@ -862,66 +970,82 @@ def build_gemm_a8w4_tdm_task(
             wv,
             pad=None,
             wg_mask=None,
-            split_inner=False,
             target_jobs=None,
             cache_modifier=0,
         ):
-            split_i = split_inner and len(wv) > 1
-            if const_expr(len(wv) > 1):
-                if const_expr(split_i):
-                    assert inner % len(wv) == 0, "TDM inner extent must divide owners"
-                else:
-                    assert outer % len(wv) == 0, "TDM outer extent must divide owners"
-            seg = outer if split_i else outer // len(wv)
-            inner_seg = inner // len(wv) if split_i else inner
-            wave_outer_off = 0 if split_i or len(wv) == 1 else (wave - wv[0]) * seg
-            wave_inner_off = (wave - wv[0]) * inner_seg if split_i else 0
+            """Build one tiled-atom load of an (outer, inner) tile for ``wv``.
+
+            The owners no longer carve the tile up by hand: the atom is built
+            with ``num_warps=len(wv)`` and tdm_partition hands each owner its
+            share of the same compact LDS traversal, whichever axis that ends
+            up splitting. That subsumes the old outer/inner segment arithmetic
+            and the ``split_inner`` flag that chose between them.
+
+            The view spans every k-tile the rest index can reach instead of one
+            tile at a runtime offset, so the ragged last tile is clamped by the
+            view's own extent: the per-iteration ``extent_1`` write is gone,
+            and with it the ``imm_offset`` the old interface needed.
+
+            ``pad`` is implicit too -- a box row wider than the tile leaves
+            exactly the slack the old pad_interval/pad_amount pair described --
+            so it is kept only to assert the two agree.
+            """
+            nw = len(wv)
+            if const_expr(k_waves > 1 and k_adv):
+                # This group's first k-tile, in the view's element units.
+                g_off = g_off + fx.Int64(k_group * K_TILES) * fx.Int64(
+                    k_adv // 4 if on_i32 else k_adv
+                )
+            if pad is not None:
+                assert pad == (inner, lds_row - inner), (
+                    f"the LDS box row already states this pad: row {lds_row}, "
+                    f"tile {inner}, declared {pad}"
+                )
+            assert lds_row == inner or inner <= _TDM_MAX_PAD_INTERVAL_BYTES, (
+                f"a padded row of {inner} needs its K axis split (the pad "
+                f"interval caps at {_TDM_MAX_PAD_INTERVAL_BYTES})"
+            )
+            # k_adv counts LDS elements on an i32 view and bytes otherwise;
+            # either way it is the tile's inner width, so the coordinate rest
+            # steps exactly one tile per k-tile.
+            k_step = (k_adv // 4 if on_i32 else k_adv) if k_adv else 0
+            assert (
+                not k_step or k_step == inner
+            ), f"rest step {k_step} must equal the tile's inner width {inner}"
             gt = tensor_view(
-                g_base
-                + (
-                    g_off
-                    + fx.Int64(wave_outer_off) * g_stride
-                    + fx.Int64(wave_inner_off)
-                ),
-                (seg, inner_seg),
+                g_base + g_off,
+                (outer if oob is None else oob, inner * K_TILES if k_adv else inner),
                 (g_stride, 1),
             )
-            ext = None if oob is None else oob - wave_outer_off
-            pad_kw = {"pad_interval": pad[0], "pad_amount": pad[1]} if pad else {}
-            atom = fx.rocdl.make_tdm_atom(
+            tile = (outer, inner)
+            atom, coord = fx.rocdl.cdna5.make_tiled_tdm_atom(
+                fx.rocdl.TensorLoad(cache_modifier=cache_modifier),
                 gt,
-                [ext, None],
-                strides=[g_stride, None],
+                fx.make_layout(tile, (lds_row, 1)),
+                tile,
                 num_warps=nw,
-                # Descriptor bit 21: release to the peers already present and
-                # re-broadcast later, so early arrivals are not held for a merge.
-                early_timeout=bool(wg_mask is not None),
-                cache_modifier=cache_modifier,
-                **pad_kw,
             )
             if const_expr(wg_mask is not None):
                 # A runtime zero mask keeps a partial-M tail on the ordinary
                 # global-load path; nonzero masks select CLUSTER_LOAD_ASYNC.
                 atom = fx.atom_set_value(atom, "workgroup_mask", fx.Int32(wg_mask))
-            # Every K-advancing load lays a tile out k128-major, so the ragged
-            # last tile keeps the first KWS_TAIL/KWS of its inner extent. The
-            # extent is relative to this wave's base, which imm_offset bumps.
-            tail_ext = None
-            if const_expr(HAS_K_TAIL and k_adv):
-                tail_ext = inner * KWS_TAIL // KWS - wave_inner_off
+                # Descriptor bit 21 preserves the tuned multicast early release.
+                atom = fx.atom_set_value(
+                    atom, "early_timeout", fx.Int32(int(tdm_early_timeout))
+                )
+            blk = fx.zipped_divide(coord, tile)[None, (0, None)]
             (jobs if target_jobs is None else target_jobs).append(
                 Job(
                     atom,
-                    gt,
+                    blk,
                     on_i32,
-                    lds_off + wave_outer_off * lds_row + wave_inner_off,
+                    lds_off,
                     lds_stage,
                     lds_row,
-                    inner_seg,
-                    seg,
-                    k_adv,
+                    inner,
+                    outer,
                     wv,
-                    tail_ext,
+                    nw,
                 )
             )
 
@@ -942,7 +1066,6 @@ def build_gemm_a8w4_tdm_task(
                 k_adv=16 * A_ROW_B,
                 wv=waves[0],
                 wg_mask=a_mcast_mask,
-                split_inner=tile_m // 16 < len(waves[0]),
             )
         else:
             add_tdm_loads(
@@ -1027,7 +1150,6 @@ def build_gemm_a8w4_tdm_task(
                 lds_row=AS_FULL_INNER,
                 k_adv=0,
                 wv=waves[2],
-                split_inner=AS_SUPERS < len(waves[2]),
                 target_jobs=as_prologue_jobs,
             )
         else:
@@ -1044,7 +1166,6 @@ def build_gemm_a8w4_tdm_task(
                 lds_row=AS_INNER,
                 k_adv=AS_INNER * 4,
                 wv=waves[2],
-                split_inner=AS_SUPERS < len(waves[2]),
             )
         add_tdm_loads(
             gSB_base,
@@ -1074,30 +1195,18 @@ def build_gemm_a8w4_tdm_task(
 
         def issue(s, kt, my_jobs=None):
             base_i8 = fx.recast_iter(p8_shared, base_ptr)
-            # Only the last tile is ragged: a prologue kt picks its extent at
-            # compile time, a loop kt selects it with one scalar compare.
-            static_kt = isinstance(kt, int)
-            is_tail = None
-            if const_expr(HAS_K_TAIL):
-                is_tail = (
-                    kt == K_TILES - 1 if static_kt else fx.Int32(kt) == K_TILES - 1
-                )
 
             def emit(j):
                 base = base_i32 if j.on_i32 else base_i8
                 dst = lds_view(
                     base + j.lds_off + s * j.lds_stage,
-                    (j.outer, j.inner),
-                    (j.lds_row, 1),
+                    ((j.outer, j.inner), 1),
+                    ((j.lds_row, 1), j.outer * j.lds_row),
                 )
-                atom = j.atom
-                if const_expr(j.tail_ext is not None and not static_kt):
-                    atom = fx.atom_set_value(
-                        atom, "extent_1", fx.Int32(is_tail.select(j.tail_ext, j.inner))
-                    )
-                elif const_expr(j.tail_ext is not None and is_tail):
-                    atom = fx.atom_set_value(atom, "extent_1", fx.Int32(j.tail_ext))
-                fx.copy(atom, j.gt, dst, imm_offset=fx.Int64(kt * j.k_adv))
+                ts, tg = fx.rocdl.cdna5.tdm_partition(
+                    j.atom, wave - j.waves[0], fx.make_layout(j.nw, 1), dst, j.blk
+                )
+                fx.copy(j.atom, tg[None, fx.Int32(kt)], ts[None, 0])
                 if const_expr(tdm_snop):
                     # A branch must never directly follow a TDM issue (see
                     # mega_moe_gfx1250.tdm_prims); the owner test around this
@@ -1126,18 +1235,24 @@ def build_gemm_a8w4_tdm_task(
                 if owns(job.waves):
                     destination = tensor_view(
                         base_i32 + job.lds_off,
-                        (job.outer, job.inner),
-                        (job.lds_row, 1),
+                        ((job.outer, job.inner), 1),
+                        ((job.lds_row, 1), job.outer * job.lds_row),
                     )
-                    fx.copy(job.atom, job.gt, destination)
+                    ts, tg = fx.rocdl.cdna5.tdm_partition(
+                        job.atom,
+                        wave - job.waves[0],
+                        fx.make_layout(job.nw, 1),
+                        destination,
+                        job.blk,
+                    )
+                    fx.copy(job.atom, tg[None, 0], ts[None, 0])
                     if const_expr(tdm_snop):
                         rocdl.s_nop(0)
 
         wmb = wave_m * warp_tile_m
         wnb = wave_n * warp_tile_n
 
-        # Split each region's offset into a lane-varying base, which keepalive
-        # can pin, and a compile-time part that folds into ds_load's offset:.
+        # Keep stage/lane bases separate from the constant DS load offsets.
         lds_a_lane_off = (
             (wmb // 16) * 16 * A_ROW_B + lane16 * 16 + kgrp * 256
             if a_preshuffled
@@ -1159,35 +1274,57 @@ def build_gemm_a8w4_tdm_task(
 
         LdsAddr = namedtuple("LdsAddr", "a b sa sb")
 
-        def calc_lds_addr(slot):
-            """Calculate the lane-specific LDS bases for one stage buffer."""
-            slot_idx = fx.Index(slot)
-            return LdsAddr(
-                a=(
-                    stC_idx
-                    + A_LDS_OFF
-                    + slot_idx * A_LDS_STAGE
-                    + fx.index_cast(T.index, lds_a_lane_off)
-                ),
-                b=(
-                    stC_idx
-                    + B_LDS_OFF
-                    + slot_idx * B_LDS_STAGE
-                    + fx.index_cast(T.index, lds_b_lane_off)
-                ),
-                sa=(
-                    stC_idx
-                    + SA_LDS_OFF
-                    + slot_idx * SA_LDS_STAGE
-                    + fx.index_cast(T.index, lds_sa_lane_off)
-                ),
-                sb=(
-                    stC_idx
-                    + SB_LDS_OFF
-                    + slot_idx * SB_LDS_STAGE
-                    + fx.index_cast(T.index, lds_sb_lane_off)
-                ),
+        def lds_address_base(addr):
+            # Hide the stage constant from address reassociation. Otherwise
+            # LLVM can fold it into every load and materialize many full VGPR
+            # addresses instead of one base plus DS offset immediates.
+            # Tied input/output: identity, no instruction or memory barrier.
+            return fx.Int32(
+                llvm_dialect.InlineAsmOp(
+                    res=T.i32,
+                    operands_=[_raw(fx.Int32(addr))],
+                    asm_string="",
+                    constraints="=v,0",
+                    has_side_effects=False,
+                    is_align_stack=False,
+                ).res
             )
+
+        def calc_lds_base(slot, offset, stride, lane_offset):
+            return lds_address_base(
+                stC_idx
+                + offset
+                + fx.Index(slot) * stride
+                + fx.index_cast(T.index, lane_offset)
+            )
+
+        def calc_payload_bases(slot):
+            return (
+                calc_lds_base(slot, A_LDS_OFF, A_LDS_STAGE, lds_a_lane_off),
+                calc_lds_base(slot, B_LDS_OFF, B_LDS_STAGE, lds_b_lane_off),
+            )
+
+        def calc_scale_bases(slot):
+            return (
+                calc_lds_base(slot, SA_LDS_OFF, SA_LDS_STAGE, lds_sa_lane_off),
+                calc_lds_base(slot, SB_LDS_OFF, SB_LDS_STAGE, lds_sb_lane_off),
+            )
+
+        # Materialize each constant-stage base in the prologue. KSL/operand
+        # offsets stay in DS immediates instead of rebuilding scale addresses
+        # inside the unrolled ring. Runtime-stage paths keep their fallback.
+        payload_bases = [calc_payload_bases(s) for s in range_constexpr(num_buffers)]
+        scale_bases = [calc_scale_bases(s) for s in range_constexpr(num_buffers)]
+
+        def calc_lds_addr(slot):
+            """Get the lane-specific LDS bases for one stage buffer."""
+            if const_expr(isinstance(slot, int)):
+                a_base, b_base = payload_bases[slot]
+                sa_base, sb_base = scale_bases[slot]
+            else:
+                a_base, b_base = calc_payload_bases(slot)
+                sa_base, sb_base = calc_scale_bases(slot)
+            return LdsAddr(a=a_base, b=b_base, sa=sa_base, sb=sb_base)
 
         def load_a(base, wm, ksl):
             off = (
@@ -1214,16 +1351,18 @@ def build_gemm_a8w4_tdm_task(
                 .shuffle(v[2].shuffle(v[3], list(range(8))), list(range(16)))
             )
 
-        def load_b(base, wn, ksl):
-            def load_half(half):
-                off = half * B_LDS_ROW + ksl * 1024
-                return Vec(lds_load_b128(base, fx.Int32(off))).shuffle(
-                    Vec(lds_load_b128(base, fx.Int32(off + 512))), list(range(8))
-                )
+        def load_b_half(base, half, ksl):
+            off = half * B_LDS_ROW + ksl * 1024
+            return Vec(lds_load_b128(base, fx.Int32(off))).shuffle(
+                Vec(lds_load_b128(base, fx.Int32(off + 512))), list(range(8))
+            )
 
+        def load_b(base, wn, ksl):
             if const_expr(a_is_fp4):
-                return load_half(wn * 2).shuffle(load_half(wn * 2 + 1), list(range(16)))
-            return load_half(wn)
+                return load_b_half(base, wn * 2, ksl).shuffle(
+                    load_b_half(base, wn * 2 + 1, ksl), list(range(16))
+                )
+            return load_b_half(base, wn, ksl)
 
         def load_sa(base, sm, ksl, kt):
             off = (ksl * wmma_m_rep + sm * 2) * 16 * 4
@@ -1272,66 +1411,124 @@ def build_gemm_a8w4_tdm_task(
             fx.make_rmem_tensor(WMMA_VECTOR_DWORDS, fx.Float32)
             for _ in range_constexpr(n_acc)
         ]
-        if const_expr(SUPPORT_EXPLICIT_VGPR_PARTITION):
+        if const_expr(USE_EXPLICIT_VGPR_PARTITION):
             assert n_acc * WMMA_VECTOR_DWORDS <= 512
             for idx in range_constexpr(n_acc):
-                fx.set_register(
-                    c_frags[idx],
-                    register_class=fx.rocdl.VGPR,
-                    start=512 + idx * WMMA_VECTOR_DWORDS,
-                )
-        for cf in c_frags:
-            cf.store(fx.constant_vector(0.0, T.vec(WMMA_VECTOR_DWORDS, T.f32)))
+                c_frags[idx] = place_vgpr(c_frags[idx], 512 + idx * WMMA_VECTOR_DWORDS)
+
+        def init_accumulators():
+            # Cover prologue TDM latency before the first pipeline wait.
+            rocdl.sched_barrier(0)
+            for idx in range_constexpr(n_acc):
+                cf = c_frags[idx]
+                zero = fx.constant_vector(0.0, T.vec(WMMA_VECTOR_DWORDS, T.f32))
+                if const_expr(USE_EXPLICIT_VGPR_PARTITION):
+                    start = 512 + idx * WMMA_VECTOR_DWORDS
+                    end = start + WMMA_VECTOR_DWORDS - 1
+                    # Uppercase names select LLVM's physical-register lookup;
+                    # the AMDGPU lowercase "v" parser limits operands to v255.
+                    # Keep the opaque, tied result as the loop's initial value
+                    # so zero materialization cannot sink past the TDM wait.
+                    cf.store(zero)
+                    initial_value = _raw(cf.load())
+                    constraints = f"={{V[{start}:{end}]}},0"
+                    cf.store(
+                        llvm_dialect.InlineAsmOp(
+                            res=T.vec(WMMA_VECTOR_DWORDS, T.f32),
+                            operands_=[initial_value],
+                            asm_string="",
+                            constraints=constraints,
+                            has_side_effects=True,
+                            is_align_stack=False,
+                        ).res
+                    )
+                else:
+                    # Leave ordinary accumulators unconstrained; only the
+                    # explicit partition needs pinned early materialization.
+                    cf.store(zero)
+            rocdl.sched_barrier(0)
 
         front_wm = (wmma_m_rep + 1) // 2
         FRONT = list(range(front_wm))
         BACK = list(range(front_wm, wmma_m_rep))
 
         # WMMA held back as a closing pure-MFMA group, covering the next k128's
-        # REUSE fence; the prefetch reads interleave evenly over the rest. Narrow
-        # tiles can have n_acc as low as the tail itself, so clamp it to keep at
+        # REUSE fence; the prefetch reads interleave with the preceding groups.
+        # Small tiles can have n_acc as low as the tail, so clamp it to keep at
         # least one group for the interleaved part.
-        FENCE_COVER_MMA = min(8, max(0, n_acc - sched_mma_group))
+        FENCE_COVER_MMA = min(
+            ksl0_fence_mma,
+            max(0, n_acc - sched_mma_group),
+        )
 
-        def mma_rows(wm_list, act, wt, sa_k, sb_k):
-            for i in range_constexpr(len(wm_list)):
+        def mma_rows(
+            wm_list,
+            act,
+            wt,
+            sa_k,
+            sb_k,
+            start_mma=0,
+            end_mma=None,
+        ):
+            group_m = 4 if wmma_2x4 else 1
+            group_n = 2 if wmma_2x4 else wmma_n_rep
+            mma_order = []
+            for wm_base in range_constexpr(0, len(wm_list), group_m):
+                for wn_base in range_constexpr(0, wmma_n_rep, group_n):
+                    for i in range_constexpr(
+                        wm_base, min(wm_base + group_m, len(wm_list))
+                    ):
+                        wn_end = min(wn_base + group_n, wmma_n_rep)
+                        for wn in range_constexpr(wn_base, wn_end):
+                            mma_order.append((i, wn))
+            mma_end = len(mma_order) if end_mma is None else end_mma
+            for mma_index in range_constexpr(start_mma, mma_end):
+                i, wn = mma_order[mma_index]
                 wm = wm_list[i]
-                for wn_raw in range_constexpr(wmma_n_rep):
-                    wn = (wmma_n_rep - 1 - wn_raw) if (wm % 2 == 1) else wn_raw
-                    idx = wm * wmma_n_rep + wn
-                    scale_a = sb_k[wn if a_is_fp4 else wn // 2]
-                    scale_b = sa_k[wm // 2]
-                    if const_expr(a_is_fp4):
-                        wt_value = wt[wn].load()
-                        act_value = act[i].load()
-                        c_frags[idx].store(
-                            rocdl.wmma_scale_f32_32x16x128_f4(
-                                T.vec(16, T.f32),
-                                wt_value.ir_value(),
-                                act_value.ir_value(),
-                                c_frags[idx].load().ir_value(),
-                                scale_a,
-                                scale_b,
-                                scaleAType=0,
-                                scaleBType=wm % 2,
-                            )
-                        )
-                    else:
-                        fx.gemm(
-                            wmma_atoms[wn % 2][wm % 2],
-                            c_frags[idx],
-                            wt[wn],
-                            act[i],
-                            c_frags[idx],
-                            scale_a=scale_a,
-                            scale_b=scale_b,
-                        )
+                idx = wm * wmma_n_rep + wn
+                scale_a = sb_k[wn if a_is_fp4 else wn // 2]
+                scale_b = sa_k[wm // 2]
+                if const_expr(a_is_fp4):
+                    wt_value = wt[wn].load()
+                    act_value = act[i].load()
+                    mma_result = rocdl.wmma_scale_f32_32x16x128_f4(
+                        T.vec(16, T.f32),
+                        wt_value.ir_value(),
+                        act_value.ir_value(),
+                        c_frags[idx].load().ir_value(),
+                        scale_a,
+                        scale_b,
+                        scaleAType=0,
+                        scaleBType=wm % 2,
+                        reuseA=False,
+                        reuseB=False,
+                    )
+                    c_frags[idx].store(mma_result)
+                else:
+                    accumulator = _mma_tensor(c_frags[idx])
+                    fx.gemm(
+                        wmma_atoms[wn % 2][wm % 2],
+                        accumulator,
+                        _mma_tensor(wt[wn]),
+                        _mma_tensor(act[i]),
+                        accumulator,
+                        scale_a=scale_a,
+                        scale_b=scale_b,
+                    )
 
         DS_A = 2 if a_is_fp4 else 4
-        DS_B = 2
+        # FP4 WMMA spans N32: load_b joins two halves, each with two b128 reads.
+        DS_B = 4 if a_is_fp4 else 2
         sb_pairs = output_n_rep // 2
         sa_pairs = (wmma_m_rep + 1) // 2
-        BS_DS = wmma_n_rep * DS_B + sb_pairs + sa_pairs
+        # Packed scale b32 reads merge pairwise into native ds_load_2addr.
+        # Keep a conservative scalar-read count for the alternate A-scale
+        # addressing paths, where pairing is not guaranteed.
+        SA_DS = (
+            sa_pairs if row_major_ascale or tdm_as_in_prologue else ceildiv(sa_pairs, 2)
+        )
+        SB_DS = ceildiv(sb_pairs, 2)
+        BS_DS = wmma_n_rep * DS_B + SB_DS + SA_DS
         STATE_DS = wmma_m_rep * DS_A + BS_DS
 
         SA_WIDTH, SB_WIDTH = max(2, sa_pairs), max(2, sb_pairs)
@@ -1353,32 +1550,42 @@ def build_gemm_a8w4_tdm_task(
                 fx.make_rmem_tensor(WMMA_VECTOR_DWORDS, fx.Int32)
                 for _ in range_constexpr(wmma_n_rep)
             ]
-            if const_expr(SUPPORT_EXPLICIT_VGPR_PARTITION):
+            sa = fx.make_rmem_tensor(SA_WIDTH, fx.Int32)
+            sb = fx.make_rmem_tensor(SB_WIDTH, fx.Int32)
+            if const_expr(USE_EXPLICIT_VGPR_PARTITION):
                 slot_width = wmma_m_rep * ACT_NDW + wmma_n_rep * WMMA_VECTOR_DWORDS
                 assert slot_width <= 128
                 reg = 256 + slot_idx * 128
                 for wm in range_constexpr(wmma_m_rep):
-                    fx.set_register(a[wm], register_class=fx.rocdl.VGPR, start=reg)
+                    a[wm] = place_vgpr(a[wm], reg)
                     reg += ACT_NDW
                 for wn in range_constexpr(wmma_n_rep):
-                    fx.set_register(b[wn], register_class=fx.rocdl.VGPR, start=reg)
+                    b[wn] = place_vgpr(b[wn], reg)
                     reg += WMMA_VECTOR_DWORDS
                 assert reg <= 256 + (slot_idx + 1) * 128
+                # Scales remain free in v0-v255.
             return RmemSlot(
                 a=a,
                 b=b,
-                sa=fx.make_rmem_tensor(SA_WIDTH, fx.Int32),
-                sb=fx.make_rmem_tensor(SB_WIDTH, fx.Int32),
+                sa=sa,
+                sb=sb,
             )
 
         # Two slots: the k-tile loop is a runtime scf.for, so the tile boundary
         # cannot carry a Python value, and a prefetch needs a slot no WMMA reads.
         rmem_slots = [make_rmem_slot(i) for i in range_constexpr(2)]
 
-        def load_lds_data(slot, lds_addr, ksl, kt, interleaved_lds_load=False):
+        def load_lds_data(
+            slot,
+            lds_addr,
+            ksl,
+            kt,
+            interleaved_lds_load=False,
+        ):
             """Load one k128 from precomputed LDS bases into ``slot``."""
-            if const_expr(not interleaved_lds_load):
-                # Preserve the legacy instruction order for a clean A/B test.
+            if const_expr(a_is_fp4 or not interleaved_lds_load):
+                # Keep low-bank scale reads separate from high-bank payloads.
+                # LLVM may pair scale reads; SA_DS/SB_DS count those pairs.
                 sb_v = [
                     load_sb(lds_addr.sb, sn, ksl) for sn in range_constexpr(sb_pairs)
                 ]
@@ -1388,6 +1595,22 @@ def build_gemm_a8w4_tdm_task(
                 ]
                 slot.sb.store(Vec.from_elements(sb_v + sb_v[: SB_WIDTH - sb_pairs]))
                 slot.sa.store(Vec.from_elements(sa_v + sa_v[: SA_WIDTH - sa_pairs]))
+            if const_expr(a_is_fp4 and interleaved_lds_load):
+                # Alternate equal 32-byte A/B chunks. DS_GROUP controls only
+                # scheduling hints; it must not select the load order.
+                a_parts, b_parts = [], []
+                for pair in range_constexpr(max(wmma_m_rep, wmma_n_rep * 2)):
+                    if const_expr(pair < wmma_m_rep):
+                        a_parts.append(load_a(lds_addr.a, pair, ksl))
+                    if const_expr(pair < wmma_n_rep * 2):
+                        b_parts.append(load_b_half(lds_addr.b, pair, ksl))
+                for wm in range_constexpr(wmma_m_rep):
+                    slot.a[wm].store(a_parts[wm])
+                for wn in range_constexpr(wmma_n_rep):
+                    slot.b[wn].store(
+                        b_parts[wn * 2].shuffle(b_parts[wn * 2 + 1], list(range(16)))
+                    )
+            elif const_expr(not interleaved_lds_load):
                 for wm in range_constexpr(wmma_m_rep):
                     slot.a[wm].store(load_a(lds_addr.a, wm, ksl))
                 for wn in range_constexpr(wmma_n_rep):
@@ -1419,27 +1642,76 @@ def build_gemm_a8w4_tdm_task(
             load_nxt_fn=None,
             num_outstanding_tdm=None,
             issue_fn=None,
-            fence_fn=None,
+            wait_fn=None,
+            pre_fence_mma=0,
+            fence_mma=0,
         ):
             """Compute one k128 while optionally loading the next LDS slot."""
             reuse_cur_rmem = load_nxt_fn is not None and next_rmem is cur_rmem
+            first_rows = FRONT
+            second_rows = BACK
+            # These ranges emit real WMMAs, not scheduling hints. Never clamp
+            # invalid counts: doing so can skip or repeat accumulator updates.
+            assert isinstance(pre_fence_mma, int) and pre_fence_mma >= 0
+            assert isinstance(fence_mma, int) and fence_mma >= 0
+            assert pre_fence_mma + fence_mma <= len(first_rows) * wmma_n_rep
+            first_a = cur_rmem.a[:front_wm]
+            second_a = cur_rmem.a[front_wm:]
+
+            def emit_mma_range(start, end):
+                # Keep scale loads local to each phase and preserve the separate
+                # half-tile orders.
+                sa_k, sb_k = cur_rmem.sa.load(), cur_rmem.sb.load()
+                first_mma = len(first_rows) * wmma_n_rep
+                for half in range_constexpr(2):
+                    rows = first_rows if half == 0 else second_rows
+                    act = first_a if half == 0 else second_a
+                    offset = 0 if half == 0 else first_mma
+                    begin = max(0, start - offset)
+                    stop = min(end - offset, len(rows) * wmma_n_rep)
+                    if const_expr(begin < stop):
+                        mma_rows(
+                            rows,
+                            act,
+                            cur_rmem.b,
+                            sa_k,
+                            sb_k,
+                            start_mma=begin,
+                            end_mma=stop,
+                        )
+
+            if const_expr(pre_fence_mma > 0):
+                emit_mma_range(0, pre_fence_mma)
+                # Close the prefix region before the pipeline fence. The
+                # suffix hints must not count these WMMAs a second time.
+                rocdl.sched_mfma(pre_fence_mma)
+                rocdl.sched_barrier(0)
             if const_expr(issue_fn is not None):
                 # The carried operands may still be reading the LDS buffer
                 # that issue_fn recycles. Retire those reads before all waves
                 # rendezvous at the REUSE fence; waiting at the MMA is too late.
                 rocdl.s_wait_dscnt(0)
-            if const_expr(fence_fn is not None):
-                fence_fn()
-            elif const_expr(num_outstanding_tdm is not None):
-                pipeline_fence(outstanding=num_outstanding_tdm)
+            has_barrier = wait_fn is not None or num_outstanding_tdm is not None
+            if const_expr(has_barrier):
+                if const_expr(wait_fn is not None):
+                    wait_fn()
+                else:
+                    tdm_ops.tensor_wait(num_outstanding_tdm)
+                # TDM readiness is handled above; LDS reuse waits before signal.
+                # No global-memory publication is required by this rendezvous.
+                rocdl.s_barrier_signal(-1)
+            if const_expr(fence_mma > 0):
+                rocdl.sched_barrier(0)
+                emit_mma_range(pre_fence_mma, pre_fence_mma + fence_mma)
+                rocdl.sched_mfma(fence_mma)
+                rocdl.sched_barrier(0)
+            if const_expr(has_barrier):
+                rocdl.s_barrier_wait(-1)
             if const_expr(issue_fn is not None):
                 issue_fn()
             if const_expr(load_nxt_fn is not None and not reuse_cur_rmem):
                 load_nxt_fn()
-            sa_k, sb_k = cur_rmem.sa.load(), cur_rmem.sb.load()
-            mma_rows(FRONT, cur_rmem.a[:front_wm], cur_rmem.b, sa_k, sb_k)
-            if const_expr(len(BACK) > 0):
-                mma_rows(BACK, cur_rmem.a[front_wm:], cur_rmem.b, sa_k, sb_k)
+            emit_mma_range(pre_fence_mma + fence_mma, n_acc)
             if const_expr(reuse_cur_rmem):
                 load_nxt_fn()
 
@@ -1451,7 +1723,7 @@ def build_gemm_a8w4_tdm_task(
             next_stage_buf=None,
             my_jobs=None,
             next_stage_wait=None,
-            next_stage_fence_fn=None,
+            next_stage_wait_fn=None,
             interleaved_lds_load=False,
             kws=KWS,
         ):
@@ -1493,50 +1765,56 @@ def build_gemm_a8w4_tdm_task(
                     previous = current
                 return counts
 
-            def emit_hints(ksl, tail_mfma=0):
+            def emit_hints(ksl, tail_mfma=0, pre_fence_mma=0, mma_count=n_acc):
                 has_next = ksl + 1 < kws or (
                     ksl + 1 == kws and next_stage_lds_addr is not None
                 )
-                if const_expr(ksl == 0):
-                    rocdl.sched_dsrd(STATE_DS if not rmem_preloaded else 0)
-                # Keep one normal group for the LDS/TDM scheduling slots. Small
-                # tiles can have no more MFMAs than the requested fence tail.
-                tail_mfma = min(tail_mfma, max(0, n_acc - sched_mma_group))
-                mma_total = n_acc - tail_mfma
-                # K256 needs grouping to limit VGPR-bank switches without
-                # turning the complete A/B/scale prefetch into long LDS bursts.
-                mma_group = min(sched_mma_group, mma_total) if KWS > 1 else 1
-                first_group = min(sched_first_group, mma_total) if KWS > 1 else 1
-                remaining_mma = mma_total - first_group
-                remaining_slots = (
-                    (remaining_mma + mma_group - 1) // mma_group
-                    if remaining_mma > 0
-                    else 0
-                )
-                mma_groups = [first_group] + [
-                    min(mma_group, remaining_mma - i * mma_group)
-                    for i in range_constexpr(remaining_slots)
-                ]
-                schedule_slots = len(mma_groups)
-                future_schedule = spread(STATE_DS if has_next else 0, schedule_slots)
-                # Spread the tail issue's TDMs over the WMMA groups: one burst
-                # would block the MFMA pipe for its whole descriptor setup.
+                if const_expr(ksl == 0 and not rmem_preloaded):
+                    # Initial operands must be loaded before their first MMA.
+                    # A carried slot needs no leading DS group.
+                    rocdl.sched_dsrd(STATE_DS)
+                # The caller already scheduled ksl0_prefix_mma, or KSL1's
+                # fixed prefix + wmma_in_barrier. It also reserves the fence
+                # tail (ksl0_fence_mma on the tuned 256^3 path). FIRST is extra
+                # work after the prefix, drawn only from the remaining budget.
+                assert 0 <= pre_fence_mma <= mma_count
+                assert 0 <= tail_mfma <= mma_count - pre_fence_mma
+                mma_total = mma_count - pre_fence_mma - tail_mfma
+                mma_groups = []
+                for i in range_constexpr(mma_total + 1):
+                    if const_expr(mma_total > 0):
+                        group = sched_first_group if i == 0 else sched_mma_group
+                        count = min(group if KWS > 1 else 1, mma_total)
+                        mma_groups.append(count)
+                        mma_total -= count
+                ds_groups = []
+                ds_total = STATE_DS if has_next else 0
+                first_ds = min(sched_ds_first, ds_total)
+                if const_expr(first_ds > 0):
+                    rocdl.sched_dsrd(first_ds)
+                ds_total -= first_ds
+                if const_expr(sched_ds_group > 0 and has_next):
+                    # DS_GROUP counts native DS instructions.
+                    for offset in range_constexpr(0, ds_total, sched_ds_group):
+                        ds_groups.append(min(sched_ds_group, ds_total - offset))
+                elif const_expr(has_next):
+                    # DS_GROUP=0 distributes reads over the available MMA slots.
+                    ds_groups = spread(ds_total, max(1, len(mma_groups)))
+                schedule_slots = max(1, len(mma_groups), len(ds_groups))
+                # Spread TDM descriptor work instead of emitting one burst.
                 tdm_schedule = spread(
                     TDM_PER if (prefetch_kt is not None and ksl + 1 == kws) else 0,
                     schedule_slots,
                 )
-                first_ds = min(sched_ds_first, future_schedule[0])
+                # Once either list ends, emit the other list's remaining
+                # groups. Consecutive DS hints can become a long DS-only run.
                 for i in range_constexpr(schedule_slots):
                     if const_expr(tdm_schedule[i] > 0):
                         rocdl.sched_vmem(tdm_schedule[i])
-                    if const_expr(i == 0 and first_ds > 0):
-                        rocdl.sched_dsrd(first_ds)
-                    rocdl.sched_mfma(mma_groups[i])
-                    remaining_ds = future_schedule[i] - (first_ds if i == 0 else 0)
-                    if const_expr(remaining_ds > 0):
-                        rocdl.sched_dsrd(remaining_ds)
-                # Closing on an MFMA group is what covers the next k128's fence,
-                # so it must come out of mma_total; reordering slots does not.
+                    if const_expr(i < len(mma_groups) and mma_groups[i] > 0):
+                        rocdl.sched_mfma(mma_groups[i])
+                    if const_expr(i < len(ds_groups) and ds_groups[i] > 0):
+                        rocdl.sched_dsrd(ds_groups[i])
                 if const_expr(tail_mfma > 0):
                     rocdl.sched_mfma(tail_mfma)
 
@@ -1550,7 +1828,11 @@ def build_gemm_a8w4_tdm_task(
                 if const_expr(not is_last):
                     next_rmem = rmem_slots[(ksl + 1) % 2]
                     load_nxt_fn = lambda n=next_rmem, k=ksl + 1: load_lds_data(
-                        n, lds_addr, k, kt, interleaved_lds_load
+                        n,
+                        lds_addr,
+                        k,
+                        kt,
+                        interleaved_lds_load,
                     )
                 elif const_expr(carries):
                     next_rmem = rmem_slots[0]
@@ -1559,6 +1841,12 @@ def build_gemm_a8w4_tdm_task(
                     )
                 else:
                     next_rmem, load_nxt_fn = None, None
+                # Counts do not depend on synchronization. Without a stage
+                # wait, k_step executes the same WMMAs without a barrier.
+                pre_fence_mma = ksl1_prefence_mma if ksl == 1 else 0
+                if const_expr(ksl == 0 and kws > 1):
+                    pre_fence_mma = ksl0_prefix_mma
+                fence_mma = wmma_in_barrier if ksl == 1 else 0
                 k_step(
                     rmem_slots[ksl % 2],
                     next_rmem,
@@ -1571,10 +1859,12 @@ def build_gemm_a8w4_tdm_task(
                         if const_expr(prefetch_kt is not None and is_last)
                         else None
                     ),
-                    fence_fn=(next_stage_fence_fn if const_expr(carries) else None),
+                    wait_fn=(next_stage_wait_fn if const_expr(carries) else None),
+                    pre_fence_mma=pre_fence_mma,
+                    fence_mma=fence_mma,
                 )
-                # One region per k128: sched_group_barrier only partitions
-                # within a region, and only sched_barrier delimits one.
+                # Prefix and in-fence WMMAs have their own regions. Keep all
+                # DS/TDM hints here, but omit both sets of issued WMMAs.
                 emit_hints(
                     ksl,
                     (
@@ -1586,6 +1876,7 @@ def build_gemm_a8w4_tdm_task(
                         )
                         else 0
                     ),
+                    pre_fence_mma=pre_fence_mma + fence_mma,
                 )
                 rocdl.sched_barrier(0)
 
@@ -1650,11 +1941,6 @@ def build_gemm_a8w4_tdm_task(
             if const_expr(tdm_as_in_prologue):
                 issue_as_prologue()
                 # The first normal pipeline fence covers this oldest TDM load.
-            if const_expr(  # noqa: SIM102 - preserve DSL staging
-                cluster_m > 1 and not DISABLE_CLUSTER_SYNC
-            ):
-                if full_cluster:
-                    cluster_sync()
 
             def stage_fence(outstanding):
                 # Drain-side pipeline fence. raw_drain: the barrier orders only
@@ -1682,6 +1968,7 @@ def build_gemm_a8w4_tdm_task(
                     a_ready_gate()
                     for i in range_constexpr(num_buffers):
                         issue(i, i)
+                    init_accumulators()
                     n_steady = K_TILES - num_buffers
                     if const_expr(next_stage_on):
                         # Every rolled iteration reads the carry, so prime it here --
@@ -1720,14 +2007,6 @@ def build_gemm_a8w4_tdm_task(
                             )
                             workgroup_barrier()
                             issue(s, kt + num_buffers, my_jobs)
-                            if const_expr(  # noqa: SIM102 - preserve DSL staging
-                                cluster_m > 1 and not DISABLE_CLUSTER_SYNC
-                            ):
-                                if (  # noqa: SIM102 - preserve DSL staging
-                                    kt + 1
-                                ) % num_buffers == 0:
-                                    if full_cluster:
-                                        cluster_sync()
 
                     dispatch_wave_job(steady_post)
                     for j in range_constexpr(num_buffers):
@@ -1757,6 +2036,7 @@ def build_gemm_a8w4_tdm_task(
                     a_ready_gate()
                     for i in range_constexpr(PRE):
                         issue(i, i)
+                    init_accumulators()
                     n_steady = K_TILES - PRE
                     if const_expr(next_stage_on):
                         pipeline_fence(outstanding=TDM_PER * (PRE - 1))
@@ -1805,11 +2085,6 @@ def build_gemm_a8w4_tdm_task(
                                 for phase in range_constexpr(num_buffers):
                                     kt = ring * num_buffers + phase
                                     steady_mid_iteration(my_jobs, kt, phase)
-                                if const_expr(  # noqa: SIM102 - preserve DSL staging
-                                    not DISABLE_CLUSTER_SYNC
-                                ):
-                                    if full_cluster:
-                                        cluster_sync()
                             for phase in range_constexpr(n_steady % num_buffers):
                                 kt = (n_steady // num_buffers) * num_buffers + phase
                                 steady_mid_iteration(my_jobs, kt, phase)
@@ -1823,22 +2098,31 @@ def build_gemm_a8w4_tdm_task(
                         # epilogue, so a load issued here stays in flight.
                         item_hooks[0]["drain_start"]()
 
-                    def drain_fence(j):
-                        # Select only the immediate wait count. Both loop forms
-                        # call this at the same point in the tile's pipeline.
+                    def wait_drain_stage(outstanding):
+                        tdm_ops.tensor_wait(outstanding)
+                        if const_expr(raw_drain):
+                            rocdl.s_wait_dscnt(0)
+
+                    def wait_drain(j):
+                        # Tensor wait counts must be immediate in both loop forms.
                         if const_expr(rolled_drain and not isinstance(j, int)):
                             for wait_stage in range_constexpr(PRE):
                                 if j == wait_stage:
-                                    stage_fence(
+                                    wait_drain_stage(
                                         TDM_PER * max(0, num_buffers - 2 - wait_stage)
                                     )
                         else:
-                            stage_fence(TDM_PER * max(0, num_buffers - 2 - j))
+                            wait_drain_stage(TDM_PER * max(0, num_buffers - 2 - j))
 
                     def compute_drain_tile(j, has_next, kws=KWS):
                         kt = n_steady + j
                         if const_expr(not next_stage_on):
-                            drain_fence(j)
+                            wait_drain(j)
+                            if const_expr(raw_drain):
+                                rocdl.s_barrier_signal(-1)
+                                rocdl.s_barrier_wait(-1)
+                            else:
+                                workgroup_barrier()
                         next_stage_buf = (
                             (kt + 1) % num_buffers if const_expr(has_next) else None
                         )
@@ -1848,8 +2132,8 @@ def build_gemm_a8w4_tdm_task(
                             None,
                             next_stage_on,
                             next_stage_buf,
-                            next_stage_fence_fn=(
-                                (lambda: drain_fence(j))
+                            next_stage_wait_fn=(
+                                (lambda: wait_drain(j))
                                 if const_expr(has_next)
                                 else None
                             ),
@@ -1877,6 +2161,57 @@ def build_gemm_a8w4_tdm_task(
             # This is a compile-time selection. The interleaved version has one
             # mainloop body and no wave-parity branch.
             run_mainloop(bool(interleaved_lds_load_on))
+
+            if const_expr(k_waves > 1):
+                # Every group is past its last LDS input read once this fence
+                # retires, so each parks its partials in its own arena. Group 0
+                # adds them in group order (deterministic) and alone keeps the
+                # tile; the other groups blank their epilogue via mn_oob.
+                pipeline_fence(outstanding=0)
+                KW_CHUNKS = WMMA_VECTOR_DWORDS // 4
+                KW_LANES = num_waves * WAVE
+                kw_tid = tid % KW_LANES
+
+                def kw_off(idx, q):
+                    # Lane-contiguous dword4s: conflict-free b128 LDS traffic.
+                    return ((idx * KW_CHUNKS + q) * KW_LANES + kw_tid) * 16
+
+                if k_group > 0:
+                    for idx in range_constexpr(n_acc):
+                        v = Vec(c_frags[idx].load())
+                        for q in range_constexpr(KW_CHUNKS):
+                            lds_store_b128(
+                                stC_idx,
+                                kw_off(idx, q),
+                                Vec.from_elements(
+                                    [v[q * 4 + i] for i in range_constexpr(4)],
+                                    fx.Float32,
+                                )
+                                .bitcast(fx.Int32)
+                                .ir_value(),
+                            )
+                workgroup_barrier()
+                if k_group == 0:
+                    for idx in range_constexpr(n_acc):
+                        own = Vec(c_frags[idx].load())
+                        tot = []
+                        for q in range_constexpr(KW_CHUNKS):
+                            acc4 = Vec.from_elements(
+                                [own[q * 4 + i] for i in range_constexpr(4)],
+                                fx.Float32,
+                            )
+                            for g in range_constexpr(1, k_waves):
+                                part = Vec(
+                                    lds_load_b128(
+                                        stC_idx, g * GROUP_ARENA_B + kw_off(idx, q)
+                                    )
+                                ).bitcast(fx.Float32)
+                                acc4 = acc4 + part
+                            tot += [acc4[i] for i in range_constexpr(4)]
+                        c_frags[idx].store(
+                            Vec.from_elements(tot, fx.Float32).ir_value()
+                        )
+                mn_oob = (k_group == 0).select(mn_oob, mn_oob * 0)
 
             accs = []
             output_fragments_per_acc = WMMA_N // 16
@@ -1952,7 +2287,12 @@ def build_gemm_a8w4_tdm_task(
                 is_kgrp0 = fx.Int32(kgrp) == 0
                 # i32_n is the pre-activation gate+up width; the quantized
                 # output has half as many columns and one scale dword per K128.
-                q_dst_scale_dwpr = i32_n // 256
+                q_dst_scale_dwpr = (i32_n + 255) // 256
+                # A half-k128 output tail leaves the last scale dword's upper two
+                # bytes without an MX block; GEMM2 reads them against zero data,
+                # so they get a finite e8m0 (a stale 0xFF is NaN).
+                q_last_mx_blk = (i32_n >> 6) - 1
+                q_half_tail = (i32_n & 255) != 0
                 scale_rsrc = create_buffer_resource_from_addr(
                     fx.ptrtoint(scale_ptr),
                     num_records_bytes=(
@@ -2120,6 +2460,23 @@ def build_gemm_a8w4_tdm_task(
                                 dst_byte,
                                 mask=is_kgrp0,
                             )
+                            # Half-k128 tail (inter_dim % 128 == 64): one scale
+                            # dword carries the e8m0 of four 32-column MX blocks,
+                            # i.e. one k128 of GEMM2's K, but the last dword only
+                            # has two real blocks. GEMM2 still reads all four
+                            # bytes (against zero A data in the padded half), so
+                            # the lane that writes the last real block also fills
+                            # bytes 2..3 with 0x7F (2^0): a stale 0xFF there is
+                            # NaN, and 0 * NaN poisons the whole output row.
+                            buffer_store(
+                                fx.Int16(0x7F7F),
+                                scale_rsrc,
+                                dst_byte - byte_in_dw + 2,
+                                mask=is_kgrp0
+                                & q_half_tail
+                                & (mx_blk_is[mx_blk] == q_last_mx_blk),
+                                offset_is_bytes=True,
+                            )
             else:
                 # bf16/f16 activation (or passthrough) -> stage to LDS.
                 if const_expr(enable_ep_scatter):
@@ -2150,7 +2507,11 @@ def build_gemm_a8w4_tdm_task(
                     for wm in range_constexpr(wmma_m_rep):
                         row_rel = wmb + wm * 16 + lane16
                         _wf = _wf_rows[wm]
-                        _row_byte = row_rel * _lds_row_bytes
+                        # Past the scale lines of the chunks before this warp's.
+                        _row_byte = (
+                            row_rel * _lds_row_bytes
+                            + wnb // COMBINE_CHUNK * COMBINE_SCALE_LINE
+                        )
                         _e8m0_blks = []
                         for mx_blk in range_constexpr(_n_mx_blks):
                             _vals = []
@@ -2209,15 +2570,17 @@ def build_gemm_a8w4_tdm_task(
                                         ),
                                     )
                         # Both kgrp lanes hold the same block scales; one stores.
-                        # This row's e8m0 bytes are contiguous -- block b sits at
-                        # wnb/32 + b -- so they go out as whole dwords instead of
-                        # one masked byte store per block. Each warp owns
-                        # warp_tile_n/32 bytes starting at a multiple of that, so
-                        # a dword store stays inside this warp's own run.
+                        # This warp's e8m0 bytes are contiguous in its chunk's
+                        # scale line -- block b sits at (wnb % 256)/32 + b -- so
+                        # they go out as whole dwords instead of one masked byte
+                        # store per block. Each warp owns warp_tile_n/32 bytes
+                        # starting at a multiple of that, so a dword store stays
+                        # inside this warp's own run.
                         _sc_byte = (
-                            row_rel * _lds_scale_row_bytes
-                            + wnb // EP_SCALE_BLOCK
-                            + _ep_scale_lds_off
+                            row_rel * _lds_row_bytes
+                            + wnb // COMBINE_CHUNK * EP_CHUNK_BYTES
+                            + EP_CHUNK_PAYLOAD_BYTES
+                            + wnb % COMBINE_CHUNK // EP_SCALE_BLOCK
                         )
                         if _is_kgrp0:
                             if const_expr(_e8m0_pack_dwords):
@@ -2306,8 +2669,7 @@ def build_gemm_a8w4_tdm_task(
                 # pe*K + slot over the single base lsa_ptr(0, off). perRankSize is
                 # measured in-kernel from the lsa_ptr stride. Each wave issues the
                 # gather-stores for its row groups, 8 rows per instruction.
-                # Quantized rows are addressed in bytes, so a 4-bit element just
-                # halves the row length; the scale plane rides a second store.
+                # Quantized rows are addressed in bytes, scale lines included.
                 elem_bytes = 1 if ep_quant_bits else 2
                 _row_elems = C_ROW_BYTES if ep_quant_bits else STORE_N
                 _lds_row_elems = _lds_row_bytes if ep_quant_bits else STORE_PITCH
@@ -2337,14 +2699,8 @@ def build_gemm_a8w4_tdm_task(
                     (_lds_row_elems, 1),
                 )
                 if const_expr(ep_quant_bits):
-                    # Byte column of this tile in the payload plane: one byte per
-                    # element on the fp8 wire, half that on fp4.
-                    _elem_div = 8 // ep_quant_bits
-                    _gboff = blk_n64 // _elem_div
-                    # The scale plane starts one payload plane into the slot; blk_n
-                    # is a multiple of tile_n, itself a multiple of the scale block,
-                    # so the tile's scale run starts whole.
-                    _gboff_s = n64 // _elem_div + blk_n64 // EP_SCALE_BLOCK
+                    # The tile's first chunk in the slot.
+                    _gboff = blk_n64 // COMBINE_CHUNK * EP_CHUNK_BYTES
                 else:
                     _gboff = blk_n * elem_bytes
                 _passes = scatter_passes
@@ -2397,27 +2753,6 @@ def build_gemm_a8w4_tdm_task(
                         global_byte_offset=_gboff,
                     )
                     tensor_store_gather(desc)
-                    if const_expr(ep_quant_bits):
-                        # Same rows and slot stride as the payload store; only the
-                        # plane base and the row width differ.
-                        desc_s = make_tensor_gather_descriptor(
-                            _comb_view,
-                            _lds_c,
-                            row_indices,
-                            row_width=_lds_scale_row_bytes,
-                            tensor_dim0=EP_SCALE_ROW_BYTES,
-                            tensor_dim1=_oob.ir_value(),
-                            stride=_stride_elems,
-                            elem_bytes=1,
-                            index_size=32,
-                            lds_byte_offset=fx.index_cast(
-                                T.index,
-                                fx.Int32(_ep_scale_lds_off)
-                                + base_row * fx.Int32(_lds_scale_row_bytes),
-                            ),
-                            global_byte_offset=_gboff_s,
-                        )
-                        tensor_store_gather(desc_s)
 
                 # Let every wave issue its own groups directly. This avoids
                 # cloning every descriptor behind a wave-selection branch.
@@ -2432,6 +2767,15 @@ def build_gemm_a8w4_tdm_task(
                         issue_scatter_group(group, scatter_vector, vector_pass)
                 tdm_ops.tensor_wait(0)
             else:
+
+                def store_tile(gt, tile, lds_ptr, lds_row):
+                    # A k_waves workgroup's tile belongs to group 0 alone.
+                    if const_expr(k_waves > 1):
+                        if k_group == 0:
+                            tiled_store(gt, tile, lds_ptr, lds_row)
+                    else:
+                        tiled_store(gt, tile, lds_ptr, lds_row)
+
                 if const_expr(stage1_act):
                     out_divisor = 4 if is_fp4_quant else 2
                     out_stride = i32_n // out_divisor
@@ -2451,46 +2795,31 @@ def build_gemm_a8w4_tdm_task(
                     c_off_rt = blk_m64 * fx.Int64(out_stride) + out_col_off * 16
                     gtC = tensor_view(
                         c_iter + c_off_rt,
-                        (tile_m // 16, STORE_N * 16),
+                        ((mn_oob + 15) // 16, STORE_N * 16),
                         (out_stride * 16, 1),
                     )
-                    atomC = make_tdm_store(gtC, (mn_oob + 15) // 16, out_stride * 16)
-                    src = tensor_view(
-                        fx.recast_iter(oc_store, c_q_base_ptr),
+                    store_tile(
+                        gtC,
                         (tile_m // 16, STORE_N * 16),
-                        (STORE_N * 16, 1),
+                        fx.recast_iter(oc_store, c_q_base_ptr),
+                        STORE_N * 16,
                     )
-                    fx.copy(atomC, src, gtC)
                 else:
                     c_off_rt = c_outer_off * fx.Int64(out_stride) + out_col_off
-                    if const_expr(STORE_PAD == 0):
-                        gtC = tensor_view(
-                            c_iter + c_off_rt, (tile_m, STORE_N), (STORE_N, 1)
-                        )
-                        atomC = make_tdm_store(gtC, mn_oob, out_stride)
-                        src = tensor_view(
-                            fx.recast_iter(oc_store, c_q_base_ptr),
-                            (tile_m, STORE_N),
-                            (STORE_N, 1),
-                        )
-                    else:
-                        # The LDS tile is (tile_m, STORE_PITCH) dense; the per-dim OOB
-                        # extent clamps the inner axis to STORE_N so the pad never lands.
-                        gtC = tensor_view(
-                            c_iter + c_off_rt, (tile_m, STORE_PITCH), (out_stride, 1)
-                        )
-                        atomC = fx.rocdl.make_tdm_atom(
-                            gtC,
-                            [mn_oob, STORE_N],
-                            strides=[out_stride, None],
-                            num_warps=num_waves,
-                        )
-                        src = tensor_view(
-                            fx.recast_iter(oc_store, base_ptr),
-                            (tile_m, STORE_PITCH),
-                            (STORE_PITCH, 1),
-                        )
-                    fx.copy(atomC, src, gtC)
+                    gtC = tensor_view(
+                        c_iter + c_off_rt, (mn_oob, STORE_N), (out_stride, 1)
+                    )
+                    # The LDS tile is (tile_m, STORE_PITCH) dense; gtC's inner
+                    # extent is STORE_N, so the pad columns never reach global.
+                    # c_q_base_ptr is base_ptr unless defer_c_wait, and that
+                    # asserts stage1_act and not enable_ep_scatter -- the only
+                    # case it differs already has STORE_PAD == 0 (PITCH == N).
+                    store_tile(
+                        gtC,
+                        (tile_m, STORE_PITCH),
+                        fx.recast_iter(oc_store, c_q_base_ptr),
+                        STORE_PITCH,
+                    )
                 if const_expr(tdm_snop):
                     rocdl.s_nop(0)
                 if const_expr(not defer_c_wait):
@@ -2517,6 +2846,7 @@ def build_gemm_a8w4_tdm_task(
                 workgroup_barrier()
 
     layout = {
+        "kernel_attrs": kernel_attrs,
         "arena": ARENA_B,
         "pitch": PITCH,
         "prologue_stages": _pro_stages,
@@ -2528,11 +2858,11 @@ def build_gemm_a8w4_tdm_task(
 
 @flyc.jit
 def launch_gemm_a8w4_tdm(
-    arg_c: fx.Tensor,
+    arg_c: fx.Pointer,
     arg_a: fx.Pointer,
     arg_b: fx.Pointer,
-    arg_scale_a: fx.Tensor,
-    arg_scale_b: fx.Tensor,
+    arg_scale_a: fx.Pointer,
+    arg_scale_b: fx.Pointer,
     i32_m: fx.Int32,
     stream: fx.Stream,
     N: fx.Int32,
@@ -2553,7 +2883,7 @@ def launch_gemm_a8w4_tdm(
     f32_swiglu_limit: fx.Float32,
     stage1_quant_out: Constexpr[int] = 0,
     quant_wmma_rep: Constexpr[int] = 1,
-    arg_quant_scale: fx.Tensor = None,
+    arg_quant_scale: fx.Pointer = None,
     cluster_n: Constexpr[int] = 1,
     cluster_m: Constexpr[int] = 1,
     next_stage_prefetch: Constexpr[int] = 0,
@@ -2567,7 +2897,7 @@ def launch_gemm_a8w4_tdm(
     ep_destination_stride: Constexpr[int] = 0,
     ep_world_size: Constexpr[int] = 0,
     ep_quant_bits: Constexpr[int] = 0,
-    arg_ep_row_map: fx.Tensor = None,
+    arg_ep_row_map: fx.Pointer = None,
     f32_situ_beta: fx.Float32 = 1.0,
     f32_situ_linear_beta: fx.Float32 = 1.0,
     row_major_ascale: Constexpr[int] = 0,
@@ -2578,6 +2908,7 @@ def launch_gemm_a8w4_tdm(
     rolled_drain: Constexpr[int] = 0,
     a_preshuffled: Constexpr[int] = 0,
     m_align: Constexpr[int] = 0,
+    k_waves: Constexpr[int] = 1,
 ):
     """Launch the grouped contiguous-M a8w4 MoE GEMM for gfx1250.
 
@@ -2605,7 +2936,7 @@ def launch_gemm_a8w4_tdm(
        check -- so the callers that choose cluster_n enforce it
        (batched_gemm_mxfp4._pick_cluster_n and its assert).
     """
-    gemm_task, block, _kname, cluster_m, _ = build_gemm_a8w4_tdm_task(
+    gemm_task, block, _kname, cluster_m, layout = build_gemm_a8w4_tdm_task(
         K=K,
         tile_m=tile_m,
         tile_n=tile_n,
@@ -2641,6 +2972,7 @@ def launch_gemm_a8w4_tdm(
         rolled_drain=rolled_drain,
         a_preshuffled=a_preshuffled,
         m_align=m_align,
+        k_waves=k_waves,
     )
 
     @flyc.kernel(name=_kname, known_block_size=[block, 1, 1])
@@ -2706,15 +3038,15 @@ def launch_gemm_a8w4_tdm(
     if arg_quant_scale is None:
         arg_quant_scale = arg_c
     kargs = (
-        fx.get_iter(arg_c),
+        arg_c,
         arg_a,
         arg_b,
-        fx.get_iter(arg_scale_a),
-        fx.get_iter(arg_scale_b),
+        arg_scale_a,
+        arg_scale_b,
         arg_m_tile_map,
         arg_bias,
-        fx.get_iter(arg_quant_scale),
-        fx.get_iter(arg_ep_row_map),
+        arg_quant_scale,
+        arg_ep_row_map,
         i32_m,
         N,
         f32_swiglu_limit,
@@ -2737,7 +3069,10 @@ def launch_gemm_a8w4_tdm(
         # cluster never forms and the TDM loads silently fall back to per-load.
         launch_kernel(
             *launch_args,
-            value_attrs={"rocdl.cluster_dims": f"{cluster_n},{cluster_m},1"},
+            value_attrs={
+                **layout["kernel_attrs"],
+                "rocdl.cluster_dims": f"{cluster_n},{cluster_m},1",
+            },
         ).launch(
             grid=grid,
             block=(block, 1, 1),
@@ -2745,7 +3080,7 @@ def launch_gemm_a8w4_tdm(
             cluster=(cluster_n, cluster_m, 1),
         )
     else:
-        launch_kernel(*launch_args).launch(
+        launch_kernel(*launch_args, value_attrs=layout["kernel_attrs"]).launch(
             grid=grid, block=(block, 1, 1), stream=stream
         )
 
@@ -2755,6 +3090,3 @@ launch_gemm_a8w4_tdm.compile_hints["llvm_options"] = {
     "amdgpu-kernarg-preload": AITER_FLYDSL_KERNARG_PRELOAD,
     "amdgpu-kernarg-preload-count": AITER_FLYDSL_KERNARG_PRELOAD_COUNT,
 }
-if SUPPORT_EXPLICIT_VGPR_PARTITION:
-    launch_gemm_a8w4_tdm.compile_hints["waves_per_eu"] = 1
-    launch_gemm_a8w4_tdm.compile_hints["maxnreg"] = 1024
