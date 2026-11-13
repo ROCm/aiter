@@ -1348,6 +1348,279 @@ __launch_bounds__(Traits::kNumThreads) __global__
     }
 }
 
+// Wave-per-head reduce for wave32 GPUs (gfx1250) and 512-wide heads: decode and
+// verify tiles with few splits each (2-7 in MLA decode with a split KV), which
+// the wide kernel leaves to kn_mla_reduce_v1. On wave32, kn_mla_reduce_v1 gives
+// each (tile, head) a 2-wave workgroup, stages the split map in LDS behind a
+// barrier and loads the splits one after another, so it waits on latency and
+// moves far less than the HBM bandwidth. Here one wave owns kHeadsPerWave
+// adjacent heads of one tile (their partial rows are adjacent in memory) and
+// every lane reads float4 number c * kWave + lane of each head's row, so each
+// load instruction covers 512 contiguous bytes. Lane i holds split i's slot and
+// LSE; the weights come from a wave max / sum, and the first split's rows are
+// requested before the weights are known. No LDS and no barrier: the waves of a
+// workgroup are independent.
+template <int32_t kSizeDV_, int32_t kNumHeadQ_>
+struct MlaReduceWaveHeadTraits
+{
+    static constexpr int32_t kSizeDV        = kSizeDV_;
+    static constexpr int32_t kNumHeadQ      = kNumHeadQ_;
+    static constexpr int32_t kWaveSize      = 32; // launched on wave32 devices only
+    static constexpr int32_t kHeadsPerWave  = (kNumHeadQ % 2 == 0) ? 2 : 1;
+    static constexpr int32_t kWavesPerBlock = 4;
+    static constexpr int32_t kNumThreads    = kWaveSize * kWavesPerBlock;
+    static constexpr int32_t kVec4PerHead   = kSizeDV / (4 * kWaveSize); // float4 per lane per head
+    static constexpr int32_t kNumWaves      = kNumHeadQ / kHeadsPerWave; // per tile
+    static constexpr int32_t kBlocksPerTile = (kNumWaves + kWavesPerBlock - 1) / kWavesPerBlock;
+    // A wave walks its tile's rows and splits itself: decode / verify sizes only.
+    static constexpr int32_t kMaxRows   = 16;
+    static constexpr int32_t kMaxSplits = kWaveSize;
+    // Fewer waves than this per CU leave each wave a long serial walk over its
+    // splits; kn_mla_reduce_v1 is then faster.
+    static constexpr int32_t kMinWavesPerCu = 6;
+
+    static_assert(kSizeDV % (4 * kWaveSize) == 0);
+};
+
+template <typename Traits, typename lse_t, typename out_t>
+__launch_bounds__(Traits::kNumThreads) __global__
+    void kn_mla_reduce_v1_wave_head(const MlaReduceKernelV1Params params)
+{
+    if constexpr(opus::get_warp_size() != Traits::kWaveSize)
+    {
+        return; // never launched on wave64 devices
+    }
+    else
+    {
+        constexpr int32_t kWave = Traits::kWaveSize;
+        constexpr int32_t kHW   = Traits::kHeadsPerWave;
+        constexpr int32_t kC    = Traits::kVec4PerHead;
+        constexpr int32_t kH    = Traits::kNumHeadQ;
+        constexpr int32_t kDV   = Traits::kSizeDV;
+        using f32x4_t           = opus::vector_t<float, 4>;
+        using out4_t            = opus::vector_t<out_t, 4>;
+
+        const int32_t lane  = threadIdx.x % kWave;
+        const int32_t head0 = (blockIdx.y * Traits::kWavesPerBlock + threadIdx.x / kWave) * kHW;
+        const int32_t tile  = blockIdx.x;
+        if(head0 >= kH)
+        {
+            return;
+        }
+
+        const int32_t* p_pmap = params.p_reduce_partial_map;
+        const float* p_lse    = reinterpret_cast<const float*>(params.p_partial_lse);
+        const float* p_po     = reinterpret_cast<const float*>(params.p_partial_output);
+
+        {
+            const int32_t start = __builtin_amdgcn_readfirstlane(params.p_reduce_indptr[tile]);
+            const int32_t n =
+                __builtin_amdgcn_readfirstlane(params.p_reduce_indptr[tile + 1]) - start;
+            if(n <= 0)
+            {
+                return;
+            }
+            // Lane i holds split i's partial row (the first kWave splits).
+            const int32_t slot_l = (lane < n) ? p_pmap[start + lane] : 0;
+            const int32_t slot0  = __builtin_amdgcn_readlane(slot_l, 0);
+            // -1 marks a v1_0 tile whose only split already wrote the final output.
+            if(n == 1 && slot0 == -1)
+            {
+                return;
+            }
+            int32_t q_start, num_rows;
+            if(params.use_reduce_final_map)
+            {
+                const MlaPartialTileInfo loc = params.p_reduce_final_map[tile];
+                q_start                      = __builtin_amdgcn_readfirstlane(loc.q_start);
+                num_rows                     = __builtin_amdgcn_readfirstlane(loc.q_end) - q_start;
+            }
+            else
+            {
+                // Same qo_len rule as kn_mla_reduce_v1: one split means no rows.
+                const int32_t qo_len = (n > 1) ? (__builtin_amdgcn_readlane(slot_l, 1) - slot0) : 0;
+                q_start              = tile * qo_len;
+                num_rows             = qo_len;
+            }
+
+            // kHW heads x kC float4 of one partial row, coalesced across the wave.
+            auto load_rows = [&](const int32_t slot, const int32_t row, f32x4_t(&v)[kHW][kC]) {
+                const f32x4_t* base = reinterpret_cast<const f32x4_t*>(
+                    p_po + (int64_t(slot + row) * kH + head0) * kDV);
+#pragma unroll
+                for(int32_t hh = 0; hh < kHW; ++hh)
+                {
+#pragma unroll
+                    for(int32_t c = 0; c < kC; ++c)
+                    {
+                        v[hh][c] = base[hh * (kDV / 4) + c * kWave + lane];
+                    }
+                }
+            };
+            auto accumulate = [&](const f32x4_t(&v)[kHW][kC],
+                                  const float (&w)[kHW],
+                                  const int32_t i,
+                                  f32x4_t(&acc)[kHW][kC]) {
+#pragma unroll
+                for(int32_t hh = 0; hh < kHW; ++hh)
+                {
+                    const float s =
+                        __int_as_float(__builtin_amdgcn_readlane(__float_as_int(w[hh]), i));
+#pragma unroll
+                    for(int32_t c = 0; c < kC; ++c)
+                    {
+                        opus::static_for<4>(
+                            [&](auto j) { acc[hh][c][j.value] += s * v[hh][c][j.value]; });
+                    }
+                }
+            };
+
+            for(int32_t row = 0; row < num_rows; ++row)
+            {
+                f32x4_t acc[kHW][kC];
+#pragma unroll
+                for(int32_t hh = 0; hh < kHW; ++hh)
+                {
+#pragma unroll
+                    for(int32_t c = 0; c < kC; ++c)
+                    {
+                        acc[hh][c] = f32x4_t{0.f, 0.f, 0.f, 0.f};
+                    }
+                }
+                float sum_w[kHW], max_lse[kHW];
+
+                if(n <= kWave)
+                {
+                    float lse[kHW], w[kHW];
+#pragma unroll
+                    for(int32_t hh = 0; hh < kHW; ++hh)
+                    {
+                        lse[hh] =
+                            (lane < n) ? p_lse[int64_t(slot_l + row) * kH + head0 + hh] : -INFINITY;
+                    }
+                    // The first split's rows need only its slot: in flight while the
+                    // weights are reduced.
+                    f32x4_t v[kHW][kC];
+                    load_rows(slot0, row, v);
+#pragma unroll
+                    for(int32_t hh = 0; hh < kHW; ++hh)
+                    {
+                        const float m = aiter::warpReduce<aiter::MaxFunctor, float, kWave>(lse[hh]);
+                        max_lse[hh]   = (m == -INFINITY) ? 0.f : m;
+                        w[hh]         = (lane < n) ? __expf(lse[hh] - max_lse[hh]) : 0.f;
+                        sum_w[hh]     = aiter::warpReduce<aiter::AddFunctor, float, kWave>(w[hh]);
+                    }
+                    accumulate(v, w, 0, acc);
+                    for(int32_t i = 1; i < n; ++i)
+                    {
+                        load_rows(__builtin_amdgcn_readlane(slot_l, i), row, v);
+                        accumulate(v, w, i, acc);
+                    }
+                }
+                else
+                {
+                    // More splits than lanes (outside what the dispatcher selects
+                    // this kernel for): max over chunks of kWave, then one at a time.
+#pragma unroll
+                    for(int32_t hh = 0; hh < kHW; ++hh)
+                    {
+                        float m = -INFINITY;
+                        for(int32_t b = 0; b < n; b += kWave)
+                        {
+                            const float l =
+                                (b + lane < n)
+                                    ? p_lse[int64_t(p_pmap[start + b + lane] + row) * kH + head0 +
+                                            hh]
+                                    : -INFINITY;
+                            m = opus::max(m, aiter::warpReduce<aiter::MaxFunctor, float, kWave>(l));
+                        }
+                        max_lse[hh] = (m == -INFINITY) ? 0.f : m;
+                        sum_w[hh]   = 0.f;
+                    }
+                    for(int32_t b = 0; b < n; b += kWave)
+                    {
+                        const int32_t cnt = min(kWave, n - b);
+                        const int32_t sl  = (lane < cnt) ? p_pmap[start + b + lane] : 0;
+                        float w[kHW];
+#pragma unroll
+                        for(int32_t hh = 0; hh < kHW; ++hh)
+                        {
+                            w[hh] = (lane < cnt)
+                                        ? __expf(p_lse[int64_t(sl + row) * kH + head0 + hh] -
+                                                 max_lse[hh])
+                                        : 0.f;
+                            sum_w[hh] += aiter::warpReduce<aiter::AddFunctor, float, kWave>(w[hh]);
+                        }
+                        for(int32_t i = 0; i < cnt; ++i)
+                        {
+                            f32x4_t v[kHW][kC];
+                            load_rows(__builtin_amdgcn_readlane(sl, i), row, v);
+                            accumulate(v, w, i, acc);
+                        }
+                    }
+                }
+
+                // As kn_mla_reduce_v1: a row whose splits all have zero weight comes
+                // out as 0 with LSE +inf.
+#pragma unroll
+                for(int32_t hh = 0; hh < kHW; ++hh)
+                {
+                    const bool valid = (sum_w[hh] > 0.f) && (sum_w[hh] == sum_w[hh]);
+                    const float inv  = valid ? 1.f / sum_w[hh] : 0.f;
+                    out_t* p_row     = reinterpret_cast<out_t*>(params.p_final_output) +
+                                       int64_t(q_start + row) * params.stride_s_o +
+                                       int64_t(head0 + hh) * params.stride_h_o;
+#pragma unroll
+                    for(int32_t c = 0; c < kC; ++c)
+                    {
+                        f32x4_t r;
+                        opus::static_for<4>(
+                            [&](auto j) { r[j.value] = acc[hh][c][j.value] * inv; });
+                        const auto r_o = opus::cast<out_t>(r);
+                        out4_t o4;
+                        opus::static_for<4>([&](auto j) { o4[j.value] = r_o[j.value]; });
+                        *reinterpret_cast<out4_t*>(p_row + (c * kWave + lane) * 4) = o4;
+                    }
+                    if(params.output_lse && lane == 0)
+                    {
+                        reinterpret_cast<lse_t*>(
+                            params.p_final_lse)[int64_t(q_start + row) * kH + head0 + hh] =
+                            opus::cast<lse_t>(valid ? (__logf(sum_w[hh]) + max_lse[hh]) : INFINITY);
+                    }
+                }
+            }
+        }
+    }
+}
+
+// Whether a launch takes kn_mla_reduce_v1_wave_head: wave32, 512-wide heads,
+// decode / verify tile shapes. AITER_MLA_REDUCE_WAVE_HEAD=0 keeps
+// kn_mla_reduce_v1, =1 drops the parallelism heuristic; read once.
+template <typename Traits>
+bool mla_reduce_use_wave_head(const MlaReduceKernelV1Params& params,
+                              const hipDeviceProp_t& dev_prop,
+                              const int32_t num_cu)
+{
+    static const int env = []() {
+        const char* v = std::getenv("AITER_MLA_REDUCE_WAVE_HEAD");
+        return (v == nullptr || v[0] == '\0') ? -1 : std::atoi(v);
+    }();
+    if(env == 0)
+    {
+        return false;
+    }
+    // num_kv_splits bounds the splits of any tile; past kMaxSplits a wave would
+    // walk them one at a time.
+    const bool can_run = (dev_prop.warpSize == Traits::kWaveSize) && (params.max_seqlen_q >= 1) &&
+                         (params.max_seqlen_q <= Traits::kMaxRows) && (params.num_kv_splits >= 1) &&
+                         (params.num_kv_splits <= Traits::kMaxSplits);
+    // num_reduce_tile is the planner's (graph-batch) table size, an upper bound
+    // on the live tiles.
+    const bool enough_waves = int64_t(params.num_reduce_tile) * Traits::kNumWaves >=
+                              int64_t(num_cu) * Traits::kMinWavesPerCu;
+    return can_run && ((env == 1) || enough_waves);
+}
+
 // Whether a launch takes kn_mla_reduce_v1_wide. AITER_MLA_REDUCE_WIDE=0 keeps
 // kn_mla_reduce_v1 everywhere, =1 drops the size and split-count heuristics; read once.
 template <typename WideTraits>
@@ -1421,6 +1694,18 @@ void dispatch_mla_reduce_v1(const MlaReduceKernelV1Params& params,
                    mla_reduce_wide_lds_bytes<WideTraits>(),
                    stream>>>(params);
             return;
+        }
+
+        if constexpr(Traits::kSizeDV == 512)
+        {
+            using WaveHeadTraits = MlaReduceWaveHeadTraits<Traits::kSizeDV, Traits::kNumHeadQ>;
+            if(mla_reduce_use_wave_head<WaveHeadTraits>(params, dev_prop, num_cu))
+            {
+                const dim3 grid = dim3(params.num_reduce_tile, WaveHeadTraits::kBlocksPerTile);
+                kn_mla_reduce_v1_wave_head<WaveHeadTraits, lse_t, out_t>
+                    <<<grid, WaveHeadTraits::kNumThreads, 0, stream>>>(params);
+                return;
+            }
         }
 
         // lds_scale_cap = LDS span (in #splits) written by the massive LSE path,
