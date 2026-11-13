@@ -480,17 +480,27 @@ __device__ __forceinline__ void gemm_a16w16_4wave_body(const opus_gemm_a16w16_4w
         return __builtin_bit_cast(i32x2_t, __builtin_amdgcn_ds_read_tr16_b64_v4i16(
             reinterpret_cast<OPUS_LDS_ADDR opus::vector_t<short, 4>*>(sm_.ptr + byte_ofs)));
     };
-    // M/N-contiguous: the [e][s][h] read bases of the linear layout + the (e, h) swizzle.
-    auto load_mn = [&](auto& sm_, const auto& u_r, int wave, auto& v, auto half_, auto agpr_) {
+    // M/N-contiguous: per-lane read bases [e][h] = linear layout (s = 0) + the (e, h) swizzle, built once
+    // (like the MXFP8 u_ra(mi)); the K-step (32 W) and the half are immediates of the TR16 reads.
+    auto mn_bases = [&](const auto& u_r, int wave, auto e_) {
+        constexpr int EE = decltype(e_)::value;
+        const auto r = opus::layout_to_offsets<8>(u_r);                 // [e][s][h]
+        opus::array<int, 2 * EE> rb;
+        opus::static_for<EE>([&](auto e) { opus::static_for<2>([&](auto h) {
+            rb[e.value * 2 + h.value] = r[(e.value * 2 + 0) * 2 + h.value] + mn_r_xor<EE>(lane_id, wave, e.value, h.value);
+        }); });
+        return rb;
+    };
+    const auto rb_a_mn = mn_bases(u_ra_mn, wave_id_m, number<T::E_M>{});
+    const auto rb_b_mn = mn_bases(u_rb_mn, wave_id_n, number<T::E_N>{});
+    auto load_mn = [&](auto& sm_, const auto& rb, auto& v, auto half_, auto agpr_) {
         constexpr int EE = sizeof(v) / sizeof(v[0]), W = 64 * EE;
         constexpr int o = decltype(half_)::value * 64 * W;              // the half's offset in bytes
-        const auto r = opus::layout_to_offsets<8>(u_r);                 // [e][s][h]
         opus::static_for<EE>([&](auto e) {
             constexpr int agpr = decltype(agpr_)::value + e.value * 8;
-            auto rd = [&](int s_, int h) {
-                return tr16(sm_, r[(e.value * 2 + s_) * 2 + h] + mn_r_xor<EE>(lane_id, wave, e.value, h) + o);
-            };
-            const i32x2_t q0 = rd(0, 0), q1 = rd(0, 1), q2 = rd(1, 0), q3 = rd(1, 1);
+            const int b0 = rb[e.value * 2], b1 = rb[e.value * 2 + 1];
+            const i32x2_t q0 = tr16(sm_, b0 + o), q1 = tr16(sm_, b1 + o);
+            const i32x2_t q2 = tr16(sm_, b0 + o + 32 * W), q3 = tr16(sm_, b1 + o + 32 * W);
             const chunk16_t c0 = __builtin_shufflevector(q0, q1, 0, 1, 2, 3), c1 = __builtin_shufflevector(q2, q3, 0, 1, 2, 3);
             if constexpr (!T::PIN) {
                 v[e.value] = __builtin_shufflevector(c0, c1, 0, 1, 2, 3, 4, 5, 6, 7);
@@ -503,12 +513,12 @@ __device__ __forceinline__ void gemm_a16w16_4wave_body(const opus_gemm_a16w16_4w
     };
     auto load_a = [&](auto& sm_, auto half_) {
         constexpr int half = decltype(half_)::value;
-        if constexpr (T::A_T) load_mn(sm_, u_ra_mn, wave_id_m, v_a[half], half_, number<half * 32>{});
+        if constexpr (T::A_T) load_mn(sm_, rb_a_mn, v_a[half], half_, number<half * 32>{});
         else load_k(sm_, ra_offs, v_a[half], sa_offset(0, half), number<half * 32>{});
     };
     auto load_b = [&](auto& sm_, auto half_) {
         constexpr int half = decltype(half_)::value;
-        if constexpr (T::B_T) load_mn(sm_, u_rb_mn, wave_id_n, v_b[half], half_, number<64 + half * 32>{});
+        if constexpr (T::B_T) load_mn(sm_, rb_b_mn, v_b[half], half_, number<64 + half * 32>{});
         else load_k(sm_, rb_offs, v_b[half], sb_offset(0, half), number<64 + half * 32>{});
     };
 
