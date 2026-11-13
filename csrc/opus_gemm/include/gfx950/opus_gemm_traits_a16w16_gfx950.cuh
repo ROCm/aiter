@@ -760,3 +760,130 @@ struct opus_gemm_mono_tile_kargs_gfx950 {
     int stride_c_batch;
 };
 #endif
+
+// ============================================================================
+// 4-wave pinned-register pipeline: opus_gemm_pipeline_a16w16_4wave_gfx950.cuh
+// ============================================================================
+//
+// C[b] = A[b] * B[b]^T for all four storage layouts of A [M, K] and B [N, K]:
+//   A_T = false: A stored [M, K] (K contiguous)   A_T = true: A stored [K, M] (M contiguous)
+//   B_T = false: B stored [N, K] (K contiguous)   B_T = true: B stored [K, N] (N contiguous)
+// i.e. (A_T, B_T) = (0, 0) NT, (0, 1) NN, (1, 0) TT, (1, 1) TN in BLAS terms of C = A x B.
+//
+// 4 waves (2 x 2), tile B_M x B_N x 64 with B_M, B_N in {64, 128, 256}; each wave owns
+// E_M x E_N 16x16 fragments in each of the 4 (half M) x (half N) quadrants; MFMA 16x16x32 bf16.
+// A / B operands and C are pinned to fixed AGPR / VGPR ranges ([[clang::amdgpu_pin_agpr]]),
+// which needs the AGPR-pinning toolchain; the device code is built offline (gen_co).
+//
+// Requirements: K % 64 == 0, K / 64 >= 2 per split; leading dimensions (stride_a / stride_b)
+// multiples of 8 elements (16-byte rows). M and N are arbitrary (OOB reads return 0, C stores
+// are masked). Strides are in elements.
+template<int B_M_, int B_N_,
+         bool A_T_, bool B_T_,
+         typename D_C_ = opus::bf16_t,
+         bool SPLITK_ = false,
+         bool HAS_BIAS_ = false>
+struct opus_gemm_a16w16_4wave_traits_gfx950 {
+    using D_A = opus::bf16_t;
+    using D_B = opus::bf16_t;
+    using D_C = D_C_;
+    using D_ACC = opus::fp32_t;
+    static constexpr bool A_T = A_T_;
+    static constexpr bool B_T = B_T_;
+    static constexpr bool SPLITK = SPLITK_;
+    static constexpr bool HAS_BIAS = HAS_BIAS_;
+    // Written by the kernel: C itself, or (SPLITK) fp32 partial sums into the workspace.
+    using D_OUT = std::conditional_t<SPLITK, opus::fp32_t, D_C>;
+    using D_BIAS = D_C;                                                   // bias dtype matches the output (aiter convention)
+    static_assert(std::is_same_v<D_C, opus::bf16_t> || std::is_same_v<D_C, opus::fp32_t>, "D_C: bf16 or fp32");
+    static_assert(!(SPLITK && HAS_BIAS), "split-K: the bias is folded in by splitk_reduce_kernel");
+
+    static constexpr int BLOCK_SIZE = 256;
+    static constexpr int WARP_SIZE = 64;
+    static constexpr int NUM_WAVES = BLOCK_SIZE / WARP_SIZE;              // 4
+
+    static constexpr int B_M = B_M_;
+    static constexpr int B_N = B_N_;
+    static constexpr int B_K = 64;                                        // bf16 elements
+    static constexpr int B_K_BYTES = B_K * 2;                             // 128: one LDS row
+
+    static constexpr int T_M = 2;
+    static constexpr int T_N = 2;
+    static constexpr int T_K = 1;
+    static_assert(NUM_WAVES == T_M * T_N * T_K);
+
+    static constexpr int W_M = 16;
+    static constexpr int W_N = 16;
+    static constexpr int W_K = 32;                                        // 16x16x32 bf16 MFMA
+
+    static constexpr int HALF_B_M = B_M / 2;
+    static constexpr int HALF_B_N = B_N / 2;
+    static constexpr int E_M = HALF_B_M / (W_M * T_M);                    // 1, 2, 4
+    static constexpr int E_N = HALF_B_N / (W_N * T_N);
+    static_assert(E_M >= 1 && E_N >= 1 && E_M <= 4 && E_N <= 4 && (E_M & (E_M - 1)) == 0 && (E_N & (E_N - 1)) == 0
+                  && HALF_B_M == 32 * E_M && HALF_B_N == 32 * E_N, "tile = 2 halves x 2 waves x E x 16, E in {1, 2, 4}");
+
+    // Copies are 16 bytes per lane (buffer_load ... lds); one wave issue = 1 KB.
+    static constexpr int VEC_A = 16;                                      // bytes
+    static constexpr int VEC_B = 16;
+    static constexpr int VEC_A_ELEMS = VEC_A / 2;                         // 8 bf16
+    // One MFMA operand register set per lane: 2 K-steps x 8 bf16 = 32 bytes = E_C chunks of 16 bytes.
+    static constexpr int E_C = 2;
+    static constexpr int VEC_C = 4;
+
+    static constexpr int smem_padding = 0;
+    static constexpr int smem_linear_wave_a = WARP_SIZE * VEC_A;          // 1024
+    static constexpr int smem_linear_wave_b = WARP_SIZE * VEC_B;
+    static constexpr int smem_sub_a = smem_linear_wave_a / B_K_BYTES;     // 8 rows per 1 KB chunk
+    static constexpr int smem_sub_b = smem_linear_wave_b / B_K_BYTES;
+    static constexpr int smem_m_rep = HALF_B_M / smem_sub_a;
+    static constexpr int smem_n_rep = HALF_B_N / smem_sub_b;
+    // buffer_load ... lds per wave per half tile per K tile (both layouts move HALF x 128 bytes).
+    static constexpr int a_buffer_load_insts = HALF_B_M * B_K_BYTES / (BLOCK_SIZE * VEC_A);   // E_M
+    static constexpr int b_buffer_load_insts = HALF_B_N * B_K_BYTES / (BLOCK_SIZE * VEC_B);   // E_N
+
+    // LDS: 2 stages x 2 halves of A and B; the C staging of the epilogue reuses it. C is staged as one
+    // D_OUT image of the tile (rows padded by 8 elements) when it fits, else (256 x 256 fp32) quadrant by
+    // quadrant in 2 alternating regions of HALF_B_M x (HALF_B_N + 8).
+    static constexpr int SMEM_A_BYTES = smem_m_rep * (smem_linear_wave_a + smem_padding) * 4;
+    static constexpr int SMEM_B_BYTES = smem_n_rep * (smem_linear_wave_b + smem_padding) * 4;
+    static constexpr int C_IMAGE_BYTES = B_M * (B_N + 8) * static_cast<int>(sizeof(D_OUT));
+    static constexpr bool C_STAGE_FULL = C_IMAGE_BYTES <= 163840;
+    static constexpr int C_STAGE_BYTES = C_STAGE_FULL ? C_IMAGE_BYTES : 2 * HALF_B_M * (HALF_B_N + 8) * static_cast<int>(sizeof(D_OUT));
+    static constexpr int LDS_BYTES = (SMEM_A_BYTES + SMEM_B_BYTES) > C_STAGE_BYTES ? (SMEM_A_BYTES + SMEM_B_BYTES) : C_STAGE_BYTES;
+    static_assert(LDS_BYTES <= 163840);
+
+    // Schedule: LDS reads per half-operand (2 per K-contiguous operand, 4 per TR16 one), at most CAP per MFMA pair.
+    static constexpr int SCHED_C00CAP = 2;
+    static constexpr int SCHED_C01CAP = 1;
+    static constexpr int SCHED_C11CAP = 1;
+};
+
+// Kernel arguments of the 4-wave pipeline (all strides in elements).
+//   ptr_a : bf16 [batch][M][K] (A_T: [batch][K][M]), row pitch stride_a, batch pitch stride_a_batch
+//   ptr_b : bf16 [batch][N][K] (B_T: [batch][K][N]), row pitch stride_b, batch pitch stride_b_batch
+//   ptr_c : D_C  [batch][M][N], row pitch stride_c, batch pitch stride_c_batch
+//   ptr_ws, split_k, stride_ws*: fp32 [split_k][batch][padded_M][padded_N] partial sums (SPLITK);
+//           the layout of splitk_reduce_gfx950.cuh (padded_* = round up to the tile)
+//   ptr_bias, stride_bias_batch: per-N bias (HAS_BIAS, not SPLITK; SPLITK folds it in the reduce)
+struct opus_gemm_a16w16_4wave_kargs_gfx950 {
+    const void* __restrict__ ptr_a;
+    const void* __restrict__ ptr_b;
+    void* __restrict__ ptr_c;
+    void* __restrict__ ptr_ws;
+    const void* __restrict__ ptr_bias;
+    int m;
+    int n;
+    int k;
+    int batch;
+    int split_k;
+    int stride_a;
+    int stride_b;
+    int stride_c;
+    int stride_ws;
+    int stride_a_batch;
+    int stride_b_batch;
+    int stride_c_batch;
+    int stride_ws_batch;
+    int stride_bias_batch;
+};
