@@ -114,7 +114,7 @@ to the same `_execute_a16w16` planner/executor used by A16W16 GEMM.
 
 | Registry family | Current route | Public operation and dtype rules |
 |---|---|---|
-| `a16w16` | gfx942, gfx950, gfx1250 | GEMM or BMM; BF16 `XQ/WQ`, normally BF16 or FP32 `Y`, plain WQ, optional bias/split-K/Torch workspace; gfx942 BF16-workspace exact kids require BF16 `Y` |
+| `a16w16` | gfx942, gfx950, gfx1250 | GEMM or BMM; BF16 `XQ/WQ`, normally BF16 or FP32 `Y`, plain WQ, optional bias/split-K/Torch workspace; gfx942 BF16-workspace exact kids require BF16 `Y`. gfx950 4-wave kids 1000-1015 (BF16 `Y`) also take M/N-contiguous `XQ`/`WQ` views (NT/NN/TT/TN picked from the strides; see `csrc/opus_gemm/gen_co/README.md`) |
 | `a8w8` | gfx950 kid 2 | GEMM only; FP8 `XQ/WQ`, FP32 `Y`, plain WQ, no scales |
 | `a8w8_blockscale` | gfx950 kid 1 | GEMM only; FP8 `XQ/WQ`, FP32 `Y`, plain WQ, two FP32 scales |
 | `a8w8_blockscale_bpreshuffle` | gfx942 kid 11000 | GEMM only; FP8 `XQ/WQ`, BF16 `Y`, pre-shuffled WQ, two FP32 scales |

@@ -207,9 +207,10 @@ specialization that writes partial sums. Its direct BF16/FP32
 | `opus_gemm_common.py` | canonical registry, unique route map and compile-floor constants |
 | `gen_instances.py` | subset selection, manifests and typed dispatch generation |
 | `codegen/gen_instances_gfx*.py` | exact-instance host launchers and generated input checks |
-| `gen_co/` | offline CO manifest/builder, build metadata and packaged gfx1250 ELF images |
+| `gen_co/` | offline CO manifests/builder, build metadata and packaged gfx1250 / gfx950 ELF images |
 | `include/gfx950/opus_bmm_*` | MXFP8 BMM traits, launchers and pipelines |
 | `include/gfx1250/opus_co_launch_gfx1250.cuh` | first-use CO loader and cluster launcher |
+| `include/gfx950/opus_co_launch_gfx950.cuh` | first-use loader of the gfx950 a16w16 4-wave images |
 | `include/gfx*/opus_gemm_arch_*.cuh` | sorted exact-kid tables |
 | `include/gfx*/**/opus_gemm_traits*.cuh` | kernel arguments and traits |
 
