@@ -17,7 +17,7 @@
 //   * PIN: A operands live in a[0:63], B operands in a[64:127], C in a[128:255] + v[128:...] (pinned;
 //     needed by the large tiles). PIN = false leaves registers to the allocator (small tiles: fewer
 //     registers -> WG_PER_CU workgroups per CU) and builds with stock ROCm clang.
-//   * C (bf16, + optional bias) is written back through LDS (image rows padded by 8), one quadrant at a
+//   * C (bf16) is written back through LDS (image rows padded by 8), one quadrant at a
 //     time. Split-K: each split writes its fp32 partial tile into the workspace of
 //     splitk_reduce_gfx950.cuh, whose reduce kernel produces C.
 #pragma once
@@ -235,7 +235,6 @@ __device__ __forceinline__ void gemm_a16w16_4wave_body(const opus_gemm_a16w16_4w
     using D_C = typename T::D_C;
     using D_ACC = typename T::D_ACC;
     using D_OUT = typename T::D_OUT;    // bf16 C, or fp32 partial sums (SPLITK)
-    using D_BIAS = typename T::D_BIAS;
     using D_AB = opus::u8_t;            // operands are addressed in bytes
     static_assert(!T::PIN || OPUS_A16W16_4WAVE_HAS_PIN, "PIN instances need the AGPR-pinning toolchain ([[clang::amdgpu_pin_agpr]])");
 
@@ -600,29 +599,11 @@ __device__ __forceinline__ void gemm_a16w16_4wave_body(const opus_gemm_a16w16_4w
             }
         }
     };
-    // Bias (per output column, fp32 add before the cast): the E_N column groups of this lane in both
-    // halves of N, loaded up front (columns >= N read 0).
-    using BiasV = opus::vector_t<D_BIAS, T::VEC_C>;
-    BiasV v_bias[2][T::E_N];
-    if constexpr (T::HAS_BIAS) {
-        auto g_bias = make_gmem(uniform_ptr(reinterpret_cast<const D_BIAS*>(kargs.ptr_bias) + batch_id * kargs.stride_bias_batch + col),
-                                __builtin_amdgcn_readfirstlane(static_cast<unsigned int>(((kargs.n - col) * sizeof(D_BIAS) + 3) & ~3u)));   // range checks are per dword: keep the dword of an odd last column
-        const auto sc_offs = opus::layout_to_offsets<T::VEC_C>(u_sc);   // fragment f = m * E_N + n
-        opus::static_for<2>([&](auto hn) { opus::static_for<T::E_N>([&](auto n) {
-            v_bias[hn.value][n.value] = g_bias.template load<T::VEC_C>(hn.value * T::HALF_B_N + sc_offs[n.value] % c_lds_stride);
-        }); });
-    }
     auto store_quadrant = [&](const auto& acc, auto half_tile_m_, auto half_tile_n_) {
         constexpr int hm = decltype(half_tile_m_)::value, hn = decltype(half_tile_n_)::value;
         typename MMA::vtype_c quad;
         opus::static_for<T::E_M * T::E_N>([&](auto f) {
-            auto frag = acc[f.value];
-            if constexpr (T::HAS_BIAS) {
-                opus::static_for<T::VEC_C>([&](auto j) {
-                    frag[j.value] += static_cast<float>(v_bias[hn][f.value % T::E_N][j.value]);
-                });
-            }
-            opus::set_slice(quad, frag, opus::number<f.value * MMA::mma_c_len>{}, opus::number<(f.value + 1) * MMA::mma_c_len>{});
+            opus::set_slice(quad, acc[f.value], opus::number<f.value * MMA::mma_c_len>{}, opus::number<(f.value + 1) * MMA::mma_c_len>{});
         });
         if constexpr (!FULL && hn == 1) {   // region hm is reused: every wave is done copying (hm, 0) out
             s_waitcnt_lgkmcnt(0_I);

@@ -3190,7 +3190,7 @@ _A16W16_4WAVE_LAUNCHER = r"""// SPDX-License-Identifier: MIT
 //
 // Auto-generated. Do not edit. See codegen/gen_instances_gfx950.py:gen_a16w16_4wave_instance.
 // Pre-built gfx950 4-wave kid: host launcher only; the device images live in
-// gen_co/gfx950/@NAME@_<nt|nn|tt|tn>[_bias].co (gen_co/build_co.py --arch gfx950).
+// gen_co/gfx950/@NAME@_<nt|nn|tt|tn>.co (gen_co/build_co.py --arch gfx950).
 #pragma once
 #if !defined(__HIP_DEVICE_COMPILE__) && !defined(__HIPCC_RTC__)
 #include "aiter_tensor.h"
@@ -3287,7 +3287,7 @@ void
     kargs.stride_a_batch = static_cast<int>(stride_a_batch);
     kargs.stride_b_batch = static_cast<int>(stride_b_batch);
     kargs.stride_c_batch = static_cast<int>(M * N);
-    // Image <symbol>_<layout>[_bias]; layout index = A_T * 2 + B_T.
+    // Image <symbol>_<layout>; layout index = A_T * 2 + B_T.
     static const char* const kImages[@NUM_IMAGES@] = {@IMAGES@};
     const int layout = (a_t ? 2 : 0) + (b_t ? 1 : 0);
     auto stream = aiter::getCurrentHIPStream();
@@ -3304,10 +3304,7 @@ _A16W16_4WAVE_DIRECT_LAUNCH = """
     AITER_CHECK(reinterpret_cast<uintptr_t>(Y.data_ptr()) % 16 == 0,
         "@NAME@: the direct 4wave kernel needs a 16-byte aligned Y");
     kargs.split_k = 1;
-    kargs.ptr_bias = ptr_bias_;
-    kargs.stride_bias_batch = stride_bias_batch_;
-    AiterAsmKernelFast& kernel = opus_gfx950_co::co_kernel(
-        kImages[layout * 2 + (bias.has_value() ? 1 : 0)], XQ.device_id);
+    AiterAsmKernelFast& kernel = opus_gfx950_co::co_kernel(kImages[layout], XQ.device_id);
     opus_gfx950_co::launch(kernel, dim3(static_cast<unsigned>(tiles_m * tiles_n), 1,
                                         static_cast<unsigned>(batch)),
                            BLOCK_SIZE, kargs, stream);"""
@@ -3367,7 +3364,7 @@ def gen_a16w16_4wave_instance(
 ):
     """Emit the host launcher of one pre-built gfx950 4-wave kid.
 
-    a16w16_4wave uses the five-argument direct ABI (bias fused in the kernel),
+    a16w16_4wave uses the five-argument direct ABI (no bias: use the _ws kids),
     a16w16_4wave_ws the workspace ABI (fp32 split-K partials, then the shared
     gfx950 splitk_reduce_kernel adds the bias and writes bf16 Y). No device
     instantiation is emitted: each image is loaded at first use per device.
@@ -3376,12 +3373,8 @@ def gen_a16w16_4wave_instance(
 
     workspace = k.kernel_tag == "a16w16_4wave_ws"
     images = a16w16_4wave_co_images(k)
-    # The launcher indexes kImages as layout * (2 if direct) + bias.
-    expected = [
-        (layout, bias)
-        for layout in ("nt", "nn", "tt", "tn")
-        for bias in ((False,) if workspace else (False, True))
-    ]
+    # The launcher indexes kImages by layout.
+    expected = [(layout, False) for layout in ("nt", "nn", "tt", "tn")]
     assert [(layout, bias) for layout, bias, _ in images] == expected, images
     if workspace and k.splitk_workspace_dtype != "fp32_t":
         raise ValueError(f"{k.name}: the 4wave workspace kid needs fp32_t storage")
@@ -3400,7 +3393,14 @@ def gen_a16w16_4wave_instance(
             if workspace
             else "the direct launcher writes bf16 Y",
         )
-        .replace("@BIAS_HOST_VALIDATE@", BIAS_HOST_VALIDATE)
+        .replace(
+            "@BIAS_HOST_VALIDATE@",
+            BIAS_HOST_VALIDATE
+            if workspace
+            else '    AITER_CHECK(!bias.has_value(),\n'
+            '        "@NAME@: bias is not supported on the direct a16w16_4wave kid; "\n'
+            '        "use an a16w16_4wave_ws kid (the split-K reduce adds it, split_k 1 included)");',
+        )
         .replace("@NUM_IMAGES@", str(len(images)))
         .replace("@IMAGES@", ", ".join(f'"{symbol}"' for _, _, symbol in images))
         .replace("@TRAITS_HEADER@", traits_header)

@@ -4,7 +4,7 @@
 // Runtime loader for the pre-built gfx950 a16w16 4-wave code objects
 // (gen_co/gfx950/<symbol>.co, built by gen_co/build_co.py --arch gfx950).
 // Host pass only. One .co holds exactly one extern "C" kernel whose name equals
-// the file stem; its kernarg is opus_gemm_a16w16_4wave_kargs_gfx950 (96 bytes).
+// the file stem; its kernarg is opus_gemm_a16w16_4wave_kargs_gfx950 (88 bytes).
 #pragma once
 
 #include "opus_gemm_traits_a16w16_gfx950.cuh"
@@ -28,8 +28,8 @@
 
 namespace opus_gfx950_co {
 
-static_assert(sizeof(opus_gemm_a16w16_4wave_kargs_gfx950) == 96,
-              "pre-built gfx950 4wave images expect a 96-byte kernarg segment");
+static_assert(sizeof(opus_gemm_a16w16_4wave_kargs_gfx950) == 88,
+              "pre-built gfx950 4wave images expect an 88-byte kernarg segment");
 
 inline std::string co_dir() {
     const char* env = std::getenv("OPUS_GEN_CO_DIR");

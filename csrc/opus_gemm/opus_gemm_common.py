@@ -2917,12 +2917,9 @@ def _a16w16_4wave_gfx950(tag, bm, bn):
 
 def a16w16_4wave_co_images(instance):
     """Return [(layout, has_bias, symbol)] of every image one kid launches."""
-    variants = (False, True) if instance.kernel_tag == "a16w16_4wave" else (False,)
-    return [
-        (layout, bias, f"{instance.name}_{layout}{'_bias' if bias else ''}")
-        for layout in A16W16_4WAVE_LAYOUTS
-        for bias in variants
-    ]
+    # One image per layout; no bias images: a bias goes through the split-K
+    # (_ws) kids, whose reduce adds it (as for the other gfx950 a16w16 families).
+    return [(layout, False, f"{instance.name}_{layout}") for layout in A16W16_4WAVE_LAYOUTS]
 
 
 def a16w16_4wave_co_image_paths(instance, json_path=None):
@@ -3186,7 +3183,7 @@ def _in_group(name, family, instance):
             "SPLITK_KIDS": workspace,
             "NON_SPLITK_KIDS": not workspace,
             "BIAS_AWARE_KIDS": workspace
-            or instance.kernel_tag in ("a16w16", "a16w16_4wave"),
+            or instance.kernel_tag == "a16w16",
             "GFX1250_4WAVE_CO_KIDS": instance.kernel_tag in _A16W16_CO_TAGS,
             "GFX950_A16W16_4WAVE_KIDS": instance.kernel_tag
             in _A16W16_4WAVE_GFX950_TAGS,

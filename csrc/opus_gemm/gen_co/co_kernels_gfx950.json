@@ -7,14 +7,14 @@
     "Per-entry fields:",
     "  kid   explicit local a16w16/gfx950 kid (registered for every gfx950 CU namespace);",
     "        kept >= 1000, clear of the JIT-built gfx950 kids.",
-    "  tag   a16w16_4wave    : direct launcher (bf16 Y, optional bias fused in the kernel, split_k 0/1).",
+    "  tag   a16w16_4wave    : direct launcher (bf16 Y, no bias, split_k 0/1).",
     "        a16w16_4wave_ws : workspace launcher, always fp32 split-K partials + splitk_reduce_kernel",
     "                          (bias folded by the reduce), split_k >= 1.",
     "  tile  [B_M, B_N], each in {64, 128, 256}; B_K = 64, 256 threads. PIN / WG_PER_CU are the",
     "        traits defaults (pinned registers and 1 WG/CU for tiles larger than 128x128).",
     "",
     "One kid carries every layout as a separate image; the launcher picks one from the tensor",
-    "strides at runtime: <kid symbol>_<nt|nn|tt|tn>[_bias].co under gen_co/gfx950/",
+    "strides at runtime: <kid symbol>_<nt|nn|tt|tn>.co under gen_co/gfx950/",
     "(nt = A [M,K], B [N,K]; nn = B stored [K,N]; tt = A stored [K,M]; tn = both)."
   ],
   "gfx950": [

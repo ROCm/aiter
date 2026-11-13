@@ -776,14 +776,14 @@ struct opus_gemm_mono_tile_kargs_gfx950 {
 // which needs the AGPR-pinning toolchain; the device code is built offline (gen_co).
 //
 // Output C is bf16. SPLITK: the kernel writes fp32 partial sums into the workspace and
-// splitk_reduce_kernel (splitk_reduce_gfx950.cuh) sums them (+ bias) into C.
+// splitk_reduce_kernel (splitk_reduce_gfx950.cuh) sums them into C and adds the optional bias
+// (a bias is only supported through split-K kids, as for the other gfx950 a16w16 families).
 // Requirements: K % 64 == 0, K / 64 >= 2 per split; leading dimensions (stride_a / stride_b)
 // multiples of 8 elements (16-byte rows). M and N are arbitrary (OOB reads return 0, C stores
 // are masked). Strides are in elements.
 template<int B_M_, int B_N_,
          bool A_T_, bool B_T_,
          bool SPLITK_ = false,
-         bool HAS_BIAS_ = false,
          // Large tiles (> 128 x 128) pin operands / C to fixed AGPR / VGPR ranges (they need every register);
          // small tiles leave registers to the allocator (~100-200 registers -> 2 workgroups per CU).
          bool PIN_ = (B_M_ * B_N_ > 128 * 128),
@@ -796,13 +796,10 @@ struct opus_gemm_a16w16_4wave_traits_gfx950 {
     static constexpr bool A_T = A_T_;
     static constexpr bool B_T = B_T_;
     static constexpr bool SPLITK = SPLITK_;
-    static constexpr bool HAS_BIAS = HAS_BIAS_;
     static constexpr bool PIN = PIN_;
     static constexpr int WG_PER_CU = WG_PER_CU_;
     // Written by the kernel: C itself, or (SPLITK) fp32 partial sums into the workspace.
     using D_OUT = std::conditional_t<SPLITK, opus::fp32_t, D_C>;
-    using D_BIAS = D_C;                                                   // bf16 bias [N] (aiter convention: matches C)
-    static_assert(!(SPLITK && HAS_BIAS), "split-K: the bias is folded in by splitk_reduce_kernel");
 
     static constexpr int BLOCK_SIZE = 256;
     static constexpr int WARP_SIZE = 64;
@@ -871,13 +868,11 @@ struct opus_gemm_a16w16_4wave_traits_gfx950 {
 //   ptr_c : bf16 [batch][M][N], row pitch stride_c, batch pitch stride_c_batch
 //   ptr_ws, split_k, stride_ws*: fp32 [split_k][batch][padded_M][padded_N] partial sums (SPLITK);
 //           the layout of splitk_reduce_gfx950.cuh (padded_* = round up to the tile)
-//   ptr_bias, stride_bias_batch: per-N bias (HAS_BIAS, not SPLITK; SPLITK folds it in the reduce)
 struct opus_gemm_a16w16_4wave_kargs_gfx950 {
     const void* __restrict__ ptr_a;
     const void* __restrict__ ptr_b;
     void* __restrict__ ptr_c;
     void* __restrict__ ptr_ws;
-    const void* __restrict__ ptr_bias;
     int m;
     int n;
     int k;
@@ -891,5 +886,4 @@ struct opus_gemm_a16w16_4wave_kargs_gfx950 {
     int stride_b_batch;
     int stride_c_batch;
     int stride_ws_batch;
-    int stride_bias_batch;
 };

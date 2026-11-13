@@ -2,7 +2,7 @@
 # Copyright (C) 2025-2026, Advanced Micro Devices, Inc. All rights reserved.
 """gfx950 a16w16 4-wave kids (pre-built .co device images, gen_co/gfx950).
 
-Kids 1000-1007 (``a16w16_4wave``) launch directly (bias fused in the kernel);
+Kids 1000-1007 (``a16w16_4wave``) launch directly (no bias);
 kids 1008-1015 (``a16w16_4wave_ws``) always write fp32 split-K partials into a
 workspace and reduce them (bias folded by the reduce). Every kid detects the
 operand layout (NT / NN / TT / TN) from the tensor strides at runtime.
@@ -100,17 +100,15 @@ def test_registry_declares_16_kids_with_images():
         assert inst.kernel_tag == ("a16w16_4wave_ws" if workspace else "a16w16_4wave")
         assert inst.splitk_workspace_dtype == ("fp32_t" if workspace else None)
         images = a16w16_4wave_co_images(inst)
-        assert len(images) == (4 if workspace else 8)
-        assert [layout for layout, _, _ in images[:: 1 if workspace else 2]] == list(
-            A16W16_4WAVE_LAYOUTS
-        )
+        assert len(images) == 4   # one image per layout, no bias images
+        assert [layout for layout, _, _ in images] == list(A16W16_4WAVE_LAYOUTS)
         for path in a16w16_4wave_co_image_paths(inst):
             assert os.path.isfile(path), path
             assert os.path.dirname(path) == os.path.join(
                 os.path.dirname(CO_KERNELS_GFX950_JSON), "gfx950"
             )
     # 8 tiles x (8 + 4) images
-    assert sum(len(a16w16_4wave_co_images(i)) for i in gfx950_a16w16_4wave_kernels_declared.values()) == 96
+    assert sum(len(a16w16_4wave_co_images(i)) for i in gfx950_a16w16_4wave_kernels_declared.values()) == 64
 
 
 @pytest.mark.parametrize("cu_num", (128, 256))
@@ -119,7 +117,8 @@ def test_registry_namespaces_and_groups(cu_num):
     assert set(DIRECT_KIDS + WS_KIDS) <= set(registry)
     assert {"a16w16_4wave", "a16w16_4wave_ws"} <= OPUS_KERNEL_TAGS_BY_ARCH_FAMILY["gfx950"]["a16w16"]
     assert set(DIRECT_KIDS + WS_KIDS) <= DEFAULT_COMPILED_KIDS_BY_NAMESPACE[("gfx950", cu_num)]
-    assert set(DIRECT_KIDS + WS_KIDS) <= group_kids("BIAS_AWARE_KIDS", "gfx950", cu_num=cu_num)
+    bias_aware = group_kids("BIAS_AWARE_KIDS", "gfx950", cu_num=cu_num)
+    assert set(WS_KIDS) <= bias_aware and not (set(DIRECT_KIDS) & bias_aware)   # bias only via _ws
     assert set(WS_KIDS) <= group_kids("SPLITK_KIDS", "gfx950", cu_num=cu_num)
     assert set(DIRECT_KIDS) <= group_kids("NON_SPLITK_KIDS", "gfx950", cu_num=cu_num)
     for kid in DIRECT_KIDS + WS_KIDS:
@@ -180,32 +179,29 @@ def test_plan_rejections():
 
 @requires_gfx950
 @pytest.mark.parametrize("kid", DIRECT_KIDS)
-def test_direct_kid_all_layouts_bias(kid):
+def test_direct_kid_all_layouts(kid):
     gen = torch.Generator(device="cuda").manual_seed(kid)
     cases = (
         # batch, M, N, K, pad (odd M/N, padded leading dims, batch > 1)
         (1, 193, 136, 256, 8),
         (2, 64, 264, 512, 0),
         (3, 301, 72, 384, 24),
-        (1, 77, 131, 256, 8),   # odd N: column-N tail stored per element, odd-length bias
+        (1, 77, 131, 256, 8),   # odd N: column-N tail stored per element
         (2, 129, 7, 384, 0),
     )
     for layout, (a_t, b_t) in LAYOUTS.items():
         for batch, M, N, K, pad in cases:
             A = _operand(batch, M, K, a_t, pad, gen)
             B = _operand(batch, N, K, b_t, pad, gen)
-            for bias_kind in (None, "1d", "2d"):
-                bias = None
-                if bias_kind == "1d":
-                    bias = torch.randn((N,), generator=gen, device="cuda").to(torch.bfloat16)
-                elif bias_kind == "2d":
-                    bias = torch.randn((batch, N), generator=gen, device="cuda").to(torch.bfloat16)
-                Y = torch.full((batch, M, N), float("nan"), device="cuda", dtype=torch.bfloat16)
-                out = opus_bmm(A, B, Y, family="a16w16", kid=kid, bias=bias)
-                torch.cuda.synchronize()
-                assert out is Y
-                golden = _golden(A, B, None if bias is None else bias.view(-1, 1, N) if bias.dim() == 2 else bias)
-                _assert_close(Y, golden, f"kid {kid} {layout} b{batch} {M}x{N}x{K} pad{pad} bias={bias_kind}")
+            Y = torch.full((batch, M, N), float("nan"), device="cuda", dtype=torch.bfloat16)
+            out = opus_bmm(A, B, Y, family="a16w16", kid=kid)
+            torch.cuda.synchronize()
+            assert out is Y
+            _assert_close(Y, _golden(A, B), f"kid {kid} {layout} b{batch} {M}x{N}x{K} pad{pad}")
+    # No bias on the direct kids (use the _ws kids, whose reduce adds it).
+    bias = torch.zeros((N,), device="cuda", dtype=torch.bfloat16)
+    with pytest.raises((ValueError, RuntimeError), match="bias"):
+        opus_bmm(A, B, Y, family="a16w16", kid=kid, bias=bias)
 
 
 @requires_gfx950
@@ -241,7 +237,7 @@ def test_logical_2d_gemm_views(kid, split_k, layout):
     M, N, K = 77, (520 if kid < 1008 else 515), 768
     A = _operand(1, M, K, a_t, 0, gen)[0]
     B = _operand(1, N, K, b_t, 8, gen)[0]
-    bias = torch.randn((N,), generator=gen, device="cuda").to(torch.bfloat16)
+    bias = torch.randn((N,), generator=gen, device="cuda").to(torch.bfloat16) if kid >= 1008 else None
     Y = torch.empty((M, N), device="cuda", dtype=torch.bfloat16)
     opus_gemm(A, B, Y, family="a16w16", kid=kid, split_k=split_k, bias=bias)
     torch.cuda.synchronize()
