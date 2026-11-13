@@ -34,18 +34,32 @@ from .kernels.pa_decode_reduce import (
     SPLIT_PARTITIONS,
     compile_pa_decode_ps_reduce,
 )
-from .kernels.tensor_shim import _run_compiled, get_dtype_str, ptr_arg
+from .kernels.tensor_shim import (
+    _run_compiled,
+    get_dtype_str,
+    ptr_arg,
+    torch_to_fx_dtype,
+)
+
+_CONSTANT_SCALES: dict[tuple[torch.device, float], torch.Tensor] = {}
 
 
-def _flydsl_pointer_dtype(dtype: torch.dtype):
-    return {
-        torch.float32: fx.Float32,
-        torch.float16: fx.Float16,
-        torch.bfloat16: fx.BFloat16,
-        torch.float8_e4m3fn: fx.Float8E4M3FN,
-        torch.float8_e4m3fnuz: fx.Float8E4M3FNUZ,
-        torch.int32: fx.Int32,
-    }[dtype]
+def _constant_scale(device: torch.device, value: float) -> torch.Tensor:
+    """One-element float32 scale, kept per (device, value) once built eagerly.
+
+    Building it per call adds a fill or host copy to every call and to every
+    captured CUDA graph: two extra dispatches per scalar-scale FP8 call. A
+    scale first built during graph capture is not cached: its fill has not run
+    yet, and its memory belongs to that graph's pool.
+    """
+    key = (device, value)
+    scale = _CONSTANT_SCALES.get(key)
+    if scale is None:
+        scale = torch.full((1,), value, dtype=torch.float32, device=device)
+        if not torch.cuda.is_current_stream_capturing() and len(_CONSTANT_SCALES) < 64:
+            torch.cuda.current_stream(device).synchronize()  # readable from any stream
+            _CONSTANT_SCALES[key] = scale
+    return scale
 
 
 def launch_pa_decode_ps_reduce(
@@ -167,16 +181,16 @@ def launch_pa_decode_ps_reduce(
         num_xcds=num_xcds,
     )
     sink_ptr = (
-        flyc.from_c_void_p(_flydsl_pointer_dtype(output.dtype), 0)
+        flyc.from_c_void_p(torch_to_fx_dtype(output.dtype), 0)
         if sink_token is None
-        else ptr_arg(sink_token, _flydsl_pointer_dtype(sink_token.dtype))
+        else ptr_arg(sink_token, torch_to_fx_dtype(sink_token.dtype))
     )
     _run_compiled(
         compiled["launch"],
-        ptr_arg(output, _flydsl_pointer_dtype(output.dtype)),
+        ptr_arg(output, torch_to_fx_dtype(output.dtype)),
         ptr_arg(exp_sums, fx.Float32),
         ptr_arg(max_logits, fx.Float32),
-        ptr_arg(logits, _flydsl_pointer_dtype(logits.dtype)),
+        ptr_arg(logits, torch_to_fx_dtype(logits.dtype)),
         sink_ptr,
         stride_output_bs,
         stride_output_len,
@@ -213,7 +227,7 @@ def _pa_decode_mxfp4(
     work_plan,
     max_context_length,
 ):
-    """MXFP4 K/V on gfx950: ``kv_dtype="mxfp4"`` of the shared tile kernel."""
+    """MXFP4 K/V on gfx950: ``kv_dtype=dtypes.fp4x2`` of the shared tile kernel."""
     if get_gfx_runtime() != "gfx950":
         raise NotImplementedError("MXFP4 pa_decode supports gfx950")
     # fp4x2 data and fp8_e8m0 scale views are the same bytes as uint8 ones.
@@ -337,8 +351,8 @@ def _pa_decode_mxfp4(
             ).multi_processor_count,
             num_partitions=1 if direct else work_plan.max_partitions,
             softmax_scale=softmax_scale,
-            query_dtype="fp8" if query.dtype == torch.float8_e4m3fn else "bf16",
-            kv_dtype="mxfp4",
+            query_dtype=query.dtype,
+            kv_dtype=dtypes.fp4x2,
             work_capacity=capacity,
             max_context_length=schedule_context_length,
             direct_output=direct,
@@ -371,8 +385,8 @@ def _pa_decode_mxfp4(
             compiled["launch"],
             ptr_arg(pmax, fx.Float32),
             ptr_arg(psum, fx.Float32),
-            ptr_arg(pout, _flydsl_pointer_dtype(pout.dtype)),
-            ptr_arg(query, _flydsl_pointer_dtype(query.dtype)),
+            ptr_arg(pout, torch_to_fx_dtype(pout.dtype)),
+            ptr_arg(query, torch_to_fx_dtype(query.dtype)),
             ptr_arg(k_data, fx.Float4E2M1FN),
             ptr_arg(v_data, fx.Float4E2M1FN),
             ptr_arg(block_tables, fx.Int32),
@@ -473,9 +487,9 @@ def pa_decode(
     the device CU count for the gfx950 head-256 pipe shapes and twice that
     otherwise; ``tune=True`` forces a search during preparation.
     Decode and graph replay use the explicit plan without accessing autotune. Set its
-    partition cap with ``plan_pa_decode(max_partitions=...)``. On gfx1250, when
-    sinks are absent and query/output strides match, a cap of one writes output
-    directly. So do plans with one task slot per sequence (capacity equal to
+    partition cap with ``plan_pa_decode(max_partitions=...)``. On gfx950 and
+    gfx1250, when sinks are absent and query/output strides match, a cap of one
+    writes output directly, without the reducer. On gfx1250, so do plans with one task slot per sequence (capacity equal to
     the batch, at most 8 partitions per sequence, head_dim <= 512): sequences
     that still own several tasks merge them in the tile kernel using the plan's
     arrival counters when partial scratch is eight-byte aligned. Otherwise,
@@ -660,7 +674,6 @@ def pa_decode(
             f"pa_decode only supports gfx942, gfx950 and gfx1250, got {arch}"
         )
     is_bf16_kv = key_cache.dtype == torch.bfloat16
-    kv_dtype = "bf16" if is_bf16_kv else "fp8"
     expected_kv_dtype = torch.bfloat16 if is_bf16_kv else dtypes.fp8
     compute_type = key_cache.dtype if compute_type is None else compute_type
     if compute_type != expected_kv_dtype:
@@ -746,11 +759,7 @@ def pa_decode(
         raise TypeError(f"context_lengths must be int32, got {context_lengths.dtype}")
     query_group_size = num_q_heads // num_kv_heads
     max_blocks_per_seq = block_tables.shape[1]
-    if query.dtype == torch.bfloat16:
-        query_dtype = "bf16"
-    elif query.dtype == torch.float16:
-        query_dtype = "f16"
-    else:
+    if query.dtype not in (torch.bfloat16, torch.float16):
         raise TypeError(f"pa_decode only supports f16/bf16 query, got {query.dtype}")
     if (
         is_bf16_kv
@@ -821,9 +830,9 @@ def pa_decode(
 
     def normalize_scale(scale, name):
         if scale is None:
-            return torch.ones(1, dtype=torch.float32, device=dev)
+            return _constant_scale(dev, 1.0)
         if not isinstance(scale, torch.Tensor):
-            return torch.tensor([float(scale)], dtype=torch.float32, device=dev)
+            return _constant_scale(dev, float(scale))
         if scale.numel() == 1:
             return scale.reshape(1)
         if scale.dim() == 4:
@@ -940,7 +949,14 @@ def pa_decode(
     # CTA. That merge costs two device-scope round trips (sparse decode 64
     # rows: 17.7 us vs 10.3 us for tile plus reducer), so wider plans merge
     # within workgroup clusters instead.
+    # gfx942/gfx950 one-partition plans (capacity == batch) store final rows
+    # from the tile kernel too, without the reducer launch.
     direct_output = (
+        arch in ("gfx942", "gfx950")
+        and num_partitions == 1
+        and sinks is None
+        and output.stride() == query.stride()
+    ) or (
         arch in ("gfx1250", "gfx1250-strict")
         and sinks is None
         and output.stride() == query.stride()
@@ -1003,8 +1019,8 @@ def pa_decode(
             num_compute_units=num_compute_units,
             num_partitions=num_partitions,
             softmax_scale=softmax_scale,
-            query_dtype=query_dtype,
-            kv_dtype=kv_dtype,
+            query_dtype=query.dtype,
+            kv_dtype=expected_kv_dtype,
             per_token_kv=per_token_kv,
             query_length=query_length,
             trans_v=trans_v,
@@ -1076,7 +1092,7 @@ def pa_decode(
     if arch in ("gfx1250", "gfx1250-strict"):
         merged = direct_output and not one_partition_output
         merge_args = (
-            ptr_arg(output, _flydsl_pointer_dtype(output.dtype)),
+            ptr_arg(output, torch_to_fx_dtype(output.dtype)),
             ptr_arg(work_plan.reduce_info, fx.Int32),
             (
                 ptr_arg(work_plan.arrival_counters, fx.Int32)
@@ -1096,11 +1112,11 @@ def pa_decode(
             ptr_arg(psum, fx.Float32),
             ptr_arg(
                 output if one_partition_output else pout,
-                _flydsl_pointer_dtype(pout.dtype),
+                torch_to_fx_dtype(pout.dtype),
             ),
-            ptr_arg(query, _flydsl_pointer_dtype(query.dtype)),
-            ptr_arg(key_cache, _flydsl_pointer_dtype(key_cache.dtype)),
-            ptr_arg(value_cache, _flydsl_pointer_dtype(value_cache.dtype)),
+            ptr_arg(query, torch_to_fx_dtype(query.dtype)),
+            ptr_arg(key_cache, torch_to_fx_dtype(key_cache.dtype)),
+            ptr_arg(value_cache, torch_to_fx_dtype(value_cache.dtype)),
             ptr_arg(block_tables, fx.Int32),
             (
                 flyc.from_c_void_p(fx.Float32, 0)
