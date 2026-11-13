@@ -101,14 +101,16 @@ def reference(d, H, HV, use_l2norm, lower_bound):
             ut = (d["v"][0, i].float() - (S * kt[:, None, :]).sum(-1)) * beta[:, None]
             S = S + ut[:, :, None] * kt[:, None, :]
             o[i] = (S * qt[:, None, :]).sum(-1)
-            bk[s, :, base + t] = kt[::rep].repeat_interleave(rep, 0).to(bk.dtype)
+            bk[s, :, base + t] = kt.to(bk.dtype)
             bu[s, :, base + t] = ut.to(bu.dtype)
             bg[s, :, base + t] = gt.to(bg.dtype)
     return o, ckpt, bk, bu, bg
 
 
 def run(d, use_l2norm, lower_bound):
-    args = {x: (t.clone() if torch.is_tensor(t) else t) for x, t in d.items()}
+    # clone only the state the kernel updates in place: inputs keep their layout (clone() would make views dense)
+    state = ("ckpt", "buf_k", "buf_u", "buf_g")
+    args = {x: (t.clone() if x in state else t) for x, t in d.items()}
     o = kda_replayssm_decode(
         args["q"],
         args["k"],
@@ -176,6 +178,30 @@ def test_kda_replayssm_decode(N, T, H, HV, gdtype, gate):
     close(
         "buf_g", got["buf_g"], bg_ref, 1e-5 if gdtype == torch.float32 else 1e-2, 1e-2
     )
+
+
+@pytest.mark.parametrize("head_step", [1, 2])
+def test_kda_replayssm_decode_strided_gate_beta(head_step):
+    """gate and beta as column views of a wider fused buffer (Kimi-K3 passes beta that way): read by token
+    stride, results bitwise equal to contiguous inputs; head_step 2 is a layout that must be copied.
+    """
+    HV = 12
+    d = make_inputs(8, 5, HV, HV, 16, torch.float32, seed=11)
+    T_tot = d["q"].shape[1]
+    width = 4 * HV * K + 2 * HV * head_step + 64
+    fused = torch.randn(T_tot, width, device=DEV, dtype=torch.bfloat16)
+    gcol = 3 * HV * K
+    gate = fused[:, gcol : gcol + HV * K].view(1, T_tot, HV, K)
+    bcol = 4 * HV * K
+    beta = fused[:, bcol : bcol + head_step * HV : head_step].unsqueeze(0)
+    assert not gate.is_contiguous() and not beta.is_contiguous()
+    d_view = dict(d, a=gate, b=beta)
+    d_cont = dict(d, a=gate.contiguous(), b=beta.contiguous())
+    o_v, got_v = run(d_view, True, -5.0)
+    o_c, got_c = run(d_cont, True, -5.0)
+    assert torch.equal(o_v, o_c)
+    for x in ("ckpt", "buf_k", "buf_u", "buf_g"):
+        assert torch.equal(got_v[x], got_c[x]), x
 
 
 @pytest.mark.parametrize("l2norm", [True, False])

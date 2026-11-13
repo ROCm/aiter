@@ -160,6 +160,7 @@ struct Params
     int H;
     int HV;
     int64_t s_ck_slot, s_bk_slot, s_bk_pos, s_bk_hv, s_bu_slot, s_bu_pos, s_bu_hv, s_bg_slot, s_bg_pos, s_bg_hv;
+    int64_t s_a_tok, s_b_tok; // token strides of the gate input and beta (column views of a wider buffer allowed)
 };
 
 template <int RPT, typename GT>
@@ -211,7 +212,7 @@ __global__ void __launch_bounds__(4 * VD / RPT) kda_replayssm_decode_kernel(cons
             const int t       = min(sr + i * RPP, T - 1);
             trow[i]           = t;
             const int64_t tok = bos + t;
-            wa[i] = *reinterpret_cast<const uint4*>(p.a + (tok * HV + hv) * KD + col);
+            wa[i] = *reinterpret_cast<const uint4*>(p.a + tok * p.s_a_tok + hv * KD + col);
             wq[i] = *reinterpret_cast<const uint4*>(p.q + (tok * p.H + ih) * KD + col);
             wk[i] = *reinterpret_cast<const uint4*>(p.k + (tok * p.H + ih) * KD + col);
             wv[i] = *reinterpret_cast<const uint4*>(p.v + (tok * HV + hv) * VD + col);
@@ -234,7 +235,7 @@ __global__ void __launch_bounds__(4 * VD / RPT) kda_replayssm_decode_kernel(cons
                                                     j * p.s_bu_pos + col);
         }
         const int bt      = min(tid & (MAXT - 1), T - 1);
-        const uint16_t rb = p.b[(int64_t)(bos + bt) * HV + hv];
+        const uint16_t rb = p.b[(int64_t)(bos + bt) * p.s_b_tok + hv];
         const float4 db0  = reinterpret_cast<const float4*>(p.dt_bias + (int64_t)hv * KD + col)[0];
         const float4 db1  = reinterpret_cast<const float4*>(p.dt_bias + (int64_t)hv * KD + col)[1];
         // checkpoint tile into registers (consumed only after the staging barrier)
@@ -534,9 +535,11 @@ void kda_replayssm_decode(aiter_tensor_t& o,
     AITER_CHECK(write_pos.dtype() == AITER_DTYPE_i32 && slot_idx.dtype() == AITER_DTYPE_i32 &&
                     cu_seqlens.dtype() == AITER_DTYPE_i32,
                 "kda_replayssm_decode: write_pos, slot_idx and cu_seqlens must be int32");
-    AITER_CHECK(q.is_contiguous() && k.is_contiguous() && v.is_contiguous() && a.is_contiguous() &&
-                    b.is_contiguous() && o.is_contiguous(),
-                "kda_replayssm_decode: q, k, v, a, b and o must be contiguous");
+    AITER_CHECK(q.is_contiguous() && k.is_contiguous() && v.is_contiguous() && o.is_contiguous(),
+                "kda_replayssm_decode: q, k, v and o must be contiguous");
+    // a and b may be column views of a wider buffer (Kimi-K3's beta is): only each token's row must be dense
+    AITER_CHECK(a.stride(-1) == 1 && a.stride(-2) == K && (a.stride(-3) * 2) % 16 == 0 && b.stride(-1) == 1,
+                "kda_replayssm_decode: a needs dense, 16-byte aligned token rows and b unit head stride");
     AITER_CHECK(ckpt.stride(-1) == 1 && ckpt.stride(-2) == K && ckpt.stride(-3) == V * K,
                 "kda_replayssm_decode: ckpt must be [slot, HV, V, K] with contiguous heads");
     AITER_CHECK(buf_k.stride(-1) == 1 && buf_u.stride(-1) == 1 && buf_g.stride(-1) == 1 &&
@@ -583,6 +586,8 @@ void kda_replayssm_decode(aiter_tensor_t& o,
     prm.s_bg_slot       = buf_g.stride(0);
     prm.s_bg_hv         = buf_g.stride(1);
     prm.s_bg_pos        = buf_g.stride(2);
+    prm.s_a_tok         = a.stride(-3);
+    prm.s_b_tok         = b.stride(-2);
 
     HipDeviceGuard device_guard(q.device_id);
     const hipStream_t stream = aiter::getCurrentHIPStream();

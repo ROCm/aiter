@@ -114,14 +114,24 @@ def kda_replayssm_decode(
 
     q, k ``[1, T, H, K]``, v ``[1, T, HV, V]``, a ``[1, T, HV, K]`` (gate input), b ``[1, T, HV]`` (beta logits),
     ckpt ``[slot, HV, V, K]``, records ``[slot, HV, cache_len, K|V]``.  Returns ``[1, T, HV, V]`` (``o`` if given,
-    as ``[T, HV, V]``).
+    as ``[T, HV, V]``).  ``a`` and ``b`` may be column views of a wider buffer (read by token stride, no copy) as
+    long as each token's row is dense.
     """
     assert q.shape[0] == 1, "varlen layout expected (B == 1)"
     _, T_tot, _, K = q.shape
     HV, V = v.shape[2], v.shape[3]
     if scale is None:
         scale = K**-0.5
-    q, k, v, a, b = (x.contiguous() for x in (q, k, v, a, b))
+    q, k, v = (x.contiguous() for x in (q, k, v))
+    if (
+        a.stride(-1) != 1
+        or a.stride(-2) != K
+        or (a.stride(-3) * a.element_size()) % 16
+        or a.data_ptr() % 16
+    ):
+        a = a.contiguous()
+    if b.stride(-1) != 1:
+        b = b.contiguous()
     out = q.new_empty(1, T_tot, HV, V) if o is None else o.unsqueeze(0)
     _kda_replayssm_decode(
         out,
