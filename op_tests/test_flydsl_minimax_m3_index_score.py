@@ -2831,7 +2831,8 @@ def bench_score_nvfp4(case, B, S, H, lens, kwargs):
         for r, kk in (("e4m3", e4m3), ("exact", exact))
     }
     ret = {"gfx": get_gfx_runtime(), "timing": "repeated-buffer (warm effective TB/s)"}
-    wm = kernel.build_work_map(seq, mb, S, H)
+    # The NVFP4 scorer's own depth table: a shared (MXFP4) map would keep the shared geometry.
+    wm = kernel.build_work_map(seq, mb, S, H, nvfp4=True)
     pages = sum((L + P - 1) // P for L in lens)
     flops = 2 * pages * P * D * S * H
     out = kernel.alloc_score(B, S, H, mb, q.device)
