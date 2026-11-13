@@ -1552,6 +1552,7 @@ def flydsl_kda_decode(
         float(lower_bound),
         fuse_f_b=False,
         state_dtype=_KDA_STATE_DTYPE_TAGS[state.dtype],
+        device_index=device.index,
     )
     with torch.cuda.device(device):
         stream = torch.cuda.current_stream(device)
@@ -1672,6 +1673,7 @@ def flydsl_kda_decode_with_f_b(
         float(lower_bound),
         fuse_f_b=True,
         state_dtype=_KDA_STATE_DTYPE_TAGS[state.dtype],
+        device_index=device.index,
     )
     with torch.cuda.device(device):
         stream = torch.cuda.current_stream(device)
