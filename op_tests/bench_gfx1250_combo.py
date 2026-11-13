@@ -209,6 +209,9 @@ H=128 and N=512 for the CSA/HCA KV pools. The TP result keeps the
 the shipped H=128 kernel coverage; the model-local H=32 path is not enabled by
 the kargpreld test/dispatcher yet.
 
+An additional H=64 ``v41_fp4`` ASM run uses the same EP batch, CSA/HCA pools,
+topk budgets and SWA window. Its results are reported separately from H=128.
+
 The DSv4 ``mla_v4_prefill`` op runs eighteen performance cases at H=128 and
 D=512: compressed prefix-pool rows 4096/16384, crossed with topk 0/512/1024,
 crossed with v4_fp8/v41_fp8/bf16. The current chunk remains uncompressed:
@@ -222,6 +225,10 @@ The UT compares the backends it has for each precision -- opus and asm on
 v4_fp8, opus on v41_fp8, opus and triton on bf16 -- so one run covers all
 precisions and all three backends. --topk is the prefix rows each token draws;
 0 takes the whole pool.
+
+The same prefill sweep also runs ``v41_fp4`` ASM at H=64: six cases per token
+count, with the same pools, topk budgets and window. All sparse-prefill calls
+use ``--num_kv_splits auto`` so each host selects its default split count.
 
 The ``inverse_rope`` op runs the TP1 and TP4 attention-output shapes (-b is
 (n_local_heads, n_local_groups); 128,16 and 32,4 are V4-Pro at TP1 and TP4):
@@ -877,6 +884,7 @@ _MLA_V4_DSV4_SHAPES = [
 # the result even where a KV length overlaps the TP kargpreld sweep. The last
 # field is the pool's --topk.
 _MLA_V4_EP_HEADS = 128
+_MLA_V41_ASM_HEADS = 64
 _MLA_V4_EP_BATCH = 512
 _MLA_V4_EP_KV_GROUPS = (
     ("CSA", (384, 448, 512, 583, 640, 1024), (512, 1024)),
@@ -2127,8 +2135,8 @@ def run_mla_v4_decode(args):
     """Run the existing EP and TP tests serially in separate child processes."""
     _unused_scale_init(args, "mla_v4_decode")
     repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-    for group, kv_seq_lens, topks in _MLA_V4_EP_KV_GROUPS:
-        name = f"mla_v4 decode [EP] {group} (fp8 sparse prefill, opus vs asm)"
+
+    def run_ep_case(group, kv_seq_lens, topks, heads, precs, backends, name):
         _run_child(
             name,
             [
@@ -2137,7 +2145,7 @@ def run_mla_v4_decode(args):
                 "-n",
                 str(_MLA_V4_EP_BATCH),
                 "--h_q",
-                str(_MLA_V4_EP_HEADS),
+                str(heads),
                 "-d",
                 "512",
                 "--total_pages",
@@ -2147,11 +2155,11 @@ def run_mla_v4_decode(args):
                 "--window",
                 str(_MLA_V4_SWA_WINDOW),
                 "--prec",
-                "v4_fp8",
-                "v41_fp8",
+                *precs,
                 "--backend",
-                "opus",
-                "asm",
+                *backends,
+                "--num_kv_splits",
+                "auto",
                 "--no-verify",
                 "--seed",
                 str(args.seed),
@@ -2164,6 +2172,26 @@ def run_mla_v4_decode(args):
             ),
             kernels=False,
             structured=True,
+        )
+
+    for group, kv_seq_lens, topks in _MLA_V4_EP_KV_GROUPS:
+        run_ep_case(
+            group,
+            kv_seq_lens,
+            topks,
+            _MLA_V4_EP_HEADS,
+            ("v4_fp8", "v41_fp8"),
+            ("opus", "asm"),
+            f"mla_v4 decode [EP] {group} (fp8 sparse prefill, opus vs asm)",
+        )
+        run_ep_case(
+            group,
+            kv_seq_lens,
+            topks,
+            _MLA_V41_ASM_HEADS,
+            ("v41_fp4",),
+            ("asm",),
+            f"mla_v4 decode [EP] {group} (H64, v41_fp4, asm)",
         )
 
     tp_args = json.dumps(
@@ -2333,11 +2361,11 @@ def run_inverse_rope(args):
 
 
 def run_mla_v4_prefill(args):
-    """Run DSv4 prefill across three precisions, pools and topk budgets."""
+    """Run DSv4 H128 prefill and H64 V4.1 ASM over the same pools and budgets."""
     _unused_scale_init(args, "mla_v4_prefill")
     data_inits = args.data_init or ["norm"]
 
-    def run_case(tokens, pages, precs, topks, backends, init_values, label):
+    def run_case(tokens, heads, pages, precs, topks, backends, init_values, label):
         _run_child(
             label,
             [
@@ -2346,22 +2374,23 @@ def run_mla_v4_prefill(args):
                 "-n",
                 str(tokens),
                 "--h_q",
-                "128",
+                str(heads),
                 "-d",
                 "512",
                 "--total_pages",
                 *map(str, pages),
                 "--prec",
                 *precs,
-                # bf16 takes the single-tensor Q/K/V/O kernel; only v4_fp8 has
-                # an asm candidate, so the bf16 rows compare opus against triton
-                # and leave the asm columns empty.
+                # The shared UT selects supported backends for each precision
+                # and head count; bf16 compares opus against triton.
                 "--topk",
                 *topks,
                 "--window",
                 str(_MLA_V4_SWA_WINDOW),
                 "--backend",
                 *backends,
+                "--num_kv_splits",
+                "auto",
                 "--no-verify",
                 "--seed",
                 str(args.seed),
@@ -2376,6 +2405,7 @@ def run_mla_v4_prefill(args):
     for tokens in _MLA_PREFILL_TOKENS:
         run_case(
             tokens,
+            _MLA_V4_EP_HEADS,
             (4096, 16384),
             ("v4_fp8", "v41_fp8", "bf16"),
             # 0 takes the whole pool; 512/1024 are DSv4 index_topk on V4-Flash
@@ -2385,6 +2415,16 @@ def run_mla_v4_prefill(args):
             data_inits,
             f"mla_v4 prefill (M={tokens}, prec=v4_fp8/v41_fp8/bf16, "
             "pages=4096/16384)",
+        )
+        run_case(
+            tokens,
+            _MLA_V41_ASM_HEADS,
+            (4096, 16384),
+            ("v41_fp4",),
+            ("0", "512", "1024"),
+            ("asm",),
+            data_inits,
+            f"mla_v4 prefill (M={tokens}, H64, prec=v41_fp4, pages=4096/16384)",
         )
 
 
