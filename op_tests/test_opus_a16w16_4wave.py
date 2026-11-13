@@ -164,9 +164,8 @@ def test_plan_rejections():
         for K in (64, 160, 1000):
             with pytest.raises(ValueError, match="incompatible with shape"):
                 _plan(kid, K=K)
-    # Direct kids store C rows in 16-byte vectors: N % 8 == 0 only.
-    with pytest.raises(ValueError, match="incompatible with shape"):
-        _plan(1003, N=131)
+    # Any N (the direct kernel stores the column-N tail per element).
+    assert _plan(1003, N=131).workspace_spec is None   # accepted (no split-K plan)
     assert _plan(1011, N=131, split_k=1).abi_split_k == 1
     with pytest.raises(ValueError, match="does not support output dtype"):
         _get_cached_a16w16_launch_plan(
@@ -185,10 +184,11 @@ def test_direct_kid_all_layouts_bias(kid):
     gen = torch.Generator(device="cuda").manual_seed(kid)
     cases = (
         # batch, M, N, K, pad (odd M/N, padded leading dims, batch > 1)
-        # (the direct kernel needs N % 8 == 0; odd N is covered by the ws kids)
         (1, 193, 136, 256, 8),
         (2, 64, 264, 512, 0),
         (3, 301, 72, 384, 24),
+        (1, 77, 131, 256, 8),   # odd N: column-N tail stored per element, odd-length bias
+        (2, 129, 7, 384, 0),
     )
     for layout, (a_t, b_t) in LAYOUTS.items():
         for batch, M, N, K, pad in cases:

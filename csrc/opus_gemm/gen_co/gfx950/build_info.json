@@ -19,9 +19,9 @@
         "s": "asm/opus_gemm_gfx950_4wave_256x256x256x64_2x2_16x16x32_0x0x0_nn.s"
       },
       "b_t": true,
-      "co_sha256": "283928dc59debe9e338461f0920443bfb14395812f6e10d3fe4e5990e865e147",
+      "co_sha256": "f6c719046f6fd9eb6026ecf48ee643ed90ccee41840aa1d698afe7113ea2715b",
       "device_flags": [],
-      "dis_lines": 2526,
+      "dis_lines": 2766,
       "dis_mfma": 640,
       "elf_flags": 1359,
       "elf_machine": 224,
@@ -59,9 +59,9 @@
         "s": "asm/opus_gemm_gfx950_4wave_256x256x256x64_2x2_16x16x32_0x0x0_nn_bias.s"
       },
       "b_t": true,
-      "co_sha256": "e7e41275187e30f36ebf7205a7be587291164cf423a6596b2c0c7f1c8bc331e0",
+      "co_sha256": "f1d2ce8acbc8d3d7b68bb2da768a3d6666a3a74903184355d8a5160f6b2d53a5",
       "device_flags": [],
-      "dis_lines": 2783,
+      "dis_lines": 3077,
       "dis_mfma": 640,
       "elf_flags": 1359,
       "elf_machine": 224,
@@ -99,9 +99,9 @@
         "s": "asm/opus_gemm_gfx950_4wave_256x256x256x64_2x2_16x16x32_0x0x0_nt.s"
       },
       "b_t": false,
-      "co_sha256": "89937d6316398eea376b4af04f4882cf4f62a3de1b91b0d2634d20386b532779",
+      "co_sha256": "430dee3688a9c5823066d1e5662c514d4408a624a1cf5b080dc1f773a06ea1f4",
       "device_flags": [],
-      "dis_lines": 2398,
+      "dis_lines": 2616,
       "dis_mfma": 640,
       "elf_flags": 1359,
       "elf_machine": 224,
@@ -118,7 +118,7 @@
       "layout": "nt",
       "offload_arch": "gfx950",
       "pin": true,
-      "sgpr_count": 46,
+      "sgpr_count": 47,
       "sgpr_spill_count": 0,
       "splitk": false,
       "symbol": "opus_gemm_gfx950_4wave_256x256x256x64_2x2_16x16x32_0x0x0_nt",
@@ -139,9 +139,9 @@
         "s": "asm/opus_gemm_gfx950_4wave_256x256x256x64_2x2_16x16x32_0x0x0_nt_bias.s"
       },
       "b_t": false,
-      "co_sha256": "936abbc9c4ec3a5b785faa34235c3aeafc3ae12205ebb802a2d53ca64830cdaa",
+      "co_sha256": "08fed5ed072041f0f816d92ee290978fe91f38d0fa3991762729823c875bb10d",
       "device_flags": [],
-      "dis_lines": 2583,
+      "dis_lines": 2834,
       "dis_mfma": 640,
       "elf_flags": 1359,
       "elf_machine": 224,
@@ -158,7 +158,7 @@
       "layout": "nt",
       "offload_arch": "gfx950",
       "pin": true,
-      "sgpr_count": 50,
+      "sgpr_count": 51,
       "sgpr_spill_count": 0,
       "splitk": false,
       "symbol": "opus_gemm_gfx950_4wave_256x256x256x64_2x2_16x16x32_0x0x0_nt_bias",
@@ -179,9 +179,9 @@
         "s": "asm/opus_gemm_gfx950_4wave_256x256x256x64_2x2_16x16x32_0x0x0_tn.s"
       },
       "b_t": true,
-      "co_sha256": "e0bb8be6f62f74a1bcb63ebc3f090b360d6e40c6e5b5c382706a6d888f8e10c1",
+      "co_sha256": "b0e516416b8d97ad00edc9e9bb6d0b2410b7aafa8084103e5297cffb38cc475f",
       "device_flags": [],
-      "dis_lines": 2628,
+      "dis_lines": 2866,
       "dis_mfma": 640,
       "elf_flags": 1359,
       "elf_machine": 224,
@@ -219,9 +219,9 @@
         "s": "asm/opus_gemm_gfx950_4wave_256x256x256x64_2x2_16x16x32_0x0x0_tn_bias.s"
       },
       "b_t": true,
-      "co_sha256": "c15ba7a7fc18f129d8cbe662432554e3942696d19841c179191d3aeae316bb5f",
+      "co_sha256": "df07d972e4a3235303f76663034958deeab6b698ebc66bf469d8a56fc0c28a22",
       "device_flags": [],
-      "dis_lines": 2829,
+      "dis_lines": 3099,
       "dis_mfma": 640,
       "elf_flags": 1359,
       "elf_machine": 224,
@@ -259,9 +259,9 @@
         "s": "asm/opus_gemm_gfx950_4wave_256x256x256x64_2x2_16x16x32_0x0x0_tt.s"
       },
       "b_t": false,
-      "co_sha256": "0953fe403bb98b23fce9848f27e50e926ae67f55648f35a66710d708ffb36217",
+      "co_sha256": "cf0e72996b3ac4011ba82fa950de21709df61413735d00408fcf592244ce536a",
       "device_flags": [],
-      "dis_lines": 2528,
+      "dis_lines": 2768,
       "dis_mfma": 640,
       "elf_flags": 1359,
       "elf_machine": 224,
@@ -299,9 +299,9 @@
         "s": "asm/opus_gemm_gfx950_4wave_256x256x256x64_2x2_16x16x32_0x0x0_tt_bias.s"
       },
       "b_t": false,
-      "co_sha256": "be9388158cce4f2848de31fa7696564a3949c9d3bbeb2a7bb4cf90790f8f85e5",
+      "co_sha256": "5e800c59d74831f34cf4ea070f5b561da5e1ce77098dd48c2bc07d2ab90798a6",
       "device_flags": [],
-      "dis_lines": 2702,
+      "dis_lines": 2990,
       "dis_mfma": 640,
       "elf_flags": 1359,
       "elf_machine": 224,
@@ -318,7 +318,7 @@
       "layout": "tt",
       "offload_arch": "gfx950",
       "pin": true,
-      "sgpr_count": 52,
+      "sgpr_count": 53,
       "sgpr_spill_count": 0,
       "splitk": false,
       "symbol": "opus_gemm_gfx950_4wave_256x256x256x64_2x2_16x16x32_0x0x0_tt_bias",
@@ -339,9 +339,9 @@
         "s": "asm/opus_gemm_gfx950_4wave_256x256x128x64_2x2_16x16x32_0x0x0_nn.s"
       },
       "b_t": true,
-      "co_sha256": "f76fa7a4329446fd2f950302dd39a32b25455c162346acd1cf400f265ebf034d",
+      "co_sha256": "2b6a09d59a4b62b71efc256b68651852f330e18caf162e80ddbfbc1774028999",
       "device_flags": [],
-      "dis_lines": 1721,
+      "dis_lines": 1907,
       "dis_mfma": 320,
       "elf_flags": 1359,
       "elf_machine": 224,
@@ -368,7 +368,7 @@
         64
       ],
       "undefined_symbols": [],
-      "vgpr_count": 432,
+      "vgpr_count": 392,
       "vgpr_spill_count": 0
     },
     {
@@ -379,9 +379,9 @@
         "s": "asm/opus_gemm_gfx950_4wave_256x256x128x64_2x2_16x16x32_0x0x0_nn_bias.s"
       },
       "b_t": true,
-      "co_sha256": "90ec7fbd247f70b05693e5d34d9670625d2ec5d6b45a1c61ead3bf6bbf4297d5",
+      "co_sha256": "4ac494ec03cb6a21a266714c2506838d64b32e07cbd8213ae88a381f246ac139",
       "device_flags": [],
-      "dis_lines": 1812,
+      "dis_lines": 2017,
       "dis_mfma": 320,
       "elf_flags": 1359,
       "elf_machine": 224,
@@ -408,7 +408,7 @@
         64
       ],
       "undefined_symbols": [],
-      "vgpr_count": 380,
+      "vgpr_count": 384,
       "vgpr_spill_count": 0
     },
     {
@@ -419,9 +419,9 @@
         "s": "asm/opus_gemm_gfx950_4wave_256x256x128x64_2x2_16x16x32_0x0x0_nt.s"
       },
       "b_t": false,
-      "co_sha256": "d778b17e5e52e0ab81700ac43953831be4f5383039eb8695a88c90679cdce26e",
+      "co_sha256": "f7df2e79a01f45526c1f738f89db9a48dd5a177b1be6e3bc6bd78daf116af150",
       "device_flags": [],
-      "dis_lines": 1658,
+      "dis_lines": 1833,
       "dis_mfma": 320,
       "elf_flags": 1359,
       "elf_machine": 224,
@@ -438,7 +438,7 @@
       "layout": "nt",
       "offload_arch": "gfx950",
       "pin": true,
-      "sgpr_count": 46,
+      "sgpr_count": 47,
       "sgpr_spill_count": 0,
       "splitk": false,
       "symbol": "opus_gemm_gfx950_4wave_256x256x128x64_2x2_16x16x32_0x0x0_nt",
@@ -448,7 +448,7 @@
         64
       ],
       "undefined_symbols": [],
-      "vgpr_count": 432,
+      "vgpr_count": 392,
       "vgpr_spill_count": 0
     },
     {
@@ -459,9 +459,9 @@
         "s": "asm/opus_gemm_gfx950_4wave_256x256x128x64_2x2_16x16x32_0x0x0_nt_bias.s"
       },
       "b_t": false,
-      "co_sha256": "ec70618f80ae81e00a46bb9102188b9ea402921e8077f71b7bc3614ddb2cf436",
+      "co_sha256": "29dbaac7644dde291919135051de88c3e5831ca0cf0243db70a97049494398ac",
       "device_flags": [],
-      "dis_lines": 1747,
+      "dis_lines": 1956,
       "dis_mfma": 320,
       "elf_flags": 1359,
       "elf_machine": 224,
@@ -478,7 +478,7 @@
       "layout": "nt",
       "offload_arch": "gfx950",
       "pin": true,
-      "sgpr_count": 50,
+      "sgpr_count": 51,
       "sgpr_spill_count": 0,
       "splitk": false,
       "symbol": "opus_gemm_gfx950_4wave_256x256x128x64_2x2_16x16x32_0x0x0_nt_bias",
@@ -499,9 +499,9 @@
         "s": "asm/opus_gemm_gfx950_4wave_256x256x128x64_2x2_16x16x32_0x0x0_tn.s"
       },
       "b_t": true,
-      "co_sha256": "13c4a972a6a2ba43d73d04e532d1ee3b063082db80c593e290f4a82946aa4d3e",
+      "co_sha256": "3126b45e6e00e9e388d8ead028c2497a75239b3ae195cdf70ff8bdc51b4fa05d",
       "device_flags": [],
-      "dis_lines": 1820,
+      "dis_lines": 2008,
       "dis_mfma": 320,
       "elf_flags": 1359,
       "elf_machine": 224,
@@ -528,7 +528,7 @@
         64
       ],
       "undefined_symbols": [],
-      "vgpr_count": 420,
+      "vgpr_count": 392,
       "vgpr_spill_count": 0
     },
     {
@@ -539,9 +539,9 @@
         "s": "asm/opus_gemm_gfx950_4wave_256x256x128x64_2x2_16x16x32_0x0x0_tn_bias.s"
       },
       "b_t": true,
-      "co_sha256": "22a988681cfcf7b024919a064f0b6fc5c5d221f4aaf719b001060647fa0b71e6",
+      "co_sha256": "0ba3f80210c27cf23cb39785f74e5f622a09e3141204645726e3fdd4c96ca046",
       "device_flags": [],
-      "dis_lines": 1911,
+      "dis_lines": 2133,
       "dis_mfma": 320,
       "elf_flags": 1359,
       "elf_machine": 224,
@@ -579,9 +579,9 @@
         "s": "asm/opus_gemm_gfx950_4wave_256x256x128x64_2x2_16x16x32_0x0x0_tt.s"
       },
       "b_t": false,
-      "co_sha256": "a6356538fa3bc5497ec8a1f0c79f55c6d07feb748e24f2067bb511d2d3fbaca0",
+      "co_sha256": "f8df677e573ddc3c5f3e1276df5f3c3ad1857a05e0825c45e94de2c30191d81b",
       "device_flags": [],
-      "dis_lines": 1765,
+      "dis_lines": 1969,
       "dis_mfma": 320,
       "elf_flags": 1359,
       "elf_machine": 224,
@@ -608,7 +608,7 @@
         64
       ],
       "undefined_symbols": [],
-      "vgpr_count": 416,
+      "vgpr_count": 392,
       "vgpr_spill_count": 0
     },
     {
@@ -619,9 +619,9 @@
         "s": "asm/opus_gemm_gfx950_4wave_256x256x128x64_2x2_16x16x32_0x0x0_tt_bias.s"
       },
       "b_t": false,
-      "co_sha256": "231a9d73c7dc8e3132dbbfa9fa74991f11c9534a3948fab5943febed652e9fa9",
+      "co_sha256": "61e228fa33d96ea014c3d3c8d0e50da5278b899f35f20f7e1db29bdf69881d84",
       "device_flags": [],
-      "dis_lines": 1855,
+      "dis_lines": 2077,
       "dis_mfma": 320,
       "elf_flags": 1359,
       "elf_machine": 224,
@@ -638,7 +638,7 @@
       "layout": "tt",
       "offload_arch": "gfx950",
       "pin": true,
-      "sgpr_count": 51,
+      "sgpr_count": 52,
       "sgpr_spill_count": 0,
       "splitk": false,
       "symbol": "opus_gemm_gfx950_4wave_256x256x128x64_2x2_16x16x32_0x0x0_tt_bias",
@@ -659,9 +659,9 @@
         "s": "asm/opus_gemm_gfx950_4wave_256x128x256x64_2x2_16x16x32_0x0x0_nn.s"
       },
       "b_t": true,
-      "co_sha256": "d2b5731c994aa2a342679f6cb7e847ea0644163194cee00ea470944e5497e77b",
+      "co_sha256": "a6399fae7e6c73d9c7492146b764b88590bb7364974ca796ae887d03f52d3ac5",
       "device_flags": [],
-      "dis_lines": 1764,
+      "dis_lines": 1970,
       "dis_mfma": 320,
       "elf_flags": 1359,
       "elf_machine": 224,
@@ -688,7 +688,7 @@
         64
       ],
       "undefined_symbols": [],
-      "vgpr_count": 440,
+      "vgpr_count": 392,
       "vgpr_spill_count": 0
     },
     {
@@ -699,9 +699,9 @@
         "s": "asm/opus_gemm_gfx950_4wave_256x128x256x64_2x2_16x16x32_0x0x0_nn_bias.s"
       },
       "b_t": true,
-      "co_sha256": "5aefbccdab292a6281e16cd5aa5bcfcfba697a9c76104261797084de054e006e",
+      "co_sha256": "7edc9b7cbb0cca1bf4f5bf44f24a8566c14c245a9761b9b93116fba8ead0df67",
       "device_flags": [],
-      "dis_lines": 1897,
+      "dis_lines": 2119,
       "dis_mfma": 320,
       "elf_flags": 1359,
       "elf_machine": 224,
@@ -728,7 +728,7 @@
         64
       ],
       "undefined_symbols": [],
-      "vgpr_count": 384,
+      "vgpr_count": 388,
       "vgpr_spill_count": 0
     },
     {
@@ -739,9 +739,9 @@
         "s": "asm/opus_gemm_gfx950_4wave_256x128x256x64_2x2_16x16x32_0x0x0_nt.s"
       },
       "b_t": false,
-      "co_sha256": "fbad5ea210d3ce2eaee2eddc4f74559ab68bf0f9fbfb9b0e1cc30a56a65a4eba",
+      "co_sha256": "10b4792e7239ddec98e459ebc2a241827215b45bc6bb9964dab27a44cb090e4b",
       "device_flags": [],
-      "dis_lines": 1645,
+      "dis_lines": 1821,
       "dis_mfma": 320,
       "elf_flags": 1359,
       "elf_machine": 224,
@@ -758,7 +758,7 @@
       "layout": "nt",
       "offload_arch": "gfx950",
       "pin": true,
-      "sgpr_count": 48,
+      "sgpr_count": 49,
       "sgpr_spill_count": 0,
       "splitk": false,
       "symbol": "opus_gemm_gfx950_4wave_256x128x256x64_2x2_16x16x32_0x0x0_nt",
@@ -768,7 +768,7 @@
         64
       ],
       "undefined_symbols": [],
-      "vgpr_count": 428,
+      "vgpr_count": 392,
       "vgpr_spill_count": 0
     },
     {
@@ -779,9 +779,9 @@
         "s": "asm/opus_gemm_gfx950_4wave_256x128x256x64_2x2_16x16x32_0x0x0_nt_bias.s"
       },
       "b_t": false,
-      "co_sha256": "077bc1776cf50b20f7562404610457341b96e544550864d3f3c58e0c74510f2e",
+      "co_sha256": "99c047215505f20577992eabcdf624920089b38017c39019d5be2edcd48e2f53",
       "device_flags": [],
-      "dis_lines": 1761,
+      "dis_lines": 1953,
       "dis_mfma": 320,
       "elf_flags": 1359,
       "elf_machine": 224,
@@ -798,7 +798,7 @@
       "layout": "nt",
       "offload_arch": "gfx950",
       "pin": true,
-      "sgpr_count": 52,
+      "sgpr_count": 53,
       "sgpr_spill_count": 0,
       "splitk": false,
       "symbol": "opus_gemm_gfx950_4wave_256x128x256x64_2x2_16x16x32_0x0x0_nt_bias",
@@ -819,9 +819,9 @@
         "s": "asm/opus_gemm_gfx950_4wave_256x128x256x64_2x2_16x16x32_0x0x0_tn.s"
       },
       "b_t": true,
-      "co_sha256": "321f456198f108d59b63686d8bf93311faeb7b5add2b2ab8d7f6a4d7f9bcb2db",
+      "co_sha256": "e991dfba532324d591e677f72643790833cf3b1cd0d31f9fc8228d6d02ebcf94",
       "device_flags": [],
-      "dis_lines": 1812,
+      "dis_lines": 2004,
       "dis_mfma": 320,
       "elf_flags": 1359,
       "elf_machine": 224,
@@ -848,7 +848,7 @@
         64
       ],
       "undefined_symbols": [],
-      "vgpr_count": 440,
+      "vgpr_count": 392,
       "vgpr_spill_count": 0
     },
     {
@@ -859,9 +859,9 @@
         "s": "asm/opus_gemm_gfx950_4wave_256x128x256x64_2x2_16x16x32_0x0x0_tn_bias.s"
       },
       "b_t": true,
-      "co_sha256": "a6ab31aaf699ec6c1dde90d0366c0ad80e2b6aac6591dc0d14190ba44489d390",
+      "co_sha256": "7c41837acbe29dce448d835d3f0fe76507dc52137df517c6a4e7b15d7c706d2c",
       "device_flags": [],
-      "dis_lines": 1945,
+      "dis_lines": 2152,
       "dis_mfma": 320,
       "elf_flags": 1359,
       "elf_machine": 224,
@@ -899,9 +899,9 @@
         "s": "asm/opus_gemm_gfx950_4wave_256x128x256x64_2x2_16x16x32_0x0x0_tt.s"
       },
       "b_t": false,
-      "co_sha256": "89ef691c2c7f7f4a33af64806b8d59d693b02e711faa36c38c1fbc8dafa6a167",
+      "co_sha256": "7f3549636456d7f4bd2aab129aa7e1284d16aa521a7bf481943369a16664fc50",
       "device_flags": [],
-      "dis_lines": 1700,
+      "dis_lines": 1892,
       "dis_mfma": 320,
       "elf_flags": 1359,
       "elf_machine": 224,
@@ -928,7 +928,7 @@
         64
       ],
       "undefined_symbols": [],
-      "vgpr_count": 436,
+      "vgpr_count": 392,
       "vgpr_spill_count": 0
     },
     {
@@ -939,9 +939,9 @@
         "s": "asm/opus_gemm_gfx950_4wave_256x128x256x64_2x2_16x16x32_0x0x0_tt_bias.s"
       },
       "b_t": false,
-      "co_sha256": "fb80de7c979ae418e3a2e2b5cd81c81e693efc377a6a2483cf81af2f8e1478d9",
+      "co_sha256": "0cab759d235c10bbbbc2241e0b7a65fbd1f19ade6c0af74cc833172deb40b9ea",
       "device_flags": [],
-      "dis_lines": 1818,
+      "dis_lines": 2025,
       "dis_mfma": 320,
       "elf_flags": 1359,
       "elf_machine": 224,
@@ -958,7 +958,7 @@
       "layout": "tt",
       "offload_arch": "gfx950",
       "pin": true,
-      "sgpr_count": 51,
+      "sgpr_count": 52,
       "sgpr_spill_count": 0,
       "splitk": false,
       "symbol": "opus_gemm_gfx950_4wave_256x128x256x64_2x2_16x16x32_0x0x0_tt_bias",
@@ -968,7 +968,7 @@
         64
       ],
       "undefined_symbols": [],
-      "vgpr_count": 376,
+      "vgpr_count": 380,
       "vgpr_spill_count": 0
     },
     {
@@ -979,9 +979,9 @@
         "s": "asm/opus_gemm_gfx950_4wave_256x128x128x64_2x2_16x16x32_0x0x0_nn.s"
       },
       "b_t": true,
-      "co_sha256": "886728ec5728d1bd72f31ae6d0d34b690639cd82d747bfee7c5911c545142547",
+      "co_sha256": "60ffbbee0374c8507091603a1fcbca8d525550b14f563fb86f6cbd4d07d51d6a",
       "device_flags": [],
-      "dis_lines": 1104,
+      "dis_lines": 1263,
       "dis_mfma": 160,
       "elf_flags": 1359,
       "elf_machine": 224,
@@ -1008,7 +1008,7 @@
         64
       ],
       "undefined_symbols": [],
-      "vgpr_count": 152,
+      "vgpr_count": 174,
       "vgpr_spill_count": 0
     },
     {
@@ -1019,9 +1019,9 @@
         "s": "asm/opus_gemm_gfx950_4wave_256x128x128x64_2x2_16x16x32_0x0x0_nn_bias.s"
       },
       "b_t": true,
-      "co_sha256": "11e4fb3d3a18e282d975fbd8757f0269c4f62038cafa010281b2bdec4a6ed79c",
+      "co_sha256": "493aa618c714a243838625af47bb34bef014520b3f843236be9aa4d1ec0c2db5",
       "device_flags": [],
-      "dis_lines": 1178,
+      "dis_lines": 1341,
       "dis_mfma": 160,
       "elf_flags": 1359,
       "elf_machine": 224,
@@ -1048,7 +1048,7 @@
         64
       ],
       "undefined_symbols": [],
-      "vgpr_count": 152,
+      "vgpr_count": 174,
       "vgpr_spill_count": 0
     },
     {
@@ -1059,9 +1059,9 @@
         "s": "asm/opus_gemm_gfx950_4wave_256x128x128x64_2x2_16x16x32_0x0x0_nt.s"
       },
       "b_t": false,
-      "co_sha256": "bf8d6a3c1fd8904eb3966481f992eaf353413c0bdc4937b65746ed40797b292a",
+      "co_sha256": "f0f1128896b0afdc78e299b2e965c47836d159d407f4de48bb53025abd448f6a",
       "device_flags": [],
-      "dis_lines": 1038,
+      "dis_lines": 1213,
       "dis_mfma": 160,
       "elf_flags": 1359,
       "elf_machine": 224,
@@ -1078,7 +1078,7 @@
       "layout": "nt",
       "offload_arch": "gfx950",
       "pin": false,
-      "sgpr_count": 44,
+      "sgpr_count": 45,
       "sgpr_spill_count": 0,
       "splitk": false,
       "symbol": "opus_gemm_gfx950_4wave_256x128x128x64_2x2_16x16x32_0x0x0_nt",
@@ -1088,7 +1088,7 @@
         64
       ],
       "undefined_symbols": [],
-      "vgpr_count": 152,
+      "vgpr_count": 170,
       "vgpr_spill_count": 0
     },
     {
@@ -1099,9 +1099,9 @@
         "s": "asm/opus_gemm_gfx950_4wave_256x128x128x64_2x2_16x16x32_0x0x0_nt_bias.s"
       },
       "b_t": false,
-      "co_sha256": "c34d13d68954a7b896ade85bcf1f533226b0e6f68864e1078e94212d861c7c64",
+      "co_sha256": "4596d1cabd275cc0e4f4efa1d5b9348267a04a76fc23f4a180205296b717f1c1",
       "device_flags": [],
-      "dis_lines": 1112,
+      "dis_lines": 1272,
       "dis_mfma": 160,
       "elf_flags": 1359,
       "elf_machine": 224,
@@ -1118,7 +1118,7 @@
       "layout": "nt",
       "offload_arch": "gfx950",
       "pin": false,
-      "sgpr_count": 48,
+      "sgpr_count": 49,
       "sgpr_spill_count": 0,
       "splitk": false,
       "symbol": "opus_gemm_gfx950_4wave_256x128x128x64_2x2_16x16x32_0x0x0_nt_bias",
@@ -1128,7 +1128,7 @@
         64
       ],
       "undefined_symbols": [],
-      "vgpr_count": 152,
+      "vgpr_count": 178,
       "vgpr_spill_count": 0
     },
     {
@@ -1139,9 +1139,9 @@
         "s": "asm/opus_gemm_gfx950_4wave_256x128x128x64_2x2_16x16x32_0x0x0_tn.s"
       },
       "b_t": true,
-      "co_sha256": "58fa53d77df84538f100b6a02f5eaff41487fee5415183c014c7771ee631a37a",
+      "co_sha256": "41a0a1cea839e347c48f03856bc4cbc35ed2e1865d7e6b119d9a6ca5e62f6e50",
       "device_flags": [],
-      "dis_lines": 1112,
+      "dis_lines": 1272,
       "dis_mfma": 160,
       "elf_flags": 1359,
       "elf_machine": 224,
@@ -1168,7 +1168,7 @@
         64
       ],
       "undefined_symbols": [],
-      "vgpr_count": 152,
+      "vgpr_count": 166,
       "vgpr_spill_count": 0
     },
     {
@@ -1179,9 +1179,9 @@
         "s": "asm/opus_gemm_gfx950_4wave_256x128x128x64_2x2_16x16x32_0x0x0_tn_bias.s"
       },
       "b_t": true,
-      "co_sha256": "3ba8e8c6a329ed861c1a03ae7c5c2311755ade9e6251f38668b222e0738786d6",
+      "co_sha256": "bf4256ec2ce927c806fd64bebda5455fc6dd8d97bf642893840ee9ae5be1b7b7",
       "device_flags": [],
-      "dis_lines": 1188,
+      "dis_lines": 1350,
       "dis_mfma": 160,
       "elf_flags": 1359,
       "elf_machine": 224,
@@ -1208,7 +1208,7 @@
         64
       ],
       "undefined_symbols": [],
-      "vgpr_count": 152,
+      "vgpr_count": 170,
       "vgpr_spill_count": 0
     },
     {
@@ -1219,9 +1219,9 @@
         "s": "asm/opus_gemm_gfx950_4wave_256x128x128x64_2x2_16x16x32_0x0x0_tt.s"
       },
       "b_t": false,
-      "co_sha256": "9466f26e7f3e92e2fcc86e10b6d6985c5b7bb4262d555c85cf515ce877398df4",
+      "co_sha256": "cb561cbf6a50e8b08805933b01ea2855c7aa73ebd96c418cdd184815aa6dcf9d",
       "device_flags": [],
-      "dis_lines": 1096,
+      "dis_lines": 1257,
       "dis_mfma": 160,
       "elf_flags": 1359,
       "elf_machine": 224,
@@ -1248,7 +1248,7 @@
         64
       ],
       "undefined_symbols": [],
-      "vgpr_count": 154,
+      "vgpr_count": 170,
       "vgpr_spill_count": 0
     },
     {
@@ -1259,9 +1259,9 @@
         "s": "asm/opus_gemm_gfx950_4wave_256x128x128x64_2x2_16x16x32_0x0x0_tt_bias.s"
       },
       "b_t": false,
-      "co_sha256": "12dbe16455ef8dd44c106a209f3d0d0115664df1b32cc7671f079125960d1385",
+      "co_sha256": "e5b6b3ebcc92a8a9fab707a9bcbb7b05f41b2aa2ba8c612af8808ce23f7d602d",
       "device_flags": [],
-      "dis_lines": 1171,
+      "dis_lines": 1333,
       "dis_mfma": 160,
       "elf_flags": 1359,
       "elf_machine": 224,
@@ -1278,7 +1278,7 @@
       "layout": "tt",
       "offload_arch": "gfx950",
       "pin": false,
-      "sgpr_count": 52,
+      "sgpr_count": 53,
       "sgpr_spill_count": 0,
       "splitk": false,
       "symbol": "opus_gemm_gfx950_4wave_256x128x128x64_2x2_16x16x32_0x0x0_tt_bias",
@@ -1288,7 +1288,7 @@
         64
       ],
       "undefined_symbols": [],
-      "vgpr_count": 154,
+      "vgpr_count": 166,
       "vgpr_spill_count": 0
     },
     {
@@ -1299,9 +1299,9 @@
         "s": "asm/opus_gemm_gfx950_4wave_256x256x64x64_2x2_16x16x32_0x0x0_nn.s"
       },
       "b_t": true,
-      "co_sha256": "6c40e4235a77236a20b3d745e64b0e0e8b791203883d4bb1c3b4fbb9bec78fc0",
+      "co_sha256": "96012831ef83bab81a24139388454b2c0931cdab97ee96c62626eafe48d197e8",
       "device_flags": [],
-      "dis_lines": 1098,
+      "dis_lines": 1268,
       "dis_mfma": 160,
       "elf_flags": 1359,
       "elf_machine": 224,
@@ -1328,7 +1328,7 @@
         64
       ],
       "undefined_symbols": [],
-      "vgpr_count": 172,
+      "vgpr_count": 180,
       "vgpr_spill_count": 0
     },
     {
@@ -1339,9 +1339,9 @@
         "s": "asm/opus_gemm_gfx950_4wave_256x256x64x64_2x2_16x16x32_0x0x0_nn_bias.s"
       },
       "b_t": true,
-      "co_sha256": "5f70ded34e9ff7025cfbd9bfcff550c52f5b1c3389026d0e1c37eb15f6a5b236",
+      "co_sha256": "ab6052cb01b29ad17fd7613cc64dc05b684b20fcee9125bd2bd7f1e6d2c2cdd6",
       "device_flags": [],
-      "dis_lines": 1150,
+      "dis_lines": 1320,
       "dis_mfma": 160,
       "elf_flags": 1359,
       "elf_machine": 224,
@@ -1368,7 +1368,7 @@
         64
       ],
       "undefined_symbols": [],
-      "vgpr_count": 172,
+      "vgpr_count": 188,
       "vgpr_spill_count": 0
     },
     {
@@ -1379,9 +1379,9 @@
         "s": "asm/opus_gemm_gfx950_4wave_256x256x64x64_2x2_16x16x32_0x0x0_nt.s"
       },
       "b_t": false,
-      "co_sha256": "fdf37dfdc877aa898ea5fa908777e9876f2d03098099b16421fb0ecbe017c2b7",
+      "co_sha256": "e9712b5b716db15ba21cbe492273efaaa10d47761e35c46e55aa39443b0ad28d",
       "device_flags": [],
-      "dis_lines": 1066,
+      "dis_lines": 1238,
       "dis_mfma": 160,
       "elf_flags": 1359,
       "elf_machine": 224,
@@ -1398,7 +1398,7 @@
       "layout": "nt",
       "offload_arch": "gfx950",
       "pin": false,
-      "sgpr_count": 45,
+      "sgpr_count": 46,
       "sgpr_spill_count": 0,
       "splitk": false,
       "symbol": "opus_gemm_gfx950_4wave_256x256x64x64_2x2_16x16x32_0x0x0_nt",
@@ -1408,7 +1408,7 @@
         64
       ],
       "undefined_symbols": [],
-      "vgpr_count": 170,
+      "vgpr_count": 182,
       "vgpr_spill_count": 0
     },
     {
@@ -1419,9 +1419,9 @@
         "s": "asm/opus_gemm_gfx950_4wave_256x256x64x64_2x2_16x16x32_0x0x0_nt_bias.s"
       },
       "b_t": false,
-      "co_sha256": "bf83b42338fb90f0363951f61e9bedca6ab5874de55e3130d18ad71ac0d3d125",
+      "co_sha256": "577298d9a5e2176b96f3d348f485564e99daa7547facc25ae1aaa6d5b552701e",
       "device_flags": [],
-      "dis_lines": 1117,
+      "dis_lines": 1289,
       "dis_mfma": 160,
       "elf_flags": 1359,
       "elf_machine": 224,
@@ -1438,7 +1438,7 @@
       "layout": "nt",
       "offload_arch": "gfx950",
       "pin": false,
-      "sgpr_count": 49,
+      "sgpr_count": 50,
       "sgpr_spill_count": 0,
       "splitk": false,
       "symbol": "opus_gemm_gfx950_4wave_256x256x64x64_2x2_16x16x32_0x0x0_nt_bias",
@@ -1448,7 +1448,7 @@
         64
       ],
       "undefined_symbols": [],
-      "vgpr_count": 170,
+      "vgpr_count": 186,
       "vgpr_spill_count": 0
     },
     {
@@ -1459,9 +1459,9 @@
         "s": "asm/opus_gemm_gfx950_4wave_256x256x64x64_2x2_16x16x32_0x0x0_tn.s"
       },
       "b_t": true,
-      "co_sha256": "e8295a55a2cea5b8eac7f961512fef9c17857a7b8c6b6350ed245e7bc0c6beba",
+      "co_sha256": "2434979d57c9068fbb40cfd568b5c5d5f3df60ffa333968cbe206da379960cfa",
       "device_flags": [],
-      "dis_lines": 1211,
+      "dis_lines": 1367,
       "dis_mfma": 160,
       "elf_flags": 1359,
       "elf_machine": 224,
@@ -1488,7 +1488,7 @@
         64
       ],
       "undefined_symbols": [],
-      "vgpr_count": 166,
+      "vgpr_count": 178,
       "vgpr_spill_count": 0
     },
     {
@@ -1499,9 +1499,9 @@
         "s": "asm/opus_gemm_gfx950_4wave_256x256x64x64_2x2_16x16x32_0x0x0_tn_bias.s"
       },
       "b_t": true,
-      "co_sha256": "cb038cd0dd85228ac8bd32d8b9700ca06b8ebbc565e1f1c04b78ceb581adb6a6",
+      "co_sha256": "b10a468c34ee2f0a4600a00c313d14f7441c25d8e58c6d1601d94571f83abce8",
       "device_flags": [],
-      "dis_lines": 1264,
+      "dis_lines": 1435,
       "dis_mfma": 160,
       "elf_flags": 1359,
       "elf_machine": 224,
@@ -1528,7 +1528,7 @@
         64
       ],
       "undefined_symbols": [],
-      "vgpr_count": 166,
+      "vgpr_count": 178,
       "vgpr_spill_count": 0
     },
     {
@@ -1539,9 +1539,9 @@
         "s": "asm/opus_gemm_gfx950_4wave_256x256x64x64_2x2_16x16x32_0x0x0_tt.s"
       },
       "b_t": false,
-      "co_sha256": "6deaace290c6e9e659fc99b6e298ef38a71d1a96d02ff96f32d11314bc4cca8c",
+      "co_sha256": "5c364359e5957057502ee45f8fe87f2ea860d6a0df2e4c962ff4b01a36eb13c0",
       "device_flags": [],
-      "dis_lines": 1190,
+      "dis_lines": 1362,
       "dis_mfma": 160,
       "elf_flags": 1359,
       "elf_machine": 224,
@@ -1568,7 +1568,7 @@
         64
       ],
       "undefined_symbols": [],
-      "vgpr_count": 170,
+      "vgpr_count": 178,
       "vgpr_spill_count": 0
     },
     {
@@ -1579,9 +1579,9 @@
         "s": "asm/opus_gemm_gfx950_4wave_256x256x64x64_2x2_16x16x32_0x0x0_tt_bias.s"
       },
       "b_t": false,
-      "co_sha256": "c59c540f1f841dfe10145616e831d8a5c849c0e519e4f1c3f9d88655455ceaf1",
+      "co_sha256": "40e16273d13e5905aebc1382a8e02150a2f7def43459748664b7ce51317d002c",
       "device_flags": [],
-      "dis_lines": 1258,
+      "dis_lines": 1429,
       "dis_mfma": 160,
       "elf_flags": 1359,
       "elf_machine": 224,
@@ -1598,7 +1598,7 @@
       "layout": "tt",
       "offload_arch": "gfx950",
       "pin": false,
-      "sgpr_count": 50,
+      "sgpr_count": 51,
       "sgpr_spill_count": 0,
       "splitk": false,
       "symbol": "opus_gemm_gfx950_4wave_256x256x64x64_2x2_16x16x32_0x0x0_tt_bias",
@@ -1608,7 +1608,7 @@
         64
       ],
       "undefined_symbols": [],
-      "vgpr_count": 170,
+      "vgpr_count": 178,
       "vgpr_spill_count": 0
     },
     {
@@ -1619,9 +1619,9 @@
         "s": "asm/opus_gemm_gfx950_4wave_256x64x256x64_2x2_16x16x32_0x0x0_nn.s"
       },
       "b_t": true,
-      "co_sha256": "18de7045b68475d3e5c3e923bf78123fbc6ef80006272cfb393fb51f7f77c74a",
+      "co_sha256": "56f3e8ce37ff525e0282e2c00fde2d15f11ab2117c59e9eb14a855a3da8cc18b",
       "device_flags": [],
-      "dis_lines": 1198,
+      "dis_lines": 1369,
       "dis_mfma": 160,
       "elf_flags": 1359,
       "elf_machine": 224,
@@ -1648,7 +1648,7 @@
         64
       ],
       "undefined_symbols": [],
-      "vgpr_count": 172,
+      "vgpr_count": 182,
       "vgpr_spill_count": 0
     },
     {
@@ -1659,9 +1659,9 @@
         "s": "asm/opus_gemm_gfx950_4wave_256x64x256x64_2x2_16x16x32_0x0x0_nn_bias.s"
       },
       "b_t": true,
-      "co_sha256": "ad650028457501417bcdf9afd2d24b458fd9369bd0da9f689e0f656bf9077595",
+      "co_sha256": "a2533ddcf24aa8e623060d6f788991269cb1332c3715f67c454ba35eb85cf2ab",
       "device_flags": [],
-      "dis_lines": 1316,
+      "dis_lines": 1488,
       "dis_mfma": 160,
       "elf_flags": 1359,
       "elf_machine": 224,
@@ -1688,7 +1688,7 @@
         64
       ],
       "undefined_symbols": [],
-      "vgpr_count": 178,
+      "vgpr_count": 182,
       "vgpr_spill_count": 0
     },
     {
@@ -1699,9 +1699,9 @@
         "s": "asm/opus_gemm_gfx950_4wave_256x64x256x64_2x2_16x16x32_0x0x0_nt.s"
       },
       "b_t": false,
-      "co_sha256": "6f78184556db8ee7de2a006f7b82e28d093bea54dae7164de84b39ec992b5700",
+      "co_sha256": "46058b8f281ea78175121a90bd8aeb9c35e12c3d32d9f235e5c5d425c53c8b20",
       "device_flags": [],
-      "dis_lines": 1059,
+      "dis_lines": 1246,
       "dis_mfma": 160,
       "elf_flags": 1359,
       "elf_machine": 224,
@@ -1718,7 +1718,7 @@
       "layout": "nt",
       "offload_arch": "gfx950",
       "pin": false,
-      "sgpr_count": 45,
+      "sgpr_count": 46,
       "sgpr_spill_count": 0,
       "splitk": false,
       "symbol": "opus_gemm_gfx950_4wave_256x64x256x64_2x2_16x16x32_0x0x0_nt",
@@ -1728,7 +1728,7 @@
         64
       ],
       "undefined_symbols": [],
-      "vgpr_count": 166,
+      "vgpr_count": 182,
       "vgpr_spill_count": 0
     },
     {
@@ -1739,9 +1739,9 @@
         "s": "asm/opus_gemm_gfx950_4wave_256x64x256x64_2x2_16x16x32_0x0x0_nt_bias.s"
       },
       "b_t": false,
-      "co_sha256": "d8d939601dc078c3f9d018255c28fdec1654eb3940aecfba8d3797bcc97f7ea0",
+      "co_sha256": "50e0bbe20fcbce1cd35fc17008b696a001f4ebb22373f8a6dd7de0efd9c614d2",
       "device_flags": [],
-      "dis_lines": 1177,
+      "dis_lines": 1348,
       "dis_mfma": 160,
       "elf_flags": 1359,
       "elf_machine": 224,
@@ -1758,7 +1758,7 @@
       "layout": "nt",
       "offload_arch": "gfx950",
       "pin": false,
-      "sgpr_count": 49,
+      "sgpr_count": 50,
       "sgpr_spill_count": 0,
       "splitk": false,
       "symbol": "opus_gemm_gfx950_4wave_256x64x256x64_2x2_16x16x32_0x0x0_nt_bias",
@@ -1768,7 +1768,7 @@
         64
       ],
       "undefined_symbols": [],
-      "vgpr_count": 178,
+      "vgpr_count": 182,
       "vgpr_spill_count": 0
     },
     {
@@ -1779,9 +1779,9 @@
         "s": "asm/opus_gemm_gfx950_4wave_256x64x256x64_2x2_16x16x32_0x0x0_tn.s"
       },
       "b_t": true,
-      "co_sha256": "5263e0b70ab19e4573927dfc829721cd05879ba13fff4972167b4087127f72d6",
+      "co_sha256": "d903a276038e384501a207a030c36cfd3d2789820a9420ebe074f9fd52d3634d",
       "device_flags": [],
-      "dis_lines": 1213,
+      "dis_lines": 1385,
       "dis_mfma": 160,
       "elf_flags": 1359,
       "elf_machine": 224,
@@ -1808,7 +1808,7 @@
         64
       ],
       "undefined_symbols": [],
-      "vgpr_count": 172,
+      "vgpr_count": 184,
       "vgpr_spill_count": 0
     },
     {
@@ -1819,9 +1819,9 @@
         "s": "asm/opus_gemm_gfx950_4wave_256x64x256x64_2x2_16x16x32_0x0x0_tn_bias.s"
       },
       "b_t": true,
-      "co_sha256": "92a071ded6b2f18877e79042c05b123785ce7baeb396a18998887ae0419eb713",
+      "co_sha256": "d31c04b69e34f74341d8c37fb8a87eda2188e568997ec98ac73b4bc28962d727",
       "device_flags": [],
-      "dis_lines": 1332,
+      "dis_lines": 1504,
       "dis_mfma": 160,
       "elf_flags": 1359,
       "elf_machine": 224,
@@ -1848,7 +1848,7 @@
         64
       ],
       "undefined_symbols": [],
-      "vgpr_count": 178,
+      "vgpr_count": 182,
       "vgpr_spill_count": 0
     },
     {
@@ -1859,9 +1859,9 @@
         "s": "asm/opus_gemm_gfx950_4wave_256x64x256x64_2x2_16x16x32_0x0x0_tt.s"
       },
       "b_t": false,
-      "co_sha256": "be2053f9c68641e56476caa0ce10d4865eca966b74f25f916d573a80f7701416",
+      "co_sha256": "901c4bdfcdb59c4606650d4318d295459d8fc4b04b1ceb9c9faec7144e0761c6",
       "device_flags": [],
-      "dis_lines": 1085,
+      "dis_lines": 1273,
       "dis_mfma": 160,
       "elf_flags": 1359,
       "elf_machine": 224,
@@ -1888,7 +1888,7 @@
         64
       ],
       "undefined_symbols": [],
-      "vgpr_count": 166,
+      "vgpr_count": 182,
       "vgpr_spill_count": 0
     },
     {
@@ -1899,9 +1899,9 @@
         "s": "asm/opus_gemm_gfx950_4wave_256x64x256x64_2x2_16x16x32_0x0x0_tt_bias.s"
       },
       "b_t": false,
-      "co_sha256": "83ec76c03b2e231fe9fd2d64406dc715615b6eeecfb615106038e1a7f6f25bb1",
+      "co_sha256": "3a982343a06dcbd0592888341daf365054d44ee190cb1c6d7fc00b263ef51b2a",
       "device_flags": [],
-      "dis_lines": 1204,
+      "dis_lines": 1376,
       "dis_mfma": 160,
       "elf_flags": 1359,
       "elf_machine": 224,
@@ -1918,7 +1918,7 @@
       "layout": "tt",
       "offload_arch": "gfx950",
       "pin": false,
-      "sgpr_count": 51,
+      "sgpr_count": 52,
       "sgpr_spill_count": 0,
       "splitk": false,
       "symbol": "opus_gemm_gfx950_4wave_256x64x256x64_2x2_16x16x32_0x0x0_tt_bias",
@@ -1928,7 +1928,7 @@
         64
       ],
       "undefined_symbols": [],
-      "vgpr_count": 178,
+      "vgpr_count": 186,
       "vgpr_spill_count": 0
     },
     {
@@ -1939,9 +1939,9 @@
         "s": "asm/opus_gemm_gfx950_4wave_256x128x64x64_2x2_16x16x32_0x0x0_nn.s"
       },
       "b_t": true,
-      "co_sha256": "dc258a4871a49827b380a1d9152c02fce7a8abd63164b302e15decaa5f23c6a6",
+      "co_sha256": "abd81fe283a3f069768c980edecba8f1ba793cd87b53433e02e0e81ef02835ac",
       "device_flags": [],
-      "dis_lines": 858,
+      "dis_lines": 1015,
       "dis_mfma": 80,
       "elf_flags": 1359,
       "elf_machine": 224,
@@ -1979,9 +1979,9 @@
         "s": "asm/opus_gemm_gfx950_4wave_256x128x64x64_2x2_16x16x32_0x0x0_nn_bias.s"
       },
       "b_t": true,
-      "co_sha256": "c13df8c04820f92f05fc51fd4ce35049698356bd7db648bf2fed5877f5dfe418",
+      "co_sha256": "c591bc9137a654c49348ec6a5aa422c2e2ef2dfdcf94b84aeedca4af26d0e3a4",
       "device_flags": [],
-      "dis_lines": 910,
+      "dis_lines": 1052,
       "dis_mfma": 80,
       "elf_flags": 1359,
       "elf_machine": 224,
@@ -2008,7 +2008,7 @@
         64
       ],
       "undefined_symbols": [],
-      "vgpr_count": 100,
+      "vgpr_count": 104,
       "vgpr_spill_count": 0
     },
     {
@@ -2019,9 +2019,9 @@
         "s": "asm/opus_gemm_gfx950_4wave_256x128x64x64_2x2_16x16x32_0x0x0_nt.s"
       },
       "b_t": false,
-      "co_sha256": "d445d5396305fa4ff6004521911e8fb3ecccba712d0a7a5abc9603977094d119",
+      "co_sha256": "e42aa11a15d5faeb311443493ef9e7c6b61d8d04125f7bb8191d3eb1d223302a",
       "device_flags": [],
-      "dis_lines": 822,
+      "dis_lines": 980,
       "dis_mfma": 80,
       "elf_flags": 1359,
       "elf_machine": 224,
@@ -2038,7 +2038,7 @@
       "layout": "nt",
       "offload_arch": "gfx950",
       "pin": false,
-      "sgpr_count": 44,
+      "sgpr_count": 45,
       "sgpr_spill_count": 0,
       "splitk": false,
       "symbol": "opus_gemm_gfx950_4wave_256x128x64x64_2x2_16x16x32_0x0x0_nt",
@@ -2059,9 +2059,9 @@
         "s": "asm/opus_gemm_gfx950_4wave_256x128x64x64_2x2_16x16x32_0x0x0_nt_bias.s"
       },
       "b_t": false,
-      "co_sha256": "6d77169b9eb3b9a6cfabe361d8b04248b6cfc87b59ce40ceef984a50faad8735",
+      "co_sha256": "5d64b1224e44de5a9ad66cfb1e62eda52a4fb30f1955417f5aa690ac3c5d0855",
       "device_flags": [],
-      "dis_lines": 873,
+      "dis_lines": 1015,
       "dis_mfma": 80,
       "elf_flags": 1359,
       "elf_machine": 224,
@@ -2078,7 +2078,7 @@
       "layout": "nt",
       "offload_arch": "gfx950",
       "pin": false,
-      "sgpr_count": 48,
+      "sgpr_count": 49,
       "sgpr_spill_count": 0,
       "splitk": false,
       "symbol": "opus_gemm_gfx950_4wave_256x128x64x64_2x2_16x16x32_0x0x0_nt_bias",
@@ -2099,9 +2099,9 @@
         "s": "asm/opus_gemm_gfx950_4wave_256x128x64x64_2x2_16x16x32_0x0x0_tn.s"
       },
       "b_t": true,
-      "co_sha256": "cf4902e6bf76f0c32a09d704922dec748ccddc9bdb25cd51a1ee89c4c2c43a5e",
+      "co_sha256": "a328233968c4435f9cc1ef08d15633340d121af5e43e6fa8bf02a917e8663b9d",
       "device_flags": [],
-      "dis_lines": 905,
+      "dis_lines": 1063,
       "dis_mfma": 80,
       "elf_flags": 1359,
       "elf_machine": 224,
@@ -2139,9 +2139,9 @@
         "s": "asm/opus_gemm_gfx950_4wave_256x128x64x64_2x2_16x16x32_0x0x0_tn_bias.s"
       },
       "b_t": true,
-      "co_sha256": "b1cb84e62241c1d12200607d21ab97a4488cb6db316bdc003c75f9e667bf14db",
+      "co_sha256": "bf1b97aa19c6ec8301f249ed1fd98dd82fc34c2b52c10c7a4d70ecbd6683c8ef",
       "device_flags": [],
-      "dis_lines": 941,
+      "dis_lines": 1100,
       "dis_mfma": 80,
       "elf_flags": 1359,
       "elf_machine": 224,
@@ -2179,9 +2179,9 @@
         "s": "asm/opus_gemm_gfx950_4wave_256x128x64x64_2x2_16x16x32_0x0x0_tt.s"
       },
       "b_t": false,
-      "co_sha256": "9fc6c539c04c69c3e680174ecf0162126ce5235b690e4f2cc0f0ce4d89faea0b",
+      "co_sha256": "b72e5294109b9fd053ffb8e21520f0c88823d4f279bcf85b2a01829a974d2e42",
       "device_flags": [],
-      "dis_lines": 880,
+      "dis_lines": 1039,
       "dis_mfma": 80,
       "elf_flags": 1359,
       "elf_machine": 224,
@@ -2208,7 +2208,7 @@
         64
       ],
       "undefined_symbols": [],
-      "vgpr_count": 100,
+      "vgpr_count": 104,
       "vgpr_spill_count": 0
     },
     {
@@ -2219,9 +2219,9 @@
         "s": "asm/opus_gemm_gfx950_4wave_256x128x64x64_2x2_16x16x32_0x0x0_tt_bias.s"
       },
       "b_t": false,
-      "co_sha256": "6c398bc1578be3576fbd4a8efab66cb471726d1339e24de98664aad1d0acd26b",
+      "co_sha256": "6b38d8eefa42f4e072d725ada7f5ff3b053b91efa5a68be635dadbb558739d19",
       "device_flags": [],
-      "dis_lines": 933,
+      "dis_lines": 1075,
       "dis_mfma": 80,
       "elf_flags": 1359,
       "elf_machine": 224,
@@ -2238,7 +2238,7 @@
       "layout": "tt",
       "offload_arch": "gfx950",
       "pin": false,
-      "sgpr_count": 50,
+      "sgpr_count": 51,
       "sgpr_spill_count": 0,
       "splitk": false,
       "symbol": "opus_gemm_gfx950_4wave_256x128x64x64_2x2_16x16x32_0x0x0_tt_bias",
@@ -2248,7 +2248,7 @@
         64
       ],
       "undefined_symbols": [],
-      "vgpr_count": 100,
+      "vgpr_count": 104,
       "vgpr_spill_count": 0
     },
     {
@@ -2259,9 +2259,9 @@
         "s": "asm/opus_gemm_gfx950_4wave_256x64x128x64_2x2_16x16x32_0x0x0_nn.s"
       },
       "b_t": true,
-      "co_sha256": "58041f7390b88f2159f44a00bf6a247837ee0f540124b79079d6b2aede858fa6",
+      "co_sha256": "c723951b27485578d3dbb219f5b80e7f62f926a731b79b7d210330294dcda765",
       "device_flags": [],
-      "dis_lines": 887,
+      "dis_lines": 1044,
       "dis_mfma": 80,
       "elf_flags": 1359,
       "elf_machine": 224,
@@ -2288,7 +2288,7 @@
         64
       ],
       "undefined_symbols": [],
-      "vgpr_count": 100,
+      "vgpr_count": 104,
       "vgpr_spill_count": 0
     },
     {
@@ -2299,9 +2299,9 @@
         "s": "asm/opus_gemm_gfx950_4wave_256x64x128x64_2x2_16x16x32_0x0x0_nn_bias.s"
       },
       "b_t": true,
-      "co_sha256": "2b84fedc80bafa8671158f69113944ad8c1d9d787a9c7ef023eb3430aeff80fa",
+      "co_sha256": "faa066ae698a544b391ccdace331f84a420f274258c24ba234e20fcaae9c718f",
       "device_flags": [],
-      "dis_lines": 945,
+      "dis_lines": 1104,
       "dis_mfma": 80,
       "elf_flags": 1359,
       "elf_machine": 224,
@@ -2328,7 +2328,7 @@
         64
       ],
       "undefined_symbols": [],
-      "vgpr_count": 100,
+      "vgpr_count": 104,
       "vgpr_spill_count": 0
     },
     {
@@ -2339,9 +2339,9 @@
         "s": "asm/opus_gemm_gfx950_4wave_256x64x128x64_2x2_16x16x32_0x0x0_nt.s"
       },
       "b_t": false,
-      "co_sha256": "b5517cbcddb66446096f79e297dbe8314e855ea5756faecd5d6ff0119cc0a8ef",
+      "co_sha256": "a743074c57c12a278fb92dba3a0eadbf70c34ceaddb79348457a990c473839ba",
       "device_flags": [],
-      "dis_lines": 837,
+      "dis_lines": 994,
       "dis_mfma": 80,
       "elf_flags": 1359,
       "elf_machine": 224,
@@ -2358,7 +2358,7 @@
       "layout": "nt",
       "offload_arch": "gfx950",
       "pin": false,
-      "sgpr_count": 46,
+      "sgpr_count": 47,
       "sgpr_spill_count": 0,
       "splitk": false,
       "symbol": "opus_gemm_gfx950_4wave_256x64x128x64_2x2_16x16x32_0x0x0_nt",
@@ -2379,9 +2379,9 @@
         "s": "asm/opus_gemm_gfx950_4wave_256x64x128x64_2x2_16x16x32_0x0x0_nt_bias.s"
       },
       "b_t": false,
-      "co_sha256": "cd24c3c5d7f888bda6028e17bf25577ce1d3b6481d4a5683bb62d9df42e89961",
+      "co_sha256": "c6b3a3f4f822b7c8a2e1174eebff0906547e2f01e218e7182595d3a5e1753e3f",
       "device_flags": [],
-      "dis_lines": 895,
+      "dis_lines": 1036,
       "dis_mfma": 80,
       "elf_flags": 1359,
       "elf_machine": 224,
@@ -2398,7 +2398,7 @@
       "layout": "nt",
       "offload_arch": "gfx950",
       "pin": false,
-      "sgpr_count": 50,
+      "sgpr_count": 51,
       "sgpr_spill_count": 0,
       "splitk": false,
       "symbol": "opus_gemm_gfx950_4wave_256x64x128x64_2x2_16x16x32_0x0x0_nt_bias",
@@ -2408,7 +2408,7 @@
         64
       ],
       "undefined_symbols": [],
-      "vgpr_count": 100,
+      "vgpr_count": 102,
       "vgpr_spill_count": 0
     },
     {
@@ -2419,9 +2419,9 @@
         "s": "asm/opus_gemm_gfx950_4wave_256x64x128x64_2x2_16x16x32_0x0x0_tn.s"
       },
       "b_t": true,
-      "co_sha256": "cee31202d3d118eeaf686ffd6a0550dfc2583a2272e732a5827fd0b7c397e48e",
+      "co_sha256": "8cf3537530f17a5dcff8611a1f54ca2c2314918768feb654cca786ff2f46ef46",
       "device_flags": [],
-      "dis_lines": 907,
+      "dis_lines": 1065,
       "dis_mfma": 80,
       "elf_flags": 1359,
       "elf_machine": 224,
@@ -2448,7 +2448,7 @@
         64
       ],
       "undefined_symbols": [],
-      "vgpr_count": 102,
+      "vgpr_count": 104,
       "vgpr_spill_count": 0
     },
     {
@@ -2459,9 +2459,9 @@
         "s": "asm/opus_gemm_gfx950_4wave_256x64x128x64_2x2_16x16x32_0x0x0_tn_bias.s"
       },
       "b_t": true,
-      "co_sha256": "e8e1cd0e7b9d1850a429b83395ba4ecbf7e70c32ac5a4c3824c3e92902833dd3",
+      "co_sha256": "55fa4299f5ea5a6a97219ca921cb0cb2130aaaece46ad0517f8d6c43c6df757e",
       "device_flags": [],
-      "dis_lines": 965,
+      "dis_lines": 1125,
       "dis_mfma": 80,
       "elf_flags": 1359,
       "elf_machine": 224,
@@ -2488,7 +2488,7 @@
         64
       ],
       "undefined_symbols": [],
-      "vgpr_count": 102,
+      "vgpr_count": 104,
       "vgpr_spill_count": 0
     },
     {
@@ -2499,9 +2499,9 @@
         "s": "asm/opus_gemm_gfx950_4wave_256x64x128x64_2x2_16x16x32_0x0x0_tt.s"
       },
       "b_t": false,
-      "co_sha256": "2cc6634729cdb357f563997db6e7504c451366324c6e4f678ad14da6a7c4af24",
+      "co_sha256": "0c3529836bc3032e0bd281c3b751ae2b4799bbaf91000bc9818eba9383dc4fa0",
       "device_flags": [],
-      "dis_lines": 863,
+      "dis_lines": 1006,
       "dis_mfma": 80,
       "elf_flags": 1359,
       "elf_machine": 224,
@@ -2539,9 +2539,9 @@
         "s": "asm/opus_gemm_gfx950_4wave_256x64x128x64_2x2_16x16x32_0x0x0_tt_bias.s"
       },
       "b_t": false,
-      "co_sha256": "a7fd71b62d52629f05db76def0ac0d231680fb168ee6f1c9fe7445da54842ea8",
+      "co_sha256": "23e99891808dc266d0e2449c661f7b3d3c88882ce5e806f4b1b74b13ee53999f",
       "device_flags": [],
-      "dis_lines": 922,
+      "dis_lines": 1065,
       "dis_mfma": 80,
       "elf_flags": 1359,
       "elf_machine": 224,
@@ -2558,7 +2558,7 @@
       "layout": "tt",
       "offload_arch": "gfx950",
       "pin": false,
-      "sgpr_count": 51,
+      "sgpr_count": 52,
       "sgpr_spill_count": 0,
       "splitk": false,
       "symbol": "opus_gemm_gfx950_4wave_256x64x128x64_2x2_16x16x32_0x0x0_tt_bias",
@@ -2579,7 +2579,7 @@
         "s": "asm/opus_gemm_gfx950_splitk_4wave_ws_256x256x256x64_2x2_16x16x32_0x0x0_nn.s"
       },
       "b_t": true,
-      "co_sha256": "c72c08679e4eaade5e9029532fd202ffba96450f3c81e198dac8f3764f3625f5",
+      "co_sha256": "103e26718d011ce70fdaa3935c40d79fce11c525b07b31f4288cb88eb0749749",
       "device_flags": [],
       "dis_lines": 2498,
       "dis_mfma": 640,
@@ -2619,7 +2619,7 @@
         "s": "asm/opus_gemm_gfx950_splitk_4wave_ws_256x256x256x64_2x2_16x16x32_0x0x0_nt.s"
       },
       "b_t": false,
-      "co_sha256": "edeebf8979923afd2b00d68d42d6322726cce0f6a5ab9226b27b2288773780e4",
+      "co_sha256": "c862155f41cdc1132c01fd9e77f583363d23d8416a45c37ed5c0566d08cd4086",
       "device_flags": [],
       "dis_lines": 2375,
       "dis_mfma": 640,
@@ -2659,7 +2659,7 @@
         "s": "asm/opus_gemm_gfx950_splitk_4wave_ws_256x256x256x64_2x2_16x16x32_0x0x0_tn.s"
       },
       "b_t": true,
-      "co_sha256": "30a5c5f3f1e73c0196030927bbddf069b1649e797775fa8ef6ef12a73d747f02",
+      "co_sha256": "bdd9bb86a8771ae91511c4959db06e8d20d4526baaeaf3416aa90f50c93b4d10",
       "device_flags": [],
       "dis_lines": 2598,
       "dis_mfma": 640,
@@ -2699,7 +2699,7 @@
         "s": "asm/opus_gemm_gfx950_splitk_4wave_ws_256x256x256x64_2x2_16x16x32_0x0x0_tt.s"
       },
       "b_t": false,
-      "co_sha256": "82c52a08479e442a710e3fb5f38d3e2cddb646116c215a5432d11599e6a55a54",
+      "co_sha256": "6f350c7f6f306dc3aad9877fdf911e967f18f04a1533b76a497bd11c614d1788",
       "device_flags": [],
       "dis_lines": 2489,
       "dis_mfma": 640,
@@ -2739,7 +2739,7 @@
         "s": "asm/opus_gemm_gfx950_splitk_4wave_ws_256x256x128x64_2x2_16x16x32_0x0x0_nn.s"
       },
       "b_t": true,
-      "co_sha256": "bc02bf1c87c95777f225778e39ad54302bc11fea43dd494e3f1379e396856ef4",
+      "co_sha256": "43679d826ca364320f4bb5e96e4fc99193d304102052ebcc32478bb756b434e9",
       "device_flags": [],
       "dis_lines": 1647,
       "dis_mfma": 320,
@@ -2779,7 +2779,7 @@
         "s": "asm/opus_gemm_gfx950_splitk_4wave_ws_256x256x128x64_2x2_16x16x32_0x0x0_nt.s"
       },
       "b_t": false,
-      "co_sha256": "bcfc56a9dff6aa9a10a8849a1f0a6b555be767553158d02db78f61c5b59676ea",
+      "co_sha256": "ae3dc4cabf7a49ff69c7e696354818e3eb33946a8da25178da3734b05abdafe8",
       "device_flags": [],
       "dis_lines": 1581,
       "dis_mfma": 320,
@@ -2819,7 +2819,7 @@
         "s": "asm/opus_gemm_gfx950_splitk_4wave_ws_256x256x128x64_2x2_16x16x32_0x0x0_tn.s"
       },
       "b_t": true,
-      "co_sha256": "dbc341a76f0e938039c384b23cc07b8712bd8395bd6ae43c4b81337551154838",
+      "co_sha256": "5fec611002da8f264e91369fd759ac8d5cdff15899bf69d9090181398fd85408",
       "device_flags": [],
       "dis_lines": 1761,
       "dis_mfma": 320,
@@ -2859,7 +2859,7 @@
         "s": "asm/opus_gemm_gfx950_splitk_4wave_ws_256x256x128x64_2x2_16x16x32_0x0x0_tt.s"
       },
       "b_t": false,
-      "co_sha256": "d9115ddbc3acb2fe8d709290339e336a9e90aa9429be12c1515969b561add9e9",
+      "co_sha256": "90e0407a64b30bc597eed77953a886df263522b03a178026237251440b2cdfb9",
       "device_flags": [],
       "dis_lines": 1704,
       "dis_mfma": 320,
@@ -2899,7 +2899,7 @@
         "s": "asm/opus_gemm_gfx950_splitk_4wave_ws_256x128x256x64_2x2_16x16x32_0x0x0_nn.s"
       },
       "b_t": true,
-      "co_sha256": "21657c15ca52d68165c7539de474ee988726110222216ee3157f118654283826",
+      "co_sha256": "fc1f56f25da73bfdf22025cf9c84831c09b5b6897e2dafc966fdf84baf3de01a",
       "device_flags": [],
       "dis_lines": 1701,
       "dis_mfma": 320,
@@ -2939,7 +2939,7 @@
         "s": "asm/opus_gemm_gfx950_splitk_4wave_ws_256x128x256x64_2x2_16x16x32_0x0x0_nt.s"
       },
       "b_t": false,
-      "co_sha256": "908e4f326d19d592c7d5594d10b6adfa80e92f09d4a6a3eb081aa75d5ec3bb04",
+      "co_sha256": "b5497dd8582eb2ff6ce154e90e6ec042618f15d15102f7e4f9d7c49e8193f15c",
       "device_flags": [],
       "dis_lines": 1563,
       "dis_mfma": 320,
@@ -2979,7 +2979,7 @@
         "s": "asm/opus_gemm_gfx950_splitk_4wave_ws_256x128x256x64_2x2_16x16x32_0x0x0_tn.s"
       },
       "b_t": true,
-      "co_sha256": "a0cae4252860e2320e6205e8b99da3ecebe5b018ea3114de29cb854b3ed4a404",
+      "co_sha256": "da7733765640c7249f7527ffd4cbf4868a6f732eb85bdb44043a91526572be13",
       "device_flags": [],
       "dis_lines": 1752,
       "dis_mfma": 320,
@@ -3019,7 +3019,7 @@
         "s": "asm/opus_gemm_gfx950_splitk_4wave_ws_256x128x256x64_2x2_16x16x32_0x0x0_tt.s"
       },
       "b_t": false,
-      "co_sha256": "7f70617e213793c8dca47534750fae370f77501237d9c6fbdb948a452e82cab7",
+      "co_sha256": "2738b078cb7826d1840ede49044c871a0ba746c668f0919e97eb3552cdb98dba",
       "device_flags": [],
       "dis_lines": 1638,
       "dis_mfma": 320,
@@ -3059,7 +3059,7 @@
         "s": "asm/opus_gemm_gfx950_splitk_4wave_ws_256x128x128x64_2x2_16x16x32_0x0x0_nn.s"
       },
       "b_t": true,
-      "co_sha256": "6ef18552603649b9fd9bf30f0573f11cc8c36e3b15fcf8e7c75a8e137477da27",
+      "co_sha256": "97f448cbab22a740d92fd3664a7ecc4e0d871ba8cd32b3224fa0ee52efd185d1",
       "device_flags": [],
       "dis_lines": 1154,
       "dis_mfma": 160,
@@ -3099,7 +3099,7 @@
         "s": "asm/opus_gemm_gfx950_splitk_4wave_ws_256x128x128x64_2x2_16x16x32_0x0x0_nt.s"
       },
       "b_t": false,
-      "co_sha256": "97c0048c382eb7f3402f71d2ecf60bb9ca46f816deecac96acccdda18f044f65",
+      "co_sha256": "9cec19cfeb3fa35fc13b05e9d70ef7a18d0bbe10e2c789d6d1455fbe58dd5b88",
       "device_flags": [],
       "dis_lines": 1104,
       "dis_mfma": 160,
@@ -3139,7 +3139,7 @@
         "s": "asm/opus_gemm_gfx950_splitk_4wave_ws_256x128x128x64_2x2_16x16x32_0x0x0_tn.s"
       },
       "b_t": true,
-      "co_sha256": "568a6f19fd9f83e7b70cfde13cda80042c6ca5c0059cd30d8cd2bf249d4004e1",
+      "co_sha256": "36ad30ebcf145aa2030a1f7ae0e315df2bc0921f6d51b95813beaf952e49c6df",
       "device_flags": [],
       "dis_lines": 1164,
       "dis_mfma": 160,
@@ -3179,7 +3179,7 @@
         "s": "asm/opus_gemm_gfx950_splitk_4wave_ws_256x128x128x64_2x2_16x16x32_0x0x0_tt.s"
       },
       "b_t": false,
-      "co_sha256": "1ea2236c98570728bc22dac67c201aeef631625e477d4efed7e10cb0ba32fb65",
+      "co_sha256": "83c47c18eb033681d262f6c2010db0c8d6587e3c123792aec1301c2b5e11179f",
       "device_flags": [],
       "dis_lines": 1146,
       "dis_mfma": 160,
@@ -3219,7 +3219,7 @@
         "s": "asm/opus_gemm_gfx950_splitk_4wave_ws_256x256x64x64_2x2_16x16x32_0x0x0_nn.s"
       },
       "b_t": true,
-      "co_sha256": "554f80740f1a1abbfe5da6299e2c566f3d34f6d16c11a011e04b3f9722242574",
+      "co_sha256": "78fed1d8c5744892dc6d81eac9455d4555df4f4d974bcdf3ca660da396bd3be9",
       "device_flags": [],
       "dis_lines": 1158,
       "dis_mfma": 160,
@@ -3259,7 +3259,7 @@
         "s": "asm/opus_gemm_gfx950_splitk_4wave_ws_256x256x64x64_2x2_16x16x32_0x0x0_nt.s"
       },
       "b_t": false,
-      "co_sha256": "2162c0db3b26b18c9fbf3fac685ff43f49f21fe454e8bf48b0b0813f02ba1419",
+      "co_sha256": "1a7063f48db73a3c553850e044c2639870723e7d38b7fa349059abe4ba35cbbe",
       "device_flags": [],
       "dis_lines": 1125,
       "dis_mfma": 160,
@@ -3299,7 +3299,7 @@
         "s": "asm/opus_gemm_gfx950_splitk_4wave_ws_256x256x64x64_2x2_16x16x32_0x0x0_tn.s"
       },
       "b_t": true,
-      "co_sha256": "4a83dc66891319307cba62181f0ee78af504465d3dcc2b0418fb838269aaf89e",
+      "co_sha256": "ad74f1c7ae3f920f80cefdee4b495a09f301468df9623f525fd323b76ea98464",
       "device_flags": [],
       "dis_lines": 1269,
       "dis_mfma": 160,
@@ -3339,7 +3339,7 @@
         "s": "asm/opus_gemm_gfx950_splitk_4wave_ws_256x256x64x64_2x2_16x16x32_0x0x0_tt.s"
       },
       "b_t": false,
-      "co_sha256": "56ccf2ae98089c858a33f0172282f863b5d5f044857da5cb95527d39683aec30",
+      "co_sha256": "5538accef25184892dac2dd31c93ba3a545be11bc65f819eb52eb79d573fef4a",
       "device_flags": [],
       "dis_lines": 1264,
       "dis_mfma": 160,
@@ -3379,7 +3379,7 @@
         "s": "asm/opus_gemm_gfx950_splitk_4wave_ws_256x64x256x64_2x2_16x16x32_0x0x0_nn.s"
       },
       "b_t": true,
-      "co_sha256": "7d197e0e55131c6ebe0b30dce8aabbc8c36aacbc80dbd1ab34afd7ab3d0f4ab2",
+      "co_sha256": "98ddd398e02368938ae8270f75adb2f924dc81cd9072b3dd5b68a05eb4e25e0f",
       "device_flags": [],
       "dis_lines": 1263,
       "dis_mfma": 160,
@@ -3419,7 +3419,7 @@
         "s": "asm/opus_gemm_gfx950_splitk_4wave_ws_256x64x256x64_2x2_16x16x32_0x0x0_nt.s"
       },
       "b_t": false,
-      "co_sha256": "e9b6927bf6ca73fbb768e4f905dca26f4436fc5728703814b97d569efb2ff0d4",
+      "co_sha256": "3f77d80ee3942e45594f4ecbea5bc9252a233c78f1f453d3620f70b81efd5ac2",
       "device_flags": [],
       "dis_lines": 1124,
       "dis_mfma": 160,
@@ -3459,7 +3459,7 @@
         "s": "asm/opus_gemm_gfx950_splitk_4wave_ws_256x64x256x64_2x2_16x16x32_0x0x0_tn.s"
       },
       "b_t": true,
-      "co_sha256": "f516faac9f5a61f780d84b40ee7123818b3ddeec97ed8efb398f6c559d8bef1c",
+      "co_sha256": "d8fceedfe1db31c8614e8f2179fd9e9b4483039c2452d200a798131c6e33c2a9",
       "device_flags": [],
       "dis_lines": 1279,
       "dis_mfma": 160,
@@ -3499,7 +3499,7 @@
         "s": "asm/opus_gemm_gfx950_splitk_4wave_ws_256x64x256x64_2x2_16x16x32_0x0x0_tt.s"
       },
       "b_t": false,
-      "co_sha256": "4fc292e14232e21eecdb923030f985ca6bf217ebe54c865e5630b808b53155fc",
+      "co_sha256": "163e1f9ca85bb7191fd83253fc3512fd44c124ae31cc7c18ec9aaaa7997cb06c",
       "device_flags": [],
       "dis_lines": 1151,
       "dis_mfma": 160,
@@ -3539,7 +3539,7 @@
         "s": "asm/opus_gemm_gfx950_splitk_4wave_ws_256x128x64x64_2x2_16x16x32_0x0x0_nn.s"
       },
       "b_t": true,
-      "co_sha256": "f418fdd0ae535e4c030f349543877a67f8cbcc41e2f0e421d334372a601b4d53",
+      "co_sha256": "bad1f5824c5548125c3c0d72b7c02a7364a3bd5b32ab1dbf5b7bc26ba87f6190",
       "device_flags": [],
       "dis_lines": 918,
       "dis_mfma": 80,
@@ -3579,7 +3579,7 @@
         "s": "asm/opus_gemm_gfx950_splitk_4wave_ws_256x128x64x64_2x2_16x16x32_0x0x0_nt.s"
       },
       "b_t": false,
-      "co_sha256": "46a32a78dee6f6fec6a279d15532d24c51159a288984d9081b7b5aad6ec02e15",
+      "co_sha256": "7b4a6398dfea4c0cec5f7793479e4ccd9432af564c6567c16d8a35bc3a1e4aa3",
       "device_flags": [],
       "dis_lines": 882,
       "dis_mfma": 80,
@@ -3619,7 +3619,7 @@
         "s": "asm/opus_gemm_gfx950_splitk_4wave_ws_256x128x64x64_2x2_16x16x32_0x0x0_tn.s"
       },
       "b_t": true,
-      "co_sha256": "9050e7c11bbf52a2f71d9aabac295ec93d9cf9079e62fe39703109e3ede10ea2",
+      "co_sha256": "85d12f3c07f53dcd4d05245c58ff29179373490e765d76d47649e8eaf619a4c4",
       "device_flags": [],
       "dis_lines": 964,
       "dis_mfma": 80,
@@ -3659,7 +3659,7 @@
         "s": "asm/opus_gemm_gfx950_splitk_4wave_ws_256x128x64x64_2x2_16x16x32_0x0x0_tt.s"
       },
       "b_t": false,
-      "co_sha256": "03e6d9148f1b8a7a7df89c7ff534191e66c5fe113f6133c118acd2d50eb868a4",
+      "co_sha256": "be8938ba4a61962f3ebe8790a06f72f3f2341201b4e61ff08df8a8457f6472b3",
       "device_flags": [],
       "dis_lines": 941,
       "dis_mfma": 80,
@@ -3699,7 +3699,7 @@
         "s": "asm/opus_gemm_gfx950_splitk_4wave_ws_256x64x128x64_2x2_16x16x32_0x0x0_nn.s"
       },
       "b_t": true,
-      "co_sha256": "99dac078dcbcbad8858dd2277f998545a7e21a5bce39dcd8a37bcdb64c249420",
+      "co_sha256": "17263184a0dfc8316cfb2160ee9f8ec34144cfa8787a24d2a16446ae238ef244",
       "device_flags": [],
       "dis_lines": 952,
       "dis_mfma": 80,
@@ -3739,7 +3739,7 @@
         "s": "asm/opus_gemm_gfx950_splitk_4wave_ws_256x64x128x64_2x2_16x16x32_0x0x0_nt.s"
       },
       "b_t": false,
-      "co_sha256": "08a4ffa8d41d394fc6a15e832440f6743e58bfe7b4b328bf4421ca9a2e29d8cd",
+      "co_sha256": "8794c5057926ab09a098e61e53ec26901c8e2facdb3c6dc41fe34d75200ff55a",
       "device_flags": [],
       "dis_lines": 900,
       "dis_mfma": 80,
@@ -3779,7 +3779,7 @@
         "s": "asm/opus_gemm_gfx950_splitk_4wave_ws_256x64x128x64_2x2_16x16x32_0x0x0_tn.s"
       },
       "b_t": true,
-      "co_sha256": "d1cdf42a712105cc44824dd628b0494845fa054839e8b18236110ead21e5a235",
+      "co_sha256": "adb5f3d6344c118102e6725a78c03543cb81143eb7a2b5deceb55a158449c430",
       "device_flags": [],
       "dis_lines": 970,
       "dis_mfma": 80,
@@ -3819,7 +3819,7 @@
         "s": "asm/opus_gemm_gfx950_splitk_4wave_ws_256x64x128x64_2x2_16x16x32_0x0x0_tt.s"
       },
       "b_t": false,
-      "co_sha256": "9c108d4bcbfabf3eff69ab72ff08a96255b6633635d5253a7eb2c2a85ae128c4",
+      "co_sha256": "a5be4234e4155b0a3947f81dc70a7fb3dbb2bffd8dc5507b974d0dbfa8edf4a2",
       "device_flags": [],
       "dis_lines": 927,
       "dis_mfma": 80,

@@ -86,11 +86,7 @@ def _supports_a16w16_shape(
         return N % instance.B_N == 0 and K % instance.B_K == 0
 
     if instance.kernel_tag in GFX950_4WAVE_TAGS:
-        # K tiles of 64, at least 2 per split. The direct kernel stores C rows
-        # in 16-byte vectors, so it needs N % 8 == 0 (contiguous bf16 Y); the
-        # workspace kids write Y through the reducer and take any M and N.
-        if instance.kernel_tag == _GFX950_4WAVE_TAG and N % 8 != 0:
-            return False
+        # K tiles of 64, at least 2 per split; any M and N.
         return K % _GFX950_4WAVE_B_K == 0 and K >= 2 * _GFX950_4WAVE_B_K
 
     if not instance.has_oob:

@@ -574,17 +574,31 @@ __device__ __forceinline__ void gemm_a16w16_4wave_body(const opus_gemm_a16w16_4w
         return half_tile_m * T::HALF_B_M * c_lds_stride + (FULL ? half_tile_n * T::HALF_B_N : 0);
     };
     const int output_thread_id = static_cast<int>(thread_id_x());
+    // A tile whose last column chunk straddles column N (N % VEC_OUT != 0) cannot use the 16-byte stores
+    // there: the descriptor only bounds rows, so the vector would spill into the next row. Such tiles
+    // (the last tile column only) take a compact per-element path; all others the vector path.
+    const bool ragged = !T::SPLITK && c_n_rem < T::B_N && (c_n_rem % VEC_OUT) != 0;   // wave-uniform
     auto copy_output = [&](int half_tile_m, int half_tile_n) {
-        opus::static_for<T::HALF_B_M * T::HALF_B_N / (T::BLOCK_SIZE * VEC_OUT)>([&](auto i) {
-            const int linear = output_thread_id * VEC_OUT + decltype(i)::value * T::BLOCK_SIZE * VEC_OUT;
-            const int r = linear / T::HALF_B_N + half_tile_m * T::HALF_B_M;
-            const int cl = linear % T::HALF_B_N, c = cl + half_tile_n * T::HALF_B_N;
-            const auto value = load<VEC_OUT>(s_c, r * c_lds_stride + (FULL ? c : cl));
-            // columns >= N: 2^31 bytes, far outside the descriptor, dropped by the hardware (no branch;
-            // a larger offset would wrap the 32-bit byte offset)
-            constexpr int OOB = static_cast<int>((1u << 31) / sizeof(D_OUT));
-            store<VEC_OUT>(g_c, value, c < c_n_rem ? r * out_stride + c : OOB, 0, opus::number<2>{});
-        });
+        // columns >= N: 2^31 bytes, far outside the descriptor, dropped by the hardware (a larger offset
+        // would wrap the 32-bit byte offset)
+        constexpr int OOB = static_cast<int>((1u << 31) / sizeof(D_OUT));
+        if (!ragged) {
+            opus::static_for<T::HALF_B_M * T::HALF_B_N / (T::BLOCK_SIZE * VEC_OUT)>([&](auto i) {
+                const int linear = output_thread_id * VEC_OUT + decltype(i)::value * T::BLOCK_SIZE * VEC_OUT;
+                const int r = linear / T::HALF_B_N + half_tile_m * T::HALF_B_M;
+                const int cl = linear % T::HALF_B_N, c = cl + half_tile_n * T::HALF_B_N;
+                const auto value = load<VEC_OUT>(s_c, r * c_lds_stride + (FULL ? c : cl));
+                store<VEC_OUT>(g_c, value, c < c_n_rem ? r * out_stride + c : OOB, 0, opus::number<2>{});
+            });
+        } else {
+#pragma clang loop unroll(disable)
+            for (int linear = output_thread_id; linear < T::HALF_B_M * T::HALF_B_N; linear += T::BLOCK_SIZE) {
+                const int r = linear / T::HALF_B_N + half_tile_m * T::HALF_B_M;
+                const int cl = linear % T::HALF_B_N, c = cl + half_tile_n * T::HALF_B_N;
+                g_c.template store<1>(load<1>(s_c, r * c_lds_stride + (FULL ? c : cl)),
+                                      c < c_n_rem ? r * out_stride + c : OOB, 0, opus::number<2>{});
+            }
+        }
     };
     // Bias (per output column, fp32 add before the cast): the E_N column groups of this lane in both
     // halves of N, loaded up front (columns >= N read 0).
@@ -592,7 +606,7 @@ __device__ __forceinline__ void gemm_a16w16_4wave_body(const opus_gemm_a16w16_4w
     BiasV v_bias[2][T::E_N];
     if constexpr (T::HAS_BIAS) {
         auto g_bias = make_gmem(uniform_ptr(reinterpret_cast<const D_BIAS*>(kargs.ptr_bias) + batch_id * kargs.stride_bias_batch + col),
-                                __builtin_amdgcn_readfirstlane(static_cast<unsigned int>((kargs.n - col) * sizeof(D_BIAS))));
+                                __builtin_amdgcn_readfirstlane(static_cast<unsigned int>(((kargs.n - col) * sizeof(D_BIAS) + 3) & ~3u)));   // range checks are per dword: keep the dword of an odd last column
         const auto sc_offs = opus::layout_to_offsets<T::VEC_C>(u_sc);   // fragment f = m * E_N + n
         opus::static_for<2>([&](auto hn) { opus::static_for<T::E_N>([&](auto n) {
             v_bias[hn.value][n.value] = g_bias.template load<T::VEC_C>(hn.value * T::HALF_B_N + sc_offs[n.value] % c_lds_stride);

@@ -3300,10 +3300,9 @@ _A16W16_4WAVE_DIRECT_LAUNCH = """
     AITER_CHECK(splitK == 0 || splitK == 1,
         "@NAME@ is the direct (no split-K) launcher; use a16w16_4wave_ws kids for split-K "
         "(got splitK=", splitK, ")");
-    // The kernel stores C rows in 16-byte vectors: bf16 Y rows must stay 16-byte aligned.
-    AITER_CHECK(N % 8 == 0 && reinterpret_cast<uintptr_t>(Y.data_ptr()) % 16 == 0,
-        "@NAME@: the direct 4wave kernel needs N % 8 == 0 and a 16-byte aligned Y (got N=", N,
-        "); use an a16w16_4wave_ws kid (any N)");
+    // C is stored in 16-byte vectors (per element at the column-N tail): any N, 16-byte aligned Y base.
+    AITER_CHECK(reinterpret_cast<uintptr_t>(Y.data_ptr()) % 16 == 0,
+        "@NAME@: the direct 4wave kernel needs a 16-byte aligned Y");
     kargs.split_k = 1;
     kargs.ptr_bias = ptr_bias_;
     kargs.stride_bias_batch = stride_bias_batch_;

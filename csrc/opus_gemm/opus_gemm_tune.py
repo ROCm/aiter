@@ -563,8 +563,6 @@ def kid_rejects_shape(k_inst, M, N, K):
             or M * K * 2 > _INT32_MAX
             or N * K * 2 > _INT32_MAX
             or M * N > _INT32_MAX
-            # direct kernel: 16-byte C row stores
-            or (k_inst.kernel_tag == "a16w16_4wave" and N % 8 != 0)
         )
 
     # 4 GiB buffer-resource filter. Legacy a16w16 kids build a single

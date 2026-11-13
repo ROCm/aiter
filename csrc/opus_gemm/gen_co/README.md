@@ -399,7 +399,7 @@ device TU for these kids.
 
 | kid | tag | launcher | tiles (`B_M x B_N`, `B_K` 64) |
 |---|---|---|---|
-| 1000-1007 | `a16w16_4wave` | direct ABI; bias fused in the kernel; `split_k` 0/1; needs `N % 8 == 0` | 256x256, 256x128, 128x256, 128x128, 256x64, 64x256, 128x64, 64x128 |
+| 1000-1007 | `a16w16_4wave` | direct ABI; bias fused in the kernel; `split_k` 0/1; any N | 256x256, 256x128, 128x256, 128x128, 256x64, 64x256, 128x64, 64x128 |
 | 1008-1015 | `a16w16_4wave_ws` | workspace ABI; fp32 partials `[split][batch][pM][pN]` + `splitk_reduce_kernel` (bias folded there); `split_k` clamped to `(K/64)/2`; any `N` | same order |
 
 Tiles larger than 128x128 pin their registers (1 WG/CU), the others leave them to
