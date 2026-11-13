@@ -513,6 +513,30 @@ def get_moe_a4w4_layouts_decode(
 
 
 @gluon.jit
+def _mxfp4_quant_hw(x, BLOCK_M: gl.constexpr, BLOCK_N: gl.constexpr):
+    """MXFP4 (1x32 e8m0) quantization of an fp32 [BLOCK_M, BLOCK_N] tile.
+
+    Computes the scales exactly like _mxfp4_quant_op and converts with the
+    gfx1250 v_cvt_scalef32_pk8_fp4 instructions (round to nearest even,
+    saturating), so the bytes match the software path.
+    """
+    NUM_WARPS: gl.constexpr = gl.num_warps()
+    NUM_QB: gl.constexpr = BLOCK_N // 32
+    # 8 consecutive values per thread along N, 4 threads per 32-wide group.
+    QUANT_LAYOUT: gl.constexpr = gl.BlockedLayout([1, 8], [8, 4], [NUM_WARPS, 1], [1, 0])
+    x = gl.convert_layout(x, QUANT_LAYOUT)
+    amax = gl.max(gl.abs(gl.reshape(x, [BLOCK_M, NUM_QB, 32])), axis=2)
+    amax = amax.to(gl.int32, bitcast=True)
+    amax = (amax + 0x200000).to(gl.uint32, bitcast=True) & 0xFF800000
+    amax = amax.to(gl.float32, bitcast=True)
+    scale_unbiased = gl.floor(gl.log2(amax)) - 2
+    scale_unbiased = gl.minimum(gl.maximum(scale_unbiased, -127.0), 127.0)
+    bs_e8m0 = scale_unbiased.to(gl.uint8) + 127
+    packed = gl.amd.gfx1250.scaled_downcast(x, bs_e8m0, "e2m1", axis=1)
+    return packed, bs_e8m0
+
+
+@gluon.jit
 def unswizzle_scales_gfx1250(
     scale_buffer_slice, BLOCK_N, MX_SCALE_BLOCK_K, PRESHUFFLE_FACTOR, SCALE_KWIDTH
 ):
@@ -1287,8 +1311,8 @@ def _moe_gemm_a4w4_prefill(
         # Quant groups are 32 wide along N and OUT_BLOCK_N % 32 == 0, so every
         # group lies inside this tile: no cross-program reduction, and the
         # amax of a padding row can only ever affect that same padding row.
-        packed, bs_e8m0 = _mxfp4_quant_op(
-            out.to(gl.bfloat16).to(gl.float32), OUT_BLOCK_N, BLOCK_M, 32
+        packed, bs_e8m0 = _mxfp4_quant_hw(
+            out.to(gl.bfloat16).to(gl.float32), BLOCK_M, OUT_BLOCK_N
         )
         # The two stores get their own row offsets rather than sharing one. The
         # values and the scales come off different tails of the reshape/split
@@ -2122,8 +2146,8 @@ def _moe_gemm_a4w4_decode(
         # Quant groups are 32 wide along N and OUT_BLOCK_N % 32 == 0, so every
         # group lies inside this tile: no cross-program reduction, and the
         # amax of a padding row can only ever affect that same padding row.
-        packed, bs_e8m0 = _mxfp4_quant_op(
-            out.to(gl.bfloat16).to(gl.float32), OUT_BLOCK_N, BLOCK_M, 32
+        packed, bs_e8m0 = _mxfp4_quant_hw(
+            out.to(gl.bfloat16).to(gl.float32), BLOCK_M, OUT_BLOCK_N
         )
         # The two stores get their own row offsets rather than sharing one. The
         # values and the scales come off different tails of the reshape/split

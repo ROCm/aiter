@@ -555,6 +555,7 @@ def moe_gemm_a4w4(
             EP_SCATTER=fused_ep_scatter,
             Y_ROWS=(ep_scatter.out.shape[0] if fused_ep_scatter else 0),
             num_warps=config["num_warps"],
+            waves_per_eu=config["waves_per_eu"],
         )
     elif use_gluon:
         # layouts
@@ -671,6 +672,7 @@ def moe_gemm_a4w4(
             Y_ROWS=(ep_scatter.out.shape[0] if fused_ep_scatter else 0),
             num_ctas=config["num_ctas"],
             num_warps=config["num_warps"],
+            waves_per_eu=config["waves_per_eu"],
         )
     else:
         # launch triton kernel
