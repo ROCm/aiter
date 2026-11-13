@@ -52,6 +52,8 @@ _HGEMM_KERNEL_RE = re.compile(
 # w1x1x<k_waves> the waves splitting K inside a workgroup. It has no split-K,
 # bias or fp32 output, and runs on gfx950 only.
 SKINNY_POLICY = "sk"
+# tdma/tdmia are read/dispatch aliases for old persisted CSV rows.
+# The boolean in slot 1 describes the legacy name, NOT an active atomic path.
 TDM_POLICIES = {
     "tdm": (False, False),
     "tdmi": (True, False),
@@ -197,11 +199,10 @@ def get_flydsl_hgemm_kernel_params(name: str) -> dict | None:
                 True,
                 params["split_k"],
                 interleave,
-                atomic,
             )
         except ValueError:
             return None
-        params.update(interleave=interleave, split_k_atomic=atomic)
+        params.update(interleave=interleave, split_k_atomic=False)
     if policy == "bs" and not band_stream_name_supported(params):
         return None
     return params
@@ -252,8 +253,9 @@ def flydsl_hgemm(
     ``b_non_temporal`` streams B's async loads with the non-temporal cache
     hint. It is independent of k_stagger; tune both, since shared B can
     benefit from caching. Both options default off.
-    ``policy="tdm"/"tdmi"`` selects workspace TDM, plain/interleaved;
-    ``"tdma"/"tdmia"`` selects BF16 packed-atomic split-K on gfx1250.
+    ``policy="tdm"/"tdmi"`` selects FP32-workspace cluster TDM,
+    plain/interleaved. Legacy ``"tdma"/"tdmia"`` names remain readable aliases
+    for these paths; no packed-BF16 atomic accumulation is performed.
     All four use the same-dtype output and the existing weight[N,K] convention.
     ``policy="bs"`` selects the BF16 band-stream decode kernel for the
     validated 256-CU gfx950 M/N/K and configuration catalog. It requires
@@ -282,7 +284,7 @@ def flydsl_hgemm(
             )
         from .gemm_a16w16_tdm import gemm_a16w16_tdm
 
-        interleave, atomic = TDM_POLICIES[policy]
+        interleave, _legacy_atomic = TDM_POLICIES[policy]
         with torch.cuda.stream(launch_stream):
             # The tuned op accepts strided A/B. Normalize only layouts the
             # NT TDM contract cannot represent, before launching on this stream.
@@ -307,7 +309,6 @@ def flydsl_hgemm(
                 group_m=group_m,
                 layout="nt",
                 interleave=interleave,
-                split_k_atomic=atomic,
                 stream=launch_stream,
             )
     if policy == "bs":

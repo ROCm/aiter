@@ -828,8 +828,8 @@ def _assert_guards(storage, cols):
 
 
 def run_torch_tdm(a, weight, bias, dtype, split_k, with_rounding_budget=False):
-    # Reference includes the specified same-dtype workspace partial rounding.
-    # Atomic has extra order-dependent rounding, checked with a dtype tolerance.
+    # Each split retains FP32 partials; round only after fixed-order reduction.
+    # Legacy tdma/tdmia names execute this same path.
     if split_k == 1:
         product = a.float() @ weight.float().t()
         torch.cuda.current_stream(a.device).synchronize()
@@ -848,16 +848,18 @@ def run_torch_tdm(a, weight, bias, dtype, split_k, with_rounding_budget=False):
             )
             torch.cuda.current_stream(a.device).synchronize()
             partial_magnitude += partial.abs()
-            product += partial.to(dtype).float()
+            product += partial
     result = product.to(dtype)
     if bias is not None:
         result = (result.float() + bias.float()).to(dtype)
     if with_rounding_budget:
-        # One output ULP per partial accounts for opposite rounding at a midpoint
-        # when independent FP32 dot-product orders differ. No batch-wide norm.
+        # Bound independent FP32 dot-product order error separately from final
+        # output rounding. No input-dtype rounding budget per split.
         magnitude = partial_magnitude + product.abs()
         if bias is not None:
             magnitude = magnitude + bias.float().abs()
+        # Retain the existing componentwise budget, without the former
+        # split_k multiplier for BF16 atomic-update rounding.
         return result, torch.finfo(dtype).eps * magnitude
     return result
 
@@ -883,7 +885,8 @@ def test_hgemm_tdm(m, n, k, dtype, has_bias, layout, split_k, stages):
     ref, rounding_budget = run_torch_tdm(
         a, weight, bias, dtype, split_k, with_rounding_budget=True
     )
-    # Packed atomics require BF16, split>1 and complete pairs at the N edge.
+    # Also exercise previously persisted BF16 atomic names as compatibility
+    # aliases; no floating-point atomics execute on those names anymore.
     policies = ["tdm"]
     if layout == "nt":
         policies.append("tdmi")
@@ -925,13 +928,11 @@ def test_hgemm_tdm(m, n, k, dtype, has_bias, layout, split_k, stages):
         y = fn()
         assert y.data_ptr() == out.data_ptr()
         y, us = run_perftest(fn)
-        atomic = name in ("tdma", "tdmia")
         atol = 0.012 if dtype == dtypes.bf16 else 0.002
         rtol = 0.02 if dtype == dtypes.bf16 else 0.003
         if split_k > 1:
-            # Sequential BF16 atomic updates add at most split_k rounding steps.
-            # Grade every element, including cancellation-sensitive outputs.
-            budget = atol + rounding_budget * (split_k if atomic else 1)
+            # All policy names use the same FP32 partial reduction.
+            budget = atol + rounding_budget
             normalized_error = (ref.float() - y.float()).abs() / budget
             err = checkAllclose(
                 torch.zeros_like(normalized_error),
@@ -960,7 +961,7 @@ def test_hgemm_tdm(m, n, k, dtype, has_bias, layout, split_k, stages):
     _assert_guards(w_storage, k if layout == "nt" else n)
 
     # Each split contributes a distinct exact product. Repeated poisoned-output
-    # replays detect missing/reread splits, stale bias and a missing rank-0 clear.
+    # replays detect missing/reread splits, stale bias and output accumulation.
     a.zero_()
     weight.zero_()
     width = k // split_k
@@ -1139,17 +1140,19 @@ def check_tdm_contracts(dtype):
             a, w.t(), out, torch.zeros(127, device="cuda", dtype=dtype), **cfg
         ),
         "invalid K": lambda: gemm(a[:, :767], w[:, :767].t(), out, **cfg),
-        "odd atomic N": lambda: gemm(a, w[:127].t(), split_k_atomic=True, **cfg),
+        "invalid legacy policy": lambda: gemm(
+            a, w.t(), out, split_k_policy="bad", **cfg
+        ),
+        "invalid legacy flag": lambda: gemm(a, w.t(), out, split_k_atomic="yes", **cfg),
     }
-    if dtype == dtypes.fp16:
-        calls["FP16 atomic"] = lambda: gemm(a, w.t(), out, split_k_atomic=True, **cfg)
     for reason, call in calls.items():
         try:
             call()
         except (ValueError, RuntimeError):
             continue
         raise AssertionError(f"TDM accepted {reason}")
-    # Rounded partials must be stored in the input dtype, not FP32 workspace.
+    # Fractional contributions survive FP32 partial storage. Old same-dtype
+    # partials rounded each term down, changing the final answer.
     factor = 1 / 16 if dtype == dtypes.bf16 else 1 / 64
     for part in range(3):
         a[:, part * 256] = w[:, part * 256] = 1
@@ -1157,12 +1160,12 @@ def check_tdm_contracts(dtype):
     y = gemm(a, w.t(), out, **cfg)
     assert (
         checkAllclose(
-            torch.full_like(y, 3).float(),
+            torch.full_like(y, 3 * (1 + factor * factor)).float(),
             y.float(),
             atol=0,
             rtol=0,
             tol_err_ratio=0,
-            msg="same-dtype workspace rounding",
+            msg="FP32 workspace preserves partials",
         )
         == 0
     )
@@ -1185,18 +1188,14 @@ def check_tdm_contracts(dtype):
             )
             == 0
         )
-    if dtype == dtypes.bf16:
-        deterministic = torch.are_deterministic_algorithms_enabled()
-        try:
-            torch.use_deterministic_algorithms(True)
-            try:
-                gemm(a, w.t(), out, split_k_atomic=True, **cfg)
-            except RuntimeError:
-                pass
-            else:
-                raise AssertionError("atomic policy accepted deterministic mode")
-        finally:
-            torch.use_deterministic_algorithms(deterministic)
+    deterministic = torch.are_deterministic_algorithms_enabled()
+    try:
+        torch.use_deterministic_algorithms(True)
+        normal = gemm(a, w.t(), **cfg)
+        legacy = gemm(a, w.t(), split_k_atomic=True, **cfg)
+        torch.testing.assert_close(legacy, normal, atol=0, rtol=0)
+    finally:
+        torch.use_deterministic_algorithms(deterministic)
     a.zero_()
     w.zero_()
     a[:, 0] = 1

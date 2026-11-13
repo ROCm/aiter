@@ -6,7 +6,7 @@ import functools
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
-from flydsl.expr import const_expr, llvm, range_constexpr, rocdl, tdm_ops
+from flydsl.expr import const_expr, range_constexpr, rocdl, tdm_ops
 from flydsl.expr.rocdl.cluster import cluster_barrier
 from flydsl.expr.typing import T
 
@@ -23,6 +23,8 @@ SUPPORTED_MMA = {GEMM_DTYPE_BF16: ((16, 16, 32),), GEMM_DTYPE_FP16: ((16, 16, 32
 GEMM_DTYPE_BITS = {GEMM_DTYPE_BF16: 16, GEMM_DTYPE_FP16: 16}
 FRAGMENT_LOAD_BITS = 128
 STORE_VEC_BITS = 128
+# gfx1250 buffer cache policy: device-scope cross-CTA workspace visibility.
+WORKSPACE_CACHE_DEVICE = 0x10
 
 
 def _validate_interleaved_tile(
@@ -78,12 +80,7 @@ def validate_gemm_gfx1250_config(
     b_k_contiguous=True,
     split_k=1,
     interleave=False,
-    split_k_atomic=False,
 ):
-    if type(split_k_atomic) is not bool:
-        raise ValueError("split_k_atomic must be bool")
-    if split_k_atomic and (dtype_id != GEMM_DTYPE_BF16 or split_k == 1 or n % 2):
-        raise ValueError("split_k_atomic requires BF16, split_k > 1 and even N")
     values = (
         m,
         n,
@@ -165,7 +162,7 @@ def validate_gemm_gfx1250_config(
     shared_bytes = (max(ab_bits, c_bits) + 7) // 8
     if shared_bytes > 320 * 1024:
         raise ValueError("pipeline exceeds gfx1250's 320 KiB LDS capacity")
-    if split_k not in range(1, 10):
+    if type(split_k) is not int or split_k not in range(1, 10):
         raise ValueError("cluster split_k must be in 1..9")
     if k % (split_k * block_k):
         raise ValueError("K must be divisible by split_k * block_k")
@@ -192,11 +189,10 @@ def make_gemm_a16w16_gfx1250_kernel_name(
     mma_k,
     split_k,
     interleave=False,
-    split_k_atomic=False,
 ):
     dtype_name = GEMM_DTYPE_NAMES[dtype_id]
     layout = "nt" if b_k_contiguous else "nn"
-    return f"hgemm_{dtype_name}_t{block_m}x{block_n}x{block_k}x{stages}_w{m_waves}x{n_waves}_gm{group_m}_bias{int(has_bias)}_l{layout}_sk{split_k}_mma{mma_m}x{mma_n}x{mma_k}{('_interleave' if interleave else '')}{('_atomic' if split_k_atomic else '')}"
+    return f"hgemm_{dtype_name}_t{block_m}x{block_n}x{block_k}x{stages}_w{m_waves}x{n_waves}_gm{group_m}_bias{int(has_bias)}_l{layout}_sk{split_k}_mma{mma_m}x{mma_n}x{mma_k}{('_interleave' if interleave else '')}{('_fp32sk' if split_k > 1 else '')}"
 
 
 @functools.lru_cache(maxsize=128)
@@ -216,7 +212,6 @@ def build_gemm_gfx1250(
     mma_k: int,
     split_k: int = 1,
     interleave: bool = False,
-    split_k_atomic: bool = False,
     device_id: int = 0,
 ):
     # device_id participates in this cached factory's identity: a compiled
@@ -464,35 +459,6 @@ def build_gemm_gfx1250(
         k_rank = fx.block_idx.y
         k_tiles = k // split_k // block_k
         k_tile_base = k_rank * k_tiles
-        if const_expr(split_k_atomic):
-            if k_rank == 0:
-                for i in range_constexpr(
-                    block_m * block_n // (threads * out_vec_elems)
-                ):
-                    offset = (i * threads + tid) * out_vec_elems
-                    row, col = (offset // block_n, offset % block_n)
-                    destination = (
-                        out
-                        + fx.Int64(row_start + row) * fx.Int64(c_leading_stride)
-                        + col_start
-                        + col
-                    )
-                    if row_start + block_m <= m and col_start + block_n <= n:
-                        fx.make_view(
-                            destination, fx.make_layout(out_vec_elems, 1)
-                        ).store(fx.full(out_vec_elems, 0.0, out_dtype))
-                    else:
-                        for pair in range_constexpr(out_vec_elems // 2):
-                            if (
-                                row_start + row < m
-                                and col_start + col + pair * 2 + 1 < n
-                            ):
-                                fx.make_view(
-                                    destination + pair * 2, fx.make_layout(2, 1)
-                                ).store(fx.full(2, 0.0, out_dtype))
-            llvm.memory_fence(syncscope="agent", ordering=fx.AtomicOrdering.Release)
-            cluster_barrier()
-            llvm.memory_fence(syncscope="agent", ordering=fx.AtomicOrdering.Acquire)
         if const_expr(interleave):
             fragment_words = frag_elems * elem_bits // 32
             quadrant_steps = half_m_steps * half_n_steps
@@ -802,248 +768,196 @@ def build_gemm_gfx1250(
                 wait_tile(stages - 2 - tail)
                 compute_tile(current_stage)
                 current_stage = (current_stage + 1) % stages
-        fx.gpu.barrier()
-        if const_expr(interleave):
-            if const_expr(has_bias and split_k == 1):
-                bias_fragments = [
-                    fx.Vector.from_elements(
-                        [
-                            fx.ptr_load(
-                                bias
-                                + fx.min(
-                                    col_start
-                                    + wave_col
-                                    + ni * mma_n
-                                    + lane // 16 * acc_elems
-                                    + i,
-                                    n - 1,
-                                ),
-                                result_type=out_dtype.ir_type,
-                            )
-                            for i in range_constexpr(acc_elems)
-                        ]
-                    )
-                    for ni in range_constexpr(n_steps)
-                ]
-            for mi in range_constexpr(m_steps):
-                for ni in range_constexpr(n_steps):
-                    row = wave_row + mi * mma_m + lane % 16
-                    col = wave_col + ni * mma_n + lane // 16 * acc_elems
-                    values = accumulators[mi * n_steps + ni].load()
-                    values = values.to(out_dtype)
-                    if const_expr(has_bias and split_k == 1):
-                        values = (
-                            values.to(fx.Float32) + bias_fragments[ni].to(fx.Float32)
-                        ).to(out_dtype)
-                    fx.make_view(
-                        shared_out + row * c_pitch + col, fx.make_layout(acc_elems, 1)
-                    ).store(values)
-        else:
-            for mi in range_constexpr(m_steps):
-                for ni in range_constexpr(n_steps):
-                    row = wave_row + mi * mma_m + lane // 16 * acc_elems
-                    col = wave_col + ni * mma_n + lane % 16
-                    values = accumulators[mi * n_steps + ni].load()
-                    values = values.to(out_dtype)
-                    for i in range_constexpr(acc_elems):
-                        fx.ptr_store(values[i], shared_out + (row + i) * block_n + col)
-        fx.gpu.barrier()
 
-        def commit_output(values, row, col):
-            destination = (
-                out
-                + fx.Int64(row_start + row) * fx.Int64(c_leading_stride)
-                + col_start
-                + col
-            )
-            if row_start + block_m <= m and col_start + block_n <= n:
-                output_values = values.to(out_dtype)
+        def finish_tile():
+            # Only split1 or rank0 reaches the epilogue. Round the fully
+            # reduced product once, then add bias in output-dtype semantics.
+            fx.gpu.barrier()
+            if const_expr(interleave):
                 if const_expr(has_bias):
-                    bias_values = fx.ptr_load(
-                        bias + col_start + col,
-                        result_type=T.vec(out_vec_elems, out_dtype.ir_type),
-                    )
-                    output_values = (
-                        output_values.to(fx.Float32) + bias_values.to(fx.Float32)
-                    ).to(out_dtype)
-                fx.make_view(destination, fx.make_layout(out_vec_elems, 1)).store(
-                    output_values
-                )
-            else:
-                for element in range_constexpr(out_vec_elems):
-                    if row_start + row < m and col_start + col + element < n:
-                        value = values[element]
-                        value = value.to(out_dtype)
+                    bias_fragments = [
+                        fx.Vector.from_elements(
+                            [
+                                fx.ptr_load(
+                                    bias
+                                    + fx.min(
+                                        col_start
+                                        + wave_col
+                                        + ni * mma_n
+                                        + lane // 16 * acc_elems
+                                        + i,
+                                        n - 1,
+                                    ),
+                                    result_type=out_dtype.ir_type,
+                                )
+                                for i in range_constexpr(acc_elems)
+                            ]
+                        )
+                        for ni in range_constexpr(n_steps)
+                    ]
+                for mi in range_constexpr(m_steps):
+                    for ni in range_constexpr(n_steps):
+                        row = wave_row + mi * mma_m + lane % 16
+                        col = wave_col + ni * mma_n + lane // 16 * acc_elems
+                        values = accumulators[mi * n_steps + ni].load()
+                        values = values.to(out_dtype)
                         if const_expr(has_bias):
-                            bias_value = fx.ptr_load(
-                                bias + col_start + col + element,
-                                result_type=out_dtype.ir_type,
-                            )
-                            value = (
-                                value.to(fx.Float32) + bias_value.to(fx.Float32)
-                            ).to(out_dtype)
-                        fx.ptr_store(value, destination + element)
-
-        tile_elems = block_m * block_n
-        if const_expr(split_k_atomic):
-            output_view = fx.make_view(
-                out, fx.make_layout((m, n), (c_leading_stride, 1))
-            )
-            # Each pair is explicitly M/N-masked below; the host bounds the
-            # complete strided byte footprint to the buffer offset range.
-            output_buffer = rocdl.make_buffer_tensor(output_view)
-            atomic_atom = fx.make_copy_atom(
-                rocdl.BufferAtomicPkAdd(out_dtype), out_dtype
-            )
-            pair_layout = fx.make_layout(2, 1)
-            pair_fragment = fx.make_rmem_tensor(pair_layout, out_dtype)
-            for i in range_constexpr(tile_elems // (threads * out_vec_elems)):
-                offset = (i * threads + tid) * out_vec_elems
-                row, col = (offset // block_n, offset % block_n)
-                values = fx.ptr_load(
-                    shared_out + row * c_pitch + col,
-                    result_type=T.vec(out_vec_elems, out_dtype.ir_type),
-                )
-                for pair in range_constexpr(out_vec_elems // 2):
-                    pair_col = col_start + col + pair * 2
-                    if row_start + row < m and pair_col + 1 < n:
-                        pair_fragment.store(
-                            fx.Vector.from_elements(
-                                [values[pair * 2], values[pair * 2 + 1]], out_dtype
-                            )
-                        )
-                        destination = fx.make_view(
-                            fx.get_iter(output_buffer)
-                            + (row_start + row) * c_leading_stride
-                            + pair_col,
-                            pair_layout,
-                        )
-                        fx.copy(atomic_atom, pair_fragment, destination)
-            llvm.memory_fence(syncscope="agent", ordering=fx.AtomicOrdering.Release)
-            if const_expr(has_bias):
-                cluster_barrier()
-                llvm.memory_fence(syncscope="agent", ordering=fx.AtomicOrdering.Acquire)
-                if k_rank == 0:
-                    for i in range_constexpr(tile_elems // (threads * out_vec_elems)):
-                        offset = (i * threads + tid) * out_vec_elems
-                        row, col = (offset // block_n, offset % block_n)
-                        destination = (
-                            out
-                            + fx.Int64(row_start + row) * fx.Int64(c_leading_stride)
-                            + col_start
-                            + col
-                        )
-                        if row_start + block_m <= m and col_start + block_n <= n:
-                            values = fx.ptr_load(
-                                destination,
-                                result_type=T.vec(out_vec_elems, out_dtype.ir_type),
-                            )
-                            bias_values = fx.ptr_load(
-                                bias + col_start + col,
-                                result_type=T.vec(out_vec_elems, out_dtype.ir_type),
-                            )
                             values = (
-                                values.to(fx.Float32) + bias_values.to(fx.Float32)
+                                values.to(fx.Float32)
+                                + bias_fragments[ni].to(fx.Float32)
                             ).to(out_dtype)
-                            fx.make_view(
-                                destination, fx.make_layout(out_vec_elems, 1)
-                            ).store(values)
-                        else:
-                            for pair in range_constexpr(out_vec_elems // 2):
-                                if (
-                                    row_start + row < m
-                                    and col_start + col + pair * 2 + 1 < n
-                                ):
-                                    values = fx.ptr_load(
-                                        destination + pair * 2,
-                                        result_type=T.vec(2, out_dtype.ir_type),
-                                    )
-                                    bias_values = fx.ptr_load(
-                                        bias + col_start + col + pair * 2,
-                                        result_type=T.vec(2, out_dtype.ir_type),
-                                    )
-                                    values = (
-                                        values.to(fx.Float32)
-                                        + bias_values.to(fx.Float32)
-                                    ).to(out_dtype)
-                                    fx.make_view(
-                                        destination + pair * 2, pair_layout
-                                    ).store(values)
-        elif const_expr(interleave and split_k == 1):
-            c_tile = (block_m, c_pitch)
-            atom_c, coords_c = tdm_operand(
-                out + fx.Int64(row_start) * fx.Int64(c_leading_stride) + col_start,
-                (
-                    fx.max(0, fx.min(block_m, m - row_start)),
-                    fx.max(0, fx.min(block_n, n - col_start)),
-                ),
-                (c_leading_stride, 1),
-                c_tile,
-                (c_pitch, 1),
-                store=True,
-            )
-            shared_c = fx.make_view(
-                shared_out,
-                fx.make_layout((c_tile, 1), ((c_pitch, 1), block_m * c_pitch)),
-            )
-            src, dst = rocdl.cdna5.tdm_partition(
-                atom_c,
-                wave,
-                fx.make_layout(waves, 1),
-                shared_c,
-                coords_c[None, (0, None)],
-            )
-            fx.copy(atom_c, src[None, 0], dst[None, 0])
-            tdm_ops.tensor_wait(0)
-        elif const_expr(split_k == 1):
-            for i in range_constexpr(tile_elems // (threads * out_vec_elems)):
-                offset = (i * threads + tid) * out_vec_elems
-                row, col = (offset // block_n, offset % block_n)
-                values = fx.ptr_load(
-                    shared_out + row * c_pitch + col,
-                    result_type=T.vec(out_vec_elems, out_dtype.ir_type),
-                )
-                commit_output(values, row, col)
-        else:
-            for i in range_constexpr(tile_elems // (threads * out_vec_elems)):
-                offset = (i * threads + tid) * out_vec_elems
-                row, col = (offset // block_n, offset % block_n)
-                values = fx.ptr_load(
-                    shared_out + row * c_pitch + col,
-                    result_type=T.vec(out_vec_elems, out_dtype.ir_type),
-                )
-                partial = (
-                    workspace
-                    + fx.Int64(block_id) * (split_k * tile_elems)
-                    + fx.Int64(k_rank) * tile_elems
-                    + row * block_n
+                        fx.make_view(
+                            shared_out + row * c_pitch + col,
+                            fx.make_layout(acc_elems, 1),
+                        ).store(values)
+            else:
+                for mi in range_constexpr(m_steps):
+                    for ni in range_constexpr(n_steps):
+                        row = wave_row + mi * mma_m + lane // 16 * acc_elems
+                        col = wave_col + ni * mma_n + lane % 16
+                        values = accumulators[mi * n_steps + ni].load()
+                        values = values.to(out_dtype)
+                        for i in range_constexpr(acc_elems):
+                            fx.ptr_store(
+                                values[i], shared_out + (row + i) * block_n + col
+                            )
+            fx.gpu.barrier()
+
+            def commit_output(values, row, col):
+                destination = (
+                    out
+                    + fx.Int64(row_start + row) * fx.Int64(c_leading_stride)
+                    + col_start
                     + col
                 )
-                fx.make_view(partial, fx.make_layout(out_vec_elems, 1)).store(values)
-            # Publish same-dtype partials before another workgroup reads them.
-            llvm.memory_fence(syncscope="agent", ordering=fx.AtomicOrdering.Release)
-            cluster_barrier()
-            llvm.memory_fence(syncscope="agent", ordering=fx.AtomicOrdering.Acquire)
-            if k_rank == 0:
+                if row_start + block_m <= m and col_start + block_n <= n:
+                    output_values = values.to(out_dtype)
+                    if const_expr(has_bias):
+                        bias_values = fx.ptr_load(
+                            bias + col_start + col,
+                            result_type=T.vec(out_vec_elems, out_dtype.ir_type),
+                        )
+                        output_values = (
+                            output_values.to(fx.Float32) + bias_values.to(fx.Float32)
+                        ).to(out_dtype)
+                    fx.make_view(destination, fx.make_layout(out_vec_elems, 1)).store(
+                        output_values
+                    )
+                else:
+                    for element in range_constexpr(out_vec_elems):
+                        if row_start + row < m and col_start + col + element < n:
+                            value = values[element]
+                            value = value.to(out_dtype)
+                            if const_expr(has_bias):
+                                bias_value = fx.ptr_load(
+                                    bias + col_start + col + element,
+                                    result_type=out_dtype.ir_type,
+                                )
+                                value = (
+                                    value.to(fx.Float32) + bias_value.to(fx.Float32)
+                                ).to(out_dtype)
+                            fx.ptr_store(value, destination + element)
+
+            tile_elems = block_m * block_n
+            if const_expr(interleave):
+                c_tile = (block_m, c_pitch)
+                atom_c, coords_c = tdm_operand(
+                    out + fx.Int64(row_start) * fx.Int64(c_leading_stride) + col_start,
+                    (
+                        fx.max(0, fx.min(block_m, m - row_start)),
+                        fx.max(0, fx.min(block_n, n - col_start)),
+                    ),
+                    (c_leading_stride, 1),
+                    c_tile,
+                    (c_pitch, 1),
+                    store=True,
+                )
+                shared_c = fx.make_view(
+                    shared_out,
+                    fx.make_layout((c_tile, 1), ((c_pitch, 1), block_m * c_pitch)),
+                )
+                src, dst = rocdl.cdna5.tdm_partition(
+                    atom_c,
+                    wave,
+                    fx.make_layout(waves, 1),
+                    shared_c,
+                    coords_c[None, (0, None)],
+                )
+                fx.copy(atom_c, src[None, 0], dst[None, 0])
+                tdm_ops.tensor_wait(0)
+            else:
                 for i in range_constexpr(tile_elems // (threads * out_vec_elems)):
                     offset = (i * threads + tid) * out_vec_elems
                     row, col = (offset // block_n, offset % block_n)
-                    total = fx.ptr_load(
-                        workspace
-                        + fx.Int64(block_id) * (split_k * tile_elems)
-                        + offset,
+                    values = fx.ptr_load(
+                        shared_out + row * c_pitch + col,
                         result_type=T.vec(out_vec_elems, out_dtype.ir_type),
-                    ).to(fx.Float32)
-                    for part in range_constexpr(split_k - 1):
-                        partial = fx.ptr_load(
-                            workspace
-                            + fx.Int64(block_id) * (split_k * tile_elems)
-                            + (part + 1) * tile_elems
-                            + offset,
-                            result_type=T.vec(out_vec_elems, out_dtype.ir_type),
+                    )
+                    commit_output(values, row, col)
+
+        if const_expr(split_k == 1):
+            finish_tile()
+        else:
+            tile_elems = block_m * block_n
+            tile_base = fx.Int64(block_id) * (split_k * tile_elems)
+            # Each tile has disjoint FP32 planes in accumulator/lane order.
+            # Device-scope vector loads/stores publish partials across CTAs.
+            # The per-tile V# bound keeps workspace addressing within 32 bits;
+            # tile_base is computed in 64 bits.
+            ws = rocdl.make_buffer_tensor(
+                fx.make_view(
+                    workspace + tile_base, fx.make_layout(split_k * tile_elems, 1)
+                ),
+                max_size=False,
+                num_records_bytes=split_k * tile_elems * 4,
+            )
+            ws_atom = fx.make_copy_atom(
+                rocdl.BufferCopy128b(WORKSPACE_CACHE_DEVICE), fx.Float32
+            )
+            vec4_layout = fx.make_layout(4, 1)
+
+            def store_partial(ai):
+                values = accumulators[ai].load()
+                offset = k_rank * tile_elems + (ai * threads + tid) * acc_elems
+                for half in range_constexpr(acc_elems // 4):
+                    frag = fx.make_rmem_tensor(vec4_layout, fx.Float32)
+                    frag.store(
+                        fx.Vector.from_elements(
+                            [values[half * 4 + e] for e in range_constexpr(4)]
                         )
-                        total = total + partial.to(fx.Float32)
-                    commit_output(total, row, col)
+                    )
+                    dst = fx.make_view(fx.get_iter(ws) + offset + half * 4, vec4_layout)
+                    fx.copy(ws_atom, frag, dst)
+
+            def load_partial(ai, part, half):
+                offset = part * tile_elems + (ai * threads + tid) * acc_elems + half * 4
+                frag = fx.make_rmem_tensor(vec4_layout, fx.Float32)
+                src = fx.make_view(fx.get_iter(ws) + offset, vec4_layout)
+                fx.copy(ws_atom, src, frag)
+                return frag
+
+            for ai in range_constexpr(m_steps * n_steps):
+                store_partial(ai)
+            # Complete every wave's device-scope stores before the one-signal
+            # cluster barrier. Rank0 loads are issued only after the wait.
+            rocdl.s_wait_storecnt(0)
+            cluster_barrier()
+            if k_rank == 0:
+                for ai in range_constexpr(m_steps * n_steps):
+                    frags = [
+                        load_partial(ai, part, half)
+                        for half in range_constexpr(acc_elems // 4)
+                        for part in range_constexpr(split_k)
+                    ]
+                    values = []
+                    for half in range_constexpr(acc_elems // 4):
+                        total = frags[half * split_k].load()
+                        for part in range_constexpr(1, split_k):
+                            total = total + frags[half * split_k + part].load()
+                        for e in range_constexpr(4):
+                            values.append(total[e])
+                    accumulators[ai].store(fx.Vector.from_elements(values))
+                finish_tile()
 
     @flyc.jit
     def launch(
@@ -1112,7 +1026,6 @@ def build_gemm_gfx1250(
         mma_k,
         split_k,
         interleave,
-        split_k_atomic,
     )
     if interleave:
         launch.compile_hints["llvm_options"] = {

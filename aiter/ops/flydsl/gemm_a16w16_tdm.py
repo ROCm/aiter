@@ -41,14 +41,11 @@ def gemm_a16w16_tdm(
     orders on even/odd waves. It requires NT B and sufficiently large even wave
     tiles; the default schedule and split-K reduction semantics are unchanged.
 
-    ``split_k_atomic=True`` opts into workspace-free cluster reduction using
-    packed BF16 atomic adds. It requires split_k > 1, even N and an even output
-    leading stride. Each atomic update rounds to BF16 and rank arrival order
-    is unspecified, so results may differ between runs and from the default
-    FP32 sum of rounded partials. Workspace partials are stored in the
-    input/output dtype (BF16 or FP16, two bytes), not FP32. Bias is added once
-    after the completed sum. ``split_k_policy`` is a compatibility alias;
-    ``"workspace"`` selects the default, ``"atomic"`` selects BF16 atomics.
+    All split-K calls use FP32 partial workspace, one cluster barrier,
+    and a fixed-order rank0 reduction. Output is rounded before bias.
+    ``split_k_atomic`` and ``split_k_policy`` are deprecated compatibility
+    arguments: old atomic requests now select this same FP32 cluster path,
+    not packed BF16 atomic accumulation. Old tuning timings must be remeasured.
     """
     import flydsl.expr as fx
 
@@ -62,15 +59,14 @@ def gemm_a16w16_tdm(
     )
     from .kernels.tensor_shim import _run_compiled, ptr_arg
 
+    if type(split_k_atomic) is not bool:
+        raise ValueError("split_k_atomic must be bool")
     if split_k_policy is not None:
         if split_k_policy not in ("atomic", "workspace"):
             raise ValueError("split_k_policy must be atomic or workspace")
-        requested_atomic = split_k_policy == "atomic" and split_k > 1
-        if split_k_atomic and not requested_atomic:
+        if split_k_atomic and split_k_policy == "workspace":
             raise ValueError("conflicting split-K policy arguments")
-        split_k_atomic = requested_atomic
-    if split_k_atomic and torch.are_deterministic_algorithms_enabled():
-        raise RuntimeError("BF16 atomic split-K is nondeterministic")
+    # Compatibility only; no atomic implementation or second reduction policy.
     if a.ndim != 2 or b.ndim != 2 or a.shape[1] != b.shape[0]:
         raise ValueError("expected A[M,K] and B[K,N]")
     if a.dtype not in (torch.float16, torch.bfloat16) or b.dtype != a.dtype:
@@ -101,7 +97,6 @@ def gemm_a16w16_tdm(
         layout == "nt",
         split_k,
         interleave,
-        split_k_atomic,
     )
     a_leading_stride = _leading_stride(
         a, 1, 0, k, f"A does not satisfy the {layout.upper()} layout"
@@ -119,8 +114,6 @@ def gemm_a16w16_tdm(
     if out.shape != (m, n) or out.dtype != a.dtype or out.device != a.device:
         raise ValueError("out must be [M,N] with the input dtype and device")
     c_leading_stride = _leading_stride(out, 1, 0, n, "out must be row-major [M,N]")
-    if split_k_atomic and c_leading_stride % 2:
-        raise ValueError("split_k_atomic requires an even output leading stride")
     if bias is not None and (
         bias.shape != (n,)
         or bias.dtype != a.dtype
@@ -152,17 +145,18 @@ def gemm_a16w16_tdm(
             raise ValueError("stream must belong to the input device")
         dtype = fx.Float16 if dtype_id == GEMM_DTYPE_FP16 else fx.BFloat16
         mn_tiles = ((m + block_m - 1) // block_m) * ((n + block_n - 1) // block_n)
-        # Partials use the input/output dtype: BF16 GEMM has a 2-byte BF16
-        # workspace. Only the post-barrier register sum is FP32.
-        workspace = (
-            out
-            if split_k == 1 or split_k_atomic
-            else torch.empty(
-                (mn_tiles * split_k * block_m * block_n,),
-                device=a.device,
-                dtype=a.dtype,
+        # Allocate on the selected launch stream (also during capture).
+        # Each invocation/graph owns its FP32 partials; no cached counters.
+        with torch.cuda.stream(stream):
+            workspace = (
+                out
+                if split_k == 1
+                else torch.empty(
+                    mn_tiles * split_k * block_m * block_n,
+                    device=a.device,
+                    dtype=torch.float32,
+                )
             )
-        )
         has_bias = bias is not None
         b_k_contiguous = layout == "nt"
         launch = build_gemm_gfx1250(
@@ -181,7 +175,6 @@ def gemm_a16w16_tdm(
             mma_k,
             split_k,
             interleave,
-            split_k_atomic,
             device_id=torch.cuda.current_device(),
         )
         _run_compiled(
@@ -190,7 +183,7 @@ def gemm_a16w16_tdm(
             ptr_arg(b, dtype),
             ptr_arg(out, dtype),
             ptr_arg(out if bias is None else bias, dtype),
-            ptr_arg(workspace, dtype),
+            ptr_arg(workspace, dtype if split_k == 1 else fx.Float32),
             m,
             n,
             k,
