@@ -159,7 +159,7 @@ def _gate_up_batch(
 
 
 @flyc.jit
-def _gemm1_body_sc2(
+def _gemm1_body_m16(
     lds_raw_ptr,
     arg_aq,
     arg_ascale,
@@ -184,6 +184,7 @@ def _gemm1_body_sc2(
     swiglu_limit=None,
     situ_beta=4.0,
     situ_linear_beta=25.0,
+    aqin_row_base=False,
     aqout_row_base=False,
     NW=4,
     h1_wt=False,
@@ -196,6 +197,9 @@ def _gemm1_body_sc2(
     # aqout_row_base: the h1 output exceeds the i32 byte range (mtpr > 4096), so
     # the m-block's row offset goes into the 64-bit base and the store index only
     # covers the BM rows of this block. Off: the original single-base addressing.
+    # aqin_row_base: compact EP32 inputs can exceed signed-i32 byte offsets.
+    # Use 64-bit global addresses for those loads; smaller inputs retain the
+    # direct buffer-to-LDS DMA path and its existing instruction sequence.
     is_f8_a = a_dtype == "fp8"
     KH_TILE = BK if is_f8_a else BK // 2
     K_HALF = k_half_for(K)
@@ -372,21 +376,49 @@ def _gemm1_body_sc2(
             else:
                 mask = _lds_swizzle_mask(lds_row + lane_div_8)
                 lane_col = lane_mod_8 * fx.Int32(16)
-            voffset = (lane_col ^ mask) + cached_actual_row[sub] * fx.Int32(A_ROW_BYTES)
             off = fx.Int32(slot * (BM * KH_TILE)) + lds_row * fx.Int32(KH_TILE)
-            # As in mxfp4_gemm2._issue_a_load_lds: a wave-uniform LDS base, with 16B per lane.
-            rocdl.raw_ptr_buffer_load_lds(
-                aq_rsrc,
-                _lds_ptr3(_lds_base_i32, off),
-                fx.Int32(16),
-                voffset,
-                fx.Int32(kt * KH_TILE),
-                fx.Int32(0),
-                fx.Int32(0),
-                **_scope_attrs(slot),
-            )
+            if const_expr(aqin_row_base):
+                actual_row = cached_actual_row[sub]
+                valid_row = (actual_row >= fx.Int32(0)) & (actual_row < i32_ntok)
+                safe_row = valid_row.select(actual_row, fx.Int32(0))
+                address = (
+                    fx.Int64(arg_aq)
+                    + fx.Int64(safe_row) * fx.Int64(A_ROW_BYTES)
+                    + fx.Int64(lane_col ^ mask)
+                    + fx.Int64(kt * KH_TILE)
+                )
+                pointer_type = fx.PointerType.get(
+                    fx.Int32.ir_type, fx.AddressSpace.Global, 16
+                )
+                values = fx.Vector(
+                    fx.ptr_load(
+                        fx.inttoptr(pointer_type, address),
+                        result_type=fx.Vector.make_type(4, fx.Int32),
+                    )
+                )
+                values = valid_row.select(values, fx.Vector.filled(4, 0, fx.Int32))
+                destination = fx.add_offset(
+                    fx.recast_iter(fx.Int32, lds_raw_ptr),
+                    (off + lane * fx.Int32(16)) // fx.Int32(4),
+                )
+                fx.ptr_store(values, destination)
+            else:
+                voffset = (lane_col ^ mask) + cached_actual_row[sub] * fx.Int32(
+                    A_ROW_BYTES
+                )
+                # A wave-uniform LDS base, with 16B per lane.
+                rocdl.raw_ptr_buffer_load_lds(
+                    aq_rsrc,
+                    _lds_ptr3(_lds_base_i32, off),
+                    fx.Int32(16),
+                    voffset,
+                    fx.Int32(kt * KH_TILE),
+                    fx.Int32(0),
+                    fx.Int32(0),
+                    **_scope_attrs(slot),
+                )
 
-    def issue_a_ds_read(slot):
+    def issue_a_ds_read(slot, first_m=0, count_m=kMChunks):
         mask = (
             lds_swizzle_mask_f8(lane_mod_16, KH_TILE)
             if is_f8_a
@@ -402,7 +434,7 @@ def _gemm1_body_sc2(
                 fx.recast_iter(fx.Uint8, lds_raw_ptr),
                 lane_mod_16 * fx.Int32(KH_TILE) + lds_col,
             )
-            for i in range_constexpr(kMChunks):
+            for i in range_constexpr(first_m, first_m + count_m):
                 block_off = (slot * BM + i * 16) * KH_TILE
                 lo = Vec(
                     llvm.LoadOp(
@@ -576,12 +608,14 @@ def _gemm1_body_sc2(
     mfma_ty = T.f32x4
     zero4 = fx.Vector.filled(4, 0.0, fx.Float32)
 
-    def mfma_cluster(b_slot, a, a_scale, bs_slot, J, init):
+    def mfma_cluster(
+        b_slot, a, a_scale, bs_slot, J, init, first_sub=0, count_sub=kSubBlocks
+    ):
         mni = J % 2
         in_b = J // 2
         sb = bs_slot[mni]
         bJ0, bJ1 = b_slot[J][0], b_slot[J][1]
-        for sub in range_constexpr(kSubBlocks):
+        for sub in range_constexpr(first_sub, first_sub + count_sub):
             i0 = sub * 2 + 0
             i1 = sub * 2 + 1
             sa = a_scale[sub]
@@ -652,6 +686,19 @@ def _gemm1_body_sc2(
                 ],
             )
 
+    def mfma_row(b_slot, a, a_scale, bs_slot, J, i, init):
+        in_b = J // 2
+        sb = bs_slot[J % 2]
+        sa = a_scale[i // 2]
+        previous = zero4 if init else accm[i][J]
+        accm[i][J] = rocdl.mfma_scale_f32_16x16x128_f8f6f4(
+            mfma_ty, [a[i][0], b_slot[J][0], previous, 0, 4, i % 2, sa, in_b, sb]
+        )
+        accm[i][J] = rocdl.mfma_scale_f32_16x16x128_f8f6f4(
+            mfma_ty,
+            [a[i][1], b_slot[J][1], accm[i][J], 0, 4, 2 + i % 2, sa, 2 + in_b, sb],
+        )
+
     # B vmem instructions per K step: 4 j x 2 halves of dwordx4, plus 2 B-scale loads.
     _B_VMEM_PER_STEP = NJW * 2 + 2
 
@@ -705,31 +752,70 @@ def _gemm1_body_sc2(
             rocdl.sched_barrier(0)
             issue_a_load_lds((kt + kStages) % 3, kt + kStages)
             rocdl.sched_barrier(0)
-        if const_expr(BM == 128):
+        if const_expr(is_f8_a and BM == 128):
             asc_cur = issue_a_scale_ds_read(kt)
-            a_cur = issue_a_ds_read(kt % 3)
-        else:
-            a_cur = issue_a_ds_read(kt % 3)
-            asc_cur = issue_a_scale_ds_read(kt)
-        for J in range_constexpr(NJW):
-            if const_expr(BM != 128):
+            # Retain every B operand until both M halves consume it. No A
+            # fragment survives across halves; B prefetch happens only once.
+            for first_m in range_constexpr(kMChunks):
                 rocdl.sched_barrier(0)
-                rocdl.s_setprio(1)
-            mfma_cluster(
-                b[slot_b], a_cur, asc_cur, b_scale_v[slot_b], J, init=(kt == 0)
-            )
-            if const_expr(BM != 128):
-                rocdl.s_setprio(0)
-            rocdl.sched_barrier(0)
-            if const_expr(refill):
-                issue_b_load_j(b[slot_b], kt + kStages, J)
-            rocdl.sched_barrier(0)
+                a_cur = issue_a_ds_read(kt % 3, first_m, 1)
+                for J in range_constexpr(NJW):
+                    mfma_row(
+                        b[slot_b],
+                        a_cur,
+                        asc_cur,
+                        b_scale_v[slot_b],
+                        J,
+                        first_m,
+                        init=(kt == 0),
+                    )
+                    rocdl.sched_barrier(0)
+                    if const_expr(refill and first_m + 1 == kMChunks):
+                        issue_b_load_j(b[slot_b], kt + kStages, J)
+                    rocdl.sched_barrier(0)
+        else:
+            if const_expr(BM == 128):
+                asc_cur = issue_a_scale_ds_read(kt)
+                a_cur = issue_a_ds_read(kt % 3)
+            else:
+                a_cur = issue_a_ds_read(kt % 3)
+                asc_cur = issue_a_scale_ds_read(kt)
+            for J in range_constexpr(NJW):
+                if const_expr(BM != 128):
+                    rocdl.sched_barrier(0)
+                    rocdl.s_setprio(1)
+                mfma_cluster(
+                    b[slot_b], a_cur, asc_cur, b_scale_v[slot_b], J, init=(kt == 0)
+                )
+                if const_expr(BM != 128):
+                    rocdl.s_setprio(0)
+                rocdl.sched_barrier(0)
+                if const_expr(refill):
+                    issue_b_load_j(b[slot_b], kt + kStages, J)
+                rocdl.sched_barrier(0)
         if const_expr(refill):
             issue_b_scale_load(b_scale_v[slot_b], kt + kStages)
         if const_expr(has_next):
             _wait_lds_barrier(_vmcnt_after_a(kt + 1))
 
     gpu.barrier()
+
+    if const_expr(is_f8_a and BM == 128):
+        # Reconstruct physical wave lanes after the MFMA chain. The explicit
+        # hardware count avoids keeping epilogue lane coordinates live across
+        # GEMM. Counting an all-ones mask returns lane0..63 independently of
+        # the current execution mask; this does not change the output mapping.
+        epi_lane = fx.Int32(
+            llvm.inline_asm(
+                T.i32,
+                [],
+                "v_mbcnt_lo_u32_b32 $0, -1, 0\n\tv_mbcnt_hi_u32_b32 $0, -1, $0",
+                "=v",
+                has_side_effects=True,
+            )
+        )
+        lane_div_16 = epi_lane // fx.Int32(16)
+        lane_mod_16 = epi_lane % fx.Int32(16)
 
     # lds_acc reuses the s_aq region (offset 0) as an f32 accumulator.
     # A BN+4 row stride without column XOR removes epilogue LDS bank conflicts.
@@ -774,7 +860,19 @@ def _gemm1_body_sc2(
 
     gpu.barrier()
 
-    tx_i32 = fx.Int32(gpu.thread_id("x"))
+    if const_expr(is_f8_a and BM == 128):
+        quant_lane = fx.Int32(
+            llvm.inline_asm(
+                T.i32,
+                [],
+                "v_mbcnt_lo_u32_b32 $0, -1, 0\n\tv_mbcnt_hi_u32_b32 $0, -1, $0",
+                "=v",
+                has_side_effects=True,
+            )
+        )
+        tx_i32 = wave * fx.Int32(64) + quant_lane
+    else:
+        tx_i32 = fx.Int32(gpu.thread_id("x"))
     # 16 threads per row; 4-wave: tx // 16 covers 16 rows per pass.  8-wave: the
     # second 256 threads (half = 1) take the next 32-row block in the same pass.
     m_lane = (tx_i32 % fx.Int32(256)) // fx.Int32(16) if W8 else tx_i32 // fx.Int32(16)
@@ -947,7 +1045,7 @@ def _gemm1_body_sc2(
 # Preserve the private import spelling used by the fused wrappers while making
 # the JIT function name itself layout-versioned.  FlyDSL keys its persistent
 # cache by JIT function, not only by the emitted GPU symbol.
-_gemm1_body = _gemm1_body_sc2
+_gemm1_body = _gemm1_body_m16
 
 
 # Bank-conflict-free LDS layout for the f32 epilogue accumulator (BN=256 only).
@@ -983,7 +1081,7 @@ _EPI_SWZ_CHECKED = set()
 
 
 def _epi_swz_selfcheck(BM, BN):
-    """Check the _gemm1_body_sc2 epilogue addresses using compile-time Python integers.
+    """Check the _gemm1_body epilogue addresses using compile-time Python integers.
     With a BN+4 stride, b128 reads are 16B-aligned. Writes (b32, one phase of 64
     lanes or two phases of 32 lanes) and reads (four CDNA4 phases or eight CDNA3
     phases) have no bank conflicts.
@@ -1216,6 +1314,7 @@ def gemm2_compute_v2(
     assert NW in (4, 8)
     wave_c = wave % fx.Int32(4) if NW == 8 else wave  # column slice within the n_block
     is_f8_a = a_dtype == "fp8"
+    stream_a = is_f8_a and BM == 128
     A_NW = min(NW, BM // (4 if is_f8_a else 8))
     kMChunks = BM // 16  # 16-row MFMA row-groups
     kHalves = BK // 128  # 16x16x128 MFMA K-steps per K-tile
@@ -1294,10 +1393,10 @@ def gemm2_compute_v2(
                 a_dtype=a_dtype,
             )
 
-    def issue_a_ds_read(slot):
+    def issue_a_ds_read(slot, first_m=0, count_m=kMChunks):
         # A ds-read for one slot into a_frags: fp8 -> i32<8:1> (two 128-K halves), fp4 -> i32<4:1>.
         for k in range_constexpr(kHalves):
-            for i in range_constexpr(kMChunks):
+            for i in range_constexpr(first_m, first_m + count_m):
                 lds_row = lane_mod_16 + i * 16
                 row_off = fx.Int32(slot * slot_bytes) + lds_row * KH_TILE_A
                 mask = (
@@ -1442,6 +1541,23 @@ def gemm2_compute_v2(
                     k_halves=kHalves,
                 )
 
+    def mfma_row(bqf, bsf, sa, i):
+        # Preserve each row's K-half order and E8M0 operand selection.
+        for J in range_constexpr(numAccN):
+            sb = Vec(bsf[J // 2].load())[0]
+            for half in range_constexpr(kHalves):
+                osa = 2 * half + i % 2
+                osb = 2 * half + J % 2
+                fx.gemm(
+                    mma_atoms[(osa, osb)],
+                    c_frags[i][J],
+                    a_frags[i][half],
+                    bqf[J][half],
+                    c_frags[i][J],
+                    scale_a=sa[i // 2],
+                    scale_b=sb,
+                )
+
     # C accumulator: register fragments, zeroed then accumulated in place; (un)packed to K-loop carry.
     zero4 = fx.full(4, 0.0, Float32)
     c_frags = [
@@ -1565,10 +1681,12 @@ def gemm2_compute_v2(
     ):
         store_carry(state)
         kt_rt = fx.Int32(kt_iv)
-        prefetch_next_b(kt_rt)
+        if const_expr(not stream_a):
+            prefetch_next_b(kt_rt)
         gpu.barrier()
         nxt_a = kt_rt + fx.Int32(kStages)
-        issue_a_ds_read(kt_rt % fx.Int32(aStages))
+        if const_expr(not stream_a):
+            issue_a_ds_read(kt_rt % fx.Int32(aStages))
         if nxt_a < K_TILES_RT:
             issue_a_load_lds(nxt_a % fx.Int32(aStages), nxt_a)
         # A-scale from the prefetch carry (g2_ascale_pf) or loaded synchronously here.
@@ -1576,7 +1694,16 @@ def gemm2_compute_v2(
         # Fence the MFMA chain from the B vmem loads (next-tile loads ride ahead of compute).
         rocdl.sched_barrier(0)
         rocdl.s_setprio(1)
-        mfma_cluster(cur_bqf, cur_bsf, sa, kt_rt)
+        if const_expr(stream_a):
+            # A row is consumed before reading the next. B is reused over M;
+            # refill its next K tile only when the final M row starts.
+            for i in range_constexpr(kMChunks):
+                issue_a_ds_read(kt_rt % fx.Int32(aStages), i, 1)
+                if const_expr(i == kMChunks - 1):
+                    prefetch_next_b(kt_rt)
+                mfma_row(cur_bqf, cur_bsf, sa, i)
+        else:
+            mfma_cluster(cur_bqf, cur_bsf, sa, kt_rt)
         rocdl.s_setprio(0)
         rocdl.sched_barrier(0)
         results = yield yield_carry()

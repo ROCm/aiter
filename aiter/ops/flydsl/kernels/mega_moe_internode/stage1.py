@@ -28,6 +28,7 @@ import math
 import flydsl.compiler as flyc
 import flydsl.expr as fx
 import mori.cco.device.flydsl as cco
+from flydsl._mlir.dialects import llvm as _llvm_d
 from flydsl._mlir.dialects import rocdl as _mlir_rocdl
 from flydsl.expr import const_expr, gpu, range_constexpr, rocdl
 from flydsl.expr.typing import T
@@ -35,13 +36,22 @@ from flydsl.expr.typing import Vector as Vec
 
 from aiter.ops.flydsl.kernels import buffer_ops
 from aiter.ops.flydsl.kernels.communication_ops_utils import (
+    _device_trap,
+)
+from aiter.ops.flydsl.kernels.communication_ops_utils import (
     atomic_add_workgroup as _atomic_add_wg,
 )
 
 from ..mxfp4_gemm_common import k_tiles_total_for
 from . import communication as comm
+from .buffer_addressing import (
+    region_local_address,
+    region_lsa_address,
+    region_window_address,
+)
+from .communication import RailGda
 from .communication import ccqe_enabled as _rail_ccqe
-from .communication import rail as _rail
+from .communication import rail as _default_rail
 
 # GEMM helper changes must also invalidate this module's kernel cache.
 from .gemm import (
@@ -103,6 +113,11 @@ def _compile_stage1(
     situ_linear_beta: float = 1.0,
     waves: int = 4,
     group_ready: bool = False,
+    buffer_regions: tuple = (),
+    lsa_peer_base: int = 0,
+    gda_peer_stride: int = 1,
+    gda_peer_lane: int = 0,
+    gda_physical_width: int = 0,
 ):
     """Compile one EP16 Stage-1 persistent-kernel shape specialization.
 
@@ -168,8 +183,31 @@ def _compile_stage1(
     group_ready = bool(group_ready)
     GROUP_ROWS = BM * G
     BN = int(layout.block_n)
-    if WORLD != 16 or GPUS_PER_NODE != 8:
-        raise ValueError("Stage-1 transport requires EP16 on two 8-GPU nodes")
+    if (
+        WORLD not in (16, 32, 64)
+        or GPUS_PER_NODE not in (4, 8)
+        or WORLD // GPUS_PER_NODE not in (2, 4, 8)
+    ):
+        raise ValueError(
+            "Stage-1 transport requires 2, 4 or 8 logical nodes of 4 or 8 GPUs"
+        )
+    if GPUS_PER_NODE == 4 and not buffer_regions:
+        raise NotImplementedError(
+            "four-GPU logical nodes require separated CCO buffers"
+        )
+    lsa_peer_base = int(lsa_peer_base)
+    if lsa_peer_base < 0 or lsa_peer_base % GPUS_PER_NODE:
+        raise ValueError("LSA peer base must align to a logical GPU node")
+    _rail = (
+        _default_rail
+        if (gda_peer_stride, gda_peer_lane) == (1, 0)
+        else RailGda(
+            peer_stride=gda_peer_stride,
+            peer_lane=gda_peer_lane,
+            rank=rank,
+            physical_width=gda_physical_width,
+        )
+    )
     if HIDDEN < 1024 or HIDDEN % 512:
         raise ValueError("Stage-1 hidden must be >= 1024 and divisible by 512")
     if HIDDEN > 8192:
@@ -201,6 +239,10 @@ def _compile_stage1(
         )
     # Keep the progress grid resident even when token capacity grows.
     MAX_TOKENS = int(layout.max_tokens)
+    BOUNDED_RECV = layout.route_capacity < (
+        layout.source_capacity * layout.max_routes_per_token_per_rank
+    )
+    COMPACT_INPUT = layout.input_capacity < layout.source_capacity
     COMM_CTAS = GPUS_PER_NODE
     PRODUCER_FIRST = COMM_CTAS
     PRODUCER_CTAS = min(128, MAX_TOKENS)
@@ -220,7 +262,7 @@ def _compile_stage1(
             f"{worker_blocks}"
         )
     if not 0 <= int(rank) < WORLD:
-        raise ValueError("rank must be in [0, 16)")
+        raise ValueError(f"rank must be in [0, {WORLD})")
     if worker_blocks < ESSENTIAL_CTAS:
         raise ValueError(
             f"worker_blocks must be >= {ESSENTIAL_CTAS} so all progress roles are resident"
@@ -235,14 +277,17 @@ def _compile_stage1(
     rank = int(rank)
     local_rank = rank % GPUS_PER_NODE
     node = rank // GPUS_PER_NODE
-    remote_node = 1 - node
-    remote_source_rank = remote_node * GPUS_PER_NODE + local_rank
+    NODES = WORLD // GPUS_PER_NODE
+    REMOTE_NODES = tuple(peer for peer in range(NODES) if peer != node)
     stage2_window_offset = int(stage2_window_offset)
     # rail_soa layout shared by dispatch_staging[p] and remote_dispatch_rx[p].
     from .quant import rail_record_layout as _rail_record_layout
 
     REC_BYTES, REC_Q, REC_S, REC_I, REC_W = _rail_record_layout(HIDDEN, TOPK, A_DTYPE)
-    RAIL_QPS = 4
+    # Each poster borrows the first fanout shard of a nonzero destination.
+    # A fourth poster on a four-GPU node would steal dest0's first token
+    # shard as well as T0's reserved shard, leaving those tokens unprocessed.
+    RAIL_QPS = min(4, GPUS_PER_NODE - 1)
     # Assign fanout CTAs by (dest, shard). T0 handles CCO, credits, and sealing,
     # so it cannot also handle a dest0 shard; at least two shards are required.
     if fanout_ctas_per_dest < 2:
@@ -335,6 +380,9 @@ def _compile_stage1(
     # h1_output_q at mtpr > 4096 passes the i32 byte range: GMM1 then puts each
     # m-block's row offset into the 64-bit base (sizes <= 4096 keep the old ISA).
     H1_ROW_BASE = layout.region("h1_output_q").nbytes // layout.parity_depth >= 1 << 31
+    INPUT_ROW_BASE = (
+        layout.region("grouped_input_q").nbytes // layout.parity_depth >= 1 << 31
+    )
 
     # Compile-time region helpers.  CCO offsets are relative to the physical
     # window; local addresses add arena_ptr at runtime.
@@ -343,6 +391,8 @@ def _compile_stage1(
 
     def plane(name):
         return _plane_bytes(layout, name)
+
+    region_indices = {(stage, name): index for stage, name, index in buffer_regions}
 
     s2_parity_depth = int(stage2_layout.parity_depth)
     stage2_geometry = (
@@ -396,6 +446,9 @@ def _compile_stage1(
             else ""
         )
         + ("_a8w4" if A_DTYPE == "fp8" else "")
+        # Distinguish the restored M16 helper from prior M32 compiled handles.
+        + ("_am16" if A_DTYPE == "fp8" and GBM == 128 else "")
+        + (f"_ep{WORLD}_gpn{GPUS_PER_NODE}" if NODES != 2 else "")
         + (
             ""
             if swiglu_limit is None
@@ -411,7 +464,14 @@ def _compile_stage1(
         + ("_slg" if split_local else "_nsl")
         + (f"_w{WAVES}" if WAVES != 4 else "")
         + ("_gr" if group_ready else "")
+        + ("_c1" if buffer_regions else "")
+        + (
+            f"_vl{gda_peer_stride}l{gda_peer_lane}b{lsa_peer_base}"
+            if gda_peer_stride != 1
+            else ""
+        )
         + ("_rq_bounded_ac1_mgloop_c1" if ready_q else "")
+        + ("_recv_status" if BOUNDED_RECV else "")
         # Compile rail CQ polling in CCQE mode.
         + ("_ccqe" if _rail_ccqe() else "")
     )
@@ -434,14 +494,25 @@ def _compile_stage1(
     ):
         if const_expr(lds_raw is None):
             lds_raw = fx.SharedAllocator().allocate(SharedStorage).peek().raw.ptr
-        arena_window = cco.Window(arena_win)
         # cco_lsa_ptr(w, peer, off) = winBase + peer*(stride4G<<32) + off.
         # Each call reloads two window fields (~6.5% of routing time in ATT).
         # Cache the base and peer stride at entry; later peer addresses use integer arithmetic.
-        arena_lsa_base = fx.Int64(arena_window.lsa_ptr(fx.Int32(0), fx.Int64(0)))
-        arena_lsa_stride = (
-            fx.Int64(arena_window.lsa_ptr(fx.Int32(1), fx.Int64(0))) - arena_lsa_base
-        )
+        if const_expr(not buffer_regions):
+            arena_window = cco.Window(arena_win)
+            arena_lsa_base = fx.Int64(arena_window.lsa_ptr(fx.Int32(0), fx.Int64(0)))
+            arena_lsa_stride = (
+                fx.Int64(arena_window.lsa_ptr(fx.Int32(1), fx.Int64(0)))
+                - arena_lsa_base
+            )
+
+        def persistent_addr(name):
+            address = arena_ptr + fx.Int64(off(name))
+            if const_expr(bool(buffer_regions)):
+                address = region_local_address(
+                    arena_ptr, region_indices[1, name], fx.Int64(0)
+                )
+            return address
+
         tx = fx.Int32(gpu.thread_id("x"))
         lane = tx & fx.Int32(63)
         wave = rocdl.readfirstlane(T.i32, tx // fx.Int32(64))
@@ -453,9 +524,7 @@ def _compile_stage1(
         ticket_view = fx.make_view(ticket_ptr, fx.make_layout(1, 1))
         if tx == fx.Int32(0):
             ticket_lane = fx.Int64(
-                comm.atomic_add_agent(
-                    arena_ptr + fx.Int64(off("entry_count")), fx.Int64(1)
-                )
+                comm.atomic_add_agent(persistent_addr("entry_count"), fx.Int64(1))
             )
             fx.ptr_store(Vec.from_elements([ticket_lane], fx.Int64), ticket_ptr)
         gpu.barrier()
@@ -468,19 +537,42 @@ def _compile_stage1(
         control_generation = generation
 
         def local_addr(name):
-            return arena_ptr + fx.Int64(off(name)) + parity * fx.Int64(plane(name))
+            address = arena_ptr + fx.Int64(off(name)) + parity * fx.Int64(plane(name))
+            if const_expr(bool(buffer_regions)):
+                address = region_local_address(
+                    arena_ptr, region_indices[1, name], parity
+                )
+            return address
 
         def window_off(name):
-            return fx.Int64(off(name)) + parity * fx.Int64(plane(name))
+            offset = fx.Int64(off(name)) + parity * fx.Int64(plane(name))
+            if const_expr(bool(buffer_regions)):
+                offset = region_window_address(
+                    arena_ptr, region_indices[1, name], parity
+                )[1]
+            return offset
+
+        def window_handle(name):
+            handle = arena_win
+            if const_expr(bool(buffer_regions)):
+                handle = region_window_address(
+                    arena_ptr, region_indices[1, name], parity
+                )[0]
+            return handle
 
         def stage2_addr(name):
-            return (
+            address = (
                 arena_ptr
                 + fx.Int64(stage2_window_offset + s2_off(name))
                 + parity * fx.Int64(s2_plane(name))
             )
+            if const_expr(bool(buffer_regions)):
+                address = region_local_address(
+                    arena_ptr, region_indices[2, name], parity
+                )
+            return address
 
-        error_addr = arena_ptr + fx.Int64(off("error_count"))
+        error_addr = persistent_addr("error_count")
 
         # Arrival tickets, rather than block IDs, ensure every progress role is
         # among the first resident CTAs on an oversubscribed persistent grid.
@@ -506,6 +598,20 @@ def _compile_stage1(
                 comm.fence_system_acquire()
             gpu.barrier()
 
+        def peer_local_addr(name, peer):
+            # RX/credit/request arrays omit this node; their full allocation
+            # stride includes all peers and both parities.
+            peer_bytes = plane(name) // (NODES - 1)
+            index = peer - int(peer > node)
+            return local_addr(name) + fx.Int64(index * peer_bytes)
+
+        def peer_window_off(name, peer):
+            # A remote write indexes the destination's array by our node,
+            # excluding that destination. The source's local index differs.
+            peer_bytes = plane(name) // (NODES - 1)
+            index = node - int(node > peer)
+            return window_off(name) + fx.Int64(index * peer_bytes)
+
         def _rail_post(post_qp, with_credit):
             """Post QP post_qp's token records from one wave using rail_soa.
 
@@ -514,57 +620,64 @@ def _compile_stage1(
             with_credit waits for this QP's generation g-2 credit on the same parity;
             T0 has already waited for all credits outside this helper.
             """
-            src_base = fx.Int64(off("dispatch_staging"))
-            comm.fence_system_release()
-            if const_expr(with_credit):  # noqa: SIM102
-                if lane == fx.Int32(0):
-                    for cchunk in range(
-                        fx.Int32(0), fx.Int32(dispatch_chunks), fx.Int32(1)
-                    ):
-                        _spin(
-                            local_addr("remote_chunk_credit")
-                            + fx.Int64(cchunk * fx.Int32(layout.num_qp) + post_qp)
-                            * fx.Int64(8),
-                            generation - fx.Int64(2),
-                        )
-            rows = fx.Int32((MAX_TOKENS + RAIL_QPS - 1) // RAIL_QPS)
-            r0 = post_qp * rows
-            left = ntokens - r0
-            left = (left > fx.Int32(0)).select(left, fx.Int32(0))
-            nr = (left < rows).select(left, rows)
-            if nr > fx.Int32(0):
-                _rail.put(
-                    dev_comm,
-                    post_qp,
-                    fx.Int32(remote_node),
-                    arena_win,
-                    window_off("remote_dispatch_rx")
-                    + fx.Int64(r0 * fx.Int32(REC_BYTES)),
-                    arena_win,
-                    src_base + fx.Int64(r0 * fx.Int32(REC_BYTES)),
-                    fx.Int64(nr * fx.Int32(REC_BYTES)),
-                    aggregate=True,
-                )
-            # Consumers wait only for chunk 0's num_qp ready words. Each QP publishes at
-            # least one ready word after its ordered data writes, so all data has arrived.
-            for w in range_constexpr(layout.num_qp):
-                if post_qp == fx.Int32(w % RAIL_QPS):
-                    _rail.put_value(
+            for remote_index in range_constexpr(NODES - 1):
+                remote_node = REMOTE_NODES[remote_index]
+                src_base = fx.Int64(off("dispatch_staging"))
+                if const_expr(bool(buffer_regions)):
+                    src_base = region_window_address(
+                        arena_ptr, region_indices[1, "dispatch_staging"], fx.Int64(0)
+                    )[1]
+                comm.fence_system_release()
+                if const_expr(with_credit):  # noqa: SIM102
+                    if lane == fx.Int32(0):
+                        for cchunk in range(
+                            fx.Int32(0), fx.Int32(dispatch_chunks), fx.Int32(1)
+                        ):
+                            _spin(
+                                peer_local_addr("remote_chunk_credit", remote_node)
+                                + fx.Int64(cchunk * fx.Int32(layout.num_qp) + post_qp)
+                                * fx.Int64(8),
+                                generation - fx.Int64(2),
+                            )
+                rows = fx.Int32((MAX_TOKENS + RAIL_QPS - 1) // RAIL_QPS)
+                r0 = post_qp * rows
+                left = ntokens - r0
+                left = (left > fx.Int32(0)).select(left, fx.Int32(0))
+                nr = (left < rows).select(left, rows)
+                if nr > fx.Int32(0):
+                    _rail.put(
                         dev_comm,
                         post_qp,
                         fx.Int32(remote_node),
-                        arena_win,
-                        window_off("remote_chunk_ready") + fx.Int64(w * 8),
-                        generation,
+                        window_handle("remote_dispatch_rx"),
+                        peer_window_off("remote_dispatch_rx", remote_node)
+                        + fx.Int64(r0 * fx.Int32(REC_BYTES)),
+                        window_handle("dispatch_staging"),
+                        src_base + fx.Int64(r0 * fx.Int32(REC_BYTES)),
+                        fx.Int64(nr * fx.Int32(REC_BYTES)),
                         aggregate=True,
                     )
-            request = _rail.flush_async(dev_comm, post_qp, fx.Int32(remote_node))
-            if lane == fx.Int32(0):
-                comm.store_i64_global_system(
-                    local_addr("remote_chunk_request")
-                    + fx.Int64(post_qp) * fx.Int64(8),
-                    request,
-                )
+                # Consumers wait only for chunk 0's num_qp ready words. Each QP publishes at
+                # least one ready word after its ordered data writes, so all data has arrived.
+                for w in range_constexpr(layout.num_qp):
+                    if post_qp == fx.Int32(w % RAIL_QPS):
+                        _rail.put_value(
+                            dev_comm,
+                            post_qp,
+                            fx.Int32(remote_node),
+                            window_handle("remote_chunk_ready"),
+                            peer_window_off("remote_chunk_ready", remote_node)
+                            + fx.Int64(w * 8),
+                            generation,
+                            aggregate=True,
+                        )
+                request = _rail.flush_async(dev_comm, post_qp, fx.Int32(remote_node))
+                if lane == fx.Int32(0):
+                    comm.store_i64_global_system(
+                        peer_local_addr("remote_chunk_request", remote_node)
+                        + fx.Int64(post_qp) * fx.Int64(8),
+                        request,
+                    )
 
         # Role arrival counters remain host-readable through the CCO window's local_ptr
         # even if the kernel hangs. Write them directly into the arena so the host can
@@ -588,7 +701,7 @@ def _compile_stage1(
                 buffer_ops.buffer_store(fx.Int32(0), shard_done, tx)
             for item in range(
                 tx,
-                fx.Int32(dispatch_chunks * layout.num_qp),
+                fx.Int32((NODES - 1) * dispatch_chunks * layout.num_qp),
                 fx.Int32(THREADS),
             ):
                 buffer_ops.buffer_store(fx.Int32(0), consumed, item)
@@ -597,6 +710,36 @@ def _compile_stage1(
                     buffer_ops.buffer_store(
                         fx.Int32(0),
                         buffer_ops.create_buffer_resource_from_addr(local_addr(name)),
+                        fx.Int32(0),
+                    )
+                if const_expr(BOUNDED_RECV):
+                    buffer_ops.buffer_store(
+                        fx.Int32(0),
+                        buffer_ops.create_buffer_resource_from_addr(
+                            local_addr("recv_overflow")
+                        ),
+                        fx.Int32(0),
+                    )
+                    buffer_ops.buffer_store(
+                        fx.Int32(0),
+                        buffer_ops.create_buffer_resource_from_addr(
+                            persistent_addr("forward_status")
+                        ),
+                        fx.Int32(0),
+                    )
+                    buffer_ops.buffer_store(
+                        fx.Int32(0),
+                        buffer_ops.create_buffer_resource_from_addr(
+                            local_addr("recv_route_count")
+                        ),
+                        fx.Int32(0),
+                    )
+                if const_expr(COMPACT_INPUT):
+                    buffer_ops.buffer_store(
+                        fx.Int32(0),
+                        buffer_ops.create_buffer_resource_from_addr(
+                            local_addr("grouped_input_alloc")
+                        ),
                         fx.Int32(0),
                     )
                 if const_expr(early_local_gmm):
@@ -702,14 +845,14 @@ def _compile_stage1(
                 # pub_relaxed: one fence publishes all clears, avoiding an L2 writeback per gate store.
                 _pub_st = comm.store_i64_global_system_relaxed
                 _pub_st(
-                    arena_ptr + fx.Int64(off("epoch_gate")),
+                    persistent_addr("epoch_gate"),
                     control_generation,
                 )
                 _pub_st(local_addr("launch_ready"), control_generation)
         else:
             if tx == fx.Int32(0):
                 _spin(
-                    arena_ptr + fx.Int64(off("epoch_gate")),
+                    persistent_addr("epoch_gate"),
                     control_generation,
                 )
             _cta_acquire()
@@ -741,77 +884,95 @@ def _compile_stage1(
             # a QP's waits (reads only).
             qp = wave % fx.Int32(layout.num_qp) if WAVES > layout.num_qp else wave
 
-            # credit_async waits here for the peer's generation g-2 consumption credit,
-            # just before overwriting the same remote_dispatch_rx parity plane.
-            # Do not wait at kernel exit, which would require all peer fan2 work to finish.
-            if lane == fx.Int32(0):
-                for cchunk in range(
-                    fx.Int32(0), fx.Int32(dispatch_chunks), fx.Int32(1)
-                ):
-                    _spin(
-                        local_addr("remote_chunk_credit")
-                        + fx.Int64(cchunk * fx.Int32(layout.num_qp) + qp) * fx.Int64(8),
-                        generation - fx.Int64(2),
-                    )
-            # rail_soa reads contiguous [q|scale|ids|weights|pad] records, REC bytes/token,
-            # written by rail_record_quant into dispatch_staging's registered parity-0 plane.
-            # Each QP sends one contiguous token segment: one PUT, one ready word, and one
-            # doorbell. Reap requests at the final credit phase. WQE posting costs ~15us
-            # independent of size (TS3/TS5), so avoid separate PUTs by field.
-            # The source is single-buffered: complete this PUT at kernel exit before the
-            # next quantization. Tickets 1..RAIL_QPS post QPs at fanout entry; T0 does not.
-            comm.fence_system_release()
+            for remote_index in range_constexpr(NODES - 1):
+                remote_node = REMOTE_NODES[remote_index]
+                # credit_async waits here for the peer's generation g-2 consumption credit,
+                # just before overwriting the same remote_dispatch_rx parity plane.
+                # Do not wait at kernel exit, which would require all peer fan2 work to finish.
+                if lane == fx.Int32(0):
+                    for cchunk in range(
+                        fx.Int32(0), fx.Int32(dispatch_chunks), fx.Int32(1)
+                    ):
+                        _spin(
+                            peer_local_addr("remote_chunk_credit", remote_node)
+                            + fx.Int64(cchunk * fx.Int32(layout.num_qp) + qp)
+                            * fx.Int64(8),
+                            generation - fx.Int64(2),
+                        )
+                # rail_soa reads contiguous [q|scale|ids|weights|pad] records, REC bytes/token,
+                # written by rail_record_quant into dispatch_staging's registered parity-0 plane.
+                # Each QP sends one contiguous token segment: one PUT, one ready word, and one
+                # doorbell. Reap requests at the final credit phase. WQE posting costs ~15us
+                # independent of size (TS3/TS5), so avoid separate PUTs by field.
+                # The source is single-buffered: complete this PUT at kernel exit before the
+                # next quantization. Tickets 1..RAIL_QPS post QPs at fanout entry; T0 does not.
+                comm.fence_system_release()
 
-            # After posting all transfers, wait for the batch with one acquire fence.
-            # rail_soa publishes only chunk 0 ready words.
-            if lane == fx.Int32(0):
-                _spin(
-                    local_addr("remote_chunk_ready") + fx.Int64(qp) * fx.Int64(8),
-                    generation,
-                )
-            _cta_acquire()
-            gpu.barrier()
-            rx_all = buffer_ops.create_buffer_resource_from_addr(
-                local_addr("remote_dispatch_rx")
-            )
-            # agent: the 256-thread CCO CTA parses all remote tokens with a strided loop.
-            # Capacities above THREADS must process more than the first 256 records.
-            for token in range(tx, ntokens, fx.Int32(THREADS)):
-                remote_record_available = fx.Int32(1)
-                remote_slot_mask = fx.Int32(0)
-                if remote_record_available != fx.Int32(0):
-                    # Token IDs vary by lane, but descriptors must be scalar. Per-token descriptors
-                    # generate readfirstlane waterfall loops (ATT5: up to 64 iterations per load,
-                    # ~230k T0 cycles here). Use one RX descriptor with lane-specific offsets.
-                    record_dword = token * fx.Int32(REC_BYTES // 4) + fx.Int32(
-                        REC_I // 4
+                # After posting all transfers, wait for the batch with one acquire fence.
+                # rail_soa publishes only chunk 0 ready words.
+                if lane == fx.Int32(0):
+                    _spin(
+                        peer_local_addr("remote_chunk_ready", remote_node)
+                        + fx.Int64(qp) * fx.Int64(8),
+                        generation,
                     )
-                    for slot in range_constexpr(TOPK):
-                        expert = buffer_ops.buffer_load(
-                            rx_all,
-                            record_dword + fx.Int32(slot),
-                            vec_width=1,
-                            dtype=T.i32,
-                        )
-                        valid = (expert >= fx.Int32(0)) & (expert < fx.Int32(EXPERTS))
-                        owner = valid.select(
-                            expert // fx.Int32(LOCAL_EXPERTS),
-                            fx.Int32(0),
-                        )
-                        on_node = valid & (
-                            (owner // fx.Int32(GPUS_PER_NODE)) == fx.Int32(node)
-                        )
-                        remote_slot_mask = on_node.select(
-                            remote_slot_mask | (fx.Int32(1) << fx.Int32(slot)),
-                            remote_slot_mask,
-                        )
-                buffer_ops.buffer_store(
-                    remote_slot_mask,
-                    buffer_ops.create_buffer_resource_from_addr(
-                        stage2_addr("node_dest_slot_mask")
-                    ),
-                    fx.Int32(remote_node * MAX_TOKENS) + token,
+                _cta_acquire()
+                gpu.barrier()
+                rx_all = buffer_ops.create_buffer_resource_from_addr(
+                    peer_local_addr("remote_dispatch_rx", remote_node)
                 )
+                # agent: the 256-thread CCO CTA parses all remote tokens with a strided loop.
+                # Capacities above THREADS must process more than the first 256 records.
+                for token in range(tx, ntokens, fx.Int32(THREADS)):
+                    remote_record_available = fx.Int32(1)
+                    remote_slot_mask = fx.Int32(0)
+                    if remote_record_available != fx.Int32(0):
+                        # Token IDs vary by lane, but descriptors must be scalar. Per-token descriptors
+                        # generate readfirstlane waterfall loops (ATT5: up to 64 iterations per load,
+                        # ~230k T0 cycles here). Use one RX descriptor with lane-specific offsets.
+                        record_dword = token * fx.Int32(REC_BYTES // 4) + fx.Int32(
+                            REC_I // 4
+                        )
+                        for slot in range_constexpr(TOPK):
+                            expert = buffer_ops.buffer_load(
+                                rx_all,
+                                record_dword + fx.Int32(slot),
+                                vec_width=1,
+                                dtype=T.i32,
+                            )
+                            valid = (expert >= fx.Int32(0)) & (
+                                expert < fx.Int32(EXPERTS)
+                            )
+                            owner = valid.select(
+                                expert // fx.Int32(LOCAL_EXPERTS),
+                                fx.Int32(0),
+                            )
+                            on_node = valid & (
+                                (owner // fx.Int32(GPUS_PER_NODE)) == fx.Int32(node)
+                            )
+                            remote_slot_mask = on_node.select(
+                                remote_slot_mask | (fx.Int32(1) << fx.Int32(slot)),
+                                remote_slot_mask,
+                            )
+                    buffer_ops.buffer_store(
+                        remote_slot_mask,
+                        buffer_ops.create_buffer_resource_from_addr(
+                            stage2_addr("node_dest_slot_mask")
+                        ),
+                        fx.Int32(remote_node * MAX_TOKENS) + token,
+                    )
+                if const_expr(group_ready):
+                    # EOS on this rank's expert tiles does not join T0's mask
+                    # parser. Publish all lanes' mask writes before the sealer
+                    # hands the tables to concurrently executing Stage2 CTAs.
+                    fx.rocdl.s_waitcnt(vmcnt=0)
+                    gpu.barrier()
+                    if tx == fx.Int32(0):
+                        comm.store_i64_global_system(
+                            local_addr("node_mask_ready")
+                            + fx.Int64((remote_node - int(remote_node > node) + 1) * 8),
+                            generation,
+                        )
         # Split fanout CTAs cover the eight node-local destinations. Each writes
         # both its local source rank and the aligned remote source rank directly
         # into destination expert tiles; there is no rank inbox/sort.
@@ -820,11 +981,19 @@ def _compile_stage1(
         is_sealer = is_finisher
 
         def _peer_addr(dest, name):
-            return (
-                arena_lsa_base
-                + fx.Int64(dest) * arena_lsa_stride
-                + fx.Int64(window_off(name))
-            )
+            if const_expr(bool(buffer_regions)):
+                if const_expr(lsa_peer_base != 0):
+                    dest = dest + fx.Int32(lsa_peer_base)
+                address = region_lsa_address(
+                    arena_ptr, region_indices[1, name], parity, dest
+                )
+            else:
+                address = (
+                    arena_lsa_base
+                    + fx.Int64(dest) * arena_lsa_stride
+                    + fx.Int64(window_off(name))
+                )
+            return address
 
         def _tr_resv_signal(dest, cnt):
             """Publish tile_ready after P2 completes for this rank's last fan CTA to dest."""
@@ -925,7 +1094,10 @@ def _compile_stage1(
             )
             if base >= fx.Int32(max_route_tiles - G + 1):
                 comm.atomic_add_system(error_addr, fx.Int32(1))
-                base = fx.Int32(0)
+                # llvm.intr_trap's noreturn CFG changes normal-path VGPR/scratch
+                # allocation on gfx950. The shared s_trap 2 helper preserves
+                # those resources while aborting before any map or payload store.
+                _device_trap()
             map_res = buffer_ops.create_buffer_resource_from_addr(
                 _peer_addr(dest, "expert_tile_map")
             )
@@ -978,6 +1150,9 @@ def _compile_stage1(
         # Dword distance from IDs to weights: (REC_W-REC_I) after record alignment,
         # or TOPK in the contiguous ids_first [ids|weights] array.
         _GB_WDW_REC = (REC_W - REC_I) // 4
+        # Arrival tickets have already been read into registers. Reuse one
+        # dword of the reserved 16-dword prefix for the batch acceptance vote.
+        _GB_ACCEPT = 4
         _GB_CNT = 16
         _GB_BASE = _GB_CNT + LOCAL_EXPERTS
         _GB_HIT = _GB_BASE + LOCAL_EXPERTS
@@ -996,8 +1171,8 @@ def _compile_stage1(
         assert payload_dwords % 4 == 0
         assert (
             layout.region("grouped_input_scale").nbytes // layout.parity_depth
-            == int(layout.source_capacity) * scale_bytes
-        ), "source-major scales must fit the grouped_input_scale region"
+            == int(layout.input_capacity) * scale_bytes
+        ), "input scales must fit the grouped_input_scale region"
 
         def _gb_ptr(idx):
             return fx.add_offset(fx.recast_iter(fx.Int32, lds_raw), idx * fx.Int32(4))
@@ -1060,7 +1235,8 @@ def _compile_stage1(
             if const_expr(emit_masks):  # noqa: SIM102
                 # Retain the original producer loop's Stage2 local-plane mask, once per token
                 # with identical semantics. dest0 shards collectively cover all tokens.
-                # Stage2 runs after k2 on the same stream, so no fence is needed.
+                # The dest0 shard join publishes these writes for the single
+                # kernel; the two-kernel path also has a stream boundary.
                 if (dest == fx.Int32(0)) & (slot == fx.Int32(0)) & live:
                     m_lslot = fx.Int32(0)
                     m_err = fx.Int32(0)
@@ -1083,6 +1259,70 @@ def _compile_stage1(
                         fx.Int32(node * MAX_TOKENS) + tok,
                     )
             gpu.barrier()
+            if const_expr(BOUNDED_RECV):
+                # Reserve all routes in this batch before any tile or payload
+                # write. The atomic serializes concurrent source CTAs at the
+                # destination, so accepted batches can never exceed the arena.
+                if tx == fx.Int32(0):
+                    batch_routes = fx.Int32(0)
+                    for ex in range_constexpr(LOCAL_EXPERTS):
+                        batch_routes += _gb_ld(fx.Int32(_GB_CNT + ex))
+                    prev_routes = fx.Int32(
+                        comm.atomic_add_system(
+                            _peer_addr(dest, "recv_route_count"), batch_routes
+                        )
+                    )
+                    accepted = prev_routes + batch_routes <= fx.Int32(
+                        layout.route_capacity
+                    )
+                    _gb_st(
+                        fx.Int32(_GB_ACCEPT),
+                        accepted.select(fx.Int32(1), fx.Int32(0)),
+                    )
+                    if prev_routes + batch_routes > fx.Int32(layout.route_capacity):
+                        comm.atomic_add_system(error_addr, fx.Int32(1))
+                        # Keep the protocol alive: rejected batches allocate no
+                        # rows or payload slots. Stage2 propagates the error and
+                        # the stream reports failure after every peer has drained.
+                        comm.atomic_add_system(
+                            _peer_addr(dest, "recv_overflow"), fx.Int32(1)
+                        )
+                gpu.barrier()
+                accepted = _gb_ld(fx.Int32(_GB_ACCEPT)) != fx.Int32(0)
+                hit = hit & accepted
+                # Each count is consumed by the same thread in P2. Each HIT
+                # word is consumed by the same thread for compact allocation;
+                # P2's existing barrier publishes both clears before P3.
+                if tx < fx.Int32(LOCAL_EXPERTS):
+                    count = _gb_ld(fx.Int32(_GB_CNT) + tx)
+                    _gb_st(
+                        fx.Int32(_GB_CNT) + tx,
+                        accepted.select(count, fx.Int32(0)),
+                    )
+                if tx < fx.Int32(_GB_NB):
+                    token_hit = _gb_ld(fx.Int32(_GB_HIT) + tx)
+                    _gb_st(
+                        fx.Int32(_GB_HIT) + tx,
+                        accepted.select(token_hit, fx.Int32(0)),
+                    )
+            if const_expr(COMPACT_INPUT):
+                # A token may match several experts on this destination rank,
+                # yet gets exactly one payload slot. Reuse the batch hit word
+                # to carry slot+1 into metadata and optional copy CTAs.
+                # Keep the LDS load inside its thread bound; a DSL conjunction
+                # may evaluate both operands before applying the predicate.
+                if tx < fx.Int32(_GB_NB):  # noqa: SIM102
+                    if _gb_ld(fx.Int32(_GB_HIT) + tx) != fx.Int32(0):
+                        input_slot = fx.Int32(
+                            comm.atomic_add_system(
+                                _peer_addr(dest, "grouped_input_alloc"), fx.Int32(1)
+                            )
+                        )
+                        if input_slot >= fx.Int32(layout.input_capacity):
+                            comm.atomic_add_system(error_addr, fx.Int32(1))
+                            _llvm_d.intr_trap()
+                        _gb_st(fx.Int32(_GB_HIT) + tx, input_slot + fx.Int32(1))
+                gpu.barrier()
             # P2: reserve one segment per expert with a system atomic. This thread claims
             # any group heads in its segment without waiting.
             if tx < fx.Int32(LOCAL_EXPERTS):
@@ -1232,8 +1472,11 @@ def _compile_stage1(
                     rs, id0 + fx.Int32(_gb_wdw) + slot, vec_width=1, dtype=T.f32
                 )
                 src = src_base + tok
+                input_row = src
+                if const_expr(COMPACT_INPUT):
+                    input_row = _gb_ld(fx.Int32(_GB_HIT) + r) - fx.Int32(1)
                 buffer_ops.buffer_store(
-                    src,
+                    input_row,
                     buffer_ops.create_buffer_resource_from_addr(
                         _peer_addr(dest, "tile_row_input")
                     ),
@@ -1259,9 +1502,12 @@ def _compile_stage1(
             if const_expr(not data_send_ctas):
                 for prec, ptok, vals, sv in _pl:
                     if _gb_ld(fx.Int32(_GB_HIT) + prec) != fx.Int32(0):
+                        input_row = src_base + ptok
+                        if const_expr(COMPACT_INPUT):
+                            input_row = _gb_ld(fx.Int32(_GB_HIT) + prec) - fx.Int32(1)
                         dst_payload = buffer_ops.create_buffer_resource_from_addr(
                             _peer_addr(dest, "grouped_input_q")
-                            + fx.Int64(src_base + ptok) * fx.Int64(wire.payload_bytes),
+                            + fx.Int64(input_row) * fx.Int64(wire.payload_bytes),
                             num_records_bytes=wire.payload_bytes,
                         )
                         for it in range_constexpr(_GB_IT):
@@ -1275,7 +1521,7 @@ def _compile_stage1(
                                 sv,
                                 buffer_ops.create_buffer_resource_from_addr(
                                     _peer_addr(dest, "grouped_input_scale")
-                                    + fx.Int64(src_base + ptok) * fx.Int64(scale_bytes)
+                                    + fx.Int64(input_row) * fx.Int64(scale_bytes)
                                 ),
                                 lane,
                                 cache_modifier=_WT_PAY,
@@ -1359,7 +1605,9 @@ def _compile_stage1(
                         generation,
                     )
                 else:
-                    for ci in range_constexpr(dispatch_chunks * layout.num_qp):
+                    for ci in range_constexpr(
+                        (NODES - 1) * dispatch_chunks * layout.num_qp
+                    ):
                         comm.atomic_add_system(
                             local_addr("remote_chunk_consumed") + fx.Int64(ci * 4),
                             fx.Int32(1),
@@ -1508,10 +1756,15 @@ def _compile_stage1(
                         + fx.Int64(ji) * fx.Int64(SEND_DW * 4),
                         num_records_bytes=SEND_DW * 4,
                     )
+                    source_node = src_base // fx.Int32(MAX_TOKENS * GPUS_PER_NODE)
+                    source_peer = source_node - (source_node > fx.Int32(node)).select(
+                        fx.Int32(1), fx.Int32(0)
+                    )
+                    remote_base = local_addr("remote_dispatch_rx") + fx.Int64(
+                        source_peer
+                    ) * fx.Int64(plane("remote_dispatch_rx") // (NODES - 1))
                     rs = buffer_ops.create_buffer_resource_from_addr(
-                        (remote != fx.Int32(0)).select(
-                            local_addr("remote_dispatch_rx"), x_q
-                        )
+                        (remote != fx.Int32(0)).select(remote_base, x_q)
                     )
                     # Wave-uniform live mask skips every inactive payload row.
                     # No CTA barrier, atomic, map wait or acquire inside copies.
@@ -1522,6 +1775,9 @@ def _compile_stage1(
                         )
                         ptok = tok0 + prec * stride
                         if hit != fx.Int32(0):
+                            input_row = src_base + ptok
+                            if const_expr(COMPACT_INPUT):
+                                input_row = hit - fx.Int32(1)
                             q0 = ptok * fx.Int32(REC_BYTES // 4) + fx.Int32(REC_Q // 4)
                             vals = []
                             for it in range_constexpr(_GB_IT):
@@ -1546,8 +1802,7 @@ def _compile_stage1(
                             )
                             pay = buffer_ops.create_buffer_resource_from_addr(
                                 _peer_addr(dest, "grouped_input_q")
-                                + fx.Int64(src_base + ptok)
-                                * fx.Int64(wire.payload_bytes),
+                                + fx.Int64(input_row) * fx.Int64(wire.payload_bytes),
                                 num_records_bytes=wire.payload_bytes,
                             )
                             for it in range_constexpr(_GB_IT):
@@ -1561,8 +1816,7 @@ def _compile_stage1(
                                     sv,
                                     buffer_ops.create_buffer_resource_from_addr(
                                         _peer_addr(dest, "grouped_input_scale")
-                                        + fx.Int64(src_base + ptok)
-                                        * fx.Int64(scale_bytes)
+                                        + fx.Int64(input_row) * fx.Int64(scale_bytes)
                                     ),
                                     lane,
                                     cache_modifier=_WT_PAY,
@@ -1960,6 +2214,24 @@ def _compile_stage1(
                     fx.Int32(rank * MAX_TOKENS),
                     emit_masks=True,
                 )
+            if const_expr(group_ready):  # noqa: SIM102
+                if dest == fx.Int32(0):
+                    # Only dest0 shards write the local-source mask, but the
+                    # sealer observes EOS from shards targeting local_rank.
+                    # Join the actual writers rather than relying on their
+                    # scheduling relative to those unrelated EOS publishers.
+                    fx.rocdl.s_waitcnt(vmcnt=0)
+                    gpu.barrier()
+                    if tx == fx.Int32(0):
+                        mask_join = local_addr("node_mask_ready") + fx.Int64(NODES * 8)
+                        mask_prev = fx.Int64(
+                            comm.atomic_add_agent_acq_rel(mask_join, fx.Int64(1))
+                        )
+                        if mask_prev + fx.Int64(1) == fx.Int64(fan_stride):
+                            comm.atomic_add_agent(mask_join, -fx.Int64(fan_stride))
+                            comm.store_i64_global_system(
+                                local_addr("node_mask_ready"), generation
+                            )
             if const_expr(split_local):
                 # local_eos means this source rank's local fan1 half is complete for dest.
                 # Use comm_eos-style shard counting and subtractive reset in counters [8,16).
@@ -1991,42 +2263,51 @@ def _compile_stage1(
                 # for remote fanout and stays outside the rail-post pool.
                 if ticket == fx.Int32(GPUS_PER_NODE * _SEG1_SHARD + local_rank):
                     _seal_seg1()
-            # One flush publishes all dispatch chunks together; wait once per CTA.
-            if (tx < fx.Int32(layout.num_qp)) & (
-                fan_wshard < fx.Int32(F2S if F2S else 1 << 20)
-            ):
-                _spin(
-                    local_addr("remote_chunk_ready") + fx.Int64(tx) * fx.Int64(8),
-                    generation,
+            for remote_index in range_constexpr(NODES - 1):
+                remote_node = REMOTE_NODES[remote_index]
+                # One flush publishes all dispatch chunks together; wait once per CTA.
+                if (tx < fx.Int32(layout.num_qp)) & (
+                    fan_wshard < fx.Int32(F2S if F2S else 1 << 20)
+                ):
+                    _spin(
+                        peer_local_addr("remote_chunk_ready", remote_node)
+                        + fx.Int64(tx) * fx.Int64(8),
+                        generation,
+                    )
+                _cta_acquire()
+                f2_stride = fx.Int32(F2S) if F2S else fan_tstride
+                f2_end = (
+                    (fan_wshard < fx.Int32(F2S)).select(
+                        fx.Int32(MAX_TOKENS), fx.Int32(0)
+                    )
+                    if F2S
+                    else fx.Int32(MAX_TOKENS)
                 )
-            _cta_acquire()
-            f2_stride = fx.Int32(F2S) if F2S else fan_tstride
-            f2_end = (
-                (fan_wshard < fx.Int32(F2S)).select(fx.Int32(MAX_TOKENS), fx.Int32(0))
-                if F2S
-                else fx.Int32(MAX_TOKENS)
-            )
-            for token in range(fan_wshard, f2_end, f2_stride * fx.Int32(_GB_NB)):
-                _route_gbatch(
-                    buffer_ops.create_buffer_resource_from_addr(
-                        local_addr("remote_dispatch_rx")
-                    ),
-                    token,
-                    f2_stride,
-                    dest,
-                    fx.Int32(remote_source_rank * MAX_TOKENS),
-                    remote=True,
-                    resv_last=(
-                        token + f2_stride * fx.Int32(_GB_NB) >= f2_end
-                        if tile_ready
-                        else None
-                    ),
-                    resv_n=fan_stride,
-                )
-            if const_expr(tile_ready):  # noqa: SIM102
-                # Fan CTAs with no batch, including posting CTAs, must still report once to reach fan_stride.
-                if (fan_wshard >= f2_end) & (tx == fx.Int32(0)):
-                    _tr_resv_signal(dest, fan_stride)
+                for token in range(fan_wshard, f2_end, f2_stride * fx.Int32(_GB_NB)):
+                    _route_gbatch(
+                        buffer_ops.create_buffer_resource_from_addr(
+                            peer_local_addr("remote_dispatch_rx", remote_node)
+                        ),
+                        token,
+                        f2_stride,
+                        dest,
+                        fx.Int32(
+                            (remote_node * GPUS_PER_NODE + local_rank) * MAX_TOKENS
+                        ),
+                        remote=True,
+                        resv_last=(
+                            token + f2_stride * fx.Int32(_GB_NB) >= f2_end
+                            if tile_ready and remote_node == REMOTE_NODES[-1]
+                            else None
+                        ),
+                        resv_n=fan_stride,
+                    )
+                if const_expr(  # noqa: SIM102
+                    tile_ready and remote_node == REMOTE_NODES[-1]
+                ):
+                    # Fan CTAs with no batch, including posting CTAs, must still report once to reach fan_stride.
+                    if (fan_wshard >= f2_end) & (tx == fx.Int32(0)):
+                        _tr_resv_signal(dest, fan_stride)
             fx.rocdl.s_waitcnt(vmcnt=0, lgkmcnt=0, expcnt=0)
             gpu.barrier()
             # Reap this CTA's data request before publishing its shard. It must complete
@@ -2034,13 +2315,15 @@ def _compile_stage1(
             if (ticket >= fx.Int32(_POST_LO)) & (ticket < fx.Int32(_POST_HI)):
                 if wave == fx.Int32(0):
                     post_qp = ticket - fx.Int32(1)
-                    post_req = fx.Int64(
-                        comm.load_i64_global(
-                            local_addr("remote_chunk_request")
-                            + fx.Int64(post_qp) * fx.Int64(8)
+                    for remote_index in range_constexpr(NODES - 1):
+                        remote_node = REMOTE_NODES[remote_index]
+                        post_req = fx.Int64(
+                            comm.load_i64_global(
+                                peer_local_addr("remote_chunk_request", remote_node)
+                                + fx.Int64(post_qp) * fx.Int64(8)
+                            )
                         )
-                    )
-                    _rail.wait(dev_comm, post_qp, post_req)
+                        _rail.wait(dev_comm, post_qp, post_req)
                 gpu.barrier()
             # k1 never touches fanout_shard_done, comm_eos, or remote_chunk_consumed.
             # They describe all destination records completing, whereas k1 completes only
@@ -2092,7 +2375,7 @@ def _compile_stage1(
                             # Only local T0 reads consumed, using a system load and acquire fence. Fan RX
                             # reads completed at s_waitcnt(0), so credit has no race and a relaxed atomic suffices.
                             for consume_index in range_constexpr(
-                                dispatch_chunks * layout.num_qp
+                                (NODES - 1) * dispatch_chunks * layout.num_qp
                             ):
                                 comm.atomic_add_system(
                                     local_addr("remote_chunk_consumed")
@@ -2102,7 +2385,7 @@ def _compile_stage1(
                         else:
                             comm.fence_system_release()
                             for consume_index in range_constexpr(
-                                dispatch_chunks * layout.num_qp
+                                (NODES - 1) * dispatch_chunks * layout.num_qp
                             ):
                                 comm.atomic_add_system_acq_rel(
                                     local_addr("remote_chunk_consumed")
@@ -2129,56 +2412,39 @@ def _compile_stage1(
             qp_poster = (
                 (wave < fx.Int32(layout.num_qp)) if WAVES > layout.num_qp else None
             )
-            for chunk in range(fx.Int32(0), fx.Int32(dispatch_chunks), fx.Int32(1)):
-                # Do not credit a chunk until every destination fanout role has
-                # consumed its reciprocal payload.
-                consume_index = chunk * fx.Int32(layout.num_qp) + qp
-                if lane == fx.Int32(0):
-                    consumed_count = fx.Int32(
-                        comm.load_i32_global_system(
-                            local_addr("remote_chunk_consumed")
-                            + fx.Int64(consume_index) * fx.Int64(4)
-                        )
-                    )
-                    while consumed_count < fx.Int32(GPUS_PER_NODE):
+            for remote_index in range_constexpr(NODES - 1):
+                remote_node = REMOTE_NODES[remote_index]
+                for chunk in range(fx.Int32(0), fx.Int32(dispatch_chunks), fx.Int32(1)):
+                    # Do not credit a chunk until every destination fanout role has
+                    # consumed its reciprocal payload.
+                    consume_index = chunk * fx.Int32(layout.num_qp) + qp
+                    if lane == fx.Int32(0):
                         consumed_count = fx.Int32(
-                            _pl32(
-                                local_addr("remote_chunk_consumed")
+                            comm.load_i32_global_system(
+                                peer_local_addr("remote_chunk_consumed", remote_node)
                                 + fx.Int64(consume_index) * fx.Int64(4)
                             )
                         )
-                    comm.fence_system_acquire()
-                _cta_acquire()
-                credit_byte = window_off("remote_chunk_credit") + fx.Int64(
-                    consume_index
-                ) * fx.Int64(8)
-                if const_expr(WAVES <= layout.num_qp):
-                    _rail.put_value(
-                        dev_comm,
-                        qp,
-                        fx.Int32(remote_node),
-                        arena_win,
-                        credit_byte,
-                        generation,
-                        aggregate=True,
-                    )
-                    # Ring per chunk so the peer sees each credit as soon as it is
-                    # earned; nothing here needs our own completion, so reap only
-                    # the last request (one QP completes in order).
-                    credit_req = _rail.flush_async(
-                        dev_comm,
-                        qp,
-                        fx.Int32(remote_node),
-                    )
-                    if chunk == fx.Int32(dispatch_chunks - 1):
-                        _rail.wait(dev_comm, qp, credit_req)
-                else:
-                    if qp_poster:
+                        while consumed_count < fx.Int32(GPUS_PER_NODE):
+                            consumed_count = fx.Int32(
+                                _pl32(
+                                    peer_local_addr(
+                                        "remote_chunk_consumed", remote_node
+                                    )
+                                    + fx.Int64(consume_index) * fx.Int64(4)
+                                )
+                            )
+                        comm.fence_system_acquire()
+                    _cta_acquire()
+                    credit_byte = peer_window_off(
+                        "remote_chunk_credit", remote_node
+                    ) + fx.Int64(consume_index) * fx.Int64(8)
+                    if const_expr(WAVES <= layout.num_qp):
                         _rail.put_value(
                             dev_comm,
                             qp,
                             fx.Int32(remote_node),
-                            arena_win,
+                            window_handle("remote_chunk_credit"),
                             credit_byte,
                             generation,
                             aggregate=True,
@@ -2186,13 +2452,34 @@ def _compile_stage1(
                         # Ring per chunk so the peer sees each credit as soon as it is
                         # earned; nothing here needs our own completion, so reap only
                         # the last request (one QP completes in order).
-                        credit_req_w = _rail.flush_async(
+                        credit_req = _rail.flush_async(
                             dev_comm,
                             qp,
                             fx.Int32(remote_node),
                         )
                         if chunk == fx.Int32(dispatch_chunks - 1):
-                            _rail.wait(dev_comm, qp, credit_req_w)
+                            _rail.wait(dev_comm, qp, credit_req)
+                    else:
+                        if qp_poster:
+                            _rail.put_value(
+                                dev_comm,
+                                qp,
+                                fx.Int32(remote_node),
+                                window_handle("remote_chunk_credit"),
+                                credit_byte,
+                                generation,
+                                aggregate=True,
+                            )
+                            # Ring per chunk so the peer sees each credit as soon as it is
+                            # earned; nothing here needs our own completion, so reap only
+                            # the last request (one QP completes in order).
+                            credit_req_w = _rail.flush_async(
+                                dev_comm,
+                                qp,
+                                fx.Int32(remote_node),
+                            )
+                            if chunk == fx.Int32(dispatch_chunks - 1):
+                                _rail.wait(dev_comm, qp, credit_req_w)
 
         # The role targeting this rank observes exactly eight EOS values; each
         # one covers a local source rank and its aligned remote source rank.
@@ -2251,6 +2538,13 @@ def _compile_stage1(
             fx.rocdl.s_waitcnt(vmcnt=0, lgkmcnt=0, expcnt=0)
             gpu.barrier()
             if tx == fx.Int32(0):
+                if const_expr(group_ready):
+                    for mask_plane in range_constexpr(NODES):
+                        _spin(
+                            local_addr("node_mask_ready") + fx.Int64(mask_plane * 8),
+                            generation,
+                        )
+                    comm.fence_system_acquire()
                 buffer_ops.buffer_store(
                     tiles * fx.Int32(BM),
                     buffer_ops.create_buffer_resource_from_addr(
@@ -2282,7 +2576,7 @@ def _compile_stage1(
                 job,
                 lane,
                 wave,
-                fx.Int32(layout.source_capacity),
+                fx.Int32(layout.input_capacity),
                 BM=GBM,
                 BN=GBN,
                 BK=BK,
@@ -2294,6 +2588,7 @@ def _compile_stage1(
                 situ_beta=situ_beta,
                 situ_linear_beta=situ_linear_beta,
                 NW=WAVES,
+                aqin_row_base=INPUT_ROW_BASE,
                 aqout_row_base=H1_ROW_BASE,
                 h1_wt=group_ready,
                 a_dtype=A_DTYPE,
@@ -2571,6 +2866,8 @@ def _compile_stage1(
         else None
     )
     launch_stage1.epoch_off = int(off("epoch_gate"))
+    launch_stage1.buffer_regions = buffer_regions
+    launch_stage1.group_sync_tail = 4 * GR_N
     return launch_stage1
 
 

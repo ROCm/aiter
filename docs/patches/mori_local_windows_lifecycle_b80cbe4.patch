@@ -1,0 +1,385 @@
+diff --git a/include/mori/application/context/context.hpp b/include/mori/application/context/context.hpp
+index c67a717b..8a982aa3 100644
+--- a/include/mori/application/context/context.hpp
++++ b/include/mori/application/context/context.hpp
+@@ -181,6 +181,9 @@ class Context {
+   // INIT → RTR → RTS. Must use the same peerMask as CreateAdditionalEndpoints.
+   void ConnectAdditionalEndpoints(std::vector<RdmaEndpoint>& endpoints, int numQpPerPe,
+                                   const std::vector<bool>& peerMask);
++  // The caller has completed all GPU/RDMA work that uses this endpoint set.
++  // Select the same owner/rail context used by CreateAdditionalEndpoints.
++  void DestroyAdditionalEndpoints(const std::vector<RdmaEndpoint>& endpoints, int numQpPerPe);
+
+  private:
+   void CollectHostNames();
+diff --git a/include/mori/application/transport/rdma/providers/ionic/ionic.hpp b/include/mori/application/transport/rdma/providers/ionic/ionic.hpp
+index c7fc6c8a..e1a31751 100644
+--- a/include/mori/application/transport/rdma/providers/ionic/ionic.hpp
++++ b/include/mori/application/transport/rdma/providers/ionic/ionic.hpp
+@@ -165,6 +165,7 @@ class IonicDeviceContext : public RdmaDeviceContext {
+   ~IonicDeviceContext();
+
+   virtual RdmaEndpoint CreateRdmaEndpoint(const RdmaEndpointConfig&) override;
++  bool DestroyRdmaEndpointNoThrow(const RdmaEndpoint&) noexcept override;
+   virtual void ConnectEndpoint(const RdmaEndpointHandle& local, const RdmaEndpointHandle& remote,
+                                uint32_t qpn = 0) override;
+   static void pd_release(ibv_pd* pd, void* pd_context, void* ptr, uint64_t resource_type);
+diff --git a/include/mori/cco/cco.hpp b/include/mori/cco/cco.hpp
+index e3af51da..893b14fa 100644
+--- a/include/mori/cco/cco.hpp
++++ b/include/mori/cco/cco.hpp
+@@ -832,17 +832,25 @@ struct ccoWindowHost {
+   size_t size;
+   ccoWindowDevice* devPtr;
+   uint32_t* peerRkeys_gpu;
++  // Keep registration policy separate from the deferred MR materialization state.
++  bool rdmaRegisterRequested{true};
++  bool rdmaRegistered{false};
+   // Peer's dma-buf imported handles. WindowRegister inserts one per P2P-
+   // mapped peer; WindowDeregister hipMemUnmap's the peer VA then
+   // hipMemRelease's the handle to drop the cross-process refcount.
+   std::vector<hipMemGenericAllocationHandle_t> peerImportedHandles;
+ };
+
++// Host endpoint ownership is separate from the device ABI. Its definition
++// lives in cco_init.cpp, where the native provider handles are available.
++struct ccoDevCommEndpoints;
++
+ struct ccoComm {
+   int rank{0};
+   int worldSize{0};
+   application::BootstrapNetwork* bootNet{nullptr};
+   application::Context* ctx{nullptr};
++  std::unordered_map<void*, std::shared_ptr<ccoDevCommEndpoints>> devCommEndpoints;
+
+   // rank 0's pid, gathered via Allgather. Disambiguates LocalBootstrap socket
+   // paths across independent comm groups in the same process tree.
+@@ -973,6 +981,10 @@ int ccoMemImport(ccoComm* comm, void* externalPtr, size_t size, void** ptr);
+ int ccoWindowRegister(ccoComm* comm, size_t size, ccoWindow_t* win, void** localPtr);
+ // Overload B: register pre-allocated ptr from ccoMemAlloc
+ int ccoWindowRegister(ccoComm* comm, void* ptr, size_t size, ccoWindow_t* win);
++// Register only the LSA mappings and GPU window metadata, without a NIC MR.
++// Collective: all ranks use the same size and registration mode in the same order.
++// The returned window supports LSA/SDMA access only; do not use it for GDA puts/gets.
++int ccoWindowRegisterLocal(ccoComm* comm, void* ptr, size_t size, ccoWindow_t* win);
+ // Overload C: import + register an external HIP VMM allocation (= MemImport +
+ // WindowRegister(ptr)); *localPtr returns the flat-VA alias.
+ int ccoWindowRegister(ccoComm* comm, void* externalPtr, size_t size, ccoWindow_t* win,
+diff --git a/python/mori/cco/cco.pxd b/python/mori/cco/cco.pxd
+index 55c75201..bb271d09 100644
+--- a/python/mori/cco/cco.pxd
++++ b/python/mori/cco/cco.pxd
+@@ -127,6 +127,8 @@ cdef extern from "mori/cco/cco.hpp" namespace "mori::cco":
+                           ccoWindow_t* outWin, void** outLocalPtr) nogil
+     int ccoWindowRegister(ccoComm* comm, void* ptr, size_t size,
+                           ccoWindow_t* outWin) nogil
++    int ccoWindowRegisterLocal(ccoComm* comm, void* ptr, size_t size,
++                               ccoWindow_t* outWin) nogil
+     int ccoWindowRegister(ccoComm* comm, void* externalPtr, size_t size,
+                           ccoWindow_t* outWin, void** outLocalPtr) nogil
+     int ccoWindowDeregister(ccoComm* comm, ccoWindow_t win) nogil
+diff --git a/python/mori/cco/cco.pyx b/python/mori/cco/cco.pyx
+index 774bf963..32044203 100644
+--- a/python/mori/cco/cco.pyx
++++ b/python/mori/cco/cco.pyx
+@@ -17,7 +17,7 @@ from .cco cimport (
+     ccoMemAlloc, ccoMemImport, ccoMemFree,
+     ccoWindowDeregister, ccoDevCommCreate, ccoDevCommDestroy,
+     ccoDevCommCopyToDevice, ccoDevCommFreeDeviceCopy,
+-    ccoBarrierAll, ccoWindowRegister,
++    ccoBarrierAll, ccoWindowRegister, ccoWindowRegisterLocal,
+ )
+
+
+@@ -350,17 +350,22 @@ def window_register(Comm comm, size_t size):
+     return (<intptr_t>win, <intptr_t>local_ptr)
+
+
+-def window_register_ptr(Comm comm, intptr_t ptr, size_t size):
++def window_register_ptr(Comm comm, intptr_t ptr, size_t size, bint rdma_register=True):
+     """
+     Overload B: register a pre-allocated ccoMemAlloc pointer as a window.
+-    Collective — all ranks call in the same order with the same size.
++    Collective — all ranks call in the same order with the same size and mode.
++    With rdma_register=False, create only LSA mappings and GPU metadata.
++    Such windows must not be used for GDA puts or gets.
+
+     Returns win: intptr_t.
+     """
+     cdef ccoWindow_t win = NULL
+     cdef int ret
+     with nogil:
+-        ret = ccoWindowRegister(comm._ptr, <void*>ptr, size, &win)
++        if rdma_register:
++            ret = ccoWindowRegister(comm._ptr, <void*>ptr, size, &win)
++        else:
++            ret = ccoWindowRegisterLocal(comm._ptr, <void*>ptr, size, &win)
+     if ret != 0:
+         raise RuntimeError(f"ccoWindowRegister (ptr) failed: {ret}")
+     return <intptr_t>win
+diff --git a/python/mori/cco/communicator.py b/python/mori/cco/communicator.py
+index 87a1a288..a628fcbf 100644
+--- a/python/mori/cco/communicator.py
++++ b/python/mori/cco/communicator.py
+@@ -32,7 +32,6 @@ from abc import ABC, abstractmethod
+
+ import mori.cco.cco as _cco
+
+-
+ __all__ = [
+     "UniqueId",
+     "get_unique_id",
+@@ -179,11 +178,16 @@ class AllocatedMemory(CCOResource):
+ class RegisteredWindow(CCOResource):
+     """Window registered from a caller-allocated ``ccoMemAlloc`` pointer."""
+
+-    def __init__(self, comm: Communicator, ptr: int, size: int) -> None:
++    def __init__(
++        self, comm: Communicator, ptr: int, size: int, *, rdma_register: bool = True
++    ) -> None:
+         super().__init__(comm)
+         self._ptr = ptr
+         self._size = size
+-        self._handle = _cco.window_register_ptr(comm._raw, ptr, size)
++        if rdma_register:
++            self._handle = _cco.window_register_ptr(comm._raw, ptr, size)
++        else:
++            self._handle = _cco.window_register_ptr(comm._raw, ptr, size, False)
+         _WINDOW_OWNERS[self._handle] = comm
+
+     def _deallocate(self) -> None:
+@@ -432,9 +436,18 @@ class Communicator:
+         self._resources.append(r)
+         return r
+
+-    def register_window(self, ptr: int, size: int) -> RegisteredWindow:
++    def register_window(
++        self, ptr: int, size: int, *, rdma_register: bool = True
++    ) -> RegisteredWindow:
++        """Collectively map a CCO allocation for node-local access.
++
++        By default also register its prefix with the NIC. Set
++        ``rdma_register=False`` for local-only LSA/SDMA buffers; these windows
++        cannot be used for GDA puts/gets. All ranks must use the same size and
++        registration mode in the same order.
++        """
+         self._check_valid("register_window")
+-        r = RegisteredWindow(self, ptr, size)
++        r = RegisteredWindow(self, ptr, size, rdma_register=rdma_register)
+         self._resources.append(r)
+         return r
+
+diff --git a/src/application/context/context.cpp b/src/application/context/context.cpp
+index 0492b8f1..e6db6c24 100644
+--- a/src/application/context/context.cpp
++++ b/src/application/context/context.cpp
+@@ -556,5 +556,18 @@ void Context::ConnectAdditionalEndpoints(std::vector<RdmaEndpoint>& endpoints, i
+   }
+ }
+
++void Context::DestroyAdditionalEndpoints(const std::vector<RdmaEndpoint>& endpoints,
++                                         int qpPerPe) {
++  assert(endpoints.size() == static_cast<size_t>(WorldSize()) * qpPerPe);
++  for (int peer = 0; peer < WorldSize(); peer++) {
++    for (int qp = 0; qp < qpPerPe; qp++) {
++      const auto& ep = endpoints[peer * qpPerPe + qp];
++      if (ep.vendorId == RdmaDeviceVendorId::Unknown) continue;
++      RdmaDeviceContext* ctx = proxyEnabled ? GetRailContext(peer) : rdmaDeviceContext.get();
++      if (ctx) ctx->DestroyRdmaEndpointNoThrow(ep);
++    }
++  }
++}
++
+ }  // namespace application
+ }  // namespace mori
+diff --git a/src/application/transport/rdma/providers/ionic/ionic.cpp b/src/application/transport/rdma/providers/ionic/ionic.cpp
+index 09067721..0552d3f2 100644
+--- a/src/application/transport/rdma/providers/ionic/ionic.cpp
++++ b/src/application/transport/rdma/providers/ionic/ionic.cpp
+@@ -767,10 +767,9 @@ IonicDeviceContext::~IonicDeviceContext() {
+   }
+   cqPool.clear();
+
+-  // Parent domains can only be released once no CQ/QP references them. Only done with
+-  // dmabuf rings, whose fds must be returned; the default path keeps them until the
+-  // device is closed, as it always has.
+-  for (int i = 0; i < 2 && dmabufRingsEnabled; i++) {
++  // All tracked CQ/QP objects are gone, so both allocation modes can release
++  // the parent domains before the base protection domain is destroyed.
++  for (int i = 0; i < 2; i++) {
+     if (pd_uxdma[i] == nullptr) continue;
+     int err = ibv_dealloc_pd(pd_uxdma[i]);
+     if (err != 0) {
+@@ -836,8 +835,8 @@ RdmaEndpoint IonicDeviceContext::CreateRdmaEndpoint(const RdmaEndpointConfig& co
+   endpoint.atomicIbuf.rkey = qp->atomicIbufMr->rkey;
+   endpoint.atomicIbuf.nslots = RoundUpPowOfTwo(config.atomicIbufSlots);
+   // One CQ per endpoint, keyed by its QP's qpn: ionic leaves cqn unset (0 for every CQ).
+-  // Tracked (and so destroyed at teardown) only with dmabuf rings, to release the ring fd.
+-  if (dmabufRingsEnabled) cqPool.insert({qp->qpn, cq});
++  // Bare-VA rings need the same lifetime tracking as dmabuf rings.
++  cqPool.insert({qp->qpn, cq});
+   qpPool.insert({qp->qpn, qp});
+
+   MORI_APP_TRACE(
+@@ -849,6 +848,30 @@ RdmaEndpoint IonicDeviceContext::CreateRdmaEndpoint(const RdmaEndpointConfig& co
+   return endpoint;
+ }
+
++bool IonicDeviceContext::DestroyRdmaEndpointNoThrow(const RdmaEndpoint& ep) noexcept {
++  try {
++    if (ep.vendorId != RdmaDeviceVendorId::Pensando) return false;
++    auto qp = qpPool.find(ep.handle.qpn);
++    if (qp == qpPool.end()) return true;
++    auto cq = cqPool.find(ep.handle.qpn);
++    if (cq == cqPool.end() || qp->second->GetSqAddress() != ep.wqHandle.sqAddr) {
++      MORI_APP_WARN("Ionic endpoint ownership mismatch while destroying qpn={}", ep.handle.qpn);
++      return false;
++    }
++    // A CQ must outlive its QP. The QP destructor also releases its atomic MR
++    // and buffer; provider callbacks release the descriptor rings.
++    delete qp->second;
++    qpPool.erase(qp);
++    delete cq->second;
++    cqPool.erase(cq);
++    MORI_APP_TRACE("Ionic endpoint destroyed: qpn={} remaining_qps={} remaining_cqs={}",
++                   ep.handle.qpn, qpPool.size(), cqPool.size());
++    return true;
++  } catch (...) {
++    return false;
++  }
++}
++
+ void IonicDeviceContext::ConnectEndpoint(const RdmaEndpointHandle& local,
+                                          const RdmaEndpointHandle& remote, uint32_t qpn) {
+   uint32_t local_qpn = local.qpn;
+diff --git a/src/cco/cco_init.cpp b/src/cco/cco_init.cpp
+index 81897d53..a3574b93 100644
+--- a/src/cco/cco_init.cpp
++++ b/src/cco/cco_init.cpp
+@@ -178,6 +178,11 @@ static_assert(sizeof(ccoFabricHandle_t) == sizeof(hipMemFabricHandle_compat_t),
+ // Out-of-line dtor for the unique_ptr<HeapVAManager> member: ccoComm is defined
+ // in cco.hpp with HeapVAManager only forward-declared, so its destruction must
+ // be emitted here where HeapVAManager (va_manager.hpp) is complete.
++struct ccoDevCommEndpoints {
++  std::vector<application::RdmaEndpoint> endpoints;
++  int numQpPerPe;
++};
++
+ ccoComm::~ccoComm() = default;
+
+ static size_t AlignUp(size_t x, size_t align) { return (x + align - 1) & ~(align - 1); }
+@@ -1173,6 +1178,8 @@ int ccoMemFree(ccoComm* comm, void* ptr) {
+ // Collective: register wh's RDMA MR, Allgather rkeys, publish lkey/rkeys into its device struct.
+ static void CcoWindowRegisterMr(ccoComm* comm, ccoWindowHost* wh, bool isFabric, int shareFd,
+                                 size_t dataOffset) {
++  if (!wh->rdmaRegisterRequested || wh->rdmaRegistered) return;
++
+   uint32_t lkey = 0;
+   uint32_t localRkey = 0;
+   uint32_t iovaBias = 0;
+@@ -1208,6 +1215,7 @@ static void CcoWindowRegisterMr(ccoComm* comm, ccoWindowHost* wh, bool isFabric,
+     }
+     lkey = mr.lkey;
+     localRkey = mr.rkey;
++    wh->rdmaRegistered = true;
+   }
+
+   std::vector<uint32_t> peerRkeys(comm->worldSize, 0);
+@@ -1227,7 +1235,9 @@ static void CcoWindowRegisterMr(ccoComm* comm, ccoWindowHost* wh, bool isFabric,
+   }
+ }
+
+-int ccoWindowRegister(ccoComm* comm, void* ptr, size_t size, ccoWindow_t* outWin) {
++static int ccoWindowRegisterImpl(ccoComm* comm, void* ptr, size_t size, ccoWindow_t* outWin,
++                                 bool rdmaRegister) {
++  if (comm == nullptr || outWin == nullptr) return -1;
+   auto it = comm->allocTable.find(ptr);
+   if (it == comm->allocTable.end()) {
+     MORI_SHMEM_ERROR("ccoWindowRegister: ptr {} not in allocTable", ptr);
+@@ -1235,6 +1245,11 @@ int ccoWindowRegister(ccoComm* comm, void* ptr, size_t size, ccoWindow_t* outWin
+   }
+
+   auto& meta = it->second;
++  const size_t availableBytes = meta.size - meta.dataOffset;
++  if (size == 0 || size > availableBytes) {
++    MORI_SHMEM_ERROR("ccoWindowRegister: size {} must be in [1, {}]", size, availableBytes);
++    return -1;
++  }
+   size_t slotOffset = meta.slotOffset;
+   void* localPtr = ptr;
+   int worldSize = comm->worldSize;
+@@ -1515,6 +1530,7 @@ int ccoWindowRegister(ccoComm* comm, void* ptr, size_t size, ccoWindow_t* outWin
+   wh->size = size;
+   wh->devPtr = devPtr;
+   wh->peerRkeys_gpu = peerRkeys_gpu;
++  wh->rdmaRegisterRequested = rdmaRegister;
+   wh->peerImportedHandles = std::move(p2pImportedHandles);
+
+   if (comm->windowMrsEnabled) CcoWindowRegisterMr(comm, wh, useFabric, meta.shareFd, dataOffset);
+@@ -1540,6 +1556,14 @@ int ccoWindowRegister(ccoComm* comm, void* ptr, size_t size, ccoWindow_t* outWin
+   return 0;
+ }
+
++int ccoWindowRegister(ccoComm* comm, void* ptr, size_t size, ccoWindow_t* outWin) {
++  return ccoWindowRegisterImpl(comm, ptr, size, outWin, true);
++}
++
++int ccoWindowRegisterLocal(ccoComm* comm, void* ptr, size_t size, ccoWindow_t* outWin) {
++  return ccoWindowRegisterImpl(comm, ptr, size, outWin, false);
++}
++
+ /* ========================================================================== */
+ /*                      ccoWindowRegister (convenience)                    */
+ /* ========================================================================== */
+@@ -1652,7 +1676,9 @@ int ccoWindowDeregister(ccoComm* comm, ccoWindow_t win) {
+       entries.end());
+
+   application::RdmaDeviceContext* rdmaDevCtx = comm->ctx->GetRdmaDeviceContext();
+-  if (rdmaDevCtx) rdmaDevCtx->DeregisterRdmaMemoryRegion(wh->localPtr);
++  if (rdmaDevCtx && wh->rdmaRegistered) {
++    rdmaDevCtx->DeregisterRdmaMemoryRegion(wh->localPtr);
++  }
+
+   if (wh->peerRkeys_gpu) HIP_RUNTIME_CHECK(hipFree(wh->peerRkeys_gpu));
+   if (wh->devPtr) HIP_RUNTIME_CHECK(hipFree(wh->devPtr));
+@@ -1763,6 +1789,8 @@ int ccoDevCommCreate(ccoComm* comm, const ccoDevCommRequirements* reqs, ccoDevCo
+   if (reqs->gdaConnectionType == CCO_GDA_CONNECTION_FULL && !comm->windowMrsEnabled) {
+     comm->windowMrsEnabled = true;
+     for (ccoWindowHost* wh : comm->windows) {
++      // Local-only windows never acquire an MR, including deferred back-fill.
++      if (!wh->rdmaRegisterRequested) continue;
+       bool isFabric = false;
+       int shareFd = -1;
+       size_t dataOffset = 0;
+@@ -1822,6 +1850,11 @@ int ccoDevCommCreate(ccoComm* comm, const ccoDevCommRequirements* reqs, ccoDevCo
+     }
+     epsGpu = reinterpret_cast<core::RdmaEndpointDevice*>(block);
+     HIP_RUNTIME_CHECK(hipMemcpy(epsGpu, epsHost.data(), epsBytes, hipMemcpyHostToDevice));
++    // Keep the native handles, not just the GPU descriptor copies. DevComm
++    // destruction must release precisely this QP set while other sets live.
++    comm->devCommEndpoints.emplace(
++        epsGpu, std::make_shared<ccoDevCommEndpoints>(
++                    ccoDevCommEndpoints{std::move(newEps), numQpPerPe}));
+   }
+   ibgda.endpoints = epsGpu;
+
+@@ -2191,7 +2224,18 @@ int ccoDevCommDestroy(ccoComm* comm, ccoDevComm* devComm) {
+   // QP endpoints array. signalBuf/Shadows/counterBuf are sub-pointers into
+   // the resource window — they were freed above by ccoWindowDeregister +
+   // ccoMemFree, so no separate hipFree needed.
+-  if (ibgda.endpoints) HIP_RUNTIME_CHECK(hipFree(ibgda.endpoints));
++  if (ibgda.endpoints) {
++    if (comm && comm->ctx) {
++      auto owned = comm->devCommEndpoints.find(ibgda.endpoints);
++      if (owned != comm->devCommEndpoints.end()) {
++        comm->ctx->DestroyAdditionalEndpoints(owned->second->endpoints,
++                                              owned->second->numQpPerPe);
++        comm->devCommEndpoints.erase(owned);
++      }
++    }
++    HIP_RUNTIME_CHECK(hipFree(ibgda.endpoints));
++    ibgda.endpoints = nullptr;
++  }
+
+   // SDMA pool cleanup. peerSignalPtrs is a GPU array of host-mapped peer
+   // pointers — only the cross-process entries came from hipIpcOpenMemHandle

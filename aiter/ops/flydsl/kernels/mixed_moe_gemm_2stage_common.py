@@ -1481,7 +1481,10 @@ def compile_mixed_moe_gemm1_common(
                     k_off = sk * layout_b_scale.stride_k0
 
                     rocdl.sched_barrier(0)
-                    if const_expr(heterogeneous_b and use_async_copy):
+                    if const_expr(use_async_copy and (is_f8_a or heterogeneous_b)):
+                        # FP8 A needs multiple VMEM-to-LDS loads per tile. Wait
+                        # for every load before another wave reads that tile;
+                        # the partial B/scale wait does not cover those writes.
                         barrier(vmcnt=0)
                     else:
                         rocdl.s_waitcnt(body_vmcnt_before_barrier)
