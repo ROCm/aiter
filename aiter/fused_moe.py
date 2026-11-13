@@ -2812,6 +2812,7 @@ def _flydsl_stage1_wrapper(
     model_dim_pad: int = 0,
     out_dtype: str | None = None,
     v2_output_layout: bool = False,
+    stage2_skips_inter_pad: bool = False,
     **_kwargs,
 ):
     inter_dim_pad, model_dim_pad = _get_padding_for_flydsl(
@@ -2867,6 +2868,7 @@ def _flydsl_stage1_wrapper(
         swiglu_limit=swiglu_limit,
         k_wave=parsed.get("k_wave", 1),
         v2_output_layout=v2_output_layout,
+        stage2_skips_inter_pad=stage2_skips_inter_pad,
     )
 
 
@@ -3537,6 +3539,7 @@ def _flydsl_v2_stage2_wrapper(
     topk_weights=None,
     reverse_sorted=None,
     use_valid_token_count=False,
+    inter_dim_pad=0,
     **_kwargs,
 ):
     from aiter.ops.flydsl.kernels.mxmoe_dispatcher import (
@@ -3671,6 +3674,8 @@ def _flydsl_v2_stage2_wrapper(
         is_ep=expert_mask is not None,
         out_scale=target_scale,
         use_valid_token_count=use_valid_token_count,
+        # The kernel skips whole 32-wide K blocks of zero padding.
+        D_INTER_VALID=inter_dim - inter_dim_pad // 32 * 32,
     )
     if _s2_fp4_scatter:
         aiter.mxfp4_moe_scatter_reduce_q(
@@ -5091,6 +5096,7 @@ def get_2stage_cfgs(
                 activation=activation,
                 inter_dim_pad=intermediate_pad,
                 model_dim_pad=hidden_pad,
+                stage2_skips_inter_pad=is_flydsl2_layout,
             )
         else:
             stage1_func = functools.partial(
@@ -5114,6 +5120,7 @@ def get_2stage_cfgs(
                 model_dim=model_dim,
                 inter_dim=inter_dim,
                 num_experts=expert,
+                inter_dim_pad=intermediate_pad,
             )
         elif is_flydsl2:
             stage2_func = functools.partial(

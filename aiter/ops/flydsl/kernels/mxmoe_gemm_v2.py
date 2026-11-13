@@ -168,8 +168,10 @@ def issue_a_load_lds_dt(
     K_BYTES,
     BM=32,
     resolved_rows=(),
+    k_valid_bytes=None,
 ):
-    """A->LDS DMA for one K-tile; gemm2 A is the already-sorted row, OOB-zero via the flat buffer view bounds."""
+    """A->LDS DMA for one K-tile; gemm2 A is the already-sorted row, OOB-zero via the flat buffer view bounds.
+    Columns from k_valid_bytes on load as zero (an out-of-bounds offset)."""
     lanes_per_row = KH_TILE_A // 16  # 8 (fp4) / 16 (fp8)
     rows_per_call = 64 // lanes_per_row  # 8 (fp4) / 4 (fp8)
     a_lane_row = lane // lanes_per_row
@@ -202,10 +204,15 @@ def issue_a_load_lds_dt(
         )
         sorted_row = m_row + lds_row + a_lane_row
         car = resolved_rows[g] if const_expr(len(resolved_rows) > 0) else sorted_row
-        voffset = (lane_col ^ mask) + car * K_BYTES
+        src_col = lane_col ^ mask
+        voffset = src_col + car * K_BYTES
         off = fx.Int32(slot * (BM * KH_TILE_A)) + lds_row * KH_TILE_A
         # The byte offset is non-negative and 4-byte aligned; avoid signed-division fixup VGPRs.
         v_e = (voffset + kt * KH_TILE_A).shrui(fx.Int32(2))
+        if const_expr(k_valid_bytes is not None):
+            v_e = (src_col + kt * KH_TILE_A >= fx.Int32(k_valid_bytes)).select(
+                fx.Int32(0x3FFFFFF0), v_e
+            )
         fx.copy(
             atom, src[v_e, None], lds_dma_dst(s_aq_base, off, elem_ty=T.i32, align=16)
         )
@@ -263,6 +270,7 @@ def gemm2_body_v2(
     output_n_base=0,
     output_width=None,
     write_limit=None,
+    K_VALID=None,
 ):
     # GEMM2 double-buffers B weight and scale one tile ahead. bhoist issues that
     # prefetch above the LDS barrier; ascale_pf prefetches A-scale one tile ahead.
@@ -294,8 +302,25 @@ def gemm2_body_v2(
     kbs_per_expert_dw = _udiv(N_OUT_rt, fx.Int32(32)) * kBS_stride_n0_dw
     num_n_blocks = _udiv(N_OUT_rt, fx.Int32(BN))
     KH4 = _udiv(K_rt, fx.Int32(4 if is_f8_b else 8))
-    K_TILES_MAX = INTER_MAX // BK
+    # K columns from K_VALID on are the caller's zero padding: K tiles past it
+    # are not run. A lane's MFMA operand covers one 32-wide K block, so in the
+    # last tile lanes whose block is padding re-read the last valid block's
+    # weight bytes (no extra traffic), load A as zero and use unit scales:
+    # their products are exactly 0 whatever stage 1 left in the padding.
+    if K_VALID is None:
+        K_VALID = INTER_MAX
+    assert K_VALID % 32 == 0 and 0 < K_VALID <= INTER_MAX, K_VALID
+    K_TILES_MAX = (K_VALID + BK - 1) // BK
     K_SCALE_CHUNKS_MAX = (INTER_MAX + 255) // 256
+
+    def valid_klanes(kt_c, half):
+        return max(0, min(4, (K_VALID - kt_c * BK - half * 128) // 32))
+
+    def klane_pad(kt_c, half):
+        nv = valid_klanes(kt_c, half)
+        if const_expr(nv >= 4):
+            return None
+        return lane // 16 >= fx.Int32(nv)
 
     # block -> (m_block_idx, n_block_idx); e = sorted_expert_ids[SBM-padded sort block] (SBM==BM: sort_block==m_block_idx).
     if const_expr(mn_idx is not None):
@@ -342,6 +367,7 @@ def gemm2_body_v2(
             K_BYTES,
             BM=BM,
             resolved_rows=resolved_input_rows,
+            k_valid_bytes=None if K_VALID == INTER_MAX else K_VALID // a_pack,
         )
 
     def issue_a_ds_read(slot):
@@ -477,18 +503,26 @@ def gemm2_body_v2(
     )
     # B-scale word template shares the A-scale layout (sc_frag_tmpl).
 
-    def issue_b_value_load(dst, j, half, kt_rt):
+    def issue_b_value_load(dst, j, half, kt_c):
+        kt_rt = fx.Int32(kt_c)
+        klane = lane_div_16
+        src_half = half
+        nv = valid_klanes(kt_c, half)
+        if const_expr(nv == 0):
+            src_half = 0
+        elif const_expr(nv < 4):
+            klane = (lane_div_16 < fx.Int32(nv)).select(lane_div_16, fx.Int32(nv - 1))
         if const_expr(is_f8_b):
             lo = fx.make_rmem_tensor(4, Int32)
             hi = fx.make_rmem_tensor(4, Int32)
             fx.copy(
                 b_catom,
-                bq_views[j][lane_div_16, lane_mod_16, kt_rt, half, 0, None],
+                bq_views[j][klane, lane_mod_16, kt_rt, src_half, 0, None],
                 lo,
             )
             fx.copy(
                 b_catom,
-                bq_views[j][lane_div_16, lane_mod_16, kt_rt, half, 1, None],
+                bq_views[j][klane, lane_mod_16, kt_rt, src_half, 1, None],
                 hi,
             )
             lo_v = fx.memref_load_vec(lo)
@@ -497,7 +531,7 @@ def gemm2_body_v2(
         else:
             fx.copy(
                 b_catom,
-                bq_views[j][lane_div_16, lane_mod_16, kt_rt, half, None],
+                bq_views[j][klane, lane_mod_16, kt_rt, src_half, None],
                 dst,
             )
 
@@ -509,12 +543,12 @@ def gemm2_body_v2(
                 bsf[mw],
             )
 
-    def issue_b_load_into(bqf, bsf, kt_rt):
+    def issue_b_load_into(bqf, bsf, kt_c):
         for j in range_constexpr(numAccN):
             for half in range_constexpr(kHalves):
-                issue_b_value_load(bqf[j][half], j, half, kt_rt)
+                issue_b_value_load(bqf[j][half], j, half, kt_c)
         if const_expr(bsf is not None):
-            issue_bscale_into(bsf, scale_chunk_tile(kt_rt))
+            issue_bscale_into(bsf, scale_chunk_tile(fx.Int32(kt_c)))
 
     def make_bq_fragments():
         if const_expr(is_f8_b):
@@ -536,13 +570,25 @@ def gemm2_body_v2(
         scale_shift = (kt_rt % fx.Int32(tilesPerScaleChunk)) * fx.Int32(16)
         return scale.shrui(scale_shift)
 
-    def mfma_cluster(bqf, bsf, sa, kt_rt, interleave=None):
+    def unit_scale_pad(word, kt_c):
+        # Half k's MFMAs read scale bytes 2k and 2k+1 (opsel); 0x7F is 1.0.
+        for k in range_constexpr(kHalves):
+            pad = klane_pad(kt_c, k)
+            if const_expr(pad is not None):
+                sh = 16 * k
+                keep = fx.Int32(~(0xFFFF << sh) & 0xFFFFFFFF)
+                word = pad.select((word & keep) | fx.Int32(0x7F7F << sh), word)
+        return word
+
+    def mfma_cluster(bqf, bsf, sa, kt_c, interleave=None):
         # opsel (no gate/up split): mni=J//2, in_b=J%2; sa is a per-32-row-chunk list.
+        kt_rt = fx.Int32(kt_c)
         sa = [
-            shift_scale_word(sa[sub], kt_rt) for sub in range_constexpr(kScaleSubBlocks)
+            unit_scale_pad(shift_scale_word(sa[sub], kt_rt), kt_c)
+            for sub in range_constexpr(kScaleSubBlocks)
         ]
         sb_words = [
-            shift_scale_word(Vec(bsf[mni].load())[0], kt_rt)
+            unit_scale_pad(shift_scale_word(Vec(bsf[mni].load())[0], kt_rt), kt_c)
             for mni in range_constexpr(nPairs)
         ]
         for J in range_constexpr(numAccN):
@@ -667,7 +713,7 @@ def gemm2_body_v2(
                 bsf = make_scale_fragments(nPairs)
                 issue_bscale_into(bsf, scale_chunk_tile(fx.Int32(S)))
                 bs.append(bsf)
-            issue_b_load_into(b[0], None, fx.Int32(0))
+            issue_b_load_into(b[0], None, 0)
             gpu.barrier()
             nDsPerTile = kMChunks * kHalves
             nBPerTile = numAccN * kHalves
@@ -683,8 +729,8 @@ def gemm2_body_v2(
             for S in range_constexpr(KT):
                 issue_a_ds_read(fx.Int32(S % aStages))
                 if const_expr(S + 1 < KT):
-                    issue_b_load_into(b[S + 1], None, fx.Int32(S + 1))
-                mfma_cluster(b[S], bs[S], sa[S], fx.Int32(S))
+                    issue_b_load_into(b[S + 1], None, S + 1)
+                mfma_cluster(b[S], bs[S], sa[S], S)
         else:
             sa = [load_a_scale_tile(fx.Int32(S)) for S in range_constexpr(KT)]
             bs = []
@@ -694,7 +740,7 @@ def gemm2_body_v2(
                 bs.append(bsf)
             cur_bqf = make_bq_fragments()
             nxt_bqf = make_bq_fragments()
-            issue_b_load_into(cur_bqf, None, fx.Int32(0))
+            issue_b_load_into(cur_bqf, None, 0)
             nDsPerTile = kMChunks * kHalves
             nBPerTile = numAccN * kHalves
             nMfmaPerJ = kHalves if is_bm16 else kScaleSubBlocks * 2 * kHalves
@@ -733,7 +779,7 @@ def gemm2_body_v2(
                         rocdl.sched_mfma(nMfmaLeft)
                         rocdl.sched_dsrd(nDsPerGroup)
                 if const_expr(kt + 1 < KT):
-                    issue_b_load_into(nxt_bqf, None, fx.Int32(kt + 1))
+                    issue_b_load_into(nxt_bqf, None, kt + 1)
                 issue_a_ds_read(fx.Int32(kt % aStages))
                 if prefetch_a:
                     if const_expr(a_slot_alias):
@@ -744,7 +790,7 @@ def gemm2_body_v2(
                         fx.Int32(kt + kStages),
                     )
                     issued = kt + kStages
-                mfma_cluster(cur_bqf, bs[kt], sa[kt], fx.Int32(kt))
+                mfma_cluster(cur_bqf, bs[kt], sa[kt], kt)
                 cur_bqf, nxt_bqf = nxt_bqf, cur_bqf
     else:
         KT = K_TILES_MAX
@@ -774,11 +820,11 @@ def gemm2_body_v2(
                 _ks_issue_ascale(saf_slots[slot], fx.Int32(kt))
 
         def _ks_prefetch(kt):
-            issue_b_load_into(nxt_bqf, None, fx.Int32(kt))
+            issue_b_load_into(nxt_bqf, None, kt)
             if const_expr(kt == 0 or chunk_of[kt] != chunk_of[kt - 1]):
                 _ks_issue_scales(kt)
 
-        issue_b_load_into(cur_bqf, None, fx.Int32(0))
+        issue_b_load_into(cur_bqf, None, 0)
         _ks_issue_scales(0)
         rocdl.sched_barrier(0)
 
@@ -819,7 +865,7 @@ def gemm2_body_v2(
                 prefetched_ids = load_epilog_ids()
                 rocdl.sched_barrier(0)
             rocdl.s_setprio(1)
-            mfma_cluster(cur_bqf, cur_bsf, sa, kt_rt, interleave=_il)
+            mfma_cluster(cur_bqf, cur_bsf, sa, kt, interleave=_il)
             rocdl.s_setprio(0)
             rocdl.sched_barrier(0)
             cur_bqf, nxt_bqf = nxt_bqf, cur_bqf
