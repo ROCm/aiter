@@ -86,7 +86,7 @@ def _resolve_contract(
         return "a16w16", instance, _a16w16_family
 
     family = launch_plan._validate_a8w8_public_contract(
-        kernel_tag=instance.kernel_tag,
+        instance=instance,
         kid=kid,
         input_dtype=input_dtype,
         weight_dtype=weight_dtype,
@@ -97,7 +97,6 @@ def _resolve_contract(
         has_bias=has_bias,
         has_workspace=has_workspace,
         split_k=split_k,
-        bpreshuffle_uses_workspace=instance.splitk_workspace_dtype is not None,
     )
     return family, instance, _a8w8_family
 

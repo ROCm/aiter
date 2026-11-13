@@ -184,6 +184,111 @@ def test_a8w8_opus_families_use_explicit_exact_kids(
         assert raw_w_scale is w_scale
 
 
+@pytest.mark.parametrize("kid", [7722, 7991], ids=["direct_b", "staged_b"])
+@pytest.mark.parametrize("provide_workspace", [False, True], ids=["allocate", "reuse"])
+def test_mxfp8_bpreshuffle_passes_one_workspace(monkeypatch, kid, provide_workspace):
+    from aiter.ops.opus import dispatch
+    from csrc.opus_gemm.opus_gemm_common import (
+        bpreshuffle_workspace_bytes,
+        get_kernel_instance,
+    )
+
+    XQ = torch.empty((64, 512), dtype=torch.float8_e4m3fn)
+    WQ = torch.empty((128, 512), dtype=torch.float8_e4m3fn)
+    Y = torch.empty((64, 128), dtype=torch.bfloat16)
+    x_scale = torch.empty((4, 64), dtype=torch.uint8).T
+    w_scale = torch.empty((1, 4), dtype=torch.uint8)
+    instance = get_kernel_instance(
+        "gfx950", "a8w8_blockscale_bpreshuffle", kid, cu_num=256
+    )
+    required_numel = bpreshuffle_workspace_bytes(instance, 64, 128, 512) // 4
+    workspace = torch.empty(required_numel) if provide_workspace else None
+    calls, allocations, recorded = [], [], []
+    empty = torch.empty
+    stream = object()
+
+    def allocate(*args, **kwargs):
+        buffer = empty(*args, **kwargs)
+        allocations.append(buffer)
+        return buffer
+
+    def capture(xq, wq, xs, ws, output, launched_kid, workspace=None):
+        calls.append((launched_kid, workspace))
+
+    monkeypatch.setattr(dispatch, "_device_arch_and_cu", lambda _: ("gfx950", 256))
+    monkeypatch.setattr(torch, "empty", allocate)
+    monkeypatch.setattr(torch.cuda, "current_stream", lambda _: stream)
+    monkeypatch.setattr(
+        torch.Tensor,
+        "record_stream",
+        lambda tensor, used: recorded.append((tensor, used)),
+    )
+    monkeypatch.setattr(
+        opus_a8w8, "_opus_gemm_a8w8_blockscale_bpreshuffle_launch_raw", capture
+    )
+
+    assert (
+        opus_gemm(
+            XQ,
+            WQ,
+            Y,
+            family="a8w8_blockscale_bpreshuffle",
+            layout="bpreshuffle",
+            kid=kid,
+            x_scale=x_scale,
+            w_scale=w_scale,
+            workspace=workspace,
+        )
+        is Y
+    )
+    assert len(calls) == 1
+    assert calls[0][0] == kid
+    actual_workspace = calls[0][1]
+    assert actual_workspace.dtype == torch.float32
+    assert actual_workspace.device == XQ.device
+    assert actual_workspace.numel() == required_numel
+    if provide_workspace:
+        assert actual_workspace is workspace
+        assert not allocations
+        assert len(recorded) == 1
+        assert recorded[0][0] is workspace and recorded[0][1] is stream
+    else:
+        assert len(allocations) == 1 and actual_workspace is allocations[0]
+        assert not recorded
+
+
+@pytest.mark.parametrize("arch,kid", [("gfx950", 6000), ("gfx942", 0)])
+def test_bpreshuffle_direct_kid_rejects_workspace(monkeypatch, arch, kid):
+    from aiter.ops.opus import dispatch
+
+    def reject_launch(*args, **kwargs):
+        pytest.fail("a non-workspace kid must reject the buffer before launch")
+
+    monkeypatch.setattr(
+        dispatch,
+        "_device_arch_and_cu",
+        lambda _: (arch, 256 if arch == "gfx950" else 304),
+    )
+    monkeypatch.setattr(
+        opus_a8w8, "_opus_gemm_a8w8_blockscale_bpreshuffle_launch_raw", reject_launch
+    )
+    XQ = torch.empty((64, 512), dtype=torch.float8_e4m3fn)
+    WQ = torch.empty((128, 512), dtype=torch.float8_e4m3fn)
+    Y = torch.empty((64, 128), dtype=torch.bfloat16)
+    with pytest.raises(ValueError, match="does not use workspace"):
+        opus_gemm(
+            XQ,
+            WQ,
+            Y,
+            family="a8w8_blockscale_bpreshuffle",
+            layout="bpreshuffle",
+            kid=kid,
+            x_scale=torch.empty((4, 64), dtype=torch.uint8).T,
+            w_scale=torch.empty((1, 4), dtype=torch.uint8),
+            workspace=torch.empty(1024),
+        )
+
+
 def test_bpreshuffle_uses_opus_for_tuned_row(monkeypatch):
     opus_calls = []
     ck_calls = []

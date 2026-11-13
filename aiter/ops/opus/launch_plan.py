@@ -533,7 +533,7 @@ class A8W8MxscaleBMMPlan:
 
 def _validate_a8w8_public_contract(
     *,
-    kernel_tag: str,
+    instance: OpusGemmInstance,
     kid: int,
     input_dtype: torch.dtype,
     weight_dtype: torch.dtype,
@@ -544,9 +544,9 @@ def _validate_a8w8_public_contract(
     has_bias: bool,
     has_workspace: bool,
     split_k: int,
-    bpreshuffle_uses_workspace: bool = False,
 ) -> str:
     """Validate immutable options for the public A8W8 operation routers."""
+    kernel_tag = instance.kernel_tag
     try:
         family = _A8W8_FAMILY_BY_TAG[kernel_tag]
     except KeyError as exc:
@@ -603,7 +603,8 @@ def _validate_a8w8_public_contract(
         return family
 
     if has_workspace and not (
-        family == _A8W8_BPRESHUFFLE_FAMILY and bpreshuffle_uses_workspace
+        family == _A8W8_BPRESHUFFLE_FAMILY
+        and instance.splitk_workspace_dtype is not None
     ):
         raise ValueError(f"OPUS family {family} does not use workspace")
     if split_k != 0:
