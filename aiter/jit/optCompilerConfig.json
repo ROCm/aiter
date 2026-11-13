@@ -124,6 +124,18 @@
         "torch_exclude": "True",
         "blob_gen_cmd": "f'{AITER_META_DIR}/hsa/codegen.py -m mla_v4 --output_dir {{}}'"
     },
+    "module_mla_sparse_prefill_v41_asm": {
+        "srcs": [
+            "f'{AITER_CSRC_DIR}/py_itfs_cu/asm_mla_sparse_prefill_v41.cu'"
+        ],
+        "flags_extra_cc": ["'-DENABLE_CK=0'"],
+        "flags_extra_hip": ["'-DENABLE_CK=0'"],
+        "extra_ldflags": "None",
+        "extra_include": [],
+        "verbose": "False",
+        "torch_exclude": "True",
+        "blob_gen_cmd": "''"
+    },
     "module_cache": {
         "srcs": [
             "f'{AITER_CSRC_DIR}/pybind/cache_pybind.cu'",
@@ -933,7 +945,9 @@
     "module_msa_sparse_attention": {
         "srcs": [
             "f'{AITER_CSRC_DIR}/kernels/sparse_attn/msa/pa_sparse_block_score_decode.cu'",
+            "f'{AITER_CSRC_DIR}/kernels/sparse_attn/msa/pa_sparse_block_score_decode_q2.cu'",
             "f'{AITER_CSRC_DIR}/kernels/sparse_attn/msa/pa_sparse_block_score_prefill.cu'",
+            "f'{AITER_CSRC_DIR}/kernels/sparse_attn/msa/pa_sparse_block_score_prefill_nvfp4.cu'",
             "f'{AITER_CSRC_DIR}/kernels/sparse_attn/msa/pa_sparse_block_topk.cu'",
             "f'{AITER_CSRC_DIR}/kernels/sparse_attn/msa/pa_sparse_block_select_entry.cu'"
         ],

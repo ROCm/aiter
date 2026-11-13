@@ -94,6 +94,24 @@ def test_pa_decode_plan(
         ]
         total_tiles = max(sum(last - first for first, last in ranges), 1)
         remaining = plan.capacity - sum(last > first for first, last in ranges)
+        # gfx942/gfx950 single-block plans bound every task by the smallest
+        # tile count T whose tasks fit the capacity; others split
+        # proportionally.
+        args = calls[-1][0]
+        balanced = len(args) > 3 and args[3] and args[0] <= args[1]
+        if balanced:
+
+            def tasks(tiles, bound):
+                return min(-(-tiles // bound), plan.max_partitions) if tiles else 0
+
+            # The smallest feasible bound from ceil(total / capacity) up;
+            # ceil(total / (capacity - rows)) always fits.
+            low = max(-(-total_tiles // plan.capacity), 1)
+            bound = max(-(-total_tiles // max(remaining, 1)), low)
+            while low < bound:
+                mid = (low + bound) // 2
+                need = sum(tasks(last - first, mid) for first, last in ranges)
+                low, bound = (low, mid) if need <= plan.capacity else (mid + 1, bound)
         cursor = prefix_tiles = 0
         for seq, (ctx, (start, count), (first, last)) in enumerate(
             zip(lengths, info, ranges)
@@ -102,9 +120,12 @@ def test_pa_decode_plan(
             tiles = last - first
             # Verify that the runtime capacity supplies the task budget used
             # to distribute slots by cumulative visible tile count.
-            extra = (prefix_tiles + tiles) * remaining // total_tiles
-            extra -= prefix_tiles * remaining // total_tiles
-            assert count == min(int(tiles > 0) + extra, tiles, plan.max_partitions)
+            if balanced:
+                assert count == tasks(tiles, bound)
+            else:
+                extra = (prefix_tiles + tiles) * remaining // total_tiles
+                extra -= prefix_tiles * remaining // total_tiles
+                assert count == min(int(tiles > 0) + extra, tiles, plan.max_partitions)
             tile = first
             for record in work[start : start + count]:
                 row, begin, end, original_length = record
