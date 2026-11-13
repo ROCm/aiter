@@ -312,8 +312,7 @@ def _gfx1250_tdm_configs(m, n, k, dtype, layout="nt"):
         config.pop("mma_m")
         config.pop("mma_n")
         config.pop("mma_k")
-        config["policy"] = "tdmi" if config["interleave"] else "tdm"
-        config["split_k_atomic"] = False  # legacy schema, one implementation
+        config["policy"] = "tdm"
         config["use_half_tile_interleaved"] = False
     return valid_configs
 

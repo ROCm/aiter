@@ -122,12 +122,14 @@ class TestGfx1250FlydslCandidates(unittest.TestCase):
 
 
 class TestTdmPolicyContract(unittest.TestCase):
-    def test_names_include_schedule_and_reduction_and_reject_invalid(self):
+    def test_single_policy_names_and_legacy_normalization(self):
         from aiter.ops.flydsl.gemm_kernels import (
+            TDM_POLICIES,
             flydsl_hgemm_kernel_name,
             get_flydsl_hgemm_kernel_params,
         )
 
+        self.assertEqual(set(TDM_POLICIES), {"tdm"})
         config = {
             "block_m": 128,
             "block_n": 128,
@@ -138,38 +140,54 @@ class TestTdmPolicyContract(unittest.TestCase):
             "n_waves": 2,
             "k_waves": 1,
             "group_m": 0,
+            "policy": "tdm",
         }
         names = []
         for dtype in (torch.bfloat16, torch.float16):
-            for policy in ("tdm", "tdmi", "tdma", "tdmia"):
-                kwargs = {
-                    "dtype": dtype,
-                    "out_dtype": dtype,
-                    "config": dict(config, policy=policy),
-                    "has_bias": True,
-                    "target_gfx": "gfx1250",
-                }
-                if dtype == torch.float16 and policy in ("tdma", "tdmia"):
-                    with self.assertRaises(ValueError):
-                        flydsl_hgemm_kernel_name(**kwargs)
-                    continue
-                name = flydsl_hgemm_kernel_name(**kwargs)
+            for interleave in (False, True):
+                name = flydsl_hgemm_kernel_name(
+                    dtype=dtype,
+                    out_dtype=dtype,
+                    config=dict(config, interleave=interleave),
+                    has_bias=True,
+                    target_gfx="gfx1250",
+                )
                 names.append(name)
                 parsed = get_flydsl_hgemm_kernel_params(name)
-                self.assertEqual(parsed["policy"], policy)
-                self.assertFalse(parsed["split_k_atomic"])
-                self.assertEqual(parsed["interleave"], policy in ("tdmi", "tdmia"))
+                self.assertEqual(parsed["policy"], "tdm")
+                self.assertEqual(parsed["interleave"], interleave)
+                self.assertNotIn("split_k_atomic", parsed)
                 for invalid in (
                     name.replace("gfx1250", "gfx950"),
                     name.replace("_w2x2x1_", "_w2x2x2_"),
                     name.replace("x128x2_ks", "x128x1_ks"),
                 ):
                     self.assertIsNone(get_flydsl_hgemm_kernel_params(invalid))
-                if policy in ("tdma", "tdmia"):
-                    self.assertIsNone(
-                        get_flydsl_hgemm_kernel_params(name.replace("_ks3_", "_ks1_"))
+                for legacy in ("tdmi", "tdma", "tdmia"):
+                    with self.assertRaises(ValueError):
+                        flydsl_hgemm_kernel_name(
+                            dtype=dtype,
+                            out_dtype=dtype,
+                            config=dict(config, policy=legacy),
+                            has_bias=True,
+                            target_gfx="gfx1250",
+                        )
+                for legacy, schedule in (
+                    ("tdm", False),
+                    ("tdmi", True),
+                    ("tdma", False),
+                    ("tdmia", True),
+                ):
+                    old_name = name.replace(
+                        f"_i{int(interleave)}_ptdm_", f"_p{legacy}_"
                     )
-        self.assertEqual(len(set(names)), len(names))
+                    parsed = get_flydsl_hgemm_kernel_params(old_name)
+                    if dtype == torch.float16 and legacy in ("tdma", "tdmia"):
+                        self.assertIsNone(parsed)
+                    else:
+                        self.assertEqual(parsed["policy"], "tdm")
+                        self.assertEqual(parsed["interleave"], schedule)
+        self.assertEqual(len(names), len(set(names)))
 
     def test_examples_large_policy_and_single_cluster_reduction(self):
         from types import SimpleNamespace
@@ -199,29 +217,17 @@ class TestTdmPolicyContract(unittest.TestCase):
                             c["n_waves"],
                             c["split_k"],
                             c["interleave"],
-                            c["split_k_atomic"],
                         ),
-                        (256, 256, 128, 2, 2, 2, 1, True, False),
+                        (256, 256, 128, 2, 2, 2, 1, True),
                     )
                 self.assertEqual({c["group_m"] for c in large}, {0, 4})
                 small = policy._gfx1250_tdm_configs(32, 32, 256, dtype)
                 self.assertTrue(small)
-                paired = {}
-                for c in small:
-                    key = tuple(
-                        sorted(
-                            (k, v)
-                            for k, v in c.items()
-                            if k not in ("split_k_atomic", "policy")
-                        )
-                    )
-                    paired.setdefault(key, set()).add(c["split_k_atomic"])
-                self.assertTrue(all(c["policy"] in ("tdm", "tdmi") for c in small))
-                for key, flags in paired.items():
-                    self.assertEqual(
-                        flags,
-                        {False},
-                    )
+                self.assertTrue(all(c["policy"] == "tdm" for c in small))
+                self.assertTrue(all("split_k_atomic" not in c for c in small))
+                self.assertEqual(
+                    len(small), len({tuple(sorted(c.items())) for c in small})
+                )
             configs = policy._gfx1250_tdm_configs(128, 128, 768, torch.bfloat16)
             self.assertTrue(any(c["interleave"] for c in configs))
             self.assertTrue(
@@ -233,7 +239,61 @@ class TestTdmPolicyContract(unittest.TestCase):
             )
             odd = policy._gfx1250_tdm_configs(128, 139, 768, torch.bfloat16)
             self.assertTrue(odd)
-            self.assertTrue(all(not c["split_k_atomic"] for c in odd))
+            self.assertTrue(all(c["policy"] == "tdm" for c in odd))
+
+    def test_single_policy_schedule_forwarded_by_tuner_and_production(self):
+        import importlib.util
+
+        import aiter.ops.flydsl.gemm_kernels as kernels
+        import aiter.tuned_gemm as tuned
+
+        path = (
+            Path(__file__).resolve().parents[2] / "csrc/gemm_a16w16/gemm_a16w16_tune.py"
+        )
+        spec = importlib.util.spec_from_file_location(
+            "_hgemm_tuner_schedule_test", path
+        )
+        tuner = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(tuner)
+        a = torch.empty((128, 768), dtype=torch.bfloat16)
+        w = torch.empty((128, 768), dtype=a.dtype)
+        out = torch.empty((128, 128), dtype=a.dtype)
+        for interleave in (False, True):
+            cfg = {
+                "block_m": 128,
+                "block_n": 128,
+                "block_k": 128,
+                "stages": 2,
+                "split_k": 3,
+                "m_waves": 2,
+                "n_waves": 2,
+                "k_waves": 1,
+                "group_m": 0,
+                "policy": "tdm",
+                "interleave": interleave,
+                "use_half_tile_interleaved": False,
+            }
+            with mock.patch.object(tuner, "flydsl_hgemm", return_value=out) as launch:
+                actual = tuner.run_flydsl_gemm_bf16(
+                    a, w, out, otype=a.dtype, config=cfg
+                )
+                self.assertIs(actual, out)
+                self.assertEqual(launch.call_args.kwargs["policy"], "tdm")
+                self.assertIs(launch.call_args.kwargs["interleave"], interleave)
+            name = kernels.flydsl_hgemm_kernel_name(
+                dtype=a.dtype,
+                out_dtype=a.dtype,
+                config=cfg,
+                has_bias=False,
+                target_gfx="gfx1250",
+            )
+            with mock.patch.object(kernels, "flydsl_hgemm", return_value=out) as launch:
+                actual = tuned.flydsl_gemm(
+                    a, w, 0, otype=a.dtype, out=out, config={"kernelName": name}
+                )
+                self.assertIs(actual, out)
+                self.assertEqual(launch.call_args.kwargs["policy"], "tdm")
+                self.assertIs(launch.call_args.kwargs["interleave"], interleave)
 
 
 class TestGfx950FlydslMemoryCandidates(unittest.TestCase):
@@ -378,6 +438,14 @@ class TestLegacyFlydslHgemmConfigs(unittest.TestCase):
                     .replace("_wf16_", "_wfp16_")
                     .replace("_f16_", "_fp16_")
                 )
+                if params["policy"] == "tdm":
+                    import re
+
+                    canonical = re.sub(
+                        r"(?:_i[01])?_p(?:tdm|tdmi|tdma|tdmia)_gfx1250$",
+                        f"_i{int(params['interleave'])}_ptdm_gfx1250",
+                        canonical,
+                    )
                 self.assertEqual(rebuilt, canonical)
             count += 1
         self.assertGreater(count, 0, "No persisted HGEMM rows were checked")
@@ -553,6 +621,7 @@ class TestLegacyFlydslHgemmConfigs(unittest.TestCase):
             "k_waves",
             "group_m",
             "policy",
+            "interleave",
         )
         seen = set()
         for _, row in self._rows():

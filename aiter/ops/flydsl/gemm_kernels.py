@@ -43,7 +43,7 @@ _HGEMM_KERNEL_RE = re.compile(
     r"x(?P<stages>\d+)_ks(?P<split_k>\d+)_"
     r"w(?P<m_waves>\d+)x(?P<n_waves>\d+)x(?P<k_waves>\d+)_"
     r"bias(?P<has_bias>[01])_ktail(?P<has_k_tail>[01])_"
-    r"gm(?P<group_m>\d+)(?:_stg(?P<k_stagger>\d+))?(?P<b_non_temporal>_bnt)?_p(?P<policy>ft|ht|hti|sk|bs|tdm|tdmi|tdma|tdmia)_"
+    r"gm(?P<group_m>\d+)(?:_stg(?P<k_stagger>\d+))?(?P<b_non_temporal>_bnt)?(?:_i(?P<interleave>[01]))?_p(?P<policy>ft|ht|hti|sk|bs|tdm|tdmi|tdma|tdmia)_"
     r"(?P<target_gfx>gfx[0-9a-z]+(?:-[0-9a-z]+)*)$"
 )
 
@@ -52,10 +52,10 @@ _HGEMM_KERNEL_RE = re.compile(
 # w1x1x<k_waves> the waves splitting K inside a workgroup. It has no split-K,
 # bias or fp32 output, and runs on gfx950 only.
 SKINNY_POLICY = "sk"
-# tdma/tdmia are read/dispatch aliases for old persisted CSV rows.
-# The boolean in slot 1 describes the legacy name, NOT an active atomic path.
-TDM_POLICIES = {
-    "tdm": (False, False),
+# One executable/tunable TDM policy. The legacy spellings below are accepted
+# ONLY by the persisted-name parser, then normalized to this policy.
+TDM_POLICIES = frozenset({"tdm"})
+_LEGACY_TDM_NAMES = {
     "tdmi": (True, False),
     "tdma": (False, True),
     "tdmia": (True, True),
@@ -91,6 +91,8 @@ def flydsl_hgemm_kernel_name(
             f"Unsupported output dtype {out_dtype_name} for input {dtype_name}"
         )
 
+    if config.get("policy") in _LEGACY_TDM_NAMES:
+        raise ValueError("use policy='tdm' with interleave=True/False")
     if config.get("policy") in (SKINNY_POLICY, "bs", *TDM_POLICIES):
         policy = config["policy"]
     else:
@@ -100,6 +102,12 @@ def flydsl_hgemm_kernel_name(
     _validate_k_stagger(k_stagger, gfx, policy)
     b_non_temporal = config.get("b_non_temporal", False)
     _validate_b_non_temporal(b_non_temporal, gfx, policy)
+    interleave = config.get("interleave", False)
+    if type(interleave) is not bool:
+        raise ValueError("interleave must be bool")
+    if interleave and policy != "tdm":
+        raise ValueError("interleave is a TDM schedule option")
+    schedule_suffix = f"_i{int(interleave)}" if policy == "tdm" else ""
     stagger_suffix = f"_stg{k_stagger}" if k_stagger else ""
     memory_suffix = "_bnt" if b_non_temporal else ""
     name = (
@@ -107,7 +115,7 @@ def flydsl_hgemm_kernel_name(
         f"t{config['block_m']}x{config['block_n']}x{config['block_k']}"
         f"x{config['stages']}_ks{config['split_k']}_"
         f"w{config['m_waves']}x{config['n_waves']}x{config['k_waves']}_"
-        f"bias{int(has_bias)}_ktail0_gm{config['group_m']}{stagger_suffix}{memory_suffix}_p{policy}_"
+        f"bias{int(has_bias)}_ktail0_gm{config['group_m']}{stagger_suffix}{memory_suffix}{schedule_suffix}_p{policy}_"
         f"{gfx}"
     )
     if policy in ("bs", *TDM_POLICIES) and get_flydsl_hgemm_kernel_params(name) is None:
@@ -165,13 +173,18 @@ def get_flydsl_hgemm_kernel_params(name: str) -> dict | None:
         "target_gfx": match.group("target_gfx"),
     }
 
-    if policy in TDM_POLICIES:
-        interleave, atomic = TDM_POLICIES[policy]
+    schedule = match.group("interleave")
+    if schedule is not None and policy != "tdm":
+        return None
+    if policy in TDM_POLICIES or policy in _LEGACY_TDM_NAMES:
+        interleave, legacy_atomic = _LEGACY_TDM_NAMES.get(
+            policy, (schedule == "1", False)
+        )
         if (
             params["target_gfx"] != "gfx1250"
             or params["out_dtype"] != params["dtype"]
             or params["k_waves"] != 1
-            or (atomic and (dtype != "bf16" or params["split_k"] == 1))
+            or (legacy_atomic and (dtype != "bf16" or params["split_k"] == 1))
         ):
             return None
         from .kernels.gemm_a16w16_tdm_gfx1250 import (
@@ -202,7 +215,7 @@ def get_flydsl_hgemm_kernel_params(name: str) -> dict | None:
             )
         except ValueError:
             return None
-        params.update(interleave=interleave, split_k_atomic=False)
+        params.update(policy="tdm", interleave=interleave)
     if policy == "bs" and not band_stream_name_supported(params):
         return None
     return params
@@ -241,6 +254,7 @@ def flydsl_hgemm(
     stream: torch.cuda.Stream | None = None,
     k_stagger: int = 0,
     b_non_temporal: bool = False,
+    interleave: bool = False,
 ) -> torch.Tensor:
     """Run the A16W16 kernel with AITER's ``B[N, K]`` convention.
 
@@ -253,10 +267,9 @@ def flydsl_hgemm(
     ``b_non_temporal`` streams B's async loads with the non-temporal cache
     hint. It is independent of k_stagger; tune both, since shared B can
     benefit from caching. Both options default off.
-    ``policy="tdm"/"tdmi"`` selects FP32-workspace cluster TDM,
-    plain/interleaved. Legacy ``"tdma"/"tdmia"`` names remain readable aliases
-    for these paths; no packed-BF16 atomic accumulation is performed.
-    All four use the same-dtype output and the existing weight[N,K] convention.
+    ``policy="tdm"`` selects FP32-workspace cluster TDM on gfx1250.
+    ``interleave`` is a schedule option, not another reduction policy.
+    Older persisted names are normalized by the name parser before dispatch.
     ``policy="bs"`` selects the BF16 band-stream decode kernel for the
     validated 256-CU gfx950 M/N/K and configuration catalog. It requires
     no bias, split_k=1 and BF16 output. As on the legacy FT path, strided
@@ -266,6 +279,10 @@ def flydsl_hgemm(
 
     if policy not in ("ft", "ht", "hti", SKINNY_POLICY, "bs", *TDM_POLICIES):
         raise ValueError(f"Unsupported FlyDSL HGEMM policy: {policy!r}")
+    if type(interleave) is not bool:
+        raise ValueError("interleave must be bool")
+    if interleave and policy != "tdm":
+        raise ValueError("interleave is a TDM schedule option")
     launch_stream = (
         torch.cuda.current_stream(device=a.device) if stream is None else stream
     )
@@ -284,7 +301,6 @@ def flydsl_hgemm(
             )
         from .gemm_a16w16_tdm import gemm_a16w16_tdm
 
-        interleave, _legacy_atomic = TDM_POLICIES[policy]
         with torch.cuda.stream(launch_stream):
             # The tuned op accepts strided A/B. Normalize only layouts the
             # NT TDM contract cannot represent, before launching on this stream.

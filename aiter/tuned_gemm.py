@@ -710,6 +710,7 @@ def flydsl_gemm(
         k_stagger=flydsl_config["k_stagger"],
         b_non_temporal=flydsl_config["b_non_temporal"],
         policy=policy,
+        interleave=flydsl_config.get("interleave", False),
         out_dtype=None if skinny else otype,
     )
 

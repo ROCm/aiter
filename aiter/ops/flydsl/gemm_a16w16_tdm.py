@@ -25,8 +25,6 @@ def gemm_a16w16_tdm(
     stream: torch.cuda.Stream | None = None,
     layout: str = "nt",
     interleave: bool = False,
-    split_k_atomic: bool = False,
-    split_k_policy: str | None = None,
 ) -> torch.Tensor:
     """C = A[M,K] @ B[K,N]; FP16/BF16 output, optional bias.
 
@@ -43,9 +41,7 @@ def gemm_a16w16_tdm(
 
     All split-K calls use FP32 partial workspace, one cluster barrier,
     and a fixed-order rank0 reduction. Output is rounded before bias.
-    ``split_k_atomic`` and ``split_k_policy`` are deprecated compatibility
-    arguments: old atomic requests now select this same FP32 cluster path,
-    not packed BF16 atomic accumulation. Old tuning timings must be remeasured.
+    There are no atomic-policy arguments or completion counters.
     """
     import flydsl.expr as fx
 
@@ -59,14 +55,6 @@ def gemm_a16w16_tdm(
     )
     from .kernels.tensor_shim import _run_compiled, ptr_arg
 
-    if type(split_k_atomic) is not bool:
-        raise ValueError("split_k_atomic must be bool")
-    if split_k_policy is not None:
-        if split_k_policy not in ("atomic", "workspace"):
-            raise ValueError("split_k_policy must be atomic or workspace")
-        if split_k_atomic and split_k_policy == "workspace":
-            raise ValueError("conflicting split-K policy arguments")
-    # Compatibility only; no atomic implementation or second reduction policy.
     if a.ndim != 2 or b.ndim != 2 or a.shape[1] != b.shape[0]:
         raise ValueError("expected A[M,K] and B[K,N]")
     if a.dtype not in (torch.float16, torch.bfloat16) or b.dtype != a.dtype:
