@@ -493,6 +493,20 @@ def _padded_scale_cols(size, group_size=32):
     return (((size + group_size - 1) // group_size + 7) // 8) * 8
 
 
+def _is_row_major_2d(tensor):
+    return (
+        tensor.ndim == 2
+        and tensor.stride(1) == 1
+        and (
+            tensor.shape[0] == 1
+            or (
+                tensor.stride(0) >= tensor.shape[1]
+                and tensor.stride(0) * tensor.element_size() % 16 == 0
+            )
+        )
+    )
+
+
 def _is_inline_sort_kname(kernel1):
     """Whether stage1 can use the generated BM16 inline-sort path."""
     try:
@@ -611,10 +625,12 @@ def _mxfp4_inline_sort_unsupported(
     ):
         return "MXFP4 weight scales are smaller than the padded stride"
 
-    tensors = (hidden_states, w1, w2, topk_ids, w1_scale, w2_scale)
-    if not all(tensor.is_contiguous() for tensor in tensors):
+    tensors = (w1, w2, topk_ids, w1_scale, w2_scale)
+    if not _is_row_major_2d(hidden_states) or not all(
+        tensor.is_contiguous() for tensor in tensors
+    ):
         return "non-contiguous tensors"
-    if len({tensor.device for tensor in tensors}) != 1:
+    if len({tensor.device for tensor in (hidden_states, *tensors)}) != 1:
         return "cross-device tensors"
 
     p2 = parse_flydsl_v2_gemm2_kernel(metadata.stage2.keywords["kernelName2"])
@@ -1622,6 +1638,8 @@ def _fused_moe_impl(
             )
         topk = herd_topk
     E, model_dim, inter_dim = get_inter_dim(w1.shape, w2.shape)
+    if not hidden_states.is_contiguous() and not _is_row_major_2d(hidden_states):
+        hidden_states = hidden_states.contiguous()
 
     assert w1.shape[1] in [
         inter_dim,
@@ -1905,6 +1923,8 @@ def _fused_moe_impl(
             )
             metadata = _resolve_metadata(disable_inline_sort=True)
             use_inline_sort = False
+    if not use_inline_sort and not hidden_states.is_contiguous():
+        hidden_states = hidden_states.contiguous()
 
     stage2_func = getattr(metadata.stage2, "func", metadata.stage2)
     if (

@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import NamedTuple
 
 import flydsl.expr as fx
 import torch
@@ -135,12 +136,42 @@ def _bf16_lds_bytes(head_dim, query_rows, block_size):
     return qp_bytes + max_sum_bytes + 4 * pages_per_chunk * 4
 
 
+class PaDecodeCacheKey(NamedTuple):
+    """Tile specialization key. ``select`` builds it by keyword and ``create``
+    reads it by name, so a field one change adds and another misses fails
+    loudly instead of shifting the rest. Tests read the last two by position."""
+
+    head_dim: int
+    query_group_size: int
+    block_size: int
+    num_partitions: int
+    softmax_scale: float | None
+    query_dtype: object
+    per_token_kv: bool
+    query_length: int
+    trans_v: bool
+    wide_kv_addressing: bool
+    BUFFER_KV: bool
+    prefetch_v: bool
+    PER_TOKEN_M1: bool
+    query_splits: int
+    single_tile_plan: bool
+    sliding_window: int
+    kv_dtype: object
+    mask_unowned_kv: bool
+    direct_output: bool
+    sparse_grid: bool
+    D256_PIPE: bool
+    stage_pages: int
+
+
 @dataclass(frozen=True)
 class PaDecodeSchedule:
     """Select the cache key without constructing the full kernel layout."""
 
     cache_key: tuple[object, ...]
     is_gfx950: bool
+    is_gfx942: bool
     PER_TOKEN_M1: bool
 
     @classmethod
@@ -183,9 +214,16 @@ class PaDecodeSchedule:
             raise NotImplementedError("Non-transposed key cache is not implemented")
         arch = str(get_rocm_arch()).split(":", 1)[0]
         is_gfx950 = "gfx95" in arch
+        is_gfx942 = arch == "gfx942"
         kv_dtype, query_dtype = pa_fx_dtypes(kv_dtype, query_dtype)
-        if direct_output and kv_dtype != MXFP4_KV_DTYPE:
-            raise NotImplementedError("direct_output requires gfx1250 or MXFP4")
+        if direct_output and not (
+            kv_dtype == MXFP4_KV_DTYPE
+            or ((is_gfx950 or is_gfx942) and num_partitions == 1)
+        ):
+            raise NotImplementedError(
+                "direct_output requires gfx1250, MXFP4 or a one-partition "
+                "gfx942/gfx950 plan"
+            )
         # The MMAs read FP8 as the arch's format: FNUZ on gfx94x, OCP elsewhere
         # (gfx950, and gfx1250, whose schedule the tests still query).
         arch_fp8 = fx.Float8E4M3FNUZ if "gfx94" in arch else fx.Float8E4M3FN
@@ -369,7 +407,14 @@ class PaDecodeSchedule:
             or (
                 TUNED_PER_TOKEN and QUERIES_PER_CTA == 1 and 8 <= query_group_size <= 16
             )
-            or (TUNED_SCALAR and block_size == 128 and TOTAL_ROWS <= MFMA_MNK)
+            or (TUNED_SCALAR and TOTAL_ROWS <= MFMA_MNK)
+            or (
+                is_gfx950
+                and (kv_dtype == fx.BFloat16)
+                and block_size == 16
+                and QUERIES_PER_CTA == 1
+                and TOTAL_ROWS <= MFMA_MNK
+            )
         )
         # Keep the tuned page/scale layout selection separate from V prefetch.
         PER_TOKEN_M1 = (
@@ -383,32 +428,35 @@ class PaDecodeSchedule:
                 or (single_tile_plan and split_workgroups <= 2 * num_compute_units)
             )
         )
-        cache_key = (
-            head_dim,
-            query_group_size,
-            block_size,
-            num_partitions,
-            softmax_scale,
-            query_dtype,
-            per_token_kv,
-            query_length,
-            trans_v,
-            wide_kv_addressing,
-            BUFFER_KV,
-            prefetch_v,
-            PER_TOKEN_M1,
-            query_splits,
-            single_tile_plan,
-            sliding_window,
-            kv_dtype,
-            bool(mask_unowned_kv),
-            direct_output,
-            D256_PIPE,
-            stage_pages,
+        cache_key = PaDecodeCacheKey(
+            head_dim=head_dim,
+            query_group_size=query_group_size,
+            block_size=block_size,
+            num_partitions=num_partitions,
+            softmax_scale=softmax_scale,
+            query_dtype=query_dtype,
+            per_token_kv=per_token_kv,
+            query_length=query_length,
+            trans_v=trans_v,
+            wide_kv_addressing=wide_kv_addressing,
+            BUFFER_KV=BUFFER_KV,
+            prefetch_v=prefetch_v,
+            PER_TOKEN_M1=PER_TOKEN_M1,
+            query_splits=query_splits,
+            single_tile_plan=single_tile_plan,
+            sliding_window=sliding_window,
+            kv_dtype=kv_dtype,
+            mask_unowned_kv=bool(mask_unowned_kv),
+            direct_output=direct_output,
+            # At most one CTA per CU: room for two four-wave groups per CTA.
+            sparse_grid=split_workgroups * query_splits <= num_compute_units,
+            D256_PIPE=D256_PIPE,
+            stage_pages=stage_pages,
         )
         return cls(
             cache_key=cache_key,
             is_gfx950=is_gfx950,
+            is_gfx942=is_gfx942,
             PER_TOKEN_M1=PER_TOKEN_M1,
         )
 
@@ -457,8 +505,22 @@ class PaDecodeTraits:
     PACKS_PER_MFMA: int
     MTP4_FUSED: bool
     MTP4_PREFETCH_V: bool
+    FP8_MTP4_LEAN: bool
+    FP8_MTP4_Q_LDS: bool
+    FP8_MTP4_PAGES_AHEAD: bool
+    BF16_MTP_FUSED: bool
+    BF16_DECODE_NT_KV: bool
+    FP8_DECODE_NT_V: bool
+    DECODE_Q_EARLY: bool
+    FP8_SCALES_AFTER_Q: bool
+    FP8_LOOP_SCALES_LATE: bool
+    DECODE_LAST_V_AFTER_QK: bool
+    Q_ROW_BYTES: int
+    QK_AGROUP: int
     BUFFER_KV: bool
     PAGE16_VPIPE: bool
+    PAGE16_PAGES_FIRST: bool
+    PAGE16_EARLY_K: bool
     REUSE_KV_PAGES: bool
     SCALES_BEFORE_CURRENT_V: bool
     M1_SCALE_BEFORE_MASK: bool
@@ -488,6 +550,13 @@ class PaDecodeTraits:
     STEPS_PER_PAGE: int
     STEPS_PER_CHUNK: int
     BLOCK_THREADS: int
+    IS_GFX950: bool
+    IS_GFX942: bool
+    packed_q_absmax: bool
+    DUAL_GROUP: bool
+    STAGE_PAGES: int
+    GROUP_LDS_BYTES: int
+    CTA_THREADS: int
     K_SLOT: int
     V_SLOT: int
     STATE_PER_M: int
@@ -522,30 +591,30 @@ class PaDecodeTraits:
     def create(cls, schedule: PaDecodeSchedule) -> PaDecodeTraits:
         """Derive the immutable kernel layout after a specialization cache miss."""
         cache_key = schedule.cache_key
-        (
-            head_dim,
-            query_group_size,
-            block_size,
-            _num_partitions,
-            softmax_scale,
-            query_dtype,
-            per_token_kv,
-            query_length,
-            trans_v,
-            wide_kv_addressing,
-            BUFFER_KV,
-            prefetch_v,
-            PER_TOKEN_M1,
-            query_splits,
-            single_tile_plan,
-            sliding_window,
-            kv_dtype,
-            mask_unowned_kv,
-            DIRECT,
-            D256_PIPE,
-            stage_page_capacity,
-        ) = cache_key
+        head_dim = cache_key.head_dim
+        query_group_size = cache_key.query_group_size
+        block_size = cache_key.block_size
+        _num_partitions = cache_key.num_partitions
+        softmax_scale = cache_key.softmax_scale
+        query_dtype = cache_key.query_dtype
+        per_token_kv = cache_key.per_token_kv
+        query_length = cache_key.query_length
+        trans_v = cache_key.trans_v
+        wide_kv_addressing = cache_key.wide_kv_addressing
+        BUFFER_KV = cache_key.BUFFER_KV
+        prefetch_v = cache_key.prefetch_v
+        PER_TOKEN_M1 = cache_key.PER_TOKEN_M1
+        query_splits = cache_key.query_splits
+        single_tile_plan = cache_key.single_tile_plan
+        sliding_window = cache_key.sliding_window
+        kv_dtype = cache_key.kv_dtype
+        mask_unowned_kv = cache_key.mask_unowned_kv
+        DIRECT = cache_key.direct_output
+        SPARSE_GRID = cache_key.sparse_grid
+        D256_PIPE = cache_key.D256_PIPE
+        stage_page_capacity = cache_key.stage_pages
         is_gfx950 = schedule.is_gfx950
+        is_gfx942 = schedule.is_gfx942
         # MXFP4 V is widened to bf16 in LDS, so both run the bf16 PV MFMA.
         PV_BF16 = kv_dtype in (fx.BFloat16, MXFP4_KV_DTYPE)
         TUNED_SHAPE = (
@@ -622,9 +691,141 @@ class PaDecodeTraits:
         MTP4_PREFETCH_V = MTP4_FUSED and (
             block_size == 16 or not wide_kv_addressing or BUFFER_KV
         )
+        # gfx950 FP8 MTP4 tiles: scores stay frag * k_scale and the positive
+        # per-row scale folds into exp2's FMA; each chunk's P is multiplied by
+        # one v_scale / v_max factor, shared by the M-tiles, before the FP8
+        # pack, and PV's output is scaled back by v_max (the PV MFMA itself
+        # takes unit scales).
+        FP8_MTP4_LEAN = (
+            is_gfx950
+            and MTP4_FUSED
+            and not single_tile_plan
+            and (softmax_scale is None or softmax_scale > 0)
+        )
+        # They reread Q operands from LDS every tile (P no longer aliases Q),
+        # which frees the registers loop-invariant Q held.
+        FP8_MTP4_Q_LDS = FP8_MTP4_LEAN
+        # Its page128 tiles carry the next tile's K/V page ids in registers:
+        # the next scales load at tile start and land in LDS before the
+        # second barrier, off the first barrier's path. The first tile's
+        # scales go ahead of its K and V on vmcnt.
+        FP8_MTP4_PAGES_AHEAD = FP8_MTP4_Q_LDS and MTP4_PREFETCH_V and block_size == 128
+        # gfx950 BF16 multi-query tiles: Q stays in padded LDS rows, every
+        # M-tile owns a private P/Lsum slot (one publication barrier), V is
+        # carried across tiles and K16 packs pair into K32 MFMAs. The resident
+        # set then fits 256 registers, two CTAs per CU.
+        BF16_MTP_FUSED = (
+            is_gfx950
+            and (kv_dtype == fx.BFloat16)
+            and head_dim == 128
+            and block_size == 128
+            and 1 < M_TILES <= 4
+            and sliding_window == 0
+            # max(scale * s) = scale * max(s) lets the scale fold into exp2.
+            and (softmax_scale is None or softmax_scale > 0)
+        )
+        # gfx950 BF16 single-M-tile decode reads every K and V byte once:
+        # stream both nontemporally. A cache that stays MALL-resident across
+        # calls loses that reuse (MiniMax-M3 b4 8K replayed hot: ~0.96x); cold
+        # KV, as in serving, gains.
+        BF16_DECODE_NT_KV = (
+            is_gfx950
+            and (kv_dtype == fx.BFloat16)
+            and head_dim == 128
+            and block_size == 128
+            and M_TILES == 1
+            and sliding_window == 0
+            and not BUFFER_KV
+        )
+        # gfx950 FP8 single-M-tile page-128 decode reads every V byte once:
+        # stream V nontemporally. K stays cached: streaming it too slowed the
+        # short single-tile tasks, and on page 16 streaming fights the V pipe.
+        FP8_DECODE_NT_V = (
+            is_gfx950
+            and kv_dtype in FP8_KV_DTYPES
+            and head_dim == 128
+            and block_size == 128
+            and M_TILES == 1
+            and sliding_window == 0
+            and not BUFFER_KV
+        )
+        # gfx950 single-M-tile decode (BF16, or FP8 with a full 16-row tile)
+        # issues Q ahead of the page ids and stages it while K is in flight.
+        DECODE_Q_EARLY = (
+            BF16_DECODE_NT_KV
+            or (
+                is_gfx950
+                and kv_dtype in FP8_KV_DTYPES
+                and head_dim == 128
+                and M_TILES == 1
+                and sliding_window == 0
+                and (
+                    (block_size == 128 and CTA_ROWS == MFMA_MNK)
+                    # Scalar page 16 also covers partial tiles: padded rows
+                    # load the last real row and are never staged.
+                    or (block_size == 16 and not per_token_kv)
+                )
+            )
+            # The scalar head-256 pipe and BF16 page 16 take the same early Q.
+            # (Per-token head-256 orders its scale loads ahead of K instead.)
+            or (
+                is_gfx950
+                and D256_PIPE
+                and not per_token_kv
+                and M_TILES == 1
+                and sliding_window == 0
+            )
+            or (
+                is_gfx950
+                and (kv_dtype == fx.BFloat16)
+                and block_size == 16
+                and M_TILES == 1
+                and sliding_window == 0
+            )
+        )
+        # gfx950 per-token FP8 page128 tiles that load Q early stage the
+        # first tile's scales after Q, so Q quantizes while K is in flight.
+        FP8_SCALES_AFTER_Q = (
+            is_gfx950
+            and kv_dtype in FP8_KV_DTYPES
+            and per_token_kv
+            and head_dim == 128
+            and block_size == 128
+            and sliding_window == 0
+            and not D256_PIPE
+            and (MTP4_FUSED or DECODE_Q_EARLY)
+        )
+        # Its peeled last tile loads no next K, so V issues right behind QK
+        # and overlaps the softmax barriers instead of following them.
+        DECODE_LAST_V_AFTER_QK = BF16_DECODE_NT_KV
+        # QK K chunks per Q operand read: K registers die chunk by chunk.
+        QK_AGROUP = 2
         TUNE_PAGE128 = block_size == 128 and (PER_TOKEN_M1 or TUNED_SCALAR)
         PAGE16_VPIPE = prefetch_v and block_size == 16
+        # gfx950 scalar-scale page-16 pipes load the next tile's page ids
+        # ahead of the current V: staging them then waits on vmcnt without
+        # draining V, which stays in flight through the softmax.
+        PAGE16_PAGES_FIRST = (
+            is_gfx950
+            and PAGE16_VPIPE
+            and not per_token_kv
+            and not D256_PIPE
+            and not single_tile_plan
+        )
+        # FP8 also issues the next K from those ids right after QK instead of
+        # after the P barrier. BF16's next K is twice the registers and slower.
+        PAGE16_EARLY_K = PAGE16_PAGES_FIRST and kv_dtype != fx.BFloat16
         REUSE_KV_PAGES = PER_TOKEN_M1 or (D256_PIPE and per_token_kv)
+        # gfx950 per-token FP8 B>=2 decode loops (their tiles always have a
+        # next tile) store the next tile's scales after PV, so the scale vmcnt
+        # wait does not drain next K and current V ahead of the softmax.
+        FP8_LOOP_SCALES_LATE = (
+            FP8_SCALES_AFTER_Q
+            and M_TILES == 1
+            and not REUSE_KV_PAGES
+            and not PAGE16_VPIPE
+            and not single_tile_plan
+        )
         SCALES_BEFORE_CURRENT_V = (
             WIDE_FP8_MFMA and PER_TOKEN_M1 and (block_size == 16 or not trans_v)
         )
@@ -634,7 +835,7 @@ class PaDecodeTraits:
         # publishes all of them.
         P_BUFFERS = (
             M_TILES
-            if MTP4_FUSED or D256_PIPE
+            if MTP4_FUSED or D256_PIPE or BF16_MTP_FUSED
             else 2 if TUNE_PAGE128 and M_TILES == 3 else 1
         )
         # PV uses V=A, P=B: output [head-dim, query-row=lane16].
@@ -703,17 +904,27 @@ class PaDecodeTraits:
         # LDS holds Q/P, cross-wave max/sum, V page IDs and FP8 scales.
         # PV output and online-softmax state remain in registers.
         f32 = 4
-        sQ_bytes = ROWS_PADDED * head_dim * QP_ELEM_BYTES
+        # Tiles that reread Q every tile pad its rows like P's.
+        Q_ROW_BYTES = head_dim * QP_ELEM_BYTES + (
+            16 if BF16_MTP_FUSED or FP8_MTP4_Q_LDS else 0
+        )
+        sQ_bytes = ROWS_PADDED * Q_ROW_BYTES
         # First-QK's max barrier retires all sQ reads before P overwrites it.
         # Still-live Q scales stay outside the aliased, 16-byte-aligned Q/P regions.
-        sP_off = 0
+        # Fused BF16 tiles keep Q live, so P follows it instead of aliasing it.
+        Q_STAYS = BF16_MTP_FUSED or FP8_MTP4_Q_LDS
+        sP_off = sQ_bytes if Q_STAYS else 0
         # Padding avoids 32-bank conflicts while preserving ds_read_b128 alignment.
         SP_ROW_BYTES = KV_COMPUTE_BLOCK * QP_ELEM_BYTES + 16
         sP_bytes = P_BUFFERS * MFMA_MNK * SP_ROW_BYTES
-        sQscale_off = max(sQ_bytes, sP_bytes)
-        sQscale_bytes = 0 if kv_dtype == fx.BFloat16 else ROWS_PADDED * f32
+        sQscale_off = sP_off + sP_bytes if Q_STAYS else max(sQ_bytes, sP_bytes)
+        sQscale_bytes = 0 if (kv_dtype == fx.BFloat16) else ROWS_PADDED * f32
         # Tuned rows need 16-byte vector alignment; other paths use bank padding.
-        NWARP_PAD = NWARP if TUNE_PAGE128 or PER_TOKEN_M1 or MTP4_FUSED else NWARP + 1
+        NWARP_PAD = (
+            NWARP
+            if TUNE_PAGE128 or PER_TOKEN_M1 or MTP4_FUSED or BF16_MTP_FUSED
+            else NWARP + 1
+        )
         # Phase-split slices sLmax per M-tile so all pass-1 writes share one barrier.
         sLmax_off = sQscale_off + sQscale_bytes
         sLsum_off = sLmax_off + M_TILES * MFMA_MNK * NWARP_PAD * f32
@@ -732,9 +943,38 @@ class PaDecodeTraits:
             NWARP_PAD * f32 if per_token_kv else 0
         )  # m-independent: one cross-warp slot
         total_bytes = sVScaleMax_off + sVScaleMax_bytes
+        # gfx942/gfx950 one-partition decode tasks walk all of a sequence's
+        # tiles in one CTA (sparse grids: at most one CTA per CU). Two
+        # four-wave groups take alternate tiles, each with its own LDS copy,
+        # and merge once at the end, so each SIMD interleaves two independent
+        # tile chains.
+        DUAL_GROUP = (
+            # gfx942 wider heads already take up to 512 VGPRs per wave, so an
+            # eight-wave CTA of them cannot launch.
+            (is_gfx950 or (is_gfx942 and head_dim == 128))
+            and (DIRECT or _num_partitions == 1)
+            and SPARSE_GRID
+            # The head-256 pipe's waves leave no room for a second group.
+            and not D256_PIPE
+            and not per_token_kv
+            and query_length == 1
+            and sliding_window == 0
+            and M_TILES == 1
+            and not single_tile_plan
+            and not BF16_MTP_FUSED
+            and not MTP4_FUSED
+        )
         # Page ids for the task's tiles, one i32 each, staged before the loop.
+        # Dual MXFP4 groups stage only their own (alternate) tiles' ids, so
+        # each copy of the layout holds half of them.
+        STAGE_PAGES = stage_page_capacity
+        if DUAL_GROUP and (kv_dtype == MXFP4_KV_DTYPE) and stage_page_capacity:
+            pages_per_tile = KV_COMPUTE_BLOCK // block_size
+            STAGE_PAGES = (
+                -(-(stage_page_capacity // pages_per_tile) // 2) * pages_per_tile
+            )
         sPages_off = total_bytes
-        total_bytes += stage_page_capacity * 4
+        total_bytes += STAGE_PAGES * 4
         # Wave-private bf16 V staging for MXFP4; also holds the wave's O at the end.
         sMxfp4VBf16_off = (total_bytes + 15) // 16 * 16
         if kv_dtype == MXFP4_KV_DTYPE:
@@ -745,8 +985,23 @@ class PaDecodeTraits:
                     f"{MXFP4_LDS_LIMIT_BYTES} B of gfx950"
                 )
 
+        GROUP_LDS_BYTES = (total_bytes + 15) // 16 * 16
+        # MXFP4 stages V and page ids per group: both copies must fit.
+        DUAL_GROUP = DUAL_GROUP and (
+            kv_dtype != MXFP4_KV_DTYPE or 2 * GROUP_LDS_BYTES <= MXFP4_LDS_LIMIT_BYTES
+        )
+        CTA_THREADS = BLOCK_THREADS * (2 if DUAL_GROUP else 1)
         return cls(
             cache_key=cache_key,
+            IS_GFX950=is_gfx950,
+            IS_GFX942=is_gfx942,
+            # gfx942 head-1024 tiles already spill; the packed Q prologue shifts
+            # their allocation (per-tensor transposed-V b64 32K: 0.87x).
+            packed_q_absmax=is_gfx950 or (is_gfx942 and head_dim <= 256),
+            DUAL_GROUP=DUAL_GROUP,
+            STAGE_PAGES=STAGE_PAGES,
+            GROUP_LDS_BYTES=GROUP_LDS_BYTES,
+            CTA_THREADS=CTA_THREADS,
             head_dim=head_dim,
             query_group_size=query_group_size,
             block_size=block_size,
@@ -778,8 +1033,22 @@ class PaDecodeTraits:
             PACKS_PER_MFMA=PACKS_PER_MFMA,
             MTP4_FUSED=MTP4_FUSED,
             MTP4_PREFETCH_V=MTP4_PREFETCH_V,
+            FP8_MTP4_LEAN=FP8_MTP4_LEAN,
+            FP8_MTP4_Q_LDS=FP8_MTP4_Q_LDS,
+            FP8_MTP4_PAGES_AHEAD=FP8_MTP4_PAGES_AHEAD,
+            BF16_MTP_FUSED=BF16_MTP_FUSED,
+            BF16_DECODE_NT_KV=BF16_DECODE_NT_KV,
+            FP8_DECODE_NT_V=FP8_DECODE_NT_V,
+            DECODE_Q_EARLY=DECODE_Q_EARLY,
+            FP8_SCALES_AFTER_Q=FP8_SCALES_AFTER_Q,
+            FP8_LOOP_SCALES_LATE=FP8_LOOP_SCALES_LATE,
+            DECODE_LAST_V_AFTER_QK=DECODE_LAST_V_AFTER_QK,
+            Q_ROW_BYTES=Q_ROW_BYTES,
+            QK_AGROUP=QK_AGROUP,
             BUFFER_KV=BUFFER_KV,
             PAGE16_VPIPE=PAGE16_VPIPE,
+            PAGE16_PAGES_FIRST=PAGE16_PAGES_FIRST,
+            PAGE16_EARLY_K=PAGE16_EARLY_K,
             REUSE_KV_PAGES=REUSE_KV_PAGES,
             SCALES_BEFORE_CURRENT_V=SCALES_BEFORE_CURRENT_V,
             M1_SCALE_BEFORE_MASK=M1_SCALE_BEFORE_MASK,
