@@ -659,6 +659,10 @@ def _moe_gemm_a4w4_prefill(
     EP_SCATTER: gl.constexpr = False,
     # Row extent of the combine window, so an out-of-range index is droppable.
     Y_ROWS=0,
+    # Top-k combine in the epilogue: per sorted row, its routing slot (the
+    # gather index); rows of slot // N_EXPTS_ACT are summed into Y with atomics.
+    TopkTok=None,
+    ATOMIC_COMBINE: gl.constexpr = False,
     PRELOAD_X_SCALES: gl.constexpr = False,
     XS_SLAB_COLS: gl.constexpr = 0,
     # Warm L2 with the first this-many K-tiles of w during the prologue.
@@ -1340,6 +1344,35 @@ def _moe_gemm_a4w4_prefill(
             bs_e8m0,
             mask=(offs_m_s[:, None] < M) & (offs_n_s[None, :] < gl.cdiv(yN, 32)),
         )
+    elif ATOMIC_COMBINE:
+        # Sum the top-k rows of each token straight into Y: the GEMM writes no
+        # per-route rows and no separate reduction pass reads them back. Rows
+        # are converted to 8 contiguous bf16 per thread, issued as packed
+        # 2 x bf16 atomic adds. Accumulation is in bf16, in arrival order.
+        NUM_WARPS_C: gl.constexpr = gl.num_warps()
+        COMBINE_LAYOUT: gl.constexpr = gl.BlockedLayout(
+            [1, 8], [32 // (OUT_BLOCK_N // 8) if OUT_BLOCK_N < 256 else 1,
+                     (OUT_BLOCK_N // 8) if OUT_BLOCK_N < 256 else 32],
+            [NUM_WARPS_C, 1], [1, 0]
+        )
+        out_c = gl.convert_layout(out.to(gl.bfloat16), COMBINE_LAYOUT)
+        offs_m_c = BLOCK_M * block_id + gl.arange(
+            0, BLOCK_M, layout=gl.SliceLayout(1, COMBINE_LAYOUT)
+        )
+        mask_m_c = offs_m_c < M
+        tok = gl.load(TopkTok + start_m + offs_m_c, mask=mask_m_c, other=0) // N_EXPTS_ACT
+        offs_n_c = pid_n * OUT_BLOCK_N + gl.arange(
+            0, OUT_BLOCK_N, layout=gl.SliceLayout(0, COMBINE_LAYOUT)
+        )
+        # Buffer atomics mask through an out-of-range offset instead of a branch
+        # around every instruction.
+        gl.amd.cdna4.buffer_atomic_add(
+            Y,
+            tok[:, None] * stride_y_m + offs_n_c[None, :] * stride_y_n,
+            out_c,
+            mask=mask_m_c[:, None] & (offs_n_c[None, :] < yN),
+            sem="relaxed",
+        )
     elif EP_SCATTER:
         # Expert-parallel combine: these rows leave for arbitrary rows of a peer
         # combine-staging window rather than for their slot in a contiguous Y
@@ -1509,6 +1542,8 @@ def _moe_gemm_a4w4_decode(
     EP_SCATTER: gl.constexpr = False,
     # Row extent of the combine window, so an out-of-range index is droppable.
     Y_ROWS=0,
+    TopkTok=None,
+    ATOMIC_COMBINE: gl.constexpr = False,
 ):
     MX_PACK_DIVISOR: gl.constexpr = 32
     gl.static_assert(
@@ -2174,6 +2209,35 @@ def _moe_gemm_a4w4_decode(
             + offs_n_s[None, :] * stride_y_mx_n,
             bs_e8m0,
             mask=(offs_m_s[:, None] < M) & (offs_n_s[None, :] < gl.cdiv(yN, 32)),
+        )
+    elif ATOMIC_COMBINE:
+        # Sum the top-k rows of each token straight into Y: the GEMM writes no
+        # per-route rows and no separate reduction pass reads them back. Rows
+        # are converted to 8 contiguous bf16 per thread, issued as packed
+        # 2 x bf16 atomic adds. Accumulation is in bf16, in arrival order.
+        NUM_WARPS_C: gl.constexpr = gl.num_warps()
+        COMBINE_LAYOUT: gl.constexpr = gl.BlockedLayout(
+            [1, 8], [32 // (OUT_BLOCK_N // 8) if OUT_BLOCK_N < 256 else 1,
+                     (OUT_BLOCK_N // 8) if OUT_BLOCK_N < 256 else 32],
+            [NUM_WARPS_C, 1], [1, 0]
+        )
+        out_c = gl.convert_layout(out.to(gl.bfloat16), COMBINE_LAYOUT)
+        offs_m_c = BLOCK_M * block_id + gl.arange(
+            0, BLOCK_M, layout=gl.SliceLayout(1, COMBINE_LAYOUT)
+        )
+        mask_m_c = offs_m_c < M
+        tok = gl.load(TopkTok + start_m + offs_m_c, mask=mask_m_c, other=0) // N_EXPTS_ACT
+        offs_n_c = pid_n * OUT_BLOCK_N + gl.arange(
+            0, OUT_BLOCK_N, layout=gl.SliceLayout(0, COMBINE_LAYOUT)
+        )
+        # Buffer atomics mask through an out-of-range offset instead of a branch
+        # around every instruction.
+        gl.amd.cdna4.buffer_atomic_add(
+            Y,
+            tok[:, None] * stride_y_m + offs_n_c[None, :] * stride_y_n,
+            out_c,
+            mask=mask_m_c[:, None] & (offs_n_c[None, :] < yN),
+            sem="relaxed",
         )
     elif EP_SCATTER:
         # Expert-parallel combine: these rows leave for arbitrary rows of a peer

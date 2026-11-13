@@ -2,6 +2,7 @@
 # original code https://github.com/triton-lang/triton/blob/main/python/triton_kernels/triton_kernels/matmul_ogs.py
 
 import itertools
+import os
 
 import torch
 import triton
@@ -316,6 +317,9 @@ def moe_gemm_a4w4(
     # directly and that separate launch over the intermediate disappears.
     # GEMM1-style only -- requires split_k == 1 and no scatter_indx.
     out_mx_quant: bool = False,
+    # Routing slot of each sorted row (the GEMM1 gather index). Only used by the
+    # atomic top-k combine; derived from scatter_indx when not given.
+    topk_tok=None,
 ):
     """
     Y[:, :] = 0.
@@ -421,6 +425,25 @@ def moe_gemm_a4w4(
         and split_k == 1
     )
 
+    # Sum the top-k rows in the GEMM epilogue with atomics instead of writing
+    # every routed row and reducing them in a second pass. Opt-in: the sum is
+    # accumulated in bf16 in arrival order rather than in fp32. Only the decode
+    # kernel (block_m == 16) benefits on gfx1250; at larger M the atomic
+    # traffic costs more than the reduction it replaces.
+    atomic_combine = (
+        os.environ.get("AITER_A4W4_ATOMIC_COMBINE", "0") == "1"
+        and use_gluon
+        and config["block_m"] == 16
+        and scatter_indx is not None
+        and routing_data.n_expts_act > 1
+        and split_k == 1
+        and ep_scatter is None
+        and not out_mx_quant
+        and not apply_swiglu_reduction
+        and gate_valid is None
+        and (out_dtype or x.dtype) == torch.bfloat16
+    )
+
     # allocate output memory
     y, y_final = allocate_output(
         x,
@@ -438,10 +461,26 @@ def moe_gemm_a4w4(
         skip_final=ep_scatter is not None,
         # The epilogue writes straight into the staging window, so the
         # (M x hidden) matmul buffer is never read. Skip allocating it.
-        skip_matmul=fused_ep_scatter,
+        skip_matmul=fused_ep_scatter or atomic_combine,
         out_mx_quant=out_mx_quant,
     )
-    if fused_ep_scatter:
+    topk_tok_arg = None
+    if atomic_combine:
+        y_final.zero_()
+        if topk_tok is None:
+            # int32: small routings use uint16 indices, which arange lacks.
+            topk_tok = torch.empty(
+                scatter_indx.numel(), device=scatter_indx.device, dtype=torch.int32
+            )
+            topk_tok[scatter_indx.long()] = torch.arange(
+                scatter_indx.numel(), device=scatter_indx.device, dtype=torch.int32
+            )
+        topk_tok_arg = topk_tok
+        y_ptr = y_final
+        stride_y_m = y_final.stride(0)
+        stride_y_n = y_final.stride(1)
+        dst_row = None
+    elif fused_ep_scatter:
         # `Y` and its strides now name the staging window; the kernel indexes it
         # by dst_row instead of by sorted row, so no `start_m` bias applies.
         y_ptr = ep_scatter.out
@@ -554,6 +593,8 @@ def moe_gemm_a4w4(
             DstRow=dst_row,
             EP_SCATTER=fused_ep_scatter,
             Y_ROWS=(ep_scatter.out.shape[0] if fused_ep_scatter else 0),
+            TopkTok=topk_tok_arg,
+            ATOMIC_COMBINE=atomic_combine,
             num_warps=config["num_warps"],
             waves_per_eu=config["waves_per_eu"],
         )
@@ -670,6 +711,8 @@ def moe_gemm_a4w4(
             DstRow=dst_row,
             EP_SCATTER=fused_ep_scatter,
             Y_ROWS=(ep_scatter.out.shape[0] if fused_ep_scatter else 0),
+            TopkTok=topk_tok_arg,
+            ATOMIC_COMBINE=atomic_combine,
             num_ctas=config["num_ctas"],
             num_warps=config["num_warps"],
             waves_per_eu=config["waves_per_eu"],
@@ -748,6 +791,8 @@ def moe_gemm_a4w4(
     # MXFP4 emit path: scatter_indx is None and split_k == 1, so we bypass
     # reduce_grouped and return (packed e2m1, e8m0 scales) directly -- the same
     # pair, in the same layout, that `mxfp4_quant` returns.
+    if atomic_combine:
+        return y_final
     if out_mx_quant:
         return y.squeeze(0), y_scale
     if ep_scatter is not None:
