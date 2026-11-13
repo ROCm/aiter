@@ -226,9 +226,9 @@ def get_kernel_config_gluon(m, n, k, routing_data):
         "block_n": block_n,
         "block_k": block_k,
         "num_warps": num_warps,
-        "xcd_swizzle": num_xcds,
+        "xcd_swizzle": cfg.get("xcd_swizzle", num_xcds),
         "num_buffers": num_buffers,
-        "waves_per_eu": 0,
+        "waves_per_eu": cfg.get("waves_per_eu", 0),
         "num_ctas": 1,
     }
     return ret
