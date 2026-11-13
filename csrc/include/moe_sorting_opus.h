@@ -772,6 +772,7 @@ struct MoeSortingKernel
                                                opus::index_t* p_reverse_sorted,
                                                const opus::index_t num_experts,
                                                const opus::index_t tokens,
+                                               const opus::index_t pad_tokens,
                                                const opus::mdiv unit_size_mdiv,
                                                const opus::mdiv topk_mdiv,
                                                const opus::mdiv expert_mdiv,
@@ -1116,14 +1117,17 @@ struct MoeSortingKernel
             }
             while(e_start < e_end)
             {
+                // The pad id is the token capacity (rows of topk_ids), not the local
+                // token count: every consumer rejects an id >= its row count, and a
+                // local count below the capacity would turn pad entries into rows.
 #if OPUS_MOE_SORTING_MOCK_ID
-                p_sorted_token_ids[e_start] = MOE_SORTING_MOCK_ID(tokens, topk);
+                p_sorted_token_ids[e_start] = MOE_SORTING_MOCK_ID(pad_tokens, topk);
 #else
-                p_sorted_token_ids[e_start] = tokens;
+                p_sorted_token_ids[e_start] = pad_tokens;
 #endif
                 p_sorted_weights[e_start] = static_cast<WeightType>(0.0);
                 if(p_m_indices)
-                    p_m_indices[e_start] = tokens; // pad = tokens -> OOB row for gemm1
+                    p_m_indices[e_start] = pad_tokens; // pad = capacity -> OOB row for gemm1
                 e_start++;
             }
         }
@@ -1175,6 +1179,7 @@ struct MoeSortingKernel
             static_cast<opus::index_t*>(kargs.p_reverse_sorted),
             kargs.num_experts,
             tokens_,
+            kargs.tokens,
             kargs.unit_size_mdiv,
             kargs.topk_mdiv,
             kargs.expert_mdiv,
@@ -2772,13 +2777,13 @@ struct MoeSortingMultiPhaseKernel_P3
         for(opus::index_t i = e_start + prev_cumsum + threadIdx.x; i < e_end; i += kBlockSize)
         {
 #if OPUS_MOE_SORTING_MOCK_ID
-            p_sorted_token_ids[i] = MOE_SORTING_MOCK_ID(tokens, kargs.topk_mdiv.divisor);
+            p_sorted_token_ids[i] = MOE_SORTING_MOCK_ID(kargs.tokens, kargs.topk_mdiv.divisor);
 #else
-            p_sorted_token_ids[i] = tokens;
+            p_sorted_token_ids[i] = kargs.tokens;
 #endif
             p_sorted_weights[i] = static_cast<WeightType>(0.0);
             if(p_m_indices)
-                p_m_indices[i] = tokens; // pad = tokens -> OOB row for gemm1
+                p_m_indices[i] = kargs.tokens; // pad = capacity -> OOB row for gemm1
         }
     }
 };
@@ -3373,13 +3378,13 @@ struct MoeSortingMultiPhaseKernel_P23
             for(opus::index_t i = e_start + prev_cumsum + threadIdx.x; i < e_end; i += kBlockSize)
             {
 #if OPUS_MOE_SORTING_MOCK_ID
-                p_sorted_token_ids[i] = MOE_SORTING_MOCK_ID(tokens, kargs.topk_mdiv.divisor);
+                p_sorted_token_ids[i] = MOE_SORTING_MOCK_ID(kargs.tokens, kargs.topk_mdiv.divisor);
 #else
-                p_sorted_token_ids[i] = tokens;
+                p_sorted_token_ids[i] = kargs.tokens;
 #endif
                 p_sorted_weights[i] = static_cast<WeightType>(0.0);
                 if(p_m_indices)
-                    p_m_indices[i] = tokens; // pad = tokens -> OOB row for gemm1
+                    p_m_indices[i] = kargs.tokens; // pad = capacity -> OOB row for gemm1
             }
         }
     }

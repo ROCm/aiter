@@ -190,7 +190,8 @@ __device__ __forceinline__ void build_sorted_metadata(
     float* sorted_weights,
     int32_t* sorted_expert_ids,
     int32_t* num_valid_ids,
-    int tokens)
+    int tokens,
+    int capacity)
 {
     // Experts are scanned as complete hardware waves; a trailing partial wave
     // (E=385) is covered by the running prefix of the last full wave.
@@ -268,7 +269,9 @@ __device__ __forceinline__ void build_sorted_metadata(
     }
     __syncthreads();
 
-    const int sentinel = pack_token_topk_id(tokens, 0);
+    // Pad with the token capacity, not the local count: every consumer rejects
+    // an id >= its row count.
+    const int sentinel = pack_token_topk_id(capacity, 0);
     for(int expert = tid; expert < NumExperts; expert += kThreads)
     {
         const int count = expert_counts[expert];
@@ -384,6 +387,7 @@ __global__ void __launch_bounds__(kThreads) moe_sort_quant_kernel(
     // rather than what the buffer held; only the local rows are sorted and
     // quantized, as moe_sorting_opus_fwd sorts them.
     zero_moe_output<kSortQuantCtas>(moe_buf, tokens);
+    const int capacity = tokens;
     if(num_local_tokens != nullptr)
         tokens = min(tokens, *num_local_tokens);
     if(blockIdx.x == 0)
@@ -395,7 +399,8 @@ __global__ void __launch_bounds__(kThreads) moe_sort_quant_kernel(
             sorted_weights,
             sorted_expert_ids,
             num_valid_ids,
-            tokens);
+            tokens,
+            capacity);
     }
     else
     {
