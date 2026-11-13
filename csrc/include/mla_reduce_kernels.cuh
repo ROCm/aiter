@@ -1354,19 +1354,36 @@ __launch_bounds__(Traits::kNumThreads) __global__
 // each (tile, head) a 2-wave workgroup, stages the split map in LDS behind a
 // barrier and loads the splits one after another, so it waits on latency and
 // moves far less than the HBM bandwidth. Here one wave owns kHeadsPerWave
-// adjacent heads of one tile (their partial rows are adjacent in memory) and
-// every lane reads float4 number c * kWave + lane of each head's row, so each
-// load instruction covers 512 contiguous bytes. Lane i holds split i's slot and
-// LSE; the weights come from a wave max / sum, and the first split's rows are
-// requested before the weights are known. No LDS and no barrier: the waves of a
-// workgroup are independent.
-template <int32_t kSizeDV_, int32_t kNumHeadQ_>
+// adjacent heads of one row of a tile (their partial rows are adjacent in
+// memory) and every lane reads float4 number c * kWave + lane of each head's
+// row, so each load instruction covers 512 contiguous bytes. Lane i holds split
+// i's slot and LSE; the weights come from a wave max / sum. The rows of the
+// first kInFlight splits are requested before the weights are known, and split
+// i + kInFlight as soon as split i is accumulated. No LDS and no barrier: the
+// waves of a workgroup are independent.
+//
+// Tiles of several rows (a multi-token query of up to 64 heads, cut by the
+// decode planner) come few, with many splits each. They take more parallelism
+// and more loads in flight: grid.y spreads the rows over row parts, a wave owns
+// one head, and 4 splits are in flight (MlaReduceWaveHeadMultiRowTraits).
+template <int32_t kSizeDV_,
+          int32_t kNumHeadQ_,
+          int32_t kHeadsPerWave_,
+          int32_t kInFlight_,
+          int32_t kMaxGridTiles_ = 0>
 struct MlaReduceWaveHeadTraits
 {
+    // Most tiles launched along grid.x (0: one per table entry); more are walked
+    // by the same workgroups.
+    static constexpr int32_t kMaxGridTiles = kMaxGridTiles_;
     static constexpr int32_t kSizeDV        = kSizeDV_;
     static constexpr int32_t kNumHeadQ      = kNumHeadQ_;
+    // Splits whose rows are in flight at once per wave (a ring of buffers).
+    static constexpr int32_t kInFlight      = kInFlight_;
+    // Rows of a tile spread over this many parts of grid.y at most.
+    static constexpr int32_t kMaxRowParts   = 4;
     static constexpr int32_t kWaveSize      = 32; // launched on wave32 devices only
-    static constexpr int32_t kHeadsPerWave  = (kNumHeadQ % 2 == 0) ? 2 : 1;
+    static constexpr int32_t kHeadsPerWave  = kHeadsPerWave_;
     static constexpr int32_t kWavesPerBlock = 4;
     static constexpr int32_t kNumThreads    = kWaveSize * kWavesPerBlock;
     static constexpr int32_t kVec4PerHead   = kSizeDV / (4 * kWaveSize); // float4 per lane per head
@@ -1380,7 +1397,36 @@ struct MlaReduceWaveHeadTraits
     static constexpr int32_t kMinWavesPerCu = 6;
 
     static_assert(kSizeDV % (4 * kWaveSize) == 0);
+    static_assert(kNumHeadQ % kHeadsPerWave == 0);
 };
+
+// One-row tiles: 2 adjacent heads per wave, 2 splits in flight (4 beat 2 by up
+// to 1 us at batch 8-16 but lost as much at batch 32-64 of a 96-head decode).
+template <int32_t kSizeDV, int32_t kNumHeadQ>
+using MlaReduceWaveHeadSingleRowTraits =
+    MlaReduceWaveHeadTraits<kSizeDV, kNumHeadQ, (kNumHeadQ % 2 == 0) ? 2 : 1, 2>;
+// Multi-row tiles: rows over row parts, 1 head per wave, 4 splits in flight. At
+// most 256 tiles along grid.x: with 4x the waves per table entry of the one-row
+// instance, launching one per entry of an empty graph-batch-sized table cost
+// 7-10 us (64 heads x 4-token draft block, batch 128, no tile to reduce).
+template <int32_t kSizeDV, int32_t kNumHeadQ>
+using MlaReduceWaveHeadMultiRowTraits = MlaReduceWaveHeadTraits<kSizeDV, kNumHeadQ, 1, 4, 256>;
+
+// Row parts of a launch: the rows per tile the decode planner cuts a query of
+// max_seqlen_q into (mla_v12_num_qo_tiles: one above 64 heads, else
+// ceil(q / ceil(heads * q / 128))), capped at kMaxRowParts. A tile with more rows
+// is still covered: part p walks rows p, p + parts, ...
+template <typename Traits>
+int32_t mla_reduce_wave_head_row_parts(const MlaReduceKernelV1Params& params)
+{
+    if(Traits::kNumHeadQ * 2 > 128)
+    {
+        return 1;
+    }
+    const int32_t q     = max(params.max_seqlen_q, 1);
+    const int32_t tiles = (Traits::kNumHeadQ * q + 127) / 128;
+    return min((q + tiles - 1) / tiles, Traits::kMaxRowParts);
+}
 
 template <typename Traits, typename lse_t, typename out_t>
 __launch_bounds__(Traits::kNumThreads) __global__
@@ -1400,9 +1446,13 @@ __launch_bounds__(Traits::kNumThreads) __global__
         using f32x4_t           = opus::vector_t<float, 4>;
         using out4_t            = opus::vector_t<out_t, 4>;
 
-        const int32_t lane  = threadIdx.x % kWave;
-        const int32_t head0 = (blockIdx.y * Traits::kWavesPerBlock + threadIdx.x / kWave) * kHW;
-        const int32_t tile  = blockIdx.x;
+        const int32_t lane = threadIdx.x % kWave;
+        // grid.y = kBlocksPerTile x row parts: part p takes rows p, p + parts, ...
+        const int32_t row_part  = blockIdx.y / Traits::kBlocksPerTile;
+        const int32_t row_parts = gridDim.y / Traits::kBlocksPerTile;
+        const int32_t head0 =
+            ((blockIdx.y % Traits::kBlocksPerTile) * Traits::kWavesPerBlock + threadIdx.x / kWave) *
+            kHW;
         if(head0 >= kH)
         {
             return;
@@ -1412,13 +1462,33 @@ __launch_bounds__(Traits::kNumThreads) __global__
         const float* p_lse    = reinterpret_cast<const float*>(params.p_partial_lse);
         const float* p_po     = reinterpret_cast<const float*>(params.p_partial_output);
 
+        // grid.x can be smaller than the table (Traits::kMaxGridTiles): a workgroup
+        // walks tiles blockIdx.x, + gridDim.x, ... and stops at the first one that
+        // starts at the table's end. reduce_indptr does not decrease, so every later
+        // tile is empty too; a table sized for the graph batch costs no extra waves.
+        // With one workgroup per entry (kMaxGridTiles 0) the loop runs once and the
+        // end-of-table load is skipped: it would put a second round trip in front
+        // of every empty entry's exit.
+        int32_t last = 0;
+        if constexpr(Traits::kMaxGridTiles > 0)
+        {
+            last = __builtin_amdgcn_readfirstlane(params.p_reduce_indptr[params.num_reduce_tile]);
+        }
+        for(int32_t tile = blockIdx.x; tile < params.num_reduce_tile; tile += gridDim.x)
         {
             const int32_t start = __builtin_amdgcn_readfirstlane(params.p_reduce_indptr[tile]);
+            if constexpr(Traits::kMaxGridTiles > 0)
+            {
+                if(start == last)
+                {
+                    break;
+                }
+            }
             const int32_t n =
                 __builtin_amdgcn_readfirstlane(params.p_reduce_indptr[tile + 1]) - start;
             if(n <= 0)
             {
-                return;
+                continue;
             }
             // Lane i holds split i's partial row (the first kWave splits).
             const int32_t slot_l = (lane < n) ? p_pmap[start + lane] : 0;
@@ -1426,7 +1496,7 @@ __launch_bounds__(Traits::kNumThreads) __global__
             // -1 marks a v1_0 tile whose only split already wrote the final output.
             if(n == 1 && slot0 == -1)
             {
-                return;
+                continue;
             }
             int32_t q_start, num_rows;
             if(params.use_reduce_final_map)
@@ -1475,7 +1545,7 @@ __launch_bounds__(Traits::kNumThreads) __global__
                 }
             };
 
-            for(int32_t row = 0; row < num_rows; ++row)
+            for(int32_t row = row_part; row < num_rows; row += row_parts)
             {
                 f32x4_t acc[kHW][kC];
 #pragma unroll
@@ -1498,10 +1568,20 @@ __launch_bounds__(Traits::kNumThreads) __global__
                         lse[hh] =
                             (lane < n) ? p_lse[int64_t(slot_l + row) * kH + head0 + hh] : -INFINITY;
                     }
-                    // The first split's rows need only its slot: in flight while the
-                    // weights are reduced.
-                    f32x4_t v[kHW][kC];
-                    load_rows(slot0, row, v);
+                    // A ring of kInFlight buffers: the first kInFlight splits' rows
+                    // need only their slots, so they are in flight while the weights
+                    // are reduced; after split i is accumulated its buffer takes split
+                    // i + kInFlight.
+                    constexpr int32_t kB = Traits::kInFlight;
+                    f32x4_t vb[kB][kHW][kC];
+#pragma unroll
+                    for(int32_t j = 0; j < kB; ++j)
+                    {
+                        if(j < n)
+                        {
+                            load_rows(__builtin_amdgcn_readlane(slot_l, j), row, vb[j]);
+                        }
+                    }
 #pragma unroll
                     for(int32_t hh = 0; hh < kHW; ++hh)
                     {
@@ -1510,11 +1590,21 @@ __launch_bounds__(Traits::kNumThreads) __global__
                         w[hh]         = (lane < n) ? __expf(lse[hh] - max_lse[hh]) : 0.f;
                         sum_w[hh]     = aiter::warpReduce<aiter::AddFunctor, float, kWave>(w[hh]);
                     }
-                    accumulate(v, w, 0, acc);
-                    for(int32_t i = 1; i < n; ++i)
+                    for(int32_t i0 = 0; i0 < n; i0 += kB)
                     {
-                        load_rows(__builtin_amdgcn_readlane(slot_l, i), row, v);
-                        accumulate(v, w, i, acc);
+#pragma unroll
+                        for(int32_t j = 0; j < kB; ++j)
+                        {
+                            const int32_t i = i0 + j;
+                            if(i < n)
+                            {
+                                accumulate(vb[j], w, i, acc);
+                                if(i + kB < n)
+                                {
+                                    load_rows(__builtin_amdgcn_readlane(slot_l, i + kB), row, vb[j]);
+                                }
+                            }
+                        }
                     }
                 }
                 else
@@ -1595,11 +1685,12 @@ __launch_bounds__(Traits::kNumThreads) __global__
 
 // Whether a launch takes kn_mla_reduce_v1_wave_head: wave32, 512-wide heads,
 // decode / verify tile shapes. AITER_MLA_REDUCE_WAVE_HEAD=0 keeps
-// kn_mla_reduce_v1, =1 drops the parallelism and tile-shape heuristics; read once.
+// kn_mla_reduce_v1, =1 drops the parallelism heuristic; read once.
 template <typename Traits>
 bool mla_reduce_use_wave_head(const MlaReduceKernelV1Params& params,
                               const hipDeviceProp_t& dev_prop,
-                              const int32_t num_cu)
+                              const int32_t num_cu,
+                              const int32_t row_parts)
 {
     static const int env = []() {
         const char* v = std::getenv("AITER_MLA_REDUCE_WAVE_HEAD");
@@ -1616,14 +1707,9 @@ bool mla_reduce_use_wave_head(const MlaReduceKernelV1Params& params,
                          (params.num_kv_splits <= Traits::kMaxSplits);
     // num_reduce_tile is the planner's (graph-batch) table size, an upper bound
     // on the live tiles.
-    const bool enough_waves = int64_t(params.num_reduce_tile) * Traits::kNumWaves >=
+    const bool enough_waves = int64_t(params.num_reduce_tile) * Traits::kNumWaves * row_parts >=
                               int64_t(num_cu) * Traits::kMinWavesPerCu;
-    // Tiles of several rows (the decode planner cuts a multi-token query of
-    // up to 64 heads that way) keep kn_mla_reduce_v1: in decode they come
-    // few, with many splits each, which the table size above does not show,
-    // and one wave walking rows and splits back to back is slower there.
-    const bool single_row_tiles = (Traits::kNumHeadQ * 2 > 128) || (params.max_seqlen_q == 1);
-    return can_run && ((env == 1) || (enough_waves && single_row_tiles));
+    return can_run && ((env == 1) || enough_waves);
 }
 
 // Whether a launch takes kn_mla_reduce_v1_wide. AITER_MLA_REDUCE_WIDE=0 keeps
@@ -1703,12 +1789,28 @@ void dispatch_mla_reduce_v1(const MlaReduceKernelV1Params& params,
 
         if constexpr(Traits::kSizeDV == 512)
         {
-            using WaveHeadTraits = MlaReduceWaveHeadTraits<Traits::kSizeDV, Traits::kNumHeadQ>;
-            if(mla_reduce_use_wave_head<WaveHeadTraits>(params, dev_prop, num_cu))
+            // Multi-row tiles take the multi-row instance (rows over row parts, one
+            // head per wave, 4 splits in flight), one-row tiles the single-row one.
+            auto try_wave_head = [&](auto wh_traits) {
+                using WT                = decltype(wh_traits);
+                const int32_t row_parts = mla_reduce_wave_head_row_parts<WT>(params);
+                if(!mla_reduce_use_wave_head<WT>(params, dev_prop, num_cu, row_parts))
+                {
+                    return false;
+                }
+                const int32_t tiles = (WT::kMaxGridTiles > 0)
+                                          ? min(params.num_reduce_tile, WT::kMaxGridTiles)
+                                          : params.num_reduce_tile;
+                const dim3 grid     = dim3(tiles, WT::kBlocksPerTile * row_parts);
+                kn_mla_reduce_v1_wave_head<WT, lse_t, out_t>
+                    <<<grid, WT::kNumThreads, 0, stream>>>(params);
+                return true;
+            };
+            using SingleRow = MlaReduceWaveHeadSingleRowTraits<Traits::kSizeDV, Traits::kNumHeadQ>;
+            using MultiRow  = MlaReduceWaveHeadMultiRowTraits<Traits::kSizeDV, Traits::kNumHeadQ>;
+            if((mla_reduce_wave_head_row_parts<SingleRow>(params) > 1) ? try_wave_head(MultiRow{})
+                                                                       : try_wave_head(SingleRow{}))
             {
-                const dim3 grid = dim3(params.num_reduce_tile, WaveHeadTraits::kBlocksPerTile);
-                kn_mla_reduce_v1_wave_head<WaveHeadTraits, lse_t, out_t>
-                    <<<grid, WaveHeadTraits::kNumThreads, 0, stream>>>(params);
                 return;
             }
         }
