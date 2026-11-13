@@ -50,7 +50,9 @@ _COMPUTE_PROFILES = (
     (128, 256, 128, 2, 2, 4),
     (128, 256, 128, 2, 2, 3),
 )
-_COMPUTE_CLUSTERS = ((2, 2), (4, 2), (2, 4), (4, 4), (1, 4))
+# (4,1)/(2,1): let 256x256 serve N that are multiples of 256 but not of
+# 512/1024 (e.g. gemm-request N=1792), instead of falling back to 128x128.
+_COMPUTE_CLUSTERS = ((2, 2), (4, 2), (2, 4), (4, 4), (1, 4), (4, 1), (2, 1))
 _COMPUTE_MIN_K_PER_SPLIT = 512
 _PERSISTENT_N_TILES = (2, 4, 8)
 

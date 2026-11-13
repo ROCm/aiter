@@ -24,6 +24,13 @@ from .gemm_common_gfx1250 import (
 )
 from .gfx1250_cluster import compute_mcast_masks
 from .kernels_common import format_kernel_name
+from .mxfp8_sched_hints_gfx1250 import (
+    ENABLE_ASM_PIPE,
+    ENABLE_SCHED_VGPR,
+    pin_a_frag,
+    pin_acc_vec,
+    pin_b_frag,
+)
 from .splitk_fused_epilogue_gfx1250 import emit_fused_splitk_epilogue
 from .tensor_shim import (
     AITER_FLYDSL_KERNARG_PRELOAD,
@@ -613,16 +620,28 @@ def launch_gemm_a8w8_256x256(
                         c_frags[(qm * half_m + im) * wmma_n_rep + qn * half_n + jn] = (
                             fx.make_rmem_tensor(8, fx.Float32)
                         )
-        for cf in c_frags:
-            cf.store(fx.constant_vector(0.0, T.vec(8, T.f32)))
+        # Pin accumulators into VGPR[512..) so A/B ping-pong owns the low half
+        # (ASM / MXFP4-style partition). Gated by AITER_FLYDSL_MXFP8_SCHED_VGPR.
+        for cf_i, cf in enumerate(c_frags):
+            z = fx.constant_vector(0.0, T.vec(8, T.f32))
+            if const_expr(ENABLE_SCHED_VGPR):
+                z = pin_acc_vec(z, cf_i)
+            cf.store(z)
 
-        def _rmem(n, v):
+        def _rmem(n, v, *, kind=None, slot=0, phase=0):
+            if const_expr(ENABLE_SCHED_VGPR and kind == "a"):
+                v = pin_a_frag(v, slot, phase)
+            elif const_expr(ENABLE_SCHED_VGPR and kind == "b"):
+                v = pin_b_frag(v, slot, phase)
             t = fx.make_rmem_tensor(n, fx.Int32)
             t.store(v)
             return t
 
         def _mma_one(wm, wn, act, wt, sa_k, sb_k):
             idx = wm * wmma_n_rep + wn
+            # Acc window is pinned once at zero-init; avoid per-MMA load/store
+            # re-pins (they break the soft-pipeline). Tighten later via
+            # tied-srcC pin if RA drifts.
             fx.gemm(
                 wmma_atoms[wn % 2 if mx32 else 0][wm % 2],
                 c_frags[idx],
@@ -748,15 +767,33 @@ def launch_gemm_a8w8_256x256(
         lds_load_b128, _ = make_lds_copy_ops(128)
 
         DS_PER_FRAG = 4  # ds_load_b128 per 16-dword fragment
+        # Soft-pipe WAR: 256 / half=4 / short-K (class 0) only. Mid/long K
+        # stay on `_quad` with a4w4 hints + spaced producers (class-1 WAR and
+        # per-burst beats on the WAR path both regressed).
         WAR_SCHED = const_expr(
-            k_tiles_class == 0
-            and tile_m == 256
+            tile_m == 256
             and half_m == 4
             and half_n == 4
-            and not mx32
+            and k_tiles_class == 0
+            and (not mx32 or ENABLE_ASM_PIPE)
         )
-        # Load windows (first, last WMMA position a load may follow) per quadrant.
-        WAR_Q0, WAR_Q1, WAR_Q2, WAR_Q3 = (4, 15), (0, 11), (4, 11), (3, 10)
+
+        def _asm_sched_hint(n_ds_bursts):
+            rocdl.sched_mfma(1)
+            rocdl.sched_dsrd(2)
+            for _ in range_constexpr(n_ds_bursts):
+                rocdl.sched_mfma(1)
+                rocdl.sched_dsrd(DS_PER_FRAG)
+            rocdl.sched_barrier(0)
+
+        def _asm_beat():
+            rocdl.sched_mfma(1)
+            rocdl.sched_dsrd(DS_PER_FRAG)
+
+        if const_expr(ENABLE_ASM_PIPE):
+            WAR_Q0, WAR_Q1, WAR_Q2, WAR_Q3 = (4, 15), (0, 15), (4, 15), (3, 15)
+        else:
+            WAR_Q0, WAR_Q1, WAR_Q2, WAR_Q3 = (4, 15), (0, 11), (4, 11), (3, 10)
         WAR_WAIT_AT = 3
         WAR_PERM_AT = 11
 
@@ -953,7 +990,12 @@ def launch_gemm_a8w8_256x256(
             ):
                 if const_expr(pre is not None):
                     pre()
-                last = const_expr(max(produce) if produce else -1)
+                # a4w4: delimit the quadrant as one sched region.
+                if const_expr(ENABLE_ASM_PIPE):
+                    rocdl.sched_barrier(0)
+                lead_positions = sorted(produce)
+                n_lead = len(lead_positions)
+                last = const_expr(lead_positions[-1] if n_lead else -1)
                 for pos in range_constexpr(half_m * half_n):
                     _mma_block_range(
                         wm0,
@@ -968,11 +1010,18 @@ def launch_gemm_a8w8_256x256(
                     )
                     if const_expr(pos in produce):
                         produce[pos]()
-                    if const_expr(pos == last):
-                        for _ in range_constexpr(2 * len(produce)):
-                            rocdl.sched_mfma(1)
-                            rocdl.sched_dsrd(DS_PER_FRAG // 2)
-                        rocdl.sched_barrier(0)
+                        # Per-producer ASM beat so RA sees 1 WMMA : 4 ds_load
+                        # locally, not only at the closing hint.
+                        if const_expr(ENABLE_ASM_PIPE):
+                            _asm_beat()
+                    if const_expr(pos == last and n_lead):
+                        if const_expr(ENABLE_ASM_PIPE):
+                            _asm_sched_hint(max(0, n_lead - 1))
+                        else:
+                            for _ in range_constexpr(2 * n_lead):
+                                rocdl.sched_mfma(1)
+                                rocdl.sched_dsrd(DS_PER_FRAG // 2)
+                            rocdl.sched_barrier(0)
                 if const_expr(post is not None):
                     post()
 
@@ -996,7 +1045,9 @@ def launch_gemm_a8w8_256x256(
                         )
                     )
                     if const_expr(j == DS_PER_FRAG - 1):
-                        nxt[key][i] = _rmem(16, _join(parts[i]))
+                        nxt[key][i] = _rmem(
+                            16, _join(parts[i]), kind=kind, slot=i
+                        )
 
                 per = const_expr(DS_PER_FRAG if mx32 or tile_m != 256 else 1)
                 return [
@@ -1057,8 +1108,14 @@ def launch_gemm_a8w8_256x256(
                 # Every fragment dies only in the last four WMMAs of a quadrant and
                 # every load issues at least four WMMAs after the latest death, so
                 # no ds_load overwrites VGPRs that an in-flight WMMA still reads.
-                a0 = [_rmem(16, t.load()) for t in seed_a]
-                b0 = [_rmem(16, t.load()) for t in seed_b]
+                a0 = [
+                    _rmem(16, t.load(), kind="a", slot=i)
+                    for i, t in enumerate(seed_a)
+                ]
+                b0 = [
+                    _rmem(16, t.load(), kind="b", slot=i)
+                    for i, t in enumerate(seed_b)
+                ]
                 frags = {}
 
                 def _frag_thunks(kind, stg, idx, dest):
@@ -1078,8 +1135,8 @@ def launch_gemm_a8w8_256x256(
                     out = []
                     for i in range_constexpr(n):
 
-                        def _set(v, i=i):
-                            frags[key][i] = _rmem(16, v)
+                        def _set(v, i=i, kind=kind):
+                            frags[key][i] = _rmem(16, v, kind=kind, slot=i)
 
                         out += _frag_thunks(kind, stage, n + i, _set)
                     return out
@@ -1117,6 +1174,19 @@ def launch_gemm_a8w8_256x256(
                     out = {}
                     if const_expr(len(thunks) == 0):
                         return out
+                    # ASM: ~4× ds_load_b128 per WMMA as one burst. Park bursts
+                    # on spaced MMA slots in [lo, hi]; closing hint asks RA for
+                    # 1 WMMA : 4 ds_load interleave.
+                    if const_expr(ENABLE_ASM_PIPE):
+                        n = len(thunks)
+                        n_bursts = (n + DS_PER_FRAG - 1) // DS_PER_FRAG
+                        span = hi - lo + 1
+                        for b in range_constexpr(n_bursts):
+                            slot = lo + (b * span) // n_bursts
+                            beg = b * DS_PER_FRAG
+                            end = min(beg + DS_PER_FRAG, n)
+                            out.setdefault(slot, []).extend(thunks[beg:end])
+                        return out
                     pos = list(range(lo, hi + 1))
                     for t_i, t in enumerate(thunks):
                         out.setdefault(pos[t_i * len(pos) // len(thunks)], []).append(t)
@@ -1145,6 +1215,14 @@ def launch_gemm_a8w8_256x256(
                         pre()
                     if const_expr(head is not None):
                         head()
+                    # Producer slots that issue ≥1 ds thunk (a4w4-style n_lead).
+                    lead_positions = sorted(p for p, ts in loads.items() if ts)
+                    n_lead = len(lead_positions)
+                    last_lead = lead_positions[-1] if n_lead else -1
+                    # Delimit a sched region so `_asm_sched_hint` can partition
+                    # WMMA vs ds_load inside this quadrant (a4w4 pattern).
+                    if const_expr(ENABLE_ASM_PIPE):
+                        rocdl.sched_barrier(0)
                     for pos in range_constexpr(len(order)):
                         i, j = order[pos]
                         _mma_one(wm0 + i, wn0 + j, act[i], wt[j], sa_k, sb_k)
@@ -1152,7 +1230,12 @@ def launch_gemm_a8w8_256x256(
                             at[pos]()
                         for t in loads.get(pos, []):
                             t()
-                        if const_expr(pos >= free - 1):
+                        # Closing a4w4-style region hint after the last producer.
+                        if const_expr(ENABLE_ASM_PIPE and pos == last_lead and n_lead):
+                            _asm_sched_hint(max(0, n_lead - 1))
+                        elif const_expr(
+                            (not ENABLE_ASM_PIPE) and pos >= free - 1
+                        ):
                             rocdl.sched_barrier(0)
 
                 def _perm_seeds():
@@ -1272,20 +1355,26 @@ def launch_gemm_a8w8_256x256(
             ), "tail seeds collide with the Q3 early seeds"
             q3.update(dict(zip(tail_at, tail)))
 
-            def _seq(thunks, extra=()):
-                out = {i: t for i, t in enumerate(thunks)}
+            def _seq(thunks, extra=(), start=0):
+                # ASM_PIPE Q0 uses start=4 (WAR gap). Per-producer `_asm_beat`
+                # (not stride spacing) won the long-K A/B.
+                n_slots = half_m * half_n
                 assert (
-                    len(thunks) <= half_m * half_n
+                    start + len(thunks) <= n_slots
                 ), "producer thunks overflow the quadrant"
+                out = {start + i: t for i, t in enumerate(thunks)}
                 for k in range_constexpr(len(extra)):
                     at = min(
-                        len(thunks) - 1,
-                        (len(thunks) // len(extra)) * (k + 1) - 1,
+                        start + len(thunks) - 1,
+                        start + (len(thunks) // len(extra)) * (k + 1) - 1,
                     )
                     out[at] = lambda p=out[at], q=extra[k]: (p(), q())
                 return out
 
             sched_fence = lambda: rocdl.sched_barrier(0)
+            # WAR gap before producing the next half (256 / half=4 only;
+            # half=2 start=2 regressed N=1792).
+            q0_start = 4 if const_expr(ENABLE_ASM_PIPE and half_m == 4) else 0
             q1_fast = const_expr(parity == 0 if mx32 else parity == 1)
             if const_expr(parity == 0):
                 # (A0,B0) -> (A0,B1) -> (A1,B1) -> (A1,B0); produce b1 then a1.
@@ -1294,7 +1383,7 @@ def launch_gemm_a8w8_256x256(
                     0,
                     a0,
                     b0,
-                    _seq(_mk("b", 1, "b1")),
+                    _seq(_mk("b", 1, "b1"), start=q0_start),
                     False,
                 )
                 _quad(
@@ -1331,7 +1420,7 @@ def launch_gemm_a8w8_256x256(
                     0,
                     a0,
                     b0,
-                    _seq(_mk("a", 1, "a1")),
+                    _seq(_mk("a", 1, "a1"), start=q0_start),
                     True,
                 )
                 _quad(
