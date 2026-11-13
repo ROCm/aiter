@@ -2403,6 +2403,8 @@ def score_flydsl_fp4(
     max_block,
     out=None,
     work_map=None,
+    cp_world: int = 1,
+    cp_rank: int = 0,
 ):
     """`score_flydsl` for an MXFP4 index cache.
 
@@ -2410,7 +2412,8 @@ def score_flydsl_fp4(
     their own page strides (two tensors, or two views of one `[128 x 64 B
     data][128 x 4 B scale]` page); the work map and the score layout are as in
     `score_flydsl`. `idx_q` is bf16 or e4m3 (`dtypes.fp8`), dispatched on its
-    dtype; an e4m3 Q is scored as stored.
+    dtype; an e4m3 Q is scored as stored. `cp_world` / `cp_rank` shard the blocks as
+    in `score_flydsl`.
     """
     return score_flydsl(
         idx_q,
@@ -2423,6 +2426,8 @@ def score_flydsl_fp4(
         max_block,
         out=out,
         work_map=work_map,
+        cp_world=cp_world,
+        cp_rank=cp_rank,
         k_scale=k_scale,
     )
 
@@ -2440,6 +2445,8 @@ def score_flydsl_nvfp4(
     out=None,
     work_map=None,
     k_round="e4m3",
+    cp_world: int = 1,
+    cp_rank: int = 0,
 ):
     """`score_flydsl` for an NVFP4 index cache (decode).
 
@@ -2450,7 +2457,9 @@ def score_flydsl_nvfp4(
     scale), as the vLLM nvfp4 indexer reads it, bit-identical to it; the fp8 MFMA with an
     e4m3 Q) or "exact" (K = e2m1 * scale, no rounding, on the bf16 MFMA, or on the f16
     MFMA with an e4m3 Q). Scale bytes must be positive e4m3 (sign bit unread) and not
-    0x7F. Work map and score layout as in `score_flydsl`.
+    0x7F. Work map and score layout as in `score_flydsl`, and so is the context-parallel
+    shard (`cp_world` / `cp_rank`): this rank scores the blocks `b % cp_world == cp_rank`
+    into the compacted `[H, tokens, ceil(blocks / cp_world)]` layout.
     """
     if k_round not in NVFP4_ROUNDINGS:
         raise ValueError(f"k_round must be one of {NVFP4_ROUNDINGS}, got {k_round!r}")
@@ -2465,6 +2474,8 @@ def score_flydsl_nvfp4(
         max_block,
         out=out,
         work_map=work_map,
+        cp_world=cp_world,
+        cp_rank=cp_rank,
         k_scale=k_scale,
         nvfp4=k_round,
     )
