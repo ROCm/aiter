@@ -1161,7 +1161,7 @@ def launch_gemm_a8w8(
                 rocdl.sched_barrier(0)
 
             # All num_buffers stages are in flight; tile 0 lands first.
-            tdm_ops.tensor_wait(num_buffers - 1)
+            rocdl.s_wait_tensorcnt(num_buffers - 1)
             workgroup_barrier(use_cluster=False)
             buf0 = _stage_bases(0)
             if const_expr(early):
