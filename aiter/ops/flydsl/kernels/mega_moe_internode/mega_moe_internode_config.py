@@ -7,7 +7,10 @@ shapes use built-in rules; both stages reject a row whose split path does
 not match the shape. There are no per-field environment overrides.
 
 The key follows the MegaMoE TP table naming: ``gfx, cu_num, model_dim,
-inter_dim, experts, topk, tokens``. ``tokens`` is the per-rank input capacity,
+inter_dim, experts, topk, tokens, quant, world_size, gpus_per_node``. Legacy rows
+without ``quant`` use A4W4; without topology columns they use EP16 on two
+eight-GPU nodes. A8W4 never selects an A4W4 row.
+``tokens`` is the per-rank input capacity,
 not tokens*topk. ``experts`` is the routed-expert count per EP rank. Internal
 lookup functions still accept GEMM rows as ``token`` and divide by topk.
 
@@ -30,14 +33,15 @@ Stage2 parameters:
 * ``gemm2_bm``: M tile. 0 selects the path-dependent default: 64 for xGMI,
   128 for SDMA, or 32 when remote-first fusion/tile-group alignment prevents
   the larger tile. SDMA rows retain 0 so a missing SDMA queue can safely fall
-  back to the xGMI tile. An explicit tile above 32 must divide 32*tile_group.
+  back to the xGMI tile. An explicit tile above 32 may also be used without
+  the Stage1 local/remote split; it must divide 32*tile_group.
 * ``gemm2_bn``: GEMM2 N tile, 128 or 256.
 * ``gemm2_cu``: persistent grid; 0 uses the operator's worker_blocks.
 * ``return_chunk_tokens``: token granularity of rail chunks/readiness signals.
 * ``intra_comm``: xgmi or sdma; SDMA requires the fused remote-first split path.
 
 ``us`` is informational and never affects selection. Measured rows record
-A4W4 full-forward GPU event latency, including quantization and communication,
+full-forward GPU event latency for their quant, including quantization and communication,
 for EPLB: warmup 10, 40 samples per rank, mean of all 16 per-rank minima.
 No redundant configuration tag is stored: the parameter columns already
 describe the chosen configuration.
@@ -52,7 +56,14 @@ import threading
 
 logger = logging.getLogger(__name__)
 
-_KEY_FIELDS = ("gfx", "cu_num", "model_dim", "inter_dim", "experts", "topk", "tokens")
+_SHAPE_FIELDS = ("gfx", "cu_num", "model_dim", "inter_dim", "experts", "topk", "tokens")
+
+
+def _quant_key(quant: str, where: str) -> str:
+    quant = str(quant).strip().lower()
+    if quant not in ("a4w4", "a8w4"):
+        raise ValueError(f"{where}: quant must be a4w4 or a8w4 (got {quant!r})")
+    return quant
 
 
 class _TuneTable:
@@ -90,7 +101,7 @@ class _TuneTable:
             return table
         with open(path, newline="") as handle:
             reader = csv.DictReader(handle)
-            fields = _KEY_FIELDS + self.value_fields
+            fields = _SHAPE_FIELDS + self.value_fields
             missing = [f for f in fields if f not in (reader.fieldnames or ())]
             if missing:
                 raise ValueError(f"{path}: tune table is missing columns {missing}")
@@ -99,8 +110,18 @@ class _TuneTable:
                     continue
                 key = tuple(
                     raw["gfx"].strip() if f == "gfx" else int(raw[f])
-                    for f in _KEY_FIELDS
+                    for f in _SHAPE_FIELDS
+                ) + (
+                    _quant_key(
+                        (raw.get("quant") or "").strip() or "a4w4", f"{path}:{lineno}"
+                    ),
+                    int((raw.get("world_size") or "").strip() or 16),
+                    int((raw.get("gpus_per_node") or "").strip() or 8),
                 )
+                if key[-2] <= 0 or key[-1] <= 0 or key[-2] % key[-1]:
+                    raise ValueError(
+                        f"{path}:{lineno}: world_size must divide into equal GPU nodes"
+                    )
                 row = {f: int(raw[f]) for f in self.value_fields}
                 for f, default in self.optional_fields:
                     v = (raw.get(f) or "").strip()
@@ -110,8 +131,25 @@ class _TuneTable:
         return table
 
     def lookup(
-        self, *, gfx, cu_num, token, model_dim, inter_dim, expert, topk
+        self,
+        *,
+        gfx,
+        cu_num,
+        token,
+        model_dim,
+        inter_dim,
+        expert,
+        topk,
+        quant="a4w4",
+        world_size=16,
+        gpus_per_node=8,
     ) -> dict | None:
+        if (
+            int(world_size) <= 0
+            or int(gpus_per_node) <= 0
+            or int(world_size) % int(gpus_per_node)
+        ):
+            raise ValueError("tune lookup: world_size must divide into equal GPU nodes")
         key = (
             str(gfx),
             int(cu_num),
@@ -120,6 +158,9 @@ class _TuneTable:
             int(expert),
             int(topk),
             int(token) // int(topk),
+            _quant_key(quant, "tune lookup"),
+            int(world_size),
+            int(gpus_per_node),
         )
         path = self.path()
         with self._lock:
@@ -209,6 +250,9 @@ def select_stage1_tile(
     inter_dim: int,
     expert: int,
     topk: int,
+    quant: str = "a4w4",
+    world_size: int = 16,
+    gpus_per_node: int = 8,
     gfx: str | None = None,
     cu_num: int | None = None,
 ) -> dict:
@@ -240,6 +284,9 @@ def select_stage1_tile(
             inter_dim=inter_dim,
             expert=expert,
             topk=topk,
+            quant=quant,
+            world_size=world_size,
+            gpus_per_node=gpus_per_node,
         )
     except ValueError:
         # A malformed table is a configuration error, not a miss.
@@ -411,6 +458,9 @@ def lookup_tune(
     inter_dim: int,
     expert: int,
     topk: int,
+    quant: str = "a4w4",
+    world_size: int = 16,
+    gpus_per_node: int = 8,
 ) -> dict | None:
     """Return one paired configuration, or None when the shape/path has no row.
 
@@ -426,6 +476,9 @@ def lookup_tune(
         inter_dim=inter_dim,
         expert=expert,
         topk=topk,
+        quant=quant,
+        world_size=world_size,
+        gpus_per_node=gpus_per_node,
     )
     if row is not None and row["split_local"] != default_split_local(token, topk):
         return None
@@ -455,8 +508,9 @@ def select_gemm2_bm(
     """GEMM2 M tile and its source: table > rule (fused stage2: GEMM2_BM_SDMA
     or GEMM2_BM_XGMI by the intra-node path, while the tile group holds it) > 32.
 
-    Only the fused remote-first stage2 takes a tile above 32, and it must cover
-    whole 32-row tiles of one Stage1 tile group (``32*tile_group % bm == 0``).
+    The default larger tile is selected for fused remote-first stage2. An
+    explicit larger tile also works on the unsplit path when it covers whole
+    32-row tiles of one Stage1 tile group (``32*tile_group % bm == 0``).
     """
     bm = int((tuned or {}).get("gemm2_bm", 0))
     if not bm:
@@ -466,8 +520,6 @@ def select_gemm2_bm(
         return 32, "default"
     if bm == 32:
         return 32, "table"
-    if not fused:
-        return 32, "table (gemm2_bm needs the fused stage2; using 32)"
     if bm not in GEMM2_BMS or (32 * int(tile_group)) % bm:
         raise ValueError(
             f"gemm2_bm {bm} must be one of {GEMM2_BMS} and divide 32*tile_group "

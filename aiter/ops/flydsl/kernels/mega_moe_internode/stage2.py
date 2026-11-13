@@ -44,8 +44,14 @@ from ..mxfp4_gemm_common import _fabs_f32 as fabs_f32
 from ..mxfp4_gemm_common import global_typed_ptr, lds_typed_ptr, lds_vec_load
 from ..tensor_shim import _run_compiled, buf_copy_load, buf_copy_store, ptr_buf_tensor
 from . import communication as comm
+from .buffer_addressing import (
+    region_local_address,
+    region_local_dev_comm,
+    region_lsa_address,
+    region_window_address,
+)
+from .communication import RailGda
 from .communication import ccqe_enabled as _rail_ccqe
-from .communication import rail as _rail
 from .gemm import gemm2_compute_v2, issue_a_load_lds_dt, kStages
 from .layout import MAX_FUSED_MODEL_DIM
 from .mega_moe_internode_config import GEMM2_BNS
@@ -299,7 +305,8 @@ def compile_mega_moe_stage2(*, model_dim: int, inter_dim: int, experts: int, top
     sdma_chunk_tiles: int = 32, sdma_send_rows: int = 0, sdma_frac_q64: int = 64,
     sdma_put_bytes: int = 4 << 20, sdma_arrival_woff: int = 0, sdma_arrival_plane: int = 0,
     sdma_max_chunks: int = 0, gemm2_bm: int = 32, sdma_ramp_chunks: int = 0, waves: int = 4,
-    sdma_remote_only: bool = False, token_ready: bool = False, a_dtype: str = "fp4"):
+    sdma_remote_only: bool = False, token_ready: bool = False, a_dtype: str = "fp4",
+    buffer_regions: tuple = (), group_sync_tail: int = 0):
 # fmt: on
     """Compile the persistent GEMM2 + node push kernel (stage2 kernel1).
 
@@ -332,6 +339,9 @@ def compile_mega_moe_stage2(*, model_dim: int, inter_dim: int, experts: int, top
     Stage1 already stores local expert ids.
     """
     epoch_planes = tuple(int(v) for v in epoch_planes)
+    region_indices = {(stage, name): index for stage, name, index in buffer_regions}
+    if buffer_regions and token_ready:
+        raise NotImplementedError("separated buffers do not support token-ready")
     if a_dtype not in ("fp4", "fp8"):
         raise ValueError("a_dtype must be fp4 or fp8")
     a_pack = 1 if a_dtype == "fp8" else 2
@@ -349,13 +359,14 @@ def compile_mega_moe_stage2(*, model_dim: int, inter_dim: int, experts: int, top
     # GEMM2 M tile: GBM = 32*GS rows = GS consecutive 32-row Stage1 tiles of one
     # tile group (same expert, physically adjacent A/A-scale).  Tickets, the
     # remote-first tables, a_tile_map, the SDMA plan and chunks stay in 32-row
-    # tiles; only the GEMM, its row metadata and the epilogue use GBM.
+    # tiles. Without remote-first, each ticket covers GBM rows. GEMM, row
+    # metadata and epilogue use GBM on both paths.
     GBM = int(gemm2_bm)
     GS = GBM // BM
     if GBM % BM or not 1 <= GS <= 4:
-        raise ValueError(f"gemm2_bm must be 32, 64, 96 or 128, got {GBM}")
-    if GS > 1 and (not (fused and remote_first) or int(tile_group) % GS):
-        raise ValueError(f"gemm2_bm {GBM} needs the fused remote-first kernel and GS | tile_group")
+        raise ValueError(f"gemm2_bm must be 32, 64 or 128, got {GBM}")
+    if GS > 1 and int(tile_group) % GS:
+        raise ValueError(f"gemm2_bm {GBM} needs GS | tile_group")
 
     def _gs(x):
         return x if GS == 1 else x * fx.Int32(GS)
@@ -400,6 +411,7 @@ def compile_mega_moe_stage2(*, model_dim: int, inter_dim: int, experts: int, top
         # A persistent static stride is badly imbalanced (K3 TPR 1024: +22%),
         # so the fused kernel always claims m-blocks.
         dynamic, xcd_group = True, 1
+    ticket_bm = BM if remote_first and dynamic else GBM
     if dynamic and resident_ctas <= 0:
         raise ValueError("dynamic_claim needs resident_ctas > 0")
     lds_claim_off = lds_peer_off + npes * 8  # two i32 slots, double-buffered
@@ -467,7 +479,8 @@ def compile_mega_moe_stage2(*, model_dim: int, inter_dim: int, experts: int, top
     # the plan as engine-side waits + puts, one doorbell per peer.
     SD_PUT_B = int(sdma_put_bytes)
     SD_AWOFF, SD_APLANE, SD_MAXCH = int(sdma_arrival_woff), int(sdma_arrival_plane), int(sdma_max_chunks)
-    SD_CDONE_B = (256 + 2 * max_tok * topk * 4 + 255) // 256 * 256
+    SD_NODES = int(npes) // int(gpus_per_node)
+    SD_CDONE_B = (256 + SD_NODES * max_tok * topk * 4 + 255) // 256 * 256
     if sdma:
         if SD_CT <= 0 or SD_ROWS <= 0:
             raise ValueError("sdma needs sdma_chunk_tiles > 0 and sdma_send_rows > 0")
@@ -571,6 +584,7 @@ def compile_mega_moe_stage2(*, model_dim: int, inter_dim: int, experts: int, top
         # Symbols cannot contain '-'; encode negative strides with an m prefix.
         + f"_ad{'m' if arrival_delta_step < 0 else ''}{abs(arrival_delta_step)}"
         + f"_atm{int(a_tile_map_plane)}"
+        + ("_c1" if buffer_regions else "")
 
     )
 
@@ -657,6 +671,14 @@ def compile_mega_moe_stage2(*, model_dim: int, inter_dim: int, experts: int, top
         a_map_buf = ptr_buf_tensor(arg_a_tile_map, fx.Int32)
         if const_expr(sdma):
             sd_tb_buf = ptr_buf_tensor(arg_sd_tb, fx.Int32)
+            sd_arrival_ptr = fx.Int64(arena_ptr) + fx.Int64(SD_AWOFF) + _par * fx.Int64(SD_APLANE)
+            sd_arrival_win = arena_win
+            sd_arrival_off = fx.Int64(SD_AWOFF) + _par * fx.Int64(SD_APLANE)
+            if const_expr(bool(buffer_regions)):
+                sd_arrival_ptr = region_local_address(
+                    arena_ptr, region_indices[2, "plane_slot_arrived"], _par)
+                sd_arrival_win, sd_arrival_off = region_window_address(
+                    arena_ptr, region_indices[2, "plane_slot_arrived"], _par)
 
         def _sdma_row_target(packed, ticket):
             # Lanes 0..BM-1 of wave 0, one row each: where this row goes.  Rows
@@ -758,6 +780,8 @@ def compile_mega_moe_stage2(*, model_dim: int, inter_dim: int, experts: int, top
 
         if const_expr(grp_sync is not None):
             gs_ready = arena_ptr + fx.Int64(grp_sync[0]) + _par * fx.Int64(grp_sync[1])
+            if const_expr(bool(buffer_regions)):
+                gs_ready = region_local_address(arena_ptr, region_indices[1, "h1_grp_sync"], _par) + fx.Int64(group_sync_tail)
             gs_gen = fx.Int32(i64_generation)
 
         def wait_group(a_row):
@@ -772,15 +796,17 @@ def compile_mega_moe_stage2(*, model_dim: int, inter_dim: int, experts: int, top
                 fx.barrier()
 
         def run_mapped_unit(unit_bx, m_block_idx):
-            m_row0 = m_block_idx * fx.Int32(BM)
-            a_row = a_map_buf[m_row0 // fx.Int32(32)] * fx.Int32(32) + m_row0 % fx.Int32(32)
+            m_row0 = m_block_idx * fx.Int32(GBM)
+            a_row = a_map_buf[m_row0 // fx.Int32(BM)] * fx.Int32(BM)
             wait_group(a_row)
             issue_all_a_loads(a_row)
             rocdl.sched_barrier(0)
             run_unit(unit_bx, m_block_idx, a_row)
 
         cumsum0 = global_typed_ptr(arg_cumsum, T.i32)[0]
-        total_m_blocks = (cumsum0 + fx.Int32(BM - 1)) // fx.Int32(BM)
+        # Remote-first maps tickets in 32-row Stage1 tiles. The plain path
+        # indexes contiguous GEMM2 units, each spanning GS Stage1 tiles.
+        total_m_blocks = (cumsum0 + fx.Int32(ticket_bm - 1)) // fx.Int32(ticket_bm)
 
         if const_expr(dynamic):
             claim_ptr = arg_arrival_count + fx.Int64(claim_word * 4)
@@ -813,8 +839,8 @@ def compile_mega_moe_stage2(*, model_dim: int, inter_dim: int, experts: int, top
                     nxt = fx.Int32(0)
                     if tx_i32 == fx.Int32(0):
                         nxt = fx.Int32(comm.atomic_add_agent(ticket_ptr, fx.Int32(1)))
-                    m_row0 = m_block * fx.Int32(BM)
-                    a_row = a_map_buf[m_row0 // fx.Int32(32)] * fx.Int32(32) + m_row0 % fx.Int32(32)
+                    m_row0 = m_block * fx.Int32(GBM)
+                    a_row = a_map_buf[m_row0 // fx.Int32(BM)] * fx.Int32(BM)
                     wait_group(a_row)
                     issue_all_a_loads(a_row)
                     if tx_i32 == fx.Int32(0):
@@ -949,11 +975,11 @@ def compile_mega_moe_stage2(*, model_dim: int, inter_dim: int, experts: int, top
 
                     def _sd_cdone_woff(c):
                         # Window offset of chunk c's counter (this parity).
-                        return (fx.Int64(SD_AWOFF + SD_CDONE_B) + _par * fx.Int64(SD_APLANE)
+                        return (sd_arrival_off + fx.Int64(SD_CDONE_B)
                                 + fx.Int64(c) * fx.Int64(SD_CDONE_STRIDE * 4))
 
                     def _sd_cdone(c):
-                        return fx.Int64(arena_ptr) + _sd_cdone_woff(c)
+                        return sd_arrival_ptr + fx.Int64(SD_CDONE_B) + fx.Int64(c) * fx.Int64(SD_CDONE_STRIDE * 4)
 
                     def _sd_nch():
                         return _sd_nrc() + _sd_geo(_sd_lloc())[3]
@@ -1134,7 +1160,9 @@ def compile_mega_moe_stage2(*, model_dim: int, inter_dim: int, experts: int, top
                         put the moment its chunks are counted."""
                         p = tx_i32
                         if (p < fx.Int32(gpus_per_node)) & (p != fx.Int32(i32_local_rank)):
-                            sd = cco.DevComm(dev_comm).sdma()
+                            sd = cco.DevComm(
+                                region_local_dev_comm(arena_ptr, len(buffer_regions))
+                                if buffer_regions else dev_comm).sdma()
                             nrc = _sd_nrc()
                             nch = _sd_nch()
                             seg = _sd_lds_i32(lds_splan_off, p)
@@ -1154,7 +1182,7 @@ def compile_mega_moe_stage2(*, model_dim: int, inter_dim: int, experts: int, top
                                 c_t0 = hb + _sd_chunk_start(ci, hl)
                                 c_t1 = hb + _sd_chunk_start(ci + fx.Int32(1), hl)
                                 need = (c_t1 - c_t0) * fx.Int32(num_n_blocks_c)
-                                sd.post_wait_mem(p, fx.Int32(0), arena_win, _sd_cdone_woff(c), need,
+                                sd.post_wait_mem(p, fx.Int32(0), sd_arrival_win, _sd_cdone_woff(c), need,
                                                  cmp=cco.SdmaCmp.GE, aggregate=True)
                                 hi = _min_rt(_sd_gtb(c_t1, p), cap)
                                 run = _sd_lds_i32(SP_GS, fx.Int32(SP_RUN) + p)
@@ -1522,7 +1550,7 @@ def compile_mega_moe_stage2(*, model_dim: int, inter_dim: int, experts: int, top
     return launch
 
 
-def peer_table_launcher(gpus_per_node: int, npes: int):
+def peer_table_launcher(gpus_per_node: int, npes: int, *, lsa_peer_base: int = 0):
     """One-off kernel filling ``arg_p2p``: each peer's plane_slot_inbox base.
 
     CCO's ``lsa_ptr`` is device-only (the host cannot see a peer's VA), so the
@@ -1533,15 +1561,18 @@ def peer_table_launcher(gpus_per_node: int, npes: int):
     """
     local_peers = int(gpus_per_node)
     total = int(npes)
+    peer_base = int(lsa_peer_base)
+    if peer_base < 0 or peer_base % local_peers:
+        raise ValueError("LSA peer base must align to a logical GPU node")
 
     @flyc.kernel(known_block_size=[64, 1, 1])
     def fill_peer_table(window: fx.Int64, table: fx.Int64, offset: fx.Int64):
         if fx.Int32(fx.thread_idx.x) == fx.Int32(0):
             for peer in range(local_peers):
-                address = fx.Int64(cco.Window(window).lsa_ptr(fx.Int32(peer), offset))
+                address = fx.Int64(cco.Window(window).lsa_ptr(fx.Int32(peer_base + peer), offset))
                 comm.store_i64_global_relaxed(
                     table + fx.Int64(peer * 8), address)
-            fallback = fx.Int64(cco.Window(window).lsa_ptr(fx.Int32(0), offset))
+            fallback = fx.Int64(cco.Window(window).lsa_ptr(fx.Int32(peer_base), offset))
             for peer in range(local_peers, total):
                 comm.store_i64_global_relaxed(
                     table + fx.Int64(peer * 8), fallback)
@@ -1584,14 +1615,24 @@ def run_mega_moe_stage2(arg_aq, arg_ascale, arg_bq, arg_bscale, arg_eids, arg_cu
 THREADS = 256
 
 
-# Scratch layout in i32 slots.
-SCRATCH_WQE_POSTED = 0          # [num_qp] Number of chunks with posted WQEs.
-SCRATCH_RAIL_REQ = 16           # [num_qp] i64: request rung in part 1 and reaped in part 2.
-SCRATCH_SDMA_EPOCH = 48         # SDMA stage2: forwards finished (signal running totals)
-SCRATCH_FINAL_DONE = 65         # Phase 3 completion count.
-SCRATCH_CHUNK_DONE = 256        # [2][max_chunks] Completion counts by (plane, chunk).
-SCRATCH_P3_DONE = 512           # [max_chunks] Phase 3 CTA completion counts per chunk.
-SCRATCH_WORDS = 1024            # Host scratch length, checked for overflow at compile time.
+def stage2_scratch_layout(source_nodes, max_tokens, chunk_tokens, num_qp=8):
+    """Allocate disjoint i32 scratch spans from topology and chunk geometry."""
+    nodes, tokens, chunk_size, qps = map(
+        int, (source_nodes, max_tokens, chunk_tokens, num_qp))
+    if nodes < 2 or min(tokens, chunk_size, qps) <= 0:
+        raise ValueError("Stage2 scratch needs at least two nodes and positive geometry")
+    chunks = _ceil_div(tokens, chunk_size)
+    peer_qps = (nodes - 1) * qps
+    # One WQE counter and one i64 RAIL request per (peer, QP), followed
+    # by independent scalar state. Requests must never alias SDMA's epoch.
+    req = _ceil_div(peer_qps, 16) * 16
+    sdma_epoch = req + 2 * peer_qps
+    final = sdma_epoch + 1
+    chunk = _ceil_div(final + 1, 64) * 64
+    p3 = chunk + nodes * chunks
+    return {"wqe": 0, "req": req, "sdma_epoch": sdma_epoch,
+            "final": final, "chunk": chunk, "p3": p3,
+            "words": _ceil_div(p3 + chunks, 64) * 64}
 
 
 def _ceil_div(a, b):
@@ -1725,6 +1766,7 @@ def compile_stage2_node_combine(
     max_tokens: int,
     topk: int,
     rank: int,
+    source_nodes: int = 2,
     gpus_per_node: int = 8,
     num_qp: int = 8,
     return_chunk_tokens: int = 16,
@@ -1748,6 +1790,15 @@ def compile_stage2_node_combine(
     token_ready: bool = False,
     rail_idx_off: int = 0,
     rail_idx_plane: int = 0,
+    buffer_regions: tuple = (),
+    gda_context_base: int = 0,
+    lsa_peer_base: int = 0,
+    gda_peer_stride: int = 1,
+    gda_peer_lane: int = 0,
+    gda_physical_width: int = 0,
+    recv_overflow_off: int = 0,
+    recv_overflow_plane: int = 0,
+    forward_status_off: int = 0,
 ):
     """Build kernel2 with a threads-wide CTA (512 for the fused 8-wave path).
 
@@ -1759,6 +1810,24 @@ def compile_stage2_node_combine(
     group_ready, consumed, arrival.
     """
     parity_planes = tuple(int(v) for v in parity_planes)
+    RECV_STATUS = bool(recv_overflow_off)
+    if RECV_STATUS and (not forward_status_off or not recv_overflow_plane):
+        raise ValueError("receive overflow status needs both status and parity offsets")
+    if RECV_STATUS and token_ready:
+        raise NotImplementedError("receive overflow propagation needs fixed-order return readiness")
+    _rail = RailGda(gda_context_base, peer_stride=gda_peer_stride, peer_lane=gda_peer_lane,
+                    rank=rank, physical_width=gda_physical_width)
+    lsa_peer_base = int(lsa_peer_base)
+    if lsa_peer_base < 0 or lsa_peer_base % int(gpus_per_node):
+        raise ValueError("LSA peer base must align to a logical GPU node")
+    region_indices = {(stage, name): index for stage, name, index in buffer_regions}
+    NODES = int(source_nodes)
+    if NODES < 2 or not 0 <= int(rank) < NODES * int(gpus_per_node):
+        raise ValueError("rank must belong to the Stage2 node topology")
+    if NODES != 2 and token_ready:
+        raise NotImplementedError("multi-node Stage2 uses fixed-order rail")
+    if buffer_regions and token_ready:
+        raise NotImplementedError("separated buffers do not support token-ready")
     if epoch_off <= 0 or len(parity_planes) != 8:
         raise ValueError("kernel2 needs the epoch_gate offset and eight parity_planes")
 
@@ -1829,7 +1898,7 @@ def compile_stage2_node_combine(
     INBOX_ROW_BYTES = (HIDDEN * 2)
     # Inbox bytes per plane; use separate descriptors when the two-plane inbox is >=2GiB.
     INBOX_PLANE_BYTES = MAX_TOKENS * TOPK * INBOX_ROW_BYTES
-    INBOX_PER_PLANE = 2 * INBOX_PLANE_BYTES >= 1 << 31
+    INBOX_PER_PLANE = NODES * INBOX_PLANE_BYTES >= 1 << 31
     if INBOX_PLANE_BYTES >= 1 << 31:
         raise ValueError("inbox plane exceeds the 32-bit buffer-resource range")
     ACC_ROW_BYTES = RECORD_BYTES
@@ -1854,15 +1923,18 @@ def compile_stage2_node_combine(
     HPARTS = CHUNKS_PER_WAVE
     # [plane][chunk] completion counts identify the last wave to post the rail PUT.
     MAX_CHUNKS = _ceil_div(MAX_TOKENS, CHUNK)
-    if (SCRATCH_CHUNK_DONE + 2 * MAX_CHUNKS > SCRATCH_P3_DONE
-            or SCRATCH_P3_DONE + MAX_CHUNKS > SCRATCH_WORDS):
-        raise ValueError(
-            f"scratch 不够:需要 {SCRATCH_CHUNK_DONE + 2 * MAX_CHUNKS} 个 i32")
+    scratch = stage2_scratch_layout(NODES, MAX_TOKENS, CHUNK, NUM_QP)
+    S_WQE, S_REQ, S_FINAL, S_CHUNK, S_P3 = (
+        scratch[k] for k in ("wqe", "req", "final", "chunk", "p3"))
+    S_SDMA_EPOCH = scratch["sdma_epoch"]
 
     node = int(rank) // int(gpus_per_node)
-    remote_node = 1 - node
+    REMOTE_NODES = tuple(n for n in range(NODES) if n != node)
+    remote_node = REMOTE_NODES[0]
     local_plane = node
     remote_plane = remote_node
+    RX_PEER_BYTES = int(rx_bytes) // (NODES - 1)
+    GROUP_PEER_BYTES = parity_planes[5] // (NODES - 1)
 
     kernel_name = (
         f"megamoe_k2_h{HIDDEN}_t{MAX_TOKENS}_k{TOPK}"
@@ -1872,8 +1944,16 @@ def compile_stage2_node_combine(
         + ("_qr8" if RAIL_FP8 else "")
         + f"_de{epoch_off}_" + "_".join(str(v) for v in parity_planes)
 
+        # Layout offsets are part of the compiled-handle cache identity.
+        + "_scratch" + "x".join(str(scratch[k]) for k in
+                                  ("req", "sdma_epoch", "final", "chunk", "p3"))
         + ("_sd" if sdma else "") + (f"_ru{RED_U}" if RED_U > 1 else "")
         + ("_trf" if token_ready and sdma else "_tr" if token_ready else "")
+        + ("_c1" if buffer_regions else "")
+        + (f"_vl{gda_peer_stride}l{gda_peer_lane}b{lsa_peer_base}" if gda_peer_stride != 1 else "")
+        + ("_recv_status_poster" if RECV_STATUS else "")
+        + (f"_ctx{gda_context_base}" if gda_context_base else "")
+        + (f"_n{NODES}_r{rank}" if NODES != 2 else "")
     )
     # Token-ready rail (fused remote-first only, see tr_layout): the remote
     # plane goes out in completion order, CHUNK tokens a batch, each batch
@@ -1894,7 +1974,7 @@ def compile_stage2_node_combine(
     SD_CTR_B, SD_INV_B = 128, 256
     SD_RB8 = HIDDEN + HIDDEN // 32  # FP8 row + E8M0 scales (see p2p_scatter_epilog)
     LOCAL_RANK = int(rank) % int(gpus_per_node)
-    if sdma and 256 + 2 * MAX_TOKENS * TOPK * 4 > 2 * MAX_TOKENS * TOPK * 8:
+    if sdma and 256 + NODES * MAX_TOKENS * TOPK * 4 > NODES * MAX_TOKENS * TOPK * 8:
         raise ValueError("inv does not fit the arrival region")
 
     # Device-function body (the fused stage2 kernel inlines it with a virtual
@@ -1919,10 +1999,13 @@ def compile_stage2_node_combine(
 
 
         # As in kernel1: relaxed load without buffer_inv; readfirstlane keeps the value in SGPRs.
+        epoch_ptr = arena_ptr + fx.Int64(epoch_off)
+        if const_expr(bool(buffer_regions)):
+            epoch_ptr = region_local_address(arena_ptr, region_indices[1, "epoch_gate"], fx.Int64(0))
         generation = fx.Int64(rocdl.readfirstlane(
             T.i64,
             fx.Int64(comm.load_i64_global_agent_relaxed(
-                arena_ptr + fx.Int64(epoch_off))).ir_value()))
+                epoch_ptr)).ir_value()))
         _par = generation & fx.Int64(1)
         _inbox_off = fx.Int64(inbox_off) + _par * fx.Int64(parity_planes[0])
         _slot_mask_off = fx.Int64(slot_mask_off) + _par * fx.Int64(parity_planes[1])
@@ -1940,6 +2023,21 @@ def compile_stage2_node_combine(
         ready_ptr = arena_ptr + _partial_ready_off
         arrival_ptr = arena_ptr + _arrival_off
         group_ready_ptr = arena_ptr + _group_ready_off
+        rx_win = accumulator_win = group_ready_win = consumed_win = arena_win
+        credit_ptr = arena_ptr + _consumed_off
+        if const_expr(bool(buffer_regions)):
+            inbox_ptr = region_local_address(arena_ptr, region_indices[2, "plane_slot_inbox"], _par)
+            accum_ptr = region_local_address(arena_ptr, region_indices[2, "node_accumulator"], _par)
+            rx_ptr = region_local_address(arena_ptr, region_indices[2, "remote_partial_rx"], _par)
+            mask_ptr = region_local_address(arena_ptr, region_indices[2, "node_dest_slot_mask"], _par)
+            ready_ptr = region_local_address(arena_ptr, region_indices[2, "node_partial_ready"], _par)
+            arrival_ptr = region_local_address(arena_ptr, region_indices[2, "plane_slot_arrived"], _par)
+            group_ready_ptr = region_local_address(arena_ptr, region_indices[2, "return_group_ready"], _par)
+            credit_ptr = region_local_address(arena_ptr, region_indices[2, "return_consumed"], _par)
+            rx_win, _rx_off = region_window_address(arena_ptr, region_indices[2, "remote_partial_rx"], _par)
+            accumulator_win, _accumulator_off = region_window_address(arena_ptr, region_indices[2, "node_accumulator"], _par)
+            group_ready_win, _group_ready_off = region_window_address(arena_ptr, region_indices[2, "return_group_ready"], _par)
+            consumed_win, _consumed_off = region_window_address(arena_ptr, region_indices[2, "return_consumed"], _par)
 
         # This rank's Stage1 writes node_dest_slot_mask with local buffer_store
         # (stage1.py:891/:1487). kernel2 follows on the same rank and stream, with no
@@ -1948,7 +2046,7 @@ def compile_stage2_node_combine(
         # while waiting, repeating a token up to 16 times, and once per reduction unit,
         # for nearly 100,000 uncacheable reads.
         mask_rsrc = buffer_ops.create_buffer_resource_from_addr(
-            mask_ptr, num_records_bytes=fx.Int32(2 * MAX_TOKENS * 4))
+            mask_ptr, num_records_bytes=fx.Int32(NODES * MAX_TOKENS * 4))
         if const_expr(not INBOX_PER_PLANE):
             inbox_rsrc = buffer_ops.create_buffer_resource_from_addr(
                 inbox_ptr, num_records_bytes=fx.Int32(inbox_bytes))
@@ -1963,7 +2061,7 @@ def compile_stage2_node_combine(
         if const_expr(sdma):
             inv_rsrc = buffer_ops.create_buffer_resource_from_addr(
                 arrival_ptr + fx.Int64(SD_INV_B),
-                num_records_bytes=fx.Int32(2 * MAX_TOKENS * TOPK * 4))
+                num_records_bytes=fx.Int32(NODES * MAX_TOKENS * TOPK * 4))
 
         @flyc.jit
         def _wait_ready_relaxed(addr, expected):
@@ -1976,12 +2074,40 @@ def compile_stage2_node_combine(
             word = fx.Int64(comm.load_i64_global_system_relaxed(addr))
             while word < expected:
                 word = fx.Int64(comm.load_i64_global_system_relaxed(addr))
+
+        @flyc.jit
+        def _node_recv_overflow():
+            # Stage1 reservations are final once all local GEMM2 arrival
+            # releases have been acquired. Only the rail poster waves and
+            # CTA0's final status writer need this immutable node-wide vote.
+            overflow = fx.Int32(0)
+            for _p in range_constexpr(int(gpus_per_node)):
+                if const_expr(bool(buffer_regions)):
+                    overflow_ptr = region_lsa_address(
+                        arena_ptr, region_indices[1, "recv_overflow"], _par,
+                        fx.Int32(lsa_peer_base + _p),
+                    )
+                else:
+                    overflow_ptr = fx.Int64(
+                        cco.Window(arena_win).lsa_ptr(
+                            fx.Int32(_p),
+                            fx.Int64(recv_overflow_off)
+                            + _par * fx.Int64(recv_overflow_plane),
+                        )
+                    )
+                flag = fx.Int32(comm.load_i32_global_system_relaxed(overflow_ptr))
+                flag = fx.Int32(rocdl.readfirstlane(T.i32, flag.ir_value()))
+                overflow = overflow | (
+                    flag != fx.Int32(0)
+                ).select(fx.Int32(1), fx.Int32(0))
+            return overflow
+
         # Phase 1: reduce and post WQEs.
         # Reduce the remote plane first and ring its rail as soon as it is posted,
         # overlapping transfer with local-plane reduction. G CTAs share each chunk
         # and report completion once per CTA, preserving memory-operation overlap.
         # Per-unit waits would serialize this bandwidth path.
-        _PLANES = (remote_plane, 1 - remote_plane)
+        _PLANES = REMOTE_NODES + (local_plane,)
         _rail_req = fx.Int64(0)
         # Every node peer's kernel1 publishes once, at its end (word = its
         # local rank).  Poll relaxed, acquire once.  part 1 (fused stage2,
@@ -2003,8 +2129,10 @@ def compile_stage2_node_combine(
                 # FINAL_DONE, which every kernel2 CTA feeds after both of its
                 # waits, so both parts of every CTA read this forward's value.
                 _epoch = fx.Int32(comm.load_i32_global_system_relaxed(
-                    arg_scratch + fx.Int64(SCRATCH_SDMA_EPOCH * 4)))
-                _sd = cco.DevComm(dev_comm).sdma()
+                    arg_scratch + fx.Int64(S_SDMA_EPOCH * 4)))
+                _sd = cco.DevComm(
+                    region_local_dev_comm(arena_ptr, len(buffer_regions))
+                    if buffer_regions else dev_comm).sdma()
                 _want = fx.Int64(_epoch) * fx.Int64(2) + fx.Int64(part)
                 for _p in range_constexpr(int(gpus_per_node)):
                     if const_expr(_p != LOCAL_RANK):
@@ -2012,14 +2140,20 @@ def compile_stage2_node_combine(
                             fx.Int64(_sd.signal_slot(fx.Int32(_p), fx.Int32(0))), _want)
         gpu.barrier()
         comm.fence_system_acquire()
+        return_generation = generation
+        if const_expr(RECV_STATUS):
+            return_generation = generation * fx.Int64(2)
         ck_local = bx % total_chunks
         sub = bx // total_chunks
         n_cta = (grid - ck_local + total_chunks - fx.Int32(1)) // total_chunks
         # The rewriter needs range_constexpr to reach nested runtime loops.
-        _PIS = {0: (0, 1), 1: (0,), 2: (1,)}[part]
+        _PIS = {0: tuple(range(NODES)), 1: tuple(range(NODES - 1)),
+                2: (NODES - 1,)}[part]
         for _pii in range_constexpr(len(_PIS)):
           _pi = _PIS[_pii]
           plane = _PLANES[_pi]
+          peer_index = plane - int(plane > node)
+          destination_peer_index = node - int(node > plane)
           if const_expr(INBOX_PER_PLANE):
               # At mtpr>4096, the full inbox exceeds i32 num_records and masked out-of-range
               # reads stop returning zero. Use one descriptor per plane with plane-local token indices.
@@ -2189,7 +2323,7 @@ def compile_stage2_node_combine(
               # every partial before posting the chunk's WQE.
               fx.rocdl.s_waitcnt(vmcnt=0, lgkmcnt=0, expcnt=0)
               gpu.barrier()
-              cnt_idx = fx.Int32(SCRATCH_CHUNK_DONE + plane * MAX_CHUNKS) + ck
+              cnt_idx = fx.Int32(S_CHUNK + plane * MAX_CHUNKS) + ck
               if wave == fx.Int32(0):
                   prev = fx.Int32(0)
                   if lane == fx.Int32(0):
@@ -2212,15 +2346,16 @@ def compile_stage2_node_combine(
                               ready_ptr
                               + fx.Int64(fx.Int32(plane * MAX_TOKENS) + ck_first)
                               * fx.Int64(8), generation)
-                      if const_expr(plane == remote_plane):
+                      if const_expr(plane != local_plane):
                           _qp = ck % fx.Int32(NUM_QP)
-                          _rail.put(dev_comm, _qp, fx.Int32(remote_node),
-                              arena_win,
+                          _rail.put(dev_comm, _qp, fx.Int32(plane),
+                              rx_win,
                               _rx_off
+                              + fx.Int64(destination_peer_index * RX_PEER_BYTES)
                               + fx.Int64(ck_first) * fx.Int64(RECORD_BYTES),
-                              arena_win,
+                              accumulator_win,
                               _accumulator_off
-                              + fx.Int64(remote_plane * MAX_TOKENS)
+                              + fx.Int64(plane * MAX_TOKENS)
                               * fx.Int64(RECORD_BYTES)
                               + fx.Int64(ck_first) * fx.Int64(RECORD_BYTES),
                               fx.Int64(ck_tok) * fx.Int64(RECORD_BYTES),
@@ -2229,10 +2364,10 @@ def compile_stage2_node_combine(
                           if lane == fx.Int32(0):
                               comm.atomic_add_agent(
                                   arg_scratch
-                                  + fx.Int64(SCRATCH_WQE_POSTED) * fx.Int64(4)
+                                  + fx.Int64(S_WQE + peer_index * NUM_QP) * fx.Int64(4)
                                   + fx.Int64(_qp) * fx.Int64(4),
                                   fx.Int32(1))
-          if const_expr(_pi == 0):  # noqa: SIM102
+          if const_expr(plane != local_plane):  # noqa: SIM102
             # One CTA's wave0 per QP rings it once all its WQEs are posted.
             # QPs are independent; this needs no CTA barrier.
             if (bx < fx.Int32(NUM_QP)) & (wave == fx.Int32(0)):
@@ -2240,24 +2375,28 @@ def compile_stage2_node_combine(
                   (total_chunks - bx + fx.Int32(NUM_QP - 1))
                   // fx.Int32(NUM_QP), fx.Int32(0))
               _posted = fx.Int32(comm.load_i32_global_system_relaxed(
-                  arg_scratch + fx.Int64(SCRATCH_WQE_POSTED) * fx.Int64(4)
+                  arg_scratch + fx.Int64(S_WQE + peer_index * NUM_QP) * fx.Int64(4)
                   + fx.Int64(bx) * fx.Int64(4)))
               while _posted < _want:
                   _posted = fx.Int32(comm.load_i32_global_system_relaxed(
-                      arg_scratch + fx.Int64(SCRATCH_WQE_POSTED) * fx.Int64(4)
+                      arg_scratch + fx.Int64(S_WQE + peer_index * NUM_QP) * fx.Int64(4)
                       + fx.Int64(bx) * fx.Int64(4)))
               comm.fence_system_acquire()
+              node_overflow = fx.Int32(0)
+              if const_expr(RECV_STATUS):
+                  node_overflow = _node_recv_overflow()
               for chunk in range(bx, total_chunks, fx.Int32(NUM_QP)):
                   _rail.put_value(
-                      dev_comm, bx, fx.Int32(remote_node), arena_win,
-                      _group_ready_off + fx.Int64(chunk) * fx.Int64(8),
-                      generation, aggregate=True)
+                      dev_comm, bx, fx.Int32(plane), group_ready_win,
+                      _group_ready_off + fx.Int64(destination_peer_index * GROUP_PEER_BYTES)
+                      + fx.Int64(chunk) * fx.Int64(8),
+                      return_generation + fx.Int64(node_overflow), aggregate=True)
               _rail_req = fx.Int64(_rail.flush_async(
-                  dev_comm, bx, fx.Int32(remote_node)))
-              if const_expr(part == 1):  # noqa: SIM102
+                  dev_comm, bx, fx.Int32(plane)))
+              if const_expr(part == 1 or NODES != 2):  # noqa: SIM102
                   if lane == fx.Int32(0):
                       comm.store_i64_global_relaxed(
-                          arg_scratch + fx.Int64(SCRATCH_RAIL_REQ * 4)
+                          arg_scratch + fx.Int64(S_REQ * 4 + peer_index * NUM_QP * 8)
                           + fx.Int64(bx) * fx.Int64(8), _rail_req)
         if const_expr(part != 1):
           # Phase 2: reap rail completion. The remote plane already rang the doorbell;
@@ -2289,16 +2428,17 @@ def compile_stage2_node_combine(
                            _tb + fx.Int64(TRL2["req"]) + fx.Int64(bx) * fx.Int64(8))).ir_value())))
           else:
            if (bx < fx.Int32(NUM_QP)) & (wave == fx.Int32(0)):
-            if const_expr(part == 2):
-                _rail_req = fx.Int64(rocdl.readfirstlane(T.i64, fx.Int64(
-                    comm.load_i64_global(
-                        arg_scratch + fx.Int64(SCRATCH_RAIL_REQ * 4)
-                        + fx.Int64(bx) * fx.Int64(8))).ir_value()))
-            _rail.wait(dev_comm, bx, _rail_req)
-            if lane == fx.Int32(0):
-                comm.store_i32_system(
-                    arg_scratch, fx.Int32(SCRATCH_WQE_POSTED) + bx,
-                    fx.Int32(0))
+            for _peer_index in range_constexpr(NODES - 1):
+                if const_expr(part == 2 or NODES != 2):
+                    _rail_req = fx.Int64(rocdl.readfirstlane(T.i64, fx.Int64(
+                        comm.load_i64_global(
+                            arg_scratch + fx.Int64(S_REQ * 4 + _peer_index * NUM_QP * 8)
+                            + fx.Int64(bx) * fx.Int64(8))).ir_value()))
+                _rail.wait(dev_comm, bx, _rail_req)
+                if lane == fx.Int32(0):
+                    comm.store_i32_system(
+                        arg_scratch, fx.Int32(S_WQE + _peer_index * NUM_QP) + bx,
+                        fx.Int32(0))
           # Phase 3: all CTAs perform inter-node reduction and unpermute output.
           # Both node partials are already reduced. Add and unpermute them;
           # synchronize once per CTA/chunk and distribute its work across waves.
@@ -2322,10 +2462,30 @@ def compile_stage2_node_combine(
                         ready_ptr
                         + fx.Int64(fx.Int32(local_plane * MAX_TOKENS) + ck_first)
                         * fx.Int64(8), generation)
-                _wait_ready_relaxed(
-                    group_ready_ptr + fx.Int64(ck) * fx.Int64(8), generation)
+                for _peer_index in range_constexpr(NODES - 1):
+                    _wait_ready_relaxed(
+                        group_ready_ptr + fx.Int64(_peer_index * GROUP_PEER_BYTES)
+                        + fx.Int64(ck) * fx.Int64(8), return_generation)
             gpu.barrier()
             comm.fence_system_acquire()
+            if const_expr(RECV_STATUS):  # noqa: SIM102
+                if (bx == fx.Int32(0)) & (tx == fx.Int32(0)):
+                    overflow = _node_recv_overflow()
+                    for _peer_index in range_constexpr(NODES - 1):
+                        word = fx.Int64(comm.load_i64_global_system_relaxed(
+                            group_ready_ptr + fx.Int64(_peer_index * GROUP_PEER_BYTES)
+                            + fx.Int64(ck) * fx.Int64(8)))
+                        overflow = overflow | fx.Int32(word & fx.Int64(1))
+                    # The error bit is constant across this forward's chunks.
+                    # CTA0 observes the local vote and every peer's first
+                    # chunk, so one writer suffices for this rank's status.
+                    if overflow != fx.Int32(0):
+                        status_ptr = arena_ptr + fx.Int64(forward_status_off)
+                        if const_expr(bool(buffer_regions)):
+                            status_ptr = region_local_address(
+                                arena_ptr, region_indices[1, "forward_status"], fx.Int64(0)
+                            )
+                        comm.store_i32_global_system_relaxed(status_ptr, fx.Int32(1))
             n_cta = (grid - ck + total_chunks - fx.Int32(1)) // total_chunks
             sub = bx // total_chunks
             for u in range(sub * fx.Int32(WAVES) + wave,
@@ -2382,11 +2542,31 @@ def compile_stage2_node_combine(
                         BFloat16).to(Float32)
                     remote_values = fx.Vector(remote_packed).bitcast(
                         BFloat16).to(Float32)
-                result = fx.Vector.from_elements(
-                    [fx.Float32(local_values[i]) + fx.Float32(remote_values[i])
-                     for i in range_constexpr(VEC)],
-                    Float32,
-                ).to(BFloat16).bitcast(fx.Int32)
+                totals = [fx.Float32(local_values[i]) + fx.Float32(remote_values[i])
+                          for i in range_constexpr(VEC)]
+                for _peer_index in range_constexpr(1, NODES - 1):
+                    if const_expr(RAIL_FP8):
+                        _rrow = (fx.Int32(_peer_index * RX_PEER_BYTES)
+                                 + rx_row * fx.Int32(ACC_ROW_BYTES))
+                        remote_packed = buffer_ops.buffer_load(
+                            rx_rsrc, (_rrow + col) // fx.Int32(4),
+                            vec_width=2, dtype=T.i32)
+                        _rsc = buffer_ops.buffer_load(
+                            rx_rsrc, _rrow + fx.Int32(HIDDEN) + col // fx.Int32(32),
+                            vec_width=1, dtype=T.i8)
+                        remote_values = _fp8_decode8(
+                            remote_packed,
+                            ((fx.Uint8(_rsc).to(fx.Uint32).bitcast(fx.Int32))
+                             << fx.Int32(23)).bitcast(Float32))
+                    else:
+                        remote_packed = buffer_ops.buffer_load(
+                            rx_rsrc,
+                            fx.Int32(_peer_index * RX_PEER_BYTES // 4)
+                            + out_index // fx.Int32(2), vec_width=4, dtype=T.i32)
+                        remote_values = fx.Vector(remote_packed).bitcast(BFloat16).to(Float32)
+                    totals = [totals[i] + fx.Float32(remote_values[i])
+                              for i in range_constexpr(VEC)]
+                result = fx.Vector.from_elements(totals, Float32).to(BFloat16).bitcast(fx.Int32)
                 buffer_ops.buffer_store(
                     result, out_rsrc, out_index // fx.Int32(2))
             # Increment once per CTA/chunk. FINAL_DONE is local to this GPU, read by CTA0
@@ -2396,13 +2576,13 @@ def compile_stage2_node_combine(
             gpu.barrier()
             if tx == fx.Int32(0):
                 prev = fx.Int32(comm.atomic_add_agent_acq_rel(
-                    arg_scratch + fx.Int64(SCRATCH_P3_DONE + ck) * fx.Int64(4),
+                    arg_scratch + fx.Int64(S_P3 + ck) * fx.Int64(4),
                     fx.Int32(1)))
                 if (prev + fx.Int32(1)) == n_cta:
                     comm.store_i32_system(
-                        arg_scratch, fx.Int32(SCRATCH_P3_DONE) + ck, fx.Int32(0))
+                        arg_scratch, fx.Int32(S_P3) + ck, fx.Int32(0))
                     comm.atomic_add_system_acq_rel(
-                        arg_scratch + fx.Int64(SCRATCH_FINAL_DONE) * fx.Int64(4),
+                        arg_scratch + fx.Int64(S_FINAL) * fx.Int64(4),
                         ck_tok)
           fx.rocdl.s_waitcnt(vmcnt=0, lgkmcnt=0, expcnt=0)
           gpu.barrier()
@@ -2412,7 +2592,7 @@ def compile_stage2_node_combine(
           # values satisfy the old generation's >= wait, exposing a partially written
           # buffer without a hang. The handshake is therefore required for correctness.
           if bx == fx.Int32(0):
-            done_ptr = arg_scratch + fx.Int64(SCRATCH_FINAL_DONE) * fx.Int64(4)
+            done_ptr = arg_scratch + fx.Int64(S_FINAL) * fx.Int64(4)
             if tx == fx.Int32(0):
                 done = fx.Int32(comm.load_i32_global_system(done_ptr))
                 while done < local_tokens:
@@ -2427,29 +2607,27 @@ def compile_stage2_node_combine(
                     comm.store_i32_global_system_relaxed(
                         arrival_ptr + fx.Int64(SD_CTR_B), fx.Int32(0))
                     comm.atomic_add_agent(
-                        arg_scratch + fx.Int64(SCRATCH_SDMA_EPOCH * 4), fx.Int32(1))
+                        arg_scratch + fx.Int64(S_SDMA_EPOCH * 4), fx.Int32(1))
             gpu.barrier()
             if wave == fx.Int32(0):
-                # Acknowledge reading the peer's payload so it can reuse its send source.
-                _rail.put_value(dev_comm, fx.Int32(0), fx.Int32(remote_node),
-                                arena_win, _consumed_off, generation,
-                                aggregate=True)
-                # Ring now, reap our own completion after the peer's credit:
-                # the two are independent, so waiting for our ACK first only
-                # serializes one extra round trip in front of the credit wait.
-                _consumed_req = _rail.flush_async(
-                    dev_comm, fx.Int32(0), fx.Int32(remote_node))
-                if lane == fx.Int32(0):
-                    # Wait for peer credit confirming our writes into its RX buffer were consumed
-                    # before reusing that parity slot. System acquire is required because the
-                    # peer NIC writes this credit word.
-                    _credit_ptr = arena_ptr + _consumed_off
-                    _credit = fx.Int64(
-                        comm.load_i64_global_system(_credit_ptr))
-                    while _credit < generation:
-                        _credit = fx.Int64(
-                            comm.load_i64_global_system(_credit_ptr))
-                _rail.wait(dev_comm, fx.Int32(0), _consumed_req)
+                # Send every acknowledgement before waiting for peer credits.
+                # The receive arrays use sorted peer indices, excluding self.
+                _consumed_requests = []
+                for _peer_index in range_constexpr(NODES - 1):
+                    _peer_node = REMOTE_NODES[_peer_index]
+                    _destination_index = node - int(node > _peer_node)
+                    _rail.put_value(dev_comm, fx.Int32(0), fx.Int32(_peer_node),
+                                    consumed_win, _consumed_off + fx.Int64(_destination_index * 8),
+                                    generation, aggregate=True)
+                    _consumed_requests.append(_rail.flush_async(
+                        dev_comm, fx.Int32(0), fx.Int32(_peer_node)))
+                for _peer_index in range_constexpr(NODES - 1):
+                    if lane == fx.Int32(0):
+                        _credit_ptr = credit_ptr + fx.Int64(_peer_index * 8)
+                        _credit = fx.Int64(comm.load_i64_global_system(_credit_ptr))
+                        while _credit < generation:
+                            _credit = fx.Int64(comm.load_i64_global_system(_credit_ptr))
+                    _rail.wait(dev_comm, fx.Int32(0), _consumed_requests[_peer_index])
 
     @flyc.kernel(name=kernel_name, known_block_size=[THREADS, 1, 1])
     def kernel(
@@ -2487,10 +2665,15 @@ def compile_stage2_node_combine(
         broadcasts the word (barrier) so the whole CTA takes the same branch."""
         tx = fx.Int32(gpu.thread_id("x"))
         if tx == fx.Int32(0):
+            epoch_ptr = arena_ptr + fx.Int64(epoch_off)
+            if const_expr(bool(buffer_regions)):
+                epoch_ptr = region_local_address(arena_ptr, region_indices[1, "epoch_gate"], fx.Int64(0))
             generation = fx.Int64(comm.load_i64_global_agent_relaxed(
-                arena_ptr + fx.Int64(epoch_off)))
+                epoch_ptr))
             _par = generation & fx.Int64(1)
             arrival_ptr = arena_ptr + fx.Int64(arrival_off) + _par * fx.Int64(parity_planes[7])
+            if const_expr(bool(buffer_regions)):
+                arrival_ptr = region_local_address(arena_ptr, region_indices[2, "plane_slot_arrived"], _par)
             ok = fx.Int32(1)
             for _p in range_constexpr(int(gpus_per_node)):
                 w = fx.Int64(comm.load_i64_global_system_relaxed(
@@ -2498,8 +2681,10 @@ def compile_stage2_node_combine(
                 ok = (w < generation).select(fx.Int32(0), ok)
             if const_expr(sdma):
                 _epoch = fx.Int32(comm.load_i32_global_system_relaxed(
-                    arg_scratch + fx.Int64(SCRATCH_SDMA_EPOCH * 4)))
-                _sd = cco.DevComm(dev_comm).sdma()
+                    arg_scratch + fx.Int64(S_SDMA_EPOCH * 4)))
+                _sd = cco.DevComm(
+                    region_local_dev_comm(arena_ptr, len(buffer_regions))
+                    if buffer_regions else dev_comm).sdma()
                 _want = fx.Int64(_epoch) * fx.Int64(2) + fx.Int64(1)
                 for _p in range_constexpr(int(gpus_per_node)):
                     if const_expr(_p != LOCAL_RANK):

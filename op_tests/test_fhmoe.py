@@ -18,6 +18,7 @@ from __future__ import annotations
 import inspect
 import os
 from dataclasses import dataclass
+from itertools import pairwise
 from pathlib import Path
 
 import pytest
@@ -40,6 +41,159 @@ from aiter.ops.shuffle import (
 from aiter.ops.triton.quant import dynamic_mxfp8_quant
 from aiter.utility import fp4_utils
 from aiter.utility.mx_types import MxDtypeInt
+
+
+@pytest.mark.parametrize("nodes", [2, 3, 4, 8])
+@pytest.mark.parametrize("num_qp", [1, 4, 8, 16])
+@pytest.mark.parametrize("tokens", [32, 2048, 16384])
+def test_megamoe_stage2_sdma_epoch_does_not_alias_rail_requests(nodes, num_qp, tokens):
+    """RAIL request publication must preserve SDMA's running signal epoch."""
+    from aiter.ops.flydsl.kernels.mega_moe_internode.stage2 import (
+        stage2_scratch_layout,
+    )
+
+    layout = stage2_scratch_layout(nodes, tokens, 256, num_qp)
+    scratch = [0] * layout["words"]
+    epoch = layout["sdma_epoch"]
+    scratch[epoch] = 17
+    for peer in range(nodes - 1):
+        for qp in range(num_qp):
+            offset = layout["req"] + 2 * (peer * num_qp + qp)
+            scratch[offset : offset + 2] = [123 + qp, 456 + peer]
+    assert scratch[epoch] == 17
+    chunks = (tokens + 255) // 256
+    spans = [
+        (layout["wqe"], (nodes - 1) * num_qp),
+        (layout["req"], 2 * (nodes - 1) * num_qp),
+        (epoch, 1),
+        (layout["final"], 1),
+        (layout["chunk"], nodes * chunks),
+        (layout["p3"], chunks),
+    ]
+    for (start, size), (next_start, _) in pairwise(spans):
+        assert start + size <= next_start
+    assert spans[-1][0] + spans[-1][1] <= layout["words"]
+
+
+def test_a8w4_common_stage1_async_replay():
+    """Regress the common Stage1 VMEM-to-LDS producer/consumer race."""
+    from aiter.jit.utils.chip_info import get_gfx_runtime
+    from aiter.ops.flydsl.moe_kernels import flydsl_moe_stage1
+    from aiter.ops.quant import mxfp4_moe_sort_fwd, per_1x32_f8_scale_f8_quant
+    from aiter.test_common import benchmark, checkAllclose, run_perftest
+
+    if not torch.cuda.is_available() or get_gfx_runtime() != "gfx950":
+        pytest.skip("common A8W4 Stage1 requires gfx950")
+
+    @benchmark()
+    def run_case(tokens, capacity, hidden, inter, experts, topk):
+        device = torch.device("cuda", torch.cuda.current_device())
+        torch.manual_seed(123)
+        x = torch.randn(capacity, hidden, dtype=torch.bfloat16, device=device)
+        row_factor = torch.exp2(
+            torch.arange(capacity, device=device).remainder(5).float() - 2
+        )
+        x *= row_factor[:, None]
+        xq, xs = per_1x32_f8_scale_f8_quant(
+            x, quant_dtype=dtypes.fp8, scale_type=dtypes.fp8_e8m0
+        )
+        dense = torch.randn(
+            experts, 2 * inter, hidden, dtype=torch.bfloat16, device=device
+        ).mul_(0.05)
+        wq, ws = per_1x32_f4_quant(dense)
+        wq = wq.view(experts, 2 * inter, hidden // 2)
+        del dense
+        shuffled_w, shuffled_s = _shuffle_w1(wq, ws, interleave=True)
+        rows = torch.arange(tokens, device=device)
+        slots = rows.mul(5).remainder(topk)
+        row_experts = rows.remainder(experts)
+        sorted_chunks, block_experts = [], []
+        for expert in range(experts):
+            selected = rows[row_experts == expert]
+            encoded = selected | (slots[selected] << 24)
+            padded = (encoded.numel() + 31) // 32 * 32
+            chunk = torch.full((padded,), capacity, dtype=torch.int32, device=device)
+            chunk[: encoded.numel()] = encoded.to(torch.int32)
+            sorted_chunks.append(chunk)
+            block_experts.extend([expert] * (padded // 32))
+        sorted_ids = torch.cat(sorted_chunks)
+        expert_ids = torch.tensor(block_experts, dtype=torch.int32, device=device)
+        valid_ids = torch.tensor(
+            [sorted_ids.numel(), tokens], dtype=torch.int32, device=device
+        )
+        sorted_scales = mxfp4_moe_sort_fwd(xs, sorted_ids, valid_ids, capacity, hidden)
+        decoded_x = xq[:tokens].float() * fp4_utils.e8m0_to_f32(
+            xs[:tokens]
+        ).repeat_interleave(32, dim=-1)
+        reference = torch.empty(tokens, inter, dtype=torch.float32, device=device)
+        for expert in range(experts):
+            selected = rows[row_experts == expert]
+            decoded_w = fp4_utils.mxfp4_to_f32(wq[expert]) * fp4_utils.e8m0_to_f32(
+                ws.reshape(experts, 2 * inter, hidden // 32)[expert]
+            ).repeat_interleave(32, dim=-1)
+            gate, up = (decoded_x[selected] @ decoded_w.T).chunk(2, dim=-1)
+            reference[selected] = gate.tanh() * gate.sigmoid() * up.tanh()
+        reference = reference.bfloat16().float()
+
+        def candidate():
+            # Use the wrapper's own empty allocation so an unwritten valid
+            # route cannot be hidden by a zero-initialized test buffer.
+            return flydsl_moe_stage1(
+                xq,
+                shuffled_w,
+                sorted_ids,
+                expert_ids,
+                valid_ids,
+                topk=topk,
+                tile_m=32,
+                tile_n=128,
+                tile_k=256,
+                a_dtype="fp8",
+                b_dtype="fp4",
+                out_dtype="bf16",
+                act="situv2",
+                gate_mode="interleave",
+                a1_scale=sorted_scales,
+                w1_scale=shuffled_s,
+                use_async_copy=True,
+                waves_per_eu=2,
+            )
+
+        def validate(actual):
+            owned = actual[rows, slots].float()
+            assert torch.isfinite(owned).all()
+            error = checkAllclose(reference, owned, rtol=0.05, atol=0.05)
+            assert error == 0, f"Stage1 reference mismatch: {error}"
+            row_error = (owned - reference).norm(dim=-1) / reference.norm(
+                dim=-1
+            ).clamp_min(1e-12)
+            assert float(row_error.max()) < 0.01, "Stage1 worst-row error"
+            return owned.clone(), error
+
+        flops = 4 * tokens * hidden * inter
+        nbytes = xq.numel() + shuffled_w.numel() + tokens * inter * 2
+        result = {}
+        for name, fn in {"flydsl_async": candidate}.items():
+            output, us = run_perftest(fn, num_warmup=3, num_iters=20)
+            eager, error = validate(output)
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph):
+                captured = fn()
+            for _ in range(64):
+                graph.replay()
+                torch.cuda.synchronize(device)
+                replay, _ = validate(captured)
+                assert torch.equal(eager, replay), "Stage1 changed on fixed inputs"
+            result[f"{name} us"] = us
+            result[f"{name} TFLOPS"] = flops / us / 1e6
+            result[f"{name} TB/s"] = nbytes / us / 1e6
+            result[f"{name} err"] = error
+        return result
+
+    import pandas as pd
+
+    record = run_case(520, 1024, 3584, 3072, 28, 16)
+    aiter.logger.info("A8W4 Stage1 replay:\n%s", pd.DataFrame([record]).to_markdown())
 
 
 @dataclass(frozen=True)
@@ -2392,6 +2546,62 @@ def test_reduce_output_limit_fits_uint32_byte_extent():
         _validate_flydsl_route_output_nbytes(
             fhmoe_reduce_output_nbytes(max_tokens + 1, 9, 6144, 2)
         )
+
+
+def test_plain_a8w4_large_route_output_capability_is_scoped(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    import functools
+    import importlib
+
+    module = importlib.import_module("aiter.fused_moe")
+    fhmoe_module = importlib.import_module("aiter.fhmoe")
+    monkeypatch.setattr(module, "get_gfx_runtime", lambda: "gfx950")
+    monkeypatch.delenv("AITER_FLYDSL_STAGE2_FP8", raising=False)
+    a8w4 = functools.partial(
+        module._flydsl_stage2_wrapper,
+        kernelName="flydsl_moe2_afp8_wfp4_bf16_t32x128x256_atomic",
+    )
+    extent = 524288 * 6 * 5120 * 2
+    assert extent == 32212254720
+    assert module._stage2_runtime_uses_route_reduce(a8w4, 524288, 5120)
+    assert module._stage2_has_64bit_route_output(a8w4)
+    module._validate_flydsl_route_output_nbytes(extent, stage2=a8w4)
+
+    for wrapper, name in (
+        (None, ""),
+        (lambda: None, ""),
+        (module._flydsl_stage2_wrapper, "flydsl_moe2_unknown"),
+        (
+            module._flydsl_stage2_wrapper,
+            "flydsl_moe2_afp4_wfp4_bf16_t32x128x256_reduce",
+        ),
+        (
+            module._flydsl_stage2_wrapper,
+            "flydsl_moe2_afp8_wfp8_bf16_t32x128x128_reduce",
+        ),
+        (
+            module._flydsl_stage2_wrapper,
+            "flydsl_moe2_abf16_wfp4_bf16_t32x128x128_reduce",
+        ),
+        (module._flydsl_stage2_wrapper, "flydsl_moe2_afp8_wfp4_f16_t32x128x256_reduce"),
+        (fhmoe_module._flydsl_fhmoe_stage2_wrapper, a8w4.keywords["kernelName"]),
+    ):
+        selected = functools.partial(wrapper, kernelName=name) if wrapper else None
+        assert not module._stage2_has_64bit_route_output(selected)
+        with pytest.raises(NotImplementedError, match="32-bit buffer-addressing"):
+            module._validate_flydsl_route_output_nbytes(extent, stage2=selected)
+
+    monkeypatch.setenv("AITER_FLYDSL_STAGE2_FP8", "1")
+    assert not module._stage2_has_64bit_route_output(a8w4)
+    with pytest.raises(NotImplementedError, match="32-bit buffer-addressing"):
+        module._validate_flydsl_route_output_nbytes(extent, stage2=a8w4)
+    monkeypatch.delenv("AITER_FLYDSL_STAGE2_FP8")
+    for arch in ("gfx942", "gfx1250"):
+        monkeypatch.setattr(module, "get_gfx_runtime", lambda arch=arch: arch)
+        assert not module._stage2_has_64bit_route_output(a8w4)
+        with pytest.raises(NotImplementedError, match="32-bit buffer-addressing"):
+            module._validate_flydsl_route_output_nbytes(extent, stage2=a8w4)
 
 
 def test_global_moe_large_m_uses_32768_floor_tier_until_131072():

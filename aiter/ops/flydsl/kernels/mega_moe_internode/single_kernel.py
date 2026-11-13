@@ -18,10 +18,11 @@ been claimed, so every awaited group is in progress).
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
-from flydsl.expr import gpu, rocdl
+from flydsl.expr import const_expr, gpu, rocdl
 
 from .. import communication_ops_utils as comm
 from . import communication as comm2
+from .buffer_addressing import region_local_address
 from .mega_moe_internode_config import STAGE2_PART1_PROBE
 from .stage2_pipeline import compile_stage2_pipeline
 
@@ -46,6 +47,8 @@ def compile_single_kernel(stage1_launch, k1_kw: dict, k2_kw: dict, k2_ctas: int)
             "the single kernel needs Stage1 compiled with group_ready=True"
         )
     epoch_off = int(stage1_launch.epoch_off)
+    buffer_regions = stage1_launch.buffer_regions
+    region_indices = {(stage, name): index for stage, name, index in buffer_regions}
     remote_first = pipeline.remote_first
     lds_bytes = max(int(stage1_launch.lds_bytes), int(k1.lds_bytes))
     if lds_bytes > 160 * 1024:
@@ -83,12 +86,17 @@ def compile_single_kernel(stage1_launch, k1_kw: dict, k2_kw: dict, k2_ctas: int)
                 topk_ids, w1q, w1scale, ntokens, lds_raw=lds)
         # This generation: Stage1 published it in epoch_gate before any CTA
         # left its entry (every CTA spun on it there).
-        gen = fx.Int64(comm2.load_i64_global_system(arena_ptr + fx.Int64(epoch_off)))
+        epoch_ptr = arena_ptr + fx.Int64(epoch_off)
+        if const_expr(bool(buffer_regions)):
+            epoch_ptr = region_local_address(arena_ptr, region_indices[1, "epoch_gate"], fx.Int64(0))
+        gen = fx.Int64(comm2.load_i64_global_system(epoch_ptr))
         # Hand-off (see the module docstring): wait until Stage1's tables are
         # final, drop stale lines once, then GEMM2 waits per tile group.
         if fx.Int32(gpu.thread_id("x")) == fx.Int32(0):
             eos = (arena_ptr + fx.Int64(gsync["eos_off"])
                    + (gen & fx.Int64(1)) * fx.Int64(gsync["eos_plane"]))
+            if const_expr(bool(buffer_regions)):
+                eos = region_local_address(arena_ptr, region_indices[1, "h1_queue_eos"], gen & fx.Int64(1))
             ev = fx.Int64(comm2.load_i64_global_system(eos))
             while ev < gen:
                 rocdl.s_sleep(1)

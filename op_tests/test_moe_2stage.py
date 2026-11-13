@@ -15,12 +15,12 @@ import torch
 import aiter
 from aiter import dtypes, presorted_moe
 from aiter.aot.flydsl.common import override_env, run_only_env
-from aiter.fhmoe_contract import FHMOE_BUFFER_MAX_BYTES
 from aiter.fused_moe import (
     AsmMoeMode,
     _flydsl_route_output_nbytes,
     _is_flydsl_stage2,
     _stage2_runtime_uses_route_reduce,
+    _validate_flydsl_route_output_nbytes,
     cktile_moe_stage1,
     cktile_moe_stage2,
     fused_moe,
@@ -1276,12 +1276,11 @@ def _moe_2stage_route_workspace_skip_reason(kwargs):
         model_dim,
         torch.empty((), dtype=kwargs["dtype"]).element_size(),
     )
-    if route_bytes <= FHMOE_BUFFER_MAX_BYTES:
-        return None
-    return (
-        f"FlyDSL stage2 reduce workspace {route_bytes / (1024**3):.1f} GiB "
-        "exceeds the current 32-bit buffer-addressing limit"
-    )
+    try:
+        _validate_flydsl_route_output_nbytes(route_bytes, stage2=metadata.stage2)
+    except NotImplementedError as exc:
+        return str(exc)
+    return None
 
 
 def _format_moe_2stage_case(kwargs):
