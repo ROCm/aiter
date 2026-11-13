@@ -78,9 +78,10 @@ def _validate_fhmoe_contract(
             "Heterogeneous MXFP4/FP8 and MXFP8/FP8 experts require "
             "per_1x32 quantization"
         )
-    if activation != ActivationType.Silu:
+    if activation not in (ActivationType.Silu, ActivationType.Swiglu):
         raise ValueError(
-            "Heterogeneous MXFP4/FP8 and MXFP8/FP8 experts currently require SiLU"
+            "Heterogeneous MXFP4/FP8 and MXFP8/FP8 experts currently require "
+            "SiLU or Swiglu"
         )
     if gate_mode not in (GateMode.INTERLEAVE, GateMode.SEPARATED):
         raise ValueError(
@@ -475,8 +476,9 @@ def _config_has_mxfp8_fhmoe_geometry(
     inter_dim: int,
     experts: int,
     topk: int,
+    q_dtype_w: torch.dtype = dtypes.fp8,
 ) -> bool:
-    """Return whether the dedicated CSV declares this MXFP8/FP8 geometry."""
+    """Return whether the dedicated CSV declares this geometry for q_dtype_w."""
     with open(config_file, newline="") as stream:
         rows = csv.DictReader(stream)
         return any(
@@ -485,7 +487,7 @@ def _config_has_mxfp8_fhmoe_geometry(
             and int(row["expert"]) == experts
             and int(row["topk"]) == topk
             and int(row["shared_expert_id"]) == experts - 1
-            and row["q_dtype_w"] == str(dtypes.fp8)
+            and row["q_dtype_w"] == str(q_dtype_w)
             for row in rows
         )
 
@@ -1025,6 +1027,17 @@ def _fhmoe_impl(
         from aiter.jit.core import AITER_CONFIGS
 
         metadata_config_file = AITER_CONFIGS.AITER_CONFIG_FHMOE_FILE
+    elif w1.dtype == dtypes.fp4x2 and _config_has_mxfp8_fhmoe_geometry(
+        _fhmoe_config_file(),
+        model_dim=model_dim,
+        inter_dim=inter_dim,
+        experts=experts,
+        topk=topk,
+        q_dtype_w=dtypes.fp4x2,
+    ):
+        # Other MXFP4-routed geometries with dedicated rows (e.g. MiniMax-M3.1);
+        # a missing bucket fails in get_2stage_cfgs instead of falling back.
+        metadata_config_file = _fhmoe_config_file()
     elif w1.dtype == dtypes.fp8:
         request_dtype = hidden_states.dtype if dtype is None else dtype
         metadata_config_file = _resolve_mxfp8_fhmoe_config_file(
