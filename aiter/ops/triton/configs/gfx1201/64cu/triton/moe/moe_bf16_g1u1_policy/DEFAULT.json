@@ -1,0 +1,21 @@
+{
+  "bf16_g1u1_large_m": {
+    "arch": "gfx1201",
+    "cu_num": 64,
+    "activation_dtype": "bf16",
+    "weight_dtype": "bf16",
+    "quant_type": "none",
+    "activation": "silu",
+    "model_dim": 2048,
+    "inter_dim": 128,
+    "num_experts": 256,
+    "topk": 8,
+    "gate_mode": "separated",
+    "m_ranges": [
+      [
+        1024,
+        4096
+      ]
+    ]
+  }
+}

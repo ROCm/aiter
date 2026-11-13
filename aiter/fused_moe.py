@@ -1451,6 +1451,138 @@ def fused_moe_fake(
     return torch.empty((M, model_dim), dtype=dtype, device=device)
 
 
+@functools.lru_cache(maxsize=1)
+def _get_bf16_g1u1_gfx1201_triton_policy() -> dict:
+    from aiter.ops.triton.utils.moe_config_utils import get_moe_dispatch
+
+    dispatch = get_moe_dispatch("MOE-BF16-G1U1-POLICY", get_gfx_runtime(), "triton")
+    policy = dispatch.get("bf16_g1u1_large_m", {})
+    return dict(policy)
+
+
+def _bf16_g1u1_gfx1201_triton_policy_contains_m(
+    tokens: int, policy: dict | None = None
+) -> bool:
+    if policy is None:
+        try:
+            policy = _get_bf16_g1u1_gfx1201_triton_policy()
+        except (AssertionError, KeyError, OSError, RuntimeError, TypeError, ValueError):
+            return False
+    for start, end in policy.get("m_ranges", ()):
+        if int(start) <= tokens <= int(end):
+            return True
+    return False
+
+
+def _can_use_bf16_g1u1_gfx1201_triton_large_m(
+    *,
+    hidden_states: torch.Tensor,
+    w1: torch.Tensor,
+    w2: torch.Tensor,
+    topk_weight: torch.Tensor,
+    topk_ids: torch.Tensor,
+    activation: ActivationType,
+    quant_type: QuantType,
+    dtype: torch.dtype,
+    q_dtype_a: torch.dtype,
+    q_dtype_w: torch.dtype,
+    is_g1u1: bool,
+    doweight_stage1: bool,
+    w1_scale: torch.Tensor | None,
+    w2_scale: torch.Tensor | None,
+    a1_scale: torch.Tensor | None,
+    a2_scale: torch.Tensor | None,
+    num_local_tokens: torch.Tensor | None,
+    moe_sorting_dispatch_policy: int,
+    expert_mask: torch.Tensor | None,
+    hidden_pad: int,
+    intermediate_pad: int,
+    bias1: torch.Tensor | None,
+    bias2: torch.Tensor | None,
+    swiglu_limit: float | None = None,
+    beta: float | None = None,
+    linear_beta: float | None = None,
+    gate_mode: str | GateMode | None = GateMode.SEPARATED.value,
+    stage2_scatter: Stage2ScatterContext | None = None,
+) -> bool:
+    if topk_ids.ndim != 2 or topk_weight.shape != topk_ids.shape:
+        return False
+    tokens = topk_ids.shape[0]
+    try:
+        policy = _get_bf16_g1u1_gfx1201_triton_policy()
+        policy_arch = policy["arch"]
+        policy_cu_num = int(policy["cu_num"])
+        policy_model_dim = int(policy["model_dim"])
+        policy_inter_dim = int(policy["inter_dim"])
+        policy_num_experts = int(policy["num_experts"])
+        policy_topk = int(policy["topk"])
+        runtime_arch = get_gfx_runtime()
+        runtime_cu_num = get_cu_num()
+    except (AssertionError, KeyError, OSError, RuntimeError, TypeError, ValueError):
+        return False
+    return (
+        policy_arch == "gfx1201"
+        and policy_cu_num == 64
+        and policy.get("activation_dtype") == "bf16"
+        and policy.get("weight_dtype") == "bf16"
+        and policy.get("quant_type") == "none"
+        and policy.get("activation") == "silu"
+        and policy.get("gate_mode") == GateMode.SEPARATED.value
+        and runtime_arch == policy_arch
+        and runtime_cu_num == policy_cu_num
+        and _bf16_g1u1_gfx1201_triton_policy_contains_m(tokens, policy)
+        and hidden_states.is_cuda
+        and w1.is_cuda
+        and w2.is_cuda
+        and topk_ids.is_cuda
+        and topk_weight.is_cuda
+        and w1.device == hidden_states.device
+        and w2.device == hidden_states.device
+        and topk_ids.device == hidden_states.device
+        and topk_weight.device == hidden_states.device
+        and hidden_states.dtype == dtypes.bf16
+        and w1.dtype == dtypes.bf16
+        and w2.dtype == dtypes.bf16
+        and topk_ids.dtype == dtypes.i32
+        and topk_weight.dtype == dtypes.fp32
+        and topk_ids.ndim == 2
+        and topk_weight.shape == topk_ids.shape
+        and topk_ids.shape[1] == policy_topk
+        and quant_type == QuantType.No
+        and activation == ActivationType.Silu
+        and dtype == dtypes.bf16
+        and q_dtype_a == dtypes.bf16
+        and q_dtype_w == dtypes.bf16
+        and is_g1u1
+        and not doweight_stage1
+        and w1.shape[0] == policy_num_experts
+        and w2.shape[1] == policy_model_dim
+        and w2.shape[2] == policy_inter_dim
+        and w1.shape[1] == 2 * w2.shape[2]
+        and w1.shape[2] == w2.shape[1]
+        and expert_mask is None
+        and stage2_scatter is None
+        and w1_scale is None
+        and w2_scale is None
+        and a1_scale is None
+        and a2_scale is None
+        and num_local_tokens is None
+        and moe_sorting_dispatch_policy == 0
+        and hidden_pad == 0
+        and intermediate_pad == 0
+        and bias1 is None
+        and bias2 is None
+        and swiglu_limit is None
+        and beta is None
+        and linear_beta is None
+        and gate_mode in (None, GateMode.SEPARATED, GateMode.SEPARATED.value)
+        and w1.is_contiguous()
+        and w2.is_contiguous()
+        and not getattr(w1, "is_shuffled", False)
+        and not getattr(w2, "is_shuffled", False)
+    )
+
+
 @torch_compile_guard(gen_fake=fused_moe_fake)
 def fused_moe_(
     hidden_states: torch.Tensor,
@@ -1693,6 +1825,47 @@ def _fused_moe_impl(
         q_dtype_a = quant_dtype_a
     elif _q_dtype_a is not None:
         q_dtype_a = _q_dtype_a
+
+    if _can_use_bf16_g1u1_gfx1201_triton_large_m(
+        hidden_states=hidden_states,
+        w1=w1,
+        w2=w2,
+        topk_weight=topk_weight,
+        topk_ids=topk_ids,
+        activation=activation,
+        quant_type=quant_type,
+        dtype=dtype,
+        q_dtype_a=q_dtype_a,
+        q_dtype_w=q_dtype_w,
+        is_g1u1=isG1U1,
+        doweight_stage1=doweight_stage1,
+        w1_scale=w1_scale,
+        w2_scale=w2_scale,
+        a1_scale=a1_scale,
+        a2_scale=a2_scale,
+        num_local_tokens=num_local_tokens,
+        moe_sorting_dispatch_policy=moe_sorting_dispatch_policy,
+        expert_mask=expert_mask,
+        hidden_pad=hidden_pad,
+        intermediate_pad=intermediate_pad,
+        bias1=bias1,
+        bias2=bias2,
+        swiglu_limit=swiglu_limit,
+        beta=beta,
+        linear_beta=linear_beta,
+        gate_mode=gate_mode,
+        stage2_scatter=stage2_scatter,
+    ):
+        from aiter.ops.triton.moe.moe_op_gemm_a16w16 import fused_moe_bf16_g1u1
+
+        return fused_moe_bf16_g1u1(
+            hidden_states,
+            w1,
+            w2,
+            topk_weight,
+            topk_ids,
+            output=output,
+        )
 
     grouped_a8w4_out = None
     from aiter.ops.flydsl.grouped_moe_gfx1250 import grouped_gemm_gfx1250_a8w4
