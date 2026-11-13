@@ -7,10 +7,15 @@ sub-tiled tail.
 ``y = x @ w.T (+ bias)`` with x (M, K) and w (N, K) both K-contiguous, y (M, N) row-major.
 
 The kernel. One program per CU with four waves, one per SIMD. A BLOCK_M x BLOCK_N
-output tile (sides 64, 128 or 256; BLOCK_K 64 or 128) is split into four quadrant
-accumulators pinned to AGPRs (``cd_regclass="a"``), fed by a 2-deep async-copy LDS
-pipeline with local prefetch and the K loop unrolled by 2; every layout is derived
-from the tile. Tiles are assigned through an XCD-aware remap and a GROUP_SIZE_M
+output tile (sides any multiple of 32 from 64 to 320 with at most 256x256
+accumulators; BLOCK_K 64, or 128 when BLOCK_M + BLOCK_N <= 256) is split into four
+quadrant accumulators pinned to AGPRs (``cd_regclass="a"``), fed by a 2-deep
+async-copy LDS pipeline with local prefetch and the K loop unrolled by 2; every
+layout is derived from the tile. A side that is not a power of two has uneven halves
+(TOP_M / LEFT_N, from the tutorial's v9_uneven2): each half is a power-of-two block
+plus an optional extra block of 32 or 64 (224 = 128 + (64 + 32)), so a quadrant is a
+tuple of blocks; power-of-two tiles build the same code as before. Tiles are
+assigned through an XCD-aware remap and a GROUP_SIZE_M
 swizzle. The instruction schedule comes from Triton's MFMA scheduler, enabled per
 launch with ``schedule_hint="mfma-schedule"``; ``AITER_MFMA_SCHED=0`` turns it off for
 A/B runs, which costs about 15%. It needs an upstream Triton newer than
@@ -96,7 +101,7 @@ raises the RMS error 1.2-1.5 times over fp32 partials (the largest error up to a
 2 times). Only the policies that store partials (one_tile, two_tile, spread) take it;
 the default plan stays fp32.
 
-dp_sub's sub-tile (TAIL_BLOCK_M x TAIL_BLOCK_N, sides in 64, 128, 256 dividing the
+dp_sub's sub-tile (TAIL_BLOCK_M x TAIL_BLOCK_N, sides from the tile menu dividing the
 tile's) is derived from the shape at launch, so a tuned dp_sub follows M: the largest
 Q = (BLOCK_M / TAIL_BLOCK_M) (BLOCK_N / TAIL_BLOCK_N) with S Q <= P, then the most
 square sub-tile (subtile_tail). The full waves keep BLOCK_M x BLOCK_N; the tail runs
@@ -198,6 +203,347 @@ def coalesced_store_layout(rows, cols, elem_bytes, num_warps, threads_per_warp=6
     lanes_n = min(cols // contig, threads_per_warp)
     return gl.BlockedLayout(
         [1, contig], [threads_per_warp // lanes_n, lanes_n], [num_warps, 1], [1, 0]
+    )
+
+
+# ---------------------------------------------------------------------------------
+# Tile geometry: uneven halves
+#
+# A tile side splits into a first half (top / left) of FIRST rows (0: side / 2) and a
+# second half of the rest. Each half is a power-of-two main block plus an optional
+# extra block of 32 or 64 (224 = 128 + (64 + 32), 160 = (64 + 32) + 64), all on the
+# same MFMA layout. A power-of-two tile has equal halves and no extras. A half is
+# carried as a tuple of blocks (main[, extra]): its LDS buffers, load offsets and
+# register operands; a quadrant's accumulators are a tuple in quad_mma's order.
+# Each extra is copied in the same commit group as its main block, so the pipeline's
+# wait counts are the power-of-two tile's.
+# ---------------------------------------------------------------------------------
+
+# The MFMA layout's warps (rows, columns). The partials' 32x32 block (MFMA_BLOCK_DIM)
+# is the 2 x 2 warps' 16x16 outputs, so every partial map assumes [2, 2].
+MFMA_WARPS_MN = gl.constexpr([2, 2])
+assert MFMA_WARPS_MN.value == [2, 2], "the partial maps assume 2 x 2 MFMA warps"
+
+MFMA_LAYOUT = gl.amd.AMDMFMALayout(
+    version=4,
+    instr_shape=[16, 16, 32],
+    transposed=True,
+    warps_per_cta=MFMA_WARPS_MN.value,
+)
+
+
+@constexpr_function
+def half_size(side, first):
+    """Rows (columns) of a side's first half."""
+    return first if first > 0 else side // 2
+
+
+@constexpr_function
+def half_blocks(side, first, second):
+    """Rows (columns) of the blocks of a side's first half, or its second: the
+    power-of-two main block, then the extra if any."""
+    top = half_size(side, first)
+    n = side - top if second else top
+    main = 1 << (n.bit_length() - 1)
+    return (main,) if n == main else (main, n - main)
+
+
+@constexpr_function
+def block_starts(blocks, base):
+    """First row (column) of each block of a half that starts at base."""
+    out, start = [], base
+    for b in blocks:
+        out.append(start)
+        start += b
+    return tuple(out)
+
+
+@constexpr_function
+def is_uneven(block_m, top_m, block_n, left_n):
+    """True unless both sides have two equal power-of-two halves."""
+    return (
+        len(half_blocks(block_m, top_m, False)) > 1
+        or half_blocks(block_m, top_m, False) != half_blocks(block_m, top_m, True)
+        or len(half_blocks(block_n, left_n, False)) > 1
+        or half_blocks(block_n, left_n, False) != half_blocks(block_n, left_n, True)
+    )
+
+
+@constexpr_function
+def operand_shared_layout(operand, rows, block_k, dtype):
+    """The padded shared layout of one operand block: A's [rows, BLOCK_K] (operand 0)
+    or B's [BLOCK_K, rows] (operand 1)."""
+    dot = gl.DotOperandLayout(operand_index=operand, parent=MFMA_LAYOUT, k_width=8)
+    shape = [rows, block_k] if operand == 0 else [block_k, rows]
+    return ttgl_cdna4.compute_efficient_padded_shared_layout(dot, shape, dtype)
+
+
+@constexpr_function
+def operand_load_layout(operand, rows, block_k, dtype, num_warps):
+    """The global-load layout of one operand block (compute_gload_layout)."""
+    return compute_gload_layout(
+        operand_shared_layout(operand, rows, block_k, dtype), 8, num_warps
+    )
+
+
+@constexpr_function
+def tile_blocks(block_m, top_m, block_n, left_n, field):
+    """One field of every accumulator block of a tile, in slot order (the order the
+    partials are stored in): quadrants tl, bl, tr, br, each in quad_mma's order, with
+    the one-block (32x32) blocks moved to the end so that 16-bit partials can pair them. Fields:
+    "q" quadrant, "k" index in the quadrant's tuple, "r0" / "c0" first row / column
+    in the tile, "rows" / "cols", "off" first element in the slot, "vq" 32x32 blocks."""
+    halves_m = (
+        (half_blocks(block_m, top_m, False), 0),
+        (half_blocks(block_m, top_m, True), half_size(block_m, top_m)),
+    )
+    halves_n = (
+        (half_blocks(block_n, left_n, False), 0),
+        (half_blocks(block_n, left_n, True), half_size(block_n, left_n)),
+    )
+    blocks = []
+    for q in range(4):
+        rows, r_base = halves_m[q % 2]
+        cols, c_base = halves_n[q // 2]
+        r0s, c0s = block_starts(rows, r_base), block_starts(cols, c_base)
+        for j in range(len(cols)):
+            for i in range(len(rows)):
+                blocks.append(
+                    {
+                        "q": q,
+                        "k": i + len(rows) * j,
+                        "r0": r0s[i],
+                        "c0": c0s[j],
+                        "rows": rows[i],
+                        "cols": cols[j],
+                        "vq": rows[i] * cols[j] // 1024,
+                    }
+                )
+    blocks = [b for b in blocks if b["vq"] > 1] + [b for b in blocks if b["vq"] == 1]
+    off = 0
+    for b in blocks:
+        b["off"] = off
+        off += b["rows"] * b["cols"]
+    return tuple(b[field] for b in blocks)
+
+
+@gluon.jit
+def quad_mma(a, b, acc):
+    """A quadrant's MFMAs. a, b: its A and B halves' blocks (main[, extra]); block
+    (i, j) accumulates in acc[i + len(a) * j]."""
+    out = ()
+    for j in gl.static_range(len(b)):
+        for i in gl.static_range(len(a)):
+            out = out + (
+                gl.amd.cdna3.mfma(a[i], b[j], acc[i + len(a) * j], cd_regclass="a"),
+            )
+    return out
+
+
+@gluon.jit
+def read_half(smem, idx, layout: gl.constexpr):
+    """A half's blocks from LDS buffer idx, main then extra."""
+    out = ()
+    for j in gl.static_range(len(smem)):
+        out = out + (smem[j].index(idx).load(layout),)
+    return out
+
+
+@gluon.jit
+def copy_half(smem, idx, base, offs, masks=None):
+    """A half's async copies into LDS buffer idx; masks: one per block, or None."""
+    for j in gl.static_range(len(smem)):
+        if masks is None:
+            gl.amd.cdna4.async_copy.buffer_load_to_shared(
+                smem[j].index(idx), base, offs[j]
+            )
+        else:
+            gl.amd.cdna4.async_copy.buffer_load_to_shared(
+                smem[j].index(idx), base, offs[j], mask=masks[j]
+            )
+
+
+@gluon.jit
+def operand_smem(
+    a_dtype: gl.constexpr,
+    b_dtype: gl.constexpr,
+    BLOCK_M: gl.constexpr,
+    TOP_M: gl.constexpr,
+    BLOCK_N: gl.constexpr,
+    LEFT_N: gl.constexpr,
+    BLOCK_K: gl.constexpr,
+    NBUF: gl.constexpr,
+):
+    """The tile's LDS buffers, (A top, A bottom, B left, B right), each a tuple of
+    blocks."""
+    return (
+        half_smem(a_dtype, half_blocks(BLOCK_M, TOP_M, False), BLOCK_K, NBUF, 0),
+        half_smem(a_dtype, half_blocks(BLOCK_M, TOP_M, True), BLOCK_K, NBUF, 0),
+        half_smem(b_dtype, half_blocks(BLOCK_N, LEFT_N, False), BLOCK_K, NBUF, 1),
+        half_smem(b_dtype, half_blocks(BLOCK_N, LEFT_N, True), BLOCK_K, NBUF, 1),
+    )
+
+
+@gluon.jit
+def half_smem(
+    dtype: gl.constexpr,
+    BLOCKS: gl.constexpr,
+    BLOCK_K: gl.constexpr,
+    NBUF: gl.constexpr,
+    OPERAND: gl.constexpr,
+):
+    """A half's LDS buffers, one per block: A's [NBUF, rows, BLOCK_K] or B's
+    [NBUF, BLOCK_K, cols]."""
+    out = ()
+    for i in gl.static_range(len(BLOCKS)):
+        if OPERAND == 0:
+            out = out + (
+                gl.allocate_shared_memory(
+                    dtype,
+                    [NBUF, BLOCKS[i], BLOCK_K],
+                    operand_shared_layout(0, BLOCKS[i], BLOCK_K, dtype),
+                ),
+            )
+        else:
+            out = out + (
+                gl.allocate_shared_memory(
+                    dtype,
+                    [NBUF, BLOCK_K, BLOCKS[i]],
+                    operand_shared_layout(1, BLOCKS[i], BLOCK_K, dtype),
+                ),
+            )
+    return out
+
+
+@gluon.jit
+def half_offsets(
+    ROWS: gl.constexpr,
+    R0S: gl.constexpr,
+    stride_r,
+    stride_k,
+    lim,
+    BLOCK_K: gl.constexpr,
+    dtype: gl.constexpr,
+    OPERAND: gl.constexpr,
+    CLAMP: gl.constexpr,
+):
+    """Load offsets of a half's blocks: A's [rows, BLOCK_K] (OPERAND 0) or B's
+    [BLOCK_K, cols] (OPERAND 1), the block's rows (columns) R0S[i] .. + ROWS[i]
+    relative to the half's base. CLAMP: rows past lim (the tile's last row inside the
+    matrix, relative to the same base) are clamped to it (clamped_a_offsets)."""
+    out = ()
+    for i in gl.static_range(len(ROWS)):
+        out = out + (
+            block_offsets(
+                ROWS[i], R0S[i], stride_r, stride_k, lim, BLOCK_K, dtype, OPERAND, CLAMP
+            ),
+        )
+    return out
+
+
+@gluon.jit
+def block_offsets(
+    ROWS: gl.constexpr,
+    R0: gl.constexpr,
+    stride_r,
+    stride_k,
+    lim,
+    BLOCK_K: gl.constexpr,
+    dtype: gl.constexpr,
+    OPERAND: gl.constexpr,
+    CLAMP: gl.constexpr,
+):
+    """half_offsets of one block."""
+    layout: gl.constexpr = operand_load_layout(
+        OPERAND, ROWS, BLOCK_K, dtype, gl.num_warps()
+    )
+    if OPERAND == 0:
+        r = gl.arange(0, ROWS, gl.SliceLayout(1, layout))
+        k = gl.arange(0, BLOCK_K, gl.SliceLayout(0, layout))
+    else:
+        r = gl.arange(0, ROWS, gl.SliceLayout(0, layout))
+        k = gl.arange(0, BLOCK_K, gl.SliceLayout(1, layout))
+    if R0 > 0:
+        r = r + R0
+    if CLAMP:
+        r = gl.minimum(r, lim)
+    rt = gl.multiple_of(r * stride_r, 8)
+    if OPERAND == 0:
+        offs = rt[:, None] + k[None, :] * stride_k
+    else:
+        offs = k[:, None] * stride_k + rt[None, :]
+    return offs
+
+
+@gluon.jit
+def operand_offsets(
+    BLOCK_M: gl.constexpr,
+    TOP_M: gl.constexpr,
+    BLOCK_N: gl.constexpr,
+    LEFT_N: gl.constexpr,
+    BLOCK_K: gl.constexpr,
+    stride_am,
+    stride_ak,
+    stride_bk,
+    stride_bn,
+    a_dtype: gl.constexpr,
+    b_dtype: gl.constexpr,
+):
+    """kofs of an uneven tile on an even M and N: (A top offsets, A bottom offsets,
+    A bottom shift, B left offsets, B right offsets, B right shift). The second half
+    loads from base + shift + its offsets, the shift (the first half's rows) in the
+    scalar base; equal halves share one offset tuple, as a power-of-two tile does."""
+    TOPS: gl.constexpr = half_blocks(BLOCK_M, TOP_M, False)
+    BOTS: gl.constexpr = half_blocks(BLOCK_M, TOP_M, True)
+    LEFTS: gl.constexpr = half_blocks(BLOCK_N, LEFT_N, False)
+    RIGHTS: gl.constexpr = half_blocks(BLOCK_N, LEFT_N, True)
+    a_top = half_offsets(
+        TOPS, block_starts(TOPS, 0), stride_am, stride_ak, 0, BLOCK_K, a_dtype, 0, False
+    )
+    a_bot = a_top
+    if BOTS != TOPS:
+        a_bot = half_offsets(
+            BOTS,
+            block_starts(BOTS, 0),
+            stride_am,
+            stride_ak,
+            0,
+            BLOCK_K,
+            a_dtype,
+            0,
+            False,
+        )
+    b_left = half_offsets(
+        LEFTS,
+        block_starts(LEFTS, 0),
+        stride_bn,
+        stride_bk,
+        0,
+        BLOCK_K,
+        b_dtype,
+        1,
+        False,
+    )
+    b_right = b_left
+    if RIGHTS != LEFTS:
+        b_right = half_offsets(
+            RIGHTS,
+            block_starts(RIGHTS, 0),
+            stride_bn,
+            stride_bk,
+            0,
+            BLOCK_K,
+            b_dtype,
+            1,
+            False,
+        )
+    return (
+        a_top,
+        a_bot,
+        half_size(BLOCK_M, TOP_M) * stride_am,
+        b_left,
+        b_right,
+        half_size(BLOCK_N, LEFT_N) * stride_bn,
     )
 
 
@@ -389,6 +735,10 @@ def _gemm_a16w16_streamk_kernel(
     TAIL_BLOCK_N: gl.constexpr = 0,
     TAIL_EVEN_M: gl.constexpr = True,
     TAIL_EVEN_N: gl.constexpr = True,
+    TOP_M: gl.constexpr = 0,
+    LEFT_N: gl.constexpr = 0,
+    TAIL_TOP_M: gl.constexpr = 0,
+    TAIL_LEFT_N: gl.constexpr = 0,
 ):
     """
     Persistent full tiles followed by a uniform or end-to-end tail, on a
@@ -420,6 +770,11 @@ def _gemm_a16w16_streamk_kernel(
 
     P is fp32, or typed like C for 16-bit partials (is_16bit_partial), stored in pairs
     of blocks (pair_layout); their sums stay fp32.
+
+    TOP_M / LEFT_N (0: BLOCK_M / 2, BLOCK_N / 2): the rows of the tile's top half and
+    the columns of its left half. A half that is not a power of two is a power-of-two
+    block plus an extra block of 32 or 64 (uneven halves; see "Tile geometry").
+    TAIL_TOP_M / TAIL_LEFT_N are the dp_sub sub-tile's.
     """
     gl.static_assert(
         p_ptr.dtype.element_ty == gl.float32
@@ -446,54 +801,83 @@ def _gemm_a16w16_streamk_kernel(
     dotOpLayoutB: gl.constexpr = gl.DotOperandLayout(
         operand_index=1, parent=mfmaLayout, k_width=8
     )
-    sharedLayoutA: gl.constexpr = ttgl_cdna4.compute_efficient_padded_shared_layout(
-        dotOpLayoutA, [BLOCK_M // 2, BLOCK_K], a_ptr.dtype.element_ty
-    )
-    sharedLayoutB: gl.constexpr = ttgl_cdna4.compute_efficient_padded_shared_layout(
-        dotOpLayoutB, [BLOCK_K, BLOCK_N // 2], b_ptr.dtype.element_ty
-    )
-    gLoadLayoutA: gl.constexpr = compute_gload_layout(sharedLayoutA, 8, gl.num_warps())
-    gLoadLayoutB: gl.constexpr = compute_gload_layout(sharedLayoutB, 8, gl.num_warps())
-
+    UNEVEN: gl.constexpr = is_uneven(BLOCK_M, TOP_M, BLOCK_N, LEFT_N)
+    a_dtype: gl.constexpr = a_ptr.dtype.element_ty
+    b_dtype: gl.constexpr = b_ptr.dtype.element_ty
     nBuffers: gl.constexpr = 2
-    smemA_top = gl.allocate_shared_memory(
-        a_ptr.dtype.element_ty, [nBuffers, BLOCK_M // 2, BLOCK_K], sharedLayoutA
-    )
-    smemA_bot = gl.allocate_shared_memory(
-        a_ptr.dtype.element_ty, [nBuffers, BLOCK_M // 2, BLOCK_K], sharedLayoutA
-    )
-    smemB_left = gl.allocate_shared_memory(
-        b_ptr.dtype.element_ty, [nBuffers, BLOCK_K, BLOCK_N // 2], sharedLayoutB
-    )
-    smemB_right = gl.allocate_shared_memory(
-        b_ptr.dtype.element_ty, [nBuffers, BLOCK_K, BLOCK_N // 2], sharedLayoutB
-    )
-    smem = (smemA_top, smemA_bot, smemB_left, smemB_right)
+    if UNEVEN:
+        smem = operand_smem(
+            a_dtype, b_dtype, BLOCK_M, TOP_M, BLOCK_N, LEFT_N, BLOCK_K, nBuffers
+        )
+        kofs6 = operand_offsets(
+            BLOCK_M,
+            TOP_M,
+            BLOCK_N,
+            LEFT_N,
+            BLOCK_K,
+            stride_am,
+            stride_ak,
+            stride_bk,
+            stride_bn,
+            a_dtype,
+            b_dtype,
+        )
+        kofs = ((kofs6[0], kofs6[1], kofs6[2]), (kofs6[3], kofs6[4], kofs6[5]))
+    else:
+        sharedLayoutA: gl.constexpr = ttgl_cdna4.compute_efficient_padded_shared_layout(
+            dotOpLayoutA, [BLOCK_M // 2, BLOCK_K], a_ptr.dtype.element_ty
+        )
+        sharedLayoutB: gl.constexpr = ttgl_cdna4.compute_efficient_padded_shared_layout(
+            dotOpLayoutB, [BLOCK_K, BLOCK_N // 2], b_ptr.dtype.element_ty
+        )
+        gLoadLayoutA: gl.constexpr = compute_gload_layout(
+            sharedLayoutA, 8, gl.num_warps()
+        )
+        gLoadLayoutB: gl.constexpr = compute_gload_layout(
+            sharedLayoutB, 8, gl.num_warps()
+        )
 
-    offs_am = gl.arange(0, BLOCK_M // 2, gl.SliceLayout(1, gLoadLayoutA))
-    offs_ak = gl.arange(0, BLOCK_K, gl.SliceLayout(0, gLoadLayoutA))
+        smemA_top = gl.allocate_shared_memory(
+            a_ptr.dtype.element_ty, [nBuffers, BLOCK_M // 2, BLOCK_K], sharedLayoutA
+        )
+        smemA_bot = gl.allocate_shared_memory(
+            a_ptr.dtype.element_ty, [nBuffers, BLOCK_M // 2, BLOCK_K], sharedLayoutA
+        )
+        smemB_left = gl.allocate_shared_memory(
+            b_ptr.dtype.element_ty, [nBuffers, BLOCK_K, BLOCK_N // 2], sharedLayoutB
+        )
+        smemB_right = gl.allocate_shared_memory(
+            b_ptr.dtype.element_ty, [nBuffers, BLOCK_K, BLOCK_N // 2], sharedLayoutB
+        )
+        smem = ((smemA_top,), (smemA_bot,), (smemB_left,), (smemB_right,))
 
-    offs_bn = gl.arange(0, BLOCK_N // 2, gl.SliceLayout(0, gLoadLayoutB))
-    offs_bk = gl.arange(0, BLOCK_K, gl.SliceLayout(1, gLoadLayoutB))
+        offs_am = gl.arange(0, BLOCK_M // 2, gl.SliceLayout(1, gLoadLayoutA))
+        offs_ak = gl.arange(0, BLOCK_K, gl.SliceLayout(0, gLoadLayoutA))
 
-    # Row and column terms of the offsets. The row strides are multiples of 8
-    # elements (the wrapper checks), which keeps every 8-element group of a row
-    # 16-byte aligned; the hint says so, because Triton's argument specialization
-    # only records strides that are multiples of 16.
-    a_rows_top = gl.multiple_of(offs_am * stride_am, 8)
-    b_cols_left = gl.multiple_of(offs_bn * stride_bn, 8)
+        offs_bn = gl.arange(0, BLOCK_N // 2, gl.SliceLayout(0, gLoadLayoutB))
+        offs_bk = gl.arange(0, BLOCK_K, gl.SliceLayout(1, gLoadLayoutB))
 
-    # One half-tile offset tensor per operand, shared by both halves: the bottom /
-    # right half (a_bot_shift / b_right_shift) and the odd K-step (BLOCK_K *
-    # stride_ak / stride_bk) are shifts in the scalar base; a ragged tile replaces
-    # them with its clamped offsets (a_load_addressing). Offsets are relative to the
-    # tile, whose base is 64-bit.
-    a_offsets = a_rows_top[:, None] + offs_ak[None, :] * stride_ak
-    b_offsets = offs_bk[:, None] * stride_bk + b_cols_left[None, :]
+        # Row and column terms of the offsets. The row strides are multiples of 8
+        # elements (the wrapper checks), which keeps every 8-element group of a row
+        # 16-byte aligned; the hint says so, because Triton's argument specialization
+        # only records strides that are multiples of 16.
+        a_rows_top = gl.multiple_of(offs_am * stride_am, 8)
+        b_cols_left = gl.multiple_of(offs_bn * stride_bn, 8)
 
-    a_bot_shift = BLOCK_M // 2 * stride_am
-    b_right_shift = BLOCK_N // 2 * stride_bn
-    kofs = (a_offsets, a_bot_shift, b_offsets, b_right_shift)
+        # One half-tile offset tensor per operand, shared by both halves: the bottom /
+        # right half (a_bot_shift / b_right_shift) and the odd K-step (BLOCK_K *
+        # stride_ak / stride_bk) are shifts in the scalar base; a ragged tile replaces
+        # them with its clamped offsets (a_load_addressing). Offsets are relative to the
+        # tile, whose base is 64-bit.
+        a_offsets = a_rows_top[:, None] + offs_ak[None, :] * stride_ak
+        b_offsets = offs_bk[:, None] * stride_bk + b_cols_left[None, :]
+
+        a_bot_shift = BLOCK_M // 2 * stride_am
+        b_right_shift = BLOCK_N // 2 * stride_bn
+        kofs = (
+            ((a_offsets,), (a_offsets,), a_bot_shift),
+            ((b_offsets,), (b_offsets,), b_right_shift),
+        )
 
     # A ragged K is virtually padded to whole K-step pairs; every tile runs its last
     # pair first (on a ragged K partial and masked), so the other pairs stay aligned to
@@ -557,27 +941,27 @@ def _gemm_a16w16_streamk_kernel(
         b_first = b_ptr + first_n.to(gl.int64) * BLOCK_N * stride_bn
         a_addr = a_load_addressing(
             first_m,
-            a_offsets,
-            a_bot_shift,
+            kofs[0],
             M,
             stride_am,
             stride_ak,
             BLOCK_M,
             BLOCK_K,
-            gLoadLayoutA,
             EVEN_M,
+            a_dtype,
+            TOP_M,
         )
         b_addr = b_load_addressing(
             first_n,
-            b_offsets,
-            b_right_shift,
+            kofs[1],
             N,
             stride_bk,
             stride_bn,
             BLOCK_N,
             BLOCK_K,
-            gLoadLayoutB,
             EVEN_N,
+            b_dtype,
+            LEFT_N,
         )
         if EVEN_K:
             mask_a0, mask_b0, mask_a1, mask_b1 = None, None, None, None
@@ -588,9 +972,11 @@ def _gemm_a16w16_streamk_kernel(
                 BLOCK_M,
                 BLOCK_N,
                 BLOCK_K,
-                gLoadLayoutA,
-                gLoadLayoutB,
+                a_dtype,
+                b_dtype,
                 True,
+                TOP_M,
+                LEFT_N,
             )
         a_top, b_left = load_first_pair(
             a_first + (K_PAD - 2 * BLOCK_K) * stride_ak,
@@ -630,8 +1016,6 @@ def _gemm_a16w16_streamk_kernel(
                 GROUP_SIZE_M,
                 ADD_BIAS,
                 mfmaLayout,
-                gLoadLayoutA,
-                gLoadLayoutB,
                 EVEN_M,
                 EVEN_N,
                 EVEN_K,
@@ -639,6 +1023,8 @@ def _gemm_a16w16_streamk_kernel(
                 total_full_tiles,
                 sk_target,
                 SK_PREFETCH,
+                TOP_M,
+                LEFT_N,
             )
 
     # The Stream-K phase picks up the last trip's prefetch.
@@ -702,8 +1088,8 @@ def _gemm_a16w16_streamk_kernel(
                 NUM_PROGRAMS,
                 NUM_XCDS,
                 mfmaLayout,
-                gLoadLayoutA,
-                gLoadLayoutB,
+                TOP_M,
+                LEFT_N,
                 EVEN_M,
                 EVEN_N,
                 EVEN_K,
@@ -761,8 +1147,8 @@ def _gemm_a16w16_streamk_kernel(
                 NUM_PROGRAMS,
                 NUM_XCDS,
                 mfmaLayout,
-                gLoadLayoutA,
-                gLoadLayoutB,
+                TOP_M,
+                LEFT_N,
                 EVEN_M,
                 EVEN_N,
                 EVEN_K,
@@ -789,6 +1175,33 @@ def _gemm_a16w16_streamk_kernel(
             # phase's LDS, so every wave's last reads and copies there must be done.
             if HAS_FULL:
                 drain_and_barrier()
+        TAIL_UNEVEN: gl.constexpr = SUBTILE and is_uneven(
+            TBM, TAIL_TOP_M, TBN, TAIL_LEFT_N
+        )
+        if TAIL_UNEVEN:
+            tail_smem = operand_smem(
+                a_dtype, b_dtype, TBM, TAIL_TOP_M, TBN, TAIL_LEFT_N, BLOCK_K, nBuffers
+            )
+            tail_kofs6 = operand_offsets(
+                TBM,
+                TAIL_TOP_M,
+                TBN,
+                TAIL_LEFT_N,
+                BLOCK_K,
+                stride_am,
+                stride_ak,
+                stride_bk,
+                stride_bn,
+                a_dtype,
+                b_dtype,
+            )
+            tail_kofs = (
+                (tail_kofs6[0], tail_kofs6[1], tail_kofs6[2]),
+                (tail_kofs6[3], tail_kofs6[4], tail_kofs6[5]),
+            )
+            UNIT_EVEN_M: gl.constexpr = TAIL_EVEN_M
+            UNIT_EVEN_N: gl.constexpr = TAIL_EVEN_N
+        elif SUBTILE:
             tailSharedA: gl.constexpr = (
                 ttgl_cdna4.compute_efficient_padded_shared_layout(
                     dotOpLayoutA, [TBM // 2, BLOCK_K], a_ptr.dtype.element_ty
@@ -806,36 +1219,55 @@ def _gemm_a16w16_streamk_kernel(
                 tailSharedB, 8, gl.num_warps()
             )
             tail_smem = (
-                gl.allocate_shared_memory(
-                    a_ptr.dtype.element_ty, [nBuffers, TBM // 2, BLOCK_K], tailSharedA
+                (
+                    gl.allocate_shared_memory(
+                        a_ptr.dtype.element_ty,
+                        [nBuffers, TBM // 2, BLOCK_K],
+                        tailSharedA,
+                    ),
                 ),
-                gl.allocate_shared_memory(
-                    a_ptr.dtype.element_ty, [nBuffers, TBM // 2, BLOCK_K], tailSharedA
+                (
+                    gl.allocate_shared_memory(
+                        a_ptr.dtype.element_ty,
+                        [nBuffers, TBM // 2, BLOCK_K],
+                        tailSharedA,
+                    ),
                 ),
-                gl.allocate_shared_memory(
-                    b_ptr.dtype.element_ty, [nBuffers, BLOCK_K, TBN // 2], tailSharedB
+                (
+                    gl.allocate_shared_memory(
+                        b_ptr.dtype.element_ty,
+                        [nBuffers, BLOCK_K, TBN // 2],
+                        tailSharedB,
+                    ),
                 ),
-                gl.allocate_shared_memory(
-                    b_ptr.dtype.element_ty, [nBuffers, BLOCK_K, TBN // 2], tailSharedB
+                (
+                    gl.allocate_shared_memory(
+                        b_ptr.dtype.element_ty,
+                        [nBuffers, BLOCK_K, TBN // 2],
+                        tailSharedB,
+                    ),
                 ),
             )
             tail_am = gl.arange(0, TBM // 2, gl.SliceLayout(1, tailLoadA))
             tail_ak = gl.arange(0, BLOCK_K, gl.SliceLayout(0, tailLoadA))
             tail_bn = gl.arange(0, TBN // 2, gl.SliceLayout(0, tailLoadB))
             tail_bk = gl.arange(0, BLOCK_K, gl.SliceLayout(1, tailLoadB))
-            tail_kofs = (
+            tail_a = (
                 gl.multiple_of(tail_am * stride_am, 8)[:, None]
-                + tail_ak[None, :] * stride_ak,
-                TBM // 2 * stride_am,
+                + tail_ak[None, :] * stride_ak
+            )
+            tail_a_shift = TBM // 2 * stride_am
+            tail_b = (
                 tail_bk[:, None] * stride_bk
-                + gl.multiple_of(tail_bn * stride_bn, 8)[None, :],
-                TBN // 2 * stride_bn,
+                + gl.multiple_of(tail_bn * stride_bn, 8)[None, :]
+            )
+            tail_kofs = (
+                ((tail_a,), (tail_a,), tail_a_shift),
+                ((tail_b,), (tail_b,), TBN // 2 * stride_bn),
             )
             UNIT_EVEN_M: gl.constexpr = TAIL_EVEN_M
             UNIT_EVEN_N: gl.constexpr = TAIL_EVEN_N
         else:
-            tailLoadA: gl.constexpr = gLoadLayoutA
-            tailLoadB: gl.constexpr = gLoadLayoutB
             tail_smem = smem
             tail_kofs = kofs
             UNIT_EVEN_M: gl.constexpr = EVEN_M
@@ -844,7 +1276,9 @@ def _gemm_a16w16_streamk_kernel(
         # idle programs join each tile (rs_readers); otherwise with its own.
         RS_ALL: gl.constexpr = REDUCE_SCATTER and not L2
         # 16-bit readers read whole pairs of blocks.
-        RS_MAX: gl.constexpr = NBLK // 2 if is_16bit_partial(p_ptr) else NBLK
+        RS_MAX: gl.constexpr = pow2_floor(
+            NBLK // 2 if is_16bit_partial(p_ptr) else NBLK
+        )
         if RS_ALL and RS_E > 0:
             gl.static_assert(RS_R == TAIL_SPLIT_K + RS_E and RS_R <= RS_MAX)
         else:
@@ -886,7 +1320,11 @@ def _gemm_a16w16_streamk_kernel(
         if active:
             is_partial = (j != 0).to(gl.int32)
             n_peers = (TAIL_SPLIT_K - 1) * (1 - is_partial)
-            OWNER_MAX_PEERS: gl.constexpr = TAIL_SPLIT_K - 1 if TAIL_SPLIT_K <= 8 else 0
+            OWNER_MAX_PEERS: gl.constexpr = (
+                TAIL_SPLIT_K - 1
+                if TAIL_SPLIT_K <= owner_unroll_max(BLOCK_M, BLOCK_N)
+                else 0
+            )
             quadrant_segment(
                 total_full_tiles * Q + t,
                 even_split_start(j, PAIRS_PER_TILE, TAIL_SPLIT_K) * 2,
@@ -922,8 +1360,8 @@ def _gemm_a16w16_streamk_kernel(
                 NUM_PROGRAMS,
                 NUM_XCDS,
                 mfmaLayout,
-                tailLoadA,
-                tailLoadB,
+                TAIL_TOP_M if SUBTILE else TOP_M,
+                TAIL_LEFT_N if SUBTILE else LEFT_N,
                 UNIT_EVEN_M,
                 UNIT_EVEN_N,
                 EVEN_K,
@@ -971,6 +1409,8 @@ def _gemm_a16w16_streamk_kernel(
                     EVEN_M,
                     EVEN_N,
                     BAR_STRIDE,
+                    TOP_M,
+                    LEFT_N,
                 )
 
 
@@ -1036,31 +1476,61 @@ def clamped_b_offsets(
 @gluon.jit
 def a_load_addressing(
     m_idx,
-    a_offsets,
-    a_bot_shift,
+    a_kofs,
     M,
     stride_am,
     stride_ak,
     BLOCK_M: gl.constexpr,
     BLOCK_K: gl.constexpr,
-    gLoadLayoutA: gl.constexpr,
     EVEN_M: gl.constexpr,
+    a_dtype: gl.constexpr,
+    TOP_M: gl.constexpr = 0,
 ):
-    """Tile m_idx's a_addr = (top_offs, bot_offs, bot_shift, odd_shift): the bottom
-    half loads from base + bot_shift + bot_offs and the odd K-step adds odd_shift.
-    EVEN_M: both halves share the half-tile offsets a_offsets. Otherwise the tile's
-    clamped offsets, which differ per lane, so bot_shift is 0."""
+    """Tile m_idx's a_addr = (top_offs, bot_offs, bot_shift, odd_shift), the offsets a
+    tuple per half (one per block): the bottom half loads from base + bot_shift +
+    bot_offs and the odd K-step adds odd_shift. EVEN_M: the tile-independent a_kofs =
+    (top_offs, bot_offs, bot_shift) (equal halves share their offsets). Otherwise
+    the tile's clamped offsets, which differ per lane, so bot_shift is 0."""
+    a_top, a_bot, a_bot_shift = a_kofs
     if EVEN_M:
-        top, bot, bot_shift = a_offsets, a_offsets, a_bot_shift
+        top, bot, bot_shift = a_top, a_bot, a_bot_shift
     else:
-        top, bot = clamped_a_offsets(
-            M - 1 - m_idx * BLOCK_M,
-            stride_am,
-            stride_ak,
-            BLOCK_M,
-            BLOCK_K,
-            gLoadLayoutA,
-        )
+        TOPS: gl.constexpr = half_blocks(BLOCK_M, TOP_M, False)
+        BOTS: gl.constexpr = half_blocks(BLOCK_M, TOP_M, True)
+        m_last = M - 1 - m_idx * BLOCK_M
+        if len(TOPS) == 1 and TOPS == BOTS:
+            t, b = clamped_a_offsets(
+                m_last,
+                stride_am,
+                stride_ak,
+                BLOCK_M,
+                BLOCK_K,
+                operand_load_layout(0, BLOCK_M // 2, BLOCK_K, a_dtype, gl.num_warps()),
+            )
+            top, bot = (t,), (b,)
+        else:
+            top = half_offsets(
+                TOPS,
+                block_starts(TOPS, 0),
+                stride_am,
+                stride_ak,
+                m_last,
+                BLOCK_K,
+                a_dtype,
+                0,
+                True,
+            )
+            bot = half_offsets(
+                BOTS,
+                block_starts(BOTS, half_size(BLOCK_M, TOP_M)),
+                stride_am,
+                stride_ak,
+                m_last,
+                BLOCK_K,
+                a_dtype,
+                0,
+                True,
+            )
         bot_shift = 0
     return top, bot, bot_shift, BLOCK_K * stride_ak
 
@@ -1068,29 +1538,58 @@ def a_load_addressing(
 @gluon.jit
 def b_load_addressing(
     n_idx,
-    b_offsets,
-    b_right_shift,
+    b_kofs,
     N,
     stride_bk,
     stride_bn,
     BLOCK_N: gl.constexpr,
     BLOCK_K: gl.constexpr,
-    gLoadLayoutB: gl.constexpr,
     EVEN_N: gl.constexpr,
+    b_dtype: gl.constexpr,
+    LEFT_N: gl.constexpr = 0,
 ):
     """Tile n_idx's b_addr = (left_offs, right_offs, right_shift, odd_shift)
     (a_load_addressing)."""
+    b_left, b_right, b_right_shift = b_kofs
     if EVEN_N:
-        left, right, right_shift = b_offsets, b_offsets, b_right_shift
+        left, right, right_shift = b_left, b_right, b_right_shift
     else:
-        left, right = clamped_b_offsets(
-            N - 1 - n_idx * BLOCK_N,
-            stride_bk,
-            stride_bn,
-            BLOCK_N,
-            BLOCK_K,
-            gLoadLayoutB,
-        )
+        LEFTS: gl.constexpr = half_blocks(BLOCK_N, LEFT_N, False)
+        RIGHTS: gl.constexpr = half_blocks(BLOCK_N, LEFT_N, True)
+        n_last = N - 1 - n_idx * BLOCK_N
+        if len(LEFTS) == 1 and LEFTS == RIGHTS:
+            lt, rt = clamped_b_offsets(
+                n_last,
+                stride_bk,
+                stride_bn,
+                BLOCK_N,
+                BLOCK_K,
+                operand_load_layout(1, BLOCK_N // 2, BLOCK_K, b_dtype, gl.num_warps()),
+            )
+            left, right = (lt,), (rt,)
+        else:
+            left = half_offsets(
+                LEFTS,
+                block_starts(LEFTS, 0),
+                stride_bn,
+                stride_bk,
+                n_last,
+                BLOCK_K,
+                b_dtype,
+                1,
+                True,
+            )
+            right = half_offsets(
+                RIGHTS,
+                block_starts(RIGHTS, half_size(BLOCK_N, LEFT_N)),
+                stride_bn,
+                stride_bk,
+                n_last,
+                BLOCK_K,
+                b_dtype,
+                1,
+                True,
+            )
         right_shift = 0
     return left, right, right_shift, BLOCK_K * stride_bk
 
@@ -1114,31 +1613,96 @@ def k_tail_mask(
 
 
 @gluon.jit
+def operand_k_masks(
+    k_hi,
+    STEP: gl.constexpr,
+    BLOCK_K: gl.constexpr,
+    SIDE: gl.constexpr,
+    FIRST: gl.constexpr,
+    dtype: gl.constexpr,
+    OPERAND: gl.constexpr,
+    NONE: gl.constexpr = False,
+):
+    """One operand's K-step STEP masks (k_tail_mask) as (first half, second half),
+    one per block; equal halves share theirs. NONE: constant all-false masks of the
+    blocks' full shapes."""
+    FIRSTS: gl.constexpr = half_blocks(SIDE, FIRST, False)
+    SECONDS: gl.constexpr = half_blocks(SIDE, FIRST, True)
+    first = half_k_masks(k_hi, STEP, BLOCK_K, FIRSTS, dtype, OPERAND, NONE)
+    if SECONDS == FIRSTS:
+        second = first
+    else:
+        second = half_k_masks(k_hi, STEP, BLOCK_K, SECONDS, dtype, OPERAND, NONE)
+    return first, second
+
+
+@gluon.jit
+def half_k_masks(
+    k_hi,
+    STEP: gl.constexpr,
+    BLOCK_K: gl.constexpr,
+    BLOCKS: gl.constexpr,
+    dtype: gl.constexpr,
+    OPERAND: gl.constexpr,
+    NONE: gl.constexpr,
+):
+    """operand_k_masks of one half."""
+    out = ()
+    for i in gl.static_range(len(BLOCKS)):
+        out = out + (
+            block_k_mask(k_hi, STEP, BLOCK_K, BLOCKS[i], dtype, OPERAND, NONE),
+        )
+    return out
+
+
+@gluon.jit
+def block_k_mask(
+    k_hi,
+    STEP: gl.constexpr,
+    BLOCK_K: gl.constexpr,
+    ROWS: gl.constexpr,
+    dtype: gl.constexpr,
+    OPERAND: gl.constexpr,
+    NONE: gl.constexpr,
+):
+    layout: gl.constexpr = operand_load_layout(
+        OPERAND, ROWS, BLOCK_K, dtype, gl.num_warps()
+    )
+    if NONE and OPERAND == 0:
+        m = gl.full([ROWS, BLOCK_K], 0, gl.int1, layout)
+    elif NONE:
+        m = gl.full([BLOCK_K, ROWS], 0, gl.int1, layout)
+    else:
+        m = k_tail_mask(k_hi, STEP, BLOCK_K, layout, OPERAND == 1)
+    return m
+
+
+@gluon.jit
 def tail_pair_masks(
     k_hi,
     K_RES: gl.constexpr,
     BLOCK_M: gl.constexpr,
     BLOCK_N: gl.constexpr,
     BLOCK_K: gl.constexpr,
-    gLoadLayoutA: gl.constexpr,
-    gLoadLayoutB: gl.constexpr,
+    a_dtype: gl.constexpr,
+    b_dtype: gl.constexpr,
     TAIL: gl.constexpr = False,
+    TOP_M: gl.constexpr = 0,
+    LEFT_N: gl.constexpr = 0,
 ):
     """(mask_a0, mask_b0, mask_a1, mask_b1) for load_first_pair of a pair whose first
-    k_hi K values are in the matrix. K-step 1 of the last pair always reaches past K,
+    k_hi K values are in the matrix, each (first half, second half) of per-block
+    masks (operand_k_masks). K-step 1 of the last pair always reaches past K,
     K-step 0 only when K_RES > BLOCK_K; a mask that can never drop a lane is None.
     TAIL: k_hi is the last pair's 2 BLOCK_K - K_RES, so with K_RES >= BLOCK_K K-step 1
     drops every lane and its masks are constant."""
     mask_a0, mask_b0 = None, None
     if K_RES > BLOCK_K:
-        mask_a0 = k_tail_mask(k_hi, 0, BLOCK_K, gLoadLayoutA, False)
-        mask_b0 = k_tail_mask(k_hi, 0, BLOCK_K, gLoadLayoutB, True)
-    if TAIL and K_RES >= BLOCK_K:
-        mask_a1 = gl.full([BLOCK_M // 2, BLOCK_K], 0, gl.int1, gLoadLayoutA)
-        mask_b1 = gl.full([BLOCK_K, BLOCK_N // 2], 0, gl.int1, gLoadLayoutB)
-    else:
-        mask_a1 = k_tail_mask(k_hi, 1, BLOCK_K, gLoadLayoutA, False)
-        mask_b1 = k_tail_mask(k_hi, 1, BLOCK_K, gLoadLayoutB, True)
+        mask_a0 = operand_k_masks(k_hi, 0, BLOCK_K, BLOCK_M, TOP_M, a_dtype, 0)
+        mask_b0 = operand_k_masks(k_hi, 0, BLOCK_K, BLOCK_N, LEFT_N, b_dtype, 1)
+    CONST: gl.constexpr = TAIL and K_RES >= BLOCK_K
+    mask_a1 = operand_k_masks(k_hi, 1, BLOCK_K, BLOCK_M, TOP_M, a_dtype, 0, CONST)
+    mask_b1 = operand_k_masks(k_hi, 1, BLOCK_K, BLOCK_N, LEFT_N, b_dtype, 1, CONST)
     return mask_a0, mask_b0, mask_a1, mask_b1
 
 
@@ -1158,56 +1722,51 @@ def load_first_pair(
 ):
     """Prologue: the two K-steps at a_base / b_base into buffers 0 and 1,
     and the first one's a_top / b_left. mask_*: load masks of A's and B's K-step 0 and
-    1 (ragged K), None for unmasked."""
+    1 (ragged K), (first half, second half) of per-block masks (tail_pair_masks), None
+    for unmasked."""
     smemA_top, smemA_bot, smemB_left, smemB_right = smem
     a_top_offsets, a_bot_offsets, a_bot_shift, a_odd_shift = a_addr
     b_left_offsets, b_right_offsets, b_right_shift, b_odd_shift = b_addr
+    ma0_t, ma0_b, mb0_l, mb0_r = None, None, None, None
+    ma1_t, ma1_b, mb1_l, mb1_r = None, None, None, None
+    if mask_a0 is not None:
+        ma0_t, ma0_b = mask_a0
+        mb0_l, mb0_r = mask_b0
+    if mask_a1 is not None:
+        ma1_t, ma1_b = mask_a1
+        mb1_l, mb1_r = mask_b1
 
     g_idx = 0
-    gl.amd.cdna4.async_copy.buffer_load_to_shared(
-        smemB_left.index(g_idx), b_base, b_left_offsets, mask=mask_b0
-    )
+    copy_half(smemB_left, g_idx, b_base, b_left_offsets, mb0_l)
     gl.amd.cdna4.async_copy.commit_group()
-    gl.amd.cdna4.async_copy.buffer_load_to_shared(
-        smemA_top.index(g_idx), a_base, a_top_offsets, mask=mask_a0
-    )
+    copy_half(smemA_top, g_idx, a_base, a_top_offsets, ma0_t)
     gl.amd.cdna4.async_copy.commit_group()
-    gl.amd.cdna4.async_copy.buffer_load_to_shared(
-        smemA_bot.index(g_idx), a_base + a_bot_shift, a_bot_offsets, mask=mask_a0
-    )
+    copy_half(smemA_bot, g_idx, a_base + a_bot_shift, a_bot_offsets, ma0_b)
     gl.amd.cdna4.async_copy.commit_group()
-    gl.amd.cdna4.async_copy.buffer_load_to_shared(
-        smemB_right.index(g_idx), b_base + b_right_shift, b_right_offsets, mask=mask_b0
-    )
+    copy_half(smemB_right, g_idx, b_base + b_right_shift, b_right_offsets, mb0_r)
     gl.amd.cdna4.async_copy.commit_group()
 
     g_idx = 1
-    gl.amd.cdna4.async_copy.buffer_load_to_shared(
-        smemB_left.index(g_idx), b_base + b_odd_shift, b_left_offsets, mask=mask_b1
+    copy_half(smemB_left, g_idx, b_base + b_odd_shift, b_left_offsets, mb1_l)
+    gl.amd.cdna4.async_copy.commit_group()
+    copy_half(smemA_top, g_idx, a_base + a_odd_shift, a_top_offsets, ma1_t)
+    gl.amd.cdna4.async_copy.commit_group()
+    copy_half(
+        smemA_bot, g_idx, a_base + a_bot_shift + a_odd_shift, a_bot_offsets, ma1_b
     )
     gl.amd.cdna4.async_copy.commit_group()
-    gl.amd.cdna4.async_copy.buffer_load_to_shared(
-        smemA_top.index(g_idx), a_base + a_odd_shift, a_top_offsets, mask=mask_a1
-    )
-    gl.amd.cdna4.async_copy.commit_group()
-    gl.amd.cdna4.async_copy.buffer_load_to_shared(
-        smemA_bot.index(g_idx),
-        a_base + a_bot_shift + a_odd_shift,
-        a_bot_offsets,
-        mask=mask_a1,
-    )
-    gl.amd.cdna4.async_copy.commit_group()
-    gl.amd.cdna4.async_copy.buffer_load_to_shared(
-        smemB_right.index(g_idx),
+    copy_half(
+        smemB_right,
+        g_idx,
         b_base + b_right_shift + b_odd_shift,
         b_right_offsets,
-        mask=mask_b1,
+        mb1_r,
     )
     gl.amd.cdna4.async_copy.commit_group()
 
     gl.amd.cdna4.async_copy.wait_group(6)
-    b_left = smemB_left.index(0).load(dotOpLayoutB)
-    a_top = smemA_top.index(0).load(dotOpLayoutA)
+    b_left = read_half(smemB_left, 0, dotOpLayoutB)
+    a_top = read_half(smemA_top, 0, dotOpLayoutA)
     return a_top, b_left
 
 
@@ -1243,53 +1802,45 @@ def k_step_pair(
     ########################################
     ## Region 0: C_tl = DOT(a_top, b_left)
     ########################################
-    acc_tl = gl.amd.cdna3.mfma(a_top, b_left, acc_tl, cd_regclass="a")
+    acc_tl = quad_mma(a_top, b_left, acc_tl)
 
     gl.amd.cdna4.async_copy.wait_group(5)
-    a_bot = smemA_bot.index(0).load(dotOpLayoutA)
+    a_bot = read_half(smemA_bot, 0, dotOpLayoutA)
 
-    gl.amd.cdna4.async_copy.buffer_load_to_shared(
-        smemB_left.index(0), b_base, b_left_offsets
-    )
+    copy_half(smemB_left, 0, b_base, b_left_offsets)
     gl.amd.cdna4.async_copy.commit_group()
 
     ########################################
     ## Region 1: C_bl = DOT(a_bot, b_left)
     ########################################
-    acc_bl = gl.amd.cdna3.mfma(a_bot, b_left, acc_bl, cd_regclass="a")
+    acc_bl = quad_mma(a_bot, b_left, acc_bl)
 
     gl.amd.cdna4.async_copy.wait_group(5)
-    b_right = smemB_right.index(0).load(dotOpLayoutB)
+    b_right = read_half(smemB_right, 0, dotOpLayoutB)
 
-    gl.amd.cdna4.async_copy.buffer_load_to_shared(
-        smemA_top.index(0), a_base, a_top_offsets
-    )
+    copy_half(smemA_top, 0, a_base, a_top_offsets)
     gl.amd.cdna4.async_copy.commit_group()
 
     ########################################
     ## Region 2: C_tr = DOT(a_top, b_right)
     ########################################
-    acc_tr = gl.amd.cdna3.mfma(a_top, b_right, acc_tr, cd_regclass="a")
+    acc_tr = quad_mma(a_top, b_right, acc_tr)
 
     gl.amd.cdna4.async_copy.wait_group(5)
-    b_left = smemB_left.index(1).load(dotOpLayoutB)
+    b_left = read_half(smemB_left, 1, dotOpLayoutB)
 
-    gl.amd.cdna4.async_copy.buffer_load_to_shared(
-        smemA_bot.index(0), a_base + a_bot_shift, a_bot_offsets
-    )
+    copy_half(smemA_bot, 0, a_base + a_bot_shift, a_bot_offsets)
     gl.amd.cdna4.async_copy.commit_group()
 
     ########################################
     ## Region 3: C_br = DOT(a_bot, b_right)
     ########################################
-    acc_br = gl.amd.cdna3.mfma(a_bot, b_right, acc_br, cd_regclass="a")
+    acc_br = quad_mma(a_bot, b_right, acc_br)
 
     gl.amd.cdna4.async_copy.wait_group(5)
-    a_top = smemA_top.index(1).load(dotOpLayoutA)
+    a_top = read_half(smemA_top, 1, dotOpLayoutA)
 
-    gl.amd.cdna4.async_copy.buffer_load_to_shared(
-        smemB_right.index(0), b_base + b_right_shift, b_right_offsets
-    )
+    copy_half(smemB_right, 0, b_base + b_right_shift, b_right_offsets)
     gl.amd.cdna4.async_copy.commit_group()
 
     ## =============================================================
@@ -1301,56 +1852,48 @@ def k_step_pair(
     ## Region 0: C_tl = DOT(a_top, b_left)
     ########################################
     if not SKIP_ODD:
-        acc_tl = gl.amd.cdna3.mfma(a_top, b_left, acc_tl, cd_regclass="a")
+        acc_tl = quad_mma(a_top, b_left, acc_tl)
 
     gl.amd.cdna4.async_copy.wait_group(5)
-    a_bot = smemA_bot.index(1).load(dotOpLayoutA)
+    a_bot = read_half(smemA_bot, 1, dotOpLayoutA)
 
-    gl.amd.cdna4.async_copy.buffer_load_to_shared(
-        smemB_left.index(1), b_base + b_odd_shift, b_left_offsets
-    )
+    copy_half(smemB_left, 1, b_base + b_odd_shift, b_left_offsets)
     gl.amd.cdna4.async_copy.commit_group()
 
     ########################################
     ## Region 1: C_bl = DOT(a_bot, b_left)
     ########################################
     if not SKIP_ODD:
-        acc_bl = gl.amd.cdna3.mfma(a_bot, b_left, acc_bl, cd_regclass="a")
+        acc_bl = quad_mma(a_bot, b_left, acc_bl)
 
     gl.amd.cdna4.async_copy.wait_group(5)
-    b_right = smemB_right.index(1).load(dotOpLayoutB)
+    b_right = read_half(smemB_right, 1, dotOpLayoutB)
 
-    gl.amd.cdna4.async_copy.buffer_load_to_shared(
-        smemA_top.index(1), a_base + a_odd_shift, a_top_offsets
-    )
+    copy_half(smemA_top, 1, a_base + a_odd_shift, a_top_offsets)
     gl.amd.cdna4.async_copy.commit_group()
 
     ########################################
     ## Region 2: C_tr = DOT(a_top, b_right)
     ########################################
     if not SKIP_ODD:
-        acc_tr = gl.amd.cdna3.mfma(a_top, b_right, acc_tr, cd_regclass="a")
+        acc_tr = quad_mma(a_top, b_right, acc_tr)
 
     gl.amd.cdna4.async_copy.wait_group(5)
-    b_left = smemB_left.index(0).load(dotOpLayoutB)
+    b_left = read_half(smemB_left, 0, dotOpLayoutB)
 
-    gl.amd.cdna4.async_copy.buffer_load_to_shared(
-        smemA_bot.index(1), a_base + a_bot_shift + a_odd_shift, a_bot_offsets
-    )
+    copy_half(smemA_bot, 1, a_base + a_bot_shift + a_odd_shift, a_bot_offsets)
     gl.amd.cdna4.async_copy.commit_group()
 
     ########################################
     ## Region 3: C_br = DOT(a_bot, b_right)
     ########################################
     if not SKIP_ODD:
-        acc_br = gl.amd.cdna3.mfma(a_bot, b_right, acc_br, cd_regclass="a")
+        acc_br = quad_mma(a_bot, b_right, acc_br)
 
     gl.amd.cdna4.async_copy.wait_group(5)
-    a_top = smemA_top.index(0).load(dotOpLayoutA)
+    a_top = read_half(smemA_top, 0, dotOpLayoutA)
 
-    gl.amd.cdna4.async_copy.buffer_load_to_shared(
-        smemB_right.index(1), b_base + b_right_shift + b_odd_shift, b_right_offsets
-    )
+    copy_half(smemB_right, 1, b_base + b_right_shift + b_odd_shift, b_right_offsets)
     gl.amd.cdna4.async_copy.commit_group()
 
     return (acc_tl, acc_bl, acc_tr, acc_br), a_top, b_left
@@ -1364,28 +1907,45 @@ def init_acc(
     BLOCK_N: gl.constexpr,
     mfmaLayout: gl.constexpr,
     ADD_BIAS: gl.constexpr,
+    TOP_M: gl.constexpr = 0,
+    LEFT_N: gl.constexpr = 0,
 ):
-    """The four fp32 accumulators (tl, bl, tr, br) of a tile, starting from the tile's
-    bias[N] (or zero).
+    """The four fp32 accumulators (tl, bl, tr, br) of a tile, each a tuple of blocks
+    in quad_mma's order, starting from the tile's bias[N] (or zero).
 
     Adding the bias here rather than before the C stores keeps it out of the epilogue,
     where the stores already hold the register peak; the epilogue add spills. Without
     bias the accumulators are a constant zero, which a peeled first MFMA folds into an
     inline-0 C operand.
     """
-    acc_l = gl.zeros((BLOCK_M // 2, BLOCK_N // 2), gl.float32, mfmaLayout)
-    acc_r = acc_l
-    if ADD_BIAS:
-        # Scalar base + 32-bit lane offsets: no per-lane 64-bit addresses.
-        offs_bias = gl.arange(0, BLOCK_N // 2, gl.SliceLayout(0, mfmaLayout))
-        bias_base = bias_ptr + pid_n * BLOCK_N
-        bias_l = gl.amd.cdna3.buffer_load(ptr=bias_base, offsets=offs_bias)
-        bias_r = gl.amd.cdna3.buffer_load(
-            ptr=bias_base + BLOCK_N // 2, offsets=offs_bias
+    if is_uneven(BLOCK_M, TOP_M, BLOCK_N, LEFT_N):
+        tl, bl, tr, br = init_acc_blocks(
+            bias_ptr,
+            pid_n,
+            0,
+            BLOCK_M,
+            BLOCK_N,
+            TOP_M,
+            LEFT_N,
+            mfmaLayout,
+            ADD_BIAS,
+            True,
         )
-        acc_l = acc_l + bias_l.to(gl.float32)[None, :]
-        acc_r = acc_r + bias_r.to(gl.float32)[None, :]
-    return acc_l, acc_l, acc_r, acc_r
+    else:
+        acc_l = gl.zeros((BLOCK_M // 2, BLOCK_N // 2), gl.float32, mfmaLayout)
+        acc_r = acc_l
+        if ADD_BIAS:
+            # Scalar base + 32-bit lane offsets: no per-lane 64-bit addresses.
+            offs_bias = gl.arange(0, BLOCK_N // 2, gl.SliceLayout(0, mfmaLayout))
+            bias_base = bias_ptr + pid_n * BLOCK_N
+            bias_l = gl.amd.cdna3.buffer_load(ptr=bias_base, offsets=offs_bias)
+            bias_r = gl.amd.cdna3.buffer_load(
+                ptr=bias_base + BLOCK_N // 2, offsets=offs_bias
+            )
+            acc_l = acc_l + bias_l.to(gl.float32)[None, :]
+            acc_r = acc_r + bias_r.to(gl.float32)[None, :]
+        tl, bl, tr, br = (acc_l,), (acc_l,), (acc_r,), (acc_r,)
+    return tl, bl, tr, br
 
 
 @gluon.jit
@@ -1398,10 +1958,25 @@ def init_acc_edge(
     mfmaLayout: gl.constexpr,
     ADD_BIAS: gl.constexpr,
     EVEN_N: gl.constexpr,
+    TOP_M: gl.constexpr = 0,
+    LEFT_N: gl.constexpr = 0,
 ):
     """init_acc, with the bias loaded only for the tile's first n_left columns on a
     ragged N."""
-    if ADD_BIAS and not EVEN_N:
+    if is_uneven(BLOCK_M, TOP_M, BLOCK_N, LEFT_N):
+        tl, bl, tr, br = init_acc_blocks(
+            bias_ptr,
+            pid_n,
+            n_left,
+            BLOCK_M,
+            BLOCK_N,
+            TOP_M,
+            LEFT_N,
+            mfmaLayout,
+            ADD_BIAS,
+            EVEN_N,
+        )
+    elif ADD_BIAS and not EVEN_N:
         acc_l = gl.zeros((BLOCK_M // 2, BLOCK_N // 2), gl.float32, mfmaLayout)
         offs_bias = gl.arange(0, BLOCK_N // 2, gl.SliceLayout(0, mfmaLayout))
         bias_base = bias_ptr + pid_n * BLOCK_N
@@ -1416,12 +1991,375 @@ def init_acc_edge(
         )
         acc_r = acc_l + bias_r.to(gl.float32)[None, :]
         acc_l = acc_l + bias_l.to(gl.float32)[None, :]
-        tl, bl, tr, br = acc_l, acc_l, acc_r, acc_r
+        tl, bl, tr, br = (acc_l,), (acc_l,), (acc_r,), (acc_r,)
     else:
         tl, bl, tr, br = init_acc(
             bias_ptr, pid_n, BLOCK_M, BLOCK_N, mfmaLayout, ADD_BIAS
         )
     return tl, bl, tr, br
+
+
+@gluon.jit
+def init_acc_blocks(
+    bias_ptr,
+    pid_n,
+    n_left,
+    BLOCK_M: gl.constexpr,
+    BLOCK_N: gl.constexpr,
+    TOP_M: gl.constexpr,
+    LEFT_N: gl.constexpr,
+    mfmaLayout: gl.constexpr,
+    ADD_BIAS: gl.constexpr,
+    EVEN_N: gl.constexpr,
+):
+    """init_acc(_edge) of an uneven tile: each block from its column block's bias
+    (masked to the first n_left columns on a ragged N), or zero."""
+    TOPS: gl.constexpr = half_blocks(BLOCK_M, TOP_M, False)
+    BOTS: gl.constexpr = half_blocks(BLOCK_M, TOP_M, True)
+    LEFTS: gl.constexpr = half_blocks(BLOCK_N, LEFT_N, False)
+    RIGHTS: gl.constexpr = half_blocks(BLOCK_N, LEFT_N, True)
+    bias_l = half_bias(
+        bias_ptr,
+        pid_n,
+        n_left,
+        LEFTS,
+        block_starts(LEFTS, 0),
+        BLOCK_N,
+        mfmaLayout,
+        ADD_BIAS,
+        EVEN_N,
+    )
+    bias_r = half_bias(
+        bias_ptr,
+        pid_n,
+        n_left,
+        RIGHTS,
+        block_starts(RIGHTS, half_size(BLOCK_N, LEFT_N)),
+        BLOCK_N,
+        mfmaLayout,
+        ADD_BIAS,
+        EVEN_N,
+    )
+    tl = quad_init(TOPS, LEFTS, bias_l, mfmaLayout, ADD_BIAS)
+    bl = quad_init(BOTS, LEFTS, bias_l, mfmaLayout, ADD_BIAS)
+    tr = quad_init(TOPS, RIGHTS, bias_r, mfmaLayout, ADD_BIAS)
+    br = quad_init(BOTS, RIGHTS, bias_r, mfmaLayout, ADD_BIAS)
+    return tl, bl, tr, br
+
+
+@gluon.jit
+def half_bias(
+    bias_ptr,
+    pid_n,
+    n_left,
+    COLS: gl.constexpr,
+    C0S: gl.constexpr,
+    BLOCK_N: gl.constexpr,
+    mfmaLayout: gl.constexpr,
+    ADD_BIAS: gl.constexpr,
+    EVEN_N: gl.constexpr,
+):
+    """bias[N] of a column half's blocks in fp32 (an empty tuple without bias)."""
+    out = ()
+    if ADD_BIAS:
+        bias_base = bias_ptr + pid_n * BLOCK_N
+        for j in gl.static_range(len(COLS)):
+            offs = gl.arange(0, COLS[j], gl.SliceLayout(0, mfmaLayout))
+            if EVEN_N:
+                b = gl.amd.cdna3.buffer_load(ptr=bias_base + C0S[j], offsets=offs)
+            else:
+                b = gl.amd.cdna3.buffer_load(
+                    ptr=bias_base + C0S[j],
+                    offsets=offs,
+                    mask=offs < n_left - C0S[j],
+                    other=0.0,
+                )
+            out = out + (b.to(gl.float32),)
+    return out
+
+
+@gluon.jit
+def quad_init(
+    ROWS: gl.constexpr,
+    COLS: gl.constexpr,
+    bias,
+    mfmaLayout: gl.constexpr,
+    ADD_BIAS: gl.constexpr,
+):
+    """A quadrant's fp32 accumulator blocks in quad_mma's order, each its column
+    block's bias or zero."""
+    out = ()
+    for j in gl.static_range(len(COLS)):
+        for i in gl.static_range(len(ROWS)):
+            acc = gl.zeros((ROWS[i], COLS[j]), gl.float32, mfmaLayout)
+            if ADD_BIAS:
+                acc = acc + bias[j][None, :]
+            out = out + (acc,)
+    return out
+
+
+@gluon.jit
+def c_store_addressing(
+    c_ptr,
+    pid_m,
+    pid_n,
+    m_left,
+    n_left,
+    stride_cm,
+    stride_cn,
+    BLOCK_M: gl.constexpr,
+    BLOCK_N: gl.constexpr,
+    TOP_M: gl.constexpr,
+    LEFT_N: gl.constexpr,
+    CLAMP_ROWS: gl.constexpr,
+    MASKS: gl.constexpr,
+    EVEN_M: gl.constexpr,
+    EVEN_N: gl.constexpr,
+):
+    """C store addressing of a tile: (bases, offsets, masks), each (tl, bl, tr, br) of
+    per-block tuples in quad_mma's order. A block stores at bases[q][b] + offsets[q][b]
+    with the offsets' layout; masks (MASKS, on a ragged M or N; else empty tuples)
+    keep the rows and columns inside C.
+
+    The tile's row goes in the 64-bit scalar base, so the 32-bit offsets only span
+    BLOCK_M rows. Its column stays in the vector offsets, which keeps them
+    tile-dependent: the compiler can't hoist them above the tile loop and keep them
+    live (and spilled) through the K loop. The block shifts go in the scalar base too,
+    so blocks of one shape share one offset tensor (all four quadrants of a
+    power-of-two tile). CLAMP_ROWS: the rows are clamped to the tile's last one for
+    the same reason (only rows the store masks drop change). The row term carries the
+    loads' multiple_of hint and n_left is hinted a multiple of 8 (the wrapper checks
+    N), so each thread's 8-column group keeps one predicate and one 16-byte store when
+    stride_cm is not a multiple of 16."""
+    out_bytes: gl.constexpr = c_ptr.dtype.element_ty.primitive_bitwidth // 8
+    if not is_uneven(BLOCK_M, TOP_M, BLOCK_N, LEFT_N):
+        # Store layout sized to the half tile: 16 contiguous bytes per thread where
+        # the quadrant has enough elements, and one warp spans BLOCK_N // 2 columns
+        # ([4, 16] lanes at BLOCK_N = 256).
+        gStoreLayoutC: gl.constexpr = coalesced_store_layout(
+            BLOCK_M // 2, BLOCK_N // 2, out_bytes, gl.num_warps()
+        )
+        offs_cm = gl.arange(0, BLOCK_M // 2, gl.SliceLayout(1, gStoreLayoutC))
+        offs_cn = gl.arange(0, BLOCK_N // 2, gl.SliceLayout(0, gStoreLayoutC))
+        c_tl_base = c_ptr + pid_m.to(gl.int64) * BLOCK_M * stride_cm
+        col = pid_n * BLOCK_N + offs_cn
+        if CLAMP_ROWS:
+            c_rows = gl.multiple_of(stride_cm * gl.minimum(offs_cm, m_left - 1), 8)
+        else:
+            c_rows = gl.multiple_of(stride_cm * offs_cm, 8)
+        c_offsets = c_rows[:, None] + stride_cn * col[None, :]
+        c_tr_base = c_tl_base + BLOCK_N * stride_cn // 2
+        c_bl_base = c_tl_base + BLOCK_M * stride_cm // 2
+        c_br_base = c_bl_base + BLOCK_N * stride_cn // 2
+        masks = (), (), (), ()
+        if MASKS and not (EVEN_M and EVEN_N):
+            # The ragged last tile stores only the rows and columns inside C.
+            in_top = offs_cm[:, None] < m_left
+            in_bot = offs_cm[:, None] + BLOCK_M // 2 < m_left
+            if EVEN_N:
+                mask_tl, mask_tr = in_top, in_top
+                mask_bl, mask_br = in_bot, in_bot
+            else:
+                in_left = offs_cn[None, :] < n_left
+                in_right = offs_cn[None, :] + BLOCK_N // 2 < n_left
+                mask_tl = in_top & in_left
+                mask_tr = in_top & in_right
+                mask_bl = in_bot & in_left
+                mask_br = in_bot & in_right
+            masks = (mask_tl,), (mask_bl,), (mask_tr,), (mask_br,)
+        bases = (c_tl_base,), (c_bl_base,), (c_tr_base,), (c_br_base,)
+        offsets = (c_offsets,), (c_offsets,), (c_offsets,), (c_offsets,)
+    else:
+        c_tl_base = c_ptr + pid_m.to(gl.int64) * BLOCK_M * stride_cm
+        TOPS: gl.constexpr = half_blocks(BLOCK_M, TOP_M, False)
+        BOTS: gl.constexpr = half_blocks(BLOCK_M, TOP_M, True)
+        LEFTS: gl.constexpr = half_blocks(BLOCK_N, LEFT_N, False)
+        RIGHTS: gl.constexpr = half_blocks(BLOCK_N, LEFT_N, True)
+        T0S: gl.constexpr = block_starts(TOPS, 0)
+        B0S: gl.constexpr = block_starts(BOTS, half_size(BLOCK_M, TOP_M))
+        L0S: gl.constexpr = block_starts(LEFTS, 0)
+        R0S: gl.constexpr = block_starts(RIGHTS, half_size(BLOCK_N, LEFT_N))
+        tl = quad_c_addressing(
+            c_tl_base,
+            pid_n,
+            m_left,
+            n_left,
+            stride_cm,
+            stride_cn,
+            TOPS,
+            T0S,
+            LEFTS,
+            L0S,
+            BLOCK_N,
+            out_bytes,
+            CLAMP_ROWS,
+            MASKS,
+            EVEN_M,
+            EVEN_N,
+        )
+        bl = quad_c_addressing(
+            c_tl_base,
+            pid_n,
+            m_left,
+            n_left,
+            stride_cm,
+            stride_cn,
+            BOTS,
+            B0S,
+            LEFTS,
+            L0S,
+            BLOCK_N,
+            out_bytes,
+            CLAMP_ROWS,
+            MASKS,
+            EVEN_M,
+            EVEN_N,
+        )
+        tr = quad_c_addressing(
+            c_tl_base,
+            pid_n,
+            m_left,
+            n_left,
+            stride_cm,
+            stride_cn,
+            TOPS,
+            T0S,
+            RIGHTS,
+            R0S,
+            BLOCK_N,
+            out_bytes,
+            CLAMP_ROWS,
+            MASKS,
+            EVEN_M,
+            EVEN_N,
+        )
+        br = quad_c_addressing(
+            c_tl_base,
+            pid_n,
+            m_left,
+            n_left,
+            stride_cm,
+            stride_cn,
+            BOTS,
+            B0S,
+            RIGHTS,
+            R0S,
+            BLOCK_N,
+            out_bytes,
+            CLAMP_ROWS,
+            MASKS,
+            EVEN_M,
+            EVEN_N,
+        )
+        bases = tl[0], bl[0], tr[0], br[0]
+        offsets = tl[1], bl[1], tr[1], br[1]
+        masks = tl[2], bl[2], tr[2], br[2]
+    return bases, offsets, masks
+
+
+@gluon.jit
+def quad_c_addressing(
+    c_tl_base,
+    pid_n,
+    m_left,
+    n_left,
+    stride_cm,
+    stride_cn,
+    ROWS: gl.constexpr,
+    R0S: gl.constexpr,
+    COLS: gl.constexpr,
+    C0S: gl.constexpr,
+    BLOCK_N: gl.constexpr,
+    OUT_BYTES: gl.constexpr,
+    CLAMP_ROWS: gl.constexpr,
+    MASKS: gl.constexpr,
+    EVEN_M: gl.constexpr,
+    EVEN_N: gl.constexpr,
+):
+    """c_store_addressing of an uneven tile's quadrant: (bases, offsets, masks) of
+    its blocks in quad_mma's order."""
+    qb = ()
+    qo = ()
+    qm = ()
+    for j in gl.static_range(len(COLS)):
+        for i in gl.static_range(len(ROWS)):
+            b, o, m = block_c_addressing(
+                c_tl_base,
+                pid_n,
+                m_left,
+                n_left,
+                stride_cm,
+                stride_cn,
+                ROWS[i],
+                R0S[i],
+                COLS[j],
+                C0S[j],
+                BLOCK_N,
+                OUT_BYTES,
+                CLAMP_ROWS,
+                MASKS,
+                EVEN_M,
+                EVEN_N,
+            )
+            qb = qb + (b,)
+            qo = qo + (o,)
+            if MASKS and not (EVEN_M and EVEN_N):
+                qm = qm + (m,)
+    return qb, qo, qm
+
+
+@gluon.jit
+def block_c_addressing(
+    c_tl_base,
+    pid_n,
+    m_left,
+    n_left,
+    stride_cm,
+    stride_cn,
+    ROWS: gl.constexpr,
+    R0: gl.constexpr,
+    COLS: gl.constexpr,
+    C0: gl.constexpr,
+    BLOCK_N: gl.constexpr,
+    OUT_BYTES: gl.constexpr,
+    CLAMP_ROWS: gl.constexpr,
+    MASKS: gl.constexpr,
+    EVEN_M: gl.constexpr,
+    EVEN_N: gl.constexpr,
+):
+    """One block's (base, offsets, mask) (c_store_addressing)."""
+    SL: gl.constexpr = coalesced_store_layout(ROWS, COLS, OUT_BYTES, gl.num_warps())
+    r = gl.arange(0, ROWS, gl.SliceLayout(1, SL))
+    c = gl.arange(0, COLS, gl.SliceLayout(0, SL))
+    if CLAMP_ROWS:
+        rr = gl.multiple_of(stride_cm * gl.minimum(r, m_left - 1), 8)
+    else:
+        rr = gl.multiple_of(stride_cm * r, 8)
+    offs = rr[:, None] + stride_cn * (pid_n * BLOCK_N + c)[None, :]
+    base = c_tl_base + R0 * stride_cm + C0 * stride_cn
+    m = ()
+    if MASKS and not EVEN_M and not EVEN_N:
+        m = (r[:, None] + R0 < m_left) & (c[None, :] + C0 < n_left)
+    elif MASKS and not EVEN_M:
+        m = r[:, None] + R0 < m_left
+    elif MASKS and not EVEN_N:
+        m = c[None, :] + C0 < n_left
+    return base, offs, m
+
+
+@gluon.jit
+def store_quad(acc, bases, offsets, masks):
+    """C stores of a quadrant's blocks (c_store_addressing), converted to C's type
+    and to each block's store layout; masks is empty when nothing is masked."""
+    for b in gl.static_range(len(acc)):
+        c = acc[b].to(bases[b].dtype.element_ty)
+        c = gl.convert_layout(c, layout=offsets[b].type.layout)
+        if len(masks) == 0:
+            gl.amd.cdna3.buffer_store(ptr=bases[b], offsets=offsets[b], stored_value=c)
+        else:
+            gl.amd.cdna3.buffer_store(
+                ptr=bases[b], offsets=offsets[b], stored_value=c, mask=masks[b]
+            )
 
 
 @gluon.jit
@@ -1448,8 +2386,6 @@ def persistent_tile(
     GROUP_SIZE_M: gl.constexpr,
     ADD_BIAS: gl.constexpr,
     mfmaLayout: gl.constexpr,
-    gLoadLayoutA: gl.constexpr,
-    gLoadLayoutB: gl.constexpr,
     EVEN_M: gl.constexpr,
     EVEN_N: gl.constexpr,
     EVEN_K: gl.constexpr,
@@ -1457,6 +2393,8 @@ def persistent_tile(
     total_full_tiles,
     sk_target,
     SK_PREFETCH: gl.constexpr,
+    TOP_M: gl.constexpr = 0,
+    LEFT_N: gl.constexpr = 0,
 ):
     """One full-K tile of the persistent loop, for virtual pid vpid: the main loop and
     epilogue, the epilogue prefetching the next tile.
@@ -1479,7 +2417,9 @@ def persistent_tile(
     pair is partial), so the main loop starts at column 0, and the next tile's
     prefetch loads that tile's last pair, masked on a ragged K."""
     stride_am, stride_ak, stride_bk, stride_bn, stride_cm, stride_cn = strides
-    a_offsets, a_bot_shift, b_offsets, b_right_shift = kofs
+    a_kofs, b_kofs = kofs
+    a_dtype: gl.constexpr = a_ptr.dtype.element_ty
+    b_dtype: gl.constexpr = b_ptr.dtype.element_ty
     a_addr, b_addr = tile_addr
     smemA_top, smemA_bot, smemB_left, smemB_right = smem
     dotOpLayoutA: gl.constexpr = gl.DotOperandLayout(
@@ -1528,7 +2468,16 @@ def persistent_tile(
     ## constant-zero accumulator becomes the MFMA's inline-0 C operand, so no AGPRs
     ## are zeroed per tile (a loop-carried zero would be materialised).
     accs = init_acc_edge(
-        bias_ptr, pid_n, n_left, BLOCK_M, BLOCK_N, mfmaLayout, ADD_BIAS, EVEN_N
+        bias_ptr,
+        pid_n,
+        n_left,
+        BLOCK_M,
+        BLOCK_N,
+        mfmaLayout,
+        ADD_BIAS,
+        EVEN_N,
+        TOP_M,
+        LEFT_N,
     )
     accs, a_top, b_left = k_step_pair(
         accs,
@@ -1565,37 +2514,37 @@ def persistent_tile(
     # The next tile's load offsets, for its prefetch below and for its own trip.
     na_addr = a_load_addressing(
         next_m,
-        a_offsets,
-        a_bot_shift,
+        a_kofs,
         M,
         stride_am,
         stride_ak,
         BLOCK_M,
         BLOCK_K,
-        gLoadLayoutA,
         EVEN_M,
+        a_dtype,
+        TOP_M,
     )
     nb_addr = b_load_addressing(
         next_n,
-        b_offsets,
-        b_right_shift,
+        b_kofs,
         N,
         stride_bk,
         stride_bn,
         BLOCK_N,
         BLOCK_K,
-        gLoadLayoutB,
         EVEN_N,
+        b_dtype,
+        LEFT_N,
     )
     na_top, na_bot, na_bot_shift, na_odd_shift = na_addr
     nb_left, nb_right, nb_right_shift, nb_odd_shift = nb_addr
     # Computed here rather than with a_next, so they are not live across the K loop.
     if SK_PREFETCH and not EVEN_K:
         k_hi = gl.where(has_next, 2 * BLOCK_K - K_RES, sk_khi)
-        mask_a0 = k_tail_mask(k_hi, 0, BLOCK_K, gLoadLayoutA, False)
-        mask_b0 = k_tail_mask(k_hi, 0, BLOCK_K, gLoadLayoutB, True)
-        mask_a1 = k_tail_mask(k_hi, 1, BLOCK_K, gLoadLayoutA, False)
-        mask_b1 = k_tail_mask(k_hi, 1, BLOCK_K, gLoadLayoutB, True)
+        mask_a0 = operand_k_masks(k_hi, 0, BLOCK_K, BLOCK_M, TOP_M, a_dtype, 0)
+        mask_b0 = operand_k_masks(k_hi, 0, BLOCK_K, BLOCK_N, LEFT_N, b_dtype, 1)
+        mask_a1 = operand_k_masks(k_hi, 1, BLOCK_K, BLOCK_M, TOP_M, a_dtype, 0)
+        mask_b1 = operand_k_masks(k_hi, 1, BLOCK_K, BLOCK_N, LEFT_N, b_dtype, 1)
     elif EVEN_K:
         # Also with SK_PREFETCH: an idle program's target is in bounds and never
         # read. Dropping the masks frees registers, but at the 512-VGPR limit
@@ -1608,138 +2557,97 @@ def persistent_tile(
             BLOCK_M,
             BLOCK_N,
             BLOCK_K,
-            gLoadLayoutA,
-            gLoadLayoutB,
+            a_dtype,
+            b_dtype,
             True,
+            TOP_M,
+            LEFT_N,
         )
+    # Per half: (first, second) of per-block masks, or None.
+    ma0_t, ma0_b, mb0_l, mb0_r = None, None, None, None
+    ma1_t, ma1_b, mb1_l, mb1_r = None, None, None, None
+    if mask_a0 is not None:
+        ma0_t, ma0_b = mask_a0
+        mb0_l, mb0_r = mask_b0
+    if mask_a1 is not None:
+        ma1_t, ma1_b = mask_a1
+        mb1_l, mb1_r = mask_b1
 
     ## Epilogue: 4-quadrant stores with natural-pipeline ordering, each async copy
     ## prefetching the next tile's first pair.
 
-    # Store layout sized to the half tile: 16 contiguous bytes per thread where the
-    # quadrant has enough elements, and one warp spans BLOCK_N // 2 columns ([4, 16]
-    # lanes at BLOCK_N = 256).
-    gStoreLayoutC: gl.constexpr = coalesced_store_layout(
-        BLOCK_M // 2,
-        BLOCK_N // 2,
-        c_ptr.dtype.element_ty.primitive_bitwidth // 8,
-        gl.num_warps(),
+    c_bases, c_offs, c_masks = c_store_addressing(
+        c_ptr,
+        pid_m,
+        pid_n,
+        m_left,
+        n_left,
+        stride_cm,
+        stride_cn,
+        BLOCK_M,
+        BLOCK_N,
+        TOP_M,
+        LEFT_N,
+        not EVEN_M,
+        True,
+        EVEN_M,
+        EVEN_N,
     )
-
-    offs_cm = gl.arange(0, BLOCK_M // 2, gl.SliceLayout(1, gStoreLayoutC))
-    offs_cn = gl.arange(0, BLOCK_N // 2, gl.SliceLayout(0, gStoreLayoutC))
-    # The tile's row goes in the 64-bit scalar base, so the 32-bit offsets only span
-    # BLOCK_M rows. Its column stays in the vector offsets, which keeps them
-    # tile-dependent: the compiler can't hoist them above the tile loop and keep them
-    # live (and spilled) through the K loop. The quadrant shifts go in the scalar base
-    # too, so all four stores share one offset tensor. On a ragged M the rows are
-    # clamped to the tile's last one for the same reason (only rows the store masks
-    # drop change). The row term carries the loads' multiple_of hint and n_left is
-    # hinted a multiple of 8 (the wrapper checks N), so each thread's 8-column group
-    # keeps one predicate and one 16-byte store when stride_cm is not a multiple of 16.
-    c_tl_base = c_ptr + pid_m.to(gl.int64) * BLOCK_M * stride_cm
-    col = pid_n * BLOCK_N + offs_cn
-    if EVEN_M:
-        c_rows = gl.multiple_of(stride_cm * offs_cm, 8)
-    else:
-        c_rows = gl.multiple_of(stride_cm * gl.minimum(offs_cm, m_left - 1), 8)
-    c_offsets = c_rows[:, None] + stride_cn * col[None, :]
-    c_tr_base = c_tl_base + BLOCK_N * stride_cn // 2
-    c_bl_base = c_tl_base + BLOCK_M * stride_cm // 2
-    c_br_base = c_bl_base + BLOCK_N * stride_cn // 2
-    if EVEN_M and EVEN_N:
-        mask_tl, mask_tr, mask_bl, mask_br = None, None, None, None
-    else:
-        # The ragged last tile stores only the rows and columns inside C.
-        in_top = offs_cm[:, None] < m_left
-        in_bot = offs_cm[:, None] + BLOCK_M // 2 < m_left
-        if EVEN_N:
-            mask_tl, mask_tr = in_top, in_top
-            mask_bl, mask_br = in_bot, in_bot
-        else:
-            in_left = offs_cn[None, :] < n_left
-            in_right = offs_cn[None, :] + BLOCK_N // 2 < n_left
-            mask_tl = in_top & in_left
-            mask_tr = in_top & in_right
-            mask_bl = in_bot & in_left
-            mask_br = in_bot & in_right
 
     ## Iter iterMax - 2: same 4-region pattern as main loop, each AC prefetching the
     ## next tile's K-step 0 into the buffer the main loop would refill here, so every
     ## wait keeps 5 groups in flight.
-    acc_tl = gl.amd.cdna3.mfma(a_top, b_left, acc_tl, cd_regclass="a")
+    acc_tl = quad_mma(a_top, b_left, acc_tl)
     gl.amd.cdna4.async_copy.wait_group(5)
     l_idx = (iterMax - 2) % 2
-    a_bot = smemA_bot.index(l_idx).load(dotOpLayoutA)
-    gl.amd.cdna4.async_copy.buffer_load_to_shared(
-        smemB_left.index(0), b_next, nb_left, mask=mask_b0
-    )
+    a_bot = read_half(smemA_bot, l_idx, dotOpLayoutA)
+    copy_half(smemB_left, 0, b_next, nb_left, mb0_l)
     gl.amd.cdna4.async_copy.commit_group()
 
-    acc_bl = gl.amd.cdna3.mfma(a_bot, b_left, acc_bl, cd_regclass="a")
+    acc_bl = quad_mma(a_bot, b_left, acc_bl)
     gl.amd.cdna4.async_copy.wait_group(5)
-    b_right = smemB_right.index(l_idx).load(dotOpLayoutB)
-    gl.amd.cdna4.async_copy.buffer_load_to_shared(
-        smemA_top.index(0), a_next, na_top, mask=mask_a0
-    )
+    b_right = read_half(smemB_right, l_idx, dotOpLayoutB)
+    copy_half(smemA_top, 0, a_next, na_top, ma0_t)
     gl.amd.cdna4.async_copy.commit_group()
 
-    acc_tr = gl.amd.cdna3.mfma(a_top, b_right, acc_tr, cd_regclass="a")
+    acc_tr = quad_mma(a_top, b_right, acc_tr)
     gl.amd.cdna4.async_copy.wait_group(5)
     g_idx = 1 - l_idx
-    b_left = smemB_left.index(g_idx).load(dotOpLayoutB)
-    gl.amd.cdna4.async_copy.buffer_load_to_shared(
-        smemA_bot.index(0), a_next + na_bot_shift, na_bot, mask=mask_a0
-    )
+    b_left = read_half(smemB_left, g_idx, dotOpLayoutB)
+    copy_half(smemA_bot, 0, a_next + na_bot_shift, na_bot, ma0_b)
     gl.amd.cdna4.async_copy.commit_group()
 
-    acc_br = gl.amd.cdna3.mfma(a_bot, b_right, acc_br, cd_regclass="a")
+    acc_br = quad_mma(a_bot, b_right, acc_br)
     gl.amd.cdna4.async_copy.wait_group(5)
-    a_top = smemA_top.index(g_idx).load(dotOpLayoutA)
-    gl.amd.cdna4.async_copy.buffer_load_to_shared(
-        smemB_right.index(0), b_next + nb_right_shift, nb_right, mask=mask_b0
-    )
+    a_top = read_half(smemA_top, g_idx, dotOpLayoutA)
+    copy_half(smemB_right, 0, b_next + nb_right_shift, nb_right, mb0_r)
     gl.amd.cdna4.async_copy.commit_group()
 
     ## Iter iterMax - 1
     ## Natural-pipeline epilogue: each store follows its MFMA with one
     ## MFMA cycle of gap, yielding uniform MFMA-store interleaving. The ACs
     ## prefetch the next tile's K-step 1.
-    acc_tl = gl.amd.cdna3.mfma(a_top, b_left, acc_tl, cd_regclass="a")
+    acc_tl = quad_mma(a_top, b_left, acc_tl)
     gl.amd.cdna4.async_copy.wait_group(5)
-    a_bot = smemA_bot.index(g_idx).load(dotOpLayoutA)
-    gl.amd.cdna4.async_copy.buffer_load_to_shared(
-        smemB_left.index(1), b_next + nb_odd_shift, nb_left, mask=mask_b1
-    )
+    a_bot = read_half(smemA_bot, g_idx, dotOpLayoutA)
+    copy_half(smemB_left, 1, b_next + nb_odd_shift, nb_left, mb1_l)
     gl.amd.cdna4.async_copy.commit_group()
 
-    acc_bl = gl.amd.cdna3.mfma(a_bot, b_left, acc_bl, cd_regclass="a")
+    acc_bl = quad_mma(a_bot, b_left, acc_bl)
     gl.amd.cdna4.async_copy.wait_group(5)
-    b_right = smemB_right.index(g_idx).load(dotOpLayoutB)
-    gl.amd.cdna4.async_copy.buffer_load_to_shared(
-        smemA_top.index(1), a_next + na_odd_shift, na_top, mask=mask_a1
-    )
+    b_right = read_half(smemB_right, g_idx, dotOpLayoutB)
+    copy_half(smemA_top, 1, a_next + na_odd_shift, na_top, ma1_t)
     gl.amd.cdna4.async_copy.commit_group()
 
-    c_tl = acc_tl.to(c_ptr.dtype.element_ty)
-    c_tl = gl.convert_layout(c_tl, layout=gStoreLayoutC)
-    gl.amd.cdna3.buffer_store(
-        ptr=c_tl_base, offsets=c_offsets, stored_value=c_tl, mask=mask_tl
-    )
+    store_quad(acc_tl, c_bases[0], c_offs[0], c_masks[0])
 
-    acc_tr = gl.amd.cdna3.mfma(a_top, b_right, acc_tr, cd_regclass="a")
-    gl.amd.cdna4.async_copy.buffer_load_to_shared(
-        smemA_bot.index(1), a_next + na_bot_shift + na_odd_shift, na_bot, mask=mask_a1
-    )
+    acc_tr = quad_mma(a_top, b_right, acc_tr)
+    copy_half(smemA_bot, 1, a_next + na_bot_shift + na_odd_shift, na_bot, ma1_b)
     gl.amd.cdna4.async_copy.commit_group()
 
-    c_bl = acc_bl.to(c_ptr.dtype.element_ty)
-    c_bl = gl.convert_layout(c_bl, layout=gStoreLayoutC)
-    gl.amd.cdna3.buffer_store(
-        ptr=c_bl_base, offsets=c_offsets, stored_value=c_bl, mask=mask_bl
-    )
+    store_quad(acc_bl, c_bases[1], c_offs[1], c_masks[1])
 
-    acc_br = gl.amd.cdna3.mfma(a_bot, b_right, acc_br, cd_regclass="a")
+    acc_br = quad_mma(a_bot, b_right, acc_br)
 
     # The next tile's K-step 0 operands (prefetched at iterMax - 2), read while the
     # last MFMAs and stores drain; this tile's operand registers are all dead after
@@ -1747,27 +2655,14 @@ def persistent_tile(
     # loop: reading b_left after acc_tr keeps it live across the c_bl store, which
     # costs 24-36 AGPR moves per tile and, on a ragged M and N, an extra spill.
     gl.amd.cdna4.async_copy.wait_group(5)
-    b_left = smemB_left.index(0).load(dotOpLayoutB)
-    a_top = smemA_top.index(0).load(dotOpLayoutA)
-    gl.amd.cdna4.async_copy.buffer_load_to_shared(
-        smemB_right.index(1),
-        b_next + nb_right_shift + nb_odd_shift,
-        nb_right,
-        mask=mask_b1,
-    )
+    b_left = read_half(smemB_left, 0, dotOpLayoutB)
+    a_top = read_half(smemA_top, 0, dotOpLayoutA)
+    copy_half(smemB_right, 1, b_next + nb_right_shift + nb_odd_shift, nb_right, mb1_r)
     gl.amd.cdna4.async_copy.commit_group()
 
-    c_tr = acc_tr.to(c_ptr.dtype.element_ty)
-    c_tr = gl.convert_layout(c_tr, layout=gStoreLayoutC)
-    gl.amd.cdna3.buffer_store(
-        ptr=c_tr_base, offsets=c_offsets, stored_value=c_tr, mask=mask_tr
-    )
+    store_quad(acc_tr, c_bases[2], c_offs[2], c_masks[2])
 
-    c_br = acc_br.to(c_ptr.dtype.element_ty)
-    c_br = gl.convert_layout(c_br, layout=gStoreLayoutC)
-    gl.amd.cdna3.buffer_store(
-        ptr=c_br_base, offsets=c_offsets, stored_value=c_br, mask=mask_br
-    )
+    store_quad(acc_br, c_bases[3], c_offs[3], c_masks[3])
 
     return a_top, b_left, (na_addr, nb_addr)
 
@@ -2090,10 +2985,6 @@ def l2_tile_barrier(
 # One 32x32 MFMA accumulator block (a register vector over 4 warps): each warp holds
 # one 16x16 MFMA output, in which lane l holds row l % 16, columns 4 (l // 16) .. + 3.
 # Its elements are stored [warp][lane][4 registers].
-# The MFMA layout's warps (rows, columns). The partials' 32x32 block (MFMA_BLOCK_DIM)
-# is the 2 x 2 warps' 16x16 outputs, so every partial map assumes [2, 2].
-MFMA_WARPS_MN = gl.constexpr([2, 2])
-assert MFMA_WARPS_MN.value == [2, 2], "the partial maps assume 2 x 2 MFMA warps"
 MFMA_DIM = gl.constexpr(16)  # rows and columns of one warp's MFMA output
 MFMA_BLOCK_DIM = gl.constexpr(2 * MFMA_DIM.value)  # 32, the 2 x 2 warps' outputs
 MFMA_LANE_ELEMS = gl.constexpr(4)  # registers 0-3 of a lane, 4 adjacent columns
@@ -2462,36 +3353,37 @@ def store_partial(
 def owner_store(
     acc,
     psum,
-    q: gl.constexpr,
+    R0: gl.constexpr,
+    C0: gl.constexpr,
     bias_ptr,
     pid_n,
     c_base,
     c_offsets,
     BLOCK_N: gl.constexpr,
-    HALF_N: gl.constexpr,
     ADD_BIAS: gl.constexpr,
     out_dtype: gl.constexpr,
-    gStoreLayoutC: gl.constexpr,
     mfmaLayout: gl.constexpr,
     m_left,
     n_left,
     EVEN_M: gl.constexpr,
     EVEN_N: gl.constexpr,
 ):
-    """Quadrant q of C: the accumulator plus psum (the peers' partials) and the bias.
-    Contributors' partials exclude the bias, so it is added once, here."""
-    HALF_M: gl.constexpr = acc.shape[0]
+    """The block of C at tile row R0, column C0 (a quadrant of a power-of-two tile):
+    the accumulator plus psum (the peers' partials) and the bias, stored in
+    c_offsets' layout. Contributors' partials exclude the bias, so it is added once,
+    here."""
+    COLS: gl.constexpr = acc.shape[1]
     if ADD_BIAS:
-        offs_pn = gl.arange(0, HALF_N, gl.SliceLayout(0, mfmaLayout))
+        offs_pn = gl.arange(0, COLS, gl.SliceLayout(0, mfmaLayout))
         if EVEN_N:
             bias = gl.amd.cdna3.buffer_load(
-                ptr=bias_ptr + pid_n * BLOCK_N + (q // 2) * HALF_N, offsets=offs_pn
+                ptr=bias_ptr + pid_n * BLOCK_N + C0, offsets=offs_pn
             )
         else:
             bias = gl.amd.cdna3.buffer_load(
-                ptr=bias_ptr + pid_n * BLOCK_N + (q // 2) * HALF_N,
+                ptr=bias_ptr + pid_n * BLOCK_N + C0,
                 offsets=offs_pn,
-                mask=offs_pn < n_left - (q // 2) * HALF_N,
+                mask=offs_pn < n_left - C0,
                 other=0.0,
             )
         psum = psum + bias.to(gl.float32)[None, :]
@@ -2500,9 +3392,9 @@ def owner_store(
         c_base,
         c_offsets,
         out_dtype,
-        gStoreLayoutC,
-        m_left - (q % 2) * HALF_M,
-        n_left - (q // 2) * HALF_N,
+        c_offsets.type.layout,
+        m_left - R0,
+        n_left - C0,
         EVEN_M,
         EVEN_N,
     )
@@ -2623,19 +3515,21 @@ def owner_ending(
     p_ptr,
     locks_ptr,
     c_bases,
-    c_offsets,
+    c_offs,
     m_left,
     n_left,
     BLOCK_N: gl.constexpr,
     PEER_STEP: gl.constexpr,
     ADD_BIAS: gl.constexpr,
     out_dtype: gl.constexpr,
-    gStoreLayoutC: gl.constexpr,
     mfmaLayout: gl.constexpr,
     EVEN_M: gl.constexpr,
     EVEN_N: gl.constexpr,
     QPB: gl.constexpr,
     MAX_PEERS: gl.constexpr,
+    BLOCK_M: gl.constexpr = 0,
+    TOP_M: gl.constexpr = 0,
+    LEFT_N: gl.constexpr = 0,
 ):
     """The owner ending of a segment. A contributor (is_partial) stores its four
     quadrants to P[rank], drains and raises locks[rank]. The owner waits for its
@@ -2645,7 +3539,88 @@ def owner_ending(
     (a loop or branch that carries the AGPR accumulator spills), and stores that batch
     of C before the next batch's reads, so only one batch's sums are live. Each partial
     has one reader, so the owner lowers its peers' flags for the next launch; the
-    kernel boundary orders that against it."""
+    kernel boundary orders that against it.
+
+    accs, c_bases and c_offs hold a tuple of blocks per quadrant (c_store_addressing):
+    an uneven tile runs owner_ending_blocks."""
+    if is_uneven(BLOCK_M, TOP_M, BLOCK_N, LEFT_N):
+        owner_ending_blocks(
+            accs,
+            is_partial,
+            n_peers,
+            rank,
+            pid_n,
+            bias_ptr,
+            p_ptr,
+            locks_ptr,
+            c_bases,
+            c_offs,
+            m_left,
+            n_left,
+            BLOCK_M,
+            BLOCK_N,
+            TOP_M,
+            LEFT_N,
+            PEER_STEP,
+            ADD_BIAS,
+            out_dtype,
+            mfmaLayout,
+            EVEN_M,
+            EVEN_N,
+            MAX_PEERS,
+        )
+    else:
+        owner_ending_quads(
+            (accs[0][0], accs[1][0], accs[2][0], accs[3][0]),
+            is_partial,
+            n_peers,
+            rank,
+            pid_n,
+            bias_ptr,
+            p_ptr,
+            locks_ptr,
+            (c_bases[0][0], c_bases[1][0], c_bases[2][0], c_bases[3][0]),
+            c_offs[0][0],
+            m_left,
+            n_left,
+            BLOCK_N,
+            PEER_STEP,
+            ADD_BIAS,
+            out_dtype,
+            mfmaLayout,
+            EVEN_M,
+            EVEN_N,
+            QPB,
+            MAX_PEERS,
+        )
+
+
+@gluon.jit
+def owner_ending_quads(
+    accs,
+    is_partial,
+    n_peers,
+    rank,
+    pid_n,
+    bias_ptr,
+    p_ptr,
+    locks_ptr,
+    c_bases,
+    c_offsets,
+    m_left,
+    n_left,
+    BLOCK_N: gl.constexpr,
+    PEER_STEP: gl.constexpr,
+    ADD_BIAS: gl.constexpr,
+    out_dtype: gl.constexpr,
+    mfmaLayout: gl.constexpr,
+    EVEN_M: gl.constexpr,
+    EVEN_N: gl.constexpr,
+    QPB: gl.constexpr,
+    MAX_PEERS: gl.constexpr,
+):
+    """owner_ending of a power-of-two tile: accs and c_bases are its four quadrants,
+    which share c_offsets."""
     HALF_M: gl.constexpr = accs[0].shape[0]
     HALF_N: gl.constexpr = accs[0].shape[1]
     for pj in range(n_peers):
@@ -2691,16 +3666,15 @@ def owner_ending(
                 owner_store(
                     accs[q0 + i],
                     sums[i],
-                    q0 + i,
+                    ((q0 + i) % 2) * HALF_M,
+                    ((q0 + i) // 2) * HALF_N,
                     bias_ptr,
                     pid_n,
                     c_bases[q0 + i],
                     c_offsets,
                     BLOCK_N,
-                    HALF_N,
                     ADD_BIAS,
                     out_dtype,
-                    gStoreLayoutC,
                     mfmaLayout,
                     m_left,
                     n_left,
@@ -2717,6 +3691,712 @@ def owner_ending(
         gl.atomic_xchg(
             locks_ptr + rank + PEER_STEP * (1 + pj), 0, sem="relaxed", scope="gpu"
         )
+
+
+# ---------------------------------------------------------------------------------
+# Partials of an uneven tile, block by block
+#
+# The slot holds the tile's blocks (tile_blocks) back to back, each straight from the
+# MFMA layout as a power-of-two quadrant's is (lane_contiguous_offsets). A part is
+# what one access per lane covers in order: a block, or with 16-bit partials two
+# one-block (32x32) blocks stored as one pair (join_pair), which tile_blocks keeps
+# adjacent at the slot's end, 16 bytes per lane. A tile with an odd number of
+# one-block blocks stores the last one alone in 16 bits straight from the MFMA layout
+# ("lone"), 8 bytes per lane.
+# ---------------------------------------------------------------------------------
+
+
+@constexpr_function
+def tile_parts(block_m, top_m, block_n, left_n, p16, field):
+    """One field of every part of an uneven tile's slot, in slot order: "b0" its
+    first block (tile_blocks' index), "nb" its blocks (1, or 2 for a 16-bit pair of
+    one-block blocks), "off" its first element, "vq" its 32x32 blocks, "rows" /
+    "cols" its first block's, "loads" its loads per lane, "lone" a one-block block
+    stored alone in 16 bits (8-byte accesses)."""
+    vq = tile_blocks(block_m, top_m, block_n, left_n, "vq")
+    rows = tile_blocks(block_m, top_m, block_n, left_n, "rows")
+    cols = tile_blocks(block_m, top_m, block_n, left_n, "cols")
+    off = tile_blocks(block_m, top_m, block_n, left_n, "off")
+    parts, b = [], 0
+    while b < len(vq):
+        if p16 and vq[b] == 1 and b + 1 < len(vq):
+            parts.append(
+                dict(
+                    b0=b, nb=2, off=off[b], vq=2, rows=32, cols=32, loads=1, lone=False
+                )
+            )
+            b += 2
+        elif p16 and vq[b] == 1:
+            parts.append(
+                dict(b0=b, nb=1, off=off[b], vq=1, rows=32, cols=32, loads=1, lone=True)
+            )
+            b += 1
+        else:
+            loads = vq[b] // 2 if p16 else vq[b]
+            parts.append(
+                dict(
+                    b0=b,
+                    nb=1,
+                    off=off[b],
+                    vq=vq[b],
+                    rows=rows[b],
+                    cols=cols[b],
+                    loads=loads,
+                    lone=False,
+                )
+            )
+            b += 1
+    return tuple(p[field] for p in parts)
+
+
+@constexpr_function
+def owner_unroll_max(block_m, block_n):
+    """The largest TAIL_SPLIT_K whose owner unrolls its peer loop (MAX_PEERS): 8, or 4
+    when the accumulators fill all 256 AGPRs (256x256), where unrolling 5-7 peers
+    spills (up to 25 VGPRs) and is up to 8% slower than the run-time loop."""
+    return 4 if block_m * block_n >= 256 * 256 else 8
+
+
+@constexpr_function
+def part_batches(block_m, top_m, block_n, left_n, p16, budget):
+    """Boundaries of the owner's batches: runs of consecutive parts of at most
+    `budget` 16-byte loads per lane together (at least one part each)."""
+    loads = tile_parts(block_m, top_m, block_n, left_n, p16, "loads")
+    out, total = [0], 0
+    for i, n in enumerate(loads):
+        if total > 0 and total + n > budget:
+            out.append(i)
+            total = 0
+        total += n
+    out.append(len(loads))
+    return tuple(out)
+
+
+@constexpr_function
+def rs_part_groups(block_m, top_m, block_n, left_n, p16, nb, field):
+    """The reduce-scatter's groups over an uneven tile's parts: "nb" blocks per group
+    (at most nb, so a group stays in one block; a 16-bit pair of one-block blocks is one
+    group of 2), "gs" a part's first group, "gr" its groups, "total" all groups."""
+    vq = tile_parts(block_m, top_m, block_n, left_n, p16, "vq")
+    nbp = tile_parts(block_m, top_m, block_n, left_n, p16, "nb")
+    out, g = [], 0
+    for v, n in zip(vq, nbp):
+        k = 2 if n == 2 else max(pow2_floor(min(v, nb)), 2 if p16 and v > 1 else 1)
+        out.append(dict(nb=k, gs=g, gr=v // k))
+        g += v // k
+    if field == "total":
+        return g
+    return tuple(o[field] for o in out)
+
+
+@gluon.jit
+def part_map(p_ptr, P: gl.constexpr, GEOM: gl.constexpr, mfmaLayout: gl.constexpr):
+    """partial_map of part P of an uneven tile: a lone 16-bit block keeps the MFMA
+    layout's lane-contiguous offsets (4 elements, 8 bytes, per lane)."""
+    P16: gl.constexpr = is_16bit_partial(p_ptr)
+    BM: gl.constexpr = GEOM[0]
+    TM: gl.constexpr = GEOM[1]
+    BN: gl.constexpr = GEOM[2]
+    LN: gl.constexpr = GEOM[3]
+    ROWS: gl.constexpr = tile_parts(BM, TM, BN, LN, P16, "rows")[P]
+    COLS: gl.constexpr = tile_parts(BM, TM, BN, LN, P16, "cols")[P]
+    if tile_parts(BM, TM, BN, LN, P16, "lone")[P]:
+        offsets = lane_contiguous_offsets(ROWS, COLS, mfmaLayout)
+        zeros = gl.zeros((ROWS, COLS), gl.float32, mfmaLayout)
+    else:
+        offsets, zeros = partial_map(p_ptr, ROWS, COLS, mfmaLayout)
+    return offsets, zeros
+
+
+@gluon.jit
+def part_values(accs, P: gl.constexpr, GEOM: gl.constexpr, P_TYPE: gl.constexpr):
+    """Part P of an uneven tile's partial, as stored: fp32 blocks as they are, 16-bit
+    in pairs (to_pairs, or join_pair for two one-block blocks), a lone one-block
+    block as it is."""
+    P16: gl.constexpr = P_TYPE.primitive_bitwidth == 16
+    BM: gl.constexpr = GEOM[0]
+    TM: gl.constexpr = GEOM[1]
+    BN: gl.constexpr = GEOM[2]
+    LN: gl.constexpr = GEOM[3]
+    B0: gl.constexpr = tile_parts(BM, TM, BN, LN, P16, "b0")[P]
+    NB: gl.constexpr = tile_parts(BM, TM, BN, LN, P16, "nb")[P]
+    QS: gl.constexpr = tile_blocks(BM, TM, BN, LN, "q")
+    KS: gl.constexpr = tile_blocks(BM, TM, BN, LN, "k")
+    LONE: gl.constexpr = tile_parts(BM, TM, BN, LN, P16, "lone")[P]
+    a = accs[QS[B0]][KS[B0]]
+    if not P16:
+        part = a
+    elif LONE:
+        part = a.to(P_TYPE)
+    elif NB == 1:
+        part = to_pairs(a.to(P_TYPE), a.shape[0], a.shape[1])
+    else:
+        b = accs[QS[B0 + 1]][KS[B0 + 1]]
+        part = join_pair(a.to(P_TYPE), b.to(P_TYPE))
+    return part
+
+
+@gluon.jit
+def store_partial_blocks(
+    accs,
+    p_ptr,
+    rank,
+    GEOM: gl.constexpr,
+    mfmaLayout: gl.constexpr,
+    CACHE: gl.constexpr = ".wt",
+):
+    """An uneven tile's partial to slot P[rank], part by part (store_partial)."""
+    P16: gl.constexpr = is_16bit_partial(p_ptr)
+    BM: gl.constexpr = GEOM[0]
+    TM: gl.constexpr = GEOM[1]
+    BN: gl.constexpr = GEOM[2]
+    LN: gl.constexpr = GEOM[3]
+    OFFS: gl.constexpr = tile_parts(BM, TM, BN, LN, P16, "off")
+    slot = p_ptr + rank.to(gl.int64) * (BM * BN)
+    for P in gl.static_range(len(OFFS)):
+        p_offsets = part_map(p_ptr, P, GEOM, mfmaLayout)[0]
+        gl.amd.cdna3.buffer_store(
+            stored_value=part_values(accs, P, GEOM, p_ptr.dtype.element_ty),
+            ptr=slot + OFFS[P],
+            offsets=p_offsets,
+            cache=CACHE,
+        )
+
+
+@gluon.jit
+def peer_sums_parts(
+    p_ptr,
+    rank,
+    n_peers,
+    P0: gl.constexpr,
+    P1: gl.constexpr,
+    PEER_STEP: gl.constexpr,
+    GEOM: gl.constexpr,
+    MAX_PEERS: gl.constexpr,
+    mfmaLayout: gl.constexpr,
+):
+    """peer_sums over parts P0 .. P1 - 1 of an uneven tile: their fp32 sums over the
+    partials of peers rank + PEER_STEP i, i = 1 .. n_peers, in the parts' layouts
+    (partial_map); a peer's parts are one batch of loads."""
+    P16: gl.constexpr = is_16bit_partial(p_ptr)
+    BM: gl.constexpr = GEOM[0]
+    TM: gl.constexpr = GEOM[1]
+    BN: gl.constexpr = GEOM[2]
+    LN: gl.constexpr = GEOM[3]
+    OFFS: gl.constexpr = tile_parts(BM, TM, BN, LN, P16, "off")
+    SLOT: gl.constexpr = BM * BN
+    offs = ()
+    sums = ()
+    for P in gl.static_range(P0, P1):
+        o, z = part_map(p_ptr, P, GEOM, mfmaLayout)
+        offs = offs + (o,)
+        sums = sums + (z,)
+    if MAX_PEERS > 0:
+        for jj in gl.static_range(MAX_PEERS):
+            peer = (rank + PEER_STEP * (1 + jj)).to(gl.int64)
+            live = jj < n_peers
+            new = ()
+            for p in gl.static_range(P1 - P0):
+                new = new + (
+                    sums[p]
+                    + gl.amd.cdna3.buffer_load(
+                        ptr=p_ptr + peer * SLOT + OFFS[P0 + p],
+                        offsets=offs[p],
+                        mask=live,
+                        other=0.0,
+                        cache=".cv",
+                    ).to(gl.float32),
+                )
+            sums = new
+    else:
+        for jj in range(n_peers):
+            peer = (rank + PEER_STEP * (1 + jj)).to(gl.int64)
+            xs = ()
+            for p in gl.static_range(P1 - P0):
+                xs = xs + (
+                    gl.amd.cdna3.buffer_load(
+                        ptr=p_ptr + peer * SLOT + OFFS[P0 + p],
+                        offsets=offs[p],
+                        cache=".cv",
+                    ).to(gl.float32),
+                )
+            new = ()
+            for p in gl.static_range(P1 - P0):
+                new = new + (sums[p] + xs[p],)
+            sums = new
+    return sums
+
+
+@gluon.jit
+def part_blocks(
+    s, P: gl.constexpr, GEOM: gl.constexpr, P16: gl.constexpr, mfmaLayout: gl.constexpr
+):
+    """A part's fp32 sum as its blocks in the MFMA layout (from_partials)."""
+    BM: gl.constexpr = GEOM[0]
+    TM: gl.constexpr = GEOM[1]
+    BN: gl.constexpr = GEOM[2]
+    LN: gl.constexpr = GEOM[3]
+    NB: gl.constexpr = tile_parts(BM, TM, BN, LN, P16, "nb")[P]
+    LONE: gl.constexpr = tile_parts(BM, TM, BN, LN, P16, "lone")[P]
+    if not P16 or LONE:
+        out = (s,)
+    elif NB == 1:
+        ROWS: gl.constexpr = tile_parts(BM, TM, BN, LN, P16, "rows")[P]
+        COLS: gl.constexpr = tile_parts(BM, TM, BN, LN, P16, "cols")[P]
+        out = (from_pairs(s, ROWS, COLS, mfmaLayout),)
+    else:
+        a, b = split_pair(s, mfmaLayout)
+        out = (a, b)
+    return out
+
+
+@gluon.jit
+def owner_ending_blocks(
+    accs,
+    is_partial,
+    n_peers,
+    rank,
+    pid_n,
+    bias_ptr,
+    p_ptr,
+    locks_ptr,
+    c_bases,
+    c_offs,
+    m_left,
+    n_left,
+    BLOCK_M: gl.constexpr,
+    BLOCK_N: gl.constexpr,
+    TOP_M: gl.constexpr,
+    LEFT_N: gl.constexpr,
+    PEER_STEP: gl.constexpr,
+    ADD_BIAS: gl.constexpr,
+    out_dtype: gl.constexpr,
+    mfmaLayout: gl.constexpr,
+    EVEN_M: gl.constexpr,
+    EVEN_N: gl.constexpr,
+    MAX_PEERS: gl.constexpr,
+):
+    """owner_ending of an uneven tile: the contributors store every part, the owner
+    reads its peers' partials in batches of parts (part_batches: 16 16-byte loads per
+    lane, as the power-of-two owner's quadrants per batch) and stores each batch's
+    blocks of C before the next batch's reads. With 16-bit partials and four or more
+    peers unrolled (MAX_PEERS), the batch is 8 loads: a 16-bit load holds two blocks,
+    so 16 would hold twice fp32's blocks in fp32 sums, which spills (up to 441
+    VGPRs at 192x320, split 8)."""
+    P16: gl.constexpr = is_16bit_partial(p_ptr)
+    GEOM: gl.constexpr = (BLOCK_M, TOP_M, BLOCK_N, LEFT_N)
+    BATCH: gl.constexpr = part_batches(
+        BLOCK_M, TOP_M, BLOCK_N, LEFT_N, P16, 8 if P16 and MAX_PEERS >= 4 else 16
+    )
+    for pj in range(n_peers):
+        while (
+            gl.atomic_add(
+                locks_ptr + rank + PEER_STEP * (1 + pj), 0, sem="relaxed", scope="gpu"
+            )
+            == 0
+        ):
+            pass
+    if n_peers > 0:
+        asm_fence("s_nop 0")
+
+    if is_partial != 0:
+        store_partial_blocks(accs, p_ptr, rank, GEOM, mfmaLayout)
+    for bi in gl.static_range(len(BATCH) - 1):
+        sums = peer_sums_parts(
+            p_ptr,
+            rank,
+            n_peers,
+            BATCH[bi],
+            BATCH[bi + 1],
+            PEER_STEP,
+            GEOM,
+            MAX_PEERS,
+            mfmaLayout,
+        )
+        if is_partial == 0:
+            for p in gl.static_range(BATCH[bi + 1] - BATCH[bi]):
+                owner_store_part(
+                    accs,
+                    sums[p],
+                    BATCH[bi] + p,
+                    GEOM,
+                    P16,
+                    bias_ptr,
+                    pid_n,
+                    c_bases,
+                    c_offs,
+                    m_left,
+                    n_left,
+                    ADD_BIAS,
+                    out_dtype,
+                    mfmaLayout,
+                    EVEN_M,
+                    EVEN_N,
+                )
+
+    if is_partial != 0:
+        # The flag may only become visible after all four waves' partial stores have
+        # completed.
+        drain_and_barrier()
+        gl.atomic_xchg(locks_ptr + rank, 1, sem="relaxed", scope="gpu")
+    for pj in range(n_peers):
+        gl.atomic_xchg(
+            locks_ptr + rank + PEER_STEP * (1 + pj), 0, sem="relaxed", scope="gpu"
+        )
+
+
+@gluon.jit
+def owner_store_part(
+    accs,
+    s,
+    P: gl.constexpr,
+    GEOM: gl.constexpr,
+    P16: gl.constexpr,
+    bias_ptr,
+    pid_n,
+    c_bases,
+    c_offs,
+    m_left,
+    n_left,
+    ADD_BIAS: gl.constexpr,
+    out_dtype: gl.constexpr,
+    mfmaLayout: gl.constexpr,
+    EVEN_M: gl.constexpr,
+    EVEN_N: gl.constexpr,
+):
+    """The owner's C stores of part P's blocks: each accumulator plus its peers' sum
+    s (part_blocks) and the bias."""
+    BM: gl.constexpr = GEOM[0]
+    TM: gl.constexpr = GEOM[1]
+    BN: gl.constexpr = GEOM[2]
+    LN: gl.constexpr = GEOM[3]
+    B0: gl.constexpr = tile_parts(BM, TM, BN, LN, P16, "b0")[P]
+    blocks = part_blocks(s, P, GEOM, P16, mfmaLayout)
+    for e in gl.static_range(len(blocks)):
+        owner_store_block(
+            accs,
+            blocks[e],
+            B0 + e,
+            GEOM,
+            bias_ptr,
+            pid_n,
+            c_bases,
+            c_offs,
+            m_left,
+            n_left,
+            ADD_BIAS,
+            out_dtype,
+            mfmaLayout,
+            EVEN_M,
+            EVEN_N,
+        )
+
+
+@gluon.jit
+def owner_store_block(
+    accs,
+    psum,
+    B: gl.constexpr,
+    GEOM: gl.constexpr,
+    bias_ptr,
+    pid_n,
+    c_bases,
+    c_offs,
+    m_left,
+    n_left,
+    ADD_BIAS: gl.constexpr,
+    out_dtype: gl.constexpr,
+    mfmaLayout: gl.constexpr,
+    EVEN_M: gl.constexpr,
+    EVEN_N: gl.constexpr,
+):
+    """owner_store of block B (tile_blocks' index) of an uneven tile."""
+    BM: gl.constexpr = GEOM[0]
+    TM: gl.constexpr = GEOM[1]
+    BN: gl.constexpr = GEOM[2]
+    LN: gl.constexpr = GEOM[3]
+    Q: gl.constexpr = tile_blocks(BM, TM, BN, LN, "q")[B]
+    KK: gl.constexpr = tile_blocks(BM, TM, BN, LN, "k")[B]
+    owner_store(
+        accs[Q][KK],
+        psum,
+        tile_blocks(BM, TM, BN, LN, "r0")[B],
+        tile_blocks(BM, TM, BN, LN, "c0")[B],
+        bias_ptr,
+        pid_n,
+        c_bases[Q][KK],
+        c_offs[Q][KK],
+        BN,
+        ADD_BIAS,
+        out_dtype,
+        mfmaLayout,
+        m_left,
+        n_left,
+        EVEN_M,
+        EVEN_N,
+    )
+
+
+@gluon.jit
+def whole_tile_blocks(
+    accs,
+    pid_n,
+    bias_ptr,
+    c_bases,
+    c_offs,
+    m_left,
+    n_left,
+    BLOCK_M: gl.constexpr,
+    BLOCK_N: gl.constexpr,
+    TOP_M: gl.constexpr,
+    LEFT_N: gl.constexpr,
+    ADD_BIAS: gl.constexpr,
+    out_dtype: gl.constexpr,
+    mfmaLayout: gl.constexpr,
+    EVEN_M: gl.constexpr,
+    EVEN_N: gl.constexpr,
+):
+    """An uneven tile that no other program shares: its blocks straight to C."""
+    GEOM: gl.constexpr = (BLOCK_M, TOP_M, BLOCK_N, LEFT_N)
+    QS: gl.constexpr = tile_blocks(BLOCK_M, TOP_M, BLOCK_N, LEFT_N, "q")
+    KS: gl.constexpr = tile_blocks(BLOCK_M, TOP_M, BLOCK_N, LEFT_N, "k")
+    for B in gl.static_range(len(QS)):
+        owner_store_block(
+            accs,
+            gl.zeros(accs[QS[B]][KS[B]].shape, gl.float32, mfmaLayout),
+            B,
+            GEOM,
+            bias_ptr,
+            pid_n,
+            c_bases,
+            c_offs,
+            m_left,
+            n_left,
+            ADD_BIAS,
+            out_dtype,
+            mfmaLayout,
+            EVEN_M,
+            EVEN_N,
+        )
+
+
+@gluon.jit
+def reduce_scatter_blocks(
+    p_ptr,
+    bias_ptr,
+    c_tile,
+    b,
+    j,
+    n,
+    readers,
+    pid_n,
+    stride_cm,
+    stride_cn,
+    BLOCK_M: gl.constexpr,
+    BLOCK_N: gl.constexpr,
+    TOP_M: gl.constexpr,
+    LEFT_N: gl.constexpr,
+    ADD_BIAS: gl.constexpr,
+    NB: gl.constexpr,
+    U: gl.constexpr,
+    out_dtype: gl.constexpr,
+    LOAD_CACHE: gl.constexpr,
+    m_left,
+    n_left,
+    EVEN_M: gl.constexpr,
+    EVEN_N: gl.constexpr,
+):
+    """reduce_scatter_slice of an uneven tile. The slot's parts are cut into groups
+    of up to NB blocks that stay inside one part (rs_part_groups), and reader j of
+    `readers` reduces groups [G j / readers, G (j + 1) / readers) of the G in all, a
+    part at a time: each group's blocks are loaded and summed as in the power-of-two
+    slice, with as many loads in flight (NB U), and stored as their band of C. A 16-bit
+    pair of one-block blocks is one group whose two blocks are stored where they lie."""
+    P16: gl.constexpr = is_16bit_partial(p_ptr)
+    G: gl.constexpr = rs_part_groups(BLOCK_M, TOP_M, BLOCK_N, LEFT_N, P16, NB, "total")
+    NPARTS: gl.constexpr = len(tile_parts(BLOCK_M, TOP_M, BLOCK_N, LEFT_N, P16, "nb"))
+    glo = (G * j) // readers
+    ghi = (G * (j + 1)) // readers
+    # reduce_scatter_slice's lane order and in-block offsets.
+    L3: gl.constexpr = gl.BlockedLayout([1, 1, 4], [1, 16, 4], [1, 2, 2], [1, 2, 0])
+    r = gl.arange(0, 32, gl.SliceLayout(0, gl.SliceLayout(2, L3)))[None, :, None]
+    c = gl.arange(0, 32, gl.SliceLayout(0, gl.SliceLayout(1, L3)))[None, None, :]
+    GROUPS: gl.constexpr = MFMA_DIM // MFMA_LANE_ELEMS
+    in_blk = (
+        (r % MFMA_DIM) * MFMA_LANE_ELEMS
+        + (r // MFMA_DIM) * (2 * MFMA_WARP_ELEMS)
+        + c
+        + (c // MFMA_LANE_ELEMS % GROUPS) * (MFMA_GROUP_ELEMS - MFMA_LANE_ELEMS)
+        + (c // MFMA_DIM) * (MFMA_WARP_ELEMS - MFMA_DIM)
+    )
+    for P in gl.static_range(NPARTS):
+        rs_part(
+            p_ptr,
+            bias_ptr,
+            c_tile,
+            b,
+            n,
+            glo,
+            ghi,
+            pid_n,
+            stride_cm,
+            stride_cn,
+            r,
+            c,
+            in_blk,
+            P,
+            (BLOCK_M, TOP_M, BLOCK_N, LEFT_N),
+            P16,
+            ADD_BIAS,
+            NB,
+            U,
+            out_dtype,
+            LOAD_CACHE,
+            m_left,
+            n_left,
+            EVEN_M,
+            EVEN_N,
+        )
+
+
+@gluon.jit
+def rs_part(
+    p_ptr,
+    bias_ptr,
+    c_tile,
+    b,
+    n,
+    glo,
+    ghi,
+    pid_n,
+    stride_cm,
+    stride_cn,
+    r,
+    c,
+    in_blk,
+    P: gl.constexpr,
+    GEOM: gl.constexpr,
+    P16: gl.constexpr,
+    ADD_BIAS: gl.constexpr,
+    NB: gl.constexpr,
+    U: gl.constexpr,
+    out_dtype: gl.constexpr,
+    LOAD_CACHE: gl.constexpr,
+    m_left,
+    n_left,
+    EVEN_M: gl.constexpr,
+    EVEN_N: gl.constexpr,
+):
+    """reduce_scatter_blocks' groups [glo, ghi) that lie in part P."""
+    BM: gl.constexpr = GEOM[0]
+    TM: gl.constexpr = GEOM[1]
+    BN: gl.constexpr = GEOM[2]
+    LN: gl.constexpr = GEOM[3]
+    SLOT: gl.constexpr = BM * BN
+    B0: gl.constexpr = tile_parts(BM, TM, BN, LN, P16, "b0")[P]
+    PAIR: gl.constexpr = tile_parts(BM, TM, BN, LN, P16, "nb")[P] == 2
+    OFF: gl.constexpr = tile_parts(BM, TM, BN, LN, P16, "off")[P]
+    VN: gl.constexpr = tile_parts(BM, TM, BN, LN, P16, "cols")[P] // 32
+    R0: gl.constexpr = tile_blocks(BM, TM, BN, LN, "r0")[B0]
+    C0: gl.constexpr = tile_blocks(BM, TM, BN, LN, "c0")[B0]
+    NBR: gl.constexpr = rs_part_groups(BM, TM, BN, LN, P16, NB, "nb")[P]
+    GS: gl.constexpr = rs_part_groups(BM, TM, BN, LN, P16, NB, "gs")[P]
+    GR: gl.constexpr = rs_part_groups(BM, TM, BN, LN, P16, NB, "gr")[P]
+    # As many loads in flight as the power-of-two slice's NB U.
+    UR: gl.constexpr = max(U * NB // NBR, 1)
+    L3: gl.constexpr = gl.BlockedLayout([1, 1, 4], [1, 16, 4], [1, 2, 2], [1, 2, 0])
+    i = gl.arange(0, NBR, gl.SliceLayout(1, gl.SliceLayout(2, L3)))[:, None, None]
+    ib = gl.arange(0, NBR, gl.SliceLayout(1, gl.SliceLayout(1, L3)))[:, None]
+    cb = gl.arange(0, 32, gl.SliceLayout(0, gl.SliceLayout(1, L3)))[None, :]
+    # A lone 16-bit block is read as an fp32 block is, 4 elements (8 bytes) per lane.
+    PAIRS: gl.constexpr = P16 and not tile_parts(BM, TM, BN, LN, P16, "lone")[P]
+    if PAIRS:
+        L4: gl.constexpr = gl.BlockedLayout(
+            [1, 1, 1, 8], [1, 16, 4, 1], [1, 2, 2, 1], [3, 1, 2, 0]
+        )
+        in_pair = pair_offsets(NBR // 2, L4)
+    for gg in range(gl.maximum(glo, GS), gl.minimum(ghi, GS + GR)):
+        g0 = gg - GS
+        if PAIRS:
+            p_off = OFF + g0 * (NBR // 2) * (2 * MFMA_BLOCK_ELEMS) + in_pair
+            s4 = gl.zeros((NBR // 2, 32, 8, 8), gl.float32, L4)
+            for p0 in range(0, n, UR):
+                for u in gl.static_range(UR):
+                    slot = p_ptr + (b + p0 + u).to(gl.int64) * SLOT
+                    s4 += gl.amd.cdna3.buffer_load(
+                        ptr=slot,
+                        offsets=p_off,
+                        mask=p0 + u < n,
+                        other=0.0,
+                        cache=LOAD_CACHE,
+                    ).to(gl.float32)
+            s = gl.permute(gl.reshape(s4, [NBR // 2, 32, 8, 2, 4]), [0, 3, 1, 2, 4])
+            s = gl.convert_layout(gl.reshape(s, [NBR, 32, 32]), L3, assert_trivial=True)
+        else:
+            p_off = OFF + (g0 * NBR + i) * MFMA_BLOCK_ELEMS + in_blk
+            s = gl.zeros((NBR, 32, 32), gl.float32, L3)
+            for p0 in range(0, n, UR):
+                for u in gl.static_range(UR):
+                    slot = p_ptr + (b + p0 + u).to(gl.int64) * SLOT
+                    s += gl.amd.cdna3.buffer_load(
+                        ptr=slot,
+                        offsets=p_off,
+                        mask=p0 + u < n,
+                        other=0.0,
+                        cache=LOAD_CACHE,
+                    ).to(gl.float32)
+        if PAIR:
+            # Two one-block blocks, each where it lies in the tile.
+            R1: gl.constexpr = tile_blocks(BM, TM, BN, LN, "r0")[B0 + 1]
+            C1: gl.constexpr = tile_blocks(BM, TM, BN, LN, "c0")[B0 + 1]
+            col_b = gl.where(ib == 0, C0, C1) + cb
+            trow = gl.where(i == 0, R0, R1) + r
+            tcol = gl.where(i == 0, C0, C1) + c
+        else:
+            v0 = g0 * NBR
+            col_b = C0 + ((v0 + ib) % VN) * 32 + cb
+        if ADD_BIAS:
+            if EVEN_N:
+                bias = gl.amd.cdna3.buffer_load(
+                    ptr=bias_ptr + pid_n * BN, offsets=col_b
+                )
+            else:
+                bias = gl.amd.cdna3.buffer_load(
+                    ptr=bias_ptr + pid_n * BN,
+                    offsets=col_b,
+                    mask=col_b < n_left,
+                    other=0.0,
+                )
+            s = s + bias.to(gl.float32)[:, None, :]
+        if PAIR:
+            cs = s.to(out_dtype)
+        else:
+            CB: gl.constexpr = min(NBR, VN)
+            ROWS: gl.constexpr = 32 * (NBR // CB)
+            COLS: gl.constexpr = 32 * CB
+            SL: gl.constexpr = coalesced_store_layout(
+                ROWS, COLS, out_dtype.primitive_bitwidth // 8, gl.num_warps()
+            )
+            cs = gl.convert_layout(to_band(s.to(out_dtype), NBR, VN), SL)
+            rr = gl.arange(0, ROWS, gl.SliceLayout(1, SL))[:, None]
+            cc = gl.arange(0, COLS, gl.SliceLayout(0, SL))[None, :]
+            trow = R0 + (v0 // VN) * 32 + rr
+            tcol = C0 + (v0 % VN) * 32 + cc
+        # C's row stride is a multiple of 8 (reduce_scatter_slice).
+        if PAIR:
+            c_rows = gl.multiple_of(trow * stride_cm, [8, 8, 1])
+        else:
+            c_rows = gl.multiple_of(trow * stride_cm, [8, 1])
+        c_off = c_rows + tcol * stride_cn
+        if EVEN_M and EVEN_N:
+            gl.amd.cdna3.buffer_store(stored_value=cs, ptr=c_tile, offsets=c_off)
+        else:
+            gl.amd.cdna3.buffer_store(
+                stored_value=cs,
+                ptr=c_tile,
+                offsets=c_off,
+                mask=(trow < m_left) & (tcol < n_left),
+            )
 
 
 @gluon.jit
@@ -2783,6 +4463,8 @@ def reduce_scatter_slice(
     n_left,
     EVEN_M: gl.constexpr,
     EVEN_N: gl.constexpr,
+    TOP_M: gl.constexpr = 0,
+    LEFT_N: gl.constexpr = 0,
 ):
     """Reader j of `readers` (a power of two) of a tile split n ways: sums blocks
     [NBLK j / readers, NBLK (j + 1) / readers) over the n partials in slots P[b .. b + n
@@ -2796,143 +4478,177 @@ def reduce_scatter_slice(
 
     Each reader's NBLK / readers blocks are a whole number of groups
     (reduce_scatter_config), so every group lies inside [blk_lo, blk_hi)."""
-    HALF_M: gl.constexpr = BLOCK_M // 2
-    HALF_N: gl.constexpr = BLOCK_N // 2
-    VN: gl.constexpr = HALF_N // 32
-    VQ: gl.constexpr = VN * (HALF_M // 32)
-    NBLK: gl.constexpr = 4 * VQ
-    P16: gl.constexpr = is_16bit_partial(p_ptr)
-    PAIR_Q: gl.constexpr = P16 and VQ == 1
-    gl.static_assert(
-        NB <= VQ or (PAIR_Q and NB == 2),
-        "a reduce-scatter group must stay inside one quadrant",
-    )
-    gl.static_assert(not P16 or NB % 2 == 0)
-    # The band a group covers: PAIR_Q's is tile row p, two quadrants across.
-    VNB: gl.constexpr = 2 if PAIR_Q else VN
-    SLOT: gl.constexpr = BLOCK_M * BLOCK_N
-    blk_lo = (NBLK * j) // readers
-    blk_hi = (NBLK * (j + 1)) // readers
-    # Rows before columns in lane order: lane l gets row l % 16 and columns 4 (l // 16)
-    # .. + 3, which in_blk puts at 4 l .. 4 l + 3, so each 4-lane group reads 64
-    # contiguous bytes. Columns first, lanes 0-3 hit 4 lines 256 bytes apart and the L1
-    # stalls on tag conflicts (reads take twice as long).
-    L3: gl.constexpr = gl.BlockedLayout([1, 1, 4], [1, 16, 4], [1, 2, 2], [1, 2, 0])
-    cb = gl.arange(0, 32, gl.SliceLayout(0, gl.SliceLayout(1, L3)))[None, :]
-    ib = gl.arange(0, NB, gl.SliceLayout(1, gl.SliceLayout(1, L3)))[:, None]
-    if P16:
-        # The pairs in the same lane order, a lane's 8 elements the last dimension.
-        L4: gl.constexpr = gl.BlockedLayout(
-            [1, 1, 1, PAIR_LANE_ELEMS], [1, 16, 4, 1], [1, 2, 2, 1], [3, 1, 2, 0]
+    if is_uneven(BLOCK_M, TOP_M, BLOCK_N, LEFT_N):
+        reduce_scatter_blocks(
+            p_ptr,
+            bias_ptr,
+            c_tile,
+            b,
+            j,
+            n,
+            readers,
+            pid_n,
+            stride_cm,
+            stride_cn,
+            BLOCK_M,
+            BLOCK_N,
+            TOP_M,
+            LEFT_N,
+            ADD_BIAS,
+            NB,
+            U,
+            out_dtype,
+            LOAD_CACHE,
+            m_left,
+            n_left,
+            EVEN_M,
+            EVEN_N,
         )
-        ip = gl.arange(
-            0, NB // 2, gl.SliceLayout(1, gl.SliceLayout(2, gl.SliceLayout(3, L4)))
-        )
-        ip = ip[:, None, None, None]
-        in_pair = pair_offsets(NB // 2, L4)
     else:
-        i = gl.arange(0, NB, gl.SliceLayout(1, gl.SliceLayout(2, L3)))[:, None, None]
-        r = gl.arange(0, 32, gl.SliceLayout(0, gl.SliceLayout(2, L3)))[None, :, None]
-        c = gl.arange(0, 32, gl.SliceLayout(0, gl.SliceLayout(1, L3)))[None, None, :]
-        # in_block_row(r) + in_block_col(c) (the two add: lane_contiguous_offsets) for
-        # rows and columns 0-31, written without the modulo on bit 16 (the helpers'
-        # form costs instructions here).
-        GROUPS: gl.constexpr = MFMA_DIM // MFMA_LANE_ELEMS
-        in_blk = (
-            (r % MFMA_DIM) * MFMA_LANE_ELEMS
-            + (r // MFMA_DIM) * (2 * MFMA_WARP_ELEMS)
-            + c
-            + (c // MFMA_LANE_ELEMS % GROUPS) * (MFMA_GROUP_ELEMS - MFMA_LANE_ELEMS)
-            + (c // MFMA_DIM) * (MFMA_WARP_ELEMS - MFMA_DIM)
+        HALF_M: gl.constexpr = BLOCK_M // 2
+        HALF_N: gl.constexpr = BLOCK_N // 2
+        VN: gl.constexpr = HALF_N // 32
+        VQ: gl.constexpr = VN * (HALF_M // 32)
+        NBLK: gl.constexpr = 4 * VQ
+        P16: gl.constexpr = is_16bit_partial(p_ptr)
+        PAIR_Q: gl.constexpr = P16 and VQ == 1
+        gl.static_assert(
+            NB <= VQ or (PAIR_Q and NB == 2),
+            "a reduce-scatter group must stay inside one quadrant",
         )
-    # The band: min(NB, VNB) blocks across, the rest down.
-    ROWS: gl.constexpr = 32 * (NB // min(NB, VNB))
-    COLS: gl.constexpr = 32 * min(NB, VNB)
-    SL: gl.constexpr = coalesced_store_layout(
-        ROWS, COLS, out_dtype.primitive_bitwidth // 8, gl.num_warps()
-    )
-    for g in range(blk_lo, blk_hi, NB):
+        gl.static_assert(not P16 or NB % 2 == 0)
+        # The band a group covers: PAIR_Q's is tile row p, two quadrants across.
+        VNB: gl.constexpr = 2 if PAIR_Q else VN
+        SLOT: gl.constexpr = BLOCK_M * BLOCK_N
+        blk_lo = (NBLK * j) // readers
+        blk_hi = (NBLK * (j + 1)) // readers
+        # Rows before columns in lane order: lane l gets row l % 16 and columns 4 (l // 16)
+        # .. + 3, which in_blk puts at 4 l .. 4 l + 3, so each 4-lane group reads 64
+        # contiguous bytes. Columns first, lanes 0-3 hit 4 lines 256 bytes apart and the L1
+        # stalls on tag conflicts (reads take twice as long).
+        L3: gl.constexpr = gl.BlockedLayout([1, 1, 4], [1, 16, 4], [1, 2, 2], [1, 2, 0])
+        cb = gl.arange(0, 32, gl.SliceLayout(0, gl.SliceLayout(1, L3)))[None, :]
+        ib = gl.arange(0, NB, gl.SliceLayout(1, gl.SliceLayout(1, L3)))[:, None]
         if P16:
-            valid = g + 2 * ip < blk_hi
-            p_off = (g // 2) * PAIR_ELEMS + in_pair
-            s4 = gl.zeros(
-                (NB // 2, MFMA_BLOCK_DIM, BLOCK_GROUPS, PAIR_LANE_ELEMS), gl.float32, L4
+            # The pairs in the same lane order, a lane's 8 elements the last dimension.
+            L4: gl.constexpr = gl.BlockedLayout(
+                [1, 1, 1, PAIR_LANE_ELEMS], [1, 16, 4, 1], [1, 2, 2, 1], [3, 1, 2, 0]
             )
-            for p0 in range(0, n, U):
-                for u in gl.static_range(U):
-                    slot = p_ptr + (b + p0 + u).to(gl.int64) * SLOT
-                    s4 += gl.amd.cdna3.buffer_load(
-                        ptr=slot,
-                        offsets=p_off,
-                        mask=valid & (p0 + u < n),
-                        other=0.0,
-                        cache=LOAD_CACHE,
-                    ).to(gl.float32)
-            s = gl.permute(
-                gl.reshape(
-                    s4, [NB // 2, MFMA_BLOCK_DIM, BLOCK_GROUPS, 2, MFMA_LANE_ELEMS]
-                ),
-                [0, 3, 1, 2, 4],
+            ip = gl.arange(
+                0, NB // 2, gl.SliceLayout(1, gl.SliceLayout(2, gl.SliceLayout(3, L4)))
             )
-            s = gl.convert_layout(
-                gl.reshape(s, [NB, MFMA_BLOCK_DIM, MFMA_BLOCK_DIM]),
-                L3,
-                assert_trivial=True,
-            )
+            ip = ip[:, None, None, None]
+            in_pair = pair_offsets(NB // 2, L4)
         else:
-            blk = g + i
-            valid = blk < blk_hi
-            p_off = blk * MFMA_BLOCK_ELEMS + in_blk
-            s = gl.zeros((NB, 32, 32), gl.float32, L3)
-            for p0 in range(0, n, U):
-                for u in gl.static_range(U):
-                    slot = p_ptr + (b + p0 + u).to(gl.int64) * SLOT
-                    s += gl.amd.cdna3.buffer_load(
-                        ptr=slot,
-                        offsets=p_off,
-                        mask=valid & (p0 + u < n),
-                        other=0.0,
-                        cache=LOAD_CACHE,
-                    ).to(gl.float32)
-        if PAIR_Q:
-            g_band = g // 2
-            blk_b = g_band + 2 * ib
-        else:
-            g_band = g
-            blk_b = g + ib
-        if ADD_BIAS:
-            # Block q VQ + v: quadrant q (tl, bl, tr, br); register vector v's bits are
-            # the column blocks, then the row blocks.
-            qb = blk_b // VQ
-            vb = blk_b % VQ
-            col_b = (qb // 2) * HALF_N + block_col(vb, VN) + cb
-            if EVEN_N:
-                bias = gl.amd.cdna3.buffer_load(
-                    ptr=bias_ptr + pid_n * BLOCK_N, offsets=col_b
+            i = gl.arange(0, NB, gl.SliceLayout(1, gl.SliceLayout(2, L3)))[
+                :, None, None
+            ]
+            r = gl.arange(0, 32, gl.SliceLayout(0, gl.SliceLayout(2, L3)))[
+                None, :, None
+            ]
+            c = gl.arange(0, 32, gl.SliceLayout(0, gl.SliceLayout(1, L3)))[
+                None, None, :
+            ]
+            # in_block_row(r) + in_block_col(c) (the two add: lane_contiguous_offsets)
+            # for rows and columns 0-31; the helpers' form costs instructions here.
+            GROUPS: gl.constexpr = MFMA_DIM // MFMA_LANE_ELEMS
+            in_blk = (
+                (r % MFMA_DIM) * MFMA_LANE_ELEMS
+                + (r // MFMA_DIM) * (2 * MFMA_WARP_ELEMS)
+                + c
+                + (c // MFMA_LANE_ELEMS % GROUPS) * (MFMA_GROUP_ELEMS - MFMA_LANE_ELEMS)
+                + (c // MFMA_DIM) * (MFMA_WARP_ELEMS - MFMA_DIM)
+            )
+        # The band: min(NB, VNB) blocks across, the rest down.
+        ROWS: gl.constexpr = 32 * (NB // min(NB, VNB))
+        COLS: gl.constexpr = 32 * min(NB, VNB)
+        SL: gl.constexpr = coalesced_store_layout(
+            ROWS, COLS, out_dtype.primitive_bitwidth // 8, gl.num_warps()
+        )
+        for g in range(blk_lo, blk_hi, NB):
+            if P16:
+                valid = g + 2 * ip < blk_hi
+                p_off = (g // 2) * PAIR_ELEMS + in_pair
+                s4 = gl.zeros(
+                    (NB // 2, MFMA_BLOCK_DIM, BLOCK_GROUPS, PAIR_LANE_ELEMS),
+                    gl.float32,
+                    L4,
+                )
+                for p0 in range(0, n, U):
+                    for u in gl.static_range(U):
+                        slot = p_ptr + (b + p0 + u).to(gl.int64) * SLOT
+                        s4 += gl.amd.cdna3.buffer_load(
+                            ptr=slot,
+                            offsets=p_off,
+                            mask=valid & (p0 + u < n),
+                            other=0.0,
+                            cache=LOAD_CACHE,
+                        ).to(gl.float32)
+                s = gl.permute(
+                    gl.reshape(
+                        s4, [NB // 2, MFMA_BLOCK_DIM, BLOCK_GROUPS, 2, MFMA_LANE_ELEMS]
+                    ),
+                    [0, 3, 1, 2, 4],
+                )
+                s = gl.convert_layout(
+                    gl.reshape(s, [NB, MFMA_BLOCK_DIM, MFMA_BLOCK_DIM]),
+                    L3,
+                    assert_trivial=True,
                 )
             else:
-                bias = gl.amd.cdna3.buffer_load(
-                    ptr=bias_ptr + pid_n * BLOCK_N,
-                    offsets=col_b,
-                    mask=col_b < n_left,
-                    other=0.0,
+                blk = g + i
+                valid = blk < blk_hi
+                p_off = blk * MFMA_BLOCK_ELEMS + in_blk
+                s = gl.zeros((NB, 32, 32), gl.float32, L3)
+                for p0 in range(0, n, U):
+                    for u in gl.static_range(U):
+                        slot = p_ptr + (b + p0 + u).to(gl.int64) * SLOT
+                        s += gl.amd.cdna3.buffer_load(
+                            ptr=slot,
+                            offsets=p_off,
+                            mask=valid & (p0 + u < n),
+                            other=0.0,
+                            cache=LOAD_CACHE,
+                        ).to(gl.float32)
+            if PAIR_Q:
+                g_band = g // 2
+                blk_b = g_band + 2 * ib
+            else:
+                g_band = g
+                blk_b = g + ib
+            if ADD_BIAS:
+                # Block q VQ + v: quadrant q (tl, bl, tr, br); register vector v's bits are
+                # the column blocks, then the row blocks.
+                qb = blk_b // VQ
+                vb = blk_b % VQ
+                col_b = (qb // 2) * HALF_N + block_col(vb, VN) + cb
+                if EVEN_N:
+                    bias = gl.amd.cdna3.buffer_load(
+                        ptr=bias_ptr + pid_n * BLOCK_N, offsets=col_b
+                    )
+                else:
+                    bias = gl.amd.cdna3.buffer_load(
+                        ptr=bias_ptr + pid_n * BLOCK_N,
+                        offsets=col_b,
+                        mask=col_b < n_left,
+                        other=0.0,
+                    )
+                s = s + bias.to(gl.float32)[:, None, :]
+            cs = gl.convert_layout(to_band(s.to(out_dtype), NB, VNB), SL)
+            trow, tcol = band_pos(g_band, SL, ROWS, COLS, HALF_M, HALF_N)
+            # C's row stride is a multiple of 8 (the wrapper checks), which the launch
+            # only proves when it is one of 16: without the hint an N of 8 mod 16
+            # stores 2 bytes at a time.
+            c_off = gl.multiple_of(trow * stride_cm, [8, 1]) + tcol * stride_cn
+            if EVEN_M and EVEN_N:
+                gl.amd.cdna3.buffer_store(stored_value=cs, ptr=c_tile, offsets=c_off)
+            else:
+                gl.amd.cdna3.buffer_store(
+                    stored_value=cs,
+                    ptr=c_tile,
+                    offsets=c_off,
+                    mask=(trow < m_left) & (tcol < n_left),
                 )
-            s = s + bias.to(gl.float32)[:, None, :]
-        cs = gl.convert_layout(to_band(s.to(out_dtype), NB, VNB), SL)
-        trow, tcol = band_pos(g_band, SL, ROWS, COLS, HALF_M, HALF_N)
-        # C's row stride is a multiple of 8 (the wrapper checks), which the launch only
-        # proves when it is one of 16: without the hint an N of 8 mod 16 stores 2
-        # bytes at a time.
-        c_off = gl.multiple_of(trow * stride_cm, [8, 1]) + tcol * stride_cn
-        if EVEN_M and EVEN_N:
-            gl.amd.cdna3.buffer_store(stored_value=cs, ptr=c_tile, offsets=c_off)
-        else:
-            gl.amd.cdna3.buffer_store(
-                stored_value=cs,
-                ptr=c_tile,
-                offsets=c_off,
-                mask=(trow < m_left) & (tcol < n_left),
-            )
 
 
 @gluon.jit
@@ -2947,7 +4663,7 @@ def rs_ending(
     p_ptr,
     sync_ptr,
     c_bases,
-    c_offsets,
+    c_offs,
     stride_cm,
     stride_cn,
     m_left,
@@ -2958,12 +4674,13 @@ def rs_ending(
     RS_NB: gl.constexpr,
     RS_U: gl.constexpr,
     out_dtype: gl.constexpr,
-    gStoreLayoutC: gl.constexpr,
     mfmaLayout: gl.constexpr,
     EVEN_M: gl.constexpr,
     EVEN_N: gl.constexpr,
     RS_E: gl.constexpr = 0,
     BAR_STRIDE: gl.constexpr = 0,
+    TOP_M: gl.constexpr = 0,
+    LEFT_N: gl.constexpr = 0,
 ):
     """The reduce-scatter ending of tile-aligned segment j of n_tile (its slots are
     rank - j .. + n_tile - 1). A whole tile stores C directly. A split tile's programs
@@ -2975,34 +4692,59 @@ def rs_ending(
     r_tile - 1 (rs_extra_reader) and arrive too, so the barrier counts n_tile + RS_E.
     Tile t's barrier is slot t BAR_STRIDE (0: rank - j = t n_tile), which gives each
     tile its own cache line (rs_readers)."""
-    HALF_M: gl.constexpr = BLOCK_M // 2
-    HALF_N: gl.constexpr = BLOCK_N // 2
     is_split = gl.to_tensor(n_tile > 1).to(gl.int32)
-    p_offsets = partial_map(p_ptr, HALF_M, HALF_N, mfmaLayout)[0]
-    z = gl.zeros((HALF_M, HALF_N), gl.float32, mfmaLayout)
-    for q in gl.static_range(4):
+    if is_uneven(BLOCK_M, TOP_M, BLOCK_N, LEFT_N):
         if is_split != 0:
-            store_partial(accs, q, p_ptr, rank, p_offsets, HALF_M, HALF_N)
+            store_partial_blocks(
+                accs, p_ptr, rank, (BLOCK_M, TOP_M, BLOCK_N, LEFT_N), mfmaLayout, ".wt"
+            )
         if is_split == 0:
-            owner_store(
-                accs[q],
-                z,
-                q,
-                bias_ptr,
+            whole_tile_blocks(
+                accs,
                 pid_n,
-                c_bases[q],
-                c_offsets,
-                BLOCK_N,
-                HALF_N,
-                ADD_BIAS,
-                out_dtype,
-                gStoreLayoutC,
-                mfmaLayout,
+                bias_ptr,
+                c_bases,
+                c_offs,
                 m_left,
                 n_left,
+                BLOCK_M,
+                BLOCK_N,
+                TOP_M,
+                LEFT_N,
+                ADD_BIAS,
+                out_dtype,
+                mfmaLayout,
                 EVEN_M,
                 EVEN_N,
             )
+    else:
+        HALF_M: gl.constexpr = BLOCK_M // 2
+        HALF_N: gl.constexpr = BLOCK_N // 2
+        quads = (accs[0][0], accs[1][0], accs[2][0], accs[3][0])
+        p_offsets = partial_map(p_ptr, HALF_M, HALF_N, mfmaLayout)[0]
+        z = gl.zeros((HALF_M, HALF_N), gl.float32, mfmaLayout)
+        for q in gl.static_range(4):
+            if is_split != 0:
+                store_partial(quads, q, p_ptr, rank, p_offsets, HALF_M, HALF_N)
+            if is_split == 0:
+                owner_store(
+                    quads[q],
+                    z,
+                    (q % 2) * HALF_M,
+                    (q // 2) * HALF_N,
+                    bias_ptr,
+                    pid_n,
+                    c_bases[q][0],
+                    c_offs[q][0],
+                    BLOCK_N,
+                    ADD_BIAS,
+                    out_dtype,
+                    mfmaLayout,
+                    m_left,
+                    n_left,
+                    EVEN_M,
+                    EVEN_N,
+                )
     if n_tile > 1:
         # The arrival may only become visible after all four waves' partial stores have
         # completed.
@@ -3016,7 +4758,7 @@ def rs_ending(
             reduce_scatter_slice(
                 p_ptr,
                 bias_ptr,
-                c_bases[0] + pid_n * BLOCK_N * stride_cn,
+                c_bases[0][0] + pid_n * BLOCK_N * stride_cn,
                 rank - j,
                 j,
                 n_tile,
@@ -3035,6 +4777,8 @@ def rs_ending(
                 n_left,
                 EVEN_M,
                 EVEN_N,
+                TOP_M,
+                LEFT_N,
             )
 
 
@@ -3063,6 +4807,8 @@ def rs_extra_reader(
     EVEN_M: gl.constexpr,
     EVEN_N: gl.constexpr,
     BAR_STRIDE: gl.constexpr,
+    TOP_M: gl.constexpr = 0,
+    LEFT_N: gl.constexpr = 0,
 ):
     """An idle program as reader jr (TAIL_SPLIT_K <= jr < R) of Stream-K tile t
     (rs_ending with RS_E > 0). It arrives on the tile's barrier at once: a waiter that
@@ -3101,6 +4847,8 @@ def rs_extra_reader(
         n_left,
         EVEN_M,
         EVEN_N,
+        TOP_M,
+        LEFT_N,
     )
 
 
@@ -3116,7 +4864,7 @@ def l2_rs_ending(
     p_ptr,
     sync_ptr,
     c_bases,
-    c_offsets,
+    c_offs,
     stride_cm,
     stride_cn,
     m_left,
@@ -3129,41 +4877,67 @@ def l2_rs_ending(
     NUM_PROGRAMS: gl.constexpr,
     NUM_XCDS: gl.constexpr,
     out_dtype: gl.constexpr,
-    gStoreLayoutC: gl.constexpr,
     mfmaLayout: gl.constexpr,
     EVEN_M: gl.constexpr,
     EVEN_N: gl.constexpr,
+    TOP_M: gl.constexpr = 0,
+    LEFT_N: gl.constexpr = 0,
 ):
     """XCD-local reduce-scatter ending with graph-replay-safe flag rows: rs_ending
     with the partials kept in the XCD's L2 (default-policy stores, .cg loads)."""
-    HALF_M: gl.constexpr = BLOCK_M // 2
-    HALF_N: gl.constexpr = BLOCK_N // 2
     is_split = gl.to_tensor(n_tile > 1).to(gl.int32)
-    p_offsets = partial_map(p_ptr, HALF_M, HALF_N, mfmaLayout)[0]
-    z = gl.zeros((HALF_M, HALF_N), gl.float32, mfmaLayout)
-    for q in gl.static_range(4):
+    if is_uneven(BLOCK_M, TOP_M, BLOCK_N, LEFT_N):
         if is_split != 0:
-            store_partial(accs, q, p_ptr, rank, p_offsets, HALF_M, HALF_N, "")
+            store_partial_blocks(
+                accs, p_ptr, rank, (BLOCK_M, TOP_M, BLOCK_N, LEFT_N), mfmaLayout, ""
+            )
         if is_split == 0:
-            owner_store(
-                accs[q],
-                z,
-                q,
-                bias_ptr,
+            whole_tile_blocks(
+                accs,
                 pid_n,
-                c_bases[q],
-                c_offsets,
-                BLOCK_N,
-                HALF_N,
-                ADD_BIAS,
-                out_dtype,
-                gStoreLayoutC,
-                mfmaLayout,
+                bias_ptr,
+                c_bases,
+                c_offs,
                 m_left,
                 n_left,
+                BLOCK_M,
+                BLOCK_N,
+                TOP_M,
+                LEFT_N,
+                ADD_BIAS,
+                out_dtype,
+                mfmaLayout,
                 EVEN_M,
                 EVEN_N,
             )
+    else:
+        HALF_M: gl.constexpr = BLOCK_M // 2
+        HALF_N: gl.constexpr = BLOCK_N // 2
+        quads = (accs[0][0], accs[1][0], accs[2][0], accs[3][0])
+        p_offsets = partial_map(p_ptr, HALF_M, HALF_N, mfmaLayout)[0]
+        z = gl.zeros((HALF_M, HALF_N), gl.float32, mfmaLayout)
+        for q in gl.static_range(4):
+            if is_split != 0:
+                store_partial(quads, q, p_ptr, rank, p_offsets, HALF_M, HALF_N, "")
+            if is_split == 0:
+                owner_store(
+                    quads[q],
+                    z,
+                    (q % 2) * HALF_M,
+                    (q // 2) * HALF_N,
+                    bias_ptr,
+                    pid_n,
+                    c_bases[q][0],
+                    c_offs[q][0],
+                    BLOCK_N,
+                    ADD_BIAS,
+                    out_dtype,
+                    mfmaLayout,
+                    m_left,
+                    n_left,
+                    EVEN_M,
+                    EVEN_N,
+                )
     if n_tile > 1:
         drain_and_barrier()
         is_reader = j < r_tile
@@ -3174,7 +4948,7 @@ def l2_rs_ending(
             reduce_scatter_slice(
                 p_ptr,
                 bias_ptr,
-                c_bases[0] + pid_n * BLOCK_N * stride_cn,
+                c_bases[0][0] + pid_n * BLOCK_N * stride_cn,
                 rank - j,
                 j,
                 n_tile,
@@ -3193,6 +4967,8 @@ def l2_rs_ending(
                 n_left,
                 EVEN_M,
                 EVEN_N,
+                TOP_M,
+                LEFT_N,
             )
 
 
@@ -3232,8 +5008,8 @@ def quadrant_segment(
     NUM_PROGRAMS: gl.constexpr,
     NUM_XCDS: gl.constexpr,
     mfmaLayout: gl.constexpr,
-    gLoadLayoutA: gl.constexpr,
-    gLoadLayoutB: gl.constexpr,
+    TOP_M: gl.constexpr,
+    LEFT_N: gl.constexpr,
     EVEN_M: gl.constexpr,
     EVEN_N: gl.constexpr,
     EVEN_K: gl.constexpr,
@@ -3270,9 +5046,13 @@ def quadrant_segment(
 
     PREFETCHED: the first pair is already in flight in the state load_first_pair
     leaves (the last persistent trip's epilogue loaded it), with its first operands in
-    a_top_in / b_left_in."""
+    a_top_in / b_left_in.
+
+    TOP_M / LEFT_N: the (sub-)tile's first halves (uneven halves; 0: equal)."""
     stride_am, stride_ak, stride_bk, stride_bn, stride_cm, stride_cn = strides
-    a_offsets, a_bot_shift, b_offsets, b_right_shift = kofs
+    a_kofs, b_kofs = kofs
+    a_dtype: gl.constexpr = a_ptr.dtype.element_ty
+    b_dtype: gl.constexpr = b_ptr.dtype.element_ty
     dotOpLayoutA: gl.constexpr = gl.DotOperandLayout(
         operand_index=0, parent=mfmaLayout, k_width=8
     )
@@ -3291,28 +5071,19 @@ def quadrant_segment(
     n_left = gl.multiple_of(N - pid_n * BLOCK_N, 8)
 
     a_addr = a_load_addressing(
-        pid_m,
-        a_offsets,
-        a_bot_shift,
-        M,
-        stride_am,
-        stride_ak,
-        BLOCK_M,
-        BLOCK_K,
-        gLoadLayoutA,
-        EVEN_M,
+        pid_m, a_kofs, M, stride_am, stride_ak, BLOCK_M, BLOCK_K, EVEN_M, a_dtype, TOP_M
     )
     b_addr = b_load_addressing(
         pid_n,
-        b_offsets,
-        b_right_shift,
+        b_kofs,
         N,
         stride_bk,
         stride_bn,
         BLOCK_N,
         BLOCK_K,
-        gLoadLayoutB,
         EVEN_N,
+        b_dtype,
+        LEFT_N,
     )
 
     # Pair i of the segment (i >= 1) at a_tile + 2 BLOCK_K i; its first pair at a_tile,
@@ -3332,7 +5103,16 @@ def quadrant_segment(
         else:
             k_hi = gl.where(k0 == 0, 2 * BLOCK_K - K_RES, 2 * BLOCK_K)
             mask_a0, mask_b0, mask_a1, mask_b1 = tail_pair_masks(
-                k_hi, K_RES, BLOCK_M, BLOCK_N, BLOCK_K, gLoadLayoutA, gLoadLayoutB
+                k_hi,
+                K_RES,
+                BLOCK_M,
+                BLOCK_N,
+                BLOCK_K,
+                a_dtype,
+                b_dtype,
+                False,
+                TOP_M,
+                LEFT_N,
             )
         a_top, b_left = load_first_pair(
             a_row + first_col * stride_ak,
@@ -3354,7 +5134,7 @@ def quadrant_segment(
     # The first pair is peeled: the constant-zero accumulator becomes the MFMA's
     # inline-0 C operand, so no AGPRs are zeroed per segment (a loop-carried zero
     # would be materialised).
-    accs = init_acc(bias_ptr, pid_n, BLOCK_M, BLOCK_N, mfmaLayout, False)
+    accs = init_acc(bias_ptr, pid_n, BLOCK_M, BLOCK_N, mfmaLayout, False, TOP_M, LEFT_N)
     nxt = gl.maximum(gl.minimum(1, n_pairs - 1).to(gl.int64) * 2, nxt_lo)
     accs, a_top, b_left = k_step_pair(
         accs,
@@ -3387,22 +5167,23 @@ def quadrant_segment(
     drain_and_barrier()
 
     out_dtype: gl.constexpr = c_ptr.dtype.element_ty
-    gStoreLayoutC: gl.constexpr = coalesced_store_layout(
-        BLOCK_M // 2, BLOCK_N // 2, out_dtype.primitive_bitwidth // 8, gl.num_warps()
+    c_bases, c_offs, _ = c_store_addressing(
+        c_ptr,
+        pid_m,
+        pid_n,
+        m_left,
+        n_left,
+        stride_cm,
+        stride_cn,
+        BLOCK_M,
+        BLOCK_N,
+        TOP_M,
+        LEFT_N,
+        SEG_LOOP,
+        False,
+        EVEN_M,
+        EVEN_N,
     )
-    offs_cm = gl.arange(0, BLOCK_M // 2, gl.SliceLayout(1, gStoreLayoutC))
-    offs_cn = gl.arange(0, BLOCK_N // 2, gl.SliceLayout(0, gStoreLayoutC))
-    c_tl_base = c_ptr + pid_m.to(gl.int64) * BLOCK_M * stride_cm
-    col = pid_n * BLOCK_N + offs_cn
-    if SEG_LOOP:
-        c_rows = gl.multiple_of(stride_cm * gl.minimum(offs_cm, m_left - 1), 8)
-    else:
-        c_rows = gl.multiple_of(stride_cm * offs_cm, 8)
-    c_offsets = c_rows[:, None] + stride_cn * col[None, :]
-    c_tr_base = c_tl_base + BLOCK_N * stride_cn // 2
-    c_bl_base = c_tl_base + BLOCK_M * stride_cm // 2
-    c_br_base = c_bl_base + BLOCK_N * stride_cn // 2
-    c_bases = (c_tl_base, c_bl_base, c_tr_base, c_br_base)
 
     if L2:
         l2_rs_ending(
@@ -3416,7 +5197,7 @@ def quadrant_segment(
             p_ptr,
             sync_ptr,
             c_bases,
-            c_offsets,
+            c_offs,
             stride_cm,
             stride_cn,
             m_left,
@@ -3429,10 +5210,11 @@ def quadrant_segment(
             NUM_PROGRAMS,
             NUM_XCDS,
             out_dtype,
-            gStoreLayoutC,
             mfmaLayout,
             EVEN_M,
             EVEN_N,
+            TOP_M,
+            LEFT_N,
         )
     elif REDUCE_SCATTER:
         rs_ending(
@@ -3446,7 +5228,7 @@ def quadrant_segment(
             p_ptr,
             sync_ptr,
             c_bases,
-            c_offsets,
+            c_offs,
             stride_cm,
             stride_cn,
             m_left,
@@ -3457,12 +5239,13 @@ def quadrant_segment(
             RS_NB,
             RS_U,
             out_dtype,
-            gStoreLayoutC,
             mfmaLayout,
             EVEN_M,
             EVEN_N,
             RS_E,
             BAR_STRIDE,
+            TOP_M,
+            LEFT_N,
         )
     else:
         owner_ending(
@@ -3475,19 +5258,21 @@ def quadrant_segment(
             p_ptr,
             locks_ptr,
             c_bases,
-            c_offsets,
+            c_offs,
             m_left,
             n_left,
             BLOCK_N,
             PEER_STEP,
             ADD_BIAS,
             out_dtype,
-            gStoreLayoutC,
             mfmaLayout,
             EVEN_M,
             EVEN_N,
             OWNER_QPB,
             OWNER_MAX_PEERS,
+            BLOCK_M,
+            TOP_M,
+            LEFT_N,
         )
 
 
@@ -3504,7 +5289,10 @@ def schedule_hint():
 # Host side: configuration, topology and plan (no tensors; the launch is the wrapper's)
 # ---------------------------------------------------------------------------------
 
-TILE_SIDES = (64, 128, 256)
+# Tile sides: any multiple of 32 from 64 to 320 (uneven_first splits each into two
+# valid halves), with at most MAX_ACC accumulators (256 fp32 AGPRs per lane).
+TILE_SIDES = tuple(range(64, 321, 32))
+MAX_ACC = 256 * 256
 BLOCK_K_SIDES = (64, 128)
 STREAMK_POLICIES = ("dp", "dp_sub", "one_tile", "two_tile", "spread")
 STREAMK_FIXUPS = ("owner", "rs")
@@ -3525,12 +5313,36 @@ CONFIG_KEYS = {
 }
 # Keys a complete config may leave out (StreamKConfig's defaults).
 OPTIONAL_KEYS = ("STREAMK_PARTIALS",)
-MAX_TILE_ELEMS = max(TILE_SIDES) ** 2
+MAX_TILE_ELEMS = MAX_ACC
+
+
+def _valid_half(rows):
+    """A half of `rows` rows: a power of two, plus nothing or a power of two of at
+    least 32."""
+    extra = rows - (1 << (rows.bit_length() - 1))
+    return extra == 0 or (extra >= 32 and extra & (extra - 1) == 0)
+
+
+def uneven_first(side):
+    """The first half (top or left) of a tile side, the kernel's TOP_M / LEFT_N: 0
+    (side / 2) for a power of two, else the side's 32-wide pieces split as evenly as
+    two valid halves allow, the larger half first (224 = 128 + 96, 160 = 96 + 64)."""
+    if side & (side - 1) == 0:
+        return 0
+    pieces = side // 32
+    for big in range((pieces + 1) // 2, pieces):
+        if _valid_half(32 * big) and _valid_half(32 * (pieces - big)):
+            return 32 * big
+    raise ValueError(
+        f"side {side}: no split into two halves of a power of two + 32 or 64"
+    )
 
 
 @dataclass(frozen=True)
 class TileSpec:
-    """One supported tile: sides in TILE_SIDES, BLOCK_K in BLOCK_K_SIDES."""
+    """One supported tile: sides in TILE_SIDES with at most MAX_ACC accumulators,
+    BLOCK_K in BLOCK_K_SIDES (128 only when BLOCK_M + BLOCK_N <= 256, so the
+    double-buffered A and B fit in LDS)."""
 
     block_m: int
     block_n: int
@@ -3544,8 +5356,32 @@ class TileSpec:
                 f"BLOCK_M and BLOCK_N must be in {TILE_SIDES}, "
                 f"got {self.block_m}x{self.block_n}"
             )
+        if self.block_m * self.block_n > MAX_ACC:
+            raise ValueError(
+                f"tile {self.block_m}x{self.block_n} has more than {MAX_ACC} "
+                "accumulators"
+            )
         if self.block_k not in BLOCK_K_SIDES:
             raise ValueError(f"BLOCK_K must be in {BLOCK_K_SIDES}, got {self.block_k}")
+        if self.block_k == 128 and self.block_m + self.block_n > 256:
+            raise ValueError(
+                f"BLOCK_K 128 needs BLOCK_M + BLOCK_N <= 256 (LDS), got "
+                f"{self.block_m}x{self.block_n}"
+            )
+
+    @property
+    def top_m(self):
+        """The kernel's TOP_M (uneven_first)."""
+        return uneven_first(self.block_m)
+
+    @property
+    def left_n(self):
+        return uneven_first(self.block_n)
+
+    @property
+    def uneven(self):
+        """True unless both sides are powers of two (two equal halves)."""
+        return is_uneven(self.block_m, self.top_m, self.block_n, self.left_n)
 
     @property
     def blocks(self):
@@ -3554,7 +5390,45 @@ class TileSpec:
 
     @property
     def quadrant_blocks(self):
-        return self.blocks // 4
+        """The most 32x32 blocks a reduce-scatter group can hold: a quadrant's, or an
+        uneven tile's largest block's (tile_blocks)."""
+        if not self.uneven:
+            return self.blocks // 4
+        return max(
+            tile_blocks(self.block_m, self.top_m, self.block_n, self.left_n, "vq")
+        )
+
+
+def menu_tiles():
+    """Every supported (BLOCK_M, BLOCK_N, BLOCK_K) (TileSpec)."""
+    out = []
+    for bm in TILE_SIDES:
+        for bn in TILE_SIDES:
+            for bk in BLOCK_K_SIDES:
+                try:
+                    TileSpec(bm, bn, bk)
+                except ValueError:
+                    continue
+                out.append((bm, bn, bk))
+    return out
+
+
+def tuning_tiles(spec):
+    """The tiles tuning_candidates(tiles=) takes for a tuner's tile option: None for
+    None or "default" (TUNING_TILES), menu_tiles() for "menu", or a comma-separated
+    list of BLOCK_MxBLOCK_NxBLOCK_K, each checked by TileSpec (ValueError)."""
+    if spec is None or spec == "default":
+        return None
+    if spec == "menu":
+        return menu_tiles()
+    tiles = []
+    for item in spec.split(","):
+        sides = item.strip().lower().split("x")
+        if len(sides) != 3 or not all(s.isdigit() for s in sides):
+            raise ValueError(f"a tile is BLOCK_MxBLOCK_NxBLOCK_K, got {item!r}")
+        TileSpec(*map(int, sides))
+        tiles.append(tuple(map(int, sides)))
+    return tiles
 
 
 @dataclass(frozen=True)
@@ -3635,9 +5509,9 @@ def pow2_floor(x):
 
 
 def max_readers(tile, p16=False):
-    """The most reduce-scatter readers of a tile: one per 32x32 block, or per pair of
-    blocks with 16-bit partials (a reader reads whole pairs)."""
-    return tile.blocks // 2 if p16 else tile.blocks
+    """The most reduce-scatter readers of a tile, a power of two: up to one per 32x32
+    block, or per pair of blocks with 16-bit partials (a reader reads whole pairs)."""
+    return pow2_floor(tile.blocks // 2 if p16 else tile.blocks)
 
 
 def reduce_scatter_config(
@@ -3650,11 +5524,14 @@ def reduce_scatter_config(
     only be masked-off loads."""
     if readers is None:
         readers = min(pow2_floor(tail_split_k), max_readers(tile, p16))
-    nb = max(1, min(tile.blocks // readers, loads_in_flight, tile.quadrant_blocks))
+    nb = pow2_floor(
+        max(1, min(tile.blocks // readers, loads_in_flight, tile.quadrant_blocks))
+    )
     if p16:
         nb = max(nb, 2)
-    # reduce_scatter_slice's groups never cross a reader's slice.
-    assert (tile.blocks // readers) % nb == 0, (tile, readers, nb)
+    # reduce_scatter_slice's groups never cross a reader's slice (reduce_scatter_blocks
+    # masks an uneven tile's).
+    assert tile.uneven or (tile.blocks // readers) % nb == 0, (tile, readers, nb)
     loads_per_partial = nb // 2 if p16 else nb
     return ReduceScatterConfig(
         readers=readers,
@@ -3752,6 +5629,8 @@ def subtile_tail(M, N, tile, num_programs):
     leftover = total_tiles % num_programs
     if total_tiles < num_programs or leftover == 0:
         return None
+    # Any menu side that divides the tile's: for a power-of-two tile only 64, 128
+    # and 256 do.
     subtiles = [
         (tm, tn)
         for tm in TILE_SIDES
@@ -3955,8 +5834,12 @@ def _launch_constants(M, N, K, config, num_programs, num_xcds):
     return config, {
         "TOTAL_TILES": total_tiles,
         "TAIL_TILES": tail_tiles,
+        "TOP_M": tile.top_m,
+        "LEFT_N": tile.left_n,
         "TAIL_BLOCK_M": tail[0],
         "TAIL_BLOCK_N": tail[1],
+        "TAIL_TOP_M": uneven_first(tail[0]) if tail[0] else 0,
+        "TAIL_LEFT_N": uneven_first(tail[1]) if tail[1] else 0,
         "STREAMK_PROGRAMS": streamk_programs,
         "RESOLVED_TAIL_SPLIT_K": tail_split_k,
         "END_TO_END": end_to_end,
@@ -4056,16 +5939,17 @@ def _plans():
         yield "one_tile", "rs", n, "l2"
 
 
-def tuning_candidates(M, N, K, partials_16bit=False):
+def tuning_candidates(M, N, K, partials_16bit=False, tiles=None):
     """The complete configs the tuner times for a shape: every TUNING_TILES tile at
     the default GROUP_SIZE_M (streamk_defaults) with every plan that fits it (and the default
     plan's pick), one per distinct launch; with ``partials_16bit``, also each plan
-    that stores partials with STREAMK_PARTIALS "16bit". M, N and K may be numpy
-    integers (a tuner's pandas rows)."""
+    that stores partials with STREAMK_PARTIALS "16bit". ``tiles`` replaces
+    TUNING_TILES (any supported (BLOCK_M, BLOCK_N, BLOCK_K), e.g. menu_tiles()). M, N
+    and K may be numpy integers (a tuner's pandas rows)."""
     M, N, K = int(M), int(N), int(K)
     num_programs, num_xcds = streamk_topology()
     candidates, seen = [], set()
-    for bm, bn, bk in TUNING_TILES:
+    for bm, bn, bk in TUNING_TILES if tiles is None else tiles:
         tile = {
             "BLOCK_M": bm,
             "BLOCK_N": bn,

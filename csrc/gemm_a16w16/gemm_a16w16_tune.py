@@ -485,6 +485,14 @@ class GemmA16W16Tuner(GemmCommonTuner):
             "the output's type (half the partial bytes; 1.2-1.5x the RMS error of "
             "fp32 partials).",
         )
+        self.parser.add_argument(
+            "--gluon_streamk_tiles",
+            default=None,
+            help="Tiles of the gfx950 gluon Stream-K candidates instead of the 13 "
+            "power-of-two TUNING_TILES: 'menu' for every supported tile (menu_tiles, "
+            "4-34x the candidates per shape), or a comma-separated list such as "
+            "192x320x64,320x192x64.",
+        )
 
     def _clear_op_caches(self):
         from aiter.tuned_gemm import get_GEMM_A16W16_config, get_GEMM_A16W16_config_
@@ -877,6 +885,7 @@ class GemmA16W16Tuner(GemmCommonTuner):
                     N,
                     K,
                     partials_16bit=getattr(self, "gluon_16bit_partials", False),
+                    tiles=getattr(self, "gluon_streamk_tiles", None),
                 )
             ]
         tasks = []
@@ -992,6 +1001,13 @@ class GemmA16W16Tuner(GemmCommonTuner):
         libtype = args.libtype
         with_hipblaslt = getattr(args, "with_hipblaslt", False)
         self.gluon_16bit_partials = getattr(args, "gluon_16bit_partials", False)
+        self.gluon_streamk_tiles = None
+        if getattr(args, "gluon_streamk_tiles", None):
+            from aiter.ops.triton._gluon_kernels.gfx950.gemm.basic.gemm_a16w16_streamk import (
+                tuning_tiles,
+            )
+
+            self.gluon_streamk_tiles = tuning_tiles(args.gluon_streamk_tiles)
         gfx = self.get_gfx()
         cu_num = self.get_cu_num()
         run_kwargs = {"num_warmup": 10, "num_iters": 101}

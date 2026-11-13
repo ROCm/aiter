@@ -575,6 +575,19 @@ def test_gemm_a16_w16_gluon_streamk_tiles(tile, ragged):
     _run_streamk(M, N, K, {"BLOCK_M": bm, "BLOCK_N": bn, "BLOCK_K": bk}, bias=True)
 
 
+@pytest.mark.parametrize("tail_split_k", [4, 8])
+@pytest.mark.parametrize("partials", ["fp32", "16bit"])
+def test_gemm_a16_w16_gluon_streamk_owner_256x256(tail_split_k, partials):
+    """The 256x256 owner unrolls its peer loop up to split 4 (owner_unroll_max) and
+    reads its peers in a run-time loop past it, ragged, with bias."""
+    M, N, K = 17 * 256 - 32, 16 * 256 - 40, 2048 - 16
+    config = {"BLOCK_M": 256, "BLOCK_N": 256, "BLOCK_K": 64, "GROUP_SIZE_M": 4}
+    config.update(
+        _streamk_plan("one_tile", "owner", tail_split_k), STREAMK_PARTIALS=partials
+    )
+    _run_streamk(M, N, K, config, bias=True)
+
+
 def test_gemm_a16_w16_gluon_streamk_default_tile():
     """Without a config the kernel runs DEFAULT_TILE with the default plan."""
     _run_streamk(1000, 2048, 1024, None)
@@ -988,3 +1001,226 @@ def test_gemm_a16_w16_gluon_streamk_schedule(tile):
     for kernel in compiled:
         assert "llvm.amdgcn.sched.barrier" in kernel.asm["llir"]
         assert "sched_barrier" in kernel.asm["amdgcn"]
+
+
+# Non-power-of-two tiles (uneven halves): (M, N, K), tile, plan, sized for 256 CUs in
+# units of the tile as above (17 x 16 tiles: a tail of 16 after one wave).
+_UNEVEN_CASES = {
+    # Ragged M, N and K: the extra blocks' clamped loads and masked stores.
+    "dp": ((17 * 224 - 24, 16 * 256 - 40, 1008), (224, 256, 64), _streamk_plan("dp")),
+    # 64x64 sub-tiles of a 192x256 tile, and 96x192 sub-tiles of a 192x192 tile (a
+    # tail of 96).
+    "dp_sub": ((17 * 192, 16 * 256, 1024), (192, 256, 64), _streamk_plan("dp_sub")),
+    "dp_sub_uneven": (
+        (22 * 192 - 40, 16 * 192 - 24, 1008),
+        (192, 192, 64),
+        _streamk_plan("dp_sub"),
+    ),
+    "owner": (
+        (17 * 96, 16 * 96, 2048),
+        (96, 96, 64),
+        _streamk_plan("one_tile", "owner", 4),
+    ),
+    # Seven unrolled peers: 16-bit partials batch 8 loads, four batches.
+    "owner_k8": (
+        (17 * 224, 16 * 256, 2048),
+        (224, 256, 64),
+        _streamk_plan("one_tile", "owner", 8),
+    ),
+    "rs": (
+        (17 * 224, 16 * 256, 4096),
+        (224, 256, 64),
+        _streamk_plan("one_tile", "rs", 8),
+    ),
+    # Below one wave: 32 tiles, so 4 idle programs per tile read slices too.
+    "compact_rs": (
+        (8 * 160 - 8, 4 * 224 - 16, 4096),
+        (160, 224, 64),
+        _streamk_plan("one_tile", "rs", 4),
+    ),
+    "l2": (
+        (17 * 192, 16 * 128, 4096),
+        (192, 128, 64),
+        _streamk_plan("one_tile", "rs", 4, "l2"),
+    ),
+    "two_tile": ((16 * 224, 18 * 192, 2048), (224, 192, 64), _streamk_plan("two_tile")),
+    "spread": ((10 * 224, 20 * 192, 2048), (224, 192, 64), _streamk_plan("spread")),
+    # K_RES > BLOCK_K, BLOCK_K 128 at 96x160.
+    "kres_gt_rs": (
+        (17 * 160, 16 * 96, 432),
+        (160, 96, 64),
+        _streamk_plan("one_tile", "rs", 4),
+    ),
+    "bk128_owner": (
+        (17 * 96, 16 * 160, 2048),
+        (96, 160, 128),
+        _streamk_plan("one_tile", "owner", 2),
+    ),
+    # Sides of 320: halves of 160 = 128 + 32, ragged M, N and K.
+    "dp_320": (
+        (17 * 320 - 24, 16 * 192 - 40, 1008),
+        (320, 192, 64),
+        _streamk_plan("dp"),
+    ),
+    "rs_320": (
+        (17 * 192 - 8, 16 * 320 - 16, 4080),
+        (192, 320, 64),
+        _streamk_plan("one_tile", "rs", 8),
+    ),
+}
+
+
+def _uneven_config(case, **extra):
+    shape, (bm, bn, bk), plan = _UNEVEN_CASES[case]
+    config = {"BLOCK_M": bm, "BLOCK_N": bn, "BLOCK_K": bk, "GROUP_SIZE_M": 4, **plan}
+    return shape, dict(config, **extra)
+
+
+@pytest.mark.parametrize("case", list(_UNEVEN_CASES))
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("bias", [False, True])
+def test_gemm_a16_w16_gluon_streamk_uneven(case, dtype, bias):
+    """Non-power-of-two tiles on every Stream-K policy and ending."""
+    shape, config = _uneven_config(case)
+    _run_streamk(*shape, config, dtype=dtype, bias=bias)
+
+
+@pytest.mark.parametrize(
+    "case, tile",
+    [
+        ("owner", (96, 64, 64)),  # two one-block blocks paired across quadrants
+        ("owner", (96, 96, 64)),  # one one-block block alone, 8 bytes per lane
+        ("rs", (96, 96, 64)),
+        ("rs", (160, 224, 64)),
+        ("rs", (96, 64, 64)),
+        ("rs", (224, 256, 64)),
+        ("owner", (192, 128, 64)),
+        ("spread", (224, 192, 64)),
+        ("l2", (192, 128, 64)),
+        ("rs", (192, 320, 64)),
+        ("owner", (320, 192, 64)),
+        ("owner_k8", (224, 256, 64)),
+        ("owner_k8", (192, 320, 64)),
+    ],
+)
+def test_gemm_a16_w16_gluon_streamk_uneven_16bit_partials(case, tile):
+    """16-bit partials on uneven tiles, ragged, with bias."""
+    (M, N, K), config = _uneven_config(case, STREAMK_PARTIALS="16bit")
+    bm, bn, bk = tile
+    scale_m, scale_n = M // config["BLOCK_M"], N // config["BLOCK_N"]
+    config.update(BLOCK_M=bm, BLOCK_N=bn, BLOCK_K=bk)
+    _run_streamk(scale_m * bm - 8, scale_n * bn - 16, K - 16, config, bias=True)
+
+
+def test_gemm_a16_w16_gluon_streamk_uneven_geometry():
+    """The tile menu, its halves and its rules."""
+    from aiter.ops.triton._gluon_kernels.gfx950.gemm.basic.gemm_a16w16_streamk import (
+        TUNING_TILES,
+        StreamKConfig,
+        TileSpec,
+        menu_tiles,
+        uneven_first,
+    )
+
+    # The first half: as even as two valid halves (a power of two + 0, 32 or 64)
+    # allow, the larger first; 0 for a power of two.
+    assert [uneven_first(s) for s in (64, 96, 128, 160, 192, 224, 256, 288, 320)] == [
+        0, 64, 0, 96, 96, 128, 0, 160, 160,
+    ]  # fmt: skip
+    assert TileSpec(224, 256, 64).uneven and not TileSpec(256, 128, 64).uneven
+    for bad in [
+        (288, 256, 64),
+        (320, 320, 64),
+        (352, 64, 64),
+        (160, 160, 128),
+    ]:
+        with pytest.raises(ValueError):
+            TileSpec(*bad)
+    assert TileSpec(96, 160, 128).block_k == 128  # BLOCK_M + BLOCK_N <= 256
+    menu = menu_tiles()
+    assert set(TUNING_TILES) <= set(menu) and len(menu) == 86
+    assert all(bm * bn <= 256 * 256 for bm, bn, _ in menu)
+    # 16-bit partials on any menu tile: an odd number of one-block blocks keeps the
+    # last one alone.
+    plan = _streamk_plan("one_tile", "owner", 2)
+    tile = {"BLOCK_M": 96, "BLOCK_N": 96, "BLOCK_K": 64, "GROUP_SIZE_M": 4}
+    StreamKConfig.from_dict({**tile, **plan, "STREAMK_PARTIALS": "16bit"})
+
+
+def test_gemm_a16_w16_gluon_streamk_tuning_tiles():
+    """The tuner's --gluon_streamk_tiles values (tuning_tiles)."""
+    from aiter.ops.triton._gluon_kernels.gfx950.gemm.basic.gemm_a16w16_streamk import (
+        menu_tiles,
+        tuning_tiles,
+    )
+
+    assert tuning_tiles(None) is None and tuning_tiles("default") is None
+    assert tuning_tiles("menu") == menu_tiles()
+    assert tuning_tiles("192x320x64, 320x192x64") == [(192, 320, 64), (320, 192, 64)]
+    for bad in ["288x256x64", "320x192x128", "192x320", "192x320xk"]:
+        with pytest.raises(ValueError):
+            tuning_tiles(bad)
+
+
+@pytest.mark.parametrize(
+    "tile, tiles, tail",
+    [
+        ((192, 256), 272, (64, 64)),  # S = 16: Q = 12
+        ((224, 256), 272, (224, 64)),  # 224 has no smaller divisor in the menu
+        ((192, 192), 352, (96, 192)),  # S = 96: Q = 2, an uneven sub-tile
+        ((192, 256), 352, (192, 128)),  # Q = 2: the most square
+        ((160, 160), 300, None),  # 160 has no smaller divisor in the menu
+    ],
+)
+def test_gemm_a16_w16_gluon_streamk_uneven_subtile_tail(tile, tiles, tail):
+    """subtile_tail with uneven tiles: sub-tile sides from the menu dividing the
+    tile's (P = 256, four rows of tiles)."""
+    from aiter.ops.triton._gluon_kernels.gfx950.gemm.basic.gemm_a16w16_streamk import (
+        subtile_tail,
+    )
+
+    bm, bn = tile
+    assert subtile_tail(4 * bm, tiles // 4 * bn, (bm, bn, 64), 256) == tail
+
+
+def test_gemm_a16_w16_gluon_streamk_uneven_candidates():
+    """tuning_candidates(tiles=) times every plan at any menu tile, with kernelNames
+    that round-trip through tuned_gemm; the tuner's own candidates stay
+    TUNING_TILES', and a tile with a lone 32x32 block gets 16-bit plans too."""
+    M, N, K = 17 * 224, 16 * 256, 1024
+    _skip_unsupported_gluon("gluon", "streamk", M, N, K)
+    from aiter.ops.triton._gluon_kernels.gfx950.gemm.basic.gemm_a16w16_streamk import (
+        TUNING_TILES,
+        kernel_name,
+        tuning_candidates,
+        tuning_tiles,
+    )
+    from aiter.tuned_gemm import parse_gluon_kernel_name
+
+    stock = tuning_candidates(M, N, K)
+    assert stock == tuning_candidates(M, N, K, tiles=TUNING_TILES)
+    assert {(c["BLOCK_M"], c["BLOCK_N"], c["BLOCK_K"]) for c in stock} <= set(
+        TUNING_TILES
+    )
+    uneven = tuning_candidates(M, N, K, tiles=[(224, 256, 64)])
+    assert uneven and all(c["BLOCK_M"] == 224 for c in uneven)
+    wide = tuning_candidates(17 * 192, 16 * 320, K, tiles=tuning_tiles("192x320x64"))
+    assert wide and all(c["BLOCK_N"] == 320 for c in wide)
+    for config in uneven + wide:
+        assert parse_gluon_kernel_name(kernel_name(config)) == ("streamk", config)
+    odd = tuning_candidates(17 * 96, 16 * 96, K, True, tiles=[(96, 96, 64)])
+    assert any(c.get("STREAMK_PARTIALS") == "16bit" for c in odd)
+
+
+def test_gemm_a16_w16_gluon_streamk_uneven_tuned_gemm():
+    """tuned_gemm runs a tuned row with an uneven tile."""
+    M, N, K = 17 * 224, 16 * 256, 1024
+    _skip_unsupported_gluon("gluon", "streamk", M, N, K)
+    from aiter.tuned_gemm import gluon_gemm
+
+    x, w, _, out_dtype, _ = generate_gemm_a16w16_inputs(
+        M, N, K, torch.bfloat16, output=False
+    )
+    name = "gluon_streamk_224x256x64_g4_one_tile_rs_k8_wt"
+    out = gluon_gemm(x, w, 0, None, out_dtype, config={"kernelName": name})
+    torch.testing.assert_close(out, F.linear(x, w), atol=1e-1, rtol=1e-2)
