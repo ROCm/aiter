@@ -245,27 +245,29 @@ AITER_CTYPES_DEFINE_ENTRYPOINT_VOID(
     args.splitk              = split;
     AiterAsmKernel* impl_ptr = get_or_load_kernel(name, config_map, SUBM, SUBN);
 
-    // Each operand's buffer descriptor holds its size in bytes in a 32-bit
-    // field, so it must cover less than 4 GiB; past that the kernels return
-    // wrong values without faulting. The 256x256 kernels write fp32 output
-    // through one descriptor per 256-row tile; every other descriptor covers
-    // the whole operand.
-    const uint64_t a_bytes  = static_cast<uint64_t>(Mdim) * args.stride_A0;
-    const uint64_t b_bytes  = static_cast<uint64_t>(Ndim) * args.stride_B0;
-    const bool out_per_tile = !args.is_out_b16 && SUBM == 256 && SUBN == 256;
-    const uint64_t out_bytes =
-        static_cast<uint64_t>(out_per_tile ? std::min(Mdim, 256) : Mdim) * args.stride_D0;
-    AITER_CHECK(a_bytes < (1ull << 32) && b_bytes < (1ull << 32) && out_bytes < (1ull << 32),
-                __func__,
-                " ",
-                name,
-                ": A, B and out must each be smaller than 4 GiB; got A=",
-                a_bytes,
-                " B=",
-                b_bytes,
-                out_per_tile ? " out (one 256-row tile)=" : " out=",
-                out_bytes,
-                " bytes");
+    // The gfx942 kernels give each operand one buffer descriptor whose size in
+    // bytes is a 32-bit field, so it must cover less than 4 GiB; past that they
+    // return wrong values without faulting. The gfx950 kernels give each tile
+    // its own 64-bit base.
+    if(arch_id == "gfx942")
+    {
+        const uint64_t a_bytes   = static_cast<uint64_t>(Mdim) * args.stride_A0;
+        const uint64_t b_bytes   = static_cast<uint64_t>(Ndim) * args.stride_B0;
+        const uint64_t out_bytes = static_cast<uint64_t>(Mdim) * args.stride_D0;
+        AITER_CHECK(a_bytes < (1ull << 32) && b_bytes < (1ull << 32) && out_bytes < (1ull << 32),
+                    __func__,
+                    " ",
+                    name,
+                    ": A, B and out must each be smaller than 4 GiB on ",
+                    arch_id,
+                    "; got A=",
+                    a_bytes,
+                    " B=",
+                    b_bytes,
+                    " out=",
+                    out_bytes,
+                    " bytes");
+    }
 
     int gdx = (Ndim + SUBN - 1) / SUBN;
     int gdy = (Mdim + SUBM - 1) / SUBM;

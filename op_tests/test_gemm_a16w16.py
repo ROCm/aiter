@@ -687,58 +687,97 @@ def test_gemm_compile_packed_params(m=256, n=512, k=1024, layers=3):
     return rows
 
 
-def test_asm_rejects_4gib_operands(m=16384, k=128, rows_checked=256):
-    """The asm kernels give each operand a buffer descriptor with a 32-bit size.
+def _asm_mismatches(x, w, out, block=1 << 28):
+    """Elements of out (all of them) that differ from an fp32 reference."""
+    m, k = x.shape
+    n = w.shape[0]
+    cb = min(n, max(64, block // k))
+    rb = min(m, max(1, block // max(cb, k)))
+    bad = 0
+    for c0 in range(0, n, cb):
+        wf = w[c0 : c0 + cb].float()
+        for r0 in range(0, m, rb):
+            ref = F.linear(x[r0 : r0 + rb].float(), wf).to(out.dtype)
+            got = out[r0 : r0 + rb, c0 : c0 + cb]
+            bad += int((~torch.isclose(got, ref, rtol=1e-2, atol=1e-2)).sum())
+    return bad
 
-    A 4 GiB out used to come back partly wrong with no error, so it must raise;
-    an out just below 4 GiB must stay exact.
+
+def test_asm_4gib_operands():
+    """A, B and out of 4 GiB or more.
+
+    Each operand's buffer descriptor holds a 32-bit size. The gfx950 kernels
+    give every tile its own 64-bit base, so they must be exact past 4 GiB; the
+    gfx942 kernels use one descriptor per operand, so the launcher must refuse.
     """
-    if get_gfx() not in ("gfx942", "gfx950"):
+    gfx = get_gfx()
+    if gfx not in ("gfx942", "gfx950"):
         return []
-    n_over = (1 << 32) // (m * 2)
-    n_under = n_over - 256
-    need = 4 * m * n_over + 4 * n_over * k + 4 * rows_checked * n_over * 4
-    if torch.cuda.mem_get_info()[0] < need + (1 << 30):
-        aiter.logger.warning("skip asm 4 GiB check: needs %.1f GiB free", need / 2**30)
-        return []
-
-    x = torch.randn(m, k, dtype=dtypes.bf16, device="cuda")
-    w = torch.randn(n_over, k, dtype=dtypes.bf16, device="cuda")
-    out = torch.full((m, n_over), float("nan"), dtype=dtypes.bf16, device="cuda")
-    try:
-        aiter.gemm_a16w16_asm(x, w, out)
-    except RuntimeError as e:
-        assert "smaller than 4 GiB" in str(e), e
-    else:
-        raise AssertionError(f"asm took a 4 GiB out at {(m, n_over, k)}")
-    rows = [{"case": f"asm out 4 GiB {(m, n_over, k)}", "result": "rejected"}]
-
-    out_under = out.view(-1)[: m * n_under].view(m, n_under)
-    aiter.gemm_a16w16_asm(x, w[:n_under], out_under)
-    ref = F.linear(x[-rows_checked:].float(), w[:n_under].float()).to(dtypes.bf16)
-    err = checkAllclose(
-        ref, out_under[-rows_checked:], msg=f"asm out < 4 GiB {(m, n_under, k)}: "
-    )
-    assert err == 0, f"asm out just below 4 GiB is wrong at {(m, n_under, k)}"
-    rows.append({"case": f"asm out < 4 GiB {(m, n_under, k)}", "result": "exact"})
-    if get_gfx() != "gfx950":
-        return rows
-
-    # The 256x256 kernels store fp32 output one 256-row tile at a time, so
-    # only that tile must stay below 4 GiB.
-    del out, out_under
-    n_fp32 = (1 << 32) // (m * 4) + 256
-    out = torch.full((m, n_fp32), float("nan"), dtype=dtypes.fp32, device="cuda")
-    w = torch.randn(n_fp32, k, dtype=dtypes.bf16, device="cuda")
-    aiter.gemm_a16w16_asm(x, w, out, kernelName="_ZN5aiter24bf16gemm_bf16_tn_256x256E")
-    ref = F.linear(x[-rows_checked:].float(), w.float())
-    err = checkAllclose(
-        ref, out[-rows_checked:], msg=f"asm 256x256 fp32 out > 4 GiB {(m, n_fp32, k)}: "
-    )
-    assert err == 0, f"asm 256x256 fp32 out above 4 GiB is wrong at {(m, n_fp32, k)}"
-    rows.append(
-        {"case": f"asm 256x256 fp32 out > 4 GiB {(m, n_fp32, k)}", "result": "exact"}
-    )
+    k_ab = 8192
+    over_ab = (1 << 31) // k_ab + 256
+    k_clean = (1 << 16) + 256
+    # (operand, M, N, K, out dtype, kernels as (name, bpreshuffle, splitK));
+    # name None is the heuristic.
+    plain = [
+        (None, False, None),
+        ("_ZN5aiter24bf16gemm_bf16_tn_256x256E", False, 1),
+        ("_ZN5aiter36bf16gemm_bf16_tn_256x256_bpreshuffleE", True, 1),
+        ("_ZN5aiter37bf16gemm_fp32bf16_tn_64x64_pf3_splitkE", False, 1),
+        ("_ZN5aiter42bf16gemm_fp32bf16_tn_64x64_bshuffle_splitkE", True, 1),
+    ]
+    # *_clean kernels split K and need at most 1024 tiles, so only A or B
+    # can reach 4 GiB.
+    clean = [
+        ("_ZN5aiter39bf16gemm_fp32bf16_tn_64x64_splitk_cleanE", False, 2),
+        ("_ZN5aiter48bf16gemm_fp32bf16_tn_64x64_bshuffle_splitk_cleanE", True, 2),
+    ]
+    cases = [
+        ("A", over_ab, 256, k_ab, dtypes.bf16, plain),
+        ("B", 256, over_ab, k_ab, dtypes.bf16, plain),
+        ("out", 16384, (1 << 31) // 16384 + 256, 128, dtypes.bf16, plain),
+        ("out", 16384, (1 << 30) // 16384 + 256, 128, dtypes.fp32, plain),
+        ("A", 32768, 64, k_clean, dtypes.fp32, clean),
+        ("B", 64, 32768, k_clean, dtypes.fp32, clean),
+    ]
+    if gfx == "gfx942":
+        cases = [c[:5] + ([(None, False, None)],) for c in cases[:3]]
+    rows = []
+    for operand, m, n, k, otype, kernels in cases:
+        need = 2 * (m * k + 2 * n * k) + m * n * otype.itemsize + (4 << 30)
+        if torch.cuda.mem_get_info()[0] < need:
+            aiter.logger.warning(
+                "skip asm 4 GiB %s check: needs %.1f GiB free", operand, need / 2**30
+            )
+            continue
+        x = torch.randn(m, k, dtype=dtypes.bf16, device="cuda")
+        w = torch.randn(n, k, dtype=dtypes.bf16, device="cuda")
+        wshuffle = None
+        out = torch.empty(m, n, dtype=otype, device="cuda")
+        shape = f"{operand} > 4 GiB {(m, n, k)} {otype}"
+        for name, bpreshuffle, split in kernels:
+            if bpreshuffle and wshuffle is None:
+                wshuffle = shuffle_weight(w, layout=(16, 16))
+            out.fill_(float("nan"))
+            case = f"asm {name or 'heuristic'} {shape}"
+            try:
+                aiter.gemm_a16w16_asm(
+                    x,
+                    wshuffle if bpreshuffle else w,
+                    out,
+                    None,
+                    split,
+                    name,
+                    bpreshuffle,
+                )
+            except RuntimeError as e:
+                assert gfx == "gfx942" and "smaller than 4 GiB" in str(e), e
+                rows.append({"case": case, "result": "rejected"})
+                continue
+            assert gfx == "gfx950", f"{case}: not rejected on {gfx}"
+            bad = _asm_mismatches(x, w, out)
+            assert bad == 0, f"{case}: {bad} of {m * n} elements wrong"
+            rows.append({"case": case, "result": "exact"})
+        del x, w, wshuffle, out
     return rows
 
 
@@ -758,7 +797,7 @@ parser.add_argument(
           or -t skinny
           or -t out    # tgemm.mm(out=) on every backend
           or -t compile    # torch.compile with weights/biases in one storage
-          or -t asm_4g    # asm rejects operands of 4 GiB""",
+          or -t asm_4g    # asm with A, B or out of 4 GiB""",
 )
 parser.add_argument(
     "-d",
@@ -849,7 +888,7 @@ for test in args.test:
     elif test == "compile":
         df += test_gemm_compile_packed_params()
     elif test == "asm_4g":
-        df += test_asm_rejects_4gib_operands()
+        df += test_asm_4gib_operands()
 df = pd.DataFrame(df)
 df_md = df.to_markdown(index=False)
 aiter.logger.info("gemm_a16w16 summary (markdown):\n%s", df_md)
