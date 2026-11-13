@@ -78,8 +78,12 @@ RESCALE_TAU = 8.0
 TOKENS_PER_WORKGROUP = 4
 BLOCK_K = 16
 INDEX_FORMATS = ("dense", "csr", "dense_lengths")
-# Identity MFMAs issued ahead of their V^T pack; 2 adds a loop-top vmcnt(0).
-IDENTITY_MFMA_LEAD = 1
+# Identity MFMAs issued ahead of their V^T pack; the pack (two v_perm) runs one
+# PV step ahead of the MFMA that reads it.
+IDENTITY_MFMA_LEAD = 3
+# Unsplit launches issue the next tile's gathers inside softmax, in this many
+# chunks, instead of between the QK MFMAs: VALU work then hides their issue.
+SOFTMAX_GATHER_CHUNKS = 4
 
 
 def _mfma_ssa(mma, a, b, acc):
@@ -210,6 +214,10 @@ def compile_sparse_mla_fwd(
     BLOCK_THREADS = NUM_WAVES * WAVE
     HAS_SINK = bool(has_sink) and not SPLIT
     vt_route = "register_vt" if REGISTER_VT else "lds_vt"
+    # Gather pairs issued in the QK MFMA phase; the rest go out in softmax.
+    GM = 8 if SPLIT else 0
+    GS = SOFTMAX_GATHER_CHUNKS
+    assert GS in (1, 2, 4)
     kernel_name = (
         f"sparse_mla_fwd_{index_format}_{vt_route}"
         f"_sink{int(HAS_SINK)}_split{split_k}"
@@ -447,14 +455,17 @@ def compile_sparse_mla_fwd(
             # d = 32 pr + 8 (n // 4) + 4 hh + n % 4, column k is token k (exact f32).
             return _mfma_ssa(mma, kop, identity, _zero4())
 
-        def _pv_packed(acc_t, d, p):
+        def _pack(d):
             # D is exact bf16 in f32: its high halves are already the bf16 A operand
             # (lane (n, g) holds tokens 4g..4g+3, matching the QK S^T order of p).
             w = fx.Vector(d).bitcast(fx.Int32)
             lo = fx.rocdl.perm_b32(fx.Int32(w[1]), fx.Int32(w[0]), high_halves)
             hi = fx.rocdl.perm_b32(fx.Int32(w[3]), fx.Int32(w[2]), high_halves)
             a = fx.Vector.from_elements([fx.Int32(lo), fx.Int32(hi)], fx.Int32)
-            return _mfma_ssa(mma, a.bitcast(fx.BFloat16), p, acc_t)
+            return a.bitcast(fx.BFloat16)
+
+        def _pv_packed(acc_t, d, p):
+            return _mfma_ssa(mma, _pack(d), p, acc_t)
 
         def _mask_vt(vt, valid_bits):
             # Invalid K rows may hold NaN and NaN * 0 survives the MFMAs: zero them.
@@ -545,6 +556,7 @@ def compile_sparse_mla_fwd(
                 # packed bf16 PV MFMAs that use them.
                 new_vt = [None] * N_ACC
                 transposed = {}
+                packed = {}
                 sched = _bpermute_mfma_schedule(
                     [(g, h) for g in range(PV_GROUPS) for h in range(H4)],
                     QK_PAIRS,
@@ -563,7 +575,7 @@ def compile_sparse_mla_fwd(
                         moved[pr][i] = fx.Int32(
                             fx.rocdl.ds_bpermute(T.i32, perm_addr, fx.Int32(dw[pr][i]))
                         )
-                        if const_expr(prefetch and i == 3):
+                        if const_expr(prefetch and i == 3 and pr < GM):
                             # Raw registers are free after their fourth transfer.
                             # Preserve the PV-first FIFO lookahead before QK use.
                             fx.rocdl.sched_barrier(0)
@@ -578,10 +590,16 @@ def compile_sparse_mla_fwd(
                                     min(IDENTITY_MFMA_LEAD, len(pv_ts))
                                 ):
                                     transposed[pv_ts[j]] = _identity_mfma(vt[pv_ts[j]])
+                                packed[t] = _pack(transposed.pop(t))
                             if const_expr(pv_n + IDENTITY_MFMA_LEAD < len(pv_ts)):
                                 u = pv_ts[pv_n + IDENTITY_MFMA_LEAD]
                                 transposed[u] = _identity_mfma(vt[u])
-                            acc[t] = _pv_packed(acc[t], transposed.pop(t), p_b)
+                            acc[t] = _mfma_ssa(mma, packed.pop(t), p_b, acc[t])
+                            if const_expr(pv_n + 1 < len(pv_ts)):
+                                # Pack the next tile now so its perms sit a full
+                                # step ahead of the PV MFMA that reads them.
+                                tn = pv_ts[pv_n + 1]
+                                packed[tn] = _pack(transposed.pop(tn))
                         pv_n += 1
                     else:
                         pr, h = act[1], act[2]
@@ -626,7 +644,9 @@ def compile_sparse_mla_fwd(
                 fx.Int64(fx.rocdl.ballot(T.i64, fx.Int32(frags[-1][0]) >= 0))
             )
 
-        def _softmax(s_acc, m_i, l_i, acc, valid_bits):
+        def _softmax(s_acc, m_i, l_i, acc, valid_bits, hooks=(None,) * 4):
+            if const_expr(hooks[0] is not None):
+                hooks[0]()
             scores = []
             for i in range_constexpr(4):
                 valid = live & (
@@ -637,6 +657,8 @@ def compile_sparse_mla_fwd(
             for i in range_constexpr(1, 4):
                 m_w = (m_w > scores[i]).select(m_w, scores[i])
             # Lazy rescale: keep the stale max until some head grows past RESCALE_TAU.
+            if const_expr(hooks[1] is not None):
+                hooks[1]()
             moved = fx.Int64(
                 fx.rocdl.ballot(
                     fx.Int64.ir_type, (m_w - m_i) * qk_scale > fx.Float32(RESCALE_TAU)
@@ -649,6 +671,8 @@ def compile_sparse_mla_fwd(
                 m_n = (m_h > m_i).select(m_h, m_i)
                 alpha = (m_n == neg_inf).select(zero_f, _exp2((m_i - m_n) * qk_scale))
                 acc = _rescale_all(acc, alpha)
+            if const_expr(hooks[2] is not None):
+                hooks[2]()
             empty = m_n == neg_inf
             p_t = []
             for i in range_constexpr(4):
@@ -656,24 +680,47 @@ def compile_sparse_mla_fwd(
                 p_t.append(live.select(p, zero_f))
             l_i = l_i * alpha + ((p_t[0] + p_t[1]) + (p_t[2] + p_t[3]))
             p_b = fx.Vector.from_elements([_to_bf16(p) for p in p_t], fx.BFloat16)
+            if const_expr(hooks[3] is not None):
+                hooks[3]()
             return m_n, l_i, acc, p_b
 
         def _softmax_phase(s_acc, m_i, l_i, acc, frags, idx_s, prefetch, new_frags, vt):
             """Softmax of this tile and its V^T for the next PV."""
             # Prefetch is static here: a runtime skip would merge a gather-free
             # path into loop waitcnt state and drain the next gather early.
+            hooks = [None] * 4
+            if const_expr(not SPLIT and prefetch and GM < QK_PAIRS):
+                # Pairs GM.. of the next gather go out here, one chunk per softmax hook.
+                new_frags = list(new_frags)
+                safe_idx = (idx_s >= 0).select(idx_s, fx.Int32(0))
+                rest = list(range(GM, QK_PAIRS))
+                per = -(-len(rest) // GS)
+                for c in range_constexpr(GS):
+                    chunk = rest[c * per : (c + 1) * per]
+                    if const_expr(len(chunk) > 0):
+
+                        def _issue(chunk=chunk):
+                            for pr in chunk:
+                                new_frags[pr] = kv_g[safe_idx, _chunk(pr), None].load()
+                            fx.rocdl.sched_barrier(0)
+
+                        hooks[c * (4 // GS)] = _issue
             if const_expr(LDS_VT):
                 _store_tile(frags)
                 if const_expr(SPLIT and prefetch):
                     new_frags = _gather(idx_s)
                     fx.rocdl.sched_barrier(0)
                 valid_bits = _ballot_valid(frags)
-                m_i, l_i, acc, p_b = _softmax(s_acc, m_i, l_i, acc, valid_bits)
+                m_i, l_i, acc, p_b = _softmax(
+                    s_acc, m_i, l_i, acc, valid_bits, tuple(hooks)
+                )
                 vt = _read_vt()
                 fx.rocdl.s_waitcnt(lgkmcnt=0)
             else:
                 valid_bits = _ballot_valid(frags)
-                m_i, l_i, acc, p_b = _softmax(s_acc, m_i, l_i, acc, valid_bits)
+                m_i, l_i, acc, p_b = _softmax(
+                    s_acc, m_i, l_i, acc, valid_bits, tuple(hooks)
+                )
                 vt = _mask_vt(vt, valid_bits)
             return m_i, l_i, acc, p_b, vt, new_frags
 
