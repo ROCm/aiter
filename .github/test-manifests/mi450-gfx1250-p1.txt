@@ -1,0 +1,78 @@
+# MI450/gfx1250 P1 operator selectors: 260 nodes.
+#
+# Bounded from the P1 candidate files after a full gfx1250 A0 triage; every
+# node passed on MI455X A0 with ROCm 10.2. Each line is an exact selector and
+# its node count; a parametrized node ID selects exactly one node. Same review
+# rule as the P0 manifest.
+#
+# Left out, with reasons (known failures are tracked in
+# mi450-gfx1250-known-failures.txt):
+#   test_unified_attention.py: one 3D case never completes and holds the GPU
+#     (#7776); 4851 nodes otherwise.
+#   test_pa_decode_sparse.py fp8, v4-unified, with_extra: wrong at kv_len=136
+#     and on every eligible with_extra case (#7777).
+#   test_gemm_afp4wfp4.py preshuffled split-K: KeyError NUM_BUFFERS (#7778).
+#     The afp4_wfp4 Gluon cases are disabled on gfx1250; a bounded Triton set
+#     is in.
+#   test_mla.py NVFP4 unshuffled and Gluon-over-2GB: skip by design on gfx1250.
+#   test_f4gemm.py, test_mxfp8fp4gemm.py, test_mla_decode_pagesize64.py,
+#     test_pa_decode_bf16_asm.py: gfx1250 ASM kernels are B0-only; on A0 they
+#     raise instead of skipping (#7779).
+#   test_mhc.py, test_inverse_rope_group_quant.py: benchmark scripts, not
+#     runnable as pytest (#7780).
+
+# Triton MLA (Gluon on gfx1250): prefill and decode pipeline contracts.
+op_tests/triton_tests/attention/test_mla.py::test_mla_prefill_fwd 12
+op_tests/triton_tests/attention/test_mla.py::test_mla_decode_fwd_lds_pipeline_eligibility 10
+op_tests/triton_tests/attention/test_mla.py::test_mla_decode_fwd_lds_pipeline_ring_wraparound 4
+op_tests/triton_tests/attention/test_mla.py::test_mla_decode_fwd_unshuffled_pipeline_ring_wraparound 5
+op_tests/triton_tests/attention/test_mla.py::test_mla_decode_fwd_unshuffled_query_stride_eligibility 4
+
+# Triton MLA decode: all six q/kv/out dtype and KV-format combinations
+# (bf16, fp8 E4M3, NVFP4) on the shuffled cache at a small and a large shape,
+# plus the four non-NVFP4 combinations on the unshuffled cache.
+op_tests/triton_tests/attention/test_mla.py::test_mla_decode_fwd[True-q_dtype0-kv_dtype0-out_dtype0-64-False-True-32768-512-64-num_heads0-1328-1-1]
+op_tests/triton_tests/attention/test_mla.py::test_mla_decode_fwd[True-q_dtype0-kv_dtype0-out_dtype0-64-False-False-32768-512-64-num_heads1-4371-3-32]
+op_tests/triton_tests/attention/test_mla.py::test_mla_decode_fwd[True-q_dtype1-kv_dtype1-out_dtype1-64-False-True-32768-512-64-num_heads0-1328-1-1]
+op_tests/triton_tests/attention/test_mla.py::test_mla_decode_fwd[True-q_dtype1-kv_dtype1-out_dtype1-64-False-False-32768-512-64-num_heads1-4371-3-32]
+op_tests/triton_tests/attention/test_mla.py::test_mla_decode_fwd[True-q_dtype2-kv_dtype2-out_dtype2-64-False-True-32768-512-64-num_heads0-1328-1-1]
+op_tests/triton_tests/attention/test_mla.py::test_mla_decode_fwd[True-q_dtype2-kv_dtype2-out_dtype2-64-False-False-32768-512-64-num_heads1-4371-3-32]
+op_tests/triton_tests/attention/test_mla.py::test_mla_decode_fwd[True-q_dtype3-kv_dtype3-out_dtype3-64-True-True-32768-512-64-num_heads0-1328-1-1]
+op_tests/triton_tests/attention/test_mla.py::test_mla_decode_fwd[True-q_dtype3-kv_dtype3-out_dtype3-64-True-False-32768-512-64-num_heads1-4371-3-32]
+op_tests/triton_tests/attention/test_mla.py::test_mla_decode_fwd[True-q_dtype4-kv_dtype4-out_dtype4-128-False-True-32768-512-64-num_heads0-1328-1-1]
+op_tests/triton_tests/attention/test_mla.py::test_mla_decode_fwd[True-q_dtype4-kv_dtype4-out_dtype4-128-False-False-32768-512-64-num_heads1-4371-3-32]
+op_tests/triton_tests/attention/test_mla.py::test_mla_decode_fwd[True-q_dtype5-kv_dtype5-out_dtype5-128-False-True-32768-512-64-num_heads0-1328-1-1]
+op_tests/triton_tests/attention/test_mla.py::test_mla_decode_fwd[True-q_dtype5-kv_dtype5-out_dtype5-128-False-False-32768-512-64-num_heads1-4371-3-32]
+op_tests/triton_tests/attention/test_mla.py::test_mla_decode_fwd[False-q_dtype0-kv_dtype0-out_dtype0-64-False-True-32768-512-64-num_heads1-4371-3-4]
+op_tests/triton_tests/attention/test_mla.py::test_mla_decode_fwd[False-q_dtype1-kv_dtype1-out_dtype1-64-False-True-32768-512-64-num_heads1-4371-3-4]
+op_tests/triton_tests/attention/test_mla.py::test_mla_decode_fwd[False-q_dtype2-kv_dtype2-out_dtype2-64-False-True-32768-512-64-num_heads1-4371-3-4]
+op_tests/triton_tests/attention/test_mla.py::test_mla_decode_fwd[False-q_dtype3-kv_dtype3-out_dtype3-64-True-True-32768-512-64-num_heads1-4371-3-4]
+
+# Sparse paged-attention prefill against the reference.
+op_tests/triton_tests/attention/test_pa_prefill_sparse.py::test_pa_prefill_sparse_vs_reference 24
+op_tests/triton_tests/attention/test_pa_prefill_sparse.py::test_pa_prefill_sparse_prefix_only 2
+op_tests/triton_tests/attention/test_pa_prefill_sparse.py::test_pa_prefill_sparse_extend_only 2
+op_tests/triton_tests/attention/test_pa_prefill_sparse.py::test_pa_prefill_sparse_out_buffer_every_branch 1
+
+# Sparse paged-attention decode: bf16 path and input rejection.
+op_tests/triton_tests/attention/test_pa_decode_sparse.py::test_pa_decode_sparse_vs_reference 96
+op_tests/triton_tests/attention/test_pa_decode_sparse.py::test_pa_decode_sparse_rejects_partial_extra 1
+op_tests/triton_tests/attention/test_pa_decode_sparse.py::test_pa_decode_sparse_fp8_rejects_unsupported 1
+
+# FP4 x FP4 (MXFP4) preshuffled GEMM, gfx1250 path.
+op_tests/triton_tests/gemm/basic/test_gemm_afp4wfp4.py::test_gemm_mxfp4_preshuffled_gfx1250 70
+
+# FP4 x FP4 GEMM, Triton implementation: all eight flag combinations on
+# 1024^3 and four model shapes.
+op_tests/triton_tests/gemm/basic/test_gemm_afp4wfp4.py::test_gemm_afp4_wfp4[triton-True-True-True-1024-1024-1024]
+op_tests/triton_tests/gemm/basic/test_gemm_afp4wfp4.py::test_gemm_afp4_wfp4[triton-True-True-False-1024-1024-1024]
+op_tests/triton_tests/gemm/basic/test_gemm_afp4wfp4.py::test_gemm_afp4_wfp4[triton-True-False-True-1024-1024-1024]
+op_tests/triton_tests/gemm/basic/test_gemm_afp4wfp4.py::test_gemm_afp4_wfp4[triton-True-False-False-1024-1024-1024]
+op_tests/triton_tests/gemm/basic/test_gemm_afp4wfp4.py::test_gemm_afp4_wfp4[triton-False-True-True-1024-1024-1024]
+op_tests/triton_tests/gemm/basic/test_gemm_afp4wfp4.py::test_gemm_afp4_wfp4[triton-False-True-False-1024-1024-1024]
+op_tests/triton_tests/gemm/basic/test_gemm_afp4wfp4.py::test_gemm_afp4_wfp4[triton-False-False-True-1024-1024-1024]
+op_tests/triton_tests/gemm/basic/test_gemm_afp4wfp4.py::test_gemm_afp4_wfp4[triton-False-False-False-1024-1024-1024]
+op_tests/triton_tests/gemm/basic/test_gemm_afp4wfp4.py::test_gemm_afp4_wfp4[triton-False-True-False-128-9216-7168]
+op_tests/triton_tests/gemm/basic/test_gemm_afp4wfp4.py::test_gemm_afp4_wfp4[triton-True-False-True-192-9216-7168]
+op_tests/triton_tests/gemm/basic/test_gemm_afp4wfp4.py::test_gemm_afp4_wfp4[triton-False-False-False-8000-7168-4608]
+op_tests/triton_tests/gemm/basic/test_gemm_afp4wfp4.py::test_gemm_afp4_wfp4[triton-True-True-False-5120-5120-5120]
