@@ -1,7 +1,16 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
 
-"""Route unified attention between FlyDSL and Triton/Gluon backends."""
+"""Route unified attention between FlyDSL and Triton/Gluon backends.
+
+This is the entry point that can pick FlyDSL. ``aiter.ops.triton.unified_attention``
+and ``aiter.ops.triton.attention.unified_attention`` stay Triton/Gluon only, so
+their callers keep today's kernels; a framework gets the FlyDSL routes by
+importing ``unified_attention`` from this module instead. It takes the Triton
+entry's arguments, in the same order, except ``equal_seqlen_q``, ``attn_work``,
+``force_fp8_pv_on_fp4_kv_cache``, ``output_gate`` and ``output_rows``; a caller
+that passes one of those stays on the Triton entry.
+"""
 
 
 def unified_attention(
