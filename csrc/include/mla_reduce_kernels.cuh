@@ -1000,12 +1000,15 @@ __global__ void kn_mla_reduce_v1_d64(const MlaReduceKernelV1Params params)
 // sums meet in LDS. The planner sizes reduce_indptr for the CUDA-graph batch,
 // not the live one, so the waves-per-unit count is picked on the device from the
 // live tile count and the mean split count.
-template <int32_t kSizeDV_, int32_t kNumHeadQ_>
+// kWaveSize_ is the DEVICE wave size: the host pass sees opus::get_warp_size()
+// as 64 whatever the target, so the dispatcher picks the instance from the
+// runtime warpSize, and the kernel compiles to nothing for a mismatched one.
+template <int32_t kSizeDV_, int32_t kNumHeadQ_, int32_t kWaveSize_ = opus::get_warp_size()>
 struct MlaReduceWideTraits
 {
     static constexpr int32_t kSizeDV   = kSizeDV_;
     static constexpr int32_t kNumHeadQ = kNumHeadQ_;
-    static constexpr int32_t kWaveSize = opus::get_warp_size();
+    static constexpr int32_t kWaveSize = kWaveSize_;
     // 4 beat 8 and 16 by 0.5-3 us on gfx950 batch-1/2 verify (16 heads x 512).
     static constexpr int32_t kNumWarps   = 4;
     static constexpr int32_t kNumThreads = kNumWarps * kWaveSize;
@@ -1047,8 +1050,20 @@ __device__ __forceinline__ void mla_reduce_lds_barrier()
 }
 
 template <typename Traits, typename lse_t, typename out_t>
+__device__ __forceinline__ void mla_reduce_v1_wide_impl(const MlaReduceKernelV1Params& params);
+
+template <typename Traits, typename lse_t, typename out_t>
 __launch_bounds__(Traits::kNumThreads) __global__
     void kn_mla_reduce_v1_wide(const MlaReduceKernelV1Params params)
+{
+    if constexpr(opus::get_warp_size() == Traits::kWaveSize)
+    {
+        mla_reduce_v1_wide_impl<Traits, lse_t, out_t>(params);
+    }
+}
+
+template <typename Traits, typename lse_t, typename out_t>
+__device__ __forceinline__ void mla_reduce_v1_wide_impl(const MlaReduceKernelV1Params& params)
 {
     constexpr int32_t kWave     = Traits::kWaveSize;
     constexpr int32_t kNumWarps = Traits::kNumWarps;
@@ -1377,8 +1392,12 @@ bool mla_reduce_use_wide(const MlaReduceKernelV1Params& params,
         (params.num_kv_splits <= 0) || (params.num_kv_splits >= WideTraits::kMinSplits);
     // 16 units per CU admits a 32-request graph batch of 16 heads x 6 rows on 256
     // CUs (3072); larger graph batches keep kn_mla_reduce_v1. Not swept further.
+    // wave32 (gfx1250): past 4 units per CU kn_mla_reduce_v1 is as fast or
+    // faster (16 heads x 128 tiles x 8 splits: 9.8 vs 8.3 us; 128 heads x 16
+    // tiles x 16 splits: 17.3 vs 13.9 us).
+    const int32_t max_units_per_cu = (WideTraits::kWaveSize == 32) ? 4 : 16;
     const bool wins = (params.max_seqlen_q * WideTraits::kNumHeadQ <= kMaxRowsTimesHeads) &&
-                      (unit_bound <= num_cu * 16) && many_splits;
+                      (unit_bound <= num_cu * max_units_per_cu) && many_splits;
     return can_run && ((wide_env == 1) || wins);
 }
 
@@ -1407,9 +1426,14 @@ void dispatch_mla_reduce_v1(const MlaReduceKernelV1Params& params,
         const int32_t wave_size = dev_prop.warpSize;
         const int32_t block_dim = Traits::kNumWarps * wave_size;
 
-        using WideTraits = MlaReduceWideTraits<Traits::kSizeDV, Traits::kNumHeadQ>;
-        if(mla_reduce_use_wide<WideTraits>(params, dev_prop, num_cu))
-        {
+        // The wide kernel's traits follow the device wave size (see
+        // MlaReduceWideTraits), so pick the instance from the runtime warpSize.
+        auto try_wide = [&](auto wide_traits) {
+            using WideTraits = decltype(wide_traits);
+            if(!mla_reduce_use_wide<WideTraits>(params, dev_prop, num_cu))
+            {
+                return false;
+            }
             // One workgroup per unit is the most the kernel uses (every wave on
             // one unit); fewer are grid-strided. 4 workgroups per CU is not swept.
             const int32_t unit_bound = params.num_reduce_tile * Traits::kNumHeadQ *
@@ -1420,6 +1444,12 @@ void dispatch_mla_reduce_v1(const MlaReduceKernelV1Params& params,
                    WideTraits::kNumThreads,
                    mla_reduce_wide_lds_bytes<WideTraits>(),
                    stream>>>(params);
+            return true;
+        };
+        if((wave_size == 32)
+               ? try_wide(MlaReduceWideTraits<Traits::kSizeDV, Traits::kNumHeadQ, 32>{})
+               : try_wide(MlaReduceWideTraits<Traits::kSizeDV, Traits::kNumHeadQ, 64>{}))
+        {
             return;
         }
 
