@@ -96,6 +96,12 @@ void allreduce_add_lamport(fptr_t _fa,
                            const aiter_tensor_t& inp,
                            const aiter_tensor_t& other,
                            const aiter_tensor_t& out);
+// Lamport all-reduce of inp on the init_lamport_ar_rms inbox: one-shot, or
+// with two_shot a reduce-scatter and an all-gather (fp16/bf16).
+void allreduce_lamport(fptr_t _fa,
+                       const aiter_tensor_t& inp,
+                       const aiter_tensor_t& out,
+                       bool two_shot);
 // Lamport one-shot all-gather on the init_lamport_ar_rms inbox. dim 0
 // concatenates the ranks' inputs, any other dim gathers along the last dim.
 // An input the kernel cannot read in place (unaligned, or overlapping out other
