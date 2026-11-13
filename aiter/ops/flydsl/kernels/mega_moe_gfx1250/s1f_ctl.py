@@ -65,6 +65,16 @@ _S1F_VARIANTS = {16: (4, 2), 32: (4, 2), 64: (3, 2), 128: (3, 2), 256: (3, 1)}
 #: GEMM body's pinned-VGPR / wmma_2x4 prefill schedule (waves_per_eu=1, which
 #: the one-CTA-per-CU 256 variant already implies).
 _S1F_WARPS = {256: (2, 2)}
+#: The grouped-MoE prefill GEMM1 options, by tile_m. Packed A (the storers
+#: write disp_out as M16 x K32 slabs) is what lets the others pay off: on
+#: DSV4.1-Flash EP4 tpr 16384 the stage-1 kernel takes 606 us with all three
+#: against 686 without packed A and 676 with none.
+_S1F_GEMM_OPTS = {256: {"a_preshuffled": 1, "lds_soa": 1, "next_stage_prefetch": 1}}
+#: The smallest recv bound whose step widens GEMM1 to the 256-row prefill tile,
+#: by (world_size, topk); the 256 alignment costs GEMM2 more than it saves below
+#: it. DSV4.1 Flash EP4 per layer, 128 tile vs 256 prefill tile: tpr 8192
+#: 894 vs 907 us, 16384 1704 vs 1646, 32768 3264 vs 3168.
+_S1F_PREFILL_MIN_RECV_BY_SHAPE: dict = {(4, 6): 65536}
 #: m-tiles per group in the GEMM1 work order.
 _S1F_GROUP_M = 8
 # The S1F settings below (with S1F_BLOCK_RUNS in s1f_stage1.py and the compact
@@ -96,6 +106,20 @@ def s1f_max_recv(world_size: int, topk: int) -> int:
         cap = int(env)
         return cap if cap > 0 else 1 << 30
     return _S1F_MAX_RECV_BY_SHAPE.get((int(world_size), int(topk)), _S1F_MAX_RECV)
+
+
+def s1f_prefill_tile(world_size: int, topk: int, recv_bound: int) -> int:
+    """GEMM1 tile_m the stage-1 kernel runs for this recv bound instead of the
+    CSV's, or 0. ``AITER_MEGA_S1F_PREFILL_RECV`` overrides the bound (0: off)."""
+    if not read_s1f_mode():
+        return 0
+    env = os.environ.get("AITER_MEGA_S1F_PREFILL_RECV", "").strip()
+    lo = (
+        int(env)
+        if env
+        else _S1F_PREFILL_MIN_RECV_BY_SHAPE.get((int(world_size), int(topk)), 0)
+    )
+    return 256 if lo > 0 and int(recv_bound) >= lo else 0
 
 
 def _s1f_warps(tile_m: int) -> tuple:
@@ -228,6 +252,7 @@ class _Stage1Fusion:
         self.ticket_span = 0
         self.launches: dict = {}
         self.precompiled: set = set()
+        self._packed_sc = None
 
     def arm(self) -> None:
         """Allocate the stage-1 buffers, or record why this instance cannot.
@@ -236,6 +261,7 @@ class _Stage1Fusion:
         for a flag region that is already there.
         """
         self.enabled = False
+        self._packed_sc = None
         if not read_s1f_mode():
             return
         config = self.d.config
@@ -509,9 +535,25 @@ class _Stage1Fusion:
                 ctas_per_cu=ctas_per_cu,
                 m_warp=m_warp,
                 n_warp=n_warp,
+                **_S1F_GEMM_OPTS.get(tile_m, {}),
             )
             self.launches[key] = launch
         return launch
+
+    def _packed_scales(self) -> torch.Tensor:
+        """The e8m0 rows behind the packed A in disp_out (see make_s1f_stage1)."""
+        if self._packed_sc is None:
+            from .types import _from_gpu_ptr
+
+            config, geo = self.d.config, self.d.compact
+            sb = int(config.dispatch_scale_nbytes)
+            base = self.d.res.arena.local_ptr("disp_out")
+            self._packed_sc = _from_gpu_ptr(
+                base + int(geo.cap) * int(config.dispatch_token_nbytes),
+                (int(geo.cap), sb),
+                torch.uint8,
+            ).view(torch.int32)
+        return self._packed_sc
 
     @staticmethod
     def _run(launch, args) -> None:
@@ -554,7 +596,7 @@ class _Stage1Fusion:
             )
             if id(launch) not in seen:
                 seen.add(id(launch))
-                self._run(launch, launch_args(psum, send, runs, tsrc, 0))
+                self._run(launch, launch_args(psum, send, runs, tsrc, 0, tile_m))
         torch.cuda.synchronize()
         d.res.arena._communicator.barrier()
 
@@ -631,6 +673,13 @@ class _Stage1Fusion:
         }
         # The stage-1 kernel runs its own 256x256 n/k tiles.
         got["tile"], want["tile"] = got["tile"][:1], want["tile"][:1]
+        config = self.d.config
+        prefill = s1f_prefill_tile(
+            config.world_size, config.topk, self.d._step.recv_bound
+        )
+        if prefill == align_m and int(tile_m) <= align_m:
+            # fused_moe keeps the CSV GEMM1 tile; this step widened it.
+            got["tile"] = (align_m,)
         bad = {k: (got[k], want[k]) for k in want if got[k] != want[k]}
         if bad or stage1_act not in (1, 2) or quant_scale is None:
             raise RuntimeError(
@@ -646,12 +695,13 @@ class _Stage1Fusion:
         if stream is None:
             stream = torch.cuda.current_stream()
 
-        def launch_args(psum_t, send_t, runs_t, tsrc_t, n_tok):
+        def launch_args(psum_t, send_t, runs_t, tsrc_t, n_tok, tile=align_m):
+            packed = _S1F_GEMM_OPTS.get(int(tile), {}).get("a_preshuffled", 0)
             return (
                 out,
                 ptr_arg(a),
                 ptr_arg(w),
-                a_scales.view(torch.int32),
+                self._packed_scales() if packed else a_scales.view(torch.int32),
                 w_scales.view(torch.int32),
                 quant_scale.view(torch.uint8),
                 ptr_arg(psum_t),
