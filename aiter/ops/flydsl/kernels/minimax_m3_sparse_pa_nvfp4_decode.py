@@ -767,7 +767,13 @@ def minimax_m3_sparse_pa_nvfp4_decode(
     assert topk_idx.stride(2) == 1
     for t in (block_table, seq_lens):
         assert t.dtype == torch.int32 and t.stride(-1) == 1
+    assert (
+        seq_lens.dim() == 1 and block_table.dim() == 2
+    ), "seq_lens 1-D, block_table 2-D"
     assert rows == seq_lens.shape[0] * query_len
+    assert (
+        block_table.shape[0] >= seq_lens.shape[0]
+    ), "block_table needs a row per request"
     for t in (out, kv_cache, topk_idx, block_table, seq_lens):
         assert t.device == q.device, "all operands must be on q's device"
     dev = q.device.index
@@ -777,14 +783,16 @@ def minimax_m3_sparse_pa_nvfp4_decode(
             splits = decode_splits(rows * hkv, topk, _cu_count(dev))
     assert 1 <= splits <= MAX_SPLITS, f"splits must be in [1, {MAX_SPLITS}]"
     assert splits == 1 or rows * hkv <= MAX_SPLIT_ROWS
+    assert xcds in (None, 0, 8), "xcds must be 0 (plain grid) or 8 (gfx950's XCD count)"
     if xcds is None:
         # The XCD-aware 1-D grid only pays when splits of a row must share an L2; with one
         # workgroup per unit the plain (row, kv head) grid skips its runtime divisions.
         xcds = _xcd_count(dev) if splits > 1 else 0
     if late_v is None:
         late_v = decode_late_v(rows * hkv * splits, _cu_count(dev))
-    part, cnt = _split_buffers(dev)
     unit = _unit_scale(dev)
+    # An unsplit launch never touches the split scratch (~144 MiB): pass placeholders.
+    part, cnt = _split_buffers(dev) if splits > 1 else (unit, unit)
     ks = unit if k_scale is None else k_scale
     vs = unit if v_scale is None else v_scale
     for t in (ks, vs):
@@ -812,7 +820,7 @@ def minimax_m3_sparse_pa_nvfp4_decode(
             vs.data_ptr(),
             part.data_ptr(),
             cnt.data_ptr(),
-            part.numel() * 4,
+            part.numel() * part.element_size(),
             rows,
             query_len,
             num_heads,
