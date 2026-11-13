@@ -2288,6 +2288,7 @@ def flydsl_kda_verify_with_f_b(
         _KDA_STATE_DTYPE_TAGS[state.dtype],
         replay_ring is not None,
         num_warps,
+        device_index=device.index,
     )
     window = intermediate_conv_window
     with torch.cuda.device(device):

@@ -79,6 +79,7 @@ def create_kda_verify_kernel(
     state_dtype: str,
     cache_ring: bool,
     num_warps: int = 4,
+    device_index: int = 0,
 ):
     """Build the Kimi-K3 KDA verify specialization (gfx942/gfx950).
 
@@ -88,7 +89,9 @@ def create_kda_verify_kernel(
     ``cache_ring`` selects ReplaySSM ring writes instead of state snapshots.
     ``num_warps`` (one of :data:`KDA_VERIFY_NUM_WARPS`, 4 or 8) splits the V
     rows of a head across more waves, which shortens each serial step at the
-    cost of fewer resident workgroups.
+    cost of fewer resident workgroups. ``device_index`` only keys the cache: a
+    compiled handle launches on the GPU it was built on, so each GPU gets its own
+    launcher.
     """
     if state_dtype not in _KDA_STATE_DTYPES:
         raise ValueError(

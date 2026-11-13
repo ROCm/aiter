@@ -17,7 +17,7 @@ from torch._subclasses.fake_tensor import FakeTensorMode
 
 import aiter
 from aiter import dtypes
-from aiter.jit.utils.chip_info import get_gfx
+from aiter.jit.utils.chip_info import get_gfx_runtime
 from aiter.ops.flydsl import linear_attention_kernels
 from aiter.ops.flydsl.linear_attention_kernels import (
     flydsl_kda_decode_with_f_b,
@@ -250,15 +250,24 @@ def _reference(inp: VerifyInputs, num_tokens: int):
     return out, window, states, ring
 
 
-def _assert_close(ref, act, msg, atol, rtol, max_bad=0.0):
+# Largest mismatch fraction of one token/head (or one head's snapshot): measured
+# 23 of 16384 snapshot and 1 of 128 ring-g values; a store that never lands is ~1.
+_MAX_REGION_BAD = 1e-2
+
+
+def _assert_close(ref, act, msg, atol, rtol, max_bad=0.0, region_dims=1):
+    """checkAllclose over the pool, then the same tolerance on each region of the
+    last ``region_dims`` axes, so a whole missing token/head cannot hide."""
     ref = ref.float()
     act = act.float()
+    err = checkAllclose(ref, act, atol=atol, rtol=rtol, tol_err_ratio=max_bad, msg=msg)
+    assert err <= max_bad, f"{msg}: {err:.4%} of elements outside {atol=} {rtol=}"
     bad = ~torch.isclose(act, ref, atol=atol, rtol=rtol)
-    ratio = bad.float().mean().item()
-    assert ratio <= max_bad, (
-        f"{msg}: {ratio:.4%} outside atol={atol} rtol={rtol}, "
-        f"max abs err {(act - ref).abs().max().item():.3e}"
-    )
+    region = bad.reshape(-1, bad[(0,) * (bad.dim() - region_dims)].numel())
+    worst = region.float().mean(-1).max().item() if region.numel() else 0.0
+    assert (
+        worst <= _MAX_REGION_BAD
+    ), f"{msg}: one region has {worst:.2%} of elements outside {atol=} {rtol=}"
 
 
 def _assert_matches(inp, out, refs, max_bad=1e-3):
@@ -268,7 +277,9 @@ def _assert_matches(inp, out, refs, max_bad=1e-3):
     _assert_close(ref_out, out, "output", **_OUT_TOL, max_bad=max_bad)
     if ref_states is not None:
         tol = (1e-4, 1e-3) if inp.state.dtype == torch.float32 else (1e-4, 1e-2)
-        _assert_close(ref_states, inp.inter_states, "states", *tol, max_bad=max_bad)
+        _assert_close(
+            ref_states, inp.inter_states, "states", *tol, max_bad=max_bad, region_dims=2
+        )
     if ref_ring is not None:
         _assert_close(ref_ring[0], inp.ring[0], "ring v", 1e-2, 1e-2, max_bad)
         _assert_close(ref_ring[1], inp.ring[1], "ring k", 1e-2, 1e-2, max_bad)
@@ -313,6 +324,38 @@ def test_kda_verify_matches_reference(batch, num_tokens, state_dtype, ring, num_
         num_tokens,
         num_warps=num_warps,
     )
+
+
+@pytest.mark.skipif(torch.cuda.device_count() < 2, reason="needs two GPUs")
+@pytest.mark.parametrize("ring", [False, True], ids=["snapshot", "ring"])
+def test_kda_verify_runs_on_a_second_gpu(ring):
+    """A launcher built on cuda:0 must not serve cuda:1: its compiled handle is
+    bound to the GPU it was built on."""
+    inp = _make_inputs(4, 5, torch.float32, ring)
+    first = _copy_inputs(inp)
+    first_out = _run(first, 5)
+    torch.cuda.synchronize(0)
+
+    def to_second_gpu(value):
+        if isinstance(value, tuple):
+            return tuple(to_second_gpu(t) for t in value)
+        if not isinstance(value, torch.Tensor):
+            return value
+        moved = torch.empty_strided(
+            value.shape, value.stride(), dtype=value.dtype, device="cuda:1"
+        )
+        return moved.copy_(value)
+
+    second = VerifyInputs(
+        **{f.name: to_second_gpu(getattr(inp, f.name)) for f in dataclasses.fields(inp)}
+    )
+    second_out = _run(second, 5)
+    torch.cuda.synchronize(1)
+
+    assert second_out.device == torch.device("cuda", 1)
+    assert torch.equal(second_out.cpu(), first_out.cpu())
+    for a, b in zip(_verify_writes(second), _verify_writes(first)):
+        assert torch.equal(a.cpu(), b.cpu())
 
 
 @pytest.mark.parametrize("cus", [256, 80, 32, 8])
@@ -872,7 +915,7 @@ def test_flydsl_kda_verify(batch, num_tokens, state_dtype, mode):
     candidates = {"flydsl": lambda inputs: _run(inputs, num_tokens)}
 
     flops, nbytes = _verify_work(batch, num_tokens, state_dtype, ring)
-    ret = {"gfx": get_gfx()}
+    ret = {"gfx": get_gfx_runtime()}
     for name, fn in candidates.items():
         # The kernel only writes scratch, so rotated copies serve to keep the
         # state and scratch reads cold, not to restore inputs.
@@ -915,8 +958,10 @@ test_flydsl_kda_verify.__test__ = False
 
 
 def main():
-    if get_gfx() not in SUPPORTED_GFX:
-        aiter.logger.warning("FlyDSL KDA verify unsupported on %s; skipping", get_gfx())
+    if get_gfx_runtime() not in SUPPORTED_GFX:
+        aiter.logger.warning(
+            "FlyDSL KDA verify unsupported on %s; skipping", get_gfx_runtime()
+        )
         return
     parser = argparse.ArgumentParser(
         formatter_class=argparse.RawTextHelpFormatter,
