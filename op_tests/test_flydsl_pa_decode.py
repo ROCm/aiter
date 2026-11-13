@@ -2083,10 +2083,19 @@ def _check_quant_output(launch, query, output, compile_kwargs, capture, pad=3):
         assert torch.equal(scale[:rows], ref_scale)
         assert (fp8[rows:].view(torch.uint8) == 0).all() and (scale[rows:] == 1).all()
 
+    # Launches recorded by other cases must not skip the dispatch checked here.
+    importlib.import_module("aiter.ops.flydsl.pa_decode")._VALIDATED_LAUNCHES.clear()
     for store_output in (True, False):
         run(store_output)
         assert compile_kwargs[-1].get("quant_output", False) == fused
         check(store_output)
+    if fused and capture:
+        # With caller workspace (as ATOM passes it), a repeated call takes the
+        # recorded launch: no dispatch, same bytes.
+        calls = len(compile_kwargs)
+        run(False)
+        assert len(compile_kwargs) == calls
+        check(False)
     if capture:
         stream = torch.cuda.Stream()
         stream.wait_stream(torch.cuda.current_stream())
