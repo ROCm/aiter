@@ -92,6 +92,7 @@ from . import tdm_prims as TDM
 from .compact_plan import (
     PLAN_RUN_ROWS,
     RUN_HDR_RUNS,
+    S1F_SHARED_FIRST,
     compact_run_capacity,
     compact_run_header_dwords,
     compact_tile_capacity,
@@ -141,8 +142,16 @@ MB_REC_B = 128
 MB_SM_B = 128
 #: Rows of a flag tile, the plan's tile: the unit of the producer's pieces,
 #: of tile_info and of the per-source flags, whatever the GEMM1 tile_m (a
-#: multiple of it). A piece then has at most FLAG_M / run_rows = 8 runs.
+#: multiple of it; a smaller tile_m is its own flag tile, see s1f_flag_m).
+#: A piece then has at most FLAG_M / run_rows = 8 runs.
 FLAG_M = 64
+
+
+def s1f_flag_m(tile_m: int) -> int:
+    """Flag tile rows for a GEMM1 tile: FLAG_M, or the whole tile below it."""
+    return min(int(tile_m), FLAG_M)
+
+
 #: Run block a W1 claim covers. A piece (<= FLAG_M rows of one (dest, tile))
 #: has at most FLAG_M / run_rows = 8 runs, so a block of >= 8 runs always holds
 #: a piece start; the claimer owns the pieces that START in its block and
@@ -200,9 +209,12 @@ def s1f_ctl_words(*, npes: int, tile_cap: int) -> int:
 #: 156.3 (2); 4096 P64 313.7, P48 314.0, P80 313.9 (2).
 #: Runs per claim: the tpr <= 1024 bucket uses 2 (was 8), from DSV4.1-Flash
 #: DEP4 on MI455X, MLPerf Endpoints agentic c512 (end to end, with the rest of
-#: the S1F defaults: +2.1% gen tok/s/GPU over S1F off).
+#: the S1F defaults: +2.1% gen tok/s/GPU over S1F off). The tpr <= 2048
+#: bucket uses 2 (was 8): DSV4.1-Flash EP4 zipf 0.2, tpr 1152 per layer
+#: rb2 296.5, rb4 299.0, rb8 301.0, rb16 304.7 us (2 runs each); rb1 298.2
+#: against rb8 300.2 in a second pair.
 S1F_PRODUCERS = (64, 64, 64, 64)
-S1F_BLOCK_RUNS = (4, 2, 8, 8)
+S1F_BLOCK_RUNS = (4, 2, 2, 8)
 
 
 def _tpr_bucket(tokens_per_rank: int) -> int:
@@ -340,6 +352,12 @@ def _lds_load_i64(addr_i32):
 def _lds_load_v2(addr_i32):
     return _llvm.load(
         ir.VectorType.get([2], ir.IntegerType.get_signless(32)), _lds_ptr(addr_i32)
+    )
+
+
+def _lds_load_v4(addr_i32):
+    return _llvm.load(
+        ir.VectorType.get([4], ir.IntegerType.get_signless(32)), _lds_ptr(addr_i32)
     )
 
 
@@ -519,6 +537,12 @@ def make_s1f_stage1(
     block_runs=MB_RB,
     ticket_span=None,
     ctas_per_cu=2,
+    m_warp=1,
+    n_warp=4,
+    next_stage_prefetch=0,
+    lds_soa=0,
+    out_preshuffled=0,
+    a_preshuffled=0,
 ):
     """Build the S1F stage-1 kernel; returns a ``@flyc.jit`` launcher.
 
@@ -610,10 +634,11 @@ def make_s1f_stage1(
     run_hdr = compact_run_header_dwords(npes=npes, experts_per_rank=epr)
     run_cap = compact_run_capacity(max_routes=max_routes)
     # tile_info words and flags are per flag tile, GEMM1 items per m-tile.
-    tile_cap = compact_tile_capacity(compact_cap=compact_cap, tile_m=FLAG_M)
+    FM = s1f_flag_m(tile_m)
+    tile_cap = compact_tile_capacity(compact_cap=compact_cap, tile_m=FM)
     m_cap = compact_tile_capacity(compact_cap=compact_cap, tile_m=tile_m)
-    SUB = int(tile_m) // FLAG_M
-    FSH = FLAG_M.bit_length() - 1
+    SUB = int(tile_m) // FM
+    FSH = FM.bit_length() - 1
     SPAN = int(workers if ticket_span is None else ticket_span)
     if SPAN % int(workers):
         raise ValueError(f"ticket_span={SPAN} is not a multiple of workers={workers}")
@@ -625,6 +650,7 @@ def make_s1f_stage1(
     G = int(workers)
     P = int(producers)
     GM = int(group_m)
+    SHARED_FIRST = S1F_SHARED_FIRST if S1F_SHARED_FIRST < epr else 0
     N1 = 2 * int(inter_dim)
     assert N1 % tile_n == 0
     NT = N1 // tile_n
@@ -633,10 +659,10 @@ def make_s1f_stage1(
             f"an item code packs the n-tile in {_ITEM_N_BITS} bits, got {NT} n-tiles"
         )
     B1 = GM * NT
-    # Runs per W1 claim. A piece has at most FLAG_M / R = 8 runs, and W1 reads
+    # Runs per W1 claim. A piece has at most FM / R runs, and W1 reads
     # 31 - RBK runs past its block to find where its last piece ends.
     RBK = int(block_runs)
-    assert 1 <= RBK and RBK + FLAG_M // R <= WAVE - 1, RBK
+    assert 1 <= RBK and RBK + FM // R <= WAVE - 1, RBK
     assert int(producers) < int(workers)
     # Storer w owns the ring slots s % 2 == w and blocks on its oldest
     # store only with all of them in flight (at most 3 TDM ops per wave):
@@ -651,9 +677,9 @@ def make_s1f_stage1(
         raise ValueError("the producer gathers with 16-bit token indices")
     if R != 8 or npes > 16:
         raise ValueError("the producer is laid out for 8-row runs")
-    if int(tile_m) % FLAG_M or not 1 <= SUB <= 4:
+    if FM % R or FM & (FM - 1) or int(tile_m) % FM or not 1 <= SUB <= 4:
         raise ValueError(
-            f"GEMM1 tile_m={tile_m} must be 1 to 4 flag tiles of {FLAG_M} rows"
+            f"GEMM1 tile_m={tile_m} must be 1 to 4 flag tiles of {FM} rows"
         )
     if SUB > 1 and not POLL:
         raise ValueError(
@@ -662,6 +688,36 @@ def make_s1f_stage1(
         )
     if row_stride > 0xFFFF:
         raise ValueError("TDM row width is 16-bit")
+    # a_preshuffled: disp_out holds the payload as packed (M/16, K/128, 4, 16,
+    # 16 B) A, then every row's e8m0 row-major at scale_bytes pitch. The storers
+    # write it with byte-masked VMEM stores: a TDM store rewrites whole 128 B
+    # blocks, and one block (8 rows of one K32 slab) mixes rows of several runs.
+    APRE = bool(a_preshuffled)
+    PAY_CHUNKS = payload_bytes // 16
+    SC_CHUNKS = scale_bytes // 16
+    APRE_SCALE_OFF = compact_cap * payload_bytes
+    PAY_ITERS = PAY_CHUNKS // (WAVE // R)
+    SC_ITERS = (R * SC_CHUNKS + WAVE - 1) // WAVE
+    # VMEM store instructions per op: payload, scales, then the rowmap store.
+    OP_STORES = (PAY_ITERS + SC_ITERS + 1) if APRE else 1
+    if APRE:
+        if compact_cap % 16 or PAY_CHUNKS % (WAVE // R):
+            raise ValueError("packed A needs M16 rows and whole lane groups")
+        if APRE_SCALE_OFF + compact_cap * scale_bytes > compact_cap * row_stride:
+            raise ValueError("packed A and its e8m0 rows overflow disp_out")
+        if OP_STORES + 3 > 63:
+            raise ValueError("an op's stores overflow the storecnt wait field")
+        # buffer_store drops a masked lane by rewriting its offset to
+        # 0x7FFFFFFF, which is only out of range when num_records stays at or
+        # below that sentinel. One resource for the whole region crosses it
+        # on the wide buckets, and every masked lane then stores for real.
+        if APRE_SCALE_OFF > 0x7FFFFFFF or compact_cap * scale_bytes > 0x7FFFFFFF:
+            raise ValueError("packed A offsets exceed the masked buffer_store sentinel")
+    # storecnt waits a retiring storer can need: its flag stores, plus whole
+    # younger ops (a storer holds at most two in flight).
+    WAIT_STEPS = sorted(
+        {0, 1, 2, 3} | ({OP_STORES + p for p in range(4)} if APRE else set())
+    )
     # Producer LDS map (offsets from the arena base).
     MB_REC = ring_bytes
     MB_SM = MB_REC + MB_NREC * MB_REC_B
@@ -728,6 +784,7 @@ def make_s1f_stage1(
         f32_swiglu_limit: fx.Float32,
         stream: fx.Stream,
     ):
+        g1_buffers = min(num_buffers, max(1, model_dim // tile_k))
         lds_holder = [None]
         ready_holder = [None]
         meta_holder = [None]
@@ -737,10 +794,10 @@ def make_s1f_stage1(
             tile_m=tile_m,
             tile_n=tile_n,
             tile_k=tile_k,
-            m_warp=1,
-            n_warp=4,
+            m_warp=m_warp,
+            n_warp=n_warp,
             out_is_f16=0,
-            num_buffers=min(num_buffers, max(1, model_dim // tile_k)),
+            num_buffers=g1_buffers,
             a_is_fp4=1,
             n_experts=epr,
             stage1_act=stage1_act,
@@ -749,7 +806,7 @@ def make_s1f_stage1(
             quant_wmma_rep=quant_wmma_rep,
             cluster_n=1,
             cluster_m=1,
-            next_stage_prefetch=0,
+            next_stage_prefetch=next_stage_prefetch,
             num_waves_per_tensor_tdm=2,
             tdm_as_in_prologue=0,
             tdm_b_th=0,
@@ -761,12 +818,12 @@ def make_s1f_stage1(
             ep_world_size=0,
             ep_quant_bits=0,
             row_major_ascale=1,
-            a_row_stride_bytes=row_stride,
-            a_scale_row_stride_bytes=row_stride,
-            lds_soa_load_interleave=0,
+            a_row_stride_bytes=0 if APRE else row_stride,
+            a_scale_row_stride_bytes=scale_bytes if APRE else row_stride,
+            lds_soa_load_interleave=lds_soa,
             persistent_workers=G,
             rolled_drain=0,
-            a_preshuffled=0,
+            a_preshuffled=int(APRE),
             m_align=0,
             explicit_tile=1,
             lds_base=lds_holder,
@@ -774,8 +831,10 @@ def make_s1f_stage1(
             tile_meta=meta_holder,
             item_hooks=hooks_holder,
             raw_drain=True,
-            defer_c_wait=True,
+            # Needs the mid-loop fence the GEMM body only has above 32 rows.
+            defer_c_wait=tile_m > 32 and g1_buffers > 2 and not lds_soa,
             tdm_snop=True,
+            out_preshuffled=out_preshuffled,
         )
         if block != 4 * WAVE:
             raise ValueError(f"S1F expects the 4-wave GEMM1 block, got {block}")
@@ -796,6 +855,7 @@ def make_s1f_stage1(
             f"s1f_stage1_p{P}_w{G}_gm{GM}_r{R}d{D}s{S}_ps{POLL_SLEEP}"
             + f"_mb{RBK}i{MB_ST_INFL}l{MB_LD_INFL}"
             + f"_poll{POLL}"
+            + (f"_sf{SHARED_FIRST}" if SHARED_FIRST else "")
             + (f"_ts{SPAN}" if SPAN != G else "")
             + f"_{g1_name}"
         )
@@ -1308,8 +1368,9 @@ def make_s1f_stage1(
                                 win_base
                                 + fx.Int64(dest) * win_stride
                                 + fx.Int64(off_out_tok)
-                                + fx.Int64(row0) * fx.Int64(row_stride)
                             )
+                            if const_expr(not APRE):
+                                dva = dva + fx.Int64(row0) * fx.Int64(row_stride)
                             if lane == fx.Int32(0):
                                 _vst4(sm_at(k), [hdr, _i32_lo(dva), _i32_hi(dva), row0])
                             infl = infl + fx.Int32(1)
@@ -1394,14 +1455,17 @@ def make_s1f_stage1(
                         # storecnt retires in order: at most d of this wave's
                         # VMEM stores were issued after op hh's rowmap store
                         d = vs_now - _uniform(_vld(sm_at(hh) + fx.Int32(88)))
-                        if d == fx.Int32(0):
-                            fx.rocdl.s_wait_storecnt(0)
-                        if d == fx.Int32(1):
-                            fx.rocdl.s_wait_storecnt(1)
-                        if d == fx.Int32(2):
-                            fx.rocdl.s_wait_storecnt(2)
-                        if d >= fx.Int32(3):
-                            fx.rocdl.s_wait_storecnt(3)
+                        # Wait for the largest listed count <= d (any smaller
+                        # one only over-waits).
+                        for ti in range_constexpr(len(WAIT_STEPS)):
+                            t_lo = WAIT_STEPS[ti]
+                            if const_expr(ti + 1 < len(WAIT_STEPS)):
+                                t_hi = WAIT_STEPS[ti + 1]
+                                if (d >= fx.Int32(t_lo)) & (d < fx.Int32(t_hi)):
+                                    fx.rocdl.s_wait_storecnt(t_lo)
+                            else:
+                                if d >= fx.Int32(t_lo):
+                                    fx.rocdl.s_wait_storecnt(t_lo)
                         psl = _uniform(fx.Int32(smh[0])) >> fx.Int32(8)
                         pinfo = _uniform(
                             _vld(ring + fx.Int32(MB_PI) + psl * fx.Int32(4))
@@ -1472,31 +1536,94 @@ def make_s1f_stage1(
                             else:
                                 if n > fx.Int32(R):
                                     _trap()
-                                g0s = fx.Vector.from_elements(
-                                    [
-                                        TDM._i32(1),
-                                        arith.unwrap(_uniform(slot_lds(k))),
-                                        arith.unwrap(_uniform(fx.Int32(smv[1]))),
-                                        arith.unwrap(
-                                            _uniform(
-                                                fx.Int32(smv[2]) | fx.Int32(-(1 << 31))
-                                            )
-                                        ),
-                                    ],
-                                )
-                                rocdl.tensor_store_from_lds(
-                                    g0s,
-                                    _tdm_group1_rows(row_stride, n, 1),
-                                    z4s,
-                                    z4s,
-                                    z8s,
-                                    cache_policy=SCOPE_SYS,
-                                )
-                                s_nop(0)
+                                row0_s = _uniform(fx.Int32(smv[3]))
+                                if const_expr(APRE):
+                                    # Lane (row, slab group): 8 lanes cover one
+                                    # K32 slab's 16 B pieces of consecutive rows,
+                                    # contiguous in the packed layout.
+                                    sl_s = _uniform(slot_lds(k))
+                                    reg_va = (
+                                        fx.Int64(_uniform(fx.Int32(smv[2])))
+                                        << fx.Int64(32)
+                                    ) | (
+                                        fx.Int64(_uniform(fx.Int32(smv[1])))
+                                        & fx.Int64(0xFFFFFFFF)
+                                    )
+                                    # Separate resources so each num_records stays
+                                    # <= 0x7FFFFFFF (the masked-lane sentinel).
+                                    pay_rs = create_buffer_resource_from_addr(
+                                        reg_va.ir_value(),
+                                        num_records_bytes=APRE_SCALE_OFF,
+                                    )
+                                    sc_va = reg_va + fx.Int64(APRE_SCALE_OFF)
+                                    sc_rs = create_buffer_resource_from_addr(
+                                        sc_va.ir_value(),
+                                        num_records_bytes=compact_cap * scale_bytes,
+                                    )
+                                    p_r = lane & fx.Int32(R - 1)
+                                    p_c = lane >> fx.Int32(R.bit_length() - 1)
+                                    p_row = row0_s + p_r
+                                    p_ok = p_r < n
+                                    p_off = (p_row >> fx.Int32(4)) * fx.Int32(
+                                        16 * payload_bytes
+                                    ) + (p_row & fx.Int32(15)) * fx.Int32(16)
+                                    p_lds = sl_s + p_r * fx.Int32(row_stride)
+                                    for it in range_constexpr(PAY_ITERS):
+                                        c = p_c + fx.Int32(it * (WAVE // R))
+                                        buffer_store(
+                                            _lds_load_v4(p_lds + c * fx.Int32(16)),
+                                            pay_rs,
+                                            p_off + c * fx.Int32(256),
+                                            mask=p_ok,
+                                            cache_modifier=SCOPE_SYS,
+                                            offset_is_bytes=True,
+                                        )
+                                    for it in range_constexpr(SC_ITERS):
+                                        e = lane + fx.Int32(it * WAVE)
+                                        s_r = e // fx.Int32(SC_CHUNKS)
+                                        s_k = e - s_r * fx.Int32(SC_CHUNKS)
+                                        s_ok = s_r < n
+                                        s_r = s_ok.select(s_r, fx.Int32(0))
+                                        buffer_store(
+                                            _lds_load_v4(
+                                                sl_s
+                                                + s_r * fx.Int32(row_stride)
+                                                + fx.Int32(payload_bytes)
+                                                + s_k * fx.Int32(16)
+                                            ),
+                                            sc_rs,
+                                            (row0_s + s_r) * fx.Int32(scale_bytes)
+                                            + s_k * fx.Int32(16),
+                                            mask=s_ok,
+                                            cache_modifier=SCOPE_SYS,
+                                            offset_is_bytes=True,
+                                        )
+                                else:
+                                    g0s = fx.Vector.from_elements(
+                                        [
+                                            TDM._i32(1),
+                                            arith.unwrap(_uniform(slot_lds(k))),
+                                            arith.unwrap(_uniform(fx.Int32(smv[1]))),
+                                            arith.unwrap(
+                                                _uniform(
+                                                    fx.Int32(smv[2])
+                                                    | fx.Int32(-(1 << 31))
+                                                )
+                                            ),
+                                        ],
+                                    )
+                                    rocdl.tensor_store_from_lds(
+                                        g0s,
+                                        _tdm_group1_rows(row_stride, n, 1),
+                                        z4s,
+                                        z4s,
+                                        z8s,
+                                        cache_policy=SCOPE_SYS,
+                                    )
+                                    s_nop(0)
                                 # the op's ep_rowmap entries (meta, w), one lane
                                 # per row, SCOPE_SYS relaxed: retired with the op
                                 dest_s = (hdr >> fx.Int32(4)) & fx.Int32(15)
-                                row0_s = _uniform(fx.Int32(smv[3]))
                                 if lane < n:
                                     _store_i64_sys(
                                         win_base
@@ -1507,7 +1634,7 @@ def make_s1f_stage1(
                                             sm_at(k) + fx.Int32(16) + lane * fx.Int32(8)
                                         ),
                                     )
-                                vs = vs + fx.Int32(1)
+                                vs = vs + fx.Int32(OP_STORES)
                                 if lane == fx.Int32(0):
                                     _vst(sm_at(k) + fx.Int32(88), vs)
                                 infl = infl + fx.Int32(1)
@@ -1552,6 +1679,23 @@ def make_s1f_stage1(
             m_tiles = fx.Int32(
                 (m_tiles > fx.Int32(m_cap)).select(fx.Int32(m_cap), m_tiles)
             )
+            if const_expr(SHARED_FIRST):
+                # First m-tile of the last SHARED_FIRST local experts: expert
+                # starts are tile-aligned, so it is the end of the expert
+                # before them, rounded up.
+                rows_pre = fx.Int32(
+                    buffer_load(
+                        rsrc_psum_s,
+                        fx.Int32(epr - 1 - SHARED_FIRST),
+                        vec_width=1,
+                        is_scalar=True,
+                    )
+                )
+                rows_pre = fx.Int32(
+                    (rows_pre < fx.Int32(0)).select(fx.Int32(0), rows_pre)
+                )
+                m_sh = (rows_pre + fx.Int32(tile_m - 1)) // fx.Int32(tile_m)
+                m_sh = fx.Int32((m_sh >= m_tiles).select(fx.Int32(0), m_sh))
             rsrc_tinfo = create_buffer_resource_from_addr(
                 addr_tile_src, num_records_bytes=4 * tile_cap
             )
@@ -1629,9 +1773,12 @@ def make_s1f_stage1(
                     (k == groups - fx.Int32(1)).select(gs_last, fx.Int32(GM))
                 )
                 rq = r // gsz
-                return (
-                    (k * fx.Int32(GM) + r - rq * gsz) << fx.Int32(_ITEM_N_BITS)
-                ) | rq
+                m_q = k * fx.Int32(GM) + r - rq * gsz
+                if const_expr(SHARED_FIRST):
+                    # Rotated to start at the shared experts' m-tiles.
+                    m_q = m_q + m_sh
+                    m_q = fx.Int32((m_q >= m_tiles).select(m_q - m_tiles, m_q))
+                return (m_q << fx.Int32(_ITEM_N_BITS)) | rq
 
             def q_head_bytes(xq):
                 return (fx.Int32(CTL_HEAD) + par * fx.Int32(32)) * fx.Int32(4)
@@ -1993,6 +2140,7 @@ def make_s1f_stage1(
             i32_m,
             inp_cur_tok,
             f32_swiglu_limit,
+            value_attrs=lay["kernel_attrs"],
         ).launch(grid=(G, 1, 1), block=(block, 1, 1), stream=stream)
 
     launch.compile_hints = dict(launch_gemm_a8w4_tdm.compile_hints)
