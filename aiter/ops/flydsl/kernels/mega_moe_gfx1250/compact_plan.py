@@ -1355,8 +1355,11 @@ def compile_tdm_compact_plan(
                     p0 = c_r * fx.Int32(WAVE)
                     lo_p = fx.Int32(0)
                     lo_v = fx.Int32(0)
-                    for step in (16, 8, 4, 2, 1):
-                        cand = lo_p + fx.Int32(step)
+                    # Not `step`: the route_vec > 1 tally above binds it, so
+                    # the rewriter yields it out of `if bid == 0` and fails
+                    # when route_vec == 1 leaves it None.
+                    for half in (16, 8, 4, 2, 1):
+                        cand = lo_p + fx.Int32(half)
                         pc = p0 + cand
                         v_c = _ld(lds_rexcl, _imin(pc, fx.Int32(segs - 1)))
                         ok = (pc < fx.Int32(segs)) & (v_c <= rl)
