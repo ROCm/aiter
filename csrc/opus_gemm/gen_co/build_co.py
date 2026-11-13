@@ -5,7 +5,7 @@
 
 ``--arch gfx1250`` (default) builds the gfx1250 4-wave CO families described
 below. ``--arch gfx950`` builds the gfx950 a16w16 4-wave family
-(``gen_co/co_kernels_gfx950.json``, kernel tags ``a16w16_4wave`` and
+(``gen_co/co_kernels_gfx950_bf16.json``, kernel tags ``a16w16_4wave`` and
 ``a16w16_4wave_ws``) into ``gen_co/gfx950/``: one image per (kid, layout
 NT/NN/TT/TN[, bias]); see ``_build_gfx950`` and gen_co/README.md.
 
@@ -651,7 +651,7 @@ def _default_co_output_dir(arch, offload_arch):
     return os.path.join(_HERE, "named_reg", arch)
 
 # ---------------------------------------------------------------------------
-# gfx950: a16w16 4-wave family (gen_co/co_kernels_gfx950.json)
+# gfx950: a16w16 4-wave family (gen_co/co_kernels_gfx950_bf16.json)
 # ---------------------------------------------------------------------------
 # The pipeline needs [[clang::amdgpu_pin_agpr]] (pinned large tiles) and the
 # newer LLVM's scheduling of ds_read_b64_tr_b16 (the M/N-contiguous layouts),
@@ -865,7 +865,7 @@ def _build_gfx950(p, args, llvm_bin):
     jobs = _gfx950_jobs(instances)
     if not jobs:
         raise SystemExit(
-            "build_co: no gfx950 entries -- check gen_co/co_kernels_gfx950.json"
+            "build_co: no gfx950 entries -- check gen_co/co_kernels_gfx950_bf16.json"
         )
     n_jobs = get_worker_count_for(len(jobs), args.jobs)
     workdir = tempfile.mkdtemp(prefix="opus_build_co_gfx950_")
@@ -947,7 +947,7 @@ def main():
         default="gfx1250",
         choices=("gfx1250", "gfx950"),
         help="logical runtime architecture (A0 images use a -strict storage suffix); "
-        "gfx950 builds the a16w16 4-wave family of co_kernels_gfx950.json",
+        "gfx950 builds the a16w16 4-wave family of co_kernels_gfx950_bf16.json",
     )
     p.add_argument(
         "--offload-arch",

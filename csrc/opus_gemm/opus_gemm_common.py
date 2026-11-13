@@ -2862,12 +2862,12 @@ assert not (GFX1250_4WAVE_CO_KIDS & _GFX1250_PRE_CO_KIDS), (
 )
 
 # ---- gfx950 a16w16 4-wave family (pre-built .co device images) ----------
-# gen_co/co_kernels_gfx950.json lists the exact kids (tile + tag); the images of
+# gen_co/co_kernels_gfx950_bf16.json lists the exact kids (tile + tag); the images of
 # one kid (every layout, and bias/no-bias for the direct tag) are derived from
 # its symbol by a16w16_4wave_co_images(). A separate JSON keeps these records
 # out of the gfx1250 loader above and vice versa.
 CO_KERNELS_GFX950_JSON = os.path.join(
-    os.path.dirname(__file__), "gen_co", "co_kernels_gfx950.json"
+    os.path.dirname(__file__), "gen_co", "co_kernels_gfx950_bf16.json"
 )
 # Layout image suffixes; index = A_T * 2 + B_T (A_T: XQ stored [K, M], B_T: WQ
 # stored [K, N]). Keep in step with the launcher emitted by
