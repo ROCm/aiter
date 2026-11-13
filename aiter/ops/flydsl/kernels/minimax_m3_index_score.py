@@ -2178,8 +2178,9 @@ def index_score_supported_fp4(
     sm_scale=1.0,
     out=None,
     work_map=None,
+    **cp,
 ) -> bool:
-    """Metadata-only predicate for `score_flydsl_fp4`."""
+    """Metadata-only predicate for `score_flydsl_fp4` (`cp`: `cp_world`, `cp_rank`)."""
     return index_score_supported(
         idx_q,
         k_data,
@@ -2192,6 +2193,7 @@ def index_score_supported_fp4(
         out=out,
         work_map=work_map,
         k_scale=k_scale,
+        **cp,
     )
 
 
@@ -2209,8 +2211,9 @@ def index_score_supported_nvfp4(
     out=None,
     work_map=None,
     k_round="e4m3",
+    **cp,
 ) -> bool:
-    """Metadata-only predicate for `score_flydsl_nvfp4`."""
+    """Metadata-only predicate for `score_flydsl_nvfp4` (`cp`: `cp_world`, `cp_rank`)."""
     if k_round not in NVFP4_ROUNDINGS:  # None would validate as an MXFP4 cache
         return False
     return index_score_supported(
@@ -2226,6 +2229,7 @@ def index_score_supported_nvfp4(
         work_map=work_map,
         k_scale=k_scale,
         nvfp4=k_round,
+        **cp,
     )
 
 
@@ -2403,6 +2407,8 @@ def score_flydsl_fp4(
     max_block,
     out=None,
     work_map=None,
+    cp_world: int = 1,
+    cp_rank: int = 0,
 ):
     """`score_flydsl` for an MXFP4 index cache.
 
@@ -2423,6 +2429,8 @@ def score_flydsl_fp4(
         max_block,
         out=out,
         work_map=work_map,
+        cp_world=cp_world,
+        cp_rank=cp_rank,
         k_scale=k_scale,
     )
 
@@ -2440,6 +2448,8 @@ def score_flydsl_nvfp4(
     out=None,
     work_map=None,
     k_round="e4m3",
+    cp_world: int = 1,
+    cp_rank: int = 0,
 ):
     """`score_flydsl` for an NVFP4 index cache (decode).
 
@@ -2465,6 +2475,8 @@ def score_flydsl_nvfp4(
         max_block,
         out=out,
         work_map=work_map,
+        cp_world=cp_world,
+        cp_rank=cp_rank,
         k_scale=k_scale,
         nvfp4=k_round,
     )

@@ -2613,6 +2613,51 @@ def check_nvfp4_tuned_geometry_map(k_round):
     )
 
 
+def check_nvfp4_cp_shard_matches_oracle(point, qdt, k_round):
+    """score_flydsl_nvfp4 with a CP shard (`cp_world`/`cp_rank`) against the oracle."""
+    S, H, batch, max_block, world, rank = point
+    glob = max_block * world
+    lens = ([0, 1, 130] + [P] * batch)[: batch - 1] + [glob * P]
+    lens = [min(x, glob * P) for x in lens]
+    q, cache8, bt, seq, mb = make_case(batch, S, H, lens)
+    assert mb == glob
+    q.copy_(q.abs() + 0.25)
+    q, q_ref = q_for(q, qdt)
+    kd, ks, exact, e4m3 = nvfp4_cache_of(cache8, lambda b: -(b.abs() + 0.25))
+    del cache8
+    ref = score_oracle(
+        q_ref,
+        nvfp4_ref(k_round, exact, e4m3),
+        bt,
+        seq,
+        S,
+        H,
+        D**-0.5,
+        max_block,
+        world,
+        rank,
+    )
+    out = kernel.alloc_score(batch, S, H, max_block, q.device)
+    out.fill_(float("nan"))
+    got = run_nvfp4(
+        q,
+        kd,
+        ks,
+        bt,
+        seq,
+        S,
+        H,
+        max_block,
+        k_round,
+        out=out,
+        cp_world=world,
+        cp_rank=rank,
+    )
+    assert got.data_ptr() == out.data_ptr()
+    check_scores(got, ref)
+    assert bool((got[torch.isfinite(ref)] < 0).all())
+
+
 def exact_sum_case(B, S, H, lens, seed=0):
     """Inputs whose every partial sum is exact in fp32, so a kernel and a torch
     reference must agree to the BIT whatever the accumulation order: |Q| and every
@@ -2864,6 +2909,11 @@ def build_nvfp4_checks():
     for case, qdt, r in itertools.product(cases, QDTS, K_ROUNDS):
         name = f"matches_oracle_{case[0].replace('fp8', 'nvfp4')}_{qdt}_{r}"
         checks.append((name, check_nvfp4_matches_oracle, (case, qdt, r)))
+    for point, qdt, r in itertools.product(
+        [p for p in GEOM_POINTS if p[4] > 1], QDTS, K_ROUNDS
+    ):
+        name = f"cp_shard_{geom_id(point)}_{qdt}_{r}"
+        checks.append((name, check_nvfp4_cp_shard_matches_oracle, (point, qdt, r)))
     for (S, H, lens), qdt, r in itertools.product(
         [(4, 4, [130, 4096, 513, 0]), (8, 4, [2048, 129])], QDTS, K_ROUNDS
     ):
