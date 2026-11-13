@@ -5,8 +5,9 @@
 the op raises, in their order.
 
 These run on CPU tensors: the architecture and the ROCm device rule are injected, and a
-rejected call raises before any kernel or GPU API is reached. Message texts are written
-out here, not taken from the code under test.
+rejected call raises before any kernel or GPU API is reached. Each tensor names its
+device, since a module imported in the same session may set a default device. Message
+texts are written out here, not taken from the code under test.
 """
 
 import contextlib
@@ -136,7 +137,7 @@ def case(name, changes, message, **kwargs):
 
 def sparse_bf16():
     return torch.sparse_coo_tensor(
-        torch.zeros(3, 0, dtype=torch.int64), zeros(0), (ROWS, GROUP, DIM)
+        zeros(3, 0, dtype=torch.int64), zeros(0), (ROWS, GROUP, DIM), device="cpu"
     )
 
 
@@ -154,7 +155,7 @@ REJECTED = [
     case("v_2d", lambda: {"v": zeros(ROWS, DIM)}, SHAPE),
     case(
         "scale_tensor",
-        lambda: {"softmax_scale": torch.tensor(0.0625)},
+        lambda: {"softmax_scale": torch.tensor(0.0625, device="cpu")},
         SCALE_TYPE,
         error=TypeError,
     ),
@@ -308,10 +309,10 @@ REJECTED = [
     case(
         "indices_over_2_gib",
         lambda: {
-            "q": torch.empty(530_000, GROUP, DIM, dtype=torch.bfloat16),
-            "k": torch.empty(530_000, 1, DIM, dtype=torch.bfloat16),
-            "v": torch.empty(530_000, 1, DIM, dtype=torch.bfloat16),
-            "indices": torch.empty(530_000, WIDTH, dtype=torch.int32),
+            "q": torch.empty(530_000, GROUP, DIM, dtype=torch.bfloat16, device="cpu"),
+            "k": torch.empty(530_000, 1, DIM, dtype=torch.bfloat16, device="cpu"),
+            "v": torch.empty(530_000, 1, DIM, dtype=torch.bfloat16, device="cpu"),
+            "indices": torch.empty(530_000, WIDTH, dtype=torch.int32, device="cpu"),
         },
         INDICES,
     ),
@@ -443,7 +444,7 @@ ACCEPTED = [
         lambda: {
             "k": zeros(64, 1, DIM),
             "v": zeros(64, 1, DIM),
-            "kv_slots": torch.arange(ROWS, dtype=torch.int32),
+            "kv_slots": torch.arange(ROWS, dtype=torch.int32, device="cpu"),
         },
     ),
     # A pool is addressed from its base: only a request's K/V span packed K/V.
@@ -452,7 +453,7 @@ ACCEPTED = [
         lambda: {
             "k": zeros(208, 1, DIM),
             "v": zeros(208, 1, DIM),
-            "kv_slots": torch.arange(208, dtype=torch.int32),
+            "kv_slots": torch.arange(208, dtype=torch.int32, device="cpu"),
             "query_lens": (ROWS,),
             "prefix_lens": (200,),
         },
