@@ -3,9 +3,10 @@
 # ruff: noqa: B023, SIM102
 """MegaMoEV2 small-input path: quant, dispatch, GEMM1, GEMM2 and combine fused into one kernel.
 
-Dispatch writes each routed token straight into its expert's fixed slot on the destination rank. The
-runtime serves up to 512 tokens per rank and owns its protocol state and combine output; inside
-MegaMoEV2 its payload, GEMM1-output and combine-input storage are views of the instance's shared arenas.
+Dispatch publishes each route into its expert's fixed slot on the destination rank (with dedup_rows the
+row itself goes once per token and destination into a token-row region). The runtime serves up to 512
+tokens per rank and owns its protocol state and combine output; inside MegaMoEV2 its payload,
+GEMM1-output and combine-input storage are views of the instance's shared arenas.
 """
 
 import functools
@@ -53,7 +54,7 @@ from .mega_moe_fused_gemm import (
     store_at,
 )
 from .mega_moe_stage1 import _validate_dispatch_capacity, stage1_output_buffers
-from .mega_moe_stage2 import _stage2_lds_bytes, p2p_scatter_epilog
+from .mega_moe_stage2 import _SC0_SC1_CACHE, _stage2_lds_bytes, p2p_scatter_epilog
 from .weights import (
     check_bindable,
     check_forward_inputs,
@@ -177,13 +178,6 @@ def _quantize_row_mxfp8(row_rsrc, lane, fz_n_i32, fz_scale_n_i32):
     return row_values, scale
 
 
-def _uniform_i64(addr):
-    v = fx.Uint64(addr)
-    lo = rocdl.readfirstlane(T.i32, fx.Uint32(v))
-    hi = rocdl.readfirstlane(T.i32, fx.Uint32(v >> 32))
-    return fx.Int64((fx.Uint64(hi) << 32) | fx.Uint64(lo))
-
-
 def prefetch_direct_fixed_slot_route(
     *,
     num_waves,
@@ -218,7 +212,11 @@ def prefetch_direct_fixed_slot_route(
     ``uniform``: the table and remote pointers move to SGPRs, so their buffer stores need no waterfall loop.
     """
     rdisp = AddrBuffer(addr_disp)
-    as_ptr = _uniform_i64 if const_expr(uniform) else (lambda v: v)
+    as_ptr = (
+        (lambda v: fx.Int64(comm_ops.wave_uniform_i64(v)))
+        if const_expr(uniform)
+        else (lambda v: v)
+    )
 
     def dp(i):
         return as_ptr(load_at(rdisp, fx.Int32(int(i)), fx.Int64, 1))
@@ -493,7 +491,7 @@ def emit_direct_fixed_slot_finalize(
     def dp(i):
         v = load_at(rdisp, fx.Int32(int(i)), fx.Int64, 1)
         if const_expr(uniform):
-            v = _uniform_i64(v)
+            v = fx.Int64(comm_ops.wave_uniform_i64(v))
         return v
 
     a_se = dp(DispatchSlot.SORTED_EXPERT)
@@ -642,18 +640,19 @@ def make_fused_combine_tail(*, lds_fc_off, reducers, npes, rank, topk, total_exp
         first = i32_grid - nred
         if fx.Int32(ticket) >= first:
             # tok_done: each reducer wave waits for its own token below instead.
-            if tx_i32 < fx.Int32(0 if tok_done else npes):
-                if const_expr(row_format):
-                    # This launch's flag with either format bit (flag << 1 | fp8).
-                    seen = fx.Int64(comm_ops.spin_until_shifted_eq_i64(
-                        arg_xdb + fx.Int64(tx_i32) * fx.Int64(8), arg_flag, shift=1))
-                    fx.ptr_store(fx.Int32(seen & fx.Int64(1)) << tx_i32, fmt_ptr(tx_i32))
-                else:
-                    comm_ops.wait_i64_until_equals(arg_xdb + fx.Int64(tx_i32) * fx.Int64(8), flag)
-                if const_expr(l1_acquire):
-                    comm_ops.invalidate_l1()
-                else:
-                    comm_ops.fence_system_acquire()
+            if const_expr(not tok_done):
+                if tx_i32 < fx.Int32(npes):
+                    if const_expr(row_format):
+                        # This launch's flag with either format bit (flag << 1 | fp8).
+                        seen = fx.Int64(comm_ops.spin_until_shifted_eq_i64(
+                            arg_xdb + fx.Int64(tx_i32) * fx.Int64(8), arg_flag, shift=1))
+                        fx.ptr_store(fx.Int32(seen & fx.Int64(1)) << tx_i32, fmt_ptr(tx_i32))
+                    else:
+                        comm_ops.wait_i64_until_equals(arg_xdb + fx.Int64(tx_i32) * fx.Int64(8), flag)
+                    if const_expr(l1_acquire):
+                        comm_ops.invalidate_l1()
+                    else:
+                        comm_ops.fence_system_acquire()
             fx.barrier()
             fp8_peers = fx.Int32(0)
             if const_expr(row_format and not tok_done):
@@ -791,8 +790,8 @@ def make_g2_tile_runner(*, BM, BN, BK, SBM, use_nt, INTER_MAX, a_dtype, g2_bhois
         # resources need no waterfall loop around every load.
         if const_expr(uniform):
             arg_aq, arg_ascale, arg_bq, arg_bscale, arg_eids, arg_stids, arg_sweights, arg_trb, arg_tile_rows = (
-                _uniform_i64(a) for a in (arg_aq, arg_ascale, arg_bq, arg_bscale, arg_eids, arg_stids, arg_sweights,
-                    arg_trb, arg_tile_rows))
+                fx.Int64(comm_ops.wave_uniform_i64(a)) for a in (arg_aq, arg_ascale, arg_bq, arg_bscale, arg_eids,
+                    arg_stids, arg_sweights, arg_trb, arg_tile_rows))
             i32_max_m_blocks = fx.Int32(rocdl.readfirstlane(T.i32, fx.Int32(i32_max_m_blocks)))
         num_n_blocks = fx.Int32(i32_hidden) // fx.Int32(BN)
         k_bytes = fx.Int32(i32_inter) // fx.Int32(1 if is_f8 else 2)
@@ -832,9 +831,6 @@ def make_g2_tile_runner(*, BM, BN, BK, SBM, use_nt, INTER_MAX, a_dtype, g2_bhois
     return g2_tile, lay
 
 
-_SC0_SC1_CACHE = 17
-
-
 def _use_direct_fixed_slot(npes, experts_per_rank, max_tokens_per_rank, cap, tile_m):
     if tile_m <= 0 or max_tokens_per_rank <= 0:
         return False
@@ -851,7 +847,7 @@ def compile_mega_moe_stage1(
     pipe_weights: bool = True, mfma_amajor: bool = False, swizzle_a: bool = True,
     async_a_copy: bool = False, use_tile_resource: bool = True,
     waves_per_eu_hint: int = 2, num_cu: int = 256, num_dispatch_cu: int = 32, b_nt: int = -1,
-    swiglu_limit: float = 0.0, dedup_rows: bool = False, plan_direct: bool = False, plan_wt: bool = False,
+    swiglu_limit: float = 0.0, dedup_rows: bool = False, plan_wt: bool = False,
     plan_local: bool = False, g2_early: tuple = (0, 0), g2_uniform: bool = False, head_uniform: bool = False,
     g2_epi_lean: int = 0, g1_lookahead: int = 1, g1_a_ahead: int = 1, direct_done: int = 0, tok_done: bool = False,
     tok_counters: bool = False, bf16_head_tokens: int = 0, epi_evec: int = 2, epi_lean: int = 0,
@@ -1023,7 +1019,6 @@ def compile_mega_moe_stage1(
         f"{swiglu_suffix}"
         f"_fused{'_'.join(str(v) for v in fused)}"
         f"{'_dd' if dedup_rows else ''}"
-        f"{'_pd' if plan_direct else ''}"
         f"{'_pw' if plan_wt else ''}"
         f"{'_pl' if plan_local else ''}"
         f"{'_g2u' if g2_uniform else ''}{f'_g2l{g2_epi_lean}' if g2_epi_lean else ''}"
@@ -1056,7 +1051,7 @@ def compile_mega_moe_stage1(
         def _disp_ptr(slot):
             v = _buffer_load(disp_rsrc, fx.Int32(int(slot)), fx.Int64)
             if const_expr(head_uniform):
-                v = _uniform_i64(v)
+                v = fx.Int64(comm_ops.wave_uniform_i64(v))
             return v
 
         a_entry_count = _disp_ptr(DispatchSlot.ENTRY_COUNT)
@@ -1315,11 +1310,7 @@ def compile_mega_moe_stage1(
                 a_xcd_acq = _disp_ptr(DispatchSlot.XCD_ACQ) + fx.Int64(xcd) * fx.Int64(128)
                 plan_word = fx.Int64(0)
                 # Match this launch's epoch in the high word exactly: a >= wait breaks when the 32-bit epoch wraps.
-                if const_expr(plan_direct):
-                    plan_word = fx.Int64(comm_ops.spin_until_shifted_eq_i64(
-                        _disp_ptr(DispatchSlot.PLAN_NV), gate_epoch, shift=32))
-                    comm_ops.invalidate_l1()
-                elif first_local == fx.Int32(0):
+                if first_local == fx.Int32(0):
                     plan_word = fx.Int64(comm_ops.spin_until_shifted_eq_i64(
                         _disp_ptr(DispatchSlot.PLAN_NV), gate_epoch, shift=32))
                     comm_ops.fence_agent_acquire()
@@ -1600,7 +1591,7 @@ def _kernel_knobs(config: MegaMoEConfig) -> dict:
     k1, k2 = config.fused_stage1, config.fused_stage2
     # fmt: off
     return dict(  # noqa: C408
-        dedup_rows=k1.dedup_rows, plan_direct=k1.plan_direct, plan_wt=k1.plan_wt, plan_local=k1.plan_local,
+        dedup_rows=k1.dedup_rows, plan_wt=k1.plan_wt, plan_local=k1.plan_local,
         g2_early=(k2.early_k, k2.early_p if k2.early_k else 0), g2_uniform=k1.g2_uniform,
         head_uniform=k1.head_uniform, g2_epi_lean=k1.g2_epi_lean, g1_lookahead=k1.g1_lookahead,
         g1_a_ahead=k1.g1_a_ahead, direct_done=k1.direct_done, tok_done=k1.tok_done, tok_counters=k1.tok_counters,
@@ -1613,8 +1604,9 @@ def _kernel_knobs(config: MegaMoEConfig) -> dict:
 class SmallMRuntime:
     """Small-input single-kernel MegaMoE (MTPR <= 512) with one in-flight launch per instance.
 
-    Owns its own dispatch/combine buffers and protocol state; weights are bound
-    by pointer so one instance serves every layer.
+    Owns its protocol state and combine output; the payload, GEMM1-output and combine-input
+    storage may be passed in as shared arenas. Weights are bound by pointer so one instance
+    serves every layer.
     """
 
     # Group-major dispatch layout of the fused kernel: fixed slots of 32 rows.

@@ -65,6 +65,7 @@ from .mega_moe_fused_gemm import (
 )
 from .mega_moe_stage1 import _validate_dispatch_capacity, stage1_output_buffers
 from .mega_moe_stage2 import (
+    _SC0_SC1_CACHE,
     _stage2_lds_bytes,
     p2p_scatter_epilog,
     stage2_p2p_row_nbytes,
@@ -133,7 +134,6 @@ class DispatchSlot(IntEnum):
     TILE_EXPECTED_SHARED = 48
     ROW_ARRIVED = 49
     P2P_ROW_ARRIVED = 50
-    SENT_ROW = 51
 
 
 DISPATCH_TABLE_SIZE = max(DispatchSlot) + 1
@@ -344,10 +344,6 @@ def _publish_tile_range(
                         AddrBuffer(p_ready_epoch), destination, fx.Int64, 1
                     )
                     comm_ops.store_i32_system(remote_epoch, ready_slot, payload_epoch)
-
-
-# sc0 sc1: a store written through to the peer's memory (system coherent).
-_SYS_CACHE = 17
 
 
 def _count_tag(expected, parity, npes):
@@ -699,7 +695,7 @@ def emit_dispatch_plan(
         if const_expr(tag_counts):
             # The word is its own arrival flag: written through to the peer, no release or count_done behind it.
             store_at(count | (_count_tag(expected, parity, fz_npes) << fx.Int32(16)), AddrBuffer(remote_bigcnt),
-                fx.Int32(fz_rank * fz_epr) + local_expert, _SYS_CACHE)
+                fx.Int32(fz_rank * fz_epr) + local_expert, _SC0_SC1_CACHE)
         else:
             store_at(count, AddrBuffer(remote_bigcnt), fx.Int32(fz_rank * fz_epr) + local_expert)
     if const_expr(not tag_counts):
@@ -866,8 +862,8 @@ def emit_dispatch_plan(
         fx.rocdl.s_waitcnt(vmcnt=0, lgkmcnt=0, expcnt=0)
         comm_ops.fence_agent_release()
         if lane == fx.Int32(0):
-            # bucket_pairs: the pair order was complete at group_done (each producer released its bucket stores
-            # before its RMW), so the producers only wait for the geometry above.
+            # bucket_pairs: the pair order was complete at group_done (each producer wrote its bucket entries
+            # through before its RMW, emit_dispatch_hist), so the producers only wait for the geometry above.
             comm_ops.store_i32_system(a_pair_order_ready if bucket_pairs else a_pair_ready, parity, expected)
 
 
@@ -925,7 +921,7 @@ def emit_dispatch_plan(
 def emit_dispatch_hist(*, num_waves, fz_k, fz_total_experts, addr_disp, i32_cur_tok, addr_in_idx, dispatch_blocks,
     producer_slot, bucket_cap):
 # fmt: on
-    """emit_dispatch_group's bucket-pair histogram and group_done RMW, run before the launch gate.
+    """The payload producers' bucket-pair histogram and group_done RMW, run before the launch gate.
 
     It touches only rank-local state and the routing input: local_hist (zeroed by the previous launch's payload), the
     pair-order buckets (read by this rank's producers only) and group_done (reset by the previous launch's plan once
@@ -943,7 +939,7 @@ def emit_dispatch_hist(*, num_waves, fz_k, fz_total_experts, addr_disp, i32_cur_
         if (expert >= fx.Int32(0)) & (expert < fx.Int32(fz_total_experts)):
             slot = fx.Int32(comm_ops.atomic_add_agent(a_local_hist + fx.Int64(expert) * fx.Int64(4), fx.Int32(1)))
             # Written through: no L2 writeback (release) before group_done.
-            store_at(route, r_pair, expert * fx.Int32(bucket_cap) + slot, _SYS_CACHE)
+            store_at(route, r_pair, expert * fx.Int32(bucket_cap) + slot, _SC0_SC1_CACHE)
     fx.rocdl.s_waitcnt(vmcnt=0, lgkmcnt=0, expcnt=0)
     fx.barrier()
     if fx.thread_idx.x == fx.Int32(0):
@@ -954,15 +950,14 @@ def emit_dispatch_hist(*, num_waves, fz_k, fz_total_experts, addr_disp, i32_cur_
 @flyc.jit
 def emit_dispatch_group(
     *, num_waves, fz_k, fz_total_experts, addr_disp, i32_cur_tok, addr_in_idx, dispatch_blocks,
-    producer_slot, parity, expected, bucket_cap=0, hist_done=False,
+    producer_slot, parity, expected, bucket_cap=0,
 ):
 # fmt: on
     """Count and group disjoint route spans across payload producer CTAs.
 
-    bucket_cap > 0: a route's histogram RMW result is its slot in its expert's bucket (bucket_cap routes) of the
-    pair order, which is then complete once every producer counted; no prefix wait and no cursor pass.
-    hist_done (bucket_cap > 0): emit_dispatch_hist already counted this CTA's routes and bumped group_done before the
-    launch gate.
+    bucket_cap > 0: emit_dispatch_hist already counted this CTA's routes into its experts' buckets (bucket_cap
+    routes) of the pair order and bumped group_done before the launch gate; the pair order is complete once every
+    producer counted, so there is no prefix wait and no cursor pass.
     """
     rdisp = AddrBuffer(addr_disp)
 
@@ -984,24 +979,17 @@ def emit_dispatch_group(
     group_threads = fx.Int32(dispatch_blocks) * block_threads
     route_limit = i32_cur_tok * fx.Int32(fz_k)
 
-    assert not hist_done or bucket_cap > 0
-    if const_expr(not hist_done):
+    if const_expr(bucket_cap == 0):
         for route in range(group_tid, route_limit, group_threads):
             expert = load_at(r_idx, route, fx.Int32, 1)
             valid = (expert >= fx.Int32(0)) & (expert < fx.Int32(fz_total_experts))
             if valid:
-                if const_expr(bucket_cap > 0):
-                    slot = fx.Int32(
-                        comm_ops.atomic_add_agent(a_local_hist + fx.Int64(expert) * fx.Int64(4), fx.Int32(1)))
-                    store_at(route, r_pair, expert * fx.Int32(bucket_cap) + slot)
-                else:
-                    comm_ops.atomic_add_agent(a_local_hist + fx.Int64(expert) * fx.Int64(4), fx.Int32(1))
+                comm_ops.atomic_add_agent(a_local_hist + fx.Int64(expert) * fx.Int64(4), fx.Int32(1))
         fx.rocdl.s_waitcnt(vmcnt=0, lgkmcnt=0, expcnt=0)
         fx.barrier()
         if tid == fx.Int32(0):
             comm_ops.fence_agent_release()
             comm_ops.atomic_add_agent(a_group_done, fx.Int32(1))
-    if const_expr(bucket_cap == 0):
         if tid == fx.Int32(0):
             comm_ops.wait_i32_until_equals(a_pair_ready + fx.Int64(parity) * fx.Int64(4), expected)
             comm_ops.fence_agent_acquire()
@@ -1040,13 +1028,13 @@ def emit_dispatch_group(
 def emit_presend(
     *, num_waves, fz_k, fz_epr, fz_mtpr, fz_rank, fz_npes, fz_total_experts, fz_nbytes, fz_n_i32, fz_scale_n_i32,
     fz_enable_scales, addr_disp, addr_in_tok, addr_in_sc, addr_in_idx, i32_cur_tok, worker, workers, payload_epoch,
-    presend_experts, presend_limit=None, scale_bound=False,
+    presend_experts, presend_limit=None,
 ):
 # fmt: on
     """Dedup rows, before the plan: send every token row whose lowest expert at a destination is one of that
     destination's first presend_experts local experts (the first payload round), then stamp its arrival.
     presend_limit: a runtime expert count used in place of presend_experts.
-    scale_bound: the token-scale reads are bounded by the mtpr-row scale buffer (see emit_dispatch_payload).
+    The token-scale reads are bounded by the mtpr-row scale buffer (see emit_dispatch_payload).
 
     A dedup row's place (rank * mtpr + token) does not depend on the plan, so the first round's rows cross XGMI while
     the plan runs; that round's payload tasks then send only the route headers.
@@ -1062,7 +1050,7 @@ def emit_presend(
     lane = fx.thread_idx.x & fx.Int32(63)
     warp = fx.Int32(fx.rocdl.readfirstlane(T.i32, fx.thread_idx.x >> fx.Int32(6)))
     r_idx = AddrBuffer(addr_in_idx)
-    r_sc = AddrBuffer(addr_in_sc, fx.Int32(fz_mtpr * fz_scale_n_i32 * 4) if const_expr(scale_bound) else None)
+    r_sc = AddrBuffer(addr_in_sc, fx.Int32(fz_mtpr * fz_scale_n_i32 * 4))
     for item in range(worker * fx.Int32(num_waves) + warp, i32_cur_tok * fx.Int32(fz_npes), workers * fx.Int32(num_waves)):
         token = item // fx.Int32(fz_npes)
         destination = item - token * fx.Int32(fz_npes)
@@ -1119,7 +1107,7 @@ def emit_dispatch_payload(
     producer_slot, parity, expected, producers_per_destination, chunks_per_destination, payload_chunk_rows,
     dedup=False, addr_in_idx=None, merge_release=False, skip_payload_ready=False, chunk_release=True,
     batch_rows=False, lds_base_i32=None, presend_experts=0, bucket_pairs=False, presend_limit=None,
-    hoist_peer=False, scale_bound=False,
+    hoist_peer=False,
 ):
 # fmt: on
     """Produce independently publishable expert payloads from a compact plan.
@@ -1134,8 +1122,10 @@ def emit_dispatch_payload(
 
     chunk_release=False (merge_release): a chunk publishes its tiles without a system release (an L2 writeback).
 
-    batch_rows (dedup): a chunk resolves its routes one per thread, lists the token rows it sends in LDS
-    (lds_base_i32), then its waves copy them.
+    batch_rows (set with dedup): a chunk resolves its routes one per thread, lists the token rows it sends in LDS
+    (lds_base_i32), then its waves copy them. The token-scale reads are bounded by the mtpr-row scale buffer: a row's
+    scales take its first lanes, and the masked loads of the other lanes move past the buffer bound, which without it
+    is 4 GiB, so they would read 2 GiB past the buffer and fault where nothing is mapped there.
 
     presend_experts (batch_rows): emit_presend already sent the token rows whose lowest expert at the destination is
     below presend_experts (presend_limit, when given).
@@ -1143,17 +1133,14 @@ def emit_dispatch_payload(
     hoist_peer: the destination's rows per tile (set before its launch handshake) is read before the plan wait and its
     ready-order flag once after it, instead of after the wait and in every chunk publish (two XGMI reads off the
     first chunk's path).
-
-    scale_bound (batch_rows): the token-scale reads are bounded by the mtpr-row scale buffer. A row's scales take its
-    first lanes; the masked loads of the other lanes move past the buffer bound, which without it is 4 GiB, so they
-    read 2 GiB past the buffer and fault where nothing is mapped there.
     """
     assert merge_release or chunk_release
+    assert dedup == batch_rows
     assert not presend_experts or batch_rows
     if const_expr(batch_rows):
-        assert dedup and payload_chunk_rows <= num_waves * 64 and fz_n_i32 % 256 == 0
+        assert payload_chunk_rows <= num_waves * 64 and fz_n_i32 % 256 == 0
         assert not fz_enable_scales or fz_scale_n_i32 % 4 == 0
-        r_sc = AddrBuffer(addr_in_sc, fx.Int32(fz_mtpr * fz_scale_n_i32 * 4) if const_expr(scale_bound) else None)
+        r_sc = AddrBuffer(addr_in_sc, fx.Int32(fz_mtpr * fz_scale_n_i32 * 4))
         send_cnt_addr = fx.Int64(lds_base_i32 + fx.Int32(16))
 
         def _send_slot(i):
@@ -1182,7 +1169,6 @@ def emit_dispatch_payload(
     p_payload_ready_rows = dp(DispatchSlot.P2P_PAYLOAD_READY_ROWS)
     if const_expr(dedup):
         p_row_arrived = dp(DispatchSlot.P2P_ROW_ARRIVED)
-        r_sent = AddrBuffer(dp(DispatchSlot.SENT_ROW))
 
     tid = fx.thread_idx.x
     lane = tid & fx.Int32(63)
@@ -1384,16 +1370,7 @@ def emit_dispatch_payload(
                         fz_n_i32=fz_n_i32,
                     )
 
-                if const_expr(dedup):
-                    send = _first_route_to(addr_in_idx, source_token, topk_slot, ge, fz_k=fz_k, fz_epr=fz_epr,
-                        fz_total_experts=fz_total_experts)
-                    token_row = fx.Int32(fz_rank * fz_mtpr) + source_token
-                    if lane == fx.Int32(0):
-                        store_at(send.select(token_row, fx.Int32(-1)), r_sent, source_base + row)
-                    if send:
-                        _copy_row_data(token_row)
-                else:
-                    _copy_row_data(destination_row)
+                _copy_row_data(destination_row)
 
         if chunk_active:
             fx.rocdl.s_waitcnt(vmcnt=0, lgkmcnt=0, expcnt=0)
@@ -1424,15 +1401,9 @@ def emit_dispatch_payload(
                 # Every wave drained its token-row stores before thread 0's publish fence: stamp the token rows
                 # this chunk sent.
                 row_arrived_rsrc = AddrBuffer(load_at(AddrBuffer(p_row_arrived), destination, fx.Int64, 1))
-                if const_expr(batch_rows):
-                    for i in range(tid, num_sent, fx.Int32(num_waves * 64)):
-                        token_row = fx.Int32(fz_rank * fz_mtpr) + fx.Int32(fx.ptr_load(_send_slot(i)))
-                        store_at(payload_epoch, row_arrived_rsrc, token_row)
-                else:
-                    for row in range(row_begin + tid, row_end, fx.Int32(num_waves * 64)):
-                        token_row = load_at(r_sent, source_base + row, fx.Int32, 1)
-                        if token_row >= fx.Int32(0):
-                            store_at(payload_epoch, row_arrived_rsrc, token_row)
+                for i in range(tid, num_sent, fx.Int32(num_waves * 64)):
+                    token_row = fx.Int32(fz_rank * fz_mtpr) + fx.Int32(fx.ptr_load(_send_slot(i)))
+                    store_at(payload_epoch, row_arrived_rsrc, token_row)
 
 
 _BUFFER_OFFSET_ABI_BYTES = 1 << 31
@@ -1724,8 +1695,8 @@ def large_m_kernel_specs(
 ):
     """The fused Stage2 and Combine specs of the large-input kernel (part of its compile key).
 
-    A fused knob (FusedStage1Knobs / FusedStage2Knobs) enters a spec only when it is on, so the EP8
-    specs and kernel names stay as they were.
+    A fused knob (FusedStage1Knobs / FusedStage2Knobs) enters a spec only when it differs from its default, so
+    the EP8 DeepSeek-V4-Pro (all-knobs-off) specs and kernel names stay as they were.
     """
     s1, stage2 = config.stage1, config.stage2
     k1, k2 = config.fused_stage1, config.fused_stage2
@@ -1813,7 +1784,7 @@ def large_m_kernel_specs(
         assert k1.lean_plan
         s2_spec += (("plan_tag", 1),)
     if k1.bucket_pairs:
-        assert k1.batch_rows and k1.lean_plan
+        assert k1.batch_rows and k1.lean_plan and k1.early_hist
         s2_spec += (("disp_bucket", 1),)
     if k1.early_hist:
         assert k1.bucket_pairs
@@ -1825,6 +1796,7 @@ def large_m_kernel_specs(
     if k1.epi_evec != 2:
         s2_spec += (("g1_epi_vec", int(k1.epi_evec)),)
     if k1.dedup_rows:
+        assert k1.batch_rows
         s2_spec += (("g1_dedup", 1),)
     if k1.merge_release:
         s2_spec += (("disp_merge_rel", 1),)
@@ -1844,9 +1816,6 @@ def large_m_kernel_specs(
     if k1.batch_rows:
         assert k1.dedup_rows
         s2_spec += (("disp_batch", 1),)
-    if k1.bounded_scales:
-        assert k1.batch_rows
-        s2_spec += (("disp_sc_bound", 1),)
     if k1.presend_experts:
         assert k1.batch_rows
         s2_spec += (("disp_presend", int(k1.presend_experts)),)
@@ -1947,6 +1916,7 @@ def compile_mega_moe_stage1(
     DISP_BUCKET = bool(_s2.get("disp_bucket", 0))
     # disp_early_hist (with disp_bucket): the producers count their routes and bump group_done before the launch gate.
     DISP_EARLY_HIST = bool(_s2.get("disp_early_hist", 0))
+    assert DISP_EARLY_HIST == DISP_BUCKET
     # disp_peer_hoist: the payload producers read the destination's rows per tile and ready-order flag once, early.
     DISP_PEER_HOIST = bool(_s2.get("disp_peer_hoist", 0))
     # disp_early_clear: the owner clears its rank-local counters between sending and awaiting the launch handshake.
@@ -1990,7 +1960,7 @@ def compile_mega_moe_stage1(
             "disp_no_ready", "g1_one_acq", "disp_no_rel", "g1_a_asm", "g1_as_pack", "g1_epi_lean", "g2_a_uni", "g2_skip_pad", "disp_batch",
             "plan_lean", "plan_tag", "disp_bucket", "disp_presend", "disp_presend_rows", "disp_pmb_small", "g2_m_group", "g2_early", "g2_early_xcd", "g2_nt_single",
             "g2_early_mid", "disp_early_hist", "disp_peer_hoist",
-            "disp_early_clear", "disp_sc_bound")
+            "disp_early_clear")
     }
     # g1_short_rows > 0: a GEMM1 m-tile whose row g1_short_rows is padding (an expert's tail tile) runs a
     # g1_short_rows-row tile; padding sits at the end of an expert's rows, so so does every later row.
@@ -2019,8 +1989,6 @@ def compile_mega_moe_stage1(
     G1_EPI_LEAN = int(_s2.get("g1_epi_lean", 0))
     # disp_batch: with g1_dedup, a payload chunk resolves its routes one per thread, then copies the sent rows.
     DISP_BATCH = bool(_s2.get("disp_batch", 0))
-    # disp_sc_bound: with disp_batch, the token-scale reads are bounded by the scale buffer (emit_dispatch_payload).
-    DISP_SC_BOUND = bool(_s2.get("disp_sc_bound", 0))
     # disp_presend: with disp_batch, the consumer CTAs send the first payload round's token rows before the plan.
     DISP_PRESEND = int(_s2.get("disp_presend", 0))
     # disp_presend_rows: the presend covers disp_presend_rows // tokens experts (between disp_presend and 64).
@@ -2277,37 +2245,21 @@ def compile_mega_moe_stage1(
                 comm_ops.store_i32_system(a_payload_ready_rows, fx.Int32(0), fx.Int32(fz_tile_m))
                 comm_ops.fence_system_release()
             fx.barrier()
-            def _send_launch_ready():
-                if tid < fx.Int32(fz_npes):
-                    peer = (tid + fx.Int32(fz_rank)) % fx.Int32(fz_npes)
-                    comm_ops.fence_system_release()
-                    launch_ready_table = _make_buffer_from_addr(p_launch_ready, fx.Int64)
-                    remote_launch_ready = _buffer_load(launch_ready_table, peer, fx.Int64)
-                    comm_ops.store_i32_system(remote_launch_ready, fx.Int32(fz_rank), launch_epoch)
+            # Called by the threads tid < fz_npes, one per peer.
+            def _send_launch_ready(peer):
+                comm_ops.fence_system_release()
+                launch_ready_table = _make_buffer_from_addr(p_launch_ready, fx.Int64)
+                remote_launch_ready = _buffer_load(launch_ready_table, peer, fx.Int64)
+                comm_ops.store_i32_system(remote_launch_ready, fx.Int32(fz_rank), launch_epoch)
 
-            def _wait_launch_ready():
-                if tid < fx.Int32(fz_npes):
-                    peer = (tid + fx.Int32(fz_rank)) % fx.Int32(fz_npes)
-                    # Equality, not >=, so the 32-bit epoch may wrap: no peer can be a launch of this slot
-                    # ahead, since finishing this one needs this rank's dispatch.
-                    comm_ops.wait_i32_until_equals(
-                        a_launch_ready + fx.Int64(peer) * fx.Int64(4), launch_epoch
-                    )
-                    comm_ops.fence_system_acquire()
+            def _wait_launch_ready(peer):
+                # Equality, not >=, so the 32-bit epoch may wrap: no peer can be a launch of this slot
+                # ahead, since finishing this one needs this rank's dispatch.
+                comm_ops.wait_i32_until_equals(a_launch_ready + fx.Int64(peer) * fx.Int64(4), launch_epoch)
+                comm_ops.fence_system_acquire()
 
-            def _handshake():
-                if tid < fx.Int32(fz_npes):
-                    peer = (tid + fx.Int32(fz_rank)) % fx.Int32(fz_npes)
-                    comm_ops.fence_system_release()
-                    launch_ready_table = _make_buffer_from_addr(p_launch_ready, fx.Int64)
-                    remote_launch_ready = _buffer_load(launch_ready_table, peer, fx.Int64)
-                    comm_ops.store_i32_system(remote_launch_ready, fx.Int32(fz_rank), launch_epoch)
-                    # Equality, not >=, so the 32-bit epoch may wrap: no peer can be a launch of this slot
-                    # ahead, since finishing this one needs this rank's dispatch.
-                    comm_ops.wait_i32_until_equals(
-                        a_launch_ready + fx.Int64(peer) * fx.Int64(4), launch_epoch
-                    )
-                    comm_ops.fence_system_acquire()
+            def _peer():
+                return (tid + fx.Int32(fz_rank)) % fx.Int32(fz_npes)
 
             def _clear_local():
                 if tid == fx.Int32(0):
@@ -2344,11 +2296,16 @@ def compile_mega_moe_stage1(
             if const_expr(DISP_EARLY_CLEAR):
                 # The cleared words are rank-local (no peer writes them), so they are cleared while the
                 # launch-ready stores travel and the peers' arrive.
-                _send_launch_ready()
+                if tid < fx.Int32(fz_npes):
+                    _send_launch_ready(_peer())
                 _clear_local()
-                _wait_launch_ready()
+                if tid < fx.Int32(fz_npes):
+                    _wait_launch_ready(_peer())
             else:
-                _handshake()
+                if tid < fx.Int32(fz_npes):
+                    peer = _peer()
+                    _send_launch_ready(peer)
+                    _wait_launch_ready(peer)
                 _clear_local()
             fx.rocdl.s_waitcnt(vmcnt=0, lgkmcnt=0, expcnt=0)
             comm_ops.fence_system_release()
@@ -2395,7 +2352,7 @@ def compile_mega_moe_stage1(
                     addr_in_tok=addr_in_tok, addr_in_sc=addr_in_sc, addr_in_idx=addr_in_idx, i32_cur_tok=i32_cur_tok,
                     worker=ticket - fx.Int32(dispatch_blocks + 1), workers=fx.Int32(launch_grid_x - 1 - dispatch_blocks),
                     payload_epoch=(payload_expected // fx.Int32(fz_npes)) * fx.Int32(2) - payload_parity,
-                    presend_experts=DISP_PRESEND, presend_limit=presend_limit, scale_bound=DISP_SC_BOUND)
+                    presend_experts=DISP_PRESEND, presend_limit=presend_limit)
                 # fmt: on
 
         if producer:
@@ -2403,7 +2360,7 @@ def compile_mega_moe_stage1(
                 num_waves=NUM_WAVES, fz_k=fz_k, fz_total_experts=fz_total_experts, addr_disp=addr_disp,
                 i32_cur_tok=i32_cur_tok, addr_in_idx=addr_in_idx, dispatch_blocks=dispatch_blocks,
                 producer_slot=producer_slot, parity=payload_parity, expected=payload_expected,
-                bucket_cap=fz_mtpr if DISP_BUCKET else 0, hist_done=DISP_EARLY_HIST,
+                bucket_cap=fz_mtpr if DISP_BUCKET else 0,
             )
             producers_per_destination = fx.Int32(dispatch_blocks // fz_npes)
             chunks_per_destination = fx.Int32((fz_mtpr + payload_chunk_rows - 1) // payload_chunk_rows)
@@ -2433,7 +2390,7 @@ def compile_mega_moe_stage1(
                     merge_release=DISP_MERGE_REL, skip_payload_ready=DISP_NO_READY, chunk_release=not DISP_NO_REL,
                     batch_rows=DISP_BATCH, lds_base_i32=fx.Int32(fx.ptrtoint(lds.pool.ptr)),
                     presend_experts=DISP_PRESEND, bucket_pairs=DISP_BUCKET, presend_limit=presend_limit,
-                    hoist_peer=DISP_PEER_HOIST, scale_bound=DISP_SC_BOUND,
+                    hoist_peer=DISP_PEER_HOIST,
                 )
         addr_tile_ready = _disp_ptr(DispatchSlot.TILE_READY)
         addr_tile_expected = _disp_ptr(DispatchSlot.TILE_EXPECTED)
@@ -3300,9 +3257,8 @@ class LargeMRuntime:
         workspace["ready_tile_tail"] = op._sym((2,), torch.int32)
         workspace["payload_ready_rows"] = op._sym((1,), torch.int32)
         if knobs.dedup_rows:
-            # Per (source rank, token) row arrival stamps, and each route's sent token row (or -1).
+            # Per (source rank, token) row arrival stamps.
             workspace["row_arrived"] = op._sym((self.world_size * self.mtpr,), torch.int32)
-            workspace["sent_row"] = torch.empty(self.mtpr * self.topk, dtype=torch.int32, device=self.dev)
         return workspace
 
     def _wire_dispatch_workspace(self, op, workspace):
@@ -3374,7 +3330,6 @@ class LargeMRuntime:
         if "row_arrived" in workspace:
             table[DispatchSlot.ROW_ARRIVED] = workspace["row_arrived"].data_ptr()
             table[DispatchSlot.P2P_ROW_ARRIVED] = workspace["p2p_row_arrived"].data_ptr()
-            table[DispatchSlot.SENT_ROW] = workspace["sent_row"].data_ptr()
         table[DispatchSlot.PAYLOAD_BLOCKS_PER_DESTINATION] = workspace[
             "payload_blocks_per_destination"
         ].data_ptr()

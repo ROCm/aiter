@@ -28,6 +28,9 @@ from .gemm_util import (
     wait_lds_barrier,
 )
 
+# Cache policy (sc0|nt) of do_tile_la's B-scale loads and epilogue stores.
+_LA_CM = 3
+
 
 class _LdsF32View:
     def __init__(self, ptr):
@@ -320,7 +323,7 @@ def do_tile_la(m_tile, n_tile_base, expert, sched, a_gather, a_s2r, b_loader, b_
     full HBM latency per K-step. Unrolling by LA rotates the LA-deep register queue back to identity each
     iteration, so the yielded sets coalesce with the loop arguments and loads stay in flight across the back-edge.
     Per-accumulator MFMA order (ksub 0 then 1, K-steps ascending) is unchanged -> bit-identical output.
-    B-scale loads and epilogue stores are nt; the epilogue stores are clamped to the tile's valid rows.
+    B-scale loads and epilogue stores use sc0|nt (_LA_CM); the epilogue stores are clamped to the tile's valid rows.
     ``meta = (tile_row_base, valid_rows)`` replaces their loads (the caller's own plan); ``row_map`` as
     :func:`do_tile`, without the arrival wait.
     a_ahead > 1: the A rows of K-step k + a_ahead are loaded into registers at step k and written to LDS at step
@@ -330,7 +333,6 @@ def do_tile_la(m_tile, n_tile_base, expert, sched, a_gather, a_s2r, b_loader, b_
     N_ACC = M_REPEAT * NUM_ACC_N
     NUM_B = NUM_ACC_N * _PACK
     NUM_SB = NUM_ACC_N // _PACK
-    sb_cm = 3
     valid_rows = None
     if const_expr(meta is not None):
         tile_row_base, valid_rows = meta
@@ -354,7 +356,7 @@ def do_tile_la(m_tile, n_tile_base, expert, sched, a_gather, a_s2r, b_loader, b_
     for q in range_constexpr(LA):
         init += [h for ni_list in b_loader.load_step(b_row, fx.Int32(q)) for h in ni_list]
     for q in range_constexpr(LA):
-        init += b_scale.load_step(b_row, fx.Int32(q), sb_cm)
+        init += b_scale.load_step(b_row, fx.Int32(q), _LA_CM)
     a_lds_bytes = [lb for lb, _c in a_gather._chunks]
     # a_ahead > 1: A register sets of K-steps k+1 .. k+a_ahead-1 (only in the unrolled K-loop).
     aq = [[v for _lb, v in a_gather.load_regs(fx.Int32(j * A_K_STEP_BYTES))] for j in range_constexpr(1, a_ahead)]
@@ -383,7 +385,7 @@ def do_tile_la(m_tile, n_tile_base, expert, sched, a_gather, a_s2r, b_loader, b_
         kl = sp + fx.Int32(LA)
         if const_expr(a_issue):
             aq.append([v for _lb, v in a_gather.load_regs((sp + fx.Int32(a_ahead)) * fx.Int32(A_K_STEP_BYTES))])
-        sb_new = b_scale.load_step(b_row, kl, sb_cm) if issue else None
+        sb_new = b_scale.load_step(b_row, kl, _LA_CM) if issue else None
         sa = a_scale.load_step(a_scale_lds, sp)
         a_regs = None
         if const_expr(a_next):
@@ -429,7 +431,7 @@ def do_tile_la(m_tile, n_tile_base, expert, sched, a_gather, a_s2r, b_loader, b_
         acc, bq, sbq = step(fx.Int32(k), acc, bq, sbq, k + LA <= K_ITERS - 1, k < K_ITERS - 1,
             a_ahead > 1 and k + a_ahead <= K_ITERS - 1)
     wait_lds_barrier()
-    epi.store(acc, m_tile, tile_row_base, n_tile_base, valid_rows, 3)
+    epi.store(acc, m_tile, tile_row_base, n_tile_base, valid_rows, _LA_CM)
 
 
 # fmt: off
@@ -447,7 +449,8 @@ def build_fused_gemm1(*, x_tensor, w_rsrc, sw_rsrc, sx_rsrc,
     """Build the GEMM1 atoms and return its expert resolver and tile runner.
 
     ``lookahead > 0`` runs tiles with :func:`do_tile_la`, clamping each tile to its ``rows_rsrc`` row count;
-    ``out_cache_modifier`` is the epilogue store cache policy and ``tile_zero`` is forwarded to :func:`do_tile`.
+    ``out_cache_modifier`` is the epilogue store cache policy (not used with ``lookahead > 0``, whose stores use
+    ``_LA_CM``) and ``tile_zero`` is forwarded to :func:`do_tile`.
     The remaining knobs serve the fused kernels: ``fused_v8`` / ``epi_lean`` pick the fused evec 8 epilogue
     (SiluQuantEpilogue), ``row_map`` reads A through the srcmap (:func:`do_tile`), ``a_asm_reads`` /
     ``ascale_packed`` are the A loaders' modes, ``plan_lookup(m_tile) -> (expert, tile_row_base, rows)`` takes

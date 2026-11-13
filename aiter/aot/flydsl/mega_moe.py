@@ -91,11 +91,9 @@ V41_FLASH_QUANTS = ("a8w4",)
 # DeepSeek-V4.1-Flash EP2 deployment profile (epr192, the EP4 shape and MTPRs).
 V41_FLASH_EP2_WORLD_SIZE = 2
 V41_FLASH_EP2_EXPERTS_PER_RANKS = (192,)
-# DeepSeek-V4.1-Flash EP8 deployment profile (epr48, d5120 / i2304, a8w4 only),
-# at ATOM DEP8's instances: decode (128) and prefill (8192 and 16384).
+# DeepSeek-V4.1-Flash EP8 deployment profile (epr48, the EP4 shape and MTPRs).
 V41_FLASH_EP8_WORLD_SIZE = 8
 V41_FLASH_EP8_EXPERTS_PER_RANKS = (48,)
-V41_FLASH_EP8_MTPRS = (128, 8192, 16384)
 WORLD_SIZE = 8
 TOPK = 6
 MODEL_DIM = 7168
@@ -161,11 +159,9 @@ def production_jobs(
     world_size=WORLD_SIZE,
     swiglu_limit=SWIGLU_LIMIT,
     v41_flash_mtprs=V41_FLASH_MTPRS,
-    v41_flash_ep8_mtprs=V41_FLASH_EP8_MTPRS,
 ):
     """Every geometry the service ships: V4-Pro (default shape), Kimi-K3 and
-    V4.1-Flash EP4 / EP2 (``v41_flash_mtprs``) and EP8 (``v41_flash_ep8_mtprs``),
-    a8w4 in ``quants`` only.
+    V4.1-Flash EP4 / EP2 / EP8 (``v41_flash_mtprs``, a8w4 in ``quants`` only).
 
     Used by the default build so every profile is AOT-covered and none
     triggers an online JIT compile at serving time.
@@ -189,6 +185,7 @@ def production_jobs(
     for flash_world_size, flash_experts_per_ranks in (
         (V41_FLASH_WORLD_SIZE, V41_FLASH_EXPERTS_PER_RANKS),
         (V41_FLASH_EP2_WORLD_SIZE, V41_FLASH_EP2_EXPERTS_PER_RANKS),
+        (V41_FLASH_EP8_WORLD_SIZE, V41_FLASH_EP8_EXPERTS_PER_RANKS),
     ):
         jobs += default_jobs(
             v41_flash_mtprs,
@@ -199,15 +196,6 @@ def production_jobs(
             inter_dim=V41_FLASH_INTER_DIM,
             swiglu_limit=swiglu_limit,
         )
-    jobs += default_jobs(
-        v41_flash_ep8_mtprs,
-        V41_FLASH_EP8_EXPERTS_PER_RANKS,
-        quants=tuple(q for q in quants if q in V41_FLASH_QUANTS),
-        world_size=V41_FLASH_EP8_WORLD_SIZE,
-        model_dim=V41_FLASH_MODEL_DIM,
-        inter_dim=V41_FLASH_INTER_DIM,
-        swiglu_limit=swiglu_limit,
-    )
     return jobs
 
 
@@ -375,9 +363,6 @@ def main():
             world_size=args.world_size,
             swiglu_limit=args.swiglu_limit,
             v41_flash_mtprs=V41_FLASH_MTPRS if default_mtprs else tuple(args.mtpr),
-            v41_flash_ep8_mtprs=(
-                V41_FLASH_EP8_MTPRS if default_mtprs else tuple(args.mtpr)
-            ),
         )
     else:
         jobs = default_jobs(

@@ -1128,7 +1128,8 @@ class MegaMoEV2:
 
         ``max_tokens``: rows of this call on its largest EP rank, counting graph
         padding, passed identically on every rank; it selects the route. None
-        takes the staged route (fixed-slot or compact), as before the fused routes.
+        takes the staged route (fixed-slot or compact), or the large-input route
+        when set_large_m_enabled(True) was called.
 
         The output is a view of the route's combine buffer, valid until the next
         call. ``slice_output=False`` returns the whole buffer: as many rows as
@@ -1158,17 +1159,17 @@ class MegaMoEV2:
             )
 
     def _launch_route(self, route, x_bf16, wts, topk_ids, slice_output, mask_invalid_slots):
+        # Every launch takes stream None: _forward_route has set the current stream.
         run_tokens = int(x_bf16.shape[0])
-        stream = None  # the current stream, set by _forward_route
         route, capacity = route
         if route == ROUTE_LARGE_M:
             return self._large_m.forward(
-                x_bf16, wts, topk_ids, stream=stream, slice_output=slice_output
+                x_bf16, wts, topk_ids, slice_output=slice_output
             )
         if route == ROUTE_SMALL_M:
             runtime = self._small_m_runtimes[self._bundle_plan.small_m_mtprs.index(capacity)]
             return runtime.forward(
-                x_bf16, wts, topk_ids, stream=stream, slice_output=slice_output
+                x_bf16, wts, topk_ids, slice_output=slice_output
             )
         if self._s1_fixed_slot:
             # Into the instance's own buffers (compact prepare quantizes in place):
@@ -1185,7 +1186,7 @@ class MegaMoEV2:
                     ),
                 )
             return self._run_joint(
-                x_q, scales, wts, topk_ids, run_tokens, stream, slice_output,
+                x_q, scales, wts, topk_ids, run_tokens, None, slice_output,
                 mask_invalid_slots=mask_invalid_slots,
             )
 
@@ -1206,7 +1207,7 @@ class MegaMoEV2:
             wts,
             topk_ids,
             run_tokens,
-            stream,
+            None,
             slice_output,
             config=config,
             prepared=True,

@@ -11,8 +11,9 @@ from flydsl.expr.typing import T
 from flydsl.expr.typing import Vector as Vec
 from flydsl.expr.typing import as_ir_value as _raw
 
-from ..act import situ_mul, tanh_via_sigmoid_f32
+from ..act import sigmoid_f32, situ_mul, tanh_via_sigmoid_f32
 from ..dpp_utils import dpp_xor_f32
+from ..kernels_common import LOG2E
 from ..tensor_shim import buf_copy_load, buf_copy_store, ptr_buf_tensor
 from .mega_moe_fused_gemm import _buffer_load
 
@@ -939,9 +940,8 @@ class SiluQuantEpilogue:
 
     def _silu(self, g):
         if const_expr(self._fast_silu):
-            emu = (g * fx.Float32(-1.4426950408889634)).exp2(fastmath="afn")
-            return g * fx.Float32(rocdl.rcp(T.f32, _raw(fx.Float32(1.0) + emu)))
-        emu = (g * fx.Float32(-1.4426950408889634)).exp2()
+            return g * sigmoid_f32(g)
+        emu = (g * fx.Float32(-LOG2E)).exp2()
         return g * (fx.Float32(1.0) / (fx.Float32(1.0) + emu))
 
     def _combine(self, acc):

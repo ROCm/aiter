@@ -53,6 +53,14 @@ _DEFAULT_COMBINE_WARP_NUM = 8
 
 logger = logging.getLogger(__name__)
 
+
+def _zeroed_sym(shape, dtype):
+    """A zeroed mori symmetric tensor."""
+    t = mori_shmem_create_tensor(shape, dtype)
+    t.zero_()
+    return t
+
+
 # Launch-geometry tuned CSV lives under ``aiter/configs/`` and is resolved via
 # ``AITER_CONFIGS.AITER_CONFIG_DISPATCH_COMBINE_INTRANODE_FILE``.
 
@@ -415,22 +423,10 @@ class GroupMajorPayloadArena:
             max(1, rows * scale_n) for _, rows, _, scale_n in capacities
         )
         self.route_rows = max(nvm for nvm, _, _, _ in capacities)
-        self.rx = self._sym((self.rx_bytes,), torch.int8)
-        self.scale = self._sym((self.scale_i32,), torch.int32)
-        self.wts = self._sym((self.route_rows,), torch.float32)
-        self.srcmap = self._sym((self.route_rows,), torch.int32)
-
-    @staticmethod
-    def _sym(shape, dtype):
-        t = mori_shmem_create_tensor(shape, dtype)
-        t.zero_()
-        return t
-
-    def nbytes(self):
-        return sum(
-            t.numel() * t.element_size()
-            for t in (self.rx, self.scale, self.wts, self.srcmap)
-        )
+        self.rx = _zeroed_sym((self.rx_bytes,), torch.int8)
+        self.scale = _zeroed_sym((self.scale_i32,), torch.int32)
+        self.wts = _zeroed_sym((self.route_rows,), torch.float32)
+        self.srcmap = _zeroed_sym((self.route_rows,), torch.int32)
 
 
 class FlyDSLDispatchGroupMajorOp:
@@ -507,9 +503,7 @@ class FlyDSLDispatchGroupMajorOp:
         self._build_p2p()
 
     def _sym(self, shape, dtype):
-        t = mori_shmem_create_tensor(shape, dtype)
-        t.zero_()
-        return t
+        return _zeroed_sym(shape, dtype)
 
     def _alloc(self):
         npes, epr = self.npes, self.epr
@@ -793,11 +787,7 @@ class FlyDSLDispatchCombineIntraNodeOp:
         """A zeroed symmetric combine input large enough for every config in ``cfgs``,
         for ops whose calls never overlap to share (``combine_input=``)."""
         tok, wts = (max(n) for n in zip(*(cls.combine_input_numel(c) for c in cfgs)))
-        tok = mori_shmem_create_tensor((tok,), torch.int16)
-        wts = mori_shmem_create_tensor((wts,), torch.float32)
-        tok.zero_()
-        wts.zero_()
-        return tok, wts
+        return _zeroed_sym((tok,), torch.int16), _zeroed_sym((wts,), torch.float32)
 
     def _alloc_buffers(self):
         cfg = self.cfg

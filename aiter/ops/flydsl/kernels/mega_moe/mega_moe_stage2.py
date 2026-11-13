@@ -35,6 +35,8 @@ from .gemm2 import (
 from .mega_moe_fused_gemm import AddrBuffer, store_at
 
 _BUFFER_OFFSET_ABI_BYTES = 1 << 31
+# sc0 sc1 cache policy (system coherent): a store is written through to memory, visible to other CUs and peers.
+_SC0_SC1_CACHE = 17
 
 
 @flyc.jit
@@ -144,6 +146,7 @@ def _fp8_quant_1x32_lean(vals, route_i8=False):
         for w in range_constexpr(2):
             word = fx.Int32(0)
             for b in range_constexpr(4):
+                # Raw intrinsic: FlyDSL 0.5.0 exposes no rocdl/fx wrapper for v_cvt_pk_u8_f32.
                 word = fx.Int32(
                     llvm.call_intrinsic(
                         T.i32,
@@ -424,14 +427,14 @@ def p2p_scatter_epilog(lds_acc_base, accm, n_block_idx, wave, lane, *, N_OUT, BM
                         (stage_group0 + row) * fx.Int32(16) + lane // fx.Int32(4),
                         fx.Int32(stage_buf.num_records_bytes),
                     )
-                    store_at(e8m0.to(fx.Int8), stage_buf, stage_off, 17, offset_is_bytes=True)
+                    store_at(e8m0.to(fx.Int8), stage_buf, stage_off, _SC0_SC1_CACHE, offset_is_bytes=True)
                 else:
 
                     @flyc.jit
                     def stage_scale_if_leader():
                         if scale_leader:
                             stage_off = (stage_group0 + row) * fx.Int32(16) + lane // fx.Int32(4)
-                            store_at(e8m0.to(fx.Int8), stage_buf, stage_off, 17, offset_is_bytes=True)
+                            store_at(e8m0.to(fx.Int8), stage_buf, stage_off, _SC0_SC1_CACHE, offset_is_bytes=True)
 
                     stage_scale_if_leader()
             else:

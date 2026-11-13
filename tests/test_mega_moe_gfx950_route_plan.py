@@ -4,7 +4,7 @@
 
 Every EP rank must take the same route for a call, so the plan's choice may
 depend only on EP-wide inputs (the plan and the call's max_tokens). The
-multi-GPU behaviour of each route (EP8 DeepSeek-V4-Pro, EP4 / EP2 DeepSeek-V4.1-Flash)
+multi-GPU behaviour of each route (EP8 DeepSeek-V4-Pro, EP8 / EP4 / EP2 DeepSeek-V4.1-Flash)
 lives in op_tests/multigpu_tests/test_mega_moe_v2.py: --suite size for the
 pinned staged and large-input routes, --suite routes for the instance that
 serves all three.
@@ -78,7 +78,6 @@ def test_fused_layout_gate():
     assert fused_layout_supported(**V41_FLASH_EP4)
     assert fused_layout_supported(**V41_FLASH_EP2)
     assert fused_layout_supported(**V41_FLASH_EP8)
-    assert fused_layout_supported(**{**V41_FLASH_EP4, "world_size": 8})
     assert not fused_layout_supported(**{**V41_FLASH_EP2, "experts": 192})
     # Each layout is supported whole: no mix of the shapes.
     assert not fused_layout_supported(**{**V41_FLASH_EP4, "experts": 768})
@@ -399,7 +398,7 @@ def test_ep8_fused_configs_keep_fused_knobs_off():
 
 # Fused knobs added with the EP2 V4.1-Flash tune: they enter the table only when set, so a digest pinned before
 # them changes only where a config sets one.
-_EP2_KNOBS = ("stream_w", "bounded_scales")
+_EP2_KNOBS = ("stream_w",)
 
 
 def _knob_table(config):
@@ -421,9 +420,9 @@ def _knob_table(config):
 
 
 # The EP4 V4.1-Flash fused configs, as ported from 28ee7fcd (its _tune_v41_flash_ep4 on the post-processed
-# small-input configs and on the large-input config at MTPR 8192), with the large-input route's token-scale reads
-# bounded (bounded_scales). On a mismatch the assertion shows the current table.
-_EP4_FUSED_DIGEST = "313816b9f3811298205dcabf26ec17d0039329f0ec4c3333a8fe4d86d33cb76a"
+# small-input configs and on the large-input config at MTPR 8192). On a mismatch the assertion shows the current
+# table.
+_EP4_FUSED_DIGEST = "a254254df36be0ddd5969ca3085404cab4624ea7ca7590a1912257436e71808b"
 
 
 def test_ep4_fused_configs_unchanged():
@@ -481,7 +480,7 @@ def test_ep4_small_m_buckets_share_one_protocol(mtpr):
 # The EP8 V4.1-Flash fused configs (_tune_v41_flash_ep8_small / _large). On a mismatch the assertion shows the
 # current table.
 _V41EP8_FUSED_DIGEST = (
-    "d5240e1a8f4725a31953eb5394b30bf5a93a0855f01a62a58356c51f90721fa4"
+    "b8baf6dd7e37c64092de0b0303c8fc49cbfa3aa977f81ce115e090d5c05f4121"
 )
 
 
@@ -637,20 +636,20 @@ def test_ep2_small_m_buckets_share_one_protocol(mtpr):
 
 
 def test_ep2_large_m_config():
-    """EP2 V4.1-Flash large-input kernel: producers below the CU count and split over the 2 destinations, and the
-    batched dispatch's token-scale reads bounded by the scale buffer (they fault otherwise).
+    """EP2 V4.1-Flash large-input kernel: producers below the CU count and split over the 2 destinations, and a
+    batched dispatch, whose token-scale reads are bounded by the scale buffer (they fault otherwise).
     """
     for mtpr in (8192, 16384):
         config = select_fused_config(mtpr, mtpr, **V41_FLASH_EP2_SHAPE)
         assert 0 < config.stage1.num_dispatch_cu < 256
         assert config.stage1.num_dispatch_cu % 2 == 0
-        assert config.fused_stage1.batch_rows and config.fused_stage1.bounded_scales
-    # EP4 and EP8 V4.1-Flash (whose tune builds on EP4's) batch their rows too, so their reads are bounded as well;
-    # EP8 V4-Pro does not batch them.
+        assert config.fused_stage1.batch_rows
+    # EP4 and EP8 V4.1-Flash (whose tune builds on EP4's) batch their rows too, so their reads are bounded as well
+    # (batched reads always are); EP8 V4-Pro does not batch them.
     for shape in (V41_FLASH_EP4_SHAPE, V41_FLASH_EP8_SHAPE):
         for mtpr in (8192, 16384):
             knobs = select_fused_config(mtpr, mtpr, **shape).fused_stage1
-            assert knobs.batch_rows and knobs.bounded_scales
+            assert knobs.batch_rows
     assert not select_fused_config(8192, 8192).fused_stage1.batch_rows
 
 
@@ -712,7 +711,7 @@ def test_ep2_route_for_every_max_tokens(mtpr):
 
 # The EP2 V4.1-Flash fused configs (_tune_v41_flash_ep2_small / _large). On a mismatch the assertion shows the
 # current table.
-_EP2_FUSED_DIGEST = "110984e63a479e0864a3b55cbf1308fdfa864c4d750b8689f23a6f5b6f1ad9f6"
+_EP2_FUSED_DIGEST = "5c841f7a20b8a13a3b717d64cbf858ec686049299df575cd4c21ea2c0cf485a3"
 
 
 def test_ep2_fused_configs_unchanged():

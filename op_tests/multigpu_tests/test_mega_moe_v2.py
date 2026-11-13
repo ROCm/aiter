@@ -536,7 +536,6 @@ def _run_size(moe, x, weights, ids, ref_weights, args, rank, world, device):
             ref_weights,
             args,
             rank,
-            world,
             device,
             0 < int(token_max.item()) <= args.accuracy_max_bs,
         )
@@ -597,7 +596,7 @@ def _run_size(moe, x, weights, ids, ref_weights, args, rank, world, device):
             flush=True,
         )
     if args.pad_tail_rows:
-        _check_pad_tail(moe, x, weights, ids, ref_weights, args, rank, world, device)
+        _check_pad_tail(moe, x, weights, ids, ref_weights, args, rank, device)
 
 
 def _binding_state(moe):
@@ -654,7 +653,6 @@ def _check_large_m_edges(
     ref_weights,
     args,
     rank,
-    world,
     device,
     check_mask,
 ):
@@ -758,7 +756,7 @@ def _check_large_m_edges(
         else:
             raise AssertionError(f"{label} Stage1 accepted float8_e4m3fn scales")
 
-    # The instance's own layout (one of FUSED_LAYOUTS: EP8 DeepSeek-V4-Pro, EP4 / EP2 DeepSeek-V4.1-Flash).
+    # The instance's own layout (one of FUSED_LAYOUTS: EP8 DeepSeek-V4-Pro, EP8 / EP4 / EP2 DeepSeek-V4.1-Flash).
     layout = {
         "arch": "gfx950",
         "world_size": moe.world_size,
@@ -786,7 +784,7 @@ def _check_large_m_edges(
         )
 
 
-def _check_pad_tail(moe, x, weights, ids, ref_weights, args, rank, world, device):
+def _check_pad_tail(moe, x, weights, ids, ref_weights, args, rank, device):
     """Whole -1 rows with mask_invalid_slots=True: exact zeros, real rows intact.
 
     Runs after the unmasked passes above, so the combine input still holds

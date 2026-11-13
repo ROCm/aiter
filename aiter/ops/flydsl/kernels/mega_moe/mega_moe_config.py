@@ -62,9 +62,14 @@ V41_FLASH_EP8_LAYOUT = (8, 48, 5120, 2304)
 FUSED_LAYOUTS = frozenset(
     {
         (8, V4_MODEL_DIM, V4_INTER_DIM, 8 * REFERENCE_EXPERTS_PER_RANK, 6),
-        (4, 5120, 2304, 4 * 96, 6),
-        (2, 5120, 2304, 2 * 192, 6),
-        (8, 5120, 2304, 8 * 48, 6),
+        *(
+            (world, model_dim, inter_dim, world * epr, 6)
+            for world, epr, model_dim, inter_dim in (
+                V41_FLASH_EP4_LAYOUT,
+                V41_FLASH_EP2_LAYOUT,
+                V41_FLASH_EP8_LAYOUT,
+            )
+        ),
     }
 )
 K3_MODEL_DIM, K3_INTER_DIM = 3584, 3072
@@ -99,6 +104,15 @@ V41_FLASH_EP2_LARGE_M_MTPRS = (8192, 16384)
 # EP8 DeepSeek-V4.1-Flash, whose large-input tune builds on EP4's, likewise: at 1024 it faulted the same way
 # (1 of 2 runs), so 1024, 2048 and 4096 stay staged.
 V41_FLASH_EP8_LARGE_M_MTPRS = (8192, 16384)
+# (world_size, model_dim, inter_dim) -> large-input capacities of the DeepSeek-V4.1-Flash layouts.
+_V41_FLASH_LARGE_M_MTPRS = {
+    (world, model_dim, inter_dim): mtprs
+    for (world, _, model_dim, inter_dim), mtprs in (
+        (V41_FLASH_EP4_LAYOUT, V41_FLASH_EP4_LARGE_M_MTPRS),
+        (V41_FLASH_EP2_LAYOUT, V41_FLASH_EP2_LARGE_M_MTPRS),
+        (V41_FLASH_EP8_LAYOUT, V41_FLASH_EP8_LARGE_M_MTPRS),
+    )
+}
 # The fused kernels have no 2-token variant: 2 tokens take the 1-token config.
 FUSED_TOKEN_BUCKETS = tuple(b for b in TOKEN_BUCKETS if b != 2)
 # Below this many rows per rank the staged (or small-input) path is faster than
@@ -179,11 +193,12 @@ class Stage2Config:
 class FusedStage1Knobs:
     """Dispatch / plan / GEMM1 knobs only the fused (small- and large-input) kernels read.
 
-    All off is the EP8 DeepSeek-V4-Pro kernel; the EP4 DeepSeek-V4.1-Flash
-    tune (_tune_v41_flash_ep4) turns them on. The protocol knobs (dedup_rows,
+    All off is the EP8 DeepSeek-V4-Pro kernel; the V4.1-Flash tunes
+    (_tune_v41_flash_ep4_small / _tune_v41_flash_ep4_large and the EP2 / EP8
+    tunes built on them) turn them on. The protocol knobs (dedup_rows,
     plan_local, direct_done, tok_done) change what the ranks of a launch
-    exchange: every rank of a launch must agree on them, so they are set per
-    layout, never per token bucket.
+    exchange, so every rank of a launch must agree on them; tok_counters and
+    bf16_head_tokens are set per layout, never per token bucket.
     """
 
     # Large-input dispatch: at least this many payload producers per destination (0: one per row chunk).
@@ -195,10 +210,6 @@ class FusedStage1Knobs:
     # One dispatch row per (token, destination rank) instead of per route; GEMM1 reads A through the srcmap.
     # Every rank of a launch must agree.
     dedup_rows: bool = False
-    # Small-input fused kernel: every CTA waits on the plan flag itself and invalidates only its L1, instead of one
-    # CTA an XCD acquiring and republishing the flag. No CTA reads the plan, srcmap or token rows before the flag, so
-    # its XCD's L2 holds none of their lines (the launch's acquire dropped the earlier ones).
-    plan_direct: bool = False
     # Small-input fused kernel: the plan CTA writes the plan through to memory, so it publishes the flag without an L2
     # writeback first.
     plan_wt: bool = False
@@ -271,10 +282,6 @@ class FusedStage1Knobs:
     # Large-input lean parallel plan: a source writes each count word to its destination with this launch's tag in
     # the high half, and every plan wave spins on the words it reads (False: count_done flags + a barrier).
     tag_counts: bool = False
-    # Large-input dispatch with batch_rows: the token-scale reads (presend and payload copy) are bounded by the scale
-    # buffer, so the lanes past a row's scales read nothing (False: their masked loads read 2 GiB past the buffer,
-    # which faults where nothing is mapped there: EP2 at every token count).
-    bounded_scales: bool = False
     # Large-input dispatch with batch_rows: a route's histogram RMW result is its slot in a fixed-size per-expert
     # bucket of the pair order, so the order is complete with the histogram (False: prefix + a cursor RMW pass).
     bucket_pairs: bool = False
@@ -309,7 +316,7 @@ class FusedStage1Knobs:
 
 @dataclass(frozen=True, slots=True)
 class FusedStage2Knobs:
-    """GEMM2 / combine knobs only the fused kernels read (all off: the EP8 kernels)."""
+    """GEMM2 / combine knobs only the fused kernels read (all off: the EP8 DeepSeek-V4-Pro kernels)."""
 
     # Large-input fused kernel: the GEMM2 units are dealt to the 8 XCDs in chunks of this many; a CTA claims from
     # its own XCD's counter, then from the next XCDs' once that one is spent (0: one claim counter per work shard).
@@ -487,13 +494,9 @@ def large_m_mtprs_for(
     capacities its one tune was measured at (see _tune_v41_flash_ep4_large), EP2 DeepSeek-V4.1-Flash
     V41_FLASH_EP2_LARGE_M_MTPRS and EP8 DeepSeek-V4.1-Flash V41_FLASH_EP8_LARGE_M_MTPRS (see their tunes).
     """
-    if (world_size, model_dim, inter_dim) == (4, 5120, 2304):
-        return V41_FLASH_EP4_LARGE_M_MTPRS
-    if (world_size, model_dim, inter_dim) == (2, 5120, 2304):
-        return V41_FLASH_EP2_LARGE_M_MTPRS
-    if (world_size, model_dim, inter_dim) == (8, 5120, 2304):
-        return V41_FLASH_EP8_LARGE_M_MTPRS
-    return LARGE_M_MTPRS
+    return _V41_FLASH_LARGE_M_MTPRS.get(
+        (world_size, model_dim, inter_dim), LARGE_M_MTPRS
+    )
 
 
 def small_m_cu_supported(num_cu: int) -> bool:
@@ -1503,21 +1506,20 @@ def _large_m_config(expert_waves: int = 1) -> MegaMoEConfig:
 def _tune_v41_flash_ep4_small(config: MegaMoEConfig, bucket: int) -> MegaMoEConfig:
     """EP4 DeepSeek-V4.1-Flash small-input kernel (96 experts per rank), measured on gfx950."""
     # One dispatch row per (token, destination) instead of per route: the XGMI-bound dispatch sends ~45% fewer
-    # rows (-3% at 128 tokens, -6% at 512, neutral at 1-32). The plan reaches every CTA in one hop: the plan CTA
-    # writes it through to memory and publishes the flag without an L2 writeback, and each CTA waits on the flag
-    # itself instead of behind its XCD's acquire and republish (-1.8% at 1 token, neutral at 8-512). Every CTA
-    # builds the plan from the expert counts itself once the sources are done, so GEMM1 starts without the plan
-    # CTA's metadata stores and flag hop, and takes its tile metadata from LDS (-3% at 1 token, -2% at 8, -1.2% at
-    # 32, -0.3..-0.6% at 128-512); the counters' reset point moves to the combine. With at most 8 route-carrying
-    # producers (1-2 tokens), each one adds its share of the source flag to every destination after its own
-    # drain, skipping the last-producer counter hop (-1.5% at 1 token, -1% at 2, neutral at 16; 24 producers at 16
-    # tokens: +1.3%). These change what the ranks of a launch exchange, and the ranks of a launch may pick
-    # different buckets: every bucket sets them, as it sets the runtime's per-token counters (used by the
-    # tok_done buckets, cleared by every launch) and the BF16 rows of the first tokens (sender and combine agree).
+    # rows (-3% at 128 tokens, -6% at 512, neutral at 1-32). The plan CTA writes the plan through to memory and
+    # publishes the flag without an L2 writeback. Every CTA builds the plan from the expert counts itself once the
+    # sources are done, so GEMM1 starts without the plan CTA's metadata stores and flag hop, and takes its tile
+    # metadata from LDS (-3% at 1 token, -2% at 8, -1.2% at 32, -0.3..-0.6% at 128-512); GEMM2 waits on the plan
+    # flag itself, one hop instead of behind its XCD's acquire and republish (-1.8% at 1 token, neutral at 8-512).
+    # The counters' reset point moves to the combine. With at most 8 route-carrying producers (1-2 tokens), each one
+    # adds its share of the source flag to every destination after its own drain, skipping the last-producer counter
+    # hop (-1.5% at 1 token, -1% at 2, neutral at 16; 24 producers at 16 tokens: +1.3%). These change what the ranks
+    # of a launch exchange, and the ranks of a launch may pick different buckets: every bucket sets them, as it sets
+    # the runtime's per-token counters (used by the tok_done buckets, cleared by every launch) and the BF16 rows of
+    # the first tokens (sender and combine agree).
     stage1 = replace(
         config.fused_stage1,
         dedup_rows=True,
-        plan_direct=True,
         plan_wt=True,
         plan_local=True,
         direct_done=8,
@@ -1665,7 +1667,6 @@ def _tune_v41_flash_ep4_large(config: MegaMoEConfig) -> MegaMoEConfig:
             early_hist=True,
             early_clear=True,
             peer_hoist=True,
-            bounded_scales=True,
         ),
         fused_stage2=replace(
             config.fused_stage2,
