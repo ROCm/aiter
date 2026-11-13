@@ -1,5 +1,10 @@
 # Experimental gfx950 BF16 wave-specialized GEMM
 
+> Current follow-up: the graph-only CSV promotion was reverted at71976a2
+> because rotation regressed. All WS configurations remain explicit-only.
+> The cold-input investigation and six-process before/after microsecond
+> results are in [cold-input follow-up](flydsl_cold_input_followup.md).
+
 This is an **explicit experimental path**, not a replacement for
 `flydsl_hgemm` or tuned GEMM dispatch. It implements dedicated loader and
 compute waves on gfx950. It does not port NVIDIA TMA/WGMMA or dynamically
