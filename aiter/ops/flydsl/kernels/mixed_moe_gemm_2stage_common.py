@@ -902,8 +902,8 @@ def compile_mixed_moe_gemm1_common(
                             vec_elems=vec_elems,
                             elem_bytes=b_elem_bytes,
                             offset_in_bytes=(b_elem_bytes == 1),
-                            # a4: every shared m-tile re-reads the same shared w13, keep it cached (M1: -0.7..-1.1 us at n>=128);
-                            # a8 measured slower cached (+1.1..+3.4 us), so it keeps the row's b_nt
+                            # a4: every shared m-tile re-reads the same shared w13, keep it cached; a8 keeps the row's b_nt.
+                            # shortcut: M1 saw both effects only cross-process (within +-2.5 us noise); settle with a same-process A/B
                             cache_modifier=0 if shared_b and is_f4_a else b_nt,
                         )
                         b_i64x2 = fx.Vector(b16).bitcast(i64_t)
