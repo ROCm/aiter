@@ -31,10 +31,13 @@ def _block_threads(capacity):
 
 
 @cache
-def compile_pa_decode_plan(max_batch, threads, windowed):
+def compile_pa_decode_plan(max_batch, threads, windowed, balanced=False):
     """Compile a batch bucket and block size for dense or windowed plans.
 
     Actual batch, task capacity, partition cap and window are runtime values.
+    ``balanced`` (gfx942, gfx950) sizes each row's tasks by the smallest tile count
+    per task that fits the capacity, instead of one task per row plus a
+    tile-proportional share of the rest.
     """
     scan_tiles = fx.coop.BlockScan[fx.Int64, threads]
     scan_counts = fx.coop.BlockScan[fx.Int32, threads]
@@ -112,7 +115,43 @@ def compile_pa_decode_plan(max_batch, threads, windowed):
         remaining = fx.Int64(
             capacity - reduce_rows(thread_rows, fx.ReductionOp.ADD, storage=row_storage)
         )
-        if fx.const_expr(single):
+        if fx.const_expr(single and balanced):
+            # Smallest per-task tile bound T with sum(min(ceil(t / T), P)) <=
+            # capacity. ceil(total / capacity) bounds it below; with one slot
+            # per nonempty row reserved, ceil(total / (capacity - rows)) is
+            # feasible. The search halves [lo, hi] once per bit of hi - lo.
+            # 2**23 tiles (an int32 context) already gives every row one task,
+            # so the bounds clamp there and the search runs in int32.
+            cap = fx.Int64(capacity)
+            spare = fx.max(remaining, fx.Int64(1))
+            lo64 = fx.max((total + cap - 1) // cap, fx.Int64(1))
+            hi64 = fx.max((total + spare - 1) // spare, lo64)
+            hi = fx.Int32(fx.min(hi64, fx.Int64(1 << 23)))
+            lo = fx.Int32(fx.min(lo64, fx.Int64(1 << 23)))
+            # A full plan (one slot per nonempty row) has only one choice.
+            lo = (remaining > fx.Int64(0)).select(lo, hi)
+            row_tiles = fx.Int32(thread_tiles)
+            steps = fx.Int32(0)
+            if hi > lo:
+                span = fx.Vector.from_elements(
+                    [fx.Float32(hi - lo)], dtype=fx.Float32
+                ).bitcast(fx.Int32)[0]
+                steps = ((span >> 23) & fx.Int32(0xFF)) - fx.Int32(126)
+            for _, bounds in range(0, steps, 1, init=[lo, hi]):
+                lo, hi = bounds
+                mid = (lo + hi) >> 1
+                need = fx.Int32(0)
+                if row_tiles > 0:
+                    need = fx.min((row_tiles + mid - 1) // mid, max_parts)
+                fx.gpu.barrier()
+                need = reduce_rows(need, fx.ReductionOp.ADD, storage=row_storage)
+                fits = need <= capacity
+                results = yield [fits.select(lo, mid + 1), fits.select(mid, hi)]
+            lo, hi = results
+            thread_tasks = fx.Int32(0)
+            if row_tiles > 0:
+                thread_tasks = fx.min((row_tiles + lo - 1) // lo, max_parts)
+        elif fx.const_expr(single):
             # Empty and padding rows get no tasks; skip their Int64 divisions.
             thread_tasks = fx.Int32(0)
             if thread_tiles > 0:
@@ -276,7 +315,15 @@ def plan_pa_decode(
     """Build/refresh GPU work metadata on the current stream without readback.
 
     Allocate outside graph capture; pass ``plan`` to refresh buffers in place.
-    The budget counts task slots across KV heads before query splitting.
+    The budget counts task slots across KV heads before query splitting. It
+    defaults to two slots per CU. On gfx950 with ``query_length`` > 1 it is
+    four slots per sequence and KV head, clamped to one to two slots per CU.
+    Each nonempty sequence gets at least one task. Elsewhere the remaining
+    slots go to sequences in proportion to their tiles. On gfx942 and gfx950,
+    batches that fit one row per planner thread instead give a sequence of t
+    tiles min(ceil(t / T), max_partitions) tasks, with T the smallest tile
+    bound from ceil(total tiles / capacity) up whose tasks fit the capacity. Tasks
+    then end close together when lengths differ.
 
     ``max_partitions`` is in [1, device CU count], defaulting to CU count;
     omitting it on refresh preserves the existing limit.
@@ -290,8 +337,8 @@ def plan_pa_decode(
 
     Lengths include MTP tokens. Positive windows include each query's position;
     nonpositive windows disable them. Plans cover the MTP window union: match
-    the window and query length when decoding or refreshing. Dense plans ignore
-    query length.
+    the window and query length when decoding or refreshing. Dense plans use
+    query length only for the gfx950 default budget.
     """
     if not isinstance(sliding_window, int):
         raise TypeError("sliding_window must be an int")
@@ -339,7 +386,16 @@ def plan_pa_decode(
         raise ValueError(f"max_partitions must be in [1, {num_compute_units}]")
     if plan is None:
         if workgroup_budget is None:
+            # gfx950 multi-query tasks quantize and stage every query row, so
+            # down to one slot per CU, with longer tasks, pays that cost less
+            # often. Four slots per sequence stay so that uneven lengths can
+            # still be split.
             workgroup_budget = 2 * num_compute_units
+            if query_length > 1 and properties.gcnArchName.split(":", 1)[0] == "gfx950":
+                workgroup_budget = min(
+                    max(4 * batch * num_kv_heads, num_compute_units),
+                    workgroup_budget,
+                )
         if workgroup_budget < 1:
             raise ValueError("workgroup_budget must be positive")
         capacity = min(
@@ -378,7 +434,10 @@ def plan_pa_decode(
     window = min(query_length - 1 + sliding_window, 2**31 - 1) if sliding_window else 0
     with torch.cuda.device(dev):
         launch = compile_pa_decode_plan(
-            max_batch, _block_threads(plan.capacity), sliding_window > 0
+            max_batch,
+            _block_threads(plan.capacity),
+            sliding_window > 0,
+            properties.gcnArchName.split(":", 1)[0] in ("gfx942", "gfx950"),
         )
         _run_compiled(
             launch,
