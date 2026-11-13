@@ -4514,19 +4514,26 @@ std::tuple<dim3, dim3, int32_t, int32_t> get_grid_config(const int32_t size_s_h,
     const int32_t size_half_r = size_r >> 1;
     const int32_t total_sb    = size_s_h * size_s_w * size_b;
 
+    const int32_t warp_size = static_cast<int32_t>(get_warp_size_func());
+
     // VP selection depends on rotate style (benchmarked on gfx942):
     //   NEOX: VP=2 always wins (8-15% over VP=1, VP=4 always worst)
     //   GPTJ: VP=4 wins at saturated workloads, VP=1 is catastrophically slow (2-3x)
+    // gfx1250 uses wave32, where GPTJ VP=2 provides more memory-level parallelism.
     // VP>1 requires contiguous d-dimension (stride_d==1) for vectorized buffer ops.
     constexpr int32_t preferred_vp = (RotateStyle == 1) ? 4 : 2; // GPTJ=1 -> VP=4, NEOX=0 -> VP=2
     int32_t vec_pairs              = stride_d_eq_1 ? preferred_vp : 1;
+    if constexpr(RotateStyle == 1)
+    {
+        if(warp_size == 32)
+            vec_pairs = min(vec_pairs, 2);
+    }
 
     while(vec_pairs > 1 && (size_half_r % vec_pairs != 0))
         vec_pairs >>= 1;
 
     // Fall back to smaller VP if not enough waves to saturate the GPU.
     const int32_t gpu_capacity = static_cast<int32_t>(get_num_cu_func() * kernel_occupancy);
-    const int32_t warp_size    = static_cast<int32_t>(get_warp_size_func());
     while(vec_pairs > 1)
     {
         const int32_t total_waves = total_sb * (size_half_r / vec_pairs) / warp_size;
