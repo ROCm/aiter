@@ -1001,9 +1001,9 @@ def _fhmoe_impl(
         bias1,
         bias2,
     )
-    q_dtype_a = dtypes.fp8 if gate_mode_enum == GateMode.INTERLEAVE else dtypes.fp4x2
-    if quant_dtype_a == dtypes.fp8:  # a8 on the separated layout (one MXFP8 xn for routed and shared)
-        q_dtype_a = dtypes.fp8
+    # a8 on the separated layout: one MXFP8 xn for routed and shared
+    a4 = gate_mode_enum == GateMode.SEPARATED and quant_dtype_a != dtypes.fp8
+    q_dtype_a = dtypes.fp4x2 if a4 else dtypes.fp8
     if not clamp_shared and w1.dtype != dtypes.fp8:
         raise ValueError(
             "clamp_shared=False requires MXFP8 routed weights; "

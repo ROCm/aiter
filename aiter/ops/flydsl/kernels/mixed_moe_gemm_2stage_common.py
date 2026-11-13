@@ -102,9 +102,7 @@ barrier = _barrier
 
 
 def _shared_first(bx, num_valid_rows, tokens, block_m, max_resident):
-    """Rotate stage-1 m-tile ids so the shared expert's tiles (sorted last) are dispatched first, once the grid
-    outruns the resident CTAs (inside one resident wave it measured slightly slower). Any rotation of [0, nvb)
-    is a bijection, so correctness never depends on the counts."""
+    """Rotate m-tile ids so the shared tiles (sorted last) go first, once the grid outruns max_resident."""
     nvb = fx.Index(num_valid_rows) // block_m
     nsh = (tokens + block_m - 1) // block_m
     nsh = (nsh < nvb).select(nsh, nvb)
@@ -283,16 +281,14 @@ def compile_mixed_moe_gemm1_common(
     # they cannot alias. SiTUv2 beta values are runtime kernel arguments and
     # therefore must not be part of the on-disk symbol/cache identity.
     act_tag = "" if act == "silu" else f"_{act}"
-    heterogeneous_tag = f"_shared_fp8_e{shared_expert_id}_shf" if heterogeneous_b else ""
+    heterogeneous_tag = f"_shared_fp8_e{shared_expert_id}" if heterogeneous_b else ""
     # Keep the existing MXFP4/FP8 DSV4 cache identity unchanged. The no-clamp
     # tag is HY4-specific; heterogeneous MXFP8 kernels use the v35 revision.
     shared_clamp_tag = "_shared_noclamp" if heterogeneous_b and not clamp_shared else ""
     shared_clamp_tag += "_shallow" if heterogeneous_b and shared_shallow else ""
-    # hetero stage 1 holds 2-3 CTAs per CU, so shared-first starts paying past ~2 * cu_num CTAs (below: one wave, no tail).
-    # shortcut: cu_num is not in the cache name; a same-arch part with another CU count only mis-gates, never miscomputes.
+    # hetero stage 1 holds 2-3 CTAs per CU: shared-first pays past ~2 * cu_num CTAs
     from aiter.jit.utils.chip_info import get_cu_num
 
-    _cu_num = get_cu_num() if heterogeneous_b else 0
     # ABI v33 adds four runtime SiTUv2 beta scalars. Heterogeneous MXFP4 keeps
     # v34; v35 identifies the MXFP8 routed/shared K-offset implementation.
     kernel_version = (
@@ -1516,19 +1512,17 @@ def compile_mixed_moe_gemm1_common(
                         x_regs = load_x_tile(abs_k_dma)
 
                     if const_expr(shared_b and shared_shallow):
-                        # mono's bounded in-flight chunks: one fp8 B tile live (= the routed body's two fp4 tiles)
-                        acc_gate, acc_up, _ = compute_tile(
-                            acc_gate, acc_up, prev_gate_w, prev_up_w, prev_a_tile,
-                            prev_a_scale, prev_gate_bs, prev_up_bs,
-                        )
+                        # one fp8 B tile live (mono's bounded in-flight chunks)
+                        prev = (prev_gate_w, prev_up_w, prev_a_tile)
+                        prev += (prev_a_scale, prev_gate_bs, prev_up_bs)
+                        acc_gate, acc_up, _ = compute_tile(acc_gate, acc_up, *prev)
                         rocdl.sched_barrier(0)
-                        cur_gate_w, cur_up_w = load_b_tile(bk)
-                        cur_a_scale, cur_gate_bs, cur_up_bs = prefetch_ab_scale_tile(sk)
-                        cur_a_tile = prefetch_full_a_from_lds(lds_read)
+                        gw, uw = load_b_tile(bk)
+                        a_s, g_s, u_s = prefetch_ab_scale_tile(sk)
+                        a_t = prefetch_full_a_from_lds(lds_read)
                         if const_expr(not use_async_copy):
                             store_x_tile_to_lds(x_regs, lds_write)
-                        return (cur_a_tile, cur_gate_w, cur_up_w, cur_a_scale,
-                                cur_gate_bs, cur_up_bs, acc_gate, acc_up)
+                        return a_t, gw, uw, a_s, g_s, u_s, acc_gate, acc_up
 
                     prev_asvs = []
                     for i_as in range_constexpr(len(prev_a_scale)):
@@ -1859,12 +1853,11 @@ def compile_mixed_moe_gemm1_common(
                         prefetch_x_to_lds(k_tail1, body_lds_x_ping)
                     else:
                         x_regs_ping = load_x_tile(k_tail1)
+                    pong = (gate_w_pong, up_w_pong, a_tile_pong)
+                    pong += (a_scale_pong, gate_bs_pong, up_bs_pong)
                     shallow = shared_b and shared_shallow
                     if const_expr(shallow):
-                        acc_gate, acc_up, _ = compute_tile(
-                            acc_gate, acc_up, gate_w_pong, up_w_pong, a_tile_pong,
-                            a_scale_pong, gate_bs_pong, up_bs_pong,
-                        )
+                        acc_gate, acc_up, _ = compute_tile(acc_gate, acc_up, *pong)
                         rocdl.sched_barrier(0)
                     if const_expr(pad_ku_skip > 0):
                         gate_w_ping, up_w_ping = load_b_tile(
@@ -1887,16 +1880,7 @@ def compile_mixed_moe_gemm1_common(
                             up_bs_ping,
                         ) = prefetch_ab_scale_tile(k_tail1 // (pack_K * 128))
                     if const_expr(not shallow):
-                        acc_gate, acc_up, _ = compute_tile(
-                            acc_gate,
-                            acc_up,
-                            gate_w_pong,
-                            up_w_pong,
-                            a_tile_pong,
-                            a_scale_pong,
-                            gate_bs_pong,
-                            up_bs_pong,
-                        )
+                        acc_gate, acc_up, _ = compute_tile(acc_gate, acc_up, *pong)
                     if const_expr(not use_async_copy):
                         store_x_tile_to_lds(x_regs_ping, body_lds_x_ping)
                     rocdl.s_waitcnt(0)
@@ -2676,7 +2660,9 @@ def compile_mixed_moe_gemm1_common(
                 nonlocal expert_i32, expert_idx, exp_valid, is_shared_expert
                 bx = bx_persist * c_pm + mi_p
                 if const_expr(heterogeneous_b):
-                    bx = _shared_first(bx, num_valid_i32, tokens_in, sort_block_m, 2 * _cu_num)
+                    bx = _shared_first(
+                        bx, num_valid_i32, tokens_in, sort_block_m, 2 * get_cu_num()
+                    )
                 bx_m = bx * sort_block_m
                 bx_m_i32 = fx.Int32(bx_m)
                 blk_valid = fx.Uint32(bx_m_i32) < fx.Uint32(num_valid_i32)
@@ -3523,7 +3509,8 @@ def compile_mixed_moe_gemm2_common(
                 shared_n_half: int | None = None,
             ):
                 body_b_has_full_operand = is_f8_b or shared_b
-                s2_late = shared_b  # register diet: one fp8 B tile live (see moe_gemm1 late_issue)
+                # register diet: the shared fp8 B tile is issued only after the previous one is consumed
+                s2_late = shared_b
                 body_tile_n = tile_n // 2 if shared_n_half is not None else tile_n
                 body_n_offset = (
                     shared_n_half * body_tile_n if shared_n_half is not None else 0
@@ -3748,7 +3735,9 @@ def compile_mixed_moe_gemm2_common(
                     k1 = lane_div_16
                     vec_elems = kpack_bytes // int(b_elem_bytes)
 
-                    def load_cell(rsrc, expert_base, stride_n0, elem_type, k0, soffset=None):
+                    def load_cell(
+                        rsrc, expert_base, stride_n0, elem_type, k0, soffset=None
+                    ):
                         idx_pack = (
                             expert_base
                             + blk[ni] * stride_n0
@@ -3790,7 +3779,8 @@ def compile_mixed_moe_gemm2_common(
                             shared_b_stride_n0,
                             default_f8_type(),
                             shared_k0_base + (0 if s2_late else 1),
-                            soffset=b_stride_k0 if s2_late else None,  # next K64 cell, reuses the voffset VGPR
+                            # s2_late: the next K64 cell by soffset reuses the voffset VGPR
+                            soffset=b_stride_k0 if s2_late else None,
                         )
                         return s0, s1, s2, s3
 
@@ -4494,7 +4484,7 @@ def compile_mixed_moe_gemm2_common(
                                 else None
                             ),
                         )
-                        if const_expr(s2_late):  # shared fp8 B: next tile only after this one is consumed
+                        if const_expr(s2_late):
                             b_ping_lo = load_b_tile(next_k1_bk)
                         if const_expr(not use_async_copy):
                             store_x_tile_to_lds(x_regs_ping, lds_base_ping)
@@ -4540,7 +4530,7 @@ def compile_mixed_moe_gemm2_common(
                                 else None
                             ),
                         )
-                        if const_expr(s2_late):  # shared fp8 B: next tile only after this one is consumed
+                        if const_expr(s2_late):
                             b_pong = load_b_tile(next_k2_bk)
                         k0_pong_bk = next_k2_bk
                         if const_expr(not use_async_copy):
@@ -4604,7 +4594,7 @@ def compile_mixed_moe_gemm2_common(
                             make_b_hi_loader(k0_pong_bk) if b_split_enabled else None
                         ),
                     )
-                    if const_expr(s2_late):  # shared fp8 B: next tile only after this one is consumed
+                    if const_expr(s2_late):
                         b_ping_lo = load_b_tile(k_tail1_bk)
 
                     if const_expr(not use_async_copy):

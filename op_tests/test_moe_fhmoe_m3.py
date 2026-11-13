@@ -34,7 +34,12 @@ import aiter
 from aiter import ActivationType, QuantType, dtypes
 from aiter.fused_moe import fused_moe
 from aiter.jit.utils.chip_info import get_gfx
-from aiter.ops.shuffle import moe_shuffle_scale, moe_shuffle_weight, shuffle_scale, shuffle_weight
+from aiter.ops.shuffle import (
+    moe_shuffle_scale,
+    moe_shuffle_weight,
+    shuffle_scale,
+    shuffle_weight,
+)
 from aiter.test_common import benchmark, run_perftest
 
 torch.set_default_device("cuda")
@@ -70,7 +75,9 @@ def _quant_fp8(rows, cols, mag, seed):
 
     g = torch.Generator(device="cuda").manual_seed(seed)
     w = torch.randn((rows, cols), dtype=dtypes.bf16, generator=g).mul_(mag)
-    q, s = per_1x32_f8_scale_f8_quant(w, quant_dtype=dtypes.fp8, scale_type=dtypes.fp8_e8m0)
+    q, s = per_1x32_f8_scale_f8_quant(
+        w, quant_dtype=dtypes.fp8, scale_type=dtypes.fp8_e8m0
+    )
     return q.view(rows, cols), s.view(torch.uint8).view(rows, cols // 32)
 
 
@@ -105,8 +112,18 @@ class LayerM3:
     def __init__(self, raw: RawM3, variant: str):
         gu = GATE[variant] == "interleave"
         e = E + 1
-        self.w1 = _mark(moe_shuffle_weight(raw.w1.view(FP4), experts_cnt=e, is_guinterleave=gu, gate_up=True), gu)
-        self.w2 = _mark(moe_shuffle_weight(raw.w2.view(FP4), experts_cnt=e, is_guinterleave=gu, gate_up=False), gu)
+        self.w1 = _mark(
+            moe_shuffle_weight(
+                raw.w1.view(FP4), experts_cnt=e, is_guinterleave=gu, gate_up=True
+            ),
+            gu,
+        )
+        self.w2 = _mark(
+            moe_shuffle_weight(
+                raw.w2.view(FP4), experts_cnt=e, is_guinterleave=gu, gate_up=False
+            ),
+            gu,
+        )
         s1, s2 = raw.s1.view(dtypes.fp8_e8m0), raw.s2.view(dtypes.fp8_e8m0)
         if gu:
             self.w1s = moe_shuffle_scale(s1, e, is_guinterleave=True, gate_up=True)
@@ -116,11 +133,19 @@ class LayerM3:
         sw1 = raw.sw1.view(1, 2 * INTER, H)
         sw2 = raw.sw2.view(1, H, INTER)
         ss1, ss2 = raw.ss1.view(dtypes.fp8_e8m0), raw.ss2.view(dtypes.fp8_e8m0)
-        self.sw1 = _mark(shuffle_weight(sw1, layout=(16, 16), is_guinterleave=gu, gate_up=gu), gu)
-        self.sw2 = _mark(shuffle_weight(sw2, layout=(16, 16), is_guinterleave=gu, gate_up=False), gu)
+        self.sw1 = _mark(
+            shuffle_weight(sw1, layout=(16, 16), is_guinterleave=gu, gate_up=gu), gu
+        )
+        self.sw2 = _mark(
+            shuffle_weight(sw2, layout=(16, 16), is_guinterleave=gu, gate_up=False), gu
+        )
         if gu:
-            self.ss1 = shuffle_scale(ss1, experts_cnt=1, is_guinterleave=True, gate_up=True)
-            self.ss2 = shuffle_scale(ss2, experts_cnt=1, is_guinterleave=True, gate_up=False)
+            self.ss1 = shuffle_scale(
+                ss1, experts_cnt=1, is_guinterleave=True, gate_up=True
+            )
+            self.ss2 = shuffle_scale(
+                ss2, experts_cnt=1, is_guinterleave=True, gate_up=False
+            )
         else:
             self.ss1, self.ss2 = shuffle_scale(ss1), shuffle_scale(ss2)
 
@@ -130,7 +155,12 @@ class LayerM3:
         w2 = _mark(self.w2[:E], self.w2.gate_up_interleave)
         n1 = self.w1s.numel() * E // (E + 1)
         n2 = self.w2s.numel() * E // (E + 1)
-        return w1, w2, self.w1s.view(-1)[:n1].view(-1, self.w1s.shape[-1]), self.w2s.view(-1)[:n2].view(-1, self.w2s.shape[-1])
+        return (
+            w1,
+            w2,
+            self.w1s.view(-1)[:n1].view(-1, self.w1s.shape[-1]),
+            self.w2s.view(-1)[:n2].view(-1, self.w2s.shape[-1]),
+        )
 
     def clone(self):
         c = object.__new__(LayerM3)
@@ -183,18 +213,48 @@ def reduce_mode(on):
 def fh_call(variant, L: LayerM3, x, w5, ids5, xs=None):
     """FHMoE: routed + shared, one call. xs = e8m0 scales of a prequantised MXFP8 x (a8 only)."""
     kw = dict(a1_scale=xs) if xs is not None else {}
-    return fused_moe(x, L.w1, L.w2, w5, ids5, activation=ActivationType.Swiglu, quant_type=QuantType.per_1x32,
-                     w1_scale=L.w1s, w2_scale=L.w2s, swiglu_limit=LIMIT, gate_mode=GATE[variant], quant_dtype_a=QA[variant],
-                     dtype=dtypes.bf16, shared_w1=L.sw1, shared_w2=L.sw2, shared_w1_scale=L.ss1, shared_w2_scale=L.ss2,
-                     shared_expert_id=SID, **kw)
+    return fused_moe(
+        x,
+        L.w1,
+        L.w2,
+        w5,
+        ids5,
+        activation=ActivationType.Swiglu,
+        quant_type=QuantType.per_1x32,
+        w1_scale=L.w1s,
+        w2_scale=L.w2s,
+        swiglu_limit=LIMIT,
+        gate_mode=GATE[variant],
+        quant_dtype_a=QA[variant],
+        dtype=dtypes.bf16,
+        shared_w1=L.sw1,
+        shared_w2=L.sw2,
+        shared_w1_scale=L.ss1,
+        shared_w2_scale=L.ss2,
+        shared_expert_id=SID,
+        **kw,
+    )
 
 
 def routed_call(variant, w1, w2, w1s, w2s, x, w, ids, xs=None):
     """Plain routed-only fused_moe (no shared expert); kernels come from whatever row is active."""
     kw = dict(a1_scale=xs) if xs is not None else {}
-    return fused_moe(x, w1, w2, w, ids, activation=ActivationType.Swiglu, quant_type=QuantType.per_1x32,
-                     w1_scale=w1s, w2_scale=w2s, swiglu_limit=LIMIT, gate_mode=GATE[variant],
-                     quant_dtype_a=QA[variant], dtype=dtypes.bf16, **kw)
+    return fused_moe(
+        x,
+        w1,
+        w2,
+        w,
+        ids,
+        activation=ActivationType.Swiglu,
+        quant_type=QuantType.per_1x32,
+        w1_scale=w1s,
+        w2_scale=w2s,
+        swiglu_limit=LIMIT,
+        gate_mode=GATE[variant],
+        quant_dtype_a=QA[variant],
+        dtype=dtypes.bf16,
+        **kw,
+    )
 
 
 def fh_row(variant, n):
@@ -203,9 +263,15 @@ def fh_row(variant, n):
     from aiter.fused_moe import get_padded_M
 
     df = pd.read_csv(_fhmoe_config_file())
-    df = df[(df.model_dim == H) & (df.inter_dim == INTER) & (df.expert == E + 1) & (df.topk == TOPK + 1)
-            & (df.q_dtype_a == str(QA[variant])) & (df.gate_mode == f"GateMode.{GATE[variant].upper()}")
-            & (df.token == get_padded_M(n))]
+    df = df[
+        (df.model_dim == H)
+        & (df.inter_dim == INTER)
+        & (df.expert == E + 1)
+        & (df.topk == TOPK + 1)
+        & (df.q_dtype_a == str(QA[variant]))
+        & (df.gate_mode == f"GateMode.{GATE[variant].upper()}")
+        & (df.token == get_padded_M(n))
+    ]
     assert len(df) == 1, f"expected one M3.1 {variant} row for n={n}, got {len(df)}"
     return df.iloc[0]
 
@@ -218,14 +284,56 @@ def pinned_routed_row(variant, n, kn1, kn2, block_m=32, experts=E, topk=TOPK):
     from aiter.jit.utils.chip_info import get_cu_num
 
     if FM.cfg_2stages is None:
-        FM.get_2stage_cfgs(1, H, INTER, E, TOPK, dtypes.bf16, dtypes.bf16, FP4, QuantType.per_1x32, True,
-                           ActivationType.Swiglu, False, 0, 0)
-    key = ("gfx950", get_cu_num(), get_padded_M(n), H, INTER, experts, topk, "ActivationType.Swiglu", "torch.bfloat16",
-           str(QA[variant]), str(FP4), "QuantType.per_1x32", 1, 0)
+        FM.get_2stage_cfgs(
+            1,
+            H,
+            INTER,
+            E,
+            TOPK,
+            dtypes.bf16,
+            dtypes.bf16,
+            FP4,
+            QuantType.per_1x32,
+            True,
+            ActivationType.Swiglu,
+            False,
+            0,
+            0,
+        )
+    key = (
+        "gfx950",
+        get_cu_num(),
+        get_padded_M(n),
+        H,
+        INTER,
+        experts,
+        topk,
+        "ActivationType.Swiglu",
+        "torch.bfloat16",
+        str(QA[variant]),
+        str(FP4),
+        "QuantType.per_1x32",
+        1,
+        0,
+    )
     old = FM.cfg_2stages[0].get(key)
-    FM.cfg_2stages[0][key] = dict(block_m=block_m, ksplit=0, us1=0.0, kernelName1=kn1, err1="0.0%", us2=0.0,
-                                  kernelName2=kn2, err2="0.0%", us=0.0, run_1stage=0, xbf16=0, flat=0, tflops=0, bw=0,
-                                  _tag="")
+    FM.cfg_2stages[0][key] = dict(
+        block_m=block_m,
+        ksplit=0,
+        us1=0.0,
+        kernelName1=kn1,
+        err1="0.0%",
+        us2=0.0,
+        kernelName2=kn2,
+        err2="0.0%",
+        us=0.0,
+        run_1stage=0,
+        xbf16=0,
+        flat=0,
+        tflops=0,
+        bw=0,
+        _tag="",
+    )
     FM.get_2stage_cfgs.cache_clear()
     try:
         yield
@@ -245,7 +353,11 @@ def capture_route_rows(store):
     orig = MK._run_moe_reduction
 
     def spy(target, out, token_num, topk, model_dim, *a, **k):
-        store.append(target.reshape(-1)[: token_num * topk * model_dim].view(token_num, topk, model_dim).clone())
+        store.append(
+            target.reshape(-1)[: token_num * topk * model_dim]
+            .view(token_num, topk, model_dim)
+            .clone()
+        )
         return orig(target, out, token_num, topk, model_dim, *a, **k)
 
     MK._run_moe_reduction = spy
@@ -258,7 +370,10 @@ def capture_route_rows(store):
 # ------------------------------------------------------------------ references
 def _dequant(q, s):
     if q.dtype in (FP4, torch.uint8) and q.shape[-1] * 2 == s.shape[-1] * 32:
-        lut = torch.tensor([0, .5, 1, 1.5, 2, 3, 4, 6, -0., -.5, -1, -1.5, -2, -3, -4, -6], dtype=torch.float32)
+        lut = torch.tensor(
+            [0, 0.5, 1, 1.5, 2, 3, 4, 6, -0.0, -0.5, -1, -1.5, -2, -3, -4, -6],
+            dtype=torch.float32,
+        )
         b = q.view(torch.uint8)
         v = torch.stack([lut[(b & 0xF).long()], lut[(b >> 4).long()]], -1).flatten(-2)
     else:
@@ -283,7 +398,11 @@ def ref64(raw: RawM3, x, w, ids):
         t, k = (ids == e).nonzero(as_tuple=True)
         h = xd[t] @ _dequant(raw.w1[e], s1[e]).double().T
         a = _swi(h[:, :INTER], h[:, INTER:])
-        routed.index_add_(0, t, (a @ _dequant(raw.w2[e], s2[e]).double().T) * w[t, k].double()[:, None])
+        routed.index_add_(
+            0,
+            t,
+            (a @ _dequant(raw.w2[e], s2[e]).double().T) * w[t, k].double()[:, None],
+        )
     h = xd @ _dequant(raw.sw1, raw.ss1).double().T
     shared = _swi(h[:, :INTER], h[:, INTER:]) @ _dequant(raw.sw2, raw.ss2).double().T
     return routed, shared
@@ -301,7 +420,8 @@ def rel_l2(a, ref):
 
 def ulp_stats(a, b):
     """% of differing bf16 elements and the max distance in bf16 ulps (ordered-int metric) over |b| >= 1e-2
-    (elements near zero, e.g. the all-zero / denormal P0 rows, make ulp distances meaningless)."""
+    (elements near zero, e.g. the all-zero / denormal P0 rows, make ulp distances meaningless).
+    """
     ia = a.contiguous().view(torch.int16).int()
     ib = b.contiguous().view(torch.int16).int()
     oa = torch.where(ia < 0, -(ia & 0x7FFF), ia)
@@ -320,11 +440,25 @@ def atom_shared(raw: RawM3, xq, xs):
         return None
     w1 = shuffle_weight(raw.sw1, layout=(16, 16))
     w2 = shuffle_weight(raw.sw2, layout=(16, 16))
-    gu = native_quant_linear(xq, w1, raw.ss1.view(dtypes.fp8_e8m0), x_scale=xs, weight_group_rows=1,
-                             weight_preshuffled=True, dtype=dtypes.bf16)
+    gu = native_quant_linear(
+        xq,
+        w1,
+        raw.ss1.view(dtypes.fp8_e8m0),
+        x_scale=xs,
+        weight_group_rows=1,
+        weight_preshuffled=True,
+        dtype=dtypes.bf16,
+    )
     a = swiglu_oai_split(gu, alpha=ALPHA, beta=1.0, limit=LIMIT)
-    return native_quant_linear(a, w2, raw.ss2.view(dtypes.fp8_e8m0), x_scale=None, weight_group_rows=1,
-                               weight_preshuffled=True, dtype=dtypes.bf16)
+    return native_quant_linear(
+        a,
+        w2,
+        raw.ss2.view(dtypes.fp8_e8m0),
+        x_scale=None,
+        weight_group_rows=1,
+        weight_preshuffled=True,
+        dtype=dtypes.bf16,
+    )
 
 
 # ------------------------------------------------------------------ the test
@@ -346,17 +480,29 @@ def test_p0_layout(variant):
     raw, L = _layers(variant)
     gu = GATE[variant] == "interleave"
     w1, w2, w1s, w2s = L.routed128()
-    r1 = moe_shuffle_weight(raw.w1[:E].view(FP4), experts_cnt=E, is_guinterleave=gu, gate_up=True)
-    r2 = moe_shuffle_weight(raw.w2[:E].view(FP4), experts_cnt=E, is_guinterleave=gu, gate_up=False)
-    s1, s2 = raw.s1[: E * 2 * INTER].view(dtypes.fp8_e8m0), raw.s2[: E * H].view(dtypes.fp8_e8m0)
+    r1 = moe_shuffle_weight(
+        raw.w1[:E].view(FP4), experts_cnt=E, is_guinterleave=gu, gate_up=True
+    )
+    r2 = moe_shuffle_weight(
+        raw.w2[:E].view(FP4), experts_cnt=E, is_guinterleave=gu, gate_up=False
+    )
+    s1, s2 = raw.s1[: E * 2 * INTER].view(dtypes.fp8_e8m0), raw.s2[: E * H].view(
+        dtypes.fp8_e8m0
+    )
     if gu:
         q1 = moe_shuffle_scale(s1, E, is_guinterleave=True, gate_up=True)
         q2 = moe_shuffle_scale(s2, E, is_guinterleave=True, gate_up=False)
     else:
         q1, q2 = shuffle_scale(s1), shuffle_scale(s2)
-    eq = lambda a, b: a.shape == b.shape and torch.equal(a.view(torch.uint8), b.view(torch.uint8))
-    ret = {"w13[:128] bytes": eq(w1, r1), "w2[:128] bytes": eq(w2, r2),
-           "w13 scale[:128] bytes": eq(w1s, q1), "w2 scale[:128] bytes": eq(w2s, q2)}
+    eq = lambda a, b: a.shape == b.shape and torch.equal(
+        a.view(torch.uint8), b.view(torch.uint8)
+    )
+    ret = {
+        "w13[:128] bytes": eq(w1, r1),
+        "w2[:128] bytes": eq(w2, r2),
+        "w13 scale[:128] bytes": eq(w1s, q1),
+        "w2 scale[:128] bytes": eq(w2s, q2),
+    }
     atom_w1 = shuffle_weight(raw.sw1, layout=(16, 16))
     ret["shared w13 == ATOM preshuffled bytes"] = eq(L.sw1.view(2 * INTER, H), atom_w1)
     ret["shared w13 scale shape"] = str(tuple(L.ss1.shape))
@@ -407,8 +553,12 @@ def test_fhmoe_m3(n, seed, variant):
     # ---- atomic mode: run-to-run spread
     with reduce_mode(False):
         outs_a = [fh_call(variant, L, xin, w5, ids5, xs) for _ in range(4)]
-    ret["atomic r2r max abs"] = max(float((o.float() - outs_a[0].float()).abs().max()) for o in outs_a)
-    ret["atomic vs reduce max abs"] = float((outs_a[0].float() - out_r.float()).abs().max())
+    ret["atomic r2r max abs"] = max(
+        float((o.float() - outs_a[0].float()).abs().max()) for o in outs_a
+    )
+    ret["atomic vs reduce max abs"] = float(
+        (outs_a[0].float() - out_r.float()).abs().max()
+    )
     # bf16 atomics round each of the topk+1 partial sums once: bound by (topk+1) ulp of sum|rows| (+ subnormal floor)
     bound = (TOPK + 1) * _bf16_ulp(fh_rows.float().abs().sum(1)) + 1e-30
     ratio = lambda o, r: float(((o.float() - r.float()).abs() / bound).max())
@@ -417,7 +567,9 @@ def test_fhmoe_m3(n, seed, variant):
     if a8:
         with reduce_mode(False):
             a_bf16 = fh_call(variant, L, x, w5, ids5)
-        ret["GA P0 atomic bf16-in vs xq-in within bound"] = ratio(a_bf16, outs_a[0]) <= 2.0  # two atomic runs
+        ret["GA P0 atomic bf16-in vs xq-in within bound"] = (
+            ratio(a_bf16, outs_a[0]) <= 2.0
+        )  # two atomic runs
 
     # ---- report-only numerics
     routed64, shared64 = ref64(raw, x, w, ids)
@@ -425,7 +577,9 @@ def test_fhmoe_m3(n, seed, variant):
     ret["relL2 FH vs f64"] = rel_l2(out_r, total64)
     ret["relL2 FH atomic vs f64"] = rel_l2(outs_a[0], total64)
     ret["relL2 shared slot vs f64"] = rel_l2(fh_rows[:, TOPK], shared64)
-    ret["relL2 routed (2r) vs f64"] = rel_l2(acc - fh_rows[:, TOPK].float(), RSF * routed64)
+    ret["relL2 routed (2r) vs f64"] = rel_l2(
+        acc - fh_rows[:, TOPK].float(), RSF * routed64
+    )
     xq8, xs8 = (xq, xs) if a8 else quant_x8(x)
     s_atom = atom_shared(raw, xq8, xs8)
     if s_atom is not None:
@@ -442,7 +596,9 @@ def test_fhmoe_m3(n, seed, variant):
     # ---- warm (single layer) timing, both modes; the cold 16-layer numbers come from the bench script
     for mode in (False, True):
         with reduce_mode(mode):
-            _, us = run_perftest(fh_call, variant, L, xin, w5, ids5, xs, num_iters=50, num_warmup=5)
+            _, us = run_perftest(
+                fh_call, variant, L, xin, w5, ids5, xs, num_iters=50, num_warmup=5
+            )
         ret[f"FH {'reduce' if mode else 'atomic'} warm us"] = us
     return ret
 
@@ -451,16 +607,37 @@ def main():
     if get_gfx() not in SUPPORTED_GFX:
         aiter.logger.warning("FHMoE M3.1 test unsupported on %s; skipping", get_gfx())
         return
-    parser = argparse.ArgumentParser(formatter_class=argparse.RawTextHelpFormatter, description=__doc__)
-    parser.add_argument("-n", "--tokens", type=int, nargs="*", default=[1, 4, 16, 32, 64, 96, 128, 192, 256])
+    parser = argparse.ArgumentParser(
+        formatter_class=argparse.RawTextHelpFormatter, description=__doc__
+    )
+    parser.add_argument(
+        "-n",
+        "--tokens",
+        type=int,
+        nargs="*",
+        default=[1, 4, 16, 32, 64, 96, 128, 192, 256],
+    )
     parser.add_argument("--seeds", type=int, nargs="*", default=[0, 1])
-    parser.add_argument("-v", "--variant", nargs="*", default=["a8", "a4"], choices=["a8", "a4"])
+    parser.add_argument(
+        "-v", "--variant", nargs="*", default=["a8", "a4"], choices=["a8", "a4"]
+    )
     args = parser.parse_args()
     df = pd.DataFrame([test_p0_layout(v) for v in args.variant])
-    aiter.logger.info("FHMoE M3.1 layout byte checks (markdown):\n%s", df.to_markdown(index=False))
+    aiter.logger.info(
+        "FHMoE M3.1 layout byte checks (markdown):\n%s", df.to_markdown(index=False)
+    )
     for variant in args.variant:
-        df = pd.DataFrame([test_fhmoe_m3(n, s, variant) for n, s in itertools.product(args.tokens, args.seeds)])
-        aiter.logger.info("FHMoE M3.1 %s summary (markdown):\n%s", variant, df.to_markdown(index=False))
+        df = pd.DataFrame(
+            [
+                test_fhmoe_m3(n, s, variant)
+                for n, s in itertools.product(args.tokens, args.seeds)
+            ]
+        )
+        aiter.logger.info(
+            "FHMoE M3.1 %s summary (markdown):\n%s",
+            variant,
+            df.to_markdown(index=False),
+        )
 
 
 if __name__ == "__main__":

@@ -320,7 +320,8 @@ def get_flydsl_stage1_kernels(
                                             "xcd_swizzle": xcd,
                                             "k_wave": kw,
                                         }
-                                        if a_dtype == "fp8":  # a8 on the separated (GGUU) layout: no _gui
+                                        # a8 on the separated (GGUU) layout: no _gui
+                                        if a_dtype == "fp8":
                                             kernels[name.replace("_gui", "")] = {
                                                 **kernels[name],
                                                 "gate_mode": "separated",
