@@ -332,7 +332,17 @@ def get_flydsl_a16w16_configs(
     if out_dtype not in (dtype, torch.float32):
         return []
     if get_gfx_runtime() == "gfx1250" and out_dtype == dtype:
-        return _gfx1250_tdm_configs(m, n, k, dtype)
+        # Keep the original gfx1250 FT/HT backend in the native tuner race.
+        # Its split-K partials/tail handling differ from the cluster TDM path;
+        # validate each backend with its own existing catalog, not TDM rules.
+        legacy = [
+            {
+                **config,
+                "policy": "ht" if config["use_half_tile_interleaved"] else "ft",
+            }
+            for config in _gfx1250_configs(m, n, k)
+        ]
+        return _gfx1250_tdm_configs(m, n, k, dtype) + legacy
     if get_gfx_runtime() in ("gfx1250", "gfx1250-strict"):
         return _gfx1250_configs(m, n, k)
     if make_gemm_a16w16_param_and_validate is None:

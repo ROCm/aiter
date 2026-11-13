@@ -796,7 +796,9 @@ _TDM_FP32_MNK = [
     (4, 128, 4096),
     (8, 128, 4096),
     (16, 128, 4096),
-    (6, 32, 5120),
+    # DSV4.1's first 12 existing gfx1250 CSV rows, in file order:
+    # decode M tokens, weight[N=32,K=5120], no preshuffle.
+    *[(m, 32, 5120) for m in (6, 12, 18, 24, 30, 36, 42, 48, 72, 96, 128, 144)],
 ]
 
 _TDM_MNK = _TDM_FP32_MNK + [
@@ -1112,8 +1114,13 @@ def test_hgemm_tdm_tuned(m, n, k, dtype, has_bias, interleave):
     return ret
 
 
-def run_torch_tdm_fp32(a, weight, bias, dtype):
-    product = (a.to(dtypes.fp32) @ weight.to(dtypes.fp32).t()).to(dtype)
+def run_torch_tdm_fp32(a, weight, bias, dtype, policy="tdm"):
+    product = a.to(dtypes.fp32) @ weight.to(dtypes.fp32).t()
+    # Preserve each backend's public bias convention. The original FT/HT
+    # path fuses bias in FP32; TDM rounds the product before adding bias.
+    if policy in ("ft", "ht"):
+        return (product if bias is None else product + bias.float()).to(dtype)
+    product = product.to(dtype)
     return product if bias is None else (product.float() + bias.float()).to(dtype)
 
 
@@ -1159,18 +1166,26 @@ def test_hgemm_tdm_fp32(m, n, k, dtype, has_bias):
         old_rounding = (old_rounding.float() + bias.float()).to(dtype)
     assert torch.any(old_rounding != ref), "precision regression input lost sensitivity"
 
-    def launch():
-        return flydsl_hgemm(a, weight, out=out, bias=bias, **cfg)
-
-    candidates = {"tdm": launch}
+    # Exercise the original FT/HT backend alongside cluster TDM, using the
+    # same valid tile/partition and independent reference. These names are
+    # different backends, not additional TDM split-K reduction policies.
+    candidates = {
+        name: (
+            lambda name=name: flydsl_hgemm(
+                a, weight, out=out, bias=bias, **{**cfg, "policy": name}
+            )
+        )
+        for name in ("tdm", "ft", "ht")
+    }
     ret = {"gfx": get_gfx_runtime(), "split_k": split_k, "tile": f"16x16x{block_k}"}
     flops = 2 * m * n * k
     nbytes = (m * k + n * k + m * n + (n if has_bias else 0)) * a.element_size()
     for name, fn in candidates.items():
+        candidate_ref = run_torch_tdm_fp32(a, weight, bias, dtype, policy=name)
         out.fill_(float("nan"))
         y, us = run_perftest(fn)
         err = checkAllclose(
-            ref.to(dtypes.fp32),
+            candidate_ref.to(dtypes.fp32),
             y.to(dtypes.fp32),
             atol=0,
             rtol=0,
@@ -1189,7 +1204,7 @@ def test_hgemm_tdm_fp32(m, n, k, dtype, has_bias):
             a.neg_()
             if bias is not None:
                 bias.neg_()
-            expected = run_torch_tdm_fp32(a, weight, bias, dtype)
+            expected = run_torch_tdm_fp32(a, weight, bias, dtype, policy=name)
             out.fill_(float("nan"))
             graph.replay()
             torch.cuda.synchronize()

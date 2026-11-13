@@ -99,10 +99,21 @@ class TestGfx1250FlydslCandidates(unittest.TestCase):
                             * (config["block_m"] + config["block_n"])
                             * (config["block_k"] + 8),
                             config["block_m"]
-                            * (config["block_n"] + (8 if config["interleave"] else 0)),
+                            * (
+                                config["block_n"]
+                                + (8 if config.get("interleave", False) else 0)
+                            ),
                         )
                         * 2
                     )
+                    if config["policy"] in ("ft", "ht"):
+                        lds = policy.gfx1250_lds_bytes(
+                            config["block_m"],
+                            config["block_n"],
+                            config["block_k"],
+                            config["stages"],
+                            config["split_k"],
+                        )
                     self.assertLessEqual(lds, 320 * 1024)
                     k_tiles = -(-(k // config["split_k"]) // config["block_k"])
                     self.assertGreaterEqual(k_tiles, config["stages"] - 1)
@@ -119,6 +130,63 @@ class TestGfx1250FlydslCandidates(unittest.TestCase):
                             {key: params[key] for key in config}, config, name
                         )
                         self.assertEqual(params["target_gfx"], target_gfx)
+
+    def test_gfx1250_catalog_keeps_tdm_and_original_ft_ht(self):
+        from types import SimpleNamespace
+
+        from aiter.ops.flydsl import gemm_a16w16_policy as policy
+        from aiter.ops.flydsl.gemm_kernels import flydsl_hgemm_kernel_name
+
+        props = SimpleNamespace(
+            multi_processor_count=256,
+            warp_size=32,
+            max_threads_per_multi_processor=2048,
+        )
+        with (
+            mock.patch.object(policy, "get_gfx_runtime", return_value="gfx1250"),
+            mock.patch.object(torch.cuda, "current_device", return_value=0),
+            mock.patch.object(torch.cuda, "get_device_properties", return_value=props),
+        ):
+            for m in (6, 12, 18, 24, 30, 36, 42, 48, 72, 96, 128, 144):
+                configs = policy.get_flydsl_a16w16_configs(
+                    m,
+                    32,
+                    5120,
+                    torch.bfloat16,
+                    torch.bfloat16,
+                    False,
+                )
+
+                def names(cs):
+                    return {
+                        flydsl_hgemm_kernel_name(
+                            dtype="bf16",
+                            out_dtype="bf16",
+                            config=c,
+                            has_bias=False,
+                            target_gfx="gfx1250",
+                        )
+                        for c in cs
+                    }
+
+                original = [
+                    dict(c, policy="ht" if c["use_half_tile_interleaved"] else "ft")
+                    for c in policy._gfx1250_configs(m, 32, 5120)
+                ]
+                tdm = policy._gfx1250_tdm_configs(m, 32, 5120, torch.bfloat16)
+                self.assertEqual(names(configs), names(original) | names(tdm))
+                self.assertEqual(len(names(configs)), len(configs))
+                self.assertEqual({c["policy"] for c in configs}, {"tdm", "ft", "ht"})
+                self.assertTrue(
+                    any(
+                        c["policy"] == "ht"
+                        and c["block_m"] == c["block_n"] == 16
+                        and c["block_k"] == 256
+                        and c["stages"] == 5
+                        and c["split_k"] == 5
+                        for c in configs
+                    )
+                )
 
 
 class TestTdmPolicyContract(unittest.TestCase):
