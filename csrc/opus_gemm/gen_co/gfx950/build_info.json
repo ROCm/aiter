@@ -15,11 +15,11 @@
       "a_t": false,
       "agpr_count": 256,
       "asm": {
-        "dis": "asm/opus_gemm_gfx950_4wave_bf16_256x256x256x64_2x2_16x16x32_0x0x0_nn.dis",
-        "s": "asm/opus_gemm_gfx950_4wave_bf16_256x256x256x64_2x2_16x16x32_0x0x0_nn.s"
+        "dis": "asm/opus_gemm_gfx950_4wave_256x256x256x64_2x2_16x16x32_0x0x0_nn.dis",
+        "s": "asm/opus_gemm_gfx950_4wave_256x256x256x64_2x2_16x16x32_0x0x0_nn.s"
       },
       "b_t": true,
-      "co_sha256": "900c65e96ca85af8111af27691a0c22d9509e080bf2b409bc682cc2b8e1dfaff",
+      "co_sha256": "01c174434c6514fc6c32b3471d9620505b3c8742d761a00ed6d36d75b0cb04eb",
       "device_flags": [],
       "dis_lines": 2766,
       "dis_mfma": 640,
@@ -41,7 +41,7 @@
       "sgpr_count": 47,
       "sgpr_spill_count": 0,
       "splitk": false,
-      "symbol": "opus_gemm_gfx950_4wave_bf16_256x256x256x64_2x2_16x16x32_0x0x0_nn",
+      "symbol": "opus_gemm_gfx950_4wave_256x256x256x64_2x2_16x16x32_0x0x0_nn",
       "tile": [
         256,
         256,
@@ -55,11 +55,11 @@
       "a_t": false,
       "agpr_count": 256,
       "asm": {
-        "dis": "asm/opus_gemm_gfx950_4wave_bf16_256x256x256x64_2x2_16x16x32_0x0x0_nt.dis",
-        "s": "asm/opus_gemm_gfx950_4wave_bf16_256x256x256x64_2x2_16x16x32_0x0x0_nt.s"
+        "dis": "asm/opus_gemm_gfx950_4wave_256x256x256x64_2x2_16x16x32_0x0x0_nt.dis",
+        "s": "asm/opus_gemm_gfx950_4wave_256x256x256x64_2x2_16x16x32_0x0x0_nt.s"
       },
       "b_t": false,
-      "co_sha256": "9bfb7bb691266791c6fd2e610ceea816ff76d60e4984a660a13f7328e9492f43",
+      "co_sha256": "f79ed990d8f093770b9379c641624f37b9f11680cf74d991af8abf6ffe3a285d",
       "device_flags": [],
       "dis_lines": 2616,
       "dis_mfma": 640,
@@ -81,7 +81,7 @@
       "sgpr_count": 47,
       "sgpr_spill_count": 0,
       "splitk": false,
-      "symbol": "opus_gemm_gfx950_4wave_bf16_256x256x256x64_2x2_16x16x32_0x0x0_nt",
+      "symbol": "opus_gemm_gfx950_4wave_256x256x256x64_2x2_16x16x32_0x0x0_nt",
       "tile": [
         256,
         256,
@@ -95,11 +95,11 @@
       "a_t": true,
       "agpr_count": 256,
       "asm": {
-        "dis": "asm/opus_gemm_gfx950_4wave_bf16_256x256x256x64_2x2_16x16x32_0x0x0_tn.dis",
-        "s": "asm/opus_gemm_gfx950_4wave_bf16_256x256x256x64_2x2_16x16x32_0x0x0_tn.s"
+        "dis": "asm/opus_gemm_gfx950_4wave_256x256x256x64_2x2_16x16x32_0x0x0_tn.dis",
+        "s": "asm/opus_gemm_gfx950_4wave_256x256x256x64_2x2_16x16x32_0x0x0_tn.s"
       },
       "b_t": true,
-      "co_sha256": "d86dce7d5df97ed831bd7b59162b06aea93c1025aca2be3081d323244c5937fc",
+      "co_sha256": "00d877075e9f15c08502e59123d3b1735185cf806ea772d0849cc017c5e3fbaf",
       "device_flags": [],
       "dis_lines": 2866,
       "dis_mfma": 640,
@@ -121,7 +121,7 @@
       "sgpr_count": 46,
       "sgpr_spill_count": 0,
       "splitk": false,
-      "symbol": "opus_gemm_gfx950_4wave_bf16_256x256x256x64_2x2_16x16x32_0x0x0_tn",
+      "symbol": "opus_gemm_gfx950_4wave_256x256x256x64_2x2_16x16x32_0x0x0_tn",
       "tile": [
         256,
         256,
@@ -135,11 +135,11 @@
       "a_t": true,
       "agpr_count": 256,
       "asm": {
-        "dis": "asm/opus_gemm_gfx950_4wave_bf16_256x256x256x64_2x2_16x16x32_0x0x0_tt.dis",
-        "s": "asm/opus_gemm_gfx950_4wave_bf16_256x256x256x64_2x2_16x16x32_0x0x0_tt.s"
+        "dis": "asm/opus_gemm_gfx950_4wave_256x256x256x64_2x2_16x16x32_0x0x0_tt.dis",
+        "s": "asm/opus_gemm_gfx950_4wave_256x256x256x64_2x2_16x16x32_0x0x0_tt.s"
       },
       "b_t": false,
-      "co_sha256": "12ece6f4d61ec0db1b0c2f30b4676a97d0e89d67a1bcb04350d427062b1ab5fb",
+      "co_sha256": "563f6cd9a7e6824aaa703584605ef1ad951d7ce242bb5edd930a99cb03e6b935",
       "device_flags": [],
       "dis_lines": 2768,
       "dis_mfma": 640,
@@ -161,7 +161,7 @@
       "sgpr_count": 48,
       "sgpr_spill_count": 0,
       "splitk": false,
-      "symbol": "opus_gemm_gfx950_4wave_bf16_256x256x256x64_2x2_16x16x32_0x0x0_tt",
+      "symbol": "opus_gemm_gfx950_4wave_256x256x256x64_2x2_16x16x32_0x0x0_tt",
       "tile": [
         256,
         256,
@@ -175,11 +175,11 @@
       "a_t": false,
       "agpr_count": 256,
       "asm": {
-        "dis": "asm/opus_gemm_gfx950_4wave_bf16_256x256x128x64_2x2_16x16x32_0x0x0_nn.dis",
-        "s": "asm/opus_gemm_gfx950_4wave_bf16_256x256x128x64_2x2_16x16x32_0x0x0_nn.s"
+        "dis": "asm/opus_gemm_gfx950_4wave_256x256x128x64_2x2_16x16x32_0x0x0_nn.dis",
+        "s": "asm/opus_gemm_gfx950_4wave_256x256x128x64_2x2_16x16x32_0x0x0_nn.s"
       },
       "b_t": true,
-      "co_sha256": "c47bef5de9d943c7f5eba8526576cd6364b8a7040ee17322befe1995d9e7b8e4",
+      "co_sha256": "11666942d780b2799365fc4d61d8edc4efb59a7c5fe26cd12a4d07925dfc5d3c",
       "device_flags": [],
       "dis_lines": 1907,
       "dis_mfma": 320,
@@ -201,7 +201,7 @@
       "sgpr_count": 47,
       "sgpr_spill_count": 0,
       "splitk": false,
-      "symbol": "opus_gemm_gfx950_4wave_bf16_256x256x128x64_2x2_16x16x32_0x0x0_nn",
+      "symbol": "opus_gemm_gfx950_4wave_256x256x128x64_2x2_16x16x32_0x0x0_nn",
       "tile": [
         256,
         128,
@@ -215,11 +215,11 @@
       "a_t": false,
       "agpr_count": 256,
       "asm": {
-        "dis": "asm/opus_gemm_gfx950_4wave_bf16_256x256x128x64_2x2_16x16x32_0x0x0_nt.dis",
-        "s": "asm/opus_gemm_gfx950_4wave_bf16_256x256x128x64_2x2_16x16x32_0x0x0_nt.s"
+        "dis": "asm/opus_gemm_gfx950_4wave_256x256x128x64_2x2_16x16x32_0x0x0_nt.dis",
+        "s": "asm/opus_gemm_gfx950_4wave_256x256x128x64_2x2_16x16x32_0x0x0_nt.s"
       },
       "b_t": false,
-      "co_sha256": "01d5b3f1e1088a1ae02c43b45410f2ff169ad96643896ad83ea65e1ffc8ed11c",
+      "co_sha256": "2b3e03d2af4c85d91cc350c80bdddd67dc77363d7ee7ee0fa574e41b88285674",
       "device_flags": [],
       "dis_lines": 1833,
       "dis_mfma": 320,
@@ -241,7 +241,7 @@
       "sgpr_count": 47,
       "sgpr_spill_count": 0,
       "splitk": false,
-      "symbol": "opus_gemm_gfx950_4wave_bf16_256x256x128x64_2x2_16x16x32_0x0x0_nt",
+      "symbol": "opus_gemm_gfx950_4wave_256x256x128x64_2x2_16x16x32_0x0x0_nt",
       "tile": [
         256,
         128,
@@ -255,11 +255,11 @@
       "a_t": true,
       "agpr_count": 256,
       "asm": {
-        "dis": "asm/opus_gemm_gfx950_4wave_bf16_256x256x128x64_2x2_16x16x32_0x0x0_tn.dis",
-        "s": "asm/opus_gemm_gfx950_4wave_bf16_256x256x128x64_2x2_16x16x32_0x0x0_tn.s"
+        "dis": "asm/opus_gemm_gfx950_4wave_256x256x128x64_2x2_16x16x32_0x0x0_tn.dis",
+        "s": "asm/opus_gemm_gfx950_4wave_256x256x128x64_2x2_16x16x32_0x0x0_tn.s"
       },
       "b_t": true,
-      "co_sha256": "d08df8492e781c74f31f1158dff5422e4fb63da079f51e9acdb0c12355afb0f1",
+      "co_sha256": "bc785063bce942abaa3bbadf5e185b6841f5e98e2dd451d88a62837230d67a24",
       "device_flags": [],
       "dis_lines": 2008,
       "dis_mfma": 320,
@@ -281,7 +281,7 @@
       "sgpr_count": 47,
       "sgpr_spill_count": 0,
       "splitk": false,
-      "symbol": "opus_gemm_gfx950_4wave_bf16_256x256x128x64_2x2_16x16x32_0x0x0_tn",
+      "symbol": "opus_gemm_gfx950_4wave_256x256x128x64_2x2_16x16x32_0x0x0_tn",
       "tile": [
         256,
         128,
@@ -295,11 +295,11 @@
       "a_t": true,
       "agpr_count": 256,
       "asm": {
-        "dis": "asm/opus_gemm_gfx950_4wave_bf16_256x256x128x64_2x2_16x16x32_0x0x0_tt.dis",
-        "s": "asm/opus_gemm_gfx950_4wave_bf16_256x256x128x64_2x2_16x16x32_0x0x0_tt.s"
+        "dis": "asm/opus_gemm_gfx950_4wave_256x256x128x64_2x2_16x16x32_0x0x0_tt.dis",
+        "s": "asm/opus_gemm_gfx950_4wave_256x256x128x64_2x2_16x16x32_0x0x0_tt.s"
       },
       "b_t": false,
-      "co_sha256": "a2173e82c1fc49aca19d81a288444776267cf0ce1fc1b38e7cc36378245a5541",
+      "co_sha256": "31c56a39536dfecaa02b7688c84a04e02ed3a605bab3e166c0be8dbf26bb2a70",
       "device_flags": [],
       "dis_lines": 1969,
       "dis_mfma": 320,
@@ -321,7 +321,7 @@
       "sgpr_count": 47,
       "sgpr_spill_count": 0,
       "splitk": false,
-      "symbol": "opus_gemm_gfx950_4wave_bf16_256x256x128x64_2x2_16x16x32_0x0x0_tt",
+      "symbol": "opus_gemm_gfx950_4wave_256x256x128x64_2x2_16x16x32_0x0x0_tt",
       "tile": [
         256,
         128,
@@ -335,11 +335,11 @@
       "a_t": false,
       "agpr_count": 256,
       "asm": {
-        "dis": "asm/opus_gemm_gfx950_4wave_bf16_256x128x256x64_2x2_16x16x32_0x0x0_nn.dis",
-        "s": "asm/opus_gemm_gfx950_4wave_bf16_256x128x256x64_2x2_16x16x32_0x0x0_nn.s"
+        "dis": "asm/opus_gemm_gfx950_4wave_256x128x256x64_2x2_16x16x32_0x0x0_nn.dis",
+        "s": "asm/opus_gemm_gfx950_4wave_256x128x256x64_2x2_16x16x32_0x0x0_nn.s"
       },
       "b_t": true,
-      "co_sha256": "72a1bd1186c33a71a2fc27f13919e8a2ebbc7625e9e810bd7d9a9eac302448ad",
+      "co_sha256": "4bf28c347c02089725415c8c482582def90b763e0e5fc321e6b738cea90e2fa7",
       "device_flags": [],
       "dis_lines": 1970,
       "dis_mfma": 320,
@@ -361,7 +361,7 @@
       "sgpr_count": 47,
       "sgpr_spill_count": 0,
       "splitk": false,
-      "symbol": "opus_gemm_gfx950_4wave_bf16_256x128x256x64_2x2_16x16x32_0x0x0_nn",
+      "symbol": "opus_gemm_gfx950_4wave_256x128x256x64_2x2_16x16x32_0x0x0_nn",
       "tile": [
         128,
         256,
@@ -375,11 +375,11 @@
       "a_t": false,
       "agpr_count": 256,
       "asm": {
-        "dis": "asm/opus_gemm_gfx950_4wave_bf16_256x128x256x64_2x2_16x16x32_0x0x0_nt.dis",
-        "s": "asm/opus_gemm_gfx950_4wave_bf16_256x128x256x64_2x2_16x16x32_0x0x0_nt.s"
+        "dis": "asm/opus_gemm_gfx950_4wave_256x128x256x64_2x2_16x16x32_0x0x0_nt.dis",
+        "s": "asm/opus_gemm_gfx950_4wave_256x128x256x64_2x2_16x16x32_0x0x0_nt.s"
       },
       "b_t": false,
-      "co_sha256": "d35dd066f01b4c89a183629d3e085c3818e0baa5b1f94d67f5efc73cb023e9e5",
+      "co_sha256": "23d7ee326cd73b48dc52972927c913b56606d5d44960e7c733f380bcde72426a",
       "device_flags": [],
       "dis_lines": 1821,
       "dis_mfma": 320,
@@ -401,7 +401,7 @@
       "sgpr_count": 49,
       "sgpr_spill_count": 0,
       "splitk": false,
-      "symbol": "opus_gemm_gfx950_4wave_bf16_256x128x256x64_2x2_16x16x32_0x0x0_nt",
+      "symbol": "opus_gemm_gfx950_4wave_256x128x256x64_2x2_16x16x32_0x0x0_nt",
       "tile": [
         128,
         256,
@@ -415,11 +415,11 @@
       "a_t": true,
       "agpr_count": 256,
       "asm": {
-        "dis": "asm/opus_gemm_gfx950_4wave_bf16_256x128x256x64_2x2_16x16x32_0x0x0_tn.dis",
-        "s": "asm/opus_gemm_gfx950_4wave_bf16_256x128x256x64_2x2_16x16x32_0x0x0_tn.s"
+        "dis": "asm/opus_gemm_gfx950_4wave_256x128x256x64_2x2_16x16x32_0x0x0_tn.dis",
+        "s": "asm/opus_gemm_gfx950_4wave_256x128x256x64_2x2_16x16x32_0x0x0_tn.s"
       },
       "b_t": true,
-      "co_sha256": "56fd8ad2f5351f0307498107edfb740c3fc61e4a455771fe060029ed30b8388b",
+      "co_sha256": "246552a3ae4cb84a72e4d3006bf813cb646bb15135a9799f035c9d7009bdde58",
       "device_flags": [],
       "dis_lines": 2004,
       "dis_mfma": 320,
@@ -441,7 +441,7 @@
       "sgpr_count": 47,
       "sgpr_spill_count": 0,
       "splitk": false,
-      "symbol": "opus_gemm_gfx950_4wave_bf16_256x128x256x64_2x2_16x16x32_0x0x0_tn",
+      "symbol": "opus_gemm_gfx950_4wave_256x128x256x64_2x2_16x16x32_0x0x0_tn",
       "tile": [
         128,
         256,
@@ -455,11 +455,11 @@
       "a_t": true,
       "agpr_count": 256,
       "asm": {
-        "dis": "asm/opus_gemm_gfx950_4wave_bf16_256x128x256x64_2x2_16x16x32_0x0x0_tt.dis",
-        "s": "asm/opus_gemm_gfx950_4wave_bf16_256x128x256x64_2x2_16x16x32_0x0x0_tt.s"
+        "dis": "asm/opus_gemm_gfx950_4wave_256x128x256x64_2x2_16x16x32_0x0x0_tt.dis",
+        "s": "asm/opus_gemm_gfx950_4wave_256x128x256x64_2x2_16x16x32_0x0x0_tt.s"
       },
       "b_t": false,
-      "co_sha256": "7829029a90b02e0cc8c41e6f3d58370af8ec9bf3793eed91e4af329ac153a694",
+      "co_sha256": "42b861877704fc74301c0f5c1d78b3a80e27d9ef688571aea912b7c33d33985d",
       "device_flags": [],
       "dis_lines": 1892,
       "dis_mfma": 320,
@@ -481,7 +481,7 @@
       "sgpr_count": 47,
       "sgpr_spill_count": 0,
       "splitk": false,
-      "symbol": "opus_gemm_gfx950_4wave_bf16_256x128x256x64_2x2_16x16x32_0x0x0_tt",
+      "symbol": "opus_gemm_gfx950_4wave_256x128x256x64_2x2_16x16x32_0x0x0_tt",
       "tile": [
         128,
         256,
@@ -495,11 +495,11 @@
       "a_t": false,
       "agpr_count": 0,
       "asm": {
-        "dis": "asm/opus_gemm_gfx950_4wave_bf16_256x128x128x64_2x2_16x16x32_0x0x0_nn.dis",
-        "s": "asm/opus_gemm_gfx950_4wave_bf16_256x128x128x64_2x2_16x16x32_0x0x0_nn.s"
+        "dis": "asm/opus_gemm_gfx950_4wave_256x128x128x64_2x2_16x16x32_0x0x0_nn.dis",
+        "s": "asm/opus_gemm_gfx950_4wave_256x128x128x64_2x2_16x16x32_0x0x0_nn.s"
       },
       "b_t": true,
-      "co_sha256": "46bdca01d0759224514e7c09fd69d9e8f3f0fcd3a88c30810e23503f00534c71",
+      "co_sha256": "57c967ebe7f71a0e23c5f90125a06b57787cee49c5a057bb02fc380cf8726174",
       "device_flags": [],
       "dis_lines": 1263,
       "dis_mfma": 160,
@@ -521,7 +521,7 @@
       "sgpr_count": 47,
       "sgpr_spill_count": 0,
       "splitk": false,
-      "symbol": "opus_gemm_gfx950_4wave_bf16_256x128x128x64_2x2_16x16x32_0x0x0_nn",
+      "symbol": "opus_gemm_gfx950_4wave_256x128x128x64_2x2_16x16x32_0x0x0_nn",
       "tile": [
         128,
         128,
@@ -535,11 +535,11 @@
       "a_t": false,
       "agpr_count": 0,
       "asm": {
-        "dis": "asm/opus_gemm_gfx950_4wave_bf16_256x128x128x64_2x2_16x16x32_0x0x0_nt.dis",
-        "s": "asm/opus_gemm_gfx950_4wave_bf16_256x128x128x64_2x2_16x16x32_0x0x0_nt.s"
+        "dis": "asm/opus_gemm_gfx950_4wave_256x128x128x64_2x2_16x16x32_0x0x0_nt.dis",
+        "s": "asm/opus_gemm_gfx950_4wave_256x128x128x64_2x2_16x16x32_0x0x0_nt.s"
       },
       "b_t": false,
-      "co_sha256": "1b4845c92dc57d92f78190353cdc4a8e03bfe3620dd046fdb043ad7f3f12bcd6",
+      "co_sha256": "0d07011f9680b09f6d2e6c16e61a5acc87c3badf42949c6830cbe8c7d9dcaa1d",
       "device_flags": [],
       "dis_lines": 1213,
       "dis_mfma": 160,
@@ -561,7 +561,7 @@
       "sgpr_count": 45,
       "sgpr_spill_count": 0,
       "splitk": false,
-      "symbol": "opus_gemm_gfx950_4wave_bf16_256x128x128x64_2x2_16x16x32_0x0x0_nt",
+      "symbol": "opus_gemm_gfx950_4wave_256x128x128x64_2x2_16x16x32_0x0x0_nt",
       "tile": [
         128,
         128,
@@ -575,11 +575,11 @@
       "a_t": true,
       "agpr_count": 0,
       "asm": {
-        "dis": "asm/opus_gemm_gfx950_4wave_bf16_256x128x128x64_2x2_16x16x32_0x0x0_tn.dis",
-        "s": "asm/opus_gemm_gfx950_4wave_bf16_256x128x128x64_2x2_16x16x32_0x0x0_tn.s"
+        "dis": "asm/opus_gemm_gfx950_4wave_256x128x128x64_2x2_16x16x32_0x0x0_tn.dis",
+        "s": "asm/opus_gemm_gfx950_4wave_256x128x128x64_2x2_16x16x32_0x0x0_tn.s"
       },
       "b_t": true,
-      "co_sha256": "0dabbaf47e451e1de30f3e4a1f472974bc6f711c3f8f91a2030fe90c4af28379",
+      "co_sha256": "e250baf8e9e10d6439c1fb2c53301fbdb6065dc91af5689c2de6a2f80bdfae78",
       "device_flags": [],
       "dis_lines": 1272,
       "dis_mfma": 160,
@@ -601,7 +601,7 @@
       "sgpr_count": 46,
       "sgpr_spill_count": 0,
       "splitk": false,
-      "symbol": "opus_gemm_gfx950_4wave_bf16_256x128x128x64_2x2_16x16x32_0x0x0_tn",
+      "symbol": "opus_gemm_gfx950_4wave_256x128x128x64_2x2_16x16x32_0x0x0_tn",
       "tile": [
         128,
         128,
@@ -615,11 +615,11 @@
       "a_t": true,
       "agpr_count": 0,
       "asm": {
-        "dis": "asm/opus_gemm_gfx950_4wave_bf16_256x128x128x64_2x2_16x16x32_0x0x0_tt.dis",
-        "s": "asm/opus_gemm_gfx950_4wave_bf16_256x128x128x64_2x2_16x16x32_0x0x0_tt.s"
+        "dis": "asm/opus_gemm_gfx950_4wave_256x128x128x64_2x2_16x16x32_0x0x0_tt.dis",
+        "s": "asm/opus_gemm_gfx950_4wave_256x128x128x64_2x2_16x16x32_0x0x0_tt.s"
       },
       "b_t": false,
-      "co_sha256": "7a8c33bd86b8f690b3e6c26d344c40190e865096f4a96475f47a6d88446ce17a",
+      "co_sha256": "7c2fdb7569fe57e03f369810c6ff49bc045707db456019b37eebc46d42a4e309",
       "device_flags": [],
       "dis_lines": 1257,
       "dis_mfma": 160,
@@ -641,7 +641,7 @@
       "sgpr_count": 48,
       "sgpr_spill_count": 0,
       "splitk": false,
-      "symbol": "opus_gemm_gfx950_4wave_bf16_256x128x128x64_2x2_16x16x32_0x0x0_tt",
+      "symbol": "opus_gemm_gfx950_4wave_256x128x128x64_2x2_16x16x32_0x0x0_tt",
       "tile": [
         128,
         128,
@@ -655,11 +655,11 @@
       "a_t": false,
       "agpr_count": 0,
       "asm": {
-        "dis": "asm/opus_gemm_gfx950_4wave_bf16_256x256x64x64_2x2_16x16x32_0x0x0_nn.dis",
-        "s": "asm/opus_gemm_gfx950_4wave_bf16_256x256x64x64_2x2_16x16x32_0x0x0_nn.s"
+        "dis": "asm/opus_gemm_gfx950_4wave_256x256x64x64_2x2_16x16x32_0x0x0_nn.dis",
+        "s": "asm/opus_gemm_gfx950_4wave_256x256x64x64_2x2_16x16x32_0x0x0_nn.s"
       },
       "b_t": true,
-      "co_sha256": "070fac1b237072e4b0e9edaffce16f648a283f6ae4df0518169abf69497c2ccd",
+      "co_sha256": "c1dd3cfd3fda5ca512e10ec1ba12f72ffdcf060d17f29da66a5c663cd089f70b",
       "device_flags": [],
       "dis_lines": 1268,
       "dis_mfma": 160,
@@ -681,7 +681,7 @@
       "sgpr_count": 47,
       "sgpr_spill_count": 0,
       "splitk": false,
-      "symbol": "opus_gemm_gfx950_4wave_bf16_256x256x64x64_2x2_16x16x32_0x0x0_nn",
+      "symbol": "opus_gemm_gfx950_4wave_256x256x64x64_2x2_16x16x32_0x0x0_nn",
       "tile": [
         256,
         64,
@@ -695,11 +695,11 @@
       "a_t": false,
       "agpr_count": 0,
       "asm": {
-        "dis": "asm/opus_gemm_gfx950_4wave_bf16_256x256x64x64_2x2_16x16x32_0x0x0_nt.dis",
-        "s": "asm/opus_gemm_gfx950_4wave_bf16_256x256x64x64_2x2_16x16x32_0x0x0_nt.s"
+        "dis": "asm/opus_gemm_gfx950_4wave_256x256x64x64_2x2_16x16x32_0x0x0_nt.dis",
+        "s": "asm/opus_gemm_gfx950_4wave_256x256x64x64_2x2_16x16x32_0x0x0_nt.s"
       },
       "b_t": false,
-      "co_sha256": "2819f2383b3a750c7e579db5a284a0e13c25946320e9809d842147efcf486786",
+      "co_sha256": "ca9cfc5181ea9d43038cb6d4d1f363a1e9e34136b849e1f4556ac1191ec603d9",
       "device_flags": [],
       "dis_lines": 1238,
       "dis_mfma": 160,
@@ -721,7 +721,7 @@
       "sgpr_count": 46,
       "sgpr_spill_count": 0,
       "splitk": false,
-      "symbol": "opus_gemm_gfx950_4wave_bf16_256x256x64x64_2x2_16x16x32_0x0x0_nt",
+      "symbol": "opus_gemm_gfx950_4wave_256x256x64x64_2x2_16x16x32_0x0x0_nt",
       "tile": [
         256,
         64,
@@ -735,11 +735,11 @@
       "a_t": true,
       "agpr_count": 0,
       "asm": {
-        "dis": "asm/opus_gemm_gfx950_4wave_bf16_256x256x64x64_2x2_16x16x32_0x0x0_tn.dis",
-        "s": "asm/opus_gemm_gfx950_4wave_bf16_256x256x64x64_2x2_16x16x32_0x0x0_tn.s"
+        "dis": "asm/opus_gemm_gfx950_4wave_256x256x64x64_2x2_16x16x32_0x0x0_tn.dis",
+        "s": "asm/opus_gemm_gfx950_4wave_256x256x64x64_2x2_16x16x32_0x0x0_tn.s"
       },
       "b_t": true,
-      "co_sha256": "454344c2a5a07a7749ef0f400161f2defdb8fbab0128a90797dca27649d88ea2",
+      "co_sha256": "0acbd71135b22208fbceb8b07b27742a8d11c9dbb7a9e35a13fcbf835b3bcece",
       "device_flags": [],
       "dis_lines": 1367,
       "dis_mfma": 160,
@@ -761,7 +761,7 @@
       "sgpr_count": 47,
       "sgpr_spill_count": 0,
       "splitk": false,
-      "symbol": "opus_gemm_gfx950_4wave_bf16_256x256x64x64_2x2_16x16x32_0x0x0_tn",
+      "symbol": "opus_gemm_gfx950_4wave_256x256x64x64_2x2_16x16x32_0x0x0_tn",
       "tile": [
         256,
         64,
@@ -775,11 +775,11 @@
       "a_t": true,
       "agpr_count": 0,
       "asm": {
-        "dis": "asm/opus_gemm_gfx950_4wave_bf16_256x256x64x64_2x2_16x16x32_0x0x0_tt.dis",
-        "s": "asm/opus_gemm_gfx950_4wave_bf16_256x256x64x64_2x2_16x16x32_0x0x0_tt.s"
+        "dis": "asm/opus_gemm_gfx950_4wave_256x256x64x64_2x2_16x16x32_0x0x0_tt.dis",
+        "s": "asm/opus_gemm_gfx950_4wave_256x256x64x64_2x2_16x16x32_0x0x0_tt.s"
       },
       "b_t": false,
-      "co_sha256": "69c6f0c4fcc68be3dde441ced70bb864d0a0ca76aebc14abc4e350981c8b2b4e",
+      "co_sha256": "0274dbb5949a3d0276a4cd3d9a676efa18bc9ec6d81742732d82d594df085f29",
       "device_flags": [],
       "dis_lines": 1362,
       "dis_mfma": 160,
@@ -801,7 +801,7 @@
       "sgpr_count": 46,
       "sgpr_spill_count": 0,
       "splitk": false,
-      "symbol": "opus_gemm_gfx950_4wave_bf16_256x256x64x64_2x2_16x16x32_0x0x0_tt",
+      "symbol": "opus_gemm_gfx950_4wave_256x256x64x64_2x2_16x16x32_0x0x0_tt",
       "tile": [
         256,
         64,
@@ -815,11 +815,11 @@
       "a_t": false,
       "agpr_count": 0,
       "asm": {
-        "dis": "asm/opus_gemm_gfx950_4wave_bf16_256x64x256x64_2x2_16x16x32_0x0x0_nn.dis",
-        "s": "asm/opus_gemm_gfx950_4wave_bf16_256x64x256x64_2x2_16x16x32_0x0x0_nn.s"
+        "dis": "asm/opus_gemm_gfx950_4wave_256x64x256x64_2x2_16x16x32_0x0x0_nn.dis",
+        "s": "asm/opus_gemm_gfx950_4wave_256x64x256x64_2x2_16x16x32_0x0x0_nn.s"
       },
       "b_t": true,
-      "co_sha256": "ab1ca9c2ac4c61b035f66b105f79ef34a4289288faca56b8fb4e8c245714b8e2",
+      "co_sha256": "24cbe9134742b3e117e83bac8eb6f8eeb2a8d7c873472ca1dca21a91397cac22",
       "device_flags": [],
       "dis_lines": 1369,
       "dis_mfma": 160,
@@ -841,7 +841,7 @@
       "sgpr_count": 46,
       "sgpr_spill_count": 0,
       "splitk": false,
-      "symbol": "opus_gemm_gfx950_4wave_bf16_256x64x256x64_2x2_16x16x32_0x0x0_nn",
+      "symbol": "opus_gemm_gfx950_4wave_256x64x256x64_2x2_16x16x32_0x0x0_nn",
       "tile": [
         64,
         256,
@@ -855,11 +855,11 @@
       "a_t": false,
       "agpr_count": 0,
       "asm": {
-        "dis": "asm/opus_gemm_gfx950_4wave_bf16_256x64x256x64_2x2_16x16x32_0x0x0_nt.dis",
-        "s": "asm/opus_gemm_gfx950_4wave_bf16_256x64x256x64_2x2_16x16x32_0x0x0_nt.s"
+        "dis": "asm/opus_gemm_gfx950_4wave_256x64x256x64_2x2_16x16x32_0x0x0_nt.dis",
+        "s": "asm/opus_gemm_gfx950_4wave_256x64x256x64_2x2_16x16x32_0x0x0_nt.s"
       },
       "b_t": false,
-      "co_sha256": "07585855fd5769b079812b1c8b142a25281d413187befd238b964998d8c16097",
+      "co_sha256": "b356bc17edaf0e3d7f593920d01e5f75bc0f2b65fcca89d92664bf32b874aa38",
       "device_flags": [],
       "dis_lines": 1246,
       "dis_mfma": 160,
@@ -881,7 +881,7 @@
       "sgpr_count": 46,
       "sgpr_spill_count": 0,
       "splitk": false,
-      "symbol": "opus_gemm_gfx950_4wave_bf16_256x64x256x64_2x2_16x16x32_0x0x0_nt",
+      "symbol": "opus_gemm_gfx950_4wave_256x64x256x64_2x2_16x16x32_0x0x0_nt",
       "tile": [
         64,
         256,
@@ -895,11 +895,11 @@
       "a_t": true,
       "agpr_count": 0,
       "asm": {
-        "dis": "asm/opus_gemm_gfx950_4wave_bf16_256x64x256x64_2x2_16x16x32_0x0x0_tn.dis",
-        "s": "asm/opus_gemm_gfx950_4wave_bf16_256x64x256x64_2x2_16x16x32_0x0x0_tn.s"
+        "dis": "asm/opus_gemm_gfx950_4wave_256x64x256x64_2x2_16x16x32_0x0x0_tn.dis",
+        "s": "asm/opus_gemm_gfx950_4wave_256x64x256x64_2x2_16x16x32_0x0x0_tn.s"
       },
       "b_t": true,
-      "co_sha256": "ea5e41924622dd10cbe87c9c016982fdb97df62adf7656787fa18c7bb6229537",
+      "co_sha256": "d9bd170eb9b77a0362db6e1c5667b6cfed7a5e3dd87d9db2e0d276f939862afd",
       "device_flags": [],
       "dis_lines": 1385,
       "dis_mfma": 160,
@@ -921,7 +921,7 @@
       "sgpr_count": 47,
       "sgpr_spill_count": 0,
       "splitk": false,
-      "symbol": "opus_gemm_gfx950_4wave_bf16_256x64x256x64_2x2_16x16x32_0x0x0_tn",
+      "symbol": "opus_gemm_gfx950_4wave_256x64x256x64_2x2_16x16x32_0x0x0_tn",
       "tile": [
         64,
         256,
@@ -935,11 +935,11 @@
       "a_t": true,
       "agpr_count": 0,
       "asm": {
-        "dis": "asm/opus_gemm_gfx950_4wave_bf16_256x64x256x64_2x2_16x16x32_0x0x0_tt.dis",
-        "s": "asm/opus_gemm_gfx950_4wave_bf16_256x64x256x64_2x2_16x16x32_0x0x0_tt.s"
+        "dis": "asm/opus_gemm_gfx950_4wave_256x64x256x64_2x2_16x16x32_0x0x0_tt.dis",
+        "s": "asm/opus_gemm_gfx950_4wave_256x64x256x64_2x2_16x16x32_0x0x0_tt.s"
       },
       "b_t": false,
-      "co_sha256": "d09e9e4482a804f32cd085912894d81c8c79d6c4fa9dcceb07514c4c12ee4f8c",
+      "co_sha256": "95cbf061247abed279d109eaff5bcc9cf11ea140c803d25b56a86acb5a148146",
       "device_flags": [],
       "dis_lines": 1273,
       "dis_mfma": 160,
@@ -961,7 +961,7 @@
       "sgpr_count": 47,
       "sgpr_spill_count": 0,
       "splitk": false,
-      "symbol": "opus_gemm_gfx950_4wave_bf16_256x64x256x64_2x2_16x16x32_0x0x0_tt",
+      "symbol": "opus_gemm_gfx950_4wave_256x64x256x64_2x2_16x16x32_0x0x0_tt",
       "tile": [
         64,
         256,
@@ -975,11 +975,11 @@
       "a_t": false,
       "agpr_count": 0,
       "asm": {
-        "dis": "asm/opus_gemm_gfx950_4wave_bf16_256x128x64x64_2x2_16x16x32_0x0x0_nn.dis",
-        "s": "asm/opus_gemm_gfx950_4wave_bf16_256x128x64x64_2x2_16x16x32_0x0x0_nn.s"
+        "dis": "asm/opus_gemm_gfx950_4wave_256x128x64x64_2x2_16x16x32_0x0x0_nn.dis",
+        "s": "asm/opus_gemm_gfx950_4wave_256x128x64x64_2x2_16x16x32_0x0x0_nn.s"
       },
       "b_t": true,
-      "co_sha256": "8c7a679b80181effa0080853f635147f16602c68fc17b49b2b8eb0b41027a77e",
+      "co_sha256": "ab78acb6a00ae8dbf33f9f61f61353f844dca3a44adebba903aea72b7bc1b711",
       "device_flags": [],
       "dis_lines": 1015,
       "dis_mfma": 80,
@@ -1001,7 +1001,7 @@
       "sgpr_count": 47,
       "sgpr_spill_count": 0,
       "splitk": false,
-      "symbol": "opus_gemm_gfx950_4wave_bf16_256x128x64x64_2x2_16x16x32_0x0x0_nn",
+      "symbol": "opus_gemm_gfx950_4wave_256x128x64x64_2x2_16x16x32_0x0x0_nn",
       "tile": [
         128,
         64,
@@ -1015,11 +1015,11 @@
       "a_t": false,
       "agpr_count": 0,
       "asm": {
-        "dis": "asm/opus_gemm_gfx950_4wave_bf16_256x128x64x64_2x2_16x16x32_0x0x0_nt.dis",
-        "s": "asm/opus_gemm_gfx950_4wave_bf16_256x128x64x64_2x2_16x16x32_0x0x0_nt.s"
+        "dis": "asm/opus_gemm_gfx950_4wave_256x128x64x64_2x2_16x16x32_0x0x0_nt.dis",
+        "s": "asm/opus_gemm_gfx950_4wave_256x128x64x64_2x2_16x16x32_0x0x0_nt.s"
       },
       "b_t": false,
-      "co_sha256": "2394bf99ddb6489bea8adc5cdb3f6dfb24e097474683327733014337e92bb853",
+      "co_sha256": "16fbbac381d725c347b1535de9d6a58ce713d2561dcaa9133506fa002c2a00ae",
       "device_flags": [],
       "dis_lines": 980,
       "dis_mfma": 80,
@@ -1041,7 +1041,7 @@
       "sgpr_count": 45,
       "sgpr_spill_count": 0,
       "splitk": false,
-      "symbol": "opus_gemm_gfx950_4wave_bf16_256x128x64x64_2x2_16x16x32_0x0x0_nt",
+      "symbol": "opus_gemm_gfx950_4wave_256x128x64x64_2x2_16x16x32_0x0x0_nt",
       "tile": [
         128,
         64,
@@ -1055,11 +1055,11 @@
       "a_t": true,
       "agpr_count": 0,
       "asm": {
-        "dis": "asm/opus_gemm_gfx950_4wave_bf16_256x128x64x64_2x2_16x16x32_0x0x0_tn.dis",
-        "s": "asm/opus_gemm_gfx950_4wave_bf16_256x128x64x64_2x2_16x16x32_0x0x0_tn.s"
+        "dis": "asm/opus_gemm_gfx950_4wave_256x128x64x64_2x2_16x16x32_0x0x0_tn.dis",
+        "s": "asm/opus_gemm_gfx950_4wave_256x128x64x64_2x2_16x16x32_0x0x0_tn.s"
       },
       "b_t": true,
-      "co_sha256": "181d737365549009e9f9006b3f3fa7da6ccbdb8ee306541930428ec3fa6054a1",
+      "co_sha256": "ac4523f0c0655562e7d87dceb13d546e264b030597aefc345c604ffa2670b2d8",
       "device_flags": [],
       "dis_lines": 1063,
       "dis_mfma": 80,
@@ -1081,7 +1081,7 @@
       "sgpr_count": 47,
       "sgpr_spill_count": 0,
       "splitk": false,
-      "symbol": "opus_gemm_gfx950_4wave_bf16_256x128x64x64_2x2_16x16x32_0x0x0_tn",
+      "symbol": "opus_gemm_gfx950_4wave_256x128x64x64_2x2_16x16x32_0x0x0_tn",
       "tile": [
         128,
         64,
@@ -1095,11 +1095,11 @@
       "a_t": true,
       "agpr_count": 0,
       "asm": {
-        "dis": "asm/opus_gemm_gfx950_4wave_bf16_256x128x64x64_2x2_16x16x32_0x0x0_tt.dis",
-        "s": "asm/opus_gemm_gfx950_4wave_bf16_256x128x64x64_2x2_16x16x32_0x0x0_tt.s"
+        "dis": "asm/opus_gemm_gfx950_4wave_256x128x64x64_2x2_16x16x32_0x0x0_tt.dis",
+        "s": "asm/opus_gemm_gfx950_4wave_256x128x64x64_2x2_16x16x32_0x0x0_tt.s"
       },
       "b_t": false,
-      "co_sha256": "54ab44b25a54255bb0621d123e4fd7bec76daa64f4e94c2958ca6e4c4a87968f",
+      "co_sha256": "93ccf040830d11fe319c3b9556a9e6cb6d06487b02808f55a253664009664cff",
       "device_flags": [],
       "dis_lines": 1039,
       "dis_mfma": 80,
@@ -1121,7 +1121,7 @@
       "sgpr_count": 46,
       "sgpr_spill_count": 0,
       "splitk": false,
-      "symbol": "opus_gemm_gfx950_4wave_bf16_256x128x64x64_2x2_16x16x32_0x0x0_tt",
+      "symbol": "opus_gemm_gfx950_4wave_256x128x64x64_2x2_16x16x32_0x0x0_tt",
       "tile": [
         128,
         64,
@@ -1135,11 +1135,11 @@
       "a_t": false,
       "agpr_count": 0,
       "asm": {
-        "dis": "asm/opus_gemm_gfx950_4wave_bf16_256x64x128x64_2x2_16x16x32_0x0x0_nn.dis",
-        "s": "asm/opus_gemm_gfx950_4wave_bf16_256x64x128x64_2x2_16x16x32_0x0x0_nn.s"
+        "dis": "asm/opus_gemm_gfx950_4wave_256x64x128x64_2x2_16x16x32_0x0x0_nn.dis",
+        "s": "asm/opus_gemm_gfx950_4wave_256x64x128x64_2x2_16x16x32_0x0x0_nn.s"
       },
       "b_t": true,
-      "co_sha256": "e1b912728f21b169fcccda8253ebbd39630b834709b62fbeb9e6811c60ceaac6",
+      "co_sha256": "519cacaa69b0d4a151c7ab9b2d522dab4ab7bd00c2d0ec608c5e71c78b167edf",
       "device_flags": [],
       "dis_lines": 1044,
       "dis_mfma": 80,
@@ -1161,7 +1161,7 @@
       "sgpr_count": 46,
       "sgpr_spill_count": 0,
       "splitk": false,
-      "symbol": "opus_gemm_gfx950_4wave_bf16_256x64x128x64_2x2_16x16x32_0x0x0_nn",
+      "symbol": "opus_gemm_gfx950_4wave_256x64x128x64_2x2_16x16x32_0x0x0_nn",
       "tile": [
         64,
         128,
@@ -1175,11 +1175,11 @@
       "a_t": false,
       "agpr_count": 0,
       "asm": {
-        "dis": "asm/opus_gemm_gfx950_4wave_bf16_256x64x128x64_2x2_16x16x32_0x0x0_nt.dis",
-        "s": "asm/opus_gemm_gfx950_4wave_bf16_256x64x128x64_2x2_16x16x32_0x0x0_nt.s"
+        "dis": "asm/opus_gemm_gfx950_4wave_256x64x128x64_2x2_16x16x32_0x0x0_nt.dis",
+        "s": "asm/opus_gemm_gfx950_4wave_256x64x128x64_2x2_16x16x32_0x0x0_nt.s"
       },
       "b_t": false,
-      "co_sha256": "b52c34420c2bce65f6246fd86e4c0ed53b0c1e87ddd6221135c8107c4f1a2fc7",
+      "co_sha256": "45a930d63683c8f2915d0d287216176ea2063019b83d797213dc8a65f8caed30",
       "device_flags": [],
       "dis_lines": 994,
       "dis_mfma": 80,
@@ -1201,7 +1201,7 @@
       "sgpr_count": 47,
       "sgpr_spill_count": 0,
       "splitk": false,
-      "symbol": "opus_gemm_gfx950_4wave_bf16_256x64x128x64_2x2_16x16x32_0x0x0_nt",
+      "symbol": "opus_gemm_gfx950_4wave_256x64x128x64_2x2_16x16x32_0x0x0_nt",
       "tile": [
         64,
         128,
@@ -1215,11 +1215,11 @@
       "a_t": true,
       "agpr_count": 0,
       "asm": {
-        "dis": "asm/opus_gemm_gfx950_4wave_bf16_256x64x128x64_2x2_16x16x32_0x0x0_tn.dis",
-        "s": "asm/opus_gemm_gfx950_4wave_bf16_256x64x128x64_2x2_16x16x32_0x0x0_tn.s"
+        "dis": "asm/opus_gemm_gfx950_4wave_256x64x128x64_2x2_16x16x32_0x0x0_tn.dis",
+        "s": "asm/opus_gemm_gfx950_4wave_256x64x128x64_2x2_16x16x32_0x0x0_tn.s"
       },
       "b_t": true,
-      "co_sha256": "530ca36f10c2837ea72f754e9ac2901cc4b23103c578e5ecfe6399527b541714",
+      "co_sha256": "593e62f3459e8049fd32569145a41a3c2fd925fb3f47c5af405aba83148b4687",
       "device_flags": [],
       "dis_lines": 1065,
       "dis_mfma": 80,
@@ -1241,7 +1241,7 @@
       "sgpr_count": 47,
       "sgpr_spill_count": 0,
       "splitk": false,
-      "symbol": "opus_gemm_gfx950_4wave_bf16_256x64x128x64_2x2_16x16x32_0x0x0_tn",
+      "symbol": "opus_gemm_gfx950_4wave_256x64x128x64_2x2_16x16x32_0x0x0_tn",
       "tile": [
         64,
         128,
@@ -1255,11 +1255,11 @@
       "a_t": true,
       "agpr_count": 0,
       "asm": {
-        "dis": "asm/opus_gemm_gfx950_4wave_bf16_256x64x128x64_2x2_16x16x32_0x0x0_tt.dis",
-        "s": "asm/opus_gemm_gfx950_4wave_bf16_256x64x128x64_2x2_16x16x32_0x0x0_tt.s"
+        "dis": "asm/opus_gemm_gfx950_4wave_256x64x128x64_2x2_16x16x32_0x0x0_tt.dis",
+        "s": "asm/opus_gemm_gfx950_4wave_256x64x128x64_2x2_16x16x32_0x0x0_tt.s"
       },
       "b_t": false,
-      "co_sha256": "a393ec1ae0e5650cb5067781c20400f6720a2ded639fc7c304ba2f3be1eecec7",
+      "co_sha256": "b334f49f22ae98475973a1369f2261ba888b077adcf9f504fbe98ab4669f6b01",
       "device_flags": [],
       "dis_lines": 1006,
       "dis_mfma": 80,
@@ -1281,7 +1281,7 @@
       "sgpr_count": 47,
       "sgpr_spill_count": 0,
       "splitk": false,
-      "symbol": "opus_gemm_gfx950_4wave_bf16_256x64x128x64_2x2_16x16x32_0x0x0_tt",
+      "symbol": "opus_gemm_gfx950_4wave_256x64x128x64_2x2_16x16x32_0x0x0_tt",
       "tile": [
         64,
         128,
@@ -1295,11 +1295,11 @@
       "a_t": false,
       "agpr_count": 256,
       "asm": {
-        "dis": "asm/opus_gemm_gfx950_splitk_4wave_bf16_ws_256x256x256x64_2x2_16x16x32_0x0x0_nn.dis",
-        "s": "asm/opus_gemm_gfx950_splitk_4wave_bf16_ws_256x256x256x64_2x2_16x16x32_0x0x0_nn.s"
+        "dis": "asm/opus_gemm_gfx950_splitk_4wave_ws_256x256x256x64_2x2_16x16x32_0x0x0_nn.dis",
+        "s": "asm/opus_gemm_gfx950_splitk_4wave_ws_256x256x256x64_2x2_16x16x32_0x0x0_nn.s"
       },
       "b_t": true,
-      "co_sha256": "db0559fc66312273e46eea44223f4db1a79c233be4999459f2dbf8cca460343c",
+      "co_sha256": "0307b575847c77f1446241e54edd6bb085911e600a859ebeae62ee53d376e1a5",
       "device_flags": [],
       "dis_lines": 2498,
       "dis_mfma": 640,
@@ -1321,7 +1321,7 @@
       "sgpr_count": 48,
       "sgpr_spill_count": 0,
       "splitk": true,
-      "symbol": "opus_gemm_gfx950_splitk_4wave_bf16_ws_256x256x256x64_2x2_16x16x32_0x0x0_nn",
+      "symbol": "opus_gemm_gfx950_splitk_4wave_ws_256x256x256x64_2x2_16x16x32_0x0x0_nn",
       "tile": [
         256,
         256,
@@ -1335,11 +1335,11 @@
       "a_t": false,
       "agpr_count": 256,
       "asm": {
-        "dis": "asm/opus_gemm_gfx950_splitk_4wave_bf16_ws_256x256x256x64_2x2_16x16x32_0x0x0_nt.dis",
-        "s": "asm/opus_gemm_gfx950_splitk_4wave_bf16_ws_256x256x256x64_2x2_16x16x32_0x0x0_nt.s"
+        "dis": "asm/opus_gemm_gfx950_splitk_4wave_ws_256x256x256x64_2x2_16x16x32_0x0x0_nt.dis",
+        "s": "asm/opus_gemm_gfx950_splitk_4wave_ws_256x256x256x64_2x2_16x16x32_0x0x0_nt.s"
       },
       "b_t": false,
-      "co_sha256": "4b0ccc645cd1ee0d7bb99392ee5dfc21f8670223c9ec27ca33511f2676f0e590",
+      "co_sha256": "9441409e4d3ca94a99076291deec140b63ced1249a7996e63de2abba309980b7",
       "device_flags": [],
       "dis_lines": 2375,
       "dis_mfma": 640,
@@ -1361,7 +1361,7 @@
       "sgpr_count": 50,
       "sgpr_spill_count": 0,
       "splitk": true,
-      "symbol": "opus_gemm_gfx950_splitk_4wave_bf16_ws_256x256x256x64_2x2_16x16x32_0x0x0_nt",
+      "symbol": "opus_gemm_gfx950_splitk_4wave_ws_256x256x256x64_2x2_16x16x32_0x0x0_nt",
       "tile": [
         256,
         256,
@@ -1375,11 +1375,11 @@
       "a_t": true,
       "agpr_count": 256,
       "asm": {
-        "dis": "asm/opus_gemm_gfx950_splitk_4wave_bf16_ws_256x256x256x64_2x2_16x16x32_0x0x0_tn.dis",
-        "s": "asm/opus_gemm_gfx950_splitk_4wave_bf16_ws_256x256x256x64_2x2_16x16x32_0x0x0_tn.s"
+        "dis": "asm/opus_gemm_gfx950_splitk_4wave_ws_256x256x256x64_2x2_16x16x32_0x0x0_tn.dis",
+        "s": "asm/opus_gemm_gfx950_splitk_4wave_ws_256x256x256x64_2x2_16x16x32_0x0x0_tn.s"
       },
       "b_t": true,
-      "co_sha256": "9b77f9a96f81e789e37e6ad52feaf56ab854dcd5c75b226c957a80aa18f51f93",
+      "co_sha256": "de532e009cbc2bc19c71ea0292fc1b834ce512adccbfbf182beb4282e5ca4273",
       "device_flags": [],
       "dis_lines": 2598,
       "dis_mfma": 640,
@@ -1401,7 +1401,7 @@
       "sgpr_count": 46,
       "sgpr_spill_count": 0,
       "splitk": true,
-      "symbol": "opus_gemm_gfx950_splitk_4wave_bf16_ws_256x256x256x64_2x2_16x16x32_0x0x0_tn",
+      "symbol": "opus_gemm_gfx950_splitk_4wave_ws_256x256x256x64_2x2_16x16x32_0x0x0_tn",
       "tile": [
         256,
         256,
@@ -1415,11 +1415,11 @@
       "a_t": true,
       "agpr_count": 256,
       "asm": {
-        "dis": "asm/opus_gemm_gfx950_splitk_4wave_bf16_ws_256x256x256x64_2x2_16x16x32_0x0x0_tt.dis",
-        "s": "asm/opus_gemm_gfx950_splitk_4wave_bf16_ws_256x256x256x64_2x2_16x16x32_0x0x0_tt.s"
+        "dis": "asm/opus_gemm_gfx950_splitk_4wave_ws_256x256x256x64_2x2_16x16x32_0x0x0_tt.dis",
+        "s": "asm/opus_gemm_gfx950_splitk_4wave_ws_256x256x256x64_2x2_16x16x32_0x0x0_tt.s"
       },
       "b_t": false,
-      "co_sha256": "c6c8459782a438e528765c08b97fd69e56762f03690e16718dd5a6a6f2b3009f",
+      "co_sha256": "5939e5c9ab4162e45840b8fcf550e8f034e30e2d04ef9a9e0ceaac4ea2234221",
       "device_flags": [],
       "dis_lines": 2489,
       "dis_mfma": 640,
@@ -1441,7 +1441,7 @@
       "sgpr_count": 47,
       "sgpr_spill_count": 0,
       "splitk": true,
-      "symbol": "opus_gemm_gfx950_splitk_4wave_bf16_ws_256x256x256x64_2x2_16x16x32_0x0x0_tt",
+      "symbol": "opus_gemm_gfx950_splitk_4wave_ws_256x256x256x64_2x2_16x16x32_0x0x0_tt",
       "tile": [
         256,
         256,
@@ -1455,11 +1455,11 @@
       "a_t": false,
       "agpr_count": 256,
       "asm": {
-        "dis": "asm/opus_gemm_gfx950_splitk_4wave_bf16_ws_256x256x128x64_2x2_16x16x32_0x0x0_nn.dis",
-        "s": "asm/opus_gemm_gfx950_splitk_4wave_bf16_ws_256x256x128x64_2x2_16x16x32_0x0x0_nn.s"
+        "dis": "asm/opus_gemm_gfx950_splitk_4wave_ws_256x256x128x64_2x2_16x16x32_0x0x0_nn.dis",
+        "s": "asm/opus_gemm_gfx950_splitk_4wave_ws_256x256x128x64_2x2_16x16x32_0x0x0_nn.s"
       },
       "b_t": true,
-      "co_sha256": "f21efbec02f60062b18a63ebf228d39c04e1bd323d10a579c3aedc37b0cf5bc0",
+      "co_sha256": "d24e8c03172494d1b24f478bdb97b3f33f12516c8a929b1d794aa1cf3c85a600",
       "device_flags": [],
       "dis_lines": 1647,
       "dis_mfma": 320,
@@ -1481,7 +1481,7 @@
       "sgpr_count": 47,
       "sgpr_spill_count": 0,
       "splitk": true,
-      "symbol": "opus_gemm_gfx950_splitk_4wave_bf16_ws_256x256x128x64_2x2_16x16x32_0x0x0_nn",
+      "symbol": "opus_gemm_gfx950_splitk_4wave_ws_256x256x128x64_2x2_16x16x32_0x0x0_nn",
       "tile": [
         256,
         128,
@@ -1495,11 +1495,11 @@
       "a_t": false,
       "agpr_count": 256,
       "asm": {
-        "dis": "asm/opus_gemm_gfx950_splitk_4wave_bf16_ws_256x256x128x64_2x2_16x16x32_0x0x0_nt.dis",
-        "s": "asm/opus_gemm_gfx950_splitk_4wave_bf16_ws_256x256x128x64_2x2_16x16x32_0x0x0_nt.s"
+        "dis": "asm/opus_gemm_gfx950_splitk_4wave_ws_256x256x128x64_2x2_16x16x32_0x0x0_nt.dis",
+        "s": "asm/opus_gemm_gfx950_splitk_4wave_ws_256x256x128x64_2x2_16x16x32_0x0x0_nt.s"
       },
       "b_t": false,
-      "co_sha256": "3c26e50a28cd39588a94b7e2e6d8a789190592b7979016f1f135e1164b9f3346",
+      "co_sha256": "1028138e1a991e35f3c1a7051ab42b85200920105bf841400ade65f08f9a49bf",
       "device_flags": [],
       "dis_lines": 1581,
       "dis_mfma": 320,
@@ -1521,7 +1521,7 @@
       "sgpr_count": 46,
       "sgpr_spill_count": 0,
       "splitk": true,
-      "symbol": "opus_gemm_gfx950_splitk_4wave_bf16_ws_256x256x128x64_2x2_16x16x32_0x0x0_nt",
+      "symbol": "opus_gemm_gfx950_splitk_4wave_ws_256x256x128x64_2x2_16x16x32_0x0x0_nt",
       "tile": [
         256,
         128,
@@ -1535,11 +1535,11 @@
       "a_t": true,
       "agpr_count": 256,
       "asm": {
-        "dis": "asm/opus_gemm_gfx950_splitk_4wave_bf16_ws_256x256x128x64_2x2_16x16x32_0x0x0_tn.dis",
-        "s": "asm/opus_gemm_gfx950_splitk_4wave_bf16_ws_256x256x128x64_2x2_16x16x32_0x0x0_tn.s"
+        "dis": "asm/opus_gemm_gfx950_splitk_4wave_ws_256x256x128x64_2x2_16x16x32_0x0x0_tn.dis",
+        "s": "asm/opus_gemm_gfx950_splitk_4wave_ws_256x256x128x64_2x2_16x16x32_0x0x0_tn.s"
       },
       "b_t": true,
-      "co_sha256": "03d95b0b23885acedefe8f7d9fca667fb6c9dc73d5622cccee83fcc6ad0663cb",
+      "co_sha256": "3c8f8ed3430208354051836050f147fa0175ece1863c7cf4ba75abde6ba6c395",
       "device_flags": [],
       "dis_lines": 1761,
       "dis_mfma": 320,
@@ -1561,7 +1561,7 @@
       "sgpr_count": 48,
       "sgpr_spill_count": 0,
       "splitk": true,
-      "symbol": "opus_gemm_gfx950_splitk_4wave_bf16_ws_256x256x128x64_2x2_16x16x32_0x0x0_tn",
+      "symbol": "opus_gemm_gfx950_splitk_4wave_ws_256x256x128x64_2x2_16x16x32_0x0x0_tn",
       "tile": [
         256,
         128,
@@ -1575,11 +1575,11 @@
       "a_t": true,
       "agpr_count": 256,
       "asm": {
-        "dis": "asm/opus_gemm_gfx950_splitk_4wave_bf16_ws_256x256x128x64_2x2_16x16x32_0x0x0_tt.dis",
-        "s": "asm/opus_gemm_gfx950_splitk_4wave_bf16_ws_256x256x128x64_2x2_16x16x32_0x0x0_tt.s"
+        "dis": "asm/opus_gemm_gfx950_splitk_4wave_ws_256x256x128x64_2x2_16x16x32_0x0x0_tt.dis",
+        "s": "asm/opus_gemm_gfx950_splitk_4wave_ws_256x256x128x64_2x2_16x16x32_0x0x0_tt.s"
       },
       "b_t": false,
-      "co_sha256": "5cf957c5ea928ab404a27dc5e3ebe3d31062b6a3d70b9cabfef5d2e72a9c7623",
+      "co_sha256": "a1404899018c4cdf8870c3465686eac1474d08bececc66422221e1c6853e475f",
       "device_flags": [],
       "dis_lines": 1704,
       "dis_mfma": 320,
@@ -1601,7 +1601,7 @@
       "sgpr_count": 47,
       "sgpr_spill_count": 0,
       "splitk": true,
-      "symbol": "opus_gemm_gfx950_splitk_4wave_bf16_ws_256x256x128x64_2x2_16x16x32_0x0x0_tt",
+      "symbol": "opus_gemm_gfx950_splitk_4wave_ws_256x256x128x64_2x2_16x16x32_0x0x0_tt",
       "tile": [
         256,
         128,
@@ -1615,11 +1615,11 @@
       "a_t": false,
       "agpr_count": 256,
       "asm": {
-        "dis": "asm/opus_gemm_gfx950_splitk_4wave_bf16_ws_256x128x256x64_2x2_16x16x32_0x0x0_nn.dis",
-        "s": "asm/opus_gemm_gfx950_splitk_4wave_bf16_ws_256x128x256x64_2x2_16x16x32_0x0x0_nn.s"
+        "dis": "asm/opus_gemm_gfx950_splitk_4wave_ws_256x128x256x64_2x2_16x16x32_0x0x0_nn.dis",
+        "s": "asm/opus_gemm_gfx950_splitk_4wave_ws_256x128x256x64_2x2_16x16x32_0x0x0_nn.s"
       },
       "b_t": true,
-      "co_sha256": "5d7ac5da3c0d0194f260daf0904473baa1cd7a3fdc1fc1aa40b46858f6319091",
+      "co_sha256": "bb8dbfec5d709d998619c5951caa6b5a51aea0f48d0130fcaa3342db82ec3f42",
       "device_flags": [],
       "dis_lines": 1701,
       "dis_mfma": 320,
@@ -1641,7 +1641,7 @@
       "sgpr_count": 47,
       "sgpr_spill_count": 0,
       "splitk": true,
-      "symbol": "opus_gemm_gfx950_splitk_4wave_bf16_ws_256x128x256x64_2x2_16x16x32_0x0x0_nn",
+      "symbol": "opus_gemm_gfx950_splitk_4wave_ws_256x128x256x64_2x2_16x16x32_0x0x0_nn",
       "tile": [
         128,
         256,
@@ -1655,11 +1655,11 @@
       "a_t": false,
       "agpr_count": 256,
       "asm": {
-        "dis": "asm/opus_gemm_gfx950_splitk_4wave_bf16_ws_256x128x256x64_2x2_16x16x32_0x0x0_nt.dis",
-        "s": "asm/opus_gemm_gfx950_splitk_4wave_bf16_ws_256x128x256x64_2x2_16x16x32_0x0x0_nt.s"
+        "dis": "asm/opus_gemm_gfx950_splitk_4wave_ws_256x128x256x64_2x2_16x16x32_0x0x0_nt.dis",
+        "s": "asm/opus_gemm_gfx950_splitk_4wave_ws_256x128x256x64_2x2_16x16x32_0x0x0_nt.s"
       },
       "b_t": false,
-      "co_sha256": "e04caf676e2be965b37109d481bee872ee6e215c9641db5b24777fd471c1aa06",
+      "co_sha256": "09b72ecd2929c659cc89cd57990947b49ff459727d996208b6cf59ea294829a5",
       "device_flags": [],
       "dis_lines": 1563,
       "dis_mfma": 320,
@@ -1681,7 +1681,7 @@
       "sgpr_count": 48,
       "sgpr_spill_count": 0,
       "splitk": true,
-      "symbol": "opus_gemm_gfx950_splitk_4wave_bf16_ws_256x128x256x64_2x2_16x16x32_0x0x0_nt",
+      "symbol": "opus_gemm_gfx950_splitk_4wave_ws_256x128x256x64_2x2_16x16x32_0x0x0_nt",
       "tile": [
         128,
         256,
@@ -1695,11 +1695,11 @@
       "a_t": true,
       "agpr_count": 256,
       "asm": {
-        "dis": "asm/opus_gemm_gfx950_splitk_4wave_bf16_ws_256x128x256x64_2x2_16x16x32_0x0x0_tn.dis",
-        "s": "asm/opus_gemm_gfx950_splitk_4wave_bf16_ws_256x128x256x64_2x2_16x16x32_0x0x0_tn.s"
+        "dis": "asm/opus_gemm_gfx950_splitk_4wave_ws_256x128x256x64_2x2_16x16x32_0x0x0_tn.dis",
+        "s": "asm/opus_gemm_gfx950_splitk_4wave_ws_256x128x256x64_2x2_16x16x32_0x0x0_tn.s"
       },
       "b_t": true,
-      "co_sha256": "2c764cad5fbb4cc6068fd6e2136bcc1125961a0941cee2e076a2024361423a64",
+      "co_sha256": "b75977b193165abd130084fef5ad76463ea7b65260dca201870b2f6329d27fcc",
       "device_flags": [],
       "dis_lines": 1752,
       "dis_mfma": 320,
@@ -1721,7 +1721,7 @@
       "sgpr_count": 48,
       "sgpr_spill_count": 0,
       "splitk": true,
-      "symbol": "opus_gemm_gfx950_splitk_4wave_bf16_ws_256x128x256x64_2x2_16x16x32_0x0x0_tn",
+      "symbol": "opus_gemm_gfx950_splitk_4wave_ws_256x128x256x64_2x2_16x16x32_0x0x0_tn",
       "tile": [
         128,
         256,
@@ -1735,11 +1735,11 @@
       "a_t": true,
       "agpr_count": 256,
       "asm": {
-        "dis": "asm/opus_gemm_gfx950_splitk_4wave_bf16_ws_256x128x256x64_2x2_16x16x32_0x0x0_tt.dis",
-        "s": "asm/opus_gemm_gfx950_splitk_4wave_bf16_ws_256x128x256x64_2x2_16x16x32_0x0x0_tt.s"
+        "dis": "asm/opus_gemm_gfx950_splitk_4wave_ws_256x128x256x64_2x2_16x16x32_0x0x0_tt.dis",
+        "s": "asm/opus_gemm_gfx950_splitk_4wave_ws_256x128x256x64_2x2_16x16x32_0x0x0_tt.s"
       },
       "b_t": false,
-      "co_sha256": "4f189ede959902aa1676cebf9845b1956b7c202c22cb31f01228ebf852728d7e",
+      "co_sha256": "0512d08aa351e125fb7cc499d173f6b70b7be73ea76c912244606feb42934a44",
       "device_flags": [],
       "dis_lines": 1638,
       "dis_mfma": 320,
@@ -1761,7 +1761,7 @@
       "sgpr_count": 47,
       "sgpr_spill_count": 0,
       "splitk": true,
-      "symbol": "opus_gemm_gfx950_splitk_4wave_bf16_ws_256x128x256x64_2x2_16x16x32_0x0x0_tt",
+      "symbol": "opus_gemm_gfx950_splitk_4wave_ws_256x128x256x64_2x2_16x16x32_0x0x0_tt",
       "tile": [
         128,
         256,
@@ -1775,11 +1775,11 @@
       "a_t": false,
       "agpr_count": 0,
       "asm": {
-        "dis": "asm/opus_gemm_gfx950_splitk_4wave_bf16_ws_256x128x128x64_2x2_16x16x32_0x0x0_nn.dis",
-        "s": "asm/opus_gemm_gfx950_splitk_4wave_bf16_ws_256x128x128x64_2x2_16x16x32_0x0x0_nn.s"
+        "dis": "asm/opus_gemm_gfx950_splitk_4wave_ws_256x128x128x64_2x2_16x16x32_0x0x0_nn.dis",
+        "s": "asm/opus_gemm_gfx950_splitk_4wave_ws_256x128x128x64_2x2_16x16x32_0x0x0_nn.s"
       },
       "b_t": true,
-      "co_sha256": "89ab101c45804bec42c7a7624bfa8f6fc6c63f4d0f878188613b432037884556",
+      "co_sha256": "bcbe45748a28b8cc4392af22df0d0fc6548a49699f3bf5fd56d2830ee1c77257",
       "device_flags": [],
       "dis_lines": 1154,
       "dis_mfma": 160,
@@ -1801,7 +1801,7 @@
       "sgpr_count": 47,
       "sgpr_spill_count": 0,
       "splitk": true,
-      "symbol": "opus_gemm_gfx950_splitk_4wave_bf16_ws_256x128x128x64_2x2_16x16x32_0x0x0_nn",
+      "symbol": "opus_gemm_gfx950_splitk_4wave_ws_256x128x128x64_2x2_16x16x32_0x0x0_nn",
       "tile": [
         128,
         128,
@@ -1815,11 +1815,11 @@
       "a_t": false,
       "agpr_count": 0,
       "asm": {
-        "dis": "asm/opus_gemm_gfx950_splitk_4wave_bf16_ws_256x128x128x64_2x2_16x16x32_0x0x0_nt.dis",
-        "s": "asm/opus_gemm_gfx950_splitk_4wave_bf16_ws_256x128x128x64_2x2_16x16x32_0x0x0_nt.s"
+        "dis": "asm/opus_gemm_gfx950_splitk_4wave_ws_256x128x128x64_2x2_16x16x32_0x0x0_nt.dis",
+        "s": "asm/opus_gemm_gfx950_splitk_4wave_ws_256x128x128x64_2x2_16x16x32_0x0x0_nt.s"
       },
       "b_t": false,
-      "co_sha256": "dfde4e1653fd822b206a4d1403e545830d6ea353b742a13d45a3d31a7be6fb10",
+      "co_sha256": "b7e087204574ef7324b3fd90bd559fcf725adb55b40395e7ef9c66e041eec926",
       "device_flags": [],
       "dis_lines": 1104,
       "dis_mfma": 160,
@@ -1841,7 +1841,7 @@
       "sgpr_count": 44,
       "sgpr_spill_count": 0,
       "splitk": true,
-      "symbol": "opus_gemm_gfx950_splitk_4wave_bf16_ws_256x128x128x64_2x2_16x16x32_0x0x0_nt",
+      "symbol": "opus_gemm_gfx950_splitk_4wave_ws_256x128x128x64_2x2_16x16x32_0x0x0_nt",
       "tile": [
         128,
         128,
@@ -1855,11 +1855,11 @@
       "a_t": true,
       "agpr_count": 0,
       "asm": {
-        "dis": "asm/opus_gemm_gfx950_splitk_4wave_bf16_ws_256x128x128x64_2x2_16x16x32_0x0x0_tn.dis",
-        "s": "asm/opus_gemm_gfx950_splitk_4wave_bf16_ws_256x128x128x64_2x2_16x16x32_0x0x0_tn.s"
+        "dis": "asm/opus_gemm_gfx950_splitk_4wave_ws_256x128x128x64_2x2_16x16x32_0x0x0_tn.dis",
+        "s": "asm/opus_gemm_gfx950_splitk_4wave_ws_256x128x128x64_2x2_16x16x32_0x0x0_tn.s"
       },
       "b_t": true,
-      "co_sha256": "c55a1895d2801650f8f30a78192777be5c9557f83a77de9e5121ce16fddbec81",
+      "co_sha256": "03731a5302da4e7be06bf475c8fdeced6c177bc1e4abcc6562918f4e75051491",
       "device_flags": [],
       "dis_lines": 1164,
       "dis_mfma": 160,
@@ -1881,7 +1881,7 @@
       "sgpr_count": 47,
       "sgpr_spill_count": 0,
       "splitk": true,
-      "symbol": "opus_gemm_gfx950_splitk_4wave_bf16_ws_256x128x128x64_2x2_16x16x32_0x0x0_tn",
+      "symbol": "opus_gemm_gfx950_splitk_4wave_ws_256x128x128x64_2x2_16x16x32_0x0x0_tn",
       "tile": [
         128,
         128,
@@ -1895,11 +1895,11 @@
       "a_t": true,
       "agpr_count": 0,
       "asm": {
-        "dis": "asm/opus_gemm_gfx950_splitk_4wave_bf16_ws_256x128x128x64_2x2_16x16x32_0x0x0_tt.dis",
-        "s": "asm/opus_gemm_gfx950_splitk_4wave_bf16_ws_256x128x128x64_2x2_16x16x32_0x0x0_tt.s"
+        "dis": "asm/opus_gemm_gfx950_splitk_4wave_ws_256x128x128x64_2x2_16x16x32_0x0x0_tt.dis",
+        "s": "asm/opus_gemm_gfx950_splitk_4wave_ws_256x128x128x64_2x2_16x16x32_0x0x0_tt.s"
       },
       "b_t": false,
-      "co_sha256": "07fb2e722ad5e81a2c6758e243ef6670b3c7d021835175f2ab5bb3dc9827679b",
+      "co_sha256": "33a356e5cb0acf1759127966cd22755e0ef0cad5f7cb301653eaa04d5eac37e1",
       "device_flags": [],
       "dis_lines": 1146,
       "dis_mfma": 160,
@@ -1921,7 +1921,7 @@
       "sgpr_count": 48,
       "sgpr_spill_count": 0,
       "splitk": true,
-      "symbol": "opus_gemm_gfx950_splitk_4wave_bf16_ws_256x128x128x64_2x2_16x16x32_0x0x0_tt",
+      "symbol": "opus_gemm_gfx950_splitk_4wave_ws_256x128x128x64_2x2_16x16x32_0x0x0_tt",
       "tile": [
         128,
         128,
@@ -1935,11 +1935,11 @@
       "a_t": false,
       "agpr_count": 0,
       "asm": {
-        "dis": "asm/opus_gemm_gfx950_splitk_4wave_bf16_ws_256x256x64x64_2x2_16x16x32_0x0x0_nn.dis",
-        "s": "asm/opus_gemm_gfx950_splitk_4wave_bf16_ws_256x256x64x64_2x2_16x16x32_0x0x0_nn.s"
+        "dis": "asm/opus_gemm_gfx950_splitk_4wave_ws_256x256x64x64_2x2_16x16x32_0x0x0_nn.dis",
+        "s": "asm/opus_gemm_gfx950_splitk_4wave_ws_256x256x64x64_2x2_16x16x32_0x0x0_nn.s"
       },
       "b_t": true,
-      "co_sha256": "578f044cb7adef352e73fdf15ab8332eadb4777ec8fc20d8d972306f34652708",
+      "co_sha256": "709b0dce7d05b542d3d38e1615f4987e5426c359fc80d3cd07d5e562a75acc8c",
       "device_flags": [],
       "dis_lines": 1158,
       "dis_mfma": 160,
@@ -1961,7 +1961,7 @@
       "sgpr_count": 47,
       "sgpr_spill_count": 0,
       "splitk": true,
-      "symbol": "opus_gemm_gfx950_splitk_4wave_bf16_ws_256x256x64x64_2x2_16x16x32_0x0x0_nn",
+      "symbol": "opus_gemm_gfx950_splitk_4wave_ws_256x256x64x64_2x2_16x16x32_0x0x0_nn",
       "tile": [
         256,
         64,
@@ -1975,11 +1975,11 @@
       "a_t": false,
       "agpr_count": 0,
       "asm": {
-        "dis": "asm/opus_gemm_gfx950_splitk_4wave_bf16_ws_256x256x64x64_2x2_16x16x32_0x0x0_nt.dis",
-        "s": "asm/opus_gemm_gfx950_splitk_4wave_bf16_ws_256x256x64x64_2x2_16x16x32_0x0x0_nt.s"
+        "dis": "asm/opus_gemm_gfx950_splitk_4wave_ws_256x256x64x64_2x2_16x16x32_0x0x0_nt.dis",
+        "s": "asm/opus_gemm_gfx950_splitk_4wave_ws_256x256x64x64_2x2_16x16x32_0x0x0_nt.s"
       },
       "b_t": false,
-      "co_sha256": "b9521f7d8df3a459e72bc557fad35c8427fb9dcba0f0747d1d7d1af1514452ae",
+      "co_sha256": "0de37e0a94667cd4f549547f704acf4a7c8833c648eeff608f2bfee56504292d",
       "device_flags": [],
       "dis_lines": 1125,
       "dis_mfma": 160,
@@ -2001,7 +2001,7 @@
       "sgpr_count": 45,
       "sgpr_spill_count": 0,
       "splitk": true,
-      "symbol": "opus_gemm_gfx950_splitk_4wave_bf16_ws_256x256x64x64_2x2_16x16x32_0x0x0_nt",
+      "symbol": "opus_gemm_gfx950_splitk_4wave_ws_256x256x64x64_2x2_16x16x32_0x0x0_nt",
       "tile": [
         256,
         64,
@@ -2015,11 +2015,11 @@
       "a_t": true,
       "agpr_count": 0,
       "asm": {
-        "dis": "asm/opus_gemm_gfx950_splitk_4wave_bf16_ws_256x256x64x64_2x2_16x16x32_0x0x0_tn.dis",
-        "s": "asm/opus_gemm_gfx950_splitk_4wave_bf16_ws_256x256x64x64_2x2_16x16x32_0x0x0_tn.s"
+        "dis": "asm/opus_gemm_gfx950_splitk_4wave_ws_256x256x64x64_2x2_16x16x32_0x0x0_tn.dis",
+        "s": "asm/opus_gemm_gfx950_splitk_4wave_ws_256x256x64x64_2x2_16x16x32_0x0x0_tn.s"
       },
       "b_t": true,
-      "co_sha256": "15eb933ef596806726be45aa73deffe98a7f8055d3a3714e2c754c378c0bb515",
+      "co_sha256": "f20d140adab7e0eb30fe43ad82f04847a0a7472332f7f6c4d23740fa2adcc0db",
       "device_flags": [],
       "dis_lines": 1269,
       "dis_mfma": 160,
@@ -2041,7 +2041,7 @@
       "sgpr_count": 48,
       "sgpr_spill_count": 0,
       "splitk": true,
-      "symbol": "opus_gemm_gfx950_splitk_4wave_bf16_ws_256x256x64x64_2x2_16x16x32_0x0x0_tn",
+      "symbol": "opus_gemm_gfx950_splitk_4wave_ws_256x256x64x64_2x2_16x16x32_0x0x0_tn",
       "tile": [
         256,
         64,
@@ -2055,11 +2055,11 @@
       "a_t": true,
       "agpr_count": 0,
       "asm": {
-        "dis": "asm/opus_gemm_gfx950_splitk_4wave_bf16_ws_256x256x64x64_2x2_16x16x32_0x0x0_tt.dis",
-        "s": "asm/opus_gemm_gfx950_splitk_4wave_bf16_ws_256x256x64x64_2x2_16x16x32_0x0x0_tt.s"
+        "dis": "asm/opus_gemm_gfx950_splitk_4wave_ws_256x256x64x64_2x2_16x16x32_0x0x0_tt.dis",
+        "s": "asm/opus_gemm_gfx950_splitk_4wave_ws_256x256x64x64_2x2_16x16x32_0x0x0_tt.s"
       },
       "b_t": false,
-      "co_sha256": "24df022445d7cb6690df2a4fdf5878d8f271c3eafa9afae5cf12ad3efc4f0bc3",
+      "co_sha256": "97c07d3a0c7ef05acfacb5d1e84dd9296222620190393c1ee7c1c3f5b0c805b5",
       "device_flags": [],
       "dis_lines": 1264,
       "dis_mfma": 160,
@@ -2081,7 +2081,7 @@
       "sgpr_count": 46,
       "sgpr_spill_count": 0,
       "splitk": true,
-      "symbol": "opus_gemm_gfx950_splitk_4wave_bf16_ws_256x256x64x64_2x2_16x16x32_0x0x0_tt",
+      "symbol": "opus_gemm_gfx950_splitk_4wave_ws_256x256x64x64_2x2_16x16x32_0x0x0_tt",
       "tile": [
         256,
         64,
@@ -2095,11 +2095,11 @@
       "a_t": false,
       "agpr_count": 0,
       "asm": {
-        "dis": "asm/opus_gemm_gfx950_splitk_4wave_bf16_ws_256x64x256x64_2x2_16x16x32_0x0x0_nn.dis",
-        "s": "asm/opus_gemm_gfx950_splitk_4wave_bf16_ws_256x64x256x64_2x2_16x16x32_0x0x0_nn.s"
+        "dis": "asm/opus_gemm_gfx950_splitk_4wave_ws_256x64x256x64_2x2_16x16x32_0x0x0_nn.dis",
+        "s": "asm/opus_gemm_gfx950_splitk_4wave_ws_256x64x256x64_2x2_16x16x32_0x0x0_nn.s"
       },
       "b_t": true,
-      "co_sha256": "b47d5f4e677feb77168eb75ca9a874080d7fc1b11f6daca6ba9c052e38e20dcd",
+      "co_sha256": "686e3ae98dc4d69a87ad0821af05d909b4a21e8680d5976325611dfccbaee874",
       "device_flags": [],
       "dis_lines": 1263,
       "dis_mfma": 160,
@@ -2121,7 +2121,7 @@
       "sgpr_count": 46,
       "sgpr_spill_count": 0,
       "splitk": true,
-      "symbol": "opus_gemm_gfx950_splitk_4wave_bf16_ws_256x64x256x64_2x2_16x16x32_0x0x0_nn",
+      "symbol": "opus_gemm_gfx950_splitk_4wave_ws_256x64x256x64_2x2_16x16x32_0x0x0_nn",
       "tile": [
         64,
         256,
@@ -2135,11 +2135,11 @@
       "a_t": false,
       "agpr_count": 0,
       "asm": {
-        "dis": "asm/opus_gemm_gfx950_splitk_4wave_bf16_ws_256x64x256x64_2x2_16x16x32_0x0x0_nt.dis",
-        "s": "asm/opus_gemm_gfx950_splitk_4wave_bf16_ws_256x64x256x64_2x2_16x16x32_0x0x0_nt.s"
+        "dis": "asm/opus_gemm_gfx950_splitk_4wave_ws_256x64x256x64_2x2_16x16x32_0x0x0_nt.dis",
+        "s": "asm/opus_gemm_gfx950_splitk_4wave_ws_256x64x256x64_2x2_16x16x32_0x0x0_nt.s"
       },
       "b_t": false,
-      "co_sha256": "03c26405788f9398864346be18ab5937a96505060ec66a0847efe5ff865bb5ff",
+      "co_sha256": "a8629009079e481971a95e9fda7176a9f0e05524496bb40f47d21d8bec10d807",
       "device_flags": [],
       "dis_lines": 1124,
       "dis_mfma": 160,
@@ -2161,7 +2161,7 @@
       "sgpr_count": 45,
       "sgpr_spill_count": 0,
       "splitk": true,
-      "symbol": "opus_gemm_gfx950_splitk_4wave_bf16_ws_256x64x256x64_2x2_16x16x32_0x0x0_nt",
+      "symbol": "opus_gemm_gfx950_splitk_4wave_ws_256x64x256x64_2x2_16x16x32_0x0x0_nt",
       "tile": [
         64,
         256,
@@ -2175,11 +2175,11 @@
       "a_t": true,
       "agpr_count": 0,
       "asm": {
-        "dis": "asm/opus_gemm_gfx950_splitk_4wave_bf16_ws_256x64x256x64_2x2_16x16x32_0x0x0_tn.dis",
-        "s": "asm/opus_gemm_gfx950_splitk_4wave_bf16_ws_256x64x256x64_2x2_16x16x32_0x0x0_tn.s"
+        "dis": "asm/opus_gemm_gfx950_splitk_4wave_ws_256x64x256x64_2x2_16x16x32_0x0x0_tn.dis",
+        "s": "asm/opus_gemm_gfx950_splitk_4wave_ws_256x64x256x64_2x2_16x16x32_0x0x0_tn.s"
       },
       "b_t": true,
-      "co_sha256": "986ec7da8549801c2a4c836903463ebf523e72eaf789951d18dd5ac8248ce47c",
+      "co_sha256": "2b9178797e61d52de7d6dbeaad502b31b68583cffdc7f1bbb862d90efd3f58d5",
       "device_flags": [],
       "dis_lines": 1279,
       "dis_mfma": 160,
@@ -2201,7 +2201,7 @@
       "sgpr_count": 48,
       "sgpr_spill_count": 0,
       "splitk": true,
-      "symbol": "opus_gemm_gfx950_splitk_4wave_bf16_ws_256x64x256x64_2x2_16x16x32_0x0x0_tn",
+      "symbol": "opus_gemm_gfx950_splitk_4wave_ws_256x64x256x64_2x2_16x16x32_0x0x0_tn",
       "tile": [
         64,
         256,
@@ -2215,11 +2215,11 @@
       "a_t": true,
       "agpr_count": 0,
       "asm": {
-        "dis": "asm/opus_gemm_gfx950_splitk_4wave_bf16_ws_256x64x256x64_2x2_16x16x32_0x0x0_tt.dis",
-        "s": "asm/opus_gemm_gfx950_splitk_4wave_bf16_ws_256x64x256x64_2x2_16x16x32_0x0x0_tt.s"
+        "dis": "asm/opus_gemm_gfx950_splitk_4wave_ws_256x64x256x64_2x2_16x16x32_0x0x0_tt.dis",
+        "s": "asm/opus_gemm_gfx950_splitk_4wave_ws_256x64x256x64_2x2_16x16x32_0x0x0_tt.s"
       },
       "b_t": false,
-      "co_sha256": "7a8bca464659bebe1bf060a3ed6fd51fdcb8c64339270db5b9d381ba7f7f0b04",
+      "co_sha256": "7eab6d351d368338c6843fdd81286f87f300e2b77c4757d893a72e53e8e0d1cf",
       "device_flags": [],
       "dis_lines": 1151,
       "dis_mfma": 160,
@@ -2241,7 +2241,7 @@
       "sgpr_count": 47,
       "sgpr_spill_count": 0,
       "splitk": true,
-      "symbol": "opus_gemm_gfx950_splitk_4wave_bf16_ws_256x64x256x64_2x2_16x16x32_0x0x0_tt",
+      "symbol": "opus_gemm_gfx950_splitk_4wave_ws_256x64x256x64_2x2_16x16x32_0x0x0_tt",
       "tile": [
         64,
         256,
@@ -2255,11 +2255,11 @@
       "a_t": false,
       "agpr_count": 0,
       "asm": {
-        "dis": "asm/opus_gemm_gfx950_splitk_4wave_bf16_ws_256x128x64x64_2x2_16x16x32_0x0x0_nn.dis",
-        "s": "asm/opus_gemm_gfx950_splitk_4wave_bf16_ws_256x128x64x64_2x2_16x16x32_0x0x0_nn.s"
+        "dis": "asm/opus_gemm_gfx950_splitk_4wave_ws_256x128x64x64_2x2_16x16x32_0x0x0_nn.dis",
+        "s": "asm/opus_gemm_gfx950_splitk_4wave_ws_256x128x64x64_2x2_16x16x32_0x0x0_nn.s"
       },
       "b_t": true,
-      "co_sha256": "3fbafb0b82fcbcb9634e69c2de25bb0e3c3b128b5390f698faf68b2ca3af9bed",
+      "co_sha256": "629757e3d41ae849fbcadeda873d662eb7b383d78b40e665a90d7f4089f639e9",
       "device_flags": [],
       "dis_lines": 918,
       "dis_mfma": 80,
@@ -2281,7 +2281,7 @@
       "sgpr_count": 47,
       "sgpr_spill_count": 0,
       "splitk": true,
-      "symbol": "opus_gemm_gfx950_splitk_4wave_bf16_ws_256x128x64x64_2x2_16x16x32_0x0x0_nn",
+      "symbol": "opus_gemm_gfx950_splitk_4wave_ws_256x128x64x64_2x2_16x16x32_0x0x0_nn",
       "tile": [
         128,
         64,
@@ -2295,11 +2295,11 @@
       "a_t": false,
       "agpr_count": 0,
       "asm": {
-        "dis": "asm/opus_gemm_gfx950_splitk_4wave_bf16_ws_256x128x64x64_2x2_16x16x32_0x0x0_nt.dis",
-        "s": "asm/opus_gemm_gfx950_splitk_4wave_bf16_ws_256x128x64x64_2x2_16x16x32_0x0x0_nt.s"
+        "dis": "asm/opus_gemm_gfx950_splitk_4wave_ws_256x128x64x64_2x2_16x16x32_0x0x0_nt.dis",
+        "s": "asm/opus_gemm_gfx950_splitk_4wave_ws_256x128x64x64_2x2_16x16x32_0x0x0_nt.s"
       },
       "b_t": false,
-      "co_sha256": "1777c6e330a223c0828d479baf6c2303b74851c06490cf62f0772351c1ceecf6",
+      "co_sha256": "480551c560271b9e5f791af37166721a03233d4d6b17a5d0a43826fc03f7f01b",
       "device_flags": [],
       "dis_lines": 882,
       "dis_mfma": 80,
@@ -2321,7 +2321,7 @@
       "sgpr_count": 44,
       "sgpr_spill_count": 0,
       "splitk": true,
-      "symbol": "opus_gemm_gfx950_splitk_4wave_bf16_ws_256x128x64x64_2x2_16x16x32_0x0x0_nt",
+      "symbol": "opus_gemm_gfx950_splitk_4wave_ws_256x128x64x64_2x2_16x16x32_0x0x0_nt",
       "tile": [
         128,
         64,
@@ -2335,11 +2335,11 @@
       "a_t": true,
       "agpr_count": 0,
       "asm": {
-        "dis": "asm/opus_gemm_gfx950_splitk_4wave_bf16_ws_256x128x64x64_2x2_16x16x32_0x0x0_tn.dis",
-        "s": "asm/opus_gemm_gfx950_splitk_4wave_bf16_ws_256x128x64x64_2x2_16x16x32_0x0x0_tn.s"
+        "dis": "asm/opus_gemm_gfx950_splitk_4wave_ws_256x128x64x64_2x2_16x16x32_0x0x0_tn.dis",
+        "s": "asm/opus_gemm_gfx950_splitk_4wave_ws_256x128x64x64_2x2_16x16x32_0x0x0_tn.s"
       },
       "b_t": true,
-      "co_sha256": "f70b65fb862da82ccc63478ca364b5c9854f3b98db77a614577ad0b9f02a09b7",
+      "co_sha256": "87777fe02972885b45c8c06b90222c78e6730a152034a5be82fa6ae5969cbdfb",
       "device_flags": [],
       "dis_lines": 964,
       "dis_mfma": 80,
@@ -2361,7 +2361,7 @@
       "sgpr_count": 48,
       "sgpr_spill_count": 0,
       "splitk": true,
-      "symbol": "opus_gemm_gfx950_splitk_4wave_bf16_ws_256x128x64x64_2x2_16x16x32_0x0x0_tn",
+      "symbol": "opus_gemm_gfx950_splitk_4wave_ws_256x128x64x64_2x2_16x16x32_0x0x0_tn",
       "tile": [
         128,
         64,
@@ -2375,11 +2375,11 @@
       "a_t": true,
       "agpr_count": 0,
       "asm": {
-        "dis": "asm/opus_gemm_gfx950_splitk_4wave_bf16_ws_256x128x64x64_2x2_16x16x32_0x0x0_tt.dis",
-        "s": "asm/opus_gemm_gfx950_splitk_4wave_bf16_ws_256x128x64x64_2x2_16x16x32_0x0x0_tt.s"
+        "dis": "asm/opus_gemm_gfx950_splitk_4wave_ws_256x128x64x64_2x2_16x16x32_0x0x0_tt.dis",
+        "s": "asm/opus_gemm_gfx950_splitk_4wave_ws_256x128x64x64_2x2_16x16x32_0x0x0_tt.s"
       },
       "b_t": false,
-      "co_sha256": "676644320726706dc9e131f0a533369d2160419414d192bfed19ae4592c66c40",
+      "co_sha256": "e508115ccdf18e66167529ff55aea299cb624606f1b8ecb66f98bd449b41ae15",
       "device_flags": [],
       "dis_lines": 941,
       "dis_mfma": 80,
@@ -2401,7 +2401,7 @@
       "sgpr_count": 46,
       "sgpr_spill_count": 0,
       "splitk": true,
-      "symbol": "opus_gemm_gfx950_splitk_4wave_bf16_ws_256x128x64x64_2x2_16x16x32_0x0x0_tt",
+      "symbol": "opus_gemm_gfx950_splitk_4wave_ws_256x128x64x64_2x2_16x16x32_0x0x0_tt",
       "tile": [
         128,
         64,
@@ -2415,11 +2415,11 @@
       "a_t": false,
       "agpr_count": 0,
       "asm": {
-        "dis": "asm/opus_gemm_gfx950_splitk_4wave_bf16_ws_256x64x128x64_2x2_16x16x32_0x0x0_nn.dis",
-        "s": "asm/opus_gemm_gfx950_splitk_4wave_bf16_ws_256x64x128x64_2x2_16x16x32_0x0x0_nn.s"
+        "dis": "asm/opus_gemm_gfx950_splitk_4wave_ws_256x64x128x64_2x2_16x16x32_0x0x0_nn.dis",
+        "s": "asm/opus_gemm_gfx950_splitk_4wave_ws_256x64x128x64_2x2_16x16x32_0x0x0_nn.s"
       },
       "b_t": true,
-      "co_sha256": "e08850d3afd77a5cc595eaacc3b8e3c6621e1fcafa00ae6932af33f72fd3aa82",
+      "co_sha256": "05f3e991b5c31f969838ac55d2d49275a299add60c72f5f60c584beffe049e06",
       "device_flags": [],
       "dis_lines": 952,
       "dis_mfma": 80,
@@ -2441,7 +2441,7 @@
       "sgpr_count": 46,
       "sgpr_spill_count": 0,
       "splitk": true,
-      "symbol": "opus_gemm_gfx950_splitk_4wave_bf16_ws_256x64x128x64_2x2_16x16x32_0x0x0_nn",
+      "symbol": "opus_gemm_gfx950_splitk_4wave_ws_256x64x128x64_2x2_16x16x32_0x0x0_nn",
       "tile": [
         64,
         128,
@@ -2455,11 +2455,11 @@
       "a_t": false,
       "agpr_count": 0,
       "asm": {
-        "dis": "asm/opus_gemm_gfx950_splitk_4wave_bf16_ws_256x64x128x64_2x2_16x16x32_0x0x0_nt.dis",
-        "s": "asm/opus_gemm_gfx950_splitk_4wave_bf16_ws_256x64x128x64_2x2_16x16x32_0x0x0_nt.s"
+        "dis": "asm/opus_gemm_gfx950_splitk_4wave_ws_256x64x128x64_2x2_16x16x32_0x0x0_nt.dis",
+        "s": "asm/opus_gemm_gfx950_splitk_4wave_ws_256x64x128x64_2x2_16x16x32_0x0x0_nt.s"
       },
       "b_t": false,
-      "co_sha256": "cba3197188f44163abdfd8f6302a1edd22d756961678ccc4cbc5156ac02c4c11",
+      "co_sha256": "02d36c236b275671542b1587fc91080db940b3b61bec8623d4e1cf93991071f1",
       "device_flags": [],
       "dis_lines": 900,
       "dis_mfma": 80,
@@ -2481,7 +2481,7 @@
       "sgpr_count": 46,
       "sgpr_spill_count": 0,
       "splitk": true,
-      "symbol": "opus_gemm_gfx950_splitk_4wave_bf16_ws_256x64x128x64_2x2_16x16x32_0x0x0_nt",
+      "symbol": "opus_gemm_gfx950_splitk_4wave_ws_256x64x128x64_2x2_16x16x32_0x0x0_nt",
       "tile": [
         64,
         128,
@@ -2495,11 +2495,11 @@
       "a_t": true,
       "agpr_count": 0,
       "asm": {
-        "dis": "asm/opus_gemm_gfx950_splitk_4wave_bf16_ws_256x64x128x64_2x2_16x16x32_0x0x0_tn.dis",
-        "s": "asm/opus_gemm_gfx950_splitk_4wave_bf16_ws_256x64x128x64_2x2_16x16x32_0x0x0_tn.s"
+        "dis": "asm/opus_gemm_gfx950_splitk_4wave_ws_256x64x128x64_2x2_16x16x32_0x0x0_tn.dis",
+        "s": "asm/opus_gemm_gfx950_splitk_4wave_ws_256x64x128x64_2x2_16x16x32_0x0x0_tn.s"
       },
       "b_t": true,
-      "co_sha256": "94aeafa0bc20829d0b7ea8a3ab570268353b89d90d5dd25d793bbdb7aefc92fd",
+      "co_sha256": "a104f9e0d659d1414529cb47a93a527c6db7102c6fd5d7ee41614795ff81fc83",
       "device_flags": [],
       "dis_lines": 970,
       "dis_mfma": 80,
@@ -2521,7 +2521,7 @@
       "sgpr_count": 48,
       "sgpr_spill_count": 0,
       "splitk": true,
-      "symbol": "opus_gemm_gfx950_splitk_4wave_bf16_ws_256x64x128x64_2x2_16x16x32_0x0x0_tn",
+      "symbol": "opus_gemm_gfx950_splitk_4wave_ws_256x64x128x64_2x2_16x16x32_0x0x0_tn",
       "tile": [
         64,
         128,
@@ -2535,11 +2535,11 @@
       "a_t": true,
       "agpr_count": 0,
       "asm": {
-        "dis": "asm/opus_gemm_gfx950_splitk_4wave_bf16_ws_256x64x128x64_2x2_16x16x32_0x0x0_tt.dis",
-        "s": "asm/opus_gemm_gfx950_splitk_4wave_bf16_ws_256x64x128x64_2x2_16x16x32_0x0x0_tt.s"
+        "dis": "asm/opus_gemm_gfx950_splitk_4wave_ws_256x64x128x64_2x2_16x16x32_0x0x0_tt.dis",
+        "s": "asm/opus_gemm_gfx950_splitk_4wave_ws_256x64x128x64_2x2_16x16x32_0x0x0_tt.s"
       },
       "b_t": false,
-      "co_sha256": "a6c67fc08d05b9b9e2c09b53289e92cfcb024f80fff42030557fc7249d96adf5",
+      "co_sha256": "d81c30a52acaf1ea305a4a434a7d964dc1c288c5216f3a31c3ec63dff3b79ab6",
       "device_flags": [],
       "dis_lines": 927,
       "dis_mfma": 80,
@@ -2561,7 +2561,7 @@
       "sgpr_count": 47,
       "sgpr_spill_count": 0,
       "splitk": true,
-      "symbol": "opus_gemm_gfx950_splitk_4wave_bf16_ws_256x64x128x64_2x2_16x16x32_0x0x0_tt",
+      "symbol": "opus_gemm_gfx950_splitk_4wave_ws_256x64x128x64_2x2_16x16x32_0x0x0_tt",
       "tile": [
         64,
         128,
