@@ -15,6 +15,7 @@ from aiter.ops.triton.utils.shuffle import shuffle_scale_batched, shuffle_weight
 from aiter.ops.triton.utils.types import e4m3_dtype
 from aiter.test_common import checkAllclose
 from op_tests.triton_tests.quant.test_quant_mxfp4 import (
+    torch_dequant_nvfp4,
     torch_dynamic_mxfp4_quant,
 )
 
@@ -249,6 +250,21 @@ def dynamic_nvfp4_quant_kv_buffer(
     )
 
     return kv_buffer_quant_and_shuffled
+
+
+def dequant_nvfp4_kv_buffer(kv_buffer: torch.Tensor, kv_lora_rank: int):
+    """``[blocks, block_size, heads, d]`` values an NVFP4 cache decodes to.
+
+    The decode reference attends over these, so it sees exactly the values the
+    kernel reads, and any error left is the kernel's own arithmetic.
+    """
+    num_blocks, block_size, num_kv_heads, head_size = kv_buffer.shape
+    rows = kv_buffer.reshape(-1, head_size)
+    out = []
+    for part in (rows[:, :kv_lora_rank], rows[:, kv_lora_rank:]):
+        fp4, scales = torch_dynamic_mxfp4_quant(part.contiguous(), is_nvfp4=True)
+        out.append(torch_dequant_nvfp4(fp4, scales, out_dtype=torch.float32))
+    return torch.cat(out, dim=-1).view(num_blocks, block_size, num_kv_heads, head_size)
 
 
 def ref_masked_attention(
@@ -503,6 +519,88 @@ def test_mla_decode_fwd(
         )
         <= tol_err_ratio
     )
+
+
+@pytest.mark.parametrize("ctx_len", [1, 19, 67, 127, 128, 129, 200, 300, 1328])
+@pytest.mark.parametrize("num_heads", [16, 128])
+@pytest.mark.parametrize("batch_size", [1, 5])
+@pytest.mark.parametrize("decode_qlen", [1, 2])
+@torch.inference_mode()
+def test_mla_decode_fwd_nvfp4_kv_matches_decoded_cache(
+    ctx_len, num_heads, batch_size, decode_qlen
+):
+    """FP8 query against an NVFP4 cache, with unit scales and sharp attention,
+    checked against attention over the values the cache decodes to.
+
+    test_mla_decode_fwd's random descales flatten the softmax and its absolute
+    tolerance exceeds the output, which hid a PV token-order bug; this one
+    bounds the relative error and covers single- and partial-tile contexts.
+    """
+    if DEVICE_ARCH != "gfx1250":
+        pytest.skip("FP4 KV cache requires gfx1250")
+    kv_lora_rank, qk_rope_head_dim, block_size = 512, 64, 128
+    if decode_qlen > 1 and ctx_len % block_size == 1:
+        pytest.xfail(
+            "shared with the FP8 Gluon decode: a query whose context ends on a "
+            "tile edge is fully masked in the next KV segment"
+        )
+    torch.manual_seed(0)
+    head_dim = kv_lora_rank + qk_rope_head_dim
+    ctx_len = max(ctx_len, decode_qlen)
+    blocks_per_seq = (ctx_len + block_size - 1) // block_size
+    num_blocks = batch_size * blocks_per_seq + 3
+    kv = torch.randn(
+        (num_blocks, block_size, 1, head_dim), dtype=torch.bfloat16, device="cuda"
+    )
+    cache = dynamic_nvfp4_quant_kv_buffer(kv, kv_lora_rank)
+    decoded = dequant_nvfp4_kv_buffer(kv, kv_lora_rank)
+    block_tables = (
+        torch.randperm(num_blocks, device="cuda")[: batch_size * blocks_per_seq]
+        .view(batch_size, blocks_per_seq)
+        .to(torch.int32)
+    )
+    q = torch.randn((batch_size * decode_qlen, num_heads, head_dim), device="cuda").to(
+        e4m3_dtype
+    )
+    cu_seqlens_q = torch.arange(
+        0,
+        (batch_size + 1) * decode_qlen,
+        decode_qlen,
+        dtype=torch.int32,
+        device="cuda",
+    )
+    seq_lens = torch.full((batch_size,), ctx_len, dtype=torch.int32, device="cuda")
+    one = torch.ones((1,), dtype=torch.float32, device="cuda")
+    sm_scale = head_dim**-0.5
+    out = torch.empty(
+        (q.shape[0], num_heads, kv_lora_rank), dtype=torch.bfloat16, device="cuda"
+    )
+    mla_decode_fwd(
+        q,
+        cache,
+        out,
+        cu_seqlens_q,
+        seq_lens,
+        ctx_len,
+        block_tables,
+        sm_scale,
+        kv_lora_rank,
+        qk_rope_head_dim,
+        True,
+        one,
+        one,
+        shuffled_kv_cache=True,
+    )
+    ref = []
+    for b in range(batch_size):
+        k = decoded[block_tables[b].long()].reshape(-1, head_dim)[:ctx_len]
+        for i in range(decode_qlen):
+            visible = k[: ctx_len - (decode_qlen - 1 - i)]
+            s = q[b * decode_qlen + i].float() @ visible.T * sm_scale
+            ref.append(torch.softmax(s, dim=-1) @ visible[:, :kv_lora_rank])
+    ref = torch.stack(ref)
+    rel = ((out.float() - ref).norm() / ref.norm()).item()
+    assert rel < 1e-2, f"relative L2 error {rel:.4f}"
 
 
 @pytest.mark.parametrize(
