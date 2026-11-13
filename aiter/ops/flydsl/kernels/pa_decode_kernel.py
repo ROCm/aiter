@@ -281,6 +281,8 @@ def compile_pa_decode_tile(
                 and block_size == 128
                 and trans_v
                 and sliding_window == 0
+                # The FP8 output needs a CTA's tokens whole.
+                and not quant_output
                 else 1
             )
         return compile_gfx1250_pa_decode(
@@ -609,24 +611,12 @@ def compile_gfx1250_pa_decode(
             f"cluster_merge must be in [2, {CLUSTER_PARTITIONS}] and excludes other "
             f"output modes and head_dim > {MERGE_HEAD_DIM}"
         )
-    if quant_output and not (
-        (
-            direct_output
-            and not merge_partitions
-            and query_length == 1
-            and query_splits == 1
-        )
-        or cluster_merge == 8
-    ):
-        raise ValueError("quant_output requires the gfx1250 direct or cluster8 path")
     if quant_output and (
-        query_group_size != 16
-        or head_dim != 128
-        or query_length != 1
-        or block_size != 16
+        not (direct_output or cluster_merge) or merge_partitions or query_splits != 1
     ):
         raise ValueError(
-            "quant_output requires query_length=1, GQA=16, head_dim=128 and page16"
+            "quant_output requires the direct or cluster_merge output and one "
+            "query split"
         )
     if not (store_output or quant_output):
         raise ValueError("store_output=False requires quant_output")
@@ -697,7 +687,13 @@ def compile_gfx1250_pa_decode(
         def zero_output(seq, dst):
             # Empty sequences have no attention mass; clear this CTA's rows.
             if const_expr(t.quant_output):
-                quant.store_zero(seq, sq_row, sq_head)
+                quant.store_empty(
+                    seq * t.query_length,
+                    t.query_length,
+                    fx.Float32(0.0),
+                    sq_row,
+                    sq_head,
+                )
             rows = fx.recast_iter(t.q_dtype, dst)
             tid = fx.Int32(gpu.thread_id("x"))
             stores = -(-t.rows * t.head_dim // t.BLOCK_THREADS) if t.store_output else 0
@@ -720,10 +716,12 @@ def compile_gfx1250_pa_decode(
                     rows[offset] = t.q_dtype(0.0)
 
         def pad_output(row):
-            # A padded token-bucket row past the sequences: FP8 zero bytes and a
-            # unit descale. Called, not inlined, so the runtime branches that
-            # use it do not carry ``quant`` as branch state.
-            quant.store_pad(row, sq_row, sq_head)
+            # A padded token-bucket row past the sequences' tokens: FP8 zero
+            # bytes and a unit descale. Called, not inlined, so the runtime
+            # branches that use it do not carry ``quant`` as branch state.
+            quant.store_empty(
+                row + sequences * t.query_length, 1, fx.Float32(1.0), sq_row, sq_head
+            )
 
         task_slot = fx.Int32(gpu.block_id("x"))
         if const_expr(t.cluster_merge):
@@ -824,7 +822,7 @@ def compile_gfx1250_pa_decode(
                 if block < sequences:
                     zero_output(gpu.block_id("x"), pout)
                 else:
-                    pad_output(block)
+                    pad_output(block - sequences)
             else:
                 zero_output(gpu.block_id("x"), pout)
         if const_expr(t.merge_partitions):
@@ -850,8 +848,8 @@ def compile_gfx1250_pa_decode(
                 merge.run(seq, part, first, count, capacity)
             elif const_expr(t.quant_output):
                 if seq >= sequences:
-                    row = sequences + (seq - sequences) * t.cluster_merge + part
-                    if row < quant_rows:
+                    row = (seq - sequences) * t.cluster_merge + part
+                    if row < quant_rows - sequences * t.query_length:
                         pad_output(row)
                 elif (count == 0) & (part == 0):
                     zero_output(seq, output)
@@ -890,15 +888,15 @@ def compile_gfx1250_pa_decode(
         if const_expr(t.direct_output):
             grid_x = sequences
             if const_expr(t.quant_output):
-                # One CTA per padded FP8 row past the sequences.
-                grid_x = quant_rows
+                # One CTA per padded FP8 row past the sequences' tokens.
+                grid_x = quant_rows - sequences * (t.query_length - 1)
         if const_expr(t.cluster_merge):
             grid_x = sequences * t.cluster_merge
             if const_expr(t.quant_output):
-                # One cluster per 8 padded FP8 rows past the sequences.
+                # One cluster per P padded FP8 rows past the sequences' tokens.
+                pads = quant_rows - sequences * t.query_length
                 grid_x = (
-                    sequences
-                    + (quant_rows - sequences + t.cluster_merge - 1) // t.cluster_merge
+                    sequences + (pads + t.cluster_merge - 1) // t.cluster_merge
                 ) * t.cluster_merge
         pa_decode_tile_kernel(
             work,

@@ -460,14 +460,15 @@ def pa_decode(
     head dimensions must match.
     ALiBi and externally quantized queries are unsupported.
 
-    ``quantized_output`` and ``output_scale`` opt into the MiniMax-M3 sparse
-    output epilogue. They must be supplied together. The epilogue writes OCP
-    FP8 in the same logical layout as ``output`` and one contiguous FP32
-    descale per flattened query token, shape ``[num_seqs * query_length, 1]``;
-    dequantization is ``quantized_output.float() * output_scale``. It is
-    intentionally limited to gfx1250 page16 sparse PA, query_length=1, one KV
-    head, GQA16, head_dim=128, and the direct or cluster8 output modes. Calls
-    that omit both tensors retain the existing output and dispatch unchanged.
+    ``quantized_output`` and ``output_scale`` (gfx1250) add a per-token FP8
+    output. They must be supplied together. It is OCP FP8 in the same logical
+    layout as ``output`` with one contiguous FP32 descale per flattened query
+    token, shape ``[num_seqs * query_length, 1]``; dequantization is
+    ``quantized_output.float() * output_scale``. With one KV head the direct
+    and cluster-merge outputs quantize in the tile kernel's epilogue; other
+    plans run the standalone per-token quant after PA, with identical bytes.
+    Calls that omit both tensors retain the existing output and dispatch
+    unchanged.
     With the quantized output, ``store_output=False`` skips the BF16/FP16
     store: ``output`` then only fixes the layout and its contents are left
     unspecified. ``quantized_pad_rows`` extra rows of ``quantized_output`` and
@@ -637,6 +638,8 @@ def pa_decode(
             )
         if sinks is not None:
             raise NotImplementedError("MXFP4 KV supports no sinks, got sinks")
+        if quant_output:
+            raise NotImplementedError("MXFP4 KV supports no quantized output")
         if compute_type not in (None, torch.uint8, dtypes.fp4x2):
             raise NotImplementedError(
                 "MXFP4 KV takes compute_type None, uint8 or fp4x2, "
@@ -799,19 +802,6 @@ def pa_decode(
     if quant_output:
         if arch != "gfx1250":
             raise NotImplementedError("quantized PA output requires gfx1250")
-        if (
-            query_length != 1
-            or num_kv_heads != 1
-            or query_group_size != 16
-            or head_dim != 128
-            or block_size != 16
-            or sinks is not None
-            or sliding_window != 0
-        ):
-            raise NotImplementedError(
-                "quantized PA output requires query_length=1, one KV head, "
-                "GQA=16, head_dim=128, page16, no sinks and no sliding window"
-            )
         expected_quant_shape = (
             output.shape[0] + quantized_pad_rows,
             *output.shape[1:],
@@ -1071,12 +1061,15 @@ def pa_decode(
         )
         else 0
     )
-    # The quant epilogue exists only in the one-partition direct output and the
-    # cluster-of-8 merge. Any other output mode the plan picks (it depends on the
-    # batch and context) writes the BF16 output as usual and quantizes it after
-    # with the standalone per-token kernel, which is exactly the unfused path.
+    # A token's descale needs the max over all of its values. With one KV head
+    # a CTA, or the cluster merging its tasks, holds every row of its tokens, so
+    # the one-partition direct and the cluster-merge outputs quantize in their
+    # epilogue. More KV heads spread a token over separate CTAs (grid y), and the
+    # last-arriver merge is not fused; those write the BF16 output as usual and
+    # quantize it after with the standalone per-token kernel, which is exactly
+    # the unfused path.
     quant_after_output = quant_output and not (
-        one_partition_output or cluster_merge == 8
+        num_kv_heads == 1 and (one_partition_output or cluster_merge)
     )
     if quant_after_output:
         quant_output = False

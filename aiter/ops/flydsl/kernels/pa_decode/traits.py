@@ -5,6 +5,7 @@
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 
 import flydsl.expr as fx
@@ -1058,13 +1059,15 @@ class Gfx1250Traits:
 
     @property
     def quant_offset(self):
-        # Four wave maxima of the FP8 output epilogue. No loop stage uses
-        # them, so a wave can publish its maximum while others still read P.
+        # Per-wave maxima of the FP8 output epilogue's gcd(GQA, 16)-row units.
+        # No loop stage uses them, so a wave can publish its maxima while
+        # others still read P.
         return self.stats_offset + 576
 
     @property
     def total_bytes(self):
-        return self.quant_offset + (16 if self.quant_output else 0)
+        units = self.m_tiles * 16 // math.gcd(self.query_group_size, 16)
+        return self.quant_offset + (units * self.NWARP * 4 if self.quant_output else 0)
 
     @property
     def use_tdm(self):
