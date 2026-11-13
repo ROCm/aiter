@@ -235,7 +235,7 @@ def _launch_a16w16_gemm(
             "opus_gemm A16W16 expects 2D XQ/WQ/Y; use opus_bmm for "
             "batch-first 3D tensors"
         )
-    _launch_a16w16_route(
+    _execute_a16w16_by_layout(
         XQ.unsqueeze(0),
         WQ.unsqueeze(0),
         Y.unsqueeze(0),
@@ -269,7 +269,7 @@ def _launch_a16w16_bmm(
             "opus_bmm A16W16 expects batch-first 3D XQ/WQ/Y; use "
             "opus_gemm for logical 2D tensors"
         )
-    return _launch_a16w16_route(
+    return _execute_a16w16_by_layout(
         XQ,
         WQ,
         Y,
@@ -284,24 +284,13 @@ def _launch_a16w16_bmm(
 
 
 # ---------------------------------------------------------------------------
-# NT / NN / TT / TN branches of the main flow (gfx950 4-wave kids)
+# NT / NN / TT / TN
 # ---------------------------------------------------------------------------
-# opus_gemm / opus_bmm -> _launch_a16w16_gemm / _bmm -> _launch_a16w16_route:
-# a 4-wave kid serves every direction, so the route picks the branch from the
-# operand strides (batch-first XQ [B,M,K] / WQ [B,N,K]); the C++ launcher then
-# loads the image of that direction. Other a16w16 kids keep the plain path.
+# opus_gemm / opus_bmm -> _launch_a16w16_gemm / _bmm -> _execute_a16w16_by_layout picks the layout from
+# the operand strides (batch-first XQ [B,M,K] / WQ [B,N,K]); each layout checks its own contract, then
+# _execute_a16w16 plans and launches (the gfx950 4-wave launchers load the image of that layout).
 #   NT: XQ (K,1)  WQ (K,1)      NN: XQ (K,1)  WQ (1,N)
 #   TT: XQ (1,M)  WQ (K,1)      TN: XQ (1,M)  WQ (1,N)
-@lru_cache(maxsize=1024)
-def _kid_takes_mn_major_operands(arch: str, cu_num: int, kid: int) -> bool:
-    """Whether exact kid ``kid`` is a gfx950 4-wave kid (NT/NN/TT/TN from strides)."""
-    try:
-        instance = get_kernel_instance(arch, "a16w16", int(kid), cu_num=cu_num)
-    except (TypeError, ValueError):
-        return False
-    return instance is not None and instance.kernel_tag in GFX950_4WAVE_TAGS
-
-
 def _a16w16_operand_transposed(tensor: torch.Tensor) -> bool:
     """True if the [.., rows, K] operand is stored [K, rows] (rows contiguous)."""
     rows, K = tensor.shape[-2:]
@@ -309,40 +298,50 @@ def _a16w16_operand_transposed(tensor: torch.Tensor) -> bool:
     return rows > 1 and stride_row == 1 and not (stride_k == 1 and stride_row >= K)
 
 
-def _launch_a16w16_route(XQ, WQ, Y, bias=None, *, kid, instance=None, **kwargs):
-    if instance is not None:
-        four_wave = instance.kernel_tag in GFX950_4WAVE_TAGS
-    else:
-        arch, cu_num = _device_arch_and_cu(XQ.device)
-        four_wave = _kid_takes_mn_major_operands(arch, cu_num, int(kid))
-    if not four_wave:  # NT-only kids: their launchers do not check strides
-        _check_a16w16_launch_layout(XQ, WQ, Y)
-        return _execute_a16w16(XQ, WQ, Y, bias, kid=kid, instance=instance, **kwargs)
+def _execute_a16w16_by_layout(XQ, WQ, Y, bias=None, **kwargs):
     a_t, b_t = _a16w16_operand_transposed(XQ), _a16w16_operand_transposed(WQ)
-    launch = (
-        (_launch_a16w16_nt, _launch_a16w16_nn),
-        (_launch_a16w16_tt, _launch_a16w16_tn),
+    execute = (
+        (_execute_a16w16_nt, _execute_a16w16_nn),
+        (_execute_a16w16_tt, _execute_a16w16_tn),
     )[a_t][b_t]
-    return launch(XQ, WQ, Y, bias, kid=kid, instance=instance, **kwargs)
+    return execute(XQ, WQ, Y, bias, **kwargs)
 
 
-def _launch_a16w16_nt(XQ, WQ, Y, bias=None, **kwargs):
-    """NT: XQ [B,M,K] stored [M,K], WQ [B,N,K] stored [N,K]."""
+def _require_layout_kid(layout, device, *, kid, instance=None, route_arch=None, route_cu_num=None, **_):
+    """NN / TT / TN need a kid whose launcher takes M/N-contiguous operands (gfx950 4-wave)."""
+    if instance is None:
+        arch, cu_num = route_arch, route_cu_num
+        if arch is None or cu_num is None:
+            arch, cu_num = _device_arch_and_cu(device)
+        instance = get_kernel_instance(arch, "a16w16", int(kid), cu_num=cu_num)
+    if instance is None or instance.kernel_tag not in GFX950_4WAVE_TAGS:
+        raise NotImplementedError(
+            f"opus_gemm_a16w16_launch: {layout} operands need a gfx950 a16w16 4-wave kid "
+            f"(tags {sorted(GFX950_4WAVE_TAGS)}); kid {kid} takes K-contiguous XQ/WQ only"
+        )
+
+
+def _execute_a16w16_nt(XQ, WQ, Y, bias=None, **kwargs):
+    """NT: XQ [B,M,K] stored [M,K], WQ [B,N,K] stored [N,K]; every kid."""
+    _check_a16w16_launch_layout(XQ, WQ, Y)
     return _execute_a16w16(XQ, WQ, Y, bias, **kwargs)
 
 
-def _launch_a16w16_nn(XQ, WQ, Y, bias=None, **kwargs):
+def _execute_a16w16_nn(XQ, WQ, Y, bias=None, **kwargs):
     """NN: XQ stored [M,K], WQ the [N,K] view of a [K,N] weight."""
+    _require_layout_kid("NN", XQ.device, **kwargs)
     return _execute_a16w16(XQ, WQ, Y, bias, **kwargs)
 
 
-def _launch_a16w16_tt(XQ, WQ, Y, bias=None, **kwargs):
+def _execute_a16w16_tt(XQ, WQ, Y, bias=None, **kwargs):
     """TT: XQ the [M,K] view of a [K,M] activation, WQ stored [N,K]."""
+    _require_layout_kid("TT", XQ.device, **kwargs)
     return _execute_a16w16(XQ, WQ, Y, bias, **kwargs)
 
 
-def _launch_a16w16_tn(XQ, WQ, Y, bias=None, **kwargs):
+def _execute_a16w16_tn(XQ, WQ, Y, bias=None, **kwargs):
     """TN: XQ / WQ views of [K,M] / [K,N] storage."""
+    _require_layout_kid("TN", XQ.device, **kwargs)
     return _execute_a16w16(XQ, WQ, Y, bias, **kwargs)
 
 
