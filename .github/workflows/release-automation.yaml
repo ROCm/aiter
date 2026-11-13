@@ -88,6 +88,34 @@ jobs:
           should_run=true
           skip_reason=""
 
+          if [ "${EVENT_NAME}" = "schedule" ]; then
+            active_sunday="2026-11-22"
+            scheduled_date="$(TZ=America/Chicago date +%F)"
+            days_since_active=$(( ( $(date -u -d "${scheduled_date}" +%s) - $(date -u -d "${active_sunday}" +%s) ) / 86400 ))
+            cadence_offset=$(( (days_since_active % 14 + 14) % 14 ))
+
+            if [ "${cadence_offset}" -ne 0 ]; then
+              should_run=false
+              skip_reason="Biweekly release cadence: ${scheduled_date} is not an active release Sunday."
+              {
+                echo "should_run=${should_run}"
+                echo "skip_reason=${skip_reason}"
+                echo "release_tag="
+                echo "release_branch="
+                echo "release_version="
+                echo "release_kind="
+                echo "previous_tag="
+                echo "expected_wheel_count=${EXPECTED_WHEEL_COUNT}"
+              } >> "${GITHUB_OUTPUT}"
+              {
+                echo "## Release Target"
+                echo "- Should run: ${should_run}"
+                echo "- Skip reason: ${skip_reason}"
+              } >> "${GITHUB_STEP_SUMMARY}"
+              exit 0
+            fi
+          fi
+
           git fetch --force --tags origin
           git fetch --force origin '+refs/heads/*:refs/remotes/origin/*'
 

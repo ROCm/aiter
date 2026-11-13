@@ -19,9 +19,9 @@ from .gemm_op_mixed_mxfp import _get_device_gfx_cu
 
 # The mxfp6 (E2M3, per-1x32 blockscale) asm gemm shares the a4w4 kernarg ABI.
 # Its packed operand/scale layouts are produced by the helpers below and must
-# match exactly what the `f6gemm_dmabig_kernel_func` kernel consumes.
-_KERNEL_NAME = "f6gemm_dmabig_kernel_func"
-_SAFE_FALLBACK_KERNEL_NAME = "f6gemm_dmabig_swz0_kernel_func"
+# match exactly what the `_ZN5aiter29f6gemm_bf16_per1x32Fp6_dmabigE` kernel consumes.
+_KERNEL_NAME = "_ZN5aiter29f6gemm_bf16_per1x32Fp6_dmabigE"
+_SAFE_FALLBACK_KERNEL_NAME = "_ZN5aiter34f6gemm_bf16_per1x32Fp6_dmabig_swz0E"
 _TILE = 256
 _K_TILE = 128
 _SCALE_GROUP_SIZE = 32
@@ -1064,6 +1064,39 @@ def _gemm_a6w6_asm(
 ) -> None: ...
 
 
+def _launch_output_row_chunks(launch, A, A_scale, out, padK, a_tile_bytes):
+    """Run ``launch(A, A_scale, out)`` on 256-row output chunks that fit 2 GiB each.
+
+    The kernels address every tensor through a 2 GiB buffer descriptor. The packed
+    A operand and its scales are stored tile-row-major, so each chunk of whole
+    256-row tiles is a contiguous slice of both buffers.
+    """
+    padM, padN = out.shape
+    rows = _MAX_BUFFER_BYTES // (padN * out.element_size()) // _TILE * _TILE
+    if rows <= 0:
+        raise ValueError(
+            "a 256-row output tile exceeds the kernel's 2 GiB address range"
+        )
+    steps = padK // _K_TILE + _PADK
+    a_tile, scale_tile = steps * a_tile_bytes, steps * _SCALE_TILE_BYTES
+    if (
+        A.numel() != (padM // _TILE) * a_tile
+        or A_scale.numel() != (padM // _TILE) * scale_tile
+    ):
+        raise ValueError(
+            "packed A operand and scale buffer sizes must exactly match the launch dimensions"
+        )
+    A, A_scale = A.reshape(-1), A_scale.reshape(-1)
+    for start in range(0, padM, rows):
+        stop = min(start + rows, padM)
+        first, last = start // _TILE, stop // _TILE
+        launch(
+            A[first * a_tile : last * a_tile],
+            A_scale[first * scale_tile : last * scale_tile],
+            out[start:stop],
+        )
+
+
 def gemm_a6w6_asm(
     A: Tensor,
     B: Tensor,
@@ -1080,6 +1113,18 @@ def gemm_a6w6_asm(
         if out.ndim != 2:
             raise ValueError("gemm_a6w6_asm expects a 2D [M, N] output tensor.")
         kernelName = _default_gemm_a6w6_kernel(*out.shape, K)
+    if out.ndim == 2 and out.numel() * out.element_size() > _MAX_BUFFER_BYTES:
+        _launch_output_row_chunks(
+            lambda a, a_scale, o: _gemm_a6w6_asm(
+                a, B, a_scale, B_scale, o, int(K), kernelName, float(alpha)
+            ),
+            A,
+            A_scale,
+            out,
+            int(K),
+            _PACKED_TILE_BYTES,
+        )
+        return out
     _gemm_a6w6_asm(
         A,
         B,
