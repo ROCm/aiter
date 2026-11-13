@@ -331,6 +331,7 @@ def _process_token(
 
 _NI = 16 * 128 // 64 // 2
 _N = gl.constexpr(_NI)
+_HAS_INLINE_ASM = gl.constexpr(hasattr(gl, "inline_asm"))
 
 
 # Keep whole-line stores in one block. Wait for their SGPR and VGPR operands before reuse.
@@ -448,7 +449,10 @@ def _writeback_rows(
         pair = (Sb.to(gl.uint32, bitcast=True).to(gl.uint64) << 32) | Sa.to(
             gl.uint32, bitcast=True
         ).to(gl.uint64)
-        _store_lines(pair, oa, s_p + c * CS * K, _N)
+        if _HAS_INLINE_ASM:
+            _store_lines(pair, oa, s_p + c * CS * K, _N)
+        else:
+            gl.store(s_p + c * CS * K + off_s, S)
         osm.slice(c * CH, CH).store(o)
         if c + 1 < NC:
             S = gl.amd.gfx1250.buffer_load(s_p + (c + 1) * CS * K, off_s)

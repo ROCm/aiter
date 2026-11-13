@@ -1,6 +1,9 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
 
+import importlib.util
+import sys
+
 import pytest
 import torch
 
@@ -98,6 +101,38 @@ def test_writeback_decode(tokens, padded, steps, monkeypatch):
     assert len(selected) == steps and all(
         selected
     ), "the public wrapper must select write-back decode"
+
+
+def test_writeback_without_inline_asm(monkeypatch):
+    from triton.experimental.gluon import language as gl
+
+    from aiter.ops.triton._gluon_kernels.gfx1250.attention import kda_decode
+    from aiter.ops.triton.attention import kda_writeback
+
+    monkeypatch.delattr(gl, "inline_asm", raising=False)
+    spec = importlib.util.spec_from_file_location(
+        "_aiter_test_kda_without_inline_asm", kda_decode.__file__
+    )
+    module = importlib.util.module_from_spec(spec)
+    monkeypatch.setitem(sys.modules, spec.name, module)
+    spec.loader.exec_module(module)
+    assert not module._HAS_INLINE_ASM.value
+    monkeypatch.setattr(kda_writeback, "kernel", module.kda_writeback_decode_kernel)
+    monkeypatch.setattr(kda_writeback, "_launcher", None)
+
+    torch.manual_seed(42)
+    inputs = make_writeback_inputs(8, padded=True)
+    expected_state = inputs["initial_state"].clone()
+    expected_out = inputs["out"].clone()
+    for step in range(3):
+        if step:
+            for name in ("q", "k", "v", "g", "beta"):
+                inputs[name].normal_()
+        reference_step(inputs, expected_state, expected_out)
+        out, state = run_writeback(inputs)
+        assert kda_writeback._launcher is not None
+        torch.testing.assert_close(out, expected_out, atol=2e-3, rtol=2e-2)
+        torch.testing.assert_close(state, expected_state, atol=1e-5, rtol=1e-4)
 
 
 def test_writeback_empty_and_negative_slots():
