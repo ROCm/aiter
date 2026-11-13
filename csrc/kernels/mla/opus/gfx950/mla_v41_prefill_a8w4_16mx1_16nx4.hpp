@@ -367,7 +367,7 @@ __device__ __attribute__((always_inline)) void attn_pv(
     __builtin_amdgcn_s_barrier();
 }
 
-// Prefix QK runs in bf16 with lane (r = lane % 16, g = lane / 16) holding 32-dim chunks c = 4i + g of row r for both
+// The prefix QK runs in bf16: lane (r = lane % 16, g = lane / 16) holds the 32-dim chunks c = 4i + g of row r of both
 // Q and K, so step 4i + t of the 16x16x32 MFMA takes dims 32c + 8t + [0, 8).
 
 template<class T>
@@ -483,12 +483,11 @@ __device__ __attribute__((always_inline)) void attention(
     const u32_t scale_sh0 = 8 * (kblk / 2);
     const u32_t scale_sh1 = scale_sh0 + 16;
 
-    auto u_rk_fp4 = make_layout_rk_fp4<T>(0);
-
     // K rows and their scales are loaded a tile ahead, the page index two. A prefix row load is one address per page
-    // (the lane's bytes of chunk 0) plus an immediate per chunk.
+    // (the lane's bytes of chunk 0, so the layout is lane 0's) plus an immediate per chunk.
     const auto* p_ext = reinterpret_cast<const D_ATTN*>(ext.kv);
     const auto* p_pre = reinterpret_cast<const D_ATTN*>(pre.kv);
+    const auto u_rk_fp4 = make_layout_rk_fp4<T>(0);
     decltype(global_load<T::VEC_KV>(p_ext, u_rk)) v_k;
     decltype(global_load<T::D_SCALE_SIZE>(p_ext, 0)) v_scl;
     decltype(global_load<T::VEC_KV>(p_pre, u_rk_fp4)) v_k_fp4;
@@ -499,7 +498,7 @@ __device__ __attribute__((always_inline)) void attention(
             reinterpret_cast<const D_ATTN*>(ext.kv_scale) + static_cast<int64_t>(page) * ext.stride_kv_scale, 0);
     };
     auto load_pre_k = [&](int page) {
-        v_k_fp4   = global_load<T::VEC_KV>(p_pre + (lane_id / T::W_N) * (T::PREFIX_CHUNK / 2)
+        v_k_fp4   = global_load<T::VEC_KV>(p_pre + kblk * (T::PREFIX_CHUNK / 2)
                                            + static_cast<int64_t>(page) * pre.stride_kv, u_rk_fp4);
         v_scl_fp4 = global_load<T::D_PREFIX_SCALE_SIZE>(
             reinterpret_cast<const D_ATTN*>(pre.kv_scale) + static_cast<int64_t>(page) * pre.stride_kv_scale, 0);
@@ -554,12 +553,11 @@ __device__ __attribute__((always_inline)) void attention(
         softmax_pv(ext.len, tile_idx);
     };
 
-    const int g = lane_id / T::W_M;
     if (ext_tiles > 0) {
         const int page0 = kv_page;
         kv_page = load_kv_page<T>(seg(1), 1, warp_id, lane_id);
         load_ext_k(page0);
-        const auto v_q    = read_q_smem<T>(smem_q, lane_id, g, 4 + g);
+        const auto v_q    = read_q_smem<T>(smem_q, lane_id, kblk, 4 + kblk);
         const int scale_q = read_q_scale_smem<T>(smem_q, lane_id);
         if constexpr (TWO) {
             for (int tile_idx = 0; tile_idx + 1 < ext_tiles; ++tile_idx) ext_stage(v_q, scale_q, tile_idx, false_type{});
@@ -578,13 +576,13 @@ __device__ __attribute__((always_inline)) void attention(
             number<T::W_M>{}, number<T::W_N>{}, number<T::W_K_QK_PREFIX>{}, mfma_adaptor_swap_ab{});
         const auto sk_chunk_offs = layout_to_offsets<T::VEC_KV>(make_layout_sk_chunk<T>(warp_id, lane_id));
         const u32_t pre_scale_sel = (2 * kblk) * 0x0101u | (2 * kblk + 1) * 0x01010000u;
-        const auto v_qb = dequant_q_bf16<T>(read_q_smem<T>(smem_q, lane_id, 2 * g, 2 * g + 1),
+        const auto v_qb = dequant_q_bf16<T>(read_q_smem<T>(smem_q, lane_id, 2 * kblk, 2 * kblk + 1),
                                             read_q_scale_smem<T>(smem_q, lane_id));
         auto pre_stage = [&](int tile_idx) {
             const int next_page = kv_page;
             kv_page = load_kv_page<T>(pre_rows, tile_idx + 2, warp_id, lane_id);
 
-            // ──── Per chunk: dequantize K, GEMM0 S += Q·Kᵀ (bf16), stage it in the V tile ────
+            // ──── Per chunk: dequantize K, S += Q·Kᵀ (bf16), store K as the V tile ────
             constexpr index_t k_step = vector_traits<typename decltype(mfma_pre)::vtype_a>::size();
             constexpr int STEPS  = T::PREFIX_CHUNK / k_step;
             constexpr int PIECES = T::PREFIX_CHUNK / T::VEC_KV;
