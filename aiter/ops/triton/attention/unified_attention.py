@@ -429,6 +429,15 @@ def use_2d_kernel(params: _UAParams, backend: str = "triton"):
     )
 
 
+def _deterministic_use_2d(params: _UAParams, backend: str):
+    # The gluon 3d kernel run unsplit (gfx950's decode grid; gfx1250's 3d kernel,
+    # which has no sliding-window carve), else the 2d kernel: chosen by arch,
+    # shapes and dtypes only, and neither splits the KV range.
+    if not is_3d_gluon_available(params, backend):
+        return True
+    return IS_DEVICE_ARCH_GFX12 and params.sliding_window > 0
+
+
 def unified_attention(
     q,
     k,
@@ -673,11 +682,7 @@ def unified_attention(
     )
 
     if deterministic:
-        # The gfx950 gluon kernel's decode grid, else the 2d kernel: chosen by
-        # arch, shapes and dtypes only, and neither splits the KV range.
-        use_2d = not (
-            DEVICE_ARCH == "gfx950" and is_3d_gluon_available(params, backend)
-        )
+        use_2d = _deterministic_use_2d(params, backend)
     else:
         use_2d = use_2d_kernel(params, backend)
 
@@ -736,7 +741,7 @@ def unified_attention(
             # and a sequence's split boundaries follow the split count.
             NUM_SEGMENTS = 1
         segm_tiles = None
-        if use_gluon_3d and DEVICE_ARCH == "gfx1250":
+        if use_gluon_3d and DEVICE_ARCH == "gfx1250" and not deterministic:
             NUM_SEGMENTS, segm_tiles = _gfx12_split_rebalance(params, CONFIG_TILE_SIZE)
         # The triton kernels read a shuffled tile as one contiguous page, so
         # there the tile is the page. The gfx950 gluon loader gathers per token

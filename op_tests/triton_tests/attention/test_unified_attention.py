@@ -2416,7 +2416,15 @@ def test_unified_attn_split_rebalance_reduce_configs_k4v8(
 
 
 def _decode_batch(
-    reqs, key_cache, value_cache, window_size, sinks, kv_descale, backend, deterministic
+    reqs,
+    key_cache,
+    value_cache,
+    window_size,
+    sinks,
+    kv_descale,
+    shuffled_kv_cache,
+    backend,
+    deterministic,
 ):
     """Decode one query token per request; each request owns its block-table row."""
     device = key_cache.device
@@ -2446,6 +2454,7 @@ def _decode_batch(
         k_descale=kv_descale,
         v_descale=kv_descale,
         sinks=sinks,
+        shuffled_kv_cache=shuffled_kv_cache,
         backend=backend,
         deterministic=deterministic,
     )
@@ -2461,12 +2470,22 @@ def _decode_batch(
         ((8, 1), 256, None, False),
     ],
 )
-@pytest.mark.parametrize("block_size", [1, 16])
+# A shuffled cache takes the gluon 3d kernel on gfx1250 as well as on gfx950.
+@pytest.mark.parametrize(
+    "block_size,shuffled_kv_cache", [(1, False), (16, False), (64, True)]
+)
 @pytest.mark.parametrize("dtype", [torch.bfloat16, e4m3_dtype])
 @pytest.mark.parametrize("backend", ["triton", "gluon"])
 @torch.inference_mode()
 def test_triton_unified_attn_deterministic_decode(
-    num_heads, head_size, sliding_window, use_sinks, block_size, dtype, backend
+    num_heads,
+    head_size,
+    sliding_window,
+    use_sinks,
+    block_size,
+    shuffled_kv_cache,
+    dtype,
+    backend,
 ) -> None:
     """With deterministic=True a request decodes to the same bits in any batch.
 
@@ -2476,6 +2495,8 @@ def test_triton_unified_attn_deterministic_decode(
     """
     if backend == "gluon" and not _is_gluon_available():
         pytest.skip(f"skip gluon backend, not available on {DEVICE_ARCH}")
+    if shuffled_kv_cache and backend != "gluon":
+        pytest.skip("a shuffled cache is tested on the gluon kernels")
     rng = random.Random(0)
     torch.manual_seed(0)
     device = "cuda"
@@ -2488,6 +2509,8 @@ def test_triton_unified_attn_deterministic_decode(
     value_cache = torch.randn(
         num_blocks, block_size, num_kv_heads, head_size, device=device
     ).to(dtype)
+    if shuffled_kv_cache:
+        key_cache, value_cache = shuffle_kv_cache(key_cache, value_cache)
     kv_descale = (
         None
         if dtype == torch.bfloat16
@@ -2518,6 +2541,7 @@ def test_triton_unified_attn_deterministic_decode(
             window_size,
             sinks,
             kv_descale,
+            shuffled_kv_cache,
             backend,
             deterministic,
         )
