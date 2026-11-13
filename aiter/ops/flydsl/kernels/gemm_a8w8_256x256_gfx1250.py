@@ -725,15 +725,17 @@ def launch_gemm_a8w8_256x256(
         lds_load_b128, _ = make_lds_copy_ops(128)
 
         DS_PER_FRAG = 4  # ds_load_b128 per 16-dword fragment
-        # Soft-pipe WAR: 256 / half=4 / short-K (class 0) only. Mid/long K
-        # stay on `_quad` with a4w4 hints + spaced producers (class-1 WAR and
-        # per-burst beats on the WAR path both regressed).
+        # Soft-pipe WAR: non-mx 256 / half=4 / short-K (class 0) only.
+        # mx32 gemm-request short-K (e.g. K=1280) measures faster on plain
+        # `_quad`; ASM_PIPE beats / WAR both regress there. Mid/long K keep
+        # a4w4 hints via ASM_PIPE_ACTIVE (class >= 1).
+        ASM_PIPE_ACTIVE = const_expr(ENABLE_ASM_PIPE and k_tiles_class > 0)
         WAR_SCHED = const_expr(
             tile_m == 256
             and half_m == 4
             and half_n == 4
             and k_tiles_class == 0
-            and (not mx32 or ENABLE_ASM_PIPE)
+            and not mx32
         )
 
         def _asm_sched_hint(n_ds_bursts):
@@ -748,7 +750,7 @@ def launch_gemm_a8w8_256x256(
             rocdl.sched_mfma(1)
             rocdl.sched_dsrd(DS_PER_FRAG)
 
-        if const_expr(ENABLE_ASM_PIPE):
+        if const_expr(ASM_PIPE_ACTIVE):
             WAR_Q0, WAR_Q1, WAR_Q2, WAR_Q3 = (4, 15), (0, 15), (4, 15), (3, 15)
         else:
             WAR_Q0, WAR_Q1, WAR_Q2, WAR_Q3 = (4, 15), (0, 11), (4, 11), (3, 10)
@@ -949,7 +951,7 @@ def launch_gemm_a8w8_256x256(
                 if const_expr(pre is not None):
                     pre()
                 # a4w4: delimit the quadrant as one sched region.
-                if const_expr(ENABLE_ASM_PIPE):
+                if const_expr(ASM_PIPE_ACTIVE):
                     rocdl.sched_barrier(0)
                 lead_positions = sorted(produce)
                 n_lead = len(lead_positions)
@@ -970,10 +972,10 @@ def launch_gemm_a8w8_256x256(
                         produce[pos]()
                         # Per-producer ASM beat so RA sees 1 WMMA : 4 ds_load
                         # locally, not only at the closing hint.
-                        if const_expr(ENABLE_ASM_PIPE):
+                        if const_expr(ASM_PIPE_ACTIVE):
                             _asm_beat()
                     if const_expr(pos == last and n_lead):
-                        if const_expr(ENABLE_ASM_PIPE):
+                        if const_expr(ASM_PIPE_ACTIVE):
                             _asm_sched_hint(max(0, n_lead - 1))
                         else:
                             for _ in range_constexpr(2 * n_lead):
@@ -1135,7 +1137,7 @@ def launch_gemm_a8w8_256x256(
                     # ASM: ~4× ds_load_b128 per WMMA as one burst. Park bursts
                     # on spaced MMA slots in [lo, hi]; closing hint asks RA for
                     # 1 WMMA : 4 ds_load interleave.
-                    if const_expr(ENABLE_ASM_PIPE):
+                    if const_expr(ASM_PIPE_ACTIVE):
                         n = len(thunks)
                         n_bursts = (n + DS_PER_FRAG - 1) // DS_PER_FRAG
                         span = hi - lo + 1
@@ -1179,7 +1181,7 @@ def launch_gemm_a8w8_256x256(
                     last_lead = lead_positions[-1] if n_lead else -1
                     # Delimit a sched region so `_asm_sched_hint` can partition
                     # WMMA vs ds_load inside this quadrant (a4w4 pattern).
-                    if const_expr(ENABLE_ASM_PIPE):
+                    if const_expr(ASM_PIPE_ACTIVE):
                         rocdl.sched_barrier(0)
                     for pos in range_constexpr(len(order)):
                         i, j = order[pos]
@@ -1189,10 +1191,10 @@ def launch_gemm_a8w8_256x256(
                         for t in loads.get(pos, []):
                             t()
                         # Closing a4w4-style region hint after the last producer.
-                        if const_expr(ENABLE_ASM_PIPE and pos == last_lead and n_lead):
+                        if const_expr(ASM_PIPE_ACTIVE and pos == last_lead and n_lead):
                             _asm_sched_hint(max(0, n_lead - 1))
                         elif const_expr(
-                            (not ENABLE_ASM_PIPE) and pos >= free - 1
+                            (not ASM_PIPE_ACTIVE) and pos >= free - 1
                         ):
                             rocdl.sched_barrier(0)
 
@@ -1332,7 +1334,7 @@ def launch_gemm_a8w8_256x256(
             sched_fence = lambda: rocdl.sched_barrier(0)
             # WAR gap before producing the next half (256 / half=4 only;
             # half=2 start=2 regressed N=1792).
-            q0_start = 4 if const_expr(ENABLE_ASM_PIPE and half_m == 4) else 0
+            q0_start = 4 if const_expr(ASM_PIPE_ACTIVE and half_m == 4) else 0
             q1_fast = const_expr(parity == 0 if mx32 else parity == 1)
             if const_expr(parity == 0):
                 # (A0,B0) -> (A0,B1) -> (A1,B1) -> (A1,B0); produce b1 then a1.
