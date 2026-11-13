@@ -458,6 +458,8 @@ def torch_mla_extend(
     os = []
     lses = []
     for i in range(bs):
+        if qs[i].shape[0] == 0:
+            continue
         cur_num_page = kvs[i].shape[0]
         real_kv_seq_len = (cur_num_page - 1) * page_size + kv_last_page_lens.tolist()[i]
         kvc = kvs[i].flatten(0, 1)[:real_kv_seq_len,]
@@ -635,6 +637,7 @@ def torch_mla_extend_split_kv(
         *plan_dtypes,
         fast_mode=fast_mode,
         intra_batch_mode=intra_batch_mode,
+        page_size=page_size,
     ).fold_factor
     if fold_factor > 1:
         # mla_decode_fwd views qo as (total_s * fold_factor, nheads // fold_factor)
@@ -667,6 +670,8 @@ def torch_mla_extend_split_kv(
         partial_qo_loc = row[1].item()
         qo_start = row[2].item()
         qo_end = row[3].item()
+        if qo_start == qo_end:
+            continue
         kv_start = row[4].item()
         # kv_end = row[5].item()
         kv_offset = row[6].item()
@@ -1106,10 +1111,16 @@ def _make_mla_metadata(
     causal=True,
     is_cp_round_robin=False,
     metadata_mode=None,
+    kv_granularity=None,
 ):
     if metadata_mode is None:
         metadata_mode = "v1_0" if non_persistent_mode else "fast"
     fast_mode, intra_batch_mode = MLA_METADATA_MODES[metadata_mode]
+    if kv_granularity is None:
+        kv_granularity = max(
+            page_size,
+            32 if nhead == 64 and dtype == dtypes.fp8 and kvtype == dtypes.fp8 else 16,
+        )
     names = (
         "work_meta_data",
         "work_indptr",
@@ -1147,10 +1158,7 @@ def _make_mla_metadata(
         metadata["reduce_final_map"],
         metadata["reduce_partial_map"],
         page_size=page_size,
-        kv_granularity=max(
-            page_size,
-            32 if nhead == 64 and dtype == dtypes.fp8 and kvtype == dtypes.fp8 else 16,
-        ),
+        kv_granularity=kv_granularity,
         max_seqlen_qo=int(max_seqlen_qo),
         uni_seqlen_qo=decode_qlen,
         fast_mode=fast_mode,
@@ -1184,6 +1192,8 @@ def test_mla(
     return_lse,
     causal,
     metadata_mode=None,
+    kv_granularity=None,
+    pad_batches=0,
 ):
     ret = {}
 
@@ -1219,6 +1229,12 @@ def test_mla(
             kv_last_page_lens.fill_(page_size)
         else:
             kv_last_page_lens.fill_(ctx_lens % page_size)
+
+    # Trailing CUDA-graph padding rows: no queries and no KV.
+    num_real = batch_size - pad_batches
+    seq_lens_kv[num_real:] = 0
+    kv_block_nums[num_real:] = 0
+    kv_last_page_lens[num_real:] = page_size
 
     kv_indptr[1 : batch_size + 1] = torch.cumsum(kv_block_nums, dim=0)
     num_page = kv_indptr[-1].item()
@@ -1264,6 +1280,7 @@ def test_mla(
     # if nhead == 16 and decode_qlen != 1:
     #     return
     seq_lens_qo.fill_(decode_qlen)
+    seq_lens_qo[num_real:] = 0
 
     max_seqlen_qo = seq_lens_qo.max().item()
     qo_indptr[1 : batch_size + 1] = torch.cumsum(seq_lens_qo, dim=0)
@@ -1318,10 +1335,11 @@ def test_mla(
         kvtype,
         page_size,
         max_seqlen_qo,
-        decode_qlen,
+        decode_qlen if pad_batches == 0 else -1,
         max_split_per_batch,
         causal=causal,
         metadata_mode=metadata_mode,
+        kv_granularity=kv_granularity,
     )
     work_meta_data = metadata["work_meta_data"]
     work_indptr = metadata["work_indptr"]
@@ -1683,18 +1701,24 @@ def test_mla(
                 )
             )
 
-            checkAllclose(
+            split_err = checkAllclose(
                 split_out_ref,
                 out_asm,
                 msg=f"mla_decode-absorb_fp8    [golden fp8 split_out_ref vs aiter_asm]: {us_asm_decode:>8.2f} us......",
             )
+            # Enforce the gfx942 QH64 regression; retain warning-only checks for
+            # unrelated shapes with pre-existing short-context FP8 mismatches.
+            if nhead == 64 and get_gfx() == "gfx942":
+                assert split_err < 0.05
 
             if partial_out_ref.shape[0] > 0:
-                checkAllclose(
+                partial_err = checkAllclose(
                     partial_out_ref,
                     attn_logits[: partial_out_ref.shape[0]].flatten(0, 1),
                     msg=f"mla_decode-absorb_fp8    [partial_out_ref vs attn_logits]: {us_asm_decode:>8.2f} us......",
                 )
+                if nhead == 64 and get_gfx() == "gfx942":
+                    assert partial_err < 0.05
 
         cal_diff(out_ref, out_asm, "out", True)
         return err, us_asm_decode
@@ -1920,6 +1944,127 @@ def test_mla(
     ret["decode:TB/s"] = bytes / us_asm_decode / 1e6
 
     return ret
+
+
+def test_mla_v1_0_kv_tail():
+    # v1_0 folds a 1-4 key tail into the previous split. gfx942 plans 16 splits per
+    # row, so 17-20 keys end in one split at granularity 16; gfx950 plans
+    # seqlen // 196 splits, so 513-516 keys do at granularity 256. 16 and 512 keep
+    # their split count and are the controls.
+    gfx = get_gfx()
+    if gfx == "gfx942":
+        kv_granularity, ctx_lens = 16, [16, 17, 18, 19, 20]
+    elif gfx == "gfx950":
+        kv_granularity, ctx_lens = 256, [512, 513, 514, 515, 516]
+    else:
+        return
+    bad = {}
+    for ctx_len in ctx_lens:
+        ret = test_mla(
+            ctx_lens=ctx_len,
+            batch_size=1,
+            nhead=16,
+            kv_lora_rank=512,
+            qk_nope_head_dim=512,
+            qk_rope_head_dim=64,
+            v_head_dim=512,
+            dtype=dtypes.bf16,
+            kvtype=dtypes.bf16,
+            page_size=1,
+            varlen=False,
+            decode_qlen=1,
+            max_split_per_batch=32,
+            non_persistent_mode=True,
+            paged_layout="LEGACY",
+            scale_dim=16,
+            return_lse=False,
+            causal=True,
+            metadata_mode="v1_0",
+            kv_granularity=kv_granularity,
+        )
+        if ret["decode:err"] > 0.05:
+            bad[ctx_len] = ret["decode:err"]
+    assert not bad, (
+        f"v1_0 decode mismatches the reference at kv_granularity {kv_granularity}: "
+        + ", ".join(f"ctx_len {k} on {v:.1%} of outputs" for k, v in bad.items())
+    )
+
+
+def check_fp8_gqa16_multi_tile_batch(
+    decode_qlen: int, persistent: bool = True, return_lse: bool = False
+) -> None:
+    """gfx950 fp8 gqa16 decode with 128 rows of 3 KV tiles each.
+    The waves of a workgroup share Q, K, V and softmax data through LDS. A
+    missing s_barrier or s_waitcnt gives wrong rows only under load, so every
+    call runs a full batch next to a copy on a side stream."""
+    nhead, kv_lora_rank, qk_head_dim, num_kv = 16, 512, 576, 1 << 20
+    batch_size, sm_scale = 128, 1.0 / 16
+    one = torch.ones(1, dtype=torch.float)
+    kv_buffer = torch.randn((num_kv, qk_head_dim)).to(dtypes.fp8)
+    copy_src, copy_dst = torch.zeros(64 << 20), torch.empty(64 << 20)
+    side_stream = torch.cuda.Stream()
+    qo_indptr = torch.arange(batch_size + 1, dtype=torch.int) * decode_qlen
+    kv_last_page_lens = torch.ones(batch_size, dtype=torch.int)
+    num_bad = 0
+    for kv_len in range(257, 385, 2):
+        kv_indptr = torch.arange(batch_size + 1, dtype=torch.int) * kv_len
+        kv_indices = torch.randint(0, num_kv, (batch_size * kv_len,), dtype=torch.int)
+        q = torch.randn((batch_size * decode_qlen, nhead, qk_head_dim)) * 3
+        q = q.to(dtypes.fp8)
+        out = torch.empty(
+            (batch_size * decode_qlen, nhead, kv_lora_rank), dtype=torch.bfloat16
+        )
+        if persistent:
+            splits = _make_mla_metadata(
+                qo_indptr,
+                kv_indptr,
+                kv_last_page_lens,
+                nhead,
+                1,
+                dtypes.fp8,
+                dtypes.fp8,
+                1,
+                decode_qlen,
+                decode_qlen,
+                1,
+            )
+        else:
+            splits = {
+                "num_kv_splits": 1,
+                "num_kv_splits_indptr": torch.arange(batch_size + 1, dtype=torch.int),
+            }
+        side_stream.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(side_stream):
+            for _ in range(4):
+                copy_dst.copy_(copy_src)
+        aiter.mla.mla_decode_fwd(
+            q,
+            kv_buffer.view(-1, 1, 1, qk_head_dim),
+            out,
+            qo_indptr,
+            kv_indptr,
+            kv_indices,
+            kv_last_page_lens,
+            decode_qlen,
+            sm_scale=sm_scale,
+            q_scale=one,
+            kv_scale=one,
+            return_lse=return_lse,
+            **splits,
+        )
+        torch.cuda.current_stream().wait_stream(side_stream)
+        k = kv_buffer[kv_indices.long()].float().view(batch_size, kv_len, -1)
+        q = q.float().view(batch_size, decode_qlen, nhead, -1)
+        s = torch.einsum("bqhd,bkd->bqhk", q, k) * sm_scale
+        last = kv_len - decode_qlen + torch.arange(decode_qlen).view(1, -1, 1, 1)
+        s = s.masked_fill(torch.arange(kv_len) > last, float("-inf"))
+        ref = torch.softmax(s, -1) @ k[:, None, :, :kv_lora_rank]
+        err = (out.float().view_as(ref) - ref).abs().amax(-1)
+        num_bad += int((err > 0.1 * ref.abs().amax(-1)).sum())
+    assert num_bad == 0, (
+        f"qlen {decode_qlen}, persistent {persistent}, lse {return_lse}: "
+        f"{num_bad} wrong (row, query, head) outputs"
+    )
 
 
 _HEADS = 16
@@ -2215,7 +2360,7 @@ parser.add_argument(
     type=dtypes.str2tuple,
     nargs="*",
     const=None,
-    default=[(16, 1), (16, 2), (16, 4), (48, 1), (128, 2)],
+    default=[(16, 1), (16, 2), (16, 4), (48, 1), (64, 1), (128, 2)],
     help="""Number of heads.
     e.g.: -n 16,1""",
 )
@@ -2287,6 +2432,16 @@ parser.add_argument(
     e.g.: --no-causal""",
 )
 parser.add_argument(
+    "-pad",
+    "--pad_batches",
+    type=int,
+    nargs="*",
+    default=[0],
+    help="""trailing CUDA-graph padding rows (no queries, no KV) per batch.
+    Non-zero runs the planner with uni_seqlen_qo=-1. Default: 0.
+    e.g.: -pad 0 1""",
+)
+parser.add_argument(
     "--softmax-underflow",
     action="store_true",
     help="Run gfx950 FP8 persistent/LSE/CP uniform/long-tail checks (KV=2048, split=1).",
@@ -2334,14 +2489,16 @@ def main():
             ctx_len,
             batch_size,
             max_split_per_batch,
+            pad_batches,
         ) in itertools.product(
             args.dtype,
             args.kv_dtype,
             args.ctxLen,
             args.batchSize,
             args.max_split_per_batch,
+            args.pad_batches,
         ):
-            if check_support(dtype, kvtype, nhead):
+            if check_support(dtype, kvtype, nhead) and pad_batches < batch_size:
                 ret = test_mla(
                     ctx_len,
                     batch_size,
@@ -2363,6 +2520,7 @@ def main():
                     causal=args.causal,
                     metadata_mode=args.metadata_mode
                     or ("v1_0" if args.non_persistent_mode else "fast"),
+                    pad_batches=pad_batches,
                 )
                 df.append(ret)
         df = pd.DataFrame(df)
@@ -2370,6 +2528,12 @@ def main():
         aiter.logger.info("mla_persistent summary (markdown):\n%s", df_md)
     check_fold_seqlen_indptr_cuda_graph_capture()
     aiter.logger.info("_fold_seqlen_indptr cuda-graph capture: passed")
+    test_mla_v1_0_kv_tail()
+    aiter.logger.info("v1_0 KV tail end-to-end: passed")
+    if get_gfx() == "gfx950":
+        check_fp8_gqa16_multi_tile_batch(1)
+        check_fp8_gqa16_multi_tile_batch(1, return_lse=True)
+        aiter.logger.info("fp8 gqa16 qlen 1 multi-tile batch: passed")
     return df if args.nhead else None
 
 

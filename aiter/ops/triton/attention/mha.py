@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
+import functools
 import math
 import os
 import warnings
@@ -10,15 +11,24 @@ import torch
 import triton
 import triton.language as tl
 from packaging.version import Version
+from triton.experimental.gluon import language as gl
 
+from aiter.ops.triton._gluon_kernels.gfx950.attention.mha import (
+    _MIN_PIPE_BLOCKS as _GLUON_MIN_PIPE_BLOCKS,
+)
 from aiter.ops.triton._gluon_kernels.gfx950.attention.mha import (
     _attn_fwd as _gluon_attn_fwd,
 )
 from aiter.ops.triton._gluon_kernels.gfx950.attention.mha import (
     _get_config as _get_gluon_config,
 )
+from aiter.ops.triton._gluon_kernels.gfx950.attention.mha import (
+    kv_async_copy_ok as _gluon_kv_async_copy_ok,
+)
+from aiter.ops.triton._triton_kernels.attention.dao_ai import (
+    flash_attn_2,
+)
 from aiter.ops.triton._triton_kernels.attention.mha import _attn_fwd, _get_config
-from aiter.ops.triton._triton_kernels.flash_attn_triton_amd import flash_attn_2
 from aiter.ops.triton.attention.mha_fused_bwd import flash_attn_fused_backward
 from aiter.ops.triton.attention.mha_onekernel_bwd import flash_attn_onekernel_backward
 from aiter.ops.triton.utils import types
@@ -45,10 +55,26 @@ _USE_FUSED_BWD_KERNEL = False
 
 def is_gluon_available() -> bool:
     """True when the Gluon MHA forward kernel can actually run on this device."""
-    if not _TRITON_GE_36:
+    if not _TRITON_GE_36 or not hasattr(gl, "map_elementwise"):
         return False
     arch = get_arch() or ""
     return any(supported in arch for supported in _GLUON_SUPPORTED_ARCHS)
+
+
+@functools.cache
+def is_gluon_async_copy_ok(
+    head_dim_pow2, pe_head_dim, block_n, num_warps, elem_bits, stride_align
+) -> bool:
+    """True when the Gluon kernel can async-copy every K/V tile of this launch.
+
+    A pure function of the launch shape; the kernel's constexpr_function costs
+    tens of microseconds per call from host code, so make it cached.
+    """
+    return bool(
+        _gluon_kv_async_copy_ok(
+            head_dim_pow2, pe_head_dim, block_n, num_warps, elem_bits, stride_align
+        )
+    )
 
 
 _MHA_BACKENDS = ("triton", "gluon")
@@ -79,10 +105,20 @@ def mha_set_use_fused_bwd_kernel(value: bool):
 _MHA_IMPL: Literal["default", "dao_ai"] = "default"
 
 
+def _resolve_implementation(
+    implementation: Literal["default", "dao_ai"] | None,
+) -> Literal["default", "dao_ai"]:
+    if implementation is None:
+        return _MHA_IMPL
+    if implementation not in ("default", "dao_ai"):
+        raise ValueError(f"Unknown MHA implementation {implementation!r}")
+    return implementation
+
+
 def mha_set_impl(impl: Literal["default", "dao_ai"]):
-    """Set MHA forward implementation: 'default' (_attn_fwd) or 'dao_ai' (flash_attn_triton_amd)."""
+    """Set the default implementation for subsequent calls without an explicit choice."""
     global _MHA_IMPL
-    _MHA_IMPL = impl
+    _MHA_IMPL = _resolve_implementation(impl)
 
 
 _USE_INT64_STRIDES = True
@@ -202,7 +238,7 @@ def gluon_forward_unsupported_reason(
     if not is_gluon_available():
         return (
             f"Gluon MHA backend requires one of {_GLUON_SUPPORTED_ARCHS} with "
-            f"Triton>=3.6 (arch={get_arch()!r}, triton={triton.__version__})"
+            f"Gluon map_elementwise support (arch={get_arch()!r}, triton={triton.__version__})"
         )
     if dropout_p and dropout_p != 0.0:
         return "Gluon MHA backend does not support dropout"
@@ -261,8 +297,8 @@ def _gluon_flash_attn_forward(
         q, k, v: query / key / value tensors (layout per the mode above).
         sm_scale: QK^T scale.
         causal: whether to apply a (bottom-right aligned) causal mask.
-        window_size: (left, right) local attention window. Only a left window is
-            supported, so right must be -1.
+        window_size: (left, right) local attention window. A zero right bound
+            selects causal attention. Positive right bounds require causal=True.
         return_lse: allocate and write the log-sum-exp. When False the kernel
             skips the LSE epilogue entirely.
         return_softmax: also write out the per-block softmax probabilities.
@@ -287,13 +323,23 @@ def _gluon_flash_attn_forward(
 
     assert is_gluon_available(), (
         f"Gluon MHA backend requires one of {_GLUON_SUPPORTED_ARCHS} with "
-        f"Triton>=3.6 (arch={get_arch()!r}, triton={triton.__version__})"
+        f"Gluon map_elementwise support (arch={get_arch()!r}, triton={triton.__version__})"
     )
     assert q.shape[-1] == k.shape[-1], "q/k head_dim mismatch"
+    # Unless q is pre-scaled, the kernel takes the row max of the unscaled scores,
+    # which needs a nonnegative scale.
+    assert sm_scale >= 0, f"Gluon MHA requires sm_scale >= 0 (got {sm_scale})"
 
-    if int(window_size[1]) != -1:
-        raise ValueError("window_size_right is not supported yet in the Gluon Backend")
-    sliding_window = _get_sliding_window_size(window_size)
+    right = int(window_size[1])
+    if right == 0:
+        causal = True
+    elif right != -1 and not (causal and right > 0):
+        raise ValueError("Gluon MHA requires right=-1, right=0, or causal attention")
+    sliding_window = max(int(window_size[0]), -1)
+    seqlen_k_max = int(max_seqlen_k) if varlen else k.shape[1]
+    if sliding_window >= seqlen_k_max - 1:
+        # This bound includes every key, even for the last query row.
+        sliding_window = -1
 
     IS_FP8 = types._is_fp8(q)
     FP8_MAX = torch.finfo(q.dtype).max if IS_FP8 else 0.0
@@ -315,7 +361,15 @@ def _gluon_flash_attn_forward(
         )
 
     if config is None:
-        config = _get_gluon_config(is_fp8=IS_FP8, has_pe=pe_head_dim > 0)
+        config = _get_gluon_config(
+            is_fp8=IS_FP8,
+            is_fp32=q.dtype == torch.float32,
+            has_pe=pe_head_dim > 0,
+            causal=causal,
+            v_head_dim=v_head_dim,
+            sliding_window=sliding_window,
+            seqlen_k=seqlen_k_max,
+        )
     config = dict(config)
     BLOCK_M = config.pop("BLOCK_M")
     BLOCK_N = config.pop("BLOCK_N")
@@ -346,7 +400,10 @@ def _gluon_flash_attn_forward(
     # Pad to a vectorizable head dim
     head_size_og = v_head_dim
     if head_size_og % 8 != 0:
-        pad = 8 - head_size_og % 8
+        # FP8 needs 16 elements for 128-bit async copies. Keep already aligned
+        # heads unchanged: adding pad kernels to them costs more than it saves.
+        pad_multiple = 16 if IS_FP8 else 8
+        pad = (-head_size_og) % pad_multiple
         warnings.warn(
             f"Gluon MHA is padding q/k/v from head_dim {head_size_og} to "
             f"{head_size_og + pad} so the head-axis accesses vectorize. This costs "
@@ -379,12 +436,12 @@ def _gluon_flash_attn_forward(
     # not want LSE so the kernel can drop the epilogue store.
     if return_lse:
         if varlen:
-            softmax_lse = torch.zeros(
+            softmax_lse = torch.empty(
                 (q.shape[0], num_q_heads), device=q.device, dtype=torch.float32
             )
             lse_strides = (0, softmax_lse.stride(1), softmax_lse.stride(0))
         else:
-            softmax_lse = torch.zeros(
+            softmax_lse = torch.empty(
                 (batch, num_q_heads, seqlen_q), device=q.device, dtype=torch.float32
             )
             lse_strides = softmax_lse.stride()
@@ -423,16 +480,51 @@ def _gluon_flash_attn_forward(
         0 if pe_head_dim == 0 else max(triton.next_power_of_2(pe_head_dim), 16)
     )
     assert (pe_head_dim == 0 and BLOCK_DMODEL_PE_POW2 == 0) or (
-        v_head_dim == BLOCK_DMODEL_POW2 and pe_head_dim == BLOCK_DMODEL_PE_POW2
+        head_size_og == BLOCK_DMODEL_POW2 and pe_head_dim == BLOCK_DMODEL_PE_POW2
     ), "Positional encoding support requires NOPE and PE head sizes to be unpadded powers of 2."
+    # fp8's 32x32x64 MFMA contracts 64 at a time.
     assert (not IS_FP8) or (
-        IS_FP8 and pe_head_dim == 0
-    ), "Positional encoding doesn't support FP8."
-    # FP8 uses 32x32x64 (K=64) scaled MFMA, so the PE head size must be a multiple of 64.
-    # TODO: Enable this assert if the assert above is ever lifted.
-    # assert (not IS_FP8) or (
-    #     pe_head_dim % 64 == 0
-    # ), "FP8 positional encoding requires the PE head size to be a multiple of 64."
+        pe_head_dim % 64 == 0
+    ), "FP8 positional encoding requires the PE head size to be a multiple of 64."
+
+    # K/V reach LDS only by async copy: contiguous last axis, 16-byte-aligned base,
+    # strides aligned to the copy's vector.  A K or V that fails is copied to a
+    # contiguous buffer, which always qualifies (the head dim is padded to 8 above).
+    def _stride_align(t, strides):
+        if strides[3] != 1 or t.data_ptr() % 16 != 0:
+            return 0
+        return math.gcd(16, *strides[:3])
+
+    def _contiguous(t):
+        # clone, not .contiguous(): a contiguous view at a misaligned offset has to
+        # move too, and .contiguous() would hand it back unchanged.
+        t = t.clone(memory_format=torch.contiguous_format)
+        if varlen:
+            return t, (0, t.stride(1), t.stride(0), t.stride(2))
+        return t, (t.stride(0), t.stride(2), t.stride(1), t.stride(3))
+
+    kv_async_args = (
+        BLOCK_DMODEL_POW2,
+        BLOCK_DMODEL_PE_POW2,
+        BLOCK_N,
+        config["num_warps"],
+        k.element_size() * 8,
+    )
+    # Checked per tensor, so only the one that fails is copied.  The copy predicate
+    # only gets easier as the alignment grows, so two passing tensors pass together.
+    k_align = _stride_align(k, k_strides)
+    if not is_gluon_async_copy_ok(*kv_async_args, k_align):
+        k, k_strides = _contiguous(k)
+        k_align = _stride_align(k, k_strides)
+    v_align = _stride_align(v, v_strides)
+    if not is_gluon_async_copy_ok(*kv_async_args, v_align):
+        v, v_strides = _contiguous(v)
+        v_align = _stride_align(v, v_strides)
+    kv_stride_align = min(k_align, v_align)
+    assert is_gluon_async_copy_ok(*kv_async_args, kv_stride_align), (
+        f"Gluon MHA cannot async-copy K/V for head_dim={v_head_dim}, "
+        f"BLOCK_N={BLOCK_N}, num_warps={config['num_warps']}"
+    )
 
     # Largest power of two, capped at the 128-bit load width, that divides every
     # head-axis stride. gcd against a power of two can only return a power of two,
@@ -441,6 +533,19 @@ def _gluon_flash_attn_forward(
 
     grid = (batch * num_q_heads * triton.cdiv(seqlen_q, BLOCK_M), 1)
 
+    # Eager FP8 keeps runtime lengths and scale to avoid register spills.
+    # Other modes specialize them to simplify the dense pipeline.
+    specialize = not IS_FP8 or bool(config.get("LAZY_RESCALE_THRESHOLD"))
+    # Causal lazy rescale with constant lengths spills on a Q/K head of 128+, so
+    # pass runtime lengths when the pipelined loop runs.  Windows and short K stay
+    # faster with constants.
+    specialize_seqlen = specialize and not (
+        causal
+        and sliding_window < 0
+        and qk_head_dim >= 128
+        and bool(config.get("LAZY_RESCALE_THRESHOLD"))
+        and seqlen_k_max >= _GLUON_MIN_PIPE_BLOCKS.value * BLOCK_N + BLOCK_M
+    )
     _gluon_attn_fwd[grid](
         q,
         k,
@@ -452,11 +557,11 @@ def _gluon_flash_attn_forward(
         descale_k,
         descale_v,
         sink,
-        sm_scale,
+        gl.constexpr(sm_scale) if specialize else sm_scale,
         cu_seqlens_q,
         cu_seqlens_k,
-        seqlen_q,
-        seqlen_k,
+        gl.constexpr(seqlen_q) if specialize_seqlen else seqlen_q,
+        gl.constexpr(seqlen_k) if specialize_seqlen else seqlen_k,
         *q_strides,
         *k_strides,
         *v_strides,
@@ -485,6 +590,11 @@ def _gluon_flash_attn_forward(
         SLIDING_WINDOW=sliding_window,
         RETURN_SCORES=return_softmax,
         HEAD_STRIDE_ALIGN=head_stride_align,
+        KV_STRIDE_ALIGN=kv_stride_align,
+        # fp8 keeps the per-tile scale: q is already fp8, so re-rounding q*scale back
+        # into fp8 would throw away far more than the multiply costs.  So does fp16:
+        # q*scale can overflow it where the fp32 scores would not.
+        SCALE_ON_Q=not IS_FP8 and q.dtype != torch.float16,
         **config,
         enable_fp_fusion=True,
     )
@@ -514,11 +624,16 @@ def _flash_attn_forward(
     descale_v: torch.Tensor | None = None,
     sink: torch.Tensor | None = None,
     config: dict[str, any] | None = None,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None, int, int]:
+    out_dtype: torch.dtype | None = None,
+    implementation: Literal["default", "dao_ai"] | None = None,
+) -> tuple[
+    torch.Tensor, torch.Tensor, torch.Tensor | None, int, int, torch.Tensor | None
+]:
 
+    implementation = _resolve_implementation(implementation)
     if bias is not None:
         raise ValueError("Bias is not supported yet in the Triton Backend")
-    if _MHA_IMPL != "dao_ai" and window_size_right != -1:
+    if implementation != "dao_ai" and window_size_right != -1:
         raise ValueError("window_size_right is not supported yet in the Triton Backend")
     sliding_window = max(window_size_left, 0)
 
@@ -531,12 +646,13 @@ def _flash_attn_forward(
     FP8_MAX: tl.constexpr = torch.finfo(q.dtype).max
     is_varlen = cu_seqlens_q is not None
 
-    if IS_FP8:
-        o = torch.zeros(
-            (q.shape[:-1] + v.shape[-1:]), dtype=torch.float32, device=q.device
+    if out_dtype is None:
+        out_dtype = torch.float32 if IS_FP8 else q.dtype
+    if out_dtype not in (torch.float32, torch.bfloat16, torch.float16):
+        raise ValueError(
+            f"out_dtype must be float32, bfloat16 or float16, got {out_dtype}"
         )
-    else:
-        o = torch.zeros((q.shape[:-1] + v.shape[-1:]), dtype=q.dtype, device=q.device)
+    o = torch.zeros((q.shape[:-1] + v.shape[-1:]), dtype=out_dtype, device=q.device)
     if is_varlen:
         # Layout is thd.
         # q and k are [total_tokens, num_head, head_dim_qk].
@@ -599,7 +715,8 @@ def _flash_attn_forward(
 
     # exp_scores [batch, num_q_heads, seqlen_q, seqlen_k]
     enable_dropout = dropout_p > 0.0
-    if enable_dropout:
+    rng_state = None
+    if enable_dropout and implementation != "dao_ai":
         # Make the seeds on the CPU. A GPU tensor would sync the device in .item().
         philox_seed = torch.randint(0, 0xFFFFFF, (1,), device="cpu")[
             0
@@ -625,7 +742,7 @@ def _flash_attn_forward(
     else:
         s_dmask = None
 
-    if _MHA_IMPL == "dao_ai":
+    if implementation == "dao_ai":
         assert sink is None, "dao_ai impl does not support attention sink."
         assert (
             pe_head_dim == 0
@@ -633,8 +750,11 @@ def _flash_attn_forward(
         assert (
             not IS_FP8
         ), "dao_ai impl does not support FP8. Use the default impl or FA3 path."
+        assert (
+            out_dtype == q.dtype
+        ), f"Output and input must have the same dtype in dao_ai impl, got out_dtype={out_dtype} and q.dtype={q.dtype}."
         if is_varlen:
-            o, softmax_lse, s_dmask, _ = flash_attn_2.varlen_fwd(
+            o, softmax_lse, s_dmask, rng_state = flash_attn_2.varlen_fwd(
                 q,
                 k,
                 v,
@@ -657,7 +777,7 @@ def _flash_attn_forward(
                 return_softmax=return_softmax,
             )
         else:
-            o, softmax_lse, s_dmask, _ = flash_attn_2.fwd(
+            o, softmax_lse, s_dmask, rng_state = flash_attn_2.fwd(
                 q,
                 k,
                 v,
@@ -791,7 +911,153 @@ def _flash_attn_forward(
             enable_fp_fusion=True,
         )
 
-    return o, softmax_lse, s_dmask, philox_seed, philox_offset
+    return o, softmax_lse, s_dmask, philox_seed, philox_offset, rng_state
+
+
+def _flash_attn_backward(
+    do: torch.Tensor,
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    out: torch.Tensor,
+    softmax_lse: torch.Tensor,
+    dq: torch.Tensor,
+    dk: torch.Tensor,
+    dv: torch.Tensor,
+    dbias: torch.Tensor | None,
+    dropout_p: float,
+    softmax_scale: float,
+    causal: bool,
+    window_size_left: int,
+    window_size_right: int,
+    alibi_slopes: torch.Tensor | None,
+    deterministic: bool,
+    max_seqlen_q: int,
+    max_seqlen_k: int,
+    cu_seqlens_q: torch.Tensor | None = None,
+    cu_seqlens_k: torch.Tensor | None = None,
+    philox_seed: int | None = None,
+    philox_offset: int | None = None,
+    rng_state: torch.Tensor | None = None,
+    sink: torch.Tensor | None = None,
+    dsink: torch.Tensor | None = None,
+    implementation: Literal["default", "dao_ai"] | None = None,
+) -> torch.Tensor | None:
+    """Write the gradients into dq, dk, dv (and dbias, dsink) for a forward of
+    _flash_attn_forward. Pass the forward's dropout state: philox_seed and philox_offset
+    for the default implementation, rng_state for dao_ai.
+
+    Returns the softmax delta for dao_ai and None for default.
+    """
+    implementation = _resolve_implementation(implementation)
+    if implementation == "dao_ai":
+        assert sink is None, "dao_ai impl does not support attention sink."
+        if cu_seqlens_q is None:
+            return flash_attn_2.bwd(
+                do,
+                q,
+                k,
+                v,
+                out,
+                softmax_lse,
+                dq,
+                dk,
+                dv,
+                alibi_slopes,
+                dropout_p,
+                softmax_scale,
+                causal,
+                window_size_left=window_size_left,
+                window_size_right=window_size_right,
+                softcap=0.0,
+                deterministic=deterministic,
+                rng_state=rng_state,
+            )[3]
+        return flash_attn_2.varlen_bwd(
+            do,
+            q,
+            k,
+            v,
+            out,
+            softmax_lse,
+            dq,
+            dk,
+            dv,
+            cu_seqlens_q,
+            cu_seqlens_k,
+            alibi_slopes,
+            max_seqlen_q=max_seqlen_q,
+            max_seqlen_k=max_seqlen_k,
+            dropout_p=dropout_p,
+            softmax_scale=softmax_scale,
+            zero_tensors=False,
+            causal=causal,
+            window_size_left=window_size_left,
+            window_size_right=window_size_right,
+            softcap=0.0,
+            deterministic=deterministic,
+            rng_state=rng_state,
+        )[3]
+
+    sliding_window = max(window_size_left, 0)
+    if _USE_FUSED_BWD_KERNEL:
+        if sliding_window > 0:
+            raise ValueError(
+                "Fused backward doesn't support sliding window attention. "
+                "Disable fused backward or use the one-kernel backward."
+            )
+        assert sink is None and dsink is None, "Fused backward doesn't support sinks."
+        flash_attn_fused_backward(
+            do,
+            q,
+            k,
+            v,
+            out,
+            softmax_lse,
+            dq,
+            dk,
+            dv,
+            dbias,
+            softmax_scale,
+            alibi_slopes,
+            causal,
+            cu_seqlens_q,
+            cu_seqlens_k,
+            max_seqlen_q=max_seqlen_q,
+            max_seqlen_k=max_seqlen_k,
+            dropout_p=dropout_p,
+            philox_seed=philox_seed,
+            philox_offset=philox_offset,
+            USE_INT64_STRIDES=_USE_INT64_STRIDES,
+        )
+    else:
+        flash_attn_onekernel_backward(
+            do,
+            q,
+            k,
+            v,
+            out,
+            softmax_lse,
+            dq,
+            dk,
+            dv,
+            dbias,
+            softmax_scale,
+            alibi_slopes,
+            causal,
+            cu_seqlens_q,
+            cu_seqlens_k,
+            max_seqlen_q=max_seqlen_q,
+            max_seqlen_k=max_seqlen_k,
+            dropout_p=dropout_p,
+            philox_seed=philox_seed,
+            philox_offset=philox_offset,
+            USE_INT64_STRIDES=_USE_INT64_STRIDES,
+            sink=sink,
+            dsink=dsink,
+            sliding_window=sliding_window,
+        )
+    return None
 
 
 class _FlashAttnFunc(torch.autograd.Function):
@@ -813,7 +1079,10 @@ class _FlashAttnFunc(torch.autograd.Function):
         sink,
         is_grad_enabled,
         config=None,
+        implementation=None,
     ):
+        implementation = _resolve_implementation(implementation)
+        ctx.implementation = implementation
         is_grad = is_grad_enabled and any(
             x is not None and x.requires_grad for x in [q, k, v, sink]
         )
@@ -824,7 +1093,7 @@ class _FlashAttnFunc(torch.autograd.Function):
             q = torch.nn.functional.pad(q, [0, 8 - head_size_og % 8])
             k = torch.nn.functional.pad(k, [0, 8 - head_size_og % 8])
             v = torch.nn.functional.pad(v, [0, 8 - head_size_og % 8])
-        out_padded, softmax_lse, S_dmask, philox_seed, philox_offset = (
+        out_padded, softmax_lse, S_dmask, philox_seed, philox_offset, rng_state = (
             _flash_attn_forward(
                 q,
                 k,
@@ -842,11 +1111,13 @@ class _FlashAttnFunc(torch.autograd.Function):
                 max_seqlen_k=k.shape[1],
                 sink=sink,
                 config=config,
+                implementation=implementation,
             )
         )
 
         if is_grad:
             ctx.save_for_backward(q, k, v, out_padded, softmax_lse, sink)
+            ctx.rng_state = rng_state
             ctx.philox_seed = philox_seed
             ctx.philox_offset = philox_offset
             ctx.dropout_p = dropout_p
@@ -873,89 +1144,33 @@ class _FlashAttnFunc(torch.autograd.Function):
         do_padded = do
         if head_size_v_og % 8 != 0:
             do_padded = torch.nn.functional.pad(do, [0, 8 - head_size_v_og % 8])
-        sliding_window = _get_sliding_window_size(ctx.window_size)
-
-        if _MHA_IMPL == "dao_ai":
-            assert sink is None, "dao_ai impl does not support attention sink."
-            flash_attn_2.bwd(
-                do_padded,
-                q,
-                k,
-                v,
-                out,
-                softmax_lse,
-                dq,
-                dk,
-                dv,
-                ctx.alibi_slopes,
-                ctx.dropout_p,
-                ctx.softmax_scale,
-                ctx.causal,
-                window_size_left=ctx.window_size[0],
-                window_size_right=ctx.window_size[1],
-                softcap=0.0,
-                deterministic=ctx.deterministic,
-            )
-        else:
-            if _USE_FUSED_BWD_KERNEL:
-                if sliding_window > 0:
-                    raise ValueError(
-                        "Fused backward doesn't support sliding window attention. "
-                        "Disable fused backward or use the one-kernel backward."
-                    )
-                assert (
-                    sink is None and dsink is None
-                ), "Fused backward doesn't support sinks."
-                flash_attn_fused_backward(
-                    do_padded,
-                    q,
-                    k,
-                    v,
-                    out,
-                    softmax_lse,
-                    dq,
-                    dk,
-                    dv,
-                    dbias,
-                    ctx.softmax_scale,
-                    ctx.alibi_slopes,
-                    ctx.causal,
-                    None,
-                    None,
-                    max_seqlen_q=q.shape[1],
-                    max_seqlen_k=k.shape[1],
-                    dropout_p=ctx.dropout_p,
-                    philox_seed=ctx.philox_seed,
-                    philox_offset=ctx.philox_offset,
-                    USE_INT64_STRIDES=_USE_INT64_STRIDES,
-                )
-            else:
-                flash_attn_onekernel_backward(
-                    do_padded,
-                    q,
-                    k,
-                    v,
-                    out,
-                    softmax_lse,
-                    dq,
-                    dk,
-                    dv,
-                    dbias,
-                    ctx.softmax_scale,
-                    ctx.alibi_slopes,
-                    ctx.causal,
-                    None,
-                    None,
-                    max_seqlen_q=q.shape[1],
-                    max_seqlen_k=k.shape[1],
-                    dropout_p=ctx.dropout_p,
-                    philox_seed=ctx.philox_seed,
-                    philox_offset=ctx.philox_offset,
-                    USE_INT64_STRIDES=_USE_INT64_STRIDES,
-                    sink=sink,
-                    dsink=dsink,
-                    sliding_window=sliding_window,
-                )
+        _flash_attn_backward(
+            do_padded,
+            q,
+            k,
+            v,
+            out,
+            softmax_lse,
+            dq,
+            dk,
+            dv,
+            dbias,
+            ctx.dropout_p,
+            ctx.softmax_scale,
+            ctx.causal,
+            int(ctx.window_size[0]),
+            int(ctx.window_size[1]),
+            ctx.alibi_slopes,
+            ctx.deterministic,
+            max_seqlen_q=q.shape[1],
+            max_seqlen_k=k.shape[1],
+            philox_seed=ctx.philox_seed,
+            philox_offset=ctx.philox_offset,
+            rng_state=ctx.rng_state,
+            sink=sink,
+            dsink=dsink,
+            implementation=ctx.implementation,
+        )
 
         dq = dq[..., : ctx.head_sizes[0]]
         dk = dk[..., : ctx.head_sizes[1]]
@@ -976,6 +1191,7 @@ class _FlashAttnFunc(torch.autograd.Function):
             dsink,
             None,  # is_grad_enabled
             None,  # config
+            None,  # implementation
         )
 
 
@@ -998,6 +1214,16 @@ def flash_attn_func(
     v_descale=None,
     config: dict[str, any] | None = None,
     backend: Literal["triton", "gluon"] | None = "triton",
+    *,
+    q_mx_scale: torch.Tensor | None = None,
+    k_mx_scale: torch.Tensor | None = None,
+    v_mx_scale: torch.Tensor | None = None,
+    mx_p_scale: int = 127,
+    q_block_descale: torch.Tensor | None = None,
+    k_block_descale: torch.Tensor | None = None,
+    v_scale: torch.Tensor | None = None,
+    p_scale: float = 1.0,
+    implementation: Literal["default", "dao_ai"] | None = None,
 ):
     """dropout_p should be set to 0.0 during evaluation
     Supports multi-query and grouped-query attention (MQA/GQA) by passing in KV with fewer heads
@@ -1044,6 +1270,8 @@ def flash_attn_func(
         q_descale, k_descale, v_descale: optional fp8 dequant scalars, honored only
             by the "gluon" backend when q/k/v are fp8. Shapes (batch, num_q_heads)
             for q and (batch, num_k_heads) for k/v; the output is fp32.
+        implementation: "default" or "dao_ai"; None uses mha_set_impl's default.
+            The selected implementation is retained for backward.
         backend: "triton" (default) or "gluon". The "gluon" backend runs the
             forward-only gfx950 Gluon kernel and supports the base feature set
             plus FP8, positional encoding, attention sink, a left sliding window
@@ -1052,6 +1280,28 @@ def flash_attn_func(
             with q_descale/k_descale/v_descale. Note that the Gluon backend fills
             in S_dmask even at dropout_p == 0, where the Triton backend leaves it
             zeroed.
+        q_mx_scale, k_mx_scale, v_mx_scale: keyword-only e8m0 scales for MXFP8
+            q/k/v. When all three are set, this call runs the gfx950 MXFP8 Triton
+            kernel and does not enter the default Triton or Gluon path. Each scale
+            is shaped (batch, seqlen/32, nheads, headdim/32). q/k/v stay in
+            (batch, seqlen, nheads, headdim) and are pre-quantized e4m3. The
+            output is bf16. This mode is forward-only and rejects dropout, bias,
+            sink, sliding window, and backend="gluon". Leaving these arguments
+            unset keeps the existing behavior.
+        mx_p_scale: keyword-only softmax-probability scale for the MXFP8 path.
+            Defaults to 127. It is only used when the MXFP8 scales are set.
+        q_block_descale, k_block_descale, v_scale: keyword-only. When all three
+            are set, this call runs the block-scale FP8 Triton kernel and does
+            not enter the default Triton or Gluon path. q_block_descale is
+            (batch, num_q_heads, cdiv(seqlen_q, 64)) and k_block_descale is
+            (batch, num_k_heads, cdiv(seqlen_k, 64)), one fp32 descale per 64
+            tokens. v_scale is a single fp32 tensor scale. q/k/v are
+            pre-quantized fp8 in the usual (batch, seqlen, nheads, headdim)
+            layout, and the output is bf16. This mode is forward-only and rejects
+            dropout, bias, alibi, sink, sliding window, return_attn_probs, and
+            backend="gluon". Leaving these arguments unset keeps the existing behavior.
+        p_scale: keyword-only softmax-probability scale for the block-scale
+            path. Defaults to 1.0. It is only used when the block scales are set.
     Return:
         out: (batch_size, seqlen, nheads, headdim).
         softmax_lse [optional, if return_lse=True]: (batch_size, nheads, seqlen). The
@@ -1061,7 +1311,107 @@ def flash_attn_func(
             The output of softmax (possibly with different scaling). It also encodes the dropout
             pattern (negative means that location was dropped, nonnegative means it was kept).
     """
+    if (
+        q_mx_scale is not None
+        or k_mx_scale is not None
+        or v_mx_scale is not None
+        or mx_p_scale != 127
+    ):
+        if _resolve_backend(backend) == "gluon":
+            raise ValueError("MXFP8 attention is supported on the triton backend only.")
+        # Resolve first: it applies the mha_set_impl default and rejects unknown values.
+        if _resolve_implementation(implementation) == "dao_ai":
+            raise ValueError(
+                "MXFP8 attention is not supported by the dao_ai implementation."
+            )
+        if q_mx_scale is None or k_mx_scale is None or v_mx_scale is None:
+            raise ValueError(
+                "MXFP8 attention requires q_mx_scale, k_mx_scale, and v_mx_scale."
+            )
+        if any(
+            tensor is not None and getattr(tensor, "requires_grad", False)
+            for tensor in (q, k, v, q_mx_scale, k_mx_scale, v_mx_scale)
+        ):
+            raise RuntimeError(
+                "MXFP8 attention on flash_attn_func is forward-only. "
+                "dq/dk/dv cannot be attached to fp8 q/k/v."
+            )
+        if dropout_p:
+            raise ValueError("MXFP8 attention does not support dropout.")
+        if bias is not None:
+            raise ValueError("MXFP8 attention does not support bias.")
+        if sink is not None:
+            raise ValueError("MXFP8 attention does not support sink.")
+        if int(window_size[0]) != -1 or int(window_size[1]) != -1:
+            raise ValueError("MXFP8 attention does not support sliding window.")
+        from aiter.ops.triton.attention.mxfp8_attention import (
+            mxfp8_attention_forward,
+        )
+
+        out, softmax_lse, exp_scores = mxfp8_attention_forward(
+            q,
+            k,
+            v,
+            q_scale=q_mx_scale,
+            k_scale=k_mx_scale,
+            v_scale=v_mx_scale,
+            p_scale=mx_p_scale,
+            sm_scale=_get_softmax_scale(q, softmax_scale),
+            alibi_slopes=alibi_slopes,
+            causal=causal,
+            return_softmax=return_attn_probs,
+            layout="bshd",
+        )
+        return _pack_attn_returns(
+            out.detach(),
+            softmax_lse,
+            exp_scores,
+            return_lse,
+            return_attn_probs,
+        )
+
+    if (
+        q_block_descale is not None
+        or k_block_descale is not None
+        or v_scale is not None
+        or p_scale != 1.0
+    ):
+        if _resolve_backend(backend) == "gluon":
+            raise ValueError(
+                "Block-scale FP8 attention is supported on the triton backend only."
+            )
+        # Resolve first: it applies the mha_set_impl default and rejects unknown values.
+        if _resolve_implementation(implementation) == "dao_ai":
+            raise ValueError(
+                "Block-scale FP8 attention is not supported by the dao_ai implementation."
+            )
+        from aiter.ops.triton.attention.block_scale_fp8_attention import (
+            block_scale_fp8_attention,
+        )
+
+        return block_scale_fp8_attention(
+            q,
+            k,
+            v,
+            q_block_descale,
+            k_block_descale,
+            v_scale,
+            dropout_p=dropout_p,
+            softmax_scale=softmax_scale,
+            causal=causal,
+            window_size=window_size,
+            bias=bias,
+            alibi_slopes=alibi_slopes,
+            return_lse=return_lse,
+            return_attn_probs=return_attn_probs,
+            sink=sink,
+            p_scale=p_scale,
+        )
+
     backend = _resolve_backend(backend)
+    if backend == "gluon" and implementation is not None:
+        raise ValueError("implementation is only supported by the Triton backend")
+    implementation = _resolve_implementation(implementation)
     _LOGGER.info(
         "FLASH_ATTN [%s]:  q=%s  k=%s  v=%s",
         backend,
@@ -1114,6 +1464,7 @@ def flash_attn_func(
         sink,
         torch.is_grad_enabled(),
         config,
+        implementation,
     )
 
 
@@ -1142,7 +1493,10 @@ class _FlashAttnVarlenFunc(torch.autograd.Function):
         sink,
         is_grad_enabled,
         config=None,
+        implementation=None,
     ):
+        implementation = _resolve_implementation(implementation)
+        ctx.implementation = implementation
         is_grad = is_grad_enabled and any(
             x is not None and x.requires_grad for x in [q, k, v, sink]
         )
@@ -1153,7 +1507,7 @@ class _FlashAttnVarlenFunc(torch.autograd.Function):
             q = torch.nn.functional.pad(q, [0, 8 - head_size_og % 8])
             k = torch.nn.functional.pad(k, [0, 8 - head_size_og % 8])
             v = torch.nn.functional.pad(v, [0, 8 - head_size_og % 8])
-        out_padded, softmax_lse, S_dmask, philox_seed, philox_offset = (
+        out_padded, softmax_lse, S_dmask, philox_seed, philox_offset, rng_state = (
             _flash_attn_forward(
                 q,
                 k,
@@ -1173,6 +1527,7 @@ class _FlashAttnVarlenFunc(torch.autograd.Function):
                 cu_seqlens_k=cu_seqlens_k,
                 sink=sink,
                 config=config,
+                implementation=implementation,
             )
         )
         if is_grad:
@@ -1181,6 +1536,7 @@ class _FlashAttnVarlenFunc(torch.autograd.Function):
             )
             ctx.max_seqlen_q = max_seqlen_q
             ctx.max_seqlen_k = max_seqlen_k
+            ctx.rng_state = rng_state
             ctx.philox_seed = philox_seed
             ctx.philox_offset = philox_offset
             ctx.dropout_p = dropout_p
@@ -1189,6 +1545,7 @@ class _FlashAttnVarlenFunc(torch.autograd.Function):
             ctx.window_size = window_size
             ctx.bias = bias
             ctx.alibi_slopes = alibi_slopes
+            ctx.deterministic = deterministic
         out = out_padded[..., :head_size_og]
 
         return _pack_attn_returns(out, softmax_lse, S_dmask, return_lse, return_softmax)
@@ -1206,94 +1563,35 @@ class _FlashAttnVarlenFunc(torch.autograd.Function):
         do_padded = do
         if head_size_og % 8 != 0:
             do_padded = torch.nn.functional.pad(do, [0, 8 - head_size_og % 8])
-        sliding_window = _get_sliding_window_size(ctx.window_size)
-
-        if _MHA_IMPL == "dao_ai":
-            assert sink is None, "dao_ai impl does not support attention sink."
-            flash_attn_2.varlen_bwd(
-                do_padded,
-                q,
-                k,
-                v,
-                out,
-                softmax_lse,
-                dq,
-                dk,
-                dv,
-                cu_seqlens_q,
-                cu_seqlens_k,
-                ctx.alibi_slopes,
-                max_seqlen_q=ctx.max_seqlen_q,
-                max_seqlen_k=ctx.max_seqlen_k,
-                dropout_p=ctx.dropout_p,
-                softmax_scale=ctx.softmax_scale,
-                zero_tensors=False,
-                causal=ctx.causal,
-                window_size_left=ctx.window_size[0],
-                window_size_right=ctx.window_size[1],
-                softcap=0.0,
-                deterministic=False,
-            )
-        else:
-            if _USE_FUSED_BWD_KERNEL:
-                if sliding_window > 0:
-                    raise ValueError(
-                        "Fused backward doesn't support sliding window attention. "
-                        "Disable fused backward or use the one-kernel backward."
-                    )
-                assert (
-                    sink is None and dsink is None
-                ), "Fused backward doesn't support sinks."
-                flash_attn_fused_backward(
-                    do_padded,
-                    q,
-                    k,
-                    v,
-                    out,
-                    softmax_lse,
-                    dq,
-                    dk,
-                    dv,
-                    dbias,
-                    ctx.softmax_scale,
-                    ctx.alibi_slopes,
-                    ctx.causal,
-                    cu_seqlens_q,
-                    cu_seqlens_k,
-                    max_seqlen_q=ctx.max_seqlen_q,
-                    max_seqlen_k=ctx.max_seqlen_k,
-                    dropout_p=ctx.dropout_p,
-                    philox_seed=ctx.philox_seed,
-                    philox_offset=ctx.philox_offset,
-                    USE_INT64_STRIDES=_USE_INT64_STRIDES,
-                )
-            else:
-                flash_attn_onekernel_backward(
-                    do_padded,
-                    q,
-                    k,
-                    v,
-                    out,
-                    softmax_lse,
-                    dq,
-                    dk,
-                    dv,
-                    dbias,
-                    ctx.softmax_scale,
-                    ctx.alibi_slopes,
-                    ctx.causal,
-                    cu_seqlens_q,
-                    cu_seqlens_k,
-                    max_seqlen_q=ctx.max_seqlen_q,
-                    max_seqlen_k=ctx.max_seqlen_k,
-                    dropout_p=ctx.dropout_p,
-                    philox_seed=ctx.philox_seed,
-                    philox_offset=ctx.philox_offset,
-                    USE_INT64_STRIDES=_USE_INT64_STRIDES,
-                    sink=sink,
-                    dsink=dsink,
-                    sliding_window=sliding_window,
-                )
+        _flash_attn_backward(
+            do_padded,
+            q,
+            k,
+            v,
+            out,
+            softmax_lse,
+            dq,
+            dk,
+            dv,
+            dbias,
+            ctx.dropout_p,
+            ctx.softmax_scale,
+            ctx.causal,
+            int(ctx.window_size[0]),
+            int(ctx.window_size[1]),
+            ctx.alibi_slopes,
+            ctx.deterministic,
+            max_seqlen_q=ctx.max_seqlen_q,
+            max_seqlen_k=ctx.max_seqlen_k,
+            cu_seqlens_q=cu_seqlens_q,
+            cu_seqlens_k=cu_seqlens_k,
+            philox_seed=ctx.philox_seed,
+            philox_offset=ctx.philox_offset,
+            rng_state=ctx.rng_state,
+            sink=sink,
+            dsink=dsink,
+            implementation=ctx.implementation,
+        )
 
         dq = dq[..., : ctx.head_sizes[0]]
         dk = dk[..., : ctx.head_sizes[1]]
@@ -1320,6 +1618,7 @@ class _FlashAttnVarlenFunc(torch.autograd.Function):
             dsink,
             None,  # is_grad_enabled
             None,  # config
+            None,  # implementation
         )
 
 
@@ -1348,6 +1647,8 @@ def flash_attn_varlen_func(
     v_descale=None,
     config: dict[str, any] | None = None,
     backend: Literal["triton", "gluon"] | None = "triton",
+    *,
+    implementation: Literal["default", "dao_ai"] | None = None,
 ):
     """dropout_p should be set to 0.0 during evaluation
     Supports multi-query and grouped-query attention (MQA/GQA) by passing in K, V with fewer heads
@@ -1400,6 +1701,8 @@ def flash_attn_varlen_func(
         q_descale, k_descale, v_descale: optional fp8 dequant scalars, honored only
             by the "gluon" backend when q/k/v are fp8. Shapes (batch, num_q_heads)
             for q and (batch, num_k_heads) for k/v; the output is fp32.
+        implementation: "default" or "dao_ai"; None uses mha_set_impl's default.
+            The selected implementation is retained for backward.
         backend: "triton" (default) or "gluon". The "gluon" backend runs the
             forward-only gfx950 Gluon kernel and supports the base feature set
             plus FP8, positional encoding, attention sink, a left sliding window
@@ -1418,6 +1721,15 @@ def flash_attn_varlen_func(
             pattern (negative means that location was dropped, nonnegative means it was kept).
     """
     backend = _resolve_backend(backend)
+    if backend == "gluon" and implementation is not None:
+        raise ValueError("implementation is only supported by the Triton backend")
+    implementation = _resolve_implementation(implementation)
+    if (
+        backend == "triton"
+        and implementation == "dao_ai"
+        and (block_table is not None or out is not None)
+    ):
+        raise NotImplementedError("dao_ai varlen does not support block_table or out")
     _LOGGER.info(
         "FLASH_ATTN_VARLEN [%s]:  q=%s  k=%s  v=%s",
         backend,
@@ -1480,6 +1792,7 @@ def flash_attn_varlen_func(
         sink,
         torch.is_grad_enabled(),
         config,
+        implementation,
     )
 
 

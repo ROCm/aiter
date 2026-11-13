@@ -570,7 +570,7 @@ mha_batch_prefill(at::Tensor& q,       // [total_q, hq, d]
     }
 
 
-    if(max_seqlen_q == 1 && !alibi_slopes_.has_value())
+    if(max_seqlen_q == 1 && !alibi_slopes_.has_value() && !sink_ptr.has_value())
     {
         is_causal = false;
     } // causal=true is the same as causal=false in this case
@@ -619,7 +619,9 @@ mha_batch_prefill(at::Tensor& q,       // [total_q, hq, d]
     }
     else if(window_size_left == -1 && window_size_right == -1)
     {
-        mask = mask_info::decode("0", max_seqlen_q, max_seqlen_k); // no mask; sink N/A for full attention
+        // CK generates virtual-sink kernels only with masking enabled.
+        mask = mask_info::decode(
+            sink_ptr.has_value() ? "b:-1,-1,0" : "0", max_seqlen_q, max_seqlen_k);
     }
     else
     {

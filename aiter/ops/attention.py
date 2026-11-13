@@ -29,8 +29,18 @@ from csrc.cpp_itfs.torch_utils import direct_register_custom_op
 from ..jit.core import _atoi_flag, compile_ops, env_flag_atoi, is_experimental_enabled
 from ..jit.utils.asm_guard import is_gfx1250_asm_supported, require_gfx1250_asm
 from ..jit.utils.chip_info import get_cu_num, get_gfx, get_gfx_runtime
+from ..plugin import route as _route
+from .opus.mla import opus_mla_decode_fwd, opus_mla_decode_mxfp8_fwd  # noqa: F401
 
 MD_NAME = "module_attention"
+_PA_FWD_ASM_SUPPORTED_ARCHS = ("gfx942", "gfx950")
+
+
+@_functools.cache
+def pa_fwd_asm_supports_arch() -> bool:
+    """Whether the paged-attention ASM backend supports the current GPU."""
+    return get_gfx_runtime() in _PA_FWD_ASM_SUPPORTED_ARCHS
+
 
 direct_register_custom_op(
     "pa_decode_gluon",
@@ -135,23 +145,30 @@ def _pa_fwd_asm(
 ) -> None: ...
 
 
-def pa_fwd_asm(
+def _check_backend(op: str, backend: str | None, backends: tuple) -> None:
+    """Reject a pin naming a backend this op does not have."""
+    if backend is not None and backend not in backends:
+        raise ValueError(
+            f"{op}: backend must be one of {backends} or None, got {backend!r}"
+        )
+
+
+def _pa_fwd_native(
     Q: torch.Tensor,
     K: torch.Tensor,
     V: torch.Tensor,
     block_tables: torch.Tensor,
     context_lens: torch.Tensor,
     block_tables_stride0: int,
-    max_qlen: int = 1,
-    K_QScale: torch.Tensor | None = None,
-    V_QScale: torch.Tensor | None = None,
-    out_: torch.Tensor | None = None,
-    qo_indptr: torch.Tensor | None = None,
-    high_precision: (
-        int | None
-    ) = 1,  # [0, 1, 2] 2 is the highest precision, this is only for fp8 kvcache
-    kernelName: str | None = None,
+    max_qlen: int,
+    K_QScale: torch.Tensor | None,
+    V_QScale: torch.Tensor | None,
+    out_: torch.Tensor | None,
+    qo_indptr: torch.Tensor | None,
+    high_precision: int | None,
+    kernelName: str | None,
 ) -> torch.Tensor:
+    """The asm binding, with the output buffer settled. Not public."""
     output = out_ if out_ is not None else torch.empty_like(Q)
     _pa_fwd_asm(
         Q,
@@ -169,6 +186,155 @@ def pa_fwd_asm(
         kernelName,
     )
     return output
+
+
+# Routed here rather than on a public spelling, for the reason `rmsnorm` is:
+# `pa_fwd` and `pa_fwd_asm` are two public names for one op and both arrive
+# here, so this is where the op begins.
+#
+# What this signature leaves out is the point. `kernelName` picks one asm
+# kernel and `backend` picks an implementation -- both name something AITER
+# has and a provider does not, so a provider handed either would have to
+# decline every call that passes one. They stay above this layer, where a
+# caller passing one bypasses routing entirely and gets exactly the kernel it
+# asked for. Nothing a provider cannot honour reaches the contract.
+@_route(op="pa_fwd", version=1)
+def _pa_fwd_routed(
+    Q: torch.Tensor,
+    K: torch.Tensor,
+    V: torch.Tensor,
+    block_tables: torch.Tensor,
+    context_lens: torch.Tensor,
+    block_tables_stride0: int,
+    max_qlen: int = 1,
+    K_QScale: torch.Tensor | None = None,
+    V_QScale: torch.Tensor | None = None,
+    out_: torch.Tensor | None = None,
+    qo_indptr: torch.Tensor | None = None,
+    high_precision: int | None = 1,
+) -> torch.Tensor:
+    """Paged attention forward over a block table.
+
+    Args:
+        Q: ``[sum_qlen, heads, head_dim]`` query.
+        K, V: paged caches indexed through ``block_tables``.
+        block_tables: ``[batch, max_blocks]`` page ids per sequence.
+        context_lens: ``[batch]`` KV length per sequence.
+        block_tables_stride0: row stride of ``block_tables``.
+        max_qlen: longest query in the batch; 1 is plain decode.
+        K_QScale, V_QScale: fp8 dequant scales, ``None`` for unquantized KV.
+        out_: optional output buffer. Given, it is written and returned;
+            otherwise one shaped like ``Q`` is allocated.
+        qo_indptr: ``[batch+1]`` query offsets for a ragged batch.
+        high_precision: 0, 1 or 2 for fp8 KV, 2 being the most precise.
+
+    Returns the output tensor -- ``out_`` itself when one was passed.
+    """
+    return _pa_fwd_native(
+        Q,
+        K,
+        V,
+        block_tables,
+        context_lens,
+        block_tables_stride0,
+        max_qlen,
+        K_QScale,
+        V_QScale,
+        out_,
+        qo_indptr,
+        high_precision,
+        None,
+    )
+
+
+def pa_fwd(
+    Q: torch.Tensor,
+    K: torch.Tensor,
+    V: torch.Tensor,
+    block_tables: torch.Tensor,
+    context_lens: torch.Tensor,
+    block_tables_stride0: int,
+    max_qlen: int = 1,
+    K_QScale: torch.Tensor | None = None,
+    V_QScale: torch.Tensor | None = None,
+    out_: torch.Tensor | None = None,
+    qo_indptr: torch.Tensor | None = None,
+    high_precision: int | None = 1,
+    backend: str | None = None,
+) -> torch.Tensor:
+    """Paged attention forward -- the neutral name for this op.
+
+    Arguments and output are those of the routed contract; see
+    :func:`_pa_fwd_routed`. ``backend`` pins which implementation AITER runs
+    and bypasses routing when given, so a deployment that wants the asm
+    kernel specifically still gets it.
+    """
+    _check_backend("pa_fwd", backend, ("asm",))
+    args = (
+        Q,
+        K,
+        V,
+        block_tables,
+        context_lens,
+        block_tables_stride0,
+        max_qlen,
+        K_QScale,
+        V_QScale,
+        out_,
+        qo_indptr,
+        high_precision,
+    )
+    if backend is None:
+        return _pa_fwd_routed(*args)
+    return _pa_fwd_native(*args, None)
+
+
+def pa_fwd_asm(
+    Q: torch.Tensor,
+    K: torch.Tensor,
+    V: torch.Tensor,
+    block_tables: torch.Tensor,
+    context_lens: torch.Tensor,
+    block_tables_stride0: int,
+    max_qlen: int = 1,
+    K_QScale: torch.Tensor | None = None,
+    V_QScale: torch.Tensor | None = None,
+    out_: torch.Tensor | None = None,
+    qo_indptr: torch.Tensor | None = None,
+    high_precision: (
+        int | None
+    ) = 1,  # [0, 1, 2] 2 is the highest precision, this is only for fp8 kvcache
+    kernelName: str | None = None,
+) -> torch.Tensor:
+    """The historical spelling of :func:`pa_fwd`. Signature unchanged.
+
+    This name predates the neutral one -- `pa_fwd` had no public spelling, so
+    a caller wanting paged attention had to write the backend into the call.
+    That makes the `_asm` here a historical artifact rather than a caller
+    asking for the asm kernel, which is why an ordinary call routes: a
+    provider serves callers of either name.
+
+    ``kernelName`` is the exception, and the only one. It pins a specific asm
+    kernel, which no provider has, so passing it bypasses routing and runs
+    that kernel directly.
+    """
+    args = (
+        Q,
+        K,
+        V,
+        block_tables,
+        context_lens,
+        block_tables_stride0,
+        max_qlen,
+        K_QScale,
+        V_QScale,
+        out_,
+        qo_indptr,
+        high_precision,
+    )
+    if kernelName is None:
+        return _pa_fwd_routed(*args)
+    return _pa_fwd_native(*args, kernelName)
 
 
 def _should_use_asm_kernel(
@@ -445,7 +611,7 @@ def _pa_decode_bf16_asm(
 ) -> None: ...
 
 
-def pa_decode_bf16_asm(
+def _pa_decode_bf16_native(
     Q: torch.Tensor,
     K: torch.Tensor,
     V: torch.Tensor,
@@ -467,21 +633,7 @@ def pa_decode_bf16_asm(
     out: torch.Tensor | None = None,
     kernelName: str | None = None,
 ) -> torch.Tensor:
-    """Public wrapper for the gfx1250 PA decode kernel.
-
-    Contract details:
-      * `Q`/`K`/`V` are FP8; `out` is bf16 with Q's logical shape.
-      * `query_scale`/`key_scale`/`value_scale` are the per-tensor FP8 dequant
-        scales as 1-element fp32 tensors (None means 1.0); the attention
-        `softmax_scale` (typically 1/sqrt(head_dim)) is
-        passed BY VALUE (kernarg 0x60) and the kernel forms
-        scl_log2e = query_scale * key_scale * softmax_scale * log2e.
-      * `sink` (optional) holds per-Q-head fp32 logits in the SCALED-logit
-        domain (exp(sink), Triton/GPT-OSS convention; the kernel divides by
-        s_eff internally), shape [kv_head_num * gqa].  The kernel always reads
-        this slot, so when `sink` is None a -inf buffer is allocated, making the
-        sink a numerical no-op.
-    """
+    """The asm binding with its buffers settled. Not public."""
     require_gfx1250_asm("pa_decode_bf16_asm")
     device = Q.device
     kv_head_num = K.shape[1]
@@ -528,6 +680,224 @@ def pa_decode_bf16_asm(
     return out
 
 
+# Routed below the pins, as `pa_fwd` is: `kernelName` names one asm kernel and
+# `backend` one implementation, neither of which a provider has. Both stay
+# above this layer, so the contract carries nothing a provider cannot honour.
+@_route(op="pa_decode_bf16", version=1)
+def _pa_decode_bf16_routed(
+    Q: torch.Tensor,
+    K: torch.Tensor,
+    V: torch.Tensor,
+    kv_indices: torch.Tensor,
+    context_lens: torch.Tensor,
+    softmax_scale: float,
+    kv_indptr: torch.Tensor,
+    gqa: int = 8,
+    mtp: int = 0,
+    query_scale: torch.Tensor | None = None,
+    key_scale: torch.Tensor | None = None,
+    value_scale: torch.Tensor | None = None,
+    qo_indptr: torch.Tensor | None = None,
+    work_indptr: torch.Tensor | None = None,
+    work_info: torch.Tensor | None = None,
+    split_o: torch.Tensor | None = None,
+    split_lse: torch.Tensor | None = None,
+    sink: torch.Tensor | None = None,
+    out: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Paged-attention decode on fp8 KV, returning bf16.
+
+    Contract details:
+      * ``Q``/``K``/``V`` are FP8; ``out`` is bf16 with Q's logical shape.
+      * ``query_scale``/``key_scale``/``value_scale`` are the per-tensor FP8
+        dequant scales as 1-element fp32 tensors (None means 1.0); the
+        attention ``softmax_scale`` (typically 1/sqrt(head_dim)) is passed BY
+        VALUE and the kernel forms
+        ``scl_log2e = query_scale * key_scale * softmax_scale * log2e``.
+      * ``sink`` (optional) holds per-Q-head fp32 logits in the SCALED-logit
+        domain (exp(sink), Triton/GPT-OSS convention), shape
+        ``[kv_head_num * gqa]``. A finite large-negative buffer stands in when
+        it is None, making the sink a numerical no-op.
+
+    ``out`` is an optional caller-owned buffer: given, it is written and
+    returned; otherwise one is allocated. The output tensor comes back either
+    way, so a provider returns what it wrote rather than leaving the caller to
+    re-read ``out``.
+    """
+    return _pa_decode_bf16_native(
+        Q,
+        K,
+        V,
+        kv_indices,
+        context_lens,
+        softmax_scale,
+        kv_indptr,
+        gqa,
+        mtp,
+        query_scale,
+        key_scale,
+        value_scale,
+        qo_indptr,
+        work_indptr,
+        work_info,
+        split_o,
+        split_lse,
+        sink,
+        out,
+        None,
+    )
+
+
+def pa_decode_bf16(
+    Q: torch.Tensor,
+    K: torch.Tensor,
+    V: torch.Tensor,
+    kv_indices: torch.Tensor,
+    context_lens: torch.Tensor,
+    softmax_scale: float,
+    kv_indptr: torch.Tensor,
+    gqa: int = 8,
+    mtp: int = 0,
+    query_scale: torch.Tensor | None = None,
+    key_scale: torch.Tensor | None = None,
+    value_scale: torch.Tensor | None = None,
+    qo_indptr: torch.Tensor | None = None,
+    work_indptr: torch.Tensor | None = None,
+    work_info: torch.Tensor | None = None,
+    split_o: torch.Tensor | None = None,
+    split_lse: torch.Tensor | None = None,
+    sink: torch.Tensor | None = None,
+    out: torch.Tensor | None = None,
+    backend: str | None = None,
+) -> torch.Tensor:
+    """Paged-attention fp8 decode -- the neutral name for this op.
+
+    Arguments and output are those of the routed contract; see
+    :func:`_pa_decode_bf16_routed`. ``backend`` pins the implementation and
+    bypasses routing when given.
+    """
+    _check_backend("pa_decode_bf16", backend, ("asm",))
+    if backend is None:
+        return _pa_decode_bf16_routed(
+            Q,
+            K,
+            V,
+            kv_indices,
+            context_lens,
+            softmax_scale,
+            kv_indptr,
+            gqa,
+            mtp,
+            query_scale,
+            key_scale,
+            value_scale,
+            qo_indptr,
+            work_indptr,
+            work_info,
+            split_o,
+            split_lse,
+            sink,
+            out,
+        )
+    return _pa_decode_bf16_native(
+        Q,
+        K,
+        V,
+        kv_indices,
+        context_lens,
+        softmax_scale,
+        kv_indptr,
+        gqa,
+        mtp,
+        query_scale,
+        key_scale,
+        value_scale,
+        qo_indptr,
+        work_indptr,
+        work_info,
+        split_o,
+        split_lse,
+        sink,
+        out,
+        None,
+    )
+
+
+def pa_decode_bf16_asm(
+    Q: torch.Tensor,
+    K: torch.Tensor,
+    V: torch.Tensor,
+    kv_indices: torch.Tensor,
+    context_lens: torch.Tensor,
+    softmax_scale: float,
+    kv_indptr: torch.Tensor,
+    gqa: int = 8,
+    mtp: int = 0,
+    query_scale: torch.Tensor | None = None,
+    key_scale: torch.Tensor | None = None,
+    value_scale: torch.Tensor | None = None,
+    qo_indptr: torch.Tensor | None = None,
+    work_indptr: torch.Tensor | None = None,
+    work_info: torch.Tensor | None = None,
+    split_o: torch.Tensor | None = None,
+    split_lse: torch.Tensor | None = None,
+    sink: torch.Tensor | None = None,
+    out: torch.Tensor | None = None,
+    kernelName: str | None = None,
+) -> torch.Tensor:
+    """The historical spelling of :func:`pa_decode_bf16`. Signature unchanged.
+
+    An ordinary call routes: the ``_asm`` is a historical artifact of there
+    having been no neutral spelling, not a caller asking for that backend.
+    ``kernelName`` is the exception -- it pins one asm kernel, which no
+    provider has, so passing it bypasses routing.
+    """
+    if kernelName is None:
+        return _pa_decode_bf16_routed(
+            Q,
+            K,
+            V,
+            kv_indices,
+            context_lens,
+            softmax_scale,
+            kv_indptr,
+            gqa,
+            mtp,
+            query_scale,
+            key_scale,
+            value_scale,
+            qo_indptr,
+            work_indptr,
+            work_info,
+            split_o,
+            split_lse,
+            sink,
+            out,
+        )
+    return _pa_decode_bf16_native(
+        Q,
+        K,
+        V,
+        kv_indices,
+        context_lens,
+        softmax_scale,
+        kv_indptr,
+        gqa,
+        mtp,
+        query_scale,
+        key_scale,
+        value_scale,
+        qo_indptr,
+        work_indptr,
+        work_info,
+        split_o,
+        split_lse,
+        sink,
+        out,
+        kernelName,
+    )
+
+
 def pa_reduce_v1(
     partial_output: torch.Tensor,
     partial_lse: torch.Tensor,
@@ -567,16 +937,35 @@ def _attention_ps_reduce_asm(
     max_seqlen_q: int,
     final_output: torch.Tensor,
     final_lse: torch.Tensor | None = None,
+    merge_waves: int = 0,
 ) -> None:
     """Merge compatible PS-mode split-attention outputs and LSE on gfx950.
 
-    Partial output/LSE must be contiguous FP32 tensors with compatible int32
-    reduction maps on the output device. Output is BF16/FP16 [queries, heads,
+    Partial output and partial LSE must be contiguous FP32 tensors, with
+    compatible int32 reduction maps on the output device.
+    Output is BF16/FP16 [queries, heads,
     128]; optional final LSE is FP32. The producer must follow the same partial
     layout and LSE convention. No paged-KV or causal-mask inputs are consumed.
+    merge_waves is 0 for the existing heuristic, or 1/8 for an explicit choice.
     """
 
 
+def _pa_ps_reduce_waves(batch_size: int, kv_pages: int, num_cu: int) -> int:
+    """Estimate Q4/GQA16/page16 reduction work from packed, used KV pages.
+
+    This is not a live split count. Callers with padded kv_indices should pass
+    an explicit reduce_waves value. Metadata buffer capacity is not consulted.
+    """
+    if num_cu != 256 or not 1 <= batch_size <= 8:
+        return 0
+    output_rows = batch_size * 4 * 16
+    if output_rows < num_cu:
+        return 0
+    context_threshold = 32768 if output_rows <= num_cu else 65536
+    return 8 if kv_pages * 16 >= batch_size * context_threshold else 0
+
+
+@_route(op="pa_persistent_fwd", version=1)
 def pa_persistent_fwd(
     Q: torch.Tensor,  # [sum_qlen, kv_heads * gqa + kv_heads * 2, head_dim]
     K: torch.Tensor,  # [num_blocks, kv_heads, head_dim / x, block_size, x]
@@ -599,16 +988,39 @@ def pa_persistent_fwd(
     mask: int = 0,
     quant_type: QuantType = QuantType.per_Token,
     high_precision: int = 1,
-) -> tuple[torch.Tensor, torch.Tensor]:
+    reduce_waves: int = 0,
+    return_lse: bool = True,
+) -> tuple[torch.Tensor, torch.Tensor | None]:
     """Run persistent attention and merge only materialized partial outputs.
 
     Work records with partial index -1 write directly to output. Their final
     LSE is undefined and must not be read; the forward kernel does not produce it.
     Empty reduction maps skip the reducer; preallocated GPU maps are handled on
     device without reading metadata back to the host.
+    reduce_waves selects the gfx950/page16/D128 ASM reducer: 0 applies a static
+    PA workload heuristic, while 1/8 explicitly overrides it. The Q4/GQA16
+    policy expects packed kv_indices containing only used pages. Other paths
+    retain the original heuristic. No tuning or device-to-host readback occurs.
+    return_lse=False skips final LSE allocation and computation and returns None
+    for the second result. The default preserves the existing LSE output.
+    Split work always uses FP32 partials and FP32 LSE. Metadata partial=-1
+    selects direct output in Q's dtype without materializing a partial or LSE.
     """
     device = Q.device
     total_s, nhead, v_head_dim = output.shape
+    if reduce_waves not in (0, 1, 8):
+        raise ValueError("reduce_waves must be 0, 1, or 8")
+    use_asm_reduce = (
+        K.shape[3] == 16
+        and v_head_dim == 128
+        and output.dtype in (dtypes.bf16, dtypes.fp16)
+        and reduce_final_map is not None
+        and get_gfx_runtime() == "gfx950"
+    )
+    if reduce_waves and not use_asm_reduce:
+        raise ValueError(
+            "explicit reduce_waves requires the gfx950/page16/D128 ASM reducer"
+        )
     if softmax_scale is None:
         softmax_scale = 1.0 / (v_head_dim**0.5)
     logits = torch.empty(
@@ -621,7 +1033,11 @@ def pa_persistent_fwd(
         dtype=dtypes.fp32,
         device=device,
     )
-    final_lse = torch.empty((total_s, nhead), dtype=dtypes.fp32, device=device)
+    final_lse = (
+        torch.empty((total_s, nhead), dtype=dtypes.fp32, device=device)
+        if return_lse
+        else None
+    )
 
     pa_ps_fwd_asm(
         Q,
@@ -647,15 +1063,26 @@ def pa_persistent_fwd(
     if reduce_partial_map.numel() == 0 or reduce_indptr.numel() == 1:
         return logits, final_lse
 
-    reduce_fn = pa_reduce_v1
+    batch_size = qo_indptr.numel() - 1
     if (
-        K.shape[3] == 16
-        and v_head_dim == 128
-        and output.dtype in (dtypes.bf16, dtypes.fp16)
-        and reduce_final_map is not None
-        and get_gfx_runtime() == "gfx950"
+        use_asm_reduce
+        and reduce_waves == 0
+        and max_qlen == 4
+        and total_s == batch_size * 4
+        and nhead == 16
+        and K.shape[1] == 1
+        and K.dtype == dtypes.fp8
+        and V.dtype == dtypes.fp8
+        and quant_type == QuantType.per_Token
+        and mask == 1
     ):
-        reduce_fn = _attention_ps_reduce_asm
+        reduce_waves = _pa_ps_reduce_waves(
+            batch_size,
+            kv_indices.numel(),
+            torch.cuda.get_device_properties(device).multi_processor_count,
+        )
+    reduce_fn = _attention_ps_reduce_asm if use_asm_reduce else pa_reduce_v1
+    reduce_args = (reduce_waves,) if use_asm_reduce else ()
     reduce_fn(
         logits,
         splitLse,
@@ -665,6 +1092,7 @@ def pa_persistent_fwd(
         max_qlen,
         output,
         final_lse,
+        *reduce_args,
     )
 
     return logits, final_lse
@@ -955,11 +1383,13 @@ def mla_prefill_asm_fwd(
 ) -> None: ...
 
 
-def get_pa_metadata_info_v1(
-    batch_size: int,
-    num_head_k: int = 1,
-):
+def get_pa_metadata_info_v1(batch_size: int, num_head_k: int = 1):
     """
+    Allocate PA metadata buffers. Batches from 513 to 32768 reserve an internal
+    work-info scratch tail for parallel planning when KV heads divide the CU
+    count. Existing smaller buffers remain usable through the serial fallback.
+    Only records before work_indptr[-1] are attention tasks.
+
     Returns:
         1. Shape of work_metadata_ptrs followed by its scalar type.
         2. Shape of work_indptr followed by its scalar type.
@@ -972,10 +1402,16 @@ def get_pa_metadata_info_v1(
     gpu = torch.cuda.current_device()
     device_properties = torch.cuda.get_device_properties(gpu)
     cu_num = device_properties.multi_processor_count
-
     tile_cnt = batch_size
     max_work = (tile_cnt + cu_num - 1) * num_head_k
     max_split_tiles = min(batch_size + cu_num - 1, (cu_num - 1) * 2)
+
+    if (
+        512 < batch_size <= 32768
+        and 1 <= num_head_k <= cu_num
+        and cu_num % num_head_k == 0
+    ):
+        max_work += batch_size + 2 * ((batch_size + 511) // 512)
 
     return (
         ((2), torch.uint64),  # work_metadata_ptrs
@@ -1017,14 +1453,33 @@ def get_pa_metadata_v1(
         num_heads_per_head_k: Equals to num_heads_q // num_heads_k.
         num_heads_k: num_heads_k.
         is_causal: Whether causal mask is enabled.
+        Work records use partial_qo_loc=-1 for direct output and nonnegative
+        indexes for split output. The metadata does not encode buffer dtype.
+        For block_size=16, KV split granularity is overridden internally: page16 uses
+        256-token tiles when fast_mode=True on 256-CU gfx950, causal Q4/GQA16,
+        one KV head, 1-64 requests, max_seqlen_qo=uni_seqlen_qo=4 and the full
+        CU worker budget. Other page16 configurations retain page-granularity
+        planning. Other page sizes use the supplied kv_granularity unchanged,
+        including the original page1024 path when kv_granularity=1024.
+        Tile-aligned splits can change rounding, so attention need not be
+        bit-exact to the original page16 plan.
         Options: Detailed settings for spliting. All of them are optional.
-            kv_granularity: default=16. The granularity on kv sequence length when cutting batch.
+            kv_granularity: default=16. KV split granularity in tokens; overridden for page16 as above.
             max_seqlen_qo: default=-1. Used to check lds usage and save time. value less than 1 means unknown.
             uni_seqlen_qo: default=-1. Sequence length of qo is uniform across batches. value less than 1 means the
                            length is not fixed.
-            fast_mode: default=True. Whether user wants metadata become as fast as possible. Note that fast
-                       mode may lead to bad overall performance.
+            fast_mode: default=True. In addition to the automatic tile path above, uses parallel
+                       generation for dense, single-Q-tile inputs
+                       with page size 16, up to 32768 requests and
+                       the full CU worker budget. False, other page sizes or configurations, or
+                       buffers without the extra scratch space (see get_pa_metadata_info_v1) use
+                       the serial generator with identical metadata. Valid inputs require consistent
+                       indptrs, context lengths and positive Q lengths. Empty contexts have no
+                       attention work in the parallel path; callers own their outputs.
             topk: default=-1. Top-k tokens selected for sparse attention. -1 means non-sparse attention.
+            max_split_per_batch: Global worker budget:
+                       negative uses the CU count, otherwise min(CUs, batch * value).
+                       The budget must be positive and divisible by the KV-head count.
     Outputs:
         [0] work_metadata_ptrs  (2)                 Two 64-bits pointers point to the 1st element of work_indptr and
                                                     work_info.
@@ -1766,6 +2221,17 @@ def _get_mla_decode_shape_support_cached(
             f"mla_reduce_v1 has no ({p.kernel_num_heads} heads, "
             f"head_dim {v_head_dim}) case"
         )
+    # The stage-1 asm kernels and opus_mla_decode_fwd are built for the 512-element
+    # MLA latent row, however many reduce cases exist for other head dims (those
+    # serve prefill).
+    bad_v_dim = (asm_route or backend is MlaBackend.OPUS) and v_head_dim != 512
+    if bad_v_dim:
+        kernels = (
+            "opus_mla_decode_fwd only supports"
+            if backend is MlaBackend.OPUS
+            else f"{backend.value} decode kernels only support"
+        )
+        reasons.append(f"{kernels} v_head_dim 512, got {v_head_dim}")
     if ps1_folded:
         reasons.append(
             f"{backend.value} kernels read unfolded heads; planner {planner} folds "
@@ -1792,6 +2258,7 @@ def _get_mla_decode_shape_support_cached(
     if (
         (persistent and not planner_accepts)
         or (persistent and not p.reduce_supported)
+        or bad_v_dim
         or ps1_folded
         or hk_problems
         or opus_problems
@@ -2126,7 +2593,10 @@ def _mla_legacy_max_qo_tiles_per_batch(
             )
         )
         or (
-            get_gfx() in ("gfx942", "gfx950")
+            # Sparse sizing returns before the shared head plan is applied.
+            # Reserve four PS1 QH16 tiles there; dense sizing already covers the
+            # fold through the plan, so keep its smaller legacy estimate.
+            (get_gfx() == "gfx950" or (get_gfx() == "gfx942" and not is_sparse))
             and num_head_qo == 64
             and q_dtype == dtypes.fp8
             and kv_dtype == dtypes.fp8
@@ -2136,7 +2606,7 @@ def _mla_legacy_max_qo_tiles_per_batch(
             # Mirrors the C++ gate, which tests max_seqlen_qo rather than the
             # sparse-collapsed length; a mismatch here would size the reduce
             # buffers for a fold the planner does not perform.
-            get_gfx() == "gfx1250"
+            get_gfx() in ("gfx1250", "gfx1250-strict")
             and env_flag_atoi("AITER_MLA_DECODE_PS1_FLYDSL")
             and q_dtype == dtypes.fp8
             and kv_dtype == dtypes.fp8
@@ -2169,7 +2639,7 @@ def _mla_legacy_max_qo_tiles_per_batch(
             and fast_mode
         )
         or (
-            get_gfx() == "gfx1250"
+            get_gfx() in ("gfx1250", "gfx1250-strict")
             and env_flag_atoi("AITER_MLA_DECODE_PS1_FLYDSL")
             and q_dtype == dtypes.fp8
             and kv_dtype == dtypes.fp8
@@ -2875,50 +3345,3 @@ def hk_mla_v40_decode_fwd(
         raise NotImplementedError(
             f"hk_mla_v40_decode_fwd has no implementation for arch {arch_id}"
         )
-
-
-@compile_ops("module_mla_decode_opus", ffi_type="ctypes")
-def opus_mla_decode_mxfp8_fwd(
-    q_nope: torch.Tensor,  # [total_q, H, D_NOPE]      fp8
-    q_scale: torch.Tensor,  # [total_q, H, D_SCALE]     uint8 (E8M0)
-    q_rope: torch.Tensor,  # [total_q, H, D_ROPE]      bf16
-    kv_nope: torch.Tensor,  # [total_tokens, D_NOPE]    fp8
-    kv_scale: torch.Tensor,  # [total_tokens, D_SCALE]   uint8 (E8M0)
-    kv_rope: torch.Tensor,  # [total_tokens, D_ROPE]    bf16
-    qo_indptr: torch.Tensor,
-    kv_indptr: torch.Tensor,
-    kv_indices: torch.Tensor,
-    work_indptr: torch.Tensor,
-    work_info_set: torch.Tensor,
-    page_size: int,
-    softmax_scale: float,
-    logits: torch.Tensor,  # aiter split_output [num_partials,1,H,D_NOPE] fp32
-    attn_lse: torch.Tensor,  # aiter split_lse    [num_partials,1,H,1]      fp32
-    out: torch.Tensor,  # final [total_q, H, D_NOPE] bf16
-    final_lse: torch.Tensor | None = None,
-) -> None: ...
-
-
-@compile_ops("module_mla_decode_opus", ffi_type="ctypes")
-def opus_mla_decode_fwd(
-    q: torch.Tensor,  # [total_q, H, 576] bf16 or fp8 (merged nope+rope)
-    kv: torch.Tensor,  # [total_tokens, ..., 576] same dtype as q, page_size == 1
-    qo_indptr: torch.Tensor,
-    kv_indptr: torch.Tensor,
-    kv_indices: torch.Tensor,
-    work_indptr: torch.Tensor,
-    work_info_set: torch.Tensor,
-    page_size: int,
-    softmax_scale: float,
-    logits: torch.Tensor,  # aiter split_output [num_partials,1,H,512] fp32
-    attn_lse: torch.Tensor,  # aiter split_lse    [num_partials,1,H,1]   fp32
-    out: torch.Tensor,  # final [total_q, H, 512] bf16
-    final_lse: torch.Tensor | None = None,  # [total_q, H] fp32
-    q_scale: torch.Tensor | None = None,  # fp8: float[1] per-tensor descale
-    kv_scale: torch.Tensor | None = None,  # fp8: float[1] per-tensor descale
-    max_seqlen_q: int = -1,  # fp8: required, picks the kernel; bf16: unused
-    causal: bool = True,  # fp8: mask across the max_seqlen_q query tokens
-    g_kv_indptr: torch.Tensor | None = None,  # fp8 round-robin CP: GLOBAL kv_indptr
-    cp_world_size: int = 1,  # fp8 round-robin CP: number of ranks, 1 = no CP
-    cp_rank: int = 0,  # fp8 round-robin CP: this rank
-) -> None: ...

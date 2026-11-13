@@ -7,7 +7,8 @@ arch has a kernel for the operands' w_scale block.
 ``XQ [M, B, K]`` fp8, ``WQ [B, N, K]`` fp8 preshuffled, ``x_scale`` and
 ``w_scale`` e8m0 blocks, ``Out [M, B, N]`` bf16. ``x_scale`` is row-major, or
 with x_scale_transposed (B = 1, 1x128 blocks) column-major [K / 128, M] under
-the same shape, the blockscale convention. The per-arch modules
+the same shape, the blockscale convention. A gfx1250 1x32 ``w_scale`` holds
+n32k4-shuffled bytes (``shuffle_scale_n32k4``), gfx950's is row-major. The per-arch modules
 (batched_gemm_a8w8_gfx950, batched_gemm_a8w8_gfx1250) hold the kernels; a tuned
 kernelName names one of them, so it is only valid on its arch.
 """
@@ -20,24 +21,35 @@ from collections.abc import Callable
 
 from torch import Tensor
 
+from aiter.jit.utils.build_targets import base_gfx_arch
 from aiter.jit.utils.chip_info import get_gfx
 
 from ..gemm_op_common import mxscale_w_scale_block
 
 _GFX950 = ("batched_gemm_a8w8_gfx950", "run_bmm_a8w8_mxfp8_gfx950")
 _GFX1250 = ("batched_gemm_a8w8_gfx1250", "run_bmm_a8w8_mxfp8_128_gfx1250")
+_GFX1250_MX32 = ("batched_gemm_a8w8_gfx1250", "run_bmm_a8w8_mxfp8_32_gfx1250")
 # (gfx, w_scale block, x_scale column-major) -> (module, runner, its layout
 # argument). Only the running arch's module is ever imported.
 _RUNNERS = {
     ("gfx950", "32x32", False): (*_GFX950, {}),
+    ("gfx950", "32x32", True): (*_GFX950, {"x_scale_transposed": True}),
+    ("gfx950", "1x32", False): (*_GFX950, {}),
+    ("gfx950", "1x32", True): (*_GFX950, {"x_scale_transposed": True}),
     ("gfx950", "128x128", False): (*_GFX950, {}),
     ("gfx950", "128x128", True): (*_GFX950, {"x_scale_transposed": True}),
     ("gfx1250", "128x128", False): (*_GFX1250, {}),
+    # 1x32: the n32k4-shuffled [B, N, K/32] scale every gfx1250 mxfp8_32 GEMM
+    # reads; 32x32: the raw block scale, read in place.
+    ("gfx1250", "1x32", False): (*_GFX1250_MX32, {}),
+    ("gfx1250", "32x32", False): (*_GFX1250_MX32, {"w_scale_32x32": True}),
 }
 
 
 @functools.cache
 def _runner(gfx: str, w_scale_block: str, x_scale_transposed: bool) -> Callable | None:
+    # A0 bring-up: the gfx1250 runners serve gfx1250-strict too.
+    gfx = base_gfx_arch(gfx)
     entry = _RUNNERS.get((gfx, w_scale_block, x_scale_transposed))
     if entry is None:
         return None
@@ -53,6 +65,18 @@ def bmm_a8w8_mxfp8_supported(
     return _runner(get_gfx(), w_scale_block, x_scale_transposed) is not None
 
 
+def bmm_a8w8_mxfp8_fused_quant_supported(
+    w_scale_block: str, x_scale_transposed: bool = False
+) -> bool:
+    """Whether this arch's kernel for a w_scale block can fuse the output
+    group-32 MXFP8 quant into its epilogue (``y_scale_out=``). Only the gfx1250
+    batched mxfp8_32 runner does. The lookup goes through ``base_gfx_arch``,
+    the same mapping ``_runner`` uses, so gfx1250-strict selects that runner
+    instead of missing the table and looking like an unsupported shape."""
+    entry = _RUNNERS.get((base_gfx_arch(get_gfx()), w_scale_block, x_scale_transposed))
+    return entry is not None and entry[:2] == _GFX1250_MX32
+
+
 def run_bmm_a8w8_mxfp8(
     XQ: Tensor,
     WQ: Tensor,
@@ -61,11 +85,17 @@ def run_bmm_a8w8_mxfp8(
     Out: Tensor,
     kernel_name: str | None = None,
     x_scale_transposed: bool = False,
+    y_scale_out: Tensor | None = None,
 ) -> Tensor:
     """``Out[m, b] = dequant(XQ[m, b]) @ dequant(WQ[b]).T`` on this arch's
     kernel for the w_scale block and x_scale layout; writes into ``Out`` and
     returns it. ``kernel_name`` is a tuned row's kernelName, else the arch's
-    heuristic picks one."""
+    heuristic picks one.
+
+    ``y_scale_out``: when given, the GEMM fuses the output group-32 MXFP8 quant
+    into its epilogue -- ``Out`` is the e4m3 output and ``y_scale_out`` the
+    row-major e8m0 scale. Only the gfx1250 batched mxfp8_32 runner supports it
+    (see :func:`bmm_a8w8_mxfp8_fused_quant_supported`)."""
     n, k = WQ.shape[-2], WQ.shape[-1]
     w_scale_block = mxscale_w_scale_block(tuple(w_scale.shape), n, k)
     run = _runner(get_gfx(), w_scale_block, x_scale_transposed)
@@ -75,7 +105,26 @@ def run_bmm_a8w8_mxfp8(
             f"no preshuffled mxfp8 BMM kernel reads a {w_scale_block} w_scale "
             f"with a {layout} x_scale on {get_gfx()}"
         )
+    if y_scale_out is not None:
+        if not bmm_a8w8_mxfp8_fused_quant_supported(w_scale_block, x_scale_transposed):
+            raise NotImplementedError(
+                f"fused output quant (y_scale_out) is unsupported for a "
+                f"{w_scale_block} w_scale on {get_gfx()}"
+            )
+        return run(
+            XQ,
+            WQ,
+            x_scale,
+            w_scale,
+            Out,
+            kernel_name=kernel_name,
+            y_scale_out=y_scale_out,
+        )
     return run(XQ, WQ, x_scale, w_scale, Out, kernel_name=kernel_name)
 
 
-__all__ = ["bmm_a8w8_mxfp8_supported", "run_bmm_a8w8_mxfp8"]
+__all__ = [
+    "bmm_a8w8_mxfp8_fused_quant_supported",
+    "bmm_a8w8_mxfp8_supported",
+    "run_bmm_a8w8_mxfp8",
+]

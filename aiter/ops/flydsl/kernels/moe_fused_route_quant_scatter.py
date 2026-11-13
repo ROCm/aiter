@@ -63,13 +63,18 @@ from types import SimpleNamespace
 import flydsl.compiler as flyc
 import flydsl.expr as fx
 from flydsl._mlir.dialects import llvm
-from flydsl.expr import const_expr, gpu, ptrtoint, range_constexpr, rocdl
+from flydsl.expr import arith, const_expr, gpu, ptrtoint, range_constexpr, rocdl
 from flydsl.expr.typing import Int32, T
 from flydsl.runtime.device import get_rocm_arch
 
 from aiter.ops.flydsl.kernels import buffer_ops
 from aiter.ops.flydsl.kernels import tdm_ops_gfx1250 as tdm_ops
-from aiter.ops.flydsl.kernels.gemm_common_gfx1250 import make_lds_copy_ops
+from aiter.ops.flydsl.kernels.gemm_common_gfx1250 import (
+    fused_silu_swiglu_elem,
+    fused_situv2_elem,
+    make_lds_copy_ops,
+    situv2_consts,
+)
 from aiter.ops.flydsl.kernels.kernels_common import (
     format_kernel_name,
     get_warp_size,
@@ -154,7 +159,10 @@ _NATIVE_SCALED_CVT_ARCHS = ("gfx950",)
 # fp4 (i32, 8 nibbles) / fp8 (v2i32, 8 e4m3 bytes), dividing by the e8m0 exponent
 # carried in the f32 scale. We emit them via inline asm so they do not depend on
 # the MLIR rocdl op lowering.
-_PK8_BF16_ARCHS = ("gfx1250",)
+_PK8_BF16_ARCHS = (
+    "gfx1250",
+    "gfx1250-strict",
+)
 
 
 def _arch_has_pk8(arch: str) -> bool:
@@ -301,6 +309,33 @@ def _quant_layout(feat_dim: int, quant_mode: str, wmma_rep: int) -> SimpleNamesp
     )
 
 
+def _load_activated_gate_up(c, hidden_rsrc, col_base):
+    """Load element-interleaved BF16 gate/up and return activated BF16 values."""
+    bf16 = fx.Numeric.from_ir_type(T.bf16)
+    values = []
+    # Each activated element consumes one dword: BF16 gate followed by BF16 up.
+    for offset in range_constexpr(0, int(c.elems_per_lane), 2):
+        raw = buffer_ops.buffer_load(
+            hidden_rsrc, col_base + fx.Int32(offset), vec_width=2, dtype=T.i32
+        )
+        pairs = fx.Vector(raw).bitcast(bf16).to(fx.Float32)
+        for pair in range_constexpr(2):
+            gate, up = pairs[2 * pair], pairs[2 * pair + 1]
+            if const_expr(c.activation == 3):
+                value = fused_situv2_elem(gate, up, consts=c.situ_consts)
+            else:
+                value = fused_silu_swiglu_elem(
+                    gate,
+                    up,
+                    swiglu=c.activation == 2,
+                    limit_f32=c.act_limit,
+                    neg_limit_f32=-c.act_limit,
+                )
+            values.append(value)
+    # Match the BF16 activation intermediate used by the unfused quant path.
+    return fx.Vector.from_elements(values, fx.Float32).to(bf16)
+
+
 def _emit_quant_block_loop(c: SimpleNamespace) -> None:
     """Emit one warp's per-MX-block quant + e8m0 scale-preshuffle loop.
 
@@ -332,12 +367,20 @@ def _emit_quant_block_loop(c: SimpleNamespace) -> None:
     payload_dests = getattr(c, "payload_dests", c.dests)
     # A zero-length descriptor is how a dead destination is switched off, so
     # the quant pass stays one basic block.
-    payload_records = getattr(c, "payload_num_records", payload_bytes_per_row)
+    payload_preshuffled = getattr(c, "payload_preshuffled", False)
+    payload_records = getattr(
+        c,
+        "payload_num_records",
+        payload_bytes_per_row * (16 if payload_preshuffled else 1),
+    )
     dst_payload = []
     for dst in payload_dests:
-        row_addr = (
-            c.payload_base + fx.Uint64(dst.payload_row_i32) * payload_bytes_per_row
+        payload_row = (
+            fx.Uint64(dst.payload_row_i32) // 16 * 16
+            if payload_preshuffled
+            else fx.Uint64(dst.payload_row_i32)
         )
+        row_addr = c.payload_base + payload_row * payload_bytes_per_row
         dst_payload.append(
             buffer_ops.create_buffer_resource_from_addr(
                 row_addr, num_records_bytes=payload_records
@@ -442,8 +485,11 @@ def _emit_quant_block_loop(c: SimpleNamespace) -> None:
             # col_base = mx_block*32 + lane_in_block*8.
             col_base = mx_block * fx.Int32(32) + c.lane_in_block * c.c_elems_per_lane
             # 2 bf16/dword -> 4 dwords; one aligned dwordx4 = 8 bf16.
-            dwords4 = _emit_hidden_load(it)
-            bf16x8 = fx.Vector(dwords4).bitcast(fx.Numeric.from_ir_type(T.bf16))
+            if const_expr(getattr(c, "activation", 0)):
+                bf16x8 = _load_activated_gate_up(c, hidden_rsrc, col_base)
+            else:
+                dwords4 = _emit_hidden_load(it)
+                bf16x8 = fx.Vector(dwords4).bitcast(fx.Numeric.from_ir_type(T.bf16))
 
             # per-block amax over this lane's 8 elems, then a butterfly
             # shuffle_xor across the block's 4 lanes.
@@ -471,13 +517,16 @@ def _emit_quant_block_loop(c: SimpleNamespace) -> None:
             col_base = mx_block * fx.Int32(32) + c.lane_in_block * c.c_elems_per_lane
             hidden_dword = (feat_elem_base + col_base) >> c.c1_i32  # 2 bf16/dword
 
-            dword_raw = buffer_ops.buffer_load(
-                hidden_rsrc, hidden_dword, vec_width=1, dtype=i32
-            )
             vec2_f32_ty = T.vec(ELEMS_PER_LANE, f32)
-            bf16_pair = fx.Vector.from_elements(
-                [dword_raw], fx.Numeric.from_ir_type(i32)
-            ).bitcast(fx.Numeric.from_ir_type(T.bf16))
+            if const_expr(getattr(c, "activation", 0)):
+                bf16_pair = _load_activated_gate_up(c, hidden_rsrc, col_base)
+            else:
+                dword_raw = buffer_ops.buffer_load(
+                    hidden_rsrc, hidden_dword, vec_width=1, dtype=i32
+                )
+                bf16_pair = fx.Vector.from_elements(
+                    [dword_raw], fx.Numeric.from_ir_type(i32)
+                ).bitcast(fx.Numeric.from_ir_type(T.bf16))
             f32_pair = bf16_pair.extf(vec2_f32_ty)
             x0 = fx.Vector(f32_pair)[0]
             x1 = fx.Vector(f32_pair)[1]
@@ -667,12 +716,22 @@ def _emit_payload_stores(c, dst_payload, payload_val, mx_block):
     byte offset). A lane-unit ptr_buf_tensor store is correct and cheaper on
     most rows but perturbs VGPR alloc by +1..+4 on the fp4/fp8 pk8 modules.
     """
-    payload_byte_off = (
+    block_byte_off = (
         mx_block * c.c_payload_bytes_per_block
         + c.lane_in_block * c.c_payload_bytes_per_lane
     )
     payload_cache = getattr(c, "payload_cache_modifier", 0)
-    for rsrc in dst_payload:
+    payload_dests = getattr(c, "payload_dests", c.dests)
+    for rsrc, dst in zip(dst_payload, payload_dests):
+        if const_expr(getattr(c, "payload_preshuffled", False)):
+            # Each K32 MXFP4 block spans 16 rows x 16 packed bytes.
+            payload_byte_off = (
+                mx_block * arith.constant(256, type=c.i32)
+                + (fx.Uint32(dst.payload_row_i32) % 16) * 16
+                + c.lane_in_block * c.c_payload_bytes_per_lane
+            )
+        else:
+            payload_byte_off = block_byte_off
         buffer_ops.buffer_store(
             payload_val,
             rsrc,
@@ -713,10 +772,15 @@ def _emit_prequant_copy_preshuffle(c: SimpleNamespace) -> None:
     dst = c.dests[0]
 
     payload_bytes_per_row = c.payload_bytes_per_row
-    dst_addr = c.payload_base + fx.Uint64(dst.payload_row_i32) * payload_bytes_per_row
+    payload_preshuffled = bool(getattr(c, "payload_preshuffled", False))
+    dst_row = fx.Uint64(dst.payload_row_i32)
+    if const_expr(payload_preshuffled):
+        dst_row = dst_row // 16 * 16
+    dst_addr = c.payload_base + dst_row * payload_bytes_per_row
     src_addr = c.hidden_base + fx.Uint64(c.feat_row_i32) * c.feat_bytes_per_row
     dst_rsrc = buffer_ops.create_buffer_resource_from_addr(
-        dst_addr, num_records_bytes=payload_bytes_per_row
+        dst_addr,
+        num_records_bytes=payload_bytes_per_row * (16 if payload_preshuffled else 1),
     )
     src_rsrc = buffer_ops.create_buffer_resource_from_addr(
         src_addr, num_records_bytes=c.feat_bytes_per_row
@@ -759,10 +823,15 @@ def _emit_prequant_copy_preshuffle(c: SimpleNamespace) -> None:
         scale_chunks.append((g, src_dword))
 
     for chunk_idx, v in payload_chunks:
+        payload_byte_off = chunk_idx * c16
+        if const_expr(payload_preshuffled):
+            payload_byte_off = (
+                chunk_idx * fx.Int32(256) + (fx.Uint32(dst.payload_row_i32) % 16) * c16
+            )
         buffer_ops.buffer_store(
             v,
             dst_rsrc,
-            chunk_idx * c16,
+            payload_byte_off,
             offset_is_bytes=True,
             cache_modifier=_PREQUANT_NT_STORE,
         )
@@ -1346,6 +1415,11 @@ def build_moe_fused_quant_preshuffle_module(
     wmma_rep: int,
     quant_mode: str = "fp4",
     skip_padding: bool = False,
+    payload_preshuffled: bool = False,
+    activation: int = 0,
+    swiglu_limit: float = float("inf"),
+    situ_beta: float = 1.0,
+    situ_linear_beta: float = 1.0,
 ):
     """Return a JIT launcher for the fused (grouped) quant + scale-preshuffle kernel.
 
@@ -1369,6 +1443,9 @@ def build_moe_fused_quant_preshuffle_module(
                        caller must pass a real ``masked_m``. When False every one
                        of the ``E*max_m`` rows is quantized (padding included);
                        ``masked_m`` is then ignored (a dummy may be passed).
+    activation : int  0 for already-activated input; 1/2/3 for Silu/Swiglu/SiTUv2.
+                       Nonzero consumes element-interleaved gate/up (2*feat_dim
+                       BF16 columns) and fuses activation before quantization.
 
     Launcher signature::
 
@@ -1383,12 +1460,17 @@ def build_moe_fused_quant_preshuffle_module(
       n_rows          : E*max_m  (padding rows skipped iff skip_padding)
       max_m           : per-expert row capacity (for expert = row // max_m)
     """
+    if activation not in (0, 1, 2, 3):
+        raise ValueError(
+            "activation must be 0 (none), 1 (silu), 2 (swiglu), or 3 (situv2)"
+        )
+    if activation == 3 and (situ_beta <= 0 or situ_linear_beta <= 0):
+        raise ValueError("SiTUv2 beta and linear_beta must be positive")
+    # Activation input is (gate0, up0, gate1, up1, ...), twice the output K.
+    input_row_bytes = feat_dim * (4 if activation else 2)
     L = _quant_layout(feat_dim, quant_mode, wmma_rep)
-    # Unpack into locals so the @kernel closure captures the quant_mode-derived
-    # scalars (is_fp8, payload geometry, ...). The JIT disk cache keys on the
-    # launch function's source + scalar closure values; if these stayed hidden
-    # inside the ``L`` namespace the fp4 and fp8 variants (same feat_dim/wmma_rep)
-    # would hash to the same key and silently share one binary.
+    if payload_preshuffled and (quant_mode != "fp4" or feat_dim % 128):
+        raise ValueError("preshuffled payload requires MXFP4 and K divisible by 128")
     is_fp8 = L.is_fp8
     use_native = L.use_native
     use_pk8 = L.use_pk8
@@ -1415,6 +1497,8 @@ def build_moe_fused_quant_preshuffle_module(
     module_name = (
         f"moe_fused_quant_preshuffle_fd{feat_dim}_r{wmma_rep}"
         f"_{quant_mode}_{L.native_tag}_{skip_tag}"
+        f"{'_apre' if payload_preshuffled else ''}"
+        f"{'_act' + str(activation) if activation else ''}"
     )
 
     @flyc.kernel(name=module_name, known_block_size=[BLOCK_THREADS, 1, 1])
@@ -1518,10 +1602,21 @@ def build_moe_fused_quant_preshuffle_module(
                     ],
                     payload_base=payload_base,
                     payload_bytes_per_row=payload_bytes_per_row,
+                    payload_preshuffled=payload_preshuffled,
                     hidden_base=hidden_base,
-                    feat_bytes_per_row=feat_dim * 2,
+                    feat_bytes_per_row=input_row_bytes,
                     feat_row_i32=row,
                     scale_t=scale_t,
+                    activation=activation,
+                    elems_per_lane=elems_per_lane,
+                    act_limit=fx.Float32(swiglu_limit),
+                    situ_consts=(
+                        situv2_consts(
+                            fx.Float32(situ_beta), fx.Float32(situ_linear_beta)
+                        )
+                        if activation == 3
+                        else None
+                    ),
                 )
                 _emit_quant_block_loop(c)
 
@@ -1582,6 +1677,7 @@ def build_moe_fused_quant_preshuffle_route_ksplit_module(
     src_scale_bytes_per_row: int = 0,
     fuse_ep_psum: bool = False,
     row_major_scale: bool = False,
+    payload_preshuffled: bool = False,
 ):
     """Route-indexed grouped quant+preshuffle.
 
@@ -1601,6 +1697,8 @@ def build_moe_fused_quant_preshuffle_route_ksplit_module(
     rank assigns, which no sender knows.
     """
     L = _quant_layout(feat_dim, quant_mode, wmma_rep)
+    if payload_preshuffled and (quant_mode != "fp4" or feat_dim % 128):
+        raise ValueError("preshuffled payload requires MXFP4 and K divisible by 128")
     if not L.use_pk8:
         raise NotImplementedError(
             "route-indexed K-split is currently enabled only for gfx1250 pk8"
@@ -1660,7 +1758,7 @@ def build_moe_fused_quant_preshuffle_route_ksplit_module(
     module_name = (
         f"moe_fused_quant_preshuffle_routeks_fd{feat_dim}_r{wmma_rep}"
         f"_{quant_mode}_{L.native_tag}_{source_tag}{remap_tag}{psum_tag}{ksplit_tag}"
-        f"{prequant_tag}{rm_tag}"
+        f"{prequant_tag}{rm_tag}{'_apre' if payload_preshuffled else ''}"
     )
 
     @flyc.kernel(name=module_name, known_block_size=[BLOCK_THREADS, 1, 1])
@@ -1874,6 +1972,7 @@ def build_moe_fused_quant_preshuffle_route_ksplit_module(
                 block_iters=1 if ksplit else block_iters,
                 payload_base=payload_base,
                 payload_bytes_per_row=payload_bytes_per_row,
+                payload_preshuffled=payload_preshuffled,
                 hidden_base=hidden_base,
                 feat_bytes_per_row=src_bytes_per_row,
                 feat_row_i32=feat_row_i32,
@@ -1984,6 +2083,29 @@ def build_moe_fused_quant_preshuffle_route_ksplit_module(
     }
 
     return launch_fused
+
+
+def _token_multidest_live_rows(raw_rows):
+    """One token's destination rows, each DROPPED_ROUTE_ROW (a route to expert
+    -1, e.g. a pad row past the real row count) pointed at one of the token's
+    live rows, and whether it has any live row.
+
+    A repeated destination rewrites the same bytes to the same row, so it needs
+    no branch. A token with no live row is switched off whole, as a token past
+    the end is; its rows are then 0 so every address stays in range.
+    """
+    live = [fx.Int32(row) >= 0 for row in raw_rows]
+    alias = fx.Int32(0)
+    for k in reversed(range(len(raw_rows))):
+        alias = live[k].select(fx.Int32(raw_rows[k]), alias)
+    rows = [
+        fx.Uint32(live[k].select(fx.Int32(raw_rows[k]), alias))
+        for k in range(len(raw_rows))
+    ]
+    any_live = live[0]
+    for flag in live[1:]:
+        any_live = any_live | flag
+    return rows, any_live
 
 
 def _token_multidest_scale_base(
@@ -2214,18 +2336,21 @@ def build_moe_token_multidest_quant_module(
         # bounds check rather than by a branch.
         valid = token < fx.Uint32(token_num)
         token_eff = valid.select(token, fx.Uint32(c0_i32))
-        pay_records = valid.select(fx.Int32(payload_bytes_per_row), c0_i32)
-        # Sign-extended to i64 by the descriptor builder, so stay under 2 GiB.
-        scale_records = valid.select(fx.Int32(_SCALE_RSRC_MAX_BYTES), c0_i32)
         if token0 < fx.Uint32(token_num):
             rows_t = ptr_buf_tensor(topids_to_rows)
             route0 = token_eff * fx.Int32(topk)
             # Scalar loads: the route is wave-uniform, and landing each row in
             # an SGPR is what keeps its destination descriptor uniform too.
-            rows = [
-                fx.Uint32(buf_scalar_load(rows_t, route0 + fx.Int32(k)))
-                for k in range_constexpr(topk)
-            ]
+            rows, any_live = _token_multidest_live_rows(
+                [
+                    fx.Int32(buf_scalar_load(rows_t, route0 + fx.Int32(k)))
+                    for k in range_constexpr(topk)
+                ]
+            )
+            token_live = valid & any_live
+            pay_records = token_live.select(fx.Int32(payload_bytes_per_row), c0_i32)
+            # Sign-extended to i64 by the descriptor builder, so stay under 2 GiB.
+            scale_records = token_live.select(fx.Int32(_SCALE_RSRC_MAX_BYTES), c0_i32)
             scales = [
                 _token_multidest_scale_base(
                     row, c_rows_per_tile, c_dst_scale_dwords_per_row, c16_i32
@@ -2518,18 +2643,21 @@ def build_moe_token_multidest_compact_quant_module(
 
             valid = token < fx.Uint32(token_num)
             token_eff = valid.select(token, fx.Uint32(c0_i32))
-            pay_records = valid.select(fx.Int32(payload_bytes_per_row), c0_i32)
-            scale_records = valid.select(fx.Int32(_SCALE_RSRC_MAX_BYTES), c0_i32)
 
             rows_t = ptr_buf_tensor(topids_to_rows)
             route0 = token_eff * fx.Int32(topk)
-            rows = [
-                fx.Uint32(buf_scalar_load(rows_t, route0 + fx.Int32(k)))
-                for k in range_constexpr(topk)
-            ]
+            rows, any_live = _token_multidest_live_rows(
+                [
+                    fx.Int32(buf_scalar_load(rows_t, route0 + fx.Int32(k)))
+                    for k in range_constexpr(topk)
+                ]
+            )
+            token_live = valid & any_live
+            pay_records = token_live.select(fx.Int32(payload_bytes_per_row), c0_i32)
+            scale_records = token_live.select(fx.Int32(_SCALE_RSRC_MAX_BYTES), c0_i32)
 
             r2t_t = ptr_buf_tensor(row_to_token)
-            write_r2t = fx.Boolean(valid) & (fx.Uint32(lane) == fx.Uint32(c0_i32))
+            write_r2t = fx.Boolean(token_live) & (fx.Uint32(lane) == fx.Uint32(c0_i32))
 
             def _store_r2t():
                 for k in range_constexpr(topk):
