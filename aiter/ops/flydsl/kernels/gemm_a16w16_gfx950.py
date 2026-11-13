@@ -32,6 +32,7 @@ from .tensor_shim import (
     AITER_FLYDSL_KERNARG_PRELOAD,
     AITER_FLYDSL_KERNARG_PRELOAD_COUNT,
     _run_compiled,
+    ptr_arg,
 )
 
 GEMM_A16W16_DTYPE_FP32 = 1
@@ -62,6 +63,7 @@ class GemmA16W16Gfx950Param:
     mma_n: fx.Constexpr[int]
     mma_k: fx.Constexpr[int]
     streamk_blocks: fx.Constexpr[int]
+    split_init_ring: fx.Constexpr[bool]
     unroll_hti: fx.Constexpr[bool]
     n_grouped_loads: fx.Constexpr[bool]
     # derived params
@@ -125,6 +127,7 @@ def make_gemm_a16w16_gfx950_param(
     n_grouped_loads: bool = False,
     unroll_hti: bool = False,
     streamk_blocks: int = 0,
+    split_init_ring: bool = False,
 ) -> GemmA16W16Gfx950Param:
     if in_dtype_id not in (GEMM_A16W16_DTYPE_BF16, GEMM_A16W16_DTYPE_FP16):
         raise ValueError(f"unsupported in_dtype_id={in_dtype_id}")
@@ -326,6 +329,7 @@ def make_gemm_a16w16_gfx950_param(
             f"covered_k={mma_k_repeat * k_waves * mma_k}"
         )
     return GemmA16W16Gfx950Param(
+        split_init_ring=split_init_ring,
         streamk_blocks=streamk_blocks,
         n_grouped_loads=n_grouped_loads,
         unroll_hti=unroll_hti,
@@ -380,6 +384,7 @@ def make_gemm_a16w16_gfx950_kernel_name(param: GemmA16W16Gfx950Param):
     # the specialized HTI implementations from their original schedules.
     name += "_ng4sk" if param.n_grouped_loads else ""
     name += "_hti5sk" if param.unroll_hti else ""
+    name += "_initring4" if param.split_init_ring else ""
     if (param.mma_m, param.mma_n, param.mma_k) != (16, 16, 32):
         name += f"_mi{param.mma_m}x{param.mma_n}x{param.mma_k}"
     if param.streamk_blocks:
@@ -855,18 +860,43 @@ def _gemm_a16w16_ft_device(
     def run_pipeline():
         # Prime the staged LDS pipeline: preload the first `stages - 1` K tiles
         # before entering the main loop that overlaps async loads with compute.
+        if const_expr(param.split_init_ring):
+            # Retire output initialization before issuing A/B DMA. Otherwise
+            # the owner's vmcnt(0) publication also drains its first prefetches.
+            splitk_protocol.zero_c()
+            expected_signal = splitk_protocol.take_ticket(split_k)
+            splitk_protocol.publish(expected_signal)
         for stage in range_constexpr(stages - 1):
             async_load_b_to_lds(stage, stage)
             async_load_a_to_lds(stage, stage)
             rocdl.asyncmark()
-        if const_expr(is_split_k):
+        if const_expr(is_split_k and not param.split_init_ring):
             splitk_protocol.zero_c()
             expected_signal = splitk_protocol.take_ticket(split_k)
             splitk_protocol.publish(expected_signal)
         rocdl.sched_barrier(0)
 
         main_loop_end = k_tiles - (stages - 1)
-        for k_tile in range(0, main_loop_end, 1):
+        if const_expr(param.split_init_ring):
+            # Static slots, same K order, async groups, waits and barriers.
+            cycles_end = main_loop_end // stages * stages
+            for cycle in range(0, cycles_end, stages):
+                for phase in range_constexpr(stages):
+                    rocdl.wait_asyncmark(stages - 2)
+                    rocdl.s_barrier()
+                    async_load_b_to_lds(
+                        cycle + phase + (stages - 1), (phase + stages - 1) % stages
+                    )
+                    async_load_a_to_lds(
+                        cycle + phase + (stages - 1), (phase + stages - 1) % stages
+                    )
+                    rocdl.asyncmark()
+                    compute_stage(phase, cycle + phase)
+                    rocdl.sched_barrier(0)
+
+        else:
+            cycles_end = 0
+        for k_tile in range(cycles_end, main_loop_end, 1):
             current_stage = k_tile % stages
             write_stage = (current_stage + stages - 1) % stages
             rocdl.wait_asyncmark(stages - 2)
@@ -1672,6 +1702,51 @@ gemm_a16w16_gfx950.compile_hints = {
 set_slp_vectorize_once_used(gemm_a16w16_gfx950, False)
 
 
+@flyc.jit
+def _split_init_ring_ptr(
+    op: fx.Pointer,
+    ap: fx.Pointer,
+    bp: fx.Pointer,
+    sp: fx.Pointer,
+    fp: fx.Pointer,
+    m: fx.Int32,
+    n: fx.Int32,
+    k: fx.Int32,
+    lda: fx.Int32,
+    ldb: fx.Int32,
+    split_k: fx.Int32,
+    param: GemmA16W16Gfx950Param,
+    stream: fx.Stream,
+):
+    out = fx.make_view(op, fx.make_layout((m, n), (n, 1)))
+    a = fx.make_view(ap, fx.make_layout((m, k), (lda, 1)))
+    b = fx.make_view(bp, fx.make_layout((k, n), (1, ldb)))
+    sem = fx.make_view(sp, fx.make_layout(SPLIT_K_SEMAPHORE_MAX_LEN, 1))
+    sig = fx.make_view(fp, fx.make_layout(SPLIT_K_SEMAPHORE_MAX_LEN, 1))
+    mma = fx.make_tiled_mma(
+        fx.make_mma_atom(fx.rocdl.MFMA(16, 16, 32, fx.BFloat16)),
+        fx.make_layout((2, 2, 1), (2, 1, 0)),
+        fx.make_tile(None, None, fx.make_layout((8, 4), (1, 8))),
+    )
+    working_k = (k + split_k - 1) // split_k
+    working_k = (working_k + 7) // 8 * 8
+    gemm_a16w16_gfx950_kernel._known_block_size = [256, 1, 1]
+    gemm_a16w16_gfx950_kernel._func.__name__ = (
+        make_gemm_a16w16_gfx950_kernel_name(param) + "_ptr"
+    )
+    gemm_a16w16_gfx950_kernel(
+        out, a, b, a, sem, sig, m, n, k, split_k, working_k, lda, ldb, mma, param
+    ).launch(
+        grid=(((m + 63) // 64) * ((n + 63) // 64), split_k, 1),
+        block=(256, 1, 1),
+        stream=stream,
+    )
+
+
+_split_init_ring_ptr.compile_hints = gemm_a16w16_gfx950.compile_hints
+set_slp_vectorize_once_used(_split_init_ring_ptr, False)
+
+
 @flyc.kernel
 def _streamk_gemm_kernel(
     out: fx.Tensor,
@@ -1770,11 +1845,14 @@ set_slp_vectorize_once_used(_streamk_gemm, False)
 
 
 @functools.cache
-def _gemm_a16w16_gfx950_param_for(items):
+def _gemm_a16w16_gfx950_param_for(items, split_init_shape=False):
     # Building the param struct coerces every field through FlyDSL's typing
     # layer, which costs more host time than the launch itself; it depends
     # only on the config and selected schedule, not on the exact M value.
-    return make_gemm_a16w16_gfx950_param(**dict(items))
+    config = dict(items)
+    if split_init_shape:
+        config["split_init_ring"] = _use_split_init_ring(128, 3584, 7168, config)
+    return make_gemm_a16w16_gfx950_param(**config)
 
 
 def _is_latent_hti_policy(kwargs):
@@ -1812,6 +1890,30 @@ def _use_unrolled_hti(m, n, k, kwargs):
     return (m, n, k) == (16384, 3584, 7168) and _is_latent_hti_policy(kwargs)
 
 
+def _use_split_init_ring(m, n, k, kwargs):
+    # Preserve all padded-M consumers and all other explicit configurations.
+    return (
+        (m, n, k) == (128, 3584, 7168)
+        and kwargs.get("in_dtype_id") == GEMM_A16W16_DTYPE_BF16
+        and kwargs.get("out_dtype_id") == GEMM_A16W16_DTYPE_BF16
+        and not kwargs.get("has_bias", False)
+        and not kwargs.get("a_is_transposed", False)
+        and kwargs.get("b_is_transposed", True)
+        and not kwargs.get("use_half_tile_interleaved", False)
+        and not kwargs.get("b_non_temporal", False)
+        and kwargs.get("k_stagger", 0) == 0
+        and kwargs.get("streamk_blocks", 0) == 0
+        and (kwargs.get("mma_m", 16), kwargs.get("mma_n", 16), kwargs.get("mma_k", 32))
+        == (16, 16, 32)
+        and (kwargs.get("block_m"), kwargs.get("block_n"), kwargs.get("block_k"))
+        == (64, 64, 64)
+        and (kwargs.get("stages"), kwargs.get("split_k")) == (4, 4)
+        and (kwargs.get("m_waves"), kwargs.get("n_waves"), kwargs.get("k_waves", 1))
+        == (2, 2, 1)
+        and kwargs.get("group_m", 0) == 0
+    )
+
+
 def make_gemm_a16w16_param_and_validate(m, n, k, kwargs):
     # Python caches compare True == 1 and 16.0 == 16. Validate the new
     # fields before looking up a previously built constexpr parameter.
@@ -1828,8 +1930,16 @@ def make_gemm_a16w16_param_and_validate(m, n, k, kwargs):
         "n_grouped_loads": _use_n_grouped_loads(m, n, k, kwargs),
         "unroll_hti": _use_unrolled_hti(m, n, k, kwargs),
     }
+    # Never accept the internal schedule flag from a caller. Only the
+    # exact-shape cache entry can derive it from a validated configuration.
+    kwargs.pop("split_init_ring", None)
     try:
-        result = _gemm_a16w16_gfx950_param_for(tuple(sorted(kwargs.items())))
+        if (m, n, k) == (128, 3584, 7168):
+            result = _gemm_a16w16_gfx950_param_for(
+                tuple(sorted(kwargs.items())), split_init_shape=True
+            )
+        else:
+            result = _gemm_a16w16_gfx950_param_for(tuple(sorted(kwargs.items())))
     except Exception:  # noqa: BLE001 - invalid policies are filtered here
         return None
     split_k = kwargs.get("split_k", 1)
@@ -2125,6 +2235,47 @@ def gemm_a16w16(
                 ),
             )
         return out
+    if param.split_init_ring:
+        # Exact no-bias BF16 NT policy only; ranks, shapes, layouts and DMA
+        # alignment were checked above. Scalars/strides stay runtime inputs
+        # so this launcher preserves the validated device schedule.
+        if device.type != "cuda" or stream.device != device:
+            raise ValueError("split GEMM tensors and stream must share a CUDA device")
+        a_span = ((m - 1) * a.stride(0) + k) * a.element_size()
+        b_span = ((n - 1) * b.stride(1) + k) * b.element_size()
+        # Large spans keep the legacy tensor launcher rather than narrowing
+        # its domain. The fast pointer ABI requires signed-i32 offsets.
+        if max(a_span, b_span) <= (1 << 31) - 1:
+            # A first eager use after cold capture may allocate new counters.
+            # Initialize those on the launch stream, not the ambient stream.
+            if stream == torch.cuda.current_stream(device):
+                semaphore, signal = get_split_k_buffers(stream, device, split_k)
+            else:
+                with torch.cuda.stream(stream):
+                    semaphore, signal = get_split_k_buffers(stream, device, split_k)
+            _run_compiled(
+                _split_init_ring_ptr,
+                ptr_arg(out, fx.BFloat16),
+                ptr_arg(a, fx.BFloat16),
+                ptr_arg(b, fx.BFloat16),
+                ptr_arg(semaphore, fx.Int64),
+                ptr_arg(signal, fx.Int32),
+                m,
+                n,
+                k,
+                int(a.stride(0)),
+                int(b.stride(1)),
+                split_k,
+                param,
+                fx.Stream(stream),
+                specialization_key=(
+                    device.index,
+                    a.dtype,
+                    out.dtype,
+                    param.__cache_signature__(),
+                ),
+            )
+            return out
     semaphore, signal = get_split_k_buffers(stream, device, split_k)
     a_arg = _dynamic_tensor_arg(a, 0 if a_is_transposed else 1)
     b_arg = _dynamic_tensor_arg(b, 0 if b_is_transposed else 1)

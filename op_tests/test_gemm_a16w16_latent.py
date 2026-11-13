@@ -3,14 +3,14 @@
 
 """BF16 latent-projection GEMMs: caller buffers and changed graph inputs.
 
-The only optimized shapes are the two exact M16384 projections. Both M128
-policies and non-target padded-M consumers retain their original routes.
-The defaults also check unchanged up-M128 and padded-M boundaries.
-Down-M128 is deliberately unchanged: its packed accuracy repair regressed
-rotating-input performance and was withdrawn. Its original BF16 atomic path
-does not satisfy this suite's strict random-input tolerance. A separate
-exact-input/dispatch regression check below covers the restored path without
-relaxing the strict tests for the retained optimizations.
+The two exact M16384 projections and down-M128 have specialized schedules.
+Up-M128 and non-target padded-M consumers keep their original paths.
+Down-M128 retains the original four-way BF16 atomic arithmetic, but publishes
+output initialization before input prefetch and unrolls the LDS ring. Its
+exact-shape pointer launcher reuses the existing split-K synchronization.
+This does not repair the original strict random-reference precision limitation;
+the separate exact-input check below verifies dispatch/ownership without
+relaxing the strict tests for the other paths.
 Bias, scaling and preshuffled weights are excluded. Torch FP32 linear is an
 untimed reference.
 """
@@ -164,8 +164,8 @@ def test_latent_gemm(m, n, k, seed):
 
 
 @benchmark()
-def test_unchanged_down_projection(seed):
-    """Restored atomic path: exact-input, ownership and legacy-dispatch guard.
+def test_down_projection_split(seed, padding):
+    """Same atomic arithmetic: exact-input, ownership and pointer-dispatch guard.
 
     This does NOT certify strict random-input accuracy. The old four-way BF16
     atomic reduction has a documented random-reference error; the slower FP32
@@ -177,8 +177,29 @@ def test_unchanged_down_projection(seed):
 
     m, n, k = 128, 3584, 7168
     torch.manual_seed(seed)
-    x = torch.zeros((m, k), device="cuda", dtype=torch.bfloat16)
-    weight = (torch.randint(0, 2, (n, k), device=x.device) * 2 - 1).to(x.dtype) / 16
+    x_mem = torch.zeros((m, k + 2 * padding), device="cuda", dtype=torch.bfloat16)
+    w_mem = torch.zeros((n, k + 2 * padding), device=x_mem.device, dtype=x_mem.dtype)
+    x = x_mem[:, padding : padding + k]
+    weight = w_mem[:, padding : padding + k]
+    weight.copy_(
+        (torch.randint(0, 2, (n, k), device=x.device) * 2 - 1).to(x.dtype) / 16
+    )
+    cfg = {
+        "block_m": 64,
+        "block_n": 64,
+        "block_k": 64,
+        "stages": 4,
+        "split_k": 4,
+        "m_waves": 2,
+        "n_waves": 2,
+        "k_waves": 1,
+        "group_m": 0,
+        "use_half_tile_interleaved": False,
+    }
+
+    def direct(out, stream):
+        return impl.gemm_a16w16(x, weight.T, out=out, user_kwargs=cfg, stream=stream)
+
     # Eight nonzero terms per partition. Every product is +/-1/256; all
     # partial/intermediate sums are exact BF16 for any atomic arrival order.
     active = torch.tensor(
@@ -195,22 +216,32 @@ def test_unchanged_down_projection(seed):
     outs = [h[32:-32].view(m, n) for h in halos]
     streams = [torch.cuda.Stream() for _ in outs]
     graphs = []
+    get_buffers = impl.get_split_k_buffers
+
+    def checked_buffers(stream, device, split_k):
+        # Cold capture followed by first eager use can allocate new counters.
+        # Their initialization must be queued on the actual launch stream.
+        assert torch.cuda.current_stream(device) == stream
+        return get_buffers(stream, device, split_k)
+
     with (
         patch.object(
-            impl, "get_split_k_buffers", wraps=impl.get_split_k_buffers
+            impl, "get_split_k_buffers", side_effect=checked_buffers
         ) as scratch,
+        patch.object(impl, "_run_compiled", wraps=impl._run_compiled) as pointer,
     ):
         for stream, out in zip(streams, outs):
             stream.wait_stream(torch.cuda.current_stream())
             with torch.cuda.stream(stream):
-                gemm_a16w16_out(x, weight, out)
                 graph = torch.cuda.CUDAGraph()
                 with torch.cuda.graph(graph, stream=stream):
-                    gemm_a16w16_out(x, weight, out)
+                    direct(out, stream)
+                    direct(out, stream)
             stream.synchronize()
             assert scratch.call_args.args[2] == 4
+            assert pointer.call_args.args[0] is impl._split_init_ring_ptr
             graphs.append(graph)
-        for _ in range(3):
+        for _ in range(8):
             x.neg_()
             saved = (x.clone(), weight.clone())
             expected = run_torch(x, weight)
@@ -220,20 +251,31 @@ def test_unchanged_down_projection(seed):
                 with torch.cuda.stream(stream):
                     graph.replay()
                     graph.replay()
+            # Eager use of the same explicit stream outside its context.
+            for stream, out in zip(streams, outs):
+                direct(out, stream)
+            pressure = [
+                torch.empty((128, 3584), device=x.device, dtype=x.dtype)
+                for _ in range(4)
+            ]
             for stream, out, halo in zip(streams, outs, halos):
                 stream.synchronize()
-                assert_result(expected, out, "unchanged down exact input")
+                assert_result(expected, out, "split down exact input")
                 assert torch.equal(expected, out)
                 assert (halo[:32] == 23).all() and (halo[-32:] == 23).all()
             assert torch.equal(x, saved[0]) and torch.equal(weight, saved[1])
+            del pressure
 
+    result = gemm_a16w16(x, weight)
+    assert_result(expected, result, "functional down exact")
     ret = {"m": m, "n": n, "k": k, "gfx": get_gfx_runtime()}
     candidates = {f"graph{i}": graph.replay for i, graph in enumerate(graphs)}
     for i, (name, fn) in enumerate(candidates.items()):
         _, us = run_perftest(
             fn, num_iters=30, num_warmup=5, num_rotate_args=1, use_cuda_event=True
         )
-        error = assert_result(expected, outs[i], "restored " + name)
+        us /= 2
+        error = assert_result(expected, outs[i], "split " + name)
         ret.update(
             {
                 name + " us": us,
@@ -243,6 +285,97 @@ def test_unchanged_down_projection(seed):
             }
         )
     return ret
+
+
+def check_split_pointer_routing():
+    from unittest.mock import Mock, patch
+
+    import aiter.ops.flydsl.kernels.gemm_a16w16_gfx950 as impl
+
+    cfg = {
+        "block_m": 64,
+        "block_n": 64,
+        "block_k": 64,
+        "stages": 4,
+        "split_k": 4,
+        "m_waves": 2,
+        "n_waves": 2,
+        "k_waves": 1,
+        "group_m": 0,
+        "use_half_tile_interleaved": False,
+    }
+    x = torch.empty((129, 7168), device="cuda", dtype=torch.bfloat16)
+    w = torch.empty((3584, 7168), device=x.device, dtype=x.dtype)
+    o = torch.empty((129, 3584), device=x.device, dtype=x.dtype)
+    stream = torch.cuda.current_stream()
+    sem = torch.empty((2048,), device=x.device, dtype=torch.int64)
+    sig = torch.empty((2048,), device=x.device, dtype=torch.int32)
+    with (
+        patch.object(impl, "_run_compiled") as pointer,
+        patch.object(impl, "run_cached") as tensor,
+        patch.object(impl, "get_split_k_buffers", return_value=(sem, sig)),
+        patch.object(impl, "_dynamic_tensor_arg", return_value=None),
+    ):
+        for m in (65, 127, 128, 129):
+            pointer.reset_mock()
+            tensor.reset_mock()
+            impl.gemm_a16w16(x[:m], w.T, out=o[:m], user_kwargs=cfg, stream=stream)
+            if m == 128:
+                pointer.assert_called_once()
+                tensor.assert_not_called()
+                assert pointer.call_args.args[0] is impl._split_init_ring_ptr
+                key = pointer.call_args.kwargs["specialization_key"]
+                assert key[:3] == (x.device.index, x.dtype, o.dtype)
+            else:
+                pointer.assert_not_called()
+                tensor.assert_called_once()
+        huge = Mock(spec=torch.Tensor)
+        huge.device, huge.dtype, huge.ndim, huge.shape = (
+            x.device,
+            x.dtype,
+            2,
+            (128, 7168),
+        )
+        huge.data_ptr.return_value = x.data_ptr()
+        huge.element_size.return_value = 2
+        huge.stride.side_effect = lambda axis: 1 << 24 if axis == 0 else 1
+        pointer.reset_mock()
+        tensor.reset_mock()
+        impl.gemm_a16w16(huge, w.T, out=o[:128], user_kwargs=cfg, stream=stream)
+        pointer.assert_not_called()
+        tensor.assert_called_once()
+        wrong = Mock(spec=torch.cuda.Stream)
+        wrong.device = torch.device("cuda", x.device.index + 1)
+        cpu_x = x[:128].cpu()
+        cpu_w = w.cpu()
+        cpu_o = o[:128].cpu()
+        misaligned = torch.empty((128 * 7168 + 1,), device=x.device, dtype=x.dtype)[
+            1:
+        ].view(128, 7168)
+        for fn in (
+            lambda: impl.gemm_a16w16(
+                cpu_x, cpu_w.T, out=cpu_o, user_kwargs=cfg, stream=stream
+            ),
+            lambda: impl.gemm_a16w16(
+                x[:128], w.T, out=o[:128], user_kwargs=cfg, stream=wrong
+            ),
+            lambda: impl.gemm_a16w16(
+                misaligned, w.T, out=o[:128], user_kwargs=cfg, stream=stream
+            ),
+            lambda: impl.gemm_a16w16(
+                x[:128], cpu_w.T, out=o[:128], user_kwargs=cfg, stream=stream
+            ),
+        ):
+            pointer.reset_mock()
+            tensor.reset_mock()
+            try:
+                fn()
+            except (AssertionError, ValueError):
+                pass
+            else:
+                raise AssertionError("invalid split pointer input accepted")
+            pointer.assert_not_called()
+            tensor.assert_not_called()
 
 
 def check_n_grouped_specialization():
@@ -406,9 +539,13 @@ def main():
     aiter.logger.info(
         "BF16 latent projection GEMMs:\n%s", pd.DataFrame(rows).to_markdown(index=False)
     )
-    restored_rows = [test_unchanged_down_projection(seed) for seed in args.seed]
+    check_split_pointer_routing()
+    restored_rows = [
+        test_down_projection_split(seed, padding)
+        for seed, padding in itertools.product(args.seed, (0, 16))
+    ]
     aiter.logger.info(
-        "Unchanged down-M128 (exact-input regression, not random-accuracy repair):"
+        "Down-M128 split schedule (exact-input test, not random-accuracy repair):"
         "\n%s",
         pd.DataFrame(restored_rows).to_markdown(index=False),
     )

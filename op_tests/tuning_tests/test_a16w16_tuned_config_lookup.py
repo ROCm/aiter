@@ -65,7 +65,7 @@ class TestA16W16TunedConfigLookup(unittest.TestCase):
 
 
 class TestLatentDownProjectionUnchanged(unittest.TestCase):
-    """No packed retune or hidden parameter rewrite for the withdrawn case."""
+    """Original tile/split configuration; only exact M128 changes its schedule."""
 
     def test_down_m128_keeps_original_csv_and_effective_policy(self):
         from aiter.ops.flydsl.gemm_kernels import get_flydsl_hgemm_kernel_params
@@ -148,6 +148,81 @@ class TestLatentDownProjectionUnchanged(unittest.TestCase):
                 self.assertFalse(getattr(p, "unroll_lds_ring", False))
                 self.assertFalse(p.n_grouped_loads)
                 self.assertFalse(p.unroll_hti)
+                self.assertEqual(p.split_init_ring, m == 128)
+
+
+class TestSplitInitRingScope(unittest.TestCase):
+    def test_only_exact_validated_policy_and_no_forced_override(self):
+        from aiter.ops.flydsl.kernels.gemm_a16w16_gfx950 import (
+            _use_split_init_ring,
+            make_gemm_a16w16_gfx950_kernel_name,
+            make_gemm_a16w16_param_and_validate,
+        )
+
+        cfg = {
+            "block_m": 64,
+            "block_n": 64,
+            "block_k": 64,
+            "stages": 4,
+            "split_k": 4,
+            "m_waves": 2,
+            "n_waves": 2,
+            "k_waves": 1,
+            "group_m": 0,
+            "use_half_tile_interleaved": False,
+            "in_dtype_id": 2,
+            "out_dtype_id": 2,
+            "a_is_transposed": False,
+            "b_is_transposed": True,
+            "has_bias": False,
+        }
+        for shape in (
+            (128, 3584, 7168),
+            (127, 3584, 7168),
+            (129, 3584, 7168),
+            (128, 7168, 3584),
+            (16384, 3584, 7168),
+            (128, 3584, 3584),
+        ):
+            want = shape == (128, 3584, 7168)
+            self.assertEqual(_use_split_init_ring(*shape, cfg), want)
+            p = make_gemm_a16w16_param_and_validate(
+                *shape, {**cfg, "split_init_ring": True}
+            )
+            if shape[0] == 16384:
+                # Existing split-K tile-count capacity rejects this small tile.
+                self.assertIsNone(p)
+                continue
+            self.assertIsNotNone(p)
+            self.assertEqual(p.split_init_ring, want)
+            self.assertEqual(
+                make_gemm_a16w16_gfx950_kernel_name(p).endswith("_initring4"), want
+            )
+        for field, value in (
+            ("block_m", 128),
+            ("block_n", 128),
+            ("block_k", 128),
+            ("stages", 5),
+            ("split_k", 2),
+            ("m_waves", 4),
+            ("n_waves", 1),
+            ("k_waves", 2),
+            ("group_m", 4),
+            ("in_dtype_id", 3),
+            ("out_dtype_id", 1),
+            ("has_bias", True),
+            ("a_is_transposed", True),
+            ("b_is_transposed", False),
+            ("use_half_tile_interleaved", True),
+            ("b_non_temporal", True),
+            ("k_stagger", 1),
+            ("streamk_blocks", 224),
+            ("mma_m", 32),
+        ):
+            with self.subTest(field=field):
+                self.assertFalse(
+                    _use_split_init_ring(128, 3584, 7168, {**cfg, field: value})
+                )
 
 
 class TestLatentSmallUpUnchanged(unittest.TestCase):
