@@ -584,6 +584,48 @@ def test_fused_rope_concat_and_cache_mla(
             f"positions not clamped to a {max_position}-row cos/sin cache: "
             f"kv_err={err_kv}, q_err={err_q_out}"
         )
+    if num_kv_heads == 1 and kv_lora_rank == 512 and qk_rope_head_dim == 64:
+        # The optimized NoPE op must store exactly what rotation by an identity
+        # cache stores.
+        id_cos, id_sin = torch.ones_like(cos_cache), torch.zeros_like(sin_cache)
+        id_out = []
+        for nope_op in (False, True):
+            kv_i = torch.zeros(
+                num_blocks, block_size, num_kv_heads, entry_size, dtype=cache_dtype
+            )
+            q_i = torch.zeros_like(q_out)
+            args = (
+                q_nope,
+                q_pe,
+                kv_c,
+                k_pe,
+                kv_i.squeeze(1),
+                q_i,
+                slot_mapping,
+                scale,
+                q_scale,
+            )
+            if nope_op:
+                aiter.fused_qk_concat_and_cache_mla(
+                    *args,
+                    is_nope_first,
+                    compute_all_q=compute_all_q_rope,
+                )
+            else:
+                aiter.fused_qk_rope_concat_and_cache_mla(
+                    *args,
+                    pos,
+                    id_cos,
+                    id_sin,
+                    is_neox,
+                    is_nope_first,
+                    compute_all_q_rope=compute_all_q_rope,
+                )
+            id_out.append((kv_i.view(torch.uint8), q_i[:n_chk].view(torch.uint8)))
+        if not all(torch.equal(a, b) for a, b in zip(*id_out)):
+            raise AssertionError(
+                "fused_qk_concat_and_cache_mla differs from cos 1, sin 0 RoPE"
+            )
     ret["fused_qk_us"] = avg_us
     ret["num_valid"] = num_valid
     ret["padded"] = num_tokens - num_valid
