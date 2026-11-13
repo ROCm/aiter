@@ -623,6 +623,18 @@
             "f'{AITER_META_DIR}/hsa/codegen.py -m fmoe --output_dir {{}}'"
         ]
     },
+    "module_moe_g1u1_bf16_small_m": {
+        "srcs": [
+            "f'{AITER_CSRC_DIR}/kernels/fmoe_g1u1_bf16_small_m.cu'"
+        ],
+        "flags_extra_cc": [],
+        "flags_extra_hip": [],
+        "extra_ldflags": "None",
+        "extra_include": [],
+        "verbose": "False",
+        "torch_exclude": "True",
+        "blob_gen_cmd": "''"
+    },
     "module_moe_ck2stages": {
         "srcs": [
             "f'{AITER_CSRC_DIR}/pybind/moe_ck_2stages_pybind.cu'",
