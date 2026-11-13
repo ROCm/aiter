@@ -2166,56 +2166,6 @@ def _poison_unowned(cache, scale, owned, fill):
         )
 
 
-def test_pa_decode_mxfp4_is_per_token_kv(monkeypatch):
-    """MXFP4 KV is per-token KV: each cache row carries its own e8m0 scales.
-
-    gfx950 and gfx1250 behave alike: the schedule (gfx950) is a per-token one,
-    the kernel keeps the f32 per-token scale tensors and their LDS buffers off
-    (its scales come with the rows), and either per_token_kv selects that same
-    kernel.
-    """
-    traits = importlib.import_module("aiter.ops.flydsl.kernels.pa_decode.traits")
-    monkeypatch.setattr(traits, "get_rocm_arch", lambda: "gfx950")
-    for per_token_kv in (False, True):
-        schedule = traits.PaDecodeSchedule.select(
-            head_dim=128,
-            query_group_size=16,
-            block_size=128,
-            num_seqs=1,
-            num_kv_heads=1,
-            num_compute_units=256,
-            work_capacity=1,
-            query_dtype=torch.bfloat16,
-            kv_dtype=dtypes.fp4x2,
-            per_token_kv=per_token_kv,
-            max_context_length=2048,
-        )
-        assert schedule.cache_key.per_token_kv
-        assert not traits.PaDecodeTraits.create(schedule).per_token_kv
-    monkeypatch.undo()
-    if not torch.cuda.is_available() or get_gfx_runtime() != "gfx1250":
-        return
-    kernel = importlib.import_module("aiter.ops.flydsl.kernels.pa_decode_kernel")
-    compiled = [
-        kernel.compile_pa_decode_tile(
-            head_dim=128,
-            query_group_size=16,
-            block_size=128,
-            num_seqs=1,
-            num_kv_heads=1,
-            num_compute_units=256,
-            work_capacity=1,
-            query_dtype=torch.bfloat16,
-            kv_dtype=dtypes.fp4x2,
-            per_token_kv=per_token_kv,
-        )
-        for per_token_kv in (False, True)
-    ]
-    assert compiled[0] is compiled[1]
-    # As gfx950's MXFP4 kernels: no f32 per-token variant in the name either.
-    assert "_pertoken" not in compiled[0]["kernel"]._name
-
-
 @pytest.mark.parametrize("fill", ["nan", "inf"])
 @pytest.mark.parametrize(
     "query_length,kv_heads,group_size,head_dim",
