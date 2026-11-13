@@ -225,8 +225,8 @@ class TestSplitInitRingScope(unittest.TestCase):
                 )
 
 
-class TestLatentSmallUpUnchanged(unittest.TestCase):
-    def test_up_m128_csv_is_original(self):
+class TestLatentSmallUpBankLayout(unittest.TestCase):
+    def test_up_m128_csv_selects_qualified_layout(self):
         path = (
             Path(__file__).resolve().parents[2]
             / "aiter/configs/model_configs/kimik3_bf16_tuned_gemm.csv"
@@ -263,12 +263,122 @@ class TestLatentSmallUpUnchanged(unittest.TestCase):
         self.assertEqual(len(rows), 1)
         self.assertEqual(
             (rows[0]["libtype"], rows[0]["solidx"], rows[0]["splitK"]),
-            ("flydsl", "2787", "1"),
+            ("flydsl", "0", "1"),
         )
         self.assertEqual(
             rows[0]["kernelName"],
-            "flydsl_hgemm_abf16_wbf16_bf16_t64x64x64x7_ks1_w4x2x1_bias0_ktail0_gm0_pft_gfx950",
+            "flydsl_hgemm_abf16_wbf16_bf16_t64x64x128x3_ks1_w2x4x1_bias0_ktail0_gm0_pft_gfx950",
         )
+
+    def test_exact_shape_and_config_guard(self):
+        from aiter.ops.flydsl.kernels.gemm_a16w16_gfx950 import (
+            _use_bank_swizzle_343,
+            make_gemm_a16w16_gfx950_kernel_name,
+            make_gemm_a16w16_param_and_validate,
+        )
+
+        cfg = {
+            "block_m": 64,
+            "block_n": 64,
+            "block_k": 128,
+            "stages": 3,
+            "m_waves": 2,
+            "n_waves": 4,
+            "k_waves": 1,
+            "split_k": 1,
+            "group_m": 0,
+            "use_half_tile_interleaved": False,
+            "in_dtype_id": 2,
+            "out_dtype_id": 2,
+            "a_is_transposed": False,
+            "b_is_transposed": True,
+            "has_bias": False,
+        }
+        for shape in (
+            (128, 7168, 3584),
+            (127, 7168, 3584),
+            (129, 7168, 3584),
+            (128, 3584, 7168),
+            (16384, 7168, 3584),
+            (128, 7168, 3712),
+        ):
+            want = shape == (128, 7168, 3584)
+            self.assertEqual(_use_bank_swizzle_343(*shape, cfg), want)
+            param = make_gemm_a16w16_param_and_validate(
+                *shape, {**cfg, "bank_swizzle_343": True}
+            )
+            self.assertIsNotNone(param)
+            self.assertEqual(param.bank_swizzle_343, want)
+            self.assertEqual(
+                make_gemm_a16w16_gfx950_kernel_name(param).endswith("_sw343"), want
+            )
+        for key, value in (
+            ("has_bias", True),
+            ("in_dtype_id", 3),
+            ("out_dtype_id", 1),
+            ("split_k", 2),
+            ("m_waves", 4),
+            ("n_waves", 2),
+            ("k_waves", 2),
+            ("block_k", 64),
+            ("stages", 4),
+            ("group_m", 4),
+            ("b_non_temporal", True),
+            ("k_stagger", 1),
+            ("streamk_blocks", 256),
+        ):
+            self.assertFalse(
+                _use_bank_swizzle_343(128, 7168, 3584, {**cfg, key: value})
+            )
+
+    def test_padded_lookup_keeps_original_config(self):
+        key = ("gfx950", 256, 128, 7168, 3584, False, BF16, BF16, False, False)
+        old_name = "flydsl_hgemm_abf16_wbf16_bf16_t64x64x64x7_ks1_w4x2x1_bias0_ktail0_gm0_pft_gfx950"
+        new_name = "flydsl_hgemm_abf16_wbf16_bf16_t64x64x128x3_ks1_w2x4x1_bias0_ktail0_gm0_pft_gfx950"
+        row = {"libtype": "flydsl", "solidx": 0, "splitK": 1, "kernelName": new_name}
+        with (
+            mock.patch.object(tuned, "get_GEMM_A16W16_config_", lambda: {key: row}),
+            mock.patch.object(tuned, "get_padded_m", lambda *_: 128),
+        ):
+            for m in (65, 127, 128, 129):
+                cfg = tuned.get_GEMM_A16W16_tuned_config(
+                    m, 7168, 3584, False, BF16, BF16, gfx="gfx950", cu_num=256
+                )
+                self.assertEqual(cfg["kernelName"], new_name if m == 128 else old_name)
+        self.assertEqual(row["kernelName"], new_name)
+
+    def test_swizzle_packet_ownership_and_phase_bank_model(self):
+        # Phase groups from HipKittens paper Table 5 (CDNA4 ds_read_b128);
+        # validate address math, not a replacement for measured hardware PMC.
+        from collections import defaultdict
+
+        phase0 = list(range(4)) + list(range(12, 16)) + list(range(20, 28))
+        phase1 = [i for i in range(32) if i not in phase0]
+        phases = [phase0, phase1, [i + 32 for i in phase0], [i + 32 for i in phase1]]
+
+        def perm(x):
+            return x ^ (((x >> 7) & 7) << 4)
+
+        self.assertEqual(
+            sorted(perm(x) for x in range(64 * 128)), list(range(64 * 128))
+        )
+        for row in range(64):
+            for col in range(0, 128, 8):
+                x = row * 128 + col
+                v = perm(x)
+                self.assertEqual(v // 128, row)
+                self.assertEqual([perm(x + i) for i in range(8)], list(range(v, v + 8)))
+                self.assertEqual(perm(v), x)
+        for rows in (0, 16, 32, 48):
+            for kk in (0, 32, 64, 96):
+                for phase in phases:
+                    banks = defaultdict(set)
+                    for lane in phase:
+                        x = perm((rows + lane % 16) * 128 + kk + (lane // 16) * 8)
+                        for e in (0, 2, 4, 6):
+                            word = (x + e) // 2
+                            banks[word % 64].add(word)
+                    self.assertEqual(max(map(len, banks.values())), 1)
 
 
 class TestExactLatentLargeCsv(unittest.TestCase):

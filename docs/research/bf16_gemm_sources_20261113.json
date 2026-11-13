@@ -1,0 +1,861 @@
+{
+  "retrieved_date": "2026-11-13",
+  "scope": "Finite public-source search and targeted reading; not an exhaustive review of every file in indexed repositories.",
+  "repository_indexes": [
+    {
+      "repo": "ROCm/FlyDSL",
+      "sha": "d7c7a712aa0abbb523bf2f3c3d5becd61dd73b0f",
+      "branch": "main",
+      "truncated": false,
+      "candidates": 72,
+      "examples": [
+        ".claude/skills/gemm-optimization/SKILL.md",
+        ".claude/skills/llvm/references/arch-gfx950.md",
+        "examples/04-preshuffle_gemm.py",
+        "kernels/attention/flash_attn_fp8_gfx950.py",
+        "kernels/attention/flash_attn_fp8_paged_gfx950.py",
+        "kernels/attention/flash_attn_gfx950.py",
+        "kernels/attention/swa_gfx950.py",
+        "kernels/conv/conv3d_gfx950_utils.py",
+        "kernels/conv/conv3d_implicit_gfx950.py",
+        "kernels/gemm/__init__.py",
+        "kernels/gemm/fp4_gemm_4wave.py",
+        "kernels/gemm/fp8_gemm_4wave.py",
+        "kernels/gemm/fp8_gemm_8wave.py",
+        "kernels/gemm/fp8_gemm_utils.py"
+      ]
+    },
+    {
+      "repo": "ROCm/hipBLASLt",
+      "sha": "3a609b06926c8227e753b62087555e1f435bf2d4",
+      "branch": "develop_deprecated",
+      "truncated": false,
+      "candidates": 566,
+      "examples": [
+        "clients/benchmarks/client_groupedgemm_fixed_mk.cpp",
+        "clients/gtest/matmul_common.yaml",
+        "clients/gtest/matmul_gtest.cpp",
+        "clients/gtest/matmul_gtest.yaml",
+        "clients/include/testing_matmul.hpp",
+        "clients/samples/01_basic_gemm/sample_hipblaslt_gemm.cpp",
+        "clients/samples/01_basic_gemm_ext/sample_hipblaslt_gemm_ext.cpp",
+        "clients/samples/02_batched_gemm/sample_hipblaslt_gemm_batched.cpp",
+        "clients/samples/02_batched_gemm_ext/sample_hipblaslt_gemm_batched_ext.cpp",
+        "clients/samples/03_splitk_gemm_ext/sample_hipblaslt_gemm_tuning_splitk_ext.cpp",
+        "clients/samples/04_gemm_bias/sample_hipblaslt_gemm_bias.cpp",
+        "clients/samples/04_gemm_bias_ext/sample_hipblaslt_gemm_bias_ext.cpp",
+        "clients/samples/05_get_all_algos_gemm/sample_hipblaslt_gemm_get_all_algos.cpp",
+        "clients/samples/05_get_all_algos_gemm_ext/sample_hipblaslt_gemm_get_all_algos_ext.cpp"
+      ]
+    },
+    {
+      "repo": "ROCm/composable_kernel",
+      "sha": "3f0199f548332bdf0b67f8140618def6859289ac",
+      "branch": "develop",
+      "truncated": false,
+      "candidates": 2448,
+      "examples": [
+        "client_example/01_gemm/README.md",
+        "client_example/01_gemm/gemm.cpp",
+        "client_example/02_gemm_add_add_fastgelu/README.md",
+        "client_example/02_gemm_add_add_fastgelu/gemm_add_add_fastgelu.cpp",
+        "client_example/02_gemm_add_add_fastgelu/gemm_add_add_fastgelu_generic.cpp",
+        "client_example/02_gemm_add_add_fastgelu/gemm_add_fastgelu.cpp",
+        "client_example/02_gemm_add_add_fastgelu/gemm_add_fastgelu_generic.cpp",
+        "client_example/02_gemm_add_add_fastgelu/gemm_fastgelu.cpp",
+        "client_example/02_gemm_add_add_fastgelu/gemm_fastgelu_generic.cpp",
+        "client_example/03_gemm_layernorm/README.md",
+        "client_example/03_gemm_layernorm/gemm_add_add_layernorm_naive.cpp",
+        "client_example/03_gemm_layernorm/gemm_add_relu_add_layernorm_welford.cpp",
+        "client_example/09_quantization/gemm_quantization.cpp",
+        "client_example/17_grouped_gemm_fastgelu/README.md"
+      ]
+    },
+    {
+      "repo": "ROCm/rocWMMA",
+      "sha": "97562d33167f5dda32fa319cc5b4f62815bdd9e3",
+      "branch": "develop_deprecated",
+      "truncated": false,
+      "candidates": 544,
+      "examples": [
+        "samples/hipRTC_gemm.cpp",
+        "samples/perf_dgemm.cpp",
+        "samples/perf_hgemm.cpp",
+        "samples/perf_i8gemm.cpp",
+        "samples/perf_sgemm.cpp",
+        "samples/simple_dgemm.cpp",
+        "samples/simple_hgemm.cpp",
+        "samples/simple_sgemm.cpp",
+        "test/gemm/gemm_PGR0_LB0_MP0_MB_NC/detail/kernel_generator_impl.hpp",
+        "test/gemm/gemm_PGR0_LB0_MP0_MB_NC/detail/kernel_impl.hpp",
+        "test/gemm/gemm_PGR0_LB0_MP0_MB_NC/device/kernel_device_func.hpp",
+        "test/gemm/gemm_PGR0_LB0_MP0_MB_NC/device/kernel_predicates.hpp",
+        "test/gemm/gemm_PGR0_LB0_MP0_MB_NC/test/16x16_nn_1x1.cpp",
+        "test/gemm/gemm_PGR0_LB0_MP0_MB_NC/test/16x16_nn_1x2.cpp"
+      ]
+    },
+    {
+      "repo": "HazyResearch/HipKittens",
+      "sha": "8cde3dd146bd1c4be78023b582c1f4375c48489f",
+      "branch": "main",
+      "truncated": false,
+      "candidates": 206,
+      "examples": [
+        "analysis/baselines/gemm/persistent_gemm.py",
+        "analysis/baselines/gemm/streamk_kernel.py",
+        "analysis/baselines/gemm/triton_gemm_v01.py",
+        "analysis/baselines/gemm/triton_gemm_v02.py",
+        "analysis/baselines/gemm/triton_gemm_v03.py",
+        "analysis/baselines/gemm/utils/gemm_wrapper.py",
+        "analysis/baselines/gemm/utils/solution_selection.py",
+        "analysis/baselines/gemm/utils/tuned.yaml",
+        "analysis/baselines/gemm/utils/utils.py",
+        "analysis/bf16_gemm/README.md",
+        "analysis/bf16_gemm/mi325x/kernel_1024.cpp",
+        "analysis/bf16_gemm/mi325x/kernel_16384.cpp",
+        "analysis/bf16_gemm/mi325x/kernel_2048.cpp",
+        "analysis/bf16_gemm/mi325x/kernel_4096.cpp"
+      ]
+    },
+    {
+      "repo": "HazyResearch/ThunderKittens",
+      "sha": "67845f5fa48d05343dbbc1ba1403f11061f08d2d",
+      "branch": "main",
+      "truncated": false,
+      "candidates": 64,
+      "examples": [
+        "kernels/gemm/baselines/bf16_cublas/bf16_cublas_gemm.cu",
+        "kernels/gemm/baselines/bf16_cublas_lt/bf16_cublas_lt_gemm.cu",
+        "kernels/gemm/baselines/cutlass/README.md",
+        "kernels/gemm/baselines/fp8_cublas_lt/fp8_cublas_lt_gemm.cu",
+        "kernels/gemm/baselines/int8_cublas_lt/int8_cublas_lt_gemm.cu",
+        "kernels/gemm/baselines/mxfp8_cublas_lt/mxfp8_cublas_lt_gemm.cu",
+        "kernels/gemm/baselines/nvfp4_cublas_lt/nvfp4_cublas_lt_gemm.cu",
+        "kernels/gemm/bf16_b200/bf16_b200_gemm.cu",
+        "kernels/gemm/bf16_h100/bf16_h100_gemm.cu",
+        "kernels/gemm/educational_b200/README.md",
+        "kernels/gemm/educational_b200/launch.cu",
+        "kernels/gemm/educational_b200/level_01.cu",
+        "kernels/gemm/educational_b200/level_02.cu",
+        "kernels/gemm/educational_b200/level_03.cu"
+      ]
+    },
+    {
+      "repo": "NVIDIA/cutlass",
+      "sha": "b2f249acd20392beeb16f5e5a31f4f1a4e38b3bd",
+      "branch": "main",
+      "truncated": false,
+      "candidates": 1629,
+      "examples": [
+        "examples/00_basic_gemm/basic_gemm.cu",
+        "examples/05_batched_gemm/batched_gemm.cu",
+        "examples/06_splitK_gemm/splitk_gemm.cu",
+        "examples/07_volta_tensorop_gemm/volta_tensorop_gemm.cu",
+        "examples/08_turing_tensorop_gemm/turing_tensorop_gemm.cu",
+        "examples/111_hopper_ssd/collective/sm90_ssd_gemm_tma_warpspecialized.hpp",
+        "examples/112_blackwell_ssd/collective/sm100_ssd_gemm_tma_warpspecialized.hpp",
+        "examples/113_hopper_gemm_activation_fusion/113_hopper_gemm_fused_act.cu",
+        "examples/113_hopper_gemm_activation_fusion/113_hopper_gemm_fused_gated_act.cu",
+        "examples/113_hopper_gemm_activation_fusion/113_hopper_grouped_gemm_fused_act.cu",
+        "examples/113_hopper_gemm_activation_fusion/113_hopper_grouped_gemm_fused_gated_act.cu",
+        "examples/113_hopper_gemm_activation_fusion/gated_builder.hpp",
+        "examples/113_hopper_gemm_activation_fusion/gated_stride.hpp",
+        "examples/113_hopper_gemm_activation_fusion/options.hpp"
+      ]
+    },
+    {
+      "repo": "SohamGovande/ThundeROCats",
+      "sha": "21fbaa4629ab9602789cbebe4e93f6501845134c",
+      "branch": "main",
+      "truncated": false,
+      "candidates": 0,
+      "examples": []
+    },
+    {
+      "repo": "jhinpan/ROCmKernelWiki",
+      "sha": "9252153f81b4e2e861d412b85033e79c3256c37d",
+      "branch": "main",
+      "truncated": false,
+      "candidates": 25,
+      "examples": [
+        "examples/ck-hgemm/README.md",
+        "examples/ck-hgemm/hgemm_wmma.cpp",
+        "examples/flydsl-preshuffle-gemm/04_preshuffle_gemm_flydsl.py",
+        "examples/flydsl-preshuffle-gemm/README.md",
+        "examples/flydsl-preshuffle-gemm/preshuffle_gemm_rocwmma.cpp",
+        "examples/fp8-gemm/README.md",
+        "examples/fp8-gemm/fp8_gemm_cdna.cpp",
+        "examples/fp8-gemm/wmma_hgemm.cpp",
+        "examples/grouped-gemm/README.md",
+        "examples/grouped-gemm/grouped_gemm_wmma.cpp",
+        "ops/mi355/README.md",
+        "scripts/evolve/mi355_worker.py",
+        "sources/blogs/blog-4wave-fp8-gemm.md",
+        "sources/blogs/blog-cktile-gemm.md"
+      ]
+    },
+    {
+      "repo": "ROCm/amd_matrix_instruction_calculator",
+      "sha": "94b1f16bf3a2c7089f0f3ec0b3eb303396a18776",
+      "branch": "main",
+      "truncated": false,
+      "candidates": 0,
+      "examples": []
+    },
+    {
+      "repo": "ROCm/rocm-blogs",
+      "sha": "7d12cba060c82bf4d17529786ee6e26032d9f610",
+      "branch": "release",
+      "truncated": false,
+      "candidates": 47,
+      "examples": [
+        "blogs/artificial-intelligence/ROCm7-MI355X-training-performance/README.md",
+        "blogs/artificial-intelligence/deployingGemma-vllm/README.md",
+        "blogs/artificial-intelligence/dflash-on-MI355x/README.md",
+        "blogs/artificial-intelligence/gemm_blog/README.md",
+        "blogs/artificial-intelligence/glm5.2-mi355x-kvcache/README.md",
+        "blogs/artificial-intelligence/glm52-mxfp4-mi355/README.md",
+        "blogs/artificial-intelligence/mi355-gromacs-benchmarks/README.md",
+        "blogs/artificial-intelligence/pytorch-tunableop/src/matmul.py",
+        "blogs/software-tools-optimization/4wave-fp8gemm/README.md",
+        "blogs/software-tools-optimization/accelerating-llm-inference-on-amd-gpus-with-low-latency-gemms/README.md",
+        "blogs/software-tools-optimization/atom-high-interactivity-mi355/README.md",
+        "blogs/software-tools-optimization/building-efficient-gemm-kernels-with-ck-tile-vendo/README.md",
+        "blogs/software-tools-optimization/cdna4-gemm-kernels/README.md",
+        "blogs/software-tools-optimization/ck-int8-gemm-sq/README.md"
+      ]
+    },
+    {
+      "repo": "ROCm/rocm-libraries",
+      "sha": "eb9b307c4d56d5df63bd3bc60603d33aaa3abbc5",
+      "branch": "develop",
+      "truncated": true,
+      "candidates": 5089,
+      "examples": [
+        "dnn-providers/hip-kernel-provider/descriptor-packaging/tests/test_gfx950_attention_dense_bundle_coverage.py",
+        "dnn-providers/hip-kernel-provider/descriptor-packaging/tests/test_gfx950_attention_unified_2d_bundle_coverage.py",
+        "dnn-providers/hip-kernel-provider/descriptor-packaging/tests/test_gfx950_attention_unified_3d_bundle_coverage.py",
+        "dnn-providers/hip-kernel-provider/flydsl/kernels_src/kernels/attention_cdna/flash_attn_gfx950.py",
+        "dnn-providers/hip-kernel-provider/hipkernel_Gfx950Attention_test_categories_integration.yaml",
+        "dnn-providers/hip-kernel-provider/rocke/library/benchmarks/common/benchmark_implicit_gemm_conv.py",
+        "dnn-providers/hip-kernel-provider/rocke/library/benchmarks/gfx950/__init__.py",
+        "dnn-providers/hip-kernel-provider/rocke/library/benchmarks/gfx950/attention/__init__.py",
+        "dnn-providers/hip-kernel-provider/rocke/library/benchmarks/gfx950/attention/decode/__init__.py",
+        "dnn-providers/hip-kernel-provider/rocke/library/benchmarks/gfx950/attention/decode/benchmark_decode_live.py",
+        "dnn-providers/hip-kernel-provider/rocke/library/benchmarks/gfx950/attention/decode/decode_dispatch_diagnose.py",
+        "dnn-providers/hip-kernel-provider/rocke/library/benchmarks/gfx950/attention/decode/decode_table_sweep.py",
+        "dnn-providers/hip-kernel-provider/rocke/library/benchmarks/gfx950/attention/decode/fp8_decode_isa_inspect.py",
+        "dnn-providers/hip-kernel-provider/rocke/library/benchmarks/gfx950/attention/decode/fp8_decode_nseg_sweep.py"
+      ]
+    },
+    {
+      "repo": "NVIDIA/tilus",
+      "sha": "d8e6cc69f88de0dfe333032b2f7d03ae122080ba",
+      "branch": "main",
+      "truncated": false,
+      "candidates": 69,
+      "examples": [
+        "docs/source/tutorials/matmul-ampere/__init__.rst",
+        "docs/source/tutorials/matmul-ampere/matmul/matmul_v0.rst",
+        "docs/source/tutorials/matmul-ampere/matmul/matmul_v1.rst",
+        "docs/source/tutorials/matmul-ampere/matmul/matmul_v2.rst",
+        "docs/source/tutorials/matmul-ampere/matmul/matmul_v3.rst",
+        "docs/source/tutorials/matmul-ampere/matmul/matmul_v4.rst",
+        "docs/source/tutorials/matmul-ampere/matmul/matmul_v5.rst",
+        "docs/source/tutorials/matmul-blackwell/__init__.rst",
+        "docs/source/tutorials/matmul-blackwell/plots/plot_all.py",
+        "docs/source/tutorials/matmul-blackwell/plots/plot_perf.py",
+        "docs/source/tutorials/matmul-blackwell/plots/plot_v0.py",
+        "docs/source/tutorials/matmul-blackwell/plots/plot_v1.py",
+        "docs/source/tutorials/matmul-blackwell/plots/plot_v2.py",
+        "docs/source/tutorials/matmul-blackwell/plots/plot_v3.py"
+      ]
+    },
+    {
+      "repo": "ROCm/triton",
+      "sha": "0ec280cf80dd91e9a86887981a670f2d4541a32b",
+      "branch": "main_perf",
+      "truncated": false,
+      "candidates": 43,
+      "examples": [
+        "lib/Dialect/TritonGPU/Transforms/AccelerateMatmul.cpp",
+        "lib/Dialect/TritonGPU/Transforms/Pipeliner/MatmulLoopPipeline.cpp",
+        "python/perf-kernels/fused_moe/moe-gemm.py",
+        "python/perf-kernels/gemm.py",
+        "python/perf-kernels/multreduce_matmul_kernel.py",
+        "python/perf-kernels/streamk/03-matrix-multiplication-stream-k.py",
+        "python/perf-kernels/streamk/README.md",
+        "python/perf-kernels/streamk/fallback_tuned_configs.yaml",
+        "python/perf-kernels/streamk/gemm_benchmark.py",
+        "python/perf-kernels/streamk/gfx942_fallback_tuned_configs.yaml",
+        "python/perf-kernels/streamk/gfx950_fallback_tuned_configs.yaml",
+        "python/perf-kernels/streamk/persistent_gemm.py",
+        "python/perf-kernels/streamk/streamk_kernel.py",
+        "python/perf-kernels/streamk/streamk_kernel_atomic.py"
+      ]
+    }
+  ],
+  "files": [
+    {
+      "repo": "HazyResearch/HipKittens",
+      "path": "README.md",
+      "revision": "8cde3dd146bd1c4be78023b582c1f4375c48489f",
+      "url": "https://raw.githubusercontent.com/HazyResearch/HipKittens/8cde3dd146bd1c4be78023b582c1f4375c48489f/README.md",
+      "bytes": 9180,
+      "sha256": "756b0e4768777cc41e250be7b45e2034c931e0f1a759d0a3bec58b43acd07378",
+      "retrieved_at": "2026-11-13T05:54:45.064149+00:00"
+    },
+    {
+      "repo": "HazyResearch/HipKittens",
+      "path": "analysis/bf16_gemm/README.md",
+      "revision": "8cde3dd146bd1c4be78023b582c1f4375c48489f",
+      "url": "https://raw.githubusercontent.com/HazyResearch/HipKittens/8cde3dd146bd1c4be78023b582c1f4375c48489f/analysis/bf16_gemm/README.md",
+      "bytes": 474,
+      "sha256": "6b77010a9e3842c08d3926bedda07efce2d0aa44650afd018eb40dd6344edf8f",
+      "retrieved_at": "2026-11-13T05:54:45.172561+00:00"
+    },
+    {
+      "repo": "ROCm/rocm-blogs",
+      "path": "blogs/software-tools-optimization/cdna4-gemm-kernels/README.md",
+      "revision": "7d12cba060c82bf4d17529786ee6e26032d9f610",
+      "url": "https://raw.githubusercontent.com/ROCm/rocm-blogs/7d12cba060c82bf4d17529786ee6e26032d9f610/blogs/software-tools-optimization/cdna4-gemm-kernels/README.md",
+      "bytes": 36031,
+      "sha256": "712f08357380be4517f1b8d5f48d5ffda7d5b83c67c670d5f1dba42279750954",
+      "retrieved_at": "2026-11-13T05:54:44.965274+00:00"
+    },
+    {
+      "repo": "ROCm/rocm-blogs",
+      "path": "blogs/software-tools-optimization/accelerating-llm-inference-on-amd-gpus-with-low-latency-gemms/README.md",
+      "revision": "7d12cba060c82bf4d17529786ee6e26032d9f610",
+      "url": "https://raw.githubusercontent.com/ROCm/rocm-blogs/7d12cba060c82bf4d17529786ee6e26032d9f610/blogs/software-tools-optimization/accelerating-llm-inference-on-amd-gpus-with-low-latency-gemms/README.md",
+      "bytes": 30585,
+      "sha256": "3235cf6258afb9db5c1a3199675c7390c7eb0abda57abc28a26b04e730556c4a",
+      "retrieved_at": "2026-11-13T05:54:44.893369+00:00"
+    },
+    {
+      "repo": "ROCm/rocm-blogs",
+      "path": "blogs/software-tools-optimization/building-efficient-gemm-kernels-with-ck-tile-vendo/README.md",
+      "revision": "7d12cba060c82bf4d17529786ee6e26032d9f610",
+      "url": "https://raw.githubusercontent.com/ROCm/rocm-blogs/7d12cba060c82bf4d17529786ee6e26032d9f610/blogs/software-tools-optimization/building-efficient-gemm-kernels-with-ck-tile-vendo/README.md",
+      "bytes": 14448,
+      "sha256": "f57688e546656965f64d157e17b6b35dfcd3341280cfb48235ee0fb40f03b9a1",
+      "retrieved_at": "2026-11-13T05:54:45.013023+00:00"
+    },
+    {
+      "repo": "ROCm/rocm-blogs",
+      "path": "blogs/software-tools-optimization/4wave-fp8gemm/README.md",
+      "revision": "7d12cba060c82bf4d17529786ee6e26032d9f610",
+      "url": "https://raw.githubusercontent.com/ROCm/rocm-blogs/7d12cba060c82bf4d17529786ee6e26032d9f610/blogs/software-tools-optimization/4wave-fp8gemm/README.md",
+      "bytes": 20633,
+      "sha256": "73ad2164f3f646f95b1debfa892c38defc4a99fa4143c1824328b6c565f5de05",
+      "retrieved_at": "2026-11-13T05:54:44.889666+00:00"
+    },
+    {
+      "repo": "ROCm/FlyDSL",
+      "path": "README.md",
+      "revision": "d7c7a712aa0abbb523bf2f3c3d5becd61dd73b0f",
+      "url": "https://raw.githubusercontent.com/ROCm/FlyDSL/d7c7a712aa0abbb523bf2f3c3d5becd61dd73b0f/README.md",
+      "bytes": 20877,
+      "sha256": "0603e113d2478bce6ce75e75264cb225f3945a852ecb7576ed0bf1b025337c0a",
+      "retrieved_at": "2026-11-13T05:54:46.616639+00:00"
+    },
+    {
+      "repo": "ROCm/hipBLASLt",
+      "path": "README.md",
+      "revision": "3a609b06926c8227e753b62087555e1f435bf2d4",
+      "url": "https://raw.githubusercontent.com/ROCm/hipBLASLt/3a609b06926c8227e753b62087555e1f435bf2d4/README.md",
+      "bytes": 4234,
+      "sha256": "8fbeb5c088c2ba1b34b3f2a282243cacc5f39cbedb13d6b5c1c0ea8de7fa39e4",
+      "retrieved_at": "2026-11-13T05:54:46.804874+00:00"
+    },
+    {
+      "repo": "ROCm/rocWMMA",
+      "path": "README.md",
+      "revision": "97562d33167f5dda32fa319cc5b4f62815bdd9e3",
+      "url": "https://raw.githubusercontent.com/ROCm/rocWMMA/97562d33167f5dda32fa319cc5b4f62815bdd9e3/README.md",
+      "bytes": 6010,
+      "sha256": "baf9f78eeb701737ab8cc7d20cd63fc88e8e0b7ec34b91f03c3eac94fa324a8a",
+      "retrieved_at": "2026-11-13T05:54:46.966252+00:00"
+    },
+    {
+      "repo": "ROCm/amd_matrix_instruction_calculator",
+      "path": "README.md",
+      "revision": "94b1f16bf3a2c7089f0f3ec0b3eb303396a18776",
+      "url": "https://raw.githubusercontent.com/ROCm/amd_matrix_instruction_calculator/94b1f16bf3a2c7089f0f3ec0b3eb303396a18776/README.md",
+      "bytes": 147878,
+      "sha256": "4bd07af8340a28c95ce74a93becebc0735866bd5646acb3789ff7018c67fe4fc",
+      "retrieved_at": "2026-11-13T05:54:47.012453+00:00"
+    },
+    {
+      "repo": "HazyResearch/ThunderKittens",
+      "path": "kernels/gemm/bf16_h100/bf16_h100_gemm.cu",
+      "revision": "67845f5fa48d05343dbbc1ba1403f11061f08d2d",
+      "url": "https://raw.githubusercontent.com/HazyResearch/ThunderKittens/67845f5fa48d05343dbbc1ba1403f11061f08d2d/kernels/gemm/bf16_h100/bf16_h100_gemm.cu",
+      "bytes": 11238,
+      "sha256": "69d7ca04d6e41bf4278c1fa1b8bc8f8e523f920b8380817b8b2804068d4c1219",
+      "retrieved_at": "2026-11-13T05:54:47.136269+00:00"
+    },
+    {
+      "repo": "jhinpan/ROCmKernelWiki",
+      "path": "README.md",
+      "revision": "9252153f81b4e2e861d412b85033e79c3256c37d",
+      "url": "https://raw.githubusercontent.com/jhinpan/ROCmKernelWiki/9252153f81b4e2e861d412b85033e79c3256c37d/README.md",
+      "bytes": 16364,
+      "sha256": "247e0522761c8b8ce066d57c305eeffc55b4da2f4de8066525ea67d16715c96c",
+      "retrieved_at": "2026-11-13T05:54:47.228219+00:00"
+    },
+    {
+      "repo": "NVIDIA/cutlass",
+      "path": "media/docs/cpp/efficient_gemm.md",
+      "revision": "b2f249acd20392beeb16f5e5a31f4f1a4e38b3bd",
+      "url": "https://raw.githubusercontent.com/NVIDIA/cutlass/b2f249acd20392beeb16f5e5a31f4f1a4e38b3bd/media/docs/cpp/efficient_gemm.md",
+      "bytes": 20550,
+      "sha256": "44003151268090f0f1c3be9518164ec33eb04a030c9ed731a408f2f94886aaa5",
+      "retrieved_at": "2026-11-13T05:54:48.666000+00:00"
+    },
+    {
+      "repo": "NVIDIA/cutlass",
+      "path": "media/docs/cpp/gemm_api_3x.md",
+      "revision": "b2f249acd20392beeb16f5e5a31f4f1a4e38b3bd",
+      "url": "https://raw.githubusercontent.com/NVIDIA/cutlass/b2f249acd20392beeb16f5e5a31f4f1a4e38b3bd/media/docs/cpp/gemm_api_3x.md",
+      "bytes": 31510,
+      "sha256": "5d16cab8c6553bae046db4c5cb0061749bc13c97cfc7a0e8bf9a53077a0c2ae9",
+      "retrieved_at": "2026-11-13T05:54:48.810588+00:00"
+    },
+    {
+      "repo": "HazyResearch/HipKittens",
+      "path": "kernels/cdna4/gemm/bf16fp32/README.md",
+      "revision": "8cde3dd146bd1c4be78023b582c1f4375c48489f",
+      "url": "https://raw.githubusercontent.com/HazyResearch/HipKittens/8cde3dd146bd1c4be78023b582c1f4375c48489f/kernels/cdna4/gemm/bf16fp32/README.md",
+      "bytes": 2486,
+      "sha256": "cfc012b99b4888c818b758c1c9a0e4bea3af39ebe60f985173de0fe40e509338",
+      "retrieved_at": "2026-11-13T05:55:28.839327+00:00"
+    },
+    {
+      "repo": "HazyResearch/HipKittens",
+      "path": "kernels/cdna4/gemm/bf16fp32/256_256_64_32_with16x32.cpp",
+      "revision": "8cde3dd146bd1c4be78023b582c1f4375c48489f",
+      "url": "https://raw.githubusercontent.com/HazyResearch/HipKittens/8cde3dd146bd1c4be78023b582c1f4375c48489f/kernels/cdna4/gemm/bf16fp32/256_256_64_32_with16x32.cpp",
+      "bytes": 15180,
+      "sha256": "935f6fb5915016667aad09b4a10a033d8b5ec262404270fe5ee06654c0dd9aed",
+      "retrieved_at": "2026-11-13T05:55:28.490504+00:00"
+    },
+    {
+      "repo": "HazyResearch/HipKittens",
+      "path": "kernels/cdna4/gemm/bf16fp32/256_256_64_32_with32x16.cpp",
+      "revision": "8cde3dd146bd1c4be78023b582c1f4375c48489f",
+      "url": "https://raw.githubusercontent.com/HazyResearch/HipKittens/8cde3dd146bd1c4be78023b582c1f4375c48489f/kernels/cdna4/gemm/bf16fp32/256_256_64_32_with32x16.cpp",
+      "bytes": 6196,
+      "sha256": "41140211a8ff58b9fbd9cc96424bf6bf6759634907270f0f5a90244e84fe516f",
+      "retrieved_at": "2026-11-13T05:55:28.648721+00:00"
+    },
+    {
+      "repo": "HazyResearch/HipKittens",
+      "path": "analysis/bf16_gemm/mi350x/kernel.cpp",
+      "revision": "8cde3dd146bd1c4be78023b582c1f4375c48489f",
+      "url": "https://raw.githubusercontent.com/HazyResearch/HipKittens/8cde3dd146bd1c4be78023b582c1f4375c48489f/analysis/bf16_gemm/mi350x/kernel.cpp",
+      "bytes": 15180,
+      "sha256": "935f6fb5915016667aad09b4a10a033d8b5ec262404270fe5ee06654c0dd9aed",
+      "retrieved_at": "2026-11-13T05:55:28.636017+00:00"
+    },
+    {
+      "repo": "HazyResearch/HipKittens",
+      "path": "kernels/cdna4/gemm/bf16fp32/micros/producer_consumer/16x32/README.md",
+      "revision": "8cde3dd146bd1c4be78023b582c1f4375c48489f",
+      "url": "https://raw.githubusercontent.com/HazyResearch/HipKittens/8cde3dd146bd1c4be78023b582c1f4375c48489f/kernels/cdna4/gemm/bf16fp32/micros/producer_consumer/16x32/README.md",
+      "bytes": 1288,
+      "sha256": "138caaf087041d11007951e9511715d79055ad1f2bfd4475f635d8f3d9fc9b2b",
+      "retrieved_at": "2026-11-13T05:55:28.547249+00:00"
+    },
+    {
+      "repo": "ROCm/rocm-blogs",
+      "path": "blogs/software-tools-optimization/hipkittens-gemm-ladder/README.md",
+      "revision": "7d12cba060c82bf4d17529786ee6e26032d9f610",
+      "url": "https://raw.githubusercontent.com/ROCm/rocm-blogs/7d12cba060c82bf4d17529786ee6e26032d9f610/blogs/software-tools-optimization/hipkittens-gemm-ladder/README.md",
+      "bytes": 59935,
+      "sha256": "6003c6ab1e71b6aa1b09e93d24bede244b74aa0d167cb27471ba1a83bf1a9ecd",
+      "retrieved_at": "2026-11-13T05:55:28.478479+00:00"
+    },
+    {
+      "repo": "ROCm/rocm-blogs",
+      "path": "blogs/software-tools-optimization/occupancy-math-mi355x/README.md",
+      "revision": "7d12cba060c82bf4d17529786ee6e26032d9f610",
+      "url": "https://raw.githubusercontent.com/ROCm/rocm-blogs/7d12cba060c82bf4d17529786ee6e26032d9f610/blogs/software-tools-optimization/occupancy-math-mi355x/README.md",
+      "bytes": 52418,
+      "sha256": "5d616077d39f3a81dbc7e4f242f1edcac499a010f8d55266b02e0194900f3fda",
+      "retrieved_at": "2026-11-13T05:55:30.823448+00:00"
+    },
+    {
+      "repo": "ROCm/rocm-blogs",
+      "path": "blogs/software-tools-optimization/matrix-cores-cdna/README.md",
+      "revision": "7d12cba060c82bf4d17529786ee6e26032d9f610",
+      "url": "https://raw.githubusercontent.com/ROCm/rocm-blogs/7d12cba060c82bf4d17529786ee6e26032d9f610/blogs/software-tools-optimization/matrix-cores-cdna/README.md",
+      "bytes": 36667,
+      "sha256": "3c4e7444ae6ec46132d7b15603677084b6e48b1597d9c67e9120913d9c33905e",
+      "retrieved_at": "2026-11-13T05:55:30.702921+00:00"
+    },
+    {
+      "repo": "ROCm/rocm-blogs",
+      "path": "blogs/software-tools-optimization/lds-bank-conflict/README.md",
+      "revision": "7d12cba060c82bf4d17529786ee6e26032d9f610",
+      "url": "https://raw.githubusercontent.com/ROCm/rocm-blogs/7d12cba060c82bf4d17529786ee6e26032d9f610/blogs/software-tools-optimization/lds-bank-conflict/README.md",
+      "bytes": 11829,
+      "sha256": "774d0319ed0012006637014a12ba6cd60613bcfe9b6dba69dcdb31f0eb010899",
+      "retrieved_at": "2026-11-13T05:55:30.550235+00:00"
+    },
+    {
+      "repo": "ROCm/hipBLASLt",
+      "path": "docs/how-to/how-to-use-streamk.rst",
+      "revision": "3a609b06926c8227e753b62087555e1f435bf2d4",
+      "url": "https://raw.githubusercontent.com/ROCm/hipBLASLt/3a609b06926c8227e753b62087555e1f435bf2d4/docs/how-to/how-to-use-streamk.rst",
+      "bytes": 5009,
+      "sha256": "a2c671da7d0fe0ff0cb8c359be4a43785880090126707665ea37294cedf2896d",
+      "retrieved_at": "2026-11-13T05:55:30.413015+00:00"
+    },
+    {
+      "repo": "ROCm/composable_kernel",
+      "path": "include/ck/tensor_operation/gpu/block/blockwise_gemm_pipeline_xdlops_v4.hpp",
+      "revision": "3f0199f548332bdf0b67f8140618def6859289ac",
+      "url": "https://raw.githubusercontent.com/ROCm/composable_kernel/3f0199f548332bdf0b67f8140618def6859289ac/include/ck/tensor_operation/gpu/block/blockwise_gemm_pipeline_xdlops_v4.hpp",
+      "bytes": 59241,
+      "sha256": "40478b22f646d315b43b37b14551eea0a8cc1a47233f0f0167f1a4fe8854f240",
+      "retrieved_at": "2026-11-13T05:55:30.778833+00:00"
+    },
+    {
+      "repo": "ROCm/composable_kernel",
+      "path": "include/ck/tensor_operation/gpu/block/blockwise_gemm_pipeline_xdlops_v5.hpp",
+      "revision": "3f0199f548332bdf0b67f8140618def6859289ac",
+      "url": "https://raw.githubusercontent.com/ROCm/composable_kernel/3f0199f548332bdf0b67f8140618def6859289ac/include/ck/tensor_operation/gpu/block/blockwise_gemm_pipeline_xdlops_v5.hpp",
+      "bytes": 33782,
+      "sha256": "e528af8797096c712a1804440d421bdb00210b49a2aecf3c57245fb5ce973593",
+      "retrieved_at": "2026-11-13T05:55:30.764359+00:00"
+    },
+    {
+      "repo": "ROCm/composable_kernel",
+      "path": "include/ck_tile/ops/gemm/pipeline/gemm_pipeline_ag_bg_cr_comp_v4.hpp",
+      "revision": "3f0199f548332bdf0b67f8140618def6859289ac",
+      "url": "https://raw.githubusercontent.com/ROCm/composable_kernel/3f0199f548332bdf0b67f8140618def6859289ac/include/ck_tile/ops/gemm/pipeline/gemm_pipeline_ag_bg_cr_comp_v4.hpp",
+      "bytes": 39086,
+      "sha256": "7b62b7875a335d7fa150ecfac2f7bb3c490c1fd5f529f2bfc453578a681aa8fc",
+      "retrieved_at": "2026-11-13T05:55:32.515249+00:00"
+    },
+    {
+      "repo": "HazyResearch/HipKittens",
+      "path": "include/cdna4/ops/warp/memory/tile/shared_to_register.cuh",
+      "revision": "8cde3dd146bd1c4be78023b582c1f4375c48489f",
+      "url": "https://raw.githubusercontent.com/HazyResearch/HipKittens/8cde3dd146bd1c4be78023b582c1f4375c48489f/include/cdna4/ops/warp/memory/tile/shared_to_register.cuh",
+      "bytes": 42467,
+      "sha256": "6754bc39c7f23302e94325dd62ef98f0822cf58da3ddca494b2cfd0affc479f9",
+      "retrieved_at": "2026-11-13T05:58:31.678958+00:00"
+    },
+    {
+      "repo": "HazyResearch/HipKittens",
+      "path": "include/cdna4/ops/warp/memory/tile/assembly/shared_to_register.cuh",
+      "revision": "8cde3dd146bd1c4be78023b582c1f4375c48489f",
+      "url": "https://raw.githubusercontent.com/HazyResearch/HipKittens/8cde3dd146bd1c4be78023b582c1f4375c48489f/include/cdna4/ops/warp/memory/tile/assembly/shared_to_register.cuh",
+      "bytes": 29009,
+      "sha256": "fa0a1f1969b0deff79912ada27b54de77819ebf4ebc61144101e08e4cb5de2ee",
+      "retrieved_at": "2026-11-13T05:58:31.685318+00:00"
+    },
+    {
+      "repo": "HazyResearch/HipKittens",
+      "path": "include/cdna4/types/register/rt_layout.cuh",
+      "revision": "8cde3dd146bd1c4be78023b582c1f4375c48489f",
+      "url": "https://raw.githubusercontent.com/HazyResearch/HipKittens/8cde3dd146bd1c4be78023b582c1f4375c48489f/include/cdna4/types/register/rt_layout.cuh",
+      "bytes": 1045,
+      "sha256": "cb7a02768fb14eea91b404288ebf8d7636b9c1a1be44e7c4a06d4aee80a9fb46",
+      "retrieved_at": "2026-11-13T05:58:31.805989+00:00"
+    },
+    {
+      "repo": "HazyResearch/HipKittens",
+      "path": "include/cdna4/ops/warp/register/tile/mma.cuh",
+      "revision": "8cde3dd146bd1c4be78023b582c1f4375c48489f",
+      "url": "https://raw.githubusercontent.com/HazyResearch/HipKittens/8cde3dd146bd1c4be78023b582c1f4375c48489f/include/cdna4/ops/warp/register/tile/mma.cuh",
+      "bytes": 29758,
+      "sha256": "b0075188df956a53fac4a66ae96423433bc98e7f45157697756e50baf52b5fdf",
+      "retrieved_at": "2026-11-13T05:58:31.959512+00:00"
+    },
+    {
+      "repo": "HazyResearch/HipKittens",
+      "path": "include/cdna4/ops/warp/register/tile/assembly/mma.cuh",
+      "revision": "8cde3dd146bd1c4be78023b582c1f4375c48489f",
+      "url": "https://raw.githubusercontent.com/HazyResearch/HipKittens/8cde3dd146bd1c4be78023b582c1f4375c48489f/include/cdna4/ops/warp/register/tile/assembly/mma.cuh",
+      "bytes": 28436,
+      "sha256": "06b037e82022b3cecce7fed22a723752570b4a693d9c0abc7d365f78919f7685",
+      "retrieved_at": "2026-11-13T05:58:31.829491+00:00"
+    },
+    {
+      "repo": "ROCm/rocm-libraries",
+      "path": "projects/hipblaslt/tensilelite/tensilelite/Components/LocalRead.py",
+      "revision": "eb9b307c4d56d5df63bd3bc60603d33aaa3abbc5",
+      "url": "https://raw.githubusercontent.com/ROCm/rocm-libraries/eb9b307c4d56d5df63bd3bc60603d33aaa3abbc5/projects/hipblaslt/tensilelite/tensilelite/Components/LocalRead.py",
+      "bytes": 154532,
+      "sha256": "941947fd172ac5e0b751c8c5a151468bea0bed9d9c57312c50d36ff262c46183",
+      "retrieved_at": "2026-11-13T05:58:31.851484+00:00"
+    },
+    {
+      "repo": "ROCm/rocm-libraries",
+      "path": "projects/hipblaslt/tensilelite/tensilelite/KernelWriterAssembly.py",
+      "revision": "eb9b307c4d56d5df63bd3bc60603d33aaa3abbc5",
+      "url": "https://raw.githubusercontent.com/ROCm/rocm-libraries/eb9b307c4d56d5df63bd3bc60603d33aaa3abbc5/projects/hipblaslt/tensilelite/tensilelite/KernelWriterAssembly.py",
+      "bytes": 1457198,
+      "sha256": "6e345aca48479f86facda09e8dca1d338f57953b9e895cd210f6c159a772e1ac",
+      "retrieved_at": "2026-11-13T05:58:34.330284+00:00"
+    },
+    {
+      "repo": "HazyResearch/HipKittens",
+      "path": "include/cdna4/types/shared/shared.cuh",
+      "revision": "8cde3dd146bd1c4be78023b582c1f4375c48489f",
+      "url": "https://raw.githubusercontent.com/HazyResearch/HipKittens/8cde3dd146bd1c4be78023b582c1f4375c48489f/include/cdna4/types/shared/shared.cuh",
+      "bytes": 179,
+      "sha256": "f38cc1d019cbc1df779057f8972800648f618c75455cb45a7a0c5fb3762e22b9",
+      "retrieved_at": "2026-11-13T05:59:14.279945+00:00"
+    },
+    {
+      "repo": "HazyResearch/HipKittens",
+      "path": "include/cdna4/types/shared/st.cuh",
+      "revision": "8cde3dd146bd1c4be78023b582c1f4375c48489f",
+      "url": "https://raw.githubusercontent.com/HazyResearch/HipKittens/8cde3dd146bd1c4be78023b582c1f4375c48489f/include/cdna4/types/shared/st.cuh",
+      "bytes": 7535,
+      "sha256": "6c8432453133faae2cf29890d1f01037dd5a1e1e3cd5fb4d3461fe9b7af454b1",
+      "retrieved_at": "2026-11-13T05:59:14.288845+00:00"
+    },
+    {
+      "repo": "HazyResearch/HipKittens",
+      "path": "include/cdna4/types/shared/st_shape.cuh",
+      "revision": "8cde3dd146bd1c4be78023b582c1f4375c48489f",
+      "url": "https://raw.githubusercontent.com/HazyResearch/HipKittens/8cde3dd146bd1c4be78023b582c1f4375c48489f/include/cdna4/types/shared/st_shape.cuh",
+      "bytes": 7442,
+      "sha256": "61b68bcff6d7765e8e1b67c748ea4709e0d8266d516e8f6888723311c4369976",
+      "retrieved_at": "2026-11-13T05:59:14.229735+00:00"
+    },
+    {
+      "repo": "HazyResearch/HipKittens",
+      "path": "include/cdna4/types/shared/sv.cuh",
+      "revision": "8cde3dd146bd1c4be78023b582c1f4375c48489f",
+      "url": "https://raw.githubusercontent.com/HazyResearch/HipKittens/8cde3dd146bd1c4be78023b582c1f4375c48489f/include/cdna4/types/shared/sv.cuh",
+      "bytes": 2919,
+      "sha256": "6911833f24791c4f86dee35d675162576f9e3aa4b83722bf09ff5ff061dab219",
+      "retrieved_at": "2026-11-13T05:59:14.174270+00:00"
+    },
+    {
+      "repo": "ROCm/rocm-libraries",
+      "path": "projects/hipblaslt/tensilelite/tensilelite/Common/ValidParameters.py",
+      "revision": "eb9b307c4d56d5df63bd3bc60603d33aaa3abbc5",
+      "url": "https://raw.githubusercontent.com/ROCm/rocm-libraries/eb9b307c4d56d5df63bd3bc60603d33aaa3abbc5/projects/hipblaslt/tensilelite/tensilelite/Common/ValidParameters.py",
+      "bytes": 92955,
+      "sha256": "dc7d66690dae3105cc1fb877f1e2ed5f5a53543d3f004d4f4d56bfae09aefafd",
+      "retrieved_at": "2026-11-13T05:59:46.193354+00:00"
+    },
+    {
+      "repo": "ROCm/rocm-libraries",
+      "path": "projects/hipblaslt/tensilelite/tensilelite/SolutionStructs/Solution.py",
+      "revision": "eb9b307c4d56d5df63bd3bc60603d33aaa3abbc5",
+      "url": "https://raw.githubusercontent.com/ROCm/rocm-libraries/eb9b307c4d56d5df63bd3bc60603d33aaa3abbc5/projects/hipblaslt/tensilelite/tensilelite/SolutionStructs/Solution.py",
+      "bytes": 440888,
+      "sha256": "7d244ef6d0f456fa9df0382b15fc9be7532ece401070814d784bdc8d6a087136",
+      "retrieved_at": "2026-11-13T05:59:45.913743+00:00"
+    },
+    {
+      "repo": "ROCm/rocm-libraries",
+      "path": "projects/hipblaslt/docs/how-to/how-to-use-streamk.rst",
+      "revision": "eb9b307c4d56d5df63bd3bc60603d33aaa3abbc5",
+      "url": "https://raw.githubusercontent.com/ROCm/rocm-libraries/eb9b307c4d56d5df63bd3bc60603d33aaa3abbc5/projects/hipblaslt/docs/how-to/how-to-use-streamk.rst",
+      "bytes": 14475,
+      "sha256": "fa0d9c44c895adbaa1f52d4a70a92158aca915a8cee50891587b73f6e5c958f8",
+      "retrieved_at": "2026-11-13T05:59:45.916219+00:00"
+    },
+    {
+      "repo": "ROCm/rocm-libraries",
+      "path": "projects/hipblaslt/docs/how-to/how-to-use-hipblaslt-offline-tuning.rst",
+      "revision": "eb9b307c4d56d5df63bd3bc60603d33aaa3abbc5",
+      "url": "https://raw.githubusercontent.com/ROCm/rocm-libraries/eb9b307c4d56d5df63bd3bc60603d33aaa3abbc5/projects/hipblaslt/docs/how-to/how-to-use-hipblaslt-offline-tuning.rst",
+      "bytes": 23806,
+      "sha256": "a78878f5b85bcb14e505963f49825c04833d9204ae03c09150982b0d6880f559",
+      "retrieved_at": "2026-11-13T05:59:45.724616+00:00"
+    },
+    {
+      "repo": "ROCm/rocm-libraries",
+      "path": "projects/hipblaslt/tensilelite/tensilelite/SolutionStructs/lds_layout.py",
+      "revision": "eb9b307c4d56d5df63bd3bc60603d33aaa3abbc5",
+      "url": "https://raw.githubusercontent.com/ROCm/rocm-libraries/eb9b307c4d56d5df63bd3bc60603d33aaa3abbc5/projects/hipblaslt/tensilelite/tensilelite/SolutionStructs/lds_layout.py",
+      "bytes": 4652,
+      "sha256": "c01f04271f205b1e0a41c7f109a42259e813028b5f9266d409492c6776f0d4ec",
+      "retrieved_at": "2026-11-13T05:59:45.898808+00:00"
+    },
+    {
+      "repo": "ROCm/triton",
+      "path": "python/perf-kernels/streamk/README.md",
+      "revision": "0ec280cf80dd91e9a86887981a670f2d4541a32b",
+      "url": "https://raw.githubusercontent.com/ROCm/triton/0ec280cf80dd91e9a86887981a670f2d4541a32b/python/perf-kernels/streamk/README.md",
+      "bytes": 2432,
+      "sha256": "b51fe5b709d05fc27cbf1e9b338005b4f42043af87cf87401d35d5b1c5fd3dbb",
+      "retrieved_at": "2026-11-13T05:59:45.712822+00:00"
+    },
+    {
+      "repo": "ROCm/triton",
+      "path": "python/perf-kernels/streamk/streamk_kernel.py",
+      "revision": "0ec280cf80dd91e9a86887981a670f2d4541a32b",
+      "url": "https://raw.githubusercontent.com/ROCm/triton/0ec280cf80dd91e9a86887981a670f2d4541a32b/python/perf-kernels/streamk/streamk_kernel.py",
+      "bytes": 8431,
+      "sha256": "53600d0e33708b3d7a36300a83b50d46d3dca718f304fd1bcefb4c8e8a81294b",
+      "retrieved_at": "2026-11-13T05:59:47.541768+00:00"
+    },
+    {
+      "repo": "ROCm/triton",
+      "path": "python/perf-kernels/streamk/persistent_gemm.py",
+      "revision": "0ec280cf80dd91e9a86887981a670f2d4541a32b",
+      "url": "https://raw.githubusercontent.com/ROCm/triton/0ec280cf80dd91e9a86887981a670f2d4541a32b/python/perf-kernels/streamk/persistent_gemm.py",
+      "bytes": 3416,
+      "sha256": "4bd747f4076a1f3a75be38e5e431f97a7a3cc8caa295ec952e75f03b43e2fc1a",
+      "retrieved_at": "2026-11-13T05:59:47.624248+00:00"
+    },
+    {
+      "repo": "NVIDIA/tilus",
+      "path": "docs/source/tutorials/matmul-hopper/v6.rst",
+      "revision": "d8e6cc69f88de0dfe333032b2f7d03ae122080ba",
+      "url": "https://raw.githubusercontent.com/NVIDIA/tilus/d8e6cc69f88de0dfe333032b2f7d03ae122080ba/docs/source/tutorials/matmul-hopper/v6.rst",
+      "bytes": 14252,
+      "sha256": "14b16ad4b76654560ae72cd5de9b6782e31b80952362b6345effab1cc21a713b",
+      "retrieved_at": "2026-11-13T05:59:47.848777+00:00"
+    },
+    {
+      "repo": "NVIDIA/tilus",
+      "path": "examples/hopper_matmul/matmul_v6.py",
+      "revision": "d8e6cc69f88de0dfe333032b2f7d03ae122080ba",
+      "url": "https://raw.githubusercontent.com/NVIDIA/tilus/d8e6cc69f88de0dfe333032b2f7d03ae122080ba/examples/hopper_matmul/matmul_v6.py",
+      "bytes": 14285,
+      "sha256": "40493ba6f9463a5933cfbfd895d9f7d79347bc1061cb3ad757102337d2280899",
+      "retrieved_at": "2026-11-13T05:59:47.837725+00:00"
+    },
+    {
+      "repo": "NVIDIA/cutlass",
+      "path": "include/cutlass/gemm/kernel/sm90_gemm_tma_warpspecialized_pingpong.hpp",
+      "revision": "b2f249acd20392beeb16f5e5a31f4f1a4e38b3bd",
+      "url": "https://raw.githubusercontent.com/NVIDIA/cutlass/b2f249acd20392beeb16f5e5a31f4f1a4e38b3bd/include/cutlass/gemm/kernel/sm90_gemm_tma_warpspecialized_pingpong.hpp",
+      "bytes": 43795,
+      "sha256": "7cf80ca4ba3379935c72280338f9be74506bed5f1178547bd04861348753ca61",
+      "retrieved_at": "2026-11-13T05:59:47.673813+00:00"
+    },
+    {
+      "repo": "ROCm/rocm-libraries",
+      "path": "projects/hipblaslt/tensilelite/tensilelite/Components/DecouplePGR.py",
+      "revision": "eb9b307c4d56d5df63bd3bc60603d33aaa3abbc5",
+      "url": "https://raw.githubusercontent.com/ROCm/rocm-libraries/eb9b307c4d56d5df63bd3bc60603d33aaa3abbc5/projects/hipblaslt/tensilelite/tensilelite/Components/DecouplePGR.py",
+      "bytes": 21997,
+      "sha256": "a9e59cd27266f31dd5a7663bb7a0b646ec1cb3c2ebc0ce736d0354fdd21eabef",
+      "retrieved_at": "2026-11-13T06:01:35.014230+00:00"
+    },
+    {
+      "repo": "ROCm/rocm-libraries",
+      "path": "projects/hipblaslt/tensilelite/tensilelite/Components/PersistentLoop.py",
+      "revision": "eb9b307c4d56d5df63bd3bc60603d33aaa3abbc5",
+      "url": "https://raw.githubusercontent.com/ROCm/rocm-libraries/eb9b307c4d56d5df63bd3bc60603d33aaa3abbc5/projects/hipblaslt/tensilelite/tensilelite/Components/PersistentLoop.py",
+      "bytes": 35940,
+      "sha256": "913d3edbbc2933b2a42f60de7abfe0362a5f6f9af217f9584bf445881d1e1a2b",
+      "retrieved_at": "2026-11-13T06:01:35.165580+00:00"
+    }
+  ],
+  "documents": [
+    {
+      "name": "cdna4_isa.pdf",
+      "url": "https://www.amd.com/content/dam/amd/en/documents/instinct-tech-docs/instruction-set-architectures/amd-instinct-cdna4-instruction-set-architecture.pdf",
+      "final_url": "https://www.amd.com/content/dam/amd/en/documents/instinct-tech-docs/instruction-set-architectures/amd-instinct-cdna4-instruction-set-architecture.pdf",
+      "status": 200,
+      "bytes": 4596505,
+      "sha256": "c459fb8db759006da52df57b5d7b913686ed7a68b52dc76e3f557f553a5d667f",
+      "content_type": "application/pdf",
+      "at": "2026-11-13T05:57:12.640805+00:00"
+    },
+    {
+      "name": "cdna4_whitepaper.pdf",
+      "url": "https://www.amd.com/content/dam/amd/en/documents/instinct-tech-docs/white-papers/amd-cdna-4-architecture-whitepaper.pdf",
+      "final_url": "https://www.amd.com/content/dam/amd/en/documents/instinct-tech-docs/white-papers/amd-cdna-4-architecture-whitepaper.pdf",
+      "status": 200,
+      "bytes": 2561194,
+      "sha256": "613e3418d2d1aa0b9cda417fe1e6798f69d0da0f7c8614531b160b66cbb716ac",
+      "content_type": "application/pdf",
+      "at": "2026-11-13T05:57:11.770490+00:00"
+    },
+    {
+      "name": "hipkittens.pdf",
+      "url": "https://arxiv.org/pdf/2511.08083",
+      "final_url": "https://arxiv.org/pdf/2511.08083",
+      "status": 200,
+      "bytes": 12375543,
+      "sha256": "09c101d87b76a44a29fe065ab0e9d92627e69536ac5442b715950ce59607d398",
+      "content_type": "application/pdf",
+      "at": "2026-11-13T05:57:14.376859+00:00"
+    },
+    {
+      "name": "streamk.pdf",
+      "url": "https://arxiv.org/pdf/2301.03598",
+      "final_url": "https://arxiv.org/pdf/2301.03598",
+      "status": 200,
+      "bytes": 29417126,
+      "sha256": "f2db58086debe599590650cac1069102ddf9396ac398e5a57284d3d524832cc5",
+      "content_type": "application/pdf",
+      "at": "2026-11-13T05:57:17.550151+00:00"
+    },
+    {
+      "name": "volkov_occupancy.pdf",
+      "url": "https://www.nvidia.com/content/GTC-2010/pdfs/2238_GTC2010.pdf",
+      "final_url": "https://www.nvidia.com/content/GTC-2010/pdfs/2238_GTC2010.pdf",
+      "status": 200,
+      "bytes": 796257,
+      "sha256": "81623ecae46245dff9498de7088a986492d55752f08c0d972e2c87bc64accafd",
+      "content_type": "application/pdf",
+      "at": "2026-11-13T05:57:10.929940+00:00"
+    },
+    {
+      "name": "hipkittens_blog.html",
+      "url": "https://hazyresearch.stanford.edu/blog/2025-11-09-hk",
+      "final_url": "https://hazyresearch.stanford.edu/blog/2025-11-09-hk",
+      "status": 200,
+      "bytes": 57366,
+      "sha256": "0f1fc9fff982725c041963cf450fcf5c5e51342c357f605c734f78157f029de2",
+      "content_type": "text/html; charset=utf-8",
+      "at": "2026-11-13T05:57:09.960607+00:00"
+    },
+    {
+      "name": "amd_brr.html",
+      "url": "https://hazyresearch.stanford.edu/blog/2025-11-09-amd-brr",
+      "final_url": "https://hazyresearch.stanford.edu/blog/2025-11-09-amd-brr",
+      "status": 200,
+      "bytes": 258557,
+      "sha256": "cffe541f1f949efc1043ec4ad44881b2fbbd0e41300f3945758d97df36c94575",
+      "content_type": "text/html; charset=utf-8",
+      "at": "2026-11-13T05:57:12.417500+00:00"
+    },
+    {
+      "name": "triton_persistent.html",
+      "url": "https://triton-lang.org/main/getting-started/tutorials/09-persistent-matmul.html",
+      "final_url": "https://triton-lang.org/main/getting-started/tutorials/09-persistent-matmul.html",
+      "status": 200,
+      "bytes": 245465,
+      "sha256": "42cd05f2bf17f9a19001730fc1374447996524d742eaa8663a05cc27650bd506",
+      "content_type": "text/html; charset=utf-8",
+      "at": "2026-11-13T05:57:13.256522+00:00"
+    },
+    {
+      "name": "hipblaslt_performance.html",
+      "url": "https://rocm.docs.amd.com/projects/hipBLASLt/en/latest/how-to/Performance.html",
+      "final_url": "https://rocm.docs.amd.com/projects/hipBLASLt/en/latest/how-to/Performance.html",
+      "status": 404,
+      "bytes": 26403,
+      "sha256": "2ee68d07c17fe7a0f20c6055b8d5290b3b3873499063a7bb68114bfbd8a8d172",
+      "content_type": "text/html; charset=utf-8",
+      "at": "2026-11-13T05:57:14.529951+00:00"
+    },
+    {
+      "name": "llvm_amdgpu.html",
+      "url": "https://llvm.org/docs/AMDGPUUsage.html",
+      "final_url": "https://llvm.org/docs/AMDGPUUsage.html",
+      "status": 200,
+      "bytes": 1402536,
+      "sha256": "f1378e2cbe2cb6af93ab54bb18d65750c948310887870ff20a023f546d8f5ec6",
+      "content_type": "text/html",
+      "at": "2026-11-13T05:57:15.758180+00:00"
+    }
+  ]
+}

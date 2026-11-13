@@ -66,6 +66,7 @@ class GemmA16W16Gfx950Param:
     split_init_ring: fx.Constexpr[bool]
     unroll_hti: fx.Constexpr[bool]
     n_grouped_loads: fx.Constexpr[bool]
+    bank_swizzle_343: fx.Constexpr[bool]
     # derived params
     async_load_bytes: fx.Constexpr[int]
     in_data_bytes: fx.Constexpr[int]
@@ -128,6 +129,7 @@ def make_gemm_a16w16_gfx950_param(
     unroll_hti: bool = False,
     streamk_blocks: int = 0,
     split_init_ring: bool = False,
+    bank_swizzle_343: bool = False,
 ) -> GemmA16W16Gfx950Param:
     if in_dtype_id not in (GEMM_A16W16_DTYPE_BF16, GEMM_A16W16_DTYPE_FP16):
         raise ValueError(f"unsupported in_dtype_id={in_dtype_id}")
@@ -332,6 +334,7 @@ def make_gemm_a16w16_gfx950_param(
         split_init_ring=split_init_ring,
         streamk_blocks=streamk_blocks,
         n_grouped_loads=n_grouped_loads,
+        bank_swizzle_343=bank_swizzle_343,
         unroll_hti=unroll_hti,
         in_dtype_id=in_dtype_id,
         out_dtype_id=out_dtype_id,
@@ -385,6 +388,7 @@ def make_gemm_a16w16_gfx950_kernel_name(param: GemmA16W16Gfx950Param):
     name += "_ng4sk_u9lg" if param.n_grouped_loads else ""
     name += "_hti5sk" if param.unroll_hti else ""
     name += "_initring4" if param.split_init_ring else ""
+    name += "_sw343" if param.bank_swizzle_343 else ""
     if (param.mma_m, param.mma_n, param.mma_k) != (16, 16, 32):
         name += f"_mi{param.mma_m}x{param.mma_n}x{param.mma_k}"
     if param.streamk_blocks:
@@ -392,7 +396,23 @@ def make_gemm_a16w16_gfx950_kernel_name(param: GemmA16W16Gfx950Param):
     return name
 
 
-def make_gemm_ab_lds_layouts(rows_a, rows_b, block_k, a_is_transposed, b_is_transposed):
+def make_gemm_ab_lds_layouts(
+    rows_a, rows_b, block_k, a_is_transposed, b_is_transposed, bank_swizzle_343=False
+):
+    if const_expr(bank_swizzle_343):
+        # gfx950 ds_read_b128 executes in non-contiguous lane phases.
+        # For the qualified BK128 MFMA16 NT geometry, XOR K[6:4] with
+        # row[2:0], keeping each 8-BF16 DMA packet contiguous in its row.
+        # Unlike Swizzle(3,3,3), this avoids two-way phase-bank conflicts.
+        swizzle = fx.static(fx.SwizzleType.get(3, 4, 3))
+        return (
+            fx.make_composed_layout(
+                swizzle, fx.make_ordered_layout((rows_a, block_k), (1, 0))
+            ),
+            fx.make_composed_layout(
+                swizzle, fx.make_ordered_layout((rows_b, block_k), (1, 0))
+            ),
+        )
     a_lds_layout = (
         make_transposed_lds_layout(rows_a, block_k)
         if const_expr(a_is_transposed)
@@ -745,6 +765,7 @@ def _gemm_a16w16_ft_device(
         block_k,
         param.a_is_transposed,
         param.b_is_transposed,
+        param.bank_swizzle_343,
     )
     c_lds_layout = fx.make_layout((block_m, block_n), (block_n, 1))
 
@@ -1931,6 +1952,30 @@ def _use_split_init_ring(m, n, k, kwargs):
     )
 
 
+def _use_bank_swizzle_343(m, n, k, kwargs):
+    # Finite qualification: do not silently change other explicit BK128 GEMMs.
+    return (
+        (m, n, k) == (128, 7168, 3584)
+        and kwargs.get("in_dtype_id") == GEMM_A16W16_DTYPE_BF16
+        and kwargs.get("out_dtype_id") == GEMM_A16W16_DTYPE_BF16
+        and not kwargs.get("has_bias", False)
+        and not kwargs.get("a_is_transposed", False)
+        and kwargs.get("b_is_transposed", True)
+        and not kwargs.get("use_half_tile_interleaved", False)
+        and not kwargs.get("b_non_temporal", False)
+        and kwargs.get("k_stagger", 0) == 0
+        and kwargs.get("streamk_blocks", 0) == 0
+        and (kwargs.get("mma_m", 16), kwargs.get("mma_n", 16), kwargs.get("mma_k", 32))
+        == (16, 16, 32)
+        and (kwargs.get("block_m"), kwargs.get("block_n"), kwargs.get("block_k"))
+        == (64, 64, 128)
+        and (kwargs.get("stages"), kwargs.get("split_k")) == (3, 1)
+        and (kwargs.get("m_waves"), kwargs.get("n_waves"), kwargs.get("k_waves", 1))
+        == (2, 4, 1)
+        and kwargs.get("group_m", 0) == 0
+    )
+
+
 def make_gemm_a16w16_param_and_validate(m, n, k, kwargs):
     # Python caches compare True == 1 and 16.0 == 16. Validate the new
     # fields before looking up a previously built constexpr parameter.
@@ -1946,6 +1991,7 @@ def make_gemm_a16w16_param_and_validate(m, n, k, kwargs):
         **kwargs,
         "n_grouped_loads": _use_n_grouped_loads(m, n, k, kwargs),
         "unroll_hti": _use_unrolled_hti(m, n, k, kwargs),
+        "bank_swizzle_343": _use_bank_swizzle_343(m, n, k, kwargs),
     }
     # Never accept the internal schedule flag from a caller. Only the
     # exact-shape cache entry can derive it from a validated configuration.

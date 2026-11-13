@@ -4,7 +4,8 @@
 """BF16 latent-projection GEMMs: caller buffers and changed graph inputs.
 
 The two exact M16384 projections and down-M128 have specialized schedules.
-Up-M128 and non-target padded-M consumers keep their original paths.
+Up-M128 uses the phase-bank-matched BK128 FT layout. Non-target padded-M
+consumers keep the original BK64 path.
 Down-M128 retains the original four-way BF16 atomic arithmetic, but publishes
 output initialization before input prefetch and unrolls the LDS ring. Its
 exact-shape pointer launcher reuses the existing split-K synchronization.
@@ -28,7 +29,7 @@ from aiter.jit.utils.chip_info import get_gfx_runtime
 from aiter.test_common import benchmark, checkAllclose, run_perftest
 from aiter.tuned_gemm import gemm_a16w16, gemm_a16w16_out
 
-# Small-M CSV policies are unchanged. The new large-M row is exact-only.
+# Small-up bank layout and the large-up row are exact-only CSV policies.
 # Both large projections have exact-shape implementation specializations.
 # Exact large-up also unrolls nine two-tile periods and waits for LDS in
 # its C-only tail. Ragged-M boundaries keep original device code.
@@ -564,11 +565,91 @@ def check_large_up_k_tile_coverage():
     aiter.logger.info("Large-up unroll boundaries and final K drain: PASS")
 
 
+def check_small_up_bank_layout():
+    """Check selected binary, K coverage, and public layout/padded-M behavior."""
+    import aiter.tuned_gemm as tuned
+    from aiter.ops.flydsl.kernels.gemm_a16w16_gfx950 import (
+        make_gemm_a16w16_gfx950_kernel_name,
+        make_gemm_a16w16_param_and_validate,
+    )
+
+    m, n, k = 128, 7168, 3584
+    dtype = torch.bfloat16
+    cfg = {
+        "block_m": 64,
+        "block_n": 64,
+        "block_k": 128,
+        "stages": 3,
+        "m_waves": 2,
+        "n_waves": 4,
+        "k_waves": 1,
+        "split_k": 1,
+        "group_m": 0,
+        "use_half_tile_interleaved": False,
+        "in_dtype_id": 2,
+        "out_dtype_id": 2,
+        "a_is_transposed": False,
+        "b_is_transposed": True,
+        "has_bias": False,
+    }
+    params = make_gemm_a16w16_param_and_validate(m, n, k, cfg)
+    assert params.bank_swizzle_343
+    assert make_gemm_a16w16_gfx950_kernel_name(params).endswith("_sw343")
+    for rows in (65, 127, 128):
+        selected = tuned.get_GEMM_A16W16_config(
+            rows, n, k, False, str(dtype), str(dtype), gfx="gfx950", cu_num=256
+        )
+        signature = (
+            "t64x64x128x3_ks1_w2x4x1" if rows == 128 else "t64x64x64x7_ks1_w4x2x1"
+        )
+        assert signature in selected["kernelName"], selected
+
+    x = torch.zeros((m, k), device="cuda", dtype=dtype)
+    w = torch.zeros((n, k), device=x.device, dtype=dtype)
+    mem = torch.full((m * n + 64,), 31.0, device=x.device, dtype=dtype)
+    out = mem[32:-32].view(m, n)
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph, stream=stream):
+        gemm_a16w16_out(x, w, out)
+    stream.synchronize()
+    for tile in range(28):
+        for offset in (0, 31, 64, 127):
+            x.zero_()
+            w.zero_()
+            kk = tile * 128 + offset
+            x[:, kk] = 0.5
+            x[::2, kk] = -0.5
+            w[:, kk] = 0.25
+            w[::3, kk] = -0.25
+            out.fill_(float("nan"))
+            stream.wait_stream(torch.cuda.current_stream())
+            with torch.cuda.stream(stream):
+                graph.replay()
+            stream.synchronize()
+            expected = (x[:, kk, None].float() * w[None, :, kk].float()).to(dtype)
+            assert torch.equal(out, expected), (tile, offset)
+            assert (mem[:32] == 31).all() and (mem[-32:] == 31).all()
+
+    # Public normalization remains in effect for non-contiguous A/B.
+    torch.manual_seed(3571)
+    xp = torch.randn((m, k + 16), device=x.device, dtype=dtype)[:, 8 : 8 + k]
+    wp = torch.randn((n, 2 * k), device=x.device, dtype=dtype)[:, ::2]
+    saved = (xp.clone(), wp.clone())
+    gemm_a16w16_out(xp, wp, out)
+    torch.cuda.synchronize()
+    assert_result(run_torch(xp, wp), out, "bank layout strided public")
+    assert torch.equal(xp, saved[0]) and torch.equal(wp, saved[1])
+    aiter.logger.info("Small-up bank layout, 112 K probes and CSV isolation: PASS")
+
+
 def main():
     if get_gfx_runtime() != "gfx950":
         aiter.logger.warning("This tuning qualification targets gfx950; skipping")
         return
     check_n_grouped_specialization()
+    check_small_up_bank_layout()
     check_large_up_k_tile_coverage()
     check_hti_unroll_specialization()
     parser = argparse.ArgumentParser(description=__doc__)

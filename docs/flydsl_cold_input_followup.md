@@ -1,5 +1,9 @@
 # Reject regressing WS promotion; continue cold-input optimization
 
+> New research-led continuation: [BF16 GEMM research](bf16_gemm_research.md)
+> derives a BK128 phase-bank layout and qualifies an ordinary FT small-up
+> replacement. The older rejected WS/loop experiments below remain rejected.
+
 > Current continuation: a separately qualified exact large-up HTI improvement is now described in [large-up follow-up](flydsl_large_up_followup.md). The rejected small-up candidates below remain unselected.
 
 ## Deployment correction

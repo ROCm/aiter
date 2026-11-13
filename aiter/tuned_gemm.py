@@ -171,6 +171,28 @@ def get_GEMM_A16W16_tuned_config(
                 == "flydsl_hgemm_abf16_wbf16_bf16_t256x256x64x2_ks1_w2x4x1_bias0_ktail0_gm4_pht_gfx950"
             ):
                 continue
+            if (
+                M != padded_M
+                and (gfx, cu_num, padded_M, N, K) == ("gfx950", 256, 128, 7168, 3584)
+                and not (bias or scaleAB or bpreshuffle)
+                and str(dtype) == str(otype) == "torch.bfloat16"
+                and config["libtype"] == "flydsl"
+                and config["kernelName"]
+                == "flydsl_hgemm_abf16_wbf16_bf16_t64x64x128x3_ks1_w2x4x1_bias0_ktail0_gm0_pft_gfx950"
+            ):
+                # This row formerly supplied the BK64 policy to padded-M
+                # callers. Preserve it instead of falling through to a
+                # different backend when only exact M128 is retuned.
+                config = {
+                    **config,
+                    "kernelName": "flydsl_hgemm_abf16_wbf16_bf16_t64x64x64x7_ks1_w4x2x1_bias0_ktail0_gm0_pft_gfx950",
+                    "solidx": 2787,
+                    "splitK": 1,
+                    "us": 19.5768,
+                    "err_ratio": 0.0,
+                    "tflops": 335.94,
+                    "bw": 2765.15,
+                }
             if config["libtype"] == "flydsl":
                 flydsl_config = (
                     _get_flydsl_gemm_kernels().get_flydsl_hgemm_kernel_params(
