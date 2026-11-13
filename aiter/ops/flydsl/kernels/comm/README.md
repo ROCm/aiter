@@ -20,6 +20,7 @@ The host classes are in `aiter/ops/flydsl/`:
 |---|---|
 | `one_shot_allreduce.py` | `OneShotAllReduce`, the host class for the one-shot kernel. |
 | `quick_allreduce.py` | `FlyQuickAllReduce`, the host class for the mesh and the ring. |
+| `quick_allreduce_relay.py` | Uncached IPC bounce buffers on lending GPUs for the TP2 mesh relay. |
 | `allreduce_policy.py` | The limits, the payload-size boundaries between the three kernels, and the tuning ladders. |
 | `allreduce_host_shared.py` | IPC inbox setup, link detection and other host helpers. |
 
@@ -47,6 +48,18 @@ lap. In each lap, each rank pushes to all `N-1` peers. Both laps use the same
 wire format. The default is INT4 with one E5M2 scale for each group of 16
 values. INT5 and INT6 use the same scale and add more bits for each value. FP16
 sends the values without quantization and is used in testing.
+
+At TP2 on xGMI, `FlyQuickAllReduce(..., relay_devices=(r01, r10))` is an opt-in
+path (never enabled by production dispatch) that routes `b % den < num` blocks
+through uncached IPC bounce buffers on lending GPUs (`r01 == r10` uses one GPU
+for both directions). On `gfx950` it defaults to `3/8` from 480 KiB up
+(1.37–1.56× faster than direct at 5–120 MiB); `3/8` fills whole XCDs and keeps
+slowdown to concurrent work on the lending GPUs low. Relay stores are system
+scope (`sc0 sc1 nt`) so `vmcnt(0)` orders them before the peer's inbox flag;
+relay reads use plain loads behind a per-tile agent-scope `buffer_inv sc1`
+after the first tile (L1 retains uncached lines on `gfx950`, while bypassing L1
+slows concurrent GEMMs on the lending GPU). Allocating a bounce from a TP
+process initializes a HIP context (~490 MB) on each lending GPU.
 
 ### Ring
 

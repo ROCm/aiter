@@ -36,8 +36,7 @@ packet into a bounce buffer on a third GPU instead of the peer's inbox, so a
 share of each direction's traffic takes the two xGMI links through that GPU.
 The peer reads it from the bounce in place of its inbox. Flags, colours and the
 reduction order are those of the direct path. Relay blocks read the bounce with
-plain loads behind an L1 invalidate; see ``_RELAY_RECV_CM``. Design notes and
-measurements: ``aiter/ops/flydsl/quick_allreduce_relay.md``.
+plain loads behind an L1 invalidate; see ``_RELAY_RECV_CM``.
 """
 
 import flydsl.compiler as flyc
@@ -132,8 +131,6 @@ __all__ = [
     "max_payload_bytes",
     "mesh_lds_bytes",
     "mxfp4_scale_shape",
-    "relay_blocks",
-    "relay_tile_fraction",
     "tile_atoms_for",
 ]
 
@@ -258,8 +255,7 @@ def clamp_grid_cap(
 # from which the relay engines run, and the share of blocks that relay. Read
 # only when the caller passes ``relay_devices``; production dispatch does not,
 # as the relay GPUs may belong to other work. An arch without an entry needs
-# both values from the caller. How they were chosen:
-# ``aiter/ops/flydsl/quick_allreduce_relay.md``.
+# both values from the caller.
 MESH_RELAY_DEFAULTS = {("xgmi", 2, "gfx950"): (480 << 10, (3, 8))}
 
 # Wire formats the mesh can build.
@@ -281,8 +277,8 @@ _RELAY_STORE_CM = _CM_SC0 | _CM_SC1 | _CM_NT
 # behind a workgroup-scope acquire that emits no invalidate. The invalidate is
 # what makes plain loads correct: L1 can hold UC lines, and a block reads the
 # same bounce slots on every tile, so a plain load could otherwise be served
-# the previous tile's packet. A workgroup-scope acquire would invalidate
-# nothing. Why plain loads: ``aiter/ops/flydsl/quick_allreduce_relay.md``.
+# the previous tile's packet; bypassing L1 instead hurts concurrent work on the
+# lending GPU.
 _RELAY_RECV_CM = 0
 _RELAY_ACQUIRE_SCOPE = rocdl.SyncScope.AgentOneAs
 
@@ -295,28 +291,6 @@ def check_relay(relay):
             f"got {tuple(relay)!r}"
         )
     return num, den
-
-
-def relay_blocks(n_blocks: int, relay) -> list[bool]:
-    """Which of *n_blocks* launched blocks are relay blocks, as the kernel decides."""
-    num, den = check_relay(relay)
-    return [b % den < num for b in range(int(n_blocks))]
-
-
-def relay_tile_fraction(num_tiles: int, n_blocks: int, relay) -> float:
-    """Fraction of *num_tiles* tiles owned by relay blocks.
-
-    Block ``b`` owns tiles ``b, b + n_blocks, ...``. The fraction differs from
-    ``num/den`` when ``n_blocks`` is not a multiple of ``den``.
-    """
-    if num_tiles < 1:
-        return 0.0
-    owned = sum(
-        max(0, -(-(int(num_tiles) - b) // int(n_blocks)))
-        for b, is_relay in enumerate(relay_blocks(n_blocks, relay))
-        if is_relay
-    )
-    return owned / int(num_tiles)
 
 
 def mesh_lds_bytes(
@@ -430,11 +404,6 @@ def make_quick_allreduce_mesh_kernel(
     release_scope = policy["release"]
     acquire_scope = policy["acquire"]
     recv_policy = policy["recv"]
-    # Locals rather than module constants read from the kernel helpers, so they
-    # are part of the compile-cache key.
-    relay_store_cm = _RELAY_STORE_CM
-    relay_recv_cm = _RELAY_RECV_CM
-    relay_acquire_scope = _RELAY_ACQUIRE_SCOPE
     if tile_atoms % world_size != 0:
         raise ValueError(
             f"tile_atoms={tile_atoms} is not divisible by world_size={world_size}"
@@ -1005,7 +974,7 @@ def make_quick_allreduce_mesh_kernel(
                                 bounce_out,
                                 wire_off,
                                 v4,
-                                cache_modifier=relay_store_cm,
+                                cache_modifier=_RELAY_STORE_CM,
                             )
                         else:
                             _store_peer(j, wire_off, v4)
@@ -1094,14 +1063,14 @@ def make_quick_allreduce_mesh_kernel(
             # there was one. See _RELAY_RECV_CM.
             if const_expr(invalidate is not None):  # noqa: SIM102
                 if invalidate:
-                    _acquire_inbox(relay_acquire_scope)
+                    _acquire_inbox(_RELAY_ACQUIRE_SCOPE)
 
         def _recv_quantized(phase, src, sub, k, to_bounce):
             base = _sub_tile_i32(phase, src, sub)
             if const_expr(k):
                 base = base + fx.Int32(k * c.rank_tile_i32)
             buf, bits = (
-                (bounce_in, relay_recv_cm) if to_bounce else (inbox, recv_policy)
+                (bounce_in, _RELAY_RECV_CM) if to_bounce else (inbox, recv_policy)
             )
 
             def _get(off):

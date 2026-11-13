@@ -38,9 +38,8 @@ from aiter.ops.flydsl.kernels.comm.one_shot_allreduce import SUPPORTED_ATOMS
 from aiter.ops.flydsl.kernels.comm.quick_allreduce_mesh import (
     RELAY_MAX_DEN,
     SUPER_TILES,
+    check_relay,
     make_quick_allreduce_mesh_kernel,
-    relay_blocks,
-    relay_tile_fraction,
 )
 from aiter.ops.flydsl.kernels.comm.quick_allreduce_ring import RING_SUPER_TILES
 from aiter.ops.flydsl.one_shot_allreduce import resolve_oneshot_max_bytes
@@ -282,46 +281,17 @@ def test_ladder_rungs_fall_inside_their_dispatch_window(cell):
     # above constrains them.
 
 
-RELAY_FRACTIONS = [(1, 4), (3, 8), (1, 2), (5, 8), (3, 4), (1, 1)]
-
-
-@pytest.mark.parametrize("relay", RELAY_FRACTIONS)
-def test_relay_blocks_hit_the_fraction(relay):
-    """With a whole number of ``den`` cycles the realized fraction is exactly
-    ``num/den``, the relay blocks lead each cycle, and ``(1, 1)`` is every block."""
-    num, den = relay
-    n_blocks = den * 16
-    flags = relay_blocks(n_blocks, relay)
-    assert sum(flags) * den == num * n_blocks
-    assert flags[:den] == [True] * num + [False] * (den - num)
-    if relay == (1, 1):
-        assert all(flags)
+@pytest.mark.parametrize("relay", [(1, 4), (3, 8), (1, 2), (5, 8), (3, 4), (1, 1)])
+def test_check_relay_accepts_valid_fractions(relay):
+    assert check_relay(relay) == relay
 
 
 @pytest.mark.parametrize(
     "relay", [(0, 2), (3, 2), (1, RELAY_MAX_DEN + 1), (1, 0), (-1, 2)]
 )
-def test_relay_fraction_out_of_range_raises(relay):
+def test_check_relay_rejects_out_of_range(relay):
     with pytest.raises(ValueError):
-        relay_blocks(16, relay)
-
-
-def test_relay_tile_fraction():
-    # 8192x5120 bf16 at block 512: 1280 tiles over 128 blocks.
-    assert relay_tile_fraction(1280, 128, (1, 2)) == 0.5
-    assert relay_tile_fraction(1280, 128, (1, 1)) == 1.0
-    # Fewer blocks than a full cycle skew the realized fraction.
-    assert relay_tile_fraction(16, 16, (1, 4)) == 0.25
-    assert relay_tile_fraction(8, 8, (3, 8)) == 0.375
-    assert relay_tile_fraction(5, 5, (1, 2)) == 0.6
-    # Every tile has exactly one owner, relay or not.
-    n_blocks, num_tiles = 40, 1000
-    relay = (3, 8)
-    owned = [len(range(b, num_tiles, n_blocks)) for b in range(n_blocks)]
-    assert sum(owned) == num_tiles
-    want = sum(o for o, r in zip(owned, relay_blocks(n_blocks, relay)) if r)
-    assert relay_tile_fraction(num_tiles, n_blocks, relay) == want / num_tiles
-    assert relay_tile_fraction(0, 8, (1, 2)) == 0.0
+        check_relay(relay)
 
 
 @pytest.mark.parametrize(

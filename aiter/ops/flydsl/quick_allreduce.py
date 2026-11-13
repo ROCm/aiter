@@ -79,9 +79,6 @@ from .kernels.comm.quick_allreduce_mesh import (
     mxfp4_scale_shape,
     tile_atoms_for,
 )
-from .kernels.comm.quick_allreduce_mesh import (
-    relay_tile_fraction as _tile_fraction,
-)
 from .kernels.comm.quick_allreduce_ring import (
     AG_CODECS,
     RING_SUPER_TILES,
@@ -89,7 +86,7 @@ from .kernels.comm.quick_allreduce_ring import (
     make_quick_allreduce_ring_kernel,
 )
 from .kernels.tensor_shim import _run_compiled
-from .quick_allreduce_relay import InGroupRelayProvider, RelayProvider
+from .quick_allreduce_relay import open_relay_bounce
 
 logger = logging.getLogger("aiter")
 
@@ -322,8 +319,8 @@ class FlyQuickAllReduce:
     through one GPU. ``relay_fraction=(num, den)`` is the share
     of blocks and ``relay_min_bytes`` the payload from which relay engines are
     used; ``None`` takes the per-arch default, and an arch with none needs both.
-    ``relay_provider`` supplies the bounce buffers. Every rank passes the same
-    values, and a relay setup that cannot be completed raises.
+    Every rank passes the same values, and a relay setup that cannot be
+    completed raises.
     """
 
     def __init__(
@@ -345,7 +342,6 @@ class FlyQuickAllReduce:
         relay_devices: tuple[int, int] | None = None,
         relay_fraction: tuple[int, int] | None = None,
         relay_min_bytes: int | None = None,
-        relay_provider: RelayProvider | None = None,
     ):
         check_world_size(world_size)
         if algorithm not in ALGORITHMS:
@@ -355,13 +351,9 @@ class FlyQuickAllReduce:
         algo = ALGORITHMS[algorithm]
         link = resolve_link(link)
         if relay_devices is None and (
-            relay_fraction is not None
-            or relay_min_bytes is not None
-            or relay_provider is not None
+            relay_fraction is not None or relay_min_bytes is not None
         ):
-            raise ValueError(
-                "relay_fraction, relay_min_bytes and relay_provider need relay_devices"
-            )
+            raise ValueError("relay_fraction and relay_min_bytes need relay_devices")
         rs_codec, ag_codec = _resolve_codecs(algo, int(world_size), rs_codec, ag_codec)
         _validate_ipc_process_group(
             group, rank=int(rank), world_size=world_size, owner="FlyQuickAllReduce"
@@ -440,14 +432,11 @@ class FlyQuickAllReduce:
                 relay_fraction,
                 relay_min_bytes,
             )
-            provider = (
-                InGroupRelayProvider() if relay_provider is None else relay_provider
-            )
 
         try:
             self._build_engines(self._caps, self._by_cfg, self._build_kw)
             if self.relay_devices is not None:
-                self._build_relay_engines(provider)
+                self._build_relay_engines()
             for hidden in sorted({int(h) for h in rmsnorm_hidden}):
                 self.compile_rmsnorm(hidden)
         except Exception:
@@ -542,7 +531,7 @@ class FlyQuickAllReduce:
         self.relay_fraction = own[3]
         self.relay_min_bytes = own[4]
 
-    def _build_relay_engines(self, provider: RelayProvider) -> None:
+    def _build_relay_engines(self) -> None:
         # A relay engine shares its direct twin's grid, and each owns its inbox
         # and bounce: a rank can start a call on one while its peer is still
         # reading the other's.
@@ -554,7 +543,7 @@ class FlyQuickAllReduce:
                 spec = self._algo.build(
                     **self._build_kw[key], relay=self.relay_fraction
                 )
-                bounce = provider.open(
+                bounce = open_relay_bounce(
                     group=self.group,
                     rank=self.rank,
                     device=self._device_index,
@@ -695,14 +684,6 @@ class FlyQuickAllReduce:
         """
         return sum(eng.buf_bytes for eng in self._engines())
 
-    @property
-    def relay_bytes(self) -> int:
-        """Device bytes this rank holds for relaying: its incoming bounce on
-        each relay engine, and those engines' inboxes."""
-        return sum(b.nbytes for b in self._relay_bounces) + sum(
-            eng.buf_bytes for eng in self._relay_by_cfg.values()
-        )
-
     @staticmethod
     def _num_tiles(live_bytes: int, block: int, tile_atoms: int = DEFAULT_ATOMS) -> int:
         tile_bytes = int(block) * int(tile_atoms) * 16
@@ -768,15 +749,6 @@ class FlyQuickAllReduce:
         Ring engines have no ``relay`` field. That is the direct path.
         """
         return self._pick_engine(int(nbytes))[0].spec.get("relay") is not None
-
-    def relay_tile_fraction(self, nbytes: int) -> float:
-        """Share of an *nbytes* payload's tiles carried by relay blocks."""
-        eng, num_tiles = self._pick_engine(int(nbytes))
-        relay = eng.spec.get("relay")
-        if relay is None:
-            return 0.0
-        grid_x = self._grid_x(num_tiles, eng.super_tile, eng.grid)
-        return _tile_fraction(num_tiles, grid_x, relay)
 
     def _launch_args(
         self,

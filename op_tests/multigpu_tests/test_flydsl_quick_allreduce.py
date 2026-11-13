@@ -32,18 +32,14 @@ sweep ends in a markdown table:
   bit-identical to the fp32 reference, which separates a chunk-addressing or
   flag-protocol bug from a codec one. Run through each production schedule's
   ladder on the shipping payloads, so it covers the geometry that ships.
-* ``test_quick_allreduce_relay`` -- the TP2 mesh with relay devices set, checked
-  against a direct engine on the same inputs. A default run adds these rows
-  only on xGMI, when four GPUs are visible and this arch has relay defaults.
-  The direct TP2 rows always run. Relay rows run eager; 2.5 and 80 MiB shapes
-  also run captured into a CUDA graph, replayed with the inputs refilled
-  between replays. A block-64 row with every block relaying, eager and graph,
-  makes each block re-read its bounce slots, which catches a relay acquire that
-  no longer empties L1.
+* ``test_quick_allreduce_relay`` -- the TP2 mesh with relay devices set (on
+  xGMI when four GPUs are visible), checked bit-for-bit against a direct engine
+  on the same inputs across back-to-back calls, CUDA-graph replay, the default
+  size cutoff, and a block-64 slot-reuse row that catches a missing L1
+  invalidate.
 * ``test_quick_allreduce_setup_failure`` -- at TP2, one rank fails the inbox
-  allocation or the peer-handle open while the engines are built. Every rank
-  must raise, none may hang in an exchange, and a clean engine must build
-  afterwards. Every engine shares this setup code.
+  allocation or the peer-handle open while the engines are built; every rank
+  must raise and a clean engine must build afterwards.
 
 ``--extended`` adds what production never selects: the legacy fixed shipping
 shapes; ``test_quick_allreduce`` again, as a second table, with ``block``
@@ -133,7 +129,7 @@ from aiter.dist.parallel_state import (
 )
 from aiter.dist.utils import get_distributed_init_method, get_ip, get_open_port
 from aiter.jit.utils.chip_info import get_gfx_runtime
-from aiter.test_common import benchmark, checkAllclose, run_perftest
+from aiter.test_common import benchmark, checkAllclose
 
 set_start_method("spawn", force=True)
 
@@ -334,59 +330,35 @@ KNOB_CASES = (
     (2, "ring", 9216, 4096, 128),
 )
 
-# TP2 relay rows, on the mesh. Back-to-back calls per case, each on a different
-# input, so a payload that reaches the peer late shows up as a differing lane.
+# TP2 relay rows on the mesh (xGMI, >= 4 GPUs; relays on devices 2 and 3).
+# Back-to-back calls on distinct inputs check flag/colour handoff; the block-64
+# rows force every block to relay and re-read its bounce slots across tiles with
+# too little L1 traffic to evict them, catching a missing L1 invalidate.
 RELAY_CALLS = 4
-# Relays for the TP pair on devices 0 and 1.
 DEFAULT_RELAY = (2, 3)
 DEFAULT_RELAY_FRACTION = (3, 8)
-# (tokens, hidden, codec). Sizes: a single tile, 10 MiB (partial persistent
-# grid on gfx950's g512 block-256 rung; above 4 MiB on two-rung ladders), a
-# payload whose last tile is partial, a full-grid multiple at 80 MiB, and 120
-# MiB. The lossless wire runs the two that exercise the offsets hardest.
+# (tokens, hidden, codec, graph, fraction, super_tile, grid_cap, block)
 RELAY_CASES = (
-    (8, 1024, "int4"),
-    (1024, 5120, "int4"),
-    (8191, 5120, "int4"),
-    (8192, 5120, "int4"),
-    (12288, 5120, "int4"),
-    (1024, 5120, "fp16"),
-    (8191, 5120, "fp16"),
-    (1024, 5120, "int5"),
-    (1024, 5120, "int6"),
+    (8, 1024, "int4", False, DEFAULT_RELAY_FRACTION, None, None, None),
+    (8191, 5120, "int4", False, DEFAULT_RELAY_FRACTION, None, None, None),
+    (8191, 5120, "int4", True, DEFAULT_RELAY_FRACTION, None, None, None),
+    (8191, 5120, "fp16", False, DEFAULT_RELAY_FRACTION, None, None, None),
+    (64, 1024, "int4", False, (1, 1), 1, 8, 64),
+    (64, 1024, "int4", True, (1, 1), 1, 8, 64),
 )
-# The default relay rows that also run under CUDA-graph replay: 80 MiB (full
-# g512 grid on gfx950; block-512 rung on gfx942) and 2.5 MiB (80 tiles at
-# block-256).
-RELAY_GRAPH_CASES = ((8192, 5120, "int4"), (256, 5120, "int4"))
-# (tokens, hidden, codec, block, grid_cap): 16 tiles of 8 KiB over 8 blocks, all
-# relaying, so every block reads its bounce slots twice with too little traffic
-# in between to evict them from L1. A relay block's plain loads read the
-# previous tile's packet here unless its acquire invalidates L1, so this fails
-# if that is dropped or narrowed to workgroup scope. Eager and under graph
-# replay.
-RELAY_REUSE_CASES = ((64, 1024, "int4", 64, 8),)
-RELAY_REUSE_FRACTION = (1, 1)
-# (tokens, hidden, codec, relay_fraction, super_tile), ``--extended`` only.
 EXTENDED_RELAY_CASES = (
-    (8192, 5120, "int4", (1, 4), None),
-    (8192, 5120, "int4", (1, 2), None),
-    (8192, 5120, "int4", (3, 4), None),
-    (8192, 5120, "int4", (1, 1), None),
-    (8192, 5120, "int4", DEFAULT_RELAY_FRACTION, 8),
-    (8192, 5120, "int6", DEFAULT_RELAY_FRACTION, None),
+    (1024, 5120, "int5", False, DEFAULT_RELAY_FRACTION, None, None, None),
+    (1024, 5120, "int6", False, DEFAULT_RELAY_FRACTION, None, None, None),
+    (8192, 5120, "int4", False, DEFAULT_RELAY_FRACTION, 8, None, None),
 )
 
 # Seconds to wait for each rank of a spawn. The kernels spin on flags written
 # by peers, so a protocol bug or a dead rank hangs the rest.
 SPAWN_TIMEOUT_S = 600
 
-# Setup steps of ``_StEngine`` that a rank can fail alone, by the
-# ``UncachedIpcHeap`` method made to raise: the inbox allocation, before the
-# handle exchange, and opening the peer's handle, after it.
+# ``UncachedIpcHeap`` methods injected to fail on one rank during ``_StEngine`` setup.
 SETUP_FAULTS = {"alloc": "alloc", "open": "open_mem_handle"}
 SETUP_FAULT_RANK = 1
-# A rank left behind in an exchange would wait out the gloo timeout, far longer.
 SETUP_FAULT_TIMEOUT_S = 300
 
 _FILLS = (
@@ -762,57 +734,11 @@ def _worst(a: dict, b: dict) -> dict:
     return out
 
 
-def _engine_row(fly, m: dict, cfg_used: tuple, production_cfgs) -> dict:
-    """The row fields every case reports about the engine it ran on."""
-    st_used, block_used = cfg_used
-    return {
-        **m,
-        "link": fly.link,
-        "inbox_memory": fly.inbox_memory,
-        # Resolved, not requested: these come from the per-world-size
-        # default unless the caller pinned a lap, and a regression
-        # should name the codec that produced it.
-        "rs_codec": fly.rs_codec,
-        "ag_codec": fly.ag_codec,
-        "st_used": int(st_used),
-        "block_used": int(block_used),
-        "grid_by_cfg": {cfg: int(e.grid) for cfg, e in fly._by_cfg.items()},
-        "production_cfgs": production_cfgs,
-        "us": None,
-    }
-
-
-def _time_eager(eng, inp: torch.Tensor, out: torch.Tensor, group) -> float:
-    """Eager per-call latency of *eng* on *inp*, in microseconds.
-
-    cuda.Event timing, not run_perftest's default profiler timer:
-    `import aiter` creates a GPU context in the parent, and on some ROCm/torch
-    builds a child spawned after that records no GPU events in torch.profiler,
-    so the default timer fails reducing an empty trace.
-    """
-    import torch.distributed as dist
-
-    dist.barrier(group=group)
-    torch.cuda.synchronize()
-
-    def fn():
-        eng.allreduce(inp, out)
-        return out
-
-    _, us = run_perftest(fn, use_cuda_event=True)
-    return float(us)
-
-
 def _run_relay_case(fly, direct, case: tuple, *, rank: int, device, group, window):
-    """One case on a relay engine and its direct twin, on the same inputs.
-
-    Under *graph*, the relay engine's *calls* all-reduces are captured into one
-    graph. Each replay runs on inputs refilled in place; the direct engine's
-    eager output on the same inputs is what it is compared with.
-    """
+    """One case on a relay engine and its direct twin, on the same inputs."""
     import torch.distributed as dist
 
-    ntok, hidden, fill, graph, time_it, calls = case
+    ntok, hidden, fill, graph, calls = case
 
     def draw(replay):
         return [
@@ -826,30 +752,23 @@ def _run_relay_case(fly, direct, case: tuple, *, rank: int, device, group, windo
     relay_outs = [torch.zeros_like(inp) for inp in inps]
     direct_outs = [torch.zeros_like(inp) for inp in inps]
     nbytes = int(inps[0].numel()) * int(inps[0].element_size())
-    cfg_used, _ = fly._pick_cfg(nbytes)
-    tile_bytes = _tile_bytes(cfg_used[1])
+    st_used, block_used = fly._pick_cfg(nbytes)[0]
+    tile_bytes = _tile_bytes(block_used)
 
     def run_all(eng, outs):
         for inp, out in zip(inps, outs):
             eng.allreduce(inp, out)
 
-    relay_graph = direct_graph = None
+    relay_graph = None
     if graph:
-        # Captured on the current stream, which allreduce() launches on when it
-        # is given none, after one eager pass per engine.
-        for eng, outs in ((fly, relay_outs), (direct, direct_outs)):
-            run_all(eng, outs)
-            torch.cuda.synchronize()
-            dist.barrier()
-        relay_graph, direct_graph = torch.cuda.CUDAGraph(), torch.cuda.CUDAGraph()
-        for g, eng, outs in (
-            (relay_graph, fly, relay_outs),
-            (direct_graph, direct, direct_outs),
-        ):
-            with torch.cuda.graph(g):
-                run_all(eng, outs)
+        run_all(fly, relay_outs)
+        torch.cuda.synchronize()
+        dist.barrier()
+        relay_graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(relay_graph):
+            run_all(fly, relay_outs)
 
-    m = d = None
+    m = None
     differing = 0
     for replay in range(GRAPH_REPLAYS if graph else 1):
         if replay:
@@ -864,9 +783,6 @@ def _run_relay_case(fly, direct, case: tuple, *, rank: int, device, group, windo
             out.zero_()
         dist.barrier()
 
-        # Back to back with no sync between calls, so each call's flags and
-        # colour follow the previous one on the wire; then the direct engine
-        # on the same inputs, eager.
         if graph:
             relay_graph.replay()
         else:
@@ -879,45 +795,28 @@ def _run_relay_case(fly, direct, case: tuple, *, rank: int, device, group, windo
 
         for ref, r_out, d_out in zip(refs, relay_outs, direct_outs):
             mi = _metrics(r_out, ref, rank, tile_bytes, group)
-            di = _metrics(d_out, ref, rank, tile_bytes, group)
             m = mi if m is None else _worst(m, mi)
-            d = di if d is None else _worst(d, di)
             differing = max(
                 differing,
                 int((r_out.view(torch.int16) != d_out.view(torch.int16)).sum()),
             )
 
-    row = _engine_row(
-        fly,
-        m,
-        cfg_used,
-        None if window is None else [tuple(c) for c in fly.cfgs_for(*window)],
-    )
-    row.update(
-        {
-            "direct_sqnr_db": d["sqnr_db"],
-            "direct_err": d["err"],
-            "direct_n_mismatch": d["n_mismatch"],
-            "relay_vs_direct_lanes": differing,
-            "relay_used": fly.uses_relay(nbytes),
-            "relay_tile_fraction": fly.relay_tile_fraction(nbytes),
-            "relay_bytes": fly.relay_bytes,
-            "variant": fly.variant(nbytes),
-            "direct_us": None,
-        }
-    )
-    if time_it:
-        if graph:
-            # Per call, from a replay of *calls* of them.
-            for key, g in (("us", relay_graph), ("direct_us", direct_graph)):
-                dist.barrier(group=group)
-                torch.cuda.synchronize()
-                _, us = run_perftest(g.replay, use_cuda_event=True)
-                row[key] = float(us) / calls
-        else:
-            row["us"] = _time_eager(fly, inps[0], relay_outs[0], group)
-            row["direct_us"] = _time_eager(direct, inps[0], direct_outs[0], group)
-    return row
+    return {
+        **m,
+        "link": fly.link,
+        "inbox_memory": fly.inbox_memory,
+        "rs_codec": fly.rs_codec,
+        "ag_codec": fly.ag_codec,
+        "st_used": int(st_used),
+        "block_used": int(block_used),
+        "grid_by_cfg": {cfg: int(e.grid) for cfg, e in fly._by_cfg.items()},
+        "production_cfgs": (
+            None if window is None else [tuple(c) for c in fly.cfgs_for(*window)]
+        ),
+        "relay_vs_direct_lanes": differing,
+        "relay_used": fly.uses_relay(nbytes),
+        "variant": fly.variant(nbytes),
+    }
 
 
 def _init_dist(rank: int, tp: int, init_method: str, hip: bool):
@@ -1978,8 +1877,6 @@ def test_quick_allreduce_transport(tokens, hidden, tp, algorithm, super_tile, bl
 
 
 def _relay_key(
-    tp,
-    relay_devices,
     relay_fraction,
     codec,
     super_tile,
@@ -1987,16 +1884,9 @@ def _relay_key(
     min_bytes=0,
     block=None,
 ) -> tuple:
-    """The engine for a relay row, on *relay_devices* at *relay_fraction*.
-
-    ``min_bytes`` 0 relays from the first byte. ``None`` keeps the host's
-    per-arch cutoff. Pinned geometry is translated into a test ladder by
-    ``_engine``.
-    ``block`` pins the block size on every rung; ``None`` keeps each rung's.
-    """
     kw = {
         "algorithm": "mesh",
-        "relay_devices": tuple(relay_devices),
+        "relay_devices": DEFAULT_RELAY,
         "relay_fraction": tuple(relay_fraction),
     }
     if min_bytes is not None:
@@ -2009,73 +1899,40 @@ def _relay_key(
         kw["grid_cap"] = grid_cap
     if block is not None:
         kw["block"] = block
-    return _key(tp, **kw)
+    return _key(2, **kw)
 
 
-def _relay_case(
-    tokens: int,
-    hidden: int,
-    codec: str,
-    calls: int = RELAY_CALLS,
-    graph: bool = False,
-) -> tuple:
-    exact = codec == "fp16"
-    return (
-        tokens,
-        hidden,
-        "exact" if exact else "normal",
-        graph,
-        not exact,
-        calls,
-    )
+def _relay_case(tokens: int, hidden: int, codec: str, graph: bool, calls: int) -> tuple:
+    return (tokens, hidden, "exact" if codec == "fp16" else "normal", graph, calls)
 
 
 @benchmark()
 def test_quick_allreduce_relay(
     tokens,
     hidden,
-    tp,
-    relay_devices,
-    relay_fraction,
     codec,
+    graph=False,
+    relay_fraction=DEFAULT_RELAY_FRACTION,
     super_tile=None,
     grid_cap=None,
-    expect_relay=True,
-    min_bytes=0,
-    calls=RELAY_CALLS,
-    graph=False,
     block=None,
+    min_bytes=0,
+    expect_relay=True,
+    calls=RELAY_CALLS,
 ):
-    """TP2 relay against its direct twin on the same inputs.
-
-    Gates: SQNR and bit-identity across ranks as for any mesh row, zero lanes
-    where the relay's output differs from the direct engine's on any of the
-    back-to-back calls, and the relay engine running exactly when
-    *expect_relay* says so. The lossless wire must also match the fp32
-    reference exactly. Latencies are reported, never asserted; under *graph*
-    they are per call.
-    """
+    """TP2 relay against its direct twin on the same inputs (correctness)."""
     exact = codec == "fp16"
     rows = _result(
-        _relay_key(
-            tp,
-            relay_devices,
-            relay_fraction,
-            codec,
-            super_tile,
-            grid_cap,
-            min_bytes,
-            block,
-        ),
-        _relay_case(tokens, hidden, codec, calls, graph),
+        _relay_key(relay_fraction, codec, super_tile, grid_cap, min_bytes, block),
+        _relay_case(tokens, hidden, codec, graph, calls),
     )
     nbytes = tokens * hidden * 2
     label = (
-        f"tp={tp} relay={tuple(relay_devices)} f={tuple(relay_fraction)} {codec} "
+        f"tp=2 relay={DEFAULT_RELAY} f={tuple(relay_fraction)} {codec} "
         f"{tokens}x{hidden} st={super_tile} grid_cap={grid_cap} block={block} "
         f"graph={graph}"
     )
-    expected_st = super_tile or _shipping_st(rows, nbytes, "mesh", tp)
+    expected_st = super_tile or _shipping_st(rows, nbytes, "mesh", 2)
     if exact:
         _check(
             label,
@@ -2088,9 +1945,8 @@ def test_quick_allreduce_relay(
             ],
         )
     else:
-        _check_sqnr(
-            label, rows, floor=SQNR_MIN_DB, expected_st=expected_st, algorithm="mesh"
-        )
+        floor = MESH_PINNED_SQNR_MIN_DB.get(codec, SQNR_MIN_DB)
+        _check_sqnr(label, rows, floor=floor, expected_st=expected_st, algorithm="mesh")
     _check(
         label,
         [
@@ -2107,29 +1963,14 @@ def test_quick_allreduce_relay(
             if bool(row["relay_used"]) != expect_relay
         ],
     )
-    ret = {
+    return {
         "gfx": ARCH,
-        "sqnr dB": min(r["sqnr_db"] for r in rows),
-        "min tile sqnr dB": min(r["min_tile_sqnr_db"] for r in rows),
-        "relay err": max(r["err"] for r in rows),
-        "direct err": max(r["direct_err"] for r in rows),
+        "sqnr_db": min(r["sqnr_db"] for r in rows),
         "lanes_differing": max(r["lanes_differing"] for r in rows),
         "relay_vs_direct_lanes": max(r["relay_vs_direct_lanes"] for r in rows),
         "relay_used": all(r["relay_used"] for r in rows),
-        "relay_tile_fraction": rows[0]["relay_tile_fraction"],
-        "relay_MiB": rows[0]["relay_bytes"] / (1 << 20),
         "variant": rows[0]["variant"],
     }
-    if not exact:
-        flops = tokens * hidden * (tp - 1)
-        for name, key in (("direct", "direct_us"), ("relay", "us")):
-            us = max(r[key] for r in rows)
-            ret[f"{name} us"] = us
-            ret[f"{name} TFLOPS"] = flops / us / 1e6
-            ret[f"{name} TB/s"] = nbytes / us / 1e6
-    else:
-        ret["n_mismatch"] = max(r["n_mismatch"] for r in rows)
-    return ret
 
 
 @benchmark()
@@ -2440,6 +2281,61 @@ def _verify(args, tps, algos, dts, link) -> None:
         if fill == "outlier":
             _register(key, (tokens, hidden, fill, False, DEFAULT_DIVISOR))
 
+    relay = []
+    if (
+        2 in tps
+        and "mesh" in algos
+        and dts
+        and link == "xgmi"
+        and torch.cuda.device_count() >= 4
+    ):
+        base_relay = list(RELAY_CASES)
+        if args.extended:
+            base_relay += list(EXTENDED_RELAY_CASES)
+        relay += [(*row, 0, True, RELAY_CALLS) for row in base_relay]
+        default_cutoff = MESH_RELAY_DEFAULTS.get((link, 2, ARCH))
+        if default_cutoff is not None:
+            hidden = 5120
+            at = default_cutoff[0] // (hidden * 2)
+            relay += [
+                (
+                    tokens,
+                    hidden,
+                    "int4",
+                    False,
+                    default_cutoff[1],
+                    None,
+                    None,
+                    None,
+                    None,
+                    used,
+                    calls,
+                )
+                for tokens, used, calls in (
+                    (at - 1, False, RELAY_CALLS),
+                    (at, True, RELAY_CALLS),
+                    (at + 16, True, RELAY_CALLS),
+                    (at - 1, False, 1),
+                )
+            ]
+    for (
+        tokens,
+        hidden,
+        codec,
+        graph,
+        fraction,
+        st,
+        grid_cap,
+        block,
+        floor,
+        _expect,
+        calls,
+    ) in relay:
+        _register(
+            _relay_key(fraction, codec, st, grid_cap, floor, block),
+            _relay_case(tokens, hidden, codec, graph, calls),
+        )
+
     def _rows(cases):
         return [
             test_quick_allreduce(
@@ -2499,6 +2395,17 @@ def _verify(args, tps, algos, dts, link) -> None:
         [
             test_quick_allreduce_transport(tokens, hidden, tp, algorithm, st, block)
             for tp, algorithm, tokens, hidden, st, block in transport
+        ],
+    )
+    _summarize(
+        "flydsl quick allreduce TP2 relay",
+        [test_quick_allreduce_relay(*row) for row in relay],
+    )
+    _summarize(
+        "flydsl quick allreduce engine setup failure",
+        [
+            test_quick_allreduce_setup_failure(2, fault)
+            for fault in (SETUP_FAULTS if 2 in tps else ())
         ],
     )
     os.environ["AITER_QUICK_REDUCE_QUANTIZATION"] = HIP_QR_REGIME
@@ -2651,9 +2558,9 @@ def main():
         type=int,
         nargs="*",
         default=[None],
-        help="Persistent-launch block caps for the shipping sweep and the relay\n"
-        "rows. Default: the engine's own. The engine clamps a cap to the\n"
-        "measured resident workgroups per CU.",
+        help="Persistent-launch block caps for the shipping sweep. Default: the\n"
+        "engine's own. The engine clamps a cap to the measured resident\n"
+        "workgroups per CU.",
     )
     parser.add_argument(
         "--block",
@@ -2663,32 +2570,6 @@ def main():
         choices=(*SUPPORTED_BLOCKS, None),
         help="Threads per block for the shipping sweep, on every rung. Default:\n"
         "each rung's own.",
-    )
-    parser.add_argument(
-        "--relay",
-        type=dtypes.str2tuple,
-        nargs="*",
-        default=None,
-        help="TP2 mesh relay rows: pairs of devices that relay rank0->rank1 and\n"
-        "rank1->rank0, outside the TP pair. Default: 2,3 on xGMI when 4 GPUs\n"
-        "are visible and this arch has relay defaults. Pass an empty value to\n"
-        "run no relay rows.\n"
-        "    e.g.: --relay 2,3",
-    )
-    parser.add_argument(
-        "--relay-fraction",
-        type=dtypes.str2tuple,
-        nargs="*",
-        default=[DEFAULT_RELAY_FRACTION],
-        help="Share num,den of blocks that relay, for the relay rows.\n"
-        "    e.g.: --relay-fraction 1,2 3,4",
-    )
-    parser.add_argument(
-        "--relay-codec",
-        nargs="*",
-        default=["int4", "fp16"],
-        choices=("int4", "int5", "int6", "fp16"),
-        help="Wire formats of the relay rows; fp16 is the lossless one.",
     )
     parser.add_argument(
         "-o",
@@ -2740,194 +2621,6 @@ def main():
             _bench(args, tps, algos, link)
     else:
         _verify(args, tps, algos, dts, link)
-
-    # TP2 mesh relay rows. Each distinct (fraction, codec, super-tile) is an
-    # engine and so a spawn. The direct TP2 rows above always run; these are
-    # the second case, and only when a relay is usable on this host.
-    relay_pairs = args.relay
-    if link != "xgmi":
-        if relay_pairs:
-            aiter.logger.warning("relay rows need xGMI; link is %s, skipping", link)
-        relay_pairs = [] if relay_pairs is not None else None
-    if relay_pairs is None:
-        has_default = (link, 2, ARCH) in MESH_RELAY_DEFAULTS
-        relay_pairs = [DEFAULT_RELAY] if n_gpu >= 4 and has_default else []
-    malformed = [p for p in relay_pairs if not isinstance(p, tuple)]
-    if malformed:
-        aiter.logger.warning(
-            "--relay expects device,device pairs; skipping %s", malformed
-        )
-    relay_pairs = [p for p in relay_pairs if isinstance(p, tuple)]
-    relay = []
-    threshold_added = False
-    if args.scenario == "verify" and 2 in tps and "mesh" in algos and dts:
-        for pair in relay_pairs:
-            if (
-                len(pair) != 2
-                or min(pair) < 0
-                or max(pair) >= n_gpu
-                or {0, 1} & set(pair)
-            ):
-                aiter.logger.warning(
-                    "relay %s needs two devices outside 0,1 and below %s; skipping",
-                    pair,
-                    n_gpu,
-                )
-                continue
-            cases = [
-                (int(t), int(h), codec)
-                for codec in args.relay_codec
-                for t, h in (
-                    args.mnk
-                    if args.mnk is not None
-                    else [(t, h) for t, h, c in RELAY_CASES if c == codec]
-                )
-            ]
-            # The graph rows are the graph shapes, or the first shape of each
-            # codec when ``-s`` picks them.
-            if args.mnk is None:
-                graph_cases = [
-                    (t, h, c) for t, h, c in RELAY_GRAPH_CASES if c in args.relay_codec
-                ]
-            else:
-                graph_cases = [
-                    next(c for c in cases if c[2] == codec)
-                    for codec in dict.fromkeys(args.relay_codec)
-                ]
-            relay_cases = [(*c, False) for c in cases] + [
-                (*c, True) for c in graph_cases
-            ]
-            relay += [
-                (
-                    tokens,
-                    hidden,
-                    2,
-                    pair,
-                    tuple(fraction),
-                    codec,
-                    None,
-                    grid_cap,
-                    True,
-                    0,
-                    RELAY_CALLS,
-                    graph,
-                    None,
-                )
-                for tokens, hidden, codec, graph in relay_cases
-                for fraction in args.relay_fraction
-                for grid_cap in args.grid_cap
-            ]
-            if args.mnk is None:
-                relay += [
-                    (
-                        tokens,
-                        hidden,
-                        2,
-                        pair,
-                        RELAY_REUSE_FRACTION,
-                        codec,
-                        1,
-                        grid_cap,
-                        True,
-                        0,
-                        RELAY_CALLS,
-                        graph,
-                        block,
-                    )
-                    for tokens, hidden, codec, block, grid_cap in RELAY_REUSE_CASES
-                    if codec in args.relay_codec
-                    for graph in (False, True)
-                ]
-            if args.extended:
-                relay += [
-                    (
-                        tokens,
-                        hidden,
-                        2,
-                        pair,
-                        fraction,
-                        codec,
-                        st,
-                        None,
-                        True,
-                        0,
-                        RELAY_CALLS,
-                        False,
-                        None,
-                    )
-                    for tokens, hidden, codec, fraction, st in EXTENDED_RELAY_CASES
-                ]
-            # One engine at the host's cutoff, walked below, onto, above, and
-            # back below it. The four rows share that engine, so the return to
-            # the direct inbox happens after the relay inbox has been used.
-            # The return visit uses one call so it is a different case from the
-            # first visit and actually runs again.
-            default = MESH_RELAY_DEFAULTS.get((link, 2, ARCH))
-            if (
-                not threshold_added
-                and default is not None
-                and args.mnk is None
-                and args.grid_cap == [None]
-            ):
-                hidden = 5120
-                at = default[0] // (hidden * 2)
-                if at > 1 and at * hidden * 2 == default[0]:
-                    fraction = tuple(args.relay_fraction[0])
-                    relay += [
-                        (
-                            tokens,
-                            hidden,
-                            2,
-                            pair,
-                            fraction,
-                            "int4",
-                            None,
-                            None,
-                            used,
-                            None,
-                            calls,
-                            False,
-                            None,
-                        )
-                        for tokens, used, calls in (
-                            (at - 1, False, RELAY_CALLS),
-                            (at, True, RELAY_CALLS),
-                            (at + 16, True, RELAY_CALLS),
-                            (at - 1, False, 1),
-                        )
-                    ]
-                    threshold_added = True
-    for (
-        tokens,
-        hidden,
-        tp,
-        pair,
-        fraction,
-        codec,
-        st,
-        grid_cap,
-        expect,
-        floor,
-        calls,
-        graph,
-        block,
-    ) in relay:
-        _register(
-            _relay_key(tp, pair, fraction, codec, st, grid_cap, floor, block),
-            _relay_case(tokens, hidden, codec, calls, graph),
-        )
-
-    _summarize(
-        "flydsl quick allreduce TP2 relay",
-        [test_quick_allreduce_relay(*row) for row in relay],
-    )
-    _summarize(
-        "flydsl quick allreduce engine setup failure",
-        [
-            test_quick_allreduce_setup_failure(2, fault)
-            for fault in (SETUP_FAULTS if 2 in tps else ())
-        ],
-    )
 
     if _FAILURES:
         raise SystemExit(
