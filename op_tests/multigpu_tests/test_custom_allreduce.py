@@ -301,18 +301,22 @@ _LL128_MIXED_SIZES = {
 # owning block (16, 32 and 1 blocks) from one call to the next.
 _LL_GFX1250_MIXED_SIZES = [32000, 32768, 512]
 
-# Back-to-back gfx1250 messages at TP4 and TP8 that alternate the LL two-shot
-# kernel (1.15 MB and 4.59 MB of fp32) with the one-shot LL (0.36 MB). Each
-# kernel keeps its own scratch and per-block epochs. The 4.59 MB message runs
-# the two-shot with 512-thread blocks instead of 256. fp32, so that the expected
-# bits depend on the order the ranks are summed in (see rank_order).
-_LL2S_GFX1250_MIXED_SIZES = [40 * 7168, 25 * 3584, 160 * 7168]
+# Back-to-back gfx1250 messages at TP4 and TP8 that alternate the two-shot
+# kernel (1.15, 4.59, 3.91 and 7.81 MB of fp32) with the one-shot LL (0.36 MB).
+# Each kernel keeps its own scratch and round state. The two-shot sizes take
+# blocks of 3 x 64 and 2 x 256 threads at TP8 (3 x 128 and 2 x 512 at TP4), so a
+# pack's owning block changes from one call to the next, and the 3.91 MB and
+# 7.81 MB chunks end in a partial group of 32 packs (lanes that only re-arm).
+# fp32, so that the expected bits depend on the order the ranks are summed in
+# (see rank_order).
+_LL2S_GFX1250_MIXED_SIZES = [40 * 7168, 25 * 3584, 160 * 7168, 545 * 1792, 545 * 3584]
 
 # gfx1250 all-reduces whose output is their input (fp32 elements): 0.36 MB,
-# 0.79 MB, 1.57 MB and 3.67 MB. At TP2 and TP6 all four take the one-shot LL,
-# with 256-thread and 512-thread waves and with 2 and 4 packets a sender. At
-# TP4 and TP8 the larger ones take the two-shot (ar2sMinBytes).
-_LL_GFX1250_INPLACE_SIZES = [25 * 3584, 192 * 1024, 384 * 1024, 896 * 1024]
+# 0.79 MB, 1.57 MB, 3.67 MB and 3.91 MB. At TP2 and TP6 the first four take the
+# one-shot LL, with 256-thread and 512-thread waves and with 2 and 4 packets a
+# sender. At TP4 and TP8 the larger ones take the two-shot (ar2sMinBytes); the
+# last ends in a partial group of 32 packs there.
+_LL_GFX1250_INPLACE_SIZES = [25 * 3584, 192 * 1024, 384 * 1024, 896 * 1024, 545 * 1792]
 
 
 def _is_gfx1250() -> bool:
@@ -470,7 +474,7 @@ def test_allreduce_ll_gfx1250_mixed_size_regression(tp_size, iterations=1000):
 
 
 def test_allreduce_ll2s_gfx1250_mixed_size_regression(tp_size, iterations=200):
-    # Mixing the LL two-shot with the one-shot LL, and two-shot launches of
+    # Mixing the two-shot with the one-shot LL, and two-shot launches of
     # different block sizes, must neither accept a stale line nor overwrite a
     # slower peer's unread one, and both must sum the ranks in order 0..n-1.
     # The two-shot runs at TP4 and TP8 only (ar2sMaxBytes).
@@ -480,7 +484,7 @@ def test_allreduce_ll2s_gfx1250_mixed_size_regression(tp_size, iterations=200):
         tp_size,
         _LL2S_GFX1250_MIXED_SIZES,
         iterations,
-        "gfx1250 LL two-shot",
+        "gfx1250 two-shot",
         1,
         vary_inputs=True,
         rank_order=True,
