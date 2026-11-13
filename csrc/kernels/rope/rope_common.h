@@ -1820,6 +1820,41 @@ struct OpUncachedBwd
     }
 };
 
+__device__ __forceinline__ void
+round_f32x2_to_bf16(float value0, float value1, float& rounded0, float& rounded1)
+{
+#if defined(__gfx1250__)
+    uint32_t packed;
+    asm volatile("v_cvt_pk_bf16_f32 %0, %1, %2" : "=v"(packed) : "v"(value0), "v"(value1));
+    rounded0 = __builtin_bit_cast(float, packed << 16);
+    rounded1 = __builtin_bit_cast(float, packed & 0xffff0000u);
+#else
+    rounded0 = static_cast<float>(static_cast<hip_bfloat16>(value0));
+    rounded1 = static_cast<float>(static_cast<hip_bfloat16>(value1));
+#endif
+}
+
+template <typename scalar_t, typename scalar_f_t>
+__device__ __forceinline__ void cached_rope_fwd_pair(
+    float x0, float x1, float cos0, float sin0, float cos1, float sin1, float& out0, float& out1)
+{
+    if constexpr(std::is_same_v<scalar_t, hip_bfloat16> && std::is_same_v<scalar_f_t, hip_bfloat16>)
+    {
+        // Match the BF16 lowering used by Triton 3.8: cosine products stay
+        // FP32, while sine products round to BF16 before the final add/sub.
+        float x1_sin0;
+        float x0_sin1;
+        round_f32x2_to_bf16(x1 * sin0, x0 * sin1, x1_sin0, x0_sin1);
+        out0 = x0 * cos0 - x1_sin0;
+        out1 = x1 * cos1 + x0_sin1;
+    }
+    else
+    {
+        out0 = x0 * cos0 - x1 * sin0;
+        out1 = x1 * cos1 + x0 * sin1;
+    }
+}
+
 struct OpCachedFwd
 {
     template <int32_t RotateStyle,
@@ -1884,8 +1919,14 @@ struct OpCachedFwd
             float output_0[VecPairs], output_1[VecPairs];
             opus::static_for<VecPairs>([&](auto _v) {
                 constexpr int32_t v = _v.value;
-                output_0[v] = input_0[v] * cos_0[v] - input_1[v] * sin_0[v];
-                output_1[v] = input_1[v] * cos_1[v] + input_0[v] * sin_1[v];
+                cached_rope_fwd_pair<scalar_t, scalar_f_t>(input_0[v],
+                                                           input_1[v],
+                                                           cos_0[v],
+                                                           sin_0[v],
+                                                           cos_1[v],
+                                                           sin_1[v],
+                                                           output_0[v],
+                                                           output_1[v]);
             });
 
             store_payload_vec<RotateStyle, VecPairs>(g_o,
@@ -2007,10 +2048,10 @@ struct OpCachedFwd
                 float ox0[VecPairs], ox1[VecPairs], oy0[VecPairs], oy1[VecPairs];
                 opus::static_for<VecPairs>([&](auto _v) {
                     constexpr int32_t v = _v.value;
-                    ox0[v] = ix0_a[v] * cos_0[v] - ix1_a[v] * sin_0[v];
-                    ox1[v] = ix1_a[v] * cos_1[v] + ix0_a[v] * sin_1[v];
-                    oy0[v] = iy0_a[v] * cos_0[v] - iy1_a[v] * sin_0[v];
-                    oy1[v] = iy1_a[v] * cos_1[v] + iy0_a[v] * sin_1[v];
+                    cached_rope_fwd_pair<scalar_t, scalar_f_t>(
+                        ix0_a[v], ix1_a[v], cos_0[v], sin_0[v], cos_1[v], sin_1[v], ox0[v], ox1[v]);
+                    cached_rope_fwd_pair<scalar_t, scalar_f_t>(
+                        iy0_a[v], iy1_a[v], cos_0[v], sin_0[v], cos_1[v], sin_1[v], oy0[v], oy1[v]);
                 });
                 store_payload_vec<RotateStyle, VecPairs>(g_ox, ox0, ox1,
                     (offset_ox + hid * stride_ox_h) * elem_bytes,
@@ -2021,10 +2062,10 @@ struct OpCachedFwd
 
                 opus::static_for<VecPairs>([&](auto _v) {
                     constexpr int32_t v = _v.value;
-                    ox0[v] = ix0_b[v] * cos_0[v] - ix1_b[v] * sin_0[v];
-                    ox1[v] = ix1_b[v] * cos_1[v] + ix0_b[v] * sin_1[v];
-                    oy0[v] = iy0_b[v] * cos_0[v] - iy1_b[v] * sin_0[v];
-                    oy1[v] = iy1_b[v] * cos_1[v] + iy0_b[v] * sin_1[v];
+                    cached_rope_fwd_pair<scalar_t, scalar_f_t>(
+                        ix0_b[v], ix1_b[v], cos_0[v], sin_0[v], cos_1[v], sin_1[v], ox0[v], ox1[v]);
+                    cached_rope_fwd_pair<scalar_t, scalar_f_t>(
+                        iy0_b[v], iy1_b[v], cos_0[v], sin_0[v], cos_1[v], sin_1[v], oy0[v], oy1[v]);
                 });
                 store_payload_vec<RotateStyle, VecPairs>(g_ox, ox0, ox1,
                     (offset_ox + (hid + 1) * stride_ox_h) * elem_bytes,
@@ -2045,10 +2086,10 @@ struct OpCachedFwd
                 float ox0[VecPairs], ox1[VecPairs], oy0[VecPairs], oy1[VecPairs];
                 opus::static_for<VecPairs>([&](auto _v) {
                     constexpr int32_t v = _v.value;
-                    ox0[v] = ix0[v] * cos_0[v] - ix1[v] * sin_0[v];
-                    ox1[v] = ix1[v] * cos_1[v] + ix0[v] * sin_1[v];
-                    oy0[v] = iy0[v] * cos_0[v] - iy1[v] * sin_0[v];
-                    oy1[v] = iy1[v] * cos_1[v] + iy0[v] * sin_1[v];
+                    cached_rope_fwd_pair<scalar_t, scalar_f_t>(
+                        ix0[v], ix1[v], cos_0[v], sin_0[v], cos_1[v], sin_1[v], ox0[v], ox1[v]);
+                    cached_rope_fwd_pair<scalar_t, scalar_f_t>(
+                        iy0[v], iy1[v], cos_0[v], sin_0[v], cos_1[v], sin_1[v], oy0[v], oy1[v]);
                 });
                 store_payload_vec<RotateStyle, VecPairs>(g_ox, ox0, ox1,
                     (offset_ox + hid * stride_ox_h) * elem_bytes,
@@ -2072,10 +2113,10 @@ struct OpCachedFwd
                 float ox0[VecPairs], ox1[VecPairs], oy0[VecPairs], oy1[VecPairs];
                 opus::static_for<VecPairs>([&](auto _v) {
                     constexpr int32_t v = _v.value;
-                    ox0[v] = ix0[v] * cos_0[v] - ix1[v] * sin_0[v];
-                    ox1[v] = ix1[v] * cos_1[v] + ix0[v] * sin_1[v];
-                    oy0[v] = iy0[v] * cos_0[v] - iy1[v] * sin_0[v];
-                    oy1[v] = iy1[v] * cos_1[v] + iy0[v] * sin_1[v];
+                    cached_rope_fwd_pair<scalar_t, scalar_f_t>(
+                        ix0[v], ix1[v], cos_0[v], sin_0[v], cos_1[v], sin_1[v], ox0[v], ox1[v]);
+                    cached_rope_fwd_pair<scalar_t, scalar_f_t>(
+                        iy0[v], iy1[v], cos_0[v], sin_0[v], cos_1[v], sin_1[v], oy0[v], oy1[v]);
                 });
                 store_payload_vec<RotateStyle, VecPairs>(g_ox, ox0, ox1,
                     (offset_ox + hid * stride_ox_h) * elem_bytes,
@@ -2104,8 +2145,8 @@ struct OpCachedFwd
                 float ox0[VecPairs], ox1[VecPairs];
                 opus::static_for<VecPairs>([&](auto _v) {
                     constexpr int32_t v = _v.value;
-                    ox0[v] = a0[v] * cos_0[v] - a1[v] * sin_0[v];
-                    ox1[v] = a1[v] * cos_1[v] + a0[v] * sin_1[v];
+                    cached_rope_fwd_pair<scalar_t, scalar_f_t>(
+                        a0[v], a1[v], cos_0[v], sin_0[v], cos_1[v], sin_1[v], ox0[v], ox1[v]);
                 });
                 store_payload_vec<RotateStyle, VecPairs>(g_ox, ox0, ox1,
                     (offset_ox + hid * stride_ox_h) * elem_bytes,
@@ -2113,8 +2154,8 @@ struct OpCachedFwd
 
                 opus::static_for<VecPairs>([&](auto _v) {
                     constexpr int32_t v = _v.value;
-                    ox0[v] = b0[v] * cos_0[v] - b1[v] * sin_0[v];
-                    ox1[v] = b1[v] * cos_1[v] + b0[v] * sin_1[v];
+                    cached_rope_fwd_pair<scalar_t, scalar_f_t>(
+                        b0[v], b1[v], cos_0[v], sin_0[v], cos_1[v], sin_1[v], ox0[v], ox1[v]);
                 });
                 store_payload_vec<RotateStyle, VecPairs>(g_ox, ox0, ox1,
                     (offset_ox + (hid + 1) * stride_ox_h) * elem_bytes,
@@ -2129,8 +2170,8 @@ struct OpCachedFwd
                 float ox0[VecPairs], ox1[VecPairs];
                 opus::static_for<VecPairs>([&](auto _v) {
                     constexpr int32_t v = _v.value;
-                    ox0[v] = ix0[v] * cos_0[v] - ix1[v] * sin_0[v];
-                    ox1[v] = ix1[v] * cos_1[v] + ix0[v] * sin_1[v];
+                    cached_rope_fwd_pair<scalar_t, scalar_f_t>(
+                        ix0[v], ix1[v], cos_0[v], sin_0[v], cos_1[v], sin_1[v], ox0[v], ox1[v]);
                 });
                 store_payload_vec<RotateStyle, VecPairs>(g_ox, ox0, ox1,
                     (offset_ox + hid * stride_ox_h) * elem_bytes,
@@ -2148,8 +2189,8 @@ struct OpCachedFwd
                 float ox0[VecPairs], ox1[VecPairs];
                 opus::static_for<VecPairs>([&](auto _v) {
                     constexpr int32_t v = _v.value;
-                    ox0[v] = ix0[v] * cos_0[v] - ix1[v] * sin_0[v];
-                    ox1[v] = ix1[v] * cos_1[v] + ix0[v] * sin_1[v];
+                    cached_rope_fwd_pair<scalar_t, scalar_f_t>(
+                        ix0[v], ix1[v], cos_0[v], sin_0[v], cos_1[v], sin_1[v], ox0[v], ox1[v]);
                 });
                 store_payload_vec<RotateStyle, VecPairs>(g_ox, ox0, ox1,
                     (offset_ox + hid * stride_ox_h) * elem_bytes,
@@ -2175,8 +2216,8 @@ struct OpCachedFwd
                 float oy0[VecPairs], oy1[VecPairs];
                 opus::static_for<VecPairs>([&](auto _v) {
                     constexpr int32_t v = _v.value;
-                    oy0[v] = a0[v] * cos_0[v] - a1[v] * sin_0[v];
-                    oy1[v] = a1[v] * cos_1[v] + a0[v] * sin_1[v];
+                    cached_rope_fwd_pair<scalar_t, scalar_f_t>(
+                        a0[v], a1[v], cos_0[v], sin_0[v], cos_1[v], sin_1[v], oy0[v], oy1[v]);
                 });
                 store_payload_vec<RotateStyle, VecPairs>(g_oy, oy0, oy1,
                     (offset_oy + hid * stride_oy_h) * elem_bytes,
@@ -2184,8 +2225,8 @@ struct OpCachedFwd
 
                 opus::static_for<VecPairs>([&](auto _v) {
                     constexpr int32_t v = _v.value;
-                    oy0[v] = b0[v] * cos_0[v] - b1[v] * sin_0[v];
-                    oy1[v] = b1[v] * cos_1[v] + b0[v] * sin_1[v];
+                    cached_rope_fwd_pair<scalar_t, scalar_f_t>(
+                        b0[v], b1[v], cos_0[v], sin_0[v], cos_1[v], sin_1[v], oy0[v], oy1[v]);
                 });
                 store_payload_vec<RotateStyle, VecPairs>(g_oy, oy0, oy1,
                     (offset_oy + (hid + 1) * stride_oy_h) * elem_bytes,
@@ -2200,8 +2241,8 @@ struct OpCachedFwd
                 float oy0[VecPairs], oy1[VecPairs];
                 opus::static_for<VecPairs>([&](auto _v) {
                     constexpr int32_t v = _v.value;
-                    oy0[v] = iy0[v] * cos_0[v] - iy1[v] * sin_0[v];
-                    oy1[v] = iy1[v] * cos_1[v] + iy0[v] * sin_1[v];
+                    cached_rope_fwd_pair<scalar_t, scalar_f_t>(
+                        iy0[v], iy1[v], cos_0[v], sin_0[v], cos_1[v], sin_1[v], oy0[v], oy1[v]);
                 });
                 store_payload_vec<RotateStyle, VecPairs>(g_oy, oy0, oy1,
                     (offset_oy + hid * stride_oy_h) * elem_bytes,
@@ -2219,8 +2260,8 @@ struct OpCachedFwd
                 float oy0[VecPairs], oy1[VecPairs];
                 opus::static_for<VecPairs>([&](auto _v) {
                     constexpr int32_t v = _v.value;
-                    oy0[v] = iy0[v] * cos_0[v] - iy1[v] * sin_0[v];
-                    oy1[v] = iy1[v] * cos_1[v] + iy0[v] * sin_1[v];
+                    cached_rope_fwd_pair<scalar_t, scalar_f_t>(
+                        iy0[v], iy1[v], cos_0[v], sin_0[v], cos_1[v], sin_1[v], oy0[v], oy1[v]);
                 });
                 store_payload_vec<RotateStyle, VecPairs>(g_oy, oy0, oy1,
                     (offset_oy + hid * stride_oy_h) * elem_bytes,
