@@ -15,6 +15,13 @@ covers its window and writes ``out`` directly. ``unified_attention_flydsl``
 returns ``None`` for anything else; ``flydsl_decline_reason`` names the first
 unsupported property.
 
+Hardware: every route accepts any gfx950 device; the optimized varlen
+specialization also needs 256 CUs, so MI350X and MI355X take it and MI350P
+does not. Correctness depends on the ISA, not the SKU: plans read the device's
+CU count. Performance was measured on MI355X only; MI350X is the same chip
+at a lower power cap and clock, and ``AITER_UNIFIED_ATTN_FLYDSL_VARLEN_OPTIMIZED=0``
+or ``AITER_UNIFIED_ATTN_FLYDSL=0`` opts out if it regresses there.
+
 Graph capture: the first call of a geometry on a stream must run uncaptured to
 allocate its workspace. Each call, captured or not, records a GPU plan refresh
 from ``seqused_k``, so lengths may change between replays up to the captured
@@ -446,8 +453,9 @@ def _varlen_optimized_eligible(q, k, out, max_seqlen_k):
 def _use_varlen_optimized(q, k, out, num_seqs, max_seqlen_k, num_cu):
     if not _varlen_enabled() or not _varlen_optimized_eligible(q, k, out, max_seqlen_k):
         return False
-    # The specialization's schedule is tuned for the full 256-CU MI355X; other
-    # gfx950 parts keep the generic kernel.
+    # The specialization's schedule is tuned on the 256-CU MI355X. MI350X has the
+    # same 256 CUs and takes it unmeasured; parts with fewer CUs keep the generic
+    # kernel.
     if num_cu != 256:
         return False
     pseudo = _pseudo_capacity(q.shape[0], num_seqs)
