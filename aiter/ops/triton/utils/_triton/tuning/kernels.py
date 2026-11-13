@@ -432,6 +432,35 @@ def gemm_a16w16_atomic(shape, backend):
     return call, (x, w, y), None
 
 
+@kernel("GEMM-A16W32", bits=(16, 48), backend_kwarg=False)
+def gemm_a16w32(shape, backend):
+    from aiter.ops.triton.gemm.basic.gemm_a16w32 import gemm_a16w32 as gemm
+    from op_tests.triton_tests.gemm.basic.test_gemm_a16w32 import (
+        generate_gemm_a16w32_inputs,
+    )
+
+    M, N, K = shape["M"], shape["N"], shape["K"]
+    # the bf16x3 kernel keeps three bf16 weight tiles in LDS, hence bits=(16, 48)
+    x, w, w_bf16x3, y = generate_gemm_a16w32_inputs(M, N, K, output=True)
+
+    def call(config, x, w, w_bf16x3, y):
+        return gemm(x, w, w_bf16x3, y=y, config=config)
+
+    def should_skip(config):
+        if config.get("kernel_type") != "bandwidth_bound":
+            return False
+        # The fp32 FMA kernel computes one row of W in each program (BLOCK_SIZE_N 1,
+        # below SEARCH_SPACE), with no split-K and no tile swizzle. The sweep times
+        # the bf16x3 tiles against the installed FMA config.
+        return (
+            config["BLOCK_SIZE_N"] != 1
+            or config.get("NUM_KSPLIT", 1) != 1
+            or config.get("GROUP_SIZE_M", 1) != 1
+        )
+
+    return call, (x, w, w_bf16x3, y), should_skip
+
+
 @kernel("GEMM-A16W16-gated", backend_kwarg=False, bounds=(64, 128, 256, 512, 2048))
 def gemm_a16w16_gated(shape, backend):
     import torch
