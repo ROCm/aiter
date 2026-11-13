@@ -21,11 +21,14 @@ The ``prec`` axis picks both the input format and the backends that run:
 * ``v41_fp8`` -- MLA v4.1: 512 e4m3 rows with separate E8M0 scales
   (``mla_sparse_prefill_v41``): ``opus``.
 * ``v41_fp4`` -- ``v41_fp8`` with an NVFP4 prefix source: 512 e2m1 and 32 e4m3
-  scales packed in a 288-byte row: ``opus``, gfx950 only.
+  scales: ``opus`` on gfx950, fused ``asm`` on gfx1250 with ``H_Q == 64``.
+  The generator's 288-byte rows are separated into contiguous data and scales
+  outside the timed call for the fixed-stride gfx1250 code object.
 
 ``triton`` is the ``pa_prefill_sparse`` dispatcher, which on gfx1250 reaches a
-gluon kernel that takes both KV sources natively. ``asm`` needs ``H_Q == 128``.
-Both are gfx1250-only here and drop out of the sweep elsewhere.
+gluon kernel that takes both KV sources natively. The v4 ``asm`` needs
+``H_Q == 128``; the v4.1 ``asm`` needs ``H_Q == 64``. Both asm variants and
+triton are gfx1250-only here and drop out of the sweep elsewhere.
 
 Example CLI usage::
 
@@ -33,6 +36,10 @@ Example CLI usage::
     PYTHONPATH=. python3 op_tests/test_mla_sparse_prefill.py --topk 256 2048
     PYTHONPATH=. python3 op_tests/test_mla_sparse_prefill.py --backend opus \\
         -n 1024 --h_q 128 --prec v4_fp8 --no-verify
+    PYTHONPATH=. python3 op_tests/test_mla_sparse_prefill.py --backend opus asm \\
+        --prec v41_fp8 v41_fp4 --h_q 64 -n 96 192 384 768 1536 2048 3072 4096 \\
+        --total_pages 65536 1048576 --topk 512 1024 --total_tokens 128 \\
+        --num_kv_splits 1
 """
 
 from __future__ import annotations
@@ -54,6 +61,7 @@ from aiter.ops.mla_sparse_prefill import (
     mla_sparse_prefill_v4,
     mla_sparse_prefill_v41,
 )
+from aiter.ops.mla_sparse_prefill_v41_asm import _auto_v41_asm_splits
 from aiter.test_common import (
     benchmark,
     checkAllclose,
@@ -591,11 +599,13 @@ _PREC_BACKENDS = {
     "bf16": ("opus", "triton"),
     "v4_fp8": ("opus", "asm"),
     "v41_fp8": ("opus",),
-    "v41_fp4": ("opus",),
+    "v41_fp4": ("opus", "asm"),
 }
 
 # Baked into the asm code object; its Q address math needs gridDim.y == 1.
 _ASM_HEADS = 128
+# The fused V4.1 code object covers all 64 heads of one query per workgroup.
+_ASM_V41_HEADS = 64
 
 # Only gfx1250's pa_prefill_sparse reads a second KV source; the rest reject it.
 _TRITON_ARCHS = ("gfx1250",) if pa_prefill_sparse is not None else ()
@@ -685,6 +695,30 @@ def run_mla_sparse_prefill(
                         softmax_scale=softmax_scale,
                         num_kv_splits=num_kv_splits,
                         backend="opus",
+                    ),
+                )
+            )
+        if (
+            prec == "v41_fp4"
+            and "asm" in wanted
+            and h == _ASM_V41_HEADS
+            and _get_gpu_arch() == "gfx1250"
+        ):
+            # Prepare separate CSA data/scale buffers before kernel timing.
+            asm_inputs = dict(kernel_inputs)
+            for key in ("unified_kv", "unified_kv_scale"):
+                tensor = asm_inputs[key]
+                asm_inputs[key] = (
+                    tensor.view(torch.uint8).contiguous().view(tensor.dtype)
+                )
+            candidates.append(
+                (
+                    "asm",
+                    lambda: mla_sparse_prefill_v41(
+                        **asm_inputs,
+                        softmax_scale=softmax_scale,
+                        num_kv_splits=num_kv_splits,
+                        backend="asm",
                     ),
                 )
             )
@@ -794,11 +828,26 @@ def run_mla_sparse_prefill(
             row[f"{name} us"] = round(float(lat_us), 2)
             row[f"{name} TFLOPS"] = round(float(tflops), 2)
             if name == "asm":
-                # Effective Q/KV reads + BF16 output writes. Packed NoPE
-                # includes scales/padding; KV is shared by K/V and all heads.
-                # Count each CSR entry, without adjusting for cache reuse.
-                bytes_per_row = _FP8_D_NOPE_PADDED + _FP8_D_ROPE * 2
-                nbytes = (n * h + total_nnz) * bytes_per_row + n * h * d * 2
+                # Effective Q/KV reads + BF16 output writes; KV is shared by
+                # K/V and all heads. Count each CSR entry without adjusting
+                # for cache reuse or adding internal partial-workspace traffic.
+                if prec == "v41_fp4":
+                    prefix_nnz = kernel_inputs["kv_indices_prefix"].numel()
+                    extend_nnz = kernel_inputs["kv_indices_extend"].numel()
+                    nbytes = (
+                        (n * h + extend_nnz) * (_V41_D + _V41_D_SCALE)
+                        + prefix_nnz * (_V41_D // 2 + _V41_D // _NVFP4_BLK)
+                        + n * h * d * 2
+                    )
+                    row["asm split"] = (
+                        _auto_v41_asm_splits(n, total_nnz, prefix_nnz=prefix_nnz)
+                        if num_kv_splits is None
+                        else num_kv_splits
+                    )
+                else:
+                    # V4 packs its NoPE scales/padding into the 512-byte row.
+                    bytes_per_row = _FP8_D_NOPE_PADDED + _FP8_D_ROPE * 2
+                    nbytes = (n * h + total_nnz) * bytes_per_row + n * h * d * 2
                 tbps = nbytes / max(lat_us * 1e-6, 1e-12) / 1e12
                 row["asm TB/s"] = round(float(tbps), 2)
 
@@ -985,7 +1034,7 @@ parser.add_argument(
     default=[16, 32, 64, 128],
     help=(
         "number of query heads H_Q (default: [16, 32, 64, 128]).\n"
-        f"asm is built for H_Q={_ASM_HEADS} only and drops out elsewhere."
+        f"v4 asm needs H_Q={_ASM_HEADS}; v41_fp4 asm needs H_Q={_ASM_V41_HEADS}."
     ),
 )
 parser.add_argument(
@@ -1026,7 +1075,8 @@ parser.add_argument(
         "  bf16   : single-tensor Q/K/V/O kernel           -> opus, triton\n"
         "  v4_fp8 : split NoPE-fp8 / RoPE-bf16 kernel      -> opus, asm\n"
         "  v41_fp8: e4m3 rows + E8M0 scales (MLA v4.1)     -> opus\n"
-        "  v41_fp4: v41_fp8 with an NVFP4 prefix source    -> opus (gfx950)"
+        "  v41_fp4: v41_fp8 with an NVFP4 prefix source    -> "
+        "opus (gfx950), asm (gfx1250 H64)"
     ),
 )
 parser.add_argument(
@@ -1065,7 +1115,10 @@ parser.add_argument(
     type=lambda s: None if s == "auto" else int(s),
     nargs="+",
     default=[None],
-    help="OPUS split-K counts: auto (the op's own choice) or 1 to 32 (default: auto)",
+    help=(
+        "split-K counts: opus auto or 1..32; v41_fp4 asm shape-based auto or 1..16 "
+        "(default: auto). v4 asm has no split-K."
+    ),
 )
 
 
