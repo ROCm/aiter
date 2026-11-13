@@ -251,6 +251,12 @@ PVQK_LAG = 2
 # the back edge, instead of at the top of the body that consumes them. Clamped to
 # num_prefetch; 0 restores the un-carried head. Costs 4 VGPR per carried load.
 PVQK_HEAD_CARRY = 20
+# Loads per refill burst in the PV+QK ring. The gemm's inter-wmma gaps pay an
+# s_set_vgpr_msb toggle OUT to the ds_load destination bank and back IN for the wmma
+# (0x400 <-> 0x4 in the dumps); at the default 2-loads-per-fragment cadence that toggle
+# pair is amortised over only 2 loads. Batching the refill spreads it over more. 0 keeps
+# the per-fragment cadence.
+PVQK_REFILL_BURST = 4
 
 # NOTE: the remaining tiling constants (chunk sizes, K/V write-tile + V swizzle
 # granularity) live inside fmha_buffer_managers.py — they are intrinsic to the
@@ -555,7 +561,14 @@ def _pv_qk_gemm(
     def emit(j):
         return v_emit(j) if j < num_vld else k_emit(j - num_vld)
 
-    def consume(i, *parts):
+    def consume(i, *parts, after_first=None):
+        # ``after_first`` (the ring's refill burst) fires once this fragment's first wmma
+        # is out, so the loads issue under it instead of ahead of the stream.
+        def _mid(q_tile_idx):
+            if after_first is not None and q_tile_idx == 0:
+                after_first()
+                rocdl.sched_barrier(0)
+
         if i < num_v_frags:
             d_tile_idx, k_tile_idx = divmod(i, num_contract_tiles)
             v_frag = _concat(parts)
@@ -574,6 +587,7 @@ def _pv_qk_gemm(
                 p_frags[(q_tile_idx, k_tile_idx)] = p_frag
                 out_list[q_tile_idx][d_tile_idx] = _wmma(v_frag, p_frag, acc)
                 rocdl.sched_barrier(0)
+                _mid(q_tile_idx)
             return
         kv, d_tile_idx = divmod(i - num_v_frags, num_k_tiles)
         k_frag = _concat(parts)
@@ -587,6 +601,7 @@ def _pv_qk_gemm(
                 k_frag, q_frags_list[q_tile_idx][d_tile_idx], acc
             )
             rocdl.sched_barrier(0)
+            _mid(q_tile_idx)
 
     def dies(i):
         # The PV half's B operands die on the final d-tile row, which is where the ring is
@@ -613,6 +628,7 @@ def _pv_qk_gemm(
         head=head,
         dies=dies,
         tap=tap,
+        refill_burst=PVQK_REFILL_BURST,
     )
     rocdl.s_setprio(0 if warp_type.is_lo else 1)
     return out_list, s_acc_list

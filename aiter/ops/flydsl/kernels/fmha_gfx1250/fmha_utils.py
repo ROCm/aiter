@@ -322,7 +322,16 @@ def _ring_num_prefetch(num_ld, ring, ring_lag):
 
 
 def _ring_drive(
-    *, widths, emit, consume, ring, ring_lag, head=None, dies=None, tap=None
+    *,
+    widths,
+    emit,
+    consume,
+    ring,
+    ring_lag,
+    head=None,
+    dies=None,
+    tap=None,
+    refill_burst=0,
 ):
     """Drive a fully-unrolled LDS->VGPR ring feeding a WMMA stream.
 
@@ -339,10 +348,25 @@ def _ring_drive(
     copies spread through the ring instead of clumped ahead of it. Placement is by source
     order, so it costs the ring no fence or wait depth.
 
+    Under ``refill_burst`` the ring hands ``consume`` an ``after_first`` callback and
+    expects it to be invoked once its FIRST wmma has been emitted; that is where the
+    burst is issued.
+
     ``head`` optionally adopts an already-issued NP-deep prefetch (the PV case hoists it
     above softmax so the LDS latency hides under the softmax VALU). A tile of at most
     ``ring`` loads degenerates to that burst form (see ``_ring_num_prefetch``), as does
     ``lag=0`` with ``ring >= 2*num_frag``.
+
+    ``refill_burst`` batches refills: instead of topping the ring up every fragment (2
+    loads, which costs one s_set_vgpr_msb toggle OUT to the load bank and back IN for the
+    wmma), defer until at least this many loads are owed and issue them in one run, so one
+    toggle pair covers the whole burst. 0 keeps the per-fragment cadence. Must be <= NP or
+    a fragment could reach its wait before its own loads are issued.
+
+    The per-fragment ``s_wait_dscnt`` STAYS, even though bursting leaves it in gaps that
+    issue nothing: collapsing it to one stricter wait per run was measured 0.6% SLOWER on
+    case 51. It is already satisfied where it sits, so it costs an issue slot; the coarse
+    form costs a real stall.
 
     ``dies(i)`` optionally names values *other* than the ring pair whose last read is
     fragment ``i`` -- the B operands, which the ring does not own. Without it those
@@ -359,6 +383,10 @@ def _ring_drive(
     assert (
         num_prefetch > 0
     ), f"ring={ring} too small for lag={ring_lag} (NP={num_prefetch})"
+    assert refill_burst <= num_prefetch, (
+        f"refill_burst={refill_burst} over NP={num_prefetch}: a fragment could reach its "
+        f"s_wait_dscnt before its own loads are issued"
+    )
 
     def _waitn(n):
         rocdl.sched_barrier(0)
@@ -419,10 +447,24 @@ def _ring_drive(
         _waitn(issued - starts[i + 1])
         _release(i)
         refilling = issued < num_ld
-        _refill(starts[i + 1] + num_prefetch)
+        _target = starts[i + 1] + num_prefetch
+        _do_refill = (
+            not refill_burst
+            or _target - issued >= refill_burst
+            or _target >= num_ld
+        )
         parts = tuple(a[(starts[i] + k) % ring] for k in range(widths[i]))
         rocdl.sched_barrier(0)
-        consume(i, *parts)
+        if _do_refill and refill_burst:
+            # Put the burst INSIDE the wmma stream rather than ahead of it: a wmma owns
+            # the SIMD for 8 cycles but issues in 1, so the loads ride its shadow and the
+            # fragments after it stay clean. ``parts`` is already captured, so the refill
+            # cannot alias what this fragment reads, and the WAR distance only grows.
+            consume(i, *parts, after_first=lambda: _refill(_target))
+        else:
+            if _do_refill:
+                _refill(_target)
+            consume(i, *parts)
         rocdl.sched_barrier(0)
         # Past the last refill nothing can clobber the slots, so holding them buys nothing.
         _record(i, parts if (ring_lag and refilling) else None)
