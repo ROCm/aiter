@@ -10,8 +10,9 @@ import torch
 
 from ..jit.core import compile_ops
 from ..jit.utils.chip_info import get_gfx, get_gfx_runtime
+from ..plugin import route as _route
 from ..utility import dtypes
-from ..utility.graph_alloc import persistent_alloc
+from ..utility.graph_alloc import capture_scoped_cache, persistent_alloc
 
 
 # Raw binding: no argument validation, correction_bias must be a real tensor.
@@ -32,7 +33,8 @@ def topk_gating_fwd(
 
 _VALID_SCORE_FUNCS = {"sqrtsoftplus", "sigmoid", "softmax"}
 _GFX1250_SIGMOID_EXPERTS = {512, 768, 896, 900, 1024}
-_GFX1250_SIGMOID_TOPKS = {4, 8, 16}
+# Top-K and the Top-(K+1) candidates HERD routing hands to fused_moe(herd_topk=K).
+_GFX1250_SIGMOID_TOPKS = {4, 5, 8, 9, 16, 17}
 
 
 def _can_use_gfx1250_exact_sigmoid_topk(
@@ -59,9 +61,11 @@ def _can_use_gfx1250_exact_sigmoid_topk(
         and gating_output.stride(1) == 1
         and gating_output.stride(0) >= experts
     )
+    # An FP32 bias with BF16 logits has no wave32 HIP path: the HIP kernel
+    # takes a bias of another dtype only on its wave64 register top-k path.
     bias_ok = (
         correction_bias.shape == (experts,)
-        and correction_bias.dtype == torch.bfloat16
+        and correction_bias.dtype in (torch.bfloat16, torch.float32)
         and correction_bias.stride(0) == 1
     )
     outputs_ok = (
@@ -79,7 +83,7 @@ def _can_use_gfx1250_exact_sigmoid_topk(
     )
     if not input_ok or not bias_ok or not outputs_ok or not same_device:
         return False
-    return get_gfx_runtime() == "gfx1250"
+    return get_gfx_runtime() in ("gfx1250", "gfx1250-strict")
 
 
 def _gfx1250_exact_sigmoid_topk(
@@ -110,9 +114,10 @@ _FLYDSL_HERD_MIN_M = int(
         "AITER_FLYDSL_HERD_MIN_M", os.environ.get("AITER_TRITON_HERD_MIN_M", "16")
     )
 )
+# fused_moe(herd_topk) takes at most HERD_ROUTE_BLOCK (1024) tokens.
 _FLYDSL_HERD_MAX_M = int(
     os.environ.get(
-        "AITER_FLYDSL_HERD_MAX_M", os.environ.get("AITER_TRITON_HERD_MAX_M", "128")
+        "AITER_FLYDSL_HERD_MAX_M", os.environ.get("AITER_TRITON_HERD_MAX_M", "1024")
     )
 )
 
@@ -158,6 +163,15 @@ def _valid_bias_dtypes(gating_dtype: torch.dtype) -> tuple[torch.dtype, ...]:
     return (torch.float32, torch.bfloat16)
 
 
+def _topk_gating_fake(*args, **kwargs) -> None:
+    """Every result of this op is one of its in-place writes -- ``topk_weights``
+    and ``topk_indices`` -- so a trace of it produces nothing. The fake is what
+    lets `route` register the op, which keeps the plugin's dispatch out of a
+    caller's compiled graph."""
+    return
+
+
+@_route(op="topk_gating", version=1, fake=_topk_gating_fake)
 def topk_gating(
     topk_weights: torch.Tensor,
     topk_indices: torch.Tensor,
@@ -578,7 +592,7 @@ def _use_mulblocks(numRows: int, stride0: int) -> bool:
     )
 
 
-@functools.lru_cache(maxsize=16)
+@capture_scoped_cache
 def _get_topk_mb_workspace_keyed(
     device: torch.device, stream_id: int, size: int
 ) -> torch.Tensor:
@@ -1198,7 +1212,7 @@ _FLYDSL_TOPK_DECODE_GATES = {
             (32_768, 65_535, 16),
             (65_536, 131072, 32),
             (131072, 200_000, 48),
-            (200_000, None, 64),
+            (200_000, None, 128),
         ),
         False: ((131_072, None, 32),),
     },
@@ -1304,6 +1318,15 @@ def _hip_top_k_per_row_decode(
     )
 
 
+def _top_k_per_row_decode_fake(*args, **kwargs) -> None:
+    """Every result of this op is one of its in-place writes -- ``indices``, and
+    ``values`` when given -- so a trace of it produces nothing. The fake is what
+    lets `route` register the op, which keeps the plugin's dispatch out of a
+    caller's compiled graph."""
+    return
+
+
+@_route(op="top_k_per_row_decode", version=1, fake=_top_k_per_row_decode_fake)
 def top_k_per_row_decode(
     logits: torch.Tensor,
     next_n: int,

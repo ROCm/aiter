@@ -9,7 +9,9 @@ import triton.language as tl
 from triton.language.extra.hip import libdevice as hip_libdevice
 
 import aiter
+from aiter.ops.triton._triton_kernels.common.activation import _sigmoid_exp2
 from aiter.ops.triton.utils._triton import arch_info
+from aiter.ops.triton.utils.config_utils import load_config_json, resolve_config_dir
 
 CXX_PS_REDUCE_AVAILABLE = True
 try:
@@ -113,6 +115,27 @@ def get_recommended_splits(
     context_tiles = triton.cdiv(max_context_length, 256)
     # The C++ ps reduce is wrong above 32 partitions (cross-half ds_swizzle).
     return max(legacy, min(max_context_partition_num, context_tiles, 32))
+
+
+def _uses_ps_kernel(ps, sliding_window, kv_block_size):
+    # PS runs the sliding-window kernels, except for 1024-token blocks under a
+    # sliding window, which go to the non-PS large-block kernel.
+    return ps and not (sliding_window > 0 and kv_block_size == 1024)
+
+
+def _ps_query_split(query_seq_len, query_group_size):
+    """Spread a single-KV-head PS launch's query tokens over the grid.
+
+    Returns (query tokens per program, programs per sequence). A group of 16 or
+    more fills the tile with one token; a narrower group packs tokens up to 16
+    rows. Either way the tile does not grow with query_seq_len, and the token
+    count stays a power of two, which the kernel's layouts require.
+    """
+    group_size_pow2 = triton.next_power_of_2(query_group_size)
+    tokens_per_program = min(
+        triton.next_power_of_2(query_seq_len), max(1, 16 // group_size_pow2)
+    )
+    return tokens_per_program, triton.cdiv(query_seq_len, tokens_per_program)
 
 
 DS_WRITE = gl.constexpr(0x200)
@@ -4091,6 +4114,12 @@ def paged_attention_decode_ps_reduce_kernel(
     HEAD_SIZE_POW2: tl.constexpr,
     USE_SINKS: tl.constexpr,
     MAX_CONTEXT_PARTITION_NUM: tl.constexpr,
+    output_gate_ptr=None,  # [num_seqs, query_seq_len, num_kv_heads, query_group_size, head_size]
+    stride_output_gate_bs=0,
+    stride_output_gate_len=0,
+    stride_output_gate_kv_head=0,
+    stride_output_gate_group_size=0,
+    USE_OUTPUT_GATE: tl.constexpr = False,
 ):
     """
     Triton port of FlyDSL `compile_pa_decode_sw_reduce`.
@@ -4155,6 +4184,18 @@ def paged_attention_decode_ps_reduce_kernel(
     final_output = tl.sum(
         partial_logits.to(tl.float32) * partition_weights[:, None], axis=0
     )
+    # A zero-length sequence (e.g. a padded CUDA-graph row) has no partitions: write 0, not NaN.
+    final_output = tl.where(global_exp_sum > 0, final_output, 0.0)
+    if USE_OUTPUT_GATE:
+        gate_offsets = (
+            sequence_idx * stride_output_gate_bs
+            + query_idx * stride_output_gate_len
+            + kv_head_idx * stride_output_gate_kv_head
+            + group_idx * stride_output_gate_group_size
+            + head_offsets
+        )
+        gate = tl.load(output_gate_ptr + gate_offsets, mask=head_mask, other=0.0)
+        final_output = final_output * _sigmoid_exp2(gate.to(tl.float32))
 
     output_offsets = (
         sequence_idx * stride_output_bs
@@ -4486,7 +4527,7 @@ def _paged_attention_decode_v2_with_dot_kernel_reshape_wrapper(
 
     # PS path uses the sliding-window kernel for all KV_BLOCK_SIZE values.
     # This is required for KV_BLOCK_SIZE==1024 support in PS mode.
-    if PS and not (SLIDING_WINDOW > 0 and KV_BLOCK_SIZE == 1024):
+    if _uses_ps_kernel(PS, SLIDING_WINDOW, KV_BLOCK_SIZE):
         ONE_SHOT = num_splits <= 1
         if num_kv_heads == 1:
             paged_attention_kernel = paged_attention_decode_sliding_window_head_1
@@ -4496,16 +4537,10 @@ def _paged_attention_decode_v2_with_dot_kernel_reshape_wrapper(
                 "VALUE_HEAD_SIZE": VALUE_HEAD_SIZE,
                 "VALUE_HEAD_SIZE_POW2": VALUE_HEAD_SIZE_POW2,
             }
-            if ONE_QUERY_GROUP_SIZE_POW2 >= 16:
-                grid = (num_sequences, query_seq_len * num_kv_heads, num_splits)
-                QUERY_SEQ_LEN_POW2 = 1
-            else:
-                mtp_splits = triton.cdiv(
-                    query_seq_len * num_kv_heads,
-                    triton.cdiv(16, ONE_QUERY_GROUP_SIZE_POW2),
-                )
-                grid = (num_sequences, mtp_splits, num_splits)
-                QUERY_SEQ_LEN_POW2 = triton.cdiv(QUERY_SEQ_LEN_POW2, mtp_splits)
+            QUERY_SEQ_LEN_POW2, mtp_splits = _ps_query_split(
+                query_seq_len, query_group_size
+            )
+            grid = (num_sequences, mtp_splits, num_splits)
         else:
             paged_attention_kernel = paged_attention_decode_sliding_window
             head_size_kwargs = {}
@@ -4641,6 +4676,14 @@ def _paged_attention_decode_v2_with_dot_kernel_reshape_wrapper(
     )
 
 
+@lru_cache(maxsize=2)
+def _ps_reduce_num_warps(output_gate: bool) -> int:
+    """num_warps of the Triton PS reduce, with or without the output gate."""
+    cfg_dir = resolve_config_dir("attention", "PA_DECODE_GLUON", backend="gluon")
+    entry = "ps_reduce_output_gate" if output_gate else "ps_reduce"
+    return load_config_json(f"{cfg_dir}/DEFAULT.json")[entry]["num_warps"]
+
+
 def _paged_attention_decode_v2_reduce_kernel_wrapper(
     grid,
     output_ptr,  # [num_seqs, query_length, num_kv_heads, query_group_size, head_size]
@@ -4666,10 +4709,13 @@ def _paged_attention_decode_v2_reduce_kernel_wrapper(
     CONTEXT_PARTITION_SIZE,
     PS=False,
     context_partition_num=1,
+    output_gate_ptr=None,
+    stride_output_gate=(0, 0, 0, 0),
 ):
     """Dispatch partition reduction to C++ or Triton."""
     if PS:
-        if CXX_PS_REDUCE_AVAILABLE:
+        # Only the Triton reduce applies the output gate.
+        if CXX_PS_REDUCE_AVAILABLE and output_gate_ptr is None:
             try:
                 launch_pa_decode_ps_reduce_cxx(
                     output_ptr,
@@ -4720,8 +4766,16 @@ def _paged_attention_decode_v2_reduce_kernel_wrapper(
             HEAD_SIZE_POW2=triton.next_power_of_2(head_size),
             USE_SINKS=sink_token_ptr is not None,
             MAX_CONTEXT_PARTITION_NUM=triton.next_power_of_2(context_partition_num),
+            output_gate_ptr=output_gate_ptr,
+            stride_output_gate_bs=stride_output_gate[0],
+            stride_output_gate_len=stride_output_gate[1],
+            stride_output_gate_kv_head=stride_output_gate[2],
+            stride_output_gate_group_size=stride_output_gate[3],
+            USE_OUTPUT_GATE=output_gate_ptr is not None,
+            num_warps=_ps_reduce_num_warps(output_gate_ptr is not None),
         )
     else:
+        assert output_gate_ptr is None, "output gate needs the PS reduce"
         paged_attention_decode_v2_reduce_kernel[grid](
             output_ptr,
             exp_sums_ptr,
@@ -4774,6 +4828,7 @@ def pa_decode_gluon(
     sinks: torch.Tensor = None,
     sliding_window: int = 0,
     ps: bool = True,
+    output_gate: torch.Tensor = None,  # [num_seqs * query_length, num_query_heads, value_head_size]
 ) -> None:
     """
     Paged Attention Decode with FP8/BF16/FP16 Support.
@@ -4823,7 +4878,10 @@ def pa_decode_gluon(
         Scaling factor for attention scores, typically 1/sqrt(head_size).
 
     query_length : int
-        Length of query sequences. Must be <= 4.
+        Length of query sequences. Must be <= 4, except on the PS kernel with a
+        single KV head, which spreads the query tokens over the launch grid.
+        On that kernel, it must be less than sliding_window when
+        sliding_window > 0.
 
     max_context_partition_num : int
         Maximum number of context partitions.
@@ -4877,6 +4935,14 @@ def pa_decode_gluon(
         - Dtype: torch.float32
         - Default: None (no ALiBi)
 
+    output_gate : torch.Tensor, optional
+        Sigmoid output gate: the result is out * sigmoid(output_gate), as in the
+        Qwen3-Next gated attention.
+        - Shape: same as output; dtype: output.dtype; last dimension with stride 1
+        - Applied in the PS reduce, so it needs ps=True and
+          max_context_partition_num > 1; other paths are rejected.
+        - Default: None (no gate)
+
     Returns
     -------
     None
@@ -4884,7 +4950,9 @@ def pa_decode_gluon(
 
     Notes
     -----
-    - query_length * query_group_size must be <= 64
+    - query_length * query_group_size must be <= 64; on the PS kernel with a
+      single KV head only query_group_size must be <= 64, and query_length
+      must be less than sliding_window when sliding_window > 0
     - kv_block_size must be one of [16, 64, 1024]
     - When query_length > 1, automatic transpose operations are performed
       between standard and gluon layouts
@@ -4928,8 +4996,27 @@ def pa_decode_gluon(
     # if sliding_window > 0 and kv_block_size != 1024:
     #     max_context_partition_num = 1
     grid = (batch_size, num_kv_heads, max_context_partition_num)
+    one_shot = max_context_partition_num <= 1
+    ps = ps or one_shot
+    uses_persistent_kernel = _uses_ps_kernel(ps, sliding_window, kv_block_size)
 
-    assert query_length <= 4, f"query_length == {query_length} exceeds maximum of 4"
+    # A single-KV-head PS launch spreads the query tokens over the grid (see
+    # _ps_query_split), so only the group bounds its query tile. The other
+    # kernels hold every query token of a sequence in one tile.
+    if num_kv_heads == 1 and uses_persistent_kernel:
+        assert (
+            query_group_size <= 64
+        ), f"query_group_size={query_group_size} exceeds maximum of 64"
+        # Each query token sees sliding_window - query_length keys. A window
+        # that is not longer than the query masks all keys.
+        assert (
+            sliding_window <= 0 or query_length < sliding_window
+        ), f"query_length={query_length} must be less than sliding_window={sliding_window}"
+    else:
+        assert query_length <= 4, f"query_length == {query_length} exceeds maximum of 4"
+        assert (
+            equivalent_query_group_size <= 64
+        ), f"equivalent_query_group_size={equivalent_query_group_size} exceeds maximum of 64"
     # Validate input params constraint
     assert query.dtype in [
         aiter.dtypes.fp8,
@@ -4950,9 +5037,6 @@ def pa_decode_gluon(
         aiter.dtypes.bf16,
         aiter.dtypes.fp16,
     ], f"output tensor only support dtype in [{aiter.dtypes.bf16, aiter.dtypes.fp16}], but got output.dtype == {output.dtype}"
-    assert (
-        equivalent_query_group_size <= 64
-    ), f"equivalent_query_group_size={equivalent_query_group_size} exceeds maximum of 64"
 
     assert (
         len(output.shape) == 3
@@ -4984,9 +5068,24 @@ def pa_decode_gluon(
         f"but got shape {key_cache.shape}"
     )
 
-    one_shot = max_context_partition_num <= 1
-    ps = ps or one_shot
-    uses_persistent_kernel = ps and not (sliding_window > 0 and kv_block_size == 1024)
+    output_gate_5d = None
+    if output_gate is not None:
+        assert output_gate.shape == output.shape, (
+            f"output_gate must match output {tuple(output.shape)}, "
+            f"but got {tuple(output_gate.shape)}"
+        )
+        assert (
+            output_gate.dtype == output.dtype
+        ), f"output_gate dtype must be {output.dtype}, but got {output_gate.dtype}"
+        assert (
+            output_gate.stride(-1) == 1
+        ), "output_gate must have stride 1 in its last dimension"
+        output_gate_5d = output_gate.view(
+            batch_size, query_length, num_kv_heads, query_group_size, value_head_size
+        )
+        assert (
+            ps and not one_shot
+        ), "output_gate is applied in the PS reduce; it needs max_context_partition_num > 1"
 
     if exp_sums is None:
         exp_sums = torch.empty(
@@ -5252,4 +5351,10 @@ def pa_decode_gluon(
             CONTEXT_PARTITION_SIZE=context_partition_size,
             PS=ps,
             context_partition_num=max_context_partition_num,
+            output_gate_ptr=output_gate_5d,
+            stride_output_gate=(
+                output_gate_5d.stride()[:4]
+                if output_gate_5d is not None
+                else (0, 0, 0, 0)
+            ),
         )
