@@ -153,11 +153,8 @@ def _execute_a16w16(
     route_arch: str | None = None,
     route_cu_num: int | None = None,
     instance: OpusGemmInstance | None = None,
-    _four_wave: bool = False,
 ) -> torch.Tensor:
     """Validate, plan, and launch one exact 3D A16W16 operation."""
-    if not _four_wave:  # 4-wave kids: any NT/NN/TT/TN strides, checked by their C++ launcher
-        _check_a16w16_launch_layout(XQ, WQ, Y)
     batch, M, K = XQ.shape
     N = Y.shape[2]
 
@@ -318,7 +315,8 @@ def _launch_a16w16_route(XQ, WQ, Y, bias=None, *, kid, instance=None, **kwargs):
     else:
         arch, cu_num = _device_arch_and_cu(XQ.device)
         four_wave = _kid_takes_mn_major_operands(arch, cu_num, int(kid))
-    if not four_wave:
+    if not four_wave:  # NT-only kids: their launchers do not check strides
+        _check_a16w16_launch_layout(XQ, WQ, Y)
         return _execute_a16w16(XQ, WQ, Y, bias, kid=kid, instance=instance, **kwargs)
     a_t, b_t = _a16w16_operand_transposed(XQ), _a16w16_operand_transposed(WQ)
     launch = (
@@ -330,22 +328,22 @@ def _launch_a16w16_route(XQ, WQ, Y, bias=None, *, kid, instance=None, **kwargs):
 
 def _launch_a16w16_nt(XQ, WQ, Y, bias=None, **kwargs):
     """NT: XQ [B,M,K] stored [M,K], WQ [B,N,K] stored [N,K]."""
-    return _execute_a16w16(XQ, WQ, Y, bias, _four_wave=True, **kwargs)
+    return _execute_a16w16(XQ, WQ, Y, bias, **kwargs)
 
 
 def _launch_a16w16_nn(XQ, WQ, Y, bias=None, **kwargs):
     """NN: XQ stored [M,K], WQ the [N,K] view of a [K,N] weight."""
-    return _execute_a16w16(XQ, WQ, Y, bias, _four_wave=True, **kwargs)
+    return _execute_a16w16(XQ, WQ, Y, bias, **kwargs)
 
 
 def _launch_a16w16_tt(XQ, WQ, Y, bias=None, **kwargs):
     """TT: XQ the [M,K] view of a [K,M] activation, WQ stored [N,K]."""
-    return _execute_a16w16(XQ, WQ, Y, bias, _four_wave=True, **kwargs)
+    return _execute_a16w16(XQ, WQ, Y, bias, **kwargs)
 
 
 def _launch_a16w16_tn(XQ, WQ, Y, bias=None, **kwargs):
     """TN: XQ / WQ views of [K,M] / [K,N] storage."""
-    return _execute_a16w16(XQ, WQ, Y, bias, _four_wave=True, **kwargs)
+    return _execute_a16w16(XQ, WQ, Y, bias, **kwargs)
 
 
 def opus_gemm_a16w16_tune(
