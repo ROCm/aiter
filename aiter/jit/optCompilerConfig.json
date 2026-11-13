@@ -2274,5 +2274,21 @@
         "verbose": "False",
         "torch_exclude": "True",
         "blob_gen_cmd": "''"
+    },
+    "module_fmoe_tp_sdma_hsakmt": {
+        "srcs": [
+            "f'{AITER_CSRC_DIR}/cpp_itfs/fmoe_tp_sdma/hsakmt_sdma_queues.cpp'"
+        ],
+        "flags_extra_cc": [
+            "'-DENABLE_CK=0'"
+        ],
+        "flags_extra_hip": [
+            "'-DENABLE_CK=0'"
+        ],
+        "extra_ldflags": "_hsakmt_ldflags()",
+        "extra_include": "_hsakmt_include_dirs()",
+        "verbose": "False",
+        "torch_exclude": "True",
+        "blob_gen_cmd": "''"
     }
 }

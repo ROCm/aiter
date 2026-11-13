@@ -1,8 +1,10 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
+import contextlib
 import functools
 import importlib
+import importlib.util
 import json
 import logging
 import multiprocessing
@@ -1810,6 +1812,48 @@ def _get_ck_exclude_modules():
     }
 
     return ck_modules
+
+
+def _hsakmt_roots() -> list[str]:
+    if IS_WINDOWS:
+        return []
+    from cpp_extension import ROCM_HOME as rh
+
+    cs: list[str | None] = []
+    for pkg in ("_rocm_sdk_core", "_rocm_sdk_devel"):
+        with contextlib.suppress(ImportError, ValueError):
+            if (sp := importlib.util.find_spec(pkg)) and sp.submodule_search_locations:
+                cs += list(sp.submodule_search_locations)
+    cs += [os.getenv("ROCM_HOME"), os.getenv("ROCM_PATH"), rh, "/opt/rocm"]
+    return list(dict.fromkeys(os.path.abspath(p) for p in cs if p and os.path.isdir(p)))
+
+
+def _hsakmt_include_dirs() -> list[str]:
+    h = "include/hsakmt/hsakmt.h"
+    return [f"{r}/include" for r in _hsakmt_roots() if os.path.isfile(f"{r}/{h}")][:1]
+
+
+def _hsakmt_ldflags() -> list[str]:
+    roots = _hsakmt_roots()
+    for ld in (f"{r}/{s}" for r in roots for s in ("lib", "lib64")):
+        if os.path.isfile(la := f"{ld}/libhsakmt.a"):
+            fl = [la, "-Wl,--exclude-libs,libhsakmt.a"]
+            sds = [f"{x}/lib/rocm_sysdeps/lib" for x in (os.path.dirname(ld), *roots)]
+            sn = "librocm_sysdeps_drm_amdgpu.so.1"
+            if sd := next((d for d in sds if os.path.isfile(f"{d}/{sn}")), ""):
+                for s in ("drm_amdgpu.so.1", "drm.so.2", "numa.so.1"):
+                    if os.path.isfile(p := f"{sd}/librocm_sysdeps_{s}"):
+                        fl.append(p)
+                fl.append(f"-Wl,-rpath,{sd}")
+            else:
+                for d in ("/opt/amdgpu/lib/x86_64-linux-gnu", "/opt/amdgpu/lib64"):
+                    fl += [f"-L{d}", f"-Wl,-rpath,{d}"] if os.path.isdir(d) else []
+                fl += ["-ldrm_amdgpu", "-ldrm", "-lnuma"]
+            return [*fl, f"-Wl,-rpath,{ld}", "-ldl", "-lpthread"]
+        for so in ("libhsakmt.so", "libhsakmt.so.1"):
+            if os.path.isfile(p := f"{ld}/{so}"):
+                return [p, f"-Wl,-rpath,{ld}", "-ldl", "-lpthread"]
+    return []
 
 
 def get_args_of_build(ops_name: str, exclude=None):
