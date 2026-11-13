@@ -4,6 +4,7 @@
 """Generic FlyDSL paged decode correctness test.
 
 Run with: python -m pytest -q op_tests/test_flydsl_pa_decode.py
+Benchmark with: python -m op_tests.op_benchmarks.flydsl.bench_pa_decode --help
 """
 
 import importlib.util
@@ -449,9 +450,13 @@ def test_pa_decode_merge_alignment(
         assert torch.count_nonzero(plan.arrival_counters) == 0
     last_arriver = mode == "last" and scratch_offset == 0
     assert compile_kwargs[-1]["direct_output"] == last_arriver
+    # A one-row D128 decode splits its row into 16 step-sized parts; the
+    # one-slot budget of the last-arriver plans leaves no room for them.
+    steps = mode == "cluster" and dim == 128
     assert compile_kwargs[-1]["cluster_merge"] == (
-        0 if last_arriver or mode == "reducer" else 4
+        0 if last_arriver or mode == "reducer" else 16 if steps else 4
     )
+    assert compile_kwargs[-1]["cluster_steps"] == steps
 
 
 @pytest.mark.parametrize("architecture", ["gfx942", "gfx950"])
@@ -526,6 +531,88 @@ def _reference(
         probs.masked_fill_(visible[:, None, None, None] <= 0, 0)
         output[seq] = torch.einsum("qhgk,khd->qhgd", probs, values)
     return output.reshape_as(query).float()
+
+
+@pytest.mark.parametrize("query_length,group_size", [(3, 16), (5, 8)])
+@pytest.mark.parametrize("per_token", [False, True])
+@pytest.mark.parametrize("cap,budget", [(1, 512), (4, 512), (4, 1)])
+def test_pa_decode_fp8_three_tiles_large_logits(
+    device, query_length, group_size, per_token, cap, budget
+):
+    """Finite constant logits keep V=0.5 across direct, cluster and arrival paths."""
+    if get_gfx_runtime() != "gfx1250":
+        pytest.skip("gfx1250 FP8 wave tiles")
+    pa = importlib.import_module("aiter.ops.flydsl.pa_decode")
+    query = torch.ones(
+        (4 * query_length, group_size, 128), dtype=torch.bfloat16, device=device
+    )
+    output = torch.empty_like(query)
+    key = torch.full(
+        (8, 1, 8, 128, 16), 448.0, dtype=torch.float8_e4m3fn, device=device
+    )
+    value = torch.full_like(key, 224.0)
+    shape = (8, 1, 128, 1) if per_token else (1,)
+    key_scale = torch.ones(shape, dtype=torch.float32, device=device)
+    value_scale = torch.full_like(key_scale, 0.5 / 224.0)
+    lengths = torch.tensor([0, 0, 0, 1024], dtype=torch.int32, device=device)
+    table = torch.arange(8, dtype=torch.int32, device=device).repeat(4, 1)
+    plan = pa.plan_pa_decode(
+        lengths,
+        1,
+        query_length=query_length,
+        max_partitions=cap,
+        workgroup_budget=budget,
+    )
+
+    def call():
+        pa.pa_decode(
+            output,
+            query,
+            key,
+            value,
+            lengths,
+            table,
+            128**-0.5,
+            query_length,
+            work_plan=plan,
+            max_context_length=1024,
+            compute_type=key.dtype,
+            key_scale=key_scale,
+            value_scale=value_scale,
+        )
+
+    expected = torch.zeros_like(query, dtype=torch.float32)
+    expected[-query_length:] = 0.5
+    call()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        call()
+    for magnitude, scale in (
+        (1.0, 1.0),
+        (1.0, 1e30),
+        (1.0, 1e32),
+        (1e10, 1.0),
+        (1e30, 1.0),
+        (0.0, 1e32),
+    ):
+        query.fill_(magnitude)
+        key_scale.fill_(scale)
+        for replay in (False, True):
+            output.fill_(float("nan"))
+            graph.replay() if replay else call()
+            error = checkAllclose(
+                output.float(),
+                expected,
+                atol=5e-3,
+                rtol=5e-3,
+                tol_err_ratio=0,
+                msg=(
+                    f"FP8 three tiles: qlen={query_length} group={group_size} "
+                    f"token_scales={per_token} cap={cap} budget={budget} "
+                    f"q={magnitude} kscale={scale} replay={replay}"
+                ),
+            )
+            assert error == 0
 
 
 def _make_inputs(
@@ -799,10 +886,53 @@ _COMMON_CASES = [
         {
             "group_size": 16,
             "block_size": 16,
-            "lengths": (2048,) * 6 + (0, 1, 257, 2047),
+            "lengths": ((2048,) * 6 + (0, 1, 257, 2047)) * 2,
             "max_partitions": 8,
             "capture": True,
             "cluster": 8,
+            "cluster_steps": True,
+        },
+    ),
+    # Batches within one 16-CTA cluster per CU split each row into 16
+    # step-sized parts whatever the cap; short rows leave parts idle.
+    (
+        "cluster16-steps",
+        {
+            "group_size": 16,
+            "block_size": 16,
+            "lengths": (2048,) * 6 + (0, 1, 129, 257, 2047),
+            "max_partitions": 8,
+            "capture": True,
+            "cluster": 16,
+            "cluster_steps": True,
+        },
+    ),
+    # Two KV heads split each row's steps per head and keep their partials
+    # apart.
+    (
+        "cluster16-steps-kv2",
+        {
+            "kv_heads": 2,
+            "group_size": 8,
+            "block_size": 16,
+            "lengths": (2048, 0, 129, 1000, 2047),
+            "max_partitions": 8,
+            "capture": True,
+            "cluster": 16,
+            "cluster_steps": True,
+        },
+    ),
+    # Block tables of more than 16 steps keep plan-derived tasks.
+    (
+        "cluster4-wide-table",
+        {
+            "group_size": 16,
+            "block_size": 16,
+            "lengths": (1000, 0, 777, 1),
+            "table_width": 129,
+            "max_partitions": 8,
+            "cluster": 4,
+            "cluster_steps": False,
         },
     ),
     (
@@ -815,8 +945,246 @@ _COMMON_CASES = [
             "sink_dtype": torch.float32,
         },
     ),
+    # More than 240 split sequences share two-sequence clusters on gfx1250;
+    # an odd batch pads the last cluster, and empty rows still meet the barrier.
+    (
+        "cluster2-shared",
+        {
+            "group_size": 16,
+            "block_size": 16,
+            "lengths": (512, 0, 300) * 81,
+            "max_partitions": 2,
+            "capture": True,
+            "cluster": 2,
+            "cluster_seqs": 2,
+            "cluster_steps": True,
+        },
+    ),
 ]
 _FP8_CASES = _COMMON_CASES + [
+    # Page128 clusters under a length bound give each CTA a fixed run of
+    # tiles: bound rows split evenly, shorter rows leave CTAs idle, and rows
+    # within one tile store directly. A nine-tile bound takes nine CTAs.
+    (
+        "cluster16-runs-page128",
+        {
+            "group_size": 16,
+            "block_size": 128,
+            "lengths": (8192, 0, 1, 129, 1000, 4097, 7777, 8191),
+            "max_partitions": 16,
+            "capture": True,
+            "cluster": 16,
+            "cluster_runs": True,
+        },
+    ),
+    (
+        "cluster16-runs-page128-kv2",
+        {
+            "kv_heads": 2,
+            "group_size": 8,
+            "block_size": 128,
+            "lengths": (2048, 300, 0, 2049),
+            "max_partitions": 16,
+            "cluster": 9,
+            "cluster_runs": True,
+        },
+    ),
+    # Two 16-row tiles share each page across wave pairs. Short one-hot rows
+    # check causal/page bounds without the known FP8-P error on short random
+    # rows; long varied rows check per-token scaling and changed-Q replays.
+    (
+        "qtiles2-short-direct",
+        {
+            "query_length": 2,
+            "group_size": 16,
+            "block_size": 128,
+            "lengths": (0, 1, 63, 64, 65, 127, 128, 129, 255, 256, 257),
+            "pattern": "one_hot",
+        },
+    ),
+    (
+        "qtiles2-short-cluster",
+        {
+            "query_length": 2,
+            "group_size": 16,
+            "block_size": 128,
+            "max_partitions": 4,
+            "lengths": (0, 1, 65, 129, 257, 1025),
+            "pattern": "one_hot",
+            "cluster": 4,
+        },
+    ),
+    (
+        "qtiles2-varied-reducer",
+        {
+            "query_length": 2,
+            "group_size": 16,
+            "block_size": 128,
+            "max_partitions": 256,
+            "budget": 512,
+            "lengths": (0, 1025, 4100, 8193),
+            "pattern": "varied",
+            "capture": True,
+        },
+    ),
+    (
+        "qtiles2-varied-last-arriver",
+        {
+            "query_length": 2,
+            "group_size": 16,
+            "block_size": 128,
+            "max_partitions": 8,
+            "budget": 1,
+            "max_context": None,
+            "lengths": (0, 0, 0, 8193),
+            "pattern": "varied",
+            "capture": True,
+        },
+    ),
+    (
+        "qtiles2-mixed-task-lengths",
+        {
+            "query_length": 2,
+            "group_size": 16,
+            "block_size": 128,
+            "max_partitions": 256,
+            "budget": 512,
+            "lengths": (6400,) * 64,
+            "pattern": "varied",
+        },
+    ),
+    (
+        "qtiles2-partial-mtp3",
+        {
+            "query_length": 3,
+            "kv_heads": 2,
+            "group_size": 8,
+            "block_size": 128,
+            "max_partitions": 256,
+            "budget": 512,
+            "lengths": (1025, 4100, 8193),
+            "pattern": "varied",
+            "capture": True,
+        },
+    ),
+    (
+        "qtiles2-partial-decode",
+        {
+            "group_size": 17,
+            "block_size": 128,
+            "lengths": (0, 1, 63, 65, 129, 257),
+            "pattern": "one_hot",
+        },
+    ),
+    (
+        "qtiles2-decode-g32",
+        {
+            "group_size": 32,
+            "block_size": 128,
+            "max_partitions": 256,
+            "budget": 512,
+            "lengths": (1025, 4100, 8193),
+            "pattern": "varied",
+            "capture": True,
+        },
+    ),
+    (
+        "mtp3-g16-page128-wave-direct",
+        {
+            "query_length": 3,
+            "group_size": 16,
+            "block_size": 128,
+            "pattern": "varied",
+            "capture": True,
+            "fp8_three_tiles": True,
+        },
+    ),
+    (
+        "mtp3-g16-page128-wave-cluster",
+        {
+            "query_length": 3,
+            "kv_heads": 2,
+            "group_size": 16,
+            "block_size": 128,
+            # Longer random rows check the cluster's partials; the separate
+            # one-hot case checks short causal edges without FP8 Q/P error.
+            "lengths": (257, 513, 1027, 4100),
+            "max_partitions": 4,
+            "cluster": 4,
+            "pattern": "varied",
+            "capture": True,
+            "fp8_three_tiles": True,
+        },
+    ),
+    (
+        "mtp3-g16-page128-wave-short-edges",
+        {
+            "query_length": 3,
+            "kv_heads": 2,
+            "group_size": 16,
+            "block_size": 128,
+            "lengths": (0, 1, 2, 3, 65, 129, 257, 1027),
+            "max_partitions": 4,
+            "cluster": 4,
+            "pattern": "one_hot_token",
+            "capture": True,
+            "fp8_three_tiles": True,
+        },
+    ),
+    (
+        "mtp6-g8-page128-wave-direct",
+        {
+            "query_length": 6,
+            "group_size": 8,
+            "block_size": 128,
+            "lengths": (257, 1027),
+            "pattern": "varied",
+            "capture": True,
+            "fp8_three_tiles": True,
+        },
+    ),
+    (
+        "mtp3-g12-page128-wave-merge",
+        {
+            "query_length": 3,
+            "group_size": 12,
+            "block_size": 128,
+            "lengths": (0, 0, 1027, 4100),
+            "max_partitions": 4,
+            "budget": 1,
+            "pattern": "varied",
+            "capture": True,
+            "fp8_three_tiles": True,
+        },
+    ),
+    (
+        "mtp5-g8-page128-wave-merge",
+        {
+            "query_length": 5,
+            "group_size": 8,
+            "block_size": 128,
+            "lengths": (0, 0, 1027, 4100),
+            "max_partitions": 4,
+            "budget": 1,
+            "pattern": "varied",
+            "capture": True,
+            "fp8_three_tiles": True,
+        },
+    ),
+    (
+        "mtp3-g16-page128-wave-sinks",
+        {
+            "query_length": 3,
+            "group_size": 16,
+            "block_size": 128,
+            "lengths": (0, 65, 257, 1027),
+            "max_partitions": 7,
+            "sink_dtype": torch.float32,
+            "pattern": "varied",
+            "capture": True,
+            "fp8_three_tiles": True,
+        },
+    ),
     (
         "packed-mtp4",
         {
@@ -903,6 +1271,30 @@ _FP8_CASES = _COMMON_CASES + [
     ("mtp8-g8-page128", {"query_length": 8, "block_size": 128, "max_partitions": 7}),
 ]
 _BF16_CASES = _COMMON_CASES + [
+    # Fixed runs of tiles, as for FP8; one-CTA grids stage two pages a step.
+    (
+        "cluster16-runs-page128",
+        {
+            "group_size": 16,
+            "block_size": 128,
+            "lengths": (8192, 0, 1, 129, 1000, 4097, 7777, 8191),
+            "max_partitions": 16,
+            "capture": True,
+            "cluster": 16,
+            "cluster_runs": True,
+        },
+    ),
+    (
+        "cluster9-runs-page128-bs1",
+        {
+            "group_size": 16,
+            "block_size": 128,
+            "lengths": (2049,),
+            "max_partitions": 16,
+            "cluster": 9,
+            "cluster_runs": True,
+        },
+    ),
     (
         "mtp",
         {
@@ -923,9 +1315,10 @@ _BF16_CASES = _COMMON_CASES + [
         {
             "group_size": 16,
             "block_size": 16,
-            "lengths": (4096,) * 3 + (0, 255),
+            "lengths": ((4096,) * 3 + (0, 255)) * 4,
             "max_partitions": 16,
             "cluster": 16,
+            "cluster_steps": False,
         },
     ),
     ("head192-decode", {"group_size": 16, "head_dim": 192, "max_partitions": 4}),
@@ -1587,85 +1980,116 @@ def _check_pipe_policy(pa, case, arch, compile_kwargs):
     from aiter.ops.flydsl.kernels.pa_decode.traits import PaDecodeSchedule
 
     assert compile_kwargs[-1]["wide_kv_addressing"] == case["wide"]
+    if case.get("fp8_three_tiles") and arch in ("gfx1250", "gfx1250-strict"):
+        from aiter.ops.flydsl.kernels.pa_decode.traits import Gfx1250Traits
+
+        kw = compile_kwargs[-1]
+        traits = Gfx1250Traits(
+            head_dim=kw["head_dim"],
+            query_group_size=kw["query_group_size"],
+            block_size=kw["block_size"],
+            softmax_scale=kw["softmax_scale"],
+            query_dtype=kw["query_dtype"],
+            per_token_kv=kw["per_token_kv"],
+            query_length=kw["query_length"],
+            trans_v=kw["trans_v"],
+            sliding_window=kw["sliding_window"],
+        )
+        assert traits.m_tiles == 3 and traits.query_wave_tiles
+        assert traits.q_tiles == 4 and traits.BLOCK_THREADS == 128
     if case["cluster"] is not None:
         expected = case["cluster"] if arch == "gfx1250" else 0
         assert compile_kwargs[-1]["cluster_merge"] == expected
+    if case["cluster_seqs"] is not None and arch == "gfx1250":
+        assert compile_kwargs[-1]["cluster_seqs"] == case["cluster_seqs"]
+    if case["cluster_steps"] is not None and arch == "gfx1250":
+        assert compile_kwargs[-1]["cluster_steps"] == case["cluster_steps"]
+    if case["cluster_runs"] is not None and arch == "gfx1250":
+        assert compile_kwargs[-1]["cluster_runs"] == case["cluster_runs"]
     if case["pipe"]:
         # The cache key ends with (D256_PIPE, staged page ids).
         schedule_kwargs = dict(compile_kwargs[-1])
         schedule_kwargs.pop("architecture", None)
         schedule_kwargs.pop("direct_output", None)
         schedule_kwargs.pop("cluster_merge", None)
+        schedule_kwargs.pop("cluster_seqs", None)
+        schedule_kwargs.pop("cluster_steps", None)
+        schedule_kwargs.pop("cluster_runs", None)
         pipe, staged = PaDecodeSchedule.select(**schedule_kwargs).cache_key[-2:]
         assert pipe == (arch == "gfx950")
         if pipe:
             assert (staged > 0) == (case["staged"] is not False)
 
 
-@pytest.mark.parametrize(
-    "case",
-    [
-        *[
-            pytest.param(
-                dict(
-                    geometry,
-                    kv_dtype="fp8",
-                    query_dtype=dtype,
-                    scale_mode=scale_mode,
-                    trans_v=trans_v,
-                ),
-                id=f"fp8-{dtype}-{scale_mode}-{'transposed' if trans_v else 'plain'}-v-{name}",
-            )
-            for name, geometry in _FP8_CASES
-            for dtype, scale_mode, trans_v in product(
-                (torch.bfloat16, torch.float16),
-                ("per-tensor", "per-token"),
-                (False, True),
-            )
-        ],
-        *[pytest.param(geometry, id=f"bf16-{name}") for name, geometry in _BF16_CASES],
-        *[pytest.param(geometry, id=name) for name, geometry in _PIPE_CASES],
-        *[pytest.param(geometry, id=name) for name, geometry in _MXFP4_CASES],
-        *[
-            pytest.param(
-                {
-                    "invalid_input": invalid,
-                    "error": error,
-                    "match": match,
-                    "lengths": (1,),
-                },
-                id=f"invalid-bf16-{invalid}",
-            )
-            for invalid, error, match in _INVALID_CASES
-        ],
-        *[
-            pytest.param(
-                {
-                    "invalid_input": invalid,
-                    "invalid_kind": "mxfp4",
-                    "kv_dtype": "mxfp4",
-                    "error": error,
-                    "match": match,
-                },
-                id=f"invalid-mxfp4-{invalid}",
-            )
-            for invalid, error, match in _MXFP4_INVALID_CASES
-        ],
-        *[
-            pytest.param(
-                {
-                    "invalid_input": invalid,
-                    "invalid_kind": "select",
-                    "error": error,
-                    "match": match,
-                },
-                id=f"invalid-select-{invalid}",
-            )
-            for invalid, error, match in _SELECT_INVALID_CASES
-        ],
+_PA_DECODE_CASES = [
+    *[
+        pytest.param(
+            dict(
+                geometry,
+                kv_dtype="fp8",
+                query_dtype=dtype,
+                scale_mode=scale_mode,
+                trans_v=trans_v,
+            ),
+            id=f"fp8-{dtype}-{scale_mode}-{'transposed' if trans_v else 'plain'}-v-{name}",
+        )
+        for name, geometry in _FP8_CASES
+        for dtype, scale_mode, trans_v in product(
+            (torch.bfloat16, torch.float16),
+            ("per-tensor", "per-token"),
+            (False, True),
+        )
     ],
-)
+    *[pytest.param(geometry, id=f"bf16-{name}") for name, geometry in _BF16_CASES],
+    *[pytest.param(geometry, id=name) for name, geometry in _PIPE_CASES],
+    *[pytest.param(geometry, id=name) for name, geometry in _MXFP4_CASES],
+    *[
+        pytest.param(
+            {
+                "invalid_input": invalid,
+                "error": error,
+                "match": match,
+                "lengths": (1,),
+            },
+            id=f"invalid-bf16-{invalid}",
+        )
+        for invalid, error, match in _INVALID_CASES
+    ],
+    *[
+        pytest.param(
+            {
+                "invalid_input": invalid,
+                "invalid_kind": "mxfp4",
+                "kv_dtype": "mxfp4",
+                "error": error,
+                "match": match,
+            },
+            id=f"invalid-mxfp4-{invalid}",
+        )
+        for invalid, error, match in _MXFP4_INVALID_CASES
+    ],
+    *[
+        pytest.param(
+            {
+                "invalid_input": invalid,
+                "invalid_kind": "select",
+                "error": error,
+                "match": match,
+            },
+            id=f"invalid-select-{invalid}",
+        )
+        for invalid, error, match in _SELECT_INVALID_CASES
+    ],
+]
+
+
+@pytest.mark.parametrize("case", _PA_DECODE_CASES)
 def test_pa_decode(case, device, monkeypatch):
+    """FP8/BF16/MXFP4 decode shares input, reference, planning and replay checks."""
+    _run_pa_decode_case(case, device, monkeypatch)
+
+
+def _run_pa_decode_case(case, device, monkeypatch):
     """FP8/BF16/MXFP4 decode shares input, reference, planning and replay checks.
 
     A case with ``invalid_input`` is an input the wrapper must refuse before any
@@ -1702,6 +2126,9 @@ def test_pa_decode(case, device, monkeypatch):
             "ref_mean_min": None,
             "variants": False,
             "cluster": None,
+            "cluster_seqs": None,
+            "cluster_steps": None,
+            "cluster_runs": None,
         },
         **case,
     )
@@ -1999,6 +2426,9 @@ def test_pa_decode(case, device, monkeypatch):
             graph.replay()
             check()
 
+    # Reuse the validated inputs after restoring the test compilation spy.
+    return case, launch, check, arguments, options, plan
+
 
 def _poison_unowned(cache, scale, owned, fill):
     """Overwrite K/V rows no sequence owns (and their per-token scales)."""
@@ -2150,3 +2580,124 @@ def test_pa_decode_unowned_kv_rows(
     assert torch.equal(poisoned, clean)
     if fill == "nan":
         assert torch.equal(run("zero", mask_unowned_kv=False), clean)
+
+
+@pytest.mark.parametrize("block_size", [16, 128])
+@pytest.mark.parametrize(
+    "case",
+    [
+        # Q = K = 0: uniform weights; the halves' V scales differ by 1e40. A
+        # shared accumulator scale from the first half overflows to inf.
+        pytest.param(((1.0, 1.0), (0.0, 0.0), (1e-8, 1e32)), id="v-scale-range"),
+        # The second half's logits dominate by 14 while only the first half has
+        # V mass: P must keep the first half's own maximum through FP8
+        # quantization, or its ~4e-4 probabilities round to zero.
+        pytest.param(((224.0, 0.0), (0.0, 14.0), (100.0, 1.0)), id="p-underflow"),
+        # The second half dominates the softmax but has the far smaller V
+        # scale: the accumulator must follow its weighted factor, or its
+        # 1e-48 ratio to the first half's factor rounds to zero.
+        pytest.param(((1.0, 1.0), (0.0, 128.0), (1e32, 1e-16)), id="weighted-factor"),
+    ],
+)
+def test_pa_decode_two_page_steps_keep_page_scales(block_size, case, device):
+    """gfx1250 FP8 steps that span two one-page steps stay page-local.
+
+    One step covers two page128 pages (256 tokens) or 128 tokens of page16
+    pages; each half of it gets one value, logit and per-token V scale.
+    """
+    if get_gfx_runtime() != "gfx1250":
+        pytest.skip("two-page FP8 softmax steps run on gfx1250")
+    pa = importlib.import_module("aiter.ops.flydsl.pa_decode")
+    values, logits, value_scales = case
+    heads, dim, x = 16, 128, 16
+    length = 256 if block_size == 128 else 128
+    pages = length // block_size
+    half = pages // 2
+    fp8 = torch.float8_e4m3fn
+    query = torch.zeros(1, heads, dim, dtype=torch.bfloat16, device=device)
+    query[..., 0] = 1.0
+    key = torch.zeros(pages, 1, dim, block_size, device=device)
+    value = torch.zeros(pages, 1, block_size, dim, device=device)
+    key_scale = torch.ones(pages, 1, block_size, 1, device=device)
+    value_scale = torch.ones(pages, 1, block_size, 1, device=device)
+    for page in range(pages):
+        h = page // half
+        if logits[h]:
+            # q . k * dim**-0.5 = logit, with K at the FP8 maximum.
+            key[page, 0, 0] = 448.0
+            key_scale[page] = logits[h] / dim**-0.5 / 448.0
+        value[page] = values[h]
+        value_scale[page] = value_scales[h]
+    key_cache = (
+        key.reshape(pages, 1, dim // x, x, block_size)
+        .permute(0, 1, 2, 4, 3)
+        .contiguous()
+        .to(fp8)
+    )
+    value_cache = (
+        value.reshape(pages, 1, block_size // x, x, dim)
+        .permute(0, 1, 2, 4, 3)
+        .contiguous()
+        .to(fp8)
+    )
+    logical_key = (
+        key_cache.float().permute(0, 1, 3, 2, 4).reshape(-1, dim)
+        * key_scale.reshape(-1, 1)
+    ).double()
+    logical_value = (
+        value_cache.float().permute(0, 1, 2, 4, 3).reshape(-1, dim)
+        * value_scale.reshape(-1, 1)
+    ).double()
+    reference = (
+        torch.softmax(query[0].double() @ logical_key.T * dim**-0.5, -1) @ logical_value
+    )
+    table = torch.arange(pages, dtype=torch.int32, device=device)[None]
+    context = torch.tensor([length], dtype=torch.int32, device=device)
+    plan = pa.plan_pa_decode(context, 1, max_partitions=1)
+    output = torch.full_like(query, float("nan"))
+    pa.pa_decode(
+        output,
+        query,
+        key_cache,
+        value_cache,
+        context,
+        table,
+        dim**-0.5,
+        1,
+        compute_type=fp8,
+        key_scale=key_scale,
+        value_scale=value_scale,
+        work_plan=plan,
+        max_context_length=length,
+    )
+    output = output[0].double()
+    assert torch.isfinite(output).all()
+    torch.testing.assert_close(
+        output, reference, rtol=0.02, atol=0.02 * reference.abs().max().item()
+    )
+
+
+def test_pa_decode_tile_without_context_bound(device):
+    """Kernel selection takes the documented max_context_length=None default.
+
+    32 sequences over a 384-slot plan put the grid between one and two CTAs
+    per CU, where the gfx1250 step-width heuristic reads the bound.
+    """
+    if get_gfx_runtime() != "gfx1250":
+        pytest.skip("the step-width heuristic runs on gfx1250")
+    pa = importlib.import_module("aiter.ops.flydsl.pa_decode")
+    compiled = pa.compile_pa_decode_tile(
+        architecture="gfx1250",
+        head_dim=128,
+        query_group_size=16,
+        block_size=128,
+        num_seqs=32,
+        num_kv_heads=1,
+        num_compute_units=256,
+        work_capacity=384,
+        num_partitions=12,
+        query_dtype="bf16",
+        kv_dtype="fp8",
+        per_token_kv=True,
+    )
+    assert "launch" in compiled
