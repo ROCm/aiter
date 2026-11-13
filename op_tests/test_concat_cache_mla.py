@@ -7,6 +7,7 @@ import torch
 
 import aiter
 from aiter import dtypes
+from aiter.jit.utils.chip_info import get_gfx
 from aiter.test_common import benchmark, checkAllclose, perftest, run_perftest
 
 # torch.set_printoptions(threshold=torch.inf)
@@ -318,6 +319,88 @@ def make_q_nope(
     raise ValueError(f"Unsupported q_nope_layout: {q_nope_layout}")
 
 
+def check_fused_rope_fp8_saturates(
+    device: str,
+    kv_lora_rank: int,
+    is_neox: bool,
+    tokens: int = 4,
+    heads: int = 16,
+    kv_heads: int | None = None,
+    dtype: torch.dtype = dtypes.bf16,
+):
+    """FP8 q_out and KV cache clamp to the fp8 range in the rope part as in the
+    nope part; a bare cast turned rope values past it into NaN. The shape picks
+    the kernel (see FUSED_ROPE_FP8_SATURATE_CASES); kv_heads=None passes 2-D
+    kv_c/k_pe (decode), an int passes [tokens, kv_heads, ...] (prefill/GQA)."""
+    fp8_max = torch.finfo(dtypes.fp8).max
+    kv_shape = (tokens,) if kv_heads is None else (tokens, kv_heads)
+    q_nope = torch.randn(tokens, heads, kv_lora_rank, dtype=dtype, device=device)
+    q_pe = torch.randn(tokens, heads, 64, dtype=dtype, device=device)
+    kv_c = torch.randn(*kv_shape, kv_lora_rank, dtype=dtype, device=device)
+    k_pe = torch.randn(*kv_shape, 64, dtype=dtype, device=device)
+    for t in (q_nope, q_pe, kv_c, k_pe):
+        # Both ends of the row, so the rope part's x and y lanes both saturate
+        # in the neox (halves) and GPT-J (interleaved) layouts.
+        for cols, sign in ((slice(0, 2), 1), (slice(2, 4), -1), (slice(-4, -2), 1)):
+            t.view(-1, t.shape[-1])[:, cols] = sign * 4 * fp8_max
+        t.view(-1, t.shape[-1])[:, -2:] = -4 * fp8_max
+    kv_cache = torch.zeros(
+        tokens, 1, kv_heads or 1, kv_lora_rank + 64, dtype=dtypes.fp8, device=device
+    )
+    if kv_heads is None:
+        kv_cache = kv_cache.view(tokens, 1, kv_lora_rank + 64)
+    q_out = torch.empty(
+        tokens, heads, kv_lora_rank + 64, dtype=dtypes.fp8, device=device
+    )
+    one = torch.ones(1, dtype=torch.float32, device=device)
+    # One identity rope row: rope leaves the values as they are.
+    cos = torch.ones(1, 32, dtype=dtype, device=device)
+    sin = torch.zeros(1, 32, dtype=dtype, device=device)
+    aiter.fused_qk_rope_concat_and_cache_mla(
+        q_nope,
+        q_pe,
+        kv_c,
+        k_pe,
+        kv_cache,
+        q_out,
+        torch.arange(tokens, dtype=torch.long, device=device),
+        one,
+        one,
+        torch.zeros(tokens, dtype=torch.long, device=device),
+        cos,
+        sin,
+        is_neox,
+        True,
+    )
+    torch.cuda.synchronize()
+    expect_q = torch.cat((q_nope, q_pe), -1).float().clamp(-fp8_max, fp8_max)
+    expect_k = torch.cat((kv_c, k_pe), -1).float().clamp(-fp8_max, fp8_max)
+    torch.testing.assert_close(q_out.float(), expect_q.to(dtypes.fp8).float())
+    torch.testing.assert_close(
+        kv_cache.view(expect_k.shape).float(), expect_k.to(dtypes.fp8).float()
+    )
+
+
+# Arches with a packed fp8 convert in fp32_to_fp8_scaled_x2 (aiter_opus_plus.h);
+# elsewhere (RDNA3/3.5) it is a compile-only stub that returns zeros.
+FP8_CVT_GFX = ("gfx942", "gfx950", "gfx1200", "gfx1201", "gfx1250")
+
+# (kv_lora_rank, tokens, heads, kv_heads, dtype) -> the kernel the host dispatch
+# in fused_qk_rope_concat_and_cache_mla picks for it.
+FUSED_ROPE_FP8_SATURATE_CASES = {
+    "head-grouped (HPT)": (512, 4, 16, None, dtypes.bf16),
+    "per-head decode, rank 256": (256, 4, 16, None, dtypes.bf16),
+    "per-head decode, rank 128": (128, 4, 16, None, dtypes.bf16),
+    # FP32 input rules out HPT and 256 tokens the per-head kernel, so this is
+    # the optimized decode kernel, whose K rope goes through
+    # apply_token_rotary_embedding.
+    "optimized decode": (512, 256, 8, None, torch.float32),
+    "general decode": (256, 256, 16, None, dtypes.bf16),
+    "optimized prefill": (512, 4, 16, 2, dtypes.bf16),
+    "general prefill": (256, 4, 16, 2, dtypes.bf16),
+}
+
+
 @benchmark()
 def test_fused_rope_concat_and_cache_mla(
     kv_lora_rank: int,
@@ -619,278 +702,305 @@ def test_fused_rope_concat_and_cache_mla(
     return ret
 
 
-parser = argparse.ArgumentParser(
-    formatter_class=argparse.RawTextHelpFormatter,
-    description="config input of test",
-)
-parser.add_argument(
-    "-k",
-    "--kv_lora_rank",
-    type=int,
-    default=512,
-    help="""kv lora rank.
-    e.g.: -k 512""",
-)
-parser.add_argument(
-    "-qr",
-    "--qk_rope_head_dim",
-    type=int,
-    default=64,
-    help="""qk rope head dim.
-    e.g.: -qr 64""",
-)
+def main():
+    parser = argparse.ArgumentParser(
+        formatter_class=argparse.RawTextHelpFormatter,
+        description="config input of test",
+    )
+    parser.add_argument(
+        "-k",
+        "--kv_lora_rank",
+        type=int,
+        default=512,
+        help="""kv lora rank.
+        e.g.: -k 512""",
+    )
+    parser.add_argument(
+        "-qr",
+        "--qk_rope_head_dim",
+        type=int,
+        default=64,
+        help="""qk rope head dim.
+        e.g.: -qr 64""",
+    )
 
-parser.add_argument(
-    "-blk",
-    "--block_size",
-    type=int,
-    default=1,
-    help="""Block size.
-    e.g.: -blk 1""",
-)
-parser.add_argument(
-    "-d",
-    "--dtype",
-    type=dtypes.str2Dtype,
-    choices=[dtypes.d_dtypes["bf16"]],
-    default="bf16",
-    metavar="{bf16}",
-    help="""Data type of input.
-    e.g.: -d bf16""",
-)
-parser.add_argument(
-    "-kvd",
-    "--kv_dtype",
-    type=str,
-    choices=["auto", "fp8"],
-    nargs="*",
-    default=["auto", "fp8"],
-    help="""Data type of KV cache.
-    e.g.: -kvd auto""",
-)
-parser.add_argument(
-    "-dev",
-    "--device",
-    type=str,
-    default="cuda",
-    help="""Device.
-    e.g.: -dev cuda""",
-)
-parser.add_argument(
-    "-t",
-    "--token",
-    type=int,
-    nargs="*",
-    default=[4, 128, 256, 512, 1024, 2048],  # , 4096 , 8192, 16384,
-    help="""token nums.
-    e.g.: -t 128""",
-)
-parser.add_argument(
-    "-hd",
-    "--head",
-    type=int,
-    nargs="*",
-    default=[2, 8],
-    help="""num heads.
-    e.g.: -hd 1""",
-)
-parser.add_argument(
-    "-nkh",
-    "--num_kv_heads",
-    type=int,
-    nargs="*",
-    default=[1, 2],
-    help="""num kv heads.
-    e.g.: -nkh 1""",
-)
-parser.add_argument(
-    "-qd",
-    "--q_dtype",
-    type=str,
-    choices=["auto", "fp8"],
-    nargs="*",
-    default=["auto", "fp8"],
-    help="""Data type of Q out.
-    e.g.: -qd auto""",
-)
-parser.add_argument(
-    "-n",
-    "--is_neox",
-    type=dtypes.str2bool,
-    nargs="*",
-    default=[True, False],
-    help="""true: GPT-NeoX style rotary embedding or false: GPT-J style rotary embedding.
-    e.g.: --is_neox false
-          or --is_neox true""",
-)
+    parser.add_argument(
+        "-blk",
+        "--block_size",
+        type=int,
+        default=1,
+        help="""Block size.
+        e.g.: -blk 1""",
+    )
+    parser.add_argument(
+        "-d",
+        "--dtype",
+        type=dtypes.str2Dtype,
+        choices=[dtypes.d_dtypes["bf16"]],
+        default="bf16",
+        metavar="{bf16}",
+        help="""Data type of input.
+        e.g.: -d bf16""",
+    )
+    parser.add_argument(
+        "-kvd",
+        "--kv_dtype",
+        type=str,
+        choices=["auto", "fp8"],
+        nargs="*",
+        default=["auto", "fp8"],
+        help="""Data type of KV cache.
+        e.g.: -kvd auto""",
+    )
+    parser.add_argument(
+        "-dev",
+        "--device",
+        type=str,
+        default="cuda",
+        help="""Device.
+        e.g.: -dev cuda""",
+    )
+    parser.add_argument(
+        "-t",
+        "--token",
+        type=int,
+        nargs="*",
+        default=[4, 128, 256, 512, 1024, 2048],  # , 4096 , 8192, 16384,
+        help="""token nums.
+        e.g.: -t 128""",
+    )
+    parser.add_argument(
+        "-hd",
+        "--head",
+        type=int,
+        nargs="*",
+        default=[2, 8],
+        help="""num heads.
+        e.g.: -hd 1""",
+    )
+    parser.add_argument(
+        "-nkh",
+        "--num_kv_heads",
+        type=int,
+        nargs="*",
+        default=[1, 2],
+        help="""num kv heads.
+        e.g.: -nkh 1""",
+    )
+    parser.add_argument(
+        "-qd",
+        "--q_dtype",
+        type=str,
+        choices=["auto", "fp8"],
+        nargs="*",
+        default=["auto", "fp8"],
+        help="""Data type of Q out.
+        e.g.: -qd auto""",
+    )
+    parser.add_argument(
+        "-n",
+        "--is_neox",
+        type=dtypes.str2bool,
+        nargs="*",
+        default=[True, False],
+        help="""true: GPT-NeoX style rotary embedding or false: GPT-J style rotary embedding.
+        e.g.: --is_neox false
+              or --is_neox true""",
+    )
 
-parser.add_argument(
-    "-ql",
-    "--q_nope_layout",
-    type=str,
-    choices=["contiguous", "strided"],
-    nargs="*",
-    default=["contiguous"],
-    help="""q_nope logical layout.
-    contiguous: standard [T, H, D] contiguous tensor
-    strided: [H, T, D].transpose(0, 1), same shape but non-contiguous by head
-    e.g.: -ql contiguous strided""",
-)
+    parser.add_argument(
+        "-ql",
+        "--q_nope_layout",
+        type=str,
+        choices=["contiguous", "strided"],
+        nargs="*",
+        default=["contiguous"],
+        help="""q_nope logical layout.
+        contiguous: standard [T, H, D] contiguous tensor
+        strided: [H, T, D].transpose(0, 1), same shape but non-contiguous by head
+        e.g.: -ql contiguous strided""",
+    )
 
-parser.add_argument(
-    "-vf",
-    "--valid_frac",
-    type=float,
-    nargs="*",
-    default=[1.0, 0.5],
-    help="""fraction of tokens with a valid slot (>=0); the tail is padded
-    (slot=-1) to simulate DCP/cudagraph padded tokens. Default covers full
-    (1.0) and half-padded (0.5) so the DCP slot=-1 path is exercised.
-    e.g.: -vf 1.0 0.5""",
-)
+    parser.add_argument(
+        "-vf",
+        "--valid_frac",
+        type=float,
+        nargs="*",
+        default=[1.0, 0.5],
+        help="""fraction of tokens with a valid slot (>=0); the tail is padded
+        (slot=-1) to simulate DCP/cudagraph padded tokens. Default covers full
+        (1.0) and half-padded (0.5) so the DCP slot=-1 path is exercised.
+        e.g.: -vf 1.0 0.5""",
+    )
 
-parser.add_argument(
-    "-caqr",
-    "--compute_all_q_rope",
-    type=dtypes.str2bool,
-    nargs="*",
-    default=[False, True],
-    help="""compute Q RoPE for all tokens incl. slot=-1 padded (DCP path).
-    False = non-DCP early-return on padded tokens; True = DCP (every rank
-    RoPEs all queries). Default covers both.
-    e.g.: -caqr false true""",
-)
+    parser.add_argument(
+        "-caqr",
+        "--compute_all_q_rope",
+        type=dtypes.str2bool,
+        nargs="*",
+        default=[False, True],
+        help="""compute Q RoPE for all tokens incl. slot=-1 padded (DCP path).
+        False = non-DCP early-return on padded tokens; True = DCP (every rank
+        RoPEs all queries). Default covers both.
+        e.g.: -caqr false true""",
+    )
 
-parser.add_argument(
-    "-nf",
-    "--is_nope_first",
-    type=dtypes.str2bool,
-    nargs="*",
-    default=[True, False],
-    help="""q_out / kv_cache entry layout: true = [nope | pe], false = [pe | nope].
-    e.g.: -nf true""",
-)
+    parser.add_argument(
+        "-nf",
+        "--is_nope_first",
+        type=dtypes.str2bool,
+        nargs="*",
+        default=[True, False],
+        help="""q_out / kv_cache entry layout: true = [nope | pe], false = [pe | nope].
+        e.g.: -nf true""",
+    )
 
-parser.add_argument(
-    "-mp",
-    "--max_position",
-    type=int,
-    nargs="*",
-    default=[0, 1],
-    help="""rows in the cos/sin cache. 0 means one row per token.
-    A shorter cache tests that positions past it are clamped.
-    e.g.: -mp 0 1""",
-)
+    parser.add_argument(
+        "-mp",
+        "--max_position",
+        type=int,
+        nargs="*",
+        default=[0, 1],
+        help="""rows in the cos/sin cache. 0 means one row per token.
+        A shorter cache tests that positions past it are clamped.
+        e.g.: -mp 0 1""",
+    )
 
-parser.add_argument(
-    "-c",
-    "--case",
-    type=str,
-    choices=["normal", "fused_qk"],
-    nargs="*",
-    default=["normal", "fused_qk"],
-    help="""tests concat and cache or fused_qk.
-    e.g.: -c normal""",
-)
+    parser.add_argument(
+        "-c",
+        "--case",
+        type=str,
+        choices=["normal", "fused_qk"],
+        nargs="*",
+        default=["normal", "fused_qk"],
+        help="""tests concat and cache or fused_qk.
+        e.g.: -c normal""",
+    )
 
-args = parser.parse_args()
+    args = parser.parse_args()
 
-if "normal" in args.case:
-    df = []
-    for num_token in args.token:
-        num_blocks = num_token // args.block_size
-        for kv_cache_dtype in args.kv_dtype:
-            ret = test_concat_and_cache_mla(
-                args.kv_lora_rank,
-                args.qk_rope_head_dim,
-                num_token,
-                args.block_size,
-                num_blocks,
-                args.dtype,
-                args.device,
-                kv_cache_dtype,
-            )
-            df.append(ret)
-    df = pd.DataFrame(df)
-    df_md = df.to_markdown(index=False)
-    aiter.logger.info("concat_and_cache_mla summary (markdown):\n%s", df_md)
+    if "normal" in args.case:
+        df = []
+        for num_token in args.token:
+            num_blocks = num_token // args.block_size
+            for kv_cache_dtype in args.kv_dtype:
+                ret = test_concat_and_cache_mla(
+                    args.kv_lora_rank,
+                    args.qk_rope_head_dim,
+                    num_token,
+                    args.block_size,
+                    num_blocks,
+                    args.dtype,
+                    args.device,
+                    kv_cache_dtype,
+                )
+                df.append(ret)
+        df = pd.DataFrame(df)
+        df_md = df.to_markdown(index=False)
+        aiter.logger.info("concat_and_cache_mla summary (markdown):\n%s", df_md)
 
-
-if "fused_qk" in args.case:
-    df = []
-    for num_token in args.token:
-        num_blocks = num_token // args.block_size
-        for num_heads in args.head:
-            for num_kv_heads in args.num_kv_heads:
-                for kv_cache_dtype in args.kv_dtype:
-                    for is_neox in args.is_neox:
-                        for q_dtype in args.q_dtype:
-                            for q_nope_layout in args.q_nope_layout:
-                                for (
-                                    valid_frac,
-                                    compute_all_q_rope,
-                                    is_nope_first,
-                                    max_position,
-                                ) in itertools.product(
-                                    args.valid_frac,
-                                    args.compute_all_q_rope,
-                                    args.is_nope_first,
-                                    args.max_position,
-                                ):
-                                    if q_dtype == "fp8" and kv_cache_dtype != "fp8":
-                                        continue
-                                    if num_kv_heads > num_heads:
-                                        continue
-                                    # compute_all_q_rope (DCP: RoPE all queries
-                                    # incl. padded slot=-1) is implemented in the
-                                    # MLA *decode* kernels (num_kv_heads==1): the
-                                    # head-grouped kernel (kv_lora_rank=512,
-                                    # rope 64) and the per-head/opt fallbacks. It
-                                    # is absent from the general decode kernel and
-                                    # the GQA prefill kernels (num_kv_heads>1).
-                                    # Constants mirror the host dispatch
-                                    # (MAX_TOKENS_PER_HEAD=256, MIN_SIZE_FOR_OPT
-                                    # =2048).
-                                    hits_flag_kernel = num_kv_heads == 1 and (
-                                        (
-                                            args.kv_lora_rank == 512
-                                            and args.qk_rope_head_dim == 64
-                                        )
-                                        or (num_token < 256 and is_nope_first)
-                                        or args.kv_lora_rank * num_heads >= 2048
-                                    )
-                                    if compute_all_q_rope and not hits_flag_kernel:
-                                        continue
-                                    # Pair padding with compute_all_q_rope: only
-                                    # run (full, non-DCP) and (padded, DCP
-                                    # compute-all). Skip the redundant
-                                    # (full, compute-all) and the
-                                    # uninteresting (padded, early-return).
-                                    if compute_all_q_rope != (valid_frac < 1.0):
-                                        continue
-                                    # Only the decode kernels clamp positions.
-                                    if max_position and num_kv_heads != 1:
-                                        continue
-                                    ret = test_fused_rope_concat_and_cache_mla(
-                                        args.kv_lora_rank,
-                                        args.qk_rope_head_dim,
-                                        num_token,
-                                        args.block_size,
-                                        num_blocks,
-                                        num_heads,
-                                        num_kv_heads,
-                                        args.dtype,
-                                        args.device,
-                                        kv_cache_dtype,
-                                        q_dtype,
-                                        is_neox,
-                                        q_nope_layout,
+    if "fused_qk" in args.case:
+        # The check writes fp8 to both q_out and the KV cache, so it needs both
+        # dtype filters to include fp8 and an arch that converts to fp8.
+        if (
+            "fp8" in args.kv_dtype
+            and "fp8" in args.q_dtype
+            and get_gfx() in FP8_CVT_GFX
+        ):
+            for case, (
+                rank,
+                tokens,
+                heads,
+                kv_heads,
+                dtype,
+            ) in FUSED_ROPE_FP8_SATURATE_CASES.items():
+                for is_neox in (True, False):
+                    try:
+                        check_fused_rope_fp8_saturates(
+                            args.device, rank, is_neox, tokens, heads, kv_heads, dtype
+                        )
+                    except AssertionError as e:
+                        raise AssertionError(f"{case}, {is_neox=}: {e}") from e
+        df = []
+        for num_token in args.token:
+            num_blocks = num_token // args.block_size
+            for num_heads in args.head:
+                for num_kv_heads in args.num_kv_heads:
+                    for kv_cache_dtype in args.kv_dtype:
+                        for is_neox in args.is_neox:
+                            for q_dtype in args.q_dtype:
+                                for q_nope_layout in args.q_nope_layout:
+                                    for (
                                         valid_frac,
                                         compute_all_q_rope,
                                         is_nope_first,
                                         max_position,
-                                    )
-                                    df.append(ret)
-    df = pd.DataFrame(df)
-    df_md = df.to_markdown(index=False)
-    aiter.logger.info("fused_rope_concat_and_cache_mla summary (markdown):\n%s", df_md)
+                                    ) in itertools.product(
+                                        args.valid_frac,
+                                        args.compute_all_q_rope,
+                                        args.is_nope_first,
+                                        args.max_position,
+                                    ):
+                                        if q_dtype == "fp8" and kv_cache_dtype != "fp8":
+                                            continue
+                                        if num_kv_heads > num_heads:
+                                            continue
+                                        # compute_all_q_rope (DCP: RoPE all queries
+                                        # incl. padded slot=-1) is implemented in the
+                                        # MLA *decode* kernels (num_kv_heads==1): the
+                                        # head-grouped kernel (kv_lora_rank=512,
+                                        # rope 64) and the per-head/opt fallbacks. It
+                                        # is absent from the general decode kernel and
+                                        # the GQA prefill kernels (num_kv_heads>1).
+                                        # Constants mirror the host dispatch
+                                        # (MAX_TOKENS_PER_HEAD=256, MIN_SIZE_FOR_OPT
+                                        # =2048).
+                                        hits_flag_kernel = num_kv_heads == 1 and (
+                                            (
+                                                args.kv_lora_rank == 512
+                                                and args.qk_rope_head_dim == 64
+                                            )
+                                            or (num_token < 256 and is_nope_first)
+                                            or args.kv_lora_rank * num_heads >= 2048
+                                        )
+                                        if compute_all_q_rope and not hits_flag_kernel:
+                                            continue
+                                        # Pair padding with compute_all_q_rope: only
+                                        # run (full, non-DCP) and (padded, DCP
+                                        # compute-all). Skip the redundant
+                                        # (full, compute-all) and the
+                                        # uninteresting (padded, early-return).
+                                        if compute_all_q_rope != (valid_frac < 1.0):
+                                            continue
+                                        # Only the decode kernels clamp positions.
+                                        if max_position and num_kv_heads != 1:
+                                            continue
+                                        ret = test_fused_rope_concat_and_cache_mla(
+                                            args.kv_lora_rank,
+                                            args.qk_rope_head_dim,
+                                            num_token,
+                                            args.block_size,
+                                            num_blocks,
+                                            num_heads,
+                                            num_kv_heads,
+                                            args.dtype,
+                                            args.device,
+                                            kv_cache_dtype,
+                                            q_dtype,
+                                            is_neox,
+                                            q_nope_layout,
+                                            valid_frac,
+                                            compute_all_q_rope,
+                                            is_nope_first,
+                                            max_position,
+                                        )
+                                        df.append(ret)
+        df = pd.DataFrame(df)
+        df_md = df.to_markdown(index=False)
+        aiter.logger.info(
+            "fused_rope_concat_and_cache_mla summary (markdown):\n%s", df_md
+        )
+
+
+if __name__ == "__main__":
+    main()
