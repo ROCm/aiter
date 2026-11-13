@@ -341,7 +341,13 @@ def gemm2_body_v2(
     e_in=None,
     prune=False,
     b_lds=False,
+    sbm80=False,
+    b_nt=False,
+    sorted_rows=False,
+    native_c=False,
 ):
+    # sbm80: 80-row sort blocks (BLK=80, BM=80); odd blocks start at the second
+    # 16-row half of a 32-row A-scale chunk, so the A-scale words are realigned.
     # EP32 fork: BM is the number of computed rows (16, 64 or 80), starting at
     # m_row_in inside the BLK-row sort layout. BM=80 covers a full block plus the
     # first 16 rows of the next (a <=16-row tail of the same expert); BM=16 is a
@@ -526,6 +532,10 @@ def gemm2_body_v2(
 
     asc_per_mb = fx.Int32(max(1, BLK // 32)) * kAS_per_chunk_dw * fx.Int32(4)
     asc_num = fx.Int64(i32_max_m_blocks) * fx.Int64(asc_per_mb)
+    if const_expr(sbm80):
+        asc_num = fx.Int64(
+            (i32_max_m_blocks * fx.Int32(80) + fx.Int32(31)) // fx.Int32(32)
+        ) * fx.Int64(kAS_per_chunk_dw * fx.Int32(4))
     scale_chunk0 = (
         m_block_idx if const_expr(is_bm16 and SBM == BM) else m_row // fx.Int32(32)
     )
@@ -551,7 +561,19 @@ def gemm2_body_v2(
             else _udiv(kt, fx.Int32(tilesPerScaleChunk))
         )
 
-    def load_a_scale_tile(kt):
+    def realign_a_scale(out):
+        # v[s] = (w[s].b1, w[s+1].b0, w[s].b3, w[s+1].b2) for odd blocks.
+        odd = ((m_row >> fx.Int32(4)) & fx.Int32(1)) == fx.Int32(1)
+        res = []
+        for s_i in range_constexpr(len(out)):
+            nxt = out[s_i + 1] if s_i + 1 < len(out) else out[s_i]
+            v = (out[s_i].shrui(fx.Int32(8)) & fx.Int32(0x00FF00FF)) | (
+                (nxt << fx.Int32(8)) & fx.Int32(-16711936)
+            )
+            res.append(odd.select(v, out[s_i]))
+        return res
+
+    def load_a_scale_tile(kt, realign=True):
         chunk_kt = scale_chunk_tile(kt)
         out = []
         for sub in range_constexpr(kScaleSubBlocks):
@@ -566,6 +588,8 @@ def gemm2_body_v2(
                 scale_shift = ((m_row // 16) & fx.Int32(1)) * fx.Int32(8)
                 scale = scale.shrui(scale_shift) & fx.Int32(0x00FF00FF)
             out.append(scale)
+        if const_expr(sbm80 and realign):
+            out = realign_a_scale(out)
         return out
 
     # B-weight + B-scale: global->register, streamed per K-tile (not LDS-staged).
@@ -735,41 +759,58 @@ def gemm2_body_v2(
             c_frags[i][J].store(zero4)
 
     def _epilog(accm, **kw):
-        atomic_bf16_epilog(
-            lds_acc_base,
-            accm,
-            arg_out,
-            arg_stids,
-            arg_sweights,
-            arg_bias,
-            e,
-            m_row,
-            n_block_idx,
-            wave,
-            lane,
-            i32_M,
-            BM,
-            N_OUT_rt,
-            BN=BN,
-            use_reduce=use_reduce,
-            topk=topk,
-            SBM=SBM,
-            g2_bf16_lds=g2_bf16_lds,
-            route_out_fp8=route_out_fp8,
-            g2_defer_weight=g2_defer_weight,
-            g2_out_pitch_align=g2_out_pitch_align,
-            g2_scale_blk=g2_scale_blk,
-            g2_epi_lanes=g2_epi_lanes,
-            enable_bias=enable_bias,
-            output_n_base=output_n_base,
-            output_width=output_width,
-            reduce_store_cache_modifier=reduce_store_cache_modifier,
-            write_limit=write_limit,
-            row_limit=row_limit,
-            opaque_tid=b_lds,
-            **kw,
-        )
-
+        if const_expr(native_c):
+            # Store each native MFMA fragment contiguously: no C LDS transpose,
+            # token gather, route-weight multiply or BF16 conversion in GEMM2.
+            out_ptr = global_typed_ptr(arg_out, T.f32, align=16)
+            out_view = fx.Tensor(fx.make_view(out_ptr, fx.make_layout((1, 1), (1, 1))))
+            out_buf = fx.rocdl.make_buffer_tensor(out_view, max_size=True)
+            store = fx.make_copy_atom(fx.rocdl.BufferCopy128b(), Float32)
+            n16 = _udiv(N_OUT_rt, fx.Int32(16))
+            for i in range_constexpr(kMChunks):
+                mc = _udiv(m_row, fx.Int32(16)) + fx.Int32(i)
+                for J in range_constexpr(numAccN):
+                    nc = n_block_idx * fx.Int32(BN // 16) + wave * fx.Int32(BN // 64) + fx.Int32(J)
+                    offset = (mc * n16 + nc) * fx.Int32(256) + lane * fx.Int32(4)
+                    frag = fx.make_rmem_tensor(4, Float32)
+                    frag.store(Vec(accm[i][J]))
+                    fx.copy(store, frag, out_buf[None, offset])
+        else:
+            atomic_bf16_epilog(
+                lds_acc_base,
+                accm,
+                arg_out,
+                arg_stids,
+                arg_sweights,
+                arg_bias,
+                e,
+                m_row,
+                n_block_idx,
+                wave,
+                lane,
+                i32_M,
+                BM,
+                N_OUT_rt,
+                BN=BN,
+                use_reduce=use_reduce,
+                topk=topk,
+                SBM=SBM,
+                g2_bf16_lds=g2_bf16_lds,
+                route_out_fp8=route_out_fp8,
+                g2_defer_weight=g2_defer_weight,
+                g2_out_pitch_align=g2_out_pitch_align,
+                g2_scale_blk=g2_scale_blk,
+                g2_epi_lanes=g2_epi_lanes,
+                enable_bias=enable_bias,
+                output_n_base=output_n_base,
+                output_width=output_width,
+                reduce_store_cache_modifier=reduce_store_cache_modifier,
+                write_limit=write_limit,
+                row_limit=row_limit,
+                opaque_tid=b_lds,
+                sorted_rows=sorted_rows,
+                **kw,
+            )
     def load_epilog_ids():
         EPI_LANES = _G2_EPI_LANES if g2_epi_lanes is None else int(g2_epi_lanes)
         EPI_ROWS = 256 // EPI_LANES
@@ -787,7 +828,7 @@ def gemm2_body_v2(
             packed.append(frag.load()[0])
         return packed
 
-    g2_interleave = const_expr(g2_bf16_lds and not nonatomic and output_width is None)
+    g2_interleave = const_expr(g2_bf16_lds and not nonatomic and output_width is None and not native_c)
     g2_prefetch_ids = const_expr(
         g2_prefetch_ids
         and g2_interleave
@@ -921,7 +962,7 @@ def gemm2_body_v2(
                 voff = lane16 + fx.Int32(J * 16) * KB_B + fx.Int32(t * 1024)
                 rocdl.raw_ptr_buffer_load_lds(
                     b_rsrc, _lds_ptr3(s_aq_base, off), fx.Int32(16), voff,
-                    fx.Int32(0), fx.Int32(0), fx.Int32(0),
+                    fx.Int32(0), fx.Int32(0), 2 if b_nt else 0,
                     alias_scopes=b_scopes[slot][0], noalias_scopes=b_scopes[slot][1],
                 )
 
@@ -942,7 +983,8 @@ def gemm2_body_v2(
                 if const_expr(t % 2 == 0):
                     c = t // 2
                     issue_bscale_into(bsf_slots[c % 2], scale_chunk_tile(fx.Int32(t)))
-                    sa = load_a_scale_tile(fx.Int32(t))
+                    # Raw words: realigning here would wait for this step's DMAs.
+                    sa = load_a_scale_tile(fx.Int32(t), realign=False)
                     for sub in range_constexpr(kScaleSubBlocks):
                         saf_slots[c % 2][sub].store(Vec.from_elements([sa[sub]], Int32))
 
@@ -963,6 +1005,8 @@ def gemm2_body_v2(
             rocdl.sched_barrier(0)
             c = kt // 2
             sa = [Vec(saf_slots[c % 2][sub].load())[0] for sub in range_constexpr(kScaleSubBlocks)]
+            if const_expr(sbm80):
+                sa = realign_a_scale(sa)
             interleave = None
             if const_expr(kt == KT - 1):
                 rocdl.s_waitcnt(vmcnt=0, lgkmcnt=0)
@@ -1126,6 +1170,7 @@ def atomic_bf16_epilog(
     write_limit=None,
     row_limit=None,
     opaque_tid=False,
+    sorted_rows=False,
 ):
     if SBM is None:
         SBM = BM
@@ -1293,7 +1338,10 @@ def atomic_bf16_epilog(
     def store_one_mr(mr):
         row_in_block = fx.Int32(mr * EPI_ROWS) + m_lane
         token_id = packed[mr] & fx.Int32(0x00FFFFFF)
-        if const_expr(use_reduce):
+        if const_expr(sorted_rows):
+            out_row = fx.Int64(m_row + fx.Int32(mr * EPI_ROWS) + m_lane)
+            row_base_addr = out_row * fx.Int64(N_OUT) + fx.Int64(n_block_idx * BN + col_start)
+        elif const_expr(use_reduce):
             # reduce out_row can reach tokens*topk (large-M) so compute the element base in i64 (atomic i32 path byte-identical).
             out_row = fx.Int64(token_id * fx.Int32(topk) + (packed[mr] >> fx.Int32(24)))
             if const_expr(route_out_fp8):
@@ -1725,10 +1773,16 @@ def compile_gemm2_ep32(
     GRID_WGS=512,
     SPART=404,
     PRUNE=False,
+    BM=64,
+    B_NT=False,
+    REDUCE=False,
+    NATIVE_C=False,
 ):
     from .mxmoe_dispatcher import _spart_output_tile_index
 
-    BLK, BN, BK = 64, 256, 128
+    if BM not in (64, 80):
+        raise ValueError(f"EP32 GEMM2 supports BM64 or BM80, got {BM}")
+    BLK, BN, BK = BM, 256, 128
     a_dtype, b_dtype = "fp8", "fp4"
     KH_TILE_A = BK
     ROWS = 80  # every tile runs the 80-row body (see header)
@@ -1738,7 +1792,7 @@ def compile_gemm2_ep32(
     WAVES_PER_EU = 2
     name = (
         f"gemm2_ep32_a8w4_hmax{HIDDEN_MAX}_imax{INTER_MAX}_g{GRID_WGS}{f'_sp{SPART}' if SPART else ''}{'_pr' if PRUNE else ''}"
-        f"{'_nt' if use_nt else ''}{'_valid_tokens' if use_valid_token_count else ''}{'_blds2' if use_b_lds else ''}"
+        f"{'_nt' if use_nt else ''}{'_valid_tokens' if use_valid_token_count else ''}{'_blds2' if use_b_lds else ''}{'_bm80' if BM == 80 else ''}{'_bnt' if B_NT else ''}{'_nativef32' if NATIVE_C else ('_store128' if REDUCE else '')}"
     )
 
     @fx.struct
@@ -1815,7 +1869,7 @@ def compile_gemm2_ep32(
             a_slot_alias=False,
             a_dtype=a_dtype,
             b_dtype=b_dtype,
-            use_reduce=False,
+            use_reduce=REDUCE,
             topk=topk,
             SBM=BLK,
             g2_bhoist=True,
@@ -1840,6 +1894,11 @@ def compile_gemm2_ep32(
             e_in=e_cur,
             prune=PRUNE,
             b_lds=use_b_lds,
+            sbm80=BM == 80,
+            b_nt=B_NT,
+            sorted_rows=REDUCE,
+            native_c=NATIVE_C,
+            reduce_store_cache_modifier=0 if REDUCE else None,
         )
 
     @flyc.kernel(name=name, known_block_size=[256, 1, 1])
@@ -1988,6 +2047,78 @@ def compile_gemm2_ep32(
                     (mode == fx.Int32(2)).select(fx.Int32(80), fx.Int32(64)),
                 )
 
+    @flyc.kernel(name=name, known_block_size=[256, 1, 1])
+    def gemm2_kernel80(
+        arg_aq: fx.Int64,
+        arg_ascale: fx.Int64,
+        arg_bq: fx.Int64,
+        arg_bscale: fx.Int64,
+        arg_eids: fx.Int64,
+        arg_cumsum: fx.Int64,
+        arg_stids: fx.Int64,
+        arg_sweights: fx.Int64,
+        arg_bias: fx.Int64,
+        i32_M: fx.Int32,
+        i32_max_m_blocks: fx.Int32,
+        i32_inter: fx.Int32,
+        i32_hidden: fx.Int32,
+        arg_out: fx.Int64,
+        arg_out_scale: fx.Int64,
+        i32_grid_blocks: fx.Int32,
+    ):
+        # 80-row sort blocks: every block is one 80-row tile.
+        tx_i32 = fx.thread_idx.x
+        bx_i32 = fx.block_idx.x
+        lane = tx_i32 % 64
+        wave = rocdl.readfirstlane(T.i32, tx_i32 // 64)
+        lds = fx.SharedAllocator().allocate(SharedStorage).peek()
+        lds_base_i32 = fx.Int32(fx.ptrtoint(lds.buf.ptr))
+        num_n_blocks = _udiv(i32_hidden, BN)
+        cumsum = global_typed_ptr(arg_cumsum, T.i32)
+        n_units = _udiv(cumsum[0], BLK)
+        valid_tokens = cumsum[1]
+        write_limit = i32_M
+        if const_expr(use_valid_token_count):
+            write_limit = (valid_tokens < i32_M).select(valid_tokens, i32_M)
+        eids = global_typed_ptr(arg_eids, T.i32)
+        bound = n_units * num_n_blocks
+        for iv in range(bx_i32, bound, gpu.grid_dim.x):
+            gpu.barrier()  # LDS of the previous tile's epilogue
+            pid = fx.Int32(iv)
+            if const_expr(SPART > 0):
+                m_blk, n_blk = _spart_output_tile_index(
+                    pid, n_units, num_n_blocks, SPART // 100, SPART % 100
+                )
+            else:
+                m_blk = pid // num_n_blocks
+                n_blk = pid - m_blk * num_n_blocks
+            m_blk = fx.Int32(rocdl.readfirstlane(T.i32, _raw(m_blk)))
+            e_cur = fx.Int32(rocdl.readfirstlane(T.i32, _raw(eids[m_blk])))
+            _run_rows(
+                arg_aq,
+                arg_ascale,
+                arg_bq,
+                arg_bscale,
+                arg_eids,
+                arg_stids,
+                arg_sweights,
+                arg_bias,
+                arg_out,
+                m_blk * fx.Int32(BLK),
+                n_blk,
+                m_blk,
+                lane,
+                wave,
+                i32_M,
+                i32_max_m_blocks,
+                i32_inter,
+                i32_hidden,
+                lds_base_i32,
+                write_limit,
+                e_cur,
+                fx.Int32(BLK),
+            )
+
     @flyc.jit
     def launch_gemm2(
         arg_aq: fx.Int64,
@@ -2010,7 +2141,7 @@ def compile_gemm2_ep32(
     ):
         num_n_blocks = fx.Int32(fx.Uint32(i32_hidden) // fx.Uint32(BN))
         grid_x = fx.Int32(GRID_WGS)
-        gemm2_kernel(
+        (gemm2_kernel80 if const_expr(BM == 80) else gemm2_kernel)(
             arg_aq,
             arg_ascale,
             arg_bq,

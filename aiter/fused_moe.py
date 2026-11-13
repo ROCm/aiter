@@ -3539,6 +3539,14 @@ def _flydsl_v2_stage2_wrapper(
             f"block_m={int(block_m)}, but the kernel expects sort_block_m={sbm}."
         )
     epilog = cfg["epilog"]
+    ep32_native = (
+        cfg.get("ep32", False) and bm == 80
+        and out.shape[1] == 3584 and inter_dim == 3072 and not cfg["use_nt"]
+        and os.environ.get("G2_OUTPUT_NATIVE", "1") == "1"
+    )
+    ep32_sorted_reduce = ep32_native or (cfg.get("ep32", False) and bm == 80 and os.environ.get("G2_OUTPUT_REDUCE", "0") == "1")
+    if ep32_sorted_reduce:
+        epilog = "reduce"
     max_sorted = inter_states.shape[0]
 
     token_num = out.shape[0]
@@ -3551,7 +3559,7 @@ def _flydsl_v2_stage2_wrapper(
             f"(model_dim={model_dim_runtime}, topk={topk})"
         )
     target = out
-    _s2_fp8_inter = epilog == "reduce" and _flydsl_stage2_fp8_enabled()
+    _s2_fp8_inter = epilog == "reduce" and not ep32_sorted_reduce and _flydsl_stage2_fp8_enabled()
     if _s2_fp8_inter:
         _s2_fp8_inter = sorted_weights is not None and topk_weights is not None
     _defer_w = _s2_fp8_inter
@@ -3580,6 +3588,12 @@ def _flydsl_v2_stage2_wrapper(
             target = _stage2_scratch(
                 "target", (max_sorted, model_dim_runtime), out.dtype, out.device
             )
+    elif ep32_sorted_reduce:
+        if reverse_sorted is None or expert_mask is None or topk_ids is None:
+            raise ValueError("BM80 sorted reduction requires EP reverse routes")
+        target = _stage2_scratch(
+            "target", (max_sorted, model_dim_runtime), torch.float32 if ep32_native else out.dtype, out.device
+        )
     elif epilog == "reduce":
         if _s2_fp8_inter:
             from aiter.ops.flydsl.kernels.mxfp4_gemm_common import (
@@ -3676,6 +3690,26 @@ def _flydsl_v2_stage2_wrapper(
             TOPK=topk,
             D_HIDDEN=model_dim_runtime,
             MB=bm,
+        )
+        return out
+    if ep32_sorted_reduce:
+        if ep32_native:
+            from aiter.ops.flydsl.mxmoe_native_reduce import ep32_native_reduce
+            ep32_native_reduce(target, reverse_sorted, sorted_weights, expert_mask,
+                topk_ids, num_valid_ids, out)
+            return out
+        # Remote routes were not written. Mask their reverse indices before
+        # the existing gather/reduce, avoiding a clear of the staging buffer.
+        ids = topk_ids.long()
+        local = expert_mask[ids.clamp(0, expert_mask.numel() - 1)] != 0
+        local = local & (ids >= 0) & (ids < expert_mask.numel())
+        local = local & (torch.arange(token_num, device=out.device)[:, None] < num_valid_ids[1])
+        reverse = torch.where(local.reshape(-1), reverse_sorted, -1)
+        # GEMM2 already applied the route weight before BF16 rounding.
+        aiter.mxfp4_moe_scatter_reduce(
+            flat_out=target, reverse_sorted=reverse,
+            sorted_weights=torch.ones_like(sorted_weights), out=out,
+            NE=num_experts, TOPK=topk, D_HIDDEN=model_dim_runtime, MB=bm,
         )
         return out
     if epilog == "reduce":

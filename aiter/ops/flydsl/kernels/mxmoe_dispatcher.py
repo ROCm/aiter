@@ -791,8 +791,15 @@ def get_g2(
 
 
 @functools.cache
-def get_g2_ep32(use_nt, HIDDEN_MAX, INTER_MAX, use_valid_token_count, grid_wgs):
-    from .mxmoe_gemm2_ep32 import compile_gemm2_ep32
+def get_g2_ep32(use_nt, HIDDEN_MAX, INTER_MAX, use_valid_token_count, grid_wgs, BM=64, B_NT=False, variant="base", REDUCE=False, topk=1, NATIVE_C=False):
+    if variant == "bn448":
+        from .mxmoe_gemm2_ep32_bm80bn448 import compile_gemm2_ep32
+    elif variant == "bn512":
+        from .mxmoe_gemm2_ep32_bm80bn512 import compile_gemm2_ep32
+    elif variant == "var384":
+        from .mxmoe_gemm2_ep32_bm80var import compile_gemm2_ep32
+    else:
+        from .mxmoe_gemm2_ep32 import compile_gemm2_ep32
 
     return compile_gemm2_ep32(
         use_nt=bool(use_nt),
@@ -800,6 +807,11 @@ def get_g2_ep32(use_nt, HIDDEN_MAX, INTER_MAX, use_valid_token_count, grid_wgs):
         INTER_MAX=INTER_MAX,
         use_valid_token_count=use_valid_token_count,
         GRID_WGS=grid_wgs,
+        BM=BM,
+        B_NT=B_NT,
+        topk=topk if REDUCE else 1,
+        **({"REDUCE": True} if REDUCE else {}),
+        **({"NATIVE_C": True} if NATIVE_C else {}),
     )
 
 
@@ -895,6 +907,7 @@ def mxfp4_moe_gemm2(
     elif (
         str(out_dtype).strip().lower() == "bf16"
         and getattr(out, "dtype", None) != torch.bfloat16
+        and not (ep32 and BM == 80 and os.environ.get("G2_OUTPUT_NATIVE", "1") == "1" and out.dtype == torch.float32)
     ):
         raise TypeError(
             "FlyDSL v2 GEMM2 supports only torch.bfloat16 output, "
@@ -914,15 +927,19 @@ def mxfp4_moe_gemm2(
             bias = bias.contiguous()
     if ep32:
         # Dedicated EP32 A8W4 kernel (mxmoe_gemm2_ep32.py): fixed persistent grid.
-        if (BM, BN, BK, SBM, a_dtype, b_dtype, epilog, persist, out_dtype) != (
-            64, 256, 128, 64, "fp8", "fp4", "atomic", False, "bf16"
-        ) or bias is not None:
+        if (BN, BK, a_dtype, b_dtype, persist, out_dtype) != (
+            256, 128, "fp8", "fp4", False, "bf16"
+        ) or epilog not in ("atomic", "reduce") or (epilog == "reduce" and BM != 80) or (BM, SBM) not in ((64, 64), (80, 80)) or bias is not None:
             raise NotImplementedError(
-                "gemm2 ep32 supports only BM64/BN256/BK128 sbm64 A8W4 atomic bf16 "
+                "gemm2 ep32 supports BM64/sbm64 atomic or BM80/sbm80 atomic/reduce, BN256/BK128 A8W4 bf16 "
                 "without bias"
             )
         launch = get_g2_ep32(
-            use_nt, HIDDEN_MAX, D_INTER, bool(use_valid_token_count), 2 * get_cu_num()
+            use_nt, HIDDEN_MAX, D_INTER, bool(use_valid_token_count), 2 * get_cu_num(), BM=BM,
+            B_NT=BM == 80 and os.environ.get("G2_B_NT", "1") == "1",
+            variant=os.environ.get("G2_VARIANT", "var384" if D_HIDDEN == 3584 and D_INTER == 3072 and out.dtype == torch.float32 else "base") if BM == 80 else "base",
+            REDUCE=epilog == "reduce", topk=topk,
+            NATIVE_C=epilog == "reduce" and out.dtype == torch.float32 and os.environ.get("G2_OUTPUT_NATIVE", "1") == "1",
         )
         max_m_blocks = (max_sorted + BM - 1) // BM
         run_compiled(
