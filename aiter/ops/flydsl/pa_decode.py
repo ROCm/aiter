@@ -24,6 +24,7 @@ from .kernels.pa_decode_kernel import (
     MERGE_HEAD_DIM,
     MERGE_PARTITIONS,
     compile_pa_decode_tile,
+    mxfp4_gfx1250_query_splits,
 )
 from .kernels.pa_decode_plan import PADecodePlan
 from .kernels.pa_decode_plan import plan_pa_decode as plan_pa_decode  # noqa: PLC0414
@@ -369,6 +370,24 @@ def _pa_decode_mxfp4(
         and num_seqs * num_kv_heads <= num_compute_units * 15 // 16
         else 0
     )
+    # A gfx1250 MTP CTA keeping several M-tiles fits two to a CU. When its
+    # tasks times the query splits exceed that, a CTA runs two plan slots, so a
+    # sequence's adjacent tiles fuse into one longer task (G16 x MTP4 at the
+    # default budget: B8 x 32k 14.5 -> 13.0 us, B32 x 8k 15.2 -> 13.8 us). The tile
+    # count bounds the tasks of a short batch, which fusing would only serialize.
+    splits = mxfp4_gfx1250_query_splits(query_length, group) if gfx1250 else 1
+    max_tasks = min(
+        capacity, num_seqs * -(-schedule_context_length // KV_COMPUTE_BLOCK)
+    )
+    fuse_tasks = (
+        2
+        if gfx1250
+        and not direct
+        and not cluster_merge
+        and query_length * group // splits > 16
+        and max_tasks * splits > 2 * num_compute_units
+        else 1
+    )
     with torch.cuda.device(dev):
         compiled = compile_pa_decode_tile(
             head_dim=head_dim,
@@ -389,6 +408,7 @@ def _pa_decode_mxfp4(
             max_context_length=schedule_context_length,
             direct_output=direct,
             cluster_merge=cluster_merge,
+            fuse_tasks=fuse_tasks,
         )
     pmax = psum = pout = output
     if not direct:

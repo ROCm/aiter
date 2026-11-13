@@ -1123,6 +1123,8 @@ class Gfx1250Traits:
     # MXFP4 without a plan: ``work`` holds context lengths, CTA s runs sequence
     # s whole and stores its final rows.
     plan_free: bool = False
+    # MXFP4 partials: plan slots a CTA runs (2: adjacent tiles fuse).
+    fuse_tasks: int = 1
 
     WAVE = 32
     NWARP = 4

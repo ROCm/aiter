@@ -1431,6 +1431,22 @@ _MXFP4_GFX1250_CASES = [
         )
         for splits in (1, 2, 4)
     ],
+    # Enough tiles that a CTA runs two plan slots (fuse_tasks): adjacent tiles
+    # of a sequence fuse, pairs across sequences (and empty ones) run apart.
+    *[
+        (
+            f"mxfp4-mtp4-fused{'-window' if window else ''}",
+            {
+                **_MXFP4_BASE,
+                "query_dtype": torch.bfloat16,
+                "query_length": 4,
+                "window": window,
+                "fused": True,
+                "lengths": (0, 1, 4, 255, 256, 257, 1027, 513) * 10,
+            },
+        )
+        for window in (0, 300)
+    ],
     (
         "mxfp4-mtp4-graph",
         {
@@ -1832,6 +1848,7 @@ def test_pa_decode(case, device, monkeypatch):
             "variants": False,
             "cluster": None,
             "query_splits": None,
+            "fused": False,
         },
         **case,
     )
@@ -2129,6 +2146,8 @@ def test_pa_decode(case, device, monkeypatch):
     else:
         # MXFP4 KV is per-token KV: its e8m0 bytes are each row's scales.
         assert compile_kwargs and all(k["per_token_kv"] for k in compile_kwargs)
+        if case["fused"]:
+            assert any(k.get("fuse_tasks") == 2 for k in compile_kwargs)
     if case["capture"]:
         # Compile/allocate before capture; replay must observe changed query data.
         capture_stream = torch.cuda.Stream()
