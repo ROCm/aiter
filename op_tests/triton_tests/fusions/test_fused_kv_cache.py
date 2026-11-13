@@ -262,6 +262,185 @@ def test_fused_qk_rope_cat_and_cache_mla(
 
 @pytest.mark.parametrize("T", [1, 8, 2048])
 @pytest.mark.parametrize("QH_per_KH", [16])
+@pytest.mark.parametrize("KH", [1])
+@pytest.mark.parametrize("D_pe", [64])
+@pytest.mark.parametrize("D_lora", [512])
+@pytest.mark.parametrize("num_kv_cahce_tokens", [16384])
+@pytest.mark.parametrize("rotate_style", [RotateStyle.GPTJ, RotateStyle.NEOX])
+@pytest.mark.parametrize("reuse_freqs_front_part", [False, True])
+# q_nope_fp8 selects which branch the gfx1250 Gluon kernel takes:
+#   True  -> q_nope is pre-quantized fp8 and q_out is fp8, so Q_OUT_MATCHES and
+#            q_nope is TDM-stored straight from its load buffer (passthrough).
+#   False -> q_nope is bf16 while q_out is fp8, so Q_OUT_MATCHES is False and
+#            q_nope goes through the load->cast->store path.
+# Either way q_pe is roped in registers and must be staged at the fp8 q_out
+# dtype from its own buffer -- the regression this test guards.
+@pytest.mark.parametrize("q_nope_fp8", [True, False])
+def test_fused_qk_rope_cat_and_cache_mla_fp8_q_out(
+    T: int,
+    QH_per_KH: int,
+    KH: int,
+    D_pe: int,
+    D_lora: int,
+    num_kv_cahce_tokens: int,
+    rotate_style: int,
+    reuse_freqs_front_part: bool,
+    q_nope_fp8: bool,
+):
+    # The fp8 q_out passthrough / independent-q_pe-staging is only implemented in
+    # the gfx1250 Gluon kernel; other arches use the plain Triton kernel.
+    if DEVICE_ARCH not in ("gfx1250",):
+        pytest.skip("fp8 q_out passthrough is a gfx1250 Gluon path")
+    torch.manual_seed(0)
+    dtype = torch.bfloat16
+    cache_dtype = e4m3_dtype
+    shuffled_kv_cache = True
+    block_size = 64
+    pos = True
+    _, _, _, _, freqs, positions, offsets, cos, sin = generate_rope_inputs(
+        1,
+        T,
+        KH,
+        QH_per_KH,
+        D_pe,
+        cached=True,
+        reuse_freqs_front_part=reuse_freqs_front_part,
+        nope=False,
+        pos=pos,
+        offs=False,
+        two_inputs=True,
+        layout="thd",
+        dtype=dtype,
+    )
+    q = torch.randn(
+        (T, QH_per_KH * KH, D_lora + D_pe), dtype=torch.float32, device="cuda"
+    )
+    q_nope_bf16, q_pe = q.to(dtype).split((D_lora, D_pe), dim=-1)
+    # Passthrough path takes a pre-quantized fp8 q_nope; cast path takes bf16.
+    q_nope = q_nope_bf16.to(e4m3_dtype) if q_nope_fp8 else q_nope_bf16
+    assert (q_nope.dtype == e4m3_dtype) == q_nope_fp8
+
+    k_lora = (
+        torch.randn((T, KH, D_lora), dtype=torch.float32, device=q.device) / 20
+    ).to(dtype)
+    k_pe = (torch.randn((T, KH, D_pe), dtype=torch.float32, device=q.device) / 20).to(
+        dtype
+    )
+
+    kv_cache = torch.zeros(
+        (num_kv_cahce_tokens, KH, D_lora + D_pe), dtype=torch.bfloat16, device="cuda"
+    )
+    k_scale = torch.rand([1], dtype=torch.float32, device="cuda")[0]
+    slot_mapping = torch.randperm(T, device="cuda")
+
+    ref_freqs = (
+        freqs[positions if offsets is None else torch.add(positions, offsets)].squeeze(
+            -2
+        )
+        if pos
+        else freqs
+    )
+
+    # Reference q_out: roped q_pe and the (possibly already fp8) q_nope, both at
+    # the fp8 q_out dtype. For the passthrough case q_nope.to(e4m3) is a no-op,
+    # so the nope half must come back bit-identical.
+    torch_q_pe = ref_rope_sbhd_fwd(
+        q_pe.unsqueeze(0),
+        ref_freqs,
+        rotate_style=rotate_style,
+        reuse_freqs_front_part=reuse_freqs_front_part,
+        nope_first=False,
+    ).squeeze(0)
+    ref_q_nope_fp8 = q_nope.to(e4m3_dtype)
+    ref_q_pe_fp8 = torch_q_pe.to(e4m3_dtype)
+
+    # Build and write the kv cache exactly like the bf16/fp8 path above.
+    torch_kv_cache = kv_cache.clone()
+    torch_k_pe_rope = ref_rope_sbhd_fwd(
+        k_pe.unsqueeze(0),
+        ref_freqs,
+        rotate_style=rotate_style,
+        reuse_freqs_front_part=reuse_freqs_front_part,
+        nope_first=False,
+    ).squeeze(0)
+    torch_k_lora = (k_lora.to(torch.float32) / k_scale).to(torch.bfloat16)
+    torch_k_pe = (torch_k_pe_rope.to(torch.float32) / k_scale).to(torch.bfloat16)
+    torch_kv_cache[slot_mapping, :, :] = torch.cat((torch_k_lora, torch_k_pe), dim=-1)
+    torch_kv_cache = shuffle_kv_buffer(
+        torch_kv_cache.reshape(
+            num_kv_cahce_tokens // block_size, block_size, KH, D_lora + D_pe
+        ).to(cache_dtype),
+        D_lora,
+    )
+
+    triton_kv_cache = torch.zeros_like(torch_kv_cache)
+    q_out = torch.empty(
+        (T, QH_per_KH * KH, D_lora + D_pe), dtype=e4m3_dtype, device="cuda"
+    )
+    triton_q, _, triton_k_pe, _ = fused_qk_rope_cat_and_cache_mla(
+        q_nope,
+        q_pe,
+        k_lora,
+        k_pe,
+        triton_kv_cache,
+        slot_mapping,
+        positions,
+        cos,
+        sin,
+        k_scale,
+        (rotate_style == RotateStyle.NEOX),
+        num_decode_toks_for_zeros=0,
+        apply_scale=(k_pe.dtype != triton_kv_cache.dtype),
+        q_out=q_out,
+        decode_q_pe_out=None,
+        k_pe_out=None,
+        shuffled_kv_cache=shuffled_kv_cache,
+    )
+
+    assert triton_q.dtype == e4m3_dtype
+    check_kv_buffer(
+        torch_kv_cache,
+        triton_kv_cache,
+        slot_mapping,
+        block_size,
+        shuffled_kv_cache,
+        D_lora,
+        D_pe,
+        dtype,
+    )
+
+    triton_q_nope = triton_q[..., :D_lora]
+    triton_q_pe = triton_q[..., D_lora:]
+
+    if q_nope_fp8:
+        # Passthrough path: the nope half is a byte copy of the fp8 input, so it
+        # must match bit-for-bit (no cast, no rounding).
+        torch.testing.assert_close(
+            triton_q_nope.view(torch.uint8),
+            ref_q_nope_fp8.view(torch.uint8),
+            atol=0,
+            rtol=0,
+        )
+    else:
+        # Cast path: bf16 -> fp8 in the kernel, compared as float.
+        torch.testing.assert_close(
+            triton_q_nope.to(torch.float32),
+            ref_q_nope_fp8.to(torch.float32),
+            atol=1e-1,
+            rtol=1e-1,
+        )
+    # q_pe is roped then cast to the fp8 q_out dtype on both branches; this is
+    # the staging the PR made independent of q_nope's dtype.
+    torch.testing.assert_close(
+        triton_q_pe.to(torch.float32),
+        ref_q_pe_fp8.to(torch.float32),
+        atol=1e-1,
+        rtol=1e-1,
+    )
+
+
+@pytest.mark.parametrize("T", [1, 8, 2048])
+@pytest.mark.parametrize("QH_per_KH", [16])
 @pytest.mark.parametrize("KH", [8])
 @pytest.mark.parametrize("D", [64])  # For now, D is power of 2. D >= 16
 @pytest.mark.parametrize("num_blocks", [16384])
