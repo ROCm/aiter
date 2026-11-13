@@ -13,6 +13,11 @@ small NUM_SEGMENTS (else the wrapper falls back to Triton).
 from triton.experimental import gluon
 from triton.experimental.gluon import language as gl
 
+# Older Triton wheels lack this optional LLVM scheduling hint.
+_HAS_SCHED_BARRIER = gl.constexpr(
+    hasattr(gl.amd, "hint") and hasattr(gl.amd.hint, "sched_barrier")
+)
+
 
 @gluon.jit
 def reduce_segments_gluon(
@@ -226,7 +231,8 @@ def reduce_segments_split_rebalance_gluon(
     segm_expsum = gl.amd.gfx1250.buffer_load(e_base, offs_all)
     # nothing that needs the context length (or the tiles per segment) above here:
     # the compiler would wait for them before it issues the speculative loads
-    gl.amd.hint.sched_barrier()
+    if _HAS_SCHED_BARRIER:
+        gl.amd.hint.sched_barrier()
 
     # (clamped: a zero-length context, or a context past the grid, still ends the
     # loops below on the grid's segments)

@@ -896,6 +896,37 @@ def attn_fwd(
     offs_d_qk = tl.arange(0, BLOCK_DMODEL_QK)
     offs_d_v = tl.arange(0, BLOCK_DMODEL_V)
 
+    # Cast strides to int64 to prevent int32 overflow for large sequences (>2^31 elements).
+    # Keeps function signature unchanged to retain 32-bit vectorized load specialization.
+    # See fwd_decode.py and _triton_kernels/attention/mha.py for the same pattern.
+    stride_qm = tl.cast(stride_qm, tl.int64)
+    stride_kn = tl.cast(stride_kn, tl.int64)
+    stride_vk = tl.cast(stride_vk, tl.int64)
+    stride_om = tl.cast(stride_om, tl.int64)
+    stride_qz = tl.cast(stride_qz, tl.int64)
+    stride_kz = tl.cast(stride_kz, tl.int64)
+    stride_vz = tl.cast(stride_vz, tl.int64)
+    stride_oz = tl.cast(stride_oz, tl.int64)
+    stride_qh = tl.cast(stride_qh, tl.int64)
+    stride_kh = tl.cast(stride_kh, tl.int64)
+    stride_vh = tl.cast(stride_vh, tl.int64)
+    stride_oh = tl.cast(stride_oh, tl.int64)
+
+    # Bias strides
+    stride_bm = tl.cast(stride_bm, tl.int64)
+    stride_bn = tl.cast(stride_bn, tl.int64)
+    stride_bh = tl.cast(stride_bh, tl.int64)
+    stride_bz = tl.cast(stride_bz, tl.int64)
+
+    # LSE strides (softmax statistics writeback)
+    stride_lse_m = tl.cast(stride_lse_m, tl.int64)
+    stride_lse_h = tl.cast(stride_lse_h, tl.int64)
+    stride_lse_z = tl.cast(stride_lse_z, tl.int64)
+
+    # Alibi strides
+    stride_az = tl.cast(stride_az, tl.int64)
+    stride_ah = tl.cast(stride_ah, tl.int64)
+
     # handle seqlen
     if IS_VARLEN:
         cu_seqlens_q_start = tl.load(cu_seqlens_q + off_z)
