@@ -418,6 +418,9 @@ def _run_mxfp8_bpreshuffle_gemm_a8_gfx1250(
             1,  # batch (runtime)
             a_preshuffle,
             a_scale_preshuffled,
+            False,  # b_scale_32x32
+            False,  # k_tail
+            _ptr_arg(Out),  # arg_scale_out
             specialization_key=specialization,
         )
     if partials is not None and not fused:
