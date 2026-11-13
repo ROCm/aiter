@@ -11,14 +11,22 @@ explicit SSA values. Every LDS publication/retirement barrier stays here.
 import flydsl.compiler as flyc
 import flydsl.expr as fx
 from flydsl.expr import const_expr, gpu, range_constexpr
+from flydsl.expr import math as fmath
 from flydsl.expr.rocdl import tdm_ops
-from flydsl.expr.typing import ReductionOp
+from flydsl.expr.typing import ReductionOp, T
 
 from ..tensor_shim import buf_base_i64
 from ..utils import rcp_f32
 from .op_epilog import PaDecodeEpilogue
 from .op_gemm import Gfx1250Gemm, PaDecodeGemm
-from .op_lds import Gfx1250Memory, PaDecodeKVLoader, PaDecodeLds, PaDecodeQueryLoader
+from .op_lds import (
+    Gfx1250Memory,
+    Gfx1250Mxfp4Loader,
+    PaDecodeKVLoader,
+    PaDecodeLds,
+    PaDecodeQueryLoader,
+    _gptr,
+)
 from .op_merge import Gfx1250PartitionMerge
 from .op_softmax import PaDecodeSoftmax
 from .traits import (
@@ -2685,3 +2693,471 @@ class Gfx1250Pipeline:
                     self.merge.arrive()
         else:
             store(t.direct_output)
+
+
+class Gfx1250Mxfp4Pipeline:
+    """MXFP4 K/V on gfx1250: head_dim 128, page 128.
+
+    A CTA owns (query positions of its split) x (GQA heads) rows in 16-row
+    M-tiles. Each wave owns 64 tokens of every 256-token tile, all 128 dims and
+    all M-tiles, so the tile loop has no barrier; the waves merge once after
+    it. Raw K/V rows load one tile ahead, page ids two tiles ahead. Rows mask
+    their own causal (MTP) and sliding-window bounds.
+
+    QK is one scaled WMMA per 16 tokens and M-tile: E2M1 K rows with their
+    E8M0 scales against the E4M3 query, whose row scale's exponent rides on the
+    WMMA's B scale (its mantissa scales the scores), so the accumulator holds
+    the logit.
+
+    V is dequantized by the same scaled WMMA against E2M1 identity blocks: the
+    product is exact in f32 and lands transposed (lane = dim, registers =
+    tokens), which packed to bf16 is the A operand of the bf16 PV WMMA of every
+    M-tile; P stays in registers as its B operand. The v_cvt_scale_pk8_*_fp4
+    conversions would widen V on the VALU, but on gfx1250 (FlyDSL 0.5.0 LLVM,
+    B0) they ignore their data operand: 0x22222222 and 0x76543210 both convert
+    to the nibbles of 0x7F7F7F7F.
+    """
+
+    TILE_TOKENS = 64  # per wave
+    DIM_TILES = 8  # 16-dim PV output tiles of head_dim 128
+    DEQUANT_GROUP = 4  # dim tiles whose V dequant WMMAs issue back to back
+    STATE = 2 + 8  # per M-tile: running max, denominator, 8 output tiles
+    UNIT_SCALES = 0x7F7F7F7F
+    MIN_NORMAL_F32 = 1.17549435e-38
+
+    def __init__(self, ctx):
+        self.ctx, self.t = ctx, ctx.traits
+        self.mem = Gfx1250Memory(ctx)
+
+    def row(self, m, lane16):
+        """(query position, query head) of this lane's row in M-tile ``m``.
+        Padded rows repeat the CTA's last row; their outputs are dropped."""
+        ctx, t = self.ctx, self.t
+        row = fx.min(m * 16 + lane16, fx.Int32(t.rows - 1))
+        return (
+            ctx.query_begin + row // t.query_group_size,
+            ctx.kv_h * t.query_group_size + row % t.query_group_size,
+        )
+
+    def query_operand(self, m, lane16, half):
+        """This lane's E4M3 B operand of the QK WMMA (row lane16 of M-tile m),
+        the row's E8M0 scale word and the mantissa of its scale. A bf16 row is
+        normalized by absmax / 448, floored at the smallest normal f32 so
+        1 / scale stays finite and a bf16 subnormal row stays inside E4M3."""
+        ctx, t = self.ctx, self.t
+        position, head = self.row(m, lane16)
+        offset = (
+            ctx.planned_seq * t.query_length + position
+        ) * ctx.stride_q_row + head * ctx.stride_q_head
+        if const_expr(t.query_dtype == "fp8"):
+            q = _gptr(ctx.query_ptr, fx.Int32, 16)
+            words = []
+            for j in range_constexpr(4):
+                chunk = fx.ptr_load(
+                    fx.add_offset(q, fx.Uint32((offset + 16 * (half + 2 * j)) // 4)),
+                    result_type=fx.Vector.make_type(4, fx.Int32),
+                )
+                words.extend([chunk[i] for i in range_constexpr(4)])
+            return (
+                fx.Vector.from_elements(words, dtype=fx.Int32),
+                fx.Int32(self.UNIT_SCALES),
+                fx.Float32(1.0),
+            )
+        q = _gptr(ctx.query_ptr, fx.BFloat16, 16)
+        units = [
+            fx.Vector(
+                fx.ptr_load(
+                    fx.add_offset(q, offset + 16 * (half + 2 * j) + 8 * u),
+                    result_type=fx.Vector.make_type(8, fx.BFloat16),
+                )
+            ).to(fx.Float32)
+            for j in range_constexpr(4)
+            for u in range_constexpr(2)
+        ]
+        absmax = fmath.absf(units[0]).reduce(ReductionOp.MAX)
+        for u in range_constexpr(1, len(units)):
+            absmax = fx.maxnumf(absmax, fmath.absf(units[u]).reduce(ReductionOp.MAX))
+        absmax = fx.maxnumf(absmax, absmax.shuffle_xor(16, t.WAVE))
+        q_scale = fx.maxnumf(
+            absmax * fx.Float32(1.0 / t.FP8_MAX), fx.Float32(self.MIN_NORMAL_F32)
+        )
+        inv = fx.full(8, fx.Float32(rcp_f32(q_scale)), fx.Float32)
+        words = []
+        for u in range_constexpr(len(units)):
+            packed = self.mem.fp8(units[u] * inv)
+            words.extend([packed[0], packed[1]])
+        bits = fx.Int32(
+            fx.Vector.from_elements([q_scale], dtype=fx.Float32).bitcast(fx.Int32)[0]
+        )
+        mantissa = fx.Vector.from_elements(
+            [(bits & fx.Int32(0x7FFFFF)) | fx.Int32(0x3F800000)], dtype=fx.Int32
+        ).bitcast(fx.Float32)[0]
+        return (
+            fx.Vector.from_elements(words, dtype=fx.Int32),
+            (bits >> 23) * fx.Int32(0x01010101),
+            fx.Float32(mantissa),
+        )
+
+    @staticmethod
+    def identity_rows(lane16, half):
+        """Per owner half, 14 dwords [0 x 6, one, one', 0 x 6] whose 8-dword
+        windows are the E2M1 identity blocks (see ``identity_operand``)."""
+        zero = fx.Int32(0)
+        upper = lane16 >= 8
+        rows = []
+        for owner in range_constexpr(2):
+            one = (half == owner).select(fx.Int32(2) << ((lane16 % 8) * 4), zero)
+            rows.append(
+                fx.Vector.from_elements(
+                    [zero] * 6
+                    + [upper.select(zero, one), upper.select(one, zero)]
+                    + [zero] * 6,
+                    dtype=fx.Int32,
+                )
+            )
+        return rows
+
+    @staticmethod
+    def identity_operand(rows, j):
+        """E2M1 B operand I_j with I_j[k][n] = 1.0 iff k == 16 j + n: column n's
+        one sits in dword 4 (j // 4) + 2 (j % 2) + n // 8, nibble n % 8, of the
+        lanes of half (j // 2) % 2. Windows of one 14-dword row keep the eight
+        operands within 28 registers."""
+        row = rows[(j // 2) % 2]
+        first = 6 - (4 * (j // 4) + 2 * (j % 2))
+        return row.shuffle(row, list(range(first, first + 8)))
+
+    @flyc.jit
+    def run(self):
+        ctx, t = self.ctx, self.t
+        tiles = t.m_tiles
+        tid = fx.Int32(gpu.thread_id("x"))
+        warp = fx.Int32(fx.rocdl.readfirstlane(T.i32, tid // t.WAVE))
+        lane = tid % t.WAVE
+        lane16, half = lane % 16, lane // 16
+        kv_query = fx.Int32(gpu.block_id("y"))
+        ctx.kv_h = kv_query // t.query_splits
+        positions = t.query_length // t.query_splits
+        ctx.query_begin = (kv_query % t.query_splits) * positions
+        self.mem.allocate()
+        kv = Gfx1250Mxfp4Loader(ctx, warp, lane16, half)
+        begin, end = ctx.planned_start, ctx.planned_end
+        base = kv.base(kv.page_id(begin))
+        k_first = kv.load("k", base)
+        v_first = kv.load("v", base)
+        page_second = kv.page_id(fx.min(begin + 1, end - 1))
+        # Query position p sees tokens [upper - window, upper), upper =
+        # context - query_length + p + 1; the CTA's first and last positions
+        # bound which tiles need masks.
+        first_upper = (
+            ctx.planned_context - t.query_length + ctx.query_begin + fx.Int32(1)
+        )
+        last_upper = first_upper + (positions - 1)
+        q_ops, q_scales, score_scales, uppers = [], [], [], []
+        for m in range_constexpr(tiles):
+            q_op, q_scale, q_mantissa = self.query_operand(m, lane16, half)
+            q_ops.append(q_op)
+            q_scales.append(q_scale)
+            score_scales.append(q_mantissa * fx.Float32(t.softmax_scale * LOG2E))
+            position, _ = self.row(m, lane16)
+            uppers.append(ctx.planned_context - t.query_length + position + 1)
+        scale8 = [
+            fx.full(8, score_scales[m], fx.Float32) for m in range_constexpr(tiles)
+        ]
+        identity_rows = self.identity_rows(lane16, half)
+        # Lane offsets of the 8 scores of chunk c: tokens 16 c + 8 half + i.
+        score_tokens = fx.Vector.from_elements(
+            [float(i) for i in range_constexpr(8)], dtype=fx.Float32
+        )
+        neg_inf = fx.full(8, float("-inf"), fx.Float32)
+        zero8 = fx.full(8, 0, fx.Int32)
+        shift8 = fx.full(8, -float(MXFP4_P_EXP_SHIFT), fx.Float32)
+        initial = []
+        for m in range_constexpr(tiles):
+            initial.extend([fx.Float32(float("-inf")), fx.Float32(0.0)])
+            initial.extend(
+                [fx.Vector.filled(8, 0.0, fx.Float32) for _ in range_constexpr(8)]
+            )
+        initial.extend([k_first, v_first, page_second])
+        loads = tiles * self.STATE
+        for tt_i, state in range(begin, end, 1, init=initial):
+            tt = fx.Int32(tt_i)
+            k_cur, v_cur, page_next = state[loads], state[loads + 1], state[loads + 2]
+            # Unconditional: the last tile re-reads itself rather than branch
+            # around loads, which would make their wait counts conservative.
+            page_after = kv.page_id(fx.min(tt + 2, end - 1))
+            base_next = kv.base(page_next)
+            k_rows = [kv.chunk(k_cur, c) for c in range_constexpr(kv.CHUNKS)]
+            scores = [
+                [
+                    Gfx1250Gemm.mma_mx(
+                        k_rows[c][1],
+                        q_ops[m],
+                        k_rows[c][0],
+                        q_scales[m],
+                        Gfx1250Gemm.FMT_E4M3,
+                    )
+                    for c in range_constexpr(kv.CHUNKS)
+                ]
+                for m in range_constexpr(tiles)
+            ]
+            # The next tile loads while this one computes; its K reuses this
+            # tile's K registers.
+            k_next = kv.load("k", base_next)
+            v_next = kv.load("v", base_next)
+            v_scales, v_rows = [], []
+            for c in range_constexpr(kv.CHUNKS):
+                v_scale, v_row = kv.chunk(v_cur, c)
+                v_scales.append(v_scale)
+                v_rows.append(v_row)
+            first = tt * KV_COMPUTE_BLOCK
+            masked = first + KV_COMPUTE_BLOCK > first_upper
+            if const_expr(t.sliding_window > 0):
+                masked = masked | (first < last_upper - t.sliding_window)
+            if masked:
+                # Tiles at the causal edge or a window's start: each row masks
+                # its own bounds. V rows past the context become exact zeros:
+                # E2M1 has no NaN, but a scale byte of 255 does.
+                lane_first = first + warp * self.TILE_TOKENS + half * 8
+                for m in range_constexpr(tiles):
+                    upper = fx.full(
+                        8, (uppers[m] - lane_first).to(fx.Float32), fx.Float32
+                    )
+                    lower = fx.full(
+                        8,
+                        (uppers[m] - t.sliding_window - lane_first).to(fx.Float32),
+                        fx.Float32,
+                    )
+                    for c in range_constexpr(kv.CHUNKS):
+                        token = score_tokens + fx.full(8, float(16 * c), fx.Float32)
+                        visible = token < upper
+                        if const_expr(t.sliding_window > 0):
+                            visible = visible & (token >= lower)
+                        scores[m][c] = visible.select(scores[m][c], neg_inf)
+                tile_valid = ctx.planned_context - first
+                for c in range_constexpr(kv.CHUNKS):
+                    row_valid = warp * self.TILE_TOKENS + 16 * c + lane16 < tile_valid
+                    v_rows[c] = row_valid.select(v_rows[c], zero8)
+                    v_scales[c] = row_valid.select(
+                        v_scales[c], fx.Int32(self.UNIT_SCALES)
+                    )
+            next_state = []
+            p_ops, outs = [], []
+            for m in range_constexpr(tiles):
+                m_prev = state[m * self.STATE]
+                l_prev = state[m * self.STATE + 1]
+                out = [
+                    state[m * self.STATE + 2 + j]
+                    for j in range_constexpr(self.DIM_TILES)
+                ]
+                # The running maximum stays in accumulator units (the scale is
+                # positive and per row): the max token's difference is an exact
+                # 0 even when the scaled logit is near the f32 limit.
+                m_tile = scores[m][0].reduce(ReductionOp.MAX)
+                for c in range_constexpr(1, kv.CHUNKS):
+                    m_tile = fx.maxnumf(m_tile, scores[m][c].reduce(ReductionOp.MAX))
+                m_tile = fx.maxnumf(m_tile, m_tile.shuffle_xor(16, t.WAVE))
+                m_new = fx.maxnumf(m_prev, m_tile)
+                # Relative to 0 while nothing is visible yet: no -inf - -inf.
+                safe = fx.Float32(
+                    (m_new > fx.Float32(float("-inf"))).select(m_new, fx.Float32(0.0))
+                )
+                alpha = fx.Float32(
+                    fx.exp2((m_prev - safe) * score_scales[m], fastmath="afn")
+                )
+                # P * 2**-MXFP4_P_EXP_SHIFT = exp2((s - max) * scale - shift): a
+                # long sum of large V stays finite in f32. The denominator
+                # carries the same shift, so it cancels in the normalization.
+                safe8 = fx.full(8, safe, fx.Float32)
+                probs = [
+                    fx.Vector(
+                        fx.exp2(
+                            fmath.fma(scores[m][c] - safe8, scale8[m], shift8),
+                            fastmath="afn",
+                        )
+                    )
+                    for c in range_constexpr(kv.CHUNKS)
+                ]
+                # Each lane sums its own tokens; the halves combine after the loop.
+                l_new = l_prev * alpha
+                for c in range_constexpr(kv.CHUNKS):
+                    l_new = l_new + probs[c].reduce(ReductionOp.ADD)
+                p_bf16 = [probs[c].to(fx.BFloat16) for c in range_constexpr(4)]
+                p_ops.append(
+                    [
+                        p_bf16[2 * step].shuffle(p_bf16[2 * step + 1], list(range(16)))
+                        for step in range_constexpr(2)
+                    ]
+                )
+                # alpha is exactly 1 for every row whose maximum held: skip the
+                # rescale unless some row's maximum grew. Raw ballot: FlyDSL has
+                # no wave-vote API.
+                grew = fx.Int32(
+                    fx.rocdl.ballot(T.i32, fx.as_ir_value(alpha != fx.Float32(1.0)))
+                )
+                if grew != 0:
+                    alpha8 = fx.full(8, alpha, fx.Float32)
+                    out = [out[j] * alpha8 for j in range_constexpr(self.DIM_TILES)]
+                outs.append(out)
+                next_state.extend([m_new, l_new])
+            group = self.DEQUANT_GROUP
+            for step in range_constexpr(2):
+                # Chunks 2 step and 2 step + 1 are the K32 halves of the step.
+                for j0 in range_constexpr(0, self.DIM_TILES, group):
+                    # Dequantize a group of dim tiles before packing any: one
+                    # dequant -> pack -> PV chain at a time leaves each WMMA
+                    # waiting on the last (B16 ctx64k pa_decode 15.0 -> 13.9 us).
+                    raw = [
+                        [
+                            Gfx1250Gemm.mma_mx(
+                                v_rows[c],
+                                self.identity_operand(identity_rows, j),
+                                v_scales[c],
+                                fx.Int32(self.UNIT_SCALES),
+                                Gfx1250Gemm.FMT_E2M1,
+                            )
+                            for c in (2 * step, 2 * step + 1)
+                        ]
+                        for j in range_constexpr(j0, j0 + group)
+                    ]
+                    for j in range_constexpr(j0, j0 + group):
+                        pair = raw[j - j0]
+                        v_op = (
+                            pair[0]
+                            .to(fx.BFloat16)
+                            .shuffle(pair[1].to(fx.BFloat16), list(range(16)))
+                        )
+                        # Every M-tile reuses the tile's dequantized V.
+                        for m in range_constexpr(tiles):
+                            outs[m][j] = Gfx1250Gemm.mma(
+                                v_op, p_ops[m][step], outs[m][j], 32, bf16=True
+                            )
+            final_state = []
+            for m in range_constexpr(tiles):
+                final_state.extend(next_state[2 * m : 2 * m + 2])
+                final_state.extend(outs[m])
+            final = yield [*final_state, k_next, v_next, page_after]
+        self.store(final, warp, lane16, half, tid, score_scales)
+
+    @flyc.jit
+    def store(self, final, warp, lane16, half, tid, score_scales):
+        """Merge the four waves' (max, sum, O) through LDS and store the rows:
+        final rows without a plan or for a cluster-merged sequence's only task,
+        else packed partials for the reducer or the cluster merge."""
+        ctx, t = self.ctx, self.t
+        tiles = t.m_tiles
+        stats = t.mxfp4_stats_offset
+        for m in range_constexpr(tiles):
+            o_row = (warp * tiles + m) * t.MXFP4_O_BYTES + lane16 * (
+                t.MXFP4_O_STRIDE * 4
+            )
+            for j in range_constexpr(self.DIM_TILES):
+                self.mem.store(
+                    o_row + (16 * j + 8 * half) * 4,
+                    final[m * self.STATE + 2 + j],
+                    fx.Float32,
+                )
+            row_sum = fx.Float32(final[m * self.STATE + 1])
+            row_sum = row_sum + row_sum.shuffle_xor(16, t.WAVE)
+            if half == 0:
+                # Maxima in log2 logit units: rows of the merge below may differ
+                # in their score scale.
+                self.mem.store(
+                    stats + ((m * t.NWARP + warp) * 16 + lane16) * 4,
+                    fx.Float32(final[m * self.STATE]) * score_scales[m],
+                    fx.Float32,
+                )
+                self.mem.store(
+                    stats + (((tiles + m) * t.NWARP + warp) * 16 + lane16) * 4,
+                    row_sum,
+                    fx.Float32,
+                )
+        gpu.barrier()
+        if const_expr(t.cluster_merge):
+            # A sequence's only task stores its rows; others leave partials for
+            # the cluster's merge.
+            direct = ctx.task_count == 1
+        else:
+            direct = fx.Int32(int(t.plan_free)) == 1
+        local, dim = tid // 8, (tid % 8) * 16
+        for m in range_constexpr(tiles):
+            maxima = [
+                fx.Float32(
+                    self.mem.load(
+                        stats + ((m * t.NWARP + w) * 16 + local) * 4, fx.Float32
+                    )[0]
+                )
+                for w in range_constexpr(t.NWARP)
+            ]
+            sums = [
+                fx.Float32(
+                    self.mem.load(
+                        stats + (((tiles + m) * t.NWARP + w) * 16 + local) * 4,
+                        fx.Float32,
+                    )[0]
+                )
+                for w in range_constexpr(t.NWARP)
+            ]
+            row_max = maxima[0]
+            for w in range_constexpr(1, t.NWARP):
+                row_max = fx.maxnumf(row_max, maxima[w])
+            safe = fx.Float32(
+                (row_max > fx.Float32(float("-inf"))).select(row_max, fx.Float32(0.0))
+            )
+            denom = fx.Float32(0.0)
+            acc = fx.Vector.filled(16, 0.0, fx.Float32)
+            for w in range_constexpr(t.NWARP):
+                weight = fx.Float32(fx.exp2(maxima[w] - safe, fastmath="afn"))
+                denom = denom + sums[w] * weight
+                acc = acc + self.mem.load(
+                    (w * tiles + m) * t.MXFP4_O_BYTES
+                    + (local * t.MXFP4_O_STRIDE + dim) * 4,
+                    fx.Float32,
+                    16,
+                ) * fx.full(16, weight, fx.Float32)
+            # O and the denominator both carry 2**-MXFP4_P_EXP_SHIFT; a row's
+            # max token has p = 1, so the denominator is a normal f32 when
+            # nonzero. A row that sees no token (an MTP position before the
+            # context) stores zeros.
+            inv = fx.Float32(
+                (denom > fx.Float32(0.0)).select(
+                    fx.Float32(rcp_f32(denom)), fx.Float32(0.0)
+                )
+            )
+            values = (acc * fx.full(16, inv, fx.Float32)).to(t.q_dtype)
+            row = m * 16 + local
+            if row < t.rows:
+                position = ctx.query_begin + row // t.query_group_size
+                head = ctx.kv_h * t.query_group_size + row % t.query_group_size
+                if direct:
+                    fx.ptr_store(
+                        values,
+                        fx.add_offset(
+                            fx.recast_iter(t.q_dtype, ctx.output_ptr),
+                            (fx.Int64(ctx.planned_seq) * t.query_length + position)
+                            * ctx.stride_q_row
+                            + head * ctx.stride_q_head
+                            + dim,
+                        ),
+                    )
+                else:
+                    # Packed partials: [KV heads, capacity, query rows, D].
+                    partial = (
+                        fx.Int64(ctx.kv_h) * fx.Int64(ctx.capacity)
+                        + fx.Int64(ctx.task_slot)
+                    ) * (t.rows * t.query_splits) + (
+                        ctx.query_begin * t.query_group_size + row
+                    )
+                    fx.ptr_store(
+                        values,
+                        fx.add_offset(
+                            fx.recast_iter(t.q_dtype, ctx.pout_ptr),
+                            partial * t.head_dim + dim,
+                        ),
+                    )
+                    if tid % 8 == 0:
+                        # The shared reducer expects maxima in natural-log units.
+                        pmax = fx.recast_iter(fx.Float32, ctx.pmax_ptr)
+                        psum = fx.recast_iter(fx.Float32, ctx.psum_ptr)
+                        pmax[partial] = row_max * fx.Float32(1.0 / LOG2E)
+                        psum[partial] = denom * fx.Float32(2.0**MXFP4_P_EXP_SHIFT)
