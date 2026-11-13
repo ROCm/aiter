@@ -317,3 +317,121 @@ def test_fp8_mqa_logits_refuses_a_malformed_buffer(bad: str) -> None:
         fp8_mqa_logits(
             q_fp8, kv_fp8, scales, weights, ks, ke, False, logits=buffers[bad]
         )
+
+
+@pytest.mark.parametrize("rows,keys", [(9, 1025), (4097, 1025), (9, 65539)])
+@pytest.mark.parametrize("heads", [32, 64])
+@pytest.mark.parametrize("clean_logits", [False, True])
+@pytest.mark.parametrize("offset_dtype", [torch.int32, torch.int64])
+@torch.inference_mode()
+def test_fp8_mqa_logits_packed(rows, keys, heads, clean_logits, offset_dtype):
+    """Packed rows match the plane and leave gaps and guards untouched."""
+    torch.manual_seed(7517)
+    q = torch.randn(rows, heads, 128, device="cuda", dtype=torch.float32).to(e4m3_type)
+    kv = torch.randn(keys, 128, device="cuda", dtype=torch.float32).to(e4m3_type)
+    scales = torch.rand(keys, device="cuda", dtype=torch.float32) + 0.5
+    weights = torch.randn(rows, heads, device="cuda", dtype=torch.float32)
+    pattern = [0, 1, 63, 64, 65, 127, 128, 129, keys - 17]
+    lengths = [pattern[i % len(pattern)] for i in range(rows)]
+    visible = torch.tensor(lengths, device="cuda", dtype=torch.int32)
+    starts = (
+        torch.arange(rows, device="cuda", dtype=torch.int32)
+        * 193
+        % (keys - visible + 1)
+    )
+    ends = starts + visible
+    # Reverse the storage order to cover negative distances between row bases.
+    locations, capacity = [0] * rows, 0
+    for row in reversed(range(rows)):
+        locations[row] = capacity
+        capacity += lengths[row] + 7
+    offsets = torch.tensor(locations, device="cuda", dtype=offset_dtype)
+    storage = torch.full(
+        (capacity + 34,), float("nan"), device="cuda", dtype=torch.float32
+    )
+    packed = storage[17:-17]
+    dense = fp8_mqa_logits(q, kv, scales, weights, starts, ends, clean_logits=False)
+    actual = fp8_mqa_logits(
+        q,
+        kv,
+        scales,
+        weights,
+        starts,
+        ends,
+        clean_logits=clean_logits,
+        logits=packed,
+        out_offsets=offsets,
+    )
+    assert actual is packed
+    row_ids = torch.repeat_interleave(torch.arange(rows, device="cuda"), visible)
+    first = visible.to(torch.int64).cumsum(0) - visible
+    columns = torch.arange(sum(lengths), device="cuda") - first[row_ids]
+    destinations = offsets[row_ids] + columns
+    torch.testing.assert_close(
+        packed[destinations], dense[row_ids, starts[row_ids] + columns], rtol=0, atol=0
+    )
+    untouched = torch.ones(capacity, device="cuda", dtype=torch.bool)
+    untouched[destinations] = False
+    assert torch.isnan(packed[untouched]).all()
+    assert torch.isnan(storage[:17]).all() and torch.isnan(storage[-17:]).all()
+
+
+@pytest.mark.parametrize("rows", [0, 5])
+@torch.inference_mode()
+def test_fp8_mqa_logits_packed_empty_rows(rows):
+    q = torch.zeros(rows, 32, 128, device="cuda", dtype=e4m3_type)
+    kv = torch.zeros(73, 128, device="cuda", dtype=e4m3_type)
+    scales = torch.ones(73, device="cuda", dtype=torch.float32)
+    weights = torch.ones(rows, 32, device="cuda", dtype=torch.float32)
+    bounds = torch.zeros(rows, device="cuda", dtype=torch.int32)
+    packed = torch.full((19,), float("nan"), device="cuda", dtype=torch.float32)
+    assert (
+        fp8_mqa_logits(
+            q, kv, scales, weights, bounds, bounds, logits=packed, out_offsets=bounds
+        )
+        is packed
+    )
+    assert torch.isnan(packed).all()
+
+
+@pytest.mark.parametrize(
+    "bad",
+    [
+        "missing",
+        "rank",
+        "dtype",
+        "stride",
+        "offset_dtype",
+        "offset_shape",
+        "offset_stride",
+        "offset_device",
+    ],
+)
+def test_fp8_mqa_logits_rejects_malformed_packed_output(bad):
+    q = torch.empty(4, 32, 128, device="cuda", dtype=e4m3_type)
+    kv = torch.empty(73, 128, device="cuda", dtype=e4m3_type)
+    scales = torch.ones(73, device="cuda", dtype=torch.float32)
+    weights = torch.ones(4, 32, device="cuda", dtype=torch.float32)
+    bounds = torch.zeros(4, device="cuda", dtype=torch.int32)
+    packed = torch.empty(512, device="cuda", dtype=torch.float32)
+    offsets = torch.zeros(4, device="cuda", dtype=torch.int32)
+    if bad == "missing":
+        packed = None
+    elif bad == "rank":
+        packed = packed.view(4, 128)
+    elif bad == "dtype":
+        packed = packed.to(torch.float16)
+    elif bad == "stride":
+        packed = packed[::2]
+    elif bad == "offset_dtype":
+        offsets = offsets.to(torch.float32)
+    elif bad == "offset_shape":
+        offsets = offsets[:3]
+    elif bad == "offset_stride":
+        offsets = torch.zeros(8, device="cuda", dtype=torch.int32)[::2]
+    else:
+        offsets = torch.zeros(4, device="cpu", dtype=torch.int32)
+    with pytest.raises(ValueError):
+        fp8_mqa_logits(
+            q, kv, scales, weights, bounds, bounds, logits=packed, out_offsets=offsets
+        )

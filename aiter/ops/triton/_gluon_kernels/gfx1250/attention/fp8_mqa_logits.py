@@ -571,6 +571,7 @@ def mqa_logits_loop_pipelined(
 _gluon_fp8_mqa_logits_kernel_repr = make_kernel_repr(
     "_gluon_fp8_mqa_logits_kernel",
     [
+        "PACKED",
         "NUM_HEADS",
         "HEAD_SIZE",
         "BLOCK_KV",
@@ -593,6 +594,7 @@ def _gluon_fp8_mqa_logits_kernel(
     cu_start_ptr,  # int32  [seq_len]
     cu_end_ptr,  # int32  [seq_len]
     logits_ptr,  # fp32   [seq_len, seq_len_kv]
+    out_offsets_ptr,
     seq_len: gl.int32,
     seq_len_kv: gl.int32,
     NUM_HEADS: gl.constexpr,
@@ -613,6 +615,7 @@ def _gluon_fp8_mqa_logits_kernel(
     LOOP_VARIANT: gl.constexpr,
     USE_BUFFER_LOAD: gl.constexpr,
     USE_BUFFER_STORE: gl.constexpr,
+    PACKED: gl.constexpr = False,
 ):
 
     gl.static_assert(
@@ -704,7 +707,12 @@ def _gluon_fp8_mqa_logits_kernel(
 
     # Bake row + start offsets into the base pointers
     kv_scales_ptr_seg = kv_scales_ptr + start_ind
-    logits_ptr_row = logits_ptr + row_id * stride_logits_s + start_ind * stride_logits_k
+    if PACKED:
+        logits_ptr_row = logits_ptr + gl.load(out_offsets_ptr + row_id).to(gl.int64)
+    else:
+        logits_ptr_row = (
+            logits_ptr + row_id * stride_logits_s + start_ind * stride_logits_k
+        )
 
     if LOOP_VARIANT == 0:
         mqa_logits_loop_double_buf(

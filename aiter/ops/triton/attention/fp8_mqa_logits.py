@@ -103,6 +103,7 @@ def fp8_mqa_logits(
     cu_ends,
     clean_logits=True,
     logits=None,
+    out_offsets=None,
 ):
     """
     This function computes the logits to be used by a topk function for sparse attention.
@@ -126,9 +127,17 @@ def fp8_mqa_logits(
                   after call (a long chunked prefill) should pass one instead of
                   making the caching allocator reserve a new, slightly larger
                   block every time.
+    out_offsets: optional contiguous [seq_len] int32 or int64 row offsets, on
+                  Q.device. When set, logits must be a contiguous 1-D float32
+                  buffer. Row i writes its visible keys from out_offsets[i].
+                  The caller must provide disjoint intervals that fit logits.
+                  Offsets are in elements. Bounds are clamped to the key range.
+                  Only visible scores are written; padding stays unchanged and
+                  clean_logits has no effect. No alignment is required.
 
     Returns:
-    logits:      [seq_len, seq_len_kv], dtype float32 (must be initialized to -inf, because of causal masking)
+    logits:      The supplied output, or an allocated [seq_len, seq_len_kv]
+                  float32 tensor. Packed output is flat.
     """
 
     seq_len, num_heads, head_size = Q.shape
@@ -139,7 +148,22 @@ def fp8_mqa_logits(
     # Initialize with -inf because of causal masking
     aligned_size = 256
     seq_len_kv_aligned = (seq_len_kv + aligned_size - 1) // aligned_size * aligned_size
-    if logits is not None:
+    packed = out_offsets is not None
+    if packed:
+        if logits is None or logits.dtype != torch.float32 or logits.dim() != 1:
+            raise ValueError("out_offsets requires a 1-D float32 logits buffer")
+        if logits.stride(0) != 1 or logits.device != Q.device:
+            raise ValueError("packed logits must be contiguous and on Q.device")
+        if (
+            out_offsets.dtype not in (torch.int32, torch.int64)
+            or tuple(out_offsets.shape) != (seq_len,)
+            or not out_offsets.is_contiguous()
+            or out_offsets.device != Q.device
+        ):
+            raise ValueError(
+                "out_offsets must be contiguous [seq_len] int32 or int64 on Q.device"
+            )
+    elif logits is not None:
         if logits.dtype != torch.float32 or logits.dim() != 2:
             raise ValueError(
                 f"logits must be a 2-D float32 tensor, got {logits.dtype} "
@@ -176,7 +200,9 @@ def fp8_mqa_logits(
     stride_q_s, stride_q_h, stride_q_d = Q.stride()
     stride_kv_s, stride_kv_d = KV.stride()
     stride_w_s, stride_w_h = weights.stride()
-    stride_logits_s, stride_logits_k = logits.stride()
+    stride_logits_s, stride_logits_k = (0, 1) if packed else logits.stride()
+    if seq_len == 0:
+        return logits
     if not use_gluon:
         # On gfx942 (MI300X), drop to (64, 1) when our LDS estimate predicts
         # the default (128, 2) tile would not fit two co-resident workgroups
@@ -219,6 +245,8 @@ def fp8_mqa_logits(
             cu_start_ptr=cu_starts,
             cu_end_ptr=cu_ends,
             logits_ptr=logits,
+            out_offsets_ptr=out_offsets,
+            PACKED=packed,
             seq_len=seq_len,
             seq_len_kv=seq_len_kv,
             NUM_HEADS=num_heads,
@@ -246,9 +274,11 @@ def fp8_mqa_logits(
         # fallback path widens those strides to int64 instead.
         INT32_MAX = 2**31 - 1
         max_kv_offset = (seq_len_kv - 1) * stride_kv_s + (head_size - 1) * stride_kv_d
-        max_logits_offset = (seq_len - 1) * stride_logits_s + (
-            seq_len_kv - 1
-        ) * stride_logits_k
+        max_logits_offset = (
+            logits.numel() - 1
+            if packed
+            else (seq_len - 1) * stride_logits_s + (seq_len_kv - 1) * stride_logits_k
+        )
         use_buffer_load = max_kv_offset <= INT32_MAX
         use_buffer_store = max_logits_offset <= INT32_MAX
 
@@ -308,7 +338,7 @@ def fp8_mqa_logits(
             else:
                 m_chunk = 0
             # Relax the store masking if we don't have to provide clean logits
-            relaxed_store = 0 if clean_logits else 1
+            relaxed_store = 0 if clean_logits or packed else 1
             other = {
                 "USE_PADDED_SHARED_LAYOUT": ASYNC_COPY_SUPPORTS_DISTRIBUTED,
                 "BLOCK_M": block_m,
@@ -340,6 +370,8 @@ def fp8_mqa_logits(
             cu_start_ptr=cu_starts,
             cu_end_ptr=cu_ends,
             logits_ptr=logits,
+            out_offsets_ptr=out_offsets,
+            PACKED=packed,
             seq_len=seq_len,
             seq_len_kv=seq_len_kv,
             NUM_HEADS=num_heads,
