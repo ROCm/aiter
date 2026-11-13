@@ -1240,6 +1240,20 @@ def _raise_on_pybind11_abi_split(md_name, so_path, core_so_path, has_tensor_arg)
     )
 
 
+def _rebuild_targets_arch(arch):
+    """Whether a JIT build compiles device code for arch.
+
+    Reads the --offload-arch list build_module() passes. "native" lets clang
+    target every GPU on the node, the running one included; hipinfo on Windows
+    resolves it to the first arch it reports.
+    """
+    try:
+        targets = validate_and_update_archs()
+    except Exception:  # noqa: BLE001 the build reports a bad GPU_ARCHS itself
+        return True
+    return "native" in targets or arch in targets
+
+
 def _needs_arch_rebuild(md_name):
     # a prebuilt .so is a valid host extension on any GPU, so importing one
     # built for the wrong arch succeeds and only faults later at kernel launch.
@@ -1254,6 +1268,17 @@ def _needs_arch_rebuild(md_name):
     built = _so_offload_archs(so_path)
     if not built or cur in built:
         return False
+    if not _rebuild_targets_arch(cur):
+        # A rebuild would miss the running arch too, and loading the .so would
+        # only fail later, at its first kernel launch. The .so may have just
+        # been built with this GPU_ARCHS, so name the setting, not a "prebuilt"
+        # file.
+        raise RuntimeError(
+            f"[{md_name}] {so_path} targets {sorted(built)} but not the "
+            f"running arch {cur}, and GPU_ARCHS="
+            f"{os.environ.get('GPU_ARCHS', 'native')!r} would not rebuild for "
+            f"it either; set GPU_ARCHS to include {cur} (or to native)"
+        )
     logger.warning(
         f"[{md_name}] prebuilt .so targets {sorted(built)} but not the "
         f"running arch {cur}; rebuilding for {cur}"
