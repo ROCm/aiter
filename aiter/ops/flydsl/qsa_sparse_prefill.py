@@ -1,13 +1,14 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
-"""QSA sparse prefill on gfx942: BF16 D256 sparse attention over packed K/V.
+"""QSA sparse prefill on gfx942 and gfx950: BF16 D256 sparse attention over packed K/V.
 
 Public entry for the ``sparse_prefill_*`` kernels in ``kernels/qsa/``. Each call
 recovers the selected four-token blocks (FlyDSL K1-K3), routes every query tile to
 the union kernel (queries of a tile share one compact block list with exact
 per-query membership) or to the direct kernel (one query per wave over its own
 blocks), and writes O in place. Plans and scratch are private. K/V may also be a
-token pool read in place through a slot table.
+token pool read in place through a slot table, and on gfx950 their rows may be
+strided (an interleaved K|V cache read in place).
 """
 
 import math
@@ -15,6 +16,7 @@ import threading
 import weakref
 from collections import OrderedDict
 from types import SimpleNamespace
+from typing import NamedTuple
 
 import numpy as np
 import torch
@@ -32,11 +34,18 @@ from .kernels.qsa.sparse_prefill_common import (
     platform,
 )
 
-__all__ = ["flydsl_qsa_sparse_prefill"]
+__all__ = [
+    "flydsl_qsa_sparse_prefill",
+    "qsa_sparse_prefill_problem",
+    "qsa_sparse_prefill_warmup",
+]
 
 # Kernels use unsigned 32-bit buffer byte offsets; the 1 MiB margin keeps out-of-range
 # sentinels plus their lane offsets from wrapping.
 _MAX_SPAN = 2**32 - 2**20
+# Kernels form a four-row K/V block's extent and offsets (up to 4 x a row's bytes) as
+# 32-bit values: a row stride below 2**28 elements keeps them below 2**31.
+_MAX_KV_STRIDE = 2**28
 
 
 def _union_min_rows(group):
@@ -46,6 +55,30 @@ def _union_min_rows(group):
 
 def _aligned(nbytes):
     return -(-nbytes // SCRATCH_ALIGN) * SCRATCH_ALIGN
+
+
+def _kv_stride(tensor):
+    """Elements between the rows of K or V [rows, heads, 256], or None unless every row
+    holds dense [heads, 256] values, 16-byte aligned, before the next row starts, and
+    the next row starts fewer than _MAX_KV_STRIDE elements on. Size-1 dims have no
+    stride of their own (torch's contiguity rule): one row is dense."""
+    rows, heads, dim = tensor.shape
+    stride = tensor.stride(0) if rows > 1 else heads * dim
+    if (
+        tensor.stride(2) != 1
+        or (heads > 1 and tensor.stride(1) != dim)
+        or stride < heads * dim
+        or stride % 8
+        or stride >= _MAX_KV_STRIDE
+    ):
+        return None
+    return stride
+
+
+def _span_bytes(rows, stride, heads):
+    """Bytes from the first of rows BF16 [heads, 256] rows, stride elements apart, to the
+    end of the last."""
+    return ((rows - 1) * stride + heads * 256) * 2 if rows else 0
 
 
 class _Arena:
@@ -75,7 +108,9 @@ _arenas = weakref.WeakValueDictionary()
 
 
 class _Workspace:
-    def __init__(self, q, k, v, indices, query_lens, prefix_lens, scale, kv_slots=None):
+    def __init__(
+        self, q, k, v, indices, query_lens, prefix_lens, scale, kv_stride, kv_slots=None
+    ):
         topk = (indices.shape[1] - 3) // 4
         q_lens = np.asarray(query_lens, dtype=np.int64)
         lengths = q_lens + np.asarray(prefix_lens, dtype=np.int64)
@@ -83,7 +118,7 @@ class _Workspace:
         positions = np.arange(len(sequence)) + (lengths - np.cumsum(q_lens))[sequence]
         slotted = kv_slots is not None
         # Past this pool span raw direct byte offsets no longer reach every row.
-        wide = slotted and k.numel() * k.element_size() > _MAX_SPAN
+        wide = slotted and _span_bytes(k.shape[0], kv_stride, k.shape[1]) > _MAX_SPAN
         self.metadata = {
             "query_lens": query_lens,
             "prefix_lens": prefix_lens,
@@ -92,6 +127,7 @@ class _Workspace:
             "query_positions": prepare.upload(positions, q.device),
             "max_seqlen_k": int(lengths.max(initial=0)),
             "wide": wide,
+            "kv_stride": kv_stride,
         }
         self.captured = False
         self.block_indices = None
@@ -214,6 +250,251 @@ _lock = threading.RLock()
 _device = None
 
 
+class _Rejected(NamedTuple):
+    error: type[Exception]
+    message: str
+
+
+class _Checked(NamedTuple):
+    scale: float
+    query_lens: tuple
+    prefix_lens: tuple
+    stride: int
+    topk: int
+
+
+def _on_rocm_device(q):
+    return q.device.type == "cuda" and torch.version.hip is not None
+
+
+def _check_call(
+    q, k, v, indices, query_lens, prefix_lens, softmax_scale, out, kv_slots
+):
+    """The call's operand rules in order: the first one it breaks as _Rejected (what the
+    op raises and qsa_sparse_prefill_problem reports), else its normalized arguments.
+    Rules on state (graph capture, one GPU per process) stay in the op."""
+    if q.ndim != 3 or k.ndim != 3 or v.ndim != 3:
+        return _Rejected(ValueError, "Q/K/V must be BF16 [tokens, heads, 256]")
+    if isinstance(softmax_scale, (torch.Tensor, bool)):
+        return _Rejected(TypeError, "softmax_scale must be a host scalar or None")
+    scale = 0.0625 if softmax_scale is None else float(softmax_scale)
+    # The kernels multiply masked -inf scores by it: an FP32 zero would give NaN.
+    scaled = scale * math.log2(math.e)
+    if not math.isfinite(scaled) or not 2**-149 <= scaled <= (2 - 2**-23) * 2**127:
+        return _Rejected(
+            ValueError, "softmax_scale * log2(e) must be finite and positive in FP32"
+        )
+    if kv_slots is not None and (
+        not isinstance(kv_slots, torch.Tensor)
+        or kv_slots.dtype != torch.int32
+        or kv_slots.ndim != 1
+        or kv_slots.device != q.device
+        or not kv_slots.is_contiguous()
+    ):
+        return _Rejected(
+            ValueError, "kv_slots must be a contiguous device int32 [N] tensor"
+        )
+    # The kernels read the slot table at unsigned 32-bit buffer offsets and upload
+    # each request's start in it as int32.
+    if kv_slots is not None and kv_slots.numel() * kv_slots.element_size() > _MAX_SPAN:
+        return _Rejected(ValueError, "kv_slots requires a byte span <= 2**32 - 2**20")
+    keys = k.shape[0] if kv_slots is None else kv_slots.shape[0]
+    query_lens = (q.shape[0],) if query_lens is None else tuple(query_lens)
+    if prefix_lens is None:
+        if len(query_lens) == 1:
+            prefix_lens = (keys - q.shape[0],)
+        else:
+            prefix_lens = (0,) * len(query_lens)
+    else:
+        prefix_lens = tuple(prefix_lens)
+    if (
+        len(query_lens) != len(prefix_lens)
+        or any(
+            type(n) is not int or n < 0 or n >= 2**31
+            for n in (*query_lens, *prefix_lens)
+        )
+        or sum(query_lens) != q.shape[0]
+        or sum(query_lens) + sum(prefix_lens) != keys
+    ):
+        return _Rejected(
+            ValueError, "Host query/prefix lengths must describe the packed Q/K/V"
+        )
+    if not _on_rocm_device(q):
+        return _Rejected(
+            ValueError, "QSA sparse attention requires ROCm gfx942 or gfx950"
+        )
+    for tensor in (q, k, v):
+        if (
+            tensor.dtype != torch.bfloat16
+            or tensor.device != q.device
+            or tensor.layout != torch.strided
+            or tensor.shape[-1] != 256
+        ):
+            return _Rejected(ValueError, "Q/K/V must be BF16 [tokens, heads, 256]")
+        if tensor.data_ptr() % 16:
+            return _Rejected(ValueError, "Q/K/V require 16-byte alignment")
+    if not q.is_contiguous():
+        return _Rejected(ValueError, "Q must be contiguous")
+    if (
+        k.shape != v.shape
+        or q.shape[1] <= 0
+        or k.shape[1] <= 0
+        or q.shape[1] % k.shape[1]
+    ):
+        return _Rejected(
+            ValueError,
+            "K/V must match and Q heads must be a positive multiple of KV heads",
+        )
+    stride = _kv_stride(k)
+    if stride is None or _kv_stride(v) != stride:
+        return _Rejected(
+            ValueError,
+            "K/V rows must hold dense [heads, 256] values one 16-byte aligned stride "
+            ">= heads x 256 and < 2**28 elements apart, the same for K and V",
+        )
+    if q.shape[1] // k.shape[1] > 16:
+        return _Rejected(
+            ValueError, "At most 16 Q heads per KV head fit the direct fallback wave"
+        )
+    # K/V are addressed per request, so only each request's K (or V) span is bounded,
+    # not the packed total: about 8M context tokens at HK1, 4M at HK2 (dense rows). A
+    # slot-table pool is addressed from its base instead.
+    tokens = max(map(sum, zip(query_lens, prefix_lens)), default=0)
+    span = q.numel() * q.element_size()
+    if kv_slots is None:
+        span = max(span, _span_bytes(tokens, stride, k.shape[1]))
+    if span > _MAX_SPAN:
+        return _Rejected(
+            ValueError, "Q and each request's K/V require byte spans <= 2**32 - 2**20"
+        )
+    gfx = get_gfx_runtime()
+    if gfx not in ("gfx942", "gfx950"):
+        return _Rejected(ValueError, "QSA sparse attention requires gfx942 or gfx950")
+    # Strided rows are validated on gfx950 only.
+    if stride != k.shape[1] * 256 and gfx != "gfx950":
+        return _Rejected(ValueError, "Strided K/V rows are supported on gfx950 only")
+    topk = (indices.shape[-1] - 3) // 4 if indices.ndim else 0
+    if (
+        indices.shape != (q.shape[0], 4 * topk + 3)
+        or topk % 256
+        or not 256 <= topk <= 1024
+        or indices.dtype != torch.int32
+        or indices.device != q.device
+        or not indices.is_contiguous()
+        or indices.numel() * indices.element_size() >= 2**31
+    ):
+        return _Rejected(
+            ValueError,
+            "indices must be contiguous device int32 [M,4T+3], T = 256/512/768/1024, "
+            "with byte span < 2**31",
+        )
+    if out is not None:
+        if (
+            out.shape != q.shape
+            or out.dtype != q.dtype
+            or out.device != q.device
+            or not out.is_contiguous()
+            or out.data_ptr() % 16
+        ):
+            return _Rejected(ValueError, "out must be aligned, contiguous and match Q")
+        begin, end = out.data_ptr(), out.data_ptr() + out.numel() * out.element_size()
+        # Strided K/V rows span more bytes than they hold.
+        kv_bytes = _span_bytes(k.shape[0], stride, k.shape[1])
+        sources = [(k.data_ptr(), kv_bytes), (v.data_ptr(), kv_bytes)] + [
+            (source.data_ptr(), source.numel() * source.element_size())
+            for source in (q, indices) + (() if kv_slots is None else (kv_slots,))
+        ]
+        for pointer, size in sources:
+            if begin < pointer + size and pointer < end:
+                return _Rejected(
+                    ValueError, "out must not overlap Q/K/V, indices or kv_slots"
+                )
+    return _Checked(scale, query_lens, prefix_lens, stride, topk)
+
+
+def qsa_sparse_prefill_problem(
+    q,
+    k,
+    v,
+    indices,
+    *,
+    query_lens=None,
+    prefix_lens=None,
+    softmax_scale=None,
+    out=None,
+    kv_slots=None,
+):
+    """The first operand rule this call breaks, as the message flydsl_qsa_sparse_prefill
+    would raise it, or None when the operands are accepted. Takes the op's arguments;
+    states of the process (graph capture, one GPU per process) are not operand rules,
+    so a call accepted here can still raise them."""
+    checked = _check_call(
+        q, k, v, indices, query_lens, prefix_lens, softmax_scale, out, kv_slots
+    )
+    return checked.message if isinstance(checked, _Rejected) else None
+
+
+def _warmup_layouts(group, hk):
+    """Request lengths, none with a prefix, of one call per kernel-variant class of Q
+    heads per KV head `group` and `hk` KV heads. A call's variants follow from whether
+    it gets a union plan (from `_union_min_rows` rows) and that plan's query tile; the
+    rest of what a variant compiles in (heads, scale, width, stride, pool span) is the
+    caller's and fixed across calls."""
+    union_rows = _union_min_rows(group)
+    # Direct kernels only; then the base tile (a second request keeps a full prefill off
+    # the wide tiles).
+    layouts = [(max(union_rows - 1, 1),), (-(-union_rows // 2),) * 2]
+    for tile in (21, 42):
+        # The first row count that has a union plan and takes the wide tile (a device
+        # with few CUs takes it from fewer rows than the union gate).
+        rows = max(prepare.wide_tile_rows(tile), union_rows)
+        if prepare.plan_query_tile(group, hk, (rows,), (0,), 32) == tile:
+            layouts.append((rows,))
+    return tuple(layouts)
+
+
+def _prefill_selection(query_lens, topk, device):
+    """indices [rows, 4 topk + 3] of requests without a prefix, in the layout the op
+    takes: the row at request position p (v = p + 1 tokens) selects its last
+    min(v // 4, topk) complete four-token blocks, then its v % 4 tail tokens; the rest of
+    the row is -1."""
+    visible = torch.cat([torch.arange(1, n + 1, device=device) for n in query_lens])
+    first = 4 * (visible // 4 - topk).clamp(min=0)
+    indices = first[:, None] + torch.arange(4 * topk + 3, device=device)
+    return torch.where(indices < visible[:, None], indices, -1).to(torch.int32)
+
+
+def qsa_sparse_prefill_warmup(
+    run, *, num_q_heads, num_kv_heads, selection_width, device
+):
+    """Compile the kernels the op's calls can use, so that no served call compiles them.
+
+    ``run(q, indices, query_lens, prefix_lens)`` makes one call to the op the way the
+    caller serves it (its K/V, scale, slot table and out), and returns whether it did;
+    the compile keys are those of that call. It is called once per kernel-variant
+    class, on synthetic Q (zeros) and indices, with requests of no prefix: below the
+    union threshold, over it, and at each wide tile's first row count where the tile
+    policy takes one. Returns the request lengths for which ``run`` returned true; none
+    on an architecture other than gfx942 and gfx950 (which have no tile policy), or when
+    `selection_width` is not a width the op takes.
+    """
+    if get_gfx_runtime() not in ("gfx942", "gfx950"):
+        return ()
+    topk, rest = divmod(selection_width - 3, 4)
+    if rest or topk % 256 or not 256 <= topk <= 1024:
+        return ()
+    warmed = []
+    for query_lens in _warmup_layouts(num_q_heads // num_kv_heads, num_kv_heads):
+        q = torch.zeros(
+            sum(query_lens), num_q_heads, 256, dtype=torch.bfloat16, device=device
+        )
+        indices = _prefill_selection(query_lens, topk, device)
+        if run(q, indices, query_lens, (0,) * len(query_lens)):
+            warmed.append(query_lens)
+    torch.cuda.synchronize(device)
+    return tuple(warmed)
+
+
 def flydsl_qsa_sparse_prefill(
     q,
     k,
@@ -247,120 +528,28 @@ def flydsl_qsa_sparse_prefill(
     at a multiple of four (paged pools whose pages are a multiple of four tokens
     satisfy this), and the result is the same as for K/V packed by those slots. A
     pool may exceed 4 GiB (raw direct then uses 64-bit loads); slot values are not
-    validated. Hot calls rebuild the selection: per-layout plans share one private
-    per-stream scratch arena. out is optional and must not overlap Q/K/V, indices or
-    kv_slots. Warm the same stream and layout before graph capture. Captured
-    workspaces stay pinned for graph pointer lifetime and share their stream's
-    scratch: do not replay them concurrently with each other or with that stream's
-    calls. Each kernel variant compiles on its first use: a few seconds with empty
-    FlyDSL caches. One GPU per process (TP uses separate workers).
+    validated. On gfx950, K/V may be strided views: every row holds dense [HK, 256]
+    values and rows sit one 16-byte aligned stride >= HK x 256 and < 2**28 elements
+    apart, the same for K and V (e.g. the halves of one interleaved K|V record per
+    token, read in place); each stride compiles its own kernels. Hot calls rebuild
+    the selection: per-layout plans share one private per-stream scratch arena. out
+    is optional and must not overlap Q/K/V, indices or kv_slots. Warm the same
+    stream and layout before graph capture. Captured workspaces stay pinned for graph
+    pointer lifetime and share their stream's scratch: do not replay them
+    concurrently with each other or with that stream's calls. Each kernel variant
+    compiles on its first use, a few seconds with empty FlyDSL caches; none is
+    prebuilt (PREBUILD_KERNELS / AOT do not cover QSA). One GPU per process (TP uses
+    separate workers).
     """
     global _device
-    if q.ndim != 3 or k.ndim != 3 or v.ndim != 3:
-        raise ValueError("Q/K/V must be contiguous BF16 [tokens, heads, 256]")
-    if isinstance(softmax_scale, (torch.Tensor, bool)):
-        raise TypeError("softmax_scale must be a host scalar or None")
-    scale = 0.0625 if softmax_scale is None else float(softmax_scale)
-    # The kernels multiply masked -inf scores by it: an FP32 zero would give NaN.
-    scaled = scale * math.log2(math.e)
-    if not math.isfinite(scaled) or not 2**-149 <= scaled <= (2 - 2**-23) * 2**127:
-        raise ValueError("softmax_scale * log2(e) must be finite and positive in FP32")
-    if kv_slots is not None and (
-        not isinstance(kv_slots, torch.Tensor)
-        or kv_slots.dtype != torch.int32
-        or kv_slots.ndim != 1
-        or kv_slots.device != q.device
-        or not kv_slots.is_contiguous()
-    ):
-        raise ValueError("kv_slots must be a contiguous device int32 [N] tensor")
-    # The kernels read the slot table at unsigned 32-bit buffer offsets and upload
-    # each request's start in it as int32.
-    if kv_slots is not None and kv_slots.numel() * kv_slots.element_size() > _MAX_SPAN:
-        raise ValueError("kv_slots requires a byte span <= 2**32 - 2**20")
-    keys = k.shape[0] if kv_slots is None else kv_slots.shape[0]
-    query_lens = (q.shape[0],) if query_lens is None else tuple(query_lens)
-    if prefix_lens is None:
-        if len(query_lens) == 1:
-            prefix_lens = (keys - q.shape[0],)
-        else:
-            prefix_lens = (0,) * len(query_lens)
-    else:
-        prefix_lens = tuple(prefix_lens)
-    if (
-        len(query_lens) != len(prefix_lens)
-        or any(
-            type(n) is not int or n < 0 or n >= 2**31
-            for n in (*query_lens, *prefix_lens)
-        )
-        or sum(query_lens) != q.shape[0]
-        or sum(query_lens) + sum(prefix_lens) != keys
-    ):
-        raise ValueError("Host query/prefix lengths must describe the packed Q/K/V")
-    if q.device.type != "cuda" or torch.version.hip is None:
-        raise ValueError("QSA sparse attention requires ROCm gfx942")
-    for tensor in (q, k, v):
-        if (
-            tensor.dtype != torch.bfloat16
-            or tensor.device != q.device
-            or tensor.layout != torch.strided
-            or not tensor.is_contiguous()
-            or tensor.shape[-1] != 256
-        ):
-            raise ValueError("Q/K/V must be contiguous BF16 [tokens, heads, 256]")
-        if tensor.data_ptr() % 16:
-            raise ValueError("Q/K/V require 16-byte alignment")
-    if (
-        k.shape != v.shape
-        or q.shape[1] <= 0
-        or k.shape[1] <= 0
-        or q.shape[1] % k.shape[1]
-    ):
-        raise ValueError(
-            "K/V must match and Q heads must be a positive multiple of KV heads"
-        )
-    if q.shape[1] // k.shape[1] > 16:
-        raise ValueError("At most 16 Q heads per KV head fit the direct fallback wave")
-    # K/V are addressed per request, so only each request's K (or V) span is bounded,
-    # not the packed total: about 8M context tokens at HK1, 4M at HK2. A slot-table
-    # pool is addressed from its base instead.
-    tokens = max(map(sum, zip(query_lens, prefix_lens)), default=0)
-    span = q.numel() if kv_slots is not None else max(q.numel(), tokens * k.stride(0))
-    if span * q.element_size() > _MAX_SPAN:
-        raise ValueError("Q and each request's K/V require byte spans <= 2**32 - 2**20")
-    if get_gfx_runtime() != "gfx942":
-        raise ValueError("QSA sparse attention requires gfx942")
-    topk = (indices.shape[-1] - 3) // 4 if indices.ndim else 0
-    if (
-        indices.shape != (q.shape[0], 4 * topk + 3)
-        or topk % 256
-        or not 256 <= topk <= 1024
-        or indices.dtype != torch.int32
-        or indices.device != q.device
-        or not indices.is_contiguous()
-        or indices.numel() * indices.element_size() >= 2**31
-    ):
-        raise ValueError(
-            "indices must be contiguous device int32 [M,4T+3], T = 256/512/768/1024, "
-            "with byte span < 2**31"
-        )
+    checked = _check_call(
+        q, k, v, indices, query_lens, prefix_lens, softmax_scale, out, kv_slots
+    )
+    if isinstance(checked, _Rejected):
+        raise checked.error(checked.message)
+    scale, query_lens, prefix_lens, stride, topk = checked
     if out is None:
         out = torch.empty_like(q)
-    if (
-        out.shape != q.shape
-        or out.dtype != q.dtype
-        or out.device != q.device
-        or not out.is_contiguous()
-        or out.data_ptr() % 16
-    ):
-        raise ValueError("out must be aligned, contiguous and match Q")
-    begin, end = out.data_ptr(), out.data_ptr() + out.numel() * out.element_size()
-    sources = (q, k, v, indices) + (() if kv_slots is None else (kv_slots,))
-    for source in sources:
-        if (
-            begin < source.data_ptr() + source.numel() * source.element_size()
-            and source.data_ptr() < end
-        ):
-            raise ValueError("out must not overlap Q/K/V, indices or kv_slots")
     if q.shape[0] == 0:
         return out
     with _lock, torch.cuda.device(q.device):
@@ -379,6 +568,8 @@ def flydsl_qsa_sparse_prefill(
             topk,
             # Pool rows: they set the raw direct extent and the WIDE path.
             None if kv_slots is None else k.shape[0],
+            # Row stride: every kernel that reads K/V compiles it in.
+            stride,
         )
         workspace = _workspaces.get(key)
         if workspace is None:
@@ -387,7 +578,7 @@ def flydsl_qsa_sparse_prefill(
                     "Warm attention on this stream and layout before graph capture"
                 )
             workspace = _Workspace(
-                q, k, v, indices, query_lens, prefix_lens, scale, kv_slots
+                q, k, v, indices, query_lens, prefix_lens, scale, stride, kv_slots
             )
             _workspaces[key] = workspace
             for stale in list(_workspaces):

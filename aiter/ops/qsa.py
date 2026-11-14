@@ -8,7 +8,8 @@ Consumers should import from here rather than from the backend-specific
 modules directly.
 """
 
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
+from typing import NamedTuple
 
 import torch
 
@@ -39,7 +40,15 @@ except ImportError:
     _HAS_FLYDSL = False
 
 try:
-    from aiter.ops.flydsl.qsa_sparse_prefill import flydsl_qsa_sparse_prefill
+    from aiter.ops.flydsl.qsa_sparse_prefill import (
+        flydsl_qsa_sparse_prefill,
+    )
+    from aiter.ops.flydsl.qsa_sparse_prefill import (
+        qsa_sparse_prefill_problem as _flydsl_qsa_sparse_prefill_problem,
+    )
+    from aiter.ops.flydsl.qsa_sparse_prefill import (
+        qsa_sparse_prefill_warmup as _flydsl_qsa_sparse_prefill_warmup,
+    )
 
     _HAS_FLYDSL_PREFILL = True
 except ImportError:
@@ -224,7 +233,7 @@ def qsa_sparse_prefill(
     kv_slots: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Sparse prefill/extend attention over packed K/V, or a token pool read through
-    kv_slots; FlyDSL on gfx942 only.
+    kv_slots; FlyDSL on gfx942 and gfx950.
 
     See ``aiter.ops.flydsl.qsa_sparse_prefill.flydsl_qsa_sparse_prefill``.
     """
@@ -243,16 +252,192 @@ def qsa_sparse_prefill(
     )
 
 
+class PagedKVPool(NamedTuple):
+    """K and V of a paged cache as the token pools ``qsa_sparse_prefill`` reads in place
+    through ``kv_slots``: ``k`` and ``v`` are [rows, heads, dim] views of the cache
+    memory, and token ``o`` of page ``p`` is row ``p * rows_per_page + o``."""
+
+    k: torch.Tensor
+    v: torch.Tensor
+    page_size: int
+    rows_per_page: int
+
+
+def qsa_paged_kv_pool(
+    k_cache: torch.Tensor, v_cache: torch.Tensor
+) -> PagedKVPool | None:
+    """K and V of a paged cache [pages, page_size, heads, dim] as token pools, or None
+    when ``qsa_sparse_prefill`` cannot read the cache that way.
+
+    K and V share their shape and strides (they may be the two halves of one record per
+    token), and strides are arbitrary otherwise: pages may sit further apart than they
+    are long. The cache must hold dense head vectors, and K and V must start 16-byte
+    aligned. The op reads four-token blocks at four consecutive pool rows starting at a
+    multiple of four: a block lies in one page and starts at a multiple of four tokens
+    when the page holds a multiple of four tokens, and its row is a multiple of four
+    when pages start a multiple of four rows apart. dtype, head dimension, row stride
+    and the other operand rules are those of ``qsa_sparse_prefill_problem``, asked of
+    the pools.
+    """
+    if k_cache.ndim != 4 or k_cache.shape != v_cache.shape or 0 in k_cache.shape:
+        return None
+    if k_cache.stride() != v_cache.stride():
+        return None
+    pages, page_size, heads, dim = k_cache.shape
+    page_stride, token_stride, head_stride, element_stride = k_cache.stride()
+    if (
+        element_stride != 1
+        or (heads > 1 and head_stride != dim)
+        or token_stride < heads * dim
+    ):
+        return None
+    rows_per_page, rest = divmod(page_stride, token_stride)
+    if (
+        rest
+        or page_size % 4
+        or rows_per_page % 4
+        or k_cache.data_ptr() % 16
+        or v_cache.data_ptr() % 16
+    ):
+        return None
+    shape = ((pages - 1) * rows_per_page + page_size, heads, dim)
+    stride = (token_stride, dim, 1)
+    return PagedKVPool(
+        k_cache.as_strided(shape, stride),
+        v_cache.as_strided(shape, stride),
+        page_size,
+        rows_per_page,
+    )
+
+
+def qsa_paged_kv_slots(
+    query_lens: Sequence[int],
+    prefix_lens: Sequence[int],
+    block_table: torch.Tensor,
+    page_size: int,
+    rows_per_page: int,
+) -> torch.Tensor:
+    """``kv_slots`` for ``qsa_sparse_prefill`` over a ``qsa_paged_kv_pool``: the int32 pool
+    row of every key of the requests, in packed order (request r's tokens
+    0 .. prefix_r + query_r - 1, requests in order). Token t of request r is row
+    ``block_table[r, t // page_size] * rows_per_page + t % page_size``.
+
+    ``block_table`` [requests, pages] holds exactly these requests' rows, on the device
+    of the op. The host lengths are copied without a synchronization and the rest is
+    device work, so the table can be built per step and shared by every layer. Build it
+    outside graph capture: the lengths are staged in host memory and copied when it runs.
+    """
+    lengths = [q + p for q, p in zip(query_lens, prefix_lens, strict=True)]
+    longest = max(lengths, default=0)
+    if block_table.ndim != 2 or block_table.shape[0] != len(lengths):
+        raise ValueError("block_table must be [requests, pages], one row per request")
+    if -(-longest // page_size) > block_table.shape[1]:
+        raise ValueError("block_table is too narrow for the longest request")
+    device = block_table.device
+    counts = torch.tensor(
+        lengths, dtype=torch.int64, device="cpu", pin_memory=device.type == "cuda"
+    )
+    counts = counts.to(device, non_blocking=True)
+    total = sum(lengths)
+    request = torch.repeat_interleave(
+        torch.arange(len(lengths), device=device), counts, output_size=total
+    )
+    first = torch.cumsum(counts, 0) - counts
+    token = torch.arange(total, device=device) - first[request]
+    page = block_table[request, token // page_size].long()
+    return (page * rows_per_page + token % page_size).to(torch.int32)
+
+
+def qsa_sparse_prefill_problem(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    indices: torch.Tensor,
+    *,
+    query_lens: Sequence[int] | None = None,
+    prefix_lens: Sequence[int] | None = None,
+    softmax_scale: float | None = None,
+    out: torch.Tensor | None = None,
+    kv_slots: torch.Tensor | None = None,
+) -> str | None:
+    """The first operand rule a ``qsa_sparse_prefill`` call with these arguments breaks,
+    as the message it raises, or None when the operands are accepted. States of the
+    process (graph capture, one GPU per process) are not operand rules.
+
+    See ``aiter.ops.flydsl.qsa_sparse_prefill.qsa_sparse_prefill_problem``.
+    """
+    if not _HAS_FLYDSL_PREFILL:
+        return "QSA sparse prefill requires FlyDSL"
+    return _flydsl_qsa_sparse_prefill_problem(
+        q,
+        k,
+        v,
+        indices,
+        query_lens=query_lens,
+        prefix_lens=prefix_lens,
+        softmax_scale=softmax_scale,
+        out=out,
+        kv_slots=kv_slots,
+    )
+
+
+def can_use_flydsl_qsa_sparse_prefill(*args, **kwargs) -> bool:
+    """Whether ``qsa_sparse_prefill_problem`` finds no rule broken (same arguments)."""
+    return qsa_sparse_prefill_problem(*args, **kwargs) is None
+
+
+def qsa_sparse_prefill_available() -> bool:
+    """Whether the FlyDSL backend of ``qsa_sparse_prefill`` imports in this process: the
+    answer a consumer asks once. The device and each call are asked of
+    ``qsa_sparse_prefill_problem``."""
+    return _HAS_FLYDSL_PREFILL
+
+
+def qsa_sparse_prefill_warmup(
+    run: Callable[[torch.Tensor, torch.Tensor, tuple[int, ...], tuple[int, ...]], bool],
+    *,
+    num_q_heads: int,
+    num_kv_heads: int,
+    selection_width: int,
+    device: torch.device,
+) -> tuple[tuple[int, ...], ...]:
+    """Compile the kernels ``qsa_sparse_prefill`` calls can use, through ``run``: one
+    call of the caller's own per kernel-variant class, on synthetic Q and indices.
+    ``run(q, indices, query_lens, prefix_lens)`` makes the call and returns whether it
+    did. Returns the request lengths that ran: none where the op cannot run (FlyDSL
+    missing, see ``qsa_sparse_prefill_available``, or an architecture it does not
+    support).
+
+    See ``aiter.ops.flydsl.qsa_sparse_prefill.qsa_sparse_prefill_warmup``.
+    """
+    if not _HAS_FLYDSL_PREFILL:
+        return ()
+    return _flydsl_qsa_sparse_prefill_warmup(
+        run,
+        num_q_heads=num_q_heads,
+        num_kv_heads=num_kv_heads,
+        selection_width=selection_width,
+        device=device,
+    )
+
+
 __all__ = [
     "DEFAULT_LOGITS_WORKSPACE_BYTES",
     "FP4_GROUP",
     "FP8_DTYPE",
     "FP8_MAX",
+    "PagedKVPool",
+    "can_use_flydsl_qsa_sparse_prefill",
     "qsa_cache_row_layout",
     "qsa_expand_block_indices",
+    "qsa_paged_kv_pool",
+    "qsa_paged_kv_slots",
     "qsa_paged_mqa_logits",
     "qsa_select_paged_tokens",
     "qsa_sparse_paged_gqa",
     "qsa_sparse_prefill",
+    "qsa_sparse_prefill_available",
+    "qsa_sparse_prefill_problem",
+    "qsa_sparse_prefill_warmup",
     "qsa_store_quantized_rows",
 ]

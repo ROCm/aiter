@@ -5,6 +5,9 @@
 Four-token KV blocks are stored in the native QK/PV operand layouts. One query
 wave then needs no K-data bpermutes or PV byte permutations. Original public
 KV tensors remain unchanged; private scratch is refreshed on every call.
+
+On gfx950 the same operand words feed 16x16x32 MFMAs and probabilities convert
+with v_cvt_pk_bf16_f32; each key tile then takes one V round trip (gfx950 part).
 """
 
 import math
@@ -13,6 +16,8 @@ import flydsl.compiler as flyc
 import flydsl.expr as fx
 from flydsl.expr import rocdl
 
+from aiter.jit.utils.chip_info import get_gfx_runtime
+
 from .sparse_prefill_common import (
     _MAX_FLOOR,
     _buffer,
@@ -20,11 +25,14 @@ from .sparse_prefill_common import (
     _buffer_store_words,
     _buffer_words,
     _exp,
+    _kv_extent,
+    _kv_offset,
     _load_lds,
     _maximum,
     _mfma,
     _min,
     _pack_bf16,
+    _pack_bf16_950,
     _pin,
     _stage_end,
     _target_features,
@@ -66,6 +74,7 @@ def _output(
     active,
     gated,
     nq,
+    gfx950=False,
 ):
     shared = fx.Int32(fx.ptrtoint(fx.get_iter(storage)))
     row = (tid >> 6) * 16 + (tid & 15)
@@ -75,7 +84,7 @@ def _output(
             values = fx.Vector.from_elements(
                 [acc[n * 4 + i] * inv for n in range(8)], fx.Float32
             )
-            words = _pack_bf16(values)
+            words = (_pack_bf16_950 if gfx950 else _pack_bf16)(values)
             col = (((tid >> 4) & 3) * 4 + i) * 8 + half * 128
             address = fx.Int32(shared + ((row * 256 + col) ^ ((row & 7) * 8)) * 2)
             _write_address(address, words)
@@ -117,6 +126,7 @@ def _pack_block(
     lane,
     packed,
     hk,
+    stride,
     source_extent,
     extent,
     slots,
@@ -127,22 +137,22 @@ def _pack_block(
     start = fx.Int32(sources[_min(block, packed - 1)])
     token, chunk = lane >> 4, lane & 15
     dim = half * 128 + chunk * 8
+    # K/V rows sit stride elements apart: hk * 256 values, then a gap of padding.
+    row_bytes, gap = stride * 2, stride - hk * 256
     if slotted:
         # A wave packs one block, four consecutive pool rows from the slot table's first:
         # give it its own 64-bit base, so the pool may exceed 4 GiB. kr/vr are the pool
         # addresses here.
         row = _uniform(fx.Int32(slots[_uniform(start)]))
-        base = (fx.Int64(row) * hk + _uniform(head)) * 512
-        kr = _buffer_at(kr + base, 4 * hk * 512)
-        vr = _buffer_at(vr + base, 4 * hk * 512)
-        source = valid.select(
-            fx.Uint32(token * hk * 512 + dim * 2), fx.Uint32(4 * hk * 512)
-        )
+        base = _kv_offset(fx.Int64(row), _uniform(head), hk, gap, 2)
+        kr = _buffer_at(kr + base, 4 * row_bytes)
+        vr = _buffer_at(vr + base, 4 * row_bytes)
+        offset = _kv_offset(token, 0, hk, gap, 2, dim)
+        source = valid.select(fx.Uint32(offset), fx.Uint32(4 * row_bytes))
     else:
         # Tokens past a request's end are masked by the direct kernel.
-        source = valid.select(
-            fx.Uint32((start + token) * hk + head) * 512 + dim * 2, source_extent
-        )
+        offset = _kv_offset(fx.Uint32(start + token), head, hk, gap, 2, dim)
+        source = valid.select(offset, source_extent)
     key = _buffer_words(kr, source)
     target = (
         fx.Uint32(
@@ -191,11 +201,12 @@ def _pack_block(
 
 
 @flyc.jit
-def _pack_body(K, V, PK, PV, SOURCES, SLOTS, N, PACKED, HK, SLOTTED):
+def _pack_body(K, V, PK, PV, SOURCES, SLOTS, N, PACKED, HK, SLOTTED, KV_STRIDE):
     tid = fx.thread_idx.x
     lane, half = tid & 63, (tid >> 6) & 1
     first = fx.block_idx.x * 8 + (tid >> 7)
-    source_extent = fx.Uint32(N) * HK * 512
+    # K/V rows sit KV_STRIDE elements apart: HK * 256 values, then a gap of padding.
+    source_extent = _kv_extent(N, 0, HK, KV_STRIDE - HK * 256)
     extent = fx.Uint32(PACKED) * 4 * HK * 512
     if fx.const_expr(SLOTTED):
         kr = fx.Int64(fx.ptrtoint(fx.get_iter(K)))
@@ -216,6 +227,7 @@ def _pack_body(K, V, PK, PV, SOURCES, SLOTS, N, PACKED, HK, SLOTTED):
             lane,
             PACKED,
             HK,
+            KV_STRIDE,
             source_extent,
             extent,
             slots,
@@ -235,8 +247,9 @@ def _pack(
     PACKED: fx.Int32,
     HK: fx.Constexpr[int],
     SLOTTED: fx.Constexpr[bool],
+    KV_STRIDE: fx.Constexpr[int],
 ):
-    _pack_body(K, V, PK, PV, SOURCES, SLOTS, N, PACKED, HK, SLOTTED)
+    _pack_body(K, V, PK, PV, SOURCES, SLOTS, N, PACKED, HK, SLOTTED, KV_STRIDE)
 
 
 @flyc.kernel(name="sparse_prefill_pack_kv_gated_bf16_d256")
@@ -252,9 +265,10 @@ def _pack_gated(
     PACKED: fx.Int32,
     HK: fx.Constexpr[int],
     SLOTTED: fx.Constexpr[bool],
+    KV_STRIDE: fx.Constexpr[int],
 ):
     if _uniform(DIRECT_FLAG[0]) != 0:
-        _pack_body(K, V, PK, PV, SOURCES, SLOTS, N, PACKED, HK, SLOTTED)
+        _pack_body(K, V, PK, PV, SOURCES, SLOTS, N, PACKED, HK, SLOTTED, KV_STRIDE)
 
 
 def _key_offset(cached, n, visible, extent, hk, topk):
@@ -298,15 +312,19 @@ def _mask_value_tail(value, tile, segment, lane, visible, TOPK: fx.Constexpr[int
     return value
 
 
-def _value_load(resource, source_base, tile, segment, half, lane, visible, hk, topk):
+def _value_words(resource, source_base, half, lane, hk):
     base = fx.Uint32(source_base) + half * 2 * hk * 512 + (lane & 15) * 16
     parts = [
         _buffer_words(resource, base + (part // 2) * hk * 512 + (part % 2) * 256)
         for part in range(4)
     ]
-    value = fx.Vector.from_elements(
+    return fx.Vector.from_elements(
         [part[i] for part in parts for i in range(4)], fx.Int32
     )
+
+
+def _value_load(resource, source_base, tile, segment, half, lane, visible, hk, topk):
+    value = _value_words(resource, source_base, half, lane, hk)
     # A packed block may contain later tokens with NaNs; zero those BF16
     # elements before MFMA rather than relying on zero probabilities.
     return _mask_value_tail(value, tile, segment, lane, visible, topk)
@@ -387,6 +405,114 @@ def _rescale(output0, output1, alpha):
     return output0, output1
 
 
+def _softmax(scores0, scores1, count, tile, lane, scale, maximum, total, o0, o1):
+    """Online softmax of one BN32 tile: (new max, P of its 8 lane keys, l, rescaled O)."""
+    scaled0, scaled1 = _scale_scores(scores0, scores1, count, tile, lane, scale)
+    scores = [scaled0[i] for i in range(4)] + [scaled1[i] for i in range(4)]
+    candidate = fx.Float32(_MAX_FLOOR)
+    for score in scores:
+        candidate = _maximum(candidate, score)
+    candidate = _reduce(candidate, True)
+    updated = _maximum(maximum, candidate)
+    alpha = _exp(maximum - updated)
+    probabilities = fx.Vector.from_elements(
+        [_exp(value - updated) for value in scores], fx.Float32
+    )
+    current = fx.Float32(0.0)
+    for i in fx.range_constexpr(8):
+        current = current + probabilities[i]
+    current = _reduce(current, False)
+    total = total * alpha + current
+    o0, o1 = _rescale(o0, o1, alpha)
+    return updated, probabilities, total, o0, o1
+
+
+# ---- gfx950 (CDNA4): 16x16x32 MFMAs, native BF16 ----
+#
+# A K32 MFMA is two K16 MFMAs of the gfx942 loop side by side: lane l holds A row and
+# B column l % 16 and K values (K / 4) * (l >> 4) .. (FlyDSL's MFMA layouts), so the
+# K32 operands are the K16 ones concatenated and S and O keep their layouts. V never
+# passes through LDS here: packed V is stored in the PV operand order by the pack
+# kernel, raw V is transposed in registers (v_perm), so ds_read_b64_tr_b16 does not
+# apply. Per tile, with g = lane >> 4 and the two 16-key segments s of BN32:
+#   QK: segment s's K32 step j merges K16 steps 2j, 2j + 1: K and Q words 4j .. 4j + 3
+#       (dims 32j + 8g .. + 7).
+#   PV: lane group g's eight K32 keys are segment 0's keys 4g .. 4g + 3, then segment
+#       1's: B is P of both segments (4 words), and A of dims group n is segment 0's
+#       K16 operand words of n, then segment 1's.
+# The gfx942 loop requests segment 1's V only after segment 0's has landed, and runs
+# segment 0's PV meanwhile: two V round trips a tile. A K32 PV MFMA reads both
+# segments, so the gfx950 loop splits a tile's V by dims half instead: half 0 of both
+# segments before QK, half 1 after it, and K of the next tile before PV, so a tile
+# takes one round trip. So that both V halves and the next tile's K fit in the VGPRs
+# of two waves a SIMD, Q waits between tiles in LDS that the epilogue uses later
+# (_store_q950, reloaded each tile); the block-ID prefetch moves one tile ahead so
+# that K's addresses do not wait for V.
+
+QK950 = tuple((step, s) for step in range(8) for s in range(2))  # K32 QK, issue order
+
+
+def _qk_words950(step):
+    """K and Q words of K32 QK step `step`: the words of K16 steps 2 * step, + 1."""
+    return [step * 4 + i for i in range(4)]
+
+
+def _pv_words950(n):
+    """(key segment, packed V word) of the A operand of K32 PV MFMA n."""
+    return [(segment, n * 2 + i) for segment in range(2) for i in range(2)]
+
+
+def _store_q950(storage, q, lane, base):
+    """Q words of the lane into LDS at base: words 4j .. 4j + 3 at base + 1024j + 16 lane."""
+    shared = fx.Int32(fx.ptrtoint(fx.get_iter(storage)))
+    q = fx.Vector(q)
+    for j in range(8):
+        _write_address(
+            shared + base + lane * 16 + j * 1024,
+            fx.Vector.from_elements([q[j * 4 + i] for i in range(4)], fx.Int32),
+        )
+
+
+def _load_q950(storage, lane, base):
+    """_store_q950's words back (eight ds_read_b128)."""
+    parts = [_load_lds(storage, base + lane * 16, j * 1024) for j in range(8)]
+    return fx.Vector.from_elements([p[i] for p in parts for i in range(4)], fx.Int32)
+
+
+def _qk950(q, k0, k1):
+    """_qk on gfx950: S of key segments 0 and 1, in _qk's layout, from K32 MFMAs."""
+    q, keys = fx.Vector(q), (fx.Vector(k0), fx.Vector(k1))
+    acc = [fx.Vector.filled(4, 0.0, fx.Float32) for _ in range(2)]
+    for step, segment in QK950:
+        words = _qk_words950(step)
+        acc[segment] = _mfma(
+            fx.Vector.from_elements([keys[segment][i] for i in words], fx.Int32),
+            fx.Vector.from_elements([q[i] for i in words], fx.Int32),
+            acc[segment],
+            32,
+        )
+    return acc[0], acc[1]
+
+
+def _pv950(p, values, output):
+    """_pv on gfx950: O += P V of both key segments. p holds P of both (4 words),
+    values the two segments' packed V words of one dims half."""
+    rocdl.s_setprio(2)
+    output = fx.Vector(output)
+    values = [fx.Vector(value) for value in values]
+    acc = []
+    for n in range(8):
+        c = fx.Vector.from_elements([output[n * 4 + i] for i in range(4)], fx.Float32)
+        a = fx.Vector.from_elements(
+            [values[segment][word] for segment, word in _pv_words950(n)], fx.Int32
+        )
+        acc.append(_mfma(a, p, c, 32))
+    rocdl.s_setprio(0)
+    return fx.Vector.from_elements(
+        [acc[n][i] for n in range(8) for i in range(4)], fx.Float32
+    )
+
+
 @flyc.jit
 def _body(
     Q: fx.Tensor,
@@ -402,6 +528,7 @@ def _body(
     NQ: fx.Int32,
     SCALE: fx.Constexpr[float],
     TOPK: fx.Constexpr[int],
+    GFX950: fx.Constexpr[bool],
 ):
     storage = (
         fx.SharedAllocator()
@@ -425,17 +552,18 @@ def _body(
         fx.Uint32((wave * H + (lane & 15)) * 512), qe
     )
     q = _load(qr, qoffset, lane)
-    extent = (fx.Uint32(kv_len) * HK - hkv) * 512
+    # Packed K/V: dense rows.
+    extent = _kv_extent(kv_len, hkv, HK, 0)
     kr = _buffer(
         fx.make_view(
-            fx.get_iter(K) + (fx.Int64(k0) * HK + hkv) * 256,
+            fx.get_iter(K) + _kv_offset(fx.Int64(k0), hkv, HK, 0),
             fx.make_layout(extent // 2, 1),
         ),
         extent,
     )
     vr = _buffer(
         fx.make_view(
-            fx.get_iter(V) + (fx.Int64(k0) * HK + hkv) * 256,
+            fx.get_iter(V) + _kv_offset(fx.Int64(k0), hkv, HK, 0),
             fx.make_layout(extent // 2, 1),
         ),
         extent,
@@ -465,81 +593,132 @@ def _body(
     rocdl.s_waitcnt(vmcnt=0)
     rocdl.sched_barrier(0)
     next_cached = cached
-    for t in range(fx.Int32(0), tiles, fx.Int32(1)):
-        vrow0 = fx.Int32(
-            rocdl.ds_bpermute(fx.Int32.ir_type, (lane >> 4) * 16, fx.Int32(offset0))
-        )
-        vrow1 = fx.Int32(
-            rocdl.ds_bpermute(fx.Int32.ir_type, (lane >> 4) * 16, fx.Int32(offset1))
-        )
-        rocdl.s_waitcnt(lgkmcnt=0)
-        rocdl.sched_barrier(0)
-        values0 = _value_load(vr, vrow0, t, 0, 0, lane, visible, HK, TOPK)
-        values1 = _value_load(vr, vrow0, t, 0, 1, lane, visible, HK, TOPK)
-        if ((t + 1) & 7) == 0:
-            chunk = _min((t + 1) >> 3, fx.Int32(TOPK // 64 - 1)) * 64
-            next_cached = fx.Int32(blocks[row * TOPK + chunk + lane])
-        rocdl.sched_barrier(0)
-        # The next index-cache load is younger than V0. vmcnt(8) is
-        # conservative on those boundary iterations and still releases K.
-        rocdl.s_waitcnt(vmcnt=8)
-        rocdl.sched_barrier(0)
-        scores0, scores1 = _qk(q, kval0, kval1)
-        scaled0, scaled1 = _scale_scores(scores0, scores1, count, t, lane, scale)
-        scores = [scaled0[i] for i in range(4)] + [scaled1[i] for i in range(4)]
-        candidate = fx.Float32(_MAX_FLOOR)
-        for score in scores:
-            candidate = _maximum(candidate, score)
-        candidate = _reduce(candidate, True)
-        updated = _maximum(maximum, candidate)
-        alpha = _exp(maximum - updated)
-        probabilities = fx.Vector.from_elements(
-            [_exp(value - updated) for value in scores], fx.Float32
-        )
-        current = fx.Float32(0.0)
-        for i in fx.range_constexpr(8):
-            current = current + probabilities[i]
-        current = _reduce(current, False)
-        total = total * alpha + current
-        o0, o1 = _rescale(o0, o1, alpha)
-        rocdl.s_waitcnt(lgkmcnt=0)
-        rocdl.sched_barrier(0)
-        rocdl.s_waitcnt(vmcnt=0)
-        rocdl.sched_barrier(0)
-        if ((t + 1) & 7) == 0:
-            cached = next_cached
-        following0 = _min((t + 1) * 32, (((count + 15) >> 4) - 1) * 16)
-        following1 = _min((t + 1) * 32 + 16, (((count + 15) >> 4) - 1) * 16)
-        offset0 = _key_offset(
-            cached, following0 + (lane & 15), visible, extent, HK, TOPK
-        )
-        offset1 = _key_offset(
-            cached, following1 + (lane & 15), visible, extent, HK, TOPK
-        )
-        p0 = _pack_bf16(
-            fx.Vector.from_elements([probabilities[i] for i in range(4)], fx.Float32)
-        ).bitcast(fx.Int16)
-        p1 = _pack_bf16(
-            fx.Vector.from_elements(
-                [probabilities[4 + i] for i in range(4)], fx.Float32
+    if fx.const_expr(not GFX950):
+        for t in range(fx.Int32(0), tiles, fx.Int32(1)):
+            vrow0 = fx.Int32(
+                rocdl.ds_bpermute(fx.Int32.ir_type, (lane >> 4) * 16, fx.Int32(offset0))
             )
-        ).bitcast(fx.Int16)
-        next_values0 = _value_load(vr, vrow1, t, 1, 0, lane, visible, HK, TOPK)
-        next_values1 = _value_load(vr, vrow1, t, 1, 1, lane, visible, HK, TOPK)
-        rocdl.sched_barrier(0)
-        o0 = _pv(p0, values0, o0)
-        rocdl.sched_barrier(0)
-        kval0 = _key_load(kr, offset0, lane, HK)
-        rocdl.sched_barrier(0)
-        o1 = _pv(p0, values1, o1)
-        rocdl.sched_barrier(0)
-        kval1 = _key_load(kr, offset1, lane, HK)
-        rocdl.sched_barrier(0)
-        rocdl.s_waitcnt(vmcnt=16)
-        rocdl.sched_barrier(0)
-        o0 = _pv(p1, next_values0, o0)
-        o1 = _pv(p1, next_values1, o1)
-        maximum = updated
+            vrow1 = fx.Int32(
+                rocdl.ds_bpermute(fx.Int32.ir_type, (lane >> 4) * 16, fx.Int32(offset1))
+            )
+            rocdl.s_waitcnt(lgkmcnt=0)
+            rocdl.sched_barrier(0)
+            values0 = _value_load(vr, vrow0, t, 0, 0, lane, visible, HK, TOPK)
+            values1 = _value_load(vr, vrow0, t, 0, 1, lane, visible, HK, TOPK)
+            if ((t + 1) & 7) == 0:
+                chunk = _min((t + 1) >> 3, fx.Int32(TOPK // 64 - 1)) * 64
+                next_cached = fx.Int32(blocks[row * TOPK + chunk + lane])
+            rocdl.sched_barrier(0)
+            # The next index-cache load is younger than V0. vmcnt(8) is
+            # conservative on those boundary iterations and still releases K.
+            rocdl.s_waitcnt(vmcnt=8)
+            rocdl.sched_barrier(0)
+            scores0, scores1 = _qk(q, kval0, kval1)
+            updated, probabilities, total, o0, o1 = _softmax(
+                scores0, scores1, count, t, lane, scale, maximum, total, o0, o1
+            )
+            rocdl.s_waitcnt(lgkmcnt=0)
+            rocdl.sched_barrier(0)
+            rocdl.s_waitcnt(vmcnt=0)
+            rocdl.sched_barrier(0)
+            if ((t + 1) & 7) == 0:
+                cached = next_cached
+            following0 = _min((t + 1) * 32, (((count + 15) >> 4) - 1) * 16)
+            following1 = _min((t + 1) * 32 + 16, (((count + 15) >> 4) - 1) * 16)
+            offset0 = _key_offset(
+                cached, following0 + (lane & 15), visible, extent, HK, TOPK
+            )
+            offset1 = _key_offset(
+                cached, following1 + (lane & 15), visible, extent, HK, TOPK
+            )
+            p0 = _pack_bf16(
+                fx.Vector.from_elements(
+                    [probabilities[i] for i in range(4)], fx.Float32
+                )
+            ).bitcast(fx.Int16)
+            p1 = _pack_bf16(
+                fx.Vector.from_elements(
+                    [probabilities[4 + i] for i in range(4)], fx.Float32
+                )
+            ).bitcast(fx.Int16)
+            next_values0 = _value_load(vr, vrow1, t, 1, 0, lane, visible, HK, TOPK)
+            next_values1 = _value_load(vr, vrow1, t, 1, 1, lane, visible, HK, TOPK)
+            rocdl.sched_barrier(0)
+            o0 = _pv(p0, values0, o0)
+            rocdl.sched_barrier(0)
+            kval0 = _key_load(kr, offset0, lane, HK)
+            rocdl.sched_barrier(0)
+            o1 = _pv(p0, values1, o1)
+            rocdl.sched_barrier(0)
+            kval1 = _key_load(kr, offset1, lane, HK)
+            rocdl.sched_barrier(0)
+            rocdl.s_waitcnt(vmcnt=16)
+            rocdl.sched_barrier(0)
+            o0 = _pv(p1, next_values0, o0)
+            o1 = _pv(p1, next_values1, o1)
+            maximum = updated
+    else:
+        _store_q950(storage, q, lane, 0)
+        for t in range(fx.Int32(0), tiles, fx.Int32(1)):
+            vrows = [
+                fx.gpu.shuffle_idx(fx.Int32(offset), (lane >> 4) << 2, 64)
+                for offset in (offset0, offset1)
+            ]
+            rocdl.s_waitcnt(lgkmcnt=0)
+            rocdl.sched_barrier(0)
+            # Switch to the block IDs prefetched a tile ago here, where they have
+            # landed: a switch after this tile's prefetch would make LLVM wait for it.
+            if ((t + 1) & 7) == 0:
+                cached = next_cached
+            values0 = [_value_words(vr, vrow, 0, lane, HK) for vrow in vrows]
+            q_words = _load_q950(storage, lane, 0)
+            rocdl.sched_barrier(0)
+            # Only this tile's K, requested a tile ago, is older than the eight V
+            # loads of dims half 0: vmcnt(8) waits for K, leaving V in flight.
+            rocdl.s_waitcnt(vmcnt=8)
+            rocdl.sched_barrier(0)
+            scores0, scores1 = _qk950(q_words, kval0, kval1)
+            rocdl.sched_barrier(0)
+            values1 = [_value_words(vr, vrow, 1, lane, HK) for vrow in vrows]
+            if ((t + 2) & 7) == 0:
+                chunk = _min((t + 2) >> 3, fx.Int32(TOPK // 64 - 1)) * 64
+                next_cached = fx.Int32(blocks[row * TOPK + chunk + lane])
+            rocdl.sched_barrier(0)
+            updated, probabilities, total, o0, o1 = _softmax(
+                scores0, scores1, count, t, lane, scale, maximum, total, o0, o1
+            )
+            p = _pack_bf16_950(probabilities)
+            rocdl.sched_barrier(0)
+            following0 = _min((t + 1) * 32, (((count + 15) >> 4) - 1) * 16)
+            following1 = _min((t + 1) * 32 + 16, (((count + 15) >> 4) - 1) * 16)
+            offset0 = _key_offset(
+                cached, following0 + (lane & 15), visible, extent, HK, TOPK
+            )
+            offset1 = _key_offset(
+                cached, following1 + (lane & 15), visible, extent, HK, TOPK
+            )
+            kval0 = _key_load(kr, offset0, lane, HK)
+            kval1 = _key_load(kr, offset1, lane, HK)
+            rocdl.sched_barrier(0)
+            # V half 0 is the oldest; younger are half 1, a global block-ID prefetch
+            # (every eighth tile) and the sixteen K loads: vmcnt(24) waits for half 0.
+            rocdl.s_waitcnt(vmcnt=24)
+            rocdl.sched_barrier(0)
+            values0 = [
+                _mask_value_tail(value, t, segment, lane, visible, TOPK)
+                for segment, value in enumerate(values0)
+            ]
+            o0 = _pv950(p, values0, o0)
+            rocdl.sched_barrier(0)
+            # Only K's sixteen loads are younger than half 1 and the block IDs.
+            rocdl.s_waitcnt(vmcnt=16)
+            rocdl.sched_barrier(0)
+            values1 = [
+                _mask_value_tail(value, t, segment, lane, visible, TOPK)
+                for segment, value in enumerate(values1)
+            ]
+            o1 = _pv950(p, values1, o1)
+            maximum = updated
     rocdl.s_waitcnt(vmcnt=0)
     _stage_end()
     inv = (total > 0).select(fx.Float32(1.0) / total, fx.Float32(0.0))
@@ -564,6 +743,7 @@ def _body(
         None,
         False,
         NQ,
+        GFX950,
     )
 
 
@@ -583,6 +763,7 @@ def _kernel(
     GATED: fx.Constexpr[bool],
     SCALE: fx.Constexpr[float],
     TOPK: fx.Constexpr[int],
+    GFX950: fx.Constexpr[bool],
 ):
     task = fx.block_idx.x
     if fx.const_expr(GATED):
@@ -604,6 +785,7 @@ def _kernel(
                 NQ,
                 SCALE,
                 TOPK,
+                GFX950,
             )
     else:
         _body(
@@ -620,6 +802,7 @@ def _kernel(
             NQ,
             SCALE,
             TOPK,
+            GFX950,
         )
 
 
@@ -650,17 +833,32 @@ def _launch(
     SCALE: fx.Constexpr[float],
     TOPK: fx.Constexpr[int],
     SLOTTED: fx.Constexpr[bool],
+    GFX950: fx.Constexpr[bool],
+    KV_STRIDE: fx.Constexpr[int],
     stream: fx.Stream,
 ):
     if TASKS > 0:
         if fx.const_expr(GATED):
             _pack_gated(
-                K, V, PK, PV, SOURCES, SLOTS, DIRECT_FLAG, NK, PACKED, HK, SLOTTED
+                K,
+                V,
+                PK,
+                PV,
+                SOURCES,
+                SLOTS,
+                DIRECT_FLAG,
+                NK,
+                PACKED,
+                HK,
+                SLOTTED,
+                KV_STRIDE,
             ).launch(
                 grid=((PACKED * HK + 7) // 8, 1, 1), block=(256, 1, 1), stream=stream
             )
         else:
-            _pack(K, V, PK, PV, SOURCES, SLOTS, NK, PACKED, HK, SLOTTED).launch(
+            _pack(
+                K, V, PK, PV, SOURCES, SLOTS, NK, PACKED, HK, SLOTTED, KV_STRIDE
+            ).launch(
                 grid=((PACKED * HK + 7) // 8, 1, 1), block=(256, 1, 1), stream=stream
             )
         kernel = _kernel(
@@ -678,6 +876,7 @@ def _launch(
             GATED,
             SCALE,
             TOPK,
+            GFX950,
             value_attrs={"llvm.target_features": _target_features()},
         )
         if fx.const_expr(GATED):
@@ -723,6 +922,8 @@ def launch_args(inputs, prepared, out, tasks, stream):
         inputs.scale,
         inputs.topk,
         prepared.slotted,
+        get_gfx_runtime() == "gfx950",
+        inputs.kv_stride,
         stream,
     )
 
