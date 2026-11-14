@@ -264,11 +264,15 @@ def _launch(kernel_fn, *args):
 
 def _quant_per_tensor(x, scale=None, quant_dtype=torch.float8_e4m3fn, num_rows=None):
     assert scale is None
-    assert num_rows is None
 
     amax = torch.zeros(1, dtype=torch.float32, device=x.device)
     xq = torch.empty_like(x, dtype=quant_dtype)
-    flydsl_absmax()(x, amax)
+    if num_rows is None:
+        flydsl_absmax()(x, amax)
+    else:
+        # Rows at and past num_rows (CUDA-graph padding) hold stale values.
+        valid = torch.arange(x.shape[0], device=x.device)[:, None] < num_rows
+        amax.copy_(torch.where(valid, x.abs(), 0).amax())
     flydsl_quant_per_tensor(quant_dtype)(x, amax, xq)
     fmax = torch.finfo(quant_dtype).max
     xs = amax / fmax
@@ -347,7 +351,8 @@ def _run_prefill(
             hidden_states,
             scale=None,
             quant_dtype=w1.dtype,
-            num_rows=None,
+            # Per-token scales are row-local; a per-tensor one must skip padding.
+            num_rows=num_local_tokens if quant_type == QuantType.per_Tensor else None,
         )
         a_scale = a_scale.to(torch.float32).contiguous()
     else:

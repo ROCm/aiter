@@ -353,7 +353,10 @@ def make_case(
     else:
         w1_q, w1_scale = torch_quant(w1, quant_dtype=q_dtype)
         w2_q, w2_scale = torch_quant(w2, quant_dtype=q_dtype)
-    a1, a1_scale = quantize_activation(hidden)
+    # Rows at and past num_local_tokens (CUDA-graph padding) run no route: the
+    # reference sees zeros there, so its activation scales come from the rest.
+    local = token - min(65, (token + 1) // 2) if routing == "local_tokens" else token
+    a1, a1_scale = quantize_activation(torch.cat((hidden[:local], hidden[local:] * 0)))
     stage1 = torch_moe_stage1(
         a1,
         w1_q,
@@ -380,13 +383,14 @@ def make_case(
     )
     num_local_tokens = None
     if routing == "local_tokens":
-        # Rows at and past num_local_tokens (CUDA-graph padding) run no route.
-        local = token - min(65, (token + 1) // 2)
         num_local_tokens = torch.tensor([local], dtype=torch.int32)
-        # A captured graph's padding rows hold stale ids: route them past the
-        # expert table, so reading one shows up.
+        # A captured graph's padding rows hold stale ids and activations: route
+        # them past the expert table and make them large, so reading one, or a
+        # per-tensor scale over them, shows up.
         topk_ids = topk_ids.clone()
         topk_ids[local:] = experts
+        hidden = hidden.clone()
+        hidden[local:] = 1e4
     request = FusedMoeRequest(
         hidden_states=hidden,
         w1=behind_nan_expert(shuffle_weight(w1_q, layout=(16, 16))),
@@ -648,6 +652,18 @@ EDGE_CASES = [
             (200, "16_128_64_False"),
             (2048, "64_128_256_True:1x4_64x256:128"),
         )
+    ),
+    # The per-tensor activation scale skips the stale padding rows.
+    (
+        2048,
+        2560,
+        320,
+        513,
+        11,
+        "per_tensor",
+        "silu",
+        "local_tokens",
+        "64_128_256_True:1x4_64x256:128",
     ),
     (
         4096,
