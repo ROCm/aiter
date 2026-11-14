@@ -108,6 +108,52 @@ def _gfx1250_exact_sigmoid_topk(
     )
 
 
+def _can_use_sqrtsoftplus_384_topk(
+    topk_weights: torch.Tensor,
+    topk_indices: torch.Tensor,
+    gating_output: torch.Tensor,
+    correction_bias: torch.Tensor,
+    need_renorm: bool,
+    score_func: str,
+) -> bool:
+    """Whether the Triton 384-expert sqrtsoftplus top-k gives this call's result."""
+    if (
+        score_func != "sqrtsoftplus"
+        or not need_renorm
+        or gating_output.ndim != 2
+        or gating_output.shape[1] != 384
+    ):
+        return False
+    from .triton.moe.moe_routing.topk_gating import SQRTSOFTPLUS_384_ARCHS
+
+    arch = SQRTSOFTPLUS_384_ARCHS.get(get_gfx_runtime())
+    if arch is None:
+        return False
+    rows = gating_output.shape[0]
+    if not 1 <= rows <= arch.max_rows:
+        return False
+    if arch.graph_only and not torch.cuda.is_current_stream_capturing():
+        return False
+    if topk_indices.ndim != 2 or not 1 <= topk_indices.shape[1] <= 8:
+        return False
+    topk = topk_indices.shape[1]
+    return (
+        gating_output.dtype == torch.bfloat16
+        and gating_output.stride(1) == 1
+        and (
+            correction_bias.numel() == 0
+            or (
+                correction_bias.dtype == torch.float32
+                and correction_bias.shape == (384,)
+                and correction_bias.stride(0) == 1
+            )
+        )
+        and topk_weights.shape == topk_indices.shape == (rows, topk)
+        and (topk_weights.dtype, topk_indices.dtype) == (torch.float32, torch.int32)
+        and topk_weights.stride(1) == topk_indices.stride(1) == 1
+    )
+
+
 _FLYDSL_USE_HERD = os.environ.get("AITER_FLYDSL_USE_HERD", "0") == "1"
 _FLYDSL_HERD_MIN_M = int(
     os.environ.get(
@@ -239,6 +285,25 @@ def topk_gating(
             need_renorm,
             routed_scaling_factor,
             score_func,
+            num_valid_rows,
+        )
+        return
+    if num_shared_experts == 0 and _can_use_sqrtsoftplus_384_topk(
+        topk_weights,
+        topk_indices,
+        gating_output,
+        correction_bias,
+        need_renorm,
+        score_func,
+    ):
+        from .triton.moe.moe_routing.topk_gating import sqrtsoftplus_384_topk
+
+        sqrtsoftplus_384_topk(
+            gating_output,
+            correction_bias if correction_bias.numel() else None,
+            topk_weights,
+            topk_indices,
+            routed_scaling_factor,
             num_valid_rows,
         )
         return
