@@ -61,8 +61,40 @@ y = conv2d(
     stride=(1, 1), padding=(1, 1), dilation=(1, 1),
     activation="relu",          # "none" | "relu" | "relu6" | "gelu"
     layout="nchw",              # "nchw" or "nhwc"
+    padding_mode="zeros",
 )
 ```
+
+### Conv2D padding modes
+
+All routed and specialized Conv2D APIs accept `padding_mode="zeros"` as a
+positional or keyword argument. Padding is symmetric on opposing sides and
+accepts an integer or `(pad_height, pad_width)`.
+
+| Mode | Border behavior | Padding limits per spatial axis |
+|---|---|---|
+| `zeros` | Implicit zero padding in convolution | Nonnegative |
+| `reflect` | Mirror without repeating the edge | Less than the input size |
+| `replicate` | Repeat the nearest edge | Nonnegative; no dimension-based maximum |
+| `circular` | Wrap to the opposite edge | At most the input size |
+
+Input spatial dimensions must be positive, and padding must be nonnegative.
+Invalid modes are rejected even when padding is zero.
+
+`zeros` uses implicit padding. For other modes with nonzero padding, the input
+is padded with `torch.nn.functional.pad` before routing and activation packing;
+convolution then uses padding `(0, 0)`. Zero padding amounts skip materialization.
+Materialized padding allocates a temporary input; layout conversion may require
+an extra copy.
+
+Input, weight, and bias must share a CUDA/ROCm device. Routed calls use that
+device and restore the caller's current device afterward. Mixed-architecture
+execution within one process is unsupported.
+
+External `x_blocked` requires `padding_mode="zeros"` or zero padding amounts.
+Otherwise, omit it to pack the padded input; passing it raises `ValueError`.
+
+Conv3D supports only implicit zero padding.
 
 ### Inference tensors
 
@@ -138,9 +170,9 @@ and seed under both backends, only VAE convs swapped to Triton): max diff
 
 - Only `groups=1` is implemented; callers must send depthwise or grouped
   convolutions to another backend.
-- Only zero padding is implemented. Per-axis pad amounts may differ, for
-  example `(0, 2)` for Conv2D or `(0, 1, 2)` for Conv3D, but callers must send
-  `"reflect"`, `"replicate"`, and `"circular"` padding modes to PyTorch/MIOpen.
+- All Conv2D APIs support `zeros`, `reflect`, `replicate`, and `circular`
+  padding as described above. Conv3D supports only zero padding. Per-axis pad
+  amounts may differ, for example `(0, 2)` for Conv2D or `(0, 1, 2)` for Conv3D.
 - Inputs must be `fp16` or `bf16`.
 - Forward only (no backward / training).
 
@@ -206,6 +238,14 @@ NOT representative of production):
 python -m op_tests.op_benchmarks.triton.bench_conv2d --dtype fp16 --smoke
 ```
 
+Use `--padding-mode reflect` (or `replicate` / `circular`) to include padding,
+layout conversion, and activation packing in the primary timing. Use
+`--end-to-end` for the same timing scope with `zeros`; otherwise its legacy
+kernel-only metric is retained. Results report the mode and timing scope.
+The reference runs `F.pad + F.conv2d` without forcing a post-pad layout;
+`torch_conv_layout` / `Torch Input Layout` reports that actual layout.
+Weight packs stay cached. `--miopen-solvers` currently supports `zeros` only.
+
 The Conv3D benchmark uses the same frozen-shape-database approach as Conv2D.
 It defaults to the Wan2.2 A14B-style VAE workload and accepts a
 case-insensitive model-name substring with `--model`:
@@ -255,6 +295,8 @@ Conv2D cross-axis flags:
 --layout {nchw,nhwc}                          # default nchw
 --method {auto,default,cblocked,nhwc,winograd_f4x3,winograd_f4x3_cblocked}
 --metric {time,throughput}                    # default throughput
+--padding-mode {zeros,reflect,replicate,circular}
+--end-to-end                                # also include preparation for zeros
 --no-bias                                     # bench the bias=None code path
 --miopen-solvers                              # detect MIOpen solver names (sweep mode; ~60-120s subprocess)
 --show-kernel-name                            # include routed kernel name in single-shape output

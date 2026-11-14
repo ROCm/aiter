@@ -129,6 +129,31 @@ def _normalize_conv2d_params(stride, padding, dilation):
     )
 
 
+def _validate_conv2d_padding_mode(
+    padding_mode: str, height: int, width: int, padding: tuple[int, int]
+) -> None:
+    """Validate the mode and spatial limits after non-negative normalization."""
+    modes = ("zeros", "reflect", "replicate", "circular")
+    if padding_mode not in modes:
+        raise ValueError(f"padding_mode must be one of {modes}, got {padding_mode!r}")
+    if height <= 0 or width <= 0:
+        raise ValueError(
+            f"input spatial dimensions must be positive, got {(height, width)}"
+        )
+
+    pad_height, pad_width = padding
+    if padding_mode == "reflect" and (pad_height >= height or pad_width >= width):
+        raise ValueError(
+            "reflect padding must be less than each input spatial dimension, "
+            f"got padding={padding} for input {(height, width)}"
+        )
+    if padding_mode == "circular" and (pad_height > height or pad_width > width):
+        raise ValueError(
+            "circular padding must not exceed each input spatial dimension, "
+            f"got padding={padding} for input {(height, width)}"
+        )
+
+
 # ---------------------------------------------------------------------------
 # Conv3D helpers
 # ---------------------------------------------------------------------------
