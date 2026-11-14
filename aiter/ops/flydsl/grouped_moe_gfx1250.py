@@ -22,7 +22,7 @@ import torch
 
 from aiter import ActivationType, QuantType, dtypes, logger
 from aiter.jit.utils.build_targets import base_gfx_arch
-from aiter.jit.utils.chip_info import get_gfx
+from aiter.jit.utils.chip_info import get_gfx, get_gfx_runtime
 from aiter.ops.flydsl.kernels.mega_moe_gfx1250.types import Stage2ScatterContext
 from aiter.ops.flydsl.kernels.tensor_shim import (
     _run_compiled,
@@ -2091,6 +2091,7 @@ def _get_compiled_gather_reduce(
     split_k: int = 1,
     vec_dwords: int = 2,
     w_dtype: str = "f32",
+    wave_routes: bool = False,
 ):
     """Compile and cache the one-pass MoE gather-reduce kernel."""
     from aiter.ops.flydsl.kernels.moe_gather_reduce import (
@@ -2098,7 +2099,28 @@ def _get_compiled_gather_reduce(
     )
 
     return build_moe_gather_reduce_module(
-        model_dim, topk, out_dtype, split_k, vec_dwords, w_dtype
+        model_dim,
+        topk,
+        out_dtype,
+        split_k,
+        vec_dwords,
+        w_dtype,
+        wave_routes=wave_routes,
+    )
+
+
+def _use_wave_gather_routes(token_num, model_dim, topk, out_dtype, split_k, w_dtype):
+    """Measured MiniMax-M3 decode contract; keep the old path elsewhere.
+
+    Only a Boolean enters the factory/cache key, not the token count. This
+    avoids creating one kernel per serving batch. get_gfx_runtime also honors
+    the single build target under AITER_AOT_REPLAY without probing a device.
+    """
+    return (
+        4 <= token_num <= 256
+        and (model_dim, topk, out_dtype, split_k, w_dtype)
+        == (6144, 5, "bf16", 1, "f32")
+        and get_gfx_runtime() == "gfx1250"
     )
 
 
@@ -2402,7 +2424,15 @@ def flydsl_moe_gather_reduce(
 
     gather_vec = _choose_gather_reduce_vec(token_num, model_dim)
     launch = _get_compiled_gather_reduce(
-        model_dim, topk, out_dtype, split_k, gather_vec, w_dtype
+        model_dim,
+        topk,
+        out_dtype,
+        split_k,
+        gather_vec,
+        w_dtype,
+        wave_routes=_use_wave_gather_routes(
+            token_num, model_dim, topk, out_dtype, split_k, w_dtype
+        ),
     )
     slice_stride_dw = E * max_m * (model_dim // 2)
     # Skip dead-tail output tokens whose route map is unwritten. Default (no
