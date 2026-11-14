@@ -3380,19 +3380,20 @@ def gen_a16w16_4wave_instance(
 
     text = (
         _A16W16_4WAVE_LAUNCHER.replace(
-            "@LAUNCH@", _A16W16_4WAVE_WS_LAUNCH if workspace else _A16W16_4WAVE_DIRECT_LAUNCH
+            "@LAUNCH@",
+            _A16W16_4WAVE_WS_LAUNCH if workspace else _A16W16_4WAVE_DIRECT_LAUNCH,
         )
-        .replace(
-            "@WS_PARAM@", "\n    aiter_tensor_t &workspace," if workspace else ""
-        )
+        .replace("@WS_PARAM@", "\n    aiter_tensor_t &workspace," if workspace else "")
         .replace("@HOST_DTYPE@", "fp32_t" if workspace else "bf16_t")
         .replace(
             "@BIAS_HOST_VALIDATE@",
-            BIAS_HOST_VALIDATE
-            if workspace
-            else '    AITER_CHECK(!bias.has_value(),\n'
-            '        "@NAME@: bias is not supported on the direct a16w16_4wave kid; "\n'
-            '        "use an a16w16_4wave_ws kid (the split-K reduce adds it, split_k 1 included)");',
+            (
+                BIAS_HOST_VALIDATE
+                if workspace
+                else "    AITER_CHECK(!bias.has_value(),\n"
+                '        "@NAME@: bias is not supported on the direct a16w16_4wave kid; "\n'
+                '        "use an a16w16_4wave_ws kid (the split-K reduce adds it, split_k 1 included)");'
+            ),
         )
         .replace("@NUM_IMAGES@", str(len(images)))
         .replace("@IMAGES@", ", ".join(f'"{symbol}"' for _, symbol in images))

@@ -649,6 +649,7 @@ def _default_co_output_dir(arch, offload_arch):
         return os.path.join(_HERE, arch + "-strict")
     return os.path.join(_HERE, "named_reg", arch)
 
+
 # ---------------------------------------------------------------------------
 # gfx950: a16w16 4-wave family (gen_co/co_kernels_gfx950_bf16.json)
 # ---------------------------------------------------------------------------
@@ -839,7 +840,9 @@ def _build_gfx950(p, args, llvm_bin):
             print(f"[build_co] {len(jobs)} images on {n_jobs} jobs")
             with ThreadPoolExecutor(max_workers=n_jobs) as pool:
                 built = list(
-                    pool.map(lambda j: build_one_gfx950(j, args, llvm_bin, workdir), jobs)
+                    pool.map(
+                        lambda j: build_one_gfx950(j, args, llvm_bin, workdir), jobs
+                    )
                 )
     finally:
         if args.keep_temps:

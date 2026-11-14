@@ -229,7 +229,9 @@ def _a16w16_operand_transposed(tensor: torch.Tensor) -> bool:
     return rows > 1 and stride_row == 1 and not (stride_k == 1 and stride_row >= K)
 
 
-def _require_layout_kid(layout, XQ, *, kid, instance=None, route_arch=None, route_cu_num=None, **_):
+def _require_layout_kid(
+    layout, XQ, *, kid, instance=None, route_arch=None, route_cu_num=None, **_
+):
     if instance is None:
         arch, cu_num = route_arch, route_cu_num
         if arch is None or cu_num is None:

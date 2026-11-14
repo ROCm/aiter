@@ -40,11 +40,11 @@ from opus_gemm_common import (
     gfx942_a8w8_kernels_list,
     gfx942_nosplit_kernels_list,
     gfx942_splitk_kernels_list,
+    gfx950_a16w16_4wave_kernels_list,
     gfx1250_4wave_co_kernels_list,
     gfx1250_clusterlaunch_kernels_list,
     gfx1250_kernels_list,
     gfx1250_splitk_fuse_kernels_list,
-    gfx950_a16w16_4wave_kernels_list,
 )
 
 

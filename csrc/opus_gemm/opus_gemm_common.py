@@ -3167,20 +3167,23 @@ for _tables in KERNEL_REGISTRY["a16w16"].values():
 # Exact-id kernels kept in every default build.  The high-level A16 caller-side
 # heuristics below the tuned lookup are constrained to these ids; the unified
 # public/C++ launch path still receives one already-resolved exact kid.
-DEFAULT_COMPILED_KIDS_GFX950 = frozenset(
-    {
-        # splitk fallback (small M / non-aligned big M)
-        6,
-        52,  # cc tile 0: (64, 64, 64) WG=2
-        12,
-        58,  # cc tile 6: (64, 32, 128) WG=2
-        14,
-        60,  # cc tile 8: (64, 64, 128) WG=1
-        # persistent fallback (large M, tile-aligned)
-        30,
-        76,  # persistent (256, 256, 64)
-    }
-) | GFX950_A16W16_4WAVE_KIDS  # host-only launchers (device code is pre-built)
+DEFAULT_COMPILED_KIDS_GFX950 = (
+    frozenset(
+        {
+            # splitk fallback (small M / non-aligned big M)
+            6,
+            52,  # cc tile 0: (64, 64, 64) WG=2
+            12,
+            58,  # cc tile 6: (64, 32, 128) WG=2
+            14,
+            60,  # cc tile 8: (64, 64, 128) WG=1
+            # persistent fallback (large M, tile-aligned)
+            30,
+            76,  # persistent (256, 256, 64)
+        }
+    )
+    | GFX950_A16W16_4WAVE_KIDS
+)  # host-only launchers (device code is pre-built)
 
 DEFAULT_COMPILED_KIDS_GFX942 = frozenset(
     {
