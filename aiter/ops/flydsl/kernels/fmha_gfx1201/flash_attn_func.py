@@ -130,7 +130,12 @@ def build_flash_attn_func_module(
 
     # Buffer loads cap at dwordx4, so V rows are fetched in 8-element pieces.
     V_SUBVECS = VEC_WIDTH // 8
-    NUM_V_VECS = NUM_BATCHES_KV * V_SUBVECS
+    NUM_V_FRAGMENTS = (BLOCK_N // 16) * D_CHUNKS
+    # Each wave must own a whole number of 16x16 V fragments.
+    USE_TRANSPOSE_V = NUM_V_FRAGMENTS % NUM_WAVES == 0
+    NUM_V_VECS = (
+        NUM_V_FRAGMENTS // NUM_WAVES if USE_TRANSPOSE_V else NUM_BATCHES_KV * V_SUBVECS
+    )
 
     LDS_K_TILE_SIZE = BLOCK_N * K_STRIDE
     LDS_V_TILE_SIZE = BLOCK_N * V_STRIDE
@@ -344,7 +349,7 @@ def build_flash_attn_func_module(
             lds_idx = v_base + lds_row * V_STRIDE + load_col_base + col_extra
             fx.ptr_store(vec, lds_kv + fx.Int32(lds_idx))
 
-        def coop_load_v_global(tile_start):
+        def coop_load_v_global_rowmajor(tile_start):
             tile_start = fx.Int64(tile_start)
             vecs = []
             for batch in range_constexpr(NUM_BATCHES_KV):
@@ -365,7 +370,7 @@ def build_flash_attn_func_module(
                     vecs.append(_load_global_half_vec(v_buf_ptr, g_idx, 8))
             return vecs
 
-        def coop_store_v_lds(vecs, buf_id=0):
+        def coop_store_v_lds_rowmajor(vecs, buf_id=0):
             v_base = v_buf_base(buf_id)
             for batch in range_constexpr(NUM_BATCHES_KV):
                 linear_chunk = tid + fx.Uint64(batch * BLOCK_SIZE)
@@ -392,6 +397,44 @@ def build_flash_attn_func_module(
                             sv * 8,
                             vecs[batch * V_SUBVECS + sv],
                         )
+
+        def coop_load_v_global(tile_start):
+            if const_expr(USE_TRANSPOSE_V):
+                vecs = []
+                for vi in range_constexpr(NUM_V_VECS):
+                    frag_idx = wave_id + fx.Uint64(vi * NUM_WAVES)
+                    row0 = fx.Int64(tile_start) + (frag_idx // D_CHUNKS) * 16
+                    d0 = (frag_idx % D_CHUNKS) * 16
+                    vec = Vec.filled(8, 0.0, elem_dtype)
+                    # The public wrapper pads K/V to complete tiles. The final
+                    # speculative prefetch may be beyond that allocation.
+                    if row0 + 16 <= seq_len_kv_v:
+                        offset = kv_global_idx(row0 + lane16, d0 + klane * 8)
+                        ptr = fx.add_offset(v_elem_ptr, fx.Int64(offset))
+                        raw_ptr = fx.to_llvm_ptr(ptr)
+                        # FlyDSL 0.5.0 has no fx.copy atom for GLOBAL_LOAD_TR_B128.
+                        # Use the native load from RDNA4 ISA section 11.6.
+                        vec = Vec(
+                            fx.rocdl.global_load_tr_b128(
+                                Vec.make_type(8, elem_dtype), raw_ptr
+                            )
+                        )
+                    vecs.append(vec)
+            else:
+                vecs = coop_load_v_global_rowmajor(tile_start)
+            return vecs
+
+        def coop_store_v_lds(vecs, buf_id=0):
+            if const_expr(USE_TRANSPOSE_V):
+                # Swap lane-id bits 3 and 4 to match WMMA operand order.
+                dst_lane = (lane % 8) + ((lane // 8) % 2) * 16 + (lane // 16) * 8
+                for vi in range_constexpr(NUM_V_VECS):
+                    frag_idx = wave_id + fx.Uint64(vi * NUM_WAVES)
+                    lds_store(
+                        v_buf_base(buf_id) + frag_idx * 256 + dst_lane * 8, vecs[vi]
+                    )
+            else:
+                coop_store_v_lds_rowmajor(vecs, buf_id)
 
         q_row = q_start + wave_q_offset + lane16
         q_row_i32 = fx.Int32(q_row)
@@ -579,25 +622,33 @@ def build_flash_attn_func_module(
             # O += V^T @ P, pipelined across V packs.
             v_base = v_buf_base(0)
 
-            def _load_v_rowmajor(st_kv_base_val, pks_val, dc_val, v_base=v_base):
-                d_pos = fx.Int64(dc_val * D_CHUNK) + lane16
-                v_elems = []
-                for k_sub in range_constexpr(8):
-                    kv_row = (
-                        fx.Int64(st_kv_base_val + pks_val * PV_K_STEP)
-                        + klane * WMMA_LANE_K
-                        + fx.Int64(k_sub)
+            def _load_v_pack(st_kv_base_val, pks_val, dc_val, v_base=v_base):
+                if const_expr(USE_TRANSPOSE_V):
+                    row0 = st_kv_base_val + pks_val * PV_K_STEP
+                    frag_idx = (row0 // 16) * D_CHUNKS + dc_val
+                    value = Vec(
+                        lds_load(v_base + fx.Int64(frag_idx * 256) + lane * 8, 8)
                     )
-                    v_lds_idx = v_base + kv_row * V_STRIDE + d_pos
-                    v_elems.append(fx.ptr_load(lds_kv + fx.Int32(v_lds_idx)))
-                return Vec.from_elements(v_elems, elem_dtype)
+                else:
+                    d_pos = fx.Int64(dc_val * D_CHUNK) + lane16
+                    v_elems = []
+                    for k_sub in range_constexpr(8):
+                        kv_row = (
+                            fx.Int64(st_kv_base_val + pks_val * PV_K_STEP)
+                            + klane * WMMA_LANE_K
+                            + fx.Int64(k_sub)
+                        )
+                        v_lds_idx = v_base + kv_row * V_STRIDE + d_pos
+                        v_elems.append(fx.ptr_load(lds_kv + fx.Int32(v_lds_idx)))
+                    value = Vec.from_elements(v_elems, elem_dtype)
+                return value
 
             if wave_needs_kv_tile:
                 o_tmp = list(o_accs)
 
                 cur_v_packs = []
                 for st_idx in range_constexpr(N_SUB_TILES):
-                    cur_v_packs.append(_load_v_rowmajor(st_idx * K_SUB_N, 0, 0))
+                    cur_v_packs.append(_load_v_pack(st_idx * K_SUB_N, 0, 0))
 
                 for pks in range_constexpr(PV_K_STEPS):
                     for dc in range_constexpr(D_CHUNKS):
@@ -612,9 +663,7 @@ def build_flash_attn_func_module(
                         if const_expr(has_next):
                             for st_idx in range_constexpr(N_SUB_TILES):
                                 next_v_packs.append(
-                                    _load_v_rowmajor(
-                                        st_idx * K_SUB_N, next_pks, next_dc
-                                    )
+                                    _load_v_pack(st_idx * K_SUB_N, next_pks, next_dc)
                                 )
 
                         for st_idx in range_constexpr(N_SUB_TILES):
