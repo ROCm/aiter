@@ -193,7 +193,9 @@ def launch_gemm_a8w8(
     SB_SHAPE = (
         ((tile_n // 32, tile_k // 32) if b_scale_32x32 else (tile_n // 32, tile_k))
         if mx32
-        else (N_BLOCKS, K_WS)
+        # A one-element TDM tile has no contiguous run to describe, so a lone N
+        # block at tile_k == 128 also loads the row past it, which nothing reads.
+        else (max(N_BLOCKS, 2 // K_WS), K_WS)
     )
     STAGE_SA = ((SA_SHAPE[0] * SA_SHAPE[1] + 15) // 16) * 16
     STAGE_SB = ((SB_SHAPE[0] * SB_SHAPE[1] + 15) // 16) * 16

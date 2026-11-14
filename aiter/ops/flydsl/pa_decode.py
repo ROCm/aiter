@@ -20,12 +20,19 @@ from aiter.utility import dtypes
 
 from .kernels.pa_decode_kernel import (
     CLUSTER_PARTITIONS,
+    CLUSTER_STEP_TOKENS,
     KV_COMPUTE_BLOCK,
     MERGE_HEAD_DIM,
     MERGE_PARTITIONS,
     compile_pa_decode_tile,
+    gfx1250_tile_traits,
 )
 from .kernels.pa_decode_plan import PADecodePlan
+
+# Plans with at most this many partitions per sequence merge within a cluster
+# of at most CLUSTER_PARTITIONS CTAs. Above it, sequences would give each CTA
+# more tiles than the reducer costs.
+CLUSTER_GROUPED_PARTITIONS = 2 * CLUSTER_PARTITIONS
 from .kernels.pa_decode_plan import plan_pa_decode as plan_pa_decode  # noqa: PLC0414
 from .kernels.pa_decode_reduce import (
     DUAL_REGISTER_PARTITIONS,
@@ -494,10 +501,13 @@ def pa_decode(
     that still own several tasks merge them in the tile kernel using the plan's
     arrival counters when partial scratch is eight-byte aligned. Otherwise,
     when P = min(partition bound, max_partitions)
-    is in [2, 16], P CTAs per sequence fit the plan capacity or two per CU,
-    and the sequences times KV heads stay within 15 per 16 CUs (head_dim <=
-    512), each sequence's tasks run as one cluster of P workgroups that merges
-    them on chip. Other plans use packed scratch and the separate reducer.
+    is in [2, 32], C = min(P, 16) CTAs per sequence fit the plan capacity or
+    two per CU, and the sequences times KV heads stay within 15 per 16 CUs
+    (head_dim <= 512), each sequence runs as one cluster of C workgroups that
+    split its tiles and merge them on chip. Page16 D128 decode batches within
+    one 16-CTA cluster per CU whose plan holds 16 slots per sequence (see
+    ``plan_pa_decode``) instead split each sequence into 16 step-sized parts.
+    Other plans use packed scratch and the separate reducer.
 
     ``sinks`` is a contiguous [num_query_heads] BF16/FP16/FP32 tensor on the
     query device: unscaled zero-value logits shared across batch/MTP positions.
@@ -984,21 +994,110 @@ def pa_decode(
     # stays within the plan's or the default two-per-CU budget. gfx1250 keeps
     # 15 clusters resident per 16 CUs (240 on 256 CUs) whatever their size;
     # later clusters run as a second wave, which is slower than the reducer.
+    # A cluster of at most CLUSTER_PARTITIONS CTAs splits each sequence's
+    # tiles among its CTAs, so a 32-partition bound (8K contexts at the
+    # default cap) still merges on chip.
+    cluster_size = min(max_partitions, CLUSTER_PARTITIONS)
+    # gfx1250 keeps 15 clusters resident per 16 CUs; batches with more
+    # sequences share each cluster between several of them.
+    cluster_seqs = 1
+    while (
+        -(-num_seqs // cluster_seqs) * num_kv_heads > num_compute_units * 15 // 16
+        and 2 * cluster_seqs * cluster_size <= CLUSTER_PARTITIONS
+    ):
+        cluster_seqs *= 2
     cluster_merge = (
-        max_partitions
+        cluster_size
         if (
             arch in ("gfx1250", "gfx1250-strict")
             and not direct_output
             and sinks is None
             and output.stride() == query.stride()
-            and 2 <= max_partitions <= CLUSTER_PARTITIONS
-            and num_seqs * max_partitions
+            and 2 <= max_partitions <= CLUSTER_GROUPED_PARTITIONS
+            and num_seqs * cluster_size
             <= max(work_plan.capacity, -(-2 * num_compute_units // num_kv_heads))
-            and num_seqs * num_kv_heads <= num_compute_units * 15 // 16
+            and -(-num_seqs // cluster_seqs) * num_kv_heads
+            <= num_compute_units * 15 // 16
             and head_dim <= MERGE_HEAD_DIM
         )
         else 0
     )
+    # Page16 D128 decode clusters of P CTAs over block tables of at most 16
+    # steps give CTA p steps [p * 16 / P, (p + 1) * 16 / P), so it loads its
+    # first page ids with the context length rather than after it. For rows of
+    # 16 steps the runs are the planner's tiles. Batches within
+    # one cluster per CU split each row into single steps, one per CTA,
+    # whatever the partition bound (sparse decode at 4 rows: 5.3 -> 4.6 us);
+    # their plans reserve the steps' partial slots.
+    step_split = bool(
+        cluster_merge
+        and block_size == 16
+        and head_dim == 128
+        and query_length == 1
+        and sliding_window == 0
+        and max_blocks_per_seq * block_size <= CLUSTER_PARTITIONS * CLUSTER_STEP_TOKENS
+    )
+    step_cluster = (
+        CLUSTER_PARTITIONS
+        if step_split
+        and cluster_seqs == 1
+        and num_seqs * num_kv_heads * CLUSTER_PARTITIONS <= num_compute_units
+        and num_seqs * CLUSTER_PARTITIONS <= work_plan.capacity
+        else cluster_merge
+    )
+    tile_options = {
+        "head_dim": head_dim,
+        "query_group_size": query_group_size,
+        "block_size": int(block_size),
+        "num_seqs": num_seqs,
+        "num_kv_heads": num_kv_heads,
+        "num_compute_units": num_compute_units,
+        "num_partitions": num_partitions,
+        "softmax_scale": softmax_scale,
+        "query_dtype": query.dtype,
+        "kv_dtype": expected_kv_dtype,
+        "per_token_kv": per_token_kv,
+        "query_length": query_length,
+        "trans_v": trans_v,
+        "work_capacity": work_plan.capacity,
+        "max_context_length": schedule_context_length,
+        "sliding_window": sliding_window,
+        "direct_output": direct_output,
+    }
+    # The runs and preloaded page ids assume the tile's 128-token steps. Tiles
+    # that select 64-token steps (two query tiles, plain BF16 V, wider grids)
+    # keep plan-derived clusters.
+    cluster_steps = (
+        step_split
+        and CLUSTER_PARTITIONS % step_cluster == 0
+        and num_seqs * step_cluster <= work_plan.capacity
+        and gfx1250_tile_traits(
+            **tile_options,
+            cluster_merge=step_cluster,
+            cluster_seqs=cluster_seqs,
+            cluster_steps=True,
+        ).TOKENS
+        == CLUSTER_STEP_TOKENS
+    )
+    if cluster_steps:
+        cluster_merge = step_cluster
+    # Page128 clusters given a length bound instead give CTA p tiles
+    # [p * run, (p + 1) * run), runs splitting the bound evenly, so they too
+    # load their first page ids with the context length (decode at 8K, 1-8
+    # rows: 3-5% faster). The bound's longest rows split as the planner
+    # would; shorter rows use fewer CTAs. Runs beyond four tiles gain nothing.
+    bound_tiles = -(-schedule_context_length // KV_COMPUTE_BLOCK)
+    cluster_runs = bool(
+        cluster_merge
+        and not cluster_steps
+        and cluster_seqs == 1
+        and block_size == 128
+        and max_context_length is not None
+        and sliding_window == 0
+        and num_seqs * cluster_merge <= work_plan.capacity
+        and bound_tiles <= 4 * cluster_merge
+    )
+    run_tiles = -(-bound_tiles // cluster_merge) if cluster_runs else 0
 
     # Bound byte offsets as well as element indices for 16-bit BF16 caches.
     cache_extent = max(
@@ -1011,28 +1110,15 @@ def pa_decode(
     with torch.cuda.device(dev):
         compiled = compile_pa_decode_tile(
             architecture=arch,
-            head_dim=head_dim,
-            query_group_size=query_group_size,
-            block_size=int(block_size),
-            num_seqs=num_seqs,
-            num_kv_heads=num_kv_heads,
-            num_compute_units=num_compute_units,
-            num_partitions=num_partitions,
-            softmax_scale=softmax_scale,
-            query_dtype=query.dtype,
-            kv_dtype=expected_kv_dtype,
-            per_token_kv=per_token_kv,
-            query_length=query_length,
-            trans_v=trans_v,
+            **tile_options,
             wide_kv_addressing=wide_kv_addressing,
             kv_buffer_u32=kv_buffer_u32,
-            work_capacity=work_plan.capacity,
-            max_context_length=schedule_context_length,
-            sliding_window=sliding_window,
-            direct_output=direct_output,
             trans_k=trans_k,
             mask_unowned_kv=mask_unowned_kv,
             cluster_merge=cluster_merge,
+            cluster_seqs=cluster_seqs,
+            cluster_steps=cluster_steps,
+            cluster_runs=cluster_runs,
         )
 
     total_rows = query_length * query_group_size
@@ -1099,6 +1185,7 @@ def pa_decode(
                 if merged
                 else flyc.from_c_void_p(fx.Int32, 0)
             ),
+            run_tiles,
         )
     with torch.cuda.device(dev):
         s = torch.cuda.current_stream(dev)
@@ -1135,7 +1222,11 @@ def pa_decode(
             stride_ks_head,
             int(query.stride(0)),
             int(query.stride(1)),
-            ptr_arg(work_plan.work_info, fx.Int32),
+            # Cluster grids derive their tiles from the context lengths.
+            ptr_arg(
+                (context_lengths if cluster_merge else work_plan.work_info),
+                fx.Int32,
+            ),
             work_plan.capacity,
             *merge_args,
             s,

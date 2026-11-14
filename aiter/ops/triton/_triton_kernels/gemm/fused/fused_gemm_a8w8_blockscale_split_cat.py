@@ -30,8 +30,6 @@ _fused_gemm_a8w8_blockscale_split_cat_repr = make_kernel_repr(
 @triton.heuristics(
     {
         "EVEN_K": lambda args: args["K"] % args["BLOCK_SIZE_K"] == 0,
-        "GRID_MN": lambda args: triton.cdiv(args["M"], args["BLOCK_SIZE_M"])
-        * triton.cdiv(args["N"], args["BLOCK_SIZE_N"]),
     }
 )
 @triton.jit(repr=_fused_gemm_a8w8_blockscale_split_cat_repr)
@@ -84,7 +82,6 @@ def _fused_gemm_a8w8_blockscale_split_cat(
     NUM_KSPLIT: tl.constexpr,
     SPLITK_BLOCK_SIZE: tl.constexpr,
     EVEN_K: tl.constexpr,
-    GRID_MN: tl.constexpr,
     cache_modifier: tl.constexpr,
 ):
     tl.assume(stride_a_m > 0)
@@ -114,7 +111,8 @@ def _fused_gemm_a8w8_blockscale_split_cat(
     num_pid_n = tl.cdiv(N, BLOCK_SIZE_N)
 
     if NUM_KSPLIT == 1:
-        remap_xcd(pid, GRID_MN)
+        grid_mn = num_pid_m * num_pid_n
+        remap_xcd(pid, grid_mn)
         pid_m, pid_n = pid_grid(pid, num_pid_m, num_pid_n, GROUP_SIZE_M=GROUP_SIZE_M)
     else:
         pid_m = pid // num_pid_n
@@ -282,8 +280,6 @@ _fused_gemm_a8w8_blockscale_preshuffle_split_cat_repr = make_kernel_repr(
 @triton.heuristics(
     {
         "EVEN_K": lambda args: args["K"] % args["BLOCK_SIZE_K"] == 0,
-        "GRID_MN": lambda args: triton.cdiv(args["M"], args["BLOCK_SIZE_M"])
-        * triton.cdiv(args["N"], args["BLOCK_SIZE_N"]),
     }
 )
 @triton.jit(repr=_fused_gemm_a8w8_blockscale_preshuffle_split_cat_repr)
@@ -336,7 +332,6 @@ def _fused_gemm_a8w8_blockscale_preshuffle_split_cat(
     NUM_KSPLIT: tl.constexpr,
     SPLITK_BLOCK_SIZE: tl.constexpr,
     EVEN_K: tl.constexpr,
-    GRID_MN: tl.constexpr,
     cache_modifier: tl.constexpr,
 ):
     tl.assume(stride_a_m > 0)
@@ -366,7 +361,8 @@ def _fused_gemm_a8w8_blockscale_preshuffle_split_cat(
     num_pid_n = tl.cdiv(N, BLOCK_SIZE_N)
 
     if NUM_KSPLIT == 1:
-        remap_xcd(pid, GRID_MN)
+        grid_mn = num_pid_m * num_pid_n
+        remap_xcd(pid, grid_mn)
         pid_m, pid_n = pid_grid(pid, num_pid_m, num_pid_n, GROUP_SIZE_M=GROUP_SIZE_M)
     else:
         pid_m = pid // num_pid_n

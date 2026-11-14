@@ -220,6 +220,10 @@ def flydsl_grouped_gemm_a8w4_masked(
     if stage not in (1, 2):
         raise ValueError("gemm_stage must be 1 or 2")
     cluster_m = _select_cluster_m(cluster_m, cluster_n, stage == 1)
+    if m_align:
+        # A tile skipped for starting in an expert's padding never reaches the
+        # M-cluster barrier its peers wait in; cluster_m only buys B multicast.
+        cluster_m = 1
     persistent_workers = int(
         os.environ.get(
             f"AITER_FLYDSL_PERSISTENT_WORKERS{stage}",

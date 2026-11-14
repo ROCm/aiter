@@ -32,10 +32,6 @@ _fused_gemm_a8w8_blockscale_a16w16_repr = make_kernel_repr(
 @triton.heuristics(
     {
         "EVEN_K": lambda args: args["K"] % args["BLOCK_SIZE_K"] == 0,
-        "GRID_MN_FP8": lambda args: triton.cdiv(args["M"], args["BLOCK_SIZE_M"])
-        * triton.cdiv(args["N_fp8"], args["BLOCK_SIZE_N"]),
-        "GRID_MN_BF16": lambda args: triton.cdiv(args["M"], args["BLOCK_SIZE_M"])
-        * triton.cdiv(args["N_bf16"], args["BLOCK_SIZE_N"]),
     }
 )
 @triton.jit(repr=_fused_gemm_a8w8_blockscale_a16w16_repr)
@@ -86,8 +82,6 @@ def _fused_gemm_a8w8_blockscale_a16w16_kernel(
     ADD_BIAS_FP8: tl.constexpr,
     ADD_BIAS_BF16: tl.constexpr,
     EVEN_K: tl.constexpr,
-    GRID_MN_FP8: tl.constexpr,
-    GRID_MN_BF16: tl.constexpr,
     SKIP_REDUCE: tl.constexpr,
     cache_modifier: tl.constexpr,
 ):
@@ -120,8 +114,8 @@ def _fused_gemm_a8w8_blockscale_a16w16_kernel(
     num_pid_n = num_pid_n_fp8 + num_pid_n_bf16
 
     if NUM_KSPLIT == 1:
-        GRID_MN: tl.constexpr = GRID_MN_FP8 + GRID_MN_BF16
-        remap_xcd(pid, GRID_MN)
+        grid_mn = num_pid_m * num_pid_n
+        remap_xcd(pid, grid_mn)
 
         pid_m, pid_n = pid_grid(pid, num_pid_m, num_pid_n, GROUP_SIZE_M=GROUP_SIZE_M)
     else:
