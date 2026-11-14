@@ -23,6 +23,8 @@ self-hosted-runner:
     - radeon-r9700
     - xsj-dispatch
     - box308
+    - xsj-dispatch
+    - radeon-r9700
 
 config-variables: null
 
