@@ -27,36 +27,7 @@ v2-pr-rdna3)
 v2-full)
     pytest -v --reruns 2 --timeout=120 $V2::test_flash_attn_qkvpacked || status=1
     pytest -v --reruns 2 --timeout=120 $V2::test_flash_attn_varlen_qkvpacked || status=1
-    pytest -v --reruns 2 --timeout=120 $V2::test_flash_attn_output \
-        --deselect "test_flash_attn_triton_amd.py::test_flash_attn_output[0.0-0.17-1023-1024-59-True-False-True-False-mha-dtype0-False]" \
-        --deselect "test_flash_attn_triton_amd.py::test_flash_attn_output[0.0-0.17-1023-1024-59-True-False-True-False-mha-dtype0-True]" \
-        --deselect "test_flash_attn_triton_amd.py::test_flash_attn_output[0.0-0.17-1023-1024-64-True-False-True-False-mha-dtype0-False]" \
-        --deselect "test_flash_attn_triton_amd.py::test_flash_attn_output[0.0-0.17-1023-1024-64-True-False-True-False-mha-dtype0-True]" \
-        --deselect "test_flash_attn_triton_amd.py::test_flash_attn_output[0.0-0.17-1024-1023-40-False-False-True-False-gqa-dtype0-False]" \
-        --deselect "test_flash_attn_triton_amd.py::test_flash_attn_output[0.0-0.17-1024-1023-40-False-False-True-False-gqa-dtype0-True]" \
-        --deselect "test_flash_attn_triton_amd.py::test_flash_attn_output[0.0-0.17-1024-1023-59-True-False-True-False-mha-dtype0-False]" \
-        --deselect "test_flash_attn_triton_amd.py::test_flash_attn_output[0.0-0.17-1024-1023-59-True-False-True-False-mha-dtype0-True]" \
-        --deselect "test_flash_attn_triton_amd.py::test_flash_attn_output[0.0-0.17-1024-1023-64-True-False-True-False-mha-dtype0-False]" \
-        --deselect "test_flash_attn_triton_amd.py::test_flash_attn_output[0.0-0.17-1024-1023-64-True-False-True-False-mha-dtype0-True]" \
-        --deselect "test_flash_attn_triton_amd.py::test_flash_attn_output[0.0-0.17-108-256-59-True-False-True-False-mha-dtype0-False]" \
-        --deselect "test_flash_attn_triton_amd.py::test_flash_attn_output[0.0-0.17-108-256-59-True-False-True-False-mha-dtype0-True]" \
-        --deselect "test_flash_attn_triton_amd.py::test_flash_attn_output[0.0-0.17-108-256-64-True-False-True-False-mha-dtype0-False]" \
-        --deselect "test_flash_attn_triton_amd.py::test_flash_attn_output[0.0-0.17-108-256-64-True-False-True-False-mha-dtype0-True]" \
-        --deselect "test_flash_attn_triton_amd.py::test_flash_attn_output[0.0-0.17-113-203-59-True-False-True-False-mha-dtype0-False]" \
-        --deselect "test_flash_attn_triton_amd.py::test_flash_attn_output[0.0-0.17-113-203-59-True-False-True-False-mha-dtype0-True]" \
-        --deselect "test_flash_attn_triton_amd.py::test_flash_attn_output[0.0-0.17-113-203-64-True-False-True-False-mha-dtype0-False]" \
-        --deselect "test_flash_attn_triton_amd.py::test_flash_attn_output[0.0-0.17-113-203-64-True-False-True-False-mha-dtype0-True]" \
-        --deselect "test_flash_attn_triton_amd.py::test_flash_attn_output[0.0-0.17-113-211-59-True-False-True-False-mha-dtype0-False]" \
-        --deselect "test_flash_attn_triton_amd.py::test_flash_attn_output[0.0-0.17-113-211-59-True-False-True-False-mha-dtype0-True]" \
-        --deselect "test_flash_attn_triton_amd.py::test_flash_attn_output[0.0-0.17-113-211-64-True-False-True-False-mha-dtype0-False]" \
-        --deselect "test_flash_attn_triton_amd.py::test_flash_attn_output[0.0-0.17-113-211-64-True-False-True-False-mha-dtype0-True]" \
-        --deselect "test_flash_attn_triton_amd.py::test_flash_attn_output[0.0-0.17-128-217-40-False-False-True-False-gqa-dtype0-False]" \
-        --deselect "test_flash_attn_triton_amd.py::test_flash_attn_output[0.0-0.17-128-217-40-False-False-True-False-gqa-dtype0-True]" \
-        --deselect "test_flash_attn_triton_amd.py::test_flash_attn_output[0.0-0.17-128-217-59-True-False-True-False-mha-dtype0-False]" \
-        --deselect "test_flash_attn_triton_amd.py::test_flash_attn_output[0.0-0.17-128-217-59-True-False-True-False-mha-dtype0-True]" \
-        --deselect "test_flash_attn_triton_amd.py::test_flash_attn_output[0.0-0.17-128-217-64-True-False-True-False-mha-dtype0-False]" \
-        --deselect "test_flash_attn_triton_amd.py::test_flash_attn_output[0.0-0.17-128-217-64-True-False-True-False-mha-dtype0-True]" \
-        || status=1
+    pytest -v --reruns 2 --timeout=120 $V2::test_flash_attn_output || status=1
     pytest -v --reruns 2 --timeout=120 $V2::test_flash_attn_varlen_output || status=1
     pytest -v --reruns 2 --timeout=120 $V2::test_flash_attn_causal || status=1
     pytest -v --reruns 2 --timeout=120 $V2::test_flash_attn_varlen_causal || status=1
