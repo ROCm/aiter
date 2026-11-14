@@ -1,11 +1,11 @@
 {
-  "writeback_decode": {
+  "one_token": {
     "BV": 32,
     "CH": 16,
     "SK": 16,
     "num_warps": 2,
     "num_buffers": 1,
-    "use_writeback_decode": true
+    "use_one_token_decode": true
   },
   "fused": {
     "BV": 128,

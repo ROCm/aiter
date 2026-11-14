@@ -24,6 +24,11 @@ import torch
 from triton.runtime import driver
 from triton.runtime.jit import JITFunction
 
+try:
+    from triton import knobs
+except ImportError:
+    knobs = None
+
 _MAX_INT32 = 2**31 - 1
 
 # Entries per wrapped kernel, past which the least recently used one goes. A
@@ -37,6 +42,29 @@ _MISSES: list | None = None
 
 # Set while a test wants the ordinary path, to compare this one against.
 _BYPASS = False
+
+# CompiledKernel.run's argument list is Triton's launcher ABI. A TypeError means
+# that list moved and the fast call did not launch, so every wrapper falls back.
+_ABI_DISABLED = False
+
+
+def _launch_hooks_idle() -> bool:
+    """True when no hook needs the metadata only the ordinary JIT builds.
+
+    ``launch_enter_hook`` and ``launch_exit_hook`` are empty chains until a
+    profiler registers a callback. An empty chain has nothing to receive, which
+    is what lets the fast path pass ``None`` for both hooks.
+    """
+    if knobs is None:
+        return False
+    try:
+        enter = knobs.runtime.launch_enter_hook
+        exit_ = knobs.runtime.launch_exit_hook
+    except AttributeError:
+        return False
+    if getattr(enter, "calls", enter):
+        return False
+    return not getattr(exit_, "calls", exit_)
 
 
 @contextlib.contextmanager
@@ -85,7 +113,13 @@ class _FastLaunch:
 
     def __getitem__(self, grid):
         def launch(**kwargs):
-            if self._disabled or _BYPASS:
+            global _ABI_DISABLED
+            if (
+                self._disabled
+                or _BYPASS
+                or _ABI_DISABLED
+                or not _launch_hooks_idle()
+            ):
                 return self._kernel[grid](**kwargs)
             device = driver.active.get_current_device()
             try:
@@ -117,18 +151,22 @@ class _FastLaunch:
             # Not hoisted: capture redirects work onto its own stream, so the
             # answer changes under torch.cuda.graph.
             stream = driver.active.get_current_stream(device)
-            compiled.run(
-                g[0],
-                g[1] if len(g) > 1 else 1,
-                g[2] if len(g) > 2 else 1,
-                stream,
-                compiled.function,
-                compiled.packed_metadata,
-                None,
-                None,
-                None,
-                *[kwargs[n] if n in kwargs else frozen[n] for n in names],
-            )
+            try:
+                compiled.run(
+                    g[0],
+                    g[1] if len(g) > 1 else 1,
+                    g[2] if len(g) > 2 else 1,
+                    stream,
+                    compiled.function,
+                    compiled.packed_metadata,
+                    None,  # launch_metadata: only built for hooks, excluded above
+                    None,  # launch_enter_hook
+                    None,  # launch_exit_hook
+                    *[kwargs[n] if n in kwargs else frozen[n] for n in names],
+                )
+            except TypeError:
+                _ABI_DISABLED = True
+                return self._kernel[grid](**kwargs)
             return compiled
 
         return launch

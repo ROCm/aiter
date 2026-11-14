@@ -10,7 +10,6 @@ from triton.language.extra.hip import libdevice
 
 from aiter.ops.triton._gluon_kernels.common.utils import (
     exp_scaled,
-    fast_sigmoid,
     sigmoid,
     softplus,
 )
@@ -18,6 +17,11 @@ from aiter.ops.triton.utils._triton.kernel_repr import make_kernel_repr
 from aiter.ops.triton.utils.config_utils import load_config_json, resolve_config_dir
 
 _TDM = gl.amd.gfx1250.tdm
+
+# log2(e) / 2. exp2((tanh(z) + 1) * lower_bound * _LOG2_E_HALF)
+# equals exp(lower_bound * sigmoid(z)). Gluon jit bodies can only read globals
+# wrapped in gl.constexpr, so this must not be a plain float.
+_LOG2_E_HALF = gl.constexpr(0.7213475204444817)
 
 
 @gluon.constexpr_function
@@ -329,42 +333,51 @@ def _process_token(
     return a, kv, qv, vv, b
 
 
-_NI = 16 * 128 // 64 // 2
-_N = gl.constexpr(_NI)
+# b64 stores per thread. Each store carries two f32 values of one chunk tile.
+_STORES_PER_THREAD = 16 * 128 // 64 // 2
+_N = gl.constexpr(_STORES_PER_THREAD)
 _HAS_INLINE_ASM = gl.constexpr(hasattr(gl, "inline_asm"))
 
 
 # Keep whole-line stores in one block. Wait for their SGPR and VGPR operands before reuse.
 _STORE_ASM = gl.constexpr(
     "\n".join(
-        [f"global_store_b64 ${_NI + i}, ${i}, ${2 * _NI}" for i in range(_NI)]
+        [
+            f"global_store_b64 ${_STORES_PER_THREAD + i}, ${i}, "
+            f"${2 * _STORES_PER_THREAD}"
+            for i in range(_STORES_PER_THREAD)
+        ]
         + ["s_wait_xcnt 0x0", "s_wait_alu depctr_vm_vsrc(0)"]
     )
 )
 
 
 @gluon.jit
-def _store_lines(S, boffs, base, N: gl.constexpr):
-    gl.inline_asm(_STORE_ASM, ("v", "v", "s"), [S, boffs, base], (), is_pure=False)
+def _store_lines(values, offsets, base):
+    gl.inline_asm(
+        _STORE_ASM, ("v", "v", "s"), [values, offsets, base], (), is_pure=False
+    )
 
 
 @gluon.jit
-def _sum3(x):
+def _reduce_k(x):
+    """Reduce the 3D K layout to a scalar."""
     return gl.sum(gl.sum(gl.sum(x, axis=0), axis=1), axis=0)
 
 
 @gluon.jit
-def _rowsum(x):
+def _reduce_chunk(x):
+    """Reduce the K axes of a [chunk, k0, k1, k2] tile."""
     return gl.sum(gl.sum(gl.sum(x, axis=1), axis=2), axis=1)
 
 
 @gluon.jit
-def _bcast(x):
+def _broadcast_chunk(x):
     return gl.expand_dims(gl.expand_dims(gl.expand_dims(x, 1), 2), 1)
 
 
 @gluon.jit
-def _writeback_rows(
+def _one_token_rows(
     q_ptr,
     k_ptr,
     g_ptr,
@@ -374,11 +387,10 @@ def _writeback_rows(
     s_p,
     v_p,
     o_p,
-    o_ptr,
     tok,
     i_h,
-    stride_g_tok,
-    stride_beta_tok,
+    stride_g_token,
+    stride_beta_token,
     lower_bound,
     scale: gl.constexpr,
     H: gl.constexpr,
@@ -387,62 +399,69 @@ def _writeback_rows(
     CH: gl.constexpr,
     NUM_WARPS: gl.constexpr,
 ):
-    NC: gl.constexpr = BV // CH
-    CS: gl.constexpr = K // NC
-    RPT: gl.constexpr = CH // (2 * NUM_WARPS)
+    # CH is the V-row count of one packed store. q and k are contiguous, so a
+    # token starts at tok * H * K.
+    num_chunks: gl.constexpr = BV // CH
+    k_per_chunk: gl.constexpr = K // num_chunks
+    rows_per_thread: gl.constexpr = CH // (2 * NUM_WARPS)
     gl.static_assert(K == 128)
-    L4: gl.constexpr = gl.BlockedLayout(
-        [RPT, 4, 1, 2], [2, 1, 16, 1], [NUM_WARPS, 1, 1, 1], [3, 2, 1, 0]
+    state_layout: gl.constexpr = gl.BlockedLayout(
+        [rows_per_thread, 4, 1, 2],
+        [2, 1, 16, 1],
+        [NUM_WARPS, 1, 1, 1],
+        [3, 2, 1, 0],
     )
-    KL: gl.constexpr = gl.SliceLayout(0, L4)
-    VL: gl.constexpr = gl.SliceLayout(1, gl.SliceLayout(2, gl.SliceLayout(1, L4)))
-    kj = gl.arange(0, 4, layout=gl.SliceLayout(1, gl.SliceLayout(2, KL)))
-    kl = gl.arange(0, 16, layout=gl.SliceLayout(0, gl.SliceLayout(2, KL)))
-    kb = gl.arange(0, 2, layout=gl.SliceLayout(0, gl.SliceLayout(1, KL)))
+    k_layout: gl.constexpr = gl.SliceLayout(0, state_layout)
+    chunk_layout: gl.constexpr = gl.SliceLayout(
+        1, gl.SliceLayout(2, gl.SliceLayout(1, state_layout))
+    )
+    kj = gl.arange(0, 4, layout=gl.SliceLayout(1, gl.SliceLayout(2, k_layout)))
+    kl = gl.arange(0, 16, layout=gl.SliceLayout(0, gl.SliceLayout(2, k_layout)))
+    kb = gl.arange(0, 2, layout=gl.SliceLayout(0, gl.SliceLayout(1, k_layout)))
     off_k = (
         gl.expand_dims(gl.expand_dims(kj * 32, 1), 2)
         + gl.expand_dims(gl.expand_dims(kl * 2, 0), 2)
         + gl.expand_dims(gl.expand_dims(kb, 0), 1)
     )
-    off_c = gl.arange(0, CH, layout=VL)
-    off_s = _bcast(off_c * K) + gl.expand_dims(off_k, 0)
-    ON: gl.constexpr = max(BV, 8 * 32 * NUM_WARPS)
-    osm = gl.allocate_shared_memory(
-        gl.float32, [ON], gl.SwizzledSharedLayout(1, 1, 1, [0])
+    off_c = gl.arange(0, CH, layout=chunk_layout)
+    off_s = _broadcast_chunk(off_c * K) + gl.expand_dims(off_k, 0)
+    output_lanes: gl.constexpr = max(BV, 8 * 32 * NUM_WARPS)
+    output_lds = gl.allocate_shared_memory(
+        gl.float32, [output_lanes], gl.SwizzledSharedLayout(1, 1, 1, [0])
     )
     S = gl.amd.gfx1250.buffer_load(s_p, off_s)
     qr = gl.amd.gfx1250.buffer_load(q_ptr + tok * (H * K) + i_h * K, off_k)
     kr = gl.amd.gfx1250.buffer_load(k_ptr + tok * (H * K) + i_h * K, off_k)
-    gr = gl.amd.gfx1250.buffer_load(g_ptr + tok * stride_g_tok + i_h * K, off_k)
+    gr = gl.amd.gfx1250.buffer_load(g_ptr + tok * stride_g_token + i_h * K, off_k)
     bias = gl.amd.gfx1250.buffer_load(dt_bias_ptr + i_h * K, off_k)
-    br = gl.load(beta_ptr + tok * stride_beta_tok + i_h)
+    br = gl.load(beta_ptr + tok * stride_beta_token + i_h)
     alog = gl.load(A_log_ptr + i_h)
     v0 = gl.amd.gfx1250.buffer_load(v_p, off_c)
     v1 = v0
-    if NC > 1:
-        v1 = gl.amd.gfx1250.buffer_load(v_p + CS, off_c)
+    if num_chunks > 1:
+        v1 = gl.amd.gfx1250.buffer_load(v_p + k_per_chunk, off_c)
     q = qr.to(gl.float32)
     k = kr.to(gl.float32)
-    q = q * (gl.rsqrt(_sum3(q * q) + 1e-6) * scale)
-    k = k * gl.rsqrt(_sum3(k * k) + 1e-6)
+    q = q * (gl.rsqrt(_reduce_k(q * q) + 1e-6) * scale)
+    k = k * gl.rsqrt(_reduce_k(k * k) + 1e-6)
     a_exp = 0.5 * gl.exp(alog.to(gl.float32))
-    gate_c = lower_bound * 0.7213475204444817
+    gate_c = lower_bound * _LOG2_E_HALF
     th = libdevice.tanh(gr.to(gl.float32) * a_exp + a_exp * bias.to(gl.float32))
     a = gl.exp2(th * gate_c + gate_c)
-    beta = 1.0 / (1.0 + gl.exp(-br.to(gl.float32)))
+    beta = sigmoid(br.to(gl.float32))
     a4 = gl.expand_dims(a, 0)
     k4 = gl.expand_dims(k, 0)
     q4 = gl.expand_dims(q, 0)
-    for c in gl.static_range(NC):
+    for c in gl.static_range(num_chunks):
         vv = v0
         if c == 1:
             vv = v1
         if c > 1:
-            vv = gl.amd.gfx1250.buffer_load(v_p + c * CS, off_c)
+            vv = gl.amd.gfx1250.buffer_load(v_p + c * k_per_chunk, off_c)
         S = S * a4
-        err = (vv.to(gl.float32) - _rowsum(S * k4)) * beta
-        S = S + _bcast(err) * k4
-        o = _rowsum(S * q4)
+        err = (vv.to(gl.float32) - _reduce_chunk(S * k4)) * beta
+        S = S + _broadcast_chunk(err) * k4
+        o = _reduce_chunk(S * q4)
         gl.static_assert(CH * K == 2 * _N * 32 * NUM_WARPS)
         Sa, Sb = gl.split(S)
         oa, _ob = gl.split(off_s * 4)
@@ -450,24 +469,24 @@ def _writeback_rows(
             gl.uint32, bitcast=True
         ).to(gl.uint64)
         if _HAS_INLINE_ASM:
-            _store_lines(pair, oa, s_p + c * CS * K, _N)
+            _store_lines(pair, oa, s_p + c * k_per_chunk * K)
         else:
-            gl.store(s_p + c * CS * K + off_s, S)
-        osm.slice(c * CH, CH).store(o)
-        if c + 1 < NC:
-            S = gl.amd.gfx1250.buffer_load(s_p + (c + 1) * CS * K, off_s)
-    OL: gl.constexpr = gl.BlockedLayout([8], [32], [NUM_WARPS], [0])
-    off_o = gl.arange(0, ON, layout=OL)
+            gl.store(s_p + c * k_per_chunk * K + off_s, S)
+        output_lds.slice(c * CH, CH).store(o)
+        if c + 1 < num_chunks:
+            S = gl.amd.gfx1250.buffer_load(s_p + (c + 1) * k_per_chunk * K, off_s)
+    output_layout: gl.constexpr = gl.BlockedLayout([8], [32], [NUM_WARPS], [0])
+    off_o = gl.arange(0, output_lanes, layout=output_layout)
     gl.amd.gfx1250.buffer_store(
-        osm.load(OL).to(o_ptr.dtype.element_ty),
+        output_lds.load(output_layout).to(o_p.dtype.element_ty),
         o_p,
-        (off_o // CH) * CS + off_o % CH,
+        (off_o // CH) * k_per_chunk + off_o % CH,
         mask=off_o < BV,
     )
 
 
 @gluon.jit
-def _writeback_decode(
+def _one_token_decode(
     q_ptr,
     k_ptr,
     v_ptr,
@@ -501,7 +520,7 @@ def _writeback_decode(
     if K == 128 and V == 128 and BV == 32 and CH == 16 and SK == 16 and NUM_WARPS == 2:
         tok = bos.to(gl.int64)
         row = slot.to(gl.int64) * stride_state_slot_rows + i_h * V + i_v * CH
-        _writeback_rows(
+        _one_token_rows(
             q_ptr,
             k_ptr,
             g_ptr,
@@ -511,7 +530,6 @@ def _writeback_decode(
             state_ptr + row * K,
             v_ptr + tok * stride_v_token + i_h * V + i_v * CH,
             o_ptr + tok * stride_o_token + i_h * V + i_v * CH,
-            o_ptr,
             tok,
             i_h,
             stride_g_token,
@@ -552,23 +570,22 @@ def _writeback_decode(
             raw,
             a_exp,
             a_exp * bias.to(gl.float32),
-            lower_bound * 0.7213475204444817,
+            lower_bound * _LOG2_E_HALF,
             scale,
             True,
             True,
             True,
             True,
-            False,
+            True,
             False,
         )
-        beta = fast_sigmoid(beta)
         for c in gl.static_range(BV // CH):
             if c > 0:
                 v = gl.amd.gfx1250.buffer_load(v_p + c * CH, off_v).to(gl.float32)
             S = S * a[None, :]
             err = (v - gl.sum(S * k[None, :], axis=1)) * beta
             S = S + err[:, None] * k[None, :]
-            # Keep state stores in the write-back path without LDS staging.
+            # Store this chunk from registers. The next chunk is loaded below.
             gl.amd.gfx1250.buffer_store(S, s_p + c * CH * K, off_s)
             o = gl.sum(S * q[None, :], axis=1)
             gl.amd.gfx1250.buffer_store(
@@ -595,8 +612,6 @@ _fused_recurrent_kda_packed_decode_repr = make_kernel_repr(
         "PAD_SLOT_GUARD",
         "USE_CONV",
         "USE_RMS_GATE",
-        "USE_WRITEBACK_DECODE",
-        "CH",
     ],
 )
 
@@ -670,56 +685,7 @@ def fused_recurrent_kda_packed_decode_kernel(
     USE_CONV: gl.constexpr = False,
     USE_RMS_GATE: gl.constexpr = False,
     TDM_STORE_BUFS: gl.constexpr = 2,
-    USE_WRITEBACK_DECODE: gl.constexpr = False,
-    CH: gl.constexpr = 1,
 ):
-    if USE_WRITEBACK_DECODE:
-        gl.static_assert(IS_VARLEN and IS_CONTINUOUS_BATCHING)
-        gl.static_assert(H == HV and STATE_V_FIRST and INPLACE_FINAL_STATE)
-        gl.static_assert(BV % CH == 0 and (CH * SK) % (32 * NUM_WARPS) == 0)
-        wb_pid = gl.program_id(0)
-        wb_nh = wb_pid // (V // BV)
-        wb_n = wb_nh // H
-        wb_bos = gl.load(cu_seqlens_ptr + wb_n)
-        wb_eos = gl.load(cu_seqlens_ptr + wb_n + 1)
-        wb_slot = gl.load(state_indices_ptr + wb_n * stride_indices_seq)
-        if wb_slot < 0:
-            return
-        if wb_eos - wb_bos <= 1:
-            if (wb_eos > wb_bos) & (wb_slot >= 0):
-                _writeback_decode(
-                    q_ptr,
-                    k_ptr,
-                    v_ptr,
-                    g_ptr,
-                    beta_ptr,
-                    A_log_ptr,
-                    dt_bias_ptr,
-                    state_ptr,
-                    o_ptr,
-                    wb_bos,
-                    wb_slot,
-                    wb_nh % H,
-                    wb_pid % (V // BV),
-                    stride_q_token,
-                    stride_k_token,
-                    stride_v_token,
-                    stride_g_token,
-                    stride_beta_token,
-                    stride_o_token,
-                    stride_state_slot_rows,
-                    lower_bound,
-                    scale,
-                    H,
-                    K,
-                    V,
-                    BV,
-                    CH,
-                    SK,
-                    NUM_WARPS,
-                )
-            return
-
     gl.static_assert(V % BV == 0, "BV must divide V")
     gl.static_assert(32 % SK == 0, "SK must divide the wave")
     gl.static_assert(K % SK == 0, "SK must divide K")
@@ -821,7 +787,7 @@ def fused_recurrent_kda_packed_decode_kernel(
             a_exp = 0.5 * a_exp
             if HAS_DT_BIAS:
                 b_bias = a_exp * b_bias
-            gate_c = lower_bound * 0.7213475204444817
+            gate_c = lower_bound * _LOG2_E_HALF
         else:
             gate_c = 0.0
     else:
@@ -1216,8 +1182,6 @@ def fused_recurrent_kda_packed_decode_kernel(
                 )
                 if PAD_SLOT_GUARD and INPLACE_FINAL_STATE:
                     store_ok = out_slot > 0
-                elif USE_WRITEBACK_DECODE:
-                    store_ok = out_slot >= 0
                 else:
                     store_ok = True
                 if CACHE_STATE_UPDATES:
@@ -1293,13 +1257,14 @@ def fused_recurrent_kda_packed_decode_kernel(
             )
 
 
-_writeback_decode_repr = make_kernel_repr(
-    "kda_writeback_decode_kernel", ["H", "K", "V", "BV", "CH", "NUM_WARPS", "SK"]
+
+_one_token_decode_repr = make_kernel_repr(
+    "kda_one_token_decode_kernel", ["H", "K", "V", "BV", "CH", "NUM_WARPS", "SK"]
 )
 
 
-@gluon.jit(repr=_writeback_decode_repr)
-def kda_writeback_decode_kernel(
+@gluon.jit(repr=_one_token_decode_repr)
+def kda_one_token_decode_kernel(
     q_ptr,
     k_ptr,
     v_ptr,
@@ -1312,11 +1277,10 @@ def kda_writeback_decode_kernel(
     cu_seqlens_ptr,
     state_indices_ptr,
     stride_indices_seq,
-    stride_g_tok,
-    stride_beta_tok,
-    stride_o_tok,
+    stride_g_token,
+    stride_beta_token,
+    stride_o_token,
     stride_slot_rows,
-    state_rows,
     lower_bound,
     scale: gl.constexpr,
     H: gl.constexpr,
@@ -1327,118 +1291,67 @@ def kda_writeback_decode_kernel(
     NUM_WARPS: gl.constexpr,
     SK: gl.constexpr,
 ):
+    # Host dispatch rejects any sequence longer than one token. Empty sequences
+    # and negative slots stay on this kernel and produce no store.
     pid = gl.program_id(0)
-    nh = pid // (V // BV)
+    tile = V // BV
+    nh = pid // tile
     seq = nh // H
     bos = gl.load(cu_seqlens_ptr + seq)
     eos = gl.load(cu_seqlens_ptr + seq + 1)
     slot = gl.load(state_indices_ptr + seq * stride_indices_seq)
-    if (eos > bos) & (slot >= 0):
-        if eos - bos == 1:
-            _writeback_decode(
-                q_ptr,
-                k_ptr,
-                v_ptr,
-                g_ptr,
-                beta_ptr,
-                A_log_ptr,
-                dt_bias_ptr,
-                state_ptr,
-                o_ptr,
-                bos,
-                slot,
-                nh % H,
-                pid % (V // BV),
-                H * K,
-                H * K,
-                H * V,
-                stride_g_tok,
-                stride_beta_tok,
-                stride_o_tok,
-                stride_slot_rows,
-                lower_bound,
-                scale,
-                H,
-                K,
-                V,
-                BV,
-                CH,
-                SK,
-                NUM_WARPS,
+    if (eos - bos == 1) & (slot >= 0):
+        _one_token_decode(
+            q_ptr,
+            k_ptr,
+            v_ptr,
+            g_ptr,
+            beta_ptr,
+            A_log_ptr,
+            dt_bias_ptr,
+            state_ptr,
+            o_ptr,
+            bos,
+            slot,
+            nh % H,
+            pid % tile,
+            H * K,
+            H * K,
+            H * V,
+            stride_g_token,
+            stride_beta_token,
+            stride_o_token,
+            stride_slot_rows,
+            lower_bound,
+            scale,
+            H,
+            K,
+            V,
+            BV,
+            CH,
+            SK,
+            NUM_WARPS,
+        )
+
+
+def load_one_token_config(overrides: dict | None = None) -> dict | None:
+    """Return the one-token bucket, or None when that path is switched off."""
+    cfg_dir = resolve_config_dir(
+        "attention", "KDA_DECODE", backend="gluon", arch="gfx1250"
+    )
+    tuned = load_config_json(f"{cfg_dir}/DEFAULT.json")
+    config = dict(tuned["one_token"])
+    overrides = overrides or {}
+    config.update(overrides)
+    if not config.get("use_one_token_decode", False):
+        return None
+    if "SK" not in overrides:
+        config["SK"] = min(config["SK"], math.gcd(32, 128))
+        if "num_warps" not in overrides:
+            config["num_warps"] = max(
+                1, min(config["num_warps"], config["BV"] * config["SK"] // 32)
             )
-        else:
-            # Reuse the general recurrence when a sequence has multiple tokens.
-            fused_recurrent_kda_packed_decode_kernel(
-                q_ptr=q_ptr,
-                k_ptr=k_ptr,
-                v_ptr=v_ptr,
-                g_ptr=g_ptr,
-                beta_ptr=beta_ptr,
-                A_log_ptr=A_log_ptr,
-                dt_bias_ptr=dt_bias_ptr,
-                o_ptr=o_ptr,
-                state_ptr=state_ptr,
-                state_out_ptr=state_ptr,
-                cu_seqlens_ptr=cu_seqlens_ptr,
-                state_indices_ptr=state_indices_ptr,
-                num_accepted_ptr=None,
-                conv_state_ptr=None,
-                conv_weight_ptr=None,
-                out_gate_ptr=None,
-                norm_weight_ptr=None,
-                lower_bound=lower_bound,
-                norm_eps=1e-5,
-                T=0,
-                stride_indices_seq=stride_indices_seq,
-                stride_q_token=H * K,
-                stride_k_token=H * K,
-                stride_v_token=H * V,
-                stride_g_token=stride_g_tok,
-                stride_beta_token=stride_beta_tok,
-                stride_o_token=stride_o_tok,
-                stride_og_token=0,
-                stride_state_slot_rows=stride_slot_rows,
-                stride_state_out_slot_rows=stride_slot_rows,
-                state_rows=state_rows,
-                state_out_rows=state_rows,
-                stride_cs_slot=0,
-                stride_cs_dim=0,
-                stride_cs_pos=0,
-                scale=scale,
-                H=H,
-                HV=H,
-                K=K,
-                V=V,
-                BV=BV,
-                NUM_WARPS=NUM_WARPS,
-                SK=SK,
-                NUM_BUFFERS=1,
-                IS_VARLEN=True,
-                IS_CONTINUOUS_BATCHING=True,
-                IS_SPEC_DECODING=False,
-                IS_BETA_HEADWISE=False,
-                USE_INITIAL_STATE=True,
-                STORE_FINAL_STATE=True,
-                USE_QK_L2NORM_IN_KERNEL=True,
-                USE_GATE_IN_KERNEL=True,
-                HAS_DT_BIAS=True,
-                USE_LOWER_BOUND=True,
-                APPLY_BETA_SIGMOID=True,
-                ALLOW_NEG_EIGVAL=False,
-                INPLACE_FINAL_STATE=True,
-                STATE_V_FIRST=True,
-                USE_TDM_STORE=False,
-                USE_TDM_LOAD=False,
-                CACHE_STATE_UPDATES=False,
-                USE_TDM_FUSED_LOAD=False,
-                PAD_SLOT_GUARD=False,
-                W=4,
-                USE_CONV=False,
-                USE_RMS_GATE=False,
-                TDM_STORE_BUFS=2,
-                USE_WRITEBACK_DECODE=True,
-                CH=CH,
-            )
+    return config
 
 
 def get_kda_config(
@@ -1449,7 +1362,6 @@ def get_kda_config(
     V: int,
     overrides: dict | None = None,
     fused: bool = False,
-    writeback_decode: bool = False,
 ) -> dict:
     # Both compiler targets use this kernel's gfx1250 configuration tree.
     cfg_dir = resolve_config_dir(
@@ -1458,9 +1370,7 @@ def get_kda_config(
     tuned = load_config_json(f"{cfg_dir}/DEFAULT.json")
     num_seq_heads = num_seqs * HV
     aligned = K % 32 == 0 and V % 32 == 0
-    if writeback_decode:
-        bucket = "writeback_decode"
-    elif fused:
+    if fused:
         bucket = "fused"
     elif avg_T > 1:
         if aligned and num_seq_heads >= 3072 and V % 128 == 0:
