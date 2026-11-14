@@ -163,6 +163,8 @@ def test_gemm(
     b, avg_b = run_func(x, gemm_weight, gemm_x_scale, w_scale, dtype)
 
     err_ck = checkAllclose(a, b, msg="ck", catastrophic_check=True)
+    if w_scale_block == "32x32":
+        assert err_ck <= 0.05, f"m={m} n={n} k={k}: 32x32 mismatch ratio {err_ck}"
     if ck_preshuffle and not use_flydsl_fp8_scale:
         x_scale_strided = x_scale.transpose(0, 1).contiguous().transpose(0, 1)
         b_strided = aiter.gemm_a8w8_blockscale_bpreshuffle(

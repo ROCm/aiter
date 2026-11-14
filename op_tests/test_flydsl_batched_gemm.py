@@ -52,7 +52,7 @@ import torch
 import aiter
 from aiter import dtypes
 from aiter.jit.utils.build_targets import base_gfx_arch
-from aiter.jit.utils.chip_info import get_gfx_runtime as get_gfx
+from aiter.jit.utils.chip_info import get_gfx_runtime
 from aiter.ops.batched_gemm_op_a8w8 import batched_gemm_a8w8_mxscale_bpreshuffle
 from aiter.ops.flydsl.batched_gemm_a8w8 import run_bmm_a8w8_mxfp8
 from aiter.ops.flydsl.batched_gemm_mxfp4 import (
@@ -236,7 +236,7 @@ def test_fused_quant_n32k4_mbn(b, m, k, dtype):
         + ((m + 31) // 32) * b * (k // 32) * 32  # n32k4 scale
     )
 
-    ret = {"gfx": get_gfx()}
+    ret = {"gfx": get_gfx_runtime()}
     for name, fn in candidates.items():
         (got_fp8, got_scale), us = run_perftest(fn)
         err_fp8 = checkAllclose(
@@ -292,7 +292,7 @@ def test_batched_gemm(b, m, n, k, dtype, layout):
     # a8w4, a8w8_128 and the n32k4 1x32 scale do not run it; 32x32 does, on the
     # archs in RAGGED_K_GFX.
     ragged_k = k % 128 != 0
-    if get_gfx() in A8W4_GFX and not ragged_k:
+    if get_gfx_runtime() in A8W4_GFX and not ragged_k:
         w_bnk, refs["a8w4"] = weight(32)
         # Offline weight prep (not in the hot path); act quant mirrors every forward.
         w_codes, w_scales = preshuffle_a8w4_weight_mbn(w_bnk)
@@ -321,9 +321,11 @@ def test_batched_gemm(b, m, n, k, dtype, layout):
             + b * m * n * y_phys.element_size()  # bf16 out
         )
 
-    a8w8_blocks = A8W8_BLOCKS[get_gfx()] if layout == "mbn" else ()
+    a8w8_blocks = A8W8_BLOCKS[get_gfx_runtime()] if layout == "mbn" else ()
     for rows, block in a8w8_blocks:
-        if ragged_k and (rows != 32 or block != 32 or get_gfx() not in RAGGED_K_GFX):
+        if ragged_k and (
+            rows != 32 or block != 32 or get_gfx_runtime() not in RAGGED_K_GFX
+        ):
             continue
         name = f"a8w8_{rows}x{block}"
         w_blk, refs[name] = weight(min(rows, 32))
@@ -340,7 +342,7 @@ def test_batched_gemm(b, m, n, k, dtype, layout):
             + b * (n // rows) * (k // block)  # B scale (rows x block)
             + b * m * n * y_phys.element_size()
         )
-        if rows == block == 32 and get_gfx() in A8W8_1X32_GFX and not ragged_k:
+        if rows == block == 32 and get_gfx_runtime() in A8W8_1X32_GFX and not ragged_k:
             candidates["a8w8_1x32"] = functools.partial(
                 _a8w8, x8, shuffle_weight(w8), xs8, expand_32x32_to_n32k4(ws8), dtype
             )
@@ -351,7 +353,7 @@ def test_batched_gemm(b, m, n, k, dtype, layout):
 
     flops = 2 * b * m * n * k
 
-    ret = {"gfx": get_gfx()}
+    ret = {"gfx": get_gfx_runtime()}
     for name, fn in candidates.items():
         out, us = run_perftest(fn)
         if layout == "mbn":
@@ -421,7 +423,7 @@ def test_batched_gemm_a8w8_compute(b, m, n, k, kernel_name, dtype=dtypes.bf16):
         + b * m * n * out.element_size()
     )
     return {
-        "gfx": get_gfx(),
+        "gfx": get_gfx_runtime(),
         "compute us": us,
         "compute TFLOPS": 2 * b * m * n * k / us / 1e6,
         "compute TB/s": nbytes / us / 1e6,
@@ -565,7 +567,7 @@ def summarize(title: str, rows: list) -> None:
 
 
 def main():
-    gfx = get_gfx()
+    gfx = get_gfx_runtime()
     arch = base_gfx_arch(gfx)
     # gfx1250-strict shares the gfx1250 kernel but is not a full-suite arch.
     epilogue_only = arch == "gfx1250" and gfx not in SUPPORTED_GFX

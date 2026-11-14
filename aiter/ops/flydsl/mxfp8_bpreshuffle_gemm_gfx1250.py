@@ -7,7 +7,8 @@ mxfp8_128: fp8 e4m3 activations/weights with fp8_e8m0 block scales over a
 128-element block (distinct from the fp32-scale blockscale GEMM).
 
 mxfp8_32: A scales are row-major ``(M, K//32)`` by default, optionally
-32x4 shuffled; B scales are always 32x4 shuffled ``(N, K//32)``.
+32x4 shuffled; B scales are 32x4 shuffled ``(N, K//32)``, or row-major
+``(N//32, K//32)`` with ``w_scale_32x32``.
 """
 
 from __future__ import annotations
