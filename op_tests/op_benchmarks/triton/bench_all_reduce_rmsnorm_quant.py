@@ -39,7 +39,7 @@ TOKENS = [1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048]
 
 def benchmark(args, rank, device, tp, inboxes, calls):
     ca = tp.device_communicator.ca_comm
-    providers = ["gluon", "gluon_fp8", "rccl"]
+    providers = ["gluon", "gluon_fp8", "gluon_fp8_token", "rccl"]
     if ca is not None and not ca.disabled:
         providers += ["car", "car_fused"]
     config = triton.testing.Benchmark(
@@ -79,6 +79,9 @@ def benchmark(args, rank, device, tp, inboxes, calls):
             ),
             "gluon_fp8": lambda x, res: all_reduce_rmsnorm_quant(
                 x, res, weight, EPS, True, True, group, inboxes, calls
+            ),
+            "gluon_fp8_token": lambda x, res: all_reduce_rmsnorm_quant(
+                x, res, weight, EPS, True, True, group, inboxes, calls, True
             ),
             "rccl": rccl,
             "car": car,

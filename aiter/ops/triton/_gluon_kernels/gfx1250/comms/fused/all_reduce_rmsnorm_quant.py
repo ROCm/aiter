@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
 
-"""All-reduce + residual add + RMSNorm (+ fp8 group quant) over 4 GPUs in one kernel.
+"""All-reduce + residual add + RMSNorm (+ fp8 quant) over 4 GPUs in one kernel.
 A program moves 3 rows: unit c has column c of each row. A receiver holds the whole
 rows, so it adds, normalizes and quantizes them before it stores, as a GEMM epilogue
 does."""
@@ -28,7 +28,7 @@ def _columns(v):
 
 
 _all_reduce_rmsnorm_repr = make_kernel_repr(
-    "_all_reduce_rmsnorm_kernel", ["RANK", "HIDDEN", "GEMMA", "QUANT"]
+    "_all_reduce_rmsnorm_kernel", ["RANK", "HIDDEN", "GEMMA", "QUANT", "GROUP"]
 )
 
 
@@ -53,13 +53,15 @@ def _all_reduce_rmsnorm_kernel(
     MAXIT: gl.constexpr,
     GEMMA: gl.constexpr,
     QUANT: gl.constexpr,
+    GROUP: gl.constexpr,
 ):
     """Program t sends rows 3t to 3t + 2 of x. Programs T to T + P - 1 receive triples
-    p, p + P, ... (T triples, P = programs). Rows from tokens on are 0, not stored."""
-    # A lane has 4 columns of a row and a wave has 128: one fp8 group.
+    p, p + P, ... (T triples, P = programs). Rows from tokens on are 0, not stored.
+    An fp8 group has GROUP values: 128, or HIDDEN for the per-token quant."""
+    # A lane has 4 columns of a row and a wave has 128: one fp8 group of 128.
     ROW: gl.constexpr = gl.BlockedLayout([1, 4], [32, 1], [gl.num_warps(), 1], [1, 0])
     N: gl.constexpr = HIDDEN // 4
-    GROUPS: gl.constexpr = HIDDEN // 128
+    GROUPS: gl.constexpr = HIDDEN // GROUP
     triples = gl.cdiv(tokens, 3)
     pid = gl.program_id(0)
     lane = gl.arange(0, N, layout=gl.SliceLayout(1, ROW))[:, None]
@@ -136,8 +138,8 @@ def _all_reduce_rmsnorm_kernel(
                     gl.amd.cdna5.buffer_store(y.to(gl.bfloat16), out, at)
 
                     if QUANT:
-                        # A group is 32 lanes of one wave. 448 is the fp8 maximum.
-                        a = gl.reshape(gl.abs(y), [GROUPS, 32, 4])
+                        # A group is GROUP / 4 lanes. 448 is the fp8 maximum.
+                        a = gl.reshape(gl.abs(y), [GROUPS, GROUP // 4, 4])
                         group_max = gl.max(gl.max(a, axis=2), axis=1)
                         group_scale = gl.maximum(group_max, 1e-10) / 448
                         sc = gl.expand_dims(gl.expand_dims(group_scale, 1), 2)
@@ -145,6 +147,6 @@ def _all_reduce_rmsnorm_kernel(
                         sc = gl.convert_layout(sc, ROW, assert_trivial=True)
                         yq = (y / sc).to(gl.float8e4nv)
                         gl.amd.cdna5.buffer_store(yq, q, at)
-                        lead = col % 128 == 0  # one scale for each group
-                        at = (row + r) * GROUPS + col // 128
+                        lead = col % GROUP == 0  # one scale for each group
+                        at = (row + r) * GROUPS + col // GROUP
                         gl.amd.cdna5.buffer_store(sc, scale, at, mask=lead)

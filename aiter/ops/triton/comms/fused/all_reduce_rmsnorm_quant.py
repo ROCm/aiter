@@ -26,6 +26,7 @@ def all_reduce_rmsnorm_quant(
     group,
     inboxes,
     calls,
+    per_token: bool = False,
 ):
     """
     Returns out = RMSNorm(residual_out) and residual_out = all-reduce(x) + residual
@@ -38,6 +39,8 @@ def all_reduce_rmsnorm_quant(
         weight (torch.Tensor): bf16 (hidden,). With gemma, the norm uses 1 + weight.
         quant (bool): Also return q, out as fp8, and scale, one fp32 value for
             each 128 values.
+        per_token (bool): The quant has one scale for each row: scale is
+            (tokens, 1).
         inboxes, calls: The result of ``all_reduce_init``, for this op and one
             hidden size only, with max_bytes of 2 rows or more.
     """
@@ -59,10 +62,11 @@ def all_reduce_rmsnorm_quant(
     out = torch.empty_like(x)
     residual_out = torch.empty_like(x)
     q, scale = out, out  # not used without quant
+    group_size = hidden if per_token else 128
     if quant:
         q = torch.empty(x.shape, dtype=torch.float8_e4m3fn, device=x.device)
         scale = torch.empty(
-            (tokens, hidden // 128), dtype=torch.float32, device=x.device
+            (tokens, hidden // group_size), dtype=torch.float32, device=x.device
         )
     programs = min(triples, _ROW_PROGRAMS)
     _all_reduce_rmsnorm_kernel[(triples + programs,)](
@@ -85,6 +89,7 @@ def all_reduce_rmsnorm_quant(
         MAXIT=_MAXIT,
         GEMMA=gemma,
         QUANT=quant,
+        GROUP=group_size,
         num_warps=min(16, hidden // 128),  # one group of 128 values a wave
     )
     if quant:
