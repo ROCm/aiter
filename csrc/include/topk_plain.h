@@ -36,6 +36,10 @@ bool topk_plain_use_mulblocks(int64_t numRows, int64_t stride0, int64_t k, bool 
 // be allocated + cached on the Python side and passed into topk_plain.
 int64_t topk_plain_workspace_size(int64_t numRows, int64_t stride0, int64_t k);
 
+// Workspace sizing for the multi-block path (any dtype); topk_plain uses it for
+// the per-block partial results instead of allocating them itself.
+int64_t topk_plain_merge_workspace_size(int64_t k);
+
 // The row lengths bounding the one-block kernels -- gfx950's "any_rows_min",
 // "any_rows_max", "lds_tail_max", and the register window other parts keep,
 // "reg_window_min", "reg_window_max" -- for topk_select's router; -1 for any
