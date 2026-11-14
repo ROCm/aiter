@@ -263,7 +263,14 @@ def gen(
     inp = torch.randn((token, model_dim), dtype=dtypes.bf16) / 10
     w1 = torch.randn((E, inter_dim * 2, model_dim), dtype=dtypes.bf16) / 10
     w2 = torch.randn((E, model_dim, inter_dim), dtype=dtypes.bf16) / 10
-    score = balanced_score(token, E, topk, dtypes.bf16)
+    # Same routing as FmoeTuner.generate_data: random unless
+    # TUNE_MOE_EXPERT_BALANCE=true. Balanced routing gives every expert exactly
+    # token * topk / E rows, which at a power-of-two token count fills a
+    # block_m of that size with no padding tile and so favours it.
+    if os.environ.get("TUNE_MOE_EXPERT_BALANCE", "False").lower() == "true":
+        score = balanced_score(token, E, topk, dtypes.bf16)
+    else:
+        score = torch.randn((token, E), dtype=dtypes.bf16)
     topk_weights, topk_ids = fused_topk(inp, score, topk, True)
 
     w1_qt, w1_scale = quant_w(w1, b_dtype)
