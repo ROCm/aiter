@@ -645,7 +645,9 @@ def build_moe_contiguous_psum_remap_ep_module():
     return launch_psum_remap_ep
 
 
-def build_moe_route_psum_fused_module(emit_aux: bool = True):
+def build_moe_route_psum_fused_module(
+    emit_aux: bool = True, packed_expert_map: bool = False
+):
     """JIT launcher: single-workgroup fused route + atomic + psum + remap.
 
     For small token counts every route fits in one workgroup, so the three
@@ -662,7 +664,9 @@ def build_moe_route_psum_fused_module(emit_aux: bool = True):
     num_waves = MAX_EXPERTS_PER_BLOCK // wave_size
 
     @flyc.kernel(
-        name="moe_route_psum_fused" + ("" if emit_aux else "_lean"),
+        name="moe_route_psum_fused"
+        + ("" if emit_aux else "_lean")
+        + ("_packed" if packed_expert_map else ""),
         known_block_size=[MAX_EXPERTS_PER_BLOCK, 1, 1],
     )
     def route_psum_fused_kernel(
@@ -694,7 +698,10 @@ def build_moe_route_psum_fused_module(emit_aux: bool = True):
         m_p = ptr_buf_tensor(masked_m)
         s_p = ptr_buf_tensor(starts)
         p_p = ptr_buf_tensor(psum)
-        expert_map_p = ptr_buf_tensor(expert_tile_map)
+        expert_map_p = ptr_buf_tensor(
+            expert_tile_map,
+            fx.Int64 if packed_expert_map else fx.Int32,
+        )
 
         in_expert = tid < fx.Uint32(experts)
 
@@ -767,7 +774,17 @@ def build_moe_route_psum_fused_module(emit_aux: bool = True):
                 map_start = fx.Uint32(start) // fine_tile
                 map_count = aligned_rows // fine_tile
                 for local_tile in range(map_count):
-                    expert_map_p[map_start + fx.Uint32(local_tile)] = fx.Int32(tid)
+                    if const_expr(packed_expert_map):
+                        expert_end = fx.Uint32(start) + fx.Uint32(m_tid)
+                        expert_bits = fx.Int64(tid)
+                        if local_tile > 0:
+                            # bit 31 flags a reusable expert weight tile,
+                            # for the reuse_resident_b policy.
+                            expert_bits = expert_bits | fx.Int64(1 << 31)
+                        packed = (fx.Int64(expert_end) << fx.Int64(32)) | expert_bits
+                        expert_map_p[map_start + fx.Uint32(local_tile)] = packed
+                    else:
+                        expert_map_p[map_start + fx.Uint32(local_tile)] = fx.Int32(tid)
         gpu.barrier()
 
         # Phase D: in-place masked -> contiguous row remap.

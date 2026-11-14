@@ -968,7 +968,6 @@ def _grouped_a8w4_tdm_moe(
         and not _compact
         and not _is_ep
         and not enable_ep_scatter
-        and not _packed_expert_map
         and token_num * topk <= _FUSED_ROUTE_PSUM_MAX_NUMEL
         and int(E) <= _FUSED_ROUTE_PSUM_MAX_EXPERTS
     )
@@ -1125,6 +1124,7 @@ def _grouped_a8w4_tdm_moe(
             _align_m,
             expert_tile_m=min(tile_m, tile_m2),
             emit_aux=emit_route_aux,
+            packed_expert_map=_packed_expert_map,
         )
     elif _fuse_psum_quant:
         # The remapper's scan and ep_rowmap scatter ride the quant kernel:
@@ -2331,13 +2331,15 @@ def _get_compiled_contiguous_psum_remap(packed_expert_map: bool = False):
 
 
 @functools.cache
-def _get_compiled_route_psum_fused(emit_aux: bool = True):
+def _get_compiled_route_psum_fused(
+    emit_aux: bool = True, packed_expert_map: bool = False
+):
     """Compile and cache the single-TG fused route+atomic+psum+remap kernel."""
     from aiter.ops.flydsl.kernels.moe_contiguous_psum import (
         build_moe_route_psum_fused_module,
     )
 
-    return build_moe_route_psum_fused_module(emit_aux)
+    return build_moe_route_psum_fused_module(emit_aux, packed_expert_map)
 
 
 # One workgroup handles every route. NUMEL is advisory -- the route sweep is
@@ -2356,6 +2358,7 @@ def fused_route_psum_remap(
     tile_m: int,
     expert_tile_m: int | None = None,  # custom tile size for experts
     emit_aux: bool = True,
+    packed_expert_map: bool = False,
 ):
     """Single-launch route+atomic+psum+remap for small token counts.
 
@@ -2385,13 +2388,13 @@ def fused_route_psum_remap(
         torch.empty(
             (numel + experts * int(tile_m) + int(expert_tile_m) - 1)
             // int(expert_tile_m),
-            dtype=torch.int32,
+            dtype=torch.int64 if packed_expert_map else torch.int32,
             device=device,
         )
         if expert_tile_m is not None
         else torch.empty(0, dtype=torch.int32, device=device)
     )
-    launch = _get_compiled_route_psum_fused(emit_aux)
+    launch = _get_compiled_route_psum_fused(emit_aux, packed_expert_map)
     _run_compiled(
         launch,
         ptr_arg(topk_ids.to(torch.int32).reshape(-1)),
