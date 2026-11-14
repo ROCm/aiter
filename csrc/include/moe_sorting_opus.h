@@ -1451,18 +1451,27 @@ OPUS_H bool moe_sorting_is_oneshot(int tokens_, int num_experts_)
     return is_sub_token_onshot;
 }
 
-OPUS_H bool moe_sorting_device_is_gfx950(int device_id_ = -1)
+enum class moe_sorting_arch : unsigned char
 {
-    static const std::vector<unsigned char> gfx950_by_device = [] {
+    other,
+    gfx942,
+    gfx950,
+};
+
+OPUS_H moe_sorting_arch moe_sorting_device_arch(int device_id_ = -1)
+{
+    static const std::vector<moe_sorting_arch> arch_by_device = [] {
         int device_count = 0;
         OPUS_HIP_CHECK_ERROR(hipGetDeviceCount(&device_count));
-        std::vector<unsigned char> result(device_count, 0);
+        std::vector<moe_sorting_arch> result(device_count, moe_sorting_arch::other);
         for(int device_id = 0; device_id < device_count; ++device_id)
         {
             hipDeviceProp_t dev_prop;
             OPUS_HIP_CHECK_ERROR(hipGetDeviceProperties(&dev_prop, device_id));
-            result[device_id] =
-                std::strncmp(dev_prop.gcnArchName, "gfx950", 6) == 0;
+            if(std::strncmp(dev_prop.gcnArchName, "gfx950", 6) == 0)
+                result[device_id] = moe_sorting_arch::gfx950;
+            else if(std::strncmp(dev_prop.gcnArchName, "gfx942", 6) == 0)
+                result[device_id] = moe_sorting_arch::gfx942;
         }
         return result;
     }();
@@ -1470,9 +1479,9 @@ OPUS_H bool moe_sorting_device_is_gfx950(int device_id_ = -1)
     hipDevice_t dev = device_id_;
     if(dev < 0)
         OPUS_HIP_CHECK_ERROR(hipGetDevice(&dev));
-    if(dev >= static_cast<hipDevice_t>(gfx950_by_device.size()))
+    if(dev >= static_cast<hipDevice_t>(arch_by_device.size()))
         throw std::out_of_range("invalid HIP device id");
-    return gfx950_by_device[dev] != 0;
+    return arch_by_device[dev];
 }
 
 OPUS_H bool
@@ -1482,11 +1491,16 @@ moe_sorting_auto_is_oneshot(int tokens_, int num_experts_, int device_id_ = -1)
     if(!is_oneshot)
         return false;
 
+    const moe_sorting_arch arch = moe_sorting_device_arch(device_id_);
+    // gfx942 crossover measured on MI325X with block_m 16.
+    if(arch == moe_sorting_arch::gfx942)
+        return tokens_ < 64 && (tokens_ + 7) / 8 * 8 * num_experts_ <= 1024;
+
     // gfx950 crossover measured with E=128..255 at M>=17, E=256/257 at M>=8,
     // E=384 at M<8 and E=385 at all M.
     bool prefer_mp = num_experts_ >= 384 || (num_experts_ >= 256 && tokens_ >= 8) ||
                      (num_experts_ >= 128 && tokens_ >= 17);
-    return !(moe_sorting_device_is_gfx950(device_id_) && prefer_mp);
+    return !(arch == moe_sorting_arch::gfx950 && prefer_mp);
 }
 
 // return size in byte
