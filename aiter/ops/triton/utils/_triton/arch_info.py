@@ -20,8 +20,11 @@ except Exception:  # noqa: BLE001
     _CACHED_ARCH = None
 
 
-def get_arch():
+def get_arch(*, refresh: bool = False):
+    """Return the cached arch, or query the active device without updating it."""
     global _CACHED_ARCH
+    if refresh:
+        return str(_probe_arch()).split(":", 1)[0]
     if _CACHED_ARCH is None:
         _CACHED_ARCH = _probe_arch()
     return _CACHED_ARCH
