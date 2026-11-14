@@ -38,6 +38,38 @@ _TDM_MAX_PAD_INTERVAL_BYTES = 1024
 _NULL_SCALE_PTR = flyc.from_c_void_p(fx.Uint8, 0)
 
 
+def check_pipelined_k_loop(
+    pipelined: int,
+    *,
+    mx32: bool,
+    preload: bool,
+    use_cluster: bool,
+    split_k: int,
+    tile_k: int,
+) -> bool:
+    """Validate the ``pipelined`` constexpr of :func:`launch_gemm_a8w8`.
+
+    0 keeps the single-fence K loop. 1 (a kernelName ending in ``_pl``) takes
+    the software-pipelined K loop, which needs mxfp8_32, no scale preload, no
+    cluster, split_k 1 and tile_k >= 256 (two 128-deep k-steps per K-tile);
+    the runners already require K-tiles >= num_buffers. Anything else raises.
+    """
+    if pipelined not in (0, 1):
+        raise ValueError(
+            f"[FlyDSL gfx1250] pipelined must be 0 or 1, got {pipelined!r}"
+        )
+    if pipelined and not (
+        mx32 and not preload and not use_cluster and split_k == 1 and tile_k >= 256
+    ):
+        raise ValueError(
+            "[FlyDSL gfx1250] the pipelined K loop needs mxfp8_32, no scale "
+            f"preload, no cluster, split_k 1 and tile_k >= 256; got mx32={mx32}, "
+            f"preload={preload}, cluster={use_cluster}, split_k={split_k}, "
+            f"tile_k={tile_k}"
+        )
+    return bool(pipelined)
+
+
 @flyc.jit
 def launch_gemm_a8w8(
     arg_c: fx.Pointer,
@@ -73,7 +105,7 @@ def launch_gemm_a8w8(
     k_tail: Constexpr[bool] = False,
     arg_scale_out: fx.Pointer = _NULL_SCALE_PTR,
     fuse_quant_out: Constexpr[bool] = False,
-    pipelined: Constexpr[int] = -1,
+    pipelined: Constexpr[int] = 0,
 ):
     # fuse_quant_out: the bf16 C tile is group-32 MXFP8-quantized in the
     # epilogue instead of written as bf16. arg_c carries the e4m3 [M,B,N]
@@ -149,20 +181,16 @@ def launch_gemm_a8w8(
         )
     use_cluster = cluster_m > 1 or cluster_n > 1
     # pipelined: software-pipelined K loop (LDS reads of the next k-step and
-    # the TDM refill overlap this k-step's WMMAs, across K-tiles too).  It
-    # needs mxfp8_32, no scale preload, no cluster, split_k 1, at least two
-    # 128-deep k-steps per K-tile, and K-tiles >= num_buffers (both runners
-    # check that).  -1 picks it whenever that holds and the two fragment
-    # sets it keeps in flight are small; 1 asks for it (an error if it does
-    # not apply), 0 keeps the single-fence loop.
-    pipe_ok = (
-        mx32 and not preload and not use_cluster and split_k == 1 and tile_k >= 256
+    # the TDM refill overlap this k-step's WMMAs, across K-tiles too); see
+    # check_pipelined_k_loop.
+    pipelined = check_pipelined_k_loop(
+        pipelined,
+        mx32=mx32,
+        preload=preload,
+        use_cluster=use_cluster,
+        split_k=split_k,
+        tile_k=tile_k,
     )
-    if pipelined == 1 and not pipe_ok:
-        raise ValueError(
-            "[FlyDSL gfx1250] the pipelined K loop needs mxfp8_32, no scale "
-            "preload, no cluster, split_k 1 and tile_k >= 256"
-        )
     WMMA_M = WMMA_N = 16
     WMMA_K = 128
     WAVE = 32
@@ -177,12 +205,6 @@ def launch_gemm_a8w8(
     sb_loads = wmma_n_rep // 2 if sb_opsel else wmma_n_rep
     n_acc = wmma_m_rep * wmma_n_rep
     num_waves = m_warp * n_warp
-    if pipelined == -1:
-        # Accumulators plus two in-flight fragment sets, in VGPRs per lane.
-        pipelined = int(
-            pipe_ok and n_acc * 8 + 2 * (wmma_m_rep + wmma_n_rep) * 16 <= 512
-        )
-    pipelined = bool(pipelined)
     block = num_waves * WAVE
 
     LDS_PAD_A = 16
@@ -580,6 +602,12 @@ def launch_gemm_a8w8(
             else None
         )
 
+        def _join4(v):
+            # Four 4-dword LDS reads -> one 16-dword WMMA fragment.
+            v01 = v[0].shuffle(v[1], list(range(8)))
+            v23 = v[2].shuffle(v[3], list(range(8)))
+            return v01.shuffle(v23, list(range(16)))
+
         def load_a(buf, wm, ks):
             if const_expr(a_preshuffle):
                 b0 = a_pair_base
@@ -596,9 +624,7 @@ def launch_gemm_a8w8(
                 Vec(lds_load_b128(buf, b0 + (off0 + 32 * j)))
                 for j in range_constexpr(4)
             ]
-            v01 = v[0].shuffle(v[1], list(range(8)))
-            v23 = v[2].shuffle(v[3], list(range(8)))
-            return v01.shuffle(v23, list(range(16)))
+            return _join4(v)
 
         def load_b(buf, wn, ks):
             nbl = wnb // 16 + wn
@@ -606,9 +632,7 @@ def launch_gemm_a8w8(
                 STAGE_A + nbl * B_LDS_ROW + ks * 2048 + kgrp * 256 + lane16 * 16
             )
             v = [Vec(lds_load_b128(buf, b0 + 512 * j)) for j in range_constexpr(4)]
-            v01 = v[0].shuffle(v[1], list(range(8)))
-            v23 = v[2].shuffle(v[3], list(range(8)))
-            return v01.shuffle(v23, list(range(16)))
+            return _join4(v)
 
         def _bcast_byte(byte):
             w = byte.to(fx.Int32)
@@ -726,11 +750,15 @@ def launch_gemm_a8w8(
         _FRONT = list(range(front_wm))
         _BACK = list(range(front_wm, wmma_m_rep))
 
+        def _serpentine_wn(wm, wn_raw):
+            # Odd WMMA rows walk their N tiles backwards.
+            return (wmma_n_rep - 1 - wn_raw) if (wm % 2 == 1) else wn_raw
+
         def _mma_rows(wm_list, act, wt, sa_k, sb_k):
             for i in range_constexpr(len(wm_list)):
                 wm = wm_list[i]
                 for wn_raw in range_constexpr(wmma_n_rep):
-                    wn = (wmma_n_rep - 1 - wn_raw) if (wm % 2 == 1) else wn_raw
+                    wn = _serpentine_wn(wm, wn_raw)
                     idx = wm * wmma_n_rep + wn
                     _mma(
                         idx,
@@ -989,7 +1017,7 @@ def launch_gemm_a8w8(
             # accumulator still sees its k-steps in the same order with the
             # same operands, so the result is bit-identical to the loop above.
             _MMA_ORDER = [
-                (wm, (wmma_n_rep - 1 - wn) if (wm % 2 == 1) else wn)
+                (wm, _serpentine_wn(wm, wn))
                 for wm in range(wmma_m_rep)
                 for wn in range(wmma_n_rep)
             ]
@@ -1019,11 +1047,6 @@ def launch_gemm_a8w8(
             def _bases(stage_idx):
                 b = fx.Int32(stage_idx)
                 return [b + _a_lane, b + _b_lane, b + _sa_lane, b + _sb_lane]
-
-            def _join4(v):
-                v01 = v[0].shuffle(v[1], list(range(8)))
-                v23 = v[2].shuffle(v[3], list(range(8)))
-                return v01.shuffle(v23, list(range(16)))
 
             def _ld_a(buf, wm, ks):
                 if const_expr(not early):
@@ -1170,8 +1193,9 @@ def launch_gemm_a8w8(
                 car_base.store(Vec.from_elements(buf0))
             _put(_load_frags(buf0, 0))
             # Tile kt refills its stage with tile kt + num_buffers; the last
-            # num_buffers tiles have nothing left to load, so their fences wait
-            # for fewer outstanding TDM tiles.
+            # num_buffers tiles have nothing left to load. Tail tile j's fence
+            # waits for max(num_buffers - 2 - j, 0) outstanding TDM tiles: j = 0
+            # waits like the steady loop, later ones for fewer.
             n_steady = K_TILES - num_buffers
             for kt in range(n_steady):
                 tile(kt, num_buffers - 2, True, False)

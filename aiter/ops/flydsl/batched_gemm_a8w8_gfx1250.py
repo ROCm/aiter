@@ -53,9 +53,9 @@ _BMM_KERNEL_NAME_RE = re.compile(
     rf"^{re.escape(BMM_WMMA_NAME_PREFIX)}_{_SUFFIX_RE}(?P<preload>_pre)?$"
 )
 # mxfp8_32 has no whole-K scale preload: its scale panels are 4x (A) and 32x
-# (n32k4 B) the mxfp8_128 ones. A trailing ``_pl`` asks for the software-
-# pipelined K loop (tile_k >= 256); without it the kernel still takes that
-# loop when its fragments are small enough.
+# (n32k4 B) the mxfp8_128 ones. A trailing ``_pl`` selects the software-
+# pipelined K loop (see check_pipelined_k_loop); without it the kernel keeps
+# the single-fence loop.
 _BMM_MX32_KERNEL_NAME_RE = re.compile(
     rf"^{re.escape(BMM_MX32_WMMA_NAME_PREFIX)}_{_SUFFIX_RE}(?P<pipelined>_pl)?$"
 )
@@ -105,8 +105,7 @@ def _parse_bmm_mx32_kernel_name_cached(name: str) -> dict[str, int] | None:
     pipelined = groups.pop("pipelined")
     cfg = {key: int(value) for key, value in groups.items()}
     cfg["preload"] = 0
-    # 1: pipelined K loop asked for; -1: the kernel decides.
-    cfg["pipelined"] = 1 if pipelined is not None else -1
+    cfg["pipelined"] = int(pipelined is not None)
     return cfg
 
 
@@ -161,13 +160,11 @@ def bmm_mx32_kernel_name(
     m_warp: int,
     n_warp: int,
     num_buffers: int,
-    pipelined: bool = False,
 ) -> str:
     """Canonical name for a batched mxfp8_32 config."""
     return (
         f"{BMM_MX32_WMMA_NAME_PREFIX}_t{tile_m}x{tile_n}x{tile_k}"
         f"_mw{m_warp}_nw{n_warp}_nb{num_buffers}_sk1_cm1_cn1"
-        f"{'_pl' if pipelined else ''}"
     )
 
 
@@ -493,11 +490,6 @@ def run_bmm_a8w8_mxfp8_32_gfx1250(
         )
     tile_n, tile_k = cfg["tile_n"], cfg["tile_k"]
     k_tail = k % tile_k != 0
-    if cfg["pipelined"] == 1 and tile_k < 256:
-        raise ValueError(
-            f"[FlyDSL gfx1250 bmm] {name!r}: the pipelined K loop needs "
-            "tile_k >= 256"
-        )
     if n % tile_n or tile_n % 32 or (k_tail and not w_scale_32x32):
         raise RuntimeError(
             f"[FlyDSL gfx1250 bmm] {name!r} needs N%{tile_n}==0, tile_n%32==0 and "
