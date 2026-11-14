@@ -5,13 +5,17 @@
 
 ``IpcSymmetricAllocator`` needs nothing beyond HIP and ``torch.distributed``:
 every ``create_tensor`` call is collective over ``group`` (the ranks of one
-node); each rank allocates the same number of bytes, exports a HIP IPC handle,
-all-gathers the handles and opens every peer's allocation. ``p2p_table(t)``
-returns an i64 device tensor holding every peer's mapping of ``t`` (the own
-rank's entry is the local pointer), which is what the kernels index by PE.
+node) and maps one :class:`~aiter.ops.flydsl.dcp_mailbox.peer.PeerBuffer`:
+each rank allocates the same number of bytes, the IPC handles are exchanged,
+every peer's allocation is opened, and the ranks agree on the outcome (a rank
+that fails to open a peer makes every rank raise instead of hanging in the
+next collective). ``p2p_table(t)`` returns an i64 device tensor holding every
+peer's mapping of ``t`` (the own rank's entry is the local pointer), which is
+what the kernels index by PE.
 
-Memory is uncached (fine-grained), the same mode as mori's shmem heap: the
-kernels' cross-GPU stores and flag polls rely on it.
+Memory is uncached (``hipDeviceMallocUncached``), the mode mori's shmem heap
+uses: the kernels' cross-GPU stores and flag polls rely on it. Every buffer
+starts zero-filled.
 
 ``MoriShmemAllocator`` keeps the previous behaviour (mori's symmetric heap)
 behind the same interface for callers that share buffers with mori kernels.
@@ -19,32 +23,23 @@ behind the same interface for callers that share buffers with mori kernels.
 
 from __future__ import annotations
 
+import math
+
 import torch
 import torch.distributed as dist
 
-from .quick_allreduce_int4_ipc import UncachedIpcHeap
+from .dcp_mailbox.peer import PeerBuffer
 
 _ALIGN = 4096
 
 
-class _CudaArray:
-    """``__cuda_array_interface__`` view of a raw device pointer for torch."""
-
-    def __init__(self, ptr: int, nbytes: int):
-        self.__cuda_array_interface__ = {
-            "shape": (nbytes,),
-            "typestr": "|u1",
-            "data": (int(ptr), False),
-            "version": 3,
-            "strides": None,
-        }
-
-
-def _numel(shape) -> int:
-    n = 1
-    for s in shape:
-        n *= int(s)
-    return n
+def _group_alive(group) -> bool:
+    """Whether *group* is still a live process group of this process."""
+    try:
+        dist.get_rank(group=group)
+    except (RuntimeError, ValueError):  # destroyed / unregistered group
+        return False
+    return dist.is_initialized()
 
 
 class IpcSymmetricAllocator:
@@ -55,44 +50,36 @@ class IpcSymmetricAllocator:
         self.device = torch.device(device)
         self.rank = dist.get_rank(group=group)
         self.world_size = dist.get_world_size(group=group)
-        self._allocs: list[tuple[int, list[int], int]] = []
+        self._bufs: list[PeerBuffer] = []
+
+    def _check_same_size(self, nbytes: int) -> None:
+        """Collective: raise on every rank unless all ranks asked for *nbytes*."""
+        span = torch.tensor([nbytes, -nbytes], dtype=torch.int64)
+        dist.all_reduce(span, op=dist.ReduceOp.MAX, group=self.group)
+        if int(span[0]) != -int(span[1]):
+            raise RuntimeError(
+                "symmetric allocation size mismatch across ranks: "
+                f"{-int(span[1])}..{int(span[0])} bytes (this rank {nbytes})"
+            )
 
     def create_tensor(self, shape, dtype: torch.dtype) -> torch.Tensor:
         if isinstance(shape, int):
             shape = (shape,)
-        numel = _numel(shape)
-        elem = torch.tensor([], dtype=dtype).element_size()
-        nbytes = max(1, numel * elem)
-        nbytes = (nbytes + _ALIGN - 1) // _ALIGN * _ALIGN
-        with torch.cuda.device(self.device):
-            ptr = UncachedIpcHeap.alloc_uncached(nbytes)
-            handle = UncachedIpcHeap.get_mem_handle_bytes(ptr)
-            gathered = [None] * self.world_size
-            dist.all_gather_object(gathered, (nbytes, handle), group=self.group)
-            peers = []
-            for r, (peer_nbytes, peer_handle) in enumerate(gathered):
-                if peer_nbytes != nbytes:
-                    raise RuntimeError(
-                        f"symmetric allocation size mismatch: rank {r} asked for "
-                        f"{peer_nbytes} bytes, rank {self.rank} for {nbytes}"
-                    )
-                peers.append(
-                    ptr
-                    if r == self.rank
-                    else UncachedIpcHeap.open_mem_handle(peer_handle)
-                )
-            raw = torch.as_tensor(_CudaArray(ptr, nbytes), device=self.device)
-        self._allocs.append((ptr, peers, nbytes))
-        return raw[: numel * elem].view(dtype).view(*shape)
+        nbytes_used = (
+            math.prod(int(s) for s in shape)
+            * torch.empty((), dtype=dtype).element_size()
+        )
+        nbytes = (max(1, nbytes_used) + _ALIGN - 1) // _ALIGN * _ALIGN
+        self._check_same_size(nbytes)
+        buf = PeerBuffer(nbytes, self.group, self.rank, self.world_size, self.device)
+        self._bufs.append(buf)
+        return buf.bytes[:nbytes_used].view(dtype).view(*shape)
 
     def p2p_table(self, t: torch.Tensor) -> torch.Tensor:
         base = t.data_ptr()
-        for ptr, peers, nbytes in self._allocs:
-            if ptr <= base < ptr + nbytes:
-                off = base - ptr
-                return torch.tensor(
-                    [p + off for p in peers], dtype=torch.int64, device=self.device
-                )
+        for buf in self._bufs:
+            if buf.local <= base < buf.local + buf.bytes.numel():
+                return buf.addresses + (base - buf.local)
         raise ValueError("tensor was not allocated by this IpcSymmetricAllocator")
 
     def barrier(self):
@@ -100,15 +87,25 @@ class IpcSymmetricAllocator:
         dist.barrier(group=self.group)
 
     def close(self):
-        """Collective: unmap the peers' allocations, then free the own ones."""
-        for _, peers, _ in self._allocs:
-            for r, p in enumerate(peers):
-                if r != self.rank:
-                    UncachedIpcHeap.close_mem_handle(p)
+        """Collective: once every rank's kernels are done, unmap the peers'
+        allocations; once every rank has unmapped, free the own ones.
+
+        If ``group`` is already destroyed (``GroupCoordinator.destroy`` tears
+        down its process groups before its device communicator), the ranks can
+        no longer agree that the peers are done, so the memory is left to
+        process exit."""
+        if not self._bufs:
+            return
+        if not _group_alive(self.group):
+            self._bufs.clear()
+            return
         self.barrier()
-        for ptr, _, _ in self._allocs:
-            UncachedIpcHeap.free_device_mem(ptr)
-        self._allocs.clear()
+        for buf in self._bufs:
+            buf.close_peers()
+        dist.barrier(group=self.group)
+        for buf in self._bufs:
+            buf.close()
+        self._bufs.clear()
 
 
 class MoriShmemAllocator:
