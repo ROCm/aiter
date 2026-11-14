@@ -118,6 +118,11 @@ NONE_WRAPPED_OP = [
     "get_mla_decode_head_plan_v1",
     "mla_metadata_cluster_multiplier_v1",
     "mla_reduce_v1_supports",
+    # Bound once per NVFP4 MoE JIT module (one torch op name for many modules)
+    "_moe_nvfp4_cfg_index",
+    "_moe_nvfp4_cfg_field",
+    "_moe_nvfp4_cfg_fits",
+    "_moe_nvfp4_gemm",
 ]
 
 

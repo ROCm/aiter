@@ -1240,6 +1240,9 @@ def fused_moe(
     clamp_shared: bool = True,
     herd_topk: int = 0,
     herd_routed_scaling_factor: float = 1.0,
+    # NVFP4 weights: fp32 1 / weight_global_scale, [E, 2] (gate, up) and [E]
+    w1_global_scale: torch.Tensor | None = None,
+    w2_global_scale: torch.Tensor | None = None,
 ):
     """Run fused MoE, dispatching to FHMoE when shared-expert tensors are present.
 
@@ -1254,7 +1257,13 @@ def fused_moe(
     cache identities, so deployments changing this setting must rebuild their
     FlyDSL AOT cache.
 
+    ``w1_global_scale`` / ``w2_global_scale`` with fp4x2 weights select the
+    gfx950 NVFP4 MoE (:mod:`aiter.ops.moe_nvfp4`): w1 / w2 in the
+    ``shuffle_weight(w, (16, 32))`` layout, E4M3 ``w1_scale`` / ``w2_scale`` in
+    the ``shuffle_scale_nvfp4_moe`` layout.
     """
+    if herd_topk and (w1_global_scale is not None or w2_global_scale is not None):
+        raise ValueError("herd_topk does not support NVFP4 global scales")
     has_shared_expert = (
         any(
             tensor is not None
@@ -1280,6 +1289,8 @@ def fused_moe(
             unsupported.append("quant_dtype_a")
         if quant_dtype_a2 is not None:
             unsupported.append("quant_dtype_a2")
+        if w1_global_scale is not None or w2_global_scale is not None:
+            unsupported.append("w1_global_scale / w2_global_scale")
         # The MXFP8 path does not consume caller-prequantized activations and
         # requires an explicit preshuffle marker. Preserve the existing DSV4
         # MXFP4 path, which accepts activation scales and trusts its layout.
@@ -1386,6 +1397,8 @@ def fused_moe(
         quant_dtype_a2=quant_dtype_a2,
         herd_topk=herd_topk,
         herd_routed_scaling_factor=herd_routed_scaling_factor,
+        w1_global_scale=w1_global_scale,
+        w2_global_scale=w2_global_scale,
     )
 
 
@@ -1430,6 +1443,8 @@ def fused_moe_fake(
     quant_dtype_a2: torch.dtype | None = None,
     herd_topk: int = 0,
     herd_routed_scaling_factor: float = 1.0,
+    w1_global_scale: torch.Tensor | None = None,
+    w2_global_scale: torch.Tensor | None = None,
 ) -> torch.Tensor:
     device = topk_ids.device
     M, _topk = topk_ids.shape
@@ -1493,6 +1508,8 @@ def fused_moe_(
     quant_dtype_a2: torch.dtype | None = None,
     herd_topk: int = 0,
     herd_routed_scaling_factor: float = 1.0,
+    w1_global_scale: torch.Tensor | None = None,
+    w2_global_scale: torch.Tensor | None = None,
 ) -> torch.Tensor:
     stage2_scatter = None
     if ep_source_token_map is not None:
@@ -1538,6 +1555,8 @@ def fused_moe_(
         quant_dtype_a2=quant_dtype_a2,
         herd_topk=herd_topk,
         herd_routed_scaling_factor=herd_routed_scaling_factor,
+        w1_global_scale=w1_global_scale,
+        w2_global_scale=w2_global_scale,
     )
 
 
@@ -1574,6 +1593,8 @@ def _fused_moe_impl(
     quant_dtype_a2: torch.dtype | None = None,
     herd_topk: int = 0,
     herd_routed_scaling_factor: float = 1.0,
+    w1_global_scale: torch.Tensor | None = None,
+    w2_global_scale: torch.Tensor | None = None,
     *,
     _q_dtype_a: torch.dtype | None = None,
     _metadata_transform: Callable | None = None,
@@ -1678,6 +1699,14 @@ def _fused_moe_impl(
     _validate_output_buffer_no_overlap(output, hidden_states)
     quant_type = quant_remap.get(quant_type, quant_type)
     q_dtype_w = w1.dtype
+    if (w1_global_scale is not None or w2_global_scale is not None) and (
+        q_dtype_w != dtypes.fp4x2 or gate_mode != GateMode.SEPARATED
+    ):
+        raise ValueError(
+            "w1_global_scale / w2_global_scale (NVFP4 MoE) need fp4x2 weights and"
+            f" gate_mode={GateMode.SEPARATED.value!r}, got {q_dtype_w} and"
+            f" {gate_mode.value!r}"
+        )
     q_dtype_a = resolve_activation_dtype(
         quant_type,
         q_dtype_w,
@@ -1845,6 +1874,7 @@ def _fused_moe_impl(
             has_activation_scales=a1_scale is not None or a2_scale is not None,
             _has_input_activation_scales=a1_scale is not None,
             has_num_local_tokens=num_local_tokens is not None,
+            has_global_scale=w1_global_scale is not None or w2_global_scale is not None,
         )
         return (
             metadata if _metadata_transform is None else _metadata_transform(metadata)
@@ -1999,6 +2029,8 @@ def _fused_moe_impl(
                 gate_mode=gate_mode,
                 q_dtype_a=q_dtype_a,
                 q_dtype_w=q_dtype_w,
+                w1_global_scale=w1_global_scale,
+                w2_global_scale=w2_global_scale,
             )
         )
         return _return_output(full_output, output)
@@ -4147,8 +4179,15 @@ def get_2stage_cfgs(
     has_num_local_tokens=False,
     _exclude_mxmoe=False,
     _has_input_activation_scales=False,
+    has_global_scale=False,
 ):
     gate_mode = GateMode(gate_mode)
+    if q_dtype_w == dtypes.fp4x2 and has_global_scale:
+        from aiter.ops.moe_nvfp4 import _fused_moe_nvfp4
+
+        if has_stage2_scatter:
+            raise ValueError("NVFP4 fused_moe: stage2_scatter is not supported")
+        return MOEMetadata(None, None, 32, 0, full_impl=_fused_moe_nvfp4)
     cktile_mxfp4_unsafe = q_dtype_w == dtypes.fp4x2 and inter_dim % 256 != 0
     if q_type == QuantType.per_1x128 and activation == ActivationType.Silu:
         swiglu_limit = normalize_swiglu_limit(swiglu_limit)
