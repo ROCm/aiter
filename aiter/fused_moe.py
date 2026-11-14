@@ -1926,6 +1926,18 @@ def _fused_moe_impl(
         ksplit=metadata.ksplit,
     )
     fused_sort_quant = fused_sort_quant and not herd_topk
+    # MiniMax-M3.1 FHMoE decode (the FHMoE contract already fixed gfx950, two
+    # stages, no expert mask): sort + moe_buf zero + activation quant, one kernel
+    m3_sort_quant = (
+        not _fused_decode_sort_quant_disabled
+        and (_stage1_extra_args or {}).get("shared_expert_id") == 128
+        and (global_E, topk, model_dim, block_size_M) == (129, 5, 6144, 32)
+        and 1 <= M <= 256
+        and q_dtype_a in (dtypes.fp4x2, dtypes.fp8)
+        and hidden_pad == 0
+        and metadata.ksplit <= 1
+        and not metadata.output_aux
+    )
     # compact-scale variant not ported (its stage-1 change targets the
     # refactored mixed_moe_gemm_2stage_common); keep the fused sort+quant on
     # the expanded-scale path only.
@@ -1995,6 +2007,26 @@ def _fused_moe_impl(
             sort_reverse_sorted,
         ) = sorting_ret[:7]
         local_topk_ids = sorting_ret[7] if need_local_topk_ids else None
+    elif m3_sort_quant:
+        moe_buf = None if runtime_stage2_reduce else output
+        (
+            sorted_ids,
+            sorted_weights,
+            sorted_expert_ids,
+            num_valid_ids,
+            moe_buf,
+            prequantized_a1,
+            prequantized_a1_scale,
+        ) = aiter.m3_moe_sort_quant(
+            hidden_states,
+            topk_ids,
+            topk_weight,
+            q_dtype_a,
+            num_local_tokens,
+            moe_buf,
+            accumulate=not runtime_stage2_reduce,
+        )
+        local_topk_ids = None
     elif fused_sort_quant:
         (
             sorted_ids,
