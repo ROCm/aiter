@@ -25,7 +25,9 @@ quantize_fp8 of the unfused bf16 output. On gfx1250 it runs on the heuristic
 tile (M above 1024 is the compute-bound kernel) and on tuned tiles that pin
 each epilogue branch (FUSED_QUANT_TILES: two LDS-staged tiles and seven
 accumulator tiles, including the tuned DSv4.1 wo_a rows). gfx1250-strict runs that check and the compute
-kernelName cases alone.
+kernelName cases alone. gfx1250 also checks that the pipelined K loop
+(kernelName suffix ``_pl``) writes the single-fence loop's output bit for
+bit (PIPELINED_CASES).
 
 Input magnitudes change every 32 K (and every 32 weight rows), so the e8m0
 scales differ block to block and a scale applied to the wrong block shows up
@@ -182,7 +184,7 @@ _FP8_MAX = 448.0
 # warp (t16x64 nw4, t32x32 nw2) keeps the LDS-staged quant; an even count
 # quantizes from the accumulators. t64x32 nw1 has one quant group per tile
 # row; t160x128 has more rows than threads, so its scale rows take a second
-# pass.
+# pass. The last entry runs t128x128 again with the pipelined K loop (_pl).
 FUSED_QUANT_TILES = (
     "flydsl_bmm_mxfp8_32_wmma_t16x64x512_mw1_nw4_nb4_sk1_cm1_cn1",
     "flydsl_bmm_mxfp8_32_wmma_t32x64x512_mw2_nw2_nb4_sk1_cm1_cn1",
@@ -196,10 +198,24 @@ FUSED_QUANT_TILES = (
     "flydsl_bmm_mxfp8_32_wmma_t128x256x256_mw1_nw4_nb3_sk1_cm1_cn1",
     "flydsl_bmm_mxfp8_32_wmma_t96x128x256_mw2_nw2_nb4_sk1_cm1_cn1",
     "flydsl_bmm_mxfp8_32_wmma_t32x32x512_mw2_nw2_nb4_sk1_cm1_cn1",
+    "flydsl_bmm_mxfp8_32_wmma_t128x128x256_mw2_nw2_nb4_sk1_cm1_cn1_pl",
 )
 # M = 200 is ragged for every tile above; M = 48 is ragged for every tile but
 # t16x64, of which it is a whole number. Both use the DSv4.1 wo_a N, K.
 FUSED_QUANT_TILE_SHAPES = ((8, 48, 1024, 4096), (8, 200, 1024, 4096))
+# The pipelined K loop (kernelName suffix _pl) must give the single-fence
+# loop's output bit for bit: (b, m, n, k, kernelName without _pl) for a ragged
+# K (k_tail) and for a shipped DSv4.1 _pl row (b=1, as the 2-D table runs it).
+PIPELINED_CASES = (
+    (2, 200, 512, 576, "flydsl_bmm_mxfp8_32_wmma_t64x128x256_mw2_nw2_nb2_sk1_cm1_cn1"),
+    (
+        1,
+        576,
+        32768,
+        1280,
+        "flydsl_bmm_mxfp8_32_wmma_t192x256x256_mw2_nw2_nb2_sk1_cm1_cn1",
+    ),
+)
 
 
 def _to_e8m0_scale(scale):
@@ -645,6 +661,43 @@ def _fused_quant_k():
     return 32 if base_gfx_arch(get_gfx_runtime()) == "gfx950" else 128
 
 
+def test_pipelined_k_loop(b, m, n, k, kernel_name):
+    """``kernel_name`` and ``kernel_name + "_pl"`` must write the same bf16
+    output bit for bit (32x32 weight scale, which a ragged K needs). Returns
+    the number of mismatched elements."""
+    from aiter.ops.flydsl.batched_gemm_a8w8_gfx1250 import (
+        run_bmm_a8w8_mxfp8_32_gfx1250,
+    )
+
+    torch.manual_seed(SEED)
+    o_mbn = blockwise_randn(m, b, k, dtype=dtypes.bf16)
+    w_bnk = blockwise_randn(b, n, k, dtype=dtypes.bf16, rows=32)
+    x8, xs8 = quant_act_e8m0(o_mbn, 32)
+    w8, ws8 = quant_weight_e8m0(w_bnk, 32, 32)
+    w_shuf = shuffle_weight(w8)
+    outs = []
+    for name in (kernel_name, kernel_name + "_pl"):
+        y = torch.empty(m, b, n, dtype=dtypes.bf16)
+        run_bmm_a8w8_mxfp8_32_gfx1250(
+            x8, w_shuf, xs8, ws8, y, kernel_name=name, w_scale_32x32=True
+        )
+        outs.append(y.view(torch.int16))
+    mismatch = int((outs[0] != outs[1]).sum())
+    print(
+        f"pipelined K loop B={b} M={m} N={n} K={k} {kernel_name}: "
+        f"mismatch {mismatch}/{m * b * n}"
+    )
+    return mismatch
+
+
+def _run_pipelined():
+    bad = sum(bool(test_pipelined_k_loop(*case)) for case in PIPELINED_CASES)
+    if bad:
+        print(f"{bad} pipelined K-loop case(s) mismatched")
+        raise SystemExit(1)
+    print("pipelined K loop ALL BIT-EXACT")
+
+
 def _fused_quant_shapes(args, include_ragged_m):
     shapes = [(b, m, n, k) for b in args.batch for (m, n, k) in args.mnk]
     if include_ragged_m:
@@ -849,6 +902,8 @@ def main():
             _fused_quant_shapes(args, include_ragged_m=not custom_shape),
             pin_tiles=not custom_shape,
         )
+        if not custom_shape:
+            _run_pipelined()
 
 
 if __name__ == "__main__":
