@@ -38,6 +38,7 @@ from .mxfp4_gemm_common import _fabs_f32 as fabs_f32
 from .mxfp4_gemm_common import _lds_swizzle_mask as lds_swizzle_mask
 
 _FP8_E8M0_SHIFT = 7
+_FP4_E8M0_SHIFT = 2
 
 _G2_EPI_LANES = 32
 
@@ -248,6 +249,7 @@ def gemm2_body_v2(
     g2_ascale_pf=True,
     g2_bf16_lds=False,
     route_out_fp8=False,
+    route_out_fp4=False,
     g2_defer_weight=0,
     g2_out_pitch_align=0,
     g2_scale_blk=8,
@@ -613,6 +615,7 @@ def gemm2_body_v2(
             SBM=SBM,
             g2_bf16_lds=g2_bf16_lds,
             route_out_fp8=route_out_fp8,
+            route_out_fp4=route_out_fp4,
             g2_defer_weight=g2_defer_weight,
             g2_out_pitch_align=g2_out_pitch_align,
             g2_scale_blk=g2_scale_blk,
@@ -885,6 +888,7 @@ def atomic_bf16_epilog(
     SBM=None,
     g2_bf16_lds=False,
     route_out_fp8=False,
+    route_out_fp4=False,
     g2_defer_weight=0,
     g2_out_pitch_align=0,
     g2_scale_blk=8,
@@ -904,15 +908,18 @@ def atomic_bf16_epilog(
     EPI_ROWS = 256 // EPI_LANES
     M_REPS = BM // EPI_ROWS
     ROUTE_VEC = BN // EPI_LANES
-    if const_expr(use_reduce and route_out_fp8):
+    # fp4 route rows reuse the fp8 route-out path: packed e2m1 values, same e8m0 blocks.
+    route_out_q = route_out_fp8 or route_out_fp4
+    if const_expr(use_reduce and route_out_q):
         assert BM % EPI_ROWS == 0, (EPI_LANES, EPI_ROWS, BM)
         assert ROUTE_VEC % 4 == 0, (EPI_LANES, BN, ROUTE_VEC)
+        assert not route_out_fp4 or ROUTE_VEC % 8 == 0, (EPI_LANES, BN, ROUTE_VEC)
         assert g2_scale_blk in (ROUTE_VEC, 2 * ROUTE_VEC, 4 * ROUTE_VEC), (
             EPI_LANES,
             ROUTE_VEC,
             g2_scale_blk,
         )
-    bf16_src = const_expr(bool(g2_bf16_lds) and bool(route_out_fp8))
+    bf16_src = const_expr(bool(g2_bf16_lds) and bool(route_out_q))
     numAccN = (BN // 4) // 16  # 16-column MFMA subblocks per wave
     lane_div_16 = lane // 16
     lane_mod_16 = lane % 16
@@ -927,10 +934,13 @@ def atomic_bf16_epilog(
     m_lane = tx_i32 // EPI_LANES
     n_lane = tx_i32 % EPI_LANES
     if reduce_store_cache_modifier is not None and (
-        not use_reduce or route_out_fp8 or enable_bias or g2_defer_weight
+        not use_reduce or route_out_q or enable_bias or g2_defer_weight
     ):
         raise ValueError("custom BF16 store policies require unweighted reduce output")
     output_width = N_OUT if const_expr(output_width is None) else fx.Int32(output_width)
+    val_width = (
+        _udiv(output_width, fx.Int32(2)) if const_expr(route_out_fp4) else output_width
+    )
     output_n_base = fx.Int32(output_n_base)
     store_vec = 8 if reduce_store_cache_modifier is not None else 2
     store_group_n = EPI_LANES * store_vec
@@ -1050,8 +1060,8 @@ def atomic_bf16_epilog(
         if const_expr(use_reduce):
             # reduce out_row can reach tokens*topk (large-M) so compute the element base in i64 (atomic i32 path byte-identical).
             out_row = fx.Int64(token_id * fx.Int32(topk) + (packed[mr] >> fx.Int32(24)))
-            if const_expr(route_out_fp8):
-                row_pitch = output_width + _udiv(output_width, fx.Int32(g2_scale_blk))
+            if const_expr(route_out_q):
+                row_pitch = val_width + _udiv(output_width, fx.Int32(g2_scale_blk))
                 if const_expr(g2_out_pitch_align > 0):
                     al = fx.Int32(g2_out_pitch_align)
                     row_pitch = ((row_pitch + al - fx.Int32(1)) // al) * al
@@ -1063,7 +1073,7 @@ def atomic_bf16_epilog(
         else:
             out_row = token_id
             row_base_addr = out_row * N_OUT + n_block_idx * BN + col_start
-        if const_expr(use_reduce and route_out_fp8):
+        if const_expr(use_reduce and route_out_q):
             route_vec = ROUTE_VEC
             route_group_n = EPI_LANES * route_vec
             n_rg = (BN + route_group_n - 1) // route_group_n
@@ -1128,7 +1138,11 @@ def atomic_bf16_epilog(
                     elif const_expr(g2_scale_blk == 4 * route_vec):
                         amax_bits = _inline_dpp_quad_amax(amax_bits)
                     ax_e = (amax_bits >> fx.Int32(23)) & fx.Int32(0xFF)
-                    e8m0 = ax_e - fx.Int32(_FP8_E8M0_SHIFT)
+                    e8m0 = ax_e - fx.Int32(
+                        _FP4_E8M0_SHIFT
+                        if const_expr(route_out_fp4)
+                        else _FP8_E8M0_SHIFT
+                    )
                     e8m0 = (e8m0 < fx.Int32(1)).select(fx.Int32(1), e8m0)
                     e8m0 = (amax_bits == fx.Int32(0)).select(fx.Int32(0), e8m0)
                     block_scale = (amax_bits == fx.Int32(0)).select(
@@ -1142,7 +1156,29 @@ def atomic_bf16_epilog(
                         return _raw(fx.full([2], 0, fx.Int16))
 
                     words = []
-                    for d in range_constexpr(route_vec // 4):
+                    if const_expr(route_out_fp4):
+                        for d in range_constexpr(route_vec // 8):
+                            w = _raw(fx.Int32(0))
+                            for h in range_constexpr(4):
+                                e = 8 * d + 2 * h
+                                if const_expr(bf16_src):
+                                    src2 = Vec.from_elements(
+                                        [bvals[e], bvals[e + 1]], BFloat16
+                                    )
+                                    w = rocdl.cvt_scalef32_pk_fp4_bf16(
+                                        T.i32, w, _raw(src2), bs_raw, h
+                                    )
+                                else:
+                                    w = rocdl.cvt_scalef32_pk_fp4_f32(
+                                        T.i32,
+                                        w,
+                                        _raw(vals[e]),
+                                        _raw(vals[e + 1]),
+                                        bs_raw,
+                                        h,
+                                    )
+                            words.append(Vec.from_elements([fx.Int32(w)], Int32))
+                    for d in range_constexpr(0 if route_out_fp4 else route_vec // 4):
                         w = pk_seed()
                         for h in range_constexpr(2):
                             e = 4 * d + 2 * h
@@ -1166,7 +1202,11 @@ def atomic_bf16_epilog(
                     emit_stores(output_col, words, e8m0)
 
                 def emit_stores(output_col, words, e8m0, rg=rg):
-                    row_val_off = row_base_addr + fx.Int64(output_col)
+                    row_val_off = row_base_addr + fx.Int64(
+                        _udiv(output_col, fx.Int32(2))
+                        if const_expr(route_out_fp4)
+                        else output_col
+                    )
                     for d in range_constexpr(len(words)):
                         fx.ptr_store(
                             Vec(words[d]).bitcast(Int8),
@@ -1174,7 +1214,7 @@ def atomic_bf16_epilog(
                         )
                     scale_off = (
                         row_base_addr
-                        + fx.Int64(output_width)
+                        + fx.Int64(val_width)
                         + fx.Int64(_udiv(output_col, fx.Int32(g2_scale_blk)))
                     )
                     fx.ptr_store(e8m0.to(Int8), out_i8_ptr + scale_off)
@@ -1286,14 +1326,14 @@ def atomic_bf16_epilog(
     # the LDS latency overlaps instead of serializing read -> wait -> store per row.
     lds_pre = None
     if const_expr(
-        not (use_reduce and route_out_fp8) and reduce_store_cache_modifier is None
+        not (use_reduce and route_out_q) and reduce_store_cache_modifier is None
     ):
         lds_pre = [
             [lds_pk_load(mr, s) for s in range_constexpr(BN // store_group_n)]
             for mr in range_constexpr(M_REPS)
         ]
 
-    if const_expr(prefetched_ids is not None or (use_reduce and route_out_fp8)):
+    if const_expr(prefetched_ids is not None or (use_reduce and route_out_q)):
         rocdl.s_waitcnt(vmcnt=0)
 
     for mr in range_constexpr(M_REPS):

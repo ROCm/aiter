@@ -3574,7 +3574,16 @@ def _flydsl_v2_stage2_wrapper(
     _s2_fp8_inter = epilog == "reduce" and _flydsl_stage2_fp8_enabled()
     if _s2_fp8_inter:
         _s2_fp8_inter = sorted_weights is not None and topk_weights is not None
-    _defer_w = _s2_fp8_inter
+    # AITER_MXFP4_INTERMEDIATE: the same deferred-weight route rows, values in MXFP4.
+    _s2_fp4_inter = (
+        not _s2_fp8_inter
+        and epilog == "reduce"
+        and _mxfp4_intermediate_enabled()
+        and sorted_weights is not None
+        and topk_weights is not None
+        and model_dim_runtime % 32 == 0
+    )
+    _defer_w = _s2_fp8_inter or _s2_fp4_inter
     _fp8_scale_blk = None
     _fp8_pitch_align = None
     _s2_fp4_scatter = (
@@ -3630,6 +3639,15 @@ def _flydsl_v2_stage2_wrapper(
                 torch.uint8,
                 out.device,
             )
+        elif _s2_fp4_inter:
+            from aiter.ops.flydsl.kernels.mxfp4_gemm_common import fp4out_row_bytes
+
+            target = _stage2_scratch(
+                "target",
+                (token_num * topk, fp4out_row_bytes(model_dim_runtime)),
+                torch.uint8,
+                out.device,
+            )
         else:
             target = _stage2_scratch(
                 "target", (token_num, topk, model_dim_runtime), out.dtype, out.device
@@ -3666,7 +3684,11 @@ def _flydsl_v2_stage2_wrapper(
         persist=cfg["persist"],
         g2_bf16_lds=cfg["bf16_lds"],
         g2_spart=cfg["spart"],
-        out_dtype="fp8" if _s2_fp8_inter else ("fp4" if _s2_fp4_scatter else "bf16"),
+        out_dtype=(
+            "fp8"
+            if _s2_fp8_inter
+            else ("fp4" if (_s2_fp4_scatter or _s2_fp4_inter) else "bf16")
+        ),
         bias=bias2,
         is_ep=expert_mask is not None,
         out_scale=target_scale,
@@ -3712,6 +3734,7 @@ def _flydsl_v2_stage2_wrapper(
             topk_weights=topk_weights if _defer_w else None,
             fp8_scale_blk=_fp8_scale_blk,
             fp8_pitch_align=_fp8_pitch_align,
+            is_fp4=_s2_fp4_inter,
         )
     return out
 
@@ -5968,8 +5991,12 @@ def fused_moe_2stages(
         _mxfp4_a4w4_stage2_fw,
     ):
         extra_stage2_args["use_valid_token_count"] = num_local_tokens is not None
-    if uses_flydsl_v2_stage2 and not doweight_stage1 and _flydsl_stage2_fp8_enabled():
-        # FP8 route-output reduction applies the route weights after GEMM2.
+    if (
+        uses_flydsl_v2_stage2
+        and not doweight_stage1
+        and (_flydsl_stage2_fp8_enabled() or _mxfp4_intermediate_enabled())
+    ):
+        # FP8/FP4 route-output reduction applies the route weights after GEMM2.
         extra_stage2_args["topk_weights"] = topk_weights
     if stage2_func is _opus_a8w4.opus_a8w4_stage2_wrapper:
         extra_stage2_args["stage2_fp8_enabled"] = _opus_stage2_fp8_enabled()

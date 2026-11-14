@@ -179,9 +179,11 @@ def compile_gemm2_a4w4_port(
     route_out_fp8 = out_dtype == "fp8"
     if route_out_fp8 and not use_reduce:
         raise AssertionError("out_dtype='fp8' is supported only with epilog='reduce'")
-    scatter_out_fp4 = out_dtype == "fp4"
-    if scatter_out_fp4 and not use_scatter:
-        raise AssertionError("out_dtype='fp4' is supported only with epilog='scatter'")
+    scatter_out_fp4 = out_dtype == "fp4" and use_scatter
+    # MXFP4 route rows: the fp8 route-out epilogue with packed e2m1 values.
+    route_out_fp4 = out_dtype == "fp4" and use_reduce
+    if out_dtype == "fp4" and not (use_scatter or use_reduce):
+        raise AssertionError("out_dtype='fp4' requires epilog='scatter' or 'reduce'")
     if scatter_out_fp4 and BN not in (128, 256):
         # fp32 C staging is BM*BN*4 bytes of LDS; BN=512 would need 256KB.
         raise AssertionError(
@@ -194,7 +196,7 @@ def compile_gemm2_a4w4_port(
         g2_defer_weight = False
         g2_out_pitch_align = 0
         g2_scale_blk = 8
-    elif route_out_fp8:
+    elif route_out_fp8 or route_out_fp4:
         from .mxfp4_gemm_common import FP8OUT_PITCH_ALIGN, FP8OUT_SCALE_BLK
 
         g2_defer_weight = True
@@ -307,16 +309,22 @@ def compile_gemm2_a4w4_port(
     noil_tag = "_noil" if g2_bf16_lds and compact_route else ""
     dw_tag = "_dw" if g2_defer_weight else ""
     pitch_tag = (
-        f"_pa{g2_out_pitch_align}" if (route_out_fp8 and g2_out_pitch_align) else ""
+        f"_pa{g2_out_pitch_align}"
+        if ((route_out_fp8 or route_out_fp4) and g2_out_pitch_align)
+        else ""
     )
-    sblk_tag = f"_sblk{g2_scale_blk}" if (route_out_fp8 and g2_scale_blk != 8) else ""
-    out_tag = "_fp8out" if route_out_fp8 else ("_f4out" if scatter_out_fp4 else "")
+    sblk_tag = (
+        f"_sblk{g2_scale_blk}"
+        if ((route_out_fp8 or route_out_fp4) and g2_scale_blk != 8)
+        else ""
+    )
+    out_tag = "_fp8out" if route_out_fp8 else ("_f4out" if out_dtype == "fp4" else "")
     compact_tag = "_weighted_compact_s8" if compact_route else ""
     route_guard_tag = "_routeguard" if use_reduce else ""
     valid_tokens_tag = "_valid_tokens" if use_valid_token_count else ""
     tile_tag = "" if (BN, BK) == (256, 256) else f"_bn{BN}_bk{BK}"
     bias_tag = "_bias" if enable_bias else ""
-    g2_epi_lanes = _pick_epi_lanes(BM, BN, route_out_fp8, g2_scale_blk)
+    g2_epi_lanes = _pick_epi_lanes(BM, BN, route_out_fp8 or route_out_fp4, g2_scale_blk)
     tag = f"hmax{HIDDEN_MAX}_imax{INTER_MAX}_bm{BM}{tile_tag}{'_nt' if use_nt else ''}_{etag}{atag}{btag}{sbm_tag}{shared_scale_tag}{persist_tag}{bh_tag}{apf_tag}{spart_tag}{bf16lds_tag}{noil_tag}{dw_tag}{pitch_tag}{sblk_tag}{out_tag}{compact_tag}{bias_tag}{output_range_tag}_v2_biasabi7{route_guard_tag}"
     name = f"gemm2_a4w4_port_{tag}{valid_tokens_tag}" + (
         "_idpf" if g2_prefetch_ids else ""
@@ -445,6 +453,7 @@ def compile_gemm2_a4w4_port(
                 g2_out_pitch_align=g2_out_pitch_align,
                 g2_scale_blk=g2_scale_blk,
                 route_out_fp8=route_out_fp8,
+                route_out_fp4=route_out_fp4,
                 g2_epi_lanes=g2_epi_lanes,
                 g2_apre=g2_apre,
                 enable_bias=enable_bias,
@@ -859,7 +868,8 @@ def mxfp4_moe_gemm2(
         raise AssertionError(
             f"D_HIDDEN ({D_HIDDEN}) exceeds compile cap HIDDEN_MAX ({HIDDEN_MAX})"
         )
-    if str(out_dtype).strip().lower() == "fp4":
+    # fp4 reduce writes fp8-style route rows (scales inline), like out_dtype='fp8'.
+    if str(out_dtype).strip().lower() == "fp4" and epilog != "reduce":
         if epilog != "scatter":
             raise AssertionError(
                 "out_dtype='fp4' is supported only with epilog='scatter'"

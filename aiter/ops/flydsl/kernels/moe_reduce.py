@@ -24,7 +24,13 @@ from flydsl.expr import const_expr, gpu, ptrtoint, range_constexpr
 from flydsl.expr.typing import T
 
 from .kernels_common import ceildiv
-from .mxfp4_gemm_common import FP8OUT_PITCH_ALIGN, fp8out_row_bytes, fp8out_scale_blk
+from .mxfp4_gemm_common import (
+    FP8OUT_PITCH_ALIGN,
+    FP8OUT_SCALE_BLK,
+    fp4out_row_bytes,
+    fp8out_row_bytes,
+    fp8out_scale_blk,
+)
 
 BLOCK = 256
 FP8_VEC = 8  # fp8 values per 64b buffer load (also the store granularity)
@@ -55,13 +61,20 @@ def _moe_reduction_body(
     # and decodes to f32. Both then run the same masked f32 topk-accumulate
     # (uniform soffset = k*row_stride) and truncating store. row_stride differs:
     # an fp8 row is padded with its scale bytes ([N fp8 | N/scale_blk e8m0]).
-    is_fp8 = dtype_str == "fp8"
+    # fp4 route-out rows ([N/2 packed e2m1 | N/32 e8m0]) take the fp8 path with
+    # half the value bytes: 4 bytes = 8 values per thread.
+    is_fp4 = dtype_str == "fp4"
+    is_fp8 = dtype_str == "fp8" or is_fp4
+    pack = 2 if is_fp4 else 1
     if const_expr(is_fp8):
         in_elem, in_bytes, V = fx.Int8, 1, FP8_VEC
         row_stride = fp8_row_stride
         out_numeric = fx.Float16 if (out_dtype_str or "bf16") == "f16" else fx.BFloat16
         load_atom = fx.make_copy_atom(
-            fx.rocdl.BufferCopy64b(2 if streaming_loads else 0), fx.Int8
+            (fx.rocdl.BufferCopy32b if is_fp4 else fx.rocdl.BufferCopy64b)(
+                2 if streaming_loads else 0
+            ),
+            fx.Int8,
         )
     else:
         in_elem = (
@@ -97,7 +110,7 @@ def _moe_reduction_body(
     # for X > 4 GiB.
     x_row_bytes = topk * row_stride * in_bytes
     xbase = fx.Int64(ptrtoint(X)) + tok64 * fx.Int64(x_row_bytes)
-    xbuf = _view(in_elem, xbase, model_dim, x_row_bytes)
+    xbuf = _view(in_elem, xbase, model_dim // pack, x_row_bytes)
     ybuf = _view(
         out_numeric,
         fx.Int64(ptrtoint(Y)) + tok64 * fx.Int64(model_dim * out_bytes),
@@ -109,7 +122,7 @@ def _moe_reduction_body(
         i8pt = fx.PointerType.get(
             fx.Int8.ir_type, address_space=fx.AddressSpace.Global, alignment=1
         )
-        sc_ptr = fx.inttoptr(i8pt, xbase + fx.Int64(model_dim))
+        sc_ptr = fx.inttoptr(i8pt, xbase + fx.Int64(model_dim // pack))
     if const_expr(use_mask):
         i32pt = fx.PointerType.get(
             T.i32, address_space=fx.AddressSpace.Global, alignment=4
@@ -132,7 +145,11 @@ def _moe_reduction_body(
     tile_mn, tv_layout = fx.make_layout_tv(
         fx.make_layout((1, NTHREADS), (1, 1)), fx.make_layout((1, V), (1, 1))
     )
-    thr_load = fx.make_tiled_copy(load_atom, tv_layout, tile_mn).get_slice(tid)
+    # Loads tile packed bytes: V // pack per thread (the value tile for pack == 1).
+    tile_in, tv_in = fx.make_layout_tv(
+        fx.make_layout((1, NTHREADS), (1, 1)), fx.make_layout((1, V // pack), (1, 1))
+    )
+    thr_load = fx.make_tiled_copy(load_atom, tv_in, tile_in).get_slice(tid)
     thr_store = fx.make_tiled_copy(store_atom, tv_layout, tile_mn).get_slice(tid)
 
     def _decode_fp8(vfrag, scale):  # 8 fp8 bytes + its e8m0 scale -> Vector(8, f32)
@@ -145,9 +162,19 @@ def _moe_reduction_body(
             lanes.append(pair[1] * scale)
         return fx.Vector.from_elements(lanes, fx.Float32)
 
+    def _decode_fp4(vfrag, scale):
+        # 4 bytes of e2m1 pairs + their e8m0 scale -> Vector(8, f32)
+        w = fx.Vector(fx.memref_load_vec(vfrag)).bitcast(fx.Int32)[0]
+        lanes = []
+        for b in range_constexpr(4):
+            pair = fx.Vector(fx.rocdl.cvt_scalef32_pk_f32_fp4(T.f32x2, w, scale, b))
+            lanes.append(pair[0])
+            lanes.append(pair[1])
+        return fx.Vector.from_elements(lanes, fx.Float32)
+
     def _reduce_tile():
         p_src = thr_load.partition_S(
-            fx.slice(fx.zipped_divide(xbuf, tile_mn), (None, (0, tile)))
+            fx.slice(fx.zipped_divide(xbuf, tile_in), (None, (0, tile)))
         )
         p_dst = thr_store.partition_D(
             fx.slice(fx.zipped_divide(ybuf, tile_mn), (None, (0, tile)))
@@ -168,7 +195,9 @@ def _moe_reduction_body(
 
         acc = fx.full(V, 0.0, fx.Float32)
         for k in range_constexpr(topk):
-            if const_expr(is_fp8):
+            if const_expr(is_fp4):
+                vk = _decode_fp4(frags[k], scales[k])
+            elif const_expr(is_fp8):
                 vk = _decode_fp8(frags[k], scales[k])
             else:
                 vk = fx.Vector(fx.memref_load_vec(frags[k])).to(fx.Float32)
@@ -229,7 +258,11 @@ def compile_moe_reduction(
     stays correct. streaming_loads opts into nontemporal contribution loads
     for buffers consumed once; the default retains the existing cache policy.
     """
-    V = FP8_VEC if dtype_str == "fp8" else 128 // (32 if dtype_str == "f32" else 16)
+    V = (
+        FP8_VEC
+        if dtype_str in ("fp8", "fp4")
+        else 128 // (32 if dtype_str == "f32" else 16)
+    )
     block = _pick_reduce_block(model_dim, V)
     gy = ceildiv(model_dim, block * V)
     out_tag = out_dtype_str or dtype_str
@@ -241,6 +274,10 @@ def compile_moe_reduction(
         fp8_row_stride = fp8out_row_bytes(
             model_dim, scale_blk=scale_blk, pitch_align=align
         )
+    elif dtype_str == "fp4":
+        scale_blk = FP8OUT_SCALE_BLK
+        align = FP8OUT_PITCH_ALIGN if pitch_align is None else int(pitch_align)
+        fp8_row_stride = fp4out_row_bytes(model_dim, pitch_align=align)
     else:
         scale_blk, fp8_row_stride = FP8_VEC, model_dim
 
