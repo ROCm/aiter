@@ -19,7 +19,7 @@ import torch.nn.functional as F
 
 import aiter
 from aiter import dtypes
-from aiter.jit.utils.chip_info import get_gfx
+from aiter.jit.utils.chip_info import get_gfx_runtime
 from aiter.ops.flydsl import flydsl_flash_attn_func, flydsl_fp8_quant
 from aiter.ops.flydsl import fmha_kernels as flydsl_fmha_kernels
 from aiter.ops.flydsl.fmha_kernels import _validate_gfx1201_launch_limits
@@ -195,28 +195,43 @@ def test_gfx1201_launch_limits_allow_large_bf16_batch():
     _check_gfx1201_launch_limits_allow_large_bf16_batch()
 
 
-def _check_bf16_launch_preserves_tensor_args():
-    q = torch.ones((1, 128, 1, 64), dtype=torch.bfloat16, device="cuda")
-    out = torch.empty_like(q)
+def _check_bf16_launch_preserves_tensor_args(dtype=torch.bfloat16, seq_len=128):
+    q = torch.ones((1, seq_len, 1, 64), dtype=dtype, device="cuda")
+    is_fp8 = dtype == torch.float8_e4m3fn
+    out = torch.empty_like(q, dtype=torch.bfloat16 if is_fp8 else dtype)
+    scales = (
+        {
+            name: torch.ones(1, device=q.device)
+            for name in ("q_descale", "k_descale", "v_descale")
+        }
+        if is_fp8
+        else {}
+    )
     captured = []
 
     def fake_kernel(*args, **kwargs):
         captured.extend(args[:4])
 
-    with patch.object(flydsl_fmha_kernels, "_get_kernel", lambda **kwargs: fake_kernel):
-        result = flydsl_flash_attn_func(q, q, q, out=out)
+    kernel = "_get_fp8_gfx1201_kernel" if is_fp8 else "_get_kernel"
+    with patch.object(flydsl_fmha_kernels, kernel, lambda **kwargs: fake_kernel):
+        result = flydsl_flash_attn_func(q, q, q, out=out, **scales)
 
     assert result.data_ptr() == out.data_ptr()
-    assert captured[0] is q
-    assert captured[1] is q
-    assert captured[2] is q
-    assert captured[3] is out
-    assert all(tensor.shape == q.shape for tensor in captured)
+    # FP8 uses flattened views. All four arguments must retain the caller's
+    # storage, including unaligned lengths and a caller-provided output.
+    assert len(captured) == 4
+    for actual, expected in zip(captured, (q, q, q, out)):
+        assert actual.data_ptr() == expected.data_ptr()
+        assert actual.numel() == expected.numel()
+        if not is_fp8:
+            assert actual is expected
 
 
 @_gfx1201_only
-def test_flydsl_fmha_bf16_launch_preserves_tensor_args():
-    _check_bf16_launch_preserves_tensor_args()
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16, torch.float8_e4m3fn])
+@pytest.mark.parametrize("seq_len", [128, 97])
+def test_flydsl_fmha_bf16_launch_preserves_tensor_args(dtype, seq_len):
+    _check_bf16_launch_preserves_tensor_args(dtype, seq_len)
 
 
 def _check_zero_q_descale_produces_uniform_attention():
@@ -2039,12 +2054,72 @@ def test_fp8_repeat_launch_is_bit_exact_under_load():
     assert bad == 0, f"{bad}/200 launches differed bitwise from the reference launch"
 
 
+_GFX1201_TAIL_CASES = [
+    (97, 97, 64, False),
+    (129, 129, 128, True),
+    (65, 33, 224, False),
+    (33, 65, 128, False),
+]
+
+
+def _check_gfx1201_partial_tiles(dtype, seq_q, seq_kv, head_dim, causal):
+    q, _, _ = _make_qkv(2, seq_q, 2, head_dim, torch.bfloat16)
+    _, k, v = _make_qkv(2, seq_kv, 2, head_dim, torch.bfloat16, seed=1)
+    if dtype == torch.float8_e4m3fn:
+        q, k, v, sq, sk, sv = flydsl_fp8_quant(q, k, v, rotation=False)
+        scales = {"q_descale": sq, "k_descale": sk, "v_descale": sv}
+        ref_q, ref_k, ref_v = (
+            x.float() * scale for x, scale in zip((q, k, v), (sq, sk, sv))
+        )
+    else:
+        q, k, v = (x.to(dtype) for x in (q, k, v))
+        scales = {}
+        ref_q, ref_k, ref_v = q, k, v
+
+    # A contiguous view with NaNs beyond its logical allocation exposes
+    # unbounded tail loads without relying on allocator contents.
+    guarded = []
+    for tensor in (q, k, v):
+        storage = torch.full(
+            (tensor.numel() + 2 * head_dim * 64,),
+            float("nan"),
+            dtype=tensor.dtype,
+            device=tensor.device,
+        )
+        view = storage[: tensor.numel()].view(tensor.shape)
+        view.copy_(tensor)
+        guarded.append(view)
+    out = torch.full_like(q, float("nan"), dtype=torch.bfloat16 if scales else dtype)
+    actual = flydsl_flash_attn_func(*guarded, causal=causal, out=out, **scales)
+    reference = _optest_gfx1201_reference(ref_q, ref_k, ref_v, causal=causal)
+    assert actual.data_ptr() == out.data_ptr()
+    err = checkAllclose(
+        reference,
+        actual.float(),
+        rtol=2e-1 if scales else 2e-2,
+        atol=2e-1 if scales else 2e-2,
+        msg="gfx1201 partial tiles",
+    )
+    assert err == 0
+
+
+@_gfx1201_only
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16, torch.float8_e4m3fn])
+@pytest.mark.parametrize("seq_q,seq_kv,head_dim,causal", _GFX1201_TAIL_CASES)
+def test_gfx1201_partial_tiles(dtype, seq_q, seq_kv, head_dim, causal):
+    _check_gfx1201_partial_tiles(dtype, seq_q, seq_kv, head_dim, causal)
+
+
 # Native gfx1201 FMHA op-test.  This intentionally lives in the canonical
 # arch-dispatching test module rather than a separate test_*_gfx1201.py file.
 _GFX1201_OPTEST_SHAPES = [
     ("d64_256", 1, 256, 256, 8, 64, False),
     ("d128_cross_tail", 1, 2048, 1400, 8, 128, False),
     ("causal_d128", 1, 512, 512, 8, 128, True),
+    # Captured Qwen-Image: 4096 image tokens plus 30/47 text tokens, H=24/D=128.
+    ("qwen_4126", 1, 4126, 4126, 24, 128, False),
+    ("qwen_4143", 1, 4143, 4143, 24, 128, False),
+    ("qwen_aligned", 1, 4096, 4096, 24, 128, False),
 ]
 
 
@@ -2105,7 +2180,14 @@ def _optest_assert_gfx1201_quality(
 def _optest_gfx1201_contracts():
     """Check durable public-wrapper boundaries outside timed benchmark rows."""
     _check_gfx1201_launch_limits_allow_large_bf16_batch()
-    _check_bf16_launch_preserves_tensor_args()
+    for dtype, seq_len in itertools.product(
+        (torch.bfloat16, torch.float16, torch.float8_e4m3fn), (128, 97)
+    ):
+        _check_bf16_launch_preserves_tensor_args(dtype, seq_len)
+    for dtype, config in itertools.product(
+        (torch.bfloat16, torch.float16, torch.float8_e4m3fn), _GFX1201_TAIL_CASES
+    ):
+        _check_gfx1201_partial_tiles(dtype, *config)
     _check_zero_q_descale_produces_uniform_attention()
     _check_descales_for_bf16_are_rejected()
     for zero_row in (0, -1):
@@ -2200,7 +2282,7 @@ def run_flydsl_fmha_optest(
         * ((seq_q + 2 * seq_kv) * element_bytes + seq_q * out.element_size())
     )
 
-    ret = {"gfx": get_gfx()}
+    ret = {"gfx": get_gfx_runtime()}
     for name, fn in candidates.items():
         result, us = run_perftest(fn)
         assert result.data_ptr() == out.data_ptr(), f"{name} did not use out buffer"
@@ -2211,6 +2293,7 @@ def run_flydsl_fmha_optest(
             atol=2e-1 if is_fp8 else 2e-2,
             msg=f"{name}: {shape}",
         )
+        assert err == 0, f"{name}: {err:.2%} of elements outside tolerance"
         _optest_assert_gfx1201_quality(
             result,
             ref,
@@ -2227,9 +2310,9 @@ def run_flydsl_fmha_optest(
 
 
 def main():
-    if get_gfx() != "gfx1201":
+    if get_gfx_runtime() != "gfx1201":
         aiter.logger.warning(
-            "native FlyDSL FMHA op test unsupported on %s; skipping", get_gfx()
+            "native FlyDSL FMHA op test unsupported on %s; skipping", get_gfx_runtime()
         )
         return
 

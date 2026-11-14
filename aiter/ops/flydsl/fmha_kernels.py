@@ -11,10 +11,10 @@ CK/Triton.
 ``flydsl_flash_attn_func`` (gfx1201 / RDNA4) wraps the
 `flash_attn_func_gfx1201` kernel with:
   - Build cache keyed by shape, dtype, masking, and tuning parameters.
-  - Automatic Q and KV sequence padding to their respective tile sizes.
+  - Partial Q/K/V tiles without sequence-padding copies.
   - BSHD ([B, S, H, D]) input/output convention to match upstream
     flash-attention layout.
-  - Exact masking of padded non-causal K/V columns.
+  - Batch-bounded K/V loads and exact masking of partial non-causal tiles.
   - Non-causal cross-attention with independent Q and KV sequence lengths.
 """
 
@@ -26,7 +26,6 @@ import warnings
 from functools import lru_cache
 
 import torch
-import torch.nn.functional as F
 
 from .fmha_bwd_gfx942 import flash_attn_varlen_bwd_d192_gfx942
 from .kernels.fmha_gfx1201.flash_attn_func import (
@@ -149,9 +148,9 @@ def _validate_gfx1201_launch_limits(
 ) -> None:
     """Validate integer arguments and signed-Int32 V# buffer indices."""
     for name, value in (
-        ("padded query sequence length", seq_len),
+        ("query sequence length", seq_len),
         ("real KV sequence length", seq_len_kv_real),
-        ("padded KV sequence length", seq_len_kv),
+        ("KV sequence length", seq_len_kv),
     ):
         if value > _GFX1201_KERNEL_INT32_MAX:
             raise ValueError(
@@ -167,11 +166,11 @@ def _validate_gfx1201_launch_limits(
             )
     else:
         # The FP8 kernel's typed V# helpers narrow flattened Q/K/V/O element
-        # offsets to Int32. Bound the padded tensors before materializing them
+        # offsets to Int32. Bound the tensors before materializing them
         # so a large batch cannot wrap those buffer indices.
         for name, elements in (
-            ("padded Q/O", batch * seq_len * num_heads * head_dim),
-            ("padded K/V", batch * seq_len_kv * num_heads * head_dim),
+            ("Q/O", batch * seq_len * num_heads * head_dim),
+            ("K/V", batch * seq_len_kv * num_heads * head_dim),
         ):
             if elements > _GFX1201_KERNEL_INT32_MAX:
                 raise ValueError(
@@ -422,37 +421,18 @@ def flydsl_flash_attn_func(
             f"the {_GFX1201_LDS_CAPACITY_BYTES}-byte hardware limit"
         )
 
-    # Pad sequence lengths to their respective tile sizes. Non-causal padded
-    # K/V columns are masked in the kernel; padded query rows are sliced off.
-    seq_len_pad = ((seq_len_real + block_m - 1) // block_m) * block_m
-    seq_len_kv_pad = (
-        seq_len_pad
-        if not is_cross
-        else ((seq_len_kv_real + block_n - 1) // block_n) * block_n
-    )
-    tail_mask = not causal and seq_len_kv_real % block_n != 0
+    # Q rows are guarded and batch-bounded K/V loads zero-fill partial tiles.
+    # Keep the true sequence lengths instead of copying tensors to tile sizes.
+    tail_mask = seq_len_kv_real % block_n != 0
     _validate_gfx1201_launch_limits(
         batch=batch,
-        seq_len=seq_len_pad,
+        seq_len=seq_len_real,
         seq_len_kv_real=seq_len_kv_real,
-        seq_len_kv=seq_len_kv_pad,
+        seq_len_kv=seq_len_kv_real,
         num_heads=num_heads,
         head_dim=head_dim,
         fp8=is_fp8,
     )
-
-    def _pad_seq(tensor: torch.Tensor, pad: int) -> torch.Tensor:
-        tensor = tensor.contiguous()
-        if pad == 0:
-            return tensor
-        if tensor.dtype in _FP8_DTYPES:
-            # Some backends do not implement constant padding for float8.
-            # Padding the byte representation is equivalent because FP8 is
-            # one byte per element and the all-zero bit pattern represents 0.
-            return F.pad(tensor.view(torch.uint8), (0, 0, 0, 0, 0, pad)).view(
-                tensor.dtype
-            )
-        return F.pad(tensor, (0, 0, 0, 0, 0, pad))
 
     # Wrap kernel build + launch in q.device context so multi-GPU callers
     # whose current device differs from q.device get the kernel compiled
@@ -472,12 +452,10 @@ def flydsl_flash_attn_func(
             if is_fp8:
                 for tensor in (q_descale, k_descale, v_descale):
                     tensor.record_stream(launch_stream)
-            q_p = _pad_seq(q, seq_len_pad - seq_len_real)
-            k_p = _pad_seq(k, seq_len_kv_pad - seq_len_kv_real)
-            v_p = _pad_seq(v, seq_len_kv_pad - seq_len_kv_real)
-            write_in_place = (
-                out is not None and seq_len_pad == seq_len_real and out.is_contiguous()
-            )
+            q_p = q.contiguous()
+            k_p = k.contiguous()
+            v_p = v.contiguous()
+            write_in_place = out is not None and out.is_contiguous()
             o_p = out if write_in_place else torch.empty_like(q_p, dtype=output_dtype)
 
             if is_fp8:
@@ -500,9 +478,9 @@ def flydsl_flash_attn_func(
                     v_p.reshape(-1),
                     o_p.reshape(-1),
                     batch,
-                    seq_len_pad,
+                    seq_len_real,
                     seq_len_kv_real,
-                    seq_len_kv_pad,
+                    seq_len_kv_real,
                     q_descale,
                     k_descale,
                     v_descale,
@@ -538,18 +516,16 @@ def flydsl_flash_attn_func(
                     v_p,
                     o_p,
                     batch,
-                    seq_len_pad,
+                    seq_len_real,
                     seq_len_kv_real,
-                    seq_len_kv_pad,
+                    seq_len_kv_real,
                     stream=launch_stream,
                 )
 
-            result = o_p[:, :seq_len_real, :, :] if seq_len_pad != seq_len_real else o_p
+            result = o_p
             if out is not None and not write_in_place:
                 out.copy_(result)
                 result = out
-            elif out is None:
-                result = result.contiguous()
 
     return result
 

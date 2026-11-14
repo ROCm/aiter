@@ -39,7 +39,13 @@ from flydsl.expr.utils.arith import _to_raw as _raw
 
 from ..kernels_common import LOG2E as _LOG2E
 from ..layout_utils import crd2idx, idx2crd
-from ..tensor_shim import _run_compiled, buf_copy_load, buf_copy_store, ptr_buf_tensor
+from ..tensor_shim import (
+    _run_compiled,
+    buf_base_i64,
+    buf_copy_load,
+    buf_copy_store,
+    ptr_buf_tensor,
+)
 from .flash_attn_func_common import (
     flatten_scores,
     kv_load_schedule,
@@ -330,7 +336,7 @@ def build_flash_attn_func_module(
 
         # Logical coordinates and HBM element offsets are explicit u64 values.
         # V# helpers narrow at their intrinsic boundary; the public wrapper
-        # rejects padded tensors whose flattened offsets exceed signed Int32.
+        # rejects tensors whose flattened offsets exceed signed Int32.
         seq_len_v = fx.Uint64(seq_len)
         seq_len_kv_real_v = fx.Uint64(seq_len_kv_real)
         if const_expr(CROSS_ATTN):
@@ -375,9 +381,34 @@ def build_flash_attn_func_module(
             token = batch_idx * seq_len_v + token_idx
             return token * STRIDE_TOKEN + head_idx * HEAD_DIM + col
 
+        # Aligned K/V tiles keep the original descriptors and batch offsets.
+        # The final V prefetch already wraps to tile zero in both paths.
+        if const_expr(TAIL_MASK):
+            # Per-batch V# bounds zero-fill partial tiles and the pipelined V
+            # prefetch. They cannot read a following batch or past the allocation.
+            kv_batch_bytes = seq_len_kv_v * fx.Uint64(STRIDE_TOKEN)
+            kv_batch_offset = fx.Int64(batch_idx * kv_batch_bytes)
+            k_buf = ptr_buf_tensor(
+                buf_base_i64(K) + kv_batch_offset,
+                fx.Int32,
+                unit_elems=4,
+                unit_stride=1,
+                num_records_bytes=kv_batch_bytes,
+            )
+            v_buf = ptr_buf_tensor(
+                buf_base_i64(V) + kv_batch_offset,
+                fx.Int32,
+                unit_elems=4,
+                unit_stride=1,
+                num_records_bytes=kv_batch_bytes,
+            )
+
         def kv_global_idx(token_idx, col):
             token = batch_idx * seq_len_kv_v + token_idx
-            return token * STRIDE_TOKEN + head_idx * HEAD_DIM + col
+            index = token * STRIDE_TOKEN + head_idx * HEAD_DIM + col
+            if const_expr(TAIL_MASK):
+                index = token_idx * STRIDE_TOKEN + head_idx * HEAD_DIM + col
+            return index
 
         def _store_output_vec(base_idx, val):
             buf_copy_store(

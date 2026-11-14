@@ -181,7 +181,7 @@ def build_flash_attn_func_module(
 
         def _bounds_checked_buf_ptr(ptr, num_records_bytes):
             # OOB_SELECT=3 zero-fills accesses beyond num_records. This explicit
-            # descriptor is required for the branch-free V tail prefetch below.
+            # descriptor is required for partial K/V tiles and V tail prefetch.
             flags = (7 << 12) | (4 << 15) | (1 << 24) | (3 << 28)
             buf_ptr_ty = fx.PointerType.get(
                 elem_ty=ptr.element_type.ir_type,
@@ -265,6 +265,12 @@ def build_flash_attn_func_module(
             token = batch_idx * seq_len_kv_v + token_idx
             return token * STRIDE_TOKEN + head_idx * HEAD_DIM + col
 
+        def k_idx(token_idx, col):
+            index = kv_global_idx(token_idx, col)
+            if const_expr(TAIL_MASK):
+                index = token_idx * STRIDE_TOKEN + head_idx * HEAD_DIM + col
+            return index
+
         # Hardware OOB handling keeps the tail prefetch branch-free. A batch
         # slice must fit the descriptor's 32-bit ``num_records`` field.
         ELEM_BYTES = (elem_numeric_cls.width + 7) // 8
@@ -274,15 +280,45 @@ def build_flash_attn_func_module(
             fx.Int64(v_batch_elems) * fx.Int64(ELEM_BYTES),
         )
 
+        # Bound K to this batch too: the final partial tile must not read the
+        # next batch or run past the allocation. Invalid columns are masked.
+        if const_expr(TAIL_MASK):
+            k_elem_ptr = _bounds_checked_buf_ptr(
+                fx.add_offset(k_elem_ptr, fx.Int64(batch_idx * v_batch_elems)),
+                fx.Int64(v_batch_elems) * fx.Int64(ELEM_BYTES),
+            )
+
         def v_idx(token_idx, col):
             return token_idx * STRIDE_TOKEN + head_idx * HEAD_DIM + col
 
         def _load_global_half_vec(elem_ptr, base_idx, width):
-            view = fx.make_view(
-                fx.add_offset(elem_ptr, fx.Int64(base_idx)),
-                fx.make_layout(width, 1),
-            )
-            return Vec(view.load())
+            if const_expr(TAIL_MASK and width == 16):
+                # V# loads cap at 16 bytes. Keep the 16-element LDS store by
+                # joining two legal BF16/F16 loads for a partial K tile.
+                lo = Vec(
+                    fx.make_view(
+                        fx.add_offset(elem_ptr, fx.Int64(base_idx)),
+                        fx.make_layout(8, 1),
+                    ).load()
+                )
+                hi = Vec(
+                    fx.make_view(
+                        fx.add_offset(elem_ptr, fx.Int64(base_idx + 8)),
+                        fx.make_layout(8, 1),
+                    ).load()
+                )
+                result = Vec.from_elements(
+                    [lo[j] for j in range_constexpr(8)]
+                    + [hi[j] for j in range_constexpr(8)],
+                    elem_dtype,
+                )
+            else:
+                view = fx.make_view(
+                    fx.add_offset(elem_ptr, fx.Int64(base_idx)),
+                    fx.make_layout(width, 1),
+                )
+                result = Vec(view.load())
+            return result
 
         def _store_global_half(elem_ptr, base_idx, val):
             view = fx.make_view(
@@ -330,12 +366,12 @@ def build_flash_attn_func_module(
                 if const_expr(KV_NEEDS_GUARD):
                     chunk_valid = linear_chunk < fx.Uint64(NUM_KV_CHUNKS)
                     if chunk_valid:
-                        g_idx = kv_global_idx(row_idx, load_col_base)
+                        g_idx = k_idx(row_idx, load_col_base)
                         lds_idx = k_base + lds_row * K_STRIDE + load_col_base
                         vec = _load_global_half_vec(k_elem_ptr, g_idx, VEC_WIDTH)
                         lds_store(lds_idx, vec)
                 else:
-                    g_idx = kv_global_idx(row_idx, load_col_base)
+                    g_idx = k_idx(row_idx, load_col_base)
                     lds_idx = k_base + lds_row * K_STRIDE + load_col_base
                     vec = _load_global_half_vec(k_elem_ptr, g_idx, VEC_WIDTH)
                     lds_store(lds_idx, vec)
@@ -424,9 +460,8 @@ def build_flash_attn_func_module(
         if const_expr(CAUSAL):
             kv_upper = fx.Int64((_q_end < seq_len_v).select(_q_end, seq_len_v))
         else:
-            # The range still executes a final partial tile; K/V live in the
-            # padded allocation and TAIL_MASK excludes its padded columns.
-            # Stopping at the real length avoids processing whole padded tiles.
+            # Batch-bounded K/V loads zero-fill the final partial tile, and
+            # TAIL_MASK excludes its invalid columns. No padded copy is needed.
             kv_upper = seq_len_kv_real_v
 
         # Non-causal carries prefetched V across iterations; causal avoids the

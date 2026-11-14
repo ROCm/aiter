@@ -36,7 +36,7 @@ from torch.nn.attention import SDPBackend, sdpa_kernel
 
 import aiter
 from aiter import dtypes
-from aiter.jit.utils.chip_info import get_gfx
+from aiter.jit.utils.chip_info import get_gfx_runtime
 from aiter.ops.flydsl import flydsl_flash_attn_func, flydsl_fp8_quant
 from aiter.ops.triton.attention.mha_v3 import flash_attn_func as triton_flash_attn_func
 from aiter.test_common import benchmark, checkAllclose, run_perftest
@@ -51,6 +51,13 @@ SHAPES = [
     ("wan", 1, 8192, 12, 128),
     ("wan", 1, 32768, 12, 128),
     ("sd3.5", 1, 2048, 38, 64),
+    # Captured Qwen-Image: 4096 image tokens plus 30/47 text tokens.
+    ("qwen-image", 1, 4126, 24, 128),
+    ("qwen-image", 1, 4143, 24, 128),
+    # Wan sequence tail and a batch-two pair exercise unaligned batch strides.
+    ("wan", 1, 32760, 12, 128),
+    ("batched", 2, 1024, 8, 128),
+    ("batched", 2, 1025, 8, 128),
 ]
 
 
@@ -95,11 +102,11 @@ def test_flydsl_fmha(model, batch, seq_len, num_heads, head_dim, dtype, causal):
     # upstream. Quantized once, outside timing (rotation off -- this row isolates
     # the attention kernel, not the quant/rotate producer cost).
     qq, kk, vv, sq, sk, sv = flydsl_fp8_quant(q, k, v, rotation=False)
-    # Triton v3 accepts per-head descales; expand the native per-tensor values
+    # Triton v3 accepts per-batch/head descales; expand the per-tensor values
     # so both consumers receive identical quantized Q/K/V and effective scales.
-    triton_sq = sq.expand(1, num_heads).contiguous()
-    triton_sk = sk.expand(1, num_heads).contiguous()
-    triton_sv = sv.expand(1, num_heads).contiguous()
+    triton_sq = sq.expand(batch, num_heads).contiguous()
+    triton_sk = sk.expand(batch, num_heads).contiguous()
+    triton_sv = sv.expand(batch, num_heads).contiguous()
 
     def _sdpa_flash():
         with sdpa_kernel([SDPBackend.FLASH_ATTENTION]):
@@ -165,12 +172,13 @@ def test_flydsl_fmha(model, batch, seq_len, num_heads, head_dim, dtype, causal):
     if causal:
         flops *= 0.5
 
-    ret = {"gfx": get_gfx()}
+    ret = {"gfx": get_gfx_runtime()}
     for name, (fn, layout, in_b, out_b) in candidates.items():
         torch.cuda.synchronize()
         torch.cuda.reset_peak_memory_stats()
         base_mb = torch.cuda.memory_allocated() / 1e6
-        out, us = run_perftest(fn)
+        # Dropped ROCm profiler events can corrupt per-call aggregation.
+        out, us = run_perftest(fn, use_cuda_event=True)
         # Peak = high-water allocation during the run; transient = peak above the
         # resting baseline (ref + pre-quantized q/k/v are allocated before the loop
         # and shared by every candidate), i.e. the candidate's own working set.
@@ -183,6 +191,7 @@ def test_flydsl_fmha(model, batch, seq_len, num_heads, head_dim, dtype, causal):
             atol=2e-1 if "fp8" in name else 2e-2,
             msg=f"{name}: flydsl_fmha {model}",
         )
+        assert err == 0, f"{name}: {err:.2%} of elements outside tolerance"
         cos_min, cos_mean = cosine_stats(out_bshd, ref, head_dim)
         nbytes = batch * seq_len * num_heads * head_dim * (3 * in_b + out_b)
         # us in microseconds: TFLOP/s = flop/us/1e6, GB/s = bytes/us/1e3
@@ -206,8 +215,10 @@ test_flydsl_fmha.__test__ = False
 
 
 def main():
-    if get_gfx() not in SUPPORTED_GFX:
-        aiter.logger.warning("flydsl flash-attn unsupported on %s; skipping", get_gfx())
+    if get_gfx_runtime() not in SUPPORTED_GFX:
+        aiter.logger.warning(
+            "flydsl flash-attn unsupported on %s; skipping", get_gfx_runtime()
+        )
         return
 
     parser = argparse.ArgumentParser(
