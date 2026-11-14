@@ -71,7 +71,7 @@ def slot_maxima(row, cuts):
     chunk's share of it. The kernels' max skips NaN; no keys, -inf."""
     end = row.numel()
     groups = _ceil(end, LANE_MAX_KEYS)
-    v = torch.full((groups * LANE_MAX_KEYS,), float("-inf"))
+    v = torch.full((groups * LANE_MAX_KEYS,), float("-inf"), device=row.device)
     v[:end] = torch.where(torch.isnan(row), float("-inf"), row.float())
     tiles = v.view(groups, LANE_MAX_TILES, TILE)
     parts = {}
