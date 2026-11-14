@@ -456,9 +456,9 @@ def batched_gemm_a8w8_mxscale_bpreshuffle_fused_quant(
     standalone ``quantize_fp8`` of the bf16 output is removed.
 
     Returns ``(y_fp8 [M, G, N] e4m3, y_scale [M, (G*N)//32] e8m0)``, bit-identical
-    to ``quantize_fp8`` of the unfused bf16 output. gfx1250 flydsl mxfp8_32 only;
-    raises ``NotImplementedError`` otherwise so a caller can fall back to the
-    bf16 GEMM + ``quantize_fp8``.
+    to ``quantize_fp8`` of the unfused bf16 output. gfx1250 flydsl mxfp8_32 and
+    gfx950 flydsl (N a multiple of 32); raises ``NotImplementedError`` otherwise
+    so a caller can fall back to the bf16 GEMM + ``quantize_fp8``.
     """
     from .flydsl.batched_gemm_a8w8 import (
         bmm_a8w8_mxfp8_fused_quant_supported,
@@ -475,21 +475,88 @@ def batched_gemm_a8w8_mxscale_bpreshuffle_fused_quant(
         )
     y8 = torch.empty((m, g, n), dtype=dtypes.fp8, device=x.device)
     y_scale = torch.empty((m, g * n // 32), dtype=torch.float8_e8m0fnu, device=x.device)
+    from .opus._arch import _device_arch_and_cu
+
+    gfx, cu_num = _device_arch_and_cu(x.device)
     run_bmm_a8w8_mxfp8(
-        x, wo_a, x_scale, w_scale, y8, y_scale_out=y_scale.view(torch.uint8)
+        x,
+        wo_a,
+        x_scale,
+        w_scale,
+        y8,
+        kernel_name=_fused_quant_tuned_kernel(g, m, n, k, w_scale_block, gfx, cu_num),
+        y_scale_out=y_scale.view(torch.uint8),
     )
     return y8, y_scale
+
+
+def _fused_quant_runs(name: str, gfx: str) -> bool:
+    """Whether the fused epilogue can run this flydsl kernel name."""
+    if gfx == "gfx950":
+        from .flydsl.batched_gemm_a8w8_gfx950 import parse_bmm_kernel_name
+
+        # The runner would set aside a tile that splits a 32-column group.
+        parsed = parse_bmm_kernel_name(name)
+        return parsed is not None and parsed["tile_n"] % 32 == 0
+    from .flydsl import batched_gemm_a8w8_gfx1250 as bmm_gfx1250
+
+    return bmm_gfx1250.parse_bmm_mx32_kernel_name(name) is not None
+
+
+@functools.lru_cache(maxsize=1024)
+def _fused_quant_tuned_kernel(
+    g: int, m: int, n: int, k: int, w_scale_block: str, gfx: str, cu_num: int
+) -> str | None:
+    """The preshuffle table's flydsl batched kernel for this shape, the one the
+    bf16 entry runs, so both entries share the tuned tile.
+
+    On gfx950, where that row is OPUS or a tile the epilogue cannot run, the
+    shape's flydsl row at the next larger tuned M (else the largest) stands in:
+    the runner's own heuristic tile is far slower there at large M. None (the
+    runner's own choice) when the shape has no usable row."""
+
+    cfg = lookup_mxscale_bmm_config(
+        g,
+        m,
+        n,
+        k,
+        w_scale_block=w_scale_block,
+        bpreshuffle=True,
+        gfx=gfx,
+        cu_num=cu_num,
+    )
+    if (
+        cfg is not None
+        and cfg["libtype"] == "flydsl"
+        and _fused_quant_runs(cfg["kernelName"], gfx)
+    ):
+        return cfg["kernelName"]
+    if gfx != "gfx950":
+        return None
+    rows = sorted(
+        (key[3], row["kernelName"])
+        for key, row in _load_mxscale_bmm_tuned(None, True).items()
+        if key[:3] == (gfx, cu_num, g)
+        and key[4:] == (n, k, w_scale_block)
+        and row.get("libtype") == "flydsl"
+        and _fused_quant_runs(row["kernelName"], gfx)
+    )
+    if not rows:
+        return None
+    return next((name for row_m, name in rows if row_m >= m), rows[-1][1])
 
 
 def batched_gemm_a8w8_mxscale_bpreshuffle_fused_quant_supported(
     w_scale: tuple[int, ...], n: int, k: int
 ) -> bool:
     """Whether :func:`batched_gemm_a8w8_mxscale_bpreshuffle_fused_quant` can run
-    this shape (gfx1250 flydsl mxfp8_32). Lets a caller choose the fused path
-    once instead of catching ``NotImplementedError`` per call."""
+    this shape (gfx1250 flydsl mxfp8_32, gfx950 flydsl). Lets a caller choose
+    the fused path once instead of catching ``NotImplementedError`` per call."""
     from .flydsl.batched_gemm_a8w8 import bmm_a8w8_mxfp8_fused_quant_supported
 
-    return bmm_a8w8_mxfp8_fused_quant_supported(_w_scale_block_of(w_scale, n, k))
+    return n % 32 == 0 and bmm_a8w8_mxfp8_fused_quant_supported(
+        _w_scale_block_of(w_scale, n, k)
+    )
 
 
 @torch_compile_guard(mutates_args=[], gen_fake=_batched_gemm_a8w8_mxscale_fake)

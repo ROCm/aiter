@@ -10,7 +10,7 @@ operand      shape                          notes
 ``WQ``       ``[B, N, K]`` fp8              16x16 preshuffled (ops.shuffle.shuffle_weight)
 ``x_scale``  ``[M, B, K//XK]`` e8m0         row-major, XK = 32 or 128
 ``w_scale``  ``[B, N//WN, K//WK]`` e8m0     WN x WK = 32x32, 128x128 or 1x32
-``Out``      ``[M, B, N]`` bf16
+``Out``      ``[M, B, N]`` bf16             or e4m3 with ``y_scale_out``
 ===========  =============================  ================================
 
 The block edges come from the scale shapes. Tuned configs are rows of the
@@ -265,14 +265,16 @@ def _warn_unrecognised(name: str) -> None:
     )
 
 
-# The launcher's runtime parameters: seven pointers, M and the stream. Every
+# The launcher's runtime parameters: eight pointers, M and the stream. Every
 # later one is a Constexpr, baked into the kernel it compiles.
-_RUNTIME_PARAMS = 9
+_RUNTIME_PARAMS = 10
 _SCALE_PARAMS = ("x_scale_k", "w_scale_n", "w_scale_k", "x_scale_transposed")
 
 
 @functools.lru_cache(maxsize=1024)
-def _constexprs(name: str, n: int, k: int, b: int, *scale_args) -> tuple:
+def _constexprs(
+    name: str, n: int, k: int, b: int, *scale_args, fuse_quant_out: bool = False
+) -> tuple:
     """A kernel's Constexpr arguments in parameter order, the key of its
     compiled launcher. ``scale_args`` are the _SCALE_PARAMS values."""
     bound = inspect.signature(launch_bmm_a8w8_mxscale.func).bind(
@@ -282,6 +284,7 @@ def _constexprs(name: str, n: int, k: int, b: int, *scale_args) -> tuple:
         b,
         **_require_config(name),
         **dict(zip(_SCALE_PARAMS, scale_args)),
+        fuse_quant_out=fuse_quant_out,
     )
     bound.apply_defaults()
     return bound.args[_RUNTIME_PARAMS:]
@@ -295,8 +298,8 @@ _COMPILED: dict[tuple, flyc.CompiledFunction] = {}
 def _launch(tensors, m, stream, constexprs: tuple) -> None:
     """The one call into the kernel, shared by the runtime and AOT paths so
     both build the same FlyDSL cache key. ``tensors`` are Out, XQ, WQ,
-    x_scale, w_scale, split-K partials and counters; only their addresses
-    reach the kernel. A kernel's first launch compiles (or loads) and runs it
+    x_scale, w_scale, split-K partials and counters, and the fused quant's
+    scale output; only their addresses reach the kernel. A kernel's first launch compiles (or loads) and runs it
     through flyc.compile, which returns None under compile-only (AOT)."""
     args = (*map(ptr_arg, tensors), m, stream, *constexprs)
     compiled = _COMPILED.get(constexprs)
@@ -317,17 +320,26 @@ def compile_bmm_a8w8_mxfp8_gfx950(
     w_scale_n: int,
     w_scale_k: int,
     x_scale_transposed: bool = False,
+    fuse_quant_out: bool = False,
 ) -> None:
     """Compile ``kernel_name`` for ``[B, N, K]`` with 1 x x_scale_k x_scale
     blocks (column-major if x_scale_transposed) and w_scale_n x w_scale_k
-    w_scale blocks, as run_bmm_a8w8_mxfp8_gfx950 would launch it. M is a
-    runtime argument, so this serves every M. Call it under
-    ``aiter.aot.flydsl.common.compile_only_env``."""
+    w_scale blocks, as run_bmm_a8w8_mxfp8_gfx950 would launch it (with
+    ``y_scale_out`` when fuse_quant_out). M is a runtime argument, so this
+    serves every M. Call it under ``aiter.aot.flydsl.common.compile_only_env``."""
     constexprs = _constexprs(
-        kernel_name, n, k, b, x_scale_k, w_scale_n, w_scale_k, x_scale_transposed
+        kernel_name,
+        n,
+        k,
+        b,
+        x_scale_k,
+        w_scale_n,
+        w_scale_k,
+        x_scale_transposed,
+        fuse_quant_out=fuse_quant_out,
     )
     placeholder = torch.empty(0, dtype=torch.uint8)
-    _launch((placeholder,) * 7, 1, fx.Stream(0), constexprs)
+    _launch((placeholder,) * 8, 1, fx.Stream(0), constexprs)
 
 
 def run_bmm_a8w8_mxfp8_gfx950(
@@ -338,6 +350,7 @@ def run_bmm_a8w8_mxfp8_gfx950(
     Out: Tensor,
     kernel_name: str | None = None,
     x_scale_transposed: bool = False,
+    y_scale_out: Tensor | None = None,
 ) -> Tensor:
     """``Out[m, b] = dequant(XQ[m, b]) @ dequant(WQ[b]).T``; writes into ``Out``
     and returns it. The e8m0 block edges (1x32 or 1x128 for ``x_scale``, 32x32
@@ -347,7 +360,13 @@ def run_bmm_a8w8_mxfp8_gfx950(
     also be a single row, 1x32 only.
     x_scale_transposed (B = 1, 1x128 blocks) reads ``x_scale``'s bytes
     column-major, [K / 128, M], the blockscale convention, under its
-    [M, 1, K / 128] shape; a single row takes the row-major kernel."""
+    [M, 1, K / 128] shape; a single row takes the row-major kernel.
+
+    ``y_scale_out``: when given, the epilogue group-32 MXFP8-quantizes the
+    bf16 result instead of storing it. ``Out`` is then the e4m3 output and
+    ``y_scale_out`` the row-major ``[M, B * N // 32]`` e8m0 scale, bit-equal
+    to ``quantize_fp8`` of the bf16 ``Out``. A tuned config whose N tile is not
+    a multiple of 32 gives way to the heuristic's pick, whose N tiles all are."""
     if get_gfx() != "gfx950":
         raise RuntimeError(
             f"[FlyDSL gfx950 bmm] batched mxfp8 requires gfx950, got {get_gfx()}"
@@ -366,7 +385,23 @@ def run_bmm_a8w8_mxfp8_gfx950(
         )
     if XQ.element_size() != 1 or WQ.element_size() != 1:
         raise RuntimeError("[FlyDSL gfx950 bmm] XQ/WQ must be 1-byte fp8 storage")
-    if Out.dtype != torch.bfloat16:
+    fused = y_scale_out is not None
+    if fused:
+        if Out.dtype != torch.float8_e4m3fn:
+            raise RuntimeError(
+                f"[FlyDSL gfx950 bmm] a fused-quant Out must be e4m3, got {Out.dtype}"
+            )
+        if n % 32 or (
+            y_scale_out.element_size() != 1
+            or y_scale_out.numel() != m * b * n // 32
+            or not y_scale_out.is_contiguous()
+        ):
+            raise RuntimeError(
+                f"[FlyDSL gfx950 bmm] y_scale_out must be {m * b * n // 32} "
+                f"contiguous e8m0 bytes ([M, B * N // 32], N % 32 == 0), got "
+                f"{tuple(y_scale_out.shape)} {y_scale_out.dtype} at N={n}"
+            )
+    elif Out.dtype != torch.bfloat16:
         raise RuntimeError(f"[FlyDSL gfx950 bmm] Out must be bf16, got {Out.dtype}")
     if not (XQ.is_contiguous() and WQ.is_contiguous() and Out.is_contiguous()):
         raise RuntimeError("[FlyDSL gfx950 bmm] XQ/WQ/Out must be contiguous")
@@ -394,6 +429,8 @@ def run_bmm_a8w8_mxfp8_gfx950(
     if kernel_name and _launch_config(kernel_name) is None:
         _warn_unrecognised(kernel_name)
         kernel_name = None
+    if fused and kernel_name and _launch_config(kernel_name)["tile_n"] % 32:
+        kernel_name = None  # a 32-column quant group must stay in one tile
     name = kernel_name or pick_bmm_kernel_name(b, m, n, k, *scale_args)
     cfg = _require_config(name)
     stream = torch.cuda.current_stream(XQ.device)
@@ -411,8 +448,18 @@ def run_bmm_a8w8_mxfp8_gfx950(
             device=XQ.device,
         )
         counters = _split_counters(XQ.device.index, stream.cuda_stream)
-    tensors = (Out, XQ, WQ, x_scale, w_scale, partials, counters)
-    _launch(tensors, m, stream, _constexprs(name, n, k, b, *scale_args))
+    tensors = (
+        Out,
+        XQ,
+        WQ,
+        x_scale,
+        w_scale,
+        partials,
+        counters,
+        y_scale_out if fused else Out,
+    )
+    constexprs = _constexprs(name, n, k, b, *scale_args, fuse_quant_out=fused)
+    _launch(tensors, m, stream, constexprs)
     return Out
 
 

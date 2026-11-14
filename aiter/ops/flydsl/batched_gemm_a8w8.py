@@ -69,12 +69,15 @@ def bmm_a8w8_mxfp8_fused_quant_supported(
     w_scale_block: str, x_scale_transposed: bool = False
 ) -> bool:
     """Whether this arch's kernel for a w_scale block can fuse the output
-    group-32 MXFP8 quant into its epilogue (``y_scale_out=``). Only the gfx1250
-    batched mxfp8_32 runner does. The lookup goes through ``base_gfx_arch``,
-    the same mapping ``_runner`` uses, so gfx1250-strict selects that runner
-    instead of missing the table and looking like an unsupported shape."""
+    group-32 MXFP8 quant into its epilogue (``y_scale_out=``): the gfx1250
+    batched mxfp8_32 runner and the gfx950 runner with a row-major x_scale. The
+    lookup goes through ``base_gfx_arch``, the same mapping ``_runner`` uses,
+    so gfx1250-strict selects that runner instead of missing the table and
+    looking like an unsupported shape."""
     entry = _RUNNERS.get((base_gfx_arch(get_gfx()), w_scale_block, x_scale_transposed))
-    return entry is not None and entry[:2] == _GFX1250_MX32
+    return entry is not None and (
+        entry[:2] == _GFX1250_MX32 or (entry[:2] == _GFX950 and not x_scale_transposed)
+    )
 
 
 def run_bmm_a8w8_mxfp8(
@@ -94,8 +97,8 @@ def run_bmm_a8w8_mxfp8(
 
     ``y_scale_out``: when given, the GEMM fuses the output group-32 MXFP8 quant
     into its epilogue -- ``Out`` is the e4m3 output and ``y_scale_out`` the
-    row-major e8m0 scale. Only the gfx1250 batched mxfp8_32 runner supports it
-    (see :func:`bmm_a8w8_mxfp8_fused_quant_supported`)."""
+    row-major e8m0 scale. The gfx1250 batched mxfp8_32 runner and the gfx950
+    runner support it (see :func:`bmm_a8w8_mxfp8_fused_quant_supported`)."""
     n, k = WQ.shape[-2], WQ.shape[-1]
     w_scale_block = mxscale_w_scale_block(tuple(w_scale.shape), n, k)
     run = _runner(get_gfx(), w_scale_block, x_scale_transposed)
