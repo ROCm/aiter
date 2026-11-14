@@ -4,6 +4,7 @@
 // Torch entry point for the OPUS gfx950 bf16 flash-attention forward kernels.
 // `fmha_fwd_bf16_opus_fwd` validates the tensors and dispatches by head dim:
 //   * (D_QK,D_V) = (128,128) -> gqa_d128_kernel        (batch + group / varlen, window)
+//   * (D_QK,D_V) = (64,64)   -> gqa_d128_kernel        (batch + group / varlen)
 //   * (D_QK,D_V) = (192,128) -> gqa_d192_v128_kernel   (batch + group / varlen)
 //
 // This file owns the torch-facing validation and the tensor -> stride extraction only. The
@@ -22,8 +23,8 @@
 
 namespace {
 
-// ─── D_QK=128 / D_V=128 (symmetric) launch — batch + group (varlen), optional
-//     left-bounded causal window. ───
+// ─── D_QK = D_V in {64, 128} (symmetric) launch — batch + group (varlen), optional
+//     left-bounded causal window (D=128 only). ───
 void launch_d128(at::Tensor& q,
                  at::Tensor& k,
                  at::Tensor& v,
@@ -39,7 +40,8 @@ void launch_d128(at::Tensor& q,
                  int max_seqlen_k,
                  int window_size_left)
 {
-    constexpr int D = 128;
+    // Both head dims share the tile shape; the dispatcher only routes 64 or 128 here.
+    const int D = static_cast<int>(q.size(-1));
     constexpr int Q_TILE_SIZE = 32, NUM_WARPS = 8;
     constexpr int Q_BLOCK = Q_TILE_SIZE * NUM_WARPS;  // 256
 
@@ -57,7 +59,9 @@ void launch_d128(at::Tensor& q,
     // LOCAL implies CAUSAL in the kernel; the launch layer folds a window >= seqlen_k
     // back to -1 (plain causal).
     TORCH_CHECK(window_size_left < 0 || causal,
-                "OPUS D=128: window_size_left >= 0 requires causal");
+                "OPUS D=", D, ": window_size_left >= 0 requires causal");
+    TORCH_CHECK(window_size_left < 0 || D == 128,
+                "OPUS D=64 kernel has no sliding window");
     args.window_size_left = window_size_left;
 
     HipDeviceGuard guard(q.device().index());
@@ -72,7 +76,7 @@ void launch_d128(at::Tensor& q,
                     "group mode expects packed 3-D q/k/v/out [total, H, D]");
         TORCH_CHECK(static_cast<int>(q.size(2)) == D && static_cast<int>(k.size(2)) == D &&
                         static_cast<int>(v.size(2)) == D && static_cast<int>(out.size(2)) == D,
-                    "group mode q/k/v/out head dim must be 128");
+                    "group mode q/k/v/out head dim must equal q head dim D");
         TORCH_CHECK(seqstart_q.has_value() && seqstart_k.has_value(),
                     "group mode requires seqstart_q and seqstart_k");
         H    = static_cast<int>(q.size(1));
@@ -148,12 +152,10 @@ void launch_d128(at::Tensor& q,
         H_KV = static_cast<int>(k.size(2));
         N_KV = static_cast<int>(k.size(1));      // seqlen_kv (cross-attn: may != N)
 
-        TORCH_CHECK(static_cast<int>(q.size(3)) == D, "launch_d128 only compiles D=128, got D=",
-                    static_cast<int>(q.size(3)));
         TORCH_CHECK(k.size(0) == B && v.size(0) == B, "k/v batch must equal q batch B");
         TORCH_CHECK(v.size(1) == N_KV, "k/v seqlen must match (v seqlen != k seqlen)");
         TORCH_CHECK(v.size(2) == H_KV, "k/v must share H_KV");
-        TORCH_CHECK(k.size(3) == D && v.size(3) == D, "k/v head dim must equal D=128");
+        TORCH_CHECK(k.size(3) == D && v.size(3) == D, "k/v head dim must equal q head dim D");
         TORCH_CHECK(out.size(0) == B && out.size(1) == N && out.size(2) == H && out.size(3) == D,
                     "out shape must match q [B, N, H, D]");
 
@@ -176,7 +178,7 @@ void launch_d128(at::Tensor& q,
     const long long kv_slice_bytes =
         (long long)N_KV * std::max(k.stride(-3), v.stride(-3)) * 2LL;  // bf16
     TORCH_CHECK(kv_slice_bytes < (1LL << 32),
-                "OPUS D=128: KV byte extent ", kv_slice_bytes,
+                "OPUS D=", D, ": KV byte extent ", kv_slice_bytes,
                 " reaches the 32-bit buffer-offset limit (2^32); reduce seqlen_kv or use another backend");
 
     if (B == 0 || N == 0 || H == 0 || num_q_blocks == 0) return;
@@ -207,7 +209,7 @@ void launch_d128(at::Tensor& q,
     }
 
     TORCH_CHECK(fmha_fwd_bf16_opus_launch(args, at::hip::getCurrentHIPStream()),
-                "OPUS D=128: the launcher rejected this shape");
+                "OPUS D=", D, ": the launcher rejected this shape");
 }
 
 // ─── D_QK=192 / D_V=128 (asymmetric) launch — batch + group (varlen). ───
@@ -390,7 +392,7 @@ void fmha_fwd_bf16_opus_fwd(at::Tensor& q,
     const int D_QK = static_cast<int>(q.size(-1));
     const int D_V  = static_cast<int>(v.size(-1));
 
-    if (D_QK == 128 && D_V == 128) {
+    if (D_QK == D_V && (D_QK == 64 || D_QK == 128)) {
         launch_d128(q, k, v, out, causal, softmax_scale, lse,
                     seqstart_q, seqstart_k, seqstart_q_pad, seqstart_k_pad,
                     max_seqlen_q, max_seqlen_k, window_size_left);
@@ -401,7 +403,8 @@ void fmha_fwd_bf16_opus_fwd(at::Tensor& q,
                          seqstart_q, seqstart_k, seqstart_q_pad, seqstart_k_pad,
                          max_seqlen_q, max_seqlen_k);
     } else {
-        TORCH_CHECK(false, "OPUS fwd supports (D_QK,D_V) in {(128,128),(192,128)}, got (",
+        TORCH_CHECK(false,
+                    "OPUS fwd supports (D_QK,D_V) in {(64,64),(128,128),(192,128)}, got (",
                     D_QK, ",", D_V, ")");
     }
 }

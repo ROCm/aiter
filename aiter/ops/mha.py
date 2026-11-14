@@ -426,9 +426,9 @@ def gen_fmha_fwd_bf16_opus_fwd_fake(
 
 
 # OPUS gfx950 bf16 forward (shared entry point): low-level @compile_ops stub bound to
-# the pybind symbol via fc_name. Dispatches by head dim in C++ to the symmetric D=128
-# kernel or the asymmetric D_QK=192/D_V=128 kernel; both take batch and group/varlen
-# inputs, and only D=128 implements `window_size_left`.
+# the pybind symbol via fc_name. Dispatches by head dim in C++ to the symmetric
+# D_QK = D_V in {64, 128} kernel or the asymmetric D_QK=192/D_V=128 kernel; all take
+# batch and group/varlen inputs, and only D=128 implements `window_size_left`.
 # Writes `out` (and `lse`, when given) in place, returns None.
 @compile_ops(
     "module_fmha_fwd_bf16_opus",
@@ -464,10 +464,10 @@ def fmha_fwd_bf16_opus_fwd(
     lse: Tensor | None = None,
     window_size_left: int = -1,
 ) -> Tensor | tuple[Tensor, Tensor]:
-    """Public wrapper for the OPUS gfx950 bf16 dense (batch) forward (D=128 and
-    D_QK=192/D_V=128). q/k/v are dense bshd [B, S, H, D]; allocates `out`
-    ([B, S, H_q, D_v]) if needed and forwards. The kernel applies `softmax_scale`
-    to Q·K^T internally and handles GQA fan-out.
+    """Public wrapper for the OPUS gfx950 bf16 dense (batch) forward: symmetric
+    D_QK == D_V in {64, 128}, plus D_QK=192/D_V=128. q/k/v are dense bshd
+    [B, S, H, D]; allocates `out` ([B, S, H_q, D_v]) if needed and forwards.
+    The kernel applies `softmax_scale` to Q·K^T internally and handles GQA fan-out.
 
     `lse` is an output buffer for the log-sum-exp of the scaled scores ([B, H_q, S]
     float32, natural log; rows that see no keys get -inf), filled when supplied and
@@ -525,10 +525,10 @@ def fmha_fwd_bf16_opus_varlen_fwd(
     lse: Tensor | None = None,
     window_size_left: int = -1,
 ) -> Tensor | tuple[Tensor, Tensor]:
-    """Public wrapper for the OPUS gfx950 bf16 group/varlen forward (D=128 and
-    D_QK=192/D_V=128). q/k/v are packed [total, H, D]; allocates `out`
-    ([total_q, H_q, D_v]) if needed and forwards. The kernel applies `softmax_scale`
-    to Q·K^T internally and handles GQA fan-out.
+    """Public wrapper for the OPUS gfx950 bf16 group/varlen forward: symmetric
+    D_QK == D_V in {64, 128}, plus D_QK=192/D_V=128. q/k/v are packed [total, H, D];
+    allocates `out` ([total_q, H_q, D_v]) if needed and forwards. The kernel applies
+    `softmax_scale` to Q·K^T internally and handles GQA fan-out.
 
     `lse` is an output buffer for the log-sum-exp of the scaled scores ([H_q, total_q]
     float32, natural log), filled when supplied and allocated here when `return_lse` is
@@ -2404,9 +2404,13 @@ def _flash_attn_forward(
         return ret
 
     def _can_impl_fmha_fwd_hd128_bf16_opus():
+        # Symmetric D_QK == D_V in {64, 128}: one kernel template, only the head dim
+        # differs. The sliding window exists at D=128 only.
         if int(os.environ.get("AITER_ENABLE_FMHA_OPUS", "0")) == 0:
             return False
-        if not (hdim_q == 128 and hdim_v == 128):
+        if hdim_q != hdim_v or hdim_q not in (64, 128):
+            return False
+        if hdim_q == 64 and window_size_left >= 0:
             return False
         # Left-bounded causal window only: LOCAL implies CAUSAL and there is no right-hand
         # window. window_size_right == 0 is itself a right bound, so it needs `causal` too.
@@ -2532,8 +2536,8 @@ def _flash_attn_forward(
         S_dmask = torch.empty((0,), dtype=torch.float32, device=q.device)
         rng_state = torch.empty((2,), dtype=torch.int64, device=q.device)
     elif can_impl_fmha_fwd_bf16_opus():
-        # OPUS gfx950 dense forward (shared entry point; dispatches D=128 vs
-        # D_QK=192/D_V=128 in C++ by head dim). The S_dmask/rng slots stay unused
+        # OPUS gfx950 dense forward (shared entry point; dispatches symmetric D=64/128
+        # vs D_QK=192/D_V=128 in C++ by head dim). The S_dmask/rng slots stay unused
         # placeholders (the gate guarantees no dropout mask).
         softmax_lse = torch.empty(
             (batch_size, nhead_q, seqlen_q) if return_lse else (0,),
@@ -3458,12 +3462,15 @@ def _flash_attn_varlen_forward(
         return ret
 
     def _can_impl_fmha_fwd_hd128_bf16_opus_varlen():
-        # OPUS gfx950 group/varlen D=128 bf16 forward. Env-gated OFF by default, the same
-        # opt-in as the dense D=128 path, so enabling varlen does not silently change
-        # which backend an existing D=128 workload lands on.
+        # OPUS gfx950 group/varlen symmetric D=64/128 bf16 forward. Env-gated OFF by
+        # default, the same opt-in as the dense path, so enabling varlen does not
+        # silently change which backend an existing workload lands on. The sliding
+        # window exists at D=128 only.
         if int(os.environ.get("AITER_ENABLE_FMHA_OPUS", "0")) == 0:
             return False
-        if not (hdim_q == 128 and hdim_v == 128):
+        if hdim_q != hdim_v or hdim_q not in (64, 128):
+            return False
+        if hdim_q == 64 and window_size_left >= 0:
             return False
         # Left-bounded causal window only: LOCAL implies CAUSAL and there is no right-hand
         # window. window_size_right == 0 is itself a right bound, so it needs `causal` too.
@@ -3540,10 +3547,10 @@ def _flash_attn_varlen_forward(
         )
 
     if can_impl_fmha_fwd_bf16_opus_varlen():
-        # OPUS gfx950 group/varlen path (D=128 or D_QK=192/D_V=128, dispatched in C++ by
-        # head dim). cu_seqlens_* are the REAL cumulative lengths (masks / tile counts);
-        # cu_seqlens_*_padded are the PHYSICAL row offsets (KV padding). When no padded
-        # arrays are given, physical == real.
+        # OPUS gfx950 group/varlen path (symmetric D=64/128 or D_QK=192/D_V=128,
+        # dispatched in C++ by head dim). cu_seqlens_* are the REAL cumulative lengths
+        # (masks / tile counts); cu_seqlens_*_padded are the PHYSICAL row offsets (KV
+        # padding). When no padded arrays are given, physical == real.
         softmax_lse = torch.empty(
             (nhead_q, q.size(0)) if return_lse else (0,),
             dtype=torch.float32,

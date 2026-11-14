@@ -1,4 +1,4 @@
-// GQA flash attention kernel template for D=128 on gfx950
+// GQA flash attention kernel template for symmetric D in {64, 128} on gfx950.
 // Include this header from per-variant .cc files that instantiate specific traits.
 #pragma once
 
