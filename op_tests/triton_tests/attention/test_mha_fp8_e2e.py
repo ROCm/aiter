@@ -6,7 +6,7 @@ from dataclasses import dataclass, fields
 import pytest
 import torch
 
-from aiter.ops.triton.attention.mha_fp8 import mha_fwd
+from aiter.ops.triton.attention.mha_fp8 import mha_fwd, mha_varlen_fwd
 from aiter.ops.triton.utils._triton.arch_info import get_arch
 
 arch = get_arch()
@@ -17,7 +17,7 @@ arch = get_arch()
 # ---------------
 
 
-def mha_torch(q, k, v, sm_scale, causal):
+def mha_torch(q, k, v, sm_scale, causal, p_scale=1.0):
     # GQA: broadcast each K/V head to the group of query heads that shares it
     group_size = q.shape[1] // k.shape[1]
     k = k.repeat_interleave(group_size, dim=1)
@@ -29,11 +29,13 @@ def mha_torch(q, k, v, sm_scale, causal):
         sq, sk = q.shape[2], k.shape[2]
         M = torch.tril(torch.ones((sq, sk), device=q.device), diagonal=sk - sq)
         qk[:, :, M == 0] = float("-inf")
-    p = torch.exp(qk - qk.amax(-1, keepdim=True))
-    l = p.sum(-1, keepdim=True)
-    p_q = p.to(torch.float8_e4m3fn).to(torch.float32)
+    lse = torch.logsumexp(qk, -1)
+    m = qk.amax(-1, keepdim=True).nan_to_num(neginf=0.0)
+    p = torch.exp(qk - m)
+    l = p.sum(-1, keepdim=True).clamp_min(1e-30)
+    p_q = (p * p_scale).to(torch.float8_e4m3fn).to(torch.float32) / p_scale
     o = (p_q @ v) / l
-    return o
+    return o, lse
 
 
 # ---------------
@@ -126,7 +128,7 @@ def test_mha_fp8(b, hq, hk, sq, sk, d, causal, device="cuda"):
     v_ref = v_tri.to(torch.float32) * v_scale
     sm_scale = 1.0 / (d**0.5)
 
-    o_ref = mha_torch(q_ref, k_ref, v_ref, sm_scale, causal=causal)
+    o_ref, _ = mha_torch(q_ref, k_ref, v_ref, sm_scale, causal=causal)
 
     out = torch.empty(q_tri.shape, device=device, dtype=torch.bfloat16)
     o_tri = mha_fwd(
@@ -143,3 +145,82 @@ def test_mha_fp8(b, hq, hk, sq, sk, d, causal, device="cuda"):
     o_tri = o_tri.float()
 
     torch.testing.assert_close(o_tri, o_ref, atol=0.02, rtol=0.02)
+
+
+def generate_mha_varlen_fp8_inputs(
+    seqlens_q, seqlens_k, heads, pad=0, device="cuda", d_pe=64
+):
+    """Packed fp8 q/k/v (MLA prefill dims), cu_seqlens, per-tensor scales, and out/lse
+    buffers with ``pad`` extra rows prefilled with 7.0."""
+    D_NOPE, D_PE, D_V = 128, d_pe, 128
+    cu_q = torch.tensor([0] + seqlens_q, device=device).cumsum(0).to(torch.int32)
+    cu_k = torch.tensor([0] + seqlens_k, device=device).cumsum(0).to(torch.int32)
+    tq, tk = sum(seqlens_q), sum(seqlens_k)
+    q, q_scale = quant_fp8(
+        torch.randn(
+            (tq + pad, heads, D_NOPE + D_PE), dtype=torch.float32, device=device
+        )
+        * 0.5
+    )
+    k, k_scale = quant_fp8(
+        torch.randn((tk, heads, D_NOPE + D_PE), dtype=torch.float32, device=device)
+        * 0.5
+    )
+    v, v_scale = quant_fp8(
+        torch.randn((tk, heads, D_V), dtype=torch.float32, device=device) * 0.5
+    )
+    q_scale, k_scale, v_scale = (s.reshape(1) for s in (q_scale, k_scale, v_scale))
+    out = torch.full((tq + pad, heads, D_V), 7.0, dtype=torch.bfloat16, device=device)
+    lse = torch.full((heads, tq + pad), 7.0, dtype=torch.float32, device=device)
+    return q, k, v, cu_q, cu_k, q_scale, k_scale, v_scale, out, lse
+
+
+@pytest.mark.parametrize(
+    "seqlens_q, seqlens_k",
+    [
+        ([128], [128]),
+        # more queries than keys: the first causal rows see no key
+        ([128], [64]),
+        ([600], [600]),
+        ([1024, 77, 300], [1024, 77, 300]),
+        ([256, 100], [2048, 900]),
+        # short queries
+        ([64], [8192]),
+        ([16, 130], [4096, 6000]),
+    ],
+)
+@pytest.mark.parametrize("heads", [8, 12, 16])
+@pytest.mark.parametrize("causal", [False, True])
+@pytest.mark.parametrize("pad", [0, 50])
+@pytest.mark.parametrize("d_pe", [64, 0])
+def test_mha_varlen_fp8(seqlens_q, seqlens_k, heads, causal, pad, d_pe, device="cuda"):
+    if get_arch() != "gfx950":
+        pytest.skip("Only supported on gfx950")
+    torch.manual_seed(0)
+    q, k, v, cu_q, cu_k, q_scale, k_scale, v_scale, out, lse = (
+        generate_mha_varlen_fp8_inputs(seqlens_q, seqlens_k, heads, pad, device, d_pe)
+    )
+    tq = sum(seqlens_q)
+    sm_scale = q.shape[-1] ** -0.5
+
+    mha_varlen_fwd(
+        q, k, v, cu_q, cu_k, max(seqlens_q), max(seqlens_k),
+        q_scale, k_scale, v_scale,
+        softmax_scale=sm_scale, causal=causal, return_lse=True, out=out, lse=lse,
+    )  # fmt: skip
+
+    qf, kf, vf = q.float() * q_scale, k.float() * k_scale, v.float() * v_scale
+    for i in range(len(seqlens_q)):
+        qs, ks = slice(cu_q[i], cu_q[i + 1]), slice(cu_k[i], cu_k[i + 1])
+        o_ref, lse_ref = mha_torch(
+            *(t.transpose(0, 1)[None] for t in (qf[qs], kf[ks], vf[ks])),
+            sm_scale,
+            causal,
+            p_scale=448.0,
+        )
+        torch.testing.assert_close(
+            out[qs].float(), o_ref[0].transpose(0, 1), atol=3e-2, rtol=3e-2
+        )
+        torch.testing.assert_close(lse[:, qs], lse_ref[0], atol=1e-2, rtol=1e-3)
+    assert (out[tq:] == 7.0).all(), "rows outside cu_seqlens_q were written"
+    assert (lse[:, tq:] == 7.0).all(), "LSE outside cu_seqlens_q was written"
