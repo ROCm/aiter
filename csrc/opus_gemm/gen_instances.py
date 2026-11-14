@@ -44,6 +44,7 @@ from opus_gemm_common import (
     gfx1250_clusterlaunch_kernels_list,
     gfx1250_kernels_list,
     gfx1250_splitk_fuse_kernels_list,
+    gfx950_a16w16_4wave_kernels_list,
 )
 
 
@@ -289,6 +290,8 @@ SPLITK_TAGS = {
     "a16w16_clusterlaunch_tdm_splitk_ws",
     "a16w16_clusterlaunch_tdm_splitk_fuse",
     "a16w16_em3en4_lds1_pgr2_sk",
+    # gfx950 4-wave: pre-built fp32 split-K image + the shared gfx950 reduce.
+    "a16w16_4wave_ws",
     *_SPLITK,
 }
 
@@ -1136,9 +1139,10 @@ void
         `splitk_reduce_kernel_fallback` because exact-N row-block reduce
         is the preferred fast path when its constraints hold.
         """
-        # Bucket present archs from splitk kids.
+        # Bucket present archs from splitk kids. Host-only (pre-built .co)
+        # workspace kids have no device row but still launch the reducer.
         present_archs = set()
-        for row in self._device_instantiations:
+        for row in self._device_instantiations + self._host_instantiations:
             name = row["kid_name"]
             for arch_prefix in SPLITK_REDUCE_ARCHES:
                 if f"opus_gemm_{arch_prefix}_splitk_" in name:
@@ -1240,9 +1244,12 @@ void
         self._emit_device_tus()
         # Only emit the standalone reduce TU if the build actually has a splitk kid (otherwise the fused
         # host TU will never reference any...
+        # Host rows count too: a pre-built (.co) split-K kid, e.g. gfx950
+        # a16w16_4wave_ws, has no device instantiation of its own but its
+        # launcher still <<<>>>s the arch's splitk_reduce_kernel.
         needs_reduce_tu = any(
             ("flatmm_splitk" in row["kid_name"]) or ("_splitk_" in row["kid_name"])
-            for row in self._device_instantiations
+            for row in self._device_instantiations + self._host_instantiations
         )
         if needs_reduce_tu:
             self._emit_splitk_reduce_tu()
@@ -1358,6 +1365,16 @@ if __name__ == "__main__":
         "a16w16_cluster_tdm_splitk_ws": gfx1250_kernels_list,
         "a16w16_clusterlaunch_tdm_splitk_ws": gfx1250_clusterlaunch_kernels_list,
         "a16w16_clusterlaunch_tdm_splitk_fuse": gfx1250_splitk_fuse_kernels_list,
+        "a16w16_4wave": {
+            kid: instance
+            for kid, instance in gfx950_a16w16_4wave_kernels_list.items()
+            if instance.kernel_tag == "a16w16_4wave"
+        },
+        "a16w16_4wave_ws": {
+            kid: instance
+            for kid, instance in gfx950_a16w16_4wave_kernels_list.items()
+            if instance.kernel_tag == "a16w16_4wave_ws"
+        },
         "a16w16_4wave_co": {
             kid: instance
             for kid, instance in gfx1250_4wave_co_kernels_list.items()

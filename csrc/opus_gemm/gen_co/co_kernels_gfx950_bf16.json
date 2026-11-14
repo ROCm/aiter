@@ -1,0 +1,150 @@
+{
+  "_comment": [
+    "gfx950 a16w16 4-wave family (bf16 x bf16 -> bf16, C = A * B^T, all four layouts).",
+    "READ BY BOTH: opus_gemm_common.py (kid table -> host-only JIT launchers) and",
+    "gen_co/build_co.py --arch gfx950 (offline .co images, AGPR-pinning LLVM).",
+    "",
+    "Per-entry fields:",
+    "  kid   explicit local a16w16/gfx950 kid (registered for every gfx950 CU namespace);",
+    "        kept >= 1000, clear of the JIT-built gfx950 kids.",
+    "  tag   a16w16_4wave    : direct launcher (bf16 Y, no bias, split_k 0/1).",
+    "        a16w16_4wave_ws : workspace launcher, always fp32 split-K partials + splitk_reduce_kernel",
+    "                          (bias folded by the reduce), split_k >= 1.",
+    "  tile  [B_M, B_N], each in {64, 128, 256}; B_K = 64, 256 threads. PIN / WG_PER_CU are the",
+    "        traits defaults (pinned registers and 1 WG/CU for tiles larger than 128x128).",
+    "",
+    "One kid carries every layout as a separate image; the launcher picks one from the tensor",
+    "strides at runtime: <kid symbol>_<nt|nn|tt|tn>.co under gen_co/gfx950/",
+    "(nt = A [M,K], B [N,K]; nn = B stored [K,N]; tt = A stored [K,M]; tn = both)."
+  ],
+  "gfx950": [
+    {
+      "kid": 1000,
+      "tag": "a16w16_4wave",
+      "tile": [
+        256,
+        256
+      ]
+    },
+    {
+      "kid": 1001,
+      "tag": "a16w16_4wave",
+      "tile": [
+        256,
+        128
+      ]
+    },
+    {
+      "kid": 1002,
+      "tag": "a16w16_4wave",
+      "tile": [
+        128,
+        256
+      ]
+    },
+    {
+      "kid": 1003,
+      "tag": "a16w16_4wave",
+      "tile": [
+        128,
+        128
+      ]
+    },
+    {
+      "kid": 1004,
+      "tag": "a16w16_4wave",
+      "tile": [
+        256,
+        64
+      ]
+    },
+    {
+      "kid": 1005,
+      "tag": "a16w16_4wave",
+      "tile": [
+        64,
+        256
+      ]
+    },
+    {
+      "kid": 1006,
+      "tag": "a16w16_4wave",
+      "tile": [
+        128,
+        64
+      ]
+    },
+    {
+      "kid": 1007,
+      "tag": "a16w16_4wave",
+      "tile": [
+        64,
+        128
+      ]
+    },
+    {
+      "kid": 1008,
+      "tag": "a16w16_4wave_ws",
+      "tile": [
+        256,
+        256
+      ]
+    },
+    {
+      "kid": 1009,
+      "tag": "a16w16_4wave_ws",
+      "tile": [
+        256,
+        128
+      ]
+    },
+    {
+      "kid": 1010,
+      "tag": "a16w16_4wave_ws",
+      "tile": [
+        128,
+        256
+      ]
+    },
+    {
+      "kid": 1011,
+      "tag": "a16w16_4wave_ws",
+      "tile": [
+        128,
+        128
+      ]
+    },
+    {
+      "kid": 1012,
+      "tag": "a16w16_4wave_ws",
+      "tile": [
+        256,
+        64
+      ]
+    },
+    {
+      "kid": 1013,
+      "tag": "a16w16_4wave_ws",
+      "tile": [
+        64,
+        256
+      ]
+    },
+    {
+      "kid": 1014,
+      "tag": "a16w16_4wave_ws",
+      "tile": [
+        128,
+        64
+      ]
+    },
+    {
+      "kid": 1015,
+      "tag": "a16w16_4wave_ws",
+      "tile": [
+        64,
+        128
+      ]
+    }
+  ]
+}

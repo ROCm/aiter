@@ -7,11 +7,11 @@ from functools import lru_cache
 import torch
 
 from aiter import logger
-from csrc.opus_gemm.opus_gemm_common import OpusGemmInstance
+from csrc.opus_gemm.opus_gemm_common import OpusGemmInstance, get_kernel_instance
 
 from ...jit.core import compile_ops
 from ._arch import _device_arch_and_cu
-from .launch_plan import _get_cached_a16w16_launch_plan
+from .launch_plan import GFX950_4WAVE_TAGS, _get_cached_a16w16_launch_plan
 
 # ---- Low-level A16W16 backend --------------------------------------------
 
@@ -154,8 +154,7 @@ def _execute_a16w16(
     route_cu_num: int | None = None,
     instance: OpusGemmInstance | None = None,
 ) -> torch.Tensor:
-    """Validate, plan, and launch one exact 3D A16W16 operation."""
-    _check_a16w16_launch_layout(XQ, WQ, Y)
+    """Plan and launch one exact 3D A16W16 operation (layout checked by _execute_a16w16_<layout>)."""
     batch, M, K = XQ.shape
     N = Y.shape[2]
 
@@ -217,6 +216,56 @@ def _execute_a16w16(
     return Y
 
 
+# NT / NN / TT / TN: _launch_a16w16_gemm / _bmm pick the layout from the operand strides (batch-first
+# XQ [B,M,K] / WQ [B,N,K]); each _execute_a16w16_<layout> checks its contract, then runs _execute_a16w16.
+# NN / TT / TN need a kid whose launcher takes M/N-contiguous operands (gfx950 4-wave; it loads that
+# layout's image and checks the strides).
+#   NT: XQ (K,1)  WQ (K,1)      NN: XQ (K,1)  WQ (1,N)
+#   TT: XQ (1,M)  WQ (K,1)      TN: XQ (1,M)  WQ (1,N)
+def _a16w16_operand_transposed(tensor: torch.Tensor) -> bool:
+    """True if the [.., rows, K] operand is stored [K, rows] (rows contiguous)."""
+    rows, K = tensor.shape[-2:]
+    stride_row, stride_k = tensor.stride()[-2:]
+    return rows > 1 and stride_row == 1 and not (stride_k == 1 and stride_row >= K)
+
+
+def _require_layout_kid(layout, XQ, *, kid, instance=None, route_arch=None, route_cu_num=None, **_):
+    if instance is None:
+        arch, cu_num = route_arch, route_cu_num
+        if arch is None or cu_num is None:
+            arch, cu_num = _device_arch_and_cu(XQ.device)
+        instance = get_kernel_instance(arch, "a16w16", int(kid), cu_num=cu_num)
+    if instance is None or instance.kernel_tag not in GFX950_4WAVE_TAGS:
+        raise NotImplementedError(
+            f"opus_gemm_a16w16_launch: {layout} operands need a gfx950 a16w16 4-wave kid "
+            f"(tags {sorted(GFX950_4WAVE_TAGS)}); kid {kid} takes K-contiguous XQ/WQ only"
+        )
+
+
+def _execute_a16w16_nt(XQ, WQ, Y, bias=None, **kwargs):
+    """NT: XQ stored [M,K], WQ stored [N,K]; every kid."""
+    _check_a16w16_launch_layout(XQ, WQ, Y)
+    return _execute_a16w16(XQ, WQ, Y, bias, **kwargs)
+
+
+def _execute_a16w16_nn(XQ, WQ, Y, bias=None, **kwargs):
+    """NN: XQ stored [M,K], WQ the [N,K] view of a [K,N] weight."""
+    _require_layout_kid("NN", XQ, **kwargs)
+    return _execute_a16w16(XQ, WQ, Y, bias, **kwargs)
+
+
+def _execute_a16w16_tt(XQ, WQ, Y, bias=None, **kwargs):
+    """TT: XQ the [M,K] view of a [K,M] activation, WQ stored [N,K]."""
+    _require_layout_kid("TT", XQ, **kwargs)
+    return _execute_a16w16(XQ, WQ, Y, bias, **kwargs)
+
+
+def _execute_a16w16_tn(XQ, WQ, Y, bias=None, **kwargs):
+    """TN: XQ / WQ views of [K,M] / [K,N] storage."""
+    _require_layout_kid("TN", XQ, **kwargs)
+    return _execute_a16w16(XQ, WQ, Y, bias, **kwargs)
+
+
 def _launch_a16w16_gemm(
     XQ: torch.Tensor,
     WQ: torch.Tensor,
@@ -236,7 +285,11 @@ def _launch_a16w16_gemm(
             "opus_gemm A16W16 expects 2D XQ/WQ/Y; use opus_bmm for "
             "batch-first 3D tensors"
         )
-    _execute_a16w16(
+    execute = (
+        (_execute_a16w16_nt, _execute_a16w16_nn),
+        (_execute_a16w16_tt, _execute_a16w16_tn),
+    )[_a16w16_operand_transposed(XQ)][_a16w16_operand_transposed(WQ)]
+    execute(
         XQ.unsqueeze(0),
         WQ.unsqueeze(0),
         Y.unsqueeze(0),
@@ -270,7 +323,11 @@ def _launch_a16w16_bmm(
             "opus_bmm A16W16 expects batch-first 3D XQ/WQ/Y; use "
             "opus_gemm for logical 2D tensors"
         )
-    return _execute_a16w16(
+    execute = (
+        (_execute_a16w16_nt, _execute_a16w16_nn),
+        (_execute_a16w16_tt, _execute_a16w16_tn),
+    )[_a16w16_operand_transposed(XQ)][_a16w16_operand_transposed(WQ)]
+    return execute(
         XQ,
         WQ,
         Y,

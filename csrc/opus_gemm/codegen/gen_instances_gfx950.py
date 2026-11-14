@@ -26,6 +26,10 @@ PIPELINE_HEADER_MAP = {
     "a16w16_flatmm_splitk": "gfx950/opus_gemm_pipeline_a16w16_flatmm_splitk_gfx950.cuh",
     "a16w16_persistent": "gfx950/opus_gemm_pipeline_a16w16_persistent_gfx950.cuh",
     "a16w16_mono_tile": "gfx950/opus_gemm_pipeline_a16w16_mono_tile_gfx950.cuh",
+    # 4-wave device code is pre-built (gen_co/gfx950); the host-only launcher
+    # never includes the pipeline header, so point the lookup at the traits.
+    "a16w16_4wave": "gfx950/opus_gemm_traits_a16w16_gfx950.cuh",
+    "a16w16_4wave_ws": "gfx950/opus_gemm_traits_a16w16_gfx950.cuh",
     "a8w8_mxscale_bmm_flatmm_splitk": "gfx950/opus_gemm_pipeline_a8w8_mxscale_flatmm_splitk_gfx950.cuh",
     "a8w8_mxscale_bmm_bpreshuffle_bdirect": "gfx950/opus_gemm_pipeline_a8w8_mxscale_flatmm_splitk_gfx950.cuh",
     "a8w8_mxscale_bmm_bpreshuffle_bdirect_tilen": "gfx950/opus_gemm_pipeline_a8w8_mxscale_flatmm_splitk_gfx950.cuh",
@@ -64,6 +68,8 @@ TRAITS_HEADER_MAP = {
     "a16w16_flatmm_splitk": "gfx950/opus_gemm_traits_a16w16_gfx950.cuh",
     "a16w16_persistent": "gfx950/opus_gemm_traits_a16w16_gfx950.cuh",
     "a16w16_mono_tile": "gfx950/opus_gemm_traits_a16w16_gfx950.cuh",
+    "a16w16_4wave": "gfx950/opus_gemm_traits_a16w16_gfx950.cuh",
+    "a16w16_4wave_ws": "gfx950/opus_gemm_traits_a16w16_gfx950.cuh",
     "a8w8_mxscale_bmm_flatmm_splitk": "gfx950/opus_gemm_traits_a8w8_scale_gfx950.cuh",
     "a8w8_mxscale_bmm_bpreshuffle_bdirect": "gfx950/opus_gemm_traits_a8w8_scale_gfx950.cuh",
     "a8w8_mxscale_bmm_bpreshuffle_bdirect_tilen": "gfx950/opus_gemm_traits_a8w8_scale_gfx950.cuh",
@@ -93,6 +99,9 @@ KERNEL_FUNC_MAP = {
     "a16w16_flatmm_splitk": "gemm_a16w16_flatmm_splitk_kernel",
     "a16w16_persistent": "gemm_a16w16_persistent_kernel",
     "a16w16_mono_tile": "gemm_a16w16_mono_tile_kernel_gfx950",
+    # Body wrapped by the extern "C" entry of each pre-built image.
+    "a16w16_4wave": "gemm_a16w16_4wave_body",
+    "a16w16_4wave_ws": "gemm_a16w16_4wave_body",
     "a8w8_mxscale_bmm_flatmm_splitk": "gemm_a8w8_mxscale_flatmm_splitk_kernel",
     "a8w8_mxscale_bmm_bpreshuffle_bdirect": "gemm_a8w8_mxscale_flatmm_splitk_kernel",
     "a8w8_mxscale_bmm_bpreshuffle_bdirect_tilen": "gemm_a8w8_mxscale_flatmm_splitk_kernel",
@@ -129,6 +138,8 @@ TRAITS_NAME_MAP = {
     "a16w16_flatmm_splitk": "opus_flatmm_splitk_traits_gfx950",
     "a16w16_persistent": "opus_gemm_a16w16_persistent_traits_gfx950",
     "a16w16_mono_tile": "opus_gemm_a16w16_mono_tile_traits_gfx950",
+    "a16w16_4wave": "opus_gemm_a16w16_4wave_traits_gfx950",
+    "a16w16_4wave_ws": "opus_gemm_a16w16_4wave_traits_gfx950",
     "a8w8_mxscale_bmm_flatmm_splitk": "opus_gemm_a8w8_mxscale_flatmm_splitk_traits_gfx950",
     "a8w8_mxscale_bmm_bpreshuffle_bdirect": "opus_gemm_a8w8_mxscale_flatmm_splitk_bpreshuffle_bdirect_traits_gfx950",
     "a8w8_mxscale_bmm_bpreshuffle_bdirect_tilen": "opus_gemm_a8w8_mxscale_flatmm_splitk_bpreshuffle_bdirect_tilen_traits_gfx950",
@@ -158,6 +169,8 @@ KARGS_NAME_MAP = {
     "a16w16_flatmm_splitk": "opus_gemm_flatmm_splitk_kargs_gfx950",
     "a16w16_persistent": "opus_gemm_persistent_kargs_gfx950",
     "a16w16_mono_tile": "opus_gemm_mono_tile_kargs_gfx950",
+    "a16w16_4wave": "opus_gemm_a16w16_4wave_kargs_gfx950",
+    "a16w16_4wave_ws": "opus_gemm_a16w16_4wave_kargs_gfx950",
     "a8w8_mxscale_bmm_flatmm_splitk": "opus_gemm_scale_splitk_kargs_gfx950",
     "a8w8_mxscale_bmm_bpreshuffle_bdirect": "opus_gemm_scale_splitk_kargs_gfx950",
     "a8w8_mxscale_bmm_bpreshuffle_bdirect_tilen": "opus_gemm_scale_splitk_kargs_gfx950",
@@ -3170,6 +3183,247 @@ def gen_bmm_mxscale_fused_instance(
 
 
 # ---------- Self-register at import time ----------
+# ---------------- gfx950 a16w16 4-wave (pre-built .co) ----------------
+
+_A16W16_4WAVE_LAUNCHER = r"""// SPDX-License-Identifier: MIT
+// Copyright (C) 2025-2026, Advanced Micro Devices, Inc. All rights reserved.
+//
+// Auto-generated. Do not edit. See codegen/gen_instances_gfx950.py:gen_a16w16_4wave_instance.
+// Pre-built gfx950 4-wave kid: host launcher only; the device images live in
+// gen_co/gfx950/@NAME@_<nt|nn|tt|tn>.co (gen_co/build_co.py --arch gfx950).
+#pragma once
+#if !defined(__HIP_DEVICE_COMPILE__) && !defined(__HIPCC_RTC__)
+#include "aiter_tensor.h"
+#include "aiter_stream.h"
+#include "opus_gemm_common.cuh"
+#include <algorithm>
+#include <climits>
+#include <optional>
+#endif
+#include "@TRAITS_HEADER@"
+
+#if !defined(__HIP_DEVICE_COMPILE__) && !defined(__HIPCC_RTC__)
+#include "gfx950/opus_co_launch_gfx950.cuh"
+
+template <typename D_C>
+void
+@NAME@(
+    aiter_tensor_t &XQ,
+    aiter_tensor_t &WQ,
+    aiter_tensor_t &Y,@WS_PARAM@
+    std::optional<aiter_tensor_t> bias,
+    int splitK)
+{
+    static_assert(std::is_same<D_C, @HOST_DTYPE@>::value,
+        "@NAME@: wrong launch specialization (Y is bf16)");
+    constexpr int B_M = @B_M@;
+    constexpr int B_N = @B_N@;
+    constexpr int B_K = 64;
+    constexpr int BLOCK_SIZE = 256;
+
+    AITER_CHECK(XQ.dim() == 3 && WQ.dim() == 3 && Y.dim() == 3,
+        "@NAME@: XQ/WQ/Y must be 3D [batch,M,K] / [batch,N,K] / [batch,M,N]");
+    const int64_t batch = XQ.size(0), M = XQ.size(1), K = XQ.size(2), N = WQ.size(1);
+    AITER_CHECK(WQ.size(0) == batch && WQ.size(2) == K && Y.size(0) == batch
+                    && Y.size(1) == M && Y.size(2) == N,
+        "@NAME@: shapes must be XQ [batch,M,K], WQ [batch,N,K], Y [batch,M,N]");
+    AITER_CHECK(XQ.dtype() == AITER_DTYPE_bf16 && WQ.dtype() == AITER_DTYPE_bf16,
+        "@NAME@: XQ/WQ must be bf16");
+    AITER_CHECK(Y.dtype() == AITER_DTYPE_bf16,
+        "@NAME@: Y must be bf16, got ", AiterDtype_to_str(Y.dtype()));
+    AITER_CHECK(batch >= 1 && M >= 1 && N >= 1, "M, N and batch must be >= 1");
+    AITER_CHECK(K % B_K == 0 && K >= 2 * B_K,
+        "@NAME@: K=", K, " must be a multiple of 64 and >= 128");
+
+    // Layout from strides: operand [rows, K] is K-contiguous (stored [rows, K], row pitch
+    // stride(1)) or rows-contiguous (stored [K, rows], row pitch stride(2)). Leading
+    // dimensions and batch strides must be multiples of 8 elements (16-byte rows).
+    auto layout_of = [&](const aiter_tensor_t& t, int64_t rows, const char* what,
+                         bool& transposed, int64_t& ld) {
+        if (t.stride(2) == 1 && (rows == 1 || t.stride(1) >= K)) {
+            transposed = false;
+            ld = rows == 1 ? K : t.stride(1);
+        } else if (t.stride(1) == 1 && t.stride(2) >= rows) {
+            transposed = true;
+            ld = t.stride(2);
+        } else {
+            AITER_CHECK(false, "@NAME@: ", what, " must be K-contiguous (stride(2)==1, stride(1)>=K) "
+                "or ", what == std::string("XQ") ? "M" : "N", "-contiguous (stride(1)==1, stride(2)>=",
+                rows, "); got strides (", t.stride(0), ", ", t.stride(1), ", ", t.stride(2), ")");
+        }
+        const int64_t stored_rows = transposed ? K : rows;
+        const int64_t batch_stride = batch == 1 ? 0 : t.stride(0);
+        AITER_CHECK(ld % 8 == 0 && batch_stride % 8 == 0 && batch_stride >= 0,
+            "@NAME@: ", what, " leading dimension (", ld, ") and batch stride (", batch_stride,
+            ") must be non-negative multiples of 8 elements");
+        AITER_CHECK(reinterpret_cast<uintptr_t>(t.data_ptr()) % 16 == 0,
+            "@NAME@: ", what, " must be 16-byte aligned");
+        AITER_CHECK(stored_rows * ld * 2 <= INT_MAX && (batch - 1) * batch_stride * 2 <= INT_MAX,
+            "@NAME@: ", what, " exceeds the kernel's 32-bit byte offsets");
+        return batch_stride;
+    };
+    bool a_t = false, b_t = false;
+    int64_t lda = 0, ldb = 0;
+    const int64_t stride_a_batch = layout_of(XQ, M, "XQ", a_t, lda);
+    const int64_t stride_b_batch = layout_of(WQ, N, "WQ", b_t, ldb);
+    AITER_CHECK(Y.stride(2) == 1 && Y.stride(1) == N && (batch == 1 || Y.stride(0) == M * N),
+        "@NAME@: Y must be contiguous [batch,M,N]");
+    AITER_CHECK(batch * M * N <= INT_MAX, "@NAME@: Y exceeds the kernel's 32-bit offsets");
+@BIAS_HOST_VALIDATE@
+    const int64_t tiles_m = (M + B_M - 1) / B_M;
+    const int64_t tiles_n = (N + B_N - 1) / B_N;
+
+    opus_gemm_a16w16_4wave_kargs_gfx950 kargs{};
+    kargs.ptr_a = XQ.data_ptr();
+    kargs.ptr_b = WQ.data_ptr();
+    kargs.ptr_c = Y.data_ptr();
+    kargs.m = static_cast<int>(M);
+    kargs.n = static_cast<int>(N);
+    kargs.k = static_cast<int>(K);
+    kargs.batch = static_cast<int>(batch);
+    kargs.stride_a = static_cast<int>(lda);
+    kargs.stride_b = static_cast<int>(ldb);
+    kargs.stride_c = static_cast<int>(N);
+    kargs.stride_a_batch = static_cast<int>(stride_a_batch);
+    kargs.stride_b_batch = static_cast<int>(stride_b_batch);
+    kargs.stride_c_batch = static_cast<int>(M * N);
+    // Image <symbol>_<layout>; layout index = A_T * 2 + B_T.
+    static const char* const kImages[@NUM_IMAGES@] = {@IMAGES@};
+    const int layout = (a_t ? 2 : 0) + (b_t ? 1 : 0);
+    auto stream = aiter::getCurrentHIPStream();
+@LAUNCH@
+}
+#endif
+"""
+
+_A16W16_4WAVE_DIRECT_LAUNCH = """
+    AITER_CHECK(splitK == 0 || splitK == 1,
+        "@NAME@ is the direct (no split-K) launcher; use a16w16_4wave_ws kids for split-K "
+        "(got splitK=", splitK, ")");
+    // C is stored in 16-byte vectors (per element at the column-N tail): any N, 16-byte aligned Y base.
+    AITER_CHECK(reinterpret_cast<uintptr_t>(Y.data_ptr()) % 16 == 0,
+        "@NAME@: the direct 4wave kernel needs a 16-byte aligned Y");
+    kargs.split_k = 1;
+    AiterAsmKernelFast& kernel = opus_gfx950_co::co_kernel(kImages[layout], XQ.device_id);
+    opus_gfx950_co::launch(kernel, dim3(static_cast<unsigned>(tiles_m * tiles_n), 1,
+                                        static_cast<unsigned>(batch)),
+                           BLOCK_SIZE, kargs, stream);"""
+
+_A16W16_4WAVE_WS_LAUNCH = """
+    // Each split needs >= 2 K tiles; mirrored by launch_plan._plan_gfx950_4wave_split_k.
+    const int max_split_k = static_cast<int>(K / B_K / 2);
+    const int split_k = std::min(std::max(splitK, 1), max_split_k);
+    const int64_t padded_m = tiles_m * B_M;
+    const int64_t padded_n = tiles_n * B_N;
+    const size_t required_numel = opus_checked_extent_product(
+        {static_cast<size_t>(split_k), static_cast<size_t>(batch),
+         static_cast<size_t>(padded_m), static_cast<size_t>(padded_n)},
+        "@NAME@");
+    // splitk_reduce_kernel addresses the workspace with one 32-bit buffer resource.
+    AITER_CHECK(required_numel * sizeof(float) <= UINT_MAX && padded_m * padded_n <= INT_MAX,
+        "@NAME@: fp32 workspace (split_k=", split_k, ") exceeds 4 GiB");
+    void* workspace_ptr_ = opus_validate_workspace(
+        workspace, XQ, AITER_DTYPE_fp32, required_numel, 16, "@NAME@");
+    kargs.ptr_ws = workspace_ptr_;
+    kargs.split_k = split_k;
+    kargs.stride_ws = static_cast<int>(padded_n);
+    kargs.stride_ws_batch = static_cast<int>(padded_m * padded_n);
+    AiterAsmKernelFast& kernel = opus_gfx950_co::co_kernel(kImages[layout], XQ.device_id);
+    opus_gfx950_co::launch(kernel, dim3(static_cast<unsigned>(tiles_m * tiles_n * split_k), 1,
+                                        static_cast<unsigned>(batch)),
+                           BLOCK_SIZE, kargs, stream);
+
+    constexpr int REDUCE_VEC = 16;
+    constexpr int REDUCE_BS = 64;
+    dim3 grid_reduce(static_cast<unsigned>((N + REDUCE_VEC * REDUCE_BS - 1) / (REDUCE_VEC * REDUCE_BS)),
+                     static_cast<unsigned>(batch * M), 1);
+    if (bias.has_value()) {
+        splitk_reduce_kernel<REDUCE_VEC, REDUCE_BS, __bf16, true, __bf16, true>
+            <<<grid_reduce, dim3(REDUCE_BS), 0, stream>>>(
+                workspace_ptr_, reinterpret_cast<__bf16*>(Y.data_ptr()), split_k,
+                kargs.m, kargs.n, kargs.batch, static_cast<int>(padded_m), static_cast<int>(padded_n),
+                reinterpret_cast<const __bf16*>(ptr_bias_), stride_bias_batch_);
+    } else {
+        splitk_reduce_kernel<REDUCE_VEC, REDUCE_BS, __bf16, false, __bf16, true>
+            <<<grid_reduce, dim3(REDUCE_BS), 0, stream>>>(
+                workspace_ptr_, reinterpret_cast<__bf16*>(Y.data_ptr()), split_k,
+                kargs.m, kargs.n, kargs.batch, static_cast<int>(padded_m), static_cast<int>(padded_n),
+                nullptr, 0);
+    }"""
+
+
+def gen_a16w16_4wave_instance(
+    cg,
+    k,
+    traits_header,
+    BIAS_HOST_VALIDATE,
+    make_host_decl,
+    A16W16_LAUNCH_HOST_EXTRA,
+    A16W16_WORKSPACE_LAUNCH_HOST_EXTRA,
+    **_unused,
+):
+    """Emit the host launcher of one pre-built gfx950 4-wave kid.
+
+    a16w16_4wave uses the five-argument direct ABI (no bias: use the _ws kids),
+    a16w16_4wave_ws the workspace ABI (fp32 split-K partials, then the shared
+    gfx950 splitk_reduce_kernel adds the bias and writes bf16 Y). No device
+    instantiation is emitted: each image is loaded at first use per device.
+    """
+    from opus_gemm_common import a16w16_4wave_co_images
+
+    workspace = k.kernel_tag == "a16w16_4wave_ws"
+    images = a16w16_4wave_co_images(k)
+    # The launcher indexes kImages by layout (A_T * 2 + B_T).
+    assert [layout for layout, _ in images] == ["nt", "nn", "tt", "tn"], images
+    if workspace and k.splitk_workspace_dtype != "fp32_t":
+        raise ValueError(f"{k.name}: the 4wave workspace kid needs fp32_t storage")
+
+    text = (
+        _A16W16_4WAVE_LAUNCHER.replace(
+            "@LAUNCH@", _A16W16_4WAVE_WS_LAUNCH if workspace else _A16W16_4WAVE_DIRECT_LAUNCH
+        )
+        .replace(
+            "@WS_PARAM@", "\n    aiter_tensor_t &workspace," if workspace else ""
+        )
+        .replace("@HOST_DTYPE@", "fp32_t" if workspace else "bf16_t")
+        .replace(
+            "@BIAS_HOST_VALIDATE@",
+            BIAS_HOST_VALIDATE
+            if workspace
+            else '    AITER_CHECK(!bias.has_value(),\n'
+            '        "@NAME@: bias is not supported on the direct a16w16_4wave kid; "\n'
+            '        "use an a16w16_4wave_ws kid (the split-K reduce adds it, split_k 1 included)");',
+        )
+        .replace("@NUM_IMAGES@", str(len(images)))
+        .replace("@IMAGES@", ", ".join(f'"{symbol}"' for _, symbol in images))
+        .replace("@TRAITS_HEADER@", traits_header)
+        .replace("@B_M@", str(k.B_M))
+        .replace("@B_N@", str(k.B_N))
+        .replace("@NAME@", k.name)
+    )
+    write_if_changed(os.path.join(cg.impl_path, f"{k.name}.cuh"), text)
+
+    # Host specialization only (the compile bypass that keeps the release JIT
+    # toolchain away from the pinned device pipeline). Workspace kids still
+    # need the gfx950 reduce TU; gen_instances keys it on the "_splitk_" name.
+    for c_dtype in k.output_dtypes:
+        cg._host_instantiations.append(
+            {
+                "kid_name": k.name,
+                "dtype": c_dtype,
+                "host_decl": make_host_decl(
+                    k.name,
+                    c_dtype,
+                    (
+                        A16W16_WORKSPACE_LAUNCH_HOST_EXTRA
+                        if workspace
+                        else A16W16_LAUNCH_HOST_EXTRA
+                    ),
+                ),
+            }
+        )
+
+
 register_emit("gfx950", "a16w16_persistent", gen_persistent_instance)
 register_emit("gfx950", "a8w8_scale", gen_scale_instance)
 register_emit("gfx950", "a8w8_mxscale", gen_scale_instance)
@@ -3178,6 +3432,8 @@ register_emit("gfx950", "a8w8", gen_noscale_instance_gfx950)
 register_emit("gfx950", "a16w16_mono_tile", gen_mono_tile_instance)
 register_emit("gfx950", "a16w16_flatmm", gen_flatmm_instance)
 register_emit("gfx950", "a16w16_flatmm_splitk", gen_flatmm_splitk_instance)
+register_emit("gfx950", "a16w16_4wave", gen_a16w16_4wave_instance)
+register_emit("gfx950", "a16w16_4wave_ws", gen_a16w16_4wave_instance)
 
 
 def _register_bmm_emit(kernel_tag, fn, launcher_tile_mult):
