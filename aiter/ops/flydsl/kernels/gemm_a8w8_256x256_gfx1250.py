@@ -24,24 +24,53 @@ from .gemm_common_gfx1250 import (
 )
 from .gfx1250_cluster import compute_mcast_masks
 from .kernels_common import format_kernel_name
-from .mxfp8_sched_hints_gfx1250 import (
-    ENABLE_ASM_PIPE,
-    ENABLE_PIN_B128,
-    ENABLE_SCHED_VGPR,
-    ENABLE_SHORT_BEAT,
-    SA_PANEL_CLASS0,
-    SA_PANEL_CLASS1,
-    pin_a_frag,
-    pin_acc_vec,
-    pin_b_frag,
-    pin_frag_b128,
-    pin_scale_word,
-)
 from .splitk_fused_epilogue_gfx1250 import emit_fused_splitk_epilogue
 from .tensor_shim import (
     AITER_FLYDSL_KERNARG_PRELOAD,
     AITER_FLYDSL_KERNARG_PRELOAD_COUNT,
 )
+
+# ── VGPR pins (mxfp4 partition; no env knobs) ───────────────────────────
+# Acc@512, A@0, B@256. Optional flydsl 0.4.2+ sched_vgpr; older wheels noop.
+try:
+    from flydsl.expr.rocdl.experimental import sched_vgpr as _sched_vgpr
+except ImportError:  # pragma: no cover
+    _sched_vgpr = None
+
+_HAS_SCHED_VGPR = _sched_vgpr is not None
+_ACC_VGPR_BASE = 512
+_A_VGPR_BASE = 0
+_B_VGPR_BASE = 256
+_FRAG_VGPRS = 16
+_ASM_SCALE_BASE = 196
+# Short-K / mid-K A-scale panel widths (measured defaults).
+_SA_PANEL_CLASS0 = 4
+_SA_PANEL_CLASS1 = 8
+
+
+def _pin_vgpr(raw_val, regnum: int):
+    if const_expr(not _HAS_SCHED_VGPR) or _sched_vgpr is None:
+        return raw_val
+    try:
+        return _sched_vgpr(raw_val, regnum, soft=False)
+    except TypeError:
+        return _sched_vgpr(raw_val, regnum)
+
+
+def _pin_acc_vec(raw_val, frag_idx: int):
+    return _pin_vgpr(raw_val, _ACC_VGPR_BASE + frag_idx * 8)
+
+
+def _pin_a_frag(raw_val, slot: int):
+    return _pin_vgpr(raw_val, _A_VGPR_BASE + slot * _FRAG_VGPRS)
+
+
+def _pin_b_frag(raw_val, slot: int):
+    return _pin_vgpr(raw_val, _B_VGPR_BASE + slot * _FRAG_VGPRS)
+
+
+def _pin_scale_word(raw_val, slot: int):
+    return _pin_vgpr(fx.Int32(raw_val), _ASM_SCALE_BASE + slot)
 
 
 @flyc.jit
@@ -134,16 +163,14 @@ def launch_gemm_a8w8_256x256(
     KPAIR = 1 if num_buffers == 4 and tile_n == 256 else 2
     UNROLL = KPAIR * num_buffers
     SUPER_K = tile_k * KPAIR
-    # Short-K (class 0): SA_PANEL_CLASS0 widens the A-scale panel; stages>1
-    # disables c_relocate. Default 4. Mid-K (class 1) uses SA_PANEL_CLASS1
-    # (default 8); stages==1 unlocks persistent c_relocate. Long-K / nb3/nb4
-    # keep legacy 8/4/1.
+    # Short-K: panel=4 (c_relocate needs stages==1 and regresses on huge-N).
+    # Mid-K: panel=8. Long-K / nb3/nb4 keep legacy 8/4/1.
     SA_PANEL_STAGES = (
         (
-            SA_PANEL_CLASS0
+            _SA_PANEL_CLASS0
             if k_tiles_class == 0 and num_buffers == 2
             else (
-                SA_PANEL_CLASS1
+                _SA_PANEL_CLASS1
                 if k_tiles_class == 1 and num_buffers == 2
                 else (8 if num_buffers == 2 else 4 if num_buffers == 3 else 1)
             )
@@ -605,19 +632,19 @@ def launch_gemm_a8w8_256x256(
                         c_frags[(qm * half_m + im) * wmma_n_rep + qn * half_n + jn] = (
                             fx.make_rmem_tensor(8, fx.Float32)
                         )
-        # Pin accumulators into VGPR[512..) so A/B ping-pong owns the low half
-        # (ASM / MXFP4-style partition). Gated by AITER_FLYDSL_MXFP8_SCHED_VGPR.
+        # Pin Acc@512 so A/B ping-pong owns the low half (mxfp4 partition).
         for cf_i, cf in enumerate(c_frags):
             z = fx.constant_vector(0.0, T.vec(8, T.f32))
-            if const_expr(ENABLE_SCHED_VGPR):
-                z = pin_acc_vec(z, cf_i)
+            if const_expr(_HAS_SCHED_VGPR):
+                z = _pin_acc_vec(z, cf_i)
             cf.store(z)
 
         def _rmem(n, v, *, kind=None, slot=0, phase=0):
-            if const_expr(ENABLE_SCHED_VGPR and kind == "a"):
-                v = pin_a_frag(v, slot, phase)
-            elif const_expr(ENABLE_SCHED_VGPR and kind == "b"):
-                v = pin_b_frag(v, slot, phase)
+            del phase
+            if const_expr(_HAS_SCHED_VGPR and kind == "a"):
+                v = _pin_a_frag(v, slot)
+            elif const_expr(_HAS_SCHED_VGPR and kind == "b"):
+                v = _pin_b_frag(v, slot)
             t = fx.make_rmem_tensor(n, fx.Int32)
             t.store(v)
             return t
@@ -748,25 +775,19 @@ def launch_gemm_a8w8_256x256(
         lds_load_b128, _ = make_lds_copy_ops(128)
 
         DS_PER_FRAG = 4  # ds_load_b128 per 16-dword fragment
-        # Soft-pipe WAR: non-mx 256 / half=4 / short-K (class 0) only.
-        # mx32 gemm-request short-K (e.g. K=1280) measures faster on plain
-        # `_quad`; full ASM_PIPE WAR regresses there. Mid/long K keep a4w4
-        # hints via ASM_PIPE_ACTIVE. SHORT_BEAT optionally adds light beats
-        # on class 0 without enabling WAR.
-        ASM_PIPE_ACTIVE = const_expr(ENABLE_ASM_PIPE and k_tiles_class > 0)
+        # Mid/long-K: ASM-style DS/WMMA sched hints. mx32 short-K stays on plain
+        # `_quad` (full WAR soft-pipe regresses there).
+        ASM_PIPE_ACTIVE = const_expr(k_tiles_class > 0)
         # Mid-K: consecutive DS parking + 1×b128 producers (best on 25600×6144).
         DENSE_MIDK = const_expr(ASM_PIPE_ACTIVE and k_tiles_class == 1)
-        SHORT_BEAT = const_expr(
-            ENABLE_SHORT_BEAT and ENABLE_ASM_PIPE and k_tiles_class == 0
-        )
-        BEAT_ACTIVE = const_expr(ASM_PIPE_ACTIVE or SHORT_BEAT)
+        BEAT_ACTIVE = const_expr(ASM_PIPE_ACTIVE)
         # Load-before-MMA on mid/long-K persistent only (short-K / non-ps regress).
         LOAD_FIRST = const_expr(
             ASM_PIPE_ACTIVE and k_tiles_class > 0 and persistent_n_tiles > 1
         )
         # Scale pin helps huge-N mid-K; global pin regresses short-K (~2×).
         PIN_SCALE_ACTIVE = const_expr(
-            ENABLE_SCHED_VGPR and k_tiles_class == 1 and persistent_n_tiles > 1
+            _HAS_SCHED_VGPR and k_tiles_class == 1 and persistent_n_tiles > 1
         )
         # a4w4 WAR soft-pipe: non-mx short-K only (mx32 mid-K stays on `_quad`).
         WAR_SCHED = const_expr(
@@ -816,8 +837,6 @@ def launch_gemm_a8w8_256x256(
             parts = []
             for j in range_constexpr(DS_PER_FRAG):
                 v = Vec(lds_load_b128(addr, idx * row + span * j))
-                if const_expr(ENABLE_PIN_B128):
-                    v = pin_frag_b128(v, kind, idx, j)
                 parts.append(v)
             return _join(parts)
 
@@ -878,7 +897,7 @@ def launch_gemm_a8w8_256x256(
                     # Optional pin of scale *load result* (not LDS address).
                     w = _stage_load_sa_raw(stage, sm, sa_super)
                     if const_expr(PIN_SCALE_ACTIVE):
-                        w = pin_scale_word(w, sm)
+                        w = _pin_scale_word(w, sm)
                     seed_sa[sm].store(Vec.from_elements([w], fx.Int32))
 
                 head.append(_go_sa)
@@ -887,7 +906,7 @@ def launch_gemm_a8w8_256x256(
                 def _go_sb(sn=sn):
                     w = _stage_load_sb_raw(stage, sn)
                     if const_expr(PIN_SCALE_ACTIVE):
-                        w = pin_scale_word(w, N_SA + sn)
+                        w = _pin_scale_word(w, N_SA + sn)
                     seed_sb[sn].store(Vec.from_elements([w], fx.Int32))
 
                 head.append(_go_sb)
@@ -1054,8 +1073,6 @@ def launch_gemm_a8w8_256x256(
                             (half * n + i) * row + span * j,
                         )
                     )
-                    if const_expr(ENABLE_PIN_B128):
-                        v = pin_frag_b128(v, kind, i, j)
                     parts.setdefault(i, []).append(v)
                     if const_expr(j == DS_PER_FRAG - 1):
                         nxt[key][i] = _rmem(
@@ -1143,8 +1160,6 @@ def launch_gemm_a8w8_256x256(
 
                     def _one(j):
                         v = Vec(lds_load_b128(addr, idx * row + span * j))
-                        if const_expr(ENABLE_PIN_B128):
-                            v = pin_frag_b128(v, kind, idx, j)
                         parts.append(v)
                         if const_expr(j == DS_PER_FRAG - 1):
                             dest(_join(parts))
@@ -1182,12 +1197,12 @@ def launch_gemm_a8w8_256x256(
                     for sm in range_constexpr(N_SA):
                         w = _stage_load_sa_raw(next_stage, sm, sa_next)
                         if const_expr(PIN_SCALE_ACTIVE):
-                            w = pin_scale_word(w, sm)
+                            w = _pin_scale_word(w, sm)
                         seed_sa[sm].store(Vec.from_elements([w], fx.Int32))
                     for sn in range_constexpr(N_SB):
                         w = _stage_load_sb_raw(next_stage, sn)
                         if const_expr(PIN_SCALE_ACTIVE):
-                            w = pin_scale_word(w, N_SA + sn)
+                            w = _pin_scale_word(w, N_SA + sn)
                         seed_sb[sn].store(Vec.from_elements([w], fx.Int32))
 
                 def _spread(thunks, lo, hi):
