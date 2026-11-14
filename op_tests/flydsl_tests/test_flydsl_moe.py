@@ -31,7 +31,7 @@ from aiter.ops.quant import (
     per_1x32_f8_scale_f8_quant,
 )
 from aiter.ops.shuffle import shuffle_scale_a16w4, shuffle_weight, shuffle_weight_a16w4
-from aiter.test_common import checkAllclose
+from aiter.test_common import benchmark, checkAllclose, run_perftest
 from aiter.utility import fp4_utils
 from aiter.utility.fp4_utils import e8m0_shuffle
 
@@ -69,11 +69,16 @@ def _generate_a8w4_gui_data(
     block_m: int,
     seed: int = 0,
     dtype=torch.bfloat16,
+    distinct_experts: bool = False,
+    *,
+    inter_pad: int | None = None,
+    activation=ActivationType.Swiglu,
 ):
     torch.manual_seed(seed)
     torch.cuda.manual_seed(seed)
 
-    inter_pad = _inter_pad(inter_dim)
+    if inter_pad is None:
+        inter_pad = _inter_pad(inter_dim)
 
     inp = torch.randn(token, model_dim, dtype=dtype, device="cuda") / 4
     w1 = torch.randn(E, inter_dim * 2, model_dim, dtype=dtype, device="cuda") / 4
@@ -84,6 +89,10 @@ def _generate_a8w4_gui_data(
         w2[:, :, -inter_pad:] = 0
 
     score = torch.randn(token, E, dtype=dtype, device="cuda")
+    if distinct_experts:
+        # Token i -> experts topk*i .. topk*i+topk-1, one routed row per expert.
+        slots = torch.arange(token * topk, device="cuda")
+        score[slots // topk, slots] += 100
     topk_weights, topk_ids = fused_topk(inp, score, topk, True)
     sorted_ids, sorted_weights, sorted_expert_ids, num_valid_ids, _ = moe_sorting(
         topk_ids, topk_weights, E, model_dim, dtype, block_m
@@ -104,7 +113,7 @@ def _generate_a8w4_gui_data(
         topk_weights,
         topk_ids,
         dtype=dtype,
-        activation=ActivationType.Swiglu,
+        activation=activation,
         quant_type=Q_TYPE,
         a1_scale=a_scale,
         w1_scale=w1_scale,
@@ -619,6 +628,143 @@ def test_flydsl_e2e_a8w4_gui(inter_dim):
     )
     torch.cuda.synchronize()
     _check_close(data["ref_stage2"], out, f"e2e_a8w4_gui_i{inter_dim}")
+
+
+@benchmark()
+def benchmark_flydsl_stage1_padding(
+    tile_n,
+    tile_k,
+    k_wave,
+    inter_pad,
+    xcd_swizzle,
+    token=16,
+    model_dim=1024,
+    inter_dim=640,
+    E=8,
+    topk=2,
+):
+    """A caller-owned workspace must have its entire consumed tail overwritten.
+
+    DSV4.1 TP4 has 576 real intermediate columns and 64 padding columns.
+    With tile_n=64 the old launch left the last 32 columns untouched, letting
+    stale Inf values propagate through MXFP8 quantization into the final output.
+    tile_k=512 and pad=0 also guard against launching beyond the physical width.
+    """
+    from aiter.ops.flydsl.moe_kernels import flydsl_moe_stage1
+
+    block_m = 32
+    data = _generate_a8w4_gui_data(
+        token,
+        model_dim,
+        inter_dim,
+        E,
+        topk,
+        block_m,
+        inter_pad=inter_pad,
+        activation=ActivationType.Silu,
+    )
+    # Keep guard rows on both sides to detect an N-axis overlaunch as well.
+    storage = torch.full(
+        (token * topk + 2, inter_dim),
+        17.0,
+        dtype=torch.bfloat16,
+        device=data["a_q"].device,
+    )
+    out = storage[1:-1].view(token, topk, inter_dim)
+    out.fill_(float("inf"))
+    launch_kwargs = {
+        "a": data["a_q"],
+        "w1": data["w1_shuf"],
+        "sorted_token_ids": data["sorted_ids"],
+        "sorted_expert_ids": data["sorted_expert_ids"],
+        "num_valid_ids": data["num_valid_ids"],
+        "topk": topk,
+        "tile_m": block_m,
+        "tile_n": tile_n,
+        "tile_k": tile_k,
+        "k_wave": k_wave,
+        "xcd_swizzle": xcd_swizzle,
+        "a_dtype": "fp8",
+        "b_dtype": "fp4",
+        "out_dtype": "bf16",
+        "act": "silu",
+        "gate_mode": "interleave",
+        "w1_scale": data["w1_scale_shuf"],
+        "a1_scale": data["a_scale_sort"],
+        "inter_dim_pad": inter_pad,
+        "out": out,
+    }
+    result = flydsl_moe_stage1(**launch_kwargs)
+    assert result.data_ptr() == out.data_ptr()
+    assert torch.isfinite(out).all(), "stage1 left a poisoned output column"
+    err = checkAllclose(
+        data["ref_stage1"].float(),
+        out.float(),
+        rtol=0.02,
+        atol=0.02,
+        msg="FlyDSL stage1 padding",
+    )
+    assert err == 0, f"stage1 reference mismatch: {err}"
+    if inter_pad:
+        assert torch.count_nonzero(out[..., -inter_pad:]) == 0
+    torch.testing.assert_close(storage[0], torch.full_like(storage[0], 17.0))
+    torch.testing.assert_close(storage[-1], torch.full_like(storage[-1], 17.0))
+    _, us = run_perftest(
+        lambda: flydsl_moe_stage1(**launch_kwargs),
+        num_iters=20,
+        num_warmup=2,
+        testGraph=True,
+        num_rotate_args=1,
+    )
+    flops = 4 * token * topk * model_dim * (inter_dim - inter_pad)
+    nbytes = (
+        sum(
+            data[key].numel() * data[key].element_size()
+            for key in ("a_q", "a_scale_sort", "w1_shuf", "w1_scale_shuf")
+        )
+        + out.numel() * out.element_size()
+    )
+    return {
+        "flydsl us": us,
+        "flydsl TFLOPS": flops / us / 1e6,
+        "flydsl TB/s": nbytes / us / 1e6,
+        "flydsl err": err,
+    }
+
+
+@pytest.mark.parametrize(
+    "tile_n,tile_k,k_wave",
+    [(64, 256, 4), (128, 256, 1), (64, 512, 1), (128, 512, 1)],
+)
+@pytest.mark.parametrize("inter_pad", [0, 32, 64, 96])
+@pytest.mark.parametrize("xcd_swizzle", [0, 4])
+@_SKIP_GFX950_FLYDSL
+def test_flydsl_stage1_a8w4_gui_padding(tile_n, tile_k, k_wave, inter_pad, xcd_swizzle):
+    benchmark_flydsl_stage1_padding(tile_n, tile_k, k_wave, inter_pad, xcd_swizzle)
+
+
+def run_flydsl_padding_regressions():
+    """Run the same regression/perf sweep from the main MoE op test."""
+    import itertools
+
+    import pandas as pd
+
+    import aiter
+    from aiter.aot.flydsl.common import override_env
+    from aiter.jit.utils.chip_info import get_gfx_runtime
+
+    if get_gfx_runtime() != "gfx950":
+        return
+    rows = []
+    tiles = [(64, 256, 4), (128, 256, 1), (64, 512, 1), (128, 512, 1)]
+    with override_env("AITER_BF16_FP8_MOE_BOUND", "0"), override_env(
+        "FLYDSL_RUNTIME_RUN_ONLY", None
+    ):
+        for (tn, tk, kw), pad, xcd in itertools.product(tiles, [0, 32, 64, 96], [0, 4]):
+            rows.append(benchmark_flydsl_stage1_padding(tn, tk, kw, pad, xcd))
+    aiter.logger.info(
+        "FlyDSL stage1 padding:\n%s", pd.DataFrame(rows).to_markdown(index=False)
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -1143,3 +1289,7 @@ def test_flydsl_e2e_a8w4_situv2(inter_dim, seed, gate_mode):
     _check_close(
         d["ref_stage2"].float(), out.float(), f"situv2_{gate_mode}_e2e_i{inter_dim}"
     )
+
+
+if __name__ == "__main__":
+    run_flydsl_padding_regressions()

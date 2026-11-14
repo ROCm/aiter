@@ -222,8 +222,8 @@ def get_flydsl_stage1_kernels(
     is_fp4_a = a_dtype == "fp4"
     is_fp4_b = b_dtype == "fp4"
     # a16w4 (bf16 A x MXFP4 W) gemm1 is fully CSV/registry-driven: register the
-    # extra tile_k=128 and xcd_swizzle=1 variants its tuned kernelNames name
-    # (t32x{64,128,192,256}x128 / _xcd1), which the other dtypes don't use.
+    # extra tile_k=128 variants its tuned kernelNames name
+    # (t32x{64,128,192,256}x128), which the other dtypes don't use.
     is_a16w4 = a_dtype == "bf16" and is_fp4_b
 
     tile_ns = [32, 64, 128] if is_fp4_b else [128]
@@ -238,7 +238,7 @@ def get_flydsl_stage1_kernels(
     waves_per_eus = [1, 2, 3, 4]
     k_batches = [1, 2, 4, 7, 14]
     b_nts = [0, 2]
-    xcd_swizzles = [0, 1, 4] if is_a16w4 else [0, 4]
+    xcd_swizzles = [0, 1, 4]
 
     for tm in tile_ms:
         # tile_m=16 shares tile_m=32's N-tile set: m_repeat<=2 either way.
@@ -933,11 +933,10 @@ def compile_flydsl_moe_stage2(
             use_async_copy=use_async_copy,
             use_global_a=use_global_a,
             cu_num_mul=cu_num_mul,
-            # API parity (reviewer #3): forward `b_nt` and `xcd_swizzle`
-            # from the kernel-name parser. They are accepted as ignored
-            # kwargs on the fp4xfp4 path so callers parsing the
-            # `_bnt{N}` / `_xcd{N}` registry suffixes don't need
-            # per-dtype special cases.
+            # Forward `b_nt` and `xcd_swizzle` from the kernel-name parser
+            # so callers parsing the `_bnt{N}` / `_xcd{N}` registry suffixes
+            # don't need per-dtype special cases. This builder ignores
+            # `b_nt`; `xcd_swizzle` selects the XCD workgroup remap.
             b_nt=b_nt,
             xcd_swizzle=xcd_swizzle,
             model_dim_pad=model_dim_pad,

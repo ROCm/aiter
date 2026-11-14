@@ -2924,3 +2924,15 @@ aiter.logger.info(
 df = pd.DataFrame(df)
 df_md = df.to_markdown(index=False)
 aiter.logger.info("moe_2stage summary (markdown):\n%s", df_md)
+
+
+# Keep the FlyDSL padding regression in the standard MoE op-test entry point.
+if __name__ == "__main__":
+    try:
+        from flydsl_tests.test_flydsl_moe import run_flydsl_padding_regressions
+    except ModuleNotFoundError as e:
+        if e.name != "flydsl_tests":
+            raise
+        from op_tests.flydsl_tests.test_flydsl_moe import run_flydsl_padding_regressions
+
+    run_flydsl_padding_regressions()
