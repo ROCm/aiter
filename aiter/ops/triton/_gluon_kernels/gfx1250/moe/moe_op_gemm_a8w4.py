@@ -1836,7 +1836,9 @@ def _build_moe_a8w4_layouts(
         warp_bases = [[0, 1]]
         reg_bases = []
     elif num_warps == 4:
-        warp_bases = [[0, 1], [0, 2]]
+        # This helper only feeds the prefill kernel, which needs a warp basis
+        # along M; distributing all four warps along N produces garbage output.
+        warp_bases = [[0, 1], [1, 0]]
         reg_bases = []
     else:
         warp_bases = (
