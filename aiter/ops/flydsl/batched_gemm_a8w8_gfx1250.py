@@ -53,9 +53,11 @@ _BMM_KERNEL_NAME_RE = re.compile(
     rf"^{re.escape(BMM_WMMA_NAME_PREFIX)}_{_SUFFIX_RE}(?P<preload>_pre)?$"
 )
 # mxfp8_32 has no whole-K scale preload: its scale panels are 4x (A) and 32x
-# (n32k4 B) the mxfp8_128 ones.
+# (n32k4 B) the mxfp8_128 ones. A trailing ``_pl`` selects the software-
+# pipelined K loop (see check_pipelined_k_loop); without it the kernel keeps
+# the single-fence loop.
 _BMM_MX32_KERNEL_NAME_RE = re.compile(
-    rf"^{re.escape(BMM_MX32_WMMA_NAME_PREFIX)}_{_SUFFIX_RE}$"
+    rf"^{re.escape(BMM_MX32_WMMA_NAME_PREFIX)}_{_SUFFIX_RE}(?P<pipelined>_pl)?$"
 )
 
 _launch_gemm_a8w8 = None
@@ -99,8 +101,11 @@ def _parse_bmm_mx32_kernel_name_cached(name: str) -> dict[str, int] | None:
     match = _BMM_MX32_KERNEL_NAME_RE.fullmatch(name)
     if match is None:
         return None
-    cfg = {key: int(value) for key, value in match.groupdict().items()}
+    groups = match.groupdict()
+    pipelined = groups.pop("pipelined")
+    cfg = {key: int(value) for key, value in groups.items()}
     cfg["preload"] = 0
+    cfg["pipelined"] = int(pipelined is not None)
     return cfg
 
 
@@ -520,6 +525,7 @@ def run_bmm_a8w8_mxfp8_32_gfx1250(
         bool(w_scale_32x32),
         k_tail,
         fused,  # fuse_quant_out
+        cfg["pipelined"],
     )
     # Cached CompiledFunction per constexpr set; see _run_compiled.
     _run_compiled(
@@ -557,6 +563,7 @@ def run_bmm_a8w8_mxfp8_32_gfx1250(
         k_tail,
         _ptr_arg(y_scale_out) if fused else _ptr_arg(Out),  # arg_scale_out
         fused,  # fuse_quant_out
+        cfg["pipelined"],
         specialization_key=bmm_spec,
     )
     return Out

@@ -144,6 +144,7 @@ def _run_mxfp8_bpreshuffle_gemm_a8_gfx1250(
     persistent_n_tiles: int = 1,
     fused_splitk: bool = True,
     scale_block: int = BLOCK_K,
+    pipelined: int = 0,
 ) -> Tensor:
     """Run the gfx1250 WMMA mxfp8_128 / mxfp8_32 bpreshuffle GEMM.
 
@@ -407,6 +408,7 @@ def _run_mxfp8_bpreshuffle_gemm_a8_gfx1250(
             0,  # preload_ks
             a_preshuffle,
             a_scale_preshuffled,
+            pipelined,
         )
         _run_compiled(
             _launch_gemm_a8w8,
@@ -421,6 +423,8 @@ def _run_mxfp8_bpreshuffle_gemm_a8_gfx1250(
             False,  # b_scale_32x32
             False,  # k_tail
             _ptr_arg(Out),  # arg_scale_out
+            False,  # fuse_quant_out
+            pipelined,
             specialization_key=specialization,
         )
     if partials is not None and not fused:
@@ -456,8 +460,11 @@ _KERNEL_NAME_RE = re.compile(rf"^{re.escape(WMMA_NAME_PREFIX)}_{NAME_SUFFIX_RE}"
 _COMPUTE_KERNEL_NAME_RE = re.compile(
     rf"^{re.escape(COMPUTE_WMMA_NAME_PREFIX)}_{NAME_SUFFIX_RE}"
 )
+# A trailing ``_pl`` selects the software-pipelined K loop of the generic
+# mxfp8_32 kernel (see check_pipelined_k_loop); compute-bound names do not
+# take it.
 _MX32_KERNEL_NAME_RE = re.compile(
-    rf"^{re.escape(MX32_WMMA_NAME_PREFIX)}_{MX32_NAME_SUFFIX_RE}"
+    rf"^{re.escape(MX32_WMMA_NAME_PREFIX)}_{MX32_NAME_SUFFIX_RE}(?P<pipelined>_pl)?"
 )
 _MX32_COMPUTE_KERNEL_NAME_RE = re.compile(
     rf"^{re.escape(MX32_COMPUTE_WMMA_NAME_PREFIX)}_{MX32_NAME_SUFFIX_RE}"
@@ -472,11 +479,13 @@ def _parse_name(match):
     a_scale_preshuffled = groups.pop("a_scale_preshuffled", None) is not None
     fused_splitk = groups.pop("fused_splitk", None) is not None
     persistent_n_tiles = groups.pop("persistent_n_tiles", None)
+    pipelined = groups.pop("pipelined", None) is not None
     cfg = {key: int(value) for key, value in groups.items()}
     cfg["a_preshuffle"] = a_preshuffle
     cfg["a_scale_preshuffled"] = a_scale_preshuffled
     cfg["fused_splitk"] = fused_splitk
     cfg["persistent_n_tiles"] = int(persistent_n_tiles) if persistent_n_tiles else 1
+    cfg["pipelined"] = int(pipelined)
     return cfg
 
 
@@ -666,4 +675,5 @@ def run_gemm_a8w8_mxfp8_32_bpreshuffle_gfx1250(
         persistent_n_tiles=cfg["persistent_n_tiles"],
         scale_block=MX32_BLOCK_K,
         a_scale_preshuffled=a_scale_preshuffled,
+        pipelined=cfg["pipelined"],
     )
