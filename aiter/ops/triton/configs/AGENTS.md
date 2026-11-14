@@ -304,6 +304,12 @@ table for each op (`attn_2d`, `attn_3d`, `reduce`, `kv_split`) and a
   `DT_fp8_nvfp4` entry.
 - Do not use `any` in a three-dtype key. Do not write a three-dtype key with
   the same V and K tags: the loader never tries it.
+- The length-aware KV split (bf16 Q, head size 64, gfx950) reads
+  `SPLIT_PROGRAMS_PER_CU`, `SPLIT_SEGMENTS_PER_CU`, `SPLIT_SEQ_BLOCK_MIN` and
+  `SPLIT_SEQ_BLOCK_MAX` in the `kv_split` entry, `SPLIT_RUNS_PER_XCD` in the
+  `attn_3d` entry and `SPLIT_SEGMENT_BLOCK_MIN` in the `reduce` entry. A
+  missing key, a sliding window, a query longer than one block, or a batch
+  whose segment count overflows keeps the uniform split.
 
 ## Autotune
 
