@@ -15,6 +15,7 @@ Usage (from the repository root):
   python op_tests/op_benchmarks/triton/bench_attn_res.py --op gate --add-hidden2
   python op_tests/op_benchmarks/triton/bench_attn_res.py --op gate --close-block
   python op_tests/op_benchmarks/triton/bench_attn_res.py --op gate --sweep decode
+  python op_tests/op_benchmarks/triton/bench_attn_res.py --op gate --backend triton
 
 Bandwidth uses the MINIMUM required traffic (read each residual once + write
 the output once) for every layout, so a faster configuration always reports a
@@ -106,6 +107,7 @@ def bench_attn_res_fn(N, D, L, layout, metric, args):
             output_rms_eps=args.out_eps,
             scale=args.scale,
             close_block=args.close_block,
+            backend=args.backend,
         )
     else:
         query, residuals, rms_weight, output_rms_weight = generate_attn_res_inputs(
