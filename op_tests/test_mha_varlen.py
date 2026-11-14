@@ -920,6 +920,64 @@ def varlen_flash_attn_seq_padding_benchmark(
     )
 
 
+@pytest.mark.parametrize("dtype", [dtypes.fp16, dtypes.bf16])
+@pytest.mark.parametrize("d", [64, 128])
+@pytest.mark.parametrize("causal", [False, True])
+@pytest.mark.parametrize("return_lse", [False, True])
+@pytest.mark.parametrize("seqlens_q", [[1, 5, 16], [1, 1, 1]])
+def test_flash_attn_varlen_func_paged_kv(dtype, d, causal, return_lse, seqlens_q):
+    """block_table path must match the same batch with contiguous K/V."""
+    torch.random.manual_seed(0)
+    nheads, nheads_k, page_size = 8, 2, 128
+    seqlens_k = [300, 129, 16]
+    num_pages = [(s + page_size - 1) // page_size for s in seqlens_k]
+    total_pages = sum(num_pages) + 4
+    k_cache = torch.randn(
+        total_pages, page_size, nheads_k, d, device="cuda", dtype=dtype
+    )
+    v_cache = torch.randn_like(k_cache)
+    pages = torch.randperm(total_pages, device="cuda", dtype=torch.int32)
+    block_table = torch.zeros(
+        len(seqlens_q), max(num_pages), device="cuda", dtype=torch.int32
+    )
+    k_list, v_list, start = [], [], 0
+    for i, (n, s) in enumerate(zip(num_pages, seqlens_k)):
+        block_table[i, :n] = pages[start : start + n]
+        start += n
+        idx = block_table[i, :n].long()
+        k_list.append(k_cache[idx].reshape(-1, nheads_k, d)[:s])
+        v_list.append(v_cache[idx].reshape(-1, nheads_k, d)[:s])
+    cu_seqlens_q = torch.tensor(
+        [0] + list(itertools.accumulate(seqlens_q)), dtype=torch.int32, device="cuda"
+    )
+    cu_seqlens_k = torch.tensor(
+        [0] + list(itertools.accumulate(seqlens_k)), dtype=torch.int32, device="cuda"
+    )
+    q = torch.randn(sum(seqlens_q), nheads, d, device="cuda", dtype=dtype)
+
+    def run(k, v, block_table):
+        return aiter.flash_attn_varlen_func(
+            q,
+            k,
+            v,
+            cu_seqlens_q,
+            cu_seqlens_k,
+            max(seqlens_q),
+            max(seqlens_k),
+            causal=causal,
+            return_lse=return_lse,
+            block_table=block_table,
+        )
+
+    out = run(k_cache, v_cache, block_table)
+    out_ref = run(torch.cat(k_list), torch.cat(v_list), None)
+    if return_lse:
+        out, lse = out
+        out_ref, lse_ref = out_ref
+        torch.testing.assert_close(lse, lse_ref, atol=1e-3, rtol=1e-3)
+    torch.testing.assert_close(out, out_ref, atol=1e-2, rtol=1e-2)
+
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
         formatter_class=argparse.RawTextHelpFormatter,
