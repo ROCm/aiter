@@ -2667,9 +2667,10 @@ def run_blockscale_limit_cases():
 
 
 # FP8 per_Token / per_Tensor SiLU limit: model_dim, inter_dim, experts, topk of
-# the shipped swiglu_limit=7 tuned rows. Only gfx942 is validated so far.
+# the shipped swiglu_limit=7 tuned rows. The tuned rows are gfx942 only; gfx950
+# runs the same cases on the default heuristic tiles.
 _PLAIN_FP8_LIMIT_SHAPE = (2048, 768, 128, 8)
-_PLAIN_FP8_LIMIT_GFX = ("gfx942",)
+_PLAIN_FP8_LIMIT_GFX = ("gfx942", "gfx950")
 _plain_fp8_limit_weight_cache = {}
 
 
@@ -2874,13 +2875,18 @@ def test_plain_fp8_swiglu_limit_dispatch():
                 ), (q, token, limit)
 
     # A row tagged with the requested limit wins; an incompatible one fails.
+    # block_m 32 instances; gfx950 FP8 uses the TypeCast CDE op and N=128 stage 2.
+    if get_gfx_runtime() == "gfx950":
+        cde1, cde2, tile2 = "TypeCast", "TypeCast", "256x32x128x256"
+    else:
+        cde1, cde2, tile2 = "MulABScale", "MulABScaleExpertWeight", "256x32x64x128"
     kn1 = (
-        "moe_ck2stages_gemm1_256x32x64x256_1x4_MulABScale_v1_Nswizzle0_Quant2_"
+        f"moe_ck2stages_gemm1_256x32x64x256_1x4_{cde1}_v1_Nswizzle0_Quant2_"
         "MulRoutedWeight0_silu_F8_F8_B16"
     )
     kn2 = (
-        "moe_ck2stages_gemm2_256x32x64x128_1x4_MulABScaleExpertWeight_v1_"
-        "Nswizzle0_Quant2_MulRoutedWeight1_F8_F8_B16"
+        f"moe_ck2stages_gemm2_{tile2}_1x4_{cde2}_v1_Nswizzle0_Quant2_"
+        "MulRoutedWeight1_F8_F8_B16"
     )
     row = {"block_m": 32, "ksplit": 0, "run_1stage": 0, "kernelName1": kn1}
     row.update(kernelName2=kn2, flat=0, nt=0, xbf16=0)
@@ -2894,6 +2900,7 @@ def test_plain_fp8_swiglu_limit_dispatch():
         cache[slot] = ({key: row}, {})
         md = dispatch(1, aiter.QuantType.per_Token, 3.0)
         assert md.stage1.keywords["kernelName"] == kn1, md.stage1.keywords
+        assert md.stage2.keywords["kernelName"] == kn2, md.stage2.keywords
         assert int(md.block_m) == 32, md.block_m
         cache[slot] = ({key: {**row, "run_1stage": 1}}, {})
         raises(ValueError, "Incompatible", dispatch, 1, aiter.QuantType.per_Token, 3.0)
