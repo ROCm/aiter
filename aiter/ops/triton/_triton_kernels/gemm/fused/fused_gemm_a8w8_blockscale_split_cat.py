@@ -5,8 +5,11 @@
 import triton
 import triton.language as tl
 
+from aiter.ops.triton._triton_kernels.common.pid_preprocessing import (
+    pid_grid,
+    remap_xcd,
+)
 from aiter.ops.triton.utils._triton.kernel_repr import make_kernel_repr
-from aiter.ops.triton.utils._triton.pid_preprocessing import pid_grid, remap_xcd
 from aiter.ops.triton.utils.gemm_config_utils import get_gemm_config
 
 _fused_gemm_a8w8_blockscale_split_cat_repr = make_kernel_repr(
@@ -27,8 +30,6 @@ _fused_gemm_a8w8_blockscale_split_cat_repr = make_kernel_repr(
 @triton.heuristics(
     {
         "EVEN_K": lambda args: args["K"] % args["BLOCK_SIZE_K"] == 0,
-        "GRID_MN": lambda args: triton.cdiv(args["M"], args["BLOCK_SIZE_M"])
-        * triton.cdiv(args["N"], args["BLOCK_SIZE_N"]),
     }
 )
 @triton.jit(repr=_fused_gemm_a8w8_blockscale_split_cat_repr)
@@ -81,7 +82,6 @@ def _fused_gemm_a8w8_blockscale_split_cat(
     NUM_KSPLIT: tl.constexpr,
     SPLITK_BLOCK_SIZE: tl.constexpr,
     EVEN_K: tl.constexpr,
-    GRID_MN: tl.constexpr,
     cache_modifier: tl.constexpr,
 ):
     tl.assume(stride_a_m > 0)
@@ -111,7 +111,8 @@ def _fused_gemm_a8w8_blockscale_split_cat(
     num_pid_n = tl.cdiv(N, BLOCK_SIZE_N)
 
     if NUM_KSPLIT == 1:
-        remap_xcd(pid, GRID_MN)
+        grid_mn = num_pid_m * num_pid_n
+        remap_xcd(pid, grid_mn)
         pid_m, pid_n = pid_grid(pid, num_pid_m, num_pid_n, GROUP_SIZE_M=GROUP_SIZE_M)
     else:
         pid_m = pid // num_pid_n
@@ -154,7 +155,9 @@ def _fused_gemm_a8w8_blockscale_split_cat(
         acc_dtype = tl.float32 if c1_ptr.type.element_ty != tl.int8 else tl.int32
         accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=acc_dtype)
 
-        for k in range(pid_k * num_k_iter, (pid_k + 1) * num_k_iter):
+        # The last split can run past K, so stop at the last K block
+        k_end = tl.minimum((pid_k + 1) * num_k_iter, tl.cdiv(K, BLOCK_SIZE_K))
+        for k in range(pid_k * num_k_iter, k_end):
             # Load the next block of A and B, generate a mask by checking the K dimension.
             # If it is out of bounds, set it to 0.
             if EVEN_K:
@@ -253,7 +256,7 @@ def _fused_gemm_a8w8_blockscale_split_cat(
                 c1_ptr
                 + stride_c1_m * offs_c1_m[:, None]
                 + stride_c1_n * offs_c1_n[None, :]
-                + stride_c1_k * pid_k
+                + stride_c1_k * pid_k.to(tl.int64)
             )
             c1_mask = (offs_c1_m[:, None] < M) & (offs_c1_n[None, :] < N)
             tl.store(c1_ptrs, c, mask=c1_mask)
@@ -277,8 +280,6 @@ _fused_gemm_a8w8_blockscale_preshuffle_split_cat_repr = make_kernel_repr(
 @triton.heuristics(
     {
         "EVEN_K": lambda args: args["K"] % args["BLOCK_SIZE_K"] == 0,
-        "GRID_MN": lambda args: triton.cdiv(args["M"], args["BLOCK_SIZE_M"])
-        * triton.cdiv(args["N"], args["BLOCK_SIZE_N"]),
     }
 )
 @triton.jit(repr=_fused_gemm_a8w8_blockscale_preshuffle_split_cat_repr)
@@ -331,7 +332,6 @@ def _fused_gemm_a8w8_blockscale_preshuffle_split_cat(
     NUM_KSPLIT: tl.constexpr,
     SPLITK_BLOCK_SIZE: tl.constexpr,
     EVEN_K: tl.constexpr,
-    GRID_MN: tl.constexpr,
     cache_modifier: tl.constexpr,
 ):
     tl.assume(stride_a_m > 0)
@@ -361,7 +361,8 @@ def _fused_gemm_a8w8_blockscale_preshuffle_split_cat(
     num_pid_n = tl.cdiv(N, BLOCK_SIZE_N)
 
     if NUM_KSPLIT == 1:
-        remap_xcd(pid, GRID_MN)
+        grid_mn = num_pid_m * num_pid_n
+        remap_xcd(pid, grid_mn)
         pid_m, pid_n = pid_grid(pid, num_pid_m, num_pid_n, GROUP_SIZE_M=GROUP_SIZE_M)
     else:
         pid_m = pid // num_pid_n
@@ -408,7 +409,9 @@ def _fused_gemm_a8w8_blockscale_preshuffle_split_cat(
         acc_dtype = tl.float32 if c1_ptr.type.element_ty != tl.int8 else tl.int32
         accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=acc_dtype)
 
-        for k in range(pid_k * num_k_iter, (pid_k + 1) * num_k_iter):
+        # The last split can run past K, so stop at the last K block
+        k_end = tl.minimum((pid_k + 1) * num_k_iter, tl.cdiv(K, BLOCK_SIZE_K))
+        for k in range(pid_k * num_k_iter, k_end):
             # Load the next block of A and B, generate a mask by checking the K dimension.
             # If it is out of bounds, set it to 0.
             if EVEN_K:
@@ -521,7 +524,7 @@ def _fused_gemm_a8w8_blockscale_preshuffle_split_cat(
                 c1_ptr
                 + stride_c1_m * offs_c1_m[:, None]
                 + stride_c1_n * offs_c1_n[None, :]
-                + stride_c1_k * pid_k
+                + stride_c1_k * pid_k.to(tl.int64)
             )
             c1_mask = (offs_c1_m[:, None] < M) & (offs_c1_n[None, :] < N)
             tl.store(c1_ptrs, c, mask=c1_mask)
@@ -592,7 +595,7 @@ def _fused_gemm_a8w8_blockscale_split_cat_reduce(
     offs_k = tl.arange(0, MAX_KSPLIT)
     c_ptrs = (
         c_ptr
-        + (offs_k[:, None, None] * stride_c_k)
+        + (offs_k[:, None, None].to(tl.int64) * stride_c_k)
         + (offs_m[None, :, None] * stride_c_m)
         + (offs_n[None, None, :] * stride_c_n)
     )

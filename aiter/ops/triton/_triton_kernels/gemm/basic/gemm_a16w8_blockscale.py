@@ -4,9 +4,9 @@
 import triton
 import triton.language as tl
 
+from aiter.ops.triton._triton_kernels.common.pid_preprocessing import pid_grid
 from aiter.ops.triton._triton_kernels.quant.fused_fp8_quant import _fp8_quant_op
 from aiter.ops.triton.utils._triton.kernel_repr import make_kernel_repr
-from aiter.ops.triton.utils._triton.pid_preprocessing import pid_grid
 from aiter.ops.triton.utils.gemm_config_utils import get_gemm_config
 
 _gemm_a16w8_blockscale_repr = make_kernel_repr(
@@ -24,7 +24,7 @@ _gemm_a16w8_blockscale_repr = make_kernel_repr(
         "NUM_KSPLIT",
         "SPLITK_BLOCK_SIZE",
         "EVEN_K",
-        "GRID_MN",
+        "EVEN_SPLITK",
         "PREQUANT",
     ],
 )
@@ -33,8 +33,8 @@ _gemm_a16w8_blockscale_repr = make_kernel_repr(
 @triton.heuristics(
     {
         "EVEN_K": lambda args: args["K"] % args["BLOCK_SIZE_K"] == 0,
-        "GRID_MN": lambda args: triton.cdiv(args["M"], args["BLOCK_SIZE_M"])
-        * triton.cdiv(args["N"], args["BLOCK_SIZE_N"]),
+        "EVEN_SPLITK": lambda args: args["NUM_KSPLIT"] * args["SPLITK_BLOCK_SIZE"]
+        == args["K"],
     }
 )
 @triton.jit(repr=_gemm_a16w8_blockscale_repr)
@@ -71,7 +71,7 @@ def _gemm_a16w8_blockscale_kernel(
     NUM_KSPLIT: tl.constexpr,
     SPLITK_BLOCK_SIZE: tl.constexpr,
     EVEN_K: tl.constexpr,
-    GRID_MN: tl.constexpr,
+    EVEN_SPLITK: tl.constexpr,
     PREQUANT: tl.constexpr,
     DTYPE_MAX: tl.constexpr,
     DTYPE_MIN: tl.constexpr,
@@ -155,9 +155,11 @@ def _gemm_a16w8_blockscale_kernel(
         acc_dtype = tl.float32 if c_ptr.type.element_ty != tl.int8 else tl.int32
         accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=acc_dtype)
 
-        for k in tl.range(
-            pid_k * num_k_iter, (pid_k + 1) * num_k_iter, num_stages=num_stages
-        ):
+        k_end = (pid_k + 1) * num_k_iter
+        if not EVEN_SPLITK:
+            # SPLITK_BLOCK_SIZE is rounded up, so the last split can run past K
+            k_end = tl.minimum(k_end, tl.cdiv(K, BLOCK_SIZE_K))
+        for k in tl.range(pid_k * num_k_iter, k_end, num_stages=num_stages):
             # Load the next block of A and B, generate a mask by checking the K dimension.
             # If it is out of bounds, set it to 0.
             if EVEN_K:
@@ -202,7 +204,7 @@ def _gemm_a16w8_blockscale_kernel(
             c_ptr
             + stride_cm * offs_cm[:, None]
             + stride_cn * offs_cn[None, :]
-            + pid_k * stride_ck
+            + pid_k.to(tl.int64) * stride_ck
         )
         c_mask = (offs_cm[:, None] < M) & (offs_cn[None, :] < N)
         tl.store(c_ptrs, c, mask=c_mask)
@@ -223,7 +225,7 @@ _gemm_a16w8_blockscale_preshuffle_repr = make_kernel_repr(
         "NUM_KSPLIT",
         "SPLITK_BLOCK_SIZE",
         "EVEN_K",
-        "GRID_MN",
+        "EVEN_SPLITK",
         "PREQUANT",
     ],
 )
@@ -232,8 +234,8 @@ _gemm_a16w8_blockscale_preshuffle_repr = make_kernel_repr(
 @triton.heuristics(
     {
         "EVEN_K": lambda args: args["K"] % args["BLOCK_SIZE_K"] == 0,
-        "GRID_MN": lambda args: triton.cdiv(args["M"], args["BLOCK_SIZE_M"])
-        * triton.cdiv(args["N"], args["BLOCK_SIZE_N"]),
+        "EVEN_SPLITK": lambda args: args["NUM_KSPLIT"] * args["SPLITK_BLOCK_SIZE"]
+        == args["K"],
     }
 )
 @triton.jit(repr=_gemm_a16w8_blockscale_repr)
@@ -270,7 +272,7 @@ def _gemm_a16w8_blockscale_preshuffle_kernel(
     NUM_KSPLIT: tl.constexpr,
     SPLITK_BLOCK_SIZE: tl.constexpr,
     EVEN_K: tl.constexpr,
-    GRID_MN: tl.constexpr,
+    EVEN_SPLITK: tl.constexpr,
     PREQUANT: tl.constexpr,
     DTYPE_MAX: tl.constexpr,
     DTYPE_MIN: tl.constexpr,
@@ -362,7 +364,11 @@ def _gemm_a16w8_blockscale_preshuffle_kernel(
         acc_dtype = tl.float32 if c_ptr.type.element_ty != tl.int8 else tl.int32
         accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=acc_dtype)
 
-        for k in range(pid_k * num_k_iter, (pid_k + 1) * num_k_iter):
+        k_end = (pid_k + 1) * num_k_iter
+        if not EVEN_SPLITK:
+            # SPLITK_BLOCK_SIZE is rounded up, so the last split can run past K
+            k_end = tl.minimum(k_end, tl.cdiv(K, BLOCK_SIZE_K))
+        for k in range(pid_k * num_k_iter, k_end):
             # Load the next block of A and B, generate a mask by checking the K dimension.
             # If it is out of bounds, set it to 0.
             if EVEN_K:
@@ -414,7 +420,7 @@ def _gemm_a16w8_blockscale_preshuffle_kernel(
             c_ptr
             + stride_cm * offs_cm[:, None]
             + stride_cn * offs_cn[None, :]
-            + pid_k * stride_ck
+            + pid_k.to(tl.int64) * stride_ck
         )
         c_mask = (offs_cm[:, None] < M) & (offs_cn[None, :] < N)
         tl.store(c_ptrs, c, mask=c_mask)

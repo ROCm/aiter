@@ -9,8 +9,8 @@ Gluon persistent Triton GEMM.
 import triton.experimental.gluon.language as gl
 from triton.experimental import gluon
 
+from aiter.ops.triton._triton_kernels.common.pid_preprocessing import remap_xcd
 from aiter.ops.triton.utils._triton.kernel_repr import make_kernel_repr
-from aiter.ops.triton.utils._triton.pid_preprocessing import remap_xcd
 
 _GLUON_REPR_KEYS = [
     "BLOCK_M",
@@ -73,6 +73,7 @@ def gemm_a16w16_persistent_kernel_(
     SKIP_REDUCE: gl.constexpr,
     NUM_SMS: gl.constexpr,
     NUM_PID_N: gl.constexpr,
+    NUM_XCDS: gl.constexpr,
     num_warps: gl.constexpr,
     num_stages: gl.constexpr = 0,
     waves_per_eu: gl.constexpr = 0,
@@ -140,7 +141,7 @@ def gemm_a16w16_persistent_kernel_(
             layout=SHARED_LAYOUT_C,
         )
         # remap tile index
-        t = remap_xcd(tile_id, num_tiles, NUM_XCDS=8)
+        t = remap_xcd(tile_id, num_tiles, NUM_XCDS=NUM_XCDS)
         pid_k = t % NUM_KSPLIT
         pid = t // NUM_KSPLIT
 
@@ -374,6 +375,7 @@ def gemm_a16w16_persistent_compute_bound_kernel_(
     SKIP_REDUCE: gl.constexpr,
     NUM_SMS: gl.constexpr,
     NUM_PID_N: gl.constexpr,
+    NUM_XCDS: gl.constexpr,
     num_warps: gl.constexpr,
     num_stages: gl.constexpr = 0,
     waves_per_eu: gl.constexpr = 0,
@@ -463,7 +465,7 @@ def gemm_a16w16_persistent_compute_bound_kernel_(
                 layout=SHARED_LAYOUT_B,
             )
 
-        t = remap_xcd(tile_id, num_tiles, NUM_XCDS=8)
+        t = remap_xcd(tile_id, num_tiles, NUM_XCDS=NUM_XCDS)
         pid_k = t % NUM_KSPLIT
         pid = t // NUM_KSPLIT
         pid_m = pid // num_pid_n

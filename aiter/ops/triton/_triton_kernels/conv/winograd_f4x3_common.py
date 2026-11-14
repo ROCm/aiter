@@ -6,7 +6,9 @@
 import triton
 import triton.language as tl
 
-from aiter.ops.triton._triton_kernels.activation import _apply_activation_from_str
+from aiter.ops.triton._triton_kernels.common.activation import (
+    _apply_activation_from_str,
+)
 
 
 @triton.jit

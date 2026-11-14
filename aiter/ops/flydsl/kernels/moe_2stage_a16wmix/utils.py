@@ -19,12 +19,13 @@ from typing import NamedTuple
 
 import flydsl.expr as fx
 from flydsl._mlir.dialects import llvm
-from flydsl.expr import arith, const_expr, gpu, range_constexpr, rocdl
+from flydsl.expr import const_expr, gpu, range_constexpr, rocdl
 from flydsl.expr.typing import T
 
 from aiter.ops.flydsl.kernels import buffer_ops
 from aiter.ops.flydsl.kernels.layout_utils import crd2idx
 from aiter.ops.flydsl.kernels.mxfp4_gemm_common import (
+    _e8m0_byte_to_f32,
     _global_i32_buffer_tiles,
     _global_i32_buffer_view,
     global_typed_ptr,
@@ -37,13 +38,11 @@ A16WI4_GROUP_SIZE = 32
 
 
 def _udiv(a, c):
-    cc = fx.Int32(c) if isinstance(c, int) else c
-    return fx.Int32(arith.divui(_raw(a), _raw(cc)))
+    return fx.Int32(fx.Uint32(a) // fx.Uint32(c))
 
 
 def _umod(a, c):
-    cc = fx.Int32(c) if isinstance(c, int) else c
-    return fx.Int32(arith.remui(_raw(a), _raw(cc)))
+    return fx.Int32(fx.Uint32(a) % fx.Uint32(c))
 
 
 def _global_i32_at(addr_i64, idx):
@@ -57,7 +56,7 @@ def _buffer_i32_scalar_read(tiles1, idx, atom):
     """
     r = fx.make_rmem_tensor(fx.make_layout(1, 1), fx.Int32)
     fx.copy(atom, fx.slice(tiles1, (None, idx)), r)
-    return fx.Int32(fx.Vector(fx.memref_load_vec(r))[0])
+    return fx.memref_load_vec(r)[0]
 
 
 def _int_to_llvm_ptr(addr, address_space):
@@ -155,12 +154,6 @@ def _int4_nibble_to_bf16x8(raw_i32, scale_f32, *, is_gfx942=False, old_pack=Fals
     return v4i32.bitcast(fx.BFloat16)  # v8bf16
 
 
-def _e8m0_byte_to_f32(packed_i32, byte_pos):
-    shift = byte_pos * fx.Int32(8)
-    b = packed_i32.shrui(shift) & fx.Int32(0xFF)
-    return (b << fx.Int32(23)).bitcast(fx.Float32)
-
-
 def _a16w4_swizzle_xor16(row, col_bytes, k_blocks16, *, enable=False):
     """A-LDS bank-conflict XOR swizzle (aiter swizzle_xor16: col ^ ((row&(kb16-1))*16)).
 
@@ -210,6 +203,11 @@ class _ALoader(NamedTuple):
 
     load: Callable  # load(mi, ku, slot=0) -> v8bf16 A MMA fragment
     store_tile: Callable  # store_tile(base_k, slot=0): global -> A-LDS, one K tile
+    # gfx942 VGPR staging split in two so a pipelined caller can keep several
+    # A tiles in flight: issue_tile(base_k) -> gmem->VGPR loads,
+    # commit_tile(regs, slot=0) -> VGPR->LDS writes of those registers.
+    issue_tile: Callable | None = None
+    commit_tile: Callable | None = None
 
 
 def make_a_loader(
@@ -359,9 +357,51 @@ def make_a_loader(
         fx.copy_atom_call(
             lds_atom, fx.slice(tiles, (None, byte_off // fx.Int32(16))), r
         )
-        return fx.Vector(fx.memref_load_vec(r)).bitcast(fx.BFloat16)  # v8bf16
+        return fx.memref_load_vec(r).bitcast(fx.BFloat16)  # v8bf16
 
-    return _ALoader(load=lds_load_a, store_tile=store_a_tile)
+    def issue_a_tile(base_k):
+        assert dma_via_vgpr, "issue_tile is the gfx942 VGPR staging path"
+        base_k_div4 = (base_k * fx.Int32(elem_bytes)) // fx.Int32(4)
+        regs = []
+        for i in range_constexpr(num_x_loads):
+            col_bytes = x_col_dw[i] * fx.Int32(4)
+            col_sw = _a16w4_swizzle_xor16(
+                x_row_local[i], col_bytes, fx.Int32(k_blocks16), enable=swizzle
+            )
+            row_k_dw = x_row_base_div4[i] + base_k_div4
+            global_byte = row_k_dw * fx.Int32(4) + col_sw
+            r = fx.make_rmem_tensor(fx.make_layout(4, 1), fx.Int32)
+            fx.copy(
+                x_dma_atom,
+                fx.slice(x_dma_tiles4, (None, global_byte // fx.Int32(16))),
+                r,
+            )
+            regs.append(r)
+        return regs
+
+    def commit_a_tile(regs, slot=0):
+        if k_grp_base_bytes is None:
+            slot_byte = None
+        else:
+            slot_byte = k_grp_base_bytes + fx.Int32(slot * A_SLOT_BYTES)
+        for i in range_constexpr(num_x_loads):
+            col_bytes = x_col_dw[i] * fx.Int32(4)
+            if const_expr(slot_byte is None):
+                lds_byte = x_row_local[i] * fx.Int32(KH_TILE_BYTES) + col_bytes
+            else:
+                lds_byte = (
+                    slot_byte + x_row_local[i] * fx.Int32(KH_TILE_BYTES) + col_bytes
+                )
+            fx.copy(
+                lds_atom, regs[i], fx.slice(tiles, (None, lds_byte // fx.Int32(16)))
+            )
+
+    return _ALoader(
+        load=lds_load_a,
+        store_tile=store_a_tile,
+        issue_tile=issue_a_tile,
+        commit_tile=commit_a_tile,
+    )
 
 
 class _BCol(NamedTuple):
@@ -390,6 +430,11 @@ class _BLoader(NamedTuple):
     load_raw: Callable  # load_raw(base_k, col) -> per-K-step raw fragments
     load_scale: Callable  # load_scale(base_k, col) -> per-K-step f32 scales
     upconvert: Callable  # upconvert(raw, ku, scale) -> v8bf16 MMA operand
+    # mxfp4 deferred scales: load_scale_raw(base_k, col) issues only the e8m0
+    # dword loads; convert_scale(base_k, col, raw) later decodes them into the
+    # same per-K-step f32 scales that load_scale returns.
+    load_scale_raw: Callable | None = None
+    convert_scale: Callable | None = None
 
 
 # gfx942 MXFP4: E2M1 mag 0..7 as E4M3FNUZ fp8 bytes for one v_perm_b32.
@@ -435,8 +480,8 @@ def _fp4_nibble_to_bf16x8(raw_i32, scale_f32):
     lshr-16 used by gfx942 int4.
     """
     packed = fx.Int32(raw_i32)
-    even = packed & fx.Int32(0x0F0F0F0F)  # K0,K2,K4,K6
-    odd = packed.shrui(fx.Int32(4)) & fx.Int32(0x0F0F0F0F)  # K1,K3,K5,K7
+    even = packed & 0x0F0F0F0F  # K0,K2,K4,K6
+    odd = packed.shrui(fx.Int32(4)) & 0x0F0F0F0F  # K1,K3,K5,K7
     fe = _fp4x4_e2m1_to_f32x4(even)
     fo = _fp4x4_e2m1_to_f32x4(odd)
     scale = fx.Float32(scale_f32)
@@ -668,9 +713,9 @@ def make_b_loader(
             )
             # idx_pack is a fp4-byte offset; dwordx4 tile index = (idx_pack/4 dwords)/4.
             r = fx.make_rmem_tensor(w_reg_lay, fx.Int32)
-            fx.copy(w_copy_atom, fx.slice(w_tiles, (None, idx_pack // fx.Int32(16))), r)
+            fx.copy(w_copy_atom, fx.slice(w_tiles, (None, idx_pack // 16)), r)
             v4 = fx.Vector(fx.memref_load_vec(r))
-            raw.append([fx.Int32(v4[j]) for j in range(4)])
+            raw.append([v4[j] for j in range(4)])
         return raw
 
     def load_b_raw_int4(base_k, n_blk, n_intra):
@@ -700,12 +745,10 @@ def make_b_loader(
                 )
                 # idx is an int4-nibble byte offset; dwordx2 tile index = (idx bytes)/8.
                 r = fx.make_rmem_tensor(w_reg_lay2, fx.Int32)
-                fx.copy(
-                    w_copy_atom64, fx.slice(w_tiles8, (None, idx // fx.Int32(8))), r
-                )
+                fx.copy(w_copy_atom64, fx.slice(w_tiles8, (None, idx // 8)), r)
                 v2 = fx.Vector(fx.memref_load_vec(r))
-                four.append(fx.Int32(v2[0]))
-                four.append(fx.Int32(v2[1]))
+                four.append(v2[0])
+                four.append(v2[1])
             raw.append(four)
         return raw
 
@@ -733,7 +776,7 @@ def make_b_loader(
             )
             # elem_idx is a bf16-elem offset; dword index = elem_idx*2/4, tile idx = /4.
             r = fx.make_rmem_tensor(w_reg_lay, fx.Int32)
-            fx.copy(w_copy_atom, fx.slice(w_tiles, (None, elem_idx // fx.Int32(8))), r)
+            fx.copy(w_copy_atom, fx.slice(w_tiles, (None, elem_idx // 8)), r)
             raw.append(fx.Vector(fx.memref_load_vec(r)).bitcast(fx.BFloat16))  # v8bf16
         return raw
 
@@ -799,7 +842,7 @@ def make_b_loader(
         i32s = []
         for sel in range_constexpr(4):
             p = rocdl.cvt_scalef32_pk_bf16_fp4(vec2_bf16, i32_val, s_raw, sel)
-            i32s.append(fx.Int32(fx.Vector(p).bitcast(fx.Int32)[0]))
+            i32s.append(fx.Vector(p).bitcast(fx.Int32)[0])
         v4i32 = fx.Vector.from_elements([_raw(x) for x in i32s], fx.Int32)
         return v4i32.bitcast(fx.BFloat16)  # v8bf16
 
@@ -822,10 +865,51 @@ def make_b_loader(
             return load_b_scale_int4(base_k, col.sc_n)
         return load_b_scale(base_k, col.sc_blk, col.sc_pack)
 
+    def load_b_scale_raw(base_k, mni):
+        # load_b_scale's dword gathers only (one per 128-K block), no decode.
+        raws = {}
+        for ku in range_constexpr(k_unroll):
+            _k0_blk = ku // 4
+            if _k0_blk not in raws:
+                adj_ku = base_k // fx.Int32(32) + fx.Int32(_k0_blk * 4) + lane_div_16
+                s_ku = adj_ku // fx.Int32(8)
+                idx = (
+                    mni * fx.Int32(sc_stride_n0)
+                    + s_ku * fx.Int32(sc_stride_k0)
+                    + lane_div_16 * fx.Int32(sc_stride_klane)
+                    + lane_mod_16
+                )
+                raws[_k0_blk] = _buffer_i32_scalar_read(sw_tiles, idx, sw_read_atom)
+        return raws
+
+    def convert_b_scale(base_k, n_pack, raws):
+        # load_b_scale's decode of the gathered dwords, same arithmetic per ku.
+        scales = []
+        for ku in range_constexpr(k_unroll):
+            _k0_blk = ku // 4
+            adj_ku = base_k // fx.Int32(32) + fx.Int32(_k0_blk * 4) + lane_div_16
+            k_pack_sub = (adj_ku // fx.Int32(4)) % fx.Int32(2)
+            packed = raws[_k0_blk]
+            byte_even = k_pack_sub * fx.Int32(2)
+            byte_odd = byte_even + fx.Int32(1)
+            se = _e8m0_byte_to_f32(packed, byte_even)
+            so = _e8m0_byte_to_f32(packed, byte_odd)
+            scales.append((n_pack == fx.Int32(0)).select(se, so))
+        return scales
+
+    def load_scale_raw(base_k, col):
+        assert not _is_int4 and not _is_bf16, "deferred scales are mxfp4-only"
+        return load_b_scale_raw(base_k, col.sc_blk)
+
+    def convert_scale(base_k, col, raws):
+        return convert_b_scale(base_k, col.sc_pack, raws)
+
     return _BLoader(
         col=col,
         col_pair=col_pair,
         load_raw=load_raw,
         load_scale=load_scale,
         upconvert=upconvert_b,
+        load_scale_raw=load_scale_raw,
+        convert_scale=convert_scale,
     )
