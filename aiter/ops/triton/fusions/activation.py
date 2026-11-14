@@ -1,3 +1,4 @@
+import functools
 from typing import Literal
 
 import torch
@@ -26,6 +27,20 @@ def _get_silu_and_mul_backward_config(n_cols: int) -> dict:
     config_dir = resolve_config_dir("fusions", "SILU-AND-MUL-BACKWARD")
     configs = load_config_json(f"{config_dir}/DEFAULT.json", required=True)
     return select_leq_config(configs, n_cols)
+
+
+@functools.lru_cache(maxsize=1)
+def _act_mul_and_fp8_group_quant_config_dir() -> str:
+    # resolve_config_dir probes the file system, so an eager call must not repeat it.
+    return resolve_config_dir("fusions", "ACT_MUL_AND_FP8_GROUP_QUANT")
+
+
+def _get_act_mul_and_fp8_group_quant_config(M: int) -> dict | None:
+    # The gfx942 entries were tuned with bfloat16 input and group_size 128, for
+    # N // 2 from 1000 to 17408. Other dtypes and group sizes use the same entries.
+    config_dir = _act_mul_and_fp8_group_quant_config_dir()
+    configs = load_config_json(f"{config_dir}/DEFAULT.json", required=False)
+    return None if configs is None else select_leq_config(configs, M, prefix="M_LEQ_")
 
 
 def act_mul_and_mxfp4_quant(
@@ -149,25 +164,21 @@ def act_mul_and_fp8_group_quant(
     dtype_quant=fp8_dtype,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """
-    Apply the activation function and quantize the result to MX FP4 format.
+    Apply the activation to the first half of the features, multiply the result by the
+    second half, and quantize it to FP8 with one scale for each group of columns.
 
     Args:
-        x: The input tensor, typically fp16 or bf16.
-        activation: activation function to apply before quantization.
-            - It splits the features into two parts and applies the activation to the first part.
-            - Then, it adds the results together before quantization.
-            - Supports the following activations:
-                - "silu"
-                - "gelu"
-                - "gelu_tanh"
+        x: The 2-D input tensor, typically fp16 or bf16, with an even last dimension N.
+        activation: The activation for the first half: "silu", "gelu" or "gelu_tanh".
+        group_size: The number of columns that share one scale.
+        dtype_quant: The FP8 dtype of the output.
 
-        scaling_mode: The method to calculate MX block scaling.
-            - "even" (default): `even_round` in `quark.torch.quantization.utils`.
-            - etc.
-        shuffle: Indicates whether to enable preshuffling of scales.
-            - When enabled, scale dimensions (X, Y) are adjusted to be multiples of 8 and 256, respectively.
     Returns:
-        A tuple of (x_fp4, blockscale_e8m0).
+        A tuple of (x_fp8, scales). x_fp8 has the shape (M, N // 2). scales is fp32 with
+        the shape (M, cdiv(N // 2, group_size)).
+
+    On gfx942, ``M_LEQ_*`` entries select ``BLOCK_SIZE_N`` and the launch options.
+    Other architectures use one group for each program.
     """
     _LOGGER.info(
         "ACT_MUL_FP8_GROUP_QUANT: x=%s activation=%s", tuple(x.shape), activation
@@ -177,18 +188,17 @@ def act_mul_and_fp8_group_quant(
     assert N % 2 == 0
 
     N_half = N // 2
-    scaleN = triton.cdiv(N, group_size)
+    scaleN = triton.cdiv(N_half, group_size)
     x_fp8 = torch.empty((M, N_half), dtype=dtype_quant, device=x.device)
-    out_bs = torch.empty(
-        (M, triton.cdiv(N_half, group_size)), dtype=torch.float32, device=x.device
-    )
+    out_bs = torch.empty((M, scaleN), dtype=torch.float32, device=x.device)
 
     DTYPE_MAX = (
         torch.finfo(x_fp8.dtype).max
         if torch.is_floating_point(x_fp8)
         else torch.iinfo(x_fp8.dtype).max
     )
-    BLOCK_SIZE_N = group_size
+    config = _get_act_mul_and_fp8_group_quant_config(M) or {}
+    BLOCK_SIZE_N = max(config.pop("BLOCK_SIZE_N", group_size), group_size)
 
     grid = (
         M,
@@ -208,9 +218,10 @@ def act_mul_and_fp8_group_quant(
         QUANT_BLOCK_SIZE=group_size,
         DTYPE_MAX=DTYPE_MAX,
         DTYPE_MIN=-DTYPE_MAX,
-        # num_warps=NUM_WARPS,
-        # waves_per_eu=0,
-        # num_stages=1,
+        NUM_WARPS=config.get("num_warps"),
+        WAVES_PER_EU=config.get("waves_per_eu"),
+        NUM_STAGES=config.get("num_stages"),
+        **config,
     )
 
     return x_fp8, out_bs
