@@ -6,6 +6,7 @@
 # ------------------------------------------------------------------------------
 
 # Python standard library
+import functools
 import warnings
 
 # PyTorch
@@ -22,6 +23,8 @@ from aiter.ops.triton._triton_kernels.gemm.grouped.gmm import (
     tgmm_non_persistent_kernel,
     tgmm_persistent_kernel,
 )
+from aiter.ops.triton.utils._triton.arch_info import get_arch
+from aiter.ops.triton.utils.config_utils import load_config_json, resolve_config_dir
 from aiter.ops.triton.utils.device_info import get_num_sms, get_num_xcds
 
 # AITER: GMM utility functions
@@ -41,6 +44,19 @@ from aiter.ops.triton.utils.gmm_common import (
 
 # GMM PyTorch wrapper.
 # ------------------------------------------------------------------------------
+
+_GLUON_SUPPORTED_ARCHS = (
+    "gfx1250",
+    "gfx1250-strict",
+)
+
+
+def _is_gluon_available():
+    """Check if the gluon backend is available for the current GPU architecture."""
+    try:
+        return any(supported in get_arch() for supported in _GLUON_SUPPORTED_ARCHS)
+    except Exception:  # noqa: BLE001
+        return False
 
 
 # Per-(device, stream) cache for the work stealing tile counter. A single `int32`
@@ -108,6 +124,75 @@ def _gmm_grid(
     return (num_programs,)
 
 
+@functools.lru_cache
+def _get_gluon_gmm_config(M: int, K: int, N: int, G: int) -> dict[str, int]:
+    cfg_dir = resolve_config_dir("gemm", "grouped", backend="gluon")
+    gmm_cfgs = load_config_json(f"{cfg_dir}/DEFAULT.json")["gmm"]
+    # Rows are averaged over groups: group_sizes is on device, reading it would sync.
+    for rule in gmm_cfgs.get("dispatch", []):
+        if K >= rule.get("min_K", 0) and M >= rule["min_avg_rows_per_group"] * G:
+            return gmm_cfgs[rule["config"]]
+    return gmm_cfgs["default"]
+
+
+def _gmm_gluon(lhs, rhs, group_sizes, bias, out, trans_rhs, config):
+    from aiter.ops.triton._gluon_kernels.gfx1250.gemm.grouped.gmm import (
+        _gmm_gfx1250_kernel,
+        create_shared_layouts,
+        create_wmma_layouts,
+    )
+
+    M, K = lhs.shape
+    G = group_sizes.shape[0]
+    N = out.shape[1]
+    cfg = dict(_get_gluon_gmm_config(M, K, N, G))
+    if config:
+        cfg.update(config)
+    BM, BN, BK = cfg["BLOCK_M"], cfg["BLOCK_N"], cfg["BLOCK_K"]
+    num_buffers = max(1, min(cfg["NUM_BUFFERS"], triton.cdiv(K, BK)))
+
+    layout = "TN" if trans_rhs else "TT"
+    if trans_rhs:
+        stride_bk, stride_bn = 1, K
+    else:
+        stride_bk, stride_bn = N, 1
+
+    num_warps = cfg["num_warps"]
+    wmma_layout, operand_a, operand_b = create_wmma_layouts(num_warps)
+    shared_a, shared_b = create_shared_layouts(
+        BM, BN, BK, layout, lhs.element_size() * 8
+    )
+    # Upper bound on the number of tiles; surplus programs exit immediately.
+    grid = ((triton.cdiv(M, BM) + G) * triton.cdiv(N, BN),)
+
+    _gmm_gfx1250_kernel[grid](
+        lhs,
+        rhs,
+        out,
+        bias,
+        group_sizes,
+        N,
+        K,
+        stride_bk,
+        stride_bn,
+        G=G,
+        BLOCK_M=BM,
+        BLOCK_N=BN,
+        BLOCK_K=BK,
+        NUM_BUFFERS=num_buffers,
+        LAYOUT=layout,
+        SHARED_LAYOUT_A=shared_a,
+        SHARED_LAYOUT_B=shared_b,
+        WMMA_LAYOUT=wmma_layout,
+        OPERAND_LAYOUT_A=operand_a,
+        OPERAND_LAYOUT_B=operand_b,
+        ADD_BIAS=bias is not None,
+        num_warps=num_warps,
+        waves_per_eu=cfg["waves_per_eu"],
+    )
+    return out
+
+
 def gmm(
     lhs: Tensor,
     rhs: Tensor,
@@ -118,9 +203,13 @@ def gmm(
     work_stealing: bool = False,
     config: dict[str, int] | None = None,
     grid_dim: int | None = None,
+    backend: str = "triton",
 ) -> Tensor:
     """
     Perform Group Matrix Multiplication (GMM): out = lhs @ rhs + bias
+
+    backend="gluon" (gfx1250 only, no work stealing, no grid_dim) runs a TDM/WMMA Gluon kernel;
+    `config` then takes BLOCK_M/BLOCK_N/BLOCK_K/NUM_BUFFERS/num_warps/waves_per_eu.
 
     lhs rows are divided into G groups. Each group of lhs rows is matrix multiplied with a plane of
     rhs 3D tensor and then stored in a slice of out. In PyTorch parlance, it can be implemented as
@@ -220,6 +309,17 @@ def gmm(
     )
 
     trans_rhs, _ = get_gmm_transposition(lhs, rhs, out)
+
+    if backend == "gluon":
+        assert (
+            _is_gluon_available()
+        ), f"Gluon backend requires one of {_GLUON_SUPPORTED_ARCHS}, got '{get_arch()}'"
+        assert not work_stealing, "Gluon GMM does not support work stealing."
+        assert (
+            grid_dim is None
+        ), "Gluon GMM launches one program per tile and does not support grid_dim."
+        return _gmm_gluon(lhs, rhs, group_sizes, bias, out, trans_rhs, config)
+    assert backend == "triton", f"Unknown GMM backend {backend}."
 
     if config is None:
         config = get_config("gmm", M, K, N, G)

@@ -1,0 +1,50 @@
+{
+    "gmm": {
+        "default": {
+            "BLOCK_M": 32,
+            "BLOCK_N": 128,
+            "BLOCK_K": 64,
+            "NUM_BUFFERS": 3,
+            "num_warps": 4,
+            "waves_per_eu": 0
+        },
+        "rows_ge_256": {
+            "BLOCK_M": 256,
+            "BLOCK_N": 256,
+            "BLOCK_K": 128,
+            "NUM_BUFFERS": 2,
+            "num_warps": 8,
+            "waves_per_eu": 0
+        },
+        "rows_ge_128": {
+            "BLOCK_M": 128,
+            "BLOCK_N": 128,
+            "BLOCK_K": 128,
+            "NUM_BUFFERS": 2,
+            "num_warps": 8,
+            "waves_per_eu": 0
+        },
+        "rows_ge_64_bigK": {
+            "BLOCK_M": 64,
+            "BLOCK_N": 128,
+            "BLOCK_K": 128,
+            "NUM_BUFFERS": 3,
+            "num_warps": 4,
+            "waves_per_eu": 0
+        },
+        "rows_ge_64": {
+            "BLOCK_M": 64,
+            "BLOCK_N": 128,
+            "BLOCK_K": 64,
+            "NUM_BUFFERS": 3,
+            "num_warps": 4,
+            "waves_per_eu": 0
+        },
+        "dispatch": [
+            {"min_avg_rows_per_group": 256, "config": "rows_ge_256"},
+            {"min_avg_rows_per_group": 128, "config": "rows_ge_128"},
+            {"min_avg_rows_per_group": 64, "min_K": 4096, "config": "rows_ge_64_bigK"},
+            {"min_avg_rows_per_group": 64, "config": "rows_ge_64"}
+        ]
+    }
+}
