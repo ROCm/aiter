@@ -313,6 +313,16 @@ jobs:
             --start "${PREBUILD_START}" \
             --end "${PREBUILD_END}"
 
+      - name: Upload failed prebuild log
+        if: ${{ failure() && matrix.build_enabled && steps.restore_aiter_wheel.outputs.cache-hit != 'true' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: aiter-prebuild-log-py${{ matrix.python_version }}-attempt${{ github.run_attempt }}
+          path: .aiter-prebuild.log
+          if-no-files-found: warn
+          compression-level: 6
+          retention-days: 7
+
       - name: Verify prebuilt kernels in wheel
         if: ${{ matrix.build_enabled && steps.restore_aiter_wheel.outputs.cache-hit != 'true' }}
         run: |

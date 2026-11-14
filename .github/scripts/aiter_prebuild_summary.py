@@ -10,6 +10,12 @@ import re
 from pathlib import Path
 
 FINISH_RE = re.compile(r"finish build \[([^\]]+)\], cost ([0-9.]+)s")
+ANSI_RE = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
+FAILURE_RE = re.compile(
+    r"^FAILED:|\b(?:fatal )?error:|LLVM ERROR:|ninja: build stopped:|"
+    r"No space left on device|^Killed(?:\s|$)|"
+    r"^(?:[\w.]*Error|subprocess\.CalledProcessError):"
+)
 
 
 def parse_module_costs(log_path: Path) -> list[tuple[str, float]]:
@@ -23,6 +29,28 @@ def parse_module_costs(log_path: Path) -> list[tuple[str, float]]:
     except OSError as exc:
         print(f"::warning::Unable to read prebuild log {log_path}: {exc}")
     return module_costs
+
+
+def parse_failure_diagnostics(log_path: Path, limit: int = 8) -> list[str]:
+    diagnostics: list[str] = []
+    seen: set[str] = set()
+    try:
+        with log_path.open(encoding="utf-8", errors="replace") as log:
+            for line in log:
+                line = ANSI_RE.sub("", line).strip()
+                if not FAILURE_RE.search(line) or line in seen:
+                    continue
+                seen.add(line)
+                diagnostics.append(line[:1200])
+                if len(diagnostics) >= limit:
+                    break
+    except OSError as exc:
+        print(f"::warning::Unable to read prebuild diagnostics {log_path}: {exc}")
+    return diagnostics
+
+
+def escape_annotation(message: str) -> str:
+    return message.replace("%", "%25").replace("\r", "%0D").replace("\n", "%0A")
 
 
 def parse_args() -> argparse.Namespace:
@@ -80,6 +108,21 @@ def main() -> int:
             print(f"  {name}: {cost:.1f}")
     else:
         print("::warning::No module build cost lines were found in the prebuild log")
+
+    if args.build_status != 0:
+        diagnostics = parse_failure_diagnostics(args.log)
+        if not diagnostics:
+            diagnostics = [
+                (
+                    f"setup.py exited with code {args.build_status}; "
+                    "no compiler diagnostic was found. See the prebuild log artifact."
+                )
+            ]
+        print("Prebuild failure diagnostics:")
+        for diagnostic in diagnostics:
+            print(
+                "::error title=Aiter prebuild failure::" + escape_annotation(diagnostic)
+            )
 
     return 0
 
