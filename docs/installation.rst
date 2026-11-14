@@ -79,7 +79,8 @@ Environment Variables
      - Target GPU architecture(s), semicolon-separated. Use ``native`` to auto-detect.
      - ``native``
    * - ``PREBUILD_KERNELS``
-     - ``0`` = JIT only, ``1`` = core kernels, ``2`` = inference kernels, ``3`` = MHA only
+     - ``0`` = JIT only, ``1`` = core kernels, ``2`` = inference kernels, ``3`` = MHA only,
+       ``4`` = all non-tuning modules (variants outside the tuned configs still JIT)
      - ``0``
    * - ``AITER_MAX_JOBS``
      - Optional worker ceiling, bounded by live CPU/memory limits for
