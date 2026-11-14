@@ -229,6 +229,12 @@ def gemm_afp4wfp4_(
             config["BLOCK_SIZE_K"] = triton.next_power_of_2(2 * K)
             config["SPLITK_BLOCK_SIZE"] = 2 * K
             config["NUM_KSPLIT"] = 1
+        # A BLOCK_SIZE_K that does not divide K leaves a masked K tail in the pipelined
+        # loop, whose async copies to LDS race on gfx950 (Triton 3.8): wrong, timing-
+        # dependent results. Halve it until it divides K.
+        elif config["NUM_KSPLIT"] == 1:
+            while config["BLOCK_SIZE_K"] > 256 and K % (config["BLOCK_SIZE_K"] // 2):
+                config["BLOCK_SIZE_K"] //= 2
         config["BLOCK_SIZE_K"] = max(config["BLOCK_SIZE_K"], 128)
 
     return_y_pp = config["NUM_KSPLIT"] > 1 and skip_reduce
