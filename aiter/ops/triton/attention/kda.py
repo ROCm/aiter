@@ -6,6 +6,9 @@ import logging
 import torch
 import triton
 
+from aiter.ops.triton.attention.kda_atom import (  # noqa: F401
+    fused_sigmoid_gating_delta_rule_update,
+)
 from aiter.ops.triton.utils._triton import arch_info
 from aiter.ops.triton.utils.logger import AiterTritonLogger
 
@@ -21,6 +24,7 @@ if _ARCH in ("gfx1250", "gfx1250-strict"):
         fused_recurrent_kda_packed_decode_kernel,
         get_kda_config,
     )
+    from aiter.ops.triton.attention.kda_one_token import try_kda_one_token_decode
 elif _ARCH == "gfx950":
     from aiter.ops.triton._gluon_kernels.gfx950.attention.kda_decode import (
         fused_recurrent_kda_packed_decode_kernel,
@@ -59,11 +63,18 @@ def fused_recurrent_kda(
     out_gate: torch.Tensor | None = None,
     norm_weight: torch.Tensor | None = None,
     norm_eps: float = 1e-5,
+    ssm_state_indices_in: torch.Tensor | None = None,
+    atom_slots: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor | None]:
     """Fused recurrent Kimi Delta Attention (KDA), gfx950/gfx1250 Gluon decode path.
 
     Per token: S = exp(g_t) * S, then S += beta_t * k_t (x) (v_t - S^T k_t),
     then o_t = S^T q_t. Requires triton >= 3.6.0 on gfx1250.
+
+    The one-token path supports paged decode with 12 heads, K=V=128, one token
+    per sequence, BF16 inputs, FP32 state, int32 indices, fused q/k
+    normalization, fused gate and beta sigmoid, and lower_bound=-5. Other calls
+    use the generic path.
 
     Args:
         q: [B, T, H, K] queries
@@ -99,9 +110,20 @@ def fused_recurrent_kda(
             full slab only for a sequence's first token, then compact
             (a, k, err) records per token for replay after verification.
         pad_slot_guard: paged only: state slots <= 0 mark padded sequences
+        ssm_state_indices_in: read-side slot table. Same shape and stride as
+            ``ssm_state_indices``. None reads the write table. A distinct
+            tensor loads the initial state from those slots and stores each
+            token into ``ssm_state_indices``.
+        atom_slots: negative read slots leave the output and state untouched,
+            and negative write slots still write the output. Slot 0 is valid.
+            Requires gfx1250. ``pad_slot_guard`` remains the separate ``<= 0``
+            contract and is not a substitute.
         config: tuning dict (BV, SK, num_warps, num_buffers, use_tdm_store,
-            use_tdm_load, use_tdm_fused_load); None resolves a tuned bucket
-            from ``configs/<arch>/gluon/attention/kda_decode/DEFAULT.json``,
+            use_tdm_load, use_tdm_fused_load, use_one_token_decode, CH).
+            None selects the one-token kernel for supported gfx1250 decode inputs.
+            An explicit config keeps the generic path unless
+            ``use_one_token_decode`` is set. The generic path resolves a tuned
+            bucket from ``configs/<arch>/gluon/attention/kda_decode/DEFAULT.json``,
             and omitted keys inherit the resolved bucket's published values.
 
     Returns:
@@ -111,6 +133,57 @@ def fused_recurrent_kda(
         neither ``output_final_state`` nor ``inplace_final_state`` is set.
         A fresh state uses initial_state's dtype, or fp32 without initial_state.
     """
+
+    if (atom_slots or ssm_state_indices_in is not None) and _ARCH not in (
+        "gfx1250",
+        "gfx1250-strict",
+    ):
+        raise NotImplementedError("separate KDA read/write slots require gfx1250")
+    if ssm_state_indices_in is not None:
+        if ssm_state_indices is None:
+            raise ValueError("ssm_state_indices_in requires ssm_state_indices")
+        if (
+            ssm_state_indices_in.shape != ssm_state_indices.shape
+            or ssm_state_indices_in.stride() != ssm_state_indices.stride()
+            or ssm_state_indices_in.dtype != ssm_state_indices.dtype
+            or ssm_state_indices_in.device != ssm_state_indices.device
+        ):
+            raise ValueError(
+                "ssm_state_indices_in must match ssm_state_indices in "
+                "shape, stride, dtype, and device"
+            )
+
+    if _ARCH in ("gfx1250", "gfx1250-strict"):
+        result = try_kda_one_token_decode(
+            q,
+            k,
+            v,
+            g,
+            beta,
+            A_log,
+            dt_bias,
+            initial_state,
+            cu_seqlens,
+            ssm_state_indices,
+            out,
+            ssm_state_indices_in=ssm_state_indices_in,
+            config=config,
+            state_v_first=state_v_first,
+            inplace_final_state=inplace_final_state,
+            num_accepted_tokens=num_accepted_tokens,
+            cache_state_updates=cache_state_updates,
+            pad_slot_guard=pad_slot_guard,
+            conv_state=conv_state,
+            out_gate=out_gate,
+            use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
+            use_gate_in_kernel=use_gate_in_kernel,
+            use_beta_sigmoid_in_kernel=use_beta_sigmoid_in_kernel,
+            allow_neg_eigval=allow_neg_eigval,
+            lower_bound=lower_bound,
+            scale=scale,
+        )
+        if result is not None:
+            return result, initial_state
 
     if fused_recurrent_kda_packed_decode_kernel is None:
         raise RuntimeError(f"kda gluon decode requires gfx950/gfx1250 (found {_ARCH})")
@@ -205,7 +278,13 @@ def fused_recurrent_kda(
     )
     bucket_T = max(avg_T, 2) if bf16_resident else avg_T
     config = get_kda_config(
-        bucket_T, N, HV, K, V, overrides=config, fused=use_conv or use_rms_gate
+        bucket_T,
+        N,
+        HV,
+        K,
+        V,
+        overrides=config,
+        fused=use_conv or use_rms_gate,
     )
     BV = config["BV"]
     SK = config["SK"]
@@ -338,6 +417,22 @@ def fused_recurrent_kda(
         )
 
     grid = (triton.cdiv(V, BV) * N * HV,)
+    split_index = (
+        ssm_state_indices is not None
+        and ssm_state_indices_in is not None
+        and ssm_state_indices_in.data_ptr() != ssm_state_indices.data_ptr()
+    )
+    packed_slots = {}
+    if _ARCH in ("gfx1250", "gfx1250-strict"):
+        packed_slots = {
+            "state_indices_in_ptr": (
+                ssm_state_indices
+                if ssm_state_indices_in is None
+                else ssm_state_indices_in
+            ),
+            "ATOM_SLOTS": atom_slots,
+            "SPLIT_INDEX": split_index,
+        }
     fused_recurrent_kda_packed_decode_kernel[grid](
         q_ptr=q,
         k_ptr=k,
@@ -414,6 +509,7 @@ def fused_recurrent_kda(
             if sched_strategy
             else {}
         ),
+        **packed_slots,
     )
     return out, final_state
 
