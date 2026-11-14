@@ -28,10 +28,31 @@
       "BLOCK_M": 128,
       "BLOCK_N": 64,
       "PRELOAD_V": true,
+      "waves_per_eu": 1,
+      "num_warps": 2,
+      "num_stages": 3
+    },
+    "mid_head_noncausal": {
+      "BLOCK_M": 256,
+      "BLOCK_N": 64,
+      "PRELOAD_V": true,
+      "waves_per_eu": 1,
+      "num_warps": 4,
+      "num_stages": 3
+    },
+    "mid_head_short": {
+      "BLOCK_M": 128,
+      "BLOCK_N": 64,
+      "PRELOAD_V": true,
       "waves_per_eu": 2,
       "num_warps": 4,
       "num_stages": 3
     },
+    "mid_head_skip": [
+      {"causal": true, "max_seqlen_k": 4096, "config": "mid_head_short"},
+      {"causal": false, "max_seqlen_k": 2048, "config": "mid_head_short"},
+      {"causal": false, "config": "mid_head_noncausal"}
+    ],
     "pe": {
       "BLOCK_M": 128,
       "BLOCK_N": 32,

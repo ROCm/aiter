@@ -972,8 +972,9 @@ def _get_config(
         and "mid_head" in fwd_cfg
     ):
         # 128x128 tiles run out of LDS above d128, so larger heads keep "default".
-        # "mid_head_skip" rules send short-KV, large-grid shapes back to
-        # "default"; a rule matches when every key it sets is satisfied.
+        # "mid_head_skip" rules send short-KV, large-grid shapes to the fwd
+        # config named by the rule's "config" key ("default" if unset). A rule
+        # matches when every key it sets is satisfied.
         if None not in (max_seqlen_q, max_seqlen_k, batch_heads):
             programs = batch_heads * triton.cdiv(
                 max_seqlen_q, fwd_cfg["mid_head"]["BLOCK_M"]
@@ -985,7 +986,7 @@ def _get_config(
                     and max_seqlen_k <= rule.get("max_seqlen_k", max_seqlen_k)
                     and programs >= rule.get("min_programs", 0)
                 ):
-                    return fwd_cfg["default"]
+                    return fwd_cfg[rule.get("config", "default")]
         return fwd_cfg["mid_head"]
     else:
         return fwd_cfg["default"]

@@ -1236,3 +1236,44 @@ def test_mha_fwd_mid_head_selection(
         batch_heads=batch_heads,
     )
     assert cfg == fwd_cfg[expected]
+
+
+@pytest.mark.parametrize(
+    "causal, head_dim_v, seqlen_q, seqlen_k, batch_heads, expected",
+    [
+        (True, 128, None, None, None, "mid_head"),  # no shape info
+        (True, 128, 4096, 4096, 32, "mid_head_short"),  # causal, at boundary
+        (True, 128, 4097, 4097, 32, "mid_head"),  # causal, one token over
+        (True, 96, 16384, 16384, 32, "mid_head"),
+        (False, 128, 2048, 2048, 32, "mid_head_short"),  # non-causal, at boundary
+        (False, 128, 2049, 2049, 32, "mid_head_noncausal"),
+        (False, 96, 16384, 16384, 32, "mid_head_noncausal"),
+        (True, 64, 16384, 16384, 32, "small_head"),  # outside mid_head range
+        (True, 160, 16384, 16384, 32, "default"),
+    ],
+)
+def test_mha_fwd_mid_head_selection_gfx1250(
+    causal, head_dim_v, seqlen_q, seqlen_k, batch_heads, expected
+):
+    from aiter.ops.triton._triton_kernels.attention.mha import _get_config
+    from aiter.ops.triton.utils._triton.arch_info import get_arch
+    from aiter.ops.triton.utils.config_utils import (
+        load_config_json,
+        resolve_config_dir,
+    )
+
+    if get_arch() != "gfx1250":
+        pytest.skip("gfx1250 mid_head routing")
+    fwd_cfg = load_config_json(
+        f"{resolve_config_dir('attention', 'MHA', backend='triton')}/DEFAULT.json"
+    )["fwd"]
+    cfg = _get_config(
+        False,
+        torch.bfloat16,
+        head_dim_v=head_dim_v,
+        causal=causal,
+        max_seqlen_q=seqlen_q,
+        max_seqlen_k=seqlen_k,
+        batch_heads=batch_heads,
+    )
+    assert cfg == fwd_cfg[expected]
