@@ -53,6 +53,7 @@ _LAZY_IMPORTS = {
         ".kernels.mqa_logits.pa_mqa_logits_fp4_prefill",
         "compute_varqlen_windows",
     ),
+    "flydsl_attn_res": (".kernels.attn_res", "flydsl_attn_res"),
     "a16wfp4_shape_supported": (
         ".gemm_a16wfp4",
         "a16wfp4_shape_supported",
@@ -219,6 +220,7 @@ __all__ = [
     "dcp_lse_combine",
     "dcp_quant_query_gather",
     "dcp_query_gather",
+    "flydsl_attn_res",
     "flydsl_conv_implicit",
     "flydsl_flash_attn_fp8_func",
     "flydsl_flash_attn_fp8_supported",
