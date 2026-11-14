@@ -366,6 +366,56 @@ class TestConfigShapeCollision(unittest.TestCase):
         self.assertIsNotNone(err, "256 and 256.0 were not seen as one shape")
         self.assertIn("duplicate shape", err.lower())
 
+    def test_merge_keys_tag_as_live_or_fallback(self):
+        """Lookups skip flydsl_fallback rows and serve every other row whatever
+        its _tag, so two live rows for one shape collide even when their labels
+        differ: here a label against the 0 the merge fills into a table without
+        the column. A fallback row may sit beside the live one. The lookup
+        compares the label exactly, so a padded "flydsl_fallback " is live."""
+        model = "gfx,cu_num,M,N,K,us\ngfx950,256,1,64,128,20.0\n"
+        for tag, collides in (
+            ("fused_expert", True),
+            ("flydsl_fallback", False),
+            ("flydsl_fallback ", True),
+        ):
+            with self.subTest(tag=tag):
+                err, _, _, _ = self._merge_synthetic(
+                    f"gfx,cu_num,M,N,K,us,_tag\ngfx950,256,1,64,128,10.0,{tag}\n",
+                    model,
+                )
+                if collides:
+                    self.assertIn("duplicate shape", (err or "").lower())
+                else:
+                    self.assertIsNone(err, err)
+
+    def test_merge_refuses_power_row_against_latency_row_keyed_differently(self):
+        """A power row and a latency row for one shape are never ranked against
+        each other, however the two tables write the key: the merge names the
+        conflict and keeps both sources as they are. Grouped on the raw cells, the
+        rows would fall into separate groups on a label or on 256 against 256.0,
+        and the slower one would be deleted from its source."""
+        tagged = (
+            "gfx,cu_num,M,N,K,us,select,_tag\n"
+            "gfx950,256,1,64,128,10.0,power,fused_expert\n"
+        )
+        untagged = "gfx,cu_num,M,N,K,us,select\ngfx950,256,1,64,128,10.0,power\n"
+        for case, canonical, latency_cu in (
+            ("another tag", tagged, "256"),
+            ("another tag and spelling", tagged, "256.0"),
+            ("another spelling", untagged, "256.0"),
+        ):
+            with self.subTest(case=case):
+                model = f"gfx,cu_num,M,N,K,us\ngfx950,{latency_cu},1,64,128,20.0\n"
+                err, _, canonical_after, model_after = self._merge_synthetic(
+                    canonical, model
+                )
+                self.assertIn(
+                    "a power-tuned row and a latency row share a shape", err or ""
+                )
+                self.assertIn("No config file was rewritten", err or "")
+                self.assertEqual(canonical_after, canonical)
+                self.assertEqual(model_after, model)
+
     def test_dedup_keeps_lowest_us_despite_unparseable_cell(self):
         """A written us that is not a number, here nan on an unrelated row, must
         not turn the lowest-us pick into a text sort, which keeps 10.5 over 9.5
