@@ -6,7 +6,7 @@
 // GPU kernels for generalized top-k paths. Include AFTER block_select_lds / block_gather_topk
 // are visible in the translation unit.
 
-template <bool RAGGED, bool WRITE_VALUES, bool NAN_HIGH = false>
+template <bool RAGGED, bool WRITE_VALUES, bool NAN_HIGH = false, bool STABLE = false>
 __global__ void phase_small_n_topk(const float* __restrict__ input,
                                    int pitch,
                                    RowExtents<RAGGED> extents,
@@ -61,7 +61,17 @@ __global__ void phase_small_n_topk(const float* __restrict__ input,
         s_weq = 0;
     }
     __syncthreads();
-    if constexpr(RAGGED)
+    if constexpr(STABLE)
+    {
+        block_gather_in_order<WRITE_VALUES, NAN_HIGH>(
+            len, row_start, pivot, k_out - eq_needed, eq_needed, out, val, s_mm, [&](int j) {
+                return opus::u32x4_t{s_keys[j * FP32_EPT + 0],
+                                     s_keys[j * FP32_EPT + 1],
+                                     s_keys[j * FP32_EPT + 2],
+                                     s_keys[j * FP32_EPT + 3]};
+            });
+    }
+    else if constexpr(RAGGED)
     {
         block_gather_topk<WRITE_VALUES>(
             len,
@@ -426,7 +436,65 @@ __global__ void phase_b_filter_coop(const float* __restrict__ input,
 #endif
 }
 
-template <bool RAGGED, bool WRITE_VALUES, bool REUSE_WIDE = false, bool NAN_HIGH = false>
+// LDS words of a stable phase_c launch's own: the bitmaps' (block_gather_by_column)
+// for k past the direct ranking, and the list's (stable_list_words) for k past
+// s_hist's half, in one region. A grid of at most one block per CU has LDS to
+// spare, so its bitmaps take the wider window where that still fits: half the
+// windows. The host sizes the launch from these and the kernel carves from
+// them, so the two cannot disagree.
+__host__ __device__ inline int
+stable_bm_words(int M, int K, int cap, bool keys_only, int nwide, bool reuse_wide)
+{
+    if(K <= STABLE_RANK_DIRECT)
+        return 0;
+    const int held = PHASE_C_STATIC_LDS + cap * (keys_only ? 4 : 8) +
+                     wide_buffer_count(nwide, reuse_wide) * WIDE_WORDS * 4;
+    const int wide = 3 * STABLE_BM_WORDS_WIDE > cap ? 3 * STABLE_BM_WORDS_WIDE : cap;
+    if(M <= CU_COUNT && held + 4 * wide <= LDS_BYTES_PER_CU)
+        return STABLE_BM_WORDS_WIDE;
+    return STABLE_BM_WORDS;
+}
+
+__host__ __device__ inline int
+stable_region_words(int M, int K, int cap, bool keys_only, int nwide, bool reuse_wide)
+{
+    const int bm   = 3 * stable_bm_words(M, K, cap, keys_only, nwide, reuse_wide);
+    const int list = stable_list_words(K, cap);
+    return bm > list ? bm : list;
+}
+
+// A stable launch of more than one block a CU goes without the region, so that
+// stable phase_c holds the LDS the default one does and keeps as many blocks
+// resident: at M=257, 131072 columns, k=2048 the region left one block a CU,
+// and the call 1.21x the default one; bare, 1.09x. The windowed emit's bitmaps
+// then go in the candidate arrays and in the wide-select buffers past a list of
+// cap entries; a launch is bare only where those waves take every row's
+// windows. The host sizes the launch from this and the kernel carves from it.
+__host__ __device__ inline int stable_win_bare_list(int cap) { return (cap + 3) & ~3; }
+__host__ __device__ inline int
+stable_win_bare_waves(int cap, bool keys_only, int nwide, bool reuse_wide, int nwaves)
+{
+    const int per  = 3 * STABLE_WIN_WORDS;
+    const int wide = wide_buffer_count(nwide, reuse_wide) * WIDE_WORDS;
+    if(wide < stable_win_bare_list(cap))
+        return 0;
+    const int n = (keys_only ? cap : 2 * cap) / per + (wide - stable_win_bare_list(cap)) / per;
+    return n < nwaves ? n : nwaves;
+}
+__host__ __device__ inline bool stable_win_bare(
+    int M, int pitch, int K, int cap, bool keys_only, int nwide, bool reuse_wide, int nwaves)
+{
+    const int nww  = stable_win_bare_waves(cap, keys_only, nwide, reuse_wide, nwaves);
+    const int nwin = stable_win_count(pitch);
+    return M > CU_COUNT && nww > 0 && nwin <= STABLE_WIN_MAX &&
+           nwin <= stable_win_per_wave(K) * nww;
+}
+
+template <bool RAGGED,
+          bool WRITE_VALUES,
+          bool REUSE_WIDE = false,
+          bool NAN_HIGH   = false,
+          bool STABLE     = false>
 __global__ PHASE_C_OCCUPANCY void
 phase_c_select_contig(const float* __restrict__ input,
                       int pitch,
@@ -525,6 +593,7 @@ phase_c_select_contig(const float* __restrict__ input,
     // a candidate count the +inf threshold let through.
     int c          = (int)c_raw;
     bool fall_back = (RAGGED && len <= K) || c_raw < (unsigned)k_out || c_raw > (unsigned)cap;
+    [[maybe_unused]] bool from_collect = false;
     if(!fall_back)
     {
         read_cands(c);
@@ -562,44 +631,45 @@ phase_c_select_contig(const float* __restrict__ input,
         // multiple of FP32_EPT is read bounds-checked, or its last columns are lost.
         int got;
         if(!RAGGED && (len % FP32_EPT) != 0)
-            got = radix_fallback_row<true, WRITE_VALUES, NAN_HIGH>(rif0,
-                                                                   n4_cover(len),
-                                                                   len,
-                                                                   row_start,
-                                                                   k_out,
-                                                                   cap,
-                                                                   tmin,
-                                                                   cand_w,
-                                                                   out,
-                                                                   val,
-                                                                   s_hist,
-                                                                   s_dyn,
-                                                                   s_scan,
-                                                                   s_mm,
-                                                                   &s_wgt,
-                                                                   &s_weq);
+            got = radix_fallback_row<true, WRITE_VALUES, NAN_HIGH, STABLE>(rif0,
+                                                                           n4_cover(len),
+                                                                           len,
+                                                                           row_start,
+                                                                           k_out,
+                                                                           cap,
+                                                                           tmin,
+                                                                           cand_w,
+                                                                           out,
+                                                                           val,
+                                                                           s_hist,
+                                                                           s_dyn,
+                                                                           s_scan,
+                                                                           s_mm,
+                                                                           &s_wgt,
+                                                                           &s_weq);
         else
-            got = radix_fallback_row<RAGGED, WRITE_VALUES, NAN_HIGH>(rif0,
-                                                                     RAGGED ? n4_cover(len)
-                                                                            : pitch / FP32_EPT,
-                                                                     len,
-                                                                     row_start,
-                                                                     k_out,
-                                                                     cap,
-                                                                     tmin,
-                                                                     cand_w,
-                                                                     out,
-                                                                     val,
-                                                                     s_hist,
-                                                                     s_dyn,
-                                                                     s_scan,
-                                                                     s_mm,
-                                                                     &s_wgt,
-                                                                     &s_weq);
+            got = radix_fallback_row<RAGGED, WRITE_VALUES, NAN_HIGH, STABLE>(
+                rif0,
+                RAGGED ? n4_cover(len) : pitch / FP32_EPT,
+                len,
+                row_start,
+                k_out,
+                cap,
+                tmin,
+                cand_w,
+                out,
+                val,
+                s_hist,
+                s_dyn,
+                s_scan,
+                s_mm,
+                &s_wgt,
+                &s_weq);
         if(got < 0)
             return; // emitted; len > K here, so k_out == K and nothing to pad
         c = got;
         read_cands(c);
+        from_collect = true;
     }
 
     uint32_t pivot;
@@ -628,7 +698,137 @@ phase_c_select_contig(const float* __restrict__ input,
     }
     __syncthreads();
 
-    if(keys_only)
+    if constexpr(STABLE)
+    {
+        int ngt          = k_out - eq_needed;
+        const float* rif = input + (size_t)row * pitch + row_start;
+        // A NaN pivot under tie='low' takes the whole NaN class by column, and the
+        // collect pass kept only the band at and above the pivot's payload.
+        const bool whole_row = NAN_HIGH && from_collect && pivot >= NAN_ONE_KEY;
+        nan_one_remap<NAN_HIGH>(pivot, ngt, eq_needed);
+        auto stable_emit = [&](auto col_at) {
+            auto key_at        = [&](int i) { return s_keys_ext[i]; };
+            uint32_t* s_region = s_dyn + (keys_only ? cap : 2 * cap) +
+                                 wide_buffer_count(nwide, REUSE_WIDE) * WIDE_WORDS;
+            const int nw = stable_bm_words((int)gridDim.x, K, cap, keys_only, nwide, REUSE_WIDE);
+            const int nwaves = (int)blockDim.x / WAVE_SIZE;
+            const bool bare  = stable_win_bare(
+                (int)gridDim.x, pitch, K, cap, keys_only, nwide, REUSE_WIDE, nwaves);
+            {
+                // The windowed emit, its window counts in s_hist, done with since the
+                // select. Its bitmaps go in the candidate arrays, which its scatter reads
+                // for the last time, and the list in this region; or the bitmaps here and
+                // the list in the wide-select buffers, also done with: whichever gives
+                // more waves a bitmap. Without the region, see stable_win_bare.
+                const int cand_words = keys_only ? cap : 2 * cap;
+                const int wide_words = wide_buffer_count(nwide, REUSE_WIDE) * WIDE_WORDS;
+                const int per_wave   = 3 * STABLE_WIN_WORDS;
+                int nww              = 0;
+                int nww_first        = 0;
+                uint32_t* win_bm     = nullptr;
+                uint32_t* win_rest   = nullptr;
+                uint32_t* win_list   = nullptr;
+                if(bare)
+                {
+                    nww       = stable_win_bare_waves(cap, keys_only, nwide, REUSE_WIDE, nwaves);
+                    nww_first = min(nww, cand_words / per_wave);
+                    win_bm    = s_dyn;
+                    win_list  = s_wide;
+                    win_rest  = s_wide + stable_win_bare_list(cap);
+                }
+                else
+                {
+                    const int region_words =
+                        stable_region_words((int)gridDim.x, K, cap, keys_only, nwide, REUSE_WIDE);
+                    if(c <= region_words && min(nwaves, cand_words / per_wave) > nww)
+                    {
+                        nww      = min(nwaves, cand_words / per_wave);
+                        win_bm   = s_dyn;
+                        win_list = s_region;
+                    }
+                    if(c <= wide_words && min(nwaves, region_words / per_wave) > nww)
+                    {
+                        nww      = min(nwaves, region_words / per_wave);
+                        win_bm   = s_region;
+                        win_list = s_wide;
+                    }
+                    nww_first = nww;
+                }
+                const int nwin = stable_win_count(len);
+                if(nw > 0 && nww > 0 && nwin <= STABLE_WIN_MAX &&
+                   nwin <= stable_win_per_wave(K) * nww)
+                {
+                    block_gather_by_window<WRITE_VALUES, NAN_HIGH>(c,
+                                                                   len,
+                                                                   nww,
+                                                                   nww_first,
+                                                                   row_start,
+                                                                   pivot,
+                                                                   eq_needed,
+                                                                   out,
+                                                                   val,
+                                                                   rif,
+                                                                   s_keys_ext,
+                                                                   win_bm,
+                                                                   win_rest,
+                                                                   win_list,
+                                                                   s_hist,
+                                                                   col_at);
+                    return;
+                }
+            }
+            // In 64 bits: len + a window's columns overflows an int near INT32_MAX.
+            if(!bare && nw > 0 && (int64_t)len <= (int64_t)STABLE_BM_MAX_WINDOWS * 32 * nw)
+            {
+                block_gather_by_column<WRITE_VALUES, NAN_HIGH>(c,
+                                                               len,
+                                                               row_start,
+                                                               pivot,
+                                                               eq_needed,
+                                                               out,
+                                                               val,
+                                                               s_region,
+                                                               nw,
+                                                               s_mm,
+                                                               key_at,
+                                                               col_at);
+                return;
+            }
+            const int lw       = bare ? 0 : stable_list_words(K, cap);
+            uint32_t* s_list   = lw > 0 ? s_region : s_hist;
+            const int list_cap = lw > 0 ? lw : HIST_SLOTS;
+            stable_collect<NAN_HIGH>(c, pivot, s_list, list_cap, &s_wgt, &s_weq, key_at, col_at);
+            const int p     = (int)s_wgt;
+            const int e_all = (int)s_weq;
+            if(p <= list_cap)
+            {
+                stable_sort_place<WRITE_VALUES>(
+                    s_list, p, p, e_all, eq_needed, row_start, rif, out, val, s_mm);
+                return;
+            }
+            // Only s_hist's list overflows, on a long tie at the pivot: sort the
+            // candidates themselves, each key rewritten in place as its entry.
+            for(int i = threadIdx.x; i < c; i += blockDim.x)
+            {
+                const uint32_t k = nan_one_key<NAN_HIGH>(key_at(i));
+                s_keys_ext[i] =
+                    k >= pivot ? ((uint32_t)col_at(i) << 1) | (k == pivot ? 1u : 0u) : STABLE_NONE;
+            }
+            __syncthreads();
+            stable_sort_place<WRITE_VALUES>(
+                s_keys_ext, c, p, e_all, eq_needed, row_start, rif, out, val, s_mm);
+        };
+        if(whole_row)
+            block_gather_in_order<WRITE_VALUES, NAN_HIGH, true>(
+                len, row_start, pivot, ngt, eq_needed, out, val, s_mm, [&](int j) {
+                    return row_keys4<NAN_HIGH>(rif, j, len);
+                });
+        else if(keys_only)
+            stable_emit([&](int i) { return (int)(uint32_t)(base[i] & 0xFFFFFFFFull); });
+        else
+            stable_emit([&](int i) { return s_idx[i]; });
+    }
+    else if(keys_only)
     {
         block_gather_topk<WRITE_VALUES>(
             c,
