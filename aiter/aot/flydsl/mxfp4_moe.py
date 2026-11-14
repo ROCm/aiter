@@ -531,18 +531,23 @@ def _compile_v2_stage2(job):
     if job["epilog"] == "reduce":
         from aiter.ops.flydsl.moe_kernels import _run_moe_reduction
 
-        _run_moe_reduction(
-            target,
-            out,
-            job["BM"],
-            job["topk"],
-            job["N_OUT"],
-            expert_mask=None,
-            topk_ids=None,
-            stream=0,
-            is_fp8=is_fp8_route_out,
-            topk_weights=d if is_fp8_route_out else None,
-        )
+        # The runtime switches FP8 route reductions to streaming loads by
+        # buffer size, so RUN_ONLY needs both variants.
+        streaming_variants = (False, True) if is_fp8_route_out else (False,)
+        for streaming_loads in streaming_variants:
+            _run_moe_reduction(
+                target,
+                out,
+                job["BM"],
+                job["topk"],
+                job["N_OUT"],
+                expert_mask=None,
+                topk_ids=None,
+                stream=0,
+                is_fp8=is_fp8_route_out,
+                topk_weights=d if is_fp8_route_out else None,
+                streaming_loads=streaming_loads,
+            )
 
 
 def compile_one_config(**job):

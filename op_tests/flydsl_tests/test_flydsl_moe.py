@@ -557,6 +557,63 @@ def test_flydsl_stage2_fp8_ep_reduction():
     torch.testing.assert_close(out, torch.full_like(out, 3.0))
 
 
+def test_stage2_fp8_reduce_streaming_threshold(monkeypatch):
+    import aiter.fused_moe as fm
+    from aiter.ops.flydsl.kernels.mxfp4_gemm_common import fp8out_row_bytes
+
+    monkeypatch.setattr(fm, "_STAGE2_FP8_REDUCE_STREAMING_MIN_MIB", 192)
+    limit = 192 * 2**20
+    assert not fm._use_streaming_reduce_loads(limit, True)
+    assert fm._use_streaming_reduce_loads(limit + 1, True)
+    assert not fm._use_streaming_reduce_loads(16 * limit, False)
+
+    # Kimi-K3 MoE (hidden 3584, top-16): streaming loads measured as a loss at
+    # 2048 tokens and as a gain from 4096 tokens.
+    k3_route_bytes_per_token = 16 * fp8out_row_bytes(3584)
+    assert not fm._use_streaming_reduce_loads(2048 * k3_route_bytes_per_token, True)
+    assert fm._use_streaming_reduce_loads(4096 * k3_route_bytes_per_token, True)
+
+
+@_SKIP_GFX950_FLYDSL
+def test_flydsl_stage2_fp8_reduction_streaming_loads_bit_equal():
+    from aiter.ops.flydsl.kernels.mxfp4_gemm_common import fp8out_row_bytes
+    from aiter.ops.flydsl.moe_kernels import _run_moe_reduction
+
+    torch.manual_seed(7)
+    token, topk, model_dim = 96, 16, 3584
+    target = torch.zeros(
+        (token * topk, fp8out_row_bytes(model_dim)), dtype=torch.uint8, device="cuda"
+    )
+    values = torch.randn(token * topk, model_dim, device="cuda").to(dtypes.fp8)
+    target[:, :model_dim] = values.view(torch.uint8)
+    num_scales = model_dim // 32
+    target[:, model_dim : model_dim + num_scales] = torch.randint(
+        120, 130, (token * topk, num_scales), dtype=torch.uint8, device="cuda"
+    )
+    topk_weights = torch.rand(token, topk, dtype=torch.float32, device="cuda")
+
+    def reduce(streaming_loads):
+        out = torch.full(
+            (token, model_dim), float("nan"), dtype=torch.bfloat16, device="cuda"
+        )
+        _run_moe_reduction(
+            target,
+            out,
+            token,
+            topk,
+            model_dim,
+            is_fp8=True,
+            topk_weights=topk_weights,
+            streaming_loads=streaming_loads,
+        )
+        torch.cuda.synchronize()
+        return out
+
+    reference = reduce(streaming_loads=False)
+    assert torch.isfinite(reference).all()
+    assert torch.equal(reduce(streaming_loads=True), reference)
+
+
 @pytest.mark.parametrize("inter_dim", [256, 384, 640])
 @_SKIP_GFX950_FLYDSL
 def test_flydsl_e2e_a8w4_gui(inter_dim):
