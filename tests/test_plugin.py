@@ -1103,7 +1103,14 @@ def test_status_lists_what_is_deprecated_and_when_it_goes(monkeypatch):
     def add(left: int, right: int = 1) -> int:
         return left + right
 
-    assert plugin.status()["deprecations"] == (
+    # Ops routed at import time may supersede versions of their own (with AITER
+    # built, top_k_per_row_decode does); only the two set up here are checked.
+    deprecations = tuple(
+        entry
+        for entry in plugin.status()["deprecations"]
+        if entry["subject"] in ("test.add", "aklr")
+    )
+    assert deprecations == (
         {
             "kind": "op-version",
             "subject": "test.add",

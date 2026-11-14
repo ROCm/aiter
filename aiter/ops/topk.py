@@ -1326,7 +1326,15 @@ def _top_k_per_row_decode_fake(*args, **kwargs) -> None:
     return
 
 
-@_route(op="top_k_per_row_decode", version=1, fake=_top_k_per_row_decode_fake)
+# v2 adds the keyword-only `lane_max`. It changes only how fast long rows are
+# selected, never what is selected, so a v1 provider that ignores it still
+# writes the same indices and values: v1 stays accepted.
+@_route(
+    op="top_k_per_row_decode",
+    version=2,
+    supersedes={1: "a later aiter release"},
+    fake=_top_k_per_row_decode_fake,
+)
 def top_k_per_row_decode(
     logits: torch.Tensor,
     next_n: int,
@@ -1341,6 +1349,7 @@ def top_k_per_row_decode(
     *,
     row_starts: torch.Tensor | None = None,
     plane_width: int | None = None,
+    lane_max: torch.Tensor | None = None,
 ) -> None:
     """Per-row top-k (decode). Always uses the one-block kernel; the scratch
     workspace is allocated + cached on the Python side and passed in, so the C++
@@ -1359,12 +1368,24 @@ def top_k_per_row_decode(
     ``row_starts[r]`` [numRows] i32 (``stride0`` / ``stride1`` unused), the
     indices relative to that start. ``plane_width`` is the width of the plane
     the rows stand for: it bounds every row and picks the kernel exactly as
-    that plane would, so a packed call runs what its plane call runs."""
+    that plane would, so a packed call runs what its plane call runs.
+
+    ``lane_max`` (packed rows): lane maxima for these rows, as
+    ``mqa_logits_mxfp4(lane_max=...)`` writes them beside the logits. Long rows
+    then select from the values not below a bound read off them. The result is
+    the same whatever the buffer holds (a bound that leaves fewer than k
+    values falls back); only the speed depends on its being the scorer's.
+    It must be contiguous fp32 [n] with n at least
+    ``mqa_logits_mxfp4_lane_max_elems(logits.numel(), numRows)``, else this
+    raises; the kernel reads it only for stable selection of rows long enough
+    on wave32 arches."""
     if row_starts is not None:
         return _top_k_per_row_decode_packed(
             logits, next_n, seqLens, indices, numRows, k, stable, values,
-            row_starts, plane_width,
+            row_starts, plane_width, lane_max,
         )  # fmt: skip
+    if lane_max is not None:
+        raise ValueError("lane_max needs packed rows (row_starts)")
     if _should_use_flydsl_topk_decode(
         logits,
         next_n,
@@ -1455,6 +1476,29 @@ def top_k_per_row_decode(
     )
 
 
+def _check_topk_lane_max(
+    lane_max: torch.Tensor, flat: torch.Tensor, num_rows: int
+) -> None:
+    """Reject lane maxima the top-k would misread or read past: the kernel
+    views them as fp32 and reads row r's slots from (row start / 16) + 64 r,
+    within the size the scorer's sizing gives for ``flat`` and the rows."""
+    from .opus.pa_mqa_logits_mxfp4 import mqa_logits_mxfp4_lane_max_elems
+
+    need = mqa_logits_mxfp4_lane_max_elems(flat.numel(), num_rows)
+    if (
+        lane_max.dtype != torch.float32
+        or lane_max.dim() != 1
+        or not lane_max.is_contiguous()
+        or lane_max.device != flat.device
+        or lane_max.numel() < need
+    ):
+        raise ValueError(
+            f"lane_max must be contiguous fp32 [>= {need}] on {flat.device} for "
+            f"{flat.numel()} packed logits and {num_rows} rows, got "
+            f"{lane_max.dtype} {tuple(lane_max.shape)} on {lane_max.device}"
+        )
+
+
 def _top_k_per_row_decode_packed(
     flat: torch.Tensor,
     next_n: int,
@@ -1466,6 +1510,7 @@ def _top_k_per_row_decode_packed(
     values: torch.Tensor | None,
     row_starts: torch.Tensor,
     plane_width: int | None,
+    lane_max: torch.Tensor | None = None,
 ) -> None:
     """`top_k_per_row_decode` on packed rows: the FlyDSL kernel a
     ``plane_width`` plane would get, reading each row at its start. The HIP
@@ -1478,6 +1523,8 @@ def _top_k_per_row_decode_packed(
         raise ValueError("row_starts must be int32 [num_rows]")
     if _FLYDSL_TOPK_DECODE_DISABLED:
         raise ValueError("packed rows need the FlyDSL decode top-k")
+    if lane_max is not None:
+        _check_topk_lane_max(lane_max, flat, num_rows)
     from .flydsl.topk import topk_per_row as flydsl_topk
 
     # The kernels take their input as [rows, width] and validate it so; every
@@ -1525,6 +1572,7 @@ def _top_k_per_row_decode_packed(
         next_n=next_n,
         plane_width=plane_width,
         packed_rows=True,
+        lane_max=lane_max,
     )
 
 
