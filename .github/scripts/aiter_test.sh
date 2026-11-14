@@ -5,6 +5,9 @@ MULTIGPU=${MULTIGPU:-FALSE}
 SHARD_TOTAL=${SHARD_TOTAL:-5}
 SHARD_IDX=${SHARD_IDX:-0}
 export CLANG_TOOLCHAIN_PROGRAM_TIMEOUT="${CLANG_TOOLCHAIN_PROGRAM_TIMEOUT:-300}"
+# Files whose checkAllclose failures fail the test (see aiter/test_common.py).
+# Add a file once it has no failed! or warning! lines on MI300X and MI35X.
+export AITER_STRICT_ALLCLOSE="${AITER_STRICT_ALLCLOSE:-test_rmsnorm2d.py}"
 
 # Avoid per-invocation hipcc native arch probing (can timeout under heavy JIT
 # parallelism) by resolving the current GPU arch once for this job.
@@ -75,6 +78,7 @@ fi
 echo "Running ${sharded_files[@]} in shard $SHARD_IDX of $SHARD_TOTAL."
 echo "Using CLANG_TOOLCHAIN_PROGRAM_TIMEOUT=${CLANG_TOOLCHAIN_PROGRAM_TIMEOUT}" | tee -a latest_test.log
 echo "Using GPU_ARCHS=${GPU_ARCHS:-native}" | tee -a latest_test.log
+echo "Using AITER_STRICT_ALLCLOSE=${AITER_STRICT_ALLCLOSE}" | tee -a latest_test.log
 
 for file in "${sharded_files[@]}"; do
     # Print a clear separator and test file name for readability
