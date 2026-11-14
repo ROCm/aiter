@@ -442,7 +442,7 @@ void h32_kernel(mqa_logits_mxfp4_kargs k) {
             }
             // Lane maxima: one v_max a value (keys past a row's window masked in its last tiles);
             // a slot is stored at its 16-tile group's end or the chunk's (a slot two CTAs share
-            // gets either store). Without lane_max both indices are past the chunk.
+            // gets either store). Without lane_max both indices stay -1, which no tile reaches.
             if (t < lm_mask_t) {   // uniform
                 opus::static_for<R>([&](auto rc) {
                     opus::static_for<NT / 2>([&](auto uc) {

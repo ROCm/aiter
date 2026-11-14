@@ -849,8 +849,9 @@ def mqa_logits_mxfp4(
     very ``query_start_loc`` / ``row_ends`` tensors.
 
     ``lane_max`` (fp32, flat, :func:`mqa_logits_mxfp4_lane_max_elems` elements of ``out``'s
-    address span, padded row strides included) also receives each row's lane maxima, a lower-bound summary a top-k reads to skip most of a row
-    (``pa_mqa_logits_mxfp4.h``). Rows must start at multiples of 64 and in row order; schedule-free
+    address span, padded row strides included) also receives each row's lane maxima, a
+    lower-bound summary a top-k reads to skip most of a row (``pa_mqa_logits_mxfp4.h``).
+    Rows must start at multiples of 64 and in row order; schedule-free
     configs only (:attr:`MqaLogitsConfig.writes_lane_max`, and no ``schedule``).
     """
     inst = cfg._instance
