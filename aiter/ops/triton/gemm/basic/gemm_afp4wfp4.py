@@ -2,6 +2,9 @@
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
 
+import functools
+import importlib.metadata
+
 import torch
 import triton
 
@@ -40,6 +43,137 @@ _GLUON_DEFAULT_ARCHS = (
     "gfx1250",
     "gfx1250-strict",
 )
+
+
+@functools.cache
+def _pingpong_compiler_ok() -> bool:
+    # The ping-pong schedule depends on compiler scheduling and synchronization, so
+    # only the Triton builds it was validated on are allowed (exact package version).
+    validated = ("3.8.0+amd.rocm7.2.0.git7cb7b059", "3.8.0+gitc8305ccc")
+    try:
+        from triton.experimental.gluon.language.amd import (  # noqa: F401
+            warp_pipeline_stage,
+        )
+
+        return importlib.metadata.version("triton") in validated
+    except ImportError:  # also importlib.metadata.PackageNotFoundError
+        return False
+
+
+def _pingpong_env_unsupported():
+    """Return why this device or Triton build cannot run the ping-pong kernel, or None."""
+    if arch_info.get_arch() != "gfx950":
+        return "arch"
+    if not _pingpong_compiler_ok():
+        return "Triton build not validated"
+    try:
+        num_xcds = get_num_xcds(default=None)
+    except (RuntimeError, OSError):
+        return "unknown XCD count"
+    if num_xcds != 8:  # validated on the full device only, not in partition modes
+        return "partition mode"
+    return None
+
+
+def _pingpong_unsupported(x, w, x_scales, w_scales, y, dtype, config):
+    """Return why the gfx950 ping-pong kernel cannot run these inputs, or None.
+
+    w is the (N, K//2) weight. The kernel needs M % 16 == 0, N % 16 == 0, K % 256 == 0,
+    contiguous x and w, scales contiguous along M and N, a bf16 y, 16-byte aligned
+    tensors below 2 GiB and a 256x256x256 tile with 8 warps and no split-K.
+    """
+    reason = _pingpong_env_unsupported()
+    if reason is not None:
+        return reason
+    blocks = (config["BLOCK_SIZE_M"], config["BLOCK_SIZE_N"], config["BLOCK_SIZE_K"])
+    if (
+        blocks != (256, 256, 256)
+        or config.get("num_warps") != 8
+        or config.get("NUM_KSPLIT", 1) != 1
+    ):
+        return "config"
+    M, K = x.shape
+    N = w.shape[0]
+    if min(M, N, K) <= 0 or M % 16 or N % 16 or K % 128:
+        return "shape"
+    if dtype != torch.bfloat16 or (
+        y is not None and (y.dtype != torch.bfloat16 or tuple(y.shape) != (M, N))
+    ):
+        return "output dtype or shape"
+    if any(t.element_size() != 1 for t in (x, w, x_scales, w_scales)):
+        return "input dtype"
+    if (
+        tuple(w.shape) != (N, K)
+        or tuple(x_scales.shape) != (M, K // 16)
+        or tuple(w_scales.shape) != (N, K // 16)
+    ):
+        return "input shape"
+    if x.stride() != (K, 1) or w.stride() != (K, 1):
+        return "x or w not contiguous"
+    if x_scales.stride(0) != 1 or w_scales.stride(0) != 1:
+        return "scales not contiguous along M and N"
+    strides = [(x_scales.stride(1), M), (w_scales.stride(1), N)]
+    tensors = [x, w, x_scales, w_scales]
+    if y is None:
+        if 2 * M * N >= 2**31:
+            return "output above 2 GiB"
+    else:
+        if y.stride(1) != 1:
+            return "y inner stride"
+        strides.append((y.stride(0), N))
+        tensors.append(y)
+    if any(s % 16 or s < low for s, low in strides):
+        return "outer stride"
+    if any(t.data_ptr() % 16 for t in tensors):
+        return "alignment"
+    if any(t.untyped_storage().nbytes() >= 2**31 for t in tensors):
+        return "tensor above 2 GiB"
+    return None
+
+
+def _gemm_afp4wfp4_pingpong(x, b, x_scales, w_scales, dtype, y, config):
+    """Launch the gfx950 ping-pong kernel. b is the (K//2, N) view of w."""
+    from aiter.ops.triton._gluon_kernels.gfx950.gemm.basic.gemm_afp4wfp4_pingpong import (
+        _gemm_afp4wfp4_pingpong_kernel,
+    )
+
+    M, K = x.shape
+    N = b.shape[1]
+    if y is None:
+        y = torch.empty((M, N), dtype=dtype, device=x.device)
+    grid = (
+        triton.cdiv(M, config["BLOCK_SIZE_M"]) * triton.cdiv(N, config["BLOCK_SIZE_N"]),
+    )
+    _gemm_afp4wfp4_pingpong_kernel[grid](
+        x,
+        b,
+        y,
+        x_scales,
+        w_scales,
+        M,
+        N,
+        K,
+        x.stride(0),
+        x.stride(1),
+        b.stride(0),
+        b.stride(1),
+        y.stride(0),
+        y.stride(1),
+        x_scales.stride(0),
+        x_scales.stride(1),
+        w_scales.stride(0),
+        w_scales.stride(1),
+        BLOCK_SIZE_M=config["BLOCK_SIZE_M"],
+        BLOCK_SIZE_N=config["BLOCK_SIZE_N"],
+        BLOCK_SIZE_K=config["BLOCK_SIZE_K"],
+        GROUP_SIZE_M=config["GROUP_SIZE_M"],
+        NUM_WARPS=8,
+        NUM_XCDS=get_num_xcds(),
+        num_warps=8,
+        # The schedule needs all 256 registers of each wave as VGPRs.
+        llvm_fn_attrs="amdgpu-agpr-alloc=0",
+    )
+    return y
 
 
 def set_use_gemm_splitk_bf16(value: bool):
@@ -148,7 +282,10 @@ def gemm_afp4wfp4_(
         dtype (Optional[torch.dtype]): Output datatype (BF16 or FP16).
         y (Optional[torch.Tensor]): Pre-allocated output tensor with shape (M, N).
         config (Optional[dict]): Kernel tuning parameters (BLOCK_SIZE_M, BLOCK_SIZE_N,
-            BLOCK_SIZE_K, GROUP_SIZE_M, NUM_KSPLIT, SPLITK_BLOCK_SIZE).
+            BLOCK_SIZE_K, GROUP_SIZE_M, NUM_KSPLIT, SPLITK_BLOCK_SIZE). With
+            backend="gluon" on gfx950, kernel_type="compute_bound" selects the 8-wave
+            ping-pong kernel for inputs that meet its limits (_pingpong_unsupported).
+            Other inputs use the default Gluon kernel.
         skip_reduce (Optional[bool]): skip reduction, y becomes (SPK, M, N) where SPK is determined by config
 
     Returns:
@@ -201,6 +338,19 @@ def gemm_afp4wfp4_(
             config, _ = _get_config(M, N, K)
     else:
         config = deserialize_str(config)
+
+    kernel_type = config.pop("kernel_type", "bandwidth_bound")
+    assert kernel_type in (
+        "bandwidth_bound",
+        "compute_bound",
+    ), f"Unknown kernel_type '{kernel_type}', must be 'bandwidth_bound' or 'compute_bound'"
+    if backend == "gluon" and kernel_type == "compute_bound":
+        reason = _pingpong_unsupported(x, w.T, x_scales, w_scales, y, dtype, config)
+        if reason is None:
+            return _gemm_afp4wfp4_pingpong(x, w, x_scales, w_scales, dtype, y, config)
+        _LOGGER.info(
+            "GEMM_AFP4WFP4: compute_bound uses the default gluon kernel: %s", reason
+        )
 
     if backend == "gluon":
         # The gluon kernel rounds SPLITK_BLOCK_SIZE up to a BLOCK_SIZE_K
