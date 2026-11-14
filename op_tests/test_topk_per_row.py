@@ -831,7 +831,7 @@ def test_sampled_layout_contract():
     assert refused(logits=wide), "a row stride other than stride0"
     two_k = torch.empty(rows, 2 * K, dtype=torch.int32, device="cuda")
     assert refused(indices=two_k), "indices rows wider than k"
-    size = T._sampled_workspace_size_cached(rows, N, K)
+    size = T._sampled_workspace_size_cached(rows, N, K, torch.cuda.current_device())
     ws = torch.empty(size + 512, dtype=torch.uint8, device="cuda")[1 : 1 + size]
     assert refused(workspace=ws), "a workspace off the 256-byte grid"
 

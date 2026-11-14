@@ -141,6 +141,16 @@ def _select_gfx1250_variant(tokens, cu, hidden=5120):
     return "gfx1250_large", 1
 
 
+def _select_generic_variant(hidden, blocks, cu):
+    """The generic kernel at the largest split of H that gives each tile and split a CU."""
+    split = max(
+        k
+        for k in range(1, 21)
+        if hidden % (32 * k) == 0 and (k == 1 or max(blocks, 1) * k <= cu)
+    )
+    return "generic", split
+
+
 def mega_mhc_shuffle_fn(fn):
     """[H/32, stream, operand, lane, 8] BF16; the last operand packs hi/lo.
 
@@ -329,12 +339,7 @@ def _prepare_scratch(device, tokens, hidden, split_k=None, *, reuse_scratch=True
         elif arch == "gfx1250" and hidden in _STREAM_HIDDEN_SIZES:
             variant, selected_split = _select_gfx1250_variant(tokens, cu, hidden)
         else:
-            variant = "generic"
-            selected_split = max(
-                k
-                for k in range(1, 21)
-                if hidden % (32 * k) == 0 and (k == 1 or max(blocks, 1) * k <= cu)
-            )
+            variant, selected_split = _select_generic_variant(hidden, blocks, cu)
         if split_k is not None:
             variant, selected_split = "generic", split_k
         distributed = variant in _DISTRIBUTED_VARIANTS
@@ -343,7 +348,8 @@ def _prepare_scratch(device, tokens, hidden, split_k=None, *, reuse_scratch=True
             for name in ("HSA_CU_MASK", "ROC_GLOBAL_CU_MASK")
         )
         if distributed and (masked or (arch != "gfx1250" and cu < 256)):
-            variant, selected_split, distributed = "generic", 1, False
+            variant, selected_split = _select_generic_variant(hidden, blocks, cu)
+            distributed = False
         tagged = variant in _TAGGED_VARIANTS
         split_k = selected_split
         if (

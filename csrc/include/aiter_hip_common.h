@@ -730,3 +730,19 @@ static size_t get_smem_size_func()
         return prop.sharedMemPerBlock;
     });
 }
+
+// Dies a dispatch's workgroups are dealt over, round-robin, each behind its own
+// L2.
+static uint32_t get_num_xcds_func()
+{
+    static SynchronizedCache<int, uint32_t> cache;
+    int device = -1;
+    HIP_CALL(hipGetDevice(&device));
+    return cache.get_or_create(device, [device]() {
+        int xcds = 0;
+        HIP_CALL(hipDeviceGetAttribute(&xcds, hipDeviceAttributeNumberOfXccs, device));
+        AITER_CHECK(
+            xcds >= 1, "hipDeviceAttributeNumberOfXccs returned ", xcds, " for device ", device);
+        return static_cast<uint32_t>(xcds);
+    });
+}
