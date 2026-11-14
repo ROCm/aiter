@@ -21,9 +21,8 @@ from aiter.dist.device_communicators.quick_all_reduce import (
     QuickAllReduce,
     is_weak_contiguous,
 )
-from aiter.ops.flydsl import allreduce_host_shared as H
 from aiter.ops.flydsl import allreduce_policy as P
-from aiter.ops.flydsl.allreduce_host_shared import eligible_payload_bytes
+from aiter.ops.flydsl import comm_collectives_host_shared as H
 from aiter.ops.flydsl.allreduce_policy import (
     SUPPORTED_BLOCKS,
     AllReduceAlgorithm,
@@ -34,6 +33,7 @@ from aiter.ops.flydsl.allreduce_policy import (
     oneshot_ladder,
     ring_st_ladder,
 )
+from aiter.ops.flydsl.comm_collectives_host_shared import eligible_payload_bytes
 from aiter.ops.flydsl.kernels.comm.one_shot_allreduce import SUPPORTED_ATOMS
 from aiter.ops.flydsl.kernels.comm.quick_allreduce_mesh import SUPER_TILES
 from aiter.ops.flydsl.kernels.comm.quick_allreduce_ring import RING_SUPER_TILES
@@ -354,7 +354,7 @@ def test_link_variable_backs_up_an_unreadable_probe():
     # The KFD probe comes first; the variable is only the backup. When the probe
     # is unreadable the variable decides, and is stripped, lowercased and
     # validated against LINKS.
-    probe = "aiter.ops.flydsl.allreduce_host_shared.probe_xgmi_peer_links"
+    probe = "aiter.ops.flydsl.comm_collectives_host_shared.probe_xgmi_peer_links"
     P._probe_link.cache_clear()
     with mock.patch(probe, return_value=None):
         with _env(AITER_FLY_AR_LINK=" PCIe "):
@@ -369,7 +369,7 @@ def test_link_variable_backs_up_an_unreadable_probe():
 
 def test_unreadable_topology_needs_the_link_variable():
     env = {k: v for k, v in os.environ.items() if k != "AITER_FLY_AR_LINK"}
-    probe = "aiter.ops.flydsl.allreduce_host_shared.probe_xgmi_peer_links"
+    probe = "aiter.ops.flydsl.comm_collectives_host_shared.probe_xgmi_peer_links"
     for found, expected in ((True, "xgmi"), (False, "pcie")):
         P._probe_link.cache_clear()
         with (
