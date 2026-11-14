@@ -518,6 +518,7 @@ def _gemm_a8w8_blockscale_bpreshuffle_asm(
     kernelName: str | None = None,
     bpreshuffle: int = 1,
     zero_bias_buf: Tensor | None = None,
+    out_zeroed: bool = False,
 ) -> None: ...
 
 
@@ -546,7 +547,10 @@ def gemm_a8w8_blockscale_bpreshuffle_asm(
     kernelName: str | None = None,
     bpreshuffle: bool | None = True,
     zero_bias_buf: Tensor | None = None,
+    out_zeroed: bool = False,
 ) -> Tensor:
+    """out_zeroed: `out` already holds zeros, so a split-K kernel accumulates into it
+    without the hipMemsetAsync launched before it otherwise."""
     if bias is None and zero_bias_buf is None:
         zero_bias_buf = get_zero_bias_buf(B)
     _gemm_a8w8_blockscale_bpreshuffle_asm(
@@ -560,6 +564,7 @@ def gemm_a8w8_blockscale_bpreshuffle_asm(
         kernelName,
         int(bpreshuffle) if bpreshuffle is not None else 1,
         zero_bias_buf,
+        out_zeroed,
     )
     return out
 
@@ -1480,6 +1485,7 @@ def gemm_a8w8_blockscale_bpreshuffle_fake(
     w_scale: Tensor,
     dtype: torch.dtype = dtypes.bf16,
     out: Tensor | None = None,
+    out_zeroed: bool = False,
 ) -> Tensor:
     # Must mirror the real signature (incl. out=): the abstract_impl forwards the
     # out= kwarg here at trace time. When out is given the real fn returns it, so
@@ -1511,6 +1517,7 @@ def gemm_a8w8_blockscale_bpreshuffle(
     w_scale: Tensor,
     dtype: torch.dtype = dtypes.bf16,
     out: Tensor | None = None,
+    out_zeroed: bool = False,
 ) -> Tensor:
     """Block-scaled A8W8 GEMM whose weight is already in MFMA-fragment order.
 
@@ -1550,6 +1557,10 @@ def gemm_a8w8_blockscale_bpreshuffle(
     # positionally and write into it, so honoring `out` there is free. The
     # triton-fallback branches self-allocate their output and CANNOT honor `out`
     # -> assert loud rather than silently returning a different address.
+    # `out_zeroed`: `out` already holds zeros (written by its producer), so an asm
+    # split-K row accumulates into it without its memset; every other row
+    # overwrites `out` and ignores the flag.
+    assert out is not None or not out_zeroed, "out_zeroed needs the caller's out"
     if out is not None:
         assert out.shape == (m, n) and out.dtype == dtype and out.device == XQ.device, (
             f"gemm_a8w8_blockscale_bpreshuffle: out buffer {tuple(out.shape)}/"
@@ -1739,7 +1750,14 @@ def gemm_a8w8_blockscale_bpreshuffle(
             if dtype == dtypes.bf16:
                 splitK = config["splitK"]
                 return gemm_a8w8_blockscale_bpreshuffle_asm(
-                    XQ, WQ, Y, x_scale, w_scale, splitK=splitK, kernelName=kernelName
+                    XQ,
+                    WQ,
+                    Y,
+                    x_scale,
+                    w_scale,
+                    splitK=splitK,
+                    kernelName=kernelName,
+                    out_zeroed=out_zeroed,
                 )
             _warn_blockscale_asm_row_not_bf16(n, k, dtype)
         elif libtype == "opus":
