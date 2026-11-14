@@ -1119,10 +1119,9 @@ def test_mha_backward(
 def test_mha_dao_ai_backward_head_size(
     head_size, varlen, seqlen_q, seqlen_k, strided, monkeypatch
 ):
-    from aiter.ops.triton._triton_kernels.attention.dao_ai import bwd, interface_v2
+    from aiter.ops.triton._triton_kernels.attention.dao_ai import bwd
     from aiter.ops.triton.attention import mha
 
-    monkeypatch.setattr(interface_v2, "BWD_MODE", "fused")
     kernel = bwd.bwd_kernel_fused_causal
     original_run = kernel.run
     launches = 0
@@ -1389,8 +1388,8 @@ def test_mha_backward_varlen(
         torch.testing.assert_close(tri, ref.to(tri.dtype), atol=atol, rtol=rtol)
 
 
-@pytest.mark.parametrize("bwd_mode", [None, "fused", "split"])
-def test_mha_backward_varlen_very_negative_logits(bwd_mode, monkeypatch):
+@pytest.mark.parametrize("implementation", ["default", "dao_ai"])
+def test_mha_backward_varlen_very_negative_logits(implementation):
     # Rows whose logits are all very negative (logsumexp < -88) used to overflow exp(0 - lse) to inf
     # on the zero-loaded keys of the last partial key block of the unmasked dq loop, and inf * 0 put
     # NaN in dq. Seen on real Qwen2.5-1.5B activations. The sequence lengths are not block multiples
@@ -1426,14 +1425,12 @@ def test_mha_backward_varlen_very_negative_logits(bwd_mode, monkeypatch):
         dtype=torch.int32,
     )
 
-    if bwd_mode is None:
+    if implementation == "default":
         triton_out = flash_attn_varlen_func(
             q, k, v, cu_seqlens, cu_seqlens, max(seqlens), max(seqlens), causal=True
         )
         triton_dq, triton_dk, triton_dv = torch.autograd.grad(triton_out, (q, k, v), do)
     else:
-        # The flash_attn_2 backward has "fused" and "split" modes with different dq loops; monkeypatch restores the mode.
-        monkeypatch.setattr(flash_attn_2, "BWD_MODE", bwd_mode)
         scale = HEAD_SZ**-0.5
         out, lse, _, _ = flash_attn_2.varlen_fwd(
             q,
