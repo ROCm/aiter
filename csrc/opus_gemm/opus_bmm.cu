@@ -61,12 +61,21 @@ opus_bmm_a8w8_mxscale_exact_dispatch(const std::pair<int, int>& key)
   return it->second;
 }
 
-// (GROUP_N, GROUP_K) for a kid: 128 for the DSv4 block, 32 for the MX one.
-// Built from the same generated table as the dispatch, so a kid cannot be
-// dispatched with a scale shape nobody checked against its own blocks.
-static std::pair<int, int> opus_bmm_mxscale_kid_groups(const std::pair<int, int>& key)
+// A kid's scale blocks (GROUP_N, GROUP_K: 128 for the DSv4 block, 32 for the MX
+// one) and its tile alignment. Built from the same generated table as the
+// dispatch, so a kid cannot be dispatched with a scale shape or a shape nobody
+// checked against its own geometry.
+struct OpusBmmMxscaleKidShape {
+  int group_n;
+  int group_k;
+  int m_align;
+  int n_align;
+  int k_align;
+};
+
+static OpusBmmMxscaleKidShape opus_bmm_mxscale_kid_shape(const std::pair<int, int>& key)
 {
-  static const std::map<std::pair<int, int>, std::pair<int, int>> kGroups = {
+  static const std::map<std::pair<int, int>, OpusBmmMxscaleKidShape> kGroups = {
       GENERATE_BMM_MXSCALE_KID_GROUPS
   };
   const auto it = kGroups.find(key);
@@ -99,10 +108,11 @@ void opus_gemm_a8w8_mxscale_bmm_launch(
               arch_info.name, "'");
   const auto key = std::make_pair(arch_info.cu_num, kid);
   // Validate tensors against this kernel's scale groups before launch.
-  const auto groups = opus_bmm_mxscale_kid_groups(key);
+  const auto shape = opus_bmm_mxscale_kid_shape(key);
   opus_bmm_a8w8_common_checks(O, wo_a, Y, x_scale, w_scale,
                               "opus_gemm_a8w8_mxscale_bmm_launch",
-                              groups.first, groups.second);
+                              shape.group_n, shape.group_k,
+                              shape.m_align, shape.n_align, shape.k_align);
   opus_bmm_a8w8_mxscale_exact_dispatch(key)(
       O, wo_a, Y, x_scale, w_scale, workspace, split_k);
 #endif  // OPUS_BUILD_HAS_GFX950
