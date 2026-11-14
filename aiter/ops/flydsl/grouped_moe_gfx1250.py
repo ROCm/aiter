@@ -189,7 +189,8 @@ def _find_grouped_config(
     # stays backward compatible with pre-gfx tuned files.
     # The tuner rewrites its frame through ``astype(str)``, so a blank cell can
     # come back as the literal "nan"; read those as unset (wildcard) instead of
-    # as a value that matches nothing.
+    # as a value that matches nothing. The merge of configs/ and model_configs/
+    # also goes through pandas.
     def _cell(row, k):
         value = str(row.get(k) or "").strip()
         if value.lower() in ("nan", "none"):
