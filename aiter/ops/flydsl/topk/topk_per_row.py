@@ -349,6 +349,8 @@ def flydsl_top_k_per_row_decode(
     *,
     row_starts: torch.Tensor | None = None,
     plane_width: int | None = None,
+    arch: str | None = None,
+    finite_only: bool = False,
 ) -> None:
     """Write per-row TopK indices using each request's effective context length.
 
@@ -358,6 +360,12 @@ def flydsl_top_k_per_row_decode(
     ``seq_lens=None`` makes every row ``plane_width`` (default: the logits
     width) long; the kernels then read no length tensor, so there is nothing
     for a captured graph to hold an address of.
+    ``arch`` is the GPU this kernel is built for. A caller that cannot probe
+    the device passes it. Omitted, it is the live GPU.
+    ``finite_only`` never selects a nonfinite column (NaN, +inf, or -inf):
+    a row with fewer than k finite values returns those in column order,
+    then -1. Only the one-workgroup kernel (``plane_width`` up to 20000)
+    has it.
     Before CUDAGraph capture, warm the split path on the capture stream so its
     stream-local arrival counter is allocated and initialized.
     """
@@ -368,10 +376,14 @@ def flydsl_top_k_per_row_decode(
 
     rows, width = logits.shape
     width = width if plane_width is None else plane_width
+    if finite_only and width > _ONE_WORKGROUP_MAX_ROW_WIDTH:
+        raise ValueError(
+            f"finite_only needs rows of at most {_ONE_WORKGROUP_MAX_ROW_WIDTH}"
+        )
     if rows == 0:
         return
     # The bare arch name: the selector keys its radix layout and LDS on it.
-    arch = get_gfx_runtime()
+    arch = arch or get_gfx_runtime()
     wave_size = get_warp_size(arch)
     stream = torch.cuda.current_stream(logits.device)
     packed = row_starts is not None
@@ -386,6 +398,7 @@ def flydsl_top_k_per_row_decode(
             packed_rows=packed,
             full_rows=full_rows,
             exact_rows=full_rows and one_workgroup_rows_are_exact(width),
+            finite_only=finite_only,
         )
         run_topk_launcher(
             launcher,

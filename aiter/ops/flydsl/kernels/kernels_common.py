@@ -23,6 +23,16 @@ def ceildiv(numer, denom):
     return (numer + denom - 1) // denom
 
 
+def div_nonneg(numer, denom):
+    """Truncating divide of a non-negative dividend.
+
+    Signed ``//`` lowers to ``arith.floordivsi``. These dividends stay
+    non-negative, so an unsigned divide is the same quotient in fewer
+    instructions.
+    """
+    return fx.Int32(fx.Uint32(numer) // fx.Uint32(denom))
+
+
 def format_kernel_name(name: str) -> str:
     """Sanitize a kernel symbol name for the amdhsa assembler.
 

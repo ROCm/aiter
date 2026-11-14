@@ -1,8 +1,11 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
 
-"""QSA top-level dispatch: selects the best backend (triton, FlyDSL, etc.)
-for each QSA operator based on the input shape and available backends.
+"""QSA top-level dispatch.
+
+``qsa_select_paged_tokens`` uses ``qsa_indexer_block_ids`` for supported
+indexer shapes. ``qsa_sparse_paged_gqa`` uses ``flydsl_qsa_paged_gqa`` for
+supported sparse-GQA shapes. Every other shape stays on the existing path.
 
 Consumers should import from here rather than from the backend-specific
 modules directly.
@@ -12,6 +15,7 @@ from collections.abc import Sequence
 
 import torch
 
+from aiter.jit.utils.chip_info import get_gfx_runtime
 from aiter.ops.topk import top_k_per_row_prefill
 from aiter.ops.triton.attention.qsa import (
     FP4_GROUP,
@@ -19,11 +23,13 @@ from aiter.ops.triton.attention.qsa import (
     FP8_MAX,
     qsa_cache_row_layout,
     qsa_expand_block_indices,
-    qsa_sparse_paged_gqa,
     qsa_store_quantized_rows,
 )
 from aiter.ops.triton.attention.qsa import (
     qsa_paged_mqa_logits as _triton_qsa_paged_mqa_logits,
+)
+from aiter.ops.triton.attention.qsa import (
+    qsa_sparse_paged_gqa as _triton_qsa_sparse_paged_gqa,
 )
 
 try:
@@ -45,7 +51,42 @@ try:
 except ImportError:
     _HAS_FLYDSL_PREFILL = False
 
+try:
+    from aiter.ops.flydsl import qsa_paged as _qsa_paged
+except ImportError:
+    _qsa_paged = None
+
+_FLYDSL_QSA_ARCHS = ("gfx942", "gfx950")
+
 DEFAULT_LOGITS_WORKSPACE_BYTES = 128 * 1024 * 1024
+
+
+def _live_flydsl_qsa_arch() -> str | None:
+    """gfx942 or gfx950 when that GPU is live, else None.
+
+    No device raises ``RuntimeError`` from ``get_gfx_runtime``. An unknown
+    arch raises ``KeyError``. Both stay on the existing path, as does any
+    other architecture. The support gates return None when no device is
+    visible, so the arch check is what keeps that case off FlyDSL.
+    """
+    try:
+        arch = get_gfx_runtime()
+    except (RuntimeError, KeyError):
+        return None
+    if arch in _FLYDSL_QSA_ARCHS:
+        return arch
+    return None
+
+
+def _int32_token_index(tensor: torch.Tensor) -> torch.Tensor:
+    """Contiguous int32 copy when ``tensor`` is int64. Other dtypes pass through.
+
+    Sparse GQA and the indexer read int32. ``token_to_request`` on the public
+    entry may be int64, and the Triton select path accepts int64 metadata.
+    """
+    if tensor.dtype == torch.int64:
+        return tensor.to(torch.int32).contiguous()
+    return tensor
 
 
 def qsa_paged_mqa_logits(
@@ -137,7 +178,13 @@ def qsa_select_paged_tokens(
     compressed_k_scale: torch.Tensor | None = None,
     stacked_decode: bool = False,
 ) -> torch.Tensor:
-    """Score, select and expand in one call."""
+    """Score, select and expand in one call.
+
+    Supported indexer shapes on gfx942 and gfx950 call
+    ``qsa_indexer_block_ids`` and then ``qsa_expand_block_indices``. A
+    ``compressed_k_scale`` stays on the logits path, and so does every other
+    shape.
+    """
     if compress_ratio <= 0 or token_topk <= 0 or token_topk % compress_ratio:
         raise ValueError("token_topk must be positive and divisible by compress_ratio")
     rows = q.shape[0]
@@ -161,6 +208,33 @@ def qsa_select_paged_tokens(
         out = out[:, :output_width]
     if rows == 0:
         return out
+
+    if (
+        compressed_k_scale is None
+        and _qsa_paged is not None
+        and _live_flydsl_qsa_arch() is not None
+        and _qsa_paged.qsa_indexer_supported(q, compressed_k_cache, page_table) is None
+        and _qsa_paged.qsa_indexer_selection_supported(token_topk, compress_ratio)
+        is None
+    ):
+        block_ids = _qsa_paged.qsa_indexer_block_ids(
+            q,
+            compressed_k_cache,
+            page_table,
+            _int32_token_index(token_to_request),
+            _int32_token_index(query_positions),
+            _int32_token_index(context_lens),
+        )
+        return qsa_expand_block_indices(
+            block_ids,
+            query_positions,
+            context_lens,
+            token_to_request,
+            compress_ratio,
+            token_topk,
+            out,
+            output_width=output_width,
+        )
 
     rows_per_chunk = max(1, logits_workspace_bytes // max(columns * 4, 1))
     for row_start in range(0, rows, rows_per_chunk):
@@ -209,6 +283,63 @@ def qsa_select_paged_tokens(
             output_width=output_width,
         )
     return out
+
+
+def qsa_sparse_paged_gqa(
+    q: torch.Tensor,
+    k_cache: torch.Tensor,
+    v_cache: torch.Tensor,
+    logical_indices: torch.Tensor,
+    block_table: torch.Tensor,
+    token_to_request: torch.Tensor,
+    softmax_scale: float | None = None,
+    kv_splits: int | None = None,
+    num_decode_requests: int | None = None,
+    k_scale: torch.Tensor | None = None,
+    v_scale: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Grouped-query attention restricted to ``logical_indices`` (``-1`` = padding).
+
+    Supported sparse-GQA shapes on gfx942 and gfx950 call
+    ``flydsl_qsa_paged_gqa``. ``kv_splits``, ``num_decode_requests``, and
+    FP8 ``k_scale`` / ``v_scale`` stay on the Triton kernel, including when
+    a caller set any of them. Every other shape, any other arch, and a
+    missing device do too.
+    """
+    if (
+        kv_splits is None
+        and num_decode_requests is None
+        and k_scale is None
+        and v_scale is None
+        and _qsa_paged is not None
+        and _live_flydsl_qsa_arch() is not None
+        and _qsa_paged.flydsl_qsa_paged_gqa_supported(
+            q, k_cache, v_cache, logical_indices, block_table
+        )
+        is None
+    ):
+        return _qsa_paged.flydsl_qsa_paged_gqa(
+            q,
+            k_cache,
+            v_cache,
+            logical_indices,
+            block_table,
+            _int32_token_index(token_to_request),
+            softmax_scale=softmax_scale,
+        )
+    return _triton_qsa_sparse_paged_gqa(
+        q,
+        k_cache,
+        v_cache,
+        logical_indices,
+        block_table,
+        token_to_request,
+        softmax_scale=softmax_scale,
+        kv_splits=kv_splits,
+        num_decode_requests=num_decode_requests,
+        k_scale=k_scale,
+        v_scale=v_scale,
+    )
 
 
 def qsa_sparse_prefill(

@@ -1,0 +1,1434 @@
+# SPDX-License-Identifier: MIT
+# Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
+
+"""FlyDSL QSA public surface.
+
+``qsa_indexer_block_ids`` writes indexer ``block_ids [M, 512]`` from paged
+compressed K. Rows up to 512 blocks use the fused emit kernel; longer rows
+use tiled BLOCK_N=32 BF16 MFMA scoring. Padded decode (more than 20000
+columns and at most 64 rows) selects with the row-bounded radix on the
+full width. Prefill keeps the allocation width and uses the stable decode
+radix. A packed table at or under 20000 columns uses that radix too.
+Batches averaging at least two query rows per request (prefill, mixed
+prefill and decode, MTP decode) score 16 rows by 64 columns per workgroup,
+and a prefill workgroup walks four column tiles; MTP with 4 heads scores 4
+rows x 4 heads per MFMA instead. The long-row score workspace is at most
+128 MiB. Rows past that are scored in chunks, and the scorer and selector
+stay the ones chosen for the whole batch. The indexer head count is 4 or
+8, each a separate compile.
+
+``flydsl_qsa_paged_gqa`` writes sparse GQA ``o [M, Hq, D]`` from paged K/V at the
+selected token ids. Decode runs a BLOCK_N=16 two-wave tile with split-K and
+an LSE merge; prefill runs BLOCK_N=32 two waves and writes output directly
+once the grid alone fills the machine. Softmax is online in log2 space and the
+split
+partials are FP32. Expand+tail and the sigmoid gate stay unfused.
+
+``qsa_layer`` runs the indexer,
+``qsa_expand_block_indices``, and sparse GQA. A rank-3 query pair missing
+from the measured table logs once. A query that is not rank 3 is not a
+table miss; the indexer or sparse GQA reports it. Sigmoid and partial
+RoPE stay outside the layer.
+"""
+
+import functools
+
+import torch
+
+from aiter.jit.utils.chip_info import get_cu_num, get_gfx_runtime
+
+from .kernels.kernels_common import LOG2E, ceildiv, get_warp_size
+from .kernels.qsa.indexer_select import (
+    _D,
+    _DECODE_MAX_ROWS,
+    _H,
+    _K,
+    _KV_HEADS,
+    _R,
+    _ROWS_BLOCK_N,
+    _SCORE_HEADS,
+    _SCORE_SCALE,
+    _STREAM_SELECT_MIN_COLUMNS,
+    build_qsa_indexer_decode_scores_module,
+    build_qsa_indexer_emit_module,
+    build_qsa_indexer_prefill_scores_module,
+    build_qsa_pack_valid_blocks_module,
+)
+from .kernels.qsa.sparse_gqa import (
+    _launch_config,
+    _paged_gqa_coverage_reason,
+    _paged_gqa_lds_bytes,
+    _paged_gqa_lds_reason,
+    build_qsa_sparse_gqa_module,
+)
+from .kernels.tensor_shim import _run_compiled as _dispatch_compiled
+from .kernels.topk.topk_launch import _launch_key
+from .kernels.topk.topk_per_row_decode_persistent import (
+    build_topk_per_row_decode_one_workgroup_module,
+)
+from .topk.topk_per_row import (
+    _ONE_WORKGROUP_MAX_ROW_WIDTH,
+    flydsl_top_k_per_row_decode,
+)
+
+
+def _run_compiled(exe, *args, specialization_key=None):
+    """Dispatch one compiled kernel per tensor layout of this plan.
+
+    ``_dispatch_compiled`` keeps the first build when ``specialization_key``
+    is left unset. FlyDSL freezes the first axis whose stride is 1 and
+    leaves every other stride dynamic, so a contiguous ``[n, 1]`` table
+    (strides ``(1, 1)``) makes a later ``[n, P]`` table read ``r + p``.
+    ``_launch_key`` is the dtype, rank, and that axis, the same record
+    TopK passes for its own launches.
+    """
+    if specialization_key is None:
+        specialization_key = _launch_key(args)
+    _dispatch_compiled(exe, *args, specialization_key=specialization_key)
+
+
+_SUPPORTED_ARCHS = ("gfx942", "gfx950")
+
+
+def _qsa_arch() -> str:
+    """Live GPU arch, or raise when it is not gfx942 or gfx950.
+
+    ``get_gfx_runtime`` ignores ``GPU_ARCHS`` and returns the bare token.
+    A missing device raises ``RuntimeError`` from that lookup. The public
+    launch calls this and still rejects a bad arch.
+    """
+    arch = get_gfx_runtime()
+    if arch not in _SUPPORTED_ARCHS:
+        raise ValueError(_qsa_unsupported_arch_reason(arch))
+    return arch
+
+
+def _qsa_unsupported_arch_reason(arch: str) -> str:
+    return f"QSA supports {', '.join(_SUPPORTED_ARCHS)}, got {arch}"
+
+
+def _qsa_support_arch() -> tuple[str | None, str | None]:
+    """(arch, reason) for a support gate. Does not raise.
+
+    ``("gfx942"|"gfx950", None)`` is supported. ``(None, reason)`` is any
+    other arch ``get_gfx_runtime`` returned. ``(None, None)`` is a missing
+    device: that lookup raised ``RuntimeError``, which stays separate from
+    an unsupported arch. AOT replay patches ``get_gfx_runtime``, so a job
+    arch is read here.
+    """
+    try:
+        arch = get_gfx_runtime()
+    except RuntimeError:
+        return None, None
+    if arch not in _SUPPORTED_ARCHS:
+        return None, _qsa_unsupported_arch_reason(arch)
+    return arch, None
+
+
+# GQA query ``(Hq, D)`` -> indexer head counts swept with it.
+# An unswept rank-3 pair still runs; the table only feeds the warning.
+# Sparse GQA does not read this table. Its grid is ``(rows, kv_heads, splits)``
+# from ``_launch_config``, so a different KV-head count is a different grid.
+# M past 512 reuses the M=512 single-split config.
+_FLYDSL_DISPATCH_TABLE = {
+    (24, 256): (4, 8),  # 24 query heads, 2 KV heads
+    (12, 256): (4, 8),  # Flash-Next TP2: 12 query heads, 1 KV head
+    (6, 256): (4, 8),  # Flash-Next TP4: 6 query heads, 1 KV head
+    (3, 256): (4, 8),  # Flash-Next TP8: 3 query heads, 1 KV head
+    (10, 128): (4, 8),
+}
+
+__all__ = [
+    "flydsl_qsa_paged_gqa",
+    "qsa_indexer_block_ids",
+    "qsa_layer",
+    "span_bytes",
+]
+
+
+def span_bytes(t: torch.Tensor) -> int:
+    """Bytes from ``t``'s first element to one past its last, for any strides.
+
+    An empty tensor spans nothing. A view with gaps counts those gaps, which
+    is how a cache past 4 GiB selects the wide gather.
+    """
+    if t.numel() == 0:
+        return 0
+    last = sum((size - 1) * stride for size, stride in zip(t.shape, t.stride()))
+    return (last + 1) * t.element_size()
+
+
+def _rank3_query_pair(
+    q_indexer: torch.Tensor, q_gqa: torch.Tensor
+) -> tuple[tuple[int, int], int] | None:
+    """``((Hq, D), indexer heads)`` when both queries are rank 3.
+
+    A scalar or any other rank is not a table key. The indexer and sparse GQA report that.
+    """
+    if q_indexer.dim() != 3 or q_gqa.dim() != 3:
+        return None
+    gqa_key = (int(q_gqa.shape[1]), int(q_gqa.shape[2]))
+    return gqa_key, int(q_indexer.shape[1])
+
+
+def _warn_unmeasured_query(q_indexer: torch.Tensor, q_gqa: torch.Tensor) -> None:
+    """Log an unswept rank-3 pair. A bad rank stays quiet."""
+    pair = _rank3_query_pair(q_indexer, q_gqa)
+    if pair is None:
+        return
+    gqa_key, index_heads = pair
+    allowed = _FLYDSL_DISPATCH_TABLE.get(gqa_key)
+    if allowed is None or index_heads not in allowed:
+        _log_unmeasured_gqa_query(gqa_key, index_heads)
+
+
+@functools.cache
+def _log_unmeasured_gqa_query(gqa_key: tuple[int, int], index_heads: int) -> None:
+    """Log one table miss. The same pair does not log again."""
+    from aiter import logger
+
+    logger.warning(
+        "QSA: query pair (GQA %s, indexer heads %s) is not in the measured table",
+        gqa_key,
+        index_heads,
+    )
+
+
+def _expand_block_ids(
+    block_ids: torch.Tensor,
+    query_positions: torch.Tensor,
+    context_lens: torch.Tensor,
+    token_to_req: torch.Tensor,
+    compress_ratio: int,
+    token_topk: int,
+    indices: torch.Tensor | None,
+) -> torch.Tensor:
+    # In-tree expand. It is not fused into the indexer or sparse GQA, and it
+    # loads these three vectors without a stride.
+    from aiter.ops.qsa import qsa_expand_block_indices
+
+    return qsa_expand_block_indices(
+        block_ids,
+        query_positions.contiguous(),
+        context_lens.contiguous(),
+        token_to_req.contiguous(),
+        compress_ratio,
+        token_topk,
+        out=indices,
+    )
+
+
+@functools.lru_cache(maxsize=8)
+def _emit_plan(page_size: int, wave_size: int):
+    return build_qsa_indexer_emit_module(page_size, wave_size)
+
+
+@functools.lru_cache(maxsize=8)
+def _pack_plan(page_size: int, wave_size: int):
+    return build_qsa_pack_valid_blocks_module(page_size, wave_size)
+
+
+@functools.lru_cache(maxsize=16)
+def _scores_plan(
+    page_size: int,
+    use_k32: bool,
+    block_n: int,
+    n_heads: int = _H,
+    wide_cache: bool = False,
+    k_strides: tuple[int, int, int] | None = None,
+):
+    return build_qsa_indexer_decode_scores_module(
+        page_size, use_k32, block_n, n_heads, wide_cache, k_strides
+    )
+
+
+@functools.lru_cache(maxsize=16)
+def _prefill_scores_plan(
+    page_size: int,
+    use_k32: bool,
+    n_heads: int = _H,
+    wide_cache: bool = False,
+    k_strides: tuple[int, int, int] | None = None,
+    fold_heads: bool = False,
+):
+    return build_qsa_indexer_prefill_scores_module(
+        page_size, use_k32, n_heads, wide_cache, k_strides, fold_heads=fold_heads
+    )
+
+
+_ROWS_SCORER_MIN_ROWS_PER_REQUEST = 2
+
+
+def _indexer_uses_prefill_scorer(
+    n_requests: int, rows: int, n_heads: int, arch: str
+) -> bool:
+    """Whether this launch uses the 16-row scorer.
+
+    A tile gathers K once per request it spans and runs the MFMA for all 16
+    rows each time, so it pays off from two rows per request on average.
+    One-row decode stays on the one-row scorer. So does gfx942 H=8, which
+    has not been measured on the 16-row scorer.
+    """
+    if rows < 16 or rows < _ROWS_SCORER_MIN_ROWS_PER_REQUEST * n_requests:
+        return False
+    return not (arch.startswith("gfx942") and n_heads == 8)
+
+
+_ROWS_SCORER_TILES_PER_WG = 4
+_ROWS_SCORER_MULTI_TILE_MIN_ROWS_PER_REQUEST = 16
+_ROWS_SCORER_MIN_WORKGROUPS = 128
+_ROWS_SCORER_TWO_TILE_MIN_ROWS = 128
+_ROWS_SCORER_FOUR_TILE_MIN_ROWS = 512
+_ROWS_SCORER_MULTI_TILE_MIN_WORK = 512
+
+
+def _indexer_rows_scorer_layout(
+    n_requests: int,
+    rows: int,
+    n_heads: int,
+    live_columns: int,
+    row_bounded: bool = False,
+) -> tuple[bool, int]:
+    """``(fold_heads, tiles_per_wg)`` for a row-scorer launch.
+
+    Long prefill walks four column tiles per workgroup to reuse Q and the row
+    setup. Smaller batches give that reuse up to keep enough independent
+    workgroups on the GPU. Padded decode is row-bounded and has no
+    host-visible live width, so it keeps one tile per workgroup.
+
+    MTP instead folds four heads into the MFMA M axis: a tile is four rows,
+    and one column tile per workgroup keeps the machine full.
+    """
+    if rows < _ROWS_SCORER_MULTI_TILE_MIN_ROWS_PER_REQUEST * n_requests:
+        return n_heads == 4, 1
+    if row_bounded:
+        return False, 1
+
+    row_tiles = ceildiv(rows, 16)
+    col_tiles = ceildiv(live_columns, _ROWS_BLOCK_N)
+    tile_work = row_tiles * col_tiles
+    tiles_per_wg = 1
+    if (
+        rows >= _ROWS_SCORER_TWO_TILE_MIN_ROWS
+        or tile_work >= _ROWS_SCORER_MULTI_TILE_MIN_WORK
+    ):
+        tiles_per_wg = 2
+    if (
+        rows >= _ROWS_SCORER_FOUR_TILE_MIN_ROWS
+        and tile_work >= _ROWS_SCORER_MULTI_TILE_MIN_WORK
+    ):
+        tiles_per_wg = _ROWS_SCORER_TILES_PER_WG
+    while (
+        tiles_per_wg > 1
+        and row_tiles * ceildiv(col_tiles, tiles_per_wg) < _ROWS_SCORER_MIN_WORKGROUPS
+    ):
+        tiles_per_wg //= 2
+    return False, tiles_per_wg
+
+
+def _check_indexer_score_workspace(
+    scores: torch.Tensor, rows: int, n_columns: int
+) -> None:
+    """Reject a score buffer that is not fp32 ``[rows, n_columns]``.
+
+    The column stride stays 1 so a narrowed prefix is contiguous in each
+    row. More than one row must also have ``stride(0) >= n_columns``, so
+    the rows do not alias. A padded workspace still passes.
+    """
+    if scores.dtype != torch.float32 or tuple(scores.shape) != (rows, n_columns):
+        raise ValueError(
+            f"scores must be float32 [{rows}, {n_columns}], "
+            f"got {scores.dtype} {tuple(scores.shape)}"
+        )
+    if scores.stride(-1) != 1:
+        raise ValueError(
+            f"scores needs a unit column stride, got {tuple(scores.stride())}"
+        )
+    if rows > 1 and int(scores.stride(0)) < n_columns:
+        raise ValueError(
+            f"scores rows overlap: stride(0)={int(scores.stride(0))} "
+            f"is below {n_columns}"
+        )
+
+
+def _touched_byte_range(tensor: torch.Tensor) -> tuple[int, int] | None:
+    """Inclusive-exclusive addresses of the bytes ``tensor`` can touch."""
+    if tensor.numel() == 0:
+        return None
+    elem = tensor.element_size()
+    low = 0
+    high = 0
+    for size, stride in zip(tensor.shape, tensor.stride()):
+        step = (int(size) - 1) * int(stride) * elem
+        if step >= 0:
+            high += step
+        else:
+            low += step
+    base = tensor.data_ptr()
+    return base + low, base + high + elem
+
+
+def _tensors_overlap(left: torch.Tensor, right: torch.Tensor) -> bool:
+    """True when the two tensors can write the same byte."""
+    if left.device != right.device or left.numel() == 0 or right.numel() == 0:
+        return False
+    if left.untyped_storage().data_ptr() != right.untyped_storage().data_ptr():
+        return False
+    left_range = _touched_byte_range(left)
+    right_range = _touched_byte_range(right)
+    if left_range is None or right_range is None:
+        return False
+    return left_range[0] < right_range[1] and right_range[0] < left_range[1]
+
+
+def _check_expand_indices(
+    indices: torch.Tensor,
+    rows: int,
+    width: int,
+    device: torch.device,
+    block_ids: torch.Tensor | None,
+) -> None:
+    """Reject an expand buffer the kernel would write unsafely.
+
+    The buffer is int32 ``[rows, width]`` on ``device``, with a unit column
+    stride. More than one row needs ``stride(0) >= width``, which keeps a
+    padded workspace and rejects a broadcast view. It must not share bytes
+    with the caller's ``block_ids``.
+    """
+    if indices.dtype != torch.int32 or tuple(indices.shape) != (rows, width):
+        raise ValueError(
+            f"indices must be int32 [{rows}, {width}], "
+            f"got {indices.dtype} {tuple(indices.shape)}"
+        )
+    if indices.device != device:
+        raise ValueError(f"indices must be on {device}, got {indices.device}")
+    if indices.stride(-1) != 1:
+        raise ValueError(
+            f"indices needs a unit column stride, got {tuple(indices.stride())}"
+        )
+    if rows > 1 and int(indices.stride(0)) < width:
+        raise ValueError(
+            f"indices rows overlap: stride(0)={int(indices.stride(0))} "
+            f"is below {width}"
+        )
+    if block_ids is not None and _tensors_overlap(indices, block_ids):
+        raise ValueError("indices must not alias block_ids")
+
+
+def _pack_missing_pages(out, page_table, token_to_req, context_lens, k_cache):
+    """Drop ids on a missing page from ``out`` and pack the rest before -1.
+
+    For the selectors that can pick a ``-inf`` column when fewer than 512
+    are finite; emit and the one-workgroup radix never do."""
+    page_size = int(k_cache.shape[1])
+    _run_compiled(
+        _pack_plan(page_size, get_warp_size(_qsa_arch())),
+        out,
+        page_table,
+        token_to_req,
+        int(page_table.shape[1]) * page_size,
+        int(k_cache.shape[0]),
+        int(context_lens.shape[0]),
+        int(out.shape[0]),
+        torch.cuda.current_stream(out.device),
+    )
+
+
+# Same cap as ``aiter.ops.qsa.DEFAULT_LOGITS_WORKSPACE_BYTES``. That module
+# imports this one, so the number is repeated here.
+_SCORE_WORKSPACE_BYTES = 128 * 1024 * 1024
+
+
+def _score_workspace_rows(n_columns: int) -> int:
+    """How many fp32 score rows of ``n_columns`` fit in 128 MiB."""
+    return max(1, _SCORE_WORKSPACE_BYTES // max(int(n_columns) * 4, 1))
+
+
+def qsa_indexer_score_and_select(
+    q: torch.Tensor,
+    k_cache: torch.Tensor,
+    page_table: torch.Tensor,
+    token_to_req: torch.Tensor,
+    query_positions: torch.Tensor,
+    context_lens: torch.Tensor,
+    out: torch.Tensor,
+    n_columns: int,
+    score_scale: float,
+    n_heads: int,
+    live_columns: int | None = None,
+    row_bounded: bool = False,
+    scores: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Score long rows into ``[M, n_columns]`` and write top-512 ids into ``out``.
+
+    ``n_heads`` is 4 or 8, each a separate compile. ``M >= 16`` rows
+    averaging two or more per request use the 16-row scorer, except
+    gfx942 H=8, which stays on the one-row scorer. ``live_columns`` is
+    the widest visible row. The score buffer stays the width of the
+    table, and the selector sees that prefix. A padded table with at
+    most 64 rows and at most 20000 live columns uses the one-workgroup
+    decode radix. More than 64 rows use the stable decode radix at any
+    width. Otherwise a packed table uses the stable decode radix below
+    32768 columns and streaming radix (``tie='low'``) at or above that.
+    ``row_bounded``
+    runs the one-workgroup decode radix on the full width instead: it
+    stops at each row's ``row_lens``, so it needs no readback of the
+    widest row.
+
+    ``scores`` is an optional fp32 ``[M, n_columns]`` workspace with a
+    unit column stride. When ``M`` is more than one, the row stride is at
+    least ``n_columns``, so the rows do not alias. ``None`` allocates at
+    most 128 MiB and reuses that buffer across row chunks. The scorer and
+    the selector stay the ones chosen for the whole batch, including a
+    chunk shorter than 16 rows or 64 rows. A caller buffer is the full
+    matrix and is launched once. The buffer is overwritten and is not
+    returned.
+    """
+    if n_heads not in _SCORE_HEADS:
+        raise ValueError(f"score heads must be {_SCORE_HEADS}, got {n_heads}")
+    if q.shape[1] != n_heads:
+        raise ValueError(f"q must have {n_heads} heads, got {tuple(q.shape)}")
+    m = int(q.shape[0])
+    n_columns = int(n_columns)
+    if scores is not None:
+        _check_indexer_score_workspace(scores, m, n_columns)
+        if scores.device != q.device:
+            raise ValueError("scores must be on the same device as q")
+        return _score_and_select_rows(
+            q,
+            k_cache,
+            page_table,
+            token_to_req,
+            query_positions,
+            context_lens,
+            out,
+            n_columns,
+            score_scale,
+            n_heads,
+            live_columns=live_columns,
+            row_bounded=row_bounded,
+            scores=scores,
+            batch_rows=m,
+        )
+    rows_per_chunk = _score_workspace_rows(n_columns)
+    if m <= rows_per_chunk:
+        return _score_and_select_rows(
+            q,
+            k_cache,
+            page_table,
+            token_to_req,
+            query_positions,
+            context_lens,
+            out,
+            n_columns,
+            score_scale,
+            n_heads,
+            live_columns=live_columns,
+            row_bounded=row_bounded,
+            scores=None,
+            batch_rows=m,
+        )
+    chunk_scores = torch.empty(
+        rows_per_chunk, n_columns, dtype=torch.float32, device=q.device
+    )
+    for row_start in range(0, m, rows_per_chunk):
+        row_end = min(m, row_start + rows_per_chunk)
+        _score_and_select_rows(
+            q[row_start:row_end],
+            k_cache,
+            page_table,
+            token_to_req[row_start:row_end],
+            query_positions[row_start:row_end],
+            context_lens,
+            out[row_start:row_end],
+            n_columns,
+            score_scale,
+            n_heads,
+            live_columns=live_columns,
+            row_bounded=row_bounded,
+            scores=chunk_scores[: row_end - row_start],
+            batch_rows=m,
+        )
+    return out
+
+
+def _score_and_select_rows(
+    q: torch.Tensor,
+    k_cache: torch.Tensor,
+    page_table: torch.Tensor,
+    token_to_req: torch.Tensor,
+    query_positions: torch.Tensor,
+    context_lens: torch.Tensor,
+    out: torch.Tensor,
+    n_columns: int,
+    score_scale: float,
+    n_heads: int,
+    live_columns: int | None,
+    row_bounded: bool,
+    scores: torch.Tensor | None,
+    batch_rows: int,
+) -> torch.Tensor:
+    """Score ``q`` and select into ``out``. Policy follows ``batch_rows``.
+
+    ``q`` may be a row chunk of a larger batch. ``batch_rows`` is that
+    batch, so a short chunk keeps the full batch's scorer and selector.
+    ``page_table`` and ``context_lens`` stay the whole launch; the row
+    arguments are the chunk.
+    """
+    m = int(q.shape[0])
+    n_columns = int(n_columns)
+    if scores is not None:
+        _check_indexer_score_workspace(scores, m, n_columns)
+        if scores.device != q.device:
+            raise ValueError("scores must be on the same device as q")
+    arch = _qsa_arch()
+    use_k32 = arch == "gfx950"
+    page_size = k_cache.shape[1]
+    score_block_n = 32
+    if scores is None:
+        scores = torch.empty(m, n_columns, dtype=torch.float32, device=q.device)
+    row_lens = torch.empty(m, dtype=torch.int32, device=q.device)
+    score_tiles = ceildiv(n_columns, score_block_n)
+    # numel() is the packed page. The page stride may be larger than the
+    # packed page, and the descriptor covers that span.
+    wide_cache = span_bytes(k_cache) > (1 << 32)
+    k_strides = tuple(int(s) for s in k_cache.stride()[:3]) if wide_cache else None
+    n_requests = int(context_lens.shape[0])
+    # Scorer family follows the whole batch. A one-row tail must not drop
+    # a prefill onto the one-row scorer.
+    if _indexer_uses_prefill_scorer(n_requests, batch_rows, n_heads, arch):
+        layout_columns = n_columns if live_columns is None else int(live_columns)
+        fold_heads, tiles_per_wg = _indexer_rows_scorer_layout(
+            n_requests,
+            batch_rows,
+            n_heads,
+            layout_columns,
+            row_bounded=row_bounded,
+        )
+        # tiles_per_wg only fills the GPU, so a chunk may retune it.
+        # fold_heads and row_bounded stay on the batch decision.
+        if m != batch_rows and not fold_heads and not row_bounded:
+            tiles_per_wg = _indexer_rows_scorer_layout(
+                n_requests,
+                m,
+                n_heads,
+                layout_columns,
+                row_bounded=False,
+            )[1]
+        col_tiles = ceildiv(n_columns, _ROWS_BLOCK_N)
+        tile_rows = 16 // n_heads if fold_heads else 16
+        _run_compiled(
+            _prefill_scores_plan(
+                page_size, use_k32, n_heads, wide_cache, k_strides, fold_heads
+            ),
+            q,
+            k_cache,
+            page_table,
+            token_to_req,
+            query_positions,
+            context_lens,
+            scores,
+            row_lens,
+            int(n_columns),
+            m,
+            int(context_lens.shape[0]),
+            float(score_scale),
+            int(k_cache.shape[0]),
+            ceildiv(m, tile_rows),
+            ceildiv(col_tiles, tiles_per_wg),
+            tiles_per_wg,
+            torch.cuda.current_stream(q.device),
+        )
+    else:
+        _run_compiled(
+            _scores_plan(
+                page_size, use_k32, score_block_n, n_heads, wide_cache, k_strides
+            ),
+            q,
+            k_cache,
+            page_table,
+            token_to_req,
+            query_positions,
+            context_lens,
+            scores,
+            row_lens,
+            int(n_columns),
+            int(context_lens.shape[0]),
+            float(score_scale),
+            int(k_cache.shape[0]),
+            m,
+            score_tiles,
+            torch.cuda.current_stream(q.device),
+        )
+    if row_bounded:
+        # row_starts is unread with packed_rows off; row_lens keeps the signature.
+        _run_compiled(
+            build_topk_per_row_decode_one_workgroup_module(
+                _K,
+                wave_size=get_warp_size(arch),
+                write_values=False,
+                compact=True,
+                finite_only=True,
+            ),
+            scores,
+            row_lens,
+            row_lens,
+            out,
+            scores,
+            int(n_columns),
+            1,
+            scores.stride(0),
+            m,
+            torch.cuda.current_stream(q.device),
+        )
+        return out
+    select_columns = n_columns if live_columns is None else int(live_columns)
+    if select_columns < 1 or select_columns > n_columns:
+        raise ValueError(
+            f"live_columns must be in 1..{n_columns}, got {select_columns}"
+        )
+    # The prefix is contiguous in each row (stride 1). Narrowing it is what
+    # lets a padded allocation take the short-row selector: that dispatch
+    # reads the tensor width, not row_lens. One workgroup per row is the
+    # decode shape (at most 64 rows). A prefill takes the decode radix at any
+    # width and stops at each row's row_lens. The streaming selector is the
+    # other path for a wide table.
+    scored = (
+        scores if select_columns == n_columns else scores.narrow(1, 0, select_columns)
+    )
+    narrowed = select_columns < n_columns
+    # A chunk of 64 or fewer rows must not switch a prefill from the
+    # stable radix to streaming. That switch reads the batch row count.
+    one_workgroup = (
+        narrowed
+        and select_columns <= _ONE_WORKGROUP_MAX_ROW_WIDTH
+        and batch_rows <= _DECODE_MAX_ROWS
+    )
+    if (
+        one_workgroup
+        or batch_rows > _DECODE_MAX_ROWS
+        or (not narrowed and select_columns < _STREAM_SELECT_MIN_COLUMNS)
+    ):
+        finite_only = select_columns <= _ONE_WORKGROUP_MAX_ROW_WIDTH
+        flydsl_top_k_per_row_decode(
+            scored,
+            1,
+            row_lens,
+            out,
+            m,
+            scored.stride(0),
+            scored.stride(1),
+            k=_K,
+            stable=True,
+            arch=get_gfx_runtime(),
+            finite_only=finite_only,
+        )
+        if not finite_only:
+            _pack_missing_pages(out, page_table, token_to_req, context_lens, k_cache)
+    else:
+        # Import here so loading this module does not pull aiter.ops.enum.
+        # A compile-only process has not built module_aiter_core, and that
+        # import calls get_module.
+        from aiter.ops.topk_select import topk_select
+
+        topk_select(
+            scored,
+            _K,
+            end=row_lens,
+            output_idx=out,
+            tie="low",
+        )
+        _pack_missing_pages(out, page_table, token_to_req, context_lens, k_cache)
+    return out
+
+
+def qsa_indexer_supported(
+    q: torch.Tensor,
+    k_cache: torch.Tensor,
+    page_table: torch.Tensor,
+    heads: tuple[int, ...] = _SCORE_HEADS,
+) -> str | None:
+    """Why the indexer kernel does not support these tensors, or None if it does.
+
+    ``heads`` narrows the accepted indexer head count; pass ``(4,)`` to
+    reject the 8-head variant. Every other check is the same either way.
+    gfx942 and gfx950 stay supported. Any other arch is a reason. When
+    ``get_gfx_runtime`` raises ``RuntimeError``, this still returns None.
+    """
+    if not heads or any(h not in _SCORE_HEADS for h in heads):
+        raise ValueError(f"heads must be a non-empty subset of {_SCORE_HEADS}")
+    if q.dtype != torch.bfloat16 or k_cache.dtype != torch.bfloat16:
+        return f"q and k_cache must be bfloat16, got {q.dtype} and {k_cache.dtype}"
+    if q.dim() != 3 or q.shape[1] not in heads or q.shape[2] != _D:
+        allowed = "|".join(str(h) for h in heads)
+        return f"q must be [M, {allowed}, {_D}], got {tuple(q.shape)}"
+    if k_cache.dim() != 4:
+        return f"k_cache must be [pages, page_size, H, D], got {tuple(k_cache.shape)}"
+    if k_cache.shape[2] != _KV_HEADS or k_cache.shape[3] != _D:
+        return f"k_cache KV/D must be ({_KV_HEADS}, {_D}), got {k_cache.shape[2:]}"
+    if k_cache.shape[1] < 1:
+        return f"page_size must be positive, got {int(k_cache.shape[1])}"
+    # Read in place. D is contiguous and the token stride is D; the page
+    # stride may be larger than the packed page. The gather is a 16-byte
+    # load, so that stride has to be a multiple of 8 elements. A copy is not.
+    if k_cache.stride(3) != 1:
+        return f"k_cache needs a unit D stride, got {k_cache.stride()}"
+    if any(s % 8 for s in k_cache.stride()[:3]):
+        return (
+            f"k_cache strides must be multiples of 8 elements, got {k_cache.stride()}"
+        )
+    if page_table.dim() != 2 or page_table.dtype != torch.int32:
+        return (
+            f"page_table must be int32 [n_req, n_pages], got {tuple(page_table.shape)}"
+        )
+    # Shape checks above still apply with no device. An unsupported arch is
+    # a reason here; the launch's _qsa_arch() raise is unchanged.
+    _, reason = _qsa_support_arch()
+    return reason
+
+
+def qsa_indexer_selection_supported(token_topk: int, compress_ratio: int) -> str | None:
+    """Why this token budget is outside the baked indexer contract, or None.
+
+    The indexer writes ``[_K]`` block ids and divides positions by ``_R``. Expand
+    then expects ``token_topk // compress_ratio`` columns, so a budget of
+    1024 tokens at ratio 4 is rejected there, while 4096 tokens at ratio 8
+    still has 512 columns and would be attended at the wrong positions.
+    """
+    if compress_ratio != _R or token_topk != _K * _R:
+        return (
+            f"FlyDSL indexer selects {_K} blocks at compress ratio {_R} "
+            f"(token_topk={_K * _R}), got token_topk={token_topk} "
+            f"compress_ratio={compress_ratio}"
+        )
+    return None
+
+
+def _indexer_empty_geometry(
+    m: int,
+    k_cache: torch.Tensor,
+    page_table: torch.Tensor,
+    context_lens: torch.Tensor,
+) -> bool:
+    """True when every selection is -1 and the indexer must not launch.
+
+    The scorers clamp a missing request or page to 0 and still load it.
+    An empty context, cache, or page table has no such element.
+    """
+    return (
+        m == 0
+        or context_lens.shape[0] == 0
+        or k_cache.shape[0] == 0
+        or page_table.shape[0] == 0
+        or page_table.shape[1] == 0
+    )
+
+
+def _prepare_indexer_launch(
+    q: torch.Tensor,
+    k_cache: torch.Tensor,
+    page_table: torch.Tensor,
+    token_to_req: torch.Tensor,
+    query_positions: torch.Tensor,
+    context_lens: torch.Tensor,
+    out: torch.Tensor | None,
+    scores: torch.Tensor | None,
+    heads: tuple[int, ...],
+) -> tuple[int, str]:
+    """Host checks for one indexer call. Returns ``(rows, arch)``.
+
+    Empty geometry still prepares successfully. The caller then writes
+    ``-1``, or ``qsa_layer`` passes zero columns to expand.
+    """
+    reason = qsa_indexer_supported(q, k_cache, page_table, heads)
+    if reason is not None:
+        raise ValueError(f"[FlyDSL qsa_indexer_block_ids] {reason}")
+    m = q.shape[0]
+    if token_to_req.shape != (m,) or token_to_req.dtype != torch.int32:
+        raise ValueError(f"token_to_req must be int32 [{m}]")
+    if query_positions.shape != (m,) or query_positions.dtype != torch.int32:
+        raise ValueError(f"query_positions must be int32 [{m}]")
+    if context_lens.dim() != 1 or context_lens.dtype != torch.int32:
+        raise ValueError("context_lens must be 1-D int32")
+    if context_lens.shape[0] > page_table.shape[0]:
+        raise ValueError(
+            f"page_table has {int(page_table.shape[0])} request rows for "
+            f"{int(context_lens.shape[0])} context lengths"
+        )
+    if out is not None and (out.shape != (m, _K) or out.dtype != torch.int32):
+        raise ValueError(f"out must be int32 [{m}, {_K}], got {tuple(out.shape)}")
+    if out is not None and not out.is_contiguous():
+        raise ValueError("out must be contiguous")
+    if scores is not None:
+        _check_indexer_score_workspace(
+            scores, m, int(page_table.shape[1]) * int(k_cache.shape[1])
+        )
+    tensors = (q, k_cache, page_table, token_to_req, query_positions, context_lens)
+    if out is not None:
+        tensors = tensors + (out,)
+    if scores is not None:
+        tensors = tensors + (scores,)
+    if any(not t.is_cuda for t in tensors):
+        raise ValueError("every tensor must be on the GPU")
+    if any(t.device != q.device for t in tensors[1:]):
+        raise ValueError("every tensor must be on the same GPU")
+    return m, _qsa_arch()
+
+
+def _write_indexer_block_ids(
+    q: torch.Tensor,
+    k_cache: torch.Tensor,
+    page_table: torch.Tensor,
+    token_to_req: torch.Tensor,
+    query_positions: torch.Tensor,
+    context_lens: torch.Tensor,
+    out: torch.Tensor | None,
+    score_scale: float,
+    scores: torch.Tensor | None,
+    m: int,
+    arch: str,
+) -> torch.Tensor:
+    """Write ``block_ids [M, 512]`` after ``_prepare_indexer_launch``."""
+    if _indexer_empty_geometry(m, k_cache, page_table, context_lens):
+        if out is None:
+            out = torch.empty(m, _K, dtype=torch.int32, device=q.device)
+        return out.fill_(-1)
+    if out is None:
+        out = torch.empty(m, _K, dtype=torch.int32, device=q.device)
+    q = q.contiguous()
+    # Leave k_cache strided. contiguous() would copy it into every captured
+    # decode graph.
+    page_table = page_table.contiguous()
+    token_to_req = token_to_req.contiguous()
+    query_positions = query_positions.contiguous()
+    context_lens = context_lens.contiguous()
+    page_size = k_cache.shape[1]
+    n_columns = page_table.shape[1] * page_size
+    # A packed table at or under the one-workgroup cutoff already names its
+    # real width, so emit and the selector see it without a readback. A
+    # wider allocation with at most 64 rows is padded decode. Eager and
+    # capture both select with the one-workgroup radix on the full width.
+    # That radix stops at each row's visible length, so neither path reads
+    # the widest row back to the host. A row longer than 20000 columns
+    # finishes the later radix passes from the first-pass candidates when
+    # those fit in LDS. Prefill (more than 64 rows) keeps the allocation
+    # width and does not read it back.
+    row_bounded = n_columns > _ONE_WORKGROUP_MAX_ROW_WIDTH and m <= _DECODE_MAX_ROWS
+    if n_columns <= _K:
+        _run_compiled(
+            _emit_plan(page_size, get_warp_size(arch)),
+            token_to_req,
+            query_positions,
+            context_lens,
+            page_table,
+            out,
+            int(n_columns),
+            int(context_lens.shape[0]),
+            int(k_cache.shape[0]),
+            m,
+            torch.cuda.current_stream(q.device),
+        )
+    else:
+        qsa_indexer_score_and_select(
+            q,
+            k_cache,
+            page_table,
+            token_to_req,
+            query_positions,
+            context_lens,
+            out,
+            int(n_columns),
+            float(score_scale),
+            int(q.shape[1]),
+            live_columns=int(n_columns),
+            row_bounded=row_bounded,
+            scores=scores,
+        )
+    return out
+
+
+def qsa_indexer_block_ids(
+    q: torch.Tensor,
+    k_cache: torch.Tensor,
+    page_table: torch.Tensor,
+    token_to_req: torch.Tensor,
+    query_positions: torch.Tensor,
+    context_lens: torch.Tensor,
+    out: torch.Tensor | None = None,
+    score_scale: float = _SCORE_SCALE,
+    heads: tuple[int, ...] = _SCORE_HEADS,
+    scores: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Write indexer ``block_ids [M, 512]`` from paged compressed K.
+
+    Rows no wider than 512 use the fused emit path. Longer rows materialize
+    scores with a BLOCK_N=32 MFMA writer. A block on a missing page is
+    dropped and the kept ids stay packed in front of ``-1``, so a short
+    context does not fill the budget with that page: emit and the
+    one-workgroup radix skip it, and a separate pack follows the split
+    and streaming selectors.     ``scores`` is an optional fp32
+    ``[M, n_columns]`` workspace for that writer, with a unit column
+    stride. ``n_columns`` is ``page_table.shape[1] * page_size``. When
+    ``M`` is more than one, the row stride is at least ``n_columns``.
+    ``None`` allocates at most 128 MiB and reuses it across row chunks.
+    A caller buffer is the full matrix and is launched once. Emit does
+    not read it. The buffer is overwritten and is not returned. Batches averaging two or more rows per request score 16
+    query rows per workgroup, except gfx942 H=8; one-row decode uses one row
+    per workgroup. Padded decode (more than 20000 columns and at most 64
+    rows) selects with the one-workgroup radix on the full width and stops
+    at each row's visible length. Prefill (more than 64 rows) keeps the
+    allocation width and uses the stable decode radix. A packed table at
+    or under 20000 columns uses that radix as well.
+    Expand+tail is still separate. An empty context, cache, or page table
+    writes ``-1`` and does not launch. A page table with fewer request
+    rows than ``context_lens`` is rejected.
+
+    ``heads`` is the accepted head count. Pass ``(4,)`` to keep the contract
+    narrow; the ``(4, 8)`` default also admits the 8-head indexer.
+    """
+    m, arch = _prepare_indexer_launch(
+        q,
+        k_cache,
+        page_table,
+        token_to_req,
+        query_positions,
+        context_lens,
+        out,
+        scores,
+        heads,
+    )
+    return _write_indexer_block_ids(
+        q,
+        k_cache,
+        page_table,
+        token_to_req,
+        query_positions,
+        context_lens,
+        out,
+        score_scale,
+        scores,
+        m,
+        arch,
+    )
+
+
+@functools.lru_cache(maxsize=32)
+def _plan(
+    n_q_heads: int,
+    n_kv_heads: int,
+    head_dim: int,
+    page_size: int,
+    use_k32: bool,
+    block_n: int,
+    block_threads: int,
+    n_splits: int,
+    wide_cache: bool,
+    kv_strides: tuple[int, int, int] | None = None,
+):
+    return build_qsa_sparse_gqa_module(
+        n_q_heads,
+        n_kv_heads,
+        head_dim,
+        page_size,
+        use_k32,
+        block_n,
+        block_threads,
+        n_splits,
+        wide_cache,
+        kv_strides,
+    )
+
+
+def flydsl_qsa_paged_gqa_supported(
+    q: torch.Tensor,
+    k_cache: torch.Tensor,
+    v_cache: torch.Tensor,
+    indices: torch.Tensor,
+    page_table: torch.Tensor,
+) -> str | None:
+    """Why the sparse GQA kernel does not support these tensors, or None if it does."""
+    if q.dtype != torch.bfloat16 or k_cache.dtype != torch.bfloat16:
+        return f"q and caches must be bfloat16, got {q.dtype} and {k_cache.dtype}"
+    if v_cache.dtype != k_cache.dtype or v_cache.shape != k_cache.shape:
+        return "v_cache must match k_cache dtype and shape"
+    if q.dim() != 3:
+        return f"q must be [M, Hq, D], got {tuple(q.shape)}"
+    if k_cache.dim() != 4:
+        return f"k_cache must be [pages, page_size, H, D], got {tuple(k_cache.shape)}"
+    if k_cache.shape[3] != q.shape[2]:
+        return f"k_cache D must be q's {q.shape[2]}, got {k_cache.shape[3]}"
+    # The same geometries build_qsa_sparse_gqa_module rejects for the launch
+    # _launch_config would compile from these tensors. A reason here keeps
+    # the caller from launching a kernel that raises, drops a tail of D, or
+    # asks for more LDS than the device has. BLOCK_N and the workgroup still
+    # come from that policy.
+    n_q_heads = int(q.shape[1])
+    n_kv_heads = int(k_cache.shape[2])
+    head_dim = int(q.shape[2])
+    page_size = int(k_cache.shape[1])
+    if n_kv_heads < 1 or n_q_heads % n_kv_heads:
+        return f"{n_q_heads} query heads do not group over {n_kv_heads} KV heads"
+    if n_q_heads // n_kv_heads > 16:
+        return f"group must fit one MFMA M dim, got {n_q_heads // n_kv_heads}"
+    if head_dim % 32:
+        return f"head_dim must be a multiple of 32, got {head_dim}"
+    if page_size < 1:
+        return f"page_size must be positive, got {page_size}"
+    # Paged caches are read in place. A K|V-interleaved view
+    # ([pages, page_size, H, 2 * D] split in two) is fine; a copy is not.
+    if k_cache.stride(3) != 1 or v_cache.stride(3) != 1:
+        return f"k_cache and v_cache need a unit D stride, got {k_cache.stride()}"
+    if k_cache.stride() != v_cache.stride():
+        return (
+            f"k_cache and v_cache strides differ: {k_cache.stride()} vs "
+            f"{v_cache.stride()}"
+        )
+    if any(s % 8 for s in k_cache.stride()[:3]):
+        return (
+            f"k_cache strides must be multiples of 8 elements, got {k_cache.stride()}"
+        )
+    if indices.dim() != 2 or indices.shape[0] != q.shape[0]:
+        return "indices must be [M, W]"
+    if indices.dtype != torch.int32:
+        return f"indices must be int32, got {indices.dtype}"
+    if page_table.dim() != 2 or page_table.dtype != torch.int32:
+        return (
+            f"page_table must be int32 [n_req, n_pages], got {tuple(page_table.shape)}"
+        )
+    # The tile does not depend on the CU count, and this gate runs with no
+    # device. The split count is discarded.
+    block_n, block_threads, _ = _launch_config(
+        int(q.shape[0]), int(indices.shape[1]), n_kv_heads, head_dim, num_cus=1
+    )
+    coverage = _paged_gqa_coverage_reason(head_dim, block_n, block_threads)
+    if coverage is not None:
+        return coverage
+    # No device: the geometry checks above still apply, and a launch cannot
+    # compile. AOT replay patches get_gfx_runtime, so this sees the job arch.
+    # RuntimeError from that lookup stays "no device" (None once the geometry
+    # is valid). Any other arch is a reason, before the LDS check, which only
+    # knows the gfx942 and gfx950 layouts.
+    arch, reason = _qsa_support_arch()
+    if reason is not None:
+        return reason
+    if arch is None:
+        return None
+    use_k32 = arch == "gfx950"
+    return _paged_gqa_lds_reason(
+        _paged_gqa_lds_bytes(head_dim, block_n, block_threads, use_k32),
+        use_k32,
+    )
+
+
+def _take_paged_gqa_workspace(workspace, n_splits, rows, n_q_heads, head_dim, device):
+    """Return the caller pair, or raise if it cannot hold this split."""
+    if not isinstance(workspace, tuple) or len(workspace) != 2:
+        raise ValueError("workspace must be (partial_out, partial_lse)")
+    partial_out, partial_lse = workspace
+    out_shape = (n_splits, rows, n_q_heads, head_dim)
+    lse_shape = (n_splits, rows, n_q_heads)
+    if (
+        not isinstance(partial_out, torch.Tensor)
+        or partial_out.dtype != torch.float32
+        or tuple(partial_out.shape) != out_shape
+        or not partial_out.is_contiguous()
+        or partial_out.device != device
+    ):
+        raise ValueError(
+            f"partial_out must be contiguous float32 {out_shape} on {device}"
+        )
+    if (
+        not isinstance(partial_lse, torch.Tensor)
+        or partial_lse.dtype != torch.float32
+        or tuple(partial_lse.shape) != lse_shape
+        or not partial_lse.is_contiguous()
+        or partial_lse.device != device
+    ):
+        raise ValueError(
+            f"partial_lse must be contiguous float32 {lse_shape} on {device}"
+        )
+    return partial_out, partial_lse
+
+
+def flydsl_qsa_paged_gqa(
+    q: torch.Tensor,
+    k_cache: torch.Tensor,
+    v_cache: torch.Tensor,
+    indices: torch.Tensor,
+    page_table: torch.Tensor,
+    token_to_req: torch.Tensor,
+    out: torch.Tensor | None = None,
+    softmax_scale: float | None = None,
+    workspace: tuple[torch.Tensor, torch.Tensor] | None = None,
+    num_cus: int | None = None,
+) -> torch.Tensor:
+    """Write sparse GQA ``o [M, Hq, D]`` from paged K/V.
+
+    ``workspace`` is ``(partial_out, partial_lse)`` for a split launch.
+    ``None`` allocates that pair. A one-split launch writes ``out``
+    directly and does not read ``workspace``. ``num_cus`` is the CU count
+    the prefill split target uses. ``None`` reads ``get_cu_num()``. A
+    caller that compiles more than one arch in one process passes the
+    count for that arch, because ``get_cu_num()`` is cached for the process.
+    """
+    reason = flydsl_qsa_paged_gqa_supported(q, k_cache, v_cache, indices, page_table)
+    if reason is not None:
+        raise ValueError(f"[flydsl_qsa_paged_gqa] {reason}")
+    rows = q.shape[0]
+    n_q_heads = int(q.shape[1])
+    head_dim = int(q.shape[2])
+    n_kv_heads = int(k_cache.shape[2])
+    if token_to_req.shape != (rows,) or token_to_req.dtype != torch.int32:
+        raise ValueError(f"token_to_req must be int32 [{rows}]")
+    if out is None:
+        # The plan cache keeps the first compile, and that compile bakes
+        # the output stride. empty_like would copy a non-contiguous q.
+        out = torch.empty(q.shape, dtype=q.dtype, device=q.device)
+    elif out.shape != q.shape or out.dtype != q.dtype:
+        raise ValueError(f"out must match q, got {tuple(out.shape)} {out.dtype}")
+    elif not out.is_contiguous():
+        raise ValueError("out must be contiguous")
+    tensors = (q, k_cache, v_cache, indices, page_table, token_to_req, out)
+    if any(not tensor.is_cuda for tensor in tensors):
+        raise ValueError("every tensor must be on the GPU")
+    if any(tensor.device != q.device for tensor in tensors[1:]):
+        raise ValueError("every tensor must be on the same GPU")
+    arch = _qsa_arch()
+    if softmax_scale is None:
+        softmax_scale = head_dim**-0.5
+    if not rows or not indices.shape[1]:
+        return out.zero_()
+    # Nothing to gather. Clamping the index to 0 would still load, including
+    # a table that has columns but no request row for safe_req.
+    if k_cache.shape[0] == 0 or page_table.shape[0] == 0 or page_table.shape[1] == 0:
+        return out.zero_()
+
+    q = q.contiguous()
+    indices = indices.contiguous()
+    page_table = page_table.contiguous()
+    token_to_req = token_to_req.contiguous()
+    # Unsigned 32-bit V# span. Exactly 4 GiB still fits: the last byte
+    # offset is 2^32 - 1. Python ints do not wrap. A strided view spans
+    # more than its numel.
+    wide_cache = span_bytes(k_cache) > (1 << 32)
+    kv_strides = tuple(int(s) for s in k_cache.stride()[:3]) if wide_cache else None
+    page_size = k_cache.shape[1]
+    use_k32 = arch == "gfx950"
+    n_sel = int(indices.shape[1])
+    if num_cus is None:
+        num_cus = int(get_cu_num())
+    block_n, block_threads, n_splits = _launch_config(
+        rows, n_sel, n_kv_heads, head_dim, num_cus
+    )
+    if n_splits == 1:
+        # The split kernel stores straight into out. A caller workspace
+        # is not a second buffer on this path.
+        partial_out = out
+        partial_lse = out
+    elif workspace is None:
+        partial_out = torch.empty(
+            (n_splits, rows, n_q_heads, head_dim), dtype=torch.float32, device=q.device
+        )
+        partial_lse = torch.empty(
+            (n_splits, rows, n_q_heads), dtype=torch.float32, device=q.device
+        )
+    else:
+        partial_out, partial_lse = _take_paged_gqa_workspace(
+            workspace, n_splits, rows, n_q_heads, head_dim, q.device
+        )
+
+    _run_compiled(
+        _plan(
+            n_q_heads,
+            n_kv_heads,
+            head_dim,
+            page_size,
+            use_k32,
+            block_n,
+            block_threads,
+            n_splits,
+            wide_cache,
+            kv_strides,
+        ),
+        q,
+        k_cache,
+        v_cache,
+        indices,
+        page_table,
+        token_to_req,
+        partial_out,
+        partial_lse,
+        out,
+        n_sel,
+        int(page_table.shape[0]),
+        int(page_table.shape[1]),
+        int(k_cache.shape[0]),
+        float(softmax_scale * LOG2E),
+        int(rows),
+        int(n_kv_heads),
+        int(n_q_heads),
+        torch.cuda.current_stream(q.device),
+    )
+    return out
+
+
+def qsa_layer(
+    q_indexer: torch.Tensor,
+    index_k_cache: torch.Tensor,
+    index_page_table: torch.Tensor,
+    q_gqa: torch.Tensor,
+    k_cache: torch.Tensor,
+    v_cache: torch.Tensor,
+    kv_page_table: torch.Tensor,
+    token_to_req: torch.Tensor,
+    query_positions: torch.Tensor,
+    context_lens: torch.Tensor,
+    indices: torch.Tensor | None = None,
+    block_ids: torch.Tensor | None = None,
+    out: torch.Tensor | None = None,
+    token_topk: int = 2048,
+    compress_ratio: int = 4,
+    score_scale: float | None = None,
+    softmax_scale: float | None = None,
+    scores: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Run one QSA layer: indexer select, expand+tail, sparse GQA.
+
+    Returns the bf16 GQA tensor ``[M, Hq, D]``. A caller-provided ``out``
+    is that tensor.
+
+    The layer is the indexer, ``qsa_expand_block_indices``, and
+    ``flydsl_qsa_paged_gqa``. It raises on a token
+    budget other than 512 blocks at compress ratio 4. The live GPU must
+    be gfx942 or gfx950. ``get_gfx_runtime`` decides that, and any other
+    architecture raises. A rank-3 pair missing from the measured table
+    logs once and still runs. A query that is not rank 3 does not log;
+    the indexer or paged GQA reports it. Indexer scores are multiplied by ``score_scale``
+    and QK by ``softmax_scale``. ``None`` is ``head_dim**-0.5`` for that
+    tensor.
+
+    Args:
+        q_indexer: bf16 ``[M, H, 128]``. FlyDSL accepts ``H`` of 4 or 8.
+        index_k_cache: bf16 ``[pages, page_size, 1, 128]``. The D stride
+            is 1. The page, token, and head strides are multiples of 8
+            elements. The cache is read in place.
+        index_page_table: int32 ``[n_req, n_pages]``.
+        q_gqa: bf16 ``[M, Hq, D]``, on the same GPU as the other tensors.
+        k_cache, v_cache: bf16 ``[pages, page_size, Hkv, D]``, matching
+            each other in shape and stride, with a unit D stride and the
+            same 8-element stride rule. ``Hq`` divides across ``Hkv`` in
+            a group of at most 16. ``D`` is a multiple of 32 and fills
+            the paged GQA gather, K LDS map, and PV tile.
+        kv_page_table: int32 ``[n_req, n_pages]``.
+        token_to_req, query_positions: int32 ``[M]``.
+        context_lens: 1-D int32, with no more rows than ``index_page_table``.
+        indices: optional int32 ``[M, token_topk + compress_ratio - 1]``
+            expand buffer on the same device as ``q_indexer``. The column
+            stride is 1. When ``M`` is more than one, the row stride is at
+            least the width, and the buffer must not alias ``block_ids``.
+            ``None`` allocates it.
+        block_ids: optional caller-owned contiguous int32 ``[M, 512]``.
+            Each call overwrites it. A row is a packed set of unique
+            compressed block ids, then ``-1`` through column 512. The
+            order is not a score ranking, and an exact tie keeps the
+            smaller index. ``-1`` is padding, including a row with no
+            visible block. The incomplete tail is not stored here; expand
+            writes those token ids into ``indices``.
+        scores: optional fp32 ``[M, n_columns]`` workspace for the long-row
+            scorer. ``n_columns`` is ``index_page_table.shape[1] *
+            page_size``. The column stride is 1. When ``M`` is more than
+            one, the row stride is at least ``n_columns``. ``None``
+            allocates at most 128 MiB and reuses it across row chunks. A
+            caller buffer is the full matrix. The layer overwrites it and
+            does not return it. Emit ignores a buffer of that shape.
+        out: optional contiguous bf16 ``[M, Hq, D]`` matching ``q_gqa``.
+            ``None`` allocates it.
+        token_topk: selected tokens. The default is 2048, which is the
+            FlyDSL budget of 512 blocks.
+        compress_ratio: block size. The default, and the FlyDSL value, is 4.
+        score_scale, softmax_scale: see above.
+
+    A span past 4 GiB on a cache selects the wide gather compile. An empty
+    query writes a zero ``out`` and does not launch paged GQA. An empty
+    indexer cache or index page table has no selected blocks, but expand
+    still emits the causal tail and paged GQA gathers it from the GQA cache.
+    An empty GQA cache or KV page table writes a zero ``out`` and does not
+    launch paged GQA. Paged GQA gathers the token ids it is given and does not
+    check that they are causal. It allocates its own split partials on a
+    multi-split launch. The block ids are the selection for this call.
+    Sigmoid and partial RoPE stay outside this call.
+
+    Returns:
+        Sparse GQA output, bf16 ``[M, Hq, D]``.
+    """
+    reason = qsa_indexer_selection_supported(token_topk, compress_ratio)
+    if reason is not None:
+        raise ValueError(reason)
+    if indices is not None and q_indexer.dim() >= 1:
+        _check_expand_indices(
+            indices,
+            int(q_indexer.shape[0]),
+            token_topk + compress_ratio - 1,
+            q_indexer.device,
+            block_ids,
+        )
+    _warn_unmeasured_query(q_indexer, q_gqa)
+    # A bad rank is not a table key and has no head or D to read here.
+    extra = {}
+    if q_indexer.dim() == 3:
+        if score_scale is None:
+            score_scale = float(q_indexer.shape[2]) ** -0.5
+        extra["heads"] = (int(q_indexer.shape[1]),)
+    if score_scale is not None:
+        extra["score_scale"] = score_scale
+    heads = extra.get("heads", _SCORE_HEADS)
+    m, arch = _prepare_indexer_launch(
+        q_indexer,
+        index_k_cache,
+        index_page_table,
+        token_to_req,
+        query_positions,
+        context_lens,
+        block_ids,
+        scores,
+        heads,
+    )
+    if block_ids is None and _indexer_empty_geometry(
+        m, index_k_cache, index_page_table, context_lens
+    ):
+        # No compressed group is selected. The expand kernel does not read
+        # group ids when this axis is zero, but still emits the causal tail.
+        block_ids = torch.empty((m, 0), dtype=torch.int32, device=q_indexer.device)
+    else:
+        block_ids = _write_indexer_block_ids(
+            q_indexer,
+            index_k_cache,
+            index_page_table,
+            token_to_req,
+            query_positions,
+            context_lens,
+            block_ids,
+            extra.get("score_scale", _SCORE_SCALE),
+            scores,
+            m,
+            arch,
+        )
+    indices = _expand_block_ids(
+        block_ids,
+        query_positions,
+        context_lens,
+        token_to_req,
+        compress_ratio,
+        token_topk,
+        indices,
+    )
+    return flydsl_qsa_paged_gqa(
+        q_gqa,
+        k_cache,
+        v_cache,
+        indices,
+        kv_page_table,
+        token_to_req,
+        out=out,
+        softmax_scale=softmax_scale,
+    )
