@@ -341,8 +341,38 @@ topk_candidate_better(float a_score, int a_id, float b_score, int b_id)
     return legacy_topk_tie_rank(a_id) < legacy_topk_tie_rank(b_id);
 }
 
+// warp_rank_desc over lanes [0, N); lanes past n_cand hold key 0 and never outrank.
+template <int N>
+__device__ __forceinline__ int warp_rank_desc_upto(uint64_t key)
+{
+    const uint32_t hi = uint32_t(key >> 32), lo = uint32_t(key);
+    int rank = 0;
+#pragma unroll
+    for(int j = 0; j < N; ++j)
+    {
+        const uint64_t other = (uint64_t(uint32_t(__builtin_amdgcn_readlane(hi, j))) << 32) |
+                               uint32_t(__builtin_amdgcn_readlane(lo, j));
+        rank += other > key ? 1 : 0;
+    }
+    return rank;
+}
+
+// w[0] + w[1] + ... + w[n - 1] over lanes, left to right.
+template <int MAX_N>
+__device__ __forceinline__ float lane_serial_sum(float w, int n)
+{
+    float total = 0.0f;
+#pragma unroll
+    for(int i = 0; i < MAX_N; ++i)
+        if(i < n)
+            total +=
+                __builtin_bit_cast(float, __builtin_amdgcn_readlane(__builtin_bit_cast(int, w), i));
+    return total;
+}
+
 // The caller admits this helper only when finite-only compaction found
 // between topk and WARP_SIZE candidates, one per lane.
+template <bool UNROLLED>
 __device__ __forceinline__ void emit_legacy_ordered_topk(float* cand_val,
                                                          int* cand_idx,
                                                          const float* sig_scores,
@@ -361,7 +391,9 @@ __device__ __forceinline__ void emit_legacy_ordered_topk(float* cand_val,
         live ? (uint64_t(float_order_key(cand_val[lane])) << 32) |
                    uint32_t(~legacy_topk_tie_rank(ci))
              : 0;
-    const int rank = warp_rank_desc(key, n_cand);
+    const int rank = UNROLLED && n_cand <= 8    ? warp_rank_desc_upto<8>(key)
+                     : UNROLLED && n_cand <= 16 ? warp_rank_desc_upto<16>(key)
+                                                : warp_rank_desc(key, n_cand);
     // Every lane has read its candidate before the slots are reused in order.
     __builtin_amdgcn_wave_barrier();
     if(live && rank < topk)
@@ -377,9 +409,12 @@ __device__ __forceinline__ void emit_legacy_ordered_topk(float* cand_val,
     if(need_renorm)
     {
         // Preserve the legacy serial renormalization order.
-        for(int i = 0; i < topk; ++i)
-            total += __builtin_bit_cast(
-                float, __builtin_amdgcn_readlane(__builtin_bit_cast(int, w), i));
+        if(UNROLLED && topk <= 8)
+            total = lane_serial_sum<8>(w, topk);
+        else
+            for(int i = 0; i < topk; ++i)
+                total += __builtin_bit_cast(
+                    float, __builtin_amdgcn_readlane(__builtin_bit_cast(int, w), i));
         if(total > 0.0f)
             w *= routed_scaling_factor / total;
         else
@@ -936,56 +971,95 @@ __global__ void topk_reg_kernel(DTYPE_I* __restrict__ gating_output,
     float* cand_val = sig_scores + num_experts;
     int* cand_idx   = reinterpret_cast<int*>(cand_val + WARP_SIZE);
 
+    // Emit ranks by key, so slot order is free; wider lanes keep the scans to save VGPRs.
+    static constexpr bool BALLOT_SLOTS = EXPERTS_PER_LANE <= 8;
+
     float lmax = -INFINITY;
     for_each_owned([&](float& v, int) { lmax = dev_max_(lmax, v); });
+    const float sorted_lmax = warp_bitonic_merge_sort_to_reg(lmax, opus::number<WARP_SIZE>{});
     const float pivot =
-        __shfl(warp_bitonic_merge_sort_to_reg(lmax, opus::number<WARP_SIZE>{}), topk - 1);
+        BALLOT_SLOTS
+            ? __builtin_bit_cast(
+                  float, __builtin_amdgcn_readlane(__builtin_bit_cast(int, sorted_lmax), topk - 1))
+            : __shfl(sorted_lmax, topk - 1);
+    int cand_slot[EXPERTS_PER_LANE];
+    int gt_base = 0, eq_base = 0, n_cand = 0;
+    if constexpr(BALLOT_SLOTS)
+    {
+        int q = 0;
+        for_each_owned([&](float& v, int) {
+            const uint64_t m = __ballot(v >= pivot);
+            cand_slot[q++] =
+                v >= pivot
+                    ? n_cand + int(__builtin_amdgcn_mbcnt_hi(
+                                   uint32_t(m >> 32), __builtin_amdgcn_mbcnt_lo(uint32_t(m), 0u)))
+                    : -1;
+            n_cand += __builtin_popcountll(m);
+        });
+    }
+    else
+    {
+        // Rank candidates: all elements above the pivot first, then the ties, so a
+        // plateau at the pivot cannot hand out the same slot twice.
+        int my_gt = 0;
+        for_each_owned([&](float& v, int) { my_gt += v > pivot ? 1 : 0; });
+        gt_base = my_gt;
+        warp_cumsum(gt_base, opus::number<WARP_SIZE>{});
+        const int n_gt = __builtin_amdgcn_readlane(gt_base, WARP_SIZE - 1);
+        gt_base -= my_gt;
 
-    // Rank candidates: all elements above the pivot first, then the ties, so a
-    // plateau at the pivot cannot hand out the same slot twice.
-    int my_gt = 0;
-    for_each_owned([&](float& v, int) { my_gt += v > pivot ? 1 : 0; });
-    int gt_base = my_gt;
-    warp_cumsum(gt_base, opus::number<WARP_SIZE>{});
-    const int n_gt = __builtin_amdgcn_readlane(gt_base, WARP_SIZE - 1);
-    gt_base -= my_gt;
-
-    int my_eq = 0;
-    for_each_owned([&](float& v, int) { my_eq += v == pivot ? 1 : 0; });
-    int eq_base = my_eq;
-    warp_cumsum(eq_base, opus::number<WARP_SIZE>{});
-    const int n_cand = n_gt + __builtin_amdgcn_readlane(eq_base, WARP_SIZE - 1);
-    eq_base += n_gt - my_eq;
+        int my_eq = 0;
+        for_each_owned([&](float& v, int) { my_eq += v == pivot ? 1 : 0; });
+        eq_base = my_eq;
+        warp_cumsum(eq_base, opus::number<WARP_SIZE>{});
+        n_cand = n_gt + __builtin_amdgcn_readlane(eq_base, WARP_SIZE - 1);
+        eq_base += n_gt - my_eq;
+    }
 
     if(pivot > -INFINITY && n_cand >= topk && n_cand <= WARP_SIZE)
     {
-        int slot_gt = gt_base;
-        int slot_eq = eq_base;
-        for_each_owned([&](float& v, int id) {
-            if(v > pivot)
-            {
-                cand_val[slot_gt] = v;
-                cand_idx[slot_gt] = id;
-                slot_gt++;
-            }
-            else if(v == pivot)
-            {
-                cand_val[slot_eq] = v;
-                cand_idx[slot_eq] = id;
-                slot_eq++;
-            }
-        });
+        if constexpr(BALLOT_SLOTS)
+        {
+            int q = 0;
+            for_each_owned([&](float& v, int id) {
+                const int p = cand_slot[q++];
+                if(p >= 0)
+                {
+                    cand_val[p] = v;
+                    cand_idx[p] = id;
+                }
+            });
+        }
+        else
+        {
+            int slot_gt = gt_base;
+            int slot_eq = eq_base;
+            for_each_owned([&](float& v, int id) {
+                if(v > pivot)
+                {
+                    cand_val[slot_gt] = v;
+                    cand_idx[slot_gt] = id;
+                    slot_gt++;
+                }
+                else if(v == pivot)
+                {
+                    cand_val[slot_eq] = v;
+                    cand_idx[slot_eq] = id;
+                    slot_eq++;
+                }
+            });
+        }
         __builtin_amdgcn_wave_barrier();
 
-        emit_legacy_ordered_topk(cand_val,
-                                 cand_idx,
-                                 sig_scores,
-                                 topk_weights + token_idx * stride_tk,
-                                 topk_ids + token_idx * stride_tk,
-                                 n_cand,
-                                 topk,
-                                 routed_scaling_factor,
-                                 need_renorm);
+        emit_legacy_ordered_topk<BALLOT_SLOTS>(cand_val,
+                                               cand_idx,
+                                               sig_scores,
+                                               topk_weights + token_idx * stride_tk,
+                                               topk_ids + token_idx * stride_tk,
+                                               n_cand,
+                                               topk,
+                                               routed_scaling_factor,
+                                               need_renorm);
         return;
     }
 
