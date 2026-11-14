@@ -12,9 +12,10 @@ from aiter.fused_moe_registry import register_fused_moe_impl
 
 from .moe_common import GateMode
 
-# 0.5.0 keys the JIT cache on the traced IR; aiter no longer adds its own key
-# material to separate configs, so an older FlyDSL would share their binaries.
-_MIN_FLYDSL_VERSION = Version("0.5.0")
+# Branch ``jli/gfx1250-gemm-tune``: intentionally allow flydsl==0.4.2 so we can
+# use ``rocdl.experimental.sched_vgpr`` / ``sched_bank`` to chase ASM MXFP8
+# GEMM schedules. Upstream ``main`` keeps the 0.5.0 floor (JIT cache keying).
+_MIN_FLYDSL_VERSION = Version("0.4.2")
 
 installed_flydsl_version = getattr(_flydsl, "__version__", None)
 if installed_flydsl_version is None:
