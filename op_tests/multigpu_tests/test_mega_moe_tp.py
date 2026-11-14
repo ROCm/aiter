@@ -165,6 +165,15 @@ def route(rows, shape: ModelShape, kind: str, gen: torch.Generator, device):
         score = torch.full((rows, E), -1e4, device=device)
         score.scatter_(1, ids.view(rows, K), 0.0)
         score += 1e-3 * torch.randn((rows, E), device=device, generator=gen)
+    elif kind == "shared":
+        # the last expert in every token's topk (a shared expert fused as a routed one), the
+        # others random over the routed experts: its row chunks pile up
+        score = torch.randn((rows, E - 1), device=device, generator=gen)
+        w, ids = torch.softmax(score, dim=-1).topk(K - 1, dim=-1)
+        ids = torch.cat([ids, torch.full((rows, 1), E - 1, device=device)], 1)
+        w = torch.cat([w, w.new_full((rows, 1), 0.3)], 1)
+        w = w / w.sum(dim=-1, keepdim=True)
+        return w.float().contiguous(), ids.to(torch.int32).contiguous()
     else:
         score = torch.randn((rows, E), device=device, generator=gen)
         if kind == "hot":
@@ -999,7 +1008,7 @@ def main() -> int:
         "--routes",
         nargs="*",
         default=["balanced", "random", "hot"],
-        choices=["balanced", "random", "hot", "subset"],
+        choices=["balanced", "random", "hot", "subset", "shared"],
         help="Routing distributions.\n    e.g.: -r random",
     )
     parser.add_argument(
