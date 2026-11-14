@@ -961,6 +961,47 @@ def gemm_afp4wfp4_pre_quant_atomic(shape, backend):
     return call, (x, w, w_scales, y), None
 
 
+def a16w16_streamk_cta_split(config):
+    """CTAS_M and CTAS_N make BLOCK_M/BLOCK_N a cluster tile; each CTA owns its share."""
+    return config.get("CTAS_M", 1), config.get("CTAS_N", 1)
+
+
+@kernel(
+    "GEMM-A16W16-STREAMK",
+    cta_split=a16w16_streamk_cta_split,
+    gluon_archs=("gfx1250",),
+    gluon_default_archs=("gfx1250",),
+    backend_kwarg=False,
+)
+def gemm_a16w16_streamk(shape, backend):
+    import torch
+
+    from aiter.ops.triton.gemm.basic.gemm_a16w16_streamk import (
+        gemm_a16w16_streamk as gemm,
+    )
+    from op_tests.triton_tests.gemm.basic.test_gemm_a16w16 import (
+        generate_gemm_a16w16_inputs,
+    )
+
+    M, N, K = shape["M"], shape["N"], shape["K"]
+    # layout TN is aiter's convention here: x is (M, K) row major and w is K contiguous.
+    x, w, _, _, y = generate_gemm_a16w16_inputs(
+        M, N, K, torch.bfloat16, layout="TN", output=True, bias=False
+    )
+
+    def call(config, x, w, y):
+        return gemm(x, w, y=y, config=config)
+
+    def should_skip(config):
+        ctas_m, ctas_n = a16w16_streamk_cta_split(config)
+        if config["BLOCK_M"] % ctas_m or config["BLOCK_N"] % ctas_n:
+            return True  # the wrapper asserts each CTA gets a whole sub-tile
+        # the kernel static_asserts a ring of at least two slots
+        return config["NUM_BUFFERS"] < 2
+
+    return call, (x, w, y), should_skip
+
+
 def mxfp4_cta_split(config):
     """num_ctas makes BLOCK_SIZE_M/N a cluster tile; each CTA computes its share of it."""
     if config.get("num_ctas", 1) == 1:
