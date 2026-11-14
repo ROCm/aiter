@@ -4,6 +4,7 @@
 # Pure-Python arch constants and env-driven build target resolution.
 # No torch dependency — safe to import in build scripts, gen_instances, and tests
 # that run without a GPU or a full PyTorch install.
+import functools
 import os
 import re
 
@@ -50,6 +51,33 @@ GFX_CU_NUMS_MAP = {
     "gfx1250": (256, 192, 96),
     "gfx1250-strict": (256,),  # MI450 A0; binary-incompatible with gfx1250 (B0)
 }
+
+
+def target_num_xcds(gfx: str, cu_num: int) -> int:
+    # XCD counts for SKUs that differ from the eight-XCD default.
+    non_standard_xcds = {
+        ("gfx950", 128): 4,  # MI350P
+        ("gfx942", 80): 4,  # MI308X
+        ("gfx942", 228): 6,  # MI300A
+    }
+    target = (gfx, int(cu_num))
+    if target not in non_standard_xcds:
+        return 8
+    return non_standard_xcds[target]
+
+
+@functools.cache
+def build_num_xcds(gfx: str) -> int:
+    """Resolve and cache the target's XCD count for code generation."""
+    # Deferred: chip_info imports this module at load time.
+    try:
+        from chip_info import get_build_targets
+    except ImportError:
+        from aiter.jit.utils.chip_info import get_build_targets
+    for target_gfx, target_cu in get_build_targets():
+        if target_gfx == gfx:
+            return target_num_xcds(gfx, target_cu)
+    return 8
 
 
 # gfx1250-strict (MI450 A0) and gfx1250 (B0) are distinct build/code-object
