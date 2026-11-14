@@ -1770,24 +1770,26 @@ def test_shared_tile_suffix_without_shared_weights(monkeypatch, stage):
             "shared_k_wave": 4,
         }
         shared = {
-            "shared_w1": torch.empty((2 * inter_dim, model_dim), dtype=bf16),
+            "fused_shared_w1": torch.empty((2 * inter_dim, model_dim), dtype=bf16),
             "shared_inter_bf16": shared_inter,
         }
         shared_mx = {
-            "shared_w1": torch.empty((2 * inter_dim, model_dim), dtype=fp8),
-            "shared_w1_scale": torch.empty(2 * inter_dim * model_dim // 32, dtype=u8),
+            "fused_shared_w1": torch.empty((2 * inter_dim, model_dim), dtype=fp8),
+            "fused_shared_w1_scale": torch.empty(
+                2 * inter_dim * model_dim // 32, dtype=u8
+            ),
             "shared_inter_bf16": shared_inter,
         }
     else:
         name, suffix = _M3_STAGE2, "_sh64x64x128"
         tile = {"shared_tile_m": 64, "shared_tile_n": 64, "shared_tile_k": 128}
         shared = {
-            "shared_w2": torch.empty((model_dim, inter_dim), dtype=bf16),
+            "fused_shared_w2": torch.empty((model_dim, inter_dim), dtype=bf16),
             "shared_inter_bf16": shared_inter,
         }
         shared_mx = {
-            "shared_w2": torch.empty((model_dim, inter_dim), dtype=fp8),
-            "shared_w2_scale": torch.empty(model_dim * inter_dim // 32, dtype=u8),
+            "fused_shared_w2": torch.empty((model_dim, inter_dim), dtype=fp8),
+            "fused_shared_w2_scale": torch.empty(model_dim * inter_dim // 32, dtype=u8),
             "shared_inter_bf16": shared_inter,
         }
 
@@ -1839,7 +1841,7 @@ def test_shared_expert_rejects_unsupported_calls(monkeypatch):
     monkeypatch.setattr(kernels, "get_rocm_arch", lambda: "gfx950")
     tokens, model_dim, inter_dim = 4, 256, 256
     bf16 = torch.bfloat16
-    shared_w1 = torch.empty((2 * inter_dim, model_dim), dtype=bf16)
+    fused_shared_w1 = torch.empty((2 * inter_dim, model_dim), dtype=bf16)
     shared_inter = torch.empty((tokens, inter_dim), dtype=bf16)
 
     def gemm1(**shared):
@@ -1865,27 +1867,29 @@ def test_shared_expert_rejects_unsupported_calls(monkeypatch):
 
     monkeypatch.setattr(chip_info, "get_gfx_runtime", lambda: "gfx942")
     with pytest.raises(NotImplementedError, match="gfx950 only"):
-        gemm1(shared_w1=shared_w1, shared_inter_bf16=shared_inter)
+        gemm1(fused_shared_w1=fused_shared_w1, shared_inter_bf16=shared_inter)
     monkeypatch.setattr(chip_info, "get_gfx_runtime", lambda: "gfx950")
     with pytest.raises(ValueError, match="given together"):
-        gemm1(shared_w1=shared_w1)
+        gemm1(fused_shared_w1=fused_shared_w1)
     with pytest.raises(ValueError, match="contiguous bf16"):
-        gemm1(shared_w1=shared_w1.float(), shared_inter_bf16=shared_inter)
+        gemm1(fused_shared_w1=fused_shared_w1.float(), shared_inter_bf16=shared_inter)
     with pytest.raises(ValueError, match="contiguous bf16"):
-        gemm1(shared_w1=shared_w1, shared_inter_bf16=shared_inter[:2])
+        gemm1(fused_shared_w1=fused_shared_w1, shared_inter_bf16=shared_inter[:2])
     # MXFP8: e4m3 codes need their e8m0 scales, and only they take scales.
     codes = torch.empty((2 * inter_dim, model_dim), dtype=torch.float8_e4m3fn)
     scales = torch.empty(2 * inter_dim * model_dim // 32, dtype=torch.uint8)
-    with pytest.raises(ValueError, match="needs shared_w1_scale"):
-        gemm1(shared_w1=codes, shared_inter_bf16=shared_inter)
+    with pytest.raises(ValueError, match="needs fused_shared_w1_scale"):
+        gemm1(fused_shared_w1=codes, shared_inter_bf16=shared_inter)
     with pytest.raises(ValueError, match="only for an fp8"):
         gemm1(
-            shared_w1=shared_w1, shared_w1_scale=scales, shared_inter_bf16=shared_inter
+            fused_shared_w1=fused_shared_w1,
+            fused_shared_w1_scale=scales,
+            shared_inter_bf16=shared_inter,
         )
     with pytest.raises(ValueError, match="contiguous uint8"):
         gemm1(
-            shared_w1=codes,
-            shared_w1_scale=scales[:-1],
+            fused_shared_w1=codes,
+            fused_shared_w1_scale=scales[:-1],
             shared_inter_bf16=shared_inter,
         )
 
@@ -1962,9 +1966,9 @@ def _shared_weights(shared1, shared2):
     bf16 (the exact upcast) and MXFP8 (codes + e8m0 scales), all preshuffled."""
     out = {}
     for stage, (codes, scales, upcast) in ((1, shared1), (2, shared2)):
-        out[f"shared_w{stage}"] = shuffle_weight(upcast, layout=(16, 16))
+        out[f"fused_shared_w{stage}"] = shuffle_weight(upcast, layout=(16, 16))
         out[f"shared_w{stage}_mx"] = shuffle_weight(codes, layout=(16, 16))
-        out[f"shared_w{stage}_scale"] = shuffle_scale(scales)
+        out[f"fused_shared_w{stage}_scale"] = shuffle_scale(scales)
     return out
 
 
@@ -1972,16 +1976,16 @@ def _shared_extra_args(case, shared_dtype, shared_inter):
     """``_stage1_extra_args`` / ``_stage2_extra_args`` of the shared expert."""
     if shared_dtype == "mxfp8":
         extra1 = {
-            "shared_w1": case["shared_w1_mx"],
-            "shared_w1_scale": case["shared_w1_scale"],
+            "fused_shared_w1": case["shared_w1_mx"],
+            "fused_shared_w1_scale": case["fused_shared_w1_scale"],
         }
         extra2 = {
-            "shared_w2": case["shared_w2_mx"],
-            "shared_w2_scale": case["shared_w2_scale"],
+            "fused_shared_w2": case["shared_w2_mx"],
+            "fused_shared_w2_scale": case["fused_shared_w2_scale"],
         }
     else:
-        extra1 = {"shared_w1": case["shared_w1"]}
-        extra2 = {"shared_w2": case["shared_w2"]}
+        extra1 = {"fused_shared_w1": case["fused_shared_w1"]}
+        extra2 = {"fused_shared_w2": case["fused_shared_w2"]}
     extra1["shared_inter_bf16"] = extra2["shared_inter_bf16"] = shared_inter
     return extra1, extra2
 
@@ -2136,14 +2140,14 @@ def benchmark_moe_shared_expert(
     nbytes = hidden.nbytes + output.nbytes + routed_bytes * active // experts
     shared_bytes = {
         "": 0,
-        "bf16": case["shared_w1"].nbytes + case["shared_w2"].nbytes,
+        "bf16": case["fused_shared_w1"].nbytes + case["fused_shared_w2"].nbytes,
         "mxfp8": sum(
             case[k].nbytes
             for k in (
                 "shared_w1_mx",
-                "shared_w1_scale",
+                "fused_shared_w1_scale",
                 "shared_w2_mx",
-                "shared_w2_scale",
+                "fused_shared_w2_scale",
             )
         ),
     }

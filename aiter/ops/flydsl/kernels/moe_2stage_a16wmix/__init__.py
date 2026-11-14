@@ -19,12 +19,12 @@ Launch args are raw device pointers (``fx.Int64``); tensors passed as
 ``.data_ptr()``.
 
 Optional shared expert (both stages): a dense expert that every token uses. Its
-weights are ``shared_w1`` ``[2*D_INTER, D_HIDDEN]`` (gate|up) and ``shared_w2``
+weights are ``fused_shared_w1`` ``[2*D_INTER, D_HIDDEN]`` (gate|up) and ``fused_shared_w2``
 ``[D_HIDDEN, D_INTER]``, each preshuffled with ``shuffle_weight(w, layout=(16, 16))``,
 in one of two formats, chosen by the weight dtype:
 
   - bf16: raw bf16 weights, no scales.
-  - MXFP8: ``torch.float8_e4m3fn`` codes plus ``shared_w1_scale`` / ``shared_w2_scale``,
+  - MXFP8: ``torch.float8_e4m3fn`` codes plus ``fused_shared_w1_scale`` / ``fused_shared_w2_scale``,
     their e8m0 (uint8) per-1x32 scales ``[N, K/32]`` preshuffled with
     ``shuffle_scale`` (the routed MXFP4 scale layout). The tiles scale the codes to
     bf16 in registers (``v_cvt_scalef32_pk_bf16_fp8``; e4m3 x 2^k is exact in bf16) and
@@ -163,13 +163,13 @@ def flydsl_a16w4_gemm1(
     activation_bf16=False,
     prefetch=1,
     stream=None,
-    shared_w1=None,
+    fused_shared_w1=None,
     shared_inter_bf16=None,
     shared_tile_n=None,
     shared_tile_m=None,
     shared_tile_k=None,
     shared_k_wave=None,
-    shared_w1_scale=None,
+    fused_shared_w1_scale=None,
 ):
     """a16w4/a16wi4/a16w16 fused stage1: gate+up GEMM + SiLU -> bf16 intermediate.
 
@@ -202,8 +202,8 @@ def flydsl_a16w4_gemm1(
     the clamp. ``activation_bf16=True`` rounds both GEMM accumulators to bf16
     before this activation. Plain ``silu`` and the default rounding are unchanged.
 
-    ``shared_w1`` / ``shared_inter_bf16`` (together): the shared-expert prologue (see
-    the module docstring); bf16 ``shared_w1``, or fp8 e4m3 with ``shared_w1_scale``
+    ``fused_shared_w1`` / ``shared_inter_bf16`` (together): the shared-expert prologue (see
+    the module docstring); bf16 ``fused_shared_w1``, or fp8 e4m3 with ``fused_shared_w1_scale``
     (MXFP8). ``shared_tile_n`` defaults to ``a16w4_default_shared_tile_n``.
     """
     if k_batch != 1:
@@ -238,15 +238,21 @@ def flydsl_a16w4_gemm1(
             f"a16w4 gemm1 requires D_INTER % TILE_N({TILE_N}) == 0, got D_INTER={D_INTER}"
         )
 
-    shared = shared_w1 is not None or shared_inter_bf16 is not None
+    shared = fused_shared_w1 is not None or shared_inter_bf16 is not None
     sh_tn = None
     sh_wd = "bf16"
     shared_tiles = 0
     if shared:
-        if shared_w1 is None or shared_inter_bf16 is None:
-            raise ValueError("shared_w1 and shared_inter_bf16 must be given together")
+        if fused_shared_w1 is None or shared_inter_bf16 is None:
+            raise ValueError(
+                "fused_shared_w1 and shared_inter_bf16 must be given together"
+            )
         w_entries, sh_wd = _shared_weight_args(
-            "shared_w1", shared_w1, shared_w1_scale, 2 * D_INTER, D_HIDDEN
+            "fused_shared_w1",
+            fused_shared_w1,
+            fused_shared_w1_scale,
+            2 * D_INTER,
+            D_HIDDEN,
         )
         _check_shared(
             a_bf16.device,
@@ -305,9 +311,11 @@ def flydsl_a16w4_gemm1(
     shared_ptrs = ()
     if shared:
         # bf16: the kernel does not read the scale pointer (passed the weight's).
-        sh_scale = shared_w1 if shared_w1_scale is None else shared_w1_scale
+        sh_scale = (
+            fused_shared_w1 if fused_shared_w1_scale is None else fused_shared_w1_scale
+        )
         shared_ptrs = (
-            shared_w1.data_ptr(),
+            fused_shared_w1.data_ptr(),
             sh_scale.data_ptr(),
             shared_inter_bf16.data_ptr(),
         )
@@ -363,11 +371,11 @@ def flydsl_a16w4_gemm2(
     stream=None,
     reuse_lds=False,
     shared_inter_bf16=None,
-    shared_w2=None,
+    fused_shared_w2=None,
     shared_tile_n=None,
     shared_tile_m=None,
     shared_tile_k=None,
-    shared_w2_scale=None,
+    fused_shared_w2_scale=None,
 ):
     """a16w4/a16wi4/a16w16 fused stage2 (down-proj). Consumes the bf16 [sorted_size,
     D_INTER] intermediate; scatters routing-weighted bf16 into ``flat_out``.
@@ -382,9 +390,9 @@ def flydsl_a16w4_gemm2(
     Only gfx942 MXFP4 weights with the atomic epilogue are qualified for reuse;
     other architectures, weight formats and epilogues retain the default path.
 
-    ``shared_inter_bf16`` / ``shared_w2`` (together, atomic epilog): the shared-expert
-    prologue adds ``shared_inter_bf16 [M_logical, D_INTER] @ shared_w2^T`` into every
-    token; bf16 ``shared_w2``, or fp8 e4m3 with ``shared_w2_scale`` (MXFP8).
+    ``shared_inter_bf16`` / ``fused_shared_w2`` (together, atomic epilog): the shared-expert
+    prologue adds ``shared_inter_bf16 [M_logical, D_INTER] @ fused_shared_w2^T`` into every
+    token; bf16 ``fused_shared_w2``, or fp8 e4m3 with ``fused_shared_w2_scale`` (MXFP8).
     ``shared_tile_n`` defaults to ``a16w4_default_shared_tile_n``.
     """
     if k_batch != 1:
@@ -416,17 +424,19 @@ def flydsl_a16w4_gemm2(
     # close the E896 gap (padded launch's empty CTAs early-return ~free), kept as an
     # opt-in building block.
     _persist = False if persist is None else bool(persist)
-    shared = shared_w2 is not None or shared_inter_bf16 is not None
+    shared = fused_shared_w2 is not None or shared_inter_bf16 is not None
     sh_tn = None
     sh_wd = "bf16"
     shared_tiles = 0
     if shared:
-        if shared_w2 is None or shared_inter_bf16 is None:
-            raise ValueError("shared_w2 and shared_inter_bf16 must be given together")
+        if fused_shared_w2 is None or shared_inter_bf16 is None:
+            raise ValueError(
+                "fused_shared_w2 and shared_inter_bf16 must be given together"
+            )
         if epilog != "atomic":
             raise ValueError("the shared-expert prologue needs epilog='atomic'")
         w_entries, sh_wd = _shared_weight_args(
-            "shared_w2", shared_w2, shared_w2_scale, D_HIDDEN, D_INTER
+            "fused_shared_w2", fused_shared_w2, fused_shared_w2_scale, D_HIDDEN, D_INTER
         )
         _check_shared(
             flat_out.device,
@@ -471,10 +481,12 @@ def flydsl_a16w4_gemm2(
     )
     shared_ptrs = ()
     if shared:
-        sh_scale = shared_w2 if shared_w2_scale is None else shared_w2_scale
+        sh_scale = (
+            fused_shared_w2 if fused_shared_w2_scale is None else fused_shared_w2_scale
+        )
         shared_ptrs = (
             shared_inter_bf16.data_ptr(),
-            shared_w2.data_ptr(),
+            fused_shared_w2.data_ptr(),
             sh_scale.data_ptr(),
         )
     _run_compiled(
