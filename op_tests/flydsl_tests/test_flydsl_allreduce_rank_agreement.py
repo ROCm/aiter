@@ -51,7 +51,7 @@ QUICK_SKEWS = {
 
 
 class _FakeEngine:
-    """Stand-in for ``OneShotAllReduce`` and ``QuickAllReduceInt4``.
+    """Stand-in for ``OneShotAllReduce`` and ``FlyQuickAllReduce``.
 
     Its constructor is a collective, like the real IPC handle exchange, and it
     raises unless every rank builds the same engine (the constructor kwargs,
@@ -153,7 +153,7 @@ def _rank(rank: int, port: int, owner: str, env: dict, patches: dict) -> dict:
     )
     group = dist.group.WORLD
     module = car if owner == "oneshot" else qar
-    engine = "OneShotAllReduce" if owner == "oneshot" else "QuickAllReduceInt4"
+    engine = "OneShotAllReduce" if owner == "oneshot" else "FlyQuickAllReduce"
     disagreements = _Disagreements()
     logging.getLogger("aiter").addHandler(disagreements)
     try:

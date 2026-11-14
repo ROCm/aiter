@@ -582,6 +582,15 @@ namespace py = pybind11;
           py::arg("inp"),                                                            \
           py::arg("out"),                                                            \
           py::arg("dim"));                                                           \
+    m.def("all_gather_lastdim_add",                                                  \
+          &aiter::all_gather_lastdim_add,                                            \
+          py::arg("_fa"),                                                            \
+          py::arg("inp"),                                                            \
+          py::arg("out"),                                                            \
+          py::arg("add_b"),                                                          \
+          py::arg("add_c")     = std::nullopt,                                       \
+          py::arg("reg_ptr")   = 0,                                                  \
+          py::arg("reg_bytes") = 0);                                                 \
     m.def("all_gather_unreg",                                                        \
           &aiter::all_gather_unreg,                                                  \
           py::arg("_fa"),                                                            \
@@ -1270,7 +1279,8 @@ namespace py = pybind11;
           py::arg("splitk")            = 1,            \
           py::arg("non_temporal_load") = false,        \
           py::arg("dst_type")          = std::nullopt, \
-          py::arg("is_shuffled")       = true);              \
+          py::arg("is_shuffled")       = true,         \
+          py::arg("swiglu_limit")      = 0.0);              \
                                                        \
     m.def("ck_moe_stage2",                             \
           &ck_moe_stage2,                              \
@@ -1597,22 +1607,23 @@ namespace py = pybind11;
           py::arg("device"),                             \
           py::arg("stream"));
 
-#define FMHA_FWD_BF16_OPUS_PYBIND                   \
-    m.def("fmha_fwd_bf16_opus_fwd",                 \
-          &fmha_fwd_bf16_opus_fwd,                  \
-          py::arg("q"),                             \
-          py::arg("k"),                             \
-          py::arg("v"),                             \
-          py::arg("out"),                           \
-          py::arg("causal"),                        \
-          py::arg("softmax_scale"),                 \
-          py::arg("lse")            = std::nullopt, \
-          py::arg("seqstart_q")     = std::nullopt, \
-          py::arg("seqstart_k")     = std::nullopt, \
-          py::arg("seqstart_q_pad") = std::nullopt, \
-          py::arg("seqstart_k_pad") = std::nullopt, \
-          py::arg("max_seqlen_q")   = 0,            \
-          py::arg("max_seqlen_k")   = 0);
+#define FMHA_FWD_BF16_OPUS_PYBIND                     \
+    m.def("fmha_fwd_bf16_opus_fwd",                   \
+          &fmha_fwd_bf16_opus_fwd,                    \
+          py::arg("q"),                               \
+          py::arg("k"),                               \
+          py::arg("v"),                               \
+          py::arg("out"),                             \
+          py::arg("causal"),                          \
+          py::arg("softmax_scale"),                   \
+          py::arg("lse")              = std::nullopt, \
+          py::arg("seqstart_q")       = std::nullopt, \
+          py::arg("seqstart_k")       = std::nullopt, \
+          py::arg("seqstart_q_pad")   = std::nullopt, \
+          py::arg("seqstart_k_pad")   = std::nullopt, \
+          py::arg("max_seqlen_q")     = 0,            \
+          py::arg("max_seqlen_k")     = 0,            \
+          py::arg("window_size_left") = -1);
 
 #define NORM_PYBIND                                \
     m.def("layernorm2d_fwd",                       \
@@ -2134,7 +2145,8 @@ namespace py = pybind11;
           py::arg("rotary_dim") = 0,                                   \
           py::arg("v_norm")     = false,                              \
           py::arg("q_out_fp8")  = py::none(),                          \
-          py::arg("per_tensor_q_scale") = py::none());                 \
+          py::arg("per_tensor_q_scale") = py::none(),                  \
+          py::arg("k_out_unquantized") = py::none());                  \
     m.def("fused_qk_norm_rope_cache_block_quant_shuffle",              \
           &aiter::fused_qk_norm_rope_cache_block_quant_shuffle,        \
           py::arg("qkv"),                                              \
