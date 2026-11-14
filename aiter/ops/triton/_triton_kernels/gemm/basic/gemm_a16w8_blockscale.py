@@ -25,7 +25,6 @@ _gemm_a16w8_blockscale_repr = make_kernel_repr(
         "SPLITK_BLOCK_SIZE",
         "EVEN_K",
         "EVEN_SPLITK",
-        "GRID_MN",
         "PREQUANT",
     ],
 )
@@ -36,8 +35,6 @@ _gemm_a16w8_blockscale_repr = make_kernel_repr(
         "EVEN_K": lambda args: args["K"] % args["BLOCK_SIZE_K"] == 0,
         "EVEN_SPLITK": lambda args: args["NUM_KSPLIT"] * args["SPLITK_BLOCK_SIZE"]
         == args["K"],
-        "GRID_MN": lambda args: triton.cdiv(args["M"], args["BLOCK_SIZE_M"])
-        * triton.cdiv(args["N"], args["BLOCK_SIZE_N"]),
     }
 )
 @triton.jit(repr=_gemm_a16w8_blockscale_repr)
@@ -75,7 +72,6 @@ def _gemm_a16w8_blockscale_kernel(
     SPLITK_BLOCK_SIZE: tl.constexpr,
     EVEN_K: tl.constexpr,
     EVEN_SPLITK: tl.constexpr,
-    GRID_MN: tl.constexpr,
     PREQUANT: tl.constexpr,
     DTYPE_MAX: tl.constexpr,
     DTYPE_MIN: tl.constexpr,
@@ -230,7 +226,6 @@ _gemm_a16w8_blockscale_preshuffle_repr = make_kernel_repr(
         "SPLITK_BLOCK_SIZE",
         "EVEN_K",
         "EVEN_SPLITK",
-        "GRID_MN",
         "PREQUANT",
     ],
 )
@@ -241,8 +236,6 @@ _gemm_a16w8_blockscale_preshuffle_repr = make_kernel_repr(
         "EVEN_K": lambda args: args["K"] % args["BLOCK_SIZE_K"] == 0,
         "EVEN_SPLITK": lambda args: args["NUM_KSPLIT"] * args["SPLITK_BLOCK_SIZE"]
         == args["K"],
-        "GRID_MN": lambda args: triton.cdiv(args["M"], args["BLOCK_SIZE_M"])
-        * triton.cdiv(args["N"], args["BLOCK_SIZE_N"]),
     }
 )
 @triton.jit(repr=_gemm_a16w8_blockscale_repr)
@@ -280,7 +273,6 @@ def _gemm_a16w8_blockscale_preshuffle_kernel(
     SPLITK_BLOCK_SIZE: tl.constexpr,
     EVEN_K: tl.constexpr,
     EVEN_SPLITK: tl.constexpr,
-    GRID_MN: tl.constexpr,
     PREQUANT: tl.constexpr,
     DTYPE_MAX: tl.constexpr,
     DTYPE_MIN: tl.constexpr,

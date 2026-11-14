@@ -1497,6 +1497,7 @@ class FmoeTuner(TunerCommon):
             SBM=sbm,
             persist=kparams["persist"],
             n_sorted_padded=n,
+            g2_scatter_lds_pairs=kparams.get("scatter_lds_pairs", False),
         )
         if epilog == "scatter":
             n_valid = int(n)

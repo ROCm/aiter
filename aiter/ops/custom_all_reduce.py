@@ -70,6 +70,18 @@ def all_gather_reg(
 
 
 @compile_ops("module_custom_all_reduce", develop=True)
+def all_gather_lastdim_add(
+    _fa: int,
+    inp: torch.Tensor,
+    out: torch.Tensor,
+    add_b: torch.Tensor,
+    add_c: torch.Tensor | None = None,
+    reg_ptr: int = 0,
+    reg_bytes: int = 0,
+) -> None: ...
+
+
+@compile_ops("module_custom_all_reduce", develop=True)
 def all_gather_unreg(
     _fa: int,
     inp: torch.Tensor,
@@ -433,6 +445,10 @@ def dispose_gfx1250(_fa: int) -> None: ...
 
 @compile_ops(GFX1250_MD_NAME, fc_name="meta_size", develop=True)
 def meta_size_gfx1250(world_size: int = 8) -> int: ...
+
+
+@compile_ops(GFX1250_MD_NAME, fc_name="ll_ar_max_bytes", develop=True)
+def ll_ar_max_bytes_gfx1250(world_size: int) -> int: ...
 
 
 @compile_ops(GFX1250_MD_NAME, fc_name="register_input_buffer", develop=True)

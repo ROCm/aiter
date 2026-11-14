@@ -678,6 +678,11 @@ def run_bmm_a8w8_mxfp8_128_gfx1250(
         True,  # batched
         preload_ks,
         b,
+        False,  # a_preshuffle
+        False,  # a_scale_preshuffled
+        False,  # b_scale_32x32
+        False,  # k_tail
+        _ptr_arg(Out),  # arg_scale_out
         specialization_key=bmm_spec,
     )
     return Out

@@ -256,6 +256,7 @@ def gemm2_body_v2(
     enable_bias=False,
     nonatomic=False,
     scatter_out_fp4=False,
+    scatter_lds_pairs=False,
     arg_out_scale=None,
     g2_prefetch_ids=False,
     reduce_store_cache_modifier=None,
@@ -837,6 +838,22 @@ def gemm2_body_v2(
             BN,
             kMChunks,
         )
+    elif const_expr(nonatomic and scatter_lds_pairs):
+        # C uses the LDS of the A slots, so all waves must finish their A reads.
+        gpu.barrier()
+        nonatomic_bf16_epilog_lds_pairs(
+            [[c_frags[i][J].load() for J in range(numAccN)] for i in range(kMChunks)],
+            lds_base_i32,
+            arg_out,
+            m_row,
+            n_block_idx,
+            wave,
+            lane,
+            N_OUT_rt,
+            BM,
+            BN,
+            kMChunks,
+        )
     elif const_expr(nonatomic):
         nonatomic_bf16_epilog(
             [[c_frags[i][J].load() for J in range(numAccN)] for i in range(kMChunks)],
@@ -1349,6 +1366,97 @@ def nonatomic_bf16_epilog(
                     val = fx.Float32(val) + bias[J]
                 bf = Vec.from_elements([val], Float32).to(BFloat16)
                 out_ptr[fx.Int32(i * 16 + v) * N_OUT + J * 16] = bf[0]
+
+
+# Pad of each LDS row-pair line, in dwords. It puts the row pairs of one
+# ds_write_b32 16 banks apart.
+SCATTER_PAIR_PAD_DW = 8
+
+
+def scatter_lds_pairs_bytes(BM, BN):
+    """LDS bytes of the row-pair staged [BM, BN] bf16 C tile."""
+    return (BM // 2) * (BN + SCATTER_PAIR_PAD_DW) * 4
+
+
+def nonatomic_bf16_epilog_lds_pairs(
+    accm,
+    lds_c_base_i32,
+    arg_out,
+    m_row,
+    n_block_idx,
+    wave,
+    lane,
+    N_OUT,
+    BM,
+    BN,
+    kMChunks,
+):
+    """Scatter epilogue for bf16 rows that writes C through LDS (``_ldspa``).
+
+    Each dword in LDS holds the bf16 values of rows 2rp and 2rp+1 of one column.
+    Each thread then reads 8 columns of one row pair and writes two 16-byte
+    non-temporal row chunks, in place of 2-byte stores per element.
+    """
+    numAccN = (BN // 4) // 16
+    pitch_dw = BN + SCATTER_PAIR_PAD_DW
+    c_i32 = lds_typed_ptr(lds_c_base_i32, T.i32, align=4)
+    rp_base = (lane // 16) * 2
+    col_base = wave * (BN // 4) + (lane % 16)
+    for i in range_constexpr(kMChunks):
+        for J in range_constexpr(numAccN):
+            vec = Vec(accm[i][J])
+            for h in range_constexpr(2):
+                pk = Vec.from_elements([vec[2 * h], vec[2 * h + 1]], Float32).to(
+                    BFloat16
+                )
+                c_i32[
+                    (rp_base + fx.Int32(i * 8 + h)) * pitch_dw + col_base + J * 16
+                ] = pk.bitcast(Int32)[0]
+    gpu.barrier()
+
+    lanes_per_rp = BN // 8
+    rp_per_pass = 256 // lanes_per_rp
+    tx = fx.Int32(gpu.thread_id("x"))
+    rp_in = tx // lanes_per_rp
+    c8 = (tx % lanes_per_rp) * 8
+    # The buffer base is the first tile element, so the lane offsets stay small.
+    tile_addr = fx.Int64(arg_out) + (
+        fx.Int64(m_row) * fx.Int64(N_OUT) + fx.Int64(n_block_idx * BN)
+    ) * fx.Int64(2)
+    out_tile = flat_buffer_view(
+        tile_addr, None, T.bf16, align=16, elem_bytes=2, fold=False
+    )
+    st_nt = fx.make_copy_atom(fx.rocdl.BufferCopy128b(2), BFloat16)
+    m_lo = fx.Int32(0xFFFF)
+    m_hi = fx.Int32(-65536)
+    for p in range_constexpr(BM // 2 // rp_per_pass):
+        rp = rp_in + fx.Int32(p * rp_per_pass)
+        base_b = (rp * pitch_dw + c8) * 4
+        d = []
+        for q in range_constexpr(2):
+            v = Vec(
+                lds_vec_load(
+                    lds_c_base_i32,
+                    base_b + q * 16,
+                    Vec.make_type(4, Int32),
+                    Int32,
+                    align=16,
+                )
+            )
+            d.extend([v[j] for j in range_constexpr(4)])
+        even = [
+            (d[2 * j] & m_lo) | (d[2 * j + 1] << fx.Int32(16))
+            for j in range_constexpr(4)
+        ]
+        odd = [
+            fx.Int32(fx.Uint32(d[2 * j]) >> fx.Uint32(16)) | (d[2 * j + 1] & m_hi)
+            for j in range_constexpr(4)
+        ]
+        for r_off, words in ((0, even), (1, odd)):
+            row = rp * fx.Int32(2) + fx.Int32(r_off)
+            frag = fx.make_rmem_tensor(8, BFloat16)
+            frag.store(Vec.from_elements(words, Int32).bitcast(BFloat16))
+            fx.copy(st_nt, frag, out_tile[None, row * N_OUT + c8])
 
 
 def nonatomic_mxfp4_epilog(
