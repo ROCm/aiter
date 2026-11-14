@@ -9,12 +9,14 @@ import csv
 import dataclasses
 import functools
 import os
+import time
 
 import flydsl.expr as fx
 import torch
+import torch.distributed as dist
 
 from ..mega_moe_tp.mega_moe_tp import SymmetricArena
-from ..tensor_shim import _run_compiled, ptr_arg
+from ..tensor_shim import _preload_compiled, _run_compiled, ptr_arg
 from .config import (
     CT_ERR,
     CTRL_INTS,
@@ -22,9 +24,11 @@ from .config import (
     MAX_TP,
     TS_INTS,
     TS_N,
+    LL_TOKENS,
     GemmCfg,
     LaunchCfg,
     tcnt_ints,
+    ll_bytes,
 )
 from .kernel import compile_mega_moe_tp_1250
 
@@ -39,14 +43,15 @@ TUNED_CSV = os.path.join(os.path.dirname(__file__), "tuned_mega_moe_tp.csv")
 
 @functools.cache
 def _tuned_rows() -> dict:
-    """(model_dim, experts, inter per rank, tp, tokens) -> override string, from
-    tuned_mega_moe_tp.csv (columns: model_dim,experts,inter,tp,tokens,cfg; cfg in the
-    MEGA_CFG syntax, fields separated by ';')"""
+    """(model_dim, experts, inter per rank, tp, tokens, mode) -> override string, from
+    tuned_mega_moe_tp.csv (columns: model_dim,experts,inter,tp,tokens,mode,cfg; mode
+    empty (both), ar or ag_rs; cfg in the MEGA_CFG syntax, fields separated by ';')"""
     rows = {}
     if os.path.exists(TUNED_CSV):
         with open(TUNED_CSV) as f:
             for row in csv.DictReader(f):
                 key = tuple(int(row[k]) for k in ("model_dim", "experts", "inter", "tp", "tokens"))
+                key += ((row.get("mode") or "").strip(),)
                 rows[key] = row["cfg"].replace(";", ",")
     return rows
 
@@ -64,13 +69,16 @@ def _apply(cfg: LaunchCfg, ov: str) -> LaunchCfg:
     return cfg
 
 
-def default_launch_cfg(tokens: int, model_dim: int = 4096, shape=None) -> LaunchCfg:
+def default_launch_cfg(tokens: int, model_dim: int = 4096, shape=None, mode: str = "") -> LaunchCfg:
     """The launch config of a batch of (global) tokens: its dispatch path and tiles,
     then the tuned row of shape = (experts, inter per rank, tp) at these tokens if
-    tuned_mega_moe_tp.csv has one, then MEGA_CFG="field=value,..." (experiments)."""
+    tuned_mega_moe_tp.csv has one (then the row of this mode: ar / ag_rs), then
+    MEGA_CFG="field=value,..." (experiments)."""
     cfg = _default_launch_cfg(tokens, model_dim)
     if shape is not None:
-        cfg = _apply(cfg, _tuned_rows().get((model_dim, *shape, tokens), ""))
+        cfg = _apply(cfg, _tuned_rows().get((model_dim, *shape, tokens, ""), ""))
+        if mode:
+            cfg = _apply(cfg, _tuned_rows().get((model_dim, *shape, tokens, mode), ""))
     return _apply(cfg, os.environ.get("MEGA_CFG", ""))
 
 
@@ -87,7 +95,7 @@ def _default_launch_cfg(tokens: int, model_dim: int = 4096) -> LaunchCfg:
         # (prologue, epilogue) a persistent CTA pays serially; 1024 wide at 64 tokens
         # 2 CTAs per CU with 1024-wide G2 tiles: at 64 tokens; for H5120 (DSv4.1) also
         # at 16 / 128 / 256 (-1~6%; H4096: +1~2% at 128 / 256)
-        wide = tokens == 64 or (model_dim >= 5120 and tokens in (16, 128, 256))
+        wide = (tokens == 64 or (model_dim >= 5120 and tokens in (16, 128, 256))) and model_dim % 1024 == 0
         g2 = GemmCfg(tile_m=16, tile_n=1024 if wide else 512, num_buffers=2, b_th=th)
         # tuned (TP4, scripts/tune_mm.py): 2 CTAs per CU up to 64 tokens (cheaper
         # grid syncs, few tiles anyway), 3 from 128 (more weight streams in flight);
@@ -150,8 +158,8 @@ class MegaMoeTP1250Engine:
     ):
         if not 1 <= world_size <= MAX_TP:
             raise ValueError(f"tp {world_size} not in [1, {MAX_TP}]")
-        if model_dim % 1024 or inter_dim % 64:
-            raise ValueError(f"h{model_dim} i{inter_dim}: need h % 1024, i % 64")
+        if model_dim % 512 or inter_dim % 64:
+            raise ValueError(f"h{model_dim} i{inter_dim}: need h % 512, i % 64")
         self.rank, self.tp = int(rank), int(world_size)
         # an inter dim off the 128 grid (DSv4.1: 576 per TP4 rank) runs as I (the next
         # multiple of 128) with the weights at their own Ip: w1 [E, 2 Ip, H / 2],
@@ -179,11 +187,14 @@ class MegaMoeTP1250Engine:
         self._ids = arena.reserve("ids", (tot, K), torch.int32)
         self._tw = arena.reserve("tw", (tot, K), torch.float32)
         self._recv = arena.reserve("recv", (self.tp, self.mmax, H), torch.bfloat16)
-        # AR two-step Y: every rank's reduced rows, read by the others
-        self._yred = arena.reserve("yred", (self.tp, self.mmax, H), torch.bfloat16)
+        # AR two-step Y: every rank's reduced rows, read by the others; ag_rs (<= LL_TOKENS
+        # tokens): the LL items of ag_ll / rs_ll, both epoch parities
+        ll = 2 * ll_bytes(H, K, self.tp, LL_TOKENS // self.tp) // 2
+        self._yred = arena.reserve("yred", (max(self.tp * self.mmax * H, ll),), torch.bfloat16)
         self._flag = arena.reserve("flag", (FLAG_INTS,), torch.int32)
         arena.commit()
         self.arena = arena
+        self._group = group
         dev = self.device
         self.ctrl = torch.zeros(CTRL_INTS + TS_INTS, dtype=torch.int32, device=dev)
         # the routed-row buffers (contiguous-M, every expert's rows tile aligned)
@@ -202,6 +213,7 @@ class MegaMoeTP1250Engine:
         self.tcnt = torch.zeros(tcnt_ints(self.cm), dtype=torch.int32, device=dev)
         self.y = torch.empty((self.mmax, H), dtype=torch.bfloat16, device=dev)
         self._launchers: dict = {}
+        self._ready: set = set()  # configs every rank has compiled
 
     def set_weights(self, w1, w1_scale, w2, w2_scale) -> None:
         self.w = tuple(t.contiguous() for t in (w1, w1_scale, w2, w2_scale))
@@ -233,7 +245,25 @@ class MegaMoeTP1250Engine:
             out = self.y[:m]
         if m == 0:
             return out
-        cfg = cfg or self.cfg_fn(m * self.tp, self.H, (self.E, self.Ip, self.tp))
+        cfg = cfg or self.cfg_fn(m * self.tp, self.H, (self.E, self.Ip, self.tp), mode="ag_rs")
+        if not cfg.ar:
+            # ag_rs: write the AG rows and RS partials the peers read through at system
+            # scope instead of a writeback before the signal (MEGA_RS_WT=1: on; measured
+            # neutral on gfx1250 TP4, so off by default)
+            cfg = dataclasses.replace(cfg, rs_wt=os.environ.get("MEGA_RS_WT", "0") == "1")
+            # small M: the AG as LL items (-2~16 us at 8..256 tokens; MEGA_AG_LL=0: off),
+            # and the RS partials too (another -4~10 us; MEGA_RS_LL=0: off)
+            if (m * self.tp <= LL_TOKENS and os.environ.get("MEGA_AG_LL", "1") == "1"
+                    and not (cfg.ag_split or cfg.q_once or cfg.self_place or cfg.q_place)):
+                rsl = (os.environ.get("MEGA_RS_LL", "1") == "1"
+                       and not (cfg.rs_pull or cfg.rs_q8 or cfg.y_tdm))
+                cfg = dataclasses.replace(cfg, ag_ll=True, rs_ll=rsl or cfg.rs_ll)
+        # (the yred size: LL_TOKENS tokens; AR: rs_ll only, below the two-step Y)
+        if cfg.ag_ll and (cfg.ar or m * self.tp > LL_TOKENS):
+            cfg = dataclasses.replace(cfg, ag_ll=False)
+        if cfg.rs_ll and (m * self.tp > LL_TOKENS or cfg.ar_two
+                          or (not cfg.ar and not cfg.ag_ll)):
+            cfg = dataclasses.replace(cfg, rs_ll=False)
         x = x.contiguous()
         ids = topk_ids.to(torch.int32).contiguous()
         tw = topk_weights.to(torch.float32).contiguous()
@@ -281,6 +311,21 @@ class MegaMoeTP1250Engine:
             self.situ[1],
             torch.cuda.current_stream(),
         )
+        if cfg not in self._ready:
+            # a new kernel: every rank compiles it first, then all launch together (a rank
+            # still compiling would leave the others' cross-rank polls to time out)
+            t0 = time.time()
+            _preload_compiled(self.launcher(cfg), *args)
+            t1 = time.time()
+            if self.tp > 1 and dist.is_initialized():
+                dist.barrier(group=self._group)
+            t2 = time.time()
+            self._ready.add(cfg)
+            _run_compiled(self.launcher(cfg), *args, specialization_key=cfg)
+            if os.environ.get("MEGA_FIRST_DBG") == "1":
+                print(f"[mega first] rank{self.rank} m={m} preload {t1 - t0:.2f}s barrier "
+                      f"{t2 - t1:.2f}s first launch {time.time() - t2:.2f}s", flush=True)
+            return out
         _run_compiled(self.launcher(cfg), *args, specialization_key=cfg)
         return out
 
@@ -306,7 +351,7 @@ class MegaMoeTP1250Engine:
                 self.y_ar = torch.empty((self.mmax * self.tp, self.H), dtype=torch.bfloat16,
                                         device=self.device)
             out = self.y_ar[:T]
-        cfg = cfg or self.cfg_fn(T, self.H, (self.E, self.Ip, self.tp))
+        cfg = cfg or self.cfg_fn(T, self.H, (self.E, self.Ip, self.tp), mode="ar")
         # rs_wt (MEGA_RS_WT=0: off): the rows peers read written through at system scope
         # instead of a system-scope cache writeback before their signal (-10~55 us)
         cfg = dataclasses.replace(cfg, ar=True, rs_pull=False, ag_split=False,
@@ -319,6 +364,11 @@ class MegaMoeTP1250Engine:
         if (not cfg.local_hist and not cfg.q_once and not cfg.self_place
                 and os.environ.get("MEGA_Q_PLACE", "1") == "1"):
             cfg = dataclasses.replace(cfg, q_place=True)
+        # small T: RS partials pushed to every rank as LL items, Y polls locally (no
+        # signal / wait; -0.5~6.5 us at 8..64 tokens; MEGA_RS_LL=0: off)
+        if (T * self.tp <= LL_TOKENS and not cfg.ar_two and not cfg.rs_q8 and not cfg.y_tdm
+                and os.environ.get("MEGA_RS_LL", "1") == "1"):
+            cfg = dataclasses.replace(cfg, rs_ll=True)
         if cfg.ar_two and cfg.rs_q8 and os.environ.get("MEGA_Y_Q8", "1") == "1":
             cfg = dataclasses.replace(cfg, y_q8=True, y2_unroll=max(cfg.y2_unroll, 4))
         return self.forward(x, topk_weights, topk_ids, out=out, cfg=cfg, _m_override=True)

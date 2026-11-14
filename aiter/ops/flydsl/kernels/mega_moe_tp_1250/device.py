@@ -127,6 +127,14 @@ def ld_agent(addr):
     )
 
 
+def ld_sys64(addr):
+    """8 B system-scope load (monotonic, volatile: not cached in the L2, not hoisted out
+    of a spin): an LL item (low word data, high word the writer's epoch)"""
+    return fx.Int64(
+        fx.generic_load(gptr(addr, fx.Int64, 8), memory_order=MONO, syncscope=SYS, volatile=True)
+    )
+
+
 def ld_sys(addr):
     return fx.Int32(
         fx.generic_load(gptr(addr), memory_order=MONO, syncscope=SYS, volatile=True)
@@ -265,6 +273,9 @@ def spin_sys(addr, target, err_addr, err_bit):
         n = n + i32(1)
         if (n & i32(1023)) == i32(0):
             alive = (now() - t0) < fx.Int64(DEADLINE)
+            # a long wait: drop cached lines (a stale one can hide a peer's update for
+            # seconds: rare 20 s timeouts with the data long there)
+            acq_sys()
     if before(cur, target):
         fx.atomic_or(gptr(err_addr), fx.Int32(err_bit), syncscope=AGENT)
 

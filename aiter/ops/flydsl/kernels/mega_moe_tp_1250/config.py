@@ -10,19 +10,21 @@ from dataclasses import dataclass
 MAX_TP = 8
 WAVE = 32
 # a cross-rank / grid wait that runs longer than this (steady-counter ticks, 100 MHz)
-# gives up and sets a sticky error bit (2 s)
-DEADLINE = 200_000_000
+# gives up and sets a sticky error bit (20 s: a rank's first launch of a kernel may
+# trail the others by its trace / cache load; an LL poll that gives up reads junk)
+DEADLINE = 2_000_000_000
 
 # Local ctrl ints (one int32 array per rank, zeroed once). Counters that every CTA
 # hits sit on their own 128 B line. Every counter is monotonic across launches and
 # compared against epoch-derived targets (wrap-safe), so nothing is reset per launch
-# except the routing counters (zeroed by CTA 0 once they are dead).
+# except the routing counters ([epoch parity]: a launch zeroes the other parity's).
 LINE = 32
 CT_EPOCH = 0
 CT_ERR = 1
-CT_CNT = 8 * LINE  # [E] routes per expert
-CT_FILL = CT_CNT + 1024  # [E] routes placed per expert
 E_MAX = 1024
+LL_TOKENS = 256  # ag_rs: ag_ll / rs_ll up to this many tokens (engine)
+CT_CNT = 8 * LINE  # [par][E] routes per expert
+CT_FILL = CT_CNT + 2 * E_MAX  # [par][E] routes placed per expert
 # Grid sync points (all CTAs arrive once per launch; a set per epoch parity, the
 # other parity's zeroed by every launch for the next, so launches of kernels with
 # different CTA counts may alternate): two-level arrival counters, a
@@ -37,7 +39,7 @@ SYNC_INTS = SYNC_FLAG + LINE
 SY_AG, SY_RS, SY_DONE = 0, 1, 2  # done pushing AG rows / RS rows; done
 SY_BAR = 3  # grid barrier j uses sync point SY_BAR + j - 1
 N_SYNC = 8
-CT_SYNC = CT_FILL + E_MAX
+CT_SYNC = CT_FILL + 2 * E_MAX
 CTRL_INTS = CT_SYNC + 2 * N_SYNC * SYNC_INTS  # [epoch parity][sync point]
 # debug (MEGA_TS=1 at compile): per CTA, TS_N int64 steady-counter stamps at the
 # phase boundaries, stored after the ctrl ints
@@ -55,6 +57,9 @@ FLAG_INTS = 8 * LINE
 
 ERR_AG, ERR_RS, ERR_BAR = 1, 2, 4  # grid barrier j (1..4) sets ERR_BAR << (j - 1)
 ERR_DF = 64  # a per-m-tile wait (dataflow) timed out
+# an LL poll (ag_ll / rs_ll) timed out, by site: AG gate, hist ids, placement ids,
+# placement rows, RS weights, Y partials
+ERR_LL_GATE, ERR_LL_HIST, ERR_LL_IDS, ERR_LL_ROWS, ERR_LL_TW, ERR_LL_Y = 128, 256, 512, 1024, 2048, 4096
 
 
 def tile_counts_stride(cm: int) -> int:
@@ -97,6 +102,9 @@ class GemmCfg:
     ds_first_n: int = -1
     c_sep: int = 0  # output staging in its own LDS region; store not waited per task
     b_th: int = 0  # TDM temporal hint of the B (weight) loads (gemm_tile tdm_b_th)
+    # ug (upstream task builder) only: LDS SoA load interleave, TDM waves per tensor
+    soa: int = 0
+    tdm_w: int = 2
 
 
 @dataclass(frozen=True)
@@ -144,8 +152,32 @@ class LaunchCfg:
     # AR (not local_hist): placement quantizes each token's x row once and stores it to
     # its TOPK slots; no AG quantization pass, no xq round trip
     q_place: bool = False
+    # G1 / G2 as dense_tile (the dense gfx1250 MXFP4 GEMM's main loop: faster with deep
+    # pipelines); A scales in the 32x4 layout (placement, G1's output); needs q_place
+    dense: bool = False
+    # ag_rs: AG rows / scales / ids / weights pushed as LL items (8 B: a data word and the
+    # launch epoch) by system-scope write-through stores, into the peers' yred region
+    # (unused outside AR); readers poll the items themselves: no writeback, store
+    # drain, signal or AG wait
+    ag_ll: bool = False
+    # ag_rs (with ag_ll): RS partials pushed as LL items too; Y polls them (no RS
+    # writeback, drain, signal or wait)
+    rs_ll: bool = False
+    # G1 / G2 tiles from upstream's build_gemm_a8w4_tdm_task (mxfp4_preshuffle_gfx1250_tdm:
+    # PR #7726's main loop: strict VGPR placement for 256^3 tiles, 2 WMMA : 3 DS groups,
+    # WMMAs around the stage fences, one LDS base per stage) as explicit tiles: this
+    # kernel keeps the task order, the expert / valid rows (tile_meta) and the dataflow
+    # waits (a_ready: after the B prologue); needs Ip == I and g1 / g2 tile_m == align_m
+    ug: bool = False
     y2_unroll: int = 2  # AR two-step: Y2 (remote pull) units a wave loads at once (2: -1~5%)
 
     @property
     def align_m(self) -> int:
         return max(self.g1.tile_m, self.g2.tile_m)
+
+
+def ll_bytes(H: int, topk: int, tp: int, m: int) -> int:
+    """yred bytes the LL items of one epoch parity take (ag_ll: AG rows of the tp * m
+    tokens; rs_ll: their RS partials)"""
+    rll = (H + H // 16 + 16 * topk + 127) // 128 * 128
+    return tp * m * (rll + 4 * H)
