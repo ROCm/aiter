@@ -907,8 +907,12 @@ def _grouped_a8w4_tdm_moe(
     # place of the counter fill, route and psum-remap launches; it runs where the
     # psum is built below. HERD routes carry K+1 candidates per row and are
     # dropped to K by herd_route_psum, which this kernel does not do.
+    # A-preshuffle needs the row-to-token map emitted by contiguous_psum_remap.
+    # fused_route_psum_remap only produces the forward map and leaves that
+    # inverse map at its -1 sentinel, so retain the full route for this layout.
     _fused_tp_route = (
-        not herd_topk
+        not a_preshuffled
+        and not herd_topk
         and not _compact
         and not _is_ep
         and not enable_ep_scatter
