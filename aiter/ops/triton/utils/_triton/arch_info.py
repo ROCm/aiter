@@ -39,7 +39,7 @@ def is_sw_emulated_fp4_avail():
     # No native FP4 instructions: Triton lowers tl.dot_scaled by upcasting the
     # operands to bf16. Only the Triton backend runs here, and each FP4 entry
     # point opts in separately once it has configs and a passing test.
-    return get_arch() in ("gfx1101", "gfx1150", "gfx1151")
+    return get_arch() in ("gfx1101", "gfx1150", "gfx1151", "gfx1201")
 
 
 def is_any_fp4_avail():
