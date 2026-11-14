@@ -397,6 +397,7 @@ def test_fused_rope_concat_and_cache_mla(
         dtype=q_out_dtype,  # cache_dtype,
         device=q_nope.device,
     )
+    q_out.view(torch.uint8).fill_(0xA5)
 
     ref_q_out = torch.empty(
         (num_tokens, num_heads, qk_rope_head_dim + kv_lora_rank),
@@ -495,11 +496,12 @@ def test_fused_rope_concat_and_cache_mla(
     kv_cache = kv_cache.reshape(
         num_tokens // block_size, block_size, num_kv_heads, entry_size
     )
+    q_cmp_rows = num_tokens if compute_all_q_rope else num_valid
     if kv_cache_dtype == "fp8" and q_dtype == "fp8":
         kv_result_temp = kv_cache.to(torch.float32)
         kv_expected_temp = ref_kv_cache.to(torch.float32)
-        q_result_tmp = q_out.to(torch.float32) * q_scale
-        q_expected_tmp = ref_q_out.to(torch.float32) * q_scale
+        q_result_tmp = q_out[:q_cmp_rows].to(torch.float32) * q_scale
+        q_expected_tmp = ref_q_out[:q_cmp_rows].to(torch.float32) * q_scale
         err_kv = checkAllclose(kv_result_temp, kv_expected_temp, atol=0.01, rtol=0.01)
         err_q_out = checkAllclose(q_result_tmp, q_expected_tmp, atol=0.01, rtol=0.01)
         ## compare with qscale=1.0
@@ -527,7 +529,9 @@ def test_fused_rope_concat_and_cache_mla(
             msg="fp8 kv result compared with ref",
         )
         err_q_out = checkAllclose(
-            q_out, ref_q_out, msg="bf16 qout result compared with ref"
+            q_out[:q_cmp_rows],
+            ref_q_out[:q_cmp_rows],
+            msg="bf16 qout result compared with ref",
         )
         # if block_size == 1 and is_nope_first and (num_heads % num_kv_heads == 0):
         #  err_triton_q_out = checkAllclose(
@@ -543,7 +547,9 @@ def test_fused_rope_concat_and_cache_mla(
             kv_cache, ref_kv_cache, msg="bf16 kv result compared with ref"
         )
         err_q_out = checkAllclose(
-            q_out, ref_q_out, msg="bf16 qout result compared with ref"
+            q_out[:q_cmp_rows],
+            ref_q_out[:q_cmp_rows],
+            msg="bf16 qout result compared with ref",
         )
 
         # if block_size == 1 and is_nope_first and (num_heads % num_kv_heads == 0):
@@ -559,7 +565,14 @@ def test_fused_rope_concat_and_cache_mla(
     # With compute_all_q_rope=True every token's q_out is computed → check all.
     # With compute_all_q_rope=False (default) padded-token q_out is left
     # uninitialized (early-return), so only check the owned (valid-slot) tokens.
-    n_chk = num_tokens if compute_all_q_rope else num_valid
+    n_chk = q_cmp_rows
+    if not compute_all_q_rope and num_valid < num_tokens:
+        padded_bytes = q_out[num_valid:].view(torch.uint8)
+        if not bool(torch.all(padded_bytes == 0xA5)):
+            raise AssertionError(
+                "padded-token q_out was modified with compute_all_q_rope=False; "
+                f"T={num_tokens}, H={num_heads}, valid={num_valid}"
+            )
     q_out_chk = q_out[:n_chk].to(torch.float32)
     ref_q_out_chk = ref_q_out[:n_chk].to(torch.float32)
     if is_nope_first:
@@ -578,11 +591,55 @@ def test_fused_rope_concat_and_cache_mla(
             f"layout={q_nope_layout}, stride={tuple(q_nope.stride())}, "
             f"max_abs={q_nope_max_abs}"
         )
-    # Positions past a short cos/sin cache must use its last row.
-    if max_position < num_tokens and max(err_kv, err_q_out) > 0.05:
+    if num_kv_heads == 1 and kv_lora_rank == 512 and qk_rope_head_dim == 64:
+        # The optimized NoPE op must store exactly what rotation by an identity
+        # cache stores.
+        id_cos, id_sin = torch.ones_like(cos_cache), torch.zeros_like(sin_cache)
+        id_out = []
+        for nope_op in (False, True):
+            kv_i = torch.zeros(
+                num_blocks, block_size, num_kv_heads, entry_size, dtype=cache_dtype
+            )
+            q_i = torch.zeros_like(q_out)
+            args = (
+                q_nope,
+                q_pe,
+                kv_c,
+                k_pe,
+                kv_i.squeeze(2),
+                q_i,
+                slot_mapping,
+                scale,
+                q_scale,
+            )
+            if nope_op:
+                aiter.fused_qk_concat_and_cache_mla(
+                    *args,
+                    is_nope_first,
+                    compute_all_q=compute_all_q_rope,
+                )
+            else:
+                aiter.fused_qk_rope_concat_and_cache_mla(
+                    *args,
+                    pos,
+                    id_cos,
+                    id_sin,
+                    is_neox,
+                    is_nope_first,
+                    compute_all_q_rope=compute_all_q_rope,
+                )
+            id_out.append((kv_i.view(torch.uint8), q_i[:n_chk].view(torch.uint8)))
+        if not all(torch.equal(a, b) for a, b in zip(*id_out)):
+            raise AssertionError(
+                "fused_qk_concat_and_cache_mla differs from cos 1, sin 0 RoPE"
+            )
+    # Positions past a short cos/sin cache must use its last row. In the
+    # padded early-return case only the valid prefix has a reference value.
+    q_checked_max_abs = float((q_out_chk - ref_q_out_chk).abs().max().item())
+    if max_position < num_tokens and max(err_kv, q_checked_max_abs) > 0.05:
         raise AssertionError(
             f"positions not clamped to a {max_position}-row cos/sin cache: "
-            f"kv_err={err_kv}, q_err={err_q_out}"
+            f"kv_err={err_kv}, q_err={q_checked_max_abs}"
         )
     ret["fused_qk_us"] = avg_us
     ret["num_valid"] = num_valid
@@ -864,8 +921,9 @@ if "fused_qk" in args.case:
                                     # Pair padding with compute_all_q_rope: only
                                     # run (full, non-DCP) and (padded, DCP
                                     # compute-all). Skip the redundant
-                                    # (full, compute-all) and the
-                                    # uninteresting (padded, early-return).
+                                    # (full, compute-all). The padded
+                                    # early-return has targeted HPT=2/4
+                                    # sentinel cases below.
                                     if compute_all_q_rope != (valid_frac < 1.0):
                                         continue
                                     # Only the decode kernels clamp positions.
@@ -891,6 +949,40 @@ if "fused_qk" in args.case:
                                         max_position,
                                     )
                                     df.append(ret)
+    arch = torch.cuda.get_device_properties(torch.cuda.current_device()).gcnArchName
+    arch = arch.split(":")[0]
+    if arch in ("gfx1250", "gfx950"):
+        # Exercise the two new multi-head latency forms with padded tokens and
+        # compute_all_q_rope=False. q_out starts as 0xA5; the test above fails
+        # if either HPT path writes any byte in a padded row.
+        num_heads = 96
+        num_cu = torch.cuda.get_device_properties(
+            torch.cuda.current_device()
+        ).multi_processor_count
+        for rows_per_cu, expected_hpt in ((12, 2), (18, 4)):
+            num_token = (rows_per_cu * num_cu + num_heads - 1) // num_heads
+            assert num_token * num_heads // num_cu == rows_per_cu
+            ret = test_fused_rope_concat_and_cache_mla(
+                512,
+                64,
+                num_token,
+                1,
+                num_token,
+                num_heads,
+                1,
+                torch.bfloat16,
+                args.device,
+                "fp8",
+                "fp8",
+                True,
+                "contiguous",
+                0.5,
+                False,
+                True,
+                1,
+            )
+            ret["sentinel_hpt"] = expected_hpt
+            df.append(ret)
     df = pd.DataFrame(df)
     df_md = df.to_markdown(index=False)
     aiter.logger.info("fused_rope_concat_and_cache_mla summary (markdown):\n%s", df_md)

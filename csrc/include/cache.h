@@ -148,6 +148,23 @@ void fused_qk_rope_concat_and_cache_mla(
     // true (DCP) forces Q RoPE for every token (needed after head all-gather).
     bool compute_all_q_rope = false);
 
+// NoPE form of fused_qk_rope_concat_and_cache_mla: concatenate and quantize Q,
+// concatenate and quantize K into the cache, without positions or rotation.
+// The optimized path currently supports the Kimi MLA layout: rank 512, PE 64,
+// one KV head and fp16/bf16 input.
+void fused_qk_concat_and_cache_mla(
+    aiter_tensor_t& q_nope,
+    aiter_tensor_t& q_pe,
+    aiter_tensor_t& kv_c,
+    aiter_tensor_t& k_pe,
+    aiter_tensor_t& kv_cache,
+    aiter_tensor_t& q_out,
+    aiter_tensor_t& slot_mapping,
+    aiter_tensor_t& k_scale,
+    aiter_tensor_t& q_scale,
+    bool is_nope_first,
+    bool compute_all_q = false);
+
 // DeepSeek V3.1 MLA: fused QK RoPE(pe) + static FP8 quant + segmented paged KV
 // cache write (no RMSNorm). kv_cache is flat [num_blocks, page_size*kv_lora +
 // page_size*pe] (nope seg then rope seg, each token-major). q_out

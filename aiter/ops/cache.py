@@ -184,6 +184,24 @@ def fused_qk_rope_concat_and_cache_mla(
 
 
 @compile_ops("module_cache", develop=True)
+def fused_qk_concat_and_cache_mla(
+    q_nope: Tensor,
+    q_pe: Tensor,
+    kv_c: Tensor,  # Kimi MLA: [..., kv_lora_rank=512], one KV head
+    k_pe: Tensor,  # [..., pe_dim=64]
+    kv_cache: Tensor,
+    q_out: Tensor,
+    slot_mapping: Tensor,
+    k_scale: Tensor,
+    q_scale: Tensor,
+    is_nope_first: bool,
+    # False (default): slot<0 tokens early-return. True (DCP): compute Q for
+    # every token while guarding only the owner-specific K-cache write.
+    compute_all_q: bool = False,
+) -> None: ...
+
+
+@compile_ops("module_cache", develop=True)
 def fused_qk_rope_concat_and_cache_mla_seg(
     q_nope: Tensor,  # [num_tokens, num_heads, kv_lora_rank=512]
     q_pe: Tensor,  # [num_tokens, num_heads, pe_dim=64]
