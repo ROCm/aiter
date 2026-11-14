@@ -2211,7 +2211,13 @@ def _flydsl_moe_stage2_impl(
         )
         _epilog = "atomic"
         gemm2_out = out
-        if mode == "reduce" and b_dtype != "bf16":
+        if return_per_slot:
+            if b_dtype == "bf16":
+                raise ValueError(
+                    "a16w16 stage2 has no reduce epilogue for per-slot output"
+                )
+            _epilog = "reduce"
+        elif mode == "reduce" and b_dtype != "bf16":
             _epilog = "reduce"
             gemm2_out = torch.empty(
                 (M_logical * int(topk), model_dim),
@@ -2249,7 +2255,7 @@ def _flydsl_moe_stage2_impl(
             epilog=_epilog,
             use_valid_token_count=use_valid_token_count,
         )
-        if _epilog == "reduce":
+        if _epilog == "reduce" and not return_per_slot:
             _run_moe_reduction(
                 gemm2_out,
                 out,
