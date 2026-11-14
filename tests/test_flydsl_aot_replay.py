@@ -410,3 +410,51 @@ def test_gemm_scan_covers_the_heuristics_where_a_sparse_table_has_no_row(
         {**job, "tuned": ((1, 16, 1), (8192, 256, 1), (32768, 256, 1))}, 8193
     )
     assert not all(any(b * 256 < m <= (b + 1) * 256 for m in dense) for b in blocks)
+
+
+def test_int8_csv_rows_reach_the_4wave_kernel_through_public_replay(
+    tmp_path, monkeypatch
+):
+    from aiter.aot.flydsl import gemm
+    from aiter.ops import gemm_op_a8w8
+    from aiter.ops.flydsl import gemm_a8w8_bpreshuffle_4wave as four_wave
+
+    source = _REPO_ROOT / "aiter/configs/a8w8_bpreshuffle_tuned_gemm.csv"
+    with source.open(newline="") as stream:
+        reader = csv.DictReader(stream)
+        rows = [
+            row
+            for row in reader
+            if row["q_dtype_w"] == "torch.int8" and row["libtype"] == "flydsl"
+        ]
+        fieldnames = reader.fieldnames
+    assert len(rows) == 3
+    path = tmp_path / "a8w8_bpreshuffle_tuned_gemm.csv"
+    with path.open("w", newline="") as stream:
+        writer = csv.DictWriter(stream, fieldnames=fieldnames)
+        writer.writeheader()
+        writer.writerows(rows)
+    jobs = gemm.parse_csv(str(path))
+    assert {(j["m"], j["n"], j["k"], j["kernel_name"]) for j in jobs} == {
+        (int(r["M"]), int(r["N"]), int(r["K"]), r["kernelName"]) for r in rows
+    }
+
+    launched = []
+    run_4wave = four_wave.run_gemm_a8w8_bpreshuffle_4wave
+
+    def record(*args, **kwargs):
+        launched.append(args[5])
+        return run_4wave(*args, **kwargs)
+
+    monkeypatch.setattr(four_wave, "run_gemm_a8w8_bpreshuffle_4wave", record)
+    monkeypatch.setenv("AITER_CONFIG_GEMM_A8W8_BPRESHUFFLE", str(path))
+    gemm_op_a8w8.get_GEMM_config_with_quant_type.cache_clear()
+    try:
+        with dry_run("gfx950", 256, python_ops=True):
+            for job in jobs:
+                with replay.identified_kernels() as kernels:
+                    gemm.replay(job)
+                assert kernels, job
+    finally:
+        gemm_op_a8w8.get_GEMM_config_with_quant_type.cache_clear()
+    assert launched == [job["kernel_name"] for job in jobs]

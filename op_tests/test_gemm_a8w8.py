@@ -30,6 +30,7 @@ except ModuleNotFoundError as e:
     from op_tests.tuned_op_bench_utils import append_tuned_op_bench_rows
 import argparse
 from functools import lru_cache, wraps
+from unittest import mock
 
 import pandas as pd
 
@@ -166,8 +167,8 @@ def run_gemm_ck(x, weight, x_scale, w_scale, bias=None, dtype=dtypes.bf16):
 
 
 @gemm_perftest
-def run_gemm_ck_bpreshuffle(x, weight, x_scale, w_scale, dtype=dtypes.bf16):
-    return aiter.gemm_a8w8_bpreshuffle(x, weight, x_scale, w_scale, None, dtype)
+def run_gemm_ck_bpreshuffle(x, weight, x_scale, w_scale, bias=None, dtype=dtypes.bf16):
+    return aiter.gemm_a8w8_bpreshuffle(x, weight, x_scale, w_scale, bias, dtype)
 
 
 @gemm_perftest
@@ -278,16 +279,29 @@ def test_gemm(
             err_b = checkAllclose(
                 a, b, msg="ck: ", rtol=1e-2, atol=1e-2, catastrophic_check=True
             )
-    if quantDtype != dtypes.i8 and quant_mode == "per-token":
+    run_bpreshuffle = quant_mode == "per-token" and quantDtype != dtypes.i8
+    if quant_mode == "per-token" and quantDtype == dtypes.i8:
+        from aiter.ops.flydsl.gemm_a8w8_bpreshuffle_4wave import (
+            supports_4wave_int8_shape,
+        )
+
+        run_bpreshuffle = (
+            get_gfx() == "gfx950"
+            and dtype == dtypes.bf16
+            and supports_4wave_int8_shape(m, n, k)
+        )
+    if run_bpreshuffle:
         c, avg_c = run_gemm_ck_bpreshuffle(
             x,
             weightshuffle,
             x_scale,
             w_scale,
+            None if quantDtype == dtypes.i8 else bias,
             dtype,
             benchmark_iters=bpreshuffle_iters,
         )
-        # c = c + bias
+        if quantDtype == dtypes.i8 and bias is not None:
+            c = c + bias
         err_c = checkAllclose(
             a, c, msg="ck bpreshuffle: ", rtol=1e-2, atol=1e-2, catastrophic_check=True
         )
@@ -747,6 +761,376 @@ def test_skinny_gemm_a8w8_pertoken_quant():
                     test_skinny_gemm(dtype, m, n, k, quant_dtype, cu_count)
 
 
+def make_int8_4wave_case(shape, seed):
+    m, n, k = shape
+    generator = torch.Generator(device="cuda").manual_seed(seed)
+    x = torch.randint(
+        -31, 32, (m, k), dtype=torch.int8, device="cuda", generator=generator
+    )
+    weight = torch.randint(
+        -31, 32, (n, k), dtype=torch.int8, device="cuda", generator=generator
+    )
+    x_scale = (
+        torch.rand((m, 1), dtype=torch.float32, device="cuda", generator=generator)
+        * 1e-3
+        + 1e-4
+    )
+    w_scale = (
+        torch.rand((1, n), dtype=torch.float32, device="cuda", generator=generator)
+        * 1e-3
+        + 1e-4
+    )
+    return {
+        "x": x,
+        "weight": weight,
+        "weight_shuffled": shuffle_weight(weight, layout=(16, 16)).contiguous(),
+        "x_scale": x_scale,
+        "w_scale": w_scale,
+    }
+
+
+def int8_4wave_reference(case):
+    accum = F.linear(case["x"].float(), case["weight"].float())
+    return (accum * (case["x_scale"] * case["w_scale"])).to(torch.bfloat16)
+
+
+def _expect_value_error(message, launch, *args, **kwargs):
+    try:
+        launch(*args, **kwargs)
+    except ValueError as error:
+        if message not in str(error):
+            raise
+    else:
+        raise AssertionError(f"expected ValueError containing {message!r}")
+
+
+@torch.no_grad()
+def run_int8_4wave_ci_correctness():
+    """Observable correctness cases run by AITER's script-based CI entry."""
+    if get_gfx() != "gfx950":
+        aiter.logger.info("INT8 4-wave correctness: skipped, requires gfx950")
+        return
+
+    cases = (
+        (17, 32, 256),
+        (257, 272, 1024),
+        (257, 272, 1152),
+        (4352, 4608, 5120),
+    )
+    for m, n, k in cases:
+        case = make_int8_4wave_case((m, n, k), m + n + k)
+        actual = aiter.gemm_a8w8_bpreshuffle(
+            case["x"],
+            case["weight_shuffled"],
+            case["x_scale"],
+            case["w_scale"],
+        )
+        expected = int8_4wave_reference(case)
+        assert torch.equal(actual, expected), (m, n, k)
+
+    # Padded weights dispatch at the physical K, with XQ zero-padded to match.
+    case = make_int8_4wave_case((17, 32, 256), 384)
+    padded = aiter.gemm_a8w8_bpreshuffle(
+        case["x"],
+        shuffle_weight(case["weight"], layout=(16, 16), pad_k_to=384).contiguous(),
+        case["x_scale"],
+        case["w_scale"],
+    )
+    assert torch.equal(padded, int8_4wave_reference(case))
+
+    # Signed extrema exercise true INT8 rather than a narrowed test range.
+    m, n, k = 17, 32, 256
+    x_extreme = torch.full((m, k), -128, dtype=torch.int8, device="cuda")
+    weight_extreme = torch.full((n, k), 127, dtype=torch.int8, device="cuda")
+    x_scale_extreme = torch.full((m, 1), 1e-3, dtype=torch.float32, device="cuda")
+    w_scale_extreme = torch.full((1, n), 2e-3, dtype=torch.float32, device="cuda")
+    extreme = aiter.gemm_a8w8_bpreshuffle(
+        x_extreme,
+        shuffle_weight(weight_extreme, layout=(16, 16)).contiguous(),
+        x_scale_extreme,
+        w_scale_extreme,
+    )
+    extreme_ref = (
+        F.linear(x_extreme.float(), weight_extreme.float())
+        * (x_scale_extreme * w_scale_extreme)
+    ).to(torch.bfloat16)
+    assert torch.equal(extreme, extreme_ref)
+
+    # At the largest K, all-(-128) products sum to just below the INT32 limit.
+    from aiter.ops.flydsl.gemm_a8w8_bpreshuffle_4wave import BLOCK_K, MAX_K
+
+    ones_m = torch.ones((1, 1), dtype=torch.float32, device="cuda")
+    ones_n = torch.ones((1, 16), dtype=torch.float32, device="cuda")
+    limit = aiter.gemm_a8w8_bpreshuffle(
+        torch.full((1, MAX_K), -128, dtype=torch.int8, device="cuda"),
+        shuffle_weight(
+            torch.full((16, MAX_K), -128, dtype=torch.int8, device="cuda"),
+            layout=(16, 16),
+        ).contiguous(),
+        ones_m,
+        ones_n,
+    )
+    limit_ref = torch.full(
+        (1, 16), float(128 * 128 * MAX_K), dtype=torch.float32, device="cuda"
+    )
+    assert torch.equal(limit, limit_ref.to(torch.bfloat16))
+
+    # Zero rows return an empty BF16 matrix without compiling a specialization.
+    n = k = 256
+    zero = aiter.gemm_a8w8_bpreshuffle(
+        torch.empty((0, k), dtype=torch.int8, device="cuda"),
+        shuffle_weight(
+            torch.zeros((n, k), dtype=torch.int8, device="cuda"),
+            layout=(16, 16),
+        ).contiguous(),
+        torch.empty((0, 1), dtype=torch.float32, device="cuda"),
+        torch.ones((1, n), dtype=torch.float32, device="cuda"),
+    )
+    assert zero.shape == (0, n)
+
+    # Bias is deliberately caller-owned because adding it before and after
+    # BF16 conversion is not numerically interchangeable.
+    case = make_int8_4wave_case((17, 32, 256), 7)
+    try:
+        aiter.gemm_a8w8_bpreshuffle(
+            case["x"],
+            case["weight_shuffled"],
+            case["x_scale"],
+            case["w_scale"],
+            bias=torch.zeros(32, dtype=torch.bfloat16, device="cuda"),
+        )
+    except ValueError as error:
+        if "does not fuse bias" not in str(error):
+            raise
+    else:
+        raise AssertionError("INT8 bpreshuffle must reject fused bias")
+
+    _expect_value_error(
+        "BF16 output",
+        lambda: aiter.gemm_a8w8_bpreshuffle(
+            case["x"],
+            case["weight_shuffled"],
+            case["x_scale"],
+            case["w_scale"],
+            dtype=torch.float16,
+        ),
+    )
+    _expect_value_error(
+        "FP32",
+        lambda: aiter.gemm_a8w8_bpreshuffle(
+            case["x"],
+            case["weight_shuffled"],
+            case["x_scale"].half(),
+            case["w_scale"],
+        ),
+    )
+    _expect_value_error(
+        "K >= 256",
+        lambda: aiter.gemm_a8w8_bpreshuffle(
+            torch.zeros((17, 128), dtype=torch.int8, device="cuda"),
+            shuffle_weight(
+                torch.zeros((32, 128), dtype=torch.int8, device="cuda"),
+                layout=(16, 16),
+            ).contiguous(),
+            torch.ones((17, 1), dtype=torch.float32, device="cuda"),
+            torch.ones((1, 32), dtype=torch.float32, device="cuda"),
+        ),
+    )
+    _expect_value_error(
+        "accumulate in INT32",
+        lambda: aiter.gemm_a8w8_bpreshuffle(
+            torch.zeros((1, MAX_K + BLOCK_K), dtype=torch.int8, device="cuda"),
+            torch.zeros((16, MAX_K + BLOCK_K), dtype=torch.int8, device="cuda"),
+            ones_m,
+            ones_n,
+        ),
+    )
+
+    # Compile, graph and stream smoke use one small untuned specialization.
+    case = make_int8_4wave_case((257, 272, 384), 11)
+    x = case["x"]
+    x_scale = case["x_scale"]
+    shuffled = case["weight_shuffled"]
+    w_scale = case["w_scale"]
+    eager = aiter.gemm_a8w8_bpreshuffle(x, shuffled, x_scale, w_scale)
+
+    def launch(x_arg, scale_arg):
+        return aiter.gemm_a8w8_bpreshuffle(x_arg, shuffled, scale_arg, w_scale)
+
+    compiled = torch.compile(launch, fullgraph=True)
+    assert torch.equal(compiled(x, x_scale), eager)
+
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        captured = launch(x, x_scale)
+    graph.replay()
+    torch.cuda.synchronize()
+    assert torch.equal(captured, eager)
+
+    side = torch.cuda.Stream()
+    side.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(side):
+        streamed = launch(x, x_scale)
+        consumed = streamed.float() * 2
+    side.synchronize()
+    assert torch.equal(streamed, eager)
+    assert torch.equal(consumed, eager.float() * 2)
+    aiter.logger.info(
+        "INT8 4-wave correctness: passed %d bit-exact shapes, padded K, signed "
+        "extrema up to the INT32 K limit, zero rows, contract rejections, "
+        "compile, graph and stream",
+        len(cases),
+    )
+
+
+@torch.no_grad()
+def run_int8_4wave_dispatch_checks():
+    """INT8 routing decisions, checked with fake tuned rows and launches."""
+    if get_gfx() != "gfx950":
+        aiter.logger.info("INT8 4-wave dispatch checks: skipped, requires gfx950")
+        return
+
+    from aiter.ops import gemm_op_a8w8
+    from aiter.ops.flydsl import gemm_a8w8_bpreshuffle_4wave as four_wave
+    from aiter.ops.flydsl.kernels.gemm_a8w8_8wave import _xcd_contiguous_index
+
+    def operands(k, weight_k, m=2, n=16):
+        return (
+            torch.zeros((m, k), dtype=torch.int8, device="cuda"),
+            torch.zeros((n, weight_k), dtype=torch.int8, device="cuda"),
+            torch.ones((m, 1), dtype=torch.float32, device="cuda"),
+            torch.ones((1, n), dtype=torch.float32, device="cuda"),
+        )
+
+    def flydsl_launch(row_for_k, m=2, k=256, weight_k=256, cu_num=256, num_xcds=8):
+        seen = {"lookups": []}
+
+        def lookup(lookup_m, lookup_n, lookup_k, *_args, **_kwargs):
+            seen["lookups"].append((lookup_m, lookup_n, lookup_k))
+            return row_for_k(lookup_k)
+
+        def launch(XQ, WQ, x_scale, w_scale, out, config):
+            seen.update(x_shape=tuple(XQ.shape), kernel_name=config["kernelName"])
+            return out
+
+        with mock.patch.multiple(
+            gemm_op_a8w8,
+            get_GEMM_config_with_quant_type=lookup,
+            gemm_a8w8_bpreshuffle_flydsl=launch,
+        ), mock.patch.multiple(
+            four_wave,
+            get_cu_num=lambda: cu_num,
+            get_cdna4_num_xcds=lambda *_args: num_xcds,
+        ):
+            gemm_op_a8w8.gemm_a8w8_bpreshuffle(*operands(k, weight_k, m))
+        return seen
+
+    # Padded weights look up their tuned row, and launch, at the physical K.
+    row_256 = {
+        "libtype": "flydsl",
+        "splitK": 0,
+        "kernelName": four_wave.make_4wave_kernel_name(K=256),
+    }
+    seen = flydsl_launch(lambda k: row_256 if k == 256 else None, weight_k=384)
+    assert seen["lookups"] == [(2, 16, 384)], seen
+    assert seen["x_shape"] == (2, 384) and "_k384" in seen["kernel_name"], seen
+
+    # A tuning miss on a 128-CU device selects the 4-XCD runtime variant.
+    seen = flydsl_launch(lambda k: None, cu_num=128, num_xcds=4)
+    assert seen["kernel_name"].endswith("_k256_xcd4"), seen
+
+    # Only rows that run on FlyDSL at the launch M and K are used. The generic
+    # launcher would hand M above PRESHUFFLE_M_MAX to the FP8-only CK kernel.
+    generic = "flydsl_bpreshuflle_64x64x128_I8_I8_B16_1x2x0x2_default"
+    for libtype, kernel_name, m, uses_row in (
+        ("flydsl", row_256["kernelName"], 2, True),
+        ("flydsl", generic, 2, True),
+        ("flydsl", generic, 65537, False),
+        ("flydsl", "unparseable_row", 2, False),
+        ("asm", "asm_row", 2, False),
+    ):
+        row = {"libtype": libtype, "splitK": 0, "kernelName": kernel_name}
+        seen = flydsl_launch(lambda k, row=row: row, m=m)
+        fallback = four_wave.default_4wave_kernel_name(
+            m, 16, 256, cu_num=256, num_xcds=8
+        )
+        assert seen["kernel_name"] == (kernel_name if uses_row else fallback), row
+
+    # gemm_a8w8_ASM ignores rows of other backends in the shared table.
+    def asm_launch(row):
+        seen = {}
+
+        def asm(XQ, WQ, x_scale, w_scale, out, kernel_name, bias, **kwargs):
+            seen.update(kernel_name=kernel_name, split_k=kwargs["splitK"])
+            return out
+
+        with mock.patch.multiple(
+            gemm_op_a8w8,
+            get_GEMM_config_with_quant_type=lambda *_args, **_kwargs: row,
+            gemm_a8w8_asm=asm,
+        ):
+            bias = torch.zeros((1, 16), dtype=torch.float32, device="cuda")
+            gemm_op_a8w8.gemm_a8w8_ASM(*operands(256, 256), bias)
+        return seen
+
+    flydsl_row = {"libtype": "flydsl", "splitK": 0, "kernelName": "flydsl_row"}
+    asm_row = {"libtype": "asm", "splitK": 2, "kernelName": "asm_row"}
+    assert asm_launch(flydsl_row) == {"kernel_name": "", "split_k": 1}
+    assert asm_launch(asm_row) == {"kernel_name": "asm_row", "split_k": 2}
+
+    # Oversized shapes are rejected before the tuned-row lookup.
+    def lookup_before_check(*_args, **_kwargs):
+        raise AssertionError("tuned-row lookup ran before the INT8 contract check")
+
+    with mock.patch.object(
+        gemm_op_a8w8, "get_GEMM_config_with_quant_type", lookup_before_check
+    ):
+        over_k = four_wave.MAX_K + four_wave.BLOCK_K
+        for m, n, k, message in (
+            (1, 16, over_k, "accumulate in INT32"),
+            (65536, 16384, 256, "M*N*2, M*K_w and N*K_w below 2**31"),
+        ):
+            _expect_value_error(
+                message, gemm_op_a8w8.gemm_a8w8_bpreshuffle, *operands(k, k, m, n)
+            )
+
+    # Compile guards: persistent mode needs an even K128 tile count, and K
+    # stays small enough for full-range INT8 sums to fit in INT32.
+    _expect_value_error(
+        "even number of K128 tiles",
+        four_wave._validate_compile_config,
+        K=384,
+        xcd_swizzle=8,
+        num_cu=256,
+        num_xcds=8,
+    )
+    max_k = four_wave.MAX_K
+    assert max_k * 128 * 128 < 2**31 <= over_k * 128 * 128
+    assert four_wave.supports_4wave_int8_shape(1, 16, max_k)
+    assert not four_wave.supports_4wave_int8_shape(1, 16, over_k)
+    _expect_value_error(
+        "K must be in",
+        four_wave._validate_compile_config,
+        K=over_k,
+        xcd_swizzle=8,
+        num_cu=0,
+        num_xcds=8,
+    )
+
+    # The workgroup remap stays a permutation for non-power-of-two XCD counts.
+    for num_xcds in (3, 5):
+        for num_wg in (1, 7, 31, 64):
+            remapped = [
+                _xcd_contiguous_index(wgid, num_wg, num_xcds) for wgid in range(num_wg)
+            ]
+            assert sorted(remapped) == list(range(num_wg)), (num_xcds, num_wg)
+
+    aiter.logger.info(
+        "INT8 4-wave dispatch checks: passed padded-K lookup, 4-XCD fallback, "
+        "backend row filtering, contract before lookup and compile guards"
+    )
+
+
 def _iter_flydsl_csv_cases(compare_hipblaslt=False):
     """Yield (test_gemm kwargs, bench metadata) for flydsl tuned CSV rows."""
     gfx, cu = get_gfx(), get_cu_num()
@@ -934,6 +1318,9 @@ parser.add_argument(
 
 
 args = parser.parse_args()
+
+run_int8_4wave_ci_correctness()
+run_int8_4wave_dispatch_checks()
 
 if not args.no_flydsl_csv:
     bench_csv = os.environ.get("AITER_TUNED_OP_BENCH_CSV", "tuned_op_bench.csv")
