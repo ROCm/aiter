@@ -22,6 +22,15 @@ from hip_runtime import (
 )
 from torch_guard import torch_compile_guard
 
+# These utilities are also imported by build tools without PyTorch installed.
+try:
+    from torch.compiler import assume_constant_result
+except ImportError:
+
+    def assume_constant_result(fn):
+        return fn
+
+
 logger = logging.getLogger("aiter")
 
 IS_WINDOWS = sys.platform == "win32"
@@ -120,7 +129,9 @@ def get_lds_capacity_bytes(gfx: str | None = None) -> int:
         raise ValueError(f"Unknown LDS capacity for architecture {arch!r}") from exc
 
 
+# The live architecture is process-cached; specialize on it without tracing the probe.
 @functools.lru_cache(maxsize=1)
+@assume_constant_result
 def get_gfx_runtime() -> str:
     """Return the live GPU arch, using Torch if Windows hipinfo is unavailable.
 
