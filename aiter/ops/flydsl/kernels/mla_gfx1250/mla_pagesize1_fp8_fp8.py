@@ -1308,6 +1308,17 @@ def launch_mla_pagesize1_fp8_fp8(
                 cut_end = local_kv_begin + visible
                 attention_end = (cut_end < kv_end).select(cut_end, kv_end)
             elif const_expr(causal):
+                if const_expr(q_tile_rows not in (1, max_seqlen_q)):
+                    # The query is cut into several multi-row qo tiles, and the
+                    # planner trims each tile's kv_end by the tiles after it, not
+                    # the rows: measure from the request's last row instead.
+                    batch = work_field(work_info, 0)
+                    request_qo_end = fx.Int32(
+                        rocdl.readfirstlane(T.i32, qo_indptr[batch + 1])
+                    )
+                    qpos_from_last = (
+                        request_qo_end - qo_start - fx.Int32(1) - safe_q_pos
+                    )
                 causal_offset = qpos_from_last - kv_offset
                 causal_offset = (causal_offset > fx.Int32(0)).select(
                     causal_offset, fx.Int32(0)

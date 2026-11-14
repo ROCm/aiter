@@ -154,13 +154,16 @@ inline MlaDecodeHeadPlan mla_decode_head_plan_v1_2(const std::string_view arch_i
     // FP8 or BF16 Q/KV, the dtypes the FlyDSL PS1 kernels take.
     const bool flydsl_ps1_dtypes =
         (q_dtype == kv_dtype) && (q_is_fp8 || (q_dtype == AITER_DTYPE_bf16));
+    // 32 and 64 heads take a multi-token query as several qo tiles of at most
+    // 128 / num_heads rows (mla_v12_num_qo_tiles), one per work item, which is
+    // what the kernel's wave layout holds (mla_common.planner_q_tile_rows). The
+    // bound is the kernel's MAX_TILED_SEQLEN_Q.
     const bool gfx1250_flydsl_ps1_heads =
         flydsl_ps1 && ((arch_id == "gfx1250" || arch_id == "gfx1250-strict")) && flydsl_ps1_dtypes &&
         ((num_heads == 96) ||
          (((num_heads == 32) || (num_heads == 64) || (num_heads == 128)) &&
           (max_seqlen_qo == 1)) ||
-         (((num_heads == 32) || (num_heads == 64)) && (max_seqlen_qo <= 4) &&
-          (num_heads * max_seqlen_qo <= 128)));
+         (((num_heads == 32) || (num_heads == 64)) && (max_seqlen_qo <= 8)));
 
     // gfx942 native QH64 FP8 only supports page_size=64; otherwise fold to QH16.
     const bool natively_supported =
@@ -279,8 +282,8 @@ inline MlaBackendId mla_decode_backend(const std::string_view arch_id,
         (ps1_is_fp8 || ps1_is_bf16) &&
         ((num_heads == 16) || (num_heads == 32) || (num_heads == 64) || (num_heads == 96) ||
          (num_heads == 128)) &&
-        ((num_heads == 96) || (max_seqlen_qo == 1) ||
-         ((num_heads <= 64) && (max_seqlen_qo <= 4) && (num_heads * max_seqlen_qo <= 128))) &&
+        ((num_heads == 96) || (max_seqlen_qo == 1) || ((num_heads == 16) && (max_seqlen_qo <= 4)) ||
+         (((num_heads == 32) || (num_heads == 64)) && (max_seqlen_qo <= 8))) &&
         ((cp_world_size == 1) || cp_round_robin) && !intra_batch_mode;
     if(use_flydsl_ps1)
     {

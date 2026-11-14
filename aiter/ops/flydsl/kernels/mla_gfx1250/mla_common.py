@@ -123,6 +123,27 @@ V_HEAD_DIM = QK_NOPE_HEAD_DIM
 PV_D_TILES = V_HEAD_DIM // 16
 
 
+MAX_Q_TILE_ROWS = 4
+# Longest query a 32- or 64-head decode takes (MTP verify, draft blocks). The
+# planner cuts it into tiles that fit the budget, so this only bounds what is
+# exercised, not what the layout can hold.
+MAX_TILED_SEQLEN_Q = 8
+
+
+def planner_q_tile_rows(num_q_heads, max_seqlen_q):
+    """Query rows of one work item, as the metadata planner cuts them.
+
+    Mirrors mla_v12_num_qo_tiles (csrc/kernels/mla/metadata/v1_2_device.cuh):
+    above PLANNER_PACKED_Q_BUDGET // 2 heads every work item holds one query
+    position; below it a request's num_q_heads * max_seqlen_q rows are split
+    into ceil(rows / budget) tiles of ceil(max_seqlen_q / tiles) positions.
+    """
+    if num_q_heads * 2 > PLANNER_PACKED_Q_BUDGET:
+        return 1
+    tiles = -(-(num_q_heads * max_seqlen_q) // PLANNER_PACKED_Q_BUDGET)
+    return -(-max_seqlen_q // tiles)
+
+
 def wave_layout(num_q_heads, max_seqlen_q):
     """(q_tile_rows, head_groups, groups_per_wave, m_waves, dv_waves)."""
     if num_q_heads not in SUPPORTED_NUM_Q_HEADS:
@@ -130,11 +151,18 @@ def wave_layout(num_q_heads, max_seqlen_q):
             f"num_q_heads: expected one of {list(SUPPORTED_NUM_Q_HEADS)}, "
             f"got {num_q_heads}"
         )
-    q_tile_rows = 1 if num_q_heads * 2 > PLANNER_PACKED_Q_BUDGET else max_seqlen_q
-    if q_tile_rows > 4 or num_q_heads * q_tile_rows > PLANNER_PACKED_Q_BUDGET:
+    # A work item holds one planner tile, not the whole query: 64 heads take
+    # max_seqlen_q 4 as two 2-row tiles (each 128 rows, and the two share
+    # nothing but the request's KV), instead of being padded to 96 heads.
+    q_tile_rows = planner_q_tile_rows(num_q_heads, max_seqlen_q)
+    if (
+        q_tile_rows > MAX_Q_TILE_ROWS
+        or num_q_heads * q_tile_rows > PLANNER_PACKED_Q_BUDGET
+        or (q_tile_rows < max_seqlen_q and max_seqlen_q > MAX_TILED_SEQLEN_Q)
+    ):
         raise ValueError(
-            f"num_q_heads={num_q_heads} supports max_seqlen_q up to "
-            f"{min(4, PLANNER_PACKED_Q_BUDGET // num_q_heads)}, got {max_seqlen_q}"
+            f"num_q_heads={num_q_heads} does not support max_seqlen_q="
+            f"{max_seqlen_q} (work items of {q_tile_rows} query rows)"
         )
     head_groups = num_q_heads // HEADS_PER_GROUP
     q_slots = 1 if q_tile_rows == 1 else 2 if q_tile_rows == 2 else 4
