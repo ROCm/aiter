@@ -1165,6 +1165,108 @@ def test_triton_unified_attn_asym_head(
     )
 
 
+# gfx950 gives head sizes 129-256 their own attn_2d prefill entries; 320 is the
+# first size past them. The prefills are long enough to run the 2D kernel.
+@pytest.mark.parametrize(
+    "seq_lens",
+    [[(1100, 2048)], [(1, 1500), (777, 1200), (600, 600)]],
+)
+@pytest.mark.parametrize("head_size", [160, 192, 256, 320])
+@pytest.mark.parametrize("sliding_window", [None, 512])
+@pytest.mark.parametrize(
+    "q_dtype, kv_dtype",
+    [
+        (torch.bfloat16, torch.bfloat16),
+        (torch.bfloat16, e4m3_dtype),
+        (e4m3_dtype, e4m3_dtype),
+    ],
+)
+@torch.inference_mode()
+def test_triton_unified_attn_prefill_head_sizes(
+    seq_lens: list[tuple[int, int]],
+    head_size: int,
+    sliding_window: int | None,
+    q_dtype: torch.dtype,
+    kv_dtype: torch.dtype,
+) -> None:
+    (
+        query,
+        key_cache_orig,
+        value_cache_orig,
+        key_cache,
+        value_cache,
+        sinks,
+        output,
+        cu_query_lens,
+        kv_lens,
+        max_query_len,
+        max_kv_len,
+        scale,
+        window_size,
+        block_tables,
+        _maybe_quant_query,
+        _query_scales,
+        q_descale,
+        k_descale,
+        v_descale,
+        output_scale,
+    ) = generate_data(
+        seq_lens=seq_lens,
+        num_blocks=2048,
+        block_size=64,
+        head_size=head_size,
+        num_heads=(16, 2),
+        sliding_window=sliding_window,
+        q_dtype=q_dtype,
+        kv_dtype=kv_dtype,
+    )
+
+    unified_attention(
+        q=query,
+        k=key_cache,
+        v=value_cache,
+        out=output,
+        cu_seqlens_q=cu_query_lens,
+        seqused_k=kv_lens,
+        max_seqlen_q=max_query_len,
+        max_seqlen_k=max_kv_len,
+        softmax_scale=scale,
+        causal=True,
+        window_size=window_size,
+        block_table=block_tables,
+        softcap=0,
+        q_descale=q_descale,
+        k_descale=k_descale,
+        v_descale=v_descale,
+        sinks=sinks,
+        output_scale=output_scale,
+        backend="triton",
+    )
+
+    ref_output = ref_paged_attn(
+        query=query,
+        key_cache=key_cache_orig,
+        value_cache=value_cache_orig,
+        query_lens=[x[0] for x in seq_lens],
+        kv_lens=[x[1] for x in seq_lens],
+        block_tables=block_tables,
+        scale=scale,
+        out_dtype=torch.bfloat16,
+        sliding_window=sliding_window,
+        sinks=sinks,
+        q_descale=q_descale,
+        k_descale=k_descale,
+        v_descale=v_descale,
+    )
+
+    atol, rtol = 1.5e-2, 1e-2
+    if q_dtype != torch.bfloat16 or kv_dtype != torch.bfloat16:
+        atol, rtol = 1.5e-1, 1.5e-1
+    torch.testing.assert_close(
+        output.to(torch.float32), ref_output.to(torch.float32), atol=atol, rtol=rtol
+    )
+
+
 @pytest.mark.parametrize("case", ["shuffled_kv_cache", "out_qk_width"])
 @torch.inference_mode()
 def test_triton_unified_attn_asym_head_guards(case: str) -> None:
