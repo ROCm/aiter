@@ -80,6 +80,40 @@ def test_gemm(m, n, k, dtype=dtypes.bf16):
     }
 
 
+def check_large_a_rejected():
+    """gfx950's FlyDSL kernel reads A through one 32-bit buffer descriptor; an
+    A of 4 GiB returned 91% wrong values (M = 524288, K = 8192). So the
+    heuristic offers no kernel for it, and the launcher refuses it under a
+    kernel name that is valid one 256-row step below."""
+    from aiter.ops.flydsl.mxscale_preshuffle_kernels import (
+        pick_mxfp8_kernel_name_gfx950,
+        run_gemm_a8w8_mxfp8_gfx950,
+    )
+
+    n, k = 512, 16384
+    m = (1 << 32) // k
+    name = pick_mxfp8_kernel_name_gfx950(m - 256, n, k)
+    assert name is not None
+    assert pick_mxfp8_kernel_name_gfx950(m, n, k) is None
+    xq = torch.empty((m, k), dtype=dtypes.fp8)
+    x_scale = torch.full((m, k // 32), 127, dtype=torch.uint8)
+    w_scale = torch.full((n, k // 32), 127, dtype=torch.uint8)
+    try:
+        run_gemm_a8w8_mxfp8_gfx950(
+            xq,
+            torch.zeros((n, k), dtype=dtypes.fp8),
+            x_scale.view(dtypes.fp8_e8m0),
+            w_scale.view(dtypes.fp8_e8m0),
+            torch.empty((m, n), dtype=dtypes.bf16),
+            kernel_name=name,
+        )
+    except ValueError as e:
+        assert "smaller than 4 GiB" in str(e), e
+    else:
+        raise AssertionError("a 4 GiB A was launched")
+    aiter.logger.info("check_large_a_rejected: OK")
+
+
 def tuned_shapes():
     table = pd.read_csv(AITER_CONFIGS.AITER_CONFIG_GEMM_A8W8_MXFP8_BPRESHUFFLE_FILE)
     table = table[(table["gfx"] == get_gfx()) & (table["cu_num"] == get_cu_num())]
@@ -109,3 +143,5 @@ if __name__ == "__main__":
     else:
         df = pd.DataFrame([test_gemm(*mnk) for mnk in args.mnk or tuned_shapes()])
         aiter.logger.info(f"gemm_a8w8_mxfp8_bpreshuffle summary:\n{df.to_markdown()}")
+        if get_gfx() == "gfx950":
+            check_large_a_rejected()

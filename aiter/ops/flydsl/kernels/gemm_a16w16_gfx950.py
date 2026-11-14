@@ -1435,11 +1435,25 @@ def _gemm_a16w16_gfx950_param_for(items):
     return make_gemm_a16w16_gfx950_param(**dict(items))
 
 
+# A, B and C are each addressed through one buffer descriptor based at the
+# tensor (make_buffer_tensor(..., max_size=True)) with 32-bit byte offsets and
+# at most 0xFFFFFFFF records, so every operand must stay below 4 GiB. Past it,
+# loads wrap or read zeros and C stores fault or land in other allocations.
+BUFFER_OPERAND_LIMIT_BYTES = 1 << 32
+
+
+def _operand_bytes(m, n, k, in_bytes, out_bytes):
+    return {"A": m * k * in_bytes, "B": n * k * in_bytes, "C": m * n * out_bytes}
+
+
 def make_gemm_a16w16_param_and_validate(m, n, k, kwargs):
     result = None
     try:
         result = _gemm_a16w16_gfx950_param_for(tuple(sorted(kwargs.items())))
     except Exception:  # noqa: BLE001 - invalid policies are filtered here
+        return None
+    operand_bytes = _operand_bytes(m, n, k, result.in_data_bytes, result.out_data_bytes)
+    if max(operand_bytes.values()) >= BUFFER_OPERAND_LIMIT_BYTES:
         return None
     split_k = kwargs.get("split_k", 1)
     try:
@@ -1669,6 +1683,20 @@ def gemm_a16w16(
         assert bias.shape[0] == n
         assert bias.dtype == a.dtype
 
+    oversized = {
+        name: size
+        for name, size in _operand_bytes(
+            m, n, k, a.element_size(), out.element_size()
+        ).items()
+        if size >= BUFFER_OPERAND_LIMIT_BYTES
+    }
+    if oversized:
+        raise ValueError(
+            "gemm_a16w16_gfx950 addresses each operand with 32-bit byte offsets, "
+            "so A, B and C must each be smaller than 4 GiB; got "
+            + ", ".join(f"{name}={size} bytes" for name, size in oversized.items())
+            + f" for M={m}, N={n}, K={k}"
+        )
     param = make_gemm_a16w16_param_and_validate(m, n, k, kwargs)
     assert param is not None, "unsupported gemm_a16w16_gfx950 shape/config"
     semaphore, signal = get_split_k_buffers(stream, device, split_k)

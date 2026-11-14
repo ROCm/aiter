@@ -420,6 +420,36 @@ def _run_fused_quant(shapes):
     print("fused quant epilogue ALL BIT-EXACT")
 
 
+def check_large_a_rejected():
+    """gfx950 reads XQ [M, B, K] through one 32-bit buffer descriptor per batch,
+    spanning (M - 1) * B * K + K bytes. Past 4 GiB the last rows came back
+    wrong (M = 65792, B = 16, K = 4096), so the runner refuses that span and
+    still runs M = 65536, the largest M below it."""
+    b, n, k = 16, 512, 4096
+
+    def run(m):
+        x8 = torch.zeros((m, b, k), dtype=dtypes.fp8)
+        xs = torch.full((m, b, k // 128), 127, dtype=torch.uint8)
+        w8 = torch.zeros((b, n, k), dtype=dtypes.fp8)
+        ws = torch.full((b, n // 128, k // 128), 127, dtype=torch.uint8)
+        out = torch.empty((m, b, n), dtype=dtypes.bf16)
+        run_bmm_a8w8_mxfp8(
+            x8, w8, xs.view(dtypes.fp8_e8m0), ws.view(dtypes.fp8_e8m0), out
+        )
+        torch.cuda.synchronize()
+
+    try:
+        run(65537)
+    except RuntimeError as e:
+        assert "less than 4 GiB" in str(e), e
+    else:
+        raise AssertionError("an XQ spanning more than 4 GiB was launched")
+    torch.cuda.empty_cache()
+    run(65536)
+    torch.cuda.empty_cache()
+    aiter.logger.info("check_large_a_rejected: OK")
+
+
 def summarize(title: str, rows: list) -> None:
     df = pd.DataFrame(rows)
     aiter.logger.info("%s (markdown):\n%s", title, df.to_markdown(index=False))
@@ -511,6 +541,8 @@ def main():
             gemm_rows.append(test_batched_gemm(b, m, n, k, dtype, layout))
         summarize("batched_gemm (a8w4 and a8w8, each vs its BF16 reference)", gemm_rows)
 
+    if arch == "gfx950":
+        check_large_a_rejected()
     if arch == "gfx1250":
         _run_fused_quant(_fused_quant_shapes(args, include_ragged_m=not custom_shape))
 

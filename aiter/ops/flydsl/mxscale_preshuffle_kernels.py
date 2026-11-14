@@ -137,6 +137,7 @@ def flydsl_mxscale_preshuffle_gemm(
     A is [M, K]; N is taken from Out ([M, N]); K from A. Returns Out.
     """
     from .gemm_tune.flydsl_gemm_mxscale_preshuffle_common import (
+        A_BUFFER_LIMIT_BYTES,
         SCALE_BLOCKS_A,
         SCALE_BLOCKS_B,
         SCALE_LAYOUTS,
@@ -154,6 +155,12 @@ def flydsl_mxscale_preshuffle_gemm(
     M = int(A.shape[0])
     K = int(A.shape[-1]) * (2 if a_dtype == "fp4" else 1)
     N = int(Out.shape[-1])
+    a_bytes = M * int(A.shape[-1]) * A.element_size()
+    if a_bytes >= A_BUFFER_LIMIT_BYTES:
+        raise ValueError(
+            f"A must be smaller than 4 GiB (the kernel addresses it with 32-bit "
+            f"offsets); got {a_bytes} bytes for M={M}, K={K}"
+        )
     if N % int(tile_n) != 0:
         raise ValueError(f"N ({N}) is not a multiple of tile_n ({tile_n})")
     if K % int(tile_k) != 0:
@@ -512,8 +519,8 @@ def run_gemm_a8w8_mxfp8_gfx950(
         if ki is None:
             raise NotImplementedError(
                 f"[FlyDSL gfx950 mxfp8] no kernel for M={M}, N={N}, K={K} with "
-                f"a {w_scale_block} w_scale (needs K%128==0 and N a multiple of a "
-                f"tile_n)"
+                f"a {w_scale_block} w_scale (needs K%128==0, N a multiple of a "
+                f"tile_n and A smaller than 4 GiB)"
             )
         kernel_name = ki.name
         if warn_untuned:
