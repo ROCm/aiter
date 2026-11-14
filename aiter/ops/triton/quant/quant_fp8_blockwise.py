@@ -2,9 +2,11 @@
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 """Python wrappers for FP8 block-wise quantization kernels."""
 
+import functools
 import math
 
 import torch
+import triton
 
 from aiter.ops.triton._triton_kernels.quant.quant_fp8_blockwise import (
     quant_fp8_blockwise_for_weight_kernel,
@@ -12,6 +14,7 @@ from aiter.ops.triton._triton_kernels.quant.quant_fp8_blockwise import (
     quant_fp8_blockwise_segment_m_kernel,
     requant_fp8_row_to_col_kernel,
 )
+from aiter.ops.triton.utils.tuned_config_utils import get_tuned_kernel_config
 
 __all__ = [
     "quant_fp8_blockwise",
@@ -29,12 +32,32 @@ _FP8_MAX = torch.finfo(torch.float8_e4m3fnuz).max
 _BLOCK_SIZE = 128
 
 
-def _launch_params(block_size: int) -> dict:
+def _launch_params(block_size: int, kernel_name: str | None = None) -> dict:
     # Each program loads a [block_size, block_size] tile promoted to fp32.
     # Benchmarks on MI308X show num_warps=4 is the best stable choice across
     # common shapes (4096/8192 × 7168/8192); larger values hurt weight kernel.
     num_warps = min(16, max(1, block_size * block_size // 4096))
-    return {"num_warps": num_warps, "waves_per_eu": 2, "num_stages": 2}
+    params = {"num_warps": num_warps, "waves_per_eu": 2, "num_stages": 2}
+    if kernel_name is None:
+        return params
+    # A per-arch entry in the QUANT_FP8_BLOCKWISE DEFAULT.json overrides these values.
+    return _pinned_launch_params(
+        f"{kernel_name}_block{block_size}", tuple(params.items())
+    )
+
+
+@functools.cache
+def _pinned_launch_params(kernel_name: str, default: tuple) -> dict:
+    default = dict(default)
+    fallback = triton.Config(
+        {"waves_per_eu": default["waves_per_eu"]},
+        num_warps=default["num_warps"],
+        num_stages=default["num_stages"],
+    )
+    cfg = get_tuned_kernel_config(
+        "quant", "QUANT_FP8_BLOCKWISE", kernel_name, fallback, warn_on_miss=False
+    )
+    return {"num_warps": cfg.num_warps, "num_stages": cfg.num_stages, **cfg.kwargs}
 
 
 def _check_block_fp8(
@@ -106,7 +129,7 @@ def quant_fp8_blockwise(
         FP8_MAX=fp8_max,
         AXIS=axis,
         DUAL=False,
-        **_launch_params(block_size),
+        **_launch_params(block_size, f"quant_fp8_blockwise_axis{axis}"),
     )
     return x_fp8, scales
 

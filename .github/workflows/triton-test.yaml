@@ -453,8 +453,21 @@ jobs:
             echo '<testsuites/>' > test-reports/triton.xml
             exit 0
           fi
+          # gfx942 LLVM spill miscompile in the varlen fused causal bwd kernel
+          # (llvm/llvm-project#226689); restore once Triton has the fix.
+          SKIP_ARGS=()
+          for t in \
+            'op_tests/triton_tests/attention/test_mha.py::test_mha_dao_ai_backward_head_size[False-97-113-True-33]' \
+            'op_tests/triton_tests/attention/test_mha.py::test_mha_dao_ai_backward_head_size[False-97-113-True-53]' \
+            'op_tests/triton_tests/attention/test_mha.py::test_mha_dao_ai_backward_head_size[False-113-97-True-33]' \
+            'op_tests/triton_tests/attention/test_mha.py::test_mha_dao_ai_backward_head_size[False-113-97-True-53]' \
+            'op_tests/triton_tests/attention/test_mha.py::test_mha_dao_ai_backward_head_size[True-97-113-True-33]' \
+            'op_tests/triton_tests/attention/test_mha.py::test_mha_dao_ai_backward_head_size[True-97-113-True-53]' \
+            'op_tests/triton_tests/attention/test_mha.py::test_mha_dao_ai_backward_head_size[True-113-97-True-33]' \
+            'op_tests/triton_tests/attention/test_mha.py::test_mha_dao_ai_backward_head_size[True-113-97-True-53]' \
+          ; do SKIP_ARGS+=("--deselect=$t"); done
           # Unit tests must not autotune: surface any tuning and fail the job if it happened.
-          docker exec -e TRITON_PRINT_AUTOTUNING=1 -w /workspace triton_test pytest -v -s ${TRITON_TEST} \
+          docker exec -e TRITON_PRINT_AUTOTUNING=1 -w /workspace triton_test pytest -v -s ${TRITON_TEST} "${SKIP_ARGS[@]}" \
             --junitxml=test-reports/triton.xml 2>&1 | tee test-reports/pytest.log
           if grep -q "Triton autotuning for function" test-reports/pytest.log; then
             echo "::error::runtime autotuning ran inside unit tests"
