@@ -410,6 +410,23 @@ def test_gfx950_mono_fp32_overwrites_poisoned_output(kid):
     _assert_matches_golden(actual, A, B)
 
 
+@pytest.mark.parametrize(("M", "N"), ((1, 65552), (1448, 16384), (5793, 16384)))
+def test_gfx950_a16w16_kid_writes_every_tile(M, N):
+    """The XCD-swizzle tail of the split-barrier pipeline (kids 0-5, 46-51 and
+    their cache-policy variants) left C tiles unwritten on these grids
+    (columns 65536+ for M=1, N=65552)."""
+    if _runtime_arch() != "gfx950":
+        pytest.skip("requires gfx950 hardware")
+    torch.manual_seed(0x5A1E + M)
+    A = torch.randn((M, 512), device="cuda", dtype=torch.bfloat16)
+    B = torch.randn((N, 512), device="cuda", dtype=torch.bfloat16)
+    Y = torch.full((M, N), float("nan"), device="cuda", dtype=torch.bfloat16)
+    opus_gemm(A, B, Y, family="a16w16", kid=5)
+    torch.cuda.synchronize()
+    assert not torch.isnan(Y).any(), "C tiles left unwritten"
+    _assert_matches_golden(Y, A, B)
+
+
 def test_gfx950_bias_dtype_rules_and_numerics():
     if _runtime_arch() != "gfx950":
         pytest.skip("requires gfx950 hardware")
