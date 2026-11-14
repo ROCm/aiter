@@ -4,6 +4,7 @@
 from aiter.ops.triton.fusions.attn_res import attn_res_fwd, attn_res_gate
 from aiter.ops.triton.fusions.block_cat_fused import block_cat_fused
 from aiter.ops.triton.fusions.fused_sigmoid_mul import fused_sigmoid_mul
+from aiter.ops.triton.fusions.fused_situ_mul import fused_situ_mul
 from aiter.ops.triton.fusions.mhc import (
     MHC_DSV4_BACKWARD_FALLBACK,
     mhc,
@@ -22,6 +23,7 @@ __all__ = [
     "attn_res_gate",
     "block_cat_fused",
     "fused_sigmoid_mul",
+    "fused_situ_mul",
     "mhc",
     "mhc_fused_post_pre_delayed_rmsnorm",
     "mhc_head_dsv4",
