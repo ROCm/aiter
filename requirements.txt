@@ -8,10 +8,9 @@
 # rocm/atom-dev:latest (py3.12); the py<3.11 fallbacks are the latest release of
 # that package still supporting py3.10.
 #
-# Note: torch and triton are provided by the base image as ROCm-specific builds
-# (e.g. torch 2.10.0+rocm..., triton 3.7.0+amd.rocm...) that are not published on
-# PyPI, so they are intentionally NOT pinned here — their provenance is governed
-# by the base image, not this file.
+# Note: torch is provided by the base image as ROCm-specific builds
+# (e.g. torch 2.10.0+rocm...) that are not published on PyPI, so it is
+# intentionally NOT pinned here.
 pandas==3.0.3; python_version >= "3.11"
 pandas==2.3.3; python_version < "3.11"
 pytest==9.0.3
@@ -21,6 +20,8 @@ pyyaml==6.0.3
 einops==0.8.2
 pybind11==3.0.4
 ninja==1.13.0
-# flydsl publishes Linux-only wheels.
+# flydsl and amd-triton publish Linux-only wheels.
 flydsl==0.5.0; sys_platform != "win32"
+amd-triton==3.9.0.dev20261110; sys_platform != "win32"
+amd-triton-kernels==1.0.0.dev20261031; sys_platform != "win32"
 safetensors==0.8.0
