@@ -238,6 +238,41 @@ def test_flydsl_stage2_a8w4_gui(inter_dim, seed):
     _check_close(data["ref_stage2"], out, f"stage2_a8w4_gui_i{inter_dim}")
 
 
+@pytest.mark.parametrize("tile_n", [128, 256])
+@_SKIP_GFX950_FLYDSL
+def test_flydsl_stage2_a8w4_fp8_route_out(tile_n, monkeypatch):
+    from aiter.ops.flydsl.moe_kernels import flydsl_moe_stage2
+
+    monkeypatch.setenv("AITER_FLYDSL_STAGE2_FP8", "1")
+    token, model_dim, inter_dim, E, topk, block_m = 64, 512, 256, 8, 2, 32
+    data = _generate_a8w4_gui_data(token, model_dim, inter_dim, E, topk, block_m)
+    out = flydsl_moe_stage2(
+        inter_states=data["a2_q"],
+        w2=data["w2_shuf"],
+        sorted_token_ids=data["sorted_ids"],
+        sorted_expert_ids=data["sorted_expert_ids"],
+        num_valid_ids=data["num_valid_ids"],
+        topk=topk,
+        tile_m=block_m,
+        tile_n=tile_n,
+        tile_k=256,
+        a_dtype="fp8",
+        b_dtype="fp4",
+        out_dtype="bf16",
+        mode="reduce",
+        w2_scale=data["w2_scale_shuf"],
+        a2_scale=data["a2_scale_sort"],
+        sorted_weights=data["sorted_weights"],
+        inter_dim_pad=data["inter_pad"],
+        model_dim_pad=0,
+    )
+    torch.cuda.synchronize()
+    _check_close(data["ref_stage2"], out, f"stage2_a8w4_fp8_route_out_n{tile_n}")
+    ref = data["ref_stage2"].float()
+    rel = ((out.float() - ref).norm() / ref.norm()).item()
+    assert rel < 0.05, f"fp8 route-out tile_n={tile_n}: rel err {rel:.3e}"
+
+
 @pytest.mark.parametrize("block_m", [16, 32, 64, 128])
 @pytest.mark.parametrize(
     ("inter_dim", "tile_k"),
