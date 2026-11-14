@@ -354,6 +354,14 @@ _K_SMOOTH_SAMPLE_ROWS = 2048
 # Fewest keys kv_splits="auto" gives a split. A dense work-group spends ~8 us before its first key
 # and ~0.02 us per key at full occupancy, so a much shorter range is mostly overhead.
 _MHA_V4_MIN_KV_SPLIT_TOKENS = 512
+# The cost model kv_splits="auto" uses past half a wave, fit on MI355X BF16 (graph replay, 22
+# DiT shapes); its picks are within 1.1% of the best measured count on 50. A round with only
+# some CUs busy costs this floor of a full one plus its fill times the rest.
+_MHA_V4_PARTIAL_ROUND_FLOOR = 0.40
+# The merge per split and output row of one head, in keys of a work-group's KV loop.
+_MHA_V4_MERGE_KEYS_PER_ROW = 0.00645
+# The merge unrolls over the count, and no measured shape gained past 6.
+_MHA_V4_MAX_AUTO_KV_SPLITS = 16
 
 
 def native_fp8_format() -> AttentionFormat:
@@ -2116,16 +2124,43 @@ def mha_v4_kv_splits(
     sequence with few heads leaves most CUs idle: [1, 4352, 3] fills 51 of MI355X's 256.
     The CU count is the device's own, so each SKU and partition mode gets its own split.
     Splitting the keys into n ranges folded into the batch multiplies the grid by n at the cost
-    of a merge pass. This takes the largest n that divides the key length, still fits the grid
-    in one wave and leaves each range at least _MHA_V4_MIN_KV_SPLIT_TOKENS keys; a grid that
-    already fills the GPU gets 1, since further splits only add work-groups and merge traffic.
-    Only with no such divisor, at batch 1 and when `ragged` (operands whose dense row takes
-    per-batch key lengths), does it take the largest n that fits and let the last range take
-    the remainder.
+    of a merge pass. A grid of at most half a wave takes the largest n that divides the key
+    length, still fits the grid in one wave and leaves each range at least
+    _MHA_V4_MIN_KV_SPLIT_TOKENS keys. Only with no such divisor, at batch 1 and when `ragged`
+    (operands whose dense row takes per-batch key lengths), does it take the largest n that fits
+    and let the last range take the remainder.
+
+    A larger grid ends on a partly busy round, which costs nearly a full one: [1, 21890, 3]
+    is 258 work-groups, two rounds for 1.01 rounds of work. Splitting shrinks that last round,
+    so these grids take the n with the least modelled time: rounds (the last one at
+    _MHA_V4_PARTIAL_ROUND_FLOOR plus its fill) times the keys of the longest range, plus the
+    merge. The same divisor and ragged rules decide which n are candidates.
     """
-    work_groups = batch * query_heads * -(-query_length // _MHA_V4_Q_TILE)
+    work_groups = max(batch * query_heads * -(-query_length // _MHA_V4_Q_TILE), 1)
     cus = torch.cuda.get_device_properties(device).multi_processor_count
-    most = min(cus // max(work_groups, 1), key_length // _MHA_V4_MIN_KV_SPLIT_TOKENS)
+    if 2 * work_groups > cus:
+        most = min(
+            _MHA_V4_MAX_AUTO_KV_SPLITS, key_length // _MHA_V4_MIN_KV_SPLIT_TOKENS
+        )
+        rows = batch * query_length * query_heads
+        best, best_cost = 1, None
+        # A plain loop: Dynamo cannot trace min() with a key function under fullgraph.
+        for n in range(1, max(most, 1) + 1):
+            if key_length % n and not (ragged and batch == 1):
+                continue
+            rounds, tail = divmod(work_groups * n, cus)
+            if tail:
+                rounds += (
+                    _MHA_V4_PARTIAL_ROUND_FLOOR
+                    + (1 - _MHA_V4_PARTIAL_ROUND_FLOOR) * tail / cus
+                )
+            longest = key_length - (n - 1) * (key_length // n)
+            merge = _MHA_V4_MERGE_KEYS_PER_ROW * n * rows if n > 1 else 0.0
+            cost = rounds * longest + merge
+            if best_cost is None or cost < best_cost:
+                best, best_cost = n, cost
+        return best
+    most = min(cus // work_groups, key_length // _MHA_V4_MIN_KV_SPLIT_TOKENS)
     for splits in range(most, 1, -1):
         if key_length % splits == 0:
             return splits
@@ -2163,6 +2198,8 @@ def _resolve_kv_splits(
             or _lse_unsupported(q_format, v_format) is not None
         ):
             return 1
+        if torch.compiler.is_compiling():
+            return _KV_SPLITS_AT_LAUNCH
         return mha_v4_kv_splits(
             q.shape[0],
             q.shape[1],
@@ -2207,7 +2244,7 @@ def _resolve_kv_splits(
             f"kv_splits={kv_splits} must leave every key range at least one {kv_tile}-key "
             f"tile: at most {most} for key length {k.shape[1]}"
         )
-    if k.shape[1] % kv_splits and not _varlen_capable(q_format, v_format):
+    if not _varlen_capable(q_format, v_format) and k.shape[1] % kv_splits:
         raise ValueError(
             f"kv_splits={kv_splits} must divide the key length {k.shape[1]} for "
             f"Q={q_format.name} V={v_format.name}, whose dense row takes no per-batch key "
@@ -2250,6 +2287,164 @@ def _key_range_lengths(
     lengths = torch.full((batch * splits,), step, dtype=torch.int32, device=device)
     lengths[splits - 1 :: splits] = key_length - (splits - 1) * step
     return lengths
+
+
+# The count _resolve_kv_splits returns for kv_splits="auto" under torch.compile: picked at launch.
+_KV_SPLITS_AT_LAUNCH = 0
+
+
+def _split_kv_launch(
+    q: Tensor,
+    k: Tensor,
+    v: Tensor,
+    q_descale: Optional[Tensor],  # noqa: UP045
+    k_descale: Optional[Tensor],  # noqa: UP045
+    v_descale: Optional[Tensor],  # noqa: UP045
+    q_format: AttentionFormat,
+    k_format: AttentionFormat,
+    v_format: AttentionFormat,
+    q_scale_mode: AttentionScaleMode,
+    k_scale_mode: AttentionScaleMode,
+    v_scale_mode: AttentionScaleMode,
+    softmax_scale: Optional[float],  # noqa: UP045
+    v_pack: AttentionPack,
+    splits: int,
+    out: Tensor,
+    lse: Optional[Tensor],  # noqa: UP045
+) -> None:
+    """Attention over `splits` key ranges run as extra batches of one launch, merged by their LSE.
+
+    A None descale is a BF16 operand, which is its own (unread) descale and follows the fold.
+    """
+    if splits == _KV_SPLITS_AT_LAUNCH:
+        splits = mha_v4_kv_splits(
+            q.shape[0],
+            q.shape[1],
+            q.shape[2],
+            k.shape[1],
+            q.device,
+            ragged=_varlen_capable(q_format, v_format),
+        )
+    if splits == 1:
+        mha_v4_packed(
+            q,
+            k,
+            v,
+            q if q_descale is None else q_descale,
+            k if k_descale is None else k_descale,
+            v if v_descale is None else v_descale,
+            q_format,
+            k_format,
+            v_format,
+            q_scale_mode,
+            k_scale_mode,
+            v_scale_mode,
+            softmax_scale=softmax_scale,
+            out=out,
+            lse=lse,
+            return_lse=lse is not None,
+            v_pack=v_pack,
+        )
+        return
+    q_split = _repeat_queries(q, splits)
+    k_split = _fold_key_ranges(k, splits)
+    v_split = _fold_key_ranges(v, splits)
+    partial_out, partial_lse = mha_v4_packed(
+        q_split,
+        k_split,
+        v_split,
+        q_split if q_descale is None else q_descale,
+        k_split if k_descale is None else k_descale,
+        v_split if v_descale is None else v_descale,
+        q_format,
+        k_format,
+        v_format,
+        q_scale_mode,
+        k_scale_mode,
+        v_scale_mode,
+        softmax_scale=softmax_scale,
+        return_lse=True,
+        seqlens_k=_key_range_lengths(q.shape[0], splits, k.shape[1], q.device),
+        v_pack=v_pack,
+    )
+    _merge_kv_splits(partial_out, partial_lse, out, lse)
+
+
+@torch.library.custom_op("aiter::mha_v4_split_kv", mutates_args=())
+def _split_kv_op(
+    q: Tensor,
+    k: Tensor,
+    v: Tensor,
+    q_descale: Optional[Tensor],  # noqa: UP045
+    k_descale: Optional[Tensor],  # noqa: UP045
+    v_descale: Optional[Tensor],  # noqa: UP045
+    q_format: int,
+    k_format: int,
+    v_format: int,
+    q_scale_mode: int,
+    k_scale_mode: int,
+    v_scale_mode: int,
+    softmax_scale: Optional[float],  # noqa: UP045
+    v_pack: int,
+    splits: int,
+    return_lse: bool,
+) -> tuple[Tensor, Tensor]:
+    """_split_kv_launch as one op, so a compiled graph sees neither the count nor the ranges.
+
+    Traced, the count and the range lengths depend on the key length, so a graph with a dynamic
+    sequence would guard on it and recompile per length, and the auto pick's arithmetic on its
+    symbolic size breaks the graph. Here the sizes are concrete. Functional rather than writing
+    into the caller's buffers: Inductor's scheduler failed on the mutating form in a graph with
+    a dynamic sequence (a dependency on a node it had dropped). Without return_lse the LSE is
+    empty.
+    """
+    out = torch.empty_like(q, dtype=torch.bfloat16)
+    lse = _empty_lse(q, return_lse)
+    _split_kv_launch(
+        q,
+        k,
+        v,
+        q_descale,
+        k_descale,
+        v_descale,
+        AttentionFormat(q_format),
+        AttentionFormat(k_format),
+        AttentionFormat(v_format),
+        AttentionScaleMode(q_scale_mode),
+        AttentionScaleMode(k_scale_mode),
+        AttentionScaleMode(v_scale_mode),
+        softmax_scale,
+        AttentionPack(v_pack),
+        splits,
+        out,
+        lse,
+    )
+    return out, q.new_empty(0, dtype=torch.float32) if lse is None else lse
+
+
+@_split_kv_op.register_fake
+def _split_kv_op_fake(
+    q: Tensor,
+    k: Tensor,
+    v: Tensor,
+    q_descale: Optional[Tensor],  # noqa: UP045
+    k_descale: Optional[Tensor],  # noqa: UP045
+    v_descale: Optional[Tensor],  # noqa: UP045
+    q_format: int,
+    k_format: int,
+    v_format: int,
+    q_scale_mode: int,
+    k_scale_mode: int,
+    v_scale_mode: int,
+    softmax_scale: Optional[float],  # noqa: UP045
+    v_pack: int,
+    splits: int,
+    return_lse: bool,
+) -> tuple[Tensor, Tensor]:
+    del k, v, q_descale, k_descale, v_descale, splits
+    lse = _empty_lse(q, return_lse)
+    out = torch.empty_like(q, dtype=torch.bfloat16)
+    return out, q.new_empty(0, dtype=torch.float32) if lse is None else lse
 
 
 def _k_mean(k: Tensor, kind: _RawRecipeKind) -> Optional[Tensor]:  # noqa: UP045
@@ -2407,6 +2602,7 @@ def mha_v4(
                 "sorted-sparse MHA v4 does not accept per-batch key lengths yet"
             )
         _check_varlen_capable(q_format, v_format)
+    out_given = out is not None
     out = _validate_mha_v4_raw_inputs(q, k, v, out, "mha_v4")
     sparse = block_mask is not None
     _check_head_dim(q.shape[-1], q_format, v_format, sparse, "mha_v4")
@@ -2586,37 +2782,49 @@ def mha_v4(
             return out, _restore_k_mean_in_lse(lse_out, q, k_mean_lse, softmax_scale)
         return out
 
-    if splits > 1:
-        q_split = _repeat_queries(q_quantized, splits)
-        k_split = _fold_key_ranges(k_quantized, splits)
-        v_split = _fold_key_ranges(v_quantized, splits)
-        # A BF16 operand is passed as its own (unread) descale, so it has to follow the fold.
-        if q_descale is q_quantized:
-            q_descale = q_split
-        if k_descale is k_quantized:
-            k_descale = k_split
-        if v_descale is v_quantized:
-            v_descale = v_split
-        partial_out, partial_lse = mha_v4_packed(
-            q_split,
-            k_split,
-            v_split,
-            q_descale,
-            k_descale,
-            v_descale,
-            q_format,
-            k_format,
-            v_format,
-            q_scale_mode,
-            k_scale_mode,
-            v_scale_mode,
-            softmax_scale=softmax_scale,
-            return_lse=True,
-            seqlens_k=_key_range_lengths(q.shape[0], splits, k.shape[1], q.device),
-            v_pack=recipe.v_pack,
+    if splits != 1:
+        split_operands = (
+            q_quantized,
+            k_quantized,
+            v_quantized,
+            None if q_descale is q_quantized else q_descale,
+            None if k_descale is k_quantized else k_descale,
+            None if v_descale is v_quantized else v_descale,
         )
-        lse_out = _empty_lse(q, return_lse)
-        _merge_kv_splits(partial_out, partial_lse, out, lse_out)
+        if torch.compiler.is_compiling():
+            split_out, lse_out = _split_kv_op(
+                *split_operands,
+                int(q_format),
+                int(k_format),
+                int(v_format),
+                int(q_scale_mode),
+                int(k_scale_mode),
+                int(v_scale_mode),
+                softmax_scale,
+                int(recipe.v_pack),
+                splits,
+                return_lse,
+            )
+            if out_given:
+                out.copy_(split_out)
+            else:
+                out = split_out
+        else:
+            lse_out = _empty_lse(q, return_lse)
+            _split_kv_launch(
+                *split_operands,
+                q_format,
+                k_format,
+                v_format,
+                q_scale_mode,
+                k_scale_mode,
+                v_scale_mode,
+                softmax_scale,
+                recipe.v_pack,
+                splits,
+                out,
+                lse_out,
+            )
         if return_lse:
             return out, _restore_k_mean_in_lse(lse_out, q, k_mean_lse, softmax_scale)
         return out

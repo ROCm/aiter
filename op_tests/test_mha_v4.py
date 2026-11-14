@@ -16,6 +16,7 @@ import time
 import pandas as pd
 import torch
 import torch._dynamo
+import torch._dynamo.testing
 
 import aiter
 import aiter.ops.mha_v4 as mha_v4_module
@@ -1526,6 +1527,23 @@ def test_mha_v4_kv_splits_auto_fills_one_wave():
         assert mha_v4_kv_splits(2, 4352, 1, 4349, ragged=True) == 1
 
 
+def test_mha_v4_kv_splits_auto_shrinks_a_partial_last_round():
+    """Past half a wave, auto splits when the grid ends on a nearly idle round, not when it fills
+    whole rounds; the divisor and ragged rules still decide which counts are candidates.
+    """
+    with _patched_cu_count(256):
+        # 3 heads x 86 query tiles is 258 work-groups: two rounds for 1.01 of work.
+        assert mha_v4_kv_splits(1, 21890, 3, 21890) == 5
+        assert mha_v4_kv_splits(2, 21890, 3, 21890) == 5
+        assert mha_v4_kv_splits(1, 16384, 5, 16384) == 4
+        # Whole rounds gain nothing that pays for the merge.
+        assert mha_v4_kv_splits(1, 16384, 4, 16384) == 1
+        assert mha_v4_kv_splits(1, 8192, 48, 8192) == 1
+        # 21891 = 3 x 7297: without per-batch key lengths only 3 is even.
+        assert mha_v4_kv_splits(1, 21891, 3, 21891) == 3
+        assert mha_v4_kv_splits(1, 21891, 3, 21891, ragged=True) == 5
+
+
 @parametrize(
     "batch,key_length,splits",
     [(1, 1024, 4), (1, 1001, 3), (2, 1024, 4), (2, 1001, 3)],
@@ -1727,6 +1745,51 @@ def test_mha_v4_kv_splits_compile_parity(formats):
 
     assert torch.equal(eager[0], compiled[0])
     assert torch.equal(eager[1], compiled[1])
+
+
+@skipif(get_gfx() != "gfx950", reason="gfx950 MHA v4 LSE")
+def test_mha_v4_kv_splits_auto_cost_model_compiles():
+    """The cost-model branch of auto runs inside fullgraph torch.compile and splits as eager."""
+    torch._dynamo.reset()
+    torch.manual_seed(62)
+    # 30 heads x 9 query tiles is 270 work-groups, past one wave of gfx950's 256 CUs.
+    q = torch.randn((1, 2304, 30, 128), device="cuda", dtype=torch.bfloat16)
+    k = torch.randn((1, 8192, 30, 128), device="cuda", dtype=torch.bfloat16)
+    v = torch.randn_like(k)
+    bf16 = (AttentionFormat.BF16,) * 3
+    assert mha_v4_kv_splits(1, 2304, 30, 8192, q.device, ragged=True) > 1
+
+    eager = mha_v4(q, k, v, *bf16, kv_splits="auto")
+    compiled = torch.compile(mha_v4, fullgraph=True)(q, k, v, *bf16, kv_splits="auto")
+    torch.cuda.synchronize()
+
+    assert torch.equal(eager, compiled)
+
+
+@skipif(get_gfx() != "gfx950", reason="gfx950 MHA v4 LSE")
+def test_mha_v4_kv_splits_auto_compiles_once_for_a_dynamic_sequence():
+    """Auto under a dynamic sequence: one graph for every length, each split as eager picks.
+
+    A DiT's sequence follows its prompt, so a compiled model sees many key lengths. Traced, the
+    pick and the range lengths guard on the length, and the pick's arithmetic on its symbolic
+    size breaks the graph.
+    """
+    torch._dynamo.reset()
+    torch.manual_seed(63)
+    bf16 = (AttentionFormat.BF16,) * 3
+    counter = torch._dynamo.testing.CompileCounterWithBackend("inductor")
+    compiled = torch.compile(mha_v4, backend=counter, fullgraph=True, dynamic=True)
+    picks = set()
+    # Around one wave of 3-head work-groups, where the pick and its divisibility change.
+    for length in (21890, 21891, 22006, 22016, 17794, 4352):
+        q = torch.randn((1, length, 3, 128), device="cuda", dtype=torch.bfloat16)
+        k = torch.randn_like(q)
+        v = torch.randn_like(q)
+        picks.add(mha_v4_kv_splits(1, length, 3, length, q.device, ragged=True))
+        eager = mha_v4(q, k, v, *bf16, kv_splits="auto")
+        assert torch.equal(eager, compiled(q, k, v, *bf16, kv_splits="auto")), length
+    assert len(picks) > 1
+    assert counter.frame_count == 1
 
 
 @skipif(get_gfx() != "gfx950", reason="gfx950 LSE")
