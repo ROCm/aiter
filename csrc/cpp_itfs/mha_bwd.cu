@@ -280,6 +280,30 @@ float fmha_v3_bwd(mha_bwd_args a, const ck_tile::stream_config& s)
     {
         return -1;
     }
+    // The asm kernels take no sink, so d_sink would be left unwritten.
+    if(a.sink_ptr != nullptr || a.d_sink_ptr != nullptr)
+    {
+        return -1;
+    }
+    // gfx942 hdim_q 192 (hdim_v 192 or 128): the hd192 / hd192_128 pssk kernels take precedence
+    // over the a32 psskddv ones, which keep hdim_q in (128, 192).  These 7-GEMM (g7) kernels run
+    // dK/dV workgroups (4 GEMMs, 128 keys each) and dQ workgroups (3 GEMMs, 128 queries each) in
+    // one dispatch and write dq / dk / dv once, so they are a16 rows without dq_acc or post
+    // kernel.  They write dq with q's strides, whose batch stride only matters in batch mode with
+    // batch > 1.  Other hdim_q 192 calls keep the requested kernels: psskddv for a32 at
+    // hdim_v 192, none for a16, the g7 rows being the only a16 hdim_q 192 ones.
+    const bool gfx942_g7_hd192 =
+        arch_id == "gfx942" && a.hdim_q == 192 && (a.hdim_v == 192 || a.hdim_v == 128) &&
+        a.stride_dq == a.stride_q && a.nhead_stride_dq == a.nhead_stride_q &&
+        (a.is_group_mode || a.batch == 1 || a.batch_stride_dq == a.batch_stride_q);
+    if(gfx942_g7_hd192)
+    {
+        a.v3_atomic_fp32 = false;
+    }
+    else if(arch_id == "gfx942" && a.hdim_q == 192 && !a.v3_atomic_fp32)
+    {
+        return -1;
+    }
 
     // ASM mask type
     // 0: no mask
@@ -366,12 +390,14 @@ float fmha_v3_bwd(mha_bwd_args a, const ck_tile::stream_config& s)
     {
         return -1;
     }
-    // On gfx942, a16 (atomic32=0) has no mask_type=2 (bottom-right causal) kernels,
-    // only mask_type=1 (top-left causal). When seqlen_q == seqlen_k the two masks
+    // On gfx942, the a16 (atomic32=0) hd64 / hd128 kernels have no mask_type=2 (bottom-right
+    // causal), only mask_type=1 (top-left causal). When seqlen_q == seqlen_k the two masks
     // are mathematically equivalent, so we can safely convert 2 → 1 to hit the
-    // existing a16 causal kernels.
+    // existing a16 causal kernels. Group mode is left out: there a batch's seqlen_q and
+    // seqlen_k can differ.
     // See config: hsa/gfx942/fmha_v3_bwd/fmha_bwd_dqdkdv.csv
-    if(arch_id == "gfx942" && !a.v3_atomic_fp32 && mt == 2 && a.seqlen_q == a.seqlen_k)
+    if(arch_id == "gfx942" && !a.v3_atomic_fp32 && mt == 2 && !a.is_group_mode &&
+       a.seqlen_q == a.seqlen_k)
     {
         mt = 1;  // bottom-right → top-left (equivalent when sq == sk)
     }
@@ -490,7 +516,7 @@ float fmha_v3_bwd(mha_bwd_args a, const ck_tile::stream_config& s)
     odo_args.BAs_d           = a.batch_stride_lsed * 4;
     odo_args.Seqs_d          = 1 * 4;
     odo_args.seqlen_q        = a.seqlen_q;
-    odo_args.head_dim        = a.hdim_q;
+    odo_args.head_dim        = a.hdim_v;
     odo_args.ptr_qseq_padded = a.seqstart_q_ptr;
     odo_args.ptr_qseq =
         (a.cu_seqlen_q_ptr && a.seqstart_q_ptr) ? a.cu_seqlen_q_ptr : a.seqstart_q_ptr;
@@ -695,6 +721,12 @@ float fmha_v3_bwd(mha_bwd_args a, const ck_tile::stream_config& s)
 #endif
     }
 
+    if(gfx942_g7_hd192 && a.is_group_mode)
+    { // the g7 kernels size their job lists from seqlen_q / seqlen_k
+        dqdkdv_args.seqlen_q = a.max_seqlen_q;
+        dqdkdv_args.seqlen_k = a.max_seqlen_k;
+    }
+
     auto dqdkdv_kernel_launch = [&]() {
         arg_size = sizeof(dqdkdv_args);
         int bdx = ((arch_id == "gfx1250" || arch_id == "gfx1250-strict")) ? 128 : (a.hdim_q == 256 ? 512 : 256);
@@ -713,6 +745,21 @@ float fmha_v3_bwd(mha_bwd_args a, const ck_tile::stream_config& s)
         else if((mt == 1) || (mt == 2))
         { // mask kb
             gdx = (gdx + 1) / 2;
+        }
+        if(gfx942_g7_hd192)
+        { // ceil(max_seqlen_k / 128) dK/dV + ceil(max_seqlen_q / 128) dQ ranks per (head, batch).
+          // Rank-major (nhead_q, batch, ranks) hands the longest jobs out first.  Once one batch
+          // alone fills the GPU, batch-major (nhead_q * ranks, batch, 1) keeps the running
+          // workgroups on a few sequences whose Q / K / V / dO stay in L2 / MALL.  The kernel
+          // reads either as head = x % nhead_q, rank = z + x / nhead_q (fp32, exact below 2^22).
+            const int ranks =
+                (a.max_seqlen_k + ts_kv - 1) / ts_kv + (a.max_seqlen_q + ts_kv - 1) / ts_kv;
+            const bool batch_major = a.batch > 1 &&
+                                     4 * a.nhead_q * ranks >= 5 * get_num_cu_func() &&
+                                     a.nhead_q * ranks < (1 << 22);
+            gdx = batch_major ? a.nhead_q * ranks : a.nhead_q;
+            gdy = a.batch;
+            gdz = batch_major ? 1 : ranks;
         }
 
         impl_ptr_dqdkdv->launch_kernel(

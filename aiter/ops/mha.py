@@ -2617,6 +2617,9 @@ def can_impl_fmha_v3_bwd(
     alibi_slopes: torch.Tensor | None,
     deterministic: bool,
     is_v3_atomic_fp32: bool | None = True,
+    dq: torch.Tensor | None = None,
+    sink: torch.Tensor | None = None,
+    d_sink: torch.Tensor | None = None,
 ) -> bool:
     _, seqlen_q, nhead_q, hdim_q = q.shape
     _, seqlen_k, nhead_k, hdim_v = v.shape
@@ -2765,6 +2768,18 @@ def can_impl_fmha_v3_bwd(
 
         return ret
 
+    def g7():
+        # gfx942 hdim_q 192 7-GEMM kernels, run for a16 and a32 requests alike
+        # bwd_hd192_{bf16,fp16}_{,causal_,causal_br_}a16_[{rtne,rtna,rtz}_]pssk
+        # bwd_hd192_128_{bf16,fp16}_{,causal_,causal_br_}a16_[{rtne,rtna,rtz}_]pssk
+        # They write dq with q's strides; a missing dq is allocated with empty_like(q).
+        ret = hdim_q == 192 and hdim_v in (192, 128)
+        dq_ = dq if dq is not None else torch.empty_like(q, device="meta")
+        ret &= dq_.stride() == q.stride()
+        ret &= nmask or mask
+
+        return ret
+
     # basic
     ret = get_gfx() == "gfx942"
     ret &= alibi_slopes is None
@@ -2772,10 +2787,13 @@ def can_impl_fmha_v3_bwd(
     ret &= dbias is None
     ret &= dropout_p == 0.0
     ret &= not deterministic
-    ret &= hdim_q == hdim_v
+    # the v3 kernels take no sink, so d_sink would be left unwritten
+    ret &= sink is None and d_sink is None
+    # 192 / 128 runs the g7 kernels only
+    ret &= hdim_q == hdim_v or g7()
     ret &= nhead_q % nhead_k == 0
     ret &= hdim_q >= 64 and hdim_q <= 192 and hdim_q % 8 == 0
-    ret &= np() or pssk() or pddv() or psskddv()
+    ret &= np() or pssk() or pddv() or psskddv() or g7()
     return ret
 
 
@@ -2865,6 +2883,9 @@ def _flash_attn_backward(
         alibi_slopes,
         deterministic,
         is_v3_atomic_fp32,
+        dq=dq,
+        sink=sink,
+        d_sink=d_sink,
     )
 
     # dq, dk, dv are allocated by us so they should already be contiguous
@@ -3767,6 +3788,17 @@ def _flash_attn_varlen_backward(
 
         return ret
 
+    def g7():
+        # gfx942 hdim_q 192 7-GEMM kernels, run for a16 and a32 requests alike
+        # bwd_hd192_{bf16,fp16}_{,causal_,causal_br_}a16_[{rtne,rtna,rtz}_]pssk_group
+        # bwd_hd192_128_{bf16,fp16}_{,causal_,causal_br_}a16_[{rtne,rtna,rtz}_]pssk_group
+        # They write dq with q's strides; a missing dq is allocated with empty_like(q).
+        ret = hdim_q == 192 and hdim_v in (192, 128)
+        dq_ = dq if dq is not None else torch.empty_like(q, device="meta")
+        ret &= dq_.stride() == q.stride()
+
+        return ret
+
     def can_impl_fmha_v3_bwd():
         # basic
         ret = get_gfx() == "gfx942"
@@ -3775,11 +3807,14 @@ def _flash_attn_varlen_backward(
         # ret &= dbias is None
         ret &= dropout_p == 0.0
         ret &= deterministic == False
-        ret &= hdim_q == hdim_v
+        # the v3 kernels take no sink, so d_sink would be left unwritten
+        ret &= sink is None and d_sink is None
+        # 192 / 128 runs the g7 kernels only
+        ret &= hdim_q == hdim_v or g7()
         ret &= nhead_q % nhead_k == 0
         ret &= hdim_q >= 64 and hdim_q <= 192 and hdim_q % 8 == 0
         ret &= not swa
-        ret &= pssk() or psskddv()
+        ret &= pssk() or psskddv() or g7()
 
         return ret
 
@@ -3820,8 +3855,8 @@ def _flash_attn_varlen_backward(
         return ret
 
     def can_impl_fmha_bwd_flydsl():
-        # d_qk=192 / d_v=128 causal varlen self-attention -- the shape family both
-        # `can_impl_fmha_v3_bwd*` gates exclude by requiring hdim_q == hdim_v.
+        # d_qk=192 / d_v=128 causal varlen self-attention, taken only when no ASM v3
+        # kernel covers it (gfx942 has the hd192_128 pssk kernels).
         # `deterministic` is absent on purpose: the kernel uses no atomics and
         # writes each of dq/dk/dv exactly once, so it is deterministic either way.
         ret = get_gfx() == "gfx942"
@@ -3862,30 +3897,7 @@ def _flash_attn_varlen_backward(
     # Evaluated after maybe_contiguous: the gate checks contiguity.
     can_impl_fmha_bwd_flydsl_ = _FLYDSL_AVAILABLE and can_impl_fmha_bwd_flydsl()
 
-    if can_impl_fmha_bwd_flydsl_:
-        from .flydsl.fmha_kernels import flydsl_flash_attn_varlen_bwd
-
-        (
-            dq,
-            dk,
-            dv,
-            softmax_d,
-        ) = flydsl_flash_attn_varlen_bwd(
-            dout,
-            q,
-            k,
-            v,
-            out,
-            softmax_lse,
-            dq,
-            dk,
-            dv,
-            cu_seqlens_q,
-            max_seqlen_q,
-            max_seqlen_k,
-            softmax_scale,
-        )
-    elif can_impl_fmha_v3_bwd_:
+    if can_impl_fmha_v3_bwd_:
         (
             dq,
             dk,
@@ -3919,6 +3931,29 @@ def _flash_attn_varlen_backward(
             None,
             cu_seqlens_q_padded,
             cu_seqlens_k_padded,
+        )
+    elif can_impl_fmha_bwd_flydsl_:
+        from .flydsl.fmha_kernels import flydsl_flash_attn_varlen_bwd
+
+        (
+            dq,
+            dk,
+            dv,
+            softmax_d,
+        ) = flydsl_flash_attn_varlen_bwd(
+            dout,
+            q,
+            k,
+            v,
+            out,
+            softmax_lse,
+            dq,
+            dk,
+            dv,
+            cu_seqlens_q,
+            max_seqlen_q,
+            max_seqlen_k,
+            softmax_scale,
         )
     else:
         (
