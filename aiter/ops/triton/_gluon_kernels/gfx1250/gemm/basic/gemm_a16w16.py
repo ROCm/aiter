@@ -465,6 +465,39 @@ def _gemm_a16w16_bandwidth_bound_kernel(
 
 
 @gluon.jit
+def _bloc_gran(page, xph, u):
+    """Granule of the u-th unit (0..63) of slot parity xph in 2 MiB page `page` (aiter.ops.kv_iod.gran)."""
+    return (page << 7) + (u << 1) + (xph ^ ((u >> 2) & 1) ^ ((u >> 5) & 1))
+
+
+@gluon.jit
+def _load_b_tile(
+    b_desc,
+    dst,
+    kstep,
+    pid_n,
+    BLOCK_N: gl.constexpr,
+    B_LOC: gl.constexpr,
+    b_half=None,
+    buf=0,
+):
+    """B tile of K step `kstep` into `dst`. B_LOC (IOD-placed [N, K] bf16 B, BLOCK_N = BLOCK_K = 128, see
+    aiter.ops.lmhead_iod): N-tile t sits in page t // 4, slot parity (t // 2) & 1, units 32 (t & 1) + 2 k + h,
+    each a dense [64, 128] half; the two halves of a K step are two granules (64 rows of the placed view) apart.
+    """
+    # B_LOC: TDM into a [2 NUM_BUFFERS, 64, BLOCK_K] alias of the B buffers (row-padded, so the same bytes);
+    # a TDM load into a .slice() of a padded buffer lands elsewhere
+    if B_LOC:
+        g = _bloc_gran(pid_n // 4, (pid_n // 2) & 1, 32 * (pid_n & 1) + 2 * kstep)
+        gl.amd.gfx1250.tdm.async_load(b_desc, [g * 64, 0], b_half.index(2 * buf))
+        gl.amd.gfx1250.tdm.async_load(
+            b_desc, [(g + 2) * 64, 0], b_half.index(2 * buf + 1)
+        )
+    else:
+        gl.amd.gfx1250.tdm.async_load(b_desc, [0, 0], dst)
+
+
+@gluon.jit
 def _compute_bound_accumulate(
     a_ptr,
     b_ptr,
@@ -488,6 +521,7 @@ def _compute_bound_accumulate(
     OPERAND_LAYOUT_A: gl.constexpr,
     OPERAND_LAYOUT_B: gl.constexpr,
     CACHE_A: gl.constexpr = "",
+    B_LOC: gl.constexpr = 0,
 ):
     """The fp32 (BLOCK_M, BLOCK_N) tile (pid_m, pid_n) of A @ B: the K pipeline of
     `_gemm_a16w16_compute_bound_kernel` (see there), shared with its variants.
@@ -514,6 +548,10 @@ def _compute_bound_accumulate(
             layout=SHARED_LAYOUT_A,
         )
 
+    # B_LOC: the per-row padded layout of a 64-row half (BLOCK_K = 128 is one pad interval, as SHARED_LAYOUT_B)
+    SHARED_LAYOUT_B64: gl.constexpr = gl.PaddedSharedLayout.with_identity_for(
+        [[BLOCK_K, 8]], [64, BLOCK_K], [1, 0]
+    )
     if LAYOUT[1] == "T":
         b_desc = gl.amd.gfx1250.tdm.make_tensor_descriptor(
             base=b_base,
@@ -521,6 +559,18 @@ def _compute_bound_accumulate(
             strides=(stride_bk, stride_bn),
             block_shape=(BLOCK_K, BLOCK_N),
             layout=SHARED_LAYOUT_B,
+        )
+    elif B_LOC:
+        gl.static_assert(
+            BLOCK_N == 128 and BLOCK_K == 128, "the placed B layout is 128 x 128 tiles"
+        )
+        # the placed buffer as rows of 128 elements (one B row of a K step), 64 rows a 16 KiB granule
+        b_desc = gl.amd.gfx1250.tdm.make_tensor_descriptor(
+            base=b_ptr,
+            shape=(1 << 26, BLOCK_K),
+            strides=(BLOCK_K, 1),
+            block_shape=(64, BLOCK_K),
+            layout=SHARED_LAYOUT_B64,
         )
     else:
         b_desc = gl.amd.gfx1250.tdm.make_tensor_descriptor(
@@ -560,6 +610,12 @@ def _compute_bound_accumulate(
     load_idx = 0
     compute_idx = 0
 
+    b_half = b_buffer
+    if B_LOC:
+        b_half = b_buffer.reinterpret(
+            b_ptr.type.element_ty, [2 * NUM_BUFFERS, 64, BLOCK_K], SHARED_LAYOUT_B64
+        )
+
     accumulator = gl.zeros((BLOCK_M, BLOCK_N), dtype=gl.float32, layout=WMMA_LAYOUT)
 
     # TDM prologue: fill the pipeline with NUM_BUFFERS-1 tiles
@@ -570,8 +626,15 @@ def _compute_bound_accumulate(
             a_buffer.index(load_idx % NUM_BUFFERS),
             cache_modifier=CACHE_A,
         )
-        gl.amd.gfx1250.tdm.async_load(
-            b_desc, [0, 0], b_buffer.index(load_idx % NUM_BUFFERS)
+        _load_b_tile(
+            b_desc,
+            b_buffer.index(load_idx % NUM_BUFFERS),
+            load_idx,
+            pid_n,
+            BLOCK_N,
+            B_LOC,
+            b_half,
+            load_idx % NUM_BUFFERS,
         )
 
         # Walk the descriptors forward one K tile.
@@ -588,7 +651,7 @@ def _compute_bound_accumulate(
             b_desc = gl.amd.gfx1250.tdm.update_tensor_descriptor(
                 b_desc, add_offsets=[BLOCK_K, 0]
             )
-        else:
+        elif not B_LOC:
             b_desc = gl.amd.gfx1250.tdm.update_tensor_descriptor(
                 b_desc, add_offsets=[0, BLOCK_K]
             )
@@ -600,7 +663,7 @@ def _compute_bound_accumulate(
     # Register pre-load prologue: wait for tile 0 then read it into cur_a/cur_b.
     # After TDM prologue there are (NUM_BUFFERS-1)*2 ops in-flight; waiting for
     # (NUM_BUFFERS-2)*2 lets exactly one tile (tile 0) complete.
-    gl.amd.gfx1250.tdm.async_wait((NUM_BUFFERS - 2) * 2)
+    gl.amd.gfx1250.tdm.async_wait((NUM_BUFFERS - 2) * (3 if B_LOC else 2))
 
     if LAYOUT[0] == "T":
         cur_a = gl.amd.cdna4.async_copy.load_shared_relaxed(
@@ -637,8 +700,15 @@ def _compute_bound_accumulate(
         a_buffer.index(load_idx % NUM_BUFFERS),
         cache_modifier=CACHE_A,
     )
-    gl.amd.gfx1250.tdm.async_load(
-        b_desc, [0, 0], b_buffer.index(load_idx % NUM_BUFFERS)
+    _load_b_tile(
+        b_desc,
+        b_buffer.index(load_idx % NUM_BUFFERS),
+        load_idx,
+        pid_n,
+        BLOCK_N,
+        B_LOC,
+        b_half,
+        load_idx % NUM_BUFFERS,
     )
 
     # Walk the descriptors forward one K tile.
@@ -655,7 +725,7 @@ def _compute_bound_accumulate(
         b_desc = gl.amd.gfx1250.tdm.update_tensor_descriptor(
             b_desc, add_offsets=[BLOCK_K, 0]
         )
-    else:
+    elif not B_LOC:
         b_desc = gl.amd.gfx1250.tdm.update_tensor_descriptor(
             b_desc, add_offsets=[0, BLOCK_K]
         )
@@ -663,7 +733,7 @@ def _compute_bound_accumulate(
     # Tighter wait: after issuing the new TDM there are (NUM_BUFFERS-1)*2
     # ops in-flight.  Waiting for (NUM_BUFFERS-2)*2 guarantees that tile
     # compute_idx+1 has landed in LDS.
-    gl.amd.gfx1250.tdm.async_wait((NUM_BUFFERS - 2) * 2)
+    gl.amd.gfx1250.tdm.async_wait((NUM_BUFFERS - 2) * (3 if B_LOC else 2))
 
     load_idx += 1
 
@@ -711,8 +781,15 @@ def _compute_bound_accumulate(
             a_buffer.index(load_idx % NUM_BUFFERS),
             cache_modifier=CACHE_A,
         )
-        gl.amd.gfx1250.tdm.async_load(
-            b_desc, [0, 0], b_buffer.index(load_idx % NUM_BUFFERS)
+        _load_b_tile(
+            b_desc,
+            b_buffer.index(load_idx % NUM_BUFFERS),
+            load_idx,
+            pid_n,
+            BLOCK_N,
+            B_LOC,
+            b_half,
+            load_idx % NUM_BUFFERS,
         )
 
         # Walk the descriptors forward one K tile.
@@ -729,7 +806,7 @@ def _compute_bound_accumulate(
             b_desc = gl.amd.gfx1250.tdm.update_tensor_descriptor(
                 b_desc, add_offsets=[BLOCK_K, 0]
             )
-        else:
+        elif not B_LOC:
             b_desc = gl.amd.gfx1250.tdm.update_tensor_descriptor(
                 b_desc, add_offsets=[0, BLOCK_K]
             )
@@ -737,7 +814,7 @@ def _compute_bound_accumulate(
         # Tighter wait: after issuing the new TDM there are (NUM_BUFFERS-1)*2
         # ops in-flight.  Waiting for (NUM_BUFFERS-2)*2 guarantees that tile
         # compute_idx+1 has landed in LDS.
-        gl.amd.gfx1250.tdm.async_wait((NUM_BUFFERS - 2) * 2)
+        gl.amd.gfx1250.tdm.async_wait((NUM_BUFFERS - 2) * (3 if B_LOC else 2))
 
         load_idx += 1
 
@@ -789,7 +866,7 @@ def _compute_bound_accumulate(
         b_desc = gl.amd.gfx1250.tdm.update_tensor_descriptor(
             b_desc, set_bounds=[K - k_main, N - pid_n * BLOCK_N]
         )
-    else:
+    elif not B_LOC:
         b_desc = gl.amd.gfx1250.tdm.update_tensor_descriptor(
             b_desc, set_bounds=[N - pid_n * BLOCK_N, K - k_main]
         )
@@ -800,11 +877,18 @@ def _compute_bound_accumulate(
         a_buffer.index(load_idx % NUM_BUFFERS),
         cache_modifier=CACHE_A,
     )
-    gl.amd.gfx1250.tdm.async_load(
-        b_desc, [0, 0], b_buffer.index(load_idx % NUM_BUFFERS)
+    _load_b_tile(
+        b_desc,
+        b_buffer.index(load_idx % NUM_BUFFERS),
+        load_idx,
+        pid_n,
+        BLOCK_N,
+        B_LOC,
+        b_half,
+        load_idx % NUM_BUFFERS,
     )
 
-    gl.amd.gfx1250.tdm.async_wait((NUM_BUFFERS - 2) * 2)
+    gl.amd.gfx1250.tdm.async_wait((NUM_BUFFERS - 2) * (3 if B_LOC else 2))
 
     load_idx += 1
 
@@ -835,7 +919,7 @@ def _compute_bound_accumulate(
     # Epilogue: no more TDM loads; drain the remaining NUM_BUFFERS-1 tiles.
     # The first NUM_BUFFERS-2 iterations still use the pre-load / WMMA pattern.
     for i in gl.static_range(NUM_BUFFERS - 2):
-        gl.amd.gfx1250.tdm.async_wait((NUM_BUFFERS - 3 - i) * 2)
+        gl.amd.gfx1250.tdm.async_wait((NUM_BUFFERS - 3 - i) * (3 if B_LOC else 2))
 
         if LAYOUT[0] == "T":
             next_a = gl.amd.cdna4.async_copy.load_shared_relaxed(
@@ -897,6 +981,12 @@ def _gemm_a16w16_compute_bound_kernel(
     USE_ACTIVATION: gl.constexpr,
     ADD_BIAS: gl.constexpr,
     GATED: gl.constexpr = False,
+    # IOD-placed B (aiter.ops.lmhead_iod): 1 placed, N-tile = program id; 2 each program takes the rank-th N-tile
+    # homed on its own IOD (b_loc_list_ptr: [2, tiles / 2] int32 tile ids by probe domain); 3 the other IOD's
+    B_LOC: gl.constexpr = 0,
+    b_loc_list_ptr=None,
+    B_LOC_LABEL_XOR: gl.constexpr = 0,
+    B_LOC_HALF: gl.constexpr = 0,  # constexpr: the stock signature keeps no extra runtime argument
 ):
     """Local-load pipelining across K-tiles.
 
@@ -912,8 +1002,29 @@ def _gemm_a16w16_compute_bound_kernel(
 
     pid = gl.program_id(axis=0)
     num_pid_m = gl.cdiv(M, BLOCK_M)
-    pid_m = pid % num_pid_m
-    pid_n = pid // num_pid_m
+    if B_LOC == 2 or B_LOC == 3:
+        se = (
+            gl.inline_asm_elementwise(
+                "s_sendmsg_rtn_b32 $0, sendmsg(MSG_RTN_GET_SE_AID_ID)\n\ts_wait_kmcnt 0x0",
+                constraints="=s",
+                args=[],
+                dtype=gl.int32,
+                is_pure=False,
+                pack=1,
+            )
+            >> 16
+        ) & 7
+        rot = (se - pid) & 7
+        lab = (se >> 2) ^ B_LOC_LABEL_XOR
+        dom = lab if B_LOC == 2 else 1 - lab
+        rank = 4 * (pid >> 3) + ((pid + rot) & 3)
+        if rank >= B_LOC_HALF:
+            return
+        pid_m = 0
+        pid_n = gl.load(b_loc_list_ptr + dom * B_LOC_HALF + rank)
+    else:
+        pid_m = pid % num_pid_m
+        pid_n = pid // num_pid_m
 
     accumulator = _compute_bound_accumulate(
         a_ptr,
@@ -937,6 +1048,7 @@ def _gemm_a16w16_compute_bound_kernel(
         WMMA_LAYOUT,
         OPERAND_LAYOUT_A,
         OPERAND_LAYOUT_B,
+        B_LOC=B_LOC,
     )
 
     # if NUM_BUFFERS > 2:

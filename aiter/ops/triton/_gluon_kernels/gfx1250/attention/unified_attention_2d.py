@@ -31,6 +31,12 @@ def _tdm_gather(desc, src_row_indices, dst):
         gl.amd.gfx1250.tdm.async_gather(desc, src_row_indices, dst)
 
 
+@gluon.jit
+def _kvloc_gran(page, xph, u):
+    """Granule of the u-th unit of a placed block's domain in 2 MiB page `page` (aiter.ops.kv_iod.gran)."""
+    return (page << 7) + (u << 1) + (xph ^ ((u >> 2) & 1) ^ ((u >> 5) & 1))
+
+
 @gluon.constexpr_function
 def _tdm_ops_after(cfg, wait_count, later):
     """TDM ops a wait may leave in flight: those of the loads issued after the awaited one, `later` (\"K\" / \"V\"
@@ -429,9 +435,11 @@ class TDMKVLoaderConfig:
     shared_v_layout: gl.constexpr
     gather_ids_layout: gl.constexpr
     REMOVE_INDIRECT_ACCESS: gl.constexpr
+    KV_LOC: gl.constexpr
+    loc_gather_layout: gl.constexpr
 
     @gluon.constexpr_function
-    def __init__(self, cfg, REMOVE_INDIRECT_ACCESS):
+    def __init__(self, cfg, REMOVE_INDIRECT_ACCESS, KV_LOC=False):
         # Swizzled when we access LDS as flat 1D rows (shuffled cache, or
         # gather case that packs NUM_KV_BLOCKS * BLOCK_SIZE * HEAD_SIZE
         # per buffer). Padded when we keep a 2D (BLOCK_SIZE, HEAD_SIZE) tile.
@@ -454,6 +462,16 @@ class TDMKVLoaderConfig:
                 )
             )
         self.REMOVE_INDIRECT_ACCESS = gl.constexpr(REMOVE_INDIRECT_ACCESS)
+        # KV_LOC: the IOD-local placed A8K4V8 pool of aiter.ops.kv_iod; a page's V is two 16 KiB granules
+        self.KV_LOC = gl.constexpr(KV_LOC)
+        self.loc_gather_layout = gl.constexpr(
+            gl.BlockedLayout(
+                size_per_thread=[2],
+                threads_per_warp=[cfg.WARP_SIZE],
+                warps_per_cta=[cfg.NUM_WARPS],
+                order=[0],
+            )
+        )
         self.gather_ids_layout = gl.constexpr(
             gl.BlockedLayout(
                 size_per_thread=[cfg.NUM_KV_BLOCKS],
@@ -522,9 +540,15 @@ class TDMKVLoader:
         kv_head_idx,
         block_table_stride,
         REMOVE_INDIRECT_ACCESS,
+        KV_LOC: gl.constexpr = False,
     ):
-        kv_cfg = TDMKVLoaderConfig(cfg, REMOVE_INDIRECT_ACCESS)
-        if cfg.KV_NVFP4:
+        kv_cfg = TDMKVLoaderConfig(cfg, REMOVE_INDIRECT_ACCESS, KV_LOC)
+        if KV_LOC:
+            return TDMKVLoader.initialize_placed(
+                cfg, kv_cfg, key_cache_ptr, value_cache_ptr, block_tables_ptr_shifted, kv_head_idx,
+                block_table_stride,
+            )
+        elif cfg.KV_NVFP4:
             return TDMKVLoader.initialize_nvfp4(
                 cfg,
                 kv_cfg,
@@ -600,6 +624,67 @@ class TDMKVLoader:
                 kv_head_idx,
                 block_table_stride,
             )
+
+    @gluon.jit
+    def initialize_placed(
+        cfg,
+        kv_cfg,
+        key_cache_ptr,
+        value_cache_ptr,
+        block_tables_ptr_shifted,
+        kv_head_idx,
+        block_table_stride,
+    ):
+        # IOD-local A8K4V8 pool (aiter.ops.kv_iod): key_cache_ptr / value_cache_ptr are a layer's 2 MiB-aligned
+        # K / V regions, addressed by 16 KiB granule rows (K data, V halves) and 2 KiB rows (K scales)
+        gl.static_assert(cfg.KV_NVFP4 and not cfg.V_NVFP4 and cfg.SHUFFLED_KV_CACHE)
+        gl.static_assert(cfg.NUM_KV_BLOCKS == 1)
+        gl.static_assert(cfg.BLOCK_SIZE * cfg.HEAD_SIZE == 32768)
+        k_desc = gl.amd.gfx1250.tdm.make_tensor_descriptor(
+            base=key_cache_ptr,
+            shape=(1 << 24, 16384),
+            strides=(16384, 1),
+            block_shape=(1, 16384),
+            layout=kv_cfg.shared_k_layout,
+        )
+        k_scales_desc = gl.amd.gfx1250.tdm.make_tensor_descriptor(
+            base=key_cache_ptr,
+            shape=(1 << 27, 2048),
+            strides=(2048, 1),
+            block_shape=(1, 2048),
+            layout=kv_cfg.shared_k_layout,
+        )
+        v_desc = gl.amd.gfx1250.tdm.make_tensor_descriptor(
+            base=value_cache_ptr,
+            shape=(1 << 24, 16384),
+            strides=(16384, 1),
+            block_shape=(2, 16384),
+            layout=kv_cfg.shared_v_layout,
+        )
+        k_shared = gl.allocate_shared_memory(
+            key_cache_ptr.type.element_ty, [cfg.NUM_BUFFERS, 1, 16384], layout=kv_cfg.shared_k_layout
+        )
+        v_shared = gl.allocate_shared_memory(
+            value_cache_ptr.type.element_ty, [cfg.NUM_BUFFERS, 2, 16384], layout=kv_cfg.shared_v_layout
+        )
+        k_scales_shared = gl.allocate_shared_memory(
+            key_cache_ptr.type.element_ty, [cfg.NUM_BUFFERS, 1, 2048], layout=kv_cfg.shared_k_layout
+        )
+        return TDMKVLoader(
+            cfg,
+            kv_cfg,
+            block_tables_ptr_shifted,
+            k_shared,
+            v_shared,
+            k_desc,
+            v_desc,
+            kv_head_idx,
+            block_table_stride,
+            k_scales_shared,
+            v_shared,
+            k_scales_desc,
+            v_desc,
+        )
 
     @gluon.jit
     def initialize_nvfp4(
@@ -696,43 +781,68 @@ class TDMKVLoader:
 
     @gluon.jit
     def load_k_to_shared(self, k_offset, buffer_id=0):
-        if self.cfg.SHUFFLED_KV_CACHE:
-            offsets = [
-                (k_offset * self.cfg.NUM_KV_HEADS + self.kv_head_idx).to(gl.int32),
-                0,
-            ]
-        else:
-            offsets = [
-                (k_offset * (self.cfg.BLOCK_SIZE)).to(gl.int32),
-                (self.kv_head_idx * self.cfg.stride_k_cache_2).to(gl.int32),
-            ]
-        gl.amd.gfx1250.tdm.async_load(
-            self.k_desc, offsets, self.k_shared.index(buffer_id)
-        )
-        if self.cfg.KV_NVFP4:
+        if self.kv_cfg.KV_LOC:
+            # k_offset: code | x << 29 (load_block_ids)
+            c = k_offset.to(gl.int32)
+            n = (c & 0x1FFFFFFF) >> 1
+            xk = (c >> 29) & 1
+            pk = n // 28
+            r = 2 * (n % 28) + self.kv_head_idx
             gl.amd.gfx1250.tdm.async_load(
-                self.k_scales_desc, offsets, self.k_scales_shared.index(buffer_id)
+                self.k_desc, [_kvloc_gran(pk, xk, r), 0], self.k_shared.index(buffer_id)
             )
+            gl.amd.gfx1250.tdm.async_load(
+                self.k_scales_desc,
+                [_kvloc_gran(pk, xk, 56 + r // 8) * 8 + r % 8, 0],
+                self.k_scales_shared.index(buffer_id),
+            )
+        else:
+            if self.cfg.SHUFFLED_KV_CACHE:
+                offsets = [
+                    (k_offset * self.cfg.NUM_KV_HEADS + self.kv_head_idx).to(gl.int32),
+                    0,
+                ]
+            else:
+                offsets = [
+                    (k_offset * (self.cfg.BLOCK_SIZE)).to(gl.int32),
+                    (self.kv_head_idx * self.cfg.stride_k_cache_2).to(gl.int32),
+                ]
+            gl.amd.gfx1250.tdm.async_load(
+                self.k_desc, offsets, self.k_shared.index(buffer_id)
+            )
+            if self.cfg.KV_NVFP4:
+                gl.amd.gfx1250.tdm.async_load(
+                    self.k_scales_desc, offsets, self.k_scales_shared.index(buffer_id)
+                )
 
     @gluon.jit
     def load_v_to_shared(self, v_offset, buffer_id=0):
-        if self.cfg.SHUFFLED_KV_CACHE:
-            offsets = [
-                (v_offset * self.cfg.NUM_KV_HEADS + self.kv_head_idx).to(gl.int32),
-                0,
-            ]
+        if self.kv_cfg.KV_LOC:
+            c = v_offset.to(gl.int32)
+            n = (c & 0x1FFFFFFF) >> 1
+            xv = (c >> 30) & 1
+            u = 4 * (n % 16) + 2 * self.kv_head_idx
+            offs = gl.arange(0, 2, layout=self.kv_cfg.loc_gather_layout)
+            rows = gl.where(offs == 0, _kvloc_gran(n // 16, xv, u), _kvloc_gran(n // 16, xv, u + 1))
+            _tdm_gather(self.v_desc, rows.to(gl.int32), self.v_shared.index(buffer_id))
         else:
-            offsets = [
-                (v_offset * (self.cfg.BLOCK_SIZE)).to(gl.int32),
-                (self.kv_head_idx * self.cfg.stride_v_cache_2).to(gl.int32),
-            ]
-        gl.amd.gfx1250.tdm.async_load(
-            self.v_desc, offsets, self.v_shared.index(buffer_id)
-        )
-        if self.cfg.V_NVFP4:
+            if self.cfg.SHUFFLED_KV_CACHE:
+                offsets = [
+                    (v_offset * self.cfg.NUM_KV_HEADS + self.kv_head_idx).to(gl.int32),
+                    0,
+                ]
+            else:
+                offsets = [
+                    (v_offset * (self.cfg.BLOCK_SIZE)).to(gl.int32),
+                    (self.kv_head_idx * self.cfg.stride_v_cache_2).to(gl.int32),
+                ]
             gl.amd.gfx1250.tdm.async_load(
-                self.v_scales_desc, offsets, self.v_scales_shared.index(buffer_id)
+                self.v_desc, offsets, self.v_shared.index(buffer_id)
             )
+            if self.cfg.V_NVFP4:
+                gl.amd.gfx1250.tdm.async_load(
+                    self.v_scales_desc, offsets, self.v_scales_shared.index(buffer_id)
+                )
 
     @gluon.jit
     def load_k_scales_from_shared(self, wait_count=0, buffer_id=0):
@@ -824,7 +934,12 @@ class TDMKVLoader:
 
     @gluon.jit
     def load_block_ids(self, i):
-        if self.kv_cfg.REMOVE_INDIRECT_ACCESS:
+        if self.kv_cfg.KV_LOC:
+            # code | x << 29: the launcher resolves the x bytes once a call (a per-tile x lookup here is a dependent
+            # load that stalls the loop, ~20% of a long prefill)
+            i = gl.minimum(i, self.block_table_stride - 1)
+            return gl.load(self.block_tables_ptr_shifted + i)
+        elif self.kv_cfg.REMOVE_INDIRECT_ACCESS:
             return i
         else:
             # return gl.load(self.block_tables_ptr_shifted + i, mask=i < self.block_table_stride, other=0)
@@ -933,7 +1048,9 @@ class TDMGatherKVLoader:
         kv_head_idx,
         block_table_stride,
         REMOVE_INDIRECT_ACCESS,
+        KV_LOC: gl.constexpr = False,
     ):
+        gl.static_assert(not KV_LOC, "the placed pool runs one page a tile")
         kv_cfg = TDMKVLoaderConfig(cfg, REMOVE_INDIRECT_ACCESS)
         if cfg.KV_NVFP4:
             # NVFP4 K pages (data and scales, two gathers) with fp8 V pages; an NVFP4 V runs one page per tile
@@ -2596,6 +2713,9 @@ def _unified_attention_gluon_kernel_2d(
     gate_ptr=None,
     gate_stride_0=0,
     GATE: gl.constexpr = False,
+    # IOD-local A8K4V8 pool (aiter.ops.kv_iod): the caches are a layer's placed K / V regions and the block table's
+    # entries are code | x << 29 (unified_attention resolves them)
+    KV_LOC: gl.constexpr = False,
 ):
     NUM_WARPS: gl.constexpr = gl.num_warps()
     kv_head_idx = gl.program_id(0)
@@ -2810,6 +2930,8 @@ def _unified_attention_gluon_kernel_2d(
         return
 
     # Pick the KV loader based on TILE_SIZE and LOOP_VARIANT
+    if KV_LOC:
+        gl.static_assert(TILE_SIZE == BLOCK_SIZE, "the placed pool runs one page a tile")
     if TILE_SIZE == BLOCK_SIZE:
         KVLoader: gl.constexpr = TDMKVLoader
     else:
@@ -2830,6 +2952,7 @@ def _unified_attention_gluon_kernel_2d(
         kv_head_idx,
         gl.maximum(seq_pages, 1),
         REMOVE_INDIRECT_ACCESS,
+        KV_LOC,
     )
 
     if not USE_SINKS:

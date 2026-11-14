@@ -499,6 +499,15 @@ def use_2d_kernel(params: _UAParams, backend: str = "triton"):
     )
 
 
+# gfx1250 IOD-local KV cache: this call's kv_loc (see unified_attention), read by the gfx1250 launchers
+_KV_LOC_CALL = [None]
+
+
+def _kv_loc_resolved(kv_loc):
+    """kv_loc[6] (optional): the block table's entries already carry x (code | x_table[code] << 29)."""
+    return len(kv_loc) > 6 and bool(kv_loc[6])
+
+
 def unified_attention(
     q,
     k,
@@ -550,6 +559,32 @@ def unified_attention(
     # with the split reduce: reduce_segments_split_oneshot_gluon (bitwise the same
     # output, its loads in one round trip); None follows AITER_GFX12_SPLIT_REDUCE_ONESHOT.
     split_reduce_oneshot: bool | None = None,
+    # gfx1250 IOD-local A8K4V8 KV cache (aiter.ops.kv_iod), as (x_table, k_base, v_base, label_xor, chunk, mode
+    # [, resolved]): k / v keep the stock views for shapes, the kernels read the placed regions k_base / v_base.
+    # The block table holds the layout's block codes, or with resolved their code | x_table[code] << 29
+    # (aiter.ops.kv_iod.resolve_block_tables). Decode needs the token split; mode 2 runs each segment on the IOD
+    # its chunks are homed on (1: stock workgroup order, 3: the other IOD, controls). None: the stock cache.
+    kv_loc=None,
+):
+    _KV_LOC_CALL[0] = kv_loc
+    try:
+        return _unified_attention_body(
+            q, k, v, out, cu_seqlens_q, max_seqlen_q, seqused_k, max_seqlen_k, softmax_scale, causal,
+            window_size, block_table, softcap, q_descale, k_descale, v_descale, q_scales, alibi_slopes,
+            output_scale, qq_bias, sinks, shuffled_kv_cache, skip_reduce, equal_seqlen_q,
+            force_fp8_pv_on_fp4_kv_cache, gfx12_token_split_tiles, backend, output_gate, output_rows,
+            split_reduce, split_reduce_oneshot,
+        )
+    finally:
+        _KV_LOC_CALL[0] = None
+
+
+def _unified_attention_body(
+    q, k, v, out, cu_seqlens_q, max_seqlen_q, seqused_k, max_seqlen_k, softmax_scale, causal,
+    window_size, block_table, softcap, q_descale, k_descale, v_descale, q_scales, alibi_slopes,
+    output_scale, qq_bias, sinks, shuffled_kv_cache, skip_reduce, equal_seqlen_q,
+    force_fp8_pv_on_fp4_kv_cache, gfx12_token_split_tiles, backend, output_gate, output_rows,
+    split_reduce, split_reduce_oneshot,
 ):
     assert causal, "Only causal attention is supported"
 
@@ -741,6 +776,9 @@ def unified_attention(
             and DEVICE_ARCH == "gfx1250"
             and _2d_gate_fusable(params, output_rows)
         )
+        assert _KV_LOC_CALL[0] is None or (
+            use_gluon_2d and DEVICE_ARCH == "gfx1250"
+        ), "kv_loc needs the gfx1250 Gluon unified attention kernels"
         if use_gluon_2d:
             if DEVICE_ARCH == "gfx1250":
                 _unified_attention_2d_gfx1250(
@@ -756,6 +794,9 @@ def unified_attention(
             _output_epilogue(out, final_out, output_gate, output_rows)
     else:
         use_gluon_3d = is_3d_gluon_available(params, backend)
+        assert _KV_LOC_CALL[0] is None or (
+            use_gluon_3d and DEVICE_ARCH == "gfx1250"
+        ), "kv_loc needs the gfx1250 Gluon unified attention kernels"
         split_params = params
         if use_gluon_3d and DEVICE_ARCH == "gfx950":
             split_params = _gfx950_split_params(params)
@@ -1250,6 +1291,7 @@ def _reduce_segments_triton(
         gate_ptr=output_gate,
         gate_stride_0=output_gate.stride(0) if output_gate is not None else 0,
         rows_ptr=output_rows,
+        T_CHUNK=int(_KV_LOC_CALL[0][4]) if _KV_LOC_CALL[0] is not None and segm_tiles is not None else 0,
         **config,
         enable_fp_fusion=True,
     )
@@ -1324,6 +1366,19 @@ def _unified_attention_2d_gfx1250(params: _UAParams, output_gate=None):
     if query_span > TILE_SIZE or TILE_SIZE <= 32:
         loop_variant = 0
 
+    # IOD-local KV (kv_loc): one page a tile, the caches replaced by the layer's placed K / V regions
+    _v2 = _KV_LOC_CALL[0]
+    block_table = params.block_table
+    if _v2 is not None and not _kv_loc_resolved(_v2):
+        # the kernel reads code | x << 29 entries (a per-tile x lookup stalls its loop ~20% on a long prefill);
+        # resolve here (torch ops: the call is not fast-launch replayable), or pass a resolved table
+        block_table = block_table | (_v2[0][block_table.long()].to(torch.int32) << 29)
+    if _v2 is not None:
+        TILE_SIZE = params.block_size
+        num_kv_blocks = 1
+        if query_span > TILE_SIZE or TILE_SIZE <= 32:
+            loop_variant = 0
+
     num_buffers = config["NUM_BUFFERS"]
     waves_per_eu = config["waves_per_eu"]
     kv_nvfp4 = params.kv_cache_dtype == torch.uint8
@@ -1360,11 +1415,11 @@ def _unified_attention_2d_gfx1250(params: _UAParams, output_gate=None):
     USE_STORE_BUFFER_OP = params.out.nelement() * params.out.element_size() <= MAX_INT32
     _unified_attention_kernel_2d_gfx1250[(params.num_kv_heads, total_query_blocks)](
         query_ptr=params.q,
-        key_cache_ptr=params.k,
-        value_cache_ptr=params.v,
+        key_cache_ptr=params.k if _v2 is None else _v2[1],
+        value_cache_ptr=params.v if _v2 is None else _v2[2],
         sink_ptr=params.sinks,
         output_ptr=params.out,
-        block_tables_ptr=params.block_table,
+        block_tables_ptr=block_table,
         seq_lens_ptr=params.seqused_k,
         query_start_len_ptr=params.cu_seqlens_q,
         query_stride_0=params.q.stride(0),
@@ -1386,7 +1441,7 @@ def _unified_attention_2d_gfx1250(params: _UAParams, output_gate=None):
         stride_v_cache_1=params.v.stride(1),
         stride_v_cache_2=params.v.stride(2),
         stride_v_cache_3=params.v.stride(3),
-        block_table_stride=params.block_table.stride(0),
+        block_table_stride=block_table.stride(0),
         num_seqs=NUM_SEQS,
         SCALE=params.softmax_scale,
         NUM_QUERY_HEADS=params.num_query_heads,
@@ -1419,6 +1474,7 @@ def _unified_attention_2d_gfx1250(params: _UAParams, output_gate=None):
         gate_ptr=output_gate,
         gate_stride_0=output_gate.stride(0) if output_gate is not None else 0,
         GATE=output_gate is not None,
+        KV_LOC=_v2 is not None,
         enable_fp_fusion=True,
     )
 
@@ -1462,6 +1518,18 @@ def _unified_attention_3d_gfx1250(
     else:
         total_num_q_blocks = params.num_tokens // config["BLOCK_Q"] + params.num_seqs
 
+    # IOD-local KV (kv_loc): segments pair up over [2rT, 2(r + 1)T), T the token split's (rounded to the placement
+    # chunk in the kernels); the IOD-matched schedule (modes 2 / 3) needs an even segment count and grid % 8 == 0
+    _v2 = _KV_LOC_CALL[0]
+    _loc_mode = 0
+    if _v2 is not None:
+        assert segm_tiles is not None, "kv_loc decode needs the gfx1250 token split (AITER_GFX12_TOKEN_SPLIT=1)"
+        _loc_mode = int(_v2[5])
+        assert _loc_mode in (1, 2, 3), f"kv_loc mode {_loc_mode}"
+        if _loc_mode != 1 and (
+            NUM_SEGMENTS % 2 or (total_num_q_blocks * params.num_kv_heads * NUM_SEGMENTS) % 8
+        ):
+            _loc_mode = 1
     _unified_attention_kernel_3d_gfx1250[
         (total_num_q_blocks, params.num_kv_heads, NUM_SEGMENTS)
     ](
@@ -1470,8 +1538,8 @@ def _unified_attention_3d_gfx1250(
         segm_expsum_ptr=segm_expsum,
         query_ptr=params.q,
         query_scales_ptr=params.q_scales,
-        key_cache_ptr=params.k,
-        value_cache_ptr=params.v,
+        key_cache_ptr=params.k if _v2 is None else _v2[1],
+        value_cache_ptr=params.v if _v2 is None else _v2[2],
         sink_ptr=params.sinks,
         block_tables_ptr=params.block_table,
         seq_lens_ptr=params.seqused_k,
@@ -1542,6 +1610,11 @@ def _unified_attention_3d_gfx1250(
         BLOCK_SCALES_SIZE=params.block_scales_size,
         NUM_SEGMENTS_PER_SEQ=NUM_SEGMENTS,
         TILE_SIZE=TILE_SIZE,
+        KV_LOC=_loc_mode,
+        KV_LOC_C=int(_v2[4]) if _v2 is not None else 16,
+        KV_LOC_LABEL_XOR=int(_v2[3]) if _v2 is not None else 0,
+        kv_loc_x_ptr=_v2[0] if _v2 is not None else None,
+        KV_LOC_RESOLVED=_v2 is not None and _kv_loc_resolved(_v2),
         **config,
         enable_fp_fusion=True,
     )
@@ -1580,6 +1653,7 @@ def _reduce_segments_gfx1250(
         FP8_MIN=torch.finfo(e4m3_dtype).min,
         FP8_MAX=torch.finfo(e4m3_dtype).max,
         NUM_WARPS=gluon_num_warps,
+        T_CHUNK=int(_KV_LOC_CALL[0][4]) if _KV_LOC_CALL[0] is not None and segm_tiles is not None else 0,
         num_warps=gluon_num_warps,
         **config,
         enable_fp_fusion=True,
@@ -1628,6 +1702,7 @@ def _reduce_segments_split_gfx1250(
                 D=params.head_size_v,
                 TILE_SIZE=TILE_SIZE,
                 SEQLEN_Q=1 if params.all_decode else int(params.max_seqlen_q),
+                T_CHUNK=int(_KV_LOC_CALL[0][4]) if _KV_LOC_CALL[0] is not None and segm_tiles is not None else 0,
                 SB=sb,
                 CHUNK=chunk,
                 SPEC=min(spec, chunk) // sb * sb,
@@ -1660,6 +1735,7 @@ def _reduce_segments_split_gfx1250(
         SB=sb,
         NUM_BUF=num_buf,
         NUM_WARPS=num_warps,
+        T_CHUNK=int(_KV_LOC_CALL[0][4]) if _KV_LOC_CALL[0] is not None and segm_tiles is not None else 0,
         IS_FP8_OUT=(params.out.dtype == e4m3_dtype),
         FP8_MIN=torch.finfo(e4m3_dtype).min,
         FP8_MAX=torch.finfo(e4m3_dtype).max,

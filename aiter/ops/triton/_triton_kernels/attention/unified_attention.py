@@ -1016,6 +1016,8 @@ def reduce_segments(
     gate_stride_0: tl.int64 = 0,
     # Output row r is query token rows[r] (only those rows are reduced), or None.
     rows_ptr=None,
+    # gfx1250 IOD-local KV (aiter.ops.kv_iod): placement chunk (tiles); segments come in pairs
+    T_CHUNK: tl.constexpr = 0,
 ):
     out_row_idx = tl.program_id(0)
     if rows_ptr is not None:
@@ -1039,11 +1041,19 @@ def reduce_segments(
     num_segments = NUM_SEGMENTS_PER_SEQ
     if segm_tiles_ptr is not None:
         tiles_per_segment = tl.load(segm_tiles_ptr)
+        if T_CHUNK > 0:  # IOD-local KV: T rounded as the attention kernel rounds it
+            tiles_per_segment = tl.maximum(
+                (tiles_per_segment + T_CHUNK // 2) // T_CHUNK * T_CHUNK, T_CHUNK
+            )
     else:
         tiles_per_segment = cdiv_fn(seq_len, num_segments * TILE_SIZE)
 
     # create masks for subsequent loads
     act_num_segments = cdiv_fn(seq_len, tiles_per_segment * TILE_SIZE)
+    if T_CHUNK > 0:  # a pair's second segment may hold its range's last tiles
+        act_num_segments = tl.minimum(
+            (act_num_segments + 1) // 2 * 2, NUM_SEGMENTS_PER_SEQ
+        )
     single_tile: tl.constexpr = (
         SEGMENT_BLOCK == 0 or SEGMENT_BLOCK >= NUM_SEGMENTS_PER_SEQ
     )

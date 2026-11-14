@@ -28,6 +28,34 @@ float8_info = torch.finfo(e4m3_dtype)
 
 
 @gluon.jit
+def _kvloc_tile(t, k_first, C: gl.constexpr):
+    """Global tile of a chunked segment's t-th tile: its chunks are k_first, k_first + 2, ..."""
+    return (k_first + 2 * (t // C)) * C + t % C
+
+
+@gluon.jit
+def _kvloc_blk(block_tables_ptr_shifted, t, n_loc, k_first, C: gl.constexpr, x_ptr, RESOLVED: gl.constexpr = False):
+    """Block code of the segment's t-th tile (clamped to its last tile), with the code's x byte in bits 29-30: read
+    from the table when RESOLVED, else looked up (one dependent load, issued a tile ahead with the code)."""
+    tt = gl.maximum(gl.minimum(t, n_loc - 1), 0)
+    # a segment with no tiles in the context (its pair's other half has them) still prefetches: give it the
+    # sequence's first block, never an entry past the sequence's last (the table's tail is not this sequence's)
+    tile = gl.where(n_loc > 0, _kvloc_tile(tt, k_first, C), 0)
+    c = gl.load(block_tables_ptr_shifted + tile)
+    if RESOLVED:  # the table holds code | x << 29 already
+        return c
+    else:
+        return c | (gl.load(x_ptr + c).to(gl.int32) << 29)
+
+
+@gluon.jit
+def _kvloc_gran(page, xph, u):
+    """Granule of the u-th unit (0..63) of slot parity xph in 2 MiB page `page` (aiter.ops.kv_iod.gran): the u-th
+    of the page's granules homed on domain xph ^ phase(page) (home = a14 ^ a17 ^ a20 ^ phase)."""
+    return (page << 7) + (u << 1) + (xph ^ ((u >> 2) & 1) ^ ((u >> 5) & 1))
+
+
+@gluon.jit
 def apply_softcap(S, x):
     Sdiv = S / x
     p1 = tl.math.exp2(Sdiv)
@@ -100,6 +128,8 @@ class AttentionConfig:
     QUERY_DTYPE: gl.constexpr
     KV_CACHE_DTYPE: gl.constexpr
     V_CACHE_DTYPE: gl.constexpr
+    KV_LOC: gl.constexpr
+    LOC_GATHER_LAYOUT: gl.constexpr
     SCALE_PRESHUFFLE: gl.constexpr
     K_WIDTH: gl.constexpr
     SCALE_K_WIDTH: gl.constexpr
@@ -143,8 +173,22 @@ class AttentionConfig:
         FP8_PV=False,
         HEAD_SIZE_SPLIT=1,
         V_CACHE_DTYPE="",
+        KV_LOC=0,
     ):
         # Constants
+        # KV_LOC (IOD-local A8K4V8 pool of aiter.ops.kv_iod, decode): 0 off; 1 placed, stock workgroup order;
+        # 2 placed, each segment on a workgroup of the IOD its chunks are homed on; 3 the other IOD (a control)
+        self.KV_LOC = gl.constexpr(KV_LOC)
+        self.LOC_GATHER_LAYOUT = gl.constexpr(
+            gl.BlockedLayout(
+                size_per_thread=[2],
+                threads_per_warp=[WARP_SIZE],
+                warps_per_cta=[NUM_WARPS],
+                order=[0],
+            )
+            if KV_LOC
+            else None
+        )
         self.HEAD_SIZE = gl.constexpr(HEAD_SIZE)
         self.BLOCK_SIZE = gl.constexpr(BLOCK_SIZE)
         self.TILE_SIZE = gl.constexpr(TILE_SIZE)
@@ -783,7 +827,31 @@ class AttentionProgram:
     ):
         k_scales_desc = None
         v_scales_desc = None
-        if cfg.SHUFFLED_KV_CACHE:
+        if cfg.KV_LOC:
+            # K region rows of 16 KiB (data) and 2 KiB (scales), V region rows of 16 KiB; rows by granule
+            gl.static_assert(cfg.KV_CACHE_DTYPE == "nvfp4" and cfg.V_CACHE_DTYPE != "nvfp4")
+            k_desc = gl.amd.gfx1250.tdm.make_tensor_descriptor(
+                base=key_cache_ptr,
+                shape=(1 << 24, 16384),
+                strides=(16384, 1),
+                block_shape=(gl.constexpr(1), gl.constexpr(16384)),
+                layout=cfg.K_SHARED_LAYOUT,
+            )
+            k_scales_desc = gl.amd.gfx1250.tdm.make_tensor_descriptor(
+                base=key_cache_ptr,
+                shape=(1 << 27, 2048),
+                strides=(2048, 1),
+                block_shape=(gl.constexpr(1), gl.constexpr(2048)),
+                layout=cfg.K_SHARED_LAYOUT,
+            )
+            v_desc = gl.amd.gfx1250.tdm.make_tensor_descriptor(
+                base=value_cache_ptr,
+                shape=(1 << 24, 16384),
+                strides=(16384, 1),
+                block_shape=(gl.constexpr(2), gl.constexpr(16384)),
+                layout=cfg.V_SHARED_LAYOUT,
+            )
+        elif cfg.SHUFFLED_KV_CACHE:
             if cfg.NUM_BLOCKS_GATHER_PER_TILE == 1:
                 if cfg.KV_CACHE_DTYPE == "nvfp4":
                     k_desc = gl.amd.gfx1250.tdm.make_tensor_descriptor(
@@ -1370,7 +1438,21 @@ class AttentionProgram:
 
     @gluon.jit
     def tdm_load_global_to_shared_k(self, block_idx, buffer_id):
-        if self.cfg.NUM_BLOCKS_GATHER_PER_TILE == 1:
+        if self.cfg.KV_LOC:
+            c = block_idx.to(gl.int32)
+            n = (c & 0x1FFFFFFF) >> 1
+            xk = (c >> 29) & 1
+            pk = n // 28
+            r = 2 * (n % 28) + self.kv_head_idx
+            gl.amd.gfx1250.tdm.async_load(
+                self.k_desc, [_kvloc_gran(pk, xk, r), 0], self.k_shared.index(buffer_id)
+            )
+            gl.amd.gfx1250.tdm.async_load(
+                self.k_scales_desc,
+                [_kvloc_gran(pk, xk, 56 + r // 8) * 8 + r % 8, 0],
+                self.k_scales_shared.index(buffer_id),
+            )
+        elif self.cfg.NUM_BLOCKS_GATHER_PER_TILE == 1:
             if self.cfg.SHUFFLED_KV_CACHE:
                 offsets = [
                     (block_idx * self.cfg.NUM_KV_HEADS + self.kv_head_idx).to(gl.int32),
@@ -1406,7 +1488,19 @@ class AttentionProgram:
 
     @gluon.jit
     def tdm_load_global_to_shared_v(self, block_idx, buffer_id):
-        if self.cfg.NUM_BLOCKS_GATHER_PER_TILE == 1:
+        if self.cfg.KV_LOC:
+            c = block_idx.to(gl.int32)
+            n = (c & 0x1FFFFFFF) >> 1
+            xv = (c >> 30) & 1
+            u = 4 * (n % 16) + 2 * self.kv_head_idx
+            offs = gl.arange(0, 2, layout=self.cfg.LOC_GATHER_LAYOUT)
+            rows = gl.where(
+                offs == 0, _kvloc_gran(n // 16, xv, u), _kvloc_gran(n // 16, xv, u + 1)
+            )
+            gl.amd.gfx1250.tdm.async_gather(
+                self.v_desc, rows.to(gl.int32), self.v_shared.index(buffer_id)
+            )
+        elif self.cfg.NUM_BLOCKS_GATHER_PER_TILE == 1:
             if self.cfg.SHUFFLED_KV_CACHE:
                 offsets = [
                     (block_idx * self.cfg.NUM_KV_HEADS + self.kv_head_idx).to(gl.int32),
@@ -1949,6 +2043,7 @@ def get_seq_metadata(
     TILE_SIZE: gl.constexpr,
     NUM_SEGMENTS_PER_SEQ: gl.constexpr,
     segm_tiles_ptr,
+    T_CHUNK: gl.constexpr = 0,
 ):
     # sequence len for this particular sequence
     seq_len = gl.load(seq_lens_ptr + seq_idx)
@@ -1957,6 +2052,9 @@ def get_seq_metadata(
         # token split: every sequence's segments cover the same number of tiles,
         # so a long sequence gets more segments rather than longer ones
         tiles_per_segment = gl.load(segm_tiles_ptr)
+        if T_CHUNK > 0:
+            # IOD-local KV: the nearest multiple of the placement chunk, at least one (as the reduce does)
+            tiles_per_segment = gl.maximum((tiles_per_segment + T_CHUNK // 2) // T_CHUNK * T_CHUNK, T_CHUNK)
     else:
         # number of segments for this particular sequence
         num_segments = NUM_SEGMENTS_PER_SEQ
@@ -2119,6 +2217,11 @@ def _unified_attention_gluon_kernel_3d(
     FP8_PV: gl.constexpr = False,  # bool, NVFP4 KV only: PV as an FP8 WMMA
     HEAD_SIZE_SPLIT: gl.constexpr = 1,  # int, NVFP4 KV + BF16 PV only: V in head-dim pieces
     V_CACHE_DTYPE: gl.constexpr = "",  # V cache dtype when it differs from KV_CACHE_DTYPE (the K's): A8K4V8
+    KV_LOC: gl.constexpr = 0,  # IOD-local KV pool (see AttentionConfig.KV_LOC); needs the token split
+    KV_LOC_C: gl.constexpr = 16,  # KV_LOC: tiles a placement chunk covers (domain of chunk k: (k + seq salt) & 1)
+    KV_LOC_LABEL_XOR: gl.constexpr = 0,  # KV_LOC: a workgroup on AID a reads domain a ^ KV_LOC_LABEL_XOR locally
+    kv_loc_x_ptr=None,  # KV_LOC: [codes] uint8, bit 0 / 1: the K / V region page phase term of the code
+    KV_LOC_RESOLVED: gl.constexpr = False,  # KV_LOC: block table entries are code | x << 29
     FP8_MIN: tl.constexpr = float8_info.min,
     FP8_MAX: tl.constexpr = float8_info.max,
 ):
@@ -2156,6 +2259,7 @@ def _unified_attention_gluon_kernel_3d(
         FP8_PV,
         HEAD_SIZE_SPLIT,
         V_CACHE_DTYPE,
+        KV_LOC,
     )
     V_NVFP4: gl.constexpr = cfg.V_CACHE_DTYPE == "nvfp4"
     # TDM loads per page: data, plus the scales of an NVFP4 cache. A wait lets the loads issued after the awaited
@@ -2164,10 +2268,35 @@ def _unified_attention_gluon_kernel_3d(
     V_OPS: gl.constexpr = 2 if V_NVFP4 else 1
 
     # Workgroup offsets
-    q_block_global_idx = gl.program_id(0)
-    kv_head_idx = gl.program_id(1)
-    segm_idx = gl.program_id(2)
-
+    if KV_LOC == 2 or KV_LOC == 3:
+        # This workgroup's SE gives the launch's rotation and its AID (dispatch is SE = (b + rot) % 8). The rank-th
+        # workgroup of an AID takes a (q block, head, segment) whose segment parity is that AID's domain (2) or the
+        # other one (3). Needs an even segment count and grid % 8 == 0 (the launcher falls back to 1).
+        n_q = gl.num_programs(0)
+        n_h = gl.num_programs(1)
+        b = gl.program_id(0) + n_q * (gl.program_id(1) + n_h * gl.program_id(2))
+        se = (
+            gl.inline_asm_elementwise(
+                "s_sendmsg_rtn_b32 $0, sendmsg(MSG_RTN_GET_SE_AID_ID)\n\ts_wait_kmcnt 0x0",
+                constraints="=s",
+                args=[],
+                dtype=gl.int32,
+                is_pure=False,
+                pack=1,
+            )
+            >> 16
+        ) & 7
+        rot = (se - b) & 7
+        lab = (se >> 2) ^ KV_LOC_LABEL_XOR
+        par = lab if KV_LOC == 2 else 1 - lab
+        rank = 4 * (b >> 3) + ((b + rot) & 3)
+        q_block_global_idx = rank % n_q
+        kv_head_idx = (rank // n_q) % n_h
+        segm_idx = 2 * (rank // (n_q * n_h)) + par
+    else:
+        q_block_global_idx = gl.program_id(0)
+        kv_head_idx = gl.program_id(1)
+        segm_idx = gl.program_id(2)
     # Find sequence index using binary search
     if cfg.ALL_DECODE:
         seq_idx = q_block_global_idx
@@ -2211,10 +2340,16 @@ def _unified_attention_gluon_kernel_3d(
         cfg.TILE_SIZE,
         cfg.NUM_SEGMENTS_PER_SEQ,
         segm_tiles_ptr,
+        KV_LOC_C if KV_LOC else 0,
     )
 
-    if segm_idx * tiles_per_segment * cfg.TILE_SIZE >= seq_len:
-        return
+    if KV_LOC:
+        # chunked placement: segments 2r and 2r + 1 share the tiles [2rT, 2(r + 1)T); a pair past the context exits
+        if (segm_idx // 2) * 2 * tiles_per_segment * cfg.TILE_SIZE >= seq_len:
+            return
+    else:
+        if segm_idx * tiles_per_segment * cfg.TILE_SIZE >= seq_len:
+            return
 
     qk_factor: gl.float32 = cfg.QK_SCALE
     if q_scale_ptr is not None:
@@ -2238,6 +2373,20 @@ def _unified_attention_gluon_kernel_3d(
 
     context_len = seq_len - cur_batch_query_len
     block_tables_ptr_shifted = block_tables_ptr + seq_idx * block_table_stride
+    if KV_LOC:
+        # Segment 2r + h takes the chunks of its pair range whose domain (k + salt) & 1 is h (T a multiple of
+        # KV_LOC_C, so the pair range starts on an even chunk). n_loc: its tiles inside the context.
+        salt = gl.load(block_tables_ptr_shifted) & 1  # the domain of position 0
+        n_tiles_seq = (seq_len + cfg.TILE_SIZE - 1) // cfg.TILE_SIZE
+        kc0 = ((segm_idx // 2) * 2 * tiles_per_segment) // KV_LOC_C
+        k_first = kc0 + (((segm_idx & 1) ^ salt) & 1)
+        cps = tiles_per_segment // KV_LOC_C
+        kf_full = n_tiles_seq // KV_LOC_C
+        full_i = gl.minimum(gl.maximum((kf_full - k_first + 1) // 2, 0), cps)
+        k_tail = k_first + 2 * full_i
+        n_loc = full_i * KV_LOC_C + gl.where(
+            (full_i < cps) & (k_tail == kf_full), n_tiles_seq % KV_LOC_C, 0
+        )
 
     e4m3_dtype = gl.float8e4nv
     if QUERY_DTYPE == "nvfp4":
@@ -2446,12 +2595,26 @@ def _unified_attention_gluon_kernel_3d(
         )
 
     # physical_block_idx: gl.int32 = j_hbm_start + seq_idx * block_table_stride # no-paging expt
-    j_hbm, physical_block_idx = pgm.load_physical_block_idx(
-        j_hbm, block_tables_ptr_shifted, j_hbm_start
-    )
-    j_hbm, next_physical_block_idx = pgm.load_physical_block_idx_safe(
-        j_hbm, block_tables_ptr_shifted, j_hbm_start, max_num_tiles_this_seg
-    )
+    if KV_LOC:
+        loop_start = 0
+        loop_end = n_loc
+        safe_end = (context_len + q_block_local_idx * cfg.BLOCK_Q + 1) // cfg.TILE_SIZE
+        physical_block_idx = _kvloc_blk(
+            block_tables_ptr_shifted, 0, n_loc, k_first, KV_LOC_C, kv_loc_x_ptr, KV_LOC_RESOLVED
+        )
+        next_physical_block_idx = _kvloc_blk(
+            block_tables_ptr_shifted, 1, n_loc, k_first, KV_LOC_C, kv_loc_x_ptr, KV_LOC_RESOLVED
+        )
+    else:
+        loop_start = pgm.tile_start
+        loop_end = pgm.tile_end
+        safe_end = pgm.safe_tile_end
+        j_hbm, physical_block_idx = pgm.load_physical_block_idx(
+            j_hbm, block_tables_ptr_shifted, j_hbm_start
+        )
+        j_hbm, next_physical_block_idx = pgm.load_physical_block_idx_safe(
+            j_hbm, block_tables_ptr_shifted, j_hbm_start, max_num_tiles_this_seg
+        )
     pgm.tdm_load_global_to_shared_k(physical_block_idx, buffer_id=buffer_id)
     pgm.tdm_load_global_to_shared_v(physical_block_idx, buffer_id=buffer_id)
 
@@ -2460,12 +2623,19 @@ def _unified_attention_gluon_kernel_3d(
     # Tiles below safe_tile_end hold only keys that every row of the query block may see; the causal mask runs only
     # from safe_tile_end on (at most the sequence's last one or two tiles), behind a branch. The last iteration's
     # prefetch is the clamped (valid) last block again; it is drained after the loop.
-    for j in range(pgm.tile_start, pgm.tile_end):
+    for j_it in range(loop_start, loop_end):
         # physical_block_idx = physical_block_idx + 1 # no-paging expt
         physical_block_idx = next_physical_block_idx
-        j_hbm, next_physical_block_idx = pgm.load_physical_block_idx_safe(
-            j_hbm, block_tables_ptr_shifted, j_hbm_start, max_num_tiles_this_seg
-        )
+        if KV_LOC:
+            j = _kvloc_tile(j_it, k_first, KV_LOC_C)
+            next_physical_block_idx = _kvloc_blk(
+                block_tables_ptr_shifted, j_it + 2, n_loc, k_first, KV_LOC_C, kv_loc_x_ptr, KV_LOC_RESOLVED
+            )
+        else:
+            j = j_it
+            j_hbm, next_physical_block_idx = pgm.load_physical_block_idx_safe(
+                j_hbm, block_tables_ptr_shifted, j_hbm_start, max_num_tiles_this_seg
+            )
         if KV_CACHE_DTYPE == "nvfp4":
             k = pgm.tdm_shared_load_k(wait_count=K_OPS - 1 + V_OPS, buffer_id=buffer_id)
             k_scales = pgm.tdm_shared_load_k_scales(
@@ -2482,12 +2652,12 @@ def _unified_attention_gluon_kernel_3d(
         if cfg.USE_SOFTCAP:
             S = S * qk_factor
             S = pgm.apply_softcap(S)
-            if j >= pgm.safe_tile_end:
+            if j >= safe_end:
                 S = pgm.apply_causal_mask_tile(S, j)
         else:
             # Mask the raw QK, before the scale (qk_factor > 0 keeps -inf): the scale and the softmax shift then
             # stay one FMA on the unmasked tiles, as in a branch-free loop body.
-            if j >= pgm.safe_tile_end:
+            if j >= safe_end:
                 S = pgm.apply_causal_mask_tile(S, j)
             S = S * qk_factor
         if need_addtional_mask:
