@@ -635,3 +635,73 @@ def test_tensor_and_expert_parallel_together_refused():
     emap = torch.arange(32, dtype=torch.int32, device="cuda")
     with pytest.raises(ValueError, match="not both"):
         _run(p, expert_map=emap, leaf_reduce=lambda t: t, chunk_gather=lambda t: t)
+
+
+def _ep_inputs(T, seed, n=N, el=8, eg=32):
+    """Inputs of one EP rank: el local experts at scattered global ids of eg."""
+    p = generate_moe_mxfp4_bi_inputs(T, el, seed=seed, n=n)
+    g = torch.Generator(device="cuda").manual_seed(seed)
+    ids = torch.argsort(
+        torch.rand((T, eg), dtype=torch.float32, device="cuda", generator=g), dim=1
+    )[:, :TOP_K]
+    emap = torch.full((eg,), -1, dtype=torch.int32, device="cuda")
+    loc = torch.randperm(eg, device="cuda", generator=g)[:el]
+    emap[loc] = torch.arange(el, dtype=torch.int32, device="cuda")
+    return p[:-1] + (ids,), emap
+
+
+def _logged(calls):
+    return lambda t: calls.append(t.clone()) or t
+
+
+@pytest.mark.parametrize("T", [1, 64, 1500])
+def test_strided_expert_map_same_bits(T):
+    """A strided expert_map view gives the bits and leaves of a contiguous one."""
+    p, emap = _ep_inputs(T, seed=T)
+    ref_calls, calls = [], []
+    ref = _run(p, expert_map=emap, leaf_reduce=_logged(ref_calls))
+    buf = torch.zeros(2 * emap.numel(), dtype=emap.dtype, device="cuda")
+    buf[::2] = emap
+    out = _run(p, expert_map=buf[::2], leaf_reduce=_logged(calls))
+    assert torch.equal(out, ref)
+    assert len(calls) == len(ref_calls)
+    assert all(torch.equal(a, b) for a, b in zip(calls, ref_calls))
+
+
+def _strided_copy(t):
+    buf = torch.full(
+        t.shape[:-1] + (2 * t.shape[-1],), float("nan"), dtype=t.dtype, device=t.device
+    )
+    buf[..., ::2] = t
+    return buf[..., ::2]
+
+
+@pytest.mark.parametrize("n", [512, 1024])
+@pytest.mark.parametrize("T", [0, 64, 1500])
+def test_strided_leaf_reduce_result_same_bits(T, n):
+    """A strided leaf_reduce result gives the bits of a contiguous one."""
+    p, emap = _ep_inputs(T, seed=T + 1, n=n)
+    ref = _run(p, expert_map=emap, leaf_reduce=lambda t: t)
+    assert torch.equal(_run(p, expert_map=emap, leaf_reduce=_strided_copy), ref)
+
+
+@pytest.mark.parametrize("ep", [False, True])
+def test_cuda_default_device_graph_capture(ep):
+    """The forward runs and captures in a CUDA graph under a CUDA default device."""
+    if ep:
+        p, emap = _ep_inputs(64, seed=21)
+        kw = {"expert_map": emap, "leaf_reduce": lambda t: t}
+    else:
+        p, kw = generate_moe_mxfp4_bi_inputs(64, 32, seed=21), {}
+    ref = _run(p, **kw)
+    with torch.device("cuda"):
+        assert torch.equal(_run(p, **kw), ref)
+        stream = torch.cuda.Stream()
+        stream.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(stream):
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph):
+                out = _run(p, **kw)
+            graph.replay()
+    torch.cuda.synchronize()
+    assert torch.equal(out, ref)

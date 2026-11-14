@@ -146,7 +146,7 @@ def _route_fused(topk_ids, expert_map, n_experts, block_m):
 
 
 def _f32(v: float) -> float:
-    return float(torch.tensor(v, dtype=torch.float32))
+    return float(torch.tensor(v, dtype=torch.float32, device="cpu"))
 
 
 def _tree8_rows(P, nrows, dtype=torch.float32):
@@ -346,7 +346,7 @@ def _tree16_blocks(slots, topk_ids, leaf_reduce, leaf_block, planes=None):
         leaf_reduce(slots)
     for i in range(0, T, leaf_block):
         j = min(T, i + leaf_block)
-        red = leaf_reduce(slots[i * TOP_K : j * TOP_K])
+        red = leaf_reduce(slots[i * TOP_K : j * TOP_K]).contiguous()
         # the plane kernel with one plane of all H columns
         _moe_mxfp4_bi_tree16_plane_gluon_kernel[(j - i, triton.cdiv(H, c["BH"]))](
             red,
@@ -713,6 +713,8 @@ def moe_mxfp4_bi_forward(
                 "parallelism and H % ws == 0"
             )
     x = x.contiguous()
+    if expert_map is not None:
+        expert_map = expert_map.contiguous()  # the route reads it unstrided
     # Collectives run per collective block; without them the GEMM block is larger.
     c = _config("block_m")
     leaf_block = token_block or TOKEN_BLOCK_COLLECTIVE
