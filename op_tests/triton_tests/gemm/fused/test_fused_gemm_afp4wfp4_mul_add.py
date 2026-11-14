@@ -61,8 +61,13 @@ def test_fused_gemm_afp4wfp4_mul_add(
     b_type_is_scalar,
     fuse_type,
 ):
-    if not (arch_info.is_fp4_avail()):
+    if not arch_info.is_any_fp4_avail():
         pytest.skip("MXFP4 not supported on this architecture")
+
+    # Mirrors the arch gate in fused_gemm_afp4wfp4_preshuffle_add_mul(): archs with
+    # software-emulated FP4 run only the unshuffled path.
+    if arch_info.is_sw_emulated_fp4_avail() and shuffle_weight_scales:
+        pytest.skip(f"Only the unshuffled path is supported on {arch_info.get_arch()}.")
 
     if shuffle_weight_scales:
         if N % 32 > 0:
