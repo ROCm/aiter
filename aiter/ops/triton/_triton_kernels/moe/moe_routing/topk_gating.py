@@ -170,6 +170,8 @@ def _sqrtsoftplus_384_topk(
     compare, wave 0 first. So the ids, the tie order and the renorm sum order
     are the same as there.
     """
+    tl.static_assert(EPT == 3 or EPT == 6, "EPT must be 3 or 6")
+    tl.static_assert(WAVES * LANES * EPT == 384, "the lanes must hold 384 experts")
     C: tl.constexpr = WAVES * LANES
     row = tl.program_id(0)
     row_ptr = logits_ptr + row * stride_logits
@@ -225,9 +227,8 @@ def _sqrtsoftplus_384_topk(
         wave_cursor = tl.reshape(cursor, [WAVES, LANES])
         best = tl.max(head_v, axis=1)
         tied = head_v == best[:, None]
+        # NaN choices are -inf, so some lane always ties best.
         win_lane = tl.min(tl.where(tied, lane[None, :], LANES), axis=1)
-        # When no lane matches the best value, the HIP argmax keeps lane 0.
-        win_lane = tl.where(win_lane == LANES, 0, win_lane)
         idx = tl.sum(tl.where(lane[None, :] == win_lane[:, None], head_i, 0), axis=1)
         won = (wave_cursor < EPT) & (head_i == idx[:, None])
         # The weight comes from the lane that holds expert idx.
@@ -255,7 +256,7 @@ def _sqrtsoftplus_384_topk(
             head_w = tl.sum(tl.where(at_pos, wave_w, 0.0), axis=1)
             head_i = tl.sum(tl.where(at_pos, wave_i, 0), axis=1)
             best_v = tl.sum(tl.where(waves == 0, head_v, 0.0), axis=0)
-            best_wave = tl.sum(tl.zeros([WAVES], dtype=tl.int32), axis=0)
+            best_wave = 0
             for w in tl.static_range(1, WAVES):
                 v = tl.sum(tl.where(waves == w, head_v, 0.0), axis=0)
                 up = v > best_v

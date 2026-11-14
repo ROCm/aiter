@@ -107,17 +107,6 @@ def _gfx1250_exact_sigmoid_topk(
     )
 
 
-# 384-expert sqrtsoftplus rows that the Triton kernel takes, for each arch:
-# (most rows, only under CUDA graph capture). On gfx1250 the HIP kernel that
-# it follows runs up to 1024 rows. On gfx950 that HIP kernel runs for all row
-# counts, but it is faster above 2048 rows and in eager calls.
-_SQRTSOFTPLUS_384_ROWS = {
-    "gfx950": (2048, True),
-    "gfx1250": (1024, False),
-    "gfx1250-strict": (1024, False),
-}
-
-
 def _can_use_sqrtsoftplus_384_topk(
     topk_weights: torch.Tensor,
     topk_indices: torch.Tensor,
@@ -134,14 +123,15 @@ def _can_use_sqrtsoftplus_384_topk(
         or gating_output.shape[1] != 384
     ):
         return False
-    rows_limit = _SQRTSOFTPLUS_384_ROWS.get(get_gfx_runtime())
-    if rows_limit is None:
+    from .triton.moe.moe_routing.topk_gating import SQRTSOFTPLUS_384_ARCHS
+
+    arch = SQRTSOFTPLUS_384_ARCHS.get(get_gfx_runtime())
+    if arch is None:
         return False
-    max_rows, graph_only = rows_limit
     rows = gating_output.shape[0]
-    if not 1 <= rows <= max_rows:
+    if not 1 <= rows <= arch.max_rows:
         return False
-    if graph_only and not torch.cuda.is_current_stream_capturing():
+    if arch.graph_only and not torch.cuda.is_current_stream_capturing():
         return False
     if topk_indices.ndim != 2 or not 1 <= topk_indices.shape[1] <= 8:
         return False

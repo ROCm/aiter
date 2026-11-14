@@ -521,8 +521,9 @@ def bench_topk_softplus(
 
 @benchmark()
 def bench_sqrtsoftplus_384(num_tokens, topk, route_scale=1.5):
-    """Compare the Triton 384-expert sqrtsoftplus top-k with the HIP kernel,
-    both in a CUDA graph. The Triton result must be bit-identical."""
+    """Compare the Triton 384-expert sqrtsoftplus top-k with the HIP kernel.
+    The bit check runs eagerly: the Triton result must be bit-identical. The
+    CUDA graph is used only to time the two kernels."""
     from aiter.ops.topk import topk_gating_fwd
     from aiter.ops.triton.moe.moe_routing.topk_gating import sqrtsoftplus_384_topk
 
@@ -1165,16 +1166,16 @@ def main():
     # -- 384-expert sqrtsoftplus: Triton versus HIP ------------------------
     if "softplus-384" in sections:
         from aiter.ops.triton.moe.moe_routing.topk_gating import (
-            SQRTSOFTPLUS_384_LAYOUTS,
+            SQRTSOFTPLUS_384_ARCHS,
         )
 
         gfx = get_gfx_runtime()
-        if gfx not in SQRTSOFTPLUS_384_LAYOUTS:
+        if gfx not in SQRTSOFTPLUS_384_ARCHS:
             raise ValueError(
-                f"softplus-384 requires one of {sorted(SQRTSOFTPLUS_384_LAYOUTS)}"
+                f"softplus-384 requires one of {sorted(SQRTSOFTPLUS_384_ARCHS)}"
             )
-        # On gfx1250 the HIP kernel uses this layout only up to 1024 rows.
-        max_rows = 1024 if gfx.startswith("gfx1250") else max(num_tokens_list)
+        # The rows that topk_gating sends to the Triton kernel on this arch.
+        max_rows = SQRTSOFTPLUS_384_ARCHS[gfx].max_rows
         configs = list(
             itertools.product(
                 [t for t in num_tokens_list if t <= max_rows],

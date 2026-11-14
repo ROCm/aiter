@@ -3,27 +3,32 @@
 
 """The Triton 384-expert sqrtsoftplus top-k against the HIP topk_gating kernel."""
 
+import os
+import subprocess
+import sys
+import textwrap
+
 import pytest
 import torch
 
+from aiter.jit.utils.chip_info import get_gfx_runtime
 from aiter.ops import topk as topk_ops
 from aiter.ops.triton.moe.moe_routing.topk_gating import (
+    SQRTSOFTPLUS_384_ARCHS,
     SQRTSOFTPLUS_384_EXPERTS,
-    SQRTSOFTPLUS_384_LAYOUTS,
     sqrtsoftplus_384_topk,
 )
-from aiter.ops.triton.utils._triton.arch_info import get_arch
 
 
 def _arch() -> str | None:
     if not torch.cuda.is_available() or torch.version.hip is None:
         return None
-    return get_arch()
+    return get_gfx_runtime()
 
 
 pytestmark = pytest.mark.skipif(
-    _arch() not in SQRTSOFTPLUS_384_LAYOUTS,
-    reason="requires an arch in SQRTSOFTPLUS_384_LAYOUTS",
+    _arch() not in SQRTSOFTPLUS_384_ARCHS,
+    reason="requires an arch in SQRTSOFTPLUS_384_ARCHS",
 )
 
 EXPERTS = SQRTSOFTPLUS_384_EXPERTS
@@ -31,7 +36,7 @@ SCALE = 1.5
 
 
 def _max_rows() -> int:
-    return topk_ops._SQRTSOFTPLUS_384_ROWS[_arch()][0]
+    return SQRTSOFTPLUS_384_ARCHS[_arch()].max_rows
 
 
 def _hip(logits, bias, topk, num_valid_rows):
@@ -121,24 +126,21 @@ def test_sqrtsoftplus_384_topk_strided_logits():
 
 
 @pytest.mark.parametrize(
-    "count",
-    [
-        torch.empty(0, dtype=torch.int32),
-        torch.tensor([4], dtype=torch.int64),
-    ],
-    ids=["empty", "int64"],
+    "numel, dtype", [(0, torch.int32), (1, torch.int64)], ids=["empty", "int64"]
 )
-def test_sqrtsoftplus_384_topk_rejects_a_bad_row_count(count):
+def test_sqrtsoftplus_384_topk_rejects_a_bad_row_count(numel, dtype):
     logits = torch.randn((8, EXPERTS), dtype=torch.bfloat16, device="cuda")
+    count = torch.full((numel,), 4, dtype=dtype, device="cuda")
     with pytest.raises(ValueError, match="num_valid_rows"):
-        _triton(logits, None, 6, count.cuda())
+        _triton(logits, None, 6, count)
 
 
 @pytest.mark.parametrize("capturing", [False, True])
 def test_topk_gating_dispatch(monkeypatch, capturing):
     monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: capturing)
-    max_rows, graph_only = topk_ops._SQRTSOFTPLUS_384_ROWS[_arch()]
-    taken = capturing or not graph_only
+    arch = SQRTSOFTPLUS_384_ARCHS[_arch()]
+    max_rows = arch.max_rows
+    taken = capturing or not arch.graph_only
     bias = torch.zeros(EXPERTS, dtype=torch.float32, device="cuda")
     for rows, expected in ((1, taken), (max_rows, taken), (max_rows + 1, False)):
         logits = torch.empty((rows, EXPERTS), dtype=torch.bfloat16, device="cuda")
@@ -180,7 +182,7 @@ def test_topk_gating_graph_replay_with_a_changing_row_count(monkeypatch):
     side = torch.cuda.Stream()
     side.wait_stream(torch.cuda.current_stream())
     with torch.cuda.stream(side):
-        # Compile the kernel before capture; eager topk_gating may run HIP.
+        # Compile the kernel before capture: eager topk_gating runs HIP.
         _triton(logits, bias, topk, num_valid_rows)
         route()
     torch.cuda.current_stream().wait_stream(side)
@@ -194,3 +196,87 @@ def test_topk_gating_graph_replay_with_a_changing_row_count(monkeypatch):
         weights.fill_(-7.0)
         graph.replay()
         _assert_bitwise((weights, ids), _hip(logits, bias, topk, num_valid_rows), count)
+
+
+_FIRST_LAUNCH_UNDER_CAPTURE = textwrap.dedent("""
+    import os
+
+    import torch
+
+    from aiter.ops import topk as topk_ops
+
+    def compiled():
+        return any(
+            name.startswith("_sqrtsoftplus_384_topk")
+            for _, _, names in os.walk(os.environ["TRITON_CACHE_DIR"])
+            for name in names
+        )
+
+    rows, topk, scale = 96, 6, 1.5
+    gen = torch.Generator(device="cuda").manual_seed(5)
+    logits = (
+        torch.randn((rows, 384), generator=gen, dtype=torch.float32, device="cuda")
+        * 4
+    ).to(torch.bfloat16)
+    bias = torch.linspace(-1, 1, 384, dtype=torch.float32, device="cuda")
+    num_valid_rows = torch.tensor([rows], dtype=torch.int32, device="cuda")
+    weights = torch.empty((rows, topk), dtype=torch.float32, device="cuda")
+    ids = torch.empty((rows, topk), dtype=torch.int32, device="cuda")
+
+    def route():
+        topk_ops.topk_gating(
+            weights,
+            ids,
+            logits,
+            bias,
+            True,
+            scale,
+            "sqrtsoftplus",
+            num_valid_rows=num_valid_rows,
+        )
+
+    # Eager calls, as in a server before capture: they run HIP and give the
+    # reference for each row count.
+    counts = (rows, 40, 0)
+    refs = []
+    for count in counts:
+        num_valid_rows.fill_(count)
+        route()
+        refs.append((weights.clone(), ids.clone()))
+    torch.cuda.synchronize()
+    assert not compiled(), "an eager call compiled the Triton kernel"
+
+    def no_hip(*args, **kwargs):
+        raise AssertionError("topk_gating ran the HIP kernel under capture")
+
+    topk_ops.topk_gating_fwd = no_hip
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        route()
+    assert compiled(), "the capture did not compile the Triton kernel"
+
+    for count, (ref_weights, ref_ids) in zip(counts, refs):
+        num_valid_rows.fill_(count)
+        weights.fill_(-7.0)
+        ids.fill_(-7)
+        graph.replay()
+        torch.cuda.synchronize()
+        assert torch.equal(ids, ref_ids), count
+        assert torch.equal(weights.view(torch.int32), ref_weights.view(torch.int32))
+    """)
+
+
+def test_topk_gating_first_triton_launch_under_capture(tmp_path):
+    """Eager topk_gating runs HIP, so in a server the first compile and module
+    load of the Triton kernel happen inside graph capture. Run that in a new
+    process with an empty Triton cache and check the replays against HIP."""
+    env = dict(os.environ, TRITON_CACHE_DIR=str(tmp_path))
+    result = subprocess.run(
+        [sys.executable, "-c", _FIRST_LAUNCH_UNDER_CAPTURE],
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=900,
+        check=False,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
