@@ -264,6 +264,48 @@ def test_paged_attn(
     torch.testing.assert_close(triton_output, torch_output, rtol=1e-02, atol=1e-02)
 
 
+@pytest.mark.parametrize("SEQ_LEN", [1, 57, 1000, 4096, 20000])
+@pytest.mark.parametrize("KV_BLK_SZ", [16, 128])
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+def test_paged_attn_tensor_desc(dtype, KV_BLK_SZ, SEQ_LEN, monkeypatch):
+    """The tensor-descriptor page loads of the GQA kernels give the pointer-load result."""
+    if get_arch() != "gfx1250":
+        pytest.skip("Tensor descriptors are only available on gfx1250")
+    B, H_Q, H_KV, head_size = 4, 32, 8, 128
+    num_blocks = B * triton.cdiv(SEQ_LEN, KV_BLK_SZ)
+    query, output, _, _, key_cache, value_cache, lens, tables, max_len = input_helper(
+        B, H_Q, H_KV, head_size, KV_BLK_SZ, SEQ_LEN, dtype, dtype, dtype, num_blocks
+    )
+    compute_type = {torch.bfloat16: tl.bfloat16, torch.float16: tl.float16}[dtype]
+    # The TDM kernel would bypass the Triton ones, so turn dispatch off.
+    monkeypatch.setattr(pa_decode_mod, "_get_dispatch_config", lambda _dtype: None)
+    get_launch = pa_decode_mod._get_launch_config
+    used = []
+
+    def run(use_tensor_desc):
+        used.clear()
+        out = torch.zeros_like(output)
+
+        # Set the flag explicitly: the shipped gfx1250 config already enables it for page 128.
+        def launch(kernel, blk_sz):
+            used.append(kernel)
+            cfg = get_launch(kernel, blk_sz) or {}
+            return {**cfg, "USE_TENSOR_DESC": use_tensor_desc}
+
+        monkeypatch.setattr(pa_decode_mod, "_get_launch_config", launch)
+        paged_attention_decode(
+            out, query, key_cache, value_cache, lens, tables, head_size**-0.5,
+            max_len, compute_type,
+            k_scale=torch.ones(1, device="cuda"), v_scale=torch.ones(1, device="cuda"),
+        )  # fmt: skip
+        return out
+
+    expected = run(False)
+    actual = run(True)
+    assert any(k.endswith("w_dot") for k in used), used
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+
 # test_paged_attn stops at SEQ_LEN=1024, a single 1024-token partition, so it
 # only ever reaches the V1 kernels. SEQ_LEN=4096 spans four partitions, which
 # dispatches to the V2 (partitioned + reduce) kernels; the spy fails the test
@@ -563,6 +605,37 @@ def test_pa_decode_config_is_valid(arch, cu_num):
         for key, entry in table.items():
             assert key == "any" or key.startswith("BLK_LEQ_")
             assert entry.get("num_stages", 1) <= _MAX_NUM_STAGES
+
+
+@pytest.mark.parametrize(
+    "arch, cu_num",
+    [(arch, None) for arch in _ARCHS] + [("gfx1250", 96)],
+)
+def test_tensor_desc_is_only_set_on_w_dot_launch(arch, cu_num):
+    for kernel, table in _config(arch, cu_num=cu_num)["launch"].items():
+        for entry in table.values():
+            assert "USE_TENSOR_DESC" not in entry or kernel.endswith("w_dot")
+
+
+def test_checked_launch_drops_tensor_desc_when_misaligned():
+    launch = {"num_warps": 2, "USE_TENSOR_DESC": True}
+    off = {"num_warps": 2, "USE_TENSOR_DESC": False}
+
+    def empty(shape, dtype=torch.float16):
+        return torch.empty(shape, dtype=dtype, device="cuda")
+
+    cache = empty((4, 8, 16, 128))
+    assert pa_decode_mod._checked_launch(launch, cache, cache) is launch
+    # A view that starts one element in has a 2-byte aligned base.
+    odd = empty(cache.numel() + 1)[1:].view_as(cache)
+    assert pa_decode_mod._checked_launch(launch, odd, odd) == off
+    # Strides that are not a multiple of 16 bytes.
+    padded = empty((4, 8, 16, 129))[..., :128]
+    assert pa_decode_mod._checked_launch(launch, padded, padded) == off
+    # The same stride is a 16-byte fp16 K row but an 8-byte fp8 V row.
+    k, v = empty((4, 8, 16, 8)), empty((4, 8, 16, 8), torch.float8_e4m3fn)
+    assert pa_decode_mod._checked_launch(launch, k, k) is launch
+    assert pa_decode_mod._checked_launch(launch, k, v) == off
 
 
 def test_missing_config_gives_none(tmp_path, monkeypatch):
