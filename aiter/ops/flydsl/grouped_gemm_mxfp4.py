@@ -178,6 +178,7 @@ def flydsl_grouped_gemm_a8w4_masked(
 
     from .kernels.mxfp4_preshuffle_gfx1250_tdm import (
         SUPPORT_EXPLICIT_VGPR_PARTITION,
+        _supports_m288_persistent_cluster,
         get_gemm_a8w4_tdm_register_launcher,
         is_explicit_vgpr_partition_available,
         launch_gemm_a8w4_tdm,
@@ -218,15 +219,25 @@ def flydsl_grouped_gemm_a8w4_masked(
     )
     if persistent_workers < 0:
         raise ValueError("persistent_workers must be nonnegative")
+    persistent_m288_prefill = False
     if persistent_workers:
-        if cluster_m != 1:
-            raise ValueError("persistent workers require cluster_m=1")
+        persistent_m288_prefill = _supports_m288_persistent_cluster(
+            tile_m, tile_n, tile_k, m_warp, n_warp, num_buffers,
+            a_is_fp4, a_preshuffled, stage1_act, stage1_quant_out,
+            cluster_n, cluster_m,
+            SUPPORT_EXPLICIT_VGPR_PARTITION and is_explicit_vgpr_partition_available(),
+        )
+        if cluster_m != 1 and not persistent_m288_prefill:
+            raise ValueError(
+                "clustered persistent workers require pinned M256/M288 A4W4 prefill"
+            )
         if stage2_scatter is not None and stage2_scatter.combine_quant_bits:
             raise ValueError(
                 "persistent EP scatter requires an unquantized combine wire"
             )
+        cluster_size = cluster_n * cluster_m
         persistent_workers = (
-            (persistent_workers + cluster_n - 1) // cluster_n * cluster_n
+            (persistent_workers + cluster_size - 1) // cluster_size * cluster_size
         )
     waves_per_tensor_tdm = _select_num_waves_per_tensor_tdm(waves_per_tensor_tdm)
     rolled_drain = int(rolled_drain)
@@ -339,6 +350,7 @@ def flydsl_grouped_gemm_a8w4_masked(
         float(situ_linear_beta),
         *layout_spec,
         explicit_vgpr_partition,
+        int(N) if persistent_m288_prefill else 0,
         specialization_key=(
             gemm_spec,
             route_spec,
@@ -347,6 +359,7 @@ def flydsl_grouped_gemm_a8w4_masked(
             ep_spec,
             layout_spec,
             explicit_vgpr_partition,
+            int(N) if persistent_m288_prefill else 0,
         ),
     )
     return out

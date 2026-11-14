@@ -1758,8 +1758,8 @@ def grouped_gemm_gfx1250_a8w4(
                 _tdm_kw["a_preshuffle"] = _ov_apre
 
         _ov_m = _tdm_env("AITER_TDM_TILE_M")
-        # M288's validated A4W4 prefill path uses packed A.
-        if is_grouped_a4w4 and _ov_m == 288 and _ov_apre is None:
+        # The tuned M256/M288 A4W4 prefill paths use packed A.
+        if is_grouped_a4w4 and _ov_m in (256, 288) and _ov_apre is None:
             _tdm_kw["a_preshuffle"] = 1
         _ov_n = _tdm_env("AITER_TDM_TILE_N")
         _ov_k = _tdm_env("AITER_TDM_TILE_K")
