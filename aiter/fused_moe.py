@@ -5015,7 +5015,9 @@ def get_2stage_cfgs(
             f"activation {activation}; using default heuristics"
         )
 
-    # Runtime SiLU clamping is supported only by the non-split CK stage-1 epilogue.
+    # Runtime SiLU clamping runs only in CK stage 1: in the non-split epilogue, or
+    # in silu_and_mul after a split-K reduction (ck_moe_stage1). Tuned rows are
+    # kept only for non-split CK SiLU kernels.
     clamp_per_1x128 = (
         bool(swiglu_limit)
         and q_type == QuantType.per_1x128
@@ -5213,11 +5215,6 @@ def get_2stage_cfgs(
         and kernelName1.startswith("flydsl_moe1_")
     ):
         kernelName2 = kernelName2.replace("_afp4_", "_afp8_", 1)
-
-    if clamp_per_1x128:
-        # Deliberately override tuned, heuristic and AITER_KSPLIT selections.
-        ksplit = 0
-        run_1stage = False
 
     reroute_a16wmix_bf16 = _can_reroute_bf16_to_a16wmix(
         gfx=gfx,
@@ -6440,6 +6437,14 @@ def torch_moe_act(act_input, torch_act, inter_dim, activation=None):
         return torch_act(gate) * up
 
 
+def _silu_and_mul_limit(swiglu_limit):
+    # silu_and_mul takes a float32 limit, 0.0 = no clamp. Keep a positive limit
+    # from narrowing to 0 or inf, like the CK launcher does.
+    if not swiglu_limit:
+        return 0.0
+    return min(max(swiglu_limit, 2.0**-149), torch.finfo(dtypes.fp32).max)
+
+
 def asm_stage1(
     input,
     w1,
@@ -6506,14 +6511,9 @@ def asm_stage1(
     )
     if ksplit > 0:
         if activation == ActivationType.Silu:
-            # silu_and_mul takes a float32 limit. Keep a positive limit from
-            # narrowing to 0 (no clamp) or inf, like the CK launcher does.
-            limit = (
-                min(max(swiglu_limit, 2.0**-149), torch.finfo(dtypes.fp32).max)
-                if swiglu_limit
-                else 0.0
+            aiter.silu_and_mul(
+                out, tmp_out.view(dtypes.fp32), _silu_and_mul_limit(swiglu_limit)
             )
-            aiter.silu_and_mul(out, tmp_out.view(dtypes.fp32), limit)
         elif activation == ActivationType.Swiglu:
             aiter.swiglu_and_mul(out, tmp_out.view(dtypes.fp32))
         elif activation == ActivationType.Gelu:
@@ -6934,11 +6934,16 @@ def ck_moe_stage1(
                     "only FP8 per_1x128 has a clamped CK SiLU epilogue "
                     "(clamp before SiLU)."
                 )
-            if kernelName and ("Splitk" in kernelName or "_silu_" not in kernelName):
-                raise ValueError(
-                    "Runtime SiLU clamp requires a non-split CK SiLU kernel"
-                )
-            splitk = 0
+            # Split-K writes raw fp32 gate|up, clamped by silu_and_mul after the
+            # reduction below; any other launch clamps in the CK epilogue.
+            if splitk <= 1 or (kernelName and "Splitk" not in kernelName):
+                if kernelName and (
+                    "Splitk" in kernelName or "_silu_" not in kernelName
+                ):
+                    raise ValueError(
+                        "Runtime SiLU clamp requires a non-split CK SiLU kernel"
+                    )
+                splitk = 0
     token_num = hidden_states.shape[0]
     is_splitk = quant_type == QuantType.per_1x128 and splitk > 1
     if is_splitk:
@@ -6968,12 +6973,14 @@ def ck_moe_stage1(
         splitk if is_splitk else 0,
         use_non_temporal_load,
         out.dtype,
-        limit,
+        None if is_splitk else limit,
     )
     if is_splitk:
         valid_out = tmp_out[: token_num * topk, :]
         if activation == ActivationType.Silu:
-            aiter.silu_and_mul(out, valid_out.view(dtypes.fp32))
+            aiter.silu_and_mul(
+                out, valid_out.view(dtypes.fp32), _silu_and_mul_limit(limit)
+            )
         elif activation == ActivationType.Gelu:
             aiter.gelu_and_mul(out, valid_out.view(dtypes.fp32))
         else:

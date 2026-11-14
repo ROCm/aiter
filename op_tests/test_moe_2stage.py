@@ -3,6 +3,7 @@
 
 import argparse
 import gc
+import inspect
 import itertools
 import logging
 import os
@@ -2535,8 +2536,8 @@ def _quant_blockscale_weight(w):
 
 
 @benchmark()
-def test_blockscale_swiglu_limit(token, swiglu_limit):
-    model_dim, inter_dim, experts, topk = 256, 256, 8, 2
+def test_blockscale_swiglu_limit(token, swiglu_limit, model_dim=256):
+    inter_dim, experts, topk = 256, 8, 2
     torch.manual_seed(token)
     x = torch.randn(token, model_dim, dtype=dtypes.bf16)
     w1, s1 = _quant_blockscale_weight(
@@ -2599,19 +2600,43 @@ def test_blockscale_swiglu_limit(token, swiglu_limit):
     w1_sh = shuffle_weight(w1, layout=(16, 16))
     w2_sh = shuffle_weight(w2, layout=(16, 16))
     out = torch.empty(token, model_dim, dtype=dtypes.bf16)
-    actual = fused_moe(
-        x,
-        w1_sh,
-        w2_sh,
-        weights,
-        ids,
-        w1_scale=s1,
-        w2_scale=s2,
-        quant_type=aiter.QuantType.per_128x128,
-        activation=aiter.ActivationType.Silu,
-        swiglu_limit=swiglu_limit,
-        output=out,
-    )
+    stage1_fwd, silu_and_mul = aiter.ck_moe_stage1_fwd, aiter.silu_and_mul
+    stage1_sig = inspect.signature(stage1_fwd)
+    launches, act_limits = [], []
+
+    def spy_stage1_fwd(*args, **kwargs):
+        bound = stage1_sig.bind(*args, **kwargs)
+        bound.apply_defaults()
+        launches.append((bound.arguments["splitk"], bound.arguments["swiglu_limit"]))
+        return stage1_fwd(*args, **kwargs)
+
+    def spy_silu_and_mul(dst, src, limit=0.0):
+        act_limits.append(limit)
+        return silu_and_mul(dst, src, limit)
+
+    aiter.ck_moe_stage1_fwd, aiter.silu_and_mul = spy_stage1_fwd, spy_silu_and_mul
+    try:
+        actual = fused_moe(
+            x,
+            w1_sh,
+            w2_sh,
+            weights,
+            ids,
+            w1_scale=s1,
+            w2_scale=s2,
+            quant_type=aiter.QuantType.per_128x128,
+            activation=aiter.ActivationType.Silu,
+            swiglu_limit=swiglu_limit,
+            output=out,
+        )
+    finally:
+        aiter.ck_moe_stage1_fwd, aiter.silu_and_mul = stage1_fwd, silu_and_mul
+    if swiglu_limit is not None and model_dim == 1024:
+        # The heuristic splits K=1024 at one token: the split-K launch runs
+        # unclamped and silu_and_mul clamps after the reduction.
+        assert len(launches) == 1 and launches[0][0] > 1, launches
+        assert launches[0][1] is None, launches
+        assert act_limits == [swiglu_limit], act_limits
     msg = f"blockscale limit={swiglu_limit}"
     err = checkAllclose(ref.float(), actual.float(), rtol=0.05, atol=0.05, msg=msg)
     logits_diff = logits_difference(ref, actual)
@@ -2652,6 +2677,9 @@ def run_blockscale_limit_cases():
         # Without a limit, token > 32 takes the untuned ASM 1-stage default,
         # which picks a flat kernel for sorted inputs at model_dim 256 on gfx942.
         if limit is not None or token <= 32
+    ] + [
+        test_blockscale_swiglu_limit(1, limit, model_dim=1024)
+        for limit in (1.0, 7.0, None)
     ]
     aiter.logger.info(
         "blockscale SiLU limit summary (markdown):\n%s",
