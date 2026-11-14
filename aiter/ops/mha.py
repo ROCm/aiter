@@ -2154,7 +2154,9 @@ def fmha_v3_varlen_bwd(
 
 
 def maybe_contiguous(x):
-    return x.contiguous() if x is not None and x.stride(-1) != 1 else x
+    if x is not None and (x.stride(-1) != 1 or 0 in x.stride()):
+        return x.clone(memory_format=torch.contiguous_format)
+    return x
 
 
 def _native_splitkv_heuristic(batch, nhead_q, seqlen_q, seqlen_k, num_cu):
