@@ -1,0 +1,17 @@
+{
+    "M_LEQ_1": {
+        "BLOCK_V": 1024,
+        "num_warps": 4,
+        "num_warps_pick": 4
+    },
+    "M_LEQ_64": {
+        "BLOCK_V": 2048,
+        "num_warps": 4,
+        "num_warps_pick": 1
+    },
+    "any": {
+        "BLOCK_V": 2048,
+        "num_warps": 2,
+        "num_warps_pick": 1
+    }
+}
