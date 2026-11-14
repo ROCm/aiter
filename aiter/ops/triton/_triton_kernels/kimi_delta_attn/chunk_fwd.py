@@ -19,6 +19,7 @@ from aiter.ops.triton._triton_kernels.gated_delta_net.prefill.chunk_delta_h impo
     chunk_gated_delta_rule_fwd_h,
 )
 from aiter.ops.triton._triton_kernels.kimi_delta_attn.chunk_delta_attn_utils import (
+    CHUNK_DELTA_ATTN_TRITON_AUTOTUNE,
     RCP_LN2,
 )
 from aiter.ops.triton._triton_kernels.kimi_delta_attn.flash_kda import (
@@ -41,10 +42,14 @@ from aiter.ops.triton._triton_kernels.kimi_delta_attn.utils.index import (
     prepare_chunk_indices,
 )
 from aiter.ops.triton._triton_kernels.kimi_delta_attn.utils.l2norm import l2norm_fwd
+from aiter.ops.triton.utils.tuned_config_utils import autotune_enabled
 
 # What an unset `chunk_size` falls back to when the FlashKDA path cannot serve
 # the call.
 _DEFAULT_CHUNK_SIZE = 64
+
+# Runtime autotune picks a config per process, so batch_invariant needs it off.
+_AUTOTUNE_ON = CHUNK_DELTA_ATTN_TRITON_AUTOTUNE or autotune_enabled("GATED_DELTA_RULE")
 
 
 def chunk_delta_attn_fwd(
@@ -72,6 +77,7 @@ def chunk_delta_attn_fwd(
     state_cache: torch.Tensor | None = None,
     state_indices: torch.Tensor | None = None,
     has_initial_state: torch.Tensor | None = None,
+    batch_invariant: bool = False,
 ) -> tuple:
     """
     Forward pass for chunk_delta_attn.
@@ -110,6 +116,9 @@ def chunk_delta_attn_fwd(
         out:                Optional contiguous output buffer, same shape as
                             ``v``. FlashKDA-only, like ``state_cache``.
         state_cache:        Optional paged fp32 V-first cache. FlashKDA-only.
+        batch_invariant:    Make each sequence's output independent of the
+                            other sequences in the batch and of the tokens
+                            after each row. Uses the default pipeline only.
 
     Returns:
         (o, final_state, g_cumsum, Aqk, Akk, w, u, qg, kg)
@@ -120,6 +129,12 @@ def chunk_delta_attn_fwd(
           Akk         ``[B, T, HV, BT]``
           w, u, qg, kg or None depending on disable_recompute
     """
+    if batch_invariant and _AUTOTUNE_ON:
+        raise ValueError(
+            "batch_invariant=True needs one fixed config per kernel; "
+            "unset CHUNK_DELTA_ATTN_TRITON_AUTOTUNE and GATED_DELTA_RULE_TRITON_AUTOTUNE"
+        )
+
     # ------------------------------------------------------------------
     # Fast path — two-kernel FlashKDA split
     # ------------------------------------------------------------------
@@ -134,6 +149,7 @@ def chunk_delta_attn_fwd(
     # combination of the three.
     use_flash_kda = (
         AITER_FDA_ENABLE
+        and not batch_invariant
         and not disable_recompute
         and flash_kda_supported(
             q=q,
@@ -248,6 +264,7 @@ def chunk_delta_attn_fwd(
         chunk_indices=chunk_indices,
         safe_gate=safe_gate,
         disable_recompute=disable_recompute,
+        batch_invariant=batch_invariant,
     )
 
     # ------------------------------------------------------------------

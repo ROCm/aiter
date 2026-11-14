@@ -66,6 +66,7 @@ def chunk_kimi_delta_attn(
     state_cache: torch.Tensor | None = None,
     state_indices: torch.Tensor | None = None,
     has_initial_state: torch.Tensor | None = None,
+    batch_invariant: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor | None]:
     r"""
     Chunked Kimi Delta Attention forward pass using Triton (Forward only).
@@ -162,6 +163,15 @@ def chunk_kimi_delta_attn(
         has_initial_state (torch.Tensor, optional):
             Bool `[N]`. False starts that sequence from zero. Required with
             `state_cache`.
+        batch_invariant (bool):
+            Make the output bitwise independent of the batch. The output rows
+            of a sequence do not change with the other sequences in the batch,
+            with their order, or with the tokens that come after each row.
+            This path uses the default pipeline. It does not use FlashKDA, so
+            `out` and `state_cache` are not supported. With `safe_gate`, the
+            sub-chunk kernel uses the first row of each sub-chunk as the gate
+            reference, not the mid-point. The result agrees with the default
+            to bf16 precision. Runtime autotune must be off. Default: `False`.
 
     Returns:
         tuple[torch.Tensor, torch.Tensor | None]:
@@ -244,7 +254,7 @@ def chunk_kimi_delta_attn(
         raise ValueError(f"`scale` must be positive, got {scale}.")
 
     _LOGGER.info(
-        "CHUNK_KIMI_DELTA_ATTN: q=%s, v=%s, scale=%s, chunk_size=%s, safe_gate=%s, lower_bound=%s, state_v_first=%s, varlen=%s",
+        "CHUNK_KIMI_DELTA_ATTN: q=%s, v=%s, scale=%s, chunk_size=%s, safe_gate=%s, lower_bound=%s, state_v_first=%s, varlen=%s, batch_invariant=%s",
         tuple(q.shape),
         tuple(v.shape),
         scale,
@@ -253,6 +263,7 @@ def chunk_kimi_delta_attn(
         lower_bound,
         state_v_first,
         cu_seqlens is not None,
+        batch_invariant,
     )
 
     # Match fla's `@input_guard`: several kernels below index their operands
@@ -300,5 +311,6 @@ def chunk_kimi_delta_attn(
         state_cache=state_cache,
         state_indices=state_indices,
         has_initial_state=has_initial_state,
+        batch_invariant=batch_invariant,
     )
     return o.to(q.dtype), final_state
