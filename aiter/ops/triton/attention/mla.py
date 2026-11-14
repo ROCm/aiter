@@ -502,6 +502,7 @@ def mla_decode_fwd(
         )
         <= 256 * 1024
     )
+    partial_bf16 = False
     if use_pipelined_unshuffled:
         tuned = _tuned_decode_config(
             "pipelined_unshuffled",
@@ -511,6 +512,21 @@ def mla_decode_fwd(
             num_seqs,
             max_seqlen_kv,
         )
+        # The tuned table is keyed on H, B and KV only. NPOT_SPLITS (a split
+        # count), PARTIAL_BF16, XCHG_MODE, EARLY_PRIME, SPLIT_FP8 and ROWSPLIT
+        # were measured for page64, rank 512 and RoPE 64, and XCHG_MODE=1 needs
+        # a 64-token tile. Other geometries keep NUM_SEGMENTS_PER_SEQ and the
+        # current path.
+        npot_splits = tuned.pop("NPOT_SPLITS", 0)
+        partial_bf16 = bool(tuned.pop("PARTIAL_BF16", False))
+        if (block_size, kv_lora_rank, qk_rope_head_dim) != (64, 512, 64):
+            for key in ("XCHG_MODE", "EARLY_PRIME", "SPLIT_FP8", "ROWSPLIT"):
+                tuned.pop(key, None)
+            npot_splits, partial_bf16 = 0, False
+        if npot_splits:
+            tuned["NUM_SEGMENTS_PER_SEQ"] = npot_splits
+        # skip_reduce returns the partials to the caller, so keep them FP32.
+        partial_bf16 = partial_bf16 and not skip_reduce
         # Overrides may increase stages or Q padding even when the heuristic fits.
         # Reject the whole override before changing tiles or either segment count.
         if (
@@ -527,6 +543,7 @@ def mla_decode_fwd(
             > 256 * 1024
         ):
             tuned = {}
+            npot_splits, partial_bf16 = 0, False
         if "BLOCK_M" in tuned:
             # A smaller head tile needs less LDS, so the gate above still holds.
             assert (
@@ -536,13 +553,26 @@ def mla_decode_fwd(
             BLOCK_Q = max(BLOCK_M // num_queries_per_kv, 1)
             NUM_HEAD_BLOCKS = (num_queries_per_kv + BLOCK_M - 1) // BLOCK_M
             total_num_q_blocks = num_seqs * NUM_HEAD_BLOCKS
+        # ROWSPLIT puts the lo split parts in the padding rows 8-15 of a
+        # 16-row tile: only valid for one query token per sequence and 8 heads.
+        if tuned.get("ROWSPLIT") and not (
+            total_num_tokens == num_seqs
+            and BLOCK_M == 16
+            and num_queries_per_kv == 8
+            and tuned.get("SPLIT_FP8")
+            and tuned.get("EARLY_PRIME")
+            and tuned.get("num_stages", attn_config["num_stages"]) == 2
+        ):
+            tuned.pop("ROWSPLIT")
         if "NUM_SEGMENTS_PER_SEQ" in tuned:
-            # The reduce kernel indexes segments with tl.arange: keep a power of 2.
-            tuned["NUM_SEGMENTS_PER_SEQ"] = triton.next_power_of_2(
-                min(
-                    tuned["NUM_SEGMENTS_PER_SEQ"],
-                    triton.cdiv(max_seqlen_kv, block_size),
-                )
+            # NPOT_SPLITS keeps its count. Else use a power of 2.
+            # The reduce kernel pads its segment aranges to a power of 2.
+            num_segments = min(
+                tuned["NUM_SEGMENTS_PER_SEQ"],
+                triton.cdiv(max_seqlen_kv, block_size),
+            )
+            tuned["NUM_SEGMENTS_PER_SEQ"] = (
+                num_segments if npot_splits else triton.next_power_of_2(num_segments)
             )
             reduce_config["NUM_SEGMENTS_PER_SEQ"] = tuned["NUM_SEGMENTS_PER_SEQ"]
         attn_config.update(tuned)
@@ -567,7 +597,8 @@ def mla_decode_fwd(
             num_query_heads,
             NUM_SEGMENTS,
             triton.next_power_of_2(kv_lora_rank),
-            dtype=torch.float32,
+            # PARTIAL_BF16: the attention kernel stores BF16 partial outputs.
+            dtype=torch.bfloat16 if partial_bf16 else torch.float32,
             device=q.device,
         )
         segm_max = torch.empty(
@@ -726,6 +757,7 @@ def mla_decode_fwd(
         query_start_len_ptr=cu_seqlens_q,
         BLOCK_Q=BLOCK_Q,
         ALL_DECODE=ALL_DECODE,
+        SEGMENTS_P2=triton.next_power_of_2(reduce_config["NUM_SEGMENTS_PER_SEQ"]),
         **reduce_config,
     )
     return out
