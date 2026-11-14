@@ -177,6 +177,19 @@ class _Problem:
         )
 
 
+def default_config(token: int) -> str:
+    """Config for a token bucket with no tuned row: the batch-1 kernels at 2
+    tokens, the 16-row split-K decode tiles to 16, the 128-wide ones to 256 and
+    the prefill pipeline above."""
+    if token == 2:
+        return Config(16, 16, 16, False, use_batch1_algorithm=True).to_string()
+    if token <= 16:
+        return Config(16, 16, 16, False).to_string()
+    if token <= 256:
+        return Config(16, 128, 64, False).to_string()
+    return Config(64, 128, 128, True).to_string()
+
+
 def get_tune_space():
     prefill = [(256, 128), (128, 256), (128, 128)]
     configs = [
@@ -214,6 +227,7 @@ def _get_compiled_kernel(
     down_path="default",
     down_output_padding_bytes=0,
     fused_down_clear=False,
+    has_num_local_tokens=False,
 ):
     from aiter.ops.flydsl.kernels.moe_gemm_2stage.gfx9_fp8 import compile_gemm
 
@@ -236,6 +250,7 @@ def _get_compiled_kernel(
         down_path=down_path,
         down_output_padding_bytes=down_output_padding_bytes,
         fused_down_clear=fused_down_clear,
+        has_num_local_tokens=has_num_local_tokens,
     )
 
 
@@ -249,11 +264,15 @@ def _launch(kernel_fn, *args):
 
 def _quant_per_tensor(x, scale=None, quant_dtype=torch.float8_e4m3fn, num_rows=None):
     assert scale is None
-    assert num_rows is None
 
     amax = torch.zeros(1, dtype=torch.float32, device=x.device)
     xq = torch.empty_like(x, dtype=quant_dtype)
-    flydsl_absmax()(x, amax)
+    if num_rows is None:
+        flydsl_absmax()(x, amax)
+    else:
+        # Rows at and past num_rows (CUDA-graph padding) hold stale values.
+        valid = torch.arange(x.shape[0], device=x.device)[:, None] < num_rows
+        amax.copy_(torch.where(valid, x.abs(), 0).amax())
     flydsl_quant_per_tensor(quant_dtype)(x, amax, xq)
     fmax = torch.finfo(quant_dtype).max
     xs = amax / fmax
@@ -332,7 +351,8 @@ def _run_prefill(
             hidden_states,
             scale=None,
             quant_dtype=w1.dtype,
-            num_rows=None,
+            # Per-token scales are row-local; a per-tensor one must skip padding.
+            num_rows=num_local_tokens if quant_type == QuantType.per_Tensor else None,
         )
         a_scale = a_scale.to(torch.float32).contiguous()
     else:
@@ -463,7 +483,15 @@ def _run_batch1(
     problem: _Problem,
     activation_str: str,
     swiglu_limit: float | None,
+    num_local_tokens: torch.Tensor | None = None,
 ):
+    # No sort reads the count here: both kernels take it and skip the rows at
+    # and past it, as they skip caller-marked (-1) pad rows.
+    has_num_local_tokens = num_local_tokens is not None
+    if has_num_local_tokens and num_local_tokens.dtype != torch.int32:
+        num_local_tokens = num_local_tokens.to(torch.int32)
+    # Without a count the kernels never read this slot.
+    count_arg = num_local_tokens if has_num_local_tokens else topk_ids
     topk_weight = (
         topk_weight if topk_weight.dtype == torch.float32 else topk_weight.float()
     )
@@ -492,6 +520,7 @@ def _run_batch1(
         activation_str=activation_str,
         swiglu_limit=swiglu_limit,
         fused_down_clear=fused_down_clear,
+        has_num_local_tokens=has_num_local_tokens,
     )
     _launch(
         gateup_kernel,
@@ -501,6 +530,7 @@ def _run_batch1(
         topk_ids,
         cur_out,
         w1_scale if w1_scale is not None else _empty_scale(hidden_states.device),
+        count_arg,
         route_count,
     )
 
@@ -515,6 +545,7 @@ def _run_batch1(
         stage="down",
         alg="batch1",
         E=None,
+        has_num_local_tokens=has_num_local_tokens,
     )
     _launch(
         down_kernel,
@@ -524,6 +555,7 @@ def _run_batch1(
         topk_ids,
         topk_weight,
         w2_scale if w2_scale is not None else _empty_scale(hidden_states.device),
+        count_arg,
         route_count,
     )
     return cur_out
@@ -635,9 +667,14 @@ def run_flydsl_moe_gfx942(
     config_string: str,
     swiglu_limit: float | None = None,
 ) -> torch.Tensor:
-    if num_local_tokens is not None:
+    # num_local_tokens: rows at and past it (CUDA-graph padding) run no route
+    # and their output rows are unspecified, as in fused_moe. The sorted paths
+    # hand it to moe_sorting; the batch-1 kernels read it themselves.
+    if num_local_tokens is not None and not (
+        isinstance(num_local_tokens, torch.Tensor) and num_local_tokens.is_cuda
+    ):
         raise NotImplementedError(
-            "gfx942 FlyDSL whole-graph backend does not support num_local_tokens"
+            "gfx942 FlyDSL whole-graph backend takes num_local_tokens as a CUDA tensor"
         )
     for name, tensor in (
         ("hidden_states", hidden_states),
@@ -713,6 +750,7 @@ def run_flydsl_moe_gfx942(
             problem,
             activation_str,
             swiglu_limit,
+            num_local_tokens,
         )
     if 2 <= problem.batch <= 256:
         return _run_decode(
