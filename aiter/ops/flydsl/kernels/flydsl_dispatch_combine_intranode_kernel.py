@@ -89,6 +89,7 @@ def make_dispatch_kernel(
     scale_n_i32 = (scale_bytes + 3) // 4 if scale_bytes > 0 else 0
     enable_scales = scale_bytes > 0
     max_tokens_per_expert = npes * max_tok_per_rank
+    num_experts = npes * experts_per_rank
 
     @flyc.kernel(known_block_size=[warp_num_per_block * 64, 1, 1])
     def ep_dispatch_intranode(
@@ -154,9 +155,9 @@ def make_dispatch_kernel(
             # A negative or out-of-range expert id (padding / masked slot) is
             # not dispatched and does not count as an earlier slot's rank (as
             # mori): it takes the duplicate drop path below.
-            # Unsigned compare: 0 <= id < npes * experts_per_rank.
-            vld = fx.Uint32(dest_expert) < fx.Uint32(npes * experts_per_rank)
-            lane_vld = fx.Uint32(lane_expert) < fx.Uint32(npes * experts_per_rank)
+            # Unsigned compare: 0 <= id < num_experts.
+            vld = fx.Uint32(dest_expert) < fx.Uint32(num_experts)
+            lane_vld = fx.Uint32(lane_expert) < fx.Uint32(num_experts)
             dest_pe = vld.select(dest_expert // experts_per_rank, 0)
             lane_dest_pe = lane_expert // experts_per_rank
             # Drop lanes whose destPE duplicates an earlier k_slot (sentinel 64).
