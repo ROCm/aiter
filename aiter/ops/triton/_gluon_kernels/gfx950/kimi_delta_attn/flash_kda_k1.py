@@ -69,6 +69,9 @@ def k1_prepare_gluon(
     T,
     NT,
     TOTAL_TILES,
+    stride_q,
+    stride_k,
+    stride_g,
     H: gl.constexpr,
     K: gl.constexpr,
     C: gl.constexpr,
@@ -80,7 +83,8 @@ def k1_prepare_gluon(
     STORE_BETA: gl.constexpr = False,
 ):
     """FlashKDA K1 on gfx950, same workspace contract as the Triton prepare kernel.
-    ``STORE_BETA`` also writes ``sigmoid(beta)`` to ``ws_beta`` for the Gluon K2."""
+    q, k and g are read at their own token strides. ``STORE_BETA`` also writes
+    ``sigmoid(beta)`` to ``ws_beta`` for the Gluon K2."""
     gl.static_assert(C == 32 and K == 128)
     NUM_DOUBLING: gl.constexpr = BC.bit_length() - 2
     NUM_MERGE: gl.constexpr = (C // BC).bit_length() - 1
@@ -117,24 +121,24 @@ def k1_prepare_gluon(
     m_ck = (o_c < actual_len)[:, None]
     m_beta = o_i_r < actual_len
 
-    base = (bos + t_off) * H + i_h
-    qk_off = (base * K + o_c[:, None].to(gl.int64) * (H * K) + o_k[None, :]).to(
-        gl.int32
-    )
+    tok = bos + t_off
+    base = tok * H + i_h
+    row = tok + o_c[:, None].to(gl.int64)
+    q_off = (row * stride_q + i_h * K + o_k[None, :]).to(gl.int32)
+    k_off = (row * stride_k + i_h * K + o_k[None, :]).to(gl.int32)
 
     b_q_raw = gl.amd.cdna4.buffer_load(
-        ptr=q, offsets=qk_off, mask=m_ck, other=0.0, cache=CM_LOAD
+        ptr=q, offsets=q_off, mask=m_ck, other=0.0, cache=CM_LOAD
     )
     b_k_raw = gl.amd.cdna4.buffer_load(
-        ptr=k, offsets=qk_off, mask=m_ck, other=0.0, cache=CM_LOAD
+        ptr=k, offsets=k_off, mask=m_ck, other=0.0, cache=CM_LOAD
     )
 
     # One column per thread, so the gate's scan and row picks are in-thread.
     o_c_col = gl.arange(0, C, layout=gl.SliceLayout(1, _BLK_COL))
     o_k_col = gl.arange(0, K, layout=gl.SliceLayout(0, _BLK_COL))
-    g_off = (base * K + o_c_col[:, None].to(gl.int64) * (H * K) + o_k_col[None, :]).to(
-        gl.int32
-    )
+    row_col = tok + o_c_col[:, None].to(gl.int64)
+    g_off = (row_col * stride_g + i_h * K + o_k_col[None, :]).to(gl.int32)
     # Masked: rows past the tensor's end are not clamped by hardware.
     b_g = gl.amd.cdna4.buffer_load(
         ptr=g_raw,
@@ -342,6 +346,9 @@ def gluon_k1_prepare(
     T,
     NT,
     TOTAL_TILES,
+    stride_q,
+    stride_k,
+    stride_g,
     H,
     K,
     C,
@@ -376,6 +383,9 @@ def gluon_k1_prepare(
         T=T,
         NT=NT,
         TOTAL_TILES=TOTAL_TILES,
+        stride_q=stride_q,
+        stride_k=stride_k,
+        stride_g=stride_g,
         H=H,
         K=K,
         C=C,
