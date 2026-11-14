@@ -104,7 +104,8 @@ def gemm_a16w16_(
             "silu_exp2", "relu").
         skip_reduce (Optional[bool]): [triton only] Skip reduction of split-K partial
             results. Returns shape (NUM_KSPLIT, M, N) instead of (M, N).
-        kernel_type (str): [gluon only] Kernel variant ("bandwidth_bound", "compute_bound").
+        kernel_type (str): [gluon only] Kernel variant ("bandwidth_bound", "compute_bound",
+            "compute_bound_cluster").
         backend (Optional[str]): "triton", "gluon", or None (auto-detect).
         persistent (bool): Use the persistent kernel, NUM_SMS workgroups
 
@@ -365,6 +366,7 @@ def gemm_a16w16_(
         ), f"Gluon backend requires one of {_GLUON_SUPPORTED_ARCHS}, got '{get_arch()}'"
         from aiter.ops.triton._gluon_kernels.gfx1250.gemm.basic.gemm_a16w16 import (
             _KERNEL_MAP,
+            create_cluster_layouts,
             create_shared_layouts,
             create_store_layout,
             create_wmma_layouts,
@@ -399,8 +401,13 @@ def gemm_a16w16_(
         waves_per_eu = config.get("waves_per_eu", 0)
 
         num_k_tiles = triton.cdiv(K, BLOCK_K)
-        _MIN_BUFFERS = {"bandwidth_bound": 1, "compute_bound": 2}
-        _DEPTH_SLACK = {"compute_bound": 2}
+        _MIN_BUFFERS = {
+            "bandwidth_bound": 1,
+            "compute_bound": 2,
+            "compute_bound_cluster": 5,
+        }
+        # compute_bound_cluster reads zeros past K; -1 keeps its prologue inside K.
+        _DEPTH_SLACK = {"compute_bound": 2, "compute_bound_cluster": -1}
 
         if kernel_type_from_config is None:
             depth_cap = num_k_tiles - _DEPTH_SLACK.get(kernel_type, 0)
@@ -446,10 +453,39 @@ def gemm_a16w16_(
         if y is None:
             y = torch.empty((M, N), dtype=dtype, device=x.device)
 
-        wmma_layout, operand_a, operand_b = create_wmma_layouts(num_warps)
-        shared_a, shared_b = create_shared_layouts(
-            BLOCK_M, BLOCK_N, BLOCK_K, layout, x.element_size() * 8
-        )
+        if kernel_type == "compute_bound_cluster":
+            # BLOCK_M x BLOCK_N is one workgroup's tile, as for the other kernel types;
+            # the kernel takes the tile of the whole CLUSTER_M x CLUSTER_N cluster.
+            cluster_m = config.get("CLUSTER_M", 1)
+            cluster_n = config.get("CLUSTER_N", 1)
+            BLOCK_M *= cluster_m
+            BLOCK_N *= cluster_n
+            # Stages past K read zeros, so the minimum ring runs any K (the clamp above
+            # can go below it, and the NUM_BUFFERS default is 2).
+            NUM_BUFFERS = max(NUM_BUFFERS, _MIN_BUFFERS[kernel_type])
+            shared_a, shared_b, wmma_layout, operand_a, operand_b, red_smem, red_reg = (
+                create_cluster_layouts(
+                    BLOCK_M,
+                    BLOCK_N,
+                    BLOCK_K,
+                    layout,
+                    num_warps,
+                    cluster_m,
+                    cluster_n,
+                    x.element_size() * 8,
+                )
+            )
+            extra_kwargs = {
+                "RED_SMEM": red_smem,
+                "RED_REG": red_reg,
+                "num_ctas": cluster_m * cluster_n,
+            }
+        else:
+            wmma_layout, operand_a, operand_b = create_wmma_layouts(num_warps)
+            shared_a, shared_b = create_shared_layouts(
+                BLOCK_M, BLOCK_N, BLOCK_K, layout, x.element_size() * 8
+            )
+            extra_kwargs = {}
 
         grid = (triton.cdiv(M, BLOCK_M) * triton.cdiv(N, BLOCK_N), 1)
 

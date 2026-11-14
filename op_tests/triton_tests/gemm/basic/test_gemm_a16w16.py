@@ -7,6 +7,7 @@ import torch.nn.functional as F
 
 from aiter.ops.triton.gemm.basic.gemm_a16w16 import _is_gluon_available, gemm_a16w16
 from aiter.ops.triton.gemm.basic.gemm_a16w16_atomic import gemm_a16w16_atomic
+from aiter.ops.triton.utils.gemm_config_utils import get_gemm_config
 from op_tests.triton_tests.utils.types import str_to_torch_dtype
 
 
@@ -61,6 +62,7 @@ def get_x_vals():
     x_vals += [(3, 5, 2)]  # irregular shape
     x_vals += [(1024 * v, 1024 * v, 1024 * v) for v in (1, 2, 4, 5, 8)]
     x_vals += [(2**i, 256, 7168) for i in range(5, 9)]  # DSR1 router GEMM
+    x_vals += [(512, 2048, 7168)]  # DSv4-Pro CSA compressor GEMM
     # GPT-OSS-120B attention projections
     x_vals += [(2**i, 5120, 2880) for i in range(5, 9)]  # GPTOSS QKV input projection
     x_vals += [(2048, 5120, 2880)]  # GPTOSS QKV @ M=2048
@@ -201,6 +203,44 @@ def test_gemm_a16_w16_layout(M: int, N: int, K: int, layout, backend, kernel_typ
     )
 
     torch.testing.assert_close(triton_out, torch_out, atol=1e-1, rtol=1e-1)
+
+
+# num_buffers None runs the tuned config, which must pick compute_bound_cluster.
+@pytest.mark.parametrize(
+    "M, N, K, num_buffers",
+    [
+        (257, 2048, 7168, None),  # tuned bucket, partial cluster tile
+        (257, 1024, 7168, None),  # tuned bucket for N=1024
+        (257, 384, 7168, None),  # tuned bucket for N=384
+        (300, 2112, 7000, 9),  # partial M and N tiles, odd K-tile count, K tail
+        (512, 2048, 128, 9),  # short K: stages past K read zeros
+        (512, 2048, 7168, 8),  # even NUM_BUFFERS
+    ],
+)
+@pytest.mark.parametrize("layout", ["TN", "TT", "NN", "NT"])
+def test_gemm_a16w16_compute_bound_cluster(M, N, K, num_buffers, layout):
+    if not is_gluon_supported():
+        pytest.skip("Gluon not supported on this architecture")
+    if num_buffers is None:
+        config = None
+        tuned, _ = get_gemm_config("GEMM-A16W16", M, N, K, backend="gluon")
+        assert tuned["kernel_type"] == "compute_bound_cluster"
+    else:
+        config = {
+            "BLOCK_M": 64,
+            "BLOCK_N": 64,
+            "BLOCK_K": 128,
+            "NUM_BUFFERS": num_buffers,
+            "num_warps": 4,
+            "kernel_type": "compute_bound_cluster",
+            "CLUSTER_M": 4,
+            "CLUSTER_N": 2,
+        }
+    x, w, _, out_dtype, _ = generate_gemm_a16w16_inputs(
+        M, N, K, torch.bfloat16, layout=layout, output=False
+    )
+    out = gemm_a16w16(x, w, None, out_dtype, backend="gluon", config=config)
+    torch.testing.assert_close(out, F.linear(x, w, bias=None), atol=1e-1, rtol=1e-2)
 
 
 @pytest.mark.parametrize("M, N, K", get_x_vals())
