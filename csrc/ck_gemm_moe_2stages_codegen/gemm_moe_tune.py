@@ -3904,6 +3904,26 @@ class FmoeTuner(TunerCommon):
 
         return tasks_ck
 
+    @staticmethod
+    def _flydsl_stage1_divides_k(kparams, model_dim):
+        """Whether a FlyDSL stage-1 kernel's k_batch/k_wave splits divide K.
+
+        compile_mixed_moe_gemm1 rejects the others, but only after the
+        candidate has been dispatched, and on some shapes the launch faults the
+        queue (HSA_STATUS_ERROR_EXCEPTION) instead of raising, taking the worker
+        pool down with it."""
+        k_batch = kparams.get("k_batch", 1)
+        k_wave = kparams.get("k_wave", 1)
+        tile_k = kparams["tile_k"]
+        if model_dim % k_batch != 0:
+            return False
+        k_per_batch = model_dim // k_batch
+        if k_per_batch % tile_k != 0:
+            return False
+        return k_wave <= 1 or (
+            k_per_batch % k_wave == 0 and (k_per_batch // k_wave) % tile_k == 0
+        )
+
     def gen_flydsl_2stages_task(self, info, blockMs):
         tasks_flydsl = []
         (
@@ -3983,23 +4003,9 @@ class FmoeTuner(TunerCommon):
             for kname, kparams in flydsl_s1_kernels.items():
                 is_splitk = kparams.get("k_batch", 1) > 1
 
-                # Drop k_batch/k_wave splits that do not divide the K axis.
-                # compile_mixed_moe_gemm1 rejects them, but only after the
-                # candidate has been dispatched, and on some shapes the launch
-                # faults the queue (HSA_STATUS_ERROR_EXCEPTION) instead of
-                # raising, taking the worker pool down with it.
-                _kb = kparams.get("k_batch", 1)
+                if not self._flydsl_stage1_divides_k(kparams, model_dim):
+                    continue
                 _kw = kparams.get("k_wave", 1)
-                _tk = kparams["tile_k"]
-                if model_dim % _kb != 0:
-                    continue
-                _k_per_batch = model_dim // _kb
-                if _k_per_batch % _tk != 0:
-                    continue
-                if _kw > 1 and (
-                    _k_per_batch % _kw != 0 or (_k_per_batch // _kw) % _tk != 0
-                ):
-                    continue
 
                 # a16w-mix gemm1 splits TILE_N across (4//k_wave) N-waves, each
                 # accumulating (TILE_N//n_waves)//16 MFMA n-tiles. When that is 0
@@ -4350,6 +4356,8 @@ class FmoeTuner(TunerCommon):
                 if kparams.get("tile_m") != blockM:
                     continue
                 if kparams.get("k_batch", 1) != 1:
+                    continue
+                if not self._flydsl_stage1_divides_k(kparams, model_dim):
                     continue
                 # Only the FUSED variant (v2 always fuses quant). Fused name and
                 # params exactly as gen_flydsl_2stages_task builds them.
