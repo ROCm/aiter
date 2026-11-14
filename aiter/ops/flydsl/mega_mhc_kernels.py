@@ -15,6 +15,8 @@ import weakref
 
 import torch
 
+from aiter.jit.utils.chip_info import get_num_xcds
+
 __all__ = ["MEGA_MHC_DEFAULTS", "flydsl_mega_mhc", "get_mega_mhc_config"]
 
 _GFX = ("gfx950",)
@@ -112,9 +114,9 @@ def _require(cond: bool, msg: str, exc: type = ValueError) -> None:
 
 
 def get_mega_mhc_config(
-    T: int, H: int, arch: str, cu_num: int, out_dtype: str = "bf16"
+    T: int, H: int, arch: str, cu_num: int, out_dtype: str = "bf16", num_xcds: int = 8
 ) -> dict:
-    """Launch policy keyed on (arch, cu_num) and T; thresholds tuned on MI355X at H = 5120.
+    """Launch policy keyed on (arch, cu_num, num_xcds) and T; thresholds tuned on MI355X at H = 5120.
 
     * Up to ``64 * cu_num`` tokens: 16-token blocks, 8 warps splitting the columns, and
       the largest legal ``NUM_KSPLIT <= 20`` with ``blocks * NUM_KSPLIT <= cu_num``
@@ -175,7 +177,7 @@ def get_mega_mhc_config(
     if ks == 1 and 5 * nblk > 3 * cu_num:
         cfg["X1_LDS_SLOTS"] = max_x1_lds_slots(H, cfg)
     if ks > 1 and T >= _DIST_MIN_T:
-        cfg = _with_dist_finish(T, H, cfg, cu_num)
+        cfg = _with_dist_finish(T, H, cfg, cu_num, num_xcds)
     if ks == 1:
         cfg["SHUFFLE_DPP"] = False  # 0.8-1.2% slower with DPP
     if decode_split and _LATE_DESC_T[0] < T <= _LATE_DESC_T[1]:
@@ -194,7 +196,7 @@ def get_mega_mhc_config(
     return cfg
 
 
-def _with_dist_finish(T: int, H: int, cfg: dict, cu_num: int) -> dict:
+def _with_dist_finish(T: int, H: int, cfg: dict, cu_num: int, num_xcds: int) -> dict:
     """``cfg`` with ``DIST_FINISH`` at the largest split count <= its own that is resident
     (``_dist_guard_error``) and legal; ``cfg`` unchanged if there is none."""
     from aiter.ops.flydsl.kernels.mega_mhc import DIST_MAX_KS, check_config
@@ -209,7 +211,7 @@ def _with_dist_finish(T: int, H: int, cfg: dict, cu_num: int) -> dict:
             TILE_K=64 if H % (k * w * 64) == 0 else 32,
             DIST_FINISH=True,
         )
-        if _dist_guard_error(T, cand, cu_num):
+        if _dist_guard_error(T, cand, cu_num, num_xcds):
             continue
         try:
             check_config(H, cand)
@@ -306,7 +308,7 @@ def _prepack_fn(fn: torch.Tensor, capturing: bool) -> torch.Tensor:
 _CU_MASK_ENV = ("HSA_CU_MASK", "ROC_GLOBAL_CU_MASK")
 
 
-def _dist_guard_error(T: int, cfg: dict, cu_num: int) -> str | None:
+def _dist_guard_error(T: int, cfg: dict, cu_num: int, num_xcds: int) -> str | None:
     """Why DIST_FINISH must not run (residency, CU mask env), or None."""
     from aiter.ops.flydsl.kernels.mega_mhc import dist_residency_error
 
@@ -315,11 +317,11 @@ def _dist_guard_error(T: int, cfg: dict, cu_num: int) -> str | None:
     masked = [e for e in _CU_MASK_ENV if os.environ.get(e)]
     if masked:
         return f"a CU mask is set ({', '.join(masked)}): residency is unknown"
-    return dist_residency_error(T, cfg, cu_num)
+    return dist_residency_error(T, cfg, cu_num, num_xcds)
 
 
-def _check_dist_guard(T: int, cfg: dict, cu_num: int) -> None:
-    err = _dist_guard_error(T, cfg, cu_num)
+def _check_dist_guard(T: int, cfg: dict, cu_num: int, num_xcds: int) -> None:
+    err = _dist_guard_error(T, cfg, cu_num, num_xcds)
     if err:
         raise ValueError(
             f"[flydsl_mega_mhc] DIST_FINISH needs every split workgroup resident: {err}"
@@ -328,6 +330,11 @@ def _check_dist_guard(T: int, cfg: dict, cu_num: int) -> None:
 
 def _cu_num(device) -> int:
     return torch.cuda.get_device_properties(device).multi_processor_count
+
+
+def _num_xcds(device) -> int:
+    with torch.cuda.device(device):
+        return get_num_xcds()
 
 
 def _arch(device) -> str:
@@ -513,8 +520,11 @@ def flydsl_mega_mhc(
     if T == 0:
         return residual_out, post_out, comb_out, layer_input, next_pre
 
+    num_xcds = _num_xcds(device)
     if config is None:
-        cfg = get_mega_mhc_config(T, H, arch, _cu_num(device), out_dtype)
+        cfg = get_mega_mhc_config(
+            T, H, arch, _cu_num(device), out_dtype, num_xcds=num_xcds
+        )
     else:
         unknown = sorted(set(config) - set(MEGA_MHC_DEFAULTS))
         if unknown:
@@ -522,11 +532,11 @@ def flydsl_mega_mhc(
         cfg = dict(MEGA_MHC_DEFAULTS)
         cfg.update(config)
         check_config(H, cfg)
-        _check_dist_guard(T, cfg, _cu_num(device))
+        _check_dist_guard(T, cfg, _cu_num(device), num_xcds)
 
     capturing = torch.cuda.is_current_stream_capturing()
     fn_arg = _prepack_fn(fn, capturing)
-    nblk, n_wg = grid_size(T, cfg)
+    nblk, n_wg = grid_size(T, cfg, num_xcds)
     ks = cfg["NUM_KSPLIT"]
     stream = torch.cuda.current_stream(device)
     if ks > 1:
@@ -544,6 +554,7 @@ def flydsl_mega_mhc(
         IDENTITY_PRE=identity_pre,
         SINKHORN_ITERS=int(sinkhorn_repeat),
         QUANT=_QUANT_OF[out_dtype],
+        NUM_XCDS=num_xcds if ks > 1 else 8,
         **cfg,
     )
     dummy = residual
