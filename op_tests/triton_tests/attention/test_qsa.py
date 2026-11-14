@@ -133,6 +133,72 @@ def test_qsa_verification_is_causal_and_matches_individual_queries(k, start):
         )
 
 
+@pytest.mark.parametrize("shards", [2, 4])
+def test_qsa_row_sharded_groups_match_whole_batch(shards):
+    """Selecting groups per row shard and expanding the gathered rows must
+    reproduce the whole-batch selection exactly. Shards stay above 256 rows,
+    so every call uses the same scorer as the whole batch."""
+    from aiter.ops.qsa import (
+        qsa_expand_block_indices,
+        qsa_select_paged_groups,
+        qsa_select_paged_tokens,
+    )
+
+    torch.manual_seed(7)
+    block, ratio, budget, start, rows = 16, 4, 2048, 2000, 1500
+    s = _make_paged_scenario(
+        rows,
+        256,
+        block,
+        ratio,
+        index_heads=4,
+        index_dim=128,
+        query_heads=8,
+        query_dim=128,
+        kv_heads=1,
+        start=start,
+    )
+    args = (s["compressed"], s["tables"])
+    whole = qsa_select_paged_tokens(
+        s["index_q"],
+        *args,
+        s["requests"],
+        s["positions"],
+        s["lengths"],
+        budget,
+        ratio,
+        max_seq_len=start + rows,
+    )
+
+    chunk = -(-rows // shards)
+    parts, widths = [], set()
+    for begin in range(0, rows, chunk):
+        local = slice(begin, min(begin + chunk, rows))
+        groups, width = qsa_select_paged_groups(
+            s["index_q"][local],
+            *args,
+            s["requests"][local],
+            s["positions"][local],
+            s["lengths"],
+            budget,
+            ratio,
+            max_seq_len=start + rows,
+        )
+        parts.append(groups)
+        widths.add(width)
+    assert widths == {whole.shape[1]}
+    sharded = qsa_expand_block_indices(
+        torch.cat(parts),
+        s["positions"],
+        s["lengths"],
+        s["requests"],
+        ratio,
+        budget,
+        output_width=whole.shape[1],
+    )
+    assert torch.equal(sharded, whole)
+
+
 @pytest.mark.parametrize("rows", [512, 1024])
 def test_qsa_mfma_scorer_matches_vector_path(rows):
     """The MFMA scorer (rows > 256) must match the vector-path scorer row for row."""

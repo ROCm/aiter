@@ -17,6 +17,7 @@ from aiter.ops.triton.attention.qsa import (
     FP4_GROUP,
     FP8_DTYPE,
     FP8_MAX,
+    QSA_CACHE_FORMATS,
     qsa_cache_row_layout,
     qsa_expand_block_indices,
     qsa_sparse_paged_gqa,
@@ -121,7 +122,40 @@ def qsa_paged_mqa_logits(
     )
 
 
-def qsa_select_paged_tokens(
+def _selection_widths(
+    compressed_k_cache: torch.Tensor,
+    page_table: torch.Tensor,
+    token_topk: int,
+    compress_ratio: int,
+    max_seq_len: int | None,
+) -> tuple[int, int, int]:
+    """(scored columns, selected groups per row, emitted token width).
+
+    Width is `budget + ratio - 1` unless `max_seq_len` -- the longest
+    sequence in the batch -- shows the context cannot fill it, in which case
+    both the scored width and the emitted width shrink to what the context can
+    actually reach. Everything dropped would have been `-1` padding, so the
+    result is identical column for column.
+    """
+    if compress_ratio <= 0 or token_topk <= 0 or token_topk % compress_ratio:
+        raise ValueError("token_topk must be positive and divisible by compress_ratio")
+    columns = page_table.shape[1] * compressed_k_cache.shape[1]
+    if columns < 1:
+        raise ValueError("compressed paged-cache capacity must be positive")
+    block_topk = min(token_topk // compress_ratio, columns)
+    if max_seq_len is not None:
+        reachable = (int(max_seq_len) + compress_ratio - 1) // compress_ratio
+        # Round up to a power of two: `BLOCK_TOPK`, `OUTPUT_WIDTH` and `TOPK`
+        # are Triton constexprs, so an exact width would recompile the expand
+        # and GQA kernels every few decoded tokens. A top-k wider than the
+        # visible groups just returns -1 for the extras.
+        bucket = 1 << (max(reachable, 1) - 1).bit_length()
+        columns = max(1, min(columns, bucket))
+        block_topk = max(1, min(block_topk, bucket))
+    return columns, block_topk, block_topk * compress_ratio + compress_ratio - 1
+
+
+def qsa_select_paged_groups(
     q: torch.Tensor,
     compressed_k_cache: torch.Tensor,
     page_table: torch.Tensor,
@@ -130,38 +164,26 @@ def qsa_select_paged_tokens(
     context_lens: torch.Tensor,
     token_topk: int,
     compress_ratio: int = 4,
-    out: torch.Tensor | None = None,
     logits_workspace_bytes: int = DEFAULT_LOGITS_WORKSPACE_BYTES,
     max_seq_len: int | None = None,
     allow_flydsl: bool = False,
     compressed_k_scale: torch.Tensor | None = None,
     stacked_decode: bool = False,
-) -> torch.Tensor:
-    """Score, select and expand in one call."""
-    if compress_ratio <= 0 or token_topk <= 0 or token_topk % compress_ratio:
-        raise ValueError("token_topk must be positive and divisible by compress_ratio")
+) -> tuple[torch.Tensor, int]:
+    """Score and select: `[tokens, block_topk]` int32 group ids, and the token
+    width `qsa_expand_block_indices` must emit for them.
+
+    Every row depends only on its own query, request and position, so callers
+    may select a row range (for example one tensor-parallel rank's shard) and
+    assemble the rows elsewhere; the widths depend only on the batch-wide
+    `page_table` and `max_seq_len`.
+    """
+    columns, block_topk, output_width = _selection_widths(
+        compressed_k_cache, page_table, token_topk, compress_ratio, max_seq_len
+    )
     rows = q.shape[0]
-
-    columns = page_table.shape[1] * compressed_k_cache.shape[1]
-    if columns < 1:
-        raise ValueError("compressed paged-cache capacity must be positive")
-    block_topk = min(token_topk // compress_ratio, columns)
-    if max_seq_len is not None:
-        reachable = (int(max_seq_len) + compress_ratio - 1) // compress_ratio
-        bucket = 1 << (max(reachable, 1) - 1).bit_length()
-        columns = max(1, min(columns, bucket))
-        block_topk = max(1, min(block_topk, bucket))
-    output_width = block_topk * compress_ratio + compress_ratio - 1
-
-    if out is None:
-        out = torch.empty((rows, output_width), dtype=torch.int32, device=q.device)
-    elif out.shape[0] != rows or out.shape[1] < output_width:
-        raise ValueError("out has an invalid shape")
-    else:
-        out = out[:, :output_width]
-    if rows == 0:
-        return out
-
+    groups = torch.empty((rows, block_topk), dtype=torch.int32, device=q.device)
+    # Chunk over query rows so the FP32 logits buffer stays within budget.
     rows_per_chunk = max(1, logits_workspace_bytes // max(columns * 4, 1))
     for row_start in range(0, rows, rows_per_chunk):
         row_end = min(row_start + rows_per_chunk, rows)
@@ -183,32 +205,78 @@ def qsa_select_paged_tokens(
             compressed_k_scale=compressed_k_scale,
             stacked_decode=stacked_decode,
         )
-        selected_groups = torch.empty(
-            (row_end - row_start, block_topk), dtype=torch.int32, device=q.device
-        )
         top_k_per_row_prefill(
             logits,
             row_starts,
             visible_groups,
-            selected_groups,
+            groups[row_slice],
             None,
             logits.shape[0],
             logits.stride(0),
             logits.stride(1),
             block_topk,
+            # Equal index scores must choose the same keys and ordering in
+            # single-token decode and multi-token verification.
             stable=True,
         )
-        qsa_expand_block_indices(
-            selected_groups,
-            query_positions[row_slice],
-            context_lens,
-            token_to_request[row_slice],
-            compress_ratio,
-            token_topk,
-            out[row_slice],
-            output_width=output_width,
-        )
-    return out
+    return groups, output_width
+
+
+def qsa_select_paged_tokens(
+    q: torch.Tensor,
+    compressed_k_cache: torch.Tensor,
+    page_table: torch.Tensor,
+    token_to_request: torch.Tensor,
+    query_positions: torch.Tensor,
+    context_lens: torch.Tensor,
+    token_topk: int,
+    compress_ratio: int = 4,
+    out: torch.Tensor | None = None,
+    logits_workspace_bytes: int = DEFAULT_LOGITS_WORKSPACE_BYTES,
+    max_seq_len: int | None = None,
+    allow_flydsl: bool = False,
+    compressed_k_scale: torch.Tensor | None = None,
+    stacked_decode: bool = False,
+) -> torch.Tensor:
+    """Score, select and expand in one call: `[tokens, width]` token ids
+    (see `_selection_widths` for the width)."""
+    rows = q.shape[0]
+    _, _, output_width = _selection_widths(
+        compressed_k_cache, page_table, token_topk, compress_ratio, max_seq_len
+    )
+    if out is None:
+        out = torch.empty((rows, output_width), dtype=torch.int32, device=q.device)
+    elif out.shape[0] != rows or out.shape[1] < output_width:
+        raise ValueError("out has an invalid shape")
+    else:
+        out = out[:, :output_width]
+    if rows == 0:
+        return out
+    groups, _ = qsa_select_paged_groups(
+        q,
+        compressed_k_cache,
+        page_table,
+        token_to_request,
+        query_positions,
+        context_lens,
+        token_topk,
+        compress_ratio,
+        logits_workspace_bytes=logits_workspace_bytes,
+        max_seq_len=max_seq_len,
+        allow_flydsl=allow_flydsl,
+        compressed_k_scale=compressed_k_scale,
+        stacked_decode=stacked_decode,
+    )
+    return qsa_expand_block_indices(
+        groups,
+        query_positions,
+        context_lens,
+        token_to_request,
+        compress_ratio,
+        token_topk,
+        out,
+        output_width=output_width,
+    )
 
 
 def qsa_sparse_prefill(
@@ -248,9 +316,11 @@ __all__ = [
     "FP4_GROUP",
     "FP8_DTYPE",
     "FP8_MAX",
+    "QSA_CACHE_FORMATS",
     "qsa_cache_row_layout",
     "qsa_expand_block_indices",
     "qsa_paged_mqa_logits",
+    "qsa_select_paged_groups",
     "qsa_select_paged_tokens",
     "qsa_sparse_paged_gqa",
     "qsa_sparse_prefill",
