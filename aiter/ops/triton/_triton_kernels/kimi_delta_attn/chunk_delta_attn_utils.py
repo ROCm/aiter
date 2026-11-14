@@ -110,6 +110,64 @@ def tensor_cache(fn):
     return wrapper
 
 
+# The stream a copy was queued on and an event recorded right after it.
+UploadTicket = tuple[torch.cuda.Stream, torch.cuda.Event]
+
+
+def upload_ints(
+    values: list[int], dtype: torch.dtype, device: torch.device
+) -> tuple[torch.Tensor, UploadTicket]:
+    """Copy host integers to ``device`` without stalling the host or the stream.
+
+    A blocking host-to-device copy synchronizes the stream. Going through pinned
+    memory with ``non_blocking`` does not, and PyTorch keeps the pinned block
+    alive until the copy has run. Returns the tensor and an ``UploadTicket`` for
+    ``wait_for_upload``.
+    """
+    if torch.cuda.is_current_stream_capturing():
+        raise RuntimeError(
+            "KDA varlen metadata cannot be built during graph capture: the copy "
+            "would read a host buffer at replay. Run the same call once before "
+            "capturing so it is cached."
+        )
+    stream = torch.cuda.current_stream(device)
+    # On the CPU explicitly: under a CUDA default device a bare ``torch.tensor``
+    # is a CUDA tensor, and only CPU tensors can be pinned.
+    host = torch.tensor(values, dtype=dtype, device="cpu").pin_memory()
+    buf = host.to(device, non_blocking=True)
+    event = torch.cuda.Event()
+    event.record(stream)
+    return buf, (stream, event)
+
+
+# Cached uploads used during graph capture. A graph replays their addresses,
+# so they must outlive eviction from the cache that owns them.
+_captured_uploads: dict[int, torch.Tensor] = {}
+
+
+def wait_for_upload(ticket: UploadTicket, buf: torch.Tensor) -> None:
+    """Make ``buf``, from a cached ``upload_ints`` that returned ``ticket``, safe
+    to use on the current stream.
+
+    From another stream, the copy may not have run yet and the cache may evict
+    and free ``buf`` while kernels queued here still read it: wait for the
+    ticket's event, which covers the copy and not the work queued on the
+    uploading stream since, and record ``buf`` on the current stream. During
+    graph capture neither can be expressed, so ``buf`` is kept for the life of
+    the process, and the copy must have completed before capture began:
+    ``torch.cuda.graph`` synchronizes the device first; a caller of
+    ``CUDAGraph.capture_begin`` must do so itself.
+    """
+    if torch.cuda.is_current_stream_capturing():
+        _captured_uploads[buf.data_ptr()] = buf
+        return
+    stream, event = ticket
+    current = torch.cuda.current_stream(stream.device)
+    if current != stream:
+        current.wait_event(event)
+        buf.record_stream(current)
+
+
 def _get_available_device() -> str:
     try:
         return triton.runtime.driver.active.get_current_target().backend
