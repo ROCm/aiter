@@ -60,7 +60,7 @@ If you have built kernels before tuning, add `AITER_REBUILD=1` to rebuild with n
 - **Type**: Comma-separated string
 - **Default**: `all`
 - **Choices**: `all`, `asm`, `hipblaslt`, `triton`, `flydsl`, `torch`, `skinny`, `opus`, `gluon`
-- **Description**: Choose which backends to tune. `gluon` is the gfx950 compute-bound Gluon kernel, one candidate per tile (ragged shapes included; N and K must be multiples of 8); the tuned row's `kernelName` (`gluon_compute_bound_<BLOCK_M>x<BLOCK_N>`) carries the tile. hipblaslt requires **both** `--libtype all` (or `--libtype hipblaslt`) **and** `--with-hipblaslt` to run.
+- **Description**: Choose which backends to tune. `gluon` is the gfx950 compute-bound Gluon kernel, one candidate per tile (ragged shapes included; N and K must be multiples of 8); the tuned row's `kernelName` (`gluon_compute_bound_<BLOCK_M>x<BLOCK_N>`) carries the tile. It also times the gfx950 Gluon Stream-K kernel when the output dtype is the input's (N a multiple of 8, K of 16): every tile and Stream-K plan that fits the shape (`tuning_candidates` in `gemm_a16w16_streamk.py`), with the whole config in the `kernelName` (for example `gluon_streamk_256x256x64_g4_one_tile_rs_k8_wt` or `gluon_streamk_256x256x64_g4_dp`; a trailing `_p16` means 16-bit partials, see `--gluon_16bit_partials`; other tiles, including non-power-of-two ones, with `--gluon_streamk_tiles`). hipblaslt requires **both** `--libtype all` (or `--libtype hipblaslt`) **and** `--with-hipblaslt` to run.
 
 **Example**:
 ```bash
@@ -86,6 +86,21 @@ If you have built kernels before tuning, add `AITER_REBUILD=1` to rebuild with n
 ### `--all_bias`
 - **Type**: Flag
 - **Description**: Tune for both bias and non-bias cases regardless of what was used to collect the shapes.
+
+### `--gluon_16bit_partials`
+- **Type**: Flag
+- **Default**: disabled
+- **Description**: Also time the gfx950 Gluon Stream-K plans that store partials (one_tile, two_tile, spread) with 16-bit partials in the output's type (bf16 or fp16), half the partial bytes. Each partial is rounded once more, which raises the RMS error over fp32 partials 1.2-1.5 times (the largest error up to about 2 times). A winning row's `kernelName` ends in `_p16`.
+
+### `--gluon_streamk_tiles`
+- **Type**: String
+- **Default**: the 13 power-of-two tiles (`TUNING_TILES`)
+- **Description**: The tiles of the gfx950 Gluon Stream-K candidates. `menu` times every supported tile (`menu_tiles()`: sides that are multiples of 32 from 64 to 320, at most 256x256 accumulators, BLOCK_K 128 only when BLOCK_M + BLOCK_N <= 256), which is 4-34 times the candidates per shape. A comma-separated list of `BLOCK_MxBLOCK_NxBLOCK_K` times only those tiles; an unsupported tile is an error before any timing.
+
+**Example**:
+```bash
+--libtype gluon --gluon_streamk_tiles 192x320x64,320x192x64,256x256x64
+```
 
 ## Common Options
 
