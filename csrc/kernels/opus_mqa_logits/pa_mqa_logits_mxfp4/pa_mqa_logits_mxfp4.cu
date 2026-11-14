@@ -710,9 +710,11 @@ void mqa_logits_mxfp4_launch(int64_t q,
     k.ptr_out_offsets     = reinterpret_cast<const int*>(out_offsets);
     k.ptr_query_start_loc = reinterpret_cast<const int*>(query_start_loc);
     k.ptr_row_ends        = reinterpret_cast<const int*>(row_ends);
-    k.ptr_cta_info        = mode == ol::SCHED_TABLE
-                                ? reinterpret_cast<const opus_mqa_cta_record*>(cta_info)
-                                : nullptr;
+    // cta_info: Table, its records; Free / Prefill, the lane maxima out, or 0.
+    if (mode == ol::SCHED_TABLE)
+        k.ptr_cta_info = reinterpret_cast<const opus_mqa_cta_record*>(cta_info);
+    else
+        k.ptr_lane_max = reinterpret_cast<float*>(cta_info);
     k.bt_stride           = bt_stride;
     k.tpb_shift           = tpb_shift;
     k.out_stride          = flat ? 0 : out_stride;
