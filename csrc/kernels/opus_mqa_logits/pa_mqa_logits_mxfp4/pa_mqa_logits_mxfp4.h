@@ -60,7 +60,10 @@ struct mqa_logits_mxfp4_kargs {
     const int* ptr_out_offsets;               // [rows] each row's first logit, or null
     const int* ptr_query_start_loc;           // [num_seqs + 1]
     const int* ptr_row_ends;                  // [rows]
-    const opus_mqa_cta_record* ptr_cta_info;  // Table only
+    union {
+        const opus_mqa_cta_record* ptr_cta_info;  // Table: the schedule records
+        float* ptr_lane_max;  // Free / Prefill: the lane maxima (opus_logits::LANE_MAX_*), or null
+    };
     int bt_stride;                            // block_tables row stride
     int tpb_shift;                            // log2(64-key tiles a table entry)
     int out_stride;                           // elements between rows when ptr_out_offsets is null
@@ -74,6 +77,16 @@ struct mqa_logits_mxfp4_kargs {
 static_assert(sizeof(mqa_logits_mxfp4_kargs) == 128, "kargs past 128 B are not preloaded");
 
 namespace opus_logits {
+
+// Lane maxima (Free / Prefill, ptr_lane_max set): a lower-bound summary of each row's logits for
+// a top-k that wants to skip most of a row. Slot s of row r holds the fp32 maximum of the keys
+// c = (16 g + i) * 64 + 32 u + l, i in [0, 16), c < row_ends[r], where s = 64 g + 32 u + l --
+// or of any nonempty part of them (two CTAs may split a slot's keys; either store is one of
+// its keys' values), or -inf. Row r's slots start at element (row start / 16) + 64 r, the row
+// start being out_offsets[r] or r * out_stride, a multiple of 64 with the rows in order; it
+// has 64 * ceil(row_ends[r] / 1024) of them.
+constexpr int LANE_MAX_TILES = 16;   // 64-key tiles a slot spans
+constexpr int LANE_MAX_ROW_PAD = 64; // slots a row may hold past (row extent / 16)
 
 // A table entry names at most 2^MAX_TPB_SHIFT 64-key tiles (kargs.tpb_shift).
 constexpr int MAX_TPB_SHIFT = 15;

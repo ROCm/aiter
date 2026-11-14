@@ -217,7 +217,9 @@ def _launch_fake(*args, **kwargs) -> None:
     return None
 
 
-@torch_compile_guard(mutates_args=["out"], device="cuda", gen_fake=_launch_fake)
+@torch_compile_guard(
+    mutates_args=["out", "lane_max"], device="cuda", gen_fake=_launch_fake
+)
 def _mqa_logits_mxfp4_launch(
     q: torch.Tensor,
     q_scale: torch.Tensor,
@@ -230,6 +232,7 @@ def _mqa_logits_mxfp4_launch(
     cta_info: torch.Tensor,
     out: torch.Tensor,
     out_offsets: torch.Tensor,
+    lane_max: torch.Tensor,
     rows: int,
     num_seqs: int,
     instance: int,
@@ -251,7 +254,12 @@ def _mqa_logits_mxfp4_launch(
         block_tables.data_ptr(),
         query_start_loc.data_ptr(),
         row_ends.data_ptr(),
-        cta_info.data_ptr() if schedule_mode == TABLE else 0,
+        # Table: its records; Free / Prefill: the lane maxima out, if any.
+        (
+            cta_info.data_ptr()
+            if schedule_mode == TABLE
+            else (lane_max.data_ptr() if lane_max.numel() > 0 else 0)
+        ),
         out.data_ptr(),
         out_offsets.data_ptr() if flat else 0,
         kv_cache.numel(),
@@ -501,6 +509,21 @@ class MqaLogitsConfig:
 
     def __hash__(self) -> int:
         return hash(self._key)
+
+    @property
+    def writes_lane_max(self) -> bool:
+        """Whether a launch without a schedule writes lane maxima: a schedule-free mode of the
+        gfx1250 H = 32 kernels (``pa_mqa_logits_mxfp4.h``)."""
+        return (
+            self._mode is not None
+            and self._mode != TABLE
+            and self.arch == GFX1250
+            and self.heads == 32
+        )
+
+    @property
+    def _empty_f32(self) -> torch.Tensor:
+        return self._empty_i32.view(torch.float32)
 
     def schedule_buffers(self) -> MqaLogitsScheduleBuffers:
         """Buffers for one live schedule, sized from the bounds. Hold one set per micro-batch or
@@ -815,6 +838,7 @@ def mqa_logits_mxfp4(
     weight_scale: float = 1.0,
     out: torch.Tensor | None = None,
     out_offsets: torch.Tensor | None = None,
+    lane_max: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Paged MQA logits of ``q``'s rows (see the module docstring); returns ``out``.
 
@@ -823,6 +847,11 @@ def mqa_logits_mxfp4(
     ``out_offsets`` [rows] int32, ``out`` is flat and row r's logits start at ``out_offsets[r]``.
     ``schedule`` must come from :func:`mqa_logits_mxfp4_schedule` with this ``cfg`` and these
     very ``query_start_loc`` / ``row_ends`` tensors.
+
+    ``lane_max`` (fp32, flat, :func:`mqa_logits_mxfp4_lane_max_elems` elements of ``out``'s
+    address span, padded row strides included) also receives each row's lane maxima, a lower-bound summary a top-k reads to skip most of a row
+    (``pa_mqa_logits_mxfp4.h``). Rows must start at multiples of 64 and in row order; schedule-free
+    configs only (:attr:`MqaLogitsConfig.writes_lane_max`, and no ``schedule``).
     """
     inst = cfg._instance
     if q.device != cfg.device:
@@ -946,6 +975,12 @@ def mqa_logits_mxfp4(
         )
     if out.dtype != torch.float32:
         raise ValueError(f"out must be fp32, got {out.dtype}")
+    if lane_max is not None:
+        if schedule is not None or not cfg.writes_lane_max:
+            raise ValueError(
+                "lane maxima come from schedule-free gfx1250 H = 32 launches only"
+            )
+        _check_lane_max(lane_max, out, rows, flat=out_offsets is not None)
 
     cta_target, parts = 1, 1
     if schedule is not None:
@@ -1003,6 +1038,7 @@ def mqa_logits_mxfp4(
         cta_info,
         out,
         cfg._empty_i32 if out_offsets is None else out_offsets,
+        cfg._empty_f32 if lane_max is None else lane_max,
         rows,
         seqs,
         inst.id,
@@ -1016,11 +1052,58 @@ def mqa_logits_mxfp4(
     return out
 
 
+# Lane maxima geometry, as pa_mqa_logits_mxfp4.h lays it out.
+_LANE_MAX_TILES = 16
+_LANE_MAX_ROW_PAD = 64
+_LANE_MAX_ROW_ALIGN = 64
+
+
+def mqa_logits_mxfp4_lane_max_elems(out_elems: int, rows: int) -> int:
+    """Elements of a lane maxima buffer for ``rows`` rows of logits whose stores span
+    ``out_elems`` elements from ``out``'s first one: ``out.numel()`` for a flat or contiguous
+    ``out``, ``(rows - 1) * out.stride(0) + out.shape[1]`` for a row-strided one
+    (:func:`_lane_max_out_span`). Row r's slots start at (its row start / 16) + 64 r, so the
+    buffer follows the address span, not the element count."""
+    return out_elems // _LANE_MAX_TILES + _LANE_MAX_ROW_PAD * (rows + 1)
+
+
+def _lane_max_out_span(out: torch.Tensor, rows: int, flat: bool) -> int:
+    """Elements from ``out``'s first element to past the last one ``rows`` rows may store."""
+    if flat or rows == 0:
+        return out.numel()
+    return (rows - 1) * out.stride(0) + out.shape[1]
+
+
+def _check_lane_max(
+    lane_max: torch.Tensor, out: torch.Tensor, rows: int, flat: bool
+) -> None:
+    """Reject a ``lane_max`` the kernels would store past: rows not 64-element aligned, or
+    fewer elements than the slots of ``out``'s addressed span need (padded row strides
+    included)."""
+    if not flat and out.stride(0) % _LANE_MAX_ROW_ALIGN:
+        raise ValueError(
+            f"lane maxima need rows {_LANE_MAX_ROW_ALIGN}-element aligned, got a row stride "
+            f"of {out.stride(0)}"
+        )
+    need = mqa_logits_mxfp4_lane_max_elems(_lane_max_out_span(out, rows, flat), rows)
+    if (
+        lane_max.dtype != torch.float32
+        or not lane_max.is_contiguous()
+        or lane_max.numel() < need
+    ):
+        raise ValueError(
+            f"lane_max must be contiguous fp32 of >= {need} elements for out "
+            f"{tuple(out.shape)} strides {out.stride()} and {rows} rows, got "
+            f"{lane_max.dtype} {tuple(lane_max.shape)}"
+        )
+
+
 __all__ = [
     "MqaLogitsConfig",
     "MqaLogitsSchedule",
     "MqaLogitsScheduleBuffers",
     "mqa_logits_mxfp4",
     "mqa_logits_mxfp4_config",
+    "mqa_logits_mxfp4_lane_max_elems",
     "mqa_logits_mxfp4_schedule",
 ]
