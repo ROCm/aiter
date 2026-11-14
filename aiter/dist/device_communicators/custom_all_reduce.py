@@ -3280,8 +3280,19 @@ class CustomAllreduce:
         emit_bf16: bool = False,
         transpose_scale: bool = False,
         gemma_norm: bool = False,
+        mx_scale: bool = False,
     ):
+        """``mx_scale`` writes MXFP8 instead: E4M3 values with one E8M0 scale
+        per 32 elements (``group_size`` must be 32), returned as a
+        ``float8_e8m0fnu`` tensor of shape ``(..., K // 32)``. The bytes equal
+        quantizing the bf16/fp16 output of the unquantized fused AR + RMSNorm
+        with power-of-two (ceil) scales."""
         self._require_old_arch_fused_kernels("fused_ar_rms_per_group_quant")
+        if mx_scale and (group_size != 32 or transpose_scale):
+            raise ValueError(
+                "mx_scale needs group_size=32 and row-major scales, got "
+                f"group_size={group_size} transpose_scale={transpose_scale}"
+            )
         K = inp.shape[-1]
         # Fail fast on bad ``group_size`` at the Python boundary. Mirrors
         # the C++ host dispatcher checks; catching it here surfaces a
@@ -3292,7 +3303,13 @@ class CustomAllreduce:
         res_out = torch.empty_like(inp)
         num_groups = K // group_size
         out = torch.empty(inp.shape, dtype=fp8, device=inp.device)
-        if transpose_scale:
+        if mx_scale:
+            scale_out = torch.empty(
+                inp.shape[:-1] + (num_groups,),
+                dtype=torch.float8_e8m0fnu,
+                device=inp.device,
+            )
+        elif transpose_scale:
             M = inp.shape[0]
             scale_out = torch.empty(
                 (num_groups, M), dtype=torch.float32, device=inp.device
@@ -3318,7 +3335,7 @@ class CustomAllreduce:
             res_inp,
             res_out,
             out,
-            scale_out,
+            scale_out.view(torch.uint8) if mx_scale else scale_out,
             w,
             eps,
             group_size,
@@ -3328,6 +3345,7 @@ class CustomAllreduce:
             bf16_ptr,
             transpose_scale,
             gemma_norm,
+            mx_scale,
         )
         if emit_bf16:
             return out, res_out, scale_out, bf16_out
@@ -3604,6 +3622,7 @@ class CustomAllreduce:
         emit_bf16: bool = False,
         transpose_scale: bool = False,
         gemma_norm: bool = False,
+        mx_scale: bool = False,
     ):
         if (
             self.disabled
@@ -3624,12 +3643,19 @@ class CustomAllreduce:
                     emit_bf16=emit_bf16,
                     transpose_scale=transpose_scale,
                     gemma_norm=gemma_norm,
+                    mx_scale=mx_scale,
                 )
             else:
                 K = input.shape[-1]
                 num_groups = K // group_size
                 dummy_out = torch.zeros(input.shape, dtype=fp8, device=input.device)
-                if transpose_scale:
+                if mx_scale:
+                    dummy_scale = torch.zeros(
+                        input.shape[:-1] + (num_groups,),
+                        dtype=torch.uint8,
+                        device=input.device,
+                    ).view(torch.float8_e8m0fnu)
+                elif transpose_scale:
                     M = input.shape[0]
                     dummy_scale = torch.zeros(
                         (num_groups, M), dtype=torch.float32, device=input.device
@@ -3660,6 +3686,7 @@ class CustomAllreduce:
                 emit_bf16=emit_bf16,
                 transpose_scale=transpose_scale,
                 gemma_norm=gemma_norm,
+                mx_scale=mx_scale,
             )
 
     def custom_fused_ar_rms_mxfp4_quant(
