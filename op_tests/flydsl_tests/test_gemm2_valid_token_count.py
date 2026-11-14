@@ -8,6 +8,10 @@ When the caller's M is padded (cudagraph), that id is still < M, so an atomic
 epilog bounded by ``token_id < M`` scatters every pad slot into row ``tokens``.
 ``use_valid_token_count`` bounds rows by ``min(cumsum[1], M)`` instead.
 
+The reduce epilog stores row ``token*topk + slot``; the sentinel's slot is
+``topk``, so with tokens == M-1 it lands one row past the route buffer unless the
+epilog also requires ``slot < topk``.
+
 The weights and activations are random bytes: only which rows get written is
 under test, and each valid row takes exactly one slot so on/off are bit-equal.
 
@@ -27,18 +31,18 @@ pytestmark = pytest.mark.skipif(
 M_PAD, TOKENS, NE, BM, N, K = 128, 100, 4, 32, 512, 256
 
 
-def _sorted_buffers():
+def _sorted_buffers(tokens=TOKENS):
     """Each token goes to expert t % NE (topk 1); blocks padded with the sentinel."""
     ids, eids = [], []
     for e in range(NE):
-        toks = list(range(e, TOKENS, NE))
+        toks = list(range(e, tokens, NE))
         for b in range(0, len(toks), BM):
             blk = toks[b : b + BM]
-            ids += blk + [TOKENS | (1 << 24)] * (BM - len(blk))
+            ids += blk + [tokens | (1 << 24)] * (BM - len(blk))
             eids.append(e)
     dev = "cuda"
     sorted_ids = torch.tensor(ids, dtype=torch.int32, device=dev)
-    cumsum = torch.tensor([len(ids), TOKENS], dtype=torch.int32, device=dev)
+    cumsum = torch.tensor([len(ids), tokens], dtype=torch.int32, device=dev)
     return (
         sorted_ids,
         torch.tensor(eids, dtype=torch.int32, device=dev),
@@ -128,3 +132,38 @@ def test_mxfp4_gemm2_honours_valid_token_count():
         return out
 
     _check(run)
+
+
+def test_a16w4_reduce_gemm2_skips_pad_sentinel():
+    from aiter.ops.flydsl.kernels.moe_2stage_a16wmix import flydsl_a16w4_gemm2
+
+    tokens = M_PAD - 1
+    sorted_ids, eids, cumsum, weights = _sorted_buffers(tokens)
+    torch.manual_seed(0)
+    a = torch.randn(sorted_ids.numel(), K, dtype=torch.bfloat16, device="cuda")
+    w = torch.randint(0, 256, (NE, N, K // 2), dtype=torch.uint8, device="cuda")
+    scale = torch.full((NE * N * K // 32,), 127, dtype=torch.uint8, device="cuda")
+
+    # One guard row past the [M, N] route buffer.
+    out = torch.zeros(M_PAD + 1, N, dtype=torch.bfloat16, device="cuda")
+    flydsl_a16w4_gemm2(
+        inter_sorted_bf16=a,
+        w2_u8=w,
+        w2_scale_u8=scale,
+        sorted_expert_ids=eids,
+        cumsum_tensor=cumsum,
+        sorted_token_ids=sorted_ids,
+        sorted_weights=weights,
+        flat_out=out[:M_PAD].view(-1),
+        M_logical=M_PAD,
+        max_sorted=sorted_ids.numel(),
+        NE=NE,
+        D_HIDDEN=N,
+        D_INTER=K,
+        topk=1,
+        tile_m=BM,
+        epilog="reduce",
+    )
+    torch.cuda.synchronize()
+    assert out[:tokens].abs().sum(dim=1).gt(0).all(), "a real route was not stored"
+    assert not out[M_PAD].any(), "a pad sentinel was stored past the route buffer"
