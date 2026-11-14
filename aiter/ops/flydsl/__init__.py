@@ -200,6 +200,10 @@ _LAZY_IMPORTS = {
         ".kernels.minimax_m3_index_score_prefill",
         "alloc_score",
     ),
+    "minimax_m3_sparse_pa_nvfp4_decode": (
+        ".kernels.minimax_m3_sparse_pa_nvfp4_decode",
+        "minimax_m3_sparse_pa_nvfp4_decode",
+    ),
 }
 
 __all__ = [
@@ -258,6 +262,7 @@ __all__ = [
     "minimax_m3_index_score_work_map",
     "minimax_m3_index_score_work_map_capacity",
     "minimax_m3_index_score_work_map_size",
+    "minimax_m3_sparse_pa_nvfp4_decode",
     "pa_decode",
     "prepare_gemm_a16wfp4_weight",
     "prepare_pa_decode_plan",
