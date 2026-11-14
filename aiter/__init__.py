@@ -218,12 +218,17 @@ except (ImportError, AttributeError):
 def __getattr__(name: str):
     """Lazy public exports that must not run at ``import aiter`` time.
 
-    ``sp_qkv_fused`` is the neutral SP4 QKV contract.  Resolving it here keeps
-    ``import aiter`` from eagerly importing the ops package path; the op itself
-    imports only the routing interface.
+    ``sp_qkv_fused`` is the neutral SP4 QKV contract and ``a2a_gemm_fused`` the
+    neutral SP4 A2A->PTPC A8W8 o_proj contract.  Resolving them here keeps
+    ``import aiter`` from eagerly importing the ops package path; the ops
+    themselves import only the routing interface.
     """
     if name == "sp_qkv_fused":
         from aiter.ops.gemm_fusion.sp_qkv.op import sp_qkv_fused
 
         return sp_qkv_fused
+    if name == "a2a_gemm_fused":
+        from aiter.ops.gemm_fusion.a2a_gemm.op import a2a_gemm_fused
+
+        return a2a_gemm_fused
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

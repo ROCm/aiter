@@ -1,4 +1,11 @@
 {
+ "a2a_gemm_fused": {
+  "fingerprint": "388d9816496c260e",
+  "signature": "x:positional, x_scale:positional, w:positional, w_scale:positional, out:positional, total_tokens:keyword-only, bucket_m:keyword-only=None, registered:keyword-only=False, group:keyword-only=None, stream:keyword-only=None, -> None",
+  "source": "aiter/ops/gemm_fusion/a2a_gemm/op.py",
+  "supersedes": [],
+  "version": 1
+ },
  "batched_gemm_a8w8_mxscale": {
   "fingerprint": "e7294cd3de718c0c",
   "signature": "x:positional:Tensor, wo_a:positional:Tensor, x_scale:positional:Tensor, w_scale:positional:Tensor, dtype:positional:torch.dtype=dtypes.bf16, -> Tensor",
