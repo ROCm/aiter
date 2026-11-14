@@ -20,6 +20,7 @@ from .gemm_common_gfx1250 import (
     pipeline_fence,
     pipeline_fence_signal,
     pipeline_fence_wait,
+    prefetch_kernel_code,
     workgroup_barrier,
 )
 from .gfx1250_cluster import compute_mcast_masks
@@ -1696,6 +1697,7 @@ def launch_gemm_a8w8_256x256(
         i32_ldc: fx.Int32,
         arg_out: fx.Pointer,
     ):
+        prefetch_kernel_code(num_waves)
         tile_args = (
             arg_c,
             arg_a,
