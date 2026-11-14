@@ -926,7 +926,7 @@ __global__ void initializeScale(float *d_data, int size, float value)
 }
 
 template <typename DTYPE_I, typename DTYPE_O, int thread_data_size = 16, bool check_tail = false>
-__device__ std::tuple<float, DTYPE_I*> data_to_per_row_scale(const DTYPE_I* __restrict__ input,
+__device__ auto data_to_per_row_scale(const DTYPE_I* __restrict__ input,
                                                              const int32_t cols)
 {
     static constexpr int32_t vec_size_i =
@@ -1011,7 +1011,8 @@ __device__ std::tuple<float, DTYPE_I*> data_to_per_row_scale(const DTYPE_I* __re
     float row_scale = std::is_same_v<DTYPE_O, opus::fp4_t>
                           ? aiter::fp4_f32_to_e8m0_scale(absMax)
                           : absMax * inverted_DTYPE_MAX;
-    return std::make_tuple(row_scale, reinterpret_cast<DTYPE_I*>(&vec_cur));
+    // Return the row vector by value. A pointer to the local vec_cur dangles after return.
+    return std::make_tuple(row_scale, vec_cur);
 }
 
 __device__ __forceinline__ float atomicMaxFloat(float *addr, float value)
@@ -1237,7 +1238,7 @@ dynamic_per_token_scaled_quant_kernel(DTYPE_O* __restrict__ out,
     }
     auto res         = data_to_per_row_scale<DTYPE_I, DTYPE_O, thread_data_size>(input, cols);
     float row_scale  = std::get<0>(res);
-    DTYPE_I* vec_ptr = std::get<1>(res);
+    DTYPE_I* vec_ptr = reinterpret_cast<DTYPE_I*>(&std::get<1>(res));
 
     if(threadIdx.x == 0)
     {
@@ -1265,7 +1266,7 @@ dynamic_per_token_scaled_quant_kernel(DTYPE_O* __restrict__ out,
 }
 
 template <typename DTYPE_I, typename DTYPE_O, int block_size, int thread_data_size = 16>
-__device__ std::tuple<float, float*>
+__device__ auto
 smooth_data_to_per_row_scale(const DTYPE_I* __restrict__ input,
                              const float* __restrict__ smooth_scale,
                              int32_t smscale_map_idx,
@@ -1299,7 +1300,8 @@ smooth_data_to_per_row_scale(const DTYPE_I* __restrict__ input,
     float row_scale = std::is_same_v<DTYPE_O, opus::fp4_t>
                           ? aiter::fp4_f32_to_e8m0_scale(absMax)
                           : absMax * inverted_DTYPE_MAX;
-    return std::make_tuple(row_scale, reinterpret_cast<float*>(&smscale_cur));
+    // Return by value. A pointer to the local smscale_cur dangles after return.
+    return std::make_tuple(row_scale, smscale_cur);
 }
 
 template <typename DTYPE_I, typename DTYPE_O, int block_size, int thread_data_size = 16, bool transpose_out_dim01 = false, bool has_smscale_map = false, bool has_smscale_hash = false, int max_smscale_map_hash_size = 1024>
@@ -1413,7 +1415,7 @@ __global__ void smooth_per_token_scaled_quant_kernel(DTYPE_O* __restrict__ out,
         auto res = smooth_data_to_per_row_scale<float, DTYPE_O, block_size, thread_data_size>(
             input_f_ptr, smooth_scale, smscale_map_idx, cols);
         float row_scale = std::get<0>(res);
-        float* vec_ptr  = std::get<1>(res);
+        float* vec_ptr  = reinterpret_cast<float*>(&std::get<1>(res));
 
         int out_token_idx;
         if constexpr(transpose_out_dim01)
@@ -2675,7 +2677,7 @@ __global__ void moe_smooth_per_token_scaled_quant_kernel_v1(DTYPE_O* __restrict_
         auto res = smooth_data_to_per_row_scale<float, DTYPE_O, block_size, thread_data_size>(
             input_f_ptr, smooth_scale, smscale_map_idx, cols);
         float row_scale = std::get<0>(res);
-        float* vec_ptr  = std::get<1>(res);
+        float* vec_ptr  = reinterpret_cast<float*>(&std::get<1>(res));
 
         int out_token_idx;
         if constexpr(transpose_out_dim01)
