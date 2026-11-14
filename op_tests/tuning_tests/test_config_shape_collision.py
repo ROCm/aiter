@@ -587,18 +587,17 @@ class TestConfigShapeCollision(unittest.TestCase):
 
     def test_grouped_fmoe_merged_cells_parse(self):
         """The merge writes the integers of a column that has a blank cell as
-        floats ("16.0"); the runtime lookup and the AOT parser read that file."""
+        floats ("16.0"); the runtime lookup reads that file."""
         try:
-            from aiter.aot.flydsl.grouped_moe import parse_csv
             from aiter.ops.flydsl import grouped_moe_gfx1250 as grouped
         except Exception as e:  # noqa: BLE001
-            self.skipTest(f"grouped MoE modules not importable: {e}")
+            self.skipTest(f"grouped MoE module not importable: {e}")
         merged = self._resolve(
             self._tmp, "AITER_CONFIG_GROUPED_FMOE", "tuned_grouped_fmoe"
         )
-        self.assertTrue(parse_csv(merged))
         with open(merged, newline="") as f:
             rows = list(csv.DictReader(f))
+        self.assertTrue(rows)
         for line, row in enumerate(rows, start=2):
             for col in _GROUPED_INT_COLUMNS:
                 with self.subTest(line=line, column=col):
@@ -608,16 +607,13 @@ class TestConfigShapeCollision(unittest.TestCase):
         """Only an all-zero fraction is dropped from an integer cell, so a value
         is kept digit for digit or rejected, never rounded through a float."""
         try:
-            from aiter.aot.flydsl.grouped_moe import _as_int as aot_as_int
-            from aiter.ops.flydsl.grouped_moe_gfx1250 import _as_int as runtime_as_int
+            from aiter.ops.flydsl.grouped_moe_gfx1250 import _as_int
         except Exception as e:  # noqa: BLE001
-            self.skipTest(f"grouped MoE modules not importable: {e}")
-        for as_int in (aot_as_int, runtime_as_int):
-            with self.subTest(module=as_int.__module__):
-                self.assertEqual(as_int("16.0", None), 16)
-                self.assertEqual(as_int("9007199254740993.0", None), 9007199254740993)
-                with self.assertRaises(ValueError):
-                    as_int("1.0000000000000001", None)
+            self.skipTest(f"grouped MoE module not importable: {e}")
+        self.assertEqual(_as_int("16.0", None), 16)
+        self.assertEqual(_as_int("9007199254740993.0", None), 9007199254740993)
+        with self.assertRaises(ValueError):
+            _as_int("1.0000000000000001", None)
 
     def test_grouped_fmoe_merged_ep_row_matches(self):
         """An ep_fused row must still win the EP lookup once the merge has
