@@ -156,6 +156,7 @@ def compile_attention_kernel(
                 query_seq_len,
                 one_query_group_size,
                 head_size_pow2,
+                head_size != head_size_pow2,
                 kv_block_size,
                 context_partition_size,
                 query_quant_mode,
@@ -273,6 +274,9 @@ def compile_attention_kernel(
             f"{value_transposed}",
             f"{is_causal}",
             f"{cdna_version}",
+            f"{int(head_size != head_size_pow2)}",  # KEY_HEAD_PADDED
+            f"{int(head_size != head_size_pow2)}",  # VALUE_HEAD_PADDED
+            "0",  # SLIDING_WINDOW
         ]
         signature = ",".join(signature_parts)
         gluon_kernel_name = "paged_attention_decode_v2_gluon_dot_kernel"
@@ -634,6 +638,8 @@ def run_direct_attention_kernel(
         QUERY_SEQ_LEN=query_seq_len,
         ONE_QUERY_GROUP_SIZE=query_group_size,
         HEAD_SIZE_POW2=triton.next_power_of_2(head_size),
+        KEY_HEAD_PADDED=head_size != triton.next_power_of_2(head_size),
+        VALUE_HEAD_PADDED=head_size != triton.next_power_of_2(head_size),
         KV_BLOCK_SIZE=kv_block_size,
         CONTEXT_PARTITION_SIZE=context_partition_size,
         KV_COMPUTE_BLOCK_SIZE=kv_compute_block_size,
