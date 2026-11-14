@@ -906,7 +906,9 @@ def fused_qk_rope_reshape_and_cache(
         BLOCK_H = 1
         if t >= _BLOCK_H_MIN_TOKENS:
             qh_per_kh = qh // kh
-            for cand in (16, 8, 4, 2):
+            # With the QK norm a program also loads the rotated row; on gfx950
+            # more than 4 heads a program measured slower.
+            for cand in (4, 2) if have_qk_norm else (16, 8, 4, 2):
                 if qh % cand == 0 and (cand % qh_per_kh == 0 or qh_per_kh % cand == 0):
                     BLOCK_H = cand
                     break

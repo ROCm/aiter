@@ -1,7 +1,7 @@
 import triton
 import triton.language as tl
 
-from aiter.ops.triton._triton_kernels.common.rmsnorm import _inverse_rms, _rmsnorm_op
+from aiter.ops.triton._triton_kernels.common.rmsnorm import _inverse_rms
 from aiter.ops.triton._triton_kernels.kv_cache import _store_mla_kv_cache
 from aiter.ops.triton._triton_kernels.quant.quant import _nvfp4_quant_op
 from aiter.ops.triton.rope.rope import (
@@ -714,21 +714,8 @@ def _unit_rope(
     BLOCK_D_pe: tl.constexpr,
     BLOCK_D_HALF_pe: tl.constexpr,
 ):
-    return _rope_1d(
-        tl.load(x_ptrs), cos, sin, d_pe_offs, IS_NEOX, BLOCK_D_pe, BLOCK_D_HALF_pe
-    )
+    x_pe = tl.load(x_ptrs)
 
-
-@triton.jit
-def _rope_1d(
-    x_pe,
-    cos,
-    sin,
-    d_pe_offs,
-    IS_NEOX: tl.constexpr,
-    BLOCK_D_pe: tl.constexpr,
-    BLOCK_D_HALF_pe: tl.constexpr,
-):
     if IS_NEOX:
         x_rotated_mask = d_pe_offs < BLOCK_D_HALF_pe
         x_pe_rotated = _get_neox_rotated_x_1D(
@@ -756,29 +743,8 @@ def _unit_rope_2d(
     BLOCK_D_pe: tl.constexpr,
     BLOCK_D_HALF_pe: tl.constexpr,
 ):
-    return _rope_2d(
-        tl.load(x_ptrs),
-        cos,
-        sin,
-        d_pe_offs,
-        IS_NEOX,
-        BLOCK_H,
-        BLOCK_D_pe,
-        BLOCK_D_HALF_pe,
-    )
+    x_pe = tl.load(x_ptrs)
 
-
-@triton.jit
-def _rope_2d(
-    x_pe,
-    cos,
-    sin,
-    d_pe_offs,
-    IS_NEOX: tl.constexpr,
-    BLOCK_H: tl.constexpr,
-    BLOCK_D_pe: tl.constexpr,
-    BLOCK_D_HALF_pe: tl.constexpr,
-):
     if IS_NEOX:
         x_rotated_mask = d_pe_offs < BLOCK_D_HALF_pe
         x_pe_rotated = _get_neox_rotated_x(
@@ -794,20 +760,49 @@ def _rope_2d(
 
 
 @triton.jit
-def _head_rmsnorm(x, w, eps, BLOCK_D: tl.constexpr):
-    """RMSNorm of one head row x [BLOCK_D] in fp32, rounded to x's dtype and
-    returned in fp32, so the RoPE after it runs in fp32."""
-    y = _rmsnorm_op(x.to(tl.float32), w, BLOCK_D, eps)
-    return y.to(x.dtype).to(tl.float32)
+def _norm_rope(
+    x_ptrs,
+    x_rot_ptrs,
+    w,
+    w_rot,
+    cos,
+    sin,
+    rot_neg,
+    eps,
+    BLOCK_D: tl.constexpr,
+):
+    """RMSNorm, then RoPE, of one head row [BLOCK_D]. The norm is fp32, rounded
+    to x's dtype; RoPE is fp32. The rotated row is loaded at its permuted
+    offsets (x_rot_ptrs, w_rot, negated where rot_neg), not shuffled."""
+    x = tl.load(x_ptrs)
+    x_f32 = x.to(tl.float32)
+    inv_rms = _inverse_rms(x_f32, BLOCK_D, eps, False)
+    n = (x_f32 * inv_rms * w).to(x.dtype).to(tl.float32)
+    n_rot = (tl.load(x_rot_ptrs).to(tl.float32) * inv_rms * w_rot).to(x.dtype)
+    n_rot = n_rot.to(tl.float32)
+    return n * cos + tl.where(rot_neg, -n_rot, n_rot) * sin
 
 
 @triton.jit
-def _head_rmsnorm_2d(x, w, eps, BLOCK_D: tl.constexpr):
-    """RMSNorm of each head row of x [BLOCK_H, BLOCK_D], as `_head_rmsnorm`."""
+def _norm_rope_2d(
+    x_ptrs,
+    x_rot_ptrs,
+    w,
+    w_rot,
+    cos,
+    sin,
+    rot_neg,
+    eps,
+    BLOCK_D: tl.constexpr,
+):
+    """`_norm_rope` on each row of [BLOCK_H, BLOCK_D]."""
+    x = tl.load(x_ptrs)
     x_f32 = x.to(tl.float32)
-    inv_rms = _inverse_rms(x_f32, BLOCK_D, eps, False)
-    y = x_f32 * inv_rms[:, None] * w[None, :]
-    return y.to(x.dtype).to(tl.float32)
+    inv_rms = _inverse_rms(x_f32, BLOCK_D, eps, False)[:, None]
+    n = (x_f32 * inv_rms * w).to(x.dtype).to(tl.float32)
+    n_rot = (tl.load(x_rot_ptrs).to(tl.float32) * inv_rms * w_rot).to(x.dtype)
+    n_rot = n_rot.to(tl.float32)
+    return n * cos + tl.where(rot_neg, -n_rot, n_rot) * sin
 
 
 _fused_qk_rope_reshape_and_cache_kernel_repr = make_kernel_repr(
@@ -985,6 +980,14 @@ def _fused_qk_rope_reshape_and_cache_kernel(
         if UPCAST_OPERAND:
             cos = cos.to(tl.float32)
             sin = sin.to(tl.float32)
+        if HAVE_QK_NORM:
+            # The rotated half's offsets and the lanes RoPE negates.
+            if IS_NEOX:
+                d_rot_offs = (d_pe_offs + BLOCK_D_HALF_pe) % BLOCK_D_pe
+                rot_neg = d_pe_offs < BLOCK_D_HALF_pe
+            else:
+                d_rot_offs = d_pe_offs ^ 1
+                rot_neg = d_pe_offs % 2 == 0
 
         if HAVE_Q:
             q_ptrs = (
@@ -994,16 +997,16 @@ def _fused_qk_rope_reshape_and_cache_kernel(
                 + d_pe_offs[None, :] * q_stride_d
             )
             if HAVE_QK_NORM:
-                q_norm_w = tl.load(q_norm_weight_ptr + d_pe_offs).to(tl.float32)
-                q_pe = _rope_2d(
-                    _head_rmsnorm_2d(tl.load(q_ptrs), q_norm_w, norm_eps, BLOCK_D_pe),
+                q_pe = _norm_rope_2d(
+                    q_ptrs,
+                    q_ptrs + (d_rot_offs - d_pe_offs)[None, :] * q_stride_d,
+                    tl.load(q_norm_weight_ptr + d_pe_offs).to(tl.float32)[None, :],
+                    tl.load(q_norm_weight_ptr + d_rot_offs).to(tl.float32)[None, :],
                     cos[None, :],
                     sin[None, :],
-                    d_pe_offs[None, :],
-                    IS_NEOX,
-                    BLOCK_H,
+                    rot_neg[None, :],
+                    norm_eps,
                     BLOCK_D_pe,
-                    BLOCK_D_HALF_pe,
                 )
             else:
                 q_pe = _unit_rope_2d(
@@ -1051,6 +1054,9 @@ def _fused_qk_rope_reshape_and_cache_kernel(
                     v_scale = 1
                 if HAVE_QK_NORM:
                     k_norm_w = tl.load(k_norm_weight_ptr + d_pe_offs).to(tl.float32)
+                    k_norm_w_rot = tl.load(k_norm_weight_ptr + d_rot_offs).to(
+                        tl.float32
+                    )
                 for i in tl.static_range(KH_BLOCK):
                     pid_hk = pid_hq_base // QH_PER_KH + i
                     k_ptrs = (
@@ -1060,16 +1066,16 @@ def _fused_qk_rope_reshape_and_cache_kernel(
                         + d_pe_offs * k_stride_d
                     )
                     if HAVE_QK_NORM:
-                        k_pe = _rope_1d(
-                            _head_rmsnorm(
-                                tl.load(k_ptrs), k_norm_w, norm_eps, BLOCK_D_pe
-                            ),
+                        k_pe = _norm_rope(
+                            k_ptrs,
+                            k_ptrs + (d_rot_offs - d_pe_offs) * k_stride_d,
+                            k_norm_w,
+                            k_norm_w_rot,
                             cos,
                             sin,
-                            d_pe_offs,
-                            IS_NEOX,
+                            rot_neg,
+                            norm_eps,
                             BLOCK_D_pe,
-                            BLOCK_D_HALF_pe,
                         )
                         # The cache takes the rounded k_out, as a separate
                         # norm -> rope -> cache-write chain does.
