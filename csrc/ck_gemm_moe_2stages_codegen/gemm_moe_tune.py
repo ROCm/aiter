@@ -42,6 +42,7 @@ from aiter.fused_moe import (
     fused_moe,
     fused_topk,
     moe_sorting,
+    swiglu_limit_tag,
     torch_moe,
     torch_moe_stage1,
     torch_moe_stage2,
@@ -83,7 +84,12 @@ from aiter.ops.flydsl.mxfp4_kname import (
     _parse_mxfp4_g1_kname,
     parse_g2_kname_any,
 )
-from aiter.ops.quant import per_1x32_f8_scale_f8_quant, per_1x32_i4_quant
+from aiter.ops.moe_limits import normalize_swiglu_limit
+from aiter.ops.quant import (
+    per_1x32_f8_scale_f8_quant,
+    per_1x32_i4_quant,
+    per_1x32_mx_quant_hip,
+)
 from aiter.ops.shuffle import (
     pack_int8_to_packed_int4,
     shuffle_scale,
@@ -320,6 +326,17 @@ def cosine_diff_compare(ref, res, msg="", printLog=True):
             logger.info(f"{msg}[cosine_diff={cos_diff:.6f} \033[31mfailed!\033[0m]")
     # return real cos_diff (no flooring to 0) so small errors stay visible, not hidden
     return cos_diff
+
+
+def limit_cosine_diff_compare(ref, res, msg="", printLog=True):
+    # A tiny swiglu_limit makes correct outputs tiny or all zero, which the
+    # 1e-12 floor in cosine_diff_compare rejects, so normalize first.
+    x = _to_f64_flat(ref)
+    y = _to_f64_flat(res)
+    scale = torch.maximum(x.abs().max(), y.abs().max())
+    if scale.item() == 0:
+        return 0.0
+    return cosine_diff_compare(x / scale, y / scale, msg, printLog)
 
 
 class Mxfp4AccuracyError(RuntimeError):
@@ -687,6 +704,8 @@ _GEN_DATA_1STAGE_KEYS = [
 class FmoeTuner(TunerCommon):
     SUPPORTS_FAST_SCAN = False
     SUPPORTS_POWER_SELECT = True
+    swiglu_limit = None
+    swiglu_limit_tag = ""
 
     ARG_DEFAULTS: ClassVar[dict[str, Any]] = {
         **TunerCommon.ARG_DEFAULTS,
@@ -742,9 +761,42 @@ class FmoeTuner(TunerCommon):
             help="positive screening top-K per stage context (default 2); "
             "staged search only; unused for M_est < 4; distinct from routing top-k.",
         )
+        self.parser.add_argument(
+            "--swiglu_limit",
+            type=float,
+            default=None,
+            help="Tune FP8 per_1x128 SiLU MoE with this gate/up clamp. Only CK "
+            "2-stage candidates can clamp; results are tagged in a _tag column "
+            "and must go to a separate tuned file (-o).",
+        )
 
     def parse_args(self) -> argparse.Namespace:
         args = super().parse_args()
+        try:
+            self.swiglu_limit = normalize_swiglu_limit(args.swiglu_limit)
+        except ValueError as exc:
+            self.parser.error(str(exc))
+        self.swiglu_limit_tag = swiglu_limit_tag(self.swiglu_limit)
+        if self.swiglu_limit is not None:
+            if args.grouped_gemm or args.mxfp4_flydsl or args.e2e_tune:
+                self.parser.error(
+                    "--swiglu_limit is only supported by the default fmoe tuner "
+                    "(MXFP4 uses AITER_MXFP4_TUNE_SWIGLU_LIMIT)"
+                )
+            if args.run_config or args.compare:
+                self.parser.error(
+                    "--swiglu_limit does not support --run_config or --compare; "
+                    "their benchmark and reference would run unclamped"
+                )
+            if os.path.abspath(self.get_out_file(args.tune_file)) == os.path.abspath(
+                self.get_out_file(self.ARG_DEFAULTS["tune_file"])
+            ):
+                self.parser.error(
+                    "--swiglu_limit results must go to a separate tuned file (-o); "
+                    "they would replace unclamped rows in the default one"
+                )
+            if "_tag" not in self.columns:
+                self.columns = self.columns + ["_tag"]
         if getattr(args, "fast_scan", False) and not self.SUPPORTS_FAST_SCAN:
             self.parser.error("--fast-scan requires --mxfp4-flydsl")
         if not hasattr(args, "fast_scan"):
@@ -858,9 +910,16 @@ class FmoeTuner(TunerCommon):
         act_type,
         splitk=0,
         use_nt=False,
+        swiglu_limit=None,
     ):
         inter_dim = w1_qt_shffle_ck.shape[1] // 2
         token_num = a1_qt.shape[0]
+        swiglu_limit = normalize_swiglu_limit(swiglu_limit)
+        if swiglu_limit is not None:
+            if splitk > 1 or "Splitk" in kernelName:
+                raise ValueError("Runtime SiLU clamp tuning requires non-split CK")
+            if q_type != QuantType.per_1x128 or act_type != ActivationType.Silu:
+                raise ValueError("Runtime clamp tuning requires per_1x128 SiLU")
         is_splitk = q_type == QuantType.per_1x128 and splitk > 1
         if is_splitk:
             sorted_size = min(token_num * topk * blockM, sorted_ids.shape[0])
@@ -895,6 +954,7 @@ class FmoeTuner(TunerCommon):
             splitk if is_splitk else 0,
             use_non_temporal_load=use_nt,
             dst_type=dtype if is_splitk else None,
+            swiglu_limit=float(swiglu_limit or 0.0),
         )
         if is_splitk:
             out = torch.empty(
@@ -3531,6 +3591,8 @@ class FmoeTuner(TunerCommon):
         )
         # only the blockscale kernels read the hint
         nt_values = (False, True) if q_type == QuantType.per_1x128 else (False,)
+        clamp_limit = self.swiglu_limit if is_fp8_blockscale else None
+        stage1_kwargs = {"swiglu_limit": clamp_limit} if clamp_limit else {}
         for blockM in blockMs:
             if blockM in [16, 32, 64, 128] and use_g1u1:
                 for kernel, nt in [
@@ -3579,7 +3641,7 @@ class FmoeTuner(TunerCommon):
                                 q_type,
                                 act_type,
                             ),
-                            {"use_nt": nt},
+                            {"use_nt": nt, **stage1_kwargs},
                             FmoeTuner.run_torch_moe_stage1,
                             (
                                 [
@@ -3601,11 +3663,11 @@ class FmoeTuner(TunerCommon):
                                 topk,
                                 blockM,
                             ),
-                            {},
+                            stage1_kwargs,
                             (None),
                             0.01,
                             0.01,
-                            None,
+                            limit_cosine_diff_compare if clamp_limit else None,
                         )
                     )
 
@@ -3677,7 +3739,7 @@ class FmoeTuner(TunerCommon):
                             (None),
                             0.01,
                             0.01,
-                            None,
+                            limit_cosine_diff_compare if clamp_limit else None,
                         )
                     )
         return tasks_ck
@@ -4974,8 +5036,8 @@ class FmoeTuner(TunerCommon):
             topk = int(row["topk"])
             act_type = eval(row["act_type"])
             dtype = eval(row["dtype"])
-            q_dtype_a = eval(row["q_dtype_a"])
-            q_dtype_w = eval(row["q_dtype_w"])
+            q_dtype_a = dtypes.normalize_fp8_dtype(eval(row["q_dtype_a"]))
+            q_dtype_w = dtypes.normalize_fp8_dtype(eval(row["q_dtype_w"]))
             q_type = eval(row["q_type"])
             q_type = QuantType.per_1x128 if q_type == QuantType.per_128x128 else q_type
             use_g1u1 = bool(row["use_g1u1"])
@@ -5384,8 +5446,8 @@ class FmoeTuner(TunerCommon):
                 doweight_stage1,
             ) = line
             dtype = eval(dtype)
-            q_dtype_a = eval(q_dtype_a)
-            q_dtype_w = eval(q_dtype_w)
+            q_dtype_a = dtypes.normalize_fp8_dtype(eval(q_dtype_a))
+            q_dtype_w = dtypes.normalize_fp8_dtype(eval(q_dtype_w))
             q_type = eval(q_type)
             q_type = QuantType.per_1x128 if q_type == QuantType.per_128x128 else q_type
             print("\nStart tuning", line)
@@ -5424,6 +5486,19 @@ class FmoeTuner(TunerCommon):
                 v2_tasks = self.gen_flydsl_v2_2stages_task(info, blockMs)
                 tune_only = "flydslv2" if v2_tasks else ""
             _tune_only = {s for s in tune_only.split(",") if s}
+            if self.swiglu_limit is not None:
+                if not (
+                    q_type == QuantType.per_1x128
+                    and act_type == ActivationType.Silu
+                    and q_dtype_a == dtypes.fp8
+                    and q_dtype_w == dtypes.fp8
+                ):
+                    raise ValueError(
+                        f"--swiglu_limit supports only FP8 per_1x128 SiLU, got {line}"
+                    )
+                # ASM, FlyDSL and Opus per_1x128 SiLU kernels have no clamp.
+                print(f"--swiglu_limit={self.swiglu_limit:g}: tuning CK 2-stage only")
+                _opus_only, _tune_only = False, {"cktile"}
 
             def _want(name, _opus_only=_opus_only, _tune_only=_tune_only):
                 if _tune_only:
@@ -5525,6 +5600,16 @@ class FmoeTuner(TunerCommon):
 
     def result_to_csv(self, results, file, concat=False):
         old_tunedf = self.get_tuned_gemm_list(file)
+        other_tag_df = None
+        if self.swiglu_limit_tag:
+            # Rows tuned for another swiglu_limit share the keys; keep them as is.
+            old_tags = (
+                old_tunedf["_tag"].fillna("").astype(str)
+                if "_tag" in old_tunedf.columns
+                else pd.Series("", index=old_tunedf.index)
+            )
+            other_tag_df = old_tunedf[old_tags != self.swiglu_limit_tag]
+            old_tunedf = old_tunedf[old_tags == self.swiglu_limit_tag]
 
         for col in self.columns:
             if col not in old_tunedf.columns:
@@ -5538,7 +5623,7 @@ class FmoeTuner(TunerCommon):
         # Legacy tuned files may carry an obsolete _tag column (and tagged
         # rows). Drop the tagged rows and the column so the rewrite matches the
         # current schema.
-        if "_tag" in old_tunedf.columns:
+        if "_tag" in old_tunedf.columns and not self.swiglu_limit_tag:
             old_tunedf = old_tunedf[old_tunedf["_tag"].fillna("") == ""].drop(
                 columns=["_tag"]
             )
@@ -5559,6 +5644,10 @@ class FmoeTuner(TunerCommon):
             resultdf = resultdf.astype(str).drop_duplicates(
                 subset=self.keys,
                 keep="last",
+            )
+        if other_tag_df is not None and not other_tag_df.empty:
+            resultdf = pd.concat(
+                [other_tag_df.astype(str), resultdf], ignore_index=True
             )
         # Canonical column order (self.columns, so gfx stays the first column).
         # Without this an incremental tune of a legacy file would append gfx at
@@ -5890,6 +5979,7 @@ class FmoeTuner(TunerCommon):
                         -1,
                         -1,
                     ]
+                    + ([self.swiglu_limit_tag] if self.swiglu_limit_tag else [])
                 )
                 failedf = pd.DataFrame(ret, columns=self.columns)
                 self.failed = pd.concat([self.failed, failedf], axis=0)
@@ -6347,6 +6437,10 @@ class FmoeTuner(TunerCommon):
             best_one["dtype"] = str(best_one["dtype"])
             best_one["q_dtype_a"] = str(best_one["q_dtype_a"])
             best_one["q_dtype_w"] = str(best_one["q_dtype_w"])
+            if self.swiglu_limit_tag:
+                best_one["_tag"] = self.swiglu_limit_tag
+                if int(best_one.get("ksplit", 0) or 0) > 1:
+                    raise ValueError("Runtime SiLU clamp winner cannot use split-K")
             bests.append(best_one)
         if len(prorfiles) > 0:
             profile_result = pd.concat(prorfiles)
@@ -6384,6 +6478,14 @@ class FmoeTuner(TunerCommon):
                 and "cu_num" in self.tunedf.columns
             ):
                 self.tunedf["gfx"] = self.tunedf["cu_num"].map(gfx_from_cu_num)
+            if self.tunedf is not None and self.swiglu_limit_tag:
+                # A shape only counts as tuned for rows with the same swiglu_limit.
+                tags = (
+                    self.tunedf["_tag"].fillna("").astype(str)
+                    if "_tag" in self.tunedf.columns
+                    else pd.Series("", index=self.tunedf.index)
+                )
+                self.tunedf = self.tunedf[tags == self.swiglu_limit_tag]
             if args.last:
                 self.untunedf = self.untunedf.iloc[-1:]
 
@@ -7328,19 +7430,25 @@ class Mxfp4FlydslTuner(FmoeTuner):
         k_wave=1,
         xcd_swizzle=0,
         num_waves=4,
+        a_dtype="fp4",
+        out_dtype="fp4",
     ):
-        # flydsl_mxmoe_g1_a4w4_<BM>x<BN>x<BK>[_f16in][_hpf][_nt]
+        # flydsl_mxmoe_g1_a{4,8}w4_<BM>x<BN>x<BK>[_f16in][_hpf][_nt][_fp8out]
         #   [_situv2|_swiglu][_kw<n>][_xcd<n>][_w2];
         # token order must match _parse_mxfp4_g1_kname in mxfp4_kname.py.
+        # The tuner only enumerates A4W4; A8W4 names serve the coupled tests.
         if prefetch_hidden and not inline_quant:
             raise ValueError("hidden prefetch requires inline quantization")
-        name = f"flydsl_mxmoe_g1_a4w4_{bm}x{bn}x{bk}"
+        a_bits = 8 if a_dtype == "fp8" else 4
+        name = f"flydsl_mxmoe_g1_a{a_bits}w4_{bm}x{bn}x{bk}"
         if inline_quant:
             name += "_f16in"
         if prefetch_hidden:
             name += "_hpf"
         if use_nt:
             name += "_nt"
+        if out_dtype == "fp8":
+            name += "_fp8out"
         if act == "situv2":
             name += "_situv2"
         elif act == "swiglu":
@@ -7550,7 +7658,7 @@ class Mxfp4FlydslTuner(FmoeTuner):
         )
 
     @staticmethod
-    def _prepare_case(token, model_dim, inter_dim, expert, topk, dtype):
+    def _prepare_case(token, model_dim, inter_dim, expert, topk, dtype, a_dtype="fp4"):
         data = FmoeTuner.generate_data(
             token,
             model_dim,
@@ -7558,22 +7666,33 @@ class Mxfp4FlydslTuner(FmoeTuner):
             expert,
             topk,
             dtype,
-            dtypes.fp4x2,
+            dtypes.fp8 if a_dtype == "fp8" else dtypes.fp4x2,
             dtypes.fp4x2,
             QuantType.per_1x32,
             True,
             16,
             device="cuda",
         )
+        if a_dtype == "fp8":
+            # generate_data keeps BF16 A for the production reference; the
+            # coupled A8W4 pair is compared against actual MXFP8 A instead.
+            data["a1_qt"], data["a1_scale"] = per_1x32_mx_quant_hip(
+                data["input"],
+                quant_dtype=dtypes.fp8,
+                scale_type=dtypes.fp8_e8m0,
+                shuffle=False,
+            )
         # True a4w4 runs the SEPARATED gate/up layout (gemm1 interleave=False),
-        # so prepare weights/scales with is_guinterleave=False. The interleaved
-        # a16w4/a8w4 layout (is_guinterleave=True) fed to the separated port
-        # produces garbage. w2 (down-proj, no gate/up) is layout-invariant.
+        # so prepare weights/scales with is_guinterleave=False; a8w4 runs the
+        # interleaved layout (is_guinterleave=True). Feeding either layout to
+        # the other port produces garbage. w2 (down-proj, no gate/up) is
+        # layout-invariant.
+        interleave = a_dtype == "fp8"
         data["w1_a16"] = shuffle_weight(
-            data["w1_qt"], (16, 16), is_guinterleave=False, gate_up=True
+            data["w1_qt"], (16, 16), is_guinterleave=interleave, gate_up=True
         )
         data["w1s_a16"] = shuffle_scale(
-            data["w1_scale"], expert, is_guinterleave=False, gate_up=True
+            data["w1_scale"], expert, is_guinterleave=interleave, gate_up=True
         )
         data["w2_a16"] = shuffle_weight(
             data["w2_qt"], (16, 16), is_guinterleave=False, gate_up=False
@@ -7625,10 +7744,15 @@ class Mxfp4FlydslTuner(FmoeTuner):
         stage1_input = data["input"]
         stage1_scale = None
         # Keep the tuner aligned with the production fused_moe_2stages pipeline:
-        # BM16 quantizes inline; the other A4W4 variants consume the fused Opus
-        # prequant output.
+        # BM16 quantizes inline; the other variants consume the fused Opus
+        # prequant output in their GEMM1 activation precision.
         if BM != 16:
-            stage1_input, stage1_scale = aiter.fused_dynamic_mxfp4_quant_moe_sort(
+            quant = (
+                aiter.fused_dynamic_mxfp8_quant_moe_sort
+                if p1["a_dtype"] == "fp8"
+                else aiter.fused_dynamic_mxfp4_quant_moe_sort
+            )
+            stage1_input, stage1_scale = quant(
                 input=data["input"],
                 sorted_ids=sti,
                 num_valid_ids=nvi,
@@ -7651,6 +7775,7 @@ class Mxfp4FlydslTuner(FmoeTuner):
             a1_scale=stage1_scale,
             w1_scale=data["w1s_a16"],
             kernelName1=kn1,
+            interleave=p1["a_dtype"] == "fp8",
             m_indices=m_indices,
             moe_buf=moe_buf,
             # _torch_ref runs SiTUv2 at run_torch_moe_stage1's default betas, so

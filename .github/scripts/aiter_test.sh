@@ -44,6 +44,8 @@ skip_tests=(
     "op_tests/multigpu_tests/bench_attention_a2a.py"
     "op_tests/multigpu_tests/test_mega_moe_tp.py"
     "op_tests/multigpu_tests/test_mega_moe_v2.py"
+    "op_tests/multigpu_tests/test_megamoe_internode.py"
+    "op_tests/multigpu_tests/test_mega_moe_small_m.py"
     "op_tests/multigpu_tests/test_wide_ep_moe.py"
     "op_tests/multigpu_tests/test_dispatch_combine.py"
     "op_tests/multigpu_tests/test_communication.py"
@@ -95,6 +97,9 @@ for file in "${sharded_files[@]}"; do
     # batch gate so they exercise the persistent kernel at every batch size.
     test_cmd=(timeout 60m python3 "$file")
     case "$file" in
+        op_tests/test_flydsl_moe_a16wfp4.py)
+            test_cmd=(timeout 60m python3 -m pytest -q "$file")
+            ;;
         op_tests/test_gemm_a8w8.py)
             # This suite checks correctness across thousands of tuned shapes.
             # Check every shape once; the suite also times one shape per CSV
@@ -108,9 +113,14 @@ for file in "${sharded_files[@]}"; do
             # no tests are collected, so an empty run cannot report success.
             test_cmd=(timeout 60m python3 -m pytest -q "$file")
             ;;
-        op_tests/test_fhmoe.py|op_tests/tuning_tests/test_fhmoe_tuner.py|op_tests/test_hipb_grouped_gemm.py|op_tests/flydsl_tests/test_gemm2_valid_token_count.py)
+        op_tests/test_fhmoe.py|op_tests/tuning_tests/test_fhmoe_tuner.py|op_tests/test_graph_alloc.py|op_tests/test_hipb_grouped_gemm.py|op_tests/flydsl_tests/test_gemm2_valid_token_count.py|op_tests/test_mla_sparse_prefill_v41_asm.py)
             # These files contain pytest-style test functions and intentionally
             # have no script entry point; direct execution would only import them.
+            test_cmd=(timeout 60m python3 -m pytest -q "$file")
+            ;;
+        op_tests/test_moe_cktile_stage1_splitk.py)
+            # The standalone benchmark omits selector and expected-error tests.
+            # Use pytest to run these alongside the numerical regression cases.
             test_cmd=(timeout 60m python3 -m pytest -q "$file")
             ;;
         op_tests/test_mla_v4_nm.py)
@@ -243,6 +253,12 @@ for file in "${sharded_files[@]}"; do
                 echo "Running tuned dispatch, independent Wan references, and every mixed ASM kernel on fully padded M/N/K tails"
             } | tee -a latest_test.log
             test_cmd=(timeout 60m python3 "$file")
+            ;;
+        op_tests/test_moe_2stage.py)
+            {
+                echo "Running $file with the standard MoE CI profile: representative token sweep (CSV/FlyDSL validation still runs)"
+            } | tee -a latest_test.log
+            test_cmd=(timeout 60m env AITER_MOE_2STAGE_CI_PROFILE=standard python3 "$file")
             ;;
     esac
     # Capture start time (nanoseconds since epoch)

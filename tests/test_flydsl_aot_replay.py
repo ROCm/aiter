@@ -8,6 +8,7 @@ These run on CPU: each launch happens inside ``dry_run`` and compiles nothing.
 import csv
 import os
 import pathlib
+import subprocess
 import sys
 from types import SimpleNamespace
 from unittest import mock
@@ -108,6 +109,75 @@ def test_the_dry_run_answers_a_launch_s_raw_stream_query(monkeypatch):
         assert isinstance(tensor_shim.current_stream_arg(), fx.Stream)
 
 
+def test_the_dry_run_builds_capture_scoped_scratch_without_asking_hip(monkeypatch):
+    """A split-K GEMM's cached semaphores ask HIP which capture the stream is in;
+    with the GPUs hidden that fails, and a replay never captures."""
+    from aiter.utility import graph_alloc
+
+    def no_gpu(_stream):
+        raise RuntimeError("hipStreamGetCaptureInfo failed with error 100")
+
+    monkeypatch.setattr(graph_alloc, "_capture_id", no_gpu)
+    calls = []
+
+    @graph_alloc.capture_scoped_cache
+    def zeros(device):
+        calls.append(device)
+        return torch.zeros(4, dtype=torch.int32, device=device)
+
+    with dry_run("gfx950", 256):
+        device = torch.device("cuda", 0)
+        assert zeros(device) is zeros(device)
+    assert calls == [device]
+
+
+def test_the_dry_run_pads_an_mxfp4_scale_with_the_gpus_hidden():
+    """``shuffle_scale_a16w4`` pads a scale whose K/32 is not a multiple of 8
+    with ``padded[:, :k] = scale``. On torch 2.9.1 the bindings of
+    ``__setitem__`` and ``copy_`` take a device guard, which with the GPUs
+    hidden, as a replay process hides them, raises hipErrorNoDevice."""
+    from aiter.aot.flydsl.common import replay_env
+
+    code = (
+        "import torch\n"
+        "from aiter import dtypes\n"
+        "from aiter.aot.flydsl.dry_run import dry_run\n"
+        "from aiter.ops.shuffle import shuffle_scale_a16w4\n"
+        "with dry_run('gfx950', 256):\n"
+        "    scale = torch.empty(2 * 3584, 12, dtype=dtypes.fp8_e8m0, device='cuda')\n"
+        "    assert shuffle_scale_a16w4(scale, 2, False).shape == (2 * 3584, 16)\n"
+        "    scale[0] = 1.0\n"
+    )
+    result = subprocess.run(
+        [sys.executable, "-c", code],
+        cwd=_REPO_ROOT,
+        env=replay_env("gfx950"),
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode == 0, result.stderr[-4000:]
+
+
+def test_the_dry_run_answers_an_assignment_through_an_index(monkeypatch):
+    """torch 2.9.1's guarded ``__setitem__`` binding, simulated so that a torch
+    without the guard runs the stand-in too. The scale shuffles' K padding, the
+    int4 weight packing and MegaMoE's peer pointer table assign this way."""
+
+    def no_gpu(*_args):
+        raise RuntimeError("HIP error: no ROCm-capable device is detected")
+
+    monkeypatch.setattr(torch.Tensor, "__setitem__", no_gpu)
+    with dry_run("gfx950", 256):
+        scale = torch.empty((4, 16), device="cuda", dtype=torch.uint8)
+        scale[:, :12] = torch.empty((4, 12), device="cuda", dtype=torch.uint8)
+        scale[:, 0] = scale[:, 1] | (scale[:, 2] << 4)
+        table = torch.empty(8, device="cuda", dtype=torch.int64)
+        table[3] = 1 << 40
+        assert scale.shape == (4, 16)
+        assert table.shape == (8,)
+
+
 def test_per_arch_replays_get_the_command_line(monkeypatch):
     argv = ["--shape", "12:12:192:128", "--check"]
     forwarded = []
@@ -156,3 +226,187 @@ def test_a4w4_csv_rows_reach_flydsl_through_public_replay(monkeypatch):
                 assert kernels, job
     finally:
         get_GEMM_config.cache_clear()
+
+
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+@pytest.mark.parametrize("with_out", [False, True])
+def test_mm_fallback_with_fp32_output_under_dry_run(dtype, with_out):
+    # The smallest M probed for kimik3_bf16_tuned_gemm has no tuned config
+    # and reaches torch.mm with out_dtype, whose torch 2.9.1 meta is broken.
+    with dry_run("gfx950", 256):
+        a = torch.empty((1, 7168), device="cuda", dtype=dtype)
+        w = torch.empty((896, 7168), device="cuda", dtype=dtype)
+        out = torch.empty((1, 896), device="cuda", dtype=torch.float32)
+        result = torch.mm(
+            a, w.t(), out_dtype=torch.float32, **({"out": out} if with_out else {})
+        )
+        assert result.shape == (1, 896)
+        assert result.dtype == torch.float32
+        assert result.device == a.device
+        if with_out:
+            assert result is out
+
+
+def test_mm_fallback_still_checks_shape_and_output_dtype():
+    with dry_run("gfx950", 256):
+        a = torch.empty((1, 16), device="cuda", dtype=torch.bfloat16)
+        w = torch.empty((8, 16), device="cuda", dtype=torch.bfloat16)
+        with pytest.raises(RuntimeError, match="same reduction dim"):
+            torch.mm(a, w, out_dtype=torch.float32)
+        with pytest.raises(RuntimeError, match="out_dtype"):
+            torch.mm(a, w.t(), out_dtype=torch.float64)
+
+
+@pytest.mark.parametrize("raise_in_body", [False, True])
+def test_legacy_mm_meta_is_restored_after_dry_run(raise_in_body):
+    import inspect
+
+    from torch._meta_registrations import meta_mm
+    from torch._subclasses.fake_tensor import FakeTensorMode
+
+    if (
+        not hasattr(torch.ops.aten.mm, "dtype")
+        or "out_dtype" in inspect.signature(meta_mm).parameters
+    ):
+        pytest.skip("torch already has out_dtype meta support")
+
+    def mm():
+        a = torch.empty((1, 16), device="cuda", dtype=torch.bfloat16)
+        w = torch.empty((8, 16), device="cuda", dtype=torch.bfloat16)
+        return torch.mm(a, w.t(), out_dtype=torch.float32)
+
+    with FakeTensorMode(), pytest.raises(TypeError, match="meta_mm"):
+        mm()
+    from contextlib import nullcontext
+
+    expected = (
+        pytest.raises(RuntimeError, match="end replay")
+        if raise_in_body
+        else nullcontext()
+    )
+    with expected, dry_run("gfx950", 256):
+        assert mm().dtype == torch.float32
+        if raise_in_body:
+            raise RuntimeError("end replay")
+    with FakeTensorMode(), pytest.raises(TypeError, match="meta_mm"):
+        mm()
+
+
+@pytest.mark.parametrize("with_out", [False, True])
+def test_mm_dtype_backport_runs_against_a_simulated_legacy_meta(monkeypatch, with_out):
+    # On a torch whose meta_mm takes out_dtype (CI's), the backport would never
+    # run. Simulate torch 2.9.1's two-argument meta_mm and its failure, so the
+    # backport is exercised, and restored, on every torch.
+    import torch._meta_registrations as meta_registrations
+    from torch._subclasses import fake_impls
+    from torch._subclasses.fake_tensor import FakeTensorMode
+
+    def meta_mm(a, b):
+        raise TypeError("meta_mm() takes 2 positional arguments but 3 were given")
+
+    def legacy(fake_mode, func, *args, **kwargs):
+        return meta_mm(*args, **kwargs)
+
+    monkeypatch.setattr(meta_registrations, "meta_mm", meta_mm)
+    for overload in (torch.ops.aten.mm.dtype, torch.ops.aten.mm.dtype_out):
+        monkeypatch.setitem(fake_impls.op_implementations_dict, overload, legacy)
+    FakeTensorMode.cache_clear()
+
+    def mm():
+        a = torch.empty((1, 16), device="cuda", dtype=torch.bfloat16)
+        w = torch.empty((8, 16), device="cuda", dtype=torch.bfloat16)
+        out = torch.empty((1, 8), device="cuda", dtype=torch.float32)
+        kwargs = {"out": out} if with_out else {}
+        return torch.mm(a, w.t(), out_dtype=torch.float32, **kwargs), out
+
+    with FakeTensorMode(), pytest.raises(TypeError, match="meta_mm"):
+        mm()
+    with dry_run("gfx950", 256):
+        result, out = mm()
+        assert (result.shape, result.dtype) == ((1, 8), torch.float32)
+        if with_out:
+            assert result is out
+    with FakeTensorMode(), pytest.raises(TypeError, match="meta_mm"):
+        mm()
+
+
+def test_a_scan_identifies_only_the_sizes_the_module_names():
+    seen = []
+    module = _module(lambda job: seen.append(job["m"]))
+    module.scan_sizes = lambda job, low: [low, 7, job["m"] - 1]
+    with mock.patch.object(replay, "replay_job") as replayed:
+        replay._scan(module, {**_JOB, "m": 16}, 3, frozenset())
+    assert seen == [3, 7, 15]
+    # No size requested a kernel the row's replay lacks: none is replayed.
+    replayed.assert_not_called()
+
+
+def _padded_m(m, gl, n=7168):
+    """getPaddedM (csrc/py_itfs_cu/gemm_common.cu)."""
+    pow2 = 1 << (m - 1).bit_length()
+    if gl == 1:
+        return 8192 if m > 8192 and n > 4096 else pow2
+    if m < 16:
+        return pow2
+    limits = ((256, 16), (1024, 32), (4096, 64))
+    grain = next((g for limit, g in limits if m <= limit), 128)
+    return -(-m // grain) * grain
+
+
+def test_gemm_scan_splits_a_range_where_the_padded_lookup_changes():
+    from aiter.aot.flydsl import gemm
+
+    # Above 8192 (N > 4096) gl=1 pads to 8192; only the top 128-row block pads
+    # (gl=0) to the row's own M.
+    assert gemm._lookup_pieces(_padded_m, 8193, 16384) == [
+        (8193, 16257),
+        (16257, 16384),
+    ]
+    # gl=1 changes at each power of two; 100 pads to 112 (gl=0), past the range.
+    assert gemm._lookup_pieces(_padded_m, 5, 100) == [
+        (5, 9),
+        (9, 17),
+        (17, 33),
+        (33, 65),
+        (65, 97),
+        (97, 100),
+    ]
+
+
+def test_gemm_scan_takes_each_tile_count_ragged_at_both_parities_and_full():
+    from aiter.aot.flydsl import gemm
+
+    assert sorted(gemm._tile_sizes(1, 1000, 256, 2)) == [
+        *(1, 2, 256),  # count 1
+        *(257, 258, 512),  # count 2
+        *(769, 770, 999),  # the last count, its tile not filled below 1000
+    ]
+
+
+def test_gemm_scan_covers_the_heuristics_where_a_sparse_table_has_no_row(
+    monkeypatch,
+):
+    from aiter.aot.flydsl import gemm
+    from aiter.ops import gemm_op_common
+
+    monkeypatch.setattr(
+        gemm_op_common, "get_padded_m", lambda m, n, k, gl: _padded_m(m, gl, n)
+    )
+    job = {
+        "table": "a8w8_blockscale_mxscale_bpreshuffle_tuned_gemm",
+        "kernel_name": "flydsl_mxfp8_128_bpreshuffle_wmma_t256x256x128_cm1_cn1",
+        "m": 32768,
+        "n": 7168,
+        "k": 1024,
+    }
+    blocks = range(33, 127)  # the 256-row blocks in (8448, 32512]
+    # Above 8192, gl=1 pads to 8192: with no row there the heuristics pick,
+    # and they tell every 256-row block apart.
+    sparse = gemm.scan_sizes({**job, "tuned": ((1, 16, 1), (32768, 256, 1))}, 2)
+    assert all(any(b * 256 < m <= (b + 1) * 256 for m in sparse) for b in blocks)
+    # With a row at 8192 the lookup finds it there, and only that row's
+    # tile counts are scanned.
+    dense = gemm.scan_sizes(
+        {**job, "tuned": ((1, 16, 1), (8192, 256, 1), (32768, 256, 1))}, 8193
+    )
+    assert not all(any(b * 256 < m <= (b + 1) * 256 for m in dense) for b in blocks)

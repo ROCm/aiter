@@ -20,6 +20,7 @@ from ..jit.core import (
     compile_ops,
 )
 from ..jit.utils.asm_guard import require_gfx1250_asm
+from ..jit.utils.build_targets import base_gfx_arch, is_gfx1250_family
 from ..jit.utils.chip_info import get_cu_num
 from ..jit.utils.chip_info import get_gfx_runtime as get_gfx
 from ..jit.utils.torch_guard import torch_compile_guard
@@ -29,8 +30,9 @@ from ..ops.gemm_op_common import (
     mxscale_w_scale_block,
     with_mxscale_w_scale_block,
 )
+from ..plugin import route as _route
 from ..utility import dtypes
-from ..utility.graph_alloc import persistent_alloc
+from ..utility.graph_alloc import capture_scoped_cache, persistent_alloc
 from .mxfp8fp4gemm_common import (
     _MXFP8_GEMM_CONFIG_KEYS,
     get_mxfp8_asm_dir,
@@ -185,7 +187,7 @@ def gemm_a8w8_bpreshuffle_flydsl(
 ) -> Tensor:
     kernel_name = str(config.get("kernelName", ""))
     # gfx1250 runs the WMMA ptpc backend; other archs use the MFMA preshuffle path.
-    if get_gfx() == "gfx1250":
+    if is_gfx1250_family(get_gfx()):
         from .flydsl.bpreshuffle_gemm_gfx1250 import run_gemm_a8w8_bpreshuffle_gfx1250
 
         return run_gemm_a8w8_bpreshuffle_gfx1250(
@@ -303,7 +305,7 @@ def gemm_a8w8_mxfp8_128_bpreshuffle_flydsl(
     a_is_preshuffled: bool = False,
 ) -> Tensor:
     kernel_name = str(config.get("kernelName", ""))
-    if get_gfx() != "gfx1250":
+    if not is_gfx1250_family(get_gfx()):
         raise RuntimeError(
             "gemm_a8w8_mxfp8_128_bpreshuffle_flydsl is only supported on gfx1250"
         )
@@ -520,7 +522,7 @@ def _gemm_a8w8_blockscale_bpreshuffle_asm(
 
 
 # Ref on https://github.com/ROCm/aiter/blob/1be4ee9f70a7a7de5e9f57de2c0ecb9d13ed5983/aiter/ops/gemm_op_a16w16.py#L37-L57
-@functools.lru_cache(maxsize=1024)
+@capture_scoped_cache
 def get_zero_bias_buf_keyed(
     device: torch.device, stream_id: int, out_shape: int
 ) -> Tensor:
@@ -605,6 +607,13 @@ def get_CKGEMM_config(
     gfx = get_gfx() if gfx is None else gfx
     cu_num = get_cu_num() if cu_num is None else cu_num
     has_gfx = _CKGEMM_HAS_GFX[tuned_file]
+    # A0 bring-up: reuse gfx1250 family tuned rows when strict has none.
+    if (
+        has_gfx
+        and base_gfx_arch(gfx) != gfx
+        and gfx not in {key[0] for key in _CKGEMM_CONFIG_CACHE[tuned_file]}
+    ):
+        gfx = base_gfx_arch(gfx)
     padded_M = M
     config = None
     for gl in [None, 0, 1]:
@@ -661,6 +670,13 @@ def get_GEMM_config_with_quant_type(
     gfx = get_gfx()
     cu_num = get_cu_num()
     has_gfx = _GEMM_QUANT_TYPE_HAS_GFX[tuned_file]
+    # A0 bring-up: reuse gfx1250 family tuned rows when strict has none.
+    if (
+        has_gfx
+        and base_gfx_arch(gfx) != gfx
+        and gfx not in {key[0] for key in _GEMM_QUANT_TYPE_CACHE[tuned_file]}
+    ):
+        gfx = base_gfx_arch(gfx)
     padded_M = M
     config = None
     for gl in [None, 0, 1]:
@@ -906,7 +922,7 @@ def _gemm_a8w8_bpreshuffle_into(
         elif libtype == "flydsl":
             return gemm_a8w8_bpreshuffle_flydsl(XQ, WQ, x_scale, w_scale, Y, config)
 
-    if get_gfx() == "gfx1250":
+    if is_gfx1250_family(get_gfx()):
         from ..ops.flydsl.gemm_tune.flydsl_gemm_a8w8_bpreshuffle_wmma_common import (
             kernel_fits_shape,
             kernels_list,
@@ -1187,6 +1203,11 @@ def get_mxscale_bpreshuffle_config(m: int, n: int, k: int, w_scale_block: str):
     padded M; None when untuned. Cached per shape; a miss is reported once per
     (N, K, w_scale_block)."""
     gfx, cu_num = get_gfx(), get_cu_num()
+    # A0 bring-up: reuse gfx1250 family tuned rows when strict has none.
+    if base_gfx_arch(gfx) != gfx and gfx not in {
+        key[0] for key in _mxscale_bpreshuffle_tuned_nk()
+    }:
+        gfx = base_gfx_arch(gfx)
     if (gfx, cu_num, n, k, w_scale_block) not in _mxscale_bpreshuffle_tuned_nk():
         # No row for this N/K at any M: same answer as the walk below.
         row, padded_m = None, m
@@ -1265,6 +1286,7 @@ def _gemm_mxscale_bpreshuffle(XQ, WQ, x_scale, w_scale, Y):
     return Y
 
 
+@_route(op="gemm_a8w8_blockscale", fake=gemm_a8w8_blockscale_fake, mutates_args=[])
 @torch_compile_guard(mutates_args=[], gen_fake=gemm_a8w8_blockscale_fake)
 def gemm_a8w8_blockscale(
     XQ: Tensor,
@@ -1289,6 +1311,10 @@ def gemm_a8w8_blockscale(
     Group32 with isBpreshuffled (weights shuffled (16, 16)) goes to
     gemm_a8w8_blockscale_bpreshuffle's E8M0 route and its
     AITER_CONFIG_GEMM_A8W8_BLOCKSCALE_MXSCALE_BPRESHUFFLE table.
+
+    Returns a newly allocated ``[M, N]`` tensor of ``dtype``; there is no
+    caller-owned output buffer on this contract. ``gemm_a8w8_blockscale_bpreshuffle``
+    is the one that takes an ``out=``.
     """
     is_group32 = _group32_w_scale_block(XQ, WQ, x_scale, w_scale) is not None
     # A malformed byte-scale layout must not fall through to FP32 CK dispatch.
@@ -1471,6 +1497,12 @@ def _warn_blockscale_asm_row_not_bf16(n: int, k: int, dtype: torch.dtype):
     )
 
 
+# AITER exposes the shuffled-b weight layout as its own public function. It is a
+# layout, not a backend, so the name is allowed here -- but the two are not
+# independent: gemm_a8w8_blockscale with isBpreshuffled delegates to this one's
+# E8M0 route. Whether they should converge is #7150's question, not this one's;
+# routing them as they are keeps this pilot out of a public API change.
+@_route(op="gemm_a8w8_blockscale_bpreshuffle")
 @torch_compile_guard(gen_fake=gemm_a8w8_blockscale_bpreshuffle_fake)
 def gemm_a8w8_blockscale_bpreshuffle(
     XQ: Tensor,
@@ -1480,6 +1512,31 @@ def gemm_a8w8_blockscale_bpreshuffle(
     dtype: torch.dtype = dtypes.bf16,
     out: Tensor | None = None,
 ) -> Tensor:
+    """Block-scaled A8W8 GEMM whose weight is already in MFMA-fragment order.
+
+    Same math as :func:`gemm_a8w8_blockscale`, but ``WQ`` was permuted by
+    ``shuffle_weight(w, layout=(16, 16))`` at load time. It is a separate
+    contract rather than a flag for the reason the batched pair gives: the
+    shuffled weight has the SAME shape, dtype and strides as the row-major
+    one, so a kernel built for the other layout reads the right bytes in the
+    wrong order and returns a plausible wrong answer instead of failing.
+
+    Args:
+        XQ: ``[M, K]`` fp8 activation.
+        WQ: ``[N, K]`` fp8 weight, ``(16, 16)``-preshuffled.
+        x_scale: per-block activation scales -- ``[M, K // 32]`` e8m0 for the
+            group32 path, else the 128x128 fp32 layout.
+        w_scale: the matching weight scales.
+        dtype: output dtype; ``bf16`` or ``fp16``.
+        out: optional caller-owned ``[M, N]`` output buffer, so the result
+            lands at a FIXED address -- what lets this GEMM's consumer be
+            captured into a cudagraph without a per-step input copy. Must
+            match ``(M, N)``, ``dtype`` and device. Not every backend can
+            honour it: the triton fallbacks self-allocate and assert rather
+            than silently return a different address.
+
+    Returns the output tensor -- ``out`` itself when one was passed.
+    """
     assert dtype in [
         dtypes.bf16,
         dtypes.fp16,
@@ -1516,7 +1573,7 @@ def gemm_a8w8_blockscale_bpreshuffle(
             return _gemm_mxscale_bpreshuffle(XQ, WQ, x_scale, w_scale, Y)
 
     use_gfx1250_flydsl_or_triton_mxfp8_128 = (
-        get_gfx() == "gfx1250"
+        is_gfx1250_family(get_gfx())
         and x_scale.dtype == dtypes.fp8_e8m0
         and w_scale.dtype == dtypes.fp8_e8m0
     )
@@ -1842,7 +1899,7 @@ def gemm_a8w8_blockscale_abpreshuffle(
         Y = torch.empty(m, n, dtype=dtype, device=XQ.device)
 
     if not (
-        get_gfx() == "gfx1250"
+        is_gfx1250_family(get_gfx())
         and x_scale.dtype == dtypes.fp8_e8m0
         and w_scale.dtype == dtypes.fp8_e8m0
     ):
@@ -2499,7 +2556,7 @@ def _mxfp8_bpreshuffle_tuned_nk(tuned_file: str) -> frozenset:
 
 def mxfp8_bpreshuffle_tuned(N: int, K: int) -> bool:
     """Whether this arch has tuned MXFP8 1x32 GEMM configs for (N, K)."""
-    if get_gfx() != "gfx1250":
+    if not is_gfx1250_family(get_gfx()):
         return False
     tuned_file = AITER_CONFIGS.AITER_CONFIG_GEMM_A8W8_MXFP8_BPRESHUFFLE_FILE
     return (get_gfx(), get_cu_num(), N, K) in _mxfp8_bpreshuffle_tuned_nk(tuned_file)
@@ -2562,6 +2619,11 @@ def _get_mxfp8_bpreshuffle_config(
     """
     tuned_file = AITER_CONFIGS.AITER_CONFIG_GEMM_A8W8_MXFP8_BPRESHUFFLE_FILE
     gfx, cu_num = get_gfx(), get_cu_num()
+    # A0 bring-up: reuse gfx1250 family tuned rows when strict has none.
+    if base_gfx_arch(gfx) != gfx and gfx not in {
+        key[0] for key in _load_mxfp8_bpreshuffle_tuned(tuned_file)
+    }:
+        gfx = base_gfx_arch(gfx)
     config, padded_m = find_padded_m_row(
         _load_mxfp8_bpreshuffle_tuned(tuned_file),
         lambda pm: (gfx, cu_num, pm, N, K, w_scale_block),
@@ -2643,7 +2705,7 @@ def gemm_a8w8_mxfp8_bpreshuffle(
     M, K = XQ.shape
     N = WQ.shape[0]
     gfx = get_gfx()
-    if a_scale_preshuffled and gfx != "gfx1250":
+    if a_scale_preshuffled and not is_gfx1250_family(gfx):
         raise ValueError("a_scale_preshuffled is supported only on gfx1250")
     Y = torch.empty(M, N, dtype=dtype, device=XQ.device) if out is None else out
     if M == 0:
