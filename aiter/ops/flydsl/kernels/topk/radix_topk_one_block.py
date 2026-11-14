@@ -6,16 +6,30 @@
 Short rows cache ordered keys in LDS. Long rows compact the selected radix
 bucket; stable modes preserve index ordering and tie-breaking.
 Rows with length <= k copy/pad in the same kernel without running radix.
+On gfx1250, long rows first select from the keys above a bound sampled from
+the row, read once, and persistent blocks load each next row into an LDS row
+cache while the current one is selected.
 """
 
 from functools import cache
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
+from flydsl._mlir.dialects import llvm
 from flydsl.expr import const_expr, gpu, range_constexpr
 from flydsl.expr.typing import T
 
+from aiter.jit.utils.chip_info import get_cu_num
+
+from ..dpp_utils import update_dpp_i32
 from ..kernels_common import atomic_add_i32, atomic_or_i32
+from ..tdm_ops_gfx1250 import (
+    TDMDescriptor2D,
+    make_tensor_descriptor_2d,
+    tensor_load_2d,
+    tensor_wait,
+)
+from ..tensor_shim import buf_scalar_load
 from .topk_common import _f32_to_ord, _load_f32x4, _row_length
 
 _VEC = 4
@@ -44,8 +58,9 @@ _ONE_BLOCK_LDS_BUDGET_BYTES = {
     "gfx950": 78 * 1024,
     "gfx1250": 158 * 1024,
 }
-# A 512-thread block on these arches: two of them resident per CU, each with
-# half the budget above.
+# A 512-thread block without the row cache on these arches: two of them
+# resident per CU, each with half the budget above. With the cache, a
+# 512-thread block takes the budget above minus the cache instead.
 _HALF_BLOCK_LDS_BUDGET_BYTES = {
     "gfx1250": 78 * 1024,
 }
@@ -54,6 +69,37 @@ _STABLE_COMPACT_SORT_MIN_ROW_LEN = 48 * 1024
 # Arches whose streaming rows always take the index sort: there it beats the
 # ordered re-scan of the row at every length past the cached capacity.
 _STABLE_SORT_ALL_STREAMING_ROWS = ("gfx1250",)
+# Arches whose long rows first try a sampled bound. A sampled row takes one
+# strided sample key per _SAMPLED_BOUND_KEYS_PER_SAMPLE keys, from
+# _SAMPLED_BOUND_MIN_SAMPLES to _SAMPLED_BOUND_MAX_SAMPLES a thread, so the
+# margin's share of the candidates stays put as rows grow. The bound is the
+# level-1 bucket of the sample key whose rank is the kth key's expected sample
+# count plus _SAMPLED_BOUND_SIGMAS of its standard deviations, plus the margin.
+# Every key in or above that bucket is a candidate, compacted in one read of the
+# row. Fewer than k candidates, or more than the buffer holds, fall back to the
+# two-pass selection, so the sample decides only the speed. Rows shorter than
+# _SAMPLED_BOUND_MIN_ROWS_PER_K * k keep the two-pass selection.
+_SAMPLED_BOUND_ARCHES = ("gfx1250",)
+_SAMPLED_BOUND_MIN_SAMPLES = 1
+_SAMPLED_BOUND_MAX_SAMPLES = 8
+_SAMPLED_BOUND_KEYS_PER_SAMPLE = 64
+_SAMPLED_BOUND_SIGMAS = 4.0
+_SAMPLED_BOUND_MARGIN = 4
+_SAMPLED_BOUND_MIN_ROWS_PER_K = 4
+_SAMPLED_SCAN_UNROLL = 4
+# The level-1 buckets from a sampled row's bound that each lane counts in its
+# own bytes, four a word, as it builds the level-1 histogram.
+_SAMPLED_HOT_BUCKETS = 8
+# Sampled rows read their first columns from an LDS row cache, its size by
+# block size. Each block walks rows grid-strided, and the tensor data mover
+# fills the cache with the block's next row while the current one is selected,
+# so a cached row's scan waits on LDS instead of global memory; a longer row
+# reads its head from the cache and the rest from global. With the cache a
+# 1024-thread block takes all of a gfx1250 CU's LDS, as its VGPRs already take
+# the CU; two 512-thread blocks share a CU, the cache out of each one's half,
+# so one block's barriers and LDS waits overlap the other's work.
+_ROW_CACHE_ELEMENTS = {1024: 40 << 10, 512: 16 << 10}
+_LONG_ROW_512_THREAD_MAX_K = 512
 
 _FIRST_ABOVE = 0
 _FIRST_THRESHOLD = 1
@@ -68,6 +114,12 @@ _SELECTED_BUCKET_COUNT = 9
 _METADATA_SIZE = _SELECTED_BUCKET_COUNT + 1
 _PACKED_COUNT_BITS = 16
 _PACKED_COUNT_MASK = (1 << _PACKED_COUNT_BITS) - 1
+_DPP_ROW_SHR = 0x110
+# Bitmap words a thread reads per tile of the stable emit, a block apart: one
+# tile covers a 64K-column row at 1024 threads. Their bit counts share one
+# block scan in 16-bit fields, which a block's word of 32 columns a thread
+# keeps within. The stable collect reads as many candidates a thread at once.
+_BITMAP_WORDS_PER_THREAD = 2
 
 
 def _build_bitonic_schedule(capacity: int) -> tuple[tuple[int, ...], ...]:
@@ -84,6 +136,101 @@ def _build_bitonic_schedule(capacity: int) -> tuple[tuple[int, ...], ...]:
     return tuple(sizes), tuple(strides)
 
 
+def _stable_sort_enabled(k, block_threads, stable, short_rows, arch):
+    # The sampled bound's arches also sort at 512 threads, two blocks to a CU.
+    min_threads = 512 if arch in _SAMPLED_BOUND_ARCHES else 1024
+    return stable and not short_rows and block_threads >= min_threads and k <= 2048
+
+
+def _sampled_bound_enabled(k, block_threads, stable, short_rows, arch):
+    # The bound builds its level-1 histogram in the later levels' one, and a
+    # stable row leaves through the candidate index sort.
+    long_radix_bits, _ = _LONG_RADIX_BY_ARCH.get(arch, _LONG_RADIX_DEFAULT)
+    return (
+        arch in _SAMPLED_BOUND_ARCHES
+        and not short_rows
+        and block_threads >= 512
+        and max(long_radix_bits[1:]) >= long_radix_bits[0]
+        and (
+            _stable_sort_enabled(k, block_threads, stable, short_rows, arch)
+            or not stable
+        )
+    )
+
+
+def _row_cache_enabled(k, block_threads, stable, short_rows, arch):
+    return block_threads in _ROW_CACHE_ELEMENTS and _sampled_bound_enabled(
+        k, block_threads, stable, short_rows, arch
+    )
+
+
+def _row_cache_blocks_per_cu(block_threads):
+    return 1024 // block_threads
+
+
+def _sample_geometry(tid, row_len, block_threads):
+    """A sampled row's samples a thread, its sample count, and a thread's sample
+    columns, strided through the row."""
+    thread_sample_keys = _SAMPLED_BOUND_KEYS_PER_SAMPLE * block_threads
+    samples_per_thread = (row_len + fx.Int32(thread_sample_keys - 1)) // fx.Int32(
+        thread_sample_keys
+    )
+    samples_per_thread = (
+        samples_per_thread < fx.Int32(_SAMPLED_BOUND_MIN_SAMPLES)
+    ).select(fx.Int32(_SAMPLED_BOUND_MIN_SAMPLES), samples_per_thread)
+    samples_per_thread = (
+        samples_per_thread > fx.Int32(_SAMPLED_BOUND_MAX_SAMPLES)
+    ).select(fx.Int32(_SAMPLED_BOUND_MAX_SAMPLES), samples_per_thread)
+    sample_count = samples_per_thread * fx.Int32(block_threads)
+    sample_stride = row_len // sample_count
+    positions = []
+    for item in range(_SAMPLED_BOUND_MAX_SAMPLES):
+        pos = (tid + fx.Int32(item * block_threads)) * sample_stride
+        if item >= _SAMPLED_BOUND_MIN_SAMPLES:
+            # A sample the row does not take reads past its end: from a buffer,
+            # that loads nothing.
+            pos = (fx.Int32(item) < samples_per_thread).select(pos, row_len)
+        positions.append(pos)
+    return samples_per_thread, sample_count, positions
+
+
+def _long_row_block_threads(k, stable, arch, num_rows):
+    # Where the row cache serves 512-thread blocks, two of them share a CU and
+    # overlap each other's barriers and LDS waits. Past _LONG_ROW_512_THREAD_MAX_K
+    # a sampled bound's candidates overrun the buffer such a block leaves beside
+    # its cache, and long rows fall back. With no more rows than CUs, a row has
+    # a CU to itself, and 1024 threads take all of its waves.
+    if (
+        k <= _LONG_ROW_512_THREAD_MAX_K
+        and _row_cache_enabled(k, 512, stable, False, arch)
+        and num_rows > get_cu_num()
+    ):
+        return 512
+    return 1024
+
+
+class _ScalarReads:
+    """tensor[i] as a scalar load, for a wave-uniform i."""
+
+    def __init__(self, tensor):
+        self.tensor = fx.rocdl.make_buffer_tensor(tensor)
+
+    def __getitem__(self, index):
+        return buf_scalar_load(self.tensor, index)
+
+
+def _with_unit_dim1_stride(desc):
+    # A one-row tile with a zero tensor_dim1_stride (GROUP1 s6[31:16]) hangs
+    # the data mover, and the 2-D builder leaves it zero.
+    group1 = fx.Vector(desc.dgroup1)
+    words = [fx.Int32(group1[i]) for i in range(8)]
+    words[6] = fx.Int32(1 << 16)
+    return TDMDescriptor2D(
+        dgroup0=desc.dgroup0,
+        dgroup1=fx.Vector.from_elements(words, fx.Int32).ir_value(),
+    )
+
+
 @cache
 def build_radix_topk_one_block_body(
     k: int,
@@ -94,6 +241,7 @@ def build_radix_topk_one_block_body(
     *,
     wave_size: int,
     arch: str = "",
+    row_cache: bool = False,
 ):
     """Build the one-block selector shared by the row kernels.
 
@@ -104,6 +252,8 @@ def build_radix_topk_one_block_body(
     arch selects the first radix level from _LONG_RADIX_BY_ARCH; the arches
     listed in _ONE_BLOCK_LDS_BUDGET_BYTES also grow the candidate buffer into
     whatever that budget leaves over. The rest keep the original layout.
+    row_cache adds the LDS row cache where _row_cache_enabled, for a caller
+    that passes run_one_block_body each next row.
     """
     if k <= 0:
         raise ValueError("k must be positive")
@@ -130,12 +280,11 @@ def build_radix_topk_one_block_body(
     full_key_vector_steps = (
         (_COMPACT_CAPACITY // _VEC) + block_threads - 1
     ) // block_threads
+    # A 512-thread block without the row cache takes the half-block budget; with
+    # it, the cache comes out of the one-block budget below.
     half_block = block_threads == 512 and arch in _HALF_BLOCK_LDS_BUDGET_BYTES
-    stable_sort_enabled = (
-        stable
-        and not short_rows
-        and (block_threads == 1024 or half_block)
-        and k <= 2048
+    stable_sort_enabled = _stable_sort_enabled(
+        k, block_threads, stable, short_rows, arch
     )
     if arch in _STABLE_SORT_ALL_STREAMING_ROWS:
         # Rows up to the cached capacity never reach the streaming path.
@@ -171,11 +320,21 @@ def build_radix_topk_one_block_body(
     # Writer and readers of the candidate columns are all gated on this.
     candidate_columns_used = not stable or stable_sort_enabled
     candidate_entry_bytes = 4 + (4 if candidate_columns_used else 0)
+    sampled_bound_enabled = _sampled_bound_enabled(
+        k, block_threads, stable, short_rows, arch
+    )
+    row_cache_enabled = row_cache and _row_cache_enabled(
+        k, block_threads, stable, short_rows, arch
+    )
+    row_cache_elements = _ROW_CACHE_ELEMENTS.get(block_threads, 0)
+    row_cache_slice = row_cache_elements // num_waves
     lds_budget_bytes = (
         _HALF_BLOCK_LDS_BUDGET_BYTES[arch]
-        if half_block
+        if half_block and not row_cache_enabled
         else _ONE_BLOCK_LDS_BUDGET_BYTES.get(arch, 0)
     )
+    if row_cache_enabled and _row_cache_blocks_per_cu(block_threads) > 1:
+        lds_budget_bytes -= row_cache_elements * 4
 
     spare_bytes = (
         lds_budget_bytes - histogram_bytes - stable_stage_bytes - scratch_bytes
@@ -187,10 +346,27 @@ def build_radix_topk_one_block_body(
     bitmap_capacity = min(
         candidate_capacity, stable_sort_capacity // 2 * len(stable_sort_sizes)
     )
+    # Exactly the rows the sampled path takes.
+    row_cache_min_row_len = max(
+        _SAMPLED_BOUND_MIN_ROWS_PER_K * k, _COMPACT_CAPACITY + 1, k + 1
+    )
 
-    # Block-wide prefix sums come from the cooperative library; its shared
-    # storage is one slot per wave.
+    # Block-wide prefix sums keep one slot per wave. The cooperative library's
+    # wave32 scan shuffles through LDS and every thread then folds all the
+    # slots, so the sampled path's scans use DPP and fold the slots in one wave
+    # scan.
     block_scan = fx.coop.BlockScan[fx.Int32, block_threads]
+    dpp_scan = sampled_bound_enabled
+    scan_storage = (
+        fx.Array[fx.Int32, num_waves, 16] if dpp_scan else block_scan.SharedStorage
+    )
+    if dpp_scan and wave_size != 32:
+        raise ValueError("the DPP scans take wave32")
+    if sampled_bound_enabled and _SAMPLED_HOT_BUCKETS % 4:
+        raise ValueError("lane counts take the hot buckets four to a word")
+    # A lane counts every block_threads-th candidate, and a byte holds each count.
+    if sampled_bound_enabled and candidate_capacity > 255 * block_threads:
+        raise ValueError("a lane's hot bucket counts overflow their bytes")
 
     # LDS layouts
     @fx.struct
@@ -219,11 +395,22 @@ def build_radix_topk_one_block_body(
 
     shared_arena_type = ShortPass1Storage if short_rows else ArenaStorage
 
-    @fx.struct
-    class SharedStorage:
-        arena: shared_arena_type
-        scan: block_scan.SharedStorage
-        metadata: fx.Array[fx.Int32, _METADATA_SIZE, 16]
+    if row_cache_enabled:
+
+        @fx.struct
+        class SharedStorage:
+            arena: shared_arena_type
+            scan: scan_storage
+            metadata: fx.Array[fx.Int32, _METADATA_SIZE, 16]
+            row_cache: fx.Array[fx.Float32, row_cache_elements, 16]
+
+    else:
+
+        @fx.struct
+        class SharedStorage:
+            arena: shared_arena_type
+            scan: scan_storage
+            metadata: fx.Array[fx.Int32, _METADATA_SIZE, 16]
 
     @flyc.jit
     def run_one_block_body(
@@ -235,6 +422,9 @@ def build_radix_topk_one_block_body(
         index_base,
         row_labels=None,
         write_row_values=True,
+        next_row_iter=None,
+        next_row_len=None,
+        fill_row=None,
     ):
         """Select the top k of one row segment into row_indices/row_values.
 
@@ -245,8 +435,23 @@ def build_radix_topk_one_block_body(
         longer than k writes identity indices and is
         intentionally disabled for labelled merge rows, which must be longer
         than k.
+
+        A caller walking rows over one storage passes the block's next row
+        (next_row_len 0 after the last) and fill_row, false exactly when the
+        previous call was passed this row as its next. With a row cache, the
+        body then reads the row from the cache and loads the next row into it.
         """
         tid = fx.thread_idx.x
+        use_row_cache = row_cache_enabled and next_row_len is not None
+        if const_expr(use_row_cache):
+            # An empty asm ties tid to the row, as no FlyDSL op hides a value
+            # from LLVM: hoisted out of the caller's row loop, values derived
+            # from tid stay live across all of it and spill.
+            tid = fx.Int32(
+                llvm.inline_asm(
+                    T.i32, [tid.ir_value(), row_len.ir_value()], "", "=v,0,v"
+                )
+            ) & fx.Int32(block_threads - 1)
         lane = tid % wave_size
 
         zero = fx.Int32(0)
@@ -343,7 +548,46 @@ def build_radix_topk_one_block_body(
 
         # Shared scratch
         scan = storage.scan.peek()
+        scan_slots = scan.view(fx.make_layout(num_waves, 1)) if dpp_scan else None
         metadata = storage.metadata.peek().view(fx.make_layout(_METADATA_SIZE, 1))
+
+        # Row cache
+        if const_expr(use_row_cache):
+            row_cache = storage.row_cache.peek().view(
+                fx.make_layout(row_cache_elements, 1)
+            )
+            row_cache_tiles = fx.logical_divide(row_cache, fx.make_layout(_VEC, 1))
+            row_cache_load_atom = fx.make_copy_atom(fx.UniversalCopy128b(), fx.Float32)
+
+        def fill_row_cache(row_iter, length):
+            """Start the tensor data mover on a row's first row_cache_elements
+            columns, a slice per wave; columns past the row are not read and land
+            as zeros. Each wave's tensor_wait and then a barrier publish them."""
+            first = fx.Int32(fx.rocdl.wave_id()) * fx.Int32(row_cache_slice)
+            valid = length - first
+            if valid > zero:
+                slice_layout = fx.make_layout(
+                    (1, row_cache_slice), (row_cache_slice, 1)
+                )
+                desc = make_tensor_descriptor_2d(
+                    global_ptr=fx.Tensor(
+                        fx.make_view(fx.add_offset(row_iter, first), slice_layout)
+                    ),
+                    lds_memref=fx.Tensor(
+                        fx.make_view(
+                            fx.add_offset(fx.get_iter(row_cache), first), slice_layout
+                        )
+                    ),
+                    global_offset=(0, 0),
+                    tensor_shape=(1, row_cache_slice),
+                    strides=(row_cache_slice, 1),
+                    tile_shape=(1, row_cache_slice),
+                    elem_bytes=4,
+                    oob_inner_bound=(valid < fx.Int32(row_cache_slice)).select(
+                        valid, fx.Int32(row_cache_slice)
+                    ),
+                )
+                tensor_load_2d(_with_unit_dim1_stride(desc))
 
         # Key encoding and classification
         def ordered_key(value):
@@ -408,7 +652,49 @@ def build_radix_topk_one_block_body(
                 metadata[_RUNNING_EQUAL] = zero
             gpu.barrier()
 
+        def reset_metadata(metadata):
+            if tid < _METADATA_SIZE:
+                metadata[tid] = zero
+            gpu.barrier()
+
         # Histogram and workgroup scan primitives
+        def wave_inclusive_sum(value):
+            # DPP shifts stay inside 16-lane rows; lane 15's sum then crosses
+            # into the upper row.
+            for shift in range_constexpr(4):
+                value = value + fx.Int32(
+                    update_dpp_i32(zero, value, _DPP_ROW_SHR | (1 << shift))
+                )
+            row_total = fx.coop.warp_broadcast(value, 15)
+            return value + (lane >= fx.Int32(16)).select(row_total, zero)
+
+        def wave_total(inclusive):
+            return fx.coop.warp_broadcast(inclusive, wave_size - 1)
+
+        def block_exclusive_sum(value, slots=scan_slots):
+            """Each thread's exclusive prefix of value, and the block's total.
+            Reads the scan slots after its barrier: another barrier must pass
+            before the next call writes them."""
+            if const_expr(not dpp_scan):
+                return block_scan.exclusive_with_aggregate(
+                    value, fx.ReductionOp.ADD, storage=scan
+                )
+            value = fx.Int32(value)
+            wave = fx.Int32(fx.rocdl.wave_id())
+            inclusive = wave_inclusive_sum(value)
+            if lane == fx.Int32(wave_size - 1):
+                slots[wave] = inclusive
+            gpu.barrier()
+            has_slot = lane < fx.Int32(num_waves)
+            slot = has_slot.select(slots[has_slot.select(lane, zero)], zero)
+            slot_inclusive = wave_inclusive_sum(slot)
+            # warp_broadcast from a runtime lane would shuffle through LDS.
+            wave_prefix = fx.Int32(
+                fx.rocdl.readlane(T.i32, slot_inclusive - slot, wave)
+            )
+            total = fx.coop.warp_broadcast(slot_inclusive, num_waves - 1)
+            return wave_prefix + inclusive - value, total
+
         def clear_histograms(histograms, bins_per_thread):
             for item in range_constexpr(bins_per_thread):
                 pos = tid + item * block_threads
@@ -427,6 +713,11 @@ def build_radix_topk_one_block_body(
                     histograms[0][pos] = merged
                 gpu.barrier()
 
+        def sampled_group_flip(bucket):
+            return (
+                (bucket >> fx.Int32(6)) & fx.Int32(later_bins_per_thread // 4 - 1)
+            ) << fx.Int32(2)
+
         def choose_threshold(
             target_k,
             above_slot,
@@ -435,19 +726,36 @@ def build_radix_topk_one_block_body(
             bins_per_thread,
             metadata,
             replicas=(),
+            clear=False,
+            xor_groups=False,
         ):
+            # A thread's bins are consecutive buckets. With xor_groups, bucket b
+            # sits at sampled_slot(b); a thread's bins lie in one 64-bucket span,
+            # so they share a flip.
             first_bin = tid * fx.Int32(bins_per_thread)
+            if const_expr(xor_groups):
+                group_flip = sampled_group_flip(first_bin)
             counts = fx.make_rmem_tensor(bins_per_thread, fx.Int32)
             local_total = zero
             for item in range_constexpr(bins_per_thread):
-                count = histogram[first_bin + item]
+                slot = first_bin + item
+                if const_expr(xor_groups):
+                    slot = (
+                        first_bin
+                        + (fx.Int32(item & ~3) ^ group_flip)
+                        + fx.Int32(item & 3)
+                    )
+                count = histogram[slot]
                 for replica in range_constexpr(len(replicas)):
-                    count = count + replicas[replica][first_bin + item]
+                    count = count + replicas[replica][slot]
                 counts[item] = count
                 local_total = local_total + count
-            exclusive, total = block_scan.exclusive_with_aggregate(
-                local_total, fx.ReductionOp.ADD, storage=scan
-            )
+                if const_expr(clear):
+                    # The closing barrier orders this before the next pass.
+                    histogram[slot] = zero
+                    for replica in range_constexpr(len(replicas)):
+                        replicas[replica][slot] = zero
+            exclusive, total = block_exclusive_sum(local_total)
             target_prefix = total - target_k
             for item in range_constexpr(bins_per_thread):
                 inclusive = exclusive + counts[item]
@@ -535,6 +843,105 @@ def build_radix_topk_one_block_body(
                     if active & (col < row_len):
                         body(col, values[item])
 
+        def step_elements(vector_indices, vectors, vector_count):
+            elements = []
+            for vector_idx, values in zip(vector_indices, vectors):
+                valid = vector_idx < vector_count
+                for item in range_constexpr(_VEC):
+                    elements.append(
+                        (valid, vector_idx * vec_width + item, values[item])
+                    )
+            return elements
+
+        def scan_row_cache(visit_step, context, vector_count):
+            # Only after the barrier that publishes the cache. In steps like
+            # scan_gm_row_in_steps: unrolled whole, every load stays live.
+            step_stride = block_size * fx.Int32(_SAMPLED_SCAN_UNROLL)
+            for first in range(zero, vector_count, step_stride):
+                vector_indices = []
+                vectors = []
+                for item in range_constexpr(_SAMPLED_SCAN_UNROLL):
+                    vector_idx = first + tid + fx.Int32(item * block_threads)
+                    fragment = fx.make_rmem_tensor(value_fragment_layout, fx.Float32)
+                    fx.copy(
+                        row_cache_load_atom,
+                        fx.slice(
+                            row_cache_tiles,
+                            (
+                                None,
+                                (vector_idx < vector_count).select(vector_idx, zero),
+                            ),
+                        ),
+                        fragment,
+                    )
+                    vector_indices.append(vector_idx)
+                    vectors.append(fragment.load())
+                visit_step(
+                    step_elements(vector_indices, vectors, vector_count), context
+                )
+
+        def scan_cached_row(visit_step, prologue):
+            """scan_gm_row_in_steps for a row the row cache holds whole."""
+            context = prologue()
+            scan_row_cache(visit_step, context, full_vector_count)
+            remain_col = full_vector_count * vec_width + tid
+            remains = remain_col < row_len
+            remain_value = row_cache[remains.select(remain_col, zero)]
+            visit_step([(remains, remain_col, remain_value)], context)
+
+        def scan_gm_row_in_steps(visit_step, prologue=None, cached_vectors=None):
+            """Visit the row in steps every thread enters: visit_step gets the
+            step's (valid, column, value) triples and may use wave collectives,
+            not block ones.
+
+            Each step issues all of its _SAMPLED_SCAN_UNROLL loads before visiting
+            any, so a row costs ceil(vectors / unroll) load latencies per thread
+            where scan_gm_row's one-vector cleanup pays one per leftover vector,
+            and a step's loads are issued before the previous step is visited, so
+            two steps stay in flight. A step's loads past the row reread vector 0
+            and are not valid. prologue runs block-wide while the first step's
+            loads are in flight, and every visit gets its result. When the row
+            cache holds the first cached_vectors vectors, the steps start past
+            them and the cache is visited after the first step, with the second
+            step in flight.
+            """
+            step_stride = block_size * fx.Int32(_SAMPLED_SCAN_UNROLL)
+            first_vector = zero if cached_vectors is None else cached_vectors
+
+            def load_vectors(first):
+                # Past the row, these reread vector 0 and are not valid.
+                vectors = []
+                for item in range_constexpr(_SAMPLED_SCAN_UNROLL):
+                    vector_idx = first + tid + fx.Int32(item * block_threads)
+                    safe_idx = (vector_idx < full_vector_count).select(vector_idx, zero)
+                    vectors.append(_load_f32x4(input_vector_tiles, safe_idx))
+                return vectors
+
+            def loaded_step(first, vectors):
+                vector_indices = [
+                    first + tid + fx.Int32(item * block_threads)
+                    for item in range_constexpr(_SAMPLED_SCAN_UNROLL)
+                ]
+                return step_elements(vector_indices, vectors, full_vector_count)
+
+            first_elements = loaded_step(first_vector, load_vectors(first_vector))
+            remain_col = full_vector_count * vec_width + tid
+            remains = remain_col < row_len
+            remain_value = input_row[remains.select(remain_col, zero)]
+            context = None
+            if const_expr(prologue is not None):
+                context = prologue()
+            next_first = first_vector + step_stride
+            vectors = load_vectors(next_first)
+            visit_step(first_elements, context)
+            if const_expr(cached_vectors is not None):
+                scan_row_cache(visit_step, context, cached_vectors)
+            for first in range(next_first, full_vector_count, step_stride):
+                next_vectors = load_vectors(first + step_stride)
+                visit_step(loaded_step(first, vectors), context)
+                vectors = next_vectors
+            visit_step([(remains, remain_col, remain_value)], context)
+
         # Radix histogram passes
         def accumulate_first_histogram(
             col, key, shift, mask, flat_histograms, bins, replicas, cached_keys=None
@@ -558,11 +965,19 @@ def build_radix_topk_one_block_body(
             prefix_mask = (1 << (_KEY_BITS - prefix_shift)) - 1
             return radix_bucket(key, prefix_shift, prefix_mask)
 
-        def accumulate_prefix_histogram(key, shift, mask, histogram, prefix_threshold):
+        def accumulate_prefix_histogram(
+            key, shift, mask, histogram, prefix_threshold, slot_of=lambda b: b
+        ):
             # Callers visit only columns inside the row.
             if preceding_prefix(key, shift, mask) == prefix_threshold:
                 bucket = radix_bucket(key, shift, mask)
-                atomic_add_i32(histogram, one, bucket, "workgroup")
+                atomic_add_i32(histogram, one, slot_of(bucket), "workgroup")
+
+        def sampled_slot(bucket):
+            # A thread's four-bucket groups are reordered by its place among the
+            # 64-bucket spans: a wave's loads of one group cover all banks, while
+            # adjacent buckets, where the atomics crowd, keep adjacent words.
+            return bucket ^ sampled_group_flip(bucket)
 
         # Non-stable emitters
         def scatter_unstable_keys(
@@ -671,9 +1086,7 @@ def build_radix_topk_one_block_body(
                     if word_idx < num_words:
                         word = bitmap[word_idx]
                     count = fx.ctpop(word)
-                    prefix, total = block_scan.exclusive_with_aggregate(
-                        count, fx.ReductionOp.ADD, storage=scan
-                    )
+                    prefix, total = block_exclusive_sum(count)
                     out_pos = tile_output_base + prefix
                     while word != zero:
                         bit_idx = fx.math.cttz(word)
@@ -689,6 +1102,97 @@ def build_radix_topk_one_block_body(
             else:
                 bitonic_sort_and_store_stable(
                     selected_local_indices, row_indices, row_values
+                )
+
+        def store_selected_candidates(
+            prefix_threshold,
+            num_needed,
+            candidate_count,
+            bitmap,
+            candidate_ordered_keys,
+            candidate_local_indices,
+            staged_local_indices,
+            row_indices,
+            row_values,
+        ):
+            """Stable emit of a row that selects every candidate at or above
+            prefix_threshold. The cleared histogram holds a bitmap of their
+            columns, set straight from the candidates and left cleared."""
+            if row_len <= fx.Int32(later_buckets * 32):
+                # A candidate's two reads leave ahead of its compare.
+                collect_stride = fx.Int32(_BITMAP_WORDS_PER_THREAD * block_threads)
+                for first in range(zero, candidate_count, collect_stride):
+                    candidates = []
+                    for item in range_constexpr(_BITMAP_WORDS_PER_THREAD):
+                        pos = first + tid + fx.Int32(item * block_threads)
+                        valid = pos < candidate_count
+                        pos = valid.select(pos, zero)
+                        candidates.append(
+                            (
+                                valid,
+                                candidate_ordered_keys[pos],
+                                candidate_local_indices[pos],
+                            )
+                        )
+                    for valid, key, col in candidates:
+                        above, equal = classify_prefix(
+                            key, long_shifts, prefix_threshold, 3
+                        )
+                        if valid & (above | equal):
+                            atomic_or_i32(
+                                bitmap,
+                                one << (col & fx.Int32(31)),
+                                col >> fx.Int32(5),
+                                "workgroup",
+                            )
+                gpu.barrier()
+
+                num_words = (row_len + fx.Int32(31)) >> fx.Int32(5)
+                output_base = zero
+                for tile in range(zero, num_words, collect_stride):
+                    if tile > zero:
+                        # The previous tile's scan reads finish before this
+                        # one writes the slots.
+                        gpu.barrier()
+                    words = []
+                    packed_count = zero
+                    for item in range_constexpr(_BITMAP_WORDS_PER_THREAD):
+                        word_idx = tile + tid + fx.Int32(item * block_threads)
+                        word = zero
+                        if word_idx < num_words:
+                            word = bitmap[word_idx]
+                            bitmap[word_idx] = zero
+                        words.append((word_idx, word))
+                        packed_count = packed_count + (
+                            fx.ctpop(word) << fx.Int32(item * 16)
+                        )
+                    packed_prefix, packed_total = block_exclusive_sum(packed_count)
+                    slice_base = output_base
+                    for item, (word_idx, word) in enumerate(words):
+                        out_pos = slice_base + (
+                            (packed_prefix >> fx.Int32(item * 16)) & fx.Int32(0xFFFF)
+                        )
+                        slice_base = slice_base + (
+                            (packed_total >> fx.Int32(item * 16)) & fx.Int32(0xFFFF)
+                        )
+                        while word != zero:
+                            col = (word_idx << fx.Int32(5)) + fx.math.cttz(word)
+                            row_indices[out_pos] = reported_index(col)
+                            if const_expr(write_values) and write_row_values:
+                                row_values[out_pos] = input_row[col]
+                            out_pos = out_pos + one
+                            word = word & (word - one)
+                    output_base = slice_base
+            else:
+                scatter_stable_sorted_keys(
+                    "compacted_candidates",
+                    prefix_threshold,
+                    num_needed,
+                    3,
+                    candidate_ordered_keys,
+                    candidate_local_indices,
+                    staged_local_indices,
+                    candidate_count=candidate_count,
                 )
 
         def scatter_stable_sorted_keys(
@@ -779,9 +1283,7 @@ def build_radix_topk_one_block_body(
                             classes[item] = 1
                             packed_local = packed_local + 1
 
-                packed_prefix, packed_step_total = block_scan.exclusive_with_aggregate(
-                    packed_local, fx.ReductionOp.ADD, storage=scan
-                )
+                packed_prefix, packed_step_total = block_exclusive_sum(packed_local)
                 my_above = above_base + (packed_prefix >> _PACKED_COUNT_BITS)
                 my_eq = equal_base + (packed_prefix & fx.Int32(_PACKED_COUNT_MASK))
                 for item in range_constexpr(num_elems):
@@ -1293,6 +1795,322 @@ def build_radix_topk_one_block_body(
                         final_key_mask,
                     )
 
+        def select_from_candidates(
+            candidate_count,
+            histogram,
+            candidate_ordered_keys,
+            candidate_local_indices,
+            staged_local_indices,
+        ):
+            """Finish a row whose candidates hold all of its top k, their level-1
+            histogram already built."""
+
+            def refine(level, remaining_k, prefix_threshold):
+                # The previous choose_threshold left the histogram cleared, and
+                # so does this one: the stable emit sets its bitmap there.
+                above_slot = _SECOND_ABOVE if level == 1 else _THIRD_ABOVE
+                threshold_slot = _SECOND_THRESHOLD if level == 1 else _THIRD_THRESHOLD
+                for pos in range(tid, candidate_count, block_size):
+                    accumulate_prefix_histogram(
+                        candidate_ordered_keys[pos],
+                        long_shifts[level],
+                        long_masks[level],
+                        histogram,
+                        prefix_threshold,
+                        slot_of=sampled_slot,
+                    )
+                gpu.barrier()
+                choose_threshold(
+                    remaining_k,
+                    above_slot,
+                    threshold_slot,
+                    histogram,
+                    later_bins_per_thread,
+                    metadata,
+                    clear=True,
+                    xor_groups=True,
+                )
+                remaining_k = remaining_k - metadata[above_slot]
+                prefix_threshold = (
+                    prefix_threshold << fx.Int32(long_radix_bits[level])
+                ) | metadata[threshold_slot]
+                return remaining_k, prefix_threshold
+
+            def count_candidate(key, bound_bucket, hot, histogram):
+                # The hot buckets are counted in a lane's bytes, four a word: their
+                # atomics would queue on a concentrated row's few words.
+                bucket = radix_bucket(key, long_shifts[0], long_masks[0])
+                offset = bucket - bound_bucket
+                counted = []
+                in_word = one << ((offset & fx.Int32(3)) << fx.Int32(3))
+                for word in range_constexpr(len(hot)):
+                    in_bucket = (offset >> fx.Int32(2)) == fx.Int32(word)
+                    counted.append(hot[word] + in_bucket.select(in_word, zero))
+                if offset >= fx.Int32(_SAMPLED_HOT_BUCKETS):
+                    atomic_add_i32(histogram, one, sampled_slot(bucket), "workgroup")
+                return counted
+
+            def add_lane_counts(bound_bucket, hot, histogram):
+                # A byte's wave sum can pass 255: a word's even and odd bytes are
+                # summed apart, as two 16-bit counts each.
+                totals = []
+                for word in range_constexpr(len(hot)):
+                    for half in range_constexpr(2):
+                        pair = (hot[word] >> fx.Int32(8 * half)) & fx.Int32(0x00FF00FF)
+                        total = wave_total(wave_inclusive_sum(pair))
+                        for byte in range_constexpr(2):
+                            totals.append(
+                                (
+                                    4 * word + half + 2 * byte,
+                                    (total >> fx.Int32(16 * byte)) & fx.Int32(0xFFFF),
+                                )
+                            )
+                if lane == zero:
+                    for item, count in totals:
+                        if count > zero:
+                            atomic_add_i32(
+                                histogram,
+                                count,
+                                sampled_slot(bound_bucket + fx.Int32(item)),
+                                "workgroup",
+                            )
+
+            def build_level_1_histogram(
+                bound_bucket, candidate_ordered_keys, histogram
+            ):
+                # From the compacted candidates after the scan: during it, an atomic
+                # a candidate queues on the few words a concentrated row fills.
+                hot = [zero for _ in range_constexpr(_SAMPLED_HOT_BUCKETS // 4)]
+                for pos in range(tid, candidate_count, block_size):
+                    hot = count_candidate(
+                        candidate_ordered_keys[pos], bound_bucket, hot, histogram
+                    )
+                add_lane_counts(bound_bucket, hot, histogram)
+                gpu.barrier()
+
+            # The bound's bucket, still in _FIRST_THRESHOLD, is the candidates'
+            # lowest.
+            build_level_1_histogram(
+                metadata[_FIRST_THRESHOLD], candidate_ordered_keys, histogram
+            )
+            choose_threshold(
+                top_k,
+                _FIRST_ABOVE,
+                _FIRST_THRESHOLD,
+                histogram,
+                later_bins_per_thread,
+                metadata,
+                clear=True,
+                xor_groups=True,
+            )
+            remaining_k, prefix_threshold = refine(
+                1, top_k - metadata[_FIRST_ABOVE], metadata[_FIRST_THRESHOLD]
+            )
+            if metadata[_SELECTED_BUCKET_COUNT] == remaining_k:
+                # The kth key's level-2 bucket is selected whole, so its lowest
+                # possible key bounds the selection: both emitters below then
+                # take every candidate at or above it.
+                prefix_threshold = prefix_threshold << fx.Int32(long_radix_bits[2])
+            else:
+                remaining_k, prefix_threshold = refine(2, remaining_k, prefix_threshold)
+
+            if const_expr(stable):
+                # Ties split by the kth key need the lowest indices: an ordered
+                # read of the row finds them.
+                if metadata[_SELECTED_BUCKET_COUNT] == remaining_k:
+                    store_selected_candidates(
+                        prefix_threshold,
+                        remaining_k,
+                        candidate_count,
+                        histogram,
+                        candidate_ordered_keys,
+                        candidate_local_indices,
+                        staged_local_indices,
+                        row_indices,
+                        row_values,
+                    )
+                else:
+                    scatter_stable_ordered_keys(
+                        "global_row", long_shifts, prefix_threshold, remaining_k, 3
+                    )
+            else:
+                scatter_unstable_keys(
+                    "compacted_candidates",
+                    long_shifts,
+                    prefix_threshold,
+                    remaining_k,
+                    3,
+                    candidate_count=candidate_count,
+                    candidate_ordered_keys=candidate_ordered_keys,
+                    candidate_local_indices=candidate_local_indices,
+                )
+
+        def run_sampled_path(
+            histogram,
+            candidate_ordered_keys,
+            candidate_local_indices,
+            staged_local_indices,
+        ):
+            """Select from the keys at or above a sampled level-1 bound, reading the
+            row once. Returns whether the row still needs the two-pass selection;
+            the metadata is then reset for it."""
+
+            samples_per_thread, sample_count, sample_positions = _sample_geometry(
+                tid, row_len, block_threads
+            )
+            cached_sample_items = len(sample_positions)
+            # A cached row is short enough for _SAMPLED_BOUND_MIN_SAMPLES.
+            thread_sample_keys = _SAMPLED_BOUND_KEYS_PER_SAMPLE * block_threads
+            if const_expr(
+                thread_sample_keys * _SAMPLED_BOUND_MIN_SAMPLES >= row_cache_elements
+            ):
+                cached_sample_items = _SAMPLED_BOUND_MIN_SAMPLES
+
+            def count_sample(sample_key):
+                atomic_add_i32(
+                    histogram,
+                    one,
+                    sampled_slot(
+                        radix_bucket(sample_key, long_shifts[0], long_masks[0])
+                    ),
+                    "workgroup",
+                )
+
+            def sample_bound(samples):
+                # The kth largest key is below the sample's target-th largest
+                # unless that many sample keys exceed it. The sample keys above the
+                # kth key count near a Poisson draw, so the target is their
+                # expected count plus _SAMPLED_BOUND_SIGMAS standard deviations
+                # and the margin, and a miss only leaves fewer than k candidates.
+                # A sample read from global is loaded ahead of the scan's first
+                # step: the wait for it leaves the step in flight.
+                sample_keys = [ordered_key(sample) for sample in samples]
+                clear_histograms((histogram,), later_bins_per_thread)
+                for item in range_constexpr(len(sample_keys)):
+                    if const_expr(item < _SAMPLED_BOUND_MIN_SAMPLES):
+                        count_sample(sample_keys[item])
+                    else:
+                        if fx.Int32(item) < samples_per_thread:
+                            count_sample(sample_keys[item])
+                gpu.barrier()
+                expected = (fx.Int32(k) * sample_count).to(fx.Float32) / row_len.to(
+                    fx.Float32
+                )
+                sample_target = (
+                    expected + fx.Float32(_SAMPLED_BOUND_SIGMAS) * fx.sqrt(expected)
+                ).to(fx.Int32) + fx.Int32(1 + _SAMPLED_BOUND_MARGIN)
+                sample_target = (sample_target > sample_count).select(
+                    sample_count, sample_target
+                )
+                choose_threshold(
+                    sample_target,
+                    _FIRST_ABOVE,
+                    _FIRST_THRESHOLD,
+                    histogram,
+                    later_bins_per_thread,
+                    metadata,
+                    clear=True,
+                    xor_groups=True,
+                )
+                return metadata[_FIRST_THRESHOLD]
+
+            def collect_above_bound(
+                elements, bound, candidate_ordered_keys, candidate_local_indices
+            ):
+                # A wave reserves the step's candidates with one returning
+                # atomic: one per key would wait on LDS for nearly every key.
+                keys = []
+                taken = []
+                count = zero
+                for valid, _, value in elements:
+                    key = ordered_key(value)
+                    take = valid & (
+                        radix_bucket(key, long_shifts[0], long_masks[0]) >= bound
+                    )
+                    count = count + take.select(one, zero)
+                    keys.append(key)
+                    taken.append(take)
+                inclusive = wave_inclusive_sum(count)
+                wave_count = wave_total(inclusive)
+                wave_first = zero
+                if (lane == fx.Int32(wave_size - 1)) & (wave_count > zero):
+                    wave_first = atomic_add_i32(
+                        metadata, wave_count, _CANDIDATE_COUNT, "workgroup"
+                    )
+                candidate_pos = wave_total(wave_first) + inclusive - count
+                for (_, col, _), key, take in zip(elements, keys, taken):
+                    if take:  # noqa: SIM102 - preserve FlyDSL branches
+                        if candidate_pos < fx.Int32(candidate_capacity):
+                            candidate_ordered_keys[candidate_pos] = key
+                            candidate_local_indices[candidate_pos] = col
+                    candidate_pos = candidate_pos + take.select(one, zero)
+
+            def visit(elements, bound_bucket):
+                # A runtime if stores only to buffers local to its function.
+                collect_above_bound(
+                    elements,
+                    bound_bucket,
+                    candidate_ordered_keys,
+                    candidate_local_indices,
+                )
+
+            def load_spilled_sample(pos):
+                # Both loads issue: a cached key's global one reads past the row's
+                # end, which loads nothing.
+                cached = pos < fx.Int32(row_cache_elements)
+                return cached.select(
+                    row_cache[cached.select(pos, zero)],
+                    input_row[cached.select(row_len, pos)],
+                )
+
+            def scan_global_row():
+                samples = [input_row[pos] for pos in sample_positions]
+                scan_gm_row_in_steps(visit, prologue=lambda: sample_bound(samples))
+
+            if const_expr(use_row_cache):
+                if row_len > fx.Int32(row_cache_elements):
+                    # The head is in the cache.
+                    samples = [load_spilled_sample(pos) for pos in sample_positions]
+                    scan_gm_row_in_steps(
+                        visit,
+                        prologue=lambda: sample_bound(samples),
+                        cached_vectors=fx.Int32(row_cache_elements // _VEC),
+                    )
+                else:
+                    scan_cached_row(
+                        visit,
+                        lambda: sample_bound(
+                            [
+                                row_cache[pos]
+                                for pos in sample_positions[:cached_sample_items]
+                            ]
+                        ),
+                    )
+            else:
+                scan_global_row()
+            gpu.barrier()
+            if const_expr(use_row_cache):  # noqa: SIM102 - constexpr guard
+                # Every wave is past the cache: the next row lands in it while
+                # this one is selected. A row that skipped the cache started
+                # that on entry.
+                if row_cached & next_cached:
+                    fill_row_cache(next_row_iter, next_row_len)
+            candidate_count = metadata[_CANDIDATE_COUNT]
+            fallback = (candidate_count < top_k) | (
+                candidate_count > fx.Int32(candidate_capacity)
+            )
+            if fallback:
+                reset_metadata(metadata)
+            else:
+                select_from_candidates(
+                    candidate_count,
+                    histogram,
+                    candidate_ordered_keys,
+                    candidate_local_indices,
+                    staged_local_indices,
+                )
+            return fallback
+
         def write_direct_scalar(row_indices, row_values):
             # One column per thread: only reached when k <= block_threads.
             col = tid
@@ -1388,12 +2206,31 @@ def build_radix_topk_one_block_body(
                 write_direct_vector(row_indices, row_values)
 
         # Body control flow
+        if const_expr(use_row_cache):
+            # A row the sampled path takes fills the cache, unless the previous
+            # row started that; any other row lends the cache to the next one.
+
+            def takes_cache(length):
+                return length >= fx.Int32(row_cache_min_row_len)
+
+            row_cached = takes_cache(row_len)
+            next_cached = takes_cache(next_row_len)
+            if row_cached:
+                if fill_row:
+                    fill_row_cache(input_row_iter, row_len)
+            else:
+                if next_cached:
+                    fill_row_cache(next_row_iter, next_row_len)
+
         if const_expr(row_labels is None) and row_len <= top_k:
             write_direct_output(row_indices, row_values)
 
         if row_len > top_k:
             if tid < _METADATA_SIZE:
                 metadata[tid] = zero
+            if const_expr(use_row_cache):  # noqa: SIM102 - constexpr guard
+                if row_cached:
+                    tensor_wait(0)
             gpu.barrier()
 
             if const_expr(short_rows):
@@ -1402,13 +2239,32 @@ def build_radix_topk_one_block_body(
                 if row_len <= fx.Int32(_COMPACT_CAPACITY):
                     run_cached_path(short_histograms)
                 else:
-                    run_streaming_path(
-                        long_histograms,
-                        histogram,
-                        candidate_ordered_keys,
-                        candidate_local_indices,
-                        staged_local_indices,
-                    )
+                    if const_expr(sampled_bound_enabled):
+                        # One streaming copy serves short rows and fallbacks.
+                        use_streaming = one > zero
+                        if row_len >= fx.Int32(_SAMPLED_BOUND_MIN_ROWS_PER_K * k):
+                            use_streaming = run_sampled_path(
+                                histogram,
+                                candidate_ordered_keys,
+                                candidate_local_indices,
+                                staged_local_indices,
+                            )
+                        if use_streaming:
+                            run_streaming_path(
+                                long_histograms,
+                                histogram,
+                                candidate_ordered_keys,
+                                candidate_local_indices,
+                                staged_local_indices,
+                            )
+                    else:
+                        run_streaming_path(
+                            long_histograms,
+                            histogram,
+                            candidate_ordered_keys,
+                            candidate_local_indices,
+                            staged_local_indices,
+                        )
 
     return SharedStorage, run_one_block_body
 
@@ -1438,6 +2294,12 @@ def build_radix_topk_one_block_module(
     """
     if full_rows and not is_decode:
         raise ValueError("full_rows is a decode-mode build; prefill reads both ends")
+    # A block walks rows so it can load its next row into the row cache, as many
+    # blocks per CU as the cache leaves LDS for.
+    persistent = _row_cache_enabled(k, block_threads, stable, short_rows, arch)
+    persistent_blocks = (
+        get_cu_num() * _row_cache_blocks_per_cu(block_threads) if persistent else 0
+    )
     shared_storage, run_one_block_body = build_radix_topk_one_block_body(
         k,
         block_threads,
@@ -1446,46 +2308,117 @@ def build_radix_topk_one_block_module(
         short_rows,
         wave_size=wave_size,
         arch=arch,
+        row_cache=persistent,
     )
     row_variant = "short" if short_rows else "mixed"
-
-    @flyc.kernel(
-        name=(
-            f"radix_topk_one_block_{'decode' if is_decode else 'prefill'}"
-            f"_{row_variant}_k{k}_b{block_threads}_w{wave_size}"
-            f"_v{int(write_values)}_s{int(stable)}"
-            f"{'_packed' if packed_rows else ''}"
-            f"{'_full' if full_rows else ''}"
-        ),
-        known_block_size=[block_threads, 1, 1],
+    kernel_name = (
+        f"radix_topk_one_block_{'decode' if is_decode else 'prefill'}"
+        f"_{row_variant}_k{k}_b{block_threads}_w{wave_size}"
+        f"_v{int(write_values)}_s{int(stable)}"
+        f"{'_packed' if packed_rows else ''}"
+        f"{'_full' if full_rows else ''}"
     )
-    def radix_topk_one_block_kernel(
-        input: fx.Tensor,
-        row_starts: fx.Tensor,
-        row_ends: fx.Tensor,
-        indices: fx.Tensor,
-        value_output: fx.Tensor,
-        width: fx.Int32,
-        next_n: fx.Int32,
-    ):
-        row = fx.Int32(fx.block_idx.x)
-        if const_expr(is_decode):
-            row_start = fx.Int32(0)
-            row_end = _row_length(row, row_ends, width, next_n, full_rows)
-        else:
-            row_start = row_starts[row]
-            row_end = row_ends[row]
-        read_row = fx.Int32(0) if packed_rows else row
-        read_start = row_starts[row] if packed_rows else row_start
-        physical_row = fx.slice(input, (read_row, None))
-        run_one_block_body(
-            fx.SharedAllocator().allocate(shared_storage),
-            fx.add_offset(fx.get_iter(physical_row), read_start),
-            row_end - row_start,
-            fx.slice(indices, (row, None)),
-            fx.slice(value_output, (row, None)),
-            row_start,
-        )
+
+    if persistent:
+
+        @flyc.kernel(name=kernel_name, known_block_size=[block_threads, 1, 1])
+        def radix_topk_one_block_kernel(
+            input: fx.Tensor,
+            row_starts: fx.Tensor,
+            row_ends: fx.Tensor,
+            indices: fx.Tensor,
+            value_output: fx.Tensor,
+            width: fx.Int32,
+            next_n: fx.Int32,
+            rows_m: fx.Int32,
+            grid_rows: fx.Int32,
+        ):
+            def row_bounds(row, starts, ends):
+                # The row's length, the column of its start, and where its first
+                # element sits in the row it is read from.
+                if const_expr(is_decode):
+                    row_start = fx.Int32(0)
+                    row_end = _row_length(row, ends, width, next_n, full_rows)
+                else:
+                    row_start = starts[row]
+                    row_end = ends[row]
+                read_start = starts[row] if packed_rows else row_start
+                return row_end - row_start, row_start, read_start
+
+            def row_first(row, read_start):
+                read_row = fx.Int32(0) if packed_rows else row
+                physical_row = fx.slice(input, (read_row, None))
+                return fx.add_offset(fx.get_iter(physical_row), read_start)
+
+            storage = fx.SharedAllocator().allocate(shared_storage)
+            first_row = fx.Int32(fx.block_idx.x)
+            # The bounds are read as scalars a row ahead of their use: past the
+            # first stores the compiler no longer reads them with scalar loads,
+            # and the vector round trips would open every row.
+            starts, ends = _ScalarReads(row_starts), _ScalarReads(row_ends)
+            next_row = first_row + grid_rows
+            has_next = next_row < rows_m
+            row_len, row_start, read_start = row_bounds(first_row, starts, ends)
+            next_len, next_start, next_read = row_bounds(
+                has_next.select(next_row, first_row), starts, ends
+            )
+            next_len = has_next.select(next_len, fx.Int32(0))
+            for row in range(first_row, rows_m, grid_rows):
+                next_row = row + grid_rows
+                after_row = next_row + grid_rows
+                has_after = after_row < rows_m
+                after_len, after_start, after_read = row_bounds(
+                    has_after.select(after_row, row), starts, ends
+                )
+                run_one_block_body(
+                    storage,
+                    row_first(row, read_start),
+                    row_len,
+                    fx.slice(indices, (row, None)),
+                    fx.slice(value_output, (row, None)),
+                    row_start,
+                    next_row_iter=row_first(
+                        (next_row < rows_m).select(next_row, row), next_read
+                    ),
+                    next_row_len=next_len,
+                    fill_row=row == first_row,
+                )
+                # The next row resets LDS the slowest wave may still be reading.
+                gpu.barrier()
+                row_len, row_start, read_start = next_len, next_start, next_read
+                next_len = has_after.select(after_len, fx.Int32(0))
+                next_start, next_read = after_start, after_read
+
+    else:
+
+        @flyc.kernel(name=kernel_name, known_block_size=[block_threads, 1, 1])
+        def radix_topk_one_block_kernel(
+            input: fx.Tensor,
+            row_starts: fx.Tensor,
+            row_ends: fx.Tensor,
+            indices: fx.Tensor,
+            value_output: fx.Tensor,
+            width: fx.Int32,
+            next_n: fx.Int32,
+        ):
+            row = fx.Int32(fx.block_idx.x)
+            if const_expr(is_decode):
+                row_start = fx.Int32(0)
+                row_end = _row_length(row, row_ends, width, next_n, full_rows)
+            else:
+                row_start = row_starts[row]
+                row_end = row_ends[row]
+            read_row = fx.Int32(0) if packed_rows else row
+            read_start = row_starts[row] if packed_rows else row_start
+            physical_row = fx.slice(input, (read_row, None))
+            run_one_block_body(
+                fx.SharedAllocator().allocate(shared_storage),
+                fx.add_offset(fx.get_iter(physical_row), read_start),
+                row_end - row_start,
+                fx.slice(indices, (row, None)),
+                fx.slice(value_output, (row, None)),
+                row_start,
+            )
 
     @flyc.jit
     def launch_radix_topk_one_block(
@@ -1499,8 +2432,24 @@ def build_radix_topk_one_block_module(
         rows_m: fx.Int32,
         stream: fx.Stream,
     ):
-        radix_topk_one_block_kernel(
-            input, row_starts, row_ends, indices, values, width, next_n
-        ).launch(grid=(rows_m, 1, 1), block=(block_threads, 1, 1), stream=stream)
+        if const_expr(persistent):
+            grid_rows = (rows_m < fx.Int32(persistent_blocks)).select(
+                rows_m, fx.Int32(persistent_blocks)
+            )
+            radix_topk_one_block_kernel(
+                input,
+                row_starts,
+                row_ends,
+                indices,
+                values,
+                width,
+                next_n,
+                rows_m,
+                grid_rows,
+            ).launch(grid=(grid_rows, 1, 1), block=(block_threads, 1, 1), stream=stream)
+        else:
+            radix_topk_one_block_kernel(
+                input, row_starts, row_ends, indices, values, width, next_n
+            ).launch(grid=(rows_m, 1, 1), block=(block_threads, 1, 1), stream=stream)
 
     return launch_radix_topk_one_block
