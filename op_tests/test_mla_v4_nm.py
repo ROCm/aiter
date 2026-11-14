@@ -1311,6 +1311,34 @@ def test_v4_nm_one_split_per_seq_on_wide_grid():
 
 
 @needs_gfx950
+@pytest.mark.parametrize(
+    "gqa,kv_lens",
+    [
+        (16, [256, 0, 64, 1, 0, 33, 300, 32]),  # dchunk merge (grid 128)
+        (128, [1152, 0, 64, 1152]),  # dchunk merge (grid 512)
+        (128, [300, 0] * 10),  # loop merge (grid 2560 > 2048)
+    ],
+)
+def test_v4_nm_empty_seq_multi_split(gqa, kv_lens):
+    """A kv_len=0 seq on a multi-split grid has no valid split (stage1 writes
+    neither its partials nor its valid_split_count): both stage-2 merges must
+    write 0 for it (the sink takes all the softmax mass), not 0/0 = NaN, and
+    leave the other seqs untouched."""
+    n = len(kv_lens)
+    split = {
+        "num_kv_splits": 4,
+        "split_indptr": torch.arange(
+            0, (n + 1) * 4, 4, dtype=torch.int32, device="cuda"
+        ),
+    }
+    err, out = _run_varlen_point(kv_lens, gqa_ratio=gqa, split_kwargs=split)
+    empty = torch.tensor(kv_lens, device=out.device) == 0
+    assert torch.isfinite(out).all()
+    assert bool((out[empty] == 0).all())
+    assert err < 0.02
+
+
+@needs_gfx950
 def test_v4_nm_ragged_short_seq_no_corrupt():
     """A short seq must not be corrupted by over-allocated splits (host ragged
     split_indptr fix).
