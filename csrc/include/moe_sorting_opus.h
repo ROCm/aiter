@@ -48,6 +48,19 @@ void mxfp4_moe_sort_quant_fwd(aiter_tensor_t& hidden_states,
                               int num_experts,
                               std::optional<aiter_tensor_t> num_local_tokens = std::nullopt);
 
+// MiniMax-M3.1 FHMoE decode: opus sort + moe_buf zero + MXFP4/MXFP8 quant + scale sort, one launch.
+void m3_moe_sort_quant_fwd(aiter_tensor_t& hidden_states,
+                           aiter_tensor_t& topk_ids,
+                           aiter_tensor_t& topk_weights,
+                           aiter_tensor_t& sorted_token_ids,
+                           aiter_tensor_t& sorted_weights,
+                           aiter_tensor_t& sorted_expert_ids,
+                           aiter_tensor_t& num_valid_ids,
+                           aiter_tensor_t& moe_buf,
+                           aiter_tensor_t& activation_quant,
+                           aiter_tensor_t& activation_scale,
+                           std::optional<aiter_tensor_t> num_local_tokens = std::nullopt);
+
 #ifdef MOE_SORTING_OPUS_IMPL
 // ============================================================================
 // Implementation section - only compiled in the .cu translation unit

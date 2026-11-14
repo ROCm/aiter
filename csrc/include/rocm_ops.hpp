@@ -1538,6 +1538,19 @@ namespace py = pybind11;
           py::arg("activation_quant"),                 \
           py::arg("activation_scale_token"),           \
           py::arg("num_experts"),                      \
+          py::arg("num_local_tokens") = std::nullopt); \
+    m.def("m3_moe_sort_quant_fwd",                     \
+          &m3_moe_sort_quant_fwd,                      \
+          py::arg("hidden_states"),                    \
+          py::arg("topk_ids"),                         \
+          py::arg("topk_weights"),                     \
+          py::arg("sorted_token_ids"),                 \
+          py::arg("sorted_weights"),                   \
+          py::arg("sorted_expert_ids"),                \
+          py::arg("num_valid_ids"),                    \
+          py::arg("moe_buf"),                          \
+          py::arg("activation_quant"),                 \
+          py::arg("activation_scale"),                 \
           py::arg("num_local_tokens") = std::nullopt);
 
 #define PA_MQA_LOGITS_MXFP4_PYBIND                       \

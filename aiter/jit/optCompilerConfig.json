@@ -673,6 +673,7 @@
     "module_moe_sorting_opus": {
         "srcs": [
             "f'{AITER_CSRC_DIR}/py_itfs_cu/moe_sorting_opus_kernels.cu'",
+            "f'{AITER_CSRC_DIR}/py_itfs_cu/m3_moe_sort_quant_kernels.cu'",
             "f'{AITER_CSRC_DIR}/pybind/moe_sorting_opus_pybind.cu'"
         ],
         "flags_extra_cc": [],
