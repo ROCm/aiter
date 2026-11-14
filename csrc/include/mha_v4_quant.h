@@ -23,6 +23,13 @@ void rotate_activation_mxfp8_quant(aiter_tensor_t& out,
                                    double multiplier,
                                    const aiter_tensor_t& mean);
 
+// As above on the [b, s, 2h, 128] half-head view of hd256 K, but the data goes straight into the
+// hd256 MXFP8 code object's 64-token K records, E8M0 tail included; `scale` stays token-major.
+void rotate_activation_mxfp8_quant_k_hd256(aiter_tensor_t& out,
+                                           aiter_tensor_t& scale,
+                                           const aiter_tensor_t& input,
+                                           const aiter_tensor_t& mean);
+
 void rotate_activation_mxfp6_quant(aiter_tensor_t& out,
                                    aiter_tensor_t& scale,
                                    const aiter_tensor_t& input,
