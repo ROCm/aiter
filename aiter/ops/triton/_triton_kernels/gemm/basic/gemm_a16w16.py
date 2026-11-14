@@ -82,7 +82,9 @@ def _gemm_a16_w16_kernel(
     tl.assume(stride_ak > 0)
     tl.assume(stride_bk > 0)
     tl.assume(stride_bn > 0)
-    tl.assume(stride_ck > 0)
+    # Non-split calls have no partial-output buffer and pass a zero stride.
+    if NUM_KSPLIT > 1:
+        tl.assume(stride_ck > 0)
     tl.assume(stride_cm > 0)
     tl.assume(stride_cn > 0)
 
@@ -141,7 +143,14 @@ def _gemm_a16_w16_kernel(
 
         split_k_end = tl.minimum(split_k_start + SPLITK_BLOCK_SIZE, K)
         k_span = split_k_end - split_k_start
-        num_k_iter = tl.cdiv(k_span, BLOCK_SIZE_K)
+        # Fused-activation epilogues keep the runtime trip count: with a
+        # compile-time count, gfx950 codegen for e.g. 256x256x64 tiles with
+        # GELU fails LLVM machine verification ("Virtual register defs don't
+        # dominate all uses").
+        if EVEN_K and not use_activation:
+            num_k_iter = SPLITK_BLOCK_SIZE // BLOCK_SIZE_K
+        else:
+            num_k_iter = tl.cdiv(k_span, BLOCK_SIZE_K)
 
         for k in range(num_k_iter):
             # Load the next block of A and B, generate a mask by checking the K dimension.
