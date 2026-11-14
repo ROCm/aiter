@@ -1635,9 +1635,10 @@ class MlaDecodeShapeSupport:
     fold_factor is the number of 16-head pseudo-batches each request is split
     into, and kernel_num_heads the head count the kernel and reducer see.
     planner_accepts is False where get_mla_metadata_v1 would reject the shape.
-    The planner fields and reduce_supported describe the persistent route; with
-    persistent=False mla_decode_fwd does not fold and only the asm table
-    decides supported.
+    The planner fields and reduce_supported describe the persistent route.
+    With persistent=False, the asm table decides support and may select a
+    smaller head count with a longer query dimension. The wrapper then folds
+    heads into queries according to that returned layout.
     supported is True when the selected backend has a kernel for the shape,
     False when it does not, and None when it cannot be determined (opus, HK
     and FlyDSL routes, or a failed asm query); reasons explains every
@@ -2090,6 +2091,40 @@ def mla_decode_asm_query(
     return packed & 0xFF, (packed >> 8) & 0xFF, (packed >> 16) & 0xFF, kernel
 
 
+@_functools.lru_cache(maxsize=4096)
+def _mla_decode_asm_head_layout(
+    num_heads: int,
+    max_seqlen_q: int,
+    q_dtype: torch.dtype,
+    kv_dtype: torch.dtype,
+    arch: str,
+    page_size: int,
+) -> tuple[int, int]:
+    _, q_type = _mla_shape_dtype(q_dtype)
+    _, kv_type = _mla_shape_dtype(kv_dtype)
+    code, gqa, qlen, _ = mla_decode_asm_query(
+        arch,
+        q_type,
+        kv_type,
+        num_heads,
+        1,
+        max_seqlen_q,
+        False,
+        True,
+        False,
+        False,
+        page_size,
+    )
+    if (
+        code == _MlaAsmStatusCode.OK
+        and 0 < gqa < num_heads
+        and num_heads % gqa == 0
+        and gqa * qlen == num_heads * max_seqlen_q
+    ):
+        return gqa, qlen
+    return num_heads, max_seqlen_q
+
+
 def mla_ps1_fp8_asm_query(
     arch: str,
     num_heads: int,
@@ -2163,6 +2198,7 @@ def _get_mla_decode_shape_support_cached(
     asm_heads = (
         p.kernel_num_heads if persistent and backend is MlaBackend.ASM else num_heads
     )
+    heads_as_queries = False
     asm_status, asm_kernel = MlaAsmStatus.NOT_ASM, None
     # Stage 1 picks its cprr kernel from g_kv_indptr, PS1 from cp_world_size > 1.
     cprr = cp_round_robin if backend is MlaBackend.ASM else cp_world_size > 1
@@ -2195,6 +2231,14 @@ def _get_mla_decode_shape_support_cached(
             reasons.append(f"asm query failed: {e}")
         if asm_status is MlaAsmStatus.OK:
             asm_kernel = kernel
+            heads_as_queries = (
+                not persistent
+                and 0 < gqa < num_heads
+                and num_heads % gqa == 0
+                and gqa * qlen == num_heads * max_seqlen_qo
+            )
+            if heads_as_queries and cp_world_size != 1:
+                reasons.append("non-persistent head folding requires cp_world_size=1")
         elif asm_status is not MlaAsmStatus.UNKNOWN:
             reasons.append(
                 f"{backend.value} {asm_status.value} on {arch}: q={q_type} kv={kv_type} "
@@ -2263,6 +2307,7 @@ def _get_mla_decode_shape_support_cached(
         or hk_problems
         or opus_problems
         or a0_blocked
+        or (heads_as_queries and cp_world_size != 1)
         or (asm_route and asm_status not in (MlaAsmStatus.OK, MlaAsmStatus.UNKNOWN))
     ):
         supported = False
@@ -2279,11 +2324,16 @@ def _get_mla_decode_shape_support_cached(
         flydsl_ps1=flydsl_ps1,
         planner=planner,
         planner_accepts=planner_accepts,
-        natively_supported=p.natively_supported,
-        fold_factor=p.qk_batch_ratio,
-        seqlen_fold=p.seqlen_fold,
-        native=p.natively_supported and p.qk_batch_ratio == 1 and p.seqlen_fold == 1,
-        kernel_num_heads=p.kernel_num_heads,
+        natively_supported=p.natively_supported and not heads_as_queries,
+        fold_factor=1 if heads_as_queries else p.qk_batch_ratio,
+        seqlen_fold=num_heads // gqa if heads_as_queries else p.seqlen_fold,
+        native=(
+            not heads_as_queries
+            and p.natively_supported
+            and p.qk_batch_ratio == 1
+            and p.seqlen_fold == 1
+        ),
+        kernel_num_heads=gqa if heads_as_queries else p.kernel_num_heads,
         reduce_supported=p.reduce_supported,
         backend=backend,
         asm_status=asm_status,
@@ -2330,6 +2380,8 @@ def get_mla_decode_shape_support(
     mla_decode_fwd runs gfx950 bf16 16-head single-token decode non-persistent
     at batch >= AITER_MLA_DECODE_PERSISTENT_MAX_BATCH; persistent=False
     describes that route.
+    Non-persistent gfx950 BF16 QH128/Q1 with page_size=1 and no context
+    parallelism is folded into QH32/Q4 with the causal mask disabled.
     arch=None uses the current device's arch; an explicit arch needs no device,
     but asm availability is only known for arches compiled into the build.
     enable_experimental and flydsl_ps1 default to the AITER_ENABLE_EXPERIMENTAL
