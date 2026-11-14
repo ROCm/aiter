@@ -29,11 +29,15 @@ try:
     from aiter.ops.triton._gluon_kernels.gfx1250.attention.mla import (
         _mla_prefill_fwd_kernel_non_pipelined as gluon_mla_prefill_fwd_kernel_non_pipelined,
     )
+    from aiter.ops.triton._gluon_kernels.gfx1250.attention.mla_decode_h128_fp8_partitioned_lds import (
+        mla_decode_h128_fp8_partitioned_lds as gluon_mla_decode_h128_fp8_partitioned_lds,
+    )
 except:  # noqa: E722
     gluon_mla_prefill_fwd_kernel_non_pipelined = None
     gluon_mla_decode_fwd_kernel_non_pipelined = None
     gluon_mla_decode_fwd_kernel = None
     gluon_mla_decode_fwd_reduce_kernel = None
+    gluon_mla_decode_h128_fp8_partitioned_lds = None
 
 from aiter.ops.triton.utils._triton import arch_info
 from aiter.ops.triton.utils.config_utils import (
@@ -473,6 +477,27 @@ def mla_decode_fwd(
         and _fits_int32_offsets(out)
         and _fits_int32_offsets(block_tables)
     )
+    # Within the LDS-pipeline envelope, one KV head with BF16 output and no output
+    # scale runs the partitioned-LDS kernel; the rest stays on _mla_decode_fwd_kernel.
+    if (
+        use_lds_pipeline
+        and gluon_mla_decode_h128_fp8_partitioned_lds is not None
+        and num_kv_heads == 1
+        and out.dtype == torch.bfloat16
+        and out_scale is None
+        and q_descale is not None
+        and kv_descale is not None
+    ):
+        return gluon_mla_decode_h128_fp8_partitioned_lds(
+            q,
+            kv_buffer,
+            out,
+            seqused_k,
+            block_tables,
+            softmax_scale,
+            q_descale,
+            kv_descale,
+        )
     # The pipelined kernel reads unshuffled pages as tiles of one flat token
     # table. Multi-token decode stays on the non-pipelined kernel: the pipelined
     # epilogue always processes a tile, even in a segment past a query's prefix.
