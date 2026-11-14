@@ -319,6 +319,7 @@ jobs:
         with:
           name: aiter-prebuild-log-py${{ matrix.python_version }}-attempt${{ github.run_attempt }}
           path: .aiter-prebuild.log
+          include-hidden-files: true
           if-no-files-found: warn
           compression-level: 6
           retention-days: 7
