@@ -920,6 +920,48 @@ def varlen_flash_attn_seq_padding_benchmark(
     )
 
 
+@pytest.mark.parametrize("dtype", [dtypes.fp16, dtypes.bf16])
+@pytest.mark.parametrize("d", [64, 128])
+@pytest.mark.parametrize("causal", [False, True])
+@pytest.mark.parametrize("min_seqlen_q", [1, 2])
+def test_flash_attn_varlen_func_min_seqlen_q_computes_short_seqs(
+    dtype, d, causal, min_seqlen_q
+):
+    """Sequences with seqlen_q <= min_seqlen_q must be computed, not skipped."""
+    torch.random.manual_seed(0)
+    seqlens_q = [1, 2, 8, 1]
+    seqlens_k = [64, 2, 40, 1]
+    cu_seqlens_q = torch.tensor(
+        [0] + list(itertools.accumulate(seqlens_q)), dtype=torch.int32, device="cuda"
+    )
+    cu_seqlens_k = torch.tensor(
+        [0] + list(itertools.accumulate(seqlens_k)), dtype=torch.int32, device="cuda"
+    )
+    q = torch.randn(sum(seqlens_q), 8, d, device="cuda", dtype=dtype)
+    k = torch.randn(sum(seqlens_k), 8, d, device="cuda", dtype=dtype)
+    v = torch.randn_like(k)
+
+    def run(min_q):
+        return aiter.flash_attn_varlen_func(
+            q,
+            k,
+            v,
+            cu_seqlens_q,
+            cu_seqlens_k,
+            max(seqlens_q),
+            max(seqlens_k),
+            min_seqlen_q=min_q,
+            causal=causal,
+            return_lse=True,
+            out=torch.full_like(q, float("nan")),
+        )
+
+    out_ref, lse_ref = run(0)
+    out, lse = run(min_seqlen_q)
+    torch.testing.assert_close(out, out_ref, atol=0, rtol=0)
+    torch.testing.assert_close(lse, lse_ref, atol=0, rtol=0)
+
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
         formatter_class=argparse.RawTextHelpFormatter,

@@ -3609,7 +3609,7 @@ def _flash_attn_varlen_forward(
             cu_seqlens_k,
             max_seqlen_q,
             max_seqlen_k,
-            min_seqlen_q,
+            0,  # min_seqlen_q
             dropout_p,
             softmax_scale,
             logits_soft_cap,
@@ -3657,7 +3657,7 @@ def _flash_attn_varlen_forward(
             cu_seqlens_k,
             max_seqlen_q,
             max_seqlen_k,
-            min_seqlen_q,
+            0,  # min_seqlen_q
             dropout_p,
             softmax_scale,
             logits_soft_cap,
@@ -4239,7 +4239,8 @@ def flash_attn_varlen_func(
            of the sequences in the batch, used to index into kv.
         max_seqlen_q: int. Maximum query sequence length in the batch.
         max_seqlen_k: int. Maximum key sequence length in the batch.
-        min_seqlen_q: int. Minimum query sequence length for chunked prefill.
+        min_seqlen_q: int. Unused; kept for API compatibility. Every sequence is
+            computed regardless of its query length.
         dropout_p: float. Dropout probability.
         softmax_scale: float. The scaling of QK^T before applying softmax.
             Default to 1 / sqrt(headdim_q).
