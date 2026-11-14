@@ -16,4 +16,4 @@ Q/SWA use FP8 with E8M0 scales, CSA uses NVFP4 with E4M3 scales, and output is B
   The API allocates FP32 workspaces `[N,S,65,512]` and `[N,S,64]` for S>1.
 - Code object `fused_mla_a8w4_qh64_1tg_16mx4_64nx1_sparse_np_v41.co`.
 - Symbol `fused_mla_a8w4_qh64_1tg_16mx4_64nx1_sparse_np_v41`; 120-byte arguments, 327680-byte static LDS.
-- CO SHA256: `ef2f135b06915be3487958d2f21c06da804cf7e5199772e2d4419ce6801b632e`.
+- CO SHA256: `ab4c3201944a87bd17e57ca8d9674a9e5318ca96ccfbf6f2fde0c14a429f59c4`.
