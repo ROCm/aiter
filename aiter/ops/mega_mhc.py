@@ -120,7 +120,8 @@ def _select_stream_variant(tokens, hidden=5120):
             if limit == 384 and hidden != 5120:
                 split = 8
             return f"mid{limit}", split
-    if tokens == 4160:
+    # One to eight tiles past whole rounds of 256 CUs: split them over H.
+    if tokens > 4096 and 1 <= (tokens + 15) // 16 % 256 <= 8:
         return "tail", 1
     return "large", 1
 
