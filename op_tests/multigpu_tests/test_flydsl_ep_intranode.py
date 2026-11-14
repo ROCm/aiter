@@ -25,7 +25,6 @@ top-k slots on one rank, masked (-1) slots, ranks with no tokens.
 
 import argparse
 import os
-import socket
 import sys
 
 import torch
@@ -33,12 +32,6 @@ import torch.distributed as dist
 import torch.multiprocessing as mp
 
 ROUTINGS = ("random", "onerank", "skip0", "dupe", "neg", "empty")
-
-
-def _free_port():
-    with socket.socket() as s:
-        s.bind(("127.0.0.1", 0))
-        return s.getsockname()[1]
 
 
 def _make_ids(routing, T, K, E, epr, world, rank, g):
@@ -238,24 +231,24 @@ def _worker(rank, world, port, shapes, tokens, routings, replays, result_q):
 
 
 def run(world=None, shapes=None, tokens=None, routings=ROUTINGS, replays=3):
-    from aiter.jit.utils.chip_info import get_gfx
+    from aiter.dist.utils import get_open_port
+    from aiter.jit.utils.chip_info import get_gfx_runtime
 
-    if get_gfx() not in ("gfx942", "gfx950"):
-        print(
-            f"skip: FlyDSL intra-node EP kernels target gfx942/gfx950, not {get_gfx()}"
-        )
+    gfx = get_gfx_runtime()
+    if gfx not in ("gfx942", "gfx950"):
+        print(f"skip: FlyDSL intra-node EP kernels target gfx942/gfx950, not {gfx}")
         return True
     n_dev = torch.cuda.device_count()
     world = min(8, n_dev) if world is None else world
-    if world < 2 or world > n_dev:
-        print(f"skip: needs 2..8 GPUs, have {n_dev}")
+    if world < 2 or world > min(8, n_dev):
+        print(f"skip: world {world} needs 2..8 GPUs, have {n_dev}")
         return True
     # (hidden, experts, top-k, max tokens per rank)
     shapes = shapes or [(5120, 48 * world, 6, 4096), (2048, 16 * world, 3, 1024)]
     tokens = tokens or [1, 7, 32, 192, 1000]
     ctx = mp.get_context("spawn")
     q = ctx.Queue()
-    port = _free_port()
+    port = get_open_port()
     procs = [
         ctx.Process(
             target=_worker,
