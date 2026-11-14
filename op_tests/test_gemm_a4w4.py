@@ -2,6 +2,7 @@
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
 import argparse
+import functools
 import os
 
 import pandas as pd
@@ -12,7 +13,7 @@ from aiter import dtypes
 from aiter.jit.core import AITER_CONFIGS
 from aiter.jit.utils.chip_info import get_cu_num
 from aiter.jit.utils.chip_info import get_gfx_runtime as get_gfx
-from aiter.ops.gemm_op_a4w4 import gemm_a4w4
+from aiter.ops.gemm_op_a4w4 import _FLYDSL_AVAILABLE, gemm_a4w4
 from aiter.ops.shuffle import shuffle_mxfp8fp4_scale, shuffle_weight
 from aiter.test_common import (
     assertAllclose,
@@ -41,6 +42,22 @@ OFF_GRID_SHAPES = {
     (129, 36864, 7168): True,
     (255, 36864, 7168): True,
 }
+# (M, N, K, kernelName, other kernelName): two compute kernels that do not fit the instruction cache
+# together. Each prefetches its own code, so it must run as fast right after the other as back to back:
+# alternating vs back to back is 0.94-1.06 with the prefetch and 1.5-2.2 without. One launch holds three
+# kernels, picked by the K-tiles left after the full revolutions (0, 2 or any count); the K below leave
+# 0, 2 and 3. Other K add a data-side cost of up to 1.2 that the prefetch does not touch.
+SWITCH_CASES = tuple(
+    (
+        4096,
+        3584,
+        k,
+        "flydsl_a4w4_bpreshuffle_compute_wmma_t256x256x256_mw2_nw2_nb4_sk1_cm2_cn2",
+        "flydsl_a4w4_bpreshuffle_compute_wmma_t256x256x256_mw2_nw2_nb4_sk1_cm4_cn2",
+    )
+    for k in (7168, 3584, 7936)
+)
+SWITCH_RATIO_MAX = 1.15
 pd.set_option("display.max_columns", 30)
 pd.set_option("display.width", 1000)
 pd.set_option("display.max_colwidth", 30)
@@ -110,17 +127,10 @@ def run_gemm_asm(
     return out
 
 
-def _test_gemm_gfx1250(dtype, M, N, K):
-    """gemm_a4w4 as ATOM calls it on gfx1250: the weight and the activation scale in the
-    32x4 layout, the activation quantized straight into it. ``tuned`` is the public op, so
-    it runs the backend the tuned CSV (or the FlyDSL fallback) picks for this shape."""
-    # Importing aiter.ops.flydsl needs flydsl itself, so only a FlyDSL run may import it.
-    from aiter.ops.gemm_op_a4w4 import (
-        _FLYDSL_AVAILABLE,
-        _a4w4_mxscale_config,
-        gemm_mxfp4_asm,
-    )
-
+def _gfx1250_operands(dtype, M, N, K):
+    """The operands of gemm_a4w4 as ATOM calls it on gfx1250: the weight and the
+    activation scale in the 32x4 layout, the activation quantized straight into it.
+    Returns xq, xs, wq, ws and the torch reference."""
     quant = aiter.get_hip_quant(aiter.QuantType.per_1x32)
     x = torch.randn((M, K), dtype=dtype)
     w = torch.randn((N, K), dtype=dtype)
@@ -134,6 +144,15 @@ def _test_gemm_gfx1250(dtype, M, N, K):
     wq = shuffle_weight(wq_raw, layout=(16, 16))
     ws = shuffle_mxfp8fp4_scale(ws_raw)
     xq, xs = quant(x, quant_dtype=dtypes.fp4x2, scale_layout_m32k4=True)
+    return xq, xs, wq, ws, ref
+
+
+def _test_gemm_gfx1250(dtype, M, N, K):
+    """gemm_a4w4 as ATOM calls it on gfx1250. ``tuned`` is the public op, so it runs
+    the backend the tuned CSV (or the FlyDSL fallback) picks for this shape."""
+    from aiter.ops.gemm_op_a4w4 import _a4w4_mxscale_config, gemm_mxfp4_asm
+
+    xq, xs, wq, ws, ref = _gfx1250_operands(dtype, M, N, K)
     candidates = {
         "tuned": lambda: gemm_a4w4(xq, wq, xs, ws, dtype=dtype),
         "asm": lambda: gemm_mxfp4_asm(xq, wq, xs, ws, dtype=dtype, a_preshuffle=False),
@@ -143,6 +162,7 @@ def _test_gemm_gfx1250(dtype, M, N, K):
     # Without FlyDSL there is no family to check: both candidates still verify ASM.
     want_compute = OFF_GRID_SHAPES.get((M, N, K))
     if want_compute is not None and _FLYDSL_AVAILABLE:
+        # Importing aiter.ops.flydsl needs flydsl itself, so only a FlyDSL run may import it.
         from aiter.ops.flydsl.a4w4_mxscale_bpreshuffle_gemm_gfx1250 import (
             parse_a4w4_kernel_name,
         )
@@ -243,6 +263,53 @@ def test_gemm(dtype, M, N, K):
         ret[f"{name} err"] = err
 
     return ret
+
+
+@benchmark()
+def test_compute_switch_penalty(
+    M, N, K, kernel_name, other_kernel_name, dtype=dtypes.bf16
+):
+    """Two compute kernels run alternately must cost what they cost back to back,
+    and each must still produce its own correct result."""
+    from aiter.ops.flydsl.a4w4_mxscale_bpreshuffle_gemm_gfx1250 import (
+        run_gemm_a4w4_mxscale_bpreshuffle_gfx1250,
+    )
+
+    xq, xs, wq, ws, ref = _gfx1250_operands(dtype, M, N, K)
+    out = torch.empty((M, N), dtype=dtype)
+    names = (kernel_name, other_kernel_name)
+    fns = [
+        functools.partial(
+            run_gemm_a4w4_mxscale_bpreshuffle_gfx1250, xq, wq, xs, ws, out, name
+        )
+        for name in names
+    ]
+    # The alternating run overwrites the output, so each kernel is checked on its own first.
+    for name, fn in zip(names, fns):
+        out.fill_(float("nan"))
+        fn()
+        assertAllclose(
+            ref, out, msg=f"{name}: a4w4 M={M} N={N} K={K}", catastrophic_check=True
+        )
+
+    def alternate():
+        fns[0]()
+        fns[1]()
+
+    _, us_a = run_perftest(fns[0])
+    _, us_b = run_perftest(fns[1])
+    _, us_ab = run_perftest(alternate)
+    assert us_ab <= SWITCH_RATIO_MAX * (us_a + us_b), (
+        f"{kernel_name} then {other_kernel_name}: {us_ab:.1f} us alternating vs "
+        f"{us_a:.1f} + {us_b:.1f} us back to back"
+    )
+    return {
+        "gfx": get_gfx(),
+        "compute us": us_a,
+        "compute TFLOPS": 2 * M * N * K / us_a / 1e6,
+        "other compute us": us_b,
+        "alternating us": us_ab,
+    }
 
 
 def tuned_shapes():
@@ -383,6 +450,12 @@ def main():
     args = parser.parse_args()
 
     gfx1250 = get_gfx() == "gfx1250"
+    if gfx1250 and _FLYDSL_AVAILABLE:
+        switch_rows = [test_compute_switch_penalty(*case) for case in SWITCH_CASES]
+        aiter.logger.info(
+            "a4w4 compute kernels run alternately vs back to back (markdown):\n%s",
+            pd.DataFrame(switch_rows).to_markdown(index=False),
+        )
     if args.csv is not None:
         if not os.path.exists(args.csv):
             raise FileNotFoundError(f"CSV file not found: {args.csv}")

@@ -61,7 +61,7 @@ from aiter.ops.flydsl.batched_gemm_mxfp4 import (
     quant_act_mxfp8_mbn,
 )
 from aiter.ops.shuffle import shuffle_weight
-from aiter.test_common import benchmark, checkAllclose, run_perftest
+from aiter.test_common import assertAllclose, benchmark, checkAllclose, run_perftest
 
 torch.set_default_device("cuda")
 
@@ -399,6 +399,32 @@ def test_batched_gemm(b, m, n, k, dtype, layout):
     return ret
 
 
+def bmm_dequant_reference(x8, xs8, w8, ws8):
+    """FP32 [M, B, N] reference of the 32x32 batched GEMM from its fp8 operands and
+    E8M0 scales."""
+    x_scale = torch.exp2(xs8.to(dtypes.fp32) - 127).repeat_interleave(32, -1)
+    w_scale = torch.exp2(ws8.to(dtypes.fp32) - 127).repeat_interleave(32, -2)
+    w_scale = w_scale.repeat_interleave(32, -1)
+    return torch.einsum(
+        "mbk,bnk->mbn", x8.to(dtypes.fp32) * x_scale, w8.to(dtypes.fp32) * w_scale
+    )
+
+
+def check_batches(out, ref, msg):
+    """Every batch of ``out`` must be finite and match its own slice of ``ref``;
+    returns the worst mismatch ratio."""
+    assert torch.isfinite(out).all(), f"{msg}: unwritten or non-finite output"
+    return max(
+        assertAllclose(
+            ref[:, i],
+            out[:, i].to(dtypes.fp32),
+            tol_err_ratio=0.01,
+            msg=f"{msg} batch {i}",
+        )
+        for i in range(ref.shape[1])
+    )
+
+
 @benchmark()
 def test_batched_gemm_a8w8_compute(b, m, n, k, kernel_name, dtype=dtypes.bf16):
     """The 32x32 batched GEMM on an explicit compute kernelName; the output starts
@@ -419,25 +445,11 @@ def test_batched_gemm_a8w8_compute(b, m, n, k, kernel_name, dtype=dtypes.bf16):
         kernel_name=kernel_name,
     )
     _, us = run_perftest(fn)
-    x_scale = torch.exp2(xs8.to(dtypes.fp32) - 127).repeat_interleave(32, -1)
-    w_scale = torch.exp2(ws8.to(dtypes.fp32) - 127).repeat_interleave(32, -2)
-    w_scale = w_scale.repeat_interleave(32, -1)
-    ref = torch.einsum(
-        "mbk,bnk->mbn", x8.to(dtypes.fp32) * x_scale, w8.to(dtypes.fp32) * w_scale
+    err = check_batches(
+        out,
+        bmm_dequant_reference(x8, xs8, w8, ws8),
+        f"{kernel_name} B={b} M={m} N={n} K={k}",
     )
-    assert torch.isfinite(out).all(), f"{kernel_name}: unwritten or non-finite output"
-    errs = []
-    for i in range(b):
-        err = checkAllclose(
-            ref[:, i],
-            out[:, i].to(dtypes.fp32),
-            rtol=1e-2,
-            atol=1e-2,
-            tol_err_ratio=0.01,
-            msg=f"{kernel_name} B={b} M={m} N={n} K={k} batch {i}",
-        )
-        assert err <= 0.01, f"{kernel_name}: batch {i} mismatch ratio {err}"
-        errs.append(err)
     nbytes = (
         m * b * k
         + b * n * k
@@ -450,7 +462,7 @@ def test_batched_gemm_a8w8_compute(b, m, n, k, kernel_name, dtype=dtypes.bf16):
         "compute us": us,
         "compute TFLOPS": 2 * b * m * n * k / us / 1e6,
         "compute TB/s": nbytes / us / 1e6,
-        "compute err": max(errs),
+        "compute err": err,
     }
 
 
@@ -588,16 +600,26 @@ def _run_fused_quant(shapes):
 def test_compute_switch_penalty(
     b, m, n, k, kernel_name, other_kernel_name, dtype=dtypes.bf16
 ):
-    """Two compute kernels run alternately must cost what they cost back to back."""
+    """Two compute kernels run alternately must cost what they cost back to back,
+    and each must still produce its own correct result."""
     torch.manual_seed(SEED)
     x8, xs8 = quant_act_e8m0(blockwise_randn(m, b, k, dtype=dtype), 32)
     w8, ws8 = quant_weight_e8m0(blockwise_randn(b, n, k, dtype=dtype), 32, 32)
-    w8 = shuffle_weight(w8)
+    ref = bmm_dequant_reference(x8, xs8, w8, ws8)
+    w_shuf = shuffle_weight(w8)
     out = torch.empty((m, b, n), dtype=dtype)
+    names = (kernel_name, other_kernel_name)
     fns = [
-        functools.partial(run_bmm_a8w8_mxfp8, x8, w8, xs8, ws8, out, kernel_name=name)
-        for name in (kernel_name, other_kernel_name)
+        functools.partial(
+            run_bmm_a8w8_mxfp8, x8, w_shuf, xs8, ws8, out, kernel_name=name
+        )
+        for name in names
     ]
+    # The alternating run overwrites the output, so each kernel is checked on its own first.
+    for name, fn in zip(names, fns):
+        out.fill_(float("nan"))
+        fn()
+        check_batches(out, ref, f"{name} B={b} M={m} N={n} K={k}")
 
     def alternate():
         fns[0]()

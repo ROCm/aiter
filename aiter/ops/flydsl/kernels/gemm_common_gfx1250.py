@@ -99,10 +99,11 @@ _PREFETCH_CHUNK_SHIFT = 12
 _HWREG_MODE_SCALAR_PREFETCH_EN = 1 | (24 << 6)  # hwreg(HW_REG_MODE, 24, 1)
 
 
-def _kernel_code_span():
+def _kernel_code_span(func_index):
     """(entry address, code bytes up to the end of the function).
 
-    FlyDSL has no s_getpc or code-size query; only the assembler knows where the function ends.
+    FlyDSL has no s_getpc or code-size query; only the assembler knows where the function ends,
+    as .Lfunc_end<position of the function in its module>.
     """
 
     def asm(res, text, constraints="=s"):
@@ -115,24 +116,27 @@ def _kernel_code_span():
             is_align_stack=False,
         ).res
 
-    pc = asm(T.i64, ".Lkprefetch:\ns_getpc_b64 $0")  # the address after the label
-    size = asm(T.i32, "s_mov_b32 $0, .Lfunc_end0-.Lkprefetch")
+    label = f".Lkprefetch{func_index}"
+    pc = asm(T.i64, f"{label}:\ns_getpc_b64 $0")  # the address after the label
+    size = asm(T.i32, f"s_mov_b32 $0, .Lfunc_end{func_index}-{label}")
     return fx.Int64(pc) - 4, fx.Int32(size)
 
 
-def prefetch_kernel_code(num_waves):
+def prefetch_kernel_code(num_waves, func_index=0):
     """Prefetch this kernel's code into the instruction cache; each wave takes every num_waves-th 4 KiB.
 
     Code that another large kernel evicted from the CU is otherwise refetched line by line in the prologue and
     epilogue. s_prefetch_inst is a no-op unless MODE.SCALAR_PREFETCH_EN is set, and a wave only starts with it set
     if it is the first of its program on the WGP, so set it first.
+
+    ``func_index`` is the kernel's position among the functions of its module, in definition order.
     """
     # FlyDSL has no s_setreg or s_prefetch_inst wrapper, so these are the LLVM intrinsics.
     mode_en = fx.Int32(_HWREG_MODE_SCALAR_PREFETCH_EN).ir_value()
     llvm_dialect.call_intrinsic(
         None, "llvm.amdgcn.s.setreg", [mode_en, fx.Int32(1).ir_value()], [], []
     )
-    start, size = _kernel_code_span()
+    start, size = _kernel_code_span(func_index)
     cap = fx.Int32(KERNEL_PREFETCH_MAX_BYTES)
     span = (size < cap).select(size, cap)
     last_line = ((span - 1) >> 7) << 7
