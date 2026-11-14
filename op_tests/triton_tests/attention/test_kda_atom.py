@@ -195,9 +195,7 @@ def test_speculative_verify_forks_from_the_accepted_column():
     )
     expected_state = inputs["initial_state"].clone()
     expected_out = inputs["o"].clone()
-    _reference(
-        inputs, indices, indices_in, cu, accepted, expected_state, expected_out
-    )
+    _reference(inputs, indices, indices_in, cu, accepted, expected_state, expected_out)
     out, state = _call(inputs, indices, indices_in, cu, accepted)
     _assert_close(out, state, expected_out, expected_state)
     # Checkpoints named only by the read table stay put.
@@ -272,27 +270,23 @@ def test_rejected_signatures():
     inputs = _inputs(1, 2)
     cu = torch.arange(2, dtype=torch.int32, device="cuda")
     indices = torch.zeros(1, dtype=torch.int32, device="cuda")
-    common = dict(
-        A_log=inputs["A_log"],
-        a=inputs["a"],
-        b=inputs["b"],
-        dt_bias=inputs["dt_bias"],
-        q=inputs["q"],
-        k=inputs["k"],
-        v=inputs["v"],
-        initial_state=inputs["initial_state"],
-        cu_seqlens=cu,
-        ssm_state_indices=indices,
-        use_qk_l2norm_in_kernel=True,
-    )
+    common = {
+        "A_log": inputs["A_log"],
+        "a": inputs["a"],
+        "b": inputs["b"],
+        "dt_bias": inputs["dt_bias"],
+        "q": inputs["q"],
+        "k": inputs["k"],
+        "v": inputs["v"],
+        "initial_state": inputs["initial_state"],
+        "cu_seqlens": cu,
+        "ssm_state_indices": indices,
+        "use_qk_l2norm_in_kernel": True,
+    }
     with pytest.raises(NotImplementedError):
-        fused_sigmoid_gating_delta_rule_update(
-            **common, is_kda=False, lower_bound=-5.0
-        )
+        fused_sigmoid_gating_delta_rule_update(**common, is_kda=False, lower_bound=-5.0)
     with pytest.raises(NotImplementedError):
-        fused_sigmoid_gating_delta_rule_update(
-            **common, is_kda=True, lower_bound=None
-        )
+        fused_sigmoid_gating_delta_rule_update(**common, is_kda=True, lower_bound=None)
     with pytest.raises(ValueError):
         fused_sigmoid_gating_delta_rule_update(
             **common,

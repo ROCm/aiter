@@ -134,11 +134,11 @@ def fused_recurrent_kda(
         A fresh state uses initial_state's dtype, or fp32 without initial_state.
     """
 
-    if atom_slots or ssm_state_indices_in is not None:
-        if _ARCH not in ("gfx1250", "gfx1250-strict"):
-            raise NotImplementedError(
-                "separate KDA read/write slots require gfx1250"
-            )
+    if (atom_slots or ssm_state_indices_in is not None) and _ARCH not in (
+        "gfx1250",
+        "gfx1250-strict",
+    ):
+        raise NotImplementedError("separate KDA read/write slots require gfx1250")
     if ssm_state_indices_in is not None:
         if ssm_state_indices is None:
             raise ValueError("ssm_state_indices_in requires ssm_state_indices")
@@ -165,8 +165,8 @@ def fused_recurrent_kda(
             initial_state,
             cu_seqlens,
             ssm_state_indices,
-            ssm_state_indices_in,
             out,
+            ssm_state_indices_in=ssm_state_indices_in,
             config=config,
             state_v_first=state_v_first,
             inplace_final_state=inplace_final_state,
