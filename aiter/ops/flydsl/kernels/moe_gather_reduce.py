@@ -17,7 +17,7 @@ The Python reference does this as a per-expert loop of ``index_add_`` (scatter).
 This kernel reformulates it as a **gather-reduce**: one thread-block per output
 token gathers that token's ``topk`` source rows (via a precomputed inverse index
 map), weights them, and sums them in registers in a single pass.  No atomics, so
-the result is deterministic and order-independent like ``index_add_``.
+the route and split-K accumulation order is fixed for each output element.
 
 Layout / grid
 -------------
@@ -27,24 +27,21 @@ Inputs (all on device):
   gather_w         : (token_num, topk)     f32        -- weight per (t,k)
   out              : (token_num, model_dim) bf16/f16
 
-Grid  : (token_num, 1, 1)   -- one block per output token
+Grid  : (token_num, ceil((model_dim/2) / (BLOCK_THREADS*vec_dwords)), 1)
 Block : (BLOCK_THREADS, 1, 1)
 
-Each thread owns 4 consecutive dwords (16 B = 8 elements) and moves them with a
-single 128-bit buffer copy atom.  Wider transactions raise
-per-request bytes and cut the in-flight loads needed to saturate HBM.  When the
-row's dword count is not a multiple of 4 the trailing group falls back to a
-per-lane scalar tail (mirroring ``compile_moe_reduction`` in
-``moe_gemm_2stage.py``), so any even ``model_dim`` is supported.  Unused (t,k)
-slots are filled with row 0 and weight 0 by the host wrapper, so they contribute
-nothing and need no branch; EP routes that own no grouped row instead carry
-``moe_route_maps.DROPPED_ROUTE_ROW``, which is steered past the end of the flat
-tensor so the resource's own bounds check returns 0.
+Each thread owns ``vec_dwords`` consecutive dwords (2, 4, or 8). Buffer
+transactions are at most 128 bits: vec2 uses one 64-bit access, vec4 one
+128-bit access, and vec8 two 128-bit accesses. A partially valid thread span
+uses scalar dword accesses, so any even ``model_dim`` is supported.
 
-The ``topk`` route rows and weights are block-uniform, so they are read once
-into LDS by the first ``topk`` lanes instead of by every thread, and the reads
-of ``grouped_out`` go through one flat descriptor at a dword offset rather than
-a freshly built per-row descriptor.
+The first ``topk`` threads cache route rows and weights in LDS for the block.
+Each route's source descriptor rebases the row address in 64 bits; its byte
+offset only spans one row, including when grouped storage exceeds 4 GiB.
+Dropped routes use zero-length descriptors, returning zero without reading a
+potentially uninitialized row zero. The optional valid-token bound leaves
+output tokens beyond that bound unwritten.
+
 """
 
 import flydsl.compiler as flyc
@@ -113,6 +110,7 @@ def build_moe_gather_reduce_module(
         raise ValueError(f"vec_dwords must be 2, 4, or 8, got {vec_dwords}")
 
     VEC = int(vec_dwords)
+    ACCESS = min(VEC, 4)  # Hardware buffer copies are at most 16 bytes.
     out_dwords = model_dim // 2  # dwords per output row (also the source row width)
     DWORDS_PER_ITER = BLOCK_THREADS * VEC  # dwords advanced per loop iter
     n_iters = (out_dwords + DWORDS_PER_ITER - 1) // DWORDS_PER_ITER
@@ -221,38 +219,52 @@ def build_moe_gather_reduce_module(
             if dw_valid:
                 full_valid = dw_base + vec_i32 <= out_dwords_i32
                 if full_valid:
-                    acc = [fx.Float32(0.0) for _ in range(2 * VEC)]
-                    vec_atom = buf_copy_atom(VEC * 4)
-                    out_vec_t = ptr_buf_tensor(out, unit_elems=VEC, unit_stride=1)
-                    frag = fx.make_fragment_like(fx.slice(out_vec_t, (0, None)))
+                    # vec8 retains eight dwords per thread, but issues two
+                    # legal 128-bit accesses. The per-element reduction order
+                    # is unchanged; vec2/vec4 use one compile-time chunk.
+                    for chunk in range_constexpr(0, VEC, ACCESS):
+                        acc = [fx.Float32(0.0) for _ in range(2 * ACCESS)]
+                        vec_atom = buf_copy_atom(ACCESS * 4)
+                        out_vec_t = ptr_buf_tensor(
+                            out, unit_elems=ACCESS, unit_stride=1
+                        )
+                        frag = fx.make_fragment_like(fx.slice(out_vec_t, (0, None)))
 
-                    for k in range_constexpr(topk):
-                        row_i32, w_f32 = _row_weight(k)
-                        red = [fx.Float32(0.0) for _ in range(2 * VEC)]
-                        for sk in range_constexpr(split_k):
-                            raw_vec = fx.Vector(load_flat(row_i32, sk, dw_base, VEC))
-                            for lane in range_constexpr(VEC):
-                                raw_dw = fx.Uint32(raw_vec[lane])
-                                lo_f32, hi_f32 = _unpack_pair_to_f32(raw_dw, out_dtype)
-                                red[2 * lane] = red[2 * lane] + lo_f32
-                                red[2 * lane + 1] = red[2 * lane + 1] + hi_f32
-                        for lane in range_constexpr(VEC):
-                            acc[2 * lane] = acc[2 * lane] + w_f32 * red[2 * lane]
-                            acc[2 * lane + 1] = (
-                                acc[2 * lane + 1] + w_f32 * red[2 * lane + 1]
+                        for k in range_constexpr(topk):
+                            row_i32, w_f32 = _row_weight(k)
+                            red = [fx.Float32(0.0) for _ in range(2 * ACCESS)]
+                            for sk in range_constexpr(split_k):
+                                raw_vec = fx.Vector(
+                                    load_flat(row_i32, sk, dw_base + chunk, ACCESS)
+                                )
+                                for lane in range_constexpr(ACCESS):
+                                    raw_dw = fx.Uint32(raw_vec[lane])
+                                    lo_f32, hi_f32 = _unpack_pair_to_f32(
+                                        raw_dw, out_dtype
+                                    )
+                                    red[2 * lane] = red[2 * lane] + lo_f32
+                                    red[2 * lane + 1] = red[2 * lane + 1] + hi_f32
+                            for lane in range_constexpr(ACCESS):
+                                acc[2 * lane] = acc[2 * lane] + w_f32 * red[2 * lane]
+                                acc[2 * lane + 1] = (
+                                    acc[2 * lane + 1] + w_f32 * red[2 * lane + 1]
+                                )
+                        packed = [
+                            _pack_pair_from_f32(
+                                acc[2 * lane], acc[2 * lane + 1], out_dtype
                             )
-                    packed = [
-                        _pack_pair_from_f32(acc[2 * lane], acc[2 * lane + 1], out_dtype)
-                        for lane in range(VEC)
-                    ]
-                    fx.memref_store_vec(
-                        fx.Vector.from_elements(packed, fx.Uint32), frag
-                    )
-                    fx.copy(
-                        vec_atom,
-                        frag,
-                        fx.slice(out_vec_t, (out_row_dw_base + dw_base, None)),
-                    )
+                            for lane in range(ACCESS)
+                        ]
+                        fx.memref_store_vec(
+                            fx.Vector.from_elements(packed, fx.Uint32), frag
+                        )
+                        fx.copy(
+                            vec_atom,
+                            frag,
+                            fx.slice(
+                                out_vec_t, (out_row_dw_base + dw_base + chunk, None)
+                            ),
+                        )
                 else:
                     out_t = ptr_buf_tensor(out)
                     for lane in range_constexpr(VEC):
