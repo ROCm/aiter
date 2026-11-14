@@ -440,6 +440,7 @@ def flydsl_radix_topk_one_block(
     next_n: int = 1,
     plane_width: int | None = None,
     packed_rows: bool = False,
+    lane_max: torch.Tensor | None = None,
 ) -> None:
     """Launch the one-block radix TopK kernel for one prefill or decode call.
 
@@ -447,6 +448,10 @@ def flydsl_radix_topk_one_block(
     the input's first row, while output indices remain relative to that start.
     ``plane_width`` defaults to the logits width; it bounds every row and
     selects the same kernel variant that an unpacked plane of that width uses.
+    ``lane_max`` (packed decode rows, stable): lane maxima for these rows
+    (``mqa_logits_mxfp4(lane_max=...)``); long rows then select from the values
+    not below a bound read off them. The selection is the same whatever they
+    hold; other calls ignore them.
     """
     if packed_rows and (not is_decode or row_starts is None):
         raise ValueError("packed rows require decode mode and row_starts")
@@ -484,6 +489,15 @@ def flydsl_radix_topk_one_block(
         block_threads = 512
     else:
         block_threads = 1024
+    prefilter = (
+        lane_max is not None
+        and packed_rows
+        and stable
+        and not short_rows
+        and lane_max.dtype == torch.float32
+        and lane_max.dim() == 1
+        and lane_max.is_contiguous()
+    )
     launcher = build_radix_topk_one_block_module(
         k,
         block_threads=block_threads,
@@ -494,6 +508,7 @@ def flydsl_radix_topk_one_block(
         wave_size=wave_size,
         arch=arch,
         packed_rows=packed_rows,
+        prefilter=prefilter,
     )
     run_topk_launcher(
         launcher,
@@ -506,4 +521,5 @@ def flydsl_radix_topk_one_block(
         next_n,
         num_rows,
         stream,
+        *((lane_max,) if prefilter else ()),
     )

@@ -1341,6 +1341,7 @@ def top_k_per_row_decode(
     *,
     row_starts: torch.Tensor | None = None,
     plane_width: int | None = None,
+    lane_max: torch.Tensor | None = None,
 ) -> None:
     """Per-row top-k (decode). Always uses the one-block kernel; the scratch
     workspace is allocated + cached on the Python side and passed in, so the C++
@@ -1359,11 +1360,17 @@ def top_k_per_row_decode(
     ``row_starts[r]`` [numRows] i32 (``stride0`` / ``stride1`` unused), the
     indices relative to that start. ``plane_width`` is the width of the plane
     the rows stand for: it bounds every row and picks the kernel exactly as
-    that plane would, so a packed call runs what its plane call runs."""
+    that plane would, so a packed call runs what its plane call runs.
+
+    ``lane_max`` (packed rows): lane maxima for these rows, as
+    ``mqa_logits_mxfp4(lane_max=...)`` writes them beside the logits. Long rows
+    then select from the values not below a bound read off them. The result is
+    the same whatever the buffer holds (a bound that leaves fewer than k
+    values falls back); only the speed depends on its being the scorer's."""
     if row_starts is not None:
         return _top_k_per_row_decode_packed(
             logits, next_n, seqLens, indices, numRows, k, stable, values,
-            row_starts, plane_width,
+            row_starts, plane_width, lane_max,
         )  # fmt: skip
     if _should_use_flydsl_topk_decode(
         logits,
@@ -1466,6 +1473,7 @@ def _top_k_per_row_decode_packed(
     values: torch.Tensor | None,
     row_starts: torch.Tensor,
     plane_width: int | None,
+    lane_max: torch.Tensor | None = None,
 ) -> None:
     """`top_k_per_row_decode` on packed rows: the FlyDSL kernel a
     ``plane_width`` plane would get, reading each row at its start. The HIP
@@ -1525,6 +1533,7 @@ def _top_k_per_row_decode_packed(
         next_n=next_n,
         plane_width=plane_width,
         packed_rows=True,
+        lane_max=lane_max,
     )
 
 
