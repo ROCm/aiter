@@ -467,6 +467,16 @@ def get_flydsl_stage2_v2_kernels(
                                 "sort_block_m": block_m,
                                 "v2": True,
                             }
+                            if (
+                                epilog == "scatter"
+                                and a_dtype == "fp4"
+                                and out_dtype == "bf16"
+                            ):
+                                # Same kernel with the _ldspa scatter epilogue.
+                                kernels[name + "_ldspa"] = {
+                                    **kernels[name],
+                                    "scatter_lds_pairs": True,
+                                }
     return kernels
 
 
