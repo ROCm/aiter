@@ -1,5 +1,7 @@
 import argparse
 import contextlib
+import ctypes
+import itertools
 import os
 from unittest import mock
 
@@ -8,12 +10,25 @@ import pandas as pd
 import torch
 
 import aiter
-from aiter.jit.utils.chip_info import get_gfx, get_gfx_runtime
+from aiter.jit.utils import chip_info
+from aiter.jit.utils.chip_info import get_cu_num_device, get_gfx, get_gfx_runtime
+from aiter.ops import topk
 from aiter.ops import topk as T
+from aiter.ops import topk_decode_gate as G
 from aiter.ops import topk_select as S
+from aiter.ops.asm.asm_utils import load_hip
+from aiter.ops.flydsl.kernels.tensor_shim import wave_size_of
+from aiter.ops.flydsl.kernels.topk import (
+    topk_per_row_decode_adaptive as adaptive_kernel,
+)
+from aiter.ops.flydsl.kernels.topk.topk_launch import _launcher_on
+from aiter.ops.flydsl.topk import topk_per_row as flydsl_decode_host
 from aiter.ops.flydsl.topk.topk_per_row import _FLYDSL_TOPK_ONE_BLOCK_ARCHES
 from aiter.ops.topk import _FLYDSL_TOPK_DECODE_GATES
+from aiter.ops.topk_select import _choose as topk_select_backend_for
+from aiter.ops.topk_select import topk_select
 from aiter.test_common import benchmark, perftest
+from aiter.utility.graph_alloc import persistent_alloc
 
 
 def create_random_logits(
@@ -246,6 +261,9 @@ def run_top_k_per_row_decode(
     flydsl: bool = False,
     stable: bool = False,
     values: torch.Tensor | None = None,
+    max_row_len: int | None = None,
+    row_starts: torch.Tensor | None = None,
+    plane_width: int | None = None,
 ) -> None:
     """
     Run the top_k_per_row kernel.
@@ -267,6 +285,7 @@ def run_top_k_per_row_decode(
             k,
             stable,
             values,
+            max_row_len=max_row_len,
         )
     elif fast:
         assert k == 2048, "top_k_per_row_decode_fast only supports k=2048"
@@ -292,6 +311,9 @@ def run_top_k_per_row_decode(
             k=k,
             stable=stable,
             values=values,
+            max_row_len=max_row_len,
+            row_starts=row_starts,
+            plane_width=plane_width,
         )
 
 
@@ -508,6 +530,1486 @@ def test_top_k_per_row_decode(
     return ret
 
 
+def create_planted_logits(seq_lens: torch.Tensor, width: int, top_k: int):
+    """Distinct logits whose top k sit at known positions inside each row's live
+    length, with padding that outranks all of them, so a read past a row's end
+    selects padding."""
+    rows = seq_lens.shape[0]
+    logits = -torch.arange(width, dtype=torch.float32, device="cuda").repeat(rows, 1)
+    for r, n in enumerate(seq_lens.tolist()):
+        stride = n // top_k
+        pos = torch.arange(top_k, device="cuda") * stride + r % stride
+        logits[r, pos] = 1000.0 + torch.arange(top_k, device="cuda")
+        logits[r, n:] = 1e4
+    return logits
+
+
+def pack_rows(logits: torch.Tensor, row_ends: torch.Tensor, flat=None):
+    """Each row's live part laid end to end in `flat`, between gaps of padding
+    that outranks every planted key and whose random lengths put most starts off
+    a 16-byte boundary. Returns the buffer and the int32 starts."""
+    lens = row_ends.tolist()
+    starts, pos = [], 0
+    for n, gap in zip(lens, torch.randint(1, 68, (len(lens),)).tolist()):
+        starts.append(pos + gap)
+        pos += gap + n
+    if flat is None:
+        flat = torch.empty(pos + 67, device="cuda")
+    assert flat.numel() >= pos + 67, "packed buffer too small"
+    flat.fill_(1e4)
+    for r, (s, n) in enumerate(zip(starts, lens)):
+        flat[s : s + n] = logits[r, :n]
+    return flat, torch.tensor(starts, dtype=torch.int32, device="cuda")
+
+
+@benchmark()
+def test_top_k_per_row_decode_bounded(
+    batch_size: int,
+    context_len: int,
+    top_k: int,
+    stable: bool = False,
+    next_n: int = 1,
+    packed: bool = False,
+) -> dict:
+    """Decode rows of ragged length in a buffer 4x the bound, the longest row on
+    the bound, called with `max_row_len` as a serving stack would. With
+    `next_n > 1` each sequence owns `next_n` rows, slot `s` ending at
+    `seq_len - next_n + s + 1`. `packed` hands the same rows over as a flat
+    buffer with `row_starts`, the plane's width as `plane_width`."""
+    seq_lens = torch.randint(
+        top_k + next_n - 1,
+        context_len + 1,
+        (batch_size,),
+        dtype=torch.int32,
+        device="cuda",
+    )
+    seq_lens[0] = context_len
+    rows = batch_size * next_n
+    slot = torch.arange(rows, dtype=torch.int32, device="cuda") % next_n
+    row_ends = seq_lens.repeat_interleave(next_n) - next_n + slot + 1
+    logits = create_planted_logits(row_ends, 4 * context_len, top_k)
+    indices = torch.empty((rows, top_k), dtype=torch.int32, device="cuda")
+    args = (logits, next_n, seq_lens, indices, rows, *logits.stride())
+    call_args, gate_args = args, args
+    gate_kw = {"max_row_len": context_len}
+    call_kw = {"k": top_k, "stable": stable, "max_row_len": context_len}
+    if packed:
+        flat, starts = pack_rows(logits, row_ends)
+        view = flat.as_strided((rows, flat.numel()), (0, 1))
+        call_args = (flat, next_n, seq_lens, indices, rows, 0, 1)
+        gate_args = (view, *call_args[1:])
+        gate_kw["width"] = logits.shape[1]
+        call_kw.update(row_starts=starts, plane_width=logits.shape[1])
+
+    _, us = run_top_k_per_row_decode(*call_args, False, **call_kw)
+    torch.cuda.synchronize()
+
+    # The reference sees each row's live part only.
+    row_starts = torch.zeros(rows, dtype=torch.int32, device="cuda")
+    live = torch.arange(logits.shape[1], device="cuda")[None, :] < row_ends[:, None]
+    masked = torch.where(live, logits, float("-inf"))
+    torch_indices = masked.topk(top_k, dim=-1)[1]
+
+    return {
+        "backend": topk.decode_backend_for_call(*gate_args, top_k, stable, **gate_kw),
+        "all_close": compare_topk_results(
+            masked, indices, torch_indices, row_starts, row_ends, top_k, stable=stable
+        ),
+        "us": us,
+    }
+
+
+@benchmark()
+def test_top_k_per_row_decode_bounded_graph(
+    batch_size: int,
+    context_len: int,
+    top_k: int,
+    stable: bool = False,
+    replays: int = 3,
+    packed: bool = False,
+) -> dict:
+    """The bounded decode captured once in a CUDAGraph, then replayed on logits and
+    `seq_lens` rewritten in place, as a serving stack replays its decode step.
+    `packed` also rewrites `row_starts` and the flat buffer, sized at capture."""
+    width = 4 * context_len
+    seq_lens = torch.full((batch_size,), context_len, dtype=torch.int32, device="cuda")
+    logits = create_planted_logits(seq_lens, width, top_k)
+    indices = torch.empty((batch_size, top_k), dtype=torch.int32, device="cuda")
+    args = (logits, 1, seq_lens, indices, batch_size, *logits.stride())
+    gate_args, gate_kw, call_args, call_kw = args, {}, args, {}
+    if packed:
+        flat = torch.empty(batch_size * (context_len + 67) + 67, device="cuda")
+        _, starts = pack_rows(logits, seq_lens, flat)
+        view = flat.as_strided((batch_size, flat.numel()), (0, 1))
+        call_args = (flat, 1, seq_lens, indices, batch_size, 0, 1)
+        gate_args = (view, *call_args[1:])
+        gate_kw = {"width": width}
+        call_kw = {"row_starts": starts, "plane_width": width}
+
+    def decode():
+        aiter.top_k_per_row_decode(
+            *call_args, k=top_k, stable=stable, max_row_len=context_len, **call_kw
+        )
+
+    # Warm up outside the capture so the build is not in the captured time.
+    side = torch.cuda.Stream()
+    side.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(side):
+        decode()
+    torch.cuda.current_stream().wait_stream(side)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        decode()
+
+    row_starts = torch.zeros(batch_size, dtype=torch.int32, device="cuda")
+    all_close = True
+    for _ in range(replays):
+        fresh = torch.randint(
+            top_k, context_len + 1, (batch_size,), dtype=torch.int32, device="cuda"
+        )
+        seq_lens.copy_(fresh)
+        logits.copy_(create_planted_logits(fresh, width, top_k))
+        if packed:
+            starts.copy_(pack_rows(logits, fresh, flat)[1])
+        indices.fill_(-1)
+        graph.replay()
+        torch.cuda.synchronize()
+        live = torch.arange(width, device="cuda")[None, :] < seq_lens[:, None]
+        masked = torch.where(live, logits, float("-inf"))
+        torch_indices = masked.topk(top_k, dim=-1)[1]
+        all_close &= compare_topk_results(
+            masked, indices, torch_indices, row_starts, seq_lens, top_k, stable=stable
+        )
+
+    return {
+        "backend": topk.decode_backend_for_call(
+            *gate_args, top_k, stable, max_row_len=context_len, **gate_kw
+        ),
+        "replays": replays,
+        "all_close": all_close,
+    }
+
+
+def short_tier_exit_pass(logits: torch.Tensor, top_k: int) -> torch.Tensor:
+    """Per row, the radix pass whose boundary bucket holds exactly the count still
+    needed: 1 or 2, or 3 when only the last pass settles the row."""
+    bits = logits.view(torch.int32).long() & 0xFFFFFFFF
+    key = torch.where(bits >= 1 << 31, 0xFFFFFFFF - bits, bits | 1 << 31)
+    kth = key.topk(top_k, dim=-1).values[:, -1:]
+    exit_pass = torch.full((key.shape[0],), 3, device=key.device)
+    for radix_pass, shift in ((2, 10), (1, 21)):
+        exact = ((key >> shift) >= (kth >> shift)).sum(-1) == top_k
+        exit_pass[exact] = radix_pass
+    return exit_pass
+
+
+@benchmark()
+def test_top_k_per_row_decode_short_rows(
+    batch_size: int, context_len: int, top_k: int, data: str
+) -> dict:
+    """Bounded decode whose rows all fit the single-workgroup short tier, on data
+    that settles a row after the first radix pass (`planted`), mostly after the
+    second (`random`), or only after the last (`ties`)."""
+    short_max = adaptive_kernel.decode_adaptive_short_max(batch_size)
+    seq_lens = torch.randint(
+        top_k + 1,
+        min(short_max, context_len) + 1,
+        (batch_size,),
+        dtype=torch.int32,
+        device="cuda",
+    )
+    width = 4 * context_len
+    if data == "planted":
+        logits = create_planted_logits(seq_lens, width, top_k)
+    else:
+        shape = (batch_size, width)
+        if data == "random":
+            logits = torch.randn(shape, device="cuda")
+        else:
+            logits = torch.randint(0, 50, shape, device="cuda").float()
+        live = torch.arange(width, device="cuda")[None, :] < seq_lens[:, None]
+        logits = torch.where(live, logits, 1e4)
+    indices = torch.empty((batch_size, top_k), dtype=torch.int32, device="cuda")
+    args = (logits, 1, seq_lens, indices, batch_size, *logits.stride())
+
+    _, us = run_top_k_per_row_decode(
+        *args, False, k=top_k, stable=False, max_row_len=context_len
+    )
+    torch.cuda.synchronize()
+
+    row_starts = torch.zeros(batch_size, dtype=torch.int32, device="cuda")
+    live = torch.arange(width, device="cuda")[None, :] < seq_lens[:, None]
+    masked = torch.where(live, logits, float("-inf"))
+    torch_indices = masked.topk(top_k, dim=-1)[1]
+    exits = short_tier_exit_pass(masked[:, : int(seq_lens.max())], top_k)
+
+    return {
+        "backend": topk.decode_backend_for_call(
+            *args, top_k, False, max_row_len=context_len
+        ),
+        "data": data,
+        "exit_passes": "".join(str(p) for p in sorted(set(exits.tolist()))),
+        "all_close": compare_topk_results(
+            masked, indices, torch_indices, row_starts, seq_lens, top_k
+        ),
+        "us": us,
+    }
+
+
+def adaptive_band_cells(card):
+    """One bounded cell per band `card` ships, at the band's smallest corner, with
+    each k group's members taken in turn across its bands."""
+    for stable, per_group in topk._ADAPTIVE_BANDS_BY_K_GROUP[card].items():
+        for ks, bands in per_group.items():
+            for i, (min_width, _, min_rows, _) in enumerate(bands):
+                yield min_rows, min_width, ks[i % len(ks)], stable
+
+
+def adaptive_ragged_cells(card):
+    """Per k group, a batch of 4 and of 16 rows at the bound of a band that takes
+    it, so ragged rows sit at different starts in one launch."""
+    for stable, per_group in topk._ADAPTIVE_BANDS_BY_K_GROUP[card].items():
+        for ks, bands in per_group.items():
+            for i, batch in enumerate((4, 16)):
+                band = next(b for b in bands if b[2] <= batch <= b[3])
+                yield batch, band[0], ks[i % len(ks)], stable
+
+
+def test_decode_bound_gate():
+    """Host-side rules of the decode gate: the band matcher on a synthetic table,
+    then every carried card's bands at their own corners; no kernel runs."""
+    synthetic = ((1000, 2000, 2, 4), (4096, None, 1, 8))
+    for width, rows, admitted in (
+        (1000, 2, True),
+        (2000, 4, True),
+        (999, 2, False),
+        (2001, 4, False),
+        (1500, 1, False),
+        (1500, 5, False),
+        (4096, 8, True),
+        (1 << 24, 1, True),
+        (1 << 24, 9, False),
+    ):
+        assert topk._in_bands(synthetic, width, rows) == admitted, (width, rows)
+    table = topk._ADAPTIVE_BANDS_BY_K_GROUP
+    for (arch, cu), per_emit in table.items():
+        unmeasured = next(c for c in range(1, 1024) if (arch, c) not in table)
+        for stable, per_group in per_emit.items():
+            for ks, bands in per_group.items():
+                # Ascending and disjoint: a malformed band admits an unmeasured
+                # shape rather than failing.
+                seen_to = 0
+                for min_w, max_w, min_r, max_r in bands:
+                    assert seen_to < min_w <= max_w and 0 < min_r <= max_r, bands
+                    seen_to = max_w
+                corners = [
+                    (w, r) for b in bands for w, r in ((b[0], b[2]), (b[1], b[3]))
+                ]
+                for k, (bound, rows) in itertools.product(ks, corners):
+                    call = (stable, 4 * bound, rows, k, True)
+                    cell = (arch, cu, *call)
+                    bounded = topk._decode_backend(arch, cu, *call, bound)
+                    assert bounded == topk.BACKEND_ADAPTIVE, cell
+                    # A CU count the table does not carry never routes to the
+                    # adaptive kernel, and `None` declines its bands and nothing else.
+                    plain = topk._decode_backend(arch, unmeasured, *call, bound)
+                    assert plain != topk.BACKEND_ADAPTIVE, cell
+                    assert topk._decode_backend(arch, cu, *call, None) == plain, cell
+    print(f"[decode_bound_gate] PASS: {len(table)} cards")
+
+
+def test_decode_mixed_node():
+    """Decode runs when the node-wide `get_cu_num()` asserts, as beside an iGPU."""
+    rows, width, top_k = 4, 65536, 2048
+    torch.manual_seed(0)
+    logits = torch.randn(rows, width, device="cuda")
+    seq_lens = torch.full((rows,), width, dtype=torch.int32, device="cuda")
+    want = stable_reference(logits, top_k)
+    mixed = AssertionError("GPUs on this node differ in CU count")
+    # Every importer of `get_cu_num` shares its cache, so clear it to reach the probe.
+    chip_info.get_cu_num.cache_clear()
+    # The adaptive kernel's scan is laid out for wave64; the other two run anywhere.
+    backends = (None, topk.BACKEND_SINGLE)
+    if wave_size_of(torch.cuda.current_device()) == 64:
+        backends += (topk.BACKEND_ADAPTIVE,)
+    with mock.patch.object(chip_info, "get_cu_num_custom_op", side_effect=mixed):
+        for backend in backends:
+            out = torch.full((rows, top_k), -7, dtype=torch.int32, device="cuda")
+            flydsl_decode_host._decode_with_backend(
+                logits,
+                1,
+                seq_lens,
+                out,
+                rows,
+                width,
+                1,
+                top_k,
+                True,
+                None,
+                backend,
+                width,
+            )
+            torch.cuda.synchronize()
+            assert torch.equal(out.long(), want), backend
+    print("[decode_mixed_node] PASS")
+
+
+def test_decode_cu_num_lowers_never_raises():
+    """`CU_NUM` may lower the decode CU count but not raise it past the card, so
+    the gate never picks a larger card's bands nor sizes a grid for absent CUs."""
+    cases = [
+        # gfx, multi_processor_count, CU_NUM, expected
+        ("gfx942:sramecc+:xnack-", 80, None, 80),
+        ("gfx942:sramecc+:xnack-", 80, "64", 64),
+        ("gfx942:sramecc+:xnack-", 80, "304", 80),
+        # RDNA reports WGPs, two CUs each in the default WGP mode.
+        ("gfx1100", 48, None, 96),
+        ("gfx1100", 48, "304", 96),
+    ]
+    unset = ("CU_NUM", "GPU_ENABLE_WGP_MODE")
+    for gfx, count, cu_num, expected in cases:
+        props = mock.Mock(gcnArchName=gfx, multi_processor_count=count)
+        env = {k: v for k, v in os.environ.items() if k not in unset}
+        if cu_num is not None:
+            env["CU_NUM"] = cu_num
+        on_env = mock.patch.dict(os.environ, env, clear=True)
+        on_card = mock.patch.object(
+            torch.cuda, "get_device_properties", return_value=props
+        )
+        chip_info.get_cu_num_device.cache_clear()
+        try:
+            with on_env, on_card:
+                got = chip_info.get_cu_num_device(0)
+        finally:
+            chip_info.get_cu_num_device.cache_clear()
+        assert got == expected, (gfx, count, cu_num, got)
+    print("[decode_cu_num_lowers_never_raises] PASS")
+
+
+def test_decode_adaptive_two_gpus():
+    """One shape on GPU 0, then GPU 1, then GPU 0 again: each GPU launches a build
+    loaded on itself, not the one the first call loaded."""
+    gpus = [d for d in range(torch.cuda.device_count()) if wave_size_of(d) == 64]
+    if len(gpus) < 2:
+        print("[decode_adaptive_two_gpus] SKIP: needs two wave64 GPUs")
+        return
+    rows, width, top_k = 4, 65536, 2048
+    for dev in (gpus[0], gpus[1], gpus[0]):
+        with torch.cuda.device(dev):
+            torch.manual_seed(dev)
+            logits = torch.randn(rows, width, device="cuda")
+            seq_lens = torch.full((rows,), width, dtype=torch.int32, device="cuda")
+            out = torch.full((rows, top_k), -7, dtype=torch.int32, device="cuda")
+            flydsl_decode_host._decode_with_backend(
+                logits,
+                1,
+                seq_lens,
+                out,
+                rows,
+                width,
+                1,
+                top_k,
+                True,
+                None,
+                topk.BACKEND_ADAPTIVE,
+                width,
+            )
+            torch.cuda.synchronize()
+            assert torch.equal(out.long(), stable_reference(logits, top_k)), dev
+    print("[decode_adaptive_two_gpus] PASS")
+
+
+def test_decode_no_bound_skips_gate():
+    """Without `max_row_len`, or with one below 1, the FlyDSL entry runs the
+    single-launch kernel without asking the gate; with one it asks."""
+    rows, width, top_k = 4, 65536, 2048
+    torch.manual_seed(0)
+    logits = torch.randn(rows, width, device="cuda")
+    seq_lens = torch.full((rows,), width, dtype=torch.int32, device="cuda")
+    want = stable_reference(logits, top_k)
+    host = flydsl_decode_host
+    with mock.patch.object(
+        host, "decode_backend_for_shape", wraps=host.decode_backend_for_shape
+    ) as gate:
+        for bound, asked in ((None, 0), (0, 0), (width, 1)):
+            out = torch.full((rows, top_k), -7, dtype=torch.int32, device="cuda")
+            host.flydsl_top_k_per_row_decode(
+                logits, 1, seq_lens, out, rows, width, 1, top_k, True,
+                max_row_len=bound,
+            )  # fmt: skip
+            torch.cuda.synchronize()
+            assert gate.call_count == asked, f"bound {bound}: {gate.call_count} asks"
+            assert torch.equal(out.long(), want), f"bound {bound}: mismatch"
+            gate.reset_mock()
+    print("[decode_no_bound_skips_gate] PASS")
+
+
+def test_decode_bound_below_one():
+    """A `max_row_len` below 1 is no bound: calls that can never route adaptive
+    (`values`, a k no band carries, `topk_select`) return what `None` returns,
+    and a batch of empty rows, which 0 truly bounds, pads every slot."""
+    rows, width = 4, 65536
+    torch.manual_seed(0)
+    logits = torch.randn(rows, width, device="cuda")
+    full = torch.full((rows,), width, dtype=torch.int32, device="cuda")
+    empty = torch.zeros(rows, dtype=torch.int32, device="cuda")
+
+    def decode(seq_lens, k, with_values, bound):
+        indices = torch.full((rows, k), -7, dtype=torch.int32, device="cuda")
+        values = torch.full((rows, k), -7.0, device="cuda") if with_values else None
+        topk.top_k_per_row_decode(
+            logits, 1, seq_lens, indices, rows, width, 1, k, True, values,
+            max_row_len=bound,
+        )  # fmt: skip
+        return indices, values
+
+    calls = {
+        "values": lambda b: decode(full, 2048, True, b),
+        "k=7": lambda b: decode(full, 7, False, b),
+        "empty rows": lambda b: decode(empty, 2048, False, b),
+        "topk_select": lambda b: topk_select(
+            logits, 2048, end=full, tie="low", max_row_len=b
+        ),
+    }
+    for name, call in calls.items():
+        want = call(None)
+        for bound in (0, -1):
+            got = call(bound)
+            torch.cuda.synchronize()
+            for w, g in zip(want, got):
+                assert (w is None) == (g is None), f"{name} bound {bound}"
+                if w is not None:
+                    assert torch.equal(w, g), f"{name} bound {bound}: mismatch"
+    indices, _ = decode(empty, 2048, False, 0)
+    torch.cuda.synchronize()
+    assert (indices == -1).all(), "empty rows at bound 0 left a slot unpadded"
+    print(f"[decode_bound_below_one] PASS: {', '.join(calls)} at bounds 0, -1")
+
+
+def test_decode_bound_entry_points(card):
+    """`topk_select` and the public FlyDSL wrapper each carry `max_row_len` to the
+    adaptive kernel. A dropped bound still returns correct indices, so the launch
+    itself is checked, not only the result."""
+    dev = torch.cuda.current_device()
+    wave = wave_size_of(dev)
+    rows, context_len, top_k, _ = next(
+        (m, n, k, s)
+        for m, n, k, s in adaptive_band_cells(card)
+        if s
+        and topk_select_backend_for(
+            m, 4 * n, 4 * n, k, wave, True, "low", False, True, dev, True
+        )
+        == "decode"
+    )
+    width = 4 * context_len
+    seq_lens = torch.randint(
+        top_k, context_len + 1, (rows,), dtype=torch.int32, device="cuda"
+    )
+    seq_lens[0] = context_len
+    logits = create_planted_logits(seq_lens, width, top_k)
+    live = torch.arange(width, device="cuda")[None, :] < seq_lens[:, None]
+    masked = torch.where(live, logits, float("-inf"))
+    torch_indices = masked.topk(top_k, dim=-1)[1]
+    row_starts = torch.zeros(rows, dtype=torch.int32, device="cuda")
+
+    def flydsl_wrapper():
+        indices = torch.empty((rows, top_k), dtype=torch.int32, device="cuda")
+        aiter.flydsl_top_k_per_row_decode(
+            logits,
+            1,
+            seq_lens,
+            indices,
+            rows,
+            *logits.stride(),
+            top_k,
+            True,
+            max_row_len=context_len,
+        )
+        return indices
+
+    entry_points = {
+        "topk_select": lambda: topk_select(
+            logits, top_k, end=seq_lens, tie="low", max_row_len=context_len
+        )[1],
+        "flydsl_top_k_per_row_decode": flydsl_wrapper,
+    }
+    for name, call in entry_points.items():
+        with mock.patch.object(
+            flydsl_decode_host,
+            "_run_adaptive",
+            wraps=flydsl_decode_host._run_adaptive,
+        ) as run_adaptive:
+            indices = call()
+        torch.cuda.synchronize()
+        launches = [c.kwargs["cfg_width"] for c in run_adaptive.call_args_list]
+        assert launches == [
+            context_len
+        ], f"{name} launched the adaptive kernel as {launches}, not [{context_len}]"
+        assert compare_topk_results(
+            masked, indices, torch_indices, row_starts, seq_lens, top_k, stable=True
+        ), f"{name} mismatch at rows={rows} width={width} bound={context_len}"
+    print(
+        f"[decode_bound_entry_points] PASS: {', '.join(entry_points)} at "
+        f"rows={rows} width={width} bound={context_len} k={top_k}"
+    )
+
+
+def test_adaptive_control_stays_zero(card):
+    """Every launch leaves the control buffer all zero, eager and under replay, with
+    nothing on the host clearing it. Cells cover the multi-part tiers with and without
+    the candidate buffer and the certificate, and a one-workgroup grid; short rows
+    share each launch with long ones."""
+    top_k = 2048
+    device = torch.device("cuda", torch.cuda.current_device())
+
+    def cfg(rows, width, stable):
+        return adaptive_kernel.decode_adaptive_config(
+            rows, width, top_k, ordered=stable, cu_count=card[1]
+        )
+
+    picks = {
+        "compact": lambda c: c.compact and c.parts > 1,
+        "certified": lambda c: not c.compact
+        and c.parts > 1
+        and c.kw.get("histogram_certificate", False),
+        "uncertified": lambda c: not c.compact
+        and c.parts > 1
+        and not c.kw.get("histogram_certificate", False),
+        "one workgroup": lambda c: c.grid == 1,
+    }
+    candidates = [
+        (m, n) for m in (4, 8, 32, 64, 256) for n in (49152, 65536, 131072, 262144)
+    ]
+
+    def case(rows, width, seed):
+        torch.manual_seed(seed)
+        seq_lens = torch.randint(
+            top_k + 1, width + 1, (rows,), dtype=torch.int32, device="cuda"
+        )
+        seq_lens[0] = width
+        if rows >= 3:
+            seq_lens[1] = adaptive_kernel.decode_adaptive_short_max(rows)
+            seq_lens[2] = top_k
+        logits = torch.randint(0, 50, (rows, width), device="cuda").float()
+        return logits, seq_lens
+
+    def decode(logits, seq_lens, out, stable):
+        flydsl_decode_host._decode_with_backend(
+            logits,
+            1,
+            seq_lens,
+            out,
+            *(logits.shape[0], *logits.stride()),
+            top_k,
+            stable,
+            None,
+            topk.BACKEND_ADAPTIVE,
+            logits.shape[1],
+        )
+
+    def check(logits, seq_lens, out, stable, control, what):
+        torch.cuda.synchronize()
+        rows, width = logits.shape
+        live = torch.arange(width, device="cuda")[None, :] < seq_lens[:, None]
+        masked = torch.where(live, logits, float("-inf"))
+        if stable:
+            ok = torch.equal(out.long(), stable_reference(masked, top_k))
+        else:
+            ok = compare_topk_results(
+                masked,
+                out,
+                masked.topk(top_k, dim=-1)[1],
+                torch.zeros(rows, dtype=torch.int32, device="cuda"),
+                seq_lens,
+                top_k,
+            )
+        assert ok, f"{what}: wrong indices"
+        assert not control.any(), f"{what}: control left dirty"
+
+    def eager_control():
+        key = (device, torch.cuda.current_stream().cuda_stream)
+        return flydsl_decode_host._adaptive_control[key]
+
+    seen = []
+    for stable in (False, True):
+        for name, pick in picks.items():
+            cell = next(
+                ((m, n) for m, n in candidates if pick(cfg(m, n, stable))), None
+            )
+            if cell is None:
+                assert name == "one workgroup", f"no {name} cell, stable={stable}"
+                continue
+            seen.append((name, stable, *cell))
+            for seed in (1, 2):
+                logits, seq_lens = case(*cell, seed)
+                out = torch.full((cell[0], top_k), -7, dtype=torch.int32, device="cuda")
+                decode(logits, seq_lens, out, stable)
+                what = f"{name} stable={stable} cell={cell} seed={seed}"
+                check(logits, seq_lens, out, stable, eager_control(), what)
+
+    # Replay: the graph owns its buffer, even on a stream warmed up eagerly.
+    rows, width = next(
+        (m, n) for m, n in candidates if picks["compact"](cfg(m, n, True))
+    )
+    logits, seq_lens = case(rows, width, 3)
+    out = torch.empty((rows, top_k), dtype=torch.int32, device="cuda")
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(stream):
+        decode(logits, seq_lens, out, True)
+    stream.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph, stream=stream):
+        decode(logits, seq_lens, out, True)
+        decode(logits, seq_lens, out, True)
+    (graph_control,) = [
+        buf
+        for key, buf in flydsl_decode_host._captured_adaptive_control.items()
+        if key[:2] == (device, stream.cuda_stream)
+    ]
+    for seed in (4, 5):
+        fresh_logits, fresh_lens = case(rows, width, seed)
+        logits.copy_(fresh_logits)
+        seq_lens.copy_(fresh_lens)
+        out.fill_(-7)
+        graph.replay()
+        check(logits, seq_lens, out, True, graph_control, f"replay seed={seed}")
+    print(
+        f"[adaptive_control_stays_zero] PASS: {seen}, replay rows={rows} width={width}"
+    )
+
+
+def test_adaptive_control_per_capture(card):
+    """Each capture owns its control buffer, zeroed once per replay rather than per
+    call, whether or not its stream ran eagerly. It is zero for every replay order
+    and whatever the pool left in it, and eager launches on the stream use another."""
+    top_k, width, calls = 2048, 262144, 3
+    device = torch.device("cuda", torch.cuda.current_device())
+    multi = [
+        m
+        for m in (2, 4, 8, 16)
+        if adaptive_kernel.decode_adaptive_config(
+            m, width, top_k, ordered=True, cu_count=card[1]
+        ).parts
+        > 1
+    ]
+    assert len(multi) >= 2, f"no two multi-part row counts at width {width}"
+    rows, grown = multi[0], multi[-1]
+    hip = load_hip()
+    hip.hipGraphGetNodes.argtypes = [
+        ctypes.c_void_p,
+        ctypes.c_void_p,
+        ctypes.POINTER(ctypes.c_size_t),
+    ]
+
+    def nodes(graph):
+        n = ctypes.c_size_t()
+        assert hip.hipGraphGetNodes(graph.raw_cuda_graph(), None, ctypes.byref(n)) == 0
+        return n.value
+
+    def inputs(m, seed):
+        torch.manual_seed(seed)
+        logits = torch.randint(0, 50, (m, width), device="cuda").float()
+        seq_lens = torch.full((m,), width, dtype=torch.int32, device="cuda")
+        out = torch.full((m, top_k), -7, dtype=torch.int32, device="cuda")
+        return logits, seq_lens, out
+
+    def decode(logits, seq_lens, out):
+        m = logits.shape[0]
+        flydsl_decode_host._decode_with_backend(
+            logits,
+            1,
+            seq_lens,
+            out,
+            m,
+            width,
+            1,
+            top_k,
+            True,
+            None,
+            topk.BACKEND_ADAPTIVE,
+            width,
+        )
+
+    def check(case, what):
+        torch.cuda.synchronize()
+        logits, _, out = case
+        assert torch.equal(out.long(), stable_reference(logits, top_k)), what
+
+    def capture(stream, cases):
+        graph = torch.cuda.CUDAGraph(keep_graph=True)
+        stream.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.graph(graph, stream=stream):
+            for case in cases:
+                decode(*case)
+        graph.instantiate()
+        return graph
+
+    def replay(graph, stream, cases, seed, what):
+        for i, case in enumerate(cases):
+            case[0].copy_(inputs(case[0].shape[0], seed + i)[0])
+            case[2].fill_(-7)
+        stream.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(stream):
+            graph.replay()
+        for case in cases:
+            check(case, what)
+
+    def captured(stream):
+        (buf,) = [
+            buf
+            for key, buf in flydsl_decode_host._captured_adaptive_control.items()
+            if key[:2] == (device, stream.cuda_stream)
+        ]
+        return buf
+
+    def poison(buf):
+        # The graph's zeroing node must run on every replay; make the pool's leftovers
+        # garbage rather than trust them to be zero.
+        buf.fill_(0x01010101)
+        torch.cuda.synchronize()
+
+    flydsl_decode_host.clear_topk_per_row_decode_workspace_cache()
+
+    warm = torch.cuda.Stream()
+    warm_cases = [inputs(rows, 10 + i) for i in range(calls)]
+    warm.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(warm):
+        decode(*warm_cases[0])
+    check(warm_cases[0], "eager warm-up")
+    graph_w = capture(warm, warm_cases)
+    eager_w = flydsl_decode_host._adaptive_control[(device, warm.cuda_stream)]
+    assert captured(warm).data_ptr() != eager_w.data_ptr(), "capture took eager buffer"
+    baseline = nodes(graph_w)
+
+    # Two graphs on one stream, the later one replayed first.
+    cold = torch.cuda.Stream()
+    a_cases = [inputs(rows, 20 + i) for i in range(calls)]
+    b_cases = [inputs(rows, 30 + i) for i in range(calls)]
+    graph_a = capture(cold, a_cases)
+    buf_a = captured(cold)
+    graph_b = capture(cold, b_cases)
+    buf_b = captured(cold)
+    assert buf_a.data_ptr() != buf_b.data_ptr(), "two captures share a buffer"
+    assert nodes(graph_a) == baseline, (nodes(graph_a), baseline)
+    assert nodes(graph_b) == baseline, (nodes(graph_b), baseline)
+    poison(buf_a)
+    poison(buf_b)
+    replay(graph_b, cold, b_cases, 40, "graph B replayed before graph A")
+    replay(graph_a, cold, a_cases, 50, "graph A after graph B")
+    assert not buf_a.any() and not buf_b.any(), "control left dirty after replay"
+
+    # An eager launch on the capture stream between replays.
+    eager = inputs(rows, 70)
+    cold.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(cold):
+        decode(*eager)
+    check(eager, "eager launch on the capture stream")
+    replay(graph_a, cold, a_cases, 80, "graph A after the eager launch")
+
+    # Growing inside a capture zeroes the new buffer once more.
+    grow = torch.cuda.Stream()
+    g_cases = [inputs(rows, 90), inputs(grown, 91), inputs(grown, 92)]
+    graph_g = capture(grow, g_cases)
+    assert nodes(graph_g) == baseline + 1, (nodes(graph_g), baseline)
+    replay(graph_g, grow, g_cases, 100, "graph grown inside the capture")
+    assert not captured(grow).any(), "grown control left dirty after replay"
+    print(
+        f"[adaptive_control_per_capture] PASS: rows {rows} and {grown}, "
+        f"width {width}, {calls} calls per graph, {baseline} nodes per graph"
+    )
+
+
+def test_adaptive_control_concurrent_replays(card):
+    """Graphs replayed at once, and a replay beside eager launches on its capture
+    stream, never share control slots: every row stays exact. With one buffer per
+    stream these returned wrong rows, and the uncapped waits never finished."""
+    top_k, width, calls, rounds = 2048, 1 << 20, 4, 50
+    device = torch.device("cuda", torch.cuda.current_device())
+
+    def inputs(m, seed):
+        torch.manual_seed(seed)
+        logits = torch.randn(m, width, device="cuda")
+        seq_lens = torch.full((m,), width, dtype=torch.int32, device="cuda")
+        out = torch.full((m, top_k), -7, dtype=torch.int32, device="cuda")
+        return logits, seq_lens, out
+
+    def decode(logits, seq_lens, out):
+        m = logits.shape[0]
+        flydsl_decode_host._decode_with_backend(
+            logits,
+            1,
+            seq_lens,
+            out,
+            m,
+            width,
+            1,
+            top_k,
+            False,
+            None,
+            topk.BACKEND_ADAPTIVE,
+            width,
+        )
+
+    def check(cases, what):
+        torch.cuda.synchronize()
+        for logits, _, out in cases:
+            want = logits.topk(top_k, dim=-1)[1].sort(dim=-1)[0]
+            assert torch.equal(out.long().sort(dim=-1)[0], want), what
+
+    def capture(stream, cases):
+        graph = torch.cuda.CUDAGraph()
+        stream.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.graph(graph, stream=stream):
+            for case in cases:
+                decode(*case)
+        return graph
+
+    for m in (8, 4):
+        warm = inputs(m, m)
+        decode(*warm)
+        check([warm], f"eager warm-up, {m} rows")
+
+    home, s1, s2 = torch.cuda.Stream(), torch.cuda.Stream(), torch.cuda.Stream()
+    a_cases = [inputs(8, 10 + i) for i in range(calls)]
+    b_cases = [inputs(4, 20 + i) for i in range(calls)]
+    c_cases = [inputs(8, 30 + i) for i in range(calls)]
+
+    # Two graphs captured on one stream, replayed at once on two others.
+    for what, first, second in (
+        ("8 and 4 rows", a_cases, b_cases),
+        ("same shape", a_cases, c_cases),
+    ):
+        graph_1, graph_2 = capture(home, first), capture(home, second)
+        for stream in (s1, s2):
+            stream.wait_stream(torch.cuda.current_stream())
+        for _ in range(rounds):
+            with torch.cuda.stream(s1):
+                graph_1.replay()
+            with torch.cuda.stream(s2):
+                graph_2.replay()
+        check(first + second, f"concurrent replays, {what}")
+
+    # A replay beside eager launches on the stream it was captured on.
+    graph_a = capture(home, a_cases)
+    eager = inputs(8, 40)
+    s1.wait_stream(torch.cuda.current_stream())
+    home.wait_stream(torch.cuda.current_stream())
+    for _ in range(rounds):
+        with torch.cuda.stream(s1):
+            graph_a.replay()
+        with torch.cuda.stream(home):
+            decode(*eager)
+    check(a_cases + [eager], "replay beside eager launches on its capture stream")
+    control = flydsl_decode_host._adaptive_control[(device, home.cuda_stream)]
+    assert not control.any(), "eager control left dirty"
+    print(
+        f"[adaptive_control_concurrent_replays] PASS: width {width}, k {top_k}, "
+        f"{calls} calls per graph, {rounds} rounds per case"
+    )
+
+
+def _scratch_harness(width, top_k):
+    """Inputs, a forced-adaptive decode and an exact check, for the candidate buffer
+    tests. Every row is `width` long, so every launch reaches the compact path."""
+
+    def inputs(m, seed, data="random"):
+        torch.manual_seed(seed)
+        if data == "ties":
+            logits = torch.randint(0, 50, (m, width), device="cuda").float()
+        else:
+            logits = torch.randn(m, width, device="cuda")
+        seq_lens = torch.full((m,), width, dtype=torch.int32, device="cuda")
+        out = torch.full((m, top_k), -7, dtype=torch.int32, device="cuda")
+        return logits, seq_lens, out
+
+    def decode(logits, seq_lens, out, stable=False):
+        flydsl_decode_host._decode_with_backend(
+            logits,
+            1,
+            seq_lens,
+            out,
+            logits.shape[0],
+            width,
+            1,
+            top_k,
+            stable,
+            None,
+            topk.BACKEND_ADAPTIVE,
+            width,
+        )
+
+    def check(case, what, stable=False):
+        torch.cuda.synchronize()
+        logits, _, out = case
+        if stable:
+            ok = torch.equal(out.long(), stable_reference(logits, top_k))
+        else:
+            ends = torch.full((logits.shape[0],), width, dtype=torch.int32)
+            ok = compare_topk_results(
+                logits,
+                out.long(),
+                logits.topk(top_k, dim=-1)[1],
+                torch.zeros_like(ends),
+                ends,
+                top_k,
+            )
+        assert ok, what
+
+    return inputs, decode, check
+
+
+def _compact_slots(card, rows, width, top_k, stable=False):
+    cfg = adaptive_kernel.decode_adaptive_config(
+        rows, width, top_k, ordered=stable, cu_count=card[1]
+    )
+    assert cfg.compact, f"{rows} rows of {width} do not compact"
+    return cfg.scratch_slots
+
+
+def test_adaptive_scratch_reused(card):
+    """Eager compact launches on a stream share one candidate buffer, grown to the
+    largest launch and never shrunk, so a repeat allocates nothing; a capture takes
+    its own and leaves that one alone. Growing releases the old buffer while a launch
+    may still be using it, and the freed block is at once taken again on the stream.
+    Every row stays exact throughout."""
+    top_k, width = 2048, 1 << 20
+    device = torch.device("cuda", torch.cuda.current_device())
+    inputs, decode, check = _scratch_harness(width, top_k)
+    # A stream id can be reused, so start from no buffer for this stream.
+    flydsl_decode_host.clear_topk_per_row_decode_workspace_cache()
+    stream = torch.cuda.Stream()
+    key = (device, stream.cuda_stream)
+    slots = {m: _compact_slots(card, m, width, top_k) for m in (4, 8)}
+
+    def held():
+        return flydsl_decode_host._adaptive_scratch.get(key)
+
+    small, large = inputs(4, 50), inputs(8, 51)
+    with torch.cuda.stream(stream):
+        decode(*small)
+    check(small, "first eager launch")
+    first = held()
+    assert first is not None and first.numel() == slots[4], "no buffer kept"
+
+    with torch.cuda.stream(stream):
+        torch.cuda.synchronize()
+        torch.cuda.reset_peak_memory_stats(device)
+        base = torch.cuda.memory_allocated(device)
+        decode(*small)
+        torch.cuda.synchronize()
+        extra = torch.cuda.max_memory_allocated(device) - base
+    check(small, "repeat eager launch")
+    assert held() is first, "repeat launch replaced the buffer"
+    assert extra < slots[4] * 4, f"repeat launch allocated {extra} B"
+
+    in_flight = inputs(4, 53)
+    with torch.cuda.stream(stream):
+        decode(*in_flight)
+        decode(*large)
+        with persistent_alloc(device):
+            taker = torch.full((slots[4],), -1, dtype=torch.int32, device=device)
+        decode(*small)
+    check(in_flight, "launch whose buffer was released and taken again behind it")
+    check(large, "eager launch that grows the buffer")
+    check(small, "smaller launch after the buffer grew")
+    del taker
+    grown = held()
+    assert grown.numel() == slots[8], "buffer did not grow to the larger launch"
+
+    graph = torch.cuda.CUDAGraph()
+    captured = inputs(4, 52)
+    stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.graph(graph, stream=stream):
+        decode(*captured)
+    assert held() is grown, "capture touched the eager buffer"
+    captured[2].fill_(-7)
+    with torch.cuda.stream(stream):
+        graph.replay()
+        decode(*small)
+    check(captured, "replay")
+    check(small, "eager launch after a replay")
+
+    flydsl_decode_host.clear_topk_per_row_decode_workspace_cache()
+    assert held() is None, "clear kept the buffer"
+    print(
+        f"[adaptive_scratch_reused] PASS: rows 4 and 8, width {width}, k {top_k}, "
+        f"slots {slots[4]} -> {slots[8]}"
+    )
+
+
+def test_adaptive_scratch_poisoned(card):
+    """Whatever an eager candidate buffer holds when a launch starts, -1, random words
+    or another batch's candidates, the result is exact, stable and unstable: a launch
+    reads only the entries it wrote itself."""
+    top_k, width, rows = 2048, 1 << 20, 4
+    device = torch.device("cuda", torch.cuda.current_device())
+    inputs, decode, check = _scratch_harness(width, top_k)
+    flydsl_decode_host.clear_topk_per_row_decode_workspace_cache()
+    stream = torch.cuda.Stream()
+    key = (device, stream.cuda_stream)
+    seen = []
+    for stable, data in ((False, "random"), (True, "random"), (True, "ties")):
+        _compact_slots(card, rows, width, top_k, stable)
+        case, other = inputs(rows, 60, data), inputs(rows, 61, data)
+        with torch.cuda.stream(stream):
+            decode(*case, stable=stable)
+        check(case, f"stable={stable} {data}, warm-up", stable)
+        buf = flydsl_decode_host._adaptive_scratch[key]
+        for poison in ("minus one", "random words", "another batch"):
+            with torch.cuda.stream(stream):
+                if poison == "minus one":
+                    buf.fill_(-1)
+                elif poison == "random words":
+                    buf.copy_(
+                        torch.randint(
+                            -(2**31),
+                            2**31 - 1,
+                            buf.shape,
+                            dtype=torch.int32,
+                            device=device,
+                        )
+                    )
+                else:
+                    decode(*other, stable=stable)
+                case[2].fill_(-7)
+                decode(*case, stable=stable)
+            check(case, f"stable={stable} {data}, buffer held {poison}", stable)
+            assert flydsl_decode_host._adaptive_scratch[key] is buf
+        seen.append(f"{'stable' if stable else 'unstable'} {data}")
+    flydsl_decode_host.clear_topk_per_row_decode_workspace_cache()
+    print(
+        f"[adaptive_scratch_poisoned] PASS: {', '.join(seen)}, rows {rows}, "
+        f"width {width}, k {top_k}"
+    )
+
+
+def test_adaptive_scratch_two_streams(card):
+    """Eager compact launches on two streams at once use two candidate buffers, so
+    neither overwrites the other's candidates: every row of every round is exact."""
+    top_k, width, rounds = 2048, 1 << 20, 10
+    device = torch.device("cuda", torch.cuda.current_device())
+    inputs, decode, check = _scratch_harness(width, top_k)
+    flydsl_decode_host.clear_topk_per_row_decode_workspace_cache()
+    for m in (8, 4):
+        _compact_slots(card, m, width, top_k)
+    s1, s2 = torch.cuda.Stream(), torch.cuda.Stream()
+    a = [inputs(8, 70 + r) for r in range(rounds)]
+    b = [inputs(4, 80 + r) for r in range(rounds)]
+    for stream in (s1, s2):
+        stream.wait_stream(torch.cuda.current_stream())
+    for r in range(rounds):
+        with torch.cuda.stream(s1):
+            decode(*a[r])
+        with torch.cuda.stream(s2):
+            decode(*b[r])
+    for r in range(rounds):
+        check(a[r], f"stream 1, round {r}")
+        check(b[r], f"stream 2, round {r}")
+    one = flydsl_decode_host._adaptive_scratch[(device, s1.cuda_stream)]
+    two = flydsl_decode_host._adaptive_scratch[(device, s2.cuda_stream)]
+    lo, hi = sorted((one, two), key=lambda t: t.data_ptr())
+    assert lo.data_ptr() + lo.numel() * 4 <= hi.data_ptr(), "streams share a buffer"
+    flydsl_decode_host.clear_topk_per_row_decode_workspace_cache()
+    print(
+        f"[adaptive_scratch_two_streams] PASS: 8 and 4 rows, width {width}, "
+        f"k {top_k}, {rounds} rounds"
+    )
+
+
+def test_adaptive_plan(card):
+    """The cached plan holds what `decode_adaptive_config` and the kernel factory
+    give for the shape, on this card's CU count and on others, with a launcher of
+    its own per GPU. The further GPU is an id nothing is launched on."""
+    plan = flydsl_decode_host._adaptive_plan
+    plan.cache_clear()
+    dev = torch.cuda.current_device()
+    other = dev + 4096
+    cells = itertools.product(
+        sorted({card[1], 80, 256, 304}),
+        (1, 2, 3, 4, 7, 8, 16, 31, 32, 33, 64, 128, 256, 512),
+        (1024, 4096, 16384, 28416, 28417, 40960, 40961, 65536, 131072, 1 << 20),
+        (1024, 2048),
+        (False, True),
+        (False, True),
+    )
+    n = 0
+    for cu, rows, seq, k, ordered, packed in cells:
+        cfg = adaptive_kernel.decode_adaptive_config(
+            rows, seq, k, ordered=ordered, cu_count=cu
+        )
+        got = plan(rows, seq, k, ordered, cu, packed, dev)
+        cell = f"cu={cu} rows={rows} seq={seq} k={k} ordered={ordered} packed={packed}"
+        exe = adaptive_kernel.create_topk_per_row_decode_adaptive_kernel(
+            top_k=k, packed_rows=packed, **cfg.kw
+        )
+        assert got[0] is _launcher_on(exe, dev), cell
+        on_other = plan(rows, seq, k, ordered, cu, packed, other)
+        assert on_other[0] is _launcher_on(exe, other), cell
+        assert on_other[0] is not got[0], cell
+        assert on_other[1:] == got[1:], cell
+        assert got[1] == cfg.scratch_slots, cell
+        assert got[2] == (
+            cfg.grid,
+            cfg.parts,
+            cfg.parts_magic,
+            cfg.short_max,
+            cfg.compact_min,
+        ), cell
+        assert plan(rows, seq, k, ordered, cu, packed, dev) is got, cell
+        n += 1
+    print(f"[adaptive_plan] PASS: {n} shapes")
+
+
+def test_decode_validated_once(card):
+    """The public call checks its tensors once, in the gate; a direct
+    `_decode_with_backend` still checks them and rejects a bad one."""
+    rows, width, top_k, stable = next(adaptive_band_cells(card))
+    torch.manual_seed(0)
+    logits = torch.randn(rows, width, device="cuda")
+    seq_lens = torch.full((rows,), width, dtype=torch.int32, device="cuda")
+    indices = torch.empty(rows, top_k, dtype=torch.int32, device="cuda")
+    call = (logits, 1, seq_lens, indices, rows, *logits.stride(), top_k, stable, None)
+    host = flydsl_decode_host
+    with mock.patch.object(
+        host, "_validate_flydsl_topk_call", wraps=host._validate_flydsl_topk_call
+    ) as validate:
+        assert topk.decode_backend_for_call(*call, max_row_len=width) == (
+            topk.BACKEND_ADAPTIVE
+        )
+        topk.top_k_per_row_decode(*call, max_row_len=width)
+        torch.cuda.synchronize()
+        assert validate.call_count == 0, "the public call checked its tensors again"
+        got = indices.long() if stable else indices.long().sort(dim=-1).values
+        want = stable_reference(logits, top_k)
+        assert torch.equal(got, want), "public adaptive call mismatch"
+        host._decode_with_backend(*call, topk.BACKEND_ADAPTIVE, width)
+        assert validate.call_count == 1, "a direct call skipped its tensor check"
+    wide = torch.empty(rows, top_k, dtype=torch.int64, device="cuda")
+    bad = (logits, 1, seq_lens, wide, rows, *logits.stride(), top_k, stable, None)
+    assert topk.decode_backend_for_call(*bad, max_row_len=width) == (
+        topk.BACKEND_DEFAULT
+    ), "the gate admitted int64 indices"
+    try:
+        host._decode_with_backend(*bad, topk.BACKEND_ADAPTIVE, width)
+    except (RuntimeError, TypeError, ValueError):
+        pass
+    else:
+        raise AssertionError("a direct call ran with int64 indices")
+    print(f"[decode_validated_once] PASS: rows={rows} width={width} k={top_k}")
+
+
+def test_adaptive_row_past_width(card):
+    """A `seq_lens` entry past the buffer width reads the row to its width, as the
+    other decode kernels do, and not into the outranking padding behind it."""
+    pad = 4096
+    for rows, width, top_k, stable in adaptive_band_cells(card):
+        storage = torch.full((rows, width + pad), 1e4, device="cuda")
+        logits = storage[:, :width]
+        full = torch.full((rows,), width, dtype=torch.int32, device="cuda")
+        logits.copy_(create_planted_logits(full, width, top_k))
+        seq_lens = torch.randint(
+            top_k, width + 1, (rows,), dtype=torch.int32, device="cuda"
+        )
+        seq_lens[::2] = width + pad
+        row_ends = seq_lens.clamp(max=width)
+        indices = torch.empty((rows, top_k), dtype=torch.int32, device="cuda")
+        flydsl_decode_host._decode_with_backend(
+            logits,
+            1,
+            seq_lens,
+            indices,
+            rows,
+            *logits.stride(),
+            top_k,
+            stable,
+            None,
+            topk.BACKEND_ADAPTIVE,
+            width + pad,
+        )
+        torch.cuda.synchronize()
+        cell = f"rows={rows} width={width} k={top_k} stable={stable}"
+        assert (indices < width).all(), f"read past the width at {cell}"
+        live = torch.arange(width, device="cuda")[None, :] < row_ends[:, None]
+        masked = torch.where(live, logits, float("-inf"))
+        torch_indices = masked.topk(top_k, dim=-1)[1]
+        row_starts = torch.zeros(rows, dtype=torch.int32, device="cuda")
+        assert compare_topk_results(
+            masked, indices, torch_indices, row_starts, row_ends, top_k, stable=stable
+        ), f"row past width mismatch at {cell}"
+    print("[adaptive_row_past_width] PASS")
+
+
+def test_adaptive_bound_below_rows(card):
+    """A `max_row_len` below the live rows only shrinks the config; rows are still
+    read to `seq_lens`, so the planted top k past the bound are found."""
+    for rows, width, top_k, stable in adaptive_band_cells(card):
+        seq_lens = torch.full((rows,), width, dtype=torch.int32, device="cuda")
+        logits = create_planted_logits(seq_lens, width, top_k)
+        torch_indices = logits.topk(top_k, dim=-1)[1]
+        row_starts = torch.zeros(rows, dtype=torch.int32, device="cuda")
+        for bound in sorted({top_k + 1, max(top_k + 1, width // 4)}):
+            indices = torch.empty((rows, top_k), dtype=torch.int32, device="cuda")
+            flydsl_decode_host._decode_with_backend(
+                logits,
+                1,
+                seq_lens,
+                indices,
+                rows,
+                *logits.stride(),
+                top_k,
+                stable,
+                None,
+                topk.BACKEND_ADAPTIVE,
+                bound,
+            )
+            torch.cuda.synchronize()
+            cell = f"rows={rows} width={width} k={top_k} stable={stable} bound={bound}"
+            assert compare_topk_results(
+                logits,
+                indices,
+                torch_indices,
+                row_starts,
+                seq_lens,
+                top_k,
+                stable=stable,
+            ), f"bound below rows mismatch at {cell}"
+    print("[adaptive_bound_below_rows] PASS")
+
+
+def test_adaptive_nan_ranks_first(card):
+    """A NaN of either sign and any payload ranks above +inf, as `torch.topk` ranks
+    it on the CPU, on every band `card` ships and on rows of every tier."""
+    nans = torch.tensor(
+        [0x7FC00000, 0x7F800001, -0x400000, -1], dtype=torch.int32
+    ).view(torch.float32)
+    special = torch.cat([nans, torch.tensor([float("inf"), float("-inf")])]).cuda()
+    cols = torch.arange(special.numel(), device="cuda") * 2 + 1
+    for rows, width, top_k, stable in adaptive_band_cells(card):
+        seq_lens = torch.randint(
+            top_k + 16, width + 1, (rows,), dtype=torch.int32, device="cuda"
+        )
+        seq_lens[0] = width
+        logits = create_planted_logits(seq_lens, width, top_k)
+        logits[:, cols] = special
+        indices = torch.empty((rows, top_k), dtype=torch.int32, device="cuda")
+        flydsl_decode_host._decode_with_backend(
+            logits,
+            1,
+            seq_lens,
+            indices,
+            rows,
+            *logits.stride(),
+            top_k,
+            stable,
+            None,
+            topk.BACKEND_ADAPTIVE,
+            width,
+        )
+        torch.cuda.synchronize()
+        live = torch.arange(width, device="cuda")[None, :] < seq_lens[:, None]
+        ranked = torch.where(logits.isnan(), float("inf"), logits)
+        ranked = torch.where(live, ranked, float("-inf"))
+        want = stable_reference(ranked, top_k)
+        got = indices.long() if stable else indices.long().sort(dim=-1).values
+        cell = f"rows={rows} width={width} k={top_k} stable={stable}"
+        assert torch.equal(got, want), f"NaN ranking mismatch at {cell}"
+    print("[adaptive_nan_ranks_first] PASS")
+
+
+def test_adaptive_nan_ties_stable(card):
+    """More NaNs than k, of mixed sign and payload: a stable call keeps the
+    smallest columns, because every NaN ties with every other.
+
+    `test_adaptive_nan_ranks_first` plants fewer NaNs than k, so every NaN is
+    selected and their order among themselves never shows."""
+    del card  # one shape, forced onto the adaptive kernel; run_adaptive gates the card
+    rows, width, top_k = 1, 65536, 256
+    seq_lens = torch.full((rows,), width, dtype=torch.int32, device="cuda")
+    # (first k columns, next k): in each pair the later block's raw bits outrank
+    # the earlier block's. -0x400000 is -qNaN 0xFFC00000.
+    for early, late in ((0x7FC00000, -0x400000), (0x7FC00000, 0x7FC00001)):
+        torch.manual_seed(0)
+        logits = torch.randn(rows, width, device="cuda")
+        # Written through an int view, so the exact NaN bits land.
+        logits.view(torch.int32)[:, :top_k] = early
+        logits.view(torch.int32)[:, top_k : 2 * top_k] = late
+        indices = torch.full((rows, top_k), -7, dtype=torch.int32, device="cuda")
+        flydsl_decode_host._decode_with_backend(
+            logits,
+            1,
+            seq_lens,
+            indices,
+            rows,
+            *logits.stride(),
+            top_k,
+            True,
+            None,
+            topk.BACKEND_ADAPTIVE,
+            width,
+        )
+        torch.cuda.synchronize()
+        want = torch.arange(top_k, device="cuda").expand(rows, top_k)
+        pair = f"{early & 0xFFFFFFFF:#x} then {late & 0xFFFFFFFF:#x}"
+        assert torch.equal(indices.long(), want), f"stable NaN ties broken: {pair}"
+    print("[adaptive_nan_ties_stable] PASS")
+
+
+def stable_reference(masked: torch.Tensor, top_k: int) -> torch.Tensor:
+    """The k largest per row in ascending column order, ties to the smallest column.
+
+    Index for index, where `compare_topk_results` accepts any member of a tie.
+    """
+    order = torch.sort(masked, dim=-1, descending=True, stable=True).indices
+    return order[:, :top_k].sort(dim=-1).values
+
+
+def test_adaptive_ordered_early_stop(card):
+    """Stable decode on rows that settle before the last pass and rows that do not,
+    on a multi-part cell with the pass-0 certificate, one without it, and a
+    one-part cell: index for index the stable reference."""
+    top_k = 2048
+
+    def cfg(rows, width):
+        return adaptive_kernel.decode_adaptive_config(
+            rows, width, top_k, ordered=True, cu_count=card[1]
+        )
+
+    def multi_part(rows, width, certified):
+        # A row no longer than short_max runs on one part whatever the grid.
+        short_max = adaptive_kernel.decode_adaptive_short_max(rows)
+        c = cfg(rows, width)
+        return (
+            c.parts > 1
+            and width > short_max
+            and c.kw.get("histogram_certificate", False) == certified
+        )
+
+    candidates = [(m, n) for m in (4, 8, 32, 64, 256) for n in (8192, 49152, 65536)]
+    picks = (
+        lambda m, n: multi_part(m, n, True),
+        lambda m, n: multi_part(m, n, False),
+        lambda m, n: cfg(m, n).grid == 1,
+    )
+    cells = [
+        next((m, n) for m, n in candidates if not cfg(m, n).compact and pick(m, n))
+        for pick in picks
+    ]
+
+    def logits_for(data, seq_lens, width):
+        rows = seq_lens.shape[0]
+        if data == "planted":
+            return create_planted_logits(seq_lens, width, top_k)
+        if data == "random":
+            logits = torch.randn(rows, width, device="cuda")
+        elif data == "ties":
+            logits = torch.randint(0, 50, (rows, width), device="cuda").float()
+        else:
+            # Duplicated top values that all fall in one second-pass bucket.
+            logits = 900.0 + 90.0 * torch.rand(rows, width, device="cuda")
+            top = 1000.0 + (torch.arange(top_k, device="cuda") // 8) / 1024.0
+            for r, n in enumerate(seq_lens.tolist()):
+                logits[r, torch.arange(top_k, device="cuda") * (n // top_k)] = top
+        live = torch.arange(width, device="cuda")[None, :] < seq_lens[:, None]
+        return torch.where(live, logits, 1e4)
+
+    for rows, width in cells:
+        exits = set()
+        for data in ("planted", "duplicated", "random", "ties"):
+            torch.manual_seed(0)
+            seq_lens = torch.randint(
+                top_k + 1, width + 1, (rows,), dtype=torch.int32, device="cuda"
+            )
+            seq_lens[0] = width
+            logits = logits_for(data, seq_lens, width)
+            live = torch.arange(width, device="cuda")[None, :] < seq_lens[:, None]
+            masked = torch.where(live, logits, float("-inf"))
+            exits |= set(short_tier_exit_pass(masked, top_k).tolist())
+            out = torch.full((rows, top_k), -7, dtype=torch.int32, device="cuda")
+            flydsl_decode_host._decode_with_backend(
+                logits,
+                1,
+                seq_lens,
+                out,
+                rows,
+                *logits.stride(),
+                top_k,
+                True,
+                None,
+                topk.BACKEND_ADAPTIVE,
+                width,
+            )
+            torch.cuda.synchronize()
+            assert torch.equal(
+                out.long(), stable_reference(masked, top_k)
+            ), f"ordered early stop mismatch: {data} rows={rows} width={width}"
+        assert {1, 2} & exits and 3 in exits, f"exits {exits} at rows={rows}"
+    print(f"[adaptive_ordered_early_stop] PASS: cells={cells} k={top_k}")
+
+
+def test_adaptive_compact_cells(card):
+    """The compact builds no band corner reaches, stable, packed and both: stable
+    index for index the stable reference, unstable the set torch.topk picks. Rows
+    either side of short_max share the launch, so the buffer and the row both emit,
+    and random stable rows reach the early stop the short ones alone take."""
+    top_k = 2048
+    rows, width = next(
+        (m, n)
+        for m in (32, 64, 128)
+        for n in (131072, 262144)
+        if adaptive_kernel.decode_adaptive_config(m, n, top_k, cu_count=card[1]).compact
+    )
+    torch.manual_seed(0)
+    seq_lens = torch.randint(
+        top_k + 1, width + 1, (rows,), dtype=torch.int32, device="cuda"
+    )
+    seq_lens[0] = width
+    short_max = adaptive_kernel.decode_adaptive_short_max(rows)
+    seq_lens[1:5] = torch.tensor([short_max, short_max + 1, top_k + 1, top_k])
+    live = torch.arange(width, device="cuda")[None, :] < seq_lens[:, None]
+    row_starts = torch.zeros(rows, dtype=torch.int32, device="cuda")
+    for data, stable, packed in (
+        ("ties", True, False),
+        ("random", True, False),
+        ("random", False, True),
+        ("ties", True, True),
+    ):
+        if data == "ties":
+            logits = torch.randint(0, 50, (rows, width), device="cuda").float()
+        else:
+            logits = torch.randn(rows, width, device="cuda")
+        logits = torch.where(live, logits, 1e4)
+        masked = torch.where(live, logits, float("-inf"))
+        indices = torch.full((rows, top_k), -7, dtype=torch.int32, device="cuda")
+        src, strides, packed_kw = logits, logits.stride(), {}
+        if packed:
+            flat, starts = pack_rows(logits, seq_lens)
+            src, strides = flat.as_strided((rows, flat.numel()), (0, 1)), (0, 1)
+            packed_kw = {"row_starts": starts, "plane_width": width}
+        flydsl_decode_host._decode_with_backend(
+            src,
+            1,
+            seq_lens,
+            indices,
+            rows,
+            *strides,
+            top_k,
+            stable,
+            None,
+            topk.BACKEND_ADAPTIVE,
+            width,
+            **packed_kw,
+        )
+        torch.cuda.synchronize()
+        if stable:
+            ok = torch.equal(indices.long(), stable_reference(masked, top_k))
+        else:
+            ref = masked.topk(top_k, dim=-1)[1]
+            ok = compare_topk_results(masked, indices, ref, row_starts, seq_lens, top_k)
+        assert ok, f"compact mismatch: {data} stable={stable} packed={packed}"
+    print(f"[adaptive_compact_cells] PASS: rows={rows} width={width} k={top_k}")
+
+
 def _decode_reference(logits, row_ends, top_k):
     ref = logits.topk(min(top_k, int(max(row_ends))), dim=-1)[1]
     mask = (ref >= 0) & ((ref - row_ends[:, None]) < 0)
@@ -657,7 +2159,7 @@ def test_flydsl_decode_gates():
     limit, so narrowing the sweep shapes cannot leave a gate untested.
     """
     arch = get_gfx()
-    if arch not in _FLYDSL_TOPK_DECODE_GATES or T._FLYDSL_TOPK_DECODE_DISABLED:
+    if arch not in _FLYDSL_TOPK_DECODE_GATES or G._FLYDSL_TOPK_DECODE_DISABLED:
         print("[flydsl_decode_gates] FlyDSL decode not served here; skipping")
         return
     torch.set_default_device("cuda:0")
@@ -674,8 +2176,8 @@ def test_flydsl_decode_gates():
                 indices = torch.empty((num_rows, k), dtype=torch.int32)
                 args = (logits, 1, seq_lens, indices, num_rows, width, 1)
                 what = f"stable={stable} width={width} rows={num_rows} k={k}"
-                assert T._should_use_flydsl_topk_decode(
-                    *args, k, stable
+                assert (
+                    T.decode_backend_for_call(*args, k, stable) == T.BACKEND_SINGLE
                 ), f"not routed to FlyDSL decode: {what}"
                 aiter.top_k_per_row_decode(*args, k=k, stable=stable)
                 ref = _decode_reference(logits, seq_lens, k)
@@ -1029,98 +2531,6 @@ def test_prefill_sampled_routing():
     print("[prefill_sampled_routing] PASS: by stride0 / rows / k / stable / env")
 
 
-parser = argparse.ArgumentParser(
-    formatter_class=argparse.RawTextHelpFormatter,
-    description="config input of test",
-)
-parser.add_argument(
-    "-c",
-    "--context_len",
-    type=int,
-    default=[8, 4096, 32768, 90000],
-    nargs="+",
-    help="""number of kv.
-    e.g.: -c 64""",
-)
-
-parser.add_argument(
-    "-k",
-    "--top_k",
-    type=int,
-    default=[512, 2048],
-    nargs="+",
-    help="""top-k elements per row. The radix backend supports any positive
-    int; the `_fast` ASM-kernel path only supports 2048 and is skipped
-    for other values.
-    e.g.: -k 512 1024 2048""",
-)
-
-parser.add_argument(
-    "--num_prefix",
-    type=int,
-    default=[0],
-    nargs="+",
-    help="""top-k elements per row.
-    e.g.: --num_prefix 8000 16000 24000 32000 40000 48000 56000""",
-)
-
-parser.add_argument(
-    "--prefill_backend",
-    type=str,
-    default=["aiter"],
-    choices=["aiter", "sampled"],
-    nargs="+",
-    help="""which prefill selector to measure: `aiter` for
-    top_k_per_row_prefill, `sampled` for top_k_per_row_prefill_sampled. Pass both to
-    get one summary table with a row per backend per shape.
-    e.g.: --prefill_backend aiter sampled""",
-)
-
-parser.add_argument(
-    "-b",
-    "--decode_batch_size",
-    type=int,
-    default=[4],
-    nargs="+",
-    help="""decode_batch_size batch size.
-    e.g.: -b 4""",
-)
-
-parser.add_argument(
-    "-n",
-    "--next_n",
-    type=int,
-    default=[1, 4],
-    nargs="+",
-    help="""next_n elements per sequence in a row.
-    e.g.: -n 4""",
-)
-
-parser.add_argument(
-    "-d",
-    "--data_generation",
-    type=str,
-    default=["random"],
-    choices=["random", "10LSBits", "mixed"],
-    nargs="+",
-    help="""Specify method for generating logits.
-    e.g.: -d random""",
-)
-
-# CI runs `python3 <file>` with no arguments, so the defaults above stay small.
-_FULL_MATRIX = {
-    "context_len": [8, 128, 1024, 3072, 4096, 8192, 16384, 32768, 65536, 90000, 128000],
-    "top_k": [512, 1024, 2048],
-    "decode_batch_size": [4, 8, 16, 24],
-    "next_n": [1, 2, 3, 4],
-}
-
-parser.add_argument(
-    "--full",
-    action="store_true",
-    help="""run the full benchmark matrix; overrides -c, -k, -b and -n.""",
-)
-
 _REGRESSIONS = {
     "mb-workspace-reuse": test_mb_workspace_reuse,
     "flydsl-decode-split-reuse": test_flydsl_decode_split_reuse,
@@ -1132,121 +2542,344 @@ _REGRESSIONS = {
     "sampled-per-device": test_sampled_eligibility_per_device,
 }
 
-parser.add_argument(
-    "--regressions",
-    choices=list(_REGRESSIONS),
-    nargs="*",
-    default=list(_REGRESSIONS),
-    help="""Regression checks to run before the configured sweep.
-    Pass --regressions with no values to skip them all.""",
-)
-
-args = parser.parse_args()
-if args.full:
-    vars(args).update(_FULL_MATRIX)
-
-# Regressions run in CI via `python3 <file>`.
-for name in args.regressions:
-    _REGRESSIONS[name]()
+# CI runs `python3 <file>` with no arguments, so the defaults below stay small.
+_FULL_MATRIX = {
+    "context_len": [8, 128, 1024, 3072, 4096, 8192, 16384, 32768, 65536, 90000, 128000],
+    "top_k": [512, 1024, 2048],
+    "decode_batch_size": [4, 8, 16, 24],
+    "next_n": [1, 2, 3, 4],
+}
 
 
-# Ask each path which arches it serves rather than keeping a second copy
-# here: a copy drifts, and a test that drives a kernel production never
-# dispatches reports on something nobody runs.
-one_block_available = get_gfx() in _FLYDSL_TOPK_ONE_BLOCK_ARCHES
-flydsl_decode_available = get_gfx() in _FLYDSL_TOPK_DECODE_GATES
+def build_parser():
+    parser = argparse.ArgumentParser(
+        formatter_class=argparse.RawTextHelpFormatter,
+        description="config input of test",
+    )
+    parser.add_argument(
+        "-c",
+        "--context_len",
+        type=int,
+        default=[8, 4096, 32768, 90000],
+        nargs="+",
+        help="""number of kv.
+        e.g.: -c 64""",
+    )
 
-df = []
-for data_generation in args.data_generation:
-    for m in args.context_len:
-        for k in args.top_k:
-            for num_prefix in args.num_prefix:
-                for backend in args.prefill_backend:
-                    # Both ways round, matching the decode loop: the value
-                    # stores are a separate instantiation of the output
-                    # kernels, so skipping one leaves half of them untested.
-                    for write_values in (False, True):
-                        ret = test_top_k_per_row_prefill(
-                            m,
-                            num_prefix,
-                            k,
-                            data_generation,
-                            backend=backend,
-                            write_values=write_values,
-                        )
-                        df.append(ret)
-                # Cover the one-block radix kernel directly, so a dispatch
-                # change cannot hide a kernel regression.
-                if not one_block_available:
-                    continue
-                for stable in (False, True):
-                    for write_values in (False, True):
-                        ret = test_top_k_per_row_prefill(
-                            m,
-                            num_prefix,
-                            k,
-                            data_generation,
-                            flydsl=True,
-                            stable=stable,
-                            write_values=write_values,
-                        )
-                        df.append(ret)
+    parser.add_argument(
+        "-k",
+        "--top_k",
+        type=int,
+        default=[512, 2048],
+        nargs="+",
+        help="""top-k elements per row. The radix backend supports any positive
+        int; the `_fast` ASM-kernel path only supports 2048 and is skipped
+        for other values.
+        e.g.: -k 512 1024 2048""",
+    )
 
-df = pd.DataFrame(df)
-df_md = df.to_markdown(index=False)
-aiter.logger.info("topk_per_row_prefill summary (markdown):\n%s", df_md)
-assert df["all_close"].all(), f"topk_per_row_prefill mismatch:\n{df_md}"
+    parser.add_argument(
+        "--num_prefix",
+        type=int,
+        default=[0],
+        nargs="+",
+        help="""top-k elements per row.
+        e.g.: --num_prefix 8000 16000 24000 32000 40000 48000 56000""",
+    )
+
+    parser.add_argument(
+        "--prefill_backend",
+        type=str,
+        default=["aiter"],
+        choices=["aiter", "sampled"],
+        nargs="+",
+        help="""which prefill selector to measure: `aiter` for
+        top_k_per_row_prefill, `sampled` for top_k_per_row_prefill_sampled. Pass
+        both to get one summary table with a row per backend per shape.
+        e.g.: --prefill_backend aiter sampled""",
+    )
+
+    parser.add_argument(
+        "-b",
+        "--decode_batch_size",
+        type=int,
+        default=[4],
+        nargs="+",
+        help="""decode_batch_size batch size.
+        e.g.: -b 4""",
+    )
+
+    parser.add_argument(
+        "-n",
+        "--next_n",
+        type=int,
+        default=[1, 4],
+        nargs="+",
+        help="""next_n elements per sequence in a row.
+        e.g.: -n 4""",
+    )
+
+    parser.add_argument(
+        "-d",
+        "--data_generation",
+        type=str,
+        default=["random"],
+        choices=["random", "10LSBits", "mixed"],
+        nargs="+",
+        help="""Specify method for generating logits.
+        e.g.: -d random""",
+    )
+
+    parser.add_argument(
+        "--full",
+        action="store_true",
+        help="""run the full benchmark matrix; overrides -c, -k, -b and -n.""",
+    )
+
+    parser.add_argument(
+        "--regressions",
+        choices=list(_REGRESSIONS),
+        nargs="*",
+        default=list(_REGRESSIONS),
+        help="""Regression checks the `regressions` section runs.
+        Pass --regressions with no values to skip them all.""",
+    )
+    parser.add_argument(
+        "--sections",
+        type=str,
+        default=["regressions", "prefill", "decode", "adaptive"],
+        choices=["regressions", "prefill", "decode", "adaptive"],
+        nargs="+",
+        help="""Which parts to run; all of them by default.
+        e.g.: --sections adaptive""",
+    )
+    return parser
 
 
-df = []
-for data_generation in args.data_generation:
-    for m in args.decode_batch_size:
-        for ctx in args.context_len:
+def run_prefill(args):
+    # Ask each path which arches it serves rather than keeping a second copy
+    # here: a copy drifts, and a test that drives a kernel production never
+    # dispatches reports on something nobody runs.
+    one_block_available = get_gfx() in _FLYDSL_TOPK_ONE_BLOCK_ARCHES
+    df = []
+    for data_generation in args.data_generation:
+        for m in args.context_len:
             for k in args.top_k:
-                for n in args.next_n:
+                for num_prefix in args.num_prefix:
+                    for backend in args.prefill_backend:
+                        # Both ways round, matching the decode loop: the value
+                        # stores are a separate instantiation of the output
+                        # kernels, so skipping one leaves half of them untested.
+                        for write_values in (False, True):
+                            ret = test_top_k_per_row_prefill(
+                                m,
+                                num_prefix,
+                                k,
+                                data_generation,
+                                backend=backend,
+                                write_values=write_values,
+                            )
+                            df.append(ret)
+                    # Cover the one-block radix kernel directly, so a dispatch
+                    # change cannot hide a kernel regression.
+                    if not one_block_available:
+                        continue
                     for stable in (False, True):
                         for write_values in (False, True):
-                            ret = test_top_k_per_row_decode(
+                            ret = test_top_k_per_row_prefill(
                                 m,
-                                ctx,
+                                num_prefix,
                                 k,
-                                n,
                                 data_generation,
+                                flydsl=True,
                                 stable=stable,
                                 write_values=write_values,
                             )
                             df.append(ret)
-                            if flydsl_decode_available:
-                                # Ragged lengths only matter once some rows
-                                # are long enough to be split.
-                                for ragged in (
-                                    (False, True) if ctx >= 65536 else (False,)
-                                ):
-                                    ret = test_top_k_per_row_decode(
-                                        m,
-                                        ctx,
-                                        k,
-                                        n,
-                                        data_generation,
-                                        flydsl=True,
-                                        stable=stable,
-                                        write_values=write_values,
-                                        ragged=ragged,
-                                    )
-                                    df.append(ret)
-                        # `_fast` ASM kernel hardcodes k=2048 and is not stable.
-                        if get_gfx() == "gfx942" and k == 2048 and not stable:
-                            ret = test_top_k_per_row_decode(
-                                m,
-                                ctx,
-                                k,
-                                n,
-                                data_generation,
-                                fast=True,
-                            )
-                            df.append(ret)
 
-df = pd.DataFrame(df)
-df_md = df.to_markdown(index=False)
-aiter.logger.info("topk_per_row_decode summary (markdown):\n%s", df_md)
-assert df["all_close"].all(), f"topk_per_row_decode mismatch:\n{df_md}"
+    df = pd.DataFrame(df)
+    df_md = df.to_markdown(index=False)
+    aiter.logger.info("topk_per_row_prefill summary (markdown):\n%s", df_md)
+    assert df["all_close"].all(), f"topk_per_row_prefill mismatch:\n{df_md}"
+
+
+def run_decode(args):
+    flydsl_decode_available = get_gfx() in _FLYDSL_TOPK_DECODE_GATES
+    df = []
+    for data_generation in args.data_generation:
+        for m in args.decode_batch_size:
+            for ctx in args.context_len:
+                for k in args.top_k:
+                    for n in args.next_n:
+                        for stable in (False, True):
+                            for write_values in (False, True):
+                                ret = test_top_k_per_row_decode(
+                                    m,
+                                    ctx,
+                                    k,
+                                    n,
+                                    data_generation,
+                                    stable=stable,
+                                    write_values=write_values,
+                                )
+                                df.append(ret)
+                                if flydsl_decode_available:
+                                    # Ragged lengths only matter once some rows
+                                    # are long enough to be split.
+                                    for ragged in (
+                                        (False, True) if ctx >= 65536 else (False,)
+                                    ):
+                                        ret = test_top_k_per_row_decode(
+                                            m,
+                                            ctx,
+                                            k,
+                                            n,
+                                            data_generation,
+                                            flydsl=True,
+                                            stable=stable,
+                                            write_values=write_values,
+                                            ragged=ragged,
+                                        )
+                                        df.append(ret)
+                            # `_fast` ASM kernel hardcodes k=2048 and is not stable.
+                            if get_gfx() == "gfx942" and k == 2048 and not stable:
+                                ret = test_top_k_per_row_decode(
+                                    m,
+                                    ctx,
+                                    k,
+                                    n,
+                                    data_generation,
+                                    fast=True,
+                                )
+                                df.append(ret)
+
+    df = pd.DataFrame(df)
+    df_md = df.to_markdown(index=False)
+    aiter.logger.info("topk_per_row_decode summary (markdown):\n%s", df_md)
+    assert df["all_close"].all(), f"topk_per_row_decode mismatch:\n{df_md}"
+
+
+def run_adaptive():
+    test_decode_bound_gate()
+    test_decode_mixed_node()
+    test_decode_cu_num_lowers_never_raises()
+    test_decode_adaptive_two_gpus()
+    test_decode_no_bound_skips_gate()
+    test_decode_bound_below_one()
+    card = (get_gfx_runtime(), get_cu_num_device(torch.cuda.current_device()))
+    if card not in topk._ADAPTIVE_BANDS_BY_K_GROUP:
+        aiter.logger.warning(
+            "%s at %d CU carries no adaptive decode bands; bounded decode skipped",
+            *card,
+        )
+        return
+    # The table picks these shapes and k, not the command line: every band this
+    # card ships runs once, at a corner small enough to allocate here.
+    for name, run in (
+        ("bounded", test_top_k_per_row_decode_bounded),
+        ("bounded graph", test_top_k_per_row_decode_bounded_graph),
+        (
+            "bounded next_n=2",
+            lambda m, n, k, s: test_top_k_per_row_decode_bounded(
+                max(1, m // 2), n, k, s, next_n=2
+            ),
+        ),
+        (
+            "bounded packed",
+            lambda m, n, k, s: test_top_k_per_row_decode_bounded(
+                m, n, k, s, packed=True
+            ),
+        ),
+        (
+            "bounded packed next_n=2",
+            lambda m, n, k, s: test_top_k_per_row_decode_bounded(
+                max(1, m // 2), n, k, s, next_n=2, packed=True
+            ),
+        ),
+        (
+            "bounded packed graph",
+            lambda m, n, k, s: test_top_k_per_row_decode_bounded_graph(
+                m, n, k, s, packed=True
+            ),
+        ),
+    ):
+        torch.manual_seed(0)
+        df = pd.DataFrame([run(*c) for c in adaptive_band_cells(card)])
+        df_md = df.to_markdown(index=False)
+        aiter.logger.info("topk_per_row_decode %s summary (markdown):\n%s", name, df_md)
+        assert df["all_close"].all(), f"topk_per_row_decode {name} mismatch:\n{df_md}"
+        assert (
+            df["backend"] == topk.BACKEND_ADAPTIVE
+        ).all(), f"{name} decode left the adaptive kernel:\n{df_md}"
+    # Band corners can be single-row; packing only matters once ragged rows sit at
+    # different starts in one launch.
+    torch.manual_seed(0)
+    df = pd.DataFrame(
+        [
+            run(*cell, packed=True)
+            for run in (
+                test_top_k_per_row_decode_bounded,
+                test_top_k_per_row_decode_bounded_graph,
+            )
+            for cell in adaptive_ragged_cells(card)
+        ]
+    )
+    df_md = df.to_markdown(index=False)
+    aiter.logger.info("topk_per_row_decode packed rows summary (markdown):\n%s", df_md)
+    assert df["all_close"].all(), f"packed-row decode mismatch:\n{df_md}"
+    assert (
+        df["backend"] == topk.BACKEND_ADAPTIVE
+    ).all(), f"packed-row decode left the adaptive kernel:\n{df_md}"
+    # The short tier is unordered only, so it runs under the unstable bands.
+    rows, context_len, top_k, _ = next(c for c in adaptive_band_cells(card) if not c[3])
+    torch.manual_seed(0)
+    df = pd.DataFrame(
+        [
+            test_top_k_per_row_decode_short_rows(rows, context_len, top_k, data)
+            for data in ("planted", "random", "ties")
+        ]
+    )
+    df_md = df.to_markdown(index=False)
+    aiter.logger.info("topk_per_row_decode short rows summary (markdown):\n%s", df_md)
+    assert df["all_close"].all(), f"short-row decode mismatch:\n{df_md}"
+    assert (
+        df["backend"] == topk.BACKEND_ADAPTIVE
+    ).all(), f"short-row decode left the adaptive kernel:\n{df_md}"
+    assert set("".join(df["exit_passes"])) == set(
+        "123"
+    ), f"short-row decode does not reach every radix pass exit:\n{df_md}"
+    test_decode_bound_entry_points(card)
+    test_adaptive_control_stays_zero(card)
+    test_adaptive_control_per_capture(card)
+    test_adaptive_control_concurrent_replays(card)
+    test_adaptive_scratch_reused(card)
+    test_adaptive_scratch_poisoned(card)
+    test_adaptive_scratch_two_streams(card)
+    test_adaptive_plan(card)
+    test_decode_validated_once(card)
+    test_adaptive_row_past_width(card)
+    test_adaptive_bound_below_rows(card)
+    test_adaptive_nan_ranks_first(card)
+    test_adaptive_nan_ties_stable(card)
+    test_adaptive_ordered_early_stop(card)
+    test_adaptive_compact_cells(card)
+
+
+def main():
+    args = build_parser().parse_args()
+    if args.full:
+        vars(args).update(_FULL_MATRIX)
+    # Regressions run in CI via `python3 <file>`.
+    if "regressions" in args.sections:
+        for name in args.regressions:
+            _REGRESSIONS[name]()
+    if "prefill" in args.sections:
+        run_prefill(args)
+    if "decode" in args.sections:
+        run_decode(args)
+    if "adaptive" in args.sections:
+        run_adaptive()
+
+
+if __name__ == "__main__":
+    main()

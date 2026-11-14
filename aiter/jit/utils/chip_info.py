@@ -342,6 +342,23 @@ def get_cu_num():
     return cu_num
 
 
+@functools.cache
+def get_cu_num_device(device_index: int) -> int:
+    """CU count of one GPU, which `CU_NUM` may lower but never raise past the card.
+
+    Unlike `get_cu_num()`, it does not assert when the node's GPUs differ, e.g. an
+    iGPU beside the card.
+    """
+    import torch
+
+    props = torch.cuda.get_device_properties(device_index)
+    physical = torch_processor_count_to_cu(
+        props.gcnArchName, props.multi_processor_count
+    )
+    cu_num = int(os.getenv("CU_NUM", "0"))
+    return min(cu_num, physical) if cu_num > 0 else physical
+
+
 def get_build_targets() -> list[tuple[str, int]]:
     """Return (gfx, cu_num) pairs to compile kernels for.
 
