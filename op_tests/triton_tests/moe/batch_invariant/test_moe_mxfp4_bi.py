@@ -60,7 +60,8 @@ def generate_moe_mxfp4_bi_inputs(T, E, seed=0, h=H, n=N, rng="cuda"):
     w13, s13 = _weights(E, 2 * n, h, seed + 1, rng)
     w2, s2 = _weights(E, h, n, seed + 2, rng)
     if rng == "cpu":
-        x = torch.randn((T, h), dtype=torch.float32, generator=g).to(torch.bfloat16)
+        x = torch.randn((T, h), dtype=torch.float32, device=rng, generator=g)
+        x = x.to(torch.bfloat16)
     else:
         x = torch.randn((T, h), dtype=torch.bfloat16, device=rng, generator=g)
     ids = torch.argsort(
@@ -72,10 +73,10 @@ def generate_moe_mxfp4_bi_inputs(T, E, seed=0, h=H, n=N, rng="cuda"):
     return tuple(t.cuda() for t in (x, w13, s13, w2, s2, tw, ids))
 
 
-def _run(p, **kw):
+def _run(p, lbeta=LBETA, **kw):
     x, w13, s13, w2, s2, tw, ids = p
     return moe_mxfp4_bi_forward(
-        x, w13, s13, w2, s2, tw, ids, situ_beta=BETA, situ_linear_beta=LBETA, **kw
+        x, w13, s13, w2, s2, tw, ids, situ_beta=BETA, situ_linear_beta=lbeta, **kw
     )
 
 
@@ -89,7 +90,7 @@ def _bf16(t):
     return t.to(torch.bfloat16).float()
 
 
-def _reference(p):
+def _reference(p, lbeta=LBETA):
     """PyTorch reference with the bf16 roundings of the op (gate / up, activation, each
     W2 output). Only the FP32 summation order differs from the op."""
     x, w13, s13, w2, s2, tw, ids = p
@@ -100,12 +101,9 @@ def _reference(p):
             e = ids[t, j]
             gu = _bf16(W13[e] @ x[t].float())
             g, u = gu[:N], gu[N:]
-            act = _bf16(
-                BETA
-                * torch.tanh(g / BETA)
-                * torch.sigmoid(g)
-                * (LBETA * torch.tanh(u / LBETA))
-            )
+            if lbeta is not None:
+                u = lbeta * torch.tanh(u / lbeta)
+            act = _bf16(BETA * torch.tanh(g / BETA) * torch.sigmoid(g) * u)
             out[t] += tw[t, j] * _bf16(W2[e] @ act)
     return out
 
@@ -500,6 +498,50 @@ def _pad_view(t, extra):
     )
     buf[..., : t.shape[-1]] = t
     return buf[..., : t.shape[-1]]
+
+
+@pytest.mark.parametrize("pad", [False, True])
+def test_no_linear_beta(pad):
+    """situ_linear_beta=None (the up value as is): accuracy and split invariance on the
+    async gate / up kernel and on the one for unaligned w13 rows."""
+    T = 64
+    p = generate_moe_mxfp4_bi_inputs(T, 32, seed=17)
+    ref_bits = _run(p, lbeta=None)
+    if pad:
+        x, w13, s13, w2, s2, tw, ids = p
+        p = (x, _pad_view(w13, 8), _pad_view(s13, 1), w2, s2, tw, ids)
+    full = _run(p, lbeta=None)
+    assert torch.equal(full, ref_bits)
+    assert not torch.equal(full, _run(p))
+    head = _rows(p, slice(0, 8))
+    ref = _reference(head, lbeta=None)
+    scale = ref.abs().max().item()
+    torch.testing.assert_close(full[:8].float(), ref, rtol=1e-2, atol=1e-2 * scale)
+    k = T // 2
+    for sl in (slice(0, k), slice(k, T), slice(0, 1)):
+        assert torch.equal(_run(_rows(p, sl), lbeta=None), full[sl])
+
+
+def test_rejects_weights_past_int32_offsets():
+    """A W13 half or W2 of one expert at 2**31 bytes is refused (32-bit buffer
+    offsets). Stride-0 views: no large allocation."""
+    h = n = 65536
+
+    def wt(*shape):
+        buf = torch.zeros(shape[-1], dtype=torch.uint8, device="cuda")
+        return buf.as_strided(shape, (0,) * (len(shape) - 1) + (1,))
+
+    x = torch.zeros((1, h), dtype=torch.bfloat16, device="cuda")
+    tw = torch.ones((1, TOP_K), dtype=torch.float32, device="cuda")
+    ids = torch.zeros((1, TOP_K), dtype=torch.int32, device="cuda")
+    w = (
+        wt(1, 2 * n, h // 2),
+        wt(1, 2 * n, h // 32),
+        wt(1, h, n // 2),
+        wt(1, h, n // 32),
+    )
+    with pytest.raises(ValueError, match="2\\*\\*31"):
+        moe_mxfp4_bi_forward(x, *w, tw, ids, situ_beta=BETA)
 
 
 def test_layout_fallbacks_same_bits():

@@ -552,10 +552,10 @@ def _moe_mxfp4_bi_gu_situ_gluon_kernel(
         a_mask,
         W + e * stride_we,
         w_off,
-        N * stride_wn,
+        N.to(gl.int64) * stride_wn,
         S + e * stride_se,
         s_off,
-        N * stride_sn,
+        N.to(gl.int64) * stride_sn,
         K // BLOCK_K,
         a_s,
         w_s,
@@ -945,8 +945,8 @@ def _moe_mxfp4_bi_gu_situ_async_gluon_kernel(
     )
     w_base = W + e * stride_we
     s_base = S + e * stride_se
-    w_d = N * stride_wn
-    s_d = N * stride_sn
+    w_d = N.to(gl.int64) * stride_wn
+    s_d = N.to(gl.int64) * stride_sn
     nk = K // BLOCK_K
     acc_g = gl.zeros((BLOCK_M, BLOCK_N), dtype=gl.float32, layout=MFMA)
     acc_u = gl.zeros((BLOCK_M, BLOCK_N), dtype=gl.float32, layout=MFMA)

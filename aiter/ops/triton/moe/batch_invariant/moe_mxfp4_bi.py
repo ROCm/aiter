@@ -529,6 +529,12 @@ def _check_weights(x, w13, w13_scale, w2, w2_scale):
                 "[E, H, N/2], [E, H, N/32] with unit last stride; got "
                 f"{tuple(t.shape)} {t.dtype} stride {t.stride()}, want {shape}"
             )
+    # buffer ops take 32-bit offsets within a W13 half or an expert's W2
+    if max(N * H // 2, N * w13.stride(1), H * w2.stride(1)) >= 2**31:
+        raise ValueError(
+            f"moe_mxfp4_bi: N={N}, H={H}: a W13 half or W2 of one expert must be "
+            "below 2**31 bytes"
+        )
 
 
 def _block_tokens_max(x, w13, chunk_gather):
