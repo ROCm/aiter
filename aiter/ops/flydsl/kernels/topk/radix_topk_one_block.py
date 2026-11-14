@@ -64,6 +64,10 @@ _LANE_MAX_START_DIV = 16
 _LANE_MAX_ROW_PAD = 64
 # The ordered key of -inf: no value's key is lower.
 _NEG_INF_KEY = 0x007FFFFF
+# Shortest row the prefilter takes; shorter rows stream as without lane maxima.
+# Below it the slot pass and the collection save too little of the histogram
+# pass they replace, and with few rows they cost more than it.
+_PREFILTER_MIN_ROW_LEN = 28 * 1024
 
 _FIRST_ABOVE = 0
 _FIRST_THRESHOLD = 1
@@ -76,9 +80,9 @@ _RUNNING_EQUAL = 7
 _CANDIDATE_COUNT = 8
 _SELECTED_BUCKET_COUNT = 9
 _METADATA_SIZE = _SELECTED_BUCKET_COUNT + 1
-# Metadata (above, threshold) slots of the prefilter's radix levels.
-_PF_SLOTS = (
-    (_FIRST_ABOVE, _FIRST_THRESHOLD),
+# Metadata (above, threshold) slots of the prefilter's second and third radix
+# levels (the first level uses _FIRST_ABOVE / _FIRST_THRESHOLD).
+_PF_LATER_SLOTS = (
     (_SECOND_ABOVE, _SECOND_THRESHOLD),
     (_THIRD_ABOVE, _THIRD_THRESHOLD),
 )
@@ -202,8 +206,10 @@ def build_radix_topk_one_block_body(
     # The lane-maxima prefilter collects a row's keys at or above a lower bound
     # of its k-th into the candidate buffer and selects there; it needs the
     # candidate columns and a candidate histogram as wide as the first level.
+    # Its collection reserves a wave's hits with 32-lane ballots: wave32 only.
     prefilter = (
         prefilter
+        and wave_size == 32
         and stable_sort_enabled
         and not short_rows
         and later_buckets >= high_buckets
@@ -1338,12 +1344,16 @@ def build_radix_topk_one_block_body(
             every key equal to the k-th: each level counts the keys above its
             bin exactly and the selection is the full row's, whatever the slots
             held. A collection under k or past the buffer takes the plain
-            streaming path."""
+            streaming path, and so does a row shorter than
+            _PREFILTER_MIN_ROW_LEN (decided per row, so one launch serves any
+            mix of lengths)."""
             num_slots = (
                 (row_len + fx.Int32(_LANE_MAX_GROUP_KEYS - 1))
                 // fx.Int32(_LANE_MAX_GROUP_KEYS)
             ) * fx.Int32(_LANE_MAX_GROUP_SLOTS)
-            if num_slots < top_k:
+            # Fewer slots than k bound nothing; short rows are not worth it.
+            # Either way the row streams (via the fallback below).
+            if (num_slots < top_k) | (row_len < fx.Int32(_PREFILTER_MIN_ROW_LEN)):
                 if tid == 0:
                     metadata[_CANDIDATE_COUNT] = fx.Int32(candidate_capacity + 1)
                 gpu.barrier()
@@ -1402,6 +1412,8 @@ def build_radix_topk_one_block_body(
                 clear_histograms((histogram,), later_bins_per_thread)
 
                 def keep_value(value):
+                    # Raw cmpf: fx comparisons are ordered (OGE) and drop NaN,
+                    # whose key may lie above the bound; UGE keeps it.
                     return arith.cmpf(arith.CmpFPredicate.UGE, value, bound_value)
 
                 def store_hit(pos, col, value, keys_out, cols_out, hist):
@@ -1426,6 +1438,8 @@ def build_radix_topk_one_block_body(
                 def collect_four(col, values, keys_out, cols_out, hist):
                     # Full vectors only (inside the row). A wave reserves its
                     # hits with one atomic; a hit's place is its item, then lane.
+                    # Raw rocdl ballot / mbcnt_lo: FlyDSL has no wave-level
+                    # ballot or prefix-count API; 32-lane masks (wave32 only).
                     hits = [keep_value(values[item]) for item in range(_VEC)]
                     masks = [fx.Int32(fx.rocdl.ballot(T.i32, hit)) for hit in hits]
                     counts = [fx.Int32(fx.ctpop(mask)) for mask in masks]
@@ -1496,8 +1510,7 @@ def build_radix_topk_one_block_body(
                 prefix_threshold = metadata[_FIRST_THRESHOLD]
                 # Levels 2 and 3, always both: the threshold ends a whole key.
                 for level in range_constexpr(1, 3):
-                    above_slot = _PF_SLOTS[level][0]
-                    threshold_slot = _PF_SLOTS[level][1]
+                    above_slot, threshold_slot = _PF_LATER_SLOTS[level - 1]
                     clear_histograms((histogram,), later_bins_per_thread)
                     for pos in range(tid, candidate_count, block_size):
                         accumulate_prefix_histogram(
