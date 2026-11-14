@@ -32,9 +32,12 @@ from aiter.aot.flydsl.common import (
     compile_only_env,
     override_env,
     resolve_target_arch,
+    target_num_xcds,
 )
 from aiter.jit.core import AITER_CONFIGS, AITER_ROOT_DIR
+from aiter.ops.flydsl.kernels.mxfp4_gemm2 import DEFAULT_NUM_CU
 
+AOT_ARCH = "gfx950"
 _MODEL_CONFIG_DIR = f"{AITER_ROOT_DIR}/aiter/configs/model_configs"
 DEFAULT_CSVS = sorted(
     set(
@@ -100,6 +103,7 @@ def _job_key(job: dict) -> tuple:
             job["native_scale_layout"],
             job["num_waves"],
             job["k_wave"],
+            target_num_xcds(AOT_ARCH, job["cu_num"]),
         )
     return (
         2,
@@ -111,6 +115,8 @@ def _job_key(job: dict) -> tuple:
         job["D_INTER"],
         job["D_INTER_REAL"],
         job["xcd_swizzle"],
+        target_num_xcds(AOT_ARCH, job["cu_num"]),
+        job["cu_num"] or DEFAULT_NUM_CU,
     )
 
 
@@ -218,6 +224,7 @@ def parse_csv(
                             {
                                 "stage": 1,
                                 "kernel_name": kn1,
+                                "cu_num": int(row.get("cu_num", "0") or "0"),
                                 "BM": p1["BM"],
                                 "BN": p1["BN"],
                                 "BK": p1["BK"],
@@ -337,6 +344,7 @@ def parse_csv(
                             "D_INTER_REAL": d_inter_real,
                             "topk": topk,  # unused by the kernel; for the entry signature
                             "xcd_swizzle": p2["xcd_swizzle"],
+                            "cu_num": int(row.get("cu_num", "0") or "0"),
                         }
                     )
 
@@ -407,6 +415,7 @@ def _compile_stage1(job):
         native_scale_layout=job["native_scale_layout"],
         num_waves=job["num_waves"],
         k_wave=job["k_wave"],
+        num_xcds=target_num_xcds(AOT_ARCH, job["cu_num"]),
         stream=0,
     )
 
@@ -441,6 +450,8 @@ def _compile_stage2(job):
         cshuffle=epilog == "nonatomic_cshuffle",
         D_INTER_REAL=job["D_INTER_REAL"],
         xcd_swizzle=job["xcd_swizzle"],
+        num_xcds=target_num_xcds(AOT_ARCH, job["cu_num"]),
+        num_cu=job["cu_num"] or DEFAULT_NUM_CU,
         stream=0,
     )
 
@@ -559,7 +570,7 @@ def compile_one_config(**job):
         # mxfp4 a4w4 kernels are gfx950-only. In the GPU-free AOT build,
         # get_rocm_arch() detects gfx942 and the gfx950 intrinsics fail to
         # select (LLVM aborts), so pin FLYDSL_GPU_ARCH=gfx950.
-        with compile_only_env(), override_env("FLYDSL_GPU_ARCH", "gfx950"):
+        with compile_only_env(), override_env("FLYDSL_GPU_ARCH", AOT_ARCH):
             if stage == 1:
                 _compile_stage1(job)
             elif job.get("v2_stage2"):
@@ -611,7 +622,7 @@ def main():
     # mxfp4/layout-v2 FlyDSL MoE is gfx950-only (FLYDSL_GPU_ARCH is pinned to
     # gfx950). Skip when GPU_ARCHS omits that family, e.g. a gfx1250-strict wheel.
     targets = aot_target_archs()
-    if targets and resolve_target_arch("gfx950", targets) is None:
+    if targets and resolve_target_arch(AOT_ARCH, targets) is None:
         print(
             "[aiter] FlyDSL mxfp4 MoE AOT: skipped, GPU_ARCHS omits gfx950",
             flush=True,
