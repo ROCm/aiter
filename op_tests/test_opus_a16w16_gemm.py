@@ -561,6 +561,128 @@ def test_a16w16_launch_plan_preserves_split_k_limits(arch, kid, K, split_k, erro
         )
 
 
+@pytest.mark.parametrize("arch", ("gfx942", "gfx950", "gfx1250"))
+def test_a16w16_launch_plan_refuses_4gib_operands_without_4g_safe(arch):
+    """Kids without 64-bit operand addressing refuse an A, B or C of 4 GiB;
+    one 256-wide step below, no kid is refused for size."""
+    from aiter.ops.opus.launch_plan import (
+        _GFX1250_CO_TAGS,
+        _build_a16w16_launch_plan,
+    )
+    from csrc.opus_gemm.opus_gemm_common import get_kernel_instance, get_registry
+
+    def size_error(kid, M, N, K):
+        try:
+            _build_a16w16_launch_plan(
+                **_a16_policy_args(arch, M, N, K), kid=kid, split_k=0
+            )
+        except ValueError as exc:
+            return "uses 32-bit operand offsets" in str(exc)
+        return False
+
+    cu_num = _a16_policy_args(arch, 1, 1, 1)["cu_num"]
+    k = 1024
+    rows = (1 << 32) // (2 * k)
+    at_limit = ((rows, 256, k), (256, rows, k), (16384, 131072, k))
+    below = ((rows - 256, 256, k), (256, rows - 256, k), (16384, 130816, k))
+    limited = 0
+    for kid in sorted(get_registry("a16w16", arch, cu_num)):
+        instance = get_kernel_instance(
+            arch, "a16w16", kid, torch.bfloat16, cu_num=cu_num
+        )
+        if instance is None:
+            continue
+        expect = not instance.is_4g_safe and instance.kernel_tag not in _GFX1250_CO_TAGS
+        limited += expect
+        for shape in at_limit:
+            assert size_error(kid, *shape) == expect, (kid, shape)
+        for shape in below:
+            assert not size_error(kid, *shape), (kid, shape)
+    assert limited > 0
+
+
+def test_gfx950_fp32_output_limit_follows_c_addressing():
+    """Persistent (30) and mono-tile (92) kids size C's descriptor in bytes and
+    left tiles unwritten at a 4 GiB fp32 C. Split-barrier kids (5, 102) offset
+    C in int elements and computed an 8 GiB fp32 C (2^31 elements) correctly,
+    so their fp32 limit is 2^31 elements."""
+    from aiter.ops.opus.launch_plan import _build_a16w16_launch_plan
+
+    def refused(kid, N):
+        args = _a16_policy_args("gfx950", 16384, N, 128)
+        args["output_dtype"] = torch.float32
+        try:
+            _build_a16w16_launch_plan(**args, kid=kid, split_k=0)
+        except ValueError as exc:
+            assert "uses 32-bit operand offsets" in str(exc)
+            return True
+        return False
+
+    for kid in (30, 92):
+        assert not refused(kid, 65280)
+        assert refused(kid, 65536)
+    for kid in (5, 102):
+        assert not refused(kid, 65536)
+        assert not refused(kid, 130816)
+        assert refused(kid, 131072)
+
+
+def test_gfx950_split_k_kid_refuses_4gib_workspace():
+    """The fp32 split-K workspace is split_k x M x N; kid 6 returned wrong
+    values once it reached 4 GiB, even with a 0.25 GiB C."""
+    from aiter.ops.opus.launch_plan import _build_a16w16_launch_plan
+
+    def plan(M, N, K, split_k):
+        return _build_a16w16_launch_plan(
+            **_a16_policy_args("gfx950", M, N, K), kid=6, split_k=split_k
+        )
+
+    assert plan(16384, 16128, 1024, 4).abi_split_k == 4
+    assert plan(8192, 16128, 2048, 8).abi_split_k == 8
+    for shape in (
+        (16384, 16384, 1024, 4),
+        (8192, 16384, 2048, 8),
+        (16384, 130816, 256, 1),
+    ):
+        with pytest.raises(ValueError, match="workspace.*smaller than 4 GiB"):
+            plan(*shape)
+
+
+def test_gfx950_tuned_row_without_4g_safe_falls_through_at_4gib():
+    """tuned_gemm drops an OPUS row whose plan is refused and tries the next
+    padded row or the default backend."""
+    from aiter.ops.opus.policy import resolve_a16w16_tuned_candidate
+
+    def resolve(kid, N):
+        return resolve_a16w16_tuned_candidate(
+            **_a16_policy_args("gfx950", 16384, N, 512), requested_kid=kid
+        )
+
+    assert resolve(5, 130816) is not None
+    assert resolve(5, 131072) is None
+    assert resolve(120, 131072) is not None
+
+
+def test_gfx950_kid_without_4g_safe_rejects_4gib_output():
+    """Kid 5 refuses a 4 GiB C before launching; its 4g_safe twin, kid 120,
+    computes the same shape."""
+    if _runtime_arch() != "gfx950":
+        pytest.skip("requires gfx950 hardware")
+    M, N, K = 16384, 131072, 128
+    free, _ = torch.cuda.mem_get_info()
+    if free < 6 << 30:
+        pytest.skip("needs 6 GiB of free GPU memory")
+    torch.manual_seed(0x2032)
+    A = torch.randn((M, K), device="cuda", dtype=torch.bfloat16)
+    B = torch.randn((N, K), device="cuda", dtype=torch.bfloat16)
+    Y = torch.empty((M, N), device="cuda", dtype=torch.bfloat16)
+    with pytest.raises(ValueError, match="32-bit operand offsets"):
+        opus_gemm(A, B, Y, family="a16w16", kid=5)
+    opus_gemm(A, B, Y, family="a16w16", kid=120)
+    torch.cuda.synchronize()
+    _assert_matches_golden(Y[-256:], A[-256:], B)
+
+
 def test_gfx1250_split_k_reducer_row_limit():
     from csrc.opus_gemm.opus_gemm_common import (
         gfx1250_clusterlaunch_kernels_list,
