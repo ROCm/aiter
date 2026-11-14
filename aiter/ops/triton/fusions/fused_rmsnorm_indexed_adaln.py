@@ -56,14 +56,79 @@ def fused_rmsnorm_indexed_adaln(
         tuple(scale.shape),
         tuple(indices.shape),
     )
+    assert weight is not None, "weight is required for RMSNorm"
+    return _indexed_adaln(
+        x, weight, None, shift, scale, indices, eps, out, round_intermediate, False
+    )
 
+
+def fused_layernorm_indexed_adaln(
+    x: torch.Tensor,
+    shift: torch.Tensor,
+    scale: torch.Tensor,
+    indices: torch.Tensor,
+    eps: float = 1e-6,
+    weight: torch.Tensor | None = None,
+    bias: torch.Tensor | None = None,
+    out: torch.Tensor | None = None,
+    round_intermediate: bool = False,
+) -> torch.Tensor:
+    """LayerNorm followed by a table-indexed affine modulation, in one pass.
+
+        out[m] = layernorm(x[m], weight, bias) * (1 + scale[indices[m]]) + shift[indices[m]]
+
+    This is the AdaLN step of most diffusion transformers (PixArt, SD3, FLUX,
+    Wan): ``norm(x) * (1 + scale) + shift`` with ``nn.LayerNorm(N,
+    elementwise_affine=False)``. For a per-sample modulation of shape [B, N],
+    pass the table as is and set ``indices[m]`` to the sample of token m, for
+    example ``torch.arange(B).repeat_interleave(S)`` for x of shape [B * S, N].
+
+    Key parameters:
+    - x: [M, N] activations, contiguous
+    - shift, scale: [G, N] modulation table, one row per index value
+    - indices: [M] int32/int64, one table row per token
+    - eps: LayerNorm epsilon
+    - weight, bias: optional [N] LayerNorm affine parameters
+    - out: optional [M, N] destination; allocated when omitted
+    - round_intermediate: round to the output dtype at the points an unfused
+      implementation would store, trading accuracy for comparability with it
+
+    The mean and the variance are computed in fp32, like torch.nn.LayerNorm.
+
+    Returns:
+    - out: [M, N], same dtype as x
+    """
+    _LOGGER.info(
+        "FUSED_LAYERNORM_INDEXED_ADALN: x=%s table=%s idx=%s",
+        tuple(x.shape),
+        tuple(scale.shape),
+        tuple(indices.shape),
+    )
+    return _indexed_adaln(
+        x, weight, bias, shift, scale, indices, eps, out, round_intermediate, True
+    )
+
+
+def _indexed_adaln(
+    x, weight, bias, shift, scale, indices, eps, out, round_intermediate, is_layernorm
+):
     assert x.ndim == 2, f"x must be 2-D, got {tuple(x.shape)}"
     M, N = x.shape
-    assert weight.shape == (N,), f"weight must be [{N}], got {tuple(weight.shape)}"
+    for name, p in (("weight", weight), ("bias", bias)):
+        assert p is None or p.shape == (
+            N,
+        ), f"{name} must be [{N}], got {tuple(p.shape)}"
+        # The kernel indexes these with the column offset alone.
+        assert p is None or p.is_contiguous(), f"{name} must be contiguous"
     assert shift.shape == scale.shape, "shift and scale must have the same shape"
     assert (
         shift.ndim == 2 and shift.shape[1] == N
     ), f"modulation table must be [G, {N}], got {tuple(shift.shape)}"
+    # Only the row stride reaches the kernel, so the columns must be adjacent.
+    # A row-strided view, such as one chunk of a packed table, is fine.
+    assert N == 1 or (
+        shift.stride(1) == 1 and scale.stride(1) == 1
+    ), "shift and scale must have unit column stride"
     assert indices.shape == (M,), f"indices must be [{M}], got {tuple(indices.shape)}"
     assert x.is_contiguous(), "x must be contiguous"
     assert indices.is_contiguous(), "indices must be contiguous"
@@ -87,6 +152,7 @@ def fused_rmsnorm_indexed_adaln(
         out,
         x,
         weight,
+        bias,
         shift,
         scale,
         indices,
@@ -100,6 +166,9 @@ def fused_rmsnorm_indexed_adaln(
         ROUND_INTERMEDIATE=round_intermediate,
         BLOCK_M=BLOCK_M,
         BLOCK_N=BLOCK_N,
+        IS_LAYERNORM=is_layernorm,
+        HAS_WEIGHT=weight is not None,
+        HAS_BIAS=bias is not None,
         num_warps=4,
     )
     return out
