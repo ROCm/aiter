@@ -10,6 +10,12 @@ judge here: the Triton decode scorer this file once cross-checked against has
 been deleted from ATOM, the FlyDSL kernel having replaced it outright, so
 every candidate below is a FlyDSL config and the oracle is what they answer to.
 
+The NVFP4 decode scorer (`score_flydsl_nvfp4`: e2m1 data, one e4m3 scale per 16
+elements, no per-tensor scale) is judged by the same kind of oracle: a torch
+dequantizer (K = e2m1 x scale, exact or rounded to e4m3), with a torch page writer
+because this change has no NVFP4 write kernel. Its checks are `check_nvfp4_*` and run
+through `build_nvfp4_checks`.
+
 Run:
     python op_tests/test_flydsl_minimax_m3_index_score.py
 """
@@ -25,7 +31,7 @@ import torch
 
 import aiter
 from aiter import dtypes
-from aiter.jit.utils.chip_info import get_gfx
+from aiter.jit.utils.chip_info import get_gfx_runtime
 from aiter.ops.flydsl.kernels import minimax_m3_index_score as kernel
 from aiter.ops.flydsl.kernels.minimax_m3_index_score_prefill import (
     alloc_score as prefill_alloc_score,
@@ -59,7 +65,7 @@ DECODE_SUPPORTED_GFX = ["gfx950"]
 # objects: that list had to be kept in step by hand and had already missed
 # several CUDA-allocating tests. A decorator cannot be forgotten the same way.
 requires_gfx950 = pytest.mark.skipif(
-    not torch.cuda.is_available() or get_gfx() not in DECODE_SUPPORTED_GFX,
+    not torch.cuda.is_available() or get_gfx_runtime() not in DECODE_SUPPORTED_GFX,
     reason="GPU execution requires gfx950",
 )
 
@@ -1265,7 +1271,7 @@ def test_score(case, B, S, H, lens, layout, kwargs):
             2, 1, 0
         )
     )
-    ret = {"gfx": get_gfx(), "timing": "repeated-buffer (warm effective TB/s)"}
+    ret = {"gfx": get_gfx_runtime(), "timing": "repeated-buffer (warm effective TB/s)"}
     g = geometry(B, mb, S, H, device=q.device)
     ret["geometry"] = f"tw{g['waves_per_tok']}_L{g['pages_per_wave']}" + (
         "_sp" if g["spread"] else ""
@@ -1944,7 +1950,7 @@ def test_score_prefill_perf(batch, q_len, ctx_len, heads):
     q = c["q_bf16"]
     fp8 = True  # the cache dtype, which is what aiter's build is keyed on
 
-    ret = {"gfx": get_gfx()}
+    ret = {"gfx": get_gfx_runtime()}
     g = prefill_geometry(c["max_q"], batch, heads, c["mb"], torch.device("cuda"))
     ret["prefill_geometry"] = f"q{g['tile_q']}_w{g['waves']}_L{g['pages_per_wave']}"
     ref = live = None
@@ -2400,7 +2406,7 @@ def bench_score_mxfp4(case, B, S, H, lens, kwargs):
     q, cache8, bt, seq, mb = make_case(B, S, H, lens, **kwargs)
     kd, ks, deq = fp4_cache_of(cache8)
     ref = score_oracle(q, deq, bt, seq, S, H, D**-0.5, mb)
-    ret = {"gfx": get_gfx(), "timing": "repeated-buffer (warm effective TB/s)"}
+    ret = {"gfx": get_gfx_runtime(), "timing": "repeated-buffer (warm effective TB/s)"}
     capacity = kernel.work_map_capacity(B, mb, S, H)
     buf = torch.empty((capacity, 2), device=q.device, dtype=torch.int32)
     wm = kernel.build_work_map(seq, mb, S, H, out=buf)
@@ -2433,6 +2439,466 @@ def bench_score_mxfp4(case, B, S, H, lens, kwargs):
             }
         )
     return ret
+
+
+# ==========================================================================
+# NVFP4 INDEX CACHE (score_flydsl_nvfp4)
+#
+# A token is 64 B of e2m1 plus 8 e4m3 scale bytes (one per 16 elements, no
+# per-tensor scale). Two references, because K has two defensible values:
+#   "e4m3"  K = e4m3_rn_satfinite(e2m1 * scale)    what the vLLM nvfp4 indexer reads
+#   "exact" K = e2m1 * scale                       exact in bf16
+# They differ on ~21% of (code, scale) pairs, so each kernel mode is judged against
+# ITS reference and the cross difference is reported, never absorbed in a tolerance.
+# The quantizer below is test-side only; the kernel sees (data, scale) bytes.
+# ==========================================================================
+E2M1 = (0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0)  # code & 7; bit 3 is the sign
+E4M3_MAX = 448.0
+K_ROUNDS = ["e4m3", "exact"]
+
+
+def e2m1_encode(a):
+    """fp32 -> 4-bit e2m1 codes, round to nearest even (ties go to the even code)."""
+    m = a.abs()
+    code = (
+        (m > 0.25).int()
+        + (m >= 0.75).int()
+        + (m > 1.25).int()
+        + (m >= 1.75).int()
+        + (m > 2.5).int()
+        + (m >= 3.5).int()
+        + (m > 5.0).int()
+    )
+    return code + 8 * (a < 0).int()
+
+
+def e2m1_values(code):
+    lut = torch.tensor(E2M1, device=code.device)
+    return lut[code & 7] * (1 - 2 * (code >> 3).float())
+
+
+def nvfp4_product(data, scale):
+    """e2m1 data u8 [..., 64] x e4m3 scale u8 [..., 8] -> exact fp32 [..., 128]."""
+    lo, hi = (data & 0xF).long(), (data >> 4).long()
+    codes = torch.stack([lo, hi], -1).reshape(*data.shape[:-1], D)
+    s = scale.view(dtypes.fp8).float().repeat_interleave(16, dim=-1)
+    return e2m1_values(codes) * s
+
+
+def e4m3_rn_satfinite(x):
+    return x.clamp(-E4M3_MAX, E4M3_MAX).to(dtypes.fp8).float()
+
+
+def pack_nvfp4(codes, scale_bytes):
+    """codes int [pages, 128, 128], scale u8 [pages, 128, 8] -> (data, scale, exact, e4m3)
+    where exact / e4m3 are the two dequantized K tensors as bf16."""
+    pair = codes.reshape(*codes.shape[:-1], D // 2, 2)
+    data = (pair[..., 0] | (pair[..., 1] << 4)).to(torch.uint8)
+    prod = nvfp4_product(data, scale_bytes)
+    exact = prod.to(torch.bfloat16)
+    assert torch.equal(exact.float(), prod), "e2m1 * e4m3 must be exact in bf16"
+    return data, scale_bytes, exact, e4m3_rn_satfinite(prod).to(torch.bfloat16)
+
+
+RCP6_F32 = 0x3E2AAAAB  # RN(1/6) as fp32 bits, what the vLLM nvfp4 writer multiplies by
+
+
+def quantize_nvfp4(k):
+    """bf16 [pages,128,128] -> (data u8 [pages,128,64], scale u8 [pages,128,8],
+    exact bf16, e4m3 bf16). Numerics of vLLM's `_quant4`, bit for bit (checked
+    against it on device): scale = RNE e4m3 of min(amax * RN(1/6), 448) per 16
+    elements, elements * (1 / decoded scale) -> RNE e2m1, a zero scale gives code 0."""
+    x = k.float().reshape(*k.shape[:-1], D // 16, 16)
+    rcp6 = torch.tensor(RCP6_F32, dtype=torch.int32).view(torch.float32).item()
+    sf = (x.abs().amax(-1) * rcp6).clamp(max=E4M3_MAX).to(dtypes.fp8)
+    sv = sf.float().unsqueeze(-1)
+    quant = torch.where(sv != 0, 1.0 / sv, torch.zeros_like(sv))
+    codes = e2m1_encode(x * quant).reshape(*k.shape[:-1], D)
+    return pack_nvfp4(codes, sf.view(torch.uint8))
+
+
+def nvfp4_cache_of(cache8, transform=None):
+    """An NVFP4 version of an fp8 test cache: the same values, re-quantized."""
+    pages = cache8.shape[0]
+    outs = [[], [], [], []]
+    for i in range(0, pages, QCHUNK):
+        blk = cache8[i : i + QCHUNK].to(torch.bfloat16)
+        for o, t in zip(outs, quantize_nvfp4(transform(blk) if transform else blk)):
+            o.append(t)
+    return tuple(torch.cat(o) for o in outs)
+
+
+def nvfp4_single_region_views(data, scale):
+    """Both views of ONE `[pages, 9216]` allocation: 8192 B of e2m1 then 1024 B of
+    e4m3 scale per page, the physical layout vLLM's nvfp4 index cache has."""
+    pages = data.shape[0]
+    buf = torch.empty((pages, P * 64 + P * 8), dtype=torch.uint8, device=data.device)
+    buf[:, : P * 64] = data.reshape(pages, -1)
+    buf[:, P * 64 :] = scale.reshape(pages, -1)
+    kd = torch.as_strided(buf, (pages, P, 64), (buf.stride(0), 64, 1))
+    ks = torch.as_strided(buf, (pages, P, 8), (buf.stride(0), 8, 1), P * 64)
+    return buf, kd, ks
+
+
+def run_nvfp4(q, kd, ks, bt, seq, S, H, mb, k_round="e4m3", **kw):
+    return kernel.score_flydsl_nvfp4(
+        q, kd, ks, bt, seq, S, H, D**-0.5, mb, k_round=k_round, **kw
+    )
+
+
+def nvfp4_ref(k_round, exact, e4m3):
+    return exact if k_round == "exact" else e4m3
+
+
+def check_nvfp4_matches_oracle(case, qdt, k_round):
+    _, B, S, H, lens, kw = case
+    q, cache8, bt, seq, mb = make_case(B, S, H, lens, **kw)
+    q, q_ref = q_for(q, qdt)
+    kd, ks, exact, e4m3 = nvfp4_cache_of(cache8)
+    ref = score_oracle(
+        q_ref, nvfp4_ref(k_round, exact, e4m3), bt, seq, S, H, D**-0.5, mb
+    )
+    check_scores(run_nvfp4(q, kd, ks, bt, seq, S, H, mb, k_round), ref)
+
+
+def check_nvfp4_exact_e4m3_q_equals_bf16_q(S, H, lens):
+    """The exact arm runs the f16 MFMA for an e4m3 Q and the bf16 MFMA for a bf16 Q; both
+    hold K and Q exactly, so on RANDOM data (not only exact-sum data) the same Q must
+    score the same to the bit."""
+    q, cache8, bt, seq, mb = make_case(len(lens), S, H, lens)
+    q8, _ = q_for(q, "e4m3")
+    qb = q8.float().to(torch.bfloat16)
+    kd, ks, _, _ = nvfp4_cache_of(cache8)
+    a = run_nvfp4(q8, kd, ks, bt, seq, S, H, mb, "exact")
+    b = run_nvfp4(qb, kd, ks, bt, seq, S, H, mb, "exact")
+    live = torch.isfinite(a)
+    assert torch.equal(torch.isfinite(b), live) and torch.equal(a[live], b[live])
+
+
+def check_nvfp4_tuned_geometry_map(k_round):
+    """The NVFP4-only depth table (`nvfp4=True` on the map builders) changes the grid at
+    S8H4 / batch 8 / 64K and nothing else: the shared geometry and the MXFP4 scorer are
+    untouched, a map built either way scores bit-identically, and a tuned map is
+    refused by the MXFP4 scorer."""
+    S, H, B, mb = 8, 4, 8, 512
+    shared, tuned = kernel.geometry(B, mb, S, H), kernel.geometry(
+        B, mb, S, H, nvfp4=True
+    )
+    assert (shared["pages_per_wave"], tuned["pages_per_wave"]) == (3, 2)
+    assert kernel.geometry(B, mb, 4, 1) == kernel.geometry(B, mb, 4, 1, nvfp4=True)
+    lens = [mb * P - 5 * i for i in range(B)]
+    q, cache8, bt, seq, mb = make_case(B, S, H, lens)
+    q, _ = q_for(q, "e4m3")
+    kd, ks, _, _ = nvfp4_cache_of(cache8)
+    wm_s = kernel.build_work_map(seq, mb, S, H)
+    wm_t = kernel.build_work_map(seq, mb, S, H, nvfp4=True)
+    assert wm_s.shape != wm_t.shape
+    assert kernel.work_map_size(B, mb, S, H, nvfp4=True) == wm_t.shape[0]
+    outs = [
+        run_nvfp4(q, kd, ks, bt, seq, S, H, mb, k_round, work_map=wm)
+        for wm in (wm_s, wm_t, None)
+    ]
+    assert bool(torch.isfinite(outs[0]).any())
+    for o in outs[1:]:
+        assert torch.equal(torch.isfinite(o), torch.isfinite(outs[0]))
+        assert torch.equal(o[torch.isfinite(o)], outs[0][torch.isfinite(o)])
+    # The MXFP4 scorer, on real MXFP4 views of the same cache, takes the shared map
+    # and refuses the tuned one on the map itself (not on the cache layout).
+    kd4, ks4, _ = fp4_cache_of(cache8)
+    run_fp4(q, kd4, ks4, bt, seq, S, H, mb, work_map=wm_s)
+    expect_value_error(
+        "tuned work map to mxfp4",
+        lambda: run_fp4(q, kd4, ks4, bt, seq, S, H, mb, work_map=wm_t),
+        match="work_map",
+    )
+
+
+def exact_sum_case(B, S, H, lens, seed=0):
+    """Inputs whose every partial sum is exact in fp32, so a kernel and a torch
+    reference must agree to the BIT whatever the accumulation order: |Q| and every
+    scale in [0.5, 2) (e4m3 bytes 0x30..0x47) or zero, e2m1 data arbitrary. Term
+    ulp >= 2^-9 and |sum| < 2^12, well inside fp32's 24 bits."""
+    g = torch.Generator(device="cuda").manual_seed(seed)
+    seq = torch.tensor(lens, dtype=torch.int32, device="cuda")
+    mb = max(1, max((L + P - 1) // P for L in lens))
+    pages = B * mb
+    qb = torch.randint(0x30, 0x48, (B * S, H, D), device="cuda", generator=g)
+    qb = qb | (torch.randint(0, 2, qb.shape, device="cuda", generator=g) << 7)
+    q8 = qb.to(torch.uint8).view(dtypes.fp8)
+    codes = torch.randint(0, 16, (pages, P, D), device="cuda", generator=g)
+    sb = torch.randint(0x30, 0x48, (pages, P, 8), device="cuda", generator=g).to(
+        torch.uint8
+    )
+    data, scale, exact, e4m3 = pack_nvfp4(codes, sb)
+    bt = torch.randperm(pages, device="cuda", dtype=torch.int32, generator=g).view(
+        B, mb
+    )
+    return q8, data, scale, exact, e4m3, bt.contiguous(), seq, mb
+
+
+def check_nvfp4_bit_exact(S, H, lens, qdt, k_round):
+    """Bit-equality against each torch reference on exact-sum data. Also asserts
+    the data tells the two references apart, and records how often they differ."""
+    q8, data, scale, exact, e4m3, bt, seq, mb = exact_sum_case(len(lens), S, H, lens)
+    q = q8 if qdt == "e4m3" else q8.to(torch.bfloat16)
+    refs = {
+        r: score_oracle(q8.to(torch.bfloat16), kk, bt, seq, S, H, D**-0.5, mb)
+        for r, kk in (("exact", exact), ("e4m3", e4m3))
+    }
+    got = run_nvfp4(q, data, scale, bt, seq, S, H, mb, k_round)
+    ref = refs[k_round]
+    live = ~torch.isnan(ref)
+    assert torch.equal(got[live], ref[live]), (
+        f"not bit-equal to the {k_round} reference: "
+        f"{int((got[live] != ref[live]).sum())}/{int(live.sum())} slots"
+    )
+    other = refs["exact" if k_round == "e4m3" else "e4m3"]
+    assert not torch.equal(got[live], other[live]), "data does not separate the modes"
+
+
+def check_nvfp4_split_and_single_region_views_agree_bitwise():
+    q, cache8, bt, seq, mb = make_case(3, 4, 4, [130, 4096, 513])
+    kd, ks, _, _ = nvfp4_cache_of(cache8)
+    _buf, kd1, ks1 = nvfp4_single_region_views(kd, ks)
+    assert kd1.stride(0) == ks1.stride(0) == 9216
+    for r in K_ROUNDS:
+        assert torch.equal(
+            run_nvfp4(q, kd, ks, bt, seq, 4, 4, mb, r),
+            run_nvfp4(q, kd1, ks1, bt, seq, 4, 4, mb, r),
+        )
+
+
+def check_nvfp4_scale_range_and_saturation(qdt, k_round):
+    """Scale bytes over the whole e4m3 range (0, subnormals, 448): every lane group
+    must pick its own two bytes, and e2m1 6 x scale > 448 must saturate, not NaN.
+    Q is 2^-8 so scores stay finite; compared with the oracle."""
+    B, S, H = 2, 4, 4
+    q, cache8, bt, seq, mb = make_case(B, S, H, [2048, 700])
+    pages = cache8.shape[0]
+    g = torch.Generator(device="cuda").manual_seed(11)
+    codes = torch.randint(0, 16, (pages, P, D), device="cuda", generator=g)
+    # 0x00..0x7E: scales are positive (the sign bit is not read) and 0x7F is NaN.
+    sb = torch.randint(0, 0x7F, (pages, P, 8), device="cuda", generator=g).to(
+        torch.uint8
+    )
+    sb[0, :4] = torch.tensor(
+        [0, 1, 0x7E, 0x77], dtype=torch.uint8, device="cuda"
+    ).repeat(2)
+    kd, ks, exact, e4m3 = pack_nvfp4(codes, sb)
+    q2 = (q.float() * 2**-8).to(torch.bfloat16)
+    q2, q2_ref = q_for(q2, qdt)
+    ref = score_oracle(
+        q2_ref, nvfp4_ref(k_round, exact, e4m3), bt, seq, S, H, D**-0.5, mb
+    )
+    check_scores(run_nvfp4(q2, kd, ks, bt, seq, S, H, mb, k_round), ref)
+
+
+def tail_lengths(S):
+    """Sequence lengths that put the causal cutoff (seq_len - S + 1, the smallest any
+    feature sees) on, and one either side of, every 16-token tile and 128-token page
+    boundary of the last pages, plus the degenerate ones: length 1, shorter than S,
+    exactly S, one page, one page +-1."""
+    base = {1, 2, S - 1, S, S + 1, 127, 128, 129}
+    base |= {
+        L + d for m in range(17) for L in (128 + 16 * m + S - 1,) for d in (-1, 0, 1)
+    }
+    return sorted(x for x in base if x >= 1)
+
+
+def check_nvfp4_tail_pages_bit_exact(S, H, qdt, k_round):
+    """The mask-free path of the fp8 arm may only run on tiles the cutoff does not
+    reach; every length around the cutoff must still be bit-equal to the reference."""
+    check_nvfp4_bit_exact(S, H, tail_lengths(S), qdt, k_round)
+
+
+def check_nvfp4_repeat_launches_are_bitwise_identical():
+    """Several feature tiles (F = 32) on exact-sum data: every launch must return the
+    same bytes. A scale decode through `v_cvt_pk_f32_fp8` once did not."""
+    q8, data, scale, _, _, bt, seq, mb = exact_sum_case(2, 8, 4, [2048, 129])
+    for qdt, r in itertools.product(QDTS, K_ROUNDS):
+        q = q8 if qdt == "e4m3" else q8.to(torch.bfloat16)
+        runs = {
+            run_nvfp4(q, data, scale, bt, seq, 8, 4, mb, r).cpu().numpy().tobytes()
+            for _ in range(8)
+        }
+        assert len(runs) == 1, f"{qdt}/{r}: {len(runs)} distinct results in 8 launches"
+
+
+def check_nvfp4_default_k_round_is_e4m3():
+    """Leaving `k_round` out scores like `k_round="e4m3"` (the vLLM-identical numerics),
+    and not like "exact"."""
+    q8, data, scale, _, _, bt, seq, mb = exact_sum_case(2, 8, 4, [2048, 129])
+    args = (q8, data, scale, bt, seq, 8, 4, D**-0.5, mb)
+    default = kernel.score_flydsl_nvfp4(*args)
+    expect = kernel.score_flydsl_nvfp4(*args, k_round="e4m3")
+    live = torch.isfinite(expect)
+    assert torch.equal(torch.isfinite(default), live)
+    assert torch.equal(default[live], expect[live])
+
+
+def check_nvfp4_modes_do_not_share_a_compiled_kernel():
+    """Both K roundings and the MXFP4 scorer in one process, interleaved: each must
+    reproduce its own first answer, and the names must differ."""
+    q, cache8, bt, seq, mb = make_case(2, 4, 4, [513, 1025])
+    kd, ks, _, _ = nvfp4_cache_of(cache8)
+    kd4, ks4, _ = fp4_cache_of(cache8)
+    first = {
+        "e4m3": run_nvfp4(q, kd, ks, bt, seq, 4, 4, mb, "e4m3"),
+        "exact": run_nvfp4(q, kd, ks, bt, seq, 4, 4, mb, "exact"),
+        "mx": run_fp4(q, kd4, ks4, bt, seq, 4, 4, mb),
+    }
+    assert not torch.equal(first["e4m3"], first["exact"])
+    again = {
+        "mx": run_fp4(q, kd4, ks4, bt, seq, 4, 4, mb),
+        "exact": run_nvfp4(q, kd, ks, bt, seq, 4, 4, mb, "exact"),
+        "e4m3": run_nvfp4(q, kd, ks, bt, seq, 4, 4, mb, "e4m3"),
+    }
+    assert all(torch.equal(first[k], again[k]) for k in first)
+    g = _geom(ppw=1, nt_k=2)
+    names = {
+        kernel.kernel_name(4, 4, g, True, qf, nv)
+        for qf, nv in itertools.product([False, True], [None, "e4m3", "exact"])
+    }
+    assert len(names) == 6
+
+
+def check_nvfp4_rejections():
+    q, cache8, bt, seq, mb = make_case(2, 4, 4, [130, 513])
+    kd, ks, _, _ = nvfp4_cache_of(cache8)
+    _, ks4, _ = fp4_cache_of(cache8)
+    assert kernel.index_score_supported_nvfp4(q, kd, ks, 4, 4, mb, bt, seq_lens=seq)
+    # An MXFP4 scale view is not an NVFP4 one, and the other way round.
+    for scale in (ks4, ks[:, :, :4]):
+        assert not kernel.index_score_supported_nvfp4(
+            q, kd, scale, 4, 4, mb, bt, seq_lens=seq
+        )
+        expect_value_error(
+            "mx scale to nvfp4",
+            run_nvfp4,
+            q,
+            kd,
+            scale,
+            bt,
+            seq,
+            4,
+            4,
+            mb,
+            match="[pages, 128, 8]",
+        )
+    expect_value_error(
+        "nvfp4 scale to mxfp4",
+        run_fp4,
+        q,
+        kd,
+        ks,
+        bt,
+        seq,
+        4,
+        4,
+        mb,
+        match="[pages, 128, 4]",
+    )
+    expect_value_error(
+        "k_round", run_nvfp4, q, kd, ks, bt, seq, 4, 4, mb, "bf16", match="k_round"
+    )
+    # None would otherwise validate an MXFP4 scale view as an MXFP4 cache.
+    for bad_round, scale in (("bf16", ks), (None, ks4), (None, ks)):
+        assert not kernel.index_score_supported_nvfp4(
+            q, kd, scale, 4, 4, mb, bt, seq_lens=seq, k_round=bad_round
+        )
+    for scale in (-1.0, 0.0, float("nan")):
+        expect_value_error(
+            f"sm_scale={scale}", kernel.score_flydsl_nvfp4,
+            q, kd, ks, bt, seq, 4, 4, scale, mb, match="sm_scale",
+        )  # fmt: skip
+    bad = ks.view(torch.int8)
+    assert not kernel.index_score_supported_nvfp4(
+        q, kd, bad, 4, 4, mb, bt, seq_lens=seq
+    )
+    wide = torch.empty((ks.shape[0], P, 16), dtype=torch.uint8, device="cuda")[:, :, :8]
+    assert not kernel.index_score_supported_nvfp4(
+        q, kd, wide, 4, 4, mb, bt, seq_lens=seq
+    )
+
+
+@benchmark()
+def bench_score_nvfp4(case, B, S, H, lens, kwargs):
+    q, cache8, bt, seq, mb = make_case(B, S, H, lens, **kwargs)
+    kd, ks, exact, e4m3 = nvfp4_cache_of(cache8)
+    q8, q_ref = q_for(q, "e4m3")
+    ref = {
+        r: score_oracle(q_ref, kk, bt, seq, S, H, D**-0.5, mb)
+        for r, kk in (("e4m3", e4m3), ("exact", exact))
+    }
+    ret = {"gfx": get_gfx_runtime(), "timing": "repeated-buffer (warm effective TB/s)"}
+    # The NVFP4 scorer's own depth table: a shared (MXFP4) map would keep the shared geometry.
+    wm = kernel.build_work_map(seq, mb, S, H, nvfp4=True)
+    pages = sum((L + P - 1) // P for L in lens)
+    flops = 2 * pages * P * D * S * H
+    out = kernel.alloc_score(B, S, H, mb, q.device)
+    cands = {
+        f"nvfp4_{r}": (lambda r=r: run_nvfp4(q8, kd, ks, bt, seq, S, H, mb, r, out=out, work_map=wm), pages * P * 72, ref[r])
+        for r in K_ROUNDS
+    }  # fmt: skip
+    for name, (run, kbytes, want) in cands.items():
+        got, us = run_perftest(run, num_iters=10, num_rotate_args=1)
+        err = check_scores(got, want)
+        nbytes = kbytes + q8.numel() + pages * S * H * 4
+        ret.update(
+            {
+                f"{name} us": us,
+                f"{name} TFLOPS": flops / us / 1e6,
+                f"{name} TB/s": nbytes / us / 1e6,
+                f"{name} err": err,
+            }
+        )
+    return ret
+
+
+def build_nvfp4_checks():
+    """(name, check, args): one row per NVFP4 correctness case. A minimal matrix: the
+    regression matrix of every geometry and shape lives outside this file."""
+    checks = []
+    keep = ("F1_", "F16_", "F32_", "L129_", "causal_straddle", "ragged_zero")
+    cases = [c for c in build_matrix() if c[0].startswith(keep)]
+    for case, qdt, r in itertools.product(cases, QDTS, K_ROUNDS):
+        name = f"matches_oracle_{case[0].replace('fp8', 'nvfp4')}_{qdt}_{r}"
+        checks.append((name, check_nvfp4_matches_oracle, (case, qdt, r)))
+    for (S, H, lens), qdt, r in itertools.product(
+        [(4, 4, [130, 4096, 513, 0]), (8, 4, [2048, 129])], QDTS, K_ROUNDS
+    ):
+        name = f"bit_exact_S{S}H{H}_{'_'.join(map(str, lens))}_{qdt}_{r}"
+        checks.append((name, check_nvfp4_bit_exact, (S, H, lens, qdt, r)))
+    for qdt, r in itertools.product(QDTS, K_ROUNDS):
+        checks.append(
+            (
+                f"scale_range_and_saturation_{qdt}_{r}",
+                check_nvfp4_scale_range_and_saturation,
+                (qdt, r),
+            )
+        )
+    for (S, H), qdt, r in itertools.product([(1, 1), (8, 4)], QDTS, K_ROUNDS):
+        checks.append(
+            (
+                f"tail_pages_S{S}H{H}_{qdt}_{r}",
+                check_nvfp4_tail_pages_bit_exact,
+                (S, H, qdt, r),
+            )
+        )
+    for S, H, lens in [(4, 1, [4096]), (8, 4, [2048, 129])]:
+        name = f"exact_e4m3_q_equals_bf16_q_S{S}H{H}_{'_'.join(map(str, lens))}"
+        checks.append((name, check_nvfp4_exact_e4m3_q_equals_bf16_q, (S, H, lens)))
+    for r in K_ROUNDS:
+        checks.append((f"tuned_geometry_map_{r}", check_nvfp4_tuned_geometry_map, (r,)))
+    for fn in (
+        check_nvfp4_split_and_single_region_views_agree_bitwise,
+        check_nvfp4_repeat_launches_are_bitwise_identical,
+        check_nvfp4_default_k_round_is_e4m3,
+        check_nvfp4_modes_do_not_share_a_compiled_kernel,
+        check_nvfp4_rejections,
+    ):
+        checks.append((fn.__name__.removeprefix("check_nvfp4_"), fn, ()))
+    return checks
 
 
 def build_mxfp4_checks():
@@ -2573,7 +3039,7 @@ def select_cases(args):
 
 def main(argv=None):
     args = parse_args(argv)
-    if not torch.cuda.is_available() or get_gfx() not in DECODE_SUPPORTED_GFX:
+    if not torch.cuda.is_available() or get_gfx_runtime() not in DECODE_SUPPORTED_GFX:
         aiter.logger.warning("index score requires gfx950; skipping sweep")
         return 0
     # A custom --case/--mnk selection is a perf sweep: the correctness checks
@@ -2583,6 +3049,12 @@ def main(argv=None):
         if failed:
             aiter.logger.error(
                 "mxfp4 decode index score: %d checks failed: %s", len(failed), failed
+            )
+            return 1
+        failed = run_checks(build_nvfp4_checks(), "nvfp4 decode index score")
+        if failed:
+            aiter.logger.error(
+                "nvfp4 decode index score: %d checks failed: %s", len(failed), failed
             )
             return 1
     rows = []
@@ -2608,6 +3080,15 @@ def main(argv=None):
         aiter.logger.info(
             "mxfp4 decode index score summary (markdown):\n%s",
             pd.DataFrame(mx).to_markdown(index=False),
+        )
+    nv = [
+        bench_score_nvfp4(name, B, S, H, lens, kw)
+        for name, B, S, H, lens, kw in select_cases(args)
+    ]
+    if nv:
+        aiter.logger.info(
+            "nvfp4 decode index score summary (markdown):\n%s",
+            pd.DataFrame(nv).to_markdown(index=False),
         )
     pre = []
     for batch, q_len, ctx_len, heads in itertools.product(
