@@ -343,6 +343,13 @@ def _run_mxfp8_bpreshuffle_gemm_a8_gfx1250(
         b_scale = _require_e8m0_scale(w_scale, (N // _BLOCK_N, k_blocks), "w_scale")
         stride_ascale_k = a_scale.stride(1) if a_scale.stride(0) == 1 else M
 
+    if batch > 1 and (XQ.stride() != (batch * K, 1) or Out.stride() != (batch * N, 1)):
+        raise RuntimeError(
+            f"[FlyDSL gfx1250 mxfp8] batch > 1 needs XQ strides ({batch * K}, 1) "
+            f"and Out strides ({batch * N}, 1), got {tuple(XQ.stride())} and "
+            f"{tuple(Out.stride())}"
+        )
+
     lda = XQ.stride(0)
     ldc = Out.stride(0)
     _lazy_import()
@@ -543,10 +550,6 @@ def resolve_cluster_m(M: int, tile_m: int, cluster_m: int) -> int | None:
         if cluster_m_grid_ok(M, tile_m, cm):
             return cm
     return None
-
-
-def cluster_m_fallback_values(cluster_m: int) -> list[int]:
-    return list(range(1, max(1, int(cluster_m)) + 1))
 
 
 def is_compute_wmma_kernel_name(name: str) -> bool:

@@ -1728,8 +1728,8 @@ def launch_gemm_a8w8_256x256(
     # A cluster spans consecutive bid_x, so the x extent must stay a whole number of cluster rows.
     fits_cluster = (capped % fx.Int32(cluster_m)) == 0
     if const_expr(cluster_splitk or batched):
-        # Keep grid.z exclusively for K so every tile's splits belong to the
-        # same hardware cluster, including grids with more than 32 M tiles.
+        # Keep grid.z for K splits or batches only, so every tile's splits belong
+        # to the same hardware cluster, including grids with more than 32 M tiles.
         m_run = gx
     else:
         m_run = ((gx > m_run_max) & (pow2 >= m_run_min) & fits_cluster).select(

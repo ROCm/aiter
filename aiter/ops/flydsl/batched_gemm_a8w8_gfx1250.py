@@ -480,6 +480,11 @@ def run_bmm_a8w8_mxfp8_32_gfx1250(
 
     name = kernel_name or pick_bmm_mx32_kernel_name(b, m, n, k, w_scale_32x32)
     if is_compute_wmma_kernel_name(name):
+        if fused:
+            raise ValueError(
+                f"[FlyDSL gfx1250 bmm] compute kernel {name!r} has no fused quant "
+                "epilogue; drop y_scale_out or use a non-compute kernel"
+            )
         if m:
             from aiter.utility import dtypes
 

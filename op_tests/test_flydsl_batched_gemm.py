@@ -22,7 +22,7 @@ last k-tile); DeepSeek-V4.1's shared-expert down projection has K = 576 at TP4.
 
 On gfx1250 this file also checks the mxfp8_32 GEMM's fused quant epilogue:
 ``y_scale_out`` must be byte-identical to quantize_fp8 of the unfused bf16
-output. gfx1250-strict runs that check alone.
+output. gfx1250-strict runs that check and the compute kernelName cases alone.
 
 Input magnitudes change every 32 K (and every 32 weight rows), so the e8m0
 scales differ block to block and a scale applied to the wrong block shows up
@@ -46,12 +46,13 @@ import itertools
 import sys
 
 import pandas as pd
+import pytest
 import torch
 
 import aiter
 from aiter import dtypes
 from aiter.jit.utils.build_targets import base_gfx_arch
-from aiter.jit.utils.chip_info import get_gfx
+from aiter.jit.utils.chip_info import get_gfx_runtime as get_gfx
 from aiter.ops.batched_gemm_op_a8w8 import batched_gemm_a8w8_mxscale_bpreshuffle
 from aiter.ops.flydsl.batched_gemm_a8w8 import run_bmm_a8w8_mxfp8
 from aiter.ops.flydsl.batched_gemm_mxfp4 import (
@@ -78,7 +79,7 @@ A8W8_1X32_GFX = ["gfx1250"]
 # Archs whose a8w8 32x32 GEMM runs a ragged last k-tile (K not a multiple of 128).
 RAGGED_K_GFX = ["gfx1250"]
 # Archs whose a8w8 mxfp8_32 batched GEMM also runs the compute kernel.
-COMPUTE_GFX = ["gfx1250"]
+COMPUTE_GFX = ["gfx1250", "gfx1250-strict"]
 # (b, m, n, k, kernelName): ragged M, persistent N tiles with and without the
 # four-buffer C relocation, a three-wide cluster, and a cluster_n = 1 config that
 # falls back to a one-workgroup cluster at a prime M-tile count.
@@ -428,6 +429,46 @@ def test_batched_gemm_a8w8_compute(b, m, n, k, kernel_name, dtype=dtypes.bf16):
     }
 
 
+def test_compute_operand_guards():
+    """The compute route refuses dense A / C at batch > 1, which its per-batch
+    offsets would read and write out of bounds, and a fused quant it has no
+    epilogue for, before anything launches."""
+    from aiter.ops.flydsl.mxfp8_bpreshuffle_gemm_gfx1250 import (
+        run_gemm_a8w8_mxfp8_32_bpreshuffle_gfx1250,
+    )
+
+    b, m, n, k, kernel_name = COMPUTE_CASES[0]
+    x8 = torch.empty((m, b, k), dtype=dtypes.fp8)
+    w8 = torch.empty((b, n, k), dtype=dtypes.fp8)
+    xs8 = torch.empty((m, b, k // 32), dtype=torch.uint8)
+    ws8 = torch.empty((b, n // 32, k // 32), dtype=torch.uint8)
+    out = torch.empty((m, b, n), dtype=dtypes.bf16)
+
+    def run_dense(xq, o):
+        return run_gemm_a8w8_mxfp8_32_bpreshuffle_gfx1250(
+            xq,
+            w8[0],
+            xs8[:, 0].view(dtypes.fp8_e8m0),
+            ws8[0].view(dtypes.fp8_e8m0),
+            o,
+            kernel_name,
+            w_scale_32x32=True,
+            batch=b,
+        )
+
+    with pytest.raises(RuntimeError, match="batch > 1 needs XQ strides"):
+        run_dense(x8[:, 0].contiguous(), out[:, 0])
+    with pytest.raises(RuntimeError, match="batch > 1 needs XQ strides"):
+        run_dense(x8[:, 0], out[:, 0].contiguous())
+
+    y8 = torch.empty((m, b, n), dtype=dtypes.fp8)
+    y_scale = torch.empty(m * (b * n // 32), dtype=torch.uint8)
+    with pytest.raises(ValueError, match="no fused quant epilogue"):
+        run_bmm_a8w8_mxfp8(
+            x8, w8, xs8, ws8, y8, kernel_name=kernel_name, y_scale_out=y_scale
+        )
+
+
 def atom_quantize_fp8(y_bf16: torch.Tensor):
     """Torch mirror of ATOM ``quantize_fp8``: group-32 over the flattened row,
     amax floored at 1e-10, code = ceil_pow2(amax/448). ``y_bf16`` is [rows, C]."""
@@ -585,6 +626,13 @@ def main():
     )
     args = parser.parse_args()
     custom_shape = any(flag in sys.argv for flag in ("-s", "--mnk", "-b", "--batch"))
+    if gfx in COMPUTE_GFX:
+        test_compute_operand_guards()
+        summarize(
+            "batched_gemm a8w8 on explicit compute kernelNames",
+            [test_batched_gemm_a8w8_compute(*case) for case in COMPUTE_CASES],
+        )
+
     if epilogue_only:
         shapes = (
             _fused_quant_shapes(args, include_ragged_m=False)
@@ -593,12 +641,6 @@ def main():
         )
         _run_fused_quant(shapes)
         return
-
-    if get_gfx() in COMPUTE_GFX:
-        summarize(
-            "batched_gemm a8w8 on explicit compute kernelNames",
-            [test_batched_gemm_a8w8_compute(*case) for case in COMPUTE_CASES],
-        )
 
     for dtype in args.dtype:
         quant_rows = []
