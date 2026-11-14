@@ -68,9 +68,13 @@ REF_IMPL = (
 
 try:
     from aiter.ops.flydsl import flydsl_fp8_mqa_logits
-    from aiter.ops.flydsl.fp8_mqa_logits_kernels import _auto_variant
+    from aiter.ops.flydsl import fp8_mqa_logits_kernels as _fly_mod
+    from aiter.ops.flydsl.fp8_mqa_logits_kernels import (
+        _auto_variant,
+        _resolve_variant,
+    )
 except ImportError:
-    flydsl_fp8_mqa_logits = _auto_variant = None
+    flydsl_fp8_mqa_logits = _auto_variant = _resolve_variant = _fly_mod = None
 
 # Bench timing knobs, set from argv in main(), read by _time_us.
 BENCH_WARMUP = 10
@@ -422,6 +426,105 @@ _GFX942_AUTO_VARIANTS = {
 }
 
 
+# The variant gfx942 resolves to with the LDS kernels enabled (the default):
+# few-row calls stay on the direct-load kernel, rows per wave drop for short
+# windows, and long-KV chunks keep the num_heads cap.
+_GFX942_LDS_VARIANTS = {
+    (8, 40000, 32): "mfma_r1_w4",
+    (4095, 4095, 32): "mfma_bkv64_r1_w4_lds2",
+    (4096, 4096, 32): "mfma_bkv64_r2_w4_lds2",
+    (4096, 4096, 64): "mfma_bkv64_r2_w4_lds2",
+    (4096, 4096, 16): "mfma_bkv64_r2_w4_lds2",
+    (16380, 16380, 32): "mfma_bkv64_r2_w4_lds2",
+    (128, 65536, 32): "mfma_bkv64_r2_w4_lds2",
+    (512, 262144, 32): "mfma_bkv64_r4_w4_lds2",
+    (512, 262144, 64): "mfma_bkv64_r2_w4_lds2",
+    (512, 262144, 128): "mfma_bkv64_r1_w4_lds2",
+}
+
+
+@benchmark()
+def verify_lds_variant(s_q, s_k, num_heads):
+    """Check the gfx942 LDS-enabled variant choice. Launches nothing."""
+    variant = _resolve_variant(None, s_q, s_k, num_heads)
+    expected = _GFX942_LDS_VARIANTS[(s_q, s_k, num_heads)]
+    if variant != expected:
+        raise AssertionError(
+            f"resolved {variant}, expected {expected} "
+            f"[s_q={s_q} s_k={s_k} nh={num_heads}]"
+        )
+    return {"gfx": get_gfx(), "variant": variant, "status": "ok"}
+
+
+# The last two give the gfx942 LDS variants hundreds of grid.y splits over
+# thousands of KV tiles.
+_LAUNCHER_CONTRACT_SHAPES = [
+    (1, 4096),
+    (7, 20007),
+    (1023, 1023),
+    (8191, 40959),
+    (16, 1572864),
+    (1024, 1048576),
+]
+
+
+@benchmark()
+def verify_launcher_contract(s_q, s_k, num_heads):
+    """Host-side launcher contract on the current arch. Launches nothing.
+
+    Every variant gets the real seq_len and unpadded inputs (each kernel masks a
+    short last block itself), with no host-side cat/zeros copies. The gfx942 LDS
+    variants also get a num_splits whose slice bounds fit in i32.
+    """
+    fp8 = DTYPE_MAP[_DEFAULT_KV_DTYPES[0]]
+    captured, copies = [], []
+    real_run, real_bpc = _fly_mod._run_compiled, _fly_mod._max_blocks_per_cu
+    real_cat, real_nz = torch.cat, torch.Tensor.new_zeros
+
+    def _count(fn):
+        def wrapped(*a, **k):
+            copies.append(fn.__name__)
+            return fn(*a, **k)
+
+        return wrapped
+
+    _fly_mod._run_compiled = lambda launcher, *args: captured.append(args)
+    _fly_mod._max_blocks_per_cu = lambda launcher, args: 1
+    torch.cat, torch.Tensor.new_zeros = _count(real_cat), _count(real_nz)
+    try:
+        dev = "meta"
+        out = flydsl_fp8_mqa_logits(
+            torch.empty((s_q, num_heads, 128), dtype=fp8, device=dev),
+            torch.empty((s_k, 128), dtype=fp8, device=dev),
+            torch.empty((s_k,), dtype=torch.float32, device=dev),
+            torch.empty((s_q, num_heads), dtype=torch.float32, device=dev),
+            torch.empty((s_q,), dtype=torch.int32, device=dev),
+            torch.empty((s_q,), dtype=torch.int32, device=dev),
+        )
+    finally:
+        _fly_mod._run_compiled, _fly_mod._max_blocks_per_cu = real_run, real_bpc
+        torch.cat, torch.Tensor.new_zeros = real_cat, real_nz
+    (args,) = captured
+    tensors, seq_len_arg, num_splits = args[:7], args[7], args[-2]
+    rows_dims = [tensors[i].shape[0] for i in (0, 3, 4, 5, 6)]
+    variant = _resolve_variant(None, s_q, s_k, num_heads)
+    if copies or seq_len_arg != s_q or any(d != s_q for d in rows_dims):
+        raise AssertionError(
+            f"{variant}: host copies {copies}, seq_len arg {seq_len_arg}, row dims "
+            f"{rows_dims} [s_q={s_q} s_k={s_k} nh={num_heads}]"
+        )
+    tiles = -(-s_k // 64)
+    if variant in _fly_mod._LDS942_VARIANTS and (
+        (tiles + 1) * num_splits * (num_splits + 1) >= 2**31
+    ):
+        raise AssertionError(
+            f"{variant}: num_splits={num_splits} overflows the i32 slice bounds "
+            f"[s_q={s_q} s_k={s_k} nh={num_heads}]"
+        )
+    assert tuple(out.shape) == (s_q, s_k)
+    return {"gfx": get_gfx(), "variant": variant, "status": "ok"}
+
+
 @benchmark()
 def verify_auto_variant(s_q, s_k, num_heads):
     """Check the gfx942 auto-selected variant against its pin. Launches nothing."""
@@ -634,6 +737,32 @@ _DSv4_AND_GLM_SHAPES = [
 
 _MODELS = {"dsv4": 64, "glm5.2": 32}
 
+# Chunked-prefill calls that pack several sequences, as vLLM issues them at
+# concurrency > 1: (batch, seq_q per sequence, seq_kv per sequence). The
+# per-sequence windows are short relative to the call's s_k, and most s_q
+# totals are not a multiple of the 16 rows a gfx942 LDS block owns.
+_PACKED_SHAPES = [
+    (2, 8192, 8192),
+    (3, 2730, 2730),
+    (6, 2730, 2730),
+    (12, 1365, 1365),
+    (24, 682, 682),
+    (6, 682, 682),
+    (6, 682, 33450),  # 32k prefix per sequence
+    (6, 7, 20007),  # a few rows per sequence, long prefixes
+    (6, 1, 40001),  # decode / spec-verify style
+]
+# The subset the default (CI) lane verifies: cheap, and covers the short last
+# block, short packed windows, and the few-row / decode-sized paths.
+# The last one reaches hundreds of gfx942 grid.y splits over 24k KV tiles.
+_PACKED_CI_SHAPES = [
+    (3, 2730, 2730),
+    (24, 682, 682),
+    (6, 7, 20007),
+    (6, 1, 40001),
+    (1, 16, 1572864),
+]
+
 
 def _model_set(args):
     """Measurement grid for DSv4 and GLM 5.2: 6 shapes x 2 q-head counts."""
@@ -648,6 +777,28 @@ def _model_set(args):
                         num_heads=nh,
                         head_dim=128,
                         q_dtype=args.q_dtype[0],
+                        kv_dtype=args.kv_dtype[0],
+                        clean_logits=bool(cl),
+                        window="batch_causal",
+                        batch=b,
+                    )
+                )
+    return cases
+
+
+def _packed_set(args, shapes=_PACKED_SHAPES, clean_logits=None):
+    """Packed multi-sequence chunks x both model head counts."""
+    cases = []
+    for cl in clean_logits or args.clean_logits:
+        for _, nh in sorted(_MODELS.items()):
+            for b, q_l, kv_l in shapes:
+                cases.append(
+                    Case(
+                        s_q=b * q_l,
+                        s_k=b * kv_l,
+                        num_heads=nh,
+                        head_dim=128,
+                        q_dtype=args.q_dtype[-1],
                         kv_dtype=args.kv_dtype[0],
                         clean_logits=bool(cl),
                         window="batch_causal",
@@ -759,6 +910,14 @@ def main():
         "--num-heads, --head-dim and --window; pairs with --scenario bench.",
     )
     parser.add_argument(
+        "--packed-shapes",
+        action="store_true",
+        help="Run only packed multi-sequence chunked-prefill shapes\n"
+        "(_PACKED_SHAPES) at the DSv4/GLM head counts, block-diagonal causal\n"
+        "windows. These cover the short-window / short-last-block regime\n"
+        "that a single long sequence does not reach.",
+    )
+    parser.add_argument(
         "-s",
         "--shapes",
         type=dtypes.str2tuple,
@@ -825,10 +984,14 @@ def main():
 
     if args.model_shapes:
         cases = _model_set(args)
+    elif args.packed_shapes:
+        cases = _packed_set(args)
     elif args.full:
         cases = _full_set(args)
     else:
         cases = _reduced_set(args)
+    if not (args.model_shapes or args.packed_shapes or args.full):
+        cases += _packed_set(args, _PACKED_CI_SHAPES, clean_logits=[1])
     if not cases:
         aiter.logger.warning("fp8_mqa_logits: the requested axes select no cases")
         return
@@ -861,6 +1024,15 @@ def main():
                 aiter.logger.error("FAILED auto_variant case: %s", exc)
                 failures.append(("auto_variant", f"s_q={s_q} s_k={s_k} nh={nh}", exc))
                 rows.append({**pin, "gfx": get_gfx(), "status": "FAIL"})
+        if not os.environ.get("FLYDSL_FP8_MQA_LOGITS_VARIANT"):
+            for s_q, s_k, nh in _GFX942_LDS_VARIANTS:
+                pin = {"s_q": s_q, "s_k": s_k, "num_heads": nh}
+                try:
+                    rows.append(verify_lds_variant(**pin))
+                except AssertionError as exc:
+                    aiter.logger.error("FAILED lds_variant case: %s", exc)
+                    failures.append(("lds_variant", str(pin), exc))
+                    rows.append({**pin, "gfx": get_gfx(), "status": "FAIL"})
         total += len(rows)
         aiter.logger.info(
             "fp8_mqa_logits auto_variant summary (markdown):\n%s",
@@ -869,6 +1041,26 @@ def main():
     elif "verify" in scenarios:
         aiter.logger.warning(
             "%s: skipping the auto_variant pins, which are gfx942-only", get_gfx()
+        )
+
+    if "verify" in scenarios:
+        rows = []
+        for (s_q, s_k), nh in itertools.product(
+            _LAUNCHER_CONTRACT_SHAPES, args.num_heads
+        ):
+            pin = {"s_q": s_q, "s_k": s_k, "num_heads": nh}
+            try:
+                rows.append(verify_launcher_contract(**pin))
+            except NotImplementedError:
+                continue  # no variant for this num_heads on this arch
+            except AssertionError as exc:
+                aiter.logger.error("FAILED launcher_contract case: %s", exc)
+                failures.append(("launcher_contract", str(pin), exc))
+                rows.append({**pin, "gfx": get_gfx(), "status": "FAIL"})
+        total += len(rows)
+        aiter.logger.info(
+            "fp8_mqa_logits launcher_contract summary (markdown):\n%s",
+            pd.DataFrame(rows).to_markdown(index=False),
         )
 
     for scenario in scenarios:
