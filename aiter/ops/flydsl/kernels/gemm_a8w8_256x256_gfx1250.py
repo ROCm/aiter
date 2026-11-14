@@ -26,14 +26,9 @@ from .gfx1250_cluster import compute_mcast_masks
 from .kernels_common import format_kernel_name
 from .mxfp8_sched_hints_gfx1250 import (
     ENABLE_ASM_PIPE,
-    ENABLE_LOAD_FIRST,
-    ENABLE_LOAD_FIRST_AUTO,
     ENABLE_PIN_B128,
-    ENABLE_PIN_SCALE,
     ENABLE_SCHED_VGPR,
     ENABLE_SHORT_BEAT,
-    ENABLE_MIDK_WAR,
-    MIDK_Q0_START,
     SA_PANEL_CLASS0,
     SA_PANEL_CLASS1,
     pin_a_frag,
@@ -801,41 +796,27 @@ def launch_gemm_a8w8_256x256(
         # hints via ASM_PIPE_ACTIVE. SHORT_BEAT optionally adds light beats
         # on class 0 without enabling WAR.
         ASM_PIPE_ACTIVE = const_expr(ENABLE_ASM_PIPE and k_tiles_class > 0)
-        # Mid-K (class 1): park ds bursts on consecutive MMA slots and drop the
-        # Q0 WAR gap (q0_start=0) for denser WMMA↔DS interleave vs spaced bursts.
+        # Mid-K: consecutive DS parking + 1×b128 producers (best on 25600×6144).
         DENSE_MIDK = const_expr(ASM_PIPE_ACTIVE and k_tiles_class == 1)
         SHORT_BEAT = const_expr(
-            ENABLE_SHORT_BEAT
-            and ENABLE_ASM_PIPE
-            and (k_tiles_class == 0 or k_tiles_class == 1)
+            ENABLE_SHORT_BEAT and ENABLE_ASM_PIPE and k_tiles_class == 0
         )
         BEAT_ACTIVE = const_expr(ASM_PIPE_ACTIVE or SHORT_BEAT)
-        # Auto: mid/long-K persistent — measured ~10µs win on 25600×6144;
-        # force-on regresses short-K (1280) and small non-ps (2304).
+        # Load-before-MMA on mid/long-K persistent only (short-K / non-ps regress).
         LOAD_FIRST = const_expr(
-            ENABLE_LOAD_FIRST
-            or (
-                ENABLE_LOAD_FIRST_AUTO
-                and ENABLE_ASM_PIPE
-                and k_tiles_class > 0
-                and persistent_n_tiles > 1
-            )
+            ASM_PIPE_ACTIVE and k_tiles_class > 0 and persistent_n_tiles > 1
         )
-        # Scale pin helps huge-N mid-K (6144) but regresses short-K (~2× on
-        # 1280) when applied globally — gate to class1 + persistent only.
+        # Scale pin helps huge-N mid-K; global pin regresses short-K (~2×).
         PIN_SCALE_ACTIVE = const_expr(
-            ENABLE_PIN_SCALE and k_tiles_class == 1 and persistent_n_tiles > 1
+            ENABLE_SCHED_VGPR and k_tiles_class == 1 and persistent_n_tiles > 1
         )
-        # Legacy: non-mx short-K only. Mid-K mx32 can opt into the a4w4 WAR
-        # soft-pipe (denser _spread / Q-region hints) via MIDK_WAR=1.
+        # a4w4 WAR soft-pipe: non-mx short-K only (mx32 mid-K stays on `_quad`).
         WAR_SCHED = const_expr(
             tile_m == 256
             and half_m == 4
             and half_n == 4
-            and (
-                (k_tiles_class == 0 and not mx32)
-                or (mx32 and k_tiles_class == 1 and ENABLE_ASM_PIPE and ENABLE_MIDK_WAR)
-            )
+            and k_tiles_class == 0
+            and not mx32
         )
 
         def _asm_sched_hint(n_ds_bursts):
@@ -1440,16 +1421,11 @@ def launch_gemm_a8w8_256x256(
             q3.update(dict(zip(tail_at, tail)))
 
             def _seq(thunks, extra=(), start=0):
-                # ASM_PIPE Q0 uses start=4 (WAR gap). Per-producer `_asm_beat`
-                # (not stride spacing) won the long-K A/B.
-                # Mid-K with burst thunks: optional leading pure WMMA (start 0→1)
-                # when there is room. Split-per-1 fills all slots (no bump).
+                # ASM_PIPE Q0 uses start=4 (WAR gap). Mid-K may bump 0→1 for a
+                # leading pure WMMA when producers leave a free slot.
                 n_slots = half_m * half_n
                 if const_expr(
-                    DENSE_MIDK
-                    and start == 0
-                    and MIDK_Q0_START == 0
-                    and (1 + len(thunks) <= n_slots)
+                    DENSE_MIDK and start == 0 and (1 + len(thunks) <= n_slots)
                 ):
                     start = 1
                 assert (
@@ -1465,11 +1441,9 @@ def launch_gemm_a8w8_256x256(
                 return out
 
             sched_fence = lambda: rocdl.sched_barrier(0)
-            # WAR gap before producing the next half (256 / half=4 only;
-            # half=2 start=2 regressed N=1792). Mid-K default: _seq bumps
-            # start 0→1 for a leading pure WMMA; MIDK_Q0_START=4 keeps legacy.
+            # Mid-K: dense from slot 0. Else WAR gap (start=4) on 256/half=4.
             q0_start = (
-                (0 if MIDK_Q0_START == 0 else MIDK_Q0_START)
+                0
                 if const_expr(DENSE_MIDK)
                 else (4 if const_expr(ASM_PIPE_ACTIVE and half_m == 4) else 0)
             )
