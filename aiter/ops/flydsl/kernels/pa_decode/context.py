@@ -13,6 +13,47 @@ from flydsl.expr import arith, const_expr, gpu, range_constexpr
 from .traits import FP8_KV_DTYPES, LOG2E, MFMA_MNK, WAVE
 
 
+def _cta_splits(traits):
+    # A KV head's CTAs per task: its query splits of each of its head splits.
+    return traits.query_splits * traits.KV_HEAD_SPLITS
+
+
+def logical_block(traits):
+    """(task slot, KV head * query_splits + split) of this CTA; the KV head is
+    a head split's (group / KV_HEAD_SPLITS query heads)."""
+    bx = fx.Int32(gpu.block_id("x"))
+    by = fx.Int32(gpu.block_id("y"))
+    if const_expr(traits.SPLIT_MAJOR):
+        # A split-major grid puts (KV head, query split) on x, the slot on y.
+        return by, bx
+    if const_expr(traits.SPLIT_XCDS):
+        xcds, splits = traits.SPLIT_XCDS, _cta_splits(traits)
+        split = (bx // xcds) % splits
+        slot = (bx // (xcds * splits)) * xcds + bx % xcds
+        return slot, by * splits + split
+    if const_expr(traits.HEADS_FASTEST):
+        heads = fx.Int32(gpu.grid_dim.y)
+        linear = bx + by * fx.Int32(gpu.grid_dim.x)
+        return linear // heads, linear % heads
+    return bx, by
+
+
+def logical_kv_heads(traits):
+    if const_expr(traits.SPLIT_MAJOR):
+        return fx.Int32(gpu.grid_dim.x) // traits.query_splits
+    if const_expr(traits.SPLIT_XCDS):
+        return fx.Int32(gpu.grid_dim.y) * traits.KV_HEAD_SPLITS
+    return fx.Int32(gpu.grid_dim.y) // traits.query_splits
+
+
+def logical_slots(traits):
+    if const_expr(traits.SPLIT_MAJOR):
+        return fx.Int32(gpu.grid_dim.y)
+    if const_expr(traits.SPLIT_XCDS):
+        return fx.Int32(gpu.grid_dim.x) // _cta_splits(traits)
+    return fx.Int32(gpu.grid_dim.x)
+
+
 class PaDecodeContext:
     def __init__(
         self,
@@ -72,16 +113,16 @@ class PaDecodeContext:
         self.warp = self.tid // WAVE  # 0..NWARP-1
         self.lane = self.tid - self.warp * WAVE  # 0..63
         self.seq = self.planned_seq
-        # A split-major grid puts (KV head, query split) on x, the slot on y.
-        qx, px = ("x", "y") if self.traits.SPLIT_MAJOR else ("y", "x")
-        self.kv_query = fx.Int32(gpu.block_id(qx))
+        self.part, self.kv_query = logical_block(self.traits)
         self.kv_h = self.kv_query // self.traits.query_splits
+        # The KV cache's head of this (head split's) KV head.
+        self.cache_h = self.kv_h // self.traits.KV_HEAD_SPLITS
         self.query_begin = (
             self.kv_query % self.traits.query_splits
         ) * self.traits.QUERIES_PER_CTA
-        self.n_kv = fx.Int32(getattr(gpu.grid_dim, qx)) // self.traits.query_splits
-        self.part = fx.Int32(gpu.block_id(px))
-        self.partial_slot = self.kv_h * fx.Int32(getattr(gpu.grid_dim, px)) + self.part
+        self.n_kv = logical_kv_heads(self.traits)
+        self.slots = logical_slots(self.traits)
+        self.partial_slot = self.kv_h * self.slots + self.part
 
     def init_query_mapping(self):
         self.rgroup = (
@@ -93,6 +134,9 @@ class PaDecodeContext:
         self.qh_local = (
             self.warp * 4 + self.rgroup
         )  # 0..15: this thread's query row within an M-tile
+        if const_expr(self.traits.NWARP > MFMA_MNK // (WAVE // MFMA_MNK)):
+            # Additional token waves stage the same query rows and values.
+            self.qh_local = self.qh_local % MFMA_MNK
 
     def init_context_length(self):
         self.context_len = self.planned_context

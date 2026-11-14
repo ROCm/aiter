@@ -12,7 +12,8 @@ import flydsl.compiler as flyc
 import flydsl.expr as fx
 from flydsl.expr import const_expr, gpu, range_constexpr
 from flydsl.expr.rocdl import tdm_ops
-from flydsl.expr.typing import ReductionOp
+from flydsl._mlir.dialects import llvm as _llvm
+from flydsl.expr.typing import ReductionOp, T
 
 from ..pa_decode_plan import CLUSTER_PARTITIONS
 from ..tensor_shim import buf_base_i64
@@ -21,7 +22,7 @@ from .op_epilog import PaDecodeEpilogue
 from .op_gemm import Gfx1250Gemm, PaDecodeGemm
 from .op_lds import Gfx1250Memory, PaDecodeKVLoader, PaDecodeLds, PaDecodeQueryLoader
 from .op_merge import Gfx1250PartitionMerge
-from .op_softmax import PaDecodeSoftmax
+from .op_softmax import PaDecodeSoftmax, tree_max
 from .traits import (
     KV_COMPUTE_BLOCK,
     LOG2E,
@@ -34,6 +35,24 @@ from .traits import (
     STREAM_V_DEPTH,
     WAVE,
 )
+
+
+def splat_pairs(x, n, opaque=True):
+    """``n`` copies of the f32 ``x`` whose odd lanes are an opaque copy of it.
+
+    A splat operand of a packed f32 op reads a register pair whose high half is
+    undefined; the vmcnt wait insertion still counts that read, so a load that the
+    allocator gave the same register stalls the op for its full latency. A defined
+    high half keeps the pair out of loads' way. ``opaque=False``: a plain splat.
+    """
+    if const_expr(not opaque):
+        return fx.full(n, x, fx.Float32)
+    hi = fx.Float32(
+        _llvm.inline_asm(T.f32, [fx.Float32(x).ir_value()], "v_mov_b32 $0, $1", "=v,v")
+    )
+    return fx.Vector.from_elements(
+        [x if i % 2 == 0 else hi for i in range(n)], dtype=fx.Float32
+    )
 
 
 class PaDecodePipeline:
@@ -501,8 +520,41 @@ class PaDecodePipeline:
             # Single-tile plans eliminate loop/history but keep absolute tt for
             # addressing and masks; the outer guard excludes padded tasks.
             o_final = self.tile(
-                init_state, fx.Int32(self.ctx.part_start), multi_query, q_ops_all, True
+                init_state,
+                fx.Int32(self.ctx.part_start),
+                multi_query,
+                q_ops_all,
+                True,
+                first=self.traits.kv_dtype == MXFP4_KV_DTYPE,
             )
+        elif const_expr(self.traits.MXFP4_PEEL_FIRST):
+            # MXFP4 masks every tile at runtime, so the peeled tile is the first:
+            # it starts from no history. The last tile then re-reads itself; head
+            # dim 256 tiles are large enough to keep the last peeled instead.
+            # A dual group's tiles are part_start + 2j, j < dual_iters.
+            step = 2 if const_expr(self.traits.DUAL_GROUP) else 1
+            first_state = self.tile(
+                init_state,
+                fx.Int32(self.ctx.part_start),
+                multi_query,
+                q_ops_all,
+                True,
+                first=True,
+            )
+            n_tiles = (
+                self.ctx.dual_iters
+                if const_expr(self.traits.DUAL_GROUP)
+                else self.ctx.part_end - self.ctx.part_start
+            )
+            for loop_j, ostate in range(1, n_tiles, 1, init=first_state):
+                next_state = self.tile(
+                    ostate,
+                    self.ctx.part_start + fx.Int32(loop_j) * step,
+                    multi_query,
+                    q_ops_all,
+                    False,
+                )
+                o_final = yield next_state
         elif const_expr(self.traits.DUAL_GROUP):
             # Group tiles part_start + 2j; only the peeled last one can hold
             # the task's tail or lie past it.
@@ -548,10 +600,13 @@ class PaDecodePipeline:
         return o_final
 
     @flyc.jit
-    def tile(self, ostate, tt, multi_query, q_ops_all, mask_tail, has_next=True):
+    def tile(
+        self, ostate, tt, multi_query, q_ops_all, mask_tail, has_next=True, first=False
+    ):
         """Run one KV tile; ``mask_tail`` emits the V mask for rows past the context.
 
         ``has_next=False`` marks the task's last tile: it emits no next-tile loads.
+        ``first`` (MXFP4) marks the task's first tile: ``ostate`` holds no history.
         """
         k_cur = ostate[
             self.traits.K_SLOT
@@ -637,7 +692,7 @@ class PaDecodePipeline:
         if const_expr(self.traits.kv_dtype == MXFP4_KV_DTYPE):
             # Masks tail scores/V by tile_valid at runtime, so it ignores mask_tail.
             return self.single_query_tile_mxfp4(
-                ostate, k_cur, tt1, tile_valid, window_left, q_ops_all
+                ostate, k_cur, tt1, tile_valid, window_left, q_ops_all, first
             )
         # All query tiles share one K/V tile; each path retains its publication barriers.
         if const_expr(multi_query and self.traits.STREAM_KV):
@@ -1498,19 +1553,23 @@ class PaDecodePipeline:
         tile_valid,
         window_left,
         q_ops_all,
+        first=False,
     ):
         """MXFP4 tile: one wave, its own 64 tokens, all head dims: QK, online softmax,
         PV with P in registers (no barrier). Next-tile K/V loads are issued early;
         the four waves merge once after the loop. M-tiles share the K registers and
-        the widened V."""
+        the widened V. The ``first`` tile starts from no history: no rescale, and
+        PV accumulates from zero."""
         t = self.traits
         M = t.M_TILES
         v_raw = ostate[t.V_SLOT]
         # Unconditional: a branch around the loads makes the compiler's vmcnt counts
         # assume they were skipped and drain them at issue. The last tile re-reads itself.
-        base = self.kv.mxfp4_base(
-            self.kv.mxfp4_pages(fx.min(tt1, self.ctx.part_end - 1))
-        )
+        tt_next = fx.min(tt1, self.ctx.part_end - 1)
+        if const_expr(t.DUAL_GROUP):
+            # Group 1's only tile can lie past the task (part_end - 1 < part_start).
+            tt_next = fx.max(tt_next, self.ctx.part_start)
+        base = self.kv.mxfp4_base(self.kv.mxfp4_pages(tt_next))
         k_scales = [
             [
                 self.kv.mxfp4_e8m0_byte(k_cur[self.kv.mxfp4_raw(a, kb)])
@@ -1546,6 +1605,9 @@ class PaDecodePipeline:
         # S^T[token 4g+v][head] is already the PV B operand layout. P is scaled by
         # 2**-MXFP4_P_EXP_SHIFT (l_new is not); ``store_mxfp4`` restores it.
         p_shift = fx.full(4, 2.0**-MXFP4_P_EXP_SHIFT, fx.Float32)
+        # Head dim 256 keeps plain splats: with the copies, its spilling three
+        # M-tile (33-row) tile computed non-finite output.
+        opaque = t.head_dim <= 128
         neg4 = fx.full(4, float("-inf"), fx.Float32)
         p_ops_all, alpha_all, m_all, l_all = [], [], [], []
         for m in range_constexpr(M):
@@ -1553,7 +1615,7 @@ class PaDecodePipeline:
                 [(q_bits_all[m] & fx.Int32(0x7FFFFF)) | fx.Int32(0x3F800000)],
                 dtype=fx.Int32,
             ).bitcast(fx.Float32)[0]
-            scale_b = fx.full(4, self.ctx.scale_qk * q_mantissa, fx.Float32)
+            scale_b = splat_pairs(self.ctx.scale_qk * q_mantissa, 4, opaque)
             scores = [frag_all[m][a] * scale_b for a in range_constexpr(t.NCHUNK)]
             # Only a sequence's last tile has masked tokens (and, with MTP, the tile
             # before it: an earlier query row stops up to query_length - 1 sooner),
@@ -1569,29 +1631,31 @@ class PaDecodePipeline:
                     self.softmax.score_mask(a, thr, window_thr).select(scores[a], neg4)
                     for a in range_constexpr(t.NCHUNK)
                 ]
-            m_prev = ostate[t.m_slot(m)]
-            l_prev = ostate[t.l_slot(m)]
-            m_tile = scores[0].reduce(ReductionOp.MAX, fastmath=nnan)
-            for a in range_constexpr(1, t.NCHUNK):
-                m_tile = fx.maxnumf(
-                    m_tile,
-                    scores[a].reduce(ReductionOp.MAX, fastmath=nnan),
-                    fastmath=nnan,
-                )
+            m_tile = tree_max(
+                [scores[a][i] for a in range(t.NCHUNK) for i in range(4)], nnan
+            )
             for sh in (16, 32):
                 m_tile = fx.maxnumf(m_tile, m_tile.shuffle_xor(sh, WAVE), fastmath=nnan)
-            m_new = fx.maxnumf(m_prev, m_tile, fastmath=nnan)
+            m_new = m_tile
+            if const_expr(not first):
+                m_prev = ostate[t.m_slot(m)]
+                m_new = fx.maxnumf(m_prev, m_tile, fastmath=nnan)
             # Relative to 0 while nothing is valid yet: no -inf - -inf.
             safe = fx.Float32((m_new > self.ctx.NEG_INF).select(m_new, self.ctx.ZERO_F))
-            safe_b = fx.full(4, safe, fx.Float32)
-            alpha = fx.Float32(fx.exp2(m_prev - safe, fastmath="fast"))
+            safe_b = splat_pairs(safe, 4, opaque)
+            alpha = None
+            if const_expr(not first):
+                alpha = fx.Float32(fx.exp2(m_prev - safe, fastmath="fast"))
             probs = [
                 fx.Vector(fx.exp2(scores[a] - safe_b, fastmath="fast"))
                 for a in range_constexpr(t.NCHUNK)
             ]
-            l_new = l_prev * alpha
-            for a in range_constexpr(t.NCHUNK):
-                l_new = l_new + probs[a].reduce(ReductionOp.ADD)  # this lane's tokens
+            sums = [probs[a].reduce(ReductionOp.ADD) for a in range(t.NCHUNK)]
+            l_new = sums[0]
+            if const_expr(not first):
+                l_new = ostate[t.l_slot(m)] * alpha + sums[0]
+            for a in range_constexpr(1, t.NCHUNK):
+                l_new = l_new + sums[a]  # this lane's tokens
             p_ops_all.append(
                 [
                     (probs[a] * p_shift).to(fx.BFloat16).bitcast(fx.Int64)[0]
@@ -1605,29 +1669,41 @@ class PaDecodePipeline:
         v_next = self.kv.mxfp4_load("v", base)
         o_all = []
         for m in range_constexpr(M):
-            alpha_b = fx.full(t.OP_ELEMS, alpha_all[m], fx.Float32)
-            o_all.append(
-                [
-                    ostate[t.o_slot(m, vh)] * alpha_b
-                    for vh in range_constexpr(t.VHE_CHUNKS)
-                ]
-            )
-        # Chunk pairs take one K32 MFMA (twice the K16 one's rate on gfx950).
-        for a in range_constexpr(0, t.NCHUNK, 2):
-            v_lo = self.kv.mxfp4_read_staged_v_bf16(a)
-            v_hi = self.kv.mxfp4_read_staged_v_bf16(a + 1)
-            for m in range_constexpr(M):
-                for vh in range_constexpr(t.VHE_CHUNKS):
-                    o_all[m][vh] = fx.Vector(
-                        self.gemm.mfma_bf16_k32(
-                            [v_lo[vh], v_hi[vh]],
-                            [p_ops_all[m][a], p_ops_all[m][a + 1]],
-                            0,
-                            0,
-                            2,
-                            o_all[m][vh],
-                        )
+            if const_expr(first):
+                o_all.append([fx.full(t.OP_ELEMS, 0.0, fx.Float32)] * t.VHE_CHUNKS)
+            else:
+                alpha_b = splat_pairs(alpha_all[m], t.OP_ELEMS, opaque)
+                o_all.append(
+                    [
+                        ostate[t.o_slot(m, vh)] * alpha_b
+                        for vh in range_constexpr(t.VHE_CHUNKS)
+                    ]
+                )
+        # Chunk pairs take one K32 MFMA (twice the K16 one's rate on gfx950). Two V
+        # halves: the second is widened into the staging after the first's PV.
+        half_vh = t.VHE_CHUNKS // t.MXFP4_V_HALVES
+        for h in range_constexpr(t.MXFP4_V_HALVES):
+            if const_expr(h > 0):
+                for a in range_constexpr(t.NCHUNK):
+                    self.kv.mxfp4_stage_v_bf16(
+                        v_raw, a, tile_valid, window_first, half=h
                     )
+            for a in range_constexpr(0, t.NCHUNK, 2):
+                v_lo = self.kv.mxfp4_read_staged_v_bf16(a)
+                v_hi = self.kv.mxfp4_read_staged_v_bf16(a + 1)
+                for m in range_constexpr(M):
+                    for j in range_constexpr(half_vh):
+                        vh = h * half_vh + j
+                        o_all[m][vh] = fx.Vector(
+                            self.gemm.mfma_bf16_k32(
+                                [v_lo[j], v_hi[j]],
+                                [p_ops_all[m][a], p_ops_all[m][a + 1]],
+                                0,
+                                0,
+                                2,
+                                o_all[m][vh],
+                            )
+                        )
         state = [k_next, v_next]
         for m in range_constexpr(M):
             state.extend([*o_all[m], m_all[m], l_all[m]])
@@ -1654,6 +1730,7 @@ class Gfx1250Bf16Pipeline:
         ctx.warp, ctx.lane = ctx.tid // t.WAVE, ctx.tid % t.WAVE
         ctx.lane16, ctx.half = ctx.lane % 16, ctx.lane // 16
         ctx.kv_h = fx.Int32(gpu.block_id("y")) // t.query_splits
+        ctx.cache_h = ctx.kv_h
         ctx.query_begin = (fx.Int32(gpu.block_id("y")) % t.query_splits) * (
             t.query_length // t.query_splits
         )
@@ -2061,6 +2138,7 @@ class Gfx1250Bf16WavePipeline:
         ctx.warp, ctx.lane = ctx.tid // t.WAVE, ctx.tid % t.WAVE
         ctx.lane16, ctx.half = ctx.lane % 16, ctx.lane // 16
         ctx.kv_h = fx.Int32(gpu.block_id("y")) // t.query_splits
+        ctx.cache_h = ctx.kv_h
         ctx.query_begin = (fx.Int32(gpu.block_id("y")) % t.query_splits) * (
             t.query_length // t.query_splits
         )
@@ -2510,6 +2588,7 @@ class Gfx1250WavePipeline:
         ctx.warp, ctx.lane = ctx.tid // t.WAVE, ctx.tid % t.WAVE
         ctx.lane16, ctx.half = ctx.lane % 16, ctx.lane // 16
         ctx.kv_h = fx.Int32(gpu.block_id("y")) // t.query_splits
+        ctx.cache_h = ctx.kv_h
         ctx.query_begin = (fx.Int32(gpu.block_id("y")) % t.query_splits) * (
             t.query_length // t.query_splits
         )
@@ -2722,6 +2801,7 @@ class Gfx1250Pipeline:
         ctx.warp, ctx.lane = ctx.tid // t.WAVE, ctx.tid % t.WAVE
         ctx.lane16, ctx.half = ctx.lane % 16, ctx.lane // 16
         ctx.kv_h = fx.Int32(gpu.block_id("y")) // t.query_splits
+        ctx.cache_h = ctx.kv_h
         ctx.query_begin = (fx.Int32(gpu.block_id("y")) % t.query_splits) * (
             t.query_length // t.query_splits
         )

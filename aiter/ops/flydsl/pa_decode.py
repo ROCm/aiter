@@ -28,7 +28,7 @@ from .kernels.pa_decode_kernel import (
     gfx1250_tile_traits,
 )
 from .kernels.pa_decode.traits import MFMA_MNK as MXFP4_FUSED_M_ROWS
-from .kernels.pa_decode.traits import mxfp4_query_splits
+from .kernels.pa_decode.traits import MXFP4_MAX_M_TILES, mxfp4_query_splits
 from .kernels.pa_decode_plan import PADecodePlan
 
 # Plans with at most this many partitions per sequence merge within a cluster
@@ -158,12 +158,19 @@ def launch_pa_decode_ps_reduce(
             groups *= 2
     if dual:
         # Partition groups fill the CTA while the grid stays within 16 waves
-        # per CU. D128 sequences averaging at most 32 partitions keep one, or
-        # on gfx1250 the four that split their 32-partition rung.
+        # per CU. Elsewhere than gfx950, D128 sequences averaging at most 32
+        # partitions keep one, or on gfx1250 the four that split their
+        # 32-partition rung. On gfx950 the slowest CTA bounds the kernel: one
+        # group alone issues every load of a row past 32 partitions, and the
+        # host bound does not exclude such a row.
         group_waves = head_size // wave // (2 if pairs else 1)
         budget = max_cta_waves * props.multi_processor_count
         max_groups = max_cta_waves // group_waves
-        if head_size == 128 and exp_sums.shape[1] <= DUAL_REGISTER_PARTITIONS * batch:
+        if (
+            head_size == 128
+            and arch != "gfx950"
+            and exp_sums.shape[1] <= DUAL_REGISTER_PARTITIONS * batch
+        ):
             max_groups = SPLIT_GROUPS if arch in ("gfx1250", "gfx1250-strict") else 1
         while 2 * groups <= max_groups and 2 * groups * group_waves * ctas <= budget:
             groups *= 2
@@ -240,26 +247,67 @@ def _mxfp4_free_splits(ctas, num_compute_units, context_bound):
     )
 
 
-def _mxfp4_query_splits(query_length, group, ctas, num_compute_units):
+def _mxfp4_query_splits(
+    query_length, group, ctas, num_compute_units, head_dim, colocated
+):
     """CTAs per (task, KV head) that split an MXFP4 MTP task's query positions.
 
-    A CTA computes its rows as up to three 16-row M-tiles over one K/V tile
-    (each split re-reads and re-widens the tile), and a split leaves at least
-    16 rows a CTA. Two CTAs fit a CU: take the most splits that keep the grid
-    of ``ctas`` within two per CU, else the fewest.
+    A CTA computes its rows as up to ``MXFP4_MAX_M_TILES`` 16-row M-tiles over
+    one K/V tile; each split re-reads and re-widens the tile, so a split only
+    pays for idle CUs. Take the most splits that keep the grid of ``ctas``
+    within one CTA per CU, else the fewest (a split leaves at least 16 rows).
+    A head_dim 128 tile past two M-tiles (276 rather than 218 VGPRs: one wave
+    per SIMD rather than two) splits in two more when the splits' CTAs share
+    an XCD (``colocated``), so their second K/V read hits its L2, and the
+    halves pad no M-tile rows.
     """
     rows = query_length * group
+
+    def m_tiles(s):
+        return -(-rows // s // MXFP4_FUSED_M_ROWS)
+
     valid = [
         s
         for s in range(1, query_length + 1)
         if not query_length % s
-        and -(-rows // s // MXFP4_FUSED_M_ROWS) <= 3
+        and m_tiles(s) <= MXFP4_MAX_M_TILES
         and (s == 1 or rows // s >= MXFP4_FUSED_M_ROWS)
     ]
     if not valid:
         return mxfp4_query_splits(query_length, group)
-    fit = [s for s in valid if ctas * s <= 2 * num_compute_units]
-    return max(fit) if fit else min(valid)
+    fit = [s for s in valid if ctas * s <= num_compute_units]
+    splits = max(fit) if fit else min(valid)
+    if (
+        colocated
+        and head_dim == 128
+        and m_tiles(splits) > 2
+        and 2 * splits in valid
+        and m_tiles(2 * splits) <= 2
+        and 2 * m_tiles(2 * splits) == m_tiles(splits)
+    ):
+        return 2 * splits
+    return splits
+
+
+def _mxfp4_kv_head_splits(query_length, group, query_splits, head_dim, colocated):
+    """CTAs that split each KV head's query heads (and so its rows) when a
+    query split cannot: two when a head_dim 128 CTA's rows still take more
+    than two M-tiles (one wave per SIMD, see ``_mxfp4_query_splits``), each
+    half takes at most two and no more M-tiles in all (no padded rows), with
+    the CTAs on one XCD."""
+    rows = query_length // query_splits * group
+    m_tiles = -(-rows // MXFP4_FUSED_M_ROWS)
+    half_m_tiles = -(-rows // 2 // MXFP4_FUSED_M_ROWS)
+    if (
+        colocated
+        and head_dim == 128
+        and not group % 2
+        and m_tiles > 2
+        and half_m_tiles <= 2
+        and 2 * half_m_tiles == m_tiles
+    ):
+        return 2
+    return 1
 
 
 def _check_sinks(sinks, num_q_heads, dev):
@@ -428,27 +476,36 @@ def _pa_decode_mxfp4(
             visible_context_length, window_tiles * KV_COMPUTE_BLOCK
         )
     num_compute_units = torch.cuda.get_device_properties(dev).multi_processor_count
+    num_xcds = get_num_xcds()
+    slots = num_seqs if work_plan is None else work_plan.capacity
     query_splits = _mxfp4_query_splits(
         query_length,
         group,
-        (num_seqs if work_plan is None else work_plan.capacity) * num_kv_heads,
+        slots * num_kv_heads,
         num_compute_units,
+        head_dim,
+        num_xcds > 1 and slots % num_xcds == 0,
+    )
+    kv_head_splits = _mxfp4_kv_head_splits(
+        query_length,
+        group,
+        query_splits,
+        head_dim,
+        num_xcds > 1 and slots % num_xcds == 0,
     )
     # Without a plan, a sparse grid splits each sequence's tiles over S CTAs and
     # merges them in the reducer; otherwise one task per sequence needs neither.
-    # Sinks apply in the reducer: a plan-free decode with them splits, if only
-    # into one run per sequence.
     splits = (
         _mxfp4_free_splits(
-            num_seqs * num_kv_heads * query_splits,
+            num_seqs * num_kv_heads * query_splits * kv_head_splits,
             num_compute_units,
             visible_context_length,
         )
         if work_plan is None
         else 0
     )
-    direct = sinks is None and (
-        splits == 1 or (splits == 0 and work_plan.max_partitions == 1 and same_strides)
+    direct = splits == 1 or (
+        splits == 0 and work_plan.max_partitions == 1 and same_strides
     )
     if splits and not direct:
         capacity, partitions = num_seqs * splits, splits
@@ -456,13 +513,38 @@ def _pa_decode_mxfp4(
         capacity, partitions = num_seqs, 1
     else:
         capacity, partitions = work_plan.capacity, work_plan.max_partitions
+    # A sequence has at most one partition per tile of the block table (not of
+    # max_context_length: a task may own more tokens than it) and of its window.
+    reduce_partitions = min(
+        partitions,
+        capacity,
+        -(-max_blocks_per_seq * page_size // KV_COMPUTE_BLOCK),
+        window_tiles if sliding_window > 0 else partitions,
+    )
+    # A plan with one slot per sequence gives a sequence a second task only
+    # from a slot an empty one left. Its tile kernel then writes final rows:
+    # a sequence's only task directly, other tasks merged in the last CTA to
+    # arrive, without a reducer launch. Partials are published in eight-byte
+    # words. Wherever the tile kernel writes final rows it also folds in sinks.
+    one_slot_plan = (
+        work_plan is not None
+        and not direct
+        and same_strides
+        and capacity == num_seqs
+        and (temporary_output is None or temporary_output.data_ptr() % 8 == 0)
+    )
+    # A head split runs as kv_head_splits KV heads of group / kv_head_splits
+    # query heads each (consecutive query heads, so the same query, output,
+    # sink and scratch rows); only K/V reads map back to the cache's head.
+    kv_heads = num_kv_heads * kv_head_splits
+    group //= kv_head_splits
     with torch.cuda.device(dev):
         compiled = compile_pa_decode_tile(
             head_dim=head_dim,
             query_group_size=group,
             block_size=page_size,
             num_seqs=num_seqs,
-            num_kv_heads=num_kv_heads,
+            num_kv_heads=kv_heads,
             num_compute_units=num_compute_units,
             num_partitions=partitions,
             softmax_scale=softmax_scale,
@@ -475,20 +557,27 @@ def _pa_decode_mxfp4(
             query_length=query_length,
             query_splits=query_splits,
             sliding_window=sliding_window,
+            one_slot_plan=one_slot_plan,
+            num_xcds=num_xcds,
+            kv_head_splits=kv_head_splits,
+            sink_dtype=(
+                sinks.dtype if sinks is not None and (direct or one_slot_plan) else None
+            ),
+            compact_capacity=work_plan.compact_capacity if work_plan is not None else 0,
         )
     pmax = psum = pout = output
     reduce_info = None if work_plan is None else work_plan.reduce_info
     if splits and not direct:
         # Internal scratch; the tile kernel writes reduce_info past the sums.
-        shape = (num_kv_heads, capacity, query_length * group)
-        sums = num_kv_heads * capacity * query_length * group
+        shape = (kv_heads, capacity, query_length * group)
+        sums = kv_heads * capacity * query_length * group
         stats = torch.empty(2 * sums + 2 * num_seqs, dtype=torch.float32, device=dev)
         pmax = stats[:sums].view(shape)
         psum = stats[sums : 2 * sums].view(shape)
         reduce_info = stats[2 * sums :].view(torch.int32).view(num_seqs, 2)
         pout = torch.empty((*shape, head_dim), dtype=output.dtype, device=dev)
     elif not direct:
-        shape = (num_kv_heads, capacity, query_length * group)
+        shape = (num_kv_heads, capacity, query_length * group * kv_head_splits)
         scratch = []
         for name, t, expected, dtype in (
             ("max_logits", max_logits, shape, torch.float32),
@@ -507,7 +596,10 @@ def _pa_decode_mxfp4(
                     f"{name} must be contiguous {dtype} {expected} on {dev}"
                 )
             scratch.append(t)
-        pmax, psum, pout = scratch
+        pmax, psum, pout = (
+            t.view(kv_heads, capacity, query_length * group, *t.shape[3:])
+            for t in scratch
+        )
     with torch.cuda.device(dev):
         stream = torch.cuda.current_stream(dev)
         _run_compiled(
@@ -523,7 +615,7 @@ def _pa_decode_mxfp4(
             ptr_arg(v_scale, fx.Float8E8M0FNU),
             max_blocks_per_seq,
             num_seqs,
-            num_kv_heads,
+            kv_heads,
             *page_head_strides,
             query.stride(0),
             query.stride(1),
@@ -534,13 +626,27 @@ def _pa_decode_mxfp4(
             capacity,
             max(splits, 1),
             -(-(1 << 30) // splits) if splits and not direct else 0,
+            ptr_arg(output, torch_to_fx_dtype(output.dtype)),
+            (
+                ptr_arg(reduce_info, fx.Int32)
+                if one_slot_plan
+                else flyc.from_c_void_p(fx.Int32, 0)
+            ),
+            (
+                ptr_arg(work_plan.arrival_counters, fx.Int32)
+                if one_slot_plan
+                else flyc.from_c_void_p(fx.Int32, 0)
+            ),
+            (
+                ptr_arg(sinks, torch_to_fx_dtype(sinks.dtype))
+                if sinks is not None and (direct or one_slot_plan)
+                else flyc.from_c_void_p(fx.Float32, 0)
+            ),
             stream,
         )
-        if direct:
+        if direct or one_slot_plan:
             return
-        output_5d = output.reshape(
-            num_seqs, query_length, num_kv_heads, group, head_dim
-        )
+        output_5d = output.reshape(num_seqs, query_length, kv_heads, group, head_dim)
         launch_pa_decode_ps_reduce(
             output_5d,
             psum,
@@ -556,15 +662,7 @@ def _pa_decode_mxfp4(
             query_seq_len=query_length,
             query_group_size=group,
             head_size=head_dim,
-            # A sequence has at most one partition per tile of the block table
-            # (not of max_context_length: a task may own more tokens than it)
-            # and of its window.
-            max_partitions=min(
-                partitions,
-                capacity,
-                -(-max_blocks_per_seq * page_size // KV_COMPUTE_BLOCK),
-                window_tiles if sliding_window > 0 else partitions,
-            ),
+            max_partitions=reduce_partitions,
             stream=stream,
             reduce_info=reduce_info,
             kernarg_preload=True,
@@ -671,7 +769,13 @@ def pa_decode(
     arguments are ignored). Otherwise one task per sequence writes its row
     directly (the output needs the query's row and head strides, a context-0 row
     is zero-filled) and nothing is specialized on ``num_seqs``; a plan with
-    ``max_partitions == 1`` is served the same way. A task may span at most 4096
+    ``max_partitions == 1`` is served the same way. A plan of one slot per
+    sequence (capacity equal to the batch), with the query's output strides and
+    eight-byte aligned partial scratch, also runs no reducer: a sequence's only
+    task writes its rows, and tasks in slots that empty sequences freed merge
+    in the sequence's last CTA to arrive, through the plan's arrival counters.
+    Default-budget plans of windows over at most two 256-token tiles have one
+    slot per sequence. Rows written without the reducer fold in the sinks. A task may span at most 4096
     pages in ``max_context_length``: pass a smaller one otherwise. A
     real context longer than that bound is still fully attended (up to 2**19
     tokens a task, the bound of the fixed PV shift, unchecked on the GPU).
@@ -1303,7 +1407,15 @@ def pa_decode(
             )
         if not tensor.is_contiguous():
             raise ValueError(f"{name} must be contiguous")
-    merge_args = (1, 0)  # gfx942/gfx950: no plan-free split (count, magic)
+    # gfx942/gfx950: no plan-free split (count, magic), no in-kernel merge.
+    merge_args = (
+        1,
+        0,
+        ptr_arg(output, torch_to_fx_dtype(output.dtype)),
+        flyc.from_c_void_p(fx.Int32, 0),
+        flyc.from_c_void_p(fx.Int32, 0),
+        flyc.from_c_void_p(fx.Float32, 0),
+    )
     if arch in ("gfx1250", "gfx1250-strict"):
         merged = direct_output and not one_partition_output
         merge_args = (

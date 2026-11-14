@@ -157,6 +157,13 @@ def compile_pa_decode_ps_reduce(
     # would otherwise hoist above the count branch; issuing rung 2's loads in
     # reverse keeps them inside it.
     reverse_pair = not dual and partitions > 32
+    # The dual ladder tests counts bottom first, so every rung below the
+    # selected one shares its leading code: the statistics, their mask and the
+    # lower rung's partitions. LLVM hoists that above each count branch and
+    # waits for those loads there, one level at a time. On gfx950 a dual rung
+    # instead computes its partitions' addresses highest first, then loads,
+    # then masks the statistics.
+    descending = dual and architecture == "gfx950"
     # Groups tile whole wave-sized weight chunks, so their slots stay in range.
     weight_chunks = -(-partitions // wave)
     split = (
@@ -307,15 +314,18 @@ def compile_pa_decode_ps_reduce(
                 return fx.full(2, 0.0, fx.Float32)
             return zero_f
 
-        def _load_logits(part, unit):
-            return buf_copy_load(
-                logits_buffer,
+        def _logits_offset(part, unit):
+            return (
                 part * stride_logits_part
                 + row_idx * stride_logits_group
-                + unit * fx.Int32(elems),
-                logits_dtype,
-                unit_elems=elems,
+                + unit * fx.Int32(elems)
             )
+
+        def _load_logits_at(offset):
+            return buf_copy_load(logits_buffer, offset, logits_dtype, unit_elems=elems)
+
+        def _load_logits(part, unit):
+            return _load_logits_at(_logits_offset(part, unit))
 
         def _to_f32(value):
             if fx.const_expr(pairs):
@@ -331,7 +341,7 @@ def compile_pa_decode_ps_reduce(
             else:
                 output[offset] = acc.to(output_dtype)
 
-        def _lane_stats(chunk):
+        def _lane_stats(chunk, raw=False):
             # Lane l owns partition l + wave * chunk; part_count <= NP.
             part = lane + fx.Int32(chunk * wave)
             live = part < part_count
@@ -341,9 +351,14 @@ def compile_pa_decode_ps_reduce(
                 + live.select(part, zero_i) * stride_exp_sums_part
                 + row_idx
             )
-            part_sum = live.select(fx.Float32(exp_sums[offset]), zero_f)
-            part_max = live.select(fx.Float32(max_logits[offset]), neg_inf)
-            return part_sum, part_max
+            part_sum = fx.Float32(exp_sums[offset])
+            part_max = fx.Float32(max_logits[offset])
+            if fx.const_expr(not raw):
+                return _mask_stats(live, part_sum, part_max)
+            return live, part_sum, part_max
+
+        def _mask_stats(live, part_sum, part_max):
+            return live.select(part_sum, zero_f), live.select(part_max, neg_inf)
 
         def _softmax_weights(sums, maxes, offsets):
             lane_max = maxes[0]
@@ -381,15 +396,35 @@ def compile_pa_decode_ps_reduce(
             return [value * inv_exp_sum for value in scaled]
 
         def _reduce_register(rung, unit):
-            part_sum, part_max = _lane_stats(0)
-            order = range(rung)
-            if fx.const_expr(reverse_pair and rung == 2):
-                order = (1, 0)
             # Loads stay in the logits dtype until accumulation, so a rung
             # holds half the registers of its FP32 values.
             logits = [None] * rung
-            for part in order:
-                logits[part] = _load_logits(fx.Int32(part), unit)
+            if fx.const_expr(descending):
+                # Addresses come first: they would otherwise read a pending
+                # statistics load's register as an undefined high half and
+                # wait for it. The rung only runs for counts up to it, so the
+                # mask bounded by it is the live mask, distinct per rung. No
+                # stable API keeps the order; the scheduler would lead with
+                # the statistics and their mask.
+                addresses = [
+                    _logits_offset(fx.Int32(part), unit)
+                    for part in range(rung - 1, -1, -1)
+                ]
+                fx.rocdl.sched_barrier(0)
+                _, part_sum, part_max = _lane_stats(0, raw=True)
+                for i, address in enumerate(addresses):
+                    logits[rung - 1 - i] = _load_logits_at(address)
+                fx.rocdl.sched_barrier(0)
+                c_rung = fx.Int32(rung)
+                live = lane < (part_count < c_rung).select(part_count, c_rung)
+                part_sum, part_max = _mask_stats(live, part_sum, part_max)
+            else:
+                part_sum, part_max = _lane_stats(0)
+                order = range(rung)
+                if fx.const_expr(reverse_pair and rung == 2):
+                    order = (1, 0)
+                for part in order:
+                    logits[part] = _load_logits(fx.Int32(part), unit)
             # Wave32 reductions broadcast statistics to every output lane,
             # including lanes without a live partition.
             offsets = _shuffle_offsets(

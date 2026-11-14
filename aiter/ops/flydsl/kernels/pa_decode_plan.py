@@ -85,6 +85,7 @@ def compile_pa_decode_plan(max_batch, threads, windowed, balanced=False):
         capacity: fx.Int32,
         max_parts: fx.Int32,
         window: fx.Int32,
+        compact: fx.Int32,
     ):
         tid = fx.thread_idx.x
         lengths = ptr_buf_tensor(lengths_ptr)
@@ -126,38 +127,55 @@ def compile_pa_decode_plan(max_batch, threads, windowed, balanced=False):
             capacity - reduce_rows(thread_rows, fx.ReductionOp.ADD, storage=row_storage)
         )
         if fx.const_expr(single and balanced):
-            # Smallest per-task tile bound T with sum(min(ceil(t / T), P)) <=
-            # capacity. ceil(total / capacity) bounds it below; with one slot
-            # per nonempty row reserved, ceil(total / (capacity - rows)) is
-            # feasible. The search halves [lo, hi] once per bit of hi - lo.
-            # 2**23 tiles (an int32 context) already gives every row one task,
-            # so the bounds clamp there and the search runs in int32.
-            cap = fx.Int64(capacity)
-            spare = fx.max(remaining, fx.Int64(1))
-            lo64 = fx.max((total + cap - 1) // cap, fx.Int64(1))
-            hi64 = fx.max((total + spare - 1) // spare, lo64)
-            hi = fx.Int32(fx.min(hi64, fx.Int64(1 << 23)))
-            lo = fx.Int32(fx.min(lo64, fx.Int64(1 << 23)))
-            # A full plan (one slot per nonempty row) has only one choice.
-            lo = (remaining > fx.Int64(0)).select(lo, hi)
             row_tiles = fx.Int32(thread_tiles)
-            steps = fx.Int32(0)
-            if hi > lo:
-                span = fx.Vector.from_elements(
-                    [fx.Float32(hi - lo)], dtype=fx.Float32
-                ).bitcast(fx.Int32)[0]
-                steps = ((span >> 23) & fx.Int32(0xFF)) - fx.Int32(126)
-            for _, bounds in range(0, steps, 1, init=[lo, hi]):
-                lo, hi = bounds
-                mid = (lo + hi) >> 1
-                need = fx.Int32(0)
-                if row_tiles > 0:
-                    need = fx.min((row_tiles + mid - 1) // mid, max_parts)
-                fx.gpu.barrier()
-                need = reduce_rows(need, fx.ReductionOp.ADD, storage=row_storage)
-                fits = need <= capacity
-                results = yield [fits.select(lo, mid + 1), fits.select(mid, hi)]
-            lo, hi = results
+            rows_used = capacity - fx.Int32(remaining)
+
+            def tile_bound(slots):
+                # Smallest per-task tile bound T with sum(min(ceil(t / T), P))
+                # <= slots. ceil(total / slots) bounds it below; with one slot
+                # per nonempty row reserved, ceil(total / (slots - rows)) is
+                # feasible. The search halves [lo, hi] once per bit of hi - lo.
+                # 2**23 tiles (an int32 context) already gives every row one
+                # task, so the bounds clamp there and the search runs in int32.
+                cap = fx.Int64(slots)
+                spare_rows = cap - fx.Int64(rows_used)
+                spare = fx.max(spare_rows, fx.Int64(1))
+                lo64 = fx.max((total + cap - 1) // cap, fx.Int64(1))
+                hi64 = fx.max((total + spare - 1) // spare, lo64)
+                hi = fx.Int32(fx.min(hi64, fx.Int64(1 << 23)))
+                lo = fx.Int32(fx.min(lo64, fx.Int64(1 << 23)))
+                # A full plan (one slot per nonempty row) has only one choice.
+                lo = (spare_rows > fx.Int64(0)).select(lo, hi)
+                steps = fx.Int32(0)
+                if hi > lo:
+                    span = fx.Vector.from_elements(
+                        [fx.Float32(hi - lo)], dtype=fx.Float32
+                    ).bitcast(fx.Int32)[0]
+                    steps = ((span >> 23) & fx.Int32(0xFF)) - fx.Int32(126)
+                for _, bounds in range(0, steps, 1, init=[lo, hi]):
+                    lo, hi = bounds
+                    mid = (lo + hi) >> 1
+                    need = fx.Int32(0)
+                    if row_tiles > 0:
+                        need = fx.min((row_tiles + mid - 1) // mid, max_parts)
+                    fx.gpu.barrier()
+                    need = reduce_rows(need, fx.ReductionOp.ADD, storage=row_storage)
+                    fits = need <= slots
+                    results = yield [fits.select(lo, mid + 1), fits.select(mid, hi)]
+                lo, hi = results
+                return lo
+
+            lo = tile_bound(capacity)
+            # A task's fixed cost (prologue, first loads, partial write) is
+            # about 2.5 d128 tiles. While the full plan's tasks hold at most 2
+            # tiles, one task per CU (``compact`` slots) of at most twice that
+            # bound does the same tiles with one fixed cost instead of two;
+            # longer tasks gain more from two CTAs overlapping on a CU. Slots
+            # past the compact plan are padding.
+            fewer = (compact >= fx.max(rows_used, 1)).select(compact, capacity)
+            lo_compact = tile_bound(fewer)
+            merge = (lo <= 2) & (lo_compact <= 2 * lo)
+            lo = merge.select(lo_compact, lo)
             thread_tasks = fx.Int32(0)
             if row_tiles > 0:
                 thread_tasks = fx.min((row_tiles + lo - 1) // lo, max_parts)
@@ -239,10 +257,11 @@ def compile_pa_decode_plan(max_batch, threads, windowed, balanced=False):
         capacity: fx.Int32,
         max_parts: fx.Int32,
         window: fx.Int32,
+        compact: fx.Int32,
         stream: fx.Stream,
     ):
         pa_decode_plan_kernel(
-            lengths, work, reduce_info, batch, capacity, max_parts, window
+            lengths, work, reduce_info, batch, capacity, max_parts, window, compact
         ).launch(grid=(1, 1, 1), block=(threads, 1, 1), stream=stream)
 
     # All 40 argument bytes preload into user SGPRs, so the length loads need
@@ -283,7 +302,8 @@ class PADecodePlan:
     int32 and zero between decodes: gfx1250 decodes that merge partitions in
     the tile kernel count finished tasks in slot 0 and the last one resets it,
     so decodes running concurrently must not share a plan. ``None`` keeps the
-    shared reducer.
+    shared reducer. A nonzero ``compact_capacity`` lets the balanced planner
+    leave slots past it empty (see ``plan_pa_decode``).
     """
 
     work_info: torch.Tensor
@@ -294,6 +314,7 @@ class PADecodePlan:
     query_length: int = 1
     max_batch_size: int = DEFAULT_MAX_BATCH_SIZE
     arrival_counters: torch.Tensor | None = None
+    compact_capacity: int = 0
 
     @property
     def capacity(self) -> int:
@@ -356,12 +377,17 @@ def plan_pa_decode(
     The budget counts task slots across KV heads before query splitting. It
     defaults to two slots per CU. On gfx950 with ``query_length`` > 1 it is
     four slots per sequence and KV head, clamped to one to two slots per CU.
+    A default-budget plan whose window union touches at most two 256-token
+    tiles has one slot per sequence.
     Each nonempty sequence gets at least one task. Elsewhere the remaining
     slots go to sequences in proportion to their tiles. On gfx942 and gfx950,
     batches that fit one row per planner thread instead give a sequence of t
     tiles min(ceil(t / T), max_partitions) tasks, with T the smallest tile
     bound from ceil(total tiles / capacity) up whose tasks fit the capacity. Tasks
-    then end close together when lengths differ.
+    then end close together when lengths differ. Single-query, single-KV-head
+    plans with the gfx950 default budget whose bound is at most 2 tiles use the
+    bound for one slot per CU instead when it is at most twice that, leaving the
+    remaining slots empty.
 
     ``max_partitions`` is in [1, device CU count], defaulting to CU count;
     omitting it on refresh preserves the existing limit. gfx1250 decode plans
@@ -406,6 +432,7 @@ def plan_pa_decode(
     dev = context_lengths.device
     properties = torch.cuda.get_device_properties(dev)
     num_compute_units = properties.multi_processor_count
+    arch = properties.gcnArchName.split(":", 1)[0]
     shared_memory_per_block = getattr(properties, "shared_memory_per_block", None)
     if shared_memory_per_block is None:
         shared_memory_per_block = get_lds_capacity_bytes(properties.gcnArchName)
@@ -426,13 +453,14 @@ def plan_pa_decode(
     if not 1 <= max_partitions <= num_compute_units:
         raise ValueError(f"max_partitions must be in [1, {num_compute_units}]")
     if plan is None:
-        if workgroup_budget is None:
+        default_budget = workgroup_budget is None
+        if default_budget:
             # gfx950 multi-query tasks quantize and stage every query row, so
             # down to one slot per CU, with longer tasks, pays that cost less
             # often. Four slots per sequence stay so that uneven lengths can
             # still be split.
             workgroup_budget = 2 * num_compute_units
-            if query_length > 1 and properties.gcnArchName.split(":", 1)[0] == "gfx950":
+            if query_length > 1 and arch == "gfx950":
                 workgroup_budget = min(
                     max(4 * batch * num_kv_heads, num_compute_units),
                     workgroup_budget,
@@ -449,6 +477,30 @@ def plan_pa_decode(
             ),
             max(batch, (workgroup_budget + num_kv_heads - 1) // num_kv_heads),
         )
+        # On gfx950, a window over at most two tiles: a second task per sequence saves at
+        # most one tile of its CTA but needs the reducer launch, which alone
+        # costs more. One slot per sequence lets MXFP4 write final rows.
+        if default_budget and sliding_window > 0 and arch == "gfx950":
+            # The window union's sw + q - 1 tokens touch at most this many.
+            window_tiles = (sliding_window + query_length - 2 + 255) // 256 + 1
+            if window_tiles <= 2:
+                capacity = batch
+        # The default single-query budget on gfx950 may instead fill one slot
+        # per CU when its tasks are short. Only a
+        # single KV head's filled slots are contiguous in dispatch order; other
+        # heads' rows would interleave them with empty slots.
+        compact_capacity = 0
+        if (
+            default_budget
+            and query_length == 1
+            and num_kv_heads == 1
+            and arch == "gfx950"
+        ):
+            compact_capacity = min(
+                batch * max_partitions, max(batch, num_compute_units)
+            )
+            if compact_capacity >= capacity:
+                compact_capacity = 0
         plan = PADecodePlan(
             torch.empty((capacity, 4), dtype=torch.int32, device=dev),
             torch.empty((batch, 2), dtype=torch.int32, device=dev),
@@ -463,6 +515,7 @@ def plan_pa_decode(
                 dtype=torch.int32,
                 device=dev,
             ),
+            compact_capacity,
         )
     else:
         if workgroup_budget is not None:
@@ -484,7 +537,7 @@ def plan_pa_decode(
             max_batch,
             _block_threads(plan.capacity),
             sliding_window > 0,
-            properties.gcnArchName.split(":", 1)[0] in ("gfx942", "gfx950"),
+            arch in ("gfx942", "gfx950"),
         )
         _run_compiled(
             launch,
@@ -495,6 +548,7 @@ def plan_pa_decode(
             plan.capacity,
             plan.max_partitions,
             window,
+            plan.compact_capacity,
             torch.cuda.current_stream(dev),
         )
     return plan
