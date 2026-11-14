@@ -19,11 +19,11 @@ from codegen.common import (
     _NOSPLIT,
     _SPLITK,
     get_arch_map,
-    open_if_changed,
     prune_unwritten,
     reset_written_paths,
     write_if_changed,
 )
+from codegen.template_env import render as render_template
 from opus_gemm_common import (
     KERNEL_REGISTRY,
     KernelKey,
@@ -172,14 +172,6 @@ def _kid_name_arch(kid_name):
         if kid_name.startswith(f"opus_gemm_{arch_prefix}_"):
             return arch_prefix
     return LEGACY_OPUS_ARCH
-
-
-def _own_arch_device_pass_guard(arch):
-    """Admit the host pass and only this kid's owning device pass."""
-    return (
-        f"#if !defined(__HIP_DEVICE_COMPILE__) || defined(__{arch}__)\n",
-        f"#endif // host pass or {arch} device pass\n",
-    )
 
 
 def _splitk_reduce_baseline_instantiations(
@@ -399,32 +391,13 @@ def _kargs_template_vars(kernel_tag, kargs_name):
 
 
 # INSTANCE_IMPL building blocks. Host pass needs torch/optional; RTC/device passes skip them.
-_INSTANCE_IMPL_PREAMBLE_TEMPLATE = """// SPDX-License-Identifier: MIT
-// Copyright (C) 2025-2026, Advanced Micro Devices, Inc. All rights reserved.
-#pragma once
-#if !defined(__HIP_DEVICE_COMPILE__) && !defined(__HIPCC_RTC__)
-#include "aiter_tensor.h"
-#include "aiter_stream.h"{extra_host_includes}
-#include <optional>
-#endif"""
-
-
 def instance_impl_preamble(extra_host_includes=""):
-    return _INSTANCE_IMPL_PREAMBLE_TEMPLATE.format(
-        extra_host_includes=extra_host_includes
+    return render_template(
+        "instance_impl_preamble.cuh.j2", extra_host_includes=extra_host_includes
     )
 
 
 # Fused host TU sees only traits header + fwd decl; avoids layout-helper ODR clash.
-_INSTANCE_IMPL_HOST_TU_SPLIT_TEMPLATE = """#ifdef OPUS_FUSED_HOST_TU
-#include "{traits_header}"
-template<typename Traits{fwd_decl_kargs_tpl}>
-__global__ void {kernel_func}({fwd_decl_kargs_fnarg} kargs);
-#else
-#include "{pipeline_header}"
-#endif"""
-
-
 def instance_impl_host_tu_split(
     traits_header,
     pipeline_header,
@@ -432,7 +405,8 @@ def instance_impl_host_tu_split(
     kernel_func,
     fwd_decl_kargs_fnarg,
 ):
-    return _INSTANCE_IMPL_HOST_TU_SPLIT_TEMPLATE.format(
+    return render_template(
+        "instance_impl_host_tu_split.cuh.j2",
         traits_header=traits_header,
         pipeline_header=pipeline_header,
         fwd_decl_kargs_tpl=fwd_decl_kargs_tpl,
@@ -647,137 +621,70 @@ class opus_gemm_codegen:
 
     # Shared host-side bias validation + kargs population. Consumed by gfx950
     # noscale + gfx950 flatmm_splitk + gfx942 splitk emit modules.
-    BIAS_HOST_VALIDATE = """
-    const void* ptr_bias_ = nullptr;
-    int stride_bias_batch_ = 0;
-    if (bias.has_value()) {{
-        const auto& bt = bias.value();
-        AITER_CHECK(bt.is_contiguous(),
-            "bias must be contiguous (got non-contiguous tensor)");
-        AITER_CHECK(bt.dtype() == Y.dtype(),
-            "bias dtype must match Y dtype (got bias=",
-            AiterDtype_to_str(bt.dtype()),
-            " Y=", AiterDtype_to_str(Y.dtype()), ")");
-        if (bt.dim() == 1) {{
-            AITER_CHECK(bt.size(0) == N,
-                "bias 1D length must equal N (got bias.size(0)=", bt.size(0),
-                " N=", N, ")");
-            stride_bias_batch_ = 0;
-        }} else if (bt.dim() == 2) {{
-            AITER_CHECK(bt.size(0) == batch && bt.size(1) == N,
-                "bias 2D shape must equal [batch, N] (got [", bt.size(0), ", ",
-                bt.size(1), "] vs batch=", batch, " N=", N, ")");
-            stride_bias_batch_ = N;
-        }} else {{
-            AITER_CHECK(false, "bias must be 1D [N] or 2D [batch, N]; got dim=",
-                bt.dim());
-        }}
-        ptr_bias_ = bt.data_ptr();
-    }}
-"""
+    BIAS_HOST_VALIDATE = render_template("bias_host_validate.cuh.j2")
 
     def gen_a16w16_kid_dispatch(self, kernels_dict):
         """Emit per-arch A16W16 direct and workspace launcher tables."""
-        HEADER = """#pragma once
-// SPDX-License-Identifier: MIT
-// Copyright (C) 2025-2026, Advanced Micro Devices, Inc. All rights reserved.
-//
-// Auto-generated. Do not edit. See gen_instances.py:gen_a16w16_kid_dispatch.
-//
-// Per-arch sorted flat arrays for strict kid dispatch.  Non-workspace tables
-// contain five-argument OpusA16W16Kernel pointers.  Workspace tables contain
-// six-argument OpusA16W16WorkspaceKernel pointers. Never combine them with
-// the five-argument table.
-"""
-        NON_WORKSPACE_ENTRY = """\
-    {{ {kid}, &{kernel_name}<CTYPE> }},  \\
-"""
-        WORKSPACE_ENTRY = """\
-    {{ {kid}, &{kernel_name}<fp32_t> }},  \\
-"""
 
-        def _write_rows(f, macro_name, rows, entry, function_like=False):
-            f.write(f"#define {macro_name}_SIZE {len(rows)}\n")
-            macro_suffix = "(CTYPE)" if function_like else ""
-            if not rows:
-                f.write(f"#define {macro_name}{macro_suffix}\n\n")
-                return
-            f.write(f"#define {macro_name}{macro_suffix} \\\n")
-            for index, (kid, name) in enumerate(rows):
-                line = entry.format(
-                    kid=f"{{ {kid.cu_num}, {kid.kid} }}", kernel_name=name
-                )
-                if index == len(rows) - 1:
-                    line = line.rstrip().rstrip("\\").rstrip() + "\n"
-                f.write(line)
-            f.write("\n")
-
-        def _emit_non_workspace_map(f, arch, ctype):
+        def _collect(arch, negate_splitk, ctype):
             rows = []
             for kid, k in kernels_dict.items():
                 if not (
                     isinstance(kid, KernelKey)
                     and k.kernel_tag in A16W16_KID_DISPATCH_TAGS
                 ):
-                    continue
-                if kid.gfx != arch or k.kernel_tag in SPLITK_TAGS:
-                    continue
-                if ctype not in k.output_dtypes:
                     continue
                 if kid.gfx != arch:
                     continue
+                in_splitk = k.kernel_tag in SPLITK_TAGS
+                if in_splitk == negate_splitk:
+                    continue
+                if ctype not in k.output_dtypes:
+                    if not negate_splitk:
+                        raise ValueError(
+                            f"workspace kid {kid} ({k.name}) has no fp32_t host "
+                            "specialization"
+                        )
+                    continue
                 rows.append((kid, k.name))
             rows.sort(key=lambda r: r[0])
-            dtype_suffix = "BF16" if ctype == "bf16_t" else "FP32"
-            macro_name = (
-                "GENERATE_A16W16_NONWORKSPACE_KID_DISPATCH_"
-                f"{arch.upper()}_{dtype_suffix}"
+            return rows
+
+        maps = []
+        for arch in SPLITK_REDUCE_ARCHES:
+            for ctype in ("bf16_t", "fp32_t"):
+                rows = _collect(arch, True, ctype)
+                dtype_suffix = "BF16" if ctype == "bf16_t" else "FP32"
+                maps.append(
+                    {
+                        "macro": (
+                            "GENERATE_A16W16_NONWORKSPACE_KID_DISPATCH_"
+                            f"{arch.upper()}_{dtype_suffix}"
+                        ),
+                        "func_like": True,
+                        "rows": [
+                            (kid.cu_num, kid.kid, name, "CTYPE") for kid, name in rows
+                        ],
+                    }
+                )
+            ws_rows = _collect(arch, False, "fp32_t")
+            maps.append(
+                {
+                    "macro": f"GENERATE_A16W16_WORKSPACE_KID_DISPATCH_{arch.upper()}",
+                    "func_like": False,
+                    "rows": [
+                        (kid.cu_num, kid.kid, name, "fp32_t") for kid, name in ws_rows
+                    ],
+                }
             )
-            _write_rows(f, macro_name, rows, NON_WORKSPACE_ENTRY, function_like=True)
 
-        def _emit_workspace_map(f, arch):
-            rows = []
-            for kid, k in kernels_dict.items():
-                if not (
-                    isinstance(kid, KernelKey)
-                    and k.kernel_tag in A16W16_KID_DISPATCH_TAGS
-                ):
-                    continue
-                if kid.gfx != arch or k.kernel_tag not in SPLITK_TAGS:
-                    continue
-                if "fp32_t" not in k.output_dtypes:
-                    raise ValueError(
-                        f"workspace kid {kid} ({k.name}) has no fp32_t host "
-                        "specialization"
-                    )
-                rows.append((kid, k.name))
-            rows.sort(key=lambda r: r[0])
-            macro_name = f"GENERATE_A16W16_WORKSPACE_KID_DISPATCH_{arch.upper()}"
-            _write_rows(f, macro_name, rows, WORKSPACE_ENTRY)
-
-        with open_if_changed(
-            os.path.join(self.working_path, "opus_gemm_a16w16_kid_dispatch.h")
-        ) as f:
-            f.write(HEADER)
-            for arch in SPLITK_REDUCE_ARCHES:
-                _emit_non_workspace_map(f, arch, "bf16_t")
-                _emit_non_workspace_map(f, arch, "fp32_t")
-                _emit_workspace_map(f, arch)
+        write_if_changed(
+            os.path.join(self.working_path, "opus_gemm_a16w16_kid_dispatch.h"),
+            render_template("opus_gemm_a16w16_kid_dispatch.h.j2", maps=maps),
+        )
 
     def gen_a8w8_kid_dispatch(self, kernels_dict):
         """Emit sorted A8W8 launcher tables for each interface."""
-        header = """#pragma once
-// SPDX-License-Identifier: MIT
-// Copyright (C) 2025-2026, Advanced Micro Devices, Inc. All rights reserved.
-//
-// Auto-generated. Do not edit. See gen_instances.py:gen_a8w8_kid_dispatch.
-//
-// Interfaces remain separate even when argument counts match. Missing kernels
-// use a size-0 table.
-"""
-        entry = """\
-    {{ {kid}, &{kernel_name}<{ctype}> }},  \\
-"""
 
         def _rows(arch, tags, ctype):
             rows = []
@@ -788,209 +695,89 @@ class opus_gemm_codegen:
                     continue
                 rows.append((kid, k.name))
             rows.sort(key=lambda row: row[0])
-            return rows
+            return [(kid.cu_num, kid.kid, name, ctype) for kid, name in rows]
 
-        def _emit_map(f, macro_name, rows, ctype):
-            f.write(f"#define {macro_name}_SIZE {len(rows)}\n")
-            if not rows:
-                f.write(f"#define {macro_name}\n\n")
-                return
-            f.write(f"#define {macro_name} \\\n")
-            for index, (kid, name) in enumerate(rows):
-                line = entry.format(
-                    kid=f"{{ {kid.cu_num}, {kid.kid} }}", kernel_name=name, ctype=ctype
+        maps = [
+            {
+                "macro": "GENERATE_A8W8_NOSCALE_KID_DISPATCH_GFX950",
+                "func_like": False,
+                "rows": _rows("gfx950", {"a8w8"}, "fp32_t"),
+            },
+            {
+                "macro": "GENERATE_A8W8_BLOCKSCALE_KID_DISPATCH_GFX950",
+                "func_like": False,
+                "rows": _rows("gfx950", {"a8w8_scale"}, "fp32_t"),
+            },
+        ]
+        for arch in SPLITK_REDUCE_ARCHES:
+            for ctype, dtype_suffix in (("bf16_t", "BF16"), ("fp32_t", "FP32")):
+                maps.append(
+                    {
+                        "macro": (
+                            "GENERATE_A8W8_BLOCKSCALE_BPRESHUFFLE_KID_DISPATCH_"
+                            f"{arch.upper()}_{dtype_suffix}"
+                        ),
+                        "func_like": False,
+                        "rows": _rows(arch, A8W8_BPRESHUFFLE_TAGS, ctype),
+                    }
                 )
-                if index == len(rows) - 1:
-                    line = line.rstrip().rstrip("\\").rstrip() + "\n"
-                f.write(line)
-            f.write("\n")
 
-        with open_if_changed(
-            os.path.join(self.working_path, "opus_gemm_a8w8_kid_dispatch.h")
-        ) as f:
-            f.write(header)
-            _emit_map(
-                f,
-                "GENERATE_A8W8_NOSCALE_KID_DISPATCH_GFX950",
-                _rows("gfx950", {"a8w8"}, "fp32_t"),
-                "fp32_t",
-            )
-            _emit_map(
-                f,
-                "GENERATE_A8W8_BLOCKSCALE_KID_DISPATCH_GFX950",
-                _rows("gfx950", {"a8w8_scale"}, "fp32_t"),
-                "fp32_t",
-            )
-            for arch in SPLITK_REDUCE_ARCHES:
-                for ctype, dtype_suffix in (
-                    ("bf16_t", "BF16"),
-                    ("fp32_t", "FP32"),
-                ):
-                    macro_name = (
-                        "GENERATE_A8W8_BLOCKSCALE_BPRESHUFFLE_KID_DISPATCH_"
-                        f"{arch.upper()}_{dtype_suffix}"
-                    )
-                    _emit_map(
-                        f,
-                        macro_name,
-                        _rows(arch, A8W8_BPRESHUFFLE_TAGS, ctype),
-                        ctype,
-                    )
+        write_if_changed(
+            os.path.join(self.working_path, "opus_gemm_a8w8_kid_dispatch.h"),
+            render_template("opus_gemm_a8w8_kid_dispatch.h.j2", maps=maps),
+        )
 
     def gen_bmm_mxscale_kid_dispatch(self, kernels_dict):
         """Emit exact (CU, local kid) routes for gfx950 MXFP8 BMM launchers."""
-        header = """#pragma once
-// SPDX-License-Identifier: MIT
-// Copyright (C) 2025-2026, Advanced Micro Devices, Inc. All rights reserved.
-// Auto-generated. Do not edit.
-"""
-        entry = """\
-    {{ {kid}, &{kernel_name}<CTYPE> }},  \\
-"""
-
-        # The scale-shape check runs before the kid is dispatched, and what shape
-        # is correct depends on the kid: GROUP_N and GROUP_K are 128 or 32. So
-        # the table below travels with the dispatch table rather than the check
-        # hardcoding 128, which is what rejected the first GROUP_K=32 launch.
-        group_entry = """\
-    {{ {kid}, {{ {group_n}, {group_k} }} }},  \\
-"""
-
         rows = sorted(
             (kid, instance.name, instance.GROUP_N, instance.GROUP_K)
             for kid, instance in kernels_dict.items()
             if kid.family == "a8w8_mxscale_bmm" and "fp32_t" in instance.output_dtypes
         )
-
-        def emit(f, macro, fmt, fields):
-            f.write(f"#define {macro} \\\n")
-            for index, row in enumerate(rows):
-                line = fmt.format(**fields(row))
-                if index == len(rows) - 1:
-                    line = line.rstrip().rstrip("\\").rstrip() + "\n"
-                f.write(line)
-            f.write("\n")
-
-        with open_if_changed(
-            os.path.join(self.working_path, "opus_bmm_mxscale_kid_dispatch.h")
-        ) as f:
-            f.write(header)
-            f.write(f"#define GENERATE_BMM_MXSCALE_KID_DISPATCH_SIZE {len(rows)}\n")
-            emit(
-                f,
-                "GENERATE_BMM_MXSCALE_KID_DISPATCH(CTYPE)",
-                entry,
-                lambda r: {
-                    "kid": f"{{ {r[0].cu_num}, {r[0].kid} }}",
-                    "kernel_name": r[1],
-                },
-            )
-            emit(
-                f,
-                "GENERATE_BMM_MXSCALE_KID_GROUPS",
-                group_entry,
-                lambda r: {
-                    "kid": f"{{ {r[0].cu_num}, {r[0].kid} }}",
-                    "group_n": r[2],
-                    "group_k": r[3],
-                },
-            )
+        dispatch = [(kid.cu_num, kid.kid, name) for kid, name, _gn, _gk in rows]
+        # The scale-shape check runs before the kid is dispatched, and what shape
+        # is correct depends on the kid: GROUP_N and GROUP_K are 128 or 32. So
+        # the table below travels with the dispatch table rather than the check
+        # hardcoding 128, which is what rejected the first GROUP_K=32 launch.
+        groups = [(kid.cu_num, kid.kid, gn, gk) for kid, _name, gn, gk in rows]
+        write_if_changed(
+            os.path.join(self.working_path, "opus_bmm_mxscale_kid_dispatch.h"),
+            render_template(
+                "opus_bmm_mxscale_kid_dispatch.h.j2",
+                size=len(rows),
+                dispatch=dispatch,
+                groups=groups,
+            ),
+        )
 
     def gen_manifest_head(self, kernels_dict):
         # Forward declarations for every launcher symbol the dispatcher references.
-        MANIFEST_HEAD = """#pragma once
-// SPDX-License-Identifier: MIT
-// Copyright (C) 2025-2026, Advanced Micro Devices, Inc. All rights reserved.
-#include "aiter_tensor.h"
-#include <cstdlib>
-#include <optional>
-"""
-        MANIFEST_BLOCKSCALE = """
-template <typename D_C>
-void
-{kernel_name}(
-    aiter_tensor_t &XQ,
-    aiter_tensor_t &WQ,
-    aiter_tensor_t &Y,
-    aiter_tensor_t &x_scale,
-    aiter_tensor_t &w_scale);
-"""
-        MANIFEST_BLOCKSCALE_BPRESHUFFLE = """
-template <typename D_C>
-void
-{kernel_name}(
-    aiter_tensor_t &XQ,
-    aiter_tensor_t &WQ,
-    aiter_tensor_t &x_scale,
-    aiter_tensor_t &w_scale,
-    aiter_tensor_t &Y);
-"""
-        # a8w8 noscale (3 args, no splitK) has its own exact-kid table.
-        MANIFEST_NOSCALE_3ARG = """
-template <typename D_C>
-void
-{kernel_name}(
-    aiter_tensor_t &XQ,
-    aiter_tensor_t &WQ,
-    aiter_tensor_t &Y);
-"""
-        # Non-workspace a16w16 launchers keep the existing five-argument ABI.
-        MANIFEST_A16W16 = """
-template <typename D_C>
-void
-{kernel_name}(
-    aiter_tensor_t &XQ,
-    aiter_tensor_t &WQ,
-    aiter_tensor_t &Y,
-    std::optional<aiter_tensor_t> bias,
-    int splitK);
-"""
-        # External-workspace launchers receive a caller-owned typed tensor.
-        # This covers both two-stage reducers and gfx1250 fused in-cluster
-        # reduction.
-        MANIFEST_A16W16_WORKSPACE = """
-template <typename D_C>
-void
-{kernel_name}(
-    aiter_tensor_t &XQ,
-    aiter_tensor_t &WQ,
-    aiter_tensor_t &Y,
-    aiter_tensor_t &workspace,
-    std::optional<aiter_tensor_t> bias,
-    int splitK);
-"""
-        MANIFEST_BMM_MXSCALE = """
-template <typename D_C>
-void
-{kernel_name}(
-    aiter_tensor_t &XQ,
-    aiter_tensor_t &WQ,
-    aiter_tensor_t &Y,
-    aiter_tensor_t &x_scale,
-    aiter_tensor_t &w_scale,
-    std::optional<aiter_tensor_t> workspace,
-    int splitK);
-"""
-        parts = [MANIFEST_HEAD]
-        for k in kernels_dict.values():
-            if k.kernel_tag.startswith("a8w8_mxscale_bmm_"):
-                parts.append(MANIFEST_BMM_MXSCALE.format(kernel_name=k.name))
-            elif k.kernel_tag in SPLITK_TAGS:
-                parts.append(MANIFEST_A16W16_WORKSPACE.format(kernel_name=k.name))
-            elif k.kernel_tag in A16W16_KID_DISPATCH_TAGS:
-                parts.append(MANIFEST_A16W16.format(kernel_name=k.name))
-            elif k.kernel_tag == "a8w8":
-                parts.append(MANIFEST_NOSCALE_3ARG.format(kernel_name=k.name))
-            elif k.kernel_tag == "a8w8_scale":
-                parts.append(MANIFEST_BLOCKSCALE.format(kernel_name=k.name))
-            elif k.kernel_tag in A8W8_BPRESHUFFLE_TAGS:
-                parts.append(MANIFEST_BLOCKSCALE_BPRESHUFFLE.format(kernel_name=k.name))
-            else:
-                raise ValueError(f"no manifest ABI for kernel tag {k.kernel_tag!r}")
+        # The ABI arg-lists live in templates/opus_gemm_manifest.h.j2; this selects
+        # one per kernel tag.
+        def _abi_key(tag):
+            if tag.startswith("a8w8_mxscale_bmm_"):
+                return "bmm_mxscale"
+            if tag in SPLITK_TAGS:
+                return "a16w16_workspace"
+            if tag in A16W16_KID_DISPATCH_TAGS:
+                return "a16w16"
+            if tag == "a8w8":
+                return "noscale_3arg"
+            if tag == "a8w8_scale":
+                return "blockscale"
+            if tag in A8W8_BPRESHUFFLE_TAGS:
+                return "blockscale_bpreshuffle"
+            raise ValueError(f"no manifest ABI for kernel tag {tag!r}")
+
+        entries = [
+            {"abi": _abi_key(k.kernel_tag), "name": k.name}
+            for k in kernels_dict.values()
+        ]
         # Every TU includes this header, so rewriting it unconditionally would
         # invalidate the whole build even when the manifest is identical.
         write_if_changed(
-            os.path.join(self.working_path, "opus_gemm_manifest.h"), "".join(parts)
+            os.path.join(self.working_path, "opus_gemm_manifest.h"),
+            render_template("opus_gemm_manifest.h.j2", entries=entries),
         )
 
     # -- Per-pass TU emission -- Replaces the old "one .cpp per (kid, dtype)" scheme.
@@ -1040,20 +827,12 @@ void
                 "    const D_BIAS_* bias, int stride_bias_batch);\n"
                 f"{extra_forward_decls}"
             )
-            contents = (
-                "// SPDX-License-Identifier: MIT\n"
-                "// Copyright (C) 2025-2026, Advanced Micro Devices, Inc. All rights reserved.\n"
-                "//\n"
-                f"// Auto-generated per-arch host TU ({arch}). See gen_instances.py:_emit_fused_host_tu.\n"
-                "#ifndef __HIP_DEVICE_COMPILE__\n"
-                "#define OPUS_FUSED_HOST_TU 1\n"
-                '#include "aiter_tensor.h"\n'
-                '#include "aiter_stream.h"\n'
-                "#include <optional>\n"
-                + forward_decls
-                + "".join(f'#include "impl/{name}.cuh"\n' for name in impl_includes)
-                + host_body
-                + "#endif // host pass only\n"
+            contents = render_template(
+                "fused_host_tu.cu.j2",
+                arch=arch,
+                forward_decls=forward_decls,
+                impl_includes=impl_includes,
+                host_body=host_body,
             )
             write_if_changed(
                 os.path.join(self.instances_path, f"all_instances_host_{arch}.cu"),
@@ -1077,30 +856,16 @@ void
 
         Both the #include and the instantiations sit behind the kid's own
         arch guard, so a mixed build's other device passes see an empty TU
-        (see _own_arch_device_pass_guard).
+        (see the guard in codegen/templates/device_tu.cu.j2).
         """
         for row in self._device_instantiations:
             name = row["kid_name"]
             dtype = row["dtype"]
-            guard_open, guard_close = _own_arch_device_pass_guard(_kid_name_arch(name))
-            # Include the kid's .cuh -- it transitively pulls in the full pipeline header (because
-            # OPUS_FUSED_HOST_TU is NOT defined here) an...
-            contents = (
-                "// SPDX-License-Identifier: MIT\n"
-                "// Copyright (C) 2025-2026, Advanced Micro Devices, Inc. All rights reserved.\n"
-                "//\n"
-                "// Auto-generated. Do not edit. See gen_instances.py:_emit_device_tus.\n"
-                "//\n"
-                "// Device-only translation unit for one (kid, dtype) pair.\n"
-                "// Keep both JIT and prebuild host passes on the minimal branch --\n"
-                "// no torch and no full HIP runtime.\n"
-                "#ifndef __HIPCC_RTC__\n"
-                "#define __HIPCC_RTC__ 1\n"
-                "#endif\n"
-                + guard_open
-                + f'#include "impl/{name}.cuh"\n'
-                + row["device_decl"]
-                + guard_close
+            contents = render_template(
+                "device_tu.cu.j2",
+                arch=_kid_name_arch(name),
+                name=name,
+                device_decl=row["device_decl"],
             )
             write_if_changed(
                 os.path.join(self.instances_path, f"{name}_C{dtype}.device.cu"),
@@ -1166,33 +931,27 @@ void
                 reduce_vec, reduce_block = 16, 64
                 reduce_split_ks = (None,)
                 reduce_workspace_types = (None,)
-            guard_open, guard_close = _own_arch_device_pass_guard(reduce_arch)
-            contents = (
-                "// SPDX-License-Identifier: MIT\n"
-                "// Copyright (C) 2025-2026, Advanced Micro Devices, Inc. All rights reserved.\n"
-                "//\n"
-                f"// Auto-generated per-arch reduce TU ({reduce_arch}). See gen_instances.py:_emit_splitk_reduce_tu.\n"
-                "#ifndef __HIPCC_RTC__\n"
-                "#define __HIPCC_RTC__ 1\n"
-                "#endif\n"
-                + guard_open
-                + f'#include "{reduce_header}"\n'
-                + "".join(
-                    _splitk_reduce_baseline_instantiations(
-                        reduce_kernel,
-                        ws_ptr_type,
-                        has_oob,
-                        reduce_vec,
-                        reduce_block,
-                        reduce_split_ks,
-                        reduce_workspace_types,
-                    )
-                    for has_oob in reduce_abi["baseline_has_oob"]
+            baseline = "".join(
+                _splitk_reduce_baseline_instantiations(
+                    reduce_kernel,
+                    ws_ptr_type,
+                    has_oob,
+                    reduce_vec,
+                    reduce_block,
+                    reduce_split_ks,
+                    reduce_workspace_types,
                 )
+                for has_oob in reduce_abi["baseline_has_oob"]
             )
             extra_reduce = SPLITK_REDUCE_EXTRA_MAP.get(reduce_arch, {})
-            contents += extra_reduce.get("device_instantiations", lambda: "")()
-            contents += guard_close
+            extra = extra_reduce.get("device_instantiations", lambda: "")()
+            contents = render_template(
+                "splitk_reduce_tu.cu.j2",
+                arch=reduce_arch,
+                reduce_header=reduce_header,
+                baseline=baseline,
+                extra=extra,
+            )
             write_if_changed(
                 os.path.join(
                     self.instances_path, f"splitk_reduce_{reduce_arch}.device.cu"
@@ -1473,11 +1232,8 @@ if __name__ == "__main__":
     Path(args.working_path).mkdir(parents=True, exist_ok=True)
     write_if_changed(
         os.path.join(args.working_path, "opus_build_archs.h"),
-        "// SPDX-License-Identifier: MIT\n"
-        "// Auto-generated. See gen_instances.py.\n"
-        "#pragma once\n"
-        + "".join(
-            f"#define OPUS_BUILD_HAS_{gfx.upper()} 1\n" for gfx in sorted(target_arches)
+        render_template(
+            "opus_build_archs.h.j2", arches=sorted(g.upper() for g in target_arches)
         ),
     )
     print(
