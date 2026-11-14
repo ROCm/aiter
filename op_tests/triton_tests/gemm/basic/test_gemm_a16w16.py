@@ -71,8 +71,13 @@ def get_x_vals():
     return x_vals
 
 
+# DSv4.1 router GEMM: TN layout only, so it is not in get_x_vals().
+# The M values are the lowest and highest M of each tuned gfx1250 bucket.
+_DSV41_ROUTER_X_VALS = [(M, 384, 5120) for M in (545, 576, 641, 672, 737, 768)]
+
+
 # Test plain BF16 GEMMs - the most common types.
-@pytest.mark.parametrize("M, N, K", get_x_vals())
+@pytest.mark.parametrize("M, N, K", get_x_vals() + _DSV41_ROUTER_X_VALS)
 @pytest.mark.parametrize("backend", ["triton", "gluon"])
 @pytest.mark.parametrize("kernel_type", ["bandwidth_bound", "compute_bound"])
 def test_gemm_a16_w16(M: int, N: int, K: int, backend, kernel_type):
