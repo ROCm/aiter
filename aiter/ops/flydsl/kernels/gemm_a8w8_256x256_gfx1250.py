@@ -749,9 +749,7 @@ def launch_gemm_a8w8_256x256(
                 _planar_base(PLANAR_A_BASE, STAGE_A, slot) + a_byte + par * a_par_step
             )
             stage_b_addr.append(
-                _planar_base(PLANAR_B_BASE, STAGE_B, slot)
-                + b_byte
-                + par * PACK_TK * 16
+                _planar_base(PLANAR_B_BASE, STAGE_B, slot) + b_byte + par * PACK_TK * 16
             )
             # A's K blocks are whole rows apart, B's are single bytes apart.
             sc_par_a = (
@@ -1015,7 +1013,7 @@ def launch_gemm_a8w8_256x256(
                 for pos in range_constexpr(half_m * half_n):
                     do_load = const_expr(pos in produce)
 
-                    def _do_mma():
+                    def _do_mma(pos=pos):
                         _mma_block_range(
                             wm0,
                             wn0,
@@ -1028,7 +1026,7 @@ def launch_gemm_a8w8_256x256(
                             n_fast,
                         )
 
-                    def _do_load():
+                    def _do_load(do_load=do_load, pos=pos):
                         if const_expr(do_load):
                             produce[pos]()
                             # Per-producer beat: 1 WMMA : 4 ds_load locally so
@@ -1075,16 +1073,12 @@ def launch_gemm_a8w8_256x256(
                     )
                     parts.setdefault(i, []).append(v)
                     if const_expr(j == DS_PER_FRAG - 1):
-                        nxt[key][i] = _rmem(
-                            16, _join(parts[i]), kind=kind, slot=i
-                        )
+                        nxt[key][i] = _rmem(16, _join(parts[i]), kind=kind, slot=i)
 
                 # Mid-K: split to one b128 per thunk (fills the quadrant; best
                 # absolute on 6144). Else one thunk = DS_PER_FRAG×b128 burst.
                 per = const_expr(
-                    1
-                    if DENSE_MIDK
-                    else (DS_PER_FRAG if mx32 or tile_m != 256 else 1)
+                    1 if DENSE_MIDK else (DS_PER_FRAG if mx32 or tile_m != 256 else 1)
                 )
                 return [
                     (
@@ -1145,12 +1139,10 @@ def launch_gemm_a8w8_256x256(
                 # every load issues at least four WMMAs after the latest death, so
                 # no ds_load overwrites VGPRs that an in-flight WMMA still reads.
                 a0 = [
-                    _rmem(16, t.load(), kind="a", slot=i)
-                    for i, t in enumerate(seed_a)
+                    _rmem(16, t.load(), kind="a", slot=i) for i, t in enumerate(seed_a)
                 ]
                 b0 = [
-                    _rmem(16, t.load(), kind="b", slot=i)
-                    for i, t in enumerate(seed_b)
+                    _rmem(16, t.load(), kind="b", slot=i) for i, t in enumerate(seed_b)
                 ]
                 frags = {}
 
@@ -1271,9 +1263,7 @@ def launch_gemm_a8w8_256x256(
                         # Closing a4w4-style region hint after the last producer.
                         if const_expr(ASM_PIPE_ACTIVE and pos == last_lead and n_lead):
                             _asm_sched_hint(max(0, n_lead - 1))
-                        elif const_expr(
-                            (not ASM_PIPE_ACTIVE) and pos >= free - 1
-                        ):
+                        elif const_expr((not ASM_PIPE_ACTIVE) and pos >= free - 1):
                             rocdl.sched_barrier(0)
 
                 def _perm_seeds():
