@@ -32,6 +32,14 @@ sweep ends in a markdown table:
   bit-identical to the fp32 reference, which separates a chunk-addressing or
   flag-protocol bug from a codec one. Run through each production schedule's
   ladder on the shipping payloads, so it covers the geometry that ships.
+* ``test_quick_allreduce_relay`` -- the TP2 mesh with relay devices set (on
+  xGMI when four GPUs are visible), checked bit-for-bit against a direct engine
+  on the same inputs across back-to-back calls, CUDA-graph replay, the default
+  size cutoff, and a block-64 slot-reuse row that catches a missing L1
+  invalidate.
+* ``test_quick_allreduce_setup_failure`` -- at TP2, one rank fails the inbox
+  allocation or the peer-handle open while the engines are built; every rank
+  must raise and a clean engine must build afterwards.
 
 ``--extended`` adds what production never selects: the legacy fixed shipping
 shapes; ``test_quick_allreduce`` again, as a second table, with ``block``
@@ -95,6 +103,7 @@ import math
 import os
 import sys
 from multiprocessing import Pool, freeze_support, set_start_method
+from time import perf_counter
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
 _REPO_ROOT = os.path.abspath(os.path.join(_HERE, "..", ".."))
@@ -119,7 +128,7 @@ from aiter.dist.parallel_state import (
     set_custom_all_reduce,
 )
 from aiter.dist.utils import get_distributed_init_method, get_ip, get_open_port
-from aiter.jit.utils.chip_info import get_gfx
+from aiter.jit.utils.chip_info import get_gfx_runtime
 from aiter.test_common import benchmark, checkAllclose
 
 set_start_method("spawn", force=True)
@@ -139,14 +148,17 @@ from aiter.ops.flydsl.kernels.comm.allreduce_shared import (
     BLOCK,
     DEFAULT_GRID_CAP,
 )
-from aiter.ops.flydsl.kernels.comm.quick_allreduce_mesh import clamp_grid_cap
+from aiter.ops.flydsl.kernels.comm.quick_allreduce_mesh import (
+    MESH_RELAY_DEFAULTS,
+    clamp_grid_cap,
+)
 from aiter.ops.flydsl.quick_allreduce import (
     DEFAULT_DIVISOR,
     _resolve_inbox_flags,
     batches_publishes,
 )
 
-ARCH = get_gfx()
+ARCH = get_gfx_runtime()
 ALGORITHMS = ("mesh", "ring")
 
 # One SQNR floor for both schedules, in their shipping configuration.
@@ -318,9 +330,36 @@ KNOB_CASES = (
     (2, "ring", 9216, 4096, 128),
 )
 
+# TP2 relay rows on the mesh (xGMI, >= 4 GPUs; relays on devices 2 and 3).
+# Back-to-back calls on distinct inputs check flag/colour handoff; the block-64
+# rows force every block to relay and re-read its bounce slots across tiles with
+# too little L1 traffic to evict them, catching a missing L1 invalidate.
+RELAY_CALLS = 4
+DEFAULT_RELAY = (2, 3)
+DEFAULT_RELAY_FRACTION = (3, 8)
+# (tokens, hidden, codec, graph, fraction, super_tile, grid_cap, block)
+RELAY_CASES = (
+    (8, 1024, "int4", False, DEFAULT_RELAY_FRACTION, None, None, None),
+    (8191, 5120, "int4", False, DEFAULT_RELAY_FRACTION, None, None, None),
+    (8191, 5120, "int4", True, DEFAULT_RELAY_FRACTION, None, None, None),
+    (8191, 5120, "fp16", False, DEFAULT_RELAY_FRACTION, None, None, None),
+    (64, 1024, "int4", False, (1, 1), 1, 8, 64),
+    (64, 1024, "int4", True, (1, 1), 1, 8, 64),
+)
+EXTENDED_RELAY_CASES = (
+    (1024, 5120, "int5", False, DEFAULT_RELAY_FRACTION, None, None, None),
+    (1024, 5120, "int6", False, DEFAULT_RELAY_FRACTION, None, None, None),
+    (8192, 5120, "int4", False, DEFAULT_RELAY_FRACTION, 8, None, None),
+)
+
 # Seconds to wait for each rank of a spawn. The kernels spin on flags written
 # by peers, so a protocol bug or a dead rank hangs the rest.
 SPAWN_TIMEOUT_S = 600
+
+# ``UncachedIpcHeap`` methods injected to fail on one rank during ``_StEngine`` setup.
+SETUP_FAULTS = {"alloc": "alloc", "open": "open_mem_handle"}
+SETUP_FAULT_RANK = 1
+SETUP_FAULT_TIMEOUT_S = 300
 
 _FILLS = (
     "normal",
@@ -337,11 +376,21 @@ _FILLS = (
 
 
 def _make_inp(
-    tokens: int, hidden: int, fill: str, *, rank: int, device: torch.device
+    tokens: int,
+    hidden: int,
+    fill: str,
+    *,
+    rank: int,
+    device: torch.device,
+    call: int = 0,
 ) -> torch.Tensor:
-    """One rank's contribution, for whichever edge case *fill* names."""
+    """One rank's contribution, for whichever edge case *fill* names.
+
+    *call* picks a different draw for each back-to-back call of one case;
+    ``call=0`` is the single-call input.
+    """
     shape = (tokens, hidden)
-    gen = torch.Generator().manual_seed(1234 + rank)
+    gen = torch.Generator().manual_seed(1234 + rank + 7919 * call)
     if fill in ("normal", "outlier", "small"):
         std = {"normal": 0.1, "outlier": 100.0, "small": 0.005}[fill]
         src = torch.randn(shape, generator=gen, dtype=torch.float32) * std
@@ -685,6 +734,91 @@ def _worst(a: dict, b: dict) -> dict:
     return out
 
 
+def _run_relay_case(fly, direct, case: tuple, *, rank: int, device, group, window):
+    """One case on a relay engine and its direct twin, on the same inputs."""
+    import torch.distributed as dist
+
+    ntok, hidden, fill, graph, calls = case
+
+    def draw(replay):
+        return [
+            _make_inp(
+                ntok, hidden, fill, rank=rank, device=device, call=replay * calls + c
+            )
+            for c in range(calls)
+        ]
+
+    inps = draw(0)
+    relay_outs = [torch.zeros_like(inp) for inp in inps]
+    direct_outs = [torch.zeros_like(inp) for inp in inps]
+    nbytes = int(inps[0].numel()) * int(inps[0].element_size())
+    st_used, block_used = fly._pick_cfg(nbytes)[0]
+    tile_bytes = _tile_bytes(block_used)
+
+    def run_all(eng, outs):
+        for inp, out in zip(inps, outs):
+            eng.allreduce(inp, out)
+
+    relay_graph = None
+    if graph:
+        run_all(fly, relay_outs)
+        torch.cuda.synchronize()
+        dist.barrier()
+        relay_graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(relay_graph):
+            run_all(fly, relay_outs)
+
+    m = None
+    differing = 0
+    for replay in range(GRAPH_REPLAYS if graph else 1):
+        if replay:
+            for inp, new in zip(inps, draw(replay)):
+                inp.copy_(new)
+        refs = []
+        for inp in inps:
+            ref = inp.to(torch.float32)
+            dist.all_reduce(ref, group=group)
+            refs.append(ref)
+        for out in relay_outs + direct_outs:
+            out.zero_()
+        dist.barrier()
+
+        if graph:
+            relay_graph.replay()
+        else:
+            run_all(fly, relay_outs)
+        torch.cuda.synchronize()
+        dist.barrier()
+        run_all(direct, direct_outs)
+        torch.cuda.synchronize()
+        dist.barrier()
+
+        for ref, r_out, d_out in zip(refs, relay_outs, direct_outs):
+            mi = _metrics(r_out, ref, rank, tile_bytes, group)
+            m = mi if m is None else _worst(m, mi)
+            differing = max(
+                differing,
+                int((r_out.view(torch.int16) != d_out.view(torch.int16)).sum()),
+            )
+
+    return {
+        **m,
+        "link": fly.link,
+        "inbox_memory": fly.inbox_memory,
+        "rs_codec": fly.rs_codec,
+        "ag_codec": fly.ag_codec,
+        "st_used": int(st_used),
+        "block_used": int(block_used),
+        "grid_by_cfg": {cfg: int(e.grid) for cfg, e in fly._by_cfg.items()},
+        "production_cfgs": (
+            None if window is None else [tuple(c) for c in fly.cfgs_for(*window)]
+        ),
+        "relay_vs_direct_lanes": differing,
+        "relay_used": fly.uses_relay(nbytes),
+        "variant": fly.variant(nbytes),
+    }
+
+
 def _init_dist(rank: int, tp: int, init_method: str, hip: bool):
     """Join a TP group as production does. Returns the ``GroupCoordinator``.
 
@@ -850,6 +984,15 @@ def _run_rank(
     gloo = tp_group.cpu_group
     group = tp_group.device_group
     fly = _engine(rank, tp, gloo, device, engine_kw)
+    direct = None
+    if "relay_devices" in engine_kw:
+        direct = _engine(
+            rank,
+            tp,
+            gloo,
+            device,
+            {k: v for k, v in engine_kw.items() if not k.startswith("relay_")},
+        )
     production_cfgs = None
     if window is not None:
         production_cfgs = [(int(st), int(b)) for st, b in fly.cfgs_for(*window)]
@@ -857,7 +1000,22 @@ def _run_rank(
 
     rows = []
     try:
-        for ntok, hidden, fill, time_it, *extra in cases:
+        for case in cases:
+            if direct is not None:
+                rows.append(
+                    _run_relay_case(
+                        fly,
+                        direct,
+                        case,
+                        rank=rank,
+                        device=device,
+                        group=group,
+                        window=window,
+                    )
+                )
+                torch.cuda.empty_cache()
+                continue
+            ntok, hidden, fill, time_it, *extra = case
             divisor = extra[0] if extra else DEFAULT_DIVISOR
             if fill == "run_ahead":
                 rows.append(
@@ -924,8 +1082,53 @@ def _run_rank(
             del inp, out, ref
             torch.cuda.empty_cache()
     finally:
-        _teardown([fly], gloo)
+        _teardown([fly] + ([] if direct is None else [direct]), gloo)
     return rows
+
+
+def _run_setup_fault_rank(rank: int, tp: int, init_method: str, fault: str) -> dict:
+    """One rank of a setup-fault spawn: build an engine with *fault* injected
+    on ``SETUP_FAULT_RANK``, then build a clean one on every rank."""
+    import torch.distributed as dist
+
+    from aiter.ops.flydsl import FlyQuickAllReduce
+    from aiter.ops.flydsl.ipc_heap import UncachedIpcHeap
+
+    device = torch.device(f"cuda:{rank}")
+    torch.cuda.set_device(device)
+    dist.init_process_group(
+        backend="gloo", init_method=init_method, world_size=tp, rank=rank
+    )
+    name = SETUP_FAULTS[fault]
+    real = vars(UncachedIpcHeap)[name]
+
+    def _fail(*_args, **_kwargs):
+        raise RuntimeError(f"injected {name} failure")
+
+    def _build():
+        FlyQuickAllReduce(
+            group=dist.group.WORLD, device=device, rank=rank, world_size=tp
+        ).close()
+
+    row = {"err": None, "s": None, "rebuild_err": None}
+    try:
+        if rank == SETUP_FAULT_RANK:
+            setattr(UncachedIpcHeap, name, staticmethod(_fail))
+        start = perf_counter()
+        try:
+            _build()
+        except Exception as exc:  # noqa: BLE001
+            row["err"] = f"{type(exc).__name__}: {exc}"
+        finally:
+            row["s"] = perf_counter() - start
+            setattr(UncachedIpcHeap, name, real)
+        try:
+            _build()
+        except Exception as exc:  # noqa: BLE001
+            row["rebuild_err"] = f"{type(exc).__name__}: {exc}"
+    finally:
+        dist.destroy_process_group()
+    return row
 
 
 def _hip_runs(qr, nbytes: int) -> bool:
@@ -1234,7 +1437,7 @@ def _capture_first_rank(rank: int, tp: int, init_method: str) -> dict:
     return res
 
 
-def _spawn(target, world_size: int, **kwds) -> list:
+def _spawn(target, world_size: int, timeout_s=SPAWN_TIMEOUT_S, **kwds) -> list:
     """*target* on every rank of a new spawn, with *kwds* and the rendezvous."""
     if world_size not in SUPPORTED_WORLDS:
         raise ValueError(f"unsupported world_size={world_size}")
@@ -1253,7 +1456,7 @@ def _spawn(target, world_size: int, **kwds) -> list:
             )
             for rank in range(world_size)
         ]
-        ranks = [fut.get(timeout=SPAWN_TIMEOUT_S) for fut in results]
+        ranks = [fut.get(timeout=timeout_s) for fut in results]
     except Exception:
         pool.terminate()
         raise
@@ -1673,6 +1876,103 @@ def test_quick_allreduce_transport(tokens, hidden, tp, algorithm, super_tile, bl
     }
 
 
+def _relay_key(
+    relay_fraction,
+    codec,
+    super_tile,
+    grid_cap=None,
+    min_bytes=0,
+    block=None,
+) -> tuple:
+    kw = {
+        "algorithm": "mesh",
+        "relay_devices": DEFAULT_RELAY,
+        "relay_fraction": tuple(relay_fraction),
+    }
+    if min_bytes is not None:
+        kw["relay_min_bytes"] = min_bytes
+    if codec != "int4":
+        kw.update(rs_codec=codec, ag_codec=codec)
+    if super_tile is not None:
+        kw["super_tile"] = super_tile
+    if grid_cap is not None:
+        kw["grid_cap"] = grid_cap
+    if block is not None:
+        kw["block"] = block
+    return _key(2, **kw)
+
+
+def _relay_case(tokens: int, hidden: int, codec: str, graph: bool, calls: int) -> tuple:
+    return (tokens, hidden, "exact" if codec == "fp16" else "normal", graph, calls)
+
+
+@benchmark()
+def test_quick_allreduce_relay(
+    tokens,
+    hidden,
+    codec,
+    graph=False,
+    relay_fraction=DEFAULT_RELAY_FRACTION,
+    super_tile=None,
+    grid_cap=None,
+    block=None,
+    min_bytes=0,
+    expect_relay=True,
+    calls=RELAY_CALLS,
+):
+    """TP2 relay against its direct twin on the same inputs (correctness)."""
+    exact = codec == "fp16"
+    rows = _result(
+        _relay_key(relay_fraction, codec, super_tile, grid_cap, min_bytes, block),
+        _relay_case(tokens, hidden, codec, graph, calls),
+    )
+    nbytes = tokens * hidden * 2
+    label = (
+        f"tp=2 relay={DEFAULT_RELAY} f={tuple(relay_fraction)} {codec} "
+        f"{tokens}x{hidden} st={super_tile} grid_cap={grid_cap} block={block} "
+        f"graph={graph}"
+    )
+    expected_st = super_tile or _shipping_st(rows, nbytes, "mesh", 2)
+    if exact:
+        _check(
+            label,
+            _identity_fails(rows, "mesh")
+            + [
+                f"rank {rank}: {row['n_mismatch']} mismatched elements, "
+                f"max |err| {row['max_abs_err']:.3e}"
+                for rank, row in enumerate(rows)
+                if row["n_mismatch"]
+            ],
+        )
+    else:
+        floor = MESH_PINNED_SQNR_MIN_DB.get(codec, SQNR_MIN_DB)
+        _check_sqnr(label, rows, floor=floor, expected_st=expected_st, algorithm="mesh")
+    _check(
+        label,
+        [
+            f"rank {rank}: relay output differs from direct in "
+            f"{row['relay_vs_direct_lanes']} bf16 lanes"
+            for rank, row in enumerate(rows)
+            if row["relay_vs_direct_lanes"]
+        ]
+        + [
+            f"rank {rank}: the relay engine "
+            f"{'did not run' if expect_relay else 'ran below its cutoff'} "
+            f"({row['variant']})"
+            for rank, row in enumerate(rows)
+            if bool(row["relay_used"]) != expect_relay
+        ],
+    )
+    return {
+        "gfx": ARCH,
+        "sqnr_db": min(r["sqnr_db"] for r in rows),
+        "lanes_differing": max(r["lanes_differing"] for r in rows),
+        "relay_vs_direct_lanes": max(r["relay_vs_direct_lanes"] for r in rows),
+        "relay_used": all(r["relay_used"] for r in rows),
+        "variant": rows[0]["variant"],
+    }
+
+
 @benchmark()
 def test_quick_allreduce_run_ahead(tokens, hidden, tp, algorithm):
     """Back-to-back calls with new inputs, under rank skew; correctness only."""
@@ -1690,6 +1990,51 @@ def test_quick_allreduce_run_ahead(tokens, hidden, tp, algorithm):
         "calls": rows[0]["calls"],
         "lanes_differing": max(r["lanes_differing"] for r in rows),
         "sqnr_db": min(r["sqnr_db"] for r in rows),
+    }
+
+
+@benchmark()
+def test_quick_allreduce_setup_failure(tp, fault):
+    """A ``_StEngine`` setup step failing on one rank fails engine construction
+    on every rank.
+
+    ``SETUP_FAULT_RANK`` fails *fault* while the host builds its engines. Gates:
+    every rank raises a RuntimeError naming that rank and the injected error,
+    none is left waiting in an exchange, and a clean engine then builds on
+    every rank. The time to the raise is reported, not asserted.
+    """
+    label = f"tp={tp} setup fault={fault} on rank {SETUP_FAULT_RANK}"
+    try:
+        rows = _spawn(
+            _run_setup_fault_rank,
+            tp,
+            timeout_s=SETUP_FAULT_TIMEOUT_S,
+            fault=fault,
+        )
+    except Exception as exc:  # noqa: BLE001
+        why = str(exc) or f"no result within {SETUP_FAULT_TIMEOUT_S} s"
+        _check(label, [f"spawn failed: {type(exc).__name__}: {why}"])
+        return {"gfx": ARCH, "fault": fault, "raised_on_all": False, "rebuilt": False}
+    expected = (
+        f"rank {SETUP_FAULT_RANK}: RuntimeError: "
+        f"injected {SETUP_FAULTS[fault]} failure"
+    )
+    fails = []
+    for rank, row in enumerate(rows):
+        err = row["err"]
+        if err is None:
+            fails.append(f"rank {rank}: the engine built")
+        elif not err.startswith("RuntimeError: ") or expected not in err:
+            fails.append(f"rank {rank}: raised {err!r}, expected {expected!r}")
+        if row["rebuild_err"] is not None:
+            fails.append(f"rank {rank}: rebuild failed: {row['rebuild_err']}")
+    _check(label, fails)
+    return {
+        "gfx": ARCH,
+        "fault": fault,
+        "raised_on_all": all(r["err"] for r in rows),
+        "max raise s": max(r["s"] for r in rows),
+        "rebuilt": not any(r["rebuild_err"] for r in rows),
     }
 
 
@@ -1936,6 +2281,61 @@ def _verify(args, tps, algos, dts, link) -> None:
         if fill == "outlier":
             _register(key, (tokens, hidden, fill, False, DEFAULT_DIVISOR))
 
+    relay = []
+    if (
+        2 in tps
+        and "mesh" in algos
+        and dts
+        and link == "xgmi"
+        and torch.cuda.device_count() >= 4
+    ):
+        base_relay = list(RELAY_CASES)
+        if args.extended:
+            base_relay += list(EXTENDED_RELAY_CASES)
+        relay += [(*row, 0, True, RELAY_CALLS) for row in base_relay]
+        default_cutoff = MESH_RELAY_DEFAULTS.get((link, 2, ARCH))
+        if default_cutoff is not None:
+            hidden = 5120
+            at = default_cutoff[0] // (hidden * 2)
+            relay += [
+                (
+                    tokens,
+                    hidden,
+                    "int4",
+                    False,
+                    default_cutoff[1],
+                    None,
+                    None,
+                    None,
+                    None,
+                    used,
+                    calls,
+                )
+                for tokens, used, calls in (
+                    (at - 1, False, RELAY_CALLS),
+                    (at, True, RELAY_CALLS),
+                    (at + 16, True, RELAY_CALLS),
+                    (at - 1, False, 1),
+                )
+            ]
+    for (
+        tokens,
+        hidden,
+        codec,
+        graph,
+        fraction,
+        st,
+        grid_cap,
+        block,
+        floor,
+        _expect,
+        calls,
+    ) in relay:
+        _register(
+            _relay_key(fraction, codec, st, grid_cap, floor, block),
+            _relay_case(tokens, hidden, codec, graph, calls),
+        )
+
     def _rows(cases):
         return [
             test_quick_allreduce(
@@ -1995,6 +2395,17 @@ def _verify(args, tps, algos, dts, link) -> None:
         [
             test_quick_allreduce_transport(tokens, hidden, tp, algorithm, st, block)
             for tp, algorithm, tokens, hidden, st, block in transport
+        ],
+    )
+    _summarize(
+        "flydsl quick allreduce TP2 relay",
+        [test_quick_allreduce_relay(*row) for row in relay],
+    )
+    _summarize(
+        "flydsl quick allreduce engine setup failure",
+        [
+            test_quick_allreduce_setup_failure(2, fault)
+            for fault in (SETUP_FAULTS if 2 in tps else ())
         ],
     )
     os.environ["AITER_QUICK_REDUCE_QUANTIZATION"] = HIP_QR_REGIME
@@ -2220,8 +2631,6 @@ def main():
 
 if __name__ == "__main__":
     freeze_support()
-    from time import perf_counter
-
     start = perf_counter()
     main()
     end = perf_counter()

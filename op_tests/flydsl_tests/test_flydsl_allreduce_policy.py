@@ -35,7 +35,12 @@ from aiter.ops.flydsl.allreduce_policy import (
     ring_st_ladder,
 )
 from aiter.ops.flydsl.kernels.comm.one_shot_allreduce import SUPPORTED_ATOMS
-from aiter.ops.flydsl.kernels.comm.quick_allreduce_mesh import SUPER_TILES
+from aiter.ops.flydsl.kernels.comm.quick_allreduce_mesh import (
+    RELAY_MAX_DEN,
+    SUPER_TILES,
+    check_relay,
+    make_quick_allreduce_mesh_kernel,
+)
 from aiter.ops.flydsl.kernels.comm.quick_allreduce_ring import RING_SUPER_TILES
 from aiter.ops.flydsl.one_shot_allreduce import resolve_oneshot_max_bytes
 
@@ -274,6 +279,36 @@ def test_ladder_rungs_fall_inside_their_dispatch_window(cell):
             assert r.min_bytes < mesh.max, ("mesh", cell, r)
     # Ring rungs are offsets into an unbounded window, so only the ordering
     # above constrains them.
+
+
+@pytest.mark.parametrize("relay", [(1, 4), (3, 8), (1, 2), (5, 8), (3, 4), (1, 1)])
+def test_check_relay_accepts_valid_fractions(relay):
+    assert check_relay(relay) == relay
+
+
+@pytest.mark.parametrize(
+    "relay", [(0, 2), (3, 2), (1, RELAY_MAX_DEN + 1), (1, 0), (-1, 2)]
+)
+def test_check_relay_rejects_out_of_range(relay):
+    with pytest.raises(ValueError):
+        check_relay(relay)
+
+
+@pytest.mark.parametrize(
+    "kw",
+    [
+        {"world_size": 4, "rank": 0},
+        {"world_size": 2, "rank": -1},
+        {"world_size": 2, "rank": 0, "inbox_memory": "finegrained"},
+    ],
+)
+def test_relay_factory_rejects_unsupported_configs(kw):
+    with pytest.raises(ValueError):
+        make_quick_allreduce_mesh_kernel(
+            grid=128,
+            relay=(1, 2),
+            **{"inbox_memory": "uncached", "codec": "int4", **kw},
+        )
 
 
 def _env(**kw):

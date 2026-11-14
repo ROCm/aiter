@@ -27,6 +27,12 @@ logger = logging.getLogger("aiter")
 INBOX_MEMORY_MODES = ("auto", "uncached", "finegrained")
 
 
+def _raise_on_rank_failures(errors) -> None:
+    failures = UncachedIpcHeap.rank_failures(errors)
+    if failures:
+        raise RuntimeError(f"_StEngine setup failed: {failures}")
+
+
 def _cuda_index(device, *, owner: str) -> int:
     """The CUDA device index of *device*. *owner* names the caller in errors."""
     if isinstance(device, str):
@@ -78,6 +84,7 @@ class _StEngine:
         rank: int,
         world_size: int,
         inbox_flags: int,
+        extra_ptrs: tuple[int, ...] = (),
     ):
         self.spec = spec
         self.launch = spec["launch"]
@@ -95,46 +102,45 @@ class _StEngine:
         self._meta_ptr = None
         self._gpu_peer_ptrs = None
         self._colors = None
-        # Setup has two collectives, the handle exchange and a final agreement.
-        # A rank that fails must still take part in both, and report the
-        # failure through them. If it raised at once, its peers would wait in a
-        # collective that it never joins, and they would hang. The error is
-        # raised on every rank after the agreement.
+        try:
+            self._build(group, rank, world_size, inbox_flags, extra_ptrs)
+        except Exception:
+            self.close()
+            raise
+
+    def _build(self, group, rank, world_size, inbox_flags, extra_ptrs) -> None:
+        # Exchange each rank-local phase's outcome before any rank can raise.
         error = None
         try:
             # The inbox is the only allocation peers write into, so it is the
             # only one whose memory type matters for fabric throughput.
             self._buf_ptr = UncachedIpcHeap.alloc(
-                self.buf_bytes, inbox_flags, fill=spec.get("inbox_fill", 0)
+                self.buf_bytes, inbox_flags, fill=self.spec.get("inbox_fill", 0)
             )
             my_meta = (UncachedIpcHeap.get_mem_handle_bytes(self._buf_ptr), 0)
-        except Exception as e:  # noqa: BLE001
-            error = e
+        except Exception as exc:  # noqa: BLE001
+            error = f"{type(exc).__name__}: {exc}"
             my_meta = (None, 0)
+        all_meta = UncachedIpcHeap.gather_object_list_via_broadcast(
+            group, (error, *my_meta)
+        )
+        _raise_on_rank_failures([m[0] for m in all_meta])
+
+        error = None
         try:
-            all_meta = UncachedIpcHeap.gather_object_list_via_broadcast(group, my_meta)
-        except Exception:
-            self.close()
-            raise
+            self._open_peers(
+                [(handle, off) for _, handle, off in all_meta],
+                rank=rank,
+                world_size=world_size,
+                extra_ptrs=extra_ptrs,
+            )
+        except Exception as exc:  # noqa: BLE001
+            error = f"{type(exc).__name__}: {exc}"
+        _raise_on_rank_failures(
+            UncachedIpcHeap.gather_object_list_via_broadcast(group, error)
+        )
 
-        if error is None:
-            try:
-                if any(handle is None for handle, _off in all_meta):
-                    raise RuntimeError(
-                        "a peer rank failed to allocate its inbox, which has "
-                        f"{self.buf_bytes} B"
-                    )
-                self._open_peers(all_meta, rank=rank, world_size=world_size)
-            except Exception as e:  # noqa: BLE001
-                error = e
-
-        ok = torch.tensor([0 if error is not None else 1], dtype=torch.int32)
-        dist.all_reduce(ok, op=dist.ReduceOp.MIN, group=group)
-        if error is not None or not ok.item():
-            self.close()
-            raise error or RuntimeError("a peer rank failed to set up its engine")
-
-    def _open_peers(self, all_meta, *, rank: int, world_size: int):
+    def _open_peers(self, all_meta, *, rank: int, world_size: int, extra_ptrs=()):
         """Open the peers' inboxes and upload the pointer table and the colours."""
         peer_ptrs = [0] * world_size
         for r in range(world_size):
@@ -146,7 +152,8 @@ class _StEngine:
                 self._peer_bases[r] = base
                 peer_ptrs[r] = base + off
 
-        peer_bytes = world_size * 8
+        table = (*peer_ptrs, *extra_ptrs)
+        peer_bytes = len(table) * 8
         color_bytes = self.grid * 4
         # Peer-pointer table and per-block colours: written by the host once
         # and by this rank's own kernel, never by a peer. Stays uncached in
@@ -157,7 +164,7 @@ class _StEngine:
         self._colors = self._meta_ptr + peer_bytes
         UncachedIpcHeap.copy_host_to_device(
             self._gpu_peer_ptrs,
-            (ctypes.c_int64 * world_size)(*peer_ptrs),
+            (ctypes.c_int64 * len(table))(*table),
             peer_bytes,
         )
         UncachedIpcHeap.copy_host_to_device(

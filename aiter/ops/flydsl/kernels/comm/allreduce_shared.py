@@ -93,6 +93,14 @@ _RECV_POLICY = _CM_SC0 | _CM_SC1
 # * recv: ``sc0 sc1``. The payload loads go past L1 and L2 to memory.
 # * fanout: "sector".
 #
+# ``acquire`` and ``recv`` are one decision and must change together. A
+# workgroup-scope acquire invalidates nothing, so it is only safe when ``recv``
+# makes every payload load bypass L1 and L2 (``sc0 sc1``) -- ``nt`` is a reuse
+# hint, not a bypass, and could be answered from a line cached by an earlier
+# call into the same slot. A system-scope acquire is what makes ``nt`` safe.
+# The mesh's relay blocks are the exception: they read the bounce with plain
+# loads behind an agent-scope acquire, see ``_RELAY_RECV_CM`` there.
+#
 # Fine-grained inbox
 # ------------------
 # This memory type is cacheable. A retired store can stay in the L2 of the
@@ -263,10 +271,10 @@ def _buffer_store(ptr, elem_off, vec, cache_modifier=0):
     fx.copy(atom, reg, fx.make_view(ptr + elem_off, fx.make_layout(vec.numel, 1)))
 
 
-def _load_peers(peer_ptrs, world_size):
-    """The ``world_size`` inbox base addresses from the device-side peer table."""
+def _load_peers(peer_ptrs, n):
+    """The first ``n`` addresses of the device-side peer table."""
     table = _buffer_ptr(peer_ptrs, T.i64, 8)
-    return [_buffer_load(table, i, 1, fx.Int64)[0] for i in range(world_size)]
+    return [_buffer_load(table, i, 1, fx.Int64)[0] for i in range(n)]
 
 
 def _color_io(colors_ptr, bid):
