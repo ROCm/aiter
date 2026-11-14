@@ -1557,6 +1557,9 @@ def _compile_moe_sorting_multiphase(
 
             # Step 3: Write sorted_expert_ids for THIS expert (using local_idx_p23 for EP)
             # Store local_idx to LDS cumsum[tid], barrier, read cumsum[my_expert]
+            # Every wave read my_start / my_end from cumsum above; wait for all
+            # waves before cumsum[tid] is overwritten with local indices.
+            gpu.barrier()
             _lds_store_raw(cumsum_mr, local_idx_p23, tid)
             # For E > K4_BLOCK: thread 0 extends local_idx using cumsum[K4_BLOCK-1].
             # Barrier ensures all threads have written before thread 0 reads.
