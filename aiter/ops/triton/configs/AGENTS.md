@@ -221,6 +221,7 @@ there is no file. Do not change the returned dict.
 | `A8W4` | `triton` | `bm<block_m>_n<N>_k<K>` | `BLOCK_SIZE_N`, `BLOCK_SIZE_K`, `num_warps`, `num_stages`, `waves_per_eu`, `matrix_instr_nonkdim` |
 | `A8W4` | `gluon` | `bm<block_m>_n<N>_k<K>_<bucket>`, then `bm<block_m>_any` | `block_n`, `block_k`, `num_buffers`, `num_warps`, `persistent_iters` |
 | `A4W4` | `gluon` | `bm<block_m>_n<N>_k<K>_<bucket>`, then `bm<block_m>_any` | `block_n`, `block_k`, `num_buffers`, `num_warps` |
+| `MOE-MXFP4-BI` | `gluon` | one key per kernel: `block_m`, `route`, `gemm`, `gu_bm<block_m>`, `w2_bm<block_m>`, `combine`, `tree8` | `block_n`, `block_k`, `num_buffers`, `n_first`, `w_swz`, `mma_k`, `zero_rows`, `num_warps`, `num_stages` and the kernel's tile sizes (`bh`, `br`, `bn`, `bs`, `blk`); `block_m`: `block_m_small`, `block_m_large`, `rows_small`, `token_block` |
 
 - `block_m` is the key. Do not put `BLOCK_SIZE_M` or `block_m` in an entry.
 - `<bucket>` comes from `m2bucket()`: `tiny` (M ≤ 8), `small` (M ≤ 32),
