@@ -59,6 +59,33 @@ def _hip_blockscale_supported() -> bool:
         return False
 
 
+# The FlyDSL block-scale kernel is gfx942 only: it emits v_mfma_f32_16x16x32_fp8_fp8.
+_FLYDSL_BLOCKSCALE_ARCHES = frozenset({"gfx942"})
+
+
+def _flydsl_blockscale_supported() -> bool:
+    """True if the FlyDSL block-scale kernel supports the running arch."""
+    try:
+        return get_gfx() in _FLYDSL_BLOCKSCALE_ARCHES
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def _flydsl_blockscale_offsets_fit(m: int, n: int, k: int, kernel_name: str) -> bool:
+    """True if the shape stays within the named FlyDSL kernel's 32-bit offsets.
+
+    The padded tuned-row lookup serves every M above 8192 from an M = 8192 row, so a
+    shape past the limit can still name a FlyDSL kernel. An unparsable name passes.
+    """
+    from .flydsl.gemm_tune.flydsl_gemm_a8w8_blockscale_bpreshuffle_common import (
+        offsets_fit,
+        parse_kernel_name,
+    )
+
+    kernel_config = parse_kernel_name(kernel_name)
+    return kernel_config is None or offsets_fit(m, n, k, kernel_config.tile_m)
+
+
 def _ck_a8w8_supported() -> bool:
     """The CK/asm INT8 a8w8 GEMM ships gfx9 (CDNA) code objects only; other
     arches (e.g. RDNA gfx11/gfx12) must fall back to the Triton kernel."""
@@ -1489,6 +1516,55 @@ def gemm_a8w8_blockscale_bpreshuffle_fake(
     return torch.empty(XQ.shape[0], WQ.shape[0], dtype=dtype, device=XQ.device)
 
 
+def gemm_a8w8_blockscale_bpreshuffle_flydsl(
+    XQ: Tensor,
+    WQ: Tensor,
+    x_scale: Tensor,
+    w_scale: Tensor,
+    out: Tensor,
+    config: dict,
+) -> Tensor:
+    """FlyDSL blockscale bpreshuffle GEMM.
+
+    Matches gemm_a8w8_blockscale within fp8 block-scale tolerance, not bit for bit.
+    WQ must already be shuffled and x_scale K-major, as for the CK and asm branches.
+
+    The config's kernelName picks the kernel, split included (the splitK column is not
+    read).
+
+    Raises RuntimeError when the shape or FlyDSL install cannot serve the call, or when
+    config names no kernel of this family. Dispatch sends shapes past the kernel's
+    32-bit offsets to CK before calling this; as in the rowwise flydsl branch, it does
+    not catch the other errors.
+    """
+    from .flydsl.gemm_kernels import flydsl_gemm_a8w8_blockscale_bpreshuffle
+    from .flydsl.gemm_tune.flydsl_gemm_a8w8_blockscale_bpreshuffle_common import (
+        parse_kernel_name,
+    )
+
+    kernel_name = str(config.get("kernelName", ""))
+    kernel_config = parse_kernel_name(kernel_name)
+    if kernel_config is None:
+        raise RuntimeError(
+            f"[FlyDSL] tuned row names no block-scale bpreshuffle kernel: "
+            f"{kernel_name!r}"
+        )
+    return flydsl_gemm_a8w8_blockscale_bpreshuffle(
+        XQ,
+        WQ,
+        x_scale,
+        w_scale,
+        out,
+        kernel_config.tile_m,
+        kernel_config.tile_n,
+        kernel_config.tile_k,
+        use_cshuffle_epilog=kernel_config.use_cshuffle_epilog,
+        use_async_copy=kernel_config.use_async_copy,
+        num_waves=kernel_config.num_waves,
+        split_k=kernel_config.split_k,
+    )
+
+
 @functools.lru_cache(maxsize=1024)
 def _warn_blockscale_asm_row_not_bf16(n: int, k: int, dtype: torch.dtype):
     logger.warning(
@@ -1768,10 +1844,23 @@ def gemm_a8w8_blockscale_bpreshuffle(
                 w_scale=w_scale,
                 family="a8w8_blockscale_bpreshuffle",
             )
-        elif libtype == "flydsl" and kernelName.startswith("flydsl_blockscale_8w_"):
-            return gemm_a8w8_blockscale_flydsl(
-                XQ, WQ, x_scale, w_scale, Y, config, isBpreshuffled=True
-            )
+        elif libtype == "flydsl":
+            # Two FlyDSL families serve fp32-scale rows, told apart by kernelName:
+            # "flydsl_blockscale_8w_" is gfx950, "flydsl_blockscale_bpreshuffle_" is
+            # gfx942. Any other name, the gfx942 kernel on another arch, or a shape
+            # past its 32-bit offsets falls through to CK.
+            if kernelName.startswith("flydsl_blockscale_8w_"):
+                return gemm_a8w8_blockscale_flydsl(
+                    XQ, WQ, x_scale, w_scale, Y, config, isBpreshuffled=True
+                )
+            if (
+                kernelName.startswith("flydsl_blockscale_bpreshuffle_")
+                and _flydsl_blockscale_supported()
+                and _flydsl_blockscale_offsets_fit(m, n, k, kernelName)
+            ):
+                return gemm_a8w8_blockscale_bpreshuffle_flydsl(
+                    XQ, WQ, x_scale, w_scale, Y, config
+                )
     try:
         return gemm_a8w8_blockscale_bpreshuffle_ck(XQ, WQ, x_scale, w_scale, Y)
     except RuntimeError as e:
