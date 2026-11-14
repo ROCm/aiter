@@ -264,7 +264,9 @@ class TunerCommon:
             "'power' (experimental; aliases: efficiency, power_efficiency) "
             "ranks by package energy (us * PPT watts), measured from the GPU PPT "
             "sysfs node (power1_input) over AITER_POWER_WINDOW_S seconds "
-            "(default 0.4) while the kernel launches back to back, on the "
+            "(default 0.4) while a CUDA graph of the kernel replays back to "
+            "back (eager launches when it cannot be captured; the temporary "
+            "rollback switch AITER_POWER_GRAPH=0 forces them), on the "
             "accurate pass only. It adds no latency "
             "bound, and the score is an isolated replay under the clock and "
             "power cap in effect, so the winner can change in another model "
@@ -444,7 +446,7 @@ class TunerCommon:
             results[name] = value
         # watts / tflops_per_w are power-tune columns. They stay off the
         # latency CSV schema, which is the column list a latency tune writes.
-        power_columns = ("watts", "tflops_per_w") + POWER_ROW_COLUMNS
+        power_columns = ("watts", "tflops_per_w", "power_sample") + POWER_ROW_COLUMNS
         missing = [
             c for c in power_columns if c in results.columns and c not in self.columns
         ]
@@ -693,7 +695,7 @@ class TunerCommon:
 
         # Power columns exist only on power-tuned rows; a latency result frame
         # without them stays valid.
-        optional = ("watts", "tflops_per_w") + POWER_ROW_COLUMNS
+        optional = ("watts", "tflops_per_w", "power_sample") + POWER_ROW_COLUMNS
         missing = [
             c for c in self.columns if c in optional and c not in df_updates.columns
         ]
@@ -819,7 +821,8 @@ class TunerCommon:
         for el in rets:
             info, us, max_err_ratio = el
             watts = getattr(el, "watts", float("nan"))
-            grouped_rets[info[0]].append((info[1:], us, max_err_ratio, watts))
+            sample = getattr(el, "power_sample", "")
+            grouped_rets[info[0]].append((info[1:], us, max_err_ratio, watts, sample))
 
         grouped_results = list(grouped_rets.items())
 
@@ -828,14 +831,14 @@ class TunerCommon:
             # Drop invalid candidates before sorting: a NaN timing makes every
             # comparison False, so sorting first leaves the list out of order.
             valid_time = [
-                (info_ex, us, max_err_ratio, watts)
-                for info_ex, us, max_err_ratio, watts in time_list
+                (info_ex, us, max_err_ratio, watts, sample)
+                for info_ex, us, max_err_ratio, watts, sample in time_list
                 if max_err_ratio <= tol_err_ratio and math.isfinite(us) and us > 0
             ]
             filtered_time = [
-                (info_ex, round(us, 4), max_err_ratio, watts)
-                for info_ex, us, max_err_ratio, watts in sorted(
-                    valid_time, key=lambda x: policy.rank(x[1], x[3])
+                (info_ex, round(us, 4), max_err_ratio, watts, sample)
+                for info_ex, us, max_err_ratio, watts, sample in sorted(
+                    valid_time, key=lambda x: policy.rank(x[1], x[3], x[4])
                 )
             ]
             if len(filtered_time) == 0:
@@ -848,8 +851,10 @@ class TunerCommon:
                 print(f"choose {effective_topk} kernels")
             self.topk = effective_topk
             best_config = [
-                TuneResult((info_key, *info_ex), us, max_err_ratio, watts)
-                for info_ex, us, max_err_ratio, watts in filtered_time[0:effective_topk]
+                TuneResult((info_key, *info_ex), us, max_err_ratio, watts, sample)
+                for info_ex, us, max_err_ratio, watts, sample in filtered_time[
+                    0:effective_topk
+                ]
             ]
             if not best_config:
                 logger.info(f"No kernel can be used for {info_key}")

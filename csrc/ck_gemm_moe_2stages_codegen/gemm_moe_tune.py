@@ -451,21 +451,25 @@ def _numeric_column(frame, name, default=float("nan")):
     return pd.to_numeric(frame[name], errors="coerce")
 
 
+def _text_column(frame, name):
+    if name not in frame.columns:
+        return pd.Series("", index=frame.index, dtype="object")
+    return frame[name].fillna("").astype(str)
+
+
 def _frame_keeping_watts(columns, results):
     """Build the tuned frame without dropping a power measurement.
 
     ``DataFrame(..., columns=self.columns)`` keeps only the latency schema.
-    Grouped and MXFP4 winners carry ``watts`` on the dict, and dropping it
-    made the following stamp publish ``select=power`` with a null reading.
+    Grouped and MXFP4 winners carry ``watts`` (and ``power_sample``) on the
+    dict, and dropping it made the following stamp publish ``select=power``
+    with a null reading.
     """
     kept = list(columns)
-    if (
-        results
-        and isinstance(results[0], dict)
-        and "watts" in results[0]
-        and "watts" not in kept
-    ):
-        kept.append("watts")
+    if results and isinstance(results[0], dict):
+        for name in ("watts", "power_sample"):
+            if name in results[0] and name not in kept:
+                kept.append(name)
     return pd.DataFrame(results, columns=kept)
 
 
@@ -491,6 +495,13 @@ def rank_moe_pairs(profile_df, policy):
         for a, b, c, d in zip(us1, watts1, us2, watts2, strict=True)
     ]
     frame["energy"] = pd.Series(energy, index=frame.index).round(1)
+    # A pair ranks with eager readings when either stage that ran was eager.
+    sample1 = _text_column(frame, "power_sample1")
+    sample2 = _text_column(frame, "power_sample2").where(us2 > 0, "")
+    frame["power_sample"] = [
+        "eager" if "eager" in (a, b) else ("graph" if "graph" in (a, b) else "")
+        for a, b in zip(sample1, sample2, strict=True)
+    ]
     us = _numeric_column(frame, "us")
     if us.isna().all() and "us1" in frame.columns:
         us = us1
@@ -5690,7 +5701,13 @@ class FmoeTuner(TunerCommon):
         for el in results:
             info, us, max_err_ratio = el
             grouped_rets[tuple(info[0])].append(
-                (info[1:], us, max_err_ratio, getattr(el, "watts", float("nan")))
+                (
+                    info[1:],
+                    us,
+                    max_err_ratio,
+                    getattr(el, "watts", float("nan")),
+                    getattr(el, "power_sample", ""),
+                )
             )
         grouped_results = grouped_rets.items()
         for key, rets in grouped_results:
@@ -5714,7 +5731,7 @@ class FmoeTuner(TunerCommon):
             import re
 
             profileDF = []
-            for tail, us, err, watts in rets:
+            for tail, us, err, watts, power_sample in rets:
                 stage = tail[0]
                 kernelName = tail[1]
                 block_m = tail[2]
@@ -5755,6 +5772,7 @@ class FmoeTuner(TunerCommon):
                         v2_flag,
                         nt_flag,
                         watts,
+                        power_sample,
                     ]
                 )
 
@@ -5775,12 +5793,13 @@ class FmoeTuner(TunerCommon):
                     "v2",
                     "nt",
                     "watts",
+                    "power_sample",
                 ],
             )
             # Stage watts are a power-tune column; the latency profile files
             # keep main's schema.
             if not policy.measures_power:
-                profileDF = profileDF.drop(columns="watts")
+                profileDF = profileDF.drop(columns=["watts", "power_sample"])
             prorfiles.append(profileDF)
 
             dump_tag = _candidate_dump_tag(
@@ -5853,6 +5872,7 @@ class FmoeTuner(TunerCommon):
                     "tflops": "tflops1",
                     "bw": "bw1",
                     "watts": "watts1",
+                    "power_sample": "power_sample1",
                 }
             )
             stage1_profileDF = self._pair_nt_agnostic(stage1_profileDF, "kernelName1")
@@ -5867,6 +5887,7 @@ class FmoeTuner(TunerCommon):
                     "tflops": "tflops2",
                     "bw": "bw2",
                     "watts": "watts2",
+                    "power_sample": "power_sample2",
                 }
             )
             stage2_profileDF = self._pair_nt_agnostic(stage2_profileDF, "kernelName2")
@@ -5892,6 +5913,7 @@ class FmoeTuner(TunerCommon):
                     "tflops": "tflops1",
                     "bw": "bw1",
                     "watts": "watts1",
+                    "power_sample": "power_sample1",
                 }
             )
             empty_1stage_profileDF = pd.DataFrame(index=asm_1stage_profileDF.index)
@@ -5903,6 +5925,7 @@ class FmoeTuner(TunerCommon):
             empty_1stage_profileDF["bw2"] = 0
             if "watts1" in asm_1stage_profileDF.columns:
                 empty_1stage_profileDF["watts2"] = float("nan")
+                empty_1stage_profileDF["power_sample2"] = ""
             asm_1stage_profileDF = pd.concat(
                 [asm_1stage_profileDF, empty_1stage_profileDF], axis=1
             )

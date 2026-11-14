@@ -11,6 +11,8 @@ import os
 import threading
 import time
 
+from aiter.utility.tune_result import EAGER_SAMPLE, GRAPH_SAMPLE, PowerReading
+
 logger = logging.getLogger(__name__)
 
 
@@ -398,14 +400,26 @@ def kernel_call(func, args, kwargs):
 
 def measure_kernel(
     call, device_index: int | None = None, kernel_us: float | None = None
-) -> float:
-    """Package watts while ``call`` launches back to back.
+) -> PowerReading:
+    """Package watts while ``call`` runs back to back, tagged with how they were sampled.
 
     This is the one place a tune reads package power. ``call`` launches the
     kernel the timer measured and nothing else. ``kernel_us`` is that call's
-    timed GPU time; with it the reading is corrected for host launch gaps
-    (``active_watts``). NaN means the sensor could not be read, the call
-    raised, or the window was too idle to tell.
+    timed GPU time; without it one warm call is timed here (``_time_call_us``).
+
+    The call is captured into a CUDA graph holding ~GRAPH_SPAN_US of work and
+    the graph is replayed, so the window holds the kernel with no host launch
+    gaps; the reading's ``sample`` is ``graph``. Capture fails only for a call
+    that synchronizes with the host (for example ``.item()`` or a copy to the
+    CPU). CPU-side work in the call does not fail capture: it runs once while
+    capturing and is not part of the replay. A call that fails capture is
+    launched eagerly instead, the reading is corrected for launch gaps
+    (``active_watts``), and its ``sample`` is ``eager``; ranking keeps eager
+    readings behind graph readings.
+    ``AITER_POWER_GRAPH=0`` is a temporary rollback switch to the eager path
+    while graph sampling is new; it is not a tuning knob. NaN (with an empty
+    ``sample``) means the sensor could not be read, the call raised, or the
+    window was too idle to tell.
     """
     if device_index is None:
         try:
@@ -414,12 +428,117 @@ def measure_kernel(
             device_index = int(torch.cuda.current_device())
         except Exception:  # noqa: BLE001
             device_index = 0
+    kernel_us = _positive(kernel_us)
     try:
-        return float(
-            measure_package_watts(
-                call, device_index=device_index, kernel_us=_positive(kernel_us)
-            )
+        if kernel_us is None:
+            kernel_us = _time_call_us(call)
+        captured = _capture_graph(call, kernel_us) if _graph_enabled() else None
+        if captured is not None:
+            graph, launches = captured
+            try:
+                return _reading(
+                    measure_package_watts(
+                        graph.replay,
+                        device_index=device_index,
+                        kernel_us=None if kernel_us is None else kernel_us * launches,
+                    ),
+                    GRAPH_SAMPLE,
+                )
+            finally:
+                _sync_cuda()
+                graph.reset()
+        return _reading(
+            measure_package_watts(call, device_index=device_index, kernel_us=kernel_us),
+            EAGER_SAMPLE,
         )
     except Exception as exc:  # noqa: BLE001
         logger.warning("package power measurement failed: %s", exc)
-        return float("nan")
+        return PowerReading(float("nan"))
+
+
+def _reading(watts, sample: str) -> PowerReading:
+    watts = float(watts)
+    return PowerReading(watts, "" if math.isnan(watts) else sample)
+
+
+# GPU work captured per graph. A replay's own launch costs ~10-20 us, so ~1 ms
+# of kernels keeps that under ~2% of the window.
+GRAPH_SPAN_US = 1000.0
+# Bounds capture time and graph memory for sub-microsecond calls.
+GRAPH_MAX_LAUNCHES = 1000
+# Samples run in mp_tuner workers, so each process logs its own path once:
+# graph replay on first use, and each distinct capture failure.
+_graph_logged = False
+_capture_failures: set[str] = set()
+
+
+def _graph_enabled() -> bool:
+    # Rollback switch for the graph-replay default; remove once it has been
+    # validated beyond MI355X.
+    return os.environ.get("AITER_POWER_GRAPH", "1").strip() not in ("0", "false")
+
+
+def _time_call_us(call) -> float | None:
+    """One warm call's wall time on the GPU stream, in us, for a caller without ``us``.
+
+    Host work inside the call counts too, so for a launch-bound call this is
+    an upper bound on its GPU time. None when CUDA is unavailable.
+    """
+    try:
+        import torch
+
+        if not torch.cuda.is_available():
+            return None
+    except Exception:  # noqa: BLE001
+        return None
+    call()
+    torch.cuda.synchronize()
+    start = torch.cuda.Event(enable_timing=True)
+    end = torch.cuda.Event(enable_timing=True)
+    start.record()
+    call()
+    end.record()
+    end.synchronize()
+    return _positive(start.elapsed_time(end) * 1e3)
+
+
+def _capture_graph(call, kernel_us: float | None):
+    """``(graph, launches)`` replaying ``call`` for ~GRAPH_SPAN_US, or None.
+
+    None means the call could not be captured; it is logged once per reason
+    and the caller samples the eager loop instead.
+    """
+    global _graph_logged
+    try:
+        import torch
+
+        from aiter.utility.cuda_graph import capture
+
+        if not torch.cuda.is_available():
+            return None
+        launches = (
+            max(1, min(GRAPH_MAX_LAUNCHES, int(GRAPH_SPAN_US / kernel_us)))
+            if kernel_us
+            else 1
+        )
+        graph = capture(call, repeats=launches, warmups=2)
+        graph.replay()
+        torch.cuda.synchronize()
+        if not _graph_logged:
+            _graph_logged = True
+            logger.info(
+                "package power: sampling each candidate by CUDA graph replay "
+                "(rollback: AITER_POWER_GRAPH=0 samples eager launches)"
+            )
+        return graph, launches
+    except Exception as exc:  # noqa: BLE001
+        reason = f"{type(exc).__name__}: {str(exc).splitlines()[0][:160] if str(exc) else ''}"
+        if reason not in _capture_failures:
+            _capture_failures.add(reason)
+            logger.warning(
+                "package power: graph capture failed (%s); sampling eager "
+                "launches with the launch-gap correction",
+                reason,
+            )
+        _sync_cuda()
+        return None
