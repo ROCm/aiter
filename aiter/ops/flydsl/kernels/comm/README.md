@@ -48,6 +48,30 @@ wire format. The default is INT4 with one E5M2 scale for each group of 16
 values. INT5 and INT6 use the same scale and add more bits for each value. FP16
 sends the values without quantization and is used in testing.
 
+The mesh also runs one lap on its own, for sequence parallelism.
+`FlyQuickAllReduce.reduce_scatter(inp, out)` leaves each rank a contiguous
+block of rows of the sum, and `all_gather(inp, out)` concatenates the ranks'
+blocks. Both use INT4, `super_tile=1`, the 32 KiB tile (the payload is a whole
+number of tiles) and the inbox and colors of the all-reduce's `super_tile=1`
+engine. The reduce-scatter
+quantizes a rank's own partial too, which the all-reduce does not, so a row's
+value does not depend on which rank owns it. They are validated on the
+`uncached` inbox only.
+
+`compile_sp(full, shard)` is a collective preflight: every rank calls it, with
+the same sizes, before CUDA graph capture. It loads both builds, checks that
+every block of their grids fits the device at once (the kernels are persistent
+and spin on their peers' flags), and agrees the call and the sizes across
+the ranks. If a rank fails or differs, every rank raises, where a rank
+that went on would poll its peers' flags forever. No launch is accepted until it
+has passed; the first eager call runs it, and it cannot run under graph
+capture. Later shapes must agree across ranks too. Launches and graph replays
+on one communicator must run in one serialized device order. The single-phase
+modes, and the all-reduce sizes that the ladder gives the same `super_tile=1`
+engine, share that engine's colors and inbox slots, so calls on independent
+streams need an event dependency; one order for all launches holds for every
+ladder.
+
 ### Ring
 
 The ring is also a two-shot all-reduce. The ranks make a cycle. In each step,
@@ -222,8 +246,8 @@ If the `AITER_CUSTOM_AR_*` window and the one-shot window do not overlap,
 
 ## Tests and benchmarks
 
-Two multi-GPU tests check and time the kernels. The `--scenario` option selects
-what a test does:
+Two multi-GPU tests check and time the all-reduce kernels. The `--scenario`
+option selects what a test does:
 
 - `verify` is the default. It checks correctness and times the FlyDSL kernels.
 - `bench` compares the FlyDSL kernels with the stock kernels on the same
@@ -233,6 +257,10 @@ what a test does:
 |---|---|---|
 | `op_tests/multigpu_tests/test_flydsl_one_shot_allreduce.py` | One-shot | `cdr` and `cdr_naive`, the `CustomAllreduce` kernels with `use_new` on and off, and `rccl` |
 | `op_tests/multigpu_tests/test_flydsl_quick_allreduce.py` | Mesh and ring | `hip`, the HIP `QuickAllReduce` kernel at the INT4 regime |
+
+`op_tests/multigpu_tests/test_flydsl_quick_reduce_scatter_all_gather.py` checks
+and times `reduce_scatter` and `all_gather`. It takes `--tp` and `-s` but no
+`--scenario`.
 
 A test fails if the arch is not supported, or if a world size that you name
 with `--tp` needs more GPUs than the node has. The default sweep skips the world
