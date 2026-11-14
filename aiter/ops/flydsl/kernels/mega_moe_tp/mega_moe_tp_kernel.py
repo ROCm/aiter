@@ -790,15 +790,19 @@ def compile_bigm_kernel(
         # U(k) = the first unit slot of every CTA, UB(k) the rest: chunk k+1's input rows run
         # between them and its routing plan right after, so chunk k+1's units fill the CTAs
         # chunk k's last unit round leaves idle
+        # (ar, topk + 1 > 9: Kimi K3.1) chunk k-1's reduce right after its long topk sum: its
+        # y gather then runs under chunk k's units instead of after them (K3.1 ar 32k -6%; with
+        # few routes per token the reduce's CTAs spin on the reduce-scatter: M3.1 / DSV4.1 slower)
+        RFE = tailq == 3 and K1 > 9
         ORDER = prep(0)
         for k in range(C):
             ORDER += [(k, P_U)]
             if k >= 1:
-                ORDER += [(k - 1, P_RQ)]
+                ORDER += [(k - 1, P_RQ)] + ([(k - 1, P_RF)] if RFE else [])
             if k + 1 < C:
                 ORDER += [(k + 1, P_RB)]
             ORDER += [(k, P_UB)]
-            if k >= 1:
+            if k >= 1 and not RFE:
                 ORDER += [(k - 1, P_RF)]
             if k + 1 < C:
                 ORDER += [(k + 1, P_S1), (k + 1, P_S2), (k + 1, P_S3)]
@@ -833,7 +837,7 @@ def compile_bigm_kernel(
 
     name = (
         f"bigm_kernel_h{H}_i{I}_e{E}k{K}_tp{tp}_c{C}_rg{RG}_{fb(eps)}{'g' if gemma else 'r'}"
-        + f"_v38_t{tailq}_c1h{NSBA}_o{ORD}s{NSB}a{UA}d{RQD}r{R8}w{SXW}e{E4}b{BS2}"
+        + f"_v39_t{tailq}_c1h{NSBA}_o{ORD}s{NSB}a{UA}d{RQD}r{R8}w{SXW}e{E4}b{BS2}"
         + f"n{NAB}q{SRT}"
         + ("_eb" if EB else "")
         + ("_xl" if XL else "")
