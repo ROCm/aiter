@@ -121,6 +121,29 @@ COMPUTE_CASES = (
     ),
 )
 
+# (b, m, n, k, kernelName, other kernelName): wo_a on two compute kernels. A compute kernel must run as fast right
+# after another compute kernel as it does back to back (it prefetches its own code, see prefetch_kernel_code).
+SWITCH_CASES = (
+    (
+        8,
+        1344,
+        1024,
+        4096,
+        "flydsl_mxfp8_32_bpreshuffle_compute_wmma_t256x256x128_mw2_nw2_nb2_sk1_cm1_cn4",
+        "flydsl_mxfp8_32_bpreshuffle_compute_wmma_t256x256x128_mw2_nw2_nb2_sk1_cm1_cn1",
+    ),
+    (
+        8,
+        1344,
+        1024,
+        4096,
+        "flydsl_mxfp8_32_bpreshuffle_compute_wmma_t256x256x128_mw2_nw2_nb2_sk1_cm2_cn2",
+        "flydsl_mxfp8_32_bpreshuffle_compute_wmma_t128x256x128_mw2_nw2_nb3_sk1_cm1_cn2",
+    ),
+)
+# Alternating vs back to back: 1.03 measured with the prefetch, 1.4+ without.
+SWITCH_RATIO_MAX = 1.10
+
 # ATOM quantize_fp8's fp8 finite bound. The fused epilogue must match it.
 _FP8_MAX = 448.0
 
@@ -559,6 +582,41 @@ def _run_fused_quant(shapes):
     print("fused quant epilogue ALL BIT-EXACT")
 
 
+@benchmark()
+def test_compute_switch_penalty(
+    b, m, n, k, kernel_name, other_kernel_name, dtype=dtypes.bf16
+):
+    """Two compute kernels run alternately must cost what they cost back to back."""
+    torch.manual_seed(SEED)
+    x8, xs8 = quant_act_e8m0(blockwise_randn(m, b, k, dtype=dtype), 32)
+    w8, ws8 = quant_weight_e8m0(blockwise_randn(b, n, k, dtype=dtype), 32, 32)
+    w8 = shuffle_weight(w8)
+    out = torch.empty((m, b, n), dtype=dtype)
+    fns = [
+        functools.partial(run_bmm_a8w8_mxfp8, x8, w8, xs8, ws8, out, kernel_name=name)
+        for name in (kernel_name, other_kernel_name)
+    ]
+
+    def alternate():
+        fns[0]()
+        fns[1]()
+
+    _, us_a = run_perftest(fns[0])
+    _, us_b = run_perftest(fns[1])
+    _, us_ab = run_perftest(alternate)
+    assert us_ab <= SWITCH_RATIO_MAX * (us_a + us_b), (
+        f"{kernel_name} then {other_kernel_name}: {us_ab:.1f} us alternating vs "
+        f"{us_a:.1f} + {us_b:.1f} us back to back"
+    )
+    return {
+        "gfx": get_gfx(),
+        "compute us": us_a,
+        "compute TFLOPS": 2 * b * m * n * k / us_a / 1e6,
+        "other compute us": us_b,
+        "alternating us": us_ab,
+    }
+
+
 def summarize(title: str, rows: list) -> None:
     df = pd.DataFrame(rows)
     aiter.logger.info("%s (markdown):\n%s", title, df.to_markdown(index=False))
@@ -631,6 +689,10 @@ def main():
         summarize(
             "batched_gemm a8w8 on explicit compute kernelNames",
             [test_batched_gemm_a8w8_compute(*case) for case in COMPUTE_CASES],
+        )
+        summarize(
+            "compute kernels run alternately vs back to back",
+            [test_compute_switch_penalty(*case) for case in SWITCH_CASES],
         )
 
     if epilogue_only:
