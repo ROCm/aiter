@@ -93,12 +93,15 @@ void ck_moe_stage1(torch::Tensor &hidden_states,     // [m, k], input token
     const bool clamp_enabled = swiglu_limit > 0.0 && std::isfinite(swiglu_limit);
     TORCH_CHECK(!clamp_enabled ||
                     (activation == static_cast<int>(ActivationType::Silu) &&
-                     quant_type == static_cast<int>(QuantType::per_1x128) &&
+                     (quant_type == static_cast<int>(QuantType::per_1x128) ||
+                      quant_type == static_cast<int>(QuantType::per_Token) ||
+                      quant_type == static_cast<int>(QuantType::per_Tensor)) &&
                      splitk.value_or(1) <= 1 &&
                      (kernelName.empty() ||
                       (kernelName.find("_silu_") != std::string::npos &&
                        kernelName.find("Splitk") == std::string::npos))),
-                "Runtime SiLU clamp requires non-split per_1x128 CK SiLU");
+                "Runtime SiLU clamp requires non-split per_1x128 / per_Token / per_Tensor "
+                "CK SiLU");
     // std::cerr << __FILE__ << ":" << __LINE__ << " ck_moe_stage1 called!" << nt << " " << block_m.value() << std::endl;
     const at::hip::OptionalHIPGuardMasqueradingAsCUDA device_guard(device_of(out));
     at::hip::getCurrentHIPStream();

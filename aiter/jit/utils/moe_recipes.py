@@ -177,7 +177,7 @@ def get_moe_ck2stages_prebuild_variants(aiter_csrc_dir: str) -> list[dict]:
         runtime_swiglu_limit = (
             _has_runtime_swiglu_limit(row)
             and activation == "silu"
-            and quant_type == "per_1x128"
+            and quant_type in ("per_1x128", "per_token", "per_tensor")
             and a_dtype == "f8"
             and b_dtype == "f8"
         )

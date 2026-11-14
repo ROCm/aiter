@@ -10,7 +10,7 @@ from ..jit.core import AITER_CSRC_DIR, compile_ops
 from ..jit.utils.moe_recipes import MOE_MODULE_ABI_TAG
 from ..utility import dtypes
 from .enum import ActivationType, QuantType
-from .moe_limits import normalize_swiglu_limit
+from .moe_limits import RUNTIME_SILU_LIMIT_QUANT_TYPES, normalize_swiglu_limit
 
 torch.int4 = getattr(torch, "int4", torch.uint32)
 
@@ -646,11 +646,12 @@ def get_moe_stage_module(
         Adtype != "f8"
         or Bdtype != "f8"
         or act != "silu"
-        or quant_type != QuantType.per_1x128
+        or quant_type not in RUNTIME_SILU_LIMIT_QUANT_TYPES
         or is_splitk
     ):
         raise ValueError(
-            "Runtime SwiGLU limit requires non-split FP8 per_1x128 CK SiLU"
+            "Runtime SwiGLU limit requires non-split FP8 per_1x128 / per_Token / "
+            "per_Tensor CK SiLU"
         )
     quant_type = str(quant_type).split(".")[-1].lower()
 
@@ -703,8 +704,13 @@ def ck_moe_stage1_fwd(
     if limit is not None:
         if quant_type == QuantType.per_128x128:
             quant_type = QuantType.per_1x128
-        if activation != ActivationType.Silu or quant_type != QuantType.per_1x128:
-            raise ValueError("Runtime clamp requires per_1x128 CK SiLU")
+        if (
+            activation != ActivationType.Silu
+            or quant_type not in RUNTIME_SILU_LIMIT_QUANT_TYPES
+        ):
+            raise ValueError(
+                "Runtime clamp requires per_1x128 / per_Token / per_Tensor CK SiLU"
+            )
         if kernelName and ("Splitk" in kernelName or "_silu_" not in kernelName):
             raise ValueError("Runtime clamp requires a non-split CK SiLU kernel")
         splitk = 0
