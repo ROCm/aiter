@@ -21,7 +21,15 @@
     "",
     "num_vgpr, launch_bounds[1] and cluster all appear in the generated symbol name",
     "(..._c{m}x{n}_p{slots}_v{vgpr}w{waves}[_{variant}]), which is simultaneously the",
-    ".co filename, the .co's extern \"C\" symbol and the host launcher symbol."
+    ".co filename, the .co's extern \"C\" symbol and the host launcher symbol.",
+    "",
+    "gfx950 entries (tag a4w4_mxfp4_nt_co: MXFP4 x MXFP4 NT, 1x32 e8m0 scales, 2x2 waves):",
+    "  kid            local to the a4w4/gfx950/CU namespace.",
+    "  wave_layout    [T_M, T_N] (2x2).",
+    "  variant        \"\" persistent, \"np\" one tile per block, \"sk\" split-K, \"nob\"",
+    "                 persistent without M/N boundary handling; also the name suffix:",
+    "                 opus_gemm_gfx950_a4w4_mxfp4_nt_co_{B_M}x{B_N}x{B_K}[_{variant}].",
+    "  block_size, tile, launch_bounds and device_flags as above."
   ],
   "gfx1250": [
     {
@@ -7944,6 +7952,404 @@
         2,
         2
       ]
+    }
+  ],
+  "gfx950": [
+    {
+      "kid": 0,
+      "tag": "a4w4_mxfp4_nt_co",
+      "block_size": 256,
+      "tile": [
+        256,
+        256,
+        256
+      ],
+      "wave_layout": [
+        2,
+        2
+      ],
+      "launch_bounds": [
+        256,
+        1
+      ],
+      "device_flags": [
+        "-ffast-math"
+      ],
+      "variant": ""
+    },
+    {
+      "kid": 1,
+      "tag": "a4w4_mxfp4_nt_co",
+      "block_size": 256,
+      "tile": [
+        256,
+        128,
+        256
+      ],
+      "wave_layout": [
+        2,
+        2
+      ],
+      "launch_bounds": [
+        256,
+        1
+      ],
+      "device_flags": [
+        "-ffast-math"
+      ],
+      "variant": ""
+    },
+    {
+      "kid": 2,
+      "tag": "a4w4_mxfp4_nt_co",
+      "block_size": 256,
+      "tile": [
+        128,
+        256,
+        256
+      ],
+      "wave_layout": [
+        2,
+        2
+      ],
+      "launch_bounds": [
+        256,
+        1
+      ],
+      "device_flags": [
+        "-ffast-math"
+      ],
+      "variant": ""
+    },
+    {
+      "kid": 3,
+      "tag": "a4w4_mxfp4_nt_co",
+      "block_size": 256,
+      "tile": [
+        128,
+        128,
+        256
+      ],
+      "wave_layout": [
+        2,
+        2
+      ],
+      "launch_bounds": [
+        256,
+        1
+      ],
+      "device_flags": [
+        "-ffast-math"
+      ],
+      "variant": ""
+    },
+    {
+      "kid": 4,
+      "tag": "a4w4_mxfp4_nt_co",
+      "block_size": 256,
+      "tile": [
+        192,
+        256,
+        256
+      ],
+      "wave_layout": [
+        2,
+        2
+      ],
+      "launch_bounds": [
+        256,
+        1
+      ],
+      "device_flags": [
+        "-ffast-math"
+      ],
+      "variant": ""
+    },
+    {
+      "kid": 5,
+      "tag": "a4w4_mxfp4_nt_co",
+      "block_size": 256,
+      "tile": [
+        256,
+        192,
+        256
+      ],
+      "wave_layout": [
+        2,
+        2
+      ],
+      "launch_bounds": [
+        256,
+        1
+      ],
+      "device_flags": [
+        "-ffast-math"
+      ],
+      "variant": ""
+    },
+    {
+      "kid": 10,
+      "tag": "a4w4_mxfp4_nt_co",
+      "block_size": 256,
+      "tile": [
+        256,
+        256,
+        256
+      ],
+      "wave_layout": [
+        2,
+        2
+      ],
+      "launch_bounds": [
+        256,
+        1
+      ],
+      "device_flags": [
+        "-ffast-math"
+      ],
+      "variant": "np"
+    },
+    {
+      "kid": 11,
+      "tag": "a4w4_mxfp4_nt_co",
+      "block_size": 256,
+      "tile": [
+        256,
+        128,
+        256
+      ],
+      "wave_layout": [
+        2,
+        2
+      ],
+      "launch_bounds": [
+        256,
+        1
+      ],
+      "device_flags": [
+        "-ffast-math"
+      ],
+      "variant": "np"
+    },
+    {
+      "kid": 12,
+      "tag": "a4w4_mxfp4_nt_co",
+      "block_size": 256,
+      "tile": [
+        128,
+        256,
+        256
+      ],
+      "wave_layout": [
+        2,
+        2
+      ],
+      "launch_bounds": [
+        256,
+        1
+      ],
+      "device_flags": [
+        "-ffast-math"
+      ],
+      "variant": "np"
+    },
+    {
+      "kid": 13,
+      "tag": "a4w4_mxfp4_nt_co",
+      "block_size": 256,
+      "tile": [
+        128,
+        128,
+        256
+      ],
+      "wave_layout": [
+        2,
+        2
+      ],
+      "launch_bounds": [
+        256,
+        1
+      ],
+      "device_flags": [
+        "-ffast-math"
+      ],
+      "variant": "np"
+    },
+    {
+      "kid": 14,
+      "tag": "a4w4_mxfp4_nt_co",
+      "block_size": 256,
+      "tile": [
+        192,
+        256,
+        256
+      ],
+      "wave_layout": [
+        2,
+        2
+      ],
+      "launch_bounds": [
+        256,
+        1
+      ],
+      "device_flags": [
+        "-ffast-math"
+      ],
+      "variant": "np"
+    },
+    {
+      "kid": 15,
+      "tag": "a4w4_mxfp4_nt_co",
+      "block_size": 256,
+      "tile": [
+        256,
+        192,
+        256
+      ],
+      "wave_layout": [
+        2,
+        2
+      ],
+      "launch_bounds": [
+        256,
+        1
+      ],
+      "device_flags": [
+        "-ffast-math"
+      ],
+      "variant": "np"
+    },
+    {
+      "kid": 21,
+      "tag": "a4w4_mxfp4_nt_co",
+      "block_size": 256,
+      "tile": [
+        256,
+        128,
+        256
+      ],
+      "wave_layout": [
+        2,
+        2
+      ],
+      "launch_bounds": [
+        256,
+        1
+      ],
+      "device_flags": [
+        "-ffast-math"
+      ],
+      "variant": "sk"
+    },
+    {
+      "kid": 22,
+      "tag": "a4w4_mxfp4_nt_co",
+      "block_size": 256,
+      "tile": [
+        128,
+        256,
+        256
+      ],
+      "wave_layout": [
+        2,
+        2
+      ],
+      "launch_bounds": [
+        256,
+        1
+      ],
+      "device_flags": [
+        "-ffast-math"
+      ],
+      "variant": "sk"
+    },
+    {
+      "kid": 23,
+      "tag": "a4w4_mxfp4_nt_co",
+      "block_size": 256,
+      "tile": [
+        128,
+        128,
+        256
+      ],
+      "wave_layout": [
+        2,
+        2
+      ],
+      "launch_bounds": [
+        256,
+        1
+      ],
+      "device_flags": [
+        "-ffast-math"
+      ],
+      "variant": "sk"
+    },
+    {
+      "kid": 24,
+      "tag": "a4w4_mxfp4_nt_co",
+      "block_size": 256,
+      "tile": [
+        192,
+        256,
+        256
+      ],
+      "wave_layout": [
+        2,
+        2
+      ],
+      "launch_bounds": [
+        256,
+        1
+      ],
+      "device_flags": [
+        "-ffast-math"
+      ],
+      "variant": "sk"
+    },
+    {
+      "kid": 25,
+      "tag": "a4w4_mxfp4_nt_co",
+      "block_size": 256,
+      "tile": [
+        256,
+        192,
+        256
+      ],
+      "wave_layout": [
+        2,
+        2
+      ],
+      "launch_bounds": [
+        256,
+        1
+      ],
+      "device_flags": [
+        "-ffast-math"
+      ],
+      "variant": "sk"
+    },
+    {
+      "kid": 30,
+      "tag": "a4w4_mxfp4_nt_co",
+      "block_size": 256,
+      "tile": [
+        256,
+        256,
+        256
+      ],
+      "wave_layout": [
+        2,
+        2
+      ],
+      "launch_bounds": [
+        256,
+        1
+      ],
+      "device_flags": [
+        "-ffast-math"
+      ],
+      "variant": "nob"
     }
   ]
 }

@@ -10,11 +10,13 @@ import torch
 from torch import Tensor
 
 from csrc.opus_gemm.opus_gemm_common import (
+    A4W4_TAGS,
     KernelKey,
     OpusGemmInstance,
     get_kernel_instance,
 )
 
+from . import gemm_op_a4w4 as _a4w4_family
 from . import gemm_op_a8w8 as _a8w8_family
 from . import gemm_op_a16w16 as _a16w16_family
 from . import launch_plan
@@ -84,6 +86,19 @@ def _resolve_contract(
             has_w_scale=has_w_scale,
         )
         return "a16w16", instance, _a16w16_family
+
+    if instance.kernel_tag in A4W4_TAGS:
+        _a4w4_family._validate_a4w4_public_contract(
+            kid=kid,
+            input_dtype=input_dtype,
+            weight_dtype=weight_dtype,
+            output_dtype=output_dtype,
+            layout=layout,
+            has_x_scale=has_x_scale,
+            has_w_scale=has_w_scale,
+            has_bias=has_bias,
+        )
+        return "a4w4", instance, _a4w4_family
 
     family = launch_plan._validate_a8w8_public_contract(
         kernel_tag=instance.kernel_tag,
@@ -205,6 +220,22 @@ def _opus_dispatch(
             route_arch=route_arch,
             route_cu_num=cu_num,
             instance=instance,
+        )
+
+    if family == "a4w4":
+        assert x_scale is not None and w_scale is not None
+        return family_module._launch_a4w4_public(
+            operation,
+            XQ,
+            WQ,
+            Y,
+            x_scale,
+            w_scale,
+            kid=kid,
+            split_k=split_k,
+            workspace=workspace,
+            arch=arch,
+            cu_num=cu_num,
         )
 
     if family == "a8w8_mxscale_bmm":

@@ -126,11 +126,26 @@ def generate_data(m, n, k, seed, device="cuda", dtype=dtypes.bf16):
     }
 
 
+def opus_candidates(M, N, K):
+    """gfx950 OPUS a4w4 kids as {instance name: local kid}; tuned rows store both."""
+    from aiter.ops.opus._arch import _device_arch_and_cu
+    from csrc.opus_gemm.opus_gemm_common import get_registry
+
+    if N % 16 or K % 256:
+        return {}
+    gfx, cu_num = _device_arch_and_cu(torch.cuda.current_device())
+    return {
+        inst.name: kid
+        for kid, inst in sorted(get_registry("a4w4", gfx, cu_num).items())
+        if inst.co_variant != "nob" or (M % inst.B_M == 0 and N % inst.B_N == 0)
+    }
+
+
 def preshuffle_candidates(M, N, K, backends, split_k):
     """Reuse the FlyDSL catalog; sweep Triton tiles/splits with replayable names."""
+    names = list(opus_candidates(M, N, K)) if "opus" in backends else []
     if M < 32 or N % 16 or K % 256:
-        return []
-    names = []
+        return names
     if "flydsl" in backends:
         from aiter.ops.flydsl.gemm_tune.flydsl_gemm_mxscale_preshuffle_common import (
             candidates_for,
@@ -203,8 +218,8 @@ class GemmA4W4BlockScaleTuner(GemmCommonTuner):
     def _setup_specific_arguments(self):
         self.parser.add_argument(
             "--backends",
-            default="ck,asm",
-            help="Comma-separated candidates: ck,asm,triton,flydsl (gfx950 preshuffle)",
+            default="ck,asm,opus",
+            help="Comma-separated candidates: ck,asm,opus,triton,flydsl (gfx950 preshuffle)",
         )
 
     def run_config(self, args):
@@ -321,7 +336,7 @@ class GemmA4W4BlockScaleTuner(GemmCommonTuner):
         ref_keys = ["x", "w", "x_scales", "w_scales"]
         seed = 0
         backends = set(args.backends.split(","))
-        if not backends or not backends <= {"ck", "asm", "triton", "flydsl"}:
+        if not backends or not backends <= {"ck", "asm", "opus", "triton", "flydsl"}:
             raise ValueError(f"Unknown --backends: {args.backends}")
         for shape_idx in range(len(untunedf)):
             row = untunedf.iloc[shape_idx]
@@ -431,10 +446,12 @@ class GemmA4W4BlockScaleTuner(GemmCommonTuner):
                     asm_kernels_id = asm_kernels_id + 1
 
                     total_kernel_nums = total_kernel_nums + 1
+            opus_kids = opus_candidates(M, N, K) if "opus" in backends else {}
             for candidate_id, name in enumerate(
                 preshuffle_candidates(M, N, K, backends, useSplitK)
             ):
-                info = ((gfx, cu_num, M, N, K), 100000 + candidate_id, 0, name)
+                kernel_id = opus_kids.get(name, 100000 + candidate_id)
+                info = ((gfx, cu_num, M, N, K), kernel_id, 0, name)
                 task.append(
                     (
                         info,
