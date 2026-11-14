@@ -1789,6 +1789,15 @@ namespace py = pybind11;
           py::arg("num_valid_ids"),                                      \
           py::arg("token_num"),                                          \
           py::arg("cols"));                                              \
+    m.def("mxfp4_zero_weight_routes",                                    \
+          &aiter::mxfp4_zero_weight_routes,                              \
+          py::arg("out"),                                               \
+          py::arg("scale"),                                             \
+          py::arg("sorted_ids"),                                        \
+          py::arg("sorted_weights"),                                    \
+          py::arg("num_valid_ids"),                                     \
+          py::arg("token_num"),                                         \
+          py::arg("topk"));                                             \
     m.def("partial_transpose",                                           \
           &aiter::partial_transpose,                                     \
           py::arg("out"),                                                \

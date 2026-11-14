@@ -1087,6 +1087,18 @@ def mxfp4_moe_sort_fwd(
 
 
 @compile_ops("module_quant", develop=True)
+def mxfp4_zero_weight_routes(
+    out: torch.Tensor,
+    scale: torch.Tensor,
+    sorted_ids: torch.Tensor,
+    sorted_weights: torch.Tensor,
+    num_valid_ids: torch.Tensor,
+    token_num: int,
+    topk: int,
+) -> None: ...
+
+
+@compile_ops("module_quant", develop=True)
 def fused_dynamic_mx_quant_moe_sort_hip(
     out: torch.Tensor,
     scales: torch.Tensor,
@@ -1339,6 +1351,10 @@ def fused_dynamic_mx_quant_moe_sort(
             )
         x = input.reshape(-1, input.shape[-1]).contiguous()
         out, scale = quant_mxfp4_hip(x, round_mode=mode, e8m0_shuffle=False)
+        if sorted_weights is not None and x.shape[0] == token_num * topk:
+            mxfp4_zero_weight_routes(
+                out, scale, sorted_ids, sorted_weights, num_valid_ids, token_num, topk
+            )
         return out, mxfp4_moe_sort_fwd(
             scale, sorted_ids, num_valid_ids, token_num, x.shape[-1]
         )

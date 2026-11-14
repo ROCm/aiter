@@ -3748,6 +3748,51 @@ __global__ void mxfp4_moe_sort_kernel(
         AITER_CHECK(false, "input last dim has exceeded the maximum value ", 16384);            \
     }
 
+__global__ void mxfp4_zero_weight_routes_kernel(
+    uint8_t* out, uint8_t* scale, const int32_t* sorted_ids,
+    const float* sorted_weights, const int32_t* num_valid_ids,
+    int token_num, int topk, int out_cols, int scale_cols)
+{
+    constexpr int lanes_per_route = 16;
+    const int64_t route = static_cast<int64_t>(blockIdx.x) * (blockDim.x / lanes_per_route)
+                          + threadIdx.x / lanes_per_route;
+    const int lane = threadIdx.x % lanes_per_route;
+    if(route >= num_valid_ids[0] || sorted_weights[route] != 0.0f)
+        return;
+    const uint32_t id = static_cast<uint32_t>(sorted_ids[route]);
+    const int token = id & 0xFFFFFF;
+    const int slot = id >> 24;
+    if(token >= token_num || (topk != 1 && slot >= topk))
+        return;
+    const int64_t row = topk == 1 ? token : static_cast<int64_t>(token) * topk + slot;
+    for(int col = lane; col < out_cols; col += lanes_per_route)
+        out[row * out_cols + col] = 0;
+    for(int col = lane; col < scale_cols; col += lanes_per_route)
+        scale[row * scale_cols + col] = 0;
+}
+
+void mxfp4_zero_weight_routes(
+    aiter_tensor_t& out, aiter_tensor_t& scale, const aiter_tensor_t& sorted_ids,
+    const aiter_tensor_t& sorted_weights, const aiter_tensor_t& num_valid_ids,
+    int token_num, int topk)
+{
+    AITER_CHECK(sorted_weights.dtype() == AITER_DTYPE_fp32,
+                __func__, " sorted_weights must be fp32");
+    AITER_CHECK(sorted_weights.numel() >= sorted_ids.size(0),
+                __func__, " sorted_weights must cover sorted_ids");
+    HipDeviceGuard device_guard(out.device_id);
+    const hipStream_t stream = aiter::getCurrentHIPStream();
+    constexpr int threads = 256;
+    const int blocks = (sorted_ids.size(0) + 15) / 16;
+    mxfp4_zero_weight_routes_kernel<<<blocks, threads, 0, stream>>>(
+        reinterpret_cast<uint8_t*>(out.data_ptr()),
+        reinterpret_cast<uint8_t*>(scale.data_ptr()),
+        reinterpret_cast<const int32_t*>(sorted_ids.data_ptr()),
+        reinterpret_cast<const float*>(sorted_weights.data_ptr()),
+        reinterpret_cast<const int32_t*>(num_valid_ids.data_ptr()),
+        token_num, topk, out.size(-1), scale.size(-1));
+}
+
 void mxfp4_moe_sort_hip(
     aiter_tensor_t& out_scale,
     const aiter_tensor_t& scale,
