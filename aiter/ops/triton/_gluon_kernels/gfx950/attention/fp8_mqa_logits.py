@@ -886,6 +886,7 @@ _gluon_fp8_mqa_logits_kernel_repr = make_kernel_repr(
         "M_CHUNK",
         "UNROLL",
         "RELAXED_STORE",
+        "PACKED",
         "HAS_KV_SPLIT",
     ],
 )
@@ -905,7 +906,8 @@ def _gluon_fp8_mqa_logits_kernel(
     weights_ptr,  # fp32   [seq_len, NUM_HEADS]
     cu_start_ptr,  # int32  [seq_len]
     cu_end_ptr,  # int32  [seq_len]
-    logits_ptr,  # fp32   [seq_len, seq_len_kv]
+    logits_ptr,  # fp32   [seq_len, seq_len_kv]; flat when PACKED
+    out_offsets_ptr,  # int32/int64 [seq_len]: each row's start when PACKED
     seq_len: gl.int32,
     seq_len_kv: gl.int32,
     num_kv_splits: gl.int32,  # runtime value to remove unexpected compilations
@@ -933,6 +935,7 @@ def _gluon_fp8_mqa_logits_kernel(
     UNROLL: gl.constexpr = 1,  # KV tiles per loop body (1 = backend default)
     RELAXED_STORE: gl.constexpr = 0,  # BLOCK_M > 1: drop the per-row store mask
     HAS_KV_SPLIT: gl.constexpr = 0,  # 1 when num_kv_splits > 1
+    PACKED: gl.constexpr = False,
 ):
 
     gl.static_assert(
@@ -942,6 +945,7 @@ def _gluon_fp8_mqa_logits_kernel(
     gl.static_assert(
         BLOCK_M == 1 or BLOCK_M == 2, "only BLOCK_M in {1, 2} is implemented"
     )
+    gl.static_assert(not PACKED or not RELAXED_STORE, "packed rows need exact masks")
     gl.static_assert(
         M_CHUNK == 0 or (NUM_HEADS % M_CHUNK == 0 and M_CHUNK >= MFMA_NONK_DIM),
         "M_CHUNK must divide NUM_HEADS and cover at least one MFMA M tile",
@@ -1119,9 +1123,15 @@ def _gluon_fp8_mqa_logits_kernel(
 
     # Bake row + start offsets into the base pointers
     kv_scales_ptr_seg = kv_scales_ptr + union_start
-    logits_ptr_row = (
-        logits_ptr + row_id * stride_logits_s + union_start * stride_logits_k
-    )
+    if PACKED:
+        row_base = gl.load(out_offsets_ptr + row_id).to(gl.int64) - start_ind
+        if BLOCK_M == 2:
+            next_base = gl.load(out_offsets_ptr + row_id + 1).to(gl.int64) - start_ind1
+            # The shared loop uses the distance between the two row bases.
+            stride_logits_s = next_base - row_base
+    else:
+        row_base = row_id * stride_logits_s
+    logits_ptr_row = logits_ptr + row_base + union_start * stride_logits_k
 
     mqa_logits_loop_double_buf(
         kv_loader,
