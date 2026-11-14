@@ -3540,11 +3540,12 @@ def _flydsl_v2_stage2_wrapper(
         )
     epilog = cfg["epilog"]
     ep32_native = (
-        cfg.get("ep32", False) and bm == 80
+        cfg.get("ep32", False) and bm in (80, 96)
         and out.shape[1] == 3584 and inter_dim == 3072 and not cfg["use_nt"]
         and os.environ.get("G2_OUTPUT_NATIVE", "1") == "1"
     )
     ep32_sorted_reduce = ep32_native or (cfg.get("ep32", False) and bm == 80 and os.environ.get("G2_OUTPUT_REDUCE", "0") == "1")
+    ep32_native_bf16 = ep32_native and bm == 96 and os.environ.get("G2_NATIVE_BF16", "1") == "1"
     if ep32_sorted_reduce:
         epilog = "reduce"
     max_sorted = inter_states.shape[0]
@@ -3590,9 +3591,9 @@ def _flydsl_v2_stage2_wrapper(
             )
     elif ep32_sorted_reduce:
         if reverse_sorted is None or expert_mask is None or topk_ids is None:
-            raise ValueError("BM80 sorted reduction requires EP reverse routes")
+            raise ValueError("BM80/BM96 sorted reduction requires EP reverse routes")
         target = _stage2_scratch(
-            "target", (max_sorted, model_dim_runtime), torch.float32 if ep32_native else out.dtype, out.device
+            "target", (max_sorted, model_dim_runtime), torch.bfloat16 if ep32_native_bf16 else (torch.float32 if ep32_native else out.dtype), out.device
         )
     elif epilog == "reduce":
         if _s2_fp8_inter:
@@ -3666,6 +3667,7 @@ def _flydsl_v2_stage2_wrapper(
         out_scale=target_scale,
         use_valid_token_count=use_valid_token_count,
         ep32=cfg.get("ep32", False),
+        native_bf16=ep32_native_bf16,
     )
     if _s2_fp4_scatter:
         aiter.mxfp4_moe_scatter_reduce_q(
@@ -3696,7 +3698,7 @@ def _flydsl_v2_stage2_wrapper(
         if ep32_native:
             from aiter.ops.flydsl.mxmoe_native_reduce import ep32_native_reduce
             ep32_native_reduce(target, reverse_sorted, sorted_weights, expert_mask,
-                topk_ids, num_valid_ids, out)
+                topk_ids, num_valid_ids, out, preweighted_bf16=ep32_native_bf16)
             return out
         # Remote routes were not written. Mask their reverse indices before
         # the existing gather/reduce, avoiding a clear of the staging buffer.
