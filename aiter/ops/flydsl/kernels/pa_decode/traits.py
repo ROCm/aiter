@@ -24,11 +24,12 @@ WAVE = 64
 MFMA_ACC_ELEMS = MFMA_MNK * MFMA_MNK // WAVE
 LOG2E = 1.4426950408889634
 KV_COMPUTE_BLOCK = 256
-MXFP4_V_BF16_CHUNK_BYTES = 16 * 16 * 16
 # Keeps the f32 O accumulator from overflowing; the epilogue undoes it.
 MXFP4_P_EXP_SHIFT = 20
 BF16_LDS_LIMIT_BYTES = 64 * 1024
 MXFP4_LDS_LIMIT_BYTES = 160 * 1024
+# M-tiles (16 query rows each) one MXFP4 CTA computes over a shared K/V tile.
+MXFP4_MAX_M_TILES = 4
 PAGE_ID_STAGE_LIMIT = 4096  # i32 page ids, 16 KiB of LDS.
 # gfx942 K/V streaming (PaDecodeTraits.STREAM_KV): lane K-row bytes from which
 # a single or two M-tiles stream on busy grids and from which every tile
@@ -136,6 +137,16 @@ def stage_page_capacity(
     return max(256, 1 << max(pages - 1, 0).bit_length())
 
 
+def mxfp4_query_splits(query_length, query_group_size):
+    """Fewest MXFP4 query splits (CTAs per KV head) that leave each CTA's query
+    rows within ``MXFP4_MAX_M_TILES`` M-tiles, or None."""
+    for splits in range(1, query_length + 1):
+        rows = query_length // splits * query_group_size
+        if not query_length % splits and rows <= MXFP4_MAX_M_TILES * MFMA_MNK:
+            return splits
+    return None
+
+
 def _bf16_lds_bytes(head_dim, query_rows, block_size):
     """Match the untuned BF16 Q/P alias and cross-wave scratch layout."""
     m_tiles = (query_rows + MFMA_MNK - 1) // MFMA_MNK
@@ -169,6 +180,7 @@ class PaDecodeCacheKey(NamedTuple):
     kv_dtype: object
     mask_unowned_kv: bool
     direct_output: bool
+    split_sequences: bool
     sparse_grid: bool
     gfx942_busy: bool
     gfx942_two_per_cu: bool
@@ -212,6 +224,7 @@ class PaDecodeSchedule:
         trans_k: bool = True,
         mask_unowned_kv: bool = True,
         direct_output: bool = False,
+        split_sequences: bool = False,
     ) -> PaDecodeSchedule:
         """Choose the existing policy from host-known grid and query bounds.
 
@@ -235,6 +248,10 @@ class PaDecodeSchedule:
             raise NotImplementedError(
                 "direct_output requires gfx1250, MXFP4 or a one-partition "
                 "gfx942/gfx950 plan"
+            )
+        if split_sequences and (kv_dtype != MXFP4_KV_DTYPE or direct_output):
+            raise NotImplementedError(
+                "split_sequences is the plan-free MXFP4 split, without direct_output"
             )
         # The MMAs read FP8 as the arch's format: FNUZ on gfx94x, OCP elsewhere
         # (gfx950, and gfx1250, whose schedule the tests still query).
@@ -371,6 +388,10 @@ class PaDecodeSchedule:
                     query_splits = 4
                 elif query_length % 2 == 0 and split_workgroups <= num_compute_units:
                     query_splits = 2
+            if kv_dtype == MXFP4_KV_DTYPE:
+                query_splits = (
+                    mxfp4_query_splits(query_length, query_group_size) or query_length
+                )
             if kv_dtype == fx.BFloat16:
                 # Native BF16 doubles Q's LDS footprint. Select the smallest
                 # split that fits, keeping the packed reducer rows unchanged.
@@ -390,7 +411,7 @@ class PaDecodeSchedule:
                         f"even with one query position per CTA: head_dim={head_dim}, "
                         f"query_group_size={query_group_size}"
                     )
-        if kv_dtype == fx.BFloat16:
+        if kv_dtype in (fx.BFloat16, MXFP4_KV_DTYPE):
             assert query_splits >= 1, "query_splits must be positive"
         else:
             assert query_splits in (1, 2, 4), "query_splits must be one of 1, 2, 4"
@@ -451,9 +472,14 @@ class PaDecodeSchedule:
                     "MXFP4 PA reads page ids from LDS: pass max_context_length "
                     "and keep the pages of a task within PAGE_ID_STAGE_LIMIT"
                 )
-            if block_size != 128 or head_dim != 128 or M_TILES != 1:
+            if (
+                block_size not in (16, 64, 128)
+                or head_dim not in (64, 128, 256)
+                or M_TILES > MXFP4_MAX_M_TILES
+            ):
                 raise NotImplementedError(
-                    "MXFP4 PA supports head_dim 128, block 128, one M-tile"
+                    "MXFP4 PA supports head_dim 64, 128 or 256, block 16, 64 or 128, "
+                    f"at most {MXFP4_MAX_M_TILES} M-tiles"
                 )
         # gfx942: more CTAs than CUs hold work, so occupancy outweighs a
         # single CTA's latency (V prefetch, STREAM_KV, WAVES_PER_EU_2).
@@ -577,6 +603,7 @@ class PaDecodeSchedule:
             kv_dtype=kv_dtype,
             mask_unowned_kv=bool(mask_unowned_kv),
             direct_output=direct_output,
+            split_sequences=split_sequences,
             # At most one CTA per CU: room for two four-wave groups per CTA.
             sparse_grid=split_workgroups * query_splits <= num_compute_units,
             gfx942_busy=gfx942_busy,
@@ -626,9 +653,12 @@ class PaDecodeTraits:
     OUT_DTYPE: type
     query_dtype: type
     DIRECT: bool
+    SPLIT_SEQUENCES: bool
     kv_dtype: type
     PV_BF16: bool
     sMxfp4VBf16_off: int
+    MXFP4_KB: int
+    MXFP4_V_CHUNK_BYTES: int
     KV_VECTOR_WIDTH: int
     QP_ELEM_BYTES: int
     Q_ABSMAX_F32: bool
@@ -747,6 +777,7 @@ class PaDecodeTraits:
         kv_dtype = cache_key.kv_dtype
         mask_unowned_kv = cache_key.mask_unowned_kv
         DIRECT = cache_key.direct_output
+        SPLIT_SEQUENCES = cache_key.split_sequences
         SPARSE_GRID = cache_key.sparse_grid
         gfx942_busy = cache_key.gfx942_busy
         gfx942_two_per_cu = cache_key.gfx942_two_per_cu
@@ -1064,6 +1095,9 @@ class PaDecodeTraits:
             f"be <= 8 or a multiple of 8"
         )
         QLOAD_UNIT = min(8, QCHUNK) if QCHUNK % 8 == 0 or QCHUNK <= 8 else 4
+        if query_dtype == fx.Float8E4M3FN:
+            # An e4m3 (MXFP4) query row chunk is 4, 8 or 16 bytes: one load.
+            QLOAD_UNIT = QCHUNK
         N_QLOADS = QCHUNK // QLOAD_UNIT
 
         VHE_CHUNKS = head_dim // (
@@ -1164,8 +1198,12 @@ class PaDecodeTraits:
         total_bytes += STAGE_PAGES * 4
         # Wave-private bf16 V staging for MXFP4; also holds the wave's O at the end.
         sMxfp4VBf16_off = (total_bytes + 15) // 16 * 16
+        # MXFP4 QK takes head_dim in 128-element K blocks (head_dim 64 pads one);
+        # a chunk's widened V is 16 tokens x head_dim bf16.
+        MXFP4_KB = max(head_dim // 128, 1)
+        MXFP4_V_CHUNK_BYTES = MFMA_MNK * head_dim * 2
         if kv_dtype == MXFP4_KV_DTYPE:
-            total_bytes = sMxfp4VBf16_off + NWARP * NCHUNK * MXFP4_V_BF16_CHUNK_BYTES
+            total_bytes = sMxfp4VBf16_off + NWARP * NCHUNK * MXFP4_V_CHUNK_BYTES
             if total_bytes > MXFP4_LDS_LIMIT_BYTES:
                 raise ValueError(
                     f"MXFP4 PA needs {total_bytes} LDS bytes, over the "
@@ -1209,9 +1247,12 @@ class PaDecodeTraits:
             OUT_DTYPE=OUT_DTYPE,
             query_dtype=query_dtype,
             DIRECT=DIRECT,
+            SPLIT_SEQUENCES=SPLIT_SEQUENCES,
             kv_dtype=kv_dtype,
             PV_BF16=PV_BF16,
             sMxfp4VBf16_off=sMxfp4VBf16_off,
+            MXFP4_KB=MXFP4_KB,
+            MXFP4_V_CHUNK_BYTES=MXFP4_V_CHUNK_BYTES,
             KV_VECTOR_WIDTH=KV_VECTOR_WIDTH,
             QP_ELEM_BYTES=QP_ELEM_BYTES,
             Q_ABSMAX_F32=Q_ABSMAX_F32,

@@ -57,6 +57,7 @@ def compile_pa_decode_ps_reduce(
     pairs: bool = False,
     parallel_groups: int = 1,
     num_xcds: int = 0,
+    kernarg_preload: bool = False,
 ):
     """Build PA decode's partitioned-softmax reducer.
 
@@ -79,6 +80,8 @@ def compile_pa_decode_ps_reduce(
 
     ``pairs`` gives each lane two adjacent bf16/f16 elements (D % 128 == 0, a
     four-byte aligned base and even strides); output stores stay scalar.
+    ``kernarg_preload`` selects the gfx950 entry whose leading pointer slot
+    carries ``reduce_info``; the launch wrapper retains its argument order.
     ``num_xcds`` > 0 launches a 1-D grid that gives each XCD a contiguous run
     of CTAs; the launch then needs ``rows_magic`` and ``seq_magic`` =
     ceil(2**30 / d) for d = rows and rows * KV heads, valid while
@@ -89,6 +92,8 @@ def compile_pa_decode_ps_reduce(
     architecture = (architecture or get_gfx_runtime()).split(":", 1)[0]
     if architecture not in ("gfx942", "gfx950", "gfx1250", "gfx1250-strict"):
         raise NotImplementedError(f"PA decode reducer does not support {architecture}")
+    if kernarg_preload and architecture != "gfx950":
+        raise ValueError("explicit reducer kernarg preload requires gfx950")
     wave = 32 if architecture in ("gfx1250", "gfx1250-strict") else WAVE
     register_partitions = min(REGISTER_PARTITIONS, wave)
     max_cta_waves = MAX_CTA_WAVES * WAVE // wave
@@ -184,6 +189,8 @@ def compile_pa_decode_ps_reduce(
         kernel_name += f"_g{groups}"
     if num_xcds:
         kernel_name += f"_xcd{num_xcds}"
+    if kernarg_preload:
+        kernel_name += "_preload"
 
     @flyc.kernel(name=kernel_name, known_block_size=block)
     def pa_decode_reduce_kernel(
@@ -208,6 +215,10 @@ def compile_pa_decode_ps_reduce(
         rows_magic: fx.Int32,
         seq_magic: fx.Int32,
     ):
+        if fx.const_expr(kernarg_preload):
+            # The leading slot carries the first dependent read's metadata.
+            # The launch wrapper swaps these two slots on this path only.
+            output_ptr, reduce_info_ptr = reduce_info_ptr, output_ptr
         if fx.const_expr(num_xcds > 0):
             # Hardware deals linear workgroup ids round-robin over XCDs. Give
             # each XCD a contiguous run of (sequence, KV head, row) so rows
@@ -622,7 +633,7 @@ def compile_pa_decode_ps_reduce(
         query_rows = query_seq_len * fx.Int32(query_group_size)
         num_ctas = batch_size * num_kv_heads * query_rows
         pa_decode_reduce_kernel(
-            output,
+            reduce_info if fx.const_expr(kernarg_preload) else output,
             exp_sums,
             max_logits,
             logits,
@@ -636,7 +647,7 @@ def compile_pa_decode_ps_reduce(
             stride_logits_head,
             stride_logits_part,
             stride_logits_group,
-            reduce_info,
+            output if fx.const_expr(kernarg_preload) else reduce_info,
             query_rows,
             num_kv_heads,
             num_ctas,
@@ -652,12 +663,16 @@ def compile_pa_decode_ps_reduce(
             stream=stream,
         )
 
-    if architecture in ("gfx1250", "gfx1250-strict"):
-        # All 108 argument bytes preload into user SGPRs, so the first load
-        # is reduce_info.
+    if architecture in ("gfx1250", "gfx1250-strict") or kernarg_preload:
+        # The gfx950 entry exposes reduce_info in its leading preload slot.
+        # Keep the established preload count on the gfx1250 paths.
         launch_pa_decode_ps_reduce_kernel.compile_hints["llvm_options"] = {
             "amdgpu-kernarg-preload": AITER_FLYDSL_KERNARG_PRELOAD,
-            "amdgpu-kernarg-preload-count": AITER_FLYDSL_KERNARG_PRELOAD_COUNT,
+            "amdgpu-kernarg-preload-count": (
+                min(16, AITER_FLYDSL_KERNARG_PRELOAD_COUNT)
+                if kernarg_preload
+                else AITER_FLYDSL_KERNARG_PRELOAD_COUNT
+            ),
         }
     return {
         "launch": launch_pa_decode_ps_reduce_kernel,

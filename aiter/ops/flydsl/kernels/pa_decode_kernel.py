@@ -28,10 +28,11 @@ with resident Q and fused PV accumulation; D256 is limited to 32 query rows.
 Page16 BF16 caches at these dimensions retain vector-8 packing in LDS while
 using the 64-token pipeline.
 
-MXFP4 K/V (``kv_dtype=dtypes.fp4x2``, gfx950, head_dim 128, page 128, one query token a
-row) share this scaffolding and have their own tile: QK is one scaled MFMA (fp4 K x
-e4m3 Q), V is widened to bf16 through wave-private LDS. A wave owns 64 tokens of the
-tile and all dims, so the tile loop has no barrier; the waves merge once after it.
+MXFP4 K/V (``kv_dtype=dtypes.fp4x2``, gfx950, head_dim 64, 128 or 256, pages of
+16, 64 or 128, up to four 16-row M-tiles a CTA) share this scaffolding and have
+their own tile: QK is a scaled MFMA (fp4 K x e4m3 Q) per M-tile and 128-dim
+block, V is widened to bf16 through wave-private LDS once for all M-tiles. A wave
+owns 64 tokens of the tile and all dims, so the tile loop has no barrier; the waves merge once after it.
 
 Logical layouts (not preshuffled):
 
@@ -195,6 +196,7 @@ def compile_pa_decode_tile(
     cluster_seqs: int = 1,
     cluster_steps: bool = False,
     cluster_runs: bool = False,
+    split_sequences: bool = False,
 ):
     """Select and cache a PA-decode kernel and launch wrapper.
 
@@ -247,6 +249,14 @@ def compile_pa_decode_tile(
     of P CTAs (see ``compile_gfx1250_pa_decode``); plans must give every
     sequence at most P tasks.
 
+    ``split_sequences`` (gfx950, MXFP4): no plan -- ``work_info`` is the int32
+    context lengths -- and the grid's x extent is the batch times the launch's
+    ``split_count`` S (``split_magic`` = ceil(2**30 / S), exact for at most 2**30 /
+    S**2 tiles and slots; other kernels take 1 and 0): slot
+    b * S + s takes the s-th run of ceil(T / S) of sequence b's T tiles (possibly
+    empty) and writes its packed partial at that slot. Slot b * S also writes the
+    reducer's ``reduce_info`` row b (first slot, nonempty runs) as two int32 just
+    past the packed sums in ``psum``.
     Pages past the sequence are pinned to block 0 and the unwritten tail of the
     last owned page is read as is. On gfx942/gfx950 with ``mask_unowned_kv``
     (the default), a sequence's last tile zeroes V bytes and K/V scales at or
@@ -324,6 +334,7 @@ def compile_pa_decode_tile(
         trans_k=trans_k,
         mask_unowned_kv=mask_unowned_kv,
         direct_output=direct_output,
+        split_sequences=split_sequences,
     )
     cached = _PA_DECODE_TILE_CACHE.get(schedule.cache_key)
     if cached is not None:
@@ -416,6 +427,8 @@ def compile_pa_decode_tile(
             traits.stage_page_capacity if traits.kv_dtype == MXFP4_KV_DTYPE else 0
         ),
     ) + ("_dual" if traits.DUAL_GROUP else "")
+    if traits.SPLIT_SEQUENCES:
+        kernel_name += "_split"
 
     @flyc.jit
     def _pa_decode_tile_body(
@@ -435,6 +448,8 @@ def compile_pa_decode_tile(
         stride_q_head: fx.Int32,
         work_info_ptr: fx.Pointer,
         num_sequences: fx.Int32,
+        split_count: fx.Int32,
+        split_magic: fx.Int32,
     ):
         def _run_task(seq, start, end, context):
             _pa_decode_tile_task(
@@ -490,6 +505,16 @@ def compile_pa_decode_tile(
                         fx.full(8, 0.0, traits.OUT_DTYPE), fx.add_offset(out, offset)
                     )
 
+        def _window_first_tile(context):
+            # The first tile with a token of the MTP window union, as plans start.
+            if const_expr(traits.sliding_window > 0):
+                # The span folds to one constant within int32, so no underflow.
+                first = context - min(
+                    traits.sliding_window + traits.query_length - 1, 2**31 - 1
+                )
+                return (first > 0).select(first, 0) // KV_COMPUTE_BLOCK
+            return fx.Int32(0)
+
         # Skip cleared padding records: no scratch writes or Q loads.
         # This CTA-uniform guard keeps every task barrier convergent.
         slot = fx.Int32(gpu.block_id("y" if traits.SPLIT_MAJOR else "x"))
@@ -511,28 +536,50 @@ def compile_pa_decode_tile(
                 _run_task(fx.Int32(task[0]), start, end, fx.Int32(task[3]))
             if count == 0:
                 _zero_rows(slot)
+        elif const_expr(traits.SPLIT_SEQUENCES):
+            # No plan: ``work_info`` is the context lengths. Sequence b's tiles
+            # split into near-equal runs over slots b * S .. b * S + S - 1. S and
+            # M = ceil(2**30 / S) preload: n // S is n * M >> 30 for the n here.
+            def _split_div(n):
+                return fx.Int32((fx.Int64(n) * fx.Int64(split_magic)) >> 30)
+
+            seq = _split_div(slot)
+            run = slot - seq * split_count
+            context = fx.Int32(fx.ptr_load(fx.add_offset(work, seq)))
+            end_tile = (context + (KV_COMPUTE_BLOCK - 1)) // KV_COMPUTE_BLOCK
+            first = _window_first_tile(context)
+            tiles = end_tile - first
+            per_run = _split_div(tiles + split_count - 1)
+            start = first + run * per_run
+            end = fx.min(start + per_run, end_tile)
+            if start < end:
+                _run_task(seq, start, end, context)
+            # reduce_info row b, past the packed sums of every KV head.
+            owner = (run == 0) & (fx.Int32(gpu.block_id("y")) == 0)
+            if owner & (fx.Int32(gpu.thread_id("x")) == 0):
+                sums = (
+                    num_sequences
+                    * split_count
+                    * (fx.Int32(gpu.grid_dim.y) // traits.query_splits)
+                    * traits.TOTAL_ROWS
+                )
+                runs = (per_run > 0).select(
+                    (tiles + per_run - 1) // fx.max(per_run, 1), 0
+                )
+                fx.ptr_store(
+                    fx.Vector.from_elements([slot, runs], dtype=fx.Int32),
+                    fx.add_offset(fx.recast_iter(fx.Int32, psum_ptr), sums + seq * 2),
+                )
         elif const_expr(traits.DIRECT):
             # One task per sequence, no plan: ``work_info`` is the context lengths.
             context = fx.Int32(fx.ptr_load(fx.add_offset(work, slot)))
             # Page ids past the staged window come from the block table.
             end = (context + (KV_COMPUTE_BLOCK - 1)) // KV_COMPUTE_BLOCK
             if end > 0:
-                _run_task(slot, fx.Int32(0), end, context)
+                _run_task(slot, _window_first_tile(context), end, context)
             else:
                 # An empty row has no reduce kernel to zero-fill it.
-                tid = fx.Int32(gpu.thread_id("x"))
-                head = tid // (traits.head_dim // 8)
-                if head < traits.query_group_size:
-                    out = fx.recast_iter(traits.OUT_DTYPE, pout_ptr)
-                    offset = (
-                        slot * stride_q_row
-                        + (fx.Int32(gpu.block_id("y")) * traits.query_group_size + head)
-                        * stride_q_head
-                        + tid % (traits.head_dim // 8) * 8
-                    )
-                    fx.ptr_store(
-                        fx.full(8, 0.0, traits.OUT_DTYPE), fx.add_offset(out, offset)
-                    )
+                _zero_rows(slot)
         else:
             task = fx.ptr_load(
                 fx.add_offset(work, slot * 4),
@@ -557,6 +604,8 @@ def compile_pa_decode_tile(
             num_sequences: fx.Int32,
             stride_q_row: fx.Int32,
             stride_q_head: fx.Int32,
+            split_count: fx.Int32,
+            split_magic: fx.Int32,
             pmax_ptr: fx.Pointer,
             key_cache_ptr: fx.Pointer,
             value_cache_ptr: fx.Pointer,
@@ -584,6 +633,8 @@ def compile_pa_decode_tile(
                 stride_q_head,
                 work_info_ptr,
                 num_sequences,
+                split_count,
+                split_magic,
             )
 
         def _tile_args(
@@ -603,6 +654,8 @@ def compile_pa_decode_tile(
             stride_q_head,
             work_info,
             num_seqs,
+            split_count,
+            split_magic,
         ):
             return (
                 work_info,
@@ -612,6 +665,8 @@ def compile_pa_decode_tile(
                 num_seqs,
                 stride_q_row,
                 stride_q_head,
+                split_count,
+                split_magic,
                 pmax,
                 key_cache,
                 value_cache,
@@ -643,6 +698,8 @@ def compile_pa_decode_tile(
             stride_q_head: fx.Int32,
             work_info_ptr: fx.Pointer,
             num_sequences: fx.Int32,
+            split_count: fx.Int32,
+            split_magic: fx.Int32,
         ):
             _pa_decode_tile_body(
                 pmax_ptr,
@@ -661,6 +718,8 @@ def compile_pa_decode_tile(
                 stride_q_head,
                 work_info_ptr,
                 num_sequences,
+                split_count,
+                split_magic,
             )
 
         def _tile_args(*args):
@@ -686,6 +745,8 @@ def compile_pa_decode_tile(
         stride_q_head: fx.Int32,
         work_info: fx.Pointer,
         work_capacity: fx.Int32,
+        split_count: fx.Int32,
+        split_magic: fx.Int32,
         stream: fx.Stream = fx.Stream(None),  # noqa: B008
     ):
         # Ambient contract permits FMAs; explicit per-op fastmath still wins.
@@ -708,6 +769,8 @@ def compile_pa_decode_tile(
                     stride_q_head,
                     work_info,
                     num_seqs,
+                    split_count,
+                    split_magic,
                 )
             ).launch(
                 grid=(

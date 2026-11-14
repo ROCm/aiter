@@ -607,12 +607,15 @@ class PaDecodePipeline:
                 for vh in range_constexpr(self.traits.VHE_CHUNKS)
             ]
         elif const_expr(
-            (
-                self.traits.M_TILES > 1
-                and not self.traits.MTP4_FUSED
-                and not self.traits.STREAM_KV
+            self.traits.kv_dtype != MXFP4_KV_DTYPE
+            and (
+                (
+                    self.traits.M_TILES > 1
+                    and not self.traits.MTP4_FUSED
+                    and not self.traits.STREAM_KV
+                )
+                or (self.traits.prefetch_v and not self.traits.SCALES_BEFORE_CURRENT_V)
             )
-            or (self.traits.prefetch_v and not self.traits.SCALES_BEFORE_CURRENT_V)
         ):
             v_vh_shared = [
                 self.kv.load_v(v_page_cur, vh)
@@ -620,7 +623,10 @@ class PaDecodePipeline:
             ]
 
         q_scale_vec = None
-        if const_expr(self.traits.M_TILES > 1 and self.traits.kv_dtype != fx.BFloat16):
+        if const_expr(
+            self.traits.M_TILES > 1
+            and self.traits.kv_dtype not in (fx.BFloat16, MXFP4_KV_DTYPE)
+        ):
             q_scale_vec = self.lds.load(
                 self.traits.sQscale_off
                 + self.ctx.lane16 * (self.traits.M_TILES * self.traits.f32),
@@ -628,6 +634,11 @@ class PaDecodePipeline:
                 self.traits.M_TILES,
             )
 
+        if const_expr(self.traits.kv_dtype == MXFP4_KV_DTYPE):
+            # Masks tail scores/V by tile_valid at runtime, so it ignores mask_tail.
+            return self.single_query_tile_mxfp4(
+                ostate, k_cur, tt1, tile_valid, window_left, q_ops_all
+            )
         # All query tiles share one K/V tile; each path retains its publication barriers.
         if const_expr(multi_query and self.traits.STREAM_KV):
             return self.stream_multi_query_tile(
@@ -659,11 +670,6 @@ class PaDecodePipeline:
                 mask_tail,
                 has_next,
                 pages_early,
-            )
-        if const_expr(self.traits.kv_dtype == MXFP4_KV_DTYPE):
-            # Masks tail scores/V by tile_valid at runtime, so it ignores mask_tail.
-            return self.single_query_tile_mxfp4(
-                ostate, k_cur, tt1, tile_valid, q_ops_all
             )
         return self.single_query_tile(
             ostate,
@@ -1490,15 +1496,15 @@ class PaDecodePipeline:
         k_cur,
         tt1,
         tile_valid,
+        window_left,
         q_ops_all,
     ):
-        """MXFP4 tile: one wave, its own 64 tokens, all 128 dims: QK, online softmax,
+        """MXFP4 tile: one wave, its own 64 tokens, all head dims: QK, online softmax,
         PV with P in registers (no barrier). Next-tile K/V loads are issued early;
-        the four waves merge once after the loop."""
+        the four waves merge once after the loop. M-tiles share the K registers and
+        the widened V."""
         t = self.traits
-        o_acc = [ostate[t.o_slot(0, vh)] for vh in range_constexpr(t.VHE_CHUNKS)]
-        m_prev = ostate[t.m_slot(0)]
-        l_prev = ostate[t.l_slot(0)]
+        M = t.M_TILES
         v_raw = ostate[t.V_SLOT]
         # Unconditional: a branch around the loads makes the compiler's vmcnt counts
         # assume they were skipped and drain them at issue. The last tile re-reads itself.
@@ -1506,72 +1512,126 @@ class PaDecodePipeline:
             self.kv.mxfp4_pages(fx.min(tt1, self.ctx.part_end - 1))
         )
         k_scales = [
-            self.kv.mxfp4_e8m0_byte(k_cur[a * 5]) for a in range_constexpr(t.NCHUNK)
-        ]
-        # q_scale = 2**e * mantissa: 2**e is Q's e8m0 MFMA scale, the mantissa is applied
-        # after, so the accumulator holds the logit, not the e4m3-normalized (up to 448x) one.
-        q_bits = self.lds.load(
-            self.lds.row_offset(t.sQscale_off, self.ctx.lane16, 1, fx.Float32),
-            fx.Int32,
-            1,
-        )[0]
-        q_mantissa = fx.Vector.from_elements(
-            [(q_bits & fx.Int32(0x7FFFFF)) | fx.Int32(0x3F800000)], dtype=fx.Int32
-        ).bitcast(fx.Float32)[0]
-        frag_Ss = self.gemm.qk_mxfp4(k_cur, k_scales, q_ops_all[0], q_bits >> 23)
-        k_next = self.kv.mxfp4_load("k", base)
-        # Widen V while the softmax runs.
-        for a in range_constexpr(t.NCHUNK):
-            self.kv.mxfp4_stage_v_bf16(v_raw, a, tile_valid)
-        scale_b = fx.full(4, self.ctx.scale_qk * q_mantissa, fx.Float32)
-        scores = [frag_Ss[a] * scale_b for a in range_constexpr(t.NCHUNK)]
-        if (
-            tile_valid < KV_COMPUTE_BLOCK
-        ):  # only a sequence's last tile has masked tokens
-            thr, _ = self.softmax.row_thresholds(tile_valid, None, 0)
-            neg4 = fx.full(4, float("-inf"), fx.Float32)
-            scores = [
-                self.softmax.score_mask(a, thr, None).select(scores[a], neg4)
-                for a in range_constexpr(t.NCHUNK)
+            [
+                self.kv.mxfp4_e8m0_byte(k_cur[self.kv.mxfp4_raw(a, kb)])
+                for kb in range_constexpr(t.MXFP4_KB)
             ]
-        nnan = self.ctx.fm_nnan
-        m_tile = scores[0].reduce(ReductionOp.MAX, fastmath=nnan)
-        for a in range_constexpr(1, t.NCHUNK):
-            m_tile = fx.maxnumf(
-                m_tile, scores[a].reduce(ReductionOp.MAX, fastmath=nnan), fastmath=nnan
-            )
-        for sh in (16, 32):
-            m_tile = fx.maxnumf(m_tile, m_tile.shuffle_xor(sh, WAVE), fastmath=nnan)
-        m_new = fx.maxnumf(m_prev, m_tile, fastmath=nnan)
-        # Relative to 0 while nothing is valid yet: no -inf - -inf.
-        safe = fx.Float32((m_new > self.ctx.NEG_INF).select(m_new, self.ctx.ZERO_F))
-        safe_b = fx.full(4, safe, fx.Float32)
-        alpha = fx.Float32(fx.exp2(m_prev - safe, fastmath="fast"))
-        probs = [
-            fx.Vector(fx.exp2(scores[a] - safe_b, fastmath="fast"))
             for a in range_constexpr(t.NCHUNK)
         ]
-        l_new = l_prev * alpha
+        # Head_dim 64 pads its one K block with lane groups 2 and 3.
+        k_pad = None
+        if const_expr(t.head_dim == 64):
+            k_pad = self.ctx.rgroup >= 2
+        # q_scale = 2**e * mantissa: 2**e is Q's e8m0 MFMA scale, the mantissa is applied
+        # after, so the accumulator holds the logit, not the e4m3-normalized (up to 448x) one.
+        # Row lane16's scales are [M] f32 (the staging's transposed [qh][m] layout).
+        q_bits_all = self.lds.load(
+            t.sQscale_off + self.ctx.lane16 * (M * t.f32), fx.Int32, M
+        )
+        frag_all = [
+            self.gemm.qk_mxfp4(
+                k_cur, k_scales, q_ops_all[m], q_bits_all[m] >> 23, k_pad
+            )
+            for m in range_constexpr(M)
+        ]
+        k_next = self.kv.mxfp4_load("k", base)
+        # Widen V while the softmax runs.
+        # Tokens before the MTP window union widen to zeros as tail ones do.
+        window_first = None
+        if const_expr(t.sliding_window > 0):
+            window_first = window_left - (t.query_length - 1)
         for a in range_constexpr(t.NCHUNK):
-            l_new = l_new + probs[a].reduce(ReductionOp.ADD)  # this lane's tokens
+            self.kv.mxfp4_stage_v_bf16(v_raw, a, tile_valid, window_first)
+        nnan = self.ctx.fm_nnan
         # S^T[token 4g+v][head] is already the PV B operand layout. P is scaled by
         # 2**-MXFP4_P_EXP_SHIFT (l_new is not); ``store_mxfp4`` restores it.
         p_shift = fx.full(4, 2.0**-MXFP4_P_EXP_SHIFT, fx.Float32)
-        p_ops = [
-            (probs[a] * p_shift).to(fx.BFloat16).bitcast(fx.Int64)[0]
-            for a in range_constexpr(t.NCHUNK)
-        ]
+        neg4 = fx.full(4, float("-inf"), fx.Float32)
+        p_ops_all, alpha_all, m_all, l_all = [], [], [], []
+        for m in range_constexpr(M):
+            q_mantissa = fx.Vector.from_elements(
+                [(q_bits_all[m] & fx.Int32(0x7FFFFF)) | fx.Int32(0x3F800000)],
+                dtype=fx.Int32,
+            ).bitcast(fx.Float32)[0]
+            scale_b = fx.full(4, self.ctx.scale_qk * q_mantissa, fx.Float32)
+            scores = [frag_all[m][a] * scale_b for a in range_constexpr(t.NCHUNK)]
+            # Only a sequence's last tile has masked tokens (and, with MTP, the tile
+            # before it: an earlier query row stops up to query_length - 1 sooner),
+            # and, with a window, its first tiles.
+            needs_mask = tile_valid < KV_COMPUTE_BLOCK + t.query_length - 1
+            if const_expr(t.sliding_window > 0):
+                needs_mask = needs_mask | (window_left > 0)
+            if needs_mask:
+                thr, window_thr = self.softmax.row_thresholds(
+                    tile_valid, window_left, m
+                )
+                scores = [
+                    self.softmax.score_mask(a, thr, window_thr).select(scores[a], neg4)
+                    for a in range_constexpr(t.NCHUNK)
+                ]
+            m_prev = ostate[t.m_slot(m)]
+            l_prev = ostate[t.l_slot(m)]
+            m_tile = scores[0].reduce(ReductionOp.MAX, fastmath=nnan)
+            for a in range_constexpr(1, t.NCHUNK):
+                m_tile = fx.maxnumf(
+                    m_tile,
+                    scores[a].reduce(ReductionOp.MAX, fastmath=nnan),
+                    fastmath=nnan,
+                )
+            for sh in (16, 32):
+                m_tile = fx.maxnumf(m_tile, m_tile.shuffle_xor(sh, WAVE), fastmath=nnan)
+            m_new = fx.maxnumf(m_prev, m_tile, fastmath=nnan)
+            # Relative to 0 while nothing is valid yet: no -inf - -inf.
+            safe = fx.Float32((m_new > self.ctx.NEG_INF).select(m_new, self.ctx.ZERO_F))
+            safe_b = fx.full(4, safe, fx.Float32)
+            alpha = fx.Float32(fx.exp2(m_prev - safe, fastmath="fast"))
+            probs = [
+                fx.Vector(fx.exp2(scores[a] - safe_b, fastmath="fast"))
+                for a in range_constexpr(t.NCHUNK)
+            ]
+            l_new = l_prev * alpha
+            for a in range_constexpr(t.NCHUNK):
+                l_new = l_new + probs[a].reduce(ReductionOp.ADD)  # this lane's tokens
+            p_ops_all.append(
+                [
+                    (probs[a] * p_shift).to(fx.BFloat16).bitcast(fx.Int64)[0]
+                    for a in range_constexpr(t.NCHUNK)
+                ]
+            )
+            alpha_all.append(alpha)
+            m_all.append(m_new)
+            l_all.append(l_new)
         # V loads follow K's by part of a tile so the bursts do not queue together.
         v_next = self.kv.mxfp4_load("v", base)
-        alpha_b = fx.full(t.OP_ELEMS, alpha, fx.Float32)
-        o_acc = [o_acc[vh] * alpha_b for vh in range_constexpr(t.VHE_CHUNKS)]
-        for a in range_constexpr(t.NCHUNK):
-            v_ops = self.kv.mxfp4_read_staged_v_bf16(a)
-            for vh in range_constexpr(t.VHE_CHUNKS):
-                o_acc[vh] = fx.Vector(
-                    self.gemm.mfma([v_ops[vh]], [p_ops[a]], 0, 0, 1, o_acc[vh])
-                )
-        return [k_next, v_next, *o_acc, m_new, l_new]
+        o_all = []
+        for m in range_constexpr(M):
+            alpha_b = fx.full(t.OP_ELEMS, alpha_all[m], fx.Float32)
+            o_all.append(
+                [
+                    ostate[t.o_slot(m, vh)] * alpha_b
+                    for vh in range_constexpr(t.VHE_CHUNKS)
+                ]
+            )
+        # Chunk pairs take one K32 MFMA (twice the K16 one's rate on gfx950).
+        for a in range_constexpr(0, t.NCHUNK, 2):
+            v_lo = self.kv.mxfp4_read_staged_v_bf16(a)
+            v_hi = self.kv.mxfp4_read_staged_v_bf16(a + 1)
+            for m in range_constexpr(M):
+                for vh in range_constexpr(t.VHE_CHUNKS):
+                    o_all[m][vh] = fx.Vector(
+                        self.gemm.mfma_bf16_k32(
+                            [v_lo[vh], v_hi[vh]],
+                            [p_ops_all[m][a], p_ops_all[m][a + 1]],
+                            0,
+                            0,
+                            2,
+                            o_all[m][vh],
+                        )
+                    )
+        state = [k_next, v_next]
+        for m in range_constexpr(M):
+            state.extend([*o_all[m], m_all[m], l_all[m]])
+        return state
 
 
 class Gfx1250Bf16Pipeline:

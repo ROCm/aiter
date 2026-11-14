@@ -15,7 +15,6 @@ from .traits import (
     LOG2E,
     MFMA_MNK,
     MXFP4_P_EXP_SHIFT,
-    MXFP4_V_BF16_CHUNK_BYTES,
     WAVE,
 )
 
@@ -134,85 +133,105 @@ class PaDecodeEpilogue:
 
     @flyc.jit
     def store_mxfp4(self, o_final):
-        """MXFP4: each wave holds (max, sum, O over all dims) of its own tokens. One
-        barrier publishes them; each of the head x 8-dim threads merges its slice."""
+        """MXFP4: each wave holds (max, sum, O over all dims) of its own tokens. Per
+        M-tile, one barrier publishes them and each of the head x 8-dim threads
+        merges its slice; a second barrier frees the LDS for the next M-tile."""
         # Keep pointer writes as SSA operands of the guards (as in ``store``).
         pmax = self.pmax
         psum = self.psum
-        l_w = o_final[self.traits.l_slot(0)]
-        for sh in (16, 32):
-            l_w = l_w + l_w.shuffle_xor(sh, WAVE)  # this lane's tokens -> the wave's
         # The wave's V staging is free: its O goes there, [head][dim] f32.
-        o_off = self.traits.sMxfp4VBf16_off + self.ctx.warp * (
-            self.traits.NCHUNK * MXFP4_V_BF16_CHUNK_BYTES
-        )
-        if self.ctx.rgroup == 0:
-            self.lds.store_wave(
-                self.traits.sLmax_off,
-                self.ctx.lane16,
-                self.ctx.warp,
-                o_final[self.traits.m_slot(0)],
-            )
-            self.lds.store_wave(
-                self.traits.sLsum_off, self.ctx.lane16, self.ctx.warp, l_w
-            )
-        if self.ctx.lane16 < self.traits.CTA_ROWS:
-            for vh in range_constexpr(self.traits.VHE_CHUNKS):
-                self.lds.store(
-                    o_off
-                    + (
-                        self.ctx.lane16 * self.traits.head_dim
-                        + vh * MFMA_MNK
-                        + self.ctx.rgroup * 4
+        wave_bytes = self.traits.NCHUNK * self.traits.MXFP4_V_CHUNK_BYTES
+        o_off = self.traits.sMxfp4VBf16_off + self.ctx.warp * wave_bytes
+        # Rows are padded by 16 B: unpadded, the 16 lanes of a row group would
+        # write the same LDS banks.
+        row_bytes = self.traits.head_dim * 4 + 16
+        # A thread merges 8 dims of a row: head_dim 256 takes two passes of 8
+        # rows, head_dim 64 leaves half of the threads idle.
+        dim_threads = self.traits.head_dim // 8
+        pass_rows = min(MFMA_MNK, self.traits.BLOCK_THREADS // dim_threads)
+        pass_row = self.ctx.tid // dim_threads
+        dim8 = self.ctx.tid % dim_threads
+        for m in range_constexpr(self.traits.M_TILES):
+            if const_expr(m > 0):
+                gpu.barrier()
+            l_w = o_final[self.traits.l_slot(m)]
+            for sh in (16, 32):
+                l_w = l_w + l_w.shuffle_xor(
+                    sh, WAVE
+                )  # this lane's tokens -> the wave's
+            if self.ctx.rgroup == 0:
+                self.lds.store_wave(
+                    self.traits.sLmax_off,
+                    self.ctx.lane16,
+                    self.ctx.warp,
+                    o_final[self.traits.m_slot(m)],
+                )
+                self.lds.store_wave(
+                    self.traits.sLsum_off, self.ctx.lane16, self.ctx.warp, l_w
+                )
+            if m * MFMA_MNK + self.ctx.lane16 < self.traits.CTA_ROWS:
+                for vh in range_constexpr(self.traits.VHE_CHUNKS):
+                    self.lds.store(
+                        o_off
+                        + self.ctx.lane16 * row_bytes
+                        + (vh * MFMA_MNK + self.ctx.rgroup * 4) * 4,
+                        fx.Float32,
+                        o_final[self.traits.o_slot(m, vh)],
                     )
-                    * 4,
-                    fx.Float32,
-                    o_final[self.traits.o_slot(0, vh)],
-                )
-        gpu.barrier()
-        row = self.ctx.tid // (self.traits.head_dim // 8)
-        if row < self.traits.CTA_ROWS:
-            dim8 = self.ctx.tid % (self.traits.head_dim // 8)
-            ms = self.lds.load_wave(self.traits.sLmax_off, row)
-            ls = self.lds.load_wave(self.traits.sLsum_off, row)
-            h_max = ms.reduce(ReductionOp.MAX)
-            h_safe = (h_max > self.ctx.NEG_INF).select(h_max, self.ctx.ZERO_F)
-            wts = [
-                fx.Float32(fx.exp2(ms[w] - h_safe))
-                for w in range_constexpr(self.traits.NWARP)
-            ]
-            h_sum = self.ctx.ZERO_F
-            o = fx.full(8, 0.0, fx.Float32)
-            for w in range_constexpr(self.traits.NWARP):
-                h_sum = h_sum + ls[w] * wts[w]
-                part = self.lds.load(
-                    self.traits.sMxfp4VBf16_off
-                    + w * (self.traits.NCHUNK * MXFP4_V_BF16_CHUNK_BYTES)
-                    + (row * self.traits.head_dim + dim8 * 8) * 4,
-                    fx.Float32,
-                    8,
-                )
-                o = o + part * fx.full(8, wts[w], fx.Float32)
-            inv = (h_sum > self.ctx.ZERO_F).select(
-                fx.Float32(rcp_f32(h_sum)), self.ctx.ZERO_F
-            )
-            # O holds PV * 2**-MXFP4_P_EXP_SHIFT (``single_query_tile_mxfp4``): restore
-            # it here, after the normalization (the row's max token has p = 1, so
-            # h_sum >= 1).
-            inv = inv * fx.Float32(2.0**MXFP4_P_EXP_SHIFT)
-            o_norm = (o * fx.full(8, inv, fx.Float32)).to(self.traits.OUT_DTYPE)
-            global_row = self.ctx.query_begin * self.traits.query_group_size + row
-            for half in range_constexpr(2):
-                self._emit(
-                    fx.Vector.from_elements(
-                        [o_norm[half * 4 + i] for i in range_constexpr(4)],
-                        dtype=self.traits.OUT_DTYPE,
-                    ),
-                    dim8 * 2 + half,
-                    global_row,
-                )
-            if const_expr(not self.traits.DIRECT) and dim8 == 0:
-                base = self.ctx.partial_slot * self.traits.TOTAL_ROWS + global_row
-                # The shared reducer expects maxima in natural-log units.
-                pmax[base] = h_max * fx.Float32(1.0 / LOG2E)
-                psum[base] = h_sum
+            gpu.barrier()
+            for p in range_constexpr(MFMA_MNK // pass_rows):
+                row = p * pass_rows + pass_row
+                owned = m * MFMA_MNK + row < self.traits.CTA_ROWS
+                if const_expr(pass_rows * dim_threads < self.traits.BLOCK_THREADS):
+                    owned = owned & (pass_row < pass_rows)
+                if owned:
+                    ms = self.lds.load_wave(self.traits.sLmax_off, row)
+                    ls = self.lds.load_wave(self.traits.sLsum_off, row)
+                    h_max = ms.reduce(ReductionOp.MAX)
+                    h_safe = (h_max > self.ctx.NEG_INF).select(h_max, self.ctx.ZERO_F)
+                    wts = [
+                        fx.Float32(fx.exp2(ms[w] - h_safe))
+                        for w in range_constexpr(self.traits.NWARP)
+                    ]
+                    h_sum = self.ctx.ZERO_F
+                    o = fx.full(8, 0.0, fx.Float32)
+                    for w in range_constexpr(self.traits.NWARP):
+                        h_sum = h_sum + ls[w] * wts[w]
+                        part = self.lds.load(
+                            self.traits.sMxfp4VBf16_off
+                            + w * wave_bytes
+                            + row * row_bytes
+                            + dim8 * 8 * 4,
+                            fx.Float32,
+                            8,
+                        )
+                        o = o + part * fx.full(8, wts[w], fx.Float32)
+                    inv = (h_sum > self.ctx.ZERO_F).select(
+                        fx.Float32(rcp_f32(h_sum)), self.ctx.ZERO_F
+                    )
+                    # O holds PV * 2**-MXFP4_P_EXP_SHIFT (``single_query_tile_mxfp4``):
+                    # restore it here, after the normalization (the row's max token has
+                    # p = 1, so h_sum >= 1).
+                    inv = inv * fx.Float32(2.0**MXFP4_P_EXP_SHIFT)
+                    o_norm = (o * fx.full(8, inv, fx.Float32)).to(self.traits.OUT_DTYPE)
+                    global_row = (
+                        self.ctx.query_begin * self.traits.query_group_size
+                        + m * MFMA_MNK
+                        + row
+                    )
+                    for half in range_constexpr(2):
+                        self._emit(
+                            fx.Vector.from_elements(
+                                [o_norm[half * 4 + i] for i in range_constexpr(4)],
+                                dtype=self.traits.OUT_DTYPE,
+                            ),
+                            dim8 * 2 + half,
+                            global_row,
+                        )
+                    if const_expr(not self.traits.DIRECT) and dim8 == 0:
+                        base = (
+                            self.ctx.partial_slot * self.traits.TOTAL_ROWS + global_row
+                        )
+                        # The shared reducer expects maxima in natural-log units.
+                        pmax[base] = h_max * fx.Float32(1.0 / LOG2E)
+                        psum[base] = h_sum

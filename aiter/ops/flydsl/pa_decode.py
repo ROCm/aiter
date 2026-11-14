@@ -27,6 +27,8 @@ from .kernels.pa_decode_kernel import (
     compile_pa_decode_tile,
     gfx1250_tile_traits,
 )
+from .kernels.pa_decode.traits import MFMA_MNK as MXFP4_FUSED_M_ROWS
+from .kernels.pa_decode.traits import mxfp4_query_splits
 from .kernels.pa_decode_plan import PADecodePlan
 
 # Plans with at most this many partitions per sequence merge within a cluster
@@ -91,6 +93,7 @@ def launch_pa_decode_ps_reduce(
     max_partitions: int,
     stream: torch.cuda.Stream,
     reduce_info: torch.Tensor,
+    kernarg_preload: bool = False,
 ) -> None:
     """Reduce packed partials; every sequence has at most ``max_partitions``."""
     props = torch.cuda.get_device_properties(output.device)
@@ -186,6 +189,7 @@ def launch_pa_decode_ps_reduce(
         pairs=pairs,
         parallel_groups=groups,
         num_xcds=num_xcds,
+        kernarg_preload=kernarg_preload,
     )
     sink_ptr = (
         flyc.from_c_void_p(torch_to_fx_dtype(output.dtype), 0)
@@ -218,6 +222,60 @@ def launch_pa_decode_ps_reduce(
     )
 
 
+def _mxfp4_free_splits(ctas, num_compute_units, context_bound):
+    """CTAs per sequence for a plan-free MXFP4 decode of ``ctas`` (sequence, KV
+    head) pairs, each over at most ``context_bound`` tokens.
+
+    1 unless two or more CTAs of each pair fit within one CTA per CU. A tile a
+    CTA if every tile fits so; otherwise up to two CTAs per CU of two tiles or
+    more each (one tile a CTA does not pay for its prologue and partials).
+    """
+    tiles = -(-context_bound // KV_COMPUTE_BLOCK)
+    splits = min(tiles, num_compute_units // max(ctas, 1))
+    if splits < 2 or splits == tiles:
+        return max(splits, 1)
+    return max(
+        splits,
+        min(-(-tiles // 2), 2 * num_compute_units // ctas, num_compute_units),
+    )
+
+
+def _mxfp4_query_splits(query_length, group, ctas, num_compute_units):
+    """CTAs per (task, KV head) that split an MXFP4 MTP task's query positions.
+
+    A CTA computes its rows as up to three 16-row M-tiles over one K/V tile
+    (each split re-reads and re-widens the tile), and a split leaves at least
+    16 rows a CTA. Two CTAs fit a CU: take the most splits that keep the grid
+    of ``ctas`` within two per CU, else the fewest.
+    """
+    rows = query_length * group
+    valid = [
+        s
+        for s in range(1, query_length + 1)
+        if not query_length % s
+        and -(-rows // s // MXFP4_FUSED_M_ROWS) <= 3
+        and (s == 1 or rows // s >= MXFP4_FUSED_M_ROWS)
+    ]
+    if not valid:
+        return mxfp4_query_splits(query_length, group)
+    fit = [s for s in valid if ctas * s <= 2 * num_compute_units]
+    return max(fit) if fit else min(valid)
+
+
+def _check_sinks(sinks, num_q_heads, dev):
+    if sinks is not None:
+        if not isinstance(sinks, torch.Tensor):
+            raise TypeError("sinks must be a torch.Tensor")
+        if sinks.shape != (num_q_heads,):
+            raise ValueError("sinks must have shape [num_query_heads]")
+        if sinks.dtype not in (torch.bfloat16, torch.float16, torch.float32):
+            raise TypeError("sinks must have dtype bfloat16, float16, or float32")
+        if sinks.device != dev:
+            raise ValueError("sinks must be on the same device as query")
+        if not sinks.is_contiguous():
+            raise ValueError("sinks must be contiguous")
+
+
 def _pa_decode_mxfp4(
     output,
     query,
@@ -233,6 +291,9 @@ def _pa_decode_mxfp4(
     temporary_output,
     work_plan,
     max_context_length,
+    query_length,
+    sliding_window,
+    sinks,
 ):
     """MXFP4 K/V on gfx950: ``kv_dtype=dtypes.fp4x2`` of the shared tile kernel."""
     if get_gfx_runtime() != "gfx950":
@@ -248,12 +309,14 @@ def _pa_decode_mxfp4(
         for t in (k_data, v_data, k_scale, v_scale)
     )
     dev = query.device
-    num_seqs, num_q_heads, head_dim = query.shape
+    num_rows, num_q_heads, head_dim = query.shape
+    num_seqs = context_lengths.shape[0]
     num_kv_heads = k_data.shape[1]
     group = num_q_heads // num_kv_heads
-    if head_dim != 128 or num_q_heads % num_kv_heads or group > 16:
+    if head_dim not in (64, 128, 256) or num_q_heads % num_kv_heads or group > 64:
         raise NotImplementedError(
-            "MXFP4 pa_decode needs head_dim 128 and 1..16 query heads per KV head, "
+            "MXFP4 pa_decode needs head_dim 64, 128 or 256 and 1..64 query heads "
+            "per KV head, "
             f"got query {tuple(query.shape)} over {num_kv_heads} KV heads"
         )
     if query.dtype not in (torch.float8_e4m3fn, torch.bfloat16):
@@ -264,6 +327,7 @@ def _pa_decode_mxfp4(
         raise TypeError("MXFP4 pa_decode needs a bf16 output shaped like the query")
     if output.device != dev:
         raise ValueError(f"output must be on the query device ({dev})")
+    _check_sinks(sinks, num_q_heads, dev)
     if any(t.stride(2) != 1 for t in (query, output)) or any(
         x * t.element_size() % 16 for t in (query, output) for x in t.stride()[:2]
     ):
@@ -280,18 +344,25 @@ def _pa_decode_mxfp4(
             raise ValueError(
                 f"MXFP4 pa_decode {name} must span at most 2**31 - 1 bytes"
             )
-    # K and V are data views [pages, kv_heads, 128, 64] and e8m0 scale views
-    # [pages, kv_heads, 128, 4] of one page; the four share page and head strides.
+    # K and V are data views [pages, kv_heads, P, head_dim / 2] and e8m0 scale
+    # views [pages, kv_heads, P, head_dim / 32] of one page (P = 16, 64 or 128
+    # tokens); the four share page and head strides.
+    page_size = k_data.shape[2] if k_data.dim() == 4 else 0
+    if page_size not in (16, 64, 128):
+        raise NotImplementedError(
+            f"MXFP4 pa_decode needs pages of 16, 64 or 128 tokens, got {page_size}"
+        )
     page_head_strides = k_data.stride()[:2]
     if any(x % 16 or x >= 2**31 for x in page_head_strides):
         raise ValueError(
             "MXFP4 page and head strides must be multiples of 16 and fit i32"
         )
+    data_tail, scale_tail = head_dim // 2, head_dim // 32
     for name, t, tail in (
-        ("key_cache", k_data, 64),
-        ("value_cache", v_data, 64),
-        ("key_scale", k_scale, 4),
-        ("value_scale", v_scale, 4),
+        ("key_cache", k_data, data_tail),
+        ("value_cache", v_data, data_tail),
+        ("key_scale", k_scale, scale_tail),
+        ("value_scale", v_scale, scale_tail),
     ):
         if not isinstance(t, torch.Tensor):
             raise TypeError(
@@ -301,26 +372,27 @@ def _pa_decode_mxfp4(
             t.dtype != torch.uint8
             or t.device != dev
             or t.shape[0] != k_data.shape[0]
-            or tuple(t.shape[1:]) != (num_kv_heads, 128, tail)
+            or tuple(t.shape[1:]) != (num_kv_heads, page_size, tail)
             or t.stride() != (*page_head_strides, tail, 1)
         ):
             raise ValueError(
                 f"{name} must be a uint8 [{k_data.shape[0]} pages, {num_kv_heads}, "
-                f"128, {tail}] view (or {'fp4x2' if tail == 64 else 'fp8_e8m0'}) "
+                f"{page_size}, {tail}] view "
+                f"(or {'fp4x2' if tail == data_tail else 'fp8_e8m0'}) "
                 f"on {dev} with the key cache's page count, page and head strides, "
                 f"got {t.dtype} {tuple(t.shape)} {t.stride()}"
             )
-        # mxfp4_init loads data as 16 B and scale as 4 B aligned.
-        align = 16 if tail == 64 else 4
+        # mxfp4_init loads data as 16 B and a token's scales as 2 or 4 B aligned.
+        align = 16 if tail == data_tail else min(scale_tail, 4)
         if t.data_ptr() % align:
             raise ValueError(f"{name} base pointer must be {align} B aligned")
     if block_tables.dtype != torch.int32 or context_lengths.dtype != torch.int32:
         raise TypeError("block_tables and context_lengths must be int32")
-    if context_lengths.shape[0] != num_seqs or block_tables.shape[0] != num_seqs:
+    if num_rows != num_seqs * query_length or block_tables.shape[0] != num_seqs:
         raise ValueError(
-            f"query.shape[0] ({num_seqs}) must match context_lengths.shape[0] "
-            f"({context_lengths.shape[0]}) and block_tables.shape[0] "
-            f"({block_tables.shape[0]})"
+            f"query.shape[0] ({num_rows}) must match context_lengths.shape[0] * "
+            f"query_length ({num_seqs} * {query_length}), and block_tables.shape[0] "
+            f"({block_tables.shape[0]}) context_lengths.shape[0]"
         )
     for name, t in (
         ("block_tables", block_tables),
@@ -331,42 +403,92 @@ def _pa_decode_mxfp4(
     if num_seqs == 0:
         return
     max_blocks_per_seq = block_tables.shape[1]
-    schedule_context_length = max_blocks_per_seq * 128
+    schedule_context_length = max_blocks_per_seq * page_size
     if max_context_length is not None:
         if not 0 <= max_context_length <= schedule_context_length:
             raise ValueError("max_context_length must be within block-table capacity")
-        schedule_context_length = -(-max_context_length // 128) * 128
+        schedule_context_length = -(-max_context_length // page_size) * page_size
     same_strides = query.stride()[:2] == output.stride()[:2]
     if work_plan is None and not same_strides:
         raise ValueError("without a work_plan the output needs the query's strides")
     if work_plan is not None:
         work_plan.validate(num_seqs, num_kv_heads, dev)
-        if work_plan.sliding_window:
+        if work_plan.sliding_window != sliding_window:
             raise ValueError("sliding_window must match work_plan.sliding_window")
-    # One task per sequence needs neither the plan nor the reducer.
-    direct = work_plan is None or (work_plan.max_partitions == 1 and same_strides)
-    capacity = num_seqs if direct else work_plan.capacity
+        if sliding_window > 0 and work_plan.query_length != query_length:
+            raise ValueError("query_length must match work_plan.query_length")
+    # A window reads at most this many tokens of a sequence (the MTP union,
+    # unaligned to tiles).
+    visible_context_length = schedule_context_length
+    if sliding_window > 0:
+        window_tiles = (
+            sliding_window + query_length - 2 + KV_COMPUTE_BLOCK - 1
+        ) // KV_COMPUTE_BLOCK + 1
+        visible_context_length = min(
+            visible_context_length, window_tiles * KV_COMPUTE_BLOCK
+        )
+    num_compute_units = torch.cuda.get_device_properties(dev).multi_processor_count
+    query_splits = _mxfp4_query_splits(
+        query_length,
+        group,
+        (num_seqs if work_plan is None else work_plan.capacity) * num_kv_heads,
+        num_compute_units,
+    )
+    # Without a plan, a sparse grid splits each sequence's tiles over S CTAs and
+    # merges them in the reducer; otherwise one task per sequence needs neither.
+    # Sinks apply in the reducer: a plan-free decode with them splits, if only
+    # into one run per sequence.
+    splits = (
+        _mxfp4_free_splits(
+            num_seqs * num_kv_heads * query_splits,
+            num_compute_units,
+            visible_context_length,
+        )
+        if work_plan is None
+        else 0
+    )
+    direct = sinks is None and (
+        splits == 1 or (splits == 0 and work_plan.max_partitions == 1 and same_strides)
+    )
+    if splits and not direct:
+        capacity, partitions = num_seqs * splits, splits
+    elif direct:
+        capacity, partitions = num_seqs, 1
+    else:
+        capacity, partitions = work_plan.capacity, work_plan.max_partitions
     with torch.cuda.device(dev):
         compiled = compile_pa_decode_tile(
             head_dim=head_dim,
             query_group_size=group,
-            block_size=128,
+            block_size=page_size,
             num_seqs=num_seqs,
             num_kv_heads=num_kv_heads,
-            num_compute_units=torch.cuda.get_device_properties(
-                dev
-            ).multi_processor_count,
-            num_partitions=1 if direct else work_plan.max_partitions,
+            num_compute_units=num_compute_units,
+            num_partitions=partitions,
             softmax_scale=softmax_scale,
             query_dtype=query.dtype,
             kv_dtype=dtypes.fp4x2,
             work_capacity=capacity,
             max_context_length=schedule_context_length,
             direct_output=direct,
+            split_sequences=bool(splits) and not direct,
+            query_length=query_length,
+            query_splits=query_splits,
+            sliding_window=sliding_window,
         )
     pmax = psum = pout = output
-    if not direct:
-        shape = (num_kv_heads, capacity, group)
+    reduce_info = None if work_plan is None else work_plan.reduce_info
+    if splits and not direct:
+        # Internal scratch; the tile kernel writes reduce_info past the sums.
+        shape = (num_kv_heads, capacity, query_length * group)
+        sums = num_kv_heads * capacity * query_length * group
+        stats = torch.empty(2 * sums + 2 * num_seqs, dtype=torch.float32, device=dev)
+        pmax = stats[:sums].view(shape)
+        psum = stats[sums : 2 * sums].view(shape)
+        reduce_info = stats[2 * sums :].view(torch.int32).view(num_seqs, 2)
+        pout = torch.empty((*shape, head_dim), dtype=output.dtype, device=dev)
+    elif not direct:
+        shape = (num_kv_heads, capacity, query_length * group)
         scratch = []
         for name, t, expected, dtype in (
             ("max_logits", max_logits, shape, torch.float32),
@@ -405,32 +527,47 @@ def _pa_decode_mxfp4(
             *page_head_strides,
             query.stride(0),
             query.stride(1),
-            ptr_arg(context_lengths if direct else work_plan.work_info, fx.Int32),
+            ptr_arg(
+                context_lengths if direct or splits else work_plan.work_info,
+                fx.Int32,
+            ),
             capacity,
+            max(splits, 1),
+            -(-(1 << 30) // splits) if splits and not direct else 0,
             stream,
         )
         if direct:
             return
-        output_5d = output.reshape(num_seqs, 1, num_kv_heads, group, head_dim)
+        output_5d = output.reshape(
+            num_seqs, query_length, num_kv_heads, group, head_dim
+        )
         launch_pa_decode_ps_reduce(
             output_5d,
             psum,
             pmax,
             pout,
-            None,
+            sinks,
             *output_5d.stride()[:4],
             pmax.stride(0),
             pmax.stride(1),
             pout.stride(0),
             pout.stride(1),
             pout.stride(2),
-            query_seq_len=1,
+            query_seq_len=query_length,
             query_group_size=group,
             head_size=head_dim,
-            # Not bounded by max_context_length: a task may own more tokens than it.
-            max_partitions=min(work_plan.max_partitions, capacity),
+            # A sequence has at most one partition per tile of the block table
+            # (not of max_context_length: a task may own more tokens than it)
+            # and of its window.
+            max_partitions=min(
+                partitions,
+                capacity,
+                -(-max_blocks_per_seq * page_size // KV_COMPUTE_BLOCK),
+                window_tiles if sliding_window > 0 else partitions,
+            ),
             stream=stream,
-            reduce_info=work_plan.reduce_info,
+            reduce_info=reduce_info,
+            kernarg_preload=True,
         )
 
 
@@ -515,22 +652,27 @@ def pa_decode(
     +inf suppresses the head's output.
 
     MXFP4 K/V (gfx950): ``key_cache``/``value_cache`` are data views
-    [pages, kv_heads, 128, 64] (``dtypes.fp4x2`` or uint8) and
-    ``key_scale``/``value_scale`` e8m0 views [pages, kv_heads, 128, 4]
+    [pages, kv_heads, P, 64] (``dtypes.fp4x2`` or uint8, P = 16, 64 or 128 tokens)
+    and ``key_scale``/``value_scale`` e8m0 views [pages, kv_heads, P, 4]
     (``dtypes.fp8_e8m0`` or uint8) of the same pages (the four share page and head
     byte strides, multiples of 16). ``query`` is float8_e4m3fn, used as stored, or
     bf16, quantized to e4m3 per head row in the kernel; ``output`` is bf16.
-    Supported: head_dim 128, block size 128, ``query_length`` 1, at most 16 query
-    heads per KV head. Refused: other block sizes, head dims and output dtypes,
-    sliding windows and sinks (``mask_unowned_kv`` has no effect: tokens past the
+    Supported: head_dim 128, block size 16, 64 or 128, ``query_length`` 1..4, at
+    most 64 query heads per KV head (one query position's rows fit four
+    M-tiles). Refused: other block sizes, head dims and output dtypes, sliding
+    windows and sinks (``mask_unowned_kv`` has no effect: tokens past the
     context are always masked). Scale bytes 0 and 255 are not supported in valid
     rows. V is staged as bf16, so a V element above the bf16 maximum (3.39e38: e8m0
     byte 254 with an e2m1 magnitude of 2 or more, byte 253 with 4 or more) widens to
-    infinity even when the normalized output is finite. ``work_plan=None`` is accepted for MXFP4 only: one task per sequence
-    writes its row directly (the output needs the query's row and head strides,
-    a context-0 row is zero-filled) and nothing is specialized on ``num_seqs``; a
-    plan with ``max_partitions == 1`` is served the same way. A task may span at
-    most 4096 pages in ``max_context_length``: pass a smaller one otherwise. A
+    infinity even when the normalized output is finite. ``work_plan=None`` is
+    accepted for MXFP4 only. When at most half of the CUs hold one CTA per
+    (sequence, KV head), each sequence's tiles split into near-equal runs over
+    several CTAs, merged by the reduce kernel in internal scratch (the scratch
+    arguments are ignored). Otherwise one task per sequence writes its row
+    directly (the output needs the query's row and head strides, a context-0 row
+    is zero-filled) and nothing is specialized on ``num_seqs``; a plan with
+    ``max_partitions == 1`` is served the same way. A task may span at most 4096
+    pages in ``max_context_length``: pass a smaller one otherwise. A
     real context longer than that bound is still fully attended (up to 2**19
     tokens a task, the bound of the fixed PV shift, unchecked on the GPU).
 
@@ -613,16 +755,10 @@ def pa_decode(
             )
 
     if mxfp4:
-        if query_length != 1:
+        if query_length > 4:
             raise NotImplementedError(
-                f"MXFP4 KV supports query_length 1, got {query_length}"
+                f"MXFP4 KV supports query_length 1..4, got {query_length}"
             )
-        if sliding_window:
-            raise NotImplementedError(
-                f"MXFP4 KV supports no sliding window, got sliding_window={sliding_window}"
-            )
-        if sinks is not None:
-            raise NotImplementedError("MXFP4 KV supports no sinks, got sinks")
         if compute_type not in (None, torch.uint8, dtypes.fp4x2):
             raise NotImplementedError(
                 "MXFP4 KV takes compute_type None, uint8 or fp4x2, "
@@ -643,6 +779,9 @@ def pa_decode(
             temporary_output,
             work_plan,
             max_context_length,
+            query_length,
+            sliding_window,
+            sinks,
         )
 
     trans_k = key_cache.dim() == 5
@@ -806,17 +945,7 @@ def pa_decode(
         )
 
     dev = query.device
-    if sinks is not None:
-        if not isinstance(sinks, torch.Tensor):
-            raise TypeError("sinks must be a torch.Tensor")
-        if sinks.shape != (num_q_heads,):
-            raise ValueError("sinks must have shape [num_query_heads]")
-        if sinks.dtype not in (torch.bfloat16, torch.float16, torch.float32):
-            raise TypeError("sinks must have dtype bfloat16, float16, or float32")
-        if sinks.device != dev:
-            raise ValueError("sinks must be on the same device as query")
-        if not sinks.is_contiguous():
-            raise ValueError("sinks must be contiguous")
+    _check_sinks(sinks, num_q_heads, dev)
     for name, tensor in (
         ("output", output),
         ("key_cache", key_cache),
@@ -1174,7 +1303,7 @@ def pa_decode(
             )
         if not tensor.is_contiguous():
             raise ValueError(f"{name} must be contiguous")
-    merge_args = ()
+    merge_args = (1, 0)  # gfx942/gfx950: no plan-free split (count, magic)
     if arch in ("gfx1250", "gfx1250-strict"):
         merged = direct_output and not one_partition_output
         merge_args = (
