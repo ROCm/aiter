@@ -146,6 +146,7 @@ else:
     from .ops.pa_sparse_prefill_opus import *
     from .ops.fused_norm_rope_attn_rope_cast import *
     from .ops.msa_attention import *
+    from .ops.hk_sparse_mla import hk_sparse_mla_fwd  # noqa: F401
     from .ops.pos_encoding import *
     from .ops.cache import *
     from .ops.rmsnorm import *
