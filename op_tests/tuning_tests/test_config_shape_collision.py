@@ -3,7 +3,8 @@
 """
 Cross-file shape-collision guard for tuned config CSVs.
 
-At runtime ``aiter.jit.core.AITER_CONFIGS.get_config_file`` merges, per family,
+A4W4 uses the explicit default-source manifest in ``mxfp4_tuning``. Other
+families use ``aiter.jit.core.AITER_CONFIGS.get_config_file``, which merges
 the canonical ``aiter/configs/<name>.csv`` with every
 ``aiter/configs/model_configs/*<name>*.csv``, then ``update_config_files``
 de-duplicates on a key derived from the matching *untuned* CSV's columns and
@@ -33,13 +34,18 @@ Run:
     python3 -m unittest op_tests.tuning_tests.test_config_shape_collision -v
 """
 
+import contextlib
 import csv
 import errno
+import importlib.util
+import io
+import json
 import os
 import shutil
 import sys
 import tempfile
 import unittest
+from pathlib import Path
 from unittest import mock
 
 try:  # importing aiter requires torch; skip cleanly where it is unavailable.
@@ -137,6 +143,20 @@ class TestConfigShapeCollision(unittest.TestCase):
         core.AITER_ROOT_DIR = root
         _cache_clear()
         default_file = os.path.join(root, "aiter", "configs", f"{name}.csv")
+        if env_name == "AITER_CONFIG_GEMM_A4W4":
+            from aiter.utility import mxfp4_tuning
+
+            # A fresh resolver keeps the production freeze contract and isolates fixtures.
+            spec = importlib.util.spec_from_file_location(
+                "mxfp4_collision_check", mxfp4_tuning.__file__
+            )
+            resolver = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(resolver)
+            resolver._CONFIG_DIR = Path(default_file).parent
+            resolver._PROFILE_FILE = resolver._CONFIG_DIR / "mxfp4_profiles.json"
+            resolver._DEFAULT_FILE = resolver._CONFIG_DIR / "mxfp4_default_sources.json"
+            resolver._MODEL_DIR = resolver._CONFIG_DIR / "model_configs"
+            return resolver.get_mxfp4_config_file()
         return core.AITER_CONFIGS.get_config_file(env_name, default_file, name)
 
     def _check_family(self, env_name, name):
@@ -380,6 +400,71 @@ class TestConfigShapeCollision(unittest.TestCase):
         self.assertNotIn("10.5", canonical)
         self.assertIn("9.5", model)
 
+    def test_a4w4_tuner_reset_reads_candidate_after_frozen_baseline(self):
+        from aiter.ops import gemm_op_a4w4 as op
+        from aiter.utility import mxfp4_tuning
+
+        tuner_dir = Path(AITER_ROOT) / "csrc/ck_gemm_a4w4_blockscale"
+        with mock.patch.object(sys, "path", [str(tuner_dir), *sys.path]):
+            spec = importlib.util.spec_from_file_location(
+                "a4w4_tuner_cache_test", tuner_dir / "gemm_a4w4_blockscale_tune.py"
+            )
+            tuner_module = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(tuner_module)
+        spec = importlib.util.spec_from_file_location(
+            "aiter.utility.mxfp4_tuning", mxfp4_tuning.__file__
+        )
+        resolver = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(resolver)
+        config_dir = Path(self._tmp) / "aiter/configs"
+        baseline, candidate = config_dir / "before.csv", config_dir / "after.csv"
+        header = "gfx,cu_num,M,N,K,kernelName,splitK\n"
+        baseline.write_text(header + "gfx950,256,32,64,128,baseline,0\n")
+        candidate.write_text(header + "gfx950,256,32,64,128,candidate,0\n")
+        op.get_GEMM_config.cache_clear()
+        for attr in ("gemm_dict", "has_gfx"):
+            if hasattr(op.get_GEMM_config, attr):
+                delattr(op.get_GEMM_config, attr)
+        with (
+            mock.patch.dict(sys.modules, {"aiter.utility.mxfp4_tuning": resolver}),
+            mock.patch.dict(os.environ, {"AITER_CONFIG_GEMM_A4W4": str(baseline)}),
+            mock.patch.object(op, "get_gfx", return_value="gfx950"),
+            mock.patch.object(op, "get_cu_num", return_value=256),
+        ):
+            self.assertEqual(op.get_GEMM_config(32, 64, 128)["kernelName"], "baseline")
+            os.environ["AITER_CONFIG_GEMM_A4W4"] = str(candidate)
+            with self.assertRaisesRegex(RuntimeError, "already resolved"):
+                resolver.configure_mxfp4_tuning()
+            tuner = object.__new__(tuner_module.GemmA4W4BlockScaleTuner)
+            tuner._clear_op_caches()
+            self.assertEqual(op.get_GEMM_config(32, 64, 128)["kernelName"], "candidate")
+        op.get_GEMM_config.cache_clear()
+        for attr in ("gemm_dict", "has_gfx"):
+            if hasattr(op.get_GEMM_config, attr):
+                delattr(op.get_GEMM_config, attr)
+
+    def test_fix_preserves_opt_in_a4w4_tables(self):
+        config_dir = Path(self._tmp) / "aiter/configs"
+        profiles = json.loads((config_dir / "mxfp4_profiles.json").read_text())
+        paths = {
+            config_dir / "model_configs" / name
+            for names in profiles.values()
+            for name in names
+        }
+        before = {path: path.read_bytes() for path in paths}
+        module = sys.modules[__name__]
+        with (
+            mock.patch.object(module, "AITER_ROOT", self._tmp),
+            mock.patch.object(
+                module,
+                "FAMILIES",
+                [("AITER_CONFIG_GEMM_A4W4", "a4w4_blockscale_tuned_gemm")],
+            ),
+            contextlib.redirect_stdout(io.StringIO()),
+        ):
+            _fix_real_tree()
+        self.assertEqual({path: path.read_bytes() for path in paths}, before)
+
     def test_a4w4_blockscale(self):
         self._check_family("AITER_CONFIG_GEMM_A4W4", "a4w4_blockscale_tuned_gemm")
 
@@ -577,9 +662,8 @@ def _fix_real_tree():
     for env_name, name in FAMILIES:
         os.environ.pop(env_name, None)
         _cache_clear()
-        default_file = os.path.join(AITER_ROOT, "aiter", "configs", f"{name}.csv")
         try:
-            core.AITER_CONFIGS.get_config_file(env_name, default_file, name)
+            TestConfigShapeCollision._resolve(AITER_ROOT, env_name, name)
         except RuntimeError as e:
             if "duplicate shape" in str(e).lower():
                 fixed.append((name, str(e)))

@@ -1,0 +1,389 @@
+{
+  "baseline_revision": "ff745fb09d669f40cf81d15d3e7598b61fe2a61c",
+  "lookup": [
+    {
+      "default_keys": 2827,
+      "lookup_queries": 9482,
+      "default_lookup_differences": 0
+    },
+    {
+      "profile": "llama2_7b",
+      "profile_keys": 9,
+      "effective_keys": 2836,
+      "lookup_differences": 28,
+      "unrelated_differences": 0
+    },
+    {
+      "profile": "llama31_8b",
+      "profile_keys": 7,
+      "effective_keys": 2834,
+      "lookup_differences": 21,
+      "unrelated_differences": 0
+    },
+    {
+      "profile": "qwen3_8b",
+      "profile_keys": 8,
+      "effective_keys": 2835,
+      "lookup_differences": 25,
+      "unrelated_differences": 0
+    },
+    {
+      "profile": "qwen3_small",
+      "profile_keys": 13,
+      "effective_keys": 2839,
+      "lookup_differences": 41,
+      "unrelated_differences": 0
+    },
+    {
+      "profile": "qwen3_fsdp",
+      "profile_keys": 21,
+      "effective_keys": 2847,
+      "lookup_differences": 66,
+      "unrelated_differences": 0
+    }
+  ],
+  "gpu": {
+    "old": [
+      {
+        "mode": "old",
+        "torch": "2.11.0+rocm7.2",
+        "hip": "7.2.26015",
+        "triton": "3.7.0",
+        "aiter": "/work/aiter/__init__.py",
+        "device": "_CudaDeviceProperties(name='AMD Instinct MI355X', major=9, minor=5, gcnArchName='gfx950:sramecc+:xnack-', total_memory=294896MB, multi_processor_count=256, uuid=64333733-6337-6462-3838-643834363336, pci_bus_id=117, pci_device_id=0, pci_domain_id=0, L2_cache_size=4MB)"
+      },
+      {
+        "mode": "old",
+        "shape": [
+          1,
+          512,
+          4096
+        ],
+        "config": {
+          "kernelName": "_ZN5aiter41f4gemm_bf16_per1x32Fp4_BpreShuffle_32x128E",
+          "splitK": 0
+        },
+        "median_us": 22.15220034122467,
+        "reference_error": 0,
+        "gpu_kernels": [
+          "aiter::f4gemm_bf16_per1x32Fp4_BpreShuffle_32x128"
+        ],
+        "output_sha256": "1c1582eee459cc06caa06fd96747cd08a33f6ef1b6d247681f5eee6dcb618b67"
+      },
+      {
+        "mode": "old",
+        "shape": [
+          128,
+          7168,
+          4608
+        ],
+        "config": {
+          "kernelName": "_ZN5aiter41f4gemm_bf16_per1x32Fp4_BpreShuffle_32x128E",
+          "splitK": 0
+        },
+        "median_us": 22.288399934768677,
+        "reference_error": 0,
+        "gpu_kernels": [
+          "aiter::f4gemm_bf16_per1x32Fp4_BpreShuffle_32x128"
+        ],
+        "output_sha256": "efde064bc05b6f813e07dc8d7150a7c313a0a61a941d4ebe043e1bf28c594660"
+      },
+      {
+        "mode": "old",
+        "shape": [
+          1024,
+          1024,
+          8192
+        ],
+        "config": null,
+        "median_us": 24.32830035686493,
+        "reference_error": 0,
+        "gpu_kernels": [
+          "aiter::f4gemm_bf16_per1x32Fp4_BpreShuffle_192x128"
+        ],
+        "output_sha256": "70d1869eb2f6c1efeb6959c0d5469357e0fd547e22af605d2c58e4aac05bc3e7"
+      },
+      {
+        "mode": "old",
+        "shape": [
+          1023,
+          1024,
+          8192
+        ],
+        "config": null,
+        "median_us": 24.632299691438675,
+        "reference_error": 0,
+        "gpu_kernels": [
+          "aiter::f4gemm_bf16_per1x32Fp4_BpreShuffle_192x128"
+        ],
+        "output_sha256": "82b4bbed0512505bee0007fbc6a482a771aae43ac44275bf8703c5ab41baa3cf"
+      },
+      {
+        "mode": "old",
+        "shape": [
+          8192,
+          4096,
+          1024
+        ],
+        "config": {
+          "kernelName": "_ZN5aiter42f4gemm_bf16_per1x32Fp4_BpreShuffle_256x256E",
+          "splitK": 0
+        },
+        "median_us": 36.15640103816986,
+        "reference_error": 0,
+        "gpu_kernels": [
+          "aiter::f4gemm_bf16_per1x32Fp4_BpreShuffle_256x256"
+        ],
+        "output_sha256": "20d86f235844e80bfad2f7eb65ad39d97ef0899622fb023ec42384ad4aeabe61"
+      },
+      {
+        "mode": "old",
+        "shape": [
+          8191,
+          4096,
+          1024
+        ],
+        "config": {
+          "kernelName": "_ZN5aiter42f4gemm_bf16_per1x32Fp4_BpreShuffle_256x256E",
+          "splitK": 0
+        },
+        "median_us": 36.26440018415451,
+        "reference_error": 0,
+        "gpu_kernels": [
+          "aiter::f4gemm_bf16_per1x32Fp4_BpreShuffle_256x256"
+        ],
+        "output_sha256": "663decd058074621ed59985220b8c1478e2910cfae43b04de0b086db7466e178"
+      }
+    ],
+    "default": [
+      {
+        "mode": "default",
+        "torch": "2.11.0+rocm7.2",
+        "hip": "7.2.26015",
+        "triton": "3.7.0",
+        "aiter": "/work/aiter/__init__.py",
+        "device": "_CudaDeviceProperties(name='AMD Instinct MI355X', major=9, minor=5, gcnArchName='gfx950:sramecc+:xnack-', total_memory=294896MB, multi_processor_count=256, uuid=64333733-6337-6462-3838-643834363336, pci_bus_id=117, pci_device_id=0, pci_domain_id=0, L2_cache_size=4MB)"
+      },
+      {
+        "mode": "default",
+        "shape": [
+          1,
+          512,
+          4096
+        ],
+        "config": {
+          "kernelName": "_ZN5aiter41f4gemm_bf16_per1x32Fp4_BpreShuffle_32x128E",
+          "splitK": 0
+        },
+        "median_us": 22.004200518131256,
+        "reference_error": 0,
+        "gpu_kernels": [
+          "aiter::f4gemm_bf16_per1x32Fp4_BpreShuffle_32x128"
+        ],
+        "output_sha256": "1c1582eee459cc06caa06fd96747cd08a33f6ef1b6d247681f5eee6dcb618b67"
+      },
+      {
+        "mode": "default",
+        "shape": [
+          128,
+          7168,
+          4608
+        ],
+        "config": {
+          "kernelName": "_ZN5aiter41f4gemm_bf16_per1x32Fp4_BpreShuffle_32x128E",
+          "splitK": 0
+        },
+        "median_us": 22.20439985394478,
+        "reference_error": 0,
+        "gpu_kernels": [
+          "aiter::f4gemm_bf16_per1x32Fp4_BpreShuffle_32x128"
+        ],
+        "output_sha256": "efde064bc05b6f813e07dc8d7150a7c313a0a61a941d4ebe043e1bf28c594660"
+      },
+      {
+        "mode": "default",
+        "shape": [
+          1024,
+          1024,
+          8192
+        ],
+        "config": null,
+        "median_us": 24.092300236225128,
+        "reference_error": 0,
+        "gpu_kernels": [
+          "aiter::f4gemm_bf16_per1x32Fp4_BpreShuffle_192x128"
+        ],
+        "output_sha256": "70d1869eb2f6c1efeb6959c0d5469357e0fd547e22af605d2c58e4aac05bc3e7"
+      },
+      {
+        "mode": "default",
+        "shape": [
+          1023,
+          1024,
+          8192
+        ],
+        "config": null,
+        "median_us": 24.240300059318542,
+        "reference_error": 0,
+        "gpu_kernels": [
+          "aiter::f4gemm_bf16_per1x32Fp4_BpreShuffle_192x128"
+        ],
+        "output_sha256": "82b4bbed0512505bee0007fbc6a482a771aae43ac44275bf8703c5ab41baa3cf"
+      },
+      {
+        "mode": "default",
+        "shape": [
+          8192,
+          4096,
+          1024
+        ],
+        "config": {
+          "kernelName": "_ZN5aiter42f4gemm_bf16_per1x32Fp4_BpreShuffle_256x256E",
+          "splitK": 0
+        },
+        "median_us": 36.20840013027191,
+        "reference_error": 0,
+        "gpu_kernels": [
+          "aiter::f4gemm_bf16_per1x32Fp4_BpreShuffle_256x256"
+        ],
+        "output_sha256": "20d86f235844e80bfad2f7eb65ad39d97ef0899622fb023ec42384ad4aeabe61"
+      },
+      {
+        "mode": "default",
+        "shape": [
+          8191,
+          4096,
+          1024
+        ],
+        "config": {
+          "kernelName": "_ZN5aiter42f4gemm_bf16_per1x32Fp4_BpreShuffle_256x256E",
+          "splitK": 0
+        },
+        "median_us": 35.96440106630325,
+        "reference_error": 0,
+        "gpu_kernels": [
+          "aiter::f4gemm_bf16_per1x32Fp4_BpreShuffle_256x256"
+        ],
+        "output_sha256": "663decd058074621ed59985220b8c1478e2910cfae43b04de0b086db7466e178"
+      }
+    ],
+    "qwen3_fsdp": [
+      {
+        "mode": "qwen3_fsdp",
+        "torch": "2.11.0+rocm7.2",
+        "hip": "7.2.26015",
+        "triton": "3.7.0",
+        "aiter": "/work/aiter/__init__.py",
+        "device": "_CudaDeviceProperties(name='AMD Instinct MI355X', major=9, minor=5, gcnArchName='gfx950:sramecc+:xnack-', total_memory=294896MB, multi_processor_count=256, uuid=64333733-6337-6462-3838-643834363336, pci_bus_id=117, pci_device_id=0, pci_domain_id=0, L2_cache_size=4MB)"
+      },
+      {
+        "mode": "qwen3_fsdp",
+        "shape": [
+          1,
+          512,
+          4096
+        ],
+        "config": {
+          "kernelName": "_ZN5aiter41f4gemm_bf16_per1x32Fp4_BpreShuffle_32x128E",
+          "splitK": 0
+        },
+        "median_us": 22.224299609661102,
+        "reference_error": 0,
+        "gpu_kernels": [
+          "aiter::f4gemm_bf16_per1x32Fp4_BpreShuffle_32x128"
+        ],
+        "output_sha256": "1c1582eee459cc06caa06fd96747cd08a33f6ef1b6d247681f5eee6dcb618b67"
+      },
+      {
+        "mode": "qwen3_fsdp",
+        "shape": [
+          128,
+          7168,
+          4608
+        ],
+        "config": {
+          "kernelName": "_ZN5aiter41f4gemm_bf16_per1x32Fp4_BpreShuffle_32x128E",
+          "splitK": 0
+        },
+        "median_us": 21.77630066871643,
+        "reference_error": 0,
+        "gpu_kernels": [
+          "aiter::f4gemm_bf16_per1x32Fp4_BpreShuffle_32x128"
+        ],
+        "output_sha256": "efde064bc05b6f813e07dc8d7150a7c313a0a61a941d4ebe043e1bf28c594660"
+      },
+      {
+        "mode": "qwen3_fsdp",
+        "shape": [
+          1024,
+          1024,
+          8192
+        ],
+        "config": {
+          "kernelName": "_ZN5aiter41f4gemm_bf16_per1x32Fp4_BpreShuffle_32x128E",
+          "splitK": 0
+        },
+        "median_us": 22.888299822807312,
+        "reference_error": 0,
+        "gpu_kernels": [
+          "aiter::f4gemm_bf16_per1x32Fp4_BpreShuffle_32x128"
+        ],
+        "output_sha256": "70d1869eb2f6c1efeb6959c0d5469357e0fd547e22af605d2c58e4aac05bc3e7"
+      },
+      {
+        "mode": "qwen3_fsdp",
+        "shape": [
+          1023,
+          1024,
+          8192
+        ],
+        "config": {
+          "kernelName": "_ZN5aiter41f4gemm_bf16_per1x32Fp4_BpreShuffle_32x128E",
+          "splitK": 0
+        },
+        "median_us": 22.592299431562424,
+        "reference_error": 0,
+        "gpu_kernels": [
+          "aiter::f4gemm_bf16_per1x32Fp4_BpreShuffle_32x128"
+        ],
+        "output_sha256": "82b4bbed0512505bee0007fbc6a482a771aae43ac44275bf8703c5ab41baa3cf"
+      },
+      {
+        "mode": "qwen3_fsdp",
+        "shape": [
+          8192,
+          4096,
+          1024
+        ],
+        "config": {
+          "kernelName": "_ZN5aiter42f4gemm_bf16_per1x32Fp4_BpreShuffle_128x512E",
+          "splitK": 0
+        },
+        "median_us": 35.81649959087372,
+        "reference_error": 0,
+        "gpu_kernels": [
+          "aiter::f4gemm_bf16_per1x32Fp4_BpreShuffle_128x512"
+        ],
+        "output_sha256": "20d86f235844e80bfad2f7eb65ad39d97ef0899622fb023ec42384ad4aeabe61"
+      },
+      {
+        "mode": "qwen3_fsdp",
+        "shape": [
+          8191,
+          4096,
+          1024
+        ],
+        "config": {
+          "kernelName": "_ZN5aiter42f4gemm_bf16_per1x32Fp4_BpreShuffle_128x512E",
+          "splitK": 0
+        },
+        "median_us": 35.70059984922409,
+        "reference_error": 0,
+        "gpu_kernels": [
+          "aiter::f4gemm_bf16_per1x32Fp4_BpreShuffle_128x512"
+        ],
+        "output_sha256": "663decd058074621ed59985220b8c1478e2910cfae43b04de0b086db7466e178"
+      }
+    ]
+  }
+}

@@ -1,0 +1,10 @@
+{
+  "llama2_7b": ["llama2_7b_a4w4_blockscale_tuned_gemm.csv"],
+  "llama31_8b": ["llama31_8b_a4w4_blockscale_tuned_gemm.csv"],
+  "qwen3_8b": ["qwen3_8b_a4w4_blockscale_tuned_gemm.csv"],
+  "qwen3_small": ["qwen3_small_a4w4_blockscale_tuned_gemm.csv"],
+  "qwen3_fsdp": [
+    "qwen3_8b_a4w4_blockscale_tuned_gemm.csv",
+    "qwen3_small_a4w4_blockscale_tuned_gemm.csv"
+  ]
+}
