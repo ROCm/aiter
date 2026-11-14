@@ -41,29 +41,35 @@ _E2M1 = [
 ]
 
 
-def _weights(E, n_out, K, seed):
-    g = torch.Generator(device="cuda").manual_seed(seed)
+def _weights(E, n_out, K, seed, rng="cuda"):
+    g = torch.Generator(device=rng).manual_seed(seed)
     w = torch.randint(
-        0, 256, (E, n_out, K // 2), dtype=torch.uint8, device="cuda", generator=g
+        0, 256, (E, n_out, K // 2), dtype=torch.uint8, device=rng, generator=g
     )
     s = torch.randint(
-        120, 128, (E, n_out, K // 32), dtype=torch.uint8, device="cuda", generator=g
+        120, 128, (E, n_out, K // 32), dtype=torch.uint8, device=rng, generator=g
     )
-    return w, s
+    return w.cuda(), s.cuda()
 
 
-def generate_moe_mxfp4_bi_inputs(T, E, seed=0, h=H, n=N):
+def generate_moe_mxfp4_bi_inputs(T, E, seed=0, h=H, n=N, rng="cuda"):
     """(x, w13, w13_scale, w2, w2_scale, topk_weights, topk_ids) for T tokens and E
-    experts, all on the GPU."""
-    g = torch.Generator(device="cuda").manual_seed(seed)
-    w13, s13 = _weights(E, 2 * n, h, seed + 1)
-    w2, s2 = _weights(E, h, n, seed + 2)
-    x = torch.randn((T, h), dtype=torch.bfloat16, device="cuda", generator=g)
+    experts, all on the GPU. rng="cpu" gave the same values on every torch build
+    checked; the CUDA bf16 randn does not."""
+    g = torch.Generator(device=rng).manual_seed(seed)
+    w13, s13 = _weights(E, 2 * n, h, seed + 1, rng)
+    w2, s2 = _weights(E, h, n, seed + 2, rng)
+    if rng == "cpu":
+        x = torch.randn((T, h), dtype=torch.float32, generator=g).to(torch.bfloat16)
+    else:
+        x = torch.randn((T, h), dtype=torch.bfloat16, device=rng, generator=g)
     ids = torch.argsort(
-        torch.rand((T, E), dtype=torch.float32, device="cuda", generator=g), dim=1
+        torch.rand((T, E), dtype=torch.float32, device=rng, generator=g),
+        dim=1,
+        stable=True,
     )[:, :TOP_K]
-    tw = torch.rand((T, TOP_K), dtype=torch.float32, device="cuda", generator=g)
-    return x, w13, s13, w2, s2, tw, ids
+    tw = torch.rand((T, TOP_K), dtype=torch.float32, device=rng, generator=g)
+    return tuple(t.cuda() for t in (x, w13, s13, w2, s2, tw, ids))
 
 
 def _run(p, **kw):
@@ -304,12 +310,13 @@ def test_zero_tokens_non_contiguous(ep):
 @pytest.mark.parametrize("T,E", [(1, 32), (64, 32), (1024, 256)])
 def test_golden_bits(T, E):
     """The output bits are a contract: a change must bump BI_CONTRACT_VERSION and the
-    golden file."""
+    golden file. The inputs are drawn on the CPU: the CUDA RNG differs between torch
+    builds."""
     with open(GOLDEN) as f:
         golden = json.load(f)
     assert golden["contract_version"] == BI_CONTRACT_VERSION
     digest = hashlib.sha256(
-        _run(generate_moe_mxfp4_bi_inputs(T, E, seed=7))
+        _run(generate_moe_mxfp4_bi_inputs(T, E, seed=7, rng="cpu"))
         .view(torch.int16)
         .cpu()
         .numpy()
