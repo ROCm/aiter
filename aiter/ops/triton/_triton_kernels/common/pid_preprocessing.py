@@ -33,14 +33,24 @@ def remap_xcd_aid(
 ):
     """AID-aware remap for parts whose L2 is shared by the XCDs inside an AID, such as gfx1250.
 
-    Hardware dispatches round-robin over the W = NUM_AIDS * XCDS_PER_AID XCDs, so this gives each
-    XCD a contiguous run of pids and places same-AID XCDs next to each other. An AID then owns a
-    contiguous super-block of the tile space and operand-sharing tiles hit one shared L2.
-    AID_CONTIGUOUS selects between contiguous XCD groups and interleaved AIDs.
+    Hardware dispatches round-robin over the W = NUM_AIDS * XCDS_PER_AID XCDs, so pid % W is the
+    XCD. The L2 is per AID, not per XCD, so this blocks the tile space by AID and interleaves an
+    AID's XCDs inside its block. The XCDs that share an L2 then work on adjacent tiles at the
+    same time and share their operands in it.
+
+    Giving each XCD its own contiguous run instead, which is the obvious form, makes an AID's
+    total range contiguous but leaves its XCDs one run apart at any instant, so the shared L2
+    holds XCDS_PER_AID disjoint working sets.
+
+    AID_CONTIGUOUS says the hardware numbers an AID's XCDs consecutively; set it False when the
+    AIDs are interleaved. The two measure the same on gfx1250.
+
+    The map is a bijection for every GRID_MN: the permuted range is exactly
+    [0, (GRID_MN // W) * W), and the ragged tail above it maps to itself.
     """
     W: tl.constexpr = NUM_AIDS * XCDS_PER_AID
-    # The ragged tail maps to itself, which keeps the remap a bijection without per-XCD counting.
-    if pid >= (GRID_MN // W) * W:
+    blk = GRID_MN // W  # pids for one XCD
+    if pid >= blk * W:
         return pid
     xcd_g = pid % W
     pos = pid // W
@@ -50,8 +60,7 @@ def remap_xcd_aid(
     else:
         aid = xcd_g % NUM_AIDS
         xcd_l = xcd_g // NUM_AIDS
-    lx = aid * XCDS_PER_AID + xcd_l
-    return lx * (GRID_MN // W) + pos
+    return aid * (blk * XCDS_PER_AID) + pos * XCDS_PER_AID + xcd_l
 
 
 @triton.jit
