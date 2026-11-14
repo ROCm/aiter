@@ -22,7 +22,8 @@ last k-tile); DeepSeek-V4.1's shared-expert down projection has K = 576 at TP4.
 
 On gfx1250 this file also checks the mxfp8_32 GEMM's fused quant epilogue:
 ``y_scale_out`` must be byte-identical to quantize_fp8 of the unfused bf16
-output. gfx1250-strict runs that check alone.
+output, on the heuristic tile and on one tuned tile per epilogue branch
+(FUSED_QUANT_TILES). gfx1250-strict runs that check alone.
 
 Input magnitudes change every 32 K (and every 32 weight rows), so the e8m0
 scales differ block to block and a scale applied to the wrong block shows up
@@ -79,6 +80,16 @@ A8W8_1X32_GFX = ["gfx1250"]
 RAGGED_K_GFX = ["gfx1250"]
 # ATOM quantize_fp8's fp8 finite bound. The fused epilogue must match it.
 _FP8_MAX = 448.0
+# One tuned DSv4.1 tile per fused-quant epilogue branch: one 16-column WMMA
+# tile per warp (t16x64 nw4) keeps the LDS-staged quant, an even count (t32x64
+# nw2, t128x128 nw2) quantizes from the accumulators.
+FUSED_QUANT_TILES = (
+    "flydsl_bmm_mxfp8_32_wmma_t16x64x512_mw1_nw4_nb4_sk1_cm1_cn1",
+    "flydsl_bmm_mxfp8_32_wmma_t32x64x512_mw2_nw2_nb4_sk1_cm1_cn1",
+    "flydsl_bmm_mxfp8_32_wmma_t128x128x256_mw2_nw2_nb4_sk1_cm1_cn1",
+)
+# Ragged M for every tile above, at the DSv4.1 wo_a N, K.
+FUSED_QUANT_TILE_SHAPES = ((8, 48, 1024, 4096), (8, 200, 1024, 4096))
 
 
 def _to_e8m0_scale(scale):
@@ -344,8 +355,9 @@ def atom_quantize_fp8(y_bf16: torch.Tensor):
     return q.view(rows, c).contiguous(), code.to(torch.uint8).contiguous()
 
 
-def test_woa_fused_quant_epilogue(b, m, n, k):
-    """``y_scale_out`` must match quantize_fp8 of the unfused bf16 GEMM.
+def test_woa_fused_quant_epilogue(b, m, n, k, kernel_name=None):
+    """``y_scale_out`` must match quantize_fp8 of the unfused bf16 GEMM, both
+    run with ``kernel_name`` (the heuristic tile when None).
 
     Returns (scale mismatches, fp8 mismatches). The n32k4 weight scale needs
     a whole 128-K tile, and the quant needs N and B*N to be whole groups of 32.
@@ -366,12 +378,16 @@ def test_woa_fused_quant_epilogue(b, m, n, k):
     w_shuf = shuffle_weight(w8)
 
     y_bf16 = torch.empty(m, b, n, dtype=dtypes.bf16)
-    run_bmm_a8w8_mxfp8_32_gfx1250(x8, w_shuf, xs8, w_scale, y_bf16)
+    run_bmm_a8w8_mxfp8_32_gfx1250(
+        x8, w_shuf, xs8, w_scale, y_bf16, kernel_name=kernel_name
+    )
     y8_ref, yscale_ref = atom_quantize_fp8(y_bf16.view(m, b * n))
 
     y8 = torch.empty(m, b, n, dtype=dtypes.fp8)
     yscale = torch.empty(m * (b * n // 32), dtype=torch.uint8)
-    run_bmm_a8w8_mxfp8_32_gfx1250(x8, w_shuf, xs8, w_scale, y8, y_scale_out=yscale)
+    run_bmm_a8w8_mxfp8_32_gfx1250(
+        x8, w_shuf, xs8, w_scale, y8, kernel_name=kernel_name, y_scale_out=yscale
+    )
     scale_mismatch = int((yscale.view(m, b * n // 32) != yscale_ref).sum())
     fp8_mismatch = int(
         (
@@ -380,7 +396,7 @@ def test_woa_fused_quant_epilogue(b, m, n, k):
         ).sum()
     )
     print(
-        f"fused quant B={b} M={m} N={n} K={k}: "
+        f"fused quant B={b} M={m} N={n} K={k} tile {kernel_name or 'heuristic'}: "
         f"scale mismatch {scale_mismatch}/{m * b * n // 32}, "
         f"fp8 mismatch {fp8_mismatch}/{m * b * n}"
     )
@@ -401,13 +417,24 @@ def _fused_quant_shapes(args, include_ragged_m):
     return unique
 
 
-def _run_fused_quant(shapes):
+def _run_fused_quant(shapes, pin_tiles=False):
+    """Each shape on the heuristic tile; with ``pin_tiles`` also every
+    FUSED_QUANT_TILES entry on FUSED_QUANT_TILE_SHAPES."""
+    runs = [(shape, None) for shape in shapes]
+    if pin_tiles:
+        runs += [
+            (shape, name)
+            for name in FUSED_QUANT_TILES
+            for shape in FUSED_QUANT_TILE_SHAPES
+        ]
     bad = 0
     ran = 0
-    for b, m, n, k in shapes:
+    for (b, m, n, k), kernel_name in runs:
         if n % 32 or k % 128 or (b * n) % 32:
             continue
-        scale_mismatch, fp8_mismatch = test_woa_fused_quant_epilogue(b, m, n, k)
+        scale_mismatch, fp8_mismatch = test_woa_fused_quant_epilogue(
+            b, m, n, k, kernel_name
+        )
         ran += 1
         if scale_mismatch or fp8_mismatch:
             bad += 1
@@ -493,7 +520,7 @@ def main():
             if custom_shape
             else [(2, m, 1024, 4096) for m in (16, 48, 128, 256)]
         )
-        _run_fused_quant(shapes)
+        _run_fused_quant(shapes, pin_tiles=not custom_shape)
         return
 
     for dtype in args.dtype:
@@ -512,7 +539,10 @@ def main():
         summarize("batched_gemm (a8w4 and a8w8, each vs its BF16 reference)", gemm_rows)
 
     if arch == "gfx1250":
-        _run_fused_quant(_fused_quant_shapes(args, include_ragged_m=not custom_shape))
+        _run_fused_quant(
+            _fused_quant_shapes(args, include_ragged_m=not custom_shape),
+            pin_tiles=not custom_shape,
+        )
 
 
 if __name__ == "__main__":
