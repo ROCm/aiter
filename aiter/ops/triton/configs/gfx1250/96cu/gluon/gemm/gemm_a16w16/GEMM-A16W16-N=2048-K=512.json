@@ -1,0 +1,21 @@
+{
+    "DEFAULT_FALLBACK": true,
+    "M_LEQ_8192": {
+        "BLOCK_M": 256,
+        "BLOCK_N": 256,
+        "BLOCK_K": 64,
+        "NUM_BUFFERS": 4,
+        "num_warps": 8,
+        "kernel_type": "compute_bound",
+        "waves_per_eu": 2
+    },
+    "any": {
+        "BLOCK_M": 256,
+        "BLOCK_N": 256,
+        "BLOCK_K": 64,
+        "NUM_BUFFERS": 4,
+        "num_warps": 8,
+        "kernel_type": "compute_bound",
+        "waves_per_eu": 2
+    }
+}
