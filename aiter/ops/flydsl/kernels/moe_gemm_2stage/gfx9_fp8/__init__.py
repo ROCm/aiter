@@ -40,7 +40,9 @@ def compile_gemm(
     down_path="default",
     down_output_padding_bytes=0,
     fused_down_clear=False,
+    scale_k=None,
 ):
+    scale_kwargs = {} if scale_k is None else {"scale_k": scale_k}
     if stage == "gateup":
         if down_path != "default" or down_output_padding_bytes != 0:
             raise ValueError("Down-specific options cannot be used for Gate/Up")
@@ -59,6 +61,7 @@ def compile_gemm(
             activation=activation,
             swiglu_limit=swiglu_limit,
             fused_down_clear=fused_down_clear,
+            **scale_kwargs,
         )
     return compile_moe_gemm2(
         N=N,
@@ -77,4 +80,5 @@ def compile_gemm(
         swiglu_limit=swiglu_limit,
         down_path=down_path,
         down_output_padding_bytes=down_output_padding_bytes,
+        **scale_kwargs,
     )
