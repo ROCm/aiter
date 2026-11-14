@@ -2961,19 +2961,16 @@ _BP_ROOT = "opus_gemm_blockscale_mxscale_bpreshuffle_"
 a8w8_blockscale_mxscale_gemm_bpreshuffle_kernels_list = {}
 
 
-# JIT IDs are independent of CO availability and start at 100.
-_bpreshuffle_jit_kid_base = 100
 _BPRESHUFFLE_JIT_CACHES = ((0, 0), (1, 17), (17, 1))
 
 
-def _bpreshuffle_jit_configs(*, bms=(32, 48, 64, 96, 128), bns=(64, 128),
-                            wave_ns=(2, 4, 8), block_k=256, wgs=(1, 2)):
+def _bpreshuffle_jit_configs(bm, bn, wn, *, block_k=256, wgs=(1, 2),
+                            schedules=((2, 1), (3, 1), (3, 2), (4, 2))):
     configs = product(
-        bms, bns, wave_ns,
-        ((2, 1), (3, 1), (3, 2), (4, 2)), wgs,
+        schedules, wgs,
         _BPRESHUFFLE_JIT_CACHES, (0, 2),
     )
-    for bm, bn, wn, schedule, wg, caches, output in configs:
+    for schedule, wg, caches, output in configs:
         stages, ahead = schedule
         ca, cb = caches
         threads = wn * 64
@@ -3013,10 +3010,7 @@ def _bpreshuffle_b_jit_suffix(stages, bd, wg, ca, cb, output, pub=0):
 
 
 def _register_bpreshuffle_jit(entry, bm, bn, bk, wm, wn, max_k, *,
-                             wg=1, ca=0, cb=0):
-    global _next_bpreshuffle_jit_kid
-    kid = _next_bpreshuffle_jit_kid
-    _next_bpreshuffle_jit_kid += 1
+                             kid, wg=1, ca=0, cb=0):
     if kid in gfx950_co_kernels_declared or kid in a8w8_blockscale_mxscale_gemm_bpreshuffle_kernels_list:
         raise ValueError(f"duplicate gfx950 bpreshuffle kernel ID {kid}")
     entry["kid"] = kid
@@ -3032,7 +3026,7 @@ def _register_bpreshuffle_jit(entry, bm, bn, bk, wm, wn, max_k, *,
     )
 
 
-def _register_bpreshuffle_b_jit(bk, config, publish=None):
+def _register_bpreshuffle_b_jit(kid, bk, config, publish=None):
     bm, bn, wn, stages, ahead, wg, ca, cb, output, scale_cols = config
     family = "b_vgpr" if publish is None else "b_vgpr_overlap"
     pipeline = "prefetch_" + family
@@ -3057,7 +3051,7 @@ def _register_bpreshuffle_b_jit(bk, config, publish=None):
         entry["traits_header"] = "gfx950/opus_gemm_traits_a8w8_blockscale_mxscale_bpreshuffle_b_vgpr_gfx950.cuh"
     entry["m_align"] = 16
     _register_bpreshuffle_jit(
-        entry, bm, bn, bk, 1, wn, None, wg=wg, ca=ca, cb=cb,
+        entry, bm, bn, bk, 1, wn, None, kid=kid, wg=wg, ca=ca, cb=cb,
     )
 
 
@@ -3075,14 +3069,75 @@ def _bpreshuffle_m_repeat_legal(bm, bn, wm, panel):
     )
 
 
-def _bpreshuffle_b_vgpr_jit_configs():
-    """Generate each runtime-K B-VGPR configuration once."""
-    for config in _bpreshuffle_jit_configs():
-        yield 256, config
-    for config in _bpreshuffle_jit_configs(
-        bms=(128,), bns=(256,), wave_ns=(4,), block_k=128, wgs=(1,)
-    ):
-        yield 128, config
+# (first kid, BM, BN, WN), with BK=256 and WM=1. Unused geometry groups
+# containing ROCm 7.2.4 clang-22 MFMA crashes are removed from these sweeps.
+# Fixed group bases preserve the original IDs when a group is removed.
+_BPRESHUFFLE_B_VGPR_JIT_GEOMETRIES = (
+    (100, 32, 64, 2),
+    (148, 32, 64, 4),
+    (244, 32, 128, 4),
+    (292, 32, 128, 8),
+    (340, 48, 64, 2),
+    (388, 48, 64, 4),
+    (484, 48, 128, 4),
+    (532, 64, 64, 2),
+    (580, 64, 64, 4),
+    (676, 64, 128, 4),
+    (724, 64, 128, 8),
+    (814, 96, 64, 4),
+    (856, 96, 128, 2),
+    (898, 96, 128, 4),
+    (940, 96, 128, 8),
+    (970, 128, 64, 2),
+    (1000, 128, 64, 4),
+    (1030, 128, 128, 2),
+    (1060, 128, 128, 4),
+    (1090, 128, 128, 8),
+)
+_BPRESHUFFLE_B_VGPR_OVERLAP_JIT_GEOMETRIES = (
+    (2736, 32, 64, 2),
+    (2784, 32, 64, 4),
+    (2880, 32, 128, 4),
+    (2928, 32, 128, 8),
+    (2976, 48, 64, 2),
+    (3072, 48, 64, 4),
+    (3168, 48, 128, 2),
+    (3264, 48, 128, 4),
+    (3360, 64, 64, 2),
+    (3504, 64, 64, 4),
+    (3648, 64, 128, 2),
+    (3792, 64, 128, 4),
+    (3936, 64, 128, 8),
+    (4290, 96, 64, 4),
+    (4710, 96, 128, 4),
+    (4920, 96, 128, 8),
+    (5070, 128, 64, 2),
+    (5280, 128, 64, 4),
+    (5490, 128, 128, 2),
+    (5700, 128, 128, 4),
+    (5910, 128, 128, 8),
+)
+
+
+def _bpreshuffle_b_vgpr_jit_configs(*, overlap=False):
+    """Generate the retained geometry/schedule groups with their original IDs."""
+    geometries = (
+        _BPRESHUFFLE_B_VGPR_OVERLAP_JIT_GEOMETRIES
+        if overlap else _BPRESHUFFLE_B_VGPR_JIT_GEOMETRIES
+    )
+    for first_kid, bm, bn, wn in geometries:
+        # The unused p4 branch for this overlap geometry crashes clang-22.
+        schedules = ((2, 1), (3, 1), (3, 2))
+        if not (overlap and (bm, bn, wn) == (96, 128, 4)):
+            schedules += ((4, 2),)
+        configs = _bpreshuffle_jit_configs(bm, bn, wn, schedules=schedules)
+        publications = bm // 16 - 1 if overlap else 1
+        for offset, config in enumerate(configs):
+            yield first_kid + offset * publications, 256, config
+    if not overlap:
+        configs = _bpreshuffle_jit_configs(128, 256, 4, block_k=128, wgs=(1,))
+        for kid, config in enumerate(configs, start=1120):
+            yield kid, 128, config
 
 
 def _bpreshuffle_b_scale_columns(bm, bn, bk, wn, stages, wg):
@@ -3142,14 +3197,13 @@ def _bpreshuffle_m_repeat_jit_configs():
                 yield bm, bn, wm, panel, 0, *caches, fragments, False, 8
 
 
-_next_bpreshuffle_jit_kid = _bpreshuffle_jit_kid_base
-_bpreshuffle_b_configs = tuple(_bpreshuffle_b_vgpr_jit_configs())
-for _bk, _config in _bpreshuffle_b_configs:
-    _register_bpreshuffle_b_jit(_bk, _config)
+for _kid, _bk, _config in _bpreshuffle_b_vgpr_jit_configs():
+    _register_bpreshuffle_b_jit(_kid, _bk, _config)
 
 
-for (_bm, _bn, _wm, _panel, _gm, _ca, _cb,
-     _fragments, _bounded, _gn) in _bpreshuffle_m_repeat_jit_configs():
+for _kid, (_bm, _bn, _wm, _panel, _gm, _ca, _cb,
+           _fragments, _bounded, _gn) in enumerate(
+               _bpreshuffle_m_repeat_jit_configs(), start=1144):
     _args = (_bm, _bn, _panel, _wm, _gm, _ca, _cb,
              _fragments, _bounded, _gn)
     _register_bpreshuffle_jit(
@@ -3167,16 +3221,15 @@ for (_bm, _bn, _wm, _panel, _gm, _ca, _cb,
             "headers": ("gfx950/opus_gemm_pipeline_a8w8_blockscale_mxscale_bpreshuffle_m_repeat_gfx950.cuh",),
             "grid_layout": "n_m", "m_align": 16,
         },
-        _bm, _bn, 128, _wm, 2, _panel * 128, ca=_ca, cb=_cb,
+        _bm, _bn, 128, _wm, 2, _panel * 128, kid=_kid, ca=_ca, cb=_cb,
     )
 
 
 # Reuse the legal B-VGPR geometry/schedule sweep, with every publication point
 # before the final M repeat. Both pin switches remain disabled.
-for _bk, _config in _bpreshuffle_b_configs:
-    if _bk == 256:
-        for _publish in range(_config[0] // 16 - 1):
-            _register_bpreshuffle_b_jit(_bk, _config, _publish)
+for _first_kid, _bk, _config in _bpreshuffle_b_vgpr_jit_configs(overlap=True):
+    for _publish in range(_config[0] // 16 - 1):
+        _register_bpreshuffle_b_jit(_first_kid + _publish, _bk, _config, _publish)
 
 
 for _kid, _entry in gfx950_co_kernels_declared.items():
