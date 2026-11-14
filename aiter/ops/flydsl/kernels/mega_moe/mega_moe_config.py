@@ -52,14 +52,18 @@ KIMI_K3_EXPERTS_PER_RANK = 112
 # are tuned in their own right.
 R1_MODEL_DIM, R1_INTER_DIM = 7168, 2048
 V4_MODEL_DIM, V4_INTER_DIM = 7168, 3072
-# EP4 / EP2 DeepSeek-V4.1-Flash: (world_size, experts_per_rank, model_dim, inter_dim).
+# DeepSeek-V4.1-Flash: (world_size, experts_per_rank, model_dim, inter_dim).
+# EP8 owns 48 experts a rank, the same count as EP8 V4-Pro, so it uses that
+# schedule; the GEMM dims are kernel parameters. EP4 / EP2 own 96 / 192.
+V41_FLASH_EP8_LAYOUT = (8, 48, 5120, 2304)
 V41_FLASH_EP4_LAYOUT = (4, 96, 5120, 2304)
 V41_FLASH_EP2_LAYOUT = (2, 192, 5120, 2304)
 # (world_size, model_dim, inter_dim, experts, topk) of the layouts the fused (small- and large-input) kernels
-# serve: EP8 DeepSeek-V4-Pro and EP4 / EP2 DeepSeek-V4.1-Flash.
+# serve: EP8 DeepSeek-V4-Pro and EP8 / EP4 / EP2 DeepSeek-V4.1-Flash.
 FUSED_LAYOUTS = frozenset(
     {
         (8, V4_MODEL_DIM, V4_INTER_DIM, 8 * REFERENCE_EXPERTS_PER_RANK, 6),
+        (8, 5120, 2304, 8 * 48, 6),
         (4, 5120, 2304, 4 * 96, 6),
         (2, 5120, 2304, 2 * 192, 6),
     }
@@ -477,7 +481,8 @@ def large_m_mtprs_for(
 ) -> tuple[int, ...]:
     """Instance capacities the large-input kernel is built for on a FUSED_LAYOUTS layout.
 
-    EP8 DeepSeek-V4-Pro takes LARGE_M_MTPRS; EP4 DeepSeek-V4.1-Flash takes V41_FLASH_EP4_LARGE_M_MTPRS, the
+    EP8 DeepSeek-V4-Pro and EP8 DeepSeek-V4.1-Flash take LARGE_M_MTPRS (48 experts a rank, the V4-Pro
+    schedule). EP4 DeepSeek-V4.1-Flash takes V41_FLASH_EP4_LARGE_M_MTPRS, the
     capacities its one tune was measured at (see _tune_v41_flash_ep4_large).
     """
     if (world_size, model_dim, inter_dim) == (4, 5120, 2304):

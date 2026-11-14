@@ -91,6 +91,10 @@ V41_FLASH_QUANTS = ("a8w4",)
 # DeepSeek-V4.1-Flash EP2 deployment profile (epr192, the EP4 shape and MTPRs).
 V41_FLASH_EP2_WORLD_SIZE = 2
 V41_FLASH_EP2_EXPERTS_PER_RANKS = (192,)
+# DeepSeek-V4.1-Flash EP8 (epr48). Same MTPRs; the large-input route is the
+# V4-Pro capacity set, since this rank owns 48 experts.
+V41_FLASH_EP8_WORLD_SIZE = 8
+V41_FLASH_EP8_EXPERTS_PER_RANKS = (48,)
 WORLD_SIZE = 8
 TOPK = 6
 MODEL_DIM = 7168
@@ -158,7 +162,7 @@ def production_jobs(
     v41_flash_mtprs=V41_FLASH_MTPRS,
 ):
     """Every geometry the service ships: V4-Pro (default shape), Kimi-K3 and
-    V4.1-Flash EP4 and EP2 (``v41_flash_mtprs``, a8w4 in ``quants`` only).
+    V4.1-Flash EP8, EP4 and EP2 (``v41_flash_mtprs``, a8w4 in ``quants`` only).
 
     Used by the default build so every profile is AOT-covered and none
     triggers an online JIT compile at serving time.
@@ -180,6 +184,7 @@ def production_jobs(
         situ_linear_beta=K3_SITU_LINEAR_BETA,
     )
     for flash_world_size, flash_experts_per_ranks in (
+        (V41_FLASH_EP8_WORLD_SIZE, V41_FLASH_EP8_EXPERTS_PER_RANKS),
         (V41_FLASH_WORLD_SIZE, V41_FLASH_EXPERTS_PER_RANKS),
         (V41_FLASH_EP2_WORLD_SIZE, V41_FLASH_EP2_EXPERTS_PER_RANKS),
     ):
