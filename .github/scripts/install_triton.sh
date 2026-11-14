@@ -60,9 +60,9 @@ install_triton_from_wheelhouse() {
     return 0
 }
 
-# Triton 3.9.0 (git65ee8992) is validated from the temporary release_tmp channel.
+# Triton 3.9.0 (gitf1bf9132) is validated from the temporary release_tmp2 channel.
 TRITON_DEFAULT_ROCM_VERSION="${TRITON_DEFAULT_ROCM_VERSION:-7.2.0}"
-TRITON_INDEX_URL="https://pypi.amd.com/triton/release_tmp/rocm-${TRITON_DEFAULT_ROCM_VERSION}/simple/"
+TRITON_INDEX_URL="https://pypi.amd.com/triton/release_tmp2/rocm-${TRITON_DEFAULT_ROCM_VERSION}/simple/"
 ROCM_VERSION=$(dpkg -l rocm-core 2>/dev/null | awk '/^ii/{print $3}' || true)
 if [[ -z "$ROCM_VERSION" ]]; then
     # RPM-based systems (e.g. rocm-core-7.2.0.70200-43.el8.x86_64 -> 7.2.0.70200)
@@ -70,7 +70,7 @@ if [[ -z "$ROCM_VERSION" ]]; then
 fi
 if [[ -n "$ROCM_VERSION" ]]; then
     ROCM_MAJOR_MINOR=$(echo "$ROCM_VERSION" | cut -d. -f1,2)
-    TRITON_INDEX_URL="https://pypi.amd.com/triton/release_tmp/rocm-${ROCM_MAJOR_MINOR}.0/simple/"
+    TRITON_INDEX_URL="https://pypi.amd.com/triton/release_tmp2/rocm-${ROCM_MAJOR_MINOR}.0/simple/"
 else
     echo "rocm-core not found; using default ROCm version ${TRITON_DEFAULT_ROCM_VERSION}"
 fi
