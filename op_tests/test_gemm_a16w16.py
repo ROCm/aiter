@@ -687,6 +687,100 @@ def test_gemm_compile_packed_params(m=256, n=512, k=1024, layers=3):
     return rows
 
 
+def _asm_mismatches(x, w, out, block=1 << 28):
+    """Elements of out (all of them) that differ from an fp32 reference."""
+    m, k = x.shape
+    n = w.shape[0]
+    cb = min(n, max(64, block // k))
+    rb = min(m, max(1, block // max(cb, k)))
+    bad = 0
+    for c0 in range(0, n, cb):
+        wf = w[c0 : c0 + cb].float()
+        for r0 in range(0, m, rb):
+            ref = F.linear(x[r0 : r0 + rb].float(), wf).to(out.dtype)
+            got = out[r0 : r0 + rb, c0 : c0 + cb]
+            bad += int((~torch.isclose(got, ref, rtol=1e-2, atol=1e-2)).sum())
+    return bad
+
+
+def test_asm_4gib_operands():
+    """A, B and out of 4 GiB or more.
+
+    Each operand's buffer descriptor holds a 32-bit size. The gfx950 kernels
+    give every tile its own 64-bit base, so they must be exact past 4 GiB; the
+    gfx942 kernels use one descriptor per operand, so the launcher must refuse.
+    """
+    gfx = get_gfx()
+    if gfx not in ("gfx942", "gfx950"):
+        return []
+    k_ab = 8192
+    over_ab = (1 << 31) // k_ab + 256
+    k_clean = (1 << 16) + 256
+    # (operand, M, N, K, out dtype, kernels as (name, bpreshuffle, splitK));
+    # name None is the heuristic.
+    plain = [
+        (None, False, None),
+        ("_ZN5aiter24bf16gemm_bf16_tn_256x256E", False, 1),
+        ("_ZN5aiter36bf16gemm_bf16_tn_256x256_bpreshuffleE", True, 1),
+        ("_ZN5aiter37bf16gemm_fp32bf16_tn_64x64_pf3_splitkE", False, 1),
+        ("_ZN5aiter42bf16gemm_fp32bf16_tn_64x64_bshuffle_splitkE", True, 1),
+    ]
+    # *_clean kernels split K and need at most 1024 tiles, so only A or B
+    # can reach 4 GiB.
+    clean = [
+        ("_ZN5aiter39bf16gemm_fp32bf16_tn_64x64_splitk_cleanE", False, 2),
+        ("_ZN5aiter48bf16gemm_fp32bf16_tn_64x64_bshuffle_splitk_cleanE", True, 2),
+    ]
+    cases = [
+        ("A", over_ab, 256, k_ab, dtypes.bf16, plain),
+        ("B", 256, over_ab, k_ab, dtypes.bf16, plain),
+        ("out", 16384, (1 << 31) // 16384 + 256, 128, dtypes.bf16, plain),
+        ("out", 16384, (1 << 30) // 16384 + 256, 128, dtypes.fp32, plain),
+        ("A", 32768, 64, k_clean, dtypes.fp32, clean),
+        ("B", 64, 32768, k_clean, dtypes.fp32, clean),
+    ]
+    if gfx == "gfx942":
+        cases = [c[:5] + ([(None, False, None)],) for c in cases[:3]]
+    rows = []
+    for operand, m, n, k, otype, kernels in cases:
+        need = 2 * (m * k + 2 * n * k) + m * n * otype.itemsize + (4 << 30)
+        if torch.cuda.mem_get_info()[0] < need:
+            aiter.logger.warning(
+                "skip asm 4 GiB %s check: needs %.1f GiB free", operand, need / 2**30
+            )
+            continue
+        x = torch.randn(m, k, dtype=dtypes.bf16, device="cuda")
+        w = torch.randn(n, k, dtype=dtypes.bf16, device="cuda")
+        wshuffle = None
+        out = torch.empty(m, n, dtype=otype, device="cuda")
+        shape = f"{operand} > 4 GiB {(m, n, k)} {otype}"
+        for name, bpreshuffle, split in kernels:
+            if bpreshuffle and wshuffle is None:
+                wshuffle = shuffle_weight(w, layout=(16, 16))
+            out.fill_(float("nan"))
+            case = f"asm {name or 'heuristic'} {shape}"
+            try:
+                aiter.gemm_a16w16_asm(
+                    x,
+                    wshuffle if bpreshuffle else w,
+                    out,
+                    None,
+                    split,
+                    name,
+                    bpreshuffle,
+                )
+            except RuntimeError as e:
+                assert gfx == "gfx942" and "smaller than 4 GiB" in str(e), e
+                rows.append({"case": case, "result": "rejected"})
+                continue
+            assert gfx == "gfx950", f"{case}: not rejected on {gfx}"
+            bad = _asm_mismatches(x, w, out)
+            assert bad == 0, f"{case}: {bad} of {m * n} elements wrong"
+            rows.append({"case": case, "result": "exact"})
+        del x, w, wshuffle, out
+    return rows
+
+
 parser = argparse.ArgumentParser(
     formatter_class=argparse.RawTextHelpFormatter,
     description="config input of a16w16_gemm_test",
@@ -696,13 +790,14 @@ parser.add_argument(
     "--test",
     type=str,
     nargs="*",
-    choices=["normal", "skinny", "out", "compile"],
-    default=["normal"],
+    choices=["normal", "skinny", "out", "compile", "asm_4g"],
+    default=["normal", "asm_4g"],
     help="""Select test to run.
-    e.g.: -t normal    # default
+    e.g.: -t normal asm_4g    # default
           or -t skinny
           or -t out    # tgemm.mm(out=) on every backend
-          or -t compile    # torch.compile with weights/biases in one storage""",
+          or -t compile    # torch.compile with weights/biases in one storage
+          or -t asm_4g    # asm with A, B or out of 4 GiB""",
 )
 parser.add_argument(
     "-d",
@@ -792,6 +887,8 @@ for test in args.test:
         df += test_gemm_out()
     elif test == "compile":
         df += test_gemm_compile_packed_params()
+    elif test == "asm_4g":
+        df += test_asm_4gib_operands()
 df = pd.DataFrame(df)
 df_md = df.to_markdown(index=False)
 aiter.logger.info("gemm_a16w16 summary (markdown):\n%s", df_md)

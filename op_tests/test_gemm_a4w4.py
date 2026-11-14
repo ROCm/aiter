@@ -245,6 +245,86 @@ def test_gemm(dtype, M, N, K):
     return ret
 
 
+def _quant_rows(rows, k, chunk=65536):
+    """Random MXFP4 rows, quantized in chunks so no bf16 copy of the whole
+    tensor is needed. Returns data, plain scales and shuffled scales."""
+    quant_func = aiter.get_triton_quant(aiter.QuantType.per_1x32)
+    q, s, s_sh = [], [], []
+    for r0 in range(0, rows, chunk):
+        t = torch.randn((min(chunk, rows - r0), k), dtype=dtypes.bf16)
+        _, scales = quant_func(t, shuffle=False)
+        tq, scales_sh = quant_func(t, shuffle=True)
+        q.append(tq)
+        s.append(scales.view(torch.uint8)[: t.shape[0]])
+        s_sh.append(scales_sh[: t.shape[0]])
+    return torch.cat(q), torch.cat(s), torch.cat(s_sh)
+
+
+def check_asm_4gib_operands():
+    """A, B and out of 4 GiB or more on the 256x256 asm kernels.
+
+    Each operand's buffer descriptor holds a 32-bit size. The 256x256 kernels
+    give every tile its own 64-bit base, so every element must be exact past
+    4 GiB, picked by the heuristic or by name, with and without split-K.
+    """
+    bpre_256x256 = "_ZN5aiter42f4gemm_bf16_per1x32Fp4_BpreShuffle_256x256E"
+    nobpre_256x256 = "_ZN5aiter44f4gemm_bf16_per1x32Fp4_noBpreShuffle_256x256E"
+    # (name, bpreshuffle, log2_k_split); name "" is the heuristic.
+    bpre = [("", True, None), (bpre_256x256, True, 0), (bpre_256x256, True, 1)]
+    # noBpreShuffle_256x256 writes whole 256-row tiles, so M is a multiple of 256.
+    nobpre = [(nobpre_256x256, False, 0)]
+    over_ab = (1 << 33) // 8192 + 256
+    cases = [
+        ("out", 20192, 106496, 512, bpre),
+        ("A", over_ab, 256, 8192, bpre + nobpre),
+        ("B", 256, over_ab, 8192, bpre + nobpre),
+    ]
+    for operand, m, n, k, kernels in cases:
+        need = m * k + n * k + 2 * m * n + (4 << 30)
+        if torch.cuda.mem_get_info()[0] < need:
+            aiter.logger.warning(
+                "skip a4w4 asm 4 GiB %s check: needs %.1f GiB free",
+                operand,
+                need / 2**30,
+            )
+            continue
+        x, x_scales, x_scales_shuffle = _quant_rows(m, k)
+        w, w_scales, w_scales_shuffle = _quant_rows(n, k)
+        wshuffle = shuffle_weight(w, layout=(16, 16))
+        out = torch.empty((m, n), dtype=dtypes.bf16)
+        cb = min(n, (1 << 28) // k)
+        rb = min(m, (1 << 28) // max(cb, k))
+        for name, bpreshuffle, log2_k_split in kernels:
+            out.fill_(float("nan"))
+            aiter.gemm_a4w4_asm(
+                x,
+                wshuffle if bpreshuffle else w,
+                x_scales_shuffle,
+                w_scales_shuffle,
+                out,
+                name,
+                bpreshuffle=bpreshuffle,
+                log2_k_split=log2_k_split,
+            )
+            bad = 0
+            for c0 in range(0, n, cb):
+                for r0 in range(0, m, rb):
+                    rows, cols = slice(r0, r0 + rb), slice(c0, c0 + cb)
+                    ref = run_torch(
+                        x[rows], w[cols], x_scales[rows], w_scales[cols], dtypes.bf16
+                    ).float()
+                    # Split-K adds bf16 partial sums with bf16 atomics.
+                    atol = 1e-2
+                    if log2_k_split:
+                        atol = 4e-2 * float(ref.square().mean().sqrt())
+                    got = out[rows, cols].float()
+                    bad += int((~torch.isclose(got, ref, rtol=1e-2, atol=atol)).sum())
+            case = f"a4w4 asm {name or 'heuristic'} log2_k_split={log2_k_split}"
+            assert bad == 0, f"{case}: {bad} of {m * n} elements wrong at {(m, n, k)}"
+            aiter.logger.info(f"{case} {operand} > 4 GiB {(m, n, k)}: exact")
+        del x, w, wshuffle, out
+
+
 def tuned_shapes():
     """CSV-selected preshuffle shapes on gfx950; all tuned shapes on gfx1250."""
     gfx950 = get_gfx() == "gfx950"
@@ -411,6 +491,8 @@ def main():
         for m, n, k in shapes:
             ret = test_gemm(dtype, m, n, k)
             df.append(ret)
+    if get_gfx() == "gfx950":
+        check_asm_4gib_operands()
     df = pd.DataFrame(df)
     df_md = df.to_markdown(index=False)
     aiter.logger.info("gemm_a4w4 summary (markdown):\n%s", df_md)
