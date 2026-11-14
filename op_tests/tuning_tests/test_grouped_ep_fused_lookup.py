@@ -15,20 +15,26 @@ Run:
         op_tests.tuning_tests.test_grouped_ep_fused_lookup -v
 """
 
+import csv
 import os
 import unittest
+from pathlib import Path
 from types import SimpleNamespace
+from unittest import mock
 
 os.environ.setdefault("GPU_ARCHS", "gfx1250")
 os.environ.setdefault("CU_NUM", "256")
 
 try:
     from aiter import ActivationType, QuantType, dtypes
-    from aiter.ops.flydsl.grouped_moe_gfx1250 import _find_grouped_config
+    from aiter.ops.flydsl.grouped_moe_gfx1250 import (
+        _find_grouped_config,
+        _get_padded_m,
+    )
 
     _IMPORT_ERR = None
 except Exception as e:  # noqa: BLE001
-    ActivationType = QuantType = dtypes = _find_grouped_config = None
+    ActivationType = QuantType = dtypes = _find_grouped_config = _get_padded_m = None
     _IMPORT_ERR = e
 
 try:
@@ -120,6 +126,162 @@ class GroupedEpFusedLookupTest(unittest.TestCase):
             recv_bound=512,
         )
         self.assertEqual(align_512, 64)
+
+
+class GroupedNonEpTokenFallbackTest(unittest.TestCase):
+    """Token overflow reuses only compatible EP or non-EP configurations."""
+
+    def setUp(self):
+        if _IMPORT_ERR is not None:
+            self.skipTest(f"aiter import failed: {_IMPORT_ERR}")
+        self.rows = []
+        patcher = mock.patch(
+            "aiter.ops.flydsl.grouped_moe_gfx1250._load_grouped_config_rows",
+            return_value=self.rows,
+        )
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        for target, value in (
+            ("aiter.ops.flydsl.grouped_moe_gfx1250.get_gfx", "gfx1250"),
+            ("aiter.jit.utils.chip_info.get_cu_num", 256),
+        ):
+            patcher = mock.patch(target, return_value=value)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+        _find_grouped_config.cache_clear()
+        self.addCleanup(_find_grouped_config.cache_clear)
+
+    def add_row(self, token, **overrides):
+        row = {
+            "gfx": "gfx1250",
+            "cu_num": "256",
+            "token": str(token),
+            "model_dim": "5120",
+            "inter_dim": "2304",
+            "expert": "96",
+            "topk": "6",
+            "act_type": "ActivationType.Silu",
+            "dtype": "torch.bfloat16",
+            "q_dtype_a": str(dtypes.fp4x2),
+            "q_dtype_w": str(dtypes.fp4x2),
+            "q_type": "QuantType.per_1x32",
+            "ep_fused": "",
+            "us": "0",
+        }
+        row.update(overrides)
+        self.rows.append(row)
+        return row
+
+    def lookup(self, token, *, topk=6, ep_fused=False):
+        return _find_grouped_config(
+            token_num=token,
+            model_dim=5120,
+            inter_dim=2304,
+            experts=96,
+            topk=topk,
+            activation=ActivationType.Silu,
+            dtype=dtypes.bf16,
+            q_dtype_a=dtypes.fp4x2,
+            q_dtype_w=dtypes.fp4x2,
+            quant_type=QuantType.per_1x32,
+            ep_fused=ep_fused,
+        )
+
+    def test_largest_compatible_token(self):
+        self.add_row(8192)
+        expected = self.add_row("16384.0")
+        for field, value in (
+            ("gfx", "gfx950"),
+            ("model_dim", "7168"),
+            ("inter_dim", "2048"),
+            ("expert", "64"),
+            ("topk", "-1"),
+            ("act_type", "ActivationType.Swiglu"),
+            ("dtype", "torch.float16"),
+            ("q_dtype_a", "torch.float8_e4m3fn"),
+            ("q_dtype_w", "torch.float8_e4m3fn"),
+            ("q_type", "QuantType.per_Tensor"),
+            ("ep_fused", "1"),
+        ):
+            self.add_row(131072, **{field: value})
+        self.assertIs(self.lookup(32768), expected)
+
+    def test_exact_token_wins(self):
+        expected = self.add_row(32768)
+        self.add_row(131072)
+        self.assertIs(self.lookup(32768), expected)
+
+    def test_cu_preference_and_relaxed_fallback(self):
+        expected = self.add_row(16384)
+        other_cu = self.add_row(8192, cu_num="128")
+        self.assertIs(self.lookup(32768), expected)
+        self.assertIs(self.lookup(8192), other_cu)
+        self.rows.remove(expected)
+        _find_grouped_config.cache_clear()
+        self.assertIs(self.lookup(32768), other_cu)
+
+    def test_missing_token_below_maximum_does_not_fall_back(self):
+        largest = self.add_row(16384)
+        self.assertIsNone(self.lookup(8192))
+        self.assertIs(self.lookup(32768), largest)
+
+    def test_scatter_specificity_is_preserved(self):
+        for topk in (6, -1):
+            with self.subTest(topk=topk):
+                self.add_row(16384, topk=str(topk), us="1")
+                plain = self.add_row(16384, topk=str(topk), ep_fused="0")
+                fused = self.add_row(16384, topk=str(topk), ep_fused="1")
+                self.assertIs(self.lookup(32768, topk=topk), plain)
+                self.assertIs(self.lookup(32768, topk=topk, ep_fused=True), fused)
+
+    def test_ep_fallback_keeps_topk_and_model_separate(self):
+        ep = self.add_row(16384, topk="-1")
+        self.add_row(16384, model_dim="7168")
+        self.assertIsNone(self.lookup(32768))
+        self.add_row(65536)
+        self.assertIs(self.lookup(32768, topk=-1), ep)
+        self.assertIsNone(self.lookup(8192, topk=-1))
+
+    def test_flash_csv_32768_uses_16384(self):
+        path = (
+            Path(__file__).resolve().parents[2]
+            / "aiter/configs/model_configs/dsv41_flash_tuned_grouped_fmoe.csv"
+        )
+        with path.open() as stream:
+            self.rows.extend(csv.DictReader(stream))
+        row = self.lookup(32768)
+        self.assertEqual(row["token"], "16384")
+        self.assertEqual(row["topk"], "6")
+        self.assertEqual(
+            tuple(row[key] for key in ("cluster_m", "cluster_n")), ("4", "2")
+        )
+        for token in (16385, 32768, 32769, 65536, 65537, 131072, 262144):
+            with self.subTest(token=token):
+                self.assertEqual(self.lookup(_get_padded_m(token)), row)
+        for exponent in range(15):
+            token = 1 << exponent
+            with self.subTest(exact_token=token):
+                self.assertEqual(self.lookup(_get_padded_m(token))["token"], str(token))
+
+    def test_token_padding_has_one_upper_bound(self):
+        for token, expected in (
+            (1, 1),
+            (3, 4),
+            (16385, 32768),
+            (32768, 32768),
+            (32769, 65536),
+            (65536, 65536),
+            (65537, 131072),
+            (131072, 131072),
+            (262144, 131072),
+        ):
+            with self.subTest(token=token):
+                self.assertEqual(_get_padded_m(token), expected)
+
+    def test_ep_65536_row_can_be_selected_after_padding(self):
+        self.add_row(32768, topk="-1")
+        expected = self.add_row(65536, topk="-1")
+        self.assertIs(self.lookup(_get_padded_m(65536), topk=-1), expected)
 
 
 if __name__ == "__main__":
