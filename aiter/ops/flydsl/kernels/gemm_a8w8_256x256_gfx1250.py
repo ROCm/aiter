@@ -27,11 +27,15 @@ from .kernels_common import format_kernel_name
 from .mxfp8_sched_hints_gfx1250 import (
     ENABLE_ASM_PIPE,
     ENABLE_LOAD_FIRST,
+    ENABLE_LOAD_FIRST_AUTO,
     ENABLE_PIN_B128,
     ENABLE_PIN_SCALE,
     ENABLE_SCHED_VGPR,
     ENABLE_SHORT_BEAT,
+    ENABLE_MIDK_WAR,
+    MIDK_Q0_START,
     SA_PANEL_CLASS0,
+    SA_PANEL_CLASS1,
     pin_a_frag,
     pin_acc_vec,
     pin_b_frag,
@@ -147,12 +151,18 @@ def launch_gemm_a8w8_256x256(
     UNROLL = KPAIR * num_buffers
     SUPER_K = tile_k * KPAIR
     # Short-K (class 0): SA_PANEL_CLASS0 widens the A-scale panel; stages>1
-    # disables c_relocate. Default 4. Mid/long K keep fat panel (8/4/1).
+    # disables c_relocate. Default 4. Mid-K (class 1) uses SA_PANEL_CLASS1
+    # (default 8); stages==1 unlocks persistent c_relocate. Long-K / nb3/nb4
+    # keep legacy 8/4/1.
     SA_PANEL_STAGES = (
         (
             SA_PANEL_CLASS0
             if k_tiles_class == 0 and num_buffers == 2
-            else (8 if num_buffers == 2 else 4 if num_buffers == 3 else 1)
+            else (
+                SA_PANEL_CLASS1
+                if k_tiles_class == 1 and num_buffers == 2
+                else (8 if num_buffers == 2 else 4 if num_buffers == 3 else 1)
+            )
         )
         if mx32 and not a_scale_preshuffled
         else 1
@@ -284,6 +294,9 @@ def launch_gemm_a8w8_256x256(
         arg_out: fx.Pointer,
         tile_idx=0,
     ):
+        # Allow back-to-back WMMA issue (SCHED_MODE bit 4). Other gfx1250 MX
+        # GEMMs already set this; omitting it leaves a stall between MFMA waves.
+        rocdl.disable_xdl_arb_stall()
         K_TILES = i32_k // (tile_k * split_k)
         k64 = fx.Int64(i32_k)
         lda64 = fx.Int64(i32_lda)
@@ -788,17 +801,41 @@ def launch_gemm_a8w8_256x256(
         # hints via ASM_PIPE_ACTIVE. SHORT_BEAT optionally adds light beats
         # on class 0 without enabling WAR.
         ASM_PIPE_ACTIVE = const_expr(ENABLE_ASM_PIPE and k_tiles_class > 0)
+        # Mid-K (class 1): park ds bursts on consecutive MMA slots and drop the
+        # Q0 WAR gap (q0_start=0) for denser WMMA↔DS interleave vs spaced bursts.
+        DENSE_MIDK = const_expr(ASM_PIPE_ACTIVE and k_tiles_class == 1)
         SHORT_BEAT = const_expr(
-            ENABLE_SHORT_BEAT and ENABLE_ASM_PIPE and k_tiles_class == 0
+            ENABLE_SHORT_BEAT
+            and ENABLE_ASM_PIPE
+            and (k_tiles_class == 0 or k_tiles_class == 1)
         )
         BEAT_ACTIVE = const_expr(ASM_PIPE_ACTIVE or SHORT_BEAT)
-        LOAD_FIRST = const_expr(ENABLE_LOAD_FIRST)
+        # Auto: mid/long-K persistent — measured ~10µs win on 25600×6144;
+        # force-on regresses short-K (1280) and small non-ps (2304).
+        LOAD_FIRST = const_expr(
+            ENABLE_LOAD_FIRST
+            or (
+                ENABLE_LOAD_FIRST_AUTO
+                and ENABLE_ASM_PIPE
+                and k_tiles_class > 0
+                and persistent_n_tiles > 1
+            )
+        )
+        # Scale pin helps huge-N mid-K (6144) but regresses short-K (~2× on
+        # 1280) when applied globally — gate to class1 + persistent only.
+        PIN_SCALE_ACTIVE = const_expr(
+            ENABLE_PIN_SCALE and k_tiles_class == 1 and persistent_n_tiles > 1
+        )
+        # Legacy: non-mx short-K only. Mid-K mx32 can opt into the a4w4 WAR
+        # soft-pipe (denser _spread / Q-region hints) via MIDK_WAR=1.
         WAR_SCHED = const_expr(
             tile_m == 256
             and half_m == 4
             and half_n == 4
-            and k_tiles_class == 0
-            and not mx32
+            and (
+                (k_tiles_class == 0 and not mx32)
+                or (mx32 and k_tiles_class == 1 and ENABLE_ASM_PIPE and ENABLE_MIDK_WAR)
+            )
         )
 
         def _asm_sched_hint(n_ds_bursts):
@@ -901,7 +938,7 @@ def launch_gemm_a8w8_256x256(
                 def _go_sa(sm=sm):
                     # Optional pin of scale *load result* (not LDS address).
                     w = _stage_load_sa_raw(stage, sm, sa_super)
-                    if const_expr(ENABLE_PIN_SCALE):
+                    if const_expr(PIN_SCALE_ACTIVE):
                         w = pin_scale_word(w, sm)
                     seed_sa[sm].store(Vec.from_elements([w], fx.Int32))
 
@@ -910,7 +947,7 @@ def launch_gemm_a8w8_256x256(
 
                 def _go_sb(sn=sn):
                     w = _stage_load_sb_raw(stage, sn)
-                    if const_expr(ENABLE_PIN_SCALE):
+                    if const_expr(PIN_SCALE_ACTIVE):
                         w = pin_scale_word(w, N_SA + sn)
                     seed_sb[sn].store(Vec.from_elements([w], fx.Int32))
 
@@ -1086,7 +1123,13 @@ def launch_gemm_a8w8_256x256(
                             16, _join(parts[i]), kind=kind, slot=i
                         )
 
-                per = const_expr(DS_PER_FRAG if mx32 or tile_m != 256 else 1)
+                # Mid-K: split to one b128 per thunk (fills the quadrant; best
+                # absolute on 6144). Else one thunk = DS_PER_FRAG×b128 burst.
+                per = const_expr(
+                    1
+                    if DENSE_MIDK
+                    else (DS_PER_FRAG if mx32 or tile_m != 256 else 1)
+                )
                 return [
                     (
                         lambda i=i, base=base: [
@@ -1199,12 +1242,12 @@ def launch_gemm_a8w8_256x256(
                     sa_next = sa_super + int(stage % KPAIR == KPAIR - 1)
                     for sm in range_constexpr(N_SA):
                         w = _stage_load_sa_raw(next_stage, sm, sa_next)
-                        if const_expr(ENABLE_PIN_SCALE):
+                        if const_expr(PIN_SCALE_ACTIVE):
                             w = pin_scale_word(w, sm)
                         seed_sa[sm].store(Vec.from_elements([w], fx.Int32))
                     for sn in range_constexpr(N_SB):
                         w = _stage_load_sb_raw(next_stage, sn)
-                        if const_expr(ENABLE_PIN_SCALE):
+                        if const_expr(PIN_SCALE_ACTIVE):
                             w = pin_scale_word(w, N_SA + sn)
                         seed_sb[sn].store(Vec.from_elements([w], fx.Int32))
 
@@ -1212,15 +1255,18 @@ def launch_gemm_a8w8_256x256(
                     out = {}
                     if const_expr(len(thunks) == 0):
                         return out
-                    # ASM: ~4× ds_load_b128 per WMMA as one burst. Park bursts
-                    # on spaced MMA slots in [lo, hi]; closing hint asks RA for
-                    # 1 WMMA : 4 ds_load interleave.
+                    # ASM: ~4× ds_load_b128 per WMMA as one burst. Default: park
+                    # bursts on spaced MMA slots in [lo, hi]. Mid-K dense: park
+                    # consecutive slots from ``lo`` (tighter WMMA↔DS packing).
                     if const_expr(ASM_PIPE_ACTIVE):
                         n = len(thunks)
                         n_bursts = (n + DS_PER_FRAG - 1) // DS_PER_FRAG
                         span = hi - lo + 1
                         for b in range_constexpr(n_bursts):
-                            slot = lo + (b * span) // n_bursts
+                            if const_expr(DENSE_MIDK):
+                                slot = min(lo + b, hi)
+                            else:
+                                slot = lo + (b * span) // n_bursts
                             beg = b * DS_PER_FRAG
                             end = min(beg + DS_PER_FRAG, n)
                             out.setdefault(slot, []).extend(thunks[beg:end])
@@ -1396,7 +1442,16 @@ def launch_gemm_a8w8_256x256(
             def _seq(thunks, extra=(), start=0):
                 # ASM_PIPE Q0 uses start=4 (WAR gap). Per-producer `_asm_beat`
                 # (not stride spacing) won the long-K A/B.
+                # Mid-K with burst thunks: optional leading pure WMMA (start 0→1)
+                # when there is room. Split-per-1 fills all slots (no bump).
                 n_slots = half_m * half_n
+                if const_expr(
+                    DENSE_MIDK
+                    and start == 0
+                    and MIDK_Q0_START == 0
+                    and (1 + len(thunks) <= n_slots)
+                ):
+                    start = 1
                 assert (
                     start + len(thunks) <= n_slots
                 ), "producer thunks overflow the quadrant"
@@ -1411,8 +1466,13 @@ def launch_gemm_a8w8_256x256(
 
             sched_fence = lambda: rocdl.sched_barrier(0)
             # WAR gap before producing the next half (256 / half=4 only;
-            # half=2 start=2 regressed N=1792).
-            q0_start = 4 if const_expr(ASM_PIPE_ACTIVE and half_m == 4) else 0
+            # half=2 start=2 regressed N=1792). Mid-K default: _seq bumps
+            # start 0→1 for a leading pure WMMA; MIDK_Q0_START=4 keeps legacy.
+            q0_start = (
+                (0 if MIDK_Q0_START == 0 else MIDK_Q0_START)
+                if const_expr(DENSE_MIDK)
+                else (4 if const_expr(ASM_PIPE_ACTIVE and half_m == 4) else 0)
+            )
             q1_fast = const_expr(parity == 0 if mx32 else parity == 1)
             if const_expr(parity == 0):
                 # (A0,B0) -> (A0,B1) -> (A1,B1) -> (A1,B0); produce b1 then a1.
