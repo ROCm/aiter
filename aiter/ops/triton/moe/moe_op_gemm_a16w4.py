@@ -339,6 +339,8 @@ def get_kernel_config_gluon_gfx942(m, n, k, routing_data):
     # long-K projections (gate-up: K = hidden size) at decode block sizes: wider K tile, 8 warps
     gateup_decode = k % 512 == 0 and k >= 2048
 
+    # Prefill block sizes (block_m >= 64) use group_m = 1 below: no M-supergrouping is 1.02-1.04x
+    # faster on every prefill case swept (xcd_swizzle = 8 stays optimal).
     # Swept entries ship in configs/gfx942/gluon/moe/a16w4/DEFAULT.json, keyed like the
     # Triton table (block_m is the dispatch key, fixed by routing, not a tunable); the
     # heuristic below generalises them to unkeyed shapes.
@@ -355,13 +357,24 @@ def get_kernel_config_gluon_gfx942(m, n, k, routing_data):
         block_k = 512 if gateup_decode else block_k_decode
         num_warps = 8 if gateup_decode else 4
     elif block_m == 64:
-        block_n = 128
-        block_k = 128
-        num_warps = 8
+        # prefill grid on MI300X (DeepSeek-V4.1-Flash TP4 shapes, paired microbench): the long-K
+        # gate-up projection runs 1.24x faster with BLOCK_N=256 / BLOCK_K=256 x 8 warps, the
+        # short-K down projection 1.05x faster with 4 warps
+        group_m = 1
+        if gateup_decode:
+            block_n = 256
+            block_k = 256
+            num_warps = 8
+        else:
+            block_n = 128
+            block_k = 128
+            num_warps = 4
     else:
+        # block_m >= 128: 4 warps beat 8 on both projections (gate-up 1.16x, down 1.17x)
+        group_m = 1
         block_n = 256
         block_k = 128
-        num_warps = 8
+        num_warps = 4
 
     if block_m == 16:
         grid_m = routing_data.n_blocks(m, block_m)
