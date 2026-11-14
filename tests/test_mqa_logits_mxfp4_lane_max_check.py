@@ -25,6 +25,10 @@ from mqa_logits_mxfp4_lane_max_ref import (
     slot_errors,
 )
 
+# Every tensor names its device: `pytest tests` runs this file in one process with files that
+# import GPU scripts, and one of those sets torch's default device to cuda at import time.
+_CPU = torch.device("cpu")
+
 
 def _ceil(a, b):
     return -(-a // b)
@@ -122,7 +126,11 @@ def _stores(tiles, ends, chunk, bug=None):
             ]
             if bug == "store last tile only":
                 keep = [f]
-            v = tiles[r][keep].amax(0) if keep else torch.full((TILE,), float("-inf"))
+            v = (
+                tiles[r][keep].amax(0)
+                if keep
+                else torch.full((TILE,), float("-inf"), device=_CPU)
+            )
             g = f // LANE_MAX_TILES
             if g * LANE_MAX_KEYS < ends[r]:
                 out.append((r, g, v))
@@ -132,8 +140,11 @@ def _stores(tiles, ends, chunk, bug=None):
 
 def _lane_max(logits, ends, work, bug=None, reverse=False):
     """Each row's slots after every CTA's stores, the earlier or the later CTA's landing."""
-    lm = [torch.full((TILE * _ceil(e, LANE_MAX_KEYS),), float("nan")) for e in ends]
-    keys = torch.arange(logits.shape[1])
+    lm = [
+        torch.full((TILE * _ceil(e, LANE_MAX_KEYS),), float("nan"), device=_CPU)
+        for e in ends
+    ]
+    keys = torch.arange(logits.shape[1], device=_CPU)
     tiles = [
         torch.where((keys < e) & ~torch.isnan(row), row, float("-inf")).view(-1, TILE)
         for row, e in zip(logits, ends)
@@ -210,9 +221,9 @@ def _case(name):
     else:
         work = _assign_prefill(qsl, ends, qpb, kw["parts"], gather)
     cuts = chunk_cuts(mode, qsl, ends, rows_per_cta=qpb, gather=gather, **kw)
-    g = torch.Generator().manual_seed(len(name))
+    g = torch.Generator(device=_CPU).manual_seed(len(name))
     width = _ceil(max(ends), LANE_MAX_KEYS) * LANE_MAX_KEYS
-    logits = torch.randn(len(ends), width, generator=g)
+    logits = torch.randn(len(ends), width, generator=g, device=_CPU)
     logits[0, 5] = float("nan")  # skipped by the max
     return qsl, ends, work, cuts, logits
 
