@@ -3,6 +3,7 @@ import pytest
 import torch
 
 from aiter.ops.triton.attention.fp8_mqa_logits import fp8_mqa_logits
+from aiter.ops.triton.utils._triton.arch_info import get_arch
 from aiter.ops.triton.utils.types import get_fp8_dtypes
 
 e5m2_type, e4m3_type = get_fp8_dtypes()
@@ -458,3 +459,49 @@ def test_fp8_mqa_logits_rejects_malformed_packed_output(bad, message):
         fp8_mqa_logits(
             q, kv, scales, weights, bounds, bounds, out=packed, out_offsets=offsets
         )
+
+
+@pytest.mark.skipif(get_arch() != "gfx950", reason="gfx950 single-warp config")
+@torch.inference_mode()
+def test_fp8_mqa_logits_single_warp_tiles() -> None:
+    """gfx950 picks a single-warp config for 64 heads and more than 4096 rows,
+    where a prefetch could overwrite LDS still being read and corrupt a few
+    columns of a row. Checked per 32-column tile so one bad tile cannot hide in
+    an aggregate, and run three times since the race does not hit every run."""
+    torch.manual_seed(0)
+    seq_lens = [2730, 2730, 2730]  # three causal sequences, 8190 rows in all
+    s_q = s_k = sum(seq_lens)
+    num_heads, head_dim = 64, 128
+    q = torch.randn(s_q, num_heads, head_dim, device="cuda", dtype=torch.bfloat16)
+    kv = torch.randn(s_k, head_dim, device="cuda", dtype=torch.bfloat16)
+    kv_fp8, scales = per_custom_dims_cast_to_fp8(kv, (0,), False)
+    kv = kv_fp8.to(torch.float32) * scales.reshape(-1, 1)
+    weights = torch.randn(s_q, num_heads, device="cuda", dtype=torch.float32)
+    starts = torch.tensor([0, *seq_lens[:-1]], device="cuda").cumsum(0)
+    ks = torch.repeat_interleave(starts, torch.tensor(seq_lens, device="cuda"))
+    ke = torch.arange(1, s_q + 1, device="cuda")
+    ks, ke = ks.int(), ke.int()
+    q_fp8 = q.to(e4m3_type)
+    ref = torch.cat(
+        [
+            ref_fp8_mqa_logits(
+                q_fp8[a : a + 1024].float(),
+                kv,
+                weights[a : a + 1024],
+                ks[a : a + 1024],
+                ke[a : a + 1024],
+            )[0]
+            for a in range(0, s_q, 1024)
+        ]
+    )
+
+    def tiles(x):  # [rows, 32-column tiles, 32], -inf and the tail pad as 0
+        x = x.masked_fill(x == float("-inf"), 0)
+        return torch.nn.functional.pad(x, (0, -s_k % 32)).view(s_q, -1, 32)
+
+    ref_max = tiles(ref).abs().amax(-1).clamp(min=1)
+    for _ in range(3):
+        logits = fp8_mqa_logits(q_fp8, kv_fp8, scales, weights, ks, ke, True)
+        rel = (tiles(logits) - tiles(ref)).abs().amax(-1) / ref_max
+        row, tile = divmod(rel.argmax().item(), rel.shape[1])
+        assert rel.max() < 1e-2, f"row {row}, columns {32 * tile}+: {rel.max():.3g}"
