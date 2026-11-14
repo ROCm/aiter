@@ -291,6 +291,7 @@ def get_GEMM_A16W16_config(
         elif (
             gfx in ("gfx90a", "gfx942", "gfx950")
             and otype == dtype
+            and not scaleAB
             and is_skinny_default_shape(M, N, K, dtype, cu_num)
         ):
             # soltype, solution_idx = 3, 2
@@ -518,6 +519,9 @@ def skinny_gemm(
     import aiter as ops
 
     assert not bpreshuffle, "bpreshuffle is not supported in skinny_gemm!"
+    assert (
+        scale_a is None and scale_b is None and scale_c is None
+    ), "skinny_gemm does not support scaling"
     # The skinny kernels write the input dtype, so a caller's buffer of another
     # dtype takes the result by copy rather than as the kernels' output.
     direct = out if out is not None and out.dtype == inp.dtype else None
@@ -578,25 +582,28 @@ def _torch_scaled_gemm(
     scale_a: Tensor | None,
     scale_b: Tensor | None,
 ) -> Tensor:
-    """FP8 through `torch._scaled_mm`, or an FP32 emulation where it is refused."""
+    """FP8 through `torch._scaled_mm`, or an FP32 emulation where it is refused;
+    BF16/FP16 scaled in the FP32 accumulator."""
     if scale_a is None:
         scale_a = torch.ones(1, dtype=dtypes.fp32, device=inp.device)
     if scale_b is None:
         scale_b = torch.ones(1, dtype=dtypes.fp32, device=inp.device)
-    try:
-        return torch._scaled_mm(
-            inp,
-            weights.t(),
-            out_dtype=otype,
-            scale_a=scale_a,
-            scale_b=scale_b,
-            bias=bias,
-        )
-    except RuntimeError:
-        result = (
-            F.linear(inp.to(dtypes.fp32), weights.to(dtypes.fp32)) * scale_a * scale_b
-        )
-        return (result.to(otype) + bias) if bias is not None else result.to(otype)
+    if inp.dtype != dtypes.fp8:
+        result = torch.mm(inp, weights.t(), out_dtype=dtypes.fp32)
+    else:
+        try:
+            return torch._scaled_mm(
+                inp,
+                weights.t(),
+                out_dtype=otype,
+                scale_a=scale_a,
+                scale_b=scale_b,
+                bias=bias,
+            )
+        except RuntimeError:
+            result = F.linear(inp.to(dtypes.fp32), weights.to(dtypes.fp32))
+    result = result.mul_(scale_a * scale_b).to(otype)
+    return (result + bias) if bias is not None else result
 
 
 def torch_gemm(
@@ -613,7 +620,7 @@ def torch_gemm(
     out: Tensor | None = None,
 ):
     assert not bpreshuffle, "bpreshuffle is not supported in torch_gemm!"
-    if inp.dtype == dtypes.fp8:
+    if inp.dtype == dtypes.fp8 or scale_a is not None or scale_b is not None:
         return _into(
             out, _torch_scaled_gemm(inp, weights, bias, otype, scale_a, scale_b)
         )
@@ -650,6 +657,9 @@ def asm_gemm(
     config: dict | None = None,
     out: Tensor | None = None,
 ):
+    assert (
+        scale_a is None and scale_b is None and scale_c is None
+    ), "asm_gemm does not support scaling"
     kernelName = config.get("kernelName") if config else None
     splitK = config.get("splitK") if config else None
     result = _result_buffer(out, inp.shape[0], weights.shape[0], otype, inp.device)
