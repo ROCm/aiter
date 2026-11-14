@@ -34,8 +34,9 @@ config's own choice. Prefill shapes are 16384 rows (ATOM's batched-token budget)
            pool, the table moved with them, and every way bit for bit as on the original pool
   errors   the interface refuses what it cannot run (layouts, bounds, a foreign schedule, ...)
   lane_max (gfx1250 H = 32, schedule-free) the lane maxima: the logits bit for bit as without
-           them, every slot its keys' max (a group the schedule split: a run of its tiles'),
-           nothing outside the rows' slots written; plane, padded-stride and flat outputs
+           them, every slot its keys' max (in a slot group a CTA chunk boundary of the split falls
+           inside: the max of one chunk's share of the group), nothing outside the rows' slots
+           written; plane, padded-stride and flat outputs
 """
 
 import argparse
@@ -56,6 +57,13 @@ from aiter.ops.opus.pa_mqa_logits_mxfp4 import (
     mqa_logits_mxfp4_schedule,
 )
 from aiter.test_common import benchmark, checkAllclose, run_perftest
+
+try:
+    from mqa_logits_mxfp4_lane_max_ref import chunk_cuts, slot_errors
+except ModuleNotFoundError as e:
+    if e.name != "mqa_logits_mxfp4_lane_max_ref":
+        raise
+    from op_tests.mqa_logits_mxfp4_lane_max_ref import chunk_cuts, slot_errors
 
 torch.set_default_device("cuda")
 
@@ -1079,6 +1087,10 @@ def check_errors(model):
             out=torch.empty(rows.rows, rows.width),
             lane_max=torch.empty(need, dtype=torch.float16),
         )
+        tries["lane_max on the host"] = call(
+            out=torch.empty(rows.rows, rows.width),
+            lane_max=torch.empty(need, device="cpu"),
+        )
         tries["lane_max with a schedule"] = call(
             out=torch.empty(rows.rows, rows.width),
             lane_max=torch.empty(need),
@@ -1099,30 +1111,27 @@ def check_errors(model):
     return results
 
 
-# Lane maxima geometry (pa_mqa_logits_mxfp4.h): slot 64 g + 32 u + l of a row holds the max of
-# keys (16 g + i) * 64 + 32 u + l, i in [0, 16) -- the same position in each of its group's 16
-# 64-key tiles.
-LANE_MAX_TILES, LANE_MAX_ROW_PAD = 16, 64
-
-
-def lane_max_ref(row):
-    """A row's logits [end] -> (full [slots], runs [runs, slots]): each slot's max over its keys,
-    and over its keys in every contiguous run of its group's 16 tiles -- what a CTA holding part
-    of the group stores when the schedule splits it. The kernels' max skips NaN; no keys, -inf.
-    """
-    end = row.numel()
-    groups = -(-end // (LANE_MAX_TILES * TILE))
-    v = torch.full((groups * LANE_MAX_TILES * TILE,), float("-inf"))
-    v[:end] = torch.where(torch.isnan(row), float("-inf"), row)
-    tiles = v.view(groups, LANE_MAX_TILES, TILE)
-    runs = torch.stack(
-        [
-            tiles[:, a:b].amax(1).flatten()
-            for a in range(LANE_MAX_TILES)
-            for b in range(a + 1, LANE_MAX_TILES + 1)
-        ]
+def lane_max_cuts(cfg, rows: Rows):
+    """Per row, the tiles where the launch's schedule-free split starts a CTA chunk (other than
+    0): mqa_logits_mxfp4's cta_target / prefill_parts for this config and call, cut as the
+    kernel's mqa_assign does (mqa_logits_mxfp4_lane_max_ref.chunk_cuts)."""
+    inst = cfg._instance
+    assert inst.tile_keys == TILE, "the lane maxima geometry is 64-key tiles"
+    if cfg._mode == M.FREE:
+        mode, kw = "free", {"cta_target": inst.resident[M.FREE]}
+    else:
+        groups = M._max_groups(rows.rows, rows.num_seqs, inst.rows_per_cta)
+        width_tiles = -(-cfg.max_seq_len // inst.tile_keys)
+        parts = M._prefill_parts(inst, groups, width_tiles, cfg.arch)
+        mode, kw = "prefill", {"parts": parts}
+    return chunk_cuts(
+        mode,
+        rows.query_start_loc.tolist(),
+        rows.row_ends.tolist(),
+        rows_per_cta=inst.rows_per_cta,
+        gather=bool(inst.gather),
+        **kw,
     )
-    return tiles.amax(1).flatten(), runs
 
 
 def lane_max_shapes(model):
@@ -1148,9 +1157,9 @@ def lane_max_shapes(model):
 def check_lane_max(model):
     """Every way that writes lane maxima (schedule-free gfx1250 H = 32): the logits equal those of
     the same call without ``lane_max`` bit for bit and the reference; every row's slots equal its
-    keys' max (or, where the schedule split a slot's group across CTAs, their max over a run of
-    its tiles); nothing outside the rows' slots is written. Plane, padded-stride and flat
-    outputs."""
+    keys' max, except in a slot group a CTA chunk boundary of the launch's split falls inside,
+    where a slot may instead hold the max of one chunk's share of the group; nothing outside the
+    rows' slots is written. Plane, padded-stride and flat outputs."""
     results = []
     for rows in lane_max_shapes(model):
         case = make_case(rows, MODEL_HEADS[model])
@@ -1168,6 +1177,7 @@ def check_lane_max(model):
             "flat": (None, offs),
         }
         for name, (cfg, _) in lm_ways.items():
+            cuts = lane_max_cuts(cfg, rows)
             for layout, (stride, out_offsets) in layouts.items():
                 if out_offsets is not None and not cfg._instance.flat_out:
                     continue
@@ -1214,22 +1224,17 @@ def check_lane_max(model):
                         bad.append(f"row {r}: {why}")
                     if e == 0:
                         continue
-                    full, runs = lane_max_ref(got_row)
-                    base = starts[r] // LANE_MAX_TILES + r * LANE_MAX_ROW_PAD
-                    got = lm[base : base + full.numel()]
-                    written[base : base + full.numel()] = True
-                    exact = got == full
-                    in_run = (runs == got).any(0)
-                    split += int((~exact & in_run).sum())
-                    if not bool(in_run.all()):
-                        s = int((~in_run).nonzero()[0])
-                        bad.append(
-                            f"row {r} slot {s}: {float(got[s])}, want {float(full[s])}"
-                        )
+                    slots = M._LANE_MAX_ROW_PAD * -(-e // (M._LANE_MAX_TILES * TILE))
+                    base = starts[r] // M._LANE_MAX_TILES + r * M._LANE_MAX_ROW_PAD
+                    got = lm[base : base + slots]
+                    written[base : base + slots] = True
+                    why, n = slot_errors(got, got_row, cuts[r])
+                    split += n
+                    bad += [f"row {r} {w}" for w in why]
                 if not bool(torch.isnan(lm[~written]).all()):
                     bad.append("written outside the rows' slots")
                 aiter.logger.info(
-                    "lane_max %s %s %s: %d slots hold a split group's partial max",
+                    "lane_max %s %s %s: %d slots hold one CTA chunk's share of a split group",
                     rows.label,
                     name,
                     layout,

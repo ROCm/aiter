@@ -73,3 +73,15 @@ def test_misaligned_row_stride_rejected():
     out = _strided_out(2, 100, 100)
     with pytest.raises(ValueError, match="aligned"):
         M._check_lane_max(_lane_max(1 << 12), out, 2, flat=False)
+
+
+def test_lane_max_on_another_device_rejected():
+    # The kernels take lane_max's address as a device pointer: a buffer on another device than
+    # out (a host one, say) must be refused, not handed to them.
+    out = torch.empty((2, 4096), dtype=torch.float32, device="meta")
+    need = M.mqa_logits_mxfp4_lane_max_elems(M._lane_max_out_span(out, 2, False), 2)
+    with pytest.raises(ValueError, match="lane_max is on"):
+        M._check_lane_max(_lane_max(need), out, 2, flat=False)
+    M._check_lane_max(
+        torch.empty(need, dtype=torch.float32, device="meta"), out, 2, flat=False
+    )
