@@ -11,6 +11,7 @@ import importlib.abc
 import importlib.metadata
 import importlib.util
 import os
+import platform
 import re
 import shlex
 import shutil
@@ -47,6 +48,9 @@ else:
 SUBPROCESS_DECODE_ARGS = ()
 MINIMUM_GCC_VERSION = (5, 0, 0)
 MINIMUM_MSVC_VERSION = (19, 0, 24215)
+CMODEL = "large"
+if platform.machine() == "loongarch64":
+    CMODEL = "extreme"
 
 VersionRange = tuple[tuple[int, ...], tuple[int, ...]]
 VersionMap = dict[str, VersionRange]
@@ -359,7 +363,7 @@ if not IS_WINDOWS:
     # ELF-only codegen options.
     COMMON_HIPCC_FLAGS.extend(
         [
-            "-mcmodel=large",
+            "-mcmodel=" + CMODEL,
             "-fno-unique-section-names",
             "-ffunction-sections",
             "-fdata-sections",
@@ -1560,7 +1564,7 @@ def verify_ninja_availability():
 def _prepare_ldflags(extra_ldflags, with_cuda, verbose, is_standalone, torch_exclude):
     if not IS_WINDOWS:
         # ELF/GNU-ld only.
-        extra_ldflags.append("-mcmodel=large")
+        extra_ldflags.append("-mcmodel=" + CMODEL)
         extra_ldflags.append("-ffunction-sections")
         extra_ldflags.append("-fdata-sections ")
         extra_ldflags.append("-Wl,--gc-sections")
