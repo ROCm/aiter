@@ -120,7 +120,7 @@ def mismatches(ref, out, T):
     idx = shuffle_idx(rows[:, None], torch.arange(NG)[None, :])
     if not torch.equal(u8(ref[6]).view(-1)[idx], u8(out[6]).view(-1)[idx]):
         bad.append("scale")
-    if bool((out[4] != 0).any()):
+    if bool((out[4][:T] != 0).any()):  # production zeroes the real rows only
         bad.append("moe_buf not zero")
     return bad
 
