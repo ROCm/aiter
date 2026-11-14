@@ -38,6 +38,18 @@ def logical_block(traits):
     return bx, by
 
 
+def query_split_begin(traits, kv_query):
+    """(First query position, first stored row) of this CTA's query split. When
+    the splits do not divide query_length, the last one starts QUERIES_PER_CTA
+    positions before the end, so every split computes full rows, and stores
+    only the rows past those of the split before it."""
+    nominal = (kv_query % traits.query_splits) * traits.QUERIES_PER_CTA
+    if const_expr(traits.query_length % traits.query_splits == 0):
+        return nominal, 0
+    begin = fx.min(nominal, fx.Int32(traits.query_length - traits.QUERIES_PER_CTA))
+    return begin, (nominal - begin) * traits.query_group_size
+
+
 def logical_kv_heads(traits):
     if const_expr(traits.SPLIT_MAJOR):
         return fx.Int32(gpu.grid_dim.x) // traits.query_splits
@@ -117,9 +129,9 @@ class PaDecodeContext:
         self.kv_h = self.kv_query // self.traits.query_splits
         # The KV cache's head of this (head split's) KV head.
         self.cache_h = self.kv_h // self.traits.KV_HEAD_SPLITS
-        self.query_begin = (
-            self.kv_query % self.traits.query_splits
-        ) * self.traits.QUERIES_PER_CTA
+        self.query_begin, self.first_stored_row = query_split_begin(
+            self.traits, self.kv_query
+        )
         self.n_kv = logical_kv_heads(self.traits)
         self.slots = logical_slots(self.traits)
         self.partial_slot = self.kv_h * self.slots + self.part

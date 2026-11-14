@@ -66,7 +66,12 @@ from flydsl.expr.typing import T
 
 from aiter.jit.utils.chip_info import get_gfx_runtime
 
-from .pa_decode.context import PaDecodeContext, logical_block, logical_kv_heads
+from .pa_decode.context import (
+    PaDecodeContext,
+    logical_block,
+    logical_kv_heads,
+    query_split_begin,
+)
 from .pa_decode.op_merge import (
     MERGE_HEAD_DIM,
     MERGE_PARTITIONS,
@@ -87,6 +92,8 @@ from .pa_decode.traits import (
     MFMA_ACC_ELEMS,
     MFMA_MNK,
     MXFP4_KV_DTYPE,
+    MXFP4_LDS_LIMIT_BYTES,
+    MXFP4_O_VGPRS,
     WAVE,
     Gfx1250Traits,
     PaDecodeSchedule,
@@ -518,11 +525,7 @@ def compile_pa_decode_tile(
             row_units = traits.head_dim // 8
             kv_query = logical_block(traits)[1]
             kv_h = kv_query // traits.query_splits
-            first_row = (
-                (kv_query % traits.query_splits)
-                * traits.QUERIES_PER_CTA
-                * traits.query_group_size
-            )
+            first_row = query_split_begin(traits, kv_query)[0] * traits.query_group_size
             out = fx.recast_iter(traits.OUT_DTYPE, out_ptr)
             for it in range_constexpr(
                 -(-traits.CTA_ROWS * row_units // traits.CTA_THREADS)
@@ -888,7 +891,17 @@ def compile_pa_decode_tile(
             "amdgpu-kernarg-preload": AITER_FLYDSL_KERNARG_PRELOAD,
             "amdgpu-kernarg-preload-count": min(16, AITER_FLYDSL_KERNARG_PRELOAD_COUNT),
         }
-    if traits.FP8_MTP4_LEAN or traits.WAVES_PER_EU_2 or traits.MXFP4_V_HALVES > 1:
+    if (
+        traits.FP8_MTP4_LEAN
+        or traits.WAVES_PER_EU_2
+        or (
+            traits.MXFP4_V_PARTS > 1
+            and 2 * traits.GROUP_LDS_BYTES <= MXFP4_LDS_LIMIT_BYTES
+            # 256 registers hold the rest of the wave beside at most a quarter
+            # of them as O (two head_dim 256 M-tiles spill 273 VGPRs there).
+            and traits.M_TILES * traits.head_dim // 4 <= MXFP4_O_VGPRS // 2
+        )
+    ):
         # Two CTAs per CU: hold the allocator to 256 registers per wave.
         pa_decode_tile_launch.compile_hints["waves_per_eu"] = 2
     compiled = {

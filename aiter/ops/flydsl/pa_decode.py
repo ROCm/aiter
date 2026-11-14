@@ -28,8 +28,13 @@ from .kernels.pa_decode_kernel import (
     gfx1250_tile_traits,
 )
 from .kernels.pa_decode.traits import MFMA_MNK as MXFP4_FUSED_M_ROWS
-from .kernels.pa_decode.traits import MXFP4_MAX_M_TILES, mxfp4_query_splits
-from .kernels.pa_decode_plan import PADecodePlan
+from .kernels.pa_decode.traits import (
+    MXFP4_MAX_HEAD_DIM,
+    mxfp4_max_m_tiles,
+    mxfp4_query_splits,
+    mxfp4_split_positions,
+)
+from .kernels.pa_decode_plan import ARRIVAL_COUNTER_STRIDE, PADecodePlan
 
 # Plans with at most this many partitions per sequence merge within a cluster
 # of at most CLUSTER_PARTITIONS CTAs. Above it, sequences would give each CTA
@@ -252,62 +257,87 @@ def _mxfp4_query_splits(
 ):
     """CTAs per (task, KV head) that split an MXFP4 MTP task's query positions.
 
-    A CTA computes its rows as up to ``MXFP4_MAX_M_TILES`` 16-row M-tiles over
+    A CTA computes its rows as up to ``mxfp4_max_m_tiles`` 16-row M-tiles over
     one K/V tile; each split re-reads and re-widens the tile, so a split only
-    pays for idle CUs. Take the most splits that keep the grid of ``ctas``
+    pays for idle CUs. Splits take ceil(query_length / splits) positions each
+    (the last overlaps the one before it), so any query_length has splits of
+    up to that many M-tiles. Take the most splits that keep the grid of ``ctas``
     within one CTA per CU, else the fewest (a split leaves at least 16 rows).
     A head_dim 128 tile past two M-tiles (276 rather than 218 VGPRs: one wave
-    per SIMD rather than two) splits in two more when the splits' CTAs share
-    an XCD (``colocated``), so their second K/V read hits its L2, and the
-    halves pad no M-tile rows.
+    per SIMD rather than two) splits further, into the fewest of at most twice
+    the splits with two M-tiles or fewer, when the splits' CTAs share an XCD
+    (``colocated``), so their extra K/V reads hit its L2, and the splits take
+    no more M-tiles in all.
     """
-    rows = query_length * group
 
     def m_tiles(s):
-        return -(-rows // s // MXFP4_FUSED_M_ROWS)
+        return -(-mxfp4_split_positions(query_length, s) * group // MXFP4_FUSED_M_ROWS)
 
     valid = [
         s
         for s in range(1, query_length + 1)
-        if not query_length % s
-        and m_tiles(s) <= MXFP4_MAX_M_TILES
-        and (s == 1 or rows // s >= MXFP4_FUSED_M_ROWS)
+        if mxfp4_split_positions(query_length, s)
+        and m_tiles(s) <= mxfp4_max_m_tiles(head_dim)
+        and (
+            s == 1
+            or mxfp4_split_positions(query_length, s) * group >= MXFP4_FUSED_M_ROWS
+        )
     ]
     if not valid:
-        return mxfp4_query_splits(query_length, group)
+        return mxfp4_query_splits(query_length, group, head_dim)
     fit = [s for s in valid if ctas * s <= num_compute_units]
     splits = max(fit) if fit else min(valid)
-    if (
-        colocated
-        and head_dim == 128
-        and m_tiles(splits) > 2
-        and 2 * splits in valid
-        and m_tiles(2 * splits) <= 2
-        and 2 * m_tiles(2 * splits) == m_tiles(splits)
-    ):
-        return 2 * splits
+    if colocated and head_dim == 128 and m_tiles(splits) > 2:
+        for s in valid:
+            if (
+                splits < s <= 2 * splits
+                and m_tiles(s) <= 2
+                and s * m_tiles(s) <= splits * m_tiles(splits)
+            ):
+                return s
     return splits
 
 
-def _mxfp4_kv_head_splits(query_length, group, query_splits, head_dim, colocated):
-    """CTAs that split each KV head's query heads (and so its rows) when a
-    query split cannot: two when a head_dim 128 CTA's rows still take more
-    than two M-tiles (one wave per SIMD, see ``_mxfp4_query_splits``), each
-    half takes at most two and no more M-tiles in all (no padded rows), with
-    the CTAs on one XCD."""
-    rows = query_length // query_splits * group
-    m_tiles = -(-rows // MXFP4_FUSED_M_ROWS)
-    half_m_tiles = -(-rows // 2 // MXFP4_FUSED_M_ROWS)
-    if (
-        colocated
-        and head_dim == 128
-        and not group % 2
-        and m_tiles > 2
-        and half_m_tiles <= 2
-        and 2 * half_m_tiles == m_tiles
-    ):
-        return 2
-    return 1
+def _mxfp4_group_sets(group, head_dim=128):
+    """Equal sets of query heads that a KV head's group runs as, each as its own
+    KV head, so that one query position's rows fit ``mxfp4_max_m_tiles``
+    M-tiles: the fewest of those whose M-tiles total least (padding rows
+    included), at most one per word of a sequence's arrival counter line; None
+    when no split fits."""
+    sets = [
+        k
+        for k in range(1, ARRIVAL_COUNTER_STRIDE + 1)
+        if not group % k
+        and group // k <= mxfp4_max_m_tiles(head_dim) * MXFP4_FUSED_M_ROWS
+    ]
+    if not sets:
+        return None
+    return min(sets, key=lambda k: (k * -(-group // k // MXFP4_FUSED_M_ROWS), k))
+
+
+def _mxfp4_kv_head_splits(
+    query_length, group, query_splits, head_dim, colocated, sets=1
+):
+    """CTAs that split each KV head's query heads (and so its rows): its
+    ``sets`` (``_mxfp4_group_sets``), and when a head_dim 128 CTA's rows
+    still take more than two M-tiles (one wave per SIMD, see
+    ``_mxfp4_query_splits``), the fewest of at most twice the sets whose rows
+    take at most two and no more M-tiles in all (no padded rows), with the CTAs
+    on one XCD (and at most one per arrival counter word)."""
+    positions = mxfp4_split_positions(query_length, query_splits)
+
+    def m_tiles(k):
+        return -(-positions * (group // k) // MXFP4_FUSED_M_ROWS)
+
+    if colocated and head_dim == 128 and m_tiles(sets) > 2:
+        for k in range(sets + 1, min(2 * sets, ARRIVAL_COUNTER_STRIDE) + 1):
+            if (
+                not group % k
+                and m_tiles(k) <= 2
+                and k * m_tiles(k) <= sets * m_tiles(sets)
+            ):
+                return k
+    return sets
 
 
 def _check_sinks(sinks, num_q_heads, dev):
@@ -361,10 +391,15 @@ def _pa_decode_mxfp4(
     num_seqs = context_lengths.shape[0]
     num_kv_heads = k_data.shape[1]
     group = num_q_heads // num_kv_heads
-    if head_dim not in (64, 128, 256) or num_q_heads % num_kv_heads or group > 64:
+    head_dims = head_dim == 64 or (
+        head_dim % 128 == 0 and 0 < head_dim <= MXFP4_MAX_HEAD_DIM
+    )
+    group_sets = _mxfp4_group_sets(group, head_dim) if group and head_dims else None
+    if num_q_heads % num_kv_heads or not group_sets:
         raise NotImplementedError(
-            "MXFP4 pa_decode needs head_dim 64, 128 or 256 and 1..64 query heads "
-            "per KV head, "
+            "MXFP4 pa_decode needs head_dim 64 or a multiple of 128 up to "
+            f"{MXFP4_MAX_HEAD_DIM} and query heads per KV head that split into "
+            "at most 32 equal sets of up to 64 (32 at head_dim 256, 16 past it), "
             f"got query {tuple(query.shape)} over {num_kv_heads} KV heads"
         )
     if query.dtype not in (torch.float8_e4m3fn, torch.bfloat16):
@@ -480,8 +515,8 @@ def _pa_decode_mxfp4(
     slots = num_seqs if work_plan is None else work_plan.capacity
     query_splits = _mxfp4_query_splits(
         query_length,
-        group,
-        slots * num_kv_heads,
+        group // group_sets,
+        slots * num_kv_heads * group_sets,
         num_compute_units,
         head_dim,
         num_xcds > 1 and slots % num_xcds == 0,
@@ -492,6 +527,7 @@ def _pa_decode_mxfp4(
         query_splits,
         head_dim,
         num_xcds > 1 and slots % num_xcds == 0,
+        group_sets,
     )
     # Without a plan, a sparse grid splits each sequence's tiles over S CTAs and
     # merges them in the reducer; otherwise one task per sequence needs neither.
@@ -750,16 +786,19 @@ def pa_decode(
     +inf suppresses the head's output.
 
     MXFP4 K/V (gfx950): ``key_cache``/``value_cache`` are data views
-    [pages, kv_heads, P, 64] (``dtypes.fp4x2`` or uint8, P = 16, 64 or 128 tokens)
-    and ``key_scale``/``value_scale`` e8m0 views [pages, kv_heads, P, 4]
-    (``dtypes.fp8_e8m0`` or uint8) of the same pages (the four share page and head
-    byte strides, multiples of 16). ``query`` is float8_e4m3fn, used as stored, or
-    bf16, quantized to e4m3 per head row in the kernel; ``output`` is bf16.
-    Supported: head_dim 128, block size 16, 64 or 128, ``query_length`` 1..4, at
-    most 64 query heads per KV head (one query position's rows fit four
-    M-tiles). Refused: other block sizes, head dims and output dtypes, sliding
-    windows and sinks (``mask_unowned_kv`` has no effect: tokens past the
-    context are always masked). Scale bytes 0 and 255 are not supported in valid
+    [pages, kv_heads, P, D / 2] (``dtypes.fp4x2`` or uint8, P = 16, 64 or 128
+    tokens) and ``key_scale``/``value_scale`` e8m0 views [pages, kv_heads, P,
+    D / 32] (``dtypes.fp8_e8m0`` or uint8) of the same pages (the four share page
+    and head byte strides, multiples of 16). ``query`` is float8_e4m3fn, used as
+    stored, or bf16, quantized to e4m3 per head row in the kernel; ``output`` is
+    bf16. Supported: head_dim D 64 or a multiple of 128 up to 512, block size
+    16, 64 or 128, any ``query_length`` (query positions split over CTAs), query
+    heads per KV head up to 64 (one query position's rows fit four M-tiles; two,
+    or 32 heads, at D 256 and one, or 16 heads, past it) or splitting into at most 32 equal sets of up to
+    that many (each run as its own KV head), sliding windows and sinks.
+    Refused: other block sizes, head dims, output dtypes and groups
+    (``mask_unowned_kv`` has no effect: tokens past the context are always
+    masked). Scale bytes 0 and 255 are not supported in valid
     rows. V is staged as bf16, so a V element above the bf16 maximum (3.39e38: e8m0
     byte 254 with an e2m1 magnitude of 2 or more, byte 253 with 4 or more) widens to
     infinity even when the normalized output is finite. ``work_plan=None`` is
@@ -775,10 +814,10 @@ def pa_decode(
     task writes its rows, and tasks in slots that empty sequences freed merge
     in the sequence's last CTA to arrive, through the plan's arrival counters.
     Default-budget plans of windows over at most two 256-token tiles have one
-    slot per sequence. Rows written without the reducer fold in the sinks. A task may span at most 4096
-    pages in ``max_context_length``: pass a smaller one otherwise. A
-    real context longer than that bound is still fully attended (up to 2**19
-    tokens a task, the bound of the fixed PV shift, unchecked on the GPU).
+    slot per sequence. Rows written without the reducer fold in the sinks. A
+    task stages up to 4096 page ids in LDS; tiles past them, or past the
+    ``max_context_length`` bound, read the block table. A task attends up to
+    2**19 tokens (the bound of the fixed PV shift, unchecked on the GPU).
 
     Refresh ``work_plan`` on the current stream after changing lengths. Its
     max_partitions is bounded by device CUs. Match sliding_window and, for
@@ -859,10 +898,6 @@ def pa_decode(
             )
 
     if mxfp4:
-        if query_length > 4:
-            raise NotImplementedError(
-                f"MXFP4 KV supports query_length 1..4, got {query_length}"
-            )
         if compute_type not in (None, torch.uint8, dtypes.fp4x2):
             raise NotImplementedError(
                 "MXFP4 KV takes compute_type None, uint8 or fp4x2, "

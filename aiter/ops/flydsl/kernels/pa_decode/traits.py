@@ -30,6 +30,11 @@ BF16_LDS_LIMIT_BYTES = 64 * 1024
 MXFP4_LDS_LIMIT_BYTES = 160 * 1024
 # M-tiles (16 query rows each) one MXFP4 CTA computes over a shared K/V tile.
 MXFP4_MAX_M_TILES = 4
+# A lane's O holds head_dim / 4 f32 per M-tile. A CTA's M-tiles keep O within
+# half of the 256 arch VGPRs: past that they spill (MI355X: four head_dim 256
+# M-tiles 293-319 VGPRs, two head_dim 384 98, two head_dim 512 481).
+MXFP4_O_VGPRS = 128
+MXFP4_MAX_HEAD_DIM = 512
 MXFP4_EIGHT_WAVE_O_REGS = 64
 PAGE_ID_STAGE_LIMIT = 4096  # i32 page ids, 16 KiB of LDS.
 # gfx942 K/V streaming (PaDecodeTraits.STREAM_KV): lane K-row bytes from which
@@ -143,12 +148,26 @@ def stage_page_capacity(
     return max(256, 1 << max(pages - 1, 0).bit_length())
 
 
-def mxfp4_query_splits(query_length, query_group_size):
+def mxfp4_split_positions(query_length, splits):
+    """Query positions of each of ``splits`` MXFP4 query splits, or None when a
+    split would hold no position of its own (the last split starts that many
+    positions before the end)."""
+    positions = -(-query_length // splits)
+    return positions if -(-query_length // positions) == splits else None
+
+
+def mxfp4_max_m_tiles(head_dim):
+    """M-tiles an MXFP4 CTA of ``head_dim`` computes at most."""
+    return min(MXFP4_MAX_M_TILES, MXFP4_O_VGPRS * 4 // head_dim)
+
+
+def mxfp4_query_splits(query_length, query_group_size, head_dim=128):
     """Fewest MXFP4 query splits (CTAs per KV head) that leave each CTA's query
-    rows within ``MXFP4_MAX_M_TILES`` M-tiles, or None."""
+    rows within ``mxfp4_max_m_tiles`` M-tiles, or None."""
+    rows = mxfp4_max_m_tiles(head_dim) * MFMA_MNK
     for splits in range(1, query_length + 1):
-        rows = query_length // splits * query_group_size
-        if not query_length % splits and rows <= MXFP4_MAX_M_TILES * MFMA_MNK:
+        positions = mxfp4_split_positions(query_length, splits)
+        if positions and positions * query_group_size <= rows:
             return splits
     return None
 
@@ -422,7 +441,8 @@ class PaDecodeSchedule:
                     query_splits = 2
             if kv_dtype == MXFP4_KV_DTYPE:
                 query_splits = (
-                    mxfp4_query_splits(query_length, query_group_size) or query_length
+                    mxfp4_query_splits(query_length, query_group_size, head_dim)
+                    or query_length
                 )
             if kv_dtype == fx.BFloat16:
                 # Native BF16 doubles Q's LDS footprint. Select the smallest
@@ -447,7 +467,14 @@ class PaDecodeSchedule:
             assert query_splits >= 1, "query_splits must be positive"
         else:
             assert query_splits in (1, 2, 4), "query_splits must be one of 1, 2, 4"
-        assert query_length % query_splits == 0, "query_splits must divide query_length"
+        if kv_dtype == MXFP4_KV_DTYPE:
+            assert mxfp4_split_positions(
+                query_length, query_splits
+            ), "every MXFP4 query split needs a query position of its own"
+        else:
+            assert (
+                query_length % query_splits == 0
+            ), "query_splits must divide query_length"
         if kv_dtype == fx.BFloat16:
             lds_bytes = _bf16_lds_bytes(
                 head_dim, (query_length // query_splits) * query_group_size, block_size
@@ -457,7 +484,7 @@ class PaDecodeSchedule:
                     f"BF16 PA query_splits={query_splits} requires {lds_bytes} LDS "
                     "bytes, exceeding the 64 KiB limit; increase query_splits"
                 )
-        QUERIES_PER_CTA = query_length // query_splits
+        QUERIES_PER_CTA = -(-query_length // query_splits)
         TOTAL_ROWS = query_length * query_group_size
         CTA_ROWS = QUERIES_PER_CTA * query_group_size
         M_TILES = (CTA_ROWS + MFMA_MNK - 1) // MFMA_MNK
@@ -499,19 +526,25 @@ class PaDecodeSchedule:
                 query_length,
             )
         if kv_dtype == MXFP4_KV_DTYPE:
-            if not stage_pages:
+            if max_context_length is None:
                 raise ValueError(
-                    "MXFP4 PA reads page ids from LDS: pass max_context_length "
-                    "and keep the pages of a task within PAGE_ID_STAGE_LIMIT"
+                    "MXFP4 PA stages page ids in LDS: pass max_context_length"
                 )
+            # A longer task stages its first ids; tiles past them read the
+            # block table.
+            stage_pages = stage_pages or PAGE_ID_STAGE_LIMIT
             if (
                 block_size not in (16, 64, 128)
-                or head_dim not in (64, 128, 256)
-                or M_TILES > MXFP4_MAX_M_TILES
+                or not (
+                    head_dim == 64
+                    or (head_dim % 128 == 0 and head_dim <= MXFP4_MAX_HEAD_DIM)
+                )
+                or M_TILES > mxfp4_max_m_tiles(head_dim)
             ):
                 raise NotImplementedError(
-                    "MXFP4 PA supports head_dim 64, 128 or 256, block 16, 64 or 128, "
-                    f"at most {MXFP4_MAX_M_TILES} M-tiles"
+                    "MXFP4 PA supports head_dim 64 or a multiple of 128 up to "
+                    f"{MXFP4_MAX_HEAD_DIM}, block 16, 64 or 128, at most "
+                    f"{mxfp4_max_m_tiles(head_dim)} M-tiles"
                 )
         # gfx942: more CTAs than CUs hold work, so occupancy outweighs a
         # single CTA's latency (V prefetch, STREAM_KV, WAVES_PER_EU_2).
@@ -800,7 +833,7 @@ class PaDecodeTraits:
     MXFP4_PADDED_Q_EARLY: bool
     MXFP4_NT_KV: bool
     MXFP4_V_CHUNK_BYTES: int
-    MXFP4_V_HALVES: int
+    MXFP4_V_PARTS: int
     MXFP4_WAVE_BYTES: int
     KV_VECTOR_WIDTH: int
     QP_ELEM_BYTES: int
@@ -943,7 +976,7 @@ class PaDecodeTraits:
         )
         TUNED_PER_TOKEN = TUNED_SHAPE and query_dtype == fx.BFloat16 and per_token_kv
         TUNED_SCALAR = TUNED_SHAPE and trans_v and not per_token_kv
-        QUERIES_PER_CTA = query_length // query_splits
+        QUERIES_PER_CTA = -(-query_length // query_splits)
         TOTAL_ROWS = query_length * query_group_size
 
         buffer_plan_output = (
@@ -1243,8 +1276,9 @@ class PaDecodeTraits:
         )
         QLOAD_UNIT = min(8, QCHUNK) if QCHUNK % 8 == 0 or QCHUNK <= 8 else 4
         if query_dtype == fx.Float8E4M3FN:
-            # An e4m3 (MXFP4) query row chunk is 4, 8 or 16 bytes: one load.
-            QLOAD_UNIT = QCHUNK
+            # An e4m3 (MXFP4) query row chunk is 4 to 32 bytes; loads are at
+            # most 16 bytes, so 24 bytes (head_dim 384) takes three 8-byte loads.
+            QLOAD_UNIT = next(u for u in (16, 8, 4) if QCHUNK % u == 0)
         N_QLOADS = QCHUNK // QLOAD_UNIT
 
         VHE_CHUNKS = head_dim // (
@@ -1349,28 +1383,29 @@ class PaDecodeTraits:
         sMxfp4VBf16_off = (total_bytes + 15) // 16 * 16
         # MXFP4 QK takes head_dim in 128-element K blocks (head_dim 64 pads one);
         # a chunk's widened V is 16 tokens x head_dim bf16, unless V is widened
-        # (and PV run) one K block at a time: when the whole tile's staging keeps
-        # a second CTA off the CU and the grid has more CTAs than CUs to use it.
+        # (and PV run) one K block at a time: when the whole tile's staging
+        # does not fit, or keeps a second CTA off the CU and the grid has more
+        # CTAs than CUs to use it.
         MXFP4_KB = max(head_dim // 128, 1)
 
-        def mxfp4_wave_bytes(halves):
+        def mxfp4_wave_bytes(parts):
             # A wave's region also holds its O rows (f32, padded by 16 B) at the end.
-            chunk = MFMA_MNK * head_dim * 2 // halves
+            chunk = MFMA_MNK * head_dim * 2 // parts
             wave = max(NCHUNK * chunk, MFMA_MNK * (head_dim * 4 + 16))
             return chunk, (wave + 15) // 16 * 16
 
-        MXFP4_V_HALVES = 1
-        if (
-            kv_dtype == MXFP4_KV_DTYPE
-            and MXFP4_KB == 2
-            and not SPARSE_GRID
-            and 2 * (sMxfp4VBf16_off + NWARP * mxfp4_wave_bytes(1)[1])
-            > MXFP4_LDS_LIMIT_BYTES
-            and 2 * (sMxfp4VBf16_off + NWARP * mxfp4_wave_bytes(2)[1])
-            <= MXFP4_LDS_LIMIT_BYTES
-        ):
-            MXFP4_V_HALVES = 2
-        MXFP4_V_CHUNK_BYTES, MXFP4_WAVE_BYTES = mxfp4_wave_bytes(MXFP4_V_HALVES)
+        def mxfp4_cta_bytes(parts):
+            return sMxfp4VBf16_off + NWARP * mxfp4_wave_bytes(parts)[1]
+
+        MXFP4_V_PARTS = 1
+        if kv_dtype == MXFP4_KV_DTYPE and MXFP4_KB > 1:
+            if mxfp4_cta_bytes(1) > MXFP4_LDS_LIMIT_BYTES or (
+                not SPARSE_GRID
+                and 2 * mxfp4_cta_bytes(1) > MXFP4_LDS_LIMIT_BYTES
+                and 2 * mxfp4_cta_bytes(MXFP4_KB) <= MXFP4_LDS_LIMIT_BYTES
+            ):
+                MXFP4_V_PARTS = MXFP4_KB
+        MXFP4_V_CHUNK_BYTES, MXFP4_WAVE_BYTES = mxfp4_wave_bytes(MXFP4_V_PARTS)
         if kv_dtype == MXFP4_KV_DTYPE:
             total_bytes = sMxfp4VBf16_off + NWARP * MXFP4_WAVE_BYTES
             if total_bytes > MXFP4_LDS_LIMIT_BYTES:
@@ -1437,7 +1472,7 @@ class PaDecodeTraits:
                 and (M_TILES * MFMA_MNK <= 2 * CTA_ROWS or cache_key.sparse_grid)
             ),
             MXFP4_V_CHUNK_BYTES=MXFP4_V_CHUNK_BYTES,
-            MXFP4_V_HALVES=MXFP4_V_HALVES,
+            MXFP4_V_PARTS=MXFP4_V_PARTS,
             MXFP4_WAVE_BYTES=MXFP4_WAVE_BYTES,
             KV_VECTOR_WIDTH=KV_VECTOR_WIDTH,
             QP_ELEM_BYTES=QP_ELEM_BYTES,

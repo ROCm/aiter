@@ -232,6 +232,8 @@ class PaDecodeEpilogue:
         # rows, head_dim 64 leaves half of the threads idle.
         dim_threads = self.traits.head_dim // 8
         pass_rows = min(MFMA_MNK, self.traits.BLOCK_THREADS // dim_threads)
+        # head_dim 384 merges 5 rows a pass; a fourth pass takes the last row.
+        passes = -(-MFMA_MNK // pass_rows)
         pass_row = self.ctx.tid // dim_threads
         dim8 = self.ctx.tid % dim_threads
         # Sink loads issue before the publication barriers.
@@ -242,7 +244,7 @@ class PaDecodeEpilogue:
                 + p * pass_rows
                 + pass_row
                 for m in range_constexpr(self.traits.M_TILES)
-                for p in range_constexpr(MFMA_MNK // pass_rows)
+                for p in range_constexpr(passes)
             ]
         )
         for m in range_constexpr(self.traits.M_TILES):
@@ -273,9 +275,13 @@ class PaDecodeEpilogue:
                         o_final[self.traits.o_slot(m, vh)],
                     )
             gpu.barrier()
-            for p in range_constexpr(MFMA_MNK // pass_rows):
+            for p in range_constexpr(passes):
                 row = p * pass_rows + pass_row
                 owned = m * MFMA_MNK + row < self.traits.CTA_ROWS
+                if const_expr(passes * pass_rows > MFMA_MNK):
+                    owned = owned & (row < MFMA_MNK)
+                if const_expr(self.traits.query_length % self.traits.query_splits):
+                    owned = owned & (m * MFMA_MNK + row >= self.ctx.first_stored_row)
                 if const_expr(pass_rows * dim_threads < self.traits.BLOCK_THREADS):
                     owned = owned & (pass_row < pass_rows)
                 if owned:
@@ -310,7 +316,7 @@ class PaDecodeEpilogue:
                         final_inv = self._sink_norm(
                             h_max,
                             h_sum,
-                            sink_rows[m * (MFMA_MNK // pass_rows) + p],
+                            sink_rows[m * passes + p],
                         )
                         if const_expr(self.traits.ONE_SLOT_PLAN):
                             inv = (self.ctx.task_count == 1).select(final_inv, inv)

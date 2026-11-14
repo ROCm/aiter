@@ -1681,8 +1681,8 @@ class PaDecodePipeline:
                 )
         # Chunk pairs take one K32 MFMA (twice the K16 one's rate on gfx950). Two V
         # halves: the second is widened into the staging after the first's PV.
-        half_vh = t.VHE_CHUNKS // t.MXFP4_V_HALVES
-        for h in range_constexpr(t.MXFP4_V_HALVES):
+        half_vh = t.VHE_CHUNKS // t.MXFP4_V_PARTS
+        for h in range_constexpr(t.MXFP4_V_PARTS):
             if const_expr(h > 0):
                 for a in range_constexpr(t.NCHUNK):
                     self.kv.mxfp4_stage_v_bf16(

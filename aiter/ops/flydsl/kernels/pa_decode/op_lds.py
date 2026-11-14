@@ -1073,7 +1073,7 @@ class PaDecodeKVLoader:
         """Widen chunk ``a``'s packed-E2M1 row of this lane, times its E8M0 scale, to
         BF16 into the wave's V staging. Tokens before ``window_first`` (if given)
         are invalid as well as those from ``tile_valid``. With two V halves (head
-        dim 256), only K block ``half`` is widened."""
+        dim 256 up), only K block ``half`` is widened."""
         c = self.ctx
         tok = self.mxfp4_warp * self.traits.TOK_PER_WARP + 16 * a + c.lane16
         valid = tok < tile_valid
@@ -1083,7 +1083,7 @@ class PaDecodeKVLoader:
         g = c.rgroup
         if const_expr(self.traits.head_dim == 64):
             g = c.rgroup % 2
-        halves = self.traits.MXFP4_V_HALVES
+        halves = self.traits.MXFP4_V_PARTS
         for kb in range_constexpr(self.traits.MXFP4_KB):
             if halves > 1 and kb != half:
                 continue
@@ -1120,7 +1120,7 @@ class PaDecodeKVLoader:
             + (c.lane16 % 2) * 8
         )
         ops = []
-        for m in range_constexpr(self.traits.VHE_CHUNKS // self.traits.MXFP4_V_HALVES):
+        for m in range_constexpr(self.traits.VHE_CHUNKS // self.traits.MXFP4_V_PARTS):
             r = fx.rocdl.ds_read_tr16_b64(
                 fx.Vector.make_type(4, fx.BFloat16),
                 fx.to_llvm_ptr(self.lds.pointer(lane + m * 512, fx.BFloat16)),
