@@ -376,7 +376,7 @@ _UA_POOL_FIELDS = [
 
 
 def _make_unified_attention_fn(
-    window_size, shuffled_kv_cache, equal_seqlen_q, fp8_pv, backend
+    window_size, shuffled_kv_cache, equal_seqlen_q, fp8_pv, backend, causal=True
 ):
     """Parameterized unified_attention callable for RotatingBufferBench.bench.
 
@@ -412,7 +412,7 @@ def _make_unified_attention_fn(
             max_seqlen_q=max_seqlen_q,
             max_seqlen_k=max_seqlen_k,
             softmax_scale=softmax_scale,
-            causal=True,
+            causal=causal,
             window_size=window_size,
             block_table=block_table,
             softcap=0,
@@ -450,6 +450,8 @@ def _mode_label(args):
         parts.append("fp8out")
     if args.shuffled_kv_cache:
         parts.append("shuffled")
+    if args.non_causal:
+        parts.append("noncausal")
     return "_".join(parts) + "_fwd"
 
 
@@ -597,6 +599,7 @@ def run_benchmark(custom, args):
             args.equal_seqlen_q,
             args.fp8_pv,
             args.backend,
+            causal=not args.non_causal,
         )
 
         if args.equal_seqlen_q:
@@ -636,6 +639,7 @@ def run_benchmark(custom, args):
                 v_descale=sample["v_descale"],
                 output_scale=sample["output_scale"],
                 out_dtype=sample["output"].dtype,
+                causal=0 if args.non_causal else 1,
             )
             if any_fp8:
                 atol, rtol = 1.5e-1, 1.5e-1
@@ -652,12 +656,8 @@ def run_benchmark(custom, args):
                 print(f"  FAIL {shape_str}  max_diff={max_diff:.6f}")
                 print(f"    {e}")
 
-        # Kernel disables windowing for non-positive values (SLIDING_WINDOW > 0).
-        window = (
-            args.sliding_window
-            if args.sliding_window is not None and args.sliding_window > 0
-            else None
-        )
+        # main() turns a window of 0 or less into None
+        window = args.sliding_window
 
         def _entry_flops_bytes(entry):
             cu_query_lens = entry["cu_seqlens_q"]
@@ -668,7 +668,10 @@ def run_benchmark(custom, args):
             for i in range(num_contexts):
                 sq = (cu_query_lens[i + 1] - cu_query_lens[i]).item()
                 sk = seqlens_k[i].item()
-                if window is None:
+                if args.non_causal:
+                    valid = sq * sk
+                    kv_read = sk
+                elif window is None:
                     valid = sq * sk - ((sq**2 - sq) / 2)
                     kv_read = sk
                 else:
@@ -849,6 +852,13 @@ def parse_args(args: list[str] | None = None) -> argparse.Namespace:
         default=False,
         help="Pre-shuffle the KV cache into the layout the gluon kernels expect",
     )
+    parser.add_argument(
+        "--non_causal",
+        "-non_causal",
+        action="store_true",
+        default=False,
+        help="Let each query token attend to all keys of its sequence",
+    )
 
     return parser.parse_args(args=args)
 
@@ -860,6 +870,11 @@ def main(args: list[str] | None = None) -> None:
         raise ValueError(
             "-fp8 already quantizes K/V; -fp8_kv is redundant. Use one or the other."
         )
+    # A window of 0 or less means no window.
+    if args.sliding_window is not None and args.sliding_window <= 0:
+        args.sliding_window = None
+    if args.non_causal and args.sliding_window is not None:
+        raise ValueError("-non_causal does not support -sliding_window.")
 
     if args.fp8_pv and not (args.nvfp4 or args.nvfp4_kv):
         raise ValueError(
