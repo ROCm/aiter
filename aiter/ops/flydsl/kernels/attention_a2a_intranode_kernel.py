@@ -9,7 +9,6 @@ import os
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
-from flydsl.compiler.backends import current_target
 from flydsl.expr import const_expr, range_constexpr
 from flydsl.expr import math as fmath
 from flydsl.expr.typing import Stream
@@ -162,7 +161,7 @@ def _fp6_output_views(address, num_records_bytes=None):
 
 def _int8_e8m0_scale(amax):
     # Match the symmetric INT8 codec's floor and exponent cap, not MXFP8's.
-    need = (amax / fx.Float32(127.0)).maximumf(fx.Float32(1.0e-30))
+    need = fx.max(amax / fx.Float32(127.0), fx.Float32(1.0e-30))
     bits = need.bitcast(fx.Int32)
     exponent = ((bits >> 23) & 255) + ((bits & 0x7FFFFF) != 0).to(fx.Int32)
     exponent = (exponent < 0).select(fx.Int32(0), exponent)
@@ -173,7 +172,7 @@ def _pack_int8_pair(first, second):
     packed = []
     for value in (first, second):
         rounded = fmath.roundeven(value)
-        clipped = rounded.maximumf(fx.Float32(-127.0)).minimumf(fx.Float32(127.0))
+        clipped = fx.min(fx.max(rounded, fx.Float32(-127.0)), fx.Float32(127.0))
         packed.append(clipped.to(fx.Int32) & 255)
     return (packed[0] | (packed[1] << 8)).to(fx.Int16)
 
@@ -278,7 +277,7 @@ def _pack_v4_fp6(values, reciprocal):
         fx.Uint32(emit_f32_to_e2m3((values[i] * reciprocal).ir_value()))
         for i in range(8)
     ]
-    peer = [code.shuffle_xor(2, 64) for code in codes]
+    peer = [fx.gpu.shuffle_xor(code, 2, 64) for code in codes]
     # Lanes 0/1 interleave their eight fields with lanes 2/3, respectively.
     triples = [
         codes[i] | (peer[i] << 6) | (codes[i + 1] << 12) | (peer[i + 1] << 18)
@@ -445,8 +444,8 @@ def _pack_transport_words(pairs, codec):
         lo = pairs[0] | (pairs[1] << 12) | (pairs[2] << 24)
         hi = (pairs[2] >> 8) | (pairs[3] << 4)
         # Two adjacent lanes own one aligned 96-bit span. Shuffle before predication.
-        peer_lo = lo.shuffle_xor(1, 64)
-        peer_hi = hi.shuffle_xor(1, 64)
+        peer_lo = fx.gpu.shuffle_xor(lo, 1, 64)
+        peer_hi = fx.gpu.shuffle_xor(hi, 1, 64)
         return fx.Vector.from_elements(
             [lo, hi | (peer_lo << 16), (peer_lo >> 16) | (peer_hi << 16)],
             fx.Uint32,
@@ -551,8 +550,8 @@ def _hadamard_head(values, lane, head_dim, registers=8):
         shift = 1 << stage
         result = [
             ((lane & shift) == 0).select(
-                value + value.shuffle_xor(shift, 64),
-                value.shuffle_xor(shift, 64) - value,
+                value + fx.gpu.shuffle_xor(value, shift, 64),
+                fx.gpu.shuffle_xor(value, shift, 64) - value,
             )
             for value in result
         ]
@@ -581,7 +580,7 @@ def make_attention_a2a_kernel(
     pc_reduce=False,
     spin_timeout_iters=0,
 ):
-    target_arch = current_target().arch
+    target_arch = flyc.get_backend().target.arch
     native_fp6 = (
         target_arch == "gfx950"
         and os.environ.get("AITER_A2A_FP6_FORCE_SOFTWARE", "0") != "1"
@@ -960,12 +959,12 @@ def make_attention_a2a_kernel(
                             )
                         amax = fx.Float32(0.0)
                         for i in range_constexpr(elements_per_chunk):
-                            amax = amax.maximumf(fmath.absf(decoded[i]))
+                            amax = fx.max(amax, fmath.absf(decoded[i]))
                         # Tail lanes load a safe row, but must not contribute its max.
                         amax = fx.Float32(output_valid.select(amax, fx.Float32(0.0)))
                         # Each aligned four-lane group owns 32 contiguous head values.
                         for shift in (1, 2):
-                            amax = amax.maximumf(amax.shuffle_xor(shift, 64))
+                            amax = fx.max(amax, fx.gpu.shuffle_xor(amax, shift, 64))
                         scale = (
                             _v4_fp6_scale(amax)
                             if mode and codec == "mxfp6"
@@ -1167,7 +1166,7 @@ def make_attention_a2a_kernel(
                 ]
             maximum = fx.Float32(0.0)
             for value in vals:
-                maximum = maximum.maximumf(fmath.absf(value))
+                maximum = fx.max(maximum, fmath.absf(value))
             scale = (
                 _v4_fp6_scale(maximum)
                 if v4_output
@@ -1581,10 +1580,10 @@ def make_attention_a2a_kernel(
                     amax_partial_offset(dest_pe, fx.Int32(part)),
                     fx.Float32,
                 )
-                result = yield [state[0].maximumf(value)]
+                result = yield [fx.max(state[0], value)]
             maximum = fx.Float32(result)
             for shift in (32, 16, 8, 4, 2, 1):
-                maximum = maximum.maximumf(maximum.shuffle_xor(shift, 64))
+                maximum = fx.max(maximum, fx.gpu.shuffle_xor(maximum, shift, 64))
             return maximum
 
         @flyc.jit
@@ -1592,7 +1591,7 @@ def make_attention_a2a_kernel(
             maximum, scale_table, dest_pe, peer_warp, peer_warps
         ):
             for shift in (32, 16, 8, 4, 2, 1):
-                maximum = maximum.maximumf(maximum.shuffle_xor(shift, 64))
+                maximum = fx.max(maximum, fx.gpu.shuffle_xor(maximum, shift, 64))
             if lane == 0:
                 part = fx.Int32(
                     fx.get_scalar(
@@ -1720,7 +1719,7 @@ def make_attention_a2a_kernel(
                     if const_expr(v4_amax):
                         # A clamped duplicate row cannot change the max.
                         for i in range_constexpr(vec):
-                            current = current.maximumf(fmath.absf(values[i]))
+                            current = fx.max(current, fmath.absf(values[i]))
                     else:
                         pairs = [
                             (
@@ -1828,7 +1827,7 @@ def make_attention_a2a_kernel(
                                 ],
                                 fx.Float32,
                             )
-                            result = yield [state[0].maximumf(combined)]
+                            result = yield [fx.max(state[0], combined)]
                         maximum = fx.Vector(result)
                         for peer in range_constexpr(npes):
                             remote = buf_copy_load(scale_table, peer, fx.Int64)
@@ -1876,7 +1875,7 @@ def make_attention_a2a_kernel(
                             values = fx.Vector(
                                 buf_copy_load(input_q, source, fx.BFloat16, 8)
                             ).to(fx.Float32)
-                            result = yield [state[0].maximumf(fmath.absf(values))]
+                            result = yield [fx.max(state[0], fmath.absf(values))]
                         maximum = fx.Vector(result)
                         offset = pc_partial_offset(dest_pe, tile, token_tiles, channels)
                         partial_channels = _field_view(partials, offset, channels)
@@ -1901,9 +1900,9 @@ def make_attention_a2a_kernel(
                                 (None, channel_chunk),
                             )
                             partial = buf_copy_load(peer_scales, i, fx.Float32)
-                            maximum = maximum.maximumf(partial)
+                            maximum = fx.max(maximum, partial)
                         # Clamp amax like quantize_v_fp8 so zero channels get a positive descale.
-                        maximum = maximum.maximumf(fx.Float32(1.0e-12))
+                        maximum = fx.max(maximum, fx.Float32(1.0e-12))
                         # The per-channel descale uses a rounded FP32 reciprocal multiply.
                         scale = maximum * fx.Float32(
                             1.0 / (240.0 if fp8_fnuz else 448.0)
@@ -1990,7 +1989,7 @@ def make_attention_a2a_kernel(
                     ).to(fx.Float32)
                     current = state[0]
                     for i in range_constexpr(8):
-                        current = current.maximumf(fmath.absf(values[i]))
+                        current = fx.max(current, fmath.absf(values[i]))
                     result = yield [current]
                 broadcast_partial_amax(
                     fx.Float32(result), scale_table, dest_pe, peer_warp, peer_warps
@@ -2131,9 +2130,9 @@ def make_attention_a2a_kernel(
                 )
             scratch_row = fx.slice(scratch, (warp, channel_chunk, None))
             for i in range_constexpr(8):
-                amax = fmath.absf(values[0][i]).maximumf(fmath.absf(values[1][i]))
+                amax = fx.max(fmath.absf(values[0][i]), fmath.absf(values[1][i]))
                 for shift in (16, 32):
-                    amax = amax.maximumf(amax.shuffle_xor(shift, 64))
+                    amax = fx.max(amax, fx.gpu.shuffle_xor(amax, shift, 64))
                 if lane < 16:
                     fx.memref_store(
                         amax,
@@ -2145,11 +2144,12 @@ def make_attention_a2a_kernel(
             for i in range_constexpr(8):
                 amax = fx.Float32(0.0)
                 for source_wave in range_constexpr(4):
-                    amax = amax.maximumf(
+                    amax = fx.max(
+                        amax,
                         fx.memref_load(
                             fx.slice(scratch, (source_wave, channel_chunk, None)),
                             i,
-                        )
+                        ),
                     )
                 maxima.append(amax)
             return values, fx.Vector.from_elements(maxima, fx.Float32)
@@ -2340,16 +2340,11 @@ def make_attention_a2a_kernel(
                                 if const_expr(split_v_exchange):  # noqa: SIM102
                                     # The paired sender is one source-rank slab after this slot.
                                     if frame_start == split_frame * 64:
-                                        amax = buf_copy_load(
-                                            pair_row, i, fx.Float32
-                                        ).maximumf(
-                                            buf_copy_load(
-                                                peer_row,
-                                                i,
-                                                fx.Float32,
-                                            )
+                                        amax = fx.max(
+                                            buf_copy_load(pair_row, i, fx.Float32),
+                                            buf_copy_load(peer_row, i, fx.Float32),
                                         )
-                                bits = amax.maximumf(fx.Float32(1.0e-12)).bitcast(
+                                bits = fx.max(amax, fx.Float32(1.0e-12)).bitcast(
                                     fx.Int32
                                 )
                                 scale = (
@@ -2596,7 +2591,7 @@ def make_attention_a2a_kernel(
                                 ).to(fx.Float32)
                                 value = valid.select(raw, fx.Float32(0.0))
                                 values.append(value)
-                                amax = amax.maximumf(fmath.absf(value))
+                                amax = fx.max(amax, fmath.absf(value))
                             if const_expr(split_v_exchange):  # noqa: SIM102
                                 if frame_start == split_frame * 64:
                                     # The paired sender is one source-rank slab after this slot.
@@ -2606,14 +2601,11 @@ def make_attention_a2a_kernel(
                                     paired_slot = paired_partial_offset(
                                         fx.Int32(1), local_head, half_wave, channel
                                     )
-                                    amax = buf_copy_load(
-                                        partials, slot, fx.Float32
-                                    ).maximumf(
+                                    amax = fx.max(
+                                        buf_copy_load(partials, slot, fx.Float32),
                                         buf_copy_load(
-                                            partials,
-                                            paired_slot,
-                                            fx.Float32,
-                                        )
+                                            partials, paired_slot, fx.Float32
+                                        ),
                                     )
                             scale = _v4_fp6_scale(amax)
                             reciprocal = ((fx.Int32(254) - scale) << 23).bitcast(
