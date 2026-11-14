@@ -286,6 +286,57 @@ def _quantize_fp8_fake(input: Tensor) -> tuple[Tensor, Tensor]:
     )
 
 
+# Enough (batch*head, chunk) blocks to spread the sample over the GPU at few heads, but few
+# enough chunks that the gate pass folds them quickly.
+_K_SMOOTH_TARGET_BLOCKS = 512
+_K_SMOOTH_MAX_CHUNKS = 32
+# The moments kernel's 256 threads cover at least 16 rows per pass.
+_K_SMOOTH_MIN_CHUNK_ROWS = 16
+
+
+@compile_ops("module_mha_v4_quant", develop=True)
+def _k_smooth_mean_hip(
+    out: Tensor,
+    partial: Tensor,
+    input: Tensor,
+    sample_rows: int,
+    min_common: float,
+) -> None:
+    """Write the gated K mean of BSHD `input` into `out`; `partial` is the chunk workspace."""
+
+
+@torch.library.custom_op("aiter::mha_v4_k_smooth_mean", mutates_args=())
+def k_smooth_mean(k: Tensor, sample_rows: int, min_common: float) -> Tensor:
+    """Gated per-(batch, head, channel) mean of BSHD `k` over every max(1, S // sample_rows)-th row.
+
+    Returns fp32 [B, H, D]: the sample mean where its squared norm exceeds min_common**2 times
+    the mean squared row norm, zeros elsewhere.
+    """
+    batch, sequence, heads, head_dim = k.shape
+    mean = k.new_empty((batch, heads, head_dim), dtype=torch.float32)
+    if sequence == 0 or batch * heads == 0:
+        return mean.zero_()
+    chunks = max(
+        1,
+        min(
+            _K_SMOOTH_MAX_CHUNKS,
+            -(-_K_SMOOTH_TARGET_BLOCKS // (batch * heads)),
+            -(-min(sequence, sample_rows) // _K_SMOOTH_MIN_CHUNK_ROWS),
+        ),
+    )
+    partial = k.new_empty((batch * heads, chunks, head_dim + 1), dtype=torch.float32)
+    # The develop bridge passes the current device's stream; make that K's device.
+    with torch.cuda.device(k.device):
+        _k_smooth_mean_hip(mean, partial, k, sample_rows, min_common)
+    return mean
+
+
+@k_smooth_mean.register_fake
+def _k_smooth_mean_fake(k: Tensor, sample_rows: int, min_common: float) -> Tensor:
+    del sample_rows, min_common
+    return k.new_empty((k.shape[0], k.shape[2], k.shape[3]), dtype=torch.float32)
+
+
 def quantize_fp8_rotated(
     input: Tensor, mean: Optional[Tensor] = None  # noqa: UP045
 ) -> tuple[Tensor, Tensor]:

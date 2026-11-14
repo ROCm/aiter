@@ -73,4 +73,11 @@ PYBIND11_MODULE(AITER_EXTENSION_NAME, m)
           py::arg("scale"),
           py::arg("input"),
           py::arg("head_split") = 1);
+    m.def("_k_smooth_mean_hip",
+          &aiter::torch_itfs::k_smooth_mean,
+          py::arg("out"),
+          py::arg("partial"),
+          py::arg("input"),
+          py::arg("sample_rows"),
+          py::arg("min_common"));
 }
