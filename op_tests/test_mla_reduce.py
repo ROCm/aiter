@@ -578,7 +578,12 @@ def main():
             # 304 CUs, with 2 rows per work item.
             (12, "512x4", 2, True),
         ],
-        512: [(16, "8,4", 3, False)],
+        512: [
+            (16, "8,4", 3, False),
+            # 32 tiles x 64 splits x 32 rows: catches the missing barrier between rows
+            # (#6731), which made this case fail every run on MI300X.
+            (16, "32x64", 32, True),
+        ],
     }
 
     all_ok = True
