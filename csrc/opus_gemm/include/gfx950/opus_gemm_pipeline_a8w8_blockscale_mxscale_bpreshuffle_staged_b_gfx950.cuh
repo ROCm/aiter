@@ -329,9 +329,11 @@ __device__ __forceinline__ void opus_gemm_bpreshuffle_staged_b_body_impl(
     const auto u_ssfa = make_layout_ssfa_scale<T>(lane_id, wave_id_m, wave_id_n);
     const auto u_rsfa = make_layout_rsfa_scale<T>(lane_id, wave_id_m);
     const int sfb_thread = wave_id * T::WARP_SIZE + lane_id;
-    const auto u_gsfb = make_layout<1>( make_tuple(number<T::SCALE_N_HALVES>{}, 1_I), make_tuple(kargs.stride_sfb, 1_I), make_tuple(underscore{}, sfb_thread));
-    const auto u_ssfb = make_layout<1>( make_tuple(1_I, 1_I), make_tuple(1_I, 1_I), make_tuple(sfb_thread, underscore{}));
-    const auto u_rsfb = make_layout<1>(make_tuple(1_I), make_tuple(1_I));
+    const auto u_gsfb = make_layout<1>(opus::make_tuple(number<T::SCALE_N_HALVES>{}, 1_I),
+        opus::make_tuple(kargs.stride_sfb, 1_I), opus::make_tuple(underscore{}, sfb_thread));
+    const auto u_ssfb = make_layout<1>(opus::make_tuple(1_I, 1_I), opus::make_tuple(1_I, 1_I),
+        opus::make_tuple(sfb_thread, underscore{}));
+    const auto u_rsfb = make_layout<1>(opus::make_tuple(1_I), opus::make_tuple(1_I));
     alignas(16) extern __shared__ char smem_matrix[];
     auto s_a = make_smem(reinterpret_cast<D_A*>(smem_matrix));
     auto s_b = make_smem(reinterpret_cast<D_B*>(smem_matrix + stages * a_stage_bytes));
