@@ -147,11 +147,13 @@
   "version": 1
  },
  "top_k_per_row_decode": {
-  "fingerprint": "254392f1c1ad0fcb",
-  "signature": "logits:positional:torch.Tensor, next_n:positional:int, seqLens:positional:torch.Tensor, indices:positional:torch.Tensor, numRows:positional:int, stride0:positional:int, stride1:positional:int, k:positional:int=2048, stable:positional:bool=False, values:positional:torch.Tensor | None=None, row_starts:keyword-only:torch.Tensor | None=None, plane_width:keyword-only:int | None=None, -> None",
+  "fingerprint": "bf8f8aa26595abb4",
+  "signature": "logits:positional:torch.Tensor, next_n:positional:int, seqLens:positional:torch.Tensor, indices:positional:torch.Tensor, numRows:positional:int, stride0:positional:int, stride1:positional:int, k:positional:int=2048, stable:positional:bool=False, values:positional:torch.Tensor | None=None, row_starts:keyword-only:torch.Tensor | None=None, plane_width:keyword-only:int | None=None, lane_max:keyword-only:torch.Tensor | None=None, -> None",
   "source": "aiter/ops/topk.py",
-  "supersedes": [],
-  "version": 1
+  "supersedes": [
+   1
+  ],
+  "version": 2
  },
  "topk_gating": {
   "fingerprint": "b6325c278faa3184",

@@ -13,6 +13,7 @@ from ..kernels.kernels_common import get_warp_size
 from ..kernels.topk.radix_topk_one_block import (
     _COMPACT_CAPACITY,
     _MAX_ROW_ELEMENTS,
+    _PREFILTER_MIN_ROW_LEN,
     build_radix_topk_one_block_module,
 )
 from ..kernels.topk.topk_launch import run_topk_launcher
@@ -449,12 +450,22 @@ def flydsl_radix_topk_one_block(
     ``plane_width`` defaults to the logits width; it bounds every row and
     selects the same kernel variant that an unpacked plane of that width uses.
     ``lane_max`` (packed decode rows, stable): lane maxima for these rows
-    (``mqa_logits_mxfp4(lane_max=...)``); long rows then select from the values
-    not below a bound read off them. The selection is the same whatever they
-    hold; other calls ignore them.
+    (``mqa_logits_mxfp4(lane_max=...)``), already validated by the caller
+    (``aiter.ops.topk._check_topk_lane_max``); on wave32 arches long rows
+    then select from the values not below a bound read off them. The selection
+    is the same whatever they hold; other calls do not read them.
     """
     if packed_rows and (not is_decode or row_starts is None):
         raise ValueError("packed rows require decode mode and row_starts")
+    if lane_max is not None and not (
+        packed_rows
+        and lane_max.dtype == torch.float32
+        and lane_max.dim() == 1
+        and lane_max.is_contiguous()
+    ):
+        raise ValueError(
+            "lane_max must be contiguous fp32 [n] lane maxima of packed decode rows"
+        )
     if row_starts is None:
         if not is_decode:
             raise ValueError("row_starts is required for prefill")
@@ -489,14 +500,15 @@ def flydsl_radix_topk_one_block(
         block_threads = 512
     else:
         block_threads = 1024
+    # The prefilter: packed stable decode rows on wave32, and only if some row
+    # can reach its minimum length (the kernel also checks it row by row).
     prefilter = (
         lane_max is not None
         and packed_rows
         and stable
         and not short_rows
-        and lane_max.dtype == torch.float32
-        and lane_max.dim() == 1
-        and lane_max.is_contiguous()
+        and wave_size == 32
+        and width >= _PREFILTER_MIN_ROW_LEN
     )
     launcher = build_radix_topk_one_block_module(
         k,
