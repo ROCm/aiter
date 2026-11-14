@@ -402,6 +402,8 @@ def fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert(
     q_packed_out: torch.Tensor | None = None,
     q_rope_out: torch.Tensor | None = None,
     use_fnuz: bool = False,
+    hca_kv_indices: dict | None = None,
+    hca_kv_indices_prefill: dict | None = None,
 ):
     """The whole DSv4 decode producer in one launch.
 
@@ -428,6 +430,22 @@ def fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert(
     then UNINITIALISED and only its shape is meaningful. Use it only when the
     consumer reads the packed pair alone (a pure-decode step on the aiter
     path); anything that reads Q as bf16, prefill included, must leave it on.
+
+    ``hca_kv_indices`` (COPY_HCA_KV_INDICES) also writes the HCA layer's
+    sparse-attention index list for its first ``num_tokens`` tokens (the
+    decode tokens, which lead the batch): per token, its SWA slots then its
+    compressed slots, as rows of the flat 640 B record grid both caches share,
+    ``base + (slot // page) * block_rows + slot % page``. Keys:
+    ``swa_indices``, ``swa_indptr``, ``comp_indices``, ``comp_indptr`` (int32,
+    ragged), ``dst_indices``, ``dst_indptr`` (int32 outputs, the indptr is
+    ``swa_indptr + comp_indptr``), ``num_tokens``, ``block_rows``,
+    ``swa_base``, ``comp_base``, ``swa_page``, ``comp_page`` (pages: powers of
+    two).
+
+    ``hca_kv_indices_prefill`` does the same for the batch's prefill tokens:
+    same keys plus ``token_offset`` (the batch row of its first token; its
+    ragged inputs and outputs are indexed from that token). The geometry keys
+    must match ``hca_kv_indices`` when both are given (same layer, same caches).
     """
     t, h, dim = q.shape
     if dim != _V4_DIM_QK:
@@ -476,8 +494,62 @@ def fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert(
         q_packed = q_rope = q_out
 
     fp8_max = _v4_fp8_max(use_fnuz)
-    # One extra slot along dim 1 carries the KV row for the token.
-    _fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert_kernel[(t, padded_heads + 1)](
+    geo_keys = ("block_rows", "swa_base", "comp_base", "swa_page", "comp_page")
+    tensor_keys = (
+        "swa_indices",
+        "swa_indptr",
+        "comp_indices",
+        "comp_indptr",
+        "dst_indices",
+        "dst_indptr",
+    )
+
+    def _hca_segment(seg, name):
+        for k in tensor_keys:
+            x = seg[k]
+            if x.dtype != torch.int32 or not x.is_contiguous():
+                raise RuntimeError(f"{name}[{k!r}] must be contiguous int32")
+        for k in ("swa_page", "comp_page"):
+            if seg[k] <= 0 or seg[k] & (seg[k] - 1):
+                raise RuntimeError(f"{name} {k} {seg[k]} must be a power of two")
+        return tuple(seg[k] for k in tensor_keys)
+
+    hca, hcp = hca_kv_indices, hca_kv_indices_prefill
+    copy_hca, copy_hcp = hca is not None, hcp is not None
+    if copy_hca and copy_hcp and any(hca[k] != hcp[k] for k in geo_keys):
+        raise RuntimeError("hca_kv_indices and hca_kv_indices_prefill geometry differ")
+    geo = hca if copy_hca else hcp
+    if copy_hca:
+        hca_t = _hca_segment(hca, "hca_kv_indices")
+        if not 0 <= hca["num_tokens"] <= t:
+            raise RuntimeError(f"hca num_tokens {hca['num_tokens']} not in [0, {t}]")
+        hca_n = int(hca["num_tokens"])
+    else:
+        hca_t, hca_n = (kv_slot_mapping,) * 6, 0
+    if copy_hcp:
+        hcp_t = _hca_segment(hcp, "hca_kv_indices_prefill")
+        off, n = int(hcp["token_offset"]), int(hcp["num_tokens"])
+        if off < 0 or n < 0 or off + n > t:
+            raise RuntimeError(f"hca prefill rows [{off}, {off + n}) not in [0, {t}]")
+        hcp_s = (n, off)
+    else:
+        hcp_t, hcp_s = (kv_slot_mapping,) * 6, (0, 0)
+    if geo is not None:
+        hca_s = (
+            hca_n,
+            int(geo["block_rows"]),
+            int(geo["swa_base"]),
+            int(geo["comp_base"]),
+        )
+        hca_pages = (int(geo["swa_page"]), int(geo["comp_page"]))
+    else:
+        hca_s, hca_pages = (0, 0, 0, 0), (1, 1)
+    hcp_slot = padded_heads + 1 + int(copy_hca)
+    # One extra slot along dim 1 carries the KV row for the token, and one
+    # more per HCA index-list segment (decode, prefill).
+    _fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert_kernel[
+        (t, padded_heads + 1 + int(copy_hca) + int(copy_hcp))
+    ](
         q,
         q_out,
         q_packed,
@@ -505,6 +577,15 @@ def fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert(
         bool(pack_q),
         bool(write_q),
         bool(use_fnuz),
+        *hca_t,
+        *hca_s,
+        copy_hca,
+        *hca_pages,
+        128,
+        *hcp_t,
+        *hcp_s,
+        copy_hcp,
+        hcp_slot,
         num_warps=4,
     )
     if pack_q:

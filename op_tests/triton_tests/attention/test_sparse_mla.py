@@ -4,7 +4,8 @@
 """Tests for sparse_mla_fwd (gluon MLA, gfx950 and gfx942).
 
 Covers both geometries: separated rope (DSV3.2, GLM-5.1, GLM-5.2) and
-rope-free (GLM-5.3-Flash), where the query is the latent alone.
+rope-free (GLM-5.3-Flash), where the query is the latent alone. The last
+section covers the gfx1250 640 B DeepSeek-V4 record (fp8_dsv4_mla_640).
 """
 
 import pytest
@@ -496,3 +497,319 @@ def test_sparse_mla_fp8_two_caches(one_alloc, mxfp8, splits):
         out = (data.float().view(C, -1, 32) * step).view(C, H, KV_LORA)
     e = rel_err(out, ref)
     assert e < 0.1, f"{one_alloc=} {mxfp8=} {splits=}: rel-err {e:.3e}"
+
+
+# --------------------------------------------------------------------------- #
+# gfx1250: the 640 B aligned DeepSeek-V4 record (fp8_dsv4_mla_640)
+# --------------------------------------------------------------------------- #
+# sparse_mla_fwd routes this format to pa_decode_sparse's gfx1250 fp8 driver
+# for prefill and decode alike, taking either a bf16 q or the packed fp8 q with
+# its bf16 RoPE half (q_rope). The oracle is the driver's own previous entry
+# points, pa_decode_sparse / pa_prefill_sparse, called as vLLM called them:
+# the two routes must agree bit for bit.
+_ON_DSV4_640 = arch_info.get_arch() in smd.DSV4_640_ARCHS
+_needs_640 = pytest.mark.skipif(
+    not _ON_DSV4_640, reason="fp8_dsv4_mla_640 is gfx1250-only"
+)
+_REC640, _V4_H, _V4_ROWS_PER_BLOCK, _V4_NB = 640, 32, 2387, 24
+
+
+def _v4_record_grid(seed=0):
+    """A flat [rows, 640] grid of valid aligned records: finite e4m3 NoPE, the
+    14 duplicated UE8M0 scale bytes, zero pad, bf16 RoPE."""
+    g = torch.Generator(device="cuda").manual_seed(seed)
+    rows = _V4_NB * _V4_ROWS_PER_BLOCK
+    grid = torch.zeros(rows, _REC640, dtype=torch.uint8, device="cuda")
+    grid[:, :448] = torch.randint(
+        0, 120, (rows, 448), generator=g, device="cuda", dtype=torch.uint8
+    )
+    grid[:, 448:462] = 120  # 2^-7
+    rope = torch.randn(rows, 64, generator=g, device="cuda") * 0.3
+    grid[:, 512:] = rope.to(torch.bfloat16).view(torch.uint8)
+    return grid
+
+
+def _v4_inputs(T, max_keys, rows, seed=0):
+    """Ragged row indices (lengths in [max_keys // 3, max_keys]), bf16 q, sink."""
+    g = torch.Generator(device="cuda").manual_seed(seed)
+    lens = torch.randint(
+        max(1, max_keys // 3), max_keys + 1, (T,), generator=g, device="cuda"
+    )
+    indptr = torch.zeros(T + 1, dtype=torch.int32, device="cuda")
+    indptr[1:] = lens.cumsum(0)
+    idx = torch.randint(
+        0, rows, (int(indptr[-1]),), generator=g, device="cuda", dtype=torch.int32
+    )
+    q = (torch.randn(T, _V4_H, 512, generator=g, device="cuda") * 2).to(torch.bfloat16)
+    sink = torch.randn(_V4_H, generator=g, device="cuda") * 0.5
+    return idx, indptr, q, sink
+
+
+def _v4_pack(q):
+    from aiter.ops.triton.quant.fused_mxfp8_quant import (
+        fused_deepseek_v4_mxfp8_quant_q_pack,
+    )
+
+    return fused_deepseek_v4_mxfp8_quant_q_pack(q)
+
+
+def _v4_views(grid):
+    return grid[:, :512].view(torch.float8_e4m3fn), grid[:, 512:].view(torch.bfloat16)
+
+
+@_needs_640
+@pytest.mark.parametrize("T", [1, 16, 33, 128])
+@pytest.mark.parametrize("max_keys", [192, 1152])
+@pytest.mark.parametrize("lru", [False, True])
+def test_dsv4_640_decode_matches_pa_decode_sparse(T, max_keys, lru):
+    """Decode (split-K at these batch sizes): bit-identical to the direct
+    pa_decode_sparse call on the pre-split planes, with and without the LRU
+    partial buffers."""
+    from aiter.ops.triton.attention.pa_decode_sparse import pa_decode_sparse
+
+    grid = _v4_record_grid()
+    idx, indptr, q, sink = _v4_inputs(T, max_keys, grid.shape[0], seed=T)
+    qp, qr = _v4_pack(q)
+    kv, kv_rope = _v4_views(grid)
+    want = torch.empty(T, _V4_H, 512, dtype=torch.bfloat16, device="cuda")
+    got = torch.empty_like(want)
+    pa_decode_sparse(
+        qp,
+        kv,
+        idx,
+        indptr,
+        sink,
+        0.044,
+        q_rope=qr,
+        unified_kv_rope=kv_rope,
+        has_invalid=False,
+        use_lru_cache_partials=lru,
+        out=want,
+    )
+    sparse_mla_fwd(
+        qp,
+        grid,
+        indptr,
+        idx,
+        0.044,
+        q_rope=qr,
+        attn_sink=sink,
+        has_invalid=False,
+        use_lru_cache_partials=lru,
+        out=got,
+    )
+    torch.testing.assert_close(got, want, rtol=0, atol=0)
+
+
+@_needs_640
+@pytest.mark.parametrize("T", [1, 300, 2048])
+def test_dsv4_640_prefill_matches_pa_prefill_sparse(T):
+    """Prefill at kv_splits=1 (the single pass): bit-identical to
+    pa_prefill_sparse, which always runs one split."""
+    from aiter.ops.triton.attention.pa_prefill_sparse import pa_prefill_sparse
+
+    grid = _v4_record_grid(1)
+    idx, indptr, q, sink = _v4_inputs(T, 1152, grid.shape[0], seed=7 + T)
+    qp, qr = _v4_pack(q)
+    kv, kv_rope = _v4_views(grid)
+    want = torch.empty(T, _V4_H, 512, dtype=torch.bfloat16, device="cuda")
+    got = torch.empty_like(want)
+    pa_prefill_sparse(
+        qp,
+        kv,
+        idx,
+        indptr,
+        None,
+        None,
+        None,
+        sink,
+        0.044,
+        has_invalid=False,
+        out=want,
+        q_rope=qr,
+        unified_kv_rope=kv_rope,
+    )
+    sparse_mla_fwd(
+        qp,
+        grid,
+        indptr,
+        idx,
+        0.044,
+        q_rope=qr,
+        attn_sink=sink,
+        has_invalid=False,
+        kv_splits=1,
+        out=got,
+    )
+    torch.testing.assert_close(got, want, rtol=0, atol=0)
+
+
+@_needs_640
+def test_dsv4_640_paged_equals_flat():
+    """[nb, block, 640] (slots) and the flat [rows, 640] grid (rows) are the
+    same records, so the same indices must give the same output."""
+    grid = _v4_record_grid(2)
+    rows_used = (grid.shape[0] // 64) * 64
+    grid = grid[:rows_used]
+    idx, indptr, q, sink = _v4_inputs(16, 640, rows_used, seed=3)
+    qp, qr = _v4_pack(q)
+    flat = sparse_mla_fwd(qp, grid, indptr, idx, 0.044, q_rope=qr, attn_sink=sink)[0]
+    paged = sparse_mla_fwd(
+        qp, grid.view(-1, 64, _REC640), indptr, idx, 0.044, q_rope=qr, attn_sink=sink
+    )[0]
+    torch.testing.assert_close(paged, flat, rtol=0, atol=0)
+
+
+@_needs_640
+def test_dsv4_640_bf16_q_equals_packed_q():
+    """A bf16 q is packed inside the route; the result is the packed-q call's."""
+    grid = _v4_record_grid(3)
+    idx, indptr, q, sink = _v4_inputs(8, 400, grid.shape[0], seed=4)
+    qp, qr = _v4_pack(q)
+    a = sparse_mla_fwd(q, grid, indptr, idx, 0.044, attn_sink=sink)[0]
+    b = sparse_mla_fwd(qp, grid, indptr, idx, 0.044, q_rope=qr, attn_sink=sink)[0]
+    torch.testing.assert_close(a, b, rtol=0, atol=0)
+
+
+@_needs_640
+def test_dsv4_640_two_loop_matches_pa_decode_sparse():
+    """The SWA + top-k two-loop with both segments on 640 B caches."""
+    from aiter.ops.triton.attention.pa_decode_sparse import pa_decode_sparse
+
+    grid = _v4_record_grid(4)
+    main = grid[: 12 * 64].view(12, 64, _REC640)
+    extra = grid[12 * 64 : 36 * 64].view(24, 64, _REC640)
+    m_idx, m_ptr, q, sink = _v4_inputs(16, 128, 12 * 64, seed=5)
+    e_idx, e_ptr, _, _ = _v4_inputs(16, 512, 24 * 64, seed=6)
+    qp, qr = _v4_pack(q)
+    want = pa_decode_sparse(
+        qp,
+        main,
+        m_idx,
+        m_ptr,
+        sink,
+        0.044,
+        q_rope=qr,
+        has_invalid=False,
+        extra_cache=extra,
+        extra_indices=e_idx,
+        extra_indptr=e_ptr,
+    )
+    got = sparse_mla_fwd(
+        qp,
+        main,
+        m_ptr,
+        m_idx,
+        0.044,
+        q_rope=qr,
+        attn_sink=sink,
+        extra_kv=extra,
+        extra_indptr=e_ptr,
+        extra_indices=e_idx,
+    )[0]
+    torch.testing.assert_close(got, want, rtol=0, atol=0)
+
+
+@_needs_640
+def test_dsv4_640_lru_partials_engaged():
+    """use_lru_cache_partials reaches the driver: its partial-buffer cache
+    fills, and the flat-pool kernel refuses the flag."""
+    import aiter.ops.triton.attention.pa_decode_sparse as pds
+
+    grid = _v4_record_grid(5)
+    idx, indptr, q, sink = _v4_inputs(4, 1152, grid.shape[0], seed=8)
+    qp, qr = _v4_pack(q)
+    pds._v4_decode_partials.cache_clear()
+    sparse_mla_fwd(
+        qp,
+        grid,
+        indptr,
+        idx,
+        0.044,
+        q_rope=qr,
+        attn_sink=sink,
+        use_lru_cache_partials=True,
+    )
+    assert pds._v4_decode_partials.cache_info().currsize >= 1
+
+    qb = torch.randn(4, 16, D_QK, dtype=torch.bfloat16, device="cuda")
+    kvb = torch.randn(64, D_QK, dtype=torch.bfloat16, device="cuda")
+    with pytest.raises(ValueError, match="use_lru_cache_partials"):
+        sparse_mla_fwd(
+            qb,
+            kvb,
+            torch.tensor([0, 1, 2, 3, 4], dtype=torch.int32, device="cuda"),
+            torch.arange(4, dtype=torch.int32, device="cuda"),
+            0.1,
+            use_lru_cache_partials=True,
+        )
+
+
+@_needs_640
+def test_dsv4_640_contract():
+    """What the 640 B route refuses instead of decoding the wrong thing."""
+    grid = _v4_record_grid(6)
+    idx, indptr, q, _sink = _v4_inputs(4, 64, grid.shape[0], seed=9)
+    qp, qr = _v4_pack(q)
+    call = sparse_mla_fwd
+
+    with pytest.raises(ValueError, match="kv_scale"):
+        call(
+            qp, grid, indptr, idx, 0.1, q_rope=qr, kv_scale=torch.ones(1, device="cuda")
+        )
+    for kw, msg in (
+        ({"return_lse": True}, "return_lse"),
+        ({"dot_precision": "fp8"}, "dot_precision"),
+        ({"q_scale": torch.ones(1, device="cuda")}, "q_scale"),
+    ):
+        with pytest.raises(ValueError, match=msg):
+            call(qp, grid, indptr, idx, 0.1, q_rope=qr, **kw)
+    with pytest.raises(ValueError, match="q_rope must be"):
+        call(qp, grid, indptr, idx, 0.1, q_rope=qr[..., :32].contiguous())
+    with pytest.raises(ValueError, match="packed float8_e4m3fn"):
+        call(q, grid, indptr, idx, 0.1, q_rope=qr)
+    with pytest.raises(ValueError, match="row-contiguous"):
+        call(qp, grid[::2], indptr, idx, 0.1, q_rope=qr)
+    bf16_extra = torch.zeros(2, 64, 512, dtype=torch.bfloat16, device="cuda")
+    with pytest.raises(ValueError, match="pairs only with itself"):
+        call(
+            qp,
+            grid.view(-1, 1, _REC640),
+            indptr,
+            idx,
+            0.1,
+            q_rope=qr,
+            extra_kv=bf16_extra,
+            extra_indptr=indptr,
+            extra_indices=idx,
+        )
+
+
+def test_dsv4_640_q_rope_needs_640():
+    """q_rope names a packed DSv4 q; with any other cache it is a caller error."""
+    q = torch.randn(2, 16, D_QK, dtype=torch.bfloat16, device="cuda")
+    kv = torch.randn(64, D_QK, dtype=torch.bfloat16, device="cuda")
+    with pytest.raises(ValueError, match="fp8_dsv4_mla_640"):
+        sparse_mla_fwd(
+            q,
+            kv,
+            torch.tensor([0, 1, 2], dtype=torch.int32, device="cuda"),
+            torch.arange(2, dtype=torch.int32, device="cuda"),
+            0.1,
+            q_rope=torch.zeros(2, 16, 64, dtype=torch.bfloat16, device="cuda"),
+        )
+
+
+def test_dsv4_640_arch_gate(monkeypatch):
+    """Off gfx1250 the 640 B record has no reader: refuse it by arch."""
+    monkeypatch.setattr(smd.arch_info, "get_arch", lambda: "gfx950")
+    grid = torch.zeros(64, _REC640, dtype=torch.uint8, device="cuda")
+    q = torch.zeros(2, 16, 512, dtype=torch.bfloat16, device="cuda")
+    with pytest.raises(ValueError, match="gfx1250"):
+        sparse_mla_fwd(
+            q,
+            grid,
+            torch.tensor([0, 1, 2], dtype=torch.int32, device="cuda"),
+            torch.arange(2, dtype=torch.int32, device="cuda"),
+            0.1,
+        )

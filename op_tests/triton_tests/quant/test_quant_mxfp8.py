@@ -753,6 +753,182 @@ def test_fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert_contract():
 
 
 # --------------------------------------------------------------------------- #
+# fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert: the HCA index copy
+# (hca_kv_indices / hca_kv_indices_prefill, COPY_HCA_KV_INDICES[_PREFILL])
+# --------------------------------------------------------------------------- #
+# An HCA (compress-ratio-128) layer reads one [SWA | compressed] index list per
+# token over the flat 640 B record grid both of its caches live in. The insert
+# writes that list in the extra program slots, once for the decode tokens
+# (which lead the batch) and once for the prefill tokens (from token_offset).
+# A slot of either cache maps to base + (slot // page) * block_rows +
+# slot % page; base is the only per-layer term, and on DSv4-Pro an HCA layer's
+# compressed base sits BELOW its SWA base, so the rows are absolute.
+_HCA_ROWS = 2387  # DSv4-Pro TP4: rows per block, both caches
+_HCA_SENTINEL = -7
+
+
+def _hca_ragged(n, max_len, num_slots, min_len=0, seed=0):
+    """Ragged int32 slots + indptr for n tokens, lengths in [min_len, max_len]."""
+    g = torch.Generator().manual_seed(seed)
+    lens = torch.randint(min_len, max_len + 1, (n,), generator=g)
+    indptr = torch.zeros(n + 1, dtype=torch.int32)
+    indptr[1:] = lens.cumsum(0)
+    idx = torch.randint(0, num_slots, (max(int(indptr[-1]), 1),), generator=g)
+    return idx.to(torch.int32).cuda(), indptr.cuda()
+
+
+def _hca_segment(n, swa_base, comp_base, seed, swa_page=64, comp_page=2):
+    """One segment's kwarg dict (outputs prefilled with a sentinel) plus its
+    torch reference (rows, indptr)."""
+    nb = 48
+    swa_idx, swa_ptr = _hca_ragged(n, 128, nb * swa_page, seed=seed)
+    comp_idx, comp_ptr = _hca_ragged(n, 40, nb * comp_page, seed=seed + 1)
+    swa_ptr_c, comp_ptr_c = swa_ptr.cpu(), comp_ptr.cpu()
+    nnz = int(swa_ptr_c[-1] + comp_ptr_c[-1])
+
+    def rows(slots, base, page):
+        slots = slots.long()
+        return base + (slots // page) * _HCA_ROWS + slots % page
+
+    want, want_ptr = [], [0]
+    for t in range(n):
+        s0, s1 = int(swa_ptr_c[t]), int(swa_ptr_c[t + 1])
+        c0, c1 = int(comp_ptr_c[t]), int(comp_ptr_c[t + 1])
+        want.append(rows(swa_idx[s0:s1], swa_base, swa_page))
+        want.append(rows(comp_idx[c0:c1], comp_base, comp_page))
+        want_ptr.append(want_ptr[-1] + (s1 - s0) + (c1 - c0))
+    want = (
+        torch.cat(want).to(torch.int32).cpu()
+        if want
+        else torch.empty(0, dtype=torch.int32)
+    )
+    seg = {
+        "swa_indices": swa_idx,
+        "swa_indptr": swa_ptr,
+        "comp_indices": comp_idx,
+        "comp_indptr": comp_ptr,
+        # room past the list, so a write beyond it is caught
+        "dst_indices": torch.full(
+            (nnz + 256,), _HCA_SENTINEL, dtype=torch.int32, device="cuda"
+        ),
+        "dst_indptr": torch.full(
+            (n + 1,), _HCA_SENTINEL, dtype=torch.int32, device="cuda"
+        ),
+        "num_tokens": n,
+        "block_rows": _HCA_ROWS,
+        "swa_base": swa_base,
+        "comp_base": comp_base,
+        "swa_page": swa_page,
+        "comp_page": comp_page,
+    }
+    return seg, want, torch.tensor(want_ptr, dtype=torch.int32)
+
+
+def _check_hca_segment(seg, want, want_ptr):
+    nnz = int(want_ptr[-1])
+    torch.testing.assert_close(seg["dst_indptr"].cpu(), want_ptr, **_EXACT)
+    torch.testing.assert_close(seg["dst_indices"][:nnz].cpu(), want, **_EXACT)
+    assert (seg["dst_indices"][nnz:] == _HCA_SENTINEL).all(), "wrote past the list"
+
+
+@pytest.mark.parametrize(
+    "swa_base,comp_base",
+    # DSv4-Pro TP4 per-layer bases: equal, compressed above, and compressed far
+    # below the SWA base (absolute rows, no negative relative row may appear)
+    [(0, 0), (0, 2), (128, 6), (1856, 60)],
+)
+@pytest.mark.parametrize("n_dec,n_pre", [(1, 0), (7, 5), (33, 0), (128, 3)])
+def test_fused_deepseek_v4_qnorm_rope_kv_insert_hca_index_copy(
+    swa_base, comp_base, n_dec, n_pre
+):
+    """Decode segment: rows and indptr exactly as the reference, nothing past
+    the list, and the prefill rows behind the decode tokens left alone. Q, its
+    pack and the KV records must not change because the copy rode along."""
+    _skip_without_fp8()
+    T = n_dec + n_pre
+    q, kv, cache, slot, pos, cs = _make_inputs(T, 32, 32, nb=4, block=64)
+    seg, want, want_ptr = _hca_segment(n_dec, swa_base, comp_base, seed=T)
+
+    base_cache = cache.clone()
+    ref = fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert(
+        q, kv, base_cache, slot, pos, cs, 64, 1e-6, 32
+    )
+    got = fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert(
+        q, kv, cache, slot, pos, cs, 64, 1e-6, 32, hca_kv_indices=seg
+    )
+    _check_hca_segment(seg, want, want_ptr)
+    for a, b in zip(ref, got):
+        torch.testing.assert_close(
+            a.view(torch.uint8) if a.dtype != torch.bfloat16 else a,
+            b.view(torch.uint8) if b.dtype != torch.bfloat16 else b,
+            **_EXACT,
+        )
+    torch.testing.assert_close(cache, base_cache, **_EXACT)
+
+
+@pytest.mark.parametrize("with_decode", [False, True])
+@pytest.mark.parametrize("n_dec,n_pre", [(0, 9), (4, 37), (16, 300)])
+def test_fused_deepseek_v4_qnorm_rope_kv_insert_hca_index_copy_prefill(
+    with_decode, n_dec, n_pre
+):
+    """Prefill segment (token_offset = first prefill row), alone and together
+    with the decode segment in one launch: each list exact, neither writes the
+    other's tokens or past its own list, and Q / the KV records unchanged."""
+    _skip_without_fp8()
+    if with_decode and n_dec == 0:
+        pytest.skip("no decode tokens to give the decode segment")
+    T = n_dec + n_pre
+    q, kv, cache, slot, pos, cs = _make_inputs(T, 32, 32, nb=8, block=64)
+    pre, want_p, want_pp = _hca_segment(n_pre, 128, 6, seed=100 + T)
+    pre["token_offset"] = n_dec
+    kw = {"hca_kv_indices_prefill": pre}
+    if with_decode:
+        dec, want_d, want_dp = _hca_segment(n_dec, 128, 6, seed=200 + T)
+        kw["hca_kv_indices"] = dec
+
+    base_cache = cache.clone()
+    ref = fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert(
+        q, kv, base_cache, slot, pos, cs, 64, 1e-6, 32
+    )
+    got = fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert(
+        q, kv, cache, slot, pos, cs, 64, 1e-6, 32, **kw
+    )
+    _check_hca_segment(pre, want_p, want_pp)
+    if with_decode:
+        _check_hca_segment(dec, want_d, want_dp)
+    torch.testing.assert_close(got[0], ref[0], **_EXACT)
+    torch.testing.assert_close(cache, base_cache, **_EXACT)
+
+
+def test_fused_deepseek_v4_qnorm_rope_kv_insert_hca_index_copy_contract():
+    """What the HCA copy refuses instead of writing garbage."""
+    _skip_without_fp8()
+    q, kv, cache, slot, pos, cs = _make_inputs(6, 16, 16, nb=2, block=64)
+
+    def call(**kw):
+        return fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert(
+            q, kv, cache, slot, pos, cs, 64, 1e-6, 16, **kw
+        )
+
+    seg, _, _ = _hca_segment(4, 0, 2, seed=1)
+
+    bad = dict(seg, swa_indices=seg["swa_indices"].long())
+    with pytest.raises(RuntimeError, match="int32"):
+        call(hca_kv_indices=bad)
+    with pytest.raises(RuntimeError, match="power of two"):
+        call(hca_kv_indices=dict(seg, comp_page=3))
+    with pytest.raises(RuntimeError, match="num_tokens"):
+        call(hca_kv_indices=dict(seg, num_tokens=7))
+    with pytest.raises(RuntimeError, match="prefill rows"):
+        call(hca_kv_indices_prefill=dict(seg, token_offset=3))
+    with pytest.raises(RuntimeError, match="geometry"):
+        call(
+            hca_kv_indices=seg,
+            hca_kv_indices_prefill=dict(seg, comp_base=8, token_offset=2),
+        )
+
+
+# --------------------------------------------------------------------------- #
 # fused_deepseek_v4_quantize_and_insert_k_cache
 # fused_deepseek_v4_dequantize_and_gather_k_cache
 # --------------------------------------------------------------------------- #

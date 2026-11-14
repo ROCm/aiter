@@ -29,6 +29,12 @@ from aiter.ops.triton._gluon_kernels.gfx1250.attention.pa_prefill_sparse import 
 from aiter.ops.triton._triton_kernels.attention.sparse_attention_dsv4 import (
     _sparse_attn_prefill_kernel,
 )
+from aiter.ops.triton.attention.pa_decode_sparse import (
+    _V4_PACKED_FP8_DTYPES,
+    _V4_REC_ALIGNED,
+    _pa_decode_sparse_gfx1250_fp8,
+    pa_decode_sparse,
+)
 from aiter.ops.triton.gluon.mla_gluon import (
     mla_gluon as gluon_mla_sparse_prefill,
 )
@@ -75,6 +81,12 @@ def pa_prefill_sparse(
     softmax_scale: float,
     has_invalid: bool | None = None,
     out: torch.Tensor | None = None,
+    *,
+    q_rope: torch.Tensor | None = None,
+    unified_kv_rope: torch.Tensor | None = None,
+    kv_rope: torch.Tensor | None = None,
+    block_h: int | None = None,
+    num_warps: int | None = None,
 ) -> torch.Tensor:
     """Sparse prefill attention over two KV sources with sink.
 
@@ -106,11 +118,37 @@ def pa_prefill_sparse(
             skips ``-1`` and out-of-pool slots. gfx950 (``mla_gluon``) does not
             check slot values: pass only valid slots there.
         out:               optional contiguous [T, H, D] buffer on q's device,
-            same dtype as q; written in place and returned.
+            same dtype as q; written in place and returned. On the DSv4
+            packed-fp8 path below it is bf16 while q is fp8.
+
+    DSv4 packed-fp8 (gfx1250 only), keyword-only: pass q_rope /
+    unified_kv_rope (and kv_rope with an extend source), or a one-tensor
+    cache of 640-byte aligned records. Served by the fp8 decode kernel at
+    kv_splits=1; block_h / num_warps override its launch defaults.
 
     Returns:
         [T, H, D] attention output, same dtype as q.
     """
+    if _is_v4_2buff(q, unified_kv, q_rope, unified_kv_rope):
+        return _prefill_v4_2buff(
+            q,
+            unified_kv,
+            kv_indices_prefix,
+            kv_indptr_prefix,
+            kv,
+            kv_indices_extend,
+            kv_indptr_extend,
+            attn_sink,
+            softmax_scale,
+            has_invalid=has_invalid,
+            q_rope=q_rope,
+            unified_kv_rope=unified_kv_rope,
+            kv_rope=kv_rope,
+            block_h=block_h,
+            num_warps=num_warps,
+            out=out,
+        )
+
     if out is None:
         out = torch.empty_like(q)
     else:
@@ -320,6 +358,177 @@ def pa_prefill_sparse(
             BLOCK_D=block_d,
         )
         return out
+
+
+# ---------------------------------------------------------------------------
+# DSv4 "2buff" packed-fp8 prefill
+# ---------------------------------------------------------------------------
+
+
+def _is_v4_2buff(q, unified_kv, q_rope, unified_kv_rope) -> bool:
+    """True when the caller handed us the DSv4 packed-fp8 operands.
+
+    Either explicitly (``q_rope``/``unified_kv_rope`` given), or implicitly as
+    a one-tensor paged cache of 640-byte aligned records, which is what
+    ``pa_decode_sparse`` also accepts and splits itself.
+
+    The implicit form is gfx1250-only, and the arch test is load-bearing:
+    gfx950's packed path takes a cache in the SAME layout (3-D, 640-byte rows,
+    fp8/uint8), so shape and dtype cannot tell the two apart. Ungated, this
+    sniff claims every gfx950 fp8 call and _prefill_v4_2buff then rejects it,
+    instead of letting it fall through to the gfx950 mla_gluon path. The decode
+    entry had exactly this bug and it broke the gfx950 CI.
+
+    The explicit form is deliberately NOT arch-gated: naming q_rope /
+    unified_kv_rope on an arch with no 2buff kernel is a caller error and
+    should raise rather than silently take another path.
+    """
+    if q_rope is not None or unified_kv_rope is not None:
+        return True
+    return (
+        DEVICE_ARCH == "gfx1250"
+        and unified_kv.dim() == 3
+        and unified_kv.shape[-1] == _V4_REC_ALIGNED
+        and unified_kv.dtype in _V4_PACKED_FP8_DTYPES
+    )
+
+
+def _prefill_v4_2buff(
+    q,
+    unified_kv,
+    kv_indices_prefix,
+    kv_indptr_prefix,
+    kv,
+    kv_indices_extend,
+    kv_indptr_extend,
+    attn_sink,
+    softmax_scale,
+    *,
+    has_invalid,
+    q_rope,
+    unified_kv_rope,
+    kv_rope,
+    block_h,
+    num_warps,
+    out,
+):
+    """Packed-fp8 sparse prefill, served by the decode kernel at KV_SPLITS=1.
+
+    There is deliberately no separate prefill kernel here. At ``KV_SPLITS==1``
+    ``_pa_decode_sparse_gfx1250_fp8`` is already a single-pass, two-source,
+    sink-applying attention: the sink is folded into the online-softmax init
+    rather than into a reduce, the epilogue writes ``out`` directly by TDM
+    descriptor, and the m/l/acc partials and ``TDM_PARTIALS`` are dead. The
+    only thing "decode" about it is the launcher's defaults, and prefill
+    differs from decode only in grid extent -- which is a launch parameter,
+    not a kernel property. Forking ~930 lines to re-derive that would buy
+    nothing and cost a second copy to keep in step.
+
+    Mapping: prefix -> the main (paged) pool, extend -> ``extra_cache``, whose
+    flat ``[total_tokens, D]`` form is the ``block_size == 1`` case the kernel
+    already supports. ``kv=None`` is honoured here, so this path implements
+    the prefix-only mode the bf16 launcher documents but does not support.
+    """
+    if DEVICE_ARCH != "gfx1250":
+        raise NotImplementedError(
+            f"the DSv4 packed-fp8 prefill path is gfx1250-only, got {DEVICE_ARCH}; "
+            "pass bf16 operands for the portable path"
+        )
+    # TWO POOLS, pre-split form. pa_decode_sparse's PUBLIC entry derives the
+    # extend pool's RoPE half only when it splits a one-tensor aligned-record
+    # cache itself, so a pre-split pool plus an extend source would leave
+    # extra_cache_rope None and silently attend to zeroed RoPE. Its INTERNAL
+    # wrapper does take extra_cache_rope, so route pre-split two-pool calls
+    # straight there instead of refusing them.
+    if kv is not None and unified_kv_rope is not None:
+        if kv_rope is None:
+            raise ValueError(
+                "packed-fp8 prefill with a pre-split extend source needs "
+                "kv_rope (its bf16 RoPE plane). Without it the extend pool's "
+                "RoPE reads as zero and the numbers are quietly wrong. Pass "
+                "kv_rope, or hand both pools as one-tensor aligned records "
+                f"(..., {_V4_REC_ALIGNED}), or kv=None for prefix-only."
+            )
+        return _pa_decode_sparse_gfx1250_fp8(
+            q,
+            unified_kv,
+            unified_kv_rope,
+            kv_indices_prefix,
+            kv_indptr_prefix,
+            attn_sink,
+            softmax_scale,
+            q_rope=q_rope,
+            extra_cache=kv,
+            extra_cache_rope=kv_rope,
+            extra_indices=kv_indices_extend,
+            extra_indptr=kv_indptr_extend,
+            block_h=block_h,
+            num_warps=num_warps,
+            kv_splits=1,
+            has_invalid=True if has_invalid is None else bool(has_invalid),
+            out=out,
+        )
+    if kv_rope is not None and kv is None:
+        raise ValueError("kv_rope given without kv; nothing to attend over")
+    return _prefill_v4_2buff_call(
+        q,
+        unified_kv,
+        kv_indices_prefix,
+        kv_indptr_prefix,
+        kv,
+        kv_indices_extend,
+        kv_indptr_extend,
+        attn_sink,
+        softmax_scale,
+        has_invalid,
+        block_h,
+        num_warps,
+        out,
+        unified_kv_rope,
+        q_rope,
+    )
+
+
+def _prefill_v4_2buff_call(
+    q,
+    unified_kv,
+    kv_indices_prefix,
+    kv_indptr_prefix,
+    kv,
+    kv_indices_extend,
+    kv_indptr_extend,
+    attn_sink,
+    softmax_scale,
+    has_invalid,
+    block_h,
+    num_warps,
+    out,
+    unified_kv_rope,
+    q_rope,
+):
+    return pa_decode_sparse(
+        q,
+        unified_kv,
+        kv_indices_prefix,
+        kv_indptr_prefix,
+        attn_sink,
+        softmax_scale,
+        # Prefill fills the GPU through the token dimension, so never split K:
+        # kv_splits=1 is what makes this the single-pass kernel described above.
+        kv_splits=1,
+        # None must not reach pa_decode_sparse: it does bool(has_invalid), so
+        # None disables sentinel masking and -1 slots get attended as row 0.
+        # Default to masking, which is also pa_decode_sparse's own default.
+        has_invalid=True if has_invalid is None else bool(has_invalid),
+        block_h=block_h,
+        num_warps=num_warps,
+        out=out,
+        extra_cache=kv,
+        extra_indices=kv_indices_extend,
+        extra_indptr=kv_indptr_extend,
+        unified_kv_rope=unified_kv_rope,
+        q_rope=q_rope,
+    )
 
 
 # ---------------------------------------------------------------------------
