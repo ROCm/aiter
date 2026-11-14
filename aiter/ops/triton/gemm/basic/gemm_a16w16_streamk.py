@@ -8,6 +8,8 @@ import triton
 
 from aiter.jit.utils.torch_guard import torch_compile_guard
 from aiter.ops.triton._gluon_kernels.gfx1250.layouts import (
+    LDS_LINE_ELEMS,
+    TDM_PAD_INTERVAL_MAX,
     WMMA_INSTR_SHAPE,
     operand_bundle_cga,
     wmma_layout,
@@ -38,6 +40,54 @@ _SPLIT_FLOOR_N = 128 // _OPERAND_BYTES
 _SPLIT_FLOOR_M = 32
 
 
+#: LDS a workgroup processor can hold, in bytes.
+_LDS_CAPACITY = 327680
+
+
+def _ring_bytes(per_cta_m, per_cta_n, BLOCK_K, num_buffers, TRANSPOSE_A, TRANSPOSE_B):
+    """Bytes the A and B rings take for one per-CTA tile, including the TDM row padding.
+
+    The shared layout pads one row at a fixed interval, and the interval follows the
+    operand's orientation (see operand_bundle_cga): a K-contiguous operand pads every
+    BLOCK_K by 8, an M- or N-contiguous one pads every BM or BN by 16. The second form is
+    larger whenever the innermost extent is below 2 * BLOCK_K, so a tile that fits one
+    layout can exceed LDS in another.
+    """
+    if TRANSPOSE_A:
+        # one pad of 8 per LDS line, matching operand_bundle_cga
+        iv = min(max(per_cta_m, LDS_LINE_ELEMS), TDM_PAD_INTERVAL_MAX)
+        raw = BLOCK_K * per_cta_m
+        a = raw + (raw // iv) * 8
+    else:
+        a = per_cta_m * (BLOCK_K + 8)
+    if TRANSPOSE_B:
+        b = per_cta_n * (BLOCK_K + 8)
+    else:
+        # B keeps one pad of 16 per per-CTA N row; the aliased C store needs that interval
+        b = BLOCK_K * (min(per_cta_n, TDM_PAD_INTERVAL_MAX) + 16)
+    return (a + b) * _OPERAND_BYTES * num_buffers
+
+
+def _fit_buffers(per_cta_m, per_cta_n, BLOCK_K, num_buffers, TRANSPOSE_A, TRANSPOSE_B):
+    """Reduce the ring depth until the rings fit LDS for THIS layout.
+
+    One config file serves every layout, because the loader takes no layout. A config tuned
+    on a K-contiguous pair can therefore arrive with an M- or N-contiguous one, where the
+    same tile needs more LDS. Shrinking the ring keeps the tuned tile and BLOCK_K, which
+    costs far less than changing them, and the floor of 2 is what the kernel asserts.
+    """
+    while num_buffers > 2:
+        if (
+            _ring_bytes(
+                per_cta_m, per_cta_n, BLOCK_K, num_buffers, TRANSPOSE_A, TRANSPOSE_B
+            )
+            <= _LDS_CAPACITY
+        ):
+            return num_buffers
+        num_buffers -= 1
+    return num_buffers
+
+
 def _plan_k_pipeline(K, BLOCK_K, num_buffers):
     """Depth of the K pipeline, and whether its steady loop runs at all.
 
@@ -51,6 +101,27 @@ def _plan_k_pipeline(K, BLOCK_K, num_buffers):
     num_buffers = max(2, min(num_buffers, num_k_tiles))
     steady_nonempty = 1 if num_k_tiles - (num_buffers - 1) > 0 else 0
     return num_k_tiles, num_buffers, steady_nonempty
+
+
+#: Accumulator VGPRs above which the straight-line phase 1 spills and must stay off.
+_ONE_TILE_MAX_ACC_VGPR = 256
+
+
+def _one_tile(
+    num_tiles, streamk_tiles, num_sms, BLOCK_M, BLOCK_N, CTAS_M, CTAS_N, num_warps
+):
+    """Whether phase 1 should be straight-line code instead of a loop.
+
+    Two conditions must hold. Phase 1 must give every worker exactly one tile, so the loop
+    would run once anyway. And the accumulator must leave register headroom: with no back
+    edge the scheduler extends live ranges, which is free when there is room and spills when
+    there is not. A 256x256 per-CTA tile holds 512 accumulator VGPRs and already sits at 1022
+    of 1024, so it spills and loses up to 4%. At 128 or fewer it gains about 1%.
+    """
+    if num_tiles - streamk_tiles != num_sms:
+        return 0
+    acc_vgprs = (BLOCK_M // CTAS_M) * (BLOCK_N // CTAS_N) // (num_warps * 32)
+    return 1 if acc_vgprs <= _ONE_TILE_MAX_ACC_VGPR else 0
 
 
 def _plan_tiles(M, N, BLOCK_M, BLOCK_N, CTAS_M, CTAS_N):
@@ -110,7 +181,9 @@ def _pick_split(streamk_tiles, num_sms, BLOCK_M, BLOCK_N, CTAS_M, CTAS_N):
 
 
 @functools.lru_cache(maxsize=128)
-def _build_layouts(BLOCK_M, BLOCK_N, BLOCK_K, ctas_per_cga, num_warps, TRANSPOSE_B):
+def _build_layouts(
+    BLOCK_M, BLOCK_N, BLOCK_K, ctas_per_cga, num_warps, TRANSPOSE_B, TRANSPOSE_A=False
+):
     """Build the WMMA, operand and shared layouts for one cluster-wide tile.
 
     Cached: the layout objects cost more to build than the launch itself, and they depend only on
@@ -120,7 +193,14 @@ def _build_layouts(BLOCK_M, BLOCK_N, BLOCK_K, ctas_per_cga, num_warps, TRANSPOSE
     per_cta_n = BLOCK_N // ctas_per_cga[1]
 
     wmma = wmma_layout((per_cta_m, per_cta_n), ctas_per_cga, num_warps)
-    dot_a, shared_a = operand_bundle_cga(wmma, 0, (per_cta_m, BLOCK_K), ctas_per_cga)
+    if TRANSPOSE_A:
+        dot_a, shared_a = operand_bundle_cga(
+            wmma, 0, (BLOCK_K, per_cta_m), ctas_per_cga, transpose_a=True
+        )
+    else:
+        dot_a, shared_a = operand_bundle_cga(
+            wmma, 0, (per_cta_m, BLOCK_K), ctas_per_cga
+        )
     if TRANSPOSE_B:
         dot_b, shared_b = operand_bundle_cga(
             wmma, 1, (per_cta_n, BLOCK_K), ctas_per_cga, transpose_b=True
@@ -163,7 +243,16 @@ def gemm_a16w16_streamk_(
         a in get_arch() for a in _SUPPORTED_ARCHS
     ), f"gemm_a16w16_streamk requires one of {_SUPPORTED_ARCHS}, got '{get_arch()}'"
     assert x.shape[1] == w.shape[1], f"incompatible shapes {x.shape} and {w.shape}"
-    assert x.stride(1) == 1, f"x must be row major (M, K), got strides {x.stride()}"
+    # x may be K-contiguous (layouts TN, TT) or M-contiguous (NN, NT). Both are supported;
+    # the kernel swaps the strides itself and only the orientation flag changes.
+    if x.stride(1) == 1:
+        TRANSPOSE_A = False
+    elif x.stride(0) == 1:
+        TRANSPOSE_A = True
+    else:
+        raise ValueError(
+            f"x must be contiguous in one dimension, got strides {x.stride()}"
+        )
 
     # wmma is built for 16-bit operands, so an unsupported dtype must stop here. Without this
     # check it reaches the layout builders and fails with a compiler message about tt.dot.
@@ -214,6 +303,14 @@ def gemm_a16w16_streamk_(
         )
     stride_bk, stride_bn = w_t.stride(0), w_t.stride(1)
 
+    NUM_BUFFERS = _fit_buffers(
+        BLOCK_M // CTAS_M,
+        BLOCK_N // CTAS_N,
+        BLOCK_K,
+        NUM_BUFFERS,
+        TRANSPOSE_A,
+        TRANSPOSE_B,
+    )
     _, NUM_BUFFERS, STEADY_NONEMPTY = _plan_k_pipeline(K, BLOCK_K, NUM_BUFFERS)
 
     if y is None:
@@ -236,7 +333,7 @@ def gemm_a16w16_streamk_(
         ), f"y rows must not overlap, got shape ({M}, {N}) strides {y.stride()}"
 
     wmma, dot_a, dot_b, shared_a, shared_b = _build_layouts(
-        BLOCK_M, BLOCK_N, BLOCK_K, (CTAS_M, CTAS_N), num_warps, TRANSPOSE_B
+        BLOCK_M, BLOCK_N, BLOCK_K, (CTAS_M, CTAS_N), num_warps, TRANSPOSE_B, TRANSPOSE_A
     )
 
     num_tiles, NUM_SMS, STREAMK_TILES, SPLIT_M, SPLIT_N = _plan_tiles(
@@ -250,6 +347,7 @@ def gemm_a16w16_streamk_(
             (CTAS_M, CTAS_N),
             num_warps,
             TRANSPOSE_B,
+            TRANSPOSE_A,
         )
         if STREAMK_TILES
         else (None,) * 5
@@ -303,6 +401,7 @@ def gemm_a16w16_streamk_(
         BLOCK_N=BLOCK_N,
         BLOCK_K=BLOCK_K,
         NUM_BUFFERS=NUM_BUFFERS,
+        TRANSPOSE_A=TRANSPOSE_A,
         TRANSPOSE_B=TRANSPOSE_B,
         SHARED_LAYOUT_A=shared_a,
         SHARED_LAYOUT_B=shared_b,
@@ -313,6 +412,20 @@ def gemm_a16w16_streamk_(
         CTAS_N=CTAS_N,
         GROUP_SIZE_M=GROUP_SIZE_M,
         KTAIL=KTAIL,
+        # Derived, never read from the config. ONE_TILE drops the phase 1 back edge,
+        # which is only correct when phase 1 gives every worker exactly one tile. A
+        # config that forced it on a shape with more tiles than workers would leave
+        # every later tile of y unwritten, with no error.
+        ONE_TILE=_one_tile(
+            num_tiles,
+            STREAMK_TILES,
+            NUM_SMS,
+            BLOCK_M,
+            BLOCK_N,
+            CTAS_M,
+            CTAS_N,
+            num_warps,
+        ),
         STEADY_NONEMPTY=STEADY_NONEMPTY,
         C_OFFSET_64=C_OFFSET_64,
         STREAMK_TILES=STREAMK_TILES,

@@ -20,6 +20,7 @@ def issue_loads(
     BLOCK_K: gl.constexpr,
     TRANSPOSE_B: gl.constexpr,
     NUM_BUFFERS: gl.constexpr,
+    TRANSPOSE_A: gl.constexpr = False,
 ):
     """Start the TDM copies for one K step, then step the descriptors one K tile.
 
@@ -51,9 +52,15 @@ def issue_loads(
     else:
         gl.amd.cdna5.tdm.async_load(a_d, [0, 0], a_buffer.index(slot))
         gl.amd.cdna5.tdm.async_load(b_d, [0, 0], b_buffer.index(slot))
-    a_d = gl.amd.cdna5.tdm.update_tensor_descriptor(
-        a_d, add_offsets=[0, BLOCK_K], clamp_bounds=True
-    )
+    # A transposed is [BK, BM] with M innermost, so K steps the first axis, as for native B.
+    if TRANSPOSE_A:
+        a_d = gl.amd.cdna5.tdm.update_tensor_descriptor(
+            a_d, add_offsets=[BLOCK_K, 0], clamp_bounds=True
+        )
+    else:
+        a_d = gl.amd.cdna5.tdm.update_tensor_descriptor(
+            a_d, add_offsets=[0, BLOCK_K], clamp_bounds=True
+        )
     if TRANSPOSE_B:
         b_d = gl.amd.cdna5.tdm.update_tensor_descriptor(
             b_d, add_offsets=[0, BLOCK_K], clamp_bounds=True
@@ -96,13 +103,20 @@ def issue_wmma(
     wait_producers_cnt,
     TRANSPOSE_B: gl.constexpr,
     NUM_BUFFERS: gl.constexpr,
+    TRANSPOSE_A: gl.constexpr = False,
 ):
     """Consume one ring slot: wait, align the cluster, read LDS, then multiply."""
     _cluster_gate(wait_producers_cnt)
 
     slot = consumer % NUM_BUFFERS
     # Relaxed async LDS to register reads overlap with the matrix unit.
-    a = gl.amd.cdna4.async_copy.load_shared_relaxed(a_buffer.index(slot), a_layout)
+    # wmma wants A as [BM, BK]; a transposed ring holds [BK, BM], so permute it.
+    if TRANSPOSE_A:
+        a = gl.amd.cdna4.async_copy.load_shared_relaxed(
+            a_buffer.index(slot).permute([1, 0]), a_layout
+        )
+    else:
+        a = gl.amd.cdna4.async_copy.load_shared_relaxed(a_buffer.index(slot), a_layout)
     if TRANSPOSE_B:
         b = gl.amd.cdna4.async_copy.load_shared_relaxed(
             b_buffer.index(slot).permute([1, 0]), b_layout
@@ -125,6 +139,7 @@ def issue_wmma_ktail(
     TRANSPOSE_B: gl.constexpr,
     NUM_BUFFERS: gl.constexpr,
     KTAIL: gl.constexpr,
+    TRANSPOSE_A: gl.constexpr = False,
 ):
     """Narrow form of issue_wmma for the last K step, when K does not fill BLOCK_K.
 
@@ -135,9 +150,14 @@ def issue_wmma_ktail(
     _cluster_gate(wait_producers_cnt)
 
     slot = consumer % NUM_BUFFERS
-    a = gl.amd.cdna4.async_copy.load_shared_relaxed(
-        a_buffer.index(slot).slice(0, KTAIL, dim=1), a_layout
-    )
+    if TRANSPOSE_A:
+        a = gl.amd.cdna4.async_copy.load_shared_relaxed(
+            a_buffer.index(slot).slice(0, KTAIL, dim=0).permute([1, 0]), a_layout
+        )
+    else:
+        a = gl.amd.cdna4.async_copy.load_shared_relaxed(
+            a_buffer.index(slot).slice(0, KTAIL, dim=1), a_layout
+        )
     if TRANSPOSE_B:
         b = gl.amd.cdna4.async_copy.load_shared_relaxed(
             b_buffer.index(slot).slice(0, KTAIL, dim=1).permute([1, 0]), b_layout
@@ -177,6 +197,7 @@ def compute_tile(
     C_OFFSET_64: gl.constexpr,
     KTAIL: gl.constexpr,
     TOKENS: gl.constexpr,
+    TRANSPOSE_A: gl.constexpr = False,
 ):
     """Compute one BLOCK_M x BLOCK_N tile over the whole K and write it to C.
 
@@ -198,9 +219,14 @@ def compute_tile(
     acc = gl.zeros((BLOCK_M, BLOCK_N), dtype=ACC_DTYPE, layout=WMMA)
 
     # Place the descriptors on this tile once. The K loop then only adds BLOCK_K.
-    a_d = gl.amd.cdna5.tdm.update_tensor_descriptor(
-        a_desc, add_offsets=[off_m, 0], clamp_bounds=True
-    )
+    if TRANSPOSE_A:
+        a_d = gl.amd.cdna5.tdm.update_tensor_descriptor(
+            a_desc, add_offsets=[0, off_m], clamp_bounds=True
+        )
+    else:
+        a_d = gl.amd.cdna5.tdm.update_tensor_descriptor(
+            a_desc, add_offsets=[off_m, 0], clamp_bounds=True
+        )
     if TRANSPOSE_B:
         b_d = gl.amd.cdna5.tdm.update_tensor_descriptor(
             b_desc, add_offsets=[off_n, 0], clamp_bounds=True
@@ -220,6 +246,7 @@ def compute_tile(
             BLOCK_K,
             TRANSPOSE_B,
             NUM_BUFFERS,
+            TRANSPOSE_A,
         )
 
     # Steady state: one load issue and one consume per step keep the ring full.
@@ -233,6 +260,7 @@ def compute_tile(
             BLOCK_K,
             TRANSPOSE_B,
             NUM_BUFFERS,
+            TRANSPOSE_A,
         )
         consumer, acc = issue_wmma(
             consumer,
@@ -244,6 +272,7 @@ def compute_tile(
             (NUM_BUFFERS - 1) * TOKENS,
             TRANSPOSE_B,
             NUM_BUFFERS,
+            TRANSPOSE_A,
         )
 
     # KTAIL is a host constexpr decided from the real K, so only one drain path is compiled.
@@ -259,6 +288,7 @@ def compute_tile(
                 (NUM_BUFFERS - 2 - i) * TOKENS,
                 TRANSPOSE_B,
                 NUM_BUFFERS,
+                TRANSPOSE_A,
             )
         consumer, acc = issue_wmma_ktail(
             consumer,
@@ -271,6 +301,7 @@ def compute_tile(
             TRANSPOSE_B,
             NUM_BUFFERS,
             KTAIL,
+            TRANSPOSE_A,
         )
     else:
         for i in gl.static_range(NUM_BUFFERS - 1):
@@ -284,6 +315,7 @@ def compute_tile(
                 (NUM_BUFFERS - 2 - i) * TOKENS,
                 TRANSPOSE_B,
                 NUM_BUFFERS,
+                TRANSPOSE_A,
             )
 
     if C_ALIAS:

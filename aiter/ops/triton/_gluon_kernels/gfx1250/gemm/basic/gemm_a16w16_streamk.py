@@ -30,8 +30,10 @@ _GLUON_REPR_KEYS = [
     "GROUP_SIZE_M",
     "NUM_BUFFERS",
     "CTAS_N",
+    "TRANSPOSE_A",
     "TRANSPOSE_B",
     "KTAIL",
+    "ONE_TILE",
     "STEADY_NONEMPTY",
     "C_OFFSET_64",
     "STREAMK_TILES",
@@ -67,6 +69,7 @@ def gemm_a16w16_streamk_kernel_(
     BLOCK_N: gl.constexpr,
     BLOCK_K: gl.constexpr,
     NUM_BUFFERS: gl.constexpr,
+    TRANSPOSE_A: gl.constexpr,
     TRANSPOSE_B: gl.constexpr,
     SHARED_LAYOUT_A: gl.constexpr,
     SHARED_LAYOUT_B: gl.constexpr,
@@ -77,6 +80,7 @@ def gemm_a16w16_streamk_kernel_(
     CTAS_N: gl.constexpr = 1,
     GROUP_SIZE_M: gl.constexpr = 2,
     KTAIL: gl.constexpr = 0,
+    ONE_TILE: gl.constexpr = 0,
     STEADY_NONEMPTY: gl.constexpr = 1,
     C_OFFSET_64: gl.constexpr = 0,
     STREAMK_TILES: gl.constexpr = 0,
@@ -92,21 +96,32 @@ def gemm_a16w16_streamk_kernel_(
     gl.static_assert(NUM_BUFFERS >= 2, "NUM_BUFFERS must be at least 2")
 
     num_ctas: gl.constexpr = gl.num_ctas()
-    CTAS_M: gl.constexpr = num_ctas // CTAS_N
     # A single CTA fuses its two TDM loads, so one K step leaves one token, not two.
     TOKENS: gl.constexpr = tokens_per_step(num_ctas)
 
-    # NUM_SMS is the grid size in clusters, and program_id is the cluster rank. The AID remap gives
-    # each shared L2 a contiguous super-block of the tile space.
+    # NUM_SMS is the grid size in clusters, and program_id is the cluster rank. The remap blocks
+    # the tile space by AID, because the L2 is per AID and not per XCD, and interleaves an AID's
+    # XCDs inside its block so they stay on adjacent tiles.
     pid = remap_xcd_aid(gl.program_id(0), NUM_SMS)
 
-    a_desc = gl.amd.cdna5.tdm.make_tensor_descriptor(
-        base=a_ptr,
-        shape=(M, K),
-        strides=(stride_am, stride_ak),
-        block_shape=(BLOCK_M, BLOCK_K),
-        layout=SHARED_LAYOUT_A,
-    )
+    # A transposed means an M-contiguous x, so the descriptor is (K, M) with the strides
+    # swapped, exactly as native B is (K, N). The kernel only sees the orientation flag.
+    if TRANSPOSE_A:
+        a_desc = gl.amd.cdna5.tdm.make_tensor_descriptor(
+            base=a_ptr,
+            shape=(K, M),
+            strides=(stride_ak, stride_am),
+            block_shape=(BLOCK_K, BLOCK_M),
+            layout=SHARED_LAYOUT_A,
+        )
+    else:
+        a_desc = gl.amd.cdna5.tdm.make_tensor_descriptor(
+            base=a_ptr,
+            shape=(M, K),
+            strides=(stride_am, stride_ak),
+            block_shape=(BLOCK_M, BLOCK_K),
+            layout=SHARED_LAYOUT_A,
+        )
     if TRANSPOSE_B:
         b_desc = gl.amd.cdna5.tdm.make_tensor_descriptor(
             base=b_ptr,
@@ -167,11 +182,10 @@ def gemm_a16w16_streamk_kernel_(
     num_pid_m = gl.cdiv(M, BLOCK_M)
     num_pid_n = gl.cdiv(N, BLOCK_N)
 
-    # Phase 1: the tiles that fill whole waves, one tile for each cluster.
-    for tile_idx in range(pid, num_tiles - STREAMK_TILES, NUM_SMS):
-        pid_m, pid_n = swizzled_tile_coords(
-            tile_idx, num_pid_m, num_pid_n, GROUP_SIZE_M
-        )
+    # Phase 1: one tile for each cluster. ONE_TILE is a host constexpr saying phase 1
+    # gives every worker exactly one tile, so the loop becomes straight-line code.
+    if ONE_TILE:
+        pid_m, pid_n = swizzled_tile_coords(pid, num_pid_m, num_pid_n, GROUP_SIZE_M)
         compute_tile(
             a_desc,
             b_desc,
@@ -198,7 +212,42 @@ def gemm_a16w16_streamk_kernel_(
             C_OFFSET_64,
             KTAIL,
             TOKENS,
+            TRANSPOSE_A,
         )
+
+    else:
+        for tile_idx in range(pid, num_tiles - STREAMK_TILES, NUM_SMS):
+            pid_m, pid_n = swizzled_tile_coords(
+                tile_idx, num_pid_m, num_pid_n, GROUP_SIZE_M
+            )
+            compute_tile(
+                a_desc,
+                b_desc,
+                c_desc,
+                c_ptr,
+                pid_m * BLOCK_M,
+                pid_n * BLOCK_N,
+                M,
+                N,
+                K,
+                stride_cm,
+                stride_cn,
+                OPERAND_LAYOUT_A,
+                OPERAND_LAYOUT_B,
+                WMMA_LAYOUT,
+                SHARED_LAYOUT_C,
+                BLOCK_M,
+                BLOCK_N,
+                BLOCK_K,
+                NUM_BUFFERS,
+                TRANSPOSE_B,
+                ACC_DTYPE,
+                C_ALIAS_B,
+                C_OFFSET_64,
+                KTAIL,
+                TOKENS,
+                TRANSPOSE_A,
+            )
 
     # Phase 2: the StreamK remainder. Each leftover tile becomes SPLIT_M x SPLIT_N sub-tiles, so
     # more clusters share the last wave. A sub-tile runs the same pipeline on its own layouts.
@@ -212,13 +261,22 @@ def gemm_a16w16_streamk_kernel_(
         SHARED_REM_C: gl.constexpr = gl.PaddedSharedLayout.with_identity_for(
             [[_CR_PAD_N, 16]], [SUB_M, SUB_N], [1, 0], WMMA_REM.cga_layout
         )
-        ar_desc = gl.amd.cdna5.tdm.make_tensor_descriptor(
-            base=a_ptr,
-            shape=(M, K),
-            strides=(stride_am, stride_ak),
-            block_shape=(SUB_M, BLOCK_K),
-            layout=SHARED_REM_A,
-        )
+        if TRANSPOSE_A:
+            ar_desc = gl.amd.cdna5.tdm.make_tensor_descriptor(
+                base=a_ptr,
+                shape=(K, M),
+                strides=(stride_ak, stride_am),
+                block_shape=(BLOCK_K, SUB_M),
+                layout=SHARED_REM_A,
+            )
+        else:
+            ar_desc = gl.amd.cdna5.tdm.make_tensor_descriptor(
+                base=a_ptr,
+                shape=(M, K),
+                strides=(stride_am, stride_ak),
+                block_shape=(SUB_M, BLOCK_K),
+                layout=SHARED_REM_A,
+            )
         if TRANSPOSE_B:
             br_desc = gl.amd.cdna5.tdm.make_tensor_descriptor(
                 base=b_ptr,
@@ -274,4 +332,5 @@ def gemm_a16w16_streamk_kernel_(
                 C_OFFSET_64,
                 KTAIL,
                 TOKENS,
+                TRANSPOSE_A,
             )
