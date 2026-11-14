@@ -14,6 +14,7 @@ Run: python3 -m unittest op_tests.test_mp_tuner_logic -v
 import importlib
 import multiprocessing as mp
 import os
+import signal
 import subprocess
 import sys
 import time
@@ -451,6 +452,28 @@ class TestTaskWorkerExit(unittest.TestCase):
         self.assertTrue(worker_exited([proc.pid], 0))
         self.assertFalse(worker_exited([os.getpid()], 0))
         self.assertFalse(worker_exited([0], 0), "a queued task has no worker yet")
+
+    @unittest.skipUnless(sys.platform.startswith("linux"), "/proc is Linux only")
+    def test_killed_unreaped_worker_is_detected(self):
+        tuner = importlib.import_module("aiter.utility.mp_tuner")
+        proc = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"])
+        try:
+            proc.send_signal(signal.SIGKILL)
+            deadline = time.time() + 5.0
+            while time.time() < deadline:
+                try:
+                    with open(f"/proc/{proc.pid}/stat", "rb") as stat_file:
+                        data = stat_file.read()
+                except FileNotFoundError:
+                    break
+                if data[data.rfind(b")") + 1 :].split()[0] == b"Z":
+                    break
+                time.sleep(0.01)
+            # A killed worker awaiting reaping still answers kill(pid, 0); if it
+            # is reported as alive the GPU-faulted task waits for its timeout.
+            self.assertTrue(tuner._task_worker_exited([proc.pid], 0))
+        finally:
+            proc.wait()
 
     def test_worker_pid_recorded_when_task_starts(self):
         tuner = importlib.import_module("aiter.utility.mp_tuner")

@@ -3,6 +3,7 @@
 import math
 import multiprocessing as mp
 import os
+import sys
 import time
 from multiprocessing import TimeoutError as MPTimeoutError
 
@@ -55,6 +56,30 @@ def _run_with_start_tracking(task_index, func, args):
     return func(*args)
 
 
+def _is_zombie(pid):
+    """True if ``pid`` has already exited but was never reaped.
+
+    A killed worker stays in the process table until the pool reaps it and
+    still answers ``os.kill(pid, 0)`` with success, so the plain kill probe
+    would keep a GPU-faulted task waiting for its timeout. Only Linux exposes
+    the process state. Keep this in sync with ``FileBaton._is_zombie``.
+    """
+    if not sys.platform.startswith("linux"):
+        return False
+    try:
+        with open(f"/proc/{pid}/stat", "rb") as f:
+            data = f.read()
+    except (FileNotFoundError, ProcessLookupError, PermissionError):
+        return False
+    # "<pid> (<comm>) <state> ..." — the comm field is parenthesised and may
+    # itself contain spaces or ')', so slice between the outer parens.
+    rparen = data.rfind(b")")
+    if rparen < 0:
+        return False
+    rest = data[rparen + 1 :].split()
+    return bool(rest) and rest[0] in (b"Z", b"X")
+
+
 def _task_worker_exited(task_pids, task_index):
     """True once the worker that started this task is gone. A worker killed by a
     GPU memory fault never returns a result, so waiting on it only ends at the
@@ -68,7 +93,9 @@ def _task_worker_exited(task_pids, task_index):
         return True
     except PermissionError:
         return False
-    return False
+    # Success only proves the pid is taken: a killed worker may still be an
+    # unreaped zombie, and it can never deliver a result.
+    return _is_zombie(pid)
 
 
 def _elapsed_since_task_start(task_start_times, task_index, now=None):
