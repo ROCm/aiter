@@ -98,6 +98,8 @@ if os.path.isdir(_flydsl_cache) and "FLYDSL_RUNTIME_CACHE_DIR" not in os.environ
 
 if AITER_TRITON_ONLY:
     logger.info("Triton ops only: CK and HIP ops (and their JIT build) are skipped.")
+    # aiter.ops.triton modules read aiter.dtypes at import time.
+    from .utility import dtypes as dtypes
 elif AITER_AOT_IMPORT:
     from .jit import core as core
 else:
