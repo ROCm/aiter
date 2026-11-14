@@ -222,26 +222,64 @@ class _UAParams(NamedTuple):
     force_fp8_pv_on_fp4_kv_cache: bool = False
 
 
-def _gfx950_gluon_supported(params: _UAParams):
-    """GFX950 Gluon supported configs."""
-    if params.shuffled_kv_cache and (
-        params.block_size & (params.block_size - 1)
-        or params.block_size < params.k_width
-    ):
-        return False
+def gfx950_gluon_supported(
+    *,
+    q_dtype: torch.dtype,
+    kv_cache_dtype: torch.dtype,
+    head_size: int,
+    block_size: int,
+    head_size_v: int | None = None,
+    shuffled_kv_cache: bool = False,
+    k_width: int | None = None,
+    softcap: float = 0.0,
+    use_alibi_slopes: bool = False,
+    use_qq_bias: bool = False,
+) -> bool:
+    """Whether `unified_attention` serves a call with these arguments through the
+    gfx950 Gluon kernel.
+
+    The gate `unified_attention(..., backend="gluon")` applies, taking only the
+    arguments it reads, for a caller that decides something up front from it
+    (e.g. which dtype to give q). `head_size` is the logical one (doubled for an
+    fp4-packed q); `head_size_v` defaults to it. `k_width` is the shuffled K
+    cache's trailing dimension, required with `shuffled_kv_cache`.
+    """
+    if head_size_v is None:
+        head_size_v = head_size
+    if shuffled_kv_cache:
+        if k_width is None:
+            raise ValueError("gfx950_gluon_supported: shuffled_kv_cache needs k_width")
+        if block_size & (block_size - 1) or block_size < k_width:
+            return False
 
     return (
         DEVICE_ARCH == "gfx950"
         and _unified_attention_kernel_gfx950 is not None
         # softcap hits an AMDGPU backend assert (GCNRewritePartialRegUses) on Triton 3.8
-        and not params.softcap
-        and not params.use_qq_bias
-        and not params.use_alibi_slopes
-        and params.head_size <= 256
-        and triton.next_power_of_2(params.head_size) == params.head_size
-        and params.head_size_v == params.head_size
-        and params.q_dtype in (e4m3_dtype, torch.bfloat16)
-        and params.q_dtype == params.kv_cache_dtype
+        and not softcap
+        and not use_qq_bias
+        and not use_alibi_slopes
+        and head_size <= 256
+        and triton.next_power_of_2(head_size) == head_size
+        and head_size_v == head_size
+        and q_dtype in (e4m3_dtype, torch.bfloat16)
+        and q_dtype == kv_cache_dtype
+    )
+
+
+def _gfx950_gluon_supported(params: _UAParams):
+    """GFX950 Gluon supported configs."""
+    return gfx950_gluon_supported(
+        q_dtype=params.q_dtype,
+        kv_cache_dtype=params.kv_cache_dtype,
+        head_size=params.head_size,
+        block_size=params.block_size,
+        head_size_v=params.head_size_v,
+        shuffled_kv_cache=params.shuffled_kv_cache,
+        k_width=params.k_width,
+        softcap=params.softcap,
+        use_alibi_slopes=params.use_alibi_slopes,
+        use_qq_bias=params.use_qq_bias,
     )
 
 
