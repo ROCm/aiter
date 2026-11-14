@@ -83,6 +83,8 @@ def select_3d_config(
     reduce_waves_per_eu = 2
     num_segments = 0
     TILE_SIZE = block_size
+    seg_cap = 128
+    tuned = None
     if IS_DEVICE_ARCH_GFX12:
         # If we cannot infer max_seqlen_k during graph capture
         maybe_guess_max_seqlen_k = 128000 if max_seqlen_k == 0 else max_seqlen_k
@@ -110,18 +112,43 @@ def select_3d_config(
         num_segments = max(1, target_num_prgms // 4 * occ // max(1, num_2d_prgms))
         num_segments = min(MAX_SEGMENTS, num_segments)
         num_segments = triton.next_power_of_2(num_segments)
+    else:
+        # Tuned split-KV launch values, per KV cache dtype. Only archs and KV
+        # dtypes with a tuned entry use them.
+        tuned = load_config_json(
+            f"{resolve_config_dir('attention', 'MLA_DECODE')}/DEFAULT.json",
+            required=False,
+        )
+        if tuned is not None:
+            tuned = tuned.get(str(kv_dtype).removeprefix("torch."))
+        if tuned is not None:
+            # Optional per-tile override: {block_size: {BLOCK_M: num_warps}}.
+            attn_num_warps = (
+                tuned["attn"]
+                .get("num_warps_by_block_size_block_m", {})
+                .get(str(block_size), {})
+                .get(str(BLOCK_M), tuned["attn"]["num_warps"])
+            )
+            seg_cap = tuned["attn"]["MAX_SEGMENTS"]
 
     MAX_SEGMENTS = min(128, math.ceil(max_seqlen_k / TILE_SIZE))
     if num_segments == 0:
         num_segments = math.ceil(target_num_prgms / num_2d_prgms) * 2
         num_segments = min(num_segments, MAX_SEGMENTS)
         num_segments = triton.next_power_of_2(num_segments)
-        num_segments = min(num_segments, 128)
+        num_segments = min(num_segments, seg_cap)
         MIN_SEGMENTS = max(8, num_segments)
         num_segments = max(num_segments, MIN_SEGMENTS)
 
         if num_segments == MIN_SEGMENTS:
             reduce_num_warps = 1
+        if tuned is not None:
+            # Match reduction warps to the segment tile when a table is present.
+            reduce_num_warps = (
+                tuned["reduce"]
+                .get("num_warps_by_num_segments", {})
+                .get(str(num_segments), tuned["reduce"]["num_warps"])
+            )
 
     attn_config = {
         "TILE_SIZE": TILE_SIZE,
