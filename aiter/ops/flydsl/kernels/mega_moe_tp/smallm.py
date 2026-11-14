@@ -85,7 +85,7 @@ C_JSH = 69
 
 def build_smallm(kc: KernelCtx) -> dict:
     """The small-M schedule device functions of one instance (added to kc)."""
-    G2, GPC, H, I, KS2, L_CTL, L_DCH = kc.get("G2 GPC H I KS2 L_CTL L_DCH")
+    GPC, H, I, KS2, L_CTL, L_DCH = kc.get("GPC H I KS2 L_CTL L_DCH")
     (TOPK,) = kc.get("TOPK")
     NCK, cbar, ctrl_at = kc.get("NCK cbar ctrl_at")
     gather_routes_chunk, gemm1, gemm2 = kc.get("gather_routes_chunk gemm1 gemm2")
@@ -109,7 +109,7 @@ def build_smallm(kc: KernelCtx) -> dict:
     for q_ in (2, 3, 6):
         if KS2 % q_ == 0:
             n2 = KS2 // q_
-            s2 = _nsk2_for(n2, G2, nsk)
+            s2 = _nsk2_for(n2, GPC, nsk)
             if GPC % (s2 * n2 // math.gcd(s2, n2) // n2) == 0:
                 QF = q_
                 break
@@ -118,7 +118,7 @@ def build_smallm(kc: KernelCtx) -> dict:
     XG_PART = TMAX * TOPK * (XIB + SIB + 8)
 
     # a G2 share: GPC groups (of NW * 64 columns), a whole number of GEMM2 iterations
-    nsk2 = _nsk2_for(KS2, G2, nsk)
+    nsk2 = _nsk2_for(KS2, GPC, nsk)
     assert GPC % (nsk2 * KS2 // math.gcd(nsk2, KS2) // KS2) == 0
     # the early-share cap per CTA without an extra block: G1 block bytes / G2 share bytes
     # (2 * 128 * H vs H / NCK * I weights)

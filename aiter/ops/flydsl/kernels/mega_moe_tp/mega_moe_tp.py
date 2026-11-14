@@ -44,6 +44,7 @@ from .mega_moe_tp_config import (
     mega_moe_tp_shape_supported,
 )
 from .mega_moe_tp_kernel import compile_mega_moe_tp
+from .smallm import QC as SM_QC
 
 __all__ = [
     "LaunchCfg",
@@ -270,7 +271,7 @@ class MegaMoeTPLDSError(ValueError):
 # the tuned launch-config fields of a batch (configs/mega_moe_tp_tuned.csv)
 _TUNED_FIELDS = ("mt", "npp", "q", "pf", "lp", "ll", "llr")
 # the small-M tuned launch fields (aiter/configs/mega_moe_tp_sm_tuned.csv)
-_SM_TUNED_FIELDS = ("mt", "nc", "ar2", "nsk", "xd")
+_SM_TUNED_FIELDS = ("mt", "nc", "ar2", "nsk", "xd", "sm")
 
 
 def _mt_table(spec) -> tuple[int, list[tuple[int, int]]]:
@@ -673,8 +674,9 @@ class MegaMoeTPEngine:
         return mt
 
     def _sm_tuned(self, tot: int) -> dict:
-        """(small-M) the tuned launch fields (mt, nc, ar2) of the nearest tuned batch <= tot
-        (AITER_CONFIG_MEGA_MOE_TP_SM), else {} (the defaults)"""
+        """(small-M) the tuned launch fields (mt, nc, ar2, nsk, xd; sm 0: the dynamic
+        schedule) of the nearest tuned batch <= tot (AITER_CONFIG_MEGA_MOE_TP_SM), else {}
+        (the defaults)"""
         key = {
             **device_key(self.device),
             "model_dim": self.H,
@@ -730,10 +732,16 @@ class MegaMoeTPEngine:
         return tot >= AR2_MIN
 
     def _sm_fits(self, tot: int) -> bool:
-        # small-M: every CTA's G1 blocks (rounds of n_cta over all row chunks' inter
-        # blocks) fit its unit list
-        nch = self._chunks(self._sm_mt(tot))[1]
-        return nch * (self.I // 128) <= UL_MAX * self.n_cta
+        # small-M: every CTA's G1 unit records fit its unit list (UL_MAX). The row chunks
+        # of tot tokens: at most one partial chunk per routed expert plus the full ones;
+        # q = blocks // CTAs: from SM_QC on q contiguous blocks per CTA, one record per
+        # row chunk they span (+ the remainder block), else rounds (q + 1 records)
+        routes = tot * self.K
+        nch = min(self.E, routes) + ceildiv(routes, 16 * self._sm_mt(tot)) + 1
+        ks2 = self.I // 128
+        q = nch * ks2 // (self._sm_nc(tot) or self.n_cta)
+        n = (q + ks2 - 1) // ks2 + 2 if q >= SM_QC else q + 1
+        return n <= UL_MAX
 
     def _lb_ok(self, tot: int) -> bool:
         return bool(self.lb_min) and tot >= self.lb_min
@@ -750,6 +758,8 @@ class MegaMoeTPEngine:
                 and fp8
                 and tot <= self.dyn_max
                 and self._sm_fits(tot)
+                # (a tuned batch measured faster on the dynamic schedule: sm 0)
+                and bool(self._sm_tuned(tot).get("sm", 1))
             )
             if sm:
                 cfg = LaunchCfg(

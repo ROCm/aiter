@@ -988,7 +988,8 @@ def build_schedule(kc: KernelCtx) -> dict:
 
     @flyc.jit
     def _xq_export(L, tid, a, i0, icnt, r0, rows):
-        u16 = icnt * i32(IPB // 128) // i32(16 * (I // 128))
+        # (IPB / I is 1 / 2 or 1: I // 2 bytes need not be a multiple of 128, e.g. I 384)
+        u16 = icnt * i32(IPB) // i32(16 * I)
         rx, rxs = xg_rs(a)
         for pl in range_constexpr(XIB // IPB):
             for q_ in range(tid, rows * u16, i32(NT)):
@@ -1002,7 +1003,7 @@ def build_schedule(kc: KernelCtx) -> dict:
                     V4I,
                     16,
                 )
-                doff = i0 * i32(IPB // 128) // i32(I // 128) + c * i32(16)
+                doff = i0 * i32(IPB) // i32(I) + c * i32(16)
                 bst(v, rx, rix * i32(XIB) + i32(pl * IPB) + doff, 0, AUX_SYS)
             nsd = icnt // i32(128)
             so = pl * (I // 32)

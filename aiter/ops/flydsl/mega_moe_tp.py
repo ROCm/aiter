@@ -224,8 +224,9 @@ class MegaMoeTP:
             ),
             swiglu_limit=cfg.swiglu_limit,
             comm_mode=cfg.comm_mode,
-            # ("int8": the big-M kernel's; the small engine runs its accurate bf16 path)
-            comm_dtype="bf16" if cfg.comm_dtype == "int8" else cfg.comm_dtype,
+            # ("int8": the big-M kernel's; the small engine runs its 8-bit (FP8) path, the
+            # small-M schedule)
+            comm_dtype="fp8" if cfg.comm_dtype == "int8" else cfg.comm_dtype,
             ar_gather=cfg.ar_gather,
             schedule=cfg.schedule,
             act_dtype=cfg.act_dtype,

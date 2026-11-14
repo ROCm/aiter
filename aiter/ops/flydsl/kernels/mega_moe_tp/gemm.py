@@ -793,7 +793,8 @@ def build_gemm(kc: KernelCtx) -> dict:
             is0 = b0.select(i32(L_INTERS), i32(L_B1S))
             rix0 = i32(L_RIX) + buf * i32(128 * 4)
             wt0 = i32(L_WT) + buf * i32(128 * 4)
-        NSK2 = _nsk2_for(NKS, G2, nsk)
+        # (small-M: G2 shares of GPC groups: a whole number of ring steps each)
+        NSK2 = _nsk2_for(NKS, GPC if kc.SM else G2, nsk)
         GPI = (NSK2 * NKS // math.gcd(NSK2, NKS)) // NKS
         assert G2 % GPI == 0
         WAIT_B2 = (NSK2 - 1) * OPS
