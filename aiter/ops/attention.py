@@ -2024,6 +2024,24 @@ def _mla_decode_launch_plan_cached(
     return plan, get_cu_num() * occupancy
 
 
+def _mla_partial_rows_per_split(plan: _MlaHeadPlan, max_seqlen_qo: int) -> int:
+    """Upper bound on the partial-buffer rows one reduce_partial_map entry spans.
+
+    The v1_2 planner advances the partial row by one q tile per split, and a
+    tile is `ceil(seqlen / num_qo_tiles)` rows: one row when
+    `2 * kernel_num_heads > packed_qo_len_per_wg`, else at most
+    `ceil(packed_qo_len_per_wg / kernel_num_heads)`. The planner picks 64 or 128
+    from the max_seqlen_qo it was given, so take 128 to stay valid when that
+    differs from the decode's. v1_0 and v1_1 keep the whole q length.
+    """
+    if _MLA_PLANNER_NAMES[plan.planner] != "v1_2":
+        return max_seqlen_qo
+    packed = max(plan.packed_qo_len_per_wg, 128)
+    if plan.kernel_num_heads * 2 > packed:
+        return 1
+    return min(max_seqlen_qo, math.ceil(packed / plan.kernel_num_heads))
+
+
 @_functools.lru_cache(maxsize=1)
 def _mla_asm_query_lib() -> Any:
     import ctypes
@@ -2882,6 +2900,8 @@ def _get_mla_metadata_v1_impl(
         page_size: Page size (default 1).
         kv_granularity: Granularity of kv page counts when splitting a batch (default 16).
         max_seqlen_qo: Max qo seqlen; used to bound LDS usage. < 1 means unknown (default -1).
+            When set, it must be >= the qo seqlen of every request. mla_decode_fwd
+            sizes its split buffers from the resulting plan.
         uni_seqlen_qo: Uniform qo seqlen across batches. < 1 means not fixed (default -1).
         fast_mode: Prefer fastest metadata generation; may hurt overall perf (default True).
         topk: Top-k tokens for sparse attention. -1 means non-sparse (default -1).

@@ -27,6 +27,7 @@ from aiter.ops.asm.mla_decode_v4 import (
 )
 from aiter.ops.attention import (
     _mla_decode_launch_plan,
+    _mla_partial_rows_per_split,
     _MlaBackendId,
     _MlaHeadPlanKind,
     mla_ps64_qh128_fp8_asm_fwd,
@@ -1061,6 +1062,10 @@ def mla_decode_fwd(
     indptr, ignoring last-page values (the tensor is still required).
     Physical ``page_size`` remains 64. Token CSR is only supported by the
     shuffled QH64 path; it does not change the KV byte layout.
+
+    Persistent metadata must come from ``get_mla_metadata_v1`` with the same
+    ``fast_mode`` and ``intra_batch_mode``. Its ``max_seqlen_qo`` must be -1 or
+    >= the q length of every request. The split buffers are sized from that plan.
     """
     if kv_csr_layout not in ("page", "token"):
         raise ValueError(f"unknown MLA kv_csr_layout: {kv_csr_layout!r}")
@@ -1518,13 +1523,16 @@ def mla_decode_fwd(
         else:
             assert False, f"{nhead=} and {max_seqlen_q=} not supported"
 
+        partial_rows = reduce_partial_map.size(0) * _mla_partial_rows_per_split(
+            head_plan, max_seqlen_q
+        )
         logits = torch.empty(
-            (reduce_partial_map.size(0) * max_seqlen_q, 1, nhead, v_head_dim),
+            (partial_rows, 1, nhead, v_head_dim),
             dtype=dtypes.fp32,
             device=device,
         )
         attn_lse = torch.empty(
-            (reduce_partial_map.size(0) * max_seqlen_q, 1, nhead, 1),
+            (partial_rows, 1, nhead, 1),
             dtype=dtypes.fp32,
             device=device,
         )
