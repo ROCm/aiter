@@ -783,11 +783,7 @@ struct opus_gemm_mono_tile_kargs_gfx950 {
 // are masked). Strides are in elements.
 template<int B_M_, int B_N_,
          bool A_T_, bool B_T_,
-         bool SPLITK_ = false,
-         // Large tiles (> 128 x 128) pin operands / C to fixed AGPR / VGPR ranges (they need every register);
-         // small tiles leave registers to the allocator (~100-200 registers -> 2 workgroups per CU).
-         bool PIN_ = (B_M_ * B_N_ > 128 * 128),
-         int WG_PER_CU_ = (B_M_ * B_N_ > 128 * 128) ? 1 : 2>   // launch_bounds occupancy hint
+         bool SPLITK_ = false>
 struct opus_gemm_a16w16_4wave_traits_gfx950 {
     using D_A = opus::bf16_t;
     using D_B = opus::bf16_t;
@@ -796,8 +792,9 @@ struct opus_gemm_a16w16_4wave_traits_gfx950 {
     static constexpr bool A_T = A_T_;
     static constexpr bool B_T = B_T_;
     static constexpr bool SPLITK = SPLITK_;
-    static constexpr bool PIN = PIN_;
-    static constexpr int WG_PER_CU = WG_PER_CU_;
+    // launch_bounds hint: 1 lets the pinned operands / C use the whole AGPR file; the occupancy then
+    // follows the real register / LDS use (small tiles still get 2-3 workgroups per CU).
+    static constexpr int WG_PER_CU = 1;
     // Written by the kernel: C itself, or (SPLITK) fp32 partial sums into the workspace.
     using D_OUT = std::conditional_t<SPLITK, opus::fp32_t, D_C>;
 
@@ -807,8 +804,7 @@ struct opus_gemm_a16w16_4wave_traits_gfx950 {
 
     static constexpr int B_M = B_M_;
     static constexpr int B_N = B_N_;
-    static constexpr int B_K = 64;                                        // bf16 elements
-    static constexpr int B_K_BYTES = B_K * 2;                             // 128: one LDS row
+    static constexpr int B_K = 64;                                        // bf16 elements (128 bytes: one LDS row)
 
     static constexpr int T_M = 2;
     static constexpr int T_N = 2;
@@ -826,30 +822,30 @@ struct opus_gemm_a16w16_4wave_traits_gfx950 {
     static_assert(E_M >= 1 && E_N >= 1 && E_M <= 4 && E_N <= 4 && (E_M & (E_M - 1)) == 0 && (E_N & (E_N - 1)) == 0
                   && HALF_B_M == 32 * E_M && HALF_B_N == 32 * E_N, "tile = 2 halves x 2 waves x E x 16, E in {1, 2, 4}");
 
-    // Copies are 16 bytes per lane (buffer_load ... lds); one wave issue = 1 KB.
-    static constexpr int VEC_A = 16;                                      // bytes
-    static constexpr int VEC_B = 16;
-    static constexpr int VEC_A_ELEMS = VEC_A / 2;                         // 8 bf16
-    // One MFMA operand register set per lane: 2 K-steps x 8 bf16 = 32 bytes = E_C chunks of 16 bytes.
+    // Copies are 16 bytes per lane (buffer_load ... lds); one wave issue = 1 KB. Sizes below are in elements.
+    static constexpr int VEC_A = 8;                                       // bf16 elements (16 bytes per lane)
+    static constexpr int VEC_B = 8;
+    static constexpr int VEC_TR = 4;                                      // ds_read_b64_tr_b16: 4 bf16 per lane
+    // K steps (16x16x32 MFMAs) per K tile: B_K / W_K.
     static constexpr int E_C = 2;
     static constexpr int VEC_C = 4;
 
     static constexpr int smem_padding = 0;
-    static constexpr int smem_linear_wave_a = WARP_SIZE * VEC_A;          // 1024
+    static constexpr int smem_linear_wave_a = WARP_SIZE * VEC_A;          // 512 bf16 = 1 KB chunk
     static constexpr int smem_linear_wave_b = WARP_SIZE * VEC_B;
-    static constexpr int smem_sub_a = smem_linear_wave_a / B_K_BYTES;     // 8 rows per 1 KB chunk
-    static constexpr int smem_sub_b = smem_linear_wave_b / B_K_BYTES;
+    static constexpr int smem_sub_a = smem_linear_wave_a / B_K;           // 8 rows per chunk
+    static constexpr int smem_sub_b = smem_linear_wave_b / B_K;
     static constexpr int smem_m_rep = HALF_B_M / smem_sub_a;
     static constexpr int smem_n_rep = HALF_B_N / smem_sub_b;
-    // buffer_load ... lds per wave per half tile per K tile (both layouts move HALF x 128 bytes).
-    static constexpr int a_buffer_load_insts = HALF_B_M * B_K_BYTES / (BLOCK_SIZE * VEC_A);   // E_M
-    static constexpr int b_buffer_load_insts = HALF_B_N * B_K_BYTES / (BLOCK_SIZE * VEC_B);   // E_N
+    // buffer_load ... lds per wave per half tile per K tile (both layouts move HALF x B_K).
+    static constexpr int a_buffer_load_insts = HALF_B_M * B_K / (BLOCK_SIZE * VEC_A);   // E_M
+    static constexpr int b_buffer_load_insts = HALF_B_N * B_K / (BLOCK_SIZE * VEC_B);   // E_N
 
     // LDS: 2 stages x 2 halves of A and B; the C staging of the epilogue reuses it. C is staged as one
     // D_OUT image of the tile (rows padded by 8 elements) when it fits, else (256 x 256 split-K fp32) quadrant by
     // quadrant in 2 alternating regions of HALF_B_M x (HALF_B_N + 8).
-    static constexpr int SMEM_A_BYTES = smem_m_rep * (smem_linear_wave_a + smem_padding) * 4;
-    static constexpr int SMEM_B_BYTES = smem_n_rep * (smem_linear_wave_b + smem_padding) * 4;
+    static constexpr int SMEM_A_BYTES = smem_m_rep * (smem_linear_wave_a + smem_padding) * 4 * static_cast<int>(sizeof(D_A));
+    static constexpr int SMEM_B_BYTES = smem_n_rep * (smem_linear_wave_b + smem_padding) * 4 * static_cast<int>(sizeof(D_B));
     static constexpr int C_IMAGE_BYTES = B_M * (B_N + 8) * static_cast<int>(sizeof(D_OUT));
     static constexpr bool C_STAGE_FULL = C_IMAGE_BYTES <= 163840;
     static constexpr int C_STAGE_BYTES = C_STAGE_FULL ? C_IMAGE_BYTES : 2 * HALF_B_M * (HALF_B_N + 8) * static_cast<int>(sizeof(D_OUT));
