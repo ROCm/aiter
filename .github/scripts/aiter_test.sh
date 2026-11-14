@@ -26,8 +26,13 @@ if [[ "$MULTIGPU" == "TRUE" ]]; then
 else
     if [[ -z "${AITER_TEST:-}" ]]; then
         echo "AITER_TEST is not set"
-        # Recursively find all files under op_tests, excluding op_tests/multigpu_tests
-        mapfile -t files < <(find op_tests -maxdepth 1 -type f -name "*.py" | sort)
+        # Run the operator tests and the focused regression/unit-test suite.
+        mapfile -t files < <(
+            {
+                find op_tests -maxdepth 1 -type f -name "test_*.py"
+                find tests -maxdepth 1 -type f -name "test_*.py"
+            } | LC_ALL=C sort
+        )
     else
         # If AITER_TEST contains multiple files separated by whitespace, convert to an array
         read -r -a files <<< "$AITER_TEST"
@@ -36,14 +41,21 @@ fi
 
 skip_tests=(
     "op_tests/multigpu_tests/bench_mega_moe_v2.py"
+    "op_tests/multigpu_tests/bench_attention_a2a.py"
+    "op_tests/multigpu_tests/test_mega_moe_tp.py"
+    "op_tests/multigpu_tests/test_mega_moe_v2.py"
+    "op_tests/multigpu_tests/test_megamoe_internode.py"
+    "op_tests/multigpu_tests/test_mega_moe_small_m.py"
     "op_tests/multigpu_tests/test_wide_ep_moe.py"
     "op_tests/multigpu_tests/test_dispatch_combine.py"
     "op_tests/multigpu_tests/test_communication.py"
     "op_tests/multigpu_tests/test_mori_all2all.py"
+    # runs as its own CI step before this suite ("Mori smoke test" in aiter-test.yaml)
+    "op_tests/multigpu_tests/test_mori_smoke.py"
     "op_tests/multigpu_tests/test_fused_ar_rms.py"
-    "op_tests/multigpu_tests/test_mega_moe_v2.py"
     "op_tests/multigpu_tests/triton_test/test_reduce_scatter_all_gather.py"
     "op_tests/multigpu_tests/triton_test/test_fused_rs_rmsnorm_quant_ag.py"
+    "op_tests/multigpu_tests/flydsl_allreduce_bench.py"
 )
 
 # When AITER_TEST is set, files are already the exact list for this shard (from artifact).
@@ -85,6 +97,37 @@ for file in "${sharded_files[@]}"; do
     # batch gate so they exercise the persistent kernel at every batch size.
     test_cmd=(timeout 60m python3 "$file")
     case "$file" in
+        op_tests/test_flydsl_moe_a16wfp4.py)
+            test_cmd=(timeout 60m python3 -m pytest -q "$file")
+            ;;
+        op_tests/test_gemm_a8w8.py)
+            # This suite checks correctness across thousands of tuned shapes.
+            # Check every shape once; the suite also times one shape per CSV
+            # kernel configuration. Dedicated runs can retain 100 iterations.
+            test_cmd=(timeout 60m env "AITER_GEMM_TEST_ITERS=${AITER_GEMM_TEST_ITERS:-1}" python3 "$file")
+            ;;
+        tests/test_*.py)
+            # The focused regression suite is pytest-style with no runnable
+            # __main__, so `python3 "$file"` would exit 0 without executing a
+            # case. Dispatch it through pytest, which exits non-zero (5) when
+            # no tests are collected, so an empty run cannot report success.
+            test_cmd=(timeout 60m python3 -m pytest -q "$file")
+            ;;
+        op_tests/test_fhmoe.py|op_tests/tuning_tests/test_fhmoe_tuner.py|op_tests/test_graph_alloc.py|op_tests/test_hipb_grouped_gemm.py|op_tests/flydsl_tests/test_gemm2_valid_token_count.py|op_tests/test_mla_sparse_prefill_v41_asm.py)
+            # These files contain pytest-style test functions and intentionally
+            # have no script entry point; direct execution would only import them.
+            test_cmd=(timeout 60m python3 -m pytest -q "$file")
+            ;;
+        op_tests/test_moe_cktile_stage1_splitk.py)
+            # The standalone benchmark omits selector and expected-error tests.
+            # Use pytest to run these alongside the numerical regression cases.
+            test_cmd=(timeout 60m python3 -m pytest -q "$file")
+            ;;
+        op_tests/test_mla_v4_nm.py)
+            # The test cases are pytest functions; the script entry point is an
+            # opt-in perf sweep that exits 0 without running anything by default.
+            test_cmd=(timeout 60m python3 -m pytest -q "$file")
+            ;;
         op_tests/multigpu_tests/bench_mega_moe.py)
             {
                 echo "Running MegaMoE fused-scatter accuracy on 8 GPUs when supported"
@@ -102,8 +145,8 @@ for file in "${sharded_files[@]}"; do
                     fi
                     exec env MORI_SHMEM_HEAP_SIZE=40G \
                         torchrun --standalone --nproc_per_node=8 "$test_file" \
-                        --combine fused --dispatch_backend flydsl \
-                        --stage1_fused 1 --layers 2 --acc_verify 1
+                        --stage1_fused false --stage2_fused true \
+                        --layers 2 --acc_verify 1
                 '
                 _ "$file"
             )
@@ -120,6 +163,64 @@ for file in "${sharded_files[@]}"; do
                 "$file"
             )
             ;;
+        op_tests/multigpu_tests/test_mega_moe_tp.py)
+            {
+                echo "Running MegaMoE TP (MiniMax-M3, GLM-5) on 4 GPUs when supported"
+            } | tee -a latest_test.log
+            test_cmd=(
+                timeout 60m
+                bash -c '
+                    set -euo pipefail
+                    test_file=$1
+                    arch=$(python3 -c \
+                        "from aiter.jit.utils.chip_info import get_gfx; print(get_gfx())")
+                    ngpu=$(python3 -c "import torch; print(torch.cuda.device_count())")
+                    if [[ "$arch" != "gfx950" || "$ngpu" -lt 4 ]]; then
+                        echo "Skipping $test_file: requires 4 gfx950 GPUs, got $ngpu x $arch"
+                        exit 0
+                    fi
+                    exec torchrun --standalone --nproc_per_node=4 "$test_file" \
+                        --models m3 glm5 --tokens 256 512 1024 2048
+                '
+                _ "$file"
+            )
+            ;;
+        op_tests/multigpu_tests/test_attention_a2a.py)
+            {
+                echo "Running fused A2A at world sizes 2/4/8 with heads 8 and 40"
+            } | tee -a latest_test.log
+            # The default would only run ws2 / heads 8. The test spawns its own
+            # per-rank processes, so plain python3 rather than torchrun.
+            test_cmd=(
+                timeout 60m
+                python3 "$file" -w 2 4 8 --heads 8 40
+            )
+            ;;
+        op_tests/multigpu_tests/test_custom_allreduce.py|op_tests/multigpu_tests/test_custom_allgatherv.py)
+            {
+                echo "Running $file at its default group size, then at 6 ranks when available"
+            } | tee -a latest_test.log
+            # 6 ranks has no gather / scatter kernels (NCCL fallback) and a
+            # one-stage all-reduce whose 512 threads do not split evenly.
+            test_cmd=(
+                timeout 60m
+                bash -c '
+                    set -euo pipefail
+                    test_file=$1
+                    python3 "$test_file"
+                    ngpu=$(python3 -c "import torch; print(torch.cuda.device_count())")
+                    if [[ "$ngpu" -lt 6 ]]; then
+                        echo "Skipping the 6-rank pass of $test_file: $ngpu GPUs"
+                        exit 0
+                    fi
+                    case "$test_file" in
+                        *test_custom_allreduce.py) exec python3 "$test_file" -t 6 --regression ;;
+                        *) exec python3 "$test_file" -t 6 ;;
+                    esac
+                '
+                _ "$file"
+            )
+            ;;
         op_tests/test_mla_persistent.py|op_tests/test_mla_persistent_round_robin.py)
             {
                 echo "Using AITER_MLA_DECODE_PERSISTENT_MAX_BATCH=0 for $file"
@@ -127,17 +228,10 @@ for file in "${sharded_files[@]}"; do
             test_cmd=(env AITER_MLA_DECODE_PERSISTENT_MAX_BATCH=0 timeout 60m python3 "$file")
             ;;
         op_tests/test_flydsl_pa_decode.py)
-            # The CLI sweep is separate from the compact parametrized regression.
-            test_cmd=(
-                timeout 60m
-                bash -c '
-                    set -euo pipefail
-                    test_file=$1
-                    python3 -m pytest -q "$test_file"
-                    python3 "$test_file"
-                '
-                _ "$file"
-            )
+            test_cmd=(timeout 60m python3 -m pytest -q "$file")
+            ;;
+        op_tests/test_f4gemm.py)
+            test_cmd=(timeout 60m python3 "$file" --mode func)
             ;;
         op_tests/test_gemm_a6w6.py)
             {
@@ -159,6 +253,12 @@ for file in "${sharded_files[@]}"; do
                 echo "Running tuned dispatch, independent Wan references, and every mixed ASM kernel on fully padded M/N/K tails"
             } | tee -a latest_test.log
             test_cmd=(timeout 60m python3 "$file")
+            ;;
+        op_tests/test_moe_2stage.py)
+            {
+                echo "Running $file with the standard MoE CI profile: representative token sweep (CSV/FlyDSL validation still runs)"
+            } | tee -a latest_test.log
+            test_cmd=(timeout 60m env AITER_MOE_2STAGE_CI_PROFILE=standard python3 "$file")
             ;;
     esac
     # Capture start time (nanoseconds since epoch)

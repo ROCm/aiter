@@ -18,20 +18,19 @@ import aiter
 import aiter.mla  # main no longer auto-imports submodules; need explicit
 from aiter import dtypes
 from aiter.jit.utils.chip_info import get_cu_num, get_gfx
+from aiter.ops.asm.mla_decode_v4 import mla_decode_v4_asm
 from aiter.test_common import checkAllclose, run_perftest
 
 # ---------------------------------------------------------------------------
-# Variant under test (matches the cfg_mla_v4_asm entry in
-# hsa/gfx950/mla_v4/mla_v4_asm.csv served by csrc/py_itfs_cu/asm_mla_v4.cu).
+# Variant under test (matches the entry in hsa/gfx950/mla_v4/mla_v4_asm.csv
+# served by aiter/ops/asm/mla_decode_v4.py).
 # ---------------------------------------------------------------------------
 GQA_RATIO = 64  # num_heads / num_kv_heads
 PAGE_SIZE = 1
 NUM_KV_HEADS = 1
 DIM_NOPE = 448  # FP8 NOPE bytes per token
 DIM_ROPE = 64  # BF16 ROPE elements per token (= 128 bytes; lives in qrope/kvrope)
-DIM_QK_PACKED = (
-    576  # = args.dim(512) + args.k_rotary(64); matches the kernel stride_Page
-)
+DIM_QK_PACKED = 512  # FP8 NOPE 448 + e8m0 scales + pad; the kernel row stride
 V_HEAD_DIM = 512  # logical V head dim = args.dim = kv_lora_rank
 
 
@@ -180,9 +179,9 @@ def test_v4_nm_kernarg_scalar_slots(capfd, monkeypatch):
     """Regression guard for the 21-slot (336B) v4 nm legacy kernarg layout.
 
     Locks in the *scalar* portion (slot 7 scalar_f, slot 8-12 ints, slot 15
-    int) of the kernarg buffer produced by csrc/py_itfs_cu/asm_mla_v4.cu for
+    int) of the kernarg buffer produced by aiter/ops/asm/mla_decode_v4.py for
     the canonical qh64/(gqa,qseq)∈{(16,4),(64,1),(128,1)}/page=1/passes=1
-    config (single .co; the C++ alias in asm_mla_v4.cu remaps gqa∈{64,128}
+    config (single .co; the lookup in mla_decode_v4.py remaps gqa∈{64,128}
     to the (gqa=16,qSeqLen=4) CSV row). Any future
     change to the dispatcher that shifts a slot, mis-computes a stride /
     scale, or changes the formula here will trip this test before the golden
@@ -190,7 +189,7 @@ def test_v4_nm_kernarg_scalar_slots(capfd, monkeypatch):
 
     Pointer slots are NOT checked (their values are runtime allocation
     addresses and don't have a stable reference). Bytes printed by the
-    AITER_V4_NM_DUMP_KERNARG=1 path in asm_mla_v4.cu are captured via capfd.
+    AITER_V4_NM_DUMP_KERNARG=1 path in mla_decode_v4.py are captured via capfd.
     """
     monkeypatch.setenv("AITER_V4_NM_DUMP_KERNARG", "1")
     args = _build_inputs(batch=2, kv_seq_lens=64, q_seq_logical=1, seed=0)
@@ -198,7 +197,7 @@ def test_v4_nm_kernarg_scalar_slots(capfd, monkeypatch):
     torch.cuda.synchronize()
 
     captured = capfd.readouterr()
-    # The dispatcher fprintf's "[aiter kernarg <N>B]" then N/16 rows of 16 hex
+    # The launcher prints "[aiter kernarg <N>B]" then N/16 rows of 16 hex
     # bytes. On gfx950 the legacy (non-preload) ABI is 21 slots x 16B = 336B:
     # slots 0-18 from the original layout + slots 19/20 (valid_split scratch)
     # added by the kargs-preload change. Parse the rows out of stderr.
@@ -265,9 +264,8 @@ def test_v4_nm_kernarg_scalar_slots(capfd, monkeypatch):
     expected_out16ns = 1
     # slots 10 (s_total_kv) and 11 (s_stride_page) are NEVER read — only 17 kernarg
     # loads, none at offsets 0xA0/0xB0). The dispatcher leaves them at 0
-    # via `args = {}` zero-init to skip the per-call D2H readback that
-    # used to compute s_total_kv. See the "Dead kernarg slots" block in
-    # csrc/py_itfs_cu/asm_mla_v4.cu for the full justification.
+    # via zero-init to skip the per-call D2H readback that used to compute
+    # s_total_kv (see MlaV4KernelArgsLegacy in aiter/ops/asm/mla_decode_v4.py).
     expected_total_kv = 0
     expected_stride_pg = 0
 
@@ -744,7 +742,7 @@ def _run_one_point(
     live here).
     """
     # The shipped qh64 .co has a 64 q-row tile; the dispatcher
-    # (csrc/py_itfs_cu/asm_mla_v4.cu) selects sub_Q based on (gqa_ratio,
+    # (aiter/ops/asm/mla_decode_v4.py) selects sub_Q based on (gqa_ratio,
     # max_seqlen_q) and computes gdx = ceil(gqa*max_seqlen_q / sub_Q), so a
     # single .co covers these (gqa, q_seq_logical) entry points:
     #   (16, 4) — 16 heads × 4 logical-Q rows = 64 → sub_Q=64, gdx=1
@@ -758,7 +756,7 @@ def _run_one_point(
     #             heads; logits [num_seqs,1,2,16,512] -> [total_q,16,512]).
     #   (32, 1) — 32 heads × 1 logical-Q row  = 32 → sub_Q=32, gdx=1; compact
     #             32-row partial (row == head; logits [num_seqs,1,32,512]).
-    # The CSV alias in asm_mla_v4.cu remaps all of these to the single
+    # The CSV alias in mla_decode_v4.py remaps all of these to the single
     # (Gqa=64, qSeqLen=1) lookup row so they share one kernel symbol.
     _SHIPPED_TILE_VARIANTS = {
         (16, 4),
@@ -913,7 +911,7 @@ def _run_one_point(
     # is the only kernel invocation; for num_kv_splits>1 the wrapper would
     # additionally invoke `_fwd_kernel_stage2_asm` triton on top — see (2b).
     _ret, us_asm_kernel = run_perftest(
-        aiter.mla_decode_v4_asm,
+        mla_decode_v4_asm,
         q_packed,
         q_rope.contiguous(),
         kv_packed,
@@ -923,13 +921,14 @@ def _run_one_point(
         inputs["kv_page_indices"],
         split_indptr,
         inputs["sink"],  # per-head [num_heads] sink; req'd positional
+        logits_buf,
+        lse_buf,
+        output_buf,
+        None,  # valid_split_count
         inputs["max_seqlen_q"],
         sm_scale,
         int(out_16_nosplit),  # out_16_nosplit (timing path; raw kernel does not unpack)
         num_kv_splits,
-        logits_buf,
-        lse_buf,
-        output_buf,
         num_iters=num_iters,
         num_warmup=num_warmup,
         num_rotate_args=1,
@@ -1541,7 +1540,7 @@ def test_v4_nm_gqa16_qseqlen1_accuracy_and_perf():
 
     This pair is served by the same single qh64 .co via the
     `gqa_ratio == 16 && config_max_seqlen_q == 1` normalization branch in
-    asm_mla_v4.cu. Unlike the other three shipped variants it does NOT
+    mla_decode_v4.py. Unlike the other three shipped variants it does NOT
     satisfy gqa*q_seq=64 (here 16*1=16); the dispatcher picks sub_Q=16 and
     the kernel writes a compact 16-row partial (logits [num_seqs,1,16,512],
     no 64-row tile slack). _run_one_point's buffers are already sized to
@@ -1962,8 +1961,8 @@ def test_v4_nm_sink():
         "PR-2 regression: sink=-inf and sink=10.0 produced bit-identical "
         "output among finite cells. Either the dispatcher stopped writing "
         "ptr_sink into kernarg slot 18 (offset 0x120), or the .co was "
-        "rebuilt from a non-sink-aware .s. Check the static_assert in "
-        "csrc/py_itfs_cu/asm_mla_v4.cu and rebuild from 3_13.s."
+        "rebuilt from a non-sink-aware .s. Check MlaV4KernelArgsLegacy in "
+        "aiter/ops/asm/mla_decode_v4.py and rebuild from 3_13.s."
     )
 
     # ---- (B) sink=-inf introduces no extra NaN vs -1e9 control ----
@@ -2987,6 +2986,12 @@ def test_v4_nm_ps_oob_guardpage():
     )
 
 
+# The script driver's full perf sweep (opt-in, see __main__).
+SWEEP_BATCHES = [1, 2, 3, 4, 8, 16, 32, 64, 128, 256]
+SWEEP_KV_SEQ_LENS = [100, 256, 300, 512, 700, 1024]
+SWEEP_Q_SEQ_LOGICAL = [4]
+
+
 if __name__ == "__main__":
     import argparse
     import itertools
@@ -3020,35 +3025,44 @@ if __name__ == "__main__":
         formatter_class=argparse.RawTextHelpFormatter,
         description=(
             "v4 nm MLA DIY driver: for each shape in the (batch x kv x q_seq)\n"
-            "cartesian product, run accuracy then perf. For the pytest smoke /\n"
-            "determinism / kernarg suite, invoke `pytest op_tests/test_mla_v4_nm.py`\n"
-            "directly."
+            "cartesian product, run accuracy then perf. Opt-in: runs only with\n"
+            "--full-sweep or an explicit -b / -c / -q; without them it exits 0,\n"
+            "so the standard CI run of this file skips the sweep. For the pytest\n"
+            "smoke / determinism / kernarg suite, invoke\n"
+            "`pytest op_tests/test_mla_v4_nm.py` directly."
         ),
+    )
+    parser.add_argument(
+        "--full-sweep",
+        action="store_true",
+        help="Run the whole default sweep (every -b x -c x -q default below).",
     )
     parser.add_argument(
         "-b",
         "--batch",
         type=int,
         nargs="*",
-        default=[1, 2, 3, 4, 8, 16, 32, 64, 128, 256],
-        help="Batch size(s). e.g. -b 1 2 4",
+        default=None,
+        help=f"Batch size(s), default {SWEEP_BATCHES}. e.g. -b 1 2 4",
     )
     parser.add_argument(
         "-c",
         "--kv-seq-lens",
         type=int,
         nargs="*",
-        default=[100, 256, 300, 512, 700, 1024],
-        help="KV tokens per sequence. e.g. -c 64 256 1024",
+        default=None,
+        help=f"KV tokens per sequence, default {SWEEP_KV_SEQ_LENS}. "
+        "e.g. -c 64 256 1024",
     )
     parser.add_argument(
         "-q",
         "--q-seq-logical",
         type=int,
         nargs="*",
-        default=[4],
-        help="Q tokens per sequence (pre-GQA-broadcast). Must be <=4 for the "
-        "shipped qseqlen4 variant. e.g. -q 1 2 4",
+        default=None,
+        help=f"Q tokens per sequence (pre-GQA-broadcast), default "
+        f"{SWEEP_Q_SEQ_LOGICAL}. Must be <=4 for the shipped qseqlen4 variant. "
+        "e.g. -q 1 2 4",
     )
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--iters", type=int, default=50, help="Perf timed iterations")
@@ -3067,7 +3081,7 @@ if __name__ == "__main__":
         "tile (64 q-rows) covers via the dispatcher's sub_Q=64 + "
         "gdx=ceil(gqa*max_seqlen_q/64) launch geometry. The CSV in "
         "hsa/gfx950/mla_v4/mla_v4_asm.csv ships a single (gqa=16, qSeqLen=4) "
-        "row; asm_mla_v4.cu remaps gqa∈{64,128} to that row at lookup time.",
+        "row; mla_decode_v4.py remaps gqa∈{64,128} to that row at lookup time.",
     )
     parser.add_argument(
         "--attn-sink",
@@ -3088,6 +3102,20 @@ if __name__ == "__main__":
         "Default 0 (fp32 split path).",
     )
     args = parser.parse_args()
+
+    shapes = (args.batch, args.kv_seq_lens, args.q_seq_logical)
+    if not args.full_sweep and all(s is None for s in shapes):
+        print(
+            "[v4 nm] perf sweep skipped: it is opt-in (--full-sweep, or "
+            "-b / -c / -q for a subset). Exiting 0."
+        )
+        sys.exit(0)
+    if args.batch is None:
+        args.batch = SWEEP_BATCHES
+    if args.kv_seq_lens is None:
+        args.kv_seq_lens = SWEEP_KV_SEQ_LENS
+    if args.q_seq_logical is None:
+        args.q_seq_logical = SWEEP_Q_SEQ_LOGICAL
 
     perf_rows = []
     failures = []
@@ -3113,7 +3141,7 @@ if __name__ == "__main__":
             )
         except AssertionError as e:
             # Keep sweeping so one bad shape doesn't hide the rest; the exit
-            # code below is what fails CI (aiter_test.sh runs this as a script).
+            # code below is what fails the run.
             failures.append(((batch, kv_seq_lens, q_seq_logical), str(e)))
             continue
         perf_rows.append((batch, kv_seq_lens, q_seq_logical, us_asm, us_ref))

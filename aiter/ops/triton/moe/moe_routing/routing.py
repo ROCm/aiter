@@ -699,7 +699,9 @@ def compute_expt_data_torch(hist, n_expts_tot, n_gates, block_m):
     # offset for each experts
     device = hist.device
     token_offs_raw = torch.cumsum(hist, dim=0)
-    token_offs_raw = torch.cat((torch.zeros(1, device=device), token_offs_raw))
+    token_offs_raw = torch.cat(
+        (torch.zeros(1, dtype=torch.float32, device=device), token_offs_raw)
+    )
     token_offs_raw = token_offs_raw.int()
     # maximum number of tiles for all values of `block_m` considered
     if n_gates <= n_expts_tot:
@@ -711,10 +713,12 @@ def compute_expt_data_torch(hist, n_expts_tot, n_gates, block_m):
     # fill up tile offset/infos for each block
     n_tiles = (hist + block_m - 1) // block_m  # matmul blocks needed
     token_offs_pad = torch.cumsum(n_tiles, dim=0)
-    token_offs_pad = torch.cat((torch.zeros(1, device=device), token_offs_pad))
+    token_offs_pad = torch.cat(
+        (torch.zeros(1, dtype=torch.float32, device=device), token_offs_pad)
+    )
     token_offs_pad = token_offs_pad.int()
     # compute data required to drive ragged batch matmul
-    block_pid_map = -torch.ones(max_n_tiles, device=device)
+    block_pid_map = -torch.ones(max_n_tiles, dtype=torch.float32, device=device)
     for e in range(n_expts_tot):
         offset = token_offs_pad[e]
         for b in range(n_tiles[e]):

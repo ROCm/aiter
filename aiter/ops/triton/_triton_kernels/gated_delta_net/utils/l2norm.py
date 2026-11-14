@@ -231,7 +231,7 @@ def l2norm_fwd(
         which already pass the right flag.
     """
     x_shape_og = x.shape
-    x = x.view(-1, x.shape[-1])
+    x = x.reshape(-1, x.shape[-1])
     if output_dtype is None:
         y = torch.empty_like(x)
     else:

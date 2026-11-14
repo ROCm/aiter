@@ -14,6 +14,7 @@ Usage: python3 .claude/skills/review-pr/watchdog_test.py
 """
 
 import contextlib
+import os
 import io
 import sys
 import types
@@ -290,6 +291,38 @@ def suite(src):
     return out
 
 
+def entry_point(src):
+    """main() is the one path the behaviour checks never touch: they call run() directly, so a
+    mistyped environment variable, a changed constructor or a renamed argument lives there unseen
+    until the first real run. Drive it with a tiny window so it decides without sleeping."""
+    mod = load(src)
+    seen = []
+
+    class Fake(mod.GitHub):
+        def _get(self, path):
+            seen.append(path)
+            return {"jobs": []}
+
+        def _post(self, *a, **k):
+            seen.append("POST")
+            return 201
+
+    mod.GitHub = Fake
+    mod.POLL_SECONDS = 0.05        # main() uses the real clock; keep its one poll instant
+    saved = dict(os.environ)
+    os.environ.update({"GH_TOKEN": "t", "AITER_BOT_TOKEN": "b", "PR": "42",
+                       "GITHUB_REPOSITORY": REPO, "GITHUB_RUN_ID": str(OWN_RUN),
+                       "STUCK_MINUTES": "0.0005", "OWNER_OVERRIDE": ""})
+    try:
+        with contextlib.redirect_stdout(io.StringIO()):     # its workflow commands are not ours
+            rc = mod.main()
+    finally:
+        os.environ.clear()
+        os.environ.update(saved)
+    return [("main() runs and decides", rc in (0, 1)),
+            ("main() built an API object that was actually used", bool(seen))]
+
+
 def main():
     src = SRC.read_text(encoding="utf-8")
     ok = bad = 0
@@ -317,6 +350,13 @@ def main():
         t('breaking %s turns "%s" red' % (why, breaks),
           None if suite(src.replace(find, repl, 1))[breaks]
           else "it stayed green, so that check proves nothing")
+
+    print("[entry point]")
+    try:
+        for name, good in entry_point(src):
+            t(name, None if good else "main() did not wire up")
+    except Exception as e:                                  # noqa: BLE001 - report, not raise
+        t("main() runs", "threw: %s: %s" % (type(e).__name__, e))
 
     print("=== %d green / %d red ===" % (ok, bad))
     return 1 if bad else 0

@@ -12,24 +12,24 @@ SKILL.md is always at <repo>/.claude/skills/review-pr/SKILL.md.
 
 import pathlib
 import re
-import subprocess
 import sys
 
 HERE = pathlib.Path(__file__).resolve().parent
 
 
 def _skill_md():
-    root = subprocess.run(
-        ["git", "-C", str(HERE), "rev-parse", "--show-toplevel"],
-        capture_output=True,
-        text=True,
-        check=False,
-    ).stdout.strip()
-    p = pathlib.Path(root, ".claude", "skills", "review-pr", "SKILL.md")
-    return p.read_text(encoding="utf-8")
+    """SKILL.md sits next to this file; do not ask git where the repo root is.
+
+    `git rev-parse --show-toplevel` returns an empty string outside a checkout, and
+    Path("", ".claude", ...) is then a RELATIVE path resolved against the caller's cwd.
+    So the drift check died with FileNotFoundError on a clean `git archive HEAD` export
+    -- which is what this PR's own description tells a reviewer to verify from, and the
+    one place the check absolutely has to work. It passed everywhere it was tried
+    because every trial was inside a git checkout.
+    """
+    return (HERE / "SKILL.md").read_text(encoding="utf-8")
 
 
-# (prompt file relative to HERE, start anchor, end anchor) — anchors are unique lines in SKILL.md.
 CHECKS = [
     (
         "prompts/refuter.md",
@@ -40,6 +40,11 @@ CHECKS = [
         "prompts/worker.md",
         "**Output rules (strictly enforced):**",
         '- `⚠️ The benchmark may not include setup cost` — no "Author must" conclusion',
+    ),
+    (
+        "prompts/worker.md",
+        "## Step 7.8 — Design Assessment",
+        "and an over-bar PR carries a split.",
     ),
 ]
 
@@ -75,6 +80,7 @@ def check_fail_classes():
 
 
 WORKFLOW = HERE.parents[2] / ".github" / "workflows" / "aiter-review-bot.yml"
+GATE_WATCH_WORKFLOW = HERE.parents[2] / ".github" / "workflows" / "review-bot-gate-watch.yml"
 
 
 def _notify_mod():
@@ -104,23 +110,109 @@ def check_budget_fits():
     return 0
 
 
-def check_watchdog_owner():
-    """Every message but one routes through _notify.py's class->owner map. The watchdog posts its
-    stuck-runner page itself and carries its own copy of the handle, so the two drift apart in
-    silence: the next owner updates _notify.py and still never hears that the runner is down."""
+def check_owner_fallbacks():
+    """Every message but two routes through _notify.py's class->owner map. The watchdog, the
+    lost-review report and the gate watch page on their own -- comments, or a failed job --
+    and each carries its own copy of a handle, so they drift from the map in silence: the next
+    owner updates _notify.py and still never hears that the runner is down, that a review
+    vanished, or that the hosted runners starved. The gate watch lives in a different workflow
+    file from the other two, so each row names the workflow that must pass its variable."""
+    classes = _notify_mod().CLASSES
+    rows = [
+        ("watchdog.py", "env",
+         r'OWNER_OVERRIDE"\) or ""\)\.strip\(\) or "([A-Za-z0-9-]+)"',
+         "aiter-review-bot.yml"),
+        ("lost_review.py", "flow",
+         r'OWNER_OVERRIDE"\) or ""\)\.strip\(\) or "([A-Za-z0-9-]+)"',
+         "aiter-review-bot.yml"),
+        ("queue_gate.py", "env",
+         r'OWNER_OVERRIDE"\) or ""\)\.strip\(\) or "([A-Za-z0-9-]+)"',
+         "aiter-review-bot.yml"),
+        ("gate_watch.py", "env",
+         r'OWNER_OVERRIDE"\) or ""\)\.strip\(\) or "([A-Za-z0-9-]+)"',
+         "review-bot-gate-watch.yml"),
+    ]
+    bad = 0
+    for filename, cls, pattern, wf_name in rows:
+        m = re.search(pattern, (HERE / filename).read_text(encoding="utf-8"))
+        var, default = classes[cls][:2]
+        if not m:
+            print(f"\u274c cannot read {filename}'s owner fallback")
+            bad += 1
+            continue
+        if m.group(1) != default:
+            print(f"\u274c {filename} pages '{m.group(1)}', but _notify.py's {cls} class is "
+                  f"'{default}'")
+            bad += 1
+            continue
+        wf = (WORKFLOW.parent / wf_name).read_text(encoding="utf-8")
+        if not re.search(r"OWNER_OVERRIDE: \$\{\{ vars\." + var + r" \}\}", wf):
+            print(f"\u274c {filename} defaults to _notify.py's {cls} owner but {wf_name} does "
+                  f"not pass {var}")
+            bad += 1
+            continue
+        print(f"\u2705 {filename} matches _notify.py's {cls} class: {default} via {var}")
+    return 1 if bad else 0
+
+
+def check_gate_watch_window():
+    """gate_watch.py pages a stuck request exactly once by looking for it only inside a
+    one-poll-wide age window. The poll interval is the cron schedule, and it lives in a
+    different file from the window it widths: change one without the other and the watcher
+    either pages about the same stuck request every poll, or slips a request between two polls
+    into permanent silence -- and nothing errors either way."""
+    gw = (HERE / "gate_watch.py").read_text(encoding="utf-8")
+    wf = GATE_WATCH_WORKFLOW.read_text(encoding="utf-8")
+    m = re.search(r"^WINDOW_MINUTES = (\d+)", gw, re.M)
+    c = re.search(r'^\s*- cron: "\*/(\d+) \* \* \* \*"', wf, re.M)
+    if not m or not c:
+        print("\u274c cannot read WINDOW_MINUTES from gate_watch.py or the cron interval from "
+              "review-bot-gate-watch.yml")
+        return 1
+    window, cron = int(m.group(1)), int(c.group(1))
+    if window != cron:
+        print(f"\u274c the gate watch polls every {cron} min but its page window is {window} min "
+              f"wide -- exactly-once paging needs the window to be one poll wide")
+        return 1
+    print(f"\u2705 gate watch page window is one poll wide: {window} min")
+    return 0
+
+
+def check_no_self_trigger():
+    """The bot's own comments are issue_comment events like any other. Without an explicit
+    exclusion every card and queue notice starts a run of this workflow, which is gated off a
+    moment later -- but only after taking a hosted-runner slot the real requests are waiting
+    for. The guard is one line and leaves no trace when removed, so assert it."""
     wf = WORKFLOW.read_text(encoding="utf-8")
-    wd = (HERE / "watchdog.py").read_text(encoding="utf-8")
-    m = re.search(r'OWNER_OVERRIDE"\) or ""\)\.strip\(\) or "([A-Za-z0-9-]+)"', wd)
-    v = re.search(r"OWNER_OVERRIDE: \$\{\{ vars\.([A-Z_]+) \}\}", wf)
-    if not m or not v:
-        print("\u274c cannot read the watchdog's owner fallback from watchdog.py")
+    if not re.search(r"github\.event\.comment\.user\.login != 'aiter-bot'", wf):
+        print("\u274c the gate does not exclude the bot's own comments; every notice it posts "
+              "will start a run that competes with real requests")
         return 1
-    var, default = _notify_mod().CLASSES["env"][:2]
-    if (m.group(1), v.group(1)) != (default, var):
-        print(f"\u274c watchdog pages '{m.group(1)}' via {v.group(1)}, but _notify.py's env class "
-              f"is '{default}' via {var}")
+    print("\u2705 the gate excludes the bot's own comments")
+    return 0
+
+
+def check_notified_handoff():
+    """The report job stays quiet when the review job says it already spoke. That answer travels
+    _notify.py -> step output -> job output -> the report job's env, and every link is a string
+    that something else has to spell the same way. Break one and nothing errors: the flag simply
+    arrives empty, the report fires on every failed review, and the duplicate notice looks like
+    the bot being broken rather than the wiring being broken."""
+    wf = WORKFLOW.read_text(encoding="utf-8")
+    notify = (HERE / "_notify.py").read_text(encoding="utf-8")
+    links = [
+        ("_notify.py writes the flag", 'fh.write("notified=true' in notify),
+        ("the review job has a step to write it", re.search(r"^\s+id: notify\s*$", wf, re.M)),
+        ("the review job exports it",
+         re.search(r"^\s+notified: \$\{\{ steps\.notify\.outputs\.notified \}\}", wf, re.M)),
+        ("the report job reads it",
+         re.search(r"^\s+NOTIFIED: \$\{\{ needs\.review\.outputs\.notified \}\}", wf, re.M)),
+    ]
+    broken = [name for name, found in links if not found]
+    if broken:
+        print("\u274c the notified handoff is broken at: %s" % "; ".join(broken))
         return 1
-    print(f"\u2705 watchdog owner matches _notify.py's env class: {default} via {var}")
+    print("\u2705 notified handoff intact: _notify.py -> step -> job output -> report")
     return 0
 
 
@@ -144,6 +236,174 @@ def check_runner_label_exclusive():
     return 0
 
 
+def check_publish_needs_post_flag():
+    """_publish.py's only closure against posting with excess write access is its missing
+    `--post` flag: on the self-hosted box it falls back to ~/.git-credentials, a human PAT
+    with repo write access, and posts over plain curl -- so GITHUB_TOKEN permission scoping
+    does not stop it from posting at all. Today the workflow grants the review job only
+    `contents: read`, so that fallback never has write access to use. If the workflow is ever
+    changed to grant `issues: write` or `pull-requests: write` anywhere, GITHUB_TOKEN stops
+    being irrelevant to _publish.py's reach, and the invocation MUST pass --post explicitly
+    -- or there is a silent gap between what the token in scope can do and what the one call
+    site that would use it was actually told to do."""
+    wf = WORKFLOW.read_text(encoding="utf-8")
+    run_one = (HERE / "run_one.sh").read_text(encoding="utf-8")
+    granted = re.search(r"^\s*(issues|pull-requests):\s*write\s*$", wf, re.M)
+    invocations = re.findall(r"[^\n]*_publish\.py[^\n]*", wf) \
+        + re.findall(r"[^\n]*_publish\.py[^\n]*", run_one)
+    has_post = any("--post" in line for line in invocations)
+    if granted and not has_post:
+        print(f"\u274c aiter-review-bot.yml grants '{granted.group(0).strip()}' somewhere, "
+              f"but _publish.py is never invoked with --post -- GITHUB_TOKEN scoping is no "
+              f"longer the only thing standing between a job and a post, and _publish.py's "
+              f"missing-flag default (dry-run) must now be an explicit match, not an "
+              f"accident")
+        return 1
+    if granted:
+        print("\u2705 aiter-review-bot.yml grants write, and _publish.py is invoked with "
+              "--post to match it")
+        return 0
+    print("\u2705 aiter-review-bot.yml grants no issues/pull-requests write anywhere; "
+          "_publish.py's missing --post is its only closure, as documented")
+    return 0
+
+
+def check_publish_review_is_advisory():
+    """The card goes up as a PR review, and a review carries an `event`. COMMENT leaves the
+    bot advisory; APPROVE or REQUEST_CHANGES would make it a merge gate -- which is a
+    different thing from what the workflow's `contents: read` was reasoned about, and a
+    change no one would see in a diff that only touches a JSON literal. Pin the event, and
+    pin that the one POST in the file is the review call."""
+    src = (HERE / "_publish.py").read_text(encoding="utf-8")
+    bad = 0
+    for verdict in ("APPROVE", "REQUEST_CHANGES"):
+        if f'"{verdict}"' in src or f"'{verdict}'" in src:
+            print(f"\u274c _publish.py names {verdict}; this bot is advisory and must only ever "
+                  f"send event COMMENT -- a review that gates merge changes what the "
+                  f"workflow's permissions mean")
+            bad += 1
+    posts = re.findall(r'_api\(\s*f?"([^"]+)"\s*,\s*method="POST"', src)
+    if posts != ["pulls/{pr}/reviews"]:
+        print(f"\u274c _publish.py's POST call sites are {posts}; expected exactly one, "
+              f"pulls/{{pr}}/reviews -- the card is published as a review with inline "
+              f"comments, not as a top-level issue comment")
+        bad += 1
+    if '"event": "COMMENT"' not in src:
+        print("\u274c _publish.py does not set event COMMENT on the review it builds")
+        bad += 1
+    if not bad:
+        print("\u2705 _publish.py posts exactly one review, event COMMENT, never APPROVE/"
+              "REQUEST_CHANGES")
+    return bad
+
+
+def check_anchoring_has_a_citation_check():
+    """_publish.py anchors a finding inline only when check_citations.py vouched for its
+    citation; with no citations.txt it anchors nothing and the whole card falls back into
+    the summary. That degradation is silent and looks identical to a card whose findings
+    simply cite nothing in the diff. So the two halves must stay wired: run_one.sh has to
+    run the checker, and _collect.py has to carry its verdict into the report dir
+    _publish.py reads."""
+    run_one = (HERE / "run_one.sh").read_text(encoding="utf-8")
+    lib = (HERE / "_lib.py").read_text(encoding="utf-8")
+    broken = []
+    if not (HERE / "check_citations.py").is_file():
+        broken.append("check_citations.py is missing")
+    if "check_citations.py" not in run_one:
+        broken.append("run_one.sh never runs check_citations.py")
+    if 'tee "$W/citations.txt"' not in run_one:
+        broken.append("run_one.sh does not write citations.txt")
+    if "citations.txt" not in lib:
+        broken.append("_lib.py does not collect citations.txt into the report dir")
+    if broken:
+        print("\u274c inline anchoring is wired to nothing: %s -- every finding would "
+              "silently fall back to the summary" % "; ".join(broken))
+        return 1
+    print("\u2705 anchoring wired: run_one.sh -> citations.txt -> _lib.py OPTIONAL -> _publish.py")
+    return 0
+
+
+def check_range_anchor_shape():
+    """A span anchor is a second way to fail an all-or-nothing call, and it is invisible in
+    a diff that only edits a dict literal. GitHub spells a span as start_line..line with a
+    side for each end; it refuses the whole review -- summary and every other comment with
+    it -- if start_line is not strictly below line, if its side is missing, or if the span
+    reaches outside the hunk. So build a review over a synthetic diff whose file has two
+    hunks, and assert the shape of what comes out rather than the source that produced it.
+    """
+    import importlib.util
+
+    spec = importlib.util.spec_from_file_location("_publish", HERE / "_publish.py")
+    pub = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(pub)
+    diff = (
+        "diff --git a/x.py b/x.py\n--- a/x.py\n+++ b/x.py\n"
+        "@@ -10,2 +10,4 @@\n ten\n+eleven\n+twelve\n thirteen\n"
+        "@@ -50,1 +50,2 @@\n fifty\n+fiftyone\n"
+    )
+    card = (
+        "## card\n\n"
+        "\u26a0\ufe0f x.py:11-13 is a span inside one hunk.\n"
+        "\U0001f534 x.py:11-51 is a span across the gap between two hunks.\n"
+        "\U0001f4dd x.py:900-910 is a span the diff never reaches.\n"
+    )
+    cs = pub.build_review("1", card, diff, set(), "a" * 40)["comments"]
+    bad = []
+    for c in cs:
+        if "start_line" in c:
+            if not c["start_line"] < c["line"]:
+                bad.append(f"start_line {c['start_line']} is not below line {c['line']}")
+            if c.get("start_side") != c.get("side"):
+                bad.append(f"span on {c['path']} names side {c.get('side')!r} but "
+                           f"start_side {c.get('start_side')!r}")
+        elif "start_side" in c:
+            bad.append(f"{c['path']}:{c['line']} carries start_side with no start_line")
+    spans = [c for c in cs if "start_line" in c]
+    if len(spans) != 1 or (spans and (spans[0]["start_line"], spans[0]["line"]) != (11, 13)):
+        bad.append(f"expected exactly the one in-hunk span 11-13, got "
+                   f"{[(c['start_line'], c['line']) for c in spans]} -- a span across the "
+                   f"gap between hunks is refused like any line outside the diff")
+    if bad:
+        print("\u274c _publish.py builds a span anchor GitHub will not take: %s"
+              % "; ".join(bad))
+        return 1
+    print("\u2705 span anchors well formed: start_line < line, matching sides, inside one hunk")
+    return 0
+
+
+def check_unanchorable_citations_are_linked():
+    """The other half of the same change: a citation GitHub will not take a comment on gets
+    a blob permalink in the summary instead of bare `path:line` text. It is pinned to the
+    head SHA -- a branch link drifts off the code it was written about, which is a wrong
+    anchor arriving late. And it is gated exactly as anchoring is, because a link to the
+    wrong code is worse than no link."""
+    import importlib.util
+
+    spec = importlib.util.spec_from_file_location("_publish", HERE / "_publish.py")
+    pub = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(pub)
+    diff = "diff --git a/x.py b/x.py\n--- a/x.py\n+++ b/x.py\n@@ -10,2 +10,3 @@\n ten\n+eleven\n twelve\n"
+    card = "## card\n\n\U0001f4dd x.py:900 is context this PR does not touch.\n"
+    sha = "b" * 40
+    want = f"/blob/{sha}/x.py#L900"
+    bad = []
+    body = pub.build_review("1", card, diff, set(), sha)["body"]
+    if want not in body:
+        bad.append("an out-of-diff citation got no permalink pinned to the head SHA")
+    if "x.py:900 is context" not in body:
+        bad.append("the human-readable citation was replaced rather than added to")
+    # flagged -> no link, and no checker at all -> no link
+    if "/blob/" in pub.build_review("1", card, diff, {"x.py:900"}, sha)["body"]:
+        bad.append("a citation check_citations.py flagged was still linked")
+    if "/blob/" in pub.build_review("1", card, diff, None, sha)["body"]:
+        bad.append("a card the checker never ran on was still linked")
+    if bad:
+        print("\u274c _publish.py's permalinks are not gated as anchors are: %s" % "; ".join(bad))
+        return 1
+    print("\u2705 out-of-diff citations linked to the head SHA, and only when the checker vouched")
+    return 0
+
+
 def main():
     skill = _skill_md()
     bad = 0
@@ -160,8 +420,16 @@ def main():
             bad += 1
     bad += check_fail_classes()
     bad += check_budget_fits()
-    bad += check_watchdog_owner()
+    bad += check_owner_fallbacks()
+    bad += check_gate_watch_window()
+    bad += check_no_self_trigger()
+    bad += check_notified_handoff()
     bad += check_runner_label_exclusive()
+    bad += check_publish_needs_post_flag()
+    bad += check_publish_review_is_advisory()
+    bad += check_anchoring_has_a_citation_check()
+    bad += check_range_anchor_shape()
+    bad += check_unanchorable_citations_are_linked()
     print(f"{'OK' if bad == 0 else 'DRIFT'}: {bad} drift(s)")
     return bad
 

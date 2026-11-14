@@ -76,10 +76,19 @@ def _has_rocm_toolchain() -> bool:
 # are the supported fallback without it. Linux keeps failing loudly instead,
 # where ROCm is a hard prerequisite and its absence is a broken install.
 if not AITER_TRITON_ONLY and sys.platform == "win32" and not _has_rocm_toolchain():
+    import importlib.util
+
     AITER_TRITON_ONLY = True
+    # rocm[devel] ships its toolchain as an archive that stays packed until
+    # `rocm-sdk init` runs, so an installed wheel is not yet a usable toolchain.
+    if importlib.util.find_spec("rocm_sdk_devel") is not None:
+        hint = "Run `rocm-sdk init` to unpack the rocm[devel] toolchain"
+    else:
+        hint = "Install rocm[devel] or the HIP SDK"
     logger.warning(
         "No ROCm install found; falling back to the Triton ops. "
-        "Install the HIP SDK and set HIP_PATH to build the C++/HIP ops."
+        "%s to build the C++/HIP ops.",
+        hint,
     )
 
 # Use bundled pre-compiled FlyDSL cache unless the user overrides via env var.
@@ -113,6 +122,7 @@ else:
     from .ops.quant import *
     from .ops.gemm_op_a8w8 import *
     from .ops.gemm_op_a16w16 import *
+    from .ops.gemm_op_a16w8 import *
     from .ops.gemm_op_a4w4 import *
     from .ops.gemm_op_a6w6 import *
     from .ops.gemm_op_a6w4 import *
@@ -134,6 +144,7 @@ else:
     from .ops.moe_mxfp4_aux import *
     from .ops.mla_sparse_prefill import *
     from .ops.pa_sparse_prefill_opus import *
+    from .ops.fused_norm_rope_attn_rope_cast import *
     from .ops.msa_attention import *
     from .ops.pos_encoding import *
     from .ops.cache import *
@@ -143,10 +154,13 @@ else:
     from .ops.topk import *
     from .ops.topk_plain import topk_plain  # noqa: F401
 
-    # topk_select imports flydsl at module scope and flydsl publishes
-    # Linux-only wheels, so the op is unavailable on Windows.
+    # topk_select requires the optional, Linux-only FlyDSL package.
     if sys.platform != "win32":
-        from .ops.topk_select import topk_select, topk_select_backend  # noqa: F401
+        try:
+            from .ops.topk_select import topk_select, topk_select_backend  # noqa: F401
+        except ModuleNotFoundError as exc:
+            if exc.name != "flydsl":
+                raise
 
     from .ops.mha import *
     from .ops.vsa_sparse_attention import vsa_sparse_attention  # noqa: F401
@@ -164,6 +178,7 @@ else:
     from .ops.inverse_rope_group_quant import *
     from .ops.groupnorm import *
     from .ops.mhc import *
+    from .ops.mega_mhc import *
     from .ops.causal_conv1d_update import *
     from .ops.fused_split_gdr_update import *
     from .ops.gdr_decode_packed_bf16 import *
@@ -198,3 +213,17 @@ try:
 except (ImportError, AttributeError):
     # Iris or triton not available, skip import
     IRIS_COMM_AVAILABLE = False
+
+
+def __getattr__(name: str):
+    """Lazy public exports that must not run at ``import aiter`` time.
+
+    ``sp_qkv_fused`` is the neutral SP4 QKV contract.  Resolving it here keeps
+    ``import aiter`` from eagerly importing the ops package path; the op itself
+    imports only the routing interface.
+    """
+    if name == "sp_qkv_fused":
+        from aiter.ops.gemm_fusion.sp_qkv.op import sp_qkv_fused
+
+        return sp_qkv_fused
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

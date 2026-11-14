@@ -7,14 +7,15 @@ import triton
 from triton.experimental import gluon
 from triton.experimental.gluon import language as gl
 
-from aiter.ops.triton.utils._triton.pid_preprocessing import pid_grid, remap_xcd
+from aiter.ops.triton._triton_kernels.common.pid_preprocessing import (
+    pid_grid,
+    remap_xcd,
+)
 
 
 @triton.heuristics(
     {
         "EVEN_K": lambda args: args["K"] % args["BLOCK_SIZE_K"] == 0,
-        "GRID_MN": lambda args: triton.cdiv(args["M"], args["BLOCK_SIZE_M"])
-        * triton.cdiv(args["N"], args["BLOCK_SIZE_N"]),
     }
 )
 @gluon.jit
@@ -47,7 +48,6 @@ def _gemm_a8w8_kernel(
     BLOCK_SIZE_K: gl.constexpr,
     GROUP_SIZE_M: gl.constexpr,
     EVEN_K: gl.constexpr,
-    GRID_MN: gl.constexpr,
     NUM_XCDS: gl.constexpr,
     NUM_WARPS: gl.constexpr,
     FP8_FORMAT: gl.constexpr,
@@ -74,7 +74,8 @@ def _gemm_a8w8_kernel(
     num_pid_m = gl.cdiv(M, BLOCK_SIZE_M)
     num_pid_n = gl.cdiv(N, BLOCK_SIZE_N)
 
-    pid = remap_xcd(pid, GRID_MN, NUM_XCDS)
+    grid_mn = num_pid_m * num_pid_n
+    pid = remap_xcd(pid, grid_mn, NUM_XCDS)
 
     pid_m, pid_n = pid_grid(pid, num_pid_m, num_pid_n, GROUP_SIZE_M)
 
@@ -294,12 +295,6 @@ def _gemm_a8w8_kernel(
     gl.amd.cdna4.buffer_store(stored_value=c, ptr=c_ptr, offsets=c_offs, mask=c_mask)
 
 
-@triton.heuristics(
-    {
-        "GRID_MN": lambda args: triton.cdiv(args["M"], args["BLOCK_SIZE_M"])
-        * triton.cdiv(args["N"], args["BLOCK_SIZE_N"]),
-    }
-)
 @gluon.jit
 def _gemm_a8w8_preshuffled_kernel(
     # Pointers to matrices
@@ -329,7 +324,6 @@ def _gemm_a8w8_preshuffled_kernel(
     BLOCK_SIZE_N: gl.constexpr,
     BLOCK_SIZE_K: gl.constexpr,
     GROUP_SIZE_M: gl.constexpr,
-    GRID_MN: gl.constexpr,
     NUM_XCDS: gl.constexpr,
     NUM_WARPS: gl.constexpr,
     FP8_FORMAT: gl.constexpr,
@@ -356,7 +350,8 @@ def _gemm_a8w8_preshuffled_kernel(
     num_pid_m = gl.cdiv(M, BLOCK_SIZE_M)
     num_pid_n = gl.cdiv(N, BLOCK_SIZE_N)
 
-    pid = remap_xcd(pid, GRID_MN, NUM_XCDS)
+    grid_mn = num_pid_m * num_pid_n
+    pid = remap_xcd(pid, grid_mn, NUM_XCDS)
 
     pid_m, pid_n = pid_grid(pid, num_pid_m, num_pid_n, GROUP_SIZE_M)
 

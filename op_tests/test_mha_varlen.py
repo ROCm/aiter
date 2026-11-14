@@ -2,6 +2,8 @@
 # Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
 import argparse
+import ast
+import inspect
 import itertools
 
 import pandas as pd
@@ -11,6 +13,7 @@ import torch
 import aiter
 from aiter import dtypes
 from aiter.jit.utils.chip_info import get_gfx
+from aiter.ops import mha as mha_ops
 from aiter.ops.mha import fmha_fwd_bf16_opus_varlen_fwd
 from aiter.test_common import benchmark, run_perftest
 from aiter.test_mha_common import (
@@ -590,6 +593,14 @@ def test_flash_attn_varlen_func(
     print(f"Output Pytorch max diff: {ref_diff}")
     out_tol = max(4 * ref_diff, 0.01)
     assert out_diff <= out_tol, f"forward diff {out_diff} exceeds tolerance {out_tol}"
+    # A max bound cannot see bf16 truncation (it lands exactly on 2x); the mean
+    # error can: truncating stays above the torch reference, rounding below it.
+    if dtype == dtypes.bf16:
+        mean_diff = abs_diff.float().mean().item()
+        ref_mean_diff = (out_pt - out_ref).abs().float().mean().item()
+        assert (
+            mean_diff <= ref_mean_diff
+        ), f"forward mean diff {mean_diff} exceeds the torch bf16 reference {ref_mean_diff}"
 
     # TODO: Support varlen bwd for bias
     if bias_type == "bias":
@@ -835,6 +846,10 @@ def test_varlen_flash_attn_seq_padding(
         f"\nGroup Mode Test (bs={batch_size}, {gqa_ratio}, {padding_scenario}, {dtype}, local={local}) | Max diff: {out_diff} | Ref diff: {ref_diff} | Tol: {out_tol}"
     )
     assert out_diff <= out_tol
+    if dtype == dtypes.bf16:
+        mean_diff = (out_ck_masked - out_ref_masked).abs().float().mean().item()
+        ref_mean_diff = (out_pt_masked - out_ref_masked).abs().float().mean().item()
+        assert mean_diff <= ref_mean_diff
 
     def _mask_grad(tensor, lens):
         masked = tensor.clone()
@@ -1355,6 +1370,141 @@ _OPUS_D192_GROUP_CASES = [
 ]
 
 
+def _run_opus_group_case(
+    seqlens_q,
+    seqlens_kv,
+    nheads,
+    nheads_k,
+    kv_pad,
+    causal,
+    d_qk,
+    d_v,
+    window_size_left=-1,
+    q_pad=0,
+):
+    """Shared body: OPUS group/varlen forward with LSE, per group vs attention_ref.
+
+    `window_size_left` >= 0 adds the left-bounded causal window (D=128 only); -1 keeps
+    the unbounded mask. The window is per sequence, so each group's reference gets it
+    independently.
+
+    `q_pad` rounds each group's Q rows up to a multiple of it and passes the physical
+    offsets as seqstart_q_pad, the mirror of `kv_pad`. The two exercise different
+    offsets: KV padding only moves where K/V are READ, while Q padding also moves where
+    O and LSE are WRITTEN (q_batch_base / o_batch_base / lse_batch_base all derive from
+    seqstart_q_pad), so a kernel that confused the real and physical Q starts would place
+    every group's output rows wrong and only this covers it.
+    """
+    assert len(seqlens_q) == len(seqlens_kv)
+
+    torch.manual_seed(0)
+    window_size = (window_size_left, 0) if window_size_left >= 0 else (-1, -1)
+    tag = f"opus-d{d_qk}-group" + (
+        f"-win{window_size_left}" if window_size_left >= 0 else ""
+    )
+
+    def _cumsum(lengths):
+        return torch.tensor(
+            [0] + list(torch.tensor(lengths).cumsum(0).tolist()),
+            dtype=torch.int32,
+            device="cuda",
+        )
+
+    phys_kv = [
+        ((s + kv_pad - 1) // kv_pad) * kv_pad if kv_pad else s for s in seqlens_kv
+    ]
+    phys_q = [((s + q_pad - 1) // q_pad) * q_pad if q_pad else s for s in seqlens_q]
+    total_q = sum(phys_q)
+    cu_q = _cumsum(seqlens_q)
+    cu_q_pad = _cumsum(phys_q)
+    cu_k = _cumsum(seqlens_kv)
+    cu_k_pad = _cumsum(phys_kv)
+
+    q = torch.randn(total_q, nheads, d_qk, device="cuda", dtype=dtypes.bf16)
+    k = torch.randn(sum(phys_kv), nheads_k, d_qk, device="cuda", dtype=dtypes.bf16)
+    v = torch.randn(sum(phys_kv), nheads_k, d_v, device="cuda", dtype=dtypes.bf16)
+    if kv_pad:
+        for g, (real, phys) in enumerate(zip(seqlens_kv, phys_kv)):
+            gap = slice(int(cu_k_pad[g]) + real, int(cu_k_pad[g]) + phys)
+            k[gap] = float("nan")
+            v[gap] = float("nan")
+    if q_pad:
+        for g, (real, phys) in enumerate(zip(seqlens_q, phys_q)):
+            q[slice(int(cu_q_pad[g]) + real, int(cu_q_pad[g]) + phys)] = float("nan")
+
+    with torch.no_grad():
+        out, lse = fmha_fwd_bf16_opus_varlen_fwd(
+            q,
+            k,
+            v,
+            softmax_scale=d_qk**-0.5,
+            causal=causal,
+            seqstart_q=cu_q,
+            seqstart_k=cu_k,
+            seqstart_q_pad=cu_q_pad if q_pad else None,
+            seqstart_k_pad=cu_k_pad if kv_pad else None,
+            max_seqlen_q=max(seqlens_q),
+            max_seqlen_k=max(seqlens_kv),
+            return_lse=True,
+            window_size_left=window_size_left,
+        )
+
+    assert tuple(lse.shape) == (nheads, total_q), f"lse shape {tuple(lse.shape)}"
+    # Only the real rows: under Q padding the gap rows of out/lse are never written, so
+    # they still hold whatever torch.empty left there and a blanket check would be noise.
+    for g in range(len(seqlens_q)):
+        rows = slice(int(cu_q_pad[g]), int(cu_q_pad[g]) + seqlens_q[g])
+        assert not torch.isnan(out[rows]).any(), "read into a padding gap"
+        assert not torch.isnan(lse[:, rows]).any(), "read into a padding gap"
+
+    max_diff = 0.0
+    for g in range(len(seqlens_q)):
+        ql = int(cu_q_pad[g])  # physical start, real length -- as for K/V below
+        qh = ql + seqlens_q[g]
+        kl = int(cu_k_pad[g])  # physical start, real length
+        kh = kl + seqlens_kv[g]
+        if seqlens_q[g] == 0:
+            # No query rows, so the group owns no output and there is nothing to
+            # compare. What matters is that it consumed no Q blocks and left the
+            # neighbouring groups' rows alone, which the other groups' checks cover.
+            continue
+        if seqlens_kv[g] == 0:
+            # Assert the contract exactly rather than through attention_ref, whose
+            # degenerate-shape behaviour is its own question.
+            assert torch.equal(
+                out[ql:qh], torch.zeros_like(out[ql:qh])
+            ), f"group {g} has no keys, out must be exactly 0"
+            assert torch.isneginf(
+                lse[:, ql:qh]
+            ).all(), f"group {g} has no keys, lse must be -inf"
+            continue
+        qg = q[ql:qh].unsqueeze(0)
+        kg = k[kl:kh].unsqueeze(0)
+        vg = v[kl:kh].unsqueeze(0)
+        out_ref, _, _ = attention_ref(
+            qg, kg, vg, causal=causal, window_size=window_size
+        )
+        out_pt, _, _ = attention_ref(
+            qg,
+            kg,
+            vg,
+            causal=causal,
+            window_size=window_size,
+            upcast=False,
+            reorder_ops=True,
+        )
+        tol = max(2 * (out_pt - out_ref).abs().max().item(), 0.01)
+        diff = (out[ql:qh].unsqueeze(0) - out_ref).abs().max().item()
+        max_diff = max(max_diff, diff)
+        assert diff <= tol, f"group {g} diff {diff} > tol {tol}"
+        opus_check_lse(
+            f"{tag} g{g}",
+            lse[:, ql:qh],
+            opus_ref_lse(qg, kg, causal, window_size_left=window_size_left)[0],
+        )
+    print(f"[{tag}] max diff across groups: {max_diff}")
+
+
 @pytest.mark.parametrize("causal", [False, True])
 @pytest.mark.parametrize(
     "seqlens_q,seqlens_kv,nheads,nheads_k,kv_pad",
@@ -1370,81 +1520,429 @@ def test_fmha_fwd_bf16_opus_d192_v128_group(
     """OPUS D=192 group/varlen forward with LSE, per group against attention_ref."""
     if get_gfx() != "gfx950":
         pytest.skip("opus D=192 kernel requires gfx950")
-    assert len(seqlens_q) == len(seqlens_kv)
+    _run_opus_group_case(
+        seqlens_q, seqlens_kv, nheads, nheads_k, kv_pad, causal, 192, 128
+    )
+
+
+@pytest.mark.parametrize("causal", [False, True])
+@pytest.mark.parametrize(
+    "seqlens_q,seqlens_kv,nheads,nheads_k,kv_pad",
+    _OPUS_D192_GROUP_CASES,
+    ids=[
+        f"g{len(a)}_h{h}_hkv{hk}_pad{p}" + ("_emptykv" if 0 in b else "")
+        for (a, b, h, hk, p) in _OPUS_D192_GROUP_CASES
+    ],
+)
+def test_fmha_fwd_bf16_opus_d128_group(
+    seqlens_q, seqlens_kv, nheads, nheads_k, kv_pad, causal, monkeypatch
+):
+    """OPUS D=128 group/varlen forward with LSE, per group against attention_ref.
+
+    The same shape matrix as the D=192 test: the two kernels share the group-mode
+    contract (packed THD, KV padding, cross-attention, empty groups), so the cases
+    that pin it down are the same. Env-gated like the dense D=128 path.
+    """
+    if get_gfx() != "gfx950":
+        pytest.skip("opus D=128 kernel requires gfx950")
+    monkeypatch.setenv("AITER_ENABLE_FMHA_OPUS", "1")
+    _run_opus_group_case(
+        seqlens_q, seqlens_kv, nheads, nheads_k, kv_pad, causal, 128, 128
+    )
+
+
+# Longer group-mode shapes for D=128, both mask modes. _OPUS_D192_GROUP_CASES pins the
+# structural edges (empty groups, KV padding, cross-attention, partial tails) with short
+# sequences; these add long sequences, large batches and mixed lengths.
+#   (q seqlens, kv seqlens, nheads, nheads_k, kv_pad)
+_OPUS_D128_GROUP_LONG_CASES = [
+    ([8400] * 4, [8400] * 4, 4, 4, 0),  # long, uniform
+    ([7500, 9400, 8100, 8900], [7500, 9400, 8100, 8900], 4, 4, 0),  # long, jagged
+    ([8400] * 16, [8400] * 16, 4, 4, 0),  # long, larger batch
+    ([16354], [16354], 4, 4, 0),  # one long sequence
+    ([512] * 7 + [16354], [512] * 7 + [16354], 4, 4, 0),  # one long among short
+    ([2048] * 32, [2048] * 32, 8, 2, 0),  # mid lengths, large batch, GQA
+    ([64] * 64, [64] * 64, 8, 2, 0),  # many tiny groups
+    ([1] * 64, [4096] * 64, 16, 4, 0),  # decode: one query row against a long context
+    ([4096] * 8, [512] * 8, 32, 8, 0),  # cross q>k, GQA 4:1
+    ([512] * 8, [4096] * 8, 16, 1, 0),  # cross q<k, MQA
+    (
+        [3000, 50, 12000, 700],
+        [3000, 50, 12000, 700],
+        8,
+        8,
+        0,
+    ),  # orders of magnitude apart
+    ([9000, 9000], [9000, 9000], 4, 4, 1024),  # long + KV padding
+]
+
+
+@pytest.mark.parametrize("causal", [False, True])
+@pytest.mark.parametrize(
+    "seqlens_q,seqlens_kv,nheads,nheads_k,kv_pad",
+    _OPUS_D128_GROUP_LONG_CASES,
+    ids=[
+        f"g{len(a)}_max{max(a)}_h{h}_hkv{hk}_pad{p}"
+        for (a, b, h, hk, p) in _OPUS_D128_GROUP_LONG_CASES
+    ],
+)
+def test_fmha_fwd_bf16_opus_d128_group_long(
+    seqlens_q, seqlens_kv, nheads, nheads_k, kv_pad, causal, monkeypatch
+):
+    """OPUS D=128 group/varlen with long sequences and large batches.
+
+    Separate from test_fmha_fwd_bf16_opus_d128_group, whose shapes are shared with the
+    D=192 test and span only a few Q blocks, so the flat grid, the group lookup and the
+    KV traversal are exercised there only at their smallest.
+    """
+    if get_gfx() != "gfx950":
+        pytest.skip("opus D=128 kernel requires gfx950")
+    monkeypatch.setenv("AITER_ENABLE_FMHA_OPUS", "1")
+    _run_opus_group_case(
+        seqlens_q, seqlens_kv, nheads, nheads_k, kv_pad, causal, 128, 128
+    )
+
+
+# Group mode crossed with the left-bounded causal window: the window is per sequence,
+# so a group shorter than the window must still mask on the diagonal and a group longer
+# than it must drop its early keys. Windows are only causal, hence no causal=False.
+#   (q seqlens, kv seqlens, nheads, nheads_k, kv_pad, window_size_left)
+_OPUS_D128_GROUP_SWA_CASES = [
+    # Window width against a fixed profile: the boundaries LOCAL's bound moves across.
+    ([64, 200, 500], [64, 200, 500], 8, 2, 0, 0),  # diagonal key only
+    ([64, 200, 500], [64, 200, 500], 8, 2, 0, 1),  # two keys per row
+    ([64, 200, 500], [64, 200, 500], 8, 2, 0, 63),  # inside one KV tile
+    ([64, 200, 500], [64, 200, 500], 8, 2, 0, 64),  # exactly one KV tile
+    ([64, 200, 500], [64, 200, 500], 8, 2, 0, 128),  # wider than the first group
+    ([64, 200, 500], [64, 200, 500], 8, 2, 0, 255),  # one row short of a Q block
+    ([64, 200, 500], [64, 200, 500], 8, 2, 0, 256),  # exactly a Q block
+    ([64, 200, 500], [64, 200, 500], 8, 2, 0, 4096),  # wider than every group
+    # Wide windows against groups long enough for them to actually bind -- against the
+    # 64/200/500 profile above every one of them would be wider than the whole group and
+    # collapse to plain causal.
+    ([2000, 3000], [2000, 3000], 8, 2, 0, 1536),
+    ([2000, 3000], [2000, 3000], 8, 2, 0, 1537),  # odd window: its bound falls mid-tile
+    ([2000, 3000], [2000, 3000], 8, 2, 0, 2048),
+    ([2000, 3000], [2000, 3000], 4, 4, 0, 1024),  # MHA
+    # Partial tails and odd lengths, where the window and the tail mask interact.
+    ([1023, 65], [1023, 65], 16, 4, 0, 100),  # odd lengths, partial tiles
+    ([1, 255, 257, 511], [1, 255, 257, 511], 8, 8, 0, 128),  # Q-block boundaries
+    ([513, 1025], [513, 1025], 4, 4, 0, 257),  # window straddles a block
+    # Structural shapes: these never reach LOCAL in the non-window group cases.
+    ([256, 256], [0, 256], 8, 2, 0, 64),  # empty group + window
+    ([256, 0, 256], [256, 256, 256], 8, 2, 0, 64),  # empty query group + window
+    ([200, 64, 700], [200, 64, 700], 8, 2, 256, 128),  # KV padded + window
+    ([100, 100], [0, 300], 8, 2, 64, 32),  # empty kv + KV padding + window
+    ([777], [777], 8, 2, 0, 128),  # single group
+    ([64] * 17, [64] * 17, 8, 8, 0, 32),  # many groups, all below the window
+    # Cross attention: the bottom-right alignment shifts where the window sits.
+    ([300, 77, 1024], [700, 200, 300], 4, 4, 0, 64),  # cross, mixed
+    ([128, 512], [512, 128], 8, 2, 0, 96),  # cross, one each way
+    ([1024, 8], [1, 8], 2, 1, 0, 16),  # 1024 queries vs a single key, MQA
+    ([1, 1, 1], [256, 512, 64], 16, 4, 0, 32),  # decode-shaped groups
+    # GQA / MQA / MHA fan-out under a window.
+    ([512, 1000], [512, 1000], 32, 8, 0, 128),  # GQA 4:1
+    ([512, 1000], [512, 1000], 16, 1, 0, 128),  # MQA
+    ([512, 1000], [512, 1000], 8, 8, 0, 128),  # MHA
+    # Long sequences, alone and beside short ones.
+    ([16354], [16354], 4, 4, 0, 256),  # one long sequence
+    ([512] * 7 + [16354], [512] * 7 + [16354], 4, 4, 0, 256),  # one long + short
+    ([8400] * 4, [8400] * 4, 4, 4, 0, 256),  # long, uniform
+]
+
+
+@pytest.mark.parametrize(
+    "seqlens_q,seqlens_kv,nheads,nheads_k,kv_pad,window_size_left",
+    _OPUS_D128_GROUP_SWA_CASES,
+    ids=[
+        f"g{len(a)}_h{h}_hkv{hk}_pad{p}_win{w}"
+        for (a, b, h, hk, p, w) in _OPUS_D128_GROUP_SWA_CASES
+    ],
+)
+def test_fmha_fwd_bf16_opus_d128_group_swa(
+    seqlens_q, seqlens_kv, nheads, nheads_k, kv_pad, window_size_left, monkeypatch
+):
+    """OPUS D=128 group/varlen with a sliding window.
+
+    Distinct from test_fmha_fwd_bf16_opus_d128_group because GROUP_MODE and LOCAL are
+    separate kernel instances: the group cases never select LOCAL, and the dense SWA
+    cases in test_mha.py never select GROUP_MODE. This is the only test that covers
+    both at once, where the per-sequence base and the window bound interact.
+    """
+    if get_gfx() != "gfx950":
+        pytest.skip("opus D=128 kernel requires gfx950")
+    monkeypatch.setenv("AITER_ENABLE_FMHA_OPUS", "1")
+    _run_opus_group_case(
+        seqlens_q,
+        seqlens_kv,
+        nheads,
+        nheads_k,
+        kv_pad,
+        causal=True,
+        d_qk=128,
+        d_v=128,
+        window_size_left=window_size_left,
+    )
+
+
+# Q-side padding: each group's Q rows rounded up, physical offsets in seqstart_q_pad.
+# The KV-padded cases above only move where K/V are read; this is the only coverage of
+# the offsets that move where O and LSE are WRITTEN.
+#   (q seqlens, kv seqlens, nheads, nheads_k, q_pad, window_size_left)
+_OPUS_D128_GROUP_QPAD_CASES = [
+    ([100, 300], [100, 300], 8, 2, 128, -1),  # pad < one Q block
+    ([100, 300], [100, 300], 8, 2, 128, 64),  # same, windowed
+    ([257, 513], [257, 513], 4, 4, 256, -1),  # pad == the Q block, partial tails
+    ([257, 513], [257, 513], 4, 4, 256, 128),  # same, windowed
+    ([1, 1000], [1, 1000], 16, 4, 512, -1),  # pad >> one group's real rows
+    ([700, 64, 900], [700, 64, 900], 8, 8, 256, 256),  # three groups, windowed
+    ([512, 0, 512], [512, 512, 512], 8, 2, 256, -1),  # empty query group + padding
+    ([300, 77], [900, 200], 4, 4, 128, -1),  # cross-attention + padding
+]
+
+
+@pytest.mark.parametrize("causal", [False, True])
+@pytest.mark.parametrize(
+    "seqlens_q,seqlens_kv,nheads,nheads_k,q_pad,window_size_left",
+    _OPUS_D128_GROUP_QPAD_CASES,
+    ids=[
+        f"g{len(a)}_qpad{p}_h{h}_hkv{hk}_win{w}"
+        for (a, b, h, hk, p, w) in _OPUS_D128_GROUP_QPAD_CASES
+    ],
+)
+def test_fmha_fwd_bf16_opus_d128_group_qpad(
+    seqlens_q,
+    seqlens_kv,
+    nheads,
+    nheads_k,
+    q_pad,
+    window_size_left,
+    causal,
+    monkeypatch,
+):
+    """OPUS D=128 group/varlen with Q-side padding (seqstart_q_pad).
+
+    The kernel derives q_batch_base, o_batch_base and lse_batch_base from seqstart_q_pad
+    but every length and mask bound from seqstart_q. Nothing else covers that split: a
+    kernel that used the real starts for the bases would write every group's rows at the
+    wrong offset, and with no padding the two arrays are equal so the bug would hide.
+    """
+    if get_gfx() != "gfx950":
+        pytest.skip("opus D=128 kernel requires gfx950")
+    if window_size_left >= 0 and not causal:
+        pytest.skip("a window needs causal")
+    monkeypatch.setenv("AITER_ENABLE_FMHA_OPUS", "1")
+    _run_opus_group_case(
+        seqlens_q,
+        seqlens_kv,
+        nheads,
+        nheads_k,
+        kv_pad=0,
+        causal=causal,
+        d_qk=128,
+        d_v=128,
+        window_size_left=window_size_left,
+        q_pad=q_pad,
+    )
+
+
+# ---------------------------------------------------------------------------
+# OPUS varlen dispatch. Everything above calls fmha_fwd_bf16_opus_varlen_fwd
+# directly, which proves the kernel computes the right thing but never executes
+# can_impl_fmha_fwd_bf16_opus_varlen -- the gate that decides whether a call
+# reaches that kernel at all. These go through the public entry point instead,
+# so the conditions the kernel relies on are the ones under test.
+# ---------------------------------------------------------------------------
+
+
+def _opus_varlen_dispatch_record(monkeypatch):
+    """Count calls reaching the OPUS varlen entry point from the public API."""
+    calls = {"n": 0}
+    real = mha_ops.fmha_fwd_bf16_opus_varlen_fwd
+
+    def spy(*args, **kwargs):
+        calls["n"] += 1
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(mha_ops, "fmha_fwd_bf16_opus_varlen_fwd", spy)
+    return calls
+
+
+# (id, enabled, hdim, dtype, causal, window_size, expect_opus)
+_OPUS_VARLEN_DISPATCH_CASES = [
+    ("causal_window", True, 128, "bf16", True, (128, 0, 0), True),
+    ("causal_only", True, 128, "bf16", True, (-1, -1, 0), True),
+    ("no_mask", True, 128, "bf16", False, (-1, -1, 0), True),
+    # The gate's rejections. Each is a shape the kernel has no instance for, so
+    # reaching it would not be a slowdown but a wrong answer or a bad launch.
+    ("env_off", False, 128, "bf16", True, (128, 0, 0), False),
+    ("window_without_causal", True, 128, "bf16", False, (128, -1, 0), False),
+    ("right_window", True, 128, "bf16", True, (128, 64, 0), False),
+    ("right_zero_without_causal", True, 128, "bf16", False, (-1, 0, 0), False),
+    ("hdim64", True, 64, "bf16", True, (128, 0, 0), False),
+    ("fp16", True, 128, "fp16", True, (128, 0, 0), False),
+]
+
+
+@pytest.mark.parametrize(
+    "enabled,hdim,dtype_name,causal,window_size,expect_opus",
+    [c[1:] for c in _OPUS_VARLEN_DISPATCH_CASES],
+    ids=[c[0] for c in _OPUS_VARLEN_DISPATCH_CASES],
+)
+def test_flash_attn_varlen_func_opus_dispatch(
+    enabled, hdim, dtype_name, causal, window_size, expect_opus, monkeypatch
+):
+    """The public varlen entry point routes to OPUS exactly when the gate allows it.
+
+    The kernel has instances for three masks only, and LOCAL implies CAUSAL, so a
+    window without `causal` -- including a bare `window_size_right == 0`, which is a
+    right bound of its own -- has no instance to dispatch to. Those cases must land on
+    another backend rather than be computed as plain causal. The negative cases are the
+    point of this test: the positive ones only confirm the shape would otherwise qualify.
+    """
+    if get_gfx() != "gfx950":
+        pytest.skip("opus varlen kernels require gfx950")
+    monkeypatch.setenv("AITER_ENABLE_FMHA_OPUS", "1" if enabled else "0")
+
+    seqlens = [256, 192, 320]
+    nheads, nheads_k = 8, 2
+    max_seqlen = max(seqlens)
+    # Keep the window under max_seqlen_k: the entry point folds a wider one away to -1,
+    # which would turn the windowed cases into plain causal before the gate sees them.
+    assert window_size[0] < max_seqlen
 
     torch.manual_seed(0)
-    d_qk, d_v = 192, 128
+    total = sum(seqlens)
+    cu_seqlens = torch.tensor(
+        [0] + list(itertools.accumulate(seqlens)), device="cuda", dtype=torch.int32
+    )
+    dtype = dtypes.bf16 if dtype_name == "bf16" else dtypes.fp16
+    q = torch.randn(total, nheads, hdim, device="cuda", dtype=dtype)
+    k = torch.randn(total, nheads_k, hdim, device="cuda", dtype=dtype)
+    v = torch.randn_like(k)
 
-    def _cumsum(lengths):
-        return torch.tensor(
-            [0] + list(torch.tensor(lengths).cumsum(0).tolist()),
-            dtype=torch.int32,
-            device="cuda",
-        )
+    calls = _opus_varlen_dispatch_record(monkeypatch)
+    out = aiter.flash_attn_varlen_func(
+        q,
+        k,
+        v,
+        cu_seqlens,
+        cu_seqlens,
+        max_seqlen,
+        max_seqlen,
+        causal=causal,
+        window_size=window_size,
+    )
 
-    phys_kv = [
-        ((s + kv_pad - 1) // kv_pad) * kv_pad if kv_pad else s for s in seqlens_kv
-    ]
-    total_q = sum(seqlens_q)
-    cu_q = _cumsum(seqlens_q)
-    cu_k = _cumsum(seqlens_kv)
-    cu_k_pad = _cumsum(phys_kv)
+    assert calls["n"] == (1 if expect_opus else 0), (
+        f"opus varlen entry called {calls['n']} times, expected "
+        f"{1 if expect_opus else 0}"
+    )
+    # Whichever backend took it must still produce a usable answer -- a gate that
+    # rejects a shape is only correct if something else handles it.
+    assert out.shape == (total, nheads, hdim)
+    assert torch.isfinite(out).all()
 
-    q = torch.randn(total_q, nheads, d_qk, device="cuda", dtype=dtypes.bf16)
-    k = torch.randn(sum(phys_kv), nheads_k, d_qk, device="cuda", dtype=dtypes.bf16)
-    v = torch.randn(sum(phys_kv), nheads_k, d_v, device="cuda", dtype=dtypes.bf16)
-    if kv_pad:
-        for g, (real, phys) in enumerate(zip(seqlens_kv, phys_kv)):
-            gap = slice(int(cu_k_pad[g]) + real, int(cu_k_pad[g]) + phys)
-            k[gap] = float("nan")
-            v[gap] = float("nan")
 
-    with torch.no_grad():
-        out, lse = fmha_fwd_bf16_opus_varlen_fwd(
-            q,
-            k,
-            v,
-            softmax_scale=d_qk**-0.5,
-            causal=causal,
-            seqstart_q=cu_q,
-            seqstart_k=cu_k,
-            seqstart_k_pad=cu_k_pad if kv_pad else None,
-            max_seqlen_q=max(seqlens_q),
-            max_seqlen_k=max(seqlens_kv),
-            return_lse=True,
-        )
+# ---------------------------------------------------------------------------
+# Sink forward dispatch: the fmha_v3_varlen_fwd ASM kernels take no sink
+# arguments, so any call with sink_ptr or sink_size must route to CK
+# (mha_varlen_fwd) instead.
+# ---------------------------------------------------------------------------
 
-    assert tuple(lse.shape) == (nheads, total_q), f"lse shape {tuple(lse.shape)}"
-    assert not torch.isnan(out).any(), "read into the KV padding gap"
-    assert not torch.isnan(lse).any(), "read into the KV padding gap"
 
-    max_diff = 0.0
-    for g in range(len(seqlens_q)):
-        ql, qh = int(cu_q[g]), int(cu_q[g + 1])
-        kl = int(cu_k_pad[g])  # physical start, real length
-        kh = kl + seqlens_kv[g]
-        if seqlens_kv[g] == 0:
-            # Assert the contract exactly rather than through attention_ref, whose
-            # degenerate-shape behaviour is its own question.
-            assert torch.equal(
-                out[ql:qh], torch.zeros_like(out[ql:qh])
-            ), f"group {g} has no keys, out must be exactly 0"
-            assert torch.isneginf(
-                lse[:, ql:qh]
-            ).all(), f"group {g} has no keys, lse must be -inf"
-            continue
-        qg = q[ql:qh].unsqueeze(0)
-        kg = k[kl:kh].unsqueeze(0)
-        vg = v[kl:kh].unsqueeze(0)
-        out_ref, _, _ = attention_ref(qg, kg, vg, causal=causal)
-        out_pt, _, _ = attention_ref(
-            qg, kg, vg, causal=causal, upcast=False, reorder_ops=True
-        )
-        tol = max(2 * (out_pt - out_ref).abs().max().item(), 0.01)
-        diff = (out[ql:qh].unsqueeze(0) - out_ref).abs().max().item()
-        max_diff = max(max_diff, diff)
-        assert diff <= tol, f"group {g} diff {diff} > tol {tol}"
-        opus_check_lse(
-            f"opus-d192-group g{g}", lse[:, ql:qh], opus_ref_lse(qg, kg, causal)[0]
-        )
-    print(f"[opus-d192-group] max diff across groups: {max_diff}")
+def _vsink_dispatch_param_names(fn_name):
+    """Parameter names of an op stub in aiter.ops.mha (compile_ops hides them)."""
+    for node in ast.parse(inspect.getsource(mha_ops)).body:
+        if isinstance(node, ast.FunctionDef) and node.name == fn_name:
+            return [arg.arg for arg in node.args.args]
+    raise LookupError(fn_name)
+
+
+def _vsink_dispatch_record(monkeypatch, asm_name, ck_name):
+    """Wrap the ASM and CK entry points; return the calls each receives."""
+    calls = {"asm": 0, "ck": []}
+    asm_fn = getattr(mha_ops, asm_name)
+    ck_fn = getattr(mha_ops, ck_name)
+    ck_params = _vsink_dispatch_param_names(ck_name)
+
+    def asm_spy(*args, **kwargs):
+        calls["asm"] += 1
+        return asm_fn(*args, **kwargs)
+
+    def ck_spy(*args, **kwargs):
+        calls["ck"].append({**dict(zip(ck_params, args)), **kwargs})
+        return ck_fn(*args, **kwargs)
+
+    monkeypatch.setattr(mha_ops, asm_name, asm_spy)
+    monkeypatch.setattr(mha_ops, ck_name, ck_spy)
+    return calls
+
+
+_VSINK_DISPATCH_CASES = [
+    ("none", "unbounded"),
+    ("none", "covers_seq"),
+    ("sink_ptr", "unbounded"),
+    ("sink_ptr", "covers_seq"),
+    ("sink_size", "covers_seq"),
+]
+
+
+@pytest.mark.parametrize("sink,window", _VSINK_DISPATCH_CASES)
+def test_flash_attn_varlen_func_sink_bypasses_v3_asm(sink, window, monkeypatch):
+    """BF16 D128 calls that qualify for fmha_v3_varlen_fwd must go to CK with a sink.
+
+    `sink="none"` is the control proving the shape takes the ASM path. A window
+    covering the longest sequence is normalized to -1, so it is not SWA and does
+    not exclude ASM on its own.
+    """
+    if get_gfx() not in ("gfx942", "gfx950"):
+        pytest.skip("fmha_v3_varlen_fwd ASM kernels require gfx942/gfx950")
+    seqlens = [256, 192, 320]
+    nheads, nheads_k, hdim = 8, 2, 128
+    max_seqlen = max(seqlens)
+    sink_size = 4 if sink == "sink_size" else 0
+    left = -1 if window == "unbounded" else max_seqlen
+    window_size = (left, 0, sink_size)
+
+    torch.manual_seed(0)
+    total = sum(seqlens)
+    cu_seqlens = torch.tensor(
+        [0] + list(itertools.accumulate(seqlens)), device="cuda", dtype=torch.int32
+    )
+    q = torch.randn(total, nheads, hdim, device="cuda", dtype=dtypes.bf16)
+    k = torch.randn(total, nheads_k, hdim, device="cuda", dtype=dtypes.bf16)
+    v = torch.randn_like(k)
+    sink_ptr = (
+        torch.randn(nheads, device="cuda", dtype=torch.float32)
+        if sink == "sink_ptr"
+        else None
+    )
+
+    calls = _vsink_dispatch_record(monkeypatch, "fmha_v3_varlen_fwd", "mha_varlen_fwd")
+    out = aiter.flash_attn_varlen_func(
+        q,
+        k,
+        v,
+        cu_seqlens,
+        cu_seqlens,
+        max_seqlen,
+        max_seqlen,
+        causal=True,
+        window_size=window_size,
+        sink_ptr=sink_ptr,
+    )
+    assert torch.isfinite(out).all()
+
+    if sink == "none":
+        assert calls["asm"] == 1 and not calls["ck"]
+        return
+    assert calls["asm"] == 0, "sink call was dispatched to fmha_v3_varlen_fwd ASM"
+    assert len(calls["ck"]) == 1
+    ck_args = calls["ck"][0]
+    assert ck_args["window_size_left"] == -1
+    assert ck_args["sink_size"] == sink_size
+    if sink_ptr is None:
+        assert ck_args["sink_ptr"] is None
+    else:
+        assert torch.equal(ck_args["sink_ptr"], sink_ptr)

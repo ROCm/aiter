@@ -5,15 +5,15 @@
 # qSeqLen 0 matches any q_seq; causal=0/1 selects masking, lse writes the un-split
 # rows' LSE, cprr selects round-robin CP (causal only), dyn_lds is launch-time LDS.
 qType,kvType,Gqa,qSeqLen,causal,lse,cprr,dyn_lds,knl_name,co_name
-fp8,fp8,96,0,0,0,0,254208,_ZN5aiter37mla_a8w8_qh96_1tg_16mx6_64nx1_msk0_psE,mla_a8w8_qh96_1tg_16mx6_64nx1_msk0_ps.co
-fp8,fp8,96,0,0,1,0,254208,_ZN5aiter41mla_a8w8_qh96_1tg_16mx6_64nx1_msk0_lse_psE,mla_a8w8_qh96_1tg_16mx6_64nx1_msk0_lse_ps.co
-fp8,fp8,96,0,1,0,0,254208,_ZN5aiter32mla_a8w8_qh96_1tg_16mx6_64nx1_psE,mla_a8w8_qh96_1tg_16mx6_64nx1_ps.co
-fp8,fp8,96,0,1,1,0,254208,_ZN5aiter36mla_a8w8_qh96_1tg_16mx6_64nx1_lse_psE,mla_a8w8_qh96_1tg_16mx6_64nx1_lse_ps.co
-fp8,fp8,96,0,1,0,1,254208,_ZN5aiter37mla_a8w8_qh96_1tg_16mx6_64nx1_cprr_psE,mla_a8w8_qh96_1tg_16mx6_64nx1_cprr_ps.co
-fp8,fp8,96,0,1,1,1,254208,_ZN5aiter41mla_a8w8_qh96_1tg_16mx6_64nx1_lse_cprr_psE,mla_a8w8_qh96_1tg_16mx6_64nx1_lse_cprr_ps.co
-fp8,fp8,128,0,0,0,0,321792,_ZN5aiter38mla_a8w8_qh128_1tg_16mx8_64nx1_msk0_psE,mla_a8w8_qh128_1tg_16mx8_64nx1_msk0_ps.co
-fp8,fp8,128,0,0,1,0,321792,_ZN5aiter42mla_a8w8_qh128_1tg_16mx8_64nx1_msk0_lse_psE,mla_a8w8_qh128_1tg_16mx8_64nx1_msk0_lse_ps.co
-fp8,fp8,128,0,1,0,0,321792,_ZN5aiter33mla_a8w8_qh128_1tg_16mx8_64nx1_psE,mla_a8w8_qh128_1tg_16mx8_64nx1_ps.co
-fp8,fp8,128,0,1,1,0,321792,_ZN5aiter37mla_a8w8_qh128_1tg_16mx8_64nx1_lse_psE,mla_a8w8_qh128_1tg_16mx8_64nx1_lse_ps.co
-fp8,fp8,128,0,1,0,1,321792,_ZN5aiter38mla_a8w8_qh128_1tg_16mx8_64nx1_cprr_psE,mla_a8w8_qh128_1tg_16mx8_64nx1_cprr_ps.co
-fp8,fp8,128,0,1,1,1,321792,_ZN5aiter42mla_a8w8_qh128_1tg_16mx8_64nx1_lse_cprr_psE,mla_a8w8_qh128_1tg_16mx8_64nx1_lse_cprr_ps.co
+fp8,fp8,96,0,0,0,0,265216,_ZN5aiter37mla_a8w8_qh96_1tg_16mx6_64nx1_msk0_psE,mla_a8w8_qh96_1tg_16mx6_64nx1_msk0_ps.co
+fp8,fp8,96,0,0,1,0,265216,_ZN5aiter41mla_a8w8_qh96_1tg_16mx6_64nx1_msk0_lse_psE,mla_a8w8_qh96_1tg_16mx6_64nx1_msk0_lse_ps.co
+fp8,fp8,96,0,1,0,0,265216,_ZN5aiter32mla_a8w8_qh96_1tg_16mx6_64nx1_psE,mla_a8w8_qh96_1tg_16mx6_64nx1_ps.co
+fp8,fp8,96,0,1,1,0,265216,_ZN5aiter36mla_a8w8_qh96_1tg_16mx6_64nx1_lse_psE,mla_a8w8_qh96_1tg_16mx6_64nx1_lse_ps.co
+fp8,fp8,96,0,1,0,1,265216,_ZN5aiter37mla_a8w8_qh96_1tg_16mx6_64nx1_cprr_psE,mla_a8w8_qh96_1tg_16mx6_64nx1_cprr_ps.co
+fp8,fp8,96,0,1,1,1,265216,_ZN5aiter41mla_a8w8_qh96_1tg_16mx6_64nx1_lse_cprr_psE,mla_a8w8_qh96_1tg_16mx6_64nx1_lse_cprr_ps.co
+fp8,fp8,128,0,0,0,0,265216,_ZN5aiter38mla_a8w8_qh128_1tg_16mx8_64nx1_msk0_psE,mla_a8w8_qh128_1tg_16mx8_64nx1_msk0_ps.co
+fp8,fp8,128,0,0,1,0,265216,_ZN5aiter42mla_a8w8_qh128_1tg_16mx8_64nx1_msk0_lse_psE,mla_a8w8_qh128_1tg_16mx8_64nx1_msk0_lse_ps.co
+fp8,fp8,128,0,1,0,0,265216,_ZN5aiter33mla_a8w8_qh128_1tg_16mx8_64nx1_psE,mla_a8w8_qh128_1tg_16mx8_64nx1_ps.co
+fp8,fp8,128,0,1,1,0,265216,_ZN5aiter37mla_a8w8_qh128_1tg_16mx8_64nx1_lse_psE,mla_a8w8_qh128_1tg_16mx8_64nx1_lse_ps.co
+fp8,fp8,128,0,1,0,1,265216,_ZN5aiter38mla_a8w8_qh128_1tg_16mx8_64nx1_cprr_psE,mla_a8w8_qh128_1tg_16mx8_64nx1_cprr_ps.co
+fp8,fp8,128,0,1,1,1,265216,_ZN5aiter42mla_a8w8_qh128_1tg_16mx8_64nx1_lse_cprr_psE,mla_a8w8_qh128_1tg_16mx8_64nx1_lse_cprr_ps.co

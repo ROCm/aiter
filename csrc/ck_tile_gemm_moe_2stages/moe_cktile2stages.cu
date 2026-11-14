@@ -6,6 +6,7 @@
 #include "moe_cktile2stages_name_dispatch.h"
 #include "py_itfs_common.h"
 #include "moe_cktile2stages_heuristic_dispatch_common.h"
+#include "aiter_enum.h"
 #include <cmath>
 
 template <typename ADataType,
@@ -13,7 +14,8 @@ template <typename ADataType,
           typename AccDataType,
           typename CDataType,
           int stage = 1>
-MoeKernel moe_dispatch(int M, int N, int K, int block_m, int activation, bool has_bias, int split_k)
+MoeKernel
+moe_dispatch(int M, int N, int K, int block_m, int activation, bool has_bias, bool split_k)
 {
     // For a given shape, either find the best kernel via lookup or heuristic.
     // For many small M shapes, we bucket them to the next largest kernel.
@@ -53,7 +55,7 @@ MoeKernel moe_dispatch(int M, int N, int K, int block_m, int activation, bool ha
     //   return it->second;
     // }
     // Otherwise, use heuristics.
-    if(split_k > 1)
+    if(split_k)
     {
         if(activation == 2 && has_bias)
         {
@@ -242,7 +244,34 @@ MoeKernel moe_dispatch(int M, int N, int K, int block_m, int activation, bool ha
                                                       false>::dispatch(M, N, K, block_m);
             }
         }
+        else if(activation == static_cast<int>(ActivationType::Relu2) && !has_bias)
+        {
+            if(stage == 1)
+            {
+                return moe_gemm1_heuristic_dispatcher<ADataType,
+                                                      BDataType,
+                                                      AccDataType,
+                                                      CDataType,
+                                                      3,
+                                                      false,
+                                                      false>::dispatch(M, N, K, block_m);
+            }
+            else
+            {
+                return moe_gemm2_heuristic_dispatcher<ADataType,
+                                                      BDataType,
+                                                      AccDataType,
+                                                      CDataType,
+                                                      3,
+                                                      false,
+                                                      false>::dispatch(M, N, K, block_m);
+            }
+        }
     }
+    TORCH_CHECK(false,
+	            "moe_dispatch: unsupported (activation=", activation,
+	            ", has_bias=", has_bias, ", split_k=", split_k,
+	            ") combination \u2014 no generated kernel instance covers this case");
 }
 
 torch::Tensor cktile_moe_gemm1(torch::Tensor& XQ,
@@ -284,12 +313,47 @@ torch::Tensor cktile_moe_gemm1(torch::Tensor& XQ,
     bool has_bias = exp_bias.has_value();
     int act_op    = activation.has_value() ? activation.value() : -1;
     int k_batch   = split_k.has_value() ? split_k.value() : 1;
+    // The output width picks the kernel kind: N wide is the raw gate|up split-k
+    // workspace (also at k_batch == 1), N/2 is the fused gate/up epilogue.
+    // Relu2 is non-gated, so its N-wide output is not split-k.
+    const bool gate_only = act_op == static_cast<int>(ActivationType::Relu2);
+    TORCH_CHECK(Y.size(-1) == N || (!gate_only && 2 * Y.size(-1) == N),
+                "cktile_moe_gemm1: Y.size(-1)=",
+                Y.size(-1),
+                gate_only ? " must be N="
+                          : " must be N (split-k workspace) or N/2 (gate/up) for N=",
+                N);
+    const bool split_k_kind = !gate_only && Y.size(-1) == N;
+    TORCH_CHECK(k_batch == 1 || !gate_only,
+                "cktile_moe_gemm1: Relu2 (gate-only) has no split-k kernel, got k_batch=",
+                k_batch);
+    TORCH_CHECK(k_batch == 1 || split_k_kind,
+                "cktile_moe_gemm1: k_batch=",
+                k_batch,
+                " needs the N-wide split-k workspace (N=",
+                N,
+                "), got Y.size(-1)=",
+                Y.size(-1));
+    // The pipeline skips the k_padded_zeros tail in every split, not only the last.
+    TORCH_CHECK(k_batch == 1 || k_padded_zeros.value_or(0) == 0,
+                "cktile_moe_gemm1: k_batch=",
+                k_batch,
+                " drops K data with k_padded_zeros=",
+                k_padded_zeros.value_or(0));
 
     const at::hip::OptionalHIPGuardMasqueradingAsCUDA device_guard(device_of(Y));
 
     // Name-based dispatch: look up kernel by name directly
     if(!kernel_name.empty())
     {
+        TORCH_CHECK((kernel_name.find("SplitK") != std::string::npos) == split_k_kind,
+                    "cktile_moe_gemm1: kernel ",
+                    kernel_name,
+                    " does not match Y.size(-1)=",
+                    Y.size(-1),
+                    " (N=",
+                    N,
+                    ")");
         const auto& nlookup = get_cktile_name_lookup();
         auto it             = nlookup.find(kernel_name);
         if(it != nlookup.end())
@@ -333,21 +397,21 @@ torch::Tensor cktile_moe_gemm1(torch::Tensor& XQ,
         if(WQ.dtype() == torch_fp4x2 && Y.dtype() == at::ScalarType::BFloat16)
         {
             moe_dispatch<fp8, pk_fp4, float, bf16, 1>(
-                M, N, K, MPerBlock, act_op, has_bias, k_batch)(XQ,
-                                                               WQ,
-                                                               Y,
-                                                               sorted_ids,
-                                                               sorted_expert_ids,
-                                                               max_token_ids,
-                                                               topk,
-                                                               n_padded_zeros,
-                                                               k_padded_zeros,
-                                                               topk_weight,
-                                                               x_scale,
-                                                               w_scale,
-                                                               exp_bias,
-                                                               act_op,
-                                                               k_batch);
+                M, N, K, MPerBlock, act_op, has_bias, split_k_kind)(XQ,
+                                                                    WQ,
+                                                                    Y,
+                                                                    sorted_ids,
+                                                                    sorted_expert_ids,
+                                                                    max_token_ids,
+                                                                    topk,
+                                                                    n_padded_zeros,
+                                                                    k_padded_zeros,
+                                                                    topk_weight,
+                                                                    x_scale,
+                                                                    w_scale,
+                                                                    exp_bias,
+                                                                    act_op,
+                                                                    k_batch);
         }
     }
     else if((XQ.dtype() == at::ScalarType::BFloat16 || XQ.dtype() == at::ScalarType::Half) &&
@@ -361,21 +425,21 @@ torch::Tensor cktile_moe_gemm1(torch::Tensor& XQ,
         if(Y.dtype() == at::ScalarType::BFloat16)
         {
             moe_dispatch<bf16, pk_fp4, float, bf16, 1>(
-                M, N, K, MPerBlock, act_op, has_bias, k_batch)(XQ,
-                                                               WQ,
-                                                               Y,
-                                                               sorted_ids,
-                                                               sorted_expert_ids,
-                                                               max_token_ids,
-                                                               topk,
-                                                               n_padded_zeros,
-                                                               k_padded_zeros,
-                                                               topk_weight,
-                                                               x_scale,
-                                                               w_scale,
-                                                               exp_bias,
-                                                               act_op,
-                                                               k_batch);
+                M, N, K, MPerBlock, act_op, has_bias, split_k_kind)(XQ,
+                                                                    WQ,
+                                                                    Y,
+                                                                    sorted_ids,
+                                                                    sorted_expert_ids,
+                                                                    max_token_ids,
+                                                                    topk,
+                                                                    n_padded_zeros,
+                                                                    k_padded_zeros,
+                                                                    topk_weight,
+                                                                    x_scale,
+                                                                    w_scale,
+                                                                    exp_bias,
+                                                                    act_op,
+                                                                    k_batch);
         }
     }
     else
@@ -419,6 +483,8 @@ torch::Tensor cktile_moe_gemm2(torch::Tensor& XQ,
     bool has_bias = exp_bias.has_value();
     int act_op    = activation.has_value() ? activation.value() : -1;
     int k_batch   = split_k.has_value() ? split_k.value() : 1;
+    // moe_gemm checks the per-split K of gemm1 only.
+    TORCH_CHECK(k_batch == 1, "cktile_moe_gemm2: split-k is not supported, got k_batch=", k_batch);
 
     const at::hip::OptionalHIPGuardMasqueradingAsCUDA device_guard(device_of(Y));
 
@@ -468,21 +534,21 @@ torch::Tensor cktile_moe_gemm2(torch::Tensor& XQ,
         if(WQ.dtype() == torch_fp4x2 && Y.dtype() == at::ScalarType::BFloat16)
         {
             moe_dispatch<fp8, pk_fp4, float, bf16, 2>(
-                M, N, K, MPerBlock, act_op, has_bias, k_batch)(XQ,
-                                                               WQ,
-                                                               Y,
-                                                               sorted_ids,
-                                                               sorted_expert_ids,
-                                                               max_token_ids,
-                                                               topk,
-                                                               n_padded_zeros,
-                                                               k_padded_zeros,
-                                                               topk_weight,
-                                                               x_scale,
-                                                               w_scale,
-                                                               exp_bias,
-                                                               act_op,
-                                                               k_batch);
+                M, N, K, MPerBlock, act_op, has_bias, k_batch > 1)(XQ,
+                                                                   WQ,
+                                                                   Y,
+                                                                   sorted_ids,
+                                                                   sorted_expert_ids,
+                                                                   max_token_ids,
+                                                                   topk,
+                                                                   n_padded_zeros,
+                                                                   k_padded_zeros,
+                                                                   topk_weight,
+                                                                   x_scale,
+                                                                   w_scale,
+                                                                   exp_bias,
+                                                                   act_op,
+                                                                   k_batch);
         }
     }
     else if((XQ.dtype() == at::ScalarType::BFloat16 || XQ.dtype() == at::ScalarType::Half) &&
@@ -496,21 +562,21 @@ torch::Tensor cktile_moe_gemm2(torch::Tensor& XQ,
         if(Y.dtype() == at::ScalarType::BFloat16)
         {
             moe_dispatch<bf16, pk_fp4, float, bf16, 2>(
-                M, N, K, MPerBlock, act_op, has_bias, k_batch)(XQ,
-                                                               WQ,
-                                                               Y,
-                                                               sorted_ids,
-                                                               sorted_expert_ids,
-                                                               max_token_ids,
-                                                               topk,
-                                                               n_padded_zeros,
-                                                               k_padded_zeros,
-                                                               topk_weight,
-                                                               x_scale,
-                                                               w_scale,
-                                                               exp_bias,
-                                                               act_op,
-                                                               k_batch);
+                M, N, K, MPerBlock, act_op, has_bias, k_batch > 1)(XQ,
+                                                                   WQ,
+                                                                   Y,
+                                                                   sorted_ids,
+                                                                   sorted_expert_ids,
+                                                                   max_token_ids,
+                                                                   topk,
+                                                                   n_padded_zeros,
+                                                                   k_padded_zeros,
+                                                                   topk_weight,
+                                                                   x_scale,
+                                                                   w_scale,
+                                                                   exp_bias,
+                                                                   act_op,
+                                                                   k_batch);
         }
     }
     else

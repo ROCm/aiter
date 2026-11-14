@@ -2,12 +2,16 @@
 # Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
 import argparse
+import os
+from unittest import mock
 
 import torch
 import torch.nn.functional as F
 
 import aiter
+import aiter.ops.rmsnorm as rmsnorm_ops
 from aiter import dtypes
+from aiter.jit.utils import chip_info
 from aiter.test_common import checkAllclose, perftest
 
 
@@ -111,6 +115,79 @@ def test_rmsnorm2d_fuseAdd(dtype, m, n):
     checkAllclose(gres_ref, gres, msg="gemma res check")
 
 
+def test_rmsnorm2d_row_tail(dtype, m, n):
+    """Every element of rows whose length is not a multiple of 8 is written."""
+    x = torch.randn((m, n), dtype=dtype, device="cuda")
+    res = torch.randn((m, n), dtype=dtype, device="cuda")
+    weight = torch.randn(n, dtype=dtype, device="cuda")
+    out = torch.full_like(x, float("nan"))
+    res_out = torch.full_like(x, float("nan"))
+    aiter.rmsnorm2d_fwd_with_add(out, x, res, res_out, weight, 1e-5)
+    y = aiter.rms_norm(x, weight, 1e-5)
+    added = x.float() + res.float()
+    ref = F.rms_norm(added, (n,), weight.float(), 1e-5)
+    ref_y = F.rms_norm(x.float(), (n,), weight.float(), 1e-5)
+    msg = f"[row tail] dim: {(m, n)!s:<12}, dtype: {dtype}, "
+    assert torch.isfinite(out).all() and torch.isfinite(res_out).all(), (
+        msg + "unwritten"
+    )
+    tail = slice(n - 8, n)
+    for name, a, b in (
+        ("out", out, ref),
+        ("residual_out", res_out, added),
+        ("y", y, ref_y),
+    ):
+        err = checkAllclose(
+            b[:, tail], a[:, tail].float(), atol=0.03, tol_err_ratio=0, msg=msg + name
+        )
+        assert err == 0, msg + name
+
+
+def test_rmsnorm2d_fuseAdd_deterministic(dtype, m, n, runs=5):
+    """The block reduction does not race: repeated calls on the same inputs agree bit for bit."""
+    x = torch.randn((m, n), dtype=dtype, device="cuda")
+    res = torch.randn((m, n), dtype=dtype, device="cuda")
+    weight = torch.randn(n, dtype=dtype, device="cuda")
+    first = None
+    for _ in range(runs):
+        out = torch.empty_like(x)
+        res_out = torch.empty_like(x)
+        aiter.rmsnorm2d_fwd_with_add(out, x, res, res_out, weight, 1e-5)
+        if first is None:
+            first = out
+        else:
+            bad_rows = (out != first).any(dim=1).sum().item()
+            assert (
+                bad_rows == 0
+            ), f"[deterministic] dim: {(m, n)}, {bad_rows} rows differ"
+
+
+def test_rmsnorm2d_tail_dispatch_follows_device():
+    """GPU_ARCHS names the build target. A gfx1250 device keeps rows with N % 8 != 0
+    off the HIP kernel whatever GPU_ARCHS says."""
+    x = torch.empty((1, 1002), dtype=dtypes.bf16)
+    old_archs = os.environ.get("GPU_ARCHS")
+    os.environ["GPU_ARCHS"] = "gfx942"
+    chip_info.get_gfx.cache_clear()
+    chip_info.get_gfx_custom_op_core.cache_clear()
+    try:
+        for device, hip in (("gfx1250", False), ("gfx942", True)):
+            with mock.patch.object(
+                rmsnorm_ops, "get_gfx_runtime", return_value=device, create=True
+            ):
+                assert rmsnorm_ops._use_hip_common(x, 0) == hip, (
+                    f"[tail dispatch] device {device}, GPU_ARCHS=gfx942: "
+                    f"expected {'HIP' if hip else 'opus'}"
+                )
+    finally:
+        if old_archs is None:
+            os.environ.pop("GPU_ARCHS", None)
+        else:
+            os.environ["GPU_ARCHS"] = old_archs
+        chip_info.get_gfx.cache_clear()
+        chip_info.get_gfx_custom_op_core.cache_clear()
+
+
 # for dtype in [dtypes.fp16, dtypes.bf16]:
 #     for m in [1, 2, 4, 8, 16, 32, 64, 128, 256]:
 #         for n in [4096, 8192, 16384, 32768, 65536]:
@@ -168,3 +245,11 @@ for dtype in l_dtype:
     for m in l_m:
         for n in l_n:
             test_rmsnorm2d_fuseAdd(dtype, m, n)
+
+print("\nstart row tail and determinism tests")
+test_rmsnorm2d_tail_dispatch_follows_device()
+for dtype in [d for d in l_dtype if d in (dtypes.fp16, dtypes.bf16)]:
+    for m in [1, 64]:
+        for n in [1002, 4094, 8190]:
+            test_rmsnorm2d_row_tail(dtype, m, n)
+    test_rmsnorm2d_fuseAdd_deterministic(dtype, 8192, 65536)

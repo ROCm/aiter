@@ -50,8 +50,7 @@ from functools import lru_cache
 import flydsl.compiler as flyc
 import flydsl.expr as fx
 import torch
-from flydsl._mlir import ir
-from flydsl._mlir.dialects import llvm, vector
+from flydsl._mlir.dialects import llvm
 from flydsl.expr import gpu, rocdl
 from flydsl.expr import math as fmath
 from flydsl.expr.primitive import range_constexpr
@@ -174,11 +173,13 @@ def _global_i32(addr, words, nt=False):
     """``words`` i32 at the 64-bit global address ``addr``, a vector; a pool
     past 4 GiB is reached only this way (a buffer load's offset, index x stride
     included, is 32 bits). ``nt``: nontemporal."""
-    vt = ir.VectorType.get([words], T.i32)
-    ptr = llvm.IntToPtrOp(
-        ir.Type.parse("!llvm.ptr<1>"), as_ir_value(fx.Int64(addr))
-    ).result
-    return llvm.LoadOp(vt, ptr, alignment=4 * words, nontemporal=nt or None).result
+    ptr = fx.inttoptr(
+        fx.PointerType.get(T.i32, fx.AddressSpace.Global, 4 * words),
+        fx.Int64(addr),
+    )
+    return fx.generic_load(
+        ptr, dtype=fx.Vector[fx.Int32, words], nontemporal=nt
+    ).ir_value()
 
 
 def _addr_i32_buffer(addr, width=1, records=None):
@@ -292,9 +293,9 @@ def _lds_barrier():
     s_barrier. gpu.barrier also waits on every global read in flight, and
     the reads issued ahead of a hand-off are exactly the ones meant to stay
     in flight across it."""
-    llvm.fence(llvm.AtomicOrdering.release, syncscope="workgroup")
+    fx.memory_fence(ordering=fx.AtomicOrdering.Release, syncscope="workgroup")
     rocdl.s_barrier()
-    llvm.fence(llvm.AtomicOrdering.acquire, syncscope="workgroup")
+    fx.memory_fence(ordering=fx.AtomicOrdering.Acquire, syncscope="workgroup")
 
 
 def _add(a, b):
@@ -477,7 +478,7 @@ def build_pa_mqa_logits_fp4_rowgroup_module(
                 incl = base + _wave_inclusive_scan(takes)
                 run = incl - takes
                 hit = fx.Int64(rocdl.ballot(T.i64, (run <= slot) & (slot < incl)))
-                found = hit != fx.Int64(0)
+                found = hit != 0
                 at = found.select(fx.Int32(fx.cttz(hit)), fx.Int32(0))
                 return (
                     _uniform(_readlane(incl, WARP_SIZE - 1)),
@@ -529,7 +530,7 @@ def build_pa_mqa_logits_fp4_rowgroup_module(
             row's bound, 0 for a sequence of no rows."""
             first = fx.Int32(qsl_bt[seq])
             end = fx.Int32(qsl_bt[seq + fx.Int32(1)])
-            last = fx.Int32(ends_bt[fx.max(end - fx.Int32(1), fx.Int32(0))])
+            last = fx.Int32(ends_bt[fx.max(end - 1, fx.Int32(0))])
             return end - first, (end > first).select(last, fx.Int32(0))
 
         def chunk_steps(c):
@@ -742,7 +743,7 @@ def build_pa_mqa_logits_fp4_rowgroup_module(
             b = slot // parts
             part = slot % parts
             part = (b < batch).select(part, parts)
-            b = fx.min(b, batch - fx.Int32(1))
+            b = fx.min(b, batch - 1)
         else:
             # every sequence's first run first: under a long max_seq_len most
             # runs of short sequences are empty, and the busy ones launch
@@ -838,7 +839,7 @@ def build_pa_mqa_logits_fp4_rowgroup_module(
             for h in range_constexpr(2):
                 work_reg = fx.make_rmem_tensor(4, fx.Int32)
                 fx.copy(work_copy, work_views[h], work_reg)
-                work.append(fx.Vector(work_reg.load()))
+                work.append(work_reg.load())
             b_c, s0_c = _uniform(work[0][0]), _uniform(work[0][1])
             s_hi_c, deep_c = _uniform(work[0][2]), _uniform(work[0][3])
             t_c, mult_c = _uniform(work[1][0]), _uniform(work[1][1])
@@ -911,24 +912,20 @@ def build_pa_mqa_logits_fp4_rowgroup_module(
                     # 1 row a sequence, B = 64 at 16K keys: 26 -> 20 us, 165 ->
                     # 142 VGPRs)
                     phys = _uniform(phys)
-                kv_page_base = fx.Int64(kv_ptr) + fx.Int64(phys) * kv_page
-                kvs_page_base = fx.Int64(kvs_ptr) + fx.Int64(phys) * kvs_page
+                kv_page_base = kv_ptr + fx.Int64(phys) * kv_page
+                kvs_page_base = kvs_ptr + fx.Int64(phys) * kvs_page
                 # the scales first: the MFMAs that wait on a step's keys wait on
                 # them too, so the reads issued after them all count as slack
                 # (in the loop body's first wait as well, which also covers its
                 # entry)
                 kvs = [
-                    fx.Int32(
-                        vector.ExtractOp(
-                            _global_i32(
-                                kvs_page_base
-                                + fx.Int64(lane_kvs_off + fx.Int32(kt * 4 * page_size)),
-                                1,
-                            ),
-                            [],
-                            [0],
-                        ).result
-                    )
+                    fx.Vector(
+                        _global_i32(
+                            kvs_page_base
+                            + fx.Int64(lane_kvs_off + fx.Int32(kt * 4 * page_size)),
+                            1,
+                        )
+                    )[0]
                     for kt in range(k_tiles)
                 ]
                 kv = []
@@ -1005,9 +1002,7 @@ def build_pa_mqa_logits_fp4_rowgroup_module(
                         reg = fx.make_rmem_tensor(width, fx.Int32)
                         fx.copy(lds_copy4 if width == 4 else lds_copy1, view, reg)
                         vec = fx.Vector(reg.load())
-                        lds_rows.append(
-                            vec.ir_value() if width == 4 else fx.Int32(vec[0])
-                        )
+                        lds_rows.append(vec.ir_value() if width == 4 else vec[0])
 
                 # ---- the rows' query operands, scales and head weights ----
                 q_ops, q_scales, w_lane = [], [], []
@@ -1050,7 +1045,7 @@ def build_pa_mqa_logits_fp4_rowgroup_module(
                         else:
                             w4 = fx.Vector(raw[mi]).bitcast(fx.Float32)
                         # the 1/2 of relu as (x + |x|) / 2
-                        half = weight_scale * fx.Float32(0.5)
+                        half = weight_scale * 0.5
                         w_r.append([w4[e] * half for e in range(4)])
                     w_lane.append(w_r)
 
@@ -1098,7 +1093,7 @@ def build_pa_mqa_logits_fp4_rowgroup_module(
                         if packed_out
                         else fx.Int64(row0 + r) * fx.Int64(stride_out)
                     )
-                    row_addr = fx.Int64(out_ptr) + first * 4
+                    row_addr = out_ptr + first * 4
                     out_wins.append(
                         fx.rocdl.make_buffer_tensor(
                             fx.make_view(
@@ -1115,7 +1110,7 @@ def build_pa_mqa_logits_fp4_rowgroup_module(
                         )
                     )
 
-                zero4 = fx.Vector.filled(4, 0.0, fx.Float32)
+                zero4 = fx.full(4, 0.0, fx.Float32)
 
                 def tile_mfmas(kv, kvs, nt):
                     """Every row's MFMA output for tile nt: [rows][m_tiles]."""
@@ -1125,7 +1120,7 @@ def build_pa_mqa_logits_fp4_rowgroup_module(
                         frag.store(fx.Vector(kv[kt * TILES + nt]))
                         b_frags.append(frag)
                     kv_scales = [
-                        (fx.Int32(kvs[kt]) >> fx.Int32(8 * nt)) & fx.Int32(0xFF)
+                        (fx.Int32(kvs[kt]) >> fx.Int32(8 * nt)) & 0xFF
                         for kt in range(k_tiles)
                     ]
                     accs = []

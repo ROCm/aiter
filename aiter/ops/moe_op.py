@@ -7,8 +7,10 @@ import torch
 from torch import Tensor
 
 from ..jit.core import AITER_CSRC_DIR, compile_ops
+from ..jit.utils.moe_recipes import MOE_MODULE_ABI_TAG
 from ..utility import dtypes
 from .enum import ActivationType, QuantType
+from .moe_limits import normalize_swiglu_limit
 
 torch.int4 = getattr(torch, "int4", torch.uint32)
 
@@ -23,6 +25,7 @@ def _topk_softmax(
     need_renorm: bool,
     num_shared_experts: int = 0,
     shared_expert_scoring_func: str = "",
+    num_valid_rows: Tensor | None = None,
 ) -> None: ...
 
 
@@ -34,7 +37,12 @@ def topk_softmax(
     need_renorm: bool,
     num_shared_experts: int = 0,
     shared_expert_scoring_func: str = "",
+    num_valid_rows: Tensor | None = None,
 ) -> None:
+    """`num_valid_rows`: optional int32 device tensor whose first element is
+    the count of real rows. Rows at or past it are padding: their routed ids
+    are written -1 and their weights 0; shared columns are written as for any
+    row. Read on device, so a replayed CUDA graph follows each step's count."""
     # The softmax workspace is only touched on the non-power-of-2 / >256-expert
     # path, but is always allocated here (torch caching allocator) and passed in so
     # the C side stays torch-free. Size logic mirrors the original C implementation.
@@ -63,6 +71,7 @@ def topk_softmax(
         need_renorm,
         num_shared_experts,
         shared_expert_scoring_func,
+        num_valid_rows,
     )
 
 
@@ -79,6 +88,7 @@ def _topk_softmax_fused_shared_gate(
     gate_weight: Tensor,
     shared_expert_scale: float,
     shared_expert_base: int,
+    num_valid_rows: Tensor | None = None,
 ) -> None: ...
 
 
@@ -94,7 +104,9 @@ def topk_softmax_fused_shared_gate(
     gate_weight: Tensor,
     shared_expert_scale: float = 1.0,
     shared_expert_base: int = -1,
+    num_valid_rows: Tensor | None = None,
 ) -> None:
+    # `num_valid_rows`: as for `topk_softmax`.
     # Option A ("fuse-gate"): gating_output holds ONLY routed experts; the shared
     # logit is computed in-kernel as
     #   sigmoid(hidden_states @ gate_weight.T) * shared_expert_scale
@@ -114,6 +126,7 @@ def topk_softmax_fused_shared_gate(
         gate_weight,
         shared_expert_scale,
         shared_expert_base,
+        num_valid_rows,
     )
 
 
@@ -296,6 +309,12 @@ def fmoe_fp8_blockscale_g1u1(
 
 
 @compile_ops("module_moe_fmoe_asm", ffi_type="ctypes")
+def fmoe_fp8_blockscale_g1u1_has_kernel(
+    activation: int, xquant: bool, block_size_M: int, inter_dim: int, model_dim: int
+) -> int: ...
+
+
+@compile_ops("module_moe_fmoe_asm", ffi_type="ctypes")
 def moe_stage1_g1u1(
     input: Tensor,
     w1: Tensor,
@@ -336,12 +355,16 @@ def cmdGenFunc_ck_moe_stage(
     use_non_temporal_load: bool = False,
     dst_type: str | None = None,
     is_shuffled: bool = True,
+    swiglu_limit: float | None = None,
 ):
 
     mul_routed_weight_stage = 2 if sorted_weights is None else 1
     is_splitk = splitk > 1 and not kernelName
     is_splitk = is_splitk or (bool(kernelName) and "Splitk" in kernelName)
     outtype = str2dtype_dict[dst_type] if is_splitk else out.dtype
+    runtime_swiglu_limit = (
+        normalize_swiglu_limit(swiglu_limit) is not None if swiglu_limit else False
+    )
     md_name, blob_gen_cmd = get_moe_stage_module(
         hidden_states.dtype,
         w1.dtype,
@@ -351,6 +374,7 @@ def cmdGenFunc_ck_moe_stage(
         mul_routed_weight_stage,
         is_shuffled,
         is_splitk,
+        runtime_swiglu_limit,
     )
     return {
         "md_name": md_name,
@@ -417,6 +441,7 @@ def ck_moe_stage1(
     use_non_temporal_load: bool = False,
     dst_type: str | None = None,
     is_shuffled: bool = True,
+    swiglu_limit: float = 0.0,
 ) -> None: ...
 
 
@@ -485,6 +510,9 @@ def moe_cktile2stages_gemm1(
     split_k: int | None = 1,
     kernel_name: str = "",
 ):
+    """Y's width selects the kernel: N = WQ.size(1) writes raw gate|up (split-k
+    kernel, any split_k), N/2 applies the gated activation (split_k must be 1).
+    Relu2 is gate-only: Y is N wide and split_k must be 1."""
     return moe_cktile2stages_gemm1_ck(
         XQ,
         WQ,
@@ -594,6 +622,7 @@ def get_moe_stage_module(
     mul_routed_weight_stage,
     preshuffle_mode=False,
     is_splitk=False,
+    runtime_swiglu_limit=False,
 ):
     if isinstance(activation, int):
         activation = ActivationType(activation)
@@ -613,10 +642,21 @@ def get_moe_stage_module(
         QuantType.per_1x128 if quant_type == QuantType.per_128x128 else quant_type
     )
     act = str(activation).split(".")[-1].lower()
+    if runtime_swiglu_limit and (
+        Adtype != "f8"
+        or Bdtype != "f8"
+        or act != "silu"
+        or quant_type != QuantType.per_1x128
+        or is_splitk
+    ):
+        raise ValueError(
+            "Runtime SwiGLU limit requires non-split FP8 per_1x128 CK SiLU"
+        )
     quant_type = str(quant_type).split(".")[-1].lower()
 
     parts = [
         "module_moe_ck2stages",
+        MOE_MODULE_ABI_TAG,
         Adtype,
         Bdtype,
         "preshuffle_on" if preshuffle_mode else "preshuffle_off",
@@ -627,9 +667,12 @@ def get_moe_stage_module(
     ]
     if is_splitk:
         parts.append("splitk")
+    if runtime_swiglu_limit:
+        parts.append("runtime_swiglu_limit")
     md_name = "_".join(parts)
+    runtime_limit_arg = " --runtime-swiglu-limit" if runtime_swiglu_limit else ""
     blob_gen_cmd = [
-        f"{AITER_CSRC_DIR}/ck_gemm_moe_2stages_codegen/gen_instances.py -a {Adtype} -b {Bdtype} -c {Cdtype} -q {quant_type} -act {act} -m {mul_routed_weight_stage} {preshuffle_str} {splitk_str} -w {{}}"
+        f"{AITER_CSRC_DIR}/ck_gemm_moe_2stages_codegen/gen_instances.py -a {Adtype} -b {Bdtype} -c {Cdtype} -q {quant_type} -act {act} -m {mul_routed_weight_stage} {preshuffle_str} {splitk_str}{runtime_limit_arg} -w {{}}"
     ]
 
     return md_name, blob_gen_cmd
@@ -654,7 +697,17 @@ def ck_moe_stage1_fwd(
     splitk: int | None = 1,
     use_non_temporal_load: bool | None = False,
     dst_type: torch.dtype | None = None,
+    swiglu_limit: float | None = None,
 ):
+    limit = normalize_swiglu_limit(swiglu_limit) if swiglu_limit else None
+    if limit is not None:
+        if quant_type == QuantType.per_128x128:
+            quant_type = QuantType.per_1x128
+        if activation != ActivationType.Silu or quant_type != QuantType.per_1x128:
+            raise ValueError("Runtime clamp requires per_1x128 CK SiLU")
+        if kernelName and ("Splitk" in kernelName or "_silu_" not in kernelName):
+            raise ValueError("Runtime clamp requires a non-split CK SiLU kernel")
+        splitk = 0
     ck_moe_stage1(
         hidden_states,
         w1,
@@ -674,7 +727,8 @@ def ck_moe_stage1_fwd(
         int(splitk) if splitk is not None else splitk,
         use_non_temporal_load,
         None if dst_type is None else dtype2str_dict[dst_type],
-        is_shuffled=getattr(w1, "is_shuffled", False),
+        getattr(w1, "is_shuffled", False),
+        limit or 0.0,
     )
     return out
 
