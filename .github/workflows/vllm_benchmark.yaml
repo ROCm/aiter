@@ -140,7 +140,7 @@ jobs:
       matrix:
         include:
           - model: deepseek-ai/DeepSeek-V4-Pro
-            runner: linux-aiter-do-mi350x-8
+            runner: linux-aiter-do-mi350x-dpx-8
             kv_cache_dtype: fp8_kvcache
             tp: 8
             extra_args: >-
@@ -148,9 +148,15 @@ jobs:
               --moe-backend aiter
               --tokenizer-mode deepseek_v4
               --reasoning-parser deepseek_v4
-            extra_env_args: ""
+              --max-model-len 1024
+              --max-num-batched-tokens 1024
+              --gpu-memory-utilization 0.954
+              --enforce-eager
+              --disable-custom-all-reduce
+              --enable-expert-parallel
+            extra_env_args: -e PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
           - model: amd/MiniMax-M3-MXFP4
-            runner: linux-aiter-do-mi350x-8
+            runner: linux-aiter-do-mi350x-dpx-8
             kv_cache_dtype: default_kvcache
             tp: 4
             extra_args: >-
@@ -160,7 +166,7 @@ jobs:
               --moe-backend aiter
             extra_env_args: -e VLLM_ROCM_USE_AITER_MOE=1 -e VLLM_USE_BREAKABLE_CUDAGRAPH=0
           - model: amd/MiniMax-M3-MXFP4
-            runner: linux-aiter-do-mi350x-8
+            runner: linux-aiter-do-mi350x-dpx-8
             kv_cache_dtype: default_kvcache
             tp: 8
             extra_args: >-
@@ -168,6 +174,10 @@ jobs:
               --attention-backend TRITON_ATTN
               --reasoning-parser minimax_m3
               --moe-backend aiter
+              --max-model-len 4096
+              --max-num-batched-tokens 8192
+              --gpu-memory-utilization 0.80
+              --enforce-eager
             extra_env_args: -e VLLM_ROCM_USE_AITER_MOE=1 -e VLLM_USE_BREAKABLE_CUDAGRAPH=0
         
     steps:

@@ -104,25 +104,29 @@ jobs:
               atom_models = json.load(f)
 
           runner_overrides = {
-              "atom-mi355-8gpu.predownload": "linux-aiter-do-mi350x-8",
-              "linux-atom-do-mi350x-8": "linux-aiter-do-mi350x-8",
-              "linux-atom-mi35x-4": "linux-aiter-do-mi350x-4",
+              "atom-mi355-8gpu.predownload": "linux-aiter-do-mi350x-dpx-8",
+              "linux-atom-do-mi350x-8": "linux-aiter-do-mi350x-dpx-8",
+              "linux-atom-mi35x-4": "linux-aiter-do-mi350x-dpx-4",
               "linux-atom-mi35x-1": "linux-aiter-mi35x-1",
           }
 
           # Per-model runner pin (overrides the generic mapping above).
+          # Pinned to the DPX-partitioned do-mi350x pools to validate ATOM
+          # accuracy under DPX partitioning (was linux-aiter-do-mi350x-8/-4).
           model_runner_overrides = {
-              "DeepSeek-V4-Pro": "linux-aiter-do-mi350x-8",       # -tp 8
-              "Qwen3.5-397B-A17B-FP8": "linux-aiter-do-mi350x-4",  # -tp 4
-              "MiniMax-M2.7-MXFP4": "linux-aiter-do-mi350x-4",     # -tp 2 (MXFP4)
-              "GLM-5.1-FP8": "linux-aiter-do-mi350x-8",            # -tp 8
+              "DeepSeek-V4-Pro": "linux-aiter-do-mi350x-dpx-8",       # -tp 8
+              "Qwen3.5-397B-A17B-FP8": "linux-aiter-do-mi350x-dpx-4",  # -tp 4
+              "MiniMax-M2.7-MXFP4": "linux-aiter-do-mi350x-dpx-4",     # -tp 2 (MXFP4)
+              "GLM-5.1-FP8": "linux-aiter-do-mi350x-dpx-8",            # -tp 8
           }
 
           # Per-model extra env injected into the test container (one KEY=VALUE per
           # line, merged with any env_vars already declared in the ATOM model
-          # config). MiniMax MoE needs scratch reclaim disabled or its scratch
-          # buffers get corrupted on gfx950, failing the accuracy gate.
+          # config). DeepSeek-R1, gpt-oss TP2, and MiniMax need scratch reclaim disabled on the
+          # DPX-partitioned gfx950 runners or HIP/NCCL initialization can abort.
           model_env_overrides = {
+              "DeepSeek-R1-0528": "HSA_NO_SCRATCH_RECLAIM=1",
+              "gpt-oss-120b": "HSA_NO_SCRATCH_RECLAIM=1",
               "MiniMax-M2.7-MXFP4": "HSA_NO_SCRATCH_RECLAIM=1",
           }
 
@@ -133,8 +137,16 @@ jobs:
           # disables cudagraph capture in ATOM, so --level 0 (NO_COMPILATION) is
           # what bypasses the failing backend. The MXFP4 ATOM entry has no -tp,
           # so pin TP2 to match the do-mi350x-2 runner.
+          # gpt-oss-120b's ATOM config (--gpu-memory-utilization 0.5, single
+          # GPU) was tuned against a full-chip SPX GPU's memory. A DPX
+          # partition only has ~144 GiB total, so 0.5 utilization budgets
+          # ~72 GiB -- barely under the model's own ~70 GiB weight footprint,
+          # leaving a negative KV-cache budget (confirmed reproducible:
+          # "available_for_kv=-2.6..-2.7 GB" across two separate runs).
+          # -tp 2 shards the weights across 2 DPX partitions instead.
           model_extra_args_append = {
               "MiniMax-M2.7-MXFP4": "-tp 2 --enforce-eager --level 0",
+              "gpt-oss-120b": "-tp 2",
           }
 
           def prepare_model(model):
