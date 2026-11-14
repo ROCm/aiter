@@ -2542,6 +2542,28 @@ def fused_moe_1stage(
     return moe_buf
 
 
+# Arches whose 1-stage asm fmoe kernels address expert weights with 32-bit
+# byte offsets (see _asm_fmoe_weights_fit_u32_offsets).
+_ASM_FMOE_U32_WEIGHT_OFFSET_GFX = ("gfx942",)
+
+
+def _asm_fmoe_weights_fit_u32_offsets(
+    expert, model_dim, inter_dim, use_g1u1, q_dtype_w, dtype
+):
+    """Whether every byte of w1/w2 is within 4 GiB of the tensor base.
+
+    The gfx942 1-stage asm fmoe kernels address the expert weights with 32-bit
+    byte offsets, so weights past 4 GiB read wrapped addresses and return
+    garbage without faulting (e.g. 256 experts, model_dim 7168, inter_dim 2048
+    fp8 g1u1: w1 is 7 GiB and only experts 0-145 come out right).
+    """
+    w_dtype = dtype if q_dtype_w is None else q_dtype_w
+    bits = 4 if w_dtype in (dtypes.fp4x2, dtypes.i4x2) else w_dtype.itemsize * 8
+    w1_bytes = expert * (2 if use_g1u1 else 1) * inter_dim * model_dim * bits // 8
+    w2_bytes = expert * model_dim * inter_dim * bits // 8
+    return max(w1_bytes, w2_bytes) <= 1 << 32
+
+
 @functools.lru_cache(maxsize=2048)
 def get_block_size_M(token, topk, expert, inter_dim):
     cu_num = get_cu_num()
@@ -4845,6 +4867,21 @@ def get_2stage_cfgs(
                 run_1stage = token > 16 or inter_dim % 128 != 0
             elif q_type != QuantType.per_1x32:
                 run_1stage = token < 256
+            if (
+                run_1stage
+                and get_gfx_runtime() in _ASM_FMOE_U32_WEIGHT_OFFSET_GFX
+                and not _asm_fmoe_weights_fit_u32_offsets(
+                    expert, model_dim, inter_dim, use_g1u1, q_dtype_w, dtype
+                )
+            ):
+                if not use_g1u1:
+                    raise NotImplementedError(
+                        "Non-gated MoE weights past 4 GiB are not supported on "
+                        "gfx942: the asm 1-stage kernel wraps 32-bit offsets and "
+                        "CK stage 1 assumes gate and up are fused."
+                    )
+                run_1stage = False
+                run_1stage_xbf16 = False
 
         block_m = (
             BLOCK_SIZE_M

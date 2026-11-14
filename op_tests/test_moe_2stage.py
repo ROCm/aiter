@@ -2519,6 +2519,96 @@ def test_swiglu_mxfp4_untagged_layout_dispatch():
     )
 
 
+def test_gfx942_asm_1stage_4gib_guard():
+    """The gfx942 asm 1-stage fmoe kernels wrap 32-bit weight offsets past 4 GiB.
+
+    The legacy sweep only logs an accuracy warning (strict_accuracy=False), so
+    this asserts the dispatch itself. It needs no multi-GiB tensors: the weight
+    size is computed from the shape, and the tuned config is bypassed so the
+    default heuristic decides.
+    """
+    fm = aiter.fused_moe
+    fits = fm._asm_fmoe_weights_fit_u32_offsets
+    bf16, fp8 = dtypes.bf16, dtypes.fp8
+
+    # Weight size, by shape (g1u1 w1 is 2 * inter_dim rows; w2 is model_dim x inter_dim).
+    assert not fits(256, 7168, 2048, True, fp8, bf16)  # w1 = 7 GiB
+    assert fits(256, 7168, 1024, True, fp8, bf16)  # w1 = 3.5 GiB
+    assert fits(256, 4096, 2048, True, fp8, bf16)  # w1 = exactly 4 GiB
+    assert not fits(256, 4096, 2049, True, fp8, bf16)  # one row past it
+    assert fits(256, 7168, 2048, False, fp8, bf16)  # g1u2: w1 = w2 = 3.5 GiB
+    # A 4-bit weight counts half a byte per element, so a shape that is 7 GiB
+    # in fp8 is 3.5 GiB packed.
+    assert fits(256, 7168, 2048, True, dtypes.fp4x2, bf16)
+    # No q_dtype_w: the weights are in the model dtype (2 bytes).
+    assert not fits(256, 7168, 1024, True, None, bf16)
+
+    def run_1stage(token, inter_dim, qtype, w_dtype, a_dtype=fp8, g1u1=True):
+        fm.get_2stage_cfgs.cache_clear()
+        try:
+            with override_env("AITER_BYPASS_TUNE_CONFIG", "1"):
+                return fm.get_2stage_cfgs(
+                    token,
+                    7168,
+                    inter_dim,
+                    256,
+                    8,
+                    bf16,
+                    a_dtype,
+                    w_dtype,
+                    qtype,
+                    g1u1,
+                    aiter.ActivationType.Silu,
+                    False,
+                    0,
+                    0,
+                ).run_1stage
+        finally:
+            fm.get_2stage_cfgs.cache_clear()
+
+    host = fm.get_gfx_runtime()
+    real_gfx = fm._ASM_FMOE_U32_WEIGHT_OFFSET_GFX
+    assert "gfx942" in real_gfx, "the production guard must cover gfx942"
+    cases = (  # (token, quant type): the default heuristic takes asm 1-stage here
+        (256, aiter.QuantType.per_Token),
+        (256, aiter.QuantType.per_1x128),
+    )
+    try:
+        for token, qtype in cases:
+            # Previous dispatch: the guard turned off for every arch.
+            fm._ASM_FMOE_U32_WEIGHT_OFFSET_GFX = ()
+            before_big = run_1stage(token, 2048, qtype, fp8)
+            before_small = run_1stage(token, 1024, qtype, fp8)
+            if host == "gfx942":
+                assert before_big and before_small, (
+                    f"{qtype}: the default heuristic no longer takes asm 1-stage, "
+                    "so this test cannot see the guard"
+                )
+            # The guard on for this arch: oversized weights leave asm 1-stage,
+            # weights that fit keep the previous dispatch.
+            fm._ASM_FMOE_U32_WEIGHT_OFFSET_GFX = (host,)
+            assert not run_1stage(token, 2048, qtype, fp8), f"{qtype}: 7 GiB w1"
+            assert run_1stage(token, 1024, qtype, fp8) == before_small, qtype
+            # An arch outside the guard keeps the previous dispatch at any size.
+            fm._ASM_FMOE_U32_WEIGHT_OFFSET_GFX = ("gfx90a",)
+            assert run_1stage(token, 2048, qtype, fp8) == before_big, qtype
+        # Non-gated weights cannot take CK stage 1 (it halves w1.size(1)), so an
+        # oversized one is rejected rather than rerouted.
+        fm._ASM_FMOE_U32_WEIGHT_OFFSET_GFX = (host,)
+        if host == "gfx942":
+            try:
+                run_1stage(1, 2048, aiter.QuantType.No, bf16, bf16, False)
+            except NotImplementedError:
+                pass
+            else:
+                raise AssertionError("oversized non-gated weights must be rejected")
+            assert run_1stage(1, 1024, aiter.QuantType.No, bf16, bf16, False)
+    finally:
+        fm._ASM_FMOE_U32_WEIGHT_OFFSET_GFX = real_gfx
+        fm.get_2stage_cfgs.cache_clear()
+    aiter.logger.info("moe_2stage: gfx942 asm 1-stage 4 GiB guard passed")
+
+
 def _quant_blockscale_weight(w):
     e, n, k = w.shape
     blocks = w.view(e, n // 128, 128, k // 128, 128).permute(0, 1, 3, 2, 4).contiguous()
@@ -2807,6 +2897,7 @@ if args.bm16_scale_boundary:
     test_bm16_tiled_scale_boundary()
 else:
     test_output_buffer_contract()
+    test_gfx942_asm_1stage_4gib_guard()
     test_swiglu_limit_guards()
     if get_gfx() in ("gfx942", "gfx950"):
         run_blockscale_limit_cases()
