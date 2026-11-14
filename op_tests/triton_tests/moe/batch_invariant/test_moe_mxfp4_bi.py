@@ -179,6 +179,12 @@ def test_tensor_parallel_layout(tp):
     for out in _two_pass(run_rank, tp, lambda planes: torch.cat(planes)):
         assert torch.equal(out, ref)
 
+    def strided_rank(r, gather):  # gather returns a strided view, NaN in the gaps
+        return run_rank(r, lambda t: _strided_copy(gather(t)))
+
+    for out in _two_pass(strided_rank, tp, lambda planes: torch.cat(planes)):
+        assert torch.equal(out, ref)
+
 
 def test_chunk_planes_past_int32():
     """One TP rank, one large token block: 7 chunk-plane strides pass 2**31."""

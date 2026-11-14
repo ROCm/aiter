@@ -398,7 +398,7 @@ def _w2(
             _grouped_gemm(
                 act, ar, w2, w2_scale, route, n_out, N_local // chunk, block_m
             )
-        )
+        ).contiguous()
         assert P.shape[0] == N_CHUNKS, f"{P.shape[0]} chunk planes, expected {N_CHUNKS}"
         return _tree8_rows(
             P,
