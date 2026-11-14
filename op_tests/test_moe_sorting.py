@@ -194,7 +194,7 @@ def _moe_sorting_roofline(token, topk, E, model_dim, dtype):
     return flops, nbytes
 
 
-def _compare_moe_sorting_outputs(ref, out, topk, num_rows):
+def _compare_moe_sorting_outputs(ref, out, topk, num_rows, exact_ids=True):
     (
         sorted_ids_a,
         sorted_weights_a,
@@ -231,10 +231,14 @@ def _compare_moe_sorting_outputs(ref, out, topk, num_rows):
     )
     weight_mask = sorted_ids_a != (topk << 24 | num_rows)
     num_tokens_post_pad = num_tokens_post_padded_a[0].item()
+    # Exact: ids are packed (topk << 24 | token), so a relative tolerance would
+    # pass a pad id holding the wrong token.
+    exact = {"rtol": 0, "atol": 0} if exact_ids else {}
     errs["sorted_ids"] = checkAllclose(
         sorted_ids_a[:num_tokens_post_pad],
         sorted_ids_b[:num_tokens_post_pad],
         msg="sorted_ids",
+        **exact,
     )
     errs["sorted_weights"] = checkAllclose(
         sorted_weights_a[weight_mask],
@@ -485,7 +489,14 @@ def test_moe_sorting(
             num_warmup=1,
             num_iters=2,
         )
-        errs = _compare_moe_sorting_outputs(ref, out, topk, topk_ids.shape[0])
+        # CK-tile's sorter still pads with the device-side count, so its ids
+        # keep the loose comparison: in composable_kernel's
+        # moe_sorting_kernel.hpp, moe_align_block_size_kernel_ex and
+        # MoeSortingMultiPhaseKernel_P3 / _P23 write `tokens`, which under
+        # LocalToken is p_local_tokens[0].
+        errs = _compare_moe_sorting_outputs(
+            ref, out, topk, topk_ids.shape[0], exact_ids=name != "ck"
+        )
         err = max(errs.values()) if errs else 0.0
         bad = {k: v for k, v in errs.items() if v}
         if bad:
