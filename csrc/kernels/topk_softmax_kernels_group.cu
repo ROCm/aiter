@@ -43,10 +43,14 @@
 #define AITER_TOPK_REG_MIN_TOPK 4
 #endif
 
-// Wave64 EPL = ceil(num_experts / 64). Instantiating 1..32 dominates
+// EPL = ceil(num_experts / wave size). Instantiating 1..32 dominates
 // module_moe_asm device codegen; keep the shapes this path is meant to hit,
-// fall back to LDS for the rest. Override by defining
-// AITER_TOPK_REG_LAUNCH_EPLS before include.
+// fall back to LDS for the rest. Both lists are instantiated for every target,
+// so the wave32 one reuses wave64 instantiations only: E=384, 768 and 896 would
+// need 12, 24 and 28 of their own, and aligned BF16 rows of E=768 and 896
+// take topk_reg_mw_kernel. Wave32 builds leave the EPLs only wave64 launches
+// empty. Override by defining AITER_TOPK_REG_LAUNCH_EPLS (wave64) or
+// AITER_TOPK_REG_LAUNCH_EPLS_W32 (wave32) before include.
 #ifndef AITER_TOPK_REG_LAUNCH_EPLS
 #define AITER_TOPK_REG_LAUNCH_EPLS(X) \
     X(2)  /* E=128 */                 \
@@ -57,6 +61,14 @@
     X(14) /* E=896 */                 \
     X(16) /* E=1024 */                \
     X(32) /* E=2048 */
+#endif
+#ifndef AITER_TOPK_REG_LAUNCH_EPLS_W32
+#define AITER_TOPK_REG_LAUNCH_EPLS_W32(X) \
+    X(4)  /* E=128 */                     \
+    X(6)  /* E=192 */                     \
+    X(8)  /* E=256 */                     \
+    X(16) /* E=512 */                     \
+    X(32) /* E=1024 */
 #endif
 
 #ifndef C_LOG2E
@@ -313,6 +325,11 @@ __inline__ __device__ void warpReduceMax(float& val_o, int& idx)
 // Compact form of the legacy wave64 DPP tie-priority table.
 constexpr int kLegacyTopKLocalBits      = 5;
 constexpr int kTopKRegMaxExpertsPerLane = 1 << kLegacyTopKLocalBits;
+// Candidates the register path stages before its fallback: one slot per lane
+// on wave64, two on wave32. At topk 16, one per lane on wave32 would overflow
+// on up to ~0.16% of random rows (E=1024), and on MI455X each such row adds
+// 25-45 us to the whole launch (E = 512 and 1024).
+constexpr int kTopKRegCandCap = 64;
 
 // Wave64 rank; its low five bits are the wave32 rank (permlanex16 for row_bcast).
 __device__ __forceinline__ int legacy_topk_lane_rank(int lane)
@@ -322,14 +339,14 @@ __device__ __forceinline__ int legacy_topk_lane_rank(int lane)
     return ((~lane) & 0x38) | bit2 | low2;
 }
 
-// Legacy float4 order: lane + 64 * round, then element 0..3.
+// Legacy float4 order: lane + WARP_SIZE * round, then element 0..3.
 __device__ __forceinline__ int legacy_topk_tie_rank(int expert_id)
 {
     if(expert_id < 0)
         return 0x7fffffff;
     const int vec4_id   = expert_id >> 2;
     const int lane      = vec4_id & (WARP_SIZE - 1);
-    const int local_pos = ((vec4_id >> 6) << 2) | (expert_id & 3);
+    const int local_pos = ((vec4_id / WARP_SIZE) << 2) | (expert_id & 3);
     return (legacy_topk_lane_rank(lane) << kLegacyTopKLocalBits) | local_pos;
 }
 
@@ -341,8 +358,41 @@ topk_candidate_better(float a_score, int a_id, float b_score, int b_id)
     return legacy_topk_tie_rank(a_id) < legacy_topk_tie_rank(b_id);
 }
 
+// warp_rank_desc over kSlots keys per lane: lane L holds slots L + s * WARP_SIZE,
+// and rank[s] counts the slots in [0, n) with a larger key.
+template <int kSlots>
+__device__ __forceinline__ void
+warp_rank_desc_slots(const uint64_t (&key)[kSlots], int (&rank)[kSlots], int n)
+{
+#pragma unroll
+    for(int s = 0; s < kSlots; ++s)
+        rank[s] = 0;
+    // n is wave-uniform; most rows fit in the first slot row.
+    if(n <= WARP_SIZE)
+    {
+        rank[0] = warp_rank_desc(key[0], n);
+        return;
+    }
+#pragma unroll
+    for(int t = 0; t < kSlots; ++t)
+    {
+        const uint32_t hi = uint32_t(key[t] >> 32), lo = uint32_t(key[t]);
+        const int cnt = min(n - t * WARP_SIZE, WARP_SIZE);
+#pragma unroll 8
+        for(int j = 0; j < cnt; ++j)
+        {
+            const uint64_t other = (uint64_t(uint32_t(__builtin_amdgcn_readlane(hi, j))) << 32) |
+                                   uint32_t(__builtin_amdgcn_readlane(lo, j));
+#pragma unroll
+            for(int s = 0; s < kSlots; ++s)
+                rank[s] += other > key[s] ? 1 : 0;
+        }
+    }
+}
+
 // The caller admits this helper only when finite-only compaction found
-// between topk and WARP_SIZE candidates, one per lane.
+// between topk and kTopKRegCandCap candidates; lane L holds slots
+// L + s * WARP_SIZE.
 __device__ __forceinline__ void emit_legacy_ordered_topk(float* cand_val,
                                                          int* cand_idx,
                                                          const float* sig_scores,
@@ -353,21 +403,51 @@ __device__ __forceinline__ void emit_legacy_ordered_topk(float* cand_val,
                                                          float routed_scaling_factor,
                                                          bool need_renorm)
 {
-    const int lane  = threadIdx.x;
-    const bool live = lane < n_cand;
-    const int ci    = live ? cand_idx[lane] : -1;
+    constexpr int kSlots = kTopKRegCandCap / WARP_SIZE;
+    const int lane       = threadIdx.x;
     // A larger key is further ahead: the score, then the lower legacy tie rank.
-    const uint64_t key =
-        live ? (uint64_t(float_order_key(cand_val[lane])) << 32) |
-                   uint32_t(~legacy_topk_tie_rank(ci))
-             : 0;
-    const int rank = warp_rank_desc(key, n_cand);
-    // Every lane has read its candidate before the slots are reused in order.
-    __builtin_amdgcn_wave_barrier();
-    if(live && rank < topk)
+    // Every lane reads its candidates before the slots are reused in order.
+    if constexpr(kSlots == 1)
     {
-        cand_val[rank] = sig_scores[ci];
-        cand_idx[rank] = ci;
+        const bool live    = lane < n_cand;
+        const int ci       = live ? cand_idx[lane] : -1;
+        const uint64_t key = live ? (uint64_t(float_order_key(cand_val[lane])) << 32) |
+                                        uint32_t(~legacy_topk_tie_rank(ci))
+                                  : 0;
+        const int rank     = warp_rank_desc(key, n_cand);
+        __builtin_amdgcn_wave_barrier();
+        if(live && rank < topk)
+        {
+            cand_val[rank] = sig_scores[ci];
+            cand_idx[rank] = ci;
+        }
+    }
+    else
+    {
+        int ci[kSlots];
+        uint64_t key[kSlots];
+#pragma unroll
+        for(int s = 0; s < kSlots; ++s)
+        {
+            const int slot  = lane + s * WARP_SIZE;
+            const bool live = slot < n_cand;
+            ci[s]           = live ? cand_idx[slot] : -1;
+            key[s]          = live ? (uint64_t(float_order_key(cand_val[slot])) << 32) |
+                                uint32_t(~legacy_topk_tie_rank(ci[s]))
+                                   : 0;
+        }
+        int rank[kSlots];
+        warp_rank_desc_slots(key, rank, n_cand);
+        __builtin_amdgcn_wave_barrier();
+#pragma unroll
+        for(int s = 0; s < kSlots; ++s)
+        {
+            if(ci[s] >= 0 && rank[s] < topk)
+            {
+                cand_val[rank[s]] = sig_scores[ci[s]];
+                cand_idx[rank[s]] = ci[s];
+            }
+        }
     }
     __builtin_amdgcn_wave_barrier();
 
@@ -739,6 +819,13 @@ grouped_topk_kernel(DTYPE_I* __restrict__ gating_output,         // [num_tokens,
     }
 }
 
+constexpr bool topk_reg_w32_launches(int epl)
+{
+#define AITER_TOPK_REG_IS_EPL(EPL) epl == (EPL) ||
+    return AITER_TOPK_REG_LAUNCH_EPLS_W32(AITER_TOPK_REG_IS_EPL) false;
+#undef AITER_TOPK_REG_IS_EPL
+}
+
 // Single-group top-k that keeps scores in VGPRs and preserves legacy ordering.
 // For biased sigmoid the output weights are the pre-bias sigmoid (from LDS),
 // not (score - bias).
@@ -767,6 +854,9 @@ __global__ void topk_reg_kernel(DTYPE_I* __restrict__ gating_output,
     static_assert(!(isBiased && isSoftmax), "biased path is sigmoid only");
     static_assert(EXPERTS_PER_LANE <= kTopKRegMaxExpertsPerLane,
                   "legacy tie-rank encoding reserves five local-position bits");
+    // The wave32 dispatch skips this EPL; an empty body saves its codegen.
+    if constexpr(WARP_SIZE == 32 && !topk_reg_w32_launches(EXPERTS_PER_LANE))
+        return;
 
     using cktype_i = typename aiter::hip2opus<DTYPE_I>::type;
     using vec_i    = opus::vector_t<cktype_i, 2>;
@@ -934,7 +1024,7 @@ __global__ void topk_reg_kernel(DTYPE_I* __restrict__ gating_output,
     __builtin_amdgcn_wave_barrier();
     // The lane-max pivot keeps every true winner before candidate sorting.
     float* cand_val = sig_scores + num_experts;
-    int* cand_idx   = reinterpret_cast<int*>(cand_val + WARP_SIZE);
+    int* cand_idx   = reinterpret_cast<int*>(cand_val + kTopKRegCandCap);
 
     float lmax = -INFINITY;
     for_each_owned([&](float& v, int) { lmax = dev_max_(lmax, v); });
@@ -957,7 +1047,8 @@ __global__ void topk_reg_kernel(DTYPE_I* __restrict__ gating_output,
     const int n_cand = n_gt + __builtin_amdgcn_readlane(eq_base, WARP_SIZE - 1);
     eq_base += n_gt - my_eq;
 
-    if(pivot > -INFINITY && n_cand >= topk && n_cand <= WARP_SIZE)
+    constexpr int kCandSlots = kTopKRegCandCap / WARP_SIZE;
+    if(pivot > -INFINITY && n_cand >= topk && n_cand <= kCandSlots * WARP_SIZE)
     {
         int slot_gt = gt_base;
         int slot_eq = eq_base;
@@ -989,7 +1080,7 @@ __global__ void topk_reg_kernel(DTYPE_I* __restrict__ gating_output,
         return;
     }
 
-    // Fallback for more candidates than the wave can stage one per lane. Rare --
+    // Fallback for more than kTopKRegCandCap candidates. Rare --
     // a poison probe measured zero hits over 4096 rows of the benchmark
     // distribution -- but correctness depends on it, so it stays. Still register
     // resident; it only gives up the pivot, not the VGPR-held scores.
@@ -1061,6 +1152,405 @@ __global__ void topk_reg_kernel(DTYPE_I* __restrict__ gating_output,
         topk_weights[token_idx * stride_tk + lane] = topk_value * sum;
         topk_ids[token_idx * stride_tk + lane]     = topk_indice;
     }
+}
+
+// Multi-wave register top-k on wave32 (gfx1250), biased sigmoid scores only.
+// Aimed at decode; it also beats topk_reg_kernel at 8192 tokens (E = 512, 1024).
+//
+// topk_reg_kernel runs a row per wave: at decode that is a few dozen waves on
+// a 256-CU part, each walking E / 32 experts per lane through long serial
+// chains. Here a row gets a workgroup of E / 128 waves and every lane owns
+// four consecutive experts (one vector load each for logits and bias):
+//
+//   1. sigmoid + bias for the lane's four experts, the lane maximum to LDS;
+//   2. barrier; group g is lane g of every wave (E / 32 experts), so every
+//      wave sorts the same 32 group maxima and takes the topk-th as the
+//      pivot;
+//   3. elements >= pivot go to LDS as candidate records, one LDS atomic per
+//      wave for the slot base (order is irrelevant: the key is unique);
+//   4. barrier; wave 0 ranks up to 64 records by lane rotations and
+//      renormalizes in rank order. More than 64 take topk wave arg-max
+//      rounds over the whole row.
+//
+// The groups only set the pivot. Ids and weights match topk_reg_kernel bit for
+// bit: the same score key and legacy tie rank order the picks, the sigmoid gives
+// the same bits, and the renormalization sums them serially in rank order.
+
+// HIP's math header and opus both offer a templated max/min for unsigned.
+__device__ __forceinline__ uint32_t umax32(uint32_t a, uint32_t b) { return a > b ? a : b; }
+__device__ __forceinline__ uint32_t umin32(uint32_t a, uint32_t b) { return a > b ? b : a; }
+
+// Maximum of v[0..N) as a balanced tree, which the compiler leaves unbalanced
+// when handed a chain.
+template <int N>
+__device__ __forceinline__ uint32_t umax_tree(const uint32_t* v)
+{
+    if constexpr(N == 1)
+        return v[0];
+    else
+        return umax32(umax_tree<N / 2>(v), umax_tree<N - N / 2>(v + N / 2));
+}
+
+// Value of lane ^ kXor within a wave32, without an LDS round trip. Every source
+// lane is valid, so bound_ctrl changes nothing but lets the DPP combiner fold
+// the move into its user.
+template <int kXor, typename T>
+__device__ __forceinline__ T wave32_xor_lane(T v)
+{
+    static_assert(sizeof(T) == 4);
+    if constexpr(kXor == 1)
+        return aiter_dpp::move_dpp<T, 0xb1, 0xf, 0xf, true>(v); // quad_perm:[1,0,3,2]
+    else if constexpr(kXor == 2)
+        return aiter_dpp::move_dpp<T, 0x4e, 0xf, 0xf, true>(v); // quad_perm:[2,3,0,1]
+    else if constexpr(kXor == 4)
+        return aiter_dpp::move_dpp<T, 0x164, 0xf, 0xf, true>(v); // row_xmask:4
+    else if constexpr(kXor == 8)
+        return aiter_dpp::move_dpp<T, 0x168, 0xf, 0xf, true>(v); // row_xmask:8
+    else
+    {
+        static_assert(kXor == 16);
+        return warp_permlanex16(v);
+    }
+}
+
+// Descending bitonic sort of one u32 per lane over a wave32, each
+// compare-exchange a single med3: the median of (a, b, ~0u) is max(a, b), of
+// (a, b, 0u) min(a, b). Afterwards lane 0 holds the largest.
+__device__ __forceinline__ uint32_t wave32_sort_desc_u32(uint32_t v, int lane)
+{
+    uint32_t lane_bit[6]; // all ones where bit b of the lane is set; K = 32 has none
+#pragma unroll
+    for(int b = 0; b < 5; ++b)
+        lane_bit[b] = 0u - ((uint32_t(lane) >> b) & 1u);
+    lane_bit[5] = 0u;
+    opus::static_for<5>([&](auto ks) {
+        constexpr int k = decltype(ks)::value + 1; // K = 1 << k
+        opus::static_for<decltype(ks)::value + 1>([&](auto js) {
+            constexpr int j            = k - 1 - decltype(js)::value; // J = 1 << j
+            const uint32_t keep_larger = ~(lane_bit[j] ^ lane_bit[k]);
+            const uint32_t o           = wave32_xor_lane<1 << j>(v);
+            v                          = umax32(umin32(o, v), umin32(umax32(o, v), keep_larger));
+        });
+    });
+    return v;
+}
+
+// warp_rank_desc over all 32 lanes from lane rotations, without the scalar
+// round trip of a readlane per lane: row_ror covers the other lanes of a
+// 16-lane row, and the same rotations of the row-swapped key the other row.
+__device__ __forceinline__ int wave32_rank_desc_dpp(uint64_t key)
+{
+    const uint32_t hi = uint32_t(key >> 32), lo = uint32_t(key);
+    const uint32_t xhi = warp_permlanex16(hi), xlo = warp_permlanex16(lo);
+    int rank   = 0;
+    auto count = [&](uint32_t o_hi, uint32_t o_lo) {
+        rank += ((uint64_t(o_hi) << 32) | o_lo) > key ? 1 : 0;
+    };
+    count(xhi, xlo);
+    opus::static_for<15>([&](auto d) {
+        constexpr int kRowRor = 0x121 + decltype(d)::value; // row_ror:d+1
+        count(aiter_dpp::move_dpp<uint32_t, kRowRor>(hi),
+              aiter_dpp::move_dpp<uint32_t, kRowRor>(lo));
+        count(aiter_dpp::move_dpp<uint32_t, kRowRor>(xhi),
+              aiter_dpp::move_dpp<uint32_t, kRowRor>(xlo));
+    });
+    return rank;
+}
+
+// wave32_rank_desc_dpp for two keys per lane, slot s of lane l being key
+// l + 32 * s: every rotation of either slot meets both of the lane's keys. The
+// unrotated other slot counts too; a key never outranks itself.
+__device__ __forceinline__ void wave32_rank_desc_dpp2(const uint64_t (&key)[2], int (&rank)[2])
+{
+    rank[0] = rank[1] = 0;
+    auto count        = [&](uint32_t o_hi, uint32_t o_lo) {
+        const uint64_t o = (uint64_t(o_hi) << 32) | o_lo;
+        rank[0] += o > key[0] ? 1 : 0;
+        rank[1] += o > key[1] ? 1 : 0;
+    };
+#pragma unroll
+    for(int s = 0; s < 2; ++s)
+    {
+        const uint32_t hi = uint32_t(key[s] >> 32), lo = uint32_t(key[s]);
+        const uint32_t xhi = warp_permlanex16(hi), xlo = warp_permlanex16(lo);
+        count(hi, lo);
+        count(xhi, xlo);
+        opus::static_for<15>([&](auto d) {
+            constexpr int kRowRor = 0x121 + decltype(d)::value; // row_ror:d+1
+            count(aiter_dpp::move_dpp<uint32_t, kRowRor>(hi),
+                  aiter_dpp::move_dpp<uint32_t, kRowRor>(lo));
+            count(aiter_dpp::move_dpp<uint32_t, kRowRor>(xhi),
+                  aiter_dpp::move_dpp<uint32_t, kRowRor>(xlo));
+        });
+    }
+}
+
+// Top-16 routing plus the extra candidate of HERD's top-(K + 1). The
+// renormalization reads this many lanes on every row.
+constexpr int kTopKRegMwMaxTopK = 17;
+// The two-slot ranking parks every rank past the wave in lane 31, which must
+// stay past topk, and the fallback draws its fillers from ids 0..31.
+static_assert(kTopKRegMwMaxTopK < 32, "lane 31 must not hold a pick");
+
+template <typename DTYPE_I, int kWaves, typename DTYPE_B = DTYPE_I>
+__global__ __launch_bounds__(kWaves * 32) void topk_reg_mw_kernel(
+    const DTYPE_I* __restrict__ gating_output,   // [num_tokens, kWaves * 128]
+    const DTYPE_B* __restrict__ correction_bias, // [kWaves * 128]
+    float* __restrict__ topk_weights,            // [num_tokens, topk]
+    int* __restrict__ topk_ids,                  // [num_tokens, topk]
+    const size_t stride_gating,
+    const size_t stride_tk,
+    const int topk,
+    const float routed_scaling_factor,
+    const bool need_renorm,
+    const int* __restrict__ num_valid_rows)
+{
+#if !defined(__GFX9__) // wave64 there; the host launches this only at wave32
+    constexpr int W        = 32;
+    constexpr int kExperts = kWaves * W * 4;
+    static_assert(kWaves >= 1 && kWaves <= 8,
+                  "legacy tie-rank encoding reserves five local-position bits");
+    static_assert(kTopKRegCandCap == 2 * W);
+    using vec_i = opus::vector_t<typename aiter::hip2opus<DTYPE_I>::type, 4>;
+    using vec_b = opus::vector_t<typename aiter::hip2opus<DTYPE_B>::type, 4>;
+    // float_order_key(-INFINITY): a pivot at or below it means fewer than topk finite group maxima.
+    constexpr uint32_t kNegInfKey = 0x007fffffu;
+
+    // Lane maxima as [group][wave]; group g is lane g of every wave.
+    __shared__ __attribute__((aligned(16))) uint32_t s_gmax[W * 8];
+    // Candidates: {score key, ~tie rank << 16 | id, sigmoid bits, unused}, then
+    // a dump record per lane for its misses. The overflow lands in the dump
+    // records too; past kTopKRegCandCap candidates the fallback reloads the row.
+    __shared__ uint4 s_cand[kTopKRegCandCap + W];
+    // Sigmoid by expert, for the fallback only.
+    __shared__ float s_sig[kExperts];
+    // Word W - 1 counts the candidates; the other lanes add 0 to their own word.
+    __shared__ uint32_t s_ncand[W];
+
+    const int lane  = threadIdx.x % W;
+    const int wave  = __builtin_amdgcn_readfirstlane(threadIdx.x / W);
+    const int token = blockIdx.x;
+    const int quad  = wave * W + lane; // experts 4 * quad .. 4 * quad + 3
+
+    // Loads go out before the pad-row check so their latency overlaps its
+    // scalar load; a pad row's slice is still allocated.
+    const DTYPE_I* row = gating_output + token * stride_gating;
+    const vec_i g      = reinterpret_cast<const vec_i*>(row)[quad];
+    const vec_b b      = reinterpret_cast<const vec_b*>(correction_bias)[quad];
+    if(__builtin_expect(is_pad_row(num_valid_rows, token), 0))
+    {
+        write_pad_row(topk_weights + token * stride_tk,
+                      topk_ids + token * stride_tk,
+                      topk,
+                      threadIdx.x,
+                      blockDim.x);
+        return;
+    }
+
+    // topk_reg_kernel rounds the f64 product -C_LOG2E * x to float, and f64
+    // runs at 1/32 rate on gfx1250. For 16-bit inputs a hi/lo split fma gives
+    // the same sigmoid bits (checked over every bf16 and fp16 value).
+    static_assert(sizeof(DTYPE_I) == 2, "the split fma matches only for 16-bit inputs");
+    constexpr float kNegLog2eHi = -static_cast<float>(C_LOG2E);
+    constexpr float kNegLog2eLo = static_cast<float>(-C_LOG2E - static_cast<double>(kNegLog2eHi));
+
+    auto sigmoid = [](float x) {
+        const float t = __builtin_fmaf(kNegLog2eHi, x, kNegLog2eLo * x);
+        return __builtin_amdgcn_rcpf(1.0f + exp2f(t));
+    };
+    float sig[4];
+    uint32_t key[4];
+#pragma unroll
+    for(int i = 0; i < 4; ++i)
+    {
+        sig[i]        = sigmoid(static_cast<float>(g[i]));
+        const float s = sig[i] + static_cast<float>(b[i]);
+        // topk_reg_kernel never picks a NaN score either; here it ranks as -inf.
+        key[i] = float_order_key(s == s ? s : -INFINITY);
+    }
+
+    s_gmax[lane * 8 + wave] = umax32(umax32(key[0], key[1]), umax32(key[2], key[3]));
+    if(threadIdx.x == 0)
+        s_ncand[W - 1] = 0;
+    __syncthreads();
+
+    // Every wave derives the same pivot: the topk-th largest group maximum.
+    // At least topk scores reach it, so it keeps every winner.
+    uint32_t gk = 0;
+#pragma unroll
+    for(int w = 0; w < kWaves; ++w)
+        gk = umax32(gk, s_gmax[lane * 8 + w]);
+    // A bitonic network rather than lane-rotation ranks: waves sharing a SIMD
+    // fill each other's latency gaps here, and the ranks issue more VALU work.
+    gk                   = wave32_sort_desc_u32(gk, lane);
+    const uint32_t pivot = __builtin_amdgcn_readlane(gk, topk - 1);
+
+    // Slots are lane-major: a lane's candidates follow those of the lanes
+    // below it, counted by mbcnt. Counts, slots and stores all stay on the
+    // VALU with the full exec mask; on gfx1250 a scalar op that consumes a
+    // fresh compare stalls ~25 cycles, and a conditional store pays that
+    // for its exec mask. Every lane joins the atomic so its address is
+    // divergent and the atomic optimizer leaves it alone.
+    bool hit[4];
+    int below = 0;
+    int mine  = 0;
+#pragma unroll
+    for(int i = 0; i < 4; ++i)
+    {
+        hit[i] = key[i] >= pivot;
+        below  = __builtin_amdgcn_mbcnt_lo(__builtin_amdgcn_ballot_w32(hit[i]), below);
+        mine += hit[i] ? 1 : 0;
+    }
+    const uint32_t old = atomicAdd(&s_ncand[lane], lane == W - 1 ? uint32_t(below + mine) : 0u);
+    int slot           = __builtin_amdgcn_readlane(int(old), W - 1) + below;
+#pragma unroll
+    for(int i = 0; i < 4; ++i)
+    {
+        const int id = 4 * quad + i;
+        // A min rather than hit && slot < cap, which the compiler ands on the SALU.
+        const uint32_t dst = umin32(hit[i] ? uint32_t(slot) : ~0u, kTopKRegCandCap + lane);
+        s_cand[dst]        = make_uint4(key[i],
+                                 (uint32_t(~legacy_topk_tie_rank(id)) << 16) | uint32_t(id),
+                                 __builtin_bit_cast(uint32_t, sig[i]),
+                                 0u);
+        slot += hit[i] ? 1 : 0;
+    }
+    __syncthreads();
+    if(wave != 0)
+        return;
+
+    // Lane k ends up with the k-th pick's sigmoid and id. The count and both
+    // candidate rows load together; dead slots get a zero key, which ranks
+    // last.
+    const uint32_t n_raw = s_ncand[W - 1];
+    uint4 c0             = s_cand[lane];
+    uint4 c1             = s_cand[lane + W];
+    // Otherwise the record loads wait for the count.
+    __builtin_amdgcn_sched_barrier(0);
+    const int n_cand = __builtin_amdgcn_readfirstlane(n_raw);
+    if(lane >= n_cand)
+        c0 = make_uint4(0u, 0u, 0u, 0u);
+    const bool fast = pivot > kNegInfKey && n_cand >= topk;
+    float w         = 0.0f;
+    int id          = 0;
+    // The common path is laid out straight after the barrier, the rest out of line.
+    if(__builtin_expect(fast && n_cand <= W, 1))
+    {
+        // Live keys are unique, so ranks 0..n_cand-1 go to distinct lanes;
+        // dead lanes all rank n_cand, a lane past topk.
+        const uint64_t k64 = (uint64_t(c0.x) << 32) | c0.y;
+        const int dst      = wave32_rank_desc_dpp(k64) * 4;
+        w                  = __builtin_bit_cast(float, __builtin_amdgcn_ds_permute(dst, int(c0.z)));
+        id                 = __builtin_amdgcn_ds_permute(dst, int(c0.y & 0xffffu));
+    }
+    else if(fast && n_cand <= kTopKRegCandCap)
+    {
+        if(lane + W >= n_cand)
+            c1 = make_uint4(0u, 0u, 0u, 0u);
+        // Each lane below topk gets exactly one of the two pushes, and
+        // ds_permute reads 0 where nothing lands. Its targets wrap mod 32,
+        // so ranks past the wave are clamped to lane 31, past topk.
+        uint32_t got = 0;
+        // Keep the lambda: written straight-line, this compiler puts every
+        // rank compare in an SGPR mask, each behind an s_delay_alu stall.
+        auto rank_and_push = [&] {
+            const uint64_t k64[2] = {(uint64_t(c0.x) << 32) | c0.y, (uint64_t(c1.x) << 32) | c1.y};
+            int rank[2];
+            wave32_rank_desc_dpp2(k64, rank);
+            const int d0 = umin32(rank[0], W - 1) * 4, d1 = umin32(rank[1], W - 1) * 4;
+            w   = __builtin_bit_cast(float,
+                                   __builtin_amdgcn_ds_permute(d0, int(c0.z)) |
+                                       __builtin_amdgcn_ds_permute(d1, int(c1.z)));
+            got = __builtin_amdgcn_ds_permute(d0, int(c0.y)) |
+                  __builtin_amdgcn_ds_permute(d1, int(c1.y));
+        };
+        rank_and_push();
+        id = int(got & 0xffffu);
+    }
+    else
+    {
+        // The whole row, which wave 0 reloads: lane L owns quads L + W * r,
+        // keyed as the candidate records are. Every pick is a branch-free wave
+        // arg-max, the score words first and then the tie words of the scores
+        // that reach their maximum: v_max_u64 issues at 1/32 rate on gfx1250,
+        // and topk_reg_kernel's scan through topk_candidate_better takes
+        // ~40 us for a row of ties.
+        uint32_t fhi[kWaves * 4]; // score key, 0 once taken or for -inf / NaN
+        uint32_t flo[kWaves * 4]; // ~tie rank << 16 | id
+#pragma unroll
+        for(int r = 0; r < kWaves; ++r)
+        {
+            const int q    = r * W + lane;
+            const vec_i gr = reinterpret_cast<const vec_i*>(row)[q];
+            const vec_b br = reinterpret_cast<const vec_b*>(correction_bias)[q];
+#pragma unroll
+            for(int i = 0; i < 4; ++i)
+            {
+                const int e       = 4 * q + i;
+                const float sg    = sigmoid(static_cast<float>(gr[i]));
+                const float s     = sg + static_cast<float>(br[i]);
+                const uint32_t sk = float_order_key(s == s ? s : -INFINITY);
+                s_sig[e]          = sg;
+                // A -inf or NaN score is never picked, as in topk_reg_kernel.
+                fhi[4 * r + i] = sk > kNegInfKey ? sk : 0u;
+                flo[4 * r + i] = (uint32_t(~legacy_topk_tie_rank(e)) << 16) | uint32_t(e);
+            }
+        }
+        __builtin_amdgcn_wave_barrier();
+        auto wave_umax = [](uint32_t v) {
+            opus::static_for<5>(
+                [&](auto s) { v = umax32(v, wave32_xor_lane<1 << decltype(s)::value>(v)); });
+            return v;
+        };
+        uint32_t selected_low_mask = 0;
+        for(int k = 0; k < topk; ++k)
+        {
+            const uint32_t hmax = wave_umax(umax_tree<kWaves * 4>(fhi));
+            uint32_t tie[kWaves * 4];
+            opus::static_for<kWaves * 4>(
+                [&](auto j) { tie[j.value] = fhi[j.value] == hmax ? flo[j.value] : 0u; });
+            const uint32_t lmax            = wave_umax(umax_tree<kWaves * 4>(tie));
+            const bool has_valid_candidate = hmax != 0;
+            // At most topk - 1 IDs are taken, fewer than 32, so [0, 31] holds an unused one.
+            const uint32_t unused        = ~selected_low_mask;
+            const uint32_t unused_from_k = unused & (~0u << k);
+            const int filler  = __builtin_ctz(unused_from_k != 0 ? unused_from_k : unused);
+            const int max_idx = has_valid_candidate ? int(lmax & 0xffffu) : filler;
+            selected_low_mask |= max_idx < 32 ? 1u << max_idx : 0u;
+            opus::static_for<kWaves * 4>(
+                [&](auto j) { fhi[j.value] = flo[j.value] == lmax ? 0u : fhi[j.value]; });
+            const float sg     = s_sig[max_idx];
+            const float pick_w = has_valid_candidate ? sg : 0.0f;
+            id                 = lane == k ? max_idx : id;
+            w                  = lane == k ? pick_w : w;
+        }
+    }
+
+    if(need_renorm)
+    {
+        // Preserve the legacy serial renormalization order. Unrolled to the
+        // host's topk bound so the readlanes issue ahead of the adds; past
+        // topk the sum adds +0, which leaves a non-negative total as is.
+        // The per-lane +0 seed (w is a finite sigmoid or 0) keeps the adds on
+        // the VALU: a scalar add of a readlane result stalls ~29 cycles a
+        // step on gfx1250, a vector add ~6.
+        const int wm = __builtin_bit_cast(int, lane < topk ? w : 0.0f);
+        float total  = w * 0.0f;
+#pragma unroll
+        for(int i = 0; i < kTopKRegMwMaxTopK; ++i)
+            total += __builtin_bit_cast(float, __builtin_amdgcn_readlane(wm, i));
+        w = total > 0.0f ? w * (routed_scaling_factor / total) : 0.0f;
+    }
+    else
+    {
+        w *= routed_scaling_factor;
+    }
+    if(lane < topk)
+    {
+        topk_weights[token * stride_tk + lane] = w;
+        topk_ids[token * stride_tk + lane]     = id;
+    }
+#endif
 }
 
 template <typename DTYPE_I,
@@ -1888,13 +2378,13 @@ biased_grouped_topk_w32_kernel(const DTYPE_I* __restrict__ gating_output, // [nu
                 return;                                                              \
             }
 
-/* Register-resident path. Gates:
+/* Register-resident path, one token per wave (wave64 or wave32). Gates:
  * - no group filter: topk_grp == num_expert_group
- * - wave64 only (wave32 untested)
  * - num_experts % 4 == 0, so the legacy float4 tie order still describes it
- * - ceil(num_experts / 64) in AITER_TOPK_REG_LAUNCH_EPLS (else LDS); lanes
- *   past num_experts in the last round are masked
- * - topk in [AITER_TOPK_REG_MIN_TOPK, 32]
+ * - ceil(num_experts / wave size) in AITER_TOPK_REG_LAUNCH_EPLS (wave64) or
+ *   AITER_TOPK_REG_LAUNCH_EPLS_W32 (wave32), else LDS; lanes past num_experts
+ *   in the last round are masked
+ * - topk in [AITER_TOPK_REG_MIN_TOPK, wave size / 2]
  */
 #define LAUNCHER_TOPK_REG()                                                          \
     {                                                                                \
@@ -1902,16 +2392,22 @@ biased_grouped_topk_w32_kernel(const DTYPE_I* __restrict__ gating_output, // [nu
         const int reg_lanes        = static_cast<int>(get_warp_size_func());         \
         const int experts_per_lane = (num_experts + reg_lanes - 1) / reg_lanes;      \
         if(topk_grp == num_expert_group &&                                           \
-           reg_lanes == 64 &&                                                        \
            (num_experts % 4) == 0 &&                                                 \
            experts_per_lane <= kMaxExpertsPerLane &&                                 \
            topk <= reg_lanes / 2 &&                                                  \
            topk >= AITER_TOPK_REG_MIN_TOPK)                                          \
         {                                                                            \
-            const size_t shared_mem_size = num_experts * sizeof(float) +             \
-                                           reg_lanes * sizeof(float) +               \
-                                           reg_lanes * sizeof(int);                  \
-            AITER_TOPK_REG_LAUNCH_EPLS(AITER_TOPK_REG_LAUNCH_ONE)                    \
+            const size_t shared_mem_size =                                           \
+                num_experts * sizeof(float) +                                        \
+                aiter::kTopKRegCandCap * (sizeof(float) + sizeof(int));              \
+            if(reg_lanes == 64)                                                      \
+            {                                                                        \
+                AITER_TOPK_REG_LAUNCH_EPLS(AITER_TOPK_REG_LAUNCH_ONE)                \
+            }                                                                        \
+            else                                                                     \
+            {                                                                        \
+                AITER_TOPK_REG_LAUNCH_EPLS_W32(AITER_TOPK_REG_LAUNCH_ONE)            \
+            }                                                                        \
         }                                                                            \
     }
 
@@ -2030,7 +2526,7 @@ biased_grouped_topk_w32_kernel(const DTYPE_I* __restrict__ gating_output, // [nu
         });
 
 #define LAUNCHER_topk_reg_kernel(EPL, isBiased, isSoftmax)                                        \
-    if(num_experts == (EPL) * 64)                                                                  \
+    if(num_experts == (EPL) * reg_lanes)                                                           \
     {                                                                                              \
         LAUNCHER_topk_reg_kernel_stride(EPL, isBiased, isSoftmax, false)                           \
     }                                                                                              \
@@ -2176,6 +2672,59 @@ void biased_grouped_topk(const aiter_tensor_t& gating_output,   // [num_tokens, 
         case 4: launch_ng(opus::number<4>{}); break;
         case 2: launch_ng(opus::number<2>{}); break;
         default: launch_ng(opus::number<1>{}); break;
+        }
+        return;
+    }
+
+    // wave32 without a group filter, E = 128 * waves: a row per workgroup,
+    // four experts per lane, read as naturally aligned four-element vectors
+    // from the BF16 logits and the BF16 or FP32 bias.
+    // biased_grouped_topk in aiter/ops/topk.py sends rows here when
+    // _gfx1250_reg_mw_fits passes, so keep the two gates in step: a row it
+    // admits and this gate rejects falls through to topk_reg_kernel (E = 512
+    // and 1024 at topk <= 16) or else to the LDS kernel, which aborts on an FP32 bias.
+    const int mw_waves      = num_experts / 128;
+    const bool mw_bias_fp32 = correction_bias.dtype() == AITER_DTYPE_fp32;
+    if(get_warp_size_func() == 32 && topk_grp == num_expert_group &&
+       num_experts == 128 * mw_waves &&
+       (mw_waves == 4 || mw_waves == 6 || mw_waves == 7 || mw_waves == 8) && topk >= 1 &&
+       topk <= aiter::kTopKRegMwMaxTopK && gating_output.dtype() == AITER_DTYPE_bf16 &&
+       (mw_bias_fp32 || correction_bias.dtype() == AITER_DTYPE_bf16) && stride_gating % 4 == 0 &&
+       reinterpret_cast<uintptr_t>(gating_output.data_ptr()) % 8 == 0 &&
+       reinterpret_cast<uintptr_t>(correction_bias.data_ptr()) % (mw_bias_fp32 ? 16 : 8) == 0)
+    {
+        if(num_tokens == 0)
+            return;
+        auto launch = [&](auto waves, auto bias_tag) {
+            using BiasType = decltype(bias_tag);
+            hipLaunchKernelGGL((aiter::topk_reg_mw_kernel<hip_bfloat16, waves.value, BiasType>),
+                               dim3(num_tokens),
+                               dim3(waves.value * 32),
+                               0,
+                               stream,
+                               reinterpret_cast<const hip_bfloat16*>(gating_output.data_ptr()),
+                               reinterpret_cast<const BiasType*>(correction_bias.data_ptr()),
+                               reinterpret_cast<float*>(topk_weights.data_ptr()),
+                               reinterpret_cast<int*>(topk_ids.data_ptr()),
+                               stride_gating,
+                               stride_tk,
+                               topk,
+                               routed_scaling_factor,
+                               need_renorm,
+                               aiter::num_valid_rows_ptr(num_valid_rows));
+        };
+        auto launch_bias = [&](auto waves) {
+            if(mw_bias_fp32)
+                launch(waves, float{});
+            else
+                launch(waves, hip_bfloat16{});
+        };
+        switch(mw_waves)
+        {
+        case 4: launch_bias(opus::number<4>{}); break;
+        case 6: launch_bias(opus::number<6>{}); break;
+        case 7: launch_bias(opus::number<7>{}); break;
+        default: launch_bias(opus::number<8>{}); break;
         }
         return;
     }
