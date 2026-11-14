@@ -3,6 +3,7 @@ import torch
 import torch.nn.functional as F
 import triton
 
+import aiter.ops.triton.moe.moe_routing.routing as ep_routing
 from aiter.ops.topk import biased_grouped_topk_torch, grouped_topk_torch
 from aiter.ops.triton.moe.moe_routing.routing import (
     compute_expt_data_torch,
@@ -879,6 +880,155 @@ def test_routing_score_mode_grouped(
     assert tri_routing_data.n_expts_tot == n_expts_tot
     assert tri_routing_data.n_expts_act == n_expts_act
     assert tri_routing_data.block_m == block_m
+
+
+def _ep_sort_scratch_stress_setup():
+    """Capture mixed EP calls and retain each histogram until the round ends."""
+    n_local, n_global, top_k, n_bins = 64, 256, 8, 128
+    generator = torch.Generator(device="cuda").manual_seed(20261031)
+    expert_map = torch.full((n_global + 1,), -1, dtype=torch.int32, device="cuda")
+    expert_map[:n_local] = torch.arange(n_local, dtype=torch.int32, device="cuda")
+    sizes = [
+        1,
+        65536,
+        2,
+        32768,
+        3,
+        16384,
+        7,
+        8192,
+        8,
+        4096,
+        15,
+        2048,
+        16,
+        1024,
+        31,
+        512,
+        32,
+        256,
+        33,
+        128,
+        63,
+        64,
+        65,
+        127,
+        129,
+        255,
+        257,
+        511,
+        513,
+        1023,
+        1025,
+        2047,
+        2049,
+        4095,
+        4097,
+        8191,
+        8193,
+        16383,
+        16385,
+        32767,
+        32769,
+        65535,
+        65536,
+    ]
+    cases, expected_hists = [], []
+    for index, n_tokens in enumerate(sizes):
+        ids = torch.randint(
+            -16,
+            n_global + 17,
+            (n_tokens, top_k),
+            dtype=torch.int32,
+            device="cuda",
+            generator=generator,
+        )
+        if index % 2 == 0:
+            # Leave early lanes idle while later lanes contend on one bin.
+            gate = torch.arange(n_tokens * top_k, device="cuda").view_as(ids)
+            ids = torch.where(gate % 128 < 64, 64, 63).to(torch.int32)
+        ids[0] = torch.tensor(
+            [0, 63, 64, 255, -1, 256, 300, -17],
+            dtype=torch.int32,
+            device="cuda",
+        )
+        weights = torch.rand(
+            (n_tokens, top_k), dtype=torch.float32, device="cuda", generator=generator
+        )
+        live_rows = n_tokens if index % 3 == 0 else n_tokens * 3 // 4
+        num_local_tokens = (
+            None
+            if index % 3 == 0
+            else torch.tensor([live_rows], dtype=torch.int32, device="cuda")
+        )
+        # Match the clamping and padded-row mask used by dispatched routing.
+        local = expert_map[ids.long().clamp(0, expert_map.numel() - 1)]
+        valid = (local >= 0) & (
+            torch.arange(n_tokens, device="cuda")[:, None] < live_rows
+        )
+        expected_hists.append(
+            torch.bincount(local[valid].long(), minlength=n_bins).to(torch.int32)
+        )
+        n_gates = n_tokens * top_k
+        block_m = max(16, min(triton.next_power_of_2(max(1, n_gates // n_global)), 128))
+        expt_data = ep_routing._compute_expt_data_internal(
+            n_local, n_gates, block_m, ids.device
+        )
+        src_token_map = torch.arange(n_tokens, dtype=torch.int32, device="cuda")
+        src_token_map += (index % 4) * 65536
+        geometry = ep_routing.EpScatterGeometry(src_token_map, 65536, 65536 * top_k)
+        cases.append((weights, ids, num_local_tokens, expt_data, geometry))
+
+    def route(case):
+        weights, ids, num_local_tokens, expt_data, geometry = case
+        return ep_routing.ep_sort_routing(
+            weights,
+            ids,
+            expert_map,
+            n_local,
+            num_local_tokens,
+            ids.shape[0],
+            top_k,
+            ids.numel(),
+            expt_data,
+            ep_scatter_geometry=geometry,
+        )
+
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(stream):
+        for case in cases:
+            route(case)
+    stream.synchronize()
+    scratch = ep_routing._ep_sort_scratch(cases[0][1].device, n_bins)
+    # JIT warmup is outside the measured sequence. Replays never clear scratch.
+    for buffer in scratch:
+        buffer.zero_()
+    expected = torch.cat(
+        expected_hists + [torch.zeros(n_bins + 1, dtype=torch.int32, device="cuda")]
+    )
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph, stream=stream):
+        outputs = [route(case) for case in cases]
+        observed = torch.cat([output[0] for output in outputs] + list(scratch))
+    return graph, observed, expected, (cases, expert_map, outputs, scratch, stream)
+
+
+def test_ep_sort_scratch_consistency(monkeypatch):
+    # Keep this test's persistent scratch separate from other routing tests.
+    monkeypatch.setattr(ep_routing, "_EP_SORT_SCRATCH", {})
+    graph, observed, expected, _keepalive = _ep_sort_scratch_stress_setup()
+    for round_index in range(1000):
+        graph.replay()
+        torch.testing.assert_close(
+            observed,
+            expected,
+            rtol=0,
+            atol=0,
+            msg=lambda message, round_index=round_index: (
+                f"EP scratch round {round_index}: {message}"
+            ),
+        )
 
 
 def bench_routing():
