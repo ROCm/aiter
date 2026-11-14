@@ -250,6 +250,32 @@ class MegaMoeTPLDSError(ValueError):
     """max_local_tokens does not fit in LDS (retry with a smaller one)."""
 
 
+# s_memrealtime, the clock of the kernels' waits, runs at 100 MHz
+TICKS_PER_MS = 100_000
+
+
+def wait_timeout_ticks(wait_timeout_ms, group=None) -> int:
+    """Collective: wait_timeout_ms (a positive int, the same on every rank) in
+    s_memrealtime ticks; raises ValueError on every rank otherwise."""
+    ok = (
+        isinstance(wait_timeout_ms, int)
+        and not isinstance(wait_timeout_ms, bool)
+        and wait_timeout_ms > 0
+    )
+    every: list = [None] * dist.get_world_size(group)
+    dist.all_gather_object(
+        every, (repr(wait_timeout_ms), wait_timeout_ms if ok else None), group=group
+    )
+    values = {v for _, v in every}
+    if None in values or len(values) != 1:
+        got = ", ".join(f"rank {r}: {s}" for r, (s, _) in enumerate(every))
+        raise ValueError(
+            "wait_timeout_ms must be the same positive int (milliseconds) on every "
+            f"rank; got {got}"
+        )
+    return every[0][1] * TICKS_PER_MS
+
+
 # the tuned launch-config fields of a batch (configs/mega_moe_tp_tuned.csv)
 _TUNED_FIELDS = ("mt", "npp", "q", "pf", "lp", "ll", "llr")
 
@@ -290,10 +316,11 @@ class MegaMoeTPEngine:
         group=None,
         device: torch.device | None = None,
         fit_max_local: bool = False,
+        wait_timeout_ms: int,
     ):
         """fit_max_local: max_local_tokens is an upper bound, lowered to the largest count
         the kernel takes (its tables, 32-bit offsets, LDS; see capacity) instead of
-        raising."""
+        raising. wait_timeout_ms: see MegaMoeTPConfig (collective check)."""
         if not mega_moe_tp_shape_supported(model_dim, inter_dim, world_size):
             raise ValueError(
                 f"fused TP MegaMoE does not tile h{model_dim} i{inter_dim} tp{world_size}"
@@ -371,6 +398,7 @@ class MegaMoeTPEngine:
                 f"i{inter_dim} e{experts} k{topk} tp{world_size}: at most {ok}"
             )
 
+        self.wait_ticks = wait_timeout_ticks(wait_timeout_ms, group)
         tot = self.mmax * self.tp
         H, K = model_dim, topk
         arena = SymmetricArena(group=group, device=self.device)
@@ -831,6 +859,7 @@ class MegaMoeTPEngine:
             *(ptr(t) for t in (tail or (None, None, None))),
             self._qall.offset,
             self._sall.offset,
+            self.wait_ticks,
             self.n_cta,
         )
 
