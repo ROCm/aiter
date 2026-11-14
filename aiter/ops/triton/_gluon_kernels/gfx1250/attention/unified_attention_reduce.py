@@ -35,6 +35,7 @@ def reduce_segments_gluon(
     IS_FP8_OUT: gl.constexpr,
     FP8_MIN: gl.constexpr,
     FP8_MAX: gl.constexpr,
+    T_CHUNK: gl.constexpr = 0,  # IOD-local KV: placement chunk (tiles); segments come in pairs
 ):
     token = gl.program_id(0)
 
@@ -42,10 +43,16 @@ def reduce_segments_gluon(
     seq_len = gl.load(seq_lens_ptr + token)
     if segm_tiles_ptr is not None:
         tiles_per_segment = gl.load(segm_tiles_ptr)
+        if T_CHUNK > 0:  # IOD-local KV: T rounded as the attention kernel rounds it
+            tiles_per_segment = gl.maximum(
+                (tiles_per_segment + T_CHUNK // 2) // T_CHUNK * T_CHUNK, T_CHUNK
+            )
     else:
         tiles_per_segment = (seq_len + S * TILE_SIZE - 1) // (S * TILE_SIZE)
     denom = tiles_per_segment * TILE_SIZE
     act_num_segments = (seq_len + denom - 1) // denom
+    if T_CHUNK > 0:
+        act_num_segments = gl.minimum((act_num_segments + 1) // 2 * 2, S)
 
     # --- layouts: head axis split across waves, segment axis in-thread ---
     SIZE_H: gl.constexpr = H // NUM_WARPS
@@ -148,6 +155,7 @@ def reduce_segments_split_gluon(
     IS_FP8_OUT: gl.constexpr,
     FP8_MIN: gl.constexpr,
     FP8_MAX: gl.constexpr,
+    T_CHUNK: gl.constexpr = 0,  # IOD-local KV: placement chunk (tiles); segments come in pairs
 ):
     """Split-KV reduce for decode / spec-decode verify with many KV segments (the gfx1250
     token split: 128-256 segments a sequence in the grid, of which only the live ones
@@ -172,10 +180,16 @@ def reduce_segments_split_gluon(
     seq_len = gl.load(seq_lens_ptr + seq_idx)
     if segm_tiles_ptr is not None:
         tiles_per_segment = gl.load(segm_tiles_ptr)
+        if T_CHUNK > 0:  # IOD-local KV: T rounded as the attention kernel rounds it
+            tiles_per_segment = gl.maximum(
+                (tiles_per_segment + T_CHUNK // 2) // T_CHUNK * T_CHUNK, T_CHUNK
+            )
     else:
         tiles_per_segment = (seq_len + S * TILE_SIZE - 1) // (S * TILE_SIZE)
     span = tiles_per_segment * TILE_SIZE
     num_segments = (seq_len + span - 1) // span
+    if T_CHUNK > 0:
+        num_segments = gl.minimum((num_segments + 1) // 2 * 2, S)
     num_steps = (num_segments + SB - 1) // SB
 
     # [SB, D] tile: the head dim across lanes and warps, the segments in-thread
@@ -287,6 +301,7 @@ def reduce_segments_split_oneshot_gluon(
     IS_FP8_OUT: gl.constexpr,
     FP8_MIN: gl.constexpr,
     FP8_MAX: gl.constexpr,
+    T_CHUNK: gl.constexpr = 0,  # IOD-local KV: placement chunk (tiles); segments come in pairs
 ):
     """reduce_segments_split_gluon with its loads in one round trip instead of a chain.
 
@@ -326,6 +341,10 @@ def reduce_segments_split_oneshot_gluon(
     seq_len = gl.load(seq_lens_ptr + seq_idx)
     if segm_tiles_ptr is not None:
         tiles_per_segment = gl.load(segm_tiles_ptr)
+        if T_CHUNK > 0:  # IOD-local KV: T rounded as the attention kernel rounds it
+            tiles_per_segment = gl.maximum(
+                (tiles_per_segment + T_CHUNK // 2) // T_CHUNK * T_CHUNK, T_CHUNK
+            )
     else:
         tiles_per_segment = (seq_len + S * TILE_SIZE - 1) // (S * TILE_SIZE)
 
@@ -367,6 +386,8 @@ def reduce_segments_split_oneshot_gluon(
     # loops below on the grid's segments)
     span = gl.maximum(tiles_per_segment, 1) * TILE_SIZE
     num_segments = gl.minimum((seq_len + span - 1) // span, S)
+    if T_CHUNK > 0:
+        num_segments = gl.minimum((num_segments + 1) // 2 * 2, S)
     num_steps = (num_segments + SB - 1) // SB
     # the rest of the first pass and any further ones, clipped to the live segments
     o_live = gl.amd.gfx1250.tdm.make_tensor_descriptor(

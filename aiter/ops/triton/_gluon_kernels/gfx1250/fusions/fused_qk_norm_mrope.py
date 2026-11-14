@@ -28,7 +28,7 @@ def get_fused_qk_norm_mrope_layouts(num_warps):
 
 
 _fused_qk_norm_mrope_repr = make_kernel_repr(
-    "fused_qk_norm_mrope_gfx1250", ["Q_HEADS", "K_HEADS", "BLOCK_M", "CACHE", "FP8", "K_NVFP4"]
+    "fused_qk_norm_mrope_gfx1250", ["Q_HEADS", "K_HEADS", "BLOCK_M", "CACHE", "FP8", "K_NVFP4", "KV_LOC"]
 )
 _fused_qk_norm_mrope_tdm_repr = make_kernel_repr(
     "fused_qk_norm_mrope_tdm_gfx1250", ["Q_HEADS", "K_HEADS", "BLOCK_M", "CACHE"]
@@ -76,6 +76,7 @@ def _store_k_nvfp4(
     k_cache_ptr,
     x,
     page,
+    scale_page,
     offset,
     write,
     COL0: gl.constexpr,
@@ -88,8 +89,9 @@ def _store_k_nvfp4(
     """NVFP4-quantize columns [COL0, COL0 + N) of BLOCK_M K rows (x: [BLOCK_M, N] fp32, COL0 and N
     multiples of 16, so whole scale groups) and store them into the shuffled NVFP4 K page of each row, as
     _store_nvfp4_shuffled_row lays it out: the HEAD_DIM // 2 e2m1 bytes of a token in (16, 16)-byte tiles,
-    then the HEAD_DIM // 16 e4m3 scales preshuffled in SCALE_PRESHUFFLE-row groups. page: the byte offset
-    of the row's (block, head) page; offset: the row's token in the page; write: rows to store. Rows are
+    then the HEAD_DIM // 16 e4m3 scales preshuffled in SCALE_PRESHUFFLE-row groups. page / scale_page: the
+    byte offsets of the row's (block, head) data and scales (page + BLOCK_SIZE * HEAD_DIM // 2 in a stock
+    page); offset: the row's token in the page; write: rows to store. Rows are
     in SliceLayout(1, store_layout)."""
     D_BYTES: gl.constexpr = HEAD_DIM // 2
     D_SCALES: gl.constexpr = HEAD_DIM // NVFP4_GROUP
@@ -110,8 +112,7 @@ def _store_k_nvfp4(
     )
     sub = offset % P
     scale_dst = (
-        page
-        + BLOCK_SIZE * D_BYTES
+        scale_page
         + (offset // P) * (D_SCALES * P)
         + (sub % P_QUARTER) * (4 * D_SCALES)
         + (sub // P_QUARTER) * D_SCALES
@@ -128,6 +129,7 @@ def _store_k_nvfp4_tail(
     k_cache_ptr,
     y,
     page,
+    scale_page,
     offset,
     write,
     BLOCK_M: gl.constexpr,
@@ -154,8 +156,7 @@ def _store_k_nvfp4_tail(
     g = gl.arange(0, D_SCALES, layout=gl.SliceLayout(0, store_layout))
     sub = offset % P
     scale_dst = (
-        page
-        + BLOCK_SIZE * D_BYTES
+        scale_page
         + (offset // P) * (D_SCALES * P)
         + (sub % P_QUARTER) * (4 * D_SCALES)
         + (sub // P_QUARTER) * D_SCALES
@@ -165,6 +166,34 @@ def _store_k_nvfp4_tail(
         scales.to(gl.float8e4nv).to(gl.uint8, bitcast=True),
         mask=write[:, None] & (g >= 2 * ROPE_HALF // NVFP4_GROUP)[None, :],
     )
+
+
+@gluon.jit
+def _kv_loc_gran(page, x, u):
+    # Byte offset of the u-th granule of a 2 MiB page homed on domain x (aiter.ops.kv_iod.gran).
+    return ((page << 7) + (u << 1) + (x ^ ((u >> 2) & 1) ^ ((u >> 5) & 1))) * 16384
+
+
+@gluon.jit
+def _kv_loc_k(xk, block, h):
+    """Placed K of (code block, head h), x bit xk (aiter.ops.kv_iod): the byte offsets of its 16 KiB data granule
+    and of its 2 KiB scale row."""
+    n = block >> 1
+    pk = n // 28
+    uk = 2 * (n % 28) + h
+    page = _kv_loc_gran(pk, xk, uk)
+    scale_page = _kv_loc_gran(pk, xk, 56 + uk // 8) + (uk % 8) * 2048
+    return page, scale_page
+
+
+@gluon.jit
+def _kv_loc_v(xv, block, h, offset, X: gl.constexpr):
+    """Placed V of the token at offset (of 128) in code block, head h, x bit xv: the byte offset of its value 0.
+    V half offset // 64 of the page is its own granule."""
+    n = block >> 1
+    pv = n // 16
+    uv = 4 * (n % 16) + 2 * h + offset // 64
+    return _kv_loc_gran(pv, xv, uv) + ((offset // X) % 4) * (HEAD_DIM * X) + offset % X
 
 
 @gluon.jit
@@ -203,6 +232,7 @@ def fused_qk_norm_mrope_gfx1250(
     k_cache_ptr,
     v_cache_ptr,
     kv_inv_scale,
+    x_table_ptr,
     EPS: gl.constexpr,
     Q_HEADS: gl.constexpr,
     K_HEADS: gl.constexpr,
@@ -217,6 +247,7 @@ def fused_qk_norm_mrope_gfx1250(
     rope_layout: gl.constexpr,
     K_NVFP4: gl.constexpr = False,
     SCALE_PRESHUFFLE: gl.constexpr = 128,
+    KV_LOC: gl.constexpr = False,
 ):
     # 16 for an fp8 cache and for A8K4V8's uint8 NVFP4 K (whose fp8 V has that layout)
     X: gl.constexpr = 128 // k_cache_ptr.dtype.element_ty.primitive_bitwidth
@@ -365,19 +396,28 @@ def fused_qk_norm_mrope_gfx1250(
             if gl.max(write_k.to(gl.int32), axis=0) > 0:
                 v_c = gl.minimum(gl.maximum(v.to(gl.float32) * kv_inv_scale, -FP8_MAX), FP8_MAX)
                 v_c = v_c.to(v_cache_ptr.dtype.element_ty)
-                gl.store(v_cache_ptr + v_dst[:, None] + offs_v[None, :] * X, v_c, mask=write)
                 K_ROW: gl.constexpr = HEAD_DIM // 2 + HEAD_DIM // NVFP4_GROUP
-                page = (block * K_HEADS + head_r - Q_HEADS) * (BLOCK_SIZE * K_ROW)
+                if KV_LOC:
+                    # Placed granules (aiter.ops.kv_iod): block id = code c, x bits from the layer's table.
+                    # Block 128 and 2 heads; V half offset // 64 of the page is its own granule.
+                    xb = gl.load(x_table_ptr + block, mask=write_k, other=0).to(gl.int64)
+                    h = (head_r - Q_HEADS).to(gl.int64)
+                    page, scale_page = _kv_loc_k(xb & 1, block, h)
+                    v_dst = _kv_loc_v((xb >> 1) & 1, block, h, offset, X)
+                else:
+                    page = (block * K_HEADS + head_r - Q_HEADS) * (BLOCK_SIZE * K_ROW)
+                    scale_page = page + BLOCK_SIZE * (HEAD_DIM // 2)
+                gl.store(v_cache_ptr + v_dst[:, None] + offs_v[None, :] * X, v_c, mask=write)
                 _store_k_nvfp4(
-                    k_cache_ptr, rope_lo.to(gl.float32), page, offset, write_k, 0, ROPE_HALF,
+                    k_cache_ptr, rope_lo.to(gl.float32), page, scale_page, offset, write_k, 0, ROPE_HALF,
                     BLOCK_M, BLOCK_SIZE, SCALE_PRESHUFFLE, rope_layout,
                 )
                 _store_k_nvfp4(
-                    k_cache_ptr, rope_hi.to(gl.float32), page, offset, write_k, ROPE_HALF, ROPE_HALF,
+                    k_cache_ptr, rope_hi.to(gl.float32), page, scale_page, offset, write_k, ROPE_HALF, ROPE_HALF,
                     BLOCK_M, BLOCK_SIZE, SCALE_PRESHUFFLE, rope_layout,
                 )
                 _store_k_nvfp4_tail(
-                    k_cache_ptr, gl.where(tail, y.to(gl.float32), 0.0), page, offset, write_k,
+                    k_cache_ptr, gl.where(tail, y.to(gl.float32), 0.0), page, scale_page, offset, write_k,
                     BLOCK_M, BLOCK_SIZE, SCALE_PRESHUFFLE, rope_layout,
                 )
         else:
@@ -605,7 +645,7 @@ def fused_qk_norm_mrope_tdm_gfx1250(
 
 SUB = gl.constexpr(16)  # tokens a block: one 16-row tile of the shuffled NVFP4 data / of the fp8 V page
 
-_k4v8_repr = make_kernel_repr("fused_qk_norm_mrope_k4v8_gfx1250", ["Q_HEADS", "K_HEADS", "BLOCK_SIZE"])
+_k4v8_repr = make_kernel_repr("fused_qk_norm_mrope_k4v8_gfx1250", ["Q_HEADS", "K_HEADS", "BLOCK_SIZE", "KV_LOC"])
 
 
 @gluon.jit
@@ -717,6 +757,7 @@ def fused_qk_norm_mrope_k4v8_gfx1250(
     stride_positions,
     stride_cos,
     kv_inv_scale,
+    x_table_ptr,
     EPS: gl.constexpr,
     Q_HEADS: gl.constexpr,
     K_HEADS: gl.constexpr,
@@ -728,6 +769,7 @@ def fused_qk_norm_mrope_k4v8_gfx1250(
     QH_PER: gl.constexpr,
     BLOCK_M_Q: gl.constexpr,
     BLOCK_M_V: gl.constexpr,
+    KV_LOC: gl.constexpr = False,
 ):
     """A8K4V8 Q/K norm + MRoPE and KV-cache write of a prefill batch, byte-identical to
     fused_qk_norm_mrope_gfx1250(CACHE, FP8, K_NVFP4). Grid = K + Q + V blocks, in that program-id order, 16 tokens
@@ -740,7 +782,9 @@ def fused_qk_norm_mrope_k4v8_gfx1250(
       and tail, short sequences, pads) the same, stored row by row. k_out for every row the CTA owns.
     - Q: (Q_HEADS / QH_PER) * cdiv(T, BLOCK_M_Q) CTAs, BLOCK_M_Q tokens of QH_PER Q heads, Q out in fp8.
     - V: K_HEADS * cdiv(T, BLOCK_M_V) CTAs, V / kv_scale in fp8 into the shuffled V cache.
-    Rows come in with one TDM box each, the MRoPE cos / sin rows with TDM gathers into LDS, once a CTA."""
+    Rows come in with one TDM box each, the MRoPE cos / sin rows with TDM gathers into LDS, once a CTA.
+    KV_LOC: k_cache_ptr / v_cache_ptr are one layer's placed K / V regions (aiter.ops.kv_iod), the block id is a
+    code and x_table_ptr its x bytes; the same bytes go to the placed addresses of each (block, head) page."""
     NW: gl.constexpr = gl.num_warps()
     P: gl.constexpr = BLOCK_SIZE
     D_BYTES: gl.constexpr = HEAD_DIM // 2
@@ -806,6 +850,8 @@ def fused_qk_norm_mrope_k4v8_gfx1250(
                 gl.barrier()
                 cos, sin = _rope_from_smem(tab_smem, same, SECTION_H, SECTION_W, rope_layout)
                 write = own_r & (slot >= 0)
+                if KV_LOC:
+                    xk_r = gl.load(x_table_ptr + slot // P, mask=write, other=0).to(gl.int64) & 1
                 for h in gl.static_range(K_HEADS):
                     y, rope_lo, rope_hi = _norm_mrope_smem(
                         x_smem.index(h), k_weight_ptr, cos, sin, EPS, row_layout, rope_layout
@@ -813,14 +859,18 @@ def fused_qk_norm_mrope_k4v8_gfx1250(
                     _store_rows(k_out_ptr + h * HEAD_DIM, tok, tok_r, own, own_r, K_HEADS * HEAD_DIM, y, rope_lo,
                                 rope_hi, row_layout, rope_layout)
                     if gl.max(write.to(gl.int32), axis=0) > 0:
-                        page = ((slot // P) * K_HEADS + h) * (P * K_ROW)
+                        if KV_LOC:
+                            page, s_page = _kv_loc_k(xk_r, slot // P, h)
+                        else:
+                            page = ((slot // P) * K_HEADS + h) * (P * K_ROW)
+                            s_page = page + P * (HEAD_DIM // 2)
                         offset = slot % P
-                        _store_k_nvfp4(k_cache_ptr, rope_lo.to(gl.float32), page, offset, write, 0, ROPE_HALF,
-                                       SUB, P, SCALE_PRESHUFFLE, rope_layout)
-                        _store_k_nvfp4(k_cache_ptr, rope_hi.to(gl.float32), page, offset, write, ROPE_HALF,
+                        _store_k_nvfp4(k_cache_ptr, rope_lo.to(gl.float32), page, s_page, offset, write, 0,
                                        ROPE_HALF, SUB, P, SCALE_PRESHUFFLE, rope_layout)
-                        _store_k_nvfp4_tail(k_cache_ptr, gl.where(tail, y.to(gl.float32), 0.0), page, offset,
-                                            write, SUB, P, SCALE_PRESHUFFLE, rope_layout)
+                        _store_k_nvfp4(k_cache_ptr, rope_hi.to(gl.float32), page, s_page, offset, write,
+                                       ROPE_HALF, ROPE_HALF, SUB, P, SCALE_PRESHUFFLE, rope_layout)
+                        _store_k_nvfp4_tail(k_cache_ptr, gl.where(tail, y.to(gl.float32), 0.0), page, s_page,
+                                            offset, write, SUB, P, SCALE_PRESHUFFLE, rope_layout)
         if full:
             # one full tile: rows f .. f + 15 are the tile's rows 0 .. 15
             gl.barrier()
@@ -833,11 +883,17 @@ def fused_qk_norm_mrope_k4v8_gfx1250(
             all_n = tok >= 0
             all_r = tok_r >= 0
             o0 = slot_f % P  # the tile's first row in the page
+            if KV_LOC:
+                xk_f = gl.load(x_table_ptr + slot_f // P).to(gl.int64) & 1
             gl.amd.gfx1250.tdm.async_wait(0)
             gl.barrier()
             cos, sin = _rope_from_smem(tab_smem, same, SECTION_H, SECTION_W, rope_layout)
             for h in gl.static_range(K_HEADS):
-              page_f = ((slot_f // P) * K_HEADS + h) * (P * K_ROW)
+              if KV_LOC:
+                  page_f, s_page_f = _kv_loc_k(xk_f, slot_f // P, h)
+              else:
+                  page_f = ((slot_f // P) * K_HEADS + h) * (P * K_ROW)
+                  s_page_f = page_f + P * D_BYTES
               y, rope_lo, rope_hi = _norm_mrope_smem(
                   x_smem.index(h), k_weight_ptr, cos, sin, EPS, row_layout, rope_layout
               )
@@ -863,7 +919,7 @@ def fused_qk_norm_mrope_k4v8_gfx1250(
               )
               # scale rows o0 .. o0 + 15 sit at (o % PQ) * 64 + (o // PQ) * 16: one [16, 16] box, row stride 64
               s_desc = gl.amd.gfx1250.tdm.make_tensor_descriptor(
-                  base=k_cache_ptr + page_f + P * D_BYTES + (o0 % PQ) * (4 * D_SCALES) + (o0 // PQ) * D_SCALES,
+                  base=k_cache_ptr + s_page_f + (o0 % PQ) * (4 * D_SCALES) + (o0 // PQ) * D_SCALES,
                   shape=(SUB, D_SCALES), strides=(4 * D_SCALES, 1),
                   block_shape=(SUB, D_SCALES), layout=SH,
               )
@@ -931,7 +987,11 @@ def fused_qk_norm_mrope_k4v8_gfx1250(
         v_slot = gl.load(slot_mapping_ptr + v_tok, mask=v_tok < n_valid, other=-1).to(gl.int64)
         v_write = (v_tok < n_valid) & (v_slot >= 0)
         v_off = v_slot % P
-        v_dst = ((v_slot // P) * K_HEADS + h) * (HEAD_DIM * P) + (v_off // 16) * (HEAD_DIM * 16) + v_off % 16
+        if KV_LOC:
+            xv = (gl.load(x_table_ptr + v_slot // P, mask=v_write, other=0).to(gl.int64) >> 1) & 1
+            v_dst = _kv_loc_v(xv, v_slot // P, h, v_off, 16)
+        else:
+            v_dst = ((v_slot // P) * K_HEADS + h) * (HEAD_DIM * P) + (v_off // 16) * (HEAD_DIM * 16) + v_off % 16
         gl.amd.gfx1250.tdm.async_wait(0)
         gl.barrier()
         v_rows = v_smem.load(v_layout)

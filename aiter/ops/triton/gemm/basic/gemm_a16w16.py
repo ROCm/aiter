@@ -663,7 +663,14 @@ def gemm_a16w16_(
         M, K = x.shape
         N, _ = w.shape
 
+        w_nk = w
         w = w.T
+        from aiter.ops import lmhead_iod
+
+        if config is None and M <= 16 and lmhead_iod.mode() and lmhead_iod.lookup(w_nk) is not None:
+            # a placed weight's 128 x 128 tile (decode M <= 16: placed 0.93x of the tuned config, which may not
+            # be a 128 x 128 one; at M 17-32 placed 32-row tiles only tie)
+            config = {"BLOCK_M": 16, "BLOCK_N": 128, "BLOCK_K": 128, "NUM_BUFFERS": 2, "num_warps": 4}
 
         kernel, grid, meta, num_warps, waves_per_eu = _gluon_plan(
             M,
@@ -687,9 +694,27 @@ def gemm_a16w16_(
             w.shape,
         )
 
+        b_arg = w
+        _loc = lmhead_iod.mode()
+        if (
+            _loc
+            and kernel is _KERNEL_MAP["compute_bound"]
+            and meta.get("BLOCK_N") == 128
+            and meta.get("BLOCK_K") == 128
+            and triton.cdiv(M, meta["BLOCK_M"]) == 1
+        ):
+            # IOD-placed weight (aiter.ops.lmhead_iod.place): B from the placed buffer; modes 2 / 3 schedule
+            # each workgroup onto an N-tile homed on its own / the other IOD
+            pw = lmhead_iod.lookup(w_nk)
+            if pw is not None:
+                b_arg = pw.weight
+                meta = dict(meta, B_LOC=_loc)
+                if _loc >= 2:
+                    meta = dict(meta, b_loc_list_ptr=pw.lists, B_LOC_LABEL_XOR=pw.label_xor, B_LOC_HALF=pw.half)
+                    grid = (8 * triton.cdiv(pw.half, 4),)
         kernel[grid](
             x,
-            w,
+            b_arg,
             y,
             bias,
             M,
