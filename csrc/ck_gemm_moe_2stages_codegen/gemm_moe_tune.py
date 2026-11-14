@@ -5452,7 +5452,27 @@ class FmoeTuner(TunerCommon):
             q_type = eval(q_type)
             q_type = QuantType.per_1x128 if q_type == QuantType.per_128x128 else q_type
             print("\nStart tuning", line)
-            if get_gfx() not in ["gfx950"] and q_type in [aiter.QuantType.per_1x32]:
+            # gfx950 tunes every per_1x32 combo. gfx942 has no CK per_1x32
+            # kernels. The FlyDSL a16w-mix port implements gfx942 for a BF16
+            # activation with MXFP4 (a16w4) or INT4 (a16wi4) weights. FP8/FP4
+            # activations and MXFP8 stay rejected: those builders are gfx950.
+            is_gfx942_a16w4 = (
+                get_gfx() == "gfx942"
+                and q_type == aiter.QuantType.per_1x32
+                and q_dtype_w == dtypes.fp4x2
+                and q_dtype_a == dtypes.bf16
+            )
+            is_gfx942_a16wi4 = (
+                get_gfx() == "gfx942"
+                and q_type == aiter.QuantType.per_1x32
+                and q_dtype_w == dtypes.i4x2
+                and q_dtype_a == dtypes.bf16
+            )
+            if (
+                get_gfx() not in ["gfx950"]
+                and q_type in [aiter.QuantType.per_1x32]
+                and not (is_gfx942_a16w4 or is_gfx942_a16wi4)
+            ):
                 print(f"{q_type} is not supported on {get_gfx()}")
                 return []
             if not use_g1u1:
@@ -5485,7 +5505,17 @@ class FmoeTuner(TunerCommon):
             v2_tasks = None
             if tune_only is None:
                 v2_tasks = self.gen_flydsl_v2_2stages_task(info, blockMs)
-                tune_only = "flydslv2" if v2_tasks else ""
+                if v2_tasks:
+                    tune_only = "flydslv2"
+                elif is_gfx942_a16w4:
+                    # v2 enumerates fp4/fp8 activations only. This shape is the
+                    # FlyDSL a16w4 port, and CK has no b16 x fp4x2 kernel.
+                    tune_only = "flydsl"
+                elif is_gfx942_a16wi4:
+                    # Same a16w-mix port, selected by gen_flydsl_i4_2stages_task.
+                    tune_only = "flydsli4"
+                else:
+                    tune_only = ""
             _tune_only = {s for s in tune_only.split(",") if s}
             if self.swiglu_limit is not None:
                 if not (
