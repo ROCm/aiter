@@ -41,6 +41,8 @@ _SUPPORTED_QUANT_TYPES = ("none", "fp8_direct_cast")
 _SUPPORTED_STAGE2_P2P_QUANT_TYPES = ("none", "fp8_blockwise_1x32")
 
 _MAX_INTRANODE_NPES = 8
+# Widest per-row scales the token-major dispatch moves (one i32 per lane).
+_MAX_TOKMAJOR_SCALE_BYTES = 256
 
 # Kernel streams 16-byte chunks (v4i32); sets ``token_bytes`` alignment.
 _TOK_BYTES_ALIGN = 16
@@ -557,6 +559,31 @@ class FlyDSLDispatchGroupMajorOp:
         }
 
 
+def _check_lds_capacity(cfg, arch=None):
+    """Reject configs whose combine-kernel LDS overflows the GPU."""
+
+    # Mirror make_combine_jit's LDS layout: two 8B-aligned i64[npes] tables.
+    def _align(p, a):
+        return (p + a - 1) // a * a
+
+    ptr = 0
+    ptr = _align(ptr, 8) + cfg.world_size * 8
+    ptr = _align(ptr, 8) + cfg.world_size * 8
+    lds_bytes = max(_align(ptr, 128), 128)
+
+    arch = arch or get_rocm_arch()
+    try:
+        limit = get_lds_capacity_bytes(arch)
+    except ValueError:
+        return
+    if lds_bytes > limit:
+        raise RuntimeError(
+            f"combine kernel LDS needs {lds_bytes} B "
+            f"(2 x i64[world_size={cfg.world_size}] P2P tables + 128 B arena), "
+            f"but device {arch} provides only {limit} B"
+        )
+
+
 class FlyDSLDispatchCombineIntraNodeOp:
     def __init__(self, config, group=None):
         """``group``: process group of the intra-node EP ranks (a CPU/gloo group
@@ -584,7 +611,13 @@ class FlyDSLDispatchCombineIntraNodeOp:
                 )
             self._heap = IpcSymmetricAllocator(group, self._dev)
 
-        self._alloc_buffers()
+        try:
+            self._alloc_buffers()
+        except RuntimeError:
+            # A failed IPC mapping or a size mismatch raises on every rank
+            # (the allocator agrees on the outcome): free what is mapped.
+            self._heap.close()
+            raise
         self._heap.barrier()
 
         _p2p_srcs = {
@@ -608,8 +641,9 @@ class FlyDSLDispatchCombineIntraNodeOp:
         # whenever the StdMoE expert-major output is not requested.
         self._tokmajor_dispatch = not config.enable_std_moe
 
-        self._disp_jit_cache: dict[tuple[torch.dtype, int, int], Any] = {}
-        self._disp_compiled_cache: dict[tuple[torch.dtype, int, int], Any] = {}
+        # (dispatch dtype, block_num, warp_num_per_block, with scales)
+        self._disp_jit_cache: dict[tuple[torch.dtype, int, int, bool], Any] = {}
+        self._disp_compiled_cache: dict[tuple[torch.dtype, int, int, bool], Any] = {}
         self._comb_jit_cache: dict[
             tuple[torch.dtype, bool, bool, bool, int, int], Any
         ] = {}
@@ -729,12 +763,6 @@ class FlyDSLDispatchCombineIntraNodeOp:
         self.shmem_comb_out_wts = self._heap.create_tensor((mt * k,), torch.float32)
         self.shmem_xdev_bar_mem = self._heap.create_tensor((npes,), torch.int64)
 
-        # shmem_malloc is uninitialized; zero what combine reads.
-        self.shmem_tok_id_to_src.zero_()
-        self.shmem_comb_inp_tok.zero_()
-        self.shmem_comb_inp_wts.zero_()
-        self.shmem_xdev_bar_mem.zero_()
-
         self.dest_pe_ctr = torch.zeros(npes, dtype=torch.int32, device=self._dev)
         # Zeroed row the fast combine reads for top-k slots with no contribution.
         self._zero_row = torch.zeros(
@@ -773,8 +801,15 @@ class FlyDSLDispatchCombineIntraNodeOp:
 
     def _check_config(self):
         """Static check of ``self.cfg``; runs before any GPU alloc."""
-        cfg = self.cfg
+        self.check_config(self.cfg)
 
+    @staticmethod
+    def check_config(cfg, arch=None):
+        """Raise (``ValueError`` / ``NotImplementedError`` / ``RuntimeError``)
+        if this op cannot serve ``cfg`` on ``arch`` (default: the current GPU).
+
+        Allocates nothing, so a caller can use it to pick an implementation
+        before building the op (``MoriAll2AllManager`` does)."""
         if not isinstance(cfg.rank, int) or cfg.rank < 0:
             raise ValueError(f"rank must be a non-negative int, got {cfg.rank!r}")
         if not isinstance(cfg.world_size, int) or cfg.world_size <= 0:
@@ -904,6 +939,13 @@ class FlyDSLDispatchCombineIntraNodeOp:
                 "scale_dim and scale_type_size must be both zero or both "
                 f"positive, got ({cfg.scale_dim}, {cfg.scale_type_size})"
             )
+        # The token-major dispatch (no StdMoE) moves a row's scales with one
+        # 4-byte word per lane.
+        if not cfg.enable_std_moe and cfg.scale_bytes > _MAX_TOKMAJOR_SCALE_BYTES:
+            raise ValueError(
+                f"scales of {cfg.scale_bytes} B per row exceed the token-major "
+                f"dispatch limit ({_MAX_TOKMAJOR_SCALE_BYTES} B)"
+            )
 
         # expert_id (= dest_pe * experts_per_rank + local) must fit i32.
         total_experts = cfg.world_size * cfg.num_experts_per_rank
@@ -913,32 +955,7 @@ class FlyDSLDispatchCombineIntraNodeOp:
                 "exceeds int32 range"
             )
 
-        self._check_lds_capacity()
-
-    def _check_lds_capacity(self):
-        """Reject configs whose combine-kernel LDS overflows the GPU."""
-        cfg = self.cfg
-
-        # Mirror make_combine_jit's LDS layout: two 8B-aligned i64[npes] tables.
-        def _align(p, a):
-            return (p + a - 1) // a * a
-
-        ptr = 0
-        ptr = _align(ptr, 8) + cfg.world_size * 8
-        ptr = _align(ptr, 8) + cfg.world_size * 8
-        lds_bytes = max(_align(ptr, 128), 128)
-
-        arch = get_rocm_arch()
-        try:
-            limit = get_lds_capacity_bytes(arch)
-        except ValueError:
-            return
-        if lds_bytes > limit:
-            raise RuntimeError(
-                f"combine kernel LDS needs {lds_bytes} B "
-                f"(2 x i64[world_size={cfg.world_size}] P2P tables + 128 B arena), "
-                f"but device {arch} provides only {limit} B"
-            )
+        _check_lds_capacity(cfg, arch)
 
     def _check_tensor_device(self, name, t):
         if not torch.is_tensor(t):
@@ -1004,16 +1021,15 @@ class FlyDSLDispatchCombineIntraNodeOp:
         if indices.dtype not in (torch.int32, torch.int64):
             raise ValueError(f"indices.dtype={indices.dtype} must be int32 or int64")
 
-        # scales all-or-none: tensor + scale_dim>0 + scale_type_size>0, or none.
-        scales_configured = cfg.scale_bytes > 0
-        if (scales is not None) != scales_configured:
+        # A scales tensor needs scale_dim>0 and scale_type_size>0. The reverse
+        # is optional, as in mori: a handle configured with scales may
+        # dispatch a call without them (e.g. a bf16 wire); that call moves
+        # no scales and returns None for them.
+        if scales is not None and cfg.scale_bytes == 0:
             raise ValueError(
-                "dispatch scales all-or-none contract violated: "
-                f"scales={'provided' if scales is not None else 'None'} but "
-                f"cfg.scale_dim={cfg.scale_dim} / cfg.scale_type_size={cfg.scale_type_size} "
-                f"{'enable' if scales_configured else 'disable'} the scales path. "
-                "Pass all three (scales tensor + cfg.scale_dim>0 + cfg.scale_type_size>0) "
-                "or none of them."
+                "dispatch got a scales tensor but cfg.scale_dim="
+                f"{cfg.scale_dim} / cfg.scale_type_size={cfg.scale_type_size} "
+                "disable the scales path"
             )
         if scales is not None:
             self._check_tensor_device("scales", scales)
@@ -1100,8 +1116,8 @@ class FlyDSLDispatchCombineIntraNodeOp:
                     "packed_recv_x is only consumed when cfg.enable_std_moe=True"
                 )
 
-    def _get_dispatch_jit(self, d_dtype, block_num, warp_num_per_block):
-        key = (d_dtype, block_num, warp_num_per_block)
+    def _get_dispatch_jit(self, d_dtype, block_num, warp_num_per_block, with_scales):
+        key = (d_dtype, block_num, warp_num_per_block, with_scales)
         if key not in self._disp_jit_cache:
             cfg = self.cfg
             self._disp_jit_cache[key] = make_dispatch_jit(
@@ -1114,8 +1130,8 @@ class FlyDSLDispatchCombineIntraNodeOp:
                 block_num=block_num,
                 warp_num_per_block=warp_num_per_block,
                 data_type=d_dtype,
-                scale_dim=cfg.scale_dim,
-                scale_type_size=cfg.scale_type_size,
+                scale_dim=cfg.scale_dim if with_scales else 0,
+                scale_type_size=cfg.scale_type_size if with_scales else 0,
                 enable_std_moe=cfg.enable_std_moe,
                 max_recv=self._effective_max_recv,
                 tokmajor=self._tokmajor_dispatch,
@@ -1146,7 +1162,8 @@ class FlyDSLDispatchCombineIntraNodeOp:
             _DEFAULT_DISPATCH_WARP_NUM,
         )
         _check_block_num_resident("dispatch", bn)
-        disp_key = (d_dtype, bn, wpb)
+        with_scales = scales is not None
+        disp_key = (d_dtype, bn, wpb, with_scales)
         self._last_inp_cur_tok = inp_cur_tok
         stream = torch.cuda.current_stream()
         inp_c = input if input.is_contiguous() else input.contiguous()
@@ -1174,7 +1191,7 @@ class FlyDSLDispatchCombineIntraNodeOp:
             self._fx_disp_grid_bar,
         )
 
-        disp_fn = self._get_dispatch_jit(d_dtype, bn, wpb)
+        disp_fn = self._get_dispatch_jit(d_dtype, bn, wpb, with_scales)
         disp_compiled = self._disp_compiled_cache.get(disp_key)
         if disp_compiled is None:
             args = (
@@ -1238,7 +1255,7 @@ class FlyDSLDispatchCombineIntraNodeOp:
         out_wts = self.shmem_disp_out_wts.view(mr, k)
         out_idx = self.shmem_disp_out_idx.view(mr, k)
         out_scales = None
-        if cfg.scale_bytes > 0:
+        if with_scales:
             out_scales = (
                 self.shmem_out_scales[: mr * cfg.scale_bytes]
                 .view(scales.dtype)
@@ -1483,10 +1500,11 @@ class FlyDSLDispatchCombineIntraNodeOp:
     ):
         """Run intranode combine.
 
-        ``weights=None`` skips the per-slot weight combine (the returned
-        weights view is then not written), which is what callers that only
-        need the token sum (e.g. ATOM, mori-style ``combine(x, None, ids)``)
-        want."""
+        ``weights=None``: without StdMoE, skips the per-slot weight combine
+        (the returned weights view is then not written), which is what callers
+        that only need the token sum (e.g. ATOM, mori-style
+        ``combine(x, None, ids)``) want. With ``enable_std_moe`` the weights
+        are always combined, read from the dispatch output when ``None``."""
         return self._launch_combine(
             input,
             weights,
