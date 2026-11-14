@@ -17,6 +17,7 @@ import contextlib
 import importlib
 import inspect
 import math
+import random
 
 import pytest
 import torch
@@ -34,8 +35,15 @@ from aiter.ops.triton._triton_kernels.kimi_delta_attn.flash_kda import (
     flash_kda_fwd,
     flash_kda_supported,
 )
+from aiter.ops.triton._triton_kernels.kimi_delta_attn.utils.snapshot import (
+    snapshot_chunk_rows,
+)
 from aiter.ops.triton.kimi_delta_attn import chunk_kimi_delta_attn
-from op_tests.triton_tests.utils.kda_ref import chunk_kda_ref
+from op_tests.triton_tests.utils.kda_ref import (
+    chunk_kda_ref,
+    kda_gate_ref,
+    l2norm_ref,
+)
 
 device = "cuda"
 dtype = torch.bfloat16
@@ -1328,6 +1336,8 @@ def test_positional_call_keeps_skipped_storage(monkeypatch):
         "state_cache": cache,
         "state_indices": indices,
         "has_initial_state": torch.ones(1, device=device, dtype=torch.bool),
+        "snapshot_targets": None,
+        "snapshot_out": None,
     }
     params = inspect.signature(flash_kda_fwd).parameters
     assert by_name.keys() == params.keys()
@@ -1351,3 +1361,433 @@ def test_positional_call_keeps_skipped_storage(monkeypatch):
         assert seen.keys() == handed.keys()
         for key, band in handed.items():
             assert seen[key] == {band.data_ptr()}, key
+
+
+# State snapshots (`snapshot_targets`). Where pass C puts them is tested on the
+# CPU in `TestSnapshotMap`, at the end of this file; these run the kernel.
+
+
+def _cu_seqlens(lens):
+    return torch.tensor(
+        [0] + list(torch.tensor(lens, device=device).cumsum(0)),
+        device=device,
+        dtype=torch.long,
+    )
+
+
+def _interior_targets(lens, every=1):
+    """Every ``every``-th interior chunk boundary of each sequence."""
+    return tuple(
+        (n, off)
+        for n, length in enumerate(lens)
+        for off in range(FLASH_KDA_CHUNK, length, FLASH_KDA_CHUNK)[::every]
+    )
+
+
+def _snapshot_run(args, targets, **kw):
+    """``flash_kda_fwd`` with ``targets``: ``(o, final_state, snapshots)``."""
+    snaps = torch.full(
+        (len(targets), args[0].shape[2], K_DIM, K_DIM),
+        float("nan"),
+        device=device,
+        dtype=torch.float32,
+    )
+    o, ht = flash_kda_fwd(
+        *args,
+        lower_bound=LOWER_BOUND,
+        snapshot_targets=targets,
+        snapshot_out=snaps,
+        **{"output_final_state": True, **kw},
+    )
+    return o, ht, snaps
+
+
+def _prefix(args, lens, n, off):
+    """The inputs of the first ``off`` tokens of sequence ``n``, as one sequence."""
+    bos = sum(lens[:n])
+    head = [t[:, bos : bos + off] for t in args[:5]]
+    return (*head, *args[5:])
+
+
+@pytest.mark.parametrize("chunks_per_seg", [0, 2])
+@pytest.mark.parametrize("state_v_first", [False, True])
+def test_snapshots_are_the_states_of_their_prefixes(state_v_first, chunks_per_seg):
+    """Several targets per sequence, in reverse order, on several sequences."""
+    lens = [256, 100, 160]
+    args = make_inputs(1, sum(lens), 4)
+    targets = _interior_targets(lens)[::-1]
+    kw = {"state_v_first": state_v_first, "chunks_per_seg": chunks_per_seg}
+    _o, _ht, snaps = _snapshot_run(args, targets, cu_seqlens=_cu_seqlens(lens), **kw)
+    for i, (n, off) in enumerate(targets):
+        head = _prefix(args, lens, n, off)
+        _, gold = fp32_gold(*head, output_final_state=True, state_v_first=state_v_first)
+        assert rel_err(snaps[i], gold[0]) < 2e-2, (n, off)
+        if chunks_per_seg == 0:
+            # The same Triton K2 walk that ends at `off`. Bit-identical unless
+            # the two calls pick different K2 tiles.
+            with _route(k2=False):
+                _, ht = run_flash(
+                    *head,
+                    output_final_state=True,
+                    state_v_first=state_v_first,
+                    chunks_per_seg=0,
+                )
+            assert rel_err(snaps[i], ht[0]) < 1e-4, (n, off)
+
+
+@pytest.mark.parametrize("state_v_first", [False, True])
+def test_snapshots_leave_the_forward_unchanged(state_v_first):
+    """On the Triton K2, a call with targets computes the same o and final state."""
+    lens = [256, 100]
+    args = make_inputs(1, sum(lens), 4)
+    kw = {"state_v_first": state_v_first, "cu_seqlens": _cu_seqlens(lens)}
+    targets = _interior_targets(lens, every=2)
+    with _route(k2=False):
+        for _ in range(2):  # the second call of each runs a settled config
+            o_ref, ht_ref = run_flash(*args, output_final_state=True, **kw)
+            o, ht, _snaps = _snapshot_run(args, targets, **kw)
+    assert torch.equal(o, o_ref)
+    assert torch.equal(ht, ht_ref)
+
+
+def test_snapshot_calls_stay_off_the_gluon_k2(monkeypatch):
+    if not _flash_kda._gluon_k2_usable(FLASH_KDA_CHUNK, K_DIM, K_DIM):
+        pytest.skip("this arch or tile shape never routes K2 to Gluon")
+    g2 = _gluon_k2_module()
+
+    def refuse(*args, **kwargs):
+        raise AssertionError("a snapshot call reached the Gluon K2")
+
+    for name in dir(g2):
+        if name.startswith("gluon_k2"):
+            monkeypatch.setattr(g2, name, refuse)
+    args = make_inputs(1, 1024, 4)
+    for chunks_per_seg in (0, 1):
+        with _route(k2=True):
+            _snapshot_run(args, ((0, 512), (0, 992)), chunks_per_seg=chunks_per_seg)
+
+
+@pytest.mark.parametrize("chunks_per_seg", [0, 4])
+def test_paged_snapshots_match_dense(chunks_per_seg):
+    H, T = 4, 512
+    args = make_inputs(1, T, H)
+    h0 = torch.randn(1, H, K_DIM, K_DIM, device=device, dtype=torch.float32) * 0.1
+    targets = _interior_targets([T], every=3)
+    kw = {"state_v_first": True, "chunks_per_seg": chunks_per_seg}
+    cache, indices, _storage = _paged_pool(1, H, h0)
+    paged = {
+        "out": torch.empty_like(args[2]),
+        "state_cache": cache,
+        "state_indices": indices,
+        "has_initial_state": torch.ones(1, device=device, dtype=torch.bool),
+    }
+    for _ in range(2):  # the first call of a new specialization autotunes
+        _o, _ht, dense = _snapshot_run(args, targets, initial_state=h0, **kw)
+        cache[indices] = h0
+        _o, _ht, from_cache = _snapshot_run(
+            args, targets, output_final_state=False, **kw, **paged
+        )
+    assert torch.equal(from_cache, dense)
+
+
+def test_snapshot_table_survives_graph_replay():
+    """A graph captured after the table is cached stores the eager call's
+    snapshots on every replay, though the capture frees and rewrites scratch
+    first, and the cached table is not in the graph's pool."""
+    args = make_inputs(1, 512, 4)
+    targets = ((0, 128), (0, 320), (0, 480))
+    for _ in range(2):  # the first call of a new specialization autotunes
+        _o, _ht, ref = _snapshot_run(args, targets)
+    snaps = torch.full_like(ref, float("nan"))
+    seqs = ((0, 512),)
+    table = _flash_kda._build_snapshots(seqs, FLASH_KDA_CHUNK, targets, ref.device)
+    rows = snapshot_chunk_rows(seqs, FLASH_KDA_CHUNK, targets)
+
+    def forward():
+        flash_kda_fwd(
+            *args,
+            lower_bound=LOWER_BOUND,
+            output_final_state=True,
+            snapshot_targets=targets,
+            snapshot_out=snaps,
+        )
+
+    side = torch.cuda.Stream()
+    side.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(side):
+        forward()
+    torch.cuda.current_stream().wait_stream(side)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        scratch = torch.empty(4 * table.numel(), device=device, dtype=torch.int32)
+        scratch.fill_(-7)
+        del scratch
+        forward()
+    for _ in range(3):
+        snaps.fill_(float("nan"))
+        graph.replay()
+        torch.cuda.synchronize()
+        assert torch.equal(snaps, ref)
+        assert table.tolist() == rows
+
+
+def test_segment_layout_matches_the_snapshot_map():
+    """A target at a segment's first token maps to that segment's first chunk."""
+    lens = [300, 64, 0, 200]
+    seqs, bos = [], 0
+    for length in lens:
+        seqs.append((bos, bos + length))
+        bos += length
+    seqs = tuple(seqs)
+    desc, *_ = _flash_kda._build_segments(seqs, FLASH_KDA_CHUNK, 3, device)
+    chunk_base, nchunks, tok_base, _end, seq_id, _last = desc.tolist()
+    starts = []
+    for base, m, tok, n in zip(chunk_base, nchunks, tok_base, seq_id):
+        off = tok - seqs[n][0]
+        if m and off:
+            starts.append((base, n, off))
+    assert starts, "the layout should have segments that start inside a sequence"
+    rows = snapshot_chunk_rows(
+        seqs, FLASH_KDA_CHUNK, tuple((n, o) for _, n, o in starts)
+    )
+    for i, (base, _n, _off) in enumerate(starts):
+        assert rows[base] == i
+
+
+def test_no_targets_take_no_snapshot_path(monkeypatch):
+    def refuse(*args, **kwargs):
+        raise AssertionError("an empty target list built a snapshot map")
+
+    monkeypatch.setattr(_flash_kda, "_build_snapshots", refuse)
+    args = make_inputs(1, 256, 4)
+    with _route(k2=False):
+        o_ref, ht_ref = run_flash(*args, output_final_state=True)
+        o, ht = flash_kda_fwd(
+            *args,
+            lower_bound=LOWER_BOUND,
+            output_final_state=True,
+            snapshot_targets=(),
+            snapshot_out=None,
+        )
+    assert torch.equal(o, o_ref)
+    assert torch.equal(ht, ht_ref)
+
+
+def test_snapshot_out_must_be_contiguous():
+    """A strided `snapshot_out` is rejected, not silently packed into a clone."""
+    args = make_inputs(1, 256, 4)
+    strided = torch.empty(1, 4, K_DIM, 2 * K_DIM, device=device)[..., :K_DIM]
+    assert not strided.is_contiguous()
+    with pytest.raises(ValueError, match="snapshot_out must be a contiguous"):
+        flash_kda_fwd(
+            *args,
+            lower_bound=LOWER_BOUND,
+            snapshot_targets=((0, 128),),
+            snapshot_out=strided,
+        )
+
+
+def test_snapshot_arguments_are_checked():
+    args = make_inputs(1, 256, 4)
+    good = torch.empty(1, 4, K_DIM, K_DIM, device=device)
+    for targets, out in (
+        (((0, 128),), None),  # no destination
+        (((0, 128),), torch.empty(2, 4, K_DIM, K_DIM, device=device)),
+        (((0, 128),), torch.empty(1, 4, K_DIM, K_DIM)),  # on the CPU
+        (((0, 100),), good),  # off the chunk grid
+        (((0, 256),), good),  # the final state
+    ):
+        with pytest.raises(ValueError):
+            flash_kda_fwd(
+                *args,
+                lower_bound=LOWER_BOUND,
+                snapshot_targets=targets,
+                snapshot_out=out,
+            )
+    q, k, v, g, beta, A_log, dt_bias, scale = args
+    with _force_default_pipeline(), pytest.raises(ValueError):
+        chunk_delta_attn_fwd(
+            q=q,
+            k=k,
+            v=v,
+            g=g,
+            beta=beta,
+            scale=scale,
+            initial_state=None,
+            output_final_state=False,
+            A_log=A_log,
+            dt_bias=dt_bias,
+            chunk_size=FLASH_KDA_CHUNK,
+            safe_gate=True,
+            lower_bound=LOWER_BOUND,
+            use_gate_in_kernel=True,
+            use_qk_l2norm_in_kernel=True,
+            use_beta_sigmoid_in_kernel=True,
+            snapshot_targets=((0, 128),),
+            snapshot_out=good,
+        )
+
+
+# ── Where pass C puts the snapshots: CPU only, no kernel launch ──────────────
+#
+# `snapshot_chunk_rows` maps each target ``(n, off)`` to one chunk of the K1
+# grid. Pass C stores row ``rows[chunk_base + j]`` when it enters chunk ``j`` of
+# a segment. `TestSnapshotMap` walks that loop on the CPU, with the reference
+# recurrence moving the state forward one chunk at a time, and compares each
+# stored state with the reference run over the first ``off`` tokens only. It
+# uses CPU tensors and launches no kernel, so it tests the placement apart from
+# the kernel. Collecting this file still imports aiter's FlashKDA modules
+# (`flash_kda` reads the GPU architecture at import), as on the CI runners.
+
+_MAP_H, _MAP_K, _MAP_V = 2, 8, 8
+
+
+def _map_inputs(lens, seed=0):
+    """Packed ``[1, T, ...]`` CPU inputs, with the gate, l2norm and beta sigmoid applied.
+
+    They are applied once to the whole batch, so a slice of a sequence sees the
+    same values as the whole sequence does.
+    """
+    gen = torch.Generator().manual_seed(seed)
+    T = sum(lens)
+
+    def randn(*shape):
+        return torch.randn(*shape, generator=gen)
+
+    A_log, dt_bias = randn(_MAP_H).abs() * 0.5, randn(_MAP_H * _MAP_K) * 0.1
+    return {
+        "q": l2norm_ref(randn(1, T, _MAP_H, _MAP_K)),
+        "k": l2norm_ref(randn(1, T, _MAP_H, _MAP_K)),
+        "v": randn(1, T, _MAP_H, _MAP_V),
+        "g": kda_gate_ref(
+            randn(1, T, _MAP_H, _MAP_K) * 0.1, A_log, dt_bias, LOWER_BOUND
+        ),
+        "beta": torch.sigmoid(randn(1, T, _MAP_H)),
+    }
+
+
+def _map_bounds(lens):
+    out, bos = [], 0
+    for length in lens:
+        out.append((bos, bos + length))
+        bos += length
+    return tuple(out)
+
+
+def _map_state(x, bos, eos, h0=None):
+    """The reference state after tokens ``[bos, eos)``, from ``h0`` (zero if None)."""
+    _, state = chunk_kda_ref(
+        **{name: t[:, bos:eos] for name, t in x.items()},
+        scale=_MAP_K**-0.5,
+        initial_state=h0,
+        output_final_state=True,
+    )
+    return state
+
+
+def _map_segments(seqs, chunks_per_seg):
+    """``(n, chunk_base, nchunks, tok_base, tok_end)`` per segment.
+
+    This is the layout of `_build_segments`; the kernel tests above check that
+    the two agree.
+    """
+    out, g_chunk, C = [], 0, FLASH_KDA_CHUNK
+    for n, (bos, eos) in enumerate(seqs):
+        nch = -(-(eos - bos) // C)
+        for s in range(max(1, -(-nch // chunks_per_seg))):
+            c0 = s * chunks_per_seg
+            m = min(chunks_per_seg, nch - c0)
+            end = min(bos + (c0 + m) * C, eos)
+            out.append((n, g_chunk + c0, m, bos + c0 * C, end))
+        g_chunk += nch
+    return out
+
+
+def _map_walk(x, seqs, rows, chunks_per_seg, n_rows):
+    """Pass C on the CPU.
+
+    Each segment starts from its true incoming state. When it enters chunk
+    ``j``, it stores the state in row ``rows[chunk_base + j]``.
+    """
+    snaps = [None] * n_rows
+    carried = {}
+    for n, base, nchunks, tok, end in _map_segments(seqs, chunks_per_seg):
+        state = carried.get(n)
+        for j in range(nchunks):
+            row = rows[base + j]
+            if row >= 0:
+                snaps[row] = state.clone()
+            t0 = tok + j * FLASH_KDA_CHUNK
+            state = _map_state(x, t0, min(t0 + FLASH_KDA_CHUNK, end), state)
+        carried[n] = state
+    return snaps
+
+
+def _map_interior(seqs, every=1):
+    """Every ``every``-th interior chunk boundary of each sequence, as targets."""
+    return [
+        (n, off)
+        for n, (bos, eos) in enumerate(seqs)
+        for off in range(FLASH_KDA_CHUNK, eos - bos, FLASH_KDA_CHUNK)[::every]
+    ]
+
+
+class TestSnapshotMap:
+    """Where pass C stores each snapshot, on the CPU (the section note above)."""
+
+    @pytest.mark.parametrize("chunks_per_seg", [1, 2, 3, 1 << 20])
+    @pytest.mark.parametrize(
+        "lens",
+        [
+            [160],  # one sequence, four interior boundaries
+            [100, 64, 33],  # several sequences, all ending mid-chunk or on a boundary
+            [0, 130, 31, 97],  # an empty one and one with no interior boundary
+        ],
+    )
+    def test_every_snapshot_is_the_state_of_its_prefix(self, lens, chunks_per_seg):
+        seqs = _map_bounds(lens)
+        x = _map_inputs(lens)
+        targets = _map_interior(seqs)
+        random.Random(0).shuffle(targets)
+        rows = snapshot_chunk_rows(seqs, FLASH_KDA_CHUNK, tuple(targets))
+        assert len(rows) == sum(-(-length // FLASH_KDA_CHUNK) for length in lens)
+        assert sorted(r for r in rows if r >= 0) == list(range(len(targets)))
+
+        snaps = _map_walk(x, seqs, rows, chunks_per_seg, len(targets))
+        for i, (n, off) in enumerate(targets):
+            bos = seqs[n][0]
+            assert torch.equal(snaps[i], _map_state(x, bos, bos + off)), (n, off)
+
+    def test_rows_follow_the_order_of_the_targets(self):
+        seqs = _map_bounds([200, 96])
+        x = _map_inputs([200, 96], seed=1)
+        targets = list(reversed(_map_interior(seqs, every=2)))
+        rows = snapshot_chunk_rows(seqs, FLASH_KDA_CHUNK, tuple(targets))
+        snaps = _map_walk(x, seqs, rows, 2, len(targets))
+        for i, (n, off) in enumerate(targets):
+            bos = seqs[n][0]
+            assert torch.equal(snaps[i], _map_state(x, bos, bos + off))
+
+    def test_no_targets_store_nothing(self):
+        seqs = _map_bounds([96, 40])
+        rows = snapshot_chunk_rows(seqs, FLASH_KDA_CHUNK, ())
+        assert rows == [-1] * (3 + 2)
+        assert _map_walk(_map_inputs([96, 40]), seqs, rows, 1, 0) == []
+
+    @pytest.mark.parametrize(
+        "targets",
+        [
+            [(0, 0)],  # the initial state
+            [(0, 96)],  # the final state of the 96-token sequence
+            [(0, 33)],  # off the chunk grid
+            [(0, 31)],  # off the chunk grid, before the first boundary
+            [(0, 128)],  # past the end
+            [(1, 32)],  # a 20-token sequence has no interior boundary
+            [(2, 32)],  # no such sequence
+            [(-1, 32)],
+            [(0, 32), (0, 64), (0, 32)],  # the same position twice
+        ],
+    )
+    def test_rejects_a_position_it_cannot_store(self, targets):
+        with pytest.raises(ValueError):
+            snapshot_chunk_rows(_map_bounds([96, 20]), FLASH_KDA_CHUNK, tuple(targets))
