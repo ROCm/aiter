@@ -6,6 +6,9 @@ import logging
 import torch
 import triton
 
+from aiter.ops.triton.attention.kda_atom import (  # noqa: F401
+    fused_sigmoid_gating_delta_rule_update,
+)
 from aiter.ops.triton.utils._triton import arch_info
 from aiter.ops.triton.utils.logger import AiterTritonLogger
 
@@ -60,6 +63,8 @@ def fused_recurrent_kda(
     out_gate: torch.Tensor | None = None,
     norm_weight: torch.Tensor | None = None,
     norm_eps: float = 1e-5,
+    ssm_state_indices_in: torch.Tensor | None = None,
+    atom_slots: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor | None]:
     """Fused recurrent Kimi Delta Attention (KDA), gfx950/gfx1250 Gluon decode path.
 
@@ -105,6 +110,14 @@ def fused_recurrent_kda(
             full slab only for a sequence's first token, then compact
             (a, k, err) records per token for replay after verification.
         pad_slot_guard: paged only: state slots <= 0 mark padded sequences
+        ssm_state_indices_in: read-side slot table. Same shape and stride as
+            ``ssm_state_indices``. None reads the write table. A distinct
+            tensor loads the initial state from those slots and stores each
+            token into ``ssm_state_indices``.
+        atom_slots: negative read slots leave the output and state untouched,
+            and negative write slots still write the output. Slot 0 is valid.
+            Requires gfx1250. ``pad_slot_guard`` remains the separate ``<= 0``
+            contract and is not a substitute.
         config: tuning dict (BV, SK, num_warps, num_buffers, use_tdm_store,
             use_tdm_load, use_tdm_fused_load, use_one_token_decode, CH).
             None selects the one-token kernel for supported gfx1250 decode inputs.
@@ -121,6 +134,25 @@ def fused_recurrent_kda(
         A fresh state uses initial_state's dtype, or fp32 without initial_state.
     """
 
+    if atom_slots or ssm_state_indices_in is not None:
+        if _ARCH not in ("gfx1250", "gfx1250-strict"):
+            raise NotImplementedError(
+                "separate KDA read/write slots require gfx1250"
+            )
+    if ssm_state_indices_in is not None:
+        if ssm_state_indices is None:
+            raise ValueError("ssm_state_indices_in requires ssm_state_indices")
+        if (
+            ssm_state_indices_in.shape != ssm_state_indices.shape
+            or ssm_state_indices_in.stride() != ssm_state_indices.stride()
+            or ssm_state_indices_in.dtype != ssm_state_indices.dtype
+            or ssm_state_indices_in.device != ssm_state_indices.device
+        ):
+            raise ValueError(
+                "ssm_state_indices_in must match ssm_state_indices in "
+                "shape, stride, dtype, and device"
+            )
+
     if _ARCH in ("gfx1250", "gfx1250-strict"):
         result = try_kda_one_token_decode(
             q,
@@ -133,6 +165,7 @@ def fused_recurrent_kda(
             initial_state,
             cu_seqlens,
             ssm_state_indices,
+            ssm_state_indices_in,
             out,
             config=config,
             state_v_first=state_v_first,
@@ -384,6 +417,22 @@ def fused_recurrent_kda(
         )
 
     grid = (triton.cdiv(V, BV) * N * HV,)
+    split_index = (
+        ssm_state_indices is not None
+        and ssm_state_indices_in is not None
+        and ssm_state_indices_in.data_ptr() != ssm_state_indices.data_ptr()
+    )
+    packed_slots = {}
+    if _ARCH in ("gfx1250", "gfx1250-strict"):
+        packed_slots = {
+            "state_indices_in_ptr": (
+                ssm_state_indices
+                if ssm_state_indices_in is None
+                else ssm_state_indices_in
+            ),
+            "ATOM_SLOTS": atom_slots,
+            "SPLIT_INDEX": split_index,
+        }
     fused_recurrent_kda_packed_decode_kernel[grid](
         q_ptr=q,
         k_ptr=k,
@@ -460,6 +509,7 @@ def fused_recurrent_kda(
             if sched_strategy
             else {}
         ),
+        **packed_slots,
     )
     return out, final_state
 

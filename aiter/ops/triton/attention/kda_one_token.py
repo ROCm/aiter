@@ -61,6 +61,7 @@ def try_kda_one_token_decode(
     initial_state,
     cu_seqlens,
     ssm_state_indices,
+    ssm_state_indices_in,
     out,
     *,
     config,
@@ -133,6 +134,17 @@ def try_kda_one_token_decode(
         and V % cfg["BV"] == 0
     ):
         return None
+    split_index = False
+    if ssm_state_indices_in is not None:
+        if (
+            ssm_state_indices_in.shape != ssm_state_indices.shape
+            or ssm_state_indices_in.stride() != ssm_state_indices.stride()
+            or ssm_state_indices_in.dtype != ssm_state_indices.dtype
+        ):
+            return None
+        split_index = ssm_state_indices_in.data_ptr() != ssm_state_indices.data_ptr()
+    else:
+        ssm_state_indices_in = ssm_state_indices
     tensors = (
         q,
         k,
@@ -145,6 +157,7 @@ def try_kda_one_token_decode(
         initial_state,
         cu_seqlens,
         ssm_state_indices,
+        ssm_state_indices_in,
     )
     device = q.device
     if not all(x.device == device for x in tensors if x is not None):
@@ -164,7 +177,8 @@ def try_kda_one_token_decode(
     if out is not None:
         out_ptr = storages[7].data_ptr()
         if any(
-            storage.data_ptr() == out_ptr for storage in storages[:7] + storages[8:]
+            storage is not None and storage.data_ptr() == out_ptr
+            for storage in storages[:7] + storages[8:]
         ):
             return None
     else:
@@ -182,6 +196,7 @@ def try_kda_one_token_decode(
         state_ptr=initial_state,
         cu_seqlens_ptr=cu_seqlens,
         state_indices_ptr=ssm_state_indices,
+        state_indices_in_ptr=ssm_state_indices_in,
         stride_indices_seq=ssm_state_indices.stride(0),
         stride_g_token=g.stride(1),
         stride_beta_token=beta.stride(1),
@@ -196,6 +211,7 @@ def try_kda_one_token_decode(
         CH=cfg["CH"],
         NUM_WARPS=cfg["num_warps"],
         SK=cfg["SK"],
+        SPLIT_INDEX=split_index,
         num_warps=cfg["num_warps"],
         enable_fp_fusion=True,
     )

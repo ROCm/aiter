@@ -597,6 +597,251 @@ def _one_token_decode(
                 gl.amd.hint.sched_barrier()
 
 
+@gluon.jit
+def _one_token_rows_split(
+    q_ptr,
+    k_ptr,
+    g_ptr,
+    beta_ptr,
+    A_log_ptr,
+    dt_bias_ptr,
+    s_p,
+    s_store,
+    v_p,
+    o_p,
+    tok,
+    i_h,
+    stride_g_token,
+    stride_beta_token,
+    lower_bound,
+    store_state,
+    scale: gl.constexpr,
+    H: gl.constexpr,
+    K: gl.constexpr,
+    BV: gl.constexpr,
+    CH: gl.constexpr,
+    NUM_WARPS: gl.constexpr,
+):
+    """One-token rows that load ``s_p`` and store ``s_store``.
+
+    The in-place kernel keeps a single base pointer. A state fork passes the
+    checkpoint as ``s_p`` and the new slot as ``s_store``. ``store_state`` is
+    false when the write slot is negative: the output is still produced.
+    """
+    num_chunks: gl.constexpr = BV // CH
+    k_per_chunk: gl.constexpr = K // num_chunks
+    rows_per_thread: gl.constexpr = CH // (2 * NUM_WARPS)
+    gl.static_assert(K == 128)
+    state_layout: gl.constexpr = gl.BlockedLayout(
+        [rows_per_thread, 4, 1, 2],
+        [2, 1, 16, 1],
+        [NUM_WARPS, 1, 1, 1],
+        [3, 2, 1, 0],
+    )
+    k_layout: gl.constexpr = gl.SliceLayout(0, state_layout)
+    chunk_layout: gl.constexpr = gl.SliceLayout(
+        1, gl.SliceLayout(2, gl.SliceLayout(1, state_layout))
+    )
+    kj = gl.arange(0, 4, layout=gl.SliceLayout(1, gl.SliceLayout(2, k_layout)))
+    kl = gl.arange(0, 16, layout=gl.SliceLayout(0, gl.SliceLayout(2, k_layout)))
+    kb = gl.arange(0, 2, layout=gl.SliceLayout(0, gl.SliceLayout(1, k_layout)))
+    off_k = (
+        gl.expand_dims(gl.expand_dims(kj * 32, 1), 2)
+        + gl.expand_dims(gl.expand_dims(kl * 2, 0), 2)
+        + gl.expand_dims(gl.expand_dims(kb, 0), 1)
+    )
+    off_c = gl.arange(0, CH, layout=chunk_layout)
+    off_s = _broadcast_chunk(off_c * K) + gl.expand_dims(off_k, 0)
+    output_lanes: gl.constexpr = max(BV, 8 * 32 * NUM_WARPS)
+    output_lds = gl.allocate_shared_memory(
+        gl.float32, [output_lanes], gl.SwizzledSharedLayout(1, 1, 1, [0])
+    )
+    S = gl.amd.gfx1250.buffer_load(s_p, off_s)
+    qr = gl.amd.gfx1250.buffer_load(q_ptr + tok * (H * K) + i_h * K, off_k)
+    kr = gl.amd.gfx1250.buffer_load(k_ptr + tok * (H * K) + i_h * K, off_k)
+    gr = gl.amd.gfx1250.buffer_load(g_ptr + tok * stride_g_token + i_h * K, off_k)
+    bias = gl.amd.gfx1250.buffer_load(dt_bias_ptr + i_h * K, off_k)
+    br = gl.load(beta_ptr + tok * stride_beta_token + i_h)
+    alog = gl.load(A_log_ptr + i_h)
+    v0 = gl.amd.gfx1250.buffer_load(v_p, off_c)
+    v1 = v0
+    if num_chunks > 1:
+        v1 = gl.amd.gfx1250.buffer_load(v_p + k_per_chunk, off_c)
+    q = qr.to(gl.float32)
+    k = kr.to(gl.float32)
+    q = q * (gl.rsqrt(_reduce_k(q * q) + 1e-6) * scale)
+    k = k * gl.rsqrt(_reduce_k(k * k) + 1e-6)
+    a_exp = 0.5 * gl.exp(alog.to(gl.float32))
+    gate_c = lower_bound * _LOG2_E_HALF
+    th = libdevice.tanh(gr.to(gl.float32) * a_exp + a_exp * bias.to(gl.float32))
+    a = gl.exp2(th * gate_c + gate_c)
+    beta = sigmoid(br.to(gl.float32))
+    a4 = gl.expand_dims(a, 0)
+    k4 = gl.expand_dims(k, 0)
+    q4 = gl.expand_dims(q, 0)
+    for c in gl.static_range(num_chunks):
+        vv = v0
+        if c == 1:
+            vv = v1
+        if c > 1:
+            vv = gl.amd.gfx1250.buffer_load(v_p + c * k_per_chunk, off_c)
+        S = S * a4
+        err = (vv.to(gl.float32) - _reduce_chunk(S * k4)) * beta
+        S = S + _broadcast_chunk(err) * k4
+        o = _reduce_chunk(S * q4)
+        gl.static_assert(CH * K == 2 * _N * 32 * NUM_WARPS)
+        if store_state:
+            Sa, Sb = gl.split(S)
+            oa, _ob = gl.split(off_s * 4)
+            pair = (Sb.to(gl.uint32, bitcast=True).to(gl.uint64) << 32) | Sa.to(
+                gl.uint32, bitcast=True
+            ).to(gl.uint64)
+            if _HAS_INLINE_ASM:
+                _store_lines(pair, oa, s_store + c * k_per_chunk * K)
+            else:
+                gl.store(s_store + c * k_per_chunk * K + off_s, S)
+        output_lds.slice(c * CH, CH).store(o)
+        if c + 1 < num_chunks:
+            S = gl.amd.gfx1250.buffer_load(s_p + (c + 1) * k_per_chunk * K, off_s)
+    output_layout: gl.constexpr = gl.BlockedLayout([8], [32], [NUM_WARPS], [0])
+    off_o = gl.arange(0, output_lanes, layout=output_layout)
+    gl.amd.gfx1250.buffer_store(
+        output_lds.load(output_layout).to(o_p.dtype.element_ty),
+        o_p,
+        (off_o // CH) * k_per_chunk + off_o % CH,
+        mask=off_o < BV,
+    )
+
+
+@gluon.jit
+def _one_token_decode_split(
+    q_ptr,
+    k_ptr,
+    v_ptr,
+    g_ptr,
+    beta_ptr,
+    A_log_ptr,
+    dt_bias_ptr,
+    state_ptr,
+    o_ptr,
+    bos,
+    slot_in,
+    slot_out,
+    store_state,
+    i_h,
+    i_v,
+    stride_q_token: gl.constexpr,
+    stride_k_token: gl.constexpr,
+    stride_v_token: gl.constexpr,
+    stride_g_token: gl.constexpr,
+    stride_beta_token: gl.constexpr,
+    stride_o_token: gl.constexpr,
+    stride_state_slot_rows,
+    lower_bound,
+    scale: gl.constexpr,
+    H: gl.constexpr,
+    K: gl.constexpr,
+    V: gl.constexpr,
+    BV: gl.constexpr,
+    CH: gl.constexpr,
+    SK: gl.constexpr,
+    NUM_WARPS: gl.constexpr,
+):
+    if K == 128 and V == 128 and BV == 32 and CH == 16 and SK == 16 and NUM_WARPS == 2:
+        tok = bos.to(gl.int64)
+        row_in = slot_in.to(gl.int64) * stride_state_slot_rows + i_h * V + i_v * CH
+        row_out = slot_out.to(gl.int64) * stride_state_slot_rows + i_h * V + i_v * CH
+        s_in = state_ptr + row_in * K
+        # A negative write slot must not form the store base. The load base is
+        # valid: the caller already rejected a negative read slot.
+        s_out = s_in
+        if store_state:
+            s_out = state_ptr + row_out * K
+        _one_token_rows_split(
+            q_ptr,
+            k_ptr,
+            g_ptr,
+            beta_ptr,
+            A_log_ptr,
+            dt_bias_ptr,
+            s_in,
+            s_out,
+            v_ptr + tok * stride_v_token + i_h * V + i_v * CH,
+            o_ptr + tok * stride_o_token + i_h * V + i_v * CH,
+            tok,
+            i_h,
+            stride_g_token,
+            stride_beta_token,
+            lower_bound,
+            store_state,
+            scale,
+            H,
+            K,
+            BV,
+            CH,
+            NUM_WARPS,
+        )
+    else:
+        layout: gl.constexpr = _state_layout(
+            True, CH * SK // (32 * NUM_WARPS), K, CH, SK, NUM_WARPS
+        )
+        off_k = gl.arange(0, K, layout=gl.SliceLayout(0, layout))
+        off_v = gl.arange(0, CH, layout=gl.SliceLayout(1, layout))
+        off_s = off_v[:, None] * K + off_k[None, :]
+        tok = bos.to(gl.int64)
+        q_p = q_ptr + tok * stride_q_token + i_h * K
+        k_p = k_ptr + tok * stride_k_token + i_h * K
+        g_p = g_ptr + tok * stride_g_token + i_h * K
+        v_p = v_ptr + tok * stride_v_token + i_h * V + i_v * BV
+        o_p = o_ptr + tok * stride_o_token + i_h * V + i_v * BV
+        b_p = beta_ptr + tok * stride_beta_token + i_h
+        s_in = (
+            state_ptr
+            + (slot_in.to(gl.int64) * stride_state_slot_rows + i_h * V + i_v * BV) * K
+        )
+        s_out = s_in
+        if store_state:
+            s_out = (
+                state_ptr
+                + (slot_out.to(gl.int64) * stride_state_slot_rows + i_h * V + i_v * BV)
+                * K
+            )
+        raw = _fetch_token(q_p, k_p, v_p, g_p, b_p, off_k, off_v, False)
+        bias = gl.amd.gfx1250.buffer_load(dt_bias_ptr + i_h * K, off_k)
+        a_log = gl.load(A_log_ptr + i_h)
+        S = gl.amd.gfx1250.buffer_load(s_in, off_s)
+        gl.amd.hint.sched_barrier()
+        a_exp = 0.5 * gl.exp(a_log.to(gl.float32))
+        a, k, q, v, beta = _process_token(
+            raw,
+            a_exp,
+            a_exp * bias.to(gl.float32),
+            lower_bound * _LOG2_E_HALF,
+            scale,
+            True,
+            True,
+            True,
+            True,
+            True,
+            False,
+        )
+        for c in gl.static_range(BV // CH):
+            if c > 0:
+                v = gl.amd.gfx1250.buffer_load(v_p + c * CH, off_v).to(gl.float32)
+            S = S * a[None, :]
+            err = (v - gl.sum(S * k[None, :], axis=1)) * beta
+            S = S + err[:, None] * k[None, :]
+            if store_state:
+                gl.amd.gfx1250.buffer_store(S, s_out + c * CH * K, off_s)
+            o = gl.sum(S * q[None, :], axis=1)
+            gl.amd.gfx1250.buffer_store(
+                o.to(o_ptr.dtype.element_ty), o_p + c * CH, off_v
+            )
+            if c + 1 < BV // CH:
+                S = gl.amd.gfx1250.buffer_load(s_in + (c + 1) * CH * K, off_s)
+                gl.amd.hint.sched_barrier()
+
+
 _fused_recurrent_kda_packed_decode_repr = make_kernel_repr(
     "fused_recurrent_kda_packed_decode_kernel",
     [
@@ -630,6 +875,7 @@ def fused_recurrent_kda_packed_decode_kernel(
     state_out_ptr,
     cu_seqlens_ptr,
     state_indices_ptr,
+    state_indices_in_ptr,
     num_accepted_ptr,
     conv_state_ptr,
     conv_weight_ptr,
@@ -685,6 +931,12 @@ def fused_recurrent_kda_packed_decode_kernel(
     USE_CONV: gl.constexpr = False,
     USE_RMS_GATE: gl.constexpr = False,
     TDM_STORE_BUFS: gl.constexpr = 2,
+    # ATOM slot rules: a negative read slot leaves o and state untouched, and a
+    # negative write slot still writes o. Slot 0 stays a real slot.
+    ATOM_SLOTS: gl.constexpr = False,
+    # Read the initial slab from state_indices_in_ptr. Per-token stores stay on
+    # state_indices_ptr, so a fork does not clobber the checkpoint.
+    SPLIT_INDEX: gl.constexpr = False,
 ):
     gl.static_assert(V % BV == 0, "BV must divide V")
     gl.static_assert(32 % SK == 0, "SK must divide the wave")
@@ -890,12 +1142,18 @@ def fused_recurrent_kda_packed_decode_kernel(
                 slot = gl.load(state_indices_ptr + i_n * stride_indices_seq).to(
                     gl.int32
                 )
+            elif SPLIT_INDEX:
+                slot = gl.load(
+                    state_indices_in_ptr + i_n * stride_indices_seq + seed
+                ).to(gl.int32)
             else:
                 slot = gl.load(state_indices_ptr + i_n * stride_indices_seq + seed).to(
                     gl.int32
                 )
         else:
             slot = i_n
+        if (ATOM_SLOTS or SPLIT_INDEX) and slot < 0:
+            return
         if USE_CONV:
             FLATK: gl.constexpr = gl.BlockedLayout(
                 [1, (K * CR) // (32 * NUM_WARPS)],
@@ -1011,7 +1269,8 @@ def fused_recurrent_kda_packed_decode_kernel(
     n_steady = gl.where(n_tok > PREFETCH_DEPTH, n_tok - PREFETCH_DEPTH, 0)
 
     if IS_CONTINUOUS_BATCHING and INPLACE_FINAL_STATE and PREFETCH_DEPTH == 1:
-        if USE_INITIAL_STATE and not IS_SPEC_DECODING:
+        # A split read slot must not be reused as the first write slot.
+        if (not SPLIT_INDEX) and USE_INITIAL_STATE and not IS_SPEC_DECODING:
             slot_nxt = slot
         else:
             slot_nxt = gl.load(state_indices_ptr + i_n * stride_indices_seq).to(
@@ -1182,6 +1441,8 @@ def fused_recurrent_kda_packed_decode_kernel(
                 )
                 if PAD_SLOT_GUARD and INPLACE_FINAL_STATE:
                     store_ok = out_slot > 0
+                elif (ATOM_SLOTS or SPLIT_INDEX) and INPLACE_FINAL_STATE:
+                    store_ok = out_slot >= 0
                 else:
                     store_ok = True
                 if CACHE_STATE_UPDATES:
@@ -1275,6 +1536,7 @@ def kda_one_token_decode_kernel(
     state_ptr,
     cu_seqlens_ptr,
     state_indices_ptr,
+    state_indices_in_ptr,
     stride_indices_seq,
     stride_g_token,
     stride_beta_token,
@@ -1289,9 +1551,12 @@ def kda_one_token_decode_kernel(
     CH: gl.constexpr,
     NUM_WARPS: gl.constexpr,
     SK: gl.constexpr,
+    SPLIT_INDEX: gl.constexpr,
 ):
     # Host dispatch rejects any sequence longer than one token. Empty sequences
-    # and negative slots stay on this kernel and produce no store.
+    # and a negative read slot stay on this kernel and produce no store. With
+    # SPLIT_INDEX the read slot and the write slot are different tensors: a
+    # negative write slot still stores the output.
     pid = gl.program_id(0)
     tile = V // BV
     nh = pid // tile
@@ -1299,7 +1564,43 @@ def kda_one_token_decode_kernel(
     bos = gl.load(cu_seqlens_ptr + seq)
     eos = gl.load(cu_seqlens_ptr + seq + 1)
     slot = gl.load(state_indices_ptr + seq * stride_indices_seq)
-    if (eos - bos == 1) & (slot >= 0):
+    if SPLIT_INDEX:
+        slot_in = gl.load(state_indices_in_ptr + seq * stride_indices_seq)
+        if (eos - bos == 1) & (slot_in >= 0):
+            _one_token_decode_split(
+                q_ptr,
+                k_ptr,
+                v_ptr,
+                g_ptr,
+                beta_ptr,
+                A_log_ptr,
+                dt_bias_ptr,
+                state_ptr,
+                o_ptr,
+                bos,
+                slot_in,
+                slot,
+                slot >= 0,
+                nh % H,
+                pid % tile,
+                H * K,
+                H * K,
+                H * V,
+                stride_g_token,
+                stride_beta_token,
+                stride_o_token,
+                stride_slot_rows,
+                lower_bound,
+                scale,
+                H,
+                K,
+                V,
+                BV,
+                CH,
+                SK,
+                NUM_WARPS,
+            )
+    elif (eos - bos == 1) & (slot >= 0):
         _one_token_decode(
             q_ptr,
             k_ptr,
