@@ -12,7 +12,9 @@ import triton
 import triton.language as tl
 
 from aiter.ops.triton.attention.unified_attention import (
+    _gfx950_gluon_supported,
     _is_gluon_available,
+    gfx950_gluon_supported,
     is_2d_gluon_available,
     unified_attention,
 )
@@ -2413,3 +2415,54 @@ def test_unified_attn_split_rebalance_reduce_configs_k4v8(
     )
     assert not new[live].isnan().any()
     assert torch.equal(old[live].view(torch.int16), new[live].view(torch.int16))
+
+
+@pytest.mark.parametrize("q_dtype", [torch.bfloat16, e4m3_dtype, torch.float16])
+@pytest.mark.parametrize("kv_dtype", [torch.bfloat16, e4m3_dtype])
+@pytest.mark.parametrize("head_size", [64, 96, 128, 512])
+@pytest.mark.parametrize("shuffled,block_size", [(False, 16), (True, 8), (True, 64)])
+@pytest.mark.parametrize(
+    "softcap,alibi,qq_bias",
+    [(0, False, False), (30.0, False, False), (0, True, False), (0, False, True)],
+)
+def test_the_public_gluon_gate_is_the_one_unified_attention_applies(
+    q_dtype, kv_dtype, head_size, shuffled, block_size, softcap, alibi, qq_bias
+):
+    """`gfx950_gluon_supported` takes only what the gate reads; it answers
+    exactly as the gate `unified_attention` applies to its own parameters."""
+    k_width = 16 if kv_dtype == e4m3_dtype else 8
+    params = SimpleNamespace(
+        q_dtype=q_dtype,
+        kv_cache_dtype=kv_dtype,
+        head_size=head_size,
+        head_size_v=head_size,
+        block_size=block_size,
+        shuffled_kv_cache=shuffled,
+        k_width=k_width,
+        softcap=softcap,
+        use_alibi_slopes=alibi,
+        use_qq_bias=qq_bias,
+    )
+    assert gfx950_gluon_supported(**vars(params)) == _gfx950_gluon_supported(params)
+
+
+@pytest.mark.skipif(DEVICE_ARCH != "gfx950", reason="the gfx950 Gluon kernel")
+@pytest.mark.parametrize("dtype", [torch.bfloat16, e4m3_dtype])
+def test_the_public_gluon_gate_accepts_a_matching_q_and_cache(dtype):
+    assert gfx950_gluon_supported(
+        q_dtype=dtype, kv_cache_dtype=dtype, head_size=64, block_size=1024
+    )
+    assert not gfx950_gluon_supported(
+        q_dtype=torch.bfloat16, kv_cache_dtype=e4m3_dtype, head_size=64, block_size=1024
+    )
+
+
+def test_the_public_gluon_gate_needs_k_width_for_a_shuffled_cache():
+    with pytest.raises(ValueError, match="k_width"):
+        gfx950_gluon_supported(
+            q_dtype=torch.bfloat16,
+            kv_cache_dtype=torch.bfloat16,
+            head_size=64,
+            block_size=64,
+            shuffled_kv_cache=True,
+        )
