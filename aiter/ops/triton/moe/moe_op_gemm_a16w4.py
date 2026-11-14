@@ -13,7 +13,12 @@ from aiter.ops.triton._gluon_kernels.gfx942.moe.moe_op_gemm_a16w4 import (
     _moe_gemm_a16w4_gfx942 as _moe_gemm_a16w4_gluon_gfx942,
 )
 from aiter.ops.triton._gluon_kernels.gfx942.moe.moe_op_gemm_a16w4 import (
+    STRIP16_COLS,
+    STRIP16_K,
+    STRIP16_REC_BYTES,
+    W_LAYOUT_STRIP16,
     gfx942_a16w4_layouts,
+    gfx942_strip16_pack,  # noqa: F401  (re-exported for the weight loader)
 )
 from aiter.ops.triton._gluon_kernels.gfx950.moe.moe_op_gemm_a16w4 import (
     _moe_gemm_a16w4_swizzle as _moe_gemm_a16w4_gluon_gfx950_swizzle,
@@ -485,6 +490,7 @@ def moe_gemm_a16w4(
     backend: str | None = None,
     expert_map=None,
     gate_valid=None,
+    w_layout=None,
 ):
     """
     Computes MoE GEMM with 16-bit activations and MxFP4 weights
@@ -512,6 +518,12 @@ def moe_gemm_a16w4(
         limit(float):
         swiglu_add_residual(bool): Whether to add swiglu residual
         backend(Optional[str]): "triton", "gluon" or None(auto-detect).
+        w_layout(Optional[str]): None = column-major `w` as described above. "GFX942_STRIP16" (gfx942 gluon
+            only): `w` is the (E, N/16, K/128, 1088) record tensor from gfx942_strip16_pack (weights and
+            scales of one 16-column x 128-K block in 17 contiguous cache lines); `w_scales` must still be
+            the original (E, K/32, N) tensor (shapes and the fp16-operand range check come from it, the
+            kernel reads the scales from the records). Bit-identical output to the column-major layout.
+            There is no Triton fallback for this layout: unsupported shapes raise.
 
     Returns:
         torch.Tensor: Output with shape as x(num_tokens, K/hidden_dim/emb_dim)
@@ -553,19 +565,36 @@ def moe_gemm_a16w4(
         backend,
     )
 
-    assert w.stride(-2) == 1, "`w` must be column-major when it has data-type mxfp"
+    strip16 = w_layout == W_LAYOUT_STRIP16
+    assert w_layout is None or strip16, f"unknown w_layout {w_layout!r}"
+    if not strip16:
+        assert w.stride(-2) == 1, "`w` must be column-major when it has data-type mxfp"
     assert x_scales is None, "x_scales must be none"
     assert x_static_scale is None, "x_static_scale must be none"
     assert quant_static_scale is None, "quant_static_scale must be none"
 
     # determine shapes
     M = x.shape[-2] if gather_indx is None else gather_indx.shape[0]
-    K, N = x.shape[-1], w.shape[-1]
     block_m = routing_data.block_m
-    if unpadded_N and block_m == 16:
-        N = unpadded_N
-    if unpadded_K and block_m == 16:
-        K = unpadded_K
+    if strip16:
+        # records are addressed by the physical (padded) K, so unpadded_K is ignored: the padding
+        # weights are zero and add nothing to the accumulator
+        K, N = x.shape[-1], w_scales.shape[-1]
+        assert backend == "gluon" and get_arch() == "gfx942", "w_layout GFX942_STRIP16 needs the gfx942 gluon kernel"
+        assert swizzle_mx_scale is None and expert_map is None
+        assert w.is_contiguous() and w.ndim == 4 and w.shape[-1] == STRIP16_REC_BYTES, tuple(w.shape)
+        assert K % STRIP16_K == 0 and N % STRIP16_COLS == 0, (K, N)
+        assert w.shape[1] * STRIP16_COLS == N and w.shape[2] * STRIP16_K == K, (tuple(w.shape), N, K)
+        assert tuple(w_scales.shape[-2:]) == (K // 32, N), tuple(w_scales.shape)
+        if unpadded_N and block_m == 16:
+            assert unpadded_N % STRIP16_COLS == 0, unpadded_N
+            N = unpadded_N
+    else:
+        K, N = x.shape[-1], w.shape[-1]
+        if unpadded_N and block_m == 16:
+            N = unpadded_N
+        if unpadded_K and block_m == 16:
+            K = unpadded_K
 
     # compute optimization flags
     if backend == "gluon":
@@ -580,13 +609,16 @@ def moe_gemm_a16w4(
             config = None
             if (
                 swizzle_mx_scale is None
-                and w.stride(-2) == 1
                 and K % 128 == 0
-                and _gfx942_gluon_weight_layout_ok(w, w_scales)
+                and (
+                    strip16
+                    or (w.stride(-2) == 1 and _gfx942_gluon_weight_layout_ok(w, w_scales))
+                )
             ):
                 config = get_kernel_config_gluon_gfx942(M, N, K, routing_data)
                 if config is not None and K % (config["block_k"] * config["split_k"]) != 0:
                     config = None
+            assert config is not None or not strip16, "w_layout GFX942_STRIP16: no gluon config for this shape"
             if config is None:
                 backend = "triton"
                 config = get_kernel_config_triton(M, N, K, routing_data)
@@ -680,6 +712,8 @@ def moe_gemm_a16w4(
         load_x, load_w, load_s, mfma_layout = _gfx942_layouts_cached(
             config["block_m"], config["block_n"], config["block_k"], config["num_warps"]
         )
+        # W_STRIP16: the kernel takes the strip stride (bytes) as stride_w_n; the record stride is fixed (1088 B)
+        w_stride_k, w_stride_n = (w.stride(2), w.stride(1)) if strip16 else (w.stride(1), w.stride(2))
         _moe_gemm_a16w4_gluon_gfx942[(grid,)](
             y,
             y.stride(0),
@@ -690,8 +724,8 @@ def moe_gemm_a16w4(
             x.stride(1),
             w,
             w.stride(0),
-            w.stride(1),
-            w.stride(2),
+            w_stride_k,
+            w_stride_n,
             w_scales,
             w_scales.stride(0),
             w_scales.stride(1),
@@ -730,6 +764,7 @@ def moe_gemm_a16w4(
             MFMA_LAYOUT=mfma_layout,
             UPCAST_INDICES=should_upcast_indices(x, w, y),
             FP16_OPERAND=fp16_operand,
+            W_STRIP16=strip16,
             num_warps=config["num_warps"],
             num_stages=config["num_stages"],
             waves_per_eu=config["waves_per_eu"],

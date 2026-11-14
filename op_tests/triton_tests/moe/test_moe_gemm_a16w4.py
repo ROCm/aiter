@@ -358,6 +358,46 @@ def test_gfx942_gluon_fp16_operand_graph_capture(monkeypatch):
     assert torch.equal(y_graph, y_eager)
 
 
+@pytest.mark.parametrize("m", [24, 256, 4096])
+@pytest.mark.parametrize("n, k", [(1536, 5120), (5120, 768), (5120, 384)])
+@pytest.mark.parametrize("fp16_mode", ["0", "auto"])
+def test_gfx942_gluon_strip16_matches_column_major(m, n, k, fp16_mode, monkeypatch):
+    """w_layout="GFX942_STRIP16": pack/unpack round trip, and the record layout gives a bit-identical output to the
+    column-major layout (same registers, K grouping and MFMA order) at decode and prefill block sizes, on the bf16
+    and the fp16 operand paths."""
+    if arch_info.get_arch() != "gfx942":
+        pytest.skip("gfx942 Gluon a16w4 kernel only")
+    import aiter.ops.triton.moe.moe_op_gemm_a16w4 as moe_mod
+    from aiter.ops.triton._gluon_kernels.gfx942.moe.moe_op_gemm_a16w4 import (
+        W_LAYOUT_STRIP16,
+        gfx942_strip16_pack,
+        gfx942_strip16_unpack,
+    )
+
+    monkeypatch.setattr(moe_mod, "_GFX942_FP16", fp16_mode)
+    device = "cuda"
+    torch.manual_seed(0)
+    n_expts_tot, n_expts_act = 64, 6
+    m, rdata, gindx, sindx = init_routing_data(m, n_expts_tot, n_expts_act, True, False, device=device)
+    x = (torch.randn((m, k), device=device) * 0.5).to(torch.bfloat16)
+    w_packed = torch.randint(0, 256, (n_expts_tot, n, k // 2), dtype=torch.uint8, device=device)
+    w_scale = torch.randint(114, 141, (n_expts_tot, n, k // 32), dtype=torch.uint8, device=device)
+    w_tri, s_tri = w_packed.transpose(1, 2), w_scale.transpose(1, 2)
+
+    rec = gfx942_strip16_pack(w_tri, s_tri)
+    w_back, s_back = gfx942_strip16_unpack(rec)
+    assert torch.equal(w_back, w_tri) and torch.equal(s_back, s_tri)
+
+    y_col = moe_gemm_a16w4(
+        x, w_tri, None, s_tri, None, None, None, rdata, gindx, None, None, None, torch.bfloat16, False, backend="gluon"
+    )
+    y_rec = moe_gemm_a16w4(
+        x, rec, None, s_tri, None, None, None, rdata, gindx, None, None, None, torch.bfloat16, False,
+        backend="gluon", w_layout=W_LAYOUT_STRIP16,
+    )
+    assert torch.equal(y_rec, y_col)
+
+
 def _ep_setup(
     m, n, k, n_expts_tot, n_expts_act, ep_size, ep_rank, do_gather, do_scatter
 ):

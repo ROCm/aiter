@@ -31,7 +31,16 @@ and per 8 weight elements the dequant is 12 VALU ops (2 lookups, 3 sign ops, 4 b
 114 <= e8m0 <= 140; e8m0 = 0 is allowed for all-zero groups (zero padding). bf16 activations are
 converted to fp16 in registers before the LDS stage (exact for 2^-17 <= |x| <= 65504; larger
 magnitudes saturate to 65504, round toward zero). The wrapper selects this path per weight tensor.
+
+W_STRIP16 weight layout: instead of column-major fp4 weights (column stride K/2 bytes) plus a
+separate e8m0 tensor, W points at records of 1088 B = 17 cache lines, one per (expert, 16-column strip,
+128-K block), see gfx942_strip16_pack. A 16-lane quarter-wave load then reads 256 contiguous bytes (4 lines)
+instead of 16 B from each of 16 columns (16 lines), the scales of a record sit right behind its weights, and
+one workgroup reads one sequential stream per strip. Register contents, K grouping and MFMA order are the
+same as with the column-major layout, so the output is bit-identical.
 """
+
+import torch
 
 import triton
 import triton.language as tl
@@ -164,6 +173,51 @@ v_cvt_pkrtz_f16_f32 $0, $1, $2
 """
 )
 _ASM_BF16_TO_F16_CONSTRAINTS = tl.constexpr("=v,=&v,=&v,v")
+
+
+# ---- W_STRIP16 record layout (see gfx942_strip16_pack)
+STRIP16_COLS = 16  # columns per strip = one quarter-wave
+STRIP16_K = 128  # K per record = 4 e8m0 groups = 64 B of fp4 per column
+STRIP16_W_BYTES = 1024  # 4 groups x 16 columns x 16 B
+STRIP16_REC_BYTES = 1088  # + 16 columns x 4 e8m0 = 17 cache lines
+W_LAYOUT_STRIP16 = "GFX942_STRIP16"
+
+
+def gfx942_strip16_pack(w, w_scales, experts_per_chunk=16):
+    """Re-lay MXFP4 expert weights for the W_STRIP16 path of the gfx942 kernel. Done once at weight load.
+
+    w:        (E, K/2, N) uint8, 2 fp4 per byte along K (any strides; vLLM passes a stride(-2) == 1 view)
+    w_scales: (E, K/32, N) uint8 e8m0
+    Returns a contiguous (E, N/16, K/128, 1088) uint8 tensor. Record (e, strip, rec):
+      bytes [0, 1024)    weights  [j = 0..3][n16 = 0..15][16 B]: K group 4*rec + j (32 K) of column 16*strip + n16
+      bytes [1024, 1088) scales   [n16 = 0..15][j = 0..3]:       e8m0 of the same (group, column)
+    Byte and nibble order inside each 16-byte run are unchanged. Needs K % 128 == 0 and N % 16 == 0.
+    """
+    E, K2, N = w.shape
+    assert w.dtype == torch.uint8 and w_scales.dtype == torch.uint8
+    assert K2 % (STRIP16_K // 2) == 0 and N % STRIP16_COLS == 0, (K2, N)
+    assert tuple(w_scales.shape) == (E, K2 // 16, N), (tuple(w_scales.shape), tuple(w.shape))
+    R, S = K2 // 64, N // 16
+    out = torch.empty((E, S, R, STRIP16_REC_BYTES), dtype=torch.uint8, device=w.device)
+    for e0 in range(0, E, experts_per_chunk):  # bounded transient memory
+        wc = w[e0 : e0 + experts_per_chunk]
+        sc = w_scales[e0 : e0 + experts_per_chunk]
+        n = wc.shape[0]
+        # (e, rec, j, r, strip, n16) -> (e, strip, rec, j, n16, r)
+        ww = wc.reshape(n, R, 4, 16, S, 16).permute(0, 4, 1, 2, 5, 3)
+        out[e0 : e0 + n, :, :, :STRIP16_W_BYTES] = ww.reshape(n, S, R, STRIP16_W_BYTES)
+        # (e, rec, j, strip, n16) -> (e, strip, rec, n16, j)
+        ss = sc.reshape(n, R, 4, S, 16).permute(0, 3, 1, 4, 2)
+        out[e0 : e0 + n, :, :, STRIP16_W_BYTES:] = ss.reshape(n, S, R, STRIP16_REC_BYTES - STRIP16_W_BYTES)
+    return out
+
+
+def gfx942_strip16_unpack(rec):
+    """Inverse of gfx942_strip16_pack: (E, N/16, K/128, 1088) -> (w (E, K/2, N), w_scales (E, K/32, N)), contiguous."""
+    E, S, R, _ = rec.shape
+    ww = rec[..., :STRIP16_W_BYTES].reshape(E, S, R, 4, 16, 16).permute(0, 2, 3, 5, 1, 4)
+    ss = rec[..., STRIP16_W_BYTES:].reshape(E, S, R, 16, 4).permute(0, 2, 4, 1, 3)
+    return ww.reshape(E, R * 64, S * 16), ss.reshape(E, R * 4, S * 16)
 
 
 def gfx942_a16w4_layouts(block_m, block_n, block_k, num_warps):
@@ -375,6 +429,7 @@ def _moe_gemm_a16w4_gfx942(
     num_warps: gl.constexpr,
     UPCAST_INDICES: gl.constexpr = False,
     FP16_OPERAND: gl.constexpr = False,
+    W_STRIP16: gl.constexpr = False,
 ):
     gl.assume(stride_y_k >= 0)
     gl.assume(stride_y_m >= 0)
@@ -402,6 +457,8 @@ def _moe_gemm_a16w4_gfx942(
         gl.static_assert(X.dtype.element_ty == gl.bfloat16, "activations must be bf16")
         OP_DTYPE: gl.constexpr = gl.bfloat16
     gl.static_assert(BLOCK_K % 128 == 0, "BLOCK_K must be a multiple of 128")
+    if W_STRIP16:
+        gl.static_assert(BLOCK_K <= 512, "W_STRIP16: a lane's scales must sit in one record")
 
     KG: gl.constexpr = BLOCK_K // 32  # e8m0 groups (= packed dwords per lane) per tile
     PK2: gl.constexpr = BLOCK_K // 4  # uint16 elements of packed fp4 per column per tile
@@ -482,16 +539,33 @@ def _moe_gemm_a16w4_gfx942(
     W_VEC: gl.constexpr = 2 * KG
     offs_w_n = pid_n * BLOCK_N + gl.arange(0, BLOCK_N, layout=gl.SliceLayout(0, LOAD_W))
     offs_w_n = gl.max_contiguous(gl.multiple_of(offs_w_n % N, BLOCK_N), BLOCK_N)
-    offs_w_q = PK2 * pid_k + gl.arange(0, PK2, layout=gl.SliceLayout(1, LOAD_W))
-    offs_w_q = gl.max_contiguous(gl.multiple_of(offs_w_q, W_VEC), W_VEC)
-    # column stride and expert stride are multiples of 16 bytes (K % 256 == 0): keep the 16-byte
-    # vector loads by stating it for the combined offsets
-    offs_w = (
-        offs_w_q.to(index_type)[:, None]
-        + offs_w_n.to(index_type)[None, :] * (stride_w_n // 2)
-        + w_expt_id * (stride_w_e // 2)
-    )
-    offs_w = gl.max_contiguous(gl.multiple_of(offs_w, [8, 8]), [W_VEC, 1])
+    if W_STRIP16:
+        # records of REC16 uint16 per (strip, 128-K block); stride_w_n = strip stride in bytes.
+        # uint16 q of the tile's K run -> record q // 32, group j = (q // 8) % 4, 16-byte run element q % 8
+        REC16: gl.constexpr = 544
+        q_t = gl.arange(0, PK2, layout=gl.SliceLayout(1, LOAD_W))
+        offs_w_q = (PK2 // 32) * REC16 * pid_k + (q_t // 32) * REC16 + ((q_t // 8) % 4) * 128 + (q_t % 8)
+        offs_w = (
+            offs_w_q.to(index_type)[:, None]
+            + ((offs_w_n % 16) * 8).to(index_type)[None, :]
+            + (offs_w_n // 16).to(index_type)[None, :] * (stride_w_n // 2)
+            + w_expt_id * (stride_w_e // 2)
+        )
+        # every 16-byte run is contiguous and 16-byte aligned (record, strip and expert strides are)
+        offs_w = gl.max_contiguous(gl.multiple_of(offs_w, [8, 8]), [8, 1])
+        W_STEP: gl.constexpr = (PK2 // 32) * REC16 * SPLIT_K
+    else:
+        offs_w_q = PK2 * pid_k + gl.arange(0, PK2, layout=gl.SliceLayout(1, LOAD_W))
+        offs_w_q = gl.max_contiguous(gl.multiple_of(offs_w_q, W_VEC), W_VEC)
+        # column stride and expert stride are multiples of 16 bytes (K % 256 == 0): keep the 16-byte
+        # vector loads by stating it for the combined offsets
+        offs_w = (
+            offs_w_q.to(index_type)[:, None]
+            + offs_w_n.to(index_type)[None, :] * (stride_w_n // 2)
+            + w_expt_id * (stride_w_e // 2)
+        )
+        offs_w = gl.max_contiguous(gl.multiple_of(offs_w, [8, 8]), [W_VEC, 1])
+        W_STEP: gl.constexpr = PK2 * SPLIT_K
     WPtrs = W16 + offs_w
 
     # ---- scale pointers: (KGL, 1, 4, BLOCK_N); lane (g, n) reads the KGL groups of its dwords
@@ -501,12 +575,28 @@ def _moe_gemm_a16w4_gfx942(
     offs_s_n = pid_n * BLOCK_N + gl.arange(0, BLOCK_N, layout=gl.SliceLayout(0, gl.SliceLayout(1, gl.SliceLayout(2, LOAD_S))))
     offs_s_n = gl.max_contiguous(gl.multiple_of(offs_s_n % N, BLOCK_N), BLOCK_N)
     offs_s_kg = KG * pid_k + offs_s_g.to(index_type)[None, None, :, None] * KGL + offs_s_j.to(index_type)[:, None, None, None]
-    if SCALE_K_CONTIG:
-        offs_s = offs_s_kg + offs_s_n.to(index_type)[None, None, None, :] * stride_w_mx_n + w_expt_id * stride_w_mx_e
+    if W_STRIP16:
+        # the e8m0 bytes live in the weight records: group kg -> record kg // 4, byte 1024 + 4 * n16 + kg % 4.
+        # A lane's KGL (<= 4) groups start at a multiple of KGL, so they are contiguous inside one record.
+        offs_s_n16 = offs_s_n % 16
+        offs_s_strip = offs_s_n // 16
+        offs_s = (
+            (offs_s_kg // 4) * 1088
+            + (1024 + offs_s_kg % 4)
+            + (offs_s_n16 * 4).to(index_type)[None, None, None, :]
+            + offs_s_strip.to(index_type)[None, None, None, :] * stride_w_n
+            + w_expt_id * stride_w_e
+        )
         offs_s = gl.max_contiguous(gl.multiple_of(offs_s, [KGL, 1, 1, 1]), [KGL, 1, 1, 1])
+        SPtrs = W + offs_s
+        S_STEP: gl.constexpr = (KG // 4) * 1088 * SPLIT_K
     else:
-        offs_s = offs_s_kg * stride_w_mx_k + offs_s_n.to(index_type)[None, None, None, :] * stride_w_mx_n + w_expt_id * stride_w_mx_e
-    SPtrs = WMxScale + offs_s
+        if SCALE_K_CONTIG:
+            offs_s = offs_s_kg + offs_s_n.to(index_type)[None, None, None, :] * stride_w_mx_n + w_expt_id * stride_w_mx_e
+            offs_s = gl.max_contiguous(gl.multiple_of(offs_s, [KGL, 1, 1, 1]), [KGL, 1, 1, 1])
+        else:
+            offs_s = offs_s_kg * stride_w_mx_k + offs_s_n.to(index_type)[None, None, None, :] * stride_w_mx_n + w_expt_id * stride_w_mx_e
+        SPtrs = WMxScale + offs_s
 
     x_smem = gl.allocate_shared_memory(OP_DTYPE, [BLOCK_M, BLOCK_K], SMEM_X)
     if not FP16_OPERAND:
@@ -556,8 +646,10 @@ def _moe_gemm_a16w4_gfx942(
         acc = gl.amd.cdna3.mfma(xa, wb, acc)
 
         XPtrs += (BLOCK_K * SPLIT_K) * stride_x_k
-        WPtrs += PK2 * SPLIT_K
-        if SCALE_K_CONTIG:
+        WPtrs += W_STEP
+        if W_STRIP16:
+            SPtrs += S_STEP
+        elif SCALE_K_CONTIG:
             SPtrs += KG * SPLIT_K
         else:
             SPtrs += (KG * SPLIT_K) * stride_w_mx_k
