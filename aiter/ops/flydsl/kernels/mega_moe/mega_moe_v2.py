@@ -19,6 +19,7 @@ from ..flydsl_dispatch_combine_intranode_op import (
 from . import envs
 from .dispatch import DISPATCH_TABLE_SIZE, DispatchSlot
 from .mega_moe_config import (
+    FUSED_PATH_SHAPES,
     INDEXED_PAYLOAD_MIN_MTPR,
     MegaMoEConfig,
     Stage1Config,
@@ -58,19 +59,15 @@ def large_m_eligible(
     fanout_masks: tuple[int, ...] = (),
     act: str = "silu",
 ) -> bool:
-    """Whether the large-input path supports this layout (EP8 DeepSeek-V4 a8w4)."""
+    """Whether the large-input path supports this layout (EP8 a8w4, FUSED_PATH_SHAPES)."""
     return (
         enabled
         and arch.split(":", 1)[0] == "gfx950"
         and world_size == 8
-        and model_dim == 7168
-        and inter_dim == 3072
-        and experts == 384
-        and experts // world_size == 48
-        and topk == 6
+        and (model_dim, inter_dim, experts, topk, float(swiglu_limit))
+        in FUSED_PATH_SHAPES
         and quant == "a8w4"
         and max_tok_per_rank == 8192
-        and swiglu_limit == 10.0
         and act == "silu"
         and not fanout_masks
     )
@@ -91,7 +88,7 @@ def small_m_eligible(
     fanout_masks: tuple[int, ...] = (),
     act: str = "silu",
 ) -> bool:
-    """Whether the small-input path supports this layout (EP8 DeepSeek-V4 a8w4).
+    """Whether the small-input path supports this layout (EP8 a8w4, FUSED_PATH_SHAPES).
 
     The kernel splits its work across 8 XCDs by XCC id, so it needs the 8-XCD
     (256-CU) gfx950 parts; a 4-XCD part would leave half the work unclaimed.
@@ -101,12 +98,9 @@ def small_m_eligible(
         and arch.split(":", 1)[0] == "gfx950"
         and num_cu == 256
         and world_size == 8
-        and model_dim == 7168
-        and inter_dim == 3072
-        and experts == 384
-        and topk == 6
+        and (model_dim, inter_dim, experts, topk, float(swiglu_limit))
+        in FUSED_PATH_SHAPES
         and quant == "a8w4"
-        and swiglu_limit == 10.0
         and act == "silu"
         and not fanout_masks
     )
