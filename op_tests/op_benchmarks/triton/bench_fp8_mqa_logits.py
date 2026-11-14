@@ -49,6 +49,23 @@ def run_benchmark(args):
             args.clean_logits,
         ]
     ]
+    if args.long_kv_cases:
+        x_vals_list = [
+            [1, rows, keys, 32, 128, clean]
+            for rows, keys, clean in (
+                (8, 4095, 0),
+                (8, 4096, 0),
+                (8, 4097, 0),
+                (9, 4097, 0),
+                (24, 4223, 0),
+                (64, 573440, 0),
+                (1856, 116480, 0),
+                (4096, 8192, 0),
+                (4098, 8192, 0),
+                (4104, 8192, 0),
+                (8, 4097, 1),
+            )
+        ]
     if args.metric == "time":
         ylabel = "Time (ms)"
     elif args.metric == "throughput":
@@ -131,6 +148,11 @@ def main():
     )
     parser.add_argument(
         "--clean_logits", type=int, default=1, help="Clean the untouched logits"
+    )
+    parser.add_argument(
+        "--long_kv_cases",
+        action="store_true",
+        help="Benchmark long-KV row groups and fallback boundaries at H32/D128",
     )
     parser.add_argument(
         "-o", action="store_true", help="Write performance results to CSV file"
