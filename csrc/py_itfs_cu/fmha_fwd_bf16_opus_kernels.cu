@@ -38,7 +38,8 @@ void launch_d128(at::Tensor& q,
                  std::optional<at::Tensor>& seqstart_k_pad,
                  int max_seqlen_q,
                  int max_seqlen_k,
-                 int window_size_left)
+                 int window_size_left,
+                 std::optional<at::Tensor>& sink)
 {
     // Both head dims share the tile shape; the dispatcher only routes 64 or 128 here.
     const int D = static_cast<int>(q.size(-1));
@@ -62,6 +63,8 @@ void launch_d128(at::Tensor& q,
                 "OPUS D=", D, ": window_size_left >= 0 requires causal");
     TORCH_CHECK(window_size_left < 0 || D == 128,
                 "OPUS D=64 kernel has no sliding window");
+    TORCH_CHECK(window_size_left < 0 || !sink.has_value(),
+                "OPUS: attention sink is not supported with a sliding window");
     args.window_size_left = window_size_left;
 
     HipDeviceGuard guard(q.device().index());
@@ -206,6 +209,18 @@ void launch_d128(at::Tensor& q,
             args.stride_lse_h = static_cast<int>(l.stride(1));
         }
         args.lse_ptr = l.data_ptr();
+    }
+
+    // Attention sink: one fp32 valueless logit per QUERY head, [H], unit stride. It
+    // changes the softmax denominator without requiring an extra value/output buffer.
+    if (sink.has_value()) {
+        const at::Tensor& s = *sink;
+        TORCH_CHECK(s.device() == q.device(), "sink must be on the same device as q");
+        TORCH_CHECK(s.scalar_type() == at::kFloat, "sink must be float32");
+        TORCH_CHECK(s.dim() == 1 && static_cast<int>(s.size(0)) == H,
+                    "sink must be 1-D [H] matching q head count");
+        TORCH_CHECK(s.stride(0) == 1, "sink must be contiguous");
+        args.sink_ptr = s.data_ptr();
     }
 
     TORCH_CHECK(fmha_fwd_bf16_opus_launch(args, at::hip::getCurrentHIPStream()),
@@ -378,7 +393,8 @@ void fmha_fwd_bf16_opus_fwd(at::Tensor& q,
                             std::optional<at::Tensor> seqstart_k_pad,
                             int max_seqlen_q,
                             int max_seqlen_k,
-                            int window_size_left)
+                            int window_size_left,
+                            std::optional<at::Tensor> sink)
 {
     TORCH_CHECK(q.is_cuda(), "q must be a GPU tensor");
     TORCH_CHECK(k.device() == q.device() && v.device() == q.device() &&
@@ -395,10 +411,12 @@ void fmha_fwd_bf16_opus_fwd(at::Tensor& q,
     if (D_QK == D_V && (D_QK == 64 || D_QK == 128)) {
         launch_d128(q, k, v, out, causal, softmax_scale, lse,
                     seqstart_q, seqstart_k, seqstart_q_pad, seqstart_k_pad,
-                    max_seqlen_q, max_seqlen_k, window_size_left);
+                    max_seqlen_q, max_seqlen_k, window_size_left, sink);
     } else if (D_QK == 192 && D_V == 128) {
         TORCH_CHECK(window_size_left < 0,
                     "OPUS D_QK=192/D_V=128 kernel has no sliding window");
+        TORCH_CHECK(!sink.has_value(),
+                    "OPUS D_QK=192/D_V=128 kernel does not support attention sinks");
         launch_d192_v128(q, k, v, out, causal, softmax_scale, lse,
                          seqstart_q, seqstart_k, seqstart_q_pad, seqstart_k_pad,
                          max_seqlen_q, max_seqlen_k);

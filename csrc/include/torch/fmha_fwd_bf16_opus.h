@@ -21,7 +21,7 @@
 //                 out [total_q, H, D_V]   (packed / varlen; group = num sequences)
 //
 // Supported head dims: (D_QK, D_V) in {(64,64), (128,128), (192,128)}. Every one of them
-// supports batch and group mode.
+// supports batch and group mode; only the symmetric kernels accept `sink`.
 //
 // `causal` selects the causal mask (bottom-right aligned when seqlen_q != seqlen_kv).
 // `softmax_scale` is applied to Q·K^T internally (pass <= 0 for the default 1/sqrt(D_QK)).
@@ -35,8 +35,12 @@
 // `lse` (optional) receives the log-sum-exp of the scaled scores in natural log,
 // float32, contiguous along the query dim:
 //   batch mode: [B, H, N]        group mode: [H, total_q]
-// Rows that see no keys (causal with seqlen_q > seqlen_kv) get -inf, matching
-// torch.logsumexp. Pass std::nullopt to skip it (the kernel then stores nothing).
+// Rows that see no keys (causal with seqlen_q > seqlen_kv) get -inf, or the sink logit
+// when a sink is supplied. Pass std::nullopt to skip it (the kernel stores nothing).
+//
+// `sink` (optional) is an attention sink: one fp32 logit per query head, [H], contiguous.
+// It joins the softmax denominator as a valueless extra key, attenuating O and raising
+// lse. Symmetric head dims only, and not together with a sliding window.
 //
 // Group / varlen (all four seqstart tensors are int32, length num_groups+1; pass
 // std::nullopt for batch mode):
@@ -57,4 +61,5 @@ void fmha_fwd_bf16_opus_fwd(at::Tensor& q,
                             std::optional<at::Tensor> seqstart_k_pad = std::nullopt,
                             int max_seqlen_q                         = 0,
                             int max_seqlen_k                         = 0,
-                            int window_size_left                     = -1);
+                            int window_size_left                     = -1,
+                            std::optional<at::Tensor> sink           = std::nullopt);

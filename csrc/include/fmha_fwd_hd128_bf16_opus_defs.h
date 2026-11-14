@@ -33,6 +33,10 @@ struct opus_gqa_kargs {
     void* __restrict__ ptr_lse;
     int stride_lse_b;
     int stride_lse_h;
+    // Optional attention sink: one fp32 logit per QUERY head, [H], unit stride -- a
+    // valueless extra key in the softmax denominator (see store_result). nullptr => none.
+    // Read by gqa_d128_kernel only; the sliding-window kernel is never given one.
+    const void* __restrict__ ptr_sink;
 
     // ── group mode (varlen / packed sequences) ──
     // Prefix sums (length B+1). *_seqstart_* are real lengths (masking, KV-tile count,

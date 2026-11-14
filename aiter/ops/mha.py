@@ -421,6 +421,7 @@ def gen_fmha_fwd_bf16_opus_fwd_fake(
     max_seqlen_q: int = 0,
     max_seqlen_k: int = 0,
     window_size_left: int = -1,
+    sink: Tensor | None = None,
 ) -> None:
     return None
 
@@ -428,7 +429,8 @@ def gen_fmha_fwd_bf16_opus_fwd_fake(
 # OPUS gfx950 bf16 forward (shared entry point): low-level @compile_ops stub bound to
 # the pybind symbol via fc_name. Dispatches by head dim in C++ to the symmetric
 # D_QK = D_V in {64, 128} kernel or the asymmetric D_QK=192/D_V=128 kernel; all take
-# batch and group/varlen inputs, and only D=128 implements `window_size_left`.
+# batch and group/varlen inputs, and only D=128 implements `window_size_left`. `sink`
+# is symmetric-only and excludes a window.
 # Writes `out` (and `lse`, when given) in place, returns None.
 @compile_ops(
     "module_fmha_fwd_bf16_opus",
@@ -450,6 +452,7 @@ def _fmha_fwd_bf16_opus_fwd(
     max_seqlen_q: int = 0,
     max_seqlen_k: int = 0,
     window_size_left: int = -1,
+    sink: Tensor | None = None,
 ) -> None: ...
 
 
@@ -463,6 +466,7 @@ def fmha_fwd_bf16_opus_fwd(
     return_lse: bool = False,
     lse: Tensor | None = None,
     window_size_left: int = -1,
+    sink: Tensor | None = None,
 ) -> Tensor | tuple[Tensor, Tensor]:
     """Public wrapper for the OPUS gfx950 bf16 dense (batch) forward: symmetric
     D_QK == D_V in {64, 128}, plus D_QK=192/D_V=128. q/k/v are dense bshd
@@ -470,13 +474,18 @@ def fmha_fwd_bf16_opus_fwd(
     The kernel applies `softmax_scale` to Q·K^T internally and handles GQA fan-out.
 
     `lse` is an output buffer for the log-sum-exp of the scaled scores ([B, H_q, S]
-    float32, natural log; rows that see no keys get -inf), filled when supplied and
-    allocated here when `return_lse` is set. Like `out` it does not change the return
-    type on its own: only `return_lse` does, and then the return is `(out, lse)`.
+    float32, natural log; rows that see no keys get -inf, or the sink logit when a
+    sink is set), filled when supplied and allocated here when `return_lse` is set.
+    Like `out` it does not change the return type on its own: only `return_lse`
+    does, and then the return is `(out, lse)`.
 
     `window_size_left` >= 0 bounds the causal mask on the left (a query at KV
     coordinate j sees keys [j - window_size_left, j]); -1 is plain causal. It needs
     `causal` and is implemented by the D=128 kernel only.
+
+    `sink` is an optional attention sink: one fp32 logit per query head ([H_q]),
+    acting as a valueless extra key in the softmax denominator. It attenuates O
+    and raises lse; symmetric kernels only, and not together with a window.
 
     Varlen / packed inputs go through `fmha_fwd_bf16_opus_varlen_fwd` instead.
     """
@@ -504,6 +513,7 @@ def fmha_fwd_bf16_opus_fwd(
         float(softmax_scale),
         lse=lse,
         window_size_left=int(window_size_left),
+        sink=sink,
     )
     return (out, lse) if return_lse else out
 
@@ -524,6 +534,7 @@ def fmha_fwd_bf16_opus_varlen_fwd(
     return_lse: bool = False,
     lse: Tensor | None = None,
     window_size_left: int = -1,
+    sink: Tensor | None = None,
 ) -> Tensor | tuple[Tensor, Tensor]:
     """Public wrapper for the OPUS gfx950 bf16 group/varlen forward: symmetric
     D_QK == D_V in {64, 128}, plus D_QK=192/D_V=128. q/k/v are packed [total, H, D];
@@ -533,8 +544,9 @@ def fmha_fwd_bf16_opus_varlen_fwd(
     `lse` is an output buffer for the log-sum-exp of the scaled scores ([H_q, total_q]
     float32, natural log), filled when supplied and allocated here when `return_lse` is
     set. Like `out` it does not change the return type on its own: only `return_lse`
-    does, and then the return is `(out, lse)`. Rows that see no keys get -inf; rows in
-    the padding gaps of a KV-padded layout are left untouched.
+    does, and then the return is `(out, lse)`. Rows that see no keys get -inf, or the
+    sink logit when a sink is set; rows in the padding gaps of a KV-padded layout are
+    left untouched.
 
     seqstart_q / seqstart_k          : cumulative REAL sequence lengths (int32, len
                                        num_groups+1; drive masks / tile counts).
@@ -544,6 +556,8 @@ def fmha_fwd_bf16_opus_varlen_fwd(
     window_size_left                 : >= 0 bounds the causal mask on the left, per
                                        sequence; -1 is plain causal. Needs `causal`
                                        and is implemented by the D=128 kernel only.
+    sink                             : optional fp32 [H_q] attention-sink logits, as
+                                       for the dense wrapper (symmetric, no window).
     """
     v_head_dim = v.size(-1)
     total_q, q_head_num = q.size(0), q.size(1)
@@ -578,6 +592,7 @@ def fmha_fwd_bf16_opus_varlen_fwd(
         int(max_seqlen_q),
         int(max_seqlen_k),
         int(window_size_left),
+        sink,
     )
     return (out, lse) if return_lse else out
 
@@ -2154,6 +2169,23 @@ def fmha_v3_varlen_bwd(
 ) -> tuple[Tensor, Tensor, Tensor, Tensor]: ...
 
 
+def _reject_sink_autograd(entry, bwd_entry, grad_enabled, sink_ptr, *tensors):
+    """The forward applies the sink but every backward hard-codes sink=None, so a
+    gradient-tracked sink call would get dQ/dK/dV from a different softmax (and no
+    d_sink). Reject it instead. `grad_enabled` is passed in because grad mode is already
+    off inside autograd.Function.forward, where torch.is_grad_enabled() reads False.
+    """
+    if (
+        sink_ptr is not None
+        and grad_enabled
+        and any(t.requires_grad for t in (*tensors, sink_ptr))
+    ):
+        raise NotImplementedError(
+            f"attention sink is not differentiable through {entry}; call under "
+            f"torch.no_grad() for inference, or use {bwd_entry} with d_sink"
+        )
+
+
 def maybe_contiguous(x):
     return x.contiguous() if x is not None and x.stride(-1) != 1 else x
 
@@ -2405,12 +2437,12 @@ def _flash_attn_forward(
 
     def _can_impl_fmha_fwd_hd128_bf16_opus():
         # Symmetric D_QK == D_V in {64, 128}: one kernel template, only the head dim
-        # differs. The sliding window exists at D=128 only.
+        # differs. The sliding window exists at D=128 only, and not with a sink.
         if int(os.environ.get("AITER_ENABLE_FMHA_OPUS", "0")) == 0:
             return False
         if hdim_q != hdim_v or hdim_q not in (64, 128):
             return False
-        if hdim_q == 64 and window_size_left >= 0:
+        if window_size_left >= 0 and (hdim_q == 64 or sink_ptr is not None):
             return False
         # Left-bounded causal window only: LOCAL implies CAUSAL and there is no right-hand
         # window. window_size_right == 0 is itself a right bound, so it needs `causal` too.
@@ -2427,8 +2459,10 @@ def _flash_attn_forward(
         # OPUS gfx950 dense D_QK=192 / D_V=128 bf16 forward. Enabled by DEFAULT (no env)
         if int(os.environ.get("AITER_DISABLE_FMHA_OPUS", "0")) != 0:
             return False
-        # No sliding window on this head-dim pair; only D=128 implements it.
+        # No sliding window or sink on this head-dim pair; only D=128 / symmetric do.
         if not (window_size_left == -1 and window_size_right == -1):
+            return False
+        if sink_ptr is not None:
             return False
         # Any KV extent: the kernel rebases the buffer descriptor per KV tile, so the
         # 32-bit buffer-offset limit no longer bounds the per-head KV row.
@@ -2446,7 +2480,18 @@ def _flash_attn_forward(
         ret = ret and (cu_seqlens_q is None and cu_seqlens_kv is None)  # dense here
         ret = ret and (bias is None and alibi_slopes is None)
         ret = ret and (dropout_p == 0.0)
-        ret = ret and (sink_size == 0 and sink_ptr is None)
+        # sink_size (the "first N keys are sinks" variant) is unsupported. sink_ptr is
+        # validated as the launcher reads it ([nhead_q] fp32, unit stride) so a mismatch
+        # falls back; the head-dim helpers decide which kernels take one.
+        ret = ret and (sink_size == 0)
+        ret = ret and (
+            sink_ptr is None
+            or (
+                sink_ptr.dtype == dtypes.fp32
+                and sink_ptr.shape == (nhead_q,)
+                and sink_ptr.is_contiguous()
+            )
+        )
         ret = ret and (q_descale is None and k_descale is None and v_descale is None)
         ret = ret and (not return_softmax)
         # The window check is per head dim, so it lives in the helpers below.
@@ -2553,6 +2598,7 @@ def _flash_attn_forward(
             out=out,
             lse=softmax_lse if return_lse else None,
             window_size_left=int(window_size_left),
+            sink=sink_ptr,
         )
         S_dmask = torch.empty((0,), dtype=torch.float32, device=q.device)
         rng_state = torch.empty((2,), dtype=torch.int64, device=q.device)
@@ -3042,6 +3088,9 @@ class FlashAttnFunc(torch.autograd.Function):
         num_splits: int = 0,
     ):
         is_grad = is_grad_enabled and any(x.requires_grad for x in [q, k, v])
+        _reject_sink_autograd(
+            "flash_attn_func", "mha_bwd", is_grad_enabled, sink_ptr, q, k, v
+        )
         if softmax_scale is None:
             softmax_scale = q.shape[-1] ** (-0.5)
         head_size_q_og = q.size(3)
@@ -3246,6 +3295,8 @@ def flash_attn_func(
            (they might not have the right scaling).
         cu_seqlens_q: (batch_size + 1,). The cumulative sequence lengths of the query sequences.
         cu_seqlens_kv: (batch_size + 1,). The cumulative sequence lengths of the key/value sequences.
+        sink_ptr: (nheads,), fp32. Optional valueless attention-sink logit per query
+            head. Sink-enabled calls are forward-only and must run without autograd.
         num_splits: int. Number of key/value splits for the native split-K forward path.
             0 (default) lets aiter decide via a heuristic; 1 disables split-K (uses the
             standard CK/ASM dispatch); >=2 forces the native split-K kernel with that many
@@ -3259,6 +3310,10 @@ def flash_attn_func(
             The output of softmax (possibly with different scaling). It also encodes the dropout
             pattern (negative means that location was dropped, nonnegative means it was kept).
     """
+    _reject_sink_autograd(
+        "flash_attn_func", "mha_bwd", torch.is_grad_enabled(), sink_ptr, q, k, v
+    )
+
     # FlyDSL path returns result if supported, None otherwise. window_size[2] (sink
     # size) is unsupported: the FlyDSL gate rejects it, and this screen keeps it off
     # the path so a sink-token request is never silently dropped.
@@ -3465,12 +3520,12 @@ def _flash_attn_varlen_forward(
         # OPUS gfx950 group/varlen symmetric D=64/128 bf16 forward. Env-gated OFF by
         # default, the same opt-in as the dense path, so enabling varlen does not
         # silently change which backend an existing workload lands on. The sliding
-        # window exists at D=128 only.
+        # window exists at D=128 only, and not with a sink.
         if int(os.environ.get("AITER_ENABLE_FMHA_OPUS", "0")) == 0:
             return False
         if hdim_q != hdim_v or hdim_q not in (64, 128):
             return False
-        if hdim_q == 64 and window_size_left >= 0:
+        if window_size_left >= 0 and (hdim_q == 64 or sink_ptr is not None):
             return False
         # Left-bounded causal window only: LOCAL implies CAUSAL and there is no right-hand
         # window. window_size_right == 0 is itself a right bound, so it needs `causal` too.
@@ -3489,6 +3544,9 @@ def _flash_attn_varlen_forward(
             return False
         if not (hdim_q == 192 and hdim_v == 128):
             return False
+        # No sink on this head-dim pair.
+        if sink_ptr is not None:
+            return False
         # No window. Test the -1 sentinel, not `swa`: swa only tests > 0 and would let
         # window_size=(0, 0) through as plain causal.
         return window_size_left == -1 and window_size_right == -1
@@ -3497,16 +3555,28 @@ def _flash_attn_varlen_forward(
         # Shared eligibility for the OPUS gfx950 bf16 group/varlen forward kernels.
         # Packed THD q/k/v; supports KV padding (cu_seqlens_*_padded), cross-attention
         # (causal bottom-right aligned) and LSE ([H_q, total_q] fp32, natural log).
-        # No dropout / bias / alibi / sink / quant / paged. Cheapest / most-selective
-        # gates first so the per-head-dim helpers (which read env vars) are only
-        # evaluated once the common conditions already hold.
+        # Sink logits on the symmetric kernel; no dropout / bias / alibi / sink_size /
+        # quant / paged. Cheapest / most-selective gates first so the per-head-dim
+        # helpers (which read env vars) are only evaluated once the common conditions
+        # already hold.
         ret = get_gfx() == "gfx950"
         ret = ret and (q.dtype == dtypes.bf16)
         ret = ret and (nhead_q % nhead_k == 0)
         ret = ret and (dropout_p == 0.0)
         ret = ret and (logits_soft_cap == 0.0)
         ret = ret and (bias is None and alibi_slopes is None)
-        ret = ret and (sink_size == 0 and sink_ptr is None)
+        # sink_size (the "first N keys are sinks" variant) is unsupported. sink_ptr is
+        # validated as the launcher reads it ([nhead_q] fp32, unit stride) so a mismatch
+        # falls back; the head-dim helpers decide which kernels take one.
+        ret = ret and (sink_size == 0)
+        ret = ret and (
+            sink_ptr is None
+            or (
+                sink_ptr.dtype == dtypes.fp32
+                and sink_ptr.shape == (nhead_q,)
+                and sink_ptr.is_contiguous()
+            )
+        )
         ret = ret and (q_descale is None and k_descale is None and v_descale is None)
         ret = ret and (block_table is None)
         ret = ret and (not return_softmax)
@@ -3571,6 +3641,7 @@ def _flash_attn_varlen_forward(
             max_seqlen_k=int(max_seqlen_k),
             lse=softmax_lse if return_lse else None,
             window_size_left=int(window_size_left),
+            sink=sink_ptr,
         )
         S_dmask = torch.empty((0,), dtype=torch.float32, device=q.device)
         rng_state = torch.empty((2,), dtype=torch.int64, device=q.device)
@@ -4038,6 +4109,15 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
         v_descale=None,
     ):
         is_grad = is_grad_enabled and any(x.requires_grad for x in [q, k, v])
+        _reject_sink_autograd(
+            "flash_attn_varlen_func",
+            "mha_varlen_bwd",
+            is_grad_enabled,
+            sink_ptr,
+            q,
+            k,
+            v,
+        )
         if softmax_scale is None:
             softmax_scale = q.shape[-1] ** (-0.5)
         head_size_q_og = q.size(-1)
@@ -4295,6 +4375,8 @@ def flash_attn_varlen_func(
         return_attn_probs: bool. Whether to return the attention probabilities. This option is for
            testing only. The returned probabilities are not guaranteed to be correct
            (they might not have the right scaling).
+        sink_ptr: (nheads,), fp32. Optional valueless attention-sink logit per query
+            head. Sink-enabled calls are forward-only and must run without autograd.
     Return:
         out: (total, nheads, headdim_v).
         softmax_lse [optional, if return_attn_probs=True]: (nheads, total_q_seqlen). The
@@ -4318,6 +4400,15 @@ def flash_attn_varlen_func(
         together for fp8 inputs; ``block_table`` reads k and v from a paged
         cache, and ``cu_seqlens_*_padded`` give physical row offsets.
     """
+    _reject_sink_autograd(
+        "flash_attn_varlen_func",
+        "mha_varlen_bwd",
+        torch.is_grad_enabled(),
+        sink_ptr,
+        q,
+        k,
+        v,
+    )
     if block_table is not None and (
         cu_seqlens_q_padded is not None or cu_seqlens_k_padded is not None
     ):

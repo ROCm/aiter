@@ -759,6 +759,27 @@ __device__ __attribute__((always_inline)) void gqa_d128_impl(opus_gqa_kargs karg
     // label_write_out`. The stagger balancing barrier stays outside it: the no-keys path
     // runs no prologue, so neither wave group owes the other one.
     auto store_result = [&]() {
+        // ── attention sink ────────────────────────────────────────────────────────────
+        // A per-head logit acting as one valueless extra key in the softmax denominator.
+        // Rebase onto M = max(m_row, sink) before folding it in so a dominant sink cannot
+        // overflow exp2. The numerator and denominator rescale by
+        // alpha = exp2(m_row - M); LOG2_E converts the natural-log sink to the kernel's
+        // base-2 exponent. alpha folds into l_inv below, so v_o is scaled once. With no
+        // keys, m_row=lowest and l_row=0, so alpha=0, l_row=1, O=0, and lse=sink.
+        D_ACC alpha = D_ACC(1.0f);
+        if (kargs.ptr_sink != nullptr) {
+            const D_ACC sink_b2 =
+                reinterpret_cast<const D_ACC*>(kargs.ptr_sink)[h] * D_ACC(LOG2_E);
+            const D_ACC m_new = (m_row > sink_b2) ? m_row : sink_b2;
+            alpha = __builtin_amdgcn_exp2f(m_row - m_new);
+            // Avoid exp2(+inf - +inf): when the sink is M its contribution is exactly 1.
+            const D_ACC sink_term =
+                (sink_b2 >= m_new) ? D_ACC(1.0f)
+                                   : __builtin_amdgcn_exp2f(sink_b2 - m_new);
+            l_row = l_row * alpha + sink_term;
+            m_row = m_new;
+        }
+
         if (kargs.ptr_lse != nullptr && lane_id < T::W_M) {
             constexpr D_ACC LN2 = D_ACC(0.69314718055994531f);   // 1 / log2(e)
             const D_ACC lse = (l_row > D_ACC(0.0f))
@@ -771,7 +792,7 @@ __device__ __attribute__((always_inline)) void gqa_d128_impl(opus_gqa_kargs karg
             g_lse.store(lse, warp_id * T::Q_TILE_SIZE + lane_id);
         }
 
-        D_ACC l_inv = (l_row > D_ACC(0.0f)) ? (D_ACC(1.0f) / l_row) : D_ACC(0.0f);
+        D_ACC l_inv = (l_row > D_ACC(0.0f)) ? (alpha / l_row) : D_ACC(0.0f);
         static_for<o_len>([&](auto i) { v_o[i.value] *= l_inv; });
 
         // Widened store: each dwordx4 (VEC_O_X4) group is packed and stored one group at a
@@ -801,8 +822,8 @@ __device__ __attribute__((always_inline)) void gqa_d128_impl(opus_gqa_kargs karg
     };
 
     // No keys at all: nothing to accumulate, and v_o is already cleared with l_row == 0,
-    // so the store emits lse = -inf and O = 0. N_KV is workgroup-uniform, so both wave
-    // groups exit together.
+    // so the store emits O = 0 and lse = -inf (the sink logit, when one is set). N_KV is
+    // workgroup-uniform, so both wave groups exit together.
     if (num_kv_tiles == 0) {
         store_result();
         return;

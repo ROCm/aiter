@@ -34,6 +34,9 @@ struct fmha_fwd_bf16_opus_args
     void* o_ptr       = nullptr;
     // nullptr => the kernel skips the log-sum-exp store entirely.
     void* lse_ptr = nullptr;
+    // Optional attention sink: one fp32 logit per query head, [nhead]. nullptr => no sink.
+    // Symmetric D=64/128 kernels only, and not with a sliding window.
+    const void* sink_ptr = nullptr;
 
     // Group / varlen, int32, length batch+1. A null seqstart_q_ptr selects batch mode.
     // The *_pad arrays give the physical row offsets (equal to the non-pad arrays when
@@ -143,6 +146,7 @@ inline bool fill_d128_kargs(opus_gqa_kargs& kargs, const fmha_fwd_bf16_opus_args
     kargs.ptr_lse      = a.lse_ptr;
     kargs.stride_lse_b = a.stride_lse_b;
     kargs.stride_lse_h = a.stride_lse_h;
+    kargs.ptr_sink     = a.sink_ptr;
 
     // Group / varlen. A null seqstart_q selects batch mode, where these stay null and the
     // GROUP_MODE branches compile out entirely.
@@ -414,6 +418,12 @@ inline bool fmha_fwd_bf16_opus_launch(const fmha_fwd_bf16_opus_args& a, hipStrea
     if(a.hdim_q == 64 && a.window_size_left >= 0)
     {
         AITER_LOG_WARNING("opus fwd: hdim 64 has no sliding-window kernel");
+        return false;
+    }
+    // Only gqa_d128_kernel reads the sink; refuse it where it would be ignored.
+    if(a.sink_ptr != nullptr && (a.window_size_left >= 0 || a.hdim_q != a.hdim_v))
+    {
+        AITER_LOG_WARNING("opus fwd: attention sink needs a symmetric head dim and no window");
         return false;
     }
 
