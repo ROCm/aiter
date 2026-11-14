@@ -1257,7 +1257,6 @@ def fused_recurrent_kda_packed_decode_kernel(
             )
 
 
-
 _one_token_decode_repr = make_kernel_repr(
     "kda_one_token_decode_kernel", ["H", "K", "V", "BV", "CH", "NUM_WARPS", "SK"]
 )

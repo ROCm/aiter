@@ -3,6 +3,8 @@
 
 """Host dispatch for the gfx1250 one-token KDA decode path."""
 
+import itertools
+
 import torch
 
 from aiter.ops.triton._gluon_kernels.gfx1250.attention.kda_decode import (
@@ -45,7 +47,7 @@ def _one_token_sequences(starts, n_tokens):
     bounds = starts.tolist()
     if bounds[0] < 0 or bounds[-1] > n_tokens:
         return False
-    return all(0 <= nxt - cur <= 1 for cur, nxt in zip(bounds, bounds[1:]))
+    return all(0 <= nxt - cur <= 1 for cur, nxt in itertools.pairwise(bounds))
 
 
 def try_kda_one_token_decode(

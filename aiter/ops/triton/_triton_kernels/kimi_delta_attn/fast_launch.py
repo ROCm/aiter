@@ -114,12 +114,7 @@ class _FastLaunch:
     def __getitem__(self, grid):
         def launch(**kwargs):
             global _ABI_DISABLED
-            if (
-                self._disabled
-                or _BYPASS
-                or _ABI_DISABLED
-                or not _launch_hooks_idle()
-            ):
+            if self._disabled or _BYPASS or _ABI_DISABLED or not _launch_hooks_idle():
                 return self._kernel[grid](**kwargs)
             device = driver.active.get_current_device()
             try:
