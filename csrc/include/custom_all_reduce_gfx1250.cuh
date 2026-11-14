@@ -193,10 +193,11 @@ constexpr size_t llScratchBytes(int ngpus)
 }
 
 // Byte offset of the LL scratch within the shared meta buffer: right after the
-// Signal struct, 128-byte aligned. The meta buffer (see meta_size()) is sized
-// kLLScratchOffset + llScratchBytes(world_size) + kArRmsShardBytes +
-// ar2sScratchBytes(world_size) and zero-initialized, which doubles as the LL
-// flag reset (flag 0 == cleared line).
+// Signal struct, 128-byte aligned. The meta buffer (see meta_size()) holds
+// llScratchBytes(world_size) of LL scratch from here, then kArRmsShardBytes,
+// then the two-shot's inbox (ar2sScratchOffset), and is zero-initialized, which
+// doubles as the LL flag reset (flag 0 == cleared line). The two-shot's inbox
+// is then filled with its sentinel at construction (ensure_2s_tables_).
 constexpr size_t kLLScratchOffset =
     ((sizeof(Signal) + 127) / 128) * 128;
 
@@ -209,51 +210,54 @@ constexpr size_t arRmsShardOffset(int ngpus)
     return kLLScratchOffset + llScratchBytes(ngpus);
 }
 
-// The largest message the LL two-shot all-reduce (ar_2s_ll_gfx1250) takes at
-// each world size, from MI455X measurements, bf16 in a CUDA graph:
-// - TP8, two trays: ahead of RCCL at 8.39 MB (39.2 vs 43.7 us); an earlier
-//   two-shot was behind it at 14.68 MB (59.1 vs 51.0 us).
-// - TP4, one tray: ahead of the one-shot pull up to 8.39 MB (32 vs 89 us).
-//   RCCL is ahead from about 5 MiB, so plain all-reduce stops at 4 MiB by
-//   default (_GFX1250_PLAIN_AR_MAX_SIZE in Python).
+// The largest message the two-shot all-reduce (ar_2s_lamport_gfx1250) takes
+// at each world size. MI455X, bf16 in a CUDA graph:
+// - TP8, two trays: 26.6 us at 8.26 MB against 43.5 for RCCL; an earlier
+//   two-shot was behind RCCL at 14.68 MB (59.1 vs 51.0 us).
+// - TP4, one tray: 29.0 us at 8.39 MB, level with RCCL (29.7) and far ahead of
+//   the one-shot pull (89); RCCL is ahead at 4.59 MB (23.7 vs 26.8), so plain
+//   all-reduce stops at 4 MiB by default (_GFX1250_PLAIN_AR_MAX_SIZE in Python).
 // 0 means the world size does not take the two-shot: TP2, and TP6, which is
-// not measured. This cap also sizes the two-shot's scratch (ar2sScratchBytes).
+// not measured. This cap also sizes the two-shot's inbox (ar2sScratchBytes).
 constexpr size_t ar2sMaxBytes(int ngpus)
 {
     return ngpus == 4 || ngpus == 8 ? (size_t)8 * 1024 * 1024 : 0;
 }
 
-// The smallest message the LL two-shot takes over from the one-shot at, from
-// MI455X measurements, bf16:
+// The smallest message the two-shot takes over from the one-shot at, from
+// MI455X measurements of the LL two-shot it replaced, bf16:
 // - TP8, two trays: the one-shot is ahead at 0.43 MB (12.5 vs 13.6 us), the
 //   two-shot at 0.57 MB (12.8 vs 15.9 us).
 // - TP4, one tray: the two are level at about 1 MiB.
 constexpr size_t ar2sMinBytes(int ngpus) { return ngpus == 8 ? (size_t)512 * 1024 : (size_t)1024 * 1024; }
 
-// The LL two-shot's own scratch, after the AR + RMSNorm shard. It is apart from
-// the LL scratch, so a change to either kernel's layout, capacity or epochs
-// leaves the other alone. Two banks, each a reduce-scatter region and an
-// all-gather region of ar2sMaxBytes / 8 lines: 8 x ar2sMaxBytes a rank, i.e.
-// 64 MiB at TP4 and TP8, and nothing where the two-shot does not run.
-constexpr size_t ar2sRegionPk(int ngpus) { return ar2sMaxBytes(ngpus) / 8; }
+// The two-shot's own inbox, after the AR + RMSNorm shard, apart from the LL
+// scratch so a change to either kernel's layout leaves the other alone:
+// inbox[kAr2sBuffers][2 phases][ngpus sources][ar2sSlotPacks] of 16-byte packs,
+// phase 0 the reduce-scatter and 1 the all-gather. 48 MiB a rank at TP4 and TP8,
+// nothing where the two-shot does not run. See ar_2s_lamport_gfx1250.
+constexpr int kAr2sBuffers = 3;
+
+// Packs a source's slot takes: a chunk of ar2sMaxBytes / ngpus, rounded to
+// 4 KiB. A slot that does not start on a cache-line boundary costs ~3 us a call
+// (MI455X, measured).
+constexpr size_t ar2sSlotPacks(int ngpus)
+{
+    return ngpus == 0 ? 0 : (ar2sMaxBytes(ngpus) / 16 / ngpus + 255) / 256 * 256;
+}
 constexpr size_t ar2sScratchBytes(int ngpus)
 {
-    return (size_t)2 * 2 * ar2sRegionPk(ngpus) * sizeof(LLPackedMsg);
-}
-constexpr size_t ar2sScratchOffset(int ngpus)
-{
-    return arRmsShardOffset(ngpus) + kArRmsShardBytes;
+    return (size_t)kAr2sBuffers * 2 * ngpus * ar2sSlotPacks(ngpus) * 16;
 }
 
-// Lines a source's slot takes in a region of the two-shot's scratch: a chunk of
-// ar2sMaxBytes / ngpus in 8-byte packets, rounded to 4 KiB. A slot that does not
-// start on a cache-line boundary costs ~3 us a call (MI455X, measured).
-constexpr size_t ar2sSrcLines(int ngpus)
+// The inbox starts on a 2 MiB boundary of the meta buffer (whose base is 2 MiB
+// aligned on every transport). Started where the shard ends, 264 KiB past one,
+// the TP8 two-shot took 6.7 us longer at 7.81 MB (33.2 vs 26.1 us, MI455X).
+constexpr size_t kAr2sAlign = (size_t)2 * 1024 * 1024;
+constexpr size_t ar2sScratchOffset(int ngpus)
 {
-    return ngpus == 0 ? 0 : (ar2sMaxBytes(ngpus) / 8 / ngpus + 255) / 256 * 256;
+    return (arRmsShardOffset(ngpus) + kArRmsShardBytes + kAr2sAlign - 1) / kAr2sAlign * kAr2sAlign;
 }
-static_assert(8 * ar2sSrcLines(8) <= ar2sRegionPk(8) && 4 * ar2sSrcLines(4) <= ar2sRegionPk(4),
-              "every source's slot must fit the two-shot's regions");
 
 // gfx1250 128-bit global load/store at *system* scope ("" == system). A single
 // 16B transaction keeps a line's data and flags atomic w.r.t. a peer reader.
@@ -448,149 +452,256 @@ __global__ void __launch_bounds__(1024, 1) ar_ll_gfx1250(
 }
 
 // ---------------------------------------------------------------------------
-// LL two-shot all-reduce: reduce-scatter + all-gather over LL lines
+// Two-shot all-reduce: reduce-scatter + all-gather over Lamport lines
 // ---------------------------------------------------------------------------
-// The message splits into ngpus chunks of chunk_pk 8-byte packets; rank c owns
-// chunk c. The lines live in a scratch of its own (ar2sScratchOffset) with
-// epochs of its own (block_flags), double-banked by epoch parity. In a bank,
-// the reduce-scatter region holds rank s's lines in slot s, s * ar2sSrcLines
-// lines on, and the all-gather region, ar2sRegionPk lines on, the same. Every
-// thread takes packet j of every chunk, in one of ROLES wave groups a block:
-//   send:   send packet j of every other chunk c to rank c's reduce-scatter
-//           slot[rank]
-//   reduce: poll the ngpus - 1 contributions to packet j of the own chunk,
-//           reduce them with the own one in rank order, send the result to
-//           every peer's all-gather slot[rank] and write it to recvbuff (its
-//           polls come before its stores)
-//   gather: poll the other ranks' reduced packet j into recvbuff
-// ROLES = 3 runs them in three groups. ROLES = 2 runs gather in the send
-// group, after its stores: a reduced packet lands only after the stores it
-// depends on, about a round trip after they were sent, so waiting for them
-// costs about nothing, and a block of 2 x W threads covers more packets a CU
-// (allreduce_2s_ll picks ROLES by size).
-// Every rank moves 2 * (ngpus - 1) / ngpus * bytes of payload (the lines double
-// it) against (ngpus - 1) * bytes for the one-shot, for one more fabric
-// latency: it wins from ar2sMinBytes.
-// With recvbuff == sendbuff: reduce reads and writes only packet j of the own
-// chunk, in that order. gather writes packet j of chunk c only once rank c has
-// sent its reduction, which needs this rank's contribution, which send sent
-// after it loaded the packet; send reads no other packet of recvbuff.
+// The message splits into ngpus chunks of chunk_pk 16-byte packs; rank c owns
+// chunk c. A pack travels as one 16-byte line of payload alone: the receiver's
+// inbox (ar2sScratchOffset) holds the sentinel, all bits set, in every 32-bit
+// word where no line is pending, and a line has arrived once none of its words
+// is the sentinel. A sender rewrites a payload word that is the sentinel to
+// 0x7fffffff, which is a NaN in fp32 and two NaNs in fp16 / bf16 as the
+// sentinel is, so no payload reads as pending and no value changes class. A
+// word lands whole, so a line needs no wider atomicity (LL lines need 8 bytes).
+// Every rank moves 2 * (ngpus - 1) / ngpus * bytes of payload in lines that
+// carry 16 bytes of it, against 8 in the LL lines this replaces: half the bytes
+// on the fabric, for one more fabric latency than the one-shot, which moves
+// (ngpus - 1) * bytes; it wins from ar2sMinBytes.
+//
+// Inbox: kAr2sBuffers buffers, each a reduce-scatter and an all-gather phase of
+// ngpus slots of ar2sSlotPacks packs; rank s writes slot s. Every group of 32
+// packs (pack j of every chunk) has a rank-local round counter, round[j / 32],
+// that picks the buffer. Every rank runs the same calls, so the counters agree
+// across ranks whatever the grid, and a group that a call does not reach keeps
+// its counter. A peer is at most one round ahead on a pack (its next round needs
+// this rank's pushes of this round), so a round's buffer was last written three
+// rounds back, and a round re-arms the previous round's buffer,
+// (round + 2) % kAr2sBuffers, which nothing writes before this rank's next call.
+// Lanes past the chunk in its last group only re-arm, so every pack of a group
+// that advances has its previous buffer re-armed whatever the size of the next
+// call. All state is on the device, so CUDA graphs replay it as is.
+//
+// Roles, in ROLES wave groups of W threads a block (W a multiple of 32, so a
+// wave is one role and one group); thread t of each group owns pack
+// blockIdx.x * W + t of every chunk:
+//   send:   load the pack of the ngpus - 1 other chunks (all loads first), then
+//           push each to its owner's reduce-scatter slot[rank]
+//   reduce: re-arm its reduce-scatter slots of the previous buffer, wait
+//           `delay` x s_sleep(16) as nothing lands earlier, poll the ngpus - 1
+//           contributions to the own chunk, sum them with the local value in
+//           rank order in fp32, round to T once, push the result to every
+//           peer's all-gather slot[rank] and write it to recvbuff
+//   gather: re-arm its all-gather slots of the previous buffer, poll the other
+//           chunks' reductions into recvbuff
+// ROLES = 3 runs them in three groups (gather waits 2 x delay). ROLES = 2 runs
+// gather in the send group after its pushes: a wave's load issued after its own
+// remote store waits for that store, about a fabric round trip, but a reduction
+// lands later than that anyway. A poll loads every source, the own slot too (it
+// is never written and stays the sentinel; masked out), since a branch per
+// source would make each load wait for the one before it.
+//
+// With recvbuff == sendbuff: reduce reads and writes only its own pack of the
+// own chunk, in that order. gather writes pack j of chunk c only once rank c
+// has pushed its reduction, which needs this rank's contribution, which send
+// pushed after it loaded the pack; send reads no other pack of recvbuff.
+//
+// The inboxes come in as scalar arguments, not a table, as for
+// lamport_ar_add_gfx1250: a table would be loaded before the first push.
+constexpr uint32_t kAr2sSentinel = 0xffffffffu;
+
+using ar2s_u32x4 = __attribute__((__vector_size__(4 * sizeof(uint32_t)))) uint32_t;
+
+DINLINE void ar2s_store(void* dst, ar2s_u32x4 v)
+{
+#if AITER_GFX1250_HAVE_B128
+    __builtin_amdgcn_global_store_b128((llx_v4u_gptr)dst, v, "");
+#else
+    __builtin_nontemporal_store(v, reinterpret_cast<ar2s_u32x4*>(dst));
+#endif
+}
+
+DINLINE ar2s_u32x4 ar2s_load(const void* src)
+{
+#if AITER_GFX1250_HAVE_B128
+    return __builtin_amdgcn_global_load_b128((llx_v4u_gptr)src, "");
+#else
+    return __builtin_nontemporal_load(reinterpret_cast<const ar2s_u32x4*>(src));
+#endif
+}
+
+DINLINE ar2s_u32x4 ar2s_canonical(ar2s_u32x4 v)
+{
+    ar2s_u32x4 r;
+#pragma unroll
+    for(int q = 0; q < 4; ++q)
+        r[q] = v[q] == kAr2sSentinel ? 0x7fffffffu : v[q];
+    return r;
+}
+
+DINLINE bool ar2s_pending(ar2s_u32x4 v)
+{
+    return v[0] == kAr2sSentinel || v[1] == kAr2sSentinel || v[2] == kAr2sSentinel ||
+           v[3] == kAr2sSentinel;
+}
+
+// First pack of slot `src` of phase `phase` (0 reduce-scatter, 1 all-gather) of
+// buffer `buf` in an inbox.
+template <int ngpus>
+DINLINE size_t ar2s_slot(uint32_t buf, int phase, int src)
+{
+    return ((size_t)(buf * 2 + phase) * ngpus + src) * ar2sSlotPacks(ngpus);
+}
+
 template <typename T, int ngpus, int ROLES>
-__global__ void __launch_bounds__(1024) ar_2s_ll_gfx1250(
-    T* const* __restrict__ peer_scratch, // ngpus two-shot scratch bases (device table)
-    T* __restrict__ recvbuff,
-    const T* __restrict__ sendbuff,
-    size_t chunk_pk,     // 8-byte packets per chunk = bytes / (8 * ngpus)
-    int rank,
-    uint32_t* __restrict__ block_flags) // device array[kMaxBlocks], persisted
+__global__ void __launch_bounds__(1024) ar_2s_lamport_gfx1250(void* p0,
+                                                              void* p1,
+                                                              void* p2,
+                                                              void* p3,
+                                                              void* p4,
+                                                              void* p5,
+                                                              void* p6,
+                                                              void* p7,
+                                                              T* __restrict__ recvbuff,
+                                                              const T* __restrict__ sendbuff,
+                                                              int chunk_pk,
+                                                              int rank,
+                                                              uint32_t* __restrict__ round,
+                                                              int delay)
 {
     static_assert(ROLES == 2 || ROLES == 3, "two or three wave groups");
-    constexpr int LP = 8 / sizeof(T); // elements per 8-byte packet
+    using V          = ar2s_u32x4;
+    constexpr int LP = 16 / sizeof(T); // elements a pack
     using PL         = typename opus::vector_t<T, LP>;
-    constexpr size_t region = ar2sRegionPk(ngpus);
-    constexpr size_t src    = ar2sSrcLines(ngpus);
 
-    __shared__ uint32_t s_flag;
-    if(threadIdx.x == 0)
-    {
-        uint32_t f = block_flags[blockIdx.x] + 1u;
-        if(f == 0u)
-            f = 2u; // flag is never 0 (0 == cleared scratch); keep bank parity
-        s_flag = f;
-    }
-    __syncthreads();
-    const uint32_t flag = s_flag;
+    const int W         = blockDim.x / ROLES;
+    const int role      = __builtin_amdgcn_readfirstlane(threadIdx.x / W);
+    const int t         = threadIdx.x - role * W;
+    const int j         = blockIdx.x * W + t;
+    const bool act      = j < chunk_pk;
+    const bool gact     = (j & ~31) < chunk_pk; // this lane's group of 32 runs the call
+    const uint32_t rnd  = gact ? __builtin_amdgcn_readfirstlane(round[j >> 5]) : 0u;
+    const uint32_t prev = (rnd + 2) % kAr2sBuffers;
 
-    LLPackedMsg* rs[ngpus]; // rs[k]: this call's reduce-scatter region of rank (rank + k) % ngpus
+    // q[k]: the inbox of rank (rank + k) % ngpus, q[0] this rank's own
+    V* const ptrs[8] = {reinterpret_cast<V*>(p0),
+                        reinterpret_cast<V*>(p1),
+                        reinterpret_cast<V*>(p2),
+                        reinterpret_cast<V*>(p3),
+                        reinterpret_cast<V*>(p4),
+                        reinterpret_cast<V*>(p5),
+                        reinterpret_cast<V*>(p6),
+                        reinterpret_cast<V*>(p7)};
+    V* q[ngpus];
 #pragma unroll
     for(int k = 0; k < ngpus; ++k)
-        rs[k] = reinterpret_cast<LLPackedMsg*>(peer_scratch[(rank + k) % ngpus]) +
-                (size_t)(flag & 1u) * 2 * region;
-
-    const size_t W      = blockDim.x / ROLES;
-    const size_t role   = threadIdx.x / W; // 0 send (+ gather at ROLES 2), 1 reduce, 2 gather
-    const size_t first  = (size_t)blockIdx.x * W + threadIdx.x % W;
-    const size_t stride = (size_t)gridDim.x * W;
-    const uint2* in     = reinterpret_cast<const uint2*>(sendbuff);
-    uint2* out          = reinterpret_cast<uint2*>(recvbuff);
-
-    for(size_t j = first; j < chunk_pk; j += stride)
     {
-        if(role == 0)
-        {
-            uint2 d[ngpus];
+        const int s = (rank + k) % ngpus;
+        V* b        = ptrs[0];
 #pragma unroll
-            for(int k = 1; k < ngpus; ++k)
-                d[k] = in[(size_t)((rank + k) % ngpus) * chunk_pk + j];
+        for(int i = 1; i < ngpus; ++i)
+            b = s == i ? ptrs[i] : b;
+        q[k] = b;
+    }
+    V* const own = q[0];
+    const V* in  = reinterpret_cast<const V*>(sendbuff);
+    V* out       = reinterpret_cast<V*>(recvbuff);
+    const V sentinel{kAr2sSentinel, kAr2sSentinel, kAr2sSentinel, kAr2sSentinel};
+
+    if(role == 0 && act)
+    {
+        V v[ngpus];
 #pragma unroll
-            for(int k = 1; k < ngpus; ++k)
-                ll_store_b128(reinterpret_cast<uint32_t*>(rs[k] + (size_t)rank * src + j),
-                              d[k].x, flag, d[k].y, flag);
-        }
-        if(role == 1)
+        for(int k = 1; k < ngpus; ++k)
+            v[k] = in[(size_t)((rank + k) % ngpus) * chunk_pk + j];
+#pragma unroll
+        for(int k = 1; k < ngpus; ++k)
+            ar2s_store(q[k] + ar2s_slot<ngpus>(rnd, 0, rank) + j, ar2s_canonical(v[k]));
+    }
+    if(role == 1)
+    {
+        if(gact)
+#pragma unroll
+            for(int s = 0; s < ngpus; ++s)
+                if(s != rank)
+                    ar2s_store(own + ar2s_slot<ngpus>(prev, 0, s) + j, sentinel);
+        for(int d = 0; d < delay; ++d)
+            __builtin_amdgcn_s_sleep(16);
+        if(act)
         {
-            const uint2 mine = in[(size_t)rank * chunk_pk + j];
-            uint32_t w[ngpus][4];
-            uint32_t pending = ((1u << ngpus) - 1u) & ~(1u << rank);
-            while(pending)
+            const V mine = in[(size_t)rank * chunk_pk + j];
+            V w[ngpus];
+            bool pending;
+            do
             {
+                asm volatile("" ::: "memory"); // every poll is a real load
 #pragma unroll
                 for(int s = 0; s < ngpus; ++s)
-                    if(pending & (1u << s))
-                        ll_load_b128(reinterpret_cast<const uint32_t*>(rs[0] + (size_t)s * src + j),
-                                     w[s][0], w[s][1], w[s][2], w[s][3]);
+                    w[s] = ar2s_load(own + ar2s_slot<ngpus>(rnd, 0, s) + j);
+                __builtin_amdgcn_sched_barrier(0); // all loads before any compare
+                pending = false;
 #pragma unroll
                 for(int s = 0; s < ngpus; ++s)
-                    if((pending & (1u << s)) && w[s][1] == flag && w[s][3] == flag)
-                        pending &= ~(1u << s);
-            }
+                    pending |= s != rank && ar2s_pending(w[s]);
+            } while(pending);
             opus::fp32_t acc[LP];
 #pragma unroll
             for(int s = 0; s < ngpus; ++s)
             {
-                const uint32_t pw[2] = {s == rank ? mine.x : w[s][0], s == rank ? mine.y : w[s][2]};
-                const PL pv          = *reinterpret_cast<const PL*>(pw);
+                const V x   = s == rank ? mine : w[s];
+                const PL pv = *reinterpret_cast<const PL*>(&x);
 #pragma unroll
-                for(int q = 0; q < LP; ++q)
-                    acc[q] = s == 0 ? upcast_s(pv[q]) : acc[q] + upcast_s(pv[q]);
+                for(int e = 0; e < LP; ++e)
+                    acc[e] = s == 0 ? upcast_s(pv[e]) : acc[e] + upcast_s(pv[e]);
             }
             PL ov;
 #pragma unroll
-            for(int q = 0; q < LP; ++q)
-                ov[q] = downcast_s<T>(acc[q]);
-            const uint2 r = *reinterpret_cast<const uint2*>(&ov);
+            for(int e = 0; e < LP; ++e)
+                ov[e] = downcast_s<T>(acc[e]);
+            const V r  = *reinterpret_cast<const V*>(&ov);
+            const V rc = ar2s_canonical(r);
 #pragma unroll
             for(int k = 1; k < ngpus; ++k)
-                ll_store_b128(reinterpret_cast<uint32_t*>(rs[k] + region + (size_t)rank * src + j),
-                              r.x, flag, r.y, flag);
+                ar2s_store(q[k] + ar2s_slot<ngpus>(rnd, 1, rank) + j, rc);
             out[(size_t)rank * chunk_pk + j] = r;
         }
-        if(role == (ROLES == 3 ? 2 : 0))
-        {
-            uint32_t g[ngpus][4];
-            uint32_t pending = ((1u << ngpus) - 1u) & ~(1u << rank);
-            while(pending)
-            {
-#pragma unroll
-                for(int s = 0; s < ngpus; ++s)
-                    if(pending & (1u << s))
-                        ll_load_b128(reinterpret_cast<const uint32_t*>(rs[0] + region + (size_t)s * src + j),
-                                     g[s][0], g[s][1], g[s][2], g[s][3]);
-#pragma unroll
-                for(int s = 0; s < ngpus; ++s)
-                    if((pending & (1u << s)) && g[s][1] == flag && g[s][3] == flag)
-                        pending &= ~(1u << s);
-            }
+    }
+    if(role == (ROLES == 3 ? 2 : 0))
+    {
+        if(gact)
 #pragma unroll
             for(int s = 0; s < ngpus; ++s)
                 if(s != rank)
-                    out[(size_t)s * chunk_pk + j] = make_uint2(g[s][0], g[s][2]);
+                    ar2s_store(own + ar2s_slot<ngpus>(prev, 1, s) + j, sentinel);
+        if(ROLES == 3)
+            for(int d = 0; d < 2 * delay; ++d)
+                __builtin_amdgcn_s_sleep(16);
+        if(act)
+        {
+            V g[ngpus];
+            bool pending;
+            do
+            {
+                asm volatile("" ::: "memory");
+#pragma unroll
+                for(int s = 0; s < ngpus; ++s)
+                    g[s] = ar2s_load(own + ar2s_slot<ngpus>(rnd, 1, s) + j);
+                __builtin_amdgcn_sched_barrier(0);
+                pending = false;
+#pragma unroll
+                for(int s = 0; s < ngpus; ++s)
+                    pending |= s != rank && ar2s_pending(g[s]);
+            } while(pending);
+#pragma unroll
+            for(int s = 0; s < ngpus; ++s)
+                if(s != rank)
+                    out[(size_t)s * chunk_pk + j] = g[s];
         }
     }
 
-    for(int e = blockIdx.x + threadIdx.x * gridDim.x; e < kMaxBlocks;
-        e += gridDim.x * blockDim.x)
-        block_flags[e] = flag;
+    // every wave of the block has read its group's counter by now; a group
+    // advances once
+    __syncthreads();
+    if(role == 0 && gact && (t & 31) == 0)
+        round[j >> 5] = (rnd + 1) % kAr2sBuffers;
 }
 
 // ---------------------------------------------------------------------------
@@ -2159,11 +2270,12 @@ public:
     void**    d_ll_peers_       = nullptr;
     uint32_t* d_ll_block_flags_ = nullptr;
 
-    // LL two-shot all-reduce, apart from the LL tables above: per-rank bases of
-    // its own scratch (peer meta base + ar2sScratchOffset) and its own per-block
-    // epochs. Built by ensure_2s_tables_(); null where it does not run.
-    void**    d_2s_peers_       = nullptr;
-    uint32_t* d_2s_block_flags_ = nullptr;
+    // Two-shot all-reduce, apart from the LL tables above: every rank's inbox
+    // (peer meta base + ar2sScratchOffset; unused entries repeat this rank's) and
+    // this rank's round counters, one a group of 32 packs. Built by
+    // ensure_2s_tables_(); d_2s_round_ is null where the two-shot does not run.
+    std::array<void*, kMaxNgpusAr> peers_2s_{};
+    uint32_t* d_2s_round_ = nullptr;
 
     // Lamport fused all-reduce + RMSNorm inbox (init_lamport_ar_rms), or null.
     std::unique_ptr<LamportArRms> lamport_;
@@ -2270,10 +2382,8 @@ public:
             (void)hipFree(d_ll_peers_);
         if(d_ll_block_flags_)
             (void)hipFree(d_ll_block_flags_);
-        if(d_2s_peers_)
-            (void)hipFree(d_2s_peers_);
-        if(d_2s_block_flags_)
-            (void)hipFree(d_2s_block_flags_);
+        if(d_2s_round_)
+            (void)hipFree(d_2s_round_);
     }
 
     // Whether allreduce of this size takes the LL kernel, which reads the input
@@ -2283,17 +2393,17 @@ public:
         return ll_enabled() && bytes <= kLLArMaxBytes && world_size_ <= kLLMaxRanks;
     }
 
-    // Whether allreduce of this size takes the LL two-shot kernel: four ranks or
+    // Whether allreduce of this size takes the two-shot kernel: four ranks or
     // more, from where it overtakes the one-shot (ar2sMinBytes) up to its cap
-    // (ar2sMaxBytes, 0 where it does not run), in whole packets per chunk.
-    bool use_2s_ll(size_t bytes) const
+    // (ar2sMaxBytes, 0 where it does not run), in whole 16-byte packs per chunk.
+    bool use_2s(size_t bytes) const
     {
         return ll_enabled() && world_size_ <= kLLMaxRanks && bytes >= ar2sMinBytes(world_size_) &&
-               bytes <= ar2sMaxBytes(world_size_) && bytes % (8 * (size_t)world_size_) == 0;
+               bytes <= ar2sMaxBytes(world_size_) && bytes % (16 * (size_t)world_size_) == 0;
     }
 
     // Whether allreduce of this size reads its input in place (no copy-in).
-    bool ar_reads_in_place(size_t bytes) const { return use_2s_ll(bytes) || use_ll(bytes); }
+    bool ar_reads_in_place(size_t bytes) const { return use_2s(bytes) || use_ll(bytes); }
 
     static int cu_count()
     {
@@ -2346,22 +2456,23 @@ public:
         HIP_CALL(hipMemset(d_ll_block_flags_, 0, sizeof(uint32_t) * kMaxBlocks));
     }
 
-    // The LL two-shot's per-rank scratch table and per-block epoch, as
-    // ensure_ll_tables_() builds the LL ones; nothing at a world size it does not
-    // run at. Its scratch sits at + ar2sScratchOffset in the zero-initialized
-    // meta buffer.
+    // The two-shot's inbox table and round counters, as ensure_ll_tables_()
+    // builds the LL ones; nothing at a world size it does not run at. Fills this
+    // rank's inbox with the sentinel (see ar_2s_lamport_gfx1250) and waits for
+    // it: the Python caller barriers across ranks after construction, so no peer
+    // pushes into it before.
     void ensure_2s_tables_()
     {
-        if(d_2s_peers_ || world_size_ > kLLMaxRanks || ar2sMaxBytes(world_size_) == 0)
+        if(d_2s_round_ || world_size_ > kLLMaxRanks || ar2sMaxBytes(world_size_) == 0)
             return;
-        std::vector<void*> peers(world_size_);
-        for(int i = 0; i < world_size_; ++i)
-            peers[i] = reinterpret_cast<char*>(sg_.signals[i]) + ar2sScratchOffset(world_size_);
-        HIP_CALL(hipMalloc(&d_2s_peers_, sizeof(void*) * world_size_));
-        HIP_CALL(hipMemcpy(
-            d_2s_peers_, peers.data(), sizeof(void*) * world_size_, hipMemcpyHostToDevice));
-        HIP_CALL(hipMalloc(&d_2s_block_flags_, sizeof(uint32_t) * kMaxBlocks));
-        HIP_CALL(hipMemset(d_2s_block_flags_, 0, sizeof(uint32_t) * kMaxBlocks));
+        for(int i = 0; i < kMaxNgpusAr; ++i)
+            peers_2s_[i] = reinterpret_cast<char*>(sg_.signals[i < world_size_ ? i : rank_]) +
+                           ar2sScratchOffset(world_size_);
+        const size_t groups = ar2sSlotPacks(world_size_) / 32;
+        HIP_CALL(hipMalloc(&d_2s_round_, sizeof(uint32_t) * groups));
+        HIP_CALL(hipMemset(d_2s_round_, 0, sizeof(uint32_t) * groups));
+        HIP_CALL(hipMemset(peers_2s_[rank_], 0xff, ar2sScratchBytes(world_size_)));
+        HIP_CALL(hipDeviceSynchronize());
     }
 
     // LL one-shot all-reduce (see ar_ll_gfx1250). Reads `input` in place.
@@ -2405,51 +2516,53 @@ public:
 #undef LAUNCH_LL_U
     }
 
-    // LL two-shot all-reduce (see ar_2s_ll_gfx1250); use_2s_ll(bytes) holds.
-    // Three wave groups while one block of 3 x 128 threads a CU covers a chunk,
-    // else two (2 x W threads cover more packets a CU; MI455X TP8: three groups
-    // ahead by ~1 us up to 2.1 MB, two from 3.3 MB, by up to 5 us at 8.4 MB).
-    // W: the fewest packets on the busiest CU, ceil(blocks / CUs) x W, for at most
-    // kMaxBlocks blocks; the smaller W on a tie (more CUs issue).
+    // Two-shot all-reduce (see ar_2s_lamport_gfx1250); use_2s(bytes) holds.
+    // W, the threads of a role: the smallest of 64, 128, 256 and 512 that takes a
+    // chunk in at most one block a CU, since a CU running two blocks finishes
+    // last (MI455X, TP8, 7.81 MB: 273 blocks of 2 x 224 threads 45.5 us, 239
+    // blocks of 2 x 256 threads 26.2 us). Three wave groups up to W = 128, two
+    // above. The pollers first wait out the time before anything can land:
+    // delay = 4 at W = 64, else 8 (0.5 to 1 us a call). MI455X, TP8 across two
+    // trays, bf16 in a CUDA graph, us against the LL two-shot this replaced:
+    // 0.92 MB 13.2 vs 15.1, 2.75 MB 17.3 vs 21.0, 3.91 MB 18.8 vs 25.3,
+    // 5.51 MB 24.1 vs 29.9, 7.81 MB 26.0 vs 39.4. Blocks of 3 x 160 threads would
+    // take 4.59 MB ~2 us sooner; no other width is ahead by more than noise.
     template <typename T>
-    void allreduce_2s_ll(hipStream_t stream, const T* input, T* output, int numel)
+    void allreduce_2s(hipStream_t stream, const T* input, T* output, int numel)
     {
-        ensure_2s_tables_();
-        const size_t bytes    = (size_t)numel * sizeof(T);
-        const size_t chunk_pk = bytes / (8 * (size_t)world_size_);
-        const size_t cus      = (size_t)cu_count();
-        const int    roles    = chunk_pk <= cus * 128 ? 3 : 2;
-        int W = 64;
-        size_t best = (size_t)-1;
-        for(int w = 64; w * roles <= 1024; w += 64)
-        {
-            const size_t b = (chunk_pk + w - 1) / w;
-            if(b > (size_t)kMaxBlocks)
-                continue;
-            const size_t load = (b + cus - 1) / cus * w;
-            if(load < best)
+        const size_t bytes = (size_t)numel * sizeof(T);
+        const int chunk_pk = (int)(bytes / (16 * (size_t)world_size_));
+        const int cus      = cu_count();
+        int W              = 512;
+        for(int w : {64, 128, 256})
+            if((chunk_pk + w - 1) / w <= cus)
             {
-                best = load;
-                W    = w;
+                W = w;
+                break;
             }
+        const int roles  = W <= 128 ? 3 : 2;
+        const int delay  = W == 64 ? 4 : 8;
+        const int blocks = std::max(1, (chunk_pk + W - 1) / W);
+        void* const* p   = peers_2s_.data();
+#define LAUNCH_2S(NG, RR) \
+        ar_2s_lamport_gfx1250<T, NG, RR><<<blocks, RR * W, 0, stream>>>( \
+            p[0], p[1], p[2], p[3], p[4], p[5], p[6], p[7], output, input, chunk_pk, rank_, \
+            d_2s_round_, delay)
+        if(world_size_ == 8)
+        {
+            if(roles == 3)
+                LAUNCH_2S(8, 3);
+            else
+                LAUNCH_2S(8, 2);
         }
-        const int blocks = std::max(1, std::min<int>(kMaxBlocks, (int)((chunk_pk + W - 1) / W)));
-        T* const* peers = reinterpret_cast<T* const*>(d_2s_peers_);
-#define LAUNCH_2S_LL_R(NG, RR) \
-        ar_2s_ll_gfx1250<T, NG, RR><<<blocks, RR * W, 0, stream>>>( \
-            peers, output, input, chunk_pk, rank_, d_2s_block_flags_)
-#define LAUNCH_2S_LL(NG)            \
-        if(roles == 3)              \
-        {                           \
-            LAUNCH_2S_LL_R(NG, 3);  \
-        }                           \
-        else                        \
-        {                           \
-            LAUNCH_2S_LL_R(NG, 2);  \
+        else
+        {
+            if(roles == 3)
+                LAUNCH_2S(4, 3);
+            else
+                LAUNCH_2S(4, 2);
         }
-        DISPATCH_NGPUS_1250(world_size_, LAUNCH_2S_LL);
-#undef LAUNCH_2S_LL
-#undef LAUNCH_2S_LL_R
+#undef LAUNCH_2S
     }
 
     // -----------------------------------------------------------------------
@@ -2941,9 +3054,9 @@ public:
         // shared peer scratch — no registered peer-input table (_input_dp) is
         // needed, so branch before get_buffer_RD.
         const size_t bytes = (size_t)size * sizeof(T);
-        if(use_2s_ll(bytes))
+        if(use_2s(bytes))
         {
-            allreduce_2s_ll<T>(stream, input, output, size);
+            allreduce_2s<T>(stream, input, output, size);
             return;
         }
         if(use_ll(bytes))
