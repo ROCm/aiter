@@ -345,6 +345,29 @@ def _starved_rows_ok(num_experts, num_tokens, topk, score_func, dtype):
     return True
 
 
+def test_topk_gating_all_nan_row_picks_k_distinct_experts():
+    """A row of all-NaN logits still routes to `topk` distinct, in-range experts."""
+    num_experts, num_tokens, topk = 256, 4, 8
+    gating_output = _make_gating(num_experts, num_tokens, torch.bfloat16)
+    gating_output[0, :] = float("nan")
+
+    topk_weights = torch.empty((num_tokens, topk), dtype=torch.float32, device="cuda")
+    topk_ids = torch.empty((num_tokens, topk), dtype=torch.int32, device="cuda")
+    aiter.topk_gating(
+        topk_weights,
+        topk_ids,
+        gating_output,
+        None,
+        need_renorm=False,
+        routed_scaling_factor=1.0,
+        score_func="softmax",
+    )
+
+    row_ids = topk_ids[0].tolist()
+    assert all(0 <= e < num_experts for e in row_ids), f"id out of range: {row_ids}"
+    assert len(set(row_ids)) == topk, f"all-NaN row chose repeated experts: {row_ids}"
+
+
 # ---------------------------------------------------------------------------
 # topk_sigmoid (Llama4 routing, via topk_gating score_func="sigmoid")
 # ---------------------------------------------------------------------------
@@ -1170,6 +1193,11 @@ def main():
                 f"(err>0, nan/inf leak, or a mis-weighted starved row)!"
             )
             print(errors.to_string(index=False))
+            failed_sections.append("nan")
+        try:
+            test_topk_gating_all_nan_row_picks_k_distinct_experts()
+        except AssertionError as e:
+            print(f"\nERROR: {e}")
             failed_sections.append("nan")
 
     # -- topk_gating exact-tie handling ------------------------------------
