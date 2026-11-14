@@ -97,7 +97,7 @@
         "matrix_instr_nonkdim": 16,
         "num_warps": 4,
         "num_ctas": 1,
-        "num_stages": 1
+        "num_stages": 2
     }
   }
 
