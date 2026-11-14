@@ -5,6 +5,8 @@ import triton.experimental.gluon.language as gl
 from triton._C.libtriton.gluon_ir import make_cga_layout
 from triton.experimental import gluon
 
+from triton.language.extra.libdevice import fast_dividef
+
 from aiter.ops.triton._gluon_kernels.gfx1250.quant.fused_mxfp4_quant import (
     _mxfp4_quant_op,
 )
@@ -12,7 +14,6 @@ from aiter.ops.triton._triton_kernels.common.pid_preprocessing import (
     pid_grid,
     remap_xcd,
 )
-from aiter.ops.triton._triton_kernels.moe.activations import _swiglu
 from aiter.ops.triton.utils._triton.kernel_repr import make_kernel_repr
 
 _MOE_GEMM_A4W4_REPR_KEYS = [
@@ -550,6 +551,24 @@ def unshuffle_weights_gfx1250(
         .permute((0, 2, 1, 3))
         .reshape((PACKED_BLOCK_N_W, PACKED_BLOCK_K_W))
     )
+
+
+@gluon.jit
+def _swiglu(input, alpha, limit, ADD_RESIDUAL: gl.constexpr):
+    # Gluon-native SwiGLU, avoids the v_min_f32 inline asm in the shared Triton
+    # version whose register clobber causes non-deterministic corruption on gfx1250.
+    gate, up = gl.split(gl.reshape(input, (input.shape[0], input.shape[1] // 2, 2)))
+    gate = gate.to(gl.float32)
+    if limit is not None:
+        gate = gl.minimum(gate, limit)
+    up = up.to(gl.float32)
+    if limit is not None:
+        up = gl.maximum(-limit, gl.minimum(up, limit))
+    s = fast_dividef(gate, 1 + gl.exp2(-1.44269504089 * alpha * gate))
+    if ADD_RESIDUAL:
+        return gl.fma(s, up, s)
+    else:
+        return s * up
 
 
 @gluon.jit(launch_metadata=matmul_launch_metadata, repr=_moe_gemm_a4w4_prefill_repr)
