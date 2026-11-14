@@ -53,9 +53,9 @@ def dg_tmp_rows(x):
 
 
 def num_programs_fwd(x):
-    # Replaces num_programs() for the forward operators on gfx950, and falls back
-    # to num_programs() for other architectures
-    if get_arch() == "gfx950":
+    # Replaces num_programs() for the forward operators on gfx950 and gfx1250, and
+    # falls back to num_programs() for other architectures
+    if get_arch() in ("gfx950", "gfx1250", "gfx1250-strict"):
         # num_programs() caps the grid at one workgroup per CU, so oversubscribe
         fwd_program_oversub = 4
         fwd_oversub_max_block_size = 8192
