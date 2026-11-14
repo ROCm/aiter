@@ -6,7 +6,6 @@
         "num_warps": 8,
         "num_stages": 1,
         "waves_per_eu": 6,
-        "matrix_instr_nonkdim": 16,
         "cache_modifier": null
     },
     "M_LEQ_4": {
@@ -16,7 +15,6 @@
         "num_warps": 1,
         "num_stages": 1,
         "waves_per_eu": 1,
-        "matrix_instr_nonkdim": 16,
         "cache_modifier": ".cg"
     },
     "M_LEQ_8": {
@@ -26,7 +24,6 @@
         "num_warps": 2,
         "num_stages": 1,
         "waves_per_eu": 2,
-        "matrix_instr_nonkdim": 16,
         "cache_modifier": ".cg"
     },
     "M_LEQ_16": {
@@ -36,7 +33,6 @@
         "num_warps": 8,
         "num_stages": 1,
         "waves_per_eu": 4,
-        "matrix_instr_nonkdim": 16,
         "cache_modifier": ".cg"
     },
     "M_LEQ_32": {
@@ -46,7 +42,6 @@
         "num_warps": 2,
         "num_stages": 1,
         "waves_per_eu": 4,
-        "matrix_instr_nonkdim": 16,
         "cache_modifier": null
     },
     "M_LEQ_64": {
@@ -56,7 +51,6 @@
         "num_warps": 8,
         "num_stages": 1,
         "waves_per_eu": 1,
-        "matrix_instr_nonkdim": 16,
         "cache_modifier": ".cg"
     },
     "M_LEQ_128": {
@@ -66,7 +60,6 @@
         "num_warps": 8,
         "num_stages": 1,
         "waves_per_eu": 4,
-        "matrix_instr_nonkdim": 16,
         "cache_modifier": null
     },
     "M_LEQ_256": {
@@ -76,7 +69,6 @@
         "num_warps": 8,
         "num_stages": 1,
         "waves_per_eu": 4,
-        "matrix_instr_nonkdim": 16,
         "cache_modifier": null
     },
     "M_LEQ_512": {
@@ -86,7 +78,6 @@
         "num_warps": 8,
         "num_stages": 1,
         "waves_per_eu": 1,
-        "matrix_instr_nonkdim": 16,
         "cache_modifier": ".cg"
     },
     "M_LEQ_1024": {
@@ -96,7 +87,6 @@
         "num_warps": 8,
         "num_stages": 1,
         "waves_per_eu": 1,
-        "matrix_instr_nonkdim": 16,
         "cache_modifier": ".cg"
     },
     "M_LEQ_2048": {
@@ -106,7 +96,6 @@
         "num_warps": 8,
         "num_stages": 1,
         "waves_per_eu": 1,
-        "matrix_instr_nonkdim": 16,
         "cache_modifier": null
     },
     "M_LEQ_4096": {
@@ -116,7 +105,6 @@
         "num_warps": 8,
         "num_stages": 1,
         "waves_per_eu": 1,
-        "matrix_instr_nonkdim": 16,
         "cache_modifier": null
     },
     "any": {
@@ -126,7 +114,6 @@
         "num_warps": 8,
         "num_stages": 1,
         "waves_per_eu": 1,
-        "matrix_instr_nonkdim": 16,
         "cache_modifier": ".cg"
     }
 }

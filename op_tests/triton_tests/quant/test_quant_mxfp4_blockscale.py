@@ -19,28 +19,26 @@ def _torch_dynamic_mxfp4_quant_blockscale(
     x: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """CPU reference matching the Triton 32x32 EVEN-scale quantizer."""
-    # Keep implicit constructors on CPU when the default device changes.
-    with torch.device("cpu"):
-        x = x.float().cpu()
-        M, N = x.shape
-        tiles = (
-            x.reshape(M // _BLOCK_SIZE, _BLOCK_SIZE, N // _BLOCK_SIZE, _BLOCK_SIZE)
-            .permute(0, 2, 1, 3)
-            .contiguous()
-        )
-        amax = tiles.abs().amax(dim=(-2, -1))
+    x = x.float().cpu()
+    M, N = x.shape
+    tiles = (
+        x.reshape(M // _BLOCK_SIZE, _BLOCK_SIZE, N // _BLOCK_SIZE, _BLOCK_SIZE)
+        .permute(0, 2, 1, 3)
+        .contiguous()
+    )
+    amax = tiles.abs().amax(dim=(-2, -1))
 
-        scales = f32_to_mx_e8m0_scale(
-            amax,
-            mode=MxScaleRoundModeInt.Even,
-            dtype=MxDtypeInt.FP4_E2M1,
-        ).view(torch.uint8)
-        scales = scales.clamp_max(254)
-        scale_f32 = e8m0_to_f32(scales).float()
+    scales = f32_to_mx_e8m0_scale(
+        amax,
+        mode=MxScaleRoundModeInt.Even,
+        dtype=MxDtypeInt.FP4_E2M1,
+    ).view(torch.uint8)
+    scales = scales.clamp_max(254)
+    scale_f32 = e8m0_to_f32(scales).float()
 
-        scaled_tiles = tiles / scale_f32[:, :, None, None]
-        scaled = scaled_tiles.permute(0, 2, 1, 3).reshape(M, N)
-        packed = f32_to_mxfp4(scaled).view(torch.uint8)
+    scaled_tiles = tiles / scale_f32[:, :, None, None]
+    scaled = scaled_tiles.permute(0, 2, 1, 3).reshape(M, N)
+    packed = f32_to_mxfp4(scaled).view(torch.uint8)
     return packed, scales
 
 
@@ -79,7 +77,8 @@ def test_dynamic_mxfp4_quant_blockscale_matches_reference(M: int, N: int, dtype)
 
 def test_dynamic_mxfp4_quant_blockscale_even_scale_tie():
     below_tie = torch.nextafter(
-        torch.tensor(1.75, device="cpu"), torch.tensor(0.0, device="cpu")
+        torch.tensor(1.75, dtype=torch.float32, device="cpu"),
+        torch.tensor(0.0, dtype=torch.float32, device="cpu"),
     ).item()
     x = torch.zeros((64, 32), dtype=torch.float32, device="cuda")
     x[0, 0] = below_tie

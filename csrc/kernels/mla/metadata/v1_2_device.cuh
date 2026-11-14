@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: MIT
 // Copyright (C) 2025-2026, Advanced Micro Devices, Inc. All rights reserved.
 
+#include "mla_decode_shape.h"
 #include "mla_metadata.h"
 #include "v1_comm.cuh"
 
@@ -82,19 +83,20 @@ mla_v12_effective_splits(const MlaMetadataV1KernelParameter& params, const int32
 
 template <typename Traits>
 __device__ __forceinline__ int32_t mla_v12_num_qo_tiles(const MlaMetadataV1KernelParameter& params,
-                                                        QoState<Traits>& qo_state,
-                                                        const int32_t batch_idx)
+                                                        const int32_t seqlen_qo)
 {
     if constexpr(Traits::kQoSplits)
     {
-        const int32_t seqlen_qo = qo_state.get_seqlen(batch_idx);
+        // An empty request (graph padding) still needs one tile; zero tiles never advance the
+        // planner past it.
         if(params.num_heads * 2 > Traits::kPackedQoLenPerWg)
         {
-            return seqlen_qo;
+            return max(seqlen_qo, 1);
         }
         const int32_t packed_qo_len = seqlen_qo * params.num_heads;
-        return integer_divide_ceil_power2(
-            packed_qo_len, Traits::kPackedQoLenPerWg, Traits::kPackedQoLenPerWg_log2);
+        return max(integer_divide_ceil_power2(
+                       packed_qo_len, Traits::kPackedQoLenPerWg, Traits::kPackedQoLenPerWg_log2),
+                   1);
     }
     else
     {
@@ -126,18 +128,30 @@ mla_v12_compute_sum_blocks(const MlaMetadataV1KernelParameter& params,
         {
             p_lds_seqlens_kv[bid] = seqlen_kv;
         }
-
-        const int32_t num_blocks = integer_divide_ceil_power2(
-            seqlen_kv, params.kv_granularity, params.kv_granularity_log2);
-        const int32_t num_qo_tiles = mla_v12_num_qo_tiles<Traits>(params, qo_state, bid);
-        const int32_t unit_blocks  = num_blocks + params.fixed_over_head_num_blocks;
-        sum_blocks += unit_blocks * num_qo_tiles;
-
+        // Stored before mla_v12_num_qo_tiles, which reads it back through qo_state.
         if constexpr(QoState<Traits>::is_unique() == false)
         {
             p_lds_seqlens_qo[bid] =
                 params.p_seqlens_qo_indptr[bid_ori + 1] - params.p_seqlens_qo_indptr[bid_ori];
         }
+
+        int32_t seqlen_qo;
+        if constexpr(QoState<Traits>::is_unique())
+        {
+            seqlen_qo = qo_state.get_seqlen(bid);
+        }
+        else
+        {
+            seqlen_qo =
+                params.p_seqlens_qo_indptr[bid_ori + 1] - params.p_seqlens_qo_indptr[bid_ori];
+            p_lds_seqlens_qo[bid] = seqlen_qo;
+        }
+
+        const int32_t num_blocks = integer_divide_ceil_power2(
+            seqlen_kv, params.kv_granularity, params.kv_granularity_log2);
+        const int32_t num_qo_tiles = mla_v12_num_qo_tiles<Traits>(params, seqlen_qo);
+        const int32_t unit_blocks  = num_blocks + params.fixed_over_head_num_blocks;
+        sum_blocks += unit_blocks * num_qo_tiles;
     }
 
     return aiter::warpReduce<aiter::AddFunctor, decltype(sum_blocks), opus::get_warp_size()>(
@@ -184,7 +198,11 @@ __launch_bounds__(opus::get_warp_size() * MLA_V12_FILL_WARPS, 1) __global__
     int32_t* p_lds_partial_before = p_lds_reduce_before + kBatchChunk;
 
     QoState qo_state(
-        params.uni_seqlen_qo, ori_seqlen_qo, p_lds_seqlens_qo, params.p_seqlens_qo_indptr);
+        params.uni_seqlen_qo,
+        ori_seqlen_qo,
+        params.qk_batch_ratio,
+        p_lds_seqlens_qo,
+        params.p_seqlens_qo_indptr);
 
     MlaWorkInfo* p_work_info_set = reinterpret_cast<MlaWorkInfo*>(params.p_work_info_set_raw);
 
@@ -513,7 +531,11 @@ __launch_bounds__(opus::get_warp_size(), 1) __global__
     int32_t* p_lds_seqlens_kv = p_lds_seqlens_qo + (QoState::is_unique() ? 0 : num_batches);
 
     QoState qo_state(
-        params.uni_seqlen_qo, ori_seqlen_qo, p_lds_seqlens_qo, params.p_seqlens_qo_indptr);
+        params.uni_seqlen_qo,
+        ori_seqlen_qo,
+        params.qk_batch_ratio,
+        p_lds_seqlens_qo,
+        params.p_seqlens_qo_indptr);
 
     const int32_t lane_idx = opus::lane_id();
 
@@ -561,9 +583,9 @@ __launch_bounds__(opus::get_warp_size(), 1) __global__
         int32_t remain_payload = payload;
         while(curr_batch < num_batches)
         {
-            const int32_t num_qo_tiles = mla_v12_num_qo_tiles<Traits>(params, qo_state, curr_batch);
-            const int32_t qo_tile_size =
-                integer_divide_ceil(qo_state.get_seqlen(curr_batch), num_qo_tiles);
+            const int32_t seqlen_qo     = qo_state.get_seqlen(curr_batch);
+            const int32_t num_qo_tiles  = mla_v12_num_qo_tiles<Traits>(params, seqlen_qo);
+            const int32_t qo_tile_size  = integer_divide_ceil(seqlen_qo, num_qo_tiles);
             const int32_t num_kv_blocks = integer_divide_ceil_power2(
                 curr_kv_seqlen, params.kv_granularity, params.kv_granularity_log2);
             const int32_t remain_kv_blocks = num_kv_blocks - curr_kv_block;
@@ -909,7 +931,11 @@ __launch_bounds__(opus::get_warp_size(), 1) __global__
     int32_t* p_lds_wb          = p_lds_j0 + num_xcd * (rows + 1);
 
     QoState qo_state(
-        params.uni_seqlen_qo, params.ori_seqlen_qo, p_lds_seqlens_qo, params.p_seqlens_qo_indptr);
+        params.uni_seqlen_qo,
+        params.ori_seqlen_qo,
+        params.qk_batch_ratio,
+        p_lds_seqlens_qo,
+        params.p_seqlens_qo_indptr);
 
     MlaWorkInfo* p_work_info_set = reinterpret_cast<MlaWorkInfo*>(params.p_work_info_set_raw);
 
@@ -921,10 +947,10 @@ __launch_bounds__(opus::get_warp_size(), 1) __global__
                                                                   num_batches,
                                                                   lane_idx);
 
+    const int32_t seqlen_qo0 = (num_batches > 0) ? qo_state.get_seqlen(0) : 0;
     const int32_t qo_tiles =
-        (num_batches > 0) ? mla_v12_num_qo_tiles<Traits>(params, qo_state, 0) : 1;
-    const int32_t qo_tile_size =
-        (num_batches > 0) ? integer_divide_ceil(qo_state.get_seqlen(0), qo_tiles) : 1;
+        (num_batches > 0) ? mla_v12_num_qo_tiles<Traits>(params, seqlen_qo0) : 1;
+    const int32_t qo_tile_size = (num_batches > 0) ? integer_divide_ceil(seqlen_qo0, qo_tiles) : 1;
 
     // kv blocks of a batch, and the extent the fragments are cut out of
     auto kv_len_of = [&](const int32_t bid) -> int32_t {
@@ -1295,38 +1321,6 @@ void dispatch_mla_metadata_v1_2_device(const MlaMetadataV1KernelParameter& param
     }
 }
 
-// HK MLA m16x4 kernel runs at occupancy=2 (gfx950 + 64 q-tokens per tile, gated on
-// AITER_ENABLE_EXPERIMENTAL same as the dispatch in aiter/mla.py:use_hk). When it
-// applies, the m16x4 launch site spawns 2*num_cu workgroups; the work distribution
-// here must produce work_indptr sized to match so the second occupancy slot actually
-// receives work. Detection mirrors hk_decode_fwd dispatch (num_heads * max_seqlen_qo
-// == 64) and uses ORIGINAL num_heads/max_seqlen_qo (pre-fold). V32 uses fp8 across
-// nope+rope; V40 uses fp8 nope + bf16 rope.
-static inline int32_t mla_metadata_cluster_multiplier(const std::string& arch_id,
-                                                      const bool enable_experimental,
-                                                      const int32_t num_heads,
-                                                      const int32_t max_seqlen_qo,
-                                                      const MlaVersion mla_version,
-                                                      const AiterDtype q_nope_dtype,
-                                                      const AiterDtype q_rope_dtype,
-                                                      const AiterDtype kv_nope_dtype,
-                                                      const AiterDtype kv_rope_dtype)
-{
-    auto is_fp8  = [](const AiterDtype dtype) { return dtype == AITER_DTYPE_fp8; };
-    auto is_bf16 = [](const AiterDtype dtype) { return dtype == AITER_DTYPE_bf16; };
-
-    const bool dtype_ok =
-        ((mla_version == MlaVersion::V32) && is_fp8(q_nope_dtype) && is_fp8(q_rope_dtype) &&
-         is_fp8(kv_nope_dtype) && is_fp8(kv_rope_dtype)) ||
-        ((mla_version == MlaVersion::V40) && is_fp8(q_nope_dtype) && is_bf16(q_rope_dtype) &&
-         is_fp8(kv_nope_dtype) && is_bf16(kv_rope_dtype));
-
-    const bool is_hk_m16x4 = enable_experimental && (arch_id == "gfx950") &&
-                             (num_heads * max_seqlen_qo == 64) && dtype_ok;
-
-    return is_hk_m16x4 ? 2 : 1;
-}
-
 void get_mla_metadata_v1_2_device(const aiter_tensor_t& seqlens_qo_indptr, // [batch size + 1]
                                   const aiter_tensor_t& seqlens_kv_indptr, // [batch size + 1]
                                   const aiter_tensor_t& kv_last_page_lens, // [batch size]
@@ -1369,11 +1363,6 @@ void get_mla_metadata_v1_2_device(const aiter_tensor_t& seqlens_qo_indptr, // [b
 
     auto arch_id = get_gpu_arch();
 
-    // In the following cases, we use #head=16 to simulate cases which is not natively supported by
-    // mla main kernel.
-    const bool q_is_fp8  = (q_dtype == AITER_DTYPE_fp8);
-    const bool kv_is_fp8 = (kv_dtype == AITER_DTYPE_fp8);
-
     const bool enable_experimental = std::getenv("AITER_ENABLE_EXPERIMENTAL") != nullptr &&
                                      std::atoi(std::getenv("AITER_ENABLE_EXPERIMENTAL")) != 0;
 
@@ -1388,63 +1377,20 @@ void get_mla_metadata_v1_2_device(const aiter_tensor_t& seqlens_qo_indptr, // [b
                                                                        kv_rope_dtype);
     const int32_t num_clusters = (dev_prop.multiProcessorCount * cluster_multiplier) / num_heads_k;
 
-    // Gate on arch_id consistent with hk_mla_v32_decode_fwd dispatch (gfx942/gfx950).
-    // Otherwise this would mark shapes as natively supported on archs where the
-    // HK kernels are unavailable, producing metadata that downstream kernels
-    // cannot consume.
-    const bool hk_mtp_experimental =
-        (arch_id == "gfx942" || arch_id == "gfx950") && (q_is_fp8 && kv_is_fp8) &&
-        (num_heads * max_seqlen_qo == 128) &&
-        ((num_heads == 16) || (num_heads == 32) || (num_heads == 64) || (num_heads == 128)) &&
-        enable_experimental;
-
-    // FlyDSL PS1 on gfx1250 consumes the full 32/64/128 Q heads in one work
-    // item. Without this gate the planner folds those shapes to 16-head
-    // pseudo-batches (qk_batch_ratio), which the FlyDSL kernel does not read.
-    // Keep it behind AITER_MLA_DECODE_PS1_FLYDSL so gfx1250 persistent ASM
-    // (16-head fold + host Q fold) is unchanged when FlyDSL is off.
     const bool flydsl_ps1 = std::getenv("AITER_MLA_DECODE_PS1_FLYDSL") != nullptr &&
                             std::atoi(std::getenv("AITER_MLA_DECODE_PS1_FLYDSL")) != 0;
-    const bool gfx1250_flydsl_ps1_heads =
-        flydsl_ps1 && (arch_id == "gfx1250") && q_is_fp8 && kv_is_fp8 &&
-        ((num_heads == 96) ||
-         (((num_heads == 32) || (num_heads == 64) || (num_heads == 128)) &&
-          (max_seqlen_qo == 1)));
 
-    const bool natively_supported =
-        (num_heads == 16) || gfx1250_flydsl_ps1_heads ||
-        ((arch_id == "gfx942" || arch_id == "gfx950") && (num_heads == 64) && q_is_fp8 &&
-         kv_is_fp8 && (max_seqlen_qo == 1)) ||
-        ((arch_id == "gfx950") && !q_is_fp8 && !kv_is_fp8) ||
-        ((arch_id == "gfx942") && (num_heads == 128) && q_is_fp8 && kv_is_fp8) ||
-        ((arch_id == "gfx950") && q_is_fp8 && kv_is_fp8 &&
-         ((num_heads == 32) || (num_heads == 64) || (num_heads == 128))) ||
-        ((arch_id == "gfx950") && q_is_fp8 && kv_is_fp8 && (num_heads == 96) &&
-         (max_seqlen_qo <= 6)) ||
-        ((arch_id == "gfx950") && q_is_fp8 && kv_is_fp8 && (num_heads == 12) &&
-         ((num_heads * max_seqlen_qo) <= 128)) ||
-        hk_mtp_experimental;
+    const MlaDecodeHeadPlan head_plan = mla_decode_head_plan_v1_2(
+        arch_id, num_heads, max_seqlen_qo, q_dtype, kv_dtype, page_size,
+        {enable_experimental, flydsl_ps1});
+    const bool natively_supported = head_plan.natively_supported;
 
-    if(!natively_supported && (num_heads % 16 == 0))
-    {
-        qk_batch_ratio = num_heads / 16;
-        num_heads      = 16;
-        num_batches *= qk_batch_ratio;
-    }
+    qk_batch_ratio = head_plan.qk_batch_ratio;
+    num_heads      = head_plan.kernel_num_heads;
+    num_batches *= qk_batch_ratio;
 
     AITER_CHECK(
-        natively_supported || (num_heads == 16) || (num_heads == 128) ||
-            ((num_heads == 32) && q_is_fp8 && kv_is_fp8) ||
-            ((num_heads == 64) && q_is_fp8 && kv_is_fp8 && (max_seqlen_qo == 1)) ||
-            ((arch_id == "gfx950") && (num_heads == 8) && (max_seqlen_qo == 4) && q_is_fp8 &&
-             kv_is_fp8) ||
-            ((arch_id == "gfx942") && (num_heads == 8) && (max_seqlen_qo == 2) && !q_is_fp8 &&
-             !kv_is_fp8) ||
-            ((arch_id == "gfx950") && !q_is_fp8 && !kv_is_fp8) ||
-            ((arch_id == "gfx950") && q_is_fp8 && kv_is_fp8 &&
-             (((num_heads == 32) && (max_seqlen_qo == 4)) || (num_heads == 64) ||
-              (num_heads == 128))) ||
-            hk_mtp_experimental,
+        head_plan.plan != MlaHeadPlan::Unsupported,
         __func__,
         ": only supports #heads in [16, 64, 128], or (#head, uni_seqlen_qo) = (16*N, 1) where "
         "N is in [2, 8), or (#head, max_seqlen_qo) = (8, 4) where q and kv are fp8, "
@@ -1487,17 +1433,7 @@ void get_mla_metadata_v1_2_device(const aiter_tensor_t& seqlens_qo_indptr, // [b
 
     params.num_xcd = (arch_id == "gfx950") ? 8 : 1;
 
-    int32_t kPackedQoLenPerWg = 128;
-    if((arch_id == "gfx950") && !q_is_fp8 && !kv_is_fp8 && (num_heads * max_seqlen_qo >= 64) &&
-       (num_heads <= 64) && (((num_heads * max_seqlen_qo) < 128) || (num_heads == 48)))
-    {
-        kPackedQoLenPerWg = 64;
-    }
-    else if((arch_id == "gfx950") && q_is_fp8 && kv_is_fp8 && (num_heads == 32) &&
-            (max_seqlen_qo == 3))
-    {
-        kPackedQoLenPerWg = 64;
-    }
+    const int32_t kPackedQoLenPerWg = head_plan.packed_qo_len_per_wg;
 
     const int32_t xcd_rows_per_lane = (params.num_xcd > 0) ? (num_clusters / params.num_xcd) : 0;
     const bool xcd_multi_tile       = (num_heads * 2 > kPackedQoLenPerWg) && (max_seqlen_qo > 1) &&

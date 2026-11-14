@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: MIT
-# Copyright (C) 2026-2026, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
 
 """Loads tuning configs for unified attention.
 
@@ -12,6 +12,7 @@ only the axes that matter, joined by '.':
       "attn_2d": {
         "D_LEQ_128.Q_LEQ_1.SW": {...},   # head_size <= 128, decode, sliding window
         "D_LEQ_128.Q_LEQ_1":    {...},   # head_size <= 128, decode
+        "D_EQ_192":             {...},   # head_size == 192 and nothing else
         "D_GEQ_512":            {...},   # head_size >= 512, any query length
         "DT_fp8_fp8":           {...},   # fp8 query and KV cache
         "any":                  {...}
@@ -21,9 +22,15 @@ only the axes that matter, joined by '.':
     }
 
 Lookup walks the axes in the order "schema" lists them and takes the first key
-that exists: LEQ bounds ascending, then GEQ descending, then "any". So the
-leftmost axis wins: D before Q is what makes head_size outrank max_seqlen_q.
-Dtypes fall back too: DT_fp8_fp8, then DT_fp8_any, DT_any_fp8, then "any".
+that exists: an exact EQ first, then LEQ bounds ascending, then GEQ
+descending, then "any". So the leftmost axis wins: D before Q is what makes
+head_size outrank max_seqlen_q.
+Dtypes fall back too: DT_fp8_fp8, then DT_fp8_any, DT_any_fp8, then "any". The second dtype is the K
+cache's; a V cache of another dtype (A8K4V8: NVFP4 K, fp8 V) first tries DT_<q>_<k>_<v>, e.g.
+DT_fp8_nvfp4_fp8, then that same chain.
+SW is the keys a row can see, min(window, max_seqlen_k), and 0 with no window:
+SW_GEQ_<n> targets a window size, a bare SW matches any window, and a table
+may not mix SW_LEQ and SW_GEQ keys.
 
 A section with no axes, like reduce above, is just a config.
 
@@ -60,12 +67,15 @@ _SEP = "."
 
 _AXIS_KIND = {
     "D": "num",  # head_size
+    "G": "num",  # num_queries_per_kv, the query heads sharing a KV head (GQA group)
     "Q": "num",  # max_seqlen_q; Q_LEQ_1 is decode
     "BS": "num",  # block_size, the KV page size
-    "SW": "bool",  # sliding_window > 0
+    "SW": "opt_num",  # keys a row can see, 0 when off; bare SW = any window
     "SKLT": "bool",  # max_seqlen_k < 2048
     "SHUF": "bool",  # shuffled_kv_cache
-    "DT": "enum",  # (q dtype tag, kv dtype tag)
+    "DT": "enum",  # (q dtype tag, K cache dtype tag[, V cache dtype tag when it differs])
+    # 2d programs per CU, rounded up to a power of 2, so P bounds must be powers of 2
+    "P": "num",
 }
 
 
@@ -104,6 +114,14 @@ def _index(keys: tuple, axes: tuple) -> tuple:
         if key != "any":
             for part in key.split(_SEP):
                 parts[_axis_of(part)].add(part)
+    # every matching LEQ key outranks every GEQ key, so one direction per axis
+    for a in axes:
+        if _AXIS_KIND[a] == "opt_num":
+            dirs = {p.split("_")[1] for p in parts[a] if "_" in p}
+            assert not {"LEQ", "GEQ"} <= dirs, (
+                f"{_CONFIG_NAME}: {a} keys mix LEQ and GEQ "
+                f"({sorted(parts[a])}); use one direction"
+            )
     return {_canonical(k, axes): k for k in keys}, parts
 
 
@@ -117,16 +135,25 @@ def _candidates(axis: str, value, parts: set) -> list[str]:
     if kind == "bool":
         return ([axis] if value else []) + ["any"]
     if kind == "enum":
-        q, kv = value
-        return [f"{axis}_{q}_{kv}", f"{axis}_{q}_any", f"{axis}_any_{kv}", "any"]
+        q, kv = value[:2]
+        # a V cache dtype unlike K's (A8K4V8) tries its own DT_q_k_v first
+        own = (
+            [f"{axis}_{q}_{kv}_{value[2]}"] if len(value) > 2 and value[2] != kv else []
+        )
+        return own + [f"{axis}_{q}_{kv}", f"{axis}_{q}_any", f"{axis}_any_{kv}", "any"]
+    if kind == "opt_num" and not value:
+        return ["any"]
 
+    eq = sorted(c for c in parts if c.startswith(f"{axis}_EQ_"))
     leq = sorted((c for c in parts if c.startswith(f"{axis}_LEQ_")), key=_bound)
     geq = sorted(
         (c for c in parts if c.startswith(f"{axis}_GEQ_")), key=_bound, reverse=True
     )
     return (
-        [c for c in leq if value <= _bound(c)]
+        [c for c in eq if value == _bound(c)]
+        + [c for c in leq if value <= _bound(c)]
         + [c for c in geq if value >= _bound(c)]
+        + ([axis] if kind == "opt_num" else [])
         + ["any"]
     )
 
@@ -177,11 +204,19 @@ def compute_segment_params(config: dict, params) -> dict:
     mfma_dim = config.pop("MFMA_DIM", None)
     min_tiles = config.pop("SPLIT_MIN_TILES", 0)
     min_share = config.pop("SPLIT_MIN_SHARE", 0)
+    fit_budget = config.pop("SPLIT_FIT_BUDGET", False)
+    seqs_per_tile = config.pop("SPLIT_SEQS_PER_TILE", 0)
 
     # tokens one segment must cover, so the split never outruns the context
     tile = triton.next_power_of_2(params.block_size)
     tile = max(tile_lo, tile if tile_hi is None else min(tile_hi, tile))
-    limit = triton.cdiv(params.max_seqlen_k, tile)
+    kv_len = params.max_seqlen_k
+    # a sliding-window split carves only the window: rows see at most
+    # window + q - 1 keys
+    if params.sliding_window > 0:
+        kv_len = min(kv_len, params.sliding_window + params.max_seqlen_q - 1)
+    limit = triton.cdiv(kv_len, tile)
+    too_many_seqs = seqs_per_tile and params.num_seqs > seqs_per_tile * limit
     if cap is not None:
         limit = min(cap, limit)
 
@@ -194,7 +229,9 @@ def compute_segment_params(config: dict, params) -> dict:
         )
         budget //= num_waves
     share = triton.cdiv(budget, prgms)
-    if limit <= min_tiles or share < min_share:
+    if fit_budget:
+        share = 1 << ((budget // prgms).bit_length() - 1) if budget >= prgms else 0
+    if limit <= min_tiles or share < min_share or too_many_seqs:
         segments = 1
     else:
         claim = max(min(lo, limit), min(limit, max(1, share)))
@@ -216,16 +253,26 @@ def _axis_values(
     block_size,
     q_dtype,
     kv_dtype,
+    programs_per_cu,
+    num_queries_per_kv=1,
+    v_dtype=None,
 ) -> dict:
     return {
         "D": head_size,
+        "G": num_queries_per_kv,
         "Q": max_seqlen_q,
         "BS": block_size,
-        "SW": sliding_window > 0,
+        "SW": max(1, min(sliding_window, max_seqlen_k)) if sliding_window > 0 else 0,
         "SKLT": max_seqlen_k < 2048,
         "SHUF": shuffled_kv_cache,
-        "DT": (get_dtype_str(q_dtype), get_dtype_str(kv_dtype)),
+        "DT": (get_dtype_str(q_dtype), get_dtype_str(kv_dtype))
+        + ((get_dtype_str(v_dtype),) if v_dtype is not None else ()),
+        "P": programs_per_cu,
     }
+
+
+def _programs_per_cu(params) -> int:
+    return triton.next_power_of_2(triton.cdiv(params.num_2d_prgms, params.num_sms))
 
 
 def _load(op: str, backend, arch: str | None) -> tuple:
@@ -263,8 +310,11 @@ def _get_unified_attention_config_cached(
     q_dtype: torch.dtype,
     kv_dtype: torch.dtype,
     block_size: int,
+    programs_per_cu: int,
     backend: str,
     arch: str | None,
+    num_queries_per_kv: int = 1,
+    v_cache_dtype: torch.dtype | None = None,
 ) -> dict:
     assert op in _OPS, f"Unknown config op {op!r}, expected one of {_OPS}"
     assert head_size > 0, "head_size must be positive"
@@ -280,6 +330,9 @@ def _get_unified_attention_config_cached(
         block_size,
         q_dtype,
         kv_dtype,
+        programs_per_cu,
+        num_queries_per_kv,
+        v_dtype=v_cache_dtype,
     )
     _, config = _lookup(table, axes, values)
     return compute_tile_params(config, block_size)
@@ -315,8 +368,11 @@ def get_unified_attention_config(
         params.q_dtype,
         params.kv_cache_dtype,
         params.block_size,
+        _programs_per_cu(params),
         backend,
         arch,
+        params.num_queries_per_kv,
+        v_cache_dtype=getattr(params, "v_cache_dtype", None),
     )
     # NUM_SEGMENTS is derived out here rather than in the cached lookup: it
     # reads the launch's program count, which is not part of the cache key.
@@ -335,6 +391,9 @@ def explain(op: str, params, backend: str = "triton", arch: str | None = None) -
         params.block_size,
         params.q_dtype,
         params.kv_cache_dtype,
+        _programs_per_cu(params),
+        params.num_queries_per_kv,
+        v_dtype=getattr(params, "v_cache_dtype", None),
     )
     key, config = _lookup(table, axes, values)
     derived = compute_segment_params(

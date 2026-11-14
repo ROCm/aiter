@@ -23,6 +23,7 @@ GITHUB_* that Actions sets for every step. Writes `ok` to GITHUB_OUTPUT.
 import datetime
 import math
 import os
+import statistics
 import sys
 import time
 
@@ -30,7 +31,8 @@ import time
 # up the sibling rather than any installed package of the same name.
 from watchdog import GitHub
 
-AVG_REVIEW_MINUTES = 50      # measured: a full review is about this
+AVG_REVIEW_MINUTES = 50      # fallback when no completed review can be measured
+RECENT_REVIEWS = 8            # the estimate is the median of what the box actually did lately
 MAX_WAIT_HOURS = 8           # refuse beyond this rather than accept it; see below
 NO_RUNNER_MINUTES = 30       # nothing moving for this long, with work waiting, means nobody is taking it
 RECHECK_SECONDS = 60         # before calling a box dead, see whether it was simply between reviews
@@ -68,27 +70,37 @@ def tunable(env, name, default):
 
 
 def survey(api, repo, own_run_id, now):
-    """How many reviews are running, and how long the waiting ones have waited."""
-    running, waiting = 0, []
-    for run in api.in_progress_runs(repo):
+    """How many reviews are running, how long the ones past their gate have waited, and how many
+    requests are still queued at their own gate -- a burst queues whole runs at the hosted
+    runner before any gate job runs, and those requests are as ahead of the requester as any."""
+    running, waiting, arriving = 0, [], 0
+    for run in api.live_runs(repo):
         if run["id"] == own_run_id:
             continue
-        review = next((j for j in api.jobs(repo, run["id"]) if j["name"] == "review"), None)
-        if review is None:
-            continue
-        if review["status"] == "in_progress":
+        jobs = api.jobs(repo, run["id"])
+        review = next((j for j in jobs if j["name"] == "review"), None)
+        gate = next((j for j in jobs if j["name"] == "gate"), None)
+        if review is not None and review["status"] == "in_progress":
             running += 1
-        elif review["status"] == "queued":
+        elif review is not None and review["status"] == "queued" and gate is not None \
+                and gate["status"] == "completed" and gate["conclusion"] == "success":
+            # past its gate and waiting for the box: the wait a dead runner would explain
             waiting.append(_age_minutes(run["created_at"], now))
-    return running, waiting
+        elif run["status"] == "queued" or (gate is not None and gate["status"] != "completed"):
+            # real, but still short of the box -- its own gate has not finished, which says
+            # nothing about the box, so it counts toward the queue without ever paging anyone
+            arriving += 1
+    return running, waiting, arriving
 
 
-def decide(running, waiting, cfg):
-    """Pure: (running count, list of waiting ages in minutes) -> (verdict, ahead, eta_minutes).
+def decide(running, waiting, arriving, cfg):
+    """Pure: (running count, waiting ages, arriving count) -> (verdict, ahead, eta_minutes).
 
     Verdicts: 'idle' (start now), 'queued' (start in eta), 'too-deep' (refuse), 'no-runner'.
+    A request still queued at its own gate counts toward the queue but never toward the
+    no-runner verdict: a starved hosted runner is not a dead box.
     """
-    ahead = running + len(waiting)
+    ahead = running + len(waiting) + arriving
     if running == 0 and waiting and max(waiting) >= cfg["no_runner_minutes"]:
         return "no-runner", ahead, int(max(waiting))
     eta = ahead * cfg["avg_minutes"]
@@ -148,13 +160,26 @@ def run(api, env, now=None, sleep=time.sleep):
     # unparseable one, a network error on the way out.
     try:
         now = now or datetime.datetime.now(datetime.timezone.utc)
-        cfg = {"avg_minutes": tunable(env, "AVG_REVIEW_MINUTES", AVG_REVIEW_MINUTES),
-               "max_wait_minutes": tunable(env, "MAX_WAIT_HOURS", MAX_WAIT_HOURS) * 60,
-               "no_runner_minutes": tunable(env, "NO_RUNNER_MINUTES", NO_RUNNER_MINUTES)}
         repo = env["GITHUB_REPOSITORY"]
         own = int(env["GITHUB_RUN_ID"])
-        running, waiting = survey(api, repo, own, now)
-        verdict, ahead, eta = decide(running, waiting, cfg)
+
+        # The estimate is measured, not remembered: a constant taken from the longest review
+        # anyone had seen told every requester to expect 2.5x what the box actually does.
+        try:
+            done = api.recent_review_minutes(repo, RECENT_REVIEWS)
+        except Exception as e:  # the ETA is a courtesy, not a gate
+            print("::warning::could not read recent review times (%s: %s); assuming %d min"
+                  % (type(e).__name__, e, AVG_REVIEW_MINUTES))
+            done = []
+        typical = statistics.median(done) if done else AVG_REVIEW_MINUTES
+        if done:
+            print("::notice::eta base: median %.0f min over the last %d review(s)"
+                  % (typical, len(done)))
+        cfg = {"avg_minutes": tunable(env, "AVG_REVIEW_MINUTES", typical),
+               "max_wait_minutes": tunable(env, "MAX_WAIT_HOURS", MAX_WAIT_HOURS) * 60,
+               "no_runner_minutes": tunable(env, "NO_RUNNER_MINUTES", NO_RUNNER_MINUTES)}
+        running, waiting, arriving = survey(api, repo, own, now)
+        verdict, ahead, eta = decide(running, waiting, arriving, cfg)
 
         # One snapshot cannot tell a dead runner from the seconds between one review finishing
         # and the next being picked up: in both, nothing is running and something has been
@@ -165,8 +190,8 @@ def run(api, env, now=None, sleep=time.sleep):
             pause = tunable(env, "RECHECK_SECONDS", RECHECK_SECONDS)
             sleep(pause)
             later = now + datetime.timedelta(seconds=pause)
-            running, waiting = survey(api, repo, own, later)
-            verdict, ahead, eta = decide(running, waiting, cfg)
+            running, waiting, arriving = survey(api, repo, own, later)
+            verdict, ahead, eta = decide(running, waiting, arriving, cfg)
             if verdict != "no-runner":
                 print("::notice::the box was between reviews, not stopped")
 

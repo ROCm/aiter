@@ -4,10 +4,10 @@
 import triton
 import triton.language as tl
 
+from aiter.ops.triton._triton_kernels.common.pid_preprocessing import pid_grid
 from aiter.ops.triton._triton_kernels.quant.quant import _mxfp4_quant_op
 from aiter.ops.triton.rope.rope import _get_gptj_rotated_x_1D, _get_neox_rotated_x_1D
 from aiter.ops.triton.utils._triton.kernel_repr import make_kernel_repr
-from aiter.ops.triton.utils._triton.pid_preprocessing import pid_grid
 from aiter.ops.triton.utils.gemm_config_utils import get_gemm_config
 
 _fused_fp4_bmm_rope_cat_and_cache_mla_repr = make_kernel_repr(
@@ -102,8 +102,6 @@ def _unit_rope(
         "EVEN_K": lambda args: (args["K"] % (args["BLOCK_SIZE_K"] // 2) == 0)
         and (args["SPLITK_BLOCK_SIZE"] % args["BLOCK_SIZE_K"] == 0)
         and (args["K"] % (args["SPLITK_BLOCK_SIZE"] // 2) == 0),
-        "GRID_MN": lambda args: triton.cdiv(args["M"], args["BLOCK_SIZE_M"])
-        * triton.cdiv(args["N"], args["BLOCK_SIZE_N"]),
     }
 )
 @triton.jit(repr=_fused_fp4_bmm_rope_cat_and_cache_mla_repr)
@@ -196,7 +194,6 @@ def _fused_fp4_bmm_rope_cat_and_cache_mla_kernel(
     HAVE_Y_SCALE: tl.constexpr,
     HAVE_K_SCALE: tl.constexpr,
     EVEN_K: tl.constexpr,
-    GRID_MN: tl.constexpr,
     cache_modifier: tl.constexpr = ".ca",
 ):
     """
@@ -245,15 +242,16 @@ def _fused_fp4_bmm_rope_cat_and_cache_mla_kernel(
             c_scale = 1
         c_scale_rcprl = (1 / c_scale).to(tl.float32)
 
-        pid_head = pid // (NUM_KSPLIT * GRID_MN)
-        pid_unified = pid % (NUM_KSPLIT * GRID_MN)
+        grid_mn = num_pid_m * num_pid_n
+        pid_head = pid // (NUM_KSPLIT * grid_mn)
+        pid_unified = pid % (NUM_KSPLIT * grid_mn)
         pid_k = pid_unified % NUM_KSPLIT
         pid_tile = pid_unified // NUM_KSPLIT
 
         pid_head_i64 = tl.cast(pid_head, tl.int64)
 
         if NUM_KSPLIT == 1:
-            # remap_xcd(pid_tile, GRID_MN)
+            # remap_xcd(pid_tile, grid_mn)
             pid_m, pid_n = pid_grid(
                 pid_tile, num_pid_m, num_pid_n, GROUP_SIZE_M=GROUP_SIZE_M
             )
@@ -348,7 +346,7 @@ def _fused_fp4_bmm_rope_cat_and_cache_mla_kernel(
                 c_ptrs = (
                     c_ptr
                     + pid_head_i64 * stride_cb
-                    + pid_k * stride_ck
+                    + pid_k.to(tl.int64) * stride_ck
                     + offs_cm[:, None] * stride_cm
                     + offs_cn[None, :] * stride_cn
                 )
@@ -588,7 +586,7 @@ def _fused_fp4_bmm_reduce_kernel(
     c_in_ptrs = (
         c_in_ptr
         + pid_head * stride_c_in_b
-        + (offs_k[:, None, None] * stride_c_in_k)
+        + (offs_k[:, None, None].to(tl.int64) * stride_c_in_k)
         + (offs_m[None, :, None] * stride_c_in_m)
         + (offs_n[None, None, :] * stride_c_in_n)
     )
@@ -623,8 +621,6 @@ def _fused_fp4_bmm_reduce_kernel(
 @triton.heuristics(
     {
         "EVEN_K": lambda args: args["K"] % args["BLOCK_SIZE_K"] == 0,
-        "GRID_MN": lambda args: triton.cdiv(args["M"], args["BLOCK_SIZE_M"])
-        * triton.cdiv(args["N"], args["BLOCK_SIZE_N"]),
     }
 )
 @triton.jit(repr=_fused_fp8_bmm_rope_cat_and_cache_mla_repr)
@@ -708,7 +704,6 @@ def _fused_fp8_bmm_rope_cat_and_cache_mla_kernel(
     HAVE_K_SCALE: tl.constexpr,
     DTYPE_MAX: tl.constexpr,
     EVEN_K: tl.constexpr,
-    GRID_MN: tl.constexpr,
     cache_modifier: tl.constexpr = ".ca",
 ):
     """
@@ -753,8 +748,9 @@ def _fused_fp8_bmm_rope_cat_and_cache_mla_kernel(
         tl.assume(stride_cm_i64 > 0)
         tl.assume(stride_cn_i64 > 0)
 
-        pid_head = pid // GRID_MN
-        pid_tile = pid % GRID_MN
+        grid_mn = num_pid_m * num_pid_n
+        pid_head = pid // grid_mn
+        pid_tile = pid % grid_mn
 
         pid_head_i64 = tl.cast(pid_head, tl.int64)
 
@@ -1036,6 +1032,21 @@ def _fused_fp8_bmm_rope_cat_and_cache_mla_kernel(
                     kv_cache_ptrs + (d_pe_offs + BLOCK_DK_nope) * kv_cache_stride_d,
                     k_pe_scaled,
                 )
+
+
+def _get_fp4_config(
+    M: int,
+    N: int,
+    K: int,
+):
+    # Own config family: the fused BMM + RoPE grid prefers different tiles
+    # than the standalone batched_gemm_a16wfp4 kernel.
+    return get_gemm_config(
+        "FUSED-FP4-BMM-ROPE-CAT-AND-CACHE-MLA",
+        M,
+        N,
+        2 * K,
+    )
 
 
 def _get_fp8_config(

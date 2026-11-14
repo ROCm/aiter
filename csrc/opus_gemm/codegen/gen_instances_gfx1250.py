@@ -3,9 +3,13 @@
 """Generate gfx1250 OPUS A16W16 launchers."""
 
 import os
-from pathlib import Path
 
-from codegen.common import register_arch_map, register_emit, splitk_workspace_type
+from codegen.common import (
+    register_arch_map,
+    register_emit,
+    splitk_workspace_type,
+    write_if_changed,
+)
 
 # ---------------- gfx1250 arch-override maps ----------------
 
@@ -408,7 +412,7 @@ void
 }}}}
 #endif // launcher only on regular host pass
 """
-    Path(os.path.join(cg.impl_path, f"{k.name}.cuh")).write_text(INSTANCE_IMPL)
+    write_if_changed(os.path.join(cg.impl_path, f"{k.name}.cuh"), INSTANCE_IMPL)
 
     # The <fp32_t> token is the host launch-dispatch specialization. The physical
     # workspace type is independently embedded in the Traits alias above.
@@ -602,7 +606,7 @@ void
 }}}}
 #endif
 """
-    Path(os.path.join(cg.impl_path, f"{k.name}.cuh")).write_text(INSTANCE_IMPL)
+    write_if_changed(os.path.join(cg.impl_path, f"{k.name}.cuh"), INSTANCE_IMPL)
 
     host_decl = (
         f"template void\n"
@@ -640,7 +644,8 @@ def gen_4wave_co_instance(
 
     The launcher uses the repository's existing five-argument non-workspace
     A16W16 ABI. No device instantiation is emitted: the matching device image is
-    loaded from ``gen_co/gfx1250/<symbol>.co`` on first use.
+    selected from the regular or A0 subtree on first use per device/image path,
+    with the same exact kid and symbol on both steppings.
     """
     traits_alias = f"""
 // The pre-built image fixes this complete traits configuration.
@@ -709,8 +714,12 @@ void
     grid_n = (grid_n + Traits::kClusterWgN - 1) /
              Traits::kClusterWgN * Traits::kClusterWgN;
 
-    static AiterAsmKernelFast& kernel =
-        opus_gfx1250_co::co_kernel("{k.name}");
+    AITER_CHECK(XQ.device_id >= 0 && XQ.device_id == WQ.device_id &&
+                XQ.device_id == Y.device_id,
+        "4wave CO inputs/output must share one GPU device");
+    // Resolve against the current device/root, not a process-wide first load.
+    AiterAsmKernelFast& kernel =
+        opus_gfx1250_co::co_kernel("{k.name}", XQ.device_id);
     opus_co_launch_gfx1250<Traits>(
         kernel,
         dim3(grid_m, grid_n, batch),
@@ -720,7 +729,7 @@ void
 }}
 #endif
 """
-    Path(os.path.join(cg.impl_path, f"{k.name}.cuh")).write_text(instance_impl)
+    write_if_changed(os.path.join(cg.impl_path, f"{k.name}.cuh"), instance_impl)
 
     # Intentionally append host instantiations only. This is the compile bypass
     # that keeps release hipcc away from the pin-VGPR device pipeline.

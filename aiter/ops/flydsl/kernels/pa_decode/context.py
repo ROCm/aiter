@@ -10,7 +10,7 @@ Loop-carried softmax and output values are passed as SSA values, not stored here
 import flydsl.expr as fx
 from flydsl.expr import arith, const_expr, gpu, range_constexpr
 
-from .traits import LOG2E, MFMA_MNK, WAVE
+from .traits import FP8_KV_DTYPES, LOG2E, MFMA_MNK, WAVE
 
 
 class PaDecodeContext:
@@ -63,26 +63,25 @@ class PaDecodeContext:
     def init_thread_mapping(self):
         """Resolve the physical grid to a sequence, KV head and partial slot."""
         self.tid = fx.Int32(gpu.thread_id("x"))
+        self.group = None
+        if const_expr(self.traits.DUAL_GROUP):
+            # Two four-wave groups: everything below works on the group-local
+            # thread id; ``group`` picks the tile parity and the LDS copy.
+            self.group = self.tid // self.traits.BLOCK_THREADS
+            self.tid = self.tid - self.group * self.traits.BLOCK_THREADS
         self.warp = self.tid // WAVE  # 0..NWARP-1
         self.lane = self.tid - self.warp * WAVE  # 0..63
         self.seq = self.planned_seq
-        self.kv_query = fx.Int32(gpu.block_id("y"))
+        # A split-major grid puts (KV head, query split) on x, the slot on y.
+        qx, px = ("x", "y") if self.traits.SPLIT_MAJOR else ("y", "x")
+        self.kv_query = fx.Int32(gpu.block_id(qx))
         self.kv_h = self.kv_query // self.traits.query_splits
         self.query_begin = (
             self.kv_query % self.traits.query_splits
         ) * self.traits.QUERIES_PER_CTA
-        self.n_kv = fx.Int32(gpu.grid_dim.y) // self.traits.query_splits
-        if const_expr(self.traits.batch_first_plan_grid):
-            self.part = fx.Int32(
-                fx.Uint32(gpu.block_id("x")) * fx.Uint32(gpu.grid_dim.z)
-                + fx.Uint32(gpu.block_id("z"))
-            )
-            # Physical x groups packed slots, not sequences.
-            capacity = fx.Int32(fx.Uint32(gpu.grid_dim.x) * fx.Uint32(gpu.grid_dim.z))
-            self.partial_slot = self.kv_h * capacity + self.part
-        else:
-            self.part = fx.Int32(gpu.block_id("x"))
-            self.partial_slot = self.kv_h * fx.Int32(gpu.grid_dim.x) + self.part
+        self.n_kv = fx.Int32(getattr(gpu.grid_dim, qx)) // self.traits.query_splits
+        self.part = fx.Int32(gpu.block_id(px))
+        self.partial_slot = self.kv_h * fx.Int32(getattr(gpu.grid_dim, px)) + self.part
 
     def init_query_mapping(self):
         self.rgroup = (
@@ -104,9 +103,17 @@ class PaDecodeContext:
         ) // self.traits.block_size  # pages this sequence really owns
         self.part_start = self.planned_start
         self.part_end = self.planned_end
+        if const_expr(self.traits.DUAL_GROUP):
+            # Group g walks tiles planned_start + g, + 2, ...; both groups run
+            # the same iteration count (group 1's last may lie past the task,
+            # fully masked) so their CTA barriers pair up.
+            self.dual_iters = (self.planned_end - self.planned_start + 1) // 2
+            self.part_start = self.planned_start + self.group
 
     def init_scales(self, key_scale, value_scale):
-        if const_expr(self.traits.per_token_kv or self.traits.is_bf16_kv):
+        if const_expr(
+            self.traits.per_token_kv or self.traits.kv_dtype not in FP8_KV_DTYPES
+        ):
             self.scale_qk = fx.Float32(self.traits.softmax_scale * LOG2E)
         else:
             self.scale_qk = fx.Float32(self.traits.softmax_scale * LOG2E) * fx.Float32(

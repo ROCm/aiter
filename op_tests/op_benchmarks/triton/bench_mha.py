@@ -8,7 +8,9 @@ from dataclasses import dataclass
 import torch
 import triton
 
-from aiter.ops.triton._triton_kernels.flash_attn_triton_amd.utils import get_arch
+from aiter.ops.triton._triton_kernels.attention.dao_ai.utils import (
+    get_arch,
+)
 from aiter.ops.triton.attention.mha import (
     flash_attn_func,
     flash_attn_varlen_func,
@@ -369,7 +371,7 @@ def model_benchmark_configs(
             if config["num_key_value_heads"] is None
             else config["num_key_value_heads"]
         )
-        HEAD_DIM = config["hidden_size"] // HQ
+        HEAD_DIM = config.get("head_dim", config["hidden_size"] // HQ)
         if args.sq:
             b = args.b if args.b else 1
             causal = args.causal if args.causal is not None else True
@@ -434,7 +436,9 @@ def pad_rearrange_dropout_mask(
     batch_size = cu_seqlens_q.numel() - 1
 
     padded_dropout_mask = torch.ones(
-        (batch_size, num_q_heads, seqlen_q, seqlen_k), device="cuda"
+        (batch_size, num_q_heads, seqlen_q, seqlen_k),
+        device="cuda",
+        dtype=torch.float32,
     )
     for b in range(batch_size):
         start_q = cu_seqlens_q[b].item()
@@ -1009,7 +1013,7 @@ def parse_args(args: list[str] | None = None) -> BenchRun:
         type=str,
         default="default",
         choices=["default", "dao_ai"],
-        help="MHA forward implementation: default (_attn_fwd) or dao_ai (flash_attn_triton_amd)",
+        help="MHA forward implementation: default (_attn_fwd) or dao_ai (Dao-AI FlashAttention)",
     )
     parser.add_argument(
         "--window-size-left",

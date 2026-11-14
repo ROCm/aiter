@@ -6,14 +6,40 @@
 import flydsl.compiler as flyc
 import flydsl.expr as fx
 from flydsl.compiler.protocol import dsl_size_of
-from flydsl.expr import const_expr, range_constexpr
+from flydsl.expr import arith, const_expr, range_constexpr
 from flydsl.expr import math as fmath
-from flydsl.expr.typing import ReductionOp
+from flydsl.expr.typing import ReductionOp, T
 
 from .. import dpp_utils
-from ..tensor_shim import ptr_buf_tensor
+from ..kernels_common import create_llvm_ptr
+from ..mxfp4_gemm_common import _e8m0_byte_to_f32
+from ..tensor_shim import buf_base_i64, ptr_buf_tensor
 from ..utils import rcp_f32
-from .traits import MFMA_MNK
+from .traits import (
+    FP8_KV_DTYPES,
+    KV_COMPUTE_BLOCK,
+    MFMA_MNK,
+    MXFP4_KV_DTYPE,
+    MXFP4_V_BF16_CHUNK_BYTES,
+)
+
+
+def _gptr(base, elem_ty, align):
+    ty = fx.PointerType.get(elem_ty.ir_type, fx.AddressSpace.Global, align)
+    return fx.recast_iter(ty, base)
+
+
+def _fp4_dword_to_bf16(word, scale_f32):
+    """One dword of 8 packed e2m1, times ``scale_f32``, as 8 bf16 in element order."""
+    w = fx.as_ir_value(fx.Int32(word))
+    sc = fx.as_ir_value(scale_f32)
+    elems = []
+    for sel in range_constexpr(4):
+        pair = fx.Vector(
+            fx.rocdl.cvt_scalef32_pk_bf16_fp4(T.vec(2, T.bf16), w, sc, sel)
+        )
+        elems += [fx.BFloat16(pair[0]), fx.BFloat16(pair[1])]
+    return elems
 
 
 class PaDecodeLds:
@@ -23,11 +49,26 @@ class PaDecodeLds:
         self.traits = traits
         self.storage_type = storage_type
 
-    def allocate(self):
+    def allocate(self, group=None):
         # Keep an ir.Value pointer for use inside scf control flow;
         # the Python SharedStorage handle cannot cross that boundary.
         lds = fx.SharedAllocator().allocate(self.storage_type).peek()
         self.base = fx.recast_iter(fx.Uint8, lds.buf.ptr)  # byte-addressed base
+        self.root = self.base
+        if group is not None:
+            # Each dual group addresses its own copy of the layout.
+            self.base = fx.add_offset(
+                self.base,
+                fx.make_int_tuple(group * self.traits.GROUP_LDS_BYTES),
+            )
+
+    def root_pointer(self, byte_off, elem_ty):
+        """Like ``pointer`` but from the start of the whole allocation."""
+        p = fx.add_offset(self.root, fx.make_int_tuple(byte_off))
+        ptr_ty = fx.PointerType.get(
+            elem_ty.ir_type, fx.AddressSpace.Shared, dsl_size_of(elem_ty)
+        )
+        return fx.recast_iter(ptr_ty, p)
 
     def pointer(self, byte_off, elem_ty):
         # Restore element alignment lost by the byte-base recast.
@@ -82,16 +123,17 @@ class PaDecodeQueryLoader:
         self.gemm = gemm
 
     def init_loaders(self):
+        q_dtype = self.traits.query_dtype
         _q_copy_op = (
             fx.rocdl.BufferCopy128b()
-            if self.traits.QLOAD_UNIT == 8
+            if self.traits.QLOAD_UNIT * dsl_size_of(q_dtype) == 16
             else fx.rocdl.BufferCopy64b()
         )
-        self.q_buf = ptr_buf_tensor(self.ctx.query_ptr, self.traits.Q_DTYPE)
+        self.q_buf = ptr_buf_tensor(self.ctx.query_ptr, q_dtype)
         self.q_tiled = fx.logical_divide(self.q_buf, fx.make_layout(1, 1))
-        self.q_copy_atom = fx.make_copy_atom(_q_copy_op, self.traits.Q_DTYPE)
+        self.q_copy_atom = fx.make_copy_atom(_q_copy_op, q_dtype)
         self.q_reg = fx.make_rmem_tensor(
-            fx.make_layout(self.traits.QLOAD_UNIT, 1), self.traits.Q_DTYPE
+            fx.make_layout(self.traits.QLOAD_UNIT, 1), q_dtype
         )
 
     def load_chunk(self, elem_idx):
@@ -100,26 +142,45 @@ class PaDecodeQueryLoader:
 
     def load_row(self, qi, gs_head):
         qh0 = self.ctx.kv_h * self.traits.query_group_size + gs_head
+        qb = dsl_size_of(self.traits.query_dtype)
         row_byte0 = (
             (self.ctx.seq * self.traits.query_length + self.ctx.query_begin + qi)
             * self.ctx.stride_q_row
             + qh0 * self.ctx.stride_q_head
-        ) * 2  # 16-bit float = 2B/elem
+        ) * qb
         base_elem = (
-            row_byte0 + self.ctx.lane16 * (self.traits.QCHUNK * 2)
-        ) // 2  # byte offset -> element index
+            row_byte0 + self.ctx.lane16 * (self.traits.QCHUNK * qb)
+        ) // qb  # byte offset -> element index
         return [
             self.load_chunk(base_elem + u * self.traits.QLOAD_UNIT)
             for u in range_constexpr(self.traits.N_QLOADS)
         ]
 
+    def _q_early(self):
+        # MXFP4: Q ahead of the K/V bursts, so its staging does not wait for them
+        # (a padded row would read past the query). gfx942 clamps padded rows
+        # to the last real one instead; staging zeroes them.
+        return (
+            self.traits.MTP4_FUSED
+            or self.traits.DECODE_Q_EARLY
+            or self.traits.GFX942_Q_EARLY
+            or (
+                (self.traits.kv_dtype == MXFP4_KV_DTYPE)
+                and self.traits.CTA_ROWS % MFMA_MNK == 0
+            )
+        )
+
     def prefetch(self):
         # Issue independent Q loads ahead of K/page/scale prefetch.
         q_units_prefetched = None
-        if const_expr(self.traits.MTP4_FUSED):
+        if const_expr(self._q_early()):
             q_units_prefetched = []
             for m in range_constexpr(self.traits.M_TILES):
                 flat_idx = m * MFMA_MNK + self.ctx.qh_local
+                if const_expr((m + 1) * MFMA_MNK > self.traits.CTA_ROWS):
+                    # Keep padded rows' loads inside the query.
+                    last = fx.Int32(self.traits.CTA_ROWS - 1)
+                    flat_idx = (flat_idx < last).select(flat_idx, last)
                 qi = flat_idx // self.traits.query_group_size
                 gs_head = flat_idx - qi * self.traits.query_group_size
                 q_units_prefetched.append(self.load_row(qi, gs_head))
@@ -128,32 +189,94 @@ class PaDecodeQueryLoader:
     def local_absmax(self, q_unit):
         if const_expr(self.traits.Q_ABSMAX_F32):
             return fmath.absf(q_unit.to(fx.Float32)).reduce(ReductionOp.MAX)
-        else:
-            return fmath.absf(q_unit).reduce(ReductionOp.MAX).to(fx.Float32)
+        if const_expr(
+            self.traits.packed_q_absmax
+            and self.traits.query_dtype in (fx.BFloat16, fx.Float16)
+            and q_unit.shape[0] % 2 == 0
+        ):
+            # |x| of a 16-bit float orders like its sign-cleared bit pattern,
+            # so a packed 16-bit integer max over whole words replaces the
+            # per-element widen-and-max; one conversion follows.
+            words = q_unit.bitcast(fx.Int32)
+            m = None
+            for i in range_constexpr(q_unit.shape[0] // 2):
+                mag = fx.Vector.from_elements(
+                    [fx.Int32(words[i]) & fx.Int32(0x7FFF7FFF)], dtype=fx.Int32
+                ).bitcast(fx.Int16)
+                m = (
+                    mag
+                    if m is None
+                    else fx.Vector(arith.maxsi(fx.as_ir_value(m), fx.as_ir_value(mag)))
+                )
+            m = fx.Int32(m.bitcast(fx.Int32)[0])
+            high = fx.Int32(fx.Uint32(m) >> 16)
+            low = m & fx.Int32(0xFFFF)
+            mx = (low > high).select(low, high)
+            return (
+                fx.Vector.from_elements([mx], dtype=fx.Int32)
+                .bitcast(self.traits.query_dtype)[0]
+                .to(fx.Float32)
+            )
+        return fmath.absf(q_unit).reduce(ReductionOp.MAX).to(fx.Float32)
+
+    def _packed_absmax(self):
+        return (
+            self.traits.packed_q_absmax
+            and not self.traits.Q_ABSMAX_F32
+            and self.traits.query_dtype in (fx.BFloat16, fx.Float16)
+            and self.traits.QLOAD_UNIT % 2 == 0
+        )
+
+    def row_absmax(self, q_units):
+        """max |q| over this row's 16 lanes, as f32."""
+        if const_expr(not self._packed_absmax()):
+            absmax = self.local_absmax(q_units[0])
+            for u in range_constexpr(1, self.traits.N_QLOADS):
+                absmax = fx.maxnumf(absmax, self.local_absmax(q_units[u]))
+            for sh in (8, 4, 2, 1):
+                absmax = fx.maxnumf(absmax, dpp_utils.dpp_xor_f32(absmax, sh))
+            return absmax
+        # Non-negative f32 values order like their bits: reduce the bits with
+        # integer max, whose DPP forms fold into the max (rotate by 8 and 4
+        # within the row, then the two quad swaps, cover all 16 lanes).
+        bits = None
+        for u in range_constexpr(self.traits.N_QLOADS):
+            b = fx.Int32(
+                fx.Vector.from_elements(
+                    [self.local_absmax(q_units[u])], dtype=fx.Float32
+                ).bitcast(fx.Int32)[0]
+            )
+            bits = (
+                b
+                if bits is None
+                else fx.Int32(arith.maxui(fx.as_ir_value(bits), fx.as_ir_value(b)))
+            )
+        for ctrl in (0x128, 0x124, 0x4E, 0xB1):  # row_ror:8, row_ror:4, quad swaps
+            other = fx.Int32(dpp_utils.update_dpp_i32(bits, bits, ctrl, 0xF, 0xF, True))
+            bits = fx.Int32(arith.maxui(fx.as_ir_value(bits), fx.as_ir_value(other)))
+        return fx.Vector.from_elements([bits], dtype=fx.Int32).bitcast(fx.Float32)[0]
 
     @flyc.jit
     def quantize_row(self, m, q_row_off, q_units):
         """Each M-tile owns disjoint rows; only scale publication needs a lane guard."""
-        absmax = self.local_absmax(q_units[0])
-        for u in range_constexpr(1, self.traits.N_QLOADS):
-            absmax = fx.maxnumf(
-                absmax,
-                self.local_absmax(q_units[u]),
-            )
-        for sh in (8, 4, 2, 1):
-            absmax = fx.maxnumf(absmax, dpp_utils.dpp_xor_f32(absmax, sh))
+        absmax = self.row_absmax(q_units)
 
         q_scale = absmax * fx.Float32(1.0 / self.traits.FP8_MAX)
-        inv = fx.Float32(rcp_f32(fx.maxnumf(q_scale, fx.Float32(1e-20))))
-        inv_b = fx.Vector.from_elements([inv], dtype=fx.Float32).broadcast_to(
-            self.traits.QLOAD_UNIT
-        )
+        if const_expr(self.traits.kv_dtype == MXFP4_KV_DTYPE):
+            # Published scale is a normal f32: the QK MFMA takes its exponent as the
+            # e8m0 byte of Q (see single_query_tile_mxfp4). The floor keeps 1/0 finite
+            # and still leaves a bf16 subnormal row (>= 2**-133) inside e4m3.
+            q_scale = fx.maxnumf(q_scale, fx.Float32(1.17549435e-38))
+            inv = fx.Float32(rcp_f32(q_scale))
+        else:
+            inv = fx.Float32(rcp_f32(fx.maxnumf(q_scale, fx.Float32(1e-20))))
+        inv_b = fx.full(self.traits.QLOAD_UNIT, inv, fx.Float32)
 
         for u in range_constexpr(self.traits.N_QLOADS):
             q_scaled_unit = q_units[u].to(fx.Float32) * inv_b
             self.lds.store_words(
                 q_row_off
-                + self.ctx.qh_local * self.traits.head_dim
+                + self.ctx.qh_local * self.traits.Q_ROW_BYTES
                 + self.ctx.lane16 * self.traits.QCHUNK
                 + u * self.traits.QLOAD_UNIT,
                 self.gemm.fp8_words(q_scaled_unit),
@@ -168,7 +291,7 @@ class PaDecodeQueryLoader:
 
     @flyc.jit
     def stage_row(self, m, q_row_off, q_units):
-        if const_expr(self.traits.is_bf16_kv):
+        if const_expr(self.traits.kv_dtype == fx.BFloat16):
             for u in range_constexpr(self.traits.N_QLOADS):
                 elem_off = (
                     self.ctx.qh_local * self.traits.head_dim
@@ -176,6 +299,19 @@ class PaDecodeQueryLoader:
                     + u * self.traits.QLOAD_UNIT
                 )
                 self.lds.store(q_row_off + elem_off * 2, fx.BFloat16, q_units[u])
+        elif const_expr(self.traits.query_dtype == fx.Float8E4M3FN):
+            self.lds.store_words(
+                q_row_off
+                + self.ctx.qh_local * self.traits.Q_ROW_BYTES
+                + self.ctx.lane16 * self.traits.QCHUNK,
+                q_units[0].bitcast(fx.Int32),
+            )
+            if self.ctx.lane16 == 0:
+                self.lds.store_scalar(
+                    self.traits.sQscale_off,
+                    self.ctx.qh_local * self.traits.M_TILES + m,
+                    fx.Float32(1.0),
+                )
         else:
             self.quantize_row(m, q_row_off, q_units)
 
@@ -185,19 +321,27 @@ class PaDecodeQueryLoader:
             flat_idx = m * MFMA_MNK + self.ctx.qh_local
             qi = flat_idx // self.traits.query_group_size
             gs_head = flat_idx - qi * self.traits.query_group_size
-            q_row_off = m * MFMA_MNK * self.traits.head_dim * self.traits.QP_ELEM_BYTES
+            q_row_off = m * MFMA_MNK * self.traits.Q_ROW_BYTES
             # Only the final M-tile can need a runtime row guard.
             if const_expr((m + 1) * MFMA_MNK <= self.traits.CTA_ROWS):
                 q_units = (
                     q_units_prefetched[m]
-                    if const_expr(self.traits.MTP4_FUSED)
+                    if const_expr(self._q_early())
                     else self.load_row(qi, gs_head)
                 )
                 self.stage_row(m, q_row_off, q_units)
             elif flat_idx < self.traits.CTA_ROWS:
-                self.stage_row(m, q_row_off, self.load_row(qi, gs_head))
+                self.stage_row(
+                    m,
+                    q_row_off,
+                    (
+                        q_units_prefetched[m]
+                        if const_expr(self._q_early())
+                        else self.load_row(qi, gs_head)
+                    ),
+                )
             else:
-                if const_expr(self.traits.is_bf16_kv):
+                if const_expr(self.traits.kv_dtype == fx.BFloat16):
                     for u in range_constexpr(self.traits.N_QLOADS):
                         elem_off = (
                             self.ctx.qh_local * self.traits.head_dim
@@ -207,14 +351,14 @@ class PaDecodeQueryLoader:
                         self.lds.store(
                             q_row_off + elem_off * 2,
                             fx.BFloat16,
-                            fx.Vector.filled(self.traits.QLOAD_UNIT, 0.0, fx.BFloat16),
+                            fx.full(self.traits.QLOAD_UNIT, 0.0, fx.BFloat16),
                         )
                 else:
                     self.lds.store_words(
                         q_row_off
-                        + self.ctx.qh_local * self.traits.head_dim
+                        + self.ctx.qh_local * self.traits.Q_ROW_BYTES
                         + self.ctx.lane16 * self.traits.QCHUNK,
-                        fx.Vector.filled(self.traits.QCHUNK // 4, 0, fx.Int32),
+                        fx.full(self.traits.QCHUNK // 4, 0, fx.Int32),
                     )
                     if self.ctx.lane16 == 0:
                         self.lds.store_scalar(
@@ -224,6 +368,8 @@ class PaDecodeQueryLoader:
                         )
 
     def load_operands(self):
+        if const_expr(self.traits.kv_dtype == MXFP4_KV_DTYPE):
+            return self._load_operands_mxfp4()
         # Match the head-dim permutation of PaDecodeKVLoader.load_k_chunk.
         q_ops_all = []
         for m in range_constexpr(self.traits.M_TILES):
@@ -238,11 +384,51 @@ class PaDecodeQueryLoader:
                     )
                     * self.traits.QP_ELEM_BYTES,
                     fx.Int64,
-                    4 if self.traits.is_bf16_kv else 2,
+                    4 if self.traits.kv_dtype == fx.BFloat16 else 2,
                 )
-                for qkr in range_constexpr(4 if self.traits.is_bf16_kv else 2):
+                for qkr in range_constexpr(
+                    4 if self.traits.kv_dtype == fx.BFloat16 else 2
+                ):
                     q_ops_all.append(chunk[qkr])
         return q_ops_all
+
+    def load_operands_m(self, m):
+        """One M-tile's QK B operands, reread from LDS (FP8_MTP4_Q_LDS).
+
+        Volatile: the reread must not be hoisted out of the tile loop, where
+        it would hold the registers it exists to free.
+        """
+        ops = []
+        for qkhe in range_constexpr(self.traits.QKHE_LOOP):
+            he_idx = qkhe * self.traits.RGROUP_QUARTERS + self.ctx.rgroup
+            chunk = fx.generic_load(
+                self.lds.pointer(
+                    m * MFMA_MNK * self.traits.Q_ROW_BYTES
+                    + self.ctx.lane16 * self.traits.Q_ROW_BYTES
+                    + he_idx * self.traits.QK_CHUNK_ELEMS,
+                    fx.Int64,
+                ),
+                dtype=fx.Int64,
+                count=2,
+                volatile=True,
+            )
+            ops.extend([chunk[0], chunk[1]])
+        return ops
+
+    def _load_operands_mxfp4(self):
+        """B operand of the scaled MFMA: head ``lane16``, bytes 16*rgroup..+15 and
+        64 + 16*rgroup..+15 of its E4M3 Q row (the layout measured for fp8 B with an
+        fp4 A, whose lane holds one 32-element e8m0 group)."""
+        row = self.ctx.lane16 * self.traits.head_dim + self.ctx.rgroup * 16
+        lo = self.lds.load(row, fx.Int32, 4)
+        hi = self.lds.load(row + 64, fx.Int32, 4)
+        return [
+            fx.Vector.from_elements(
+                [lo[i] for i in range_constexpr(4)]
+                + [hi[i] for i in range_constexpr(4)],
+                dtype=fx.Int32,
+            )
+        ]
 
 
 class PaDecodeKVLoader:
@@ -283,19 +469,53 @@ class PaDecodeKVLoader:
 
         return _load
 
+    def _make_nt_k_loader(self, tensor_ptr, elem_bytes=1):
+        # K on the pipe is a flat global_load_dwordx4 with !nontemporal.
+        # V stays on the cached copy.
+        base = buf_base_i64(tensor_ptr)
+        ptr_ty = fx.PointerType.get(
+            fx.Int32.ir_type,
+            address_space=fx.AddressSpace.Global,
+            alignment=16,
+        )
+
+        def _load(elem_idx):
+            # FP8 elements are one byte, so the element index is the byte offset.
+            # inttoptr, not add_offset: the GEP form reschedules the K loads and
+            # splits their vmcnt waits (q4 loop: one wait becomes seven).
+            off = fx.Int64(elem_idx)
+            if const_expr(elem_bytes != 1):
+                off = off * elem_bytes
+            ptr = fx.Pointer(fx.inttoptr(ptr_ty, base + off))
+            return fx.generic_load(ptr, dtype=fx.Int32, count=4, nontemporal=True)
+
+        return _load
+
     def init_loaders(self):
-        self._k_load_vector = self._make_raw_flat_loader(
-            self.ctx.key_cache_ptr,
-            self.traits.KV_DTYPE,
-            self.traits.KV_VECTOR_WIDTH,
-            self.traits.KV_EXTENT,
-        )
-        self._v_load_vector = self._make_raw_flat_loader(
-            self.ctx.value_cache_ptr,
-            self.traits.KV_DTYPE,
-            self.traits.KV_VECTOR_WIDTH,
-            self.traits.KV_EXTENT,
-        )
+        if const_expr(self.traits.kv_dtype == MXFP4_KV_DTYPE):
+            return
+        if const_expr(self.traits.BF16_DECODE_NT_KV):
+            self._k_load_vector = self._make_nt_k_loader(self.ctx.key_cache_ptr, 2)
+            self._v_load_vector = self._make_nt_k_loader(self.ctx.value_cache_ptr, 2)
+            return
+        if const_expr(self.traits.D256_PIPE):
+            self._k_load_vector = self._make_nt_k_loader(self.ctx.key_cache_ptr)
+        else:
+            self._k_load_vector = self._make_raw_flat_loader(
+                self.ctx.key_cache_ptr,
+                self.traits.kv_dtype,
+                self.traits.KV_VECTOR_WIDTH,
+                self.traits.KV_EXTENT,
+            )
+        if const_expr(self.traits.FP8_DECODE_NT_V):
+            self._v_load_vector = self._make_nt_k_loader(self.ctx.value_cache_ptr)
+        else:
+            self._v_load_vector = self._make_raw_flat_loader(
+                self.ctx.value_cache_ptr,
+                self.traits.kv_dtype,
+                self.traits.KV_VECTOR_WIDTH,
+                self.traits.KV_EXTENT,
+            )
 
     def kv_address(self, phys, page_elems, rest):
         if const_expr(self.traits.BUFFER_KV):
@@ -325,7 +545,18 @@ class PaDecodeKVLoader:
             unit_stride=1,
             num_records_bytes=bt_num_records_bytes,
         )
-        if const_expr(not self.traits.per_token_kv and not self.traits.is_bf16_kv):
+        self.bt_scalar = (
+            self.bt_buf
+            if const_expr(self.traits.PAGES_PER_CHUNK == 1)
+            else ptr_buf_tensor(
+                self.ctx.block_tables_ptr,
+                fx.Int32,
+                num_records_bytes=bt_num_records_bytes,
+            )
+        )
+        if const_expr(
+            self.traits.kv_dtype in FP8_KV_DTYPES and not self.traits.per_token_kv
+        ):
             key_scale_buf = ptr_buf_tensor(self.ctx.key_scale_ptr, fx.Float32)
             value_scale_buf = ptr_buf_tensor(self.ctx.value_scale_ptr, fx.Float32)
             self.key_scale = fx.Float32(key_scale_buf[0])
@@ -371,13 +602,43 @@ class PaDecodeKVLoader:
         )
         return fx.Vector(fx.memref_load_vec(self.v_scale_reg))
 
+    def _table_page(self, page):
+        element_offset = self.ctx.seq * self.ctx.max_blocks_per_seq + page
+        result = self.bt_scalar[element_offset]
+        return (page < self.ctx.num_pages).select(fx.Int32(result), fx.Int32(0))
+
+    @flyc.jit
+    def _staged_page(self, page):
+        """Page id from LDS, or the block table when the index is outside it.
+
+        A task can own more pages than ``max_context_length`` staged. The
+        table load stays in the other branch so an in-window page does not
+        wait on it.
+        """
+        rel = page - self.ctx.part_start * (KV_COMPUTE_BLOCK // self.traits.block_size)
+        page_id = fx.Int32(0)
+        if (rel >= 0) & (rel < self.traits.stage_page_capacity):
+            page_id = fx.Int32(
+                self.lds.load(self.traits.sPages_off + rel * 4, fx.Int32, 1)[0]
+            )
+        else:
+            page_id = self._table_page(page)
+        return page_id
+
     def load_pages(self, page, vec_width=1):
         # Even an in-bounds table entry can contain a stale page ID beyond
         # this context. Pin those pages to block 0 before loading K/V.
-        element_offset = self.ctx.seq * self.ctx.max_blocks_per_seq + page
+        # Staged ids were pinned the same way when they were stored.
+        if const_expr(self.traits.stage_page_capacity):
+            if const_expr(vec_width == 1):
+                return self._staged_page(page)
+            return fx.Vector.from_elements(
+                [self._staged_page(page + i) for i in range_constexpr(vec_width)],
+                dtype=fx.Int32,
+            )
         if const_expr(vec_width == 1):
-            result = self.bt_buf[element_offset]
-            return (page < self.ctx.num_pages).select(fx.Int32(result), fx.Int32(0))
+            return self._table_page(page)
+        element_offset = self.ctx.seq * self.ctx.max_blocks_per_seq + page
         bt_copy_atom = fx.make_copy_atom(fx.rocdl.BufferCopy128b(), fx.Int32)
         frag = fx.make_fragment_like(fx.slice(self.bt_buf, (0, None)))
         fx.copy(
@@ -404,20 +665,24 @@ class PaDecodeKVLoader:
                 phys_vec,
             )
 
-    def fetch_v_pages(self, tt_i32):
+    def load_tile_pages(self, tt_i32):
+        """This wave's page ids of tile ``tt_i32``, without staging them."""
         base_page = (
-            tt_i32 * self.traits.TILE_TOK // self.traits.block_size
+            tt_i32 * KV_COMPUTE_BLOCK // self.traits.block_size
         )  # tile start is page-aligned
         fetched = self.load_pages(
             base_page
             + (self.ctx.warp * self.traits.TOK_PER_WARP) // self.traits.block_size,
             self.traits.PAGES_PER_CHUNK,
         )
-        fetched_vec = (
-            fx.Vector.from_elements([fx.Int32(fetched)], dtype=fx.Int32)
+        return (
+            fx.Vector.from_elements([fetched], dtype=fx.Int32)
             if const_expr(self.traits.PAGES_PER_CHUNK == 1)
             else fx.Vector(fetched)
         )
+
+    def fetch_v_pages(self, tt_i32):
+        fetched_vec = self.load_tile_pages(tt_i32)
         self.stage_v_pages(fetched_vec)
         return fetched_vec
 
@@ -436,7 +701,27 @@ class PaDecodeKVLoader:
             return (tt_val & fx.Int32(1)) * self.traits.KV_BUF_STRIDE
         return 0
 
-    def stage_scales(self, phys_vec, buf_off=0):
+    def _context_scales(self, scales, remaining):
+        """Zero scales of tokens at or past the context length.
+
+        P is zero there, but a NaN or infinite V scale still makes P * scale
+        NaN. ``remaining`` counts valid tokens from the vector's first element.
+        """
+        if const_expr(not self.traits.mask_unowned_kv):
+            return scales
+        zero = fx.Float32(0.0)
+        return fx.Vector.from_elements(
+            [
+                (remaining > i).select(fx.Float32(scales[i]), zero)
+                for i in range_constexpr(scales.shape[0])
+            ],
+            dtype=fx.Float32,
+        )
+
+    def stage_scales(self, phys_vec, buf_off, tt, defer=False):
+        """Stage tile ``tt``'s K/V scales in LDS; ``defer`` (page64/128) only
+        loads them and returns the ``(offset, values)`` stores to issue later."""
+        tile_valid = self.ctx.context_len - tt * KV_COMPUTE_BLOCK
         if const_expr(self.traits.block_size >= 64):
             phys = fx.Int32(phys_vec[0])
             chunk_tok = (
@@ -452,17 +737,18 @@ class PaDecodeKVLoader:
                 + self.ctx.kv_h * self.ctx.stride_ks_head
                 + page_tok
             )
-            k_scale_vec = self.load_k_scale(scale_idx)
-            v_scale_vec = self.load_v_scale(scale_idx)
-            slot = (
-                self.ctx.warp * self.traits.TOK_PER_WARP + chunk_tok
-            ) * self.traits.f32
-            self.lds.store(
-                self.traits.sKScale_off + buf_off + slot, fx.Float32, k_scale_vec
-            )
-            self.lds.store(
-                self.traits.sVScale_off + buf_off + slot, fx.Float32, v_scale_vec
-            )
+            tile_tok = self.ctx.warp * self.traits.TOK_PER_WARP + chunk_tok
+            remaining = tile_valid - tile_tok
+            k_scale_vec = self._context_scales(self.load_k_scale(scale_idx), remaining)
+            v_scale_vec = self._context_scales(self.load_v_scale(scale_idx), remaining)
+            slot = tile_tok * self.traits.f32
+            stores = [
+                (self.traits.sKScale_off + buf_off + slot, k_scale_vec),
+                (self.traits.sVScale_off + buf_off + slot, v_scale_vec),
+            ]
+            if const_expr(defer):
+                return stores
+            self.store_scales(stores)
         else:
             # Each rgroup stages its own page16 sub-block.
             phys = fx.Int32(fx.Vector(phys_vec)[self.ctx.rgroup])
@@ -474,11 +760,16 @@ class PaDecodeKVLoader:
             k_scale_scalar = fx.Float32(self.load_k_scale(scale_idx)[0])
             v_scale_scalar = fx.Float32(self.load_v_scale(scale_idx)[0])
             fx.rocdl.sched_barrier(fx.rocdl.mask_vmem_rd)
-            slot = (
+            tile_tok = (
                 self.ctx.warp * self.traits.TOK_PER_WARP
                 + self.ctx.rgroup * MFMA_MNK
                 + self.ctx.lane16
-            ) * self.traits.f32
+            )
+            if const_expr(self.traits.mask_unowned_kv):
+                in_context = tile_tok < tile_valid
+                k_scale_scalar = in_context.select(k_scale_scalar, fx.Float32(0.0))
+                v_scale_scalar = in_context.select(v_scale_scalar, fx.Float32(0.0))
+            slot = tile_tok * self.traits.f32
             self.lds.store(
                 self.traits.sKScale_off + buf_off + slot,
                 fx.Float32,
@@ -489,6 +780,10 @@ class PaDecodeKVLoader:
                 fx.Float32,
                 fx.Vector.from_elements([v_scale_scalar], dtype=fx.Float32),
             )
+
+    def store_scales(self, stores):
+        for off, vec in stores:
+            self.lds.store(off, fx.Float32, vec)
 
     def load_scale(self, base_off, a, buf_off=0):
         slot = (
@@ -503,16 +798,18 @@ class PaDecodeKVLoader:
             self.traits.sVScale_off, a, buf_off
         )
 
-    def load_k_chunk(self, phys, a):
+    def load_k_chunk(self, phys, a, qkhe_lo=0, qkhe_hi=None):
         # K token = warp*TOK_PER_WARP + a*MFMA_MNK + lane16, matching the
         # softmax mask and probability-word scatter.
         within_page_tok = (
             self.ctx.warp * self.traits.TOK_PER_WARP + a * MFMA_MNK + self.ctx.lane16
         ) % self.traits.block_size
         ops = []
-        for qkhe in range_constexpr(self.traits.QKHE_LOOP):
+        if qkhe_hi is None:
+            qkhe_hi = self.traits.QKHE_LOOP
+        for qkhe in range_constexpr(qkhe_lo, qkhe_hi):
             he_idx = qkhe * self.traits.RGROUP_QUARTERS + self.ctx.rgroup
-            if const_expr(self.traits.is_bf16_kv):
+            if const_expr(self.traits.kv_dtype == fx.BFloat16):
                 for qkr in range_constexpr(2):
                     he8_idx = he_idx * 2 + qkr
                     base = self.kv_address(
@@ -550,6 +847,149 @@ class PaDecodeKVLoader:
                 fx.rocdl.sched_barrier(fx.rocdl.mask_vmem_rd)
         return ops  # N_SUBCHUNKS i64 operands
 
+    # ---- MXFP4 K/V: packed E2M1 data + E8M0 scales (per 32 dims), loaded raw one tile
+    # ahead; K stays packed for the scaled MFMA, V is widened to BF16. Per 16-token
+    # chunk a, lane (lane16, rgroup) loads token warp*64 + 16a + lane16: 16 B of K and V
+    # (dims 32*rgroup..+31) and the token's scale dword (byte rgroup).
+
+    def mxfp4_init(self):
+        c = self.ctx
+        self.mxfp4_warp = fx.Int32(fx.rocdl.readfirstlane(T.i32, c.warp))
+        row = (self.mxfp4_warp % 2) * 64 + c.lane16  # token row of chunk 0 in its page
+        self.mxfp4_data_off = (
+            row * 64 + c.rgroup * 16
+        )  # byte offsets, chunk a adds 1024 * a
+        self.mxfp4_scale_off = row * 4  # chunk a adds 64 * a
+        self.mxfp4_ptr = {
+            n: _gptr(p, fx.Int32, al)
+            for n, p, al in (
+                ("kd", c.key_cache_ptr, 16),
+                ("vd", c.value_cache_ptr, 16),
+                # Scales load as a token's dword; the byte is picked at use.
+                ("ks", c.key_scale_ptr, 4),
+                ("vs", c.value_scale_ptr, 4),
+            )
+        }
+
+    @flyc.jit
+    def mxfp4_pages(self, tt):
+        """The two page ids of tile ``tt`` (wave-uniform): the pair staged in LDS, or
+        the block table past the staged window (``max_context_length`` below the
+        context). ``tt`` is not before ``part_start``."""
+        ppt = KV_COMPUTE_BLOCK // self.traits.block_size
+        first = tt * ppt
+        if const_expr(self.traits.DUAL_GROUP):
+            # A dual group stages only its own tiles: part_start, + 2, ...
+            rel = ((tt - self.ctx.part_start) >> 1) * ppt
+        else:
+            rel = first - self.ctx.part_start * ppt
+        # The LDS read stays in bounds whatever rel is; past the window it is replaced.
+        cap = self.traits.STAGE_PAGES
+        ids = self.lds.load(
+            self.traits.sPages_off + fx.min(rel, cap - 2) * 4, fx.Int32, 2
+        )
+        p0 = fx.Int32(ids[0])
+        p1 = fx.Int32(ids[1])
+        # Even rel and an even capacity: both ids of the pair are in or out together.
+        if rel >= cap:
+            p0 = self._table_page(first)
+            p1 = self._table_page(first + 1)
+        return [
+            fx.Int32(fx.rocdl.readfirstlane(T.i32, p0)),
+            fx.Int32(fx.rocdl.readfirstlane(T.i32, p1)),
+        ]
+
+    def mxfp4_base(self, pages):
+        """This wave's page byte offset; K and V views share page and head strides."""
+        page = (self.mxfp4_warp >= 2).select(pages[1], pages[0])
+        return fx.Int64(page) * fx.Int64(self.ctx.stride_ks_block) + fx.Int64(
+            self.ctx.kv_h
+        ) * fx.Int64(self.ctx.stride_ks_head)
+
+    def mxfp4_load(self, kv, base):
+        """Raw K (``kv`` "k") or V ("v") of a tile: per chunk [E8M0 scale dword, 4
+        packed-E2M1 data dwords]. Scales issue first so a use of them waits (vmcnt
+        counts in order) for the scales only, not the data behind them."""
+        # Uniform base + unsigned 32-bit lane offset (the saddr form of the load).
+        data = fx.add_offset(self.mxfp4_ptr[kv + "d"], base // 4)
+        scale = fx.add_offset(self.mxfp4_ptr[kv + "s"], base // 4)
+        n = self.traits.NCHUNK
+        sc = [
+            fx.ptr_load(
+                fx.add_offset(scale, fx.Uint32(self.mxfp4_scale_off // 4 + 16 * a))
+            )
+            for a in range_constexpr(n)
+        ]
+        dw = [
+            fx.ptr_load(
+                fx.add_offset(data, fx.Uint32((self.mxfp4_data_off + 1024 * a) // 4)),
+                result_type=fx.Vector.make_type(4, fx.Int32),
+            )
+            for a in range_constexpr(n)
+        ]
+        raw = []
+        for a in range_constexpr(n):
+            raw.extend([sc[a], dw[a][0], dw[a][1], dw[a][2], dw[a][3]])
+        return fx.Vector.from_elements(raw, dtype=fx.Int32)
+
+    @flyc.jit
+    def mxfp4_prefetch(self, kv):
+        raw = fx.full(self.traits.NCHUNK * 5, 0, fx.Int32)
+        if self.ctx.part_start < self.ctx.part_end:
+            raw = self.mxfp4_load(
+                kv, self.mxfp4_base(self.mxfp4_pages(self.ctx.part_start))
+            )
+        return raw
+
+    def mxfp4_e8m0_byte(self, dword):
+        """This lane's e8m0 byte (group ``rgroup``) of a token's scale dword."""
+        return (fx.Int32(dword) >> (self.ctx.rgroup * 8)) & fx.Int32(0xFF)
+
+    def _mxfp4_v_bf16_chunk(self, a):
+        return (
+            self.traits.sMxfp4VBf16_off
+            + (self.mxfp4_warp * self.traits.NCHUNK + a) * MXFP4_V_BF16_CHUNK_BYTES
+        )
+
+    def mxfp4_stage_v_bf16(self, v_raw, a, tile_valid):
+        """Widen chunk ``a``'s packed-E2M1 row of this lane, times its E8M0 scale, to
+        BF16 into the wave's V staging."""
+        c = self.ctx
+        tok = self.mxfp4_warp * 64 + 16 * a + c.lane16
+        # An invalid token widens to exact zeros, whatever its scale byte holds.
+        scale = (tok < tile_valid).select(
+            _e8m0_byte_to_f32(fx.Int32(v_raw[a * 5]), c.rgroup), fx.Float32(0.0)
+        )
+        for q in range_constexpr(4):
+            vec = fx.Vector.from_elements(
+                _fp4_dword_to_bf16(fx.Int32(v_raw[a * 5 + 1 + q]), scale),
+                dtype=fx.BFloat16,
+            )
+            self.lds.store(
+                self._mxfp4_v_bf16_chunk(a) + (4 * c.rgroup + q) * 256 + c.lane16 * 16,
+                fx.BFloat16,
+                vec,
+            )
+
+    def mxfp4_read_staged_v_bf16(self, a):
+        """PV A operands of chunk ``a``, [dim block] i64 (4 bf16): the transpose read
+        of the staged BF16 V (not packed MXFP4)."""
+        c = self.ctx
+        lane = (
+            self._mxfp4_v_bf16_chunk(a)
+            + ((c.lane16 % 4) // 2) * 256
+            + (4 * c.rgroup + c.lane16 // 4) * 16
+            + (c.lane16 % 2) * 8
+        )
+        ops = []
+        for m in range_constexpr(self.traits.VHE_CHUNKS):
+            r = fx.rocdl.ds_read_tr16_b64(
+                fx.Vector.make_type(4, fx.BFloat16),
+                fx.to_llvm_ptr(self.lds.pointer(lane + m * 512, fx.BFloat16)),
+            ).result
+            ops.append(fx.Vector(r).bitcast(fx.Int64)[0])
+        return ops
+
     def load_k_from_pages(self, phys_vec):
         flat = []
         for a in range_constexpr(self.traits.NCHUNK):
@@ -560,9 +1000,41 @@ class PaDecodeKVLoader:
 
         return fx.Vector.from_elements(flat, dtype=fx.Int64)
 
+    def warp_pages_raw(self, tt_i32):
+        """Issue the block-table load of this warp's pages of tile ``tt_i32``.
+
+        Returns them unpinned, so no wait is placed at the load;
+        ``pin_warp_pages`` applies the context bound where they are used.
+        """
+        first = (
+            tt_i32 * KV_COMPUTE_BLOCK // self.traits.block_size
+            + (self.ctx.warp * self.traits.TOK_PER_WARP) // self.traits.block_size
+        )
+        element_offset = self.ctx.seq * self.ctx.max_blocks_per_seq + first
+        if const_expr(self.traits.PAGES_PER_CHUNK == 1):
+            return first, fx.Vector.from_elements(
+                [fx.Int32(self.bt_scalar[element_offset])], dtype=fx.Int32
+            )
+        bt_copy_atom = fx.make_copy_atom(fx.rocdl.BufferCopy128b(), fx.Int32)
+        frag = fx.make_fragment_like(fx.slice(self.bt_buf, (0, None)))
+        fx.copy(bt_copy_atom, fx.slice(self.bt_buf, (element_offset, None)), frag)
+        return first, fx.Vector(fx.memref_load_vec(frag))
+
+    def pin_warp_pages(self, raw):
+        first, loaded = raw
+        return fx.Vector.from_elements(
+            [
+                (first + i < self.ctx.num_pages).select(
+                    fx.Int32(loaded[i]), fx.Int32(0)
+                )
+                for i in range_constexpr(self.traits.PAGES_PER_CHUNK)
+            ],
+            dtype=fx.Int32,
+        )
+
     def load_k(self, tt_i32):
         base_page = (
-            tt_i32 * self.traits.TILE_TOK // self.traits.block_size
+            tt_i32 * KV_COMPUTE_BLOCK // self.traits.block_size
         )  # tile start is page-aligned
         fetched = self.load_pages(
             base_page
@@ -570,7 +1042,7 @@ class PaDecodeKVLoader:
             self.traits.PAGES_PER_CHUNK,
         )
         phys_vec = (
-            fx.Vector.from_elements([fx.Int32(fetched)], dtype=fx.Int32)
+            fx.Vector.from_elements([fetched], dtype=fx.Int32)
             if const_expr(self.traits.PAGES_PER_CHUNK == 1)
             else fx.Vector(fetched)
         )
@@ -619,28 +1091,1199 @@ class PaDecodeKVLoader:
             fx.rocdl.sched_vmem(len(ops) // 2)
         return ops  # NVOPS i64, the 64-token contiguous run for this head
 
+    def v_tail_masks(self, tile_valid):
+        """Byte masks keeping only this lane's V tokens below the context length.
+
+        Operand i holds tokens rgroup * TOK_PER_WARP + i * (8 // element bytes)
+        onward, in load_v's order.
+        """
+        remaining = tile_valid - self.ctx.rgroup * self.traits.TOK_PER_WARP
+        bits_per_tok = 8 * self.traits.QP_ELEM_BYTES
+        if const_expr(
+            self.traits.kv_dtype == fx.BFloat16 and self.traits.block_size >= 64
+        ):
+            # The per-word form below is fewer VALU ops, but these kernels
+            # already sit at the register limit and it spills inside the tile
+            # loop there.
+            tok_per_op = 8 // self.traits.QP_ELEM_BYTES
+            masks = []
+            for i in range_constexpr(self.traits.NVOPS):
+                n = remaining - i * tok_per_op
+                n = (n > 0).select(n, 0)
+                full = n >= tok_per_op
+                shift = fx.Int64((n * bits_per_tok) & 63)
+                masks.append(full.select(fx.Int64(-1), (fx.Int64(1) << shift) - 1))
+            return masks
+        valid_bits = remaining * bits_per_tok
+        words = []
+        for d in range_constexpr(2 * self.traits.NVOPS):
+            # A 64-bit shift of the low word by 0..32 bits covers every 32-bit
+            # mask from all ones to zero.
+            shift = 32 * (d + 1) - valid_bits
+            shift = (shift > 0).select(shift, 0)
+            shift = (shift < 32).select(shift, 32)
+            words.append(fx.Int64(0xFFFFFFFF) >> fx.Int64(shift))
+        return [
+            words[2 * i] | (words[2 * i + 1] << 32)
+            for i in range_constexpr(self.traits.NVOPS)
+        ]
+
+    def tail_masks(self, tile_valid):
+        """V byte masks for mask_v_chunk; None when masking is disabled."""
+        if const_expr(not self.traits.mask_unowned_kv):
+            return None
+        return self._tail_masks(tile_valid)
+
+    @flyc.jit
+    def _tail_masks(self, tile_valid):
+        # Only a sequence's last tile holds tokens at or past its context.
+        masks = fx.full(self.traits.NVOPS, -1, fx.Int64)
+        if tile_valid < KV_COMPUTE_BLOCK:
+            masks = fx.Vector.from_elements(
+                self.v_tail_masks(tile_valid), dtype=fx.Int64
+            )
+        return masks
+
+    @flyc.jit
+    def _mask_v_chunk(self, v, masks, tile_valid):
+        if tile_valid < KV_COMPUTE_BLOCK:
+            v = v & masks
+        return v
+
+    def mask_v_chunk(self, v_ops, masks, tile_valid):
+        """Zero one head chunk's V tokens at or past the context length before PV.
+
+        Their probabilities are exactly zero, but those rows may be pinned
+        block-0 pages or unwritten tails holding NaN, and 0 * NaN is NaN in PV.
+        Disabled by ``mask_unowned_kv=False``, which returns ``v_ops`` as is.
+        """
+        if const_expr(not self.traits.mask_unowned_kv):
+            return v_ops
+        v = self._mask_v_chunk(
+            fx.Vector.from_elements(
+                [v_ops[i] for i in range_constexpr(self.traits.NVOPS)],
+                dtype=fx.Int64,
+            ),
+            masks,
+            tile_valid,
+        )
+        return [v[i] for i in range_constexpr(self.traits.NVOPS)]
+
+    @flyc.jit
+    def stage_page_ids(self):
+        """Stage this task's page ids in LDS so the tile loop never reads the table."""
+        traits = self.traits
+        ppt = KV_COMPUTE_BLOCK // traits.block_size
+        if const_expr(traits.DUAL_GROUP):
+            self.stage_group_page_ids()
+        else:
+            first_page = self.ctx.part_start * ppt
+            n_part_pages = (self.ctx.part_end - self.ctx.part_start) * ppt
+            rounds = traits.stage_page_capacity // traits.BLOCK_THREADS
+            for r in range_constexpr(rounds):
+                idx = self.ctx.tid + r * traits.BLOCK_THREADS
+                if idx < n_part_pages:
+                    pg = first_page + idx
+                    raw = fx.Int32(
+                        self.bt_scalar[self.ctx.seq * self.ctx.max_blocks_per_seq + pg]
+                    )
+                    val = (pg < self.ctx.num_pages).select(raw, fx.Int32(0))
+                    self.lds.store(
+                        traits.sPages_off + idx * 4,
+                        fx.Int32,
+                        fx.Vector.from_elements([val], dtype=fx.Int32),
+                    )
+
+    @flyc.jit
+    def stage_group_page_ids(self):
+        """Dual groups: stage the ids of tiles part_start + 2j, each tile's contiguous."""
+        traits = self.traits
+        ppt = KV_COMPUTE_BLOCK // traits.block_size
+        n_group_pages = self.ctx.dual_iters * ppt
+        for r in range_constexpr(-(-traits.STAGE_PAGES // traits.BLOCK_THREADS)):
+            idx = self.ctx.tid + r * traits.BLOCK_THREADS
+            if (idx < n_group_pages) & (idx < traits.STAGE_PAGES):
+                pg = (self.ctx.part_start + (idx // ppt) * 2) * ppt + idx % ppt
+                raw = fx.Int32(
+                    self.bt_scalar[self.ctx.seq * self.ctx.max_blocks_per_seq + pg]
+                )
+                val = (pg < self.ctx.num_pages).select(raw, fx.Int32(0))
+                self.lds.store(
+                    traits.sPages_off + idx * 4,
+                    fx.Int32,
+                    fx.Vector.from_elements([val], dtype=fx.Int32),
+                )
+
+    def prefetch_first_scales_deferred(self):
+        """First tile's K, V page ids and scale loads; the scale LDS stores
+        are returned so they can follow Q staging. Tasks are nonempty here."""
+        k_pf0, phys_vec0 = self.load_k(self.ctx.part_start)
+        if const_expr(self.traits.REUSE_KV_PAGES):
+            self.stage_v_pages(phys_vec0)
+        else:
+            self.fetch_v_pages(self.ctx.part_start)
+        stores = self.stage_scales(
+            phys_vec0,
+            self.scale_buffer_offset(fx.Int32(self.ctx.part_start)),
+            self.ctx.part_start,
+            defer=True,
+        )
+        return k_pf0, stores
+
     @flyc.jit
     def prefetch_first(self):
         # Empty partitions must not read K/V or block_tables.
-        k_pf0 = fx.Vector.filled(
-            self.traits.NCHUNK * self.traits.N_SUBCHUNKS, 0, fx.Int64
-        )
+        if const_expr(self.traits.kv_dtype == MXFP4_KV_DTYPE):
+            self.mxfp4_init()
+            return self.mxfp4_prefetch("k")
+        if const_expr(self.traits.STREAM_KV):
+            # K streams within the tile; carry this warp's page ids instead.
+            k_pf0 = fx.full(self.traits.PAGES_PER_CHUNK, 0, fx.Int32)
+        else:
+            k_pf0 = fx.full(self.traits.NCHUNK * self.traits.N_SUBCHUNKS, 0, fx.Int64)
         if self.ctx.part_start < self.ctx.part_end:
-            k_pf0, phys_vec0 = self.load_k(self.ctx.part_start)
-            if const_expr(self.traits.REUSE_KV_PAGES):
-                # Reuse K page IDs for V's LDS broadcast.
-                self.stage_v_pages(phys_vec0)
-            else:
-                self.fetch_v_pages(self.ctx.part_start)
-            if const_expr(self.traits.per_token_kv):
+            if const_expr(self.traits.STREAM_KV):
+                k_pf0 = self.fetch_v_pages(self.ctx.part_start)
+                if const_expr(self.traits.per_token_kv):
+                    self.stage_scales(
+                        k_pf0,
+                        self.scale_buffer_offset(fx.Int32(self.ctx.part_start)),
+                        self.ctx.part_start,
+                    )
+            elif const_expr(self.traits.D256_PIPE and self.traits.per_token_kv):
+                # Put scales ahead of K on vmcnt, so waiting for their LDS
+                # writes does not also drain the first K prefetch.
+                phys_vec0 = self.fetch_v_pages(self.ctx.part_start)
                 self.stage_scales(
-                    phys_vec0, self.scale_buffer_offset(fx.Int32(self.ctx.part_start))
+                    phys_vec0,
+                    self.scale_buffer_offset(fx.Int32(self.ctx.part_start)),
+                    self.ctx.part_start,
                 )
+                k_pf0 = self.load_k_from_pages(phys_vec0)
+            else:
+                k_pf0, phys_vec0 = self.load_k(self.ctx.part_start)
+                if const_expr(self.traits.REUSE_KV_PAGES):
+                    # Reuse K page IDs for V's LDS broadcast.
+                    self.stage_v_pages(phys_vec0)
+                else:
+                    self.fetch_v_pages(self.ctx.part_start)
+                if const_expr(self.traits.per_token_kv):
+                    self.stage_scales(
+                        phys_vec0,
+                        self.scale_buffer_offset(fx.Int32(self.ctx.part_start)),
+                        self.ctx.part_start,
+                    )
         elif self.ctx.lane == 0:
             self.lds.store(
                 self.traits.sVPage_off
                 + self.ctx.warp * (self.traits.PAGES_PER_CHUNK * 4),
                 fx.Int32,
-                fx.Vector.filled(self.traits.PAGES_PER_CHUNK, 0, fx.Int32),
+                fx.full(self.traits.PAGES_PER_CHUNK, 0, fx.Int32),
             )
         return k_pf0
+
+
+class Gfx1250Memory:
+    def __init__(self, ctx):
+        self.ctx = ctx
+        self.t = ctx.traits
+
+    def allocate(self):
+        storage = fx.SharedAllocator().allocate(self.ctx.shared_storage).peek()
+        self.base = fx.recast_iter(fx.Uint8, storage.buf.ptr)
+
+    def pointer(self, offset, dtype):
+        return fx.recast_iter(
+            fx.PointerType.get(dtype.ir_type, fx.AddressSpace.Shared, dtype.width // 8),
+            fx.add_offset(self.base, offset),
+        )
+
+    def load(self, offset, dtype, n=1):
+        return fx.Vector(
+            fx.ptr_load(
+                self.pointer(offset, dtype), result_type=fx.Vector.make_type(n, dtype)
+            )
+        )
+
+    def store(self, offset, value, dtype):
+        fx.ptr_store(value, self.pointer(offset, dtype))
+
+    def fp8(self, values):
+        # Unit scale preserves the explicitly normalized Q/P values. The gfx1250
+        # instruction converts eight FP32 values into two packed dwords.
+        return fx.Vector(
+            fx.rocdl.cvt_scalef32_pk8_fp8_f32(
+                T.i32x2, fx.as_ir_value(values), fx.as_ir_value(fx.Float32(1.0))
+            )
+        )
+
+    def operand(self, offset, stride, k, lane16, half):
+        # Each half-wave owns alternating 16-byte chunks of the contraction.
+        words = []
+        for j in range_constexpr(k * self.t.elem_bytes // 32):
+            frag = self.load(offset + lane16 * stride + half * 16 + j * 32, fx.Int32, 4)
+            words.extend([frag[i] for i in range_constexpr(4)])
+        result = fx.Vector.from_elements(words, dtype=fx.Int32)
+        return result.bitcast(fx.BFloat16) if self.t.bf16 else result
+
+    def packed_operand(self, offset, rows, k, lane16, half):
+        # WMMA distributes alternating 16-byte contraction chunks across the
+        # two half-waves. Read them directly from the packed LDS layout.
+        words = []
+        for j in range_constexpr(k // 32):
+            frag = self.load(
+                offset + (half + 2 * j) * rows * 16 + lane16 * 16, fx.Int32, 4
+            )
+            words.extend([frag[i] for i in range_constexpr(4)])
+        return fx.Vector.from_elements(words, dtype=fx.Int32)
+
+    def async_copy(self, global_base, global_offset, shared_offset):
+        src = create_llvm_ptr(global_base + fx.Int64(global_offset), address_space=1)
+        dst = create_llvm_ptr(
+            fx.Int64(fx.ptrtoint(self.base)) + fx.Int64(shared_offset), address_space=3
+        )
+        fx.rocdl.global_load_async_to_lds_b128(src, dst, 0)
+
+    def tdm_copy(
+        self, ptr, offset, shared_offset, shape, strides, extents, width, row_stride
+    ):
+        """Gather a packed cache slice into padded LDS using one wave."""
+        packed_strides = []
+        stride = 1
+        for size in reversed(shape):
+            packed_strides.insert(0, stride)
+            stride *= size
+        lds_strides = tuple(
+            s // width * row_stride if s >= width else s for s in packed_strides
+        )
+        # The tile is the whole view on every unbounded mode; a runtime extent
+        # narrows the view and the tile clamps against it.
+        gshape = tuple(
+            shape[i] if extents[i] is None else extents[i] for i in range(len(shape))
+        )
+        src = fx.Tensor(
+            fx.make_view(
+                fx.add_offset(fx.recast_iter(self.t.kv_dtype, ptr), offset),
+                fx.make_layout(gshape, tuple(strides)),
+            )
+        )
+        atom, coord = fx.rocdl.cdna5.make_tiled_tdm_atom(
+            fx.rocdl.TensorLoad(),
+            src,
+            fx.make_layout(shape, lds_strides),
+            shape,
+            num_warps=1,
+        )
+        # early_timeout has no tiled-atom equivalent; it is a multicast GL1 bit
+        # and these loads are single-warp with no mask.
+        # Keep one rest mode so the global side stays nested like the LDS box.
+        rest = None if len(shape) == 1 else tuple(0 for _ in shape[:-1]) + (None,)
+        blk = fx.zipped_divide(coord, shape)[None, rest]
+        dst = fx.Tensor(
+            fx.make_view(
+                self.pointer(shared_offset, self.t.kv_dtype),
+                fx.make_layout((shape, 1), (lds_strides, stride)),
+            )
+        )
+        ts, tg = fx.rocdl.cdna5.tdm_partition(atom, 0, fx.make_layout(1, 1), dst, blk)
+        fx.copy(atom, tg[None, 0], ts[None, 0])
+
+    @flyc.jit
+    def stage_tdm(self, token_base, kv_off, full_tile=False, cached_page=None):
+        if const_expr(self.t.packed_lds):
+            self.stage_packed_tdm(token_base, kv_off, full_tile, cached_page)
+        elif const_expr(self.t.bf16_page16_packed):
+            self.stage_bf16_page16(token_base, kv_off, full_tile)
+        else:
+            self.stage_padded_tdm(token_base, kv_off, full_tile)
+
+    @flyc.jit
+    def stage_bf16_page16(self, token_base, kv_off, full_tile):
+        """Keep each wave's BF16 pages packed and zero-fill invalid tokens.
+
+        A stage of TOKENS tokens gives wave w pages TOKENS // 64 * w onward,
+        stored page-major.
+        """
+        ctx, t = self.ctx, self.t
+        per_wave = t.TOKENS // 64
+        table = fx.recast_iter(fx.Int32, ctx.block_tables_ptr)
+        for j in range_constexpr(per_wave):
+            slot = ctx.warp * per_wave + j
+            absolute = token_base + slot * 16
+            page = self._stage_page(table, absolute, j, full_tile)
+            off = (fx.Int64(page) * ctx.n_kv + ctx.kv_h) * t.head_dim * 16
+            valid = fx.max(
+                fx.Int32(0), fx.min(fx.Int32(16), ctx.planned_context - absolute)
+            )
+            self.tdm_copy(
+                ctx.key_cache_ptr,
+                off,
+                kv_off + slot * t.head_dim * 32,
+                (t.head_dim // 8, 16, 8),
+                (128, 8, 1),
+                (None, None, None) if full_tile else (None, valid, None),
+                8,
+                8,
+            )
+            if const_expr(full_tile):
+                self.tdm_copy(
+                    ctx.value_cache_ptr,
+                    off,
+                    kv_off + t.k_bytes + slot * t.head_dim * 32,
+                    (t.head_dim * 16,),
+                    (1,),
+                    (None,),
+                    8,
+                    8,
+                )
+            else:
+                # V packs eight tokens per dimension; mask inside each chunk.
+                for chunk in range_constexpr(2):
+                    count = fx.max(fx.Int32(0), fx.min(fx.Int32(8), valid - chunk * 8))
+                    self.tdm_copy(
+                        ctx.value_cache_ptr,
+                        off + chunk * t.head_dim * 8,
+                        kv_off
+                        + t.k_bytes
+                        + slot * t.head_dim * 32
+                        + chunk * t.head_dim * 16,
+                        (t.head_dim, 8),
+                        (8, 1),
+                        (None, count),
+                        8,
+                        8,
+                    )
+
+    @flyc.jit
+    def stage_packed_tdm(self, token_base, kv_off, full_tile, cached_page=None):
+        ctx, t = self.ctx, self.t
+        if const_expr(t.page16_wide):
+            self.stage_page16_pair(token_base, kv_off, full_tile)
+            return
+        if const_expr(t.TOKENS == 128):
+            self.stage_page_tdm(token_base, kv_off, full_tile, cached_page)
+            return
+        table = fx.recast_iter(fx.Int32, ctx.block_tables_ptr)
+        # Keep the cache's contiguous 16-byte chunks in LDS. TDM then gathers
+        # whole spans without transposing them or inserting row padding.
+        absolute = token_base + (ctx.warp * 16 if t.block_size == 16 else 0)
+        safe = (
+            absolute
+            if full_tile
+            else (absolute < ctx.planned_context).select(absolute, fx.Int32(0))
+        )
+        if const_expr(cached_page is not None):
+            page = cached_page
+        else:
+            page = fx.Int32(
+                table[
+                    ctx.planned_seq * ctx.max_blocks_per_seq
+                    + fx.Uint32(safe) // t.block_size
+                ]
+            )
+        off = (fx.Int64(page) * ctx.n_kv + ctx.kv_h) * t.head_dim * t.block_size
+        pt = fx.Uint32(safe) % t.block_size
+        wave_token = pt + (ctx.warp * 16 if t.block_size != 16 else 0)
+        valid = fx.max(
+            fx.Int32(0),
+            fx.min(fx.Int32(16), ctx.planned_context - token_base - ctx.warp * 16),
+        )
+        self.tdm_copy(
+            ctx.key_cache_ptr,
+            off + wave_token * 16,
+            kv_off + ctx.warp * t.head_dim * 16,
+            (t.head_dim // 16, 256) if full_tile else (t.head_dim // 16, 16, 16),
+            (t.block_size * 16, 1) if full_tile else (t.block_size * 16, 16, 1),
+            (None, None) if full_tile else (None, valid, None),
+            16,
+            16,
+        )
+        if const_expr(t.trans_v or t.block_size == 16):
+            self.tdm_copy(
+                ctx.value_cache_ptr,
+                off + (wave_token // 16) * t.head_dim * 16,
+                kv_off + t.k_bytes + ctx.warp * t.head_dim * 16,
+                (t.head_dim * 16,) if full_tile else (t.head_dim, 16),
+                (1,) if full_tile else (16, 1),
+                (None,) if full_tile else (None, valid),
+                16,
+                16,
+            )
+        else:
+            # Gather plain [D, page] rows into packed [D, 16] wave slices.
+            self.tdm_copy(
+                ctx.value_cache_ptr,
+                off + wave_token,
+                kv_off + t.k_bytes + ctx.warp * t.head_dim * 16,
+                (t.head_dim, 16),
+                (t.block_size, 1),
+                (None, None) if full_tile else (None, valid),
+                16,
+                16,
+            )
+
+    def page16_pair(self, token_base, full_tile):
+        """Wave w's page16 indices of a stage: pages n w to n w + n - 1."""
+        ctx, n = self.ctx, self.t.page16_pages
+        table = fx.recast_iter(fx.Int32, ctx.block_tables_ptr)
+        pages = []
+        for j in range_constexpr(n):
+            absolute = token_base + (ctx.warp * n + j) * 16
+            pages.append(self._stage_page(table, absolute, j, full_tile))
+        return pages
+
+    def _stage_page(self, table, absolute, j, full_tile):
+        """Page of a wave's j-th page16 slice; tokens past the context use page 0.
+
+        Step-split clusters load their first stage's ids with the context
+        length (``ctx.stage_pages``: the wave's pages, then token 0's).
+        """
+        ctx = self.ctx
+        stage_pages = getattr(ctx, "stage_pages", None)
+        if const_expr(stage_pages is not None):
+            if const_expr(full_tile):
+                return stage_pages[j]
+            return (absolute < ctx.planned_context).select(
+                stage_pages[j], stage_pages[-1]
+            )
+        safe = (
+            absolute
+            if full_tile
+            else (absolute < ctx.planned_context).select(absolute, fx.Int32(0))
+        )
+        return fx.Int32(table[ctx.planned_seq * ctx.max_blocks_per_seq + safe // 16])
+
+    @flyc.jit
+    def stage_page16_pair(self, token_base, kv_off, full_tile):
+        """Each wave copies two whole page16 slices; LDS keeps them page-major."""
+        ctx, t = self.ctx, self.t
+        pages = self.page16_pair(token_base, full_tile)
+        for j in range_constexpr(t.page16_pages):
+            slot = ctx.warp * t.page16_pages + j
+            off = (fx.Int64(pages[j]) * ctx.n_kv + ctx.kv_h) * t.head_dim * 16
+            valid = fx.max(
+                fx.Int32(0),
+                fx.min(fx.Int32(16), ctx.planned_context - token_base - slot * 16),
+            )
+            self.tdm_copy(
+                ctx.key_cache_ptr,
+                off,
+                kv_off + slot * t.head_dim * 16,
+                (t.head_dim // 16, 256) if full_tile else (t.head_dim // 16, 16, 16),
+                (256, 1) if full_tile else (256, 16, 1),
+                (None, None) if full_tile else (None, valid, None),
+                16,
+                16,
+            )
+            self.tdm_copy(
+                ctx.value_cache_ptr,
+                off,
+                kv_off + t.k_bytes + slot * t.head_dim * 16,
+                (t.head_dim * 16,) if full_tile else (t.head_dim, 16),
+                # Both V layouts store a page16 slice as [D][16 tokens].
+                (1,) if full_tile else (16, 1),
+                (None,) if full_tile else (None, valid),
+                16,
+                16,
+            )
+
+    @flyc.jit
+    def stage_page_tdm(self, token_base, kv_off, full_tile, cached_page=None):
+        """Stage a packed 128-token slice, splitting K by dimension and V by token."""
+        ctx, t = self.ctx, self.t
+        table = fx.recast_iter(fx.Int32, ctx.block_tables_ptr)
+        safe = (
+            token_base
+            if full_tile
+            else (token_base < ctx.planned_context).select(token_base, fx.Int32(0))
+        )
+        if const_expr(cached_page is None):
+            cached_page = self._preloaded_page(token_base, 0, full_tile)
+        if const_expr(cached_page is not None):
+            page = cached_page
+        else:
+            page = fx.Int32(
+                table[
+                    ctx.planned_seq * ctx.max_blocks_per_seq
+                    + fx.Uint32(safe) // t.block_size
+                ]
+            )
+        off = (fx.Int64(page) * ctx.n_kv + ctx.kv_h) * t.head_dim * t.block_size
+        pt = fx.Uint32(safe) % t.block_size
+        valid = fx.max(
+            fx.Int32(0), fx.min(fx.Int32(128), ctx.planned_context - token_base)
+        )
+        self.tdm_copy(
+            ctx.key_cache_ptr,
+            off + ctx.warp * (t.head_dim // 64) * t.block_size * 16 + pt * 16,
+            kv_off + ctx.warp * (t.head_dim // 64) * 2048,
+            (t.head_dim // 64, 2048) if full_tile else (t.head_dim // 64, 128, 16),
+            (t.block_size * 16, 1) if full_tile else (t.block_size * 16, 16, 1),
+            (None, None) if full_tile else (None, valid, None),
+            16,
+            16,
+        )
+        if const_expr(full_tile and t.trans_v):
+            self.tdm_copy(
+                ctx.value_cache_ptr,
+                off + (pt // 16 + ctx.warp * 2) * t.head_dim * 16,
+                kv_off + t.k_bytes + ctx.warp * t.head_dim * 32,
+                (t.head_dim * 32,),
+                (1,),
+                (None,),
+                16,
+                16,
+            )
+        else:
+            # Exact token extents zero-fill invalid V bytes, including NaNs.
+            for chunk in range_constexpr(2):
+                count = fx.max(
+                    fx.Int32(0),
+                    fx.min(fx.Int32(16), valid - ctx.warp * 32 - chunk * 16),
+                )
+                self.tdm_copy(
+                    ctx.value_cache_ptr,
+                    (
+                        off + (pt // 16 + ctx.warp * 2 + chunk) * t.head_dim * 16
+                        if t.trans_v
+                        else off + pt + ctx.warp * 32 + chunk * 16
+                    ),
+                    kv_off
+                    + t.k_bytes
+                    + ctx.warp * t.head_dim * 32
+                    + chunk * t.head_dim * 16,
+                    (t.head_dim, 16),
+                    (16, 1) if t.trans_v else (t.block_size, 1),
+                    (None, None) if full_tile else (None, count),
+                    16,
+                    16,
+                )
+
+    def packed_k_operand(self, kv_off, token_tile, dim_tile):
+        ctx, t = self.ctx, self.t
+        if const_expr(t.page16_wide):
+            # Token tile n of wave w is page 2 w + n, stored page-major.
+            return self.packed_operand(
+                kv_off
+                + (ctx.warp * t.page16_pages + token_tile) * t.head_dim * 16
+                + dim_tile * 128 * 16,
+                16,
+                128,
+                ctx.lane16,
+                ctx.half,
+            )
+        if const_expr(t.page128_pair):
+            # Wave w's 64 tokens lie in page w // 2, 16 KiB apart per page.
+            return self.page_k_operand(
+                kv_off + (ctx.warp // 2) * 128 * t.head_dim,
+                (ctx.warp % 2) * 64 + token_tile * 16,
+                ctx.lane16,
+                ctx.half,
+            )
+        if const_expr(t.TOKENS == 128):
+            return self.page_k_operand(
+                kv_off + dim_tile * 128 * 128,
+                ctx.warp * 32 + token_tile * 16,
+                ctx.lane16,
+                ctx.half,
+            )
+        return self.packed_operand(
+            kv_off + ctx.warp * t.head_dim * 16 + dim_tile * 128 * 16,
+            16,
+            128,
+            ctx.lane16,
+            ctx.half,
+        )
+
+    def page_k_operand(self, offset, token, lane16, half):
+        words = []
+        for j in range_constexpr(4):
+            frag = self.load(
+                offset + (half + 2 * j) * 128 * 16 + (token + lane16) * 16, fx.Int32, 4
+            )
+            words.extend([frag[i] for i in range_constexpr(4)])
+        return fx.Vector.from_elements(words, dtype=fx.Int32)
+
+    def page_v_operands(self, kv_off, k=None):
+        # At most K128 per operand; 128 tokens span eight 16-token groups.
+        ctx, t = self.ctx, self.t
+        k = min(t.TOKENS, 128) if k is None else k
+        return [
+            [
+                self.packed_operand(
+                    kv_off
+                    + t.k_bytes
+                    + c * (k // 16) * t.head_dim * 16
+                    + (vh * 64 + ctx.warp * 16) * 16,
+                    t.head_dim,
+                    k,
+                    ctx.lane16,
+                    ctx.half,
+                )
+                for c in range_constexpr(t.TOKENS // k)
+            ]
+            for vh in range_constexpr(t.head_dim // 64)
+        ]
+
+    def bf16_k_operand(self, offset, token, dim, lane16, half):
+        # Retain vector-8 cache packing: each half-wave reads alternate chunks.
+        words = []
+        for j in range_constexpr(2):
+            frag = self.load(
+                offset
+                + ((dim // 8 + half + 2 * j) * self.t.block_size + token + lane16) * 16,
+                fx.Int32,
+                4,
+            )
+            words.extend([frag[i] for i in range_constexpr(4)])
+        return fx.Vector.from_elements(words, dtype=fx.Int32).bitcast(fx.BFloat16)
+
+    def bf16_v_operand(self, offset, dim, token, lane16, half):
+        words = []
+        for j in range_constexpr(2):
+            frag = self.load(
+                offset
+                + (token // 8 + half + 2 * j) * self.t.head_dim * 16
+                + (dim + lane16) * 16,
+                fx.Int32,
+                4,
+            )
+            words.extend([frag[i] for i in range_constexpr(4)])
+        return fx.Vector.from_elements(words, dtype=fx.Int32).bitcast(fx.BFloat16)
+
+    @flyc.jit
+    def stage_bf16_page(self, token_base, buffer, slot=0, preload=None):
+        """Gather a BF16 page without transposition; zero-fill its unwritten tail.
+
+        ``slot`` places the page within a multi-page step, 128 tokens apart;
+        ``preload`` indexes a fixed run's preloaded first page ids.
+        """
+        ctx, t = self.ctx, self.t
+        page_bytes = 128 * t.head_dim * 2
+        page = (
+            None
+            if preload is None
+            else self._preloaded_page(token_base, preload, False)
+        )
+        if const_expr(page is None):
+            safe = (token_base < ctx.planned_context).select(token_base, fx.Int32(0))
+            table = fx.recast_iter(fx.Int32, ctx.block_tables_ptr)
+            page = fx.Int32(
+                table[ctx.planned_seq * ctx.max_blocks_per_seq + safe // 128]
+            )
+        off = (fx.Int64(page) * ctx.n_kv + ctx.kv_h) * t.head_dim * 128
+        kv_off = t.q_bytes + buffer * t.kv_stride + slot * page_bytes
+        valid = fx.max(
+            fx.Int32(0), fx.min(fx.Int32(128), ctx.planned_context - token_base)
+        )
+        self.tdm_copy(
+            ctx.key_cache_ptr,
+            off + ctx.warp * (t.head_dim // 32) * 1024,
+            kv_off + ctx.warp * (t.head_dim // 32) * 2048,
+            (t.head_dim // 32, 128, 8),
+            (1024, 8, 1),
+            (None, valid, None),
+            8,
+            8,
+        )
+        if token_base + 128 <= ctx.planned_context:
+            self.tdm_copy(
+                ctx.value_cache_ptr,
+                off + ctx.warp * t.head_dim * 32,
+                kv_off + t.k_bytes + ctx.warp * t.head_dim * 64,
+                (32 * t.head_dim,),
+                (1,),
+                (None,),
+                8,
+                8,
+            )
+        else:
+            # Token extents apply inside each eight-token V chunk.
+            for chunk in range_constexpr(4):
+                count = fx.max(
+                    fx.Int32(0), fx.min(fx.Int32(8), valid - ctx.warp * 32 - chunk * 8)
+                )
+                self.tdm_copy(
+                    ctx.value_cache_ptr,
+                    off + (ctx.warp * 4 + chunk) * t.head_dim * 8,
+                    kv_off + t.k_bytes + (ctx.warp * 4 + chunk) * t.head_dim * 16,
+                    (t.head_dim, 8),
+                    (8, 1),
+                    (None, count),
+                    8,
+                    8,
+                )
+
+    @flyc.jit
+    def stage_padded_tdm(self, token_base, kv_off, full_tile):
+        ctx, t = self.ctx, self.t
+        table = fx.recast_iter(fx.Int32, ctx.block_tables_ptr)
+        # Explicit wave slices keep the hardware padding local to each copy.
+        # Collective rank-3 atoms cannot apply row padding to their wave offset
+        # with the installed lowering, so each wave owns a single-wave atom.
+        absolute = token_base + ctx.warp * 16
+        safe_token = (
+            absolute
+            if full_tile
+            else (absolute < ctx.planned_context).select(absolute, fx.Int32(0))
+        )
+        page = fx.Int32(
+            table[ctx.planned_seq * ctx.max_blocks_per_seq + safe_token // t.block_size]
+        )
+        off = (fx.Int64(page) * ctx.n_kv + ctx.kv_h) * t.head_dim * t.block_size
+        page_token = safe_token % t.block_size
+        valid = fx.max(
+            fx.Int32(0), fx.min(fx.Int32(16), ctx.planned_context - absolute)
+        )
+        self.tdm_copy(
+            ctx.key_cache_ptr,
+            off + page_token * t.chunk,
+            kv_off + ctx.warp * 16 * t.q_stride,
+            (16, t.head_dim // t.chunk, t.chunk),
+            (t.chunk, t.block_size * t.chunk, 1),
+            (None if full_tile else valid, None, None),
+            t.head_dim,
+            t.q_stride // t.elem_bytes,
+        )
+        if const_expr(t.block_size == 16):
+            v_tokens, v_rows = 16, t.head_dim
+            v_dst = ctx.warp * 16 * t.elem_bytes
+            v_d = fx.Int32(0)
+        else:
+            v_tokens, v_rows = t.TOKENS, t.head_dim // t.NWARP
+            v_d = ctx.warp * v_rows
+            v_dst = v_d * t.v_stride
+            safe_token = (token_base < ctx.planned_context).select(
+                token_base, fx.Int32(0)
+            )
+            page = fx.Int32(
+                table[
+                    ctx.planned_seq * ctx.max_blocks_per_seq
+                    + safe_token // t.block_size
+                ]
+            )
+            off = (fx.Int64(page) * ctx.n_kv + ctx.kv_h) * t.head_dim * t.block_size
+            page_token = safe_token % t.block_size
+            valid = fx.max(
+                fx.Int32(0),
+                fx.min(fx.Int32(v_tokens), ctx.planned_context - token_base),
+            )
+        if const_expr(t.trans_v):
+            self.tdm_copy(
+                ctx.value_cache_ptr,
+                off + (page_token // t.chunk) * t.head_dim * t.chunk + v_d * t.chunk,
+                kv_off + t.k_bytes + v_dst,
+                (v_rows, v_tokens // t.chunk, t.chunk),
+                (t.chunk, t.head_dim * t.chunk, 1),
+                (None, None if full_tile else (valid + t.chunk - 1) // t.chunk, None),
+                v_tokens,
+                t.v_stride // t.elem_bytes,
+            )
+        else:
+            self.tdm_copy(
+                ctx.value_cache_ptr,
+                off + v_d * t.block_size + page_token,
+                kv_off + t.k_bytes + v_dst,
+                (v_rows, v_tokens),
+                (t.block_size, 1),
+                (None, None if full_tile else valid),
+                v_tokens,
+                t.v_stride // t.elem_bytes,
+            )
+
+    @flyc.jit
+    def stage_vector_dma(self, token_base, kv_off):
+        ctx, t = self.ctx, self.t
+        table = fx.recast_iter(fx.Int32, ctx.block_tables_ptr)
+        key_base = buf_base_i64(ctx.key_cache_ptr)
+        value_base = buf_base_i64(ctx.value_cache_ptr)
+        # K cache has contiguous 16-byte head-dimension chunks.
+        for i in range_constexpr(t.TOKENS * t.head_dim // t.chunk // t.BLOCK_THREADS):
+            chunk = ctx.tid + i * t.BLOCK_THREADS
+            token = chunk // (t.head_dim // t.chunk)
+            d = (chunk % (t.head_dim // t.chunk)) * t.chunk
+            absolute = token_base + token
+            safe_token = (absolute < ctx.planned_context).select(absolute, fx.Int32(0))
+            page = fx.Int32(
+                table[
+                    ctx.planned_seq * ctx.max_blocks_per_seq
+                    + safe_token // t.block_size
+                ]
+            )
+            off = (
+                (fx.Int64(page) * ctx.n_kv + ctx.kv_h) * t.head_dim * t.block_size
+                + fx.Int64(d // t.chunk) * t.block_size * t.chunk
+                + (safe_token % t.block_size) * t.chunk
+            )
+            self.async_copy(
+                key_base,
+                off * t.elem_bytes,
+                kv_off + token * t.q_stride + d * t.elem_bytes,
+            )
+
+        # Both supported V layouts have contiguous 16-byte token chunks.
+        for i in range_constexpr(t.head_dim * (t.TOKENS // t.chunk) // t.BLOCK_THREADS):
+            chunk = ctx.tid + i * t.BLOCK_THREADS
+            d = chunk // (t.TOKENS // t.chunk)
+            token = (chunk % (t.TOKENS // t.chunk)) * t.chunk
+            absolute = token_base + token
+            safe_token = (absolute < ctx.planned_context).select(absolute, fx.Int32(0))
+            page = fx.Int32(
+                table[
+                    ctx.planned_seq * ctx.max_blocks_per_seq
+                    + safe_token // t.block_size
+                ]
+            )
+            page_token = safe_token % t.block_size
+            off = (fx.Int64(page) * ctx.n_kv + ctx.kv_h) * t.head_dim * t.block_size
+            if const_expr(t.trans_v):
+                off = off + (page_token // t.chunk) * t.head_dim * t.chunk + d * t.chunk
+            else:
+                off = off + d * t.block_size + page_token
+            self.async_copy(
+                value_base,
+                off * t.elem_bytes,
+                kv_off + t.k_bytes + d * t.v_stride + token * t.elem_bytes,
+            )
+
+    def _preloaded_page(self, token_base, j, full_tile):
+        """Preloaded page128 id of a run's first stage, or None.
+
+        Fixed-run clusters load their first stage's ids with the context
+        length (``ctx.stage_pages``: the stage's pages, then token 0's).
+        """
+        stage_pages = getattr(self.ctx, "stage_pages", None)
+        if const_expr(stage_pages is None or not self.t.cluster_runs):
+            return None
+        if const_expr(full_tile):
+            return stage_pages[j]
+        return (token_base < self.ctx.planned_context).select(
+            stage_pages[j], stage_pages[-1]
+        )
+
+    @flyc.jit
+    def stage_page128_pair(self, token_base, buffer, full_tile):
+        """Stage two page128 pages; each keeps the one-page LDS layout 16 KiB apart."""
+        ctx, t = self.ctx, self.t
+        kv_off = t.q_bytes + buffer * t.kv_stride
+        table = fx.recast_iter(fx.Int32, ctx.block_tables_ptr)
+        scales = kv_off + t.k_bytes + t.v_bytes
+        for p in range_constexpr(2):
+            base = token_base + p * 128
+            page = self._preloaded_page(base, p, full_tile)
+            if const_expr(page is None):
+                safe = (base < ctx.planned_context).select(base, fx.Int32(0))
+                page = fx.Int32(
+                    table[ctx.planned_seq * ctx.max_blocks_per_seq + safe // 128]
+                )
+            if const_expr(full_tile):
+                self.stage_page_tdm(base, kv_off + p * 128 * t.head_dim, True, page)
+            else:
+                self.stage_page_pair_tail(base, kv_off + p * 128 * t.head_dim, page)
+            if const_expr(full_tile and t.per_token_kv):
+                index = (
+                    fx.Int64(page) * ctx.stride_ks_block + ctx.kv_h * ctx.stride_ks_head
+                )
+                if ctx.tid < t.WAVE:
+                    self.async_copy(
+                        fx.Int64(fx.ptrtoint(ctx.key_scale_ptr)),
+                        (index + ctx.tid * 4) * 4,
+                        scales + p * 512 + ctx.tid * 16,
+                    )
+                    self.async_copy(
+                        fx.Int64(fx.ptrtoint(ctx.value_scale_ptr)),
+                        (index + ctx.tid * 4) * 4,
+                        scales + (t.TOKENS + p * 128) * 4 + ctx.tid * 16,
+                    )
+        if const_expr(not full_tile and t.per_token_kv):
+            ks = fx.recast_iter(fx.Float32, ctx.key_scale_ptr)
+            vs = fx.recast_iter(fx.Float32, ctx.value_scale_ptr)
+            for rep in range_constexpr(t.TOKENS // t.BLOCK_THREADS):
+                tok = ctx.tid + rep * t.BLOCK_THREADS
+                absolute = token_base + tok
+                valid = absolute < ctx.planned_context
+                safe = valid.select(absolute, fx.Int32(0))
+                page = fx.Int32(
+                    table[ctx.planned_seq * ctx.max_blocks_per_seq + safe // 128]
+                )
+                index = (
+                    fx.Int64(page) * ctx.stride_ks_block
+                    + ctx.kv_h * ctx.stride_ks_head
+                    + safe % 128
+                )
+                self.store(
+                    scales + tok * 4,
+                    valid.select(fx.Float32(ks[index]), fx.Float32(0.0)),
+                    fx.Float32,
+                )
+                self.store(
+                    scales + (t.TOKENS + tok) * 4,
+                    valid.select(fx.Float32(vs[index]), fx.Float32(0.0)),
+                    fx.Float32,
+                )
+
+    @flyc.jit
+    def stage_page_pair_tail(self, base, kv_off, page):
+        if base + 128 <= self.ctx.planned_context:
+            self.stage_page_tdm(base, kv_off, True, page)
+        else:
+            self.stage_page_tdm(base, kv_off, False, page)
+
+    @flyc.jit
+    def stage_kv(self, token_base, buffer):
+        # Constant full-tile extents keep the hot TDM descriptor path scalar.
+        # The tail retains clamped extents and safe owned-page addresses.
+        if const_expr(self.t.page128_pair):
+            if token_base + self.t.TOKENS <= self.ctx.planned_context:
+                self.stage_page128_pair(token_base, buffer, True)
+            else:
+                self.stage_page128_pair(token_base, buffer, False)
+            return
+        if token_base + self.t.TOKENS <= self.ctx.planned_context:
+            self.stage_kv_impl(token_base, buffer, True)
+        else:
+            self.stage_kv_impl(token_base, buffer, False)
+
+    @flyc.jit
+    def stage_kv_impl(self, token_base, buffer, full_tile):
+        ctx, t = self.ctx, self.t
+        kv_off = t.q_bytes + buffer * t.kv_stride
+        table = fx.recast_iter(fx.Int32, ctx.block_tables_ptr)
+        page = fx.Int32(0)
+        if const_expr((t.async_page or t.page16_async_scales) and not t.page16_wide):
+            page_absolute = token_base + (ctx.warp * 16 if t.page16_async_scales else 0)
+            safe = (
+                page_absolute
+                if full_tile
+                else (page_absolute < ctx.planned_context).select(
+                    page_absolute, fx.Int32(0)
+                )
+            )
+            page = fx.Int32(
+                table[ctx.planned_seq * ctx.max_blocks_per_seq + safe // t.block_size]
+            )
+        if const_expr(t.use_tdm):
+            self.stage_tdm(
+                token_base,
+                kv_off,
+                full_tile,
+                (
+                    page
+                    if (t.async_page or t.page16_async_scales) and not t.page16_wide
+                    else None
+                ),
+            )
+        else:
+            self.stage_vector_dma(token_base, kv_off)
+
+        if const_expr(t.async_page and full_tile and t.per_token_kv):
+            # One wave copies four FP32 scales per lane directly into LDS.
+            # Waiting on ASYNC_CNT at consumption avoids the load/store drain
+            # that otherwise serializes K/V staging with scale staging.
+            index = fx.Int64(page) * ctx.stride_ks_block + ctx.kv_h * ctx.stride_ks_head
+            if ctx.tid < t.WAVE:
+                self.async_copy(
+                    fx.Int64(fx.ptrtoint(ctx.key_scale_ptr)),
+                    (index + ctx.tid * 4) * 4,
+                    kv_off + t.k_bytes + t.v_bytes + ctx.tid * 16,
+                )
+                self.async_copy(
+                    fx.Int64(fx.ptrtoint(ctx.value_scale_ptr)),
+                    (index + ctx.tid * 4) * 4,
+                    kv_off + t.k_bytes + t.v_bytes + t.TOKENS * 4 + ctx.tid * 16,
+                )
+        elif const_expr(t.page16_wide and t.per_token_kv and full_tile):
+            # Lanes 4 j to 4 j + 3 copy the wave's page j, four scales each.
+            pages = self.page16_pair(token_base, True)
+            if ctx.lane < 4 * t.page16_pages:
+                j = ctx.lane // 4
+                pair_page = pages[0]
+                for k in range_constexpr(1, t.page16_pages):
+                    pair_page = (j == k).select(pages[k], pair_page)
+                pair_index = (
+                    fx.Int64(pair_page) * ctx.stride_ks_block
+                    + ctx.kv_h * ctx.stride_ks_head
+                )
+                token = (ctx.warp * t.page16_pages + j) * 16 + (ctx.lane % 4) * 4
+                self.async_copy(
+                    fx.Int64(fx.ptrtoint(ctx.key_scale_ptr)),
+                    (pair_index + (ctx.lane % 4) * 4) * 4,
+                    kv_off + t.k_bytes + t.v_bytes + token * 4,
+                )
+                self.async_copy(
+                    fx.Int64(fx.ptrtoint(ctx.value_scale_ptr)),
+                    (pair_index + (ctx.lane % 4) * 4) * 4,
+                    kv_off + t.k_bytes + t.v_bytes + (t.TOKENS + token) * 4,
+                )
+        elif const_expr(t.page16_async_scales and full_tile and not t.page16_wide):
+            index = fx.Int64(page) * ctx.stride_ks_block + ctx.kv_h * ctx.stride_ks_head
+            if ctx.lane < 4:
+                token = ctx.warp * 16 + ctx.lane * 4
+                self.async_copy(
+                    fx.Int64(fx.ptrtoint(ctx.key_scale_ptr)),
+                    (index + ctx.lane * 4) * 4,
+                    kv_off + t.k_bytes + t.v_bytes + token * 4,
+                )
+                self.async_copy(
+                    fx.Int64(fx.ptrtoint(ctx.value_scale_ptr)),
+                    (index + ctx.lane * 4) * 4,
+                    kv_off + t.k_bytes + t.v_bytes + (t.TOKENS + token) * 4,
+                )
+        else:
+            if const_expr(t.per_token_kv):
+                ks = fx.recast_iter(fx.Float32, ctx.key_scale_ptr)
+                vs = fx.recast_iter(fx.Float32, ctx.value_scale_ptr)
+                # A stage can hold more tokens than the CTA has threads.
+                for rep in range_constexpr(-(-t.TOKENS // t.BLOCK_THREADS)):
+                    tok = ctx.tid + rep * t.BLOCK_THREADS
+                    if tok < t.TOKENS:
+                        absolute = token_base + tok
+                        safe_token = (
+                            absolute
+                            if full_tile
+                            else (absolute < ctx.planned_context).select(
+                                absolute, fx.Int32(0)
+                            )
+                        )
+                        if const_expr(t.block_size >= t.TOKENS):
+                            page_start = (
+                                token_base
+                                if full_tile
+                                else (token_base < ctx.planned_context).select(
+                                    token_base, fx.Int32(0)
+                                )
+                            )
+                            if const_expr(not t.async_page):
+                                page = fx.Int32(
+                                    table[
+                                        ctx.planned_seq * ctx.max_blocks_per_seq
+                                        + page_start // t.block_size
+                                    ]
+                                )
+                            scale_idx = (
+                                fx.Int64(page) * ctx.stride_ks_block
+                                + ctx.kv_h * ctx.stride_ks_head
+                                + page_start % t.block_size
+                                + tok
+                            )
+                        else:
+                            page = fx.Int32(
+                                table[
+                                    ctx.planned_seq * ctx.max_blocks_per_seq
+                                    + safe_token // t.block_size
+                                ]
+                            )
+                            scale_idx = (
+                                fx.Int64(page) * ctx.stride_ks_block
+                                + ctx.kv_h * ctx.stride_ks_head
+                                + safe_token % t.block_size
+                            )
+                        kscale = fx.Float32(ks[scale_idx])
+                        vscale = fx.Float32(vs[scale_idx])
+                        if const_expr(not full_tile):
+                            kscale = (absolute < ctx.planned_context).select(
+                                kscale, fx.Float32(0.0)
+                            )
+                        # Normalize over the MTP window union, independently of the row.
+                        visible = (
+                            fx.Int32(1) if full_tile else absolute < ctx.planned_context
+                        )
+                        if const_expr(t.sliding_window > 0):
+                            visible = visible & (
+                                absolute
+                                >= ctx.planned_context
+                                - t.query_length
+                                + 1
+                                - t.sliding_window
+                            )
+                        vscale = visible.select(vscale, fx.Float32(0.0))
+                        self.store(
+                            kv_off + t.k_bytes + t.v_bytes + tok * 4, kscale, fx.Float32
+                        )
+                        self.store(
+                            kv_off + t.k_bytes + t.v_bytes + (t.TOKENS + tok) * 4,
+                            vscale,
+                            fx.Float32,
+                        )
+
+    @flyc.jit
+    def stage_query(self, first_tile=0):
+        self.store_query(self.load_query(first_tile), first_tile)
+
+    @flyc.jit
+    def load_query(self, first_tile=0):
+        """Issue the global Q loads; ``store_query`` stages them.
+
+        Splitting the two lets the loads overlap the block-table lookup and
+        the first page's DMA issue.
+        """
+        ctx, t = self.ctx, self.t
+        query = fx.recast_iter(t.q_dtype, ctx.query_ptr)
+        # Eight adjacent lanes stage each row, normalizing only for FP8.
+        row, shard = ctx.tid // 8, ctx.tid % 8
+        tiles = []
+        for m in range_constexpr(t.q_tiles):
+            flat = (first_tile + m) * 16 + row
+            units = []
+            for j in range_constexpr(t.head_dim // 64):
+                d = shard * (t.head_dim // 8) + j * 8
+                qoff = (
+                    (
+                        fx.Int64(ctx.planned_seq) * t.query_length
+                        + ctx.query_begin
+                        + flat // t.query_group_size
+                    )
+                    * ctx.stride_q_row
+                    + (ctx.kv_h * t.query_group_size + flat % t.query_group_size)
+                    * ctx.stride_q_head
+                    + d
+                )
+                values = fx.Vector.filled(8, 0.0, t.q_dtype)
+                if flat < t.rows:
+                    values = fx.Vector(
+                        fx.ptr_load(
+                            fx.add_offset(query, qoff),
+                            result_type=fx.Vector.make_type(8, t.q_dtype),
+                        )
+                    )
+                units.append(values)
+            tiles.append(units)
+        return tiles
+
+    @flyc.jit
+    def store_query(self, tiles, first_tile=0):
+        ctx, t = self.ctx, self.t
+        row, shard = ctx.tid // 8, ctx.tid % 8
+        for m in range_constexpr(t.q_tiles):
+            shared_row = m * 16 + row
+            units = [unit.to(fx.Float32) for unit in tiles[m]]
+            if const_expr(not t.bf16):
+                absmax = fx.Float32(0.0)
+                for j in range_constexpr(len(units)):
+                    absmax = fx.maxnumf(
+                        absmax, fmath.absf(units[j]).reduce(ReductionOp.MAX)
+                    )
+                for shift in (4, 2, 1):
+                    absmax = fx.maxnumf(absmax, absmax.shuffle_xor(shift, t.WAVE))
+                scale = absmax * fx.Float32(1.0 / t.FP8_MAX)
+                inv = fx.Float32(rcp_f32(fx.maxnumf(scale, fx.Float32(1e-20))))
+            for j in range_constexpr(len(units)):
+                if const_expr(t.bf16):
+                    packed = units[j].to(fx.BFloat16)
+                else:
+                    packed = self.fp8(
+                        units[j]
+                        * fx.Vector.from_elements(
+                            [fx.Float32(inv)], dtype=fx.Float32
+                        ).broadcast_to(8)
+                    )
+                self.store(
+                    shared_row * t.q_stride
+                    + (shard * (t.head_dim // 8) + j * 8) * t.elem_bytes,
+                    packed,
+                    fx.BFloat16 if t.bf16 else fx.Int32,
+                )
+            if const_expr(not t.bf16):  # noqa: SIM102
+                if shard == 0:
+                    # Temporary query scales live in the unused Q row padding.
+                    self.store(shared_row * t.q_stride + t.head_dim, scale, fx.Float32)

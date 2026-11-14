@@ -4,6 +4,10 @@
 import triton
 import triton.language as tl
 
+from aiter.ops.triton._triton_kernels.fusions.indexed_table import (
+    _gather_indexed_rows,
+    _load_block_indices,
+)
 from aiter.ops.triton.utils._triton.kernel_repr import make_kernel_repr
 
 _fused_rmsnorm_indexed_adaln_repr = make_kernel_repr(
@@ -43,16 +47,9 @@ def _fused_rmsnorm_indexed_adaln_kernel(
     rows = row_block * BLOCK_M + tl.arange(0, BLOCK_M)
     row_mask = rows < M
 
-    # The block's first row always exists, so its index is a safe fill for the
-    # tail lanes -- they must not make a uniform block look mixed.
-    first = tl.load(idx_ptr + row_block * BLOCK_M)
-    idx = tl.load(idx_ptr + rows, mask=row_mask, other=first)
-
-    # A block of consecutive rows usually shares one modulation index: the
-    # packed sequence is laid out in runs of one modality. When it does, the
-    # modulation tiles collapse from a [BLOCK_M, BLOCK_N] gather to a single
-    # [BLOCK_N] vector reused across the block.
-    uniform = tl.min(idx) == tl.max(idx)
+    idx, first, uniform = _load_block_indices(
+        idx_ptr, row_block, rows, row_mask, BLOCK_M
+    )
 
     acc = tl.zeros((BLOCK_M,), dtype=tl.float32)
     for start in tl.range(0, N, BLOCK_N):
@@ -87,36 +84,30 @@ def _fused_rmsnorm_indexed_adaln_kernel(
             # an unfused reference matters more than the extra precision.
             normed = normed.to(out_ptr.dtype.element_ty).to(tl.float32)
 
-        if uniform:
-            # One row of the table, replicated in registers. The broadcast is
-            # free; skipping BLOCK_M-1 redundant loads is the point.
-            scale = tl.broadcast_to(
-                tl.load(
-                    scale_ptr + first * stride_scale_row + cols,
-                    mask=col_mask,
-                    other=0.0,
-                ).to(tl.float32)[None, :],
-                (BLOCK_M, BLOCK_N),
-            )
-            shift = tl.broadcast_to(
-                tl.load(
-                    shift_ptr + first * stride_shift_row + cols,
-                    mask=col_mask,
-                    other=0.0,
-                ).to(tl.float32)[None, :],
-                (BLOCK_M, BLOCK_N),
-            )
-        else:
-            scale = tl.load(
-                scale_ptr + idx[:, None] * stride_scale_row + cols[None, :],
-                mask=mask2d,
-                other=0.0,
-            ).to(tl.float32)
-            shift = tl.load(
-                shift_ptr + idx[:, None] * stride_shift_row + cols[None, :],
-                mask=mask2d,
-                other=0.0,
-            ).to(tl.float32)
+        scale = _gather_indexed_rows(
+            scale_ptr,
+            stride_scale_row,
+            idx,
+            first,
+            uniform,
+            cols,
+            row_mask,
+            col_mask,
+            BLOCK_M,
+            BLOCK_N,
+        )
+        shift = _gather_indexed_rows(
+            shift_ptr,
+            stride_shift_row,
+            idx,
+            first,
+            uniform,
+            cols,
+            row_mask,
+            col_mask,
+            BLOCK_M,
+            BLOCK_N,
+        )
 
         modulated = normed * (1.0 + scale)
         if ROUND_INTERMEDIATE:

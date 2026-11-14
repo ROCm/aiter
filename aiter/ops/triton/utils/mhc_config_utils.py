@@ -217,10 +217,12 @@ def get_mhc_post_pre_gluon_gfx1250_config(M: int) -> dict:
     for the post + split-K GEMM/sqrsum kernel; ``SPLIT_MAX_CTAS_PER_CU``, its LDS
     residency (workgroups per CU), caps the split-K count to one round (see
     ``_mhc_post_pre_gluon_split_k``) and gates the deeper ``SPLIT_DEEP_NUM_STAGES``
-    ring (see ``_gluon_split_num_stages``); ``RA_NORM_NUM_WARPS`` (fused
-    RMSNorm) and ``RA_ROWS`` / ``RA_NUM_WARPS`` / ``RA_CTAS_PER_CU`` (without it)
-    for the pre reduce/apply kernel. The split-K count is not here: it follows
-    the HIP ``get_mhc_fused_post_pre_config`` policy, capped as above.
+    ring (see ``_gluon_split_num_stages``); ``SPLIT_K_MAX`` (optional) caps the
+    split-K count further; ``RA_NORM_NUM_WARPS`` (fused RMSNorm: the fewest
+    apply warps, raised until a row fits 4 column chunks) and ``RA_ROWS`` /
+    ``RA_NUM_WARPS`` / ``RA_CTAS_PER_CU`` (without it) for the pre reduce/apply
+    kernel. The split-K count follows the HIP ``get_mhc_fused_post_pre_config``
+    policy, capped as above.
 
     The returned dict is cached and shared -- read-only.
     """

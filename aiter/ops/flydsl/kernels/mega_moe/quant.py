@@ -10,7 +10,7 @@ from flydsl.expr import const_expr, range_constexpr, rocdl
 from flydsl.expr import math as fmath
 from flydsl.expr.typing import ReductionOp, T
 
-from ..tensor_shim import buf_copy_atom, ptr_buf_tensor
+from ..tensor_shim import _run_compiled, buf_copy_atom, ptr_buf_tensor
 
 BLOCK = 64
 GROUP = 32
@@ -23,7 +23,7 @@ _FP8_E4M3_INV_MAX_POS_BITS = 0x3B124925
 def _load_i32x4(buffer, index):
     fragment = fx.make_rmem_tensor(4, fx.Int32)
     fx.copy(buf_copy_atom(16), fx.slice(buffer, (index, None)), fragment)
-    return fx.Vector(fragment.load())
+    return fragment.load()
 
 
 def _store_i32x4(buffer, index, value):
@@ -181,8 +181,14 @@ def per_1x32_mx_quant(x, quant_mode="fp4", stream=None):
         stream if stream is not None else torch.cuda.current_stream().cuda_stream
     )
     # Store FP4 as bytes and return the payload with aiter's packed FP4 dtype.
-    _get_launcher(n, quant_mode)(
-        x, y, scale, int(m), int(grid_blocks), stream=fx_stream
+    _run_compiled(
+        _get_launcher(n, quant_mode),
+        x,
+        y,
+        scale,
+        int(m),
+        int(grid_blocks),
+        fx_stream,
     )
     if quant_mode == "fp4":
         y = y.view(torch.float4_e2m1fn_x2)
@@ -221,7 +227,7 @@ def build_mxfp4_moe_scale_sort_module(cols: int):
         row_base = block << fx.Int32(5)
         tile_base = block * fx.Int32(n32)
         num_valid_ids = nv_buf[fx.Int32(0)]
-        token_max = token_num - fx.Int32(1)
+        token_max = token_num - 1
 
         def token_scale_base(row):
             fused = sid_buf[row]
@@ -282,17 +288,20 @@ def mxfp4_moe_scale_sort(
         launcher = build_mxfp4_moe_scale_sort_module(int(cols))
         _SCALE_SORT_CACHE[int(cols)] = launcher
     out_u8 = out_scale.view(torch.uint8)
-    scale_u8 = scale.view(torch.uint8)
+    # The kernel uses base addresses. Flat aliases keep the cached argument
+    # layout stable when callers change the rank of these raw buffers.
+    scale_u8 = scale.view(torch.uint8).view(-1)
     grid_tiles = int(out_u8.shape[0]) // 32  # one block per 32-row preshuffle tile
     fx_stream = fx.Stream(
         stream if stream is not None else torch.cuda.current_stream().cuda_stream
     )
-    launcher(
+    _run_compiled(
+        launcher,
         scale_u8,
-        sorted_ids,
-        num_valid,
-        out_u8,
+        sorted_ids.view(-1),
+        num_valid.view(-1),
+        out_u8.view(-1),
         int(token_num),
         int(grid_tiles),
-        stream=fx_stream,
+        fx_stream,
     )
