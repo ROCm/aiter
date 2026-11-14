@@ -1,4 +1,55 @@
 {
+    "chunk_delta_attn_bwd_kernel_dav": {
+        "BV": 64,
+        "num_warps": 4,
+        "num_stages": 2
+    },
+    "chunk_delta_attn_bwd_kernel_fwd_h": {
+        "BV": 32,
+        "num_warps": 2,
+        "num_stages": 2
+    },
+    "chunk_delta_attn_bwd_kernel_fwd_h_wide": {
+        "BV": 64,
+        "num_warps": 4,
+        "num_stages": 2
+    },
+    "chunk_delta_attn_bwd_kernel_dhu": {
+        "BV": 32,
+        "num_warps": 2,
+        "num_stages": 2
+    },
+    "chunk_delta_attn_bwd_kernel_dhu_wide": {
+        "BV": 64,
+        "num_warps": 4,
+        "num_stages": 2
+    },
+    "chunk_delta_attn_bwd_kernel_wy_dqkg": {
+        "BK": 64,
+        "BV": 32,
+        "num_warps": 2,
+        "num_stages": 1
+    },
+    "chunk_delta_attn_bwd_kernel_intra": {
+        "BK": 64,
+        "num_warps": 2,
+        "num_stages": 2
+    },
+    "chunk_delta_attn_bwd_kernel_gate_cumsum": {
+        "BS": 32,
+        "num_warps": 4,
+        "num_stages": 2
+    },
+    "chunk_delta_attn_bwd_kernel_l2norm": {
+        "BT": 32,
+        "num_warps": 2,
+        "num_stages": 2
+    },
+    "chunk_delta_attn_bwd_kernel_beta_sigmoid": {
+        "BLOCK_SIZE": 2048,
+        "num_warps": 8,
+        "num_stages": 2
+    },
     "chunk_gla_fwd_kernel_o": {
         "BK": 64,
         "BV": 128,
