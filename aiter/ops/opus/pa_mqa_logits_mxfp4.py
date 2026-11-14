@@ -1078,9 +1078,14 @@ def _lane_max_out_span(out: torch.Tensor, rows: int, flat: bool) -> int:
 def _check_lane_max(
     lane_max: torch.Tensor, out: torch.Tensor, rows: int, flat: bool
 ) -> None:
-    """Reject a ``lane_max`` the kernels would store past: rows not 64-element aligned, or
-    fewer elements than the slots of ``out``'s addressed span need (padded row strides
-    included)."""
+    """Reject a ``lane_max`` the kernels cannot store to: on another device than ``out``, a
+    2-D ``out`` whose row stride is not 64-element aligned, or fewer elements than the slots of
+    ``out``'s addressed span need (padded row strides included). For a flat ``out`` the
+    64-element alignment and row order of ``out_offsets`` are the caller's job and are not
+    checked here: offsets that break them make rows' slots overlap, but the stores stay inside a
+    buffer this check accepts."""
+    if lane_max.device != out.device:
+        raise ValueError(f"lane_max is on {lane_max.device}; out is on {out.device}")
     if not flat and out.stride(0) % _LANE_MAX_ROW_ALIGN:
         raise ValueError(
             f"lane maxima need rows {_LANE_MAX_ROW_ALIGN}-element aligned, got a row stride "
