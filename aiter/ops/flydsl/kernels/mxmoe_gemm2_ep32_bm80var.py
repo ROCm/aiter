@@ -364,6 +364,7 @@ def gemm2_body_v2(
     b_nt=False,
     sorted_rows=False,
     native_c=False,
+    native_bf16=False,
     n_waves=4,
     b_stages=3,
     n_col_in=None,
@@ -788,22 +789,38 @@ def gemm2_body_v2(
 
     def _epilog(accm, **kw):
         if const_expr(native_c):
-            # Store each native MFMA fragment contiguously: no C LDS transpose,
-            # token gather, route-weight multiply or BF16 conversion in GEMM2.
-            out_ptr = global_typed_ptr(arg_out, T.f32, align=16)
+            # Native BF16 stores the same weighted, rounded route contribution
+            # that the FP32 reducer computes, so the following sum is unchanged.
+            out_elem = BFloat16 if const_expr(native_bf16) else Float32
+            out_ptr = global_typed_ptr(arg_out, T.bf16 if const_expr(native_bf16) else T.f32, align=16)
             out_view = fx.Tensor(fx.make_view(out_ptr, fx.make_layout((1, 1), (1, 1))))
             out_buf = fx.rocdl.make_buffer_tensor(out_view, max_size=True)
-            store = fx.make_copy_atom(fx.rocdl.BufferCopy128b(), Float32)
+            store = fx.make_copy_atom(
+                fx.rocdl.BufferCopy64b() if const_expr(native_bf16) else fx.rocdl.BufferCopy128b(), out_elem
+            )
+            if const_expr(native_bf16):
+                weight_ptr = global_typed_ptr(arg_sweights, T.f32, align=16)
+                weight_view = fx.Tensor(fx.make_view(weight_ptr, fx.make_layout((1, 1), (1, 1))))
+                weight_buf = fx.rocdl.make_buffer_tensor(weight_view, max_size=True)
+                weight_load = fx.make_copy_atom(fx.rocdl.BufferCopy128b(), Float32)
             n16 = _udiv(N_OUT_rt, fx.Int32(16))
             live_cols = fx.Int32(BN) if const_expr(n_live is None) else n_live
             if wave * fx.Int32(CPW) < live_cols:
                 for i in range_constexpr(kMChunks):
                     mc = _udiv(m_row, fx.Int32(16)) + fx.Int32(i)
+                    if const_expr(native_bf16):
+                        wf = fx.make_rmem_tensor(4, Float32)
+                        weight_row = m_row + fx.Int32(i * 16) + lane_div_16 * fx.Int32(4)
+                        fx.copy(weight_load, weight_buf[None, weight_row], wf)
+                        weights4 = Vec(wf.load())
                     for J in range_constexpr(numAccN):
                         nc = n_col // fx.Int32(16) + wave * fx.Int32(CPW // 16) + fx.Int32(J)
                         offset = (mc * n16 + nc) * fx.Int32(256) + lane * fx.Int32(4)
-                        frag = fx.make_rmem_tensor(4, Float32)
-                        frag.store(Vec(accm[i][J]))
+                        frag = fx.make_rmem_tensor(4, out_elem)
+                        values = Vec(accm[i][J])
+                        if const_expr(native_bf16):
+                            values = (values * weights4).to(BFloat16)
+                        frag.store(values)
                         fx.copy(store, frag, out_buf[None, offset])
         else:
             atomic_bf16_epilog(
@@ -964,10 +981,10 @@ def gemm2_body_v2(
                 mfma_cluster(cur_bqf, bs[kt], sa[kt], fx.Int32(kt))
                 cur_bqf, nxt_bqf = nxt_bqf, cur_bqf
     elif const_expr(b_lds):
-        # Three 10 KiB A slots and three 16 KiB B slots fit two WGs/CU.
-        # A and B are both issued two steps ahead, in that order. Scopes
+        # Three A slots and a per-specialization B ring. BM96 uses three B
+        # slots to fit 160 KiB LDS; both streams are then two steps ahead. Scopes
         # let current-slot DS reads wait without draining future DMAs.
-        assert BM == 80 and BK == 128 and aStages == 3
+        assert BM in (80, 96) and BK == 128 and aStages == 3
         KT = K_TILES_MAX
         B_SLOT = BN * KH_TILE_A // 2
         b_base = aStages * slot_bytes
@@ -1820,32 +1837,43 @@ def compile_gemm2_ep32(
     B_NT=False,
     REDUCE=False,
     NATIVE_C=False,
+    NATIVE_BF16=False,
     NW=8,
     CPW=64,
     EPI_L=32,
     WPE=2,
-    BSTAGES=4,
+    BSTAGES=None,
     VARWIDTH=True,
 ):
     from .mxmoe_dispatcher import _spart_output_tile_index
 
-    if BM not in (64, 80):
-        raise ValueError(f"EP32 GEMM2 supports BM64 or BM80, got {BM}")
+    if BM not in (64, 80, 96):
+        raise ValueError(f"EP32 GEMM2 supports BM64, BM80 or BM96, got {BM}")
+    if NATIVE_BF16 and not (NATIVE_C and BM == 96):
+        raise ValueError("weighted native BF16 staging requires BM96 native output")
+    if NATIVE_BF16:
+        NW, CPW, VARWIDTH = 7, 64, False
+        GRID_WGS = min(GRID_WGS, 256)
     assert not VARWIDTH or (NATIVE_C and NW == 8 and CPW == 64)
+    if BSTAGES is None:
+        BSTAGES = 3 if BM == 96 else 4
     BLK, BN, BK = BM, NW * CPW, 128
     a_dtype, b_dtype = "fp8", "fp4"
     KH_TILE_A = BK
-    ROWS = 80  # every tile runs the 80-row body (see header)
+    ROWS = 96 if BM == 96 else 80
     aStages = 3
     use_b_lds = not use_nt and INTER_MAX == 3072
     lds_bytes = max(ROWS * BN * 2, aStages * ROWS * KH_TILE_A + (BSTAGES * BN * BK // 2 if use_b_lds else 0))
+    assert lds_bytes <= 160 * 1024, f"EP32 GEMM2 LDS exceeds gfx950 capacity: {lds_bytes}"
     WAVES_PER_EU = WPE
     name = (
         f"gemm2_ep32_a8w4_hmax{HIDDEN_MAX}_imax{INTER_MAX}_g{GRID_WGS}{f'_sp{SPART}' if SPART else ''}{'_pr' if PRUNE else ''}"
-        f"{'_nt' if use_nt else ''}{'_valid_tokens' if use_valid_token_count else ''}{'_blds2' if use_b_lds else ''}{'_bm80' if BM == 80 else ''}{'_bnt' if B_NT else ''}{'_nativef32' if NATIVE_C else ('_store128' if REDUCE else '')}"
+        f"{'_nt' if use_nt else ''}{'_valid_tokens' if use_valid_token_count else ''}{'_blds2' if use_b_lds else ''}{f'_bm{BM}' if BM in (80, 96) else ''}{'_bnt' if B_NT else ''}{'_nativef32' if NATIVE_C else ('_store128' if REDUCE else '')}"
     )
 
     name += f'_bn{BN}w{NW}_bs{BSTAGES}' + ('_var384x8_512' if VARWIDTH else '')
+    if NATIVE_BF16:
+        name += '_nativebf16w'
 
     @fx.struct
     class SharedStorage:
@@ -1952,6 +1980,7 @@ def compile_gemm2_ep32(
             b_nt=B_NT,
             sorted_rows=REDUCE,
             native_c=NATIVE_C,
+            native_bf16=NATIVE_BF16,
             n_waves=NW,
             b_stages=BSTAGES,
             n_col_in=col_start if VARWIDTH else None,
@@ -2106,7 +2135,7 @@ def compile_gemm2_ep32(
                 )
 
     @flyc.kernel(name=name, known_block_size=[64 * NW, 1, 1])
-    def gemm2_kernel80(
+    def gemm2_kernel_block(
         arg_aq: fx.Int64,
         arg_ascale: fx.Int64,
         arg_bq: fx.Int64,
@@ -2124,7 +2153,7 @@ def compile_gemm2_ep32(
         arg_out_scale: fx.Int64,
         i32_grid_blocks: fx.Int32,
     ):
-        # 80-row sort blocks: every block is one 80-row tile.
+        # BM80/BM96 sort blocks: every block is one full tile.
         tx_i32 = fx.thread_idx.x
         bx_i32 = fx.block_idx.x
         lane = tx_i32 % 64
@@ -2199,7 +2228,7 @@ def compile_gemm2_ep32(
     ):
         num_n_blocks = fx.Int32(fx.Uint32(i32_hidden) // fx.Uint32(BN))
         grid_x = fx.Int32(GRID_WGS)
-        (gemm2_kernel80 if const_expr(BM == 80) else gemm2_kernel)(
+        (gemm2_kernel_block if const_expr(BM in (80, 96)) else gemm2_kernel)(
             arg_aq,
             arg_ascale,
             arg_bq,
