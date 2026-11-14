@@ -183,7 +183,7 @@ gfx1250,256,8,201088,2880,False,torch.bfloat16,torch.bfloat16,False,False,triton
 gfx1250,256,16,201088,2880,False,torch.bfloat16,torch.bfloat16,False,False,triton,0,0,0.0,auto,0.0,0.0,0.0
 gfx1250,256,32,201088,2880,False,torch.bfloat16,torch.bfloat16,False,False,triton,0,0,0.0,auto,0.0,0.0,0.0
 gfx1250,256,48,201088,2880,False,torch.bfloat16,torch.bfloat16,False,False,triton,0,0,0.0,auto,0.0,0.0,0.0
-gfx1250,256,64,201088,2880,False,torch.bfloat16,torch.bfloat16,False,False,triton,0,0,0.0,auto,0.0,0.0,0.0
+gfx1250,256,64,201088,2880,False,torch.bfloat16,torch.bfloat16,False,False,flydsl,0,1,97.9762,flydsl_hgemm_abf16_wbf16_bf16_t64x128x128x3_ks1_w2x2x1_bias0_ktail0_gm0_pht_gfx1250,0.0,756.6,12088.39
 gfx1250,256,128,201088,2880,False,torch.bfloat16,torch.bfloat16,False,False,triton,0,0,0.0,auto,0.0,0.0,0.0
 gfx1250,256,256,201088,2880,False,torch.bfloat16,torch.bfloat16,False,False,triton,0,0,0.0,auto,0.0,0.0,0.0
 gfx1250,256,512,201088,2880,False,torch.bfloat16,torch.bfloat16,False,False,triton,0,0,0.0,auto,0.0,0.0,0.0
