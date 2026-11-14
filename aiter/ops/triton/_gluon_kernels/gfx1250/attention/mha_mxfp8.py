@@ -173,14 +173,19 @@ def apply_mask(
     BLOCK_M,
     BLOCK_N,
     SEQLEN_K,
-    USE_CAUSAL_OFFSET,
+    USE_CAUSAL_OFFSET: gl.constexpr,
     CAUSAL_OFFSET,
-    LAYOUT,
-    CAUSAL,
-    MASK_END,
+    LAYOUT: gl.constexpr,
+    CAUSAL: gl.constexpr,
+    MASK_START: gl.constexpr,
+    MASK_END: gl.constexpr,
+    PAD_START,
+    SLIDING_WINDOW: gl.constexpr,
 ):
-    # CAUSAL_OFFSET = SEQLEN_K - SEQLEN_Q aligns the causal diagonal to the
-    # bottom-right corner: query i attends to keys j <= i + CAUSAL_OFFSET.
+    # CAUSAL_OFFSET aligns the causal diagonal to the bottom-right corner:
+    # query i attends to keys j <= i + CAUSAL_OFFSET, and with a sliding window
+    # (SLIDING_WINDOW > 0) to keys j >= i + CAUSAL_OFFSET - SLIDING_WINDOW.
+    # Keys j < PAD_START belong to the previous varlen sequence.
     if CAUSAL:
         offs_m = tile_m * BLOCK_M + gl.arange(
             0, BLOCK_M, layout=gl.SliceLayout(1, LAYOUT)
@@ -198,6 +203,11 @@ def apply_mask(
         mask = offs_m[:, None] >= offs_n[None, :]
     else:
         mask = offs_n[None, :] < SEQLEN_K
+
+    if MASK_START:
+        mask = mask & (offs_n[None, :] >= PAD_START)
+        if SLIDING_WINDOW > 0:
+            mask = mask & (offs_n[None, :] >= offs_m[:, None] - SLIDING_WINDOW)
 
     qk = tl.where(mask, qk, float("-inf"))
     return qk
@@ -246,8 +256,13 @@ def _mha_fwd_subtiled(
     NUM_K_HEADS: gl.constexpr,
     SEQLEN_Q,
     SEQLEN_K,
-    USE_CAUSAL_OFFSET: gl.constexpr,
-    CAUSAL_OFFSET,
+    UNEQUAL_SEQLENS: gl.constexpr,
+    VARLEN: gl.constexpr,
+    SLIDING_WINDOW: gl.constexpr,
+    sink_ptr,
+    ENABLE_SINK: gl.constexpr,
+    cu_seqlens_q_ptr,
+    cu_seqlens_k_ptr,
     grid_m,
     BLOCK_M: gl.constexpr,
     BLOCK_N: gl.constexpr,
@@ -263,8 +278,10 @@ def _mha_fwd_subtiled(
 ):
     BLOCK_N_MX: gl.constexpr = BLOCK_N // 32
     HEAD_DIM_MX: gl.constexpr = HEAD_DIM // 32
+    # The left edge of the window fits in K tile 0 only if
+    # BLOCK_N >= BLOCK_M + 32. Otherwise mask it in all K tiles.
+    MASK_SW_ALL: gl.constexpr = SLIDING_WINDOW > 0 and BLOCK_N < BLOCK_M + 32
     HEAD_DIM_POW2_MX: gl.constexpr = HEAD_DIM_POW2 // 32
-    SEQLEN_K_MX = gl.cdiv(SEQLEN_K, 32)
 
     SHARED_LAYOUT_Q: gl.constexpr = gl.PaddedSharedLayout.with_identity_for(
         [[256, 16]], [BLOCK_M, HEAD_DIM_POW2], [1, 0]
@@ -321,13 +338,53 @@ def _mha_fwd_subtiled(
     GQA_SIZE: gl.constexpr = NUM_Q_HEADS // NUM_K_HEADS
     h_k = h_q // GQA_SIZE
 
-    q_ptr += z * stride_q_z + h_q * stride_q_h
-    q_scale_ptr += z * stride_q_scale_z + h_q * stride_q_scale_h
-    k_ptr += z * stride_k_z + h_k * stride_k_h
-    k_scale_ptr += z * stride_k_scale_z + h_k * stride_k_scale_h
-    v_ptr += z * stride_v_z + h_k * stride_v_h
-    v_scale_ptr += z * stride_v_scale_z + h_k * stride_v_scale_h
-    o_ptr += z * stride_o_z + h_q * stride_o_h
+    if VARLEN:
+        q_start = gl.load(cu_seqlens_q_ptr + z)
+        SEQLEN_Q = gl.load(cu_seqlens_q_ptr + z + 1) - q_start
+        if pid_m * BLOCK_M >= SEQLEN_Q:
+            return
+        k_start = gl.load(cu_seqlens_k_ptr + z)
+        SEQLEN_K = gl.load(cu_seqlens_k_ptr + z + 1) - k_start
+        # Start K and V at a multiple of 32 so that the V scale blocks align
+        # with the tiles. The PAD_START keys before the start are masked.
+        PAD_START = k_start % 32
+        k_start -= PAD_START
+        SEQLEN_K += PAD_START
+        q_ptr += h_q * stride_q_h + q_start * stride_q_m
+        q_scale_ptr += h_q * stride_q_scale_h + q_start * stride_q_scale_m
+        k_ptr += h_k * stride_k_h + k_start * stride_k_n
+        k_scale_ptr += h_k * stride_k_scale_h + k_start * stride_k_scale_n
+        v_ptr += h_k * stride_v_h + k_start * stride_v_n
+        v_scale_ptr += h_k * stride_v_scale_h + (k_start // 32) * stride_v_scale_n
+        o_ptr += h_q * stride_o_h + q_start * stride_o_m
+    else:
+        PAD_START = 0
+        q_ptr += z * stride_q_z + h_q * stride_q_h
+        q_scale_ptr += z * stride_q_scale_z + h_q * stride_q_scale_h
+        k_ptr += z * stride_k_z + h_k * stride_k_h
+        k_scale_ptr += z * stride_k_scale_z + h_k * stride_k_scale_h
+        v_ptr += z * stride_v_z + h_k * stride_v_h
+        v_scale_ptr += z * stride_v_scale_z + h_k * stride_v_scale_h
+        o_ptr += z * stride_o_z + h_q * stride_o_h
+
+    CAUSAL_OFFSET = SEQLEN_K - SEQLEN_Q
+
+    if SLIDING_WINDOW > 0:
+        # Skip the keys before the window of the first row of this tile. Keep
+        # the start a multiple of 32 so that the V scale blocks align.
+        window_start = gl.maximum(
+            pid_m * BLOCK_M + CAUSAL_OFFSET - SLIDING_WINDOW, PAD_START
+        )
+        k_skip = window_start // 32 * 32
+        k_ptr += (k_skip // PRESHUFFLE_FACTOR_K) * stride_k_n
+        k_scale_ptr += k_skip * stride_k_scale_n
+        v_ptr += k_skip * stride_v_n
+        v_scale_ptr += (k_skip // 32) * stride_v_scale_n
+        SEQLEN_K -= k_skip
+        CAUSAL_OFFSET -= k_skip
+        PAD_START = window_start % 32
+
+    SEQLEN_K_MX = gl.cdiv(SEQLEN_K, 32)
 
     qk_scale: gl.constexpr = SM_SCALE * 1.44269504
 
@@ -409,6 +466,27 @@ def _mha_fwd_subtiled(
         o_ptr.dtype.element_ty, shape=[BLOCK_M, HEAD_DIM_POW2], layout=SHARED_LAYOUT_O
     )
 
+    if CAUSAL and UNEQUAL_SEQLENS:  # noqa: SIM102 (constexpr check, then runtime check)
+        # No row of this tile has a visible key: write zeros and exit.
+        if (pid_m + 1) * BLOCK_M + CAUSAL_OFFSET - PAD_START <= 0:
+            o_buffer.store(
+                gl.zeros(
+                    (BLOCK_M, HEAD_DIM_POW2),
+                    dtype=o_ptr.dtype.element_ty,
+                    layout=WMMA_LAYOUT_O,
+                )
+            )
+            o_desc = gl.amd.cdna5.tdm.make_tensor_descriptor(
+                base=o_ptr,
+                shape=(SEQLEN_Q, HEAD_DIM),
+                strides=(stride_o_m, stride_o_d),
+                block_shape=(BLOCK_M, HEAD_DIM_POW2),
+                layout=SHARED_LAYOUT_O,
+            )
+            gl.amd.gfx1250.tdm.async_store(o_desc, [pid_m * BLOCK_M, 0], o_buffer)
+            gl.amd.gfx1250.tdm.async_wait(0)
+            return
+
     gl.amd.gfx1250.tdm.async_load(
         q_desc,
         [pid_m * BLOCK_M, 0],
@@ -429,14 +507,30 @@ def _mha_fwd_subtiled(
     acc1 = gl.zeros(
         (BLOCK_M, HEAD_DIM_POW2 // 2), dtype=gl.float32, layout=WMMA_LAYOUT_O
     )
+    if ENABLE_SINK:
+        # The sink is a softmax column without a value vector. Start the
+        # running max at the sink logit and the running sum at its term, 1.
+        m_i_init = gl.load(sink_ptr + h_q).to(gl.float32) * 1.44269504
+        l_i_init = 1.0
+    elif MASK_SW_ALL:
+        # A row sees no key in K tile 0 when its window starts in a later
+        # tile. A finite start keeps exp2(qk - m_i) at 0 instead of NaN.
+        m_i_init = -1e30
+        l_i_init = 0.0
+    else:
+        m_i_init = float("-inf")
+        l_i_init = 0.0
     m_i = gl.full(
         [BLOCK_M],
-        float("-inf"),
+        m_i_init,
         dtype=gl.float32,
         layout=gl.SliceLayout(1, WMMA_LAYOUT_QK),
     )
-    l_i = gl.zeros(
-        [BLOCK_M], dtype=gl.float32, layout=gl.SliceLayout(1, WMMA_LAYOUT_QK)
+    l_i = gl.full(
+        [BLOCK_M],
+        l_i_init,
+        dtype=gl.float32,
+        layout=gl.SliceLayout(1, WMMA_LAYOUT_QK),
     )
 
     read_idx_k = 0
@@ -511,22 +605,27 @@ def _mha_fwd_subtiled(
     qk0 = gl.amd.cdna5.wmma_scaled(q, q_scale, "e4m3", k0, k0_scale, "e4m3", qk_zeros)
     qk1 = gl.amd.cdna5.wmma_scaled(q, q_scale, "e4m3", k1, k1_scale, "e4m3", qk_zeros)
 
-    if (CAUSAL or SHORT_SEQ) and num_n_iter <= 2:
-        qk = concat_subtile(qk0, qk1)
-        qk = apply_mask(
-            qk,
-            pid_m,
-            0,
-            BLOCK_M,
-            BLOCK_N,
-            SEQLEN_K,
-            USE_CAUSAL_OFFSET,
-            CAUSAL_OFFSET,
-            WMMA_LAYOUT_QK,
-            CAUSAL,
-            SHORT_SEQ,
-        )
-        qk0, qk1 = split_subtile(qk)
+    # Constexpr check, then runtime check: they cannot be one `if`.
+    if CAUSAL or SHORT_SEQ or VARLEN:  # noqa: SIM102
+        if SLIDING_WINDOW > 0 or num_n_iter <= 2 or PAD_START > 0:
+            qk = concat_subtile(qk0, qk1)
+            qk = apply_mask(
+                qk,
+                pid_m,
+                0,
+                BLOCK_M,
+                BLOCK_N,
+                SEQLEN_K,
+                UNEQUAL_SEQLENS or SLIDING_WINDOW > 0,
+                CAUSAL_OFFSET,
+                WMMA_LAYOUT_QK,
+                CAUSAL,
+                VARLEN or SLIDING_WINDOW > 0,
+                SHORT_SEQ or VARLEN or SLIDING_WINDOW > 0,
+                PAD_START,
+                SLIDING_WINDOW,
+            )
+            qk0, qk1 = split_subtile(qk)
 
     qk = concat_subtile(qk0, qk1)
     m_ij = fast_maximum(m_i, gl.reduce(qk, 1, fast_maximum) * qk_scale)
@@ -545,7 +644,7 @@ def _mha_fwd_subtiled(
         layout=DOT_LAYOUT_K_SCALE,
     )
 
-    for _ in range(num_n_iter - 3):
+    for i in range(num_n_iter - 3):
 
         if _HAS_SCHED_BARRIER:
             gl.amd.hint.sched_barrier()
@@ -591,6 +690,25 @@ def _mha_fwd_subtiled(
         qk1 = gl.amd.cdna5.wmma_scaled(
             q, q_scale, "e4m3", k1, k1_scale, "e4m3", qk_zeros
         )
+        if MASK_SW_ALL:
+            qk = concat_subtile(qk0, qk1)
+            qk = apply_mask(
+                qk,
+                pid_m,
+                i + 1,
+                BLOCK_M,
+                BLOCK_N,
+                SEQLEN_K,
+                True,
+                CAUSAL_OFFSET,
+                WMMA_LAYOUT_QK,
+                CAUSAL,
+                True,
+                False,
+                PAD_START,
+                SLIDING_WINDOW,
+            )
+            qk0, qk1 = split_subtile(qk)
         v0 = local_load_v(
             v_buffer, read_idx_v, 0, BLOCK_N, HEAD_DIM_POW2, layout=DOT_LAYOUT_V
         )
@@ -704,7 +822,7 @@ def _mha_fwd_subtiled(
         qk1 = gl.amd.cdna5.wmma_scaled(
             q, q_scale, "e4m3", k1, k1_scale, "e4m3", qk_zeros
         )
-        if CAUSAL or SHORT_SEQ:
+        if CAUSAL or SHORT_SEQ or VARLEN:
             num_n_iter = gl.maximum(num_n_iter, 3)
             qk = concat_subtile(qk0, qk1)
             qk = apply_mask(
@@ -714,11 +832,14 @@ def _mha_fwd_subtiled(
                 BLOCK_M,
                 BLOCK_N,
                 SEQLEN_K,
-                USE_CAUSAL_OFFSET,
+                UNEQUAL_SEQLENS or SLIDING_WINDOW > 0,
                 CAUSAL_OFFSET,
                 WMMA_LAYOUT_QK,
                 CAUSAL,
-                SHORT_SEQ,
+                MASK_SW_ALL,
+                SHORT_SEQ or VARLEN or SLIDING_WINDOW > 0,
+                PAD_START,
+                SLIDING_WINDOW,
             )
             qk0, qk1 = split_subtile(qk)
 
@@ -818,7 +939,7 @@ def _mha_fwd_subtiled(
             q, q_scale, "e4m3", k1, k1_scale, "e4m3", qk_zeros
         )
 
-        if CAUSAL or not EVEN_N or SHORT_SEQ:
+        if CAUSAL or not EVEN_N or SHORT_SEQ or VARLEN:
             qk = concat_subtile(qk0, qk1)
             qk = apply_mask(
                 qk,
@@ -827,11 +948,14 @@ def _mha_fwd_subtiled(
                 BLOCK_M,
                 BLOCK_N,
                 SEQLEN_K,
-                USE_CAUSAL_OFFSET,
+                UNEQUAL_SEQLENS or SLIDING_WINDOW > 0,
                 CAUSAL_OFFSET,
                 WMMA_LAYOUT_QK,
                 CAUSAL,
-                not EVEN_N or SHORT_SEQ,
+                MASK_SW_ALL,
+                not EVEN_N or SHORT_SEQ or VARLEN or SLIDING_WINDOW > 0,
+                PAD_START,
+                SLIDING_WINDOW,
             )
             qk0, qk1 = split_subtile(qk)
 
@@ -923,6 +1047,12 @@ def _mha_fwd_subtiled(
     # epilogue
 
     acc = concat_subtile(acc0, acc1)
+    if CAUSAL and UNEQUAL_SEQLENS:
+        # Rows without a visible key give zero.
+        offs_m = pid_m * BLOCK_M + gl.arange(
+            0, BLOCK_M, layout=gl.SliceLayout(1, WMMA_LAYOUT_O)
+        )
+        acc = gl.where((offs_m + CAUSAL_OFFSET - PAD_START >= 0)[:, None], acc, 0.0)
     o_buffer.store(acc)
     o_desc = gl.amd.cdna5.tdm.make_tensor_descriptor(
         base=o_ptr,
