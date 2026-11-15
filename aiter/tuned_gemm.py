@@ -689,8 +689,8 @@ def flydsl_gemm(
         and bias.dtype == inp.dtype
     ):
         fused_bias = bias
-    if skinny:
-        policy = flydsl_gemm_kernels.SKINNY_POLICY
+    if skinny or flydsl_config["policy"] in ("bs", *flydsl_gemm_kernels.TDM_POLICIES):
+        policy = flydsl_config["policy"]
     else:
         policy = "ht" if flydsl_config["use_half_tile_interleaved"] else "ft"
     result = flydsl_gemm_kernels.flydsl_hgemm(
@@ -707,6 +707,8 @@ def flydsl_gemm(
         k_waves=flydsl_config["k_waves"],
         stages=flydsl_config["stages"],
         group_m=flydsl_config["group_m"],
+        k_stagger=flydsl_config["k_stagger"],
+        b_non_temporal=flydsl_config["b_non_temporal"],
         policy=policy,
         out_dtype=None if skinny else otype,
     )

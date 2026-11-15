@@ -466,8 +466,10 @@ void pa_ps_fwd(aiter_tensor_t* Q,            //   [num_seqs, num_heads, head_siz
     }
 
     CFG* config_map = &cfg_pa_asm; // only one config csv in hsa/<arch>/pa, now
-    static SynchronizedCache<std::string_view, AiterAsmKernel> impl_ptr_map;
+    static SynchronizedCache<std::string, AiterAsmKernel> impl_ptr_map;
     std::string arch_id = get_gpu_arch();
+    AITER_CHECK(!splitData || splitData->dtype() == AITER_DTYPE_fp32,
+                __func__, ": split partial output must be FP32");
     std::string kernelName = (kernelName_ != nullptr) ? std::string(kernelName_) :
         get_heuristic_kernel(q_type, kv_type, gqa, mtp, msk, hp, block_size, arch_id, ps, qTile, quant_type, config_map);
     if(kernelName.empty())
@@ -482,11 +484,11 @@ void pa_ps_fwd(aiter_tensor_t* Q,            //   [num_seqs, num_heads, head_siz
     if(it != config_map->end())
     {
         const auto& cfg     = it->second;
-        const char* name    = cfg.knl_name.c_str();
-        const char* co_name = cfg.co_name.c_str();
+        std::string name = cfg.knl_name;
+        std::string co_name = cfg.co_name;
 
         impl_ptr =
-            &impl_ptr_map.get_or_create(name, [&]() { return AiterAsmKernel(name, co_name); });
+            &impl_ptr_map.get_or_create(name, [&]() { return AiterAsmKernel(name.c_str(), co_name.c_str()); });
         if(cfg.ps)
         {
             gdx = get_num_cu_func();

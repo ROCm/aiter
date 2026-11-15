@@ -341,7 +341,7 @@ def _make_topk(
     score = _make_routing_score(tokens, routed_experts, routed_topk)
     topk_w, topk_id = fused_topk(hidden_states, score, routed_topk, True)
     if shared_experts:
-        # Shared MLPs contribute outside the routed-weight renormalization.
+        # Shared MLPs always contribute with unit weight, outside routed renorm.
         shared_ids = torch.arange(
             routed_experts, experts, dtype=topk_id.dtype, device=topk_id.device
         ).expand(tokens, -1)
@@ -657,20 +657,26 @@ def _active_expert_count(topk_ids: torch.Tensor) -> int:
 
 def _gemm_work_metrics(
     *,
-    active_experts: int,
+    active_experts: int | None = None,
+    experts: int | None = None,
     tokens: int,
     topk: int,
     model_dim: int,
     inter_dim: int,
     data_format: str,
+    shared_experts: int = 0,
+    fuse_gemm1_act: bool = True,
+    fuse_gemm1_requant: bool = True,
 ) -> dict[str, tuple[float, float]]:
     """Return conventional GEMM FLOPs and effective fused-MoE bytes.
 
-    The byte model matches the grouped-MoE tuner: logical quantized inputs and
-    weights, their E8M0 block scales, and logical BF16 outputs. Weight payloads
-    and scales are counted once per actually routed expert, not per allocated
-    expert. GEMM1 counts the post-activation output, whose width is
-    ``inter_dim``; GEMM2 counts its
+    The byte model counts logical quantized inputs, weights and their E8M0 block
+    scales, and the selected GEMM output formats. Weight and scale bytes use an
+    active-expert count
+    of min(tokens * routed_topk, routed_experts) plus shared experts.
+    GEMM1 writes MX payload plus scales when activation and requant are fused,
+    BF16 gate/up when activation is separate, or BF16 post-activation output
+    when only requant is separate. GEMM2 counts its BF16
     per-route output before gather-reduce. The model excludes routing,
     quantization, bias, and other fused-MoE auxiliary traffic, so the reported
     bandwidth is effective bandwidth rather than measured HBM traffic.
@@ -680,12 +686,25 @@ def _gemm_work_metrics(
     output_bytes = 2.0
     stage1_n = 2 * inter_dim
     routed_rows = tokens * topk
+    if active_experts is None:
+        active_experts = (
+            min(tokens * (topk - shared_experts), experts - shared_experts)
+            + shared_experts
+        )
+    if fuse_gemm1_act and fuse_gemm1_requant:
+        # Match the MX output allocation, including padded E8M0 scale dwords.
+        gemm1_output_bytes = routed_rows * (
+            inter_dim * input_bytes + (inter_dim + 127) // 128 * 4
+        )
+    else:
+        output_width = inter_dim if fuse_gemm1_act else stage1_n
+        gemm1_output_bytes = routed_rows * output_width * output_bytes
 
     gemm1_flops = routed_rows * stage1_n * model_dim * 2
     gemm1_bytes = (
         routed_rows * model_dim * input_bytes
         + routed_rows * model_dim // SCALE_BLOCK
-        + routed_rows * inter_dim * output_bytes
+        + gemm1_output_bytes
         + active_experts * model_dim * stage1_n * weight_bytes
         + active_experts * model_dim * stage1_n // SCALE_BLOCK
     )
@@ -717,6 +736,38 @@ def _rates(
 # ---------------------------------------------------------------------------
 # Pytest correctness suite
 # ---------------------------------------------------------------------------
+@pytest.mark.parametrize(
+    "data_format,fuse_act,fuse_requant,gemm1_bytes,gemm2_bytes",
+    [
+        ("a4w4", True, True, 1188640, 603536),
+        ("a4w4", True, False, 1195408, 603536),
+        ("a4w4", False, True, 1204624, 603536),
+        ("a4w4", False, False, 1204624, 603536),
+        ("a8w4", True, True, 1193248, 605840),
+        ("a8w4", True, False, 1197712, 605840),
+        ("a8w4", False, True, 1206928, 605840),
+        ("a8w4", False, False, 1206928, 605840),
+    ],
+)
+def test_shared_expert_byte_accounting(
+    data_format, fuse_act, fuse_requant, gemm1_bytes, gemm2_bytes
+):
+    """Two tokens touch 16 routed weights plus one shared weight, not 18."""
+    work = _gemm_work_metrics(
+        experts=65,
+        tokens=2,
+        topk=9,
+        shared_experts=1,
+        model_dim=256,
+        inter_dim=256,
+        data_format=data_format,
+        fuse_gemm1_act=fuse_act,
+        fuse_gemm1_requant=fuse_requant,
+    )
+    assert work["gemm1"] == (4718592, gemm1_bytes)
+    assert work["gemm2"] == (2359296, gemm2_bytes)
+
+
 @pytest.mark.parametrize(
     "ids, expected",
     [([[0, 1], [1, 0]], 2), ([[7, 7], [-1, 2]], 2), ([[-1, -1]], 0)],
@@ -797,6 +848,7 @@ def run_moe(
             experts=experts,
             tokens=tokens,
             topk=topk,
+            shared_experts=shared_experts,
             model_dim=model_dim,
             inter_dim=inter_dim,
             data_format=data_format,
@@ -815,7 +867,6 @@ def run_moe(
             data_init=data_init,
             scale_init=scale_init,
             routing_stats=routing_stats,
-            shared_experts=shared_experts,
             launch_audit=launch_audit,
         )
     mode = "kernel" if kernel_bench else ("graph" if bench else "eager")
@@ -831,7 +882,15 @@ def run_moe(
         assert (
             passed
         ), f"grouped {tag} {mode} vs ref logits_diff={ld:.4e} > {LOGITS_DIFF_TOL}"
+    truthy = ("1", "true", "True", "yes", "YES")
     work = _gemm_work_metrics(
+        shared_experts=shared_experts,
+        fuse_gemm1_act=os.environ.get("AITER_FLYDSL_DISABLE_GEMM1_ACT", "").strip()
+        not in truthy,
+        fuse_gemm1_requant=os.environ.get(
+            "AITER_FLYDSL_DISABLE_GEMM1_REQUANT", ""
+        ).strip()
+        not in truthy,
         active_experts=routing_stats["active_experts"],
         tokens=tokens,
         topk=topk,
@@ -1595,6 +1654,8 @@ def _run_csv_file(args, csv_path: str) -> None:
 
 
 def main() -> None:
+    global AITER_MOE_EXPERT_BALANCE
+
     if not is_gfx1250():
         print("skipping: requires gfx1250")
         sys.exit(0)
@@ -1630,14 +1691,19 @@ def main() -> None:
         "--shared-experts",
         type=int,
         default=0,
-        help="trailing shared experts included in --experts and --topk; "
-        "each runs for every token with unit weight",
+        help="Trailing experts included for every token with weight 1; "
+        "both --experts and --topk include these shared experts.",
+    )
+    parser.add_argument(
+        "--balanced-routing",
+        action="store_true",
+        help="route tokens evenly across experts (same as "
+        "AITER_MOE_EXPERT_BALANCE=true)",
     )
     parser.add_argument(
         "--output-json",
         type=Path,
-        help="save full-precision per-case results and eager kernel launch audits; "
-        "updated after each completed case",
+        help="save per-case results and eager launch audits",
     )
     parser.add_argument("--model-dim", type=int, default=7168)
     parser.add_argument("--inter-dim", type=int, default=256)
@@ -1712,6 +1778,8 @@ def main() -> None:
         "miss raises. Pass this flag to allow runtime JIT compilation.",
     )
     args = parser.parse_args()
+    if args.balanced_routing:
+        AITER_MOE_EXPERT_BALANCE = True
     if not 0 <= args.shared_experts < args.topk <= args.experts:
         parser.error("Expected 0 <= --shared-experts < --topk <= --experts")
     data_init_list = args.data_init or ["constant", "uniform"]
@@ -1732,8 +1800,13 @@ def main() -> None:
     # CSV sweep: settings come from the CSV, not the shape flags. Each row sets
     # its own data format / shape, so skip the single-shape guards below.
     if args.scenario == "csv":
+        if args.shared_experts:
+            parser.error("--shared-experts requires bench, kernel or verify")
         run_csv_scenario(args)
         return
+
+    if not 0 <= args.shared_experts < args.topk <= args.experts:
+        parser.error("Expected 0 <= shared-experts < topk <= experts")
 
     # The >=256 floor is a FlyDSL grouped-kernel constraint (two K tiles at
     # tile_k=128; e.g. Kimi-K3 TP8 runs inter_dim=384).
@@ -1795,9 +1868,9 @@ def main() -> None:
                     "scale_init": scale_init,
                     "seed": args.seed,
                     "experts": args.experts,
+                    "shared_experts": args.shared_experts,
                     "tokens": _tok,
                     "topk": args.topk,
-                    "shared_experts": args.shared_experts,
                     "model_dim": args.model_dim,
                     "inter_dim": args.inter_dim,
                     "active_experts": metrics["active_experts"],

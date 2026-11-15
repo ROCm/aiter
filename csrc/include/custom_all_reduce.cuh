@@ -17,7 +17,9 @@
  */
 #include "aiter_hip_common.h"
 #include "hip_float8.h"
+#include "mx_quant_utils.h"
 #include "opus/opus.hpp"
+#include "quant_amax_floor.h"
 #include <hip/hip_bf16.h>
 #include <hip/hip_fp16.h>
 #include <hip/hip_runtime.h>
@@ -859,6 +861,60 @@ __global__ void __launch_bounds__(512, 1)
                     reinterpret_cast<const uint32_t*>(src)[idx];
             }
         }
+    }
+    end_sync<ngpus, true>(sg, self_sg, rank);
+}
+
+// allgather along the last dim fused with the residual adds that follow it:
+// result = T(T(gathered + b) [+ c]), the same double rounding as the unfused
+// add-then-add (sglang add3). b and c are [rows, ngpus * last_dim] like result.
+template <typename T, int ngpus, bool kHasC>
+__global__ void __launch_bounds__(512, 1) allgather_lastdim_add(RankData* _dp,
+                                                                RankSignals sg,
+                                                                Signal* self_sg,
+                                                                T* __restrict__ result,
+                                                                int rank,
+                                                                int size,
+                                                                int last_dim_size,
+                                                                const T* __restrict__ add_b,
+                                                                const T* __restrict__ add_c)
+{
+    constexpr int tnum_gpu  = THREAD_NUM / ngpus;
+    constexpr int pack_size = 16 / sizeof(T);
+    using P                 = typename opus::vector_t<T, pack_size>;
+    using A                 = typename opus::vector_t<opus::fp32_t, pack_size>;
+    int warp_id             = threadIdx.x / tnum_gpu;
+    int lane_id             = threadIdx.x % tnum_gpu;
+    int tid                 = blockIdx.x * tnum_gpu + lane_id;
+    int stride              = gridDim.x * tnum_gpu;
+
+    last_dim_size /= pack_size;
+    const P* ptrs[ngpus];
+
+#pragma unroll
+    for(int i = 0; i < ngpus; ++i)
+    {
+        ptrs[i] = (const P*)_dp->ptrs[i];
+    }
+    const P* bp = reinterpret_cast<const P*>(add_b);
+    const P* cp = reinterpret_cast<const P*>(add_c);
+    start_sync<ngpus>(sg, self_sg, rank);
+
+    for(int idx = tid; idx < size; idx += stride)
+    {
+        int y         = idx / last_dim_size;
+        int x         = idx % last_dim_size;
+        int write_idx = (ngpus * y + warp_id) * last_dim_size + x;
+        A acc         = upcast(ptrs[warp_id][idx]);
+        packed_assign_add<opus::fp32_t, pack_size>(acc, upcast(bp[write_idx]));
+        P out = downcast<P>(acc);
+        if constexpr(kHasC)
+        {
+            A acc2 = upcast(out);
+            packed_assign_add<opus::fp32_t, pack_size>(acc2, upcast(cp[write_idx]));
+            out = downcast<P>(acc2);
+        }
+        *(reinterpret_cast<P*>(&result[0]) + write_idx) = out;
     }
     end_sync<ngpus, true>(sg, self_sg, rank);
 }
@@ -1918,7 +1974,77 @@ __device__ __forceinline__ float ar_mxfp4_quant_scale(uint8_t scale_e8m0)
     return v.f;
 }
 
-template <typename P, typename A, typename T, int PACK_SIZE, bool GEMMA_NORM = false>
+// Rotates each 32-element group by the normalized Sylvester Hadamard matrix, then
+// quantizes it exactly as per_1x32_f4_quant_hip(hadamard_rotate=True) does on the
+// normed output in T: same butterfly order, same RoundUp e8m0 scale, same FP4 convert.
+// The group is spread over 32 / PACK_SIZE consecutive lanes, so the butterfly stages
+// below PACK_SIZE run in registers and the rest exchange with __shfl_xor.
+template <typename T, int PACK_SIZE, typename A>
+__device__ __forceinline__ void ar_mxfp4_hadamard32_quant(const A& out,
+                                                          int lane_in_group,
+                                                          uint8_t* __restrict__ packed,
+                                                          uint8_t& scale_e8m0)
+{
+    constexpr int threads_per_group = 32 / PACK_SIZE;
+    static_assert(32 % PACK_SIZE == 0);
+    float v[PACK_SIZE];
+#pragma unroll
+    for(int i = 0; i < PACK_SIZE; ++i)
+        v[i] = upcast_s(downcast_s<T>(out[i]));
+#pragma unroll
+    for(int h = 1; h < PACK_SIZE; h <<= 1)
+    {
+#pragma unroll
+        for(int i = 0; i < PACK_SIZE; i += 2 * h)
+        {
+#pragma unroll
+            for(int j = i; j < i + h; ++j)
+            {
+                const float a = v[j];
+                const float b = v[j + h];
+                v[j]          = a + b;
+                v[j + h]      = a - b;
+            }
+        }
+    }
+#pragma unroll
+    for(int lane_mask = 1; lane_mask < threads_per_group; lane_mask <<= 1)
+    {
+        const bool upper = (lane_in_group & lane_mask) != 0;
+#pragma unroll
+        for(int i = 0; i < PACK_SIZE; ++i)
+        {
+            const float other = __shfl_xor(v[i], lane_mask, threads_per_group);
+            v[i]              = upper ? other - v[i] : v[i] + other;
+        }
+    }
+    constexpr float kInvSqrt32 = 0.17677669529663687f;
+    float amax                 = aiter::kAmaxFloor;
+#pragma unroll
+    for(int i = 0; i < PACK_SIZE; ++i)
+    {
+        v[i] = upcast_s(downcast_s<T>(v[i] * kInvSqrt32));
+        amax = fmaxf(amax, fabsf(v[i]));
+    }
+    for(int stride = threads_per_group / 2; stride > 0; stride >>= 1)
+        amax = fmaxf(amax, __shfl_xor(amax, stride, threads_per_group));
+
+    const float dq_scale =
+        aiter::fp_f32_to_e8m0_scale<aiter::kDefaultMxScaleRoundMode, aiter::MxDtype::FP4_E2M1>(
+            amax);
+    scale_e8m0 = static_cast<uint8_t>((__builtin_bit_cast(uint32_t, dq_scale) >> 23) & 0xFFu);
+#pragma unroll
+    for(int i = 0; i < PACK_SIZE; i += 2)
+        packed[i / 2] = __builtin_bit_cast(
+            uint8_t, opus::fp32_to_fp4_packed_x2(opus::fp32x2_t{v[i], v[i + 1]}, dq_scale));
+}
+
+template <typename P,
+          typename A,
+          typename T,
+          int PACK_SIZE,
+          bool GEMMA_NORM = false,
+          bool HADAMARD32 = false>
 __device__ __forceinline__ void ar_fusion_epilogue_mxfp4(
     A& in,
     P& weight,
@@ -1952,6 +2078,23 @@ __device__ __forceinline__ void ar_fusion_epilogue_mxfp4(
     int group_id                    = threadIdx.x / threads_per_group;
     int lane_in_group               = threadIdx.x % threads_per_group;
     int num_groups                  = hidden_dim / MXFP4_GROUP_SIZE;
+
+    if constexpr(HADAMARD32)
+    {
+        uint8_t packed[PACK_SIZE / 2];
+        uint8_t scale_e8m0;
+        ar_mxfp4_hadamard32_quant<T, PACK_SIZE>(out, lane_in_group, packed, scale_e8m0);
+        if(active)
+        {
+            int byte_idx = tidx * (hidden_dim / 2) + (threadIdx.x * PACK_SIZE) / 2;
+#pragma unroll
+            for(int i = 0; i < PACK_SIZE / 2; ++i)
+                output[byte_idx + i] = packed[i];
+            if(lane_in_group == 0)
+                scale_out[tidx * num_groups + group_id] = scale_e8m0;
+        }
+        return;
+    }
 
     auto fn = [](float a, float b) { return a > b ? a : b; };
     float local_max = 0.0f;
@@ -2382,7 +2525,7 @@ void allreduce_fusion_kernel_1stage_per_group_launcher(
     per_group_launch_flags(launch, transpose_scale, gemma_norm);
 }
 
-template <typename T, int ngpus, bool GEMMA_NORM = false>
+template <typename T, int ngpus, bool GEMMA_NORM = false, bool HADAMARD32 = false>
 __global__ void __launch_bounds__(1024, 1)
     allreduce_fusion_kernel_1stage_mxfp4(RankData* _dp,
                                          RankSignals sg,
@@ -2452,14 +2595,14 @@ __global__ void __launch_bounds__(1024, 1)
             weight_p = *reinterpret_cast<P*>(weight + access_id_in_token);
         }
         int padded_block_size = (int)blockDim.x;
-        ar_fusion_epilogue_mxfp4<P, A, T, pack_size, GEMMA_NORM>(
+        ar_fusion_epilogue_mxfp4<P, A, T, pack_size, GEMMA_NORM, HADAMARD32>(
             acc, weight_p, hidden_dim, eps, idx, tidx, padded_block_size,
             output, scale_out, active, bf16_output);
     }
     end_sync<ngpus, true>(sg, self_sg, rank);
 }
 
-template <typename T, int NGPUS, bool GEMMA_NORM = false>
+template <typename T, int NGPUS, bool GEMMA_NORM = false, bool HADAMARD32 = false>
 void allreduce_fusion_kernel_1stage_mxfp4_launcher(
     RankData* _dp, RankSignals sg, Signal* self_sg, int rank,
     T* residual_inp, T* residual_out, uint8_t* output, T* weight,
@@ -2472,7 +2615,7 @@ void allreduce_fusion_kernel_1stage_mxfp4_launcher(
     int m           = size / hidden_dim;
     dim3 block(padded_size);
     dim3 grid(std::min(m, kMaxBlocks));
-    allreduce_fusion_kernel_1stage_mxfp4<T, NGPUS, GEMMA_NORM>
+    allreduce_fusion_kernel_1stage_mxfp4<T, NGPUS, GEMMA_NORM, HADAMARD32>
         <<<grid, block, 0, stream>>>(_dp, sg, self_sg, rank,
                                      residual_inp, residual_out,
                                      output, weight, scale_out,
@@ -2491,7 +2634,7 @@ void allreduce_fusion_kernel_1stage_mxfp4_launcher(
 //   * keeps the stage-1 numerics identical to the per-group 2-stage kernel
 //     (sum in fp32, downcast to T before storing in tmp), which matches the
 //     unfused (allreduce -> RMSNorm -> dynamic_mxfp4_quant) reference.
-template <typename T, int ngpus, bool GEMMA_NORM = false>
+template <typename T, int ngpus, bool GEMMA_NORM = false, bool HADAMARD32 = false>
 __global__ void __launch_bounds__(1024, 1)
     allreduce_fusion_kernel_2stage_mxfp4(RankData* _dp,
                                          RankSignals sg,
@@ -2588,13 +2731,13 @@ __global__ void __launch_bounds__(1024, 1)
             for(int v = 0; v < pack_size; ++v)
                 acc[v] = upcast_s(vec[v]);
         }
-        ar_fusion_epilogue_mxfp4<P, A, T, pack_size, GEMMA_NORM>(
+        ar_fusion_epilogue_mxfp4<P, A, T, pack_size, GEMMA_NORM, HADAMARD32>(
             acc, weight_p, hidden_dim, eps, idx, tidx, padded_block_size,
             output, scale_out, active, bf16_output);
     }
 }
 
-template <typename T, int NGPUS, bool GEMMA_NORM = false>
+template <typename T, int NGPUS, bool GEMMA_NORM = false, bool HADAMARD32 = false>
 void allreduce_fusion_kernel_2stage_mxfp4_launcher(
     RankData* _dp, RankSignals sg, Signal* self_sg, int rank,
     T* residual_inp, T* residual_out, uint8_t* output, T* weight,
@@ -2614,7 +2757,7 @@ void allreduce_fusion_kernel_2stage_mxfp4_launcher(
     token_num = std::min(token_num, kMaxBlocks);
     dim3 numBlocks(token_num);
     size_t smem_size = padded_block_size * sizeof(typename opus::vector_t<T, PACK_SIZE>);
-    allreduce_fusion_kernel_2stage_mxfp4<T, NGPUS, GEMMA_NORM>
+    allreduce_fusion_kernel_2stage_mxfp4<T, NGPUS, GEMMA_NORM, HADAMARD32>
         <<<numBlocks, threadsPerBlock, smem_size, stream>>>(
             _dp, sg, self_sg, rank,
             residual_inp, residual_out, output, weight, scale_out,
@@ -5825,6 +5968,43 @@ void dispatchAllGatherV(hipStream_t stream,
 static constexpr int kFusedArRms2StageMaxRows = kMaxBlocks;
 
 template <typename T>
+void dispatchAllGatherLastDimAdd(hipStream_t stream,
+                                 T* input,
+                                 T* output,
+                                 int size,
+                                 int last_dim_size,
+                                 const T* add_b,
+                                 const T* add_c)
+{
+    RankData* ptrs = get_buffer_RD(stream, input);
+    auto d         = 16 / sizeof(T);
+    if(size % d != 0 || last_dim_size % d != 0)
+        throw std::runtime_error("allgather_lastdim_add needs 16-byte aligned rows");
+    size /= d;
+    dim3 block(512);
+    int tnum_per_block = 512 / world_size_;
+    int block_num      = (size + tnum_per_block - 1) / tnum_per_block;
+    dim3 grid(std::min(block_num, 80));
+#define AG_ADD_CASE(ngpus)                                                                  \
+    case ngpus:                                                                            \
+        if(add_c != nullptr)                                                               \
+            allgather_lastdim_add<T, ngpus, true><<<grid, block, 0, stream>>>(             \
+                ptrs, sg_, self_sg_, output, rank_, size, last_dim_size, add_b, add_c);    \
+        else                                                                               \
+            allgather_lastdim_add<T, ngpus, false><<<grid, block, 0, stream>>>(            \
+                ptrs, sg_, self_sg_, output, rank_, size, last_dim_size, add_b, add_c);    \
+        break;
+    switch(world_size_)
+    {
+        AG_ADD_CASE(8)
+        AG_ADD_CASE(4)
+        AG_ADD_CASE(2)
+    default: throw std::runtime_error("allgather_lastdim_add world_size error");
+    }
+#undef AG_ADD_CASE
+}
+
+template <typename T>
 void dispatchFusedAllReduceRMSNorm(hipStream_t stream,
                                    T* input,
                                    T* residual_inp,
@@ -6281,7 +6461,8 @@ void dispatchFusedAllReduceRMSNormQuantMXFP4(hipStream_t stream,
                                              int n,
                                              bool use_1stage,
                                              T* bf16_output = nullptr,
-                                             bool gemma_norm = false)
+                                             bool gemma_norm = false,
+                                             bool hadamard_rotate = false)
 {
     auto d   = 16 / sizeof(T);
     int size = m * n;
@@ -6317,30 +6498,40 @@ void dispatchFusedAllReduceRMSNormQuantMXFP4(hipStream_t stream,
             "size*sizeof(T) <= 512 KiB)");
     }
 
-#define DISPATCH_AR_FUSION_MXFP4_KERNEL_IMPL(NGPUS, GEMMA)                                  \
+#define DISPATCH_AR_FUSION_MXFP4_KERNEL_IMPL(NGPUS, GEMMA, HADAMARD)                        \
     if(can_1stage)                                                                           \
     {                                                                                        \
-        allreduce_fusion_kernel_1stage_mxfp4_launcher<T, NGPUS, GEMMA>(                      \
+        allreduce_fusion_kernel_1stage_mxfp4_launcher<T, NGPUS, GEMMA, HADAMARD>(            \
             ptrs, sg_, self_sg_, rank_, residual_inp, residual_out, output, weight,           \
             scale_out, size, n, eps, stream, bf16_output);                                    \
         return;                                                                              \
     }                                                                                        \
     else                                                                                     \
     {                                                                                        \
-        allreduce_fusion_kernel_2stage_mxfp4_launcher<T, NGPUS, GEMMA>(                      \
+        allreduce_fusion_kernel_2stage_mxfp4_launcher<T, NGPUS, GEMMA, HADAMARD>(            \
             ptrs, sg_, self_sg_, rank_, residual_inp, residual_out, output, weight,           \
             scale_out, size, n, eps, stream, bf16_output);                                    \
         return;                                                                              \
     }
 
-#define DISPATCH_AR_FUSION_MXFP4_KERNEL(NGPUS)                                              \
-    if(gemma_norm)                                                                           \
+#define DISPATCH_AR_FUSION_MXFP4_KERNEL_HADAMARD(NGPUS, GEMMA)                              \
+    if(hadamard_rotate)                                                                      \
     {                                                                                        \
-        DISPATCH_AR_FUSION_MXFP4_KERNEL_IMPL(NGPUS, true)                                    \
+        DISPATCH_AR_FUSION_MXFP4_KERNEL_IMPL(NGPUS, GEMMA, true)                             \
     }                                                                                        \
     else                                                                                     \
     {                                                                                        \
-        DISPATCH_AR_FUSION_MXFP4_KERNEL_IMPL(NGPUS, false)                                   \
+        DISPATCH_AR_FUSION_MXFP4_KERNEL_IMPL(NGPUS, GEMMA, false)                            \
+    }
+
+#define DISPATCH_AR_FUSION_MXFP4_KERNEL(NGPUS)                                              \
+    if(gemma_norm)                                                                           \
+    {                                                                                        \
+        DISPATCH_AR_FUSION_MXFP4_KERNEL_HADAMARD(NGPUS, true)                                \
+    }                                                                                        \
+    else                                                                                     \
+    {                                                                                        \
+        DISPATCH_AR_FUSION_MXFP4_KERNEL_HADAMARD(NGPUS, false)                               \
     }
 
     switch(world_size_)
@@ -6354,6 +6545,7 @@ void dispatchFusedAllReduceRMSNormQuantMXFP4(hipStream_t stream,
             std::to_string(world_size_));
     }
 #undef DISPATCH_AR_FUSION_MXFP4_KERNEL
+#undef DISPATCH_AR_FUSION_MXFP4_KERNEL_HADAMARD
 #undef DISPATCH_AR_FUSION_MXFP4_KERNEL_IMPL
 }
 

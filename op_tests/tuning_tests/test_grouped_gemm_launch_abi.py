@@ -5,7 +5,6 @@
 
 import ctypes
 import inspect
-import struct
 
 import pytest
 import torch
@@ -140,9 +139,8 @@ def test_large_buffers_pack_on_first_and_cached_calls(
             is out
         )
 
-    # Packed input changes ABI at the Tensor dimension limit. Ordinary input
-    # keeps Pointer packing, and both policies reuse their own cached calls.
-    assert len(compiled) == (2 if a_preshuffled else 1)
+    # Every layout uses Pointer packing, including dimensions beyond i32.
+    assert len(compiled) == 1
     assert len(launches) == 4
 
 
@@ -174,12 +172,9 @@ def test_output_dimension_boundary_preserves_cached_abis(dispatch, a_preshuffled
             ep_row_map=meta((64,), torch.int32),
         )
         layout = launches[-1]["layout_buffers"].get("arg_c")
-        if a_preshuffled and elements == 2**31 - 1:
-            assert struct.unpack("<i", layout) == (elements,)
-        else:
-            assert layout is None
+        assert layout is None
         assert (launches[-1]["arg_c"] or 0) == out.data_ptr()
-    assert len(compiled) == (2 if a_preshuffled else 1)
+    assert len(compiled) == 1
     assert len(launches) == 4
 
 
@@ -304,54 +299,6 @@ def test_default_optional_buffers_allow_odd_output_sizes(dispatch, dtype, elemen
     assert len(launches) == 2
 
 
-@pytest.mark.parametrize(
-    "dtype,shape,offset,tensor_abi",
-    [
-        (torch.bfloat16, (2, 3), 0, True),
-        (torch.uint8, (4, 3), 0, True),
-        (torch.float64, (2, 3), 0, True),
-        (torch.bfloat16, (4,), 1, False),
-        (torch.bfloat16, (4,), 2, True),
-        (torch.uint8, (4,), 1, False),
-        (torch.uint8, (4,), 2, False),
-        (torch.uint8, (4,), 3, False),
-        (torch.uint8, (4,), 4, True),
-        (torch.int32, (3,), 1, True),
-    ],
-)
-def test_scale_reinterpretation_packs_flat_sizes_and_byte_offsets(
-    dtype, shape, offset, tensor_abi
-):
-    elements = 1
-    for dim in shape:
-        elements *= dim
-    storage = torch.empty(elements + offset, dtype=dtype)
-    tensor = storage[offset:].view(shape)
-    argument = grouped._gemm_launch_buffer_arg(tensor, grouped.fx.Int32)
-    assert isinstance(argument, torch.Tensor) == tensor_abi
-
-    def launcher(buffer):
-        pass
-
-    slots = _build_call_spec(inspect.signature(launcher), (argument,))
-    state = CallState(slots, lambda _packed: None)
-    state((argument,))
-    # Hidden stream slots have negative indices and are not buffer arguments.
-    pointers = [
-        value.value
-        for (index, _ctype, _fill), value in zip(slots, state._tls.storages)
-        if index == 0 and isinstance(value, ctypes.c_void_p)
-    ]
-    assert pointers == [tensor.data_ptr()]
-    layouts = [
-        bytes(value)
-        for (index, _ctype, _fill), value in zip(slots, state._tls.storages)
-        if index == 0 and isinstance(value, ctypes.Array)
-    ]
-    expected = [struct.pack("<i", elements * tensor.element_size() // 4)]
-    assert layouts == (expected if tensor_abi else [])
-
-
 @pytest.mark.parametrize("a_preshuffled", [0, 1])
 def test_scale_byte_offset_changes_cached_abi(dispatch, a_preshuffled):
     compiled, launches = dispatch
@@ -377,10 +324,8 @@ def test_scale_byte_offset_changes_cached_abi(dispatch, a_preshuffled):
         )
         assert launches[-1]["arg_scale_a"] == scale_a.data_ptr()
         layout = launches[-1]["layout_buffers"].get("arg_scale_a")
-        assert layout == (
-            struct.pack("<i", 64) if a_preshuffled and offset == 4 else None
-        )
-    assert len(compiled) == (2 if a_preshuffled else 1)
+        assert layout is None
+    assert len(compiled) == 1
     assert len(launches) == 4
 
 
@@ -417,15 +362,136 @@ def test_quant_output_layout_preserves_size_and_offset_abis(
                 launch = launches[-1]
                 assert (launch["arg_c"] or 0) == out.data_ptr()
                 assert launch["arg_scale_a"] == scale_a.data_ptr()
-                assert launch["layout_buffers"].get("arg_c") == (
-                    struct.pack("<i", elements)
-                    if native_quant_output and elements < 2**31
-                    else None
-                )
-                assert launch["layout_buffers"].get("arg_scale_a") == (
-                    struct.pack("<i", 64)
-                    if native_quant_output and offset == 4
-                    else None
-                )
-    assert len(compiled) == (4 if native_quant_output else 1)
+                assert launch["layout_buffers"].get("arg_c") is None
+                assert launch["layout_buffers"].get("arg_scale_a") is None
+    assert len(compiled) == 1
     assert len(launches) == 8
+
+
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16, torch.uint8])
+def test_persistent_buffers_keep_tensor_dimensions_bounded(dispatch, dtype):
+    compiled, launches = dispatch
+
+    def meta(elements, dtype=torch.uint8):
+        return torch.empty(elements, dtype=dtype, device="meta")
+
+    for elements in (2**31 - 1, 2**31) * 2:
+        out = meta(elements, dtype)
+        grouped.flydsl_grouped_gemm_a8w4_masked(
+            out,
+            meta(256 * 3584),
+            meta(256 * 3584),
+            meta(2**33),
+            meta(2**33),
+            meta(256, torch.int32),
+            n_experts=64,
+            contiguous_m=256,
+            N=7168,
+            K=7168,
+            tile_m=256,
+            tile_n=256,
+            tile_k=256,
+            m_warp=2,
+            n_warp=2,
+            num_buffers=4,
+            cluster_m=4,
+            cluster_n=4,
+            persistent_workers=256,
+            a_is_fp4=1,
+            a_preshuffled=1,
+            stream=0,
+            out_is_f16=int(dtype == torch.float16),
+            stage1_act=int(dtype == torch.uint8),
+            stage1_quant_out=int(dtype == torch.uint8),
+        )
+        launch = launches[-1]
+        assert (launch["arg_c"] or 0) == out.data_ptr()
+        # Runtime Tensor layout dimensions occupy signed i32 slots. The
+        # actual buffers can be larger; these address-only views always fit.
+        for name in (
+            "arg_c",
+            "arg_scale_a",
+            "arg_scale_b",
+            "arg_quant_scale",
+            "arg_ep_row_map",
+        ):
+            assert (
+                int.from_bytes(launch["layout_buffers"][name], "little", signed=True)
+                == 1
+            )
+    assert len(compiled) == 1
+    assert len(launches) == 4
+
+
+def test_persistent_pitched_scale_offsets_select_compatible_cached_abis(dispatch):
+    compiled, launches = dispatch
+    for offset in (1, 4) * 2:
+        out = torch.empty((256, 7168), dtype=torch.bfloat16, device="meta")
+        storage = torch.empty(256 * 512 + offset, dtype=torch.uint8)
+        scale = storage.as_strided((256, 225), (512, 1), offset)
+        data = torch.empty(256 * 1024, dtype=torch.uint8, device="meta")
+        grouped.flydsl_grouped_gemm_a8w4_masked(
+            out,
+            data,
+            data,
+            scale,
+            data,
+            torch.empty(256, dtype=torch.int32),
+            n_experts=64,
+            contiguous_m=256,
+            N=7168,
+            K=2048,
+            tile_m=256,
+            tile_n=256,
+            tile_k=256,
+            m_warp=2,
+            n_warp=2,
+            num_buffers=4,
+            cluster_m=4,
+            cluster_n=4,
+            persistent_workers=256,
+            a_is_fp4=1,
+            a_preshuffled=1,
+            stream=0,
+        )
+        assert launches[-1]["arg_scale_a"] == scale.data_ptr()
+        layout = launches[-1]["layout_buffers"].get("arg_scale_a")
+        assert (layout is None) == (offset == 1)
+    assert len(compiled) == 2
+    assert len(launches) == 4
+
+
+def test_persistent_empty_and_nonempty_buffers_keep_compatible_cached_abis(dispatch):
+    compiled, launches = dispatch
+    for elements in (0, 256) * 2:
+        out = torch.empty(elements, dtype=torch.bfloat16, device="meta")
+        data = torch.empty(elements, dtype=torch.uint8, device="meta")
+        grouped.flydsl_grouped_gemm_a8w4_masked(
+            out,
+            data,
+            data,
+            data,
+            data,
+            torch.empty(64, dtype=torch.int32),
+            n_experts=64,
+            contiguous_m=elements,
+            N=7168,
+            K=2048,
+            tile_m=256,
+            tile_n=256,
+            tile_k=256,
+            m_warp=2,
+            n_warp=2,
+            num_buffers=4,
+            cluster_m=4,
+            cluster_n=4,
+            persistent_workers=256,
+            a_is_fp4=1,
+            a_preshuffled=1,
+            stream=0,
+        )
+        layout = launches[-1]["layout_buffers"]["arg_c"]
+        assert int.from_bytes(layout, "little", signed=True) == int(elements != 0)
+        assert (launches[-1]["arg_c"] or 0) == out.data_ptr()
+    assert len(compiled) == 2
+    assert len(launches) == 4

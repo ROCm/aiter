@@ -114,6 +114,9 @@ struct MlaReduceKernelV1Params
     int32_t stride_h_o;
     int32_t max_splits;
     int32_t num_reduce_tile;
+    int32_t max_seqlen_q;
+    // The caller's bound on splits per tile; 0 when it gave none.
+    int32_t num_kv_splits;
     bool output_lse;
     bool use_reduce_final_map; // If true, qo len is uniform and implicitly set by
                                // reduce_partial_map[1] - reduce_partial_map[0].
@@ -989,6 +992,396 @@ __global__ void kn_mla_reduce_v1_d64(const MlaReduceKernelV1Params params)
     }
 }
 
+// Split-K reduce for decode and verify, where few (tile, head, row) units each
+// carry many splits. kn_mla_reduce_v1 gives each unit one 2-wave workgroup that
+// walks the splits two loads at a time, so a batch-1 verify with ~250 splits
+// leaves most CUs idle and waits on memory latency. Here up to kNumWarps waves
+// share one unit's splits, each with kUnroll loads in flight, and the partial
+// sums meet in LDS. The planner sizes reduce_indptr for the CUDA-graph batch,
+// not the live one, so the waves-per-unit count is picked on the device from the
+// live tile count and the mean split count.
+template <int32_t kSizeDV_, int32_t kNumHeadQ_>
+struct MlaReduceWideTraits
+{
+    static constexpr int32_t kSizeDV   = kSizeDV_;
+    static constexpr int32_t kNumHeadQ = kNumHeadQ_;
+    static constexpr int32_t kWaveSize = opus::get_warp_size();
+    // 4 beat 8 and 16 by 0.5-3 us on gfx950 batch-1/2 verify (16 heads x 512).
+    static constexpr int32_t kNumWarps   = 4;
+    static constexpr int32_t kNumThreads = kNumWarps * kWaveSize;
+    // One wave covers kWave * kVec columns, at most a 16-byte load per lane; a
+    // wider kSizeDV is cut into column chunks, each its own unit, so a
+    // batch-1 verify spreads over every CU instead of one per (head, row).
+    static constexpr int32_t kVec      = (kSizeDV / kWaveSize < 4) ? (kSizeDV / kWaveSize) : 4;
+    static constexpr int32_t kChunkDV  = kWaveSize * kVec;
+    static constexpr int32_t kDvChunks = kSizeDV / kChunkDV;
+    static constexpr int32_t kUnroll   = 8; // split loads in flight per wave
+    // Fewest splits a wave takes before its unit gets another wave; 4 and 16
+    // measured within run-to-run noise of 8 on the same shapes.
+    static constexpr int32_t kMinSplitsPerWarp = 8;
+    // Below 8 splits per tile kn_mla_reduce_v1 is as fast or faster (gfx950).
+    static constexpr int32_t kMinSplits = 8;
+    // Every wave scans reduce_indptr for the live tiles; longer tables keep
+    // kn_mla_reduce_v1. Arbitrary; 2048 is past any decode batch.
+    static constexpr int32_t kMaxTiles = 2048;
+
+    static_assert(kSizeDV % kChunkDV == 0);
+};
+
+// LDS: one column-chunk accumulator, max and sum per wave, 2 pass counters.
+template <typename Traits>
+static constexpr int32_t mla_reduce_wide_lds_bytes()
+{
+    return Traits::kNumWarps * (Traits::kChunkDV + 2) * int32_t(sizeof(float)) +
+           2 * int32_t(sizeof(int32_t));
+}
+
+// Orders LDS only, so global loads issued before it stay in flight.
+__device__ __forceinline__ void mla_reduce_lds_barrier()
+{
+#if defined(__GFX9__)
+    asm volatile("s_waitcnt lgkmcnt(0)\n\ts_barrier" ::: "memory");
+#else
+    __syncthreads();
+#endif
+}
+
+template <typename Traits, typename lse_t, typename out_t>
+__launch_bounds__(Traits::kNumThreads) __global__
+    void kn_mla_reduce_v1_wide(const MlaReduceKernelV1Params params)
+{
+    constexpr int32_t kWave     = Traits::kWaveSize;
+    constexpr int32_t kNumWarps = Traits::kNumWarps;
+    constexpr int32_t kVec      = Traits::kVec;
+    constexpr int32_t kH        = Traits::kNumHeadQ;
+    constexpr int32_t kDV       = Traits::kSizeDV;
+    constexpr int32_t kChunkDV  = Traits::kChunkDV;
+    constexpr int32_t kDvChunks = Traits::kDvChunks;
+    constexpr int32_t kUnroll   = Traits::kUnroll;
+    using vec_f32_t             = opus::vector_t<float, kVec>;
+
+    extern __shared__ int32_t p_lds[];
+    float* lds_acc          = reinterpret_cast<float*>(p_lds);
+    const int32_t num_tiles = params.num_reduce_tile;
+    float* lds_max          = lds_acc + kNumWarps * kChunkDV;
+    float* lds_sum          = lds_max + kNumWarps;
+    int32_t* lds_extra      = reinterpret_cast<int32_t*>(lds_sum + kNumWarps); // [2], per group
+    const int32_t* p_indptr = params.p_reduce_indptr;
+
+    const int32_t warp = __builtin_amdgcn_readfirstlane(threadIdx.x / kWave);
+    const int32_t lane = threadIdx.x % kWave;
+
+    const int32_t* p_pmap   = params.p_reduce_partial_map;
+    const float* p_part_lse = reinterpret_cast<const float*>(params.p_partial_lse);
+    const float* p_part_out = reinterpret_cast<const float*>(params.p_partial_output);
+
+    // The planner pads the reduce_indptr tail with its total, so a tile that
+    // starts at `last` and every tile after it are empty. Each wave counts the
+    // live tiles itself: one round of loads, no LDS and no barrier.
+    const int32_t last = __builtin_amdgcn_readfirstlane(p_indptr[num_tiles]);
+    int32_t live       = 0;
+    for(int32_t t = lane; t < num_tiles; t += kWave)
+    {
+        live += (p_indptr[t] < last) ? 1 : 0;
+    }
+    const int32_t live_tiles = __builtin_amdgcn_readfirstlane(
+        aiter::warpReduce<aiter::AddFunctor, int32_t, kWave>(live));
+    if(live_tiles == 0)
+    {
+        return;
+    }
+
+    // Waves per unit: a power of two, at most kNumWarps, each wave taking at
+    // least kMinSplitsPerWarp of the mean split count. Uniform across the grid.
+    const int32_t mean_splits = last / live_tiles;
+    int32_t num_parts         = 1;
+    while(num_parts < kNumWarps && 2 * num_parts * Traits::kMinSplitsPerWarp <= mean_splits)
+    {
+        num_parts *= 2;
+    }
+    const int32_t units_per_wg = kNumWarps / num_parts;
+    const int32_t sub          = warp / num_parts; // unit slot in this workgroup
+    const int32_t part         = warp % num_parts; // this wave's share of the unit
+    const int32_t max_rows     = max(params.max_seqlen_q, 1);
+    const int32_t num_units    = live_tiles * max_rows * kH * kDvChunks;
+    const int32_t num_groups   = (num_units + units_per_wg - 1) / units_per_wg;
+    float* my_acc              = lds_acc + warp * kChunkDV;
+    const int32_t lane_byte    = lane * kVec * int32_t(sizeof(float));
+    // One wave per unit shares nothing across waves, so it skips every barrier.
+    const bool shared_unit = num_parts > 1;
+    if(shared_unit)
+    {
+        if(threadIdx.x == 0)
+        {
+            lds_extra[0] = 0;
+            lds_extra[1] = 0;
+        }
+        __syncthreads();
+    }
+
+    int32_t parity = 0;
+    for(int32_t group = blockIdx.x; group < num_groups; group += gridDim.x, parity ^= 1)
+    {
+        // Column chunk fastest, so neighbouring workgroups read one partial row.
+        const int32_t unit  = group * units_per_wg + sub;
+        const int32_t chunk = unit % kDvChunks;
+        const int32_t head  = (unit / kDvChunks) % kH;
+        const int32_t row0  = (unit / (kDvChunks * kH)) % max_rows;
+        const int32_t tile  = unit / (kDvChunks * kH * max_rows);
+
+        int32_t tile_start = 0;
+        int32_t num_splits = 0;
+        if(unit < num_units)
+        {
+            tile_start = __builtin_amdgcn_readfirstlane(p_indptr[tile]);
+            num_splits = __builtin_amdgcn_readfirstlane(p_indptr[tile + 1]) - tile_start;
+        }
+        // This wave takes splits part, part + num_parts, ...; lane m holds the
+        // m-th one's slot (first kWave of them).
+        int32_t n_part = (num_splits > part) ? (num_splits - part + num_parts - 1) / num_parts : 0;
+        const int32_t slot0 = (lane < n_part) ? p_pmap[tile_start + part + lane * num_parts] : 0;
+        int32_t q_start     = 0;
+        int32_t num_rows    = 0;
+        if(num_splits > 0)
+        {
+            if(params.use_reduce_final_map)
+            {
+                const MlaPartialTileInfo loc = params.p_reduce_final_map[tile];
+                q_start                      = loc.q_start;
+                num_rows                     = loc.q_end - loc.q_start;
+            }
+            else
+            {
+                // Same qo_len rule as kn_mla_reduce_v1: one split means no rows.
+                const int32_t qo_len =
+                    (num_splits > 1) ? (p_pmap[tile_start + 1] - p_pmap[tile_start]) : 0;
+                q_start  = tile * qo_len;
+                num_rows = qo_len;
+            }
+            // -1 marks a v1_0 tile whose only split already wrote the final output.
+            if(num_splits == 1 && p_pmap[tile_start] == -1)
+            {
+                num_splits = 0;
+                n_part     = 0;
+            }
+        }
+        // A tile has at most max_rows rows in decode; more take extra passes.
+        // Waves sharing units run the workgroup's largest count so barriers match.
+        const int32_t my_passes =
+            (num_splits > 0 && num_rows > row0) ? (num_rows - row0 + max_rows - 1) / max_rows : 0;
+        if(shared_unit)
+        {
+            if(part == 0 && lane == 0 && my_passes > 1)
+            {
+                atomicMax(lds_extra + parity, my_passes - 1);
+            }
+            if(threadIdx.x == 0)
+            {
+                lds_extra[parity ^ 1] = 0; // next group's; last read before this group began
+            }
+        }
+
+        for(int32_t pass = 0;; ++pass)
+        {
+            const int32_t row      = row0 + pass * max_rows;
+            const bool active      = pass < my_passes;
+            const int32_t n        = active ? n_part : 0;
+            const int64_t row_elem = (int64_t(row) * kH + head) * kDV + chunk * kChunkDV;
+
+            auto load_partial = [&](const int32_t slot) {
+                auto g = opus::make_gmem<float>(p_part_out + (int64_t(slot) * kH * kDV + row_elem));
+                return buf_load_vec<kVec>(g, lane_byte);
+            };
+            auto chunk_slot = [&](const int32_t c) {
+                return (c + lane < n) ? p_pmap[tile_start + part + (c + lane) * num_parts] : 0;
+            };
+            auto lse_of = [&](const int32_t slot, const int32_t c) {
+                return (c + lane < n) ? p_part_lse[int64_t(slot + row) * kH + head] : -INFINITY;
+            };
+
+            const float lse0 = lse_of(slot0, 0);
+            // The first round of partials needs only the slots, so it loads
+            // while the LSEs are reduced.
+            vec_f32_t data[kUnroll];
+            if(n > 0)
+            {
+#pragma unroll
+                for(int32_t u = 0; u < kUnroll; ++u)
+                {
+                    data[u] = load_partial(__builtin_amdgcn_readlane(slot0, min(u, n - 1)));
+                }
+            }
+
+            float local_max = lse0;
+            for(int32_t c = kWave; c < n; c += kWave)
+            {
+                local_max = opus::max(local_max, lse_of(chunk_slot(c), c));
+            }
+            local_max     = aiter::warpReduce<aiter::MaxFunctor, float, kWave>(local_max);
+            float max_lse = local_max;
+            if(shared_unit)
+            {
+                if(lane == 0)
+                {
+                    lds_max[warp] = local_max;
+                }
+                mla_reduce_lds_barrier();
+                for(int32_t q = 0; q < num_parts; ++q)
+                {
+                    max_lse = opus::max(max_lse, lds_max[sub * num_parts + q]);
+                }
+            }
+            float local_sum = (lane < n) ? expf(lse0 - max_lse) : 0.f;
+            for(int32_t c = kWave; c < n; c += kWave)
+            {
+                if(c + lane < n)
+                {
+                    local_sum += expf(lse_of(chunk_slot(c), c) - max_lse);
+                }
+            }
+            local_sum     = aiter::warpReduce<aiter::AddFunctor, float, kWave>(local_sum);
+            float sum_lse = local_sum;
+            if(shared_unit)
+            {
+                if(lane == 0)
+                {
+                    lds_sum[warp] = local_sum;
+                }
+                mla_reduce_lds_barrier();
+                sum_lse = 0.f;
+                for(int32_t q = 0; q < num_parts; ++q)
+                {
+                    sum_lse += lds_sum[sub * num_parts + q];
+                }
+            }
+            const float global_lse =
+                ((sum_lse == 0.f) || (sum_lse != sum_lse)) ? INFINITY : (logf(sum_lse) + max_lse);
+
+            // Weighted sum, chunk by chunk of kWave splits, kUnroll loads in flight.
+            vec_f32_t acc = {0};
+            for(int32_t c = 0; c < n; c += kWave)
+            {
+                const int32_t slot_c = (c == 0) ? slot0 : chunk_slot(c);
+                const float scale_c =
+                    (c + lane < n) ? expf(((c == 0) ? lse0 : lse_of(slot_c, c)) - global_lse) : 0.f;
+                const int32_t chunk_n = min(n - c, kWave);
+                for(int32_t j0 = 0; j0 < chunk_n; j0 += kUnroll)
+                {
+                    if(c > 0 || j0 > 0)
+                    {
+#pragma unroll
+                        for(int32_t u = 0; u < kUnroll; ++u)
+                        {
+                            data[u] = load_partial(
+                                __builtin_amdgcn_readlane(slot_c, min(j0 + u, chunk_n - 1)));
+                        }
+                    }
+#pragma unroll
+                    for(int32_t u = 0; u < kUnroll; ++u)
+                    {
+                        if(j0 + u < chunk_n)
+                        {
+                            const float s = __int_as_float(
+                                __builtin_amdgcn_readlane(__float_as_int(scale_c), j0 + u));
+                            opus::static_for<kVec>(
+                                [&](auto i) { acc[i.value] += s * data[u][i.value]; });
+                        }
+                    }
+                }
+            }
+
+            const bool store       = active && num_splits > 0;
+            const int64_t out_elem = int64_t(q_start + row) * params.stride_s_o +
+                                     int64_t(head) * params.stride_h_o + chunk * kChunkDV;
+            if(!shared_unit)
+            {
+                if(store)
+                {
+                    auto g_out = opus::make_gmem<out_t>(
+                        reinterpret_cast<out_t*>(params.p_final_output) + out_elem);
+                    buf_store_vec<kVec>(
+                        g_out, opus::cast<out_t>(acc), lane * kVec * int32_t(sizeof(out_t)));
+                }
+            }
+            else
+            {
+                opus::static_for<kVec>(
+                    [&](auto i) { my_acc[lane * kVec + i.value] = acc[i.value]; });
+                mla_reduce_lds_barrier();
+                if(store)
+                {
+                    out_t* p_out = reinterpret_cast<out_t*>(params.p_final_output) + out_elem;
+                    const float* unit_acc = lds_acc + sub * num_parts * kChunkDV;
+                    for(int32_t e = part * kWave + lane; e < kChunkDV; e += num_parts * kWave)
+                    {
+                        float s = 0.f;
+                        for(int32_t q = 0; q < num_parts; ++q)
+                        {
+                            s += unit_acc[q * kChunkDV + e];
+                        }
+                        p_out[e] = opus::cast<out_t>(s);
+                    }
+                }
+            }
+            if(params.output_lse && store && chunk == 0 && part == 0 && lane == 0)
+            {
+                reinterpret_cast<lse_t*>(params.p_final_lse)[int64_t(q_start + row) * kH + head] =
+                    opus::cast<lse_t>(global_lse);
+            }
+            if(!shared_unit)
+            {
+                if(pass + 1 >= my_passes)
+                {
+                    break;
+                }
+                continue;
+            }
+            // Published before this pass's first barrier; read before the last one,
+            // after which the next group resets this slot.
+            const int32_t extra = __builtin_amdgcn_readfirstlane(lds_extra[parity]);
+            mla_reduce_lds_barrier();
+            if(pass >= extra)
+            {
+                break;
+            }
+        }
+    }
+}
+
+// Whether a launch takes kn_mla_reduce_v1_wide. AITER_MLA_REDUCE_WIDE=0 keeps
+// kn_mla_reduce_v1 everywhere, =1 drops the size and split-count heuristics; read once.
+template <typename WideTraits>
+bool mla_reduce_use_wide(const MlaReduceKernelV1Params& params,
+                         const hipDeviceProp_t& dev_prop,
+                         const int32_t num_cu)
+{
+    static const int wide_env = []() {
+        const char* v = std::getenv("AITER_MLA_REDUCE_WIDE");
+        return (v == nullptr || v[0] == '\0') ? -1 : std::atoi(v);
+    }();
+    if(wide_env == 0)
+    {
+        return false;
+    }
+    // Decode and verify only: prefill tiles hold many rows and few splits.
+    constexpr int32_t kMaxRows = 16;
+    const bool can_run         = (dev_prop.warpSize == WideTraits::kWaveSize) &&
+                         (params.max_seqlen_q >= 1) && (params.max_seqlen_q <= kMaxRows) &&
+                         (params.num_reduce_tile <= WideTraits::kMaxTiles);
+    // Past 128 (head, row) pairs per tile the reduce is bandwidth-bound, and
+    // kn_mla_reduce_v1 is as fast or up to ~10% faster (gfx950, 128 heads x 4-8 rows).
+    constexpr int32_t kMaxRowsTimesHeads = 128;
+    const int32_t unit_bound =
+        params.num_reduce_tile * WideTraits::kNumHeadQ * max(params.max_seqlen_q, 1);
+    const bool many_splits =
+        (params.num_kv_splits <= 0) || (params.num_kv_splits >= WideTraits::kMinSplits);
+    // 16 units per CU admits a 32-request graph batch of 16 heads x 6 rows on 256
+    // CUs (3072); larger graph batches keep kn_mla_reduce_v1. Not swept further.
+    const bool wins = (params.max_seqlen_q * WideTraits::kNumHeadQ <= kMaxRowsTimesHeads) &&
+                      (unit_bound <= num_cu * 16) && many_splits;
+    return can_run && ((wide_env == 1) || wins);
+}
+
 template <typename Traits, typename lse_t, typename out_t>
 void dispatch_mla_reduce_v1(const MlaReduceKernelV1Params& params,
                             const int32_t num_cu,
@@ -1013,6 +1406,22 @@ void dispatch_mla_reduce_v1(const MlaReduceKernelV1Params& params,
         // block dim and LDS spill boundary from the runtime warpSize instead.
         const int32_t wave_size = dev_prop.warpSize;
         const int32_t block_dim = Traits::kNumWarps * wave_size;
+
+        using WideTraits = MlaReduceWideTraits<Traits::kSizeDV, Traits::kNumHeadQ>;
+        if(mla_reduce_use_wide<WideTraits>(params, dev_prop, num_cu))
+        {
+            // One workgroup per unit is the most the kernel uses (every wave on
+            // one unit); fewer are grid-strided. 4 workgroups per CU is not swept.
+            const int32_t unit_bound = params.num_reduce_tile * Traits::kNumHeadQ *
+                                       max(params.max_seqlen_q, 1) * WideTraits::kDvChunks;
+            const dim3 grid = dim3(min(unit_bound, num_cu * 4));
+            kn_mla_reduce_v1_wide<WideTraits, lse_t, out_t>
+                <<<grid,
+                   WideTraits::kNumThreads,
+                   mla_reduce_wide_lds_bytes<WideTraits>(),
+                   stream>>>(params);
+            return;
+        }
 
         // lds_scale_cap = LDS span (in #splits) written by the massive LSE path,
         // which is num_lse_per_thr * wave_size per bucket and can exceed max_splits:

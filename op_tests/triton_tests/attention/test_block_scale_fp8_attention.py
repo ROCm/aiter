@@ -17,7 +17,7 @@ import torch
 import triton
 import triton.language as tl
 
-from aiter.ops.triton._triton_kernels.flash_attn_triton_amd.utils import FP8_ARCHS
+from aiter.ops.triton._triton_kernels.attention.dao_ai.utils import FP8_ARCHS
 from aiter.ops.triton.attention.block_scale_fp8_attention import (
     _bwd_kernel_dkdv,
     _bwd_kernel_dq,

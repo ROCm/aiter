@@ -17,26 +17,6 @@ _SUPPORTED_CLUSTER_M = (1, 2, 4)
 _SUPPORTED_CLUSTER_N = (1, 2, 3, 4)
 
 
-def _gemm_launch_buffer_arg(tensor, dtype=None):
-    # Tensor launch dimensions use signed 32-bit integers. Preserve the
-    # existing flat Tensor ABI where it fits, and keep raw pointers for
-    # oversized buffers rather than truncating a dimension at the C boundary.
-    if not tensor.is_contiguous():
-        return ptr_arg(tensor, dtype)
-    view = tensor.view(-1)
-    if dtype is fx.Int32:
-        # Flatten before reinterpreting compact scales. Odd byte sizes or
-        # offsets cannot be represented by an Int32 Tensor, including unused
-        # optional buffers that alias the output.
-        itemsize = tensor.element_size()
-        if tensor.numel() * itemsize % 4 or tensor.storage_offset() * itemsize % 4:
-            return ptr_arg(tensor, dtype)
-        view = view.view(torch.int32)
-    if view.numel() <= 0x7FFFFFFF:
-        return view
-    return ptr_arg(tensor, dtype)
-
-
 def _select_bool_env(name: str, csv_value: int) -> int:
     """Select a strict 0/1 environment override or the CSV setting."""
     value = os.environ.get(name)
@@ -112,12 +92,25 @@ def _select_num_waves_per_tensor_tdm(csv_num_waves: int) -> int:
         ) from exc
     if num_waves not in (1, 2, 4):
         raise ValueError(
-            f"AITER_FLYDSL_NUM_WAVES_PER_TENSOR_TDM must be 1, 2, or 4, got {num_waves}"
+            "AITER_FLYDSL_NUM_WAVES_PER_TENSOR_TDM must be 1, 2, or 4, got "
+            f"{num_waves}"
         )
     return num_waves
 
 
 _BIAS_MODE = {torch.bfloat16: 1, torch.float32: 2, torch.float16: 3}
+
+
+def _bounded_buffer_arg(tensor, dtype=None, tensor_abi=False):
+    """Keep persistent launch Tensor metadata bounded, without copying buffers."""
+    if not tensor_abi:
+        return ptr_arg(tensor, dtype)
+    if dtype is fx.Int32:
+        size = tensor.element_size()
+        if tensor.numel() * size < 4 or (tensor.storage_offset() * size) % 4:
+            return ptr_arg(tensor, dtype)
+        return tensor.as_strided((max(1, 4 // size),), (1,)).view(torch.int32)
+    return tensor.as_strided((min(tensor.numel(), 1),), (1,))
 
 
 def flydsl_grouped_gemm_a8w4_masked(
@@ -205,13 +198,8 @@ def flydsl_grouped_gemm_a8w4_masked(
             "preshuffled MXFP4 quant output requires N divisible by 256 "
             "and tile_n divisible by 64, with M and tile_m divisible by 16"
         )
-    from flydsl.expr import rocdl
-
     from .kernels.mxfp4_preshuffle_gfx1250_tdm import (
-        SUPPORT_EXPLICIT_VGPR_PARTITION,
-        _supports_m288_persistent_cluster,
-        get_gemm_a8w4_tdm_register_launcher,
-        is_explicit_vgpr_partition_available,
+        _supports_clustered_persistent,
         launch_gemm_a8w4_tdm,
     )
 
@@ -255,6 +243,10 @@ def flydsl_grouped_gemm_a8w4_masked(
     if stage not in (1, 2):
         raise ValueError("gemm_stage must be 1 or 2")
     cluster_m = _select_cluster_m(cluster_m, cluster_n, stage == 1)
+    if m_align:
+        # A tile skipped for starting in an expert's padding never reaches the
+        # M-cluster barrier its peers wait in; cluster_m only buys B multicast.
+        cluster_m = 1
     persistent_workers = int(
         os.environ.get(
             f"AITER_FLYDSL_PERSISTENT_WORKERS{stage}",
@@ -265,7 +257,7 @@ def flydsl_grouped_gemm_a8w4_masked(
         raise ValueError("persistent_workers must be nonnegative")
     persistent_prefill = bool(
         persistent_workers
-        and _supports_m288_persistent_cluster(
+        and _supports_clustered_persistent(
             tile_m,
             tile_n,
             tile_k,
@@ -278,7 +270,6 @@ def flydsl_grouped_gemm_a8w4_masked(
             stage1_quant_out,
             cluster_n,
             cluster_m,
-            SUPPORT_EXPLICIT_VGPR_PARTITION,
         )
     )
     if persistent_workers:
@@ -366,81 +357,31 @@ def flydsl_grouped_gemm_a8w4_masked(
         int(m_align),
         k_waves,
     )
-    explicit_vgpr_partition = int(SUPPORT_EXPLICIT_VGPR_PARTITION)
-    if (
-        a_is_fp4
-        and a_preshuffled
-        and not persistent_workers
-        and tile_m == 64
-        and m_warp == 1
-        and n_warp == 4
-        and num_buffers == 3
-        and (tile_n, tile_k) in ((256, 256), (512, 128))
-    ):
-        # The narrow-N tile fits the automatic allocation without spilling;
-        # high fixed registers unnecessarily restrict its wave residency.
-        # The wide-N tile needs the larger register budget to avoid scratch
-        # spills. Tune the tile, independently of expert count or routing.
-        explicit_vgpr_partition = int(
-            tile_n == 512 and is_explicit_vgpr_partition_available()
+    launch_spec = (int(quant_payload_preshuffled), int(N) if persistent_prefill else 0)
+    # Paired gfx1250 profiling favors Tensor packing for clustered workers.
+    # Only the base address reaches the kernel; extents use the explicit sizes.
+    # Small views retain main's large-buffer ABI and pitched/offset support.
+    c_arg, sa_arg, sb_arg, qs_arg, ep_arg = (
+        _bounded_buffer_arg(tensor, dtype, persistent_prefill)
+        for tensor, dtype in (
+            (out, out_dtype),
+            (a_scales, fx.Int32),
+            (w_scales, fx.Int32),
+            (quant_scale_tensor, None),
+            (ep_row_map_tensor, fx.Int32),
         )
-        launch_gemm_a8w4_tdm = get_gemm_a8w4_tdm_register_launcher(
-            explicit_vgpr_partition
-        )
-    elif (
-        a_is_fp4
-        and a_preshuffled
-        and not persistent_workers
-        and not enable_ep_scatter
-        and not stage1_act
-        and not stage1_quant_out
-        and (tile_m, tile_n, tile_k, m_warp, n_warp, num_buffers)
-        == (256, 256, 256, 2, 2, 4)
-        and (cluster_m == 1 or K // tile_k >= num_buffers * 4)
-        and callable(getattr(rocdl, "sched_vgpr", None))
-    ):
-        # This output tile benefits from explicit SSA register placement.
-        # Select by tile geometry and K pipeline length.
-        explicit_vgpr_partition = 1
-        launch_gemm_a8w4_tdm = get_gemm_a8w4_tdm_register_launcher(1)
-    # Keep the compact Tensor ABI for native input or native quantized output.
-    # Ordinary layouts retain main's Pointer ABI, including fused quant output.
-    buffer_arg = (
-        _gemm_launch_buffer_arg
-        if a_preshuffled or quant_payload_preshuffled
-        else ptr_arg
     )
-    out_arg = buffer_arg(out, out_dtype)
-    scale_a_arg = buffer_arg(a_scales, fx.Int32)
-    scale_b_arg = buffer_arg(w_scales, fx.Int32)
-    quant_scale_arg = buffer_arg(quant_scale_tensor)
-    ep_row_map_arg = buffer_arg(ep_row_map_tensor, fx.Int32)
-    # Ordinary pointer launches use the launcher's established defaults.
-    # Only packed input/output needs explicit register/layout ABI overrides.
-    launch_spec = ()
-    abi_spec = ()
-    if buffer_arg is _gemm_launch_buffer_arg:
-        launch_spec = (explicit_vgpr_partition, int(quant_payload_preshuffled))
-        tensor_arg_mask = tuple(
-            isinstance(arg, torch.Tensor)
-            for arg in (
-                out_arg,
-                scale_a_arg,
-                scale_b_arg,
-                quant_scale_arg,
-                ep_row_map_arg,
-            )
-        )
-        if persistent_prefill:
-            launch_spec += (int(N),)
-        abi_spec = (*launch_spec, tensor_arg_mask)
+    buffer_spec = tuple(
+        (value.dtype, tuple(value.shape)) if isinstance(value, torch.Tensor) else None
+        for value in (c_arg, sa_arg, sb_arg, qs_arg, ep_arg)
+    )
     _run_compiled(
         launch_gemm_a8w4_tdm,
-        out_arg,
+        c_arg,
         ptr_arg(a),
         ptr_arg(w),
-        scale_a_arg,
-        scale_b_arg,
+        sa_arg,
+        sb_arg,
         contiguous_m,
         stream,
         N,
@@ -450,10 +391,10 @@ def flydsl_grouped_gemm_a8w4_masked(
         bias_ptr,
         float(swiglu_limit),
         *quant_spec,
-        quant_scale_arg,
+        qs_arg,
         *tdm_spec,
         *ep_spec,
-        ep_row_map_arg,
+        ep_arg,
         float(situ_beta),
         float(situ_linear_beta),
         *layout_spec,
@@ -465,7 +406,9 @@ def flydsl_grouped_gemm_a8w4_masked(
             tdm_spec,
             ep_spec,
             layout_spec,
-            *abi_spec,
+            launch_spec,
+            out.device,
+            buffer_spec,
         ),
     )
     return out

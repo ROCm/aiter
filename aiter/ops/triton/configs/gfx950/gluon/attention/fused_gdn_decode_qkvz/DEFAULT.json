@@ -1,0 +1,10 @@
+{
+  "fp32_state": {
+    "num_buffers": 12,
+    "num_warps": 8
+  },
+  "bf16_state": {
+    "num_buffers": 4,
+    "num_warps": 8
+  }
+}
