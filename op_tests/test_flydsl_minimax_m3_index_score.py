@@ -2106,14 +2106,15 @@ def fp4_cache_of(cache8, transform=None):
 
 
 def single_region_views(data, scale):
-    """Both views of ONE `[pages, 8704]` allocation: 8192 B of data followed by
-    512 B of scale per page, the physical layout the cache is meant to have."""
-    pages = data.shape[0]
-    buf = torch.empty((pages, P * 64 + P * 4), dtype=torch.uint8, device=data.device)
+    """Both views of ONE `[pages, 8192 + P * w]` allocation: 8192 B of data followed by
+    the scale (w = its width: 4 B a token for MXFP4, 8 for NVFP4) per page, the physical
+    layout the cache is meant to have."""
+    pages, w = data.shape[0], scale.shape[-1]
+    buf = torch.empty((pages, P * 64 + P * w), dtype=torch.uint8, device=data.device)
     buf[:, : P * 64] = data.reshape(pages, -1)
     buf[:, P * 64 :] = scale.reshape(pages, -1)
     kd = torch.as_strided(buf, (pages, P, 64), (buf.stride(0), 64, 1))
-    ks = torch.as_strided(buf, (pages, P, 4), (buf.stride(0), 4, 1), P * 64)
+    ks = torch.as_strided(buf, (pages, P, w), (buf.stride(0), w, 1), P * 64)
     return buf, kd, ks
 
 
@@ -2162,10 +2163,11 @@ def check_mxfp4_matches_oracle(case, qdt):
     check_scores(got, ref)
 
 
-def check_mxfp4_every_geometry_matches_oracle(point, qdt):
+def check_mxfp4_every_geometry_matches_oracle(point, qdt, k_round=None):
     """Every launch geometry the selector can reach (work-chunk depth, token
     split, spread, CP shard) against the oracle. Negative scores expose accidental
-    zero-initialised maxima, as in the fp8 test."""
+    zero-initialised maxima, as in the fp8 test. `k_round` set: the NVFP4 scorer at
+    that rounding instead (it has no CP shard, so only the world-1 points)."""
     S, H, batch, max_block, world, rank = point
     # As in the fp8 test: `max_block` is this rank's LOCAL width, the table and
     # lengths are global, and the score is the compacted shard.
@@ -2176,25 +2178,37 @@ def check_mxfp4_every_geometry_matches_oracle(point, qdt):
     assert mb == glob
     q.copy_(q.abs() + 0.25)
     q, q_ref = q_for(q, qdt)
-    kd, ks, deq = fp4_cache_of(cache8, lambda b: -(b.abs() + 0.25))
+
+    def neg(b):
+        return -(b.abs() + 0.25)
+
+    if k_round is None:
+        kd, ks, deq = fp4_cache_of(cache8, neg)
+    else:
+        assert world == 1
+        kd, ks, exact, e4m3 = nvfp4_cache_of(cache8, neg)
+        deq = nvfp4_ref(k_round, exact, e4m3)
     del cache8
     ref = score_oracle(q_ref, deq, bt, seq, S, H, D**-0.5, max_block, world, rank)
     out = kernel.alloc_score(batch, S, H, max_block, q.device)
     out.fill_(float("nan"))
-    got = score_flydsl(
-        q,
-        kd,
-        bt,
-        seq,
-        S,
-        H,
-        D**-0.5,
-        max_block,
-        out=out,
-        cp_world=world,
-        cp_rank=rank,
-        k_scale=ks,
-    )
+    if k_round is None:
+        got = score_flydsl(
+            q,
+            kd,
+            bt,
+            seq,
+            S,
+            H,
+            D**-0.5,
+            max_block,
+            out=out,
+            cp_world=world,
+            cp_rank=rank,
+            k_scale=ks,
+        )
+    else:
+        got = run_nvfp4(q, kd, ks, bt, seq, S, H, max_block, k_round, out=out)
     assert got.data_ptr() == out.data_ptr()
     check_scores(got, ref)
     assert bool((got[torch.isfinite(ref)] < 0).all())
@@ -2531,18 +2545,6 @@ def nvfp4_cache_of(cache8, transform=None):
     return tuple(torch.cat(o) for o in outs)
 
 
-def nvfp4_single_region_views(data, scale):
-    """Both views of ONE `[pages, 9216]` allocation: 8192 B of e2m1 then 1024 B of
-    e4m3 scale per page: the layout of a cache that keeps both regions in one tensor."""
-    pages = data.shape[0]
-    buf = torch.empty((pages, P * 64 + P * 8), dtype=torch.uint8, device=data.device)
-    buf[:, : P * 64] = data.reshape(pages, -1)
-    buf[:, P * 64 :] = scale.reshape(pages, -1)
-    kd = torch.as_strided(buf, (pages, P, 64), (buf.stride(0), 64, 1))
-    ks = torch.as_strided(buf, (pages, P, 8), (buf.stride(0), 8, 1), P * 64)
-    return buf, kd, ks
-
-
 def run_nvfp4(q, kd, ks, bt, seq, S, H, mb, k_round="e4m3", **kw):
     return kernel.score_flydsl_nvfp4(
         q, kd, ks, bt, seq, S, H, D**-0.5, mb, k_round=k_round, **kw
@@ -2562,6 +2564,11 @@ def check_nvfp4_matches_oracle(case, qdt, k_round):
         q_ref, nvfp4_ref(k_round, exact, e4m3), bt, seq, S, H, D**-0.5, mb
     )
     check_scores(run_nvfp4(q, kd, ks, bt, seq, S, H, mb, k_round), ref)
+
+
+def check_nvfp4_every_geometry_matches_oracle(point, qdt, k_round):
+    """The NVFP4 scorer through every non-CP launch geometry the selector can reach."""
+    check_mxfp4_every_geometry_matches_oracle(point, qdt, k_round)
 
 
 def check_nvfp4_exact_e4m3_q_equals_bf16_q(S, H, lens):
@@ -2664,7 +2671,7 @@ def check_nvfp4_bit_exact(S, H, lens, qdt, k_round):
 def check_nvfp4_split_and_single_region_views_agree_bitwise():
     q, cache8, bt, seq, mb = make_case(3, 4, 4, [130, 4096, 513])
     kd, ks, _, _ = nvfp4_cache_of(cache8)
-    _buf, kd1, ks1 = nvfp4_single_region_views(kd, ks)
+    _buf, kd1, ks1 = single_region_views(kd, ks)
     assert kd1.stride(0) == ks1.stride(0) == 9216
     for r in K_ROUNDS:
         assert torch.equal(
@@ -2819,9 +2826,15 @@ def check_nvfp4_rejections():
     assert not kernel.index_score_supported_nvfp4(
         q, kd, bad, 4, 4, mb, bt, seq_lens=seq
     )
+    expect_value_error(
+        "int8 scale", run_nvfp4, q, kd, bad, bt, seq, 4, 4, mb, match="k_scale"
+    )
     wide = torch.empty((ks.shape[0], P, 16), dtype=torch.uint8, device="cuda")[:, :, :8]
     assert not kernel.index_score_supported_nvfp4(
         q, kd, wide, 4, 4, mb, bt, seq_lens=seq
+    )
+    expect_value_error(
+        "wide-stride scale", run_nvfp4, q, kd, wide, bt, seq, 4, 4, mb, match="packed"
     )
 
 
@@ -2892,6 +2905,13 @@ def build_nvfp4_checks():
     for S, H, lens in [(4, 1, [4096]), (8, 4, [2048, 129])]:
         name = f"exact_e4m3_q_equals_bf16_q_S{S}H{H}_{'_'.join(map(str, lens))}"
         checks.append((name, check_nvfp4_exact_e4m3_q_equals_bf16_q, (S, H, lens)))
+    for point, qdt, r in itertools.product(
+        [p for p in GEOM_POINTS if p[4] == 1], QDTS, K_ROUNDS
+    ):
+        name = f"every_geometry_{geom_id(point)}_{qdt}_{r}"
+        checks.append(
+            (name, check_nvfp4_every_geometry_matches_oracle, (point, qdt, r))
+        )
     for r in K_ROUNDS:
         checks.append((f"tuned_geometry_map_{r}", check_nvfp4_tuned_geometry_map, (r,)))
     for fn in (
