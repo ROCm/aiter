@@ -1,16 +1,16 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-"""MiniMax-M3 NVFP4 sparse paged attention, decode (FlyDSL, gfx950).
+"""MiniMax-M3 NVFP4 sparse paged attention, decode and prefill (FlyDSL, gfx950).
 
-The kernel takes the selector's output directly: ``topk_idx [Hkv, rows, 16]`` logical
+The kernels take the selector's output directly: ``topk_idx [Hkv, rows, 16]`` logical
 128-token block ids plus the request block table; K / V pages are the single-buffer
 NVFP4 page (see ``kernels/sparse_pa_nvfp4_common.py``).
 
 Reference: an fp64 torch attention over K / V = e2m1 x e4m3 scale x global scale taken
 from the token-major codes and scale bytes the pages were *built from* -- nothing is
 read back through the kernel's lane layout, so a wrong page layout cannot cancel. The
-kernel does the products exactly in f16, so what is left against the reference is the
+kernels do the products exactly in f16, so what is left against the reference is the
 bf16 output (relative L2 of ~1.7e-3) and the f16 Q / P.
 
 Run (exits nonzero if any check fails):
@@ -30,6 +30,9 @@ import aiter
 from aiter.jit.utils.chip_info import get_gfx_runtime
 from aiter.ops.flydsl.kernels.sparse_pa_nvfp4_decode import (
     sparse_pa_nvfp4_decode,
+)
+from aiter.ops.flydsl.kernels.sparse_pa_nvfp4_prefill import (
+    sparse_pa_nvfp4_prefill,
 )
 from aiter.test_common import benchmark, checkAllclose, run_perftest
 
@@ -117,6 +120,8 @@ def make_case(
     order="shuffle",
     fill=TOPK,  # valid ids per row (<= TOPK incl. the tail)
     junk=False,  # sprinkle invalid ids (-1 in the middle, ids past the tail, negatives)
+    dup=0,  # repeat the first `dup` ids of each row in the free slots (out of contract)
+    alias=False,  # every logical block of a request maps to the request's first page
     poison=False,  # NaN (e4m3 0x7f) scale bytes in the unwritten tail of every request's last page
     k_scale=0.05,
     v_scale=0.03,
@@ -131,6 +136,8 @@ def make_case(
     o = 0
     for r in range(reqs):
         bt[r, : nblk[r]] = perm[o : o + nblk[r]].int()
+        if alias:
+            bt[r, : nblk[r]] = bt[r, 0].clone()
         o += nblk[r]
     amp = torch.exp(torch.randn(n_pages, BLK, hkv, 1, generator=g) * 0.25)
     k = (torch.randn(n_pages, BLK, hkv, D, generator=g) * amp).bfloat16()
@@ -168,6 +175,8 @@ def make_case(
                 ids = torch.cat([ids[-1:], ids[:-1]])
             else:
                 ids = ids[torch.randperm(len(ids), generator=g)]
+            if dup:
+                ids = torch.cat([ids, ids[:dup]])[:TOPK]
             topk[h, i, : len(ids)] = ids
             if junk:
                 free = list(range(len(ids), TOPK))
@@ -198,7 +207,8 @@ def make_case(
 
 
 def run_torch(c):
-    """fp64 reference: attention of every row over the valid keys of its blocks."""
+    """fp64 reference: attention of every row over the valid keys of its blocks. A block id
+    repeated in a row counts once per slot (both kernels do the same)."""
     q = c["q"].double()
     rows = q.shape[0]
     hkv, group = c["hkv"], c["group"]
@@ -251,6 +261,23 @@ def decode_call(c, splits=None, **kw):
     )
 
 
+def prefill_call(c, **kw):
+    out = torch.empty_like(c["q"])
+    return sparse_pa_nvfp4_prefill(
+        c["q"],
+        c["cache"],
+        c["topk"],
+        c["bt"],
+        c["row_req"],
+        c["row_kv"],
+        SM_SCALE,
+        out,
+        c["k_scale"],
+        c["v_scale"],
+        **kw,
+    )
+
+
 # (name, seq_lens, q_lens, hkv, group, kwargs)
 DECODE_CASES = [
     ("ragged_h1", [5000, 2300, 900, 100], [1] * 4, 1, 16, {}),
@@ -269,8 +296,32 @@ DECODE_CASES = [
     ("mtp8_g8", [3000, 9], [8, 8], 1, 8, {}),
     ("batch40_h1", [300 + 331 * i for i in range(40)], [1] * 40, 1, 16, {}),
     ("batch130_h4", [200 + 97 * i for i in range(130)], [1] * 130, 4, 16, {"fill": 12}),
+    ("alias_pages", [129, 3000, 700], [1] * 3, 1, 16, {"alias": True}),
 ]
 DECODE_SPLITS = (None, 1, 2, 4, 8, 16)
+
+
+PREFILL_CASES = [
+    ("chunk_h1", [3000, 700, 130], [300, 700, 130], 1, 16, {}),
+    ("chunk_h4", [3000, 700, 130], [300, 700, 130], 4, 16, {}),
+    ("chunk_h2", [2100, 5], [1000, 5], 2, 16, {}),
+    ("group8", [3000, 700], [300, 700], 1, 8, {}),
+    ("one_row", [1, 129], [1, 1], 1, 16, {}),
+    ("edges", [128, 256, 257, 255, 1], [128, 256, 5, 3, 1], 1, 16, {}),
+    ("full_prompt", [1500], [1500], 1, 16, {}),
+    ("fewer_than_topk", [900, 400], [900, 100], 1, 16, {"fill": 4}),
+    ("junk_ids", [3000, 700], [300, 700], 1, 16, {"junk": True}),
+    # Out of contract (ids within a row should be distinct): a repeated id counts once per
+    # slot, whatever the tile, so every tile matches the oracle (and the decode kernel).
+    ("dup_ids", [3000, 700, 130], [300, 700, 130], 1, 16, {"fill": 12, "dup": 3}),
+    ("dup_ids_h2", [900, 2100], [200, 1000], 2, 16, {"fill": 13, "dup": 2}),
+    ("ragged_batch", [2000, 33, 4097, 512], [511, 33, 70, 512], 1, 16, {}),
+    # A table that maps several logical blocks of a request to one page: each block keeps
+    # its own causal limit (the first is the block_table [[p, p]] / row_kv 129 case).
+    ("alias_two_blocks", [129], [1], 1, 16, {"alias": True}),
+    ("alias_chunk", [3000, 700, 130], [300, 700, 130], 1, 16, {"alias": True}),
+]
+PREFILL_TQ = ((4, 2), (4, 1), (2, 1), (1, 1))
 
 
 def check(name, out, ref, tol=REL_L2_TOL):
@@ -297,6 +348,19 @@ def test_correctness(name, hkv, group, rows, splits):
     ref = run_torch(c)
     out = decode_call(c, splits)
     ok, err, mx = check(f"decode {name} splits={splits}", out, ref)
+    return {"rel_l2": err, "max_abs": mx, "ok": ok}
+
+
+@benchmark()
+def test_prefill_correctness(name, hkv, group, rows, tq, rounds):
+    case = {c[0]: c for c in PREFILL_CASES}[name]
+    _, seq_lens, q_lens, hkv_, group_, kw = case
+    c = make_case(
+        seq_lens, q_lens, hkv_, group_, seed=zlib.crc32(name.encode()) % 1000, **kw
+    )
+    ref = run_torch(c)
+    out = prefill_call(c, tq=tq, rounds=rounds)
+    ok, err, mx = check(f"prefill {name} tq={tq} rounds={rounds}", out, ref)
     return {"rel_l2": err, "max_abs": mx, "ok": ok}
 
 
@@ -358,28 +422,56 @@ def padding_rows():
         c0 = dict(c, seq_lens=torch.tensor([0, 700], dtype=torch.int32, device="cuda"))
         out = decode_call(c0, s)
         bad += int(out[0].abs().max().item() != 0 or not torch.equal(out[1], ref[1]))
+    c1 = dict(
+        c,
+        row_kv=torch.tensor([0, int(c["row_kv"][1])], dtype=torch.int32, device="cuda"),
+    )
+    out = prefill_call(c1)
+    bad += int(
+        out[0].abs().max().item() != 0 or not torch.equal(out[1], prefill_call(c)[1])
+    )
     if bad:
         print("padding rows: FAILED")
     return bad
 
 
 def padding_empty_table():
-    """A padding-only call (length 0, every slot -1) with an empty block table reads no table
-    entry: the table is not touched when no slot is valid."""
+    """A padding-only call (length 0, every slot -1) touches neither the block table nor
+    the pages: it must work with an empty table and with an empty KV cache ([0, page]).
+    """
     bad = 0
     c = make_case([500], [1], 1, 16, seed=5)
     topk = torch.full_like(c["topk"], -1)
-    bt = torch.zeros(1, 0, dtype=torch.int32, device="cuda")
     zero_len = torch.zeros(1, dtype=torch.int32, device="cuda")
-    for s, x in itertools.product((None, 1, 4), (0, 8)):
-        out = torch.full_like(c["q"], 1.0)
-        sparse_pa_nvfp4_decode(
-            c["q"], c["cache"], topk, bt, zero_len, SM_SCALE, out,
-            c["k_scale"], c["v_scale"], splits=s, xcds=x,
-        )  # fmt: skip
-        if out.abs().max().item() != 0:
-            bad += 1
-            print(f"empty block_table: padding row not zero (splits={s} xcds={x})")
+    caches = {
+        "cache": c["cache"],
+        "empty cache": torch.empty(
+            0, c["cache"].shape[1], dtype=torch.uint8, device="cuda"
+        ),
+    }
+    tables = {
+        "empty table": torch.zeros(1, 0, dtype=torch.int32, device="cuda"),
+        "table": torch.zeros(1, 4, dtype=torch.int32, device="cuda"),
+    }
+    for (cn, cache), (bn, bt) in itertools.product(caches.items(), tables.items()):
+        for s, x in itertools.product((None, 1, 4), (0, 8)):
+            out = torch.full_like(c["q"], 1.0)
+            sparse_pa_nvfp4_decode(
+                c["q"], cache, topk, bt, zero_len, SM_SCALE, out,
+                c["k_scale"], c["v_scale"], splits=s, xcds=x,
+            )  # fmt: skip
+            if out.abs().max().item() != 0:
+                bad += 1
+                print(f"{cn} / {bn}: decode padding row not zero (splits={s} xcds={x})")
+        for tq, rnd in PREFILL_TQ:
+            out = torch.full_like(c["q"], 1.0)
+            sparse_pa_nvfp4_prefill(
+                c["q"], cache, topk, bt, zero_len, zero_len, SM_SCALE, out,
+                c["k_scale"], c["v_scale"], tq=tq, rounds=rnd,
+            )  # fmt: skip
+            if out.abs().max().item() != 0:
+                bad += 1
+                print(f"{cn} / {bn}: prefill padding row not zero (tq={tq})")
     return bad
 
 
@@ -406,12 +498,25 @@ def poisoned_tail():
         for s, lv in ((None, None), (1, False), (1, True), (4, None)):
             out = decode_call(c, s, late_v=lv)
             bad += int(not check(f"decode {name} splits={s} late_v={lv}", out, ref)[0])
+    # Prefill: tiles of rows share the tail page; the keys past the last row of a tile are
+    # unwritten, the ones between its rows are not.
+    for name, seq_lens, q_lens, hkv, group, kw in POISON_CASES + [
+        ("poison_chunk", [5, 200, 700], [5, 70, 300], 1, 16, {}),
+    ]:
+        c = make_case(
+            seq_lens, q_lens, hkv, group, seed=zlib.crc32(name.encode()) % 1000,
+            poison=True, **kw,
+        )  # fmt: skip
+        ref = run_torch(c)
+        for tq, rnd in PREFILL_TQ:
+            out = prefill_call(c, tq=tq, rounds=rnd)
+            bad += int(not check(f"prefill {name} tq={tq}", out, ref)[0])
     return bad
 
 
 def refusals():
-    """Arguments the kernel cannot read correctly are refused before launch, each with
-    its own message."""
+    """Arguments the kernels cannot read correctly are refused before launch (ValueError,
+    which ``python -O`` does not strip), each with its own message."""
     bad = 0
     c = make_case([500, 700], [1, 1], 1, 16, seed=5)
     cache, ks = c["cache"], c["k_scale"]
@@ -429,26 +534,23 @@ def refusals():
     # refused (the 8 GiB buffer below is never read; the refusal comes first).
     c2 = make_case([500, 700], [1, 1], 2, 8, seed=5)
     wide = torch.empty(2**31 + 64, dtype=torch.int32, device="cuda")
-    cases = [
-        ("splits > MAX_SPLITS", {"splits": 32}, "splits must be"),
-        ("splits 0", {"splits": 0}, "splits must be"),
+    shared = [
         ("strided cache view", {"cache": cache[:, ::2]}, "unit last stride"),
         ("cache too narrow", {"cache": cache[:, :-1]}, "smaller than its payload"),
         ("cpu k_scale", {"k_scale": ks.cpu()}, "k_scale and v_scale"),
         ("fp16 k_scale", {"k_scale": ks.half()}, "k_scale and v_scale"),
         ("empty k_scale", {"k_scale": ks[:0]}, "k_scale and v_scale"),
-        ("short block_table", {"bt": c["bt"][:1]}, "row per request"),
-        ("2-D seq_lens", {"seq_lens": c["seq_lens"][None]}, "seq_lens 1-D"),
-        ("xcds 1", {"xcds": 1}, "xcds must be"),
         ("fp16 q", {"q": c["q"].half()}, "bfloat16"),
         ("group 4", {"q": c["q"][:, :4]}, "8 or 16 heads"),
         ("2-D topk_idx", {"topk": c["topk"][0]}, "must be 3-D"),
         ("int64 topk_idx", {"topk": c["topk"].long()}, "topk_idx must be int32"),
+        ("flattened block_table", {"bt": c["bt"].flatten()}, "block_table 2-D"),
         ("sm_scale 0", {"sm_scale": 0.0}, "sm_scale"),
         ("sm_scale nan", {"sm_scale": float("nan")}, "sm_scale"),
         ("cpu q", {"q": c["q"].cpu()}, "CUDA"),
         ("page stride not 4-aligned", {"cache": padded[:, :page_b]}, "4-byte"),
         ("cache base not 4-aligned", {"cache": shifted[:, 1 : page_b + 1]}, "4-byte"),
+        ("cache base +2 bytes", {"cache": shifted[:, 2 : page_b + 2]}, "4-byte"),
         ("q base not 4-aligned", {"q": odd_q}, "4-byte"),
         ("out base not 4-aligned", {"out": odd_q}, "4-byte"),
         (
@@ -477,25 +579,52 @@ def refusals():
             "2 GiB",
         ),
     ]
-    for name, kw, msg in cases:
-        a = {
-            "q": c["q"], "cache": cache, "sm_scale": SM_SCALE, "k_scale": ks,
-            "v_scale": c["v_scale"], "splits": None, "bt": c["bt"],
-            "seq_lens": c["seq_lens"], "xcds": None, "topk": c["topk"], "out": None, **kw,
-        }  # fmt: skip
-        try:
-            sparse_pa_nvfp4_decode(
-                a["q"], a["cache"], a["topk"], a["bt"], a["seq_lens"], a["sm_scale"],
-                a["out"], a["k_scale"], a["v_scale"], query_len=1, splits=a["splits"],
-                xcds=a["xcds"],
-            )  # fmt: skip
-        except ValueError as e:
-            if msg in str(e):
-                continue
-            print(f"refusal: {name}: wrong message: {e!r}")
-        else:
-            print(f"refusal: {name} was accepted")
-        bad += 1
+    decode_only = [
+        ("splits > MAX_SPLITS", {"splits": 32}, "splits must be"),
+        ("splits 0", {"splits": 0}, "splits must be"),
+        ("short block_table", {"bt": c["bt"][:1]}, "row per request"),
+        ("2-D seq_lens", {"seq_lens": c["seq_lens"][None]}, "seq_lens 1-D"),
+        ("xcds 1", {"xcds": 1}, "xcds must be"),
+    ]
+    prefill_only = [
+        ("empty block_table", {"bt": c["bt"][:0]}, "block_table 2-D"),
+        ("tq 3", {"tq": 3}, "tq must be"),
+        ("rounds without tq", {"rounds": 1}, "rounds needs tq"),
+    ]
+
+    def decode(a):
+        sparse_pa_nvfp4_decode(
+            a["q"], a["cache"], a["topk"], a["bt"], a["seq_lens"], a["sm_scale"],
+            a.get("out"), a["k_scale"], a["v_scale"], query_len=1, splits=a.get("splits"),
+            xcds=a.get("xcds"),
+        )  # fmt: skip
+
+    def prefill(a):
+        sparse_pa_nvfp4_prefill(
+            a["q"], a["cache"], a["topk"], a["bt"], c["row_req"], c["row_kv"],
+            a["sm_scale"], a.get("out"), a["k_scale"], a["v_scale"], tq=a.get("tq"),
+            rounds=a.get("rounds"),
+        )  # fmt: skip
+
+    for kind, call, cases in (
+        ("decode", decode, shared + decode_only),
+        ("prefill", prefill, shared + prefill_only),
+    ):
+        for name, kw, msg in cases:
+            a = {
+                "q": c["q"], "cache": cache, "sm_scale": SM_SCALE, "k_scale": ks,
+                "v_scale": c["v_scale"], "bt": c["bt"], "topk": c["topk"],
+                "seq_lens": c["seq_lens"], **kw,
+            }  # fmt: skip
+            try:
+                call(a)
+            except ValueError as e:
+                if msg in str(e):
+                    continue
+                print(f"refusal: {kind} {name}: wrong message: {e!r}")
+            else:
+                print(f"refusal: {kind} {name} was accepted")
+            bad += 1
     decode_call(c, 16)  # the largest split count still launches
     # An aligned padded page is accepted and reads the same data.
     pad4 = torch.zeros(pages, page_b + 4, dtype=torch.uint8, device="cuda")
@@ -595,6 +724,72 @@ def test_decode_perf(rows, query_len, hkv, group, ctx):
     }
 
 
+@benchmark()
+def test_prefill_perf(q_len, hkv, group, ctx):
+    """One request, a chunk of ``q_len`` rows ending at ``ctx`` keys; random top-k blocks
+    per row (no overlap between neighbouring rows, the worst case for the page reuse).
+    """
+    pool, kd, vd = perf_pool(hkv, 8192)
+    g = torch.Generator(device="cuda").manual_seed(2)
+    nblk = math.ceil(ctx / BLK)
+    bt = torch.randint(
+        0, pool.shape[0], (1, nblk), generator=g, device="cuda", dtype=torch.int32
+    )
+    kv = (ctx - q_len + 1 + torch.arange(q_len, device="cuda")).int()
+    row_req = torch.zeros(q_len, dtype=torch.int32, device="cuda")
+    sb = (kv - 1) // BLK
+    sc = torch.rand(hkv, q_len, nblk, generator=g, device="cuda")
+    sc = torch.where(
+        torch.arange(nblk, device="cuda") < sb[None, :, None],
+        sc,
+        torch.full_like(sc, -1.0),
+    )
+    topk = torch.full((hkv, q_len, TOPK), -1, dtype=torch.int32, device="cuda")
+    v, i = sc.topk(TOPK - 1, dim=-1)
+    topk[..., : TOPK - 1] = torch.where(v >= 0, i.int(), torch.full_like(i.int(), -1))
+    topk[..., TOPK - 1] = sb.int()[None, :]
+    q = torch.randn(q_len, hkv * group, D, generator=g, device="cuda").bfloat16()
+    out = torch.empty_like(q)
+    ks = vs = torch.ones(1, dtype=torch.float32, device="cuda")
+    _, us = run_perftest(
+        sparse_pa_nvfp4_prefill,
+        q,
+        pool,
+        topk,
+        bt,
+        row_req,
+        kv,
+        SM_SCALE,
+        out,
+        ks,
+        vs,
+        num_iters=10,
+        num_warmup=2,
+    )
+    nref = min(q_len, 8)
+    ref = run_torch(
+        {
+            "q": q[:nref],
+            "topk": topk[:, :nref],
+            "bt": bt % BASE_PAGES,
+            "row_req": row_req[:nref],
+            "row_kv": kv[:nref],
+            "hkv": hkv,
+            "group": group,
+            "kd": kd,
+            "vd": vd,
+        }
+    )
+    nvalid = int((topk >= 0).sum().item())
+    keys = nvalid * BLK - int(((sb + 1) * BLK - kv).sum().item()) * hkv
+    return {
+        "us": us,
+        "TFLOPS": 4 * group * D * keys / us / 1e6,
+        "TB/s": nvalid * 2 * PAGE_B / us / 1e6,  # logical: re-used pages count again
+        "err": rel_l2(out[:nref], ref),
+    }
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     ap.add_argument(
@@ -616,6 +811,12 @@ def main(argv=None):
         if want(name):
             for sp in DECODE_SPLITS:
                 rows.append(test_correctness(name, hkv, group, sum(q_lens), sp))
+    for name, seq_lens, q_lens, hkv, group, kw in PREFILL_CASES:
+        if want(name):
+            for tq, rnd in PREFILL_TQ:
+                rows.append(
+                    test_prefill_correctness(name, hkv, group, sum(q_lens), tq, rnd)
+                )
     df = pd.DataFrame(rows)
     failed += int((~df["ok"]).sum())
     aiter.logger.info(
@@ -642,6 +843,15 @@ def main(argv=None):
         df = pd.DataFrame(perf)
         aiter.logger.info("decode perf:\n%s", df.to_markdown(index=False))
         failed += int((~(df["err"] <= REL_L2_TOL)).sum())  # a NaN err fails too
+        perf = [
+            test_prefill_perf(ql, hkv, g, ctx)
+            for (ql, ctx), (hkv, g) in itertools.product(
+                [(512, 4096), (2048, 32768), (8192, 32768)], [(1, 16), (4, 16)]
+            )
+        ]
+        df = pd.DataFrame(perf)
+        aiter.logger.info("prefill perf:\n%s", df.to_markdown(index=False))
+        failed += int((~(df["err"] <= REL_L2_TOL)).sum())
     print("FAILED" if failed else "PASSED", failed)
     return 1 if failed else 0
 
