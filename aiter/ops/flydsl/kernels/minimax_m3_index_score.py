@@ -48,27 +48,33 @@ both paths; do not rely on any other behaviour for these two bytes.
 `score_flydsl_nvfp4` scores an NVFP4 index cache: the same e2m1 data view, but one
 e4m3 scale per 16 elements (`k_scale uint8 [pages, 128, 8]`) and no per-tensor
 scale. gfx950's block-scaled MFMA and `v_cvt_scalef32_*_fp4` only apply a power of
-two (measured: the mantissa of the scale is ignored), so K is widened by
-`cvt(scale=1.0)` then an f32 multiply, and fed to the bf16 MFMA; Q (bf16 or e4m3)
-is widened to bf16. `k_round` picks what K is: "e4m3" (default) rounds the product
-`e2m1 * scale` to e4m3 (RNE, saturating at 448) like the vLLM nvfp4 indexer, so the
-scores are bit-identical to vLLM's; "exact" keeps the product unrounded, which bf16
-holds exactly. e4m3 scale bytes must be positive (the sign bit is not read) and not
-0x7F (NaN).
+two (measured: the mantissa of the scale is ignored), so the e4m3 scale is applied
+by an ordinary multiply. Scale bytes must be non-negative e4m3: the sign bit is
+not read, zero is allowed, and 0x7F (NaN) is out of contract. `k_round` picks what
+K is: "e4m3" (default) is `e2m1 * scale` rounded to e4m3 (RNE, saturating at 448;
+the convert itself does not saturate, so the product is clamped to +-448 first);
+"exact" keeps the product unrounded. Q is bf16 or e4m3, and the (Q dtype, `k_round`)
+pair picks one of three arms:
 
-With an e4m3 Q and `k_round="e4m3"` (the default, and the served combination) K never goes through
-f32 per element: each CTA builds, in LDS, the 8 e4m3 bytes `e4m3_rn_satfinite(mag *
-scale)` of every scale byte, and a K dword is looked up from it with `v_perm_b32`
-(selector = e2m1 magnitudes, sign OR-ed in), giving K as e4m3 for ONE fp8 MFMA per
-tile: the same K values as the bf16 arm's, at a quarter of its ALU, which is what
-keeps this kernel at the HBM rate. Scores of the two arms agree to the bit when the
-sums are exact (the op test's `bit_exact` cases); on general data they differ in
-the last digits (measured up to ~5e-5 relative) because the fp8 MFMA accumulates
-differently from the bf16 one.
-
-With an e4m3 Q and `k_round="exact"` the bf16 lift is skipped: e2m1 * scale and an e4m3
-Q are both exact in f16, so K dwords are converted straight to f16 pairs and scored on
-the f16 MFMA; a bf16 Q keeps the bf16 MFMA above.
+- bf16 Q, either `k_round`: each K data dword is widened by
+  `v_cvt_scalef32_pk_f32_fp4` at scale 2^120 and multiplied in f32 by the scale
+  (held as the f32 `scale / 2^120`), which is exact; "e4m3" then rounds the product
+  to e4m3 and widens it back, "exact" narrows it to bf16, which holds
+  `e2m1 * e4m3` exactly. The MFMA is the bf16 one, as for the fp8 cache.
+- e4m3 Q, `k_round="e4m3"` (the default, and the served combination): K never goes
+  through f32 per element. Each CTA builds, in LDS, the 8 e4m3 bytes
+  `e4m3_rn_satfinite(mag * scale)` of every scale byte, and a K dword is looked up
+  from it with `v_perm_b32` (selector = e2m1 magnitudes, sign OR-ed in), giving K
+  as e4m3 for ONE fp8 `v_mfma_scale_f32_16x16x128_f8f6f4` per tile (unit scales, Q
+  as stored): the same K values as the bf16 arm's, at a quarter of its ALU, which
+  is what keeps this kernel at the HBM rate. Scores of the two arms agree to the
+  bit when the sums are exact (the op test's `bit_exact` cases); on general data
+  they differ in the last digits (measured up to ~5e-5 relative) because the fp8
+  MFMA accumulates differently from the bf16 one.
+- e4m3 Q, `k_round="exact"`: the bf16 lift is skipped. `e2m1 * scale` and an e4m3 Q
+  are both exact in f16, so K dwords are converted straight to f16 pairs
+  (`v_cvt_scalef32_pk_f16_fp4` at 2^8, times the f16 `scale / 2^8`) and scored,
+  with Q widened to f16, on the 16x16x32 f16 MFMA.
 """
 
 import math
@@ -314,7 +320,8 @@ def e4m3_to_f32(byte):
 def e4m3_table_words(scale_f32):
     """The 8 e4m3 bytes `e4m3_rn_satfinite(mag * scale)` for mag in E2M1_MAGS, as two
     dwords (entries 0..3, 4..7). Same clamp-then-convert as `nvfp4_dword_to_bf16`,
-    which the P0 microtest pinned to bit equality with the torch reference."""
+    which the op test `check_nvfp4_matches_oracle` pins to bit equality with the torch
+    reference."""
     hi = fx.Float32(E4M3_MAX)
     v = [(fx.Float32(m) * scale_f32).minimumf(hi) for m in E2M1_MAGS]
     words = []
@@ -446,11 +453,13 @@ _ONE_TILE_DECODE_DEPTH = _SERVED_DECODE_DEPTH[(4, 1)]
 
 
 # NVFP4 only (opt-in, `geometry(..., nvfp4=True)`): at Q8 / four index heads the shared
-# table's depth 3 for batches 3..16 lands the grid at 1.33-2.67 CTAs per CU slot, so
-# some CUs run two rounds while others idle; depth 2 gives 1024 / 512 CTAs at batch 8
-# (ctx 128K / 64K), whole rounds on 256 CUs. Measured on both arms, S8H4, batch 8..16,
-# ctx 32K..128K: depth 2 is 2..21% faster than 3 on the e4m3 arm (batch 8: -5% / -17% at
-# 128K / 64K; batch 16: -21% at 32K) and 2..21% on the exact arm; batch 2..4 does not move.
+# table gives depth 2 for batches 3-4 and depth 3 for batches 5..16; at depth 3 the grid
+# lands at 1.33-2.67 CTAs per CU slot, so some CUs run two rounds while others idle.
+# Depth 2 gives 1024 / 512 CTAs at batch 8 (ctx 128K / 64K), whole rounds on 256 CUs.
+# Measured on both arms, S8H4, batch 8..16, ctx 32K..128K: depth 2 is 2..21% faster
+# than 3 on the e4m3 arm (batch 8: -5% / -17% at 128K / 64K; batch 16: -21% at 32K)
+# and 2..21% on the exact arm. The NVFP4 table therefore only changes batches 5..16
+# (batches 3-4 are already depth 2).
 # MXFP4 keeps the shared table, so its work map and outputs do not move.
 _NVFP4_DECODE_DEPTH = {(8, 4): ((2, 1), (16, 2))}
 
@@ -686,11 +695,12 @@ def build_index_score(
 
     S = max query tokens per request (num_spec + 1), H = index heads, and
     F = S*H is the feature count, laid out as column n = tok*H + head.
-    `mxfp4` reads the two-view MXFP4 cache instead of the fp8 one; `q_fp8`
-    (MXFP4 only) takes an e4m3 Q and one scaled MFMA per tile. `nvfp4` (with
-    `mxfp4` set: same two-view plumbing) reads the NVFP4 cache -- e4m3 scale per 16
-    -- on the bf16 MFMA, `nvfp4` being the K rounding ("e4m3" / "exact"); an e4m3 Q
-    is widened to bf16 there, not fed to the scaled MFMA.
+    `mxfp4` reads the two-view MXFP4 cache instead of the fp8 one; `q_fp8` takes an
+    e4m3 Q. On MXFP4 that is one scaled MFMA per tile. `nvfp4` (with `mxfp4` set:
+    same two-view plumbing) reads the NVFP4 cache -- e4m3 scale per 16 -- and is the
+    K rounding ("e4m3" / "exact"). Its arm follows from (`q_fp8`, `nvfp4`) as in the
+    module docstring: a bf16 Q uses the bf16 MFMA; an e4m3 Q uses the fp8 MFMA
+    with "e4m3" K (table lookup, unit scales) and the f16 MFMA with "exact" K.
     """
     assert nvfp4 is None or (mxfp4 and nvfp4 in NVFP4_ROUNDINGS)
     q8_scaled = q_fp8 and nvfp4 is None  # e4m3 Q on the scaled MFMA (MXFP4 only)
@@ -2447,9 +2457,9 @@ def score_flydsl_nvfp4(
     [pages, 128, 8]` uint8 holds one e4m3 scale per 16 elements (8 B a token, token
     major; no per-tensor scale), each view with its own page stride. `idx_q` is
     bf16 or e4m3. `k_round` is "e4m3" (the default: K = e4m3_rn_satfinite(e2m1 *
-    scale), as the vLLM nvfp4 indexer reads it, bit-identical to it; the fp8 MFMA with an
-    e4m3 Q) or "exact" (K = e2m1 * scale, no rounding, on the bf16 MFMA, or on the f16
-    MFMA with an e4m3 Q). Scale bytes must be positive e4m3 (sign bit unread) and not
+    scale), the fp8 MFMA with an e4m3 Q) or "exact" (K = e2m1 * scale, no rounding, on
+    the bf16 MFMA, or on the f16 MFMA with an e4m3 Q). Scale bytes must be non-negative
+    e4m3 (sign bit unread) and not
     0x7F. Work map and score layout as in `score_flydsl`.
     """
     if k_round not in NVFP4_ROUNDINGS:
