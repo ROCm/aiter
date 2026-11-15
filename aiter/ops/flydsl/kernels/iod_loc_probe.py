@@ -25,6 +25,12 @@ the GEMMs read c the same way); the others are relaunched on another stream.
 Each class must agree with the domain formula on (nearly) every page of the
 kept passes; if one does not, or too few passes are kept, the probe reports it
 instead of returning a phase.
+
+Lines the kernels before the probe left dirty in the memory-side cache (the
+shuffle that wrote the weight, the scatter that placed the previous one) blur
+the two parities until they are written back; a small tensor, a scale, then
+fails on most pages. Writing more does not drain them, reading does, so the
+probe first streams ``EVICT_BYTES`` of reads.
 """
 
 import numpy as np
@@ -51,6 +57,9 @@ _ROT = np.array(
 )
 #: hwreg(HW_REG_HW_ID2, offset 0, size 6): QUEUE_ID [3:0], PIPE_ID [5:4].
 _HW_ID2_QUEUE_PIPE = 24 | (0 << 6) | ((6 - 1) << 11)
+#: Reads streamed before probing; 256 MiB was the least that drained a
+#: freshly written tensor on gfx1250.
+EVICT_BYTES = 512 << 20
 
 
 def launch_rotation():
@@ -170,6 +179,14 @@ def probe_windows(start: int, nbytes: int, lo: int, hi: int):
     return base, npg, wins[0], wins[1]
 
 
+def _drain_dirty_lines(dev):
+    try:
+        junk = torch.empty(EVICT_BYTES // 4, dtype=torch.int32, device=dev)
+    except torch.OutOfMemoryError:
+        return
+    junk.sum(dtype=torch.int64)
+
+
 def probe_phase(buf: torch.Tensor, npass: int = 4, span=None):
     """Phase of every 2 MiB page ``buf`` touches.
 
@@ -190,6 +207,7 @@ def probe_phase(buf: torch.Tensor, npass: int = 4, span=None):
     dev = buf.device
     lat = torch.zeros(PROBERS * npg * NGRAN + PROBERS, dtype=torch.int32, device=dev)
     current = torch.cuda.current_stream(dev)
+    _drain_dirty_lines(dev)
     stream = current
     est = []
     rotations = []
