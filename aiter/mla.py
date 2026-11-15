@@ -988,6 +988,17 @@ def mla_decode_prepare_page_csr(
     return kv_indptr, kv_indices, kv_last_page_lens
 
 
+def _put_empty_work_items_last(work_indptr, work_info_set):
+    """Move each CU's work items with no KV after its others, in place."""
+    pos = torch.arange(
+        work_info_set.size(0), dtype=work_indptr.dtype, device=work_indptr.device
+    )
+    cu = torch.searchsorted(work_indptr, pos, right=True)
+    empty = work_info_set[:, 5] <= work_info_set[:, 4]
+    order = torch.sort(cu * 2 + empty, stable=True).indices
+    work_info_set.copy_(work_info_set[order])
+
+
 def mla_decode_fwd(
     q,
     kv_buffer,
@@ -1065,9 +1076,11 @@ def mla_decode_fwd(
 
     ``empty_work_items=True`` lets a persistent work plan hold work items
     with no KV, as one planned at a KV bound and cut to each request's keys
-    does. Such an item adds nothing; a request with no keys gets O=0 and
-    LSE=+inf, the reduce's value for a sum with no weight. It costs one fill
-    of the partial LSE per call.
+    does. The asm kernels end a CU's work at its first empty item, so each
+    CU's empty items are moved after its others in ``work_info_set``, in
+    place. Such an item adds nothing; a request with no keys gets O=0 and
+    LSE=+inf, the reduce's value for a sum with no weight. It costs a sort of
+    the plan, a zero fill of ``o`` and two LSE fills per call.
     """
     if kv_csr_layout not in ("page", "token"):
         raise ValueError(f"unknown MLA kv_csr_layout: {kv_csr_layout!r}")
@@ -1535,14 +1548,20 @@ def mla_decode_fwd(
             dtype=dtypes.fp32,
             device=device,
         )
-        if empty_work_items:
-            # Such an item writes no partial; -inf gives it no weight in mla_reduce_v1.
-            attn_lse.fill_(float("-inf"))
         final_lse = (
             torch.empty((total_s, nhead), dtype=dtypes.fp32, device=device)
             if return_lse
             else None
         )
+        if empty_work_items:
+            # The asm kernels read the plan through work_meta_data's pointers.
+            _put_empty_work_items_last(work_indptr, work_info_set)
+            # An empty item writes nothing: -inf gives its partial no weight in
+            # mla_reduce_v1, and a request whose one item writes O stays 0, +inf.
+            attn_lse.fill_(float("-inf"))
+            o.zero_()
+            if final_lse is not None:
+                final_lse.fill_(float("inf"))
 
         use_hk = head_plan.backend == _MlaBackendId.HK
 
