@@ -812,6 +812,12 @@ def sparse_pa_nvfp4_decode(
         (seq_lens.shape[0] - 1) * block_table.stride(0) + block_table.shape[1] <= 2**31,
         "block_table element offsets (request stride) must stay below 2**31",
     )
+    # Q, out and the pages are read and written in dwords through 4-byte-aligned buffers.
+    require(
+        all(t.data_ptr() % 4 == 0 for t in (q, out, kv_cache))
+        and kv_cache.stride(0) % 4 == 0,
+        "q, out and kv_cache must start on a 4-byte boundary, with a 4-byte-aligned page stride",
+    )
     for t in (out, kv_cache, topk_idx, block_table, seq_lens):
         require(t.device == q.device, "all operands must be on q's device")
     dev = q.device.index

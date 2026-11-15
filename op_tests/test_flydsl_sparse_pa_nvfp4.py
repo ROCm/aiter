@@ -415,6 +415,16 @@ def refusals():
     bad = 0
     c = make_case([500, 700], [1, 1], 1, 16, seed=5)
     cache, ks = c["cache"], c["k_scale"]
+    pages, page_b = cache.shape
+    # The kernel loads Q, the output and the pages in dwords: their addresses and the page
+    # stride must be 4-byte aligned (a padded page stays fine).
+    padded = torch.zeros(pages, page_b + 1, dtype=torch.uint8, device="cuda")
+    padded[:, :page_b] = cache
+    shifted = torch.zeros(pages, page_b + 4, dtype=torch.uint8, device="cuda")
+    shifted[:, 1 : page_b + 1] = cache
+    odd_q = torch.empty(c["q"].numel() + 1, dtype=torch.bfloat16, device="cuda")[1:]
+    odd_q = odd_q.view_as(c["q"])
+    odd_q.copy_(c["q"])
     # Element offsets (rows x stride) are 32-bit: views reaching past 2**31 elements are
     # refused (the 8 GiB buffer below is never read; the refusal comes first).
     c2 = make_case([500, 700], [1, 1], 2, 8, seed=5)
@@ -437,6 +447,10 @@ def refusals():
         ("sm_scale 0", {"sm_scale": 0.0}, "sm_scale"),
         ("sm_scale nan", {"sm_scale": float("nan")}, "sm_scale"),
         ("cpu q", {"q": c["q"].cpu()}, "CUDA"),
+        ("page stride not 4-aligned", {"cache": padded[:, :page_b]}, "4-byte"),
+        ("cache base not 4-aligned", {"cache": shifted[:, 1 : page_b + 1]}, "4-byte"),
+        ("q base not 4-aligned", {"q": odd_q}, "4-byte"),
+        ("out base not 4-aligned", {"out": odd_q}, "4-byte"),
         (
             "topk_idx offsets past 2**31",
             {
@@ -467,12 +481,12 @@ def refusals():
         a = {
             "q": c["q"], "cache": cache, "sm_scale": SM_SCALE, "k_scale": ks,
             "v_scale": c["v_scale"], "splits": None, "bt": c["bt"],
-            "seq_lens": c["seq_lens"], "xcds": None, "topk": c["topk"], **kw,
+            "seq_lens": c["seq_lens"], "xcds": None, "topk": c["topk"], "out": None, **kw,
         }  # fmt: skip
         try:
             sparse_pa_nvfp4_decode(
                 a["q"], a["cache"], a["topk"], a["bt"], a["seq_lens"], a["sm_scale"],
-                None, a["k_scale"], a["v_scale"], query_len=1, splits=a["splits"],
+                a["out"], a["k_scale"], a["v_scale"], query_len=1, splits=a["splits"],
                 xcds=a["xcds"],
             )  # fmt: skip
         except ValueError as e:
@@ -483,6 +497,12 @@ def refusals():
             print(f"refusal: {name} was accepted")
         bad += 1
     decode_call(c, 16)  # the largest split count still launches
+    # An aligned padded page is accepted and reads the same data.
+    pad4 = torch.zeros(pages, page_b + 4, dtype=torch.uint8, device="cuda")
+    pad4[:, :page_b] = cache
+    if not torch.equal(decode_call(dict(c, cache=pad4[:, :page_b])), decode_call(c)):
+        print("padded page (stride +4) gives a different result")
+        bad += 1
     return bad
 
 
