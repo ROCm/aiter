@@ -158,38 +158,26 @@ MXFP4_K_CACHE = 2
 NVFP4_FP8_TILE_DEPTH = 4
 
 
-def fp8_dwords_to_bf16(raw, lo, dwords):
-    """`dwords` packed-fp8 dwords of `raw` from index `lo`, as 4*dwords bf16.
+def fp8_dwords_widen(raw, lo, dwords, dtype):
+    """`dwords` packed-fp8 dwords of `raw` from index `lo`, as 4*dwords `dtype`
+    (`fx.BFloat16` or `fx.Float16`; both hold e4m3 exactly).
 
     Split out of `convert_k` so an fp8 Q is widened by exactly the conversion K
     is widened by; two copies would be silent wrong numbers, not a crash. The
     cache is unit-scale, hence scale 1.0.
     """
+    assert dtype in (fx.BFloat16, fx.Float16), dtype
+    if dtype is fx.BFloat16:
+        cvt, elem_ty = fx.rocdl.cvt_scalef32_pk_bf16_fp8, T.bf16
+    else:
+        cvt, elem_ty = fx.rocdl.cvt_scalef32_pk_f16_fp8, T.f16
     one = _to_raw(fx.Float32(1.0))
     elems = []
     for d in range_constexpr(dwords):
         word = _to_raw(fx.Int32(raw[lo + d]))
         for half in range_constexpr(2):
-            pair = fx.Vector(
-                fx.rocdl.cvt_scalef32_pk_bf16_fp8(
-                    T.vec(2, T.bf16), word, one, bool(half)
-                )
-            )
-            elems += [fx.BFloat16(pair[0]), fx.BFloat16(pair[1])]
-    return elems
-
-
-def fp8_dwords_to_f16(raw, lo, dwords):
-    """`fp8_dwords_to_bf16` into f16: 4*dwords f16, exact (e4m3 is a subset of f16)."""
-    one = _to_raw(fx.Float32(1.0))
-    elems = []
-    for d in range_constexpr(dwords):
-        word = _to_raw(fx.Int32(raw[lo + d]))
-        for half in range_constexpr(2):
-            pair = fx.Vector(
-                fx.rocdl.cvt_scalef32_pk_f16_fp8(T.vec(2, T.f16), word, one, bool(half))
-            )
-            elems += [fx.Float16(pair[0]), fx.Float16(pair[1])]
+            pair = fx.Vector(cvt(T.vec(2, elem_ty), word, one, bool(half)))
+            elems += [dtype(pair[0]), dtype(pair[1])]
     return elems
 
 
@@ -236,10 +224,11 @@ def fragment_helpers(g):
         t = fx.make_rmem_tensor(fx.make_layout(LANE_K, 1), fx.BFloat16)
         t.store(
             fx.Vector.from_elements(
-                fp8_dwords_to_bf16(
+                fp8_dwords_widen(
                     raws[ks // K_PER_LOAD],
                     (ks % K_PER_LOAD) * (LANE_K // 4),
                     LANE_K // 4,
+                    fx.BFloat16,
                 ),
                 fx.BFloat16,
             )
@@ -433,7 +422,9 @@ def nvfp4_dword_to_bf16(word, scale_raw, k_e4m3):
                 T.i32, _to_raw(a), _to_raw(b), packed, bool(h)
             )
         words.append(fx.Int32(packed))
-    return fx.Vector.from_elements(fp8_dwords_to_bf16(words, 0, 2), fx.BFloat16)
+    return fx.Vector.from_elements(
+        fp8_dwords_widen(words, 0, 2, fx.BFloat16), fx.BFloat16
+    )
 
 
 # rocdl.sched_group_barrier instruction-class masks (rocdl._SCHED_MASK_INT_TO_KW).
@@ -936,20 +927,13 @@ def build_index_score(
                     fx.get_iter(q_buf), (base + fx.Int32(16 * j)) >> fx.Int32(2)
                 ).load(T.vec(4, T.i32))
                 for half in range_constexpr(2):
-                    if const_expr(f16_arm):
-                        t = fx.make_rmem_tensor(fx.make_layout(LANE_K, 1), fx.Float16)
-                        t.store(
-                            fx.Vector.from_elements(
-                                fp8_dwords_to_f16(raw, 2 * half, 2), fx.Float16
-                            )
+                    wdt = fx.Float16 if f16_arm else fx.BFloat16
+                    t = fx.make_rmem_tensor(fx.make_layout(LANE_K, 1), wdt)
+                    t.store(
+                        fx.Vector.from_elements(
+                            fp8_dwords_widen(raw, 2 * half, 2, wdt), wdt
                         )
-                    else:
-                        t = fx.make_rmem_tensor(fx.make_layout(LANE_K, 1), fx.BFloat16)
-                        t.store(
-                            fx.Vector.from_elements(
-                                fp8_dwords_to_bf16(raw, 2 * half, 2), fx.BFloat16
-                            )
-                        )
+                    )
                     frags.append(t)
             return frags
 
