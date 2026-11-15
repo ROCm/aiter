@@ -45,6 +45,62 @@ def _check_out(out, q, kv_lora_rank):
     return out
 
 
+def _check_q_rope_fusion(
+    q,
+    fmt,
+    arch,
+    q_scale,
+    positions,
+    cos_sin_cache,
+    qk_rope_head_dim,
+    kv_lora_rank,
+    dot_precision,
+    has_invalid,
+    skip_reduce,
+    num_heads,
+):
+    """The fused q RoPE + fp8 cast exists only in gfx950's fp8 kernel, for a
+    plain per-tensor fp8 cache whose rope lives inside the 512-wide row."""
+    if arch != "gfx950":
+        raise ValueError(f"the fused q RoPE needs gfx950, got {arch}")
+    if q.dtype != torch.bfloat16:
+        raise ValueError(f"the fused q RoPE needs bf16 q, got {q.dtype}")
+    if fmt != "fp8_scalar":
+        raise ValueError(f"the fused q RoPE needs an fp8_scalar cache, got {fmt}")
+    if qk_rope_head_dim != 0 or kv_lora_rank != 512:
+        raise ValueError(
+            "the fused q RoPE needs the rope inside the row (qk_rope_head_dim=0, "
+            f"kv_lora_rank=512), got {qk_rope_head_dim} / {kv_lora_rank}"
+        )
+    if dot_precision != "fp8":
+        raise ValueError(
+            f"the fused q RoPE needs dot_precision='fp8', got {dot_precision}"
+        )
+    if has_invalid or skip_reduce:
+        raise ValueError(
+            "the fused q RoPE does not combine with has_invalid or skip_reduce"
+        )
+    if num_heads not in (8, 16, 32, 64, 128):
+        raise ValueError(
+            f"the fused q RoPE needs 8/16/32/64/128 heads, got {num_heads}"
+        )
+    if q_scale is None or q_scale.numel() != 1:
+        raise ValueError("the fused q RoPE needs a single per-tensor q_scale")
+    if cos_sin_cache is None or cos_sin_cache.dtype != torch.float32:
+        raise ValueError("q_rope_cos_sin_cache must be an f32 [P, 64] (cos | sin)")
+    if cos_sin_cache.ndim != 2 or cos_sin_cache.shape[1] != 64:
+        raise ValueError(
+            f"q_rope_cos_sin_cache must be [P, 64], got {tuple(cos_sin_cache.shape)}"
+        )
+    if positions.dtype != torch.int64 or positions.shape != (q.shape[0],):
+        raise ValueError(
+            f"q_rope_positions must be int64 [{q.shape[0]}], got {positions.dtype} "
+            f"{tuple(positions.shape)}"
+        )
+    if q.stride(2) != 1:
+        raise ValueError("the fused q RoPE needs q with a unit last stride")
+
+
 def _cache_pointers(fmt, kv, d_qk, kv_scale):
     """-> (cache, alt_ptr, scl_ptr, block_size) for an MLA-route format. Pointer
     roles follow the kernel's Seg contract (see its docstring)."""
@@ -514,6 +570,9 @@ def _sparse_mla_fwd_gfx950_fp8(
     inv_rope_positions,
     inv_rope_cos_sin_cache,
     out_mxfp8,
+    q_rope_positions=None,
+    q_rope_cos_sin_cache=None,
+    q_norm_eps=None,
 ):
     """gfx950's kernel for a per-tensor fp8 cache with fp8 dots
     (_gluon_kernels/gfx950/attention/sparse_mla_fp8.py) and, when split, the
@@ -619,7 +678,7 @@ def _sparse_mla_fwd_gfx950_fp8(
         indptr_ptr=kv_indptr,
         idx_ptr=kv_indices,
         sink_ptr=attn_sink,
-        q_scale_ptr=None if q_bf16 else q_scale,
+        q_scale_ptr=None if (q_bf16 and q_rope_positions is None) else q_scale,
         ks_ptr=kv_scale,
         lse_ptr=None if split else lse,
         part_m_ptr=part_m,
@@ -633,6 +692,11 @@ def _sparse_mla_fwd_gfx950_fp8(
         extra_stride=extra[1],
         x_kv_ptr=x_kv,
         x_ks_ptr=x_ks,
+        qpos_ptr=q_rope_positions,
+        qcs_ptr=q_rope_cos_sin_cache,
+        qcs_stride=0 if q_rope_positions is None else q_rope_cos_sin_cache.stride(0),
+        q_eps=0.0 if q_norm_eps is None else q_norm_eps,
+        APPLY_Q_NORM=q_norm_eps is not None,
         num_queries=C,
         num_heads=H,
         sm_scale=softmax_scale,
@@ -718,6 +782,9 @@ def sparse_mla_fwd(
     inv_rope_positions: torch.Tensor | None = None,
     inv_rope_cos_sin_cache: torch.Tensor | None = None,
     out_mxfp8: tuple[torch.Tensor, torch.Tensor] | None = None,
+    q_rope_positions: torch.Tensor | None = None,
+    q_rope_cos_sin_cache: torch.Tensor | None = None,
+    q_norm_eps: float | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor | None]:
     """Sparse (top-k gathered) MLA attention.
 
@@ -808,6 +875,18 @@ def sparse_mla_fwd(
             rotated back (inverse GPT-J RoPE) before the store. DeepSeek-V4
             caches only (fp8_dsv4_mla, fp8_g64, the two-loop), whose rope lives
             inside the row, and gfx950's 512-wide fp8_scalar with fp8 dots.
+        q_rope_positions, q_rope_cos_sin_cache: optional [C] int64 positions and
+            [P, 64] f32 (cos | sin) that fuse the query's forward GPT-J RoPE (last
+            64 of the 512 columns) and fp8 cast into the kernel. q is then the raw
+            bf16 [C, H, 512] projection and q_scale (the static per-tensor scale
+            the fp8 cast uses, folded into the softmax scale as for fp8 q) is
+            required. The result matches the two-step path (RoPE + cast to fp8,
+            then fp8 q) up to rounding: roughly 1 in 1e8 q codes can land one e4m3
+            step away. Needs gfx950, an fp8_scalar cache with qk_rope_head_dim=0,
+            kv_lora_rank=512, dot_precision="fp8", no -1 sentinels and no
+            skip_reduce; anything else raises.
+        q_norm_eps: with q_rope_positions, also apply the weightless per-head RMS
+            norm (this eps) to q before the RoPE. Unoptimised.
         out_mxfp8: (data [C, H * D] e4m3, scale [C, H * D // 32] uint8 E8M0) in
             place of out, for the same caches: the output is stored
             MXFP8-quantized, one scale per 32 lanes, and data viewed as
@@ -831,6 +910,24 @@ def sparse_mla_fwd(
         fmt,
     )
     _check_geometry(fmt, d_qk, kv_lora_rank, qk_rope_head_dim)
+    q_raw = q_rope_positions is not None
+    if q_raw:
+        _check_q_rope_fusion(
+            q,
+            fmt,
+            arch_info.get_arch(),
+            q_scale,
+            q_rope_positions,
+            q_rope_cos_sin_cache,
+            qk_rope_head_dim,
+            kv_lora_rank,
+            dot_precision,
+            has_invalid,
+            skip_reduce,
+            num_heads,
+        )
+    elif q_rope_cos_sin_cache is not None or q_norm_eps is not None:
+        raise ValueError("q_rope_cos_sin_cache and q_norm_eps need q_rope_positions")
     _check_index_stream(kv_indptr, kv_indices, num_queries, q.device)
     if attn_sink is not None and attn_sink.numel() != num_heads:
         raise ValueError(
@@ -931,7 +1028,9 @@ def sparse_mla_fwd(
         extra_indices = _as_int32_contiguous_1d(extra_indices)
         extra_indptr = _as_int32_contiguous_1d(extra_indptr)
     fp8_dots = _resolve_dot_precision(dot_precision, fmt, arch)
-    if not q_is_fp8:
+    if q_raw:
+        q_scale = q_scale.reshape(1).to(torch.float32).contiguous()
+    elif not q_is_fp8:
         # q_scale describes an fp8 q's encoding. With bf16 q the kernel quantizes
         # per (query, head-block) tile when the dots are fp8, so a caller-supplied
         # scale has nothing to apply to; callers pass layer._q_scale regardless.
@@ -983,9 +1082,17 @@ def sparse_mla_fwd(
             inv_rope_positions=inv_rope_positions,
             inv_rope_cos_sin_cache=inv_rope_cos_sin_cache,
             out_mxfp8=out_mxfp8,
+            q_rope_positions=q_rope_positions,
+            q_rope_cos_sin_cache=q_rope_cos_sin_cache,
+            q_norm_eps=q_norm_eps,
         )
         if res is not None:
             return res
+    if q_raw:
+        raise ValueError(
+            "the fused q RoPE needs the gfx950 fp8 kernel, which cannot address "
+            "these caches (empty, or not row-contiguous)"
+        )
     if epilogue:
         raise ValueError(
             "the inverse-RoPE / MXFP8 output epilogue needs a DeepSeek-V4 cache, "

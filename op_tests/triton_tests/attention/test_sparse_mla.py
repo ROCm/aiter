@@ -496,3 +496,93 @@ def test_sparse_mla_fp8_two_caches(one_alloc, mxfp8, splits):
         out = (data.float().view(C, -1, 32) * step).view(C, H, KV_LORA)
     e = rel_err(out, ref)
     assert e < 0.1, f"{one_alloc=} {mxfp8=} {splits=}: rel-err {e:.3e}"
+
+
+def _rope_cast_q(q, pos, cos_sin, q_scale):
+    """The two-step path's Q prep: GPT-J RoPE on the last 64 columns in f32, then
+    * 1 / q_scale, saturate and cast to e4m3."""
+    C, H, _ = q.shape
+    x = q.float()
+    pair = x[..., KV_LORA - ROPE :].reshape(C, H, ROPE // 2, 2)
+    cos = cos_sin[pos, : ROPE // 2][:, None, :]
+    sin = cos_sin[pos, ROPE // 2 :][:, None, :]
+    even, odd = pair[..., 0], pair[..., 1]
+    rot = torch.stack([even * cos - odd * sin, odd * cos + even * sin], dim=-1)
+    x = torch.cat([x[..., : KV_LORA - ROPE], rot.reshape(C, H, ROPE)], dim=-1)
+    return (x * (1.0 / q_scale)).clamp(-FP8_MAX, FP8_MAX).to(FP8_DTYPE)
+
+
+@pytest.mark.parametrize("out_mode", ["bf16", "inv_rope", "inv_rope_mxfp8"])
+@pytest.mark.parametrize("two_lists", [False, True], ids=["swa_only", "two_lists"])
+@pytest.mark.parametrize("H", [16, 64])
+@pytest.mark.parametrize("C", [1, 64, 1000])
+def test_sparse_mla_fused_q_rope(C, H, two_lists, out_mode):
+    """q_rope_positions / q_rope_cos_sin_cache: raw bf16 q, RoPE'd and cast to e4m3
+    inside gfx950's fp8 kernel, against the two-step path (RoPE + cast in torch,
+    then the same kernel on fp8 q). Not bit-exact: a q code can land one e4m3 step
+    away from rounding order, which moves an output row by at most a bf16 ulp.
+    out_mode adds the inverse-RoPE output epilogue (vLLM always passes it) and its
+    MXFP8 variant, whose one-step q difference can flip an output's e4m3 rounding,
+    so that one is bounded by an e4m3 step (2**-3) of the largest output."""
+    _skip_unless_supported("fp8", "tensor")
+    if arch_info.get_arch() != "gfx950":
+        pytest.skip("the fused q RoPE is gfx950-only")
+    B, nb = 64, 64
+    sm = KV_LORA**-0.5
+    torch.manual_seed(0)
+    q = torch.randn(C, H, KV_LORA, dtype=torch.bfloat16, device="cuda") * 2
+    kv = torch.randn(2, nb * B, KV_LORA, dtype=torch.bfloat16, device="cuda") * 2
+    main_u8, ks = quantize_flat_fp8(kv[0])
+    x_u8, x_ks = quantize_flat_fp8(kv[1] * 4)
+    main = main_u8.view(nb, B, -1)
+    m_idx, m_ptr = make_indices(C, nb * B, 128, "cuda", 1, ragged=True)
+    extra_args = {}
+    if two_lists:
+        x_idx, x_ptr = make_indices(C, nb * B, 256, "cuda", 2, ragged=True)
+        extra_args = {
+            "extra_kv": x_u8.view(nb, B, -1),
+            "extra_indptr": x_ptr,
+            "extra_indices": x_idx,
+            "extra_kv_scale": x_ks,
+        }
+    sink = torch.randn(H, device="cuda")
+    ang = torch.rand(4096, ROPE // 2, device="cuda") * 6.2831853
+    cos_sin = torch.cat([ang.cos(), ang.sin()], dim=1).contiguous()
+    pos = torch.randint(0, 4096, (C,), device="cuda", dtype=torch.int64)
+    q_scale = torch.ones(1, device="cuda", dtype=torch.float32)
+
+    epi = {}
+    if out_mode != "bf16":
+        epi = {"inv_rope_positions": pos, "inv_rope_cos_sin_cache": cos_sin}
+    mxfp8 = out_mode == "inv_rope_mxfp8"
+
+    def run(q_in, **kw):
+        if mxfp8:
+            data = torch.empty(C, H * KV_LORA, dtype=torch.float8_e4m3fn, device="cuda")
+            scale = torch.empty(C, H * KV_LORA // 32, dtype=torch.uint8, device="cuda")
+            kw["out_mxfp8"] = (data, scale)
+        out = sparse_mla_fwd(
+            q_in,
+            main,
+            m_ptr,
+            m_idx,
+            sm,
+            kv_scale=ks,
+            qk_rope_head_dim=0,
+            dot_precision="fp8",
+            q_scale=q_scale,
+            attn_sink=sink,
+            **extra_args,
+            **epi,
+            **kw,
+        )[0]
+        if mxfp8:
+            step = torch.exp2(scale.float() - 127.0).view(C, -1, 1)
+            out = (data.float().view(C, -1, 32) * step).view(C, H, KV_LORA)
+        return out
+
+    ref = run(_rope_cast_q(q, pos, cos_sin, q_scale))
+    out = run(q, q_rope_positions=pos, q_rope_cos_sin_cache=cos_sin)
+    tol = 2 ** (-3 if mxfp8 else -7) * ref.float().abs().max().item()
+    err = (out.float() - ref.float()).abs().max().item()
+    assert err <= tol, f"{out_mode}: max abs err {err:.3e} > {tol:.3e}"
