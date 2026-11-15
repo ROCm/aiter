@@ -2446,11 +2446,13 @@ def bench_score_mxfp4(case, B, S, H, lens, kwargs):
 #
 # A token is 64 B of e2m1 plus 8 e4m3 scale bytes (one per 16 elements, no
 # per-tensor scale). Two references, because K has two defensible values:
-#   "e4m3"  K = e4m3_rn_satfinite(e2m1 * scale)    what the vLLM nvfp4 indexer reads
+#   "e4m3"  K = e4m3_rn_satfinite(e2m1 * scale)    RNE to e4m3, saturating at 448 (default)
 #   "exact" K = e2m1 * scale                       exact in bf16
 # They differ on ~21% of (code, scale) pairs, so each kernel mode is judged against
 # ITS reference and the cross difference is reported, never absorbed in a tolerance.
-# The quantizer below is test-side only; the kernel sees (data, scale) bytes.
+# The quantizer below is test-side only; the kernel sees (data, scale) bytes. The
+# rounding rule is pinned by `check_nvfp4_matches_oracle` (kernel vs the torch
+# `e4m3_rn_satfinite` oracle) and `check_nvfp4_scale_range_and_saturation` (448 clamp).
 # ==========================================================================
 E2M1 = (0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0)  # code & 7; bit 3 is the sign
 E4M3_MAX = 448.0
@@ -2500,13 +2502,14 @@ def pack_nvfp4(codes, scale_bytes):
     return data, scale_bytes, exact, e4m3_rn_satfinite(prod).to(torch.bfloat16)
 
 
-RCP6_F32 = 0x3E2AAAAB  # RN(1/6) as fp32 bits, what the vLLM nvfp4 writer multiplies by
+RCP6_F32 = (
+    0x3E2AAAAB  # RN(1/6) as fp32 bits: amax is multiplied by it (not divided by 6)
+)
 
 
 def quantize_nvfp4(k):
     """bf16 [pages,128,128] -> (data u8 [pages,128,64], scale u8 [pages,128,8],
-    exact bf16, e4m3 bf16). Numerics of vLLM's `_quant4`, bit for bit (checked
-    against it on device): scale = RNE e4m3 of min(amax * RN(1/6), 448) per 16
+    exact bf16, e4m3 bf16). scale = RNE e4m3 of min(amax * RN(1/6), 448) per 16
     elements, elements * (1 / decoded scale) -> RNE e2m1, a zero scale gives code 0."""
     x = k.float().reshape(*k.shape[:-1], D // 16, 16)
     rcp6 = torch.tensor(RCP6_F32, dtype=torch.int32).view(torch.float32).item()
@@ -2530,7 +2533,7 @@ def nvfp4_cache_of(cache8, transform=None):
 
 def nvfp4_single_region_views(data, scale):
     """Both views of ONE `[pages, 9216]` allocation: 8192 B of e2m1 then 1024 B of
-    e4m3 scale per page, the physical layout vLLM's nvfp4 index cache has."""
+    e4m3 scale per page: the layout of a cache that keeps both regions in one tensor."""
     pages = data.shape[0]
     buf = torch.empty((pages, P * 64 + P * 8), dtype=torch.uint8, device=data.device)
     buf[:, : P * 64] = data.reshape(pages, -1)
@@ -2616,8 +2619,9 @@ def check_nvfp4_tuned_geometry_map(k_round):
 def exact_sum_case(B, S, H, lens, seed=0):
     """Inputs whose every partial sum is exact in fp32, so a kernel and a torch
     reference must agree to the BIT whatever the accumulation order: |Q| and every
-    scale in [0.5, 2) (e4m3 bytes 0x30..0x47) or zero, e2m1 data arbitrary. Term
-    ulp >= 2^-9 and |sum| < 2^12, well inside fp32's 24 bits."""
+    scale in [0.5, 3.75] (e4m3 bytes 0x30..0x47) or zero, e2m1 data arbitrary. Term
+    ulp >= 2^-9 and |sum| < 2^14 (at most 128 * 6 * 3.75 * 3.75), so a sum needs 23 of
+    fp32's 24 bits."""
     g = torch.Generator(device="cuda").manual_seed(seed)
     seq = torch.tensor(lens, dtype=torch.int32, device="cuda")
     mb = max(1, max((L + P - 1) // P for L in lens))
@@ -2638,7 +2642,8 @@ def exact_sum_case(B, S, H, lens, seed=0):
 
 def check_nvfp4_bit_exact(S, H, lens, qdt, k_round):
     """Bit-equality against each torch reference on exact-sum data. Also asserts
-    the data tells the two references apart, and records how often they differ."""
+    the data tells the two references apart (it asserts that they differ; it does not
+    record how often)."""
     q8, data, scale, exact, e4m3, bt, seq, mb = exact_sum_case(len(lens), S, H, lens)
     q = q8 if qdt == "e4m3" else q8.to(torch.bfloat16)
     refs = {
@@ -2725,8 +2730,7 @@ def check_nvfp4_repeat_launches_are_bitwise_identical():
 
 
 def check_nvfp4_default_k_round_is_e4m3():
-    """Leaving `k_round` out scores like `k_round="e4m3"` (the vLLM-identical numerics),
-    and not like "exact"."""
+    """Leaving `k_round` out scores like `k_round="e4m3"`, and not like "exact"."""
     q8, data, scale, _, _, bt, seq, mb = exact_sum_case(2, 8, 4, [2048, 129])
     args = (q8, data, scale, bt, seq, 8, 4, D**-0.5, mb)
     default = kernel.score_flydsl_nvfp4(*args)
@@ -2831,7 +2835,8 @@ def bench_score_nvfp4(case, B, S, H, lens, kwargs):
         for r, kk in (("e4m3", e4m3), ("exact", exact))
     }
     ret = {"gfx": get_gfx_runtime(), "timing": "repeated-buffer (warm effective TB/s)"}
-    wm = kernel.build_work_map(seq, mb, S, H)
+    # The NVFP4 scorer's own depth table: a shared (MXFP4) map would keep the shared geometry.
+    wm = kernel.build_work_map(seq, mb, S, H, nvfp4=True)
     pages = sum((L + P - 1) // P for L in lens)
     flops = 2 * pages * P * D * S * H
     out = kernel.alloc_score(B, S, H, mb, q.device)
@@ -2856,7 +2861,7 @@ def bench_score_nvfp4(case, B, S, H, lens, kwargs):
 
 def build_nvfp4_checks():
     """(name, check, args): one row per NVFP4 correctness case. A minimal matrix: the
-    regression matrix of every geometry and shape lives outside this file."""
+    `keep` cases of `build_matrix` x Q dtype x `k_round`, plus the dedicated checks."""
     checks = []
     keep = ("F1_", "F16_", "F32_", "L129_", "causal_straddle", "ragged_zero")
     cases = [c for c in build_matrix() if c[0].startswith(keep)]
