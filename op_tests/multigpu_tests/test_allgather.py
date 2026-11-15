@@ -320,6 +320,11 @@ l_shape = [
     # are whole 8-byte packets but not 16-byte ones.
     (12, 50016),
     (12, 4),
+    # Kimi-K3 DCP8 prefill prefix-KV all-gathers (ATOM dcp_all_gather): fp8 KV
+    # rows of 576 bytes, sent as 288 two-byte elements, for 16384- and
+    # 7168-token chunks: 2048 / 896 rows a rank (1.18 / 0.52 MB), LL all-gather
+    (2048, 288),
+    (896, 288),
 ]
 
 parser = argparse.ArgumentParser(description="config input of test")

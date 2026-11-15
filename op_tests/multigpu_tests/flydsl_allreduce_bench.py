@@ -3,7 +3,7 @@
 
 """Shared timing and reporting for the FlyDSL all-reduce tests' ``bench`` scenario.
 
-``test_flydsl_one_shot_allreduce.py`` and ``test_flydsl_quick_allreduce_int4.py``
+``test_flydsl_one_shot_allreduce.py`` and ``test_flydsl_quick_allreduce.py``
 each compare a FlyDSL kernel with the stock kernels production runs on the same
 payloads. This module is how both of them time and report that comparison, so
 the two tests cannot drift apart on method.

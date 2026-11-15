@@ -2,19 +2,11 @@
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 """Host side of the big-M path of MegaMoeTP.forward (the kernel: compile_bigm_kernel in
 mega_moe_tp_kernel.py): MegaMoeTPBigM (the SDMA queues and hipIpc arena, buffers, per-batch
-plans, launches), the disk cache of the compiled kernels, the bf16 row gather of the fused tail.
+plans, launches), the bf16 row gather of the fused tail.
 """
 
-import ast
 import ctypes
-import hashlib
 import inspect
-import logging
-import os
-import pickle
-import re
-import stat
-import tempfile
 import time
 
 import torch
@@ -22,9 +14,8 @@ import torch.distributed as dist
 from flydsl.utils import env as fenv
 
 from aiter.jit.core import AITER_CONFIGS
-from aiter.jit.utils.chip_info import get_gfx
 
-from ....communication import SdmaComm, compile_signal_read, sdma_bitcode
+from ....communication import SdmaComm, compile_signal_read
 from ..tensor_shim import _preload_compiled, _run_compiled
 from .common import device_key, nearest, tuned_rows
 from .gemm import bigm_lds
@@ -42,185 +33,14 @@ from .mega_moe_tp_config import (
 )
 from .mega_moe_tp_kernel import compile_bigm_kernel
 
-_log = logging.getLogger("aiter")
-
 __all__ = ["MegaMoeTPBigM"]
 
 
-# ---- disk cache of the compiled big-M kernels ----
-# FlyDSL keeps kernels that link external bitcode (link_extern: the SDMA device functions here)
-# out of its disk cache -- its key does not cover the bitcode -- so every process would compile
-# every big-M variant again (~86 s each, all ranks waiting). The artifact itself pickles fine
-# (no post-load processors), so this keeps it on disk keyed by the compile arguments plus the
-# digest of everything else it is built from: the kernel's sources (mega_moe_tp_kernel.py and
-# the modules it imports from aiter.ops.flydsl.kernels), the SDMA bitcode, the FlyDSL compiler
-# (its own cache key) and the GPU arch.
-_DIGEST = None
-
-
-def _kernel_sources():
-    """mega_moe_tp_kernel.py and every module of aiter.ops.flydsl.kernels it imports, transitively
-    (relative imports, wherever in the file; MORI's bitcode is hashed itself)"""
-    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))  # .../kernels
-    todo = [os.path.join(root, "mega_moe_tp", "mega_moe_tp_kernel.py")]
-    seen = set()
-    while todo:
-        f = todo.pop()
-        if f in seen or not os.path.isfile(f):
-            continue
-        seen.add(f)
-        here = os.path.dirname(f)
-        with open(f) as fh:
-            tree = ast.parse(fh.read())
-        for node in ast.walk(tree):
-            if not isinstance(node, ast.ImportFrom) or not node.level:
-                continue
-            base = here
-            for _ in range(node.level - 1):
-                base = os.path.dirname(base)
-            if not base.startswith(root):
-                continue
-            mods = (
-                [os.path.join(base, *node.module.split("."))]
-                if node.module
-                else [os.path.join(base, a.name) for a in node.names]
-            )
-            for m in mods:
-                todo += [m + ".py", os.path.join(m, "__init__.py")]
-    return sorted(seen)
-
-
-def _bigm_digest():
-    global _DIGEST
-    if _DIGEST is None:
-        h = hashlib.sha256(get_gfx().encode())
-        for f in _kernel_sources() + [sdma_bitcode()]:
-            with open(f, "rb") as fh:
-                h.update(fh.read())
-        try:
-            from flydsl.compiler.jit_function import _flydsl_key
-
-            h.update(_flydsl_key().encode())
-        except Exception:  # noqa: BLE001 (older / newer FlyDSL: its version instead)
-            import flydsl
-
-            h.update(str(getattr(flydsl, "__version__", "")).encode())
-        _DIGEST = h.hexdigest()
-    return _DIGEST
-
-
-def _bigm_cache_dir():
-    """FlyDSL's cache root (FLYDSL_RUNTIME_CACHE_DIR) / aiter_bigm; None when FlyDSL caching
-    is off."""
-    if not fenv.runtime.enable_cache:
-        return None
-    return os.path.join(fenv.runtime.cache_dir, "aiter_bigm")
-
-
-_WARNED = set()
-
-
-def _warn_once(key, msg, *args):
-    if key not in _WARNED:
-        _WARNED.add(key)
-        _log.warning(msg, *args)
-
-
-def _private(path):
-    """path (the cache directory or an entry) is this user's and only writable by them: a
-    pickled entry runs code when loaded, so a shared / writable-by-others cache is skipped
-    """
-    try:
-        st = os.stat(path)
-    except OSError:
-        return False
-    return st.st_uid == os.getuid() and not st.st_mode & (stat.S_IWGRP | stat.S_IWOTH)
-
-
 def _bigm_cached(launch, args):
-    """Collective-free: make launch(*args)'s compiled artifact resident -- from this process's
-    memory, else the disk cache, else compiled (no kernel dispatch) and written to the disk
-    cache -- and its code object loaded."""
-    try:  # FlyDSL's in-process key of these arguments (private API: on any change, just compile)
-        launch._ensure_sig()
-        launch._ensure_cache_manager()
-        bound = launch._sig.bind(*args)
-        bound.apply_defaults()
-        ck = launch._build_full_cache_key(
-            bound.arguments, effective_hints=launch._effective_compile_hints()
-        )
-        mem = launch._mem_cache
-    except Exception:  # noqa: BLE001
-        _warn_once(
-            "api",
-            "MegaMoeTP big-M: FlyDSL's cache API changed (private names): no disk cache, "
-            "every process compiles its big-M kernels (minutes each)",
-        )
-        _preload_compiled(launch, *args)
-        return
-    if ck in mem:
-        mem[ck]._get_func_exe()
-        return
-    d = _bigm_cache_dir()
-    path = None
-    if d:
-        sig = re.sub(r" at 0x[0-9a-f]+", "", str(ck))
-        name = hashlib.sha256(
-            f"{launch._bigm_spec}|{_bigm_digest()}|{sig}".encode()
-        ).hexdigest()[:32]
-        path = os.path.join(d, f"bigm_{name}.pkl")
-        if os.path.isdir(d) and not _private(d):
-            _warn_once(
-                d,
-                "MegaMoeTP big-M: disk cache %s is not private to this user "
-                "(group / others writable or another owner): not used",
-                d,
-            )
-            path = None
-        elif os.path.isfile(path) and not _private(path):
-            path = None
-        if path and os.path.isfile(path):
-            try:
-                with open(path, "rb") as f:
-                    art = pickle.load(f)
-                art._get_func_exe()  # code object loaded here, not in the first launch
-                mem[ck] = art
-                return
-            # a stale / corrupt entry: compile again
-            except Exception as e:  # noqa: BLE001
-                _log.warning("MegaMoeTP big-M: disk cache %s unusable (%s)", path, e)
+    """Collective-free: compile launch(*args) without dispatching a kernel. FlyDSL's disk cache
+    (keyed on the traced IR and the linked SDMA bitcode) makes this a load in a warm process.
+    """
     _preload_compiled(launch, *args)
-    art = mem.get(ck)
-    if art is None:
-        return
-    art._get_func_exe()
-    _warn_spills(launch, art)
-    if path:
-        try:
-            os.makedirs(d, mode=0o700, exist_ok=True)
-            fd, tmp = tempfile.mkstemp(dir=d, suffix=".tmp")
-            try:
-                with os.fdopen(fd, "wb") as f:
-                    pickle.dump(art, f)
-                os.replace(tmp, path)  # atomic: concurrent ranks write the same bytes
-            except BaseException:
-                os.unlink(tmp)
-                raise
-        except Exception as e:  # noqa: BLE001
-            _log.warning("MegaMoeTP big-M: disk cache write %s failed (%s)", path, e)
-
-
-def _warn_spills(launch, art):
-    """a freshly compiled kernel that spills to scratch: its register file is exhausted (seen
-    with the waits timing out)"""
-    m_ = re.search(r"private_segment_fixed_size = (\d+)", getattr(art, "ir", "") or "")
-    if m_ and int(m_.group(1)):
-        _log.warning(
-            "MegaMoeTP big-M: kernel %s spills to scratch (%s B per lane): lower its "
-            "register use (e.g. AITER_BIGM_R8=1 in the tuned csv's opts)",
-            launch._bigm_spec[:120],
-            m_.group(1),
-        )
 
 
 _HIP = None
@@ -752,7 +572,7 @@ class MegaMoeTPBigM:
         the disk cache, split over the ranks -- rank r compiles every tp-th -- so a cold cache
         costs about one compile, not one per kernel; the moe() warm-ups then load them. No-op
         without a disk cache."""
-        if not _bigm_cache_dir():
+        if not fenv.runtime.enable_cache:
             return
         mine = [m for i, m in enumerate(rows) if i % self.tp == self.rank]
         for m in mine:
