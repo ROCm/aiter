@@ -964,6 +964,54 @@ def check_prefill_nvfp4_block_table_row_stride_beyond_2gib():
     check_scores(got, ref, live, "block_table row stride 2**29")
 
 
+def check_prefill_nvfp4_causal_window_near_int32_bound():
+    """One query row at the end of a 2147483392-token sequence (an accepted bound) on
+    16 heads takes the 512-row tile. `prefix + q_base + 512` passes 2**31 and, in
+    int32, wrapped negative before the clamp to `seq_len`, so no page was scored.
+    Every block id is page 0, so every block of every head scores the same value."""
+    import aiter.ops.flydsl.kernels.minimax_m3_index_score_prefill as mod
+
+    S, heads = 2147483392, 16
+    c = nv_case([1], [P], heads, exact_sum=True)  # one page, 16 query heads
+    mb = -(-S // P)
+    assert mod.geometry(1, 1, heads, mb, "cuda", xwide=True)["tile_q"] == 512
+    deq = c["e4m3"].float()[0]  # the one page [128, D]
+    ref = torch.einsum("hd,td->ht", c["q8"][0].float(), deq).amax(-1)  # [H]
+    c.update(
+        bt=torch.zeros((1, mb), dtype=torch.int32, device="cuda"),
+        seq=torch.tensor([S], dtype=torch.int32, device="cuda"),
+        prefix=torch.tensor([S - 1], dtype=torch.int32, device="cuda"),
+        max_q=1,
+        max_seq=S,
+        mb=mb,
+    )
+    got = run_nv(c)  # [H, 1, mb]
+    unwritten = int((got == SENTINEL).sum())
+    assert unwritten == 0, f"{unwritten} of {got.numel()} slots left unwritten"
+    check_equal(got[:, 0, :], ref[:, None].expand(heads, mb), "near-int32 window")
+
+
+def check_prefill_nvfp4_exact_geometry_is_not_mutated_by_the_output():
+    """`exact_geometry` is cached: a launch must not write its output's store mode
+    (`contig_k`) into the shared dict, so a padded `out` between two aligned ones
+    changes neither the cached geometry nor any result."""
+    import aiter.ops.flydsl.kernels.minimax_m3_index_score_prefill as mod
+
+    heads = 4
+    c = nv_case([1024, 1024], [8192, 8192], heads, exact_sum=True)
+    mb, rows = c["mb"], c["q8"].shape[0]
+    bounds = (c["max_q"], 2, heads, mb, c["q8"].device)
+    before = dict(mod.exact_geometry(*bounds))
+    assert before["pages_per_wave"] > 1, "contig_k only matters from ppw 2"
+    ref = nv_oracle(c, c["exact"])
+    live = torch.isfinite(ref)
+    for pad in (0, 1, 0, 1):  # a row stride of mb + 1 is no multiple of ppw
+        buf = torch.full((heads, rows, mb + pad), SENTINEL, device="cuda")
+        got = run_nv(c, k_round="exact", out=buf[..., :mb])
+        check_scores(got, ref, live, f"exact, row padding {pad}")
+        assert mod.exact_geometry(*bounds) == before, "cached geometry was mutated"
+
+
 def check_prefill_nvfp4_rejections():
     c = nv_case([64], [300])
 
@@ -1256,6 +1304,8 @@ def build_cases():
         check_prefill_nvfp4_default_k_round_is_e4m3,
         check_prefill_nvfp4_modes_do_not_share_a_compiled_kernel,
         check_prefill_nvfp4_block_table_row_stride_beyond_2gib,
+        check_prefill_nvfp4_causal_window_near_int32_bound,
+        check_prefill_nvfp4_exact_geometry_is_not_mutated_by_the_output,
         check_prefill_nvfp4_rejections,
     ):
         cases.append((fn.__name__.removeprefix("check_prefill_"), fn, ()))

@@ -635,8 +635,11 @@ def build_prefill_score(g, k_fp4=False, q_fp8=False, nvfp4=None):
         q_base = pid_q * fx.Int32(TILE_Q)
         # Causal window for this tile: no page past the last row's own position
         # can contribute, and this chunk owns a slice of what is left.
-        hi_tok = prefix_len + q_base + fx.Int32(TILE_Q)
-        hi_tok = (hi_tok < seq_len).select(hi_tok, seq_len)
+        # Summed in int64: for a tile of 256+ rows near the 2**31 length bound the
+        # sum passes int32 before it is clamped, wraps negative and skips every page.
+        hi_tok = fx.Int64(prefix_len) + fx.Int64(q_base) + fx.Int64(TILE_Q)
+        hi_tok = (hi_tok < fx.Int64(seq_len)).select(hi_tok, fx.Int64(seq_len))
+        hi_tok = fx.Int32(hi_tok)
         # The grid is sized by `max_query_len`, so a short request still gets every
         # tile. A tile at or past its last query row stores nothing, but `hi_tok` is
         # clamped only by `seq_len`, so without this it would walk the whole causal
@@ -2522,13 +2525,19 @@ def _score_prefill_impl(
             f"got {tuple(block_table.shape)}"
         )
     # The merged store needs the block axis contiguous and the run aligned.
+    # `exact_geometry` returns one cached dict per set of bounds: copy before adding
+    # what depends on THIS output, or a padded and an aligned `out` overwrite each
+    # other's store mode (and the `_get` key and the kernel built from it can differ).
     ppw = geom["pages_per_wave"]
-    geom["contig_k"] = int(
-        out.stride(2) == 1
-        and out.stride(1) % ppw == 0
-        and out.stride(0) % ppw == 0
-        and out.data_ptr() % (4 * ppw) == 0
-    )
+    geom = {
+        **geom,
+        "contig_k": int(
+            out.stride(2) == 1
+            and out.stride(1) % ppw == 0
+            and out.stride(0) % ppw == 0
+            and out.data_ptr() % (4 * ppw) == 0
+        ),
+    }
     q_tiles = -(-max_query_len // geom["tile_q"])
     cb = chunk_blocks(max_block, q_tiles, batch, heads, idx_q.device, geom["waves"])
     # A trip stores PPW consecutive blocks as one vector, so a chunk starts on
