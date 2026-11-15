@@ -1028,6 +1028,7 @@ def mla_decode_fwd(
     page_table=None,
     kv_csr_layout="page",
     fast_mode=True,
+    empty_work_items=False,
 ):
     """MLA decode with explicit KV byte-layout selection.
 
@@ -1061,6 +1062,12 @@ def mla_decode_fwd(
     indptr, ignoring last-page values (the tensor is still required).
     Physical ``page_size`` remains 64. Token CSR is only supported by the
     shuffled QH64 path; it does not change the KV byte layout.
+
+    ``empty_work_items=True`` lets a persistent work plan hold work items
+    with no KV, as one planned at a KV bound and cut to each request's keys
+    does. Such an item adds nothing; a request with no keys gets O=0 and
+    LSE=+inf, the reduce's value for a sum with no weight. It costs one fill
+    of the partial LSE per call.
     """
     if kv_csr_layout not in ("page", "token"):
         raise ValueError(f"unknown MLA kv_csr_layout: {kv_csr_layout!r}")
@@ -1523,14 +1530,14 @@ def mla_decode_fwd(
             dtype=dtypes.fp32,
             device=device,
         )
-        # A work item with no KV writes no partial; -inf makes mla_reduce_v1
-        # give it no weight.
-        attn_lse = torch.full(
+        attn_lse = torch.empty(
             (reduce_partial_map.size(0) * max_seqlen_q, 1, nhead, 1),
-            float("-inf"),
             dtype=dtypes.fp32,
             device=device,
         )
+        if empty_work_items:
+            # Such an item writes no partial; -inf gives it no weight in mla_reduce_v1.
+            attn_lse.fill_(float("-inf"))
         final_lse = (
             torch.empty((total_s, nhead), dtype=dtypes.fp32, device=device)
             if return_lse

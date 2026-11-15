@@ -145,6 +145,7 @@ def test_empty_work_item_adds_nothing(d, n):
         sm_scale=SM_SCALE,
         num_kv_splits=MAX_SPLIT_PER_BATCH,
         return_lse=True,
+        empty_work_items=True,
         **meta,
         **kw,
     )
@@ -154,8 +155,9 @@ def test_empty_work_item_adds_nothing(d, n):
     for b, length in enumerate(KV_LENS):
         tag = f"{d} N={n} request {b} with {length} keys:"
         if length == 0:
-            assert bool((o[b] == 0).all()), tag
-            assert not bool(lse[b].isfinite().any()), tag
+            # Every split has LSE -inf; the reduce maps that empty sum to +inf.
+            assert bool(torch.isposinf(lse[b]).all()), f"{tag} LSE {lse[b].unique()}"
+            assert bool((o[b] == 0).all()), f"{tag} O {o[b].unique()[:4]}"
             continue
         k = kvf[kv_indices[starts[b] : starts[b + 1]].long().cpu()]
         scores = (q[b].float().cpu() @ k.T) * SM_SCALE
