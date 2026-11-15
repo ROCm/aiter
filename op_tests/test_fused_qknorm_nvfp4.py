@@ -437,7 +437,7 @@ def main():
     cases = [
         (t, n, s, gs)
         for t, n, s, gs in itertools.product(args.tokens, args.nkv, args.slots, args.gs)
-        if not (s in ("seq_gaps", "mtp") and t < 64) or t == 64
+        if not (s in ("seq_gaps", "mtp") and t < 64)
     ]
     df = pd.DataFrame([test_nvfp4_write(*c) for c in cases])
     aiter.logger.info(
