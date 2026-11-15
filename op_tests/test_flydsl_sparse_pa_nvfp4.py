@@ -426,10 +426,17 @@ def padding_rows():
         c,
         row_kv=torch.tensor([0, int(c["row_kv"][1])], dtype=torch.int32, device="cuda"),
     )
-    out = prefill_call(c1)
-    bad += int(
-        out[0].abs().max().item() != 0 or not torch.equal(out[1], prefill_call(c)[1])
-    )
+    # Every tile: the auto tile for 2 rows is tq 1, where a padding row never shares a
+    # workgroup with its neighbour.
+    ref = run_torch(c)
+    for tq, rnd in PREFILL_TQ:
+        out = prefill_call(c1, tq=tq, rounds=rnd)
+        same = torch.equal(out[1], prefill_call(c, tq=tq, rounds=rnd)[1])
+        bad += int(
+            out[0].abs().max().item() != 0
+            or not same
+            or rel_l2(out[1], ref[1]) > REL_L2_TOL
+        )
     if bad:
         print("padding rows: FAILED")
     return bad
