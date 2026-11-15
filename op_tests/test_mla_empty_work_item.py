@@ -6,12 +6,12 @@
 Plan get_mla_metadata_v1 once for every request at a fixed KV bound, then
 shrink each request's work items to the keys it really has, as a caller
 reusing one plan across layers does. A request with fewer keys than work
-items keeps items with no KV. Two plans: 8 requests with up to 16 KV splits
-each, whose partials mla_reduce_v1 combines, and one unsplit item a request
-for twice as many requests as CUs, so an empty item comes before a live one
-on its CU, where the asm kernel would stop. The output and the decode's
-buffers are filled with NaN first, so a skipped item or a stale slot cannot
-pass.
+items keeps items with no KV. The split plans cut each request into KV splits
+whose partials mla_reduce_v1 combines, one plan for each of its paths; the
+unsplit plan holds more requests than CUs, so an empty item comes before a
+live one on its CU, where the asm kernel would stop. The output and the
+decode's buffers are filled with NaN first, so a skipped item or a stale slot
+cannot pass.
 """
 
 import itertools
@@ -30,8 +30,7 @@ DIM = KV_LORA_RANK + 64
 SM_SCALE = 1.0 / DIM**0.5
 BOUND = 2048
 # Keys each request really has: none, fewer than its splits, and the bound.
-KV_LENS = [0, 1, 3, 5, 17, 300, BOUND, 7]
-MAX_SPLIT_PER_BATCH = 16
+KV_LENS = [0, 1, 2, 5, 17, 300, BOUND, 7]
 ONE_ITEM_BOUND = 64
 PLAN_ORDER = (
     "work_meta_data",
@@ -99,8 +98,8 @@ def _bound_plan(bs, n, qd, bound, splits):
 
 def _shrink_to_owned(meta, starts, fold, bound):
     """Scale each work item's KV range from [0, bound) to its request's keys;
-    return the fewest splits a (pseudo-)request has, and how many CUs run an
-    empty item before a live one."""
+    return the item counts the (pseudo-)requests have, and how many CUs run
+    an empty item before a live one."""
     n_work = int(meta["work_indptr"][-1].item())
     info = meta["work_info_set"][:n_work].cpu()
     for item in info:
@@ -118,24 +117,26 @@ def _shrink_to_owned(meta, starts, fold, bound):
         for lo, hi in itertools.pairwise(indptr)
         if True in empty[lo:hi]
     )
-    return min(splits.count(fb) for fb in range((len(starts) - 1) * fold)), cus
+    return {splits.count(fb) for fb in range((len(starts) - 1) * fold)}, cus
 
 
 @requires_gpu
-@pytest.mark.parametrize("plan", ["split", "one_item"])
+# 16, 6 and 3 splits take mla_reduce_v1's wide kernel, and kn_mla_reduce_v1's
+# massive and simple paths; 1 is one item a request, which writes O directly.
+@pytest.mark.parametrize("max_split", (16, 6, 3, 1))
 @pytest.mark.parametrize("n", (16, 96, 128))
 @pytest.mark.parametrize("d", ["fp8", "bf16"])
-def test_empty_work_item_adds_nothing(d, n, plan):
+def test_empty_work_item_adds_nothing(d, n, max_split):
     qd = dtypes.fp8 if d == "fp8" else torch.bfloat16
     s = get_mla_decode_shape_support(n, 1, qd, qd, return_lse=True)
     if s.supported is not True:
         pytest.skip(f"decode {s.backend.value} supported={s.supported}")
-    if plan == "split":
-        kv_lens, bound, max_split = KV_LENS, BOUND, MAX_SPLIT_PER_BATCH
+    if max_split > 1:
+        kv_lens, bound = KV_LENS, BOUND
     else:
         cus = torch.cuda.get_device_properties(0).multi_processor_count
         kv_lens = [(0, 1, 3, 17, ONE_ITEM_BOUND)[i % 5] for i in range(2 * cus)]
-        bound, max_split = ONE_ITEM_BOUND, 1
+        bound = ONE_ITEM_BOUND
     bs = len(kv_lens)
     starts = [0, *itertools.accumulate(kv_lens)]
     g = torch.Generator().manual_seed(518 + n)
@@ -145,9 +146,8 @@ def test_empty_work_item_adds_nothing(d, n, plan):
 
     meta = _bound_plan(bs, n, qd, bound, max_split)
     splits, empty_first = _shrink_to_owned(meta, starts, s.fold_factor, bound)
-    if plan == "split":
-        assert splits > max(length for length in kv_lens if length < 16), splits
-    else:
+    assert splits == {max_split}, splits
+    if max_split == 1:
         assert empty_first > 0, "no CU runs an empty item before a live one"
 
     o = torch.full(
@@ -177,10 +177,10 @@ def test_empty_work_item_adds_nothing(d, n, plan):
 
     kvf = kv[:, 0, 0].float().cpu()
     for b, length in enumerate(kv_lens):
-        tag = f"{d} N={n} {plan} request {b} with {length} keys:"
+        tag = f"{d} N={n} {max_split} splits request {b} with {length} keys:"
         if length == 0:
-            # +inf is the reduce's LSE for a sum of splits that all have -inf.
-            assert bool(torch.isposinf(lse[b]).all()), f"{tag} LSE {lse[b].unique()}"
+            # No weight in a later merge of this request's attention.
+            assert bool((lse[b].exp() == 0).all()), f"{tag} LSE {lse[b].unique()}"
             assert bool((o[b] == 0).all()), f"{tag} O {o[b].unique()[:4]}"
             continue
         k = kvf[kv_indices[starts[b] : starts[b + 1]].long().cpu()]
