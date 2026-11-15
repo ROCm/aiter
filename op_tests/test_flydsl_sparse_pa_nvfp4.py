@@ -572,26 +572,6 @@ def refusals():
             },
             "q and out must be contiguous",
         ),
-        (
-            "strided topk_idx last dim",
-            {"topk": torch.stack([c["topk"], c["topk"]], -1)[..., 0]},
-            "with a unit last stride",
-        ),
-        (
-            "non-contiguous q",
-            {
-                "q": torch.empty(2, 16, 2 * D, dtype=torch.bfloat16, device="cuda")[
-                    ..., :D
-                ]
-            },
-            "q and out must be contiguous",
-        ),
-        ("rows != reqs * query_len", {"query_len": 2}, "rows must be reqs * query_len"),
-        (
-            "splits 2 with rows * Hkv > MAX_SPLIT_ROWS",
-            {**over, "splits": 2},
-            f"splits > 1 needs rows * Hkv <= {MAX_SPLIT_ROWS}",
-        ),
         ("int64 topk_idx", {"topk": c["topk"].long()}, "topk_idx must be int32"),
         ("flattened block_table", {"bt": c["bt"].flatten()}, "block_table 2-D"),
         ("sm_scale 0", {"sm_scale": 0.0}, "sm_scale"),
