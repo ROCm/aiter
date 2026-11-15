@@ -4,10 +4,15 @@
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
-from flydsl.expr import const_expr, gpu, range_constexpr, rocdl
+from flydsl.expr import (
+    const_expr,
+    gpu,
+    range_constexpr,
+    rocdl,
+)
 from flydsl.expr.typing import T, as_ir_value
 
-from . import dpp_utils
+from .mxfp4_gemm1 import gemm1_grid as gemm1_grid, _bm_constants
 from .mxfp4_gemm_common import (
     _activation_mul_batch,
     _e8m0_from_amax,
@@ -19,14 +24,11 @@ from .mxfp4_gemm_common import (
     _global_i32_load,
     _global_scalar_tiles,
     _inline_dpp_quad_amax,
-    _inline_e8m0,
     _layout_idx,
     _lds_swizzle_mask,
-    _pkmax_u16,
     _scalar_store,
     _scale_mma_atoms,
     _udiv,
-    _umax_i32,
     _umod,
     bq_bytes_for,
     bscale_bytes_for,
@@ -35,75 +37,23 @@ from .mxfp4_gemm_common import (
     kbs_per_expert_dw_for,
     kBS_stride_k0_dw,
     kbs_stride_n0_dw_for,
-    kmchunks_for,
     kStages,
-    lds_acc_bytes_for,
     lds_swizzle_mask_f8,
 )
 
 ACC_LDS_PAD_DW = 4
 
 
-def _situv2_4_25_mul_batch(gs, us):
-    """SiTUv2 with beta=4, linear_beta=25 using 2 exp2 and 1 reciprocal per output
-    (the generic form uses 3 exp and 3 reciprocals). With a=|g|, qg=exp(-a/2),
-    qu=exp(-|u|*2/25): 4*tanh(g/4)*sigmoid(g) = 4*sg*(1-qg)/((1+qg)(1+qg^2)) with
-    sg = 1 (g>0) or -qg^2, and 25*tanh(u/25) = 25*su*(1-qu)/(1+qu). Mathematically
-    equal to the reference; rounding differs."""
-    log2e = 1.4426950408889634
-    qg = [fx.exp2(fx.max(g, -g) * fx.Float32(-0.5 * log2e), fastmath="afn") for g in gs]
-    qu = [fx.exp2(fx.max(u, -u) * fx.Float32(-0.08 * log2e), fastmath="afn") for u in us]
-    out = []
-    for i in range(len(gs)):
-        qg2 = qg[i] * qg[i]
-        den = (fx.Float32(1.0) + qg[i]) * (fx.Float32(1.0) + qg2) * (fx.Float32(1.0) + qu[i])
-        recip = fx.Float32(rocdl.rcp(T.f32, as_ir_value(den)))
-        pos = fx.Float32(100.0) * (fx.Float32(1.0) - qg[i]) * (fx.Float32(1.0) - qu[i]) * recip
-        sg = (gs[i] > fx.Float32(0.0)).select(fx.Float32(1.0), -qg2)
-        su = (us[i] > fx.Float32(0.0)).select(fx.Float32(1.0), fx.Float32(-1.0))
-        out.append(pos * sg * su)
-    return out
-
-# Dedicated GEMM1 for the Kimi-K3 EP32 A8W4 SiTUv2 shape (H=3584, I=3072, 28
-# local experts, sort block 64), forked from mxfp4_gemm1.py. Differences:
-#   * Padding-aware tiles: per M block, a 16-row chunk whose first sorted row is
-#     padding is padding throughout, so its A loads, LDS reads, MFMAs and
-#     activation are skipped (it emits zeros). A tail block of an expert run with
-#     <= 16 real rows is folded into the preceding full block (one 80-row tile,
-#     one weight stream).
-#   * Scheduling: workgroups index a compact list of real tiles (unit ballot), so
-#     the real tiles take the first grid slots and land 2-3 per CU in one wave;
-#     with folded blocks interleaved in the grid, the dispatcher refilled their
-#     freed slots and stacked up to 4 real tiles on some CUs (amd bench routing,
-#     every expert 64 + 9 rows: 85.5 -> 74 us). The list is cut into one
-#     contiguous run per XCD, so each unit's gathered A rows are read into one or
-#     two XCD L2s instead of all eight (HBM reads ~402 -> 336 MB).
-#   * 3 workgroups per CU: K-half-major MFMA order with one 16-row A chunk live
-#     at a time, one B stage in registers, and the epilogue staged 32 rows at a
-#     time, so VGPRs fit 3 waves/SIMD and LDS fits 3 workgroups.
-#   * Weights are loaded non-temporal (use_nt): after the tail fold no weight
-#     tile is read twice, and NT keeps the gathered activations resident in L2.
-#   * SiTUv2 uses the generic kernel's activation, so real rows are bit-exact.
-#     The merged 2-exp2 + 1-rcp form (fast_situ, from the cx workspace's
-#     FASTSITU) saves ~0.5 us but changes rounding (7 of 6.1M fp8 outputs differ
-#     by one step on the M=4096 dump); it is kept but off.
-# Output layout matches the generic kernel;
-# padding rows hold zeros (or are left unwritten for folded tail blocks).
+# EP32 A8W4 GEMM1 uses interleaved gate/up weights and sorted FP8 output.
+# BM64 compacts active tiles and folds a <=16-route tail with the existing extra 16 rows;
+# BM96 compute a full sorted block. Contiguous tile runs per XCD keep
+# gathered activations local to L2. NT weights avoid evicting those activations.
+# The fixed pipeline consumes one 16-row A fragment at a time and stages
+# 32 C rows per epilogue region, keeping the original activation arithmetic.
 EP32_G1_VARIANTS = {
     (64, True, False), (64, False, False),
-    (80, True, False), (80, False, False),
     (96, True, False), (96, False, False),
 }
-
-
-def gemm1_grid(n_tokens, BM, *, NE, TOPK, INTER, BN=256):
-    num_n_blocks = 2 * INTER // BN
-    if BM == 128:
-        max_m_blocks = (n_tokens * TOPK + NE * (BM - 1) + BM - 1) // BM
-    else:
-        active = min(n_tokens * TOPK, NE)
-        max_m_blocks = (n_tokens * TOPK + active * (BM - 1) + BM - 1) // BM
-    return max_m_blocks * num_n_blocks
 
 
 @flyc.jit
@@ -151,12 +101,7 @@ def _gemm1_body(
     khalf_loop=False,
     epi32=False,
     fast_situ=False,
-    sbm80=False,
 ):
-    # sbm80: the sort block is 80 rows (BM=64 body + 16-row tail chunk, one tile per
-    # block). Blocks start at 80*b, i.e. at the second 16-row half of a 32-row scale
-    # chunk for odd b: A-scale words are realigned by one half and the output
-    # scales are written per 16-row half.
     # active_chunks: compile-time number of leading 16-row chunks that hold real
     # rows (None = all). Chunks past it are padding: their A loads, LDS reads,
     # MFMAs and activation are skipped and they emit zeros.
@@ -220,7 +165,7 @@ def _gemm1_body(
     n_block_idx = bx_i32 % fx.Int32(NUM_N_BLOCKS)
     m_block_idx = bx_i32 // fx.Int32(NUM_N_BLOCKS)
     e = rocdl.readfirstlane(T.i32, as_ir_value(_global_i32_at(arg_eids, m_block_idx)))
-    m_row = m_block_idx * fx.Int32(80 if sbm80 else BM)
+    m_row = m_block_idx * fx.Int32(BM)
 
     lane_div_16 = lane // fx.Int32(16)
     lane_mod_16 = lane % fx.Int32(16)
@@ -230,10 +175,6 @@ def _gemm1_body(
     aq_num_records = fx.Int64(i32_ntok * fx.Int32(A_ROW_BYTES))
     _asc_per_mb = max(BM // 32, 1) * kAS_per_chunk_dw * 4
     ascale_num = fx.Int64(i32_total_m_blocks) * fx.Int64(_asc_per_mb)
-    if const_expr(sbm80):
-        ascale_num = fx.Int64(
-            (i32_total_m_blocks * fx.Int32(80) + fx.Int32(31)) // fx.Int32(32)
-        ) * fx.Int64(kAS_per_chunk_dw * 4)
 
     bq_tiles = _global_i32_buffer_tiles(arg_bq, BQ_BYTES, 4)
     bq_copy_atom = fx.make_copy_atom(fx.rocdl.BufferCopy128b(b_aux), fx.Int32)
@@ -253,10 +194,6 @@ def _gemm1_body(
     ascale_dma_atom16 = fx.make_copy_atom(fx.rocdl.BufferCopyLDS128b(), fx.Int32)
     ascale_dma_atom4 = fx.make_copy_atom(fx.rocdl.BufferCopyLDS32b(), fx.Int32)
 
-    if const_expr(inline_quant):
-        hidden_num = fx.Int64(i32_ntok * fx.Int32(K * 2))
-        hidden_tiles = _global_i32_buffer_tiles(arg_hidden, hidden_num, 4)
-        hidden_copy_atom = fx.make_copy_atom(fx.rocdl.BufferCopy128b(), fx.Int32)
 
     # Union LDS region [s_aq | s_asc], reused as lds_acc (f32 accumulator) in the
     # epilogue. s_aq/lds_acc start at lds_raw_ptr; s_asc follows at
@@ -264,37 +201,21 @@ def _gemm1_body(
 
     cached_actual_row = []
     cached_row_inline = None
-    if const_expr(inline_quant):
-        rcls = wave_n * fx.Int32(4) + lane_div_16
-        cached_row_inline = _global_i32_at(arg_mind, m_row + rcls)
-    elif const_expr(num_waves == 2):
-        for load_group in range_constexpr(2):
-            idx = (
-                m_row
-                + wave_n * fx.Int32(BM // 2)
-                + fx.Int32(load_group * 8)
-                + lane_div_8
-            )
-            cached_actual_row.append(_global_i32_at(arg_mind, idx))
-    else:
-        for sub in range_constexpr(kSubBlocks):
-            idx = m_row + wave_n * fx.Int32(BM // 4) + fx.Int32(sub * 8) + lane_div_8
-            actual_row = _global_i32_at(arg_mind, idx)
-            if const_expr(a_dtype == "fp8" and BM >= 64):
-                cached_actual_row.append(
-                    [
-                        fx.Int32(
-                            rocdl.ds_bpermute(
-                                T.i32,
-                                (lane_div_16 + fx.Int32(row_group * 4)) * fx.Int32(32),
-                                as_ir_value(actual_row),
-                            )
-                        )
-                        for row_group in range_constexpr(2)
-                    ]
+    for sub in range_constexpr(kSubBlocks):
+        idx = m_row + wave_n * fx.Int32(BM // 4) + fx.Int32(sub * 8) + lane_div_8
+        actual_row = _global_i32_at(arg_mind, idx)
+        cached_actual_row.append(
+            [
+                fx.Int32(
+                    rocdl.ds_bpermute(
+                        T.i32,
+                        (lane_div_16 + fx.Int32(row_group * 4)) * fx.Int32(32),
+                        as_ir_value(actual_row),
+                    )
                 )
-            else:
-                cached_actual_row.append(actual_row)
+                for row_group in range_constexpr(2)
+            ]
+        )
     tail_row = None
     if const_expr(NCH > kMChunks):
         # Tail chunk rows BM..BM+15: wave w DMAs rows BM+4w..BM+4w+3.
@@ -305,38 +226,19 @@ def _gemm1_body(
     N0_HALF = N_OUT // 32
     b_load_s_base = []
     for j in range_constexpr(N_REPS):
-        if const_expr(interleave):
-            col = (
-                n_block_idx * fx.Int32(BN)
-                + wave_n * fx.Int32(N_REPS * 16)
-                + fx.Int32(j * 16)
-            )
-        else:
-            tile_il = (
-                n_block_idx * fx.Int32(BN // 16)
-                + wave_n * fx.Int32(N_REPS)
-                + fx.Int32(j)
-            )
-            g = tile_il & fx.Int32(1)
-            n0 = tile_il >> fx.Int32(1)
-            col = (g * fx.Int32(N0_HALF) + n0) * fx.Int32(16)
+        col = (
+            n_block_idx * fx.Int32(BN)
+            + wave_n * fx.Int32(N_REPS * 16)
+            + fx.Int32(j * 16)
+        )
         v = (e * fx.Int32(N_OUT) + col) * fx.Int32(K_HALF)
         b_load_s_base.append(rocdl.readfirstlane(T.i32, v))
 
-    if const_expr(interleave):
-        # Each scale word covers two consecutive 16-column weight tiles.
-        mni_base = n_block_idx * fx.Int32(BN // 32) + wave_n * fx.Int32(
-            N_REPS
-        ) // fx.Int32(2)
-        np_list = [mni_base, mni_base + fx.Int32(1)]
-    else:
-        if const_expr(BN == 64):
-            np_gate = n_block_idx
-        elif const_expr(BN == 128):
-            np_gate = n_block_idx * fx.Int32(2) + wave_n // fx.Int32(2)
-        else:
-            np_gate = n_block_idx * fx.Int32(BN // 64) + wave_n
-        np_list = [np_gate, np_gate + fx.Int32(N_OUT // 64)]
+    # Each scale word covers two consecutive 16-column weight tiles.
+    mni_base = n_block_idx * fx.Int32(BN // 32) + wave_n * fx.Int32(
+        N_REPS
+    ) // fx.Int32(2)
+    np_list = [mni_base, mni_base + fx.Int32(1)]
     b_scale_s_base, b_scale_s_base_hi = [], []
     for mw in range_constexpr(B_SCALE_REPS):
         base = (
@@ -370,25 +272,6 @@ def _gemm1_body(
         # A wave-wide BufferCopyLDS128b writes 1024 contiguous bytes. That is
         # eight FP4 rows or four FP8 rows. Larger FP8 tiles use two four-row
         # passes; BM32 keeps register staging, which is faster at low occupancy.
-        if const_expr(num_waves == 2):
-            for load_group in range_constexpr(2):
-                lds_row = wave_n * fx.Int32(BM // 2) + fx.Int32(load_group * 8)
-                mask = _lds_swizzle_mask(lds_row + lane_div_8)
-                voffset = ((lane_mod_8 * fx.Int32(16)) ^ mask) + cached_actual_row[
-                    load_group
-                ] * fx.Int32(A_ROW_BYTES)
-                off = (
-                    aq_group_base
-                    + fx.Int32(slot * (A_ROWS * KH_TILE))
-                    + lds_row * fx.Int32(KH_TILE)
-                )
-                fx.copy(
-                    aq_dma_atom,
-                    fx.slice(aq_dma_tiles4, (None, voffset // fx.Int32(16))),
-                    fx.slice(s_aq_i32x4_tiles, (None, off // fx.Int32(16))),
-                    soffset=fx.Int32(kt * KH_TILE) // 4,
-                )
-            return
         for sub in range_constexpr(kSubBlocks):
             lds_row = wave_n * fx.Int32(BM // 4) + fx.Int32(sub * 8)
             if const_expr(a_dtype == "fp8" and BM >= 64 and ACT < kMChunks):
@@ -495,38 +378,6 @@ def _gemm1_body(
             soffset=fx.Int32(kt * KH_TILE) // 4,
         )
 
-    def issue_a_load_reg(kt):
-        regs = []
-        for sub in range_constexpr(kSubBlocks):
-            lds_row = wave_n * fx.Int32(BM // 4) + fx.Int32(sub * 8)
-            mask = _lds_swizzle_mask(lds_row + lane_div_8)
-            voffset = ((lane_mod_8 * fx.Int32(16)) ^ mask) + cached_actual_row[
-                sub
-            ] * fx.Int32(A_ROW_BYTES)
-            r = fx.make_rmem_tensor(mem_4x1, fx.Int32)
-            fx.copy(
-                aq_reg_atom,
-                fx.slice(aq_dma_tiles4, (None, voffset // fx.Int32(16))),
-                r,
-                soffset=fx.Int32(kt * KH_TILE) // 4,
-            )
-            regs.append(r)
-        return regs
-
-    def a_reg_write_lds(slot, regs):
-        for sub in range_constexpr(kSubBlocks):
-            lds_row = wave_n * fx.Int32(BM // 4) + fx.Int32(sub * 8)
-            dst = (
-                aq_group_base
-                + fx.Int32(slot * (A_ROWS * KH_TILE))
-                + (lds_row + lane_div_8) * fx.Int32(KH_TILE)
-                + lane_mod_8 * fx.Int32(16)
-            )
-            fx.copy(
-                i32x4_copy_atom,
-                regs[sub],
-                fx.slice(s_aq_i32x4_tiles, (None, dst // fx.Int32(16))),
-            )
 
     def _lds_i32x4_frag(tile_idx):
         # ds_read_b128 straight into an i32[4] register fragment (kept as a tensor
@@ -542,50 +393,29 @@ def _gemm1_body(
             mask = _lds_swizzle_mask(lane_mod_16)
         a = [[None, None] for _ in range(NCH)]
         halves = range_constexpr(2) if khalf is None else (khalf,)
-        if const_expr(kMChunks == 1):
-            order = [(0, k) for k in halves]
-        elif const_expr(not k_split):
-            order = [(i, k) for k in halves for i in range_constexpr(NCH)]
-        else:
-            order = [
-                (sub * 2 + i, k)
-                for sub in range_constexpr(kSubBlocks)
-                for k in halves
-                for i in range_constexpr(2)
-            ]
+        order = [(i, k) for k in halves for i in range_constexpr(NCH)]
         order = [(i, k) for i, k in order if i < ACT and (chunks is None or i in chunks)]
         for i, k in order:
-            if const_expr(a_dtype == "fp8"):
-                # fp8 128-K operand (v8i32) = two 16 B halves 64 B apart in the row
-                # (f8f6f4 ABI), packed lo++hi. k selects the 128-K half (upper = +128 B).
-                kbase = fx.Int32(k * 128)
-                lo_col = (lane_div_16 * fx.Int32(16) + kbase) ^ mask
-                hi_col = (lane_div_16 * fx.Int32(16) + kbase + fx.Int32(64)) ^ mask
-                lds_row = lane_mod_16 + fx.Int32(i * 16)
-                boff = (
-                    aq_group_base
-                    + fx.Int32(slot * (A_ROWS * KH_TILE))
-                    + lds_row * fx.Int32(KH_TILE)
-                )
-                lo = fx.Vector(
-                    fx.memref_load_vec(_lds_i32x4_frag((boff + lo_col) // fx.Int32(16)))
-                )
-                hi = fx.Vector(
-                    fx.memref_load_vec(_lds_i32x4_frag((boff + hi_col) // fx.Int32(16)))
-                )
-                t = fx.make_rmem_tensor(mem_8x1, fx.Int32)
-                t.store(lo.shuffle(hi, list(range(8))))
-                a[i][k] = t
-            else:
-                lds_col = (lane_div_16 * fx.Int32(16) + fx.Int32(k * 64)) ^ mask
-                lds_row = lane_mod_16 + fx.Int32(i * 16)
-                off = (
-                    aq_group_base
-                    + fx.Int32(slot * (A_ROWS * KH_TILE))
-                    + lds_row * fx.Int32(KH_TILE)
-                    + lds_col
-                )
-                a[i][k] = _lds_i32x4_frag(off // fx.Int32(16))
+            # fp8 128-K operand (v8i32) = two 16 B halves 64 B apart in the row
+            # (f8f6f4 ABI), packed lo++hi. k selects the 128-K half (upper = +128 B).
+            kbase = fx.Int32(k * 128)
+            lo_col = (lane_div_16 * fx.Int32(16) + kbase) ^ mask
+            hi_col = (lane_div_16 * fx.Int32(16) + kbase + fx.Int32(64)) ^ mask
+            lds_row = lane_mod_16 + fx.Int32(i * 16)
+            boff = (
+                aq_group_base
+                + fx.Int32(slot * (A_ROWS * KH_TILE))
+                + lds_row * fx.Int32(KH_TILE)
+            )
+            lo = fx.Vector(
+                fx.memref_load_vec(_lds_i32x4_frag((boff + lo_col) // fx.Int32(16)))
+            )
+            hi = fx.Vector(
+                fx.memref_load_vec(_lds_i32x4_frag((boff + hi_col) // fx.Int32(16)))
+            )
+            t = fx.make_rmem_tensor(mem_8x1, fx.Int32)
+            t.store(lo.shuffle(hi, list(range(8))))
+            a[i][k] = t
         return a
 
     def issue_a_scale_load():
@@ -593,103 +423,6 @@ def _gemm1_body(
         v16 = (wave_n * fx.Int32(64) + lane) * fx.Int32(16)
         v4 = (wave_n * fx.Int32(64) + lane) * fx.Int32(4)
         thread_linear = wave_n * fx.Int32(64) + lane
-        if const_expr(num_waves == 2):
-            bytes_per_16b_pass = num_waves * 64 * 16
-            bytes_per_4b_pass = num_waves * 64 * 4
-            for sub in range_constexpr(kSubBlocks):
-                s_chunk = rocdl.readfirstlane(
-                    T.i32,
-                    (chunk_base + fx.Int32(sub)) * fx.Int32(kAS_per_chunk_dw * 4),
-                )
-                lds_sub = fx.Int32(sub * kAS_per_chunk_dw * 4)
-                for block4k in range_constexpr(ASCALE_CHUNK_BYTES // 4096):
-                    byte_off = block4k * 4096
-                    for load_pass in range_constexpr(4096 // bytes_per_16b_pass):
-                        pass_off = load_pass * bytes_per_16b_pass
-                        s_off = rocdl.readfirstlane(
-                            T.i32, s_chunk + fx.Int32(byte_off + pass_off)
-                        )
-                        fx.copy(
-                            ascale_dma_atom16,
-                            fx.slice(
-                                ascale_dma_tiles4,
-                                (None, v16 // fx.Int32(16)),
-                            ),
-                            fx.slice(
-                                asc_i32x4_tiles,
-                                (
-                                    None,
-                                    (
-                                        lds_sub
-                                        + fx.Int32(byte_off + pass_off)
-                                        + wave_n * fx.Int32(1024)
-                                    )
-                                    // fx.Int32(16),
-                                ),
-                            ),
-                            soffset=s_off // fx.Int32(4),
-                        )
-                full4k_bytes = (ASCALE_CHUNK_BYTES // 4096) * 4096
-                remainder_bytes = ASCALE_CHUNK_BYTES - full4k_bytes
-                for block1k in range_constexpr(remainder_bytes // 1024):
-                    byte_off = full4k_bytes + block1k * 1024
-                    for load_pass in range_constexpr(1024 // bytes_per_4b_pass):
-                        pass_off = load_pass * bytes_per_4b_pass
-                        s_off = rocdl.readfirstlane(
-                            T.i32, s_chunk + fx.Int32(byte_off + pass_off)
-                        )
-                        fx.copy(
-                            ascale_dma_atom4,
-                            fx.slice(
-                                ascale_dma_tiles1,
-                                (None, v4 // fx.Int32(4)),
-                            ),
-                            fx.slice(
-                                asc_i32_tiles,
-                                (
-                                    None,
-                                    (
-                                        lds_sub
-                                        + fx.Int32(byte_off + pass_off)
-                                        + wave_n * fx.Int32(256)
-                                    )
-                                    // fx.Int32(4),
-                                ),
-                            ),
-                            soffset=s_off // fx.Int32(4),
-                        )
-                tail_bytes = remainder_bytes % 1024
-                for load_pass in range_constexpr(
-                    (tail_bytes + bytes_per_4b_pass - 1) // bytes_per_4b_pass
-                ):
-                    pass_off = load_pass * bytes_per_4b_pass
-                    remaining = tail_bytes - pass_off
-                    if thread_linear < fx.Int32((remaining + 3) // 4):
-                        byte_off = (
-                            full4k_bytes + (remainder_bytes // 1024) * 1024 + pass_off
-                        )
-                        s_off = rocdl.readfirstlane(T.i32, s_chunk + fx.Int32(byte_off))
-                        fx.copy(
-                            ascale_dma_atom4,
-                            fx.slice(
-                                ascale_dma_tiles1,
-                                (None, v4 // fx.Int32(4)),
-                            ),
-                            fx.slice(
-                                asc_i32_tiles,
-                                (
-                                    None,
-                                    (
-                                        lds_sub
-                                        + fx.Int32(byte_off)
-                                        + wave_n * fx.Int32(256)
-                                    )
-                                    // fx.Int32(4),
-                                ),
-                            ),
-                            soffset=s_off // fx.Int32(4),
-                        )
-            return
         for sub in range_constexpr(ACT_SUBS):
             s_chunk = rocdl.readfirstlane(
                 T.i32, (chunk_base + fx.Int32(sub)) * fx.Int32(kAS_per_chunk_dw * 4)
@@ -785,161 +518,12 @@ def _gemm1_body(
                 lds_dw = fx.Int32(sub * kAS_per_chunk_dw) + fx.Int32(kt * 64)
             lds_dw = lds_dw + lane_div_16 * fx.Int32(16) + lane_mod_16
             out.append(as_ir_value(_global_i32_load(asc_i32_tiles, lds_dw)))
-        if const_expr(sbm80):
-            # Odd block: 16-row chunk ci is half (1+ci)%2 of loaded word (1+ci)//2.
-            # Rebuild words so byte (khalf, ci%2) of word ci//2 holds it, as for
-            # an aligned block: v[s] = (w[s].b1, w[s+1].b0, w[s].b3, w[s+1].b2).
-            odd = ((m_row >> fx.Int32(4)) & fx.Int32(1)) == fx.Int32(1)
-            w = [fx.Int32(x) for x in out]
-            res = []
-            for s_i in range_constexpr(len(w)):
-                nxt = w[s_i + 1] if s_i + 1 < len(w) else w[s_i]
-                v = ((w[s_i] >> fx.Int32(8)) & fx.Int32(0x00FF00FF)) | (
-                    (nxt << fx.Int32(8)) & fx.Int32(-16711936)
-                )
-                res.append(as_ir_value(odd.select(v, w[s_i])))
-            out = res
         return out
 
     lib = lane & fx.Int32(3)
     lane_shr2_and3 = (lane >> fx.Int32(2)) & fx.Int32(3)
     r_in_chunk = wave_n * fx.Int32(4) + lane_div_16
 
-    def inline_quant_load_kt(B128_IDX, kt, row_token):
-        v_voff = (
-            row_token * fx.Int32(K * 2)
-            + lane_shr2_and3 * fx.Int32(64)
-            + lib * fx.Int32(16)
-        )
-        s_soff = rocdl.readfirstlane(T.i32, fx.Int32(kt * (BK * 2) + B128_IDX * 256))
-        r = fx.make_rmem_tensor(mem_4x1, fx.Int32)
-        fx.copy(
-            hidden_copy_atom,
-            fx.slice(hidden_tiles, (None, v_voff // fx.Int32(16))),
-            r,
-            soffset=s_soff // fx.Int32(4),
-        )
-        return r.load()
-
-    def _bf16x2(dw):
-        return as_ir_value(fx.Vector.from_elements([dw], fx.Int32).bitcast(fx.BFloat16))
-
-    def _iq_block_amax(h_dw_i):
-        # Per-32 amax over the 8 bf16 in this lane's block (4 bf16x2 dwords).
-        hm = [h_dw_i[j] & fx.Int32(0x7FFF7FFF) for j in range_constexpr(4)]
-        m01 = _pkmax_u16(hm[0], hm[1])
-        m23 = _pkmax_u16(hm[2], hm[3])
-        m0123 = _pkmax_u16(m01, m23)
-        lo = m0123 & fx.Int32(0xFFFF)
-        hi = m0123.shrui(fx.Int32(16)) & fx.Int32(0xFFFF)
-        return _umax_i32(lo, hi)
-
-    def _iq_pack_store(h_dw_i, qs_raw, B128_IDX, SUB, slot):
-        # Quantize this lane's 8 elements (4 bf16x2 dwords) and store into the A-LDS
-        # slot at the position issue_a_ds_read expects. fp4: 8 fp4 -> one i32 in a
-        # 16 B swizzled block. fp8: 8 fp8 -> two i32; the 16 B block is
-        # B128_IDX*8 + lsa3*2 + lib//2 and the byte within it is (lib%2)*8 (matches
-        # the split-64 fp8 read).
-        r = fx.Int32(SUB * 16) + r_in_chunk
-        mask_r = _lds_swizzle_mask(r)
-        row_off = fx.Int32(slot * (A_ROWS * KH_TILE)) + r * fx.Int32(KH_TILE)
-        if const_expr(a_dtype == "fp8"):
-            blk_byte = (
-                fx.Int32(B128_IDX * 128)
-                + lane_shr2_and3 * fx.Int32(32)
-                + (lib >> fx.Int32(1)) * fx.Int32(16)
-            )
-            off = row_off + (blk_byte ^ mask_r) + (lib & fx.Int32(1)) * fx.Int32(8)
-            # cvt.pk.fp8 packs 2 fp8 into a 16b lane of a vector<2xi16> accumulator
-            # (dstLoHiSel = lo/hi); two lanes -> 4 fp8 = one i32 stored to LDS.
-            i16x2 = fx.Vector.make_type(2, fx.Int16)
-            zero16 = fx.full(2, 0, fx.Int16)
-            pk0 = rocdl.cvt_scalef32_pk_fp8_bf16(
-                i16x2, zero16, _bf16x2(h_dw_i[0]), qs_raw, 0
-            )
-            pk0 = rocdl.cvt_scalef32_pk_fp8_bf16(
-                i16x2, pk0, _bf16x2(h_dw_i[1]), qs_raw, 1
-            )
-            pk1 = rocdl.cvt_scalef32_pk_fp8_bf16(
-                i16x2, zero16, _bf16x2(h_dw_i[2]), qs_raw, 0
-            )
-            pk1 = rocdl.cvt_scalef32_pk_fp8_bf16(
-                i16x2, pk1, _bf16x2(h_dw_i[3]), qs_raw, 1
-            )
-            _scalar_store(
-                s_aq_i32x1_tiles,
-                off // fx.Int32(4),
-                fx.Vector(pk0).bitcast(fx.Int32)[0],
-                fx.Int32,
-            )
-            _scalar_store(
-                s_aq_i32x1_tiles,
-                (off + fx.Int32(4)) // fx.Int32(4),
-                fx.Vector(pk1).bitcast(fx.Int32)[0],
-                fx.Int32,
-            )
-        else:
-            kb_in_kt = fx.Int32(B128_IDX * 4) + lane_shr2_and3
-            off = row_off + ((kb_in_kt * fx.Int32(16)) ^ mask_r) + lib * fx.Int32(4)
-            pk = as_ir_value(fx.Int32(0))
-            for j in range_constexpr(4):
-                pk = rocdl.cvt_scalef32_pk_fp4_bf16(
-                    T.i32, pk, _bf16x2(h_dw_i[j]), qs_raw, j
-                )
-            _scalar_store(s_aq_i32x1_tiles, off // fx.Int32(4), fx.Int32(pk), fx.Int32)
-
-    def _inline_quant_core_batch(specs, slot, scale_accum):
-        n = len(specs)
-        h_dw = [[h_v[j] for j in range_constexpr(4)] for (_b, _s, h_v) in specs]
-        a = [_iq_block_amax(h_dw[i]) for i in range_constexpr(n)]
-        s1 = [
-            fx.Int32(
-                dpp_utils.update_dpp_i32(
-                    as_ir_value(a[i]),
-                    as_ir_value(a[i]),
-                    0xB1,
-                    0xF,
-                    0xF,
-                    True,
-                )
-            )
-            for i in range_constexpr(n)
-        ]
-        a = [_umax_i32(a[i], s1[i]) for i in range_constexpr(n)]
-        s2 = [
-            fx.Int32(
-                dpp_utils.update_dpp_i32(
-                    as_ir_value(a[i]),
-                    as_ir_value(a[i]),
-                    0x4E,
-                    0xF,
-                    0xF,
-                    True,
-                )
-            )
-            for i in range_constexpr(n)
-        ]
-        a = [_umax_i32(a[i], s2[i]) for i in range_constexpr(n)]
-        e8 = [
-            _inline_e8m0(a[i], max_norm=448.0 if a_dtype == "fp8" else 6.0)
-            for i in range_constexpr(n)
-        ]
-        for i in range_constexpr(n):
-            B128_IDX, SUB, _hv = specs[i]
-            qs_raw = as_ir_value((e8[i] << fx.Int32(23)).bitcast(fx.Float32))
-            _iq_pack_store(h_dw[i], qs_raw, B128_IDX, SUB, slot)
-            pack_byte = B128_IDX * 2 + SUB
-            scale_accum = scale_accum | (e8[i] << fx.Int32(pack_byte * 8))
-        return scale_accum
-
-    def inline_quant_kt(B128_IDX, SUB, slot, kt, row_token, scale_accum):
-        h_v = inline_quant_load_kt(B128_IDX, kt, row_token)
-        return _inline_quant_core_batch([(B128_IDX, SUB, h_v)], slot, scale_accum)
-
-    def inline_quant_pack_write(kt, scale_accum):
-        lane_tgt = lane_shr2_and3 * fx.Int32(16) + r_in_chunk
-        off = fx.Int32(kt * 256) + lane_tgt * fx.Int32(4)
-        _scalar_store(asc_i32_tiles, off // fx.Int32(4), scale_accum, fx.Int32)
 
     def issue_b_load_j(b_slot, K_C, j):
         v = (
@@ -1003,103 +587,6 @@ def _gemm1_body(
             scale_b=sb,
         )
 
-    def mfma_cluster(b_slot, a, a_scale, bs_slot, J, khalf=None):
-        if const_expr(interleave):
-            mni = J // 2
-        else:
-            mni = J % 2
-        if const_expr(khalf is None):
-            bJ0, bJ1 = b_slot[J][0], b_slot[J][1]
-        else:
-            bJ0 = bJ1 = b_slot[J]
-
-        def issue_cluster(scale_slot, in_b):
-            sb = bs_slot[scale_slot]
-            if const_expr(kMChunks == 1):
-                sa = a_scale[0]
-                if const_expr(khalf is None or khalf == 0):
-                    _mma(accm[0][J], 0, 0 + in_b, a[0][0], bJ0, sa, sb)
-                if const_expr(khalf is None or khalf == 1):
-                    _mma(accm[0][J], 2, 2 + in_b, a[0][1], bJ1, sa, sb)
-            else:
-                for sub in range_constexpr(ACT_SUBS):
-                    sa = a_scale[sub]
-                    live = [ci for ci in (sub * 2, sub * 2 + 1) if ci < ACT]
-                    if const_expr(khalf is None or khalf == 0):
-                        for ci in live:
-                            _mma(accm[ci][J], ci % 2, 0 + in_b, a[ci][0], bJ0, sa, sb)
-                    if const_expr(khalf is None or khalf == 1):
-                        for ci in live:
-                            _mma(accm[ci][J], 2 + ci % 2, 2 + in_b, a[ci][1], bJ1, sa, sb)
-
-        if const_expr(interleave and N_REPS == 1):
-            # Adjacent waves consume the low/high N half of one scale word.
-            if (wave_n & fx.Int32(1)) == fx.Int32(0):
-                issue_cluster(0, 0)
-            else:
-                issue_cluster(0, 1)
-        elif const_expr(BN == 64 and not interleave):
-            if const_expr(num_waves == 2):
-                if wave_n == fx.Int32(0):
-                    issue_cluster(mni, 0)
-                else:
-                    issue_cluster(mni, 1)
-            else:
-                if wave_n == fx.Int32(0):
-                    issue_cluster(0, 0)
-                elif wave_n == fx.Int32(1):
-                    issue_cluster(1, 0)
-                elif wave_n == fx.Int32(2):
-                    issue_cluster(0, 1)
-                else:
-                    issue_cluster(1, 1)
-        elif const_expr(BN == 128 and not interleave):
-            if (wave_n & fx.Int32(1)) == fx.Int32(0):
-                issue_cluster(mni, 0)
-            else:
-                issue_cluster(mni, 1)
-        else:
-            issue_cluster(mni, J % 2 if const_expr(interleave) else J // 2)
-
-    def run_k_slice_ksplit(global_k_tile):
-        bh = [[None] * N_REPS for _ in range(2)]
-        a_regs = [None] * a_reg_depth
-        issue_a_scale_load()
-        for S in range_constexpr(k_stages):
-            issue_a_load_lds(S, global_k_tile(S))
-        rocdl.sched_barrier(0)
-        for S in range_constexpr(k_stages):
-            issue_b_scale_load(b_scale_v[S], global_k_tile(S))
-        for h in range_constexpr(2):
-            for j in range_constexpr(N_REPS):
-                issue_b_load_half(bh[h], global_k_tile(0), j, h)
-        for d in range_constexpr(a_reg_depth):
-            if const_expr(k_stages + d < K_TILES_PER_WAVE):
-                a_regs[d] = issue_a_load_reg(global_k_tile(k_stages + d))
-
-        for KT in range_constexpr(K_TILES_PER_WAVE):
-            read_slot = KT % kAStages
-            slot_b = KT % k_stages
-            wt = KT + k_stages
-            gpu.barrier()
-            asc_cur = issue_a_scale_ds_read(global_k_tile(KT))
-            if const_expr(wt < K_TILES_PER_WAVE):
-                rocdl.sched_barrier(0)
-                a_reg_write_lds(wt % kAStages, a_regs[KT % a_reg_depth])
-                nxt = wt + a_reg_depth
-                if const_expr(nxt < K_TILES_PER_WAVE):
-                    a_regs[KT % a_reg_depth] = issue_a_load_reg(global_k_tile(nxt))
-                rocdl.sched_barrier(0)
-            for h in range_constexpr(2):
-                a_h = issue_a_ds_read(read_slot, khalf=h)
-                for J in range_constexpr(N_REPS):
-                    mfma_cluster(bh[h], a_h, asc_cur, b_scale_v[slot_b], J, khalf=h)
-                    rocdl.sched_barrier(0)
-                    if const_expr(KT + 1 < K_TILES_PER_WAVE):
-                        issue_b_load_half(bh[h], global_k_tile(KT + 1), J, h)
-                    rocdl.sched_barrier(0)
-            if const_expr(wt < K_TILES_PER_WAVE):
-                issue_b_scale_load(b_scale_v[slot_b], global_k_tile(wt))
 
     def kh_chunk_major(slot, slot_b, asc_cur, h, b_half=None, bs_cur=None):
         # One K half, one 16-row chunk of A fragments live at a time.
@@ -1166,67 +653,25 @@ def _gemm1_body(
             return k_tile_base_const + local_tile
 
         b_half = [None] * N_REPS if const_expr(BM == 96) else None
-        if const_expr(k_split):
-            run_k_slice_ksplit(global_k_tile)
-            return
 
         _relax_prologue = (BM == 128) and not inline_quant
-        if const_expr(not inline_quant):
-            if const_expr(BM == 96):
-                for s in range_constexpr(2):
-                    issue_a_scale_tile(s, global_k_tile(s))
-            else:
-                issue_a_scale_load()
+        if const_expr(BM == 96):
+            for s in range_constexpr(2):
+                issue_a_scale_tile(s, global_k_tile(s))
+        else:
+            issue_a_scale_load()
         hidden_prefetch = None
-        if const_expr(inline_quant and prefetch_hidden):
-            hidden_prefetch = (
-                inline_quant_load_kt(0, global_k_tile(0), cached_row_inline),
-                inline_quant_load_kt(1, global_k_tile(0), cached_row_inline),
-            )
         for K_C_LOCAL in range_constexpr(k_stages):
             K_C = global_k_tile(K_C_LOCAL)
-            if const_expr(inline_quant):
-                scale_accum = fx.Int32(0)
-                if const_expr(prefetch_hidden):
-                    h_v0, h_v1 = hidden_prefetch
-                    if const_expr(K_C_LOCAL + 1 < K_TILES_PER_WAVE):
-                        next_k = global_k_tile(K_C_LOCAL + 1)
-                        hidden_prefetch = (
-                            inline_quant_load_kt(0, next_k, cached_row_inline),
-                            inline_quant_load_kt(1, next_k, cached_row_inline),
-                        )
-                    scale_accum = _inline_quant_core_batch(
-                        [(0, 0, h_v0)], K_C_LOCAL, scale_accum
-                    )
-                else:
-                    scale_accum = inline_quant_kt(
-                        0, 0, K_C_LOCAL, K_C, cached_row_inline, scale_accum
-                    )
-
-                issue_b_load_j(b[K_C_LOCAL], K_C, 0)
-                issue_b_load_j(b[K_C_LOCAL], K_C, 1)
-                if const_expr(prefetch_hidden):
-                    scale_accum = _inline_quant_core_batch(
-                        [(1, 0, h_v1)], K_C_LOCAL, scale_accum
-                    )
-                else:
-                    scale_accum = inline_quant_kt(
-                        1, 0, K_C_LOCAL, K_C, cached_row_inline, scale_accum
-                    )
-                if const_expr(N_REPS > 2):
-                    issue_b_load_j(b[K_C_LOCAL], K_C, 2)
-                    issue_b_load_j(b[K_C_LOCAL], K_C, 3)
-                inline_quant_pack_write(K_C_LOCAL, scale_accum)
-            else:
-                issue_a_load_lds(K_C_LOCAL, K_C)
-                if const_expr(NCH > kMChunks):
-                    issue_a_load_lds_tail(K_C_LOCAL, K_C)
-                if const_expr(not _relax_prologue):
-                    for j in range_constexpr(N_REPS):
-                        if const_expr(BM == 96):
-                            issue_b_load_half(b_half, K_C, j, 0)
-                        else:
-                            issue_b_load_j(b[K_C_LOCAL], K_C, j)
+            issue_a_load_lds(K_C_LOCAL, K_C)
+            if const_expr(NCH > kMChunks):
+                issue_a_load_lds_tail(K_C_LOCAL, K_C)
+            if const_expr(not _relax_prologue):
+                for j in range_constexpr(N_REPS):
+                    if const_expr(BM == 96):
+                        issue_b_load_half(b_half, K_C, j, 0)
+                    else:
+                        issue_b_load_j(b[K_C_LOCAL], K_C, j)
             if const_expr(not _relax_prologue):
                 issue_b_scale_load(b_scale_v[K_C_LOCAL], K_C)
         if const_expr(_relax_prologue):
@@ -1243,143 +688,49 @@ def _gemm1_body(
             read_slot = OFFSET % kAStages
             write_slot = K_C_LOCAL % kAStages
             slot_b = OFFSET % k_stages
-            if const_expr(inline_quant and prefetch_hidden):
-                h_v0, h_v1 = hidden_prefetch
-                if const_expr(OFFSET + 1 < kUnroll):
-                    hidden_prefetch = (
-                        inline_quant_load_kt(0, K_C + 1, cached_row_inline),
-                        inline_quant_load_kt(1, K_C + 1, cached_row_inline),
-                    )
             gpu.barrier()
-            if const_expr(khalf_loop):
-                # K-half major: hold only one half of the A fragments, and refill
-                # each B half for tile K_C right after its last use.
-                asc_cur = issue_a_scale_ds_read(K_C - k_stages)
-                for h in range_constexpr(2):
-                    if const_expr(khalf_loop == 2):
-                        kh_chunk_major(read_slot, slot_b, asc_cur, h, b_half)
-                        if const_expr(h == 1):
-                            rocdl.sched_barrier(0)
-                            issue_a_load_lds(write_slot, K_C)
-                            if const_expr(NCH > kMChunks):
-                                issue_a_load_lds_tail(write_slot, K_C)
-                            if const_expr(BM == 96 and K_C_LOCAL + 1 < K_TILES_PER_WAVE):
-                                future = global_k_tile(K_C_LOCAL + 1)
-                                issue_a_scale_tile(future % AS_K_SLOTS, future)
-                            rocdl.sched_barrier(0)
-                        if const_expr(BM == 96):
-                            load_tile = K_C - k_stages if h == 0 else K_C
-                            load_half = 1 if h == 0 else 0
-                            for J in range_constexpr(N_REPS):
-                                issue_b_load_half(b_half, load_tile, J, load_half)
-                        else:
-                            bh = [b[slot_b][j][h] for j in range(N_REPS)]
-                            for J in range_constexpr(N_REPS):
-                                issue_b_load_half(bh, K_C, J, h)
-                                b[slot_b][J][h] = bh[J]
-                        continue
-                    a_h = issue_a_ds_read(read_slot, khalf=h)
-                    if const_expr(h == 1):
-                        rocdl.sched_barrier(0)
-                        issue_a_load_lds(write_slot, K_C)
-                        if const_expr(NCH > kMChunks):
-                            issue_a_load_lds_tail(write_slot, K_C)
+            # K-half major: hold only one half of the A fragments, and refill
+            # each B half for tile K_C right after its last use.
+            asc_cur = issue_a_scale_ds_read(K_C - k_stages)
+            for h in range_constexpr(2):
+                kh_chunk_major(read_slot, slot_b, asc_cur, h, b_half)
+                if const_expr(h == 1):
+                    rocdl.sched_barrier(0)
+                    issue_a_load_lds(write_slot, K_C)
+                    if const_expr(NCH > kMChunks):
+                        issue_a_load_lds_tail(write_slot, K_C)
+                    if const_expr(BM == 96 and K_C_LOCAL + 1 < K_TILES_PER_WAVE):
+                        future = global_k_tile(K_C_LOCAL + 1)
+                        issue_a_scale_tile(future % AS_K_SLOTS, future)
+                    rocdl.sched_barrier(0)
+                if const_expr(BM == 96):
+                    load_tile = K_C - k_stages if h == 0 else K_C
+                    load_half = 1 if h == 0 else 0
+                    for J in range_constexpr(N_REPS):
+                        issue_b_load_half(b_half, load_tile, J, load_half)
+                else:
                     bh = [b[slot_b][j][h] for j in range(N_REPS)]
                     for J in range_constexpr(N_REPS):
-                        rocdl.sched_barrier(0)
-                        rocdl.s_setprio(1)
-                        mfma_cluster(bh, a_h, asc_cur, b_scale_v[slot_b], J, khalf=h)
-                        rocdl.s_setprio(0)
-                        rocdl.sched_barrier(0)
                         issue_b_load_half(bh, K_C, J, h)
                         b[slot_b][J][h] = bh[J]
-                        rocdl.sched_barrier(0)
-                issue_b_scale_load(b_scale_v[slot_b], K_C)
                 continue
-            if const_expr(BM == 128):
-                asc_cur = issue_a_scale_ds_read(K_C - k_stages)
-                a_cur = issue_a_ds_read(read_slot)
-            else:
-                a_cur = issue_a_ds_read(read_slot)
-                asc_cur = issue_a_scale_ds_read(K_C - k_stages)
-            if const_expr(not inline_quant):
-                # Keep the LDS reads ahead of the next DMA into LDS: if the DMA is
-                # hoisted above them, the waitcnt pass cannot tell the slots apart
-                # and drains every in-flight load (vmcnt(0)) before the reads.
-                rocdl.sched_barrier(0)
-                issue_a_load_lds(write_slot, K_C)
-                if const_expr(NCH > kMChunks):
-                    issue_a_load_lds_tail(write_slot, K_C)
-            if const_expr(inline_quant and not prefetch_hidden):
-                h_v0 = inline_quant_load_kt(0, K_C, cached_row_inline)
-                h_v1 = inline_quant_load_kt(1, K_C, cached_row_inline)
-                rocdl.sched_barrier(0)
-            for J in range_constexpr(N_REPS):
-                if const_expr(BM != 128):
-                    rocdl.sched_barrier(0)
-                    rocdl.s_setprio(1)
-                mfma_cluster(b[slot_b], a_cur, asc_cur, b_scale_v[slot_b], J)
-                if const_expr(BM != 128):
-                    rocdl.s_setprio(0)
-                rocdl.sched_barrier(0)
-                issue_b_load_j(b[slot_b], K_C, J)
-                rocdl.sched_barrier(0)
             issue_b_scale_load(b_scale_v[slot_b], K_C)
-            if const_expr(inline_quant):
-                scale_accum = _inline_quant_core_batch(
-                    [(0, 0, h_v0), (1, 0, h_v1)], write_slot, fx.Int32(0)
-                )
-                inline_quant_pack_write(K_C, scale_accum)
+            continue
 
         for S in range_constexpr(k_stages):
             kt_local = K_TILES_PER_WAVE - k_stages + S
             kt = global_k_tile(kt_local)
             gpu.barrier()
-            if const_expr(khalf_loop):
-                asc_cur = issue_a_scale_ds_read(kt)
-                for h in range_constexpr(2):
-                    if const_expr(khalf_loop == 2):
-                        kh_chunk_major(kt_local % kAStages, kt_local % k_stages, asc_cur, h, b_half)
-                        if const_expr(BM == 96 and h == 0):
-                            for J in range_constexpr(N_REPS):
-                                issue_b_load_half(b_half, kt, J, 1)
-                        continue
-                    a_h = issue_a_ds_read(kt_local % kAStages, khalf=h)
-                    bh = [b[kt_local % k_stages][j][h] for j in range(N_REPS)]
+            asc_cur = issue_a_scale_ds_read(kt)
+            for h in range_constexpr(2):
+                kh_chunk_major(kt_local % kAStages, kt_local % k_stages, asc_cur, h, b_half)
+                if const_expr(BM == 96 and h == 0):
                     for J in range_constexpr(N_REPS):
-                        mfma_cluster(bh, a_h, asc_cur, b_scale_v[kt_local % k_stages], J, khalf=h)
+                        issue_b_load_half(b_half, kt, J, 1)
                 continue
-            if const_expr(BM == 128):
-                asc_cur = issue_a_scale_ds_read(kt)
-                a_cur = issue_a_ds_read(kt_local % kAStages)
-            else:
-                a_cur = issue_a_ds_read(kt_local % kAStages)
-                asc_cur = issue_a_scale_ds_read(kt)
-            for J in range_constexpr(N_REPS):
-                mfma_cluster(
-                    b[kt_local % k_stages],
-                    a_cur,
-                    asc_cur,
-                    b_scale_v[kt_local % k_stages],
-                    J,
-                )
+            continue
 
-    if const_expr(k_wave == 1):
-        run_k_slice(0)
-    elif const_expr(k_wave == 2):
-        if wave_k == fx.Int32(0):
-            run_k_slice(0)
-        else:
-            run_k_slice(K_TILES_PER_WAVE)
-    else:
-        if wave_k == fx.Int32(0):
-            run_k_slice(0)
-        elif wave_k == fx.Int32(1):
-            run_k_slice(K_TILES_PER_WAVE)
-        elif wave_k == fx.Int32(2):
-            run_k_slice(2 * K_TILES_PER_WAVE)
-        else:
-            run_k_slice(3 * K_TILES_PER_WAVE)
+    run_k_slice(0)
 
     gpu.barrier()
 
@@ -1418,16 +769,10 @@ def _gemm1_body(
         return value
 
     tx_i32 = wave_n * fx.Int32(64) + lane
-    if const_expr(num_waves == 2):
-        m_lane = tx_i32 // fx.Int32(4)
-        n_lane = tx_i32 % fx.Int32(4)
-        wave_grp = fx.Int32(0)
-        kk = n_lane
-    else:
-        m_lane = tx_i32 // fx.Int32(16)
-        n_lane = tx_i32 % fx.Int32(16)
-        wave_grp = n_lane // fx.Int32(4)
-        kk = n_lane % fx.Int32(4)
+    m_lane = tx_i32 // fx.Int32(16)
+    n_lane = tx_i32 % fx.Int32(16)
+    wave_grp = n_lane // fx.Int32(4)
+    kk = n_lane % fx.Int32(4)
 
     CHUNKS_PER_SPLIT = kMChunks // epi_splits
 
@@ -1441,32 +786,14 @@ def _gemm1_body(
                 for J in range_constexpr(N_REPS):
                     # Both weight layouts assign alternating gate/up tiles to the
                     # same accumulators, including BN64's pairs of adjacent waves.
-                    if const_expr(BN == 64):
-                        if const_expr(num_waves == 2):
-                            gate_up = fx.Int32(J % 2)
-                            n16 = wave_n
-                            lds_col = (
-                                gate_up * fx.Int32(BN_INT)
-                                + n16 * fx.Int32(16)
-                                + lane_mod_16
-                            )
-                        else:
-                            gate_up = wave_n & fx.Int32(1)
-                            n16 = wave_n >> fx.Int32(1)
-                            lds_col = (
-                                gate_up * fx.Int32(BN_INT)
-                                + n16 * fx.Int32(16)
-                                + lane_mod_16
-                            )
-                    else:
-                        is_up = (J % 2) == 1
-                        J_local = J // 2
-                        col_local = (
-                            wave_n * fx.Int32(BN // 8)
-                            + fx.Int32(J_local * 16)
-                            + lane_mod_16
-                        )
-                        lds_col = fx.Int32(BN_INT) + col_local if is_up else col_local
+                    is_up = (J % 2) == 1
+                    J_local = J // 2
+                    col_local = (
+                        wave_n * fx.Int32(BN // 8)
+                        + fx.Int32(J_local * 16)
+                        + lane_mod_16
+                    )
+                    lds_col = fx.Int32(BN_INT) + col_local if is_up else col_local
                     vec = fx.Vector(fx.memref_load_vec(accm[i][J]))
                     for v in range_constexpr(4):
                         idx = acc_idx(wave_k, row_base + fx.Int32(v), lds_col)
@@ -1488,38 +815,24 @@ def _gemm1_body(
         aqout_tiles = _global_scalar_tiles(arg_aqout, fx.Int32, 1 << 24)
 
         def store_payload(payload_row, packed0, packed1):
-            if const_expr(out_dtype == "fp8"):
-                byte_pos = (
-                    n_block_idx * fx.Int32(BN_INT)
-                    + wave_grp * fx.Int32(32)
-                    + kk * fx.Int32(8)
-                )
-                store_off = _layout_idx(aqout_layout, payload_row, byte_pos)
-                _scalar_store(
-                    aqout_tiles,
-                    store_off // fx.Int32(4),
-                    packed0,
-                    fx.Int32,
-                )
-                _scalar_store(
-                    aqout_tiles,
-                    (store_off + fx.Int32(4)) // fx.Int32(4),
-                    packed1,
-                    fx.Int32,
-                )
-            else:
-                byte_pos = (
-                    n_block_idx * fx.Int32(BN_INT // 2)
-                    + wave_grp * fx.Int32(16)
-                    + kk * fx.Int32(4)
-                )
-                store_off = _layout_idx(aqout_layout, payload_row, byte_pos)
-                _scalar_store(
-                    aqout_tiles,
-                    store_off // fx.Int32(4),
-                    packed0,
-                    fx.Int32,
-                )
+            byte_pos = (
+                n_block_idx * fx.Int32(BN_INT)
+                + wave_grp * fx.Int32(32)
+                + kk * fx.Int32(8)
+            )
+            store_off = _layout_idx(aqout_layout, payload_row, byte_pos)
+            _scalar_store(
+                aqout_tiles,
+                store_off // fx.Int32(4),
+                packed0,
+                fx.Int32,
+            )
+            _scalar_store(
+                aqout_tiles,
+                (store_off + fx.Int32(4)) // fx.Int32(4),
+                packed1,
+                fx.Int32,
+            )
 
         if const_expr(enable_bias):
             bias_gate = [None] * 8
@@ -1552,26 +865,17 @@ def _gemm1_body(
             if const_expr(mr >= ACT):
                 result = [fx.Float32(0.0)] * 8
             else:
-                if const_expr(
-                    fast_situ
-                    and act == "situv2"
-                    and situ_beta == 4.0
-                    and situ_linear_beta == 25.0
-                ):
-                    result = _situv2_4_25_mul_batch(gate_vs, up_vs)
-                else:
-                    result = _activation_mul_batch(
-                        gate_vs,
-                        up_vs,
-                        act=act,
-                        situ_beta=situ_beta,
-                        situ_linear_beta=situ_linear_beta,
-                        swiglu_limit=swiglu_limit,
-                    )
-            if const_expr(out_dtype == "fp8"):
-                # Match the existing two-stage path: activation is materialized
-                # as BF16 before the inter-stage MXFP8 quantization.
-                result = [value.to(fx.BFloat16).to(fx.Float32) for value in result]
+                result = _activation_mul_batch(
+                    gate_vs,
+                    up_vs,
+                    act=act,
+                    situ_beta=situ_beta,
+                    situ_linear_beta=situ_linear_beta,
+                    swiglu_limit=swiglu_limit,
+                )
+            # Match the existing two-stage path: activation is materialized
+            # as BF16 before the inter-stage MXFP8 quantization.
+            result = [value.to(fx.BFloat16).to(fx.Float32) for value in result]
 
             local_max = _fabs_f32(result[0])
             for ee in range_constexpr(1, 8):
@@ -1586,62 +890,45 @@ def _gemm1_body(
 
             qscale_raw = as_ir_value(qscale)
             sorted_out_row = m_row + row_local
-            if const_expr(out_dtype == "fp8"):
-                i16x2 = fx.Vector.make_type(2, fx.Int16)
-                zero16 = fx.full(2, 0, fx.Int16)
-                packed0 = rocdl.cvt_scalef32_pk_fp8_f32(
-                    i16x2,
-                    zero16,
-                    as_ir_value(result[0]),
-                    as_ir_value(result[1]),
-                    qscale_raw,
-                    0,
-                )
-                packed0 = rocdl.cvt_scalef32_pk_fp8_f32(
-                    i16x2,
-                    packed0,
-                    as_ir_value(result[2]),
-                    as_ir_value(result[3]),
-                    qscale_raw,
-                    1,
-                )
-                packed1 = rocdl.cvt_scalef32_pk_fp8_f32(
-                    i16x2,
-                    zero16,
-                    as_ir_value(result[4]),
-                    as_ir_value(result[5]),
-                    qscale_raw,
-                    0,
-                )
-                packed1 = rocdl.cvt_scalef32_pk_fp8_f32(
-                    i16x2,
-                    packed1,
-                    as_ir_value(result[6]),
-                    as_ir_value(result[7]),
-                    qscale_raw,
-                    1,
-                )
-                store_payload(
-                    sorted_out_row,
-                    fx.Vector(packed0).bitcast(fx.Int32)[0],
-                    fx.Vector(packed1).bitcast(fx.Int32)[0],
-                )
-            else:
-                packed_i32 = as_ir_value(fx.Int32(0))
-                for w in range_constexpr(4):
-                    packed_i32 = rocdl.cvt_scalef32_pk_fp4_f32(
-                        T.i32,
-                        packed_i32,
-                        as_ir_value(result[2 * w]),
-                        as_ir_value(result[2 * w + 1]),
-                        qscale_raw,
-                        w,
-                    )
-                store_payload(
-                    sorted_out_row,
-                    fx.Int32(packed_i32),
-                    fx.Int32(0),
-                )
+            i16x2 = fx.Vector.make_type(2, fx.Int16)
+            zero16 = fx.full(2, 0, fx.Int16)
+            packed0 = rocdl.cvt_scalef32_pk_fp8_f32(
+                i16x2,
+                zero16,
+                as_ir_value(result[0]),
+                as_ir_value(result[1]),
+                qscale_raw,
+                0,
+            )
+            packed0 = rocdl.cvt_scalef32_pk_fp8_f32(
+                i16x2,
+                packed0,
+                as_ir_value(result[2]),
+                as_ir_value(result[3]),
+                qscale_raw,
+                1,
+            )
+            packed1 = rocdl.cvt_scalef32_pk_fp8_f32(
+                i16x2,
+                zero16,
+                as_ir_value(result[4]),
+                as_ir_value(result[5]),
+                qscale_raw,
+                0,
+            )
+            packed1 = rocdl.cvt_scalef32_pk_fp8_f32(
+                i16x2,
+                packed1,
+                as_ir_value(result[6]),
+                as_ir_value(result[7]),
+                qscale_raw,
+                1,
+            )
+            store_payload(
+                sorted_out_row,
+                fx.Vector(packed0).bitcast(fx.Int32)[0],
+                fx.Vector(packed1).bitcast(fx.Int32)[0],
+            )
 
     def store_scales(subs=None):
         # Generic scale chunks cover 32 sorted rows; native BM16 GEMM2 consumes
@@ -1649,7 +936,7 @@ def _gemm1_body(
         num_scale_chunks = (
             i32_total_m_blocks
             if native_scale_layout
-            else (i32_total_m_blocks * fx.Int32(80 if sbm80 else BM) + fx.Int32(31)) // fx.Int32(32)
+            else (i32_total_m_blocks * fx.Int32(BM) + fx.Int32(31)) // fx.Int32(32)
         )
         ascaleout_layout = fx.make_layout(
             (num_scale_chunks, 2, 4, 16), (OUT_AS_PER_CHUNK_DW, 64, 16, 1)
@@ -1657,74 +944,10 @@ def _gemm1_body(
         ascaleout_i8_tiles = _global_scalar_tiles(arg_ascaleout, fx.Int8, 1 << 26)
         ascaleout_i16_tiles = _global_scalar_tiles(arg_ascaleout, fx.Int16, 1 << 25)
         if kk == fx.Int32(0):
-            if const_expr(BN == 64):
-                ku = n_block_idx >> fx.Int32(3)
-                scale_wave_grp = n_block_idx & fx.Int32(3)
-                ikxdl = (n_block_idx >> fx.Int32(2)) & fx.Int32(1)
-            elif const_expr(BN == 128):
-                # Match shuffle_scale's physical layout for logical scale column
-                # c = 2*n_block_idx + wave_grp:
-                #   (ku, n4, n2) = (c//8, c%4, (c//4)%2).
-                ku = n_block_idx >> fx.Int32(2)
-                scale_wave_grp = (n_block_idx * fx.Int32(2) + wave_grp) & fx.Int32(3)
-                ikxdl = (n_block_idx >> fx.Int32(1)) & fx.Int32(1)
-            else:
-                ku = n_block_idx >> fx.Int32(1)
-                scale_wave_grp = wave_grp
-                ikxdl = n_block_idx & fx.Int32(1)
-            if const_expr(BM == 16):
-                if const_expr(native_scale_layout):
-                    # Native GEMM2 addresses one padded scale chunk per BM16
-                    # block. Each A scale is duplicated for GEMM2's two N16
-                    # MFMA selectors.
-                    chunk = m_block_idx
-                    dword_off = _layout_idx(
-                        ascaleout_layout, chunk, ku, scale_wave_grp, m_lane
-                    )
-                    duplicated_scale = scales_per_mr[0] | (
-                        scales_per_mr[0] << fx.Int32(8)
-                    )
-                    # ikxdl selects one of the two disjoint 16-bit halves of
-                    # the dword, so a narrow store replaces the atomic merge.
-                    _scalar_store(
-                        ascaleout_i16_tiles,
-                        dword_off * fx.Int32(2) + ikxdl,
-                        duplicated_scale,
-                        fx.Int16,
-                    )
-                else:
-                    # Generic v2 GEMM2 packs two BM16 blocks into one 32-row
-                    # scale chunk.
-                    chunk = m_block_idx >> fx.Int32(1)
-                    row_half = m_block_idx & fx.Int32(1)
-                    dword_off = _layout_idx(
-                        ascaleout_layout, chunk, ku, scale_wave_grp, m_lane
-                    )
-                    byte_pos = ikxdl * fx.Int32(2) + row_half
-                    _scalar_store(
-                        ascaleout_i8_tiles,
-                        dword_off * fx.Int32(4) + byte_pos,
-                        scales_per_mr[0],
-                        fx.Int8,
-                    )
-            elif const_expr(sbm80):
-                g16 = m_row >> fx.Int32(4)
-                for sub in (range((NCH + 1) // 2) if subs is None else subs):
-                    for ci in (sub * 2, sub * 2 + 1):
-                        if const_expr(ci < NCH):
-                            g = g16 + fx.Int32(ci)
-                            dword_off = _layout_idx(
-                                ascaleout_layout, g >> fx.Int32(1), ku, scale_wave_grp, m_lane
-                            )
-                            _scalar_store(
-                                ascaleout_i8_tiles,
-                                dword_off * fx.Int32(4)
-                                + ikxdl * fx.Int32(2)
-                                + (g & fx.Int32(1)),
-                                scales_per_mr[ci],
-                                fx.Int8,
-                            )
-            elif const_expr(num_waves == 2):
+            ku = n_block_idx >> fx.Int32(1)
+            scale_wave_grp = wave_grp
+            ikxdl = n_block_idx & fx.Int32(1)
+            if const_expr(num_waves == 2):
                 chunk = m_block_idx
                 row_half = m_lane >> fx.Int32(4)
                 row_in_16 = m_lane & fx.Int32(15)
@@ -1755,65 +978,25 @@ def _gemm1_body(
                         fx.Int16,
                     )
 
-    if const_expr(epi_splits > 1):
-        for split in range_constexpr(epi_splits):
-            if const_expr(split > 0):
-                gpu.barrier()
-            store_acc_split(split)
-            gpu.barrier()
-            run_epilogue(split)
-        store_scales()
-    elif const_expr(epi32):
-        # Stage the accumulators 32 rows (one scale group) at a time so the
-        # epilogue LDS stays below the A buffers (3 WGs/CU).
-        def _epi32(fn):
-            if wave_k == fx.Int32(0):
-                fn()
-
-        regions = [list(range(c, min(c + 2, NCH))) for c in range(0, NCH, 2)]
-        for r_i in range_constexpr(len(regions)):
-            reg = regions[r_i]
-            if const_expr(r_i > 0):
-                gpu.barrier()
-            store_acc_split(0, reg)
-            gpu.barrier()
-
-            def _region(reg=reg):
-                run_epilogue(0, reg)
-                store_scales([reg[0] // 2])
-
-            _epi32(_region)
-    else:
-        store_acc_split(0)
-        gpu.barrier()
+    # Stage the accumulators 32 rows (one scale group) at a time so the
+    # epilogue LDS stays below the A buffers (3 WGs/CU).
+    def _epi32(fn):
         if wave_k == fx.Int32(0):
-            if const_expr(num_waves == 2):
-                run_epilogue(0)
-                store_scales()
-            elif const_expr(BN == 64):
-                if wave_grp == fx.Int32(0):
-                    run_epilogue(0)
-                    store_scales()
-            elif const_expr(BN == 128):
-                if wave_grp < fx.Int32(2):
-                    run_epilogue(0)
-                    store_scales()
-            else:
-                run_epilogue(0)
-                store_scales()
+            fn()
 
+    regions = [list(range(c, min(c + 2, NCH))) for c in range(0, NCH, 2)]
+    for r_i in range_constexpr(len(regions)):
+        reg = regions[r_i]
+        if const_expr(r_i > 0):
+            gpu.barrier()
+        store_acc_split(0, reg)
+        gpu.barrier()
 
-def _bm_constants(
-    BM, BN, KH_TILE, K_TILES_TOTAL, k_wave=1, epi_splits=1, k_stages=kStages
-):
-    kAStages = 2 if (BM == 128 and BN != 256) else k_stages + 1
-    kSubBlocks = 1 if BM < 32 else BM // 32
-    kMChunks = kmchunks_for(BM)
-    s_aq_bytes = k_wave * kAStages * BM * KH_TILE
-    s_asc_bytes = kSubBlocks * K_TILES_TOTAL * 256
-    lds_acc_bytes = k_wave * lds_acc_bytes_for(BM // epi_splits, BN + ACC_LDS_PAD_DW)
-    lds_bytes = max(s_aq_bytes + s_asc_bytes, lds_acc_bytes)
-    return kAStages, kSubBlocks, kMChunks, lds_bytes
+        def _region(reg=reg):
+            run_epilogue(0, reg)
+            store_scales([reg[0] // 2])
+
+        _epi32(_region)
 
 
 def compile_gemm1_ep32(
@@ -1855,17 +1038,13 @@ def compile_gemm1_ep32(
         xcd_swizzle,
     ) != ("fp8", "fp8", 256, 256, True, 4, 1, False, False, 0):
         raise AssertionError(
-            "gemm1 ep32 supports BM64/BM80/BM96 BN256 BK256 A8 FP8-out interleaved gate/up, "
+            "gemm1 ep32 supports BM64/BM96 BN256 BK256 A8 FP8-out interleaved gate/up, "
             "4 waves, k_wave 1, no inline quant / xcd swizzle; got "
             f"BM={BM} use_nt={use_nt} inline_quant={inline_quant} a={a_dtype} "
             f"out={out_dtype} BN={BN} BK={BK} interleave={interleave} "
             f"num_waves={num_waves} k_wave={k_wave} xcd_swizzle={xcd_swizzle}"
         )
-    # BM=80: 80-row sort blocks, one tile per block (64-row body + 16-row tail).
     sort_block_m = BM
-    sbm80 = BM == 80
-    if sbm80:
-        BM = 64
     if act not in ("silu", "swiglu", "situv2"):
         raise AssertionError(f"act must be 'silu', 'swiglu', or 'situv2', got {act!r}")
     if act == "situv2" and (situ_beta <= 0.0 or situ_linear_beta <= 0.0):
@@ -1891,7 +1070,7 @@ def compile_gemm1_ep32(
     epi32 = True
     compact = True  # real tiles first in the grid (see the unit ballot in the kernel)
     xcd_chunk = True  # contiguous tile runs per XCD over the compact list
-    fast_situ = False  # True: SiTUv2 beta=4/25 as 2 exp2 + 1 rcp (_situv2_4_25_mul_batch), not bit-exact
+    fast_situ = False  # Preserve the original activation rounding.
     kAStages_ = k_stages + 1
     pipeline_rows = 96 if sort_block_m == 96 else BM + 16
     scale_k_slots = 2 if sort_block_m == 96 else K_TILES_TOTAL
@@ -1906,6 +1085,33 @@ def compile_gemm1_ep32(
         name_suffix += "_ask2_bpf2_swf8"
     if enable_bias:
         name_suffix += "_bias"
+
+    body_kwargs = dict(
+        BM=BM,
+        BN=BN,
+        BK=BK,
+        inline_quant=inline_quant,
+        prefetch_hidden=prefetch_hidden,
+        a_dtype=a_dtype,
+        out_dtype=out_dtype,
+        act=act,
+        situ_beta=situ_beta,
+        situ_linear_beta=situ_linear_beta,
+        swiglu_limit=swiglu_limit,
+        enable_bias=enable_bias,
+        K=D_HIDDEN,
+        N_OUT=N_OUT,
+        NE=NE,
+        interleave=interleave,
+        native_scale_layout=native_scale_layout,
+        num_waves=num_waves,
+        k_wave=k_wave,
+        epi_splits=epi_splits,
+        k_stages=k_stages,
+        khalf_loop=khalf_loop,
+        epi32=epi32,
+        fast_situ=fast_situ,
+    )
 
     block_threads = num_waves * k_wave * 64
 
@@ -1946,245 +1152,87 @@ def compile_gemm1_ep32(
         # Workgroups past every M block's tiles (the host grid is an upper
         # bound, ~20x the real tiles) exit before any per-block loads.
         if bx_i32 < bound:
-            if const_expr(compact):
-                # Units = M blocks not folded into the previous block's tile, found
-                # with a wave ballot over the first 128 blocks (later blocks are
-                # appended unchanged). Workgroups index units compactly so the real
-                # tiles take the first grid slots; with folded blocks interleaved
-                # the dispatcher refills their freed slots and stacks up to 4 real
-                # tiles on some CUs while others get one.
-                u_masks = []
-                for c in range_constexpr(2):
-                    b = lane + fx.Int32(c * 64)
-                    b_ok = b < total_m_blocks
-                    bc = b_ok.select(b, zero)
-                    bp = (bc > zero).select(bc - one, bc)
-                    t16 = _global_i32_at(arg_mind, bc * fx.Int32(BM) + fx.Int32(16))
-                    folded = (bc > zero).select(
-                        (_global_i32_at(arg_eids, bc) == _global_i32_at(arg_eids, bp)).select(
-                            (t16 == pad_tok).select(one, zero), zero
-                        ),
-                        zero,
-                    )
-                    is_unit = b_ok.select((folded == zero).select(one, zero), zero)
-                    u_masks.append(fx.Int64(rocdl.ballot(T.i64, as_ir_value(is_unit == one))))
-                u_cnt0 = fx.Int32(fx.math.ctpop(u_masks[0]))
-                u_cnt1 = fx.Int32(fx.math.ctpop(u_masks[1]))
-                extra = (total_m_blocks > fx.Int32(128)).select(total_m_blocks - fx.Int32(128), zero)
-                n_units = u_cnt0 + u_cnt1 + extra
-                gate = bx_i32 < n_units * fx.Int32(NUM_N_BLOCKS)
-            else:
-                gate = bx_i32 < bound
+            # Units = M blocks not folded into the previous block's tile, found
+            # with a wave ballot over the first 128 blocks (later blocks are
+            # appended unchanged). Workgroups index units compactly so the real
+            # tiles take the first grid slots; with folded blocks interleaved
+            # the dispatcher refills their freed slots and stacks up to 4 real
+            # tiles on some CUs while others get one.
+            u_masks = []
+            for c in range_constexpr(2):
+                b = lane + fx.Int32(c * 64)
+                b_ok = b < total_m_blocks
+                bc = b_ok.select(b, zero)
+                bp = (bc > zero).select(bc - one, bc)
+                t16 = _global_i32_at(arg_mind, bc * fx.Int32(BM) + fx.Int32(16))
+                folded = (bc > zero).select(
+                    (_global_i32_at(arg_eids, bc) == _global_i32_at(arg_eids, bp)).select(
+                        (t16 == pad_tok).select(one, zero), zero
+                    ),
+                    zero,
+                )
+                is_unit = b_ok.select((folded == zero).select(one, zero), zero)
+                u_masks.append(fx.Int64(rocdl.ballot(T.i64, as_ir_value(is_unit == one))))
+            u_cnt0 = fx.Int32(fx.math.ctpop(u_masks[0]))
+            u_cnt1 = fx.Int32(fx.math.ctpop(u_masks[1]))
+            extra = (total_m_blocks > fx.Int32(128)).select(total_m_blocks - fx.Int32(128), zero)
+            n_units = u_cnt0 + u_cnt1 + extra
+            gate = bx_i32 < n_units * fx.Int32(NUM_N_BLOCKS)
 
             NXCD = 8
             xq = _udiv(bound, NXCD)
             xr = _umod(bound, NXCD)
 
-            def _xcd(pid):
-                xc = _umod(pid, NXCD)
-                wgid = xc * xq + (xc < xr).select(xc, xr) + _udiv(pid, NXCD)
-                ng = fx.Int32(xcd_swizzle * NUM_N_BLOCKS)
-                group_id = wgid // ng
-                first_pid_m = group_id * fx.Int32(xcd_swizzle)
-                remaining_m = total_m_blocks - first_pid_m
-                sw = fx.Int32(xcd_swizzle)
-                group_size_m = (remaining_m < sw).select(remaining_m, sw)
-                wig = wgid % ng
-                m_block = first_pid_m + (wig % group_size_m)
-                n_block = wig // group_size_m
-                return m_block * fx.Int32(NUM_N_BLOCKS) + n_block
 
             if gate:
-                if const_expr(compact):
-                    tid = bx_i32
-                    if const_expr(xcd_chunk):
-                        # Workgroups go round-robin over the 8 XCDs; give each XCD a
-                        # contiguous run of the (unit, N block) list so a unit's
-                        # gathered A rows are read into one or two XCD L2s, not all 8.
-                        n_tiles = n_units * fx.Int32(NUM_N_BLOCKS)
-                        cq = _udiv(n_tiles, 8)
-                        cr = _umod(n_tiles, 8)
-                        xc = _umod(bx_i32, 8)
-                        tid = xc * cq + (xc < cr).select(xc, cr) + _udiv(bx_i32, 8)
-                    u = tid // fx.Int32(NUM_N_BLOCKS)
-                    n_blk = tid - u * fx.Int32(NUM_N_BLOCKS)
-                    in0 = u < u_cnt0
-                    k = in0.select(u, u - u_cnt0)
-                    msk = in0.select(u_masks[0], u_masks[1])
-                    lane64 = fx.Int64(lane)
-                    below = msk & ((fx.Int64(1) << lane64) - fx.Int64(1))
-                    bit = (msk >> lane64) & fx.Int64(1)
-                    rank = fx.Int32(fx.math.ctpop(below))
-                    hit = (bit == fx.Int64(1)).select((rank == k).select(one, zero), zero)
-                    sel = fx.Int64(rocdl.ballot(T.i64, as_ir_value(hit == one)))
-                    pos = fx.Int32(fx.math.cttz(sel))
-                    m_u = (u < u_cnt0 + u_cnt1).select(
-                        in0.select(pos, pos + fx.Int32(64)), fx.Int32(128) + u - u_cnt0 - u_cnt1
-                    )
-                    m_u = fx.Int32(rocdl.readfirstlane(T.i32, as_ir_value(m_u)))
-                    tile = m_u * fx.Int32(NUM_N_BLOCKS) + n_blk
-                elif const_expr(xcd_swizzle > 0):
-                    tile = _xcd(bx_i32)
-                else:
-                    tile = bx_i32
-                if const_expr(skip_pad):
-                    # Per M block: absorb a <=16-row tail block of the same expert
-                    # into the preceding full block's tile (80 rows, one weight
-                    # stream); blocks with <=16 real rows otherwise take the light
-                    # path. Padding sits at the end of each expert run.
-                    m_blk = tile // fx.Int32(NUM_N_BLOCKS)
-                    m_prev = (m_blk > fx.Int32(0)).select(m_blk - one, m_blk)
-                    has_next = m_blk + one < total_m_blocks
-                    m_next = has_next.select(m_blk + one, m_blk)
-                    e_cur = _global_i32_at(arg_eids, m_blk)
-                    e_prev = _global_i32_at(arg_eids, m_prev)
-                    e_next = _global_i32_at(arg_eids, m_next)
-                    tok16 = _global_i32_at(arg_mind, m_blk * fx.Int32(BM) + fx.Int32(16))
-                    tokn16 = _global_i32_at(arg_mind, m_next * fx.Int32(BM) + fx.Int32(16))
-                    light = (tok16 == pad_tok).select(one, fx.Int32(0))
-                    prev_same = (m_blk > fx.Int32(0)).select((e_prev == e_cur).select(one, fx.Int32(0)), fx.Int32(0))
-                    next_light = has_next.select((e_next == e_cur).select((tokn16 == pad_tok).select(one, fx.Int32(0)), fx.Int32(0)), fx.Int32(0))
-                    mode = rocdl.readfirstlane(
-                        T.i32,
-                        as_ir_value((light * prev_same == one).select(fx.Int32(3), (next_light * (one - light) == one).select(fx.Int32(2), light))),
-                    )
-                    mode = fx.Int32(mode)
-                    if mode == fx.Int32(2):
-                        _gemm1_body(
-                            lds_raw_ptr,
-                            arg_aq,
-                            arg_ascale,
-                            arg_bq,
-                            arg_bscale,
-                            arg_eids,
-                            arg_mind,
-                            arg_aqout,
-                            arg_ascaleout,
-                            arg_hidden,
-                            arg_bias,
-                            tile,
-                            lane,
-                            wave,
-                            use_nt,
-                            i32_ntok,
-                            total_m_blocks,
-                            BM=BM,
-                            BN=BN,
-                            BK=BK,
-                            inline_quant=inline_quant,
-                            prefetch_hidden=prefetch_hidden,
-                            a_dtype=a_dtype,
-                            out_dtype=out_dtype,
-                            act=act,
-                            situ_beta=situ_beta,
-                            situ_linear_beta=situ_linear_beta,
-                            swiglu_limit=swiglu_limit,
-                            enable_bias=enable_bias,
-                            K=D_HIDDEN,
-                            N_OUT=N_OUT,
-                            NE=NE,
-                            interleave=interleave,
-                            native_scale_layout=native_scale_layout,
-                            num_waves=num_waves,
-                            k_wave=k_wave,
-                            epi_splits=epi_splits,
-                            k_stages=k_stages,
-                            khalf_loop=khalf_loop,
-                            epi32=epi32,
-                            fast_situ=fast_situ,
-                            active_chunks=5,
-                        )
-                    elif mode == fx.Int32(1):
-                        _gemm1_body(
-                            lds_raw_ptr,
-                            arg_aq,
-                            arg_ascale,
-                            arg_bq,
-                            arg_bscale,
-                            arg_eids,
-                            arg_mind,
-                            arg_aqout,
-                            arg_ascaleout,
-                            arg_hidden,
-                            arg_bias,
-                            tile,
-                            lane,
-                            wave,
-                            use_nt,
-                            i32_ntok,
-                            total_m_blocks,
-                            BM=BM,
-                            BN=BN,
-                            BK=BK,
-                            inline_quant=inline_quant,
-                            prefetch_hidden=prefetch_hidden,
-                            a_dtype=a_dtype,
-                            out_dtype=out_dtype,
-                            act=act,
-                            situ_beta=situ_beta,
-                            situ_linear_beta=situ_linear_beta,
-                            swiglu_limit=swiglu_limit,
-                            enable_bias=enable_bias,
-                            K=D_HIDDEN,
-                            N_OUT=N_OUT,
-                            NE=NE,
-                            interleave=interleave,
-                            native_scale_layout=native_scale_layout,
-                            num_waves=num_waves,
-                            k_wave=k_wave,
-                            epi_splits=epi_splits,
-                            k_stages=k_stages,
-                            khalf_loop=khalf_loop,
-                            epi32=epi32,
-                            fast_situ=fast_situ,
-                            active_chunks=1,
-                        )
-                    elif mode == fx.Int32(0):
-                        _gemm1_body(
-                            lds_raw_ptr,
-                            arg_aq,
-                            arg_ascale,
-                            arg_bq,
-                            arg_bscale,
-                            arg_eids,
-                            arg_mind,
-                            arg_aqout,
-                            arg_ascaleout,
-                            arg_hidden,
-                            arg_bias,
-                            tile,
-                            lane,
-                            wave,
-                            use_nt,
-                            i32_ntok,
-                            total_m_blocks,
-                            BM=BM,
-                            BN=BN,
-                            BK=BK,
-                            inline_quant=inline_quant,
-                            prefetch_hidden=prefetch_hidden,
-                            a_dtype=a_dtype,
-                            out_dtype=out_dtype,
-                            act=act,
-                            situ_beta=situ_beta,
-                            situ_linear_beta=situ_linear_beta,
-                            swiglu_limit=swiglu_limit,
-                            enable_bias=enable_bias,
-                            K=D_HIDDEN,
-                            N_OUT=N_OUT,
-                            NE=NE,
-                            interleave=interleave,
-                            native_scale_layout=native_scale_layout,
-                            num_waves=num_waves,
-                            k_wave=k_wave,
-                            epi_splits=epi_splits,
-                            k_stages=k_stages,
-                            khalf_loop=khalf_loop,
-                            epi32=epi32,
-                            fast_situ=fast_situ,
-                            active_chunks=None,
-                        )
-                else:
+                tid = bx_i32
+                # Workgroups go round-robin over the 8 XCDs; give each XCD a
+                # contiguous run of the (unit, N block) list so a unit's
+                # gathered A rows are read into one or two XCD L2s, not all 8.
+                n_tiles = n_units * fx.Int32(NUM_N_BLOCKS)
+                cq = _udiv(n_tiles, 8)
+                cr = _umod(n_tiles, 8)
+                xc = _umod(bx_i32, 8)
+                tid = xc * cq + (xc < cr).select(xc, cr) + _udiv(bx_i32, 8)
+                u = tid // fx.Int32(NUM_N_BLOCKS)
+                n_blk = tid - u * fx.Int32(NUM_N_BLOCKS)
+                in0 = u < u_cnt0
+                k = in0.select(u, u - u_cnt0)
+                msk = in0.select(u_masks[0], u_masks[1])
+                lane64 = fx.Int64(lane)
+                below = msk & ((fx.Int64(1) << lane64) - fx.Int64(1))
+                bit = (msk >> lane64) & fx.Int64(1)
+                rank = fx.Int32(fx.math.ctpop(below))
+                hit = (bit == fx.Int64(1)).select((rank == k).select(one, zero), zero)
+                sel = fx.Int64(rocdl.ballot(T.i64, as_ir_value(hit == one)))
+                pos = fx.Int32(fx.math.cttz(sel))
+                m_u = (u < u_cnt0 + u_cnt1).select(
+                    in0.select(pos, pos + fx.Int32(64)), fx.Int32(128) + u - u_cnt0 - u_cnt1
+                )
+                m_u = fx.Int32(rocdl.readfirstlane(T.i32, as_ir_value(m_u)))
+                tile = m_u * fx.Int32(NUM_N_BLOCKS) + n_blk
+                # Per M block: absorb a <=16-row tail block of the same expert
+                # into the preceding full block's tile (80 rows, one weight
+                # stream); blocks with <=16 real rows otherwise take the light
+                # path. Padding sits at the end of each expert run.
+                m_blk = tile // fx.Int32(NUM_N_BLOCKS)
+                m_prev = (m_blk > fx.Int32(0)).select(m_blk - one, m_blk)
+                has_next = m_blk + one < total_m_blocks
+                m_next = has_next.select(m_blk + one, m_blk)
+                e_cur = _global_i32_at(arg_eids, m_blk)
+                e_prev = _global_i32_at(arg_eids, m_prev)
+                e_next = _global_i32_at(arg_eids, m_next)
+                tok16 = _global_i32_at(arg_mind, m_blk * fx.Int32(BM) + fx.Int32(16))
+                tokn16 = _global_i32_at(arg_mind, m_next * fx.Int32(BM) + fx.Int32(16))
+                light = (tok16 == pad_tok).select(one, fx.Int32(0))
+                prev_same = (m_blk > fx.Int32(0)).select((e_prev == e_cur).select(one, fx.Int32(0)), fx.Int32(0))
+                next_light = has_next.select((e_next == e_cur).select((tokn16 == pad_tok).select(one, fx.Int32(0)), fx.Int32(0)), fx.Int32(0))
+                mode = rocdl.readfirstlane(
+                    T.i32,
+                    as_ir_value((light * prev_same == one).select(fx.Int32(3), (next_light * (one - light) == one).select(fx.Int32(2), light))),
+                )
+                mode = fx.Int32(mode)
+                if mode == fx.Int32(2):
                     _gemm1_body(
                         lds_raw_ptr,
                         arg_aq,
@@ -2203,30 +1251,51 @@ def compile_gemm1_ep32(
                         use_nt,
                         i32_ntok,
                         total_m_blocks,
-                        BM=BM,
-                        BN=BN,
-                        BK=BK,
-                        inline_quant=inline_quant,
-                        prefetch_hidden=prefetch_hidden,
-                        a_dtype=a_dtype,
-                        out_dtype=out_dtype,
-                        act=act,
-                        situ_beta=situ_beta,
-                        situ_linear_beta=situ_linear_beta,
-                        swiglu_limit=swiglu_limit,
-                        enable_bias=enable_bias,
-                        K=D_HIDDEN,
-                        N_OUT=N_OUT,
-                        NE=NE,
-                        interleave=interleave,
-                        native_scale_layout=native_scale_layout,
-                        num_waves=num_waves,
-                        k_wave=k_wave,
-                        epi_splits=epi_splits,
-                        k_stages=k_stages,
-                        khalf_loop=khalf_loop,
-                        epi32=epi32,
-                        fast_situ=fast_situ,
+                        **body_kwargs,
+                        active_chunks=5,
+                    )
+                elif mode == fx.Int32(1):
+                    _gemm1_body(
+                        lds_raw_ptr,
+                        arg_aq,
+                        arg_ascale,
+                        arg_bq,
+                        arg_bscale,
+                        arg_eids,
+                        arg_mind,
+                        arg_aqout,
+                        arg_ascaleout,
+                        arg_hidden,
+                        arg_bias,
+                        tile,
+                        lane,
+                        wave,
+                        use_nt,
+                        i32_ntok,
+                        total_m_blocks,
+                        **body_kwargs,
+                        active_chunks=1,
+                    )
+                elif mode == fx.Int32(0):
+                    _gemm1_body(
+                        lds_raw_ptr,
+                        arg_aq,
+                        arg_ascale,
+                        arg_bq,
+                        arg_bscale,
+                        arg_eids,
+                        arg_mind,
+                        arg_aqout,
+                        arg_ascaleout,
+                        arg_hidden,
+                        arg_bias,
+                        tile,
+                        lane,
+                        wave,
+                        use_nt,
+                        i32_ntok,
+                        total_m_blocks,
+                        **body_kwargs,
                         active_chunks=None,
                     )
 
@@ -2248,7 +1317,7 @@ def compile_gemm1_ep32(
         arg_hidden: fx.Int64,
         arg_bias: fx.Int64,
     ):
-        # BM80/BM96 sort blocks: one full tile per block; the (block, N) list
+        # BM96 sort blocks: one full tile per block; the (block, N) list
         # is cut into one contiguous run per XCD (as in the BM64 kernel).
         lds_raw_ptr = fx.SharedAllocator().allocate(SharedStorage).peek().raw.ptr
         tx_i32 = fx.thread_idx.x
@@ -2280,32 +1349,8 @@ def compile_gemm1_ep32(
                 use_nt,
                 i32_ntok,
                 total_m_blocks,
-                BM=BM,
-                BN=BN,
-                BK=BK,
-                inline_quant=inline_quant,
-                prefetch_hidden=prefetch_hidden,
-                a_dtype=a_dtype,
-                out_dtype=out_dtype,
-                act=act,
-                situ_beta=situ_beta,
-                situ_linear_beta=situ_linear_beta,
-                swiglu_limit=swiglu_limit,
-                enable_bias=enable_bias,
-                K=D_HIDDEN,
-                N_OUT=N_OUT,
-                NE=NE,
-                interleave=interleave,
-                native_scale_layout=native_scale_layout,
-                num_waves=num_waves,
-                k_wave=k_wave,
-                epi_splits=epi_splits,
-                k_stages=k_stages,
-                khalf_loop=khalf_loop,
-                epi32=epi32,
-                fast_situ=fast_situ,
+                **body_kwargs,
                 active_chunks=sort_block_m // 16,
-                sbm80=sbm80,
             )
 
     @flyc.jit
@@ -2326,7 +1371,7 @@ def compile_gemm1_ep32(
         stream: fx.Stream,
     ):
         grid_x = fx.Int64(i32_grid)
-        (gemm1_kernel_block if const_expr(sort_block_m in (80, 96)) else gemm1_kernel)(
+        (gemm1_kernel_block if const_expr(sort_block_m == 96) else gemm1_kernel)(
             arg_aq,
             arg_ascale,
             arg_bq,

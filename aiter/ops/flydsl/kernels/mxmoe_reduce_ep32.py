@@ -7,7 +7,7 @@ from flydsl.expr.typing import T
 from .mxfp4_gemm_common import global_typed_ptr
 
 
-@flyc.kernel(name="ep32_bm80_moe_reduce_native_nativewide", known_block_size=[256, 1, 1])
+@flyc.kernel(name="ep32_moe_reduce_native", known_block_size=[256, 1, 1])
 def native_reduce_kernel(
     arg_x: fx.Pointer, arg_rev: fx.Pointer, arg_weight: fx.Pointer,
     arg_mask: fx.Pointer, arg_ids: fx.Pointer, arg_valid: fx.Pointer,
