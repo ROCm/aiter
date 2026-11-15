@@ -89,6 +89,19 @@ def _get_gptj_rotated_x(
     return x_rotated
 
 
+@triton.jit
+def _rope_accumulate(x, x_rotated, cos, sin):
+    if x.dtype == tl.bfloat16 and cos.dtype == tl.bfloat16 and sin.dtype == tl.bfloat16:
+        cos_product = x.to(tl.float32) * cos.to(tl.float32)
+        sin_product = (
+            (x_rotated.to(tl.float32) * sin.to(tl.float32))
+            .to(tl.bfloat16)
+            .to(tl.float32)
+        )
+        return (cos_product + sin_product).to(tl.bfloat16)
+    return x * cos + x_rotated * sin
+
+
 _rope_kernel_sbhd_fwd_repr = make_kernel_repr(
     "_rope_kernel_sbhd_fwd",
     [
@@ -700,7 +713,7 @@ def _rope_kernel_sbhd_cached_fwd(
             x, x_rotated_mask, BLOCK_S, BLOCK_D, BLOCK_D_HALF
         )
 
-    out_x = x * cos + x_rotated * sin
+    out_x = _rope_accumulate(x, x_rotated, cos, sin)
     out_x = out_x.to(x_ptr.dtype.element_ty)
     x_out_offs = (
         b * stride_out_b
@@ -1017,9 +1030,9 @@ def _rope_kernel_thd_cached_2c_fwd(
                 y, x_rotated_mask, BLOCK_T, BLOCK_D, BLOCK_D_HALF
             )
 
-        out_x = x * cos + x_rotated * sin
+        out_x = _rope_accumulate(x, x_rotated, cos, sin)
         out_x = out_x.to(x_ptr.dtype.element_ty)
-        out_y = y * cos + y_rotated * sin
+        out_y = _rope_accumulate(y, y_rotated, cos, sin)
         out_y = out_y.to(y_ptr.dtype.element_ty)
 
         out_x_offs = (
@@ -1399,7 +1412,7 @@ def _rope_kernel_cached_thd_2c_gqa_fwd(
         + d_offs[None, :] * stride_out_y_d
         + h_s * stride_out_y_h
     )
-    out_y = y * cos + y_rotated * sin
+    out_y = _rope_accumulate(y, y_rotated, cos, sin)
     out_y = out_y.to(y_ptr.dtype.element_ty)
     tl.store(out_y_ptr + out_y_offs, out_y, mask=x_mask)
 
@@ -1434,7 +1447,7 @@ def _rope_kernel_cached_thd_2c_gqa_fwd(
             + d_offs[None, :] * stride_out_x_d
             + (h_start_idx + h) * stride_out_x_h
         )
-        out_x = x * cos + x_rotated * sin
+        out_x = _rope_accumulate(x, x_rotated, cos, sin)
         out_x = out_x.to(x_ptr.dtype.element_ty)
 
         tl.store(out_x_ptr + out_x_offs, out_x, mask=x_mask)
@@ -1594,7 +1607,7 @@ def _rope_kernel_cached_thd_2c_gqa_onehead_fwd(
         + d_offs[None, :] * stride_out_x_d
         + hq * stride_out_x_h
     )
-    out_x = x * cos + x_rotated * sin
+    out_x = _rope_accumulate(x, x_rotated, cos, sin)
     out_x = out_x.to(x_ptr.dtype.element_ty)
     tl.store(out_x_ptr + out_x_offs, out_x, mask=x_mask)
 
@@ -1628,7 +1641,7 @@ def _rope_kernel_cached_thd_2c_gqa_onehead_fwd(
             + d_offs[None, :] * stride_out_y_d
             + hq * stride_out_y_h
         )
-        out_y = y * cos + y_rotated * sin
+        out_y = _rope_accumulate(y, y_rotated, cos, sin)
         out_y = out_y.to(y_ptr.dtype.element_ty)
         tl.store(out_y_ptr + out_y_offs, out_y, mask=x_mask)
 

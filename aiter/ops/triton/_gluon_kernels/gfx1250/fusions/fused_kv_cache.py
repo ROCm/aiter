@@ -353,6 +353,26 @@ def _freq_from_shared_2d(
 
 
 @gluon.jit
+def _rope_accumulate(x_pe, x_pe_rotated, cos, sin):
+    if (
+        x_pe.dtype == gl.bfloat16
+        and cos.dtype == gl.bfloat16
+        and sin.dtype == gl.bfloat16
+    ):
+        # Keep gfx1250 BF16 RoPE bitwise-stable across Triton versions:
+        # cosine products stay FP32, sine products and the final sum round
+        # through BF16 before a possible FP8 q_out store.
+        cos_product = x_pe.to(gl.float32) * cos.to(gl.float32)
+        sin_product = (
+            (x_pe_rotated.to(gl.float32) * sin.to(gl.float32))
+            .to(gl.bfloat16)
+            .to(gl.float32)
+        )
+        return (cos_product + sin_product).to(gl.bfloat16)
+    return x_pe * cos + x_pe_rotated * sin
+
+
+@gluon.jit
 def _rope_pe(
     x_pe,
     cos,
@@ -373,7 +393,7 @@ def _rope_pe(
         x_pe_rotated = _get_gptj_rotated_x_1D(
             x_pe, x_rotated_mask, BLOCK_D_pe, BLOCK_D_HALF_pe
         )
-    return x_pe * cos + x_pe_rotated * sin
+    return _rope_accumulate(x_pe, x_pe_rotated, cos, sin)
 
 
 @gluon.jit
@@ -953,7 +973,7 @@ def _rope_pe_2d(
         x_pe_rotated = _get_gptj_rotated_x_2d(
             x_pe, x_rotated_mask, BLOCK_T, BLOCK_D_pe, BLOCK_D_HALF_pe
         )
-    return x_pe * cos + x_pe_rotated * sin
+    return _rope_accumulate(x_pe, x_pe_rotated, cos, sin)
 
 
 @gluon.jit
