@@ -1154,6 +1154,105 @@ def _check_fused_moe_inline_sort_pad_rows(tokens=32, valid=29):
     assert (out[valid:] == 0).all()
 
 
+def _check_fused_moe_strided_hidden(tokens_list=(1, 2, 32, 128)):
+    """fused_moe on Kimi-K3's tuned rows with hidden_states a column view of a
+    wider row, as ATOM's merged front GEMM hands it over. The inline-sort rows
+    are kept, their GEMM1 (the one kernel that reads hidden_states) matches the
+    contiguous copy bit for bit on the same sort, and the output matches the
+    copy's up to the atomic stage2 order, which differs between any two calls."""
+    from aiter.ops.flydsl import mxfp4_gemm1_kernels
+    from aiter.ops.shuffle import shuffle_weight
+
+    experts, hidden, inter, topk, width, col = 896, 3584, 384, 16, 6016, 2432
+
+    def fp4_weight(n, k):
+        w = torch.randint(0, 256, (experts, n, k // 2), dtype=torch.uint8)
+        s = torch.randint(118, 124, (experts * n, k // 32), dtype=torch.uint8)
+        w = shuffle_weight(w.cuda().view(dtypes.fp4x2), layout=(16, 16))
+        w.is_shuffled = True
+        return w, fp4_utils.e8m0_shuffle(s.cuda().view(dtypes.fp8_e8m0))
+
+    torch.manual_seed(width)
+    w1, w1_scale = fp4_weight(2 * inter, hidden)
+    w2, w2_scale = fp4_weight(hidden, inter)
+    reasons = []
+    unsupported = fused_moe._mxfp4_inline_sort_unsupported
+
+    def record(*a, **kw):
+        reasons.append(unsupported(*a, **kw))
+        return reasons[-1]
+
+    gemm1 = mxfp4_gemm1_kernels.flydsl_mxfp4_gemm1
+    strided_gemm1 = []
+
+    def gemm1_vs_copy(**kw):
+        h = kw["hidden_states"]
+        if not h.is_contiguous():
+            outs = ("inter_sorted_quant", "inter_sorted_shuffled_scale")
+            got, want = ({k: torch.zeros_like(kw[k]) for k in outs} for _ in "ab")
+            gemm1(**{**kw, **got})
+            gemm1(**{**kw, **want, "hidden_states": h.contiguous()})
+            strided_gemm1.append(all(torch.equal(got[k], want[k]) for k in outs))
+        return gemm1(**kw)
+
+    env = {"AITER_SITUV2_A4W4": "1"}
+    saved = {k: os.environ.get(k) for k in env}
+    os.environ.update(env)
+    fused_moe._mxfp4_inline_sort_unsupported = record
+    mxfp4_gemm1_kernels.flydsl_mxfp4_gemm1 = gemm1_vs_copy
+    try:
+        for tokens in tokens_list:
+            x = torch.randn((tokens, width), dtype=dtypes.bf16)[:, col : col + hidden]
+            topk_ids = torch.stack(
+                [
+                    torch.randperm(experts, dtype=torch.int32)[:topk]
+                    for _ in range(tokens)
+                ]
+            ).cuda()
+            topk_weights = torch.softmax(torch.randn((tokens, topk)), dim=1)
+            reasons.clear()
+            strided_gemm1.clear()
+            out, ref = (
+                fused_moe.fused_moe(
+                    h,
+                    w1,
+                    w2,
+                    topk_weights,
+                    topk_ids,
+                    activation=aiter.ActivationType.Situv2,
+                    quant_type=aiter.QuantType.per_1x32,
+                    w1_scale=w1_scale,
+                    w2_scale=w2_scale,
+                )
+                for h in (x, x.contiguous())
+            )
+            assert all(r == "" for r in reasons), (tokens, reasons)
+            if reasons and not x.is_contiguous():
+                assert strided_gemm1 and all(strided_gemm1), (tokens, strided_gemm1)
+            rel = ((out.float() - ref.float()).norm() / ref.float().norm()).item()
+            assert rel < 0.02, (tokens, rel)
+    finally:
+        fused_moe._mxfp4_inline_sort_unsupported = unsupported
+        mxfp4_gemm1_kernels.flydsl_mxfp4_gemm1 = gemm1
+        for k, v in saved.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+
+
+def _check_output_overlap_sees_strided_span():
+    """An output past a strided input's nbytes but inside its span overlaps it."""
+    from aiter.presorted_moe import bytes_overlap
+
+    buf = torch.empty((4, 64), dtype=dtypes.bf16, device="cpu")
+    x = buf[:, 32:48]
+    assert bytes_overlap(buf.view(-1)[100:110], x)
+    assert not bytes_overlap(buf.view(-1)[:32], x)
+
+
+_check_output_overlap_sees_strided_span()
+
 if _running_on_gfx950():
     _check_aux_sort_pad_rows_and_num_local_tokens()
     _check_aux_sort_pad_rows_and_num_local_tokens(tokens=4, valid=3)
@@ -1161,4 +1260,5 @@ if _running_on_gfx950():
         _check_three_stage_sort_pad_rows(bm)
     _check_fused_moe_inline_sort_pad_rows()
     _check_fused_moe_inline_sort_pad_rows(tokens=4, valid=3)
+    _check_fused_moe_strided_hidden()
     aiter.logger.info("aux sort pad-row / num_local_tokens checks passed")

@@ -87,6 +87,7 @@ def _gemm1_body(
     swiglu_limit=7.0,
     enable_bias=False,
     K,
+    hidden_stride,
     N_OUT,
     NE,
     interleave=False,
@@ -176,7 +177,7 @@ def _gemm1_body(
     ascale_dma_atom4 = fx.make_copy_atom(fx.rocdl.BufferCopyLDS32b(), fx.Int32)
 
     if const_expr(inline_quant):
-        hidden_num = fx.Int64(i32_ntok * fx.Int32(K * 2))
+        hidden_num = fx.Int64(i32_ntok * fx.Int32(hidden_stride * 2))
         hidden_tiles = _global_i32_buffer_tiles(arg_hidden, hidden_num, 4)
         hidden_copy_atom = fx.make_copy_atom(fx.rocdl.BufferCopy128b(), fx.Int32)
 
@@ -695,7 +696,7 @@ def _gemm1_body(
 
     def inline_quant_load_kt(B128_IDX, kt, row_token):
         v_voff = (
-            row_token * fx.Int32(K * 2)
+            row_token * fx.Int32(hidden_stride * 2)
             + lane_shr2_and3 * fx.Int32(64)
             + lib * fx.Int32(16)
         )
@@ -1597,8 +1598,12 @@ def compile_gemm1_a4w4_port(
     native_scale_layout=False,
     num_waves=4,
     k_wave=1,
+    hidden_stride=None,
 ):
-    """Compile GEMM1 with expert-sorted output."""
+    """Compile GEMM1 with expert-sorted output.
+
+    ``hidden_stride``: the inline-quant hidden_states row stride in elements
+    (default ``D_HIDDEN``, contiguous rows)."""
     try:
         _assert_supported(
             D_HIDDEN=D_HIDDEN,
@@ -1694,6 +1699,10 @@ def compile_gemm1_a4w4_port(
         name_suffix += f"_kw{k_wave}"
     if epi_splits > 1:
         name_suffix += f"_es{epi_splits}"
+    if hidden_stride is None:
+        hidden_stride = D_HIDDEN
+    elif hidden_stride != D_HIDDEN:
+        name_suffix += f"_hs{hidden_stride}"
 
     block_threads = num_waves * k_wave * 64
 
@@ -1784,6 +1793,7 @@ def compile_gemm1_a4w4_port(
                 swiglu_limit=swiglu_limit,
                 enable_bias=enable_bias,
                 K=D_HIDDEN,
+                hidden_stride=hidden_stride,
                 N_OUT=N_OUT,
                 NE=NE,
                 interleave=interleave,
