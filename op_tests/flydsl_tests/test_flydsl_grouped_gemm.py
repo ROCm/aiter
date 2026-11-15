@@ -778,9 +778,13 @@ def test_active_expert_count(ids, expected):
 
 @pytest.mark.parametrize("data_format", ["a4w4", "a8w4"])
 def test_gemm_work_metrics_active_weights(data_format):
-    shape = dict(
-        tokens=1, topk=8, model_dim=7168, inter_dim=2048, data_format=data_format
-    )
+    shape = {
+        "tokens": 1,
+        "topk": 8,
+        "model_dim": 7168,
+        "inter_dim": 2048,
+        "data_format": data_format,
+    }
     active = _gemm_work_metrics(active_experts=8, **shape)
     allocated = _gemm_work_metrics(active_experts=64, **shape)
     for name, weight_elements in (

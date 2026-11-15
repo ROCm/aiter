@@ -740,9 +740,7 @@ def build_gemm_a8w4_tdm_task(
         and static_n % (tile_n * cluster_n) == 0
     )
     rotating_gemm2_k = bool(
-        next_n_prefetch_on
-        and persistent_gemm2
-        and K_TILES % num_buffers == 0
+        next_n_prefetch_on and persistent_gemm2 and K_TILES % num_buffers == 0
     )
     head_gemm2_kt = rotating_gemm2_k
     inline_zero_acc = inline_zero_acc or head_gemm2_kt
@@ -4336,7 +4334,12 @@ def build_gemm_a8w4_tdm_task(
                         ((mn_oob + 15) // 16, STORE_N * 16),
                         (out_stride * 16, 1),
                     )
-                    store_tile(gtC, (tile_m // 16, STORE_N * 16), fx.recast_iter(oc_store, c_q_base_ptr), STORE_N * 16)
+                    store_tile(
+                        gtC,
+                        (tile_m // 16, STORE_N * 16),
+                        fx.recast_iter(oc_store, c_q_base_ptr),
+                        STORE_N * 16,
+                    )
                 else:
                     c_off_rt = c_outer_off * fx.Int64(out_stride) + out_col_off
                     if const_expr(coalesced_gemm2_output):
@@ -4386,7 +4389,12 @@ def build_gemm_a8w4_tdm_task(
                         # c_q_base_ptr is base_ptr unless defer_c_wait, and that
                         # asserts stage1_act and not enable_ep_scatter -- the only
                         # case it differs already has STORE_PAD == 0 (PITCH == N).
-                        store_tile(gtC, (tile_m, STORE_PITCH), fx.recast_iter(oc_store, c_q_base_ptr), STORE_PITCH)
+                        store_tile(
+                            gtC,
+                            (tile_m, STORE_PITCH),
+                            fx.recast_iter(oc_store, c_q_base_ptr),
+                            STORE_PITCH,
+                        )
                 if const_expr(tdm_snop):
                     rocdl.s_nop(0)
                 if const_expr(not defer_c_wait and not clustered_persistent):
