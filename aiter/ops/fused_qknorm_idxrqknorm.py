@@ -112,7 +112,7 @@ def fused_qknorm_idxrqknorm(
     #   32-bit words, so no two tokens of one call may share a slot;
     #   index_cache is whole contiguous 9216 B pages ([128 x 64 B e2m1][128 x 8 B e4m3]); k_scale / v_scale are
     #   the fp32 [1] global scales of K and V (the index key has none). The rounding is integer/compare
-    #   arithmetic, not a hardware convert: the bytes do not depend on the arch.
+    #   arithmetic, not a hardware convert, but nvfp4 (like mxfp4) is refused off gfx950.
     # q_out may be an e4m3 tensor (fp8 or uint8, insert mode): unit-scale e4m3 cast, saturating
     #   (+-inf too; NaN stays NaN), written instead of the bf16 q (as index_q_out).
     if index_cache_dtype is None:
@@ -124,8 +124,9 @@ def fused_qknorm_idxrqknorm(
 
     # opus has no fp4 conversion off gfx950 and no fp8 conversion on gfx1100/gfx115x: the
     # stores would silently write zeros.
-    if "mxfp4" in (kv_cache_dtype, index_cache_dtype) and get_gfx_runtime() != "gfx950":
-        raise RuntimeError("fused_qknorm_idxrqknorm mxfp4 caches require gfx950")
+    fp4_dtypes = {"mxfp4", "nvfp4"} & {kv_cache_dtype, index_cache_dtype}
+    if fp4_dtypes and get_gfx_runtime() != "gfx950":
+        raise RuntimeError("fused_qknorm_idxrqknorm mxfp4/nvfp4 caches require gfx950")
     if (
         q_out is not None
         and q_out.dtype != qkv.dtype
