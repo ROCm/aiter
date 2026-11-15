@@ -42,7 +42,8 @@ _QUANT_FUSE_BLOCKS = int(os.environ.get("AITER_MEGA_QUANT_FUSE", "128"))
 
 # Smallest m-tile the flag region is sized for (one flag per tile/source).
 _S1F_MIN_TILE_M = 16
-#: The GEMM1 tile n / k every stage-1 variant embeds (with 1x4 waves).
+#: The GEMM1 tile n / k every stage-1 variant embeds (M256 uses 2x2 waves;
+#: smaller M tiles use 1x4).
 _S1F_TILE_N, _S1F_TILE_K = 256, 256
 #: Stage-1 variants by GEMM1 tile_m: (pipeline buffers, CTAs per CU).
 #:
