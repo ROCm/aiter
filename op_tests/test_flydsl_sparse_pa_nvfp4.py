@@ -5,7 +5,7 @@
 
 The kernel takes the selector's output directly: ``topk_idx [Hkv, rows, 16]`` logical
 128-token block ids plus the request block table; K / V pages are the single-buffer
-NVFP4 page (see ``kernels/minimax_m3_sparse_pa_nvfp4_common.py``).
+NVFP4 page (see ``kernels/sparse_pa_nvfp4_common.py``).
 
 Reference: an fp64 torch attention over K / V = e2m1 x e4m3 scale x global scale taken
 from the token-major codes and scale bytes the pages were *built from* -- nothing is
@@ -14,7 +14,7 @@ kernel does the products exactly in f16, so what is left against the reference i
 bf16 output (relative L2 of ~1.7e-3) and the f16 Q / P.
 
 Run (exits nonzero if any check fails):
-    python op_tests/test_flydsl_minimax_m3_sparse_pa_nvfp4.py [--case SUBSTR ...] [--perf]
+    python op_tests/test_flydsl_sparse_pa_nvfp4.py [--case SUBSTR ...] [--perf]
 """
 
 import argparse
@@ -28,8 +28,8 @@ import torch
 
 import aiter
 from aiter.jit.utils.chip_info import get_gfx_runtime
-from aiter.ops.flydsl.kernels.minimax_m3_sparse_pa_nvfp4_decode import (
-    minimax_m3_sparse_pa_nvfp4_decode,
+from aiter.ops.flydsl.kernels.sparse_pa_nvfp4_decode import (
+    sparse_pa_nvfp4_decode,
 )
 from aiter.test_common import benchmark, checkAllclose, run_perftest
 
@@ -229,7 +229,7 @@ def rel_l2(out, ref):
 
 def decode_call(c, splits=None, **kw):
     out = torch.empty_like(c["q"])
-    return minimax_m3_sparse_pa_nvfp4_decode(
+    return sparse_pa_nvfp4_decode(
         c["q"],
         c["cache"],
         c["topk"],
@@ -390,7 +390,7 @@ def refusals():
             "seq_lens": c["seq_lens"], "xcds": None, **kw,
         }  # fmt: skip
         try:
-            minimax_m3_sparse_pa_nvfp4_decode(
+            sparse_pa_nvfp4_decode(
                 a["q"], a["cache"], c["topk"], a["bt"], a["seq_lens"], a["sm_scale"],
                 None, a["k_scale"], a["v_scale"], query_len=1, splits=a["splits"],
                 xcds=a["xcds"],
@@ -454,7 +454,7 @@ def test_decode_perf(rows, query_len, hkv, group, ctx):
     out = torch.empty_like(q)
     ks = vs = torch.ones(1, dtype=torch.float32, device="cuda")
     _, us = run_perftest(
-        minimax_m3_sparse_pa_nvfp4_decode,
+        sparse_pa_nvfp4_decode,
         q,
         pool,
         topk,

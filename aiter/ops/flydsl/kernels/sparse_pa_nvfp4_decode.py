@@ -33,7 +33,7 @@ from flydsl.expr.typing import T
 from flydsl.expr.typing import Vector as Vec
 
 from aiter.ops.flydsl.kernels import buffer_ops
-from aiter.ops.flydsl.kernels.minimax_m3_sparse_pa_nvfp4_common import (
+from aiter.ops.flydsl.kernels.sparse_pa_nvfp4_common import (
     BLK,
     DATA_B,
     HEAD_B,
@@ -654,7 +654,7 @@ def _unit_scale(device_index: int) -> torch.Tensor:
 def _split_buffers(device_index: int):
     """Split partials and tickets, one set per device; allocated on first use, so warm up
     before capture. Launches that split a row share them, so they must not overlap on
-    different streams of one device (see ``minimax_m3_sparse_pa_nvfp4_decode``)."""
+    different streams of one device (see ``sparse_pa_nvfp4_decode``)."""
     dev = f"cuda:{device_index}"
     part = torch.empty(
         (MAX_SPLIT_ROWS + 1) * MAX_SPLITS * 64 * PART_F, dtype=torch.float32, device=dev
@@ -711,7 +711,7 @@ def decode_late_v(workgroups: int, cus: int) -> bool:
     return 3 * cus <= 2 * workgroups <= 2 * _WG_PER_CU * cus
 
 
-def minimax_m3_sparse_pa_nvfp4_decode(
+def sparse_pa_nvfp4_decode(
     q: torch.Tensor,  # [rows, Hq, 128] bf16
     kv_cache: torch.Tensor,  # uint8 pages, [pages, 2 * Hkv * 9216] (any view with page stride)
     topk_idx: torch.Tensor,  # [Hkv, >= rows, topk] int32 logical blocks, -1 = none
