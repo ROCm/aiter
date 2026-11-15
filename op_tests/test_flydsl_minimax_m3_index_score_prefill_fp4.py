@@ -15,10 +15,12 @@ test. e8m0 bytes 0 and 255 are outside its contract and are not generated.
 
 The NVFP4 cache (`score_prefill_flydsl_nvfp4`: e2m1 data, one e4m3 scale per 16
 elements, 72 B per token, no per-tensor scale) is checked against a torch oracle that
-dequantizes the cache itself (K = e2m1 x scale, either exact or rounded to e4m3 like
-vLLM's NVFP4 scorer), on data whose fp32 partial sums are exact so the comparison is
+dequantizes the cache itself (K = e2m1 x scale, either exact or rounded to e4m3: RNE,
+saturating at 448), on data whose fp32 partial sums are exact so the comparison is
 bit for bit whatever the accumulation order. There is no NVFP4 write kernel in this
-change; the pages are written by a torch reference quantizer in this file.
+change; the pages are written by the torch reference quantizer of the decode test
+(`quantize_nvfp4` in test_flydsl_minimax_m3_index_score.py): scale = RNE e4m3 of
+min(amax * RN(1/6), 448) per 16 elements, then each element * (1 / scale) -> RNE e2m1.
 
 Run (exits nonzero if any check fails):
     python op_tests/test_flydsl_minimax_m3_index_score_prefill_fp4.py [--case SUBSTR ...]
@@ -26,7 +28,10 @@ Run (exits nonzero if any check fails):
 
 import argparse
 import itertools
+import os
 import sys
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import pandas as pd
 import torch
@@ -44,12 +49,16 @@ from aiter.ops.flydsl.kernels.minimax_m3_index_score_prefill import (
     alloc_score as prefill_alloc_score,
 )
 from aiter.ops.flydsl.kernels.minimax_m3_index_score_prefill import (
+    exact_geometry as prefill_exact_geometry,
+)
+from aiter.ops.flydsl.kernels.minimax_m3_index_score_prefill import (
     geometry as prefill_geometry,
 )
 from aiter.ops.msa_block_select import pa_sparse_block_score_prefill
 from aiter.ops.quant import per_1x32_f4_quant
 from aiter.test_common import benchmark, checkAllclose, run_perftest
 from aiter.utility import fp4_utils
+from op_tests.test_flydsl_minimax_m3_index_score import nvfp4_cache_of, pack_nvfp4
 
 P = 128  # page size and head dim: the public operator contract
 D = 128
@@ -350,6 +359,50 @@ def check_prefill_geometry_arms_are_exhaustive():
         for batch, q_len, ctx in GEOM_SHAPES
     }
     assert covered == reachable, f"uncovered: {sorted(reachable - covered)}"
+    check_nvfp4_geometry_arms_are_covered(dev)
+
+
+def check_nvfp4_geometry_arms_are_covered(dev):
+    """The NVFP4-only arms -- the 512-row DMA tile (`geometry(..., xwide=True)`) and
+    `exact_geometry` -- each have a case. The xwide thresholds keep it off the small
+    shapes the tests use, so its cases force them (`_with_xwide`) and the arms they
+    reach are compared with the ones the real thresholds reach."""
+
+    def key(g):
+        return (g["tile_q"], g["waves"], g["pages_per_wave"], g["m32"], g.get("dma", 0))
+
+    def blocks(seqs):
+        return max(-(-L // P) for L in seqs)
+
+    reach_x, reach_e = set(), set()
+    for ctx, q_len, batch, heads in itertools.product(
+        (256, 1000, 2048, 5000, 8192, 16384, 32768, 131072, 524288),
+        (128, 130, 256, 512, 777, 1024, 2048, 4096),
+        (1, 2, 3, 4, 8),
+        (1, 4),
+    ):
+        if q_len <= ctx:
+            mb = -(-ctx // P)
+            g = prefill_geometry(q_len, batch, heads, mb, dev, xwide=True)
+            if g.get("dma"):  # the other arms are the MXFP4 ones checked above
+                reach_x.add(key(g))
+            reach_e.add(key(prefill_exact_geometry(q_len, batch, heads, mb, dev)))
+    cover_x, cover_e = set(), set()
+    with _with_xwide():
+        for (qls, seqs), heads, ppw in itertools.product(WIDE, (1, 4), WIDE_PPW):
+            g = prefill_geometry(max(qls), len(qls), heads, blocks(seqs), dev, True)
+            cover_x.add(key({**g, "pages_per_wave": ppw or g["pages_per_wave"]}))
+    for batch, q_len, ctx in GEOM_SHAPES:  # check_prefill_nvfp4_exact_every_shape
+        cover_e.add(key(prefill_exact_geometry(q_len, batch, 1, -(-ctx // P), dev)))
+    for (qls, seqs), heads in itertools.product(SHORT_TAILS, (1, 4)):
+        g = prefill_exact_geometry(max(qls), len(qls), heads, blocks(seqs), dev)
+        cover_e.add(key(g))  # check_prefill_nvfp4_exact_tails
+    for (qls, seqs), heads, ppw in itertools.product(WIDE, (1, 4), WIDE_PPW):
+        g = prefill_exact_geometry(max(qls), len(qls), heads, blocks(seqs), dev)
+        # check_prefill_nvfp4_exact_wide forces the 256-row tile and the ppw
+        cover_e.add(key({**g, "tile_q": 256, "pages_per_wave": ppw or 2}))
+    assert reach_x <= cover_x, f"xwide arms without a case: {sorted(reach_x - cover_x)}"
+    assert reach_e <= cover_e, f"exact arms without a case: {sorted(reach_e - cover_e)}"
 
 
 def check_prefill_typed_views(qdt):
@@ -543,81 +596,23 @@ def check_prefill_rejections():
 # A token is 64 B of e2m1 plus 8 e4m3 scale bytes (one per 16 elements, no
 # per-tensor scale). K is e4m3_rn_satfinite(e2m1 * scale), which fits an fp8 cache
 # exactly, so aiter's own fp8 judges (`aiter_scores`) score the same values; and an
-# independent torch oracle scores them in fp32. The quantizer is test-side and has
-# vLLM's `_quant4` numerics.
+# independent torch oracle scores them in fp32. The quantizer and the dequantized
+# references are the decode test's (`quantize_nvfp4`, `pack_nvfp4`), not a copy.
 #
 # Two kinds of comparison, because the fp8 MFMA's internal accumulation depends on
 # which k elements share an instruction: on exact-sum data (every partial sum exact
 # in fp32) the oracle must be matched to the BIT whatever the partition; on general
-# data the judge is matched to a few fp32 ulps (the kernel's partition is vLLM's,
-# not the fp8 scorer's -- see `_k32_chunk`).
+# data the judge is matched to a few fp32 ulps (the kernel's partition is not the fp8
+# scorer's -- see `_k32_chunk`).
 # ==========================================================================
-E2M1 = (0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0)
-E4M3_MAX = 448.0
-RCP6_F32 = 0x3E2AAAAB
-NV_ROUNDS = ["e4m3"]
-
-
-def e2m1_encode(a):
-    """fp32 -> 4-bit e2m1 codes, round to nearest even (ties to the even code)."""
-    m = a.abs()
-    code = (
-        (m > 0.25).int()
-        + (m >= 0.75).int()
-        + (m > 1.25).int()
-        + (m >= 1.75).int()
-        + (m > 2.5).int()
-        + (m >= 3.5).int()
-        + (m > 5.0).int()
-    )
-    return code + 8 * (a < 0).int()
-
-
-def nv_product(data, scale):
-    """e2m1 data u8 [..., 64] x e4m3 scale u8 [..., 8] -> exact fp32 [..., 128]."""
-    lut = torch.tensor(E2M1, device=data.device)
-    codes = torch.stack([(data & 0xF).long(), (data >> 4).long()], -1)
-    codes = codes.reshape(*data.shape[:-1], D)
-    val = lut[codes & 7] * (1 - 2 * (codes >> 3).float())
-    return val * scale.view(dtypes.fp8).float().repeat_interleave(16, dim=-1)
-
-
-def nv_pack(codes, scale_bytes):
-    """codes int [pages,128,128], scale u8 [pages,128,8] -> (data, scale, exact, e4m3)."""
-    pair = codes.reshape(*codes.shape[:-1], D // 2, 2)
-    data = (pair[..., 0] | (pair[..., 1] << 4)).to(torch.uint8)
-    prod = nv_product(data, scale_bytes)
-    e4m3 = prod.clamp(-E4M3_MAX, E4M3_MAX).to(dtypes.fp8).float()
-    return data, scale_bytes, prod, e4m3
-
-
-def nv_quantize(k):
-    """bf16 [pages,128,128] -> (data, scale, exact fp32, e4m3 fp32), vLLM `_quant4`
-    numerics: scale = RNE e4m3 of min(amax * RN(1/6), 448) per 16 elements, elements
-    * (1 / decoded scale) -> RNE e2m1."""
-    x = k.float().reshape(*k.shape[:-1], D // 16, 16)
-    rcp6 = torch.tensor(RCP6_F32, dtype=torch.int32).view(torch.float32).item()
-    sf = (x.abs().amax(-1) * rcp6).clamp(max=E4M3_MAX).to(dtypes.fp8)
-    sv = sf.float().unsqueeze(-1)
-    quant = torch.where(sv != 0, 1.0 / sv, torch.zeros_like(sv))
-    return nv_pack(
-        e2m1_encode(x * quant).reshape(*k.shape[:-1], D), sf.view(torch.uint8)
-    )
-
-
-def nv_cache_of(cache8):
-    outs = [[], [], [], []]
-    for i in range(0, cache8.shape[0], QCHUNK):
-        for o, t in zip(outs, nv_quantize(cache8[i : i + QCHUNK].to(torch.bfloat16))):
-            o.append(t)
-    return tuple(torch.cat(o) for o in outs)
 
 
 def nv_oracle(c, deq):
-    """[H, total_q, mb] block scores of `c` over the dequantized cache `deq` (fp32
-    [pages,128,D]), in fp32: max over a page's tokens visible to the row, -inf where
+    """[H, total_q, mb] block scores of `c` over the dequantized cache `deq`
+    ([pages,128,D]), in fp32: max over a page's tokens visible to the row, -inf where
     the page is not visible at all."""
     H, total_q = c["q8"].shape[1], c["q8"].shape[0]
+    deq = deq.float()  # the shared quantizer hands back bf16, exact for these values
     out = torch.full((H, total_q, c["mb"]), -float("inf"), device="cuda")
     cu, seq, pre = c["cu"].tolist(), c["seq"].tolist(), c["prefix"].tolist()
     for b in range(len(cu) - 1):
@@ -639,7 +634,7 @@ def nv_oracle(c, deq):
 def nv_case(qls, seqs, heads=1, seed=0, exact_sum=False):
     """A ragged prefill case over an NVFP4 cache. Request b has qls[b] new rows on
     seqs[b] tokens (prefix = the rest). `exact_sum` makes every partial sum exact in
-    fp32 (|Q| and every scale in [0.5, 2), see the decode test) so a kernel must match
+    fp32 (|Q| and every scale in [0.5, 3.75], see the decode test) so a kernel must match
     the oracle to the bit whatever the accumulation order."""
     dev = "cuda"
     g = torch.Generator(device=dev).manual_seed(seed)
@@ -652,13 +647,13 @@ def nv_case(qls, seqs, heads=1, seed=0, exact_sum=False):
         q8 = qb.to(torch.uint8).view(dtypes.fp8)
         codes = torch.randint(0, 16, (pages, P, D), device=dev, generator=g)
         sb = torch.randint(0x30, 0x48, (pages, P, 8), device=dev, generator=g)
-        kd, ks, exact, e4m3 = nv_pack(codes, sb.to(torch.uint8))
+        kd, ks, exact, e4m3 = pack_nvfp4(codes, sb.to(torch.uint8))
     else:
         q8 = (torch.randn(total_q, heads, D, device=dev, generator=g) / 4).to(
             dtypes.fp8
         )
         cache8 = (torch.randn(pages, P, D, device=dev, generator=g) / 4).to(dtypes.fp8)
-        kd, ks, exact, e4m3 = nv_cache_of(cache8)
+        kd, ks, exact, e4m3 = nvfp4_cache_of(cache8)
     bt = torch.randperm(pages, device=dev, dtype=torch.int32, generator=g).view(B, mb)
     seq = torch.tensor(seqs, dtype=torch.int32, device=dev)
     ql = torch.tensor(qls, dtype=torch.int32, device=dev)
@@ -783,9 +778,10 @@ def check_prefill_nvfp4_bit_exact(qls, seqs, heads, qdt, k_round, m32=None):
 def check_prefill_nvfp4_matches_aiter(shape, qdt):
     """Random data against aiter's HIP scorer on the same e4m3 values, fp8 cache. Equal
     to a few fp32 ulps, not the bit: the fp8 MFMA sums differently depending on which
-    k elements one instruction holds, and this kernel uses vLLM's grouping."""
+    k elements one instruction holds, and the NVFP4 kernel's grouping is its own (see
+    `_k32_chunk`)."""
     c = make_prefill_case(*shape)
-    kd, ks, _, e4m3 = nv_cache_of(c["cache"])
+    kd, ks, _, e4m3 = nvfp4_cache_of(c["cache"])
     c = dict(c, cache=e4m3.to(dtypes.fp8))
     ref, live = aiter_scores(c)
     cn = dict(c, kd=kd, ks=ks)
@@ -823,6 +819,21 @@ def prefill_tail_cases():
     ]
 
 
+# A page tail, a tile tail and an empty request: the NVFP4 tail / exact-tail cases.
+SHORT_TAILS = [prefill_tail_cases()[i] for i in (3, 5, 15)]
+# Tail tiles of the 512-row DMA tile and the forced 256-row exact tile, the last with
+# an empty request between two short ones (no other DMA case has a request with ql = 0).
+WIDE = [
+    ([513], [513]),
+    ([1100, 1, 600], [5000, 4099, 2500]),
+    ([5, 0, 7], [300, 300, 4099]),
+]
+WIDE_PPW = (
+    None,
+    4,
+)  # pages per wave forced on the WIDE cases; None keeps the selector's
+
+
 def check_prefill_nvfp4_tails(qls, seqs, heads, qdt, m32=None):
     check_prefill_nvfp4_bit_exact(qls, seqs, heads, qdt, "e4m3", m32)
 
@@ -851,7 +862,7 @@ def check_prefill_nvfp4_exact_wide(qls, seqs, heads, qdt, ppw):
 
 
 def check_prefill_nvfp4_exact_tails(qls, seqs, heads, qdt):
-    """The exact arm (bf16 MFMA, K = e2m1 * scale unrounded) on the same lengths."""
+    """The exact arm (f16 MFMA, K = e2m1 * scale unrounded) on the same lengths."""
     check_prefill_nvfp4_bit_exact(qls, seqs, heads, qdt, "exact")
 
 
@@ -865,7 +876,7 @@ def check_prefill_nvfp4_exact_random(shape, qdt):
     is the MFMA's, so allow a few fp32 ulps -- and require the e4m3 arm to differ (it
     scores rounded K), so a kernel that silently fell back to it fails here."""
     c = make_prefill_case(*shape)
-    kd, ks, exact, e4m3 = nv_cache_of(c["cache"])
+    kd, ks, exact, e4m3 = nvfp4_cache_of(c["cache"])
     cn = dict(c, kd=kd, ks=ks, exact=exact, e4m3=e4m3)
     ref = nv_oracle(cn, exact)
     live = torch.isfinite(ref)
@@ -896,7 +907,7 @@ def check_prefill_nvfp4_single_region_views_and_typed_scale():
 
 
 def check_prefill_nvfp4_default_k_round_is_e4m3():
-    """Leaving `k_round` out scores like `k_round="e4m3"` (the vLLM-identical numerics)."""
+    """Leaving `k_round` out scores like `k_round="e4m3"`."""
     c = nv_case([300, 200], [1000, 700], 2, exact_sum=True)
     heads, rows = c["q8"].shape[1], c["q8"].shape[0]
     out = prefill_alloc_score(rows, heads, c["mb"], "cuda")
@@ -1129,19 +1140,14 @@ def build_cases():
         )
     )
     cases.append(("rejections", check_prefill_rejections, ()))
-    # NVFP4, a minimal matrix (the full regression matrix lives outside this file):
+    # NVFP4, a minimal matrix:
     # exact-sum data to the bit against the torch oracle for both k_round values, on
     # tile and page boundaries, ragged and empty requests, H = 1/4, both Q dtypes, the
     # 16- and 32-wide MFMA, the 512-row DMA tile and the 8-wave tile; random data
     # against aiter's fp8 scorer.
-    tails = prefill_tail_cases()
-    short = [
-        tails[3],
-        tails[5],
-        tails[15],
-    ]  # a page tail, a tile tail, an empty request
-    wide = [([513], [513]), ([1100, 1, 600], [5000, 4099, 2500])]  # 512-row tail tiles
-    for (qls, seqs), heads, qdt, m32 in itertools.product(short, (1, 4), QDTS, (0, 1)):
+    for (qls, seqs), heads, qdt, m32 in itertools.product(
+        SHORT_TAILS, (1, 4), QDTS, (0, 1)
+    ):
         name = f"q{'_'.join(map(str, qls))}_seq{'_'.join(map(str, seqs))}_H{heads}_{qdt}_m32{m32}"
         cases.append(
             (
@@ -1150,9 +1156,7 @@ def build_cases():
                 (qls, seqs, heads, qdt, m32),
             )
         )
-    for (qls, seqs), heads, qdt, ppw in itertools.product(
-        wide, (1, 4), QDTS, (None, 4)
-    ):
+    for (qls, seqs), heads, qdt, ppw in itertools.product(WIDE, (1, 4), QDTS, WIDE_PPW):
         name = f"q{'_'.join(map(str, qls))}_seq{'_'.join(map(str, seqs))}_H{heads}_{qdt}_ppw{ppw}"
         cases.append(
             (
@@ -1168,7 +1172,7 @@ def build_cases():
                 (qls, seqs, heads, qdt, ppw or 2),
             )
         )
-    for (qls, seqs), heads, qdt in itertools.product(short, (1, 4), QDTS):
+    for (qls, seqs), heads, qdt in itertools.product(SHORT_TAILS, (1, 4), QDTS):
         name = (
             f"q{'_'.join(map(str, qls))}_seq{'_'.join(map(str, seqs))}_H{heads}_{qdt}"
         )
@@ -1188,6 +1192,8 @@ def build_cases():
                 (shape, "e4m3", None),
             )
         )
+    for shape in GEOM_SHAPES:  # every arm `exact_geometry` can reach
+        name = f"b{shape[0]}_q{shape[1]}_ctx{shape[2]}"
         cases.append(
             (
                 f"nvfp4_exact_every_shape_{name}",
