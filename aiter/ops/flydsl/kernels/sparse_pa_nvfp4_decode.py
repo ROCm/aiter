@@ -156,6 +156,16 @@ def _dq4(word, scales):
     )
 
 
+def _scales_up_to(word, h, g, lim):
+    """``word``, 4 e4m3 scale bytes of keys 8 g + 4 h + b, with the bytes of the keys
+    past ``lim`` zeroed."""
+    keep = fx.Int32(0)
+    for b in range_constexpr(4):
+        byte = (0xFF << 8 * b) - (1 << 32 if b == 3 else 0)  # as a signed i32
+        keep = keep | (8 * g + 4 * h + b <= lim).select(fx.Int32(byte), fx.Int32(0))
+    return word & keep
+
+
 def compile_decode(
     splits: int = 1,
     topk: int = 16,
@@ -216,7 +226,6 @@ def compile_decode(
         w = fx.Int32(fx.rocdl.readfirstlane(T.i32, tx // 64))
         n, g = lane % 16, lane // 16
         topk = global_i32_ptr(arg_topk)
-        bt = global_i32_ptr(arg_bt)
         seq_p = global_i32_ptr(arg_seq)
         c = f32_c * fx.Float32(global_f32_ptr(arg_ks)[0])
         v_scale = fx.Float32(global_f32_ptr(arg_vs)[0])
@@ -255,7 +264,10 @@ def compile_decode(
             ]
         )
         ok = slot_ok & (blk >= 0) & (blk <= self_blk)
-        page = fx.Int32(bt[req * i32_bt_s + ok.select(blk, fx.Int32(0))])
+        # A slot that is not valid does not read the table (it may have no columns): its
+        # lane loads the first request length instead, which is discarded.
+        bt_at = arg_bt + fx.Int64(req * i32_bt_s + ok.select(blk, fx.Int32(0))) * 4
+        page = fx.Int32(global_i32_ptr(ok.select(bt_at, arg_seq))[0])
         page = ok.select(page, fx.Int32(-1))
         blk = ok.select(blk, fx.Int32(-1))
         vmask = fx.Int64(fx.rocdl.ballot(T.i64, ok))
@@ -324,11 +336,18 @@ def compile_decode(
             if after_qk is not None:
                 after_qk()
             diag = cur_blk == self_blk
+            v_scl = [raw[17], raw[18]]
             # Only the tail block and the empty slots of the unrolled tail need masking.
             if diag | (cur_blk < 0):
                 a = [
                     ((cur_blk < 0) | (diag & (key_off[i] > lim))).select(neg_inf, a[i])
                     for i in range_constexpr(8)
+                ]
+                # Masking P is not enough: the keys past the row's position may be unwritten
+                # and hold a NaN V scale (e4m3 0x7f), and 0 * NaN is NaN in the PV MFMA.
+                # Zero the scale bytes of those keys (byte b of dword h is key 8 g + 4 h + b).
+                v_scl = [
+                    _scales_up_to(raw[17 + h], h, g, lim) for h in range_constexpr(2)
                 ]
             mx = a[0]
             for i in range_constexpr(1, 8):
@@ -352,8 +371,8 @@ def compile_decode(
             vs = []
             for h in range_constexpr(2):
                 vs += [
-                    cvt_fp8x2_f16(raw[17 + h], False),
-                    cvt_fp8x2_f16(raw[17 + h], True),
+                    cvt_fp8x2_f16(v_scl[h], False),
+                    cvt_fp8x2_f16(v_scl[h], True),
                 ]
             o_t = [
                 mfma_f16(_dq4(raw[9 + dt], vs), pf, o_t[dt])

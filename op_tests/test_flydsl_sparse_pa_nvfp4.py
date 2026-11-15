@@ -121,6 +121,7 @@ def make_case(
     fill=TOPK,  # valid ids per row (<= TOPK incl. the tail)
     junk=False,  # sprinkle invalid ids (-1 in the middle, ids past the tail, negatives)
     dup=0,  # repeat the first `dup` ids of each row in the free slots (out of contract)
+    poison=False,  # NaN (e4m3 0x7f) scale bytes in the unwritten tail of every request's last page
     k_scale=0.05,
     v_scale=0.03,
     device="cuda",
@@ -140,6 +141,11 @@ def make_case(
     v = (torch.randn(n_pages, BLK, hkv, D, generator=g) * amp).bfloat16()
     kc, ks = quantize_nvfp4(k.to(device), k_scale)
     vc, vs = quantize_nvfp4(v.to(device), v_scale)
+    if poison:
+        for r in range(reqs):
+            page = int(bt[r, nblk[r] - 1])
+            used = seq_lens[r] - (nblk[r] - 1) * BLK
+            ks[page, used:] = vs[page, used:] = 0x7F
     cache = pack_pages(kc, ks, vc, vs)
     rows = sum(q_lens)
     row_req = torch.empty(rows, dtype=torch.int32)
@@ -424,12 +430,72 @@ def padding_rows():
     return bad
 
 
+def padding_empty_table():
+    """A padding-only call (length 0, every slot -1) with an empty block table reads no table
+    entry: the table is not touched when no slot is valid."""
+    bad = 0
+    c = make_case([500], [1], 1, 16, seed=5)
+    topk = torch.full_like(c["topk"], -1)
+    bt = torch.zeros(1, 0, dtype=torch.int32, device="cuda")
+    zero_len = torch.zeros(1, dtype=torch.int32, device="cuda")
+    for s, x in itertools.product((None, 1, 4), (0, 8)):
+        out = torch.full_like(c["q"], 1.0)
+        sparse_pa_nvfp4_decode(
+            c["q"], c["cache"], topk, bt, zero_len, SM_SCALE, out,
+            c["k_scale"], c["v_scale"], splits=s, xcds=x,
+        )  # fmt: skip
+        if out.abs().max().item() != 0:
+            bad += 1
+            print(f"empty block_table: padding row not zero (splits={s} xcds={x})")
+    return bad
+
+
+# (name, seq_lens, q_lens, hkv, group, kwargs); the unwritten tail of the last page holds NaN scales
+POISON_CASES = [
+    ("poison_one_token", [1, 2, 5, 127], [1] * 4, 1, 16, {}),
+    ("poison_tail_h4", [129, 300, 1000, 5000], [1] * 4, 4, 16, {}),
+    ("poison_mtp4", [5, 130, 900, 4097], [4] * 4, 1, 16, {}),
+    ("poison_g8_tail_only", [1, 700], [1, 1], 1, 8, {"fill": 1}),
+]
+
+
+def poisoned_tail():
+    """Keys past a request's length are masked out of P, but 0 * NaN is NaN in the PV MFMA:
+    a recycled page may hold a NaN V scale there (e4m3 0x7f), and the kernel must zero it.
+    """
+    bad = 0
+    for name, seq_lens, q_lens, hkv, group, kw in POISON_CASES:
+        c = make_case(
+            seq_lens, q_lens, hkv, group, seed=zlib.crc32(name.encode()) % 1000,
+            poison=True, **kw,
+        )  # fmt: skip
+        ref = run_torch(c)
+        for s, lv in ((None, None), (1, False), (1, True), (4, None)):
+            out = decode_call(c, s, late_v=lv)
+            bad += int(not check(f"decode {name} splits={s} late_v={lv}", out, ref)[0])
+    return bad
+
+
 def refusals():
     """Arguments the kernels cannot read correctly are refused before launch (ValueError,
     which ``python -O`` does not strip), each with its own message."""
     bad = 0
     c = make_case([500, 700], [1, 1], 1, 16, seed=5)
     cache, ks = c["cache"], c["k_scale"]
+    pages, page_b = cache.shape
+    # The kernel loads Q, the output and the pages in dwords: their addresses and the page
+    # stride must be 4-byte aligned (a padded page stays fine).
+    padded = torch.zeros(pages, page_b + 1, dtype=torch.uint8, device="cuda")
+    padded[:, :page_b] = cache
+    shifted = torch.zeros(pages, page_b + 4, dtype=torch.uint8, device="cuda")
+    shifted[:, 1 : page_b + 1] = cache
+    odd_q = torch.empty(c["q"].numel() + 1, dtype=torch.bfloat16, device="cuda")[1:]
+    odd_q = odd_q.view_as(c["q"])
+    odd_q.copy_(c["q"])
+    # Element offsets (rows x stride) are 32-bit: views reaching past 2**31 elements are
+    # refused (the 8 GiB buffer below is never read; the refusal comes first).
+    c2 = make_case([500, 700], [1, 1], 2, 8, seed=5)
+    wide = torch.empty(2**31 + 64, dtype=torch.int32, device="cuda")
     shared = [
         ("strided cache view", {"cache": cache[:, ::2]}, "unit last stride"),
         ("cache too narrow", {"cache": cache[:, :-1]}, "smaller than its payload"),
@@ -444,6 +510,30 @@ def refusals():
         ("sm_scale 0", {"sm_scale": 0.0}, "sm_scale"),
         ("sm_scale nan", {"sm_scale": float("nan")}, "sm_scale"),
         ("cpu q", {"q": c["q"].cpu()}, "CUDA"),
+        ("page stride not 4-aligned", {"cache": padded[:, :page_b]}, "4-byte"),
+        ("cache base not 4-aligned", {"cache": shifted[:, 1 : page_b + 1]}, "4-byte"),
+        ("q base not 4-aligned", {"q": odd_q}, "4-byte"),
+        ("out base not 4-aligned", {"out": odd_q}, "4-byte"),
+        (
+            "topk_idx offsets past 2**31",
+            {
+                "q": c2["q"],
+                "cache": c2["cache"],
+                "bt": c2["bt"],
+                "topk": wide.as_strided((2, 2, 16), (2**31, 16, 1)),
+            },
+            "topk_idx element offsets",
+        ),
+        (
+            "block_table offsets past 2**31",
+            {
+                "q": c2["q"],
+                "cache": c2["cache"],
+                "topk": c2["topk"],
+                "bt": wide.as_strided((2, 4), (2**31, 1)),
+            },
+            "block_table element offsets",
+        ),
         (
             "q over 2 GiB",
             {"q": torch.empty(2**19 + 1, 16, D, dtype=torch.bfloat16, device="cuda")},
@@ -466,14 +556,14 @@ def refusals():
     def decode(a):
         sparse_pa_nvfp4_decode(
             a["q"], a["cache"], a["topk"], a["bt"], a["seq_lens"], a["sm_scale"],
-            None, a["k_scale"], a["v_scale"], query_len=1, splits=a.get("splits"),
+            a.get("out"), a["k_scale"], a["v_scale"], query_len=1, splits=a.get("splits"),
             xcds=a.get("xcds"),
         )  # fmt: skip
 
     def prefill(a):
         sparse_pa_nvfp4_prefill(
             a["q"], a["cache"], a["topk"], a["bt"], c["row_req"], c["row_kv"],
-            a["sm_scale"], None, a["k_scale"], a["v_scale"], tq=a.get("tq"),
+            a["sm_scale"], a.get("out"), a["k_scale"], a["v_scale"], tq=a.get("tq"),
             rounds=a.get("rounds"),
         )  # fmt: skip
 
@@ -497,6 +587,12 @@ def refusals():
                 print(f"refusal: {kind} {name} was accepted")
             bad += 1
     decode_call(c, 16)  # the largest split count still launches
+    # An aligned padded page is accepted and reads the same data.
+    pad4 = torch.zeros(pages, page_b + 4, dtype=torch.uint8, device="cuda")
+    pad4[:, :page_b] = cache
+    if not torch.equal(decode_call(dict(c, cache=pad4[:, :page_b])), decode_call(c)):
+        print("padded page (stride +4) gives a different result")
+        bad += 1
     return bad
 
 
@@ -693,6 +789,8 @@ def main(argv=None):
     failed += decode_xcd_grid_agree()
     failed += decode_late_v_agree()
     failed += padding_rows()
+    failed += padding_empty_table()
+    failed += poisoned_tail()
     failed += refusals()
     if args.perf:
         perf = [

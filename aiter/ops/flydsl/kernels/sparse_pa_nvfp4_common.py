@@ -145,6 +145,26 @@ def check_operands(q, out, kv_cache, topk_idx, block_table):
         block_table.dtype == torch.int32 and block_table.stride(-1) == 1,
         "block_table must be int32 with a unit last stride",
     )
+    require(block_table.dim() == 2, "block_table 2-D [reqs, max_blocks]")
+    # The topk_idx and block_table element offsets are 32-bit in the kernels.
+    require(
+        (hkv - 1) * topk_idx.stride(0)
+        + (rows - 1) * topk_idx.stride(1)
+        + topk_idx.shape[2]
+        <= 2**31,
+        "topk_idx element offsets (head / row strides) must stay below 2**31",
+    )
+    require(
+        (block_table.shape[0] - 1) * block_table.stride(0) + block_table.shape[1]
+        <= 2**31,
+        "block_table element offsets (request stride) must stay below 2**31",
+    )
+    # Q, out and the pages are read and written in dwords through 4-byte-aligned buffers.
+    require(
+        all(t.data_ptr() % 4 == 0 for t in (q, out, kv_cache))
+        and kv_cache.stride(0) % 4 == 0,
+        "q, out and kv_cache must start on a 4-byte boundary, with a 4-byte-aligned page stride",
+    )
     for t in (out, kv_cache, topk_idx, block_table):
         require(t.device == q.device, "all operands must be on q's device")
     return group
