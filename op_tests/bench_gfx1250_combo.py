@@ -42,10 +42,15 @@ Run from the aiter repo root so `op_tests/` siblings import cleanly:
     python op_tests/bench_gfx1250_combo.py --dsv4 --ops mori_ep   # MORI EPv2 dispatch/combine
     python op_tests/bench_gfx1250_combo.py --dsv4 --ops mega_moe  # base + Mega, 4 GPUs
 
-    # DeepSeek-V4.1 operators at the DSv4.1 workload's shapes.
+    # DeepSeek-V4.1-Flash operators, one rank of its DEP4 recipe (EP4 + DP attention).
     python op_tests/bench_gfx1250_combo.py --dsv41                # all DSv4.1 ops
+    python op_tests/bench_gfx1250_combo.py --dsv41 --ops moe      # grouped MoE FC1/FC2 (96 experts, a4w4)
+    python op_tests/bench_gfx1250_combo.py --dsv41 --ops mega_moe # Mega MoE, default and recipe env, 4 GPUs
+    python op_tests/bench_gfx1250_combo.py --dsv41 --ops mla_v4_decode   # sparse MLA, H64 bf16 + v41_fp4
+    python op_tests/bench_gfx1250_combo.py --dsv41 --ops mla_v4_prefill  # same, prefill
     python op_tests/bench_gfx1250_combo.py --dsv41 --ops score_qk_fp4  # MXFP4 paged MQA logits (OPUS):
                                                                   # ratio-2 full layers + candidate layers
+    python op_tests/bench_gfx1250_combo.py --dsv41 --ops topk     # indexer top-512, stable, indices only
 
     # DeepSeek-R1 MLPerf operators, one rank of TP4 + DP attention + EP4.
     python op_tests/bench_gfx1250_combo.py --dsr1                 # all DSR1 ops
@@ -84,6 +89,11 @@ same thing to every op:
     score_qk_fp4    none: one fixed case a scenario (prefill, and decode at
                     two MTP depths), each the fastest of a realistic sweep;
                     see _SCORE_QK_FP4_CASES.
+    --dsv41 moe,    tokens/rank, powers of 2 up to 16384.
+    mega_moe
+    --dsv41         the same plus 384/768/1536 (decode at max-num-seqs
+    mla_v4_*        64/128/256, 6 tokens a sequence); decode stops at 2048.
+                    KV pools 512..65536 rows. See _DSV41_TOKENS, _DSV41_MLA_POOLS.
     --dsr1 moe,     per-GPU decode batch up to 16384, plus 1536, the recipe's
     mla_decode      max_num_seqs; MoE starts at 4, MLA decode at 1. See
                     _DSR1_MOE_BATCH and _DSR1_BATCH.
@@ -318,7 +328,9 @@ import subprocess
 import sys
 import tempfile
 import time
+import types
 import warnings
+from pathlib import Path
 
 warnings.filterwarnings("ignore")
 
@@ -633,6 +645,8 @@ _MLA_PREFILL_TOKENS = _tokens((1024, 2048, 4096, 8192, 16384))
 # MORI_SHMEM_HEAP_SIZE reaches. Keep the tier in the sweep so the limitation is
 # visible in the structured failure output rather than silently unmeasured.
 _MEGA_MOE_TOKENS = _tokens((1, 16, 32, 64, 128, 256, 512, 1024, 2048, 16384, 65536))
+# Seconds before one mega_moe case is stopped, JIT build included.
+_MEGA_MOE_TIMEOUT_S = 1200
 # What dispatch puts on the wire; combine is always bf16, so anything but bf16
 # is an asymmetric pair. fp4 is the wire DSv4 actually serves on -- the receiver
 # hands the payload straight to the expert GEMM as its A operand, and that GEMM
@@ -711,6 +725,54 @@ _MOE_CONFIG = {
     "activation": "silu",  # ActivationType.Silu
     "use_bias": False,
 }
+# DeepSeek-V4.1-Flash on its DEP4 recipe (serve_dep4.sh: -tp 4 with expert
+# parallel and DP attention, 16384-token prefill chunks, DSpark verifying 6
+# tokens a sequence). Tokens per rank: powers of 2 up to the chunk, plus decode
+# at max-num-seqs 64/128/256, i.e. 384/768/1536.
+_DSV41_TOKENS = _tokens(tuple(sorted({*(1 << i for i in range(15)), 384, 768, 1536})))
+# Decode never carries more than 256 x 6 tokens a rank.
+_DSV41_DECODE_TOKENS = tuple(t for t in _DSV41_TOKENS if t <= 2048)
+# MoE and Mega MoE sweep powers of 2 only.
+_DSV41_MOE_TOKENS = _tokens(tuple(1 << i for i in range(15)))
+# 384 routed experts over EP4; the recipe keeps the shared expert out of the MoE.
+_DSV41_MOE_CONFIG = {
+    "experts": 96,
+    "tokens": _DSV41_MOE_TOKENS,
+    "topk": 6,
+    "model_dim": 5120,
+    "inter_dim": 2304,
+    "activation": "silu",
+    "use_bias": False,
+}
+# What the recipe adds on top of bench_mega_moe.py's defaults; its
+# AITER_S1F_MAX_RECV is 4096, 6144 past max-num-seqs 128.
+_DSV41_MEGA_RECIPE_ENV = {
+    "MEGA_DISPATCH_WIRE": "fp4",
+    "AITER_MEGA_S1F": "1",
+    "AITER_S1F_BLOCK_RUNS": "4,2,8,8",
+    "AITER_S1F_ANY_TILE": "1",
+    "AITER_TDM_COMPACT_ROUTE_UPTO": "1024",
+    "AITER_TDM_COMPACT_ROUTE_SPEC": "384,16",
+    "AITER_MOE_LOC": "1",
+}
+# Indexer top-k as ATOM calls it: k=512, stable, indices only. Decode rows are
+# batch x 6 (DSpark) over a candidate layer's 2048 x 8 = 16384 columns and a
+# full layer's 40960-token context at ratio 2 (20480, score_qk_fp4's context).
+_DSV41_TOPK_K = 512
+_DSV41_TOPK_NEXT_N = 6
+_DSV41_TOPK_BATCH = _tokens((1, 2, 4, 8, 16, 32, 64, 128, 256))
+_DSV41_TOPK_WIDTHS = (16384, 20480)
+# V4.1-Flash keeps all 64 heads on each rank; its MLA runs bf16 or fp4 KV.
+_DSV41_MLA_CASES = (
+    ("bf16", ("opus", "triton")),
+    ("v41_fp4", ("asm",)),
+)
+# MLA KV: the compressed history (1K..64K tokens at ratio 2 or 1, so 512..64K
+# rows), index top-512 of it, plus the 128-token window.
+_DSV41_MLA_POOLS = tuple(
+    sorted({ctx // r for ctx in (1 << i for i in range(10, 17)) for r in (2, 1)})
+)
+_DSV41_MLA_TOPK = ("512",)
 # DeepSeek-R1 MLPerf decode batch per GPU. 1536 is the recipe's max_num_seqs
 # and largest captured graph, where steady-state decode sits.
 _DSR1_BATCH = _tokens(
@@ -1262,6 +1324,51 @@ def _pin_arch(env):
     return env
 
 
+# _ut_timing for a child UT: argv is [-c, this, ut.py, ut args...]. The patch
+# goes in once the UT itself imports aiter.test_common, so whatever the UT sets
+# before importing aiter still applies.
+_UT_TIMING_CHILD = r"""
+import importlib.abc
+import importlib.util
+import os
+import runpy
+import sys
+
+
+class _UtTiming(importlib.abc.MetaPathFinder):
+    def find_spec(self, name, path, target=None):
+        if name != "aiter.test_common":
+            return None
+        sys.meta_path.remove(self)
+        spec = importlib.util.find_spec(name)
+        exec_module = spec.loader.exec_module
+
+        def exec_and_patch(module):
+            exec_module(module)
+            orig = module.get_trace_perf
+
+            def get_trace_perf(*args, **kwargs):
+                os.environ["AITER_LOG_MORE"] = "1"
+                try:
+                    return orig(*args, **kwargs)
+                finally:
+                    os.environ["AITER_LOG_MORE"] = "0"
+
+            module.get_trace_perf = get_trace_perf
+            os.environ["AITER_LOG_MORE"] = "0"
+
+        spec.loader.exec_module = exec_and_patch
+        return spec
+
+
+sys.meta_path.insert(0, _UtTiming())
+script = sys.argv[1]
+sys.argv = sys.argv[1:]
+sys.path[0] = os.path.dirname(os.path.abspath(script))
+runpy.run_path(script, run_name="__main__")
+"""
+
+
 def _run_child(
     name,
     cmd,
@@ -1274,6 +1381,7 @@ def _run_child(
     smi=True,
     outer_smi=False,
     structured=False,
+    ut_timing=False,
 ):
     """Run a child UT with its output captured and surface only its results.
 
@@ -1281,7 +1389,11 @@ def _run_child(
     couple of thousand IR-dump lines, which buries the numbers. Capture all of
     it, echo what `extract` pulls out, and fall back to the tail of the output
     when the child fails or emits nothing recognisable.
+
+    ut_timing runs a `python ut.py ...` command under _UT_TIMING_CHILD.
     """
+    if ut_timing and not _LOG_MORE_FROM_CALLER:
+        cmd = [cmd[0], "-c", _UT_TIMING_CHILD, *cmd[1:]]
     extract = extract or _json_tables
     # Give calls without @benchmark context a combo-owned fallback label.
     # Decorated UT calls derive their per-case label from their actual args.
@@ -1478,11 +1590,13 @@ def _pinned_shared_experts(shared, active):
 
 
 def run_moe(args):
-    cfg = _DSR1_MOE_CONFIG if args.suite == "dsr1" else _MOE_CONFIG
+    cfg = {"dsr1": _DSR1_MOE_CONFIG, "dsv41": _DSV41_MOE_CONFIG}.get(
+        args.suite, _MOE_CONFIG
+    )
     shared = cfg.get("shared_experts", 0)
     activation = moe_mod.ActivationType.Silu
     rows = []
-    data_formats = {"dsv4": ["a8w4"], "dsr1": ["a4w4"]}.get(
+    data_formats = {"dsv4": ["a8w4"], "dsv41": ["a4w4"], "dsr1": ["a4w4"]}.get(
         args.suite, _MOE_DATA_FORMATS
     )
     init_pairs = _init_pairs(args, defaults=(("uniform", "auto"),))
@@ -1821,7 +1935,43 @@ def run_mega_moe(args):
     # different allocator. The same error also prints "Hint: Increase via
     # MORI_SHMEM_HEAP_SIZE" -- that hint is what points the wrong way.
     env.update({"MORI_V2_KERNEL_BACKEND": "hip", "MEGA_DISPATCH": "mori"})
+    # AITER_FORCE_A8W4 selects the grouped kernel's ACTIVATION dtype (0 -> fp4,
+    # 1 -> fp8); the weights are mxfp4 either way and -q only picks their layout,
+    # so the env var and the quant key have to move together.
+    # base+Mega: stage2_fused=both runs the plain fused_moe + mori combine and the
+    # gemm2-fused Mega combine. The V4.1 recipe also fuses stage 1 (S1F) on an
+    # fp4 dispatch wire.
+    base_mega = ("base+Mega", ("--stage2_fused", "both"), {})
+    if args.suite == "dsv41":
+        shape = ("5120", "2304", "40")
+        tokens_list = _DSV41_MOE_TOKENS
+        quants = (("a4w4_mxfp4", "0"),)
+        configs = (
+            base_mega,
+            (
+                "recipe S1F+Mega fp4 wire",
+                (
+                    "--stage1_fused",
+                    "true",
+                    "--stage2_fused",
+                    "true",
+                    "--dispatch_wire",
+                    "fp4",
+                ),
+                _DSV41_MEGA_RECIPE_ENV,
+            ),
+        )
+    else:
+        shape = ("7168", "3072", "61")
+        tokens_list = _MEGA_MOE_TOKENS
+        quants = (("a4w4_mxfp4", "0"), ("a8w4_mxfp4", "1"))
+        configs = (base_mega,)
     base_cmd = [
+        # A hung case would stall the suite. SIGTERM lets torchrun stop its four
+        # ranks; a kill of torchrun alone would leave them spinning on the GPUs.
+        "timeout",
+        "--kill-after=60",
+        str(_MEGA_MOE_TIMEOUT_S),
         "torchrun",
         "--standalone",
         "--nproc_per_node=4",
@@ -1831,45 +1981,44 @@ def run_mega_moe(args):
         "-k",
         "6",
         "-hd",
-        "7168",
+        shape[0],
         "-id",
-        "3072",
+        shape[1],
         "--layers",
-        "61",
+        shape[2],
         "--acc_verify",
         "0",
         "--profile_table",
         "0",
     ]
-    # AITER_FORCE_A8W4 selects the grouped kernel's ACTIVATION dtype (0 -> fp4,
-    # 1 -> fp8); the weights are mxfp4 either way and -q only picks their layout,
-    # so the env var and the quant key have to move together.
     data_inits = args.data_init or [None]
     _unused_scale_init(args, "mega_moe")
-    for tokens, (quant, force_a8w4), (label, combine), data_init in itertools.product(
-        _MEGA_MOE_TOKENS,
-        (("a4w4_mxfp4", "0"), ("a8w4_mxfp4", "1")),
-        (("base+Mega", "both"),),
-        data_inits,
-    ):
+    for (
+        tokens,
+        (quant, force_a8w4),
+        (label, flags, config_env),
+        data_init,
+    ) in itertools.product(tokens_list, quants, configs, data_inits):
         init_label = data_init or "native-default"
+        case_env = {**env, "AITER_FORCE_A8W4": force_a8w4, **config_env}
+        if config_env:
+            case_env["AITER_S1F_MAX_RECV"] = "6144" if tokens > 768 else "4096"
         _run_child(
             f"mega_moe (tokens/rank={tokens}, {quant}, {label}, "
-            f"combine={combine}, init={init_label}, seed={args.seed})",
+            f"init={init_label}, seed={args.seed})",
             [
                 *base_cmd,
                 "-tpr",
                 str(tokens),
                 "-q",
                 quant,
-                "--combine",
-                combine,
+                *flags,
                 *(["--data-init", data_init] if data_init else []),
                 "--seed",
                 str(args.seed),
             ],
             cwd=os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
-            env={**env, "AITER_FORCE_A8W4": force_a8w4},
+            env=case_env,
             extract=_json_tables,
             kernels=False,
             structured=True,
@@ -2022,7 +2171,67 @@ def run_score_qk_fp4(args):
             cwd=repo_root,
             extract=_score_qk_fp4_tables(scenario),
             structured=True,
+            ut_timing=args.suite == "dsv41",
         )
+
+
+def _load_ut_head(path, stop):
+    """A UT module whose sweep runs at import, loaded only up to `stop`."""
+    src = Path(path).read_text()
+    if stop not in src:
+        raise RuntimeError(f"{path}: {stop!r} not found")
+    mod = types.ModuleType(Path(path).stem)
+    mod.__file__ = str(path)
+    # The UT's sweep runs at import; load only its definitions.
+    exec(compile(src.split(stop, 1)[0], str(path), "exec"), mod.__dict__)  # noqa: S102
+    return mod
+
+
+def run_topk(args):
+    """DSv4.1 indexer top-k through op_tests/test_topk_per_row.py's tests."""
+    _unsupported_init(args, "topk")
+    path = Path(__file__).with_name("test_topk_per_row.py")
+    with _silence():
+        mod = _load_ut_head(path, "\nparser = argparse.ArgumentParser(")
+    k, next_n = _DSV41_TOPK_K, _DSV41_TOPK_NEXT_N
+    cases = [("prefill", m, None) for m in _DSV41_TOKENS] + [
+        ("decode", b, w) for w in _DSV41_TOPK_WIDTHS for b in _DSV41_TOPK_BATCH
+    ]
+    tables = {"prefill": [], "decode": []}
+    # No torch.device context here: the UT sets its own default device.
+    with _ut_timing():
+        for mode, size, width in cases:
+            row = {"rows": size if mode == "prefill" else size * next_n, "top_k": k}
+            if width:
+                row.update({"batch": size, "next_n": next_n, "width": width})
+            box = []
+            try:
+                with _capture() as box:
+                    if mode == "prefill":
+                        ret = mod.test_top_k_per_row_prefill(
+                            size, 0, k, stable=True, write_values=False
+                        )
+                    else:
+                        ret = mod.test_top_k_per_row_decode(
+                            size, width, k, next_n, stable=True, write_values=False
+                        )
+                row.update(
+                    {
+                        key: ret.get(key)
+                        for key in ("us", "all_close")
+                        if isinstance(ret, dict)
+                    }
+                )
+            except (RuntimeError, AssertionError, ValueError) as exc:
+                row["err_msg"] = _first_line(exc)
+            if box:
+                _attach_kernel_profiles(
+                    {"rows": [row]}, _profile_kernel_blocks(box[0].splitlines())
+                )
+            tables[mode].append(row)
+            torch.cuda.empty_cache()
+    for mode, rows in tables.items():
+        _print_table(f"topk {mode} (V4.1 indexer, k={k}, stable, indices only)", rows)
 
 
 def run_mori_ep(args):
@@ -2136,14 +2345,23 @@ def run_mla_v4_decode(args):
     _unused_scale_init(args, "mla_v4_decode")
     repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
-    def run_ep_case(group, kv_seq_lens, topks, heads, precs, backends, name):
+    def run_ep_case(
+        group,
+        kv_seq_lens,
+        topks,
+        heads,
+        precs,
+        backends,
+        name,
+        batches=(_MLA_V4_EP_BATCH,),
+    ):
         _run_child(
             name,
             [
                 sys.executable,
                 "op_tests/test_mla_sparse_prefill.py",
                 "-n",
-                str(_MLA_V4_EP_BATCH),
+                *map(str, batches),
                 "--h_q",
                 str(heads),
                 "-d",
@@ -2172,7 +2390,22 @@ def run_mla_v4_decode(args):
             ),
             kernels=False,
             structured=True,
+            ut_timing=args.suite == "dsv41",
         )
+
+    if args.suite == "dsv41":
+        for prec, backends in _DSV41_MLA_CASES:
+            run_ep_case(
+                "V4.1",
+                _DSV41_MLA_POOLS,
+                _DSV41_MLA_TOPK,
+                _MLA_V41_ASM_HEADS,
+                (prec,),
+                backends,
+                f"mla_v4 decode (V4.1, H64, {prec}, top-512 + window 128)",
+                batches=_DSV41_DECODE_TOKENS,
+            )
+        return
 
     for group, kv_seq_lens, topks in _MLA_V4_EP_KV_GROUPS:
         run_ep_case(
@@ -2365,6 +2598,12 @@ def run_mla_v4_prefill(args):
     _unused_scale_init(args, "mla_v4_prefill")
     data_inits = args.data_init or ["norm"]
 
+    def named(label):
+        # The UT names every table "mla_sparse_prefill summary".
+        return lambda lines: [
+            json.dumps({**json.loads(t), "name": label}) for t in _json_tables(lines)
+        ]
+
     def run_case(tokens, heads, pages, precs, topks, backends, init_values, label):
         _run_child(
             label,
@@ -2372,7 +2611,7 @@ def run_mla_v4_prefill(args):
                 sys.executable,
                 "op_tests/test_mla_sparse_prefill.py",
                 "-n",
-                str(tokens),
+                *map(str, tokens),
                 "--h_q",
                 str(heads),
                 "-d",
@@ -2398,13 +2637,28 @@ def run_mla_v4_prefill(args):
                 *init_values,
             ],
             cwd=os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
-            extract=_json_tables,
+            extract=named(label) if args.suite == "dsv41" else _json_tables,
             structured=True,
+            ut_timing=args.suite == "dsv41",
         )
+
+    if args.suite == "dsv41":
+        for prec, backends in _DSV41_MLA_CASES:
+            run_case(
+                _DSV41_TOKENS,
+                _MLA_V41_ASM_HEADS,
+                _DSV41_MLA_POOLS,
+                (prec,),
+                _DSV41_MLA_TOPK,
+                backends,
+                data_inits,
+                f"mla_v4 prefill (V4.1, H64, {prec}, top-512 + window 128)",
+            )
+        return
 
     for tokens in _MLA_PREFILL_TOKENS:
         run_case(
-            tokens,
+            (tokens,),
             _MLA_V4_EP_HEADS,
             (4096, 16384),
             ("v4_fp8", "v41_fp8", "bf16"),
@@ -2417,7 +2671,7 @@ def run_mla_v4_prefill(args):
             "pages=4096/16384)",
         )
         run_case(
-            tokens,
+            (tokens,),
             _MLA_V41_ASM_HEADS,
             (4096, 16384),
             ("v41_fp4",),
@@ -2646,6 +2900,7 @@ OPS = {
     "qk_norm": run_qk_norm,
     "score_qk": run_score_qk,
     "score_qk_fp4": run_score_qk_fp4,
+    "topk": run_topk,
     "mori_ep": run_mori_ep,
     "mega_moe": run_mega_moe,
     "mla_decode": run_mla_decode,
@@ -2733,8 +2988,14 @@ DSV4_OPS = [
     "score_qk",
     "score_qk_fp4",
 ]
-# MQA logits only for now: the other DSv4.1 operators are not on gfx1250 yet.
-DSV41_OPS = ["score_qk_fp4"]
+DSV41_OPS = [
+    "moe",
+    "mega_moe",
+    "mla_v4_decode",
+    "mla_v4_prefill",
+    "score_qk_fp4",
+    "topk",
+]
 DSR1_OPS = ["moe", "mla_decode", "mla_prefill"]
 
 
