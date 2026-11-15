@@ -18,12 +18,17 @@ H = 12
 K = 128
 
 
-def _inputs(tokens, slots):
+def _inputs(tokens, slots, strided_beta=False):
     qkv = {
         name: torch.randn((1, tokens, H, K), dtype=torch.bfloat16, device="cuda")
         for name in ("q", "k", "v", "a")
     }
-    qkv["b"] = torch.randn((1, tokens, H), dtype=torch.bfloat16, device="cuda")
+    if strided_beta:
+        # Kimi-K3 slices beta from a wider projection, so its token stride is wider.
+        wide = torch.randn((1, tokens, H + 8), dtype=torch.bfloat16, device="cuda")
+        qkv["b"] = wide[..., 4 : 4 + H]
+    else:
+        qkv["b"] = torch.randn((1, tokens, H), dtype=torch.bfloat16, device="cuda")
     state = torch.randn((slots, H, K, K), dtype=torch.float32, device="cuda")
     return qkv | {
         "A_log": torch.randn((H,), dtype=torch.float32, device="cuda") * 0.1,
@@ -33,7 +38,7 @@ def _inputs(tokens, slots):
     }
 
 
-def _call(inputs, indices, indices_in, cu, accepted=None):
+def _call(inputs, indices, indices_in, cu, accepted=None, **kwargs):
     args = dict(inputs)
     out = args.pop("o")
     return fused_sigmoid_gating_delta_rule_update(
@@ -52,6 +57,7 @@ def _call(inputs, indices, indices_in, cu, accepted=None):
         is_kda=True,
         lower_bound=-5.0,
         **args,
+        **kwargs,
     )
 
 
@@ -264,6 +270,57 @@ def test_cuda_graph_replay_uses_updated_slots():
     _reference(inputs, indices, indices_in, cu, None, expected, expected_out)
     _assert_close(captured_out, inputs["initial_state"], expected_out, expected)
     torch.testing.assert_close(inputs["initial_state"][5], baseline[5])
+
+
+def test_strided_beta_is_read_with_its_token_stride():
+    torch.manual_seed(7)
+    inputs = _inputs(4, 6, strided_beta=True)
+    cu = torch.arange(5, dtype=torch.int32, device="cuda")
+    indices = torch.tensor([1, 0, 4, 2], dtype=torch.int32, device="cuda")
+    indices_in = torch.tensor([3, 0, 5, 2], dtype=torch.int32, device="cuda")
+    expected_state = inputs["initial_state"].clone()
+    expected_out = inputs["o"].clone()
+    _reference(inputs, indices, indices_in, cu, None, expected_state, expected_out)
+    out, state = _call(inputs, indices, indices_in, cu)
+    _assert_close(out, state, expected_out, expected_state)
+
+
+@pytest.mark.parametrize("mode", ["decode", "spec"])
+def test_not_in_place_returns_the_state_of_each_token(mode):
+    torch.manual_seed(6)
+    if mode == "spec":
+        indices = torch.tensor([[1, 2, 3], [4, 5, 0]], dtype=torch.int32, device="cuda")
+        accepted = torch.tensor([2, 3], dtype=torch.int32, device="cuda")
+    else:
+        indices = torch.tensor([3, 0, 5, 1], dtype=torch.int32, device="cuda")
+        accepted = None
+    sequences = indices.shape[0]
+    width = indices.shape[1] if indices.ndim == 2 else 1
+    tokens = sequences * width
+    inputs = _inputs(tokens, 6)
+    cu = torch.arange(0, tokens + 1, width, dtype=torch.int32, device="cuda")
+    original = inputs["initial_state"].clone()
+    # ATOM stores the state after token t at index t: slot 6 + t of this buffer.
+    expected = torch.cat(
+        [original, torch.zeros((tokens, H, K, K), dtype=torch.float32, device="cuda")]
+    )
+    by_token = torch.arange(6, 6 + tokens, dtype=torch.int32, device="cuda")
+    expected_out = inputs["o"].clone()
+    _reference(
+        inputs,
+        by_token.reshape(indices.shape),
+        indices,
+        cu,
+        accepted,
+        expected,
+        expected_out,
+    )
+    out, final_state = _call(
+        inputs, indices, None, cu, accepted, inplace_final_state=False
+    )
+    assert final_state.shape == (tokens, H, K, K)
+    _assert_close(out, final_state, expected_out, expected[6:])
+    assert torch.equal(inputs["initial_state"], original)
 
 
 def test_rejected_signatures():

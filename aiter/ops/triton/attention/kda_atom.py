@@ -81,12 +81,23 @@ def fused_sigmoid_gating_delta_rule_update(
                 f"batch dimension, got {tuple(out.shape)} for v {tuple(v.shape)}"
             )
 
+    # When not in place, ATOM stores the state after each token at the token's
+    # index in a new tensor.
+    state_out = None
+    if not inplace_final_state and initial_state is not None:
+        state_out = torch.empty(
+            (v.shape[0] * v.shape[1], *initial_state.shape[1:]),
+            dtype=initial_state.dtype,
+            device=initial_state.device,
+        )
+
     result, final_state = fused_recurrent_kda(
         q.contiguous(),
         k.contiguous(),
         v.contiguous(),
         a.contiguous(),
-        b.contiguous(),
+        # The kernels read beta with its token stride: Kimi-K3 passes a view.
+        b if b.stride(-1) == 1 else b.contiguous(),
         A_log=A_log,
         dt_bias=dt_bias,
         initial_state=initial_state,
@@ -103,6 +114,7 @@ def fused_sigmoid_gating_delta_rule_update(
         use_beta_sigmoid_in_kernel=True,
         lower_bound=lower_bound,
         out=out,
+        state_out=state_out,
         atom_slots=True,
     )
     if squeeze:
