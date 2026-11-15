@@ -1,0 +1,502 @@
+# SPDX-License-Identifier: MIT
+# Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
+
+import argparse
+import itertools
+import math
+
+import pandas as pd
+import torch
+import torch.nn.functional as F
+
+import aiter
+from aiter import dtypes
+from aiter.jit.utils.chip_info import get_gfx_runtime
+from aiter.ops.flydsl.mamba2_ssd import SUPPORTED_GFX, mamba_chunk_scan_combined
+from aiter.test_common import (
+    benchmark,
+    checkAllclose,
+    run_perftest,
+)
+
+try:
+    from fla.ops.simple_gla import chunk_simple_gla
+except ImportError:
+    chunk_simple_gla = None
+
+torch.set_default_device("cuda")
+# Mismatching elements allowed per output, as in the other FlyDSL op tests.
+_TOL_ERR_RATIO = 1e-3
+_TERM_TOL = 2**-6  # ~4 bf16 ulps of an element's summed |terms|
+
+
+def _ref_decay_cumsum(a, dt, chunk_size):
+    """Per-chunk cumsum of a * dt."""
+    B, T, H = dt.shape
+    decay = (a * dt).view(B, T // chunk_size, chunk_size, H)
+    return decay.cumsum(dim=2).view(B, T, H)
+
+
+def _ref_pass_state(x, b, dt, decay_cumsum, init_state, chunk_size):
+    """Chunk-entry states and final state."""
+    H, G = x.shape[2], b.shape[2]
+    b = b.repeat_interleave(H // G, dim=2)
+    hid, hiddens = init_state, []
+    for ci in range(x.shape[1] // chunk_size):
+        hiddens.append(hid.clone())
+        sl = slice(ci * chunk_size, (ci + 1) * chunk_size)
+        xc, bc = x[:, sl].transpose(1, 2), b[:, sl].transpose(1, 2)
+        dtc, dc = dt[:, sl].transpose(1, 2), decay_cumsum[:, sl].transpose(1, 2)
+        g_last = dc[:, :, -1]
+        bw = bc * (dtc * torch.exp(g_last[..., None] - dc))[..., None]
+        hid = hid * torch.exp(g_last[..., None, None]) + xc.transpose(-1, -2) @ bw
+    return torch.stack(hiddens, dim=2), hid
+
+
+def _ref_out(x, b, c, d, dt, decay_cumsum, hiddens, chunk_size):
+    """Fused chunk output."""
+    H, G = x.shape[2], b.shape[2]
+    b = b.repeat_interleave(H // G, dim=2)
+    c = c.repeat_interleave(H // G, dim=2)
+    out = torch.zeros_like(x)
+    for ci in range(hiddens.shape[2]):
+        sl = slice(ci * chunk_size, (ci + 1) * chunk_size)
+        xc, bc, cc = (t[:, sl].transpose(1, 2) for t in (x, b, c))
+        dtc, dc = dt[:, sl].transpose(1, 2), decay_cumsum[:, sl].transpose(1, 2)
+        cb = cc @ bc.transpose(-1, -2)
+        # Mask the exponent, not its result: exp of the upper triangle overflows,
+        # and autograd through inf * 0 turns da / ddt into NaN.
+        causal = torch.ones(cb.shape[-2:], dtype=torch.bool, device=cb.device).tril()
+        seg = torch.where(causal, dc[..., None] - dc[..., None, :], -torch.inf)
+        cb = cb * torch.exp(seg)
+        y = (cc * torch.exp(dc[..., None])) @ hiddens[:, :, ci].transpose(-1, -2)
+        y = y + cb @ (dtc[..., None] * xc) + d[None, :, None, None] * xc
+        out[:, sl] = y.transpose(1, 2)
+    return out
+
+
+def run_torch(x, a, b, c, d, dt, init_state, chunk_size, dtype=dtypes.fp32):
+    """Chunked Mamba-2 forward reference, computed in ``dtype``."""
+    x, a, b, c, d, dt, init_state = (
+        t.to(dtype) for t in (x, a, b, c, d, dt, init_state)
+    )
+    decay_cumsum = _ref_decay_cumsum(a, dt, chunk_size)
+    hiddens, final_state = _ref_pass_state(
+        x, b, dt, decay_cumsum, init_state, chunk_size
+    )
+    out = _ref_out(x, b, c, d, dt, decay_cumsum, hiddens, chunk_size)
+    return out, final_state
+
+
+def _bf16_ulp(x):
+    """Spacing of bf16 values at magnitude x (8 significant bits)."""
+    return 2.0 ** (math.floor(math.log2(x)) - 7) if x > 0 else 0.0
+
+
+def make_inputs(B, T, G, H, N, P, L, dtype):
+    """Random inputs; the initial state comes from one chunk of the recurrence
+    so it is in distribution."""
+    x = F.silu(torch.randn(B, T, H, P, dtype=dtype))
+    a = -torch.empty(H, dtype=dtypes.fp32).uniform_(1, 16)
+    b = F.silu(torch.randn(B, T, G, N, dtype=dtype))
+    c = F.silu(torch.randn(B, T, G, N, dtype=dtype))
+    d = torch.randn(H, dtype=dtypes.fp32)
+    dt = F.softplus(torch.randn(B, T, H, dtype=dtype))
+    x0 = F.silu(torch.randn(B, L, H, P, dtype=dtype))
+    b0 = F.silu(torch.randn(B, L, G, N, dtype=dtype))
+    dt0 = F.softplus(torch.randn(B, L, H, dtype=dtype))
+    a0 = -torch.empty(H, dtype=dtypes.fp32).uniform_(1, 16)
+    zeros = torch.zeros(B, H, P, N, dtype=dtypes.fp32)
+    x0, b0, dt0 = x0.float(), b0.float(), dt0.float()
+    _, init_state = _ref_pass_state(x0, b0, dt0, (a0 * dt0).cumsum(dim=1), zeros, L)
+    return x, a, b, c, d, dt, init_state
+
+
+@benchmark()
+def test_mamba2_chunk_forward(
+    batch, num_tokens, num_groups, num_heads, state_size, head_size, chunk_size, dtype
+):
+    B, T, G, H, N, P, L = (
+        batch,
+        num_tokens,
+        num_groups,
+        num_heads,
+        state_size,
+        head_size,
+        chunk_size,
+    )
+    x, a, b, c, d, dt, init_state = make_inputs(B, T, G, H, N, P, L, dtype)
+    ref_out, ref_state = run_torch(x, a, b, c, d, dt, init_state, L)
+
+    candidates = {
+        "flydsl": lambda: mamba_chunk_scan_combined(
+            x, dt, a, b, c, L, D=d, initial_states=init_state, return_final_states=True
+        ),
+    }
+    if chunk_simple_gla is not None:
+        # Mamba-2 SSD == simple GLA with q=C, k=B, v=dt*x, g=a*dt, state [N, P];
+        # the input prep is hoisted so only fla's kernels are timed.
+        q_f = c.repeat_interleave(H // G, dim=2).contiguous()
+        k_f = b.repeat_interleave(H // G, dim=2).contiguous()
+        v_f = (x.float() * dt.float()[..., None]).to(dtype)
+        g_f = a * dt.float()
+        h0_f = init_state.transpose(-1, -2).contiguous()
+
+        def fla_fn():
+            o, ht = chunk_simple_gla(
+                q_f,
+                k_f,
+                v_f,
+                g=g_f,
+                scale=1.0,
+                initial_state=h0_f,
+                output_final_state=True,
+                chunk_size=L,
+            )
+            return (o + d[:, None] * x).to(dtype), ht.transpose(-1, -2)
+
+        candidates["fla_triton"] = fla_fn
+
+    nc = T // L
+    # Per (chunk, head): state update 2LPN, carried-state term 2LPN, causal C.B^T and P@x ~ L^2 (N + P).
+    flops = B * H * nc * (4 * L * P * N + L * L * (N + P))
+    nbytes = (
+        2 * B * T * H * P * x.element_size()  # x in, out
+        + 2 * B * T * G * N * b.element_size()  # b, c
+        + 2 * B * H * nc * P * N * 2  # bf16 chunk-entry states written then read
+        + 2 * B * H * P * N * 4  # init / final state
+    )
+
+    # bf16 rounding scales with each element's summed |terms|, not its value, so
+    # errors are measured relative to that (the reference run on |inputs|).
+    out_scale, state_scale = run_torch(
+        x.abs(), a, b.abs(), c.abs(), d.abs(), dt, init_state.abs(), L
+    )
+    out_scale = out_scale.float().clamp_min(1e-6)
+    state_scale = state_scale.clamp_min(1e-6)
+
+    ret = {"gfx": get_gfx_runtime()}
+    for name, fn in candidates.items():
+        (out, state), us = run_perftest(fn)
+        err = checkAllclose(
+            ref_out.float() / out_scale,
+            out.float() / out_scale,
+            rtol=0,
+            atol=_TERM_TOL,
+            tol_err_ratio=_TOL_ERR_RATIO,
+            msg=f"{name}: out",
+        )
+        state_err = checkAllclose(
+            ref_state / state_scale,
+            state.float() / state_scale,
+            rtol=0,
+            atol=_TERM_TOL,
+            tol_err_ratio=_TOL_ERR_RATIO,
+            msg=f"{name}: final_state",
+        )
+        if name == "flydsl":  # the optional fla baseline is reported, not gated
+            assert err <= _TOL_ERR_RATIO, f"out mismatch ratio {err:.3e}"
+            assert state_err <= _TOL_ERR_RATIO, f"state mismatch ratio {state_err:.3e}"
+        ret[f"{name} us"] = us
+        ret[f"{name} TFLOPS"] = flops / us / 1e6
+        ret[f"{name} TB/s"] = nbytes / us / 1e6
+        ret[f"{name} err"] = err
+    return ret
+
+
+def run_torch_backward(x, a, b, c, d, dt, init_state, dout, dfinal_state, chunk_size):
+    """Gradients of the reference by autograd, in fp64: fp32 PyTorch is less
+    accurate than the kernel's fp32 gradients (da, dinit)."""
+    f64 = torch.float64
+    leaves = [t.detach().to(f64).requires_grad_() for t in (x, a, b, c, d, dt)]
+    h0 = init_state.detach().to(f64).requires_grad_()
+    out, final = run_torch(*leaves, h0, chunk_size, dtype=f64)
+    torch.autograd.backward([out, final], [dout.to(f64), dfinal_state.to(f64)])
+    return [t.grad for t in leaves] + [h0.grad]  # dx, da, db, dc, dd, ddt, dinit
+
+
+@benchmark()
+def test_mamba2_chunk_backward(
+    batch, num_tokens, num_groups, num_heads, state_size, head_size, chunk_size, dtype
+):
+    B, T, G, H, N, P, L = (
+        batch,
+        num_tokens,
+        num_groups,
+        num_heads,
+        state_size,
+        head_size,
+        chunk_size,
+    )
+    x, a, b, c, d, dt, init_state = make_inputs(B, T, G, H, N, P, L, dtype)
+    dout = torch.randn_like(x)
+    dfinal = 0.1 * torch.randn_like(init_state)
+    ref = run_torch_backward(x, a, b, c, d, dt, init_state, dout, dfinal, L)
+
+    # Time the backward alone: build the graph once, replay it.
+    leaves = [t.detach().clone().requires_grad_() for t in (x, a, b, c, d, dt)]
+    h0 = init_state.detach().clone().requires_grad_()
+    lx, la, lb, lc, ld, ldt = leaves
+    out, final = mamba_chunk_scan_combined(
+        lx, ldt, la, lb, lc, L, D=ld, initial_states=h0, return_final_states=True
+    )
+    candidates = {
+        "flydsl": lambda: torch.autograd.grad(
+            [out, final], [*leaves, h0], [dout, dfinal], retain_graph=True
+        ),
+    }
+    if chunk_simple_gla is not None:
+        # fla's backward via autograd on the simple-GLA mapping, chained back to
+        # the Mamba-2 gradients (dv -> dx, ddt; dg -> ddt, da; dq / dk summed per group).
+        HPG = H // G
+        q_f = c.repeat_interleave(HPG, dim=2).contiguous().requires_grad_()
+        k_f = b.repeat_interleave(HPG, dim=2).contiguous().requires_grad_()
+        v_f = (x.float() * dt.float()[..., None]).to(dtype).requires_grad_()
+        g_f = (a * dt.float()).requires_grad_()
+        h0_f = init_state.transpose(-1, -2).contiguous().requires_grad_()
+        o, ht = chunk_simple_gla(
+            q_f,
+            k_f,
+            v_f,
+            g=g_f,
+            scale=1.0,
+            initial_state=h0_f,
+            output_final_state=True,
+            chunk_size=L,
+        )
+        dfinal_t = dfinal.transpose(-1, -2)
+
+        def fla_fn():
+            dq, dk, dv, dg, dh0 = torch.autograd.grad(
+                [o, ht], [q_f, k_f, v_f, g_f, h0_f], [dout, dfinal_t], retain_graph=True
+            )
+            dv = dv.float()
+            return (
+                dv * dt.float()[..., None] + d[:, None] * dout.float(),
+                (dg * dt.float()).sum((0, 1)),
+                dk.float().view(B, T, G, HPG, N).sum(3),
+                dq.float().view(B, T, G, HPG, N).sum(3),
+                (dout.float() * x.float()).sum((0, 1, 3)),
+                (dv * x.float()).sum(-1) + dg * a,
+                dh0.transpose(-1, -2),
+            )
+
+        candidates["fla_triton"] = fla_fn
+
+    names = ["dx", "da", "db", "dc", "dd", "ddt", "dinit"]
+    FP32_GRADS = ("da", "dd", "dinit")  # the fp32 inputs a, d, init_state
+    ret = {"gfx": get_gfx_runtime()}
+    for name, fn in candidates.items():
+        grads, us = run_perftest(fn)
+        errs = []
+        for gname, r, g in zip(names, ref, grads):
+            scale = r.abs().max().item()
+            if gname in FP32_GRADS:  # returned in fp32: held to fp32 accuracy
+                rtol, atol = 1e-3, 1e-4 * scale
+            else:
+                rtol, atol = 2e-2, 2e-2 + _bf16_ulp(scale)
+            errs.append(
+                checkAllclose(
+                    r,
+                    g.to(r.dtype),
+                    rtol=rtol,
+                    atol=atol,
+                    tol_err_ratio=_TOL_ERR_RATIO,
+                    msg=f"{name}: {gname}",
+                )
+            )
+        if name == "flydsl":  # the optional fla baseline is reported, not gated
+            bad = {n: e for n, e in zip(names, errs) if e > _TOL_ERR_RATIO}
+            assert not bad, f"grad mismatch ratios {bad}"
+        ret[f"{name} us"] = us
+        ret[f"{name} err"] = max(errs)
+    return ret
+
+
+def _ref_sequence(x, dt, a, b, c, d, h0):
+    """Exact (unchunked) SSD of one sequence: x [T, H, P], dt [T, H] (processed),
+    b / c [T, G, N], h0 [H, P, N] -> out [T, H, P], final state [H, P, N]."""
+    T, H, _ = x.shape
+    b = b.repeat_interleave(H // b.shape[1], 1)
+    c = c.repeat_interleave(H // c.shape[1], 1)
+    cum = (a * dt).cumsum(0)
+    causal = torch.ones(T, T, dtype=torch.bool).tril()[..., None]
+    seg = torch.where(causal, cum[:, None] - cum[None], -torch.inf).exp()
+    out = torch.einsum("tsh,shp->thp", torch.einsum("thn,shn->tsh", c, b) * seg * dt, x)
+    out = (
+        out
+        + torch.einsum("thn,hpn->thp", c, h0) * cum.exp()[..., None]
+        + d[:, None] * x
+    )
+    last = cum[-1] if T else torch.zeros_like(a)
+    w = (last - cum).exp() * dt
+    final = h0 * last.exp()[:, None, None] + torch.einsum("th,thp,thn->hpn", w, x, b)
+    return out, final
+
+
+def run_torch_varlen(x, dt, a, b, c, d, dt_bias, h0, lens):
+    """Packed batch reference: each sequence from its own initial state."""
+    dt = F.softplus(dt + dt_bias)
+    starts = [0, *itertools.accumulate(lens)]
+    outs, finals = [], []
+    for i, (t0, t1) in enumerate(itertools.pairwise(starts)):
+        o, f = _ref_sequence(
+            x[0, t0:t1], dt[0, t0:t1], a, b[0, t0:t1], c[0, t0:t1], d, h0[i]
+        )
+        outs.append(o)
+        finals.append(f)
+    return torch.cat(outs)[None], torch.stack(finals)
+
+
+@benchmark()
+def test_mamba2_chunk_scan_varlen(
+    seq_lens, num_groups, num_heads, state_size, head_size, chunk_size, dtype
+):
+    """Packed ragged sequences (incl. empty and 1-token ones) with dt_bias and
+    softplus, forward and every gradient, against the exact per-sequence scan."""
+    G, H, N, P, L = num_groups, num_heads, state_size, head_size, chunk_size
+    T, S = sum(seq_lens), len(seq_lens)
+    x = F.silu(torch.randn(1, T, H, P, dtype=dtype))
+    b = F.silu(torch.randn(1, T, G, N, dtype=dtype))
+    c = F.silu(torch.randn(1, T, G, N, dtype=dtype))
+    dt = torch.randn(1, T, H, dtype=dtypes.fp32)
+    a = -torch.empty(H, dtype=dtypes.fp32).uniform_(1, 16)
+    d = torch.randn(H, dtype=dtypes.fp32)
+    dt_bias = 0.5 * torch.randn(H, dtype=dtypes.fp32)
+    h0 = 0.1 * torch.randn(S, H, P, N, dtype=dtypes.fp32)
+    cu_seqlens = torch.tensor([0, *itertools.accumulate(seq_lens)], dtype=torch.int32)
+    inputs = (x, dt, a, b, c, d, dt_bias, h0)
+    dout = torch.randn_like(x)
+    dstates = 0.1 * torch.randn_like(h0)
+
+    ref_leaves = [t.detach().double().requires_grad_() for t in inputs]  # see above
+    ref_out, ref_states = run_torch_varlen(*ref_leaves, seq_lens)
+    torch.autograd.backward([ref_out, ref_states], [dout.double(), dstates.double()])
+
+    leaves = [t.detach().clone().requires_grad_() for t in inputs]
+    lx, ldt, la, lb, lc, ld, lbias, lh0 = leaves
+
+    def fwd():
+        return mamba_chunk_scan_combined(
+            lx,
+            ldt,
+            la,
+            lb,
+            lc,
+            L,
+            D=ld,
+            dt_bias=lbias,
+            initial_states=lh0,
+            cu_seqlens=cu_seqlens,
+            dt_softplus=True,
+            return_varlen_states=True,
+        )
+
+    (out, states), us = run_perftest(fwd)
+    torch.autograd.backward([out, states], [dout, dstates])
+
+    checks = {"out": (ref_out, out), "states": (ref_states, states)}
+    names = ["dx", "ddt", "da", "db", "dc", "dd", "ddt_bias", "dinit"]
+    checks.update({n: (r.grad, g.grad) for n, r, g in zip(names, ref_leaves, leaves)})
+    errs = {}
+    for name, (r, g) in checks.items():
+        scale = r.abs().max().item()
+        if g.dtype == dtypes.fp32 and name != "states":  # fp32 grads: fp32 accuracy
+            rtol, atol = 1e-3, 1e-4 * scale
+        else:
+            rtol, atol = 2e-2, 2e-2 + _bf16_ulp(scale)
+        errs[name] = checkAllclose(
+            r,
+            g.to(r.dtype),
+            rtol=rtol,
+            atol=atol,
+            tol_err_ratio=_TOL_ERR_RATIO,
+            msg=name,
+        )
+    bad = {n: e for n, e in errs.items() if e > _TOL_ERR_RATIO}
+    assert not bad, f"mismatch ratios {bad}"
+    return {"gfx": get_gfx_runtime(), "fwd us": us, "err": max(errs.values())}
+
+
+def main():
+    if get_gfx_runtime() not in SUPPORTED_GFX:
+        aiter.logger.warning(
+            "mamba2_chunk_forward (FlyDSL) unsupported on %s; skipping",
+            get_gfx_runtime(),
+        )
+        return
+
+    parser = argparse.ArgumentParser(
+        formatter_class=argparse.RawTextHelpFormatter,
+        description="config input of test",
+    )
+    parser.add_argument(
+        "-d",
+        "--dtype",
+        type=dtypes.str2Dtype,
+        nargs="*",
+        default="bf16,",
+        help="input dtype",
+    )
+    # Default sweep: B=4, H=8, P=64, chunk 128, state 64-512.
+    parser.add_argument(
+        "-b", "--batch", type=int, nargs="*", default=[4], help="batch size"
+    )
+    parser.add_argument(
+        "-t",
+        "--num_tokens",
+        type=int,
+        nargs="*",
+        default=[1024, 4096, 16384],
+        help="sequence length",
+    )
+    parser.add_argument(
+        "-s",
+        "--shape",
+        type=dtypes.str2tuple,
+        nargs="*",
+        default=[(1, 8, s, 64) for s in (64, 128, 256, 512)],
+        help="(num_groups, num_heads, state_size, head_size), e.g. -s 1,8,128,64",
+    )
+    parser.add_argument(
+        "-c", "--chunk_size", type=int, nargs="*", default=[128], help="chunk size"
+    )
+    parser.add_argument(
+        "--direction",
+        nargs="*",
+        default=["fwd", "bwd", "varlen"],
+        choices=["fwd", "bwd", "varlen"],
+        help="forward, backward, and / or packed ragged sequences (fwd + bwd)",
+    )
+    parser.add_argument(
+        "--seq_lens",
+        type=dtypes.str2tuple,
+        default=(100, 37, 0, 300, 1, 512),
+        help="ragged sequence lengths of the varlen case",
+    )
+    args = parser.parse_args()
+
+    tests = {"fwd": test_mamba2_chunk_forward, "bwd": test_mamba2_chunk_backward}
+    for direction, dtype in itertools.product(args.direction, args.dtype):
+        if direction == "varlen":
+            df = [
+                test_mamba2_chunk_scan_varlen(args.seq_lens, g, h, n, p, cs, dtype)
+                for (g, h, n, p), cs in itertools.product(args.shape, args.chunk_size)
+            ]
+        else:
+            df = [
+                tests[direction](b, t, g, h, n, p, cs, dtype)
+                for b, t, (g, h, n, p), cs in itertools.product(
+                    args.batch, args.num_tokens, args.shape, args.chunk_size
+                )
+            ]
+        df = pd.DataFrame(df)
+        aiter.logger.info(
+            "mamba2_chunk %s summary (markdown):\n%s",
+            direction,
+            df.to_markdown(index=False),
+        )
+
+
+if __name__ == "__main__":
+    main()
