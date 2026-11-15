@@ -415,6 +415,10 @@ def refusals():
     bad = 0
     c = make_case([500, 700], [1, 1], 1, 16, seed=5)
     cache, ks = c["cache"], c["k_scale"]
+    # Element offsets (rows x stride) are 32-bit: views reaching past 2**31 elements are
+    # refused (the 8 GiB buffer below is never read; the refusal comes first).
+    c2 = make_case([500, 700], [1, 1], 2, 8, seed=5)
+    wide = torch.empty(2**31 + 64, dtype=torch.int32, device="cuda")
     cases = [
         ("splits > MAX_SPLITS", {"splits": 32}, "splits must be"),
         ("splits 0", {"splits": 0}, "splits must be"),
@@ -433,6 +437,26 @@ def refusals():
         ("sm_scale 0", {"sm_scale": 0.0}, "sm_scale"),
         ("sm_scale nan", {"sm_scale": float("nan")}, "sm_scale"),
         ("cpu q", {"q": c["q"].cpu()}, "CUDA"),
+        (
+            "topk_idx offsets past 2**31",
+            {
+                "q": c2["q"],
+                "cache": c2["cache"],
+                "bt": c2["bt"],
+                "topk": wide.as_strided((2, 2, 16), (2**31, 16, 1)),
+            },
+            "topk_idx element offsets",
+        ),
+        (
+            "block_table offsets past 2**31",
+            {
+                "q": c2["q"],
+                "cache": c2["cache"],
+                "topk": c2["topk"],
+                "bt": wide.as_strided((2, 4), (2**31, 1)),
+            },
+            "block_table element offsets",
+        ),
         (
             "q over 2 GiB",
             {"q": torch.empty(2**19 + 1, 16, D, dtype=torch.bfloat16, device="cuda")},

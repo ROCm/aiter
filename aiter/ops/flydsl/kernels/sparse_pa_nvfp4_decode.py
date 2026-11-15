@@ -802,6 +802,16 @@ def sparse_pa_nvfp4_decode(
         block_table.shape[0] >= seq_lens.shape[0],
         "block_table needs a row per request",
     )
+    # The topk_idx and block_table element offsets are 32-bit in the kernel.
+    require(
+        (hkv - 1) * topk_idx.stride(0) + (rows - 1) * topk_idx.stride(1) + topk
+        <= 2**31,
+        "topk_idx element offsets (head / row strides) must stay below 2**31",
+    )
+    require(
+        (seq_lens.shape[0] - 1) * block_table.stride(0) + block_table.shape[1] <= 2**31,
+        "block_table element offsets (request stride) must stay below 2**31",
+    )
     for t in (out, kv_cache, topk_idx, block_table, seq_lens):
         require(t.device == q.device, "all operands must be on q's device")
     dev = q.device.index
