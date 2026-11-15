@@ -510,6 +510,9 @@ def moe_cktile2stages_gemm1(
     split_k: int | None = 1,
     kernel_name: str = "",
 ):
+    """Y's width selects the kernel: N = WQ.size(1) writes raw gate|up (split-k
+    kernel, any split_k), N/2 applies the gated activation (split_k must be 1).
+    Relu2 is gate-only: Y is N wide and split_k must be 1."""
     return moe_cktile2stages_gemm1_ck(
         XQ,
         WQ,

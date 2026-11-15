@@ -592,3 +592,144 @@ def test_the_parameter_gate_matches_the_names_it_claims_to_guard():
         + ", ".join(missing)
         + " -- the gate above is guarding a name nothing uses"
     )
+
+
+# Registration is what keeps a routed op out of a caller's compiled graph. It
+# is opt-in per op (`route(..., fake=...)`, #7850), so "not registered" is the
+# default -- and the default is the state that breaks the day a provider is
+# enabled, which is the configuration this interface exists for. The gate
+# below makes that state cost a written sentence instead of nothing.
+#
+# An op is accounted for in exactly one of three ways:
+#   * it passes `fake=`;
+#   * a `torch_compile_guard` sits OUTSIDE its `@route`, so the caller already
+#     reaches an opaque op and the plugin's dispatch is behind it (detected
+#     from the decorator order, never listed, so it cannot go stale);
+#   * it is named below with the reason it is not registered.
+#
+# Three reasons recur, and each is a measurement rather than a preference:
+#
+# "out-buffer in the contract" -- the op takes an optional output tensor and
+# returns it. Registered, that is an op returning one of its own arguments.
+# Measured: `opcheck` rejects it ("Argument out is not defined to alias output
+# but was aliasing"), and -- worse, because it is silent -- a compiled region
+# that passes the buffer gets a correct RETURN VALUE while the buffer itself
+# is left unwritten. A caller reading its own buffer afterwards reads stale
+# data and nothing reports it. Registering such an op therefore has to wait
+# for the contract to drop the buffer, which moves the signature and so needs
+# an op_version bump; `fused_dual_rmsnorm_mxfp8_quant` shows the shape of the
+# fix for a contract new enough not to need one.
+#
+# "unannotated contract" -- the contract renders without types (`x:positional`
+# rather than `x:positional:Tensor`) because the function has no annotations.
+# `infer_schema` needs them, and adding them moves the rendered signature and
+# so the fingerprint: an annotation-only change is indistinguishable here from
+# a real contract change, so it needs the same op_version decision.
+#
+# "no schema can express it" -- a parameter whose type is AITER's own.
+_NOT_REGISTERED = {
+    "gemm_a8w8_blockscale_bpreshuffle": "out-buffer in the contract (`out`)",
+    "inverse_rope_group_quant": "out-buffer in the contract (`x_fp8`, `x_scale`)",
+    "mla_sparse_prefill": "out-buffer in the contract (`out`)",
+    "mla_sparse_prefill_v41": "out-buffer in the contract (`out`)",
+    "pa_decode_bf16": "out-buffer in the contract (`out`)",
+    "pa_fwd": "out-buffer in the contract (`out_`)",
+    "mla_decode_fwd_v4_nm": "unannotated contract, and an out-buffer in it",
+    "mla_decode_fwd_v4_nm_ps": "unannotated contract, and an out-buffer in it",
+    "sp_qkv_fused": "unannotated contract",
+    "pertoken_quant": (
+        "unannotated contract; and its body is pure torch, which inductor "
+        "fuses with its neighbours today -- measured, one reduction kernel "
+        "for silu + amax + divide + the consumer. Registering it trades that "
+        "fusion away for every compiling caller, including those with no "
+        "provider, because registration happens at import and AITER_PLUGINS=0 "
+        "does not undo it (measured). Worth paying when a provider serves it, "
+        "not before."
+    ),
+    "rmsnorm": "unannotated contract; pure-torch body, as `pertoken_quant`",
+    "pa_persistent_fwd": "no schema can express it (`QuantType` parameter)",
+}
+
+
+def _routed_registration(root: Path) -> dict[str, tuple[bool, bool]]:
+    """Per routed op: whether it passes ``fake=``, and whether an outer
+    ``torch_compile_guard`` already makes it opaque to a caller."""
+
+    found: dict[str, tuple[bool, bool]] = {}
+    for path in sorted(root.glob("aiter/**/*.py")):
+        tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+        spellings = _route_spellings(tree)
+        if not spellings:
+            continue
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.FunctionDef):
+                continue
+            decorators = node.decorator_list
+            route_at = [i for i, d in enumerate(decorators) if _is_route(d, spellings)]
+            if not route_at:
+                continue
+            decorator = decorators[route_at[0]]
+            keywords = {k.arg: k.value for k in decorator.keywords}
+            op = ast.literal_eval(keywords["op"])
+            outer = decorators[: route_at[0]]
+            shielded = any(
+                (
+                    getattr(d.func if isinstance(d, ast.Call) else d, "id", None)
+                    or getattr(d.func if isinstance(d, ast.Call) else d, "attr", None)
+                )
+                == "torch_compile_guard"
+                for d in outer
+            )
+            found[op] = ("fake" in keywords, shielded)
+    return found
+
+
+def test_every_routed_op_is_registered_or_says_why_not():
+    """The default -- no ``fake=`` -- is the state that breaks under a provider.
+
+    Registration is per op and silent when absent: an op added without
+    ``fake=`` works exactly as before and starts splitting a caller's graph
+    only once someone enables a provider for it, which is far from where the
+    omission happened. This gate turns that silence into a failing test unless
+    the omission is written down.
+    """
+
+    accounted = _NOT_REGISTERED.keys()
+    unexplained = sorted(
+        op
+        for op, (has_fake, shielded) in _routed_registration(_REPO).items()
+        if not has_fake and not shielded and op not in accounted
+    )
+    assert not unexplained, (
+        "routed ops that are neither registered nor explained: "
+        + ", ".join(unexplained)
+        + " -- pass fake= to route(), or add the op to _NOT_REGISTERED with "
+        "the reason it cannot be registered"
+    )
+
+
+def test_the_registration_gate_is_not_vacuous():
+    """The gate passes trivially if nothing is routed, if every op is listed
+    as an exception, or if an exception outlives the problem it names."""
+
+    registration = _routed_registration(_REPO)
+    assert registration, "the scanner found no routed ops"
+    assert any(
+        has_fake for has_fake, _ in registration.values()
+    ), "no routed op passes fake=; the gate would be satisfied by exceptions alone"
+
+    stale = sorted(
+        op for op in _NOT_REGISTERED if op in registration and registration[op][0]
+    )
+    assert not stale, (
+        "ops listed as not registered that now pass fake=: "
+        + ", ".join(stale)
+        + " -- remove them from _NOT_REGISTERED"
+    )
+    unknown = sorted(set(_NOT_REGISTERED) - set(registration))
+    assert not unknown, "_NOT_REGISTERED names ops that are not routed: " + ", ".join(
+        unknown
+    )
+    assert all(
+        reason.strip() for reason in _NOT_REGISTERED.values()
+    ), "every entry in _NOT_REGISTERED needs a reason, not an empty string"

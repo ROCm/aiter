@@ -37,7 +37,18 @@ def _fused_qk_norm_rope_cache_quant_shuffle_hip(
 ) -> None: ...
 
 
-@_route(op="fused_qk_norm_rope_cache_quant_shuffle", version=1)
+def _fused_qk_norm_rope_cache_quant_shuffle_fake(*args, **kwargs) -> None:
+    """Every result of this op is one of its in-place writes, so a trace of it
+    produces nothing. The fake is what lets `route` register the op, which
+    keeps the plugin's dispatch out of a caller's compiled graph."""
+    return
+
+
+@_route(
+    op="fused_qk_norm_rope_cache_quant_shuffle",
+    version=1,
+    fake=_fused_qk_norm_rope_cache_quant_shuffle_fake,
+)
 def fused_qk_norm_rope_cache_quant_shuffle(
     q: Tensor,
     k: Tensor,

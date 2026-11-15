@@ -93,12 +93,21 @@ static int select_opt_hd256(long batch, long total_k, int kv_head_num, bool is_c
     return remap ? 0x6 : 0;
 }
 
-// D256 launch width along the Q tiles.  Without remap_xy, x is the Q tile and workgroups go
-// to the XCCs round-robin by linear id, so with an even width the working tiles of the shorter
-// sequences land on a few XCCs.  The width is made odd unless the lengths are known equal
-// (q has exactly max_seqlen_q x batch rows); the extra column exits at once, since the kernel
-// exits by each sequence's own tile count.
-static int launch_width_hd256(int gdx, int max_seqlen_q, long total_q, int batch, int opt)
+// D192x128 launch options: remap_xy while kv heads x max(max_seqlen_q, mean kv length)
+// <= 2^18 rows; double_q always, reverse_kv when causal.
+static int select_opt_hd192x128(int max_seqlen_q, long batch, long total_k, int kv_head_num,
+                                bool is_causal)
+{
+    const long mean_k = total_k / (batch > 0 ? batch : 1);
+    const long len    = mean_k > max_seqlen_q ? mean_k : (long)max_seqlen_q;
+    const bool remap  = (long)kv_head_num * len <= (1L << 18);
+    return (is_causal ? 0x3 : 0x2) | (remap ? 0x4 : 0);
+}
+
+// D192x128 / D256 Q-tile launch width.  Without remap_xy the XCCs take workgroups round-robin
+// along x, so an even width puts the shorter sequences' tiles on a few XCCs; made odd unless
+// the lengths are known equal (the extra column exits at once).
+static int launch_width_odd(int gdx, int max_seqlen_q, long total_q, int batch, int opt)
 {
     if ((opt & 0x4) || gdx % 2 || (long)max_seqlen_q * batch == total_q)
         return gdx;
@@ -300,14 +309,15 @@ AITER_CTYPES_DEFINE_ENTRYPOINT_VOID(
     args.scalar     = softmax_scale;
     args.gqa        = gqa;
     args.q_head_num = q_head_num;
-    // s_opt: bit0 reverse_kv | bit1 double_q | bit2 remap_xy (gdx/gdy are swapped
-    // at launch when set).  D64 / D128 / D192x128 causal: 7 = 0b111, all three on.
-    // D192x128 non-causal: one Q tile per workgroup (no double_q).  D256: chosen per
-    // call (select_opt_hd256); the launch below follows it.
+    // s_opt: bit0 reverse_kv | bit1 double_q | bit2 remap_xy (gdx/gdy swapped at launch).
+    // D64 / D128: 0x7; D192x128 / D256: chosen per call.
     if (hd256)
         args.opt    = select_opt_hd256(batch, total_k, kv_head_num, is_causal != 0);
+    else if (hd192x128)
+        args.opt    = select_opt_hd192x128(max_seqlen_q, batch, total_k, kv_head_num,
+                                           is_causal != 0);
     else
-        args.opt    = (hd192x128 && mask_flag == 0) ? 0x4 : 0x7;
+        args.opt    = 0x7;
     args.lse        = return_lse ? 1 : 0;
     args.max_q_len  = max_seqlen_q;
     args.sink_addr  = sink ? sink->data_ptr() : nullptr;
@@ -360,8 +370,8 @@ AITER_CTYPES_DEFINE_ENTRYPOINT_VOID(
     const int  tg_div      = double_q ? 2 : 1;
     const int  q_tile_count = (max_seqlen_q + sub_Q - 1) / sub_Q;
     int        gdx          = (q_tile_count + tg_div - 1) / tg_div;
-    if (hd256)
-        gdx = launch_width_hd256(gdx, max_seqlen_q, total_q, batch, args.opt);
+    if (strided)
+        gdx = launch_width_odd(gdx, max_seqlen_q, total_q, batch, args.opt);
     const int gdy          = q_head_num;
     const int gdz          = batch;
 

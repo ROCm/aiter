@@ -22,10 +22,12 @@ from ..jit.utils.chip_info import get_gfx_runtime as get_gfx
 from ..utility.mx_types import MX_DEFAULT_ROUND_MODE
 from .gemm_op_a6w6 import (
     _K_TILE,
+    _PACKED_TILE_BYTES,
     _PADK,
     _SCALE_GROUP_SIZE,
     _TILE,
     _ceil,
+    _launch_output_row_chunks,
     _rotate_k32_torch,
     pack_scale_torch,
 )
@@ -456,6 +458,18 @@ def gemm_a6w4_asm(
     if out.ndim != 2:
         raise ValueError(f"gemm_a6w4_asm expects a 2D output, got {out.ndim}D")
     kernelName = kernelName or _default_gemm_a6w4_kernel(*out.shape, K)
+    if out.numel() * out.element_size() > _MAX_BUFFER_BYTES:
+        _launch_output_row_chunks(
+            lambda a, a_scale, o: _gemm_a6w4_asm(
+                a, B, a_scale, B_scale, o, K, kernelName, alpha
+            ),
+            A,
+            A_scale,
+            out,
+            K,
+            _PACKED_TILE_BYTES,
+        )
+        return out
     _gemm_a6w4_asm(A, B, A_scale, B_scale, out, K, kernelName, alpha)
     return out
 
@@ -489,8 +503,6 @@ def gemm_a6w4(
         raise ValueError(f"gemm_a6w4 padded K is outside the int32 kernel ABI: {padK}")
     selected_kernel = _select_gemm_a6w4_kernel(M, N, K, kernelName, device=A.device)
     padM, padN = _ceil(M, _TILE), _ceil(N, _TILE)
-    if padM * padN * torch.bfloat16.itemsize > _MAX_BUFFER_BYTES:
-        raise ValueError("gemm_a6w4 output exceeds the kernel's 2 GiB address range")
     out = torch.empty((padM, padN), dtype=dtype, device=A.device)
     gemm_a6w4_asm(
         A,
