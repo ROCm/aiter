@@ -115,7 +115,8 @@ SCALE_BYTES = HEAD_DIM // 32
 # Query rows one CTA scores. The tunable this kernel exists for; see the header
 # for why it is the dial onto arithmetic intensity and what bounds it.
 TILE_Q_CHOICES = (64, 128, 192, 256, 384, 512)
-_LDS_LIMIT = 64 * 1024
+_LDS_LIMIT = 64 * 1024  # page buffers + Q staging budget (sizes tile_q)
+_LDS_HW_BYTES = 160 * 1024  # gfx950 LDS per CU; one CTA may take all of it
 # Largest tile worth using, per arithmetic path. The register file bounds
 # tile_q: fp8 stops at the largest tile that still gets two waves per SIMD,
 # bf16 cannot reach two at any size and takes the largest that does not spill.
@@ -539,7 +540,13 @@ def build_prefill_score(g, k_fp4=False, q_fp8=False, nvfp4=None):
         _lut_bytes += 2 * WAVES * RAW_W
     if _total > _LDS_LIMIT:
         raise ValueError(f"the LDS page buffers need {_total} B")
+    # The NVFP4 fields (scale table, score staging, DMA landing zone) sit on top of the
+    # budgeted buffers: the 512-row DMA tile needs 76.8 KB in all and the exact 256-row
+    # tile 77.8 KB (group_segment_fixed_size in their ISA), past the 64 KB budget but well
+    # inside what gfx950 has. Check the sum against the hardware.
     _total += _lut_bytes
+    if _total > _LDS_HW_BYTES:
+        raise ValueError(f"the LDS fields need {_total} B, gfx950 has {_LDS_HW_BYTES}")
     SharedStorage = fx.struct(
         type("PrefillSharedStorage", (), {"__annotations__": _fields})
     )
@@ -1950,6 +1957,9 @@ def build_prefill_score(g, k_fp4=False, q_fp8=False, nvfp4=None):
             safe = (blk < blk_hi).select(blk, blk_lo)
             safe = (blk_lo < blk_hi).select(safe, fx.Int32(0))
             if const_expr(DMA):
+                # Legacy GEP kept on purpose: FlyDSL 0.5.0's `fly.ptr` has no constant
+                # (addrspace 4) address space and `fx.ptr_load` no `invariant` flag, so
+                # this scalar block-table load has no pointer-API form (see above).
                 addr = buffer_ops.get_element_ptr(
                     bt_const,
                     byte_offset=((b * i32_stride_bt_b + safe) * fx.Int32(4)).ir_value(),
