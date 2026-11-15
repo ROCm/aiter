@@ -189,16 +189,17 @@ def suite_of(prov):
 
 
 def table_list(path):
-    """Every JSON table in combo.log, in order, duplicates kept."""
-    out = []
+    """Every JSON table in combo.log, in order of first appearance. Tables that
+    share a name (e.g. mega_moe, one child per size) are merged into one."""
+    out = {}
     for line in path.read_text(errors="replace").splitlines():
         try:
             t = json.loads(line)
         except json.JSONDecodeError:
             continue
         if isinstance(t, dict) and "name" in t and isinstance(t.get("rows"), list):
-            out.append((t["name"], t["rows"]))
-    return out
+            out.setdefault(t["name"], []).extend(t["rows"])
+    return list(out.items())
 
 
 def cell(v):
