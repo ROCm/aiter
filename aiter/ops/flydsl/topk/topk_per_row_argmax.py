@@ -8,7 +8,7 @@ from functools import lru_cache
 import torch
 from flydsl.expr import BFloat16, Float16, Float32
 
-from ..kernels.tensor_shim import _run_compiled
+from ..kernels.topk.topk_launch import run_topk_launcher
 from ..kernels.topk.topk_per_row_argmax import (
     VEC_BY_ELEM,
     build_topk_per_row_argmax_module,
@@ -97,7 +97,7 @@ def topk_per_row_argmax(
         # One split writes the answer directly; the partials are unread, so pass
         # the output buffer in their place rather than allocating a pair to
         # ignore.
-        _run_compiled(
+        run_topk_launcher(
             slice_launch,
             scores,
             len_slot,
@@ -116,7 +116,7 @@ def topk_per_row_argmax(
     # buffer would be shared across streams.
     part_key = torch.empty((rows, splits), dtype=torch.int32, device=scores.device)
     part_col = torch.empty_like(part_key)
-    _run_compiled(
+    run_topk_launcher(
         slice_launch,
         scores,
         len_slot,
@@ -128,7 +128,7 @@ def topk_per_row_argmax(
         rows,
         stream,
     )
-    _run_compiled(
+    run_topk_launcher(
         fold_launch,
         scores,
         len_slot,

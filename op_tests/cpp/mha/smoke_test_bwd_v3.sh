@@ -1,13 +1,20 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2018-2026, Advanced Micro Devices, Inc. All rights reserved.
 #!/bin/sh
-EXE="$(find . -name bwd.exe -type f | head -n 1)"
+BWD="$(find . -name bwd.exe -type f | head -n 1)"
+EXE=run_case
 KNAME=1
 
 export CK_WARMUP=0
 export CK_REPEAT=1
 
 COMMON_ARGS='-v=1'
+
+# bwd.exe exits nonzero when a case fails or has no kernel; such cases are printed and counted
+FAILED=0
+run_case() {
+    "$BWD" "$@" || { FAILED=$((FAILED + 1)); echo "FAILED: $BWD $*"; }
+}
 
 run_batch_mode_tests() {
     for prec in "fp16" "bf16" ; do
@@ -174,11 +181,50 @@ run_gfx950_hd192_128_bwd_v3() {
     done
 }
 
-run_batch_mode_tests
-run_group_mode_tests
-run_swa_tests
-# run_gfx950_group_bwd_v3
-# run_gfx950_bwd_v3
+# gfx950 sliding window kernels: top-left (t:) and bottom-right (b:) windows in batch and group mode
+run_gfx950_swa_tests() {
+    for prec in "bf16" "fp16" ; do
+    for v3_atomic_fp32 in 0 1 ; do
+    for mode in 0 1 ; do
+    for perm in 0 1 ; do
+    for hdim in 72 128 ; do
+    for seqlen in "200 256" "777 777" "1000 600" ; do
+    for mask in "t:0,0" "t:64,64" "t:-1,100" "t:15,17" "b:127,0" "b:256,0" "b:300,-1" "xb:257" ; do
 
-# hdim 192+128 tests
-# run_gfx950_hd192_128_bwd_v3
+    sq=${seqlen% *}
+    sk=${seqlen#* }
+    $EXE -prec=$prec -b=2 -h=4 -h_k=2 -d=$hdim -s=$sq -s_k=$sk -iperm=$perm -operm=$perm -mask=$mask -bwd_v3=1 -v3_atomic_fp32=$v3_atomic_fp32 -mode=$mode -kname=$KNAME $COMMON_ARGS
+
+    done
+    done
+    done
+    done
+    done
+    done
+    done
+}
+
+# usage: smoke_test_bwd_v3.sh [arch], arch defaults to the gfx target of the first GPU
+ARCH=${1:-$(rocminfo 2>/dev/null | grep -m1 -oE "gfx[0-9a-f]+")}
+case "$ARCH" in
+    gfx942)
+        run_batch_mode_tests
+        run_group_mode_tests
+        run_swa_tests
+        ;;
+    gfx950)
+        run_gfx950_bwd_v3
+        run_gfx950_group_bwd_v3
+        run_gfx950_hd192_128_bwd_v3
+        run_gfx950_swa_tests
+        ;;
+    *)
+        echo "unsupported arch '$ARCH', expected gfx942 or gfx950"
+        exit 1
+        ;;
+esac
+
+if [ $FAILED -gt 0 ]; then
+    echo "$FAILED case(s) failed"
+    exit 1
+fi

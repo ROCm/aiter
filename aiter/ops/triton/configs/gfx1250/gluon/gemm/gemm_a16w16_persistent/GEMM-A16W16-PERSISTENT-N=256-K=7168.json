@@ -104,11 +104,11 @@
         "waves_per_eu": 1
     },
     "any": {
-        "BLOCK_M": 128,
+        "BLOCK_M": 64,
         "BLOCK_N": 128,
         "BLOCK_K": 128,
-        "NUM_BUFFERS": 4,
+        "NUM_BUFFERS": 5,
         "num_warps": 4,
-        "waves_per_eu": 0
+        "waves_per_eu": 1
     }
 }

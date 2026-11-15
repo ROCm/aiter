@@ -54,12 +54,13 @@ b,m,n,k,w_scale_block
 For `32x32`, activation scales have shape `[m,b,k/32]` and weight scales
 have shape `[b,n/32,k/32]`. Per-row weight quantization (`1x32`) uses
 weight scales `[b,n,k/32]` and activation scales `[m,b,k/32]`. It is supported
-by OPUS kids 9700--9710 and 9713; the joint tuner skips FlyDSL candidates for this block.
+by OPUS kids 9700--9710 and 9713, and by FlyDSL.
 Compact OPUS kernels support `128x128` weight scales only; the existing
 OPUS families provide the `32x32` candidates.
 
 All dimensions must be positive integers. For `1x32`, N must be a multiple of
-16 and K a multiple of 128; other blocks require both multiples of 128.
+16 and K a multiple of 64 (OPUS needs 128; FlyDSL also runs K = 64 mod 128,
+e.g. 576); other blocks require both multiples of 128.
 Individual kernels impose additional tile, layout and split-K constraints;
 the tuner filters candidates for each shape. Weights use the `(16,16)`
 preshuffle layout, scales use ordinary E8M0 storage, and tuning uses BF16 output.
@@ -177,7 +178,13 @@ export AITER_CONFIG_BATCHED_GEMM_A8W8_BLOCKSCALE_MXSCALE_BPRESHUFFLE=/tmp/bmm_tu
 
 This selects that CSV for `aiter.batched_gemm_a8w8_mxscale_bpreshuffle` calls.
 The same environment override can select the pre-tune baseline for `--compare`.
-When a config lookup misses, the existing FlyDSL fallback remains in effect.
+When a config lookup misses, the FlyDSL heuristic runs the shape; on gfx950,
+`1x32` runs OPUS's heuristic kid, or FlyDSL's when no OPUS kid runs the shape.
+A 2-D `gemm_a8w8_blockscale_bpreshuffle` call with E8M0 scales runs the `b=1`
+FlyDSL kernel but reads the `kernelId=bmm` rows of
+`a8w8_blockscale_mxscale_bpreshuffle_tuned_gemm.csv`, not this CSV;
+`csrc/gemm_a8w8_mxfp8_bpreshuffle/gemm_a8w8_mxfp8_bpreshuffle_tune.py
+--mxscale_table` tunes those rows.
 
 ## Other useful options
 

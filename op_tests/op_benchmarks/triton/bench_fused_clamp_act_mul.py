@@ -6,8 +6,8 @@ weights + optional FP8 group quant).
 
 Structure mirrors the other op_benchmarks/triton bench scripts (a
 ``triton.testing.Benchmark`` + ``perf_report`` shape sweep, ``--metric`` /
-``--shape`` / ``-o`` / ``-print_vgpr``). Timing uses ``do_bench_cudagraph`` (CUDA
-graph replay) rather than ``do_bench`` to remove host launch overhead — this op
+``--shape`` / ``-o`` / ``-print_vgpr``). Timing uses ``RotatingBufferBench.bench`` ( rotating buffers +
+CUDA graph replay) rather than ``do_bench`` to remove host launch overhead — this op
 is a short, memory-bound elementwise pass where per-launch overhead would
 otherwise dominate. ``--backend {auto,triton,gluon}`` selects the wrapper's
 dispatch so the Triton and gfx1250 Gluon paths can be compared head-to-head.
@@ -15,6 +15,8 @@ dispatch so the Triton and gfx1250 Gluon paths can be compared head-to-head.
 Correctness is not checked here — see op_tests/test_fused_clamp_act_mul.py for
 the value/scale reference test.
 """
+
+import functools
 
 import torch
 import triton
@@ -25,12 +27,17 @@ from aiter.ops.triton.fusions.fused_clamp_act_mul import (
     fused_clamp_act_mul,
 )
 from op_tests.op_benchmarks.triton.utils.argparse import (
+    get_do_bench_graph_kwargs,
     get_parser,
+    get_rot_bufs_kwargs,
     override_parser_action,
 )
 from op_tests.op_benchmarks.triton.utils.benchmark_utils import (
     get_caller_name_no_ext,
     print_vgpr,
+)
+from op_tests.op_benchmarks.triton.utils.rotating_buffer_bench import (
+    RotatingBufferBench,
 )
 
 # quant mode -> (dtype_quant, quant_block_size, scale_dtype_fmt)
@@ -39,6 +46,37 @@ _QUANT_MODES = {
     "fp8": (dtypes.fp8, 128, "fp32"),
     "ue8m0": (dtypes.fp8, 32, "ue8m0"),
 }
+
+
+def _generate_inputs(
+    M,
+    n_half,
+    dtype,
+    dtype_quant,
+    quant_block_size,
+    scale_dtype_fmt,
+    HAS_QUANT,
+    weighted,
+    weight_shape,
+):
+    inp = torch.randn((M, 2 * n_half), dtype=dtype, device="cuda") * 3.0
+    weights = None
+    if weighted:
+        w_cols = 1 if weight_shape == "broadcast" else n_half
+        weights = torch.randn((M, w_cols), dtype=dtype, device="cuda")
+
+    # Preallocate outputs so the timed fn does no allocation (clean CUDA-graph
+    # capture): the wrapper writes into the provided out/scale buffers.
+    out_dtype = dtype_quant if HAS_QUANT else dtype
+    out = torch.empty((M, n_half), dtype=out_dtype, device="cuda")
+    num_blocks = (n_half + quant_block_size - 1) // quant_block_size
+    if HAS_QUANT:
+        scale_dt = torch.uint8 if scale_dtype_fmt == "ue8m0" else torch.float32
+        scale = torch.empty((M, num_blocks), dtype=scale_dt, device="cuda")
+    else:
+        scale = None
+
+    return (inp, weights, out, scale)
 
 
 def get_x_vals():
@@ -60,8 +98,7 @@ def run_benchmark(args):
         backend = "gluon" if _is_gluon_available() else "triton"
     elif backend == "gluon" and not _is_gluon_available():
         raise ValueError(
-            "backend='gluon' requested but this arch has no Gluon port "
-            "(only gfx1250)."
+            "backend='gluon' requested but this arch has no Gluon port (only gfx1250)."
         )
 
     if args.metric == "time":
@@ -94,40 +131,51 @@ def run_benchmark(args):
     swiglu_limit = args.swiglu_limit
     weighted = bool(args.weighted)
     weight_shape = args.weight_shape
+    bencher = RotatingBufferBench.from_dict(
+        {**get_rot_bufs_kwargs(args), **get_do_bench_graph_kwargs(args)}
+    )
 
     @triton.testing.perf_report([benchmark])
     def bench_fused_clamp_act_mul(M, n_half, metric, **kwargs):
-        inp = torch.randn((M, 2 * n_half), dtype=dtype, device="cuda") * 3.0
-        weights = None
-        if weighted:
-            w_cols = 1 if weight_shape == "broadcast" else n_half
-            weights = torch.randn((M, w_cols), dtype=dtype, device="cuda")
-
-        # Preallocate outputs so the timed fn does no allocation (clean CUDA-graph
-        # capture): the wrapper writes into the provided out/scale buffers.
-        out_dtype = dtype_quant if HAS_QUANT else dtype
-        out = torch.empty((M, n_half), dtype=out_dtype, device="cuda")
         num_blocks = (n_half + quant_block_size - 1) // quant_block_size
-        if HAS_QUANT:
-            scale_dt = torch.uint8 if scale_dtype_fmt == "ue8m0" else torch.float32
-            scale = torch.empty((M, num_blocks), dtype=scale_dt, device="cuda")
-        else:
-            scale = None
 
-        fn = lambda: fused_clamp_act_mul(
-            inp,
-            out=out,
-            scale=scale,
-            swiglu_limit=swiglu_limit,
-            activation=activation,
-            weights=weights,
-            dtype_quant=dtype_quant,
-            quant_block_size=quant_block_size,
-            scale_dtype_fmt=scale_dtype_fmt,
-            backend=backend,
+        _p_gen = functools.partial(
+            _generate_inputs,
+            M,
+            n_half,
+            dtype,
+            dtype_quant,
+            quant_block_size,
+            scale_dtype_fmt,
+            HAS_QUANT,
+            weighted,
+            weight_shape,
         )
+        _out_val_keys = ["inp", "weights", "out", "scale"]
+        rot_bufs = bencher.build_pool([_p_gen], [_out_val_keys])
 
-        ms = triton.testing.do_bench_cudagraph(fn, rep=args.rep, return_mode="mean")
+        # Shapes/dtypes are identical across the pool, so any entry works for sizing.
+        sample = rot_bufs[0]
+        inp = sample["inp"]
+        weights = sample["weights"]
+        out = sample["out"]
+        scale = sample["scale"]
+
+        def _run(inp, weights, out, scale):
+            fused_clamp_act_mul(
+                inp,
+                out=out,
+                scale=scale,
+                swiglu_limit=swiglu_limit,
+                activation=activation,
+                weights=weights,
+                dtype_quant=dtype_quant,
+                quant_block_size=quant_block_size,
+                scale_dtype_fmt=scale_dtype_fmt,
+                backend=backend,
+            )
+
+        ms = bencher.bench(_run)
 
         # Memory-bound: read gate+up (M x 2N), write out (M x N) + small scale
         # buffer. Weights add M x 1 when broadcast (negligible) or a full
@@ -206,14 +254,6 @@ def parse_args(args: list[str] | None = None):
         choices=("broadcast", "full"),
         help="weight layout when --weighted 1: 'broadcast' is [M, 1] applied "
         "across the row, 'full' is [M, n_half], one weight per output element.",
-    )
-    parser.add_argument(
-        "--rep",
-        type=int,
-        default=20,
-        help="do_bench_cudagraph measurement target, in ms (default is 20). "
-        "captured graph unrolls rep/kernel_ms iterations, so its made configurable "
-        "Large rep can bloat the graph for small kernels and break profilers.",
     )
     parser.add_argument(
         "-print_vgpr",

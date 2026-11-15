@@ -30,9 +30,14 @@ from csrc.opus_gemm.opus_gemm_common import (
 )
 
 from ...jit.core import AITER_CONFIGS, AITER_LOG_TUNED_CONFIG
+from ...jit.utils.build_targets import base_gfx_arch
 from ...jit.utils.chip_info import get_cu_num
 from ...jit.utils.chip_info import get_gfx_runtime as get_gfx
-from ..gemm_op_common import get_padded_m, with_mxscale_w_scale_block
+from ..gemm_op_common import (
+    get_padded_m,
+    mxscale_bmm_groups_of_block,
+    with_mxscale_w_scale_block,
+)
 from ._arch import GFX942, GFX950, GFX1250
 from .launch_plan import (
     A16W16LaunchPlan,
@@ -762,6 +767,9 @@ def lookup_mxscale_bmm_config(
     if cu_num is None:
         cu_num = get_cu_num()
     tuned = _load_mxscale_bmm_tuned(libtype, bpreshuffle)
+    # A0 bring-up: reuse gfx1250 family tuned rows when strict has none.
+    if base_gfx_arch(gfx) != gfx and gfx not in {key[0] for key in tuned}:
+        gfx = base_gfx_arch(gfx)
     row, padded_m = None, m
     for gl in (None, 0, 1):
         padded_m = m if gl is None else get_padded_m(m, n, k, gl)
@@ -803,13 +811,6 @@ def _validate_mxscale_bmm_group_size(group_size: int) -> None:
 def mxscale_bmm_group_of_block(w_scale_block: str) -> int:
     """Return K grouping; use groups_of_block for weight-scale addressing."""
     return mxscale_bmm_groups_of_block(w_scale_block)[1]
-
-
-def mxscale_bmm_groups_of_block(w_scale_block: str) -> tuple[int, int]:
-    groups = {"1x32": (1, 32), "32x32": (32, 32), "128x128": (128, 128)}
-    if w_scale_block not in groups:
-        raise ValueError(f"unsupported OPUS MXFP8 BMM scale block {w_scale_block!r}")
-    return groups[w_scale_block]
 
 
 def _heuristic_mxscale_bmm_kid(

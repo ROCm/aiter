@@ -58,8 +58,10 @@ from aiter.jit.utils.chip_info import get_cu_num, get_gfx_runtime
 from aiter.ops.comm_fused_moe_runtime import CommFusedMoeRuntime
 from aiter.ops.flydsl.comm_fused_moe_host import (
     ShapeKey,
+    _winner_table,
     config_name,
     create_flydsl_comm_fused_runners,
+    get_gpu_model,
     is_flydsl_comm_fused_moe_available,
     winners_for,
 )
@@ -1184,6 +1186,9 @@ def _runtime_skip_reason() -> str | None:
         return f"requires one of {SUPPORTED_GFX}, got {gfx}"
     if not is_flydsl_comm_fused_moe_available():
         return "requires ROCm >= 7.2 and a compatible mori.cco installation"
+    gpu_model = get_gpu_model()
+    if all(key.gpu_model != gpu_model for key in _winner_table()):
+        return f"no comm-fused winners are tuned for {gpu_model}"
     return None
 
 

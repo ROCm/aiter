@@ -6,6 +6,9 @@ import torch
 import torch.nn.functional as F
 
 from aiter.ops.shuffle import shuffle_weight
+from aiter.ops.triton._triton_kernels.gemm.fused.fused_gemm_a8w8_blockscale_split_cat import (
+    _get_config,
+)
 from aiter.ops.triton.gemm.fused.fused_gemm_a8w8_blockscale_split_cat import (
     fused_gemm_a8w8_blockscale_preshuffle_split_cat,
     fused_gemm_a8w8_blockscale_split_cat,
@@ -214,6 +217,41 @@ def test_fused_gemm_a8w8_blockscale_split_cat(dtype, M, N, K, D, S3, layout, imp
     c1_torch, c2_torch = run_torch(x, w, y, x_scale, w_scale, S1, S2, D, dtype)
     c1_triton, c2_triton = run_triton(
         impl, x, w_triton, y, x_scale_triton, w_scale, S1, S2, D, dtype
+    )
+
+    torch.testing.assert_close(c1_torch, c1_triton, atol=0.01, rtol=1e-2)
+    torch.testing.assert_close(c2_torch, c2_triton, atol=0.01, rtol=1e-2)
+
+
+@pytest.mark.parametrize("num_ksplit", [3, 6])
+@pytest.mark.parametrize("shuffle", [False, True])
+def test_fused_gemm_a8w8_blockscale_split_cat_uneven_splitk(num_ksplit, shuffle):
+    # K=1792 has 14 K blocks. compute_splitk_params rounds 3 splits to 5 blocks
+    # each and 6 splits to 5 splits of 3 blocks, so the last split runs past K.
+    M, N, K, D, S3 = 32, 1280, 1792, 16, 64
+    S1 = S2 = N // D // 2
+    x, w, w_triton, y, x_scale, x_scale_triton, w_scale = (
+        generate_fused_gemm_a8w8_blockscale_split_cat_inputs(
+            M, N, K, S3, *block_shape, shuffle=shuffle
+        )
+    )
+    config = {**_get_config(M, N, K, shuffle)[0], "NUM_KSPLIT": num_ksplit}
+    impl = (
+        fused_gemm_a8w8_blockscale_preshuffle_split_cat
+        if shuffle
+        else fused_gemm_a8w8_blockscale_split_cat
+    )
+
+    c1_torch, c2_torch = run_torch(x, w, y, x_scale, w_scale, S1, S2, D)
+    c1_triton, c2_triton = impl(
+        x,
+        w_triton,
+        y.expand(M, D, -1),
+        x_scale_triton,
+        w_scale,
+        S1,
+        S2,
+        config=config,
     )
 
     torch.testing.assert_close(c1_torch, c1_triton, atol=0.01, rtol=1e-2)

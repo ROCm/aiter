@@ -880,9 +880,9 @@ class DeepseekScalingRotaryEmbedding(RotaryEmbedding):
         )
 
     def _compute_inv_freq(self, scaling_factor: float) -> torch.Tensor:
+        # Cache tensors follow the construction device, including meta replicas.
         pos_freqs = self.base ** (
-            torch.arange(0, self.rotary_dim, 2, dtype=dtypes.fp32, device="cuda")
-            / self.rotary_dim
+            torch.arange(0, self.rotary_dim, 2, dtype=dtypes.fp32) / self.rotary_dim
         )
         inv_freq_extrapolation = 1.0 / pos_freqs
         inv_freq_interpolation = 1.0 / (scaling_factor * pos_freqs)
@@ -909,7 +909,6 @@ class DeepseekScalingRotaryEmbedding(RotaryEmbedding):
         inv_freq = self._compute_inv_freq(self.scaling_factor)
         t = torch.arange(
             self.max_position_embeddings * self.scaling_factor,
-            device="cuda",
             dtype=dtypes.fp32,
         )
         freqs = torch.einsum("i,j -> ij", t, inv_freq)
@@ -1763,6 +1762,7 @@ def get_rope(
         rope_scaling_args,
         dual_chunk_attention_args,
         dtype,
+        torch.get_default_device(),
     )
     if key in _ROPE_DICT:
         return _ROPE_DICT[key]

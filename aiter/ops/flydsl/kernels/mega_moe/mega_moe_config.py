@@ -442,6 +442,7 @@ class _TuningContext:
     a_dtype: str
     apply_fp4: bool
     fixed_slot: bool = False
+    world_size: int = 8
 
 
 def _fp4_common_prelude(config: MegaMoEConfig, ctx: _TuningContext) -> MegaMoEConfig:
@@ -786,6 +787,39 @@ def _tune_v41_flash_ep2(config: MegaMoEConfig, ctx: _TuningContext) -> MegaMoECo
     return config
 
 
+def _tune_v41_flash_ep8(config: MegaMoEConfig, ctx: _TuningContext) -> MegaMoEConfig:
+    if ctx.apply_fp4 or ctx.world_size != 8:
+        return config
+    if ctx.fixed_slot:
+        if ctx.bucket in (16, 32):
+            return _replace_config(config, stage1={"tile_n": 256, "grid_mult": 2})
+        if ctx.bucket == 128:
+            return _replace_config(config, stage1={"tile_n": 256})
+        return config
+    # Finite producers retire into consumers; the wider copy cohort reduces
+    # compact decode's payload-readiness tail without changing its wire layout.
+    if (ctx.mtpr == 32768 and ctx.bucket <= 512) or (
+        ctx.mtpr in (256, 512) and ctx.bucket == ctx.mtpr
+    ):
+        config = _replace_config(config, stage1={"num_dispatch_cu": 224})
+    if ctx.mtpr == 8192 and ctx.bucket == 128:
+        return _replace_config(config, stage1={"num_dispatch_cu": 160})
+    if ctx.mtpr not in (4096, 8192, 16384, 32768) or ctx.bucket < 4096:
+        return config
+    # The plain deep pipeline outperforms the default aligned-pair schedule.
+    # The existing 32K skew path benefits from the full persistent M cohort.
+    return _replace_config(
+        config,
+        stage2={
+            "b2stage": True,
+            "deep_a_pipeline": True,
+            "aligned_pair": False,
+            "pair_cu": 0,
+            "skew_cu": 240 if ctx.bucket == 32768 else config.stage2.skew_cu,
+        },
+    )
+
+
 @dataclass(frozen=True, slots=True)
 class NetworkProfile:
     """One tunable network, identified by (experts_per_rank, model_dim, inter_dim).
@@ -806,10 +840,18 @@ class NetworkProfile:
     inter_dim: int
     tuner: Callable[[MegaMoEConfig, _TuningContext], MegaMoEConfig]
     family_experts_per_rank: tuple[int, ...] = ()
+    fp4_prelude: bool = False
 
 
 _NETWORKS = (
-    NetworkProfile("r1", R1_EXPERTS_PER_RANK, R1_MODEL_DIM, R1_INTER_DIM, _tune_r1),
+    NetworkProfile(
+        "r1",
+        R1_EXPERTS_PER_RANK,
+        R1_MODEL_DIM,
+        R1_INTER_DIM,
+        _tune_r1,
+        fp4_prelude=True,
+    ),
     NetworkProfile(
         "v4_pro",
         REFERENCE_EXPERTS_PER_RANK,
@@ -817,11 +859,20 @@ _NETWORKS = (
         V4_INTER_DIM,
         _tune_v4_pro,
         V4_EPLB_EXPERTS_PER_RANKS,
+        fp4_prelude=True,
     ),
     NetworkProfile(
         "kimi_k3", KIMI_K3_EXPERTS_PER_RANK, K3_MODEL_DIM, K3_INTER_DIM, _tune_kimi_k3
     ),
-    NetworkProfile("v41_flash_ep2", 192, 5120, 2304, _tune_v41_flash_ep2),
+    NetworkProfile(
+        "v41_flash_ep2",
+        192,
+        5120,
+        2304,
+        _tune_v41_flash_ep2,
+        fp4_prelude=True,
+    ),
+    NetworkProfile("v41_flash_ep8", 48, 5120, 2304, _tune_v41_flash_ep8),
 )
 
 
@@ -955,14 +1006,11 @@ def select_mega_moe_config(
         a_dtype=a_dtype,
         apply_fp4=apply_fp4,
         fixed_slot=fixed_slot_dispatch,
+        world_size=world_size,
     )
-    # FP4 common prelude applies to every matched non-K3 network, including the
-    # V4-Pro EPLB redundant-expert profiles 52/56 that have no tuner; apply it as
-    # a pre-rule, then let the per-network tuner add its table.  Only the
-    # canonical experts-per-rank carries a tuner (EPLB family profiles get the
-    # prelude only).
-    is_k3 = profile is not None and profile.name == "kimi_k3"
-    if apply_fp4 and profile is not None and not is_k3:
+    # Keep FP4 base adjustments opt-in: adding an A8-only profile must not
+    # silently retune its FP4 path. EPLB families inherit their profile's prelude.
+    if apply_fp4 and profile is not None and profile.fp4_prelude:
         config = _fp4_common_prelude(config, ctx)
     if profile is not None and experts_per_rank == profile.experts_per_rank:
         config = profile.tuner(config, ctx)

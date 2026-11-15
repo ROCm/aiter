@@ -149,9 +149,9 @@
         "BLOCK_SIZE_M": 256,
         "BLOCK_SIZE_N": 128,
         "BLOCK_SIZE_K": 128,
-        "GROUP_SIZE_M": 16,
+        "GROUP_SIZE_M": 1,
         "num_warps": 4,
-        "NUM_BUFFERS": 6,
+        "NUM_BUFFERS": 4,
         "waves_per_eu": 1,
         "cache_modifier": null,
         "NUM_KSPLIT": 1

@@ -286,6 +286,10 @@ _base_tiles_950_2wave = [
 # Combo sweep: lds_stage x waves_per_eu x async_copy x xcd_swizzle
 # ---------------------------------------------------------------------------
 _ASYNC_COPY_VALS = (0, 1)
+# acp=1 aborts the gfx942 compile ("LLVM ERROR: Do not know how to expand this
+# operator's operand!" on the 128-bit llvm.amdgcn.raw.ptr.buffer.load.lds); under
+# --mp the abort surfaces as a GPU hang.
+_ASYNC_COPY_VALS_942 = (0,)
 _WAVES_PER_EU    = (0, 1, 2, 3, 4)
 _XCD_SWIZZLE_VALS = (0, 4)  # 0=off, >0=XCD remap group size
 _LDS_STAGES      = (2, 1)  # 2=double-buffer ping-pong, 1=single A-LDS buffer
@@ -369,13 +373,15 @@ def k_split_candidates(ki, M: int, N: int, K: int, cu_num: int = 256) -> list[in
     return [d for d in range(2, max_split + 1) if n_tiles % d == 0]
 
 
-def _build_kernels_list(tiles, total_vgpr=512, start_idx=0):
+def _build_kernels_list(
+    tiles, total_vgpr=512, start_idx=0, async_copy_vals=_ASYNC_COPY_VALS
+):
     kl = {}
     idx = start_idx
 
     for lds in _LDS_STAGES:
         for wpe in _WAVES_PER_EU:
-            for acp in _ASYNC_COPY_VALS:
+            for acp in async_copy_vals:
                 for xcd in _XCD_SWIZZLE_VALS:
                     for tm, tn, tk in tiles:
                         if wpe > 0 and wpe > _estimate_max_wpe(
@@ -389,7 +395,8 @@ def _build_kernels_list(tiles, total_vgpr=512, start_idx=0):
 
 kernels_list_942 = _build_kernels_list(
     _base_tiles_common + _base_tiles_942_extra,
-    total_vgpr=_vgpr_per_simd("gfx942"))
+    total_vgpr=_vgpr_per_simd("gfx942"),
+    async_copy_vals=_ASYNC_COPY_VALS_942)
 kernels_list_950 = _build_kernels_list(
     _base_tiles_common + _base_tiles_950_extra,
     total_vgpr=_vgpr_per_simd("gfx950"))

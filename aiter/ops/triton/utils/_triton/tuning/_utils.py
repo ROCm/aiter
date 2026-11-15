@@ -91,12 +91,15 @@ def iter_records(path):
                 continue
 
 
-def read_records(path):
+def read_records(path, cu_num=None):
     """Last record per candidate. A 'start' marker never replaces a final record, so a candidate
-    the worker died on keeps status 'start'."""
+    the worker died on keeps status 'start'. With cu_num, only records timed on that CU count.
+    """
     records = {}
     for record in iter_records(path):
         if record["status"] == "ready":
+            continue
+        if cu_num is not None and record.get("cu_num") != cu_num:
             continue
         key = "baseline" if record.get("baseline") else config_key(record["config"])
         is_final = record["status"] != "start"

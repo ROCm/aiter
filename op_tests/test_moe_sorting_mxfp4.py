@@ -18,6 +18,7 @@ Covers two operations, dispatched by ``--quant-dtype``:
 
 import argparse
 import itertools
+import os
 
 import pandas as pd
 import torch
@@ -579,6 +580,109 @@ for _qd, _topk, _stage, _bound in itertools.product(
 
 
 # ---------------------------------------------------------------------------
+# Padding sentinels under a num_local_tokens count.
+#
+# Sorted with a real-row count, a block's padding slots hold the sentinel
+# (topk << 24 | count): a real token id with an out-of-range slot. The stage-2
+# quant + sort must not take it for a route -- its row, count * topk + topk,
+# lies past `out` when count is the last real row -- and must leave the real
+# routes exactly as an uncounted sort does.
+# ---------------------------------------------------------------------------
+_PS_TAIL = 2  # extra out rows checked for stray writes
+
+
+def _check_padding_sentinels(quant_dtype, tokens, topk, bound):
+    weights, ids = _zero_weight_routing(topk)
+    weights, ids = weights[:tokens].contiguous(), ids[:tokens].contiguous()
+    valid = tokens - 1
+    ids[valid:] = -1
+    weights[valid:] = 0.0
+    count = torch.tensor([valid], dtype=torch.int32)
+    rows = tokens * topk
+    torch.manual_seed(9)
+    x = torch.randn(rows, _ZW_COLS, dtype=torch.bfloat16)
+    out_cols = _ZW_COLS // 2 if quant_dtype == dtypes.fp4x2 else _ZW_COLS
+    tag = f"{quant_dtype} tokens={tokens} topk={topk} bound={bound}"
+    results = []
+    for num_local_tokens in (count, None):
+        sorted_ids, sorted_w, _, num_valid, _ = moe_sorting(
+            ids, weights, _ZW_EXPERTS, _ZW_COLS, torch.bfloat16, _ZW_BLOCK,
+            None, num_local_tokens,
+        )  # fmt: skip
+        buf = torch.full((rows + _PS_TAIL, out_cols), _SENTINEL, dtype=torch.uint8)
+        scale = torch.empty(
+            ((sorted_ids.shape[0] + 31) // 32 * 32, _ZW_COLS // 32), dtype=torch.uint8
+        )
+        args = (buf[:rows].view(quant_dtype), scale.view(dtypes.fp8_e8m0), x,
+                sorted_ids, num_valid, tokens, _ZW_BLOCK, rows)  # fmt: skip
+        if bound:
+            fused_dynamic_mx_quant_moe_sort_hip_bounded(
+                *args, _ZW_EXPERTS, 32, sorted_w
+            )
+        else:
+            fused_dynamic_mx_quant_moe_sort_hip(*args, 32, sorted_w)
+        assert (buf[rows:] == _SENTINEL).all(), f"{tag}: wrote past out"
+        results.append(buf[: valid * topk])
+    assert torch.equal(results[0], results[1]), f"{tag}: a real route changed"
+    aiter.logger.info("padding sentinels OK: %s", tag)
+
+
+for _qd, _tokens, _bound in itertools.product(
+    (dtypes.fp8, dtypes.fp4x2), (2, 5, 7, 33), (False, True)
+):
+    _check_padding_sentinels(_qd, _tokens, 6, _bound)
+
+
+# ---------------------------------------------------------------------------
+# Row tails of the scale sort.
+#
+# Each thread reads its part of a scale row in 2- to 16-byte loads. When a row
+# ends inside a load, the last row's final load runs past the end of the scale
+# buffer, and the buffer range check read the dword holding that row's last
+# in-range bytes as 0, so the last route lost its final scales (#7646). Row
+# lengths with 1-3 bytes past a dword in every dispatch bucket, a row shorter
+# than one load (96), and a whole-dword row that ends inside an 8-byte load
+# (1152); both stages; 30000 tokens take the scatter store of the 32-row
+# buckets.
+# ---------------------------------------------------------------------------
+_TAIL_EXPERTS, _TAIL_TOPK = 64, 8
+
+
+def _check_tail_scales(model_dim, tokens, stage):
+    torch.manual_seed(10)
+    ids = torch.rand((tokens, _TAIL_EXPERTS)).topk(_TAIL_TOPK, dim=1).indices
+    sorted_ids, _, _, num_valid, _ = moe_sorting(
+        ids.to(torch.int32), torch.rand((tokens, _TAIL_TOPK)), _TAIL_EXPERTS,
+        model_dim, torch.bfloat16, 32,
+    )  # fmt: skip
+    topk = _TAIL_TOPK if stage == "stage2" else 1
+    # Nonzero bytes, so a scale read as 0 shows.
+    scale = torch.randint(1, 255, (tokens * topk, model_dim // 32), dtype=torch.uint8)
+    ref = run_torch(
+        scale.view(tokens, topk, -1) if topk > 1 else scale.clone(),
+        sorted_ids.clone(), num_valid[0], tokens,
+    )  # fmt: skip
+    out = torch.zeros(
+        ((sorted_ids.shape[0] + 31) // 32 * 32, ((model_dim // 32) + 7) // 8 * 8),
+        dtype=torch.uint8,
+    )
+    aiter.mxfp4_moe_sort_hip(out, scale, sorted_ids, num_valid, tokens, model_dim)
+    tag = f"model_dim={model_dim} tokens={tokens} {stage}"
+    bad = int((out != ref[: out.shape[0]]).sum())
+    assert bad == 0, f"{tag}: {bad} scale bytes differ"
+    aiter.logger.info("scale row tails OK: %s", tag)
+
+
+for _dim, _tokens, _stage in itertools.product(
+    (96, 224, 320, 800, 1152, 1888, 2880, 5824, 7232, 12352),
+    (1, 5, 300),
+    ("stage1", "stage2"),
+):
+    _check_tail_scales(_dim, _tokens, _stage)
+_check_tail_scales(2880, 30000, "stage1")
+
+
+# ---------------------------------------------------------------------------
 # Fused route-sort + MXFP4 activation-quant kernel (gfx950 decode).
 #
 # `mxfp4_moe_sort_quant_fwd` fuses Opus route sorting, BF16->MXFP4 activation
@@ -945,3 +1049,218 @@ if _running_on_gfx950():
     for E, topk in _FUSED_ROUTES:
         _check_fused_cuda_graph_replay_safe(E, topk, 32)
         _check_fused_num_local_tokens(E, topk, 32)
+
+
+def _aux_sort_routes(topk_ids, topk_weights, num_local_tokens=None, bm=16):
+    """Aux sort at the kimi-k3 shape: BM16 is the tuned inline-sort path's sort,
+    BM >= 32 the three-stage sort."""
+    sorted_ids, sorted_weights, sorted_experts, num_valid, moe_buf, _, rev = (
+        fused_moe._adaptive_moe_sort(
+            topk_ids,
+            topk_weights,
+            896,
+            topk_ids.shape[1],
+            bm,
+            3584,
+            atomic=True,
+            emit_aux=True,
+            num_local_tokens=num_local_tokens,
+        )
+    )
+    tokens, topk = topk_ids.shape
+    entries = []
+    for block, expert in enumerate(sorted_experts[: int(num_valid[0]) // bm].tolist()):
+        for row in range(block * bm, block * bm + bm):
+            packed = int(sorted_ids[row])
+            if packed & 0x00FFFFFF != tokens:  # padding slot
+                entries.append(
+                    (
+                        expert,
+                        packed & 0xFFFFFF,
+                        packed >> 24,
+                        float(sorted_weights[row]),
+                    )
+                )
+    for i, slot in enumerate(rev.tolist()):
+        if slot >= 0:
+            assert int(sorted_ids[slot]) == (i // topk) | ((i % topk) << 24)
+    return sorted(entries), num_valid.tolist(), moe_buf, rev
+
+
+def _check_aux_sort_pad_rows_and_num_local_tokens(tokens=32, valid=29, topk=16):
+    """Pad rows routed to -1 and/or past num_local_tokens are not routes: the
+    sort equals one over the valid rows alone, reverse_sorted is -1 for them
+    and the whole output is zeroed (as moe_sorting_opus_fwd does)."""
+    torch.manual_seed(valid)
+    topk_ids = torch.stack(
+        [torch.randperm(896, dtype=torch.int32)[:topk] for _ in range(tokens)]
+    )
+    topk_weights = torch.rand((tokens, topk), dtype=torch.float32)
+    ref, ref_valid, _, _ = _aux_sort_routes(
+        topk_ids[:valid].contiguous(), topk_weights[:valid].contiguous()
+    )
+    pad_ids = topk_ids.clone()
+    pad_ids[valid:] = -1
+    count = torch.tensor([valid], dtype=torch.int32)
+    for ids, nlt in ((pad_ids, None), (topk_ids, count), (pad_ids, count)):
+        got, got_valid, moe_buf, rev = _aux_sort_routes(ids, topk_weights, nlt)
+        assert got == ref
+        assert got_valid[0] == ref_valid[0]
+        assert got_valid[1] == (valid if nlt is not None else tokens)
+        assert (rev[valid * topk :] == -1).all()
+        assert (moe_buf == 0).all()
+
+
+def _check_three_stage_sort_pad_rows(bm, tokens=32, valid=29, topk=16):
+    """The three-stage sort (BM >= 32) treats ids routed to -1 as no route: the
+    sort equals one over the valid rows alone."""
+    torch.manual_seed(valid + bm)
+    topk_ids = torch.stack(
+        [torch.randperm(896, dtype=torch.int32)[:topk] for _ in range(tokens)]
+    )
+    topk_weights = torch.rand((tokens, topk), dtype=torch.float32)
+    ref, ref_valid, _, _ = _aux_sort_routes(
+        topk_ids[:valid].contiguous(), topk_weights[:valid].contiguous(), bm=bm
+    )
+    pad_ids = topk_ids.clone()
+    pad_ids[valid:] = -1
+    got, got_valid, moe_buf, rev = _aux_sort_routes(pad_ids, topk_weights, bm=bm)
+    assert got == ref
+    assert got_valid[0] == ref_valid[0]
+    assert (rev[valid * topk :] == -1).all()
+    assert (moe_buf == 0).all()
+
+
+def _check_fused_moe_inline_sort_pad_rows(tokens=32, valid=29):
+    """fused_moe on Kimi-K3's tuned inline-sort row with pad rows routed to -1
+    and num_local_tokens, with row-strided activations as a merged projection
+    produces: the tuned row is kept, real rows match contiguous input and pad
+    rows come out zero."""
+    from aiter.ops.shuffle import shuffle_weight
+    from aiter.utility import fp4_utils
+
+    experts, hidden, inter, topk = 896, 3584, 384, 16
+
+    def fp4_weight(n, k):
+        w = torch.randint(0, 256, (experts, n, k // 2), dtype=torch.uint8)
+        s = torch.randint(118, 124, (experts * n, k // 32), dtype=torch.uint8)
+        w = shuffle_weight(w.cuda().view(dtypes.fp4x2), layout=(16, 16))
+        w.is_shuffled = True
+        return w, fp4_utils.e8m0_shuffle(s.cuda().view(dtypes.fp8_e8m0))
+
+    torch.manual_seed(tokens)
+    w1, w1_scale = fp4_weight(2 * inter, hidden)
+    w2, w2_scale = fp4_weight(hidden, inter)
+
+    def standard_rows(tensor):
+        # .contiguous() is a no-op for a size-1 row whose stride PyTorch ignores.
+        copied = torch.empty_like(tensor, memory_format=torch.contiguous_format).copy_(
+            tensor
+        )
+        assert copied.stride() == (tensor.shape[1], 1)
+        assert copied.data_ptr() != tensor.data_ptr()
+        return copied
+
+    if tokens == 1:
+        x = torch.randn((hidden, 1), dtype=dtypes.bf16, device="cuda").t()
+        assert x.stride() == (1, 1)
+        assert x.is_contiguous() and x.contiguous().data_ptr() == x.data_ptr()
+    else:
+        x = torch.randn((tokens, hidden + 64), dtype=dtypes.bf16, device="cuda")[
+            :, :hidden
+        ]
+        assert not x.is_contiguous()
+    misaligned = torch.randn((tokens, hidden + 4), dtype=dtypes.bf16, device="cuda")[
+        :, :hidden
+    ]
+    assert misaligned.stride(0) * misaligned.element_size() % 16
+    inner_strided = torch.randn((tokens, hidden * 2), dtype=dtypes.bf16, device="cuda")[
+        :, ::2
+    ]
+    topk_ids = torch.stack(
+        [torch.randperm(experts, dtype=torch.int32)[:topk] for _ in range(tokens)]
+    ).cuda()
+    topk_weights = torch.softmax(torch.randn((tokens, topk), device="cuda"), dim=1)
+    pad_ids = topk_ids.clone()
+    pad_ids[valid:] = -1
+    count = torch.tensor([valid], dtype=torch.int32, device="cuda")
+
+    reasons = []
+    unsupported = fused_moe._mxfp4_inline_sort_unsupported
+
+    def record(*a, **kw):
+        reasons.append(unsupported(*a, **kw))
+        return reasons[-1]
+
+    env = {"AITER_SITUV2_A4W4": "1", "AITER_FLYDSL_STAGE2_FP8": "1"}
+    saved = {k: os.environ.get(k) for k in env}
+    os.environ.update(env)
+    fused_moe._mxfp4_inline_sort_unsupported = record
+    try:
+
+        def run(ids, rows, nlt=None, activations=x):
+            return fused_moe.fused_moe(
+                activations[:rows],
+                w1,
+                w2,
+                topk_weights[:rows],
+                ids[:rows],
+                activation=aiter.ActivationType.Situv2,
+                quant_type=aiter.QuantType.per_1x32,
+                w1_scale=w1_scale,
+                w2_scale=w2_scale,
+                num_local_tokens=nlt,
+            )
+
+        out = run(pad_ids, tokens, count)
+        ref = run(topk_ids, valid)
+        contiguous = run(pad_ids, tokens, count, standard_rows(x))
+        materialized = run(pad_ids, tokens, count, inner_strided)
+        materialized_ref = run(pad_ids, tokens, count, standard_rows(inner_strided))
+        misaligned_out = run(pad_ids, tokens, count, misaligned)
+        misaligned_ref = run(pad_ids, tokens, count, standard_rows(misaligned))
+        graph = None
+        if tokens == 32:
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph):
+                graph_out = run(pad_ids, tokens, count)
+            graph.replay()
+    finally:
+        fused_moe._mxfp4_inline_sort_unsupported = unsupported
+        for k, v in saved.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+
+    assert reasons and all(r == "" for r in reasons), reasons
+    real = out[:valid].float()
+    rel = ((real - ref.float()).norm() / ref.float().norm()).item()
+    assert rel < 0.02, rel  # atomic stage2 order only (~0.5%)
+    rel = ((out.float() - contiguous.float()).norm() / contiguous.float().norm()).item()
+    assert rel < 0.02, rel
+    rel = (
+        (materialized.float() - materialized_ref.float()).norm()
+        / materialized_ref.float().norm()
+    ).item()
+    assert rel < 0.02, rel
+    rel = (
+        (misaligned_out.float() - misaligned_ref.float()).norm()
+        / misaligned_ref.float().norm()
+    ).item()
+    assert rel < 0.02, rel
+    if graph is not None:
+        rel = ((out.float() - graph_out.float()).norm() / out.float().norm()).item()
+        assert rel < 0.02, rel
+    assert (out[valid:] == 0).all()
+
+
+if _running_on_gfx950():
+    _check_aux_sort_pad_rows_and_num_local_tokens()
+    _check_aux_sort_pad_rows_and_num_local_tokens(tokens=4, valid=3)
+    for bm in (32, 64):
+        _check_three_stage_sort_pad_rows(bm)
+    _check_fused_moe_inline_sort_pad_rows()
+    _check_fused_moe_inline_sort_pad_rows(tokens=4, valid=3)
+    _check_fused_moe_inline_sort_pad_rows(tokens=1, valid=1)
+    aiter.logger.info("aux sort pad-row / num_local_tokens checks passed")

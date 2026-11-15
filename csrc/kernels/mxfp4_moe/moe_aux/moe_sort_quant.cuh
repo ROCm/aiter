@@ -78,17 +78,20 @@ __device__ __forceinline__ void count_tokens_per_expert(int *__restrict__ count,
     const int4 *topk_vec = reinterpret_cast<const int4 *>(topk_ids);
     const int total_aligned = total_pairs & ~3;
 
+    // An id outside [0, NUM_EXPERTS) (e.g. -1 for a pad row) is not a route.
+    auto count_one = [&](int eid) {
+        if ((unsigned)eid < (unsigned)NUM_EXPERTS)
+            atomicAdd(&count[eid], 1);
+    };
     for (int i = tid * 4; i < total_aligned; i += THREADS_PER_CTA * 4) {
         int4 ids = topk_vec[i / 4];
-        atomicAdd(&count[ids.x], 1);
-        atomicAdd(&count[ids.y], 1);
-        atomicAdd(&count[ids.z], 1);
-        atomicAdd(&count[ids.w], 1);
+        count_one(ids.x);
+        count_one(ids.y);
+        count_one(ids.z);
+        count_one(ids.w);
     }
-    for (int i = total_aligned + tid; i < total_pairs; i += THREADS_PER_CTA) {
-        int eid = topk_ids[i];
-        atomicAdd(&count[eid], 1);
-    }
+    for (int i = total_aligned + tid; i < total_pairs; i += THREADS_PER_CTA)
+        count_one(topk_ids[i]);
 
     __syncthreads();
 }
@@ -130,7 +133,7 @@ __device__ __forceinline__ void parallel_cumsum(int *__restrict__ count, int *__
     __syncthreads();
 }
 
-template <int TOPK, int THREADS_PER_CTA>
+template <int NUM_EXPERTS, int TOPK, int THREADS_PER_CTA>
 __device__ __forceinline__ void place_tokens(int *__restrict__ cumsum, int *__restrict__ counter,
                                              const int *__restrict__ topk_ids,
                                              const float *__restrict__ topk_weight,
@@ -138,7 +141,7 @@ __device__ __forceinline__ void place_tokens(int *__restrict__ cumsum, int *__re
                                              float *__restrict__ sorted_weights,
                                              int *__restrict__ reverse_sorted,
                                              int *__restrict__ m_indices,
-                                             int total_pairs) {
+                                             int valid_pairs, int total_pairs) {
     const int tid = threadIdx.x;
     int token_id = tid / TOPK;
     int topk_id = tid % TOPK;
@@ -146,12 +149,16 @@ __device__ __forceinline__ void place_tokens(int *__restrict__ cumsum, int *__re
     constexpr int stride_rem = THREADS_PER_CTA % TOPK;
 
     for (int i = tid; i < total_pairs; i += THREADS_PER_CTA) {
-        int eid = topk_ids[i];
-        int pos = atomicAdd(&counter[eid], 1);
-        int sp = cumsum[eid] + pos;
-        sorted_token_ids[sp] = (token_id & 0x00FFFFFF) | ((topk_id & 0xFF) << 24);
-        m_indices[sp] = token_id & 0x00FFFFFF;
-        sorted_weights[sp] = topk_weight[i];
+        // Rows past the local-token count and ids outside [0, NUM_EXPERTS)
+        // are not routes; -1 is the "no route" reverse_sorted entry, as in EP.
+        int eid = i < valid_pairs ? topk_ids[i] : -1;
+        int sp = -1;
+        if ((unsigned)eid < (unsigned)NUM_EXPERTS) {
+            sp = cumsum[eid] + atomicAdd(&counter[eid], 1);
+            sorted_token_ids[sp] = (token_id & 0x00FFFFFF) | ((topk_id & 0xFF) << 24);
+            m_indices[sp] = token_id & 0x00FFFFFF;
+            sorted_weights[sp] = topk_weight[i];
+        }
         reverse_sorted[i] = sp;
 
         token_id += stride_tok;
@@ -193,22 +200,25 @@ template <int NUM_EXPERTS, int TOPK, int M_PER_BLOCK, int THREADS_PER_CTA>
 __device__ __forceinline__ void
 sort_subkernel(const int32_t *topk_ids, const float *topk_weight, int32_t *sorted_token_ids, int32_t *sorted_expert_ids,
                float *sorted_weights, int32_t *cumsum_tensor, int32_t *reverse_sorted,
-               int32_t *m_indices, int M) {
+               int32_t *m_indices, int M, const int32_t *num_local_tokens) {
     __shared__ int count[std::max(NUM_EXPERTS, THREADS_PER_CTA)];
     __shared__ int cumsum[NUM_EXPERTS + 1];
     __shared__ int counter[NUM_EXPERTS];
 
     const int tid = threadIdx.x;
     const int total_pairs = M * TOPK;
+    // As moe_sorting_opus_fwd: only the first num_local_tokens rows are sorted.
+    const int valid_tokens = num_local_tokens ? max(0, min(M, *num_local_tokens)) : M;
+    const int valid_pairs = valid_tokens * TOPK;
 
-    count_tokens_per_expert<NUM_EXPERTS, THREADS_PER_CTA>(count, topk_ids, total_pairs);
+    count_tokens_per_expert<NUM_EXPERTS, THREADS_PER_CTA>(count, topk_ids, valid_pairs);
     parallel_cumsum<NUM_EXPERTS, THREADS_PER_CTA, M_PER_BLOCK>(count, cumsum, counter);
-    place_tokens<TOPK, THREADS_PER_CTA>(cumsum, counter, topk_ids, topk_weight, sorted_token_ids, sorted_weights, reverse_sorted, m_indices, total_pairs);
+    place_tokens<NUM_EXPERTS, TOPK, THREADS_PER_CTA>(cumsum, counter, topk_ids, topk_weight, sorted_token_ids, sorted_weights, reverse_sorted, m_indices, valid_pairs, total_pairs);
     fill_padding_gaps<NUM_EXPERTS, THREADS_PER_CTA, M_PER_BLOCK>(count, cumsum, sorted_token_ids, sorted_expert_ids, m_indices, sorted_weights, M);
 
     if (tid == 0) {
         cumsum_tensor[0] = cumsum[NUM_EXPERTS];
-        cumsum_tensor[1] = M;  // num_valid_ids[1] = valid tokens (non-EP == M)
+        cumsum_tensor[1] = valid_tokens;  // num_valid_ids[1] = valid tokens
     }
 }
 
@@ -322,13 +332,14 @@ __global__ void sort_quant_kernel_impl(
     int32_t *__restrict__ m_indices,
     __hip_bfloat16 *__restrict__ bf16_zero_out = nullptr,
     void *__restrict__ bf16_zero_workspace = nullptr,
-    long long workspace_bytes = 0) {
+    long long workspace_bytes = 0,
+    const int32_t *__restrict__ num_local_tokens = nullptr) {
     if (blockIdx.x == 0) {
         if constexpr (!kSkipSort) {
             sort_subkernel<NUM_EXPERTS, TOPK, M_PER_BLOCK, THREADS_PER_CTA>(topk_ids, topk_weight, sorted_token_ids,
                                                                             sorted_expert_ids, sorted_weights,
                                                                             cumsum_tensor, reverse_sorted,
-                                                                            m_indices, M);
+                                                                            m_indices, M, num_local_tokens);
         }
     } else if constexpr (!kSkipQuant) {
         quant_subkernel<N_CTAS - 1, THREADS_PER_CTA, D_HIDDEN>(hidden_states, a_quant, a_scale, M);
@@ -365,7 +376,8 @@ inline void launch_sort_only_impl(
     const int32_t *topk_ids, const float *topk_w,
     int32_t *sorted_token_ids, int32_t *sorted_expert_ids, int32_t *cumsum,
     int32_t *reverse_sorted, float *sorted_weights,
-    int32_t *m_indices)
+    int32_t *m_indices,
+    const int32_t *num_local_tokens = nullptr)
 {
     constexpr int N = FullGrid ? N_CTAS : 1;
     sort_quant_kernel_impl<NE, TOPK, MB, D_HIDDEN, N, THREADS_PER_CTA, /*kSkipQuant=*/true>
@@ -373,7 +385,9 @@ inline void launch_sort_only_impl(
             M, /*hidden=*/nullptr, topk_ids, topk_w,
             sorted_token_ids, sorted_expert_ids, cumsum, reverse_sorted, sorted_weights,
             /*a_quant=*/nullptr, /*a_scale=*/nullptr,
-            m_indices);
+            m_indices, /*bf16_zero_out=*/nullptr,
+            /*bf16_zero_workspace=*/nullptr, /*workspace_bytes=*/0,
+            num_local_tokens);
 }
 
 template <int NE, int TOPK, int MB, int D_HIDDEN, int THREADS_PER_CTA>
@@ -382,12 +396,13 @@ inline void launch_sort_only(
     const int32_t *topk_ids, const float *topk_w,
     int32_t *sorted_token_ids, int32_t *sorted_expert_ids, int32_t *cumsum,
     int32_t *reverse_sorted, float *sorted_weights,
-    int32_t *m_indices)
+    int32_t *m_indices,
+    const int32_t *num_local_tokens = nullptr)
 {
     launch_sort_only_impl<NE, TOPK, MB, D_HIDDEN, /*N_CTAS=*/1, THREADS_PER_CTA, /*FullGrid=*/false>(
         stream, M, topk_ids, topk_w,
         sorted_token_ids, sorted_expert_ids, cumsum, reverse_sorted, sorted_weights,
-        m_indices);
+        m_indices, num_local_tokens);
 }
 
 template <int NE, int TOPK, int MB, int D_HIDDEN, int N_CTAS, int THREADS_PER_CTA>
@@ -399,7 +414,8 @@ inline void launch_sort_only_with_zero_init(
     int32_t *m_indices,
     __hip_bfloat16 *bf16_zero_out,
     void *bf16_zero_workspace,
-    long long workspace_bytes)
+    long long workspace_bytes,
+    const int32_t *num_local_tokens = nullptr)
 {
     sort_quant_kernel_impl<NE, TOPK, MB, D_HIDDEN, N_CTAS, THREADS_PER_CTA, /*kSkipQuant=*/true>
         <<<N_CTAS, THREADS_PER_CTA, 0, stream>>>(
@@ -407,7 +423,7 @@ inline void launch_sort_only_with_zero_init(
             sorted_token_ids, sorted_expert_ids, cumsum, reverse_sorted, sorted_weights,
             /*a_quant=*/nullptr, /*a_scale=*/nullptr,
             m_indices, bf16_zero_out,
-            bf16_zero_workspace, workspace_bytes);
+            bf16_zero_workspace, workspace_bytes, num_local_tokens);
 }
 
 template <int NE, int TOPK, int MB, int D_HIDDEN, int THREADS_PER_CTA>
