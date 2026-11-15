@@ -130,6 +130,7 @@ a16w16_gemm1_kernels_list_gfx950= {
      9: kernelInstanceGEMM1(       256,       128,       128,        64,     1,       4,        3,),
     10: kernelInstanceGEMM1(       256,       256,       128,        64,     1,       4,        3,),
     11: kernelInstanceGEMM1(       256,       256,        64,        64,     1,       4,        1,),
+    12: kernelInstanceGEMM1(       256,       128,       128,       128,     1,       4,        3,),
 }
 
 a16w16_gemm1_kernels_list= {
