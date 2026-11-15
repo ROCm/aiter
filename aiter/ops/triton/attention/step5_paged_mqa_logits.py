@@ -8,6 +8,7 @@ import triton
 
 from aiter.ops.triton._triton_kernels.attention.step5_paged_mqa_logits import (
     _step5_paged_mqa_logits_kernel,
+    _step5_paged_mqa_logits_rows_kernel,
 )
 from aiter.ops.triton.utils._triton import arch_info
 from aiter.ops.triton.utils.logger import AiterTritonLogger
@@ -67,10 +68,10 @@ def step5_paged_mqa_logits(
         ``scale[k] * sum_h(weights[row, h] * relu(q[row, h] . key[k]))`` for
         ``k < seq_lens[batch]``, and ``-inf`` for the other columns.
 
-    Rows that map their visible keys to the same pages share one key tile.
-    Rows that map to different pages use a slower path that loads the keys of
-    each row. On gfx942 the kernel reads the e4m3fn bits as e4m3fnuz for the
-    native FP8 MFMA, so NaN inputs are not kept.
+    A block of rows that maps a key tile to the same pages scores it with one
+    shared key load. A second kernel rescores per row the tiles where the rows
+    map different pages. On gfx942 the kernels read the e4m3fn bits as
+    e4m3fnuz for the native FP8 MFMA, so NaN inputs are not kept.
     """
     batch, next_n, heads, head_dim = q.shape
     assert q.dtype == torch.float8_e4m3fn and head_dim == _HEAD_DIM
@@ -93,10 +94,10 @@ def step5_paged_mqa_logits(
     config = _launch_config()
     block_r = config.kwargs["BLOCK_M"] // heads
     tile = config.kwargs["TILE"]
+    tiles_per_program = config.kwargs["TILES_PER_PROGRAM"]
     tiles = triton.cdiv(max_seq_len, tile)
-    tiles_per_program = min(config.kwargs["TILES_PER_PROGRAM"], tiles)
     grid = (triton.cdiv(rows, block_r), triton.cdiv(tiles, tiles_per_program))
-    _step5_paged_mqa_logits_kernel[grid](
+    args = (
         q.view(torch.uint8),
         kv_fused,
         weights,
@@ -110,15 +111,21 @@ def step5_paged_mqa_logits(
         *block_tables.stride(),
         seq_lens.stride(0),
         max_seq_len,
-        NEXT_N=next_n,
-        HEADS=heads,
-        HEAD_DIM=_HEAD_DIM,
-        PAGE_SIZE=kv_fused.shape[1],
-        BLOCK_R=block_r,
-        TILE=tile,
-        TILES_PER_PROGRAM=tiles_per_program,
-        FNUZ=arch_info.get_arch() == "gfx942",
-        num_warps=config.num_warps,
-        num_stages=config.num_stages,
+    )
+    meta = {
+        "NEXT_N": next_n,
+        "HEADS": heads,
+        "HEAD_DIM": _HEAD_DIM,
+        "PAGE_SIZE": kv_fused.shape[1],
+        "BLOCK_R": block_r,
+        "TILE": tile,
+        "TILES_PER_PROGRAM": tiles_per_program,
+        "FNUZ": arch_info.get_arch() == "gfx942",
+    }
+    _step5_paged_mqa_logits_kernel[grid](
+        *args, **meta, num_warps=config.num_warps, num_stages=config.num_stages
+    )
+    _step5_paged_mqa_logits_rows_kernel[grid](
+        *args, **meta, DOT_M=max(heads, 16), num_warps=4
     )
     return logits

@@ -4,6 +4,9 @@
 import pytest
 import torch
 
+from aiter.ops.triton._triton_kernels.attention.step5_paged_mqa_logits import (
+    _step5_paged_mqa_logits_kernel,
+)
 from aiter.ops.triton.attention.step5_paged_mqa_logits import step5_paged_mqa_logits
 from aiter.ops.triton.utils._triton import arch_info
 
@@ -141,6 +144,37 @@ def test_step5_paged_mqa_logits_e4m3fn_path(monkeypatch):
     # Run the e4m3fn path of the other archs. Triton emulates it on gfx942.
     monkeypatch.setattr(arch_info, "get_arch", lambda: "gfx950")
     check_logits(step5_paged_mqa_logits(*inputs, 900), ref)
+
+
+@torch.inference_mode()
+def test_step5_paged_mqa_logits_request_boundary():
+    # Two requests meet inside one row block, as at a prefill chunk boundary.
+    q, kv_fused, weights, block_tables, seq_lens = make_inputs(
+        64, 1, 8, 32, 3000, "distinct"
+    )
+    seq_lens = torch.full_like(seq_lens, 3000)
+    block_tables[:37] = block_tables[0]
+    inputs = (q, kv_fused, weights, block_tables, seq_lens)
+
+    logits = step5_paged_mqa_logits(*inputs, 3000)
+
+    check_logits(logits, ref_step5_paged_mqa_logits(*inputs, 3000))
+
+
+@torch.inference_mode()
+def test_step5_paged_mqa_logits_one_binary_per_shape():
+    def binaries():
+        return sum(
+            len(c[0]) for c in _step5_paged_mqa_logits_kernel.device_caches.values()
+        )
+
+    step5_paged_mqa_logits(*make_inputs(8, 1, 8, 32, 50, "shared"), 50)
+    before = binaries()
+    for max_seq_len in (100, 300, 700, 1000, 3000):
+        inputs = make_inputs(8, 1, 8, 32, max_seq_len, "shared")
+        step5_paged_mqa_logits(*inputs, max_seq_len)
+
+    assert binaries() == before
 
 
 @torch.inference_mode()
