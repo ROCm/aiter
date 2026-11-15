@@ -44,7 +44,7 @@ from flydsl.expr import range_constexpr
 from flydsl.expr.typing import T
 from flydsl.expr.typing import Vector as Vec
 
-from aiter.ops.flydsl.kernels import buffer_ops
+from aiter.ops.flydsl.kernels.tensor_shim import buf_copy_load, ptr_buf_tensor
 
 BLK = 128  # tokens per page == sparse block
 D = 128
@@ -291,29 +291,27 @@ def page_loader(arg_cache, page_bytes, kvh, hkv, w, n, g):
     v_scale_load = (v_scl + (n // 2) * BLK + w * KPW + 8 * g) // 4
 
     def load(page):
-        pr = buffer_ops.create_buffer_resource_from_addr(
-            arg_cache + fx.Int64(page) * fx.Int64(page_bytes),
-            num_records_bytes=page_bytes,
-        )
+        base = arg_cache + fx.Int64(page) * fx.Int64(page_bytes)
+        # The page as buffer tensors of 4-, 2- and 1-dword units, indexed by dword.
+        pr = [
+            ptr_buf_tensor(
+                base,
+                fx.Int32,
+                unit_elems=u,
+                unit_stride=1,
+                num_records_bytes=page_bytes,
+            )
+            for u in (4, 2, 1)
+        ]
         raw = []
         for st in range_constexpr(2):
-            kd = fx.Vector(
-                buffer_ops.buffer_load(pr, k_load[st], vec_width=4, dtype=fx.Int32)
-            )
+            kd = buf_copy_load(pr[0], k_load[st], unit_elems=4)
             raw += [kd[i] for i in range_constexpr(4)]
-        raw.append(
-            fx.Int32(
-                buffer_ops.buffer_load(pr, k_scale_load, vec_width=1, dtype=fx.Int32)
-            )
-        )
+        raw.append(fx.Int32(buf_copy_load(pr[2], k_scale_load)))
         for h in range_constexpr(2):
-            vd = fx.Vector(
-                buffer_ops.buffer_load(pr, v_load + 4 * h, vec_width=4, dtype=fx.Int32)
-            )
+            vd = buf_copy_load(pr[0], v_load + 4 * h, unit_elems=4)
             raw += [vd[i] for i in range_constexpr(4)]
-        vs = fx.Vector(
-            buffer_ops.buffer_load(pr, v_scale_load, vec_width=2, dtype=fx.Int32)
-        )
+        vs = buf_copy_load(pr[1], v_scale_load, unit_elems=2)
         raw += [vs[i] for i in range_constexpr(2)]
         return raw
 

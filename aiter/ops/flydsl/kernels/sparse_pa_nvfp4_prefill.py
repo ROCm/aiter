@@ -36,7 +36,6 @@ from flydsl.expr.typing import T
 from flydsl.expr.typing import Vector as Vec
 
 from aiter.jit.utils.chip_info import get_gfx_runtime
-from aiter.ops.flydsl.kernels import buffer_ops
 from aiter.ops.flydsl.kernels.minimax_m3_index_score import _cu_count
 from aiter.ops.flydsl.kernels.sparse_pa_nvfp4_common import (
     BLK,
@@ -45,6 +44,7 @@ from aiter.ops.flydsl.kernels.sparse_pa_nvfp4_common import (
     NDT,
     NKS,
     NW,
+    OOB_DWORD,
     RAW,
     D,
     bf16x8_to_f16,
@@ -62,7 +62,12 @@ from aiter.ops.flydsl.kernels.sparse_pa_nvfp4_common import (
     require,
     xlane4,
 )
-from aiter.ops.flydsl.kernels.tensor_shim import _run_compiled
+from aiter.ops.flydsl.kernels.tensor_shim import (
+    _run_compiled,
+    buf_copy_load,
+    buf_copy_store,
+    ptr_buf_tensor,
+)
 
 TOPK = 16  # selected blocks per row (one lane per (row, slot): TQ x 16 <= 64 lanes)
 
@@ -116,6 +121,8 @@ def compile_prefill(tq: int = 4, rounds: int = 2):
         tx = fx.thread_idx.x
         bidx, kvh = fx.block_idx.x, fx.block_idx.y
         lane = tx % 64
+        # Raw rocdl ops for the wave-uniform / SGPR primitives (readfirstlane here, ballot,
+        # readlane, sched_barrier): FlyDSL 0.5.0 has no typed spelling, as in the decode kernel.
         w = fx.Int32(fx.rocdl.readfirstlane(T.i32, tx // 64))
         n, g = lane % 16, lane // 16
         topk = global_i32_ptr(arg_topk)
@@ -135,8 +142,12 @@ def compile_prefill(tq: int = 4, rounds: int = 2):
         )
         lds_atom = fx.make_copy_atom(fx.UniversalCopy128b(), fx.Int32)
         # Per row (wave-uniform): the page of its own block and its causal limit.
-        qr = buffer_ops.create_buffer_resource_from_addr(
-            arg_q, num_records_bytes=fx.Int64(i32_T) * fx.Int64(i32_H) * (D * 2)
+        qr = ptr_buf_tensor(
+            arg_q,
+            fx.Int32,
+            unit_elems=4,
+            unit_stride=1,
+            num_records_bytes=i32_T * i32_H * (D * 2),
         )
         head = (n < i32_group).select(n, fx.Int32(0))  # masked heads read head 0
         if const_expr(Q_LDS):
@@ -148,15 +159,7 @@ def compile_prefill(tq: int = 4, rounds: int = 2):
             q_src = (tok_q * i32_H + kvh * i32_group + hq_src) * (D // 2) + qq * 16
             for i in range_constexpr(4):
                 r = fx.make_rmem_tensor(fx.make_layout(4, 1), fx.Int32)
-                r.store(
-                    bf16x8_to_f16(
-                        fx.Vector(
-                            buffer_ops.buffer_load(
-                                qr, q_src + 4 * i, vec_width=4, dtype=fx.Int32
-                            )
-                        )
-                    )
-                )
+                r.store(bf16x8_to_f16(buf_copy_load(qr, q_src + 4 * i, unit_elems=4)))
                 fx.copy(
                     lds_atom,
                     r,
@@ -197,13 +200,7 @@ def compile_prefill(tq: int = 4, rounds: int = 2):
                 q_row = (tc * i32_H + kvh * i32_group + head) * (D // 2) + g * 16
                 q_regs.append(
                     [
-                        bf16x8_to_f16(
-                            fx.Vector(
-                                buffer_ops.buffer_load(
-                                    qr, q_row + ks * 4, vec_width=4, dtype=fx.Int32
-                                )
-                            )
-                        )
+                        bf16x8_to_f16(buf_copy_load(qr, q_row + ks * 4, unit_elems=4))
                         for ks in range_constexpr(NKS)
                     ]
                 )
@@ -327,8 +324,12 @@ def compile_prefill(tq: int = 4, rounds: int = 2):
         for t in range_constexpr(TQ):
             ml[((w * TQ + t) * 2) * 64 + lane] = fx.Float32(results[1 + t])
             ml[((w * TQ + t) * 2 + 1) * 64 + lane] = fx.Float32(results[1 + TQ + t])
-        outr = buffer_ops.create_buffer_resource_from_addr(
-            arg_out, num_records_bytes=fx.Int64(i32_T) * fx.Int64(i32_H) * (D * 2)
+        outr = ptr_buf_tensor(
+            arg_out,
+            fx.Int32,
+            unit_elems=4,
+            unit_stride=1,
+            num_records_bytes=i32_T * i32_H * (D * 2),
         )
         for rnd in range_constexpr(R):
             if const_expr(rnd > 0 or Q_LDS):
@@ -387,8 +388,13 @@ def compile_prefill(tq: int = 4, rounds: int = 2):
                         ],
                         fx.Int32,
                     )
-                    buffer_ops.buffer_store(
-                        val, outr, o_row + e * 4, mask=(tok < i32_T) & (n < i32_group)
+                    # Masked lanes store past the buffer end, which drops the write.
+                    keep = (tok < i32_T) & (n < i32_group)
+                    buf_copy_store(
+                        outr,
+                        keep.select(o_row + e * 4, fx.Int32(OOB_DWORD)),
+                        val,
+                        unit_elems=4,
                     )
 
     @flyc.jit
