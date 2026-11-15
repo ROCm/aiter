@@ -989,11 +989,34 @@ def mla_decode_prepare_page_csr(
 
 
 @triton.jit
+def _no_weight_row(O, Lse, ROW, HEADS, HAS_LSE: tl.constexpr, BLOCK: tl.constexpr):
+    # The lowest float, not -inf: mla_reduce_v1's 2- and 3-split path takes
+    # exp(-inf - -inf), a NaN, when every split of a request is empty.
+    cols = tl.arange(0, BLOCK)
+    for c in range(0, ROW, BLOCK):
+        tl.store(O + c + cols, 0.0, mask=c + cols < ROW)
+    if HAS_LSE:
+        for c in range(0, HEADS, BLOCK):
+            tl.store(Lse + c + cols, -3.4028234663852886e38, mask=c + cols < HEADS)
+
+
+@triton.jit
 def _put_empty_work_items_last(
-    Src, Dst, WorkIndptr, O, Lse, ROW, HEADS, HAS_LSE: tl.constexpr, BLOCK: tl.constexpr
+    Src,
+    Dst,
+    WorkIndptr,
+    O,
+    Lse,
+    PartialO,
+    PartialLse,
+    ROW,
+    HEADS,
+    HAS_LSE: tl.constexpr,
+    BLOCK: tl.constexpr,
 ):
-    """One CU's work items from Src into Dst, those with no KV last; the O and
-    LSE rows of an empty item that writes O directly get 0 and +inf."""
+    """One CU's work items from Src into Dst, those with no KV last. An empty
+    item's rows get O=0 and the lowest float as LSE: in O and the final LSE
+    when it writes O directly, in its partial slot otherwise."""
     # A work item is eight int32: partial_qo_loc at 1, qo start and end at 2
     # and 3, KV start and end at 4 and 5.
     lo = tl.load(WorkIndptr + tl.program_id(0))
@@ -1002,25 +1025,31 @@ def _put_empty_work_items_last(
     for i in range(lo, hi):
         n_live += (tl.load(Src + i * 8 + 5) > tl.load(Src + i * 8 + 4)).to(tl.int32)
     fields = tl.arange(0, 8)
-    cols = tl.arange(0, BLOCK)
     seen = 0
     for i in range(lo, hi):
         live = (tl.load(Src + i * 8 + 5) > tl.load(Src + i * 8 + 4)).to(tl.int32)
         to = tl.where(live == 1, lo + seen, n_live + i - seen)
         tl.store(Dst + to * 8 + fields, tl.load(Src + i * 8 + fields))
         seen += live
-        if (live == 0) & (tl.load(Src + i * 8 + 1) < 0):
-            for r in range(tl.load(Src + i * 8 + 2), tl.load(Src + i * 8 + 3)):
-                row = r.to(tl.int64)
-                for c in range(0, ROW, BLOCK):
-                    tl.store(O + row * ROW + c + cols, 0.0, mask=c + cols < ROW)
-                if HAS_LSE:
-                    for c in range(0, HEADS, BLOCK):
-                        tl.store(
-                            Lse + row * HEADS + c + cols,
-                            float("inf"),
-                            mask=c + cols < HEADS,
-                        )
+        if live == 0:
+            loc = tl.load(Src + i * 8 + 1)
+            q0 = tl.load(Src + i * 8 + 2)
+            for r in range(q0, tl.load(Src + i * 8 + 3)):
+                if loc < 0:
+                    row = r.to(tl.int64)
+                    _no_weight_row(
+                        O + row * ROW, Lse + row * HEADS, ROW, HEADS, HAS_LSE, BLOCK
+                    )
+                else:
+                    row = (loc + r - q0).to(tl.int64)
+                    _no_weight_row(
+                        PartialO + row * ROW,
+                        PartialLse + row * HEADS,
+                        ROW,
+                        HEADS,
+                        True,
+                        BLOCK,
+                    )
 
 
 def mla_decode_fwd(
@@ -1102,9 +1131,10 @@ def mla_decode_fwd(
     with no KV, as one planned at a KV bound and cut to each request's keys
     does. The asm kernels end a CU's work at its first empty item, so each
     CU's empty items are moved after its others in ``work_info_set``, in
-    place. Such an item adds nothing; a request with no keys gets O=0 and
-    LSE=+inf, the reduce's value for a sum with no weight. It costs a copy of
-    the plan, a kernel over it and a fill of the partial LSE per call.
+    place, and their partial O and LSE are set to 0 and the lowest float,
+    which gives them no weight in the reduce. A request with no keys gets O=0
+    and the lowest float as its LSE. It costs a copy of the plan and a kernel
+    over it per call.
     """
     if kv_csr_layout not in ("page", "token"):
         raise ValueError(f"unknown MLA kv_csr_layout: {kv_csr_layout!r}")
@@ -1585,13 +1615,13 @@ def mla_decode_fwd(
                 work_indptr,
                 o,
                 attn_lse if final_lse is None else final_lse,
+                logits,
+                attn_lse,
                 o.stride(0),
                 nhead,
                 HAS_LSE=final_lse is not None,
                 BLOCK=1024,
             )
-            # Such an item writes no partial; -inf gives it no weight in mla_reduce_v1.
-            attn_lse.fill_(float("-inf"))
 
         use_hk = head_plan.backend == _MlaBackendId.HK
 
