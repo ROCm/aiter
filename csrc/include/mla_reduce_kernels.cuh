@@ -357,6 +357,16 @@ __device__ void reduce_output_massive(const MlaReduceKernelV1Params& params,
                                        partial_output_seq_byte_offset + thread_byte_offset);
     };
 
+    // A split with no weight is an empty work item: it wrote no partial, and what its slot
+    // holds can be NaN, which 0 * NaN would carry into the sum.
+    auto accumulate = [&](const float lse_scale, const vec_f32_t& oaccu) {
+        if(lse_scale != 0.f)
+        {
+            opus::static_for<kVecWidth>(
+                [&](auto i) { reg_out[i.value] += lse_scale * oaccu[i.value]; });
+        }
+    };
+
     auto oaccu_0      = load_output(reduce_partial_map_0);
     float lse_scale_0 = p_lds_lse_scale[0];
     int32_t reduce_partial_map_0_local;
@@ -378,8 +388,7 @@ __device__ void reduce_output_massive(const MlaReduceKernelV1Params& params,
         const float lse_scale_1 = p_lds_lse_scale[tile_idx + 1 - reduce_tile_start];
 
         // calculate on tile 0
-        opus::static_for<kVecWidth>(
-            [&](auto i) { reg_out[i.value] += lse_scale_0 * oaccu_0[i.value]; });
+        accumulate(lse_scale_0, oaccu_0);
 
         // load partial map for tile 3
         reduce_partial_map_1_local = p_lds_reduce_partial_map[tile_idx + 3 - reduce_tile_start];
@@ -389,8 +398,7 @@ __device__ void reduce_output_massive(const MlaReduceKernelV1Params& params,
         lse_scale_0 = p_lds_lse_scale[tile_idx + 2 - reduce_tile_start];
 
         // calculate on tile 1
-        opus::static_for<kVecWidth>(
-            [&](auto i) { reg_out[i.value] += lse_scale_1 * oaccu_1[i.value]; });
+        accumulate(lse_scale_1, oaccu_1);
     }
 
     if((tile_idx + 1) < reduce_tile_end)
@@ -410,8 +418,7 @@ __device__ void reduce_output_massive(const MlaReduceKernelV1Params& params,
         const float lse_scale_1 = p_lds_lse_scale[tile_idx + 1 - reduce_tile_start];
 
         // calculate on tile 0
-        opus::static_for<kVecWidth>(
-            [&](auto i) { reg_out[i.value] += lse_scale_0 * oaccu_0[i.value]; });
+        accumulate(lse_scale_0, oaccu_0);
 
         // load data for tile 2
         if((tile_idx + 2) < reduce_tile_end)
@@ -421,8 +428,7 @@ __device__ void reduce_output_massive(const MlaReduceKernelV1Params& params,
         }
 
         // calculate on tile 1
-        opus::static_for<kVecWidth>(
-            [&](auto i) { reg_out[i.value] += lse_scale_1 * oaccu_1[i.value]; });
+        accumulate(lse_scale_1, oaccu_1);
 
         tile_idx += 2;
     }
@@ -433,8 +439,7 @@ __device__ void reduce_output_massive(const MlaReduceKernelV1Params& params,
         // * data for tile 0 is ready.
 
         // calculate on tile 0
-        opus::static_for<kVecWidth>(
-            [&](auto i) { reg_out[i.value] += lse_scale_0 * oaccu_0[i.value]; });
+        accumulate(lse_scale_0, oaccu_0);
     }
 
     using out_t                     = typename gmem_final_t::scalar_type;
@@ -663,6 +668,12 @@ __device__ void mla_reduce_v1_impl_simple(const MlaReduceKernelV1Params& params,
             reduce_partial_map_0 * int32_t(Traits::kNumHeadQ * sizeof(float)))[0];
         float max_lse   = lse;
         float sum_e_lse = 1.0f;
+        // A -inf LSE is an empty work item, which wrote no partial: it adds nothing.
+        if(lse == -INFINITY)
+        {
+            opus::static_for<kVecWidth>([&](auto i) { reg_out[i.value] = 0.f; });
+            sum_e_lse = 0.f;
+        }
 
         for(int32_t ti = reduce_tile_start + 1; ti < reduce_tile_end; ++ti)
         {
@@ -674,6 +685,10 @@ __device__ void mla_reduce_v1_impl_simple(const MlaReduceKernelV1Params& params,
 
             const float lse_val = g_partial_lse.template _load<1>(
                 partial_lse_seq_byte_offset + slot * int32_t(Traits::kNumHeadQ * sizeof(float)))[0];
+            if(lse_val == -INFINITY)
+            {
+                continue;
+            }
             const float new_max_lse = opus::max(max_lse, lse_val);
             const float old_scale   = expf(max_lse - new_max_lse);
             const float new_scale   = expf(lse_val - new_max_lse);
@@ -686,8 +701,9 @@ __device__ void mla_reduce_v1_impl_simple(const MlaReduceKernelV1Params& params,
             sum_e_lse = sum_e_lse * old_scale + new_scale;
         }
 
-        opus::static_for<kVecWidth>(
-            [&](auto i) { reg_out[i.value] = reg_out[i.value] / sum_e_lse; });
+        opus::static_for<kVecWidth>([&](auto i) {
+            reg_out[i.value] = (sum_e_lse == 0.f) ? 0.f : reg_out[i.value] / sum_e_lse;
+        });
 
         const int32_t store_byte_offset = threadIdx.x * kVecWidth * int32_t(sizeof(out_t));
         auto g_final_output             = make_final_output(seq_idx);
@@ -977,7 +993,11 @@ __global__ void kn_mla_reduce_v1_d64(const MlaReduceKernelV1Params params)
             const int64_t lse_offset = lse_offset_of(params.p_reduce_partial_map[ti]);
             const float scale        = expf(partial_lse[lse_offset] - global_lse);
             const int64_t out_offset = lse_offset * kHeadDim + dim_idx;
-            acc += scale * partial_output[out_offset];
+            // No weight: an empty work item, whose slot was never written.
+            if(scale != 0.f)
+            {
+                acc += scale * partial_output[out_offset];
+            }
         }
 
         const int64_t final_out_offset =
@@ -1283,8 +1303,12 @@ __launch_bounds__(Traits::kNumThreads) __global__
                         {
                             const float s = __int_as_float(
                                 __builtin_amdgcn_readlane(__float_as_int(scale_c), j0 + u));
-                            opus::static_for<kVec>(
-                                [&](auto i) { acc[i.value] += s * data[u][i.value]; });
+                            // No weight: an empty work item, whose slot was never written.
+                            if(s != 0.f)
+                            {
+                                opus::static_for<kVec>(
+                                    [&](auto i) { acc[i.value] += s * data[u][i.value]; });
+                            }
                         }
                     }
                 }

@@ -1523,8 +1523,11 @@ def mla_decode_fwd(
             dtype=dtypes.fp32,
             device=device,
         )
-        attn_lse = torch.empty(
+        # A work item with no KV writes no partial; -inf makes mla_reduce_v1
+        # give it no weight.
+        attn_lse = torch.full(
             (reduce_partial_map.size(0) * max_seqlen_q, 1, nhead, 1),
+            float("-inf"),
             dtype=dtypes.fp32,
             device=device,
         )
