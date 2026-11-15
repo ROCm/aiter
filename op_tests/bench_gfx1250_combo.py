@@ -86,9 +86,10 @@ same thing to every op:
                     smaller M stays out because of a UT bug; see DSV4_OPS.
     mla_v4_prefill  1024..16384, the DSv4 prefill chunk. 65536 faults; see
                     _MLA_PREFILL_TOKENS.
-    score_qk_fp4    none: one fixed case a scenario (prefill, and decode at
-                    two MTP depths), each the fastest of a realistic sweep;
-                    see _SCORE_QK_FP4_CASES.
+    score_qk_fp4    decode: a few batch tiers a suite at 16K / 64K / 128K
+                    contexts; prefill: 16384 rows as a batch of 1..8 sequences
+                    at 16K..128K contexts, which does not follow the variable.
+                    See _SCORE_QK_FP4_SUITES.
     --dsv41 moe,    tokens/rank, powers of 2 up to 16384.
     mega_moe
     --dsv41         the same plus 384/768/1536 (decode at max-num-seqs
@@ -535,74 +536,27 @@ _SCORE_QK_KV_LENGTHS = (
 # API as the model calls it (op_tests/test_pa_mqa_logits_mxfp4_opus.py: the op
 # picks its kernel; V4 decode passes one schedule a forward, built outside the
 # timing; prefill and V4.1 pass none). --dsv4 runs V4 (64 heads, CSA ratio 4);
-# --dsv41 runs V4.1's ratio-2 full layers (2, 8, 14) and its candidate layers,
-# which score each row against its own 2048 picked pages. One case a scenario --
-# prefill, and decode at MTP 1 and 4 (V4) or 1 and 6 (V4.1, its DSpark verify
-# depth), MTP being the rows a sequence -- the fastest of a sweep over this
-# file's DSv4 workloads: decode at score_qk's 16K/4K and 32K/16K average contexts
-# (18432 and 40960 raw tokens, which the UT compresses by the layer's ratio) and
-# batch 16..1024; prefill as 16384 rows, fresh 1K..16K chunks and a 32K input's
-# second 16K chunk. Fastest is by TB/s at MTP 1, one row a sequence leaving the
-# launch memory-bound, and by TFLOPS elsewhere. Swept on gfx1250, 2026-11-13. It
-# does not follow AITER_BENCH_TOKENS.
-def _score_qk_fp4_model(model):
-    # Only V4.1's full layers take a ratio; V4 is CSA 4, the candidate layers 1.
-    return ["-m", model, *(("--ratio", "2") if model == "v41-full" else ())]
-
-
-def _score_qk_fp4_decode(model, mtp, batch, ctx):
-    return [
-        *_score_qk_fp4_model(model),
-        *("--modes", "decode", "--mtp", str(mtp), "-b", str(batch), "-c", str(ctx)),
-    ]
-
-
-def _score_qk_fp4_prefill(model, qlen, ctx):
-    return [
-        *_score_qk_fp4_model(model),
-        *("--modes", "prefill", "-q", str(qlen), "-c", str(ctx)),
-    ]
-
-
-_SCORE_QK_FP4_CASES = {
-    # The sweep's best (gfx1250, us / TFLOPS / TB/s) beside each case.
-    "dsv4": (
-        # 232.3 us, 7100 TFLOPS
-        ("v4 prefill", _score_qk_fp4_prefill("v4", 16384, 32768)),
-        # 60.3 us, 12.60 TB/s
-        ("v4 decode MTP 1", _score_qk_fp4_decode("v4", 1, 1024, 40960)),
-        # 127.3 us, 5397 TFLOPS
-        ("v4 decode MTP 4", _score_qk_fp4_decode("v4", 4, 1024, 40960)),
-    ),
-    "dsv41": (
-        # 238.3 us, 6920 TFLOPS
-        ("v4.1 full layer prefill", _score_qk_fp4_prefill("v41-full", 16384, 32768)),
-        # 130.3 us, 11.60 TB/s
-        (
-            "v4.1 full layer decode MTP 1",
-            _score_qk_fp4_decode("v41-full", 1, 1024, 40960),
-        ),
-        # 213.8 us, 4821 TFLOPS
-        (
-            "v4.1 full layer decode MTP 6",
-            _score_qk_fp4_decode("v41-full", 6, 1024, 40960),
-        ),
-        # 386.6 us, 4251 TFLOPS
-        (
-            "v4.1 candidate layer prefill",
-            _score_qk_fp4_prefill("v41-cand", 16384, 32768),
-        ),
-        # 83.9 us, 14.42 TB/s
-        (
-            "v4.1 candidate layer decode MTP 1",
-            _score_qk_fp4_decode("v41-cand", 1, 1024, 18432),
-        ),
-        # 286.0 us, 2883 TFLOPS
-        (
-            "v4.1 candidate layer decode MTP 6",
-            _score_qk_fp4_decode("v41-cand", 6, 1024, 18432),
-        ),
-    ),
+# --dsv41 runs V4.1's ratio-2 full layers (2, 8, 14) and its candidate layers
+# (24, 28, 32, 36), which score each row against its own 2048 picked 8-row pages.
+# Two tables a suite, prefill and decode, each holding every model's rows. The
+# indexer serves long contexts, so every case is 16K to 128K tokens (raw tokens;
+# the UT compresses them by the layer's ratio):
+#   prefill  16384 rows a call, the batched-token budget, as a batch of 1..8
+#            sequences each scoring its chunk of 16384 / batch rows that ends at
+#            the context.
+#   decode   each sequence scores its last MTP rows, 1 and 4 for V4, 1 and 6 for
+#            V4.1 (DSpark's verify depth), at a few batch tiers.
+# A candidate row reads only the pages picked for it, and at MTP 6 and in prefill
+# a request's rows pick largely the same pages and re-read them from L2. The UT's
+# TB/s counts each row's reads, so for those candidate-layer rows it is no HBM
+# bandwidth: they print TFLOPS only (see _score_qk_fp4_table).
+_SCORE_QK_FP4_PREFILL_CTX = ("16384", "32768", "65536", "98304", "131072")
+_SCORE_QK_FP4_DECODE_CTX = ("16384", "65536", "131072")
+# Per suite: the models the UT runs, the prefill batches (sequences sharing the
+# 16384 rows), and the decode MTP depths and batch tiers.
+_SCORE_QK_FP4_SUITES = {
+    "dsv4": (("v4",), (1, 2, 4, 8), ("1", "4"), _tokens((16, 64, 256, 1024))),
+    "dsv41": (("v41-full", "v41-cand"), (1, 2), ("1", "6"), _tokens((64, 256))),
 }
 # Was unset, which let the UT sweep its own 27-value default down to M=1. Two
 # reasons to set it. First, M here is the token count of one step, so the small
@@ -757,7 +711,7 @@ _DSV41_MEGA_RECIPE_ENV = {
 }
 # Indexer top-k as ATOM calls it: k=512, stable, indices only. Decode rows are
 # batch x 6 (DSpark) over a candidate layer's 2048 x 8 = 16384 columns and a
-# full layer's 40960-token context at ratio 2 (20480, score_qk_fp4's context).
+# full layer's 40960-token context at ratio 2 (20480; score_qk's 32K/16K average).
 _DSV41_TOPK_K = 512
 _DSV41_TOPK_NEXT_N = 6
 _DSV41_TOPK_BATCH = _tokens((1, 2, 4, 8, 16, 32, 64, 128, 256))
@@ -2138,38 +2092,78 @@ def run_score_qk(args):
         )
 
 
-def _score_qk_fp4_tables(scenario):
-    """The child's table named for its scenario: the UT names a table for the model and mode
-    alone, so a suite's two decode cases would share a name. Profiler kernels are attached
-    first, while the name still matches (as _mla_v4_ep_tables does)."""
+def _score_qk_fp4_table(mode):
+    """The child's tables (one a model) as one ``score_qk_fp4 <mode>`` table, a
+    ``model`` column telling the rows apart. Profiler kernels are attached first,
+    while each table's name still matches (as _mla_v4_ep_tables does)."""
 
     def extract(lines):
-        tables = []
+        rows = []
         for table, profiles in _profiled_json_tables(lines):
             _attach_kernel_profiles(table, profiles)
-            table["name"] = f"score_qk_fp4 {scenario}"
-            tables.append(json.dumps(table))
-        return tables
+            rows += table["rows"]
+        for row in rows:
+            # A request's candidate rows re-read the same pages from L2 (prefill,
+            # MTP > 1): TB/s would count every re-read, so only TFLOPS stays.
+            if row.get("model") == "v41-cand" and (
+                mode == "prefill" or int(row.get("mtp", 1)) > 1
+            ):
+                row.pop("TB/s", None)
+        return (
+            [json.dumps({"name": f"score_qk_fp4 {mode}", "rows": rows})] if rows else []
+        )
 
     return extract
 
 
 def run_score_qk_fp4(args):
-    """Run MXFP4 paged MQA logits (OPUS) for the suite's model, one case a scenario.
+    """Run MXFP4 paged MQA logits (OPUS) for the suite's model: a prefill and a
+    decode table.
 
     --dsv4 runs V4; --dsv41 runs V4.1's ratio-2 full layers and its candidate
     layers (--ops score_qk_fp4 elsewhere runs V4). Perf tables only, no
-    semantics sweep; see _SCORE_QK_FP4_CASES.
+    semantics sweep; see _SCORE_QK_FP4_SUITES.
     """
     _unsupported_init(args, "score_qk_fp4")
     repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-    suite = args.suite if args.suite in _SCORE_QK_FP4_CASES else "dsv4"
-    for scenario, case in _SCORE_QK_FP4_CASES[suite]:
+    suite = args.suite if args.suite in _SCORE_QK_FP4_SUITES else "dsv4"
+    models, prefill_batches, mtps, batches = _SCORE_QK_FP4_SUITES[suite]
+    base_cmd = [
+        sys.executable,
+        "op_tests/test_pa_mqa_logits_mxfp4_opus.py",
+        "-m",
+        *models,
+        # Only V4.1's full layers take a ratio; V4 is CSA 4, the candidate layers 1.
+        *(("--ratio", "2") if "v41-full" in models else ()),
+    ]
+    for mode, shape in (
+        (
+            "prefill",
+            [
+                # The UT's -q is a sequence's chunk; its prefill is 16384 rows a call.
+                "-q",
+                *(str(16384 // b) for b in prefill_batches),
+                "-c",
+                *_SCORE_QK_FP4_PREFILL_CTX,
+            ],
+        ),
+        (
+            "decode",
+            [
+                "--mtp",
+                *mtps,
+                "-b",
+                *map(str, batches),
+                "-c",
+                *_SCORE_QK_FP4_DECODE_CTX,
+            ],
+        ),
+    ):
         _run_child(
-            f"score_qk_fp4 ({scenario})",
-            [sys.executable, "op_tests/test_pa_mqa_logits_mxfp4_opus.py", *case],
+            f"score_qk_fp4 {mode} ({', '.join(models)})",
+            [*base_cmd, "--modes", mode, *shape],
             cwd=repo_root,
-            extract=_score_qk_fp4_tables(scenario),
+            extract=_score_qk_fp4_table(mode),
             structured=True,
             ut_timing=args.suite == "dsv41",
         )
