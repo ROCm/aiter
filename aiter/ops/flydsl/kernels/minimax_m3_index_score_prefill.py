@@ -97,7 +97,7 @@ from aiter.ops.flydsl.kernels.minimax_m3_index_score import (
     e4m3_table_words,
     e4m3_to_f32,
     fp4_dword_to_e4m3,
-    fp8_dwords_to_f16,
+    fp8_dwords_widen,
     nvfp4_dword_to_f16,
 )
 from aiter.ops.flydsl.kernels.tensor_shim import (
@@ -870,7 +870,9 @@ def build_prefill_score(g, k_fp4=False, q_fp8=False, nvfp4=None):
                 ).bitcast(fx.Int32)
                 t = fx.make_rmem_tensor(fx.make_layout(8, 1), fx.Float16)
                 t.store(
-                    fx.Vector.from_elements(fp8_dwords_to_f16(raw, 0, 2), fx.Float16)
+                    fx.Vector.from_elements(
+                        fp8_dwords_widen(raw, 0, 2, fx.Float16), fx.Float16
+                    )
                 )
                 frags.append(t)
             return frags
