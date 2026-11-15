@@ -16,7 +16,7 @@ weight rebinding with interleaved staged calls, the 32-bit epoch wrap with zero
 rows, CUDA graph replay against eager, and paired timing against the staged route.
 The fused routes need an a8w4 layout of FUSED_LAYOUTS (mega_moe_config.py) on an
 8-XCD gfx950: DeepSeek-V4-Pro (--network v4_pro) on 8 ranks, or DeepSeek-V4.1-Flash
-(--network v41_flash) on the rank counts listed there (EP4: 4 ranks, EP2: 2 ranks).
+(--network v41_flash) on 8, 4 or 2 ranks (EP8, EP4, EP2).
 
     torchrun --nproc-per-node 8 test_mega_moe_v2.py --bs-list 1,64,128
     torchrun --nproc-per-node 8 test_mega_moe_v2.py --max-tok-per-rank 8192 \
@@ -758,7 +758,7 @@ def _check_large_m_edges(
         else:
             raise AssertionError(f"{label} Stage1 accepted float8_e4m3fn scales")
 
-    # The instance's own layout (one of FUSED_LAYOUTS: EP8 DeepSeek-V4-Pro, EP4 / EP2 DeepSeek-V4.1-Flash).
+    # The instance's own layout (one of FUSED_LAYOUTS: EP8 DeepSeek-V4-Pro, EP8 / EP4 / EP2 DeepSeek-V4.1-Flash).
     layout = {
         "arch": "gfx950",
         "world_size": moe.world_size,
@@ -1242,7 +1242,7 @@ def _routes_instance(args, rank, world, device):
     if moe.small_m_mtpr != max(args.small_m_mtprs):
         raise AssertionError(
             f"small-input route not built (small_m_mtpr={moe.small_m_mtpr}); it needs a fused "
-            "a8w4 layout of FUSED_LAYOUTS (DeepSeek-V4-Pro on 8 ranks, DeepSeek-V4.1-Flash on 4 or 2 ranks) "
+            "a8w4 layout of FUSED_LAYOUTS (DeepSeek-V4-Pro on 8 ranks, DeepSeek-V4.1-Flash on 8, 4 or 2 ranks) "
             "on an 8-XCD gfx950"
         )
     x, w, ids = _make_inputs(

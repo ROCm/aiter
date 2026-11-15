@@ -4,7 +4,7 @@
 
 Every EP rank must take the same route for a call, so the plan's choice may
 depend only on EP-wide inputs (the plan and the call's max_tokens). The
-multi-GPU behaviour of each route (EP8 DeepSeek-V4-Pro, EP4 / EP2 DeepSeek-V4.1-Flash)
+multi-GPU behaviour of each route (EP8 DeepSeek-V4-Pro, EP8 / EP4 / EP2 DeepSeek-V4.1-Flash)
 lives in op_tests/multigpu_tests/test_mega_moe_v2.py: --suite size for the
 pinned staged and large-input routes, --suite routes for the instance that
 serves all three.
@@ -47,6 +47,11 @@ V4_PRO = dict(
     quant="a8w4",
     swiglu_limit=10.0,
 )
+# EP8 DeepSeek-V4.1-Flash: 48 experts a rank, the V4-Pro expert count at the Flash dims.
+V41_FLASH_EP8 = dict(V4_PRO, model_dim=5120, inter_dim=2304)
+V41_FLASH_EP8_SHAPE = dict(
+    world_size=8, experts_per_rank=48, model_dim=5120, inter_dim=2304
+)
 # EP4 DeepSeek-V4.1-Flash: 96 experts a rank.
 V41_FLASH_EP4 = dict(V4_PRO, world_size=4, model_dim=5120, inter_dim=2304, experts=384)
 V41_FLASH_EP4_SHAPE = dict(
@@ -70,11 +75,12 @@ def _plan(mtpr, *, small=DEFAULT_SMALL_M_MTPRS, large=None):
 
 def test_fused_layout_gate():
     assert fused_layout_supported(**V4_PRO)
+    assert fused_layout_supported(**V41_FLASH_EP8)
     assert fused_layout_supported(**V41_FLASH_EP4)
     assert fused_layout_supported(**V41_FLASH_EP2)
     assert not fused_layout_supported(**{**V41_FLASH_EP2, "experts": 192})
-    # Each layout is supported whole: no mix of the two shapes.
-    assert not fused_layout_supported(**{**V41_FLASH_EP4, "world_size": 8})
+    # Each layout is supported whole: no mix of expert count and hidden size.
+    assert not fused_layout_supported(**{**V41_FLASH_EP8, "experts": 256})
     assert not fused_layout_supported(**{**V41_FLASH_EP4, "experts": 768})
     assert not fused_layout_supported(**{**V41_FLASH_EP4, "inter_dim": 3072})
     for field, value in (
@@ -91,6 +97,16 @@ def test_fused_layout_gate():
     assert not fused_layout_supported(**V4_PRO, act="situv2")
     assert not fused_layout_supported(**V4_PRO, fanout_masks=(3,) * 8)
     assert small_m_cu_supported(256) and not small_m_cu_supported(128)
+
+
+def test_ep8_flash_uses_the_v4_pro_48_expert_schedule():
+    """48 experts a rank: Flash EP8 keeps the V4-Pro fused schedule. Dims are kernel arguments."""
+    pro = dict(world_size=8, experts_per_rank=48, model_dim=7168, inter_dim=3072)
+    for tokens, mtpr in ((1, 256), (128, 512), (8192, 8192), (16384, 16384)):
+        assert select_fused_config(
+            tokens, mtpr, **V41_FLASH_EP8_SHAPE
+        ) == select_fused_config(tokens, mtpr, **pro), (tokens, mtpr)
+    assert large_m_mtprs_for(world_size=8, model_dim=5120, inter_dim=2304) == LARGE_M_MTPRS
 
 
 def test_small_m_capacities_pruned_to_reachable():
@@ -202,7 +218,7 @@ def test_ep4_route_for_every_max_tokens(mtpr):
         assert plan.route_for(max_tokens, large_m=False)[0] != ROUTE_LARGE_M
 
 
-@pytest.mark.parametrize("layout", ("ep8", "ep4", "ep2"))
+@pytest.mark.parametrize("layout", ("ep8", "ep8_flash", "ep4", "ep2"))
 def test_large_m_buffers_fit_32bit_offsets(layout):
     """Every large-input capacity keeps its buffer-resource views inside 32-bit offsets and its encodings in
     their bit fields (the kernel and LargeMRuntime raise past them; this pins the margin).
@@ -214,6 +230,7 @@ def test_large_m_buffers_fit_32bit_offsets(layout):
 
     world_size, epr, model_dim, inter_dim = {
         "ep8": (8, 48, 7168, 3072),
+        "ep8_flash": (8, 48, 5120, 2304),
         "ep4": (4, 96, 5120, 2304),
         "ep2": (2, 192, 5120, 2304),
     }[layout]
