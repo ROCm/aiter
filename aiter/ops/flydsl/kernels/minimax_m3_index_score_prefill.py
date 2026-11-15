@@ -42,7 +42,8 @@ two scale bytes, through a per-CTA LDS table of e4m3_rn_satfinite(mag * scale)) 
 32 e4m3 bytes in natural element order, so the page the MFMAs read is exactly an fp8
 page of K = e4m3_rn_satfinite(e2m1 * scale). One dequant per page per thread,
 amortised over every query row of the tile, instead of one per wave as in decode.
-That is `k_round="e4m3"` (the default), bit-identical to vLLM's NVFP4 scorer.
+That is `k_round="e4m3"` (the default): K is `e2m1 * scale` rounded to e4m3 (RNE,
+saturating at 448), the product the op test's torch oracle scores.
 `k_round="exact"` keeps K = e2m1 * scale unrounded: e2m1 * e4m3 scale is exact in f16
 (and so is the e4m3 Q), so the page is widened to f16 in LDS (32 KB; one convert and
 one packed multiply per element pair, no table) and scored on the 16x16x32 f16 MFMA,
@@ -97,7 +98,7 @@ from aiter.ops.flydsl.kernels.minimax_m3_index_score import (
     e4m3_table_words,
     e4m3_to_f32,
     fp4_dword_to_e4m3,
-    fp8_dwords_to_f16,
+    fp8_dwords_widen,
     nvfp4_dword_to_f16,
 )
 from aiter.ops.flydsl.kernels.tensor_shim import (
@@ -114,7 +115,8 @@ SCALE_BYTES = HEAD_DIM // 32
 # Query rows one CTA scores. The tunable this kernel exists for; see the header
 # for why it is the dial onto arithmetic intensity and what bounds it.
 TILE_Q_CHOICES = (64, 128, 192, 256, 384, 512)
-_LDS_LIMIT = 64 * 1024
+_LDS_LIMIT = 64 * 1024  # page buffers + Q staging budget (sizes tile_q)
+_LDS_HW_BYTES = 160 * 1024  # gfx950 LDS per CU; one CTA may take all of it
 # Largest tile worth using, per arithmetic path. The register file bounds
 # tile_q: fp8 stops at the largest tile that still gets two waves per SIMD,
 # bf16 cannot reach two at any size and takes the largest that does not spill.
@@ -395,7 +397,7 @@ def build_prefill_score(g, k_fp4=False, q_fp8=False, nvfp4=None):
 
     `nvfp4` ("e4m3" | "exact") reads an NVFP4 cache (two views, e4m3 scale per 16
     elements) but with `k_fp4` False: "e4m3" widens the page to e4m3 on its way
-    into LDS and everything after is the fp8 path; "exact" widens it to bf16 and
+    into LDS and everything after is the fp8 path; "exact" widens it to f16 and
     scores it on the 16x16x32 f16 MFMA (`EXACT`).
     """
     if nvfp4 is not None and (k_fp4 or nvfp4 not in NVFP4_ROUNDINGS):
@@ -538,7 +540,13 @@ def build_prefill_score(g, k_fp4=False, q_fp8=False, nvfp4=None):
         _lut_bytes += 2 * WAVES * RAW_W
     if _total > _LDS_LIMIT:
         raise ValueError(f"the LDS page buffers need {_total} B")
+    # The NVFP4 fields (scale table, score staging, DMA landing zone) sit on top of the
+    # budgeted buffers: the 512-row DMA tile needs 76.8 KB in all and the exact 256-row
+    # tile 77.8 KB (group_segment_fixed_size in their ISA), past the 64 KB budget but well
+    # inside what gfx950 has. Check the sum against the hardware.
     _total += _lut_bytes
+    if _total > _LDS_HW_BYTES:
+        raise ValueError(f"the LDS fields need {_total} B, gfx950 has {_LDS_HW_BYTES}")
     SharedStorage = fx.struct(
         type("PrefillSharedStorage", (), {"__annotations__": _fields})
     )
@@ -627,8 +635,11 @@ def build_prefill_score(g, k_fp4=False, q_fp8=False, nvfp4=None):
         q_base = pid_q * fx.Int32(TILE_Q)
         # Causal window for this tile: no page past the last row's own position
         # can contribute, and this chunk owns a slice of what is left.
-        hi_tok = prefix_len + q_base + fx.Int32(TILE_Q)
-        hi_tok = (hi_tok < seq_len).select(hi_tok, seq_len)
+        # Summed in int64: for a tile of 256+ rows near the 2**31 length bound the
+        # sum passes int32 before it is clamped, wraps negative and skips every page.
+        hi_tok = fx.Int64(prefix_len) + fx.Int64(q_base) + fx.Int64(TILE_Q)
+        hi_tok = (hi_tok < fx.Int64(seq_len)).select(hi_tok, fx.Int64(seq_len))
+        hi_tok = fx.Int32(hi_tok)
         # The grid is sized by `max_query_len`, so a short request still gets every
         # tile. A tile at or past its last query row stores nothing, but `hi_tok` is
         # clamped only by `seq_len`, so without this it would walk the whole causal
@@ -774,8 +785,8 @@ def build_prefill_score(g, k_fp4=False, q_fp8=False, nvfp4=None):
                     # K is widened in the order `fp4_dword_to_e4m3` emits -- each 8
                     # elements as evens then odds -- so Q takes the same order. The
                     # dot sums over k, so any order both operands share is the same
-                    # score up to accumulation; this is vLLM's, which is what it must
-                    # match bit for bit.
+                    # score up to accumulation; Q takes K's order, and the op test's
+                    # exact-sum cases pin it to the oracle bit for bit.
                     a, b = words
                     words = [
                         fx.Int32(fx.rocdl.perm_b32(b, a, fx.Int32(0x06040200))),
@@ -870,7 +881,9 @@ def build_prefill_score(g, k_fp4=False, q_fp8=False, nvfp4=None):
                 ).bitcast(fx.Int32)
                 t = fx.make_rmem_tensor(fx.make_layout(8, 1), fx.Float16)
                 t.store(
-                    fx.Vector.from_elements(fp8_dwords_to_f16(raw, 0, 2), fx.Float16)
+                    fx.Vector.from_elements(
+                        fp8_dwords_widen(raw, 0, 2, fx.Float16), fx.Float16
+                    )
                 )
                 frags.append(t)
             return frags
@@ -1178,10 +1191,11 @@ def build_prefill_score(g, k_fp4=False, q_fp8=False, nvfp4=None):
             def _k32_chunk(st, i):
                 """16 B chunk of the row that k-step `st`, half `i` of this lane reads on
                 the 32x32x64 shape. aiter's partition is elements 64*st + 32*h32 (the
-                two half-waves split a 64-wide step); NVFP4 takes vLLM's, 64*h32 +
-                32*st, because which elements one MFMA sums together changes the fp32
-                rounding of the score, and this is the grouping the vLLM NVFP4 scorer
-                (the reference for this cache) uses."""
+                two half-waves split a 64-wide step); NVFP4 takes 64*h32 + 32*st.
+                Which elements one MFMA sums together changes the fp32 rounding of
+                the score; the op test compares this grouping with aiter's fp8
+                scorer to a few fp32 ulps (`check_prefill_nvfp4_matches_aiter`) and
+                with the torch oracle bit for bit on exact-sum data."""
                 if const_expr(nvfp4):
                     return h32 * 4 + fx.Int32(2 * st + i)
                 return fx.Int32(4 * st) + h32 * 2 + fx.Int32(i)
@@ -1559,7 +1573,7 @@ def build_prefill_score(g, k_fp4=False, q_fp8=False, nvfp4=None):
                 if const_expr(EXACT):
                     # Page rows are 256 B of f16 (16 chunks, XOR-swizzled by the row's
                     # low bits); lane (g, u) reads chunk 4s + g of token 16*tt + u at
-                    # k-step s, which is the 8 features 32s + 8g.. -- 16x16x32 bf16 MFMA,
+                    # k-step s, which is the 8 features 32s + 8g.. -- 16x16x32 f16 MFMA,
                     # four chained k-steps per (tok_tile, tile).
                     _off_bf = [
                         (u * fx.Int32(16) + ((fx.Int32(4 * s) + g) ^ (u & fx.Int32(7))))
@@ -1946,9 +1960,16 @@ def build_prefill_score(g, k_fp4=False, q_fp8=False, nvfp4=None):
             safe = (blk < blk_hi).select(blk, blk_lo)
             safe = (blk_lo < blk_hi).select(safe, fx.Int32(0))
             if const_expr(DMA):
+                # Legacy GEP kept on purpose: FlyDSL 0.5.0's `fly.ptr` has no constant
+                # (addrspace 4) address space and `fx.ptr_load` no `invariant` flag, so
+                # this scalar block-table load has no pointer-API form (see above).
+                # The element index fits int32 (the table's span is validated), its
+                # byte offset up to 4 GiB does not: widen before the multiply.
                 addr = buffer_ops.get_element_ptr(
                     bt_const,
-                    byte_offset=((b * i32_stride_bt_b + safe) * fx.Int32(4)).ir_value(),
+                    byte_offset=(
+                        fx.Int64(b * i32_stride_bt_b + safe) * fx.Int64(4)
+                    ).ir_value(),
                     elem_type=T.i8,
                 )
                 page = fx.Int32(
@@ -2372,9 +2393,10 @@ def _score_prefill_impl(
     k_fp4 = two_view and nvfp4 is None
     if nvfp4 is not None and (nvfp4 not in NVFP4_ROUNDINGS or not two_view):
         raise ValueError(f"nvfp4: k_round must be one of {NVFP4_ROUNDINGS}")
-    if two_view:
+    if k_fp4:
         # per_1x32_f4_quant hands back fp4x2 / e8m0: take those as they are. Same
-        # bytes either way, so the uint8 view is only a reinterpretation.
+        # bytes either way, so the uint8 view is only a reinterpretation. NVFP4 takes
+        # uint8 views only: its scales are e4m3, so an e8m0-typed tensor is refused.
         if getattr(cache, "dtype", None) == dtypes.fp4x2:
             cache = cache.view(torch.uint8)
         if getattr(k_scale, "dtype", None) == dtypes.fp8_e8m0:
@@ -2503,13 +2525,19 @@ def _score_prefill_impl(
             f"got {tuple(block_table.shape)}"
         )
     # The merged store needs the block axis contiguous and the run aligned.
+    # `exact_geometry` returns one cached dict per set of bounds: copy before adding
+    # what depends on THIS output, or a padded and an aligned `out` overwrite each
+    # other's store mode (and the `_get` key and the kernel built from it can differ).
     ppw = geom["pages_per_wave"]
-    geom["contig_k"] = int(
-        out.stride(2) == 1
-        and out.stride(1) % ppw == 0
-        and out.stride(0) % ppw == 0
-        and out.data_ptr() % (4 * ppw) == 0
-    )
+    geom = {
+        **geom,
+        "contig_k": int(
+            out.stride(2) == 1
+            and out.stride(1) % ppw == 0
+            and out.stride(0) % ppw == 0
+            and out.data_ptr() % (4 * ppw) == 0
+        ),
+    }
     q_tiles = -(-max_query_len // geom["tile_q"])
     cb = chunk_blocks(max_block, q_tiles, batch, heads, idx_q.device, geom["waves"])
     # A trip stores PPW consecutive blocks as one vector, so a chunk starts on
@@ -2609,11 +2637,12 @@ def score_prefill_flydsl_nvfp4(
 ):
     """`score_prefill_flydsl` over an NVFP4 index cache: `k_data [pages, 128, 64]`
     e2m1 and `k_scale [pages, 128, 8]` uint8 e4m3 (one per 16 elements, positive,
-    not 0x7F; no per-tensor scale), each view with its own page stride.
+    not 0x7F; no per-tensor scale), each view with its own page stride. Both are
+    uint8 views: the fp4x2 / e8m0 typed views are MXFP4's and are refused here.
 
     `idx_q` is bf16 or e4m3; as in every prefill scorer here a bf16 Q is rounded to e4m3
-    first. `k_round="e4m3"` (the default) scores K = e4m3_rn_satfinite(e2m1 * scale), as
-    the vLLM nvfp4 indexer does, on the fp8 MFMA, bit-identical to vLLM's scorer.
+    first. `k_round="e4m3"` (the default) scores K = e4m3_rn_satfinite(e2m1 * scale)
+    on the fp8 MFMA.
     `"exact"` scores K = e2m1 * scale unrounded, on the f16 MFMA (K is widened to f16
     once per page into LDS; e4m3 Q and the product are both exact in f16). Layout, work
     and contract as in
