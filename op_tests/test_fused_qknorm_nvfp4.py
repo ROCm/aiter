@@ -336,11 +336,75 @@ def test_write_modes(num_tokens):
     return ret
 
 
+def test_fp8_kv_nvfp4_index(num_tokens, slot_mode):
+    """fp8 per-token K/V (SHUFFLE pages of 16) with NVFP4 index pages: the K/V pages, their
+    scales and both q outputs equal the fp8 + MXFP4-index write's (the K/V path is the same
+    code), and the index pages equal the torch reference, byte for byte."""
+    nq, nkv, niq, rotary_dim = 16, 1, 1, 64
+    dtype = torch.bfloat16
+    torch.manual_seed(13)
+    w = [torch.randn(HEAD_DIM, dtype=dtype) * 0.1 for _ in range(4)]
+    cs = torch.randn(4096, rotary_dim, dtype=dtype)
+    pos = torch.randint(0, 4096, (num_tokens,), dtype=torch.int64)
+    qkv = torch.randn(num_tokens, (nq + 2 * nkv + niq + 1) * HEAD_DIM, dtype=dtype)
+    stress_qkv(qkv, nq, nkv, niq)
+    pages = -(-num_tokens // PAGE) + 3
+    slots = make_slots(slot_mode, num_tokens, pages)
+    pages = max(pages, int(slots.max()) // PAGE + 1)
+    nb = pages * PAGE // 16
+
+    def run(index_dtype, idx):
+        kc = torch.zeros(nb, nkv, HEAD_DIM // 16, 16, 16, dtype=torch.float8_e4m3fn)
+        vc = torch.zeros(nb, nkv, 1, HEAD_DIM, 16, dtype=torch.float8_e4m3fn)
+        ksc, vsc = torch.zeros(nb, nkv, 16), torch.zeros(nb, nkv, 16)
+        q_out = torch.empty(num_tokens, nq * HEAD_DIM, dtype=dtype)
+        iq_out = torch.empty(num_tokens, niq * HEAD_DIM, dtype=torch.float8_e4m3fn)
+        aiter.fused_qknorm_idxrqknorm(
+            qkv.clone(), w[0], w[1], cs, pos, nq, nkv, rotary_dim, 1e-6, w[2], w[3],
+            niq, slots, kc, vc, idx, 16, q_out, iq_out, slots, kv_cache_dtype="fp8",
+            index_cache_dtype=index_dtype, k_scale=ksc, v_scale=vsc, asm_layout=True,
+        )  # fmt: skip
+        return kc, vc, ksc, vsc, q_out, iq_out
+
+    # the index rows the op quantizes: an "auto" write into a one-slot-per-token scratch
+    ident = torch.arange(pages * PAGE, dtype=torch.int64)[:num_tokens].cuda()
+    sk = torch.empty(pages, PAGE, nkv, HEAD_DIM, dtype=dtype)
+    sv, sik = torch.empty_like(sk), torch.empty(pages * PAGE, HEAD_DIM, dtype=dtype)
+    aiter.fused_qknorm_idxrqknorm(
+        qkv.clone(), w[0], w[1], cs, pos, nq, nkv, rotary_dim, 1e-6, w[2], w[3], niq,
+        ident, sk, sv, sik, PAGE,
+        torch.empty(num_tokens, nq * HEAD_DIM, dtype=dtype),
+        torch.empty(num_tokens, niq * HEAD_DIM, dtype=torch.float8_e4m3fn),
+        ident, index_cache_dtype="auto",
+    )  # fmt: skip
+    i_rows = sik[:num_tokens].float()
+
+    garbage = torch.randint(0, 256, (pages, HEAD_SIDE), dtype=torch.uint8)
+    nv_idx = garbage.clone()
+    got = run("nvfp4", nv_idx)
+    want = run("mxfp4", torch.zeros(pages, HEAD_DATA + PAGE * 4, dtype=torch.uint8))
+    want_idx = garbage.clone()
+    ref_index_pages(want_idx, i_rows, slots)
+
+    def exact(a, b, msg):
+        return checkAllclose(
+            a.view(torch.uint8).float(), b.view(torch.uint8).float(), 0, 0, msg=msg
+        )
+
+    names = ("k pages", "v pages", "k scales", "v scales", "q_out", "index q_out")
+    return {
+        "num_tokens": num_tokens,
+        "slots": slot_mode,
+        "kv err": max(exact(g, w_, f"{n}: ") for n, g, w_ in zip(names, got, want)),
+        "idx err": exact(nv_idx, want_idx, "nvfp4 index pages: "),
+    }
+
+
 REJECT = {  # name -> (kwargs of the op call, message of the refusal); a failed check ends the process
     "good": ({}, None),
     "no index nvfp4": (
         {"index_cache_dtype": "auto"},
-        "go together",
+        "takes index_cache_dtype='nvfp4'",
     ),
     "no scales": (
         {"k_scale": None, "v_scale": None},
@@ -450,8 +514,23 @@ def main():
         "write modes of fused_qknorm_idxrqknorm, us and TB/s (markdown):\n%s",
         perf[perf_cols].round(3).to_markdown(index=False),
     )
+    mixed = pd.DataFrame(
+        [
+            test_fp8_kv_nvfp4_index(t, s)
+            for t in args.tokens
+            for s in ("scatter", "seq", "mtp")
+            if s != "mtp" or t >= 4
+        ]
+    )
+    aiter.logger.info(
+        "fp8 K/V + nvfp4 index write (markdown):\n%s", mixed.to_markdown(index=False)
+    )
     errs = ["kv err", "idx err", "q err"]
-    bad = df[errs].to_numpy().sum() + perf[errs].to_numpy().sum()
+    bad = (
+        df[errs].to_numpy().sum()
+        + perf[errs].to_numpy().sum()
+        + mixed[["kv err", "idx err"]].to_numpy().sum()
+    )
     assert bad == 0, "nvfp4 pages or q differ from the reference"
 
 
