@@ -1119,8 +1119,19 @@ def bigm_lds(RG, NAB, I):
     return c
 
 
+def _i8x4_fast(f, inv):
+    """4 f32 * inv (|.| <= 127) -> int8 x 4 in an i32: + 1.5 * 2^23 rounds to the nearest
+    even integer in the low mantissa byte (two's complement), v_perm gathers the bytes"""
+    mg = fx.Float32(12582912.0)
+    v = [fx.Float32(x * inv + mg).bitcast(fx.Int32) for x in f]
+    lo = fx.Int32(rocdl.perm_b32(v[1], v[0], i32(0x0C0C0400)))
+    hi = fx.Int32(rocdl.perm_b32(v[3], v[2], i32(0x0C0C0400)))
+    return fx.Int32(rocdl.perm_b32(hi, lo, i32(0x05040100)))
+
+
 def build_bigm_unit(
-    H, I, TOPK, RG, NAB, BST, BS2, act, swiglu_limit, R8, situ=(1.0, 1.0), raux=0
+    H, I, TOPK, RG, NAB, BST, BS2, act, swiglu_limit, R8, situ=(1.0, 1.0), raux=0, mtc=0,
+    i8r=False,
 ):
     """The fused unit device function: unit_body(L, tid, e, r0, rows, rr, rwt, rx, rxs, w1,
     w2, rws1, rws2, r_routes, oob): rows rr / rwt[r0 : r0 + rows] (route index, weight) of expert
@@ -1130,7 +1141,9 @@ def build_bigm_unit(
     raux: the route rows' store cache policy (AUX_SYS: write-through).
     Returns (LDS layout, unit_body)."""
     assert RG % 16 == 0 and RG <= 128 and H % 256 == 0 and I % 128 == 0
-    MTE = RG // 16  # 16-row tiles (every wave computes every row of the unit)
+    # 16-row tiles computed (every wave computes every row of the unit): mtc (< RG / 16) of
+    # them for a unit of at most 16 mtc rows, its A rows still loaded as RG
+    MTE = mtc or RG // 16
     KH = H // 2  # A / w1 row bytes
     KCH = H // (128 * KCK)  # GEMM1 chunks (KCK k-steps of 128)
     RBA = 64 * KCK  # A row bytes per chunk
@@ -1155,7 +1168,13 @@ def build_bigm_unit(
     # sched barrier mask after the GEMM2 B issue groups (only VMEM is held)
     SCM = 0x38F
     NB2 = 6  # GEMM2 B ops per k-step: 4 tiles + 2 scale words per 64 columns
-    NST2 = 2 * MTE  # route stores per wave per group
+    # i8r: int8 route rows + one f32 scale per 64 columns (codes [routes][H], the scales
+    # [routes][H / 64] after them at oob / 2), quantized in registers, staged in LDS (the
+    # codes per group, every row's scales per unit: SST, after the waves' staging tiles in
+    # the A ring) and stored as whole 64 B / 224 B row segments
+    SST = lay["LA"] + NW * RG * 64
+    assert not i8r or SST + RG * (H // 16) <= lay["LA"] + NAB * RG * 64 * KCK
+    NST2 = MTE if i8r else 2 * MTE  # route stores per wave per group
     # steady-state GEMM1 issue order per chunk c: B(c + BST), then A(c + NAB - 1). By the
     # count alone A(c) has landed once (NA + NB) * (NAB - 2) newer ops remain, but its LDS
     # writes (direct-to-LDS loads) can still be in flight then: one chunk's ops more are
@@ -1289,17 +1308,16 @@ def build_bigm_unit(
             # here, one tile's after each tile's MFMAs (the LDS reads under the MFMAs)
             sgw, suw = bq[4 * KCK], bq[4 * KCK + 1]
             kp = (c * KCK + k) % 2  # the global k-step's half of the scale word
-            sc = [
-                (x >> i32(8 * (kp * 2 + h))) & i32(0xFF)
-                for x in (sgw, suw)
-                for h in (0, 1)
-            ]
+            # (the scale byte picked by the MFMA's opsel: no shift / mask)
+            sc = [(x, kp * 2 + h) for x in (sgw, suw) for h in (0, 1)]
             afs, sas = cur
             nafs, nsas = [], []
             for m in range_constexpr(MTE):
                 for t in range_constexpr(4):
                     j = (t // 2) * 2 * MTE + m * 2 + t % 2
-                    acc[j] = mfma(bq[k * 4 + t], afs[m], acc[j], sc[t], sas[m])
+                    acc[j] = mfma(
+                        bq[k * 4 + t], afs[m], acc[j], sc[t][0], sas[m], opa=sc[t][1]
+                    )
                 nafs.append(a_frag_m(nbuf, m, nk))
                 nsas.append(a_scale_m(nbuf, m, nk))
                 rocdl.sched_mfma(4)
@@ -1480,9 +1498,9 @@ def build_bigm_unit(
         # 64 B halves straight from the MFMA layout cost ~20% of GEMM2 at Kimi K3.1)
         STG = not R8 and NAB * RBA * RG >= NW * RG * 128
         if const_expr(STG):
-            stg = i32(LA) + w * i32(RG * 128)
+            stg = i32(LA) + w * i32(RG * (64 if i8r else 128))
             row_meta2 = []
-            for j in range_constexpr(RG // 8):
+            for j in range_constexpr(MTE * 2):
                 R = i32(j * 8) + lane // i32(8)
                 ok = R < rows
                 row_meta2.append(
@@ -1525,6 +1543,50 @@ def build_bigm_unit(
                     )
                     soff = oob // i32(2) + rix * i32(H // 32) + n0 // i32(32)
                     bst(sc, r_routes, (ok & (q4 == i32(0))).select(soff, oob), 0, raux)
+            elif const_expr(STG and i8r):
+                # int8 route rows quantized in registers (a lane: 4 columns of a row in each
+                # of the 4 tiles; the row's 64 columns on the 4 lanes l % 16), staged as
+                # [row][4 x 16 B] (chunk t at t ^ (row & 3)), then 4 lanes per row stored
+                for m in range_constexpr(MTE):
+                    ok, wt, rix = row_meta[m]
+                    row = i32(m * 16) + lane % i32(16)
+                    vals = []
+                    for t in range_constexpr(4):
+                        av = fx.Vector(acc[m * 4 + t])
+                        vals += [fx.Float32(av[i_]) * wt for i_ in range(4)]
+                    am = amax(vals)
+                    am = am.maximumf(am.shuffle_xor(i32(16), i32(64)))
+                    am = am.maximumf(am.shuffle_xor(i32(32), i32(64)))
+                    sc = am.maximumf(fx.Float32(1e-30)) / fx.Float32(127.0)
+                    inv = fx.Float32(1.0) / sc
+                    for t in range_constexpr(4):
+                        off = row * i32(64) + (i32(t) ^ (row & i32(3))) * i32(16)
+                        pk = _i8x4_fast(vals[4 * t : 4 * t + 4], inv)
+                        lds_st(L, stg + off + q4 * i32(4), pk, align=4)
+                    # the scale to the unit's LDS scale tile ([RG rows][H / 64]): written out
+                    # once per unit, a row's scales contiguous
+                    if q4 == i32(0):
+                        lds_st(
+                            L,
+                            i32(SST) + row * i32(H // 16) + (n0 // i32(64)) * i32(4),
+                            sc.bitcast(fx.Int32),
+                            align=4,
+                        )
+                c = lane % i32(4)
+                for it in range_constexpr(MTE):
+                    row = i32(it * 16) + lane // i32(4)
+                    ok = row < rows
+                    rix = lds_ld_i32(L, i32(LRIX) + ok.select(row, i32(0)) * i32(4))
+                    v = lds_ld(
+                        L, stg + row * i32(64) + (c ^ (row & i32(3))) * i32(16), V4I, 16
+                    )
+                    bst(
+                        v,
+                        r_routes,
+                        ok.select(rix * i32(H) + n0 + c * i32(16), oob),
+                        0,
+                        raux,
+                    )
             elif const_expr(STG):
                 # [row][8 x 16 B column chunks], chunk c at (c ^ (row & 7)) (no bank conflicts)
                 for m in range_constexpr(MTE):
@@ -1546,7 +1608,7 @@ def build_bigm_unit(
                         off = row * i32(128) + (c ^ (row & i32(7))) * i32(16)
                         lds_st(L, stg + off + (q4 % i32(2)) * i32(8), v2, align=8)
                 c = lane % i32(8)
-                for j in range_constexpr(RG // 8):
+                for j in range_constexpr(MTE * 2):
                     ok, rix = row_meta2[j]
                     row = i32(j * 8) + lane // i32(8)
                     v = lds_ld(
@@ -1648,6 +1710,29 @@ def build_bigm_unit(
                 ring2[kk % BS2] = issue_b2(gn, i32(sn % KS2))
             epi2(acc, gi)
             res2 = yield [v for s in range(BS2) for v in ring2[s]]  # noqa: F841
+        if const_expr(i8r):
+            gpu.barrier()
+            W4 = H // 256  # 16 B words of a row's scales
+            for it in range_constexpr(ceildiv(RG * W4, NW * 64)):
+                idx = tid + i32(it * NW * 64)
+                r_ = idx // i32(W4)
+                ok = (r_ < rows) & (idx < i32(RG * W4))
+                rix = lds_ld_i32(L, i32(LRIX) + ok.select(r_, i32(0)) * i32(4))
+                v = lds_ld(
+                    L, i32(SST) + ok.select(idx, i32(0)) * i32(16), V4I, 16
+                )
+                bst(
+                    v,
+                    r_routes,
+                    ok.select(
+                        oob.shrui(i32(1))
+                        + rix * i32(H // 16)
+                        + (idx - r_ * i32(W4)) * i32(16),
+                        oob,
+                    ),
+                    0,
+                    raux,
+                )
         wait_vm(0)
 
     @flyc.jit

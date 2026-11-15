@@ -367,12 +367,13 @@ def widen(v4):
 
 
 # Scaled MFMA with per-lane E8M0 scales read from LDS: no MMA-atom form.
-def mfma(a4, b4, cacc, sa, sb, b8=False):
+def mfma(a4, b4, cacc, sa, sb, b8=False, opa=0, opb=0):
+    """opa / opb: the byte of sa / sb that holds the scale (opsel)"""
     bx = b4 if b8 else widen(b4)
     return fx.Vector(
         rocdl.mfma_scale_f32_16x16x128_f8f6f4(
             _ty(V4F),
-            [widen(a4), bx, cacc, 4, 0 if b8 else 4, 0, i32(sa), 0, i32(sb)],
+            [widen(a4), bx, cacc, 4, 0 if b8 else 4, opa, i32(sa), opb, i32(sb)],
         )
     )
 
