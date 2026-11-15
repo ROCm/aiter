@@ -1205,14 +1205,18 @@ static void fused_qknorm_idxrqknorm_impl(
     const bool insert_kv = kv_cache_k.has_value();
     const bool nvfp4_kv_cache    = kv_cache_dtype == "nvfp4";
     const bool nvfp4_index_cache = index_cache_dtype == "nvfp4";
-    // NVFP4 is one mode: K/V pages and index pages together (an index-less layer has no index).
+    // An NVFP4 KV takes the NVFP4 index (an index-less layer has no index); an NVFP4 index
+    // also runs under an fp8 KV (the kernel's NVFP4 K/V writes sit under kKvFp4, its NVFP4
+    // index write under kIndexFp4), never under an MXFP4 KV.
     const bool mxfp4_kv_cache = kv_cache_dtype == "mxfp4" || nvfp4_kv_cache;
     AITER_CHECK(!mxfp4_kv_cache || (insert_kv && has_index),
                 "kv_cache_dtype='mxfp4'/'nvfp4' requires the sparse insert mode "
                 "(kv caches + index slots in qkv)");
-    AITER_CHECK(nvfp4_kv_cache == nvfp4_index_cache || (nvfp4_kv_cache && skip_index_branch),
-                "kv_cache_dtype='nvfp4' and index_cache_dtype='nvfp4' go together "
+    AITER_CHECK(!nvfp4_kv_cache || nvfp4_index_cache || skip_index_branch,
+                "kv_cache_dtype='nvfp4' takes index_cache_dtype='nvfp4' "
                 "(index_cache_dtype may be 'auto' only with skip_index_branch)");
+    AITER_CHECK(!nvfp4_index_cache || nvfp4_kv_cache || kv_cache_dtype.rfind("fp8", 0) == 0,
+                "index_cache_dtype='nvfp4' runs under kv_cache_dtype='nvfp4' or an fp8 KV");
     const bool fp8_kv_cache =
         insert_kv && kv_cache_dtype.rfind("fp8", 0) == 0;
     const bool fp8_kv_per_token =
@@ -1673,6 +1677,12 @@ static void fused_qknorm_idxrqknorm_impl(
             {
                 launch_fp4
                     .template operator()<uint8_t, T, Dt::kAuto, Dt::kAuto, false, true, false>();
+            }
+            else if(fp8_kv_cache && nvfp4_index_cache)
+            {
+                // fp8 K/V (per-token / static scales as below) + NVFP4 index pages
+                launch_fp4.template
+                operator()<opus::fp8_t, uint8_t, Dt::kFp8E4M3, Dt::kAuto, true, false, true>();
             }
             else if(fp8_kv_cache)
             {
