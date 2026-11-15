@@ -47,6 +47,8 @@ DATA_B = BLK * D // 2  # e2m1 bytes per head and side
 SCALE_B = BLK * D // 16  # e4m3 scale bytes per head and side
 HEAD_B = DATA_B + SCALE_B
 LOG2E = 1.4426950409
+# Dword index of a masked buffer store (byte 0x7FFFFFFC): past any buffer, so the write is dropped.
+OOB_DWORD = 0x1FFFFFFF
 # Cache-policy bits of buffer loads / stores: sc1 is coherent across the XCDs' L2s.
 SC1 = 0x10
 # The first 16 dwords of kernel arguments arrive in SGPRs.

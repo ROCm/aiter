@@ -26,13 +26,11 @@ import flydsl.compiler as flyc
 import flydsl.expr as fx
 import numpy as np
 import torch
-from flydsl._mlir.dialects import llvm as _llvm
 from flydsl.expr import const_expr, range_constexpr
 from flydsl.expr.typing import T
 from flydsl.expr.typing import Vector as Vec
 
 from aiter.jit.utils.chip_info import get_gfx_runtime, get_num_xcds
-from aiter.ops.flydsl.kernels import buffer_ops
 from aiter.ops.flydsl.kernels.minimax_m3_index_score import _cu_count
 from aiter.ops.flydsl.kernels.sparse_pa_nvfp4_common import (
     BLK,
@@ -43,6 +41,7 @@ from aiter.ops.flydsl.kernels.sparse_pa_nvfp4_common import (
     NDT,
     NKS,
     NW,
+    OOB_DWORD,
     PRELOAD_HINTS,
     RAW,
     SC1,
@@ -63,7 +62,12 @@ from aiter.ops.flydsl.kernels.sparse_pa_nvfp4_common import (
     require,
     xlane4,
 )
-from aiter.ops.flydsl.kernels.tensor_shim import _run_compiled
+from aiter.ops.flydsl.kernels.tensor_shim import (
+    _run_compiled,
+    buf_copy_load,
+    buf_copy_store,
+    ptr_buf_tensor,
+)
 
 # Cache-policy bit of buffer loads: non-temporal (streaming). The K data is read once, so it
 # streams; V stays cacheable (measured faster than streaming both).
@@ -76,15 +80,11 @@ MAX_SPLIT_ROWS = 1024  # (row, kv head) pairs a split launch can hold
 
 def _atomic_add(addr_i64, value):
     """Relaxed agent-scope atomic add on a global i32; returns the old value."""
-    return fx.Int32(
-        _llvm.AtomicRMWOp(
-            _llvm.AtomicBinOp.add,
-            global_i32_ptr(addr_i64).llvm_ptr,
-            fx.Int32(value).ir_value(),
-            _llvm.AtomicOrdering.monotonic,
-            syncscope="agent",
-            alignment=4,
-        ).result
+    return fx.llvm.atomic_add(
+        global_i32_ptr(addr_i64),
+        fx.Int32(value),
+        syncscope=fx.rocdl.SyncScope.Agent,
+        ordering=fx.AtomicOrdering.Monotonic,
     )
 
 
@@ -111,37 +111,34 @@ def _page_loader(arg_cache, page_bytes, kvh, hkv, w, n, g):
     v_scale_load = (v_scl + (n // 2) * BLK + w * KPW + 8 * g) // 4
 
     def open_page(page, valid):
-        return buffer_ops.create_buffer_resource_from_addr(
-            arg_cache + fx.Int64(page) * fx.Int64(page_bytes),
-            num_records_bytes=valid.select(fx.Int32(page_bytes), fx.Int32(0)),
+        """The page as buffer tensors of 4-, 2- and 1-dword units, indexed by dword."""
+        base = arg_cache + fx.Int64(page) * fx.Int64(page_bytes)
+        nbytes = valid.select(fx.Int32(page_bytes), fx.Int32(0))
+        return tuple(
+            ptr_buf_tensor(
+                base,
+                fx.Int32,
+                unit_elems=u,
+                unit_stride=1,
+                num_records_bytes=nbytes,
+            )
+            for u in (4, 2, 1)
         )
 
     def load_k(pr):
         raw = []
         for st in range_constexpr(2):
-            kd = fx.Vector(
-                buffer_ops.buffer_load(
-                    pr, k_load[st], vec_width=4, dtype=fx.Int32, cache_modifier=NT
-                )
-            )
+            kd = buf_copy_load(pr[0], k_load[st], unit_elems=4, cache_modifier=NT)
             raw += [kd[i] for i in range_constexpr(4)]
-        raw.append(
-            fx.Int32(
-                buffer_ops.buffer_load(pr, k_scale_load, vec_width=1, dtype=fx.Int32)
-            )
-        )
+        raw.append(fx.Int32(buf_copy_load(pr[2], k_scale_load)))
         return raw
 
     def load_v(pr):
         raw = []
         for h in range_constexpr(2):
-            vd = fx.Vector(
-                buffer_ops.buffer_load(pr, v_load + 4 * h, vec_width=4, dtype=fx.Int32)
-            )
+            vd = buf_copy_load(pr[0], v_load + 4 * h, unit_elems=4)
             raw += [vd[i] for i in range_constexpr(4)]
-        vs = fx.Vector(
-            buffer_ops.buffer_load(pr, v_scale_load, vec_width=2, dtype=fx.Int32)
-        )
+        vs = buf_copy_load(pr[1], v_scale_load, unit_elems=2)
         raw += [vs[i] for i in range_constexpr(2)]
         return raw
 
@@ -273,19 +270,17 @@ def compile_decode(
         # The row's offset inside its tail block, relative to this wave's first key: the keys
         # of the tail block past it are masked.
         lim = pos % BLK - w * KPW
-        qr = buffer_ops.create_buffer_resource_from_addr(
-            arg_q, num_records_bytes=fx.Int64(i32_rows) * fx.Int64(i32_H) * (D * 2)
+        qr = ptr_buf_tensor(
+            arg_q,
+            fx.Int32,
+            unit_elems=4,
+            unit_stride=1,
+            num_records_bytes=i32_rows * i32_H * (D * 2),
         )
         head = (n < i32_group).select(n, fx.Int32(0))  # masked heads read head 0
         q_row = (row * i32_H + kvh * i32_group + head) * (D // 2) + g * 16
         qf = [
-            bf16x8_to_f16(
-                fx.Vector(
-                    buffer_ops.buffer_load(
-                        qr, q_row + ks * 4, vec_width=4, dtype=fx.Int32
-                    )
-                )
-            )
+            bf16x8_to_f16(buf_copy_load(qr, q_row + ks * 4, unit_elems=4))
             for ks in range_constexpr(NKS)
         ]
 
@@ -430,9 +425,12 @@ def compile_decode(
             results = yield [fx.as_ir_value(x) for x in state]
 
         def store_out(acc, inv):
-            outr = buffer_ops.create_buffer_resource_from_addr(
+            outr = ptr_buf_tensor(
                 arg_out,
-                num_records_bytes=fx.Int64(i32_rows) * fx.Int64(i32_H) * (D * 2),
+                fx.Int32,
+                unit_elems=4,
+                unit_stride=1,
+                num_records_bytes=i32_rows * i32_H * (D * 2),
             )
             # Lane (n, g) holds dims [32 g, 32 g + 32) of head n in order.
             o_row = (row * i32_H + kvh * i32_group + n) * (D // 2) + g * 16
@@ -444,8 +442,13 @@ def compile_decode(
                     ],
                     fx.Int32,
                 )
-                buffer_ops.buffer_store(
-                    val, outr, o_row + e * 4, mask=(n < i32_group) & row_ok
+                # Masked lanes store at an offset past the buffer end, which drops the write.
+                keep = (n < i32_group) & row_ok
+                buf_copy_store(
+                    outr,
+                    keep.select(o_row + e * 4, fx.Int32(OOB_DWORD)),
+                    val,
+                    unit_elems=4,
                 )
 
         # Combine the waves' partials in wave 0.
@@ -491,21 +494,30 @@ def compile_decode(
             if const_expr(SPLITS > 1):
                 # Padding workgroups (row_ok false) work on a spare unit, never a real one.
                 tid = row_ok.select(row * i32_hkv + kvh, fx.Int32(MAX_SPLIT_ROWS))
-                pr = buffer_ops.create_buffer_resource_from_addr(
-                    arg_part, num_records_bytes=i64_part_bytes
-                )
+                pr = [
+                    ptr_buf_tensor(
+                        arg_part,
+                        fx.Int32,
+                        unit_elems=u,
+                        unit_stride=1,
+                        num_records_bytes=i64_part_bytes,
+                    )
+                    for u in (4, 2)
+                ]
                 row_f = (tid * SPLITS + zz) * 64 + lane
                 for dt in range_constexpr(NDT):
-                    buffer_ops.buffer_store(
-                        acc[dt].bitcast(fx.Int32),
-                        pr,
+                    buf_copy_store(
+                        pr[0],
                         row_f * PART_F + dt * 4,
+                        acc[dt].bitcast(fx.Int32),
+                        unit_elems=4,
                         cache_modifier=PART_SCOPE,
                     )
-                buffer_ops.buffer_store(
-                    Vec.from_elements([bits(big_raw), bits(l_tot)], fx.Int32),
-                    pr,
+                buf_copy_store(
+                    pr[1],
                     row_f * PART_F + NDT * 4,
+                    Vec.from_elements([bits(big_raw), bits(l_tot)], fx.Int32),
+                    unit_elems=2,
                     cache_modifier=PART_SCOPE,
                 )
                 # The partial is stored before the ticket is taken.
@@ -524,14 +536,11 @@ def compile_decode(
                         for sp in range_constexpr(SPLITS)
                     ]
                     mls = [
-                        Vec(
-                            buffer_ops.buffer_load(
-                                pr,
-                                rf * PART_F + NDT * 4,
-                                vec_width=2,
-                                dtype=fx.Int32,
-                                cache_modifier=PART_SCOPE,
-                            )
+                        buf_copy_load(
+                            pr[1],
+                            rf * PART_F + NDT * 4,
+                            unit_elems=2,
+                            cache_modifier=PART_SCOPE,
                         )
                         for rf in rows_f
                     ]
@@ -551,14 +560,11 @@ def compile_decode(
                     for sp in range_constexpr(SPLITS):
                         wv = Vec.filled(4, ws[sp], fx.Float32)
                         for dt in range_constexpr(NDT):
-                            part = Vec(
-                                buffer_ops.buffer_load(
-                                    pr,
-                                    rows_f[sp] * PART_F + dt * 4,
-                                    vec_width=4,
-                                    dtype=fx.Int32,
-                                    cache_modifier=PART_SCOPE,
-                                )
+                            part = buf_copy_load(
+                                pr[0],
+                                rows_f[sp] * PART_F + dt * 4,
+                                unit_elems=4,
+                                cache_modifier=PART_SCOPE,
                             ).bitcast(fx.Float32)
                             acc_all[dt] = acc_all[dt] + part * wv
                     store_out(acc_all, inv_all)
