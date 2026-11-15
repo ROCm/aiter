@@ -665,16 +665,29 @@ def _get_kernel(splits: int, topk: int, xcds: int, late_v: bool, device_index: i
     return compile_decode(splits, topk, xcds, late_v)
 
 
+def _refuse_alloc_in_capture(what):
+    # A capture records the fill instead of running it: eager calls and other graphs would
+    # then read uninitialised scratch.
+    require(
+        not torch.cuda.is_current_stream_capturing(),
+        f"the first sparse_pa_nvfp4_decode call on a device allocates its {what}: "
+        "run one eager call (same shapes) before graph capture",
+    )
+
+
 @functools.cache
 def _unit_scale(device_index: int) -> torch.Tensor:
+    _refuse_alloc_in_capture("scale placeholder")
     return torch.ones(1, dtype=torch.float32, device=f"cuda:{device_index}")
 
 
 @functools.cache
 def _split_buffers(device_index: int):
-    """Split partials and tickets, one set per device; allocated on first use, so warm up
-    before capture. Launches that split a row share them, so they must not overlap on
-    different streams of one device (see ``sparse_pa_nvfp4_decode``)."""
+    """Split partials and tickets, one set per device; allocated on first use (refused
+    during graph capture: warm up eagerly first). Launches that split a row share them, so
+    they must not overlap on different streams of one device (see
+    ``sparse_pa_nvfp4_decode``)."""
+    _refuse_alloc_in_capture("split scratch")
     dev = f"cuda:{device_index}"
     part = torch.empty(
         (MAX_SPLIT_ROWS + 1) * MAX_SPLITS * 64 * PART_F, dtype=torch.float32, device=dev
@@ -738,7 +751,8 @@ def sparse_pa_nvfp4_decode(
     must be finite and positive. One launch in flight per device: the split partials and
     arrival counters are one shared buffer per device, so two launches must not overlap
     on different streams of the same GPU (launches on one stream, and graph replays, are
-    serialized).
+    serialized). The first call on a device allocates that scratch, so graph capture needs
+    one eager call (same shapes) before it; a first call inside a capture is refused.
     """
     if q.device.type != "cuda":
         raise ValueError(f"q must be a CUDA tensor, got {q.device}")

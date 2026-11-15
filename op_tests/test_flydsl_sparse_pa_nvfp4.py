@@ -29,6 +29,8 @@ import torch
 import aiter
 from aiter.jit.utils.chip_info import get_gfx_runtime
 from aiter.ops.flydsl.kernels.sparse_pa_nvfp4_decode import (
+    _split_buffers,
+    _unit_scale,
     sparse_pa_nvfp4_decode,
 )
 from aiter.test_common import benchmark, checkAllclose, run_perftest
@@ -506,6 +508,71 @@ def refusals():
     return bad
 
 
+def capture_scratch():
+    """The first call on a device allocates (and zero-fills) its scratch; inside a graph
+    capture the fill would be recorded, not run, so that call is refused. After an eager
+    warm-up of the same shapes the capture replays correctly (and poisoned tickets, what a
+    skipped fill leaves, fail the oracle check)."""
+    bad = 0
+    dev = torch.cuda.current_device()
+    c = make_case([3000, 2300, 900, 130], [1] * 4, 1, 16, seed=7)
+    ref = run_torch(c)
+    # (name, splits, caches the warm-up leaves out, text the refusal must contain)
+    for name, splits, cold, msg in (
+        ("splits 4, cold", 4, (_unit_scale, _split_buffers), "scale placeholder"),
+        ("splits 4, warm for splits 1", 4, (_split_buffers,), "split scratch"),
+        ("splits 1, cold", 1, (_unit_scale,), "scale placeholder"),
+    ):
+        # the compile happens here, so the capture below only meets the allocation
+        decode_call(c, splits)
+        for f in cold:
+            f.cache_clear()
+        g = torch.cuda.CUDAGraph()
+        err = None
+        try:
+            with torch.cuda.graph(g):
+                decode_call(c, splits)
+        except ValueError as e:
+            err = str(e)
+        if err is None or msg not in err:
+            print(f"capture {name}: expected a refusal naming {msg!r}, got {err!r}")
+            bad += 1
+        if any(f.cache_info().currsize for f in cold):
+            print(f"capture {name}: a refused call left a cached allocation")
+            bad += 1
+    for f in (_unit_scale, _split_buffers):
+        f.cache_clear()
+    decode_call(c, 4)  # eager warm-up: allocates and fills
+    out = torch.empty_like(c["q"])
+
+    def run():
+        sparse_pa_nvfp4_decode(
+            c["q"], c["cache"], c["topk"], c["bt"], c["seq_lens"], SM_SCALE, out,
+            c["k_scale"], c["v_scale"], splits=4,
+        )  # fmt: skip
+
+    g = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(g):
+        run()
+    for i in range(3):
+        out.zero_()
+        g.replay()
+        torch.cuda.synchronize()
+        bad += int(not check(f"capture replay {i}", out, ref)[0])
+    # Eager calls after the replays still see clean tickets.
+    bad += int(not check("eager after replay", decode_call(c, 4), ref)[0])
+    # A skipped fill would leave the tickets nonzero (no merge): the oracle check must see it.
+    cnt = _split_buffers(dev)[1]
+    cnt.fill_(-1)
+    out.fill_(float("nan"))
+    run()
+    if check("tickets poisoned (expected to fail)", out, ref)[0]:
+        print("capture: poisoned tickets went unnoticed")
+        bad += 1
+    cnt.zero_()
+    return bad
+
+
 # ---------------------------------------------------------------------------
 # perf (synthetic M3.1 shapes; K/V pool far larger than the caches)
 # ---------------------------------------------------------------------------
@@ -630,6 +697,7 @@ def main(argv=None):
     failed += padding_empty_table()
     failed += poisoned_tail()
     failed += refusals()
+    failed += capture_scratch()
     if args.perf:
         perf = [
             test_decode_perf(r, ql, hkv, g, ctx)
