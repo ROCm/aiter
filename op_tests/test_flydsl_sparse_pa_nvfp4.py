@@ -120,6 +120,7 @@ def make_case(
     order="shuffle",
     fill=TOPK,  # valid ids per row (<= TOPK incl. the tail)
     junk=False,  # sprinkle invalid ids (-1 in the middle, ids past the tail, negatives)
+    dup=0,  # repeat the first `dup` ids of each row in the free slots (out of contract)
     k_scale=0.05,
     v_scale=0.03,
     device="cuda",
@@ -165,6 +166,8 @@ def make_case(
                 ids = torch.cat([ids[-1:], ids[:-1]])
             else:
                 ids = ids[torch.randperm(len(ids), generator=g)]
+            if dup:
+                ids = torch.cat([ids, ids[:dup]])[:TOPK]
             topk[h, i, : len(ids)] = ids
             if junk:
                 free = list(range(len(ids), TOPK))
@@ -194,8 +197,10 @@ def make_case(
     }
 
 
-def run_torch(c):
-    """fp64 reference: attention of every row over the valid keys of its blocks."""
+def run_torch(c, dedup=False):
+    """fp64 reference: attention of every row over the valid keys of its blocks. A block id
+    repeated in a row counts once per slot (decode's behaviour), or once with ``dedup``
+    (prefill's: it attends to the set of a row's blocks)."""
     q = c["q"].double()
     rows = q.shape[0]
     hkv, group = c["hkv"], c["group"]
@@ -206,6 +211,8 @@ def run_torch(c):
         sb = (kv - 1) // BLK
         for h in range(hkv):
             ids = [int(b) for b in topk[h, i] if 0 <= int(b) <= sb]
+            if dedup:
+                ids = list(dict.fromkeys(ids))
             if not ids:
                 continue
             kk = torch.cat(
@@ -297,6 +304,10 @@ PREFILL_CASES = [
     ("full_prompt", [1500], [1500], 1, 16, {}),
     ("fewer_than_topk", [900, 400], [900, 100], 1, 16, {"fill": 4}),
     ("junk_ids", [3000, 700], [300, 700], 1, 16, {"junk": True}),
+    # Out of contract (ids within a row should be distinct): a repeated id is attended
+    # once, whatever the tile, so every tile matches the set-semantics oracle.
+    ("dup_ids", [3000, 700, 130], [300, 700, 130], 1, 16, {"fill": 12, "dup": 3}),
+    ("dup_ids_h2", [900, 2100], [200, 1000], 2, 16, {"fill": 13, "dup": 2}),
     ("ragged_batch", [2000, 33, 4097, 512], [511, 33, 70, 512], 1, 16, {}),
 ]
 PREFILL_TQ = ((4, 2), (4, 1), (2, 1), (1, 1))
@@ -336,7 +347,7 @@ def test_prefill_correctness(name, hkv, group, rows, tq, rounds):
     c = make_case(
         seq_lens, q_lens, hkv_, group_, seed=zlib.crc32(name.encode()) % 1000, **kw
     )
-    ref = run_torch(c)
+    ref = run_torch(c, dedup=True)
     out = prefill_call(c, tq=tq, rounds=rounds)
     ok, err, mx = check(f"prefill {name} tq={tq} rounds={rounds}", out, ref)
     return {"rel_l2": err, "max_abs": mx, "ok": ok}

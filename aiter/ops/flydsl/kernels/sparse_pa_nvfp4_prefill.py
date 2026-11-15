@@ -19,6 +19,11 @@ partial buffers, nothing written but the output.
 
 Numerics as the decode kernel: exact e2m1 x e4m3 products in f16, f16 Q and P, fp32
 scores / softmax / accumulation, bf16 output.
+
+Block ids within one row must be distinct (a selector emits every block once). The page
+union is deduplicated over every (row, slot) lane of the tile, so a block id repeated in
+a row is attended once, whatever the tile size; the decode kernel attends once per slot
+and would count it twice.
 """
 
 import functools
@@ -226,9 +231,10 @@ def compile_prefill(tq: int = 4, rounds: int = 2, q_lds: bool | None = None):
 
         raw0 = load_page(page_at(valid))
         fx.rocdl.sched_barrier(0)
-        # Union: the first lane of each distinct page.
+        # Union: the first lane of each distinct page, over all TQ x TOPK lanes (the pairs
+        # of the last row included; with TQ = 1 this is the only dedup there is).
         n_dup = fx.Int32(0)
-        for j in range_constexpr(TOPK * (TQ - 1)):
+        for j in range_constexpr(TOPK * TQ - 1):
             pj = fx.Int32(fx.rocdl.readlane(T.i32, lane_page, j))
             n_dup = n_dup + ((lane_page == pj) & (lane > j)).select(
                 fx.Int32(1), fx.Int32(0)
@@ -494,7 +500,8 @@ def sparse_pa_nvfp4_prefill(
 
     gfx950 only. Every operand must be on ``q``'s device; ``k_scale`` / ``v_scale`` are
     one positive float32 element each (a device value, not checked) and ``sm_scale``
-    must be finite and positive.
+    must be finite and positive. Block ids within a row must be distinct; a repeated id
+    is attended once (see the module docstring).
     """
     if q.device.type != "cuda":
         raise ValueError(f"q must be a CUDA tensor, got {q.device}")
