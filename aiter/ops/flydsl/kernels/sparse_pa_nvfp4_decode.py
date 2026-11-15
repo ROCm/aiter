@@ -19,7 +19,6 @@ K and V are the exact e2m1 x e4m3 products in f16 (see the _common file), Q and 
 f16, scores / softmax / accumulation are fp32, the output is bf16.
 """
 
-import ctypes
 import functools
 import math
 
@@ -27,13 +26,13 @@ import flydsl.compiler as flyc
 import flydsl.expr as fx
 import numpy as np
 import torch
-from flydsl._mlir.dialects import llvm as _llvm
 from flydsl.expr import const_expr, range_constexpr
 from flydsl.expr.typing import T
 from flydsl.expr.typing import Vector as Vec
 
-from aiter.ops.flydsl.kernels import buffer_ops
-from aiter.ops.flydsl.kernels.minimax_m3_sparse_pa_nvfp4_common import (
+from aiter.jit.utils.chip_info import get_gfx_runtime, get_num_xcds
+from aiter.ops.flydsl.kernels.minimax_m3_index_score import _cu_count
+from aiter.ops.flydsl.kernels.sparse_pa_nvfp4_common import (
     BLK,
     DATA_B,
     HEAD_B,
@@ -42,6 +41,7 @@ from aiter.ops.flydsl.kernels.minimax_m3_sparse_pa_nvfp4_common import (
     NDT,
     NKS,
     NW,
+    OOB_DWORD,
     PRELOAD_HINTS,
     RAW,
     SC1,
@@ -59,9 +59,15 @@ from aiter.ops.flydsl.kernels.minimax_m3_sparse_pa_nvfp4_common import (
     mfma_f16,
     pk_bf16,
     pk_f16,
+    require,
     xlane4,
 )
-from aiter.ops.flydsl.kernels.tensor_shim import _run_compiled
+from aiter.ops.flydsl.kernels.tensor_shim import (
+    _run_compiled,
+    buf_copy_load,
+    buf_copy_store,
+    ptr_buf_tensor,
+)
 
 # Cache-policy bit of buffer loads: non-temporal (streaming). The K data is read once, so it
 # streams; V stays cacheable (measured faster than streaming both).
@@ -74,15 +80,11 @@ MAX_SPLIT_ROWS = 1024  # (row, kv head) pairs a split launch can hold
 
 def _atomic_add(addr_i64, value):
     """Relaxed agent-scope atomic add on a global i32; returns the old value."""
-    return fx.Int32(
-        _llvm.AtomicRMWOp(
-            _llvm.AtomicBinOp.add,
-            global_i32_ptr(addr_i64).llvm_ptr,
-            fx.Int32(value).ir_value(),
-            _llvm.AtomicOrdering.monotonic,
-            syncscope="agent",
-            alignment=4,
-        ).result
+    return fx.llvm.atomic_add(
+        global_i32_ptr(addr_i64),
+        fx.Int32(value),
+        syncscope=fx.rocdl.SyncScope.Agent,
+        ordering=fx.AtomicOrdering.Monotonic,
     )
 
 
@@ -109,37 +111,34 @@ def _page_loader(arg_cache, page_bytes, kvh, hkv, w, n, g):
     v_scale_load = (v_scl + (n // 2) * BLK + w * KPW + 8 * g) // 4
 
     def open_page(page, valid):
-        return buffer_ops.create_buffer_resource_from_addr(
-            arg_cache + fx.Int64(page) * fx.Int64(page_bytes),
-            num_records_bytes=valid.select(fx.Int32(page_bytes), fx.Int32(0)),
+        """The page as buffer tensors of 4-, 2- and 1-dword units, indexed by dword."""
+        base = arg_cache + fx.Int64(page) * fx.Int64(page_bytes)
+        nbytes = valid.select(fx.Int32(page_bytes), fx.Int32(0))
+        return tuple(
+            ptr_buf_tensor(
+                base,
+                fx.Int32,
+                unit_elems=u,
+                unit_stride=1,
+                num_records_bytes=nbytes,
+            )
+            for u in (4, 2, 1)
         )
 
     def load_k(pr):
         raw = []
         for st in range_constexpr(2):
-            kd = fx.Vector(
-                buffer_ops.buffer_load(
-                    pr, k_load[st], vec_width=4, dtype=fx.Int32, cache_modifier=NT
-                )
-            )
+            kd = buf_copy_load(pr[0], k_load[st], unit_elems=4, cache_modifier=NT)
             raw += [kd[i] for i in range_constexpr(4)]
-        raw.append(
-            fx.Int32(
-                buffer_ops.buffer_load(pr, k_scale_load, vec_width=1, dtype=fx.Int32)
-            )
-        )
+        raw.append(fx.Int32(buf_copy_load(pr[2], k_scale_load)))
         return raw
 
     def load_v(pr):
         raw = []
         for h in range_constexpr(2):
-            vd = fx.Vector(
-                buffer_ops.buffer_load(pr, v_load + 4 * h, vec_width=4, dtype=fx.Int32)
-            )
+            vd = buf_copy_load(pr[0], v_load + 4 * h, unit_elems=4)
             raw += [vd[i] for i in range_constexpr(4)]
-        vs = fx.Vector(
-            buffer_ops.buffer_load(pr, v_scale_load, vec_width=2, dtype=fx.Int32)
-        )
+        vs = buf_copy_load(pr[1], v_scale_load, unit_elems=2)
         raw += [vs[i] for i in range_constexpr(2)]
         return raw
 
@@ -157,6 +156,16 @@ def _dq4(word, scales):
     )
 
 
+def _scales_up_to(word, h, g, lim):
+    """``word``, 4 e4m3 scale bytes of keys 8 g + 4 h + b, with the bytes of the keys
+    past ``lim`` zeroed."""
+    keep = fx.Int32(0)
+    for b in range_constexpr(4):
+        byte = (0xFF << 8 * b) - (1 << 32 if b == 3 else 0)  # as a signed i32
+        keep = keep | (8 * g + 4 * h + b <= lim).select(fx.Int32(byte), fx.Int32(0))
+    return word & keep
+
+
 def compile_decode(
     splits: int = 1,
     topk: int = 16,
@@ -167,7 +176,8 @@ def compile_decode(
     the next page's V loads after the QK of the page in hand instead of together with its K
     loads: fewer bytes in flight, which pays when several
     workgroups share a CU."""
-    assert 1 <= topk <= 64 and 1 <= splits <= topk
+    require(1 <= topk <= 64, f"topk must be in [1, 64], got {topk}")
+    require(1 <= splits <= topk, f"splits must be in [1, topk = {topk}], got {splits}")
     SPLITS, TOPK, XCDS, LATE_V = splits, topk, xcds, late_v
     # Split partials need sc1 unless all splits of a row run on one XCD.
     PART_SCOPE = 0 if XCDS else SC1
@@ -193,7 +203,6 @@ def compile_decode(
         i32_H: fx.Int32,
         i32_hkv: fx.Int32,
         i32_group: fx.Int32,
-        i32_reqs: fx.Int32,
         arg_seq: fx.Int64,  # [reqs] int32
         arg_topk: fx.Int64,  # [Hkv, >= rows, TOPK] int32 logical blocks, -1 = none
         arg_bt: fx.Int64,  # [reqs, stride] int32
@@ -211,10 +220,12 @@ def compile_decode(
         smem = fx.SharedAllocator().allocate(Shared).peek()
         tx = fx.thread_idx.x
         lane = tx % 64
+        # The wave-uniform / SGPR primitives of this kernel are raw rocdl ops: FlyDSL 0.5.0
+        # has no typed spelling (fx.gpu offers only the shuffle family, whose result is a
+        # VGPR): readfirstlane (here), ballot, readlane, sched_barrier and s_waitcnt.
         w = fx.Int32(fx.rocdl.readfirstlane(T.i32, tx // 64))
         n, g = lane % 16, lane // 16
         topk = global_i32_ptr(arg_topk)
-        bt = global_i32_ptr(arg_bt)
         seq_p = global_i32_ptr(arg_seq)
         c = f32_c * fx.Float32(global_f32_ptr(arg_ks)[0])
         v_scale = fx.Float32(global_f32_ptr(arg_vs)[0])
@@ -253,7 +264,10 @@ def compile_decode(
             ]
         )
         ok = slot_ok & (blk >= 0) & (blk <= self_blk)
-        page = fx.Int32(bt[req * i32_bt_s + ok.select(blk, fx.Int32(0))])
+        # A slot that is not valid does not read the table (it may have no columns): its
+        # lane loads the first request length instead, which is discarded.
+        bt_at = arg_bt + fx.Int64(req * i32_bt_s + ok.select(blk, fx.Int32(0))) * 4
+        page = fx.Int32(global_i32_ptr(ok.select(bt_at, arg_seq))[0])
         page = ok.select(page, fx.Int32(-1))
         blk = ok.select(blk, fx.Int32(-1))
         vmask = fx.Int64(fx.rocdl.ballot(T.i64, ok))
@@ -268,20 +282,20 @@ def compile_decode(
             )
             n_v = fx.Int32(fx.math.ctpop(vmask).to(fx.Int32))
 
-        lim = pos % BLK - w * KPW  # last key of this wave's 32 a diagonal block shows
-        qr = buffer_ops.create_buffer_resource_from_addr(
-            arg_q, num_records_bytes=fx.Int64(i32_rows) * fx.Int64(i32_H) * (D * 2)
+        # The row's offset inside its tail block, relative to this wave's first key: the keys
+        # of the tail block past it are masked.
+        lim = pos % BLK - w * KPW
+        qr = ptr_buf_tensor(
+            arg_q,
+            fx.Int32,
+            unit_elems=4,
+            unit_stride=1,
+            num_records_bytes=i32_rows * i32_H * (D * 2),
         )
         head = (n < i32_group).select(n, fx.Int32(0))  # masked heads read head 0
         q_row = (row * i32_H + kvh * i32_group + head) * (D // 2) + g * 16
         qf = [
-            bf16x8_to_f16(
-                fx.Vector(
-                    buffer_ops.buffer_load(
-                        qr, q_row + ks * 4, vec_width=4, dtype=fx.Int32
-                    )
-                )
-            )
+            bf16x8_to_f16(buf_copy_load(qr, q_row + ks * 4, unit_elems=4))
             for ks in range_constexpr(NKS)
         ]
 
@@ -322,11 +336,18 @@ def compile_decode(
             if after_qk is not None:
                 after_qk()
             diag = cur_blk == self_blk
+            v_scl = [raw[17], raw[18]]
             # Only the tail block and the empty slots of the unrolled tail need masking.
             if diag | (cur_blk < 0):
                 a = [
                     ((cur_blk < 0) | (diag & (key_off[i] > lim))).select(neg_inf, a[i])
                     for i in range_constexpr(8)
+                ]
+                # Masking P is not enough: the keys past the row's position may be unwritten
+                # and hold a NaN V scale (e4m3 0x7f), and 0 * NaN is NaN in the PV MFMA.
+                # Zero the scale bytes of those keys (byte b of dword h is key 8 g + 4 h + b).
+                v_scl = [
+                    _scales_up_to(raw[17 + h], h, g, lim) for h in range_constexpr(2)
                 ]
             mx = a[0]
             for i in range_constexpr(1, 8):
@@ -350,8 +371,8 @@ def compile_decode(
             vs = []
             for h in range_constexpr(2):
                 vs += [
-                    cvt_fp8x2_f16(raw[17 + h], False),
-                    cvt_fp8x2_f16(raw[17 + h], True),
+                    cvt_fp8x2_f16(v_scl[h], False),
+                    cvt_fp8x2_f16(v_scl[h], True),
                 ]
             o_t = [
                 mfma_f16(_dq4(raw[9 + dt], vs), pf, o_t[dt])
@@ -426,9 +447,12 @@ def compile_decode(
             results = yield [fx.as_ir_value(x) for x in state]
 
         def store_out(acc, inv):
-            outr = buffer_ops.create_buffer_resource_from_addr(
+            outr = ptr_buf_tensor(
                 arg_out,
-                num_records_bytes=fx.Int64(i32_rows) * fx.Int64(i32_H) * (D * 2),
+                fx.Int32,
+                unit_elems=4,
+                unit_stride=1,
+                num_records_bytes=i32_rows * i32_H * (D * 2),
             )
             # Lane (n, g) holds dims [32 g, 32 g + 32) of head n in order.
             o_row = (row * i32_H + kvh * i32_group + n) * (D // 2) + g * 16
@@ -440,8 +464,13 @@ def compile_decode(
                     ],
                     fx.Int32,
                 )
-                buffer_ops.buffer_store(
-                    val, outr, o_row + e * 4, mask=(n < i32_group) & row_ok
+                # Masked lanes store at an offset past the buffer end, which drops the write.
+                keep = (n < i32_group) & row_ok
+                buf_copy_store(
+                    outr,
+                    keep.select(o_row + e * 4, fx.Int32(OOB_DWORD)),
+                    val,
+                    unit_elems=4,
                 )
 
         # Combine the waves' partials in wave 0.
@@ -487,21 +516,30 @@ def compile_decode(
             if const_expr(SPLITS > 1):
                 # Padding workgroups (row_ok false) work on a spare unit, never a real one.
                 tid = row_ok.select(row * i32_hkv + kvh, fx.Int32(MAX_SPLIT_ROWS))
-                pr = buffer_ops.create_buffer_resource_from_addr(
-                    arg_part, num_records_bytes=i64_part_bytes
-                )
+                pr = [
+                    ptr_buf_tensor(
+                        arg_part,
+                        fx.Int32,
+                        unit_elems=u,
+                        unit_stride=1,
+                        num_records_bytes=i64_part_bytes,
+                    )
+                    for u in (4, 2)
+                ]
                 row_f = (tid * SPLITS + zz) * 64 + lane
                 for dt in range_constexpr(NDT):
-                    buffer_ops.buffer_store(
-                        acc[dt].bitcast(fx.Int32),
-                        pr,
+                    buf_copy_store(
+                        pr[0],
                         row_f * PART_F + dt * 4,
+                        acc[dt].bitcast(fx.Int32),
+                        unit_elems=4,
                         cache_modifier=PART_SCOPE,
                     )
-                buffer_ops.buffer_store(
-                    Vec.from_elements([bits(big_raw), bits(l_tot)], fx.Int32),
-                    pr,
+                buf_copy_store(
+                    pr[1],
                     row_f * PART_F + NDT * 4,
+                    Vec.from_elements([bits(big_raw), bits(l_tot)], fx.Int32),
+                    unit_elems=2,
                     cache_modifier=PART_SCOPE,
                 )
                 # The partial is stored before the ticket is taken.
@@ -520,14 +558,11 @@ def compile_decode(
                         for sp in range_constexpr(SPLITS)
                     ]
                     mls = [
-                        Vec(
-                            buffer_ops.buffer_load(
-                                pr,
-                                rf * PART_F + NDT * 4,
-                                vec_width=2,
-                                dtype=fx.Int32,
-                                cache_modifier=PART_SCOPE,
-                            )
+                        buf_copy_load(
+                            pr[1],
+                            rf * PART_F + NDT * 4,
+                            unit_elems=2,
+                            cache_modifier=PART_SCOPE,
                         )
                         for rf in rows_f
                     ]
@@ -547,14 +582,11 @@ def compile_decode(
                     for sp in range_constexpr(SPLITS):
                         wv = Vec.filled(4, ws[sp], fx.Float32)
                         for dt in range_constexpr(NDT):
-                            part = Vec(
-                                buffer_ops.buffer_load(
-                                    pr,
-                                    rows_f[sp] * PART_F + dt * 4,
-                                    vec_width=4,
-                                    dtype=fx.Int32,
-                                    cache_modifier=PART_SCOPE,
-                                )
+                            part = buf_copy_load(
+                                pr[0],
+                                rows_f[sp] * PART_F + dt * 4,
+                                unit_elems=4,
+                                cache_modifier=PART_SCOPE,
                             ).bitcast(fx.Float32)
                             acc_all[dt] = acc_all[dt] + part * wv
                     store_out(acc_all, inv_all)
@@ -582,7 +614,6 @@ def compile_decode(
         i32_H: fx.Int32,
         i32_hkv: fx.Int32,
         i32_group: fx.Int32,
-        i32_reqs: fx.Int32,
         i32_grid_x: fx.Int32,
         i32_topk_hs: fx.Int32,
         i32_topk_rs: fx.Int32,
@@ -600,7 +631,6 @@ def compile_decode(
             i32_H,
             i32_hkv,
             i32_group,
-            i32_reqs,
             arg_seq,
             arg_topk,
             arg_bt,
@@ -636,16 +666,6 @@ def _get_kernel(splits: int, topk: int, xcds: int, late_v: bool, device_index: i
 
 
 @functools.cache
-def _gfx_arch(device_index: int) -> str:
-    return torch.cuda.get_device_properties(device_index).gcnArchName.split(":")[0]
-
-
-@functools.cache
-def _cu_count(device_index: int) -> int:
-    return torch.cuda.get_device_properties(device_index).multi_processor_count
-
-
-@functools.cache
 def _unit_scale(device_index: int) -> torch.Tensor:
     return torch.ones(1, dtype=torch.float32, device=f"cuda:{device_index}")
 
@@ -654,30 +674,12 @@ def _unit_scale(device_index: int) -> torch.Tensor:
 def _split_buffers(device_index: int):
     """Split partials and tickets, one set per device; allocated on first use, so warm up
     before capture. Launches that split a row share them, so they must not overlap on
-    different streams of one device (see ``minimax_m3_sparse_pa_nvfp4_decode``)."""
+    different streams of one device (see ``sparse_pa_nvfp4_decode``)."""
     dev = f"cuda:{device_index}"
     part = torch.empty(
         (MAX_SPLIT_ROWS + 1) * MAX_SPLITS * 64 * PART_F, dtype=torch.float32, device=dev
     )
     return part, torch.zeros(MAX_SPLIT_ROWS + 1, dtype=torch.int32, device=dev)
-
-
-_HIP_ATTR_NUM_XCCS = 10018
-
-
-@functools.cache
-def _xcd_count(device_index: int) -> int:
-    """XCDs of the device when HIP reports 8 (gfx950's topology, which the XCD-aware
-    grid assumes: workgroup b is dispatched to XCD b % 8), else 0 (grid off)."""
-    try:
-        get_attr = ctypes.CDLL("libamdhip64.so").hipDeviceGetAttribute
-        get_attr.argtypes = [ctypes.POINTER(ctypes.c_int), ctypes.c_int, ctypes.c_int]
-        get_attr.restype = ctypes.c_int
-        v = ctypes.c_int()
-        ok = get_attr(ctypes.byref(v), _HIP_ATTR_NUM_XCCS, device_index) == 0
-        return 8 if ok and v.value == 8 else 0
-    except (AttributeError, OSError, TypeError, ctypes.ArgumentError):
-        return 0
 
 
 def decode_splits(units: int, topk: int, cus: int) -> int:
@@ -711,7 +713,7 @@ def decode_late_v(workgroups: int, cus: int) -> bool:
     return 3 * cus <= 2 * workgroups <= 2 * _WG_PER_CU * cus
 
 
-def minimax_m3_sparse_pa_nvfp4_decode(
+def sparse_pa_nvfp4_decode(
     q: torch.Tensor,  # [rows, Hq, 128] bf16
     kv_cache: torch.Tensor,  # uint8 pages, [pages, 2 * Hkv * 9216] (any view with page stride)
     topk_idx: torch.Tensor,  # [Hkv, >= rows, topk] int32 logical blocks, -1 = none
@@ -727,7 +729,9 @@ def minimax_m3_sparse_pa_nvfp4_decode(
     late_v: bool | None = None,
 ) -> torch.Tensor:
     """Row i is query token i % query_len of request i // query_len and attends to
-    the keys of its ``topk_idx`` blocks up to its position.
+    the keys of its ``topk_idx`` blocks up to its position. Block ids within a row must
+    be distinct (a selector emits every block once): the kernel attends once per slot,
+    so a repeated id would be counted twice.
 
     gfx950 only. Every operand must be on ``q``'s device; ``k_scale`` / ``v_scale`` are
     one positive float32 element each (a device value, not checked) and ``sm_scale``
@@ -738,10 +742,10 @@ def minimax_m3_sparse_pa_nvfp4_decode(
     """
     if q.device.type != "cuda":
         raise ValueError(f"q must be a CUDA tensor, got {q.device}")
-    if _gfx_arch(q.device.index) != "gfx950":
-        raise ValueError(
-            f"NVFP4 sparse PA decode requires gfx950, got {_gfx_arch(q.device.index)}"
-        )
+    arch = get_gfx_runtime()
+    if arch != "gfx950":
+        raise ValueError(f"NVFP4 sparse PA decode requires gfx950, got {arch}")
+    require(q.dim() == 3 and topk_idx.dim() == 3, "q and topk_idx must be 3-D")
     rows, num_heads, head_dim = q.shape
     hkv = topk_idx.shape[0]
     topk = topk_idx.shape[-1]
@@ -749,45 +753,95 @@ def minimax_m3_sparse_pa_nvfp4_decode(
         out = torch.empty_like(q)
     if rows == 0:
         return out
+    require(hkv >= 1 and num_heads % hkv == 0, "q heads must be a multiple of Hkv")
     group = num_heads // hkv
-    assert head_dim == D and group * hkv == num_heads and group in (8, 16)
-    assert q.dtype == torch.bfloat16 and out.dtype == torch.bfloat16
-    assert q.is_contiguous() and out.is_contiguous() and out.shape == q.shape
+    require(
+        head_dim == D and group in (8, 16),
+        f"q must be [rows, Hq, {D}] with 8 or 16 heads per kv head",
+    )
+    require(
+        q.dtype == torch.bfloat16 and out.dtype == torch.bfloat16,
+        "q and out must be bfloat16",
+    )
+    require(
+        q.is_contiguous() and out.is_contiguous() and out.shape == q.shape,
+        "q and out must be contiguous and of the same shape",
+    )
     # Q and out are addressed with 32-bit byte offsets.
-    assert q.numel() * q.element_size() < 2**31, "q must be below 2 GiB"
+    require(q.numel() * q.element_size() < 2**31, "q must be below 2 GiB")
     page_b = 2 * hkv * (BLK * D // 2 + BLK * D // 16)
-    assert kv_cache.dtype == torch.uint8 and kv_cache.stride(0) < 2**31
-    assert (
-        kv_cache.dim() == 2 and kv_cache.stride(1) == 1
-    ), "kv_cache must be 2-D with a unit last stride"
-    assert (
-        kv_cache.stride(0) >= page_b and kv_cache.size(1) >= page_b
-    ), "kv_cache page is smaller than its payload"
-    assert topk_idx.dtype == torch.int32 and topk_idx.shape[1] >= rows
-    assert topk_idx.stride(2) == 1
+    require(
+        kv_cache.dtype == torch.uint8 and kv_cache.stride(0) < 2**31,
+        "kv_cache must be uint8 with a page stride below 2 GiB",
+    )
+    require(
+        kv_cache.dim() == 2 and kv_cache.stride(1) == 1,
+        "kv_cache must be 2-D with a unit last stride",
+    )
+    require(
+        kv_cache.stride(0) >= page_b and kv_cache.size(1) >= page_b,
+        "kv_cache page is smaller than its payload",
+    )
+    require(
+        topk_idx.dtype == torch.int32
+        and topk_idx.shape[1] >= rows
+        and topk_idx.stride(2) == 1,
+        "topk_idx must be int32 [Hkv, >= rows, topk] with a unit last stride",
+    )
     for t in (block_table, seq_lens):
-        assert t.dtype == torch.int32 and t.stride(-1) == 1
-    assert (
-        seq_lens.dim() == 1 and block_table.dim() == 2
-    ), "seq_lens 1-D, block_table 2-D"
-    assert rows == seq_lens.shape[0] * query_len
-    assert (
-        block_table.shape[0] >= seq_lens.shape[0]
-    ), "block_table needs a row per request"
+        require(
+            t.dtype == torch.int32 and t.stride(-1) == 1,
+            "block_table and seq_lens must be int32 with a unit last stride",
+        )
+    require(
+        seq_lens.dim() == 1 and block_table.dim() == 2,
+        "seq_lens 1-D, block_table 2-D",
+    )
+    require(rows == seq_lens.shape[0] * query_len, "rows must be reqs * query_len")
+    require(
+        block_table.shape[0] >= seq_lens.shape[0],
+        "block_table needs a row per request",
+    )
+    # The topk_idx and block_table element offsets are 32-bit in the kernel.
+    require(
+        (hkv - 1) * topk_idx.stride(0) + (rows - 1) * topk_idx.stride(1) + topk
+        <= 2**31,
+        "topk_idx element offsets (head / row strides) must stay below 2**31",
+    )
+    require(
+        (seq_lens.shape[0] - 1) * block_table.stride(0) + block_table.shape[1] <= 2**31,
+        "block_table element offsets (request stride) must stay below 2**31",
+    )
+    # Q, out and the pages are read and written in dwords through 4-byte-aligned buffers.
+    require(
+        all(t.data_ptr() % 4 == 0 for t in (q, out, kv_cache))
+        and kv_cache.stride(0) % 4 == 0,
+        "q, out and kv_cache must start on a 4-byte boundary, with a 4-byte-aligned page stride",
+    )
     for t in (out, kv_cache, topk_idx, block_table, seq_lens):
-        assert t.device == q.device, "all operands must be on q's device"
+        require(t.device == q.device, "all operands must be on q's device")
     dev = q.device.index
     if splits is None:
         splits = 1
         if rows * hkv <= MAX_SPLIT_ROWS:
             splits = decode_splits(rows * hkv, topk, _cu_count(dev))
-    assert 1 <= splits <= MAX_SPLITS, f"splits must be in [1, {MAX_SPLITS}]"
-    assert splits == 1 or rows * hkv <= MAX_SPLIT_ROWS
-    assert xcds in (None, 0, 8), "xcds must be 0 (plain grid) or 8 (gfx950's XCD count)"
+    require(1 <= splits <= MAX_SPLITS, f"splits must be in [1, {MAX_SPLITS}]")
+    require(
+        splits == 1 or rows * hkv <= MAX_SPLIT_ROWS,
+        f"splits > 1 needs rows * Hkv <= {MAX_SPLIT_ROWS}",
+    )
+    require(
+        xcds in (None, 0, 8), "xcds must be 0 (plain grid) or 8 (gfx950's XCD count)"
+    )
     if xcds is None:
         # The XCD-aware 1-D grid only pays when splits of a row must share an L2; with one
         # workgroup per unit the plain (row, kv head) grid skips its runtime divisions.
-        xcds = _xcd_count(dev) if splits > 1 else 0
+        xcds = 0
+        if splits > 1:
+            # The grid assumes workgroup b runs on XCD b % 8 (gfx950), so any other count,
+            # or a failed query (get_num_xcds logs it), leaves the plain grid.
+            with torch.cuda.device(q.device):
+                xcds = 8 if get_num_xcds(default=0) == 8 else 0
     if late_v is None:
         late_v = decode_late_v(rows * hkv * splits, _cu_count(dev))
     unit = _unit_scale(dev)
@@ -796,13 +850,13 @@ def minimax_m3_sparse_pa_nvfp4_decode(
     ks = unit if k_scale is None else k_scale
     vs = unit if v_scale is None else v_scale
     for t in (ks, vs):
-        assert (
-            t.device == q.device and t.dtype == torch.float32 and t.numel() == 1
-        ), "k_scale and v_scale must be one float32 element on q's device"
+        require(
+            t.device == q.device and t.dtype == torch.float32 and t.numel() == 1,
+            "k_scale and v_scale must be one float32 element on q's device",
+        )
     # The softmax runs in scaled units with masked scores at -inf, so it needs c > 0.
     c = float(np.float32(sm_scale) * np.float32(LOG2E))
-    assert math.isfinite(c) and c > 0, "sm_scale must be finite and positive"
-    reqs = seq_lens.shape[0]
+    require(math.isfinite(c) and c > 0, "sm_scale must be finite and positive")
     if xcds:
         grid_x = -(-(rows * hkv) // xcds) * xcds * splits
     else:
@@ -826,7 +880,6 @@ def minimax_m3_sparse_pa_nvfp4_decode(
             num_heads,
             hkv,
             group,
-            reqs,
             grid_x,
             topk_idx.stride(0),
             topk_idx.stride(1),
