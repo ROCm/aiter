@@ -44,6 +44,11 @@
 //   seqstart_q_pad / seqstart_k_pad  : cumulative PHYSICAL row offsets (KV-padding variant;
 //                                      equal to the non-pad arrays when there is no padding)
 //   max_seqlen_q / max_seqlen_k      : upper bounds driving the grid (group mode only)
+//
+// Paged KV (D=128, group mode, no window): k/v are [num_blocks, 128, H_KV, D] views of a
+// page pool and block_table [num_groups, max_pages] int32 maps each group's pages;
+// seqstart_k still gives the lengths. `num_splits` (paged only) cuts each Q block's KV
+// range into page-aligned shares merged by a combine kernel: 1 = off, 0 = auto, max 16.
 void fmha_fwd_bf16_opus_fwd(at::Tensor& q,
                             at::Tensor& k,
                             at::Tensor& v,
@@ -57,4 +62,6 @@ void fmha_fwd_bf16_opus_fwd(at::Tensor& q,
                             std::optional<at::Tensor> seqstart_k_pad = std::nullopt,
                             int max_seqlen_q                         = 0,
                             int max_seqlen_k                         = 0,
-                            int window_size_left                     = -1);
+                            int window_size_left                     = -1,
+                            std::optional<at::Tensor> block_table    = std::nullopt,
+                            int num_splits                           = 1);
