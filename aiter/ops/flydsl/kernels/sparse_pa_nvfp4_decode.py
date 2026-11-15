@@ -60,6 +60,7 @@ from aiter.ops.flydsl.kernels.sparse_pa_nvfp4_common import (
     mfma_f16,
     pk_bf16,
     pk_f16,
+    require,
     xlane4,
 )
 from aiter.ops.flydsl.kernels.tensor_shim import _run_compiled
@@ -168,7 +169,8 @@ def compile_decode(
     the next page's V loads after the QK of the page in hand instead of together with its K
     loads: fewer bytes in flight, which pays when several
     workgroups share a CU."""
-    assert 1 <= topk <= 64 and 1 <= splits <= topk
+    require(1 <= topk <= 64, f"topk must be in [1, 64], got {topk}")
+    require(1 <= splits <= topk, f"splits must be in [1, topk = {topk}], got {splits}")
     SPLITS, TOPK, XCDS, LATE_V = splits, topk, xcds, late_v
     # Split partials need sc1 unless all splits of a row run on one XCD.
     PART_SCOPE = 0 if XCDS else SC1
@@ -268,7 +270,9 @@ def compile_decode(
             )
             n_v = fx.Int32(fx.math.ctpop(vmask).to(fx.Int32))
 
-        lim = pos % BLK - w * KPW  # last key of this wave's 32 a diagonal block shows
+        # The row's offset inside its tail block, relative to this wave's first key: the keys
+        # of the tail block past it are masked.
+        lim = pos % BLK - w * KPW
         qr = buffer_ops.create_buffer_resource_from_addr(
             arg_q, num_records_bytes=fx.Int64(i32_rows) * fx.Int64(i32_H) * (D * 2)
         )
@@ -711,6 +715,7 @@ def sparse_pa_nvfp4_decode(
     arch = get_gfx_runtime()
     if arch != "gfx950":
         raise ValueError(f"NVFP4 sparse PA decode requires gfx950, got {arch}")
+    require(q.dim() == 3 and topk_idx.dim() == 3, "q and topk_idx must be 3-D")
     rows, num_heads, head_dim = q.shape
     hkv = topk_idx.shape[0]
     topk = topk_idx.shape[-1]
@@ -718,41 +723,70 @@ def sparse_pa_nvfp4_decode(
         out = torch.empty_like(q)
     if rows == 0:
         return out
+    require(hkv >= 1 and num_heads % hkv == 0, "q heads must be a multiple of Hkv")
     group = num_heads // hkv
-    assert head_dim == D and group * hkv == num_heads and group in (8, 16)
-    assert q.dtype == torch.bfloat16 and out.dtype == torch.bfloat16
-    assert q.is_contiguous() and out.is_contiguous() and out.shape == q.shape
+    require(
+        head_dim == D and group in (8, 16),
+        f"q must be [rows, Hq, {D}] with 8 or 16 heads per kv head",
+    )
+    require(
+        q.dtype == torch.bfloat16 and out.dtype == torch.bfloat16,
+        "q and out must be bfloat16",
+    )
+    require(
+        q.is_contiguous() and out.is_contiguous() and out.shape == q.shape,
+        "q and out must be contiguous and of the same shape",
+    )
     # Q and out are addressed with 32-bit byte offsets.
-    assert q.numel() * q.element_size() < 2**31, "q must be below 2 GiB"
+    require(q.numel() * q.element_size() < 2**31, "q must be below 2 GiB")
     page_b = 2 * hkv * (BLK * D // 2 + BLK * D // 16)
-    assert kv_cache.dtype == torch.uint8 and kv_cache.stride(0) < 2**31
-    assert (
-        kv_cache.dim() == 2 and kv_cache.stride(1) == 1
-    ), "kv_cache must be 2-D with a unit last stride"
-    assert (
-        kv_cache.stride(0) >= page_b and kv_cache.size(1) >= page_b
-    ), "kv_cache page is smaller than its payload"
-    assert topk_idx.dtype == torch.int32 and topk_idx.shape[1] >= rows
-    assert topk_idx.stride(2) == 1
+    require(
+        kv_cache.dtype == torch.uint8 and kv_cache.stride(0) < 2**31,
+        "kv_cache must be uint8 with a page stride below 2 GiB",
+    )
+    require(
+        kv_cache.dim() == 2 and kv_cache.stride(1) == 1,
+        "kv_cache must be 2-D with a unit last stride",
+    )
+    require(
+        kv_cache.stride(0) >= page_b and kv_cache.size(1) >= page_b,
+        "kv_cache page is smaller than its payload",
+    )
+    require(
+        topk_idx.dtype == torch.int32
+        and topk_idx.shape[1] >= rows
+        and topk_idx.stride(2) == 1,
+        "topk_idx must be int32 [Hkv, >= rows, topk] with a unit last stride",
+    )
     for t in (block_table, seq_lens):
-        assert t.dtype == torch.int32 and t.stride(-1) == 1
-    assert (
-        seq_lens.dim() == 1 and block_table.dim() == 2
-    ), "seq_lens 1-D, block_table 2-D"
-    assert rows == seq_lens.shape[0] * query_len
-    assert (
-        block_table.shape[0] >= seq_lens.shape[0]
-    ), "block_table needs a row per request"
+        require(
+            t.dtype == torch.int32 and t.stride(-1) == 1,
+            "block_table and seq_lens must be int32 with a unit last stride",
+        )
+    require(
+        seq_lens.dim() == 1 and block_table.dim() == 2,
+        "seq_lens 1-D, block_table 2-D",
+    )
+    require(rows == seq_lens.shape[0] * query_len, "rows must be reqs * query_len")
+    require(
+        block_table.shape[0] >= seq_lens.shape[0],
+        "block_table needs a row per request",
+    )
     for t in (out, kv_cache, topk_idx, block_table, seq_lens):
-        assert t.device == q.device, "all operands must be on q's device"
+        require(t.device == q.device, "all operands must be on q's device")
     dev = q.device.index
     if splits is None:
         splits = 1
         if rows * hkv <= MAX_SPLIT_ROWS:
             splits = decode_splits(rows * hkv, topk, _cu_count(dev))
-    assert 1 <= splits <= MAX_SPLITS, f"splits must be in [1, {MAX_SPLITS}]"
-    assert splits == 1 or rows * hkv <= MAX_SPLIT_ROWS
-    assert xcds in (None, 0, 8), "xcds must be 0 (plain grid) or 8 (gfx950's XCD count)"
+    require(1 <= splits <= MAX_SPLITS, f"splits must be in [1, {MAX_SPLITS}]")
+    require(
+        splits == 1 or rows * hkv <= MAX_SPLIT_ROWS,
+        f"splits > 1 needs rows * Hkv <= {MAX_SPLIT_ROWS}",
+    )
+    require(
+        xcds in (None, 0, 8), "xcds must be 0 (plain grid) or 8 (gfx950's XCD count)"
+    )
     if xcds is None:
         # The XCD-aware 1-D grid only pays when splits of a row must share an L2; with one
         # workgroup per unit the plain (row, kv head) grid skips its runtime divisions.
@@ -770,12 +804,13 @@ def sparse_pa_nvfp4_decode(
     ks = unit if k_scale is None else k_scale
     vs = unit if v_scale is None else v_scale
     for t in (ks, vs):
-        assert (
-            t.device == q.device and t.dtype == torch.float32 and t.numel() == 1
-        ), "k_scale and v_scale must be one float32 element on q's device"
+        require(
+            t.device == q.device and t.dtype == torch.float32 and t.numel() == 1,
+            "k_scale and v_scale must be one float32 element on q's device",
+        )
     # The softmax runs in scaled units with masked scores at -inf, so it needs c > 0.
     c = float(np.float32(sm_scale) * np.float32(LOG2E))
-    assert math.isfinite(c) and c > 0, "sm_scale must be finite and positive"
+    require(math.isfinite(c) and c > 0, "sm_scale must be finite and positive")
     if xcds:
         grid_x = -(-(rows * hkv) // xcds) * xcds * splits
     else:

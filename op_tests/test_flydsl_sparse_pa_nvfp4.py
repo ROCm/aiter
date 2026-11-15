@@ -90,8 +90,8 @@ def pack_pages(kc, ks, vc, vs):
         scl = torch.zeros(pages, hkv, 1024, dtype=torch.uint8, device=dev)
         scl[:, :, off.flatten()] = s.reshape(pages, hkv, BLK * 8)
         out[:, side, :, BLK * 64 :] = scl
-    # regions are [side][head]: data(8192) then scales(1024) per head within a side -- the
-    # in-page order is [K data heads][K scale heads][V data heads][V scale heads]
+    # Above, each head of a side is [data 8192 B | scales 1024 B]. A page groups them
+    # differently: [K data of all heads | K scales of all heads | V data ... | V scales ...].
     d = out[..., : BLK * 64].reshape(pages, 2, hkv * BLK * 64)
     sc = out[..., BLK * 64 :].reshape(pages, 2, hkv * 1024)
     return torch.cat([d, sc], dim=-1).reshape(pages, 2 * hkv * PAGE_B).contiguous()
@@ -295,7 +295,8 @@ def test_correctness(name, hkv, group, rows, splits):
 
 
 def decode_splits_agree():
-    """Every split count gives the same result as one workgroup, to the bit."""
+    """Every split count agrees with one workgroup to rel-L2 <= 2e-3 (the fp32 merge order
+    differs, so the bf16 output is not bitwise equal)."""
     bad = 0
     for name, seq_lens, q_lens, hkv, group, kw in DECODE_CASES:
         c = make_case(
@@ -305,7 +306,6 @@ def decode_splits_agree():
         for s in DECODE_SPLITS:
             if s in (None, 1) or len(seq_lens) * hkv > 1024:
                 continue
-            # splits merge in fp32 in a different association; the bf16 output then flips a few ulps
             err = rel_l2(decode_call(c, s), base)
             if err > 2e-3:
                 bad += 1
@@ -374,6 +374,10 @@ def refusals():
         ("short block_table", {"bt": c["bt"][:1]}, "row per request"),
         ("2-D seq_lens", {"seq_lens": c["seq_lens"][None]}, "seq_lens 1-D"),
         ("xcds 1", {"xcds": 1}, "xcds must be"),
+        ("fp16 q", {"q": c["q"].half()}, "bfloat16"),
+        ("group 4", {"q": c["q"][:, :4]}, "8 or 16 heads"),
+        ("2-D topk_idx", {"topk": c["topk"][0]}, "must be 3-D"),
+        ("int64 topk_idx", {"topk": c["topk"].long()}, "topk_idx must be int32"),
         ("sm_scale 0", {"sm_scale": 0.0}, "sm_scale"),
         ("sm_scale nan", {"sm_scale": float("nan")}, "sm_scale"),
         ("cpu q", {"q": c["q"].cpu()}, "CUDA"),
@@ -387,15 +391,15 @@ def refusals():
         a = {
             "q": c["q"], "cache": cache, "sm_scale": SM_SCALE, "k_scale": ks,
             "v_scale": c["v_scale"], "splits": None, "bt": c["bt"],
-            "seq_lens": c["seq_lens"], "xcds": None, **kw,
+            "seq_lens": c["seq_lens"], "xcds": None, "topk": c["topk"], **kw,
         }  # fmt: skip
         try:
             sparse_pa_nvfp4_decode(
-                a["q"], a["cache"], c["topk"], a["bt"], a["seq_lens"], a["sm_scale"],
+                a["q"], a["cache"], a["topk"], a["bt"], a["seq_lens"], a["sm_scale"],
                 None, a["k_scale"], a["v_scale"], query_len=1, splits=a["splits"],
                 xcds=a["xcds"],
             )  # fmt: skip
-        except (AssertionError, ValueError) as e:
+        except ValueError as e:
             if msg in str(e):
                 continue
             print(f"refusal: {name}: wrong message: {e!r}")

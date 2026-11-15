@@ -58,6 +58,13 @@ PRELOAD_HINTS = {
 }
 
 
+def require(cond, msg):
+    """Host-side input check that survives ``python -O`` (an ``assert`` does not): the
+    kernels take raw pointers, so a refused argument must never reach the launch."""
+    if not cond:
+        raise ValueError(msg)
+
+
 def global_i32_ptr(addr_i64):
     ptr_ty = fx.PointerType.get(
         T.i32, address_space=fx.AddressSpace.Global, alignment=4
