@@ -594,7 +594,7 @@ def refusals():
         ("xcds 1", {"xcds": 1}, "xcds must be"),
     ]
     prefill_only = [
-        ("empty block_table", {"bt": c["bt"][:0]}, "block_table 2-D"),
+        ("empty block_table", {"bt": c["bt"][:0]}, "at least one request row"),
         ("tq 3", {"tq": 3}, "tq must be"),
         ("rounds without tq", {"rounds": 1}, "rounds needs tq"),
     ]

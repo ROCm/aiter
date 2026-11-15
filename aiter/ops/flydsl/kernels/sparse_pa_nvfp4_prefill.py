@@ -550,10 +550,7 @@ def sparse_pa_nvfp4_prefill(
         return out
     group = check_operands(q, out, kv_cache, topk_idx, block_table)
     require(topk_idx.shape[-1] == TOPK, f"topk_idx must have {TOPK} slots per row")
-    require(
-        block_table.dim() == 2 and block_table.shape[0] >= 1,
-        "block_table 2-D [reqs, max_blocks] with at least one row",
-    )
+    require(block_table.shape[0] >= 1, "block_table needs at least one request row")
     for t in (row_req_id, row_kv_lens):
         require(
             t.dtype == torch.int32 and t.dim() == 1 and t.stride(-1) == 1,
