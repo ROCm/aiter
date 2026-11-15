@@ -357,6 +357,26 @@ def padding_rows():
     return bad
 
 
+def padding_empty_table():
+    """A padding-only call (length 0, every slot -1) with an empty block table reads no table
+    entry: the table is not touched when no slot is valid."""
+    bad = 0
+    c = make_case([500], [1], 1, 16, seed=5)
+    topk = torch.full_like(c["topk"], -1)
+    bt = torch.zeros(1, 0, dtype=torch.int32, device="cuda")
+    zero_len = torch.zeros(1, dtype=torch.int32, device="cuda")
+    for s, x in itertools.product((None, 1, 4), (0, 8)):
+        out = torch.full_like(c["q"], 1.0)
+        sparse_pa_nvfp4_decode(
+            c["q"], c["cache"], topk, bt, zero_len, SM_SCALE, out,
+            c["k_scale"], c["v_scale"], splits=s, xcds=x,
+        )  # fmt: skip
+        if out.abs().max().item() != 0:
+            bad += 1
+            print(f"empty block_table: padding row not zero (splits={s} xcds={x})")
+    return bad
+
+
 def refusals():
     """Arguments the kernel cannot read correctly are refused before launch, each with
     its own message."""
@@ -531,6 +551,7 @@ def main(argv=None):
     failed += decode_xcd_grid_agree()
     failed += decode_late_v_agree()
     failed += padding_rows()
+    failed += padding_empty_table()
     failed += refusals()
     if args.perf:
         perf = [

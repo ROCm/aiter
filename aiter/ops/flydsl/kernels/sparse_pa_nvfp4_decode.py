@@ -216,7 +216,6 @@ def compile_decode(
         w = fx.Int32(fx.rocdl.readfirstlane(T.i32, tx // 64))
         n, g = lane % 16, lane // 16
         topk = global_i32_ptr(arg_topk)
-        bt = global_i32_ptr(arg_bt)
         seq_p = global_i32_ptr(arg_seq)
         c = f32_c * fx.Float32(global_f32_ptr(arg_ks)[0])
         v_scale = fx.Float32(global_f32_ptr(arg_vs)[0])
@@ -255,7 +254,10 @@ def compile_decode(
             ]
         )
         ok = slot_ok & (blk >= 0) & (blk <= self_blk)
-        page = fx.Int32(bt[req * i32_bt_s + ok.select(blk, fx.Int32(0))])
+        # A slot that is not valid does not read the table (it may have no columns): its
+        # lane loads the first request length instead, which is discarded.
+        bt_at = arg_bt + fx.Int64(req * i32_bt_s + ok.select(blk, fx.Int32(0))) * 4
+        page = fx.Int32(global_i32_ptr(ok.select(bt_at, arg_seq))[0])
         page = ok.select(page, fx.Int32(-1))
         blk = ok.select(blk, fx.Int32(-1))
         vmask = fx.Int64(fx.rocdl.ballot(T.i64, ok))
