@@ -36,8 +36,9 @@ A operand with the e8m0 byte as block scale; the e4m3 Q option (`q_fp8`) belongs
 that path. Layout and contract: `_validate_cache`.
 
 An NVFP4 index cache (e2m1 pages, one e4m3 scale per 16 elements, no per-tensor
-scale: `score_prefill_flydsl_nvfp4`) takes the fp8 path's compute unchanged and
-changes only how a page reaches LDS: each thread widens its 16 B of e2m1 (with its
+scale: `score_prefill_flydsl_nvfp4`) takes the fp8 path's compute unchanged for
+`k_round="e4m3"` and changes only how a page reaches LDS (`"exact"` below changes the
+MFMA too): each thread widens its 16 B of e2m1 (with its
 two scale bytes, through a per-CTA LDS table of e4m3_rn_satfinite(mag * scale)) into
 32 e4m3 bytes in natural element order, so the page the MFMAs read is exactly an fp8
 page of K = e4m3_rn_satfinite(e2m1 * scale). One dequant per page per thread,
@@ -534,7 +535,10 @@ def build_prefill_score(g, k_fp4=False, q_fp8=False, nvfp4=None):
     _lut_bytes = (8 * LUT_ENTRIES if nvfp4 == "e4m3" else 0) + (
         3 * WAVES * XT * WAVE * 16 if XSTAGE else 0
     )
-    RAW_W = 2048 + 256
+    # One wave's 32 tokens of a page: its e2m1 codes, then its scale bytes.
+    RAW_DATA = PAGE // WAVES * DATA_BYTES
+    RAW_SCALE = PAGE // WAVES * NVFP4_SCALE_BYTES
+    RAW_W = RAW_DATA + RAW_SCALE
     if DMA:
         _fields["raw"] = fx.Array[fx.Uint8, 2 * WAVES * RAW_W, 16]
         _lut_bytes += 2 * WAVES * RAW_W
@@ -1386,7 +1390,7 @@ def build_prefill_score(g, k_fp4=False, q_fp8=False, nvfp4=None):
                         _raw_lds(base + fx.Int32(1024 * h)),
                         fx.Int32(16).ir_value(),
                         (
-                            wave_u * fx.Int32(2048)
+                            wave_u * fx.Int32(RAW_DATA)
                             + lane * fx.Int32(32)
                             + fx.Int32(16 * h)
                         ).ir_value(),
@@ -1396,9 +1400,9 @@ def build_prefill_score(g, k_fp4=False, q_fp8=False, nvfp4=None):
                     )
                 fx.rocdl.raw_ptr_buffer_load_async_lds(
                     sres,
-                    _raw_lds(base + fx.Int32(2048)),
+                    _raw_lds(base + fx.Int32(RAW_DATA)),
                     fx.Int32(4).ir_value(),
-                    (wave_u * fx.Int32(256) + lane * fx.Int32(4)).ir_value(),
+                    (wave_u * fx.Int32(RAW_SCALE) + lane * fx.Int32(4)).ir_value(),
                     fx.Int32(0).ir_value(),
                     fx.Int32(0).ir_value(),
                     aux=_AUX0,
@@ -1427,7 +1431,8 @@ def build_prefill_score(g, k_fp4=False, q_fp8=False, nvfp4=None):
                     codes += [fx.Int32(v[i]) for i in range_constexpr(4)]
                 sc = fx.Vector(
                     _raw_at(
-                        _raw_slot_base(slot) + fx.Int32(2048) + lane * fx.Int32(4), 4
+                        _raw_slot_base(slot) + fx.Int32(RAW_DATA) + lane * fx.Int32(4),
+                        4,
                     ).load()
                 ).bitcast(fx.Int32)
                 return codes, fx.Int32(sc[0])
@@ -1903,9 +1908,9 @@ def build_prefill_score(g, k_fp4=False, q_fp8=False, nvfp4=None):
                         vec = fx.Vector.from_elements(_v, fx.Float32)
                         fx.add_offset(fx.get_iter(s_buf), _a).store(vec)
 
-                    vec_pred = (
-                        is_writer & full & (flush if const_expr(XSTAGE) else full)
-                    )
+                    vec_pred = is_writer & full
+                    if const_expr(XSTAGE):
+                        vec_pred = vec_pred & flush
 
                     @flyc.jit
                     def _g_vec(_p=vec_pred, _w=_vec):
@@ -2337,35 +2342,7 @@ def score_prefill_flydsl(
     sm_scale,
     out=None,
     k_scale=None,
-):
-    """Host entry point; see `_score_prefill_impl`."""
-    return _score_prefill_impl(
-        idx_q,
-        cache,
-        block_table,
-        cu_seqlens_q,
-        seq_lens,
-        prefix_lens,
-        max_query_len,
-        max_seq_len,
-        sm_scale,
-        out,
-        k_scale,
-    )
-
-
-def _score_prefill_impl(
-    idx_q,
-    cache,
-    block_table,
-    cu_seqlens_q,
-    seq_lens,
-    prefix_lens,
-    max_query_len,
-    max_seq_len,
-    sm_scale,
-    out=None,
-    k_scale=None,
+    *,
     nvfp4=None,
 ):
     """Block scores for a ragged prefill batch.
@@ -2636,9 +2613,10 @@ def score_prefill_flydsl_nvfp4(
     k_round="e4m3",
 ):
     """`score_prefill_flydsl` over an NVFP4 index cache: `k_data [pages, 128, 64]`
-    e2m1 and `k_scale [pages, 128, 8]` uint8 e4m3 (one per 16 elements, positive,
-    not 0x7F; no per-tensor scale), each view with its own page stride. Both are
-    uint8 views: the fp4x2 / e8m0 typed views are MXFP4's and are refused here.
+    e2m1 and `k_scale [pages, 128, 8]` uint8 e4m3 (one per 16 elements; no per-tensor
+    scale), each view with its own page stride. Scale bytes must be non-negative e4m3:
+    the sign bit is not read, zero is allowed, and 0x7F (NaN) is out of contract. Both
+    are uint8 views: the fp4x2 / e8m0 typed views are MXFP4's and are refused here.
 
     `idx_q` is bf16 or e4m3; as in every prefill scorer here a bf16 Q is rounded to e4m3
     first. `k_round="e4m3"` (the default) scores K = e4m3_rn_satfinite(e2m1 * scale)
@@ -2650,7 +2628,7 @@ def score_prefill_flydsl_nvfp4(
     """
     if k_round not in NVFP4_ROUNDINGS:
         raise ValueError(f"k_round must be one of {NVFP4_ROUNDINGS}, got {k_round!r}")
-    return _score_prefill_impl(
+    return score_prefill_flydsl(
         idx_q,
         k_data,
         block_table,
