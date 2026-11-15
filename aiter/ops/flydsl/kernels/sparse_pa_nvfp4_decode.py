@@ -20,11 +20,9 @@ f16, scores / softmax / accumulation are fp32, the output is bf16.
 """
 
 import functools
-import math
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
-import numpy as np
 import torch
 from flydsl.expr import const_expr, range_constexpr
 from flydsl.expr.typing import T
@@ -37,7 +35,6 @@ from aiter.ops.flydsl.kernels.sparse_pa_nvfp4_common import (
     DATA_B,
     HEAD_B,
     KPW,
-    LOG2E,
     NDT,
     NKS,
     NW,
@@ -50,16 +47,19 @@ from aiter.ops.flydsl.kernels.sparse_pa_nvfp4_common import (
     as_f32,
     bf16x8_to_f16,
     bits,
+    check_operands,
     cvt_fp4x2_f16,
     cvt_fp8x2_f16,
     exp2,
     global_f32_ptr,
     global_i32_ptr,
+    host_scales,
     maxf_nn,
     mfma_f16,
     pk_bf16,
     pk_f16,
     require,
+    unit_scale,
     xlane4,
 )
 from aiter.ops.flydsl.kernels.tensor_shim import (
@@ -647,11 +647,6 @@ def _get_kernel(splits: int, topk: int, xcds: int, late_v: bool, device_index: i
 
 
 @functools.cache
-def _unit_scale(device_index: int) -> torch.Tensor:
-    return torch.ones(1, dtype=torch.float32, device=f"cuda:{device_index}")
-
-
-@functools.cache
 def _split_buffers(device_index: int):
     """Split partials and tickets, one set per device; allocated on first use, so warm up
     before capture. Launches that split a row share them, so they must not overlap on
@@ -727,53 +722,19 @@ def sparse_pa_nvfp4_decode(
     if arch != "gfx950":
         raise ValueError(f"NVFP4 sparse PA decode requires gfx950, got {arch}")
     require(q.dim() == 3 and topk_idx.dim() == 3, "q and topk_idx must be 3-D")
-    rows, num_heads, head_dim = q.shape
+    rows = q.shape[0]
     hkv = topk_idx.shape[0]
     topk = topk_idx.shape[-1]
     if out is None:
         out = torch.empty_like(q)
     if rows == 0:
         return out
-    require(hkv >= 1 and num_heads % hkv == 0, "q heads must be a multiple of Hkv")
-    group = num_heads // hkv
+    num_heads = q.shape[1]
+    group = check_operands(q, out, kv_cache, topk_idx, block_table)
     require(
-        head_dim == D and group in (8, 16),
-        f"q must be [rows, Hq, {D}] with 8 or 16 heads per kv head",
+        seq_lens.dtype == torch.int32 and seq_lens.stride(-1) == 1,
+        "seq_lens must be int32 with a unit last stride",
     )
-    require(
-        q.dtype == torch.bfloat16 and out.dtype == torch.bfloat16,
-        "q and out must be bfloat16",
-    )
-    require(
-        q.is_contiguous() and out.is_contiguous() and out.shape == q.shape,
-        "q and out must be contiguous and of the same shape",
-    )
-    # Q and out are addressed with 32-bit byte offsets.
-    require(q.numel() * q.element_size() < 2**31, "q must be below 2 GiB")
-    page_b = 2 * hkv * (BLK * D // 2 + BLK * D // 16)
-    require(
-        kv_cache.dtype == torch.uint8 and kv_cache.stride(0) < 2**31,
-        "kv_cache must be uint8 with a page stride below 2 GiB",
-    )
-    require(
-        kv_cache.dim() == 2 and kv_cache.stride(1) == 1,
-        "kv_cache must be 2-D with a unit last stride",
-    )
-    require(
-        kv_cache.stride(0) >= page_b and kv_cache.size(1) >= page_b,
-        "kv_cache page is smaller than its payload",
-    )
-    require(
-        topk_idx.dtype == torch.int32
-        and topk_idx.shape[1] >= rows
-        and topk_idx.stride(2) == 1,
-        "topk_idx must be int32 [Hkv, >= rows, topk] with a unit last stride",
-    )
-    for t in (block_table, seq_lens):
-        require(
-            t.dtype == torch.int32 and t.stride(-1) == 1,
-            "block_table and seq_lens must be int32 with a unit last stride",
-        )
     require(
         seq_lens.dim() == 1 and block_table.dim() == 2,
         "seq_lens 1-D, block_table 2-D",
@@ -783,8 +744,7 @@ def sparse_pa_nvfp4_decode(
         block_table.shape[0] >= seq_lens.shape[0],
         "block_table needs a row per request",
     )
-    for t in (out, kv_cache, topk_idx, block_table, seq_lens):
-        require(t.device == q.device, "all operands must be on q's device")
+    require(seq_lens.device == q.device, "all operands must be on q's device")
     dev = q.device.index
     if splits is None:
         splits = 1
@@ -809,19 +769,10 @@ def sparse_pa_nvfp4_decode(
                 xcds = 8 if get_num_xcds(default=0) == 8 else 0
     if late_v is None:
         late_v = decode_late_v(rows * hkv * splits, _cu_count(dev))
-    unit = _unit_scale(dev)
+    ks, vs, c = host_scales(q, k_scale, v_scale, sm_scale)
     # An unsplit launch never touches the split scratch (~144 MiB): pass placeholders.
+    unit = unit_scale(dev)
     part, cnt = _split_buffers(dev) if splits > 1 else (unit, unit)
-    ks = unit if k_scale is None else k_scale
-    vs = unit if v_scale is None else v_scale
-    for t in (ks, vs):
-        require(
-            t.device == q.device and t.dtype == torch.float32 and t.numel() == 1,
-            "k_scale and v_scale must be one float32 element on q's device",
-        )
-    # The softmax runs in scaled units with masked scores at -inf, so it needs c > 0.
-    c = float(np.float32(sm_scale) * np.float32(LOG2E))
-    require(math.isfinite(c) and c > 0, "sm_scale must be finite and positive")
     if xcds:
         grid_x = -(-(rows * hkv) // xcds) * xcds * splits
     else:

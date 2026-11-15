@@ -459,13 +459,11 @@ def refusals():
     ]
     prefill_only = [
         ("empty block_table", {"bt": c["bt"][:0]}, "block_table 2-D"),
-        ("tq 3", {"tq": 3}, "tq must be"),
-        ("rounds without tq", {"rounds": 1}, "rounds needs tq"),
     ]
 
     def decode(a):
         sparse_pa_nvfp4_decode(
-            a["q"], a["cache"], a["topk"], a["bt"], c["seq_lens"], a["sm_scale"],
+            a["q"], a["cache"], a["topk"], a["bt"], a["seq_lens"], a["sm_scale"],
             None, a["k_scale"], a["v_scale"], query_len=1, splits=a.get("splits"),
             xcds=a.get("xcds"),
         )  # fmt: skip
@@ -484,10 +482,9 @@ def refusals():
         for name, kw, msg in cases:
             a = {
                 "q": c["q"], "cache": cache, "sm_scale": SM_SCALE, "k_scale": ks,
-                "v_scale": c["v_scale"], "bt": c["bt"], "topk": c["topk"], **kw,
+                "v_scale": c["v_scale"], "bt": c["bt"], "topk": c["topk"],
+                "seq_lens": c["seq_lens"], **kw,
             }  # fmt: skip
-            if kind == "decode" and name == "short block_table":
-                a["bt"] = c["bt"][:1]
             try:
                 call(a)
             except ValueError as e:

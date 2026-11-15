@@ -30,7 +30,12 @@ K and V elements are the exact products e2m1 * e4m3 scale, which f16 holds exact
 (at most 6 significant bits, 2^-10 .. 2688), so nothing is rounded before the MFMA.
 """
 
+import functools
+import math
+
 import flydsl.expr as fx
+import numpy as np
+import torch
 from flydsl._mlir import ir as _ir
 from flydsl._mlir.dialects import llvm as _llvm
 from flydsl.expr import range_constexpr
@@ -69,6 +74,78 @@ def require(cond, msg):
     kernels take raw pointers, so a refused argument must never reach the launch."""
     if not cond:
         raise ValueError(msg)
+
+
+@functools.cache
+def unit_scale(device_index):
+    """A ``[1]`` float32 one on the device: the default global k / v scale."""
+    return torch.ones(1, dtype=torch.float32, device=f"cuda:{device_index}")
+
+
+def host_scales(q, k_scale, v_scale, sm_scale):
+    """``(k_scale, v_scale, c)`` of a launch: the global scales (default one) and
+    ``c = sm_scale * log2(e)``."""
+    unit = unit_scale(q.device.index)
+    ks = unit if k_scale is None else k_scale
+    vs = unit if v_scale is None else v_scale
+    for t in (ks, vs):
+        require(
+            t.device == q.device and t.dtype == torch.float32 and t.numel() == 1,
+            "k_scale and v_scale must be one float32 element on q's device",
+        )
+    # The softmax runs in scaled units with masked scores at -inf, so it needs c > 0.
+    c = float(np.float32(sm_scale) * np.float32(LOG2E))
+    require(math.isfinite(c) and c > 0, "sm_scale must be finite and positive")
+    return ks, vs, c
+
+
+def check_operands(q, out, kv_cache, topk_idx, block_table):
+    """Refuses what the kernels cannot read, before any raw pointer is launched, and
+    returns ``group`` (query heads per kv head). ``out`` must already be allocated."""
+    rows, num_heads, head_dim = q.shape
+    hkv = topk_idx.shape[0]
+    require(hkv >= 1 and num_heads % hkv == 0, "q heads must be a multiple of Hkv")
+    group = num_heads // hkv
+    require(
+        head_dim == D and group in (8, 16),
+        f"q must be [rows, Hq, {D}] with 8 or 16 heads per kv head",
+    )
+    require(
+        q.dtype == torch.bfloat16 and out.dtype == torch.bfloat16,
+        "q and out must be bfloat16",
+    )
+    require(
+        q.is_contiguous() and out.is_contiguous() and out.shape == q.shape,
+        "q and out must be contiguous and of the same shape",
+    )
+    # Q and out are addressed with 32-bit byte offsets.
+    require(q.numel() * q.element_size() < 2**31, "q must be below 2 GiB")
+    page_b = 2 * hkv * (BLK * D // 2 + BLK * D // 16)
+    require(
+        kv_cache.dtype == torch.uint8 and kv_cache.stride(0) < 2**31,
+        "kv_cache must be uint8 with a page stride below 2 GiB",
+    )
+    require(
+        kv_cache.dim() == 2 and kv_cache.stride(1) == 1,
+        "kv_cache must be 2-D with a unit last stride",
+    )
+    require(
+        kv_cache.stride(0) >= page_b and kv_cache.size(1) >= page_b,
+        "kv_cache page is smaller than its payload",
+    )
+    require(
+        topk_idx.dtype == torch.int32
+        and topk_idx.shape[1] >= rows
+        and topk_idx.stride(2) == 1,
+        "topk_idx must be int32 [Hkv, >= rows, topk] with a unit last stride",
+    )
+    require(
+        block_table.dtype == torch.int32 and block_table.stride(-1) == 1,
+        "block_table must be int32 with a unit last stride",
+    )
+    for t in (out, kv_cache, topk_idx, block_table):
+        require(t.device == q.device, "all operands must be on q's device")
+    return group
 
 
 def global_i32_ptr(addr_i64):

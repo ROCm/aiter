@@ -27,37 +27,39 @@ and would count it twice.
 """
 
 import functools
-import math
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
-import numpy as np
 import torch
 from flydsl.expr import const_expr, range_constexpr
 from flydsl.expr.typing import T
 from flydsl.expr.typing import Vector as Vec
 
+from aiter.jit.utils.chip_info import get_gfx_runtime
 from aiter.ops.flydsl.kernels import buffer_ops
+from aiter.ops.flydsl.kernels.minimax_m3_index_score import _cu_count
 from aiter.ops.flydsl.kernels.sparse_pa_nvfp4_common import (
     BLK,
     HG,
     KPW,
-    LOG2E,
     NDT,
     NKS,
     NW,
     RAW,
     D,
     bf16x8_to_f16,
+    check_operands,
     dequant_page,
     exp2,
     global_f32_ptr,
     global_i32_ptr,
+    host_scales,
     maxf_nn,
     mfma_f16,
     page_loader,
     pk_bf16,
     pk_f16,
+    require,
     xlane4,
 )
 from aiter.ops.flydsl.kernels.tensor_shim import _run_compiled
@@ -451,21 +453,6 @@ def _get_kernel(tq: int, rounds: int, device_index: int):
     return compile_prefill(tq, rounds)
 
 
-@functools.cache
-def _gfx_arch(device_index: int) -> str:
-    return torch.cuda.get_device_properties(device_index).gcnArchName.split(":")[0]
-
-
-@functools.cache
-def _unit_scale(device_index: int) -> torch.Tensor:
-    return torch.ones(1, dtype=torch.float32, device=f"cuda:{device_index}")
-
-
-@functools.cache
-def _cu_count(device_index: int) -> int:
-    return torch.cuda.get_device_properties(device_index).multi_processor_count
-
-
 def pick_tile(rows: int, hkv: int, cus: int) -> tuple[int, int]:
     """(rows per workgroup, combine rounds) from the grid size.
 
@@ -500,58 +487,41 @@ def sparse_pa_nvfp4_prefill(
 
     gfx950 only. Every operand must be on ``q``'s device; ``k_scale`` / ``v_scale`` are
     one positive float32 element each (a device value, not checked) and ``sm_scale``
-    must be finite and positive. Block ids within a row must be distinct; a repeated id
+    must be finite and positive. ``row_req_id`` values index ``block_table`` rows (a
+    device value, not checked). Block ids within a row must be distinct; a repeated id
     is attended once (see the module docstring).
     """
     if q.device.type != "cuda":
         raise ValueError(f"q must be a CUDA tensor, got {q.device}")
-    if _gfx_arch(q.device.index) != "gfx950":
-        raise ValueError(
-            f"NVFP4 sparse PA prefill requires gfx950, got {_gfx_arch(q.device.index)}"
-        )
-    rows, num_heads, head_dim = q.shape
+    arch = get_gfx_runtime()
+    if arch != "gfx950":
+        raise ValueError(f"NVFP4 sparse PA prefill requires gfx950, got {arch}")
+    require(q.dim() == 3 and topk_idx.dim() == 3, "q and topk_idx must be 3-D")
+    rows, num_heads = q.shape[:2]
     hkv = topk_idx.shape[0]
     if out is None:
         out = torch.empty_like(q)
     if rows == 0:
         return out
-    group = num_heads // hkv
-    assert head_dim == D and group * hkv == num_heads and group in (8, 16)
-    assert topk_idx.shape[-1] == TOPK
-    assert q.dtype == torch.bfloat16 and out.dtype == torch.bfloat16
-    assert q.is_contiguous() and out.is_contiguous() and out.shape == q.shape
-    # Q and out are addressed with 32-bit byte offsets.
-    assert q.numel() * q.element_size() < 2**31, "q must be below 2 GiB"
-    page_b = 2 * hkv * (BLK * D // 2 + BLK * D // 16)
-    assert kv_cache.dtype == torch.uint8 and kv_cache.stride(0) < 2**31
-    assert (
-        kv_cache.dim() == 2 and kv_cache.stride(1) == 1
-    ), "kv_cache must be 2-D with a unit last stride"
-    assert (
-        kv_cache.stride(0) >= page_b and kv_cache.size(1) >= page_b
-    ), "kv_cache page is smaller than its payload"
-    assert topk_idx.dtype == torch.int32 and topk_idx.shape[1] >= rows
-    assert topk_idx.stride(2) == 1
-    for t in (block_table, row_req_id, row_kv_lens):
-        assert t.dtype == torch.int32 and t.stride(-1) == 1
-    assert row_req_id.shape[0] >= rows and row_kv_lens.shape[0] >= rows
-    for t in (out, kv_cache, topk_idx, block_table, row_req_id, row_kv_lens):
-        assert t.device == q.device, "all operands must be on q's device"
+    group = check_operands(q, out, kv_cache, topk_idx, block_table)
+    require(topk_idx.shape[-1] == TOPK, f"topk_idx must have {TOPK} slots per row")
+    require(
+        block_table.dim() == 2 and block_table.shape[0] >= 1,
+        "block_table 2-D [reqs, max_blocks] with at least one row",
+    )
+    for t in (row_req_id, row_kv_lens):
+        require(
+            t.dtype == torch.int32 and t.dim() == 1 and t.stride(-1) == 1,
+            "row_req_id and row_kv_lens must be 1-D int32",
+        )
+        require(t.shape[0] >= rows, "row_req_id and row_kv_lens need a value per row")
+        require(t.device == q.device, "all operands must be on q's device")
     dev = q.device.index
     if tq is None:
         tq, rounds = pick_tile(rows, hkv, _cu_count(dev))
     elif rounds is None:
         rounds = 2 if tq == 4 else 1
-    unit = _unit_scale(dev)
-    ks = unit if k_scale is None else k_scale
-    vs = unit if v_scale is None else v_scale
-    for t in (ks, vs):
-        assert (
-            t.device == q.device and t.dtype == torch.float32 and t.numel() == 1
-        ), "k_scale and v_scale must be one float32 element on q's device"
-    # The softmax runs in scaled units with masked scores at -inf, so it needs c > 0.
-    c = float(np.float32(sm_scale) * np.float32(LOG2E))
-    assert math.isfinite(c) and c > 0, "sm_scale must be finite and positive"
+    ks, vs, c = host_scales(q, k_scale, v_scale, sm_scale)
     with torch.cuda.device(q.device):
         _run_compiled(
             _get_kernel(tq, rounds, dev),
