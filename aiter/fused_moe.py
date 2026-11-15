@@ -1671,7 +1671,7 @@ def _fused_moe_impl(
     # weights fall through to the generic MoE below.
     if gate_mode == GateMode.INTERLEAVE:
         grouped_a8w4_out = grouped_gemm_gfx1250_a8w4(
-            hidden_states,
+            hidden_states.contiguous(),
             w1,
             w2,
             topk_weight,
