@@ -1,0 +1,7 @@
+{
+  "TPW_K": 16,
+  "num_warps": 8,
+  "waves_per_eu": 8,
+  "max_token_tile": 8,
+  "fused_loads": true
+}
