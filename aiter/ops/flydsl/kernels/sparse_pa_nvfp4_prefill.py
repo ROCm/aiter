@@ -67,17 +67,21 @@ from aiter.ops.flydsl.kernels.tensor_shim import _run_compiled
 TOPK = 16  # selected blocks per row (one lane per (row, slot): TQ x 16 <= 64 lanes)
 
 
-def compile_prefill(tq: int = 4, rounds: int = 2, q_lds: bool | None = None):
+def compile_prefill(tq: int = 4, rounds: int = 2):
     """Build the prefill kernel for ``tq`` rows per workgroup (1, 2 or 4).
 
     ``rounds`` splits the cross-wave combine over that many passes (tq must divide);
     2 halves the LDS so two workgroups fit a CU.
     """
-    assert tq in (1, 2, 4) and tq % rounds == 0 and rounds in (1, 2)
+    require(tq in (1, 2, 4), f"tq must be 1, 2 or 4, got {tq}")
+    require(
+        rounds in (1, 2) and tq % rounds == 0,
+        f"rounds must be 1 or 2 and divide tq, got {rounds}",
+    )
     TQ, R = tq, rounds
     # Q^T lives in LDS (aliasing the combine buffer) when 4 rows would not fit the
     # 256 VGPRs two waves per SIMD allow.
-    Q_LDS = (TQ == 4 and R == 2) if q_lds is None else q_lds
+    Q_LDS = TQ == 4 and R == 2
     Q_ROW = D * 2 // 16 + 1  # 16 B LDS tiles per Q^T row, padded by one
     tpr = TQ // R  # rows per combine round
     name = f"m3_nvfp4_sparse_pa_prefill_tq{TQ}_r{R}" + ("_ql" if Q_LDS else "")
@@ -191,7 +195,6 @@ def compile_prefill(tq: int = 4, rounds: int = 2, q_lds: bool | None = None):
             lim.append(pos % BLK - w * KPW)
             if const_expr(not Q_LDS):
                 q_row = (tc * i32_H + kvh * i32_group + head) * (D // 2) + g * 16
-            if const_expr(not Q_LDS):
                 q_regs.append(
                     [
                         bf16x8_to_f16(
@@ -458,9 +461,9 @@ def pick_tile(rows: int, hkv: int, cus: int) -> tuple[int, int]:
 
     A bigger tile shares each page's dequantization across more rows but needs LDS and
     registers that cap occupancy at 2 waves per SIMD, so it only pays once the grid has
-    at least two workgroups per CU (measured on MI355X, 256 CUs, Hkv 1 / 4, q_len 256 ..
-    8192): fewer than one CU's worth of rows runs 1 row per workgroup, below two
-    workgroups per CU at 4 rows runs 2.
+    enough workgroups (measured on MI355X, 256 CUs, Hkv 1 / 4, q_len 256 .. 8192): with
+    fewer than 2 workgroups per CU at 1 row per workgroup it runs 1 row; with fewer than 2
+    per CU at 4 rows per workgroup it runs 2 rows; otherwise 4 rows, 2 combine rounds.
     """
     if rows * hkv < 2 * cus:
         return 1, 1
@@ -489,7 +492,7 @@ def sparse_pa_nvfp4_prefill(
     one positive float32 element each (a device value, not checked) and ``sm_scale``
     must be finite and positive. ``row_req_id`` values index ``block_table`` rows (a
     device value, not checked). Block ids within a row must be distinct; a repeated id
-    is attended once (see the module docstring).
+    is attended once (see the module docstring). ``rounds`` needs ``tq``.
     """
     if q.device.type != "cuda":
         raise ValueError(f"q must be a CUDA tensor, got {q.device}")
@@ -518,6 +521,7 @@ def sparse_pa_nvfp4_prefill(
         require(t.device == q.device, "all operands must be on q's device")
     dev = q.device.index
     if tq is None:
+        require(rounds is None, "rounds needs tq")
         tq, rounds = pick_tile(rows, hkv, _cu_count(dev))
     elif rounds is None:
         rounds = 2 if tq == 4 else 1

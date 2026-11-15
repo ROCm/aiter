@@ -4,8 +4,10 @@
 """Shared pieces of the MiniMax-M3 NVFP4 sparse paged-attention kernels (FlyDSL, gfx950).
 
 Both kernels (decode and prefill) read the same single-buffer K/V page and share the
-MFMA mapping, so the page loader, the exact dequantization and the softmax helpers
-live here.
+MFMA mapping, the conversion / softmax helpers and the host-side argument checks, which
+live here. ``page_loader`` and ``dequant_page`` are used by the prefill kernel only: the
+decode kernel keeps its own ``_page_loader`` / ``_dq4`` because it fuses the
+dequantization into its MFMAs.
 
 Page layout (128 tokens, ``2 * Hkv * 9216`` bytes; the global fp32 k / v scales are
 NOT in the page). ``[K side | V side]``; a side is ``Hkv x 8192 B`` of e2m1 data

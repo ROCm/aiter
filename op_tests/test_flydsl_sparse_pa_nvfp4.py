@@ -459,6 +459,8 @@ def refusals():
     ]
     prefill_only = [
         ("empty block_table", {"bt": c["bt"][:0]}, "block_table 2-D"),
+        ("tq 3", {"tq": 3}, "tq must be"),
+        ("rounds without tq", {"rounds": 1}, "rounds needs tq"),
     ]
 
     def decode(a):
