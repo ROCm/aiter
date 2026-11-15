@@ -1960,9 +1960,13 @@ def build_prefill_score(g, k_fp4=False, q_fp8=False, nvfp4=None):
                 # Legacy GEP kept on purpose: FlyDSL 0.5.0's `fly.ptr` has no constant
                 # (addrspace 4) address space and `fx.ptr_load` no `invariant` flag, so
                 # this scalar block-table load has no pointer-API form (see above).
+                # The element index fits int32 (the table's span is validated), its
+                # byte offset up to 4 GiB does not: widen before the multiply.
                 addr = buffer_ops.get_element_ptr(
                     bt_const,
-                    byte_offset=((b * i32_stride_bt_b + safe) * fx.Int32(4)).ir_value(),
+                    byte_offset=(
+                        fx.Int64(b * i32_stride_bt_b + safe) * fx.Int64(4)
+                    ).ir_value(),
                     elem_type=T.i8,
                 )
                 page = fx.Int32(
@@ -2386,9 +2390,10 @@ def _score_prefill_impl(
     k_fp4 = two_view and nvfp4 is None
     if nvfp4 is not None and (nvfp4 not in NVFP4_ROUNDINGS or not two_view):
         raise ValueError(f"nvfp4: k_round must be one of {NVFP4_ROUNDINGS}")
-    if two_view:
+    if k_fp4:
         # per_1x32_f4_quant hands back fp4x2 / e8m0: take those as they are. Same
-        # bytes either way, so the uint8 view is only a reinterpretation.
+        # bytes either way, so the uint8 view is only a reinterpretation. NVFP4 takes
+        # uint8 views only: its scales are e4m3, so an e8m0-typed tensor is refused.
         if getattr(cache, "dtype", None) == dtypes.fp4x2:
             cache = cache.view(torch.uint8)
         if getattr(k_scale, "dtype", None) == dtypes.fp8_e8m0:
@@ -2623,7 +2628,8 @@ def score_prefill_flydsl_nvfp4(
 ):
     """`score_prefill_flydsl` over an NVFP4 index cache: `k_data [pages, 128, 64]`
     e2m1 and `k_scale [pages, 128, 8]` uint8 e4m3 (one per 16 elements, positive,
-    not 0x7F; no per-tensor scale), each view with its own page stride.
+    not 0x7F; no per-tensor scale), each view with its own page stride. Both are
+    uint8 views: the fp4x2 / e8m0 typed views are MXFP4's and are refused here.
 
     `idx_q` is bf16 or e4m3; as in every prefill scorer here a bf16 Q is rounded to e4m3
     first. `k_round="e4m3"` (the default) scores K = e4m3_rn_satfinite(e2m1 * scale)

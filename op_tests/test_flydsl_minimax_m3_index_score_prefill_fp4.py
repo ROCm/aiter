@@ -942,6 +942,28 @@ def check_prefill_nvfp4_modes_do_not_share_a_compiled_kernel():
     check_equal(again[0], first[1], "nvfp4 after mxfp4")
 
 
+def check_prefill_nvfp4_block_table_row_stride_beyond_2gib():
+    """`block_table` is accepted up to a 4 GiB span, so row 1 may start 2**31 bytes
+    after row 0 (stride(0) = 2**29 int32). The DMA arm turns that into a byte offset
+    for a scalar load: in int32 it wraps negative and request 1 reads the 128 ids that
+    sit 2 GiB BEFORE the table, here request 0's pages (valid ids, wrong data)."""
+    import aiter.ops.flydsl.kernels.minimax_m3_index_score_prefill as mod
+
+    qls, seqs = [8192, 8192], [16384, 16384]
+    c = nv_case(qls, seqs, exact_sum=True)
+    mb, stride = c["mb"], 1 << 29
+    assert mod.geometry(max(qls), 2, 1, mb, "cuda", xwide=True)["dma"], "not DMA"
+    pool = torch.zeros(2 * stride + mb, dtype=torch.int32, device="cuda")
+    pool[:mb] = c["bt"][0]  # where the wrapped offset lands for request 1
+    pool[stride : stride + mb] = c["bt"][0]
+    pool[2 * stride : 2 * stride + mb] = c["bt"][1]
+    bt = pool[stride:].as_strided((2, mb), (stride, 1))
+    ref = nv_oracle(c, c["e4m3"])
+    got = run_nv({**c, "bt": bt})
+    live = torch.isfinite(ref)
+    check_scores(got, ref, live, "block_table row stride 2**29")
+
+
 def check_prefill_nvfp4_rejections():
     c = nv_case([64], [300])
 
@@ -956,6 +978,18 @@ def check_prefill_nvfp4_rejections():
     kd4, ks4 = c["kd"], c["ks"][:, :, :4]  # an MXFP4-shaped scale view
     bad("mx scale", lambda: run_nv(c, views=(kd4, ks4)), "[pages, 128, 8]")
     bad("k_round", lambda: run_nv(c, k_round="bf16"), "k_round")
+    # typed views are an MXFP4 convenience: NVFP4 scales are e4m3, so e8m0-typed
+    # bytes must not be reinterpreted as uint8 and scored as e4m3
+    bad(
+        "e8m0 scale",
+        lambda: run_nv(c, views=(c["kd"], c["ks"].view(dtypes.fp8_e8m0))),
+        "k_scale",
+    )
+    bad(
+        "fp4x2 data",
+        lambda: run_nv(c, views=(c["kd"].view(dtypes.fp4x2), c["ks"])),
+        "k_data",
+    )
     bad(
         "scale dtype",
         lambda: run_nv(c, views=(c["kd"], c["ks"].view(torch.int8))),
@@ -1221,6 +1255,7 @@ def build_cases():
         check_prefill_nvfp4_single_region_views_and_typed_scale,
         check_prefill_nvfp4_default_k_round_is_e4m3,
         check_prefill_nvfp4_modes_do_not_share_a_compiled_kernel,
+        check_prefill_nvfp4_block_table_row_stride_beyond_2gib,
         check_prefill_nvfp4_rejections,
     ):
         cases.append((fn.__name__.removeprefix("check_prefill_"), fn, ()))
