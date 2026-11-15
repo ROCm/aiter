@@ -350,7 +350,8 @@ def get_build_targets() -> list[tuple[str, int]]:
 
     Priority:
       1. GPU_ARCHS set to an explicit non-empty target list -> delegate to
-         get_build_targets_env() (no GPU needed).
+         get_build_targets_env() (no GPU needed), which pairs each arch with
+         every CU count in GFX_CU_NUMS_MAP unless CU_NUM is set.
       2. GPU_ARCHS unset, empty/whitespace, or "native" -> call get_gfx()
          (GPU_ARCHS-aware; falls back to rocminfo/hipinfo when GPU_ARCHS is
          unset) and get_cu_num(), which correctly reflect partition mode and
@@ -640,6 +641,8 @@ def _get_pci_chip_id(device_id=None):
 
 
 MI308_CHIP_IDS = {0x74A2, 0x74A8, 0x74B6, 0x74BC}
+# MI300A is the gfx942 APU: 228 CUs and 6 XCCs, against MI300X's 304 and 8.
+MI300A_CHIP_IDS = {0x74A0}
 
 
 def get_device_name():
@@ -665,6 +668,8 @@ def _get_device_name(device_id: int) -> str:
         chip_id = _get_pci_chip_id(device_id)
         if chip_id in MI308_CHIP_IDS:
             return "MI308"
+        if chip_id in MI300A_CHIP_IDS:
+            return "MI300A"
         return "MI300"
     elif gfx == "gfx950":
         num_xcds = _num_xcds_for_device(device_id)

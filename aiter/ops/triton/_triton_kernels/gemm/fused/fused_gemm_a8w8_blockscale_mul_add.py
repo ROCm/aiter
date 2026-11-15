@@ -159,7 +159,9 @@ def _fused_gemm_a8w8_blockscale_mul_add_kernel(
 
         accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
 
-        for k in range(pid_k * num_k_iter, (pid_k + 1) * num_k_iter):
+        # The last split can run past K, so stop at the last K block
+        k_end = tl.minimum((pid_k + 1) * num_k_iter, tl.cdiv(K, BLOCK_SIZE_K))
+        for k in range(pid_k * num_k_iter, k_end):
             # Load the next block of A and B, generate a mask by checking the K dimension.
             # If it is out of bounds, set it to 0.
             if EVEN_K:
@@ -167,12 +169,12 @@ def _fused_gemm_a8w8_blockscale_mul_add_kernel(
                 b = tl.load(b_ptrs, cache_modifier=cache_modifier)
             else:
                 a = tl.load(
-                    a_ptrs, mask=offs_k[None, :] < K - k * BLOCK_SIZE_K, other=0
+                    a_ptrs, mask=offs_k[None, :] < K - k * BLOCK_SIZE_K, other=0.0
                 )
                 b = tl.load(
                     b_ptrs,
                     mask=offs_k[:, None] < K - k * BLOCK_SIZE_K,
-                    other=0,
+                    other=0.0,
                     cache_modifier=cache_modifier,
                 )
 
@@ -299,7 +301,7 @@ def _fused_gemm_a8w8_blockscale_mul_add_reduce_kernel(
     if ACTUAL_KSPLIT == MAX_KSPLIT:
         c = tl.load(c_in_ptrs)
     else:
-        c = tl.load(c_in_ptrs, mask=offs_k[:, None, None] < ACTUAL_KSPLIT)
+        c = tl.load(c_in_ptrs, mask=offs_k[:, None, None] < ACTUAL_KSPLIT, other=0.0)
     c = tl.sum(c, axis=0)
 
     if IS_A_SCALAR and IS_A_TENSOR:

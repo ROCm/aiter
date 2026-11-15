@@ -459,12 +459,17 @@ def compile_gemm2_a16w4_port(
     rocm_arch,
     epilog="atomic",
     topk=1,
+    reuse_lds=False,
+    use_valid_token_count=False,
 ):
     """a16w4/a16wi4/a16w16 (bf16 intermediate A x mxfp4/int4/bf16 W2) stage2 builder.
 
     N_OUT = model_dim (down-proj output). D_INTER = inter_dim (contraction).
     ``epilog="atomic"``: routing-weighted scatter into [tokens, model_dim].
     ``epilog="reduce"``: unique [token*topk+slot, N] rows (caller runs moe_reduce).
+    ``use_valid_token_count`` (atomic only): bound scatter rows by
+    min(cumsum[1], M) -- a LocalToken sort pads with token id = real count, which
+    is still < M when M is a padded (cudagraph) row count.
 
     ``xcd_swizzle`` (>0) bijectively round-robins the launch index across the 8 XCDs to
     balance per-XCD/HBM traffic (gemm2 is HBM-bound), + optional M-group swizzle for
@@ -475,9 +480,22 @@ def compile_gemm2_a16w4_port(
         "int4",
         "bf16",
     ), f"w_dtype must be 'mxfp4', 'int4' or 'bf16', got {w_dtype!r}"
+    if w_dtype in ("fp4", "int4") and (TILE_K <= 0 or TILE_K % 128):
+        raise ValueError(
+            f"{w_dtype} TILE_K must be a positive multiple of 128, got {TILE_K}"
+        )
     if epilog not in ("atomic", "reduce"):
         raise ValueError(f"epilog must be 'atomic' or 'reduce', got {epilog!r}")
+    if reuse_lds and (
+        str(rocm_arch).split(":", 1)[0] != "gfx942"
+        or w_dtype != "fp4"
+        or epilog != "atomic"
+    ):
+        raise NotImplementedError(
+            "LDS reuse is validated only for gfx942 fp4 atomic stage2"
+        )
     _use_reduce = epilog == "reduce"
+    use_valid_token_count = bool(use_valid_token_count and not _use_reduce)
     _topk = int(topk) if _use_reduce else 1
     if _use_reduce and _topk < 1:
         raise ValueError(f"reduce epilog requires topk>=1, got {_topk}")
@@ -504,11 +522,25 @@ def compile_gemm2_a16w4_port(
     _a_bytes = BM * KH_TILE_BYTES
     if _use_reduce:
         _lds_bytes = max(_a_bytes, BM * TILE_N * 2)
+    elif reuse_lds:
+        _lds_bytes = max(_a_bytes, BM * TILE_N * 4)
     else:
         _lds_bytes = _a_bytes + BM * TILE_N * 4
 
+    if reuse_lds:
+        from aiter.jit.utils.chip_info import get_lds_capacity_bytes
+
+        lds_capacity = get_lds_capacity_bytes(str(rocm_arch))
+        if _lds_bytes > lds_capacity:
+            raise NotImplementedError(
+                f"a16w4 gemm2 requires {_lds_bytes} LDS bytes, "
+                f"exceeding {rocm_arch} capacity {lds_capacity}"
+            )
+
     _wd_tag = "" if w_dtype == "fp4" else f"_{w_dtype}"
     _name = f"gemm2_a16w4{_wd_tag}_port_ne{NE}_h{N_OUT}_i{_K}_bm{BM}_tn{TILE_N}"
+    if reuse_lds and not _use_reduce:
+        _name += "_ldsreuse"
     if b_cache_mod != 2:
         _name += f"_bcm{b_cache_mod}"
     if xcd_swizzle > 0:
@@ -519,6 +551,8 @@ def compile_gemm2_a16w4_port(
         _name += "_persist"
     if _use_reduce:
         _name += f"_reduce_tk{_topk}"
+    if use_valid_token_count:
+        _name += "_valid_tokens"
 
     @fx.struct
     class SharedStorage:
@@ -537,7 +571,15 @@ def compile_gemm2_a16w4_port(
         i32_max_m_blocks: fx.Int32,
         arg_out: fx.Int64,
     ):
-        lds_raw_ptr = fx.SharedAllocator().allocate(SharedStorage).peek().raw.ptr
+        if const_expr(reuse_lds):
+            lds_raw_ptr = (
+                fx.SharedAllocator()
+                .allocate(fx.Array[fx.Uint8, _lds_bytes, 16])
+                .peek()
+                .ptr
+            )
+        else:
+            lds_raw_ptr = fx.SharedAllocator().allocate(SharedStorage).peek().raw.ptr
         tx_i32 = fx.Int32(gpu.thread_id("x"))
         bx_i32 = fx.Int32(gpu.block_id("x"))
         lane = tx_i32 % 64
@@ -545,6 +587,10 @@ def compile_gemm2_a16w4_port(
         cumsum0 = _global_i32_at(arg_cumsum, fx.Int32(0))
         total_m_blocks = cumsum0 // fx.Int32(BM)
         bound = total_m_blocks * fx.Int32(_num_n_blocks)
+        row_limit = i32_M
+        if const_expr(use_valid_token_count):
+            valid_tokens = _global_i32_at(arg_cumsum, fx.Int32(1))
+            row_limit = (valid_tokens < i32_M).select(valid_tokens, i32_M)
 
         # Bijective XCD round-robin over valid tiles [0, bound) to balance per-XCD/HBM
         # traffic; xcd_swizzle>0 also M-group-swizzles for per-XCD L2 locality.
@@ -581,7 +627,7 @@ def compile_gemm2_a16w4_port(
                 tile,
                 lane,
                 wave,
-                i32_M,
+                row_limit,
                 BM=BM,
                 TILE_N=TILE_N,
                 TILE_K=TILE_K,

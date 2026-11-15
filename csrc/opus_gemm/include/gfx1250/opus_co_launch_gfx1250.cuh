@@ -91,6 +91,12 @@ inline bool hip_module_accepts(const SelectedImage& selected, std::string* error
     hipModule_t module = nullptr;
     const hipError_t status = hipModuleLoadData(&module, bytes.data());
     if(status != hipSuccess) {
+        // A failed capability probe must not leave HIP's sticky last-error set: on a
+        // pre-ROCm-10.1 runtime the strict (0xeb) probe fails here, and the recorded
+        // hipErrorNoBinaryForGpu would otherwise be inherited by the next unrelated HIP
+        // call (e.g. torch.empty) and abort the process downstream, even though opus has
+        // already fallen back to the regular CO. #7185 added the probe but left it recorded.
+        (void)hipGetLastError();
         *error = std::string(hipGetErrorName(status)) + " (" +
                  hipGetErrorString(status) + ")";
         return false;

@@ -69,6 +69,14 @@ struct __attribute__((packed)) KernelArgs
     p3 _p27;
 };
 
+enum class AsmMoeMode : int
+{
+    SORTED      = 0,
+    NO_SORT     = 1,
+    EMSORT      = 2,
+    POST_REDUCE = 3,
+};
+
 class FMoeKernel
 {
     private:
@@ -78,8 +86,8 @@ class FMoeKernel
     uint32_t num_persistent_tgs = 0;
     uint32_t tgs_align          = 1;
     const char* name            = nullptr;
-    // flat_mode: 0 = host-sorted, 1 = flat one-token-per-TG grid, 2 = emsort persistent grid
-    int flat_mode = 0;
+    // POST_REDUCE uses the sorted persistent grid; Python reduces route partials.
+    AsmMoeMode flat_mode = AsmMoeMode::SORTED;
     // Manifest limits. 0 max_tokens means no separate token cap.
     uint32_t max_tokens      = 0;
     uint32_t max_assignments = 0;
@@ -90,7 +98,7 @@ class FMoeKernel
                const char* hsaco,
                uint32_t sub_GU             = 512,
                uint32_t num_persistent_tgs = 0,
-               int flat_mode               = 0,
+               int flat_mode               = static_cast<int>(AsmMoeMode::SORTED),
                uint32_t tgs_align          = 1,
                uint32_t max_tokens         = 0,
                uint32_t max_assignments    = 0,
@@ -100,7 +108,7 @@ class FMoeKernel
         this->num_persistent_tgs = num_persistent_tgs;
         this->tgs_align          = std::max(tgs_align, 1u);
         this->name               = name;
-        this->flat_mode          = flat_mode;
+        this->flat_mode          = static_cast<AsmMoeMode>(flat_mode);
         this->max_tokens         = max_tokens;
         this->max_assignments    = max_assignments;
         this->max_experts        = max_experts;
@@ -109,7 +117,7 @@ class FMoeKernel
     const char* get_name() const { return name; }
     int get_num_persistent_tgs() { return num_persistent_tgs; }
     int get_sub_GU() { return sub_GU; }
-    int get_flat_mode() const { return flat_mode; }
+    AsmMoeMode get_flat_mode() const { return flat_mode; }
     void set_4bit(bool is_4bit_) { is_int4 = is_4bit_; }
 
     template <int I_elemSize, int O_elemSize, bool switchGxy = false>
@@ -161,7 +169,11 @@ class FMoeKernel
         args.ptr_O      = out->ptr;
         args.ptr_X      = input->ptr;
         args.ptr_GU     = w1->ptr;
-        args.ptr_XC     = num_valid_ids->ptr;
+        // FLAT and EMSORT read XC[0] as the token count when this pointer is
+        // set. The unsorted path passes an empty tensor when the caller did
+        // not supply num_local_tokens, and that tensor's data pointer is null,
+        // so the shader keeps the kernarg token_cnt.
+        args.ptr_XC = num_valid_ids->ptr;
         args.ptr_D      = w2->ptr;
         if constexpr(I_elemSize == 1)
         {
@@ -204,18 +216,18 @@ class FMoeKernel
         int gdx;
         int gdy;
         int gdz;
-        // flat_mode==1: one-TG-per-(token,topk) grid; no host moe_sort.
-        // flat_mode==2: EMSORT consumes raw topk and uses the configured persistent
+        // NO_SORT: one-TG-per-(token,topk) grid; no host moe_sort.
+        // EMSORT consumes raw topk and uses the configured persistent
         // TG pool as a 2D grid: hidden slices on X, expert owners on Y. The shader
         // derives expert ownership from tgy and loops over its compacted queue.
-        if(this->flat_mode == 1)
+        if(this->flat_mode == AsmMoeMode::NO_SORT)
         {
             bdx = 256;
             gdx = ((inter_dim + sub_GU - 1) / sub_GU);
             gdy = static_cast<int>(topk);
             gdz = static_cast<int>(token_cnt);
         }
-        else if(this->flat_mode == 2)
+        else if(this->flat_mode == AsmMoeMode::EMSORT)
         {
             // Each EMSORT binary declares its own queue in the manifest
             // (max_tokens, max_assignments, max_experts). A zero max_tokens
@@ -356,9 +368,38 @@ static bool ps_grid_fits(const CFG::mapped_type& cfg, int inter_dim)
 static bool kernel_fits(
     const CFG::mapped_type& cfg, int vskip, int smf, int block_size_M, int inter_dim, int model_dim)
 {
-    return cfg.vskip == vskip && cfg.smf == smf && block_size_M == cfg.subGU_m && cfg.flat == 0 &&
-           inter_dim % cfg.subGU_n == 0 && model_dim % std::max(cfg.dim_align, 1) == 0 &&
-           model_dim >= cfg.dim_min && ps_grid_fits(cfg, inter_dim);
+    if(cfg.smf != smf || inter_dim % cfg.subGU_n != 0 ||
+       model_dim % std::max(cfg.dim_align, 1) != 0 || model_dim < cfg.dim_min ||
+       !ps_grid_fits(cfg, inter_dim))
+        return false;
+    // flat==1 rows are the 16xN tiles. Their subGU_m is 16 and vskip is 0, so the
+    // checks below would hide the only rows that divide inter_dim such as 160 and 320.
+    if(cfg.flat == static_cast<int>(AsmMoeMode::NO_SORT))
+        return true;
+    return cfg.vskip == vskip && block_size_M == cfg.subGU_m &&
+           cfg.flat == static_cast<int>(AsmMoeMode::SORTED);
+}
+
+// The SwiGLU OAI MXFP4 FLAT kernels (16x32/16x128) are validated for inter_dim % 128 == 0
+// (Minimax M3 TP2/TP4/TP8: 1536/768/384). The FLAT grid is ceil(inter_dim / subGU_n)
+// with no partial-tile handling, so reject other sizes here rather than launch a kernel
+// that reads past the expert's weights.
+// Every row in this map is flat=1: it reads the raw top-k ids/weights, not the host
+// moe_sorting output. Only a tuned row (kernel_name set, flat=1 forwarded by fused_moe)
+// passes raw top-k, so an unnamed call must not reach the heuristic below.
+static void
+check_swiglu_oai_flat_launch(const CFG* cfgs, int inter_dim, const std::string& kernel_name)
+{
+    if(cfgs != &cfg_fmoe_bf16_pertokenMXfp4_g1u1_swiglu_oai)
+        return;
+    AITER_CHECK(!kernel_name.empty(),
+                __func__,
+                " SwiGLU OAI MXFP4 FLAT asm kernels need an explicit kernel name: they read "
+                "raw top-k routing, not host-sorted ids, so heuristic selection is not allowed");
+    AITER_CHECK(inter_dim % 128 == 0,
+                __func__,
+                " SwiGLU OAI MXFP4 FLAT asm kernels need inter_dim % 128 == 0, got " +
+                    std::to_string(inter_dim));
 }
 
 FMoeKernel* get_heuristic_kernel(int inter_dim,
@@ -375,6 +416,7 @@ FMoeKernel* get_heuristic_kernel(int inter_dim,
     uint32_t tg_num             = 0;
     uint32_t num_persistent_tgs = 0;
     uint32_t round              = 0xffffffff;
+    int selected_flat           = 0;
     std::string arch_id         = get_gpu_arch();
     std::string selectedKl      = kernel_name.empty() ? "" : arch_id + kernel_name;
     int vskip                   = get_vskip();
@@ -392,15 +434,19 @@ FMoeKernel* get_heuristic_kernel(int inter_dim,
                 tg_num = inter_dim / cfg.subGU_n *
                          sub_X_cnt; // how many thread_groups are needed to handle inter_dim
                 uint32_t local_round = (tg_num + num_cu - 1) / num_cu;
-                if(local_round < round || // fewer round is better
+                const uint32_t empty = local_round * num_cu - tg_num;
+                // Fewer rounds, then fewer empty CUs. At the same cost a flat==0 row
+                // beats a flat==1 row with the same subGU_n, and a PS row wins a tie.
+                if(local_round < round ||
                    (local_round == round &&
-                    (empty_cu > (local_round * num_cu - tg_num) || // fewer empty_cu is better
-                     (empty_cu == (local_round * num_cu - tg_num) &&
-                      cfg.ps == 1)))) // prefer PS kernel
+                    (empty_cu > empty ||
+                     (empty_cu == empty && cfg.flat == selected_flat && cfg.ps == 1) ||
+                     (empty_cu == empty && selected_flat != 0 && cfg.flat == 0))))
                 {
-                    round      = local_round;
-                    empty_cu   = local_round * num_cu - tg_num;
-                    selectedKl = el.first;
+                    round         = local_round;
+                    empty_cu      = empty;
+                    selectedKl    = el.first;
+                    selected_flat = cfg.flat;
                     if(cfg.ps == 1)
                         num_persistent_tgs = cfg.tg_num_perCU * num_cu;
                     else
@@ -756,8 +802,11 @@ AITER_CTYPES_DEFINE_ENTRYPOINT_VOID(
             config_map = &cfg_fmoe_bf16_pertokenMXfp4_g1u1_gelu;
         else if(out->dtype() == AITER_DTYPE_bf16 && act == ActivationType::Situv2)
             config_map = &cfg_fmoe_bf16_pertokenMXfp4_g1u1_situv2;
+        else if(out->dtype() == AITER_DTYPE_bf16 && act == ActivationType::Swiglu)
+            config_map = &cfg_fmoe_bf16_pertokenMXfp4_g1u1_swiglu_oai;
         else
             AITER_CHECK(false, __func__, " Not find proper cfg in pertokenMXfp4_g1u1. ");
+        check_swiglu_oai_flat_launch(config_map, inter_dim, kernel_name_str);
         impl_ptr = get_heuristic_kernel(inter_dim, sub_X_cnt, config_map, smf, kernel_name_str);
         impl_ptr->set_4bit(true);
         is_mxfp4 = true;
@@ -778,8 +827,11 @@ AITER_CTYPES_DEFINE_ENTRYPOINT_VOID(
             config_map = &cfg_fmoe_bf16_pertokenMXfp4_g1u1_gelu;
         else if(out->dtype() == AITER_DTYPE_bf16 && act == ActivationType::Situv2)
             config_map = &cfg_fmoe_bf16_pertokenMXfp4_g1u1_situv2;
+        else if(out->dtype() == AITER_DTYPE_bf16 && act == ActivationType::Swiglu)
+            config_map = &cfg_fmoe_bf16_pertokenMXfp4_g1u1_swiglu_oai;
         else
             AITER_CHECK(false, __func__, " Not find proper cfg in pertokenMXfp4_g1u1 (bf16 X). ");
+        check_swiglu_oai_flat_launch(config_map, inter_dim, kernel_name_str);
         impl_ptr = get_heuristic_kernel(inter_dim, sub_X_cnt, config_map, smf, kernel_name_str);
         impl_ptr->set_4bit(true);
         is_mxfp4 = true;

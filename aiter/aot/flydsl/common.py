@@ -8,6 +8,7 @@ from __future__ import annotations
 import json
 import multiprocessing
 import os
+import re
 import shutil
 import tempfile
 import time
@@ -16,6 +17,7 @@ from contextlib import contextmanager
 from multiprocessing.connection import wait as wait_for_sentinels
 from typing import Any
 
+from aiter.jit.utils.build_targets import base_gfx_arch
 from aiter_worker_limits import configure_worker_subprocesses, get_worker_count_for
 
 _DEFAULT_KERNEL_TIMEOUT = 1200.0
@@ -82,7 +84,7 @@ def run_only_env() -> Iterator[None]:
     """Force FlyDSL run-only mode: load AOT artifacts, never JIT-compile.
 
     Any kernel without a usable AOT cache raises RuntimeError at the call
-    site (with manager_key/cache_key/cache_dir details) instead of silently
+    site (naming the missing artifact and its cache dir) instead of silently
     masking missing precompiled coverage.
     """
     with override_env("FLYDSL_RUNTIME_RUN_ONLY", "1"):
@@ -114,6 +116,51 @@ def aot_target_archs() -> set[str] | None:
     return {arch.strip() for arch in value.split(";") if arch.strip()}
 
 
+def resolve_target_arch(job_arch: str, targets: set[str] | None) -> str | None:
+    """Exact requested target arch in the same kernel family as ``job_arch``, or
+    ``None`` when no requested target shares its family.
+
+    ``gfx1250-strict`` (MI450 A0) and ``gfx1250`` (B0) are one source/kernel
+    family, so a ``gfx1250``-tuned row is selected for a ``gfx1250-strict`` build
+    and **compiled for the exact requested target** (producing the strict
+    ``0xeb`` code object, not ``gfx1250`` ``0x49``). ``targets`` is ``None``
+    (GPU_ARCHS unset/native) keeps ``job_arch`` as-is.
+    """
+    if not targets:
+        return job_arch
+    fam = base_gfx_arch(job_arch)
+    for t in sorted(targets):
+        if base_gfx_arch(t) == fam:
+            return t
+    return None
+
+
+def assert_targets_covered(
+    targets: set[str] | None, available_archs, matched_archs, label: str
+) -> None:
+    """Raise when a requested arch's kernel family exists in the tuned data but
+    produced no job -- the strict-AOT filter bug that silently emitted an empty
+    wheel while reporting success (``GPU_ARCHS=gfx1250-strict`` -> 0 artifacts,
+    "succeeded"). A family genuinely absent from the tables (the op has no
+    kernels for that arch) is fine and not an error.
+    """
+    if not targets:
+        return
+    avail_fams = {base_gfx_arch(a) for a in available_archs}
+    matched_fams = {base_gfx_arch(a) for a in matched_archs}
+    dropped = sorted(
+        t
+        for t in targets
+        if base_gfx_arch(t) in avail_fams and base_gfx_arch(t) not in matched_fams
+    )
+    if dropped:
+        raise RuntimeError(
+            f"[aiter] {label}: tuned rows exist for {dropped}'s kernel family but "
+            f"none were selected for the requested target; refusing to emit a "
+            f"partial wheel (strict-AOT filter bug)"
+        )
+
+
 def replay_env(arch: str, workers: int | None = None) -> dict[str, str]:
     """Environment of a process that replays the runtime for ``arch``. aiter
     fixes some arch-dependent values at import (e.g. ``dtypes.fp8``), so the
@@ -126,9 +173,11 @@ def replay_env(arch: str, workers: int | None = None) -> dict[str, str]:
     env.update(
         GPU_ARCHS=arch,
         AITER_AOT_REPLAY="1",
-        HIP_VISIBLE_DEVICES="-1",
-        ROCR_VISIBLE_DEVICES="-1",
-        CUDA_VISIBLE_DEVICES="-1",
+        # An empty list hides every GPU. "-1" would too, but ROCm 10's
+        # rocprofiler-sdk aborts any process it is loaded into on "-1".
+        HIP_VISIBLE_DEVICES="",
+        ROCR_VISIBLE_DEVICES="",
+        CUDA_VISIBLE_DEVICES="",
     )
     if workers is not None:
         env["AITER_MAX_JOBS"] = str(workers)
@@ -388,8 +437,126 @@ AOT_MODULES = (
     "aiter.aot.flydsl.gemm",
     "aiter.aot.flydsl.conv",
     "aiter.aot.flydsl.chunk_gdn_h",
+    "aiter.aot.flydsl.gdn_fused_prefill",
     "aiter.aot.flydsl.fmha_fp8",
+    "aiter.aot.flydsl.pa_decode_plan",
 )
+
+
+STRICT_ERRATA_TABLES = frozenset(
+    {"a8w8_bpreshuffle_tuned_gemm", "a4w4_mxscale_bpreshuffle_tuned_gemm"}
+)
+
+
+def is_strict_identity(arch: str) -> bool:
+    """True for a gfx1250-strict-family arch (not the plain gfx1250 base)."""
+    return base_gfx_arch(arch) != arch
+
+
+@contextmanager
+def fail_build_on_missing_target_feature():
+    """Fail an AOT build that dropped a matmul for a disabled target feature.
+
+    gfx1250-strict disables some WMMA features (F4, fp8 16x16x128) for A0 errata;
+    a kernel that needs one compiles to a hollow, compute-less object with rc 0
+    and the LLVM diagnostic 'requires target feature ...'. That line is written
+    to the real stderr fd by the C++ backend (a Python-level redirect misses it),
+    so this captures fd 2, tees it back, and raises if the marker appears --
+    refusing to ship a hollow wheel. An errata op reaching here was not gated off
+    the strict build (see STRICT_ERRATA_TABLES / the MoE mxfp4 skip)."""
+    import sys
+    import threading
+
+    if os.environ.get("AITER_AOT_FEATURE_GUARD") == "1":
+        # An enclosing build already captures fd 2 (this process or a parent,
+        # via the inherited env); a second capture would double-handle it.
+        yield
+        return
+
+    marker = b"requires target feature"
+    r_fd, w_fd = os.pipe()
+    real_err = os.dup(2)
+    hit = []
+
+    def pump():
+        buf = b""
+        while True:
+            try:
+                chunk = os.read(r_fd, 65536)
+            except OSError:
+                break
+            if not chunk:
+                break
+            os.write(real_err, chunk)
+            buf = (buf + chunk)[-(len(marker) + 4096) :]
+            if marker in buf:
+                hit.append(True)
+
+    t = threading.Thread(target=pump, daemon=True)
+    t.start()
+    os.environ["AITER_AOT_FEATURE_GUARD"] = "1"
+    sys.stderr.flush()
+    os.dup2(w_fd, 2)
+    os.close(w_fd)
+    try:
+        yield
+    finally:
+        os.environ.pop("AITER_AOT_FEATURE_GUARD", None)
+        sys.stderr.flush()
+        os.dup2(real_err, 2)
+        os.close(real_err)
+        t.join(timeout=10)
+        os.close(r_fd)
+    if hit:
+        raise AssertionError(
+            "[aiter] AOT build dropped a matmul for a missing target feature "
+            "('requires target feature' in the compiler output): a gfx1250-strict "
+            "build produced hollow, compute-less kernels. An errata op was not "
+            "gated off the strict build. Refusing to ship a hollow wheel."
+        )
+
+
+_STRICT_ERRATA_KERNEL_RE = re.compile(
+    r"@((?:gemm_a4w4|gemm_a8w8_ptpc|mxfp4_tdm_fp4)\w*)"
+)
+_ROCDL_CHIP_RE = re.compile(r'#rocdl\.target<[^>]*chip\s*=\s*"([^"]+)"')
+
+
+def assert_no_strict_errata_products(cache_dir: str) -> None:
+    """For a strict build, fail if the cache still holds an errata-family kernel.
+
+    A stale hollow object left by an earlier build survives in the persisted
+    FlyDSL cache, and the compile-time guard cannot see it (a cache hit recompiles
+    nothing and prints no diagnostic). Cache paths carry the launcher name and a
+    hash, not the kernel (ptpc shares launch_gemm_a8w8 with mx128, fp4 MoE shares
+    launch_gemm_a8w4_tdm with fp8), so read the kernels inside each object; and
+    judge only objects built for a strict target, so a mixed gfx1250 + strict
+    build keeps its legitimate gfx1250 ones."""
+    import glob
+    import pickle
+
+    targets = aot_target_archs()
+    if not targets or not any(is_strict_identity(t) for t in targets):
+        return
+    found: list[str] = []
+    for path in glob.glob(os.path.join(cache_dir, "*", "*.pkl")):
+        try:
+            with open(path, "rb") as fh:
+                ir = getattr(pickle.load(fh), "_ir_text", "") or ""
+        except Exception:  # noqa: BLE001, S112  not a readable FlyDSL object
+            continue
+        if not any(is_strict_identity(chip) for chip in _ROCDL_CHIP_RE.findall(ir)):
+            continue
+        match = _STRICT_ERRATA_KERNEL_RE.search(ir)
+        if match:
+            found.append(f"{os.path.basename(os.path.dirname(path))}:{match.group(1)}")
+    if found:
+        raise AssertionError(
+            f"[aiter] gfx1250-strict AOT cache holds {len(found)} errata-family "
+            "kernel object(s) that strict gates off -- likely stale hollow kernels "
+            "a cache hit left from an earlier build. Clear the FlyDSL cache before a "
+            f"strict wheel build. Offenders (first 3): {sorted(found)[:3]}"
+        )
 
 
 def run_aot(cache_dir: str) -> None:
@@ -404,16 +571,21 @@ def run_aot(cache_dir: str) -> None:
     from .moe import run as run_moe_replay
     from .replay import run_default
 
-    errors = []
-    moe_failed_archs = run_moe_replay([p for p in MOE_CSVS if os.path.isfile(p)])
-    if moe_failed_archs:
-        errors.append(f"FlyDSL MOE replay failed for {moe_failed_archs} arch(es)")
-    if run_mega_moe_replay():
-        errors.append("FlyDSL MEGA_MOE replay failed")
-    for module_name in AOT_MODULES:
-        failed_archs = run_default(module_name)
-        if failed_archs:
-            label = module_name.rsplit(".", 1)[-1].upper()
-            errors.append(f"FlyDSL {label} replay failed for {failed_archs} arch(es)")
-    if errors:
-        raise AssertionError(f"[aiter] FlyDSL AOT failures: {'; '.join(errors)}")
+    with fail_build_on_missing_target_feature():
+        errors = []
+        moe_failed_archs = run_moe_replay([p for p in MOE_CSVS if os.path.isfile(p)])
+        if moe_failed_archs:
+            errors.append(f"FlyDSL MOE replay failed for {moe_failed_archs} arch(es)")
+        if run_mega_moe_replay():
+            errors.append("FlyDSL MEGA_MOE replay failed")
+        for module_name in AOT_MODULES:
+            failed_archs = run_default(module_name)
+            if failed_archs:
+                label = module_name.rsplit(".", 1)[-1].upper()
+                errors.append(
+                    f"FlyDSL {label} replay failed for {failed_archs} arch(es)"
+                )
+        if errors:
+            raise AssertionError(f"[aiter] FlyDSL AOT failures: {'; '.join(errors)}")
+
+    assert_no_strict_errata_products(cache_dir)

@@ -10,6 +10,7 @@ from aiter.ops.triton._triton_kernels.gemm.fused.fused_gemm_a8w8_blockscale_spli
     _fused_gemm_a8w8_blockscale_split_cat_reduce,
     _get_config,
 )
+from aiter.ops.triton.utils.gemm_config_utils import compute_splitk_params
 from aiter.ops.triton.utils.logger import AiterTritonLogger
 
 _LOGGER = AiterTritonLogger()
@@ -81,9 +82,8 @@ def fused_gemm_a8w8_blockscale_split_cat(
     c1 = torch.empty((M, D, S1 + S3), dtype=dtype, device=x.device)
     c2 = torch.empty((M, D, S2), dtype=dtype, device=x.device)
 
-    config["SPLITK_BLOCK_SIZE"] = triton.cdiv(
-        K, config["NUM_KSPLIT"]
-    )  # How big each split_k partition is
+    compute_splitk_params(config, K)
+
     if config["NUM_KSPLIT"] > 1:
         c_pp = torch.empty(
             (config["NUM_KSPLIT"], M, N),
@@ -92,15 +92,6 @@ def fused_gemm_a8w8_blockscale_split_cat(
         )
     else:
         c_pp = None
-
-    # If block size is greater than split k size, shrink the block size
-    if config["BLOCK_SIZE_K"] > config["SPLITK_BLOCK_SIZE"]:
-        config["BLOCK_SIZE_K"] = triton.next_power_of_2(config["SPLITK_BLOCK_SIZE"])
-        if config["BLOCK_SIZE_K"] > config["SPLITK_BLOCK_SIZE"]:
-            config["BLOCK_SIZE_K"] = config["BLOCK_SIZE_K"] // 4
-    config["BLOCK_SIZE_K"] = max(
-        config["BLOCK_SIZE_K"], 16
-    )  # minimum block size is 16 for perf
 
     # Scale block sizes
     # TODO: need a better way to pass scale block sizes around
@@ -277,9 +268,8 @@ def fused_gemm_a8w8_blockscale_preshuffle_split_cat(
     c1 = torch.empty((M, D, S1 + S3), dtype=dtype, device=x.device)
     c2 = torch.empty((M, D, S2), dtype=dtype, device=x.device)
 
-    config["SPLITK_BLOCK_SIZE"] = triton.cdiv(
-        K, config["NUM_KSPLIT"]
-    )  # How big each split_k partition is
+    compute_splitk_params(config, K)
+
     if config["NUM_KSPLIT"] > 1:
         c_pp = torch.empty(
             (config["NUM_KSPLIT"], M, N),
@@ -288,15 +278,6 @@ def fused_gemm_a8w8_blockscale_preshuffle_split_cat(
         )
     else:
         c_pp = None
-
-    # If block size is greater than split k size, shrink the block size
-    if config["BLOCK_SIZE_K"] > config["SPLITK_BLOCK_SIZE"]:
-        config["BLOCK_SIZE_K"] = triton.next_power_of_2(config["SPLITK_BLOCK_SIZE"])
-        if config["BLOCK_SIZE_K"] > config["SPLITK_BLOCK_SIZE"]:
-            config["BLOCK_SIZE_K"] = config["BLOCK_SIZE_K"] // 4
-    config["BLOCK_SIZE_K"] = max(
-        config["BLOCK_SIZE_K"], 16
-    )  # minimum block size is 16 for perf
 
     # Scale block sizes
     # TODO: need a better way to pass scale block sizes around

@@ -1,5 +1,5 @@
 #!/bin/bash
-# Builds hsa/$ARCH/mla_opus/opus_<name>.co from <name>.cu (gfx950: here, gfx1250: gfx1250/; every .cu
+# Builds hsa/$ARCH/mla_opus/opus_<name>.co from $ARCH/<name>.cu (every .cu
 # if no name is given) with the amdgpu-named-reg-pin-std LLVM (https://github.com/yuyzhang512/llvm-project),
 # built with
 #   ninja clang lld clang-offload-bundler llvm-objcopy
@@ -15,7 +15,7 @@ AITER="$(cd "$OPUS/../../../.." && pwd)"
 ARCH="${ARCH:-gfx950}"
 case "$ARCH" in
     gfx950)
-        SRC_DIR="$OPUS"
+        SRC_DIR="$OPUS/gfx950"
         ARCH_FLAGS="-ffast-math -fgpu-flush-denormals-to-zero -fno-offload-uniform-block
             -mllvm --amdgpu-kernarg-preload-count=32 -mllvm --lsr-drop-solution=1
             -mllvm -amdgpu-early-inline-all=true -mllvm -amdgpu-function-calls=false

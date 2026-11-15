@@ -21,6 +21,7 @@ SHAPES = [
     (256, 3072, 768, 8),  # minimax_b (H=3072)
     (512, 4096, 256, 10),  # qwen35_397b (H=4096, TOPK=10)
     (48, 7168, 3072, 6),  # dsv4_ep8
+    (24, 7168, 3072, 6),  # dsv4_ep16
     (384, 7168, 1536, 6),  # dsv4_tp2
     (384, 7168, 768, 6),  # dsv4_tp4
     (384, 7168, 512, 6),  # dsv4_tp6 (and dsv4_tp8: INTER 384->512 padded)
@@ -32,6 +33,7 @@ SHAPES = [
     (32, 5120, 2304, 2),  # dsv4.1 DSpark EP
     (32, 5120, 2304, 3),  # dsv4.1 DSpark EP
     (256, 4096, 256, 6),  # dsv4_lite (H=4096)
+    (256, 4096, 2048, 6),  # dsv4_lite TP=1; reuses existing aux keys
     (385, 7168, 1536, 7),  # dsv4 NE=385 TOPK=7 (tp2)
     (385, 7168, 768, 7),  # dsv4 NE=385 TOPK=7 (tp4)
     (385, 7168, 512, 7),  # dsv4 NE=385 TOPK=7 (tp6/tp8)
@@ -40,6 +42,7 @@ SHAPES = [
     (257, 6144, 512, 9),  # GLM-5.2 TP=4
     (257, 6144, 256, 9),  # GLM-5.2 TP=8
     (896, 3584, 512, 16),  # Kimi-K3 TP=1/2 (INTER 384 pads to 512)
+    (896, 3584, 3072, 16),  # Kimi-K3 A8W4 TP=1; reuses existing aux keys
     (56, 3584, 3072, 16),  # Kimi-K3 E56
     (64, 7168, 2048, 8),  # DSV3 E64
     (128, 3072, 512, 4),  # GPT-OSS TP=6
@@ -57,6 +60,7 @@ SHAPES = [
     (384, 7168, 256, 8),  # Kimi-K2 TP=8
     (512, 4096, 512, 10),  # Qwen3.5 TP=1
     (513, 4096, 512, 11),  # Qwen3.5 shared-expert variant
+    (513, 4096, 256, 11),  # Qwen3.5 TP=4 (shared-expert variant)
     (513, 8192, 256, 11),  # Qwen3.8 TP=8 (shared-expert variant)
     (513, 2560, 768, 11),  # Qwen3.8-Flash-Next TP=1 (INTER 640 pads to 768)
     (512, 2048, 512, 10),  # Qwen3-Coder-Next TP=1

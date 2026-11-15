@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
+import itertools
 import os
 from typing import Any, ClassVar
 
@@ -125,6 +126,65 @@ def generate_data(m, n, k, seed, device="cuda", dtype=dtypes.bf16):
     }
 
 
+def preshuffle_candidates(M, N, K, backends, split_k):
+    """Reuse the FlyDSL catalog; sweep Triton tiles/splits with replayable names."""
+    if M < 32 or N % 16 or K % 256:
+        return []
+    names = []
+    if "flydsl" in backends:
+        from aiter.ops.flydsl.gemm_tune.flydsl_gemm_mxscale_preshuffle_common import (
+            candidates_for,
+        )
+
+        names.extend(
+            ki.name
+            for _, ki in candidates_for(
+                "fp4",
+                "fp4",
+                M,
+                N,
+                K,
+                a_scale_block="1x32",
+                b_scale_block="1x32",
+                a_scale_layout="mfma_tile",
+                b_scale_layout="mfma_tile",
+            )
+            if split_k or ki.split_k == 1
+        )
+    if "triton" in backends:
+        from aiter.ops.triton.gemm.basic.gemm_afp4wfp4 import _get_config
+
+        config, _ = _get_config(M, N, K // 2, shuffle=True)
+        if not split_k:
+            config = dict(config, NUM_KSPLIT=1)
+        cache = (config["cache_modifier"] or "none").lstrip(".")
+        names.append(
+            f"triton_preshuffle_bm{config['BLOCK_SIZE_M']}_bn{config['BLOCK_SIZE_N']}"
+            f"_bk{config['BLOCK_SIZE_K']}_ks{config['NUM_KSPLIT']}"
+            f"_w{config['num_warps']}_wpe{config['waves_per_eu']}"
+            f"_s{config['num_stages']}_g{config['GROUP_SIZE_M']}"
+            f"_mi{config['matrix_instr_nonkdim']}_cm{cache}"
+        )
+        splits = (1, 2, 4, 7, 8, 14, 16, 28, 32) if split_k else (1,)
+        for tm, tn, sk, stages in itertools.product(
+            (32, 64), (64, 128), splits, (2, 3)
+        ):
+            if tm <= M:
+                names.append(
+                    f"triton_preshuffle_bm{tm}_bn{tn}_bk256_ks{sk}_w4_wpe2_s{stages}_g1_mi16_cmcg"
+                )
+    return names
+
+
+def run_gemm_preshuffle(x, w, x_scale, w_scale, out, kernel_name):
+    from aiter.ops.gemm_op_a4w4 import _gemm_a4w4_preshuffle
+
+    result = _gemm_a4w4_preshuffle(x, w, x_scale, w_scale, out, kernel_name)
+    if result is None:
+        raise ValueError(f"Unlaunchable A4W4 tune candidate: {kernel_name}")
+    return result
+
+
 class GemmA4W4BlockScaleTuner(GemmCommonTuner):
     ARG_DEFAULTS: ClassVar[dict[str, Any]] = {
         **GemmCommonTuner.ARG_DEFAULTS,
@@ -141,7 +201,11 @@ class GemmA4W4BlockScaleTuner(GemmCommonTuner):
             del get_GEMM_config.gemm_dict
 
     def _setup_specific_arguments(self):
-        pass
+        self.parser.add_argument(
+            "--backends",
+            default="ck,asm",
+            help="Comma-separated candidates: ck,asm,triton,flydsl (gfx950 preshuffle)",
+        )
 
     def run_config(self, args):
         from aiter.ops.gemm_op_a4w4 import gemm_a4w4
@@ -256,6 +320,9 @@ class GemmA4W4BlockScaleTuner(GemmCommonTuner):
         ]
         ref_keys = ["x", "w", "x_scales", "w_scales"]
         seed = 0
+        backends = set(args.backends.split(","))
+        if not backends or not backends <= {"ck", "asm", "triton", "flydsl"}:
+            raise ValueError(f"Unknown --backends: {args.backends}")
         for shape_idx in range(len(untunedf)):
             row = untunedf.iloc[shape_idx]
             # Native int keys so post_process grouping matches single-shape runs (no np.int64 vs int split).
@@ -263,7 +330,7 @@ class GemmA4W4BlockScaleTuner(GemmCommonTuner):
 
             total_kernel_nums = 0
 
-            for kernel_idx in range(ck_kernels_num):
+            for kernel_idx in range(ck_kernels_num) if "ck" in backends else ():
                 kernel = kernels_list[kernel_idx]
                 maxsplitK = (
                     aiter.compute_gemm_SplitK(
@@ -314,7 +381,7 @@ class GemmA4W4BlockScaleTuner(GemmCommonTuner):
             asm_kernel_list_csv = f"{get_asm_dir()}/f4gemm/f4gemm_bf16_per1x32Fp4.csv"
             asm_kernels = self.get_asm_kernels(asm_kernel_list_csv)
             asm_tiles = [key for key in asm_kernels]
-            for key in asm_tiles:
+            for key in asm_tiles if "asm" in backends else ():
                 tile_m, tile_n, splitk = key
                 maxsplitK = (
                     aiter.compute_gemm_SplitK(M, N, K, tile_m, tile_n, 256)
@@ -364,6 +431,30 @@ class GemmA4W4BlockScaleTuner(GemmCommonTuner):
                     asm_kernels_id = asm_kernels_id + 1
 
                     total_kernel_nums = total_kernel_nums + 1
+            for candidate_id, name in enumerate(
+                preshuffle_candidates(M, N, K, backends, useSplitK)
+            ):
+                info = ((gfx, cu_num, M, N, K), 100000 + candidate_id, 0, name)
+                task.append(
+                    (
+                        info,
+                        generate_data,
+                        (M, N, K, seed),
+                        run_gemm_preshuffle,
+                        (gemm_ck_keys, name),
+                        {"num_warmup": 10, "num_iters": 101},
+                        run_torch,
+                        (ref_keys, dtypes.bf16),
+                        {},
+                        None,
+                        1e-2,
+                        0.01,
+                        None,
+                        None,
+                        ("out_ck",),
+                    )
+                )
+                total_kernel_nums += 1
             tasks_in_data.append((total_kernel_nums, ()))
 
         ret = []
