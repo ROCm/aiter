@@ -238,7 +238,8 @@ SUITE_OPS = {
             "op": "mega_moe",
             "shape": (
                 "EP4 over 4 GPUs: 384 experts, top-6, hidden 5120, inter 2304, "
-                "40 layers. base+Mega and the recipe's S1F+Mega on an fp4 wire."
+                "40 layers. The recipe's setup: S1F stage 1 + Mega combine on an "
+                "fp4 dispatch wire."
             ),
             "dtype": "a4w4_mxfp4",
             "ut": "op_tests/multigpu_tests/bench_mega_moe.py under torchrun x4",
@@ -273,7 +274,10 @@ SUITE_OPS = {
             "op": "score_qk_fp4",
             "shape": (
                 "32 index heads, dim 128. Full layers (ratio 2) and candidate "
-                "layers; prefill 16384 rows, decode batch 1024 at MTP 1 and 6."
+                "layers, one table a mode: prefill 16384 rows as 1 or 2 sequences "
+                "at 16K..128K contexts; decode batch 64 and 256 at MTP 1 and 6, "
+                "16K/64K/128K contexts. Candidate rows that re-read their pages "
+                "from L2 (prefill, MTP 6) show TFLOPS only."
             ),
             "dtype": "MXFP4 Q and K (OPUS), fp32 logits",
             "ut": "op_tests/test_pa_mqa_logits_mxfp4_opus.py (with ROCm/aiter#7925)",

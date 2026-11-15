@@ -45,7 +45,7 @@ Run from the aiter repo root so `op_tests/` siblings import cleanly:
     # DeepSeek-V4.1-Flash operators, one rank of its DEP4 recipe (EP4 + DP attention).
     python op_tests/bench_gfx1250_combo.py --dsv41                # all DSv4.1 ops
     python op_tests/bench_gfx1250_combo.py --dsv41 --ops moe      # grouped MoE FC1/FC2 (96 experts, a4w4)
-    python op_tests/bench_gfx1250_combo.py --dsv41 --ops mega_moe # Mega MoE, default and recipe env, 4 GPUs
+    python op_tests/bench_gfx1250_combo.py --dsv41 --ops mega_moe # Mega MoE, recipe env (S1F, fp4 wire), 4 GPUs
     python op_tests/bench_gfx1250_combo.py --dsv41 --ops mla_v4_decode   # sparse MLA, H64 bf16 + v41_fp4
     python op_tests/bench_gfx1250_combo.py --dsv41 --ops mla_v4_prefill  # same, prefill
     python op_tests/bench_gfx1250_combo.py --dsv41 --ops score_qk_fp4  # MXFP4 paged MQA logits (OPUS):
@@ -1893,15 +1893,15 @@ def run_mega_moe(args):
     # 1 -> fp8); the weights are mxfp4 either way and -q only picks their layout,
     # so the env var and the quant key have to move together.
     # base+Mega: stage2_fused=both runs the plain fused_moe + mori combine and the
-    # gemm2-fused Mega combine. The V4.1 recipe also fuses stage 1 (S1F) on an
-    # fp4 dispatch wire.
+    # gemm2-fused Mega combine. V4.1 runs only its recipe, which also fuses stage
+    # 1 (S1F) on an fp4 dispatch wire: with stage 1 unfused, bench_mega_moe.py
+    # does not finish at hidden 5120 / inter 2304.
     base_mega = ("base+Mega", ("--stage2_fused", "both"), {})
     if args.suite == "dsv41":
         shape = ("5120", "2304", "40")
         tokens_list = _DSV41_MOE_TOKENS
         quants = (("a4w4_mxfp4", "0"),)
         configs = (
-            base_mega,
             (
                 "recipe S1F+Mega fp4 wire",
                 (
