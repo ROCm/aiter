@@ -31,7 +31,6 @@ K and V elements are the exact products e2m1 * e4m3 scale, which f16 holds exact
 
 import flydsl.expr as fx
 from flydsl._mlir import ir as _ir
-from flydsl._mlir.dialects import arith as _arith
 from flydsl._mlir.dialects import llvm as _llvm
 from flydsl.expr.typing import T
 from flydsl.expr.typing import Vector as Vec
@@ -89,23 +88,24 @@ def as_f32(x):
     return fx.Int32(x).bitcast(fx.Float32)
 
 
-def _nnan():
-    return _ir.Attribute.parse("#arith.fastmath<nnan>")
-
-
 def maxf_nn(a, b):
     """v_max_f32 with nnan (without it LLVM canonicalizes both inputs first)."""
-    return fx.Float32(
-        _arith.MaxNumFOp(fx.as_ir_value(a), fx.as_ir_value(b), fastmath=_nnan()).result
+    return fx.arith.maxnumf(
+        fx.Float32(a), fx.Float32(b), fastmath=fx.arith.FastMathFlags.nnan
     )
 
 
 def exp2(x):
-    """v_exp_f32 without the denormal range reduction."""
-    return fx.Float32(fx.rocdl.exp2(fx.Float32.ir_type, fx.Float32(x).ir_value()))
+    """v_exp_f32 without the denormal range reduction (``afn``)."""
+    return fx.math.exp2(fx.Float32(x), fastmath=fx.arith.FastMathFlags.afn)
 
 
 def _permlane_swap(op, a, b):
+    # Raw rocdl op + llvm.extractvalue: FlyDSL 0.5.0 has no typed permlane*_swap, and the
+    # typed fx.gpu.shuffle_xor (xor 32, then 16) compiles to more code: 22 more instructions
+    # in the decode kernel (1249 -> 1271 unsplit: v_cmp_eq / v_cndmask / v_mov), same bits;
+    # timing on the op-test perf shapes was 1.000 and 1.015 of this version (geomean, two
+    # interleaved runs of 5 and 7), so it is not faster either.
     pair_ty = _ir.Type.parse("!llvm.struct<(i32, i32)>")
     res = op(pair_ty, fx.as_ir_value(a), fx.as_ir_value(b), False, False)
     return (
@@ -132,11 +132,11 @@ def pk_f16(a, b):
 
 
 def pk_bf16(a, b):
-    """Two fp32 -> one dword of two bf16 (RNE), ``a`` low."""
-    return fx.Int32(
-        fx.rocdl.cvt_pk_bf16_f32(
-            fx.as_ir_value(fx.Float32(a)), fx.as_ir_value(fx.Float32(b))
-        )
+    """Two fp32 -> one dword of two bf16 (RNE), ``a`` low (v_cvt_pk_bf16_f32)."""
+    return (
+        Vec.from_elements([fx.Float32(a), fx.Float32(b)], fx.Float32)
+        .to(fx.BFloat16)
+        .bitcast(fx.Int32)[0]
     )
 
 
@@ -147,6 +147,9 @@ def bf16x8_to_f16(v):
 
 def cvt_fp4x2_f16(word, sel):
     """The two e2m1 codes of byte ``sel`` of ``word`` as two f16 (exact)."""
+    # Raw rocdl op: FlyDSL 0.5.0 has no working typed e2m1 -> f16 conversion;
+    # Vec.bitcast(fx.Float4E2M1FN).to(fx.Float16) fails to compile ("LLVM Translation
+    # failed for operation: builtin.unrealized_conversion_cast", then a segfault).
     return Vec(
         fx.rocdl.cvt_scalef32_pk_f16_fp4(
             Vec.make_type(2, fx.Float16),
@@ -159,6 +162,8 @@ def cvt_fp4x2_f16(word, sel):
 
 def cvt_fp8x2_f16(word, hi):
     """E4M3 bytes 0, 1 (``hi``: 2, 3) of ``word`` as two f16 (exact)."""
+    # Raw rocdl op, for the same reason as cvt_fp4x2_f16: the typed
+    # Vec.bitcast(fx.Float8E4M3FN).to(fx.Float16) fails with the same LLVM translation error.
     return Vec(
         fx.rocdl.cvt_scalef32_pk_f16_fp8(
             Vec.make_type(2, fx.Float16),
@@ -170,11 +175,13 @@ def cvt_fp8x2_f16(word, hi):
 
 
 def mfma_f16(a4, b4, acc):
-    """v_mfma_f32_16x16x32_f16 on 4-dword operands."""
-    a = Vec(a4).bitcast(fx.Float16)
-    b = Vec(b4).bitcast(fx.Float16)
-    return Vec(
-        fx.rocdl.mfma_f32_16x16x32_f16(
-            Vec.make_type(4, fx.Float32), [a, b, acc, 0, 0, 0]
-        )
-    )
+    """v_mfma_f32_16x16x32_f16 on 4-dword operands: ``acc + A B`` with A = ``a4``, B = ``b4``."""
+    atom = fx.make_mma_atom(fx.rocdl.MFMA(16, 16, 32, fx.Float16))
+    a = fx.make_rmem_tensor(fx.make_layout(8, 1), fx.Float16)
+    a.store(Vec(a4).bitcast(fx.Float16))
+    b = fx.make_rmem_tensor(fx.make_layout(8, 1), fx.Float16)
+    b.store(Vec(b4).bitcast(fx.Float16))
+    c = fx.make_rmem_tensor(fx.make_layout(4, 1), fx.Float32)
+    c.store(acc)
+    fx.gemm(atom, c, a, b, c)
+    return Vec(c.load())

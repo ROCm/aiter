@@ -210,6 +210,9 @@ def compile_decode(
         smem = fx.SharedAllocator().allocate(Shared).peek()
         tx = fx.thread_idx.x
         lane = tx % 64
+        # The wave-uniform / SGPR primitives of this kernel are raw rocdl ops: FlyDSL 0.5.0
+        # has no typed spelling (fx.gpu offers only the shuffle family, whose result is a
+        # VGPR): readfirstlane (here), ballot, readlane, sched_barrier and s_waitcnt.
         w = fx.Int32(fx.rocdl.readfirstlane(T.i32, tx // 64))
         n, g = lane % 16, lane // 16
         topk = global_i32_ptr(arg_topk)
