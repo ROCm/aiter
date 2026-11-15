@@ -148,6 +148,21 @@ def _is_triton_installed():
     return None
 
 
+def _triton_satisfied():
+    from importlib.metadata import version as pkg_version
+
+    from packaging.version import Version
+
+    for spec in [TRITON_VERSION, TRITON_KERNELS_VERSION]:
+        name, ver = spec.split("==")
+        try:
+            if Version(pkg_version(name)) != Version(ver):
+                return False
+        except Exception:  # noqa: BLE001
+            return False
+    return True
+
+
 _triton_info = _is_triton_installed()
 if _torch_version_below("2.9.1"):
     print(
@@ -162,31 +177,24 @@ elif AITER_USE_SYSTEM_TRITON and _triton_info:
         f"[aiter] AITER_USE_SYSTEM_TRITON=1, keeping {_triton_info[0]}=={_triton_info[1]}."
     )
 elif not AITER_USE_SYSTEM_TRITON and not IS_WINDOWS:
-    if _triton_info:
-        print(
-            f"[aiter] Replacing existing {_triton_info[0]}=={_triton_info[1]}"
-            " with aiter-compatible triton"
-            " (set AITER_USE_SYSTEM_TRITON=1 to keep your triton)"
-        )
-    _uninstall_triton_conflicts()
-    for pkg_spec in [TRITON_VERSION, TRITON_KERNELS_VERSION]:
-        pkg_name = pkg_spec.split("==")[0]
-        pkg_ver = pkg_spec.split("==")[1]
-        try:
-            from importlib.metadata import version as pkg_version
+    _needs_triton_install = not _triton_satisfied()
 
-            from packaging.version import Version
-
-            if Version(pkg_version(pkg_name)) != Version(pkg_ver):
-                raise ImportError("version mismatch")
-        except Exception:  # noqa: BLE001
+    if _needs_triton_install:
+        if _triton_info:
+            print(
+                f"[aiter] Replacing existing {_triton_info[0]}=={_triton_info[1]}"
+                " with aiter-compatible triton"
+                " (set AITER_USE_SYSTEM_TRITON=1 to keep your triton)"
+            )
+        _uninstall_triton_conflicts()
+        for pkg_spec in [TRITON_VERSION, TRITON_KERNELS_VERSION]:
             try:
                 subprocess.check_call(
                     [sys.executable, "-m", "pip", "install", pkg_spec]
                 )
             except Exception:  # noqa: BLE001
                 print(
-                    f"[aiter] Skipping {pkg_name} install (will be handled by install_requires)"
+                    f"[aiter] Skipping {pkg_spec} install (will be handled by install_requires)"
                 )
 
 

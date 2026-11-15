@@ -185,7 +185,7 @@ jobs:
           RUN bash /aiter/.github/scripts/flash_attention/install.sh /aiter /flash-attention
 
           # Verify aiter is installed from PR branch
-          RUN pip show flash-attn && pip show amd-aiter && pip show triton && \
+          RUN pip show flash-attn && pip show amd-aiter && pip show amd-triton && \
               python -c "from importlib.metadata import distribution; d = distribution('amd-aiter'); loc = d.read_text('direct_url.json'); assert '/aiter' in loc, f'aiter not from PR branch: {loc}'"
 
           WORKDIR /flash-attention
@@ -306,7 +306,7 @@ jobs:
 
           RUN pip uninstall -y amd-aiter && pip install --no-build-isolation -e /aiter
 
-          RUN pip show flash-attn-3 && pip show amd-aiter && pip show triton && \
+          RUN pip show flash-attn-3 && pip show amd-aiter && pip show amd-triton && \
               python -c "from importlib.metadata import distribution; d = distribution('amd-aiter'); loc = d.read_text('direct_url.json'); assert '/aiter' in loc, f'aiter not from PR branch: {loc}'"
 
           WORKDIR /flash-attention

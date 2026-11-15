@@ -1,7 +1,3 @@
-# Triton is installed from PyPI as amd-triton.
-amd-triton==3.9.0.dev20261110
-amd-triton-kernels==1.0.0.dev20261031
-
 # Build deps (needed for --no-build-isolation editable install).
 setuptools>=45
 setuptools_scm[toml]>=6.2
@@ -11,6 +7,10 @@ ninja==1.11.1.4
 psutil
 packaging
 flydsl==0.5.0
+
+# Triton is installed from PyPI as amd-triton.
+amd-triton==3.9.0.dev20261110
+amd-triton-kernels==1.0.0.dev20261031
 
 # Test deps.
 pandas==2.2.3
