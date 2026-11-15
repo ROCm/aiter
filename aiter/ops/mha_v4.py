@@ -2752,22 +2752,38 @@ def mha_v4_sol(
     )
     q_scale_mode, k_scale_mode, v_scale_mode = recipe.scale_modes
     v_pack = recipe.v_pack
+    operands = mha_v4_operands(
+        q_format,
+        k_format,
+        v_format,
+        q_scale_mode,
+        k_scale_mode,
+        v_scale_mode,
+        v_pack,
+    )
     tile_m, tile_n = (
-        mha_v4_block_tile(
-            mha_v4_operands(
-                q_format,
-                k_format,
-                v_format,
-                q_scale_mode,
-                k_scale_mode,
-                v_scale_mode,
-                v_pack,
-            ),
-            MHA_V4_SOL_MODE,
-        )
+        mha_v4_block_tile(operands, MHA_V4_SOL_MODE)
         if block_tile is None
         else block_tile
     )
+    # Before any quantizer. MX quantization aborts on an arch with no mode-2 row
+    # (the pybind path leaves g_aiter_can_throw unset), so mha_v4_packed's
+    # NotImplementedError would never surface.
+    if (
+        tile_n <= 0
+        or mha_v4_kv_tile_for_q_tile(tile_m, operands, MHA_V4_SOL_MODE) != tile_n
+    ):
+        if not mha_v4_block_tiles(operands, MHA_V4_SOL_MODE):
+            raise NotImplementedError(
+                f"Sol-Attn MHA v4 has no {get_gfx()} row for "
+                f"Q={q_format.name} K={k_format.name} V={v_format.name}"
+            )
+        raise ValueError(
+            f"Sol-Attn MHA v4 has no {tile_m}x{tile_n} kernel on this GPU for "
+            f"q={q_format.name} k={k_format.name} v={v_format.name}; those operands have "
+            f"{mha_v4_block_tiles(operands, MHA_V4_SOL_MODE)} and the GPU has "
+            f"{mha_v4_block_tiles_in_any_precision(MHA_V4_SOL_MODE)} in some precision"
+        )
 
     # K smoothing as in mha_v4(). The shift moves every score of a query row by the same q @ k_mean,
     # pooled columns included, since a block mean of k - k_mean is the block mean minus k_mean; and
