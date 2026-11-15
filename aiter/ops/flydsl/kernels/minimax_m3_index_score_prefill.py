@@ -42,7 +42,8 @@ two scale bytes, through a per-CTA LDS table of e4m3_rn_satfinite(mag * scale)) 
 32 e4m3 bytes in natural element order, so the page the MFMAs read is exactly an fp8
 page of K = e4m3_rn_satfinite(e2m1 * scale). One dequant per page per thread,
 amortised over every query row of the tile, instead of one per wave as in decode.
-That is `k_round="e4m3"` (the default), bit-identical to vLLM's NVFP4 scorer.
+That is `k_round="e4m3"` (the default): K is `e2m1 * scale` rounded to e4m3 (RNE,
+saturating at 448), the product the op test's torch oracle scores.
 `k_round="exact"` keeps K = e2m1 * scale unrounded: e2m1 * e4m3 scale is exact in f16
 (and so is the e4m3 Q), so the page is widened to f16 in LDS (32 KB; one convert and
 one packed multiply per element pair, no table) and scored on the 16x16x32 f16 MFMA,
@@ -395,7 +396,7 @@ def build_prefill_score(g, k_fp4=False, q_fp8=False, nvfp4=None):
 
     `nvfp4` ("e4m3" | "exact") reads an NVFP4 cache (two views, e4m3 scale per 16
     elements) but with `k_fp4` False: "e4m3" widens the page to e4m3 on its way
-    into LDS and everything after is the fp8 path; "exact" widens it to bf16 and
+    into LDS and everything after is the fp8 path; "exact" widens it to f16 and
     scores it on the 16x16x32 f16 MFMA (`EXACT`).
     """
     if nvfp4 is not None and (k_fp4 or nvfp4 not in NVFP4_ROUNDINGS):
@@ -774,8 +775,8 @@ def build_prefill_score(g, k_fp4=False, q_fp8=False, nvfp4=None):
                     # K is widened in the order `fp4_dword_to_e4m3` emits -- each 8
                     # elements as evens then odds -- so Q takes the same order. The
                     # dot sums over k, so any order both operands share is the same
-                    # score up to accumulation; this is vLLM's, which is what it must
-                    # match bit for bit.
+                    # score up to accumulation; Q takes K's order, and the op test's
+                    # exact-sum cases pin it to the oracle bit for bit.
                     a, b = words
                     words = [
                         fx.Int32(fx.rocdl.perm_b32(b, a, fx.Int32(0x06040200))),
@@ -1180,10 +1181,11 @@ def build_prefill_score(g, k_fp4=False, q_fp8=False, nvfp4=None):
             def _k32_chunk(st, i):
                 """16 B chunk of the row that k-step `st`, half `i` of this lane reads on
                 the 32x32x64 shape. aiter's partition is elements 64*st + 32*h32 (the
-                two half-waves split a 64-wide step); NVFP4 takes vLLM's, 64*h32 +
-                32*st, because which elements one MFMA sums together changes the fp32
-                rounding of the score, and this is the grouping the vLLM NVFP4 scorer
-                (the reference for this cache) uses."""
+                two half-waves split a 64-wide step); NVFP4 takes 64*h32 + 32*st.
+                Which elements one MFMA sums together changes the fp32 rounding of
+                the score; the op test compares this grouping with aiter's fp8
+                scorer to a few fp32 ulps (`check_prefill_nvfp4_matches_aiter`) and
+                with the torch oracle bit for bit on exact-sum data."""
                 if const_expr(nvfp4):
                     return h32 * 4 + fx.Int32(2 * st + i)
                 return fx.Int32(4 * st) + h32 * 2 + fx.Int32(i)
@@ -1561,7 +1563,7 @@ def build_prefill_score(g, k_fp4=False, q_fp8=False, nvfp4=None):
                 if const_expr(EXACT):
                     # Page rows are 256 B of f16 (16 chunks, XOR-swizzled by the row's
                     # low bits); lane (g, u) reads chunk 4s + g of token 16*tt + u at
-                    # k-step s, which is the 8 features 32s + 8g.. -- 16x16x32 bf16 MFMA,
+                    # k-step s, which is the 8 features 32s + 8g.. -- 16x16x32 f16 MFMA,
                     # four chained k-steps per (tok_tile, tile).
                     _off_bf = [
                         (u * fx.Int32(16) + ((fx.Int32(4 * s) + g) ^ (u & fx.Int32(7))))
@@ -2614,8 +2616,8 @@ def score_prefill_flydsl_nvfp4(
     not 0x7F; no per-tensor scale), each view with its own page stride.
 
     `idx_q` is bf16 or e4m3; as in every prefill scorer here a bf16 Q is rounded to e4m3
-    first. `k_round="e4m3"` (the default) scores K = e4m3_rn_satfinite(e2m1 * scale), as
-    the vLLM nvfp4 indexer does, on the fp8 MFMA, bit-identical to vLLM's scorer.
+    first. `k_round="e4m3"` (the default) scores K = e4m3_rn_satfinite(e2m1 * scale)
+    on the fp8 MFMA.
     `"exact"` scores K = e2m1 * scale unrounded, on the f16 MFMA (K is widened to f16
     once per page into LDS; e4m3 Q and the product are both exact in f16). Layout, work
     and contract as in
