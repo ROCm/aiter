@@ -129,6 +129,7 @@ _DEFAULT_SCALE_INIT = "constant"
 # and where rank 0 of the profiling pass left its kernel tables.
 _PASS_ENV = "_BENCH_MEGA_MOE_PASS"
 _PROFILE_FILE_ENV = "_BENCH_MEGA_MOE_PROFILE_FILE"
+_PROF_FLUSH_S = float(os.environ.get("BENCH_MEGA_MOE_PROF_FLUSH_S", "1.0"))
 
 
 def _import_mori_comm():
@@ -868,6 +869,9 @@ class DeviceMoEPipeline:
             for _ in range(prof_replays):
                 self.graph.replay()
             torch.cuda.synchronize()
+            # Kineto's roctracer backend segfaults in processActivities when
+            # the trace stops while its buffer thread still delivers records.
+            time.sleep(_PROF_FLUSH_S)
         self.comm.barrier()
         self._prof = prof
         return sum(_event_device_us(e) for e in prof.key_averages())
