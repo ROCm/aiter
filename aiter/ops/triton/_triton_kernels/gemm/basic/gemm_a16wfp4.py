@@ -31,8 +31,6 @@ _gemm_a16wfp4_repr = make_kernel_repr(
         "EVEN_K": lambda args: (args["K"] % (args["BLOCK_SIZE_K"] // 2) == 0)
         and (args["SPLITK_BLOCK_SIZE"] % args["BLOCK_SIZE_K"] == 0)
         and (args["K"] % (args["SPLITK_BLOCK_SIZE"] // 2) == 0),
-        "GRID_MN": lambda args: triton.cdiv(args["M"], args["BLOCK_SIZE_M"])
-        * triton.cdiv(args["N"], args["BLOCK_SIZE_N"]),
     }
 )
 @triton.jit(repr=_gemm_a16wfp4_repr)
@@ -65,7 +63,6 @@ def _gemm_a16wfp4_kernel(
     num_stages: tl.constexpr,
     waves_per_eu: tl.constexpr,
     matrix_instr_nonkdim: tl.constexpr,
-    GRID_MN: tl.constexpr,
     ATOMIC_ADD: tl.constexpr,
     cache_modifier: tl.constexpr,
 ):
@@ -207,8 +204,6 @@ _gemm_a16wfp4_preshuffle_repr = make_kernel_repr(
         "EVEN_K": lambda args: (args["K"] % (args["BLOCK_SIZE_K"] // 2) == 0)
         and (args["SPLITK_BLOCK_SIZE"] % args["BLOCK_SIZE_K"] == 0)
         and (args["K"] % (args["SPLITK_BLOCK_SIZE"] // 2) == 0),
-        "GRID_MN": lambda args: triton.cdiv(args["M"], args["BLOCK_SIZE_M"])
-        * triton.cdiv(args["N"], args["BLOCK_SIZE_N"]),
     }
 )
 @triton.jit(repr=_gemm_a16wfp4_preshuffle_repr)
@@ -241,7 +236,6 @@ def _gemm_a16wfp4_preshuffle_kernel(
     num_stages: tl.constexpr,
     waves_per_eu: tl.constexpr,
     matrix_instr_nonkdim: tl.constexpr,
-    GRID_MN: tl.constexpr,
     PREQUANT: tl.constexpr,
     cache_modifier: tl.constexpr,
 ):

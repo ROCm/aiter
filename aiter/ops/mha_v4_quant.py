@@ -61,9 +61,10 @@ MHA_V4_MXFP6_V_PACKED_ROW_BYTES = 96
 MHA_V4_MXFP6_V_TILE_BYTES = MHA_V4_MXFP6_V_TILE_TOKENS * MHA_V4_MXFP6_V_PACKED_ROW_BYTES
 MHA_V4_MXFP6_V_SCALE_TILE_BYTES = 512
 MHA_V4_MXFP6_V_BUFFER_SLACK_BYTES = 256
-# The 64x64 FP6-P sparse kernels gather V scales through a raw pointer with no record bound, which
-# reads up to 256 bytes past the last tile of the last (batch, head). The launcher requires this
-# slack on those rows, as for MXFP4.
+# The 64x64 FP6-P sparse and Sol-Attn kernels gather V scales through a raw pointer with no record
+# bound, which reads up to 256 bytes past the last tile of the last (batch, head). A pooled V is
+# small enough for that read to leave its allocation, so it has to land on zeroed slack. The
+# launcher requires this slack on those rows, as for MXFP4.
 MHA_V4_MXFP6_FP6_P_V_SCALE_SLACK_BYTES = 1024
 
 

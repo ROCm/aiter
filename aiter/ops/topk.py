@@ -10,6 +10,7 @@ import torch
 
 from ..jit.core import compile_ops
 from ..jit.utils.chip_info import get_gfx, get_gfx_runtime
+from ..plugin import route as _route
 from ..utility import dtypes
 from ..utility.graph_alloc import capture_scoped_cache, persistent_alloc
 
@@ -162,6 +163,15 @@ def _valid_bias_dtypes(gating_dtype: torch.dtype) -> tuple[torch.dtype, ...]:
     return (torch.float32, torch.bfloat16)
 
 
+def _topk_gating_fake(*args, **kwargs) -> None:
+    """Every result of this op is one of its in-place writes -- ``topk_weights``
+    and ``topk_indices`` -- so a trace of it produces nothing. The fake is what
+    lets `route` register the op, which keeps the plugin's dispatch out of a
+    caller's compiled graph."""
+    return
+
+
+@_route(op="topk_gating", version=1, fake=_topk_gating_fake)
 def topk_gating(
     topk_weights: torch.Tensor,
     topk_indices: torch.Tensor,
@@ -1308,6 +1318,15 @@ def _hip_top_k_per_row_decode(
     )
 
 
+def _top_k_per_row_decode_fake(*args, **kwargs) -> None:
+    """Every result of this op is one of its in-place writes -- ``indices``, and
+    ``values`` when given -- so a trace of it produces nothing. The fake is what
+    lets `route` register the op, which keeps the plugin's dispatch out of a
+    caller's compiled graph."""
+    return
+
+
+@_route(op="top_k_per_row_decode", version=1, fake=_top_k_per_row_decode_fake)
 def top_k_per_row_decode(
     logits: torch.Tensor,
     next_n: int,
