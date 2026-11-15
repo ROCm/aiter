@@ -19,7 +19,6 @@ K and V are the exact e2m1 x e4m3 products in f16 (see the _common file), Q and 
 f16, scores / softmax / accumulation are fp32, the output is bf16.
 """
 
-import ctypes
 import functools
 import math
 
@@ -32,7 +31,9 @@ from flydsl.expr import const_expr, range_constexpr
 from flydsl.expr.typing import T
 from flydsl.expr.typing import Vector as Vec
 
+from aiter.jit.utils.chip_info import get_gfx_runtime, get_num_xcds
 from aiter.ops.flydsl.kernels import buffer_ops
+from aiter.ops.flydsl.kernels.minimax_m3_index_score import _cu_count
 from aiter.ops.flydsl.kernels.sparse_pa_nvfp4_common import (
     BLK,
     DATA_B,
@@ -193,7 +194,6 @@ def compile_decode(
         i32_H: fx.Int32,
         i32_hkv: fx.Int32,
         i32_group: fx.Int32,
-        i32_reqs: fx.Int32,
         arg_seq: fx.Int64,  # [reqs] int32
         arg_topk: fx.Int64,  # [Hkv, >= rows, TOPK] int32 logical blocks, -1 = none
         arg_bt: fx.Int64,  # [reqs, stride] int32
@@ -582,7 +582,6 @@ def compile_decode(
         i32_H: fx.Int32,
         i32_hkv: fx.Int32,
         i32_group: fx.Int32,
-        i32_reqs: fx.Int32,
         i32_grid_x: fx.Int32,
         i32_topk_hs: fx.Int32,
         i32_topk_rs: fx.Int32,
@@ -600,7 +599,6 @@ def compile_decode(
             i32_H,
             i32_hkv,
             i32_group,
-            i32_reqs,
             arg_seq,
             arg_topk,
             arg_bt,
@@ -636,16 +634,6 @@ def _get_kernel(splits: int, topk: int, xcds: int, late_v: bool, device_index: i
 
 
 @functools.cache
-def _gfx_arch(device_index: int) -> str:
-    return torch.cuda.get_device_properties(device_index).gcnArchName.split(":")[0]
-
-
-@functools.cache
-def _cu_count(device_index: int) -> int:
-    return torch.cuda.get_device_properties(device_index).multi_processor_count
-
-
-@functools.cache
 def _unit_scale(device_index: int) -> torch.Tensor:
     return torch.ones(1, dtype=torch.float32, device=f"cuda:{device_index}")
 
@@ -660,24 +648,6 @@ def _split_buffers(device_index: int):
         (MAX_SPLIT_ROWS + 1) * MAX_SPLITS * 64 * PART_F, dtype=torch.float32, device=dev
     )
     return part, torch.zeros(MAX_SPLIT_ROWS + 1, dtype=torch.int32, device=dev)
-
-
-_HIP_ATTR_NUM_XCCS = 10018
-
-
-@functools.cache
-def _xcd_count(device_index: int) -> int:
-    """XCDs of the device when HIP reports 8 (gfx950's topology, which the XCD-aware
-    grid assumes: workgroup b is dispatched to XCD b % 8), else 0 (grid off)."""
-    try:
-        get_attr = ctypes.CDLL("libamdhip64.so").hipDeviceGetAttribute
-        get_attr.argtypes = [ctypes.POINTER(ctypes.c_int), ctypes.c_int, ctypes.c_int]
-        get_attr.restype = ctypes.c_int
-        v = ctypes.c_int()
-        ok = get_attr(ctypes.byref(v), _HIP_ATTR_NUM_XCCS, device_index) == 0
-        return 8 if ok and v.value == 8 else 0
-    except (AttributeError, OSError, TypeError, ctypes.ArgumentError):
-        return 0
 
 
 def decode_splits(units: int, topk: int, cus: int) -> int:
@@ -738,10 +708,9 @@ def sparse_pa_nvfp4_decode(
     """
     if q.device.type != "cuda":
         raise ValueError(f"q must be a CUDA tensor, got {q.device}")
-    if _gfx_arch(q.device.index) != "gfx950":
-        raise ValueError(
-            f"NVFP4 sparse PA decode requires gfx950, got {_gfx_arch(q.device.index)}"
-        )
+    arch = get_gfx_runtime()
+    if arch != "gfx950":
+        raise ValueError(f"NVFP4 sparse PA decode requires gfx950, got {arch}")
     rows, num_heads, head_dim = q.shape
     hkv = topk_idx.shape[0]
     topk = topk_idx.shape[-1]
@@ -787,7 +756,12 @@ def sparse_pa_nvfp4_decode(
     if xcds is None:
         # The XCD-aware 1-D grid only pays when splits of a row must share an L2; with one
         # workgroup per unit the plain (row, kv head) grid skips its runtime divisions.
-        xcds = _xcd_count(dev) if splits > 1 else 0
+        xcds = 0
+        if splits > 1:
+            # The grid assumes workgroup b runs on XCD b % 8 (gfx950), so any other count,
+            # or a failed query (get_num_xcds logs it), leaves the plain grid.
+            with torch.cuda.device(q.device):
+                xcds = 8 if get_num_xcds(default=0) == 8 else 0
     if late_v is None:
         late_v = decode_late_v(rows * hkv * splits, _cu_count(dev))
     unit = _unit_scale(dev)
@@ -802,7 +776,6 @@ def sparse_pa_nvfp4_decode(
     # The softmax runs in scaled units with masked scores at -inf, so it needs c > 0.
     c = float(np.float32(sm_scale) * np.float32(LOG2E))
     assert math.isfinite(c) and c > 0, "sm_scale must be finite and positive"
-    reqs = seq_lens.shape[0]
     if xcds:
         grid_x = -(-(rows * hkv) // xcds) * xcds * splits
     else:
@@ -826,7 +799,6 @@ def sparse_pa_nvfp4_decode(
             num_heads,
             hkv,
             group,
-            reqs,
             grid_x,
             topk_idx.stride(0),
             topk_idx.stride(1),
