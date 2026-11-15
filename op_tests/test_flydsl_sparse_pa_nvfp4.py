@@ -5,7 +5,7 @@
 
 The kernels take the selector's output directly: ``topk_idx [Hkv, rows, 16]`` logical
 128-token block ids plus the request block table; K / V pages are the single-buffer
-NVFP4 page (see ``kernels/minimax_m3_sparse_pa_nvfp4_common.py``).
+NVFP4 page (see ``kernels/sparse_pa_nvfp4_common.py``).
 
 Reference: an fp64 torch attention over K / V = e2m1 x e4m3 scale x global scale taken
 from the token-major codes and scale bytes the pages were *built from* -- nothing is
@@ -14,7 +14,7 @@ kernels do the products exactly in f16, so what is left against the reference is
 bf16 output (relative L2 of ~1.7e-3) and the f16 Q / P.
 
 Run (exits nonzero if any check fails):
-    python op_tests/test_flydsl_minimax_m3_sparse_pa_nvfp4.py [--case SUBSTR ...] [--perf]
+    python op_tests/test_flydsl_sparse_pa_nvfp4.py [--case SUBSTR ...] [--perf]
 """
 
 import argparse
@@ -28,11 +28,11 @@ import torch
 
 import aiter
 from aiter.jit.utils.chip_info import get_gfx_runtime
-from aiter.ops.flydsl.kernels.minimax_m3_sparse_pa_nvfp4_decode import (
-    minimax_m3_sparse_pa_nvfp4_decode,
+from aiter.ops.flydsl.kernels.sparse_pa_nvfp4_decode import (
+    sparse_pa_nvfp4_decode,
 )
-from aiter.ops.flydsl.kernels.minimax_m3_sparse_pa_nvfp4_prefill import (
-    minimax_m3_sparse_pa_nvfp4_prefill,
+from aiter.ops.flydsl.kernels.sparse_pa_nvfp4_prefill import (
+    sparse_pa_nvfp4_prefill,
 )
 from aiter.test_common import benchmark, checkAllclose, run_perftest
 
@@ -93,8 +93,8 @@ def pack_pages(kc, ks, vc, vs):
         scl = torch.zeros(pages, hkv, 1024, dtype=torch.uint8, device=dev)
         scl[:, :, off.flatten()] = s.reshape(pages, hkv, BLK * 8)
         out[:, side, :, BLK * 64 :] = scl
-    # regions are [side][head]: data(8192) then scales(1024) per head within a side -- the
-    # in-page order is [K data heads][K scale heads][V data heads][V scale heads]
+    # Above, each head of a side is [data 8192 B | scales 1024 B]. A page groups them
+    # differently: [K data of all heads | K scales of all heads | V data ... | V scales ...].
     d = out[..., : BLK * 64].reshape(pages, 2, hkv * BLK * 64)
     sc = out[..., BLK * 64 :].reshape(pages, 2, hkv * 1024)
     return torch.cat([d, sc], dim=-1).reshape(pages, 2 * hkv * PAGE_B).contiguous()
@@ -232,7 +232,7 @@ def rel_l2(out, ref):
 
 def decode_call(c, splits=None, **kw):
     out = torch.empty_like(c["q"])
-    return minimax_m3_sparse_pa_nvfp4_decode(
+    return sparse_pa_nvfp4_decode(
         c["q"],
         c["cache"],
         c["topk"],
@@ -250,7 +250,7 @@ def decode_call(c, splits=None, **kw):
 
 def prefill_call(c, **kw):
     out = torch.empty_like(c["q"])
-    return minimax_m3_sparse_pa_nvfp4_prefill(
+    return sparse_pa_nvfp4_prefill(
         c["q"],
         c["cache"],
         c["topk"],
@@ -343,7 +343,8 @@ def test_prefill_correctness(name, hkv, group, rows, tq, rounds):
 
 
 def decode_splits_agree():
-    """Every split count gives the same result as one workgroup, to the bit."""
+    """Every split count agrees with one workgroup to rel-L2 <= 2e-3 (the fp32 merge order
+    differs, so the bf16 output is not bitwise equal)."""
     bad = 0
     for name, seq_lens, q_lens, hkv, group, kw in DECODE_CASES:
         c = make_case(
@@ -353,7 +354,6 @@ def decode_splits_agree():
         for s in DECODE_SPLITS:
             if s in (None, 1) or len(seq_lens) * hkv > 1024:
                 continue
-            # splits merge in fp32 in a different association; the bf16 output then flips a few ulps
             err = rel_l2(decode_call(c, s), base)
             if err > 2e-3:
                 bad += 1
@@ -414,8 +414,8 @@ def padding_rows():
 
 
 def refusals():
-    """Arguments the kernels cannot read correctly are refused before launch, each with
-    its own message."""
+    """Arguments the kernels cannot read correctly are refused before launch (ValueError,
+    which ``python -O`` does not strip), each with its own message."""
     bad = 0
     c = make_case([500, 700], [1, 1], 1, 16, seed=5)
     cache, ks = c["cache"], c["k_scale"]
@@ -425,6 +425,11 @@ def refusals():
         ("cpu k_scale", {"k_scale": ks.cpu()}, "k_scale and v_scale"),
         ("fp16 k_scale", {"k_scale": ks.half()}, "k_scale and v_scale"),
         ("empty k_scale", {"k_scale": ks[:0]}, "k_scale and v_scale"),
+        ("fp16 q", {"q": c["q"].half()}, "bfloat16"),
+        ("group 4", {"q": c["q"][:, :4]}, "8 or 16 heads"),
+        ("2-D topk_idx", {"topk": c["topk"][0]}, "must be 3-D"),
+        ("int64 topk_idx", {"topk": c["topk"].long()}, "topk_idx must be int32"),
+        ("flattened block_table", {"bt": c["bt"].flatten()}, "block_table 2-D"),
         ("sm_scale 0", {"sm_scale": 0.0}, "sm_scale"),
         ("sm_scale nan", {"sm_scale": float("nan")}, "sm_scale"),
         ("cpu q", {"q": c["q"].cpu()}, "CUDA"),
@@ -437,32 +442,44 @@ def refusals():
     decode_only = [
         ("splits > MAX_SPLITS", {"splits": 32}, "splits must be"),
         ("splits 0", {"splits": 0}, "splits must be"),
+        ("short block_table", {"bt": c["bt"][:1]}, "row per request"),
+        ("2-D seq_lens", {"seq_lens": c["seq_lens"][None]}, "seq_lens 1-D"),
+        ("xcds 1", {"xcds": 1}, "xcds must be"),
+    ]
+    prefill_only = [
+        ("empty block_table", {"bt": c["bt"][:0]}, "block_table 2-D"),
+        ("tq 3", {"tq": 3}, "tq must be"),
+        ("rounds without tq", {"rounds": 1}, "rounds needs tq"),
     ]
 
     def decode(a):
-        minimax_m3_sparse_pa_nvfp4_decode(
-            a["q"], a["cache"], c["topk"], c["bt"], c["seq_lens"], a["sm_scale"],
+        sparse_pa_nvfp4_decode(
+            a["q"], a["cache"], a["topk"], a["bt"], c["seq_lens"], a["sm_scale"],
             None, a["k_scale"], a["v_scale"], query_len=1, splits=a.get("splits"),
+            xcds=a.get("xcds"),
         )  # fmt: skip
 
     def prefill(a):
-        minimax_m3_sparse_pa_nvfp4_prefill(
-            a["q"], a["cache"], c["topk"], c["bt"], c["row_req"], c["row_kv"],
-            a["sm_scale"], None, a["k_scale"], a["v_scale"],
+        sparse_pa_nvfp4_prefill(
+            a["q"], a["cache"], a["topk"], a["bt"], c["row_req"], c["row_kv"],
+            a["sm_scale"], None, a["k_scale"], a["v_scale"], tq=a.get("tq"),
+            rounds=a.get("rounds"),
         )  # fmt: skip
 
     for kind, call, cases in (
         ("decode", decode, shared + decode_only),
-        ("prefill", prefill, shared),
+        ("prefill", prefill, shared + prefill_only),
     ):
         for name, kw, msg in cases:
             a = {
                 "q": c["q"], "cache": cache, "sm_scale": SM_SCALE, "k_scale": ks,
-                "v_scale": c["v_scale"], **kw,
+                "v_scale": c["v_scale"], "bt": c["bt"], "topk": c["topk"], **kw,
             }  # fmt: skip
+            if kind == "decode" and name == "short block_table":
+                a["bt"] = c["bt"][:1]
             try:
                 call(a)
-            except (AssertionError, ValueError) as e:
+            except ValueError as e:
                 if msg in str(e):
                     continue
                 print(f"refusal: {kind} {name}: wrong message: {e!r}")
@@ -521,7 +538,7 @@ def test_decode_perf(rows, query_len, hkv, group, ctx):
     out = torch.empty_like(q)
     ks = vs = torch.ones(1, dtype=torch.float32, device="cuda")
     _, us = run_perftest(
-        minimax_m3_sparse_pa_nvfp4_decode,
+        sparse_pa_nvfp4_decode,
         q,
         pool,
         topk,
@@ -590,7 +607,7 @@ def test_prefill_perf(q_len, hkv, group, ctx):
     out = torch.empty_like(q)
     ks = vs = torch.ones(1, dtype=torch.float32, device="cuda")
     _, us = run_perftest(
-        minimax_m3_sparse_pa_nvfp4_prefill,
+        sparse_pa_nvfp4_prefill,
         q,
         pool,
         topk,
@@ -678,7 +695,7 @@ def main(argv=None):
         ]
         df = pd.DataFrame(perf)
         aiter.logger.info("decode perf:\n%s", df.to_markdown(index=False))
-        failed += int((df["err"] > REL_L2_TOL).sum())
+        failed += int((~(df["err"] <= REL_L2_TOL)).sum())  # a NaN err fails too
         perf = [
             test_prefill_perf(ql, hkv, g, ctx)
             for (ql, ctx), (hkv, g) in itertools.product(
@@ -687,7 +704,7 @@ def main(argv=None):
         ]
         df = pd.DataFrame(perf)
         aiter.logger.info("prefill perf:\n%s", df.to_markdown(index=False))
-        failed += int((df["err"] > REL_L2_TOL).sum())
+        failed += int((~(df["err"] <= REL_L2_TOL)).sum())
     print("FAILED" if failed else "PASSED", failed)
     return 1 if failed else 0
 

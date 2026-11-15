@@ -33,7 +33,7 @@ from flydsl.expr.typing import T
 from flydsl.expr.typing import Vector as Vec
 
 from aiter.ops.flydsl.kernels import buffer_ops
-from aiter.ops.flydsl.kernels.minimax_m3_sparse_pa_nvfp4_common import (
+from aiter.ops.flydsl.kernels.sparse_pa_nvfp4_common import (
     BLK,
     HG,
     KPW,
@@ -476,7 +476,7 @@ def pick_tile(rows: int, hkv: int, cus: int) -> tuple[int, int]:
     return 4, 2
 
 
-def minimax_m3_sparse_pa_nvfp4_prefill(
+def sparse_pa_nvfp4_prefill(
     q: torch.Tensor,  # [rows, Hq, 128] bf16
     kv_cache: torch.Tensor,  # uint8 pages, see the _common file
     topk_idx: torch.Tensor,  # [Hkv, >= rows, 16] int32 logical blocks, -1 = none
