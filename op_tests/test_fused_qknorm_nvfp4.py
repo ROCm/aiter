@@ -159,7 +159,13 @@ def stress_qkv(qkv, nq, nkv, niq):
 
 
 @benchmark()
-def test_nvfp4_write(num_tokens, num_kv_heads, slot_mode, gs, perf=False):
+def test_nvfp4_write(
+    num_tokens, num_kv_heads, slot_mode, gs, perf=False, variant="base"
+):
+    """variant: base; padded (KV page stride 64 B above the page size, the pad bytes must stay);
+    skip (skip_index_branch with index_cache_dtype "auto": index operands untouched);
+    skip_bare (the same with no index operands passed)."""
+    skip, bare = variant.startswith("skip"), variant == "skip_bare"
     nq, niq = 16, 1  # M3.1 TP4
     dtype = torch.bfloat16
     torch.manual_seed(7)
@@ -186,9 +192,12 @@ def test_nvfp4_write(num_tokens, num_kv_heads, slot_mode, gs, perf=False):
     ident = torch.arange(pages * PAGE, dtype=torch.int64)[:num_tokens]
 
     def call(qkv_, kv_pages, idx_pages, q_out, iq_out, ks, vs, **kw):
+        iw, islots = ((None, None), None) if bare else ((iqn, ikn), slots)
+        if bare:
+            idx_pages = iq_out = None
         aiter.fused_qknorm_idxrqknorm(
-            qkv_, qn, kn, cos_sin, pos, nq, num_kv_heads, rotary_dim, eps, iqn, ikn,
-            niq, slots, kv_pages, kv_pages, idx_pages, PAGE, q_out, iq_out, slots,
+            qkv_, qn, kn, cos_sin, pos, nq, num_kv_heads, rotary_dim, eps, *iw,
+            niq, slots, kv_pages, kv_pages, idx_pages, PAGE, q_out, iq_out, islots,
             k_scale=ks, v_scale=vs, **kw,
         )  # fmt: skip
 
@@ -206,10 +215,11 @@ def test_nvfp4_write(num_tokens, num_kv_heads, slot_mode, gs, perf=False):
     i_rows = sik[:num_tokens].float().cpu()
 
     g = torch.Generator().manual_seed(11)
+    pad = 64 if variant == "padded" else 0
     kv_garbage = torch.randint(
         0,
         256,
-        (pages, 2 * num_kv_heads * HEAD_SIDE),
+        (pages, 2 * num_kv_heads * HEAD_SIDE + pad),
         dtype=torch.uint8,
         generator=g,
         device="cpu",
@@ -218,17 +228,25 @@ def test_nvfp4_write(num_tokens, num_kv_heads, slot_mode, gs, perf=False):
         0, 256, (pages, HEAD_SIDE), dtype=torch.uint8, generator=g, device="cpu"
     )
     ks, vs = torch.tensor([gs]), torch.tensor([gs * 0.5])
-    kv_pages, idx_pages = kv_garbage.clone().cuda(), idx_garbage.clone().cuda()
+    kv_full, idx_pages = kv_garbage.clone().cuda(), idx_garbage.clone().cuda()
+    kv_pages = kv_full[:, : 2 * num_kv_heads * HEAD_SIDE]  # a narrowed view when padded
     q_out = torch.empty_like(q_ref)
     iq_out = torch.empty_like(iq_ref)
+    if skip:  # the index operands must come back unchanged
+        iq_out.fill_(1.0)
+        iq_ref = iq_out.clone()
+        i_kw = {"skip_index_branch": True, "index_cache_dtype": "auto"}
+    else:
+        i_kw = {"index_cache_dtype": "nvfp4"}
     call(qkv.clone(), kv_pages, idx_pages, q_out, iq_out, ks, vs,
-         kv_cache_dtype="nvfp4", index_cache_dtype="nvfp4")  # fmt: skip
+         kv_cache_dtype="nvfp4", **i_kw)  # fmt: skip
 
     want_kv, want_idx = kv_garbage.clone().cuda(), idx_garbage.clone().cuda()
     cs = slots.cpu()
     for side, (rows, sc) in enumerate(((k_rows, gs), (v_rows, gs * 0.5))):
         ref_pages(want_kv, rows.cuda(), cs.cuda(), side, num_kv_heads, sc)
-    ref_index_pages(want_idx, i_rows.cuda(), cs.cuda())
+    if not skip:
+        ref_index_pages(want_idx, i_rows.cuda(), cs.cuda())
 
     def exact(a, b, msg):
         return checkAllclose(
@@ -236,7 +254,7 @@ def test_nvfp4_write(num_tokens, num_kv_heads, slot_mode, gs, perf=False):
         )
 
     ret = {
-        "kv err": exact(kv_pages, want_kv, "kv pages: "),
+        "kv err": exact(kv_full, want_kv, "kv pages: "),
         "idx err": exact(idx_pages, want_idx, "index pages: "),
         "q err": max(
             exact(q_out, q_ref, "q_out: "), exact(iq_out, iq_ref, "index q_out: ")
@@ -253,7 +271,7 @@ def test_nvfp4_write(num_tokens, num_kv_heads, slot_mode, gs, perf=False):
             ks,
             vs,
             kv_cache_dtype="nvfp4",
-            index_cache_dtype="nvfp4",
+            **i_kw,
             num_iters=50,
             num_warmup=20,
         )
@@ -438,6 +456,12 @@ def main():
         (t, n, s, gs)
         for t, n, s, gs in itertools.product(args.tokens, args.nkv, args.slots, args.gs)
         if not (s in ("seq_gaps", "mtp") and t < 64)
+    ]
+    # the layouts the sweep above does not run: padded page stride, index-less (skip) layers
+    cases += [
+        (t, n, s, 0.37, False, v)
+        for v in ("padded", "skip", "skip_bare")
+        for t, n, s in itertools.product(args.tokens, args.nkv, ("scatter", "seq_off3"))
     ]
     df = pd.DataFrame([test_nvfp4_write(*c) for c in cases])
     aiter.logger.info(
