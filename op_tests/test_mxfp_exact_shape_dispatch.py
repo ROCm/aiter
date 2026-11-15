@@ -31,12 +31,12 @@ SPECS = {
     "a6w6": (
         ROOT / "hsa/gfx950/f6gemm/f6gemm_bf16_per1x32Fp6.csv",
         ROOT / "aiter/configs/a6w6_blockscale_tuned_gemm.csv",
-        27,
+        32,
     ),
     "a6w4": (
         ROOT / "hsa/gfx950/f6f4gemm/f6f4gemm_bf16_per1x32Fp6Fp4.csv",
         ROOT / "aiter/configs/a6w4_asm_tuned_gemm.csv",
-        22,
+        30,
     ),
     "a4w6": (
         ROOT / "hsa/gfx950/f4f6gemm/f4f6gemm_bf16_per1x32Fp4Fp6.csv",

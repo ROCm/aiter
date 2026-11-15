@@ -40,9 +40,6 @@ from .communication_ops_utils import (
     wave_uniform_i64,
 )
 
-# Bump when generated kernel shape changes.
-_DISPATCH_COMBINE_JIT_SCHEMA_VERSION = "v10-stage2-blockwise-fp8-scale-prefetch"
-
 # Stage-3 switches from narrow step=64 to wide step=128/256 above this threshold.
 _S3_WIDE_PATH_THRESHOLD_I32 = 895
 # AMDGPU cache modifier used by Stage-3 buffer loads/stores.
@@ -1202,23 +1199,6 @@ def make_dispatch_jit(
         max_recv=max_recv,
     )
 
-    # Closure vars keying the JIT cache: every IR-affecting input must appear
-    # here or a config change reuses a stale hsaco. Keep in sync with combine.
-    _key_rank, _key_npes, _key_block_num = rank, npes, block_num
-    _key_warp_per_block = warp_num_per_block
-    _key_max_tok = max_tok_per_rank
-    _key_std_moe = enable_std_moe
-    _key_max_recv = max_recv if max_recv is not None else npes * max_tok_per_rank
-    # str(torch.dtype): _collect_closure_scalar_vals only whitelists primitive
-    # scalars; a raw torch.dtype would drop out of the key.
-    _key_data_type = str(data_type)
-    _key_hidden_dim = hidden_dim
-    _key_experts_per_token = experts_per_token
-    _key_experts_per_rank = experts_per_rank
-    _key_scale_dim = scale_dim
-    _key_scale_type_size = scale_type_size
-    _key_schema_version = _DISPATCH_COMBINE_JIT_SCHEMA_VERSION
-
     @flyc.jit
     def dispatch_launch(
         addr_inp_tok: fx.Int64,
@@ -1249,22 +1229,6 @@ def make_dispatch_jit(
         inp_cur_tok: fx.Int32,
         stream: Stream = Stream(None),  # noqa: B008
     ):
-        _ = (
-            _key_rank,
-            _key_npes,
-            _key_block_num,
-            _key_warp_per_block,
-            _key_max_tok,
-            _key_std_moe,
-            _key_max_recv,
-            _key_data_type,
-            _key_hidden_dim,
-            _key_experts_per_token,
-            _key_experts_per_rank,
-            _key_scale_dim,
-            _key_scale_type_size,
-            _key_schema_version,
-        )
         kernel(
             addr_inp_tok,
             addr_inp_idx,
@@ -1346,22 +1310,6 @@ def make_combine_jit(
         mask_topk_ids=mask_topk_ids,
     )
 
-    # JIT cache key (mirrors the dispatch launcher above; keep in sync).
-    _key_rank, _key_npes, _key_block_num = rank, npes, block_num
-    _key_warp_per_block = warp_num_per_block
-    _key_max_tok = max_tok_per_rank
-    _key_weights = enable_weights
-    _key_std_moe = enable_std_moe
-    _key_zero_copy = zero_copy
-    _key_skip_s1 = skip_stage1
-    _key_fp8_direct_cast = bool(fp8_direct_cast)
-    _key_blockwise_fp8_transport = bool(blockwise_fp8_transport)
-    _key_max_recv = max_recv if max_recv is not None else npes * max_tok_per_rank
-    _key_mask_topk_ids = bool(mask_topk_ids)
-    # See dispatch launcher for the ``str(torch.dtype)`` rationale.
-    _key_data_type = str(data_type)
-    _key_schema_version = _DISPATCH_COMBINE_JIT_SCHEMA_VERSION
-
     @flyc.jit
     def combine_launch(
         addr_inp_tok: fx.Int64,
@@ -1385,23 +1333,6 @@ def make_combine_jit(
         cur_rank_num_token: fx.Int32,
         stream: Stream = Stream(None),  # noqa: B008
     ):
-        _ = (
-            _key_rank,
-            _key_npes,
-            _key_block_num,
-            _key_warp_per_block,
-            _key_max_tok,
-            _key_weights,
-            _key_std_moe,
-            _key_zero_copy,
-            _key_skip_s1,
-            _key_fp8_direct_cast,
-            _key_blockwise_fp8_transport,
-            _key_max_recv,
-            _key_mask_topk_ids,
-            _key_data_type,
-            _key_schema_version,
-        )
         kernel(
             addr_inp_tok,
             addr_shmem_tok,

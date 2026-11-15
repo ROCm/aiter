@@ -133,16 +133,21 @@ def device_cu_count(device_index: int) -> int:
 
 
 @lru_cache(maxsize=64)
-def _build_kernel(heads, next_n, block_size, ctx_stride, unroll, waves, wide_cache):
+def _build_kernel(
+    heads, next_n, block_size, ctx_stride, unroll, waves, wide_cache, row_dim=INDEX_DIM
+):
     threads = WAVE * waves
     m_tiles = heads // WMMA_M
     bn = min(block_size, 16)
-    page_bytes = block_size * INDEX_DIM
+    # A page is block_size rows of row_dim bytes: the K plane (block_size * 128),
+    # the fp32 scales (block_size * 4), then any row padding the caller allocated.
+    page_bytes = block_size * row_dim
     scale_off = block_size * HEAD_DIM
     wide = "_wide" if wide_cache else ""
     kernel_name = (
         f"fp8_paged_mqa_logits_gfx1250_H{heads}_D{HEAD_DIM}_nn{next_n}"
-        f"_kvb{block_size}_cs{ctx_stride}_u{unroll}_w{waves}{wide}_flydsl"
+        f"_kvb{block_size}{'' if row_dim == INDEX_DIM else f'_r{row_dim}'}"
+        f"_cs{ctx_stride}_u{unroll}_w{waves}{wide}_flydsl"
     )
 
     @flyc.kernel(name=kernel_name, known_block_size=[threads, 1, 1])
@@ -464,8 +469,9 @@ def flydsl_fp8_paged_mqa_logits_gfx1250(
     """Paged FP8 MQA logits on gfx1250; ``deepgemm_fp8_paged_mqa_logits`` args.
 
     ``q_fp8`` ``[B, next_n, H, 128]`` (H a multiple of 16, last dim
-    contiguous), ``kv_cache`` ``[num_blocks, KVBlockSize, 1, 132]`` packed and
-    preshuffled, ``weights`` ``[B * next_n, H]`` fp32, ``out_logits``
+    contiguous), ``kv_cache`` ``[num_blocks, KVBlockSize, 1, R]`` packed and
+    preshuffled, R >= 132 and a multiple of 4 (row bytes past 132 are padding),
+    ``weights`` ``[B * next_n, H]`` fp32, ``out_logits``
     ``[B * next_n, >= max context]`` fp32 (columns past a row's context are
     not written), ``context_lens`` ``[B]`` or ``[B, next_n]`` (last column),
     ``kv_indices`` ``[B, max_blocks]`` int32. ``next_n_lens`` optionally
@@ -502,7 +508,13 @@ def flydsl_fp8_paged_mqa_logits_gfx1250(
         raise ValueError("q_fp8 needs a contiguous, 16-byte aligned head dim")
     if not kv_cache.is_contiguous():
         raise ValueError("kv_cache must be contiguous")
-    if kv_cache.shape[1:] != (block_size, 1, INDEX_DIM):
+    row_dim = kv_cache.shape[-1]
+    if (
+        kv_cache.ndim != 4
+        or kv_cache.shape[1:3] != (block_size, 1)
+        or row_dim < INDEX_DIM
+        or row_dim % 4
+    ):
         raise ValueError(f"unexpected KV cache shape {tuple(kv_cache.shape)}")
     if weights.shape != (batch_size * next_n, heads) or weights.dtype != torch.float32:
         raise ValueError(
@@ -547,6 +559,7 @@ def flydsl_fp8_paged_mqa_logits_gfx1250(
         int(Unroll),
         int(Waves),
         bool(_wide_cache) or kv_cache.numel() * kv_cache.element_size() >= 2**31,
+        int(row_dim),
     )
     stream = stream or torch.cuda.current_stream(q_fp8.device)
     with torch.cuda.device(q_fp8.device.index):
