@@ -535,6 +535,8 @@ __global__ void fusedQKNormIdxrQKNormKernel(
     // Main Q as unit-scale e4m3 (kQFp8 only; replaces the q_out row).
     opus::fp8_t* __restrict__ q_fp8_out)
 {
+    // NVFP4 is K, V and index-K pages together: never a fallback to the MXFP4 stores.
+    static_assert(!kNvfp4 || (kKvFp4 && kIndexFp4), "kNvfp4 requires kKvFp4 and kIndexFp4");
     const int warps_per_block = blockDim.x / 32;
     const int lane_id = threadIdx.x % 32;
     const int global_warp_idx = blockIdx.x * warps_per_block + (threadIdx.x / 32);
@@ -1206,8 +1208,8 @@ static void fused_qknorm_idxrqknorm_impl(
     const bool nvfp4_kv_cache    = kv_cache_dtype == "nvfp4";
     const bool nvfp4_index_cache = index_cache_dtype == "nvfp4";
     // NVFP4 is one mode: K/V pages and index pages together (an index-less layer has no index).
-    const bool mxfp4_kv_cache = kv_cache_dtype == "mxfp4" || nvfp4_kv_cache;
-    AITER_CHECK(!mxfp4_kv_cache || (insert_kv && has_index),
+    const bool fp4_kv_cache = kv_cache_dtype == "mxfp4" || nvfp4_kv_cache;
+    AITER_CHECK(!fp4_kv_cache || (insert_kv && has_index),
                 "kv_cache_dtype='mxfp4'/'nvfp4' requires the sparse insert mode "
                 "(kv caches + index slots in qkv)");
     AITER_CHECK(nvfp4_kv_cache == nvfp4_index_cache || (nvfp4_kv_cache && skip_index_branch),
@@ -1359,12 +1361,12 @@ static void fused_qknorm_idxrqknorm_impl(
         }
         else
         {
-            AITER_CHECK(kv_cache_dtype == "auto" || mxfp4_kv_cache,
+            AITER_CHECK(kv_cache_dtype == "auto" || fp4_kv_cache,
                         "non-fp8 fused_qknorm_idxrqknorm expects kv_cache_dtype='auto', 'mxfp4' "
                         "or 'nvfp4'");
-            AITER_CHECK(mxfp4_kv_cache ? kc.dtype() == AITER_DTYPE_u8 : kc.dtype() == qkv.dtype(),
+            AITER_CHECK(fp4_kv_cache ? kc.dtype() == AITER_DTYPE_u8 : kc.dtype() == qkv.dtype(),
                         "kv_cache dtype must match qkv for a non-fp8 cache (uint8 for mxfp4)");
-            AITER_CHECK(nvfp4_kv_cache || !mxfp4_kv_cache ||
+            AITER_CHECK(nvfp4_kv_cache || !fp4_kv_cache ||
                             (!k_scale.has_value() && !v_scale.has_value()),
                         "kv_cache_dtype='mxfp4' keeps its scales in the pages: no k_scale/v_scale");
             AITER_CHECK(!nvfp4_kv_cache ||
@@ -1416,7 +1418,7 @@ static void fused_qknorm_idxrqknorm_impl(
                             "index_cache must contain at least num_blocks * block_size rows");
             }
         }
-        else if(mxfp4_kv_cache)
+        else if(fp4_kv_cache)
         {
             // [num_pages, num_kv_heads, 8704] uint8 per side: one page of kFp4PageTokens
             // tokens per (page, head), [128 x 64 B e2m1][128 x 4 B e8m0]; the strides are
@@ -1596,7 +1598,7 @@ static void fused_qknorm_idxrqknorm_impl(
                                                     : nullptr;
         opus::fp8_t* q_fp8_ptr =
             q_is_fp8 ? reinterpret_cast<opus::fp8_t*>(q_out->data_ptr()) : nullptr;
-        if(mxfp4_kv_cache || mxfp4_index_cache)
+        if(fp4_kv_cache || mxfp4_index_cache)
         {
             // MXFP4 main K/V and/or index K (sparse insert only); the other cache keeps its type.
             const bool kv_scaled = fp8_kv_per_token || fp8_kv_static || nvfp4_kv_cache;
@@ -1659,17 +1661,17 @@ static void fused_qknorm_idxrqknorm_impl(
                 launch_fp4.template
                 operator()<uint8_t, uint8_t, Dt::kAuto, Dt::kAuto, true, true, true>();
             }
-            else if(mxfp4_kv_cache && mxfp4_index_cache)
+            else if(fp4_kv_cache && mxfp4_index_cache)
             {
                 launch_fp4.template
                 operator()<uint8_t, uint8_t, Dt::kAuto, Dt::kAuto, true, true, false>();
             }
-            else if(mxfp4_kv_cache && process_index && index_cache_dtype != "auto")
+            else if(fp4_kv_cache && process_index && index_cache_dtype != "auto")
             {
                 launch_fp4.template
                 operator()<uint8_t, opus::fp8_t, Dt::kAuto, Dt::kFp8E4M3, false, true, false>();
             }
-            else if(mxfp4_kv_cache)
+            else if(fp4_kv_cache)
             {
                 launch_fp4
                     .template operator()<uint8_t, T, Dt::kAuto, Dt::kAuto, false, true, false>();
