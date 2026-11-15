@@ -2,6 +2,7 @@
 # Copyright (C) 2025-2026 FlyDSL Project Contributors
 """Compile + launch dispatch for the layout-API MXFP4 MoE gemm (BM32, opus-sort); a4w4/a8w4 entry point."""
 
+import functools
 import os
 
 import flydsl.compiler as flyc
@@ -789,6 +790,26 @@ def get_g2(
     return launch
 
 
+@functools.cache
+def get_g2_ep32(use_nt, HIDDEN_MAX, INTER_MAX, use_valid_token_count, grid_wgs, BM=64, B_NT=False, variant="base", REDUCE=False, topk=1, NATIVE_C=False, NATIVE_BF16=False):
+    from .mxfp4_gemm2_ep32 import compile_gemm2_ep32
+
+    return compile_gemm2_ep32(
+        use_nt=bool(use_nt),
+        HIDDEN_MAX=HIDDEN_MAX,
+        INTER_MAX=INTER_MAX,
+        use_valid_token_count=use_valid_token_count,
+        GRID_WGS=grid_wgs,
+        BM=BM,
+        B_NT=B_NT,
+        variant=variant,
+        topk=topk if REDUCE else 1,
+        **({"REDUCE": True} if REDUCE else {}),
+        **({"NATIVE_C": True} if NATIVE_C else {}),
+        **({"NATIVE_BF16": True} if NATIVE_BF16 else {}),
+    )
+
+
 def mxfp4_moe_gemm2(
     *,
     inter_sorted_quant,
@@ -826,6 +847,8 @@ def mxfp4_moe_gemm2(
     is_ep=False,
     out_scale=None,
     use_valid_token_count=False,
+    ep32=False,
+    native_bf16=False,
 ):
     """Stage-2 down-proj gemm for unpadded dimensions.
 
@@ -880,6 +903,7 @@ def mxfp4_moe_gemm2(
     elif (
         str(out_dtype).strip().lower() == "bf16"
         and getattr(out, "dtype", None) != torch.bfloat16
+        and not (ep32 and BM == 96 and os.environ.get("G2_OUTPUT_NATIVE", "1") == "1" and out.dtype == torch.float32)
     ):
         raise TypeError(
             "FlyDSL v2 GEMM2 supports only torch.bfloat16 output, "
@@ -897,6 +921,50 @@ def mxfp4_moe_gemm2(
             bias = bias.to(torch.float32)
         if not bias.is_contiguous():
             bias = bias.contiguous()
+    if ep32:
+        if native_bf16 and not (
+            BM == 96 and out.dtype == torch.bfloat16 and epilog == "reduce"
+            and D_HIDDEN == 3584 and D_INTER == 3072
+        ):
+            raise ValueError("weighted native BF16 output requires BM96 Kimi-K3 reduce staging")
+        # Dedicated EP32 A8W4 kernel (mxfp4_gemm2_ep32.py): fixed persistent grid.
+        if (BN, BK, a_dtype, b_dtype, persist, out_dtype) != (
+            256, 128, "fp8", "fp4", False, "bf16"
+        ) or epilog not in ("atomic", "reduce") or (epilog == "reduce" and BM != 96) or (BM, SBM) not in ((64, 64), (96, 96)) or bias is not None:
+            raise NotImplementedError(
+                "gemm2 ep32 supports BM64/sbm64 atomic or BM96/sbm96 reduce, BN256/BK128 A8W4 bf16 "
+                "without bias"
+            )
+        launch = get_g2_ep32(
+            use_nt, HIDDEN_MAX, D_INTER, bool(use_valid_token_count), 2 * get_cu_num(), BM=BM,
+            B_NT=BM == 96 and os.environ.get("G2_B_NT", "1") == "1",
+            variant=os.environ.get("G2_VARIANT", "native" if D_HIDDEN == 3584 and D_INTER == 3072 and (out.dtype == torch.float32 or native_bf16) else "base") if BM == 96 else "base",
+            REDUCE=epilog == "reduce", topk=topk,
+            NATIVE_C=epilog == "reduce" and (out.dtype == torch.float32 or native_bf16) and os.environ.get("G2_OUTPUT_NATIVE", "1") == "1",
+            NATIVE_BF16=native_bf16,
+        )
+        max_m_blocks = (max_sorted + BM - 1) // BM
+        run_compiled(
+            launch,
+            inter_sorted_quant.data_ptr(),
+            inter_sorted_shuffled_scale.data_ptr(),
+            w2_u8.data_ptr(),
+            w2_scale_u8.data_ptr(),
+            sorted_expert_ids.data_ptr(),
+            cumsum_tensor.data_ptr(),
+            sorted_token_ids.data_ptr(),
+            sorted_weights.data_ptr(),
+            out.data_ptr(),
+            M_logical,
+            max_m_blocks,
+            max_m_blocks,
+            D_INTER,
+            D_HIDDEN,
+            out.data_ptr(),
+            out.data_ptr(),
+            torch.cuda.current_stream() if stream is None else stream,
+        )
+        return out
     g2_prefetch_ids = (
         (BM, BN, BK) == (128, 256, 128)
         and a_dtype == b_dtype == "fp4"

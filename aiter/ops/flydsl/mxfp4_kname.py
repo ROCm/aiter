@@ -17,6 +17,7 @@ _MXMOE_G1_FLAG_TOKENS = {
     "SITUV2",
     "SWIGLU",
     "W2",
+    "EP32",
 }
 _MXMOE_G2_FLAG_TOKENS = {"NT", "ATOMIC", "F4OUT", "CSHUFFLE"}
 _MXMOE_NUMERIC_RE = re.compile(r"^([A-Z]+)(\d+)$")
@@ -58,7 +59,7 @@ _FLYDSL_V2_GEMM2_RE = re.compile(
     r"^flydsl_moe2_layout_a(?P<a>\w+?)_w(?P<b>\w+?)_(?P<out>\w+?)_"
     r"t(?P<tm>\d+)x(?P<tn>\d+)x(?P<tk>\d+)_(?P<epilog>atomic|reduce|scatter)"
     r"(?P<persist>_persist)?(?P<nt>_nt)?(?:_sbm(?P<sbm>\d+))?"
-    r"(?P<bf16lds>_bf16lds)?(?:_sp(?P<sp>\d+))?$"
+    r"(?P<bf16lds>_bf16lds)?(?:_sp(?P<sp>\d+))?(?P<ep32>_ep32)?$"
 )
 
 
@@ -109,6 +110,8 @@ def _parse_mxfp4_g1_kname_cached(kname: str) -> dict:
     parsed = _tokenize_mxfp4_kname(kname, 1, _MXMOE_G1_FLAG_TOKENS)
     nums, flags = parsed["nums"], parsed["flags"]
     act = "situv2" if "SITUV2" in flags else ("swiglu" if "SWIGLU" in flags else "silu")
+    if "EP32" in flags and nums["BM"] not in (64, 96):
+        raise ValueError("EP32 GEMM1 supports BM64/BM96")
     return {
         "BM": nums["BM"],
         "BN": nums["BN"],
@@ -124,6 +127,8 @@ def _parse_mxfp4_g1_kname_cached(kname: str) -> dict:
         "act": act,
         "num_waves": 2 if "W2" in flags else 4,
         "k_wave": nums.get("k_wave", 1),
+        # Dedicated EP32 A8W4 GEMM1 (kernels/mxfp4_gemm1_ep32.py).
+        "ep32": "EP32" in flags,
     }
 
 
@@ -174,6 +179,11 @@ def _parse_flydsl_v2_gemm2_kernel_cached(name):
     m = _FLYDSL_V2_GEMM2_RE.match(name or "")
     if not m:
         return None
+    if m.group("ep32") and (
+        int(m.group("tm")) not in (64, 96)
+        or (m.group("sbm") and int(m.group("sbm")) != int(m.group("tm")))
+    ):
+        return None
     return {
         "a_dtype": m.group("a"),
         "b_dtype": m.group("b"),
@@ -187,6 +197,8 @@ def _parse_flydsl_v2_gemm2_kernel_cached(name):
         "sort_block_m": int(m.group("sbm")) if m.group("sbm") else 0,
         "bf16_lds": True if m.group("bf16lds") else None,
         "spart": int(m.group("sp")) if m.group("sp") else None,
+        # Dedicated EP32 A8W4 GEMM2 (kernels/mxfp4_gemm2_ep32.py).
+        "ep32": bool(m.group("ep32")),
     }
 
 
