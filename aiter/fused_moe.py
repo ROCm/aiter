@@ -1934,6 +1934,12 @@ def _fused_moe_impl(
         and (global_E, topk, model_dim, block_size_M) == (129, 5, 6144, 32)
         and 1 <= M <= 256
         and q_dtype_a in (dtypes.fp4x2, dtypes.fp8)
+        # the kernel takes bf16 x and int32 / fp32 routing only: a pre-quantised x
+        # (a1_scale given, FHMoE P0) keeps the opus sort + quant path
+        and hidden_states.dtype == dtypes.bf16
+        and hidden_states.is_contiguous()
+        and topk_ids.dtype == dtypes.i32
+        and topk_weight.dtype == dtypes.fp32
         and hidden_pad == 0
         and metadata.ksplit <= 1
         and not metadata.output_aux
