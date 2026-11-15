@@ -117,6 +117,7 @@ def make_case(
     order="shuffle",
     fill=TOPK,  # valid ids per row (<= TOPK incl. the tail)
     junk=False,  # sprinkle invalid ids (-1 in the middle, ids past the tail, negatives)
+    poison=False,  # NaN (e4m3 0x7f) scale bytes in the unwritten tail of every request's last page
     k_scale=0.05,
     v_scale=0.03,
     device="cuda",
@@ -136,6 +137,11 @@ def make_case(
     v = (torch.randn(n_pages, BLK, hkv, D, generator=g) * amp).bfloat16()
     kc, ks = quantize_nvfp4(k.to(device), k_scale)
     vc, vs = quantize_nvfp4(v.to(device), v_scale)
+    if poison:
+        for r in range(reqs):
+            page = int(bt[r, nblk[r] - 1])
+            used = seq_lens[r] - (nblk[r] - 1) * BLK
+            ks[page, used:] = vs[page, used:] = 0x7F
     cache = pack_pages(kc, ks, vc, vs)
     rows = sum(q_lens)
     row_req = torch.empty(rows, dtype=torch.int32)
@@ -377,6 +383,32 @@ def padding_empty_table():
     return bad
 
 
+# (name, seq_lens, q_lens, hkv, group, kwargs); the unwritten tail of the last page holds NaN scales
+POISON_CASES = [
+    ("poison_one_token", [1, 2, 5, 127], [1] * 4, 1, 16, {}),
+    ("poison_tail_h4", [129, 300, 1000, 5000], [1] * 4, 4, 16, {}),
+    ("poison_mtp4", [5, 130, 900, 4097], [4] * 4, 1, 16, {}),
+    ("poison_g8_tail_only", [1, 700], [1, 1], 1, 8, {"fill": 1}),
+]
+
+
+def poisoned_tail():
+    """Keys past a request's length are masked out of P, but 0 * NaN is NaN in the PV MFMA:
+    a recycled page may hold a NaN V scale there (e4m3 0x7f), and the kernel must zero it.
+    """
+    bad = 0
+    for name, seq_lens, q_lens, hkv, group, kw in POISON_CASES:
+        c = make_case(
+            seq_lens, q_lens, hkv, group, seed=zlib.crc32(name.encode()) % 1000,
+            poison=True, **kw,
+        )  # fmt: skip
+        ref = run_torch(c)
+        for s, lv in ((None, None), (1, False), (1, True), (4, None)):
+            out = decode_call(c, s, late_v=lv)
+            bad += int(not check(f"decode {name} splits={s} late_v={lv}", out, ref)[0])
+    return bad
+
+
 def refusals():
     """Arguments the kernel cannot read correctly are refused before launch, each with
     its own message."""
@@ -552,6 +584,7 @@ def main(argv=None):
     failed += decode_late_v_agree()
     failed += padding_rows()
     failed += padding_empty_table()
+    failed += poisoned_tail()
     failed += refusals()
     if args.perf:
         perf = [
