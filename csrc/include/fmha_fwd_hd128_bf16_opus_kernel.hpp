@@ -550,6 +550,11 @@ __device__ __attribute__((always_inline)) void gqa_d128_impl(opus_gqa_kargs karg
     int seqlen_q, seqlen_kv;
     int64_t q_batch_base, o_batch_base, k_batch_base, v_batch_base, lse_batch_base;
     int q_block_idx;
+    // Paged KV: this group's block-table row, read through address space 4 so each page id is
+    // an s_load (lgkmcnt). A plain global load is VMEM, and its compiler-inserted vmcnt wait
+    // would drain the rolling K/V prefetch.
+    using bt_elem_t = const __attribute__((address_space(4))) int;
+    [[maybe_unused]] bt_elem_t* bt_row = nullptr;
     if constexpr (T::GROUP_MODE) {
         auto sc = [](int x) { return __builtin_amdgcn_readfirstlane(x); };
         // Two groupings of the same work, chosen by the host.
@@ -597,6 +602,8 @@ __device__ __attribute__((always_inline)) void gqa_d128_impl(opus_gqa_kargs karg
         k_batch_base   = kpad * kargs.stride_k_n;
         v_batch_base   = kpad * kargs.stride_v_n;
         lse_batch_base = qpad;
+        if constexpr (T::PAGED)
+            bt_row = (bt_elem_t*)(kargs.ptr_block_table) + (int64_t)g * kargs.stride_bt_b;
         // The rectangular grid gives every group the longest group's block count, and a
         // flat grid sized from an upper bound overshoots by at most one block per group;
         // either way the surplus is dropped here.
@@ -727,11 +734,10 @@ __device__ __attribute__((always_inline)) void gqa_d128_impl(opus_gqa_kargs karg
     // differ from seqlen_q (N) for cross-attention.
     const int k_tile_stride = T::KV_TILE_SIZE * kargs.stride_k_n;
     const int v_tile_stride = T::KV_TILE_SIZE * kargs.stride_v_n;
-    const int num_kv_tiles = ceil_div(seqlen_kv, T::KV_TILE_SIZE);
     // causal bottom-right alignment: query at global pos q_pos attends to keys with
     // k_pos <= q_pos + causal_offset. offset==0 for self-attention (N_KV==N).
-    [[maybe_unused]] const int causal_offset = seqlen_kv - seqlen_q;
-    int max_num_tiles = num_kv_tiles;
+    [[maybe_unused]] int causal_offset = seqlen_kv - seqlen_q;
+    int max_num_tiles = ceil_div(seqlen_kv, T::KV_TILE_SIZE);
     if constexpr (T::CAUSAL) {
         const int q_block_end = q_block_start + q_block_size;
         const int causal_num_tiles = ceil_div(q_block_end + causal_offset, T::KV_TILE_SIZE);
@@ -741,12 +747,67 @@ __device__ __attribute__((always_inline)) void gqa_d128_impl(opus_gqa_kargs karg
         // also keeps every tile index non-negative (no OOB kv_tile offset).
         if (max_num_tiles < 1) max_num_tiles = 1;
     }
+    // Split-KV: this split takes a page-aligned share of the max_num_tiles tiles. Rebasing KV
+    // positions, the block-table row and seqlen_kv onto the share's first tile leaves the
+    // loop below unchanged; an empty share stores lse = -inf, O = 0 via the no-keys exit.
+    if constexpr (T::SPLIT) {
+        const int per = ceil_div(ceil_div(max_num_tiles, kargs.num_splits), T::KV_TILES_PER_PAGE) *
+                        T::KV_TILES_PER_PAGE;
+        const int t_lo    = min(__builtin_amdgcn_readfirstlane(block_id_z()) * per, max_num_tiles);
+        const int n_tiles = min(per, max_num_tiles - t_lo);
+        const int kv_lo   = t_lo * T::KV_TILE_SIZE;
+        seqlen_kv = n_tiles > 0 ? min(seqlen_kv - kv_lo, n_tiles * T::KV_TILE_SIZE) : 0;
+        causal_offset -= kv_lo;
+        bt_row += kv_lo / T::PAGE_SIZE;
+        max_num_tiles = n_tiles;
+    }
+    const int num_kv_tiles = ceil_div(seqlen_kv, T::KV_TILE_SIZE);
     auto k_tile = [&](int tile_idx) { return tile_idx * k_tile_stride; };
     auto v_tile = [&](int tile_idx) { return tile_idx * v_tile_stride; };
     // Clamp a (possibly out-of-range) prefetch tile index to the last valid tile so K is
     // always prefetched (constant in-flight vmem → uniform rolling vmcnt, no tail branch;
     // the extra re-read of the last tile is harmless — it is never consumed).
     auto clamp_tile = [&](int x) { return x < max_num_tiles ? x : max_num_tiles - 1; };
+
+    // KV tile loads. !PAGED: one descriptor per (group | batch, h_kv), the tile offset in
+    // soffset. PAGED: tile t lies in page `page` = bt_row[t / KV_TILES_PER_PAGE] and gets its
+    // own descriptor rebased onto that page (soffset 0), bounded to the tile's valid rows so
+    // rows past seqlen_kv (stale pool data, possibly NaN) read as 0.
+    auto page_of = [&](int t) -> int {
+        if constexpr (T::PAGED)
+            return __builtin_amdgcn_readfirstlane(bt_row[t / T::KV_TILES_PER_PAGE]);
+        else
+            return 0;
+    };
+    [[maybe_unused]] const int kv_tail_rows = seqlen_kv - (num_kv_tiles - 1) * T::KV_TILE_SIZE;
+    [[maybe_unused]] auto kv_tile_gmem = [&](const void* ptr, int t, int page, long long page_stride,
+                                             int stride_h, int stride_n) {
+        const int rows = t >= num_kv_tiles - 1 ? kv_tail_rows : T::KV_TILE_SIZE;
+        const int64_t base = (int64_t)page * page_stride + (int64_t)h_kv * stride_h +
+                             (int64_t)((t % T::KV_TILES_PER_PAGE) * T::KV_TILE_SIZE) * stride_n;
+        return make_gmem(reinterpret_cast<const D_ATTN*>(ptr) + base,
+                         (unsigned int)(rows * stride_n) * (unsigned int)sizeof(D_ATTN));
+    };
+    auto load_k = [&](auto smem_ptr, int t, [[maybe_unused]] int page) {
+        if constexpr (T::PAGED) {
+            auto g = kv_tile_gmem(kargs.ptr_k, t, page, kargs.stride_k_page, kargs.stride_k_h, kargs.stride_k_n);
+            async_load<T::VEC_KV>(g, smem_ptr, u_gk, u_sk, 0);
+        } else {
+            async_load<T::VEC_KV>(g_k, smem_ptr, u_gk, u_sk, k_tile(t));
+        }
+    };
+    auto load_v = [&](auto smem_ptr, int t, [[maybe_unused]] int page) {
+        if constexpr (T::PAGED) {
+            auto g = kv_tile_gmem(kargs.ptr_v, t, page, kargs.stride_v_page, kargs.stride_v_h, kargs.stride_v_n);
+            async_load<T::VEC_KV>(g, smem_ptr, u_gv, u_sv, 0);
+        } else {
+            async_load<T::VEC_KV>(g_v, smem_ptr, u_gv, u_sv, v_tile(t));
+        }
+    };
+    // Page ids in flight (PAGED): pg_k for the K(t+2) prefetch, read in stage0 so that
+    // stage's lgkmcnt(0) covers the s_load (read later, the compiler's wait for it would also
+    // drain stage2's V LDS read); V(t) reuses K(t)'s page two phases on via pg_v0 / pg_v1.
+    [[maybe_unused]] int pg_k = 0, pg_v0 = 0, pg_v1 = 0;
 
     // Causal masking helpers. q_start_pos_c folds in the bottom-right offset so the mask
     // and the "does this tile need masking" checks work directly in KV coordinates.
@@ -759,6 +820,32 @@ __device__ __attribute__((always_inline)) void gqa_d128_impl(opus_gqa_kargs karg
     // label_write_out`. The stagger balancing barrier stays outside it: the no-keys path
     // runs no prologue, so neither wave group owes the other one.
     auto store_result = [&]() {
+        if constexpr (T::SPLIT) {
+            // Partial: lse, then O normalized over this share, both fp32.
+            const int64_t split = __builtin_amdgcn_readfirstlane(block_id_z());
+            if (lane_id < T::W_M) {
+                constexpr D_ACC LN2 = D_ACC(0.69314718055994531f);
+                const D_ACC lse = (l_row > D_ACC(0.0f))
+                                      ? ((m_row + __builtin_amdgcn_logf(l_row)) * LN2)
+                                      : -opus::numeric_limits<D_ACC>::infinity();
+                auto g_lse = make_gmem(reinterpret_cast<D_ACC*>(kargs.ptr_lse_acc) +
+                                           split * kargs.stride_lseacc_split + lse_batch_base +
+                                           (int64_t)h * kargs.stride_lseacc_h + q_block_start,
+                                       lse_num_records);
+                g_lse.store(lse, warp_id * T::Q_TILE_SIZE + lane_id);
+            }
+            D_ACC l_inv = (l_row > D_ACC(0.0f)) ? (D_ACC(1.0f) / l_row) : D_ACC(0.0f);
+            static_for<o_len>([&](auto i) { v_o[i.value] *= l_inv; });
+            const int64_t oacc_bytes =
+                (int64_t)(seqlen_q - q_block_start) * kargs.stride_oacc_n * (int64_t)sizeof(D_ACC);
+            auto g_oacc = make_gmem(reinterpret_cast<D_ACC*>(kargs.ptr_o_acc) +
+                                        split * kargs.stride_oacc_split +
+                                        (lse_batch_base + q_block_start) * kargs.stride_oacc_n +
+                                        (int64_t)h * kargs.stride_oacc_h,
+                                    oacc_bytes >= (int64_t)0xffffffffu ? 0xffffffffu : (unsigned int)oacc_bytes);
+            store<T::VEC_O>(g_oacc, v_o, make_layout_o<T>(warp_id, lane_id, kargs.stride_oacc_n));
+            return;
+        }
         // ── attention sink ────────────────────────────────────────────────────────────
         // A per-head logit acting as one valueless extra key in the softmax denominator.
         // Rebase onto M = max(m_row, sink) before folding it in so a dominant sink cannot
@@ -854,7 +941,11 @@ __device__ __attribute__((always_inline)) void gqa_d128_impl(opus_gqa_kargs karg
             opus::static_for<K_SPLIT_NOP>([&](auto) { asm volatile("s_nop 15"); });
         }
         v_kv.k = load<T::VEC_KV>(s_k[cur], u_rk_p);
-        async_load<T::VEC_KV>(g_v, s_v[cur].ptr, u_gv, u_sv, v_tile(t));
+        load_v(s_v[cur].ptr, t, pg_v0);
+        if constexpr (T::PAGED) {
+            pg_k = page_of(clamp_tile(t + 2));
+            asm volatile("" : "+s"(pg_k));
+        }
         s_waitcnt_lgkmcnt(0_I);
         s_waitcnt_vmcnt(number<T::KEEP_VMCNT>{});
         stage_end();
@@ -887,7 +978,9 @@ __device__ __attribute__((always_inline)) void gqa_d128_impl(opus_gqa_kargs karg
             asm volatile("s_nop 5");
         }
         v_kv.v = tr_load<T::VEC_TR_V>(s_v[prev], u_rv);
-        async_load<T::VEC_KV>(g_k, s_k[cur].ptr, u_gk, u_sk, k_tile(clamp_tile(t + 2)));
+        load_k(s_k[cur].ptr, clamp_tile(t + 2), pg_k);
+        pg_v0 = pg_v1;
+        pg_v1 = pg_k;
         if constexpr (T::CAUSAL) {
             const int kv_end_pos = (t + 1) * T::KV_TILE_SIZE;
             if (q_start_pos_c < kv_end_pos) {
@@ -963,13 +1056,18 @@ __device__ __attribute__((always_inline)) void gqa_d128_impl(opus_gqa_kargs karg
     // Prologue: stage Q + K0 into LDS. Q is loaded cooperatively across warps, so a
     // barrier is needed before each warp reads its 32 contiguous rows back; and s_q must
     // be fully read before V0 (which aliases s_q) overwrites it.
+    // Tiles 0 and 1 share page 0 whenever a page holds two or more tiles.
+    [[maybe_unused]] const int pg0 = page_of(0);
+    [[maybe_unused]] const int pg1 = T::KV_TILES_PER_PAGE > 1 ? pg0 : page_of(clamp_tile(1));
+    pg_v0 = pg1;
+    pg_v1 = page_of(clamp_tile(2));
     async_load<T::VEC_Q>(g_q, s_q.ptr, u_gq, u_sq, 0);
-    async_load<T::VEC_KV>(g_k, s_k[0].ptr, u_gk, u_sk, k_tile(0));
+    load_k(s_k[0].ptr, 0, pg0);
     s_waitcnt_vmcnt(number<T::k_buffer_load_insts>{}); // wait vmem-Q
     stage_end();
 
     v_q = load<T::VEC_Q>(s_q, u_rq);
-    async_load<T::VEC_KV>(g_k, s_k[1].ptr, u_gk, u_sk, k_tile(clamp_tile(1)));
+    load_k(s_k[1].ptr, clamp_tile(1), pg1);
     s_waitcnt_lgkmcnt(0_I);                      // Q read from LDS done → s_q free
     s_waitcnt_vmcnt(number<T::k_buffer_load_insts>{}); // wait vmem-K.blk[0]
     stage_end();
@@ -979,7 +1077,7 @@ __device__ __attribute__((always_inline)) void gqa_d128_impl(opus_gqa_kargs karg
     if (stagger) { stage_end(); }
 
     v_kv.k = load<T::VEC_KV>(s_k[0], u_rk);
-    async_load<T::VEC_KV>(g_v, s_v[0].ptr, u_gv, u_sv, v_tile(0));   // V0 aliases s_q (now safe)
+    load_v(s_v[0].ptr, 0, pg0);   // V0 aliases s_q (now safe)
     auto v_q_f32 = opus::cast<float>(v_q);
     static_for<q_len>([&](auto i) { v_q_f32[i.value] *= temperature_scale; });
     v_q = opus::cast<D_ATTN>(v_q_f32);
@@ -1012,7 +1110,7 @@ __device__ __attribute__((always_inline)) void gqa_d128_impl(opus_gqa_kargs karg
 
     stage_end();
 
-    async_load<T::VEC_KV>(g_k, s_k[0].ptr, u_gk, u_sk, k_tile(clamp_tile(2)));
+    load_k(s_k[0].ptr, clamp_tile(2), pg_v1);
     if constexpr(!STAGGER) {
         __builtin_amdgcn_s_setprio(1);
     }
