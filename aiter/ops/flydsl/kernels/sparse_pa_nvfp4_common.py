@@ -35,6 +35,8 @@ from flydsl._mlir.dialects import llvm as _llvm
 from flydsl.expr.typing import T
 from flydsl.expr.typing import Vector as Vec
 
+from aiter.ops.flydsl.kernels.tensor_shim import AITER_FLYDSL_KERNARG_PRELOAD
+
 BLK = 128  # tokens per page == sparse block
 D = 128
 NW = 4
@@ -50,10 +52,11 @@ LOG2E = 1.4426950409
 OOB_DWORD = 0x1FFFFFFF
 # Cache-policy bits of buffer loads / stores: sc1 is coherent across the XCDs' L2s.
 SC1 = 0x10
-# The first 16 dwords of kernel arguments arrive in SGPRs.
+# The first 16 dwords of kernel arguments arrive in SGPRs
+# (AITER_FLYDSL_KERNARG_PRELOAD=0 turns that off, as for the other FlyDSL kernels).
 PRELOAD_HINTS = {
     "llvm_options": {
-        "amdgpu-kernarg-preload": True,
+        "amdgpu-kernarg-preload": AITER_FLYDSL_KERNARG_PRELOAD,
         "amdgpu-kernarg-preload-count": 16,
     }
 }
