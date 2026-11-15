@@ -601,8 +601,16 @@ def _mxfp4_inline_sort_unsupported(
         return "MXFP4 weight scales are smaller than the padded stride"
 
     tensors = (hidden_states, w1, w2, topk_ids, w1_scale, w2_scale)
-    if not all(tensor.is_contiguous() for tensor in tensors):
+    if not all(tensor.is_contiguous() for tensor in tensors[1:]):
         return "non-contiguous tensors"
+    # GEMM1 reads each hidden_states row through its row stride, 16 bytes a load.
+    if not hidden_states.is_contiguous() and not (
+        hidden_states.stride(1) == 1
+        and hidden_states.stride(0) >= hidden
+        and hidden_states.stride(0) % 8 == 0
+        and hidden_states.data_ptr() % 16 == 0
+    ):
+        return "hidden_states rows are not 16-byte aligned contiguous rows"
     if len({tensor.device for tensor in tensors}) != 1:
         return "cross-device tensors"
 
@@ -1806,6 +1814,9 @@ def _fused_moe_impl(
         )
 
     metadata = _resolve_metadata(disable_inline_sort=bool(herd_topk))
+    if not _is_mxfp4_inline_sort(metadata):
+        # Only the inline-sort GEMM1 reads hidden_states through its row stride.
+        hidden_states = hidden_states.contiguous()
     reason = ""
     if _is_mxmoe_opus_metadata(metadata):
         reason = _mxmoe_opus_call_unsupported(
@@ -1878,6 +1889,7 @@ def _fused_moe_impl(
             )
             metadata = _resolve_metadata(disable_inline_sort=True)
             use_inline_sort = False
+            hidden_states = hidden_states.contiguous()
 
     stage2_func = getattr(metadata.stage2, "func", metadata.stage2)
     if (
