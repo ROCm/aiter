@@ -1,12 +1,13 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
-"""Turn one DSR1 combo run directory into a static report.html.
+"""Turn one combo run directory into a static report.html.
 
 Usage: python3 report.py <run_dir>
 
-<run_dir> holds combo.log (bench_gfx1250_combo.py --dsr1 --json), plus the
-provenance.txt and status.txt that run.sh writes. Standard library only.
+<run_dir> holds combo.log (bench_gfx1250_combo.py --<suite> --json), plus the
+provenance.txt and status.txt that run.sh writes. DSR1 gets its own layout;
+any other suite lists every table combo.log holds. Standard library only.
 """
 
 import html
@@ -178,7 +179,279 @@ def kernels(rows, key, label):
     return [(k, v if len(v) < len(rows) else ["all"]) for k, v in seen.items()]
 
 
+def suite_of(prov):
+    if prov.get("suite"):
+        return prov["suite"]
+    cmd = prov.get("cmd", "")
+    return next(
+        (w[2:] for w in cmd.split() if w.startswith("--") and w != "--json"), ""
+    )
+
+
+def table_list(path):
+    """Every JSON table in combo.log, in order, duplicates kept."""
+    out = []
+    for line in path.read_text(errors="replace").splitlines():
+        try:
+            t = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(t, dict) and "name" in t and isinstance(t.get("rows"), list):
+            out.append((t["name"], t["rows"]))
+    return out
+
+
+def cell(v):
+    if isinstance(v, bool) or v is None:
+        return "-" if v is None else str(v)
+    if isinstance(v, int):
+        return f"{v:,}"
+    if isinstance(v, float):
+        return num(v, 2 if abs(v) < 100 else 1)
+    if isinstance(v, (list, tuple)):
+        return ", ".join(str(x) for x in v)
+    return v
+
+
+# Operator notes for suites other than dsr1; "key" matches table-name prefixes.
+SUITE_OPS = {
+    "dsv41": [
+        {
+            "key": "flydsl_grouped_gemm",
+            "name": "Grouped MoE FC1 + FC2",
+            "op": "moe",
+            "shape": (
+                "96 experts a rank (384 routed / EP4; the shared expert is not "
+                "fused), top-6. FC1 N=4608 (gate/up), K=5120; FC2 N=5120, "
+                "K=2304. Rows = tokens x 6."
+            ),
+            "dtype": "a4w4 MXFP4 (fp4 A and W, e8m0 scale per 32), bf16 out",
+            "ut": (
+                "op_tests/flydsl_tests/test_flydsl_grouped_gemm.py: run_moe('a4w4', "
+                "experts=96, topk=6, model_dim=5120, inter_dim=2304, "
+                "kernel_bench=True)"
+            ),
+        },
+        {
+            "key": "mega_moe",
+            "name": "Mega MoE (dispatch + MoE + combine)",
+            "op": "mega_moe",
+            "shape": (
+                "EP4 over 4 GPUs: 384 experts, top-6, hidden 5120, inter 2304, "
+                "40 layers. base+Mega and the recipe's S1F+Mega on an fp4 wire."
+            ),
+            "dtype": "a4w4_mxfp4",
+            "ut": "op_tests/multigpu_tests/bench_mega_moe.py under torchrun x4",
+        },
+        {
+            "key": "mla_v4 decode",
+            "name": "Sparse MLA decode",
+            "op": "mla_v4_decode",
+            "shape": (
+                "64 query heads (DP attention), head dim 512, one KV head. "
+                "KV pool = compressed history (1K..64K tokens at ratio 2 or 1, "
+                "512..65536 rows); each token reads its top-512 plus a 128-token "
+                "window."
+            ),
+            "dtype": "bf16 (opus, triton); v41_fp4 (asm)",
+            "ut": "op_tests/test_mla_sparse_prefill.py",
+        },
+        {
+            "key": "mla_v4 prefill",
+            "name": "Sparse MLA prefill",
+            "op": "mla_v4_prefill",
+            "shape": (
+                "64 query heads, head dim 512. Same KV pools as decode (512..65536 "
+                "rows); each token reads its top-512 plus a 128-token window."
+            ),
+            "dtype": "bf16 (opus, triton); v41_fp4 (asm)",
+            "ut": "op_tests/test_mla_sparse_prefill.py",
+        },
+        {
+            "key": "score_qk_fp4",
+            "name": "Indexer score (paged MQA logits)",
+            "op": "score_qk_fp4",
+            "shape": (
+                "32 index heads, dim 128. Full layers (ratio 2) and candidate "
+                "layers; prefill 16384 rows, decode batch 1024 at MTP 1 and 6."
+            ),
+            "dtype": "MXFP4 Q and K (OPUS), fp32 logits",
+            "ut": "op_tests/test_pa_mqa_logits_mxfp4_opus.py (with ROCm/aiter#7925)",
+        },
+        {
+            "key": "topk",
+            "name": "Indexer top-k",
+            "op": "topk",
+            "shape": (
+                "k=512, stable, indices only. Prefill rows of causal length; "
+                "decode batch x 6 rows over 16384 (candidate) and 20480 (full "
+                "layer) columns. Rows are 2-D, not packed as ATOM passes them."
+            ),
+            "dtype": "fp32 scores",
+            "ut": "op_tests/test_topk_per_row.py: test_top_k_per_row_prefill / _decode",
+        },
+    ],
+}
+
+
+def size_range(rows):
+    """'<key> lo..hi' for the first size column the rows carry."""
+    for key in ("token", "batch", "n", "rows", "tokens"):
+        vals = sorted({r[key] for r in rows if isinstance(r.get(key), int)})
+        if len(vals) > 1:
+            return f"{key} {vals[0]:,}..{vals[-1]:,}"
+        if vals:
+            return f"{key} {vals[0]:,}"
+    return "-"
+
+
+def op_range(op_tables):
+    """Each matching table's size range, duplicates dropped."""
+    seen = []
+    for _, rows in op_tables:
+        r = size_range(rows)
+        if r not in seen:
+            seen.append(r)
+    return "; ".join(seen) if seen else "not in this run"
+
+
+def kind(key, rows):
+    """CSS class for a generic column: monospace text or right-aligned numbers."""
+    if "kernel" in key or key in ("err_msg", "output_tail"):
+        return "m"
+    vals = [r.get(key) for r in rows if r.get(key) is not None]
+    numeric = all(isinstance(v, (int, float)) and not isinstance(v, bool) for v in vals)
+    return "n" if vals and numeric else ""
+
+
+def render_generic(run_dir, suite):
+    prov = read_kv(run_dir / "provenance.txt")
+    status = read_kv(run_dir / "status.txt")
+    tables = table_list(run_dir / "combo.log")
+    failed = [(n, r) for n, rows in tables for r in rows if r.get("err_msg")]
+    title = f"{suite.upper() or 'combo'} microbench"
+    out = [
+        "<!doctype html><html lang='en'><head><meta charset='utf-8'>",
+        "<meta name='viewport' content='width=device-width,initial-scale=1'>",
+        f"<title>{esc(title)}</title><style>{CSS}</style></head><body>",
+        f"<div class='wrap'><h1>{esc(title)}</h1>",
+        (
+            f"<div class='muted'>Run {esc(run_dir.name)}, "
+            f"{esc(prov.get('date_utc'))}, exit code {esc(status.get('rc'))}, "
+            f"{len(tables)} table(s), {len(failed)} failed case(s).</div>"
+        ),
+    ]
+    meta = SUITE_OPS.get(suite)
+    if meta:
+        ops = []
+        for o in meta:
+            mine = [(n, rs) for n, rs in tables if n.startswith(o["key"])]
+            rows = [r for _, rs in mine for r in rs]
+            ops.append({**o, "rows": rows, "range": op_range(mine)})
+        out += [
+            "<h2>1. Operators</h2>",
+            table(
+                [
+                    ("Operator", lambda o: o["name"], ""),
+                    ("--ops", lambda o: o["op"], "c"),
+                    ("Shape (per GPU)", lambda o: o["shape"], ""),
+                    ("Precision", lambda o: o["dtype"], ""),
+                    ("Range", lambda o: o["range"], ""),
+                    ("Cases", lambda o: len(o["rows"]), "n"),
+                    (
+                        "Failed",
+                        lambda o: sum(1 for r in o["rows"] if r.get("err_msg")),
+                        "n",
+                    ),
+                    ("UT", lambda o: o["ut"], "m"),
+                ],
+                ops,
+            ),
+        ]
+    else:
+        out += [
+            "<h2>1. Tables</h2>",
+            table(
+                [
+                    ("#", lambda t: t[0], "n"),
+                    ("Table", lambda t: t[1], ""),
+                    ("Cases", lambda t: len(t[2]), "n"),
+                    ("Failed", lambda t: sum(1 for r in t[2] if r.get("err_msg")), "n"),
+                ],
+                [(i + 1, n, rows) for i, (n, rows) in enumerate(tables)],
+            ),
+        ]
+    out += [
+        "<h2>2. How to run</h2>",
+        (
+            "<p>From the aiter root: <code>bash .claude/skills/run-bench/run.sh "
+            f"{esc(suite)} &lt;out_dir&gt; [gpus]</code>, which runs the command "
+            "below and writes this report.</p>"
+        ),
+        f"<p><code>{esc(prov.get('cmd', '-'))}</code></p>",
+        table(
+            [("Item", lambda kv: kv[0], ""), ("Value", lambda kv: kv[1], "m")],
+            [(k, v) for k, v in prov.items() if k != "cmd"],
+        ),
+        "<h2>3. Performance per case</h2>",
+    ]
+    for i, (name, rows) in enumerate(tables):
+        cols = []
+        for r in rows:
+            cols += [k for k in r if k not in cols]
+        kcols = [k for k in cols if "kernel" in k]
+        fixed = [
+            k
+            for k in cols
+            if k not in kcols
+            and len(rows) > 1
+            and len({json.dumps(r.get(k), sort_keys=True) for r in rows}) == 1
+        ]
+        shown = [k for k in cols if k not in kcols and k not in fixed]
+        out.append(f"<h3>{i + 1}. {esc(name)} ({len(rows)} cases)</h3>")
+        if fixed:
+            same = ", ".join(f"{k}={cell(rows[0].get(k))}" for k in fixed)
+            out.append(f"<div class='muted'>Same for every case: {esc(same)}</div>")
+        out.append(
+            table(
+                [(k, lambda r, k=k: cell(r.get(k)), kind(k, rows)) for k in shown],
+                rows,
+            )
+        )
+        size = next(
+            (k for k in ("token", "batch", "n", "rows", "tokens") if k in cols), None
+        )
+        krows = [
+            (k, kern, used)
+            for k in kcols
+            for kern, used in kernels(
+                rows, k, lambda r, size=size: r.get(size, "") if size else ""
+            )
+        ]
+        if krows:
+            kcol = [("Column", lambda r: r[0], "c")] if len(kcols) > 1 else []
+            out.append(
+                table(
+                    [("Kernel", lambda r: r[1], "m")]
+                    + kcol
+                    + [
+                        (
+                            f"Used at {size or 'case'}",
+                            lambda r: ", ".join(str(u) for u in dict.fromkeys(r[2])),
+                            "",
+                        ),
+                    ],
+                    krows,
+                )
+            )
+    out.append("</div></body></html>")
+    return "\n".join(out)
+
+
 def render(run_dir):
+    suite = suite_of(read_kv(run_dir / "provenance.txt"))
+    if suite != "dsr1":
+        return render_generic(run_dir, suite)
     prov = read_kv(run_dir / "provenance.txt")
     status = read_kv(run_dir / "status.txt")
     tables = read_tables(run_dir / "combo.log")
@@ -256,7 +529,7 @@ def render(run_dir):
     # 2. How to run
     out.append("<h2>2. How to run</h2>")
     out.append(
-        "<p>From the aiter root: <code>bash .claude/skills/dsr1-microbench/run.sh "
+        "<p>From the aiter root: <code>bash .claude/skills/run-bench/run.sh dsr1 "
         "&lt;out_dir&gt; [gpu]</code>, which runs the command below and writes "
         "this report. <code>--ops</code> picks operators and "
         "<code>AITER_BENCH_TOKENS</code> overrides the bs / T sweep.</p>"
