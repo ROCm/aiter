@@ -291,6 +291,16 @@ def mfma_f16(a4, b4, acc):
     return Vec(c.load())
 
 
+def scales_up_to(word, h, g, lim):
+    """``word``, 4 e4m3 scale bytes of keys 8 g + 4 h + b, with the bytes of the keys
+    past ``lim`` zeroed."""
+    keep = fx.Int32(0)
+    for b in range_constexpr(4):
+        byte = (0xFF << 8 * b) - (1 << 32 if b == 3 else 0)  # as a signed i32
+        keep = keep | (8 * g + 4 * h + b <= lim).select(fx.Int32(byte), fx.Int32(0))
+    return word & keep
+
+
 def page_loader(arg_cache, page_bytes, kvh, hkv, w, n, g):
     """Returns ``load(page) -> RAW dwords`` of this lane's share of a page.
 

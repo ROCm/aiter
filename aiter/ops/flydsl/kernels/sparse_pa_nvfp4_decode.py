@@ -59,6 +59,7 @@ from aiter.ops.flydsl.kernels.sparse_pa_nvfp4_common import (
     pk_bf16,
     pk_f16,
     require,
+    scales_up_to,
     unit_scale,
     xlane4,
 )
@@ -154,16 +155,6 @@ def _dq4(word, scales):
         ],
         fx.Int32,
     )
-
-
-def _scales_up_to(word, h, g, lim):
-    """``word``, 4 e4m3 scale bytes of keys 8 g + 4 h + b, with the bytes of the keys
-    past ``lim`` zeroed."""
-    keep = fx.Int32(0)
-    for b in range_constexpr(4):
-        byte = (0xFF << 8 * b) - (1 << 32 if b == 3 else 0)  # as a signed i32
-        keep = keep | (8 * g + 4 * h + b <= lim).select(fx.Int32(byte), fx.Int32(0))
-    return word & keep
 
 
 def compile_decode(
@@ -347,7 +338,7 @@ def compile_decode(
                 # and hold a NaN V scale (e4m3 0x7f), and 0 * NaN is NaN in the PV MFMA.
                 # Zero the scale bytes of those keys (byte b of dword h is key 8 g + 4 h + b).
                 v_scl = [
-                    _scales_up_to(raw[17 + h], h, g, lim) for h in range_constexpr(2)
+                    scales_up_to(raw[17 + h], h, g, lim) for h in range_constexpr(2)
                 ]
             mx = a[0]
             for i in range_constexpr(1, 8):

@@ -63,6 +63,7 @@ from aiter.ops.flydsl.kernels.sparse_pa_nvfp4_common import (
     pk_bf16,
     pk_f16,
     require,
+    scales_up_to,
     xlane4,
 )
 from aiter.ops.flydsl.kernels.tensor_shim import (
@@ -289,7 +290,21 @@ def compile_prefill(tq: int = 4, rounds: int = 2):
             hits = fx.Int64(fx.rocdl.ballot(T.i64, lane_key == key))
             # An own-block key: the rows hitting it see only the keys up to their limit.
             own_blk = (key & 1) != 0
-            kf, vf = dequant_page(raw)
+            v_scl = [raw[17], raw[18]]
+            if own_blk:
+                # Masking P is not enough: the keys past every hitting row's position may be
+                # unwritten and hold a NaN V scale (e4m3 0x7f), and 0 * NaN is NaN in the PV
+                # MFMA. Zero the scale bytes of those keys.
+                lim_hit = fx.Int32(-1 << 20)
+                for t in range_constexpr(TQ):
+                    row_hit = (
+                        hits.shrui(fx.Int64(TOPK * t)) & fx.Int64(0xFFFF)
+                    ) != fx.Int64(0)
+                    lim_hit = (row_hit & (lim[t] > lim_hit)).select(lim[t], lim_hit)
+                v_scl = [
+                    scales_up_to(raw[17 + h], h, g, lim_hit) for h in range_constexpr(2)
+                ]
+            kf, vf = dequant_page(raw[:17] + v_scl)
             for t in range_constexpr(TQ):
                 m_t, l_t, o_t = m[t], l_run[t], o[t]
                 if (hits.shrui(fx.Int64(TOPK * t)) & fx.Int64(0xFFFF)) != fx.Int64(0):

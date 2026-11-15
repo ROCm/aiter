@@ -487,6 +487,19 @@ def poisoned_tail():
         for s, lv in ((None, None), (1, False), (1, True), (4, None)):
             out = decode_call(c, s, late_v=lv)
             bad += int(not check(f"decode {name} splits={s} late_v={lv}", out, ref)[0])
+    # Prefill: tiles of rows share the tail page; the keys past the last row of a tile are
+    # unwritten, the ones between its rows are not.
+    for name, seq_lens, q_lens, hkv, group, kw in POISON_CASES + [
+        ("poison_chunk", [5, 200, 700], [5, 70, 300], 1, 16, {}),
+    ]:
+        c = make_case(
+            seq_lens, q_lens, hkv, group, seed=zlib.crc32(name.encode()) % 1000,
+            poison=True, **kw,
+        )  # fmt: skip
+        ref = run_torch(c)
+        for tq, rnd in PREFILL_TQ:
+            out = prefill_call(c, tq=tq, rounds=rnd)
+            bad += int(not check(f"prefill {name} tq={tq}", out, ref)[0])
     return bad
 
 
