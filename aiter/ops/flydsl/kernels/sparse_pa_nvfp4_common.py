@@ -44,7 +44,11 @@ from flydsl.expr import range_constexpr
 from flydsl.expr.typing import T
 from flydsl.expr.typing import Vector as Vec
 
-from aiter.ops.flydsl.kernels.tensor_shim import buf_copy_load, ptr_buf_tensor
+from aiter.ops.flydsl.kernels.tensor_shim import (
+    AITER_FLYDSL_KERNARG_PRELOAD,
+    buf_copy_load,
+    ptr_buf_tensor,
+)
 
 BLK = 128  # tokens per page == sparse block
 D = 128
@@ -62,10 +66,11 @@ LOG2E = 1.4426950409
 OOB_DWORD = 0x1FFFFFFF
 # Cache-policy bits of buffer loads / stores: sc1 is coherent across the XCDs' L2s.
 SC1 = 0x10
-# The first 16 dwords of kernel arguments arrive in SGPRs.
+# The first 16 dwords of kernel arguments arrive in SGPRs
+# (AITER_FLYDSL_KERNARG_PRELOAD=0 turns that off, as for the other FlyDSL kernels).
 PRELOAD_HINTS = {
     "llvm_options": {
-        "amdgpu-kernarg-preload": True,
+        "amdgpu-kernarg-preload": AITER_FLYDSL_KERNARG_PRELOAD,
         "amdgpu-kernarg-preload-count": 16,
     }
 }
@@ -78,9 +83,20 @@ def require(cond, msg):
         raise ValueError(msg)
 
 
+def refuse_alloc_in_capture(what):
+    # A capture records the fill instead of running it: eager calls and other graphs would
+    # then read uninitialised scratch.
+    require(
+        not torch.cuda.is_current_stream_capturing(),
+        f"the first sparse_pa_nvfp4 call on a device allocates its {what}: "
+        "run one eager call (same shapes) before graph capture",
+    )
+
+
 @functools.cache
 def unit_scale(device_index):
     """A ``[1]`` float32 one on the device: the default global k / v scale."""
+    refuse_alloc_in_capture("scale placeholder")
     return torch.ones(1, dtype=torch.float32, device=f"cuda:{device_index}")
 
 
@@ -245,7 +261,9 @@ def pk_bf16(a, b):
 
 
 def bf16x8_to_f16(v):
-    """4 dwords of 8 bf16 -> 4 dwords of 8 f16 (exact unless |x| > 65504)."""
+    """4 dwords of 8 bf16 -> 4 dwords of 8 f16 (RNE). Exact for 2^-14 <= |x| < 2^16; smaller |x|
+    rounds to a multiple of 2^-24 (f16 subnormals; |x| <= 2^-25 gives 0), larger gives inf.
+    """
     return Vec(v).bitcast(fx.BFloat16).to(fx.Float32).to(fx.Float16).bitcast(fx.Int32)
 
 

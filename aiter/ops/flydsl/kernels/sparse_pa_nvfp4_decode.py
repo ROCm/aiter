@@ -58,6 +58,7 @@ from aiter.ops.flydsl.kernels.sparse_pa_nvfp4_common import (
     mfma_f16,
     pk_bf16,
     pk_f16,
+    refuse_alloc_in_capture,
     require,
     scales_up_to,
     unit_scale,
@@ -81,6 +82,8 @@ MAX_SPLIT_ROWS = 1024  # (row, kv head) pairs a split launch can hold
 
 def _atomic_add(addr_i64, value):
     """Relaxed agent-scope atomic add on a global i32; returns the old value."""
+    # llvm atomicrmw, not a copy atom: FlyDSL 0.5.0's UniversalAtomicAdd / BufferAtomicAdd
+    # accumulate into memory but return nothing, and the merge needs the old value (ticket).
     return fx.llvm.atomic_add(
         global_i32_ptr(addr_i64),
         fx.Int32(value),
@@ -90,8 +93,9 @@ def _atomic_add(addr_i64, value):
 
 
 def _page_loader(arg_cache, page_bytes, kvh, hkv, w, n, g):
-    """``(open_page, load_k, load_v)``: ``open_page(page, valid)`` is the buffer resource of a
-    page and ``load_k`` / ``load_v`` read this lane's share of its K / V side as raw dwords:
+    """``(open_page, load_k, load_v)``: ``open_page(page, valid)`` returns a page as three
+    buffer tensors (4-, 2- and 1-dword units) and ``load_k`` / ``load_v`` read this lane's
+    share of its K / V side as raw dwords:
 
       K: raw[0:4], raw[4:8]  K data of key rows st = 0, 1 (dims 32 g .. 32 g + 31)
          raw[8]              K scale bytes [st][group] of those rows
@@ -658,9 +662,11 @@ def _get_kernel(splits: int, topk: int, xcds: int, late_v: bool, device_index: i
 
 @functools.cache
 def _split_buffers(device_index: int):
-    """Split partials and tickets, one set per device; allocated on first use, so warm up
-    before capture. Launches that split a row share them, so they must not overlap on
-    different streams of one device (see ``sparse_pa_nvfp4_decode``)."""
+    """Split partials and tickets, one set per device; allocated on first use (refused
+    during graph capture: warm up eagerly first). Launches that split a row share them, so
+    they must not overlap on different streams of one device (see
+    ``sparse_pa_nvfp4_decode``)."""
+    refuse_alloc_in_capture("split scratch")
     dev = f"cuda:{device_index}"
     part = torch.empty(
         (MAX_SPLIT_ROWS + 1) * MAX_SPLITS * 64 * PART_F, dtype=torch.float32, device=dev
@@ -724,7 +730,8 @@ def sparse_pa_nvfp4_decode(
     must be finite and positive. One launch in flight per device: the split partials and
     arrival counters are one shared buffer per device, so two launches must not overlap
     on different streams of the same GPU (launches on one stream, and graph replays, are
-    serialized).
+    serialized). The first call on a device allocates that scratch, so graph capture needs
+    one eager call (same shapes) before it; a first call inside a capture is refused.
     """
     if q.device.type != "cuda":
         raise ValueError(f"q must be a CUDA tensor, got {q.device}")
