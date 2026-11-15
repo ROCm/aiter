@@ -242,7 +242,7 @@ def compile_prefill(tq: int = 4, rounds: int = 2):
             key = fx.Int32(fx.rocdl.readlane(T.i32, lane_key, idx))
             return (key >= 0).select(key, fx.Int32(0))
 
-        raw0 = load_page(key_at(valid) // 2)
+        raw0 = load_page(key_at(valid) // 2, valid != fx.Int64(0))
         fx.rocdl.sched_barrier(0)
         # Union: the first lane of each distinct key, over all TQ x TOPK lanes (the pairs
         # of the last row included; with TQ = 1 this is the only dedup there is).

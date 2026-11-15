@@ -320,8 +320,13 @@ def page_loader(arg_cache, page_bytes, kvh, hkv, w, n, g):
     v_load = (v_data + ((w * 4 + g) * BLK + 8 * n) * 4) // 4
     v_scale_load = (v_scl + (n // 2) * BLK + w * KPW + 8 * g) // 4
 
-    def load(page):
+    def load(page, valid=None):
+        """``valid`` (default: always): when false the page is read through a zero-size
+        buffer, so nothing is fetched (a padding-only call may have no pages at all)."""
         base = arg_cache + fx.Int64(page) * fx.Int64(page_bytes)
+        nbytes = fx.Int32(page_bytes)
+        if valid is not None:
+            nbytes = valid.select(nbytes, fx.Int32(0))
         # The page as buffer tensors of 4-, 2- and 1-dword units, indexed by dword.
         pr = [
             ptr_buf_tensor(
@@ -329,7 +334,7 @@ def page_loader(arg_cache, page_bytes, kvh, hkv, w, n, g):
                 fx.Int32,
                 unit_elems=u,
                 unit_stride=1,
-                num_records_bytes=page_bytes,
+                num_records_bytes=nbytes,
             )
             for u in (4, 2, 1)
         ]

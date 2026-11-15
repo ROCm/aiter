@@ -436,31 +436,42 @@ def padding_rows():
 
 
 def padding_empty_table():
-    """A padding-only call (length 0, every slot -1) with an empty block table reads no table
-    entry: the table is not touched when no slot is valid."""
+    """A padding-only call (length 0, every slot -1) touches neither the block table nor
+    the pages: it must work with an empty table and with an empty KV cache ([0, page]).
+    """
     bad = 0
     c = make_case([500], [1], 1, 16, seed=5)
     topk = torch.full_like(c["topk"], -1)
-    bt = torch.zeros(1, 0, dtype=torch.int32, device="cuda")
     zero_len = torch.zeros(1, dtype=torch.int32, device="cuda")
-    for s, x in itertools.product((None, 1, 4), (0, 8)):
-        out = torch.full_like(c["q"], 1.0)
-        sparse_pa_nvfp4_decode(
-            c["q"], c["cache"], topk, bt, zero_len, SM_SCALE, out,
-            c["k_scale"], c["v_scale"], splits=s, xcds=x,
-        )  # fmt: skip
-        if out.abs().max().item() != 0:
-            bad += 1
-            print(f"empty block_table: padding row not zero (splits={s} xcds={x})")
-    for tq, rnd in PREFILL_TQ:
-        out = torch.full_like(c["q"], 1.0)
-        sparse_pa_nvfp4_prefill(
-            c["q"], c["cache"], topk, bt, zero_len, zero_len, SM_SCALE, out,
-            c["k_scale"], c["v_scale"], tq=tq, rounds=rnd,
-        )  # fmt: skip
-        if out.abs().max().item() != 0:
-            bad += 1
-            print(f"empty block_table: prefill padding row not zero (tq={tq})")
+    caches = {
+        "cache": c["cache"],
+        "empty cache": torch.empty(
+            0, c["cache"].shape[1], dtype=torch.uint8, device="cuda"
+        ),
+    }
+    tables = {
+        "empty table": torch.zeros(1, 0, dtype=torch.int32, device="cuda"),
+        "table": torch.zeros(1, 4, dtype=torch.int32, device="cuda"),
+    }
+    for (cn, cache), (bn, bt) in itertools.product(caches.items(), tables.items()):
+        for s, x in itertools.product((None, 1, 4), (0, 8)):
+            out = torch.full_like(c["q"], 1.0)
+            sparse_pa_nvfp4_decode(
+                c["q"], cache, topk, bt, zero_len, SM_SCALE, out,
+                c["k_scale"], c["v_scale"], splits=s, xcds=x,
+            )  # fmt: skip
+            if out.abs().max().item() != 0:
+                bad += 1
+                print(f"{cn} / {bn}: decode padding row not zero (splits={s} xcds={x})")
+        for tq, rnd in PREFILL_TQ:
+            out = torch.full_like(c["q"], 1.0)
+            sparse_pa_nvfp4_prefill(
+                c["q"], cache, topk, bt, zero_len, zero_len, SM_SCALE, out,
+                c["k_scale"], c["v_scale"], tq=tq, rounds=rnd,
+            )  # fmt: skip
+            if out.abs().max().item() != 0:
+                bad += 1
+                print(f"{cn} / {bn}: prefill padding row not zero (tq={tq})")
     return bad
 
 
@@ -539,6 +550,7 @@ def refusals():
         ("cpu q", {"q": c["q"].cpu()}, "CUDA"),
         ("page stride not 4-aligned", {"cache": padded[:, :page_b]}, "4-byte"),
         ("cache base not 4-aligned", {"cache": shifted[:, 1 : page_b + 1]}, "4-byte"),
+        ("cache base +2 bytes", {"cache": shifted[:, 2 : page_b + 2]}, "4-byte"),
         ("q base not 4-aligned", {"q": odd_q}, "4-byte"),
         ("out base not 4-aligned", {"out": odd_q}, "4-byte"),
         (
