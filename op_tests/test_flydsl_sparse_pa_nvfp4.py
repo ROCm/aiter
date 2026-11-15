@@ -121,6 +121,7 @@ def make_case(
     fill=TOPK,  # valid ids per row (<= TOPK incl. the tail)
     junk=False,  # sprinkle invalid ids (-1 in the middle, ids past the tail, negatives)
     dup=0,  # repeat the first `dup` ids of each row in the free slots (out of contract)
+    alias=False,  # every logical block of a request maps to the request's first page
     poison=False,  # NaN (e4m3 0x7f) scale bytes in the unwritten tail of every request's last page
     k_scale=0.05,
     v_scale=0.03,
@@ -135,6 +136,8 @@ def make_case(
     o = 0
     for r in range(reqs):
         bt[r, : nblk[r]] = perm[o : o + nblk[r]].int()
+        if alias:
+            bt[r, : nblk[r]] = bt[r, 0].clone()
         o += nblk[r]
     amp = torch.exp(torch.randn(n_pages, BLK, hkv, 1, generator=g) * 0.25)
     k = (torch.randn(n_pages, BLK, hkv, D, generator=g) * amp).bfloat16()
@@ -203,10 +206,9 @@ def make_case(
     }
 
 
-def run_torch(c, dedup=False):
+def run_torch(c):
     """fp64 reference: attention of every row over the valid keys of its blocks. A block id
-    repeated in a row counts once per slot (decode's behaviour), or once with ``dedup``
-    (prefill's: it attends to the set of a row's blocks)."""
+    repeated in a row counts once per slot (both kernels do the same)."""
     q = c["q"].double()
     rows = q.shape[0]
     hkv, group = c["hkv"], c["group"]
@@ -217,8 +219,6 @@ def run_torch(c, dedup=False):
         sb = (kv - 1) // BLK
         for h in range(hkv):
             ids = [int(b) for b in topk[h, i] if 0 <= int(b) <= sb]
-            if dedup:
-                ids = list(dict.fromkeys(ids))
             if not ids:
                 continue
             kk = torch.cat(
@@ -296,6 +296,7 @@ DECODE_CASES = [
     ("mtp8_g8", [3000, 9], [8, 8], 1, 8, {}),
     ("batch40_h1", [300 + 331 * i for i in range(40)], [1] * 40, 1, 16, {}),
     ("batch130_h4", [200 + 97 * i for i in range(130)], [1] * 130, 4, 16, {"fill": 12}),
+    ("alias_pages", [129, 3000, 700], [1] * 3, 1, 16, {"alias": True}),
 ]
 DECODE_SPLITS = (None, 1, 2, 4, 8, 16)
 
@@ -310,11 +311,15 @@ PREFILL_CASES = [
     ("full_prompt", [1500], [1500], 1, 16, {}),
     ("fewer_than_topk", [900, 400], [900, 100], 1, 16, {"fill": 4}),
     ("junk_ids", [3000, 700], [300, 700], 1, 16, {"junk": True}),
-    # Out of contract (ids within a row should be distinct): a repeated id is attended
-    # once, whatever the tile, so every tile matches the set-semantics oracle.
+    # Out of contract (ids within a row should be distinct): a repeated id counts once per
+    # slot, whatever the tile, so every tile matches the oracle (and the decode kernel).
     ("dup_ids", [3000, 700, 130], [300, 700, 130], 1, 16, {"fill": 12, "dup": 3}),
     ("dup_ids_h2", [900, 2100], [200, 1000], 2, 16, {"fill": 13, "dup": 2}),
     ("ragged_batch", [2000, 33, 4097, 512], [511, 33, 70, 512], 1, 16, {}),
+    # A table that maps several logical blocks of a request to one page: each block keeps
+    # its own causal limit (the first is the block_table [[p, p]] / row_kv 129 case).
+    ("alias_two_blocks", [129], [1], 1, 16, {"alias": True}),
+    ("alias_chunk", [3000, 700, 130], [300, 700, 130], 1, 16, {"alias": True}),
 ]
 PREFILL_TQ = ((4, 2), (4, 1), (2, 1), (1, 1))
 
@@ -353,7 +358,7 @@ def test_prefill_correctness(name, hkv, group, rows, tq, rounds):
     c = make_case(
         seq_lens, q_lens, hkv_, group_, seed=zlib.crc32(name.encode()) % 1000, **kw
     )
-    ref = run_torch(c, dedup=True)
+    ref = run_torch(c)
     out = prefill_call(c, tq=tq, rounds=rounds)
     ok, err, mx = check(f"prefill {name} tq={tq} rounds={rounds}", out, ref)
     return {"rel_l2": err, "max_abs": mx, "ok": ok}
@@ -447,6 +452,15 @@ def padding_empty_table():
         if out.abs().max().item() != 0:
             bad += 1
             print(f"empty block_table: padding row not zero (splits={s} xcds={x})")
+    for tq, rnd in PREFILL_TQ:
+        out = torch.full_like(c["q"], 1.0)
+        sparse_pa_nvfp4_prefill(
+            c["q"], c["cache"], topk, bt, zero_len, zero_len, SM_SCALE, out,
+            c["k_scale"], c["v_scale"], tq=tq, rounds=rnd,
+        )  # fmt: skip
+        if out.abs().max().item() != 0:
+            bad += 1
+            print(f"empty block_table: prefill padding row not zero (tq={tq})")
     return bad
 
 

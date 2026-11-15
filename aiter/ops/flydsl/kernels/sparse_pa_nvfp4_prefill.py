@@ -20,10 +20,13 @@ partial buffers, nothing written but the output.
 Numerics as the decode kernel: exact e2m1 x e4m3 products in f16, f16 Q and P, fp32
 scores / softmax / accumulation, bf16 output.
 
-Block ids within one row must be distinct (a selector emits every block once). The page
-union is deduplicated over every (row, slot) lane of the tile, so a block id repeated in
-a row is attended once, whatever the tile size; the decode kernel attends once per slot
-and would count it twice.
+Every slot of a row is one attended block, as in the decode kernel: a block id repeated
+in a row (a selector never emits one) counts once per slot, and so does a table that maps
+several logical blocks of a request to one page. The union shares the page loads
+(deduplicated over every (row, slot) lane of the tile, so the result does not depend on
+the tile size); each row weights a page by the number of its slots that selected it, and
+a row's own block keeps its causal limit even when another slot of the row reaches the
+same page.
 """
 
 import functools
@@ -126,7 +129,6 @@ def compile_prefill(tq: int = 4, rounds: int = 2):
         w = fx.Int32(fx.rocdl.readfirstlane(T.i32, tx // 64))
         n, g = lane % 16, lane // 16
         topk = global_i32_ptr(arg_topk)
-        bt = global_i32_ptr(arg_bt)
         req_p = global_i32_ptr(arg_req)
         kv_p = global_i32_ptr(arg_kv)
         c = f32_c * fx.Float32(global_f32_ptr(arg_ks)[0])
@@ -141,7 +143,7 @@ def compile_prefill(tq: int = 4, rounds: int = 2):
             fx.make_layout(4, 1),
         )
         lds_atom = fx.make_copy_atom(fx.UniversalCopy128b(), fx.Int32)
-        # Per row (wave-uniform): the page of its own block and its causal limit.
+        # Per row (wave-uniform): its causal limit inside its own block.
         qr = ptr_buf_tensor(
             arg_q,
             fx.Int32,
@@ -181,20 +183,13 @@ def compile_prefill(tq: int = 4, rounds: int = 2):
                 out.append(Vec(r.load()))
             return out
 
-        diag, lim, q_regs = [], [], []
+        lim, q_regs = [], []
         for t in range_constexpr(TQ):
             tok = bidx * TQ + t
             tc = (tok < i32_T).select(tok, fx.Int32(0))
             kv = fx.Int32(fx.rocdl.readfirstlane(T.i32, fx.Int32(kv_p[tc])))
             kv = (tok < i32_T).select(kv, fx.Int32(0))
             pos = kv - 1  # -1: nothing to attend
-            req = fx.Int32(fx.rocdl.readfirstlane(T.i32, fx.Int32(req_p[tc])))
-            own = (pos >= 0).select(pos // BLK, fx.Int32(0))
-            diag.append(
-                fx.Int32(
-                    fx.rocdl.readfirstlane(T.i32, fx.Int32(bt[req * i32_bt_s + own]))
-                )
-            )
             lim.append(pos % BLK - w * KPW)
             if const_expr(not Q_LDS):
                 q_row = (tc * i32_H + kvh * i32_group + head) * (D // 2) + g * 16
@@ -207,41 +202,56 @@ def compile_prefill(tq: int = 4, rounds: int = 2):
 
         load_page = page_loader(arg_cache, i32_page_byte, kvh, i32_hkv, w, n, g)
 
-        # Lane (row lane // 16, slot lane % 16): the page of the block it selected.
+        # Lane (row lane // 16, slot lane % 16): the block it selected, as the key
+        # 2 * page + (1 if it is the row's own, partially visible, block). One load of a
+        # page serves every row that selected it; a page reached through two logical
+        # blocks of one row (a table that maps both to it) is two keys, so each block keeps
+        # its own causal limit.
         lane_tok = bidx * TQ + lane // TOPK
         lane_in = (lane // TOPK < TQ) & (lane_tok < i32_T)
         lane_tc = lane_in.select(lane_tok, fx.Int32(0))
         kv_l = fx.Int32(kv_p[lane_tc])
         blk = fx.Int32(topk[kvh * i32_topk_hs + lane_tc * i32_topk_rs + lane % TOPK])
-        lane_ok = lane_in & (kv_l > 0) & (blk >= 0) & (blk <= (kv_l - 1) // BLK)
-        lane_page = fx.Int32(
-            bt[fx.Int32(req_p[lane_tc]) * i32_bt_s + lane_ok.select(blk, fx.Int32(0))]
+        own_l = (kv_l - 1) // BLK
+        lane_ok = lane_in & (kv_l > 0) & (blk >= 0) & (blk <= own_l)
+        # A slot that is not valid does not read the table (it may have no columns): its
+        # lane loads the row's request id instead, which is discarded.
+        bt_at = (
+            arg_bt
+            + fx.Int64(
+                fx.Int32(req_p[lane_tc]) * i32_bt_s + lane_ok.select(blk, fx.Int32(0))
+            )
+            * 4
         )
-        lane_page = lane_ok.select(lane_page, fx.Int32(-1))
-        valid = fx.Int64(fx.rocdl.ballot(T.i64, lane_page >= 0))
+        lane_page = fx.Int32(global_i32_ptr(lane_ok.select(bt_at, arg_req))[0])
+        lane_key = lane_ok.select(
+            lane_page * 2 + (blk == own_l).select(fx.Int32(1), fx.Int32(0)),
+            fx.Int32(-1),
+        )
+        valid = fx.Int64(fx.rocdl.ballot(T.i64, lane_key >= 0))
         first = (valid != fx.Int64(0)).select(
             fx.Int32(fx.math.cttz(valid).to(fx.Int32)), fx.Int32(0)
         )
 
-        def page_at(mask):
-            """Page of the lowest lane left in ``mask``, the first page when empty."""
+        def key_at(mask):
+            """Key of the lowest lane left in ``mask``, the first lane's when empty."""
             idx = (mask != fx.Int64(0)).select(
                 fx.Int32(fx.math.cttz(mask).to(fx.Int32)), first
             )
-            pg = fx.Int32(fx.rocdl.readlane(T.i32, lane_page, idx))
-            return (pg >= 0).select(pg, fx.Int32(0))
+            key = fx.Int32(fx.rocdl.readlane(T.i32, lane_key, idx))
+            return (key >= 0).select(key, fx.Int32(0))
 
-        raw0 = load_page(page_at(valid))
+        raw0 = load_page(key_at(valid) // 2)
         fx.rocdl.sched_barrier(0)
-        # Union: the first lane of each distinct page, over all TQ x TOPK lanes (the pairs
+        # Union: the first lane of each distinct key, over all TQ x TOPK lanes (the pairs
         # of the last row included; with TQ = 1 this is the only dedup there is).
         n_dup = fx.Int32(0)
         for j in range_constexpr(TOPK * TQ - 1):
-            pj = fx.Int32(fx.rocdl.readlane(T.i32, lane_page, j))
-            n_dup = n_dup + ((lane_page == pj) & (lane > j)).select(
+            kj = fx.Int32(fx.rocdl.readlane(T.i32, lane_key, j))
+            n_dup = n_dup + ((lane_key == kj) & (lane > j)).select(
                 fx.Int32(1), fx.Int32(0)
             )
-        umask = fx.Int64(fx.rocdl.ballot(T.i64, (lane_page >= 0) & (n_dup == 0)))
+        umask = fx.Int64(fx.rocdl.ballot(T.i64, (lane_key >= 0) & (n_dup == 0)))
         n_u = fx.Int32(fx.math.ctpop(umask).to(fx.Int32))
 
         if const_expr(Q_LDS):
@@ -273,11 +283,13 @@ def compile_prefill(tq: int = 4, rounds: int = 2):
                 for t in range_constexpr(TQ)
             ]
             raw = [fx.Int32(st_[n_st + i]) for i in range_constexpr(RAW)]
-            page = page_at(rem)
+            key = key_at(rem)
             rem = rem & (rem - fx.Int64(1))
-            raw_next = load_page(page_at(rem))
+            raw_next = load_page(key_at(rem) // 2)
+            hits = fx.Int64(fx.rocdl.ballot(T.i64, lane_key == key))
+            # An own-block key: the rows hitting it see only the keys up to their limit.
+            own_blk = (key & 1) != 0
             kf, vf = dequant_page(raw)
-            hits = fx.Int64(fx.rocdl.ballot(T.i64, lane_page == page))
             for t in range_constexpr(TQ):
                 m_t, l_t, o_t = m[t], l_run[t], o[t]
                 if (hits.shrui(fx.Int64(TOPK * t)) & fx.Int64(0xFFFF)) != fx.Int64(0):
@@ -288,7 +300,7 @@ def compile_prefill(tq: int = 4, rounds: int = 2):
                         for ks in range_constexpr(NKS):
                             acc = mfma_f16(kf[st][ks], qf[ks], acc)
                         a += [acc[e] for e in range_constexpr(4)]
-                    if page == diag[t]:
+                    if own_blk:
                         a = [
                             (key_off[i] <= lim[t]).select(a[i], neg_inf)
                             for i in range_constexpr(8)
@@ -300,6 +312,15 @@ def compile_prefill(tq: int = 4, rounds: int = 2):
                     m_new = maxf_nn(m_t, xlane4(mx, maxf_nn) * c)
                     m_use = (m_new == neg_inf).select(fx.Float32(0.0), m_new)
                     p = [exp2(fx.math.fma(x, c, -m_use)) for x in a]
+                    # A page reached through n slots of this row (a table that maps n
+                    # logical blocks to it) counts n times, as in the decode kernel.
+                    n_slots = fx.Int32(
+                        fx.math.ctpop(
+                            hits.shrui(fx.Int64(TOPK * t)) & fx.Int64(0xFFFF)
+                        ).to(fx.Int32)
+                    )
+                    if n_slots > 1:
+                        p = [x * n_slots.to(fx.Float32) for x in p]
                     ps = p[0]
                     for i in range_constexpr(1, 8):
                         ps = ps + p[i]
@@ -497,8 +518,8 @@ def sparse_pa_nvfp4_prefill(
     gfx950 only. Every operand must be on ``q``'s device; ``k_scale`` / ``v_scale`` are
     one positive float32 element each (a device value, not checked) and ``sm_scale``
     must be finite and positive. ``row_req_id`` values index ``block_table`` rows (a
-    device value, not checked). Block ids within a row must be distinct; a repeated id
-    is attended once (see the module docstring). ``rounds`` needs ``tq``.
+    device value, not checked). Block ids within a row should be distinct; a repeated id
+    counts once per slot, as in decode (see the module docstring). ``rounds`` needs ``tq``.
     """
     if q.device.type != "cuda":
         raise ValueError(f"q must be a CUDA tensor, got {q.device}")
