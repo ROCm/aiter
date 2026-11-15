@@ -1612,6 +1612,41 @@ def _validate_gqa_heads(query_heads: int, kv_heads: int, operation: str) -> None
         raise ValueError(f"{operation} supports power-of-two GQA ratios up to 16")
 
 
+def _check_block_tile(
+    q_format: AttentionFormat,
+    k_format: AttentionFormat,
+    v_format: AttentionFormat,
+    operands: tuple[int, ...],
+    mode: int,
+    block_tile: tuple[int, int],
+) -> None:
+    """Refuse a geometry these operands have no `mode` row for.
+
+    The raw entry points call this before quantizing: an MX quantizer aborts rather than raises on
+    an arch without the row (the pybind path leaves g_aiter_can_throw unset), so an error raised
+    afterwards would never be seen.
+
+    A scalar query on the accepting path, not a membership test against mha_v4_block_tiles():
+    this sits on the torch.compile path, where only the guarded per-Q-tile read is traceable.
+    Asked for these operands rather than for any, because a geometry can be precision-specific.
+    """
+    q_tile, kv_tile = tuple(block_tile)
+    if kv_tile > 0 and mha_v4_kv_tile_for_q_tile(q_tile, operands, mode) == kv_tile:
+        return
+    mode_name = "Sol-Attn" if mode == MHA_V4_SOL_MODE else "sorted-sparse"
+    if not mha_v4_block_tiles(operands, mode):
+        raise NotImplementedError(
+            f"{mode_name} MHA v4 has no {get_gfx()} row for "
+            f"Q={q_format.name} K={k_format.name} V={v_format.name}"
+        )
+    raise ValueError(
+        f"{mode_name} MHA v4 has no {q_tile}x{kv_tile} kernel on this GPU for "
+        f"q={q_format.name} k={k_format.name} v={v_format.name}; those operands have "
+        f"{mha_v4_block_tiles(operands, mode)} and the GPU has "
+        f"{mha_v4_block_tiles_in_any_precision(mode)} in some precision"
+    )
+
+
 def mha_v4_packed(
     q: Tensor,
     k: Tensor,
@@ -1858,10 +1893,6 @@ def mha_v4_packed(
         _mha_v4_fwd_launch(*launch_args, seqlens_k, lse)
     else:
         mode_name = "Sol-Attn" if pooled is not None else "sorted-sparse"
-        # Scalar query, not a membership test against mha_v4_block_tiles(): this sits on the
-        # torch.compile path, where only the guarded per-Q-tile read is traceable. Asked for these
-        # operands rather than for any, because a geometry can be precision-specific and the
-        # alternative is the launch failing on a missing row naming format codes and no tile.
         operands = mha_v4_operands(
             q_format,
             k_format,
@@ -1873,18 +1904,7 @@ def mha_v4_packed(
         )
         mode = MHA_V4_SOL_MODE if pooled is not None else MHA_V4_SPARSE_MODE
         q_tile, kv_tile = tuple(block_tile)
-        if kv_tile <= 0 or mha_v4_kv_tile_for_q_tile(q_tile, operands, mode) != kv_tile:
-            if not mha_v4_block_tiles(operands, mode):
-                raise NotImplementedError(
-                    f"{mode_name} MHA v4 has no {get_gfx()} row for "
-                    f"Q={q_format.name} K={k_format.name} V={v_format.name}"
-                )
-            raise ValueError(
-                f"{mode_name} MHA v4 has no {q_tile}x{kv_tile} kernel on this GPU for "
-                f"q={q_format.name} k={k_format.name} v={v_format.name}; those operands have "
-                f"{mha_v4_block_tiles(operands, mode)} and the GPU has "
-                f"{mha_v4_block_tiles_in_any_precision(mode)} in some precision"
-            )
+        _check_block_tile(q_format, k_format, v_format, operands, mode, block_tile)
         if k.shape[1] % kv_tile != 0 and not _mha_v4_ragged_kv_from_manifest(
             q_tile, kv_tile, *operands, mode
         ):
@@ -2445,26 +2465,22 @@ def mha_v4(
     lut_start: Optional[Tensor] = None  # noqa: UP045
     lut_count: Optional[Tensor] = None  # noqa: UP045
     if block_mask is not None:
+        operands = mha_v4_operands(
+            q_format,
+            k_format,
+            v_format,
+            q_scale_mode,
+            k_scale_mode,
+            v_scale_mode,
+            recipe.v_pack,
+        )
         # This recipe's own geometry, not the arch's: the rows do not agree on the KV tile at a
         # given Q tile, so the mask has to be cut to the tile these operands dispatch at.
         if block_tile is None:
-            block_tile = mha_v4_block_tile(
-                mha_v4_operands(
-                    q_format,
-                    k_format,
-                    v_format,
-                    q_scale_mode,
-                    k_scale_mode,
-                    v_scale_mode,
-                    recipe.v_pack,
-                ),
-                MHA_V4_SPARSE_MODE,
-            )
-            if block_tile[1] == 0:
-                raise NotImplementedError(
-                    f"block-sparse MHA v4 has no {get_gfx()} row for "
-                    f"Q={q_format.name} K={k_format.name} V={v_format.name}"
-                )
+            block_tile = mha_v4_block_tile(operands, MHA_V4_SPARSE_MODE)
+        _check_block_tile(
+            q_format, k_format, v_format, operands, MHA_V4_SPARSE_MODE, block_tile
+        )
         lut_indices, lut_start, lut_count = _block_mask_to_lut(
             block_mask, q, k, block_tile
         )
@@ -2766,24 +2782,9 @@ def mha_v4_sol(
         if block_tile is None
         else block_tile
     )
-    # Before any quantizer. MX quantization aborts on an arch with no mode-2 row
-    # (the pybind path leaves g_aiter_can_throw unset), so mha_v4_packed's
-    # NotImplementedError would never surface.
-    if (
-        tile_n <= 0
-        or mha_v4_kv_tile_for_q_tile(tile_m, operands, MHA_V4_SOL_MODE) != tile_n
-    ):
-        if not mha_v4_block_tiles(operands, MHA_V4_SOL_MODE):
-            raise NotImplementedError(
-                f"Sol-Attn MHA v4 has no {get_gfx()} row for "
-                f"Q={q_format.name} K={k_format.name} V={v_format.name}"
-            )
-        raise ValueError(
-            f"Sol-Attn MHA v4 has no {tile_m}x{tile_n} kernel on this GPU for "
-            f"q={q_format.name} k={k_format.name} v={v_format.name}; those operands have "
-            f"{mha_v4_block_tiles(operands, MHA_V4_SOL_MODE)} and the GPU has "
-            f"{mha_v4_block_tiles_in_any_precision(MHA_V4_SOL_MODE)} in some precision"
-        )
+    _check_block_tile(
+        q_format, k_format, v_format, operands, MHA_V4_SOL_MODE, (tile_m, tile_n)
+    )
 
     # K smoothing as in mha_v4(). The shift moves every score of a query row by the same q @ k_mean,
     # pooled columns included, since a block mean of k - k_mean is the block mean minus k_mean; and

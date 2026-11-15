@@ -340,6 +340,24 @@ def test_mha_v4_block_mask_without_a_sparse_row_names_the_recipe():
     with expect_raises(NotImplementedError, match="has no .* row for"):
         mha_v4(q, q, q, foreign, foreign, foreign, block_mask=mask)
 
+    # A named geometry is checked before quantizing too, since an MX quantizer aborts where its
+    # recipe has no row. The mask is shaped for that geometry, so only the row check can refuse it.
+    if _lacks_sparse_row("mxfp4"):
+        mxfp4 = AttentionFormat.MXFP4
+        operand = torch.empty((1, 256, 2, 128), device="cuda", dtype=torch.bfloat16)
+        tiled = torch.ones((1, 2, 1, 2), device="cuda", dtype=torch.bool)
+        with expect_raises(NotImplementedError, match="has no .* row for"):
+            mha_v4(
+                operand,
+                operand,
+                operand,
+                mxfp4,
+                mxfp4,
+                mxfp4,
+                block_mask=tiled,
+                block_tile=(256, 128),
+            )
+
     packed = q.cuda()
     lut = torch.zeros(2, device="cuda", dtype=torch.int32)
     per_tensor = AttentionScaleMode.F32_PER_TENSOR
@@ -2986,8 +3004,11 @@ def test_mha_v4_sol_rejects_recipes_without_a_manifest_row():
     recipe = _resolve_raw_recipe(mxfp4, mxfp4, mxfp4, None, None, None, sparse=True)
     operands = mha_v4_operands(mxfp4, mxfp4, mxfp4, *recipe.scale_modes, recipe.v_pack)
     if not mha_v4_block_tiles(operands, MHA_V4_SOL_MODE):
-        with expect_raises(NotImplementedError, match=r"has no .+ row"):
-            mha_v4_sol(dummy, dummy, dummy, mxfp4, mxfp4, mxfp4)
+        for block_tile in (None, (256, 128)):
+            with expect_raises(NotImplementedError, match=r"has no .+ row"):
+                mha_v4_sol(
+                    dummy, dummy, dummy, mxfp4, mxfp4, mxfp4, block_tile=block_tile
+                )
 
 
 def _e8m0_operand(batch, seqlen, heads, head_dim, decades=12.0, seed=0):
