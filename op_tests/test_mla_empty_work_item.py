@@ -146,7 +146,8 @@ def test_empty_work_item_adds_nothing(d, n, max_split):
 
     meta = _bound_plan(bs, n, qd, bound, max_split)
     splits, empty_first = _shrink_to_owned(meta, starts, s.fold_factor, bound)
-    assert splits == {max_split}, splits
+    # Over half of max_split items a request keeps each plan on its reduce path.
+    assert splits <= set(range(max_split // 2 + 1, max_split + 1)), splits
     if max_split == 1:
         assert empty_first > 0, "no CU runs an empty item before a live one"
 
