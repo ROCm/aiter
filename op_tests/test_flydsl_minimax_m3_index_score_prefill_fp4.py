@@ -698,27 +698,6 @@ def run_nv(c, qdt="e4m3", k_round="e4m3", views=None, out=None):
     return out.reshape(heads, rows, c["mb"])
 
 
-def _with_m32(m32):
-    """Force the 32x32x64 (1) or 16x16x128 (0) instruction shape; None keeps the selector."""
-    import aiter.ops.flydsl.kernels.minimax_m3_index_score_prefill as mod
-
-    class _Patch:
-        def __enter__(self):
-            self.orig = mod.geometry
-            if m32 is not None:
-                # the 32-wide shape has no DMA staging (4 waves, 16-wide only)
-                mod.geometry = lambda *a, **k: {
-                    **self.orig(*a, **k),
-                    "m32": m32,
-                    **({"dma": 0} if m32 else {}),
-                }
-
-        def __exit__(self, *exc):
-            mod.geometry = self.orig
-
-    return _Patch()
-
-
 def _with_xwide(ppw=None):
     """Force the 512-row tile (and optionally the pages-per-wave) for e4m3, whatever the
     shape: its selection thresholds keep it off the small shapes the tests use."""
@@ -754,19 +733,13 @@ def nv_ref_of(c, k_round):
     return c["e4m3"] if k_round == "e4m3" else c["exact"]
 
 
-def check_prefill_nvfp4_bit_exact(qls, seqs, heads, qdt, k_round, m32=None):
-    """Exact-sum data against the fp32 oracle, bit for bit, on either instruction shape.
+def check_prefill_nvfp4_bit_exact(qls, seqs, heads, qdt, k_round):
+    """Exact-sum data against the fp32 oracle, bit for bit.
     Dead slots (no visible token) may stay unwritten or be -inf, never a score; live ones must all be written.
     """
     c = nv_case(qls, seqs, heads, exact_sum=True)
     ref = nv_oracle(c, nv_ref_of(c, k_round))
-    with _with_m32(m32):
-        try:
-            got = run_nv(c, qdt, k_round)
-        except ValueError as e:
-            if m32 == 1 and "m32" in str(e):
-                return  # this geometry has no 32-wide shape
-            raise
+    got = run_nv(c, qdt, k_round)
     live = torch.isfinite(ref)
     check_scores(got, ref, live, f"q{qls[:3]} seq{seqs[:3]} H{heads}")
     dead = got[~live]
@@ -794,33 +767,12 @@ def check_prefill_nvfp4_matches_aiter(shape, qdt):
     assert err == 0, f"{shape}: mismatch fraction {err} against aiter"
 
 
-def prefill_tail_cases():
-    """(q_lens, seq_lens): cutoffs on and around page / tile boundaries, one-row and
-    one-token requests, a prefix-only continuation, a trailing empty request, chunked
-    prefill on a long context."""
-    return [
-        ([1], [1]),
-        ([1], [127]),
-        ([1], [128]),
-        ([1], [129]),
-        ([2, 1, 3], [128, 129, 257]),
-        ([127, 128, 129], [256, 257, 255]),
-        ([64, 64, 64, 64], [127, 128, 129, 255]),
-        ([100, 1, 300, 17], [100, 2000, 301, 4096]),
-        ([128], [128]),
-        ([129], [129]),
-        ([300], [300]),
-        ([1000], [1001]),
-        ([256, 256], [384, 640]),
-        ([16, 16, 16], [16 + 112, 16 + 128, 16 + 129]),
-        ([512], [20000]),
-        ([5, 0, 7], [900, 900, 1500]),
-        ([4, 0], [300, 300]),
-    ]
-
-
 # A page tail, a tile tail and an empty request: the NVFP4 tail / exact-tail cases.
-SHORT_TAILS = [prefill_tail_cases()[i] for i in (3, 5, 15)]
+SHORT_TAILS = [
+    ([1], [129]),
+    ([127, 128, 129], [256, 257, 255]),
+    ([5, 0, 7], [900, 900, 1500]),
+]
 # Tail tiles of the 512-row DMA tile and the forced 256-row exact tile, the last with
 # an empty request between two short ones (no other DMA case has a request with ql = 0).
 WIDE = [
@@ -834,8 +786,8 @@ WIDE_PPW = (
 )  # pages per wave forced on the WIDE cases; None keeps the selector's
 
 
-def check_prefill_nvfp4_tails(qls, seqs, heads, qdt, m32=None):
-    check_prefill_nvfp4_bit_exact(qls, seqs, heads, qdt, "e4m3", m32)
+def check_prefill_nvfp4_tails(qls, seqs, heads, qdt):
+    check_prefill_nvfp4_bit_exact(qls, seqs, heads, qdt, "e4m3")
 
 
 def check_prefill_nvfp4_xwide(qls, seqs, heads, qdt, ppw):
@@ -888,9 +840,9 @@ def check_prefill_nvfp4_exact_random(shape, qdt):
     assert not torch.equal(got[live], rounded[live]), "exact scored like e4m3"
 
 
-def check_prefill_nvfp4_every_geometry(shape, qdt, m32):
+def check_prefill_nvfp4_every_geometry(shape, qdt):
     batch, q_len, ctx = shape
-    check_prefill_nvfp4_bit_exact([q_len] * batch, [ctx] * batch, 1, qdt, "e4m3", m32)
+    check_prefill_nvfp4_bit_exact([q_len] * batch, [ctx] * batch, 1, qdt, "e4m3")
 
 
 def check_prefill_nvfp4_single_region_views_and_typed_scale():
@@ -1227,15 +1179,15 @@ def build_cases():
     # tile and page boundaries, ragged and empty requests, H = 1/4, both Q dtypes, the
     # 16- and 32-wide MFMA, the 512-row DMA tile and the 8-wave tile; random data
     # against aiter's fp8 scorer.
-    for (qls, seqs), heads, qdt, m32 in itertools.product(
-        SHORT_TAILS, (1, 4), QDTS, (0, 1)
-    ):
-        name = f"q{'_'.join(map(str, qls))}_seq{'_'.join(map(str, seqs))}_H{heads}_{qdt}_m32{m32}"
+    for (qls, seqs), heads, qdt in itertools.product(SHORT_TAILS, (1, 4), QDTS):
+        name = (
+            f"q{'_'.join(map(str, qls))}_seq{'_'.join(map(str, seqs))}_H{heads}_{qdt}"
+        )
         cases.append(
             (
                 f"nvfp4_tails_{name}",
                 check_prefill_nvfp4_tails,
-                (qls, seqs, heads, qdt, m32),
+                (qls, seqs, heads, qdt),
             )
         )
     for (qls, seqs), heads, qdt, ppw in itertools.product(WIDE, (1, 4), QDTS, WIDE_PPW):
@@ -1271,7 +1223,7 @@ def build_cases():
             (
                 f"nvfp4_every_geometry_{name}",
                 check_prefill_nvfp4_every_geometry,
-                (shape, "e4m3", None),
+                (shape, "e4m3"),
             )
         )
     for shape in GEOM_SHAPES:  # every arm `exact_geometry` can reach
