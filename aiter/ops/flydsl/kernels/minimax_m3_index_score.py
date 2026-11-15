@@ -309,7 +309,7 @@ def e4m3_to_f32(byte):
 def e4m3_table_words(scale_f32):
     """The 8 e4m3 bytes `e4m3_rn_satfinite(mag * scale)` for mag in E2M1_MAGS, as two
     dwords (entries 0..3, 4..7). Same clamp-then-convert as `nvfp4_dword_to_bf16`,
-    which the op test `check_nvfp4_matches_oracle` pins to bit equality with the torch
+    which the op test `check_nvfp4_bit_exact` pins to bit equality with the torch
     reference."""
     hi = fx.Float32(E4M3_MAX)
     v = [(fx.Float32(m) * scale_f32).minimumf(hi) for m in E2M1_MAGS]
@@ -351,7 +351,7 @@ def e4m3_scale_raw_f16x2(byte):
     bit pattern is `(byte & 0x7F) << 7` -- the scale / 2^8 (f16 denormals for the
     subnormal scales, as `e4m3_scale_raw` does in f32) -- so `UNDO_SCALE_RAW_F16` times
     it is the scale. Every e4m3 scale is a normal f16, and so is every e2m1 * scale
-    (2^-10 .. 2688, five significant bits), which is why K can be held in f16 exactly.
+    (2^-10 .. 2688, six significant bits), which is why K can be held in f16 exactly.
     """
     # One u24 multiply puts `u << 7` in both halves (the two products are 16 bits apart
     # and 7 bits wide, so they cannot overlap).
@@ -577,8 +577,10 @@ def geometry(batch, max_block, S, H, cp_world=1, cp_rank=0, device=None, nvfp4=F
                     an extra CTA holding one page is nearly free, holding four
                     is not.
     nvfp4           the depth table tuned for the NVFP4 decode scorer (default False: the
-                    table MXFP4 and every existing work map use). A map built with
-                    `nvfp4=True` is only valid for `score_flydsl_nvfp4`; see `_validate_metadata`.
+                    table MXFP4 and every existing work map use). The tables differ only at
+                    S8H4, batches 5..16; there a map built with `nvfp4=True` is only valid
+                    for `score_flydsl_nvfp4` (see `_validate_metadata`), elsewhere the two
+                    maps are identical.
     """
     if not isinstance(batch, int) or not 0 <= batch <= 0xFFFF:
         raise ValueError("batch must be in [0, 65535] for packed request IDs")
@@ -951,7 +953,7 @@ def build_index_score(
             q_b = [load_q8_even_odd(i) for i in range_constexpr(FEAT_TILES_PER_WAVE)]
         elif const_expr(q8_scaled):
             q_b = [load_q8(i) for i in range_constexpr(FEAT_TILES_PER_WAVE)]
-        elif const_expr(nvfp4 and q_fp8):
+        elif const_expr(f16_arm):
             q_frag = [load_q8_lifted(i) for i in range_constexpr(FEAT_TILES_PER_WAVE)]
             mma_atom = fx.make_mma_atom(
                 fx.rocdl.MFMA(
@@ -1771,7 +1773,8 @@ def work_map_size(
     instead -- the exact grid is non-monotonic in the bounds -- and passes a
     `buf[:rows]` slice. S/H must match the `score_flydsl` call the map is for:
     they change the geometry, and a map built for a different one is a map the
-    kernel would index with the wrong stride.
+    kernel would index with the wrong stride. `nvfp4=True` (through `**cp`, as in
+    `build_work_map`) sizes the map for `score_flydsl_nvfp4`'s tuned depth table.
     """
     return _validate_bounds(
         batch, max_block, geometry(batch, max_block, S, H, device=device, **cp)
@@ -1822,6 +1825,8 @@ def build_work_map(seq_lens, max_block, S: int, H: int, out=None, **cp):
     answers in step, and a disagreement is not a crash -- it is a map the
     kernel indexes with the wrong stride. `out` may be a larger persistent
     buffer and is sliced down; a short one is an error, not a truncated grid.
+    `nvfp4=True` (through `**cp` into `geometry`) is how a caller gets the depth table
+    tuned for `score_flydsl_nvfp4`.
     """
     import torch
 
@@ -2443,8 +2448,9 @@ def score_flydsl_nvfp4(
     bf16 or e4m3. `k_round` is "e4m3" (the default: K = e4m3_rn_satfinite(e2m1 *
     scale), the fp8 MFMA with an e4m3 Q) or "exact" (K = e2m1 * scale, no rounding, on
     the bf16 MFMA, or on the f16 MFMA with an e4m3 Q). Scale bytes must be non-negative
-    e4m3 (sign bit unread) and not
-    0x7F. Work map and score layout as in `score_flydsl`.
+    e4m3 (sign bit unread) and not 0x7F. Work map and score layout as in `score_flydsl`;
+    `build_work_map(..., nvfp4=True)` builds the map for this scorer's tuned depth table
+    (S8H4, batches 5..16), which `work_map=None` also resolves.
     """
     if k_round not in NVFP4_ROUNDINGS:
         raise ValueError(f"k_round must be one of {NVFP4_ROUNDINGS}, got {k_round!r}")
