@@ -3,7 +3,7 @@
 
 """MiniMax-M3 NVFP4 sparse paged attention, decode (FlyDSL, gfx950).
 
-The kernel takes the selector's output directly: ``topk_idx [Hkv, rows, 16]`` logical
+The kernel takes the selector's output directly: ``topk_idx [Hkv, rows, topk]`` logical
 128-token block ids plus the request block table; K / V pages are the single-buffer
 NVFP4 page (see ``kernels/sparse_pa_nvfp4_common.py``).
 
@@ -29,6 +29,7 @@ import torch
 import aiter
 from aiter.jit.utils.chip_info import get_gfx_runtime
 from aiter.ops.flydsl.kernels.sparse_pa_nvfp4_decode import (
+    MAX_SPLIT_ROWS,
     _split_buffers,
     _unit_scale,
     sparse_pa_nvfp4_decode,
@@ -431,6 +432,9 @@ def refusals():
     # refused (the 8 GiB buffer below is never read; the refusal comes first).
     c2 = make_case([500, 700], [1, 1], 2, 8, seed=5)
     wide = torch.empty(2**31 + 64, dtype=torch.int32, device="cuda")
+    # 513 rows x 2 kv heads = 1026 > MAX_SPLIT_ROWS units: only splits = 1 can hold them.
+    c3 = make_case([128] * 513, [1] * 513, 2, 8, seed=5)
+    over = {k: c3[k] for k in ("q", "cache", "bt", "seq_lens", "topk")}
     cases = [
         ("splits > MAX_SPLITS", {"splits": 32}, "splits must be"),
         ("splits 0", {"splits": 0}, "splits must be"),
@@ -445,6 +449,26 @@ def refusals():
         ("fp16 q", {"q": c["q"].half()}, "bfloat16"),
         ("group 4", {"q": c["q"][:, :4]}, "8 or 16 heads"),
         ("2-D topk_idx", {"topk": c["topk"][0]}, "must be 3-D"),
+        (
+            "strided topk_idx last dim",
+            {"topk": torch.stack([c["topk"], c["topk"]], -1)[..., 0]},
+            "with a unit last stride",
+        ),
+        (
+            "non-contiguous q",
+            {
+                "q": torch.empty(2, 16, 2 * D, dtype=torch.bfloat16, device="cuda")[
+                    ..., :D
+                ]
+            },
+            "q and out must be contiguous",
+        ),
+        ("rows != reqs * query_len", {"query_len": 2}, "rows must be reqs * query_len"),
+        (
+            "splits 2 with rows * Hkv > MAX_SPLIT_ROWS",
+            {**over, "splits": 2},
+            f"splits > 1 needs rows * Hkv <= {MAX_SPLIT_ROWS}",
+        ),
         ("int64 topk_idx", {"topk": c["topk"].long()}, "topk_idx must be int32"),
         ("sm_scale 0", {"sm_scale": 0.0}, "sm_scale"),
         ("sm_scale nan", {"sm_scale": float("nan")}, "sm_scale"),
@@ -483,12 +507,13 @@ def refusals():
         a = {
             "q": c["q"], "cache": cache, "sm_scale": SM_SCALE, "k_scale": ks,
             "v_scale": c["v_scale"], "splits": None, "bt": c["bt"],
-            "seq_lens": c["seq_lens"], "xcds": None, "topk": c["topk"], "out": None, **kw,
+            "seq_lens": c["seq_lens"], "xcds": None, "topk": c["topk"], "out": None,
+            "query_len": 1, **kw,
         }  # fmt: skip
         try:
             sparse_pa_nvfp4_decode(
                 a["q"], a["cache"], a["topk"], a["bt"], a["seq_lens"], a["sm_scale"],
-                a["out"], a["k_scale"], a["v_scale"], query_len=1, splits=a["splits"],
+                a["out"], a["k_scale"], a["v_scale"], query_len=a["query_len"], splits=a["splits"],
                 xcds=a["xcds"],
             )  # fmt: skip
         except ValueError as e:
@@ -499,6 +524,11 @@ def refusals():
             print(f"refusal: {name} was accepted")
         bad += 1
     decode_call(c, 16)  # the largest split count still launches
+    # Past the limit the default falls back to one workgroup per unit; only an explicit
+    # split count is refused.
+    if not torch.equal(decode_call(c3), decode_call(c3, 1)):
+        print("rows * Hkv > MAX_SPLIT_ROWS: the default is not splits = 1")
+        bad += 1
     # An aligned padded page is accepted and reads the same data.
     pad4 = torch.zeros(pages, page_b + 4, dtype=torch.uint8, device="cuda")
     pad4[:, :page_b] = cache

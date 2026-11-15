@@ -80,6 +80,8 @@ MAX_SPLIT_ROWS = 1024  # (row, kv head) pairs a split launch can hold
 
 def _atomic_add(addr_i64, value):
     """Relaxed agent-scope atomic add on a global i32; returns the old value."""
+    # llvm atomicrmw, not a copy atom: FlyDSL 0.5.0's UniversalAtomicAdd / BufferAtomicAdd
+    # accumulate into memory but return nothing, and the merge needs the old value (ticket).
     return fx.llvm.atomic_add(
         global_i32_ptr(addr_i64),
         fx.Int32(value),
@@ -89,8 +91,9 @@ def _atomic_add(addr_i64, value):
 
 
 def _page_loader(arg_cache, page_bytes, kvh, hkv, w, n, g):
-    """``(open_page, load_k, load_v)``: ``open_page(page, valid)`` is the buffer resource of a
-    page and ``load_k`` / ``load_v`` read this lane's share of its K / V side as raw dwords:
+    """``(open_page, load_k, load_v)``: ``open_page(page, valid)`` returns a page as three
+    buffer tensors (4-, 2- and 1-dword units) and ``load_k`` / ``load_v`` read this lane's
+    share of its K / V side as raw dwords:
 
       K: raw[0:4], raw[4:8]  K data of key rows st = 0, 1 (dims 32 g .. 32 g + 31)
          raw[8]              K scale bytes [st][group] of those rows

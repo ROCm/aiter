@@ -144,7 +144,9 @@ def pk_bf16(a, b):
 
 
 def bf16x8_to_f16(v):
-    """4 dwords of 8 bf16 -> 4 dwords of 8 f16 (exact unless |x| > 65504)."""
+    """4 dwords of 8 bf16 -> 4 dwords of 8 f16 (RNE). Exact for 2^-14 <= |x| < 2^16; smaller |x|
+    rounds to a multiple of 2^-24 (f16 subnormals; |x| <= 2^-25 gives 0), larger gives inf.
+    """
     return Vec(v).bitcast(fx.BFloat16).to(fx.Float32).to(fx.Float16).bitcast(fx.Int32)
 
 
