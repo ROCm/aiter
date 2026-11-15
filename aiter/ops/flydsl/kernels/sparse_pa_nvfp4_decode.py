@@ -710,7 +710,9 @@ def sparse_pa_nvfp4_decode(
     late_v: bool | None = None,
 ) -> torch.Tensor:
     """Row i is query token i % query_len of request i // query_len and attends to
-    the keys of its ``topk_idx`` blocks up to its position.
+    the keys of its ``topk_idx`` blocks up to its position. Block ids within a row must
+    be distinct (a selector emits every block once): the kernel attends once per slot,
+    so a repeated id would be counted twice.
 
     gfx950 only. Every operand must be on ``q``'s device; ``k_scale`` / ``v_scale`` are
     one positive float32 element each (a device value, not checked) and ``sm_scale``
