@@ -734,7 +734,7 @@ def test_decode_perf(rows, query_len, hkv, group, ctx):
 @benchmark()
 def test_prefill_perf(q_len, hkv, group, ctx):
     """One request, a chunk of ``q_len`` rows ending at ``ctx`` keys; random top-k blocks
-    per row (no overlap between neighbouring rows, the worst case for the page reuse).
+    per row (neighbouring rows overlap only by chance: a low case for the page reuse).
     """
     pool, kd, vd = perf_pool(hkv, 8192)
     g = torch.Generator(device="cuda").manual_seed(2)

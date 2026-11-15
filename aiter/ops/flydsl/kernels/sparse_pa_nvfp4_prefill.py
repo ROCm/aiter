@@ -144,7 +144,6 @@ def compile_prefill(tq: int = 4, rounds: int = 2):
             fx.make_layout(4, 1),
         )
         lds_atom = fx.make_copy_atom(fx.UniversalCopy128b(), fx.Int32)
-        # Per row (wave-uniform): its causal limit inside its own block.
         qr = ptr_buf_tensor(
             arg_q,
             fx.Int32,
@@ -186,6 +185,7 @@ def compile_prefill(tq: int = 4, rounds: int = 2):
 
         lim, q_regs = [], []
         for t in range_constexpr(TQ):
+            # Per row (wave-uniform): its causal limit inside its own block.
             tok = bidx * TQ + t
             tc = (tok < i32_T).select(tok, fx.Int32(0))
             kv = fx.Int32(fx.rocdl.readfirstlane(T.i32, fx.Int32(kv_p[tc])))
