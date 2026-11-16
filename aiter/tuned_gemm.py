@@ -24,11 +24,12 @@ import torch.nn.functional as F
 from torch import Tensor
 
 from aiter import dtypes, gemm_a16w16_asm, hipb_create_extension, hipb_mm, logger
-from aiter.jit.core import AITER_CONFIGS, AITER_LOG_TUNED_CONFIG
+from aiter.jit.core import AITER_CONFIGS, AITER_LOG_MORE, AITER_LOG_TUNED_CONFIG
 from aiter.jit.utils.build_targets import base_gfx_arch
 from aiter.jit.utils.chip_info import get_cu_num, get_gfx
 from aiter.jit.utils.torch_guard import torch_compile_guard
 from aiter.ops.gemm_op_common import get_padded_m
+from aiter.ops.gradlib import _hipb_mm
 
 try:
     from aiter.ops.opus import opus_gemm as _opus_launch
@@ -321,6 +322,12 @@ def get_GEMM_A16W16_config(
     return config
 
 
+@functools.cache
+def _record_gemm_shapes() -> bool:
+    """AITER_TUNE_GEMM, read once: shape recording is on or off for the run."""
+    return bool(int(os.environ.get("AITER_TUNE_GEMM", "0")))
+
+
 def save_shapes(
     M,
     N,
@@ -331,9 +338,8 @@ def save_shapes(
     scaleAB,
     bpreshuffle,
 ):
-    save_gemm = int(os.environ.get("AITER_TUNE_GEMM", "0"))
     global tuned_df
-    if save_gemm:
+    if _record_gemm_shapes():
         tuned_df = pd.concat(
             [
                 tuned_df,
@@ -398,6 +404,264 @@ def gemm_a16w16_out(
     """`gemm_a16w16` written into ``out`` -- the [M, N] tensor of ``otype`` --
     for a caller whose consumer reads one fixed address."""
     _gemm_a16w16(A, B, bias, otype, scale_a, scale_b, scale_c, out)
+
+
+# The custom ops: what torch.compile records, and what runs every call the
+# eager fast path below declines.
+_gemm_a16w16_op = gemm_a16w16
+_gemm_a16w16_out_op = gemm_a16w16_out
+# `_eager_body` is set only when the guard registered the op itself; a
+# registration made elsewhere may run a different body, which the fast path
+# must not stand in for.
+_eager_ops_are_ours = all(
+    hasattr(op, "_eager_body") for op in (gemm_a16w16, gemm_a16w16_out, _hipb_mm)
+)
+
+# Eager fast path. Outside torch.compile a hipBLASLt GEMM spends far longer in
+# Python than in C++: two torch.ops dispatches (aiter::gemm_a16w16, then
+# aiter::_hipb_mm), the routing in `_gemm_a16w16`, the gradlib wrapper and the
+# per-call argument conversion of the develop-mode op. `_hipblaslt_eager` makes
+# the same C++ call directly -- the same config lookup, solution index and
+# arguments, so the same algorithm and the same bits -- and declines (None)
+# whenever that path may do something else.
+_eager_hipb = None  # pybind entry points once resolved; False: off for the run
+_eager_gfx_cu: dict[int, tuple[str, int]] = {}
+_eager_dtype_str: dict[torch.dtype, str] = {}
+_eager_tensor_types: dict[type, bool] = {torch.Tensor: True, torch.nn.Parameter: True}
+
+
+def _eager_tensor_type(cls: type) -> bool:
+    """Whether tensors of type ``cls`` may skip the dispatcher.
+
+    A subclass that takes over ``__torch_dispatch__`` (FakeTensor, functional
+    and wrapper tensors) has to see the op. One that only overrides
+    ``__torch_function__`` is caught per call by ``torch._C._has_torch_function``.
+    """
+    ok = _eager_tensor_types.get(cls)
+    if ok is None:
+        ok = issubclass(cls, torch.Tensor) and (
+            cls.__torch_dispatch__ is torch.Tensor.__torch_dispatch__
+        )
+        _eager_tensor_types[cls] = ok
+    return ok
+
+
+def _eager_device_gfx_cu(index: int) -> tuple[str, int]:
+    """The (gfx, cu_num) `_gemm_a16w16` looks configs up with, once per device."""
+    from aiter.ops.opus._arch import SUPPORTED_OPUS_ARCHES, _device_arch_and_cu
+
+    gfx, cu_num = _device_arch_and_cu(torch.device("cuda", index))
+    if gfx not in SUPPORTED_OPUS_ARCHES:
+        gfx, cu_num = get_gfx(), get_cu_num()
+    _eager_gfx_cu[index] = (gfx, cu_num)
+    return gfx, cu_num
+
+
+def _eager_dtype_name(dtype: torch.dtype) -> str:
+    return _eager_dtype_str.setdefault(dtype, str(dtype))
+
+
+def _resolve_eager_hipb():
+    """The pybind entry points `_hipblaslt_eager` calls, once they exist.
+
+    None until the custom-op path has created the hipBLASLt extension: the first
+    hipBLASLt GEMM of a process always runs there. False, for the rest of the
+    run, when that path has per-call side effects someone asked for (shape
+    recording, per-op argument logging), when this torch lacks a probe the
+    guards need, or when an op runs a body other than the one registered here.
+    """
+    global _eager_hipb
+    if not extensions_created:
+        return None
+    from aiter.jit.core import _pybind_develop_hooks, get_module
+
+    dispatch_modes = getattr(torch._C, "_len_torch_dispatch_stack", None)
+    functorch_active = getattr(torch._C, "_are_functorch_transforms_active", None)
+    jit_tracing = getattr(torch._C, "_is_tracing", None)
+    if (
+        not _eager_ops_are_ours
+        or _record_gemm_shapes()
+        or AITER_LOG_MORE >= 2
+        or dispatch_modes is None
+        or functorch_active is None
+        or jit_tracing is None
+    ):
+        _eager_hipb = False
+        return False
+    convert, _, raw_stream, current_device = _pybind_develop_hooks()
+    module = get_module("module_hipbsolgemm")
+    _eager_hipb = (
+        module._set_current_hip_stream,
+        module.hipb_mm,
+        convert,
+        raw_stream,
+        current_device,
+        dispatch_modes,
+        functorch_active,
+        jit_tracing,
+    )
+    return _eager_hipb
+
+
+def _hipblaslt_eager(
+    A: Tensor,
+    B: Tensor,
+    bias: Tensor | None,
+    otype: torch.dtype | None,
+    out: Tensor | None,
+) -> Tensor | None:
+    """An unscaled `gemm_a16w16` (``out`` None) or `gemm_a16w16_out`, run
+    without the dispatcher when its tuned config is hipBLASLt.
+
+    Returns the result -- ``out`` itself when given -- or None to leave the call
+    to the custom op: under torch.compile or jit tracing, inside any dispatch
+    mode, torch-function mode or functorch transform, for tensor subclasses that
+    intercept ops, inputs autograd would record, inputs `_gemm_a16w16` does not
+    simply reshape, and every config that is not hipBLASLt.
+    ``get_GEMM_A16W16_config`` is called through the module attribute on every
+    call, exactly as `_gemm_a16w16` calls it, so a replacement installed at any
+    time is honoured and its results are never cached here.
+    """
+    if torch.compiler.is_compiling():
+        return None
+    hipb = _eager_hipb
+    if hipb is None:
+        hipb = _resolve_eager_hipb()
+    if not hipb:
+        return None
+    (
+        set_stream,
+        hipb_mm_op,
+        convert,
+        raw_stream,
+        current_device,
+        dispatch_modes,
+        functorch_active,
+        jit_tracing,
+    ) = hipb
+    known = _eager_tensor_types.get
+    if (
+        dispatch_modes()
+        or functorch_active()
+        or jit_tracing()
+        or torch._C._has_torch_function((A, B, bias, out))
+        or not (known(type(A)) or _eager_tensor_type(type(A)))
+        or not (known(type(B)) or _eager_tensor_type(type(B)))
+        or not (bias is None or known(type(bias)) or _eager_tensor_type(type(bias)))
+        or not (out is None or known(type(out)) or _eager_tensor_type(type(out)))
+    ):
+        return None
+    if torch.is_grad_enabled() and (
+        A.requires_grad
+        or B.requires_grad
+        or (bias is not None and bias.requires_grad)
+        or (out is not None and out.requires_grad)
+    ):
+        return None
+    if B.dim() != 2:
+        return None
+    ndim = A.dim()
+    if ndim == 2:
+        inp = A
+    elif ndim > 2:
+        try:
+            inp = A.view(-1, A.size(-1))
+        except RuntimeError:
+            return None
+    else:
+        return None
+    index = inp.get_device()
+    if index < 0:
+        return None
+    m, k = inp.shape
+    n = B.shape[0]
+    if otype is None:
+        otype = inp.dtype
+    elif type(otype) is not torch.dtype:
+        return None
+    if out is not None and out.dtype != otype:
+        return None
+    bpreshuffle = getattr(B, "is_shuffled", None) is True
+    gfx, cu_num = _eager_gfx_cu.get(index) or _eager_device_gfx_cu(index)
+    config = get_GEMM_A16W16_config(
+        M=m,
+        N=n,
+        K=k,
+        bias=bias is not None,
+        dtype=_eager_dtype_str.get(inp.dtype) or _eager_dtype_name(inp.dtype),
+        otype=_eager_dtype_str.get(otype) or _eager_dtype_name(otype),
+        scaleAB=False,
+        bpreshuffle=bpreshuffle,
+        gfx=gfx,
+        cu_num=cu_num,
+    )
+    if not isinstance(config, dict) or config.get("libtype") != "hipblaslt":
+        return None
+    if out is None:
+        result = torch.empty((m, n), dtype=otype, device=inp.device)
+    else:
+        try:
+            result = out.view(-1, n)
+        except RuntimeError:
+            return None
+    # What hipb_gemm -> hipb_mm -> the develop-mode _hipb_mm wrapper hand over.
+    set_stream(raw_stream(current_device()))
+    hipb_mm_op(
+        convert(inp),
+        convert(B.t()),
+        config["solidx"],
+        convert(result),
+        None if bias is None else convert(bias),
+        None,
+        None,
+        None,
+        bpreshuffle,
+        None,
+        None,
+        None,
+    )
+    if out is not None:
+        return out
+    return result if ndim == 2 else result.view(*A.shape[:-1], n)
+
+
+def gemm_a16w16(
+    A: Tensor,
+    B: Tensor,
+    bias: Tensor | None = None,
+    otype: torch.dtype | None = None,
+    scale_a: Tensor | None = None,
+    scale_b: Tensor | None = None,
+    scale_c: Tensor | None = None,
+) -> Tensor:
+    """``A @ B.T`` (+ ``bias``) in ``otype``: the tuned BF16/FP16 GEMM."""
+    if scale_a is None and scale_b is None and scale_c is None:
+        result = _hipblaslt_eager(A, B, bias, otype, None)
+        if result is not None:
+            return result
+    return _gemm_a16w16_op(A, B, bias, otype, scale_a, scale_b, scale_c)
+
+
+def gemm_a16w16_out(
+    A: Tensor,
+    B: Tensor,
+    out: Tensor,
+    bias: Tensor | None = None,
+    otype: torch.dtype | None = None,
+    scale_a: Tensor | None = None,
+    scale_b: Tensor | None = None,
+    scale_c: Tensor | None = None,
+) -> None:
+    """`gemm_a16w16` written into ``out`` -- the [M, N] tensor of ``otype`` --
+    for a caller whose consumer reads one fixed address."""
+    if (
+        scale_a is None
+        and scale_b is None
+        and scale_c is None
+        and _hipblaslt_eager(A, B, bias, otype, out) is not None
+    ):
+        return
+    _gemm_a16w16_out_op(A, B, out, bias, otype, scale_a, scale_b, scale_c)
 
 
 def _gemm_a16w16(
