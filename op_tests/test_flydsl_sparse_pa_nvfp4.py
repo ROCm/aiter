@@ -1040,16 +1040,17 @@ def capture_prefill_scales():
 def two_streams(n=64, rounds=3):
     """Split launches on two streams of one device. Each stream replays a graph of ``n``
     launches (back to back, so they overlap), unsynchronised, every launch with its own
-    output. With a workspace per stream (partials poisoned with NaN) every output matches the
-    oracle; the same launches on the shared default scratch are the caller's error: their
-    wrong outputs are only reported (a race, so the count varies), then the tickets are reset.
+    output. With a workspace per stream (partials poisoned with NaN) every output passes
+    ``check`` against the oracle (componentwise too); the same launches on the shared default
+    scratch are the caller's error: their wrong outputs are only reported (a race, so the
+    count varies), then the tickets are reset.
     """
     dev = torch.cuda.current_device()
     c = make_case([3000, 2300, 900, 130, 2000, 1500, 700, 5000], [1] * 8, 1, 16, seed=3)
     ref = run_torch(c)
     decode_call(c, 4)  # loads the variant and the default scratch
 
-    def wrong_outputs(workspaces):
+    def wrong_outputs(workspaces, ok):
         streams = [torch.cuda.Stream() for _ in range(2)]
         outs = [[torch.empty_like(c["q"]) for _ in range(n)] for _ in streams]
         graphs = []
@@ -1072,23 +1073,22 @@ def two_streams(n=64, rounds=3):
                 with torch.cuda.stream(st):
                     g.replay()
             torch.cuda.synchronize()
-            wrong += sum(
-                not (
-                    rel_l2(o, ref) <= REL_L2_TOL
-                    and bool(torch.isfinite(o.float()).all())
-                )
-                for os in outs
-                for o in os
-            )
+            wrong += sum(not ok(o) for os in outs for o in os)
         return wrong
 
     wss = [sparse_pa_nvfp4_decode_alloc(dev) for _ in range(2)]
     for ws in wss:
         ws.partials.fill_(float("nan"))
-    bad = wrong_outputs(wss)
+    bad = wrong_outputs(
+        wss, lambda o: check("two streams, a workspace each", o, ref)[0]
+    )
     if bad:
         print(f"two streams, a workspace each: {bad} of {2 * n * rounds} outputs wrong")
-    shared = wrong_outputs([None, None])
+    shared = wrong_outputs(  # diagnostic only: a whole-output norm is enough to count
+        [None, None],
+        lambda o: rel_l2(o, ref) <= REL_L2_TOL
+        and bool(torch.isfinite(o.float()).all()),
+    )
     _split_buffers(dev).tickets.zero_()
     print(
         f"two streams, shared default scratch (caller error): {shared} of {2 * n * rounds} outputs wrong"
