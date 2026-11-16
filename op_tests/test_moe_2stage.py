@@ -1066,6 +1066,15 @@ def _iter_csv_cases():
             or kernel_name2.startswith("opus_")
             or kwargs["disable_stage1_bias"]
         )
+        if (
+            kwargs["actType"] == aiter.ActivationType.Swiglu
+            and kwargs["AQDType"] == dtypes.bf16
+            and kwargs["WQDType"] == dtypes.fp4x2
+            and kwargs["inter_dim"] % 256 != 0
+        ):
+            # fused_moe reroutes these to a16w4 FlyDSL, which takes no per-expert bias.
+            kwargs["disable_stage1_bias"] = True
+            kwargs["disable_stage2_bias"] = True
         if is_swiglu_oai_asm:
             # The asm FLAT kernels take no per-expert bias; with one, fused_moe
             # discards the row. Run bias-free and require the row's kernel.
