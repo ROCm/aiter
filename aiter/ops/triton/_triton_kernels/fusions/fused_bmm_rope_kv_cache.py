@@ -1114,7 +1114,11 @@ def _fp8_mma_store(
     tl.store(c_ptrs, c_val, mask=c_mask)
 
 
-@triton.jit(repr=_fused_fp8_bmm_rope_prefill_repr)
+# The token count changes from call to call. Do not compile again for it.
+@triton.jit(
+    repr=_fused_fp8_bmm_rope_prefill_repr,
+    do_not_specialize=["M", "bmm_programs", "grid_mn"],
+)
 def _fused_fp8_bmm_rope_prefill_kernel(
     a_ptr,
     b_ptr,
