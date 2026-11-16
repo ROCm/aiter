@@ -339,7 +339,7 @@ def _flydsl_b_non_temporal_configs(configs, mode, gfx):
         policy = config.get(
             "policy", "ht" if config["use_half_tile_interleaved"] else "ft"
         )
-        if gfx == "gfx950" and policy in ("ft", "ht", "hti"):
+        if gfx == "gfx950" and policy in ("ft", "ht", "hti", "sp"):
             selected.extend(dict(config, b_non_temporal=nt) for nt in choices)
         elif config.get("b_non_temporal", False) in choices:
             # Skinny/TDM do not implement BNT; band-stream requires it.
@@ -369,6 +369,31 @@ def get_flydsl_bf16_catalog(
         out_dtype,
         fused_bias,
     )
+    # Add the qualified split-plane chain only for explicit cache-policy tuning.
+    # "auto" retains the legacy catalog and its saved solution indices.
+    if (
+        b_non_temporal != "auto"
+        and get_gfx_runtime() == "gfx950"
+        and (m, n, k) == (128, 7168, 12288)
+        and in_dtype == out_dtype == torch.bfloat16
+        and not has_bias
+    ):
+        configs = configs + [
+            {
+                "block_m": 128,
+                "block_n": 160,
+                "block_k": 64,
+                "stages": 3,
+                "split_k": 5,
+                "m_waves": 2,
+                "n_waves": 2,
+                "k_waves": 1,
+                "group_m": 0,
+                "k_stagger": 0,
+                "use_half_tile_interleaved": False,
+                "policy": "sp",
+            }
+        ]
     configs = _flydsl_b_non_temporal_configs(configs, b_non_temporal, get_gfx_runtime())
     kernels = {
         flydsl_hgemm_kernel_name(
@@ -505,7 +530,8 @@ class GemmA16W16Tuner(GemmCommonTuner):
             default=self.ARG_DEFAULTS["flydsl_b_non_temporal"],
             help="FlyDSL B cache-policy candidates: auto preserves the existing "
             "catalog; off/on select cached/non-temporal loads; both compares "
-            "both for every eligible gfx950 FT/HT tile. Policies without that "
+            "both for every eligible gfx950 FT/HT tile and the qualified "
+            "BF16 (128,7168,12288) split-plane chain. Policies without that "
             "mode are excluded (on yields no candidates on non-gfx950). "
             "This controls tuning only, not runtime CSV selection. Winning "
             "names encode _bnt_; old names without it remain cached.",

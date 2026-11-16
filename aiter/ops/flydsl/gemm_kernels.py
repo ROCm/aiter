@@ -229,9 +229,10 @@ def _split_planes_name_supported(params):
         "k_waves": 1,
         "group_m": 0,
         "k_stagger": 0,
-        "b_non_temporal": True,
     }
-    return all(params.get(key) == value for key, value in expected.items())
+    return isinstance(params.get("b_non_temporal"), bool) and all(
+        params.get(key) == value for key, value in expected.items()
+    )
 
 
 def _split_planes_hgemm(a, b, out, bias, out_dtype, stream, params):
@@ -331,7 +332,7 @@ def _validate_b_non_temporal(value, gfx, policy):
     if not isinstance(value, bool):
         raise TypeError("b_non_temporal must be a bool")
     if value and (gfx != "gfx950" or policy == SKINNY_POLICY):
-        raise ValueError("b_non_temporal supports gfx950 ft/ht/hti/bs policies only")
+        raise ValueError("b_non_temporal supports gfx950 ft/ht/hti/bs/sp policies only")
 
 
 def flydsl_hgemm(
@@ -370,6 +371,7 @@ def flydsl_hgemm(
     ``policy="sp"`` selects independently written FP32 K partitions followed
     by a BF16 reduction, currently qualified only for contiguous BF16
     (M,N,K)=(128,7168,12288) on gfx950. B remains ordinary weight[N,K].
+    Its B loads honor ``b_non_temporal`` in both cached and streaming modes.
     All four TDM policies use the same-dtype output and the existing weight[N,K] convention.
     ``policy="bs"`` selects the BF16 band-stream decode kernel for the
     validated 256-CU gfx950 M/N/K and configuration catalog. It requires
