@@ -25,6 +25,7 @@ Suites:
                zero-length index tensors write zeros.
   graph        graph replay with indptr rewritten in place and a poisoned
                workspace.
+  devices      the same launch on cuda:0 and then cuda:1 (needs two GPUs).
   routes       the V^T route each launch compiles; order_plan keeps the
                caller's indices.
   contract     invalid scales, geometry, devices and metadata are rejected
@@ -55,7 +56,7 @@ import torch
 
 import aiter
 from aiter import dtypes
-from aiter.jit.utils.chip_info import get_gfx
+from aiter.jit.utils.chip_info import get_gfx_runtime
 from aiter.ops.flydsl import sparse_mla as serving
 from aiter.ops.flydsl.sparse_mla import (
     flydsl_sparse_mla_fwd,
@@ -471,6 +472,34 @@ def test_graph_replay(num_splits):
 
 
 @benchmark()
+def test_devices(num_splits, ordered_indices):
+    """One launch on cuda:0, then the same launch on cuda:1."""
+    errors = []
+    for device in (torch.device("cuda", 0), torch.device("cuda", 1)):
+        generator = torch.Generator(device=device).manual_seed(1215)
+        q = torch.randn((37, H, D), device=device, generator=generator)
+        kv = torch.randn((512, D), device=device, generator=generator)
+        rows = torch.randint(
+            512, (37, 96), device=device, generator=generator, dtype=dtypes.i32
+        )
+        rows = rows.sort(dim=1).values
+        sink = torch.randn((H,), device=device, generator=generator)
+        q, kv = q.to(dtypes.bf16), kv.to(dtypes.bf16)
+        out = flydsl_sparse_mla_fwd(
+            q,
+            kv,
+            rows,
+            attn_sink=sink,
+            num_splits=num_splits,
+            ordered_indices=ordered_indices,
+        )
+        with torch.cuda.device(device):
+            ref = run_torch(q, kv, rows, sink)
+        errors.append(check_output(ref, out, f"{device} splits={num_splits}"))
+    return {"err": max(errors)}
+
+
+@benchmark()
 def test_routes(source):
     """Ordering selects the register V^T route of unsplit launches only, and
     order_plan leaves the caller's indices unchanged."""
@@ -794,7 +823,10 @@ def test_performance(tokens, order, has_sink):
         checked = torch.cat((checked[:64], checked[-64:]))
     ref = run_torch(q[checked], kv, rows[checked], sink)
     nbytes = (tokens * TOPK * D + 2 * tokens * H * D) * 2 + rows.nbytes
-    ret = {"gfx": get_gfx(), "distinct MiB": rows.unique().numel() * D * 2 / 2**20}
+    ret = {
+        "gfx": get_gfx_runtime(),
+        "distinct MiB": rows.unique().numel() * D * 2 / 2**20,
+    }
     for name, (fn, args, kwargs) in candidates.items():
         out, us = run_perftest(
             fn, *args, num_iters=21, num_warmup=2, num_rotate_args=1, **kwargs
@@ -844,6 +876,11 @@ def suites(args):
         for layout, splits in itertools.product(("dense", "csr"), (1, 7))
     ]
     yield "graph", [(test_graph_replay, {"num_splits": n}) for n in (1, 5, 44)]
+    # Split-K with combine, the LDS V^T route and the register V^T route.
+    yield "devices", [
+        (test_devices, {"num_splits": splits, "ordered_indices": ordered})
+        for splits, ordered in ((5, False), (1, False), (1, True))
+    ]
     yield "routes", [
         (test_routes, {"source": source})
         for source in ("none", "ordered_indices", "order_plan")
@@ -857,9 +894,9 @@ def suites(args):
 
 
 def main():
-    if get_gfx() not in SUPPORTED_GFX:
+    if get_gfx_runtime() not in SUPPORTED_GFX:
         aiter.logger.warning(
-            "flydsl_sparse_mla_fwd unsupported on %s; skipping", get_gfx()
+            "flydsl_sparse_mla_fwd unsupported on %s; skipping", get_gfx_runtime()
         )
         return
 
@@ -868,7 +905,7 @@ def main():
         description="config input of test",
     )
     names = ("accuracy", "stress", "scale", "empty_rows", "empty_allocation")
-    names += ("graph", "routes", "contract", "index_order", "performance")
+    names += ("graph", "devices", "routes", "contract", "index_order", "performance")
     parser.add_argument(
         "--suite",
         type=str,
@@ -906,6 +943,9 @@ def main():
 
     for suite, cases in suites(args):
         if suite not in args.suite:
+            continue
+        if suite == "devices" and torch.cuda.device_count() < 2:
+            aiter.logger.warning("devices suite needs two GPUs; skipping")
             continue
         df = [test(**kwargs) for test, kwargs in cases]
         aiter.logger.info(

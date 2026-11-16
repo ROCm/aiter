@@ -29,7 +29,7 @@ from .kernels.sparse_mla import (
     compile_sparse_mla_order_indices,
 )
 from .kernels.tensor_shim import _run_compiled, ptr_arg
-from .kernels.topk.topk_launch import run_topk_launcher
+from .kernels.topk.topk_launch import _launcher_on, run_topk_launcher
 
 __all__ = [
     "SparseMLAOrderPlan",
@@ -311,13 +311,18 @@ def flydsl_sparse_mla_fwd(
     with torch.cuda.device(q.device):
         _require_gfx942()
         stream = fx.Stream(torch.cuda.current_stream(q.device))
+        # A compiled handle is loaded on one GPU and cannot launch on another.
+        device = q.device.index
         _run_compiled(
-            compile_sparse_mla_fwd(
-                attn_sink is not None,
-                index_format=index_format,
-                split_k=splits,
-                register_vt=register_vt,
-                imm_gather=register_vt and width <= IMM_GATHER_MAX_WIDTH,
+            _launcher_on(
+                compile_sparse_mla_fwd(
+                    attn_sink is not None,
+                    index_format=index_format,
+                    split_k=splits,
+                    register_vt=register_vt,
+                    imm_gather=register_vt and width <= IMM_GATHER_MAX_WIDTH,
+                ),
+                device,
             ),
             ptr_arg(q, fx.BFloat16),
             ptr_arg(kv, fx.BFloat16),
@@ -335,7 +340,9 @@ def flydsl_sparse_mla_fwd(
         )
         if splits > 1:
             _run_compiled(
-                compile_sparse_mla_combine(splits, attn_sink is not None),
+                _launcher_on(
+                    compile_sparse_mla_combine(splits, attn_sink is not None), device
+                ),
                 ptr_arg(partial, fx.Float32),
                 ptr_arg(stats, fx.Float32),
                 ptr_arg(sink, fx.Float32),
