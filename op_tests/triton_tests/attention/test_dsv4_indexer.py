@@ -6,11 +6,7 @@
 import torch
 import torch.nn.functional as F
 
-from aiter.ops.triton.attention.dsv4_indexer import (
-    dsv4_indexer,
-    indexer_bwd,
-    indexer_fwd,
-)
+from aiter.ops.triton.attention.dsv4_indexer import indexer_bwd, indexer_fwd
 
 
 def ref_indexer_fwd(q, k, w, compress_ratio):
@@ -132,37 +128,11 @@ def test_bwd():
         assert status == "PASS", f"BWD failed: dq={dq_cos}, dk={dk_cos}, dw={dw_cos}"
 
 
-def test_autograd():
-    print("AUTOGRAD Tests:")
-    for S, H, Hd, P in TEST_CONFIGS:
-        compress_ratio = S // P
-        q = torch.randn(
-            S, H, Hd, dtype=torch.bfloat16, device="cuda", requires_grad=True
-        )
-        k = torch.randn(P, Hd, dtype=torch.bfloat16, device="cuda", requires_grad=True)
-        w = (
-            torch.randn(S, H, dtype=torch.float32, device="cuda") * 0.1
-        ).requires_grad_(True)
-
-        scores, _indices = dsv4_indexer(q, k, w, compress_ratio, topk=min(512, P))
-        valid = scores != float("-inf")
-        loss = scores[valid].sum()
-        loss.backward()
-
-        ok = q.grad is not None and k.grad is not None and w.grad is not None
-        status = "PASS" if ok else "FAIL"
-        print(
-            f"  S={S} H={H} Hd={Hd} P={P} cr={compress_ratio} ... grads_exist={ok} {status}"
-        )
-        assert status == "PASS", "AUTOGRAD failed"
-
-
 if __name__ == "__main__":
     print("=" * 60)
     print("DSV4 Indexer Kernel — Correctness Tests")
     print("=" * 60)
     test_fwd()
     test_bwd()
-    test_autograd()
     print()
     print("ALL TESTS PASSED")

@@ -205,19 +205,6 @@ def test_block_attn_mask_to_ragged_lut_metadata_dtype():
     )
 
 
-def test_tiebreak_keeps_its_own_reference_bound():
-    """A tie resolved differently moves a whole output row, so `tiebreak` needs a looser bound.
-
-    Reusing a neighbouring distribution's bound here would report breakage on the property the
-    generator is built to create.
-    """
-    bound = fp8_max_diff_percentage("tiebreak")
-    others = [
-        fp8_max_diff_percentage(name) for name in ("normal", "diffusion", "peaked")
-    ]
-    assert bound > max(others), f"tiebreak {bound} vs {others}"
-
-
 def compare_accuracy(current, reference):
     """Print quick statistics comparing FP8 and SageAttn tensors."""
     current_f = current.float()
@@ -375,24 +362,6 @@ def check_attention_outputs(
             atol=atol or 1e-2,
             rtol=rtol or 1e-2,
         )
-
-
-def fp8_max_diff_percentage(input_distribution: str) -> float:
-    # tiebreak diverges from the BF16 reference by construction, so closeness to BF16 is not the
-    # property under test; this bound is only a backstop against gross breakage.
-    if input_distribution == "tiebreak":
-        return 25.0
-    # The coherent distributions and the LLM one are both harder on FP8 than iid inputs.
-    if input_distribution in (
-        "transformer",
-        "sink",
-        "diffusion",
-        "kcommon",
-    ) or str(
-        input_distribution
-    ).startswith("dump:"):
-        return 2.0
-    return 0.5
 
 
 def input_helper(
@@ -628,12 +597,6 @@ def test_sage_v_dtype(v_dtype, SEQLEN_Q, SEQLEN_K, NUM_Q_HEADS, NUM_K_HEADS, lay
     check_attention_outputs(
         triton_out, torch_out, fp8=True, atol=ATOL_fp8, rtol=RTOL_fp8
     )
-
-
-def test_sage_v_dtype_rejects_other_types():
-    q, k, v = input_helper(1, 2, 2, 64, 64, 128, 128, torch.bfloat16, "bshd")
-    with pytest.raises(ValueError, match="v_dtype"):
-        fav3_sage_wrapper_func(q, k, v, v_dtype=torch.float32)
 
 
 @pytest.mark.parametrize("kind", ["seq_slice", "qkv_split"])

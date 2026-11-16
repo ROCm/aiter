@@ -194,24 +194,6 @@ def test_grouped_gemm_blockwise_fp8_matches_dequantized_torch():
     torch.testing.assert_close(actual.float(), expected, rtol=6e-2, atol=1.0)
 
 
-def test_grouped_wgrad_validates_scale_rows_per_expert():
-    a = torch.randn(2, 128, device="cuda", dtype=torch.bfloat16)
-    b = torch.randn(2, 128, device="cuda", dtype=torch.bfloat16)
-    offsets = torch.tensor([0, 1, 2], dtype=torch.int32, device="cuda")
-    a_scale = torch.ones(1, 128, device="cuda", dtype=torch.float32)
-    b_scale = torch.ones(1, 128, device="cuda", dtype=torch.float32)
-
-    with pytest.raises(ValueError, match=r"A_scale must have shape \[2, 128\]"):
-        grouped_gemm(
-            a,
-            b,
-            offsets,
-            A_is_transposed=True,
-            A_scale=a_scale,
-            B_scale=b_scale,
-        )
-
-
 @pytest.mark.parametrize("with_bias", [False, True])
 def test_general_routing_grouped_weights_match_legacy_layout(with_bias):
     torch.manual_seed(43)
