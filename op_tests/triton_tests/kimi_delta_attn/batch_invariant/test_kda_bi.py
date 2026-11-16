@@ -8,6 +8,7 @@ import os
 import pytest
 import torch
 
+import aiter.ops.triton.kimi_delta_attn.batch_invariant.kda_bi as kda_bi_mod
 from aiter.ops.triton.kimi_delta_attn.batch_invariant.kda_bi import (
     BI_CONTRACT_VERSION,
     kda_bi_fwd,
@@ -164,6 +165,19 @@ def test_chunk_aligned_continuation_same_bits(split):
     o2, h2 = _run(_cut(x, split, T), [T - split], h0=h1, final=True)
     assert torch.equal(torch.cat([o1, o2], 1), full)
     assert torch.equal(h2, h_full)
+
+
+@pytest.mark.parametrize("bv", [16, 32, 64, 128])
+def test_state_block_size_same_bits(bv, monkeypatch):
+    # the wrapper picks the state pass's V block from the grid size; the bits must not
+    # depend on it
+    lens = [150, 90, 1, 64]
+    x, h0 = make_inputs(sum(lens), 14, n_seq=len(lens), with_state=True)
+    ref = _run(x, lens, h0=h0, final=True, boundary=True)
+    monkeypatch.setattr(kda_bi_mod, "_state_bv", lambda n: bv)
+    out = _run(x, lens, h0=h0, final=True, boundary=True)
+    for a, b in zip(out, ref):
+        assert torch.equal(a, b)
 
 
 def test_boundary_state():

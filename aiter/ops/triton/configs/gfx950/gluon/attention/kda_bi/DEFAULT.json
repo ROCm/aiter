@@ -1,5 +1,6 @@
 {
     "intra": {"num_warps": 4},
     "state": {"num_warps": 4, "bv": 16},
+    "state_grid": {"bv_choices": [16, 32, 64, 128], "min_programs": 512},
     "out": {"num_warps": 4, "bv": 64}
 }

@@ -52,6 +52,12 @@ def key_t_layout(num_warps):
 
 
 @constexpr_function
+def a_cols(i):
+    """Key columns of row block i's A blocks: a power of two >= 16 (i + 1)."""
+    return 16 if i == 0 else (32 if i == 1 else 64)
+
+
+@constexpr_function
 def mfma_layout(num_warps):
     """bf16 16x16x32 MFMA for the state and output passes."""
     return gl.amd.AMDMFMALayout(
@@ -115,7 +121,8 @@ def _a_block(
     register operands:
     - f32_mfma_layout: q_i, k_i (bf16 [16, 128]), g_i (fp32 [16, 128]), g_ref (fp32
       [1, 128], the gate cumsum of row 16 i) and beta_i (fp32 [16], SliceLayout(1, .));
-    - key_t_layout: k_t (bf16 [128, 64]), g_t (fp32 [128, 64]) and g_ref_t ([128, 1]).
+    - key_t_layout: k_t (bf16 [128, NC]), g_t (fp32 [128, NC]) and g_ref_t ([128, 1]),
+      NC = a_cols(i), the key columns [0, NC); the result is [16, NC].
     Key columns >= 16 (i + 1) only need finite values: they are zeroed in the operand.
     Exponents are relative to row 16 i. Aqk keeps c <= r, Akk c < r."""
     MF: gl.constexpr = f32_mfma_layout(num_warps)
@@ -123,15 +130,16 @@ def _a_block(
     e = gl.exp2(g_i - g_ref)
     qg = q_i.to(gl.float32) * e
     kg = k_i.to(gl.float32) * e
-    col_t = gl.expand_dims(gl.arange(0, BT, layout=gl.SliceLayout(0, KT)), 0)
+    NC: gl.constexpr = a_cols(i)
+    col_t = gl.expand_dims(gl.arange(0, NC, layout=gl.SliceLayout(0, KT)), 0)
     kn = gl.where(
         col_t < (i + 1) * BC, k_t.to(gl.float32) * gl.exp2(g_ref_t - g_t), 0.0
     )
-    z = gl.zeros([BC, BT], gl.float32, MF)
+    z = gl.zeros([BC, NC], gl.float32, MF)
     aqk = _f32_dot(qg, kn, z, num_warps) * scale
     akk = _f32_dot(kg, kn, z, num_warps)
     r2 = gl.expand_dims(gl.arange(0, BC, layout=gl.SliceLayout(1, MF)) + i * BC, 1)
-    c = gl.expand_dims(gl.arange(0, BT, layout=gl.SliceLayout(0, MF)), 0)
+    c = gl.expand_dims(gl.arange(0, NC, layout=gl.SliceLayout(0, MF)), 0)
     aqk = gl.where(r2 >= c, aqk, 0.0)
     akk = gl.where(r2 > c, akk * gl.expand_dims(beta_i, 1), 0.0)
     return aqk, akk
@@ -156,14 +164,15 @@ def _a_rows(
     Aqk row block (bf16) and the Akk row block to s_l (fp32)."""
     MF: gl.constexpr = f32_mfma_layout(num_warps)
     KT: gl.constexpr = key_t_layout(num_warps)
+    NC: gl.constexpr = a_cols(i)
     r = gl.arange(0, BC, layout=gl.SliceLayout(1, MF)) + i * BC
     aqk, akk = _a_block(
         s_q.slice(i * BC, BC).load(MF),
         s_k.slice(i * BC, BC).load(MF),
         s_g.slice(i * BC, BC).load(MF),
         s_g.slice(i * BC, 1).load(MF),
-        s_k.permute([1, 0]).load(KT),
-        s_g.permute([1, 0]).load(KT),
+        s_k.slice(0, NC).permute([1, 0]).load(KT),
+        s_g.slice(0, NC).permute([1, 0]).load(KT),
         s_g.slice(i * BC, 1).permute([1, 0]).load(KT),
         gl.load(BETA + r.to(gl.int64) * sb, mask=r < n, other=0.0).to(gl.float32),
         scale,
@@ -171,11 +180,13 @@ def _a_rows(
         num_warps,
     )
     r2 = gl.expand_dims(r, 1)
-    c = gl.expand_dims(gl.arange(0, BT, layout=gl.SliceLayout(0, MF)), 0)
-    gl.store(
-        AQK + r2.to(gl.int64) * s_a + c, aqk.to(gl.bfloat16), mask=(r2 < n) & (c < BT)
-    )
-    s_l.slice(i * BC, BC).store(akk)
+    c = gl.expand_dims(gl.arange(0, NC, layout=gl.SliceLayout(0, MF)), 0)
+    row = AQK + r2.to(gl.int64) * s_a + c
+    m = (r2 < n) & (c < NC)
+    gl.store(row, aqk.to(gl.bfloat16), mask=m)
+    for j in gl.static_range(NC, BT, NC):  # the columns past NC are 0
+        gl.store(row + j, gl.zeros([BC, NC], gl.bfloat16, MF), mask=m)
+    s_l.slice(i * BC, BC).slice(0, NC, 1).store(akk)
 
 
 @gluon.jit

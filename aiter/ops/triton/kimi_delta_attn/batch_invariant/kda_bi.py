@@ -39,6 +39,18 @@ def _config(name: str) -> dict:
     return {k if k in _LAUNCH else k.upper(): v for k, v in cfg[name].items()}
 
 
+def _state_bv(n_seq_heads: int) -> int:
+    """V block of the state pass: the widest one that still gives min_programs programs
+    (packed batches), else the narrowest (long sequences). The output bits do not depend
+    on it."""
+    grid = _config("state_grid")
+    choices = sorted(grid["BV_CHOICES"])
+    fits = [
+        bv for bv in choices if n_seq_heads * (HEAD_DIM // bv) >= grid["MIN_PROGRAMS"]
+    ]
+    return fits[-1] if fits else choices[0]
+
+
 def _chunks(cu_seqlens, n_chunks):
     """(CHUNKS [NT, 2] int32 row ranges, SEQ_CHUNKS [N + 1] int32) on the device, no sync."""
     dev = cu_seqlens.device
@@ -165,6 +177,7 @@ def kda_bi_fwd(
             enable_fp_fusion=False,
         )
         dummy = glast
+        cs = {**cs, "BV": _state_bv(N * H)}
         _kda_bi_state_kernel[(N, H, HEAD_DIM // cs["BV"])](
             w,
             u,
