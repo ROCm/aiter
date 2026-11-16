@@ -3,6 +3,11 @@ import triton.language as tl
 from triton.experimental import gluon
 from triton.language.extra.libdevice import fast_dividef
 
+# Older Triton wheels lack this optional LLVM scheduling hint.
+_HAS_SCHED_BARRIER = gl.constexpr(
+    hasattr(gl.amd, "hint") and hasattr(gl.amd.hint, "sched_barrier")
+)
+
 
 @gluon.jit
 def fast_maximum(a, b):
@@ -542,7 +547,8 @@ def _mha_fwd_subtiled(
 
     for _ in range(num_n_iter - 3):
 
-        gl.amd.hint.sched_barrier()
+        if _HAS_SCHED_BARRIER:
+            gl.amd.hint.sched_barrier()
 
         gl.barrier()
         qk0 = gl.amd.cdna5.wmma_scaled(
@@ -578,7 +584,8 @@ def _mha_fwd_subtiled(
         )
         write_idx_v += 1
 
-        gl.amd.hint.sched_barrier()
+        if _HAS_SCHED_BARRIER:
+            gl.amd.hint.sched_barrier()
 
         gl.amd.gfx1250.tdm.async_wait(4)
         qk1 = gl.amd.cdna5.wmma_scaled(
@@ -601,7 +608,8 @@ def _mha_fwd_subtiled(
         p_quant = p.to(gl.float8e4nv)
         p_quant = gl.convert_layout(p_quant, layout=DOT_LAYOUT_P, assert_trivial=True)
 
-        gl.amd.hint.sched_barrier()
+        if _HAS_SCHED_BARRIER:
+            gl.amd.hint.sched_barrier()
 
         gl.barrier()
         acc0 = gl.amd.cdna5.wmma_scaled(p_quant, 0, "e4m3", v0, v0_scale, "e4m3", acc0)
@@ -633,7 +641,8 @@ def _mha_fwd_subtiled(
         )
         write_idx_k += 1
 
-        gl.amd.hint.sched_barrier()
+        if _HAS_SCHED_BARRIER:
+            gl.amd.hint.sched_barrier()
 
         gl.amd.gfx1250.tdm.async_wait(4)
         acc1 = gl.amd.cdna5.wmma_scaled(p_quant, 0, "e4m3", v1, v1_scale, "e4m3", acc1)
