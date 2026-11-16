@@ -91,6 +91,11 @@ void fused_allreduce_rmsnorm_lamport(fptr_t _fa,
                                      const aiter_tensor_t& w,
                                      double eps,
                                      bool gemma_norm);
+// INT4-coded Lamport two-shot all-reduce (bf16, lossy) on its own inbox: every
+// rank's buffer of lamport_q4_2s_buffer_size bytes; max_bytes is the largest input.
+int64_t lamport_q4_2s_buffer_size(int64_t world_size, int64_t max_bytes);
+void init_lamport_q4_2s(fptr_t _fa, const std::vector<int64_t>& all_ptrs, int64_t max_bytes);
+void allreduce_lamport_q4_2s(fptr_t _fa, const aiter_tensor_t& inp, const aiter_tensor_t& out);
 // Lamport one-shot all-reduce of inp + other on the init_lamport_ar_rms inbox.
 void allreduce_add_lamport(fptr_t _fa,
                            const aiter_tensor_t& inp,

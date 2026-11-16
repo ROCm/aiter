@@ -53,6 +53,12 @@ PYBIND11_MODULE(AITER_EXTENSION_NAME, m)
           py::arg("out"), py::arg("w"), py::arg("eps"), py::arg("gemma_norm") = false);
     m.def("allreduce_add_lamport", &aiter::allreduce_add_lamport,
           py::arg("_fa"), py::arg("inp"), py::arg("other"), py::arg("out"));
+    m.def("lamport_q4_2s_buffer_size", &aiter::lamport_q4_2s_buffer_size,
+          py::arg("world_size"), py::arg("max_bytes"));
+    m.def("init_lamport_q4_2s", &aiter::init_lamport_q4_2s,
+          py::arg("_fa"), py::arg("all_ptrs"), py::arg("max_bytes"));
+    m.def("allreduce_lamport_q4_2s", &aiter::allreduce_lamport_q4_2s,
+          py::arg("_fa"), py::arg("inp"), py::arg("out"));
     m.def("all_gather_lamport", &aiter::all_gather_lamport,
           py::arg("_fa"), py::arg("inp"), py::arg("out"), py::arg("dim"),
           py::arg("reg_inp_ptr"), py::arg("reg_inp_bytes"));

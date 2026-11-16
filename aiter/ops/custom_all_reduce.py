@@ -441,6 +441,24 @@ def all_gather_lamport_gfx1250(
 ) -> None: ...
 
 
+# INT4-coded Lamport two-shot all-reduce (bf16, lossy) on its own inbox
+# (lamport_q4_2s_buffer_size_gfx1250 bytes a rank, init_lamport_q4_2s_gfx1250 once, then a barrier).
+@compile_ops(GFX1250_MD_NAME, fc_name="lamport_q4_2s_buffer_size", develop=True)
+def lamport_q4_2s_buffer_size_gfx1250(world_size: int, max_bytes: int) -> int: ...
+
+
+@compile_ops(GFX1250_MD_NAME, fc_name="init_lamport_q4_2s", develop=True)
+def init_lamport_q4_2s_gfx1250(
+    _fa: int, all_ptrs: list[int], max_bytes: int
+) -> None: ...
+
+
+@compile_ops(GFX1250_MD_NAME, fc_name="allreduce_lamport_q4_2s", develop=True)
+def allreduce_lamport_q4_2s_gfx1250(
+    _fa: int, inp: torch.Tensor, out: torch.Tensor
+) -> None: ...
+
+
 @compile_ops(GFX1250_MD_NAME, fc_name="p2p_bw_test", develop=True)
 def p2p_bw_test_gfx1250(
     _fa: int,

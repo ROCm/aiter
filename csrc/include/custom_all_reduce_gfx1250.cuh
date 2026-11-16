@@ -1996,6 +1996,379 @@ struct LamportArRms
 };
 
 // ---------------------------------------------------------------------------
+// INT4-coded Lamport two-shot all-reduce (bf16, lossy)
+// ---------------------------------------------------------------------------
+/*
+ * Every kQ4Group = 28 consecutive elements form a group, coded as one 16-B line:
+ * 28 int4 levels in [-7, 7] stored + 7 (so no nibble is 0xf) and the group's
+ * scale amax / 7 as bf16 (sign bit 0) in the top half of the last word. No word
+ * of a coded line can be 0xffffffff, the inbox sentinel, so a line has landed
+ * once its four words differ from it (4-byte single-copy atomicity suffices).
+ * The message splits into ngpus chunks of `chunk` groups; rank c reduces chunk c.
+ * Inbox of a rank: [2 banks][2: RS, AG][ngpus][slot] lines, sentinel-filled at
+ * init. Every call runs the same grid (all blocks co-resident), block b lane l
+ * owning groups g = (it * gridDim.x + b) * BLOCK + l, so a wave owns the same
+ * groups in every call and its round counter (rank-local; every rank runs the
+ * same calls) picks the bank on every rank alike. A reader re-arms a line right
+ * after reading it: the line is written next two calls later at the earliest
+ * (a peer is at most one call ahead) and a call's stores land before it ends.
+ *   role 0 codes group g of every other chunk and sends it to that rank's RS
+ *          slot [rank]; after all its groups, polls the AG lines of its groups
+ *          and writes the decoded values out;
+ *   role 1 polls the RS lines of group g of the own chunk, sums them with the
+ *          own exact input (fp32), rounds to bf16, codes the sum once, sends it
+ *          to every peer's AG slot [rank] and writes the decoded sum out, so
+ *          every rank holds the same bits.
+ */
+constexpr int kQ4Group = 28;
+
+namespace q4ar {
+DINLINE float bf_lo(uint32_t w) { return __uint_as_float(w << 16); }
+DINLINE float bf_hi(uint32_t w) { return __uint_as_float(w & 0xffff0000u); }
+DINLINE uint32_t f2bf(float f) // round to nearest even
+{
+    const uint32_t u = __float_as_uint(f);
+    return (u + 0x7fffu + ((u >> 16) & 1u)) >> 16;
+}
+DINLINE void load_group(const uint64_t* __restrict__ p, float* x)
+{
+#pragma unroll
+    for(int j = 0; j < 7; ++j)
+    {
+        const uint64_t v  = p[j];
+        const uint32_t lo = (uint32_t)v, hi = (uint32_t)(v >> 32);
+        x[4 * j]          = bf_lo(lo);
+        x[4 * j + 1]      = bf_hi(lo);
+        x[4 * j + 2]      = bf_lo(hi);
+        x[4 * j + 3]      = bf_hi(hi);
+    }
+}
+DINLINE void store_group(uint64_t* __restrict__ p, const float* x)
+{
+#pragma unroll
+    for(int j = 0; j < 7; ++j)
+        p[j] = (uint64_t)(f2bf(x[4 * j]) | (f2bf(x[4 * j + 1]) << 16)) |
+               ((uint64_t)(f2bf(x[4 * j + 2]) | (f2bf(x[4 * j + 3]) << 16)) << 32);
+}
+DINLINE lamport_u32x4 enc(const float* x)
+{
+    float m = 0.f;
+#pragma unroll
+    for(int i = 0; i < kQ4Group; ++i)
+        m = fmaxf(m, fabsf(x[i]));
+    const uint32_t sb = f2bf(m * (1.0f / 7.0f)) & 0x7fffu;
+    const float s     = __uint_as_float(sb << 16);
+    const float inv   = s > 0.f ? 1.0f / s : 0.f;
+    uint32_t w[4]     = {0u, 0u, 0u, 0u};
+#pragma unroll
+    for(int i = 0; i < kQ4Group; ++i)
+    {
+        const float r = fminf(fmaxf(rintf(x[i] * inv), -7.f), 7.f);
+        w[i >> 3] |= (uint32_t)((int)r + 7) << (4 * (i & 7));
+    }
+    w[3] |= sb << 16;
+    return lamport_u32x4{w[0], w[1], w[2], w[3]};
+}
+DINLINE void dec(lamport_u32x4 l, float* x)
+{
+    const float s = __uint_as_float(l[3] & 0xffff0000u);
+#pragma unroll
+    for(int i = 0; i < kQ4Group; ++i)
+        x[i] = (float)((int)((l[i >> 3] >> (4 * (i & 7))) & 15u) - 7) * s;
+}
+// INT8 codec (AITER_CUSTOM_AR_Q4_2S_CODEC=8): every 14 elements -> one 16-B line, 14 int8 levels in [-127, 127]
+// stored + 127 (no byte is 0xff) in bytes 0..13 and the bf16 scale amax / 127 (sign 0) in bytes 14..15: 0.57x the
+// bytes of bf16 and ~amax / 254 error; still no word can be 0xffffffff.
+constexpr int kI8Group = 14;
+DINLINE void load14(const uint32_t* __restrict__ p, float* x)
+{
+#pragma unroll
+    for(int j = 0; j < 7; ++j)
+    {
+        const uint32_t w = p[j];
+        x[2 * j]         = bf_lo(w);
+        x[2 * j + 1]     = bf_hi(w);
+    }
+}
+DINLINE void store14(uint32_t* __restrict__ p, const float* x)
+{
+#pragma unroll
+    for(int j = 0; j < 7; ++j)
+        p[j] = f2bf(x[2 * j]) | (f2bf(x[2 * j + 1]) << 16);
+}
+DINLINE lamport_u32x4 enc_i8(const float* x)
+{
+    float m = 0.f;
+#pragma unroll
+    for(int i = 0; i < kI8Group; ++i)
+        m = fmaxf(m, fabsf(x[i]));
+    const uint32_t sb = f2bf(m * (1.0f / 127.0f)) & 0x7fffu;
+    const float s     = __uint_as_float(sb << 16);
+    const float inv   = s > 0.f ? 1.0f / s : 0.f;
+    uint32_t w[4]     = {0u, 0u, 0u, 0u};
+#pragma unroll
+    for(int i = 0; i < kI8Group; ++i)
+    {
+        const float r = fminf(fmaxf(rintf(x[i] * inv), -127.f), 127.f);
+        w[i >> 2] |= (uint32_t)((int)r + 127) << (8 * (i & 3));
+    }
+    w[3] |= sb << 16;
+    return lamport_u32x4{w[0], w[1], w[2], w[3]};
+}
+DINLINE void dec_i8(lamport_u32x4 l, float* x)
+{
+    const float s = __uint_as_float(l[3] & 0xffff0000u);
+#pragma unroll
+    for(int i = 0; i < kI8Group; ++i)
+        x[i] = (float)((int)((l[i >> 2] >> (8 * (i & 3))) & 0xffu) - 127) * s;
+}
+// the codec of this process: AITER_CUSTOM_AR_Q4_2S_CODEC=8 picks INT8, anything else INT4
+inline int codec_from_env()
+{
+    const char* e = std::getenv("AITER_CUSTOM_AR_Q4_2S_CODEC");
+    return (e != nullptr && std::atoi(e) == 8) ? 8 : 4;
+}
+inline int group_of(int codec) { return codec == 8 ? kI8Group : kQ4Group; }
+DINLINE bool landed(lamport_u32x4 v)
+{
+    return v[0] != 0xffffffffu && v[1] != 0xffffffffu && v[2] != 0xffffffffu && v[3] != 0xffffffffu;
+}
+// all N lines in flight together, re-read until every one has landed
+template <int N>
+DINLINE void poll(const char* const* p, lamport_u32x4* v)
+{
+    bool ok;
+    do
+    {
+        asm volatile("" ::: "memory");
+#pragma unroll
+        for(int i = 0; i < N; ++i)
+            v[i] = lamport_load_b128(p[i]);
+        ok = true;
+#pragma unroll
+        for(int i = 0; i < N; ++i)
+            ok = ok && landed(v[i]);
+    } while(!ok);
+}
+} // namespace q4ar
+
+template <int ngpus, int BLOCK, int CODEC>
+__global__ void __launch_bounds__(2 * BLOCK)
+    lamport_q4_2s_gfx1250(const void* __restrict__ input, // bf16
+                          void* __restrict__ output,
+                          uint32_t* __restrict__ round_counter, // [2][gridDim.x * BLOCK / kLamportWave]
+                          int64_t slot,                         // lines a sender and region
+                          int rank,
+                          int64_t chunk, // groups of a chunk
+                          LamportPeers peers)
+{
+    static_assert(BLOCK % kLamportWave == 0, "blocks are whole waves");
+    static_assert(CODEC == 4 || CODEC == 8, "INT4 or INT8");
+    constexpr int G = CODEC == 8 ? q4ar::kI8Group : kQ4Group; // elements a group (= a line)
+    // a group is 7 words: 8 B (INT4, 28 elements) or 4 B (INT8, 14 elements)
+    auto load = [&](int c, int64_t g, float* x) {
+        if constexpr(CODEC == 8)
+            q4ar::load14(static_cast<const uint32_t*>(input) + (c * chunk + g) * 7, x);
+        else
+            q4ar::load_group(static_cast<const uint64_t*>(input) + (c * chunk + g) * 7, x);
+    };
+    auto store = [&](int c, int64_t g, const float* x) {
+        if constexpr(CODEC == 8)
+            q4ar::store14(static_cast<uint32_t*>(output) + (c * chunk + g) * 7, x);
+        else
+            q4ar::store_group(static_cast<uint64_t*>(output) + (c * chunk + g) * 7, x);
+    };
+    auto enc = [](const float* x) {
+        if constexpr(CODEC == 8)
+            return q4ar::enc_i8(x);
+        else
+            return q4ar::enc(x);
+    };
+    auto dec = [](lamport_u32x4 l, float* x) {
+        if constexpr(CODEC == 8)
+            q4ar::dec_i8(l, x);
+        else
+            q4ar::dec(l, x);
+    };
+    const int role       = __builtin_amdgcn_readfirstlane(threadIdx.x / BLOCK);
+    const int lane       = threadIdx.x % BLOCK;
+    const int wave       = __builtin_amdgcn_readfirstlane((blockIdx.x * BLOCK + lane) / kLamportWave);
+    uint32_t* rc         = round_counter + role * (gridDim.x * BLOCK / kLamportWave);
+    const uint32_t round = rc[wave];
+    const int64_t bank   = round & 1u;
+    char* rp[ngpus]; // rp[k]: rank (rank + k) % ngpus (selects: no runtime index into the kernel argument)
+#pragma unroll
+    for(int k = 0; k < ngpus; ++k)
+    {
+        const int want = (rank + k) % ngpus;
+        char* q        = static_cast<char*>(peers.ptrs[0]);
+#pragma unroll
+        for(int s = 1; s < ngpus; ++s)
+            q = s == want ? static_cast<char*>(peers.ptrs[s]) : q;
+        rp[k] = q;
+    }
+    auto line = [&](char* b, int region, int src, int64_t g) -> char* {
+        return b + (((bank * 2 + region) * ngpus + src) * slot + g) * 16;
+    };
+    const int64_t stride         = (int64_t)gridDim.x * BLOCK;
+    const lamport_u32x4 sentinel = {0xffffffffu, 0xffffffffu, 0xffffffffu, 0xffffffffu};
+    if(role == 0)
+    {
+        for(int64_t b0 = (int64_t)blockIdx.x * BLOCK; b0 < chunk; b0 += stride)
+        {
+            const bool full = b0 + BLOCK <= chunk; // block-uniform
+            const int64_t g = b0 + lane < chunk ? b0 + lane : chunk - 1;
+            const bool live = full || b0 + lane < chunk;
+#pragma unroll
+            for(int k = 1; k < ngpus; ++k)
+            {
+                float x[G];
+                load((rank + k) % ngpus, g, x);
+                const lamport_u32x4 l = enc(x);
+                char* d               = line(rp[k], 0, rank, g);
+                if(full)
+                    lamport_store_b128(d, l);
+                else if(live)
+                    lamport_store_b128(d, l);
+            }
+        }
+        for(int64_t b0 = (int64_t)blockIdx.x * BLOCK; b0 < chunk; b0 += stride)
+        {
+            // a wave wholly past the chunk sits out (its clamped lines belong to a live lane of another wave)
+            if(__builtin_amdgcn_readfirstlane((int)(b0 + lane >= chunk)))
+                continue;
+            const int64_t g = b0 + lane < chunk ? b0 + lane : chunk - 1;
+            const bool live = b0 + lane < chunk;
+            const char* pp[ngpus - 1];
+#pragma unroll
+            for(int k = 1; k < ngpus; ++k)
+                pp[k - 1] = line(rp[0], 1, (rank + k) % ngpus, g);
+            lamport_u32x4 ll[ngpus - 1];
+            q4ar::poll<ngpus - 1>(pp, ll);
+#pragma unroll
+            for(int k = 1; k < ngpus; ++k)
+            {
+                float y[G];
+                dec(ll[k - 1], y);
+                if(live)
+                {
+                    store((rank + k) % ngpus, g, y);
+                    lamport_store_b128(const_cast<char*>(pp[k - 1]), sentinel);
+                }
+            }
+        }
+    }
+    else
+    {
+        for(int64_t b0 = (int64_t)blockIdx.x * BLOCK; b0 < chunk; b0 += stride)
+        {
+            if(__builtin_amdgcn_readfirstlane((int)(b0 + lane >= chunk)))
+                continue;
+            const int64_t g = b0 + lane < chunk ? b0 + lane : chunk - 1;
+            const bool live = b0 + lane < chunk;
+            const char* pp[ngpus - 1];
+#pragma unroll
+            for(int k = 1; k < ngpus; ++k)
+                pp[k - 1] = line(rp[0], 0, (rank + k) % ngpus, g);
+            float acc[G];
+            load(rank, g, acc);
+            lamport_u32x4 ll[ngpus - 1];
+            q4ar::poll<ngpus - 1>(pp, ll);
+#pragma unroll
+            for(int k = 1; k < ngpus; ++k)
+            {
+                float x[G];
+                dec(ll[k - 1], x);
+#pragma unroll
+                for(int i = 0; i < G; ++i)
+                    acc[i] += x[i];
+            }
+#pragma unroll
+            for(int i = 0; i < G; ++i) // what a lossless all-reduce returns, then coded once
+                acc[i] = q4ar::bf_lo(q4ar::f2bf(acc[i]));
+            const lamport_u32x4 l = enc(acc);
+            float y[G];
+            dec(l, y);
+            if(live)
+            {
+#pragma unroll
+                for(int k = 1; k < ngpus; ++k)
+                    lamport_store_b128(line(rp[k], 1, rank, g), l);
+                store(rank, g, y);
+#pragma unroll
+                for(int k = 1; k < ngpus; ++k)
+                    lamport_store_b128(const_cast<char*>(pp[k - 1]), sentinel);
+            }
+        }
+    }
+    if(threadIdx.x % kLamportWave == 0)
+        rc[wave] = round + 1;
+}
+
+// Fills an inbox with the 0xffffffff sentinel through system-scope stores, so a system-scope poll (which reads
+// past L2) never finds a stale line.
+__global__ void lamport_q4_fill_gfx1250(void* buf, int64_t lines)
+{
+    const lamport_u32x4 sentinel = {0xffffffffu, 0xffffffffu, 0xffffffffu, 0xffffffffu};
+    for(int64_t i = (int64_t)blockIdx.x * blockDim.x + threadIdx.x; i < lines; i += (int64_t)gridDim.x * blockDim.x)
+        lamport_store_b128(static_cast<char*>(buf) + i * 16, sentinel);
+}
+
+inline constexpr int64_t lamport_q4_2s_buffer_bytes(int ngpus, int64_t slot)
+{
+    return 2LL * 2 * ngpus * slot * 16;
+}
+
+// The INT4 Lamport two-shot inbox of a communicator (see lamport_q4_2s_gfx1250).
+struct LamportQ4Ar2s
+{
+    static constexpr int BLOCK = 256;
+    LamportPeers peers{};
+    uint32_t* d_round = nullptr; // [2][grid * BLOCK / kLamportWave], rank-local
+    int64_t slot      = 0;       // the most groups a chunk takes
+    int rank          = 0;
+    int world_size    = 0;
+    int grid          = 0; // fixed: every block co-resident
+    int codec         = 4; // 4: INT4 (28 elements a line), 8: INT8 (14)
+
+    ~LamportQ4Ar2s()
+    {
+        if(d_round)
+            (void)hipFree(d_round);
+    }
+
+    void run(hipStream_t stream, const void* input, void* output, int64_t numel)
+    {
+        const int64_t G = q4ar::group_of(codec);
+        if(numel % (G * world_size) != 0)
+            throw std::runtime_error("q4 two-shot all-reduce: numel must split into whole groups a rank");
+        const int64_t chunk = numel / G / world_size;
+        if(chunk > slot)
+            throw std::runtime_error("q4 two-shot all-reduce: " + std::to_string(numel * 2) +
+                                     "B exceeds the inbox cap of " +
+                                     std::to_string(slot * G * 2 * world_size) + "B");
+        if(chunk == 0)
+            return;
+#define LAUNCH_Q4_2S(NG)                                                                              \
+    lamport_q4_2s_gfx1250<NG, BLOCK, 4><<<grid, 2 * BLOCK, 0, stream>>>(                              \
+        input, output, d_round, slot, rank, chunk, peers)
+#define LAUNCH_I8_2S(NG)                                                                              \
+    lamport_q4_2s_gfx1250<NG, BLOCK, 8><<<grid, 2 * BLOCK, 0, stream>>>(                              \
+        input, output, d_round, slot, rank, chunk, peers)
+        if(codec == 8)
+        {
+            DISPATCH_NGPUS_1250(world_size, LAUNCH_I8_2S);
+        }
+        else
+        {
+            DISPATCH_NGPUS_1250(world_size, LAUNCH_Q4_2S);
+        }
+#undef LAUNCH_Q4_2S
+#undef LAUNCH_I8_2S
+    }
+};
+
+// ---------------------------------------------------------------------------
 // gfx1250 allgather kernel — scalar fallback (size not pack-aligned)
 // ---------------------------------------------------------------------------
 template <typename T, int ngpus>
@@ -2473,6 +2846,8 @@ public:
 
     // Lamport fused all-reduce + RMSNorm inbox (init_lamport_ar_rms), or null.
     std::unique_ptr<LamportArRms> lamport_;
+    // INT4 Lamport two-shot all-reduce inbox (init_lamport_q4_2s), or null.
+    std::unique_ptr<LamportQ4Ar2s> lamportq4_;
 
     // gfx1250: hipIpc is not available. Instead, each rank's Signal buffer
     // is a torch-shared tensor whose device pointer is exchanged via the
@@ -2835,6 +3210,61 @@ public:
         if(!lamport_)
             throw std::runtime_error("allreduce_add_lamport: call init_lamport_ar_rms first");
         lamport_->run_add<T>(stream, input, other, output, numel);
+    }
+
+    // INT4 Lamport two-shot all-reduce inbox (lamport_q4_2s_gfx1250). all_ptrs:
+    // every rank's buffer of lamport_q4_2s_buffer_size(world_size, max_bytes).
+    void init_lamport_q4_2s(const std::vector<int64_t>& all_ptrs, int64_t max_bytes)
+    {
+        if(lamportq4_)
+            throw std::runtime_error("init_lamport_q4_2s: already initialized");
+        if(world_size_ > kMaxNgpusAr || (int)all_ptrs.size() != world_size_)
+            throw std::invalid_argument("init_lamport_q4_2s: need one buffer per rank, at most 8 ranks");
+        if(max_bytes <= 0)
+            throw std::invalid_argument("init_lamport_q4_2s: max_bytes must be positive");
+        auto state        = std::make_unique<LamportQ4Ar2s>();
+        state->rank       = rank_;
+        state->world_size = world_size_;
+        state->codec      = q4ar::codec_from_env();
+        const int64_t G   = q4ar::group_of(state->codec);
+        state->slot       = (max_bytes / 2 + G * world_size_ - 1) / (G * world_size_);
+        for(int i = 0; i < world_size_; i++)
+            state->peers.ptrs[i] = reinterpret_cast<void*>(all_ptrs[i]);
+        int dev = 0, ncu = 0, occ = 0;
+        HIP_CALL(hipGetDevice(&dev));
+        HIP_CALL(hipDeviceGetAttribute(&ncu, hipDeviceAttributeMultiprocessorCount, dev));
+#define OCC_Q4_2S(NG)                                                                        \
+    HIP_CALL(hipOccupancyMaxActiveBlocksPerMultiprocessor(                                   \
+        &occ, lamport_q4_2s_gfx1250<NG, LamportQ4Ar2s::BLOCK, 4>, 2 * LamportQ4Ar2s::BLOCK, 0))
+#define OCC_I8_2S(NG)                                                                        \
+    HIP_CALL(hipOccupancyMaxActiveBlocksPerMultiprocessor(                                   \
+        &occ, lamport_q4_2s_gfx1250<NG, LamportQ4Ar2s::BLOCK, 8>, 2 * LamportQ4Ar2s::BLOCK, 0))
+        if(state->codec == 8)
+        {
+            DISPATCH_NGPUS_1250(world_size_, OCC_I8_2S);
+        }
+        else
+        {
+            DISPATCH_NGPUS_1250(world_size_, OCC_Q4_2S);
+        }
+#undef OCC_Q4_2S
+#undef OCC_I8_2S
+        state->grid         = std::max(1, occ) * std::max(1, ncu);
+        const int64_t waves = (int64_t)state->grid * LamportQ4Ar2s::BLOCK / kLamportWave;
+        const int64_t packs = lamport_q4_2s_buffer_bytes(world_size_, state->slot) / 16;
+        lamport_q4_fill_gfx1250<<<1024, 256>>>(state->peers.ptrs[rank_], packs);
+        HIP_CALL(hipGetLastError());
+        HIP_CALL(hipMalloc((void**)&state->d_round, sizeof(uint32_t) * 2 * waves));
+        HIP_CALL(hipMemset(state->d_round, 0, sizeof(uint32_t) * 2 * waves));
+        HIP_CALL(hipDeviceSynchronize());
+        lamportq4_ = std::move(state);
+    }
+
+    void allreduce_lamport_q4_2s(hipStream_t stream, const void* input, void* output, int64_t numel)
+    {
+        if(!lamportq4_)
+            throw std::runtime_error("allreduce_lamport_q4_2s: call init_lamport_q4_2s first");
+        lamportq4_->run(stream, input, output, numel);
     }
 
     // Lamport all-gather on the same inbox, see lamport_ag_gfx1250.
