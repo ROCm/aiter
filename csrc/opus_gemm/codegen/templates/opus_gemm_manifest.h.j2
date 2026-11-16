@@ -1,0 +1,42 @@
+#pragma once
+// SPDX-License-Identifier: MIT
+// Copyright (C) 2025-2026, Advanced Micro Devices, Inc. All rights reserved.
+#include "aiter_tensor.h"
+#include <cstdlib>
+#include <optional>
+[% for e in entries %]
+template <typename D_C>
+void
+[[ e.name ]]([% if e.abi == "bmm_mxscale" %]
+    aiter_tensor_t &XQ,
+    aiter_tensor_t &WQ,
+    aiter_tensor_t &Y,
+    aiter_tensor_t &x_scale,
+    aiter_tensor_t &w_scale,
+    std::optional<aiter_tensor_t> workspace,
+    int splitK);[% elif e.abi == "a16w16_workspace" %]
+    aiter_tensor_t &XQ,
+    aiter_tensor_t &WQ,
+    aiter_tensor_t &Y,
+    aiter_tensor_t &workspace,
+    std::optional<aiter_tensor_t> bias,
+    int splitK);[% elif e.abi == "a16w16" %]
+    aiter_tensor_t &XQ,
+    aiter_tensor_t &WQ,
+    aiter_tensor_t &Y,
+    std::optional<aiter_tensor_t> bias,
+    int splitK);[% elif e.abi == "noscale_3arg" %]
+    aiter_tensor_t &XQ,
+    aiter_tensor_t &WQ,
+    aiter_tensor_t &Y);[% elif e.abi == "blockscale" %]
+    aiter_tensor_t &XQ,
+    aiter_tensor_t &WQ,
+    aiter_tensor_t &Y,
+    aiter_tensor_t &x_scale,
+    aiter_tensor_t &w_scale);[% elif e.abi == "blockscale_bpreshuffle" %]
+    aiter_tensor_t &XQ,
+    aiter_tensor_t &WQ,
+    aiter_tensor_t &x_scale,
+    aiter_tensor_t &w_scale,
+    aiter_tensor_t &Y);[% endif %]
+[% endfor %]
