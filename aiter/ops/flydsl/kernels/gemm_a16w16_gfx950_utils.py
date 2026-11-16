@@ -169,7 +169,9 @@ class SplitKProtocol:
                 else:
                     init_vec = zero_vec
                 if global_m_idx < self.m and global_n_idx < self.n:
-                    c_offset = global_m_idx * self.c_stride + global_n_idx
+                    c_offset = fx.Int64(self.block_m_offset) * fx.Int64(
+                        self.c_stride
+                    ) + fx.Int64(m_local_idx * self.c_stride + global_n_idx)
                     if const_expr(self.C_DTYPE_BYTES == 4):
                         store_global_f32_vec(
                             self.c_ptr,

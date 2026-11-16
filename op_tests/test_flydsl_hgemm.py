@@ -27,12 +27,11 @@ from aiter import dtypes
 from aiter.jit.utils.chip_info import get_gfx
 from aiter.ops.flydsl import flydsl_hgemm
 from aiter.ops.flydsl.gemm_a16w16_band import band_stream_config
-from aiter.ops.flydsl.gemm_a16w16_policy import get_flydsl_a16w16_configs
 from aiter.ops.flydsl.gemm_kernels import (
-    SKINNY_POLICY,
     flydsl_hgemm_kernel_name,
     get_flydsl_hgemm_kernel_params,
 )
+from aiter.ops.flydsl.kernels.gemm_a16w16_gfx950 import gemm_a16w16
 from aiter.test_common import (
     benchmark,
     checkAllclose,
@@ -725,61 +724,72 @@ def test_hgemm_tuned_strides(m, n, k, dtype, layout):
     return ret
 
 
-def check_large_operands_rejected():
-    """A, B or C of 4 GiB or more must raise, not wrap the kernel's 32-bit offsets.
+def check_large_operands():
+    """A, B or C past 4 GiB stay exact.
 
-    Unguarded, C faults ("write access to a read-only page") or lands in other
-    allocations, and rows of A or B past 4 GiB silently read the wrong data. An
-    output just below the limit stays exact.
+    Each workgroup addresses its tiles from a 64-bit base, so the kernel's
+    32-bit offsets never wrap; unfixed, C faulted and rows of A or B past 4 GiB
+    read the wrong data. Inputs in {-1, 0, 1} with K = 128 make every output an
+    exact bf16 integer, and M or N (a multiple of 8, the store vector) leaves
+    partial tiles at the end. A K-major
+    operand is still addressed whole and must stay below 4 GiB.
     """
     limit, k = 1 << 32, 128
     free, _ = torch.cuda.mem_get_info()
-    if free < 2 * limit + (1 << 30):
+    if free < 3 * limit:
         aiter.logger.info(
-            "skipping the 4 GiB operand check: %.1f GiB free", free / 2**30
+            "skipping the past-4 GiB operand check: %.1f GiB free", free / 2**30
         )
         return
-    cfg = {
-        "block_m": 64,
-        "block_n": 64,
-        "block_k": 64,
-        "stages": 2,
-        "split_k": 1,
-        "m_waves": 2,
-        "n_waves": 2,
-        "k_waves": 1,
-        "group_m": 0,
-        "policy": "ft",
+    tiles = {
+        "ft": {"block_m": 64, "block_n": 64, "m_waves": 2, "n_waves": 2},
+        "ht": {"block_m": 256, "block_n": 256, "m_waves": 2, "n_waves": 4},
     }
+    common = {"block_k": 64, "stages": 2, "split_k": 1, "k_waves": 1, "group_m": 0}
+    rows = limit // (2 * k) + 104
+
+    def ints(r, c):
+        return torch.randint(-1, 2, (r, c), dtype=torch.int8).to(dtypes.bf16)
+
     torch.manual_seed(SEED)
-    for name, m, n in (
-        ("A", limit // (2 * k), 64),
-        ("B", 64, limit // (2 * k)),
-        ("C", 16384, limit // (2 * 16384)),
-    ):
-        offered = get_flydsl_a16w16_configs(m, n, k, dtypes.bf16, dtypes.bf16, False)
-        # The skinny kernel addresses B per workgroup and stays valid.
-        assert all(
-            c.get("policy") == SKINNY_POLICY for c in offered
-        ), f"policy offers gfx950 HGEMM configs for a 4 GiB {name}"
-        a = torch.empty((m, k), dtype=dtypes.bf16)
-        w = torch.empty((n, k), dtype=dtypes.bf16)
-        try:
-            flydsl_hgemm(a, w, **cfg)
-        except ValueError as e:
-            assert f"{name}=" in str(e), e
-        else:
-            raise AssertionError(f"accepted a 4 GiB {name} operand")
+    for name, m, n in (("A", rows, 64), ("B", 64, rows), ("C", 16434, 131088)):
+        a, w = ints(m, k), ints(n, k)
+        for policy, tile in tiles.items():
+            out = flydsl_hgemm(a, w, policy=policy, **tile, **common)
+            if name == "B":
+                step = 1 << 20
+                for j in range(0, n, step):
+                    ref = a.float() @ w[j : j + step].float().t()
+                    ok = torch.equal(out[:, j : j + step], ref.to(dtypes.bf16))
+                    assert ok, f"{policy}: B past 4 GiB mismatch in columns {j}+"
+            else:
+                step = (1 << 28) // n
+                for i in range(0, m, step):
+                    ref = a[i : i + step].float() @ w.float().t()
+                    ok = torch.equal(out[i : i + step], ref.to(dtypes.bf16))
+                    assert ok, f"{policy}: {name} past 4 GiB mismatch in rows {i}+"
+            del out
         del a, w
-    m, n = 16384, limit // (2 * 16384) - 16
-    a = torch.empty((m, k), dtype=dtypes.bf16).uniform_(-1, 1)
-    w = torch.empty((n, k), dtype=dtypes.bf16).uniform_(-1, 1)
-    out = flydsl_hgemm(a, w, **cfg)
-    err = checkAllclose(
-        torch.mm(a, w.t()).float(), out.float(), rtol=1e-2, atol=1e-2, msg="C < 4 GiB"
-    )
-    assert err == 0, f"output just below 4 GiB mismatch {err}"
-    aiter.logger.info("4 GiB operands rejected; an output just below 4 GiB is exact")
+        torch.cuda.empty_cache()
+    b = torch.empty((k, limit // (2 * k)), dtype=dtypes.bf16)
+    try:
+        gemm_a16w16(
+            torch.empty((64, k), dtype=dtypes.bf16),
+            b,
+            user_kwargs={
+                **tiles["ft"],
+                **common,
+                "use_half_tile_interleaved": False,
+                "k_stagger": 0,
+                "b_non_temporal": False,
+            },
+            layout="nn",
+        )
+    except ValueError as e:
+        assert "B=" in str(e), e
+    else:
+        raise AssertionError("accepted a 4 GiB K-major B")
+    aiter.logger.info("A, B and C past 4 GiB are exact; a 4 GiB K-major B raises")
 
 
 def check_band_rejects():
@@ -961,7 +971,7 @@ def main():
     check_hgemm_memory_options()
     check_skinny_rejects()
     check_skinny_large_weight()
-    check_large_operands_rejected()
+    check_large_operands()
 
 
 if __name__ == "__main__":
