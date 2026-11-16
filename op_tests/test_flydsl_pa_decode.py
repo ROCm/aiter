@@ -1892,6 +1892,24 @@ def test_pa_decode(case, device, monkeypatch):
     _run_pa_decode_case(case, device, monkeypatch)
 
 
+def test_pa_decode_quant_empty_long_query(device, monkeypatch):
+    """An empty sequence writes every descale of a query longer than a CTA."""
+    if get_gfx_runtime() != "gfx1250":
+        pytest.skip("the fused FP8 output runs on gfx1250")
+    _run_pa_decode_case(
+        {
+            "query_length": 129,
+            "group_size": 1,
+            "head_dim": 256,
+            "block_size": 16,
+            "lengths": (129, 0),
+            "quant": True,
+        },
+        device,
+        monkeypatch,
+    )
+
+
 def _run_pa_decode_case(case, device, monkeypatch):
     """FP8/BF16/MXFP4 decode shares input, reference, planning and replay checks.
 

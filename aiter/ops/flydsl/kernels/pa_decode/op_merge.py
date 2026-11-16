@@ -629,5 +629,7 @@ class Gfx1250OutputQuant:
                 None,
                 inv_scale,
             )
-        if tid < tokens:
-            scales[token + tid] = scale
+        for i in range_constexpr(-(-tokens // t.BLOCK_THREADS)):
+            index = i * t.BLOCK_THREADS + tid
+            if index < tokens:
+                scales[token + index] = scale
