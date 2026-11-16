@@ -583,7 +583,19 @@ class CudaCommunicator(DeviceCommunicatorBase):
         )
         ca_comm = self.ca_comm
         qr_comm = self.qr_comm
-        if (
+        if ca_comm is not None and ca_comm.should_lamport_ar_rms(
+            input_, res_inp_, weight_, hidden_dim
+        ):
+            # The Lamport one-shot of fused_allreduce_rmsnorm with the per-token
+            # quant in the same kernel: one launch, the bits of the two below.
+            result = ca_comm.lamport_fused_ar_rms_quant(
+                input_, res_inp_, weight_, eps, gemma_norm, emit_bf16
+            )
+            if emit_bf16:
+                out, res_out, scale_out, bf16_out = result
+            else:
+                out, res_out, scale_out = result
+        elif (
             ca_comm is not None
             and not ca_comm.disabled
             and (

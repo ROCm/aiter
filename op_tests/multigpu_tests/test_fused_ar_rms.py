@@ -1619,6 +1619,60 @@ try:
             ret["res_err"] < 5e-2
         ), f"gemma per-token quant residual err={ret['res_err']} config={ret}"
 
+    @pytest.mark.parametrize(
+        "m,n,emit_bf16,lamport",
+        [
+            (16, 4096, False, True),
+            (16, 4096, True, True),
+            (512, 8192, False, True),  # 8 MiB, the TP4 cap
+            (513, 8192, False, False),
+            (16, 6152, False, False),  # not whole waves of 16B packs
+            (16, 12288, True, False),  # a row wider than one block
+        ],
+    )
+    def test_lamport_per_token_quant_dispatch(m, n, emit_bf16, lamport):
+        """gfx1250 TP4 on the CPU: the per-token FP8 op takes the Lamport kernel
+        wherever should_lamport_ar_rms does; the other calls keep their route."""
+        from types import MethodType, SimpleNamespace
+        from unittest.mock import Mock, patch
+
+        from aiter.dist.device_communicators import communicator_cuda as cc
+        from aiter.dist.device_communicators.custom_all_reduce import CustomAllreduce
+
+        x = torch.zeros((m, n), dtype=torch.bfloat16)
+        q = torch.zeros((m, n), dtype=dtypes.fp8)
+        scale = torch.ones((m, 1))
+        ca = SimpleNamespace(
+            disabled=False,
+            has_old_arch_fused_kernels=False,
+            _lamport_max_bytes=8 << 20,
+            should_fuse_ar_rms=lambda *args: False,
+            should_custom_ar=lambda *args: True,
+            lamport_fused_ar_rms_quant=Mock(
+                side_effect=lambda x, *args: (q, x, scale, x)[: 4 if args[-1] else 3]
+            ),
+        )
+        ca.should_lamport_ar_rms = MethodType(CustomAllreduce.should_lamport_ar_rms, ca)
+        comm = SimpleNamespace(
+            ca_comm=ca,
+            _ar_quant_max_bytes=-1,
+            _ar_quant_no_prefill_max_bytes=-1,
+            fused_allreduce_rmsnorm=Mock(return_value=(x, x)),
+        )
+        weight = torch.ones(n, dtype=torch.bfloat16)
+        with patch.object(
+            cc, "get_hip_quant", return_value=Mock(return_value=(q, scale))
+        ):
+            result = cc.CudaCommunicator.fused_allreduce_rmsnorm_quant(
+                comm, x, x, weight, 1e-6, emit_bf16=emit_bf16, gemma_norm=True
+            )
+        assert ca.lamport_fused_ar_rms_quant.called == lamport
+        assert comm.fused_allreduce_rmsnorm.called == (not lamport)
+        assert len(result) == (4 if emit_bf16 else 3)
+        if lamport:
+            args = ca.lamport_fused_ar_rms_quant.call_args.args
+            assert args[3:] == (1e-6, True, emit_bf16)
+
 except ImportError:
     pass
 
