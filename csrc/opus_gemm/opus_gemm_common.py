@@ -24,7 +24,7 @@ def base_gfx_arch(gfx: str) -> str:
 _A16W16_CO_TAGS = frozenset(
     {"a16w16_4wave_co", "a16w16_4wave_wl_co", "a16w16_4wave_wlr_co"}
 )
-# gfx950 a16w16 4-wave family: device code pre-built offline (gen_co/gfx950),
+# gfx950 a16w16 4-wave family: device code pre-built offline,
 # host launchers JIT-built. a16w16_4wave is the direct launcher, a16w16_4wave_ws
 # the fp32 split-K workspace + reduce launcher.
 _A16W16_4WAVE_GFX950_TAGS = frozenset({"a16w16_4wave", "a16w16_4wave_ws"})
@@ -2863,7 +2863,7 @@ assert not (GFX1250_4WAVE_CO_KIDS & _GFX1250_PRE_CO_KIDS), (
 
 # ---- gfx950 a16w16 4-wave family (pre-built .co device images) ----------
 # gen_co/co_kernels_gfx950_bf16.json lists the kids (kid, tag, tile). Each kid has
-# one image per layout, gen_co/gfx950/<name>_<nt|nn|tt|tn>.co (built offline by
+# one image per layout, <name>_<nt|nn|tt|tn>.co (built offline by
 # gen_co/build_co.py --arch gfx950); its launcher picks one from the tensor strides.
 CO_KERNELS_GFX950_JSON = os.path.join(
     os.path.dirname(__file__), "gen_co", "co_kernels_gfx950_bf16.json"
@@ -2908,7 +2908,7 @@ def a16w16_4wave_co_images(instance):
 
 
 def _a16w16_4wave_images_present(instance) -> bool:
-    root = os.path.join(os.path.dirname(CO_KERNELS_GFX950_JSON), "gfx950")
+    root = os.path.join(os.path.dirname(CO_KERNELS_GFX950_JSON), "gfx950", "a16w16")
     return all(
         os.path.isfile(os.path.join(root, f"{symbol}.co"))
         for _layout, symbol in a16w16_4wave_co_images(instance)

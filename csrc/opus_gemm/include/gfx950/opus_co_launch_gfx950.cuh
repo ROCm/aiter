@@ -2,7 +2,7 @@
 // Copyright (C) 2025-2026, Advanced Micro Devices, Inc. All rights reserved.
 //
 // Runtime loader for the pre-built gfx950 a16w16 4-wave code objects
-// (gen_co/gfx950/<symbol>.co, built by gen_co/build_co.py --arch gfx950).
+// (<symbol>.co, built by gen_co/build_co.py --arch gfx950).
 // Host pass only. One .co holds exactly one extern "C" kernel whose name equals
 // the file stem; its kernarg is opus_gemm_a16w16_4wave_kargs_gfx950 (88 bytes).
 #pragma once
@@ -34,7 +34,7 @@ inline std::string co_dir() {
     const char* env = std::getenv("OPUS_GEN_CO_DIR");
     const std::string root = (env && *env) ? std::string(env) : std::string(OPUS_GEN_CO_DIR);
     AITER_CHECK(!root.empty(), "opus_gemm gfx950: OPUS_GEN_CO_DIR is empty");
-    return (std::filesystem::absolute(root) / "gfx950").lexically_normal().string();
+    return (std::filesystem::absolute(root) / "gfx950" / "a16w16").lexically_normal().string();
 }
 
 // e_machine EM_AMDGPU (224), e_flags & EF_AMDGPU_MACH == EF_AMDGPU_MACH_AMDGCN_GFX950 (0x4f).

@@ -6,8 +6,7 @@
 ``--arch gfx1250`` (default) builds the gfx1250 4-wave CO families described
 below. ``--arch gfx950`` builds the gfx950 a16w16 4-wave family
 (``gen_co/co_kernels_gfx950_bf16.json``, kernel tags ``a16w16_4wave`` and
-``a16w16_4wave_ws``) into ``gen_co/gfx950/``: one image per (kid, layout
-NT/NN/TT/TN); see ``_build_gfx950``.
+``a16w16_4wave_ws``): one image per (kid, layout NT/NN/TT/TN); see ``_build_gfx950``.
 
 Why this exists
 ---------------
@@ -643,8 +642,7 @@ def build_one(k, args, llvm_bin, workdir):
 
 def _default_co_output_dir(arch, offload_arch):
     if arch == "gfx950":
-        # The runtime loader reads <OPUS_GEN_CO_DIR>/gfx950/ directly.
-        return os.path.join(_HERE, "gfx950")
+        return os.path.join(_HERE, "gfx950", "a16w16")
     if offload_arch == "gfx1250-strict":
         return os.path.join(_HERE, arch + "-strict")
     return os.path.join(_HERE, "named_reg", arch)

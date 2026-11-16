@@ -14,7 +14,7 @@
     "        and accumulators to fixed AGPR / VGPR ranges (needs the AGPR-pinning toolchain).",
     "",
     "One kid carries every layout as a separate image; the launcher picks one from the tensor",
-    "strides at runtime: <kid symbol>_<nt|nn|tt|tn>.co under gen_co/gfx950/",
+    "strides at runtime: <kid symbol>_<nt|nn|tt|tn>.co",
     "(nt = A [M,K], B [N,K]; nn = B stored [K,N]; tt = A stored [K,M]; tn = both)."
   ],
   "gfx950": [

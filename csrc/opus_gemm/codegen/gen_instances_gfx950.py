@@ -26,7 +26,7 @@ PIPELINE_HEADER_MAP = {
     "a16w16_flatmm_splitk": "gfx950/opus_gemm_pipeline_a16w16_flatmm_splitk_gfx950.cuh",
     "a16w16_persistent": "gfx950/opus_gemm_pipeline_a16w16_persistent_gfx950.cuh",
     "a16w16_mono_tile": "gfx950/opus_gemm_pipeline_a16w16_mono_tile_gfx950.cuh",
-    # 4-wave device code is pre-built (gen_co/gfx950); the host-only launcher
+    # 4-wave device code is pre-built; the host-only launcher
     # never includes the pipeline header, so point the lookup at the traits.
     "a16w16_4wave": "gfx950/opus_gemm_traits_a16w16_gfx950.cuh",
     "a16w16_4wave_ws": "gfx950/opus_gemm_traits_a16w16_gfx950.cuh",
@@ -3189,8 +3189,8 @@ _A16W16_4WAVE_LAUNCHER = r"""// SPDX-License-Identifier: MIT
 // Copyright (C) 2025-2026, Advanced Micro Devices, Inc. All rights reserved.
 //
 // Auto-generated. Do not edit. See codegen/gen_instances_gfx950.py:gen_a16w16_4wave_instance.
-// Pre-built gfx950 4-wave kid: host launcher only; the device images live in
-// gen_co/gfx950/@NAME@_<nt|nn|tt|tn>.co (gen_co/build_co.py --arch gfx950).
+// Pre-built gfx950 4-wave kid: host launcher only; the device images are
+// @NAME@_<nt|nn|tt|tn>.co (gen_co/build_co.py --arch gfx950).
 #pragma once
 #if !defined(__HIP_DEVICE_COMPILE__) && !defined(__HIPCC_RTC__)
 #include "aiter_tensor.h"
