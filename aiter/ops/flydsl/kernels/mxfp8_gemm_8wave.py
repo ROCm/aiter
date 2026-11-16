@@ -123,6 +123,7 @@ class ScaleRawLds:
         a_col_major=False,
         b_block128=False,
         c_m=None,
+        block_m_size=256,
     ):
         """``a_row`` / ``b_row``: block-local first row of this wave's tiles; ``lds``: two chunk slots.
 
@@ -168,7 +169,9 @@ class ScaleRawLds:
                     # Slot w holds half w % 2's row; only slots 0 and 1 are read.
                     offs.append((block * 2 + word % 2) * self.k128)
                 else:
-                    row = block * 256 + word // 4  # 4 words per row
+                    row = (
+                        block * (block_m_size if op == 0 else 256) + word // 4
+                    )  # 4 words per row
                     if const_expr(rows_per > 1):
                         row = row // rows_per
                     offs.append(row * self.row_bytes + (word % 4) * 4)
@@ -369,6 +372,7 @@ def compile_mxfp8_gemm_8w(
     xcd_swizzle: int = 0,
     b_scale_block: str = "1x32",
     a_scale_block: str = "1x32",
+    b_non_temporal: bool = False,
 ):
     """Build the MXFP8 launcher.
 
@@ -391,12 +395,14 @@ def compile_mxfp8_gemm_8w(
     assert (
         b_scale_block != "128x128" or K >= 512
     ), "a 128x128 B scale needs K >= 512 (a dword of K // 128 per chunk)"
-    # A 256x256 tile already spends 128 KB of the 160 KB LDS; every other
-    # BLOCK_M/BLOCK_N either overflows it or breaks the 2-threads-per-scale-row
-    # staging split. Kept as an assert rather than dead generality.
-    assert (
-        BLOCK_M == 256 and BLOCK_N == 256
-    ), "MXFP8 8-wave is specialized to a 256x256 block tile"
+    # Smaller M tiles reduce tail-wave waste without changing the number of
+    # scale DMAs or their fixed 256-row LDS slots.
+    assert BLOCK_M in (128, 192, 256) and BLOCK_N == 256
+    assert BLOCK_M == 256 or (
+        not scale_preshuffled
+        and a_scale_block == "1x32"
+        and b_scale_block in ("1x32", "32x32")
+    ), "rectangular tiles require raw 1x32 / 32x32 scales"
     assert (
         K % 256 == 0
     ), f"K must be a multiple of 256 (MX scale chunk staging), got {K}"
@@ -412,11 +418,11 @@ def compile_mxfp8_gemm_8w(
 
     LDS_BLOCK_M = BLOCK_M // 2
     LDS_BLOCK_N = BLOCK_N // 2
-    N_LDS_STEPS_A = LDS_BLOCK_M // 64
+    N_LDS_STEPS_A = ceildiv(LDS_BLOCK_M, 64)
     N_LDS_STEPS_B = LDS_BLOCK_N // 64
     N_LDS_ROUNDS = max(N_LDS_STEPS_A, N_LDS_STEPS_B)
 
-    a_lds_size = LDS_BLOCK_M * BLOCK_K
+    a_lds_size = N_LDS_STEPS_A * 64 * BLOCK_K
     b_lds_size = LDS_BLOCK_N * BLOCK_K
 
     A_GRP_ROWS = N_TILES_A * 16  # rows one wave_m owns inside one LDS half
@@ -439,6 +445,9 @@ def compile_mxfp8_gemm_8w(
         f"flydsl_{_layout_tag}_mxfp8_8w_{BLOCK_M}x{BLOCK_N}x{BLOCK_K}_F8_F8_B16_"
         f"{waves_per_eu}x{xcd_swizzle}{_scale_tag}_k{K}"
     )
+
+    if b_non_temporal:
+        _kname += "_bnt"
 
     @fx.struct
     class SharedStorage:
@@ -509,7 +518,9 @@ def compile_mxfp8_gemm_8w(
         mfma = MxMfma(N_TILES_A, N_TILES_B, paired_tiles=scale_preshuffled)
 
         a_g2s = G2SLoader(a_div, gl_off_a, N_LDS_STEPS_A, F8_IR_t, wave_id)
-        b_g2s = G2SLoader(b_div, gl_off_b, N_LDS_STEPS_B, F8_IR_t, wave_id)
+        b_g2s = G2SLoader(
+            b_div, gl_off_b, N_LDS_STEPS_B, F8_IR_t, wave_id, b_non_temporal
+        )
         a_s2r = S2RLoader(wave_m, N_TILES_A)
         b_s2r = S2RLoader(wave_n, N_TILES_B)
         store_c = StoreBf16(C, c_m, c_n, mfma.idx, N_TILES_A, N_TILES_B)
@@ -533,6 +544,7 @@ def compile_mxfp8_gemm_8w(
                 a_col_major=a_scale_block == "1x128",
                 b_block128=b_scale_block == "128x128",
                 c_m=c_m,
+                block_m_size=BLOCK_M,
             )
             n_chunks = (K_ITERS + ScaleRawLds.CHUNK - 1) // ScaleRawLds.CHUNK
         # 16-row tile index of each wave's first row, per LDS half.
@@ -545,7 +557,7 @@ def compile_mxfp8_gemm_8w(
             for h in range_constexpr(2)
         ]
         SCALE_LOADS_PER_PAIR = 2 * (N_TILES_A // 2) + 2 * (N_TILES_B // 2)
-        assert SCALE_LOADS_PER_PAIR == 6, (
+        assert not scale_preshuffled or SCALE_LOADS_PER_PAIR == 6, (
             f"scale prefetch issues {SCALE_LOADS_PER_PAIR} VMEM loads per K-pair, not the 6 the "
             "wait_barrier counts below were validated against; re-check them against the ISA"
         )

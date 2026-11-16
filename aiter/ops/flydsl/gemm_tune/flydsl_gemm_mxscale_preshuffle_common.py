@@ -525,7 +525,7 @@ from aiter.ops.flydsl.gemm_a8w8_mxfp8_8wave import (
 # prefix, not by id range -- the offset only keeps CSV rows unambiguous.
 KERNEL_ID_BASE_8WAVE = 1_000_000
 # The kernel always emits rocdl.waves_per_eu, so 0 ("no hint") is not
-# expressible; its only tile is 256x256.
+# expressible.
 _WAVES_PER_EU_8WAVE = (1, 2, 3, 4)
 _XCD_SWIZZLE_8WAVE = (0, 4, 8)
 _I32_MAX = 2**31
@@ -536,10 +536,14 @@ class EightWaveKernelInstance:
     waves_per_eu: int
     xcd_swizzle: int
     split_k: int = 1
+    block_m: int = 256
+    b_non_temporal: bool = False
 
     @property
     def name(self) -> str:
-        return make_mxfp8_8wave_kernel_name(self.waves_per_eu, self.xcd_swizzle)
+        return make_mxfp8_8wave_kernel_name(
+            self.waves_per_eu, self.xcd_swizzle, self.b_non_temporal, self.block_m
+        )
 
 
 def fits_shape_8wave(ki: EightWaveKernelInstance, M: int, N: int, K: int) -> bool:
@@ -558,6 +562,20 @@ kernels_list_8wave = {
         (w, x) for w in _WAVES_PER_EU_8WAVE for x in _XCD_SWIZZLE_8WAVE
     )
 }
+
+
+# Append candidates so the original twelve kernel IDs keep their meaning.
+for _bm in (256, 128, 192):
+    for _bnt in (False, True):
+        if _bm == 256 and not _bnt:
+            continue
+        for _wpe in _WAVES_PER_EU_8WAVE:
+            for _xcd in _XCD_SWIZZLE_8WAVE:
+                kernels_list_8wave[KERNEL_ID_BASE_8WAVE + len(kernels_list_8wave)] = (
+                    EightWaveKernelInstance(
+                        _wpe, _xcd, block_m=_bm, b_non_temporal=_bnt
+                    )
+                )
 
 
 # ===========================================================================
@@ -631,7 +649,12 @@ def _fits_mxpsh_row_w128x128(ki: kernelInstance, M: int, N: int, K: int) -> bool
 
 def _fits_8wave_w128x128(ki: EightWaveKernelInstance, M: int, N: int, K: int) -> bool:
     # A chunk stages a dword of each 128x128 scale row: K // 128 >= 4.
-    return N % 128 == 0 and K >= 512 and fits_shape_8wave(ki, M, N, K)
+    return (
+        ki.block_m == 256
+        and N % 128 == 0
+        and K >= 512
+        and fits_shape_8wave(ki, M, N, K)
+    )
 
 
 # Order is the order candidates are emitted per shape. mxpsh's _fsk variants

@@ -13,8 +13,7 @@ from torch import Tensor
 
 from aiter.jit.utils.chip_info import get_lds_capacity_bytes
 
-# Fixed by the kernel: MFMA_Scale(16, 16, 128) over a 128-deep K tile, one
-# 256x256 block tile, and scales staged a 256-K pair at a time.
+# MFMA_Scale(16, 16, 128), with a default 256x256 output tile.
 BLOCK_K = 128
 BLOCK_M = BLOCK_N = 256
 K_ALIGN = 256
@@ -22,7 +21,6 @@ SCALE_GROUP = 32
 
 # A/B stages: 4 buffers each of (BLOCK/2) x 128 fp8; the row layout adds two
 # 8 KB scale-chunk slots.
-_STAGE_LDS_BYTES = 4 * (BLOCK_M // 2 + BLOCK_N // 2) * BLOCK_K
 _ROW_SCALE_LDS_BYTES = 2 * 2 * 256 * 16
 _I32_MAX = 2**31
 
@@ -46,9 +44,11 @@ def _lazy_import() -> None:
     _fx = fx_mod
 
 
-def lds_bytes(scale_preshuffled: bool = False) -> int:
-    """Exact LDS footprint of the 256x256 kernel."""
-    return _STAGE_LDS_BYTES + (0 if scale_preshuffled else _ROW_SCALE_LDS_BYTES)
+def lds_bytes(scale_preshuffled: bool = False, block_m: int = BLOCK_M) -> int:
+    """Exact LDS footprint; each A half is padded to 64 DMA rows."""
+    a_rows = -(-(block_m // 2) // 64) * 64
+    stages = 4 * (a_rows + BLOCK_N // 2) * BLOCK_K
+    return stages + (0 if scale_preshuffled else _ROW_SCALE_LDS_BYTES)
 
 
 def _validate(
@@ -58,6 +58,8 @@ def _validate(
     scale_preshuffled: bool,
     M: int | None = None,
     N: int | None = None,
+    block_m: int = BLOCK_M,
+    w_scale_block: str = "1x32",
 ) -> None:
     """Check every kernel precondition, raising ValueError.
 
@@ -66,6 +68,10 @@ def _validate(
     AssertionError escaping here would kill the tuner worker process rather than
     just failing the candidate.
     """
+    if block_m not in (128, 192, 256):
+        raise ValueError(f"unsupported MXFP8 8-wave block_m={block_m}")
+    if block_m != BLOCK_M and (scale_preshuffled or w_scale_block == "128x128"):
+        raise ValueError("rectangular MXFP8 tiles require raw 1x32 / 32x32 scales")
     if K <= 0 or K % K_ALIGN != 0:
         raise ValueError(
             f"[FlyDSL mxfp8 8wave] K must be a positive multiple of {K_ALIGN}, got {K}"
@@ -82,7 +88,7 @@ def _validate(
     arch = get_rocm_arch().split(":", 1)[0]
     if arch != "gfx950":
         raise ValueError(f"[FlyDSL mxfp8 8wave] gfx950 only, got {arch}")
-    need = lds_bytes(scale_preshuffled)
+    need = lds_bytes(scale_preshuffled, block_m)
     have = get_lds_capacity_bytes(arch)
     if need > have:
         raise ValueError(
@@ -108,19 +114,28 @@ def compile_mxfp8_8wave_gemm(
     xcd_swizzle: int,
     scale_preshuffled: bool = False,
     w_scale_block: str = "1x32",
+    b_non_temporal: bool = False,
+    block_m: int = BLOCK_M,
 ):
     """Compile (and memoize) an 8-wave mxfp8 launcher."""
     _lazy_import()
-    _validate(K=K, waves_per_eu=waves_per_eu, scale_preshuffled=scale_preshuffled)
+    _validate(
+        K=K,
+        waves_per_eu=waves_per_eu,
+        scale_preshuffled=scale_preshuffled,
+        block_m=block_m,
+        w_scale_block=w_scale_block,
+    )
     return _compile_mxfp8_gemm_8w(
         K=K,
-        BLOCK_M=BLOCK_M,
+        BLOCK_M=block_m,
         BLOCK_N=BLOCK_N,
         b_preshuffled=True,
         scale_preshuffled=bool(scale_preshuffled),
         waves_per_eu=int(waves_per_eu),
         xcd_swizzle=int(xcd_swizzle),
         b_scale_block=w_scale_block,
+        b_non_temporal=bool(b_non_temporal),
         a_scale_block="1x128" if w_scale_block == "128x128" else "1x32",
     )
 
@@ -140,6 +155,8 @@ def flydsl_mxfp8_8wave_gemm(
     waves_per_eu: int = 2,
     xcd_swizzle: int = 0,
     w_scale_block: str = "1x32",
+    b_non_temporal: bool = False,
+    block_m: int = BLOCK_M,
 ) -> Tensor:
     """Run the 8-wave mxfp8 GEMM; writes into ``Out`` and returns it.
 
@@ -232,6 +249,8 @@ def flydsl_mxfp8_8wave_gemm(
         scale_preshuffled=scale_preshuffled,
         M=M,
         N=N,
+        block_m=block_m,
+        w_scale_block=w_scale_block,
     )
 
     exe = compile_mxfp8_8wave_gemm(
@@ -240,6 +259,8 @@ def flydsl_mxfp8_8wave_gemm(
         xcd_swizzle=int(xcd_swizzle),
         scale_preshuffled=scale_preshuffled,
         w_scale_block=w_scale_block,
+        b_non_temporal=bool(b_non_temporal),
+        block_m=block_m,
     )
 
     out_contig = Out.contiguous()
@@ -267,14 +288,19 @@ _KERNEL_NAME_RE = re.compile(
     rf"^{NAME_PREFIX}_"
     r"(?P<block_m>\d+)x(?P<block_n>\d+)x(?P<block_k>\d+)_"
     r"(?P<qa>[A-Z0-9]+)_(?P<qw>[A-Z0-9]+)_(?P<out>[A-Z0-9]+)_"
-    r"(?P<waves_per_eu>\d+)x(?P<xcd_swizzle>\d+)$"
+    r"(?P<waves_per_eu>\d+)x(?P<xcd_swizzle>\d+)(?P<b_non_temporal>_bnt)?$"
 )
 
 
-def make_mxfp8_8wave_kernel_name(waves_per_eu: int, xcd_swizzle: int) -> str:
+def make_mxfp8_8wave_kernel_name(
+    waves_per_eu: int,
+    xcd_swizzle: int,
+    b_non_temporal: bool = False,
+    block_m: int = BLOCK_M,
+) -> str:
     return (
-        f"{NAME_PREFIX}_{BLOCK_M}x{BLOCK_N}x{BLOCK_K}_F8_F8_B16_"
-        f"{waves_per_eu}x{xcd_swizzle}"
+        f"{NAME_PREFIX}_{block_m}x{BLOCK_N}x{BLOCK_K}_F8_F8_B16_"
+        f"{waves_per_eu}x{xcd_swizzle}" + ("_bnt" if b_non_temporal else "")
     )
 
 
@@ -293,6 +319,7 @@ def parse_mxfp8_8wave_kernel_name(name: str) -> dict | None:
         "dtype": g["out"],
         "waves_per_eu": int(g["waves_per_eu"]),
         "xcd_swizzle": int(g["xcd_swizzle"]),
+        "b_non_temporal": g["b_non_temporal"] is not None,
     }
 
 
@@ -311,11 +338,11 @@ def run_gemm_a8w8_mxfp8_8wave(
         raise ValueError(
             f"[FlyDSL mxfp8 8wave] unrecognised kernelName: {kernel_name!r}"
         )
-    if (cfg["block_m"], cfg["block_n"], cfg["block_k"]) != (BLOCK_M, BLOCK_N, BLOCK_K):
-        raise ValueError(
-            f"[FlyDSL mxfp8 8wave] the kernel fixes a {BLOCK_M}x{BLOCK_N}x{BLOCK_K} "
-            f"tile: {kernel_name!r}"
-        )
+    if cfg["block_m"] not in (128, 192, 256) or (cfg["block_n"], cfg["block_k"]) != (
+        BLOCK_N,
+        BLOCK_K,
+    ):
+        raise ValueError(f"unsupported MXFP8 8-wave tile: {kernel_name!r}")
     return flydsl_mxfp8_8wave_gemm(
         XQ,
         WQ,
@@ -325,4 +352,6 @@ def run_gemm_a8w8_mxfp8_8wave(
         waves_per_eu=cfg["waves_per_eu"],
         xcd_swizzle=cfg["xcd_swizzle"],
         w_scale_block=w_scale_block,
+        b_non_temporal=cfg["b_non_temporal"],
+        block_m=cfg["block_m"],
     )
