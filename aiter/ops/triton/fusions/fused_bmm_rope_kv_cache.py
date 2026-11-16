@@ -569,10 +569,11 @@ def fused_fp8_bmm_rope_cat_and_cache_mla(
     Limits: on gfx950, a pure-prefill call uses a different kernel. The call
     must have a tuned config in the FUSED-FP8-BMM-ROPE-PREFILL family (today
     kv_lora_rank=512, P=192 and 11072 to 32768 tokens), no explicit config, no
-    decode tokens, QH=8, KH=1, RoPE dim 64, group_size=128, transpose_bm=True,
-    one K row and one slot for each token, BF16 inputs, and FP8 e4m3 weights
-    and q_out. w_k must be contiguous. q_nope must be dense, or a view of a
-    (B, QH, P) or (B, QH, P + d_pe) tensor. Other calls use the generic kernel.
+    decode tokens, QH=8, KH=1, RoPE dim 64, P in two K groups (group_size=128
+    for P=192), transpose_bm=True, one K row and one slot for each token, BF16
+    inputs, and FP8 e4m3 weights and q_out. w_k must be contiguous. q_nope
+    must be dense, or a view of a (B, QH, P) or (B, QH, P + d_pe) tensor.
+    Other calls use the generic kernel.
     """
     _LOGGER.info(
         "FUSED_FP8_BMM_ROPE_CAT_AND_CACHE_MLA: q_nope=%s w_k=%s w_k_scale=%s q_pe=%s k_nope=%s k_rope=%s positions=%s cos=%s sin=%s kv_cache=%s slot_mapping=%s transpose_bm=%s group_size=%d is_neox=%s",
@@ -654,7 +655,6 @@ def fused_fp8_bmm_rope_cat_and_cache_mla(
         and arch_info.get_arch() == "gfx950"
         and qh == 8
         and kh == 1
-        and group_size == 128
         and group_size < K <= 2 * group_size
         and d_pe == qk_rope_head_dim == 64
         and b_slot == b == bk
