@@ -245,8 +245,7 @@ def _cu(lens, device="cuda"):
 def generate_mla_varlen_fp8_inputs(
     q_lens, k_lens, hq, hk, dv=128, seed=0, device="cuda"
 ):
-    """fp8 q [Tq, hq, 192]; k [Tk, hk, 128] and v [Tk, hk, dv], views of one buffer;
-    k_pe [Tk, 1, 64], a view of a [Tk, 576] latent, as vLLM passes them."""
+    """fp8 q, k/v views of one buffer, and k_pe a [Tk, 1, 64] latent view, as vLLM passes them."""
     g = torch.Generator(device=device)
     g.manual_seed(seed)
     tq, tk = sum(q_lens), sum(k_lens)
@@ -349,8 +348,7 @@ def test_mha_varlen_fp8_split_kv_pad(pad):
 @pytest.mark.parametrize("zero", ["softmax_scale", "q_descale"])
 @pytest.mark.parametrize("causal", [True, False])
 def test_mha_varlen_fp8_mla_zero_scale(causal, zero, return_lse):
-    """A zero softmax scale, or a zero q scale of a sequence, gives equal weights to
-    the visible keys. The result must not have NaN or Inf values."""
+    """A zero softmax or q scale gives equal weights to the visible keys, without NaN or Inf."""
     _skip_unless_gfx1250()
     q_lens, k_lens, h = [300, 100], [500, 100], 8
     q, k, v, k_pe = generate_mla_varlen_fp8_inputs(q_lens, k_lens, h, h, seed=4)
@@ -376,8 +374,7 @@ def test_mha_varlen_fp8_mla_zero_scale(causal, zero, return_lse):
 
 @pytest.mark.parametrize("causal", [True, False])
 def test_mha_varlen_fp8_mla_scales(causal):
-    """Dequant scales per sequence (and per head for q and v), made like quant_fp8.
-    k_pe is shared by the heads and uses the k scale, so the k scale is per sequence."""
+    """Per-sequence dequant scales; k_pe is shared by the heads, so the k scale is per sequence."""
     _skip_unless_gfx1250()
     q_lens, k_lens, hq, hk = [700, 300], [900, 300], 24, 4
     tq, tk, f8 = sum(q_lens), sum(k_lens), torch.float8_e4m3fn
@@ -434,8 +431,7 @@ def test_mha_varlen_fp8_mla_scales(causal):
 
 @pytest.mark.parametrize("context_first", [True, False])
 def test_mha_varlen_fp8_mla_merge(context_first):
-    """A context pass (split-KV) and a causal new-token pass, merged in place. The
-    second pass merges the result of the first one through o_init and lse_init."""
+    """A split-KV context pass and a causal new-token pass, merged via o_init and lse_init."""
     _skip_unless_gfx1250()
     q_lens, ctx_lens, h = [700, 300], [6000, 20000], 24
     q, k_new, v_new, kpe_new = generate_mla_varlen_fp8_inputs(

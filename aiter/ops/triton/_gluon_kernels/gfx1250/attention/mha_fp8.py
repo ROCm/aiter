@@ -3,14 +3,33 @@ import triton.language as tl
 from triton.experimental import gluon
 from triton.language.extra.libdevice import fast_dividef
 
-from aiter.ops.triton._gluon_kernels.common.utils import find_seq_idx
 from aiter.ops.triton.utils._triton.kernel_repr import make_kernel_repr
 
 RCP_LN2 = gl.constexpr(1.4426950408889634)
 LN2 = gl.constexpr(0.6931471805599453)
-# A zero softmax scale gives equal weights. A smaller positive scale keeps that result
-# and keeps masked logits at -inf, where -inf * 0 would give NaN.
+# Floor for a zero softmax scale, so masked logits stay -inf instead of -inf * 0 = NaN.
 MIN_SOFTMAX_SCALE = gl.constexpr(1e-30)
+
+
+@gluon.jit
+def find_seq_idx(
+    query_start_len_ptr,
+    target_idx,
+    num_seqs,
+    BLOCK_Q: gl.constexpr,
+    use_q_block_mode: gl.constexpr = True,
+):
+    left = 0
+    right = num_seqs
+    while left < right:
+        mid = (left + right) // 2
+        val = gl.load(query_start_len_ptr + mid)
+        mid_val = val // BLOCK_Q + mid if use_q_block_mode else val
+        if mid_val <= target_idx:
+            left = mid + 1
+        else:
+            right = mid
+    return left - 1
 
 
 @gluon.jit

@@ -10,13 +10,13 @@ Usage:
     python bench_mha_fp8.py --seqlen_q 1024 --seqlen_k 8192  # different q / k lengths
     python bench_mha_fp8.py --seqlen_q 1024 --seqlen_k 8192 --causal  # bottom-right causal
     python bench_mha_fp8.py --q_heads 32 --k_heads 8  # grouped query attention
-    python bench_mha_fp8.py --varlen --q_heads 12 --seqlen_q 7680 --causal  # MLA prefill
+    python bench_mha_fp8.py --varlen --q_heads 12 --seqlen_q 7680 --causal  # gfx950 MLA prefill
     python bench_mha_fp8.py --varlen --q_heads 12 --seqlen_q 128 --seqlen_k 16384  # key split
     python bench_mha_fp8.py --varlen --shared_pe --q_heads 24 --batch 4 --seqlen_q 2048 --causal
 
-``--varlen`` benchmarks ``mha_varlen_fwd`` (gfx950, gfx1250) with packed q/k ``[T, H,
-head_dim + pe_dim]`` and v ``[T, H, head_dim]``. A non-causal call also writes the LSE, as
-an MLA context chunk does.
+``--varlen`` benchmarks ``mha_varlen_fwd`` (gfx950/gfx1250) with packed q/k ``[T, H, head_dim +
+pe_dim]`` and v ``[T, H, head_dim]``. A non-causal call also writes the LSE, as an MLA
+context chunk does.
 """
 
 import functools

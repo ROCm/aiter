@@ -202,9 +202,7 @@ def lse_merge(
         with a contiguous last dimension.
     out: BSHD [batch, Sq, H, D], written as weighted by exp(partial_lse - lse).
     lse: optional FP32 [batch, H, Sq] receiving the merged log-sum-exp.
-    row_bounds: optional int32 tensor on the device, such as packed varlen cu_seqlens.
-        Only rows in [row_bounds[0], row_bounds[-1]) are merged; the other rows of `out`
-        and `lse` are not written. It is read on the device, so it needs no sync.
+    row_bounds: optional int32 cu_seqlens; only rows in [row_bounds[0], row_bounds[-1]) are written.
     """
     batch, sequence, heads, head_dim = out.shape
     if partial_out.shape[0] % batch or partial_out.shape[1:] != out.shape[1:]:

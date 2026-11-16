@@ -482,7 +482,7 @@ def mha_varlen_fwd(
     o_init: torch.Tensor | None = None,
     lse_init: torch.Tensor | None = None,
 ):
-    """FP8 varlen MHA forward (gfx950 and gfx1250).
+    """FP8 varlen MHA forward (gfx950, gfx1250).
 
     Args:
         q, k: [T, H, d_qk] float8_e4m3fn. v: [T, H, d_v] float8_e4m3fn. The last dim is contiguous.
@@ -494,26 +494,17 @@ def mha_varlen_fwd(
         q_descale, k_descale, v_descale: one-element fp32 tensors on the device of q, the
             per-tensor dequant scales.
         softmax_scale: defaults to 1 / sqrt(d_qk).
-        causal: apply the causal mask, aligned to the bottom-right corner of each sequence.
+        causal: apply the causal mask.
         return_lse: also return the log-sum-exp.
         out, lse: optional preallocated outputs.
         config: optional kernel config. The default comes from the JSON config.
 
-    gfx1250 only (MLA prefill, e.g. DeepSeek / Kimi-K3):
-        k_pe: [Tk, 1 or H_k, 64] rope dims of k, given apart from k, e.g. one vector per token
-            shared by the heads, as a view of the latent cache. k is then [Tk, H_k, 128].
-        o_init, lse_init: result of the same queries over other keys (an earlier chunk);
-            the output merges it. They may be ``out`` and ``lse`` themselves.
-        H_k may divide H (GQA), and d_v may be 64. The descales may also be [batch, H] for q
-        and [batch, H_k] for k and v (per sequence and head), or all None for a scale of 1.
-        ``config`` keys override the default config instead of replacing it.
-
+        k_pe, o_init, lse_init: gfx1250 only; separate k rope dims, and a prior (out, lse) to merge.
     Returns:
         out [Tq, H, d_v] bfloat16, and with ``return_lse`` also lse [H, Tq] float32 (natural log,
         -inf for a row that sees no key).
 
-    Limits: gfx950: d_v must be 128. d_qk - d_v, the rope part, must be 0 or 64.
-    gfx1250: d_qk must be 192 (128 + 64 rope dims) and d_v 64 or 128.
+    Limits: gfx950: d_v 128, rope 0 or 64. gfx1250: d_qk 192 (64 rope), d_v 64 or 128.
     """
     arch = get_arch()
     if arch == "gfx1250":
