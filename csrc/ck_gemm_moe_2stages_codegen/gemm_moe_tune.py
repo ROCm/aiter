@@ -62,6 +62,7 @@ from aiter.jit.utils.chip_info import get_gfx, gfx_from_cu_num
 from aiter.ops.flydsl.moe_common import (
     DEFAULT_SITUV2_BETA,
     DEFAULT_SITUV2_LINEAR_BETA,
+    GateMode,
     get_flydsl_activation_name,
     resolve_swiglu_limit,
 )
@@ -2816,6 +2817,7 @@ class FmoeTuner(TunerCommon):
         w1_bias=None,
         w2_bias=None,
         swiglu_limit=None,
+        stage1_ref_dtype=None,
     ):
         ref1 = torch_moe_stage1(
             hidden_states,
@@ -2823,7 +2825,7 @@ class FmoeTuner(TunerCommon):
             w2,  # E, model_dim, inter_dim
             topk_weight,
             topk_ids,
-            dtype=dtype,
+            dtype=dtype if stage1_ref_dtype is None else stage1_ref_dtype,
             activation=activation,
             quant_type=quant_type,
             a1_scale=a1_scale,
@@ -2850,7 +2852,9 @@ class FmoeTuner(TunerCommon):
             if AQDType in (dtypes.bf16, dtypes.fp16):
                 a2_qt, a2_scale = ref1.to(AQDType), None
             elif AQDType == dtypes.fp8:
-                a2_qt, a2_scale = torch_dynamic_mxfp8_quant(ref1)
+                a2_qt, a2_scale = per_1x32_f8_scale_f8_quant(
+                    ref1, quant_dtype=dtypes.fp8, scale_type=dtypes.fp8_e8m0
+                )
             else:
                 a2_qt, a2_scale = aiter.get_torch_quant(quant_type)(
                     ref1, quant_dtype=AQDType
@@ -4995,6 +4999,9 @@ class FmoeTuner(TunerCommon):
             doweight_stage1 = bool(row["doweight_stage1"])
             limit_env = os.environ.get("AITER_MXFP4_TUNE_SWIGLU_LIMIT")
             swiglu_limit = None if limit_env in (None, "") else float(limit_env)
+            asm_flat_mxfp4 = "swiglu_oai" in str(row.get("kernelName1", ""))
+            if asm_flat_mxfp4 and swiglu_limit is None:
+                swiglu_limit = 7.0
             # Every knob that decides which tuned config fused_moe dispatches to
             # lives in fmoe_runtime_policy, so this benchmark and
             # op_tests/test_moe_2stage.py cannot drift apart on it.
@@ -5049,8 +5056,10 @@ class FmoeTuner(TunerCommon):
                 # op_tests/test_moe_2stage.py. Silu (no +1) and mxfp8/a4w4/a16wi4
                 # run without bias (their tuned kernels take the no-bias path, so
                 # adding a reference-only bias would create a spurious mismatch).
+                # SwiGLU OAI FLAT kernels have no per-expert bias input.
                 use_bias = (
-                    q_type == QuantType.per_1x32
+                    not asm_flat_mxfp4
+                    and q_type == QuantType.per_1x32
                     and act_type == ActivationType.Swiglu
                     and q_dtype_a in [dtypes.bf16, dtypes.fp16, dtypes.fp8]
                     and q_dtype_w == dtypes.fp4x2
@@ -5214,17 +5223,28 @@ class FmoeTuner(TunerCommon):
                 elif q_type == QuantType.per_1x32 and q_dtype_w == dtypes.i4x2:
                     a1_qt = hidden.to(dtypes.bf16)
                     a1_scale = None
+                elif asm_flat_mxfp4:
+                    # FLAT quantizes both X and the FP32 stage1 result to MXFP4.
+                    a1_qt, a1_scale = aiter.get_torch_quant(q_type)(
+                        hidden, quant_dtype=dtypes.fp4x2
+                    )
+                elif (
+                    q_type == QuantType.per_1x32
+                    and q_dtype_a == dtypes.fp8
+                    and q_dtype_w == dtypes.fp4x2
+                ):
+                    a1_qt, a1_scale = per_1x32_f8_scale_f8_quant(
+                        hidden, quant_dtype=dtypes.fp8, scale_type=dtypes.fp8_e8m0
+                    )
                 elif q_type == QuantType.per_1x32 and (
                     (
-                        q_dtype_a in [dtypes.bf16, dtypes.fp16, dtypes.fp8]
+                        q_dtype_a in [dtypes.bf16, dtypes.fp16]
                         and q_dtype_w == dtypes.fp4x2
                     )
                     or (q_dtype_a == dtypes.fp8 and q_dtype_w == dtypes.fp8)
                 ):
-                    # a16w4 / a8w4 / mxfp8: the kernel quantizes the activation
-                    # internally; the torch reference keeps the activation in bf16
-                    # (higher precision) and lets logits_diff absorb the kernel's
-                    # quant error. Mirrors op_tests/test_moe_2stage.py.
+                    # a16w4 / mxfp8 keep the op test's unquantized activation
+                    # reference. a8w4 quantizes both reference stages above.
                     a1_qt = hidden.to(dtype)
                     a1_scale = None
                 else:
@@ -5234,9 +5254,8 @@ class FmoeTuner(TunerCommon):
                     torch_quant = aiter.get_torch_quant(q_type)
                     a1_qt, a1_scale = torch_quant(hidden, quant_dtype=q_dtype_a)
 
-                # SiTUv2 beta/linear_beta are runtime scalars whose kernel default
-                # depends on the stage1 wrapper that wins dispatch, so pin them to
-                # the same constants torch_moe_2stages references.
+                # Use the normalized SiTUv2 defaults for both the kernel and
+                # torch_moe_2stages reference.
                 situ_kwargs = (
                     {"beta": policy.situ_beta, "linear_beta": policy.situ_linear_beta}
                     if policy.situ_beta is not None
@@ -5288,6 +5307,7 @@ class FmoeTuner(TunerCommon):
                     w1_bias=exp_bias1,
                     w2_bias=exp_bias2,
                     swiglu_limit=swiglu_limit,
+                    stage1_ref_dtype=dtypes.fp32 if asm_flat_mxfp4 else dtype,
                 )
                 if not _all_finite(out) or not _all_finite(ref):
                     diag = tensor_compare_diagnostics(ref, out)
@@ -6500,8 +6520,19 @@ class FmoeTuner(TunerCommon):
             swiglu_limit=None,
             beta=None,
             linear_beta=None,
+            gate_mode=GateMode.SEPARATED.value,
+            bias1=None,
+            bias2=None,
         ):
             del beta, linear_beta
+            if GateMode(gate_mode) != GateMode.SEPARATED:
+                raise NotImplementedError(
+                    "gfx942 FlyDSL whole-graph tuning requires separated gate mode"
+                )
+            if bias1 is not None or bias2 is not None:
+                raise NotImplementedError(
+                    "gfx942 FlyDSL whole-graph tuning does not support expert bias"
+                )
             if doweight_stage1:
                 raise NotImplementedError(
                     "gfx942 FlyDSL whole-graph tuning does not support "

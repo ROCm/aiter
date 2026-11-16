@@ -13,6 +13,7 @@ Run:
 """
 
 import csv
+import math
 import os
 import re
 import subprocess
@@ -108,6 +109,27 @@ def _balance_csv_shards(csvs, shard_count):
         shard["rows"] += rows
         shard["csvs"].append(path)
     return shards
+
+
+def _shard_timeout(cfg, rows, total_rows):
+    """Scale the full-run budget by row count, retaining JIT headroom per shard."""
+    full_timeout = cfg.get("timeout", 600)
+    minimum = cfg.get("sharded_timeout", full_timeout)
+    return max(minimum, math.ceil(full_timeout * rows / max(total_rows, 1)))
+
+
+class TestShardTimeout(unittest.TestCase):
+    def test_small_gpu_counts_get_more_time(self):
+        cfg = {"timeout": 6000, "sharded_timeout": 1200}
+        self.assertEqual(_shard_timeout(cfg, 1825, 3644), 3005)
+        self.assertEqual(_shard_timeout(cfg, 915, 3644), 1507)
+        self.assertEqual(_shard_timeout(cfg, 617, 3644), 1200)
+
+    def test_empty_shard_retains_jit_budget(self):
+        self.assertEqual(
+            _shard_timeout({"timeout": 6000, "sharded_timeout": 1200}, 0, 0),
+            1200,
+        )
 
 
 def _run_config(script, config_csv, timeout=600, extra_args=None, env_overrides=None):
@@ -410,6 +432,7 @@ class TestRunConfig(unittest.TestCase):
             self.skipTest(f"No tuned CSVs found for {name} (pattern={pattern})")
 
         shards = _balance_csv_shards(csvs, shard_count)
+        total_rows = sum(shard["rows"] for shard in shards)
         print(
             f"\nRunning {name} across {len(shards)} GPUs: "
             f"{len(csvs)} CSVs / {sum(s['rows'] for s in shards)} rows"
@@ -421,7 +444,7 @@ class TestRunConfig(unittest.TestCase):
             result = _run_config(
                 cfg["script"],
                 _merge_config_paths(shard["csvs"]),
-                timeout=cfg.get("sharded_timeout", cfg.get("timeout", 600)),
+                timeout=_shard_timeout(cfg, shard["rows"], total_rows),
                 extra_args=cfg.get("extra_args"),
                 env_overrides={"HIP_VISIBLE_DEVICES": str(gpu)},
             )
@@ -587,6 +610,7 @@ class TestRunConfig(unittest.TestCase):
         self._test_family("paged_mqa_logits")
 
 
+@unittest.skipUnless(_gpu_available(), "No GPU available")
 class TestFmoeRuntimePolicy(unittest.TestCase):
     """Every per_1x32 tuned fmoe row must be reachable under its runtime policy.
 
@@ -606,8 +630,13 @@ class TestFmoeRuntimePolicy(unittest.TestCase):
                 fmoe_runtime_policy,
                 resolve_activation_dtype,
             )
+            from aiter.jit.utils.chip_info import get_gfx_runtime
         except ImportError as e:
             self.skipTest(f"aiter not importable: {e}")
+
+        gfx = get_gfx_runtime()
+        if gfx != "gfx950":
+            self.skipTest(f"gfx950 runtime policy requires gfx950 dtypes, got {gfx}")
 
         names = {
             "torch": torch,
@@ -635,7 +664,7 @@ class TestFmoeRuntimePolicy(unittest.TestCase):
                         activation=act_type,
                         gate_mode=policy.gate_mode,
                         M=int(row["token"]),
-                        gfx="gfx950",
+                        gfx=gfx,
                     )
                 if runtime_a != q_dtype_a:
                     unreachable.append(

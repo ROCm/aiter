@@ -350,10 +350,8 @@ def fmoe_runtime_policy(
                 # otherwise reroute a4w4 / a16w4 rows to fp8.
                 env["AITER_SITUV2_A8W4"] = "1" if q_dtype_a == dtypes.fp8 else "0"
                 env["AITER_SITUV2_A4W4"] = "1" if q_dtype_a == dtypes.fp4x2 else "0"
-                # beta / linear_beta are runtime scalars rather than compile keys,
-                # so the kernel default depends on which stage1 wrapper wins (1.0
-                # for FlyDSL, 4.0/25.0 for Opus). Pin them instead of inheriting
-                # whichever default the dispatch happens to land on.
+                # Match the SiTUv2 defaults fused_moe normalizes before calling
+                # either the FlyDSL or Opus stage1 wrapper.
                 situ_beta = DEFAULT_SITUV2_BETA
                 situ_linear_beta = DEFAULT_SITUV2_LINEAR_BETA
             elif q_dtype_a == dtypes.fp8:

@@ -167,6 +167,8 @@ def test_fmoe(
     )
     # Same source the callers used for gateMode: w1's gate_up shuffle flag and
     # the gate mode have to agree or the kernel misreads gate/up channels.
+    # Runtime env is selected by the sweep: the CSV iterator enables SiTUv2
+    # a8w4 and filters other modes before cases reach this function.
     policy = fmoe_runtime_policy(qType, AQDType, WQDType, actType)
     input = torch.randn((token, model_dim), dtype=dtype)
     if use_g1u1:
@@ -1106,10 +1108,8 @@ def _situv2_beta_kwargs(quant_type, aq_dtype, wq_dtype, act_type):
     """beta/linear_beta are only meaningful for SiTUv2; leave them unset (None)
     for every other activation so silu/swiglu/gelu behavior is unchanged.
 
-    They are runtime scalars rather than tuned-config keys, so an unset beta
-    inherits whichever stage1 wrapper wins the dispatch (1.0 for FlyDSL). Take
-    the policy's pinned pair instead, so a row is validated at the same beta
-    the tuner measured it with; --beta / --linear-beta still override.
+    The policy uses the same 4.0/25.0 defaults that fused_moe normalizes before
+    calling either stage1 wrapper. --beta / --linear-beta still override.
     """
     if act_type != aiter.ActivationType.Situv2:
         return {}
