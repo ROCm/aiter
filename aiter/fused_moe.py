@@ -59,7 +59,7 @@ from aiter.ops.flydsl.mxfp4_kname import (
     parse_flydsl_v2_gemm2_kernel,
     parse_g2_kname_any,
 )
-from aiter.ops.moe_limits import normalize_swiglu_limit
+from aiter.ops.moe_limits import RUNTIME_SILU_LIMIT_QUANT_TYPES, normalize_swiglu_limit
 from aiter.ops.moe_mxfp4_aux import (
     _MissingMxfp4MoeAuxInstances,
     _mxfp4_moe_sort_internal_is_supported,
@@ -4418,7 +4418,7 @@ def get_2stage_cfgs(
 ):
     gate_mode = GateMode(gate_mode)
     cktile_mxfp4_unsafe = q_dtype_w == dtypes.fp4x2 and inter_dim % 256 != 0
-    if q_type == QuantType.per_1x128 and activation == ActivationType.Silu:
+    if q_type in RUNTIME_SILU_LIMIT_QUANT_TYPES and activation == ActivationType.Silu:
         swiglu_limit = normalize_swiglu_limit(swiglu_limit)
     flydsl_can_take_over = _can_reroute_mxfp4_to_flydsl(
         model_dim=model_dim,
@@ -4654,7 +4654,7 @@ def get_2stage_cfgs(
     limit_tag = (
         swiglu_limit_tag(swiglu_limit)
         if config_file is None
-        and q_type == QuantType.per_1x128
+        and q_type in RUNTIME_SILU_LIMIT_QUANT_TYPES
         and activation == ActivationType.Silu
         else ""
     )
@@ -4934,6 +4934,41 @@ def get_2stage_cfgs(
                     "using default heuristics"
                 )
 
+    # Runtime SiLU clamping is supported only by the non-split CK stage-1 epilogue,
+    # so it must reject ASM 1-stage and FlyDSL whole-graph rows before they resolve.
+    clamp_silu_limit = (
+        bool(swiglu_limit)
+        and q_type in RUNTIME_SILU_LIMIT_QUANT_TYPES
+        and activation == ActivationType.Silu
+    )
+    if clamp_silu_limit and q_type != QuantType.per_1x128:
+        if q_dtype_w != dtypes.fp8 or q_dtype_a != dtypes.fp8:
+            raise NotImplementedError(
+                f"fused_moe cannot apply swiglu_limit={swiglu_limit!r} for {q_type} "
+                f"SiLU with weight dtype {q_dtype_w} / activation dtype {q_dtype_a}; "
+                "the runtime-limit CK instances are FP8 only."
+            )
+        if inter_dim % 128 != 0:
+            raise NotImplementedError(
+                f"fused_moe cannot apply swiglu_limit={swiglu_limit!r} for {q_type} "
+                f"SiLU at inter_dim={inter_dim}; the runtime-limit CK stage1 needs a "
+                "multiple of 128."
+            )
+    if clamp_silu_limit and cfg is not None:
+        cfg_ksplit = int(cfg.get("ksplit", 0) or 0)
+        if (
+            cfg.get("run_1stage", False)
+            or "ck2stages" not in str(cfg.get("kernelName1", ""))
+            or cfg_ksplit > 1
+            or "_silu_" not in str(cfg.get("kernelName1", ""))
+        ):
+            logger.warning(
+                f"[fused_moe] discarding tuned config {cfg.get('kernelName1')!r} "
+                f"for {keys}: it cannot apply swiglu_limit={swiglu_limit!r}; "
+                "using default heuristics"
+            )
+            cfg = None
+
     bypass_tuned_config = int(os.environ.get("AITER_BYPASS_TUNE_CONFIG", "0"))
     kernel_name1 = kn1 if cfg is not None else ""
     weights_shuffled = (
@@ -5015,27 +5050,6 @@ def get_2stage_cfgs(
             f"activation {activation}; using default heuristics"
         )
 
-    # Runtime SiLU clamping is supported only by the non-split CK stage-1 epilogue.
-    clamp_per_1x128 = (
-        bool(swiglu_limit)
-        and q_type == QuantType.per_1x128
-        and activation == ActivationType.Silu
-    )
-    if clamp_per_1x128 and cfg is not None:
-        cfg_ksplit = int(cfg.get("ksplit", 0) or 0)
-        if (
-            cfg.get("run_1stage", False)
-            or "ck2stages" not in str(cfg.get("kernelName1", ""))
-            or cfg_ksplit > 1
-            or "_silu_" not in str(cfg.get("kernelName1", ""))
-        ):
-            logger.warning(
-                f"[fused_moe] discarding tuned config {cfg.get('kernelName1')!r} "
-                f"for {keys}: it cannot apply swiglu_limit={swiglu_limit!r}; "
-                "using default heuristics"
-            )
-            cfg = None
-
     # The SwiGLU OAI FLAT asm kernels hard-code alpha=1.702 / limit=7.0, take
     # GGUU (separated) gate/up weights and have no per-expert bias input. The
     # 1-stage launch does not forward bias or swiglu_limit, so a row that does
@@ -5101,7 +5115,7 @@ def get_2stage_cfgs(
                 )
                 # for fp8 blockscale, ck has better performance so disable assembly kernel
                 run_1stage = (
-                    not clamp_per_1x128
+                    not clamp_silu_limit
                     and token > 32
                     and inter_dim % 128 == 0
                     and aiter.fmoe_fp8_blockscale_g1u1_has_kernel(
@@ -5214,7 +5228,7 @@ def get_2stage_cfgs(
     ):
         kernelName2 = kernelName2.replace("_afp4_", "_afp8_", 1)
 
-    if clamp_per_1x128:
+    if clamp_silu_limit:
         # Deliberately override tuned, heuristic and AITER_KSPLIT selections.
         ksplit = 0
         run_1stage = False
@@ -6633,7 +6647,10 @@ def torch_moe_stage1(
     situ_linear_beta: float = 25.0,
 ):
     quant_type = quant_remap.get(quant_type, quant_type)
-    if quant_type == QuantType.per_1x128 and activation == ActivationType.Silu:
+    if (
+        quant_type in RUNTIME_SILU_LIMIT_QUANT_TYPES
+        and activation == ActivationType.Silu
+    ):
         swiglu_limit = normalize_swiglu_limit(swiglu_limit)
     ctype = dtypes.fp32  # compute type
     B, _D = hidden_states.shape
@@ -6928,11 +6945,15 @@ def ck_moe_stage1(
         limit = normalize_swiglu_limit(swiglu_limit)
         if limit is not None:
             quant_type = quant_remap.get(quant_type, quant_type)
-            if quant_type != QuantType.per_1x128:
+            w1_dtype = getattr(w1, "dtype", None)
+            if quant_type not in RUNTIME_SILU_LIMIT_QUANT_TYPES or (
+                w1_dtype != dtypes.fp8
+            ):
                 raise NotImplementedError(
-                    f"CK MoE stage1 cannot apply swiglu_limit={swiglu_limit!r}; "
-                    "only FP8 per_1x128 has a clamped CK SiLU epilogue "
-                    "(clamp before SiLU)."
+                    f"CK MoE stage1 cannot apply swiglu_limit={swiglu_limit!r} for "
+                    f"{quant_type} with weight dtype {w1_dtype}; only FP8 "
+                    "per_1x128 / per_Token / per_Tensor have a clamped CK SiLU "
+                    "epilogue (clamp before SiLU)."
                 )
             if kernelName and ("Splitk" in kernelName or "_silu_" not in kernelName):
                 raise ValueError(
