@@ -20,6 +20,13 @@
   "supersedes": [],
   "version": 1
  },
+ "fp8_paged_mqa_logits": {
+  "fingerprint": "d0cc3f92ac94d915",
+  "signature": "q_fp8:positional:torch.Tensor, kv_cache:positional, weights:positional:torch.Tensor, out_logits:positional:torch.Tensor, context_lens:positional:torch.Tensor, kv_indices:positional:torch.Tensor, max_model_len:positional:int, Preshuffle:positional:bool=False, KVBlockSize:positional:int=1, ChunkK:positional:int=256, TotalCuCount:positional:int | None=None, WavePerEU:positional:int=2, VarCtxSchedule:positional:torch.Tensor | None=None, SplitKV:positional:int | None=None, PersistentSchedule:positional:torch.Tensor | None=None",
+  "source": "aiter/ops/triton/attention/pa_mqa_logits.py",
+  "supersedes": [],
+  "version": 1
+ },
  "fused_dual_rmsnorm_mxfp8_quant": {
   "fingerprint": "944105d153e047dd",
   "signature": "q:positional:torch.Tensor, k:positional:torch.Tensor, q_weight:positional:torch.Tensor, k_weight:positional:torch.Tensor, eps_q:positional:float, eps_k:positional:float | None=None, amax_floor:positional:float=0.0, -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]",
@@ -83,6 +90,13 @@
   "supersedes": [],
   "version": 1
  },
+ "mhc_fused_post_pre": {
+  "fingerprint": "b2614c95340693db",
+  "signature": "layer_input:positional:torch.Tensor, residual_in:positional:torch.Tensor, post_layer_mix:positional:torch.Tensor, comb_res_mix:positional:torch.Tensor, fn:positional:torch.Tensor, hc_scale:positional:torch.Tensor, hc_base:positional:torch.Tensor, rms_eps:positional:float=1e-06, hc_pre_eps:positional:float=1e-06, hc_sinkhorn_eps:positional:float=1e-06, hc_post_mult_value:positional:float=1.0, sinkhorn_repeat:positional:int=20, norm_weight:positional:torch.Tensor | None=None, norm_eps:positional:float=1e-06, w_preshuffle_bf16:positional:bool=False, res_preshuffle:positional:bool=False, -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]",
+  "source": "aiter/ops/mhc.py",
+  "supersedes": [],
+  "version": 1
+ },
  "mhc_post": {
   "fingerprint": "2bc5023c8a38ba47",
   "signature": "out:positional:torch.Tensor, x:positional:torch.Tensor, residual:positional:torch.Tensor, post_layer_mix:positional:torch.Tensor, comb_res_mix:positional:torch.Tensor, store_nt:positional:int=-1, res_preshuffle:positional:bool=False, -> None",
@@ -94,6 +108,13 @@
   "fingerprint": "6c084f59b1883f48",
   "signature": "residual:positional:torch.Tensor, fn:positional:torch.Tensor, hc_scale:positional:torch.Tensor, hc_base:positional:torch.Tensor, rms_eps:positional:float=1e-06, hc_pre_eps:positional:float=1e-06, hc_sinkhorn_eps:positional:float=1e-06, hc_post_mult_value:positional:float=1.0, sinkhorn_repeat:positional:int=20, norm_weight:positional:torch.Tensor | None=None, norm_eps:positional:float=1e-06, large_m_splitk:positional:bool=False, w_preshuffle_bf16:positional:int=0, res_preshuffle:positional:bool=False, -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]",
   "source": "aiter/ops/mhc.py",
+  "supersedes": [],
+  "version": 1
+ },
+ "mla_decode_fwd": {
+  "fingerprint": "8c1528aa5cb5de72",
+  "signature": "q:positional, kv_buffer:positional, o:positional, qo_indptr:positional, kv_indptr:positional, kv_indices:positional, kv_last_page_lens:positional, max_seqlen_q:positional, page_size:positional=1, nhead_kv:positional=1, sm_scale:positional=None, logit_cap:positional=0.0, num_kv_splits:positional=None, num_kv_splits_indptr:positional=None, work_meta_data:positional=None, work_indptr:positional=None, work_info_set:positional=None, reduce_indptr:positional=None, reduce_final_map:positional=None, reduce_partial_map:positional=None, q_scale:positional=None, kv_scale:positional=None, intra_batch_mode:positional=False, return_logits:positional=False, return_lse:positional=False, g_kv_indptr:positional=None, cp_world_size:positional=1, cp_rank:positional=0, causal:positional=True, kv_layout:positional='token_major', seq_lens:positional=None, page_table:positional=None, kv_csr_layout:positional='page', fast_mode:positional=True, q_aux:keyword-only=None, kv_aux:keyword-only=None, nvfp4_params:keyword-only=None, nvfp4_lse:keyword-only=None",
+  "source": "aiter/mla.py",
   "supersedes": [],
   "version": 1
  },
@@ -111,9 +132,23 @@
   "supersedes": [],
   "version": 1
  },
+ "mla_paged_decode": {
+  "fingerprint": "e79e120730fadae6",
+  "signature": "q_nope:positional:torch.Tensor, q_pe:positional:torch.Tensor, kv_c:positional:torch.Tensor, o:positional:torch.Tensor, page_table:positional:torch.Tensor, seq_info:positional:torch.Tensor, sm_scale:positional:float, k_pe:positional:torch.Tensor | None=None, kv_pe_offset:positional:int=512, use_2d_view:positional:bool=True, kv_scale:positional:float=1.0, min_kv_seq_len:positional:int=1, return_lse:positional:bool=False, -> tuple[torch.Tensor, torch.Tensor | None]",
+  "source": "aiter/ops/triton/gluon/mla_gluon.py",
+  "supersedes": [],
+  "version": 1
+ },
  "mla_sparse_prefill": {
   "fingerprint": "1f95f64a09fbd513",
   "signature": "q:positional:torch.Tensor, unified_kv:positional:torch.Tensor, kv_indices_prefix:positional:torch.Tensor, kv_indptr_prefix:positional:torch.Tensor, kv:positional:torch.Tensor, kv_indices_extend:positional:torch.Tensor, kv_indptr_extend:positional:torch.Tensor, attn_sink:positional:torch.Tensor | None, softmax_scale:positional:float, out:positional:torch.Tensor | None=None, num_kv_splits:positional:int | None=None, -> torch.Tensor",
+  "source": "aiter/ops/mla_sparse_prefill.py",
+  "supersedes": [],
+  "version": 1
+ },
+ "mla_sparse_prefill_v4": {
+  "fingerprint": "6ba41f4ad9135d81",
+  "signature": "q_nope:positional:torch.Tensor, q_rope:positional:torch.Tensor, unified_kv_nope:positional:torch.Tensor, unified_kv_rope:positional:torch.Tensor, kv_indices_prefix:positional:torch.Tensor, kv_indptr_prefix:positional:torch.Tensor, kv_nope:positional:torch.Tensor, kv_rope:positional:torch.Tensor, kv_indices_extend:positional:torch.Tensor, kv_indptr_extend:positional:torch.Tensor, attn_sink:positional:torch.Tensor | None, softmax_scale:positional:float, out:positional:torch.Tensor | None=None, num_kv_splits:positional:int | None=None, -> torch.Tensor",
   "source": "aiter/ops/mla_sparse_prefill.py",
   "supersedes": [],
   "version": 1

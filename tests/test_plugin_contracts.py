@@ -650,6 +650,13 @@ _NOT_REGISTERED = {
     "pa_fwd": "out-buffer in the contract (`out_`)",
     "mla_decode_fwd_v4_nm": "unannotated contract, and an out-buffer in it",
     "mla_decode_fwd_v4_nm_ps": "unannotated contract, and an out-buffer in it",
+    "mla_decode_fwd": (
+        "unannotated contract, and an out-buffer in it (`o`, which the first "
+        "result may be a view of)"
+    ),
+    "mla_paged_decode": "out-buffer in the contract (`o`, returned first)",
+    "mla_sparse_prefill_v4": "out-buffer in the contract (`out`)",
+    "fp8_paged_mqa_logits": "unannotated contract (`kv_cache`)",
     "sp_qkv_fused": "unannotated contract",
     "pertoken_quant": (
         "unannotated contract; and its body is pure torch, which inductor "
