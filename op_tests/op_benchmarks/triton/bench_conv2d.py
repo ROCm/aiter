@@ -53,6 +53,7 @@ from aiter.ops.triton.conv._prepack import (
 )
 from aiter.ops.triton.conv._utils import (
     BLOCK_K,
+    _conv2d_padding_geometry,
     _is_1x1_conv,
     _is_3x3_conv,
     _out_hw,
@@ -91,17 +92,14 @@ def which_kernel(
     padding=(0, 0),
     padding_mode="zeros",
 ):
-    """Name of the Triton kernel ``conv2d`` would route to for these shapes,
-    without launching anything. Delegates to the production ``_resolve_route``
-    (the same decision the router uses), so the label can never drift from
-    dispatch. Bench-only: used to label rows and pick correctness tolerances."""
+    """Predict the routed kernel without launching it.
+
+    Use shared padding geometry and dispatch rules for labels and tolerances.
+    """
     N, C, H, W_in = x.shape
     K_out, _, R, S = w_oihw.shape
     _validate_conv2d_padding_mode(padding_mode, H, W_in, padding)
-    if padding_mode != "zeros":
-        H += 2 * padding[0]
-        W_in += 2 * padding[1]
-        padding = (0, 0)
+    H, W_in, padding = _conv2d_padding_geometry(H, W_in, padding, padding_mode)
     route = _resolve_route(
         R,
         S,

@@ -161,6 +161,16 @@ def _validate_conv2d_padding_mode(
         )
 
 
+def _conv2d_padding_geometry(
+    height: int, width: int, padding: tuple[int, int], padding_mode: str
+) -> tuple[int, int, tuple[int, int]]:
+    """Return effective dimensions and kernel padding for normalized, valid inputs."""
+    if padding_mode == "zeros" or padding == (0, 0):
+        return height, width, padding
+    pad_height, pad_width = padding
+    return height + 2 * pad_height, width + 2 * pad_width, (0, 0)
+
+
 # ---------------------------------------------------------------------------
 # Conv3D helpers
 # ---------------------------------------------------------------------------

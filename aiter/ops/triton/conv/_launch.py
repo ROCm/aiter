@@ -86,6 +86,7 @@ from aiter.ops.triton._triton_kernels.conv.ncx_to_cblocked import (
     _ncx_to_cblocked_kernel,
 )
 from aiter.ops.triton.conv._utils import (
+    _conv2d_padding_geometry,
     _ensure_layout,
     _normalize_tuple,
     _validate_conv2d_padding_mode,
@@ -172,8 +173,11 @@ def _prepare_conv2d_padding(
     padding = _normalize_tuple(padding, 2, "padding", allow_zero=True)
     height, width = source.shape[2:]
     _validate_conv2d_padding_mode(padding_mode, height, width, padding)
-    if padding_mode == "zeros" or padding == (0, 0):
-        return source, padding
+    padded_height, padded_width, conv_padding = _conv2d_padding_geometry(
+        height, width, padding, padding_mode
+    )
+    if (padded_height, padded_width) == (height, width):
+        return source, conv_padding
     if x_blocked is not None:
         raise ValueError(
             "x_blocked cannot be used with materialized padding; "
@@ -188,7 +192,7 @@ def _prepare_conv2d_padding(
         (pad_width, pad_width, pad_height, pad_height),
         mode=padding_mode,
     )
-    return _ensure_layout(output, layout), (0, 0)
+    return _ensure_layout(output, layout), conv_padding
 
 
 def _launch_nchw_to_cblocked(x, x_blocked, N, C, H, W, C_pad, block_c):
