@@ -84,7 +84,10 @@ from aiter.ops.flydsl.mxfp4_kname import (
     _parse_mxfp4_g1_kname,
     parse_g2_kname_any,
 )
-from aiter.ops.moe_limits import normalize_swiglu_limit
+from aiter.ops.moe_limits import (
+    RUNTIME_SILU_LIMIT_QUANT_TYPES,
+    normalize_swiglu_limit,
+)
 from aiter.ops.quant import (
     per_1x32_f8_scale_f8_quant,
     per_1x32_i4_quant,
@@ -765,7 +768,8 @@ class FmoeTuner(TunerCommon):
             "--swiglu_limit",
             type=float,
             default=None,
-            help="Tune FP8 per_1x128 SiLU MoE with this gate/up clamp. Only CK "
+            help="Tune FP8 per_1x128 / per_Token / per_Tensor SiLU MoE with this "
+            "gate/up clamp. Only CK "
             "2-stage candidates can clamp; results are tagged in a _tag column "
             "and must go to a separate tuned file (-o).",
         )
@@ -918,8 +922,14 @@ class FmoeTuner(TunerCommon):
         if swiglu_limit is not None:
             if splitk > 1 or "Splitk" in kernelName:
                 raise ValueError("Runtime SiLU clamp tuning requires non-split CK")
-            if q_type != QuantType.per_1x128 or act_type != ActivationType.Silu:
-                raise ValueError("Runtime clamp tuning requires per_1x128 SiLU")
+            if (
+                q_type not in RUNTIME_SILU_LIMIT_QUANT_TYPES
+                or act_type != ActivationType.Silu
+            ):
+                raise ValueError(
+                    "Runtime clamp tuning requires per_1x128 / per_Token / "
+                    "per_Tensor SiLU"
+                )
         is_splitk = q_type == QuantType.per_1x128 and splitk > 1
         if is_splitk:
             sorted_size = min(token_num * topk * blockM, sorted_ids.shape[0])
@@ -3592,7 +3602,13 @@ class FmoeTuner(TunerCommon):
         )
         # only the blockscale kernels read the hint
         nt_values = (False, True) if q_type == QuantType.per_1x128 else (False,)
-        clamp_limit = self.swiglu_limit if is_fp8_blockscale else None
+        clamp_limit = (
+            self.swiglu_limit
+            if q_type in RUNTIME_SILU_LIMIT_QUANT_TYPES
+            and q_dtype_a == dtypes.fp8
+            and q_dtype_w == dtypes.fp8
+            else None
+        )
         stage1_kwargs = {"swiglu_limit": clamp_limit} if clamp_limit else {}
         for blockM in blockMs:
             if blockM in [16, 32, 64, 128] and use_g1u1:
@@ -5489,15 +5505,16 @@ class FmoeTuner(TunerCommon):
             _tune_only = {s for s in tune_only.split(",") if s}
             if self.swiglu_limit is not None:
                 if not (
-                    q_type == QuantType.per_1x128
+                    q_type in RUNTIME_SILU_LIMIT_QUANT_TYPES
                     and act_type == ActivationType.Silu
                     and q_dtype_a == dtypes.fp8
                     and q_dtype_w == dtypes.fp8
                 ):
                     raise ValueError(
-                        f"--swiglu_limit supports only FP8 per_1x128 SiLU, got {line}"
+                        "--swiglu_limit supports only FP8 per_1x128 / per_Token / "
+                        f"per_Tensor SiLU, got {line}"
                     )
-                # ASM, FlyDSL and Opus per_1x128 SiLU kernels have no clamp.
+                # ASM, FlyDSL and Opus SiLU kernels for these quant types have no clamp.
                 print(f"--swiglu_limit={self.swiglu_limit:g}: tuning CK 2-stage only")
                 _opus_only, _tune_only = False, {"cktile"}
 
