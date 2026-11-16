@@ -55,14 +55,12 @@ from functools import cache, lru_cache
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
-from flydsl._mlir import ir
 from flydsl._mlir.dialects import fly as fly_dialect
 from flydsl._mlir.dialects import llvm as _llvm
-from flydsl.expr import arith, const_expr, gpu, range_constexpr
+from flydsl.expr import const_expr, range_constexpr
 from flydsl.expr.typing import T
 
-from aiter.ops.flydsl.kernels.buffer_ops import _get_buffer_flags
-from aiter.ops.flydsl.kernels.kernels_common import LOG2E, atomic_add_i32
+from aiter.ops.flydsl.kernels.kernels_common import LOG2E, atomic_add_i32, pin_i32
 from aiter.ops.flydsl.kernels.tensor_shim import (
     AITER_FLYDSL_KERNARG_PRELOAD,
     AITER_FLYDSL_KERNARG_PRELOAD_COUNT,
@@ -90,6 +88,8 @@ SOFTMAX_GATHER_CHUNKS = 4
 
 
 def _mfma_ssa(mma, a, b, acc):
+    # SSA form: register vectors in and out, one MFMA per call, so the schedule
+    # can place each MFMA between lane transfers and gathers.
     out = fly_dialect.mma_atom_call_ssa(
         [fx.Vector.make_type(4, fx.Float32)],
         mma,
@@ -172,28 +172,16 @@ def _halves(v8, halves):
     ]
 
 
-def _opaque_v(x):
-    # An opaque VGPR copy: LLVM cannot reassociate a constant into it, so
-    # base + constant offsets stay in the load's immediate offset field.
-    v = x.ir_value() if hasattr(x, "ir_value") else x
-    return fx.Int32(
-        _llvm.inline_asm(
-            ir.IntegerType.get_signless(32), [v], "", "=v,0", has_side_effects=False
-        )
-    )
-
-
 def _bpermute_acc(addr, src):
-    # ds_bpermute with AGPR data and result. The asm is opaque to the waitcnt
-    # pass, so callers wait on lgkmcnt before reading the result.
-    ops = [x.ir_value() if hasattr(x, "ir_value") else x for x in (addr, src)]
+    # ds_bpermute with AGPR data and result. fx.rocdl.ds_bpermute cannot pin
+    # either operand to AGPRs; the IMM route keeps gathered dwords there, and
+    # the VGPR form first copies each one out with v_accvgpr_read (64 a tile).
+    # The asm is opaque to the waitcnt pass, so callers wait on lgkmcnt before
+    # reading the result.
+    ops = [x.ir_value() for x in (addr, src)]
     return fx.Int32(
         _llvm.inline_asm(
-            ir.IntegerType.get_signless(32),
-            ops,
-            "ds_bpermute_b32 $0, $1, $2",
-            "=a,v,a",
-            has_side_effects=True,
+            T.i32, ops, "ds_bpermute_b32 $0, $1, $2", "=a,v,a", has_side_effects=True
         )
     )
 
@@ -306,7 +294,7 @@ def compile_sparse_mla_fwd(
         acc_l = _colmajor(H4, PV_GROUPS)
         N_ACC = _static_int(fx.size(acc_l))
 
-        tid = fx.Int32(gpu.thread_id("x"))
+        tid = fx.thread_idx.x
         tc = fx.idx2crd(tid, _colmajor(WAVE, NUM_WAVES))
         lane = fx.get_(tc, 0).unpack()
         warp = fx.Int32(fx.rocdl.readfirstlane(T.i32, fx.get_(tc, 1).unpack()))
@@ -324,7 +312,7 @@ def compile_sparse_mla_fwd(
         # MFMA lane r + 16g consumes gather lane 4r + g (byte address).
         perm_addr = (lane_row * fx.Int32(4) + lane_g) * fx.Int32(4)
         head_xor = [_static_int(fx.crd2idx((0, b), lanes)) for b in (1, 2)]
-        block = fx.Int32(gpu.block_id("x"))
+        block = fx.block_idx.x
         t_idx = fx.get_scalar(
             fx.crd2idx((slot, block), _colmajor(NUM_WAVES, UNBOUNDED))
         )
@@ -342,7 +330,7 @@ def compile_sparse_mla_fwd(
         else:
             out_l = _rowmajor(UNBOUNDED, NUM_HEADS, PV_GROUPS, 4, 4, H4)
         out_g = fx.make_view(fx.rocdl.make_buffer_ptr(out_ptr), out_l)
-        split = fx.Int32(gpu.block_id("y"))
+        split = fx.block_idx.y
         width = fx.Int32(index_width)
         start = q_row * width
         length = width
@@ -365,28 +353,27 @@ def compile_sparse_mla_fwd(
         count = per_split + (split < extra).select(fx.Int32(1), fx.Int32(0))
         paired_count = ((count + 1) // 2) * 2
         n_kt = (paired_count > 0).select(paired_count, fx.Int32(2))
-        kv_g = fx.make_view(
-            fx.rocdl.make_buffer_ptr(kv_ptr), _rowmajor(UNBOUNDED, CHUNKS_PER_ROW, VEC)
-        )
+        kv_buf = fx.rocdl.make_buffer_ptr(kv_ptr)
+        kv_g = fx.make_view(kv_buf, _rowmajor(UNBOUNDED, CHUNKS_PER_ROW, VEC))
         # Adjacent groups of four lanes read one row's four 16-byte chunks.
         g_chunks = _rowmajor(QK_PAIRS, 4)
         if const_expr(IMM_GATHER):
             # Byte offsets fit uint32: the pool is below 2^31 bf16 elements.
-            kv_rsrc = fx.rocdl.make_buffer_rsrc(
-                ir.Type.parse("!llvm.ptr<8>"),
-                fx.to_llvm_ptr(kv_ptr),
-                fx.Int16(0).ir_value(),
-                fx.Int64(0xFFFFFFFF).ir_value(),
-                fx.Int32(_get_buffer_flags()).ir_value(),
-            )
+            kv_rsrc = fx.rocdl.get_buffer_rsrc(kv_buf)
             row_bytes = HEAD_DIM * 2
             lane_bytes = ld_chunk * fx.Int32(VEC * 2)
-            frag_ty = ir.VectorType.get([4], ir.IntegerType.get_signless(32))
+            frag_ty = fx.Vector.make_type(4, fx.Int32)
 
         def _kv_base(idx_v):
-            return _opaque_v(idx_v * fx.Int32(row_bytes) + lane_bytes)
+            # Opaque, so LLVM cannot fold a chunk offset back into this VGPR.
+            return pin_i32(idx_v * fx.Int32(row_bytes) + lane_bytes)
 
         def _kv_load(base, pr):
+            # A kv_g copy-atom load computes each chunk's voffset with VALU
+            # (v_or + v_lshl) and leaves the immediate offset at 0. This raw
+            # load reuses one base per row and puts the chunk offset in the
+            # immediate field; the IMM route is 3-20% faster at K512/K1024 on
+            # sorted rows.
             off = _static_int(fx.crd2idx((pr, 0), g_chunks)) * VEC * 2
             raw = fx.rocdl.raw_ptr_buffer_load(
                 frag_ty,
@@ -419,9 +406,9 @@ def compile_sparse_mla_fwd(
             )
 
         qk_scale = fx.Float32(scale) * fx.Float32(LOG2E)
-        neg_inf = fx.Float32(arith.constant(NEG_INF, type=T.f32))
-        zero_f = fx.Float32(arith.constant(0.0, type=T.f32))
-        one_f = fx.Float32(arith.constant(1.0, type=T.f32))
+        neg_inf = fx.Float32(NEG_INF)
+        zero_f = fx.Float32(0.0)
+        one_f = fx.Float32(1.0)
         mma = fx.make_mma_atom(fx.rocdl.MFMA(16, 16, 16, fx.BFloat16))
         if const_expr(REGISTER_VT):
             # B = I: lane (n, g) holds B[4g + j][n].
@@ -1016,9 +1003,9 @@ def compile_sparse_mla_combine(splits, has_sink):
         sink_ptr: fx.Pointer,
         out_ptr: fx.Pointer,
     ):
-        t = fx.Int32(gpu.block_id("x"))
-        head = fx.Int32(gpu.block_id("y"))
-        tid = fx.Int32(gpu.thread_id("x"))
+        t = fx.block_idx.x
+        head = fx.block_idx.y
+        tid = fx.thread_idx.x
         part = fx.make_view(
             fx.rocdl.make_buffer_ptr(part_ptr),
             _rowmajor(1 << 20, splits, 128, 16, 2, 2),
@@ -1068,9 +1055,9 @@ def compile_sparse_mla_combine(splits, has_sink):
         sink_ptr: fx.Pointer,
         out_ptr: fx.Pointer,
     ):
-        t = fx.Int32(gpu.block_id("x"))
-        db = fx.Int32(gpu.block_id("y"))
-        tid = fx.Int32(gpu.thread_id("x"))
+        t = fx.block_idx.x
+        db = fx.block_idx.y
+        tid = fx.thread_idx.x
         lane = tid % 64
         wave = tid // 64
         head = lane // 4
@@ -1114,7 +1101,7 @@ def compile_sparse_mla_combine(splits, has_sink):
         shared[0, wave, lane] = m
         shared[1, wave, lane] = l
         shared[2, wave, lane] = acc
-        gpu.barrier()
+        fx.barrier()
         if wave == fx.Int32(0):
             m = fx.Float32(float("-inf"))
             l = fx.Float32(0.0)
@@ -1200,7 +1187,7 @@ def compile_sparse_mla_order_indices(
         within = fx.make_rmem_tensor(items, fx.Int32)
         for w in range_constexpr(words_per_thread):
             scratch[tid + w * threads] = fx.Int32(0)
-        gpu.barrier()
+        fx.barrier()
         src_vec = fx.logical_divide(
             fx.rocdl.make_buffer_tensor(fx.slice(src, (row, None)), max_size=False),
             fx.make_layout(4, 1),
@@ -1250,7 +1237,7 @@ def compile_sparse_mla_order_indices(
             compact_regs[item] = compact
             if const_expr(logical):
                 regs[item] = (rank >= 0).select(compact, fx.Int32(-1))
-        gpu.barrier()
+        fx.barrier()
         for item in range_constexpr(items):
             compact = compact_regs[item]
             shift = ((compact // 16) % 4) * 8
@@ -1274,7 +1261,7 @@ def compile_sparse_mla_order_indices(
         prefix, total = Scan.exclusive_with_aggregate(
             count, fx.ReductionOp.ADD, storage=scan
         )
-        gpu.barrier()
+        fx.barrier()
         if total == 2048:
             # Prefix four byte-sized tile counts per word, then rank only
             # the selected inputs. Keep values in registers and reuse LDS
@@ -1282,13 +1269,13 @@ def compile_sparse_mla_order_indices(
             for w in range_constexpr(words_per_thread):
                 scratch[tid * words_per_thread + w] = prefix
                 prefix = prefix + counts[w]
-            gpu.barrier()
+            fx.barrier()
             for item in range_constexpr(items):
                 within[item] = scratch[compact_regs[item] // 64] + within[item]
-            gpu.barrier()
+            fx.barrier()
             for item in range_constexpr(items):
                 scratch[within[item]] = regs[item]
-            gpu.barrier()
+            fx.barrier()
             for v in range_constexpr(items // 4):
                 part = fx.slice(dst_vec, (None, tid + v * threads))
                 frag = fx.make_fragment_like(part)
@@ -1334,7 +1321,7 @@ def compile_sparse_mla_order_indices(
                         scratch[(tid + (item // 4) * block_threads) * 4 + item % 4] = (
                             regs[item]
                         )
-                    gpu.barrier()
+                    fx.barrier()
                 for item in range_constexpr(items):
                     pos = (tid + (item // 4) * block_threads) * 4 + item % 4
                     left = regs[item]
@@ -1352,7 +1339,7 @@ def compile_sparse_mla_order_indices(
                     swap = take_min.select(left > right, left < right)
                     tmp[item] = swap.select(right, left)
                 if const_expr(256 <= stride < block_threads * 4):
-                    gpu.barrier()
+                    fx.barrier()
                 for item in range_constexpr(items):
                     regs[item] = tmp[item]
             for item in range_constexpr(items):
