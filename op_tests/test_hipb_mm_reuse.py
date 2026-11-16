@@ -4,7 +4,7 @@
 """`hipb_mm` keeps the hipBLASLt layouts, descriptor and algorithm of an
 unscaled GEMM with a given solution index, and rebuilds nothing on later calls
 but the bias pointer. A call served that way must give what a freshly built
-descriptor gives, bit for bit.
+descriptor gives, bit for bit. The kept descriptors are per thread.
 
 Run:
     python op_tests/test_hipb_mm_reuse.py
@@ -12,6 +12,8 @@ Run:
 """
 
 import sys
+import threading
+from concurrent.futures import ThreadPoolExecutor
 
 import pytest
 import torch
@@ -147,6 +149,89 @@ def test_graph_replay_after_reuse():
     torch.cuda.synchronize()
     assert torch.equal(out, hipb_mm(x, w.t(), sol))
     graph.reset()
+
+
+def _thread_calls():
+    """Interleaved configurations, including one configuration that every
+    thread calls with a bias of its own."""
+    k = 512
+    x = _rand(256, k)
+    w = _rand(384, k, scale=k**-0.5)
+    sol = _solution(x, w.t())
+    biases = [_rand(384) for _ in range(4)]
+    sol_b = _solution(x, w.t(), biases[0])
+    x2, w2 = _rand(96, 768), _rand(320, 768, scale=768**-0.5)
+    sol2 = _solution(x2, w2.t())
+
+    def calls(i):
+        b = biases[i % len(biases)]
+        return [
+            lambda: hipb_mm(x, w.t(), sol_b, bias=b),
+            lambda: hipb_mm(x, w.t(), sol),
+            lambda: hipb_mm(x2, w2.t(), sol2),
+            lambda: hipb_mm(x[:128], w.t(), sol_b, bias=b),
+        ]
+
+    return calls
+
+
+def test_threads_keep_their_own_descriptors():
+    """Each thread builds and reuses its own descriptors; results match a
+    single thread bit for bit. The binding holds the GIL, so Python threads
+    take turns rather than calling hipb_mm at the same instant."""
+    calls = _thread_calls()
+    threads = 4
+    expected = [[f() for f in calls(i)] for i in range(threads)]
+    torch.cuda.synchronize()
+    barrier = threading.Barrier(threads)
+
+    def work(i):
+        barrier.wait()
+        rounds = [[f() for f in calls(i)] for _ in range(20)]
+        torch.cuda.synchronize()
+        return rounds
+
+    with ThreadPoolExecutor(threads) as pool:
+        results = list(pool.map(work, range(threads)))
+    for i, rounds in enumerate(results):
+        for outs in rounds:
+            for got, want in zip(outs, expected[i]):
+                assert torch.equal(got, want)
+
+
+def test_destroy_drops_other_threads_descriptors():
+    """A thread that outlives an extension destroy/create rebuilds its
+    descriptors for the new extension."""
+    calls = _thread_calls()
+    with ThreadPoolExecutor(1) as worker:
+
+        def run():
+            outs = [f() for f in calls(1)]
+            torch.cuda.synchronize()
+            return outs
+
+        before = worker.submit(run).result()
+        _fresh_extension()
+        after = worker.submit(run).result()
+    fresh = run()
+    for b, a, f in zip(before, after, fresh):
+        assert torch.equal(b, f) and torch.equal(a, f)
+
+
+def test_short_lived_threads():
+    """Descriptors of a thread are released when it exits."""
+    calls = _thread_calls()
+    expected = [f() for f in calls(2)]
+    out = []
+    for _ in range(16):
+        t = threading.Thread(target=lambda: out.append([f() for f in calls(2)]))
+        t.start()
+        t.join()
+    torch.cuda.synchronize()
+    assert len(out) == 16
+    for outs in out:
+        for got, want in zip(outs, expected):
+            assert torch.equal(got, want)
 
 
 def main():

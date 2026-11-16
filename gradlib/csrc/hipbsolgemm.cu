@@ -13,6 +13,7 @@
 #include "aiter_hip_common.h"  // HipDeviceGuard, get_gpu_arch
 #include "rocm_ops.hpp"        // pybind11 + namespace py + aiter_tensor_t caster
 #include <array>
+#include <atomic>
 #include <cstdlib>
 #include <cstring>
 #include <fcntl.h>
@@ -872,17 +873,6 @@ void create_matmul_descs(hipblasOperation_t op_A,
     }
 }
 
-void destroy_matmul_descs(hipblasLtMatrixLayout_t matA,
-                          hipblasLtMatrixLayout_t matB,
-                          hipblasLtMatrixLayout_t matC,
-                          hipblasLtMatmulDesc_t matmul)
-{
-    CHECK_HIPBLAS_ERROR(hipblasLtMatmulDescDestroy(matmul));
-    CHECK_HIPBLAS_ERROR(hipblasLtMatrixLayoutDestroy(matA));
-    CHECK_HIPBLAS_ERROR(hipblasLtMatrixLayoutDestroy(matB));
-    CHECK_HIPBLAS_ERROR(hipblasLtMatrixLayoutDestroy(matC));
-}
-
 // An unscaled GEMM with a given solution index builds the same layouts,
 // descriptor and algorithm on every call, so they are kept per configuration.
 // Only the bias pointer changes from call to call.
@@ -939,17 +929,36 @@ struct GemmPlan
 // Prefill sees a new M per batch; past this many configurations the set is
 // dropped and rebuilt rather than grown without bound.
 constexpr size_t max_gemm_plans = 1024;
-std::unordered_map<GemmPlanKey, GemmPlan, GemmPlanKeyHash> gemm_plans;
 
-void clear_gemm_plans()
+// Bumped by hipb_destroy_extension. A thread whose plans were built for an
+// older extension drops them before its next lookup.
+std::atomic<uint64_t> extension_generation{0};
+
+// Plans are per thread: a hit sets the bias pointer on the shared descriptor
+// before hipblasLtMatmul, so a descriptor must never be used by two threads.
+struct GemmPlanCache
 {
-    for(auto& entry : gemm_plans)
+    std::unordered_map<GemmPlanKey, GemmPlan, GemmPlanKeyHash> plans;
+    uint64_t generation = 0;
+
+    // Also runs at thread exit, so it must not throw.
+    void clear()
     {
-        const GemmPlan& plan = entry.second;
-        destroy_matmul_descs(plan.matA, plan.matB, plan.matC, plan.matmul);
+        for(auto& entry : plans)
+        {
+            const GemmPlan& plan = entry.second;
+            hipblasLtMatmulDescDestroy(plan.matmul);
+            hipblasLtMatrixLayoutDestroy(plan.matA);
+            hipblasLtMatrixLayoutDestroy(plan.matB);
+            hipblasLtMatrixLayoutDestroy(plan.matC);
+        }
+        plans.clear();
     }
-    gemm_plans.clear();
-}
+
+    ~GemmPlanCache() { clear(); }
+};
+
+thread_local GemmPlanCache gemm_plan_cache;
 } // namespace
 
 hipblasStatus_t hipblasLtMatmul_sol_wrapper(hipblasLtHandle_t handle,
@@ -1034,11 +1043,19 @@ hipblasStatus_t hipblasLtMatmul_sol_wrapper(hipblasLtHandle_t handle,
                         bpreshuffle,
                         bias != nullptr,
                         use_gelu};
+        GemmPlanCache& cache = gemm_plan_cache;
+        const uint64_t generation = extension_generation.load(std::memory_order_acquire);
+        if(cache.generation != generation)
+        {
+            cache.clear();
+            cache.generation = generation;
+        }
+        auto& gemm_plans = cache.plans;
         auto it = gemm_plans.find(key);
         if(it == gemm_plans.end())
         {
             if(gemm_plans.size() >= max_gemm_plans)
-                clear_gemm_plans();
+                cache.clear();
             GemmPlan plan;
             create_matmul_descs(op_A,
                                 op_B,
@@ -1774,7 +1791,9 @@ void hipb_destroy_extension()
     // CHECK_HIP_ERROR(hipEventDestroy(event));
 
     // hipBLASLt
-    clear_gemm_plans();
+    // Other threads drop their plans on their next call or when they exit.
+    gemm_plan_cache.clear();
+    extension_generation.fetch_add(1, std::memory_order_release);
     CHECK_HIPBLAS_ERROR(hipblasLtDestroy(hipblaslt_handle));
     CHECK_HIPBLAS_ERROR(hipblasLtMatmulPreferenceDestroy(preference));
     CHECK_HIP_ERROR(hipFree(d_workspace));
