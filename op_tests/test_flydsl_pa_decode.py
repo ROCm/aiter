@@ -7,7 +7,6 @@ Run with: python -m pytest -q op_tests/test_flydsl_pa_decode.py
 """
 
 import importlib.util
-import inspect
 from functools import partial
 from itertools import product
 
@@ -1580,7 +1579,23 @@ _INVALID_CASES = [
     ),
     ("vector16-k", ValueError, "key_cache shape must be"),
     ("vector16-v", ValueError, "transposed value_cache shape must be"),
+    ("scale-only", ValueError, "must either both be provided or both be None"),
+    ("store-without-fp8", ValueError, "store_output=False requires quantized_output"),
+    ("negative-pad-rows", ValueError, "quantized_pad_rows must be a nonnegative int"),
+    ("bool-pad-rows", ValueError, "quantized_pad_rows must be a nonnegative int"),
+    (
+        "pad-rows-without-fp8",
+        ValueError,
+        "quantized_pad_rows requires quantized_output",
+    ),
 ]
+# FP8-output arguments pa_decode refuses before any kernel compiles.
+_QUANT_ARG_ERRORS = {
+    "store-without-fp8": {"store_output": False},
+    "negative-pad-rows": {"quantized_pad_rows": -1},
+    "bool-pad-rows": {"quantized_pad_rows": True},
+    "pad-rows-without-fp8": {"quantized_pad_rows": 1},
+}
 _MXFP4_INVALID_CASES = [
     ("fp16-output", TypeError, "bf16 output"),
     ("fp16-query", TypeError, "e4m3 or bf16 query"),
@@ -1656,6 +1671,10 @@ def _check_unsupported_input(pa, arguments, options, plan, case, monkeypatch):
         key = torch.empty((1, 1, 8, 64, 16), dtype=query.dtype, device=query.device)
     elif invalid == "vector16-v":
         value = torch.empty((1, 1, 4, 128, 16), dtype=query.dtype, device=query.device)
+    elif invalid == "scale-only":
+        options["output_scale"] = torch.ones(query.shape[0], 1, device=query.device)
+    elif invalid in _QUANT_ARG_ERRORS:
+        options.update(_QUANT_ARG_ERRORS[invalid])
 
     def unexpected_compile(**_):
         pytest.fail("invalid BF16 inputs reached kernel compilation")
@@ -2285,25 +2304,28 @@ def _run_pa_decode_case(case, device, monkeypatch):
 def _check_quant_output(launch, query, output, compile_kwargs, capture, pad=3):
     """The FP8 output equals PA's output and the standalone per-token quant bit
     for bit, eagerly and in graph replays; poisoned outputs show every row is
-    written, padded rows included. One KV head's direct and cluster outputs
-    quantize in the tile kernel unless the tile splits its query rows; other
-    plans fall back to the standalone quant.
+    written, padded rows included. With one KV head, the one-partition direct
+    output and cluster merges with ``cluster_seqs == 1`` quantize in the tile
+    kernel unless the tile splits its query rows; other plans fall back to the
+    standalone quant (``fuses_quant_output``).
     """
-    from aiter.ops.flydsl.kernels.pa_decode_kernel import gfx1250_tile_traits
+    from aiter.ops.flydsl.pa_decode import fuses_quant_output
 
-    plain = compile_kwargs[-1]
-    traits_args = inspect.signature(gfx1250_tile_traits).parameters
-    fused = (
-        plain["num_kv_heads"] == 1
-        and (
-            (plain["cluster_merge"] > 0 and plain["cluster_seqs"] == 1)
-            or (plain["direct_output"] and plain["num_partitions"] == 1)
-        )
-        and gfx1250_tile_traits(
-            **{k: v for k, v in plain.items() if k in traits_args}
-        ).query_splits
-        == 1
-    )
+    # The plain launch's compile arguments are pa_decode's tile options plus
+    # these; a new argument makes the traits call raise rather than drop it.
+    plain = dict(compile_kwargs[-1])
+    cluster = {k: plain.pop(k) for k in ("cluster_merge", "cluster_seqs")}
+    for key in (
+        "architecture",
+        "wide_kv_addressing",
+        "kv_buffer_u32",
+        "trans_k",
+        "mask_unowned_kv",
+        "cluster_steps",
+        "cluster_runs",
+    ):
+        del plain[key]
+    fused = fuses_quant_output(plain, **cluster)
     rows = output.shape[0]
     fp8 = torch.empty(
         (rows + pad, *output.shape[1:]), dtype=dtypes.fp8, device=output.device

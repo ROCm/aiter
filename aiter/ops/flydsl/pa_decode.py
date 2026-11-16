@@ -69,6 +69,29 @@ def _constant_scale(device: torch.device, value: float) -> torch.Tensor:
     return scale
 
 
+def fuses_quant_output(
+    tile_options: dict, *, cluster_merge: int, cluster_seqs: int
+) -> bool:
+    """Whether the gfx1250 tile quantizes the FP8 output in its epilogue.
+
+    ``tile_options`` are the ``gfx1250_tile_traits`` arguments ``pa_decode``
+    selects. A token's descale needs the max over all of its values. With one
+    KV head a CTA, or the cluster merging its tasks, holds every row of its
+    tokens, so the one-partition direct and the cluster-merge outputs quantize
+    in their epilogue. More KV heads spread a token over separate CTAs (grid
+    y); the last-arriver merge, clusters shared by several sequences
+    (``cluster_seqs > 1``) and query-split tiles are not fused.
+    """
+    return bool(
+        tile_options["num_kv_heads"] == 1
+        and (
+            (tile_options["direct_output"] and tile_options["num_partitions"] == 1)
+            or (cluster_merge and cluster_seqs == 1)
+        )
+        and gfx1250_tile_traits(**tile_options).query_splits == 1
+    )
+
+
 def launch_pa_decode_ps_reduce(
     output: torch.Tensor,
     exp_sums: torch.Tensor,
@@ -1190,18 +1213,10 @@ def pa_decode(
         and bound_tiles <= 4 * cluster_merge
     )
     run_tiles = -(-bound_tiles // cluster_merge) if cluster_runs else 0
-    # A token's descale needs the max over all of its values. With one KV head
-    # a CTA, or the cluster merging its tasks, holds every row of its tokens, so
-    # the one-partition direct and the cluster-merge outputs quantize in their
-    # epilogue. More KV heads spread a token over separate CTAs (grid y); the
-    # last-arriver merge, clusters shared by several sequences and query-split
-    # tiles are not fused. Those write the BF16 output as usual and quantize it
-    # after with the standalone per-token kernel, which is exactly the unfused
-    # path.
-    quant_after_output = quant_output and not (
-        num_kv_heads == 1
-        and (one_partition_output or (cluster_merge and cluster_seqs == 1))
-        and gfx1250_tile_traits(**tile_options).query_splits == 1
+    # Unfused plans write the BF16 output as usual and quantize it after with
+    # the standalone per-token kernel, which is exactly the unfused path.
+    quant_after_output = quant_output and not fuses_quant_output(
+        tile_options, cluster_merge=cluster_merge, cluster_seqs=cluster_seqs
     )
     if quant_after_output:
         quant_output = False
