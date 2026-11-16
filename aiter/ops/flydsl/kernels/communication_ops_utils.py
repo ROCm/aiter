@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright (c) 2025 FlyDSL Project Contributors
+# Tagged mailbox adapted from ROCm/ATOM at a526f0d under the MIT License.
 
 """Cross-card (P2P) communication primitives for communication kernels.
 
@@ -17,25 +18,41 @@ from dataclasses import dataclass, field
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
+from flydsl._mlir import ir
 from flydsl._mlir.dialects import llvm
-from flydsl.expr import arith
+from flydsl.compiler.ast_rewriter import ASTRewriter
+from flydsl.expr import arith, const_expr, range_constexpr
 from flydsl.expr.rocdl import readfirstlane
 from flydsl.expr.typing import T
 
+from aiter.ops.flydsl.kernels.tensor_shim import (
+    buf_copy_load,
+    buf_copy_store,
+    ptr_buf_tensor,
+)
+
 __all__ = [
+    "CACHE_DEVICE",
+    "CACHE_SYSTEM",
+    "EPOCH_MASK",
     "GeometryTuningTable",
+    "TaggedMailbox",
     "atomic_add_agent",
     "atomic_add_agent_one_as",
     "atomic_add_global_at",
     "atomic_add_lds",
     "atomic_add_system",
     "atomic_add_workgroup",
+    "atomic_or_global_at",
+    "buffer_load_i32",
     "fence_acquire",
     "fence_agent_acquire",
     "fence_agent_release",
     "fence_release",
     "fence_system_acquire",
     "fence_system_release",
+    "hw_xcc_id",
+    "invalidate_l1",
     "load_i32_acquire",
     "load_i32_global_agent",
     "load_i32_global_system",
@@ -43,27 +60,192 @@ __all__ = [
     "load_i32_nt",
     "load_i32_system",
     "load_i64_acquire",
+    "load_i64_from_buffer",
     "load_i64_global",
     "load_v4i32_nt",
+    "memrealtime",
     "spin_until_eq_i32",
     "spin_until_ge_i32_agent",
     "spin_until_ge_i32_system",
     "spin_until_ge_i64",
     "spin_until_gt_i32",
+    "spin_until_shifted_eq_i64",
     "store_i32_global_agent_release",
     "store_i32_global_system_monotonic",
     "store_i32_global_system_release",
     "store_i32_lds",
     "store_i32_system",
+    "store_i64_global",
     "store_i64_global_system",
+    "tagged_peer_address",
+    "tagged_shift",
     "wait_i32_until_equals",
     "wait_i32_until_greater_than",
     "wait_i64_until_equals",
     "wait_lds_wave",
     "waitcnt_all",
     "waitcnt_stores",
+    "wave_uniform_i32",
     "wave_uniform_i64",
 ]
+
+_TAGGED_POLL_MAX = 12
+CACHE_DEVICE = 16
+CACHE_SYSTEM = 17
+EPOCH_MASK = (1 << 30) - 1
+DIAG_TICKS = 10 * 100_000_000
+TIMEOUT_BIT = -2147483648
+
+
+def tagged_peer_address(base, byte_offset):
+    """Return a byte address in an IPC-mapped peer buffer."""
+    return base + fx.Int64(byte_offset)
+
+
+def tagged_shift(address, byte_offset):
+    return address + byte_offset
+
+
+@ASTRewriter.transform
+def _spin_tagged(load_all, pending):
+    values = load_all()
+    while pending(values):
+        # FlyDSL has no typed sleep API; this wrapper emits s_sleep in the ISA.
+        fx.rocdl.s_sleep(1)
+        values = load_all()
+    return values
+
+
+def memrealtime():
+    """Read the AMD 100 MHz device timer for bounded diagnostics."""
+    # FlyDSL has no timer API; this intrinsic emits s_memrealtime in the ISA.
+    return fx.Int64(llvm.call_intrinsic(T.i64, "llvm.amdgcn.s.memrealtime", [], [], []))
+
+
+@ASTRewriter.transform
+def _spin_tagged_bounded(load_all, pending, on_timeout, initial_late):
+    """Poll for at most ``DIAG_TICKS`` and record a diagnostic on timeout."""
+    start = memrealtime()
+    values = load_all()
+    late = initial_late
+    while pending(values) & (late == 0):
+        # FlyDSL has no typed sleep API; this wrapper emits s_sleep in the ISA.
+        fx.rocdl.s_sleep(1)
+        values = load_all()
+        late = (memrealtime() - start > DIAG_TICKS).select(fx.Int32(1), fx.Int32(0))
+    if (late != 0) & (initial_late == 0):
+        on_timeout()
+    return values
+
+
+class TaggedMailbox:
+    """Transfer naturally aligned 32-bit values with adjacent launch tags.
+
+    A payload and tag form one 8-byte pair and are written by one vector store.
+    ``pair_layout`` preserves this alignment; splitting or widening a pair would
+    remove the atomic hand-off that makes a separate release fence unnecessary.
+    """
+
+    def __init__(
+        self,
+        tag,
+        *,
+        debug=False,
+        epoch_addresses=None,
+        expected_epoch=None,
+        diagnostic=None,
+    ):
+        self.tag = tag + 1
+        self.debug = debug
+        self.epoch_addresses = epoch_addresses
+        self.expected_epoch = expected_epoch
+        self.diagnostic = diagnostic
+
+    def put(self, address, index, value):
+        bits = (
+            value.bitcast(fx.Int32)
+            if isinstance(value, fx.Float32)
+            else fx.Int32(value)
+        )
+        values = fx.Vector.from_elements([bits, self.tag], fx.Int32)
+        buf_copy_store(
+            ptr_buf_tensor(address, fx.Int32, unit_elems=2, unit_stride=1),
+            index * 2,
+            values,
+            fx.Int32,
+            unit_elems=2,
+            cache_modifier=CACHE_SYSTEM,
+        )
+
+    def put_words(self, address, index, words):
+        values = []
+        for word in words:
+            values += [fx.Int32(word), self.tag]
+        buf_copy_store(
+            ptr_buf_tensor(address, fx.Int32, unit_elems=len(values), unit_stride=1),
+            index * 2,
+            fx.Vector.from_elements(values, fx.Int32),
+            fx.Int32,
+            unit_elems=len(values),
+            cache_modifier=CACHE_SYSTEM,
+        )
+
+    def poll(self, specs, batch=_TAGGED_POLL_MAX):
+        """Poll ``(address, pair index, pair count)`` specifications."""
+        if const_expr(len(specs) == 0):
+            return []
+        if const_expr(len(specs) > batch):
+            return self.poll(specs[:batch], batch) + self.poll(specs[batch:], batch)
+        tag = self.tag
+
+        def load_all():
+            words = []
+            for address, index, count in specs:
+                loaded = buf_copy_load(
+                    ptr_buf_tensor(
+                        address, fx.Int32, unit_elems=2 * count, unit_stride=1
+                    ),
+                    fx.Int32(index) * 2,
+                    fx.Int32,
+                    unit_elems=2 * count,
+                    cache_modifier=CACHE_SYSTEM,
+                )
+                words += [loaded[item] for item in range(2 * count)]
+            return fx.Vector.from_elements(words, fx.Int32)
+
+        word_count = sum(2 * count for _, _, count in specs)
+
+        def pending(values):
+            stale = values[1] != tag
+            for index in range_constexpr(3, word_count, 2):
+                stale = stale | (values[index] != tag)
+            return stale
+
+        if self.debug and self.epoch_addresses is not None:
+
+            def on_timeout():
+                missing = fx.Int32(0)
+                for rank, address in enumerate(self.epoch_addresses):
+                    seen = buffer_load_i32(address, 0, cache_modifier=CACHE_SYSTEM)
+                    behind = ((self.expected_epoch - seen) & fx.Int32(EPOCH_MASK)) == 1
+                    missing = missing | behind.select(1 << rank, 0)
+                atomic_or_global_at(
+                    self.diagnostic + 8,
+                    missing | fx.Int32(TIMEOUT_BIT),
+                    syncscope=fx.rocdl.SyncScope.Agent,
+                )
+
+            initial_late = (
+                buffer_load_i32(self.diagnostic, 2, cache_modifier=CACHE_DEVICE) < 0
+            ).select(fx.Int32(1), fx.Int32(0))
+            values = _spin_tagged_bounded(load_all, pending, on_timeout, initial_late)
+        else:
+            values = _spin_tagged(load_all, pending)
+        out, index = [], 0
+        for _, _, count in specs:
+            out.append([values[index + 2 * item] for item in range(count)])
+            index += 2 * count
+        return out
 
 
 def wait_lds_wave():
@@ -71,11 +253,42 @@ def wait_lds_wave():
     fx.rocdl.s_waitcnt(lgkmcnt=0)
 
 
+def wave_uniform_i32(value):
+    """Broadcast an i32 value from the first lane of the wave."""
+    # FlyDSL has no typed broadcast API; prior ISA uses v_readfirstlane_b32.
+    return fx.Int32(readfirstlane(T.i32, fx.Int32(value).ir_value()))
+
+
 def wave_uniform_i64(addr):
     v = fx.Uint64(addr)
+    # FlyDSL has no typed broadcast API; prior ISA uses v_readfirstlane_b32.
     lo = readfirstlane(T.i32, fx.Uint32(v))  # low 32 bits
+    # FlyDSL has no typed broadcast API; prior ISA uses v_readfirstlane_b32.
     hi = readfirstlane(T.i32, fx.Uint32(v >> 32))  # high 32 bits (unsigned shift)
     return (fx.Uint64(hi) << 32) | fx.Uint64(lo)
+
+
+def buffer_load_i32(address, index, cache_modifier=0):
+    """Load one i32 from a raw device address through a buffer resource."""
+    return fx.Int32(
+        buf_copy_load(
+            ptr_buf_tensor(address, fx.Int32),
+            index,
+            fx.Int32,
+            cache_modifier=cache_modifier,
+        )
+    )
+
+
+def load_i64_from_buffer(address, index):
+    """Load a wave-uniform i64 from two adjacent i32 buffer words."""
+    words = buf_copy_load(
+        ptr_buf_tensor(address, fx.Int32, unit_elems=2, unit_stride=1),
+        index * 2,
+        fx.Int32,
+        unit_elems=2,
+    )
+    return wave_uniform_i64((fx.Int64(words[1]) << 32) | fx.Int64(fx.Uint32(words[0])))
 
 
 def _to_ptr_global(v, dtype=fx.Int32, alignment=4):
@@ -221,6 +434,18 @@ def spin_until_ge_i64(addr_i64, val, *, max_iters=0):
 
 
 @flyc.jit
+def spin_until_shifted_eq_i64(addr_i64, val, *, shift):
+    """Spin until an i64 flag shifted right by ``shift`` equals ``val``; returns the flag.
+
+    Unlike a ``>=`` wait it stays correct when the generation in the high bits wraps.
+    """
+    cur = fx.Int64(load_i64_acquire(addr_i64))
+    while (cur >> fx.Int64(shift)) != fx.Int64(val):
+        cur = fx.Int64(load_i64_acquire(addr_i64))
+    return cur
+
+
+@flyc.jit
 def spin_until_ge_i32_system(addr_i64, val, *, acquire=False, sleep=True):
     """Spin on a system-visible i32 flag until it reaches ``val``."""
     cur = fx.Int32(load_i32_global_system(addr_i64, acquire=acquire))
@@ -301,6 +526,32 @@ def store_i64_global_system(addr_i64, val):
     )
 
 
+def store_i64_global(addr_i64, val):
+    """Plain (non-atomic) global i64 store to ``addr_i64``."""
+    fx.ptr_store(fx.Int64(val), _to_ptr_global(addr_i64, fx.Int64, 8))
+
+
+# FlyDSL has no wrapper for the two instructions below.
+def hw_xcc_id():
+    """Wave-uniform XCC (die) index of the executing wave."""
+    return fx.Int32(
+        llvm.InlineAsmOp(
+            T.i32,
+            [],
+            "s_getreg_b32 $0, hwreg(HW_REG_XCC_ID, 0, 4)",
+            "=s",
+            has_side_effects=True,
+        ).result
+    )
+
+
+def invalidate_l1():
+    """Invalidate this CU's vector L1 only (the XCD's L2 is untouched)."""
+    llvm.InlineAsmOp(
+        None, [], "buffer_inv sc0\ns_waitcnt vmcnt(0)", "", has_side_effects=True
+    )
+
+
 def store_i32_global_agent_release(addr_i64, val):
     """Agent-one-as release store to a global i32 address."""
     fx.generic_store(
@@ -377,9 +628,69 @@ def atomic_add_global_at(addr_i64, val, syncscope="one-as"):
     return fx.atomic_add(ptr, dtype(val), syncscope=syncscope)
 
 
+def atomic_or_global_at(addr_i64, val, syncscope="one-as"):
+    """Monotonic global fetch-or with configurable agent/system visibility."""
+    ptr = _to_ptr_global(addr_i64, fx.Int32, 4)
+    return fx.atomic_or(ptr, fx.Int32(val), syncscope=syncscope)
+
+
 def atomic_add_agent(addr_i64, val):
     """Agent-scope monotonic global fetch-and-add."""
     return atomic_add_global_at(addr_i64, val, syncscope=fx.rocdl.SyncScope.Agent)
+
+
+def _llvm_ptr_global(addr_i64):
+    """Raw ``!llvm.ptr<1>`` for LLVM-dialect ops that reject FlyDSL pointers."""
+    return llvm.IntToPtrOp(
+        llvm.PointerType.get(address_space=1), arith.unwrap(fx.Int64(addr_i64))
+    ).result
+
+
+def _av_scope(syncscope):
+    return llvm.MetadataAsValueOp(
+        ir.Attribute.parse(f'#llvm.md_node<#llvm.md_string<"{syncscope}">>')
+    ).result
+
+
+def av_store_b128(addr_i64, val, syncscope="agent"):
+    """Store-available 128-bit global store at ``syncscope``.
+
+    ``llvm.amdgcn.av.store.b128`` makes the payload available at the given
+    scope by itself, which is what an ``amdgcn-av:none`` release relies on.
+    The scope operand must be an MD node wrapping the scope string.
+    """
+    v4i32 = ir.VectorType.get([4], T.i32)
+    data = llvm.BitcastOp(v4i32, arith.unwrap(val)).res
+    llvm.call_intrinsic(
+        None,
+        "llvm.amdgcn.av.store.b128",
+        [_llvm_ptr_global(addr_i64), data, _av_scope(syncscope)],
+        [],
+        [],
+    )
+
+
+def atomic_add_agent_acq_rel_av_none(addr_i64, val):
+    """Agent-scope acq_rel global fetch-and-add without cache-wide maintenance.
+
+    ``!mmra !{"amdgcn-av", "none"}`` removes the release's make-available and
+    the acquire's make-visible steps (no ``buffer_wbl2``/``buffer_inv``); the
+    RMW still synchronizes. Callers must provide payload availability and
+    visibility independently through AV accesses or a documented
+    target-specific cache-policy protocol.
+    """
+    op = llvm.AtomicRMWOp(
+        llvm.AtomicBinOp.add,
+        _llvm_ptr_global(addr_i64),
+        arith.unwrap(val),
+        llvm.AtomicOrdering.acq_rel,
+        syncscope=fx.rocdl.SyncScope.Agent,
+        alignment=4,
+    )
+    op.operation.attributes["llvm.mmra"] = ir.Attribute.parse(
+        '#llvm.mmra_tag<"amdgcn-av":"none">'
+    )
+    return op.res
 
 
 def atomic_add_agent_one_as(addr_i64, val):

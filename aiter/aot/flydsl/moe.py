@@ -72,7 +72,9 @@ from aiter.aot.flydsl.common import (
     collect_aot_jobs,
     cu_num_to_arch,
     dedupe_jobs,
+    fail_build_on_missing_target_feature,
     get_max_workers,
+    is_strict_identity,
     replay_env,
     resolve_target_arch,
     run_jobs_parallel,
@@ -375,6 +377,20 @@ def _caller_inputs(job: dict) -> dict:
         else:
             w1_scale = empty(experts, 1, dtype=dtypes.fp32)
             w2_scale = empty(experts, 1, dtype=dtypes.fp32)
+    elif (
+        q_type == QuantType.No and q_dtype_a == dtypes.bf16 and q_dtype_w == dtypes.bf16
+    ):
+        # a16w16: bf16 activations and shuffle_weight (16,16) weights, no scale.
+        # get_flydsl_stage1_kernels_a16w16 / get_flydsl_stage2_kernels_a16w16
+        # register the names; _can_reroute_bf16_to_a16wmix (gated by
+        # _A16WMIX_BF16_ARCHS) / get_2stage_cfgs pick them at runtime
+        # (including _swiglu_limit_is_active). AOT only supplies the caller
+        # tensors; a flydsl_ CSV row is looked up by name even without a
+        # limit. PREBUILD_KERNELS=1 replays every flydsl_ row.
+        w1 = shuffle_weight(empty(experts, w1_rows, model_dim, dtype=q_dtype_w))
+        w2 = shuffle_weight(empty(experts, model_dim, inter_dim, dtype=q_dtype_w))
+        w1_scale = None
+        w2_scale = None
     else:
         raise NotImplementedError(
             f"no AOT input recipe for {q_type!s} with {q_dtype_a} x {q_dtype_w}"
@@ -445,11 +461,21 @@ def _replay(job: dict) -> None:
 @contextmanager
 def _without_device_queries():
     """Host queries whose C++ side reads the live device; their answers only
-    size buffers of HIP kernels the replay never launches."""
-    import aiter
+    size buffers of HIP kernels the replay never launches. The stage2 scratch
+    cache queries the stream, and would keep FakeTensors across replays."""
+    import torch
 
-    with mock.patch.object(
-        aiter, "moe_sorting_opus_get_workspace_size", lambda *_a, **_k: 0
+    import aiter
+    from aiter import fused_moe
+
+    def stage2_scratch(_slot, shape, dtype, device):
+        return torch.empty(shape, dtype=dtype, device=device)
+
+    with (
+        mock.patch.object(
+            aiter, "moe_sorting_opus_get_workspace_size", lambda *_a, **_k: 0
+        ),
+        mock.patch.object(fused_moe, "_stage2_scratch", stage2_scratch),
     ):
         yield
 
@@ -680,6 +706,12 @@ def run(csv_paths: list[str], *, edges: bool = True, check: bool = False) -> int
         if target is None:
             skipped[job_arch(job)] += 1
             continue
+        # gfx1250-strict disables F4 WMMA (A0 errata); the fp4 mxfp4 rows are
+        # hollow on strict (fp8-activation a8w4 rows share the kernel name but
+        # are fine), so key on q_dtype_a. A0 falls back to runtime JIT.
+        if is_strict_identity(target) and _FP4 in str(job.get("q_dtype_a") or ""):
+            skipped[job_arch(job)] += 1
+            continue
         if targets and target != job_arch(job):
             job = {**job, "gfx": target}
         retargeted.append(job)
@@ -776,6 +808,11 @@ def main():
         for job in jobs:
             if resolve_target_arch(job_arch(job), {args.arch}) != args.arch:
                 continue
+            # gfx1250-strict disables F4 WMMA (A0 errata): mxfp4 rows hollow.
+            if is_strict_identity(args.arch) and _FP4 in str(
+                job.get("q_dtype_a") or ""
+            ):
+                continue
             if job_arch(job) != args.arch:
                 job = {**job, "gfx": args.arch}
             kept.append(job)
@@ -794,7 +831,8 @@ def main():
     print("=" * 72, flush=True)
 
     total_t0 = time.time()
-    failed_archs = run(csv_paths, edges=edges, check=args.check)
+    with fail_build_on_missing_target_feature():
+        failed_archs = run(csv_paths, edges=edges, check=args.check)
     print(f"\n  Total time:   {time.time() - total_t0:.1f}s")
     if failed_archs:
         print("Some replays failed. Check output above for details.")

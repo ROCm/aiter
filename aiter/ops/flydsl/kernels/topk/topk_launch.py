@@ -15,10 +15,8 @@ from aiter.ops.flydsl.kernels.tensor_shim import _run_compiled
 # and the GPU target it resolves once, with the signature, on its first call.
 _PER_DEVICE_STATE = {
     "_mem_cache": dict,
-    "_call_state_cache": dict,
     "_last_compiled": lambda: None,
     "cache_manager": lambda: None,
-    "manager_key": lambda: None,
     "_sig": lambda: None,
     "_backend_target": lambda: None,
 }

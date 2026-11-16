@@ -11,6 +11,7 @@ from aiter.ops.triton._triton_kernels.moe.moe_op_gemm_a8w8_blockscale import (
 )
 from aiter.ops.triton.moe.moe_routing.routing import RoutingData
 from aiter.ops.triton.moe.reduce import reduce_grouped
+from aiter.ops.triton.utils.device_info import get_num_xcds
 
 # -----------------------------------------------------------------------------
 #                    Matrix Multiplication + Outer Gather/Scatter
@@ -71,7 +72,7 @@ def get_kernel_config(m, n, k, routing_data):
     blockscale_m = 128
     blockscale_k = 128
     blockscale_n = 128
-    num_xcds = 8
+    num_xcds = get_num_xcds()
     xcd_swizzle = num_xcds
     w_cache_modifier = ".cg" if block_m <= 32 else None
     num_stages = 2

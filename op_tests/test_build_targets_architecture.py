@@ -175,6 +175,21 @@ class TestClusterLaunchBuildArchs(unittest.TestCase):
         with mock.patch.dict(os.environ, {}, clear=True):
             self.assertTrue(self.core._cluster_launch_target(lambda: "gfx1250-strict"))
 
+    def test_gfx1250_target_follows_any_targeted_arch(self):
+        # Also gates -DUSE_NEW_UNIFIED_FRAMEWORK=0, which CK needs for gfx1250.
+        cases = {
+            "gfx1250": True,
+            "gfx942;gfx1250-strict": True,
+            "gfx942": False,
+            "gfx950": False,
+        }
+        for value, expected in cases.items():
+            with (
+                self.subTest(value=value),
+                mock.patch.dict(os.environ, {"GPU_ARCHS": value}, clear=True),
+            ):
+                self.assertEqual(self.core._targets_gfx1250(self.detect), expected)
+
 
 class TestRuntimeArchitecture(unittest.TestCase):
     def setUp(self):

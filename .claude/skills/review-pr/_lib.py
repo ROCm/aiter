@@ -30,10 +30,19 @@ REQUIRED = [
     "core_files.txt",
     "refutations.txt",
     "independent.txt",
+    "design.txt",
     "rules.txt",
     "pr_meta.json",
 ]
-OPTIONAL = ["late_findings.txt"]
+# citations.txt rides here rather than in REQUIRED: it is advisory, and a run whose
+# worker died before writing a card has no citations to check -- absence is not a defect.
+# It must be collected, though: _publish.py reads it out of the report dir to decide what
+# may be anchored inline, and an uncollected verdict reads exactly like "never checked",
+# which anchors nothing.
+# reviewers.txt / size.txt ride here too: fetch.sh writes them when it can (roster from
+# the PR's reviews + git log, size from pr_meta.json), and their absence degrades the
+# design gate to "no roster to route to" rather than failing the run.
+OPTIONAL = ["late_findings.txt", "citations.txt", "reviewers.txt", "size.txt"]
 
 
 def read(p):
@@ -84,7 +93,7 @@ def pr_meta(work):
 
 
 def run_gates(work, proj):
-    """Run the seven gates, return [(name, exit_code, first_line, full)]. Trust no agent's self-report."""
+    """Run the eight gates, return [(name, exit_code, first_line, full)]. Trust no agent's self-report."""
     sk = os.path.join(proj, ".claude", "skills", "review-pr", "triage.py")
     W = lambda f: os.path.join(work, f)
     # A missing artifact should let the gate rule "this step was not done", not crash the script
@@ -99,6 +108,8 @@ def run_gates(work, proj):
     ]:
         pathlib.Path(W(f)).touch(exist_ok=True)
     pathlib.Path(W("card.md")).touch(exist_ok=True)
+    pathlib.Path(W("design.txt")).touch(exist_ok=True)
+    pathlib.Path(W("reviewers.txt")).touch(exist_ok=True)
     specs = [
         ("answers", ["answers", W("answers.txt")]),
         ("diagnostic", ["diagnostic", W("ai_diagnostic.txt")]),
@@ -121,6 +132,17 @@ def run_gates(work, proj):
             ["refutations", W("refutations.txt"), W("pr.diff"), W("card.md")],
         ),
         ("independent", ["independent", W("independent.txt"), W("card.md")]),
+        (
+            "design",
+            [
+                "design",
+                W("design.txt"),
+                W("card.md"),
+                W("reviewers.txt"),
+                W("pr_meta.json"),
+                W("pr.diff"),
+            ],
+        ),
     ]
     env = dict(os.environ, PYTHONUTF8="1")
     res = []

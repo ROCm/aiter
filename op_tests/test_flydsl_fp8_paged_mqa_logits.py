@@ -859,6 +859,50 @@ def test_fp8_paged_mqa_logits_bad_context_lens(next_n=3, kv_len=3000):
     aiter.logger.info("fp8_paged_mqa_logits bad context_lens rejected: ok")
 
 
+def test_fp8_paged_mqa_logits_padded_rows(row_dim=144, batch=8, next_n=2, kv_len=9216):
+    """Rows padded past 132 bytes, as in a DSA index cache aligned to 16 bytes:
+    the padding is never read, so the logits equal those of the packed pages."""
+    for kvb in ARCH_KV_BLOCK_SIZES[get_gfx()]:
+        inp = _build_inputs(
+            batch, next_n, HEADS, HEAD_DIM, kv_len, _E4M3_NATIVE, block_size=kvb
+        )
+        packed, out = _kernel_inputs(inp, batch, next_n, HEAD_DIM)
+        blocks = packed.shape[0]
+        padded = torch.full(
+            (blocks, kvb * row_dim), 0xAB, dtype=torch.uint8, device=packed.device
+        )
+        padded[:, : kvb * INDEX_DIM] = packed.view(torch.uint8).reshape(blocks, -1)
+        padded = padded.view(packed.dtype).view(blocks, kvb, 1, row_dim)
+        ref = run_torch(
+            inp.q,
+            inp.kv_cache_fp8,
+            inp.weights,
+            inp.context_lens,
+            inp.block_tables,
+            inp.max_model_len,
+            inp.fp8_dtype,
+            block_size=kvb,
+        )
+        outs = []
+        for kv in (packed, padded):
+            out.fill_(float("-inf"))
+            flydsl_fp8_paged_mqa_logits(
+                inp.q_fp8,
+                kv,
+                inp.weights,
+                out,
+                inp.context_lens,
+                inp.block_tables,
+                inp.max_model_len,
+                Preshuffle=True,
+                KVBlockSize=kvb,
+            )
+            outs.append(out.clone())
+        assert torch.equal(outs[0], outs[1]), f"row_dim={row_dim} kvb={kvb} differs"
+        _grade(ref, outs[1], f"padded rows row_dim={row_dim} kvb={kvb}")
+    aiter.logger.info("fp8_paged_mqa_logits padded rows (%d B): ok", row_dim)
+
+
 def main():
     if get_gfx() not in SUPPORTED_GFX:
         aiter.logger.warning(
@@ -1023,6 +1067,8 @@ def main():
     ]
     test_fp8_paged_mqa_logits_mixed_context_lens()
     test_fp8_paged_mqa_logits_bad_context_lens()
+    if get_gfx() == "gfx1250":
+        test_fp8_paged_mqa_logits_padded_rows()
     if compact:
         _summarize("fp8_paged_mqa_logits", compact)
 

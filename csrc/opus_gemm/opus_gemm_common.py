@@ -3286,6 +3286,12 @@ def get_kernel_instance(
 ) -> OpusGemmInstance | None:
     """Return a kernel registered for ``(family, arch, cu_num, kid, Y.dtype)``."""
     arch = str(arch).lower().split(":", 1)[0]
+    # An AOT replay compiles the whole gfx1250 kernel family for the strict
+    # target, so fold strict to gfx1250 to resolve the kid (the product is
+    # still emitted for the exact strict arch). At runtime the exact identity
+    # is kept, so a non-CO kid under strict is rejected (gfx1250-strict).
+    if os.environ.get("AITER_AOT_REPLAY") == "1":
+        arch = base_gfx_arch(arch)
     family = str(family).lower()
     family_tags = OPUS_KERNEL_TAGS_BY_ARCH_FAMILY.get(arch, {}).get(family)
     if family_tags is None:

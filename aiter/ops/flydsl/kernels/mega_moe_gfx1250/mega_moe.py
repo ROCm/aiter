@@ -315,6 +315,8 @@ class MegaMoEGfx1250:
         combine_quant: str | None = None,
         combine_wire: str | None = None,
         recv_counter_is_zero: bool = False,
+        shared_add: torch.Tensor | None = None,
+        shared_ready: torch.cuda.Event | None = None,
     ) -> torch.Tensor:
         """Run one MoE layer: dispatch, its expert GEMM, then combine.
 
@@ -327,11 +329,11 @@ class MegaMoEGfx1250:
         their own. Every rank must pass the same bound: on the compact dispatch
         it picks the row alignment all senders lay their rows out with.
 
-        ``next_topk_ids`` (and optional ``next_recv_token_bound``) start the next
-        layer's compact plan on a side stream after this dispatch, so it overlaps
-        the expert GEMM. The two plans use independent hist/done slots and local
-        tok_map/psum buffers. Omit them to keep the plan sequential. The next
-        forward has to pass the same bound the plan was started with.
+        ``next_topk_ids`` (and optional ``next_recv_token_bound``) issue the next
+        layer's compact plan right after this dispatch, on the same stream (the
+        plan never runs on a side stream). The two plans use independent
+        hist/done slots and local tok_map/psum buffers. The next forward has to
+        pass the same bound the plan was started with.
 
         ``combine_wire`` picks this step's combine wire out of the recipe's
         ``combine_wires``, so a caller can quantize the steps with enough tokens
@@ -342,6 +344,12 @@ class MegaMoEGfx1250:
 
         ``recv_counter_is_zero`` is accepted and ignored: the dispatch
         overwrites the received count, so there is no reset to skip.
+
+        ``shared_add`` (bf16 ``[tokens, hidden]``, e.g. the shared expert's
+        output) is added to the result by the combine itself, so the caller
+        needs no separate add. ``shared_ready``, when given, is waited on by
+        the current stream just before the combine: its producer may run on a
+        side stream beside the dispatch and the expert GEMMs.
         """
         if combine_wire is not None:
             if combine_quant is not None:
@@ -371,8 +379,6 @@ class MegaMoEGfx1250:
                 # reduce. The next forward launches its plan in stream order.
                 next_topk_ids = None
                 hook = disp.fusion.gemm1
-            elif disp.fusion.should_probe():
-                hook = disp.fusion.probe
             step_kw = {"begin_step": False, "s1f": s1f}
         batch = ep.dispatch(
             hidden_states,
@@ -406,7 +412,9 @@ class MegaMoEGfx1250:
         )
         if isinstance(disp, _CompactDispatch):
             disp.fusion.finish(s1f)
-        return ep.combine(batch.routing, quant_bits, expert_out)
+        if shared_ready is not None:
+            torch.cuda.current_stream().wait_event(shared_ready)
+        return ep.combine(batch.routing, quant_bits, expert_out, shared_add=shared_add)
 
     __call__ = forward
 
@@ -582,7 +590,7 @@ class MegaMoEGfx1250:
         token_count: int | None = None,
     ) -> None:
         """Compile the compact plan this bound needs, before any graph capture.
-        ``token_count`` is unused: the bound alone picks the tile.
+        ``token_count`` sizes the plan grid; the bound picks the tile.
 
         The plan is compiled per tile alignment and the alignment follows the
         bound's token bucket, so a captured batch whose bucket never ran eagerly
@@ -597,12 +605,10 @@ class MegaMoEGfx1250:
         topk_ids: torch.Tensor,
         recv_token_bound: int | None = None,
     ) -> None:
-        """Launch ``tdm_compact_plan`` on a side stream into the current slot.
+        """Launch ``tdm_compact_plan`` into the current slot, in stream order.
 
-        The plan only needs ``topk_ids``, so the caller can hide the first
-        layer's plan behind RMSNorm. Later layers should pass ``next_topk_ids``
-        to ``forward`` so the plan overlaps the previous expert GEMM instead.
-        A no-op off the compact path.
+        The plan only needs ``topk_ids``, so the caller may issue it before the
+        first layer's RMSNorm. A no-op off the compact path.
         """
         self._ep.prefetch(topk_ids, recv_token_bound)
 

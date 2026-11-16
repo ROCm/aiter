@@ -16,8 +16,9 @@ constexpr int kScaleGroupSize       = 32;
 constexpr int kKPaddingTiles        = 2;
 constexpr size_t kPackedTileBytes   = 24576;
 constexpr size_t kScaleTileBytes    = 1024;
+constexpr size_t kMaxBufferBytes    = size_t{1} << 31;
 constexpr char kPackLayout[]        = "mxfp6_c0c1_256_padk2";
-constexpr char kDefaultKernelName[] = "f6gemm_dmabig_kernel_func";
+constexpr char kDefaultKernelName[] = "_ZN5aiter29f6gemm_bf16_per1x32Fp6_dmabigE";
 
 // KernelArgs layout is identical to the a4w4 asm gemm ABI; the mxfp6 dmabig
 // kernel was assembled against the same kernarg struct (0x180 bytes). Fields
@@ -149,6 +150,13 @@ AITER_CTYPES_DEFINE_ENTRYPOINT_VOID(
     AITER_CHECK(A_scale->numel() == expected_scaleA && B_scale->numel() == expected_scaleB,
                 __func__,
                 " packed scale buffer sizes must exactly match the launch dimensions");
+    const auto fits_srd = [](const aiter_tensor_t* tensor) {
+        return tensor->numel() <= kMaxBufferBytes / tensor->element_size();
+    };
+    AITER_CHECK(fits_srd(A) && fits_srd(B) && fits_srd(A_scale) && fits_srd(B_scale) &&
+                    fits_srd(out),
+                __func__,
+                " each tensor must fit within the kernel's 2 GiB buffer-address range");
 
     KernelArgs args{};
     size_t arg_size     = sizeof(args);

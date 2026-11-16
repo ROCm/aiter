@@ -5,7 +5,7 @@
 
 #include <opus/dtypes.hpp>
 
-#include "../mla_v41_prefill_kargs.h"
+#include "../mla_prefill_kargs.h"
 
 using bf16_t = opus::dtypes::bf16;
 using fp8_t  = _BitInt(8);
