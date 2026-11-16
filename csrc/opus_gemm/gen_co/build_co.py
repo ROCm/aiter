@@ -55,7 +55,7 @@ gfx950 (``--arch gfx950``)
 --------------------------
 The a4w4_mxfp4_nt pipeline pins its A / B / C fragments with
 ``[[clang::amdgpu_pin_agpr/vgpr]]``; only a pin toolchain compiles it. Its
-entries are the ``gfx950/a4w4_bpreshuffle`` list of ``co_kernels.json`` and land in
+entries are ``co_kernels_gfx950_a4w4_bpreshuffle.json`` and land in
 ``gen_co/gfx950/a4w4_bpreshuffle/``. The stub calls the pipeline's ``__device__`` body and is
 compiled with that toolchain's ``clang++ --cuda-device-only`` (``-cuid`` pinned,
 so rebuilds are byte-reproducible); ``--opus-include`` selects the opus headers
@@ -95,7 +95,7 @@ from codegen.gen_instances_gfx1250 import (
 # whose .co is not on disk (so nothing downstream can register an unlaunchable
 # kid), and this script exists to create exactly those files.
 from opus_gemm_common import (
-    A4W4_CO_KEY,
+    A4W4_CO_DIR,
     a4w4_co_kernels_declared,
     a4w4_co_traits_args,
     gfx1250_4wave_co_kernels_declared,
@@ -745,7 +745,7 @@ def _default_co_output_dir(arch, offload_arch):
     if offload_arch == "gfx1250-strict":
         return os.path.join(_HERE, arch + "-strict")
     if arch == "gfx950":
-        return os.path.join(_HERE, A4W4_CO_KEY)
+        return os.path.join(_HERE, A4W4_CO_DIR)
     return os.path.join(_HERE, "named_reg", arch)
 
 
@@ -866,7 +866,7 @@ def main():
         instances = [k for kid, k in declared.items() if kid in selected]
     if not instances:
         raise SystemExit(
-            "build_co: no pre-compiled entries -- check gen_co/co_kernels.json"
+            "build_co: no pre-compiled entries -- check gen_co/co_kernels*.json"
         )
     jobs = get_worker_count_for(len(instances), args.jobs)
 
