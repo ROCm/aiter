@@ -220,7 +220,6 @@ _PIPE_OK = {
     "preload": False,
     "use_cluster": False,
     "split_k": 1,
-    "tile_k": 256,
 }
 
 
@@ -230,9 +229,7 @@ def test_pipelined_k_loop_check():
     assert check_pipelined_k_loop(1, **_PIPE_OK) is True
     assert check_pipelined_k_loop(0, **_PIPE_OK) is False
     # 0 never asks anything of the config.
-    assert check_pipelined_k_loop(0, **{**_PIPE_OK, "tile_k": 128}) is False
-    with pytest.raises(ValueError, match="tile_k >= 256"):
-        check_pipelined_k_loop(1, **{**_PIPE_OK, "tile_k": 128})
+    assert check_pipelined_k_loop(0, **{**_PIPE_OK, "split_k": 2}) is False
     for key, value in (
         ("mx32", False),
         ("preload", True),

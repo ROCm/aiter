@@ -45,28 +45,26 @@ def check_pipelined_k_loop(
     preload: bool,
     use_cluster: bool,
     split_k: int,
-    tile_k: int,
 ) -> bool:
     """Validate the ``pipelined`` constexpr of :func:`launch_gemm_a8w8`.
 
     0 keeps the single-fence K loop. 1 (a kernelName ending in ``_pl``, or
     the default_pipelined_k_loop pick of a name without a K-loop suffix) takes
     the software-pipelined K loop, which needs mxfp8_32, no scale preload, no
-    cluster, split_k 1 and tile_k >= 256 (two 128-deep k-steps per K-tile);
-    the runners already require K-tiles >= num_buffers. Anything else raises.
+    cluster and split_k 1; the runners already require K-tiles >= num_buffers.
+    Any tile_k works: at tile_k == 128 (one k-step per K-tile) the next tile's
+    first fragments are read during the second half of this tile's WMMAs.
+    Anything else raises.
     """
     if pipelined not in (0, 1):
         raise ValueError(
             f"[FlyDSL gfx1250] pipelined must be 0 or 1, got {pipelined!r}"
         )
-    if pipelined and not (
-        mx32 and not preload and not use_cluster and split_k == 1 and tile_k >= 256
-    ):
+    if pipelined and not (mx32 and not preload and not use_cluster and split_k == 1):
         raise ValueError(
             "[FlyDSL gfx1250] the pipelined K loop needs mxfp8_32, no scale "
-            f"preload, no cluster, split_k 1 and tile_k >= 256; got mx32={mx32}, "
-            f"preload={preload}, cluster={use_cluster}, split_k={split_k}, "
-            f"tile_k={tile_k}"
+            f"preload, no cluster and split_k 1; got mx32={mx32}, "
+            f"preload={preload}, cluster={use_cluster}, split_k={split_k}"
         )
     return bool(pipelined)
 
@@ -190,7 +188,6 @@ def launch_gemm_a8w8(
         preload=preload,
         use_cluster=use_cluster,
         split_k=split_k,
-        tile_k=tile_k,
     )
     WMMA_M = WMMA_N = 16
     WMMA_K = 128

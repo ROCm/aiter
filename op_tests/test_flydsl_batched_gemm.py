@@ -147,10 +147,10 @@ FUSED_QUANT_TILE_SHAPES = ((8, 48, 1024, 4096), (8, 200, 1024, 4096))
 # The pipelined K loop (kernelName suffix _pl) must give the single-fence
 # loop's (_nopl) output bit for bit: (b, m, n, k, kernelName without a K-loop
 # suffix) for a ragged K (k_tail), for a shipped DSv4.1 _pl row (b=1, as the
-# 2-D table runs it), and
-# for three- and four-buffer tiles on the DSv4.1 N=5120, K=8192 GEMM, where the
-# tail fences wait on fewer outstanding tiles than the steady loop (with two
-# buffers the tail fence count is always 0).
+# 2-D table runs it), for three- and four-buffer tiles on the DSv4.1 N=5120,
+# K=8192 GEMM, where the tail fences wait on fewer outstanding tiles than the
+# steady loop (with two buffers the tail fence count is always 0), and for
+# tile_k = 128 (one k-step per K-tile) at the DSv4.1 wo_a / wq_b shapes.
 PIPELINED_CASES = (
     (2, 200, 512, 576, "flydsl_bmm_mxfp8_32_wmma_t64x128x256_mw2_nw2_nb2_sk1_cm1_cn1"),
     (
@@ -174,6 +174,21 @@ PIPELINED_CASES = (
         8192,
         "flydsl_bmm_mxfp8_32_wmma_t128x128x256_mw2_nw2_nb4_sk1_cm1_cn1",
     ),
+    (
+        8,
+        1344,
+        1024,
+        4096,
+        "flydsl_bmm_mxfp8_32_wmma_t96x256x128_mw1_nw4_nb3_sk1_cm1_cn1",
+    ),
+    (
+        1,
+        1344,
+        32768,
+        1280,
+        "flydsl_bmm_mxfp8_32_wmma_t224x256x128_mw2_nw2_nb3_sk1_cm1_cn1",
+    ),
+    (2, 200, 512, 576, "flydsl_bmm_mxfp8_32_wmma_t64x128x128_mw2_nw2_nb2_sk1_cm1_cn1"),
 )
 
 
