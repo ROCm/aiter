@@ -481,6 +481,12 @@ def _k3_splits(row_programs, row_tiles, block_h):
     split + 2, a split's fixed cost), with 4 // num_warps CTAs resident per CU
     (one wave per SIMD)."""
     programs = get_num_sms() * (64 // block_h)
+    # Prefill-sized calls fill the GPU many times over: splitting only adds the fp32
+    # partials (~R * splits * h_padded * 512 * 4 B written and re-read) and a reduce
+    # launch, which the wave count above does not price. Kimi-K3.1 at R=6154 / 2048 keys
+    # picked 2 splits (H=24) or 4 (H=12): 1 split is 1.11x / 1.07x faster end to end.
+    if row_programs >= 4 * programs:
+        return 1
     return min(
         (s for s in (1, 2, 4, 8, 16, 32) if s == 1 or 2 * s <= row_tiles),
         key=lambda s: -(-row_programs * s // programs) * (2 - (-row_tiles // s)),
@@ -620,7 +626,10 @@ def _forward_k3_640(
         NOPE_DIM=nope,
         ROPE_DIM=rope,
         GROUP_SIZE=64,
-        Q_IN_VGPR=True,
+        # Q in VGPRs only without splits: the split-K variants run out of registers
+        # with it (894-1024 VGPRs, 4-16 spilled); out of VGPRs they need 610-708, no
+        # spill, and are as fast or faster (1.08-1.10x at batch 1).
+        Q_IN_VGPR=kv_splits == 1,
         HAS_INVALID=bool(has_invalid),
         Q_TDM=True,
         CTAS_H=1,
