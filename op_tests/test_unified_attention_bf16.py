@@ -164,6 +164,7 @@ def route_spy(monkeypatch):
     calls = []
     for module, name, tag in (
         (flydsl_ua, "_unified_attention_varlen", "flydsl"),
+        (flydsl_ua, "_unified_attention_uniform", "flydsl"),
         (flydsl_ua, "_unified_attention_window", "flydsl"),
         (flydsl_ua, "_unified_attention_varlen_optimized", "optimized"),
         (triton_ua, "unified_attention", "triton"),
@@ -259,7 +260,7 @@ def test_release_frees_workspaces_and_kernels(route_spy):
     _call(q, k, v, out, cu, used, table, qlen=1, backend="flydsl")
     torch.cuda.synchronize()
     assert torch.cuda.memory_allocated() > baseline
-    assert compile_query_block_map.cache_info().currsize > 0
+    assert compile_pa_decode_pingpong.cache_info().currsize > 0
     release_flydsl_resources()
     assert torch.cuda.memory_allocated() == baseline
     assert flydsl_ua._WORKSPACES == {}

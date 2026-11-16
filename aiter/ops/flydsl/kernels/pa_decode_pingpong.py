@@ -102,6 +102,7 @@ def compile_pa_decode_pingpong(
     sink_dtype=None,
     seq_query_length=0,
     direct_output=False,
+    pair_ctas=False,
 ):
     """The tile kernel's launch for one geometry.
 
@@ -121,6 +122,9 @@ def compile_pa_decode_pingpong(
     ``direct_output`` (varlen, plans with one task per pseudo-sequence) writes
     normalized rows to a contiguous [tokens, heads, DV] output passed in the
     launch's ``key_scale`` slot, so no reducer runs.
+
+    ``pair_ctas`` (planned launches) gives each CTA two adjacent work slots and
+    runs a sequence's adjacent tasks as one range.
     """
     assert block_size % TILE == 0 and block_size & (block_size - 1) == 0
     # Windows' overlapping KV is reused across CTAs, so it stays cacheable.
@@ -147,6 +151,7 @@ def compile_pa_decode_pingpong(
     ROWS = QLEN * GQA
     assert R * M * 16 >= ROWS, "layout must cover every query row"
     DIRECT = bool(direct_output) and bool(varlen) and not window
+    PAIR = bool(pair_ctas) and not (window or DIRECT)
 
     K_ROW = D * 2
     V_ROW = DV * 2
@@ -193,6 +198,8 @@ def compile_pa_decode_pingpong(
         kernel_name += "_varlen"
     if DIRECT:
         kernel_name += "_direct"
+    if PAIR:
+        kernel_name += "_pair"
     if window:
         kernel_name += f"_sw{window}" + (f"_sink{sink_dtype}" if sink_dtype else "")
     SPLIT = max(seq_query_length // query_length, 1) if window and not varlen else 1
@@ -843,36 +850,122 @@ def compile_pa_decode_pingpong(
         out_ptr: fx.Pointer,
     ):
         work = fx.recast_iter(fx.Int32, work_info_ptr)
-        slot = fx.Int32(fx.block_idx.x)
-        task = fx.ptr_load(
-            fx.add_offset(work, slot * 4),
-            result_type=fx.Vector.make_type(4, fx.Int32),
-        )
-        start = fx.Int32(task[1])
-        end = fx.Int32(task[2])
-        if start < end:
-            _task(
-                pmax_ptr,
-                psum_ptr,
-                pout_ptr,
-                query_ptr,
-                key_cache_ptr,
-                value_cache_ptr,
-                block_tables_ptr,
-                query_map_ptr,
-                max_blocks_per_seq,
-                stride_q_row,
-                stride_q_head,
-                fx.Int32(task[0]),
-                start,
-                end,
-                fx.Int32(task[3]),
-                slot,
-                work_capacity,
-                out_ptr,
-                pout_ptr,
-                fx.Int32(0),
+
+        def load_task(slot):
+            return fx.ptr_load(
+                fx.add_offset(work, slot * 4),
+                result_type=fx.Vector.make_type(4, fx.Int32),
             )
+
+        if const_expr(PAIR):
+            # Slots 2x and 2x + 1; a sequence's adjacent tasks run as one range.
+            first = fx.Int32(fx.block_idx.x) * 2
+            second = first + 1
+            has_second = second < work_capacity
+            ta = load_task(first)
+            tb = load_task(has_second.select(second, first))
+            a_start = fx.Int32(ta[1])
+            a_end = fx.Int32(ta[2])
+            b_start = fx.Int32(tb[1])
+            b_end = fx.Int32(tb[2])
+            fuse = (
+                has_second
+                & (fx.Int32(ta[0]) == fx.Int32(tb[0]))
+                & (a_end == b_start)
+                & (a_start < a_end)
+                & (b_start < b_end)
+            )
+            # One _task call site (it owns the LDS allocation): run 0 is the
+            # first slot or the fused range, run 1 the unfused second slot.
+            no_work = fx.Int32(0)
+            second_live = has_second & ~fuse
+            first_end = fuse.select(b_end, a_end)
+            second_start = second_live.select(b_start, no_work)
+            second_end = second_live.select(b_end, no_work)
+            for run_i in range(0, 2, 1):
+                is_first = fx.Int32(run_i) == 0
+                start = is_first.select(a_start, second_start)
+                end = is_first.select(first_end, second_end)
+                if start < end:
+                    _task(
+                        pmax_ptr,
+                        psum_ptr,
+                        pout_ptr,
+                        query_ptr,
+                        key_cache_ptr,
+                        value_cache_ptr,
+                        block_tables_ptr,
+                        query_map_ptr,
+                        max_blocks_per_seq,
+                        stride_q_row,
+                        stride_q_head,
+                        is_first.select(fx.Int32(ta[0]), fx.Int32(tb[0])),
+                        start,
+                        end,
+                        is_first.select(fx.Int32(ta[3]), fx.Int32(tb[3])),
+                        is_first.select(first, second),
+                        work_capacity,
+                        out_ptr,
+                        pout_ptr,
+                        fx.Int32(0),
+                    )
+            if fuse:
+                # Zero weight and zero output: the reducer scales output by weight.
+                tid = fx.Int32(fx.thread_idx.x)
+                partial = fx.Int32(fx.block_idx.y) * work_capacity + second
+                row = partial * ROWS + tid % ROWS
+                fx.ptr_store(
+                    fx.Vector.from_elements(
+                        [fx.Float32(float("-inf"))], dtype=fx.Float32
+                    ),
+                    fx.add_offset(fx.recast_iter(fx.Float32, pmax_ptr), row),
+                )
+                fx.ptr_store(
+                    fx.Vector.from_elements([fx.Float32(0.0)], dtype=fx.Float32),
+                    fx.add_offset(fx.recast_iter(fx.Float32, psum_ptr), row),
+                )
+                pout = fx.recast_iter(fx.BFloat16, pout_ptr)
+                chunks = ROWS * DV // 8
+                for j in range_constexpr(-(-chunks // (NWAVES * WAVE))):
+                    idx = j * NWAVES * WAVE + tid
+                    # Overflow lanes rewrite the last chunk with the same zeros.
+                    idx = (idx < chunks).select(idx, chunks - 1)
+                    fx.ptr_store(
+                        fx.full(8, 0.0, fx.BFloat16),
+                        fx.add_offset(pout, partial * (ROWS * DV) + idx * 8),
+                    )
+        else:
+            slot = fx.Int32(fx.block_idx.x)
+            task = load_task(slot)
+            start = fx.Int32(task[1])
+            end = fx.Int32(task[2])
+            if start < end:
+                _task(
+                    pmax_ptr,
+                    psum_ptr,
+                    pout_ptr,
+                    query_ptr,
+                    key_cache_ptr,
+                    value_cache_ptr,
+                    block_tables_ptr,
+                    query_map_ptr,
+                    max_blocks_per_seq,
+                    stride_q_row,
+                    stride_q_head,
+                    fx.Int32(task[0]),
+                    start,
+                    end,
+                    fx.Int32(task[3]),
+                    slot,
+                    work_capacity,
+                    out_ptr,
+                    pout_ptr,
+                    fx.Int32(0),
+                )
+
+    def _grid_x(work_capacity):
+        # Outside the JIT rewriter, which would make the branch dynamic.
+        return (work_capacity + 1) // 2 if PAIR else work_capacity
 
     @flyc.jit
     def pa_decode_pingpong_launch(
@@ -923,7 +1016,7 @@ def compile_pa_decode_pingpong(
                 )
             },
         ).launch(
-            grid=(work_capacity, num_kv_heads, 1),
+            grid=(_grid_x(work_capacity), num_kv_heads, 1),
             block=(NWAVES * WAVE, 1, 1),
             stream=stream,
         )

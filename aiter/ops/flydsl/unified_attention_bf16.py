@@ -691,6 +691,138 @@ def _unified_attention_varlen(
     return out
 
 
+def _unified_attention_uniform(
+    q,
+    k,
+    v,
+    out,
+    seqused_k,
+    max_seqlen_k,
+    softmax_scale,
+    block_table,
+    explicit,
+    query_length,
+):
+    """Sequence s owns query rows [s * query_length, (s + 1) * query_length):
+    the plan reads ``seqused_k`` directly and no query map is built."""
+    import flydsl.compiler as flyc
+    import flydsl.expr as fx
+
+    from .kernels.pa_decode_pingpong import compile_pa_decode_pingpong
+    from .kernels.pa_decode_plan import PADecodePlan, _lds_max_batch, refresh_plan
+    from .kernels.tensor_shim import _run_compiled, ptr_arg
+    from .pa_decode import launch_pa_decode_ps_reduce
+
+    num_seqs = seqused_k.numel()
+    num_kv_heads = k.shape[2]
+    group = q.shape[1] // num_kv_heads
+    rows = query_length * group
+    dev = q.device
+    with torch.cuda.device(dev):
+        num_cu = _num_cu(dev.index)
+        capacity = _plan_capacity(num_seqs, num_kv_heads, num_cu)
+        workspace = _workspace(
+            q,
+            f"uniform_{query_length}",
+            {
+                "work_info": (capacity * 4, torch.int32),
+                "reduce_info": (num_seqs * 2, torch.int32),
+                **_partial_need(num_kv_heads, capacity, rows),
+            },
+            f"{num_seqs} sequences, query length {query_length}",
+            explicit,
+        )
+        if workspace is None:
+            return None
+        if torch.cuda.is_current_stream_capturing():
+            workspace["captured"] = True
+        plan = PADecodePlan(
+            work_info=workspace["work_info"][: capacity * 4].view(capacity, 4),
+            reduce_info=workspace["reduce_info"][: num_seqs * 2].view(num_seqs, 2),
+            num_kv_heads=num_kv_heads,
+            max_partitions=num_cu,
+            query_length=query_length,
+            max_batch_size=num_seqs,
+        )
+        stream = torch.cuda.current_stream(dev)
+        refresh_plan(plan, seqused_k, _lds_max_batch(_GFX950_LDS_BYTES), True, stream)
+        shape = (num_kv_heads, capacity, rows)
+        scalars = shape[0] * shape[1] * shape[2]
+        pmax = workspace["max_logits"][:scalars].view(shape)
+        psum = workspace["exp_sums"][:scalars].view(shape)
+        pout = workspace["temporary_output"][: scalars * _VALUE_DIM].view(
+            *shape, _VALUE_DIM
+        )
+        live_tiles = num_kv_heads * min(
+            capacity, num_seqs * -(-int(max_seqlen_k) // 256)
+        )
+        compiled = compile_pa_decode_pingpong(
+            head_dim=_HEAD_DIM,
+            value_dim=_VALUE_DIM,
+            query_group_size=group,
+            query_length=query_length,
+            block_size=k.shape[1],
+            softmax_scale=float(softmax_scale),
+            # One CTA per CU: fuse task pairs when live tasks can exceed the CUs.
+            pair_ctas=live_tiles > num_cu,
+        )
+        no_scale = flyc.from_c_void_p(fx.Float32, 0)
+        _run_compiled(
+            compiled,
+            ptr_arg(pmax, fx.Float32),
+            ptr_arg(psum, fx.Float32),
+            ptr_arg(pout, fx.BFloat16),
+            ptr_arg(q, fx.BFloat16),
+            ptr_arg(k, fx.BFloat16),
+            ptr_arg(v, fx.BFloat16),
+            ptr_arg(block_table, fx.Int32),
+            no_scale,
+            no_scale,
+            int(block_table.shape[1]),
+            num_seqs,
+            num_kv_heads,
+            0,
+            0,
+            int(q.stride(0)),
+            int(q.stride(1)),
+            ptr_arg(plan.work_info, fx.Int32),
+            capacity,
+            # Uniform query rows: the query map is unread.
+            ptr_arg(plan.work_info, fx.Int32),
+            stream,
+        )
+        output = out.as_strided(
+            (num_seqs, query_length, num_kv_heads, group, _VALUE_DIM),
+            (
+                query_length * out.stride(0),
+                out.stride(0),
+                group * out.stride(1),
+                out.stride(1),
+                1,
+            ),
+        )
+        launch_pa_decode_ps_reduce(
+            output,
+            psum,
+            pmax,
+            pout,
+            None,
+            *output.stride()[:4],
+            pmax.stride(0),
+            pmax.stride(1),
+            pout.stride(0),
+            pout.stride(1),
+            pout.stride(2),
+            query_seq_len=query_length,
+            query_group_size=group,
+            head_size=_VALUE_DIM,
+            max_partitions=max(1, min(num_cu, capacity, -(-int(max_seqlen_k) // 256))),
+            stream=stream,
+            reduce_info=plan.reduce_info,
+        )
+    return out
+
+
 _SINK_DTYPES = {torch.float32: "f32", torch.bfloat16: "bf16", torch.float16: "f16"}
 
 
@@ -929,18 +1061,32 @@ def unified_attention_flydsl(
             explicit,
         )
     # pa_decode takes the vectorized rank-5 K/V layout, not this linear cache, so
-    # uniform batches run the varlen ping-pong path with one query block per
-    # sequence.
-    return _unified_attention_varlen(
+    # uniform batches launch the ping-pong kernel here. With one task per
+    # sequence the varlen launch writes out directly instead.
+    num_seqs = seqused_k.numel()
+    if _plan_capacity(num_seqs, k.shape[2], _num_cu(q.device.index)) == num_seqs:
+        return _unified_attention_varlen(
+            q,
+            k,
+            v,
+            out,
+            cu_seqlens_q,
+            seqused_k,
+            max_seqlen_k,
+            softmax_scale,
+            block_table,
+            explicit,
+            query_block=int(max_seqlen_q),
+        )
+    return _unified_attention_uniform(
         q,
         k,
         v,
         out,
-        cu_seqlens_q,
         seqused_k,
         max_seqlen_k,
         softmax_scale,
         block_table,
         explicit,
-        query_block=int(max_seqlen_q),
+        int(max_seqlen_q),
     )
