@@ -159,6 +159,14 @@ def _triton_satisfied():
                 return False
         except Exception:  # noqa: BLE001
             return False
+    # Metadata can survive even when the module files were removed by
+    # ``pip uninstall triton`` (the old distribution shares triton/).
+    try:
+        import importlib
+
+        importlib.import_module("triton.language")
+    except Exception:  # noqa: BLE001
+        return False
     return True
 
 
@@ -188,7 +196,15 @@ elif not AITER_USE_SYSTEM_TRITON and not IS_WINDOWS:
         for pkg_spec in [TRITON_VERSION, TRITON_KERNELS_VERSION]:
             try:
                 subprocess.check_call(
-                    [sys.executable, "-m", "pip", "install", pkg_spec]
+                    [
+                        sys.executable,
+                        "-m",
+                        "pip",
+                        "install",
+                        "--force-reinstall",
+                        "--no-deps",
+                        pkg_spec,
+                    ]
                 )
             except Exception:  # noqa: BLE001
                 print(
