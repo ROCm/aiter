@@ -143,7 +143,9 @@ def select_3d_config(
         if num_segments == MIN_SEGMENTS:
             reduce_num_warps = 1
         if tuned is not None:
-            # Match reduction warps to the segment tile when a table is present.
+            # The reduce kernel holds a [NUM_SEGMENTS, KV_LORA_RANK] fp32 tile.
+            # One warp spills it to scratch from 16 segments, much more from 32.
+            # Use the per-segment-count value if listed, else the tuned default.
             reduce_num_warps = (
                 tuned["reduce"]
                 .get("num_warps_by_num_segments", {})
