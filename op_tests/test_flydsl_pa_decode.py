@@ -2242,6 +2242,12 @@ def _run_pa_decode_case(case, device, monkeypatch):
         _check_pipe_policy(pa, case, arch, compile_kwargs)
     if case["quant"] and arch == "gfx1250":
         _check_quant_output(launch, query, output, compile_kwargs, case["capture"])
+    elif case["quant"]:
+        with pytest.raises(NotImplementedError, match="requires gfx1250"):
+            launch(
+                quantized_output=torch.empty_like(output, dtype=dtypes.fp8),
+                output_scale=torch.empty(output.shape[0], 1, device=device),
+            )
     if case["capture"]:
         # Compile/allocate before capture; replay must observe changed query data.
         capture_stream = torch.cuda.Stream()
