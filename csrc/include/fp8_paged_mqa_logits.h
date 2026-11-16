@@ -13,34 +13,31 @@
 // `deepgemm_fp8_paged_mqa_logits`, so it drops into the same call site.
 //
 // Fixed at n_heads=32, head_dim=128 -- the shipped GLM-5-FP8 indexer shape.
+//
+// No torch dependency: tensors cross as aiter_tensor_t and the stream comes from
+// aiter::getCurrentHIPStream(). The output is allocated by the Python wrapper
+// (aiter/ops/fp8_paged_mqa_logits.py) when the caller passes none.
+#include "aiter_tensor.h"
+#include <cstdint>
 
-// aiter builds csrc without hipify, so the ATen CUDA headers (which pull in
-// cuda_runtime_api.h) are unavailable -- use the HIP-flavoured ones, as the rest
-// of csrc does.
-#include <ATen/hip/HIPContext.h>
-#include <ATen/hip/impl/HIPGuardImplMasqueradingAsCUDA.h>
-#include <c10/util/Optional.h>
-#include <torch/all.h>
-#include <torch/extension.h>
-#include <cstdlib>
-#include <type_traits>
+namespace aiter {
 
-// Writes into `out` when given (and returns it), otherwise allocates
-// [batch*next_n, max_model_len] f32. Only the causal window
-// p <= context_lens[b] - next_n + n is written ([batch] lengths), or
+// Writes into `out` ([batch*next_n, max_model_len] f32, contiguous). Only the causal
+// window p <= context_lens[b] - next_n + n is written ([batch] lengths), or
 // p < context_lens[b][n] ([batch, next_n] lengths, one per query row); the -inf
 // outside it is the caller's, exactly as for deepgemm_fp8_paged_mqa_logits.
-torch::Tensor
-fp8_paged_mqa_logits(torch::Tensor q_fp8,        // [batch, next_n, 32, 128] fp8
-                     torch::Tensor kv_cache_fp8, // [blocks, bsz, 1, index_dim];
-                                                 // bsz=1 plain, bsz=64 preshuffled
-                     torch::Tensor weights,      // [batch*next_n, 32] f32
-                     torch::Tensor context_lens, // [batch] or [batch, next_n] i32
-                     torch::Tensor block_tables, // [batch, max_blocks] i32
-                     int64_t max_model_len,
-                     int64_t ChunkK,
-                     int64_t SplitKV,
-                     int64_t num_warps,
-                     int64_t TotalCuCount,
-                     int64_t RowsPerBlock,
-                     std::optional<torch::Tensor> out);
+void fp8_paged_mqa_logits(aiter_tensor_t& out,                // [batch*next_n, max_model_len] f32
+                          const aiter_tensor_t& q_fp8,        // [batch, next_n, 32, 128] fp8
+                          const aiter_tensor_t& kv_cache_fp8, // [blocks, bsz, 1, index_dim];
+                                                              // bsz=1 plain, bsz=64 preshuffled
+                          const aiter_tensor_t& weights,      // [batch*next_n, 32] f32
+                          const aiter_tensor_t& context_lens, // [batch] or [batch, next_n] i32
+                          const aiter_tensor_t& block_tables, // [batch, max_blocks] i32
+                          int64_t max_model_len,
+                          int64_t ChunkK,
+                          int64_t SplitKV,
+                          int64_t num_warps,
+                          int64_t TotalCuCount,
+                          int64_t RowsPerBlock);
+
+} // namespace aiter

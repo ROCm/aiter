@@ -12,9 +12,10 @@ can be A/B'd on identical inputs.
 
 Fixed at n_heads=32, head_dim=128 -- the shipped GLM-5-FP8 indexer shape.
 ``is_supported()`` gates on that, so a caller that also has to serve other shapes
-can route them to the Triton kernel rather than trip a TORCH_CHECK.
+can route them to the Triton kernel rather than trip an AITER_CHECK.
 """
 
+import torch
 from torch import Tensor
 
 from ..jit.core import compile_ops
@@ -40,7 +41,27 @@ def is_supported(num_heads: int, head_dim: int, kv_block_size: int = 1) -> bool:
     )
 
 
-@compile_ops(MD_NAME, fc_name="fp8_paged_mqa_logits")
+# No C++ torch dependency: the module uses the ``aiter_tensor_t`` ABI and
+# ``develop=True`` converts each ``torch.Tensor`` before the call. The output is
+# allocated here (``fp8_paged_mqa_logits`` below) and written in place, so the
+# binding returns ``None``.
+@compile_ops(MD_NAME, fc_name="fp8_paged_mqa_logits", develop=True)
+def _fp8_paged_mqa_logits(
+    out: Tensor,
+    q_fp8: Tensor,
+    kv_cache_fp8: Tensor,
+    weights: Tensor,
+    context_lens: Tensor,
+    block_tables: Tensor,
+    max_model_len: int,
+    ChunkK: int,
+    SplitKV: int,
+    num_warps: int,
+    TotalCuCount: int,
+    RowsPerBlock: int,
+) -> None: ...
+
+
 def fp8_paged_mqa_logits(
     q_fp8: Tensor,
     kv_cache_fp8: Tensor,
@@ -76,3 +97,24 @@ def fp8_paged_mqa_logits(
     context_lens[b, n] for [batch, next_n] ones. The -inf outside it is the
     caller's, exactly as for `deepgemm_fp8_paged_mqa_logits`.
     """
+    if out is None:
+        out = torch.empty(
+            (q_fp8.shape[0] * q_fp8.shape[1], max_model_len),
+            dtype=torch.float32,
+            device=q_fp8.device,
+        )
+    _fp8_paged_mqa_logits(
+        out,
+        q_fp8,
+        kv_cache_fp8,
+        weights,
+        context_lens,
+        block_tables,
+        max_model_len,
+        ChunkK,
+        SplitKV,
+        num_warps,
+        TotalCuCount,
+        RowsPerBlock,
+    )
+    return out

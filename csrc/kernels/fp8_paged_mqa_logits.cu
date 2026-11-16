@@ -1,6 +1,12 @@
 // SPDX-License-Identifier: MIT
 // Decode-phase FP8 paged MQA indexer logits kernel, gfx950.
+#include "aiter_hip_common.h"
+#include "aiter_stream.h"
 #include "fp8_paged_mqa_logits.h"
+#include <algorithm>
+#include <hip/hip_fp8.h>
+#include <stdexcept>
+#include <string>
 #include <type_traits>
 
 // ============================================================================
@@ -21,7 +27,7 @@
 
 using fp8 = __hip_fp8_storage_t;
 
-constexpr int WARP_SIZE  = 64;
+constexpr int WAVE_SIZE  = 64;
 constexpr int NUM_HEADS  = 32;
 constexpr int HEAD_SIZE  = 128;
 
@@ -86,7 +92,7 @@ __device__ __forceinline__ T load_kv(const fp8* p) {
 // K staged in LDS by DMA (the R >= 3 ring in the kernel). One wave's 32-token K tile as the DMA
 // lands it: lane l's four 16-byte chunks at k[i][l].
 struct KTileLds {
-    u32x4 k[4][WARP_SIZE];
+    u32x4 k[4][WAVE_SIZE];
 };
 using lds_void    = __attribute__((address_space(3))) void;
 using KTileLdsPtr = __attribute__((address_space(3))) KTileLds*;
@@ -115,20 +121,29 @@ constexpr int OOB_VOFFSET    = 0x40800000;
 // and runs 1 wave/SIMD. Held to 2 it moves the accumulator out of AGPRs, with no spill.
 // ROW_LENS: context_lens holds one length per query row ([batch, next_n]) instead of one per
 // sequence ([batch], where row n sees context_lens[b] - next_n + n + 1 tokens).
-template <int NUM_WARPS, int CHUNK_K, int KV_BLOCK_SIZE, int ROWS_PER_BLOCK, bool K_NT,
+template <int NUM_WARPS,
+          int CHUNK_K,
+          int KV_BLOCK_SIZE,
+          int ROWS_PER_BLOCK,
+          bool K_NT,
           bool ROW_LENS = false>
-__global__ __launch_bounds__(NUM_WARPS * WARP_SIZE, ROWS_PER_BLOCK == 6 ? 2 : 1)
-void fp8_paged_mqa_logits_kernel(
-    const fp8*   __restrict__ Q_ptr,
-    const fp8*   __restrict__ kv_cache_ptr,
-    const float* __restrict__ weights_ptr,
-    const int*   __restrict__ context_lens,
-    const int*   __restrict__ block_tables,
-    float*       __restrict__ logits_ptr,
-    int batch_size, int next_n,
-    int max_blocks_per_seq, int max_model_len, int index_dim,
-    int SplitKV
-){
+__global__
+__launch_bounds__(NUM_WARPS* WAVE_SIZE,
+                  ROWS_PER_BLOCK == 6
+                      ? 2
+                      : 1) void fp8_paged_mqa_logits_kernel(const fp8* __restrict__ Q_ptr,
+                                                            const fp8* __restrict__ kv_cache_ptr,
+                                                            const float* __restrict__ weights_ptr,
+                                                            const int* __restrict__ context_lens,
+                                                            const int* __restrict__ block_tables,
+                                                            float* __restrict__ logits_ptr,
+                                                            int batch_size,
+                                                            int next_n,
+                                                            int max_blocks_per_seq,
+                                                            int max_model_len,
+                                                            int index_dim,
+                                                            int SplitKV)
+{
     constexpr int TILE_N = 32;                 // tokens per tile
     constexpr int NACC   = 16;                 // C accumulator floats/lane
     using VecOutMFMA = __attribute__((__vector_size__(NACC * sizeof(float)))) float;
@@ -177,10 +192,10 @@ void fp8_paged_mqa_logits_kernel(
         }
     }
 
-    const int l    = threadIdx.x % WARP_SIZE;
+    const int l = threadIdx.x % WAVE_SIZE;
     // Wave-uniform by construction; readfirstlane lets the compiler keep tile indices in
     // SGPRs, so the KVBlockSize=64 page-id loads become scalar loads.
-    const int warpId = __builtin_amdgcn_readfirstlane(threadIdx.x / WARP_SIZE);
+    const int warpId = __builtin_amdgcn_readfirstlane(threadIdx.x / WAVE_SIZE);
     const int rw    = l / 16;
     const int col   = l % 16;
     const int nA    = col + 16 * (rw & 1);     // input M/N index (0..31)
@@ -657,16 +672,34 @@ static void launch_kernel(
     if constexpr (R <= 2) {
         if (k_nt) {
             mqa_paged::fp8_paged_mqa_logits_kernel<NW, CK, KB, R, true, ROW_LENS>
-                <<<grid, NW * WARP_SIZE, 0, stream>>>(
-                    d_q, d_kv, d_w, d_ctx, d_bt, d_out,
-                    batch_size, next_n, max_blocks_per_seq, max_model_len, index_dim, SplitKV);
+                <<<grid, NW * WAVE_SIZE, 0, stream>>>(d_q,
+                                                      d_kv,
+                                                      d_w,
+                                                      d_ctx,
+                                                      d_bt,
+                                                      d_out,
+                                                      batch_size,
+                                                      next_n,
+                                                      max_blocks_per_seq,
+                                                      max_model_len,
+                                                      index_dim,
+                                                      SplitKV);
             return;
         }
     }
     mqa_paged::fp8_paged_mqa_logits_kernel<NW, CK, KB, R, false, ROW_LENS>
-        <<<grid, NW * WARP_SIZE, 0, stream>>>(
-            d_q, d_kv, d_w, d_ctx, d_bt, d_out,
-            batch_size, next_n, max_blocks_per_seq, max_model_len, index_dim, SplitKV);
+        <<<grid, NW * WAVE_SIZE, 0, stream>>>(d_q,
+                                              d_kv,
+                                              d_w,
+                                              d_ctx,
+                                              d_bt,
+                                              d_out,
+                                              batch_size,
+                                              next_n,
+                                              max_blocks_per_seq,
+                                              max_model_len,
+                                              index_dim,
+                                              SplitKV);
 }
 
 template <int NW, int CK, int KB, int R>
@@ -756,22 +789,30 @@ static void dispatch_fp8_paged_mqa_logits(
 }
 
 // ============================================================================
-// Torch-facing entry point
+// Entry point (aiter_tensor_t ABI, no torch dependency)
 // ============================================================================
-torch::Tensor fp8_paged_mqa_logits(
-    torch::Tensor q_fp8,            // [batch, next_n, 32, 128]
-    torch::Tensor kv_cache_fp8,     // [num_blocks, block_size, 1, index_dim]
-    torch::Tensor weights,          // [batch*next_n, 32]
-    torch::Tensor context_lens,     // [batch], or [batch, next_n] per query row
-    torch::Tensor block_tables,     // [batch, max_blocks_per_seq]
+namespace aiter {
+
+void fp8_paged_mqa_logits(
+    aiter_tensor_t& out,                // [batch*next_n, max_model_len] f32
+    const aiter_tensor_t& q_fp8,        // [batch, next_n, 32, 128]
+    const aiter_tensor_t& kv_cache_fp8, // [num_blocks, block_size, 1, index_dim]
+    const aiter_tensor_t& weights,      // [batch*next_n, 32]
+    const aiter_tensor_t& context_lens, // [batch], or [batch, next_n] per query row
+    const aiter_tensor_t& block_tables, // [batch, max_blocks_per_seq]
     int64_t max_model_len,
     int64_t ChunkK,
     int64_t SplitKV,
     int64_t num_warps,
     int64_t TotalCuCount,
-    int64_t RowsPerBlock,
-    std::optional<torch::Tensor> out
-) {
+    int64_t RowsPerBlock)
+{
+    // Called from Python: a failed AITER_CHECK raises there instead of aborting the process.
+    aiter_detail::AiterThrowGuard throw_guard;
+
+    // aiter_tensor_t::size() does not bound-check the dimension, so check the ranks first.
+    AITER_CHECK(q_fp8.dim() == 4 && kv_cache_fp8.dim() == 4 && block_tables.dim() == 2,
+                "q_fp8 and kv_cache_fp8 must be 4-D and block_tables 2-D");
     const int batch_size         = q_fp8.size(0);
     const int next_n             = q_fp8.size(1);
     const int n_heads            = q_fp8.size(2);
@@ -781,14 +822,14 @@ torch::Tensor fp8_paged_mqa_logits(
     const int max_blocks_per_seq = block_tables.size(1);
     const int total_cu_i         = static_cast<int>(TotalCuCount);
 
-    TORCH_CHECK(n_heads == NUM_HEADS && head_dim == HEAD_SIZE,
+    AITER_CHECK(n_heads == NUM_HEADS && head_dim == HEAD_SIZE,
                 "Only n_heads=32, head_dim=128 supported");
-    TORCH_CHECK(kv_cache_fp8.is_contiguous(),
+    AITER_CHECK(kv_cache_fp8.is_contiguous(),
                 "kv_cache_fp8 must be contiguous for paged MQA logits");
     const bool row_lens = context_lens.dim() == 2;
-    TORCH_CHECK(context_lens.scalar_type() == torch::kInt32 && context_lens.is_contiguous() &&
-                    context_lens.size(0) == batch_size &&
-                    (!row_lens || context_lens.size(1) == next_n) && context_lens.dim() <= 2,
+    AITER_CHECK(context_lens.dtype() == AITER_DTYPE_i32 && context_lens.is_contiguous() &&
+                    (context_lens.dim() == 1 || row_lens) && context_lens.size(0) == batch_size &&
+                    (!row_lens || context_lens.size(1) == next_n),
                 "context_lens must be a contiguous i32 [batch] or [batch, next_n] tensor");
 
     // ---- autotune ChunkK, num_warps, R, SplitKV ----
@@ -868,33 +909,40 @@ torch::Tensor fp8_paged_mqa_logits(
     const bool k_nt = num_groups == 1 && rows_per_block <= 2 && tot >= 280000;
 
     // The kernel writes only the causal window, so the -inf outside it is the
-    // caller's -- same contract as deepgemm_fp8_paged_mqa_logits. When no buffer is
-    // handed in, allocate one; those positions are then simply undefined.
-    torch::Tensor out_logits =
-        out.has_value() ? out.value()
-                        : torch::empty({batch_size * next_n,
-                                        static_cast<int64_t>(max_model_len)},
-                                       torch::dtype(torch::kFloat32).device(q_fp8.device()));
-    TORCH_CHECK(out_logits.scalar_type() == torch::kFloat32 &&
-                    out_logits.is_contiguous() &&
-                    out_logits.size(0) == batch_size * next_n &&
-                    out_logits.size(1) == max_model_len,
+    // caller's -- same contract as deepgemm_fp8_paged_mqa_logits. When the caller
+    // hands in no buffer, the Python wrapper allocates one; those positions are then
+    // simply undefined.
+    AITER_CHECK(out.dtype() == AITER_DTYPE_fp32 && out.is_contiguous() && out.dim() == 2 &&
+                    out.size(0) == (int64_t)batch_size * next_n && out.size(1) == max_model_len,
                 "out must be a contiguous f32 [batch*next_n, max_model_len] tensor");
+    AITER_CHECK(out.is_gpu() && q_fp8.device_id == out.device_id &&
+                    kv_cache_fp8.device_id == out.device_id && weights.device_id == out.device_id &&
+                    context_lens.device_id == out.device_id &&
+                    block_tables.device_id == out.device_id,
+                "all tensors must be on the same GPU");
 
-    const at::hip::OptionalHIPGuardMasqueradingAsCUDA guard(device_of(out_logits));
-    const hipStream_t stream = at::hip::getCurrentHIPStreamMasqueradingAsCUDA();
+    const HipDeviceGuard guard(out.device_id);
+    const hipStream_t stream = aiter::getCurrentHIPStream();
 
-    dispatch_fp8_paged_mqa_logits(
-        static_cast<fp8*>(q_fp8.data_ptr()),
-        static_cast<fp8*>(kv_cache_fp8.data_ptr()),
-        static_cast<float*>(weights.data_ptr()),
-        static_cast<int*>(context_lens.data_ptr()),
-        static_cast<int*>(block_tables.data_ptr()),
-        out_logits.data_ptr<float>(),
-        batch_size, next_n, max_blocks_per_seq,
-        static_cast<int>(max_model_len), index_dim,
-        chunk_k_i, split_kv_i,
-        num_warps_i, kv_block_size, rows_per_block, k_nt, row_lens, stream);
-
-    return out_logits;
+    dispatch_fp8_paged_mqa_logits(static_cast<const fp8*>(q_fp8.data_ptr()),
+                                  static_cast<const fp8*>(kv_cache_fp8.data_ptr()),
+                                  static_cast<const float*>(weights.data_ptr()),
+                                  static_cast<const int*>(context_lens.data_ptr()),
+                                  static_cast<const int*>(block_tables.data_ptr()),
+                                  static_cast<float*>(out.data_ptr()),
+                                  batch_size,
+                                  next_n,
+                                  max_blocks_per_seq,
+                                  static_cast<int>(max_model_len),
+                                  index_dim,
+                                  chunk_k_i,
+                                  split_kv_i,
+                                  num_warps_i,
+                                  kv_block_size,
+                                  rows_per_block,
+                                  k_nt,
+                                  row_lens,
+                                  stream);
 }
+
+} // namespace aiter

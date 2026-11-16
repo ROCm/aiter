@@ -2227,6 +2227,7 @@
         "flags_extra_hip": ["'-fno-honor-nans'"],
         "extra_ldflags": "None",
         "extra_include": [],
-        "verbose": "False"
+        "verbose": "False",
+        "torch_exclude": "True"
     }
 }
