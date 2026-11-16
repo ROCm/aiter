@@ -2361,6 +2361,12 @@ def score_prefill_flydsl(
     `[pages, 128, 4]` (uint8 or float8_e8m0fnu; see `_validate_cache`), and `idx_q`
     may also be e4m3.
 
+    With `nvfp4` (`"e4m3"` or `"exact"`; `score_prefill_flydsl_nvfp4`'s `k_round`) the
+    cache is NVFP4 instead: `cache` the e2m1 `[pages, 128, 64]` uint8 view, `k_scale`
+    the e4m3 `[pages, 128, 8]` uint8 view, one scale per 16 elements. `"e4m3"` scores K
+    rounded to e4m3 on the fp8 MFMA, `"exact"` scores K = e2m1 * scale unrounded on the
+    f16 MFMA.
+
     Shapes, dtypes, strides and the launch bounds are checked here. The ragged
     arrays' CONTENTS are a caller contract, as they are for the decode scorer:
     `cu_seqlens_q` is non-decreasing and ends at `idx_q.shape[0]`, every
