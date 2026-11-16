@@ -8,19 +8,16 @@ import types
 import flydsl.compiler as flyc
 import flydsl.expr as fx
 from flydsl.expr import const_expr, gpu, range_constexpr, rocdl
-from flydsl.expr.typing import Int8, T
+from flydsl.expr.typing import Int8, Int32, T
 
 from aiter.jit.utils.chip_info import get_cu_num
 
 from .mxfp4_gemm_common import _udiv
 from .mxmoe_gemm_v2 import (
-    es_default_peel,
     gemm2_body_v2,
     global_typed_ptr,
     issue_a_load_lds_dt,
     kStages,
-    load_es_einfo,
-    make_es_state,
 )
 from .tensor_shim import _run_compiled as run_compiled
 
@@ -149,9 +146,9 @@ def compile_gemm2_a4w4_port(
 ):
     """Compile gemm2 a4w4 down-proj; epilog 'atomic' (weighted atomic-fadd) or 'reduce' (store into out[token_id*topk+slot]). INTER_MAX must equal the runtime inter_dim (unrolled K-loop); SBM None -> SBM==BM byte-identical.
 
-    g2_es=(num_experts, peel): persist-es, expert-stationary panels (gemm2_body_v2 es):
-    fp4 or weighted bf16 route rows, BM=32, BN=BK=256, inter_dim 512, HIDDEN_MAX the exact model_dim;
-    arg_out_scale carries the sort's expert table."""
+    g2_es=num_experts: persist-es, a fixed grid (i32_grid_blocks: as many workgroups per CU
+    as fit) over (expert x BN) panels of the sort's expert table (passed as arg_out_scale);
+    a panel's W2 stays in registers across its row chunks."""
     SBM = _norm_sbm(SBM, BM)
     if BM not in (16, 32, 64, 128) or epilog not in ("atomic", "reduce", "scatter"):
         raise AssertionError(
@@ -254,29 +251,6 @@ def compile_gemm2_a4w4_port(
         aStages = 3 if (not g2_bf16_lds or 3 * slot_bytes <= c_lds_bytes) else 2
     a_slot_alias = aStages <= kStages
     lds_bytes = max(c_lds_bytes, aStages * slot_bytes)
-    if g2_es is not None:
-        es_bf16 = use_reduce and out_dtype == "bf16"
-        if not (
-            (route_out_fp4 or es_bf16)
-            and not is_f8
-            and b_dtype == "fp4"
-            and (BM, BN, BK, INTER_MAX) == (32, 256, 256, 512)
-            and not enable_bias
-            and cu_num > 0
-            and _composition is None
-        ):
-            raise AssertionError(
-                "g2_es needs a4w4 fp4 or bf16 route rows, BM=32, BN=BK=256, "
-                "inter_dim 512, no bias and cu_num>0"
-            )
-        # Two A chunks (K-tile slots, then their e8m0 words, route ids and, for bf16,
-        # route weights) and two staged route-row chunks (packed values then e8m0, or
-        # bf16 rows padded by 16 bytes).
-        lds_bytes = 2 * (BM * INTER_MAX // 2 + BM * INTER_MAX // 32 + BM * 4)
-        if es_bf16:
-            lds_bytes += 2 * (BM * 4 + BM * (BN * 2 + 16))
-        else:
-            lds_bytes += 2 * (BM * BN // 2 + BM * BN // 32)
     K_TILES_RT_MAX = INTER_MAX // BK
     g2_apre = aStages >= K_TILES_RT_MAX
     a_preload = min(aStages, K_TILES_RT_MAX) if g2_apre else kStages
@@ -329,7 +303,17 @@ def compile_gemm2_a4w4_port(
             "Use persist only with a_dtype='fp4', or run a8w4 with persist=False."
         )
     if g2_es is not None:
-        persist_tag = f"_pes_cu{cu_num}_ne{g2_es[0]}_p{g2_es[1][0]}"
+        if not (
+            use_reduce
+            and not is_f8
+            and b_dtype == "fp4"
+            and cu_num > 0
+            and INTER_MAX // BK <= 2
+        ):
+            raise AssertionError(
+                "g2_es needs a4w4 epilog='reduce', cu_num>0 and INTER_MAX <= 2 * BK"
+            )
+        persist_tag = f"_pes_cu{cu_num}_ne{g2_es}"
     elif persist_flat:
         persist_tag = f"_pflat_cu{cu_num}"
     elif persist:
@@ -411,7 +395,7 @@ def compile_gemm2_a4w4_port(
         mn_idx=None,
         resolved_input_rows=(),
     ):
-        if const_expr(use_scatter or g2_es is not None):
+        if const_expr(use_scatter):
             i32_inter = fx.Int32(INTER_MAX)
             i32_hidden = fx.Int32(HIDDEN_MAX)
         num_n_blocks = _udiv(i32_hidden, BN)
@@ -509,31 +493,45 @@ def compile_gemm2_a4w4_port(
             rocdl.sched_barrier(0)
             run_unit(fx.Int32(0), mn_idx=mn_idx)
         elif const_expr(g2_es is not None):
-            # persist-es: 2 WGs per CU over (expert x BN) panels in the order of the sort's
-            # expert table (arg_out_scale); register state carries from panel to panel.
-            n_wg = 2 * cu_num
-            num_experts = g2_es[0]
+            # persist-es: a fixed grid over (expert x BN) panels in the order of the sort's
+            # expert table (arg_out_scale: [first sorted row, rows, expert, 0] per expert,
+            # then [experts with rows, 0, 0, 0]). Each BM-row chunk of a panel is a v2 tile;
+            # its first chunk loads the panel's W2 and the rest reuse it.
             einfo = global_typed_ptr(arg_out_scale, T.i32)
-            n_act = rocdl.readfirstlane(T.i32, einfo[num_experts * 4])
-            n_panels = fx.Int32(n_act) * num_n_blocks
-            gl = (bx_i32 % 8) * (n_wg // 8) + bx_i32 // 8
-            npan = (gl < n_panels).select((n_panels - 1 - gl) // n_wg + 1, fx.Int32(0))
-            state = make_es_state(BN, BK, INTER_MAX)
-            for p, dst in ((gl, state.ein), (gl + n_wg, state.ein_n)):
-                load_es_einfo(
-                    arg_out_scale, num_experts, p, n_panels, num_n_blocks, dst
-                )
-            for j in range(fx.Int32(0), npan, fx.Int32(1)):
-                es = types.SimpleNamespace(
-                    state=state,
-                    p=gl + fx.Int32(j) * n_wg,
-                    j=fx.Int32(j),
-                    n_wg=n_wg,
-                    n_panels=n_panels,
-                    num_experts=num_experts,
-                    peel=g2_es[1],
-                )
-                run_unit(bx_i32, es=es)
+            n_act = fx.Int32(rocdl.readfirstlane(T.i32, einfo[g2_es * 4]))
+            # gemm2_body_v2's B double buffer (fragments, scale slots), kept across a
+            # panel's chunks: K <= 2 tiles, so it holds the panel's whole W2.
+            n_acc, k_halves = BN // 64, BK // 128
+            bq = [
+                [
+                    [fx.make_rmem_tensor(4, Int32) for _ in range_constexpr(k_halves)]
+                    for _ in range_constexpr(n_acc)
+                ]
+                for _ in range_constexpr(2)
+            ]
+            bs = [
+                [fx.make_rmem_tensor(1, Int32) for _ in range_constexpr(n_acc // 2)]
+                for _ in range_constexpr(2)
+            ]
+            # A workgroup's XCD (bx % 8) neighbours take consecutive panels.
+            n_wg = fx.Int32(gpu.grid_dim.x)
+            p0 = (bx_i32 % 8) * _udiv(n_wg, 8) + bx_i32 // 8
+            for p in range(p0, n_act * num_n_blocks, gpu.grid_dim.x):
+                row = _udiv(fx.Int32(p), num_n_blocks)
+                base = fx.Int32(rocdl.readfirstlane(T.i32, einfo[row * 4]))
+                rows = fx.Int32(rocdl.readfirstlane(T.i32, einfo[row * 4 + 1]))
+                n_block = fx.Int32(p) - row * num_n_blocks
+                for c in range(fx.Int32(0), (rows + BM - 1) // BM, fx.Int32(1)):
+                    m_block = _udiv(base, BM) + fx.Int32(c)
+                    gpu.barrier()  # the last chunk's epilogue LDS reads before A lands
+                    issue_all_a_loads(m_block * fx.Int32(BM))
+                    rocdl.sched_barrier(0)
+                    es = types.SimpleNamespace(
+                        bq=bq,
+                        bs=bs,
+                        load_w2=fx.Int32(c) == fx.Int32(0),
+                    )
+                    run_unit(fx.Int32(0), mn_idx=(m_block, n_block), es=es)
         elif const_expr(persist_flat):
             cumsum0 = global_typed_ptr(arg_cumsum, T.i32)[0]
             bound = _udiv(cumsum0, BM) * num_n_blocks
@@ -737,7 +735,7 @@ def compile_gemm2_a4w4_port(
         # i32_max_m_blocks sizes buffer resources; i32_grid_blocks bounds the launch to real m-blocks.
         num_n_blocks = fx.Int32(fx.Uint32(i32_hidden) // fx.Uint32(BN))
         if const_expr(g2_es is not None):
-            grid_x = fx.Int32(2 * cu_num)
+            grid_x = i32_grid_blocks
         elif const_expr(persist_flat):
             total_work = i32_max_m_blocks * num_n_blocks
             grid_x = (total_work > fx.Int32(4 * cu_num)).select(
@@ -765,14 +763,9 @@ def compile_gemm2_a4w4_port(
         ).launch(grid=(grid_x, 1, 1), block=(256, 1, 1), stream=stream)
 
     if g2_es is not None:
-        # The panel's W2 and the next one's take 136 VGPRs: 2 WGs per CU.
-        launch_gemm2.compile_hints = {
-            "waves_per_eu": 2,
-            "llvm_options": {
-                "amdgpu-kernarg-preload": True,
-                "amdgpu-kernarg-preload-count": 16,
-            },
-        }
+        # No spills (<= 256 VGPRs); the launch fits as many workgroups per CU as the
+        # registers allow (mxfp4_moe_gemm2).
+        launch_gemm2.compile_hints = {"waves_per_eu": 2}
     return launch_gemm2
 
 
@@ -981,22 +974,15 @@ def mxfp4_moe_gemm2(
         os.environ.get("AITER_MXFP4_G2_ES", "0") == "1"
         and expert_info is not None
         and epilog == "reduce"
-        and str(out_dtype).strip().lower() in ("fp4", "bf16")
         and a_dtype == b_dtype == "fp4"
         and bias is None
         and not is_ep
         and D_INTER == 512
-        and D_HIDDEN % 256 == 0
         and SBM % 32 == 0
-        # bf16 route rows: byte offsets of [tokens * topk, D_HIDDEN] stay in an i32.
-        and (
-            str(out_dtype).strip().lower() == "fp4"
-            or M_logical * topk * D_HIDDEN * 2 < 2**31
-        )
     ):
-        # persist-es: the sort's expert table (fused_moe._moe_sorting_impl) goes in out_scale.
-        g2_es = (NE, es_default_peel(M_logical * topk / max(1, NE)))
-        persist, HIDDEN_MAX, out_scale = True, D_HIDDEN, expert_info
+        # persist-es over the sort's expert table (fused_moe._moe_sorting_impl).
+        g2_es, persist, out_scale = NE, True, expert_info
+        # W2 streams once per panel: nontemporal.
         BM, BN, BK, use_nt = 32, 256, 256, True
         if cu_num <= 0:
             cu_num = get_cu_num()
@@ -1039,7 +1025,11 @@ def mxfp4_moe_gemm2(
         g2_es=g2_es,
     )
     max_m_blocks = (max_sorted + BM - 1) // BM
-    if persist:
+    if g2_es is not None:
+        # Resident workgroups per CU, known once the kernel is compiled (2 fit by its
+        # waves_per_eu); the persistent loop strides by the grid.
+        grid_blocks = getattr(launch, "es_wg_per_cu", 2) * cu_num
+    elif persist:
         # Fixed grid: cu_num m-slots; each block loops over its m-tiles.
         grid_blocks = cu_num
     elif n_sorted_padded is not None:
@@ -1071,4 +1061,6 @@ def mxfp4_moe_gemm2(
         out_scale.data_ptr(),
         torch.cuda.current_stream() if stream is None else stream,
     )
+    if g2_es is not None and not hasattr(launch, "es_wg_per_cu"):
+        launch.es_wg_per_cu = launch._cf.max_blocks_per_cu()
     return out
