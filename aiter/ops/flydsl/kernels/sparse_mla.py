@@ -114,6 +114,14 @@ def _exp2(x):
     return fx.Float32(fx.rocdl.exp2(fx.Float32.ir_type, x.ir_value()))
 
 
+def _merge_alpha(m, mn):
+    """Rescale for running sums whose max moves from m to mn (natural log).
+
+    Equal maxima keep the sums: a +inf sink would otherwise give inf - inf.
+    """
+    return (m == mn).select(fx.Float32(1.0), _exp2((m - mn) * LOG2E))
+
+
 def _to_bf16(v):
     bits = v.bitcast(fx.Uint32) + fx.Uint32(0x00008000)
     return (bits >> fx.Uint32(16)).to(fx.Uint16).bitcast(fx.BFloat16)
@@ -737,14 +745,17 @@ def compile_sparse_mla_fwd(
             if moved != fx.Int64(0):
                 m_h = _head_max(m_w, head_xor)
                 m_n = (m_h > m_i).select(m_h, m_i)
-                alpha = (m_n == neg_inf).select(zero_f, _exp2((m_i - m_n) * qk_scale))
+                alpha = (m_n == neg_inf).select(
+                    zero_f, _exp2(fx.fma(m_i, qk_scale, -(m_n * qk_scale)))
+                )
                 acc = _rescale_all(acc, alpha)
             if const_expr(hooks[2] is not None):
                 hooks[2]()
             empty = m_n == neg_inf
+            neg_m = -(m_n * qk_scale)
             p_t = []
             for i in range_constexpr(4):
-                p = empty.select(zero_f, _exp2((scores[i] - m_n) * qk_scale))
+                p = empty.select(zero_f, _exp2(scores[i] * qk_scale + neg_m))
                 p_t.append(live.select(p, zero_f))
             l_i = l_i * alpha + ((p_t[0] + p_t[1]) + (p_t[2] + p_t[3]))
             p_b = fx.Vector.from_elements([_to_bf16(p) for p in p_t], fx.BFloat16)
@@ -1030,8 +1041,7 @@ def compile_sparse_mla_combine(splits, has_sink):
             ms = fx.Float32(stats[t, s, head, 0])
             ls = fx.Float32(stats[t, s, head, 1])
             mn = (ms > m).select(ms, m)
-            empty = mn == fx.Float32(float("-inf"))
-            alpha = empty.select(fx.Float32(0.0), _exp2((m - mn) * LOG2E))
+            alpha = _merge_alpha(m, mn)
             beta = (ls > 0).select(_exp2((ms - mn) * LOG2E), fx.Float32(0.0))
             v = fx.Vector(part[t, s, tid // 2, head, tid % 2, None].load())
             a0 = a0 * alpha + v[0] * beta
@@ -1084,8 +1094,7 @@ def compile_sparse_mla_combine(splits, has_sink):
                 fx.Float32(stats[t, safe, head, 0]), fx.Float32(float("-inf"))
             )
             mn = (ms > m).select(ms, m)
-            empty = mn == fx.Float32(float("-inf"))
-            alpha = empty.select(fx.Float32(0.0), _exp2((m - mn) * LOG2E))
+            alpha = _merge_alpha(m, mn)
             beta = (ls > 0).select(_exp2((ms - mn) * LOG2E), fx.Float32(0.0))
             v = fx.Float32(part[t, safe, db, head, dim])
             acc = acc * alpha + v * beta
@@ -1116,8 +1125,7 @@ def compile_sparse_mla_combine(splits, has_sink):
                 ms = fx.Float32(shared[0, w, lane])
                 ls = fx.Float32(shared[1, w, lane])
                 mn = (ms > m).select(ms, m)
-                empty = mn == fx.Float32(float("-inf"))
-                alpha = empty.select(fx.Float32(0.0), _exp2((m - mn) * LOG2E))
+                alpha = _merge_alpha(m, mn)
                 beta = (ls > 0).select(_exp2((ms - mn) * LOG2E), fx.Float32(0.0))
                 acc = acc * alpha + fx.Float32(shared[2, w, lane]) * beta
                 l = l * alpha + ls * beta

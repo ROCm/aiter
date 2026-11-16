@@ -19,8 +19,10 @@ Suites:
                is NaN so a -1 slot that reads memory fails, and the output sits
                between guard rows that must stay untouched.
   stress       sharp logits, values near 2^100 and duplicate slots stay finite.
-  scale        FP32 scale edges, including subnormals and the largest legal scale.
-  empty_rows   rows with no valid slot write zeros for every split count.
+  scale        FP32 scale edges, including subnormals and the largest legal
+               scale; logits of +-2^127 under scale 2^-127 do not overflow.
+  empty_rows   rows with no valid slot write zeros for every split count, with
+               no sink and with -inf, finite and +inf sinks.
   empty_allocation
                zero-length index tensors write zeros.
   graph        graph replay with indptr rewritten in place and a poisoned
@@ -391,8 +393,27 @@ def test_scale_edge(softmax_scale, has_sink):
 
 
 @benchmark()
-def test_empty_rows(num_splits, has_sink):
-    """Empty splits and an empty row whose -1 slots would read a NaN row."""
+def test_scale_range(case, num_splits):
+    """Unscaled logits of +-2^127 under scale 2^-127 are logits of +-1. Neither
+    the softmax nor the rescale of an earlier tile may overflow FP32 first:
+    ``rescale`` moves the row max in its second 16-key tile."""
+    q = torch.zeros((1, H, D), dtype=dtypes.bf16)
+    q[..., 0] = 2.0**64
+    kv = torch.zeros((2, D), dtype=dtypes.bf16)
+    kv[0, :2] = torch.tensor([2.0**63, 1.0])
+    kv[1, :2] = torch.tensor([-(2.0**63), -1.0])
+    rows = [0, 1] if case == "one_tile" else [1] * 16 + [0]
+    rows = torch.tensor([rows], dtype=dtypes.i32)
+    scale = 2.0**-127
+    out = flydsl_sparse_mla_fwd(q, kv, rows, softmax_scale=scale, num_splits=num_splits)
+    ref = run_torch(q, kv, rows, None, scale)
+    return {"err": check_output(ref, out, f"scale range {case}")}
+
+
+@benchmark()
+def test_empty_rows(num_splits, sink):
+    """Empty splits and an empty row whose -1 slots would read a NaN row. A +inf
+    sink takes all the mass, so every row is zero on every combine path."""
     torch.manual_seed(61)
     q = torch.randn((3, H, D), dtype=dtypes.bf16)
     kv = torch.randn((64, D), dtype=dtypes.bf16)
@@ -400,7 +421,7 @@ def test_empty_rows(num_splits, has_sink):
     rows = torch.full((3, 33), -1, dtype=dtypes.i32)
     rows[1, 0] = 3
     rows[2, :17] = torch.arange(1, 18, dtype=dtypes.i32)
-    sink = torch.full((H,), 12.0) if has_sink else None
+    sink = None if sink is None else torch.full((H,), sink)
     out = flydsl_sparse_mla_fwd(q, kv, rows, attn_sink=sink, num_splits=num_splits)
     assert torch.count_nonzero(out[0]) == 0, "empty row must be zero"
     return {"err": check_output(run_torch(q, kv, rows, sink), out, "empty rows")}
@@ -866,10 +887,15 @@ def suites(args):
         for scale, has_sink in itertools.product(
             (2.0**-149, 2.0**-126, 0.037, 2.3586574359122396e38), (False, True)
         )
+    ] + [
+        (test_scale_range, {"case": case, "num_splits": splits})
+        for case, splits in itertools.product(("one_tile", "rescale"), (1, 2))
     ]
     yield "empty_rows", [
-        (test_empty_rows, {"num_splits": splits, "has_sink": has_sink})
-        for splits, has_sink in itertools.product((1, 5, 32, 128), (False, True))
+        (test_empty_rows, {"num_splits": splits, "sink": sink})
+        for splits, sink in itertools.product(
+            (1, 5, 32, 128), (None, -math.inf, 12.0, math.inf)
+        )
     ]
     yield "empty_allocation", [
         (test_empty_allocation, {"layout": layout, "num_splits": splits})

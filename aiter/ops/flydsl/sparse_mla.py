@@ -187,7 +187,8 @@ def flydsl_sparse_mla_fwd(
     contiguous int32 dense [T,K], or flat CSR with int32 indptr [T+1].
     Dense topk_length [T] limits each row before -1 masking. CSR lengths can
     be zero; -1 is ignored in either format. Empty rows return zero, with
-    or without a sink. Valid nonnegative slots must be inside the KV pool.
+    or without a sink, and a +inf sink entry zeroes its head. Valid
+    nonnegative slots must be inside the KV pool.
 
     Metadata values must be valid: monotone CSR within the index allocation,
     and 0 <= topk_length <= K. Values are not read on the host. max_seqlen
