@@ -8,6 +8,8 @@ For A4W4, the matched tuned CSV row's ``a_preshuffle`` field selects packed
 (M/16, K/128, 4, 16, 16-byte) A for both grouped GEMMs. The field defaults to
 zero and follows the same token-bucket lookup as the other kernel parameters.
 Set AITER_GROUPED_A4W4_A_PRESHUFFLE=1/0 to override the CSV selection.
+AITER_TDM_TILE_M=288 also enables packed A for A4W4 unless the preshuffle
+override is explicitly set.
 Set AITER_FLYDSL_DISABLE_GEMM1_ACT=1 to move gate/up activation out of GEMM1
 into the separate quant/preshuffle kernel (also disables GEMM1 requantization).
 """
@@ -1756,6 +1758,9 @@ def grouped_gemm_gfx1250_a8w4(
                 _tdm_kw["a_preshuffle"] = _ov_apre
 
         _ov_m = _tdm_env("AITER_TDM_TILE_M")
+        # The tuned M256/M288 A4W4 prefill paths use packed A.
+        if is_grouped_a4w4 and _ov_m in (256, 288) and _ov_apre is None:
+            _tdm_kw["a_preshuffle"] = 1
         _ov_n = _tdm_env("AITER_TDM_TILE_N")
         _ov_k = _tdm_env("AITER_TDM_TILE_K")
         _ov_nb = _tdm_env("AITER_TDM_NUM_BUFFERS")

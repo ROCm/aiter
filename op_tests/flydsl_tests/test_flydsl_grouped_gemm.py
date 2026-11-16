@@ -29,7 +29,7 @@ import csv
 import math
 import os
 import sys
-from contextlib import nullcontext
+from contextlib import contextmanager, nullcontext
 
 import pytest
 import torch
@@ -346,6 +346,36 @@ def _gguu_to_gugu_rows(t: torch.Tensor) -> torch.Tensor:
 # ---------------------------------------------------------------------------
 # Core runner: build inputs, invoke fused_moe, optionally compare to ref
 # ---------------------------------------------------------------------------
+@contextmanager
+def _capture_grouped_launches(launches: list, *, metadata_only: bool = False):
+    """Retain the existing per-stage callables without changing GPU launches."""
+    from aiter.ops.flydsl import grouped_moe_gfx1250 as grouped
+
+    class Collector:
+        def append(self, entry):
+            name, call = entry
+            if metadata_only:
+                if name not in ("gemm1", "gemm2"):
+                    return
+                # Graph timing invokes MoE repeatedly. Keep only the scalar
+                # configuration and small psum, not full intermediate tensors
+                # whose retained lifetimes would change memory profiling.
+                entry = (name, _grouped_launch_metadata(call))
+            for index, (previous_name, _) in enumerate(launches):
+                if previous_name == name:
+                    launches[index] = entry
+                    break
+            else:
+                launches.append(entry)
+
+    previous = grouped.kernel_bench_callable
+    grouped.kernel_bench_callable = Collector()
+    try:
+        yield
+    finally:
+        grouped.kernel_bench_callable = previous
+
+
 def _run_grouped_via_fused_moe(
     *,
     experts: int,
@@ -369,6 +399,7 @@ def _run_grouped_via_fused_moe(
     data_init: str = "uniform",
     scale_init: str = "auto",
     num_valid_tokens: int | None = None,
+    work_metrics: dict | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, float | None, dict | None]:
     """Build mxfp4 weights + routing, dispatch through ``fused_moe``.
 
@@ -523,22 +554,18 @@ def _run_grouped_via_fused_moe(
 
     torch.cuda.synchronize()
     kernel_us = None
+    captured_launches: list = []
     if kernel_bench:
         # Kernel-bench: time gemm1 and gemm2 in isolation. One eager call
         # populates the per-stage launch callables (and yields a correct ``out`` to
         # verify); then loop each kernel alone. ``us`` (end-to-end) stays None.
-        from aiter.ops.flydsl import grouped_moe_gfx1250 as _grouped
         from aiter.test_common import run_perftest
 
-        kernel_bench_callable: list = []
-        _grouped.kernel_bench_callable = kernel_bench_callable
-        try:
+        with _capture_grouped_launches(captured_launches):
             out = _call()
-        finally:
-            _grouped.kernel_bench_callable = None
         us = None
         kernel_us = {}
-        for _name, callable in kernel_bench_callable:
+        for _name, callable in captured_launches:
             _, _us = run_perftest(
                 callable,
                 num_warmup=warmup,
@@ -551,13 +578,30 @@ def _run_grouped_via_fused_moe(
         # data is the graph-captured output.
         from aiter.test_common import run_perftest
 
-        out, us = run_perftest(
-            _call, num_warmup=warmup, num_iters=iters, testGraph=True
+        capture = (
+            _capture_grouped_launches(captured_launches, metadata_only=True)
+            if work_metrics is not None else nullcontext()
         )
+        with capture:
+            out, us = run_perftest(
+                _call, num_warmup=warmup, num_iters=iters, testGraph=True
+            )
     else:
         # Verify: validate the eager (graph-off) path; no timing.
-        out = _call()
+        capture = (
+            _capture_grouped_launches(captured_launches, metadata_only=True)
+            if work_metrics is not None else nullcontext()
+        )
+        with capture:
+            out = _call()
         us = None
+
+    if work_metrics is not None:
+        # Histogram, device readback and accounting happen after every timer.
+        # Use the real topk_ids and the actual captured stage configurations,
+        # not a regenerated route distribution or a second CSV lookup.
+        work_metrics.update(_gemm_work_metrics(
+            experts=experts, topk_ids=topk_id, launches=captured_launches))
 
     # Reference always uses GGUU logical inputs (layouts are numerically
     # equivalent; only physical packing differs).
@@ -601,61 +645,77 @@ def _logits_diff(actual: torch.Tensor, expected: torch.Tensor) -> float:
     return float(((x - y) ** 2).sum() / denom)
 
 
-def _gemm_work_metrics(
-    *,
-    experts: int,
-    tokens: int,
-    topk: int,
-    model_dim: int,
-    inter_dim: int,
-    data_format: str,
-) -> dict[str, tuple[float, float]]:
-    """Return conventional GEMM FLOPs and effective fused-MoE bytes.
+def _grouped_launch_metadata(call) -> dict:
+    """Retain launch geometry and prefix bounds, without large buffer references."""
+    from op_tests.flydsl_tests.grouped_moe_work_metrics import GemmGeometry
 
-    The byte model matches the grouped-MoE tuner: logical quantized inputs and
-    weights, their E8M0 block scales, and BF16 outputs. GEMM1 counts the
-    post-activation output, whose width is ``inter_dim``; GEMM2 counts its
-    per-route output before gather-reduce. The model excludes routing,
-    quantization, bias, and other fused-MoE auxiliary traffic, so the reported
-    bandwidth is effective bandwidth rather than measured HBM traffic.
-    """
-    input_bytes = 0.5 if data_format == "a4w4" else 1.0
-    weight_bytes = 0.5
-    output_bytes = 2.0
-    stage1_n = 2 * inter_dim
-    routed_rows = tokens * topk
-
-    gemm1_flops = routed_rows * stage1_n * model_dim * 2
-    gemm1_bytes = (
-        routed_rows * model_dim * input_bytes
-        + routed_rows * model_dim // SCALE_BLOCK
-        + routed_rows * inter_dim * output_bytes
-        + experts * model_dim * stage1_n * weight_bytes
-        + experts * model_dim * stage1_n // SCALE_BLOCK
-    )
-    gemm2_flops = tokens * topk * model_dim * inter_dim * 2
-    gemm2_bytes = (
-        tokens * topk * inter_dim * input_bytes
-        + routed_rows * inter_dim // SCALE_BLOCK
-        + routed_rows * model_dim * output_bytes
-        + experts * inter_dim * model_dim * weight_bytes
-        + experts * inter_dim * model_dim // SCALE_BLOCK
-    )
+    kw = call.keywords
     return {
-        "gemm1": (gemm1_flops, gemm1_bytes),
-        "gemm2": (gemm2_flops, gemm2_bytes),
-        "total": (gemm1_flops + gemm2_flops, gemm1_bytes + gemm2_bytes),
+        "experts": int(kw["n_experts"]),
+        "capacity_rows": int(kw["contiguous_m"]),
+        "expert_ends": call.args[5],
+        "geometry": GemmGeometry(
+            n=int(kw["N"]), k=int(kw["K"]),
+            tile_m=int(kw["tile_m"]), tile_n=int(kw["tile_n"]),
+            tile_k=int(kw["tile_k"]), m_warp=int(kw["m_warp"]),
+            n_warp=int(kw["n_warp"]), a_is_fp4=bool(kw["a_is_fp4"]),
+            a_preshuffled=bool(kw["a_preshuffled"]),
+            stage1_act=bool(kw["stage1_act"]),
+            stage1_quant_out=bool(kw.get("stage1_quant_out", 0)),
+            output_element_bytes=call.args[0].element_size(),
+        ),
     }
 
 
+def _gemm_work_metrics(
+    *,
+    experts: int,
+    topk_ids: torch.Tensor,
+    launches: list,
+) -> dict:
+    """Count the actual expert routes, then derive tile work and unique bytes.
+
+    torch.bincount runs on the input device, outside the timed region. Only
+    the small histogram and psum are copied to the CPU. Dropped expert IDs
+    do not acquire rows. The pure mathematical byte model excludes repeated
+    WGP reads, routing, standalone quantization, bias and gather traffic.
+    """
+    from op_tests.flydsl_tests.grouped_moe_work_metrics import (
+        grouped_moe_work_metrics,
+    )
+
+    stages = {
+        name: call if isinstance(call, dict) else _grouped_launch_metadata(call)
+        for name, call in launches if name in ("gemm1", "gemm2")
+    }
+    if set(stages) != {"gemm1", "gemm2"}:
+        raise ValueError("both grouped GEMM launches are required for tile work accounting")
+    if any(stage["experts"] != experts for stage in stages.values()):
+        raise ValueError("captured GEMM expert count differs from the route histogram")
+    ids = topk_ids.reshape(-1)
+    ids = ids[(ids >= 0) & (ids < experts)].to(torch.int64)
+    route_counts = torch.bincount(ids, minlength=experts).cpu().tolist()
+
+    ends1 = stages["gemm1"]["expert_ends"].detach().cpu().reshape(-1).tolist()
+    ends2 = stages["gemm2"]["expert_ends"].detach().cpu().reshape(-1).tolist()
+    if ends1 != ends2:
+        raise ValueError("GEMM1 and GEMM2 do not share the same expert psum")
+    capacity = stages["gemm1"]["capacity_rows"]
+    if capacity != stages["gemm2"]["capacity_rows"]:
+        raise ValueError("GEMM1 and GEMM2 do not share the same grouped row capacity")
+    return grouped_moe_work_metrics(
+        route_counts, stages["gemm1"]["geometry"], stages["gemm2"]["geometry"],
+        expert_ends=ends1, capacity_rows=capacity,
+    )
+
+
 def _rates(
-    work: tuple[float, float], us: float | None
+    work: dict, us: float | None
 ) -> tuple[float | None, float | None]:
-    """Convert a (FLOPs, bytes) work estimate and microseconds to rates."""
+    """Convert tiled WMMA FLOPs and unique buffer bytes to effective rates."""
     if us is None or not math.isfinite(us) or us <= 0:
         return None, None
-    flops, data_bytes = work
-    return flops / us / 1e6, data_bytes / us / 1e3
+    return work["flops"] / us / 1e6, work["bytes"] / us / 1e3
 
 
 # ---------------------------------------------------------------------------
@@ -704,6 +764,7 @@ def run_moe(
     tag = f"{data_format} {act}"
 
     # --- grouped FlyDSL vs PyTorch fp32 ref (graph path if bench, else eager) ---
+    work = {} if bench or kernel_bench else None
     run_only = run_only_env() if check_aot_cache else nullcontext()
     with run_only:
         out, ref, us, kernel_us = _run_grouped_via_fused_moe(
@@ -727,6 +788,7 @@ def run_moe(
             iters=iters,
             data_init=data_init,
             scale_init=scale_init,
+            work_metrics=work,
         )
     mode = "kernel" if kernel_bench else ("graph" if bench else "eager")
     ld = _logits_diff(out, ref)
@@ -748,29 +810,37 @@ def run_moe(
         "grouped_norm": float(out.float().norm()),
         "ref_norm": float(ref.float().norm()),
     }
+    if work is not None:
+        metrics["work"] = work
+        print(f"[route-counts {tag}] expert_tokens={work['expert_route_counts']}", flush=True)
+        for name in ("gemm1", "gemm2"):
+            stage = work[name]
+            transfers = ", ".join(f"{key}={value}" for key, value in stage["transfers"].items())
+            print(
+                f"[work {tag}] {name}: tile={stage['tile']}, "
+                f"route_rows={stage['route_rows']}, compute_rows={stage['compute_rows']}, "
+                f"WMMA_instructions={stage['wmma_instructions']}, "
+                f"Bytes={stage['bytes']} ({transfers}; unique buffer bytes)",
+                flush=True,
+            )
+            metrics[f"{name}_bytes"] = stage["bytes"]
+            metrics[f"{name}_wmma_instructions"] = stage["wmma_instructions"]
 
     # --- perf (bench only): timed end-to-end inside _run_grouped_via_fused_moe ---
     if bench:
-        work = _gemm_work_metrics(
-            experts=experts,
-            tokens=tokens,
-            topk=topk,
-            model_dim=model_dim,
-            inter_dim=inter_dim,
-            data_format=data_format,
-        )
         tflops, bandwidth = _rates(work["total"], us)
         if tflops is None:
             logger.warning("[bench %s] timing unavailable: %r us", tag, us)
             us = tflops = bandwidth = float("nan")
         print(
             f"[bench {tag}] fused_moe end-to-end us = {us:.2f}, "
-            f"FLOPS = {work['total'][0]:.0f}, TFLOPS = {tflops:.2f}, "
-            f"Bandwidth = {bandwidth:.2f} GB/s (graph=True)",
+            f"FLOPS = {work['total']['flops']:.0f}, TFLOPS = {tflops:.2f}, "
+            f"Bandwidth = {bandwidth:.2f} GB/s (graph=True, unique GEMM buffer bytes)",
             flush=True,
         )
         metrics["us"] = us
-        metrics["flops"] = work["total"][0]
+        metrics["flops"] = work["total"]["flops"]
+        metrics["bytes"] = work["total"]["bytes"]
         metrics["tflops"] = tflops
         metrics["bandwidth_gbs"] = bandwidth
     # --- perf (kernel-bench only): per-kernel gemm1/gemm2 timing (looped alone) ---
@@ -778,14 +848,6 @@ def run_moe(
         kernel_us = kernel_us or {}
         g1 = kernel_us.get("gemm1")
         g2 = kernel_us.get("gemm2")
-        work = _gemm_work_metrics(
-            experts=experts,
-            tokens=tokens,
-            topk=topk,
-            model_dim=model_dim,
-            inter_dim=inter_dim,
-            data_format=data_format,
-        )
         if g1 is None and g2 is None:
             print(
                 f"[kernel-bench {tag}] no grouped kernels captured "
@@ -809,11 +871,11 @@ def run_moe(
                         g2 = elapsed_us
                 print(
                     f"[kernel-bench {tag}] {name}: us = {elapsed_us:.2f}, "
-                    f"FLOPS = {work[name][0]:.0f}, TFLOPS = {tflops:.2f}, "
-                    f"Bandwidth = {bandwidth:.2f} GB/s",
+                    f"FLOPS = {work[name]['flops']:.0f}, TFLOPS = {tflops:.2f}, "
+                    f"Bandwidth = {bandwidth:.2f} GB/s (unique buffer bytes)",
                     flush=True,
                 )
-                metrics[f"{name}_flops"] = work[name][0]
+                metrics[f"{name}_flops"] = work[name]["flops"]
                 metrics[f"{name}_tflops"] = tflops
                 metrics[f"{name}_bandwidth_gbs"] = bandwidth
         metrics["gemm1_us"] = g1
