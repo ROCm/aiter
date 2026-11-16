@@ -3,6 +3,15 @@
 
 import math
 
+from .enum import QuantType
+
+# FP8 quant types whose non-split CK 2-stage stage1 clamps SiLU at a runtime limit.
+RUNTIME_SILU_LIMIT_QUANT_TYPES = (
+    QuantType.per_1x128,
+    QuantType.per_Token,
+    QuantType.per_Tensor,
+)
+
 
 def normalize_swiglu_limit(limit):
     """CK SiLU override: None/0/+inf disable; positive finite values clamp.
