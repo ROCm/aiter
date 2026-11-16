@@ -340,6 +340,24 @@ def test_mha_v4_block_mask_without_a_sparse_row_names_the_recipe():
     with expect_raises(NotImplementedError, match="has no .* row for"):
         mha_v4(q, q, q, foreign, foreign, foreign, block_mask=mask)
 
+    # A named geometry is checked before quantizing too, since an MX quantizer aborts where its
+    # recipe has no row. The mask is shaped for that geometry, so only the row check can refuse it.
+    if _lacks_sparse_row("mxfp4"):
+        mxfp4 = AttentionFormat.MXFP4
+        operand = torch.empty((1, 256, 2, 128), device="cuda", dtype=torch.bfloat16)
+        tiled = torch.ones((1, 2, 1, 2), device="cuda", dtype=torch.bool)
+        with expect_raises(NotImplementedError, match="has no .* row for"):
+            mha_v4(
+                operand,
+                operand,
+                operand,
+                mxfp4,
+                mxfp4,
+                mxfp4,
+                block_mask=tiled,
+                block_tile=(256, 128),
+            )
+
     packed = q.cuda()
     lut = torch.zeros(2, device="cuda", dtype=torch.int32)
     per_tensor = AttentionScaleMode.F32_PER_TENSOR
@@ -2965,6 +2983,12 @@ def test_mha_v4_mx_scales_must_be_producer_contiguous(recipe, block_tile, mode):
 
 
 def test_mha_v4_sol_rejects_recipes_without_a_manifest_row():
+    """A missing mode-2 row is a Python error, including on an arch whose MX quantizer aborts.
+
+    MXFP4 with an FP8 V is not a Sol recipe at all. MXFP4/MXFP4/MXFP4 is, so where the manifest
+    has no mode-2 row the rejection has to happen before quantization: that quantizer aborts on
+    gfx942 instead of raising.
+    """
     dummy = torch.empty((1, 256, 1, 128), device="cuda", dtype=torch.bfloat16)
     with expect_raises(NotImplementedError, match="f6f4 and f6f8 recipes only"):
         mha_v4_sol(
@@ -2975,6 +2999,16 @@ def test_mha_v4_sol_rejects_recipes_without_a_manifest_row():
             AttentionFormat.MXFP4,
             native_fp8_format(),
         )
+
+    mxfp4 = AttentionFormat.MXFP4
+    recipe = _resolve_raw_recipe(mxfp4, mxfp4, mxfp4, None, None, None, sparse=True)
+    operands = mha_v4_operands(mxfp4, mxfp4, mxfp4, *recipe.scale_modes, recipe.v_pack)
+    if not mha_v4_block_tiles(operands, MHA_V4_SOL_MODE):
+        for block_tile in (None, (256, 128)):
+            with expect_raises(NotImplementedError, match=r"has no .+ row"):
+                mha_v4_sol(
+                    dummy, dummy, dummy, mxfp4, mxfp4, mxfp4, block_tile=block_tile
+                )
 
 
 def _e8m0_operand(batch, seqlen, heads, head_dim, decades=12.0, seed=0):
@@ -3098,6 +3132,9 @@ def test_sol_prepare_k_shift_needs_a_packed_k_of_its_shape():
     with expect_raises(ValueError, match="k_shift goes with k_packed_format"):
         sol_prepare(q, k_data, v_data, 0.5, num_heads=2, k_shift=shift)
 
+    # MXFP6 K quantization aborts on gfx942, so this check runs only on gfx950.
+    if get_gfx() != "gfx950":
+        return
     k_raw, k_scale = quantize_mxfp6_k(q)
     k_quantized, _ = mxfp6_k_view(k_raw, k_scale, 1, 512, 2)
     with expect_raises(ValueError, match=r"k_shift must be \(batch, nheads_kv, d\)"):
