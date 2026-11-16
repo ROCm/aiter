@@ -8,6 +8,7 @@ from aiter.ops.triton._triton_kernels.attention.fp8_mqa_logits import (
     _fp8_mqa_logits_kernel,
 )
 from aiter.ops.triton.utils._triton import arch_info
+from aiter.ops.triton.utils.config_utils import load_config_json, resolve_config_dir
 
 TRITON_VERSION = Version(triton.__version__)
 TRITON_GE_36 = TRITON_VERSION >= Version("3.6.0")
@@ -92,6 +93,33 @@ def _gfx942_tile_fits_lds(
     # If a future Triton spills Q or scores to LDS, re-add a `q + kv + scores <= 64 KB` upper-bound term here to avoid re-triggering the JIT abort.
     lds_bytes = occupancy * num_stages * block_kv * head_size
     return lds_bytes <= 0.9 * _GFX942_CU_LDS_BYTES
+
+
+def _gfx1250_launch_config(seq_len_kv: int) -> dict:
+    """gfx1250 launch parameters for this call, from the tuned table.
+
+    configs/gfx1250/gluon/attention/fp8_mqa_logits/DEFAULT.json buckets by KV length
+    (KV_LEQ_<n>, then "any"): the host only knows seq_len and seq_len_kv, not the
+    per-row [start, end) ranges. Without the table, keep the previous fixed launch.
+    """
+    cfg = dict(
+        BLOCK_KV=128,
+        NUM_WARPS=4,
+        LOOP_VARIANT=1,
+        NUM_CHAINS=8,
+        waves_per_eu=1,
+        enable_fp_fusion=False,
+    )
+    cfg_dir = resolve_config_dir("attention", "FP8_MQA_LOGITS", backend="gluon")
+    table = load_config_json(f"{cfg_dir}/DEFAULT.json", required=False)
+    if table:
+        keyed = sorted(
+            (int(k.split("_")[-1]), v) for k, v in table.items() if k.startswith("KV_LEQ_")
+        )
+        row = next((v for bound, v in keyed if seq_len_kv <= bound), table.get("any"))
+        if row:
+            cfg.update(row)
+    return cfg
 
 
 def fp8_mqa_logits(
@@ -348,14 +376,17 @@ def fp8_mqa_logits(
             }
             grid = ((seq_len + block_m - 1) // block_m, num_kv_splits)
         else:
-            loop_variant = 1
-            waves_per_eu = 1
-            num_chains = 8 if USE_FOLDED_REDUCTION else 0
-            num_warps = 4
-            block_kv = 128
+            cfg = _gfx1250_launch_config(seq_len_kv)
+            loop_variant = cfg["LOOP_VARIANT"]
+            waves_per_eu = cfg["waves_per_eu"]
+            num_chains = cfg["NUM_CHAINS"] if USE_FOLDED_REDUCTION else 0
+            num_warps = cfg["NUM_WARPS"]
+            block_kv = cfg["BLOCK_KV"]
             # This kernel has no BLOCK_M: it walks one query row per program.
             block_m = 1
             other = {"LOOP_VARIANT": loop_variant}
+            if cfg["enable_fp_fusion"]:
+                other["enable_fp_fusion"] = True
             grid = ((seq_len + block_m - 1) // block_m,)
 
         _gluon_fp8_mqa_logits_kernel[grid](
