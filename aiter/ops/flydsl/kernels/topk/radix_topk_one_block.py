@@ -15,22 +15,21 @@ from functools import cache
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
-from flydsl._mlir.dialects import llvm
 from flydsl.expr import const_expr, gpu, range_constexpr
 from flydsl.expr.typing import T
 
 from aiter.jit.utils.chip_info import get_cu_num
 
-from ..dpp_utils import update_dpp_i32
-from ..kernels_common import atomic_add_i32, atomic_or_i32
-from ..tdm_ops_gfx1250 import (
-    TDMDescriptor2D,
-    make_tensor_descriptor_2d,
-    tensor_load_2d,
-    tensor_wait,
-)
+from ..kernels_common import atomic_add_i32, atomic_or_i32, pin_i32
+from ..tdm_ops_gfx1250 import make_tensor_descriptor_2d, tensor_load_2d, tensor_wait
 from ..tensor_shim import buf_scalar_load
-from .topk_common import _f32_to_ord, _load_f32x4, _row_length
+from .topk_common import (
+    _f32_to_ord,
+    _load_f32x4,
+    _row_length,
+    _wave32_block_exclusive_sum_i32,
+    _wave32_inclusive_sum_i32,
+)
 
 _VEC = 4
 _LOAD_UNROLL = 4
@@ -114,7 +113,6 @@ _SELECTED_BUCKET_COUNT = 9
 _METADATA_SIZE = _SELECTED_BUCKET_COUNT + 1
 _PACKED_COUNT_BITS = 16
 _PACKED_COUNT_MASK = (1 << _PACKED_COUNT_BITS) - 1
-_DPP_ROW_SHR = 0x110
 # Bitmap words a thread reads per tile of the stable emit, a block apart: one
 # tile covers a 64K-column row at 1024 threads. Their bit counts share one
 # block scan in 16-bit fields, which a block's word of 32 columns a thread
@@ -219,18 +217,6 @@ class _ScalarReads:
         return buf_scalar_load(self.tensor, index)
 
 
-def _with_unit_dim1_stride(desc):
-    # A one-row tile with a zero tensor_dim1_stride (GROUP1 s6[31:16]) hangs
-    # the data mover, and the 2-D builder leaves it zero.
-    group1 = fx.Vector(desc.dgroup1)
-    words = [fx.Int32(group1[i]) for i in range(8)]
-    words[6] = fx.Int32(1 << 16)
-    return TDMDescriptor2D(
-        dgroup0=desc.dgroup0,
-        dgroup1=fx.Vector.from_elements(words, fx.Int32).ir_value(),
-    )
-
-
 @cache
 def build_radix_topk_one_block_body(
     k: int,
@@ -242,6 +228,7 @@ def build_radix_topk_one_block_body(
     wave_size: int,
     arch: str = "",
     row_cache: bool = False,
+    sampled_bound: bool = True,
 ):
     """Build the one-block selector shared by the row kernels.
 
@@ -253,7 +240,9 @@ def build_radix_topk_one_block_body(
     listed in _ONE_BLOCK_LDS_BUDGET_BYTES also grow the candidate buffer into
     whatever that budget leaves over. The rest keep the original layout.
     row_cache adds the LDS row cache where _row_cache_enabled, for a caller
-    that passes run_one_block_body each next row.
+    that passes run_one_block_body each next row. sampled_bound False builds
+    without the sampled bound and so without the row cache, for rows all
+    shorter than the sampled path takes: its code slows their two passes.
     """
     if k <= 0:
         raise ValueError("k must be positive")
@@ -320,11 +309,13 @@ def build_radix_topk_one_block_body(
     # Writer and readers of the candidate columns are all gated on this.
     candidate_columns_used = not stable or stable_sort_enabled
     candidate_entry_bytes = 4 + (4 if candidate_columns_used else 0)
-    sampled_bound_enabled = _sampled_bound_enabled(
+    sampled_bound_enabled = sampled_bound and _sampled_bound_enabled(
         k, block_threads, stable, short_rows, arch
     )
-    row_cache_enabled = row_cache and _row_cache_enabled(
-        k, block_threads, stable, short_rows, arch
+    row_cache_enabled = (
+        row_cache
+        and sampled_bound
+        and _row_cache_enabled(k, block_threads, stable, short_rows, arch)
     )
     row_cache_elements = _ROW_CACHE_ELEMENTS.get(block_threads, 0)
     row_cache_slice = row_cache_elements // num_waves
@@ -444,14 +435,9 @@ def build_radix_topk_one_block_body(
         tid = fx.thread_idx.x
         use_row_cache = row_cache_enabled and next_row_len is not None
         if const_expr(use_row_cache):
-            # An empty asm ties tid to the row, as no FlyDSL op hides a value
-            # from LLVM: hoisted out of the caller's row loop, values derived
-            # from tid stay live across all of it and spill.
-            tid = fx.Int32(
-                llvm.inline_asm(
-                    T.i32, [tid.ir_value(), row_len.ir_value()], "", "=v,0,v"
-                )
-            ) & fx.Int32(block_threads - 1)
+            # Hoisted out of the caller's row loop, values derived from tid
+            # stay live across all of it and spill.
+            tid = pin_i32(tid, row_len) & fx.Int32(block_threads - 1)
         lane = tid % wave_size
 
         zero = fx.Int32(0)
@@ -586,8 +572,9 @@ def build_radix_topk_one_block_body(
                     oob_inner_bound=(valid < fx.Int32(row_cache_slice)).select(
                         valid, fx.Int32(row_cache_slice)
                     ),
+                    unit_dim1_stride=True,
                 )
-                tensor_load_2d(_with_unit_dim1_stride(desc))
+                tensor_load_2d(desc)
 
         # Key encoding and classification
         def ordered_key(value):
@@ -659,14 +646,7 @@ def build_radix_topk_one_block_body(
 
         # Histogram and workgroup scan primitives
         def wave_inclusive_sum(value):
-            # DPP shifts stay inside 16-lane rows; lane 15's sum then crosses
-            # into the upper row.
-            for shift in range_constexpr(4):
-                value = value + fx.Int32(
-                    update_dpp_i32(zero, value, _DPP_ROW_SHR | (1 << shift))
-                )
-            row_total = fx.coop.warp_broadcast(value, 15)
-            return value + (lane >= fx.Int32(16)).select(row_total, zero)
+            return _wave32_inclusive_sum_i32(value, lane)
 
         def wave_total(inclusive):
             return fx.coop.warp_broadcast(inclusive, wave_size - 1)
@@ -679,21 +659,7 @@ def build_radix_topk_one_block_body(
                 return block_scan.exclusive_with_aggregate(
                     value, fx.ReductionOp.ADD, storage=scan
                 )
-            value = fx.Int32(value)
-            wave = fx.Int32(fx.rocdl.wave_id())
-            inclusive = wave_inclusive_sum(value)
-            if lane == fx.Int32(wave_size - 1):
-                slots[wave] = inclusive
-            gpu.barrier()
-            has_slot = lane < fx.Int32(num_waves)
-            slot = has_slot.select(slots[has_slot.select(lane, zero)], zero)
-            slot_inclusive = wave_inclusive_sum(slot)
-            # warp_broadcast from a runtime lane would shuffle through LDS.
-            wave_prefix = fx.Int32(
-                fx.rocdl.readlane(T.i32, slot_inclusive - slot, wave)
-            )
-            total = fx.coop.warp_broadcast(slot_inclusive, num_waves - 1)
-            return wave_prefix + inclusive - value, total
+            return _wave32_block_exclusive_sum_i32(value, slots, lane, num_waves)
 
         def clear_histograms(histograms, bins_per_thread):
             for item in range_constexpr(bins_per_thread):
@@ -2282,6 +2248,7 @@ def build_radix_topk_one_block_module(
     arch: str = "",
     packed_rows: bool = False,
     full_rows: bool = False,
+    sampled_bound: bool = True,
 ):
     """Build a prefill/decode kernel specialized for the row-length bounds.
 
@@ -2296,7 +2263,9 @@ def build_radix_topk_one_block_module(
         raise ValueError("full_rows is a decode-mode build; prefill reads both ends")
     # A block walks rows so it can load its next row into the row cache, as many
     # blocks per CU as the cache leaves LDS for.
-    persistent = _row_cache_enabled(k, block_threads, stable, short_rows, arch)
+    persistent = sampled_bound and _row_cache_enabled(
+        k, block_threads, stable, short_rows, arch
+    )
     persistent_blocks = (
         get_cu_num() * _row_cache_blocks_per_cu(block_threads) if persistent else 0
     )
@@ -2309,6 +2278,11 @@ def build_radix_topk_one_block_module(
         wave_size=wave_size,
         arch=arch,
         row_cache=persistent,
+        sampled_bound=sampled_bound,
+    )
+    # Named apart only where it changes the build, so the rest keep their names.
+    unsampled = not sampled_bound and _sampled_bound_enabled(
+        k, block_threads, stable, short_rows, arch
     )
     row_variant = "short" if short_rows else "mixed"
     kernel_name = (
@@ -2317,6 +2291,7 @@ def build_radix_topk_one_block_module(
         f"_v{int(write_values)}_s{int(stable)}"
         f"{'_packed' if packed_rows else ''}"
         f"{'_full' if full_rows else ''}"
+        f"{'_unsampled' if unsampled else ''}"
     )
 
     if persistent:

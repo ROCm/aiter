@@ -581,11 +581,13 @@ def test_flydsl_one_block_long_rows():
         print("[flydsl_one_block_long_rows] one-block kernel not served here; skip")
         return
     # 768 and 1024 rows exceed a 256-CU part, so blocks walk rows; stable
-    # k = 4096 at 300 decode rows takes 512-thread blocks without the row cache.
+    # k = 4096 at 300 decode rows takes 512-thread blocks without the row cache,
+    # and decode rows of 6144 at k = 2048, too short to sample, without the bound.
     cases = [
         ("decode", 768, 32768, 512, "randn", "full"),
         ("decode", 768, 16384, 512, "ties", "full"),
         ("decode", 768, 32768, 2048, "randn", "full"),
+        ("decode", 768, 6144, 2048, "randn", "full"),
         ("decode", 300, 20000, 4096, "randn", "full"),
         ("prefill", 1024, 40000, 512, "randn", "causal"),
         ("prefill", 300, 9000, 2048, "randn", "causal"),

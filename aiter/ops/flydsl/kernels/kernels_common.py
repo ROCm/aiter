@@ -109,6 +109,22 @@ def atomic_max_i32(memref, val, offset, syncscope):
     return _atomic_rmw_i32(fx.atomic_max, memref, val, offset, syncscope)
 
 
+def pin_i32(value, *deps):
+    """`value`, out of an empty asm that also reads each of `deps`.
+
+    Pinned FlyDSL 0.5.0 has no public opaque identity with dependency operands:
+    ``llvm.fake.use`` returns no value and the experimental scheduling hints
+    only choose registers. Keep the raw dialect access localized here. Behind
+    the asm, `value` and what is derived from it cannot be hoisted above the
+    `deps`' definitions, so loop-local values do not stay live and spill across
+    every iteration.
+    """
+    from flydsl._mlir.dialects import llvm
+
+    operands = [fx.Int32(v).ir_value() for v in (value, *deps)]
+    return fx.Int32(llvm.inline_asm(T.i32, operands, "", "=v,0" + ",v" * len(deps)))
+
+
 def get_warp_size(arch=None):
     """Return the wavefront/warp size for the given GPU architecture.
 
