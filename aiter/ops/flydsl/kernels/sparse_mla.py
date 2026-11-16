@@ -55,10 +55,13 @@ from functools import cache, lru_cache
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
+from flydsl._mlir import ir
 from flydsl._mlir.dialects import fly as fly_dialect
+from flydsl._mlir.dialects import llvm as _llvm
 from flydsl.expr import arith, const_expr, gpu, range_constexpr
 from flydsl.expr.typing import T
 
+from aiter.ops.flydsl.kernels.buffer_ops import _get_buffer_flags
 from aiter.ops.flydsl.kernels.kernels_common import LOG2E, atomic_add_i32
 from aiter.ops.flydsl.kernels.tensor_shim import (
     AITER_FLYDSL_KERNARG_PRELOAD,
@@ -169,6 +172,32 @@ def _halves(v8, halves):
     ]
 
 
+def _opaque_v(x):
+    # An opaque VGPR copy: LLVM cannot reassociate a constant into it, so
+    # base + constant offsets stay in the load's immediate offset field.
+    v = x.ir_value() if hasattr(x, "ir_value") else x
+    return fx.Int32(
+        _llvm.inline_asm(
+            ir.IntegerType.get_signless(32), [v], "", "=v,0", has_side_effects=False
+        )
+    )
+
+
+def _bpermute_acc(addr, src):
+    # ds_bpermute with AGPR data and result. The asm is opaque to the waitcnt
+    # pass, so callers wait on lgkmcnt before reading the result.
+    ops = [x.ir_value() if hasattr(x, "ir_value") else x for x in (addr, src)]
+    return fx.Int32(
+        _llvm.inline_asm(
+            ir.IntegerType.get_signless(32),
+            ops,
+            "ds_bpermute_b32 $0, $1, $2",
+            "=a,v,a",
+            has_side_effects=True,
+        )
+    )
+
+
 def _bpermute_mfma_schedule(pv_blocks, qk_pairs, halves):
     """Interleave dword lane transfers with PV/QK; satisfy each QK dependency."""
     acts, bi, nbp = [], 0, 4 * qk_pairs
@@ -191,7 +220,11 @@ def _bpermute_mfma_schedule(pv_blocks, qk_pairs, halves):
 
 @lru_cache(maxsize=64)
 def compile_sparse_mla_fwd(
-    has_sink=False, index_format="dense", split_k=1, register_vt=False
+    has_sink=False,
+    index_format="dense",
+    split_k=1,
+    register_vt=False,
+    imm_gather=False,
 ):
     """Compile one specialization of the sparse MLA forward kernel.
 
@@ -202,6 +235,10 @@ def compile_sparse_mla_fwd(
     FP32 partials and (max, sum) stats; otherwise four tokens share a
     workgroup and the kernel writes bf16 output. register_vt selects the
     register V^T route for unsplit launches; split launches ignore it.
+    imm_gather (unsplit only) addresses each gathered row from one VGPR base
+    with immediate chunk offsets and keeps the gathered dwords and their
+    lane transfers in AGPRs. Results are identical; see IMM_GATHER_MAX_WIDTH
+    in the host wrapper for when it is faster.
     """
     if index_format not in INDEX_FORMATS:
         raise ValueError(f"index_format must be one of {INDEX_FORMATS}")
@@ -213,6 +250,7 @@ def compile_sparse_mla_fwd(
     NUM_WAVES = 1 if SPLIT else TOKENS_PER_WORKGROUP
     BLOCK_THREADS = NUM_WAVES * WAVE
     HAS_SINK = bool(has_sink) and not SPLIT
+    IMM_GATHER = bool(imm_gather) and not SPLIT
     vt_route = "register_vt" if REGISTER_VT else "lds_vt"
     # Gather pairs issued in the QK MFMA phase; the rest go out in softmax.
     GM = 8 if SPLIT else 0
@@ -220,7 +258,7 @@ def compile_sparse_mla_fwd(
     assert GS in (1, 2, 4)
     kernel_name = (
         f"sparse_mla_fwd_{index_format}_{vt_route}"
-        f"_sink{int(HAS_SINK)}_split{split_k}"
+        f"_sink{int(HAS_SINK)}_split{split_k}{'_imm' if IMM_GATHER else ''}"
     )
     UNBOUNDED = 1 << 24
     CHUNKS_PER_ROW = HEAD_DIM // VEC
@@ -332,6 +370,32 @@ def compile_sparse_mla_fwd(
         )
         # Adjacent groups of four lanes read one row's four 16-byte chunks.
         g_chunks = _rowmajor(QK_PAIRS, 4)
+        if const_expr(IMM_GATHER):
+            # Byte offsets fit uint32: the pool is below 2^31 bf16 elements.
+            kv_rsrc = fx.rocdl.make_buffer_rsrc(
+                ir.Type.parse("!llvm.ptr<8>"),
+                fx.to_llvm_ptr(kv_ptr),
+                fx.Int16(0).ir_value(),
+                fx.Int64(0xFFFFFFFF).ir_value(),
+                fx.Int32(_get_buffer_flags()).ir_value(),
+            )
+            row_bytes = HEAD_DIM * 2
+            lane_bytes = ld_chunk * fx.Int32(VEC * 2)
+            frag_ty = ir.VectorType.get([4], ir.IntegerType.get_signless(32))
+
+        def _kv_base(idx_v):
+            return _opaque_v(idx_v * fx.Int32(row_bytes) + lane_bytes)
+
+        def _kv_load(base, pr):
+            off = _static_int(fx.crd2idx((pr, 0), g_chunks)) * VEC * 2
+            raw = fx.rocdl.raw_ptr_buffer_load(
+                frag_ty,
+                kv_rsrc,
+                (base + fx.Int32(off)).ir_value(),
+                fx.Int32(0).ir_value(),
+                aux=0,
+            )
+            return fx.Vector(raw).bitcast(fx.BFloat16)
 
         # ---- LDS V^T route: one private region [16 rows][512 d] per wave, swizzled
         if const_expr(LDS_VT):
@@ -414,9 +478,14 @@ def compile_sparse_mla_fwd(
         def _gather(idx_v):
             raw_idx = idx_v
             idx_v = (idx_v >= 0).select(idx_v, fx.Int32(0))
-            frags = [
-                kv_g[idx_v, _chunk(pr), None].load() for pr in range_constexpr(QK_PAIRS)
-            ]
+            if const_expr(IMM_GATHER):
+                base = _kv_base(idx_v)
+                frags = [_kv_load(base, pr) for pr in range_constexpr(QK_PAIRS)]
+            else:
+                frags = [
+                    kv_g[idx_v, _chunk(pr), None].load()
+                    for pr in range_constexpr(QK_PAIRS)
+                ]
             frags.append(fx.Vector.from_elements([raw_idx], fx.Int32))
             return frags
 
@@ -568,13 +637,20 @@ def compile_sparse_mla_fwd(
                     if a[0] == "pv"
                 ]
                 pv_n = 0
+                n_bp = 0
                 for n in range_constexpr(len(sched)):
                     act = sched[n]
                     if const_expr(act[0] == "bp"):
                         pr, i = act[1] // 4, act[1] % 4
-                        moved[pr][i] = fx.Int32(
-                            fx.rocdl.ds_bpermute(T.i32, perm_addr, fx.Int32(dw[pr][i]))
-                        )
+                        if const_expr(IMM_GATHER):
+                            moved[pr][i] = _bpermute_acc(perm_addr, fx.Int32(dw[pr][i]))
+                            n_bp += 1
+                        else:
+                            moved[pr][i] = fx.Int32(
+                                fx.rocdl.ds_bpermute(
+                                    T.i32, perm_addr, fx.Int32(dw[pr][i])
+                                )
+                            )
                         if const_expr(prefetch and i == 3 and pr < GM):
                             # Raw registers are free after their fourth transfer.
                             # Preserve the PV-first FIFO lookahead before QK use.
@@ -604,6 +680,11 @@ def compile_sparse_mla_fwd(
                     else:
                         pr, h = act[1], act[2]
                         if const_expr(kops[pr] is None):
+                            if const_expr(IMM_GATHER):
+                                # LDS returns in order: pair pr's four transfers
+                                # are done once at most this many remain.
+                                fx.rocdl.s_waitcnt(lgkmcnt=min(14, n_bp - 4 * pr - 4))
+                                fx.rocdl.sched_barrier(0)
                             kops[pr] = _halves(
                                 fx.Vector.from_elements(moved[pr], fx.Int32).bitcast(
                                     fx.BFloat16
@@ -693,6 +774,8 @@ def compile_sparse_mla_fwd(
                 # Pairs GM.. of the next gather go out here, one chunk per softmax hook.
                 new_frags = list(new_frags)
                 safe_idx = (idx_s >= 0).select(idx_s, fx.Int32(0))
+                if const_expr(IMM_GATHER):
+                    kv_base = _kv_base(safe_idx)
                 rest = list(range(GM, QK_PAIRS))
                 per = -(-len(rest) // GS)
                 for c in range_constexpr(GS):
@@ -701,7 +784,12 @@ def compile_sparse_mla_fwd(
 
                         def _issue(chunk=chunk):
                             for pr in chunk:
-                                new_frags[pr] = kv_g[safe_idx, _chunk(pr), None].load()
+                                if const_expr(IMM_GATHER):
+                                    new_frags[pr] = _kv_load(kv_base, pr)
+                                else:
+                                    new_frags[pr] = kv_g[
+                                        safe_idx, _chunk(pr), None
+                                    ].load()
                             fx.rocdl.sched_barrier(0)
 
                         hooks[c * (4 // GS)] = _issue

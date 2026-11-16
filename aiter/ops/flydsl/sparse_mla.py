@@ -42,6 +42,12 @@ __all__ = [
 # slot * D and token * H * D are int32 element offsets.
 _MAX_TOKENS = (1 << 31) // (NUM_HEADS * HEAD_DIM)
 _MAX_KV_ROWS = (1 << 31) // HEAD_DIM
+# Register-route rows up to this width use immediate-offset gathers with AGPR
+# lane transfers. MI325X, T=16384, sorted rows: 3-20% faster at K=512 and
+# 1024. At K=2048 the faster waves drift apart and paged rows lose L2 hits
+# (timing turns bimodal). The LDS route gains nothing on score-order rows:
+# every byte comes from DRAM there.
+IMM_GATHER_MAX_WIDTH = 1024
 
 
 def _require_gfx942():
@@ -311,6 +317,7 @@ def flydsl_sparse_mla_fwd(
                 index_format=index_format,
                 split_k=splits,
                 register_vt=register_vt,
+                imm_gather=register_vt and width <= IMM_GATHER_MAX_WIDTH,
             ),
             ptr_arg(q, fx.BFloat16),
             ptr_arg(kv, fx.BFloat16),
