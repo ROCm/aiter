@@ -1487,8 +1487,7 @@ static void fused_qknorm_idxrqknorm_impl(
                 // therefore cannot define the independently mapped index-cache
                 // capacity: no capacity check is possible here. Caller contract (as for
                 // slot_mapping): every non-negative index_slot_mapping entry must be below
-                // the rows index_cache holds (numel / 128; numel / 8704 * 128 for mxfp4,
-                // numel / 9216 * 128 for nvfp4).
+                // the rows index_cache holds (numel / 128; numel / 8704 * 128 for mxfp4).
                 AITER_CHECK(index_cache->numel() % kHeadDim == 0,
                             "index_cache must contain contiguous 128-element rows");
             }
