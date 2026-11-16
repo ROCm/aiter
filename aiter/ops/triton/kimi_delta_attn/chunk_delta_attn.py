@@ -66,6 +66,9 @@ def chunk_kimi_delta_attn(
     state_cache: torch.Tensor | None = None,
     state_indices: torch.Tensor | None = None,
     has_initial_state: torch.Tensor | None = None,
+    out_gate: torch.Tensor | None = None,
+    norm_weight: torch.Tensor | None = None,
+    norm_eps: float = 1e-5,
 ) -> tuple[torch.Tensor, torch.Tensor | None]:
     r"""
     Chunked Kimi Delta Attention forward pass using Triton (Forward only).
@@ -162,6 +165,16 @@ def chunk_kimi_delta_attn(
         has_initial_state (torch.Tensor, optional):
             Bool `[N]`. False starts that sequence from zero. Required with
             `state_cache`.
+        out_gate (torch.Tensor, optional):
+            `[B, T, HV, V]` gate of the fused output norm
+            `o = rmsnorm(o) * norm_weight * sigmoid(out_gate)` (RMS over V,
+            fp32 math). May be a strided token slice of a wider projection
+            (head stride V, element stride 1). Fused into the output pass on
+            the FlashKDA path.
+        norm_weight (torch.Tensor, optional):
+            `[V]` weight of the fused norm. Required with `out_gate`.
+        norm_eps (float):
+            Epsilon of the fused norm. Default: 1e-5.
 
     Returns:
         tuple[torch.Tensor, torch.Tensor | None]:
@@ -300,5 +313,8 @@ def chunk_kimi_delta_attn(
         state_cache=state_cache,
         state_indices=state_indices,
         has_initial_state=has_initial_state,
+        out_gate=out_gate,
+        norm_weight=norm_weight,
+        norm_eps=norm_eps,
     )
     return o.to(q.dtype), final_state

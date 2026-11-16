@@ -526,7 +526,7 @@ def test_gluon_k1_rejects_a_wrong_warp_count(monkeypatch):
 
 
 def test_unpublished_gluon_schedules_fall_back_to_triton(monkeypatch):
-    """Without a published schedule, K1 and pass C take their Triton kernels."""
+    # Without a published schedule, K1 and K2 fall back to Triton.
     if _flash_kda.DEVICE_ARCH != "gfx950":
         pytest.skip("only the gfx950 K1 and pass C fail closed")
     unpublished = ("k1_prepare_gluon", "k2_c_gluon", "k2_c_gluon_segmented")
@@ -538,7 +538,7 @@ def test_unpublished_gluon_schedules_fall_back_to_triton(monkeypatch):
         _count_launches(_flash_kda, ["_prepare_fast", "_segment_fast"]) as calls,
     ):
         o, _ = run_flash(*args, chunks_per_seg=4)
-    assert calls == {"_prepare_fast": 1, "_segment_fast": 1}
+    assert calls == {"_prepare_fast": 1, "_segment_fast": 3}
     assert rel_err(o, o_ref) < 2e-2
 
 
@@ -637,11 +637,13 @@ def test_routes_agree(case):
     with _route(k1=False, k2=False):
         o_triton, ht_triton = run_flash(*args, **kw)
     for k1, k2 in ((True, False), (False, True), (True, True)):
+        # The gfx950 Gluon K1 + K2 pair uses its own workspace, so it rounds apart.
+        own = k1 and k2 and _flash_kda.DEVICE_ARCH == "gfx950"
         with _route(k1=k1, k2=k2):
             o, ht = run_flash(*args, **kw)
-        assert rel_err(o, o_triton) < 2e-3, f"K1={k1} K2={k2}"
+        assert rel_err(o, o_triton) < (2e-2 if own else 2e-3), f"K1={k1} K2={k2}"
         if kw.get("output_final_state"):
-            assert rel_err(ht, ht_triton) < 1e-4, f"K1={k1} K2={k2}"
+            assert rel_err(ht, ht_triton) < (1e-2 if own else 1e-4), f"K1={k1} K2={k2}"
 
 
 def test_cases_reach_the_gluon_k2():
@@ -1328,6 +1330,9 @@ def test_positional_call_keeps_skipped_storage(monkeypatch):
         "state_cache": cache,
         "state_indices": indices,
         "has_initial_state": torch.ones(1, device=device, dtype=torch.bool),
+        "out_gate": None,
+        "norm_weight": None,
+        "norm_eps": 1e-5,
     }
     params = inspect.signature(flash_kda_fwd).parameters
     assert by_name.keys() == params.keys()
@@ -1351,3 +1356,49 @@ def test_positional_call_keeps_skipped_storage(monkeypatch):
         assert seen.keys() == handed.keys()
         for key, band in handed.items():
             assert seen[key] == {band.data_ptr()}, key
+
+
+@pytest.mark.parametrize("norm", [False, True])
+@pytest.mark.parametrize("lens", [[1112] * 3, [2136, 4608]])
+def test_cuda_graph_replay_matches_eager(lens, norm):
+    """A captured call replayed on new inputs matches an eager call: the
+    cross-program flags must not reuse the epoch of the captured call."""
+    H, T, n = 12, sum(lens), len(lens)
+    q, k, v, g, beta, A_log, dt_bias, scale = make_inputs(1, T, H)
+    h0 = torch.randn(n, H, K_DIM, K_DIM, device=device, dtype=torch.float32) * 0.1
+    cache, indices, _storage = _paged_pool(n, H, h0)
+    out = torch.empty_like(v)
+    kw = _kimi_kwargs(
+        q,
+        k,
+        v,
+        g,
+        beta,
+        A_log,
+        dt_bias,
+        scale,
+        cu_seqlens=_varlen(lens).to(torch.int32),
+        out=out,
+        state_cache=cache,
+        state_indices=indices,
+        has_initial_state=torch.ones(n, device=device, dtype=torch.bool),
+    )
+    if norm:
+        kw["out_gate"] = torch.randn(1, T, H, K_DIM, device=device, dtype=dtype)
+        kw["norm_weight"] = torch.ones(K_DIM, device=device, dtype=torch.float32)
+    for _ in range(2):
+        chunk_kimi_delta_attn(**kw)
+    torch.cuda.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        chunk_kimi_delta_attn(**kw)
+    for seed in (1, 2):
+        for dst, src in zip((q, k, v, g, beta), make_inputs(1, T, H, seed=seed)):
+            dst.copy_(src)
+        cache[indices] = h0
+        graph.replay()
+        o_graph, s_graph = out.clone(), cache[indices].clone()
+        cache[indices] = h0
+        chunk_kimi_delta_attn(**kw)
+        torch.testing.assert_close(o_graph, out, atol=0, rtol=0)
+        torch.testing.assert_close(s_graph, cache[indices], atol=0, rtol=0)

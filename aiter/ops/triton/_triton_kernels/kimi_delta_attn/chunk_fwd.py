@@ -72,6 +72,9 @@ def chunk_delta_attn_fwd(
     state_cache: torch.Tensor | None = None,
     state_indices: torch.Tensor | None = None,
     has_initial_state: torch.Tensor | None = None,
+    out_gate: torch.Tensor | None = None,
+    norm_weight: torch.Tensor | None = None,
+    norm_eps: float = 1e-5,
 ) -> tuple:
     """
     Forward pass for chunk_delta_attn.
@@ -189,6 +192,9 @@ def chunk_delta_attn_fwd(
             state_cache=state_cache,
             state_indices=state_indices,
             has_initial_state=has_initial_state,
+            out_gate=out_gate,
+            norm_weight=norm_weight,
+            norm_eps=norm_eps,
         )
         return o, final_state, None, None, None, None, None, None, None
 
@@ -282,6 +288,13 @@ def chunk_delta_attn_fwd(
         chunk_indices=chunk_indices,
         use_exp2=True,
     )
+
+    if out_gate is not None:
+        # The default pipeline has no fused norm: apply it here (fp32 math).
+        o_f = o.float()
+        o_f = o_f * torch.rsqrt(o_f.square().mean(-1, keepdim=True) + norm_eps)
+        o_f = o_f * norm_weight.float() * torch.sigmoid(out_gate.float())
+        o = o_f.to(o.dtype)
 
     if not disable_recompute:
         w, u, qg, kg, v_new = None, None, None, None, None

@@ -1044,7 +1044,7 @@ def _scan_schedule(n_seqs: int, H: int, V: int) -> tuple[int, int]:
     return _SCAN_BV_NARROW, 4
 
 
-def _choose_chunks_per_seg(n_chunks_max: int, n_seqs: int, H: int, V: int) -> int:
+def _choose_chunks_per_seg(n_chunks_max, n_seqs, H, V, nchs=None) -> int:
     """Segment length in chunks, or ``n_chunks_max`` to disable segmentation.
 
     The recurrence kernel gets ``n_segments * H * (V / BW)`` blocks, so with one
@@ -1063,6 +1063,16 @@ def _choose_chunks_per_seg(n_chunks_max: int, n_seqs: int, H: int, V: int) -> in
     cus = get_num_sms()
     # There has to be idle capacity to absorb the extra passes.
     if blocks > cus:
+        return n_chunks_max
+    if nchs is not None:
+        # Shortest length that fits one wave of the CUs, if it pays for pass A + scan.
+        P = _published_gluon_schedule("flash_kda_gluon_plan").kwargs
+        lo = max(P["A8_MIN_LEN"], triton.cdiv(n_chunks_max, P["A8_MAX_SEGS"]))
+        for L in range(lo, n_chunks_max):
+            progs = sum(triton.cdiv(n, L) for n in nchs) * H
+            if progs <= cus:
+                cost = P["SEG_FIXED_STEPS"] + P["SEG_DEVICE_STEPS"] * progs / cus
+                return n_chunks_max if n_chunks_max - L <= cost else L
         return n_chunks_max
     # And enough depth to amortize them, which no amount of idle capacity makes
     # up for.
@@ -1091,11 +1101,162 @@ def _seq_bounds(cu_seqlens: torch.Tensor) -> tuple[tuple[int, int], ...]:
     return tuple((bounds[i], bounds[i + 1]) for i in range(len(bounds) - 1))
 
 
+@tensor_cache
+def _tile_table(cu_seqlens: torch.Tensor, chunk_indices: torch.Tensor, C: int):
+    ci = chunk_indices.long()
+    tok0 = cu_seqlens.long()[ci[:, 0]] + ci[:, 1] * C
+    ln = torch.clamp(cu_seqlens.long()[ci[:, 0] + 1] - tok0, max=C)
+    return torch.stack([tok0, ln], 1).to(torch.int32).contiguous()
+
+
+@functools.lru_cache(maxsize=64)
+def _seg_plan(seqs, C, L, H, taper):
+    nchs = [triton.cdiv(e - b, C) for b, e in seqs]
+    lens = [
+        [L] * (triton.cdiv(n, L) - 1) + [n - L * (triton.cdiv(n, L) - 1)] for n in nchs
+    ]
+    longest = max(nchs)
+    k = nchs.count(longest)
+    b0 = triton.cdiv(longest, L)
+    spare = get_num_sms() // H - sum(map(len, lens))
+    if not taper:
+        return tuple(map(tuple, lens))
+    P = _published_gluon_schedule("flash_kda_gluon_plan").kwargs
+    smax = min(b0 + spare // k, max(b0, P["A8_MAX_SEGS"]))
+    if (
+        longest < max(P["TAPER_MIN_CHUNKS"], L + 1)
+        or longest > smax * L
+        or spare < k
+        or smax <= b0
+    ):
+        return tuple(map(tuple, lens))
+    c = longest / smax
+    while True:
+        t = []
+        while sum(t) < longest and len(t) < smax:
+            m = max(P["A8_MIN_LEN"], min(L, int(c - P["TAPER_RATE"] * len(t) + 1e-9)))
+            t.append(min(m, longest - sum(t)))
+        if sum(t) >= longest:
+            return tuple(tuple(t if n == longest else s) for n, s in zip(nchs, lens))
+        c += 0.05
+
+
+@functools.lru_cache(maxsize=64)
+def _scf_table(nsegs, H, NVS, device):
+    NX = get_num_xcds()  # pid % NX = XCD (round-robin dispatch)
+    streams, seg0 = [], 0
+    for n, nseg in enumerate(nsegs):
+        streams += [(n, h, nseg, seg0) for h in range(H)]
+        seg0 += nseg
+    P = sum(st[2] for st in streams)
+    scans = [[] for _ in range(NX)]
+    walks = [[] for _ in range(NX)]
+    x, rmax, done = 0, 1, 0
+    # XCD x ends at item round((x + 1) P / NX): boundaries on stream ends need no replica.
+    bnd = [((q + 1) * P + NX // 2) // NX for q in range(NX)]
+    for n, h, nseg, s0 in streams:
+        pieces, a = [], 0
+        while a < nseg:
+            while x < NX - 1 and done >= bnd[x]:
+                x += 1
+            take = min(nseg - a, max(bnd[x] - done, 1) if x < NX - 1 else nseg - a)
+            pieces.append((x, a, a + take))
+            done += take
+            a += take
+        rmax = max(rmax, len(pieces))
+        assert len(pieces) <= 8
+        nh = n * H + h
+        for r, (xp, a0, a1) in enumerate(pieces):
+            dn = 1 << 29 if r < len(pieces) - 1 else 0
+            items = [1 << 30 | dn | r << 26 | nh << 4 | v for v in range(NVS)]
+            scans[xp].append((items, a1 - 1))
+            for s in range(a0, a1):
+                aux = 0
+                if s == nseg - 1 and len(pieces) > 1:
+                    aux = sum(1 << q for q in range(len(pieces)) if q != r) | nh << 8
+                walks[xp].append((s, r << 26 | (s0 + s) * H + h, aux))
+    # Per XCD: scans first (longest first), then pass C by segment position.
+    lists = [
+        [
+            [e, cap]
+            for items, cap in sorted(scans[q], key=lambda t: -t[1])
+            for e in items
+        ]
+        + [[e, aux] for _, e, aux in sorted(walks[q], key=lambda t: t[0])]
+        for q in range(NX)
+    ]
+    tab = []
+    for i in range(max(len(lst) for lst in lists)):
+        for q in range(NX):
+            tab += lists[q][i] if i < len(lists[q]) else [-1, 0]
+    nscan = sum(len(scans[q]) * NVS for q in range(NX))
+    return torch.tensor(tab, dtype=torch.int32, device=device), rmax, nscan
+
+
+_EPOCH_BUFS = {}
+
+
+def _call_epoch(device):
+    # One int32 counter per stream; the gfx950 K1 advances it on the device, so
+    # CUDA graph replays get a new epoch too.
+    key = ("epoch", str(device), torch.cuda.current_stream(device).cuda_stream)
+    if key not in _EPOCH_BUFS:
+        _EPOCH_BUFS[key] = torch.zeros(1, dtype=torch.int32, device=device)
+    return _EPOCH_BUFS[key]
+
+
+def _epoch_buf(name, device, n, dtype):
+    key = (name, str(device), torch.cuda.current_stream(device).cuda_stream)
+    buf = _EPOCH_BUFS.get(key)
+    if buf is None or buf.numel() < n:
+        buf = _EPOCH_BUFS[key] = torch.zeros(
+            max(n, 1 << 16), dtype=dtype, device=device
+        )
+    return buf, _call_epoch(device)
+
+
+@functools.lru_cache(maxsize=64)
+def _pass_a_rows(seqs, C, seg_lens, H, n_w, device):
+    rows, g_chunk, i_seg = [], 0, 0
+    for (bos, eos), lens in zip(seqs, seg_lens):
+        c0 = 0
+        for k, m in enumerate(lens):
+            if k != len(lens) - 1:
+                rows.append(
+                    [i_seg, g_chunk + c0, m, bos + c0 * C, min(bos + (c0 + m) * C, eos)]
+                )
+            c0 += m
+            i_seg += 1
+        g_chunk += c0
+    items = sorted((-r[2], i, h) for i, r in enumerate(rows) for h in range(H))
+    n = len(items)
+    NX = get_num_xcds()  # pass A's remap_xcd runs with NUM_XCDS = get_num_xcds()
+    G = n * n_w
+    ppx, tall = (G + NX - 1) // NX, G % NX or NX
+    starts = [min(x, tall) * ppx + max(0, x - tall) * (ppx - 1) for x in range(NX + 1)]
+    cus = max(1, get_num_sms() // NX)
+    slot = []  # (XCD, wave, CU) of table row q (programs q * n_w ..)
+    for q in range(n):
+        x = max(y for y in range(NX) if starts[y] <= q * n_w)
+        slot.append((x, (q * n_w - starts[x]) // cus, (q * n_w - starts[x]) % cus))
+    firsts = sorted(
+        (q for q in range(n) if slot[q][1] == 0), key=lambda q: slot[q][::-1]
+    )
+    order = dict(zip(firsts, items))
+    rest = items[len(firsts) :]
+    part = {(slot[q][0], slot[q][2]): -order[q][0] for q in firsts}
+    later = [q for q in range(n) if slot[q][1] > 0]
+    for q in sorted(later, key=lambda q: -part.get((slot[q][0], slot[q][2]), 0)):
+        order[q] = rest.pop()
+    tab = [rows[order[q][1]] + [order[q][2], 0, 0] for q in range(n)]
+    return torch.tensor(tab, dtype=torch.int32, device=device)
+
+
 @functools.lru_cache(maxsize=64)
 def _build_segments(
     seqs: tuple[tuple[int, int], ...],
     C: int,
-    chunks_per_seg: int,
+    seg_lens: tuple,
     device: torch.device,
 ):
     """Descriptors for the segmented recurrence.
@@ -1112,12 +1273,12 @@ def _build_segments(
     chunk_base, nchunks, tok_base, tok_end, seq_id, is_last = [], [], [], [], [], []
     seq_seg_off = [0]
     g_chunk = 0
-    for i, (bos, eos) in enumerate(seqs):
+    for i, ((bos, eos), lens) in enumerate(zip(seqs, seg_lens)):
         nch = triton.cdiv(eos - bos, C)
-        nseg = max(1, triton.cdiv(nch, chunks_per_seg))
+        nseg = len(lens)
         for s in range(nseg):
-            c0 = s * chunks_per_seg
-            m = min(chunks_per_seg, nch - c0)
+            c0 = sum(lens[:s])
+            m = lens[s]
             chunk_base.append(g_chunk + c0)
             nchunks.append(m)
             tok_base.append(bos + c0 * C)
@@ -1178,7 +1339,7 @@ def _check_paged_state_cache(
         raise ValueError(f"state_indices and has_initial_state must have N={N} entries")
 
 
-@input_guard(skip=("q", "k", "v", "g", "state_cache", "out"))
+@input_guard(skip=("q", "k", "v", "g", "state_cache", "out", "out_gate"))
 def flash_kda_fwd(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -1199,6 +1360,9 @@ def flash_kda_fwd(
     state_cache: torch.Tensor | None = None,
     state_indices: torch.Tensor | None = None,
     has_initial_state: torch.Tensor | None = None,
+    out_gate: torch.Tensor | None = None,
+    norm_weight: torch.Tensor | None = None,
+    norm_eps: float = 1e-5,
 ) -> tuple[torch.Tensor, torch.Tensor | None]:
     """
     Two-kernel KDA forward, with an optional segmented (context parallel) scan.
@@ -1236,6 +1400,14 @@ def flash_kda_fwd(
                             ``[0, slots)``. Not range-checked: that would
                             need a host sync per call.
         has_initial_state:  Bool ``[N]``; false starts that sequence from zero.
+        out_gate:           Optional ``[B, T, H, V]`` gate of the fused output
+                            norm ``o = rmsnorm(o) * norm_weight * sigmoid(out_gate)``
+                            (RMS over V, fp32 math). Head and element strides
+                            must be ``V`` and 1; the token stride may be wider
+                            (a slice of a projection).
+        norm_weight:        ``[V]`` weight of the fused norm; required with
+                            ``out_gate``.
+        norm_eps:           Epsilon of the fused norm.
 
     Returns:
         ``(o, final_state)`` with ``o`` shaped like ``v``. ``final_state`` is
@@ -1269,8 +1441,21 @@ def flash_kda_fwd(
         if not out.is_contiguous():
             raise ValueError("out must be contiguous")
 
+    norm = out_gate is not None
+    if norm:
+        norm_weight = norm_weight.to(torch.float32).contiguous()
     use_gluon_k1 = AITER_FDA_USE_GLUON_K1 and _gluon_k1_usable(C, K)
     use_gluon_k2 = AITER_FDA_USE_GLUON_K2 and _gluon_k2_usable(C, K, V)
+    # The gfx950 Gluon K1 workspace is read only by the Gluon K2: all Gluon or none.
+    gluon_pipeline = DEVICE_ARCH == "gfx950" and use_gluon_k1 and use_gluon_k2
+    gluon_pipeline = gluon_pipeline and all(
+        _k2c_gluon_schedule(seg) is not None for seg in (0, 1)
+    )
+    gluon_pipeline = gluon_pipeline and (
+        _published_gluon_schedule("flash_kda_gluon_plan") is not None
+    )
+    use_gluon_k1 = use_gluon_k1 and (gluon_pipeline or DEVICE_ARCH != "gfx950")
+    use_gluon_k2 = use_gluon_k2 and (gluon_pipeline or DEVICE_ARCH != "gfx950")
     # The gfx1250 Gluon kernels read q, k, g (K1) and v (K2) at their own token
     # stride. Every other kernel needs them packed.
     stride_q = stride_k = stride_g = H * K
@@ -1321,14 +1506,23 @@ def flash_kda_fwd(
     # here rather than next to _build_segments because K1 launches first and the
     # cache modifiers below depend on the answer.
     n_chunks_max = max(triton.cdiv(eos - bos, C) for bos, eos in seqs)
+    nchs = [triton.cdiv(eos - bos, C) for bos, eos in seqs]
     if chunks_per_seg is None:
-        chunks_per_seg = _choose_chunks_per_seg(n_chunks_max, N, H, V)
+        chunks_per_seg = _choose_chunks_per_seg(
+            n_chunks_max, N, H, V, nchs if gluon_pipeline else None
+        )
     elif chunks_per_seg <= 0:
         chunks_per_seg = n_chunks_max
     segmented = n_chunks_max > chunks_per_seg
+    plan = _published_gluon_schedule("flash_kda_gluon_plan")
+    if gluon_pipeline and segmented and n_chunks_max >= plan.kwargs["TAPER_MIN_CHUNKS"]:
+        chunks_per_seg = min(
+            max(chunks_per_seg, plan.kwargs["TAPER_SEG_CHUNKS"]), n_chunks_max
+        )
+    seg_lens = _seg_plan(seqs, C, chunks_per_seg, H, gluon_pipeline and segmented)
 
-    CM_LOAD = ".cg"
-    CM_STORE = "" if segmented else ".wt"
+    CM_LOAD = "" if gluon_pipeline else ".cg"
+    CM_STORE = "" if segmented or gluon_pipeline else ".wt"
     CM_OUT_STORE = "" if segmented else ".cs"
 
     ws_shape = (H * total_tiles, C, K)
@@ -1351,17 +1545,8 @@ def flash_kda_fwd(
     # here when unsegmented; segmented, it is settled once the segment count is
     # known.
     use_gluon_k2a = use_gluon_k2 and segmented
-    use_gluon_k2c = (
-        use_gluon_k2
-        and _GLUON_K2C_ARCH_OK
-        and (DEVICE_ARCH == "gfx1250" or segmented or _k2c_gluon_usable(False, V, N, H))
-    )
-    # sigmoid(beta) per tile, read only by the gfx950 Gluon K2.
-    ws_beta = (
-        torch.empty(H * total_tiles, C, dtype=torch.float32, device=dev)
-        if DEVICE_ARCH == "gfx950" and (use_gluon_k2a or use_gluon_k2c)
-        else None
-    )
+    use_gluon_k2c = gluon_pipeline or (use_gluon_k2 and DEVICE_ARCH == "gfx1250")
+    ws_beta = None
 
     if use_gluon_k1:
         if DEVICE_ARCH == "gfx1250":
@@ -1384,9 +1569,9 @@ def flash_kda_fwd(
 
             k1_sched = _published_gluon_schedule("k1_prepare_gluon")
             k1_args = {
-                "ws_beta": ws_beta,
                 "num_warps": k1_sched.num_warps,
                 "waves_per_eu": k1_sched.kwargs.get("waves_per_eu", 0),
+                "epoch": _call_epoch(dev) if gluon_pipeline else None,
             }
 
         gluon_k1_prepare(
@@ -1402,7 +1587,11 @@ def flash_kda_fwd(
             ws_gt=ws_gt,
             ws_inv_mqk=ws_inv_mqk,
             cu_seqlens=cu_seqlens,
-            chunk_indices=chunk_indices,
+            chunk_indices=(
+                chunk_indices
+                if cu_seqlens is None or not gluon_pipeline
+                else _tile_table(cu_seqlens, chunk_indices, C)
+            ),
             scale=scale,
             lower_bound=lower_bound,
             T=T,
@@ -1448,9 +1637,7 @@ def flash_kda_fwd(
             CM_WS=CM_STORE,
         )
 
-    desc, seq_seg_off, num_segs, max_segs = _build_segments(
-        seqs, C, chunks_per_seg, dev
-    )
+    desc, seq_seg_off, num_segs, max_segs = _build_segments(seqs, C, seg_lens, dev)
     seg_chunk_base, seg_nchunks, seg_tok_base, seg_tok_end, seg_seq, seg_is_last = desc
 
     # The kernel indexes h_in by segment, so normalize a V-first initial state
@@ -1530,8 +1717,11 @@ def flash_kda_fwd(
     if max_segs > 1:
         # Pass A: b_seg (affine part) and A_seg (linear part), both fully
         # parallel across segments. Neither writes outputs.
-        b_seg = torch.empty(num_segs, H, K, V, dtype=torch.float32, device=dev)
-        A_seg = torch.empty(num_segs, H, K, K, dtype=torch.bfloat16, device=dev)
+        # The Gluon scan takes bf16 b and fp8 A.
+        b_ty = torch.bfloat16 if gluon_pipeline else torch.float32
+        A_ty = torch.float8_e4m3fn if gluon_pipeline else torch.bfloat16
+        b_seg = torch.empty(num_segs, H, K, V, dtype=b_ty, device=dev)
+        A_seg = torch.empty(num_segs, H, K, K, dtype=A_ty, device=dev)
         if use_gluon_k2a and DEVICE_ARCH == "gfx1250":
             sched = _k2_gluon_schedule(V, num_segs, H)
             _g2.gluon_k2_ab_fused(
@@ -1564,21 +1754,18 @@ def flash_kda_fwd(
                 ws_kd=ws_kd,
                 ws_kr=ws_kr,
                 ws_gt=ws_gt,
-                ws_beta=ws_beta,
                 ws_inv_mqk=ws_inv_mqk,
                 v_input=v,
                 h_out_b=b_seg,
                 h_out_a=A_seg,
-                seg_chunk_base=seg_chunk_base,
-                seg_nchunks=seg_nchunks,
-                seg_tok_base=seg_tok_base,
-                seg_tok_end=seg_tok_end,
+                seg_rows=_pass_a_rows(
+                    seqs, C, seg_lens, H, V // sched.kwargs["BW"], dev
+                ),
                 TOTAL_TILES=total_tiles,
                 H=H,
                 K=K,
                 V=V,
                 C=C,
-                num_segs=num_segs,
                 BW=sched.kwargs["BW"],
                 num_warps=sched.num_warps,
                 waves_per_eu=sched.kwargs.get("waves_per_eu", 0),
@@ -1603,7 +1790,8 @@ def flash_kda_fwd(
                     STORE_FINAL=False,
                 )
 
-        # Pass B: propagate across segments. Depth is the segment count.
+    if max_segs > 1 and not gluon_pipeline:
+        # Pass B: propagate across segments (gfx950 Gluon runs it in pass C's launch).
         h_in = torch.empty(num_segs, H, K, V, dtype=torch.float32, device=dev)
         BV_SCAN, SCAN_WARPS = _scan_schedule(N, H, V)
         scan = _seg_scan_prefetch_fast if _SCAN_PREFETCH else _seg_scan_fast
@@ -1620,12 +1808,10 @@ def flash_kda_fwd(
             **paged_args,
             num_warps=SCAN_WARPS,
         )
-    else:
+    elif max_segs <= 1:
         h_in = None if paged else h0
 
     # Pass C: re-run each segment from its true incoming state, writing outputs.
-    if use_gluon_k2c and DEVICE_ARCH == "gfx950" and segmented:
-        use_gluon_k2c = _k2c_gluon_usable(True, V, num_segs, H)
     _log_route(
         use_gluon_k1, use_gluon_k2a if segmented else None, use_gluon_k2c, C, K, V
     )
@@ -1639,7 +1825,55 @@ def flash_kda_fwd(
             }
         else:
             sched = _k2c_gluon_schedule(segmented)
-            arch_args = {"ws_beta": ws_beta}
+            bw, nx, cus = sched.kwargs["BW"], get_num_xcds(), get_num_sms()
+            norm_args = dict(
+                out_gate=out_gate, norm_weight=norm_weight, norm_eps=norm_eps
+            )
+            arch_args = norm_args if norm else {}
+            # Copier-wave walk: both V halves of each stream must be resident at once.
+            per_xcd = 2 * triton.cdiv(num_segs * H, nx)
+            if (
+                norm
+                and paged
+                and not segmented
+                and 2 * bw == V
+                and per_xcd <= cus // nx
+            ):
+                xb_n = H * total_tiles * 2 * C
+                arch_args["xbuf"], arch_args["xepoch"] = _epoch_buf(
+                    "cw", dev, xb_n, torch.int64
+                )
+            elif bw < V and (norm or triton.cdiv(V, bw) * num_segs * H > cus):
+                # Full V row per program: needed by the norm, or to fit one wave.
+                sched = triton.Config({"BW": V}, num_warps=sched.num_warps * V // bw)
+            if segmented:
+                # The scan in the same launch, in 16-column V slices.
+                nsegs = tuple(map(len, seg_lens))
+                bv = 16
+                tab, rmax, nscan = _scf_table(nsegs, H, V // bv, dev)
+                if nscan > plan.kwargs["SCAN_MAX_PROGS_PER_CU"] * cus:
+                    bv = 32
+                    tab, rmax, nscan = _scf_table(nsegs, H, V // bv, dev)
+                n_fl = rmax * (num_segs + N) * H * (V // bv) * sched.num_warps
+                sflags, ep = _epoch_buf("scf", dev, n_fl, torch.int32)
+                h_in = torch.empty(
+                    rmax, num_segs, H, K, V, dtype=torch.bfloat16, device=dev
+                )
+                arch_args["scf"] = dict(
+                    tab=tab,
+                    RMAX=rmax,
+                    A_seg=A_seg,
+                    b_seg=b_seg,
+                    h0=h0,
+                    NH=N * H,
+                    seq_seg_off=seq_seg_off,
+                    sflags=sflags,
+                    xepoch=ep,
+                    BV=bv,
+                    HSLAB=num_segs * H * K * V,
+                    HAS_H0=paged or h0 is not None,
+                    FSLAB=num_segs * H * (V // bv) * sched.num_warps,
+                )
         _g2.gluon_k2_c(
             ws_kd=ws_kd,
             ws_qd=ws_qd,
@@ -1686,5 +1920,10 @@ def flash_kda_fwd(
             STORE_FINAL=store_final,
             **(paged_args if paged else {}),
         )
+    if norm and not gluon_pipeline:
+        # The norm on the other routes: on the output, fp32 math.
+        o_f = o.float()
+        o_f = o_f * torch.rsqrt(o_f.square().mean(-1, keepdim=True) + norm_eps)
+        o.copy_(o_f * norm_weight * torch.sigmoid(out_gate.float()))
 
     return o, final_state
