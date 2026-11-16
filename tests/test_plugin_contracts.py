@@ -629,6 +629,20 @@ def test_the_parameter_gate_matches_the_names_it_claims_to_guard():
 # "no schema can express it" -- a parameter whose type is AITER's own.
 _NOT_REGISTERED = {
     "gemm_a8w8_blockscale_bpreshuffle": "out-buffer in the contract (`out`)",
+    "gemm_a16w16": (
+        "out-buffer in the contract (`out`); every caller reaches it through "
+        "the torch_compile_guard of `gemm_a16w16` or `gemm_a16w16_out`, which "
+        "is already one opaque op"
+    ),
+    "gemm_a16w16_activation": (
+        "out-buffer in the contract (`y`); every caller reaches it through the "
+        "torch_compile_guard of the Triton `gemm_a16w16_`, which is already one "
+        "opaque op"
+    ),
+    "gemm_a8w8_blockscale_out": (
+        "out-buffer in the contract (`y`), and no schema can express it "
+        "(`config` is a dict)"
+    ),
     "inverse_rope_group_quant": "out-buffer in the contract (`x_fp8`, `x_scale`)",
     "mla_sparse_prefill": "out-buffer in the contract (`out`)",
     "mla_sparse_prefill_v41": "out-buffer in the contract (`out`)",

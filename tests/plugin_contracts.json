@@ -27,6 +27,20 @@
   "supersedes": [],
   "version": 1
  },
+ "gemm_a16w16": {
+  "fingerprint": "a95a96be1d755acc",
+  "signature": "A:positional:Tensor, B:positional:Tensor, bias:positional:Tensor | None=None, otype:positional:torch.dtype | None=None, scale_a:positional:Tensor | None=None, scale_b:positional:Tensor | None=None, scale_c:positional:Tensor | None=None, out:positional:Tensor | None=None, -> Tensor",
+  "source": "aiter/tuned_gemm.py",
+  "supersedes": [],
+  "version": 1
+ },
+ "gemm_a16w16_activation": {
+  "fingerprint": "ebca7f258a00ce5a",
+  "signature": "x:positional:torch.Tensor, w:positional:torch.Tensor, bias:positional:torch.Tensor | None=None, dtype:positional:torch.dtype | None=torch.bfloat16, y:positional:torch.Tensor | None=None, config:positional:str | None=None, activation:positional:str | None=None, skip_reduce:positional:bool | None=False, kernel_type:positional:str='bandwidth_bound', persistent:positional:bool=False, -> torch.Tensor",
+  "source": "aiter/ops/triton/gemm/basic/gemm_a16w16.py",
+  "supersedes": [],
+  "version": 1
+ },
  "gemm_a8w8_blockscale": {
   "fingerprint": "47ec95c460883544",
   "signature": "XQ:positional:Tensor, WQ:positional:Tensor, x_scale:positional:Tensor, w_scale:positional:Tensor, dtype:positional:torch.dtype=dtypes.bf16, isBpreshuffled:positional:bool=False, split_k:positional:int | None=None, -> torch.Tensor",
@@ -38,6 +52,13 @@
   "fingerprint": "dd8528ae4b58d9bb",
   "signature": "XQ:positional:Tensor, WQ:positional:Tensor, x_scale:positional:Tensor, w_scale:positional:Tensor, dtype:positional:torch.dtype=dtypes.bf16, out:positional:Tensor | None=None, -> Tensor",
   "source": "aiter/ops/gemm_op_a8w8.py",
+  "supersedes": [],
+  "version": 1
+ },
+ "gemm_a8w8_blockscale_out": {
+  "fingerprint": "2dd810d09a75761b",
+  "signature": "x:positional:torch.Tensor, w:positional:torch.Tensor, x_scale:positional:torch.Tensor, w_scale:positional:torch.Tensor, dtype:positional:torch.dtype | None=torch.bfloat16, y:positional:torch.Tensor | None=None, config:positional:dict | None=None, skip_reduce:positional:bool | None=False, kernel_type:positional:str='bandwidth_bound', -> torch.Tensor",
+  "source": "aiter/ops/triton/gemm/basic/gemm_a8w8_blockscale.py",
   "supersedes": [],
   "version": 1
  },
