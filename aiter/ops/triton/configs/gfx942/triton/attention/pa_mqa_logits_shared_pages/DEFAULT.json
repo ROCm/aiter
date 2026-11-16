@@ -1,5 +1,5 @@
 {
-    "_step5_paged_mqa_logits_kernel": {
+    "_pa_mqa_logits_shared_pages_kernel": {
         "BLOCK_M": 128,
         "TILE": 256,
         "TILES_PER_PROGRAM": 8,

@@ -404,6 +404,102 @@ def check_graph_replay_reads_lengths_on_device():
         ).all(), f"{name}: replay wrote past the new context length"
 
 
+def check_triton_backend_matches_reference():
+    """The Triton backend serves few heads and a float8_e4m3fn cache on
+    every supported arch, and the op picks it for a float8_e4m3fn query on
+    gfx942."""
+    batch, next_n, heads, head_dim, kvb, kv_len = 64, 1, 8, 256, 32, 2048
+    inp = build_inputs((batch, next_n, heads, head_dim, kvb, False), kv_len, kv_len)
+    flat = inp["kv_raw"].view(inp["kv_raw"].shape[0], -1)
+    keys = flat[:, : kvb * head_dim].view(dtypes.fp8).float()
+    flat[:, : kvb * head_dim] = keys.to(torch.float8_e4m3fn).view(torch.uint8)
+    inp["q_fp8"] = inp["q_fp8"].float().to(torch.float8_e4m3fn)
+    inp["kv_cache"] = inp["kv_raw"]
+    args = launch_args(inp)
+    if not pmql.triton_supports(
+        inp["q_fp8"], inp["kv_cache"], inp["weights"], False, kvb
+    ):
+        aiter.logger.warning("paged_mqa_logits Triton backend unsupported; skipping")
+        return
+    q = inp["q_fp8"].float()
+    kv = keys.to(torch.float8_e4m3fn).float().view(-1, kvb, head_dim)
+    scales = flat[:, kvb * head_dim :].contiguous().view(torch.float32)
+    kv = kv * scales.view(-1, kvb, 1)
+    pos = torch.arange(kv_len)
+    blk = inp["kv_indices"][:, pos // kvb]
+    ref = torch.einsum("bnhd,bpd->bnhp", q, kv[blk, pos % kvb]).relu()
+    ref = (ref * inp["weights"].view(batch, next_n, heads, 1)).sum(dim=2)
+    ref = ref.view(batch * next_n, kv_len)
+    launches = {
+        "triton": lambda: pmql.run_paged_mqa_logits(pmql.TRITON_CONFIG, *args),
+    }
+    if get_gfx_runtime() == "gfx942":
+        launches["paged_mqa_logits"] = lambda: pmql.paged_mqa_logits(*args)
+    for name, launch in launches.items():
+        inp["out_logits"].fill_(float("-inf"))
+        with torch.inference_mode():
+            got = launch()[:, :kv_len]
+        diff = calc_diff(ref, got)
+        assert diff < 1e-3, f"{name}: e4m3fn calc_diff={diff}"
+
+
+def check_triton_row_falls_back_to_gluon():
+    """A Triton row the kernel cannot serve, such as a preshuffled cache, runs
+    that row's Gluon knobs."""
+    original_cfg = pmql.get_paged_mqa_logits_config
+    original_run = pmql.run_paged_mqa_logits
+    launched = {}
+
+    def spy(config, *args, **kwargs):
+        launched["config"] = dict(config)
+        return args[3]
+
+    pmql.get_paged_mqa_logits_config = lambda *a, **k: {
+        "backend": "triton",
+        "ChunkK": 128,
+        "WavePerEU": 4,
+        "wg_per_cu": 0,
+    }
+    pmql.run_paged_mqa_logits = spy
+    try:
+        pmql.paged_mqa_logits(
+            torch.empty((1, 1, HEADS, HEAD_DIM), dtype=dtypes.fp8),
+            torch.empty((1, KV_BLOCK_SIZE, 1, HEAD_DIM + 4), dtype=torch.uint8),
+            torch.empty((1, HEADS), dtype=torch.float32),
+            torch.empty((1, 64), dtype=torch.float32),
+            torch.ones((1,), dtype=torch.int32),
+            torch.zeros((1, 1), dtype=torch.int32),
+            64,
+            True,
+            KV_BLOCK_SIZE,
+        )
+    finally:
+        pmql.get_paged_mqa_logits_config = original_cfg
+        pmql.run_paged_mqa_logits = original_run
+    assert launched["config"] == {
+        "backend": "gluon",
+        "ChunkK": 128,
+        "WavePerEU": 4,
+        "wg_per_cu": 0,
+    }, launched["config"]
+
+
+def check_unsupported_fp8_format_rejected():
+    """A query in the other FP8 format that no backend reads raises, instead
+    of being read as the native format and giving scaled scores."""
+    other = {
+        torch.float8_e4m3fn: torch.float8_e4m3fnuz,
+        torch.float8_e4m3fnuz: torch.float8_e4m3fn,
+    }[dtypes.fp8]
+    inp = build_inputs((4, 1, HEADS, HEAD_DIM, KV_BLOCK_SIZE, False), 256, 256)
+    inp["q_fp8"] = inp["q_fp8"].float().to(other)
+    try:
+        pmql.paged_mqa_logits(*launch_args(inp))
+    except ValueError:
+        return
+    raise AssertionError("paged_mqa_logits accepted an unsupported FP8 format")
+
+
 def main():
     if os.environ.get(_SHIPPED_ROW_CHILD):
         assert get_gfx() != get_gfx_runtime()
@@ -417,6 +513,9 @@ def main():
     check_strided_context_lens_rejected()
     check_2d_context_lens_matches_reference()
     check_graph_replay_reads_lengths_on_device()
+    check_triton_backend_matches_reference()
+    check_triton_row_falls_back_to_gluon()
+    check_unsupported_fp8_format_rejected()
 
     parser = argparse.ArgumentParser(
         formatter_class=argparse.RawTextHelpFormatter,

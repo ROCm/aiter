@@ -1,14 +1,17 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
-"""Benchmark the Step-5 CSA paged MQA logits kernel.
+"""Benchmark the shared-pages FP8 paged MQA logits kernel.
 
-The default shape is one prefill chunk of the Step-5 indexer: 4096 query rows
-that share one page table, with causal lengths up to 8000 regions.
+The default shape is one Step-5 CSA prefill indexer chunk: 4096 query rows
+that share one page table, with causal lengths up to 8000 keys.
 """
 
+import torch
 import triton
 
-from aiter.ops.triton.attention.step5_paged_mqa_logits import step5_paged_mqa_logits
+from aiter.ops.triton.attention.pa_mqa_logits_shared_pages import (
+    pa_mqa_logits_shared_pages,
+)
 from op_tests.op_benchmarks.triton.utils.argparse import (
     get_parser,
     override_parser_action,
@@ -16,15 +19,16 @@ from op_tests.op_benchmarks.triton.utils.argparse import (
 from op_tests.op_benchmarks.triton.utils.benchmark_utils import (
     get_caller_name_no_ext,
 )
-from op_tests.triton_tests.attention.test_step5_paged_mqa_logits import (
-    HEAD_DIM,
+from op_tests.triton_tests.attention.test_pa_mqa_logits_shared_pages import (
     make_inputs,
 )
 
 
 def run_benchmark(args):
-    x_names = ["rows", "regions", "heads", "page_size", "layout"]
-    x_vals = [[args.rows, args.regions, args.heads, args.page_size, args.layout]]
+    x_names = ["rows", "keys", "heads", "head_dim", "page_size", "layout"]
+    x_vals = [
+        [args.rows, args.keys, args.heads, args.head_dim, args.page_size, args.layout]
+    ]
     ylabel = {"time": "Time (us)", "throughput": "TFLOPS"}[args.metric]
     benchmark = triton.testing.Benchmark(
         x_names=x_names,
@@ -39,29 +43,36 @@ def run_benchmark(args):
     )
 
     @triton.testing.perf_report([benchmark])
-    def bench_step5_paged_mqa_logits(
-        rows, regions, heads, page_size, layout, metric, **kwargs
+    def bench_pa_mqa_logits_shared_pages(
+        rows, keys, heads, head_dim, page_size, layout, metric, **kwargs
     ):
-        inputs = make_inputs(rows, 1, heads, page_size, regions, layout)
-        seq_lens = inputs[-1]
+        q, kv_cache, weights, lengths, block_tables = make_inputs(
+            rows, 1, heads, page_size, keys, layout, head_dim=head_dim
+        )
+        out = torch.empty((rows, keys), dtype=torch.float32, device="cuda")
 
         def fn():
-            return step5_paged_mqa_logits(*inputs, regions)
+            return pa_mqa_logits_shared_pages(
+                q, kv_cache, weights, out, lengths, block_tables, keys
+            )
 
         time_ms = triton.testing.do_bench(fn, warmup=25, rep=100)
         if metric == "time":
             return time_ms * 1e3
-        flops = 2.0 * heads * HEAD_DIM * seq_lens.sum().item()
+        flops = 2.0 * heads * head_dim * lengths.sum().item()
         return flops / (time_ms * 1e-3) / 1e12
 
-    bench_step5_paged_mqa_logits.run(save_path="." if args.o else None, print_data=True)
+    bench_pa_mqa_logits_shared_pages.run(
+        save_path="." if args.o else None, print_data=True
+    )
 
 
 def main():
-    parser = get_parser(kernel_name="Step-5 Paged MQA Logits")
+    parser = get_parser(kernel_name="Shared-pages Paged MQA Logits")
     parser.add_argument("--rows", type=int, default=4096, help="query rows")
-    parser.add_argument("--regions", type=int, default=8000, help="max_seq_len")
-    parser.add_argument("--heads", type=int, choices=[4, 8, 16], default=16)
+    parser.add_argument("--keys", type=int, default=8000, help="max_model_len")
+    parser.add_argument("--heads", type=int, choices=[4, 8, 16], default=8)
+    parser.add_argument("--head-dim", type=int, choices=[128, 256], default=256)
     parser.add_argument("--page-size", type=int, default=32)
     parser.add_argument(
         "--layout",

@@ -6,7 +6,9 @@
 cached token inside that row's causal bound. It takes:
 
 - ``q_fp8``: ``[B, next_n, H, D]`` FP8 E4M3 queries (``float8_e4m3fn`` on
-  gfx950, ``float8_e4m3fnuz`` on gfx942).
+  gfx950, ``float8_e4m3fnuz`` on gfx942). The ``triton`` backend also takes
+  ``float8_e4m3fn`` on gfx942, so vLLM's e4m3fn indexer cache needs no
+  conversion.
 - ``kv_cache``: ``[num_blocks, KVBlockSize, 1, D + 4]`` uint8. Each block holds
   its ``KVBlockSize x D`` FP8 keys followed by ``KVBlockSize`` FP32 scales; the
   keys are 16x16-preshuffled when ``Preshuffle``.
@@ -22,10 +24,12 @@ cached token inside that row's causal bound. It takes:
 It never reads device memory on the host, so it can be captured in a CUDA
 graph.
 
-The backend (Gluon or FlyDSL) and its launch knobs come from the tuned table
-``AITER_CONFIG_PAGED_MQA_LOGITS`` (``aiter/configs/paged_mqa_logits_tuned.csv``,
+The backend (Gluon, FlyDSL or Triton) and its launch knobs come from the tuned
+table ``AITER_CONFIG_PAGED_MQA_LOGITS`` (``aiter/configs/paged_mqa_logits_tuned.csv``,
 plus any ``model_configs/*paged_mqa_logits_tuned*.csv``). Tune new shapes with
-``csrc/paged_mqa_logits/paged_mqa_logits_tune.py``.
+``csrc/paged_mqa_logits/paged_mqa_logits_tune.py``. The Triton backend
+(``pa_mqa_logits_shared_pages``) serves 4 to 16 heads; its tiles live in its
+own JSON config.
 
 Rows are keyed on ``(gfx, cu_num, batch_size, next_n, heads, head_dim,
 kv_block_size, preshuffle)``: everything a decode CUDA graph fixes at capture.
@@ -37,8 +41,9 @@ The ``context_len`` column only records which lengths a row was tuned over
 
 A batch size with no row uses the row of the largest tuned batch size below it;
 a shape with no row at all uses Gluon with ``ChunkK=256, WavePerEU=2``. A
-FlyDSL row the kernel cannot run uses that row's Gluon knobs, and those
-defaults when the row stored zeros.
+FlyDSL or Triton row the kernel cannot run uses that row's Gluon knobs, and
+those defaults when the row stored zeros. A ``float8_e4m3fn`` query on gfx942
+always goes to the Triton backend, the only one that reads it.
 """
 
 from __future__ import annotations
@@ -49,14 +54,15 @@ import math
 
 import torch
 
-from aiter import logger
+from aiter import dtypes, logger
 from aiter.jit.core import AITER_CONFIGS, AITER_LOG_TUNED_CONFIG
 from aiter.jit.utils.chip_info import get_cu_num, get_gfx_runtime
 
 __all__ = ["get_paged_mqa_logits_config", "paged_mqa_logits"]
 
-BACKENDS = ("gluon", "flydsl")
+BACKENDS = ("gluon", "flydsl", "triton")
 DEFAULT_CONFIG = {"backend": "gluon", "ChunkK": 256, "WavePerEU": 2, "wg_per_cu": 0}
+TRITON_CONFIG = {"backend": "triton", "ChunkK": 0, "WavePerEU": 0, "wg_per_cu": 0}
 # FlyDSL kernel: 50 KiB of LDS per CTA, so three CTAs fit on a CU.
 FLYDSL_DEFAULT_WG_PER_CU = 3
 
@@ -205,6 +211,31 @@ def flydsl_split_kv(batch_size: int, max_model_len: int, wg_per_cu: int, device)
     return max(1, min(pages, math.ceil(total_cu * wg_per_cu / batch_size)))
 
 
+def triton_supports(q_fp8, kv_cache, weights, Preshuffle, KVBlockSize) -> bool:
+    """Whether the Triton ``pa_mqa_logits_shared_pages`` kernel can serve this call."""
+    if Preshuffle or q_fp8.dim() != 4:
+        return False
+    from aiter.ops.triton.attention import pa_mqa_logits_shared_pages as shared
+
+    _, _, heads, head_dim = q_fp8.shape
+    gfx = get_gfx_runtime()
+    return (
+        gfx in ("gfx942", "gfx950")
+        and shared.has_launch_config()
+        and heads in shared.SUPPORTED_HEADS
+        and head_dim in shared.SUPPORTED_HEAD_DIMS
+        and (
+            q_fp8.dtype == torch.float8_e4m3fn
+            or (gfx == "gfx942" and q_fp8.dtype == torch.float8_e4m3fnuz)
+        )
+        and q_fp8.stride(-1) == 1
+        and tuple(kv_cache.shape[1:]) == (KVBlockSize, 1, head_dim + 4)
+        and kv_cache.dtype == torch.uint8
+        and kv_cache.is_contiguous()
+        and weights.dtype == torch.float32
+    )
+
+
 def run_paged_mqa_logits(
     config: dict,
     q_fp8: torch.Tensor,
@@ -241,6 +272,21 @@ def run_paged_mqa_logits(
         )
         return out_logits
 
+    if config["backend"] == "triton":
+        from aiter.ops.triton.attention.pa_mqa_logits_shared_pages import (
+            pa_mqa_logits_shared_pages,
+        )
+
+        return pa_mqa_logits_shared_pages(
+            q_fp8,
+            kv_cache,
+            weights,
+            out_logits,
+            context_lens,
+            kv_indices,
+            max_model_len,
+        )
+
     from aiter.ops.triton.attention.pa_mqa_logits import deepgemm_fp8_paged_mqa_logits
 
     deepgemm_fp8_paged_mqa_logits(
@@ -273,7 +319,9 @@ def paged_mqa_logits(
     """FP8 paged MQA logits with the tuned backend for this shape.
 
     Args:
-        q_fp8: ``[B, next_n, H, D]`` FP8 E4M3 queries.
+        q_fp8: ``[B, next_n, H, D]`` FP8 E4M3 queries. On gfx942 an
+            ``float8_e4m3fn`` query needs the Triton backend (4 to 16 heads,
+            ``D`` 128 or 256, no ``Preshuffle``).
         kv_cache: ``[num_blocks, KVBlockSize, 1, D + 4]`` uint8, FP8 keys
             co-packed with their FP32 per-token scales (16x16 preshuffled when
             ``Preshuffle``).
@@ -288,13 +336,21 @@ def paged_mqa_logits(
         ``out_logits``.
     """
     batch_size, next_n, heads, head_dim = q_fp8.shape
-    config = get_paged_mqa_logits_config(
-        batch_size, next_n, heads, head_dim, KVBlockSize, bool(Preshuffle)
-    )
-    if config["backend"] == "flydsl" and not flydsl_supports(
-        q_fp8, kv_cache, weights, Preshuffle, KVBlockSize
-    ):
-        # 0 means this FlyDSL row has no stored Gluon candidate.
+    args = (q_fp8, kv_cache, weights, Preshuffle, KVBlockSize)
+    if q_fp8.dtype != dtypes.fp8:
+        if not triton_supports(*args):
+            raise ValueError(
+                f"paged_mqa_logits: no backend takes a {q_fp8.dtype} query of "
+                f"shape {tuple(q_fp8.shape)} on {get_gfx_runtime()}"
+            )
+        config = dict(TRITON_CONFIG)
+    else:
+        config = get_paged_mqa_logits_config(
+            batch_size, next_n, heads, head_dim, KVBlockSize, bool(Preshuffle)
+        )
+    supports = {"flydsl": flydsl_supports, "triton": triton_supports}
+    if config["backend"] in supports and not supports[config["backend"]](*args):
+        # 0 means this row has no stored Gluon candidate.
         config = {
             "backend": "gluon",
             "ChunkK": config["ChunkK"] or DEFAULT_CONFIG["ChunkK"],
