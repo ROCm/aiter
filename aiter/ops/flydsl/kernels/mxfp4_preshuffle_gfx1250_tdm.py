@@ -3349,7 +3349,7 @@ def launch_gemm_a8w4_tdm(
     a_preshuffled: Constexpr[int] = 0,
     m_align: Constexpr[int] = 0,
     k_waves: Constexpr[int] = 1,
-    arg_m_expert_tile_map: fx.Tensor = None,
+    arg_m_expert_tile_map: fx.Pointer = None,
     m_alignment: Constexpr[int] = 0,
     expert_tile_m: Constexpr[int] = 0,
     direct_expert_map: Constexpr[int] = 0,
@@ -3548,9 +3548,7 @@ def launch_gemm_a8w4_tdm(
     if arg_splitk_sem is None:
         arg_splitk_sem = arg_c
     expert_map_ptr = (
-        fx.get_iter(arg_m_expert_tile_map)
-        if arg_m_expert_tile_map is not None
-        else arg_c
+        arg_m_expert_tile_map if arg_m_expert_tile_map is not None else arg_c
     )
     kargs = (
         arg_c,

@@ -968,19 +968,22 @@ def _grouped_a8w4_tdm_moe(
         # Split-K workgroups cooperate through a semaphore, not a cluster.
         cluster_m = cluster_n = 1
         _stage1_task_cap *= k_grid1
+    # Take the worker count the launcher will actually use (w/env overrides).
+    from aiter.ops.flydsl.grouped_gemm_mxfp4 import resolve_persistent_workers
+
     _stage1_single_task = (
         _sparse_routing
         and expert_mask is None
         and not _compact
         and not enable_ep_scatter
-        and int(persistent_workers) >= _stage1_task_cap
+        and resolve_persistent_workers(1, persistent_workers) >= _stage1_task_cap
     )
     _stage2_single_task = (
         _sparse_routing
         and expert_mask is None
         and not _compact
         and not enable_ep_scatter
-        and int(persistent_workers2) >= _stage2_task_cap
+        and resolve_persistent_workers(2, persistent_workers2) >= _stage2_task_cap
     )
     # Both GEMMs walk the same contiguous layout, each with its own tile height,
     # so every expert must start on a row that is a multiple of both. Aligning to

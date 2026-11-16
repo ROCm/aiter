@@ -347,26 +347,31 @@ def build_moe_contiguous_psum_remap_module(packed_expert_map: bool = False):
         # Use map to find experts instead of binary search
         expert_map_is_set = fx.Int64(ptrtoint(expert_tile_map)) != 0
         if expert_map_is_set & is_blk0:
-            e = tid
-            in_expert = e < fx.Uint32(experts)
-            if in_expert:
-                m_e = fx.Uint32(m_p[e])
-                aligned_rows = (m_e + tile_minus_1) // tile_v * tile_v
-                fine_tile = fx.Uint32(expert_tile_m)
-                map_start = fx.Uint32(starts_lds[e]) // fine_tile
-                map_count = aligned_rows // fine_tile
-                for local_tile in range(map_count):
-                    if const_expr(packed_expert_map):
-                        expert_end = fx.Uint32(starts_lds[e]) + m_e
-                        expert_bits = fx.Int64(e)
-                        if local_tile > 0:
-                            # bit 31 is a flag for if this expert's weights are reusable.
-                            # for reuse_resident_b policy
-                            expert_bits = expert_bits | fx.Int64(1 << 31)
-                        packed = (fx.Int64(expert_end) << fx.Int64(32)) | expert_bits
-                        expert_map_p[map_start + fx.Uint32(local_tile)] = packed
-                    else:
-                        expert_map_p[map_start + fx.Uint32(local_tile)] = fx.Int32(e)
+            # Process in chunks instead of one block, or 
+            # some experts get left behind and tests fail
+            for base in range(0, experts, MAX_EXPERTS_PER_BLOCK):
+                e = fx.Uint32(base) + tid
+                in_expert = e < fx.Uint32(experts)
+                if in_expert:
+                    m_e = fx.Uint32(m_p[e])
+                    aligned_rows = (m_e + tile_minus_1) // tile_v * tile_v
+                    fine_tile = fx.Uint32(expert_tile_m)
+                    map_start = fx.Uint32(starts_lds[e]) // fine_tile
+                    map_count = aligned_rows // fine_tile
+                    for local_tile in range(map_count):
+                        if const_expr(packed_expert_map):
+                            expert_end = fx.Uint32(starts_lds[e]) + m_e
+                            expert_bits = fx.Int64(e)
+                            if local_tile > 0:
+                                # bit 31 flags that this expert's weights are
+                                # reusable (reuse_resident_b policy).
+                                expert_bits = expert_bits | fx.Int64(1 << 31)
+                            packed = (fx.Int64(expert_end) << fx.Int64(32)) | expert_bits
+                            expert_map_p[map_start + fx.Uint32(local_tile)] = packed
+                        else:
+                            expert_map_p[map_start + fx.Uint32(local_tile)] = fx.Int32(
+                                e
+                            )
 
         # Only remap valid routes ([0, valid_route_count)); dead-tail routes hold
         # unwritten rows from the route kernel and must not be used as a row index.

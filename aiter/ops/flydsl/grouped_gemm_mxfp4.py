@@ -90,6 +90,17 @@ def _select_num_waves_per_tensor_tdm(csv_num_waves: int) -> int:
     return num_waves
 
 
+def resolve_persistent_workers(stage: int, persistent_workers: int) -> int:
+    """Worker count after the AITER_FLYDSL_PERSISTENT_WORKERS{stage} /
+    AITER_FLYDSL_PERSISTENT_WORKERS env overrides, which are taken over CSV."""
+    return int(
+        os.environ.get(
+            f"AITER_FLYDSL_PERSISTENT_WORKERS{stage}",
+            os.environ.get("AITER_FLYDSL_PERSISTENT_WORKERS", persistent_workers),
+        )
+    )
+
+
 _BIAS_MODE = {torch.bfloat16: 1, torch.float32: 2, torch.float16: 3}
 
 
@@ -252,12 +263,7 @@ def flydsl_grouped_gemm_a8w4_masked(
     # Simplifying to constant for decode to reduce runtime
     decode_static_m = int(stage == 1 and int(contiguous_m) <= 32768)
     constexpr_m = decode_static_m
-    persistent_workers = int(
-        os.environ.get(
-            f"AITER_FLYDSL_PERSISTENT_WORKERS{stage}",
-            os.environ.get("AITER_FLYDSL_PERSISTENT_WORKERS", persistent_workers),
-        )
-    )
+    persistent_workers = resolve_persistent_workers(stage, persistent_workers)
     if persistent_workers < 0:
         raise ValueError("persistent_workers must be nonnegative")
     persistent_single_task = int(persistent_single_task)
@@ -367,11 +373,9 @@ def flydsl_grouped_gemm_a8w4_masked(
         int(m_align),
         k_waves,
     )
-    expert_tile_map_tensor = (
-        m_expert_tile_map
-        if m_expert_tile_map is not None
-        else torch.empty(0, dtype=torch.int32, device=out.device)
-    ).view(-1)
+    expert_tile_map_ptr = ptr_arg(
+        m_expert_tile_map if m_expert_tile_map is not None else m_tile_map
+    )
     moe_spec = (
         m_alignment,
         int(expert_tile_m or tile_m),
@@ -412,7 +416,7 @@ def flydsl_grouped_gemm_a8w4_masked(
         float(situ_beta),
         float(situ_linear_beta),
         *layout_spec,
-        expert_tile_map_tensor,
+        expert_tile_map_ptr,
         *moe_spec,
         k_grid,
         ptr_arg(splitk_ws if splitk_ws is not None else out),
