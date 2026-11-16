@@ -135,6 +135,10 @@ else:
     from .ops.aiter_operator import *
     from .ops.activation import *
     from .ops.attention import *
+    from .ops.sparse_mla import (  # noqa: F401
+        sparse_mla_fp8_fwd,
+        allocate_sparse_mla_fp8_workspace,
+    )
     from .ops.custom import *
     from .ops.custom_all_reduce import *
     from .ops.quick_all_reduce import *
@@ -143,7 +147,9 @@ else:
     from .ops.moe_sorting_opus import *
     from .ops.moe_mxfp4_aux import *
     from .ops.mla_sparse_prefill import *
+    from .ops.mla_nvfp4 import *
     from .ops.pa_sparse_prefill_opus import *
+    from .ops.fused_norm_rope_attn_rope_cast import *
     from .ops.msa_attention import *
     from .ops.pos_encoding import *
     from .ops.cache import *
@@ -212,3 +218,17 @@ try:
 except (ImportError, AttributeError):
     # Iris or triton not available, skip import
     IRIS_COMM_AVAILABLE = False
+
+
+def __getattr__(name: str):
+    """Lazy public exports that must not run at ``import aiter`` time.
+
+    ``sp_qkv_fused`` is the neutral SP4 QKV contract.  Resolving it here keeps
+    ``import aiter`` from eagerly importing the ops package path; the op itself
+    imports only the routing interface.
+    """
+    if name == "sp_qkv_fused":
+        from aiter.ops.gemm_fusion.sp_qkv.op import sp_qkv_fused
+
+        return sp_qkv_fused
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

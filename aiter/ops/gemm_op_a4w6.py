@@ -14,7 +14,7 @@ from aiter import logger
 from ..jit.core import AITER_CONFIGS, AITER_LOG_TUNED_CONFIG, compile_ops
 from ..jit.utils.chip_info import get_cu_num
 from ..jit.utils.chip_info import get_gfx_runtime as get_gfx
-from .gemm_op_a6w6 import _K_TILE, _TILE, _ceil
+from .gemm_op_a6w6 import _K_TILE, _TILE, _ceil, _launch_output_row_chunks
 from .gemm_op_mixed_mxfp import (
     _find_mixed_mxfp_config,
     _get_device_gfx_cu,
@@ -26,6 +26,7 @@ _MFMA32_SWZ0_KERNEL = "_ZN5aiter39f4f6gemm_bf16_per1x32Fp4Fp6_m32_s0_a4_tE"
 _MFMA32_GROUPED_KERNEL = "_ZN5aiter39f4f6gemm_bf16_per1x32Fp4Fp6_m32_s3_a5_tE"
 _MFMA32_LONG_K_KERNEL = "_ZN5aiter39f4f6gemm_bf16_per1x32Fp4Fp6_m32_s3_a6_tE"
 _MAX_BUFFER_BYTES = 1 << 31
+_PACKED_A_TILE_BYTES = 16384  # must match kPackedATileBytes in asm_gemm_a4w6.cu
 _MAX_KERNEL_K = (1 << 31) - 1
 _GROUPED_SWIZZLE_MAX_M = 131072
 _GROUPED_SWIZZLE_MAX_N = 16384
@@ -222,6 +223,18 @@ def gemm_a4w6_asm(
     if out.ndim != 2:
         raise ValueError(f"gemm_a4w6_asm expects a 2D output, got {out.ndim}D")
     kernelName = kernelName or _default_gemm_a4w6_kernel(*out.shape, K)
+    if out.numel() * out.element_size() > _MAX_BUFFER_BYTES:
+        _launch_output_row_chunks(
+            lambda a, a_scale, o: _gemm_a4w6_asm(
+                a, B, a_scale, B_scale, o, K, kernelName, alpha
+            ),
+            A,
+            A_scale,
+            out,
+            K,
+            _PACKED_A_TILE_BYTES,
+        )
+        return out
     _gemm_a4w6_asm(A, B, A_scale, B_scale, out, K, kernelName, alpha)
     return out
 
@@ -255,8 +268,6 @@ def gemm_a4w6(
         raise ValueError(f"gemm_a4w6 padded K is outside the int32 kernel ABI: {padK}")
     selected_kernel = _select_gemm_a4w6_kernel(M, N, K, kernelName, device=A.device)
     padM, padN = _ceil(M, _TILE), _ceil(N, _TILE)
-    if padM * padN * torch.bfloat16.itemsize > _MAX_BUFFER_BYTES:
-        raise ValueError("gemm_a4w6 output exceeds the kernel's 2 GiB address range")
     out = torch.empty((padM, padN), dtype=dtype, device=A.device)
     gemm_a4w6_asm(
         A,
