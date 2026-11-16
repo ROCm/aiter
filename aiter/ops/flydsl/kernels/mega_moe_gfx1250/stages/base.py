@@ -354,7 +354,11 @@ class _Dispatch:
         # it stages them, so there is no repack here.
         return payload, scale_rows.data_ptr()
 
-    def _routing(self, token_count: int) -> Routing:
+    def _routing(
+        self, token_count: int, topk_ids: torch.Tensor | None = None
+    ) -> Routing:
         return Routing(
-            token_count=token_count, reverse_source_view=self._reverse_source
+            token_count=token_count,
+            reverse_source_view=self._reverse_source,
+            topk_ids=topk_ids,
         )

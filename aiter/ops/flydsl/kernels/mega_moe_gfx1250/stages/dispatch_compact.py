@@ -93,6 +93,8 @@ def _compact_gemm_tiles(
         _get_padded_m,
     )
 
+    from ..s1f_ctl import s1f_prefill_config
+
     row = None
     if config.dispatch_wire in ("fp4", "fp8"):
         row = _find_grouped_config(
@@ -110,6 +112,19 @@ def _compact_gemm_tiles(
             quant_type=config.recipe.compute.quant_type,
             ep_fused=True,
         )
+    tuned = s1f_prefill_config(
+        hidden_dim=config.hidden_dim,
+        inter_dim=config.geometry.inter_dim,
+        experts_per_rank=config.experts_per_rank,
+        topk=config.topk,
+        world_size=config.world_size,
+        recv_bound=config.max_recv if recv_bound is None else int(recv_bound),
+        dispatch_wire=config.dispatch_wire,
+        stage1_fused=config.stage1_fused,
+        activation=config.recipe.compute.activation,
+    )
+    if tuned is not None:
+        row = tuned
     tile_m, m_warp = 64, 1
     tile_m2 = m_warp2 = None
     if row is not None:
@@ -593,7 +608,7 @@ class _CompactDispatch(_Dispatch):
             topk_ids=self._dummy_ids,
             scales=self.recv_scales,
             num_local_tokens=None,
-            routing=self._routing(token_count),
+            routing=self._routing(token_count, topk_ids),
             layout=BatchLayout.EXPERT_GROUPED,
             grouping=ExpertGrouping(
                 masked_m=self._masked_ms[slot],

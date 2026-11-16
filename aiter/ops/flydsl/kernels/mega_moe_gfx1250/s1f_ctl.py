@@ -65,6 +65,9 @@ _S1F_VARIANTS = {16: (4, 2), 32: (4, 2), 64: (3, 2), 128: (3, 2), 256: (3, 1)}
 _S1F_GROUP_M = int(os.environ.get("AITER_MEGA_S1F_GROUP_M", "8"))
 if _S1F_GROUP_M < 1:
     raise ValueError("AITER_MEGA_S1F_GROUP_M must be >= 1")
+_S1F_APRE_INPUT = os.environ.get("AITER_MEGA_S1F_APRE_INPUT")
+if _S1F_APRE_INPUT is not None and _S1F_APRE_INPUT not in ("0", "1"):
+    raise ValueError("AITER_MEGA_S1F_APRE_INPUT must be 0 or 1")
 # The S1F settings below (with S1F_BLOCK_RUNS in s1f_stage1.py and the compact
 # route schedule in config.py) come from DSV4.1-Flash DEP4 on MI455X, MLPerf
 # Endpoints agentic c512: +2.1% gen tok/s/GPU over S1F off.
@@ -107,6 +110,79 @@ def read_s1f_mode() -> bool:
     if mode not in ("0", "1"):
         raise ValueError(f"AITER_MEGA_S1F must be 0 or 1, got {mode!r}")
     return mode == "1"
+
+
+def s1f_prefill_config(
+    *,
+    hidden_dim: int,
+    inter_dim: int,
+    experts_per_rank: int,
+    topk: int,
+    world_size: int,
+    recv_bound: int,
+    dispatch_wire: str,
+    stage1_fused: bool,
+    activation,
+) -> dict | None:
+    """Shared plan/GEMM defaults for the pinned Flash EP4 prefill geometry.
+
+    This uses host metadata only, including the unrounded receive bound. A
+    manual tile or APRE selection keeps the existing CSV/env path. Buffer,
+    input-layout and copy settings remain independently overridable.
+    """
+    if (
+        not stage1_fused
+        or not read_s1f_mode()
+        or dispatch_wire != "fp4"
+        or activation != ActivationType.Silu
+        or (hidden_dim, inter_dim, experts_per_rank, topk, world_size)
+        != (5120, 2304, 96, 6, 4)
+        or int(recv_bound) < 16384
+        or os.environ.get("AITER_FLYDSL_EXPLICIT_VGPR_PARTITION", "0") != "1"
+    ):
+        return None
+    manual = (
+        "AITER_TDM_A_PRESHUFFLE",
+        "AITER_GROUPED_A4W4_A_PRESHUFFLE",
+        "AITER_TDM_TILE_M",
+        "AITER_TDM_TILE_N",
+        "AITER_TDM_TILE_K",
+        "AITER_TDM_TILE_M2",
+        "AITER_TDM_TILE_N2",
+        "AITER_TDM_TILE_K2",
+        "AITER_TDM_M_WARP",
+        "AITER_TDM_N_WARP",
+        "AITER_TDM_M_WARP2",
+        "AITER_TDM_N_WARP2",
+    )
+    if any(os.environ.get(name) not in (None, "") for name in manual):
+        return None
+    return {
+        "tile_m": 256,
+        "tile_n": 256,
+        "tile_k": 256,
+        "m_warp": 2,
+        "n_warp": 2,
+        "num_buffers": 3,
+        "tile_m2": 256,
+        "tile_n2": 256,
+        "tile_k2": 256,
+        "m_warp2": 2,
+        "n_warp2": 2,
+        "num_buffer_stage2": 4,
+        "a_preshuffle": 1,
+        "cluster_m": 1,
+        "cluster_n": 1,
+        "cluster_m2": 1,
+        "cluster_n2": 1,
+        "waves_per_tensor_tdm2": (
+            4 if os.environ.get("AITER_FLYDSL_NUM_WAVES_PER_TENSOR_TDM") is None else -1
+        ),
+        "next_stage_prefetch": 1,
+        "tdm_as_in_prologue": 0,
+        "tdm_b_th": 0,
+        "lds_soa_load_interleave": 0,
+    }
 
 
 def _s1f_cu_num() -> int:
@@ -473,6 +549,34 @@ class _Stage1Fusion:
 
         return s1f_producers(tokens), s1f_block_runs(tokens)
 
+    def _apre_settings(self) -> tuple[int, int]:
+        """Resolve GEMM1 buffers/input once for its validator and launcher."""
+        config = self.d.config
+        step = getattr(self.d, "_step", None)
+        tuned = (
+            s1f_prefill_config(
+                hidden_dim=config.hidden_dim,
+                inter_dim=config.geometry.inter_dim,
+                experts_per_rank=config.experts_per_rank,
+                topk=config.topk,
+                world_size=config.world_size,
+                recv_bound=config.max_recv if step is None else step.recv_bound,
+                dispatch_wire=config.dispatch_wire,
+                stage1_fused=config.stage1_fused,
+                activation=config.recipe.compute.activation,
+            )
+            is not None
+        )
+        num_buffers = int(
+            os.environ.get("AITER_TDM_NUM_BUFFERS", "3" if tuned else "4")
+        )
+        if num_buffers not in (3, 4):
+            raise ValueError("APRE S1F needs three or four input buffers")
+        input_preshuffled = (
+            int(_S1F_APRE_INPUT) if _S1F_APRE_INPUT is not None else int(not tuned)
+        )
+        return num_buffers, input_preshuffled
+
     def _launcher(
         self,
         *,
@@ -488,6 +592,10 @@ class _Stage1Fusion:
     ):
         from .s1f_stage1 import make_s1f_stage1
 
+        num_buffers, ctas_per_cu = _S1F_VARIANTS[tile_m]
+        input_preshuffled = 0
+        if a_preshuffled:
+            num_buffers, input_preshuffled = self._apre_settings()
         key = (
             tile_m,
             producers,
@@ -498,13 +606,12 @@ class _Stage1Fusion:
             m_warp,
             n_warp,
             a_preshuffled,
+            input_preshuffled,
+            num_buffers,
         )
         launch = self.launches.get(key)
         if launch is None:
             d, config = self.d, self.d.config
-            num_buffers, ctas_per_cu = _S1F_VARIANTS[tile_m]
-            if a_preshuffled:
-                num_buffers = 4
             launch = make_s1f_stage1(
                 rank=config.rank,
                 npes=config.world_size,
@@ -531,6 +638,7 @@ class _Stage1Fusion:
                 m_warp=m_warp,
                 n_warp=n_warp,
                 a_preshuffled=a_preshuffled,
+                a_input_preshuffled=input_preshuffled,
                 block_runs=block_runs,
                 ticket_span=self.ticket_span,
                 ctas_per_cu=ctas_per_cu,
@@ -676,8 +784,14 @@ class _Stage1Fusion:
             "variant": align_m if align_m in _S1F_VARIANTS else sorted(_S1F_VARIANTS),
         }
         if a_preshuffled:
+            apre_buffers, _ = self._apre_settings()
             got.update(m_warp=m_warp, n_warp=n_warp, num_buffers=num_buffers)
-            want.update(m_warp=2, n_warp=2, num_buffers=4, variant=256)
+            want.update(
+                m_warp=2,
+                n_warp=2,
+                num_buffers=apre_buffers,
+                variant=256,
+            )
         else:
             # The row-major stage-1 kernel runs its own 256x256 n/k tiles.
             got["tile"], want["tile"] = got["tile"][:1], want["tile"][:1]

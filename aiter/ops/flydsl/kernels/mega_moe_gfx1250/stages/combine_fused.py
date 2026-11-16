@@ -240,11 +240,7 @@ class _FusedScatterCombine:
             0 if shared_add is None else shared_add.data_ptr(),
             *grid,
             stream,
-            (
-                routing.source_topk_ids.data_ptr()
-                if routing.source_topk_ids is not None
-                else 0
-            ),
+            (routing.topk_ids.data_ptr() if routing.topk_ids is not None else 0),
         )
         return res.output(routing.token_count)
 

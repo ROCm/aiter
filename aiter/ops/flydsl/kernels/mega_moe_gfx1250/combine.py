@@ -128,10 +128,20 @@ DIRECT_ELEMS_PER_LANE = 8
 DIRECT_BLOCK_THREADS = 512
 
 
+def _combine_direct_threads(hidden_dim):
+    """Keep whole waves inside one token when its row admits that geometry."""
+    lanes_per_tok = hidden_dim // DIRECT_ELEMS_PER_LANE
+    for threads in range(DIRECT_BLOCK_THREADS, WAVE - 1, -WAVE):
+        if lanes_per_tok % threads == 0:
+            return threads
+    return DIRECT_BLOCK_THREADS
+
+
 def combine_direct_reduce_blocks(hidden_dim, token_count):
     """Grid of ``_make_combine_direct_reduce`` for ``token_count`` tokens (>= 1)."""
     lanes = max(int(token_count), 1) * (hidden_dim // DIRECT_ELEMS_PER_LANE)
-    return (lanes + DIRECT_BLOCK_THREADS - 1) // DIRECT_BLOCK_THREADS
+    threads = _combine_direct_threads(hidden_dim)
+    return (lanes + threads - 1) // threads
 
 
 def _make_combine_direct_reduce(
@@ -159,7 +169,7 @@ def _make_combine_direct_reduce(
     """
     topk = experts_per_token
     EPL = DIRECT_ELEMS_PER_LANE
-    lanes = DIRECT_BLOCK_THREADS
+    lanes = _combine_direct_threads(hidden_dim)
     lanes_per_tok = hidden_dim // EPL
     if hidden_dim % EPL:
         raise ValueError(f"hidden_dim must be a multiple of {EPL}")
@@ -195,6 +205,13 @@ def _make_combine_direct_reduce(
         tok = g // lanes_per_tok
         e0 = (g % lanes_per_tok) * EPL
         if tok < cur_rank_num_token:
+            route_tok = tok
+            if const_expr(lanes_per_tok % lanes == 0):
+                # An aligned block belongs to one token. Make its route address
+                # uniform so the same IDs are not loaded per output lane.
+                route_tok = fx.Int32(
+                    fx.rocdl.readfirstlane(fx.Int32.ir_type, tok.ir_value())
+                )
             in_off = fx.Int64(tok) * fx.Int64(topk * stride_e) + fx.Int64(e0)
             row_off = fx.Int64(tok) * fx.Int64(hidden_dim) + fx.Int64(e0)
             # All loads first, so a lane has topk (+1) b128 in flight at once.
@@ -220,7 +237,7 @@ def _make_combine_direct_reduce(
                 if addr_topk_ids != 0:
                     route = fx.Int32(
                         fx.generic_load(
-                            fx.add_offset(ids_iter, fx.Int64(tok) * topk + k)
+                            fx.add_offset(ids_iter, fx.Int64(route_tok) * topk + k)
                         )
                     )
                     values = (route >= 0).select(values, fx.full(8, 0.0, fx.Float32))

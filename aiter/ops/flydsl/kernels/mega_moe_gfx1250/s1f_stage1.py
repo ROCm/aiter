@@ -549,6 +549,7 @@ def make_s1f_stage1(
     m_warp=1,
     n_warp=4,
     a_preshuffled=0,
+    a_input_preshuffled=None,
     run_rows=PLAN_RUN_ROWS,
     depth=S1F_DEPTH,
     block_runs=MB_RB,
@@ -608,6 +609,10 @@ def make_s1f_stage1(
     """
     if WAVE != 32:
         raise ValueError("S1F requires gfx1250 wave32")
+    if a_input_preshuffled is None:
+        a_input_preshuffled = a_preshuffled
+    if a_input_preshuffled not in (0, 1) or (a_input_preshuffled and not a_preshuffled):
+        raise ValueError("S1F input layout must be compatible with its output layout")
     _ring_geometry = bool(
         a_preshuffled
         and (
@@ -616,12 +621,28 @@ def make_s1f_stage1(
             int(tile_k),
             int(m_warp),
             int(n_warp),
-            int(num_buffers),
         )
-        == (256, 256, 256, 2, 2, 4)
+        == (256, 256, 256, 2, 2)
+        and int(num_buffers) in (3, 4)
     )
     R, S, D = int(run_rows), (S1F_SLOTS if _ring_geometry else 4), int(depth)
     _st_limit = MB_ST_INFL if _ring_geometry else 0
+    # The pinned Flash prefill consumer reads the row-major wire and writes
+    # APRE A2. Its measured producer setting uses eight slots and three stores
+    # in flight; retain explicit overrides and the smaller variants' defaults.
+    flash_prefill = bool(
+        _ring_geometry
+        and not a_input_preshuffled
+        and (model_dim, inter_dim, experts_per_rank, topk, npes)
+        == (5120, 2304, 96, 6, 4)
+        and num_buffers == 3
+        and os.environ.get("AITER_FLYDSL_EXPLICIT_VGPR_PARTITION", "0") == "1"
+    )
+    if flash_prefill:
+        if "AITER_MEGA_S1F_APRE_RING_SLOTS" not in os.environ:
+            S = 8
+        if "AITER_MEGA_S1F_APRE_STORE_INFLIGHT" not in os.environ:
+            _st_limit = 3
     if not 1 <= R <= 15:
         raise ValueError(f"run_rows={R} must fit the plan's 4-bit run field")
     if not (1 <= D and S >= D + 1):
@@ -780,6 +801,15 @@ def make_s1f_stage1(
         stream: fx.Stream,
     ):
         g1_buffers = min(num_buffers, max(1, model_dim // tile_k))
+        g1_next_stage_prefetch = int(
+            a_preshuffled and os.environ.get("AITER_MEGA_S1F_APRE_PREFETCH", "0") == "1"
+        )
+        g1_wire_preshuffle = (
+            2
+            if a_input_preshuffled
+            and os.environ.get("AITER_MEGA_S1F_APRE_TDM", "0") == "1"
+            else a_input_preshuffled
+        )
         lds_holder = [None]
         ready_holder = [None]
         meta_holder = [None]
@@ -801,10 +831,7 @@ def make_s1f_stage1(
             quant_wmma_rep=quant_wmma_rep,
             cluster_n=1,
             cluster_m=1,
-            next_stage_prefetch=int(
-                a_preshuffled
-                and os.environ.get("AITER_MEGA_S1F_APRE_PREFETCH", "0") == "1"
-            ),
+            next_stage_prefetch=g1_next_stage_prefetch,
             num_waves_per_tensor_tdm=2,
             tdm_as_in_prologue=0,
             tdm_b_th=0,
@@ -815,19 +842,17 @@ def make_s1f_stage1(
             ep_destination_stride=0,
             ep_world_size=0,
             ep_quant_bits=0,
-            row_major_ascale=int(not a_preshuffled),
+            # TDM packs the FP4 wire payload directly. Its row-major scales
+            # use the existing per-lane LDS addressing without a transpose.
+            row_major_ascale=int(not a_input_preshuffled or g1_wire_preshuffle == 2),
             a_row_stride_bytes=row_stride,
             a_scale_row_stride_bytes=row_stride,
             lds_soa_load_interleave=0,
             persistent_workers=G,
             rolled_drain=0,
-            a_preshuffled=a_preshuffled,
-            wire_preshuffle=(
-                2
-                if a_preshuffled
-                and os.environ.get("AITER_MEGA_S1F_APRE_TDM", "0") == "1"
-                else a_preshuffled
-            ),
+            a_preshuffled=a_input_preshuffled,
+            quant_payload_preshuffled=a_preshuffled,
+            wire_preshuffle=g1_wire_preshuffle,
             m_align=0,
             explicit_tile=1,
             lds_base=lds_holder,
@@ -836,6 +861,8 @@ def make_s1f_stage1(
             item_hooks=hooks_holder,
             raw_drain=True,
             # Needs the mid-loop fence the GEMM body only has above 32 rows.
+            # The GEMM builder gives deferred C a disjoint staging region
+            # when APRE prefetch primes the complete input ring.
             defer_c_wait=tile_m > 32 and g1_buffers > 2,
             tdm_snop=True,
         )

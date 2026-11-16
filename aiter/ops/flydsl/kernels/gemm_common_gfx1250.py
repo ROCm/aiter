@@ -302,7 +302,9 @@ def batched_situv2(pairs, *, consts, range_constexpr):
     return results
 
 
-def batched_silu_swiglu(pairs, *, swiglu, limit_f32, neg_limit_f32, range_constexpr):
+def batched_silu_swiglu(
+    pairs, *, swiglu, limit_f32, neg_limit_f32, range_constexpr, chunk=4
+):
     """Batched silu/swiglu with pipelined tanh for better TRANS utilisation.
 
     Uses v_tanh_f32 (1 TRANS op) instead of exp2+rcp (2 TRANS ops):
@@ -326,7 +328,7 @@ def batched_silu_swiglu(pairs, *, swiglu, limit_f32, neg_limit_f32, range_conste
     _half = fx.Float32(0.5)
     _half_scale = fx.Float32((1.702 * 0.5) if swiglu else 0.5)
     N = len(pairs)
-    CHUNK = 4
+    CHUNK = chunk
     # Stage 1: clamp all pairs
     gs, us = [], []
     for i in range_constexpr(N):
