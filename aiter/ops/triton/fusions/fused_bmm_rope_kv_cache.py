@@ -22,10 +22,6 @@ from aiter.ops.triton.utils.logger import AiterTritonLogger
 
 _LOGGER = AiterTritonLogger()
 
-# Token range that the gfx950 FP8 pure-prefill configs are tuned for.
-_FP8_PREFILL_MIN_TOKENS = 11072
-_FP8_PREFILL_MAX_TOKENS = 32768
-
 _USE_GEMM_SPLITK_BF16 = False
 
 
@@ -401,6 +397,7 @@ def _fused_fp8_bmm_rope_prefill(
     cos: torch.Tensor,
     sin: torch.Tensor,
     group_size: int,
+    config: dict,
     k_scale: torch.Tensor | None,
     is_neox: bool,
     q_out_dtype: torch.dtype,
@@ -411,16 +408,11 @@ def _fused_fp8_bmm_rope_prefill(
     N = w_k_t.shape[2]
     d_pe = q_pe.shape[2]
 
-    # Config keys: a program has M_PER_CTA * BLOCK_SIZE_M rows and N_INNER chunks
-    # of BLOCK_SIZE_N columns. LDB selects the load order. A rotary program has
-    # ROPE_BLOCK_T tokens. IL_R, ILB_NUM, ILB_DEN and XCD_COLOC set the order
-    # of the projection and rotary programs in the grid.
-    config, _ = _get_fp8_prefill_config(M, N, K)
+    # A projection program has `rows` query rows and `cols` output columns.
     rows = config["BLOCK_SIZE_M"] * config["M_PER_CTA"]
     cols = config["BLOCK_SIZE_N"] * config["N_INNER"]
-    # The kernel has no column mask and reads the K tail as one group.
+    # The kernel has no column mask.
     assert N % cols == 0, f"N must be a multiple of the column tile: {N} % {cols}"
-    assert 0 < K - group_size <= group_size, f"unsupported K tail: {K} - {group_size}"
     assert rows >= config["ROPE_BLOCK_T"], "a row tile must hold one rotary block"
 
     num_pid_n = N // cols
@@ -575,11 +567,12 @@ def fused_fp8_bmm_rope_cat_and_cache_mla(
         - kv_cache: Updated KV cache (modified in-place)
 
     Limits: on gfx950, a pure-prefill call uses a different kernel. The call
-    must have 11072 to 32768 tokens, no decode tokens, no explicit config,
-    QH=8, KH=1, P=192, kv_lora_rank=512, RoPE dim 64, group_size=128, BF16
-    inputs and FP8 e4m3 weights and q_out. q_nope must be dense, or a view
-    of a (B, QH, P) or (B, QH, P + d_pe) tensor. Other calls use the generic
-    kernel.
+    must have a tuned config in the FUSED-FP8-BMM-ROPE-PREFILL family (today
+    kv_lora_rank=512, P=192 and 11072 to 32768 tokens), no explicit config, no
+    decode tokens, QH=8, KH=1, RoPE dim 64, group_size=128, transpose_bm=True,
+    one K row and one slot for each token, BF16 inputs, and FP8 e4m3 weights
+    and q_out. w_k must be contiguous. q_nope must be dense, or a view of a
+    (B, QH, P) or (B, QH, P + d_pe) tensor. Other calls use the generic kernel.
     """
     _LOGGER.info(
         "FUSED_FP8_BMM_ROPE_CAT_AND_CACHE_MLA: q_nope=%s w_k=%s w_k_scale=%s q_pe=%s k_nope=%s k_rope=%s positions=%s cos=%s sin=%s kv_cache=%s slot_mapping=%s transpose_bm=%s group_size=%d is_neox=%s",
@@ -654,16 +647,15 @@ def fused_fp8_bmm_rope_cat_and_cache_mla(
     N = kv_lora_rank
     K = k
 
-    # Large pure-prefill calls on gfx950 have their own kernel and configs.
+    # Large pure-prefill calls on gfx950 have their own kernel. Its config files
+    # give the (N, K) shapes and the token range that it is tuned for.
     if (
         config is None
         and arch_info.get_arch() == "gfx950"
-        and _FP8_PREFILL_MIN_TOKENS <= M <= _FP8_PREFILL_MAX_TOKENS
         and qh == 8
         and kh == 1
-        and N == 512
-        and K == 192
         and group_size == 128
+        and group_size < K <= 2 * group_size
         and d_pe == qk_rope_head_dim == 64
         and b_slot == b == bk
         and num_decode_toks_for_zeros == 0
@@ -679,24 +671,27 @@ def fused_fp8_bmm_rope_cat_and_cache_mla(
             (K + d_pe, qh * (K + d_pe), 1),
         )
     ):
-        return _fused_fp8_bmm_rope_prefill(
-            q_nope,
-            w_k_t,
-            w_k_scale,
-            q_pe,
-            k_nope,
-            k_rope,
-            kv_cache,
-            slot_mapping,
-            positions,
-            cos,
-            sin,
-            group_size,
-            k_scale,
-            is_neox,
-            q_out_dtype,
-            reuse_freqs_front_part,
-        )
+        prefill_config, is_tuned = _get_fp8_prefill_config(M, N, K)
+        if is_tuned:
+            return _fused_fp8_bmm_rope_prefill(
+                q_nope,
+                w_k_t,
+                w_k_scale,
+                q_pe,
+                k_nope,
+                k_rope,
+                kv_cache,
+                slot_mapping,
+                positions,
+                cos,
+                sin,
+                group_size,
+                prefill_config,
+                k_scale,
+                is_neox,
+                q_out_dtype,
+                reuse_freqs_front_part,
+            )
 
     if config is None:
         config, _ = _get_fp8_config(M, N, K)

@@ -1193,8 +1193,12 @@ def _fused_fp8_bmm_rope_prefill_kernel(
     head, no decode outputs and one cache slot for each token.
 
     Grid structure:
-    - pid < bmm_programs: projection tiles (heads x row tiles x column tiles)
+    - pid < bmm_programs: projection tiles of BLOCK_SIZE_M * M_PER_CTA rows and
+      BLOCK_SIZE_N * N_INNER columns, for each head
     - pid >= bmm_programs: RoPE and KV-cache writes for ROPE_BLOCK_T tokens
+
+    IL_R, ILB_NUM, ILB_DEN and XCD_COLOC set the order of the programs. The
+    order does not change the result.
     """
 
     tl.static_assert(K_TAIL > 0, "the prefill kernel needs a K tail group")
