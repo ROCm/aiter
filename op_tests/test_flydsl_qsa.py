@@ -21,7 +21,6 @@ from aiter.ops.flydsl.qsa_paged import (
     flydsl_qsa_paged_gqa,
     flydsl_qsa_paged_gqa_supported,
     qsa_indexer_block_ids,
-    qsa_layer,
     span_bytes,
 )
 from aiter.ops.qsa import qsa_expand_block_indices
@@ -1197,8 +1196,8 @@ def check_partial_block_not_selected():
     _assert_indexer_block_ids(ref, got, "partial block was selected")
 
 
-def check_strided_metadata_matches_packed():
-    """Expand rejects a strided metadata view. The layer packs it and matches."""
+def check_expand_rejects_strided_metadata():
+    """Expand rejects a strided metadata view."""
     device = torch.device("cuda")
     requests = torch.tensor([0, 9, 1, 9], dtype=dtypes.i32, device=device)[::2]
     positions = torch.tensor([7, 0, 3, 0], dtype=dtypes.i32, device=device)[::2]
@@ -1211,36 +1210,6 @@ def check_strided_metadata_matches_packed():
         "contiguous",
         "strided metadata",
     )
-    q_indexer = torch.zeros(2, 4, 128, dtype=dtypes.bf16, device=device)
-    q_indexer[0, 0, 0] = 1
-    q_gqa = torch.zeros(2, 24, 256, dtype=dtypes.bf16, device=device)
-    index_cache = torch.zeros(2, 16, 1, 128, dtype=dtypes.bf16, device=device)
-    index_cache[0] = 1
-    index_cache[1] = -1
-    index_table = torch.zeros(2, 1, dtype=dtypes.i32, device=device)
-    index_table[1, 0] = 1
-    k_cache = torch.zeros(2, 16, 2, 256, dtype=dtypes.bf16, device=device)
-    v_cache = torch.ones_like(k_cache)
-    kv_table = index_table.clone()
-
-    def run(pos, leng, req):
-        return qsa_layer(
-            q_indexer,
-            index_cache,
-            index_table,
-            q_gqa,
-            k_cache,
-            v_cache,
-            kv_table,
-            req,
-            pos,
-            leng,
-        )
-
-    strided = run(positions, lengths, requests)
-    packed = run(positions.contiguous(), lengths.contiguous(), requests.contiguous())
-    if not torch.equal(strided, packed):
-        raise AssertionError("strided metadata diverged from the packed metadata")
 
 
 def check_score_chunk_matches_oracle():
@@ -1295,8 +1264,61 @@ def check_qsa_edges():
     check_large_negative_score_keeps_weight()
     check_tie_keeps_smaller_block_id()
     check_partial_block_not_selected()
-    check_strided_metadata_matches_packed()
+    check_expand_rejects_strided_metadata()
     check_score_chunk_matches_oracle()
+
+
+def _check_unmeasured_gqa_warns_once(device):
+    """An unswept rank-3 GQA query logs once and still returns."""
+    import logging
+
+    def launch(hq, head_dim, kv_heads):
+        q = torch.zeros(0, hq, head_dim, dtype=torch.bfloat16, device=device)
+        cache = torch.zeros(
+            1, 16, kv_heads, head_dim, dtype=torch.bfloat16, device=device
+        )
+        indices = torch.zeros(0, 1, dtype=torch.int32, device=device)
+        table = torch.zeros(1, 1, dtype=torch.int32, device=device)
+        token = torch.zeros(0, dtype=torch.int32, device=device)
+        return flydsl_qsa_paged_gqa(q, cache, cache, indices, table, token)
+
+    messages = []
+    handler = logging.Handler()
+    handler.emit = lambda record: messages.append(record.getMessage())
+    aiter.logger.addHandler(handler)
+    try:
+        out = launch(8, 128, 1)
+        if tuple(out.shape) != (0, 8, 128):
+            raise AssertionError(f"unswept GQA returned {tuple(out.shape)}")
+        launch(8, 128, 1)
+        expected = "QSA: GQA query (8, 128) is not in the measured table"
+        if messages != [expected]:
+            raise AssertionError(f"unswept GQA warning was {messages}")
+        out = launch(24, 256, 2)
+        if tuple(out.shape) != (0, 24, 256):
+            raise AssertionError(f"measured GQA returned {tuple(out.shape)}")
+        if messages != [expected]:
+            raise AssertionError(f"measured GQA query logged {messages}")
+        rank2 = torch.zeros(1, 128, dtype=torch.bfloat16, device=device)
+        cache = torch.zeros(1, 16, 1, 128, dtype=torch.bfloat16, device=device)
+        try:
+            flydsl_qsa_paged_gqa(
+                rank2,
+                cache,
+                cache,
+                torch.zeros(1, 1, dtype=torch.int32, device=device),
+                torch.zeros(1, 1, dtype=torch.int32, device=device),
+                torch.zeros(1, dtype=torch.int32, device=device),
+            )
+        except ValueError as exc:
+            if "must be [M, Hq, D]" not in str(exc):
+                raise
+        else:
+            raise AssertionError("rank-2 GQA was accepted")
+        if messages != [expected]:
+            raise AssertionError(f"rank-2 GQA logged {messages}")
+    finally:
+        aiter.logger.removeHandler(handler)
 
 
 def check_qsa_rejections():
@@ -1318,25 +1340,6 @@ def check_qsa_rejections():
             "scores",
             f"scores {tuple(scores.shape)} {scores.dtype}",
         )
-    q_gqa = torch.zeros(1, 24, 256, dtype=torch.bfloat16)
-    k_cache = torch.zeros(1, 16, 2, 256, dtype=torch.bfloat16)
-    _expect_value_error(
-        lambda: qsa_layer(
-            q,
-            cache,
-            table,
-            q_gqa,
-            k_cache,
-            k_cache,
-            table,
-            rows,
-            rows,
-            rows,
-            scores=torch.empty(1, 4),
-        ),
-        "scores must be float32",
-        "short score workspace",
-    )
     q2 = torch.zeros(2, 4, 128, dtype=torch.bfloat16)
     rows2 = torch.zeros(2, dtype=torch.int32)
     lengths = torch.zeros(1, dtype=torch.int32)
@@ -1347,23 +1350,6 @@ def check_qsa_rejections():
         ),
         "scores rows overlap",
         "overlapping score rows",
-    )
-    _expect_value_error(
-        lambda: qsa_layer(
-            q2,
-            cache,
-            table,
-            torch.zeros(2, 24, 256, dtype=torch.bfloat16),
-            k_cache,
-            k_cache,
-            table,
-            rows2,
-            rows2,
-            lengths,
-            scores=overlap,
-        ),
-        "scores rows overlap",
-        "qsa_layer overlapping score rows",
     )
 
     short_table = torch.zeros(1, 1, dtype=torch.int32)
@@ -1380,67 +1366,6 @@ def check_qsa_rejections():
         "context lengths",
         "page table with no request rows",
     )
-
-    rows_n = 2
-    width = 2048 + 4 - 1
-    qn = torch.zeros(rows_n, 4, 128, dtype=torch.bfloat16)
-    rowsn = torch.zeros(rows_n, dtype=torch.int32)
-    q_gqa_n = torch.zeros(rows_n, 24, 256, dtype=torch.bfloat16)
-    overlap_idx = torch.empty(width, dtype=torch.int32).expand(rows_n, width)
-    storage = torch.empty(rows_n * width, dtype=torch.int32)
-    aliased = storage.view(rows_n, width)
-    block_ids = storage[: rows_n * 512].view(rows_n, 512)
-
-    def layer(**kwargs):
-        return qsa_layer(
-            qn,
-            cache,
-            table,
-            q_gqa_n,
-            k_cache,
-            k_cache,
-            table,
-            rowsn,
-            rowsn,
-            lengths,
-            **kwargs,
-        )
-
-    for name, kwargs in (
-        ("rows overlap", {"indices": overlap_idx}),
-        ("alias", {"indices": aliased, "block_ids": block_ids}),
-        ("dtype", {"indices": torch.empty(rows_n, width, dtype=torch.int64)}),
-    ):
-        _expect_value_error(lambda kwargs=kwargs: layer(**kwargs), "indices", name)
-    if torch.cuda.is_available():
-        _expect_value_error(
-            lambda: layer(
-                indices=torch.empty(rows_n, width, dtype=torch.int32, device="cuda")
-            ),
-            "indices",
-            "indices device",
-        )
-
-    for token_topk, compress_ratio in ((1024, 4), (4096, 8)):
-        _expect_value_error(
-            lambda token_topk=token_topk, compress_ratio=compress_ratio: qsa_layer(
-                q,
-                torch.zeros(8, 16, 1, 128, dtype=torch.bfloat16),
-                torch.zeros(1, 8, dtype=torch.int32),
-                q_gqa,
-                torch.zeros(8, 16, 2, 256, dtype=torch.bfloat16),
-                torch.zeros(8, 16, 2, 256, dtype=torch.bfloat16),
-                torch.zeros(1, 8, dtype=torch.int32),
-                rows,
-                rows,
-                torch.ones(1, dtype=torch.int32),
-                indices=torch.zeros(1, 2051, dtype=torch.int32),
-                token_topk=token_topk,
-                compress_ratio=compress_ratio,
-            ),
-            "FlyDSL indexer selects",
-            f"token_topk={token_topk} compress_ratio={compress_ratio}",
-        )
 
     page_size, head_dim = 16, 128
     n_pages = 3
@@ -1610,6 +1535,24 @@ def check_qsa_rejections():
         )
         if got.data_ptr() != empty_out.data_ptr():
             raise AssertionError("a matching caller out was replaced")
+        padded = torch.empty(
+            (rows_e, output_width + 8), dtype=torch.int32, device=device
+        )
+        wider = padded[:, :output_width]
+        if int(wider.stride(0)) <= output_width:
+            raise AssertionError("padded expand fixture does not keep a row gap")
+        got = qsa_expand_block_indices(
+            block_indices,
+            query_positions,
+            sequence_lengths,
+            token_to_req_e,
+            compress_ratio,
+            token_topk,
+            wider,
+        )
+        if got.data_ptr() != wider.data_ptr():
+            raise AssertionError("a padded expand out was replaced")
+        _check_unmeasured_gqa_warns_once(device)
 
 
 @benchmark()
@@ -1687,10 +1630,7 @@ def bench_qsa_flash_next_indexer(
     # Padded decode uses the row-bounded radix on the full width, eager
     # and captured. The graph column times replay of that same selector.
     n_columns = int(index_table.shape[1]) * int(page_size)
-    if (
-        m <= qsa_paged._DECODE_MAX_ROWS
-        and n_columns > qsa_paged._ONE_WORKGROUP_MAX_ROW_WIDTH
-    ):
+    if qsa_paged.qsa_indexer_row_bounded(m, n_columns):
         block_ids_g = torch.empty(m, idx.block_budget, dtype=dtypes.i32, device=device)
         indices_g = torch.empty(m, idx.index_width, dtype=dtypes.i32, device=device)
 
@@ -1972,13 +1912,58 @@ def _layer_args(case):
     )
 
 
-def _layer_kwargs(idx, **extra):
-    return {
-        "token_topk": idx.token_budget,
-        "compress_ratio": idx.compress_ratio,
-        "score_scale": idx.head_dim**-0.5,
-        **extra,
-    }
+def _run_qsa(
+    q_indexer,
+    index_cache,
+    index_table,
+    q_gqa,
+    k_cache,
+    v_cache,
+    kv_table,
+    token_to_req,
+    qpos,
+    slen,
+    *,
+    indices,
+    block_ids,
+    out,
+    n_heads,
+    token_topk,
+    compress_ratio,
+    score_scale,
+    scores=None,
+):
+    """Indexer, expand, and sparse GQA on buffers the caller already owns."""
+    qsa_indexer_block_ids(
+        q_indexer,
+        index_cache,
+        index_table,
+        token_to_req,
+        qpos,
+        slen,
+        out=block_ids,
+        score_scale=score_scale,
+        heads=(n_heads,),
+        scores=scores,
+    )
+    qsa_expand_block_indices(
+        block_ids,
+        qpos,
+        slen,
+        token_to_req,
+        compress_ratio,
+        token_topk,
+        indices,
+    )
+    return flydsl_qsa_paged_gqa(
+        q_gqa,
+        k_cache,
+        v_cache,
+        indices,
+        kv_table,
+        token_to_req,
+        out=out,
+    )
 
 
 def _capture_replay_us(fn) -> float:
@@ -2040,18 +2025,26 @@ def _raise_if_row_mismatch(row, m, seq_len):
 
 
 def _time_layer(case, idx, rotate):
-    """Time qsa_layer on buffers the caller already owns."""
+    """Time indexer, expand, and sparse GQA on buffers the caller already owns."""
     m = case["q_gqa"].shape[0]
     device = case["q_gqa"].device
     indices = torch.empty((m, idx.index_width), dtype=dtypes.i32, device=device)
     block_ids = torch.empty((m, idx.block_budget), dtype=dtypes.i32, device=device)
     out = torch.empty_like(case["q_gqa"])
-    kwargs = _layer_kwargs(idx, indices=indices, block_ids=block_ids, out=out)
+    kwargs = {
+        "indices": indices,
+        "block_ids": block_ids,
+        "out": out,
+        "n_heads": idx.n_heads,
+        "token_topk": idx.token_budget,
+        "compress_ratio": idx.compress_ratio,
+        "score_scale": idx.head_dim**-0.5,
+    }
     n_columns = int(case["index_table"].shape[1]) * int(case["index_cache"].shape[1])
     if n_columns > idx.block_budget:
         kwargs["scores"] = torch.empty((m, n_columns), dtype=dtypes.fp32, device=device)
     timed, us = run_perftest(
-        qsa_layer,
+        _run_qsa,
         *_WideRotation.wrap(rotate, *_layer_args(case)),
         num_rotate_args=rotate,
         num_iters=_WideRotation.iters,
@@ -2138,12 +2131,15 @@ def bench_qsa_flash_next_e2e_graph(
         block_ids = torch.empty((m, idx.block_budget), dtype=dtypes.i32, device=device)
 
         def launch():
-            return qsa_layer(
+            return _run_qsa(
                 *_layer_args(case),
                 indices=indices,
                 block_ids=block_ids,
                 out=out,
-                **_layer_kwargs(idx),
+                n_heads=idx.n_heads,
+                token_topk=idx.token_budget,
+                compress_ratio=idx.compress_ratio,
+                score_scale=idx.head_dim**-0.5,
             )
 
         us = _capture_replay_us(launch)
@@ -2237,7 +2233,7 @@ def main():
         formatter_class=argparse.RawTextHelpFormatter,
         description=(
             "Flash-Next and Gluon-parity QSA sweeps, FlyDSL indexer and "
-            "sparse GQA, and the end-to-end layer opt-in"
+            "sparse GQA, and the end-to-end indexer, expand, and sparse GQA"
         ),
     )
     parser.add_argument(
