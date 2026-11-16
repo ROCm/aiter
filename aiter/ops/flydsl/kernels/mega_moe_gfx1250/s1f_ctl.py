@@ -700,7 +700,7 @@ class _Stage1Fusion:
         # the GEMM1 queues handing each XCC its IOD's n-tiles.
         from aiter.ops.flydsl.iod_locality import lookup
 
-        loc_phase, _ = lookup(w, w_scales, N, K, _S1F_TILE_N, _S1F_TILE_K)
+        loc_phase, _, loc_group = lookup(w, w_scales, N, K, _S1F_TILE_N, _S1F_TILE_K)
 
         def launch_args(psum_t, send_t, runs_t, tsrc_t, n_tok):
             return (
@@ -730,7 +730,8 @@ class _Stage1Fusion:
         g1_opts = {
             "tdm_b_th": int(tdm_b_th),
             "tdm_as_in_prologue": int(bool(tdm_as_in_prologue)),
-            "iod_loc": int(loc_phase is not None),
+            # The placed W1's domain group; 0: not placed.
+            "iod_loc": int(loc_group),
         }
         keys = {(t, int(stage1_act), q, *g1_opts.values(), int(quant_out_preshuffled)) for t, q in self.launch_keys}
         keys.add((align_m, int(stage1_act), int(quant_wmma_rep), *g1_opts.values(), int(quant_out_preshuffled)))
