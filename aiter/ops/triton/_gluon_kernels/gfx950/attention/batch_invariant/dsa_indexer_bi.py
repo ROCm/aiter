@@ -312,12 +312,16 @@ def _ordered_key(x):
 
 
 @gluon.jit
-def _digit_counts(u, m, thr, shift, DBITS: gl.constexpr, layout2d: gl.constexpr):
-    # cnt[d] = #(u >= thr | d << shift); falls as d grows.
+def _digit_ge(u, m, thr, shift, DBITS: gl.constexpr, layout2d: gl.constexpr):
+    # ge[i, d] = m[i] and u[i] >= thr | d << shift; its column sums fall as d grows.
     d = gl.arange(0, 1 << DBITS, layout=gl.SliceLayout(0, layout2d)).to(gl.uint32)
     cand = thr | (d << shift)
-    ge = m[:, None] & (u[:, None] >= cand[None, :])
-    return gl.sum(ge.to(gl.int32), axis=0)
+    return (m[:, None] & (u[:, None] >= cand[None, :])).to(gl.int32)
+
+
+@gluon.jit
+def _digit_counts(u, m, thr, shift, DBITS: gl.constexpr, layout2d: gl.constexpr):
+    return gl.sum(_digit_ge(u, m, thr, shift, DBITS, layout2d), axis=0)
 
 
 @gluon.jit
@@ -383,40 +387,45 @@ def _topk_streamed(
     NW: gl.constexpr,
 ):
     flat: gl.constexpr = _flat_layout(BLOCK, NW)
-    # Longer row: every radix round and both final passes stream BLOCK tiles.
+    # Longer row: every radix round and the final passes stream BLOCK tiles.
+    # Counts stay per thread across the tiles and are reduced once per pass.
     jb = gl.arange(0, BLOCK, layout=gl.SliceLayout(1, layout))
     thr = (n * 0).to(gl.uint32)
     for r in gl.static_range(32 // DBITS):
         shift = 32 - DBITS * (r + 1)
-        cnt = gl.zeros([1 << DBITS], dtype=gl.int32, layout=gl.SliceLayout(0, layout))
+        acc = gl.zeros([BLOCK, 1 << DBITS], dtype=gl.int32, layout=layout)
         for c0 in range(0, n, BLOCK):
             cols = c0 + jb
             m = cols < n
             u = _ordered_key(gl.load(row_ptr + cols, mask=m, other=0.0))
-            cnt += _digit_counts(u, m, thr, shift, DBITS, layout)
+            acc += _digit_ge(u, m, thr, shift, DBITS, layout)
+        cnt = gl.sum(acc, axis=0)
         nd = gl.sum((cnt >= sel).to(gl.int32), axis=0)
         thr = thr | ((nd - 1).to(gl.uint32) << shift)
-    n_gt = n * 0
-    n_eq = n * 0
+    jf = gl.arange(0, BLOCK, layout=flat)
+    gt_acc = gl.zeros([BLOCK], dtype=gl.int32, layout=flat)
+    eq_acc = gl.zeros([BLOCK], dtype=gl.int32, layout=flat)
     for c0 in range(0, n, BLOCK):
-        cols = c0 + jb
+        cols = c0 + jf
         m = cols < n
         u = _ordered_key(gl.load(row_ptr + cols, mask=m, other=0.0))
-        n_gt += gl.sum((m & (u > thr)).to(gl.int32), axis=0)
-        n_eq += gl.sum((m & (u == thr)).to(gl.int32), axis=0)
+        gt_acc += (m & (u > thr)).to(gl.int32)
+        eq_acc += (m & (u == thr)).to(gl.int32)
+    n_gt = gl.sum(gt_acc, axis=0)
+    n_eq = gl.sum(eq_acc, axis=0)
     skip_eq = n_eq - (sel - n_gt)
     eq_seen = n * 0
     written = n * 0
     for c0 in range(0, n, BLOCK):
-        cols = c0 + jb
+        cols = c0 + jf
         m = cols < n
         u = _ordered_key(gl.load(row_ptr + cols, mask=m, other=0.0))
-        eq = m & (u == thr)
-        eq_rank = eq_seen + _cumsum(eq.to(gl.int32), flat) - 1
-        take = (m & (u > thr)) | (eq & (eq_rank >= skip_eq))
-        pos = written + _cumsum(take.to(gl.int32), flat) - 1
-        gl.store(out_row + pos, cols, mask=take)
-        eq_seen += gl.sum(eq.to(gl.int32), axis=0)
+        eq = (m & (u == thr)).to(gl.int32)
+        eq_rank = eq_seen + gl.associative_scan(eq, 0, _add) - 1
+        take = (m & (u > thr)) | ((eq != 0) & (eq_rank >= skip_eq))
+        pos_in = gl.associative_scan(take.to(gl.int32), 0, _add)
+        gl.store(out_row + written + pos_in - 1, cols, mask=take)
+        eq_seen += gl.sum(eq, axis=0)
         written += gl.sum(take.to(gl.int32), axis=0)
 
 
