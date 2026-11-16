@@ -30,7 +30,8 @@ shared MX quantizer). Tests and benchmark: `python3 op_tests/test_flydsl_mxfp6_m
 
 ## GEMM kernel (`compile_gg6e`)
 
-- `V_MFMA_SCALE_F32_16X16X128_F8F6F4`, FP6 B, FP6/FP8 A. Measured operand contract (see `test_mfma_contract` in the op test):
+- `V_MFMA_SCALE_F32_16X16X128_F8F6F4` through `fx.rocdl.cdna4.MFMA_Scale` atoms (one per E8M0
+  scale-byte select), FP6 B, FP6/FP8 A. Measured operand contract (see `test_mfma_contract` in the op test):
   FP6/FP4 lanes hold 32 contiguous K values; **FP8 lanes hold two K=64 halves** (bytes 0-15 = K[16g,+16),
   16-31 = K[64+16g,+16)); scale of (row r, K-block b) in lane 16b + r.
 - 4 waves; wave tile 128x128 (8x8 fragments) -> block 256x256. 256x128 when N % 256 != 0 or for FP8
@@ -70,8 +71,12 @@ hidden 8192 x inter 4096 (both weight tensors > 4 GiB packed), hidden 10496 at 2
 
 ## Known limits / next steps
 
-- Stage 2 (short K) still carries ~5 us fixed cost per tile (pipeline fill + epilogue). A persistent variant
-  that overlaps the next tile's prologue with the epilogue was prototyped but spilled registers (K-loop
-  scratch reloads wait on `vmcnt`, which drains the async DMAs); not included.
+- The global->LDS DMA stays a raw `rocdl.raw_ptr_buffer_load_async_lds`: `BufferLoadAsyncLDS128b/32b` copy
+  atoms gave identical results but grew the K loop from ~2.8k to ~5.1k instructions, spilled 12 VGPRs
+  (scratch reloads wait on vmcnt and drain the async DMAs) and cost 8-12% on the s/m layers (FlyDSL 0.5.0).
+- Stage 2 (short K) carries ~5 us fixed cost per tile (pipeline fill + epilogue). Tried and not adopted:
+  a persistent variant overlapping the next tile's prologue with the epilogue (correct, but spills; 1.67
+  vs 2.12 PF/s on the stage-2 shape) and smaller 128x128 / 128x256 tiles for two blocks per CU (12-22% /
+  2-8% slower than 256x256).
 - FP8 activations use 256x128 tiles (256x256 does not fit three LDS stages).
 - The combine re-reads the stage-2 rows (near HBM bandwidth); fusing it needs an ordered cross-tile reduction.
