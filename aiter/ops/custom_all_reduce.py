@@ -70,6 +70,18 @@ def all_gather_reg(
 
 
 @compile_ops("module_custom_all_reduce", develop=True)
+def all_gather_lastdim_add(
+    _fa: int,
+    inp: torch.Tensor,
+    out: torch.Tensor,
+    add_b: torch.Tensor,
+    add_c: torch.Tensor | None = None,
+    reg_ptr: int = 0,
+    reg_bytes: int = 0,
+) -> None: ...
+
+
+@compile_ops("module_custom_all_reduce", develop=True)
 def all_gather_unreg(
     _fa: int,
     inp: torch.Tensor,
@@ -414,6 +426,21 @@ def allreduce_add_lamport_gfx1250(
 ) -> None: ...
 
 
+# Lamport one-shot all-gather, on the same inbox as the fused AR + RMSNorm
+# above. An input the kernel cannot read in place (unaligned, or overlapping out)
+# is copied into the registered buffer at reg_inp_ptr first. Bit for bit, except
+# that a 0xffff half-word of an fp16/bf16 input comes out 0x7fff (both NaN).
+@compile_ops(GFX1250_MD_NAME, fc_name="all_gather_lamport", develop=True)
+def all_gather_lamport_gfx1250(
+    _fa: int,
+    inp: torch.Tensor,
+    out: torch.Tensor,
+    dim: int,
+    reg_inp_ptr: int,
+    reg_inp_bytes: int,
+) -> None: ...
+
+
 @compile_ops(GFX1250_MD_NAME, fc_name="p2p_bw_test", develop=True)
 def p2p_bw_test_gfx1250(
     _fa: int,
@@ -433,6 +460,10 @@ def dispose_gfx1250(_fa: int) -> None: ...
 
 @compile_ops(GFX1250_MD_NAME, fc_name="meta_size", develop=True)
 def meta_size_gfx1250(world_size: int = 8) -> int: ...
+
+
+@compile_ops(GFX1250_MD_NAME, fc_name="ll_ar_max_bytes", develop=True)
+def ll_ar_max_bytes_gfx1250(world_size: int) -> int: ...
 
 
 @compile_ops(GFX1250_MD_NAME, fc_name="register_input_buffer", develop=True)

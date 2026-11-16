@@ -259,8 +259,10 @@ _CORRECTNESS_SHAPES = [
     (256, 256, 64, 4, [256, 512]),
     (256, 256, 64, 4, [512, 1024]),
     (256, 256, 16, 16, [2048]),
-    # kv heads x mean kv length > 2^17: the host launches without remap_xy (and without
-    # double_q when non-causal); the shapes above all take remap_xy
+    # above the remap_xy threshold: launched without remap_xy, unequal lengths with a padded
+    # width (the shapes above all take remap_xy)
+    (192, 128, 128, 128, [2304]),
+    (192, 128, 128, 128, [1000, 2500, 1800]),
     (256, 256, 64, 64, [2304]),
     (256, 256, 64, 64, [1000, 3000, 2500]),
 ]
