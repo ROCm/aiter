@@ -397,10 +397,11 @@ def run_bmm_a8w8_mxfp8_gfx950(
     name = kernel_name or pick_bmm_kernel_name(b, m, n, k, *scale_args)
     cfg = _require_config(name)
     # Each tile reads XQ from its first row with 32-bit offsets.
-    if cfg["tile_m"] * b * k >= 1 << 32:
+    tile_span = (min(m, cfg["tile_m"]) - 1) * b * k + k
+    if tile_span >= 1 << 32:
         raise RuntimeError(
-            f"[FlyDSL gfx950 bmm] {name}: a {cfg['tile_m']}-row tile of XQ spans "
-            f"{cfg['tile_m'] * b * k} bytes for B={b}, K={k}; must be below 4 GiB"
+            f"[FlyDSL gfx950 bmm] {name}: one tile of XQ spans {tile_span} bytes "
+            f"for M={m}, B={b}, K={k}; must be below 4 GiB"
         )
     stream = torch.cuda.current_stream(XQ.device)
     partials = counters = Out

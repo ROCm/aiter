@@ -426,8 +426,8 @@ def check_large_a():
     Each tile reads XQ from its own first row through a 64-bit base; unfixed,
     the rows past a 4 GiB span came back wrong. Inputs in {-1, 0, 1} with unit
     scales make every fp32 sum exact, so the bf16 output must equal the rounded
-    reference bit for bit; M leaves a partial last tile. One tile's rows (tile_m * B * K bytes) must still span
-    less than 4 GiB.
+    reference bit for bit; M leaves a partial last tile. What one tile spans,
+    (min(M, tile_m) - 1) * B * K + K bytes, must still be below 4 GiB.
     """
     limit, b, n, k = 1 << 32, 16, 128, 512
     free, _ = torch.cuda.mem_get_info()
@@ -463,14 +463,14 @@ def check_large_a():
     del x8, xs
     torch.cuda.empty_cache()
 
-    b, n, k = 4096, 256, 4096
+    m, b, n, k = 256, 4096, 256, 4224
     try:
         run_bmm_a8w8_mxfp8(
-            torch.empty((1, b, k), dtype=dtypes.fp8),
+            torch.empty((m, b, k), dtype=dtypes.fp8),
             torch.empty((b, n, k), dtype=dtypes.fp8),
-            e8m0_ones(1, b, k // 128),
+            e8m0_ones(m, b, k // 128),
             e8m0_ones(b, n // 128, k // 128),
-            torch.empty((1, b, n), dtype=dtypes.bf16),
+            torch.empty((m, b, n), dtype=dtypes.bf16),
             kernel_name="flydsl_bmm_mxfp8_mfma_t256x256x128_w1x4_nb2_sk1_bd1_xcd",
         )
     except RuntimeError as e:
