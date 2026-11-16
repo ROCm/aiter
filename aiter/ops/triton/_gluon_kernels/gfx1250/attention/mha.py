@@ -597,6 +597,9 @@ def _attn_fwd(
     # NUM_XCD=1 on gfx1250
     off_q_head = wid % NUM_Q_HEADS
     start_m = (wid // NUM_Q_HEADS) % NUM_BLOCKS
+    if IS_CAUSAL:
+        # Launch the longest causal row blocks first to shorten the tail.
+        start_m = NUM_BLOCKS - 1 - start_m
     off_z = (wid // (NUM_BLOCKS * NUM_Q_HEADS)) % BATCH
 
     GRP_SZ: gl.constexpr = NUM_Q_HEADS // NUM_K_HEADS
