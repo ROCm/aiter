@@ -752,8 +752,10 @@ def make_s1f_stage1(
             tile_m=tile_m,
             tile_n=tile_n,
             tile_k=tile_k,
-            m_warp=1,
-            n_warp=4,
+            # M256 with 1x4 waves needs 160 registers per A/B prefetch slot,
+            # exceeding its 128-register partition. A 2x2 split needs 128.
+            m_warp=2 if tile_m == 256 else 1,
+            n_warp=2 if tile_m == 256 else 4,
             out_is_f16=0,
             num_buffers=g1_buffers,
             a_is_fp4=1,
