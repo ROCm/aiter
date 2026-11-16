@@ -976,6 +976,26 @@ def test_bmm_candidates_split_swizzled_seeds():
         assert cfg["splits"] == 1 or not (cfg["xcd_order"] or cfg["xcd_swizzle"])
 
 
+@pytest.mark.parametrize("w_scale_n", [1, 32])
+def test_bmm_candidates_time_xcd_swizzles(w_scale_n):
+    """Every unsplit seed is also timed with the XCD tile order and each
+    M-major swizzle that runs, whatever its own order: a plain or N-fastest
+    _xcd seed reads a B column block once per XCD its M tiles land on."""
+    from aiter.ops.flydsl.batched_gemm_a8w8_gfx950 import (
+        _XCD_SWIZZLES,
+        BMM_MFMA_NAME_PREFIX,
+        bmm_candidate_names,
+    )
+
+    stem = f"{BMM_MFMA_NAME_PREFIX}_t128x128x128_w1x4_nb4_sk1_bd2"
+    scales = {"x_scale_k": 32, "w_scale_n": w_scale_n, "w_scale_k": 32}
+    for seed in (stem, f"{stem}_xcd"):
+        names = bmm_candidate_names(1, 768, 5120, 8192, [seed], **scales)
+        assert seed in names and f"{stem}_xcd" in names
+        for g in _XCD_SWIZZLES:
+            assert f"{stem}_xcd{g}" in names
+
+
 @pytest.mark.parametrize("block", ["1x32", "32x32", "128x128"])
 def test_mxscale_table_tuner_times_bmm(block):
     """--mxscale_table times bmm on every w_scale block, 1x32's included; a
