@@ -703,6 +703,7 @@ def _mega_mhc_asm(
     norm = rms_norm(layer_input, norm_weight, norm_eps)
     return residual_out, post_out, comb_out, norm, next_pre
 
+
 # ---------------------------------------------------------------------------
 # Carrying the residual in the res_preshuffle layout between Mega-MHC calls.
 #
