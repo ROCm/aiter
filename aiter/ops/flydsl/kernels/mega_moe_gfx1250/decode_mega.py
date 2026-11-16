@@ -502,7 +502,12 @@ def make_decode_mega(
     # below 32 tokens most guessed experts get no rows and it costs.
     PREF_B = 0 if COMPACT else int(os.environ.get("AITER_DMK_PREFETCH_KB", "256")) * 1024
     PREF_B = min(PREF_B, int(tile_n) * (H // 2))
-    knob_sfx = "".join(
+    # Every CTA of the grid must be resident: a 4-wave CTA puts one wave on
+    # each SIMD, so ctas_per_cu CTAs need that many waves per EU, which caps
+    # the VGPRs (large_m at 4 CTAs per CU: 128). AITER_DMK_WPE=0 drops the cap.
+    WPE = int(os.environ.get("AITER_DMK_WPE", str(int(ctas_per_cu))))
+    knob_sfx = f"_wpe{WPE}" if WPE else ""
+    knob_sfx += "".join(
         f"_{name}{val}"
         for name, val, default in (
             ("ps", POLL_SL, POLL_SLEEP),
@@ -2110,6 +2115,7 @@ def make_decode_mega(
             i32_rows,
             addr_route,
             f32_swiglu_limit,
+            value_attrs={"rocdl.waves_per_eu": str(WPE)} if WPE else {},
         ).launch(grid=(G, 1, 1), block=(block, 1, 1), stream=stream)
 
     launch.compile_hints = dict(launch_gemm_a8w4_tdm.compile_hints)
