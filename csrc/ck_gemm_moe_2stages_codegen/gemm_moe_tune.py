@@ -58,7 +58,7 @@ from aiter.jit.core import (
     AITER_ROOT_DIR,
     get_asm_dir,
 )
-from aiter.jit.utils.chip_info import get_gfx, gfx_from_cu_num
+from aiter.jit.utils.chip_info import get_gfx, get_gfx_runtime, gfx_from_cu_num
 from aiter.ops.flydsl.kernels.moe_2stage_a16wmix.gemm1_a8w4_gfx942 import (
     _mxfp8_exponent,
     shuffle_scale_a8w4_gfx942,
@@ -199,7 +199,7 @@ def _parse_tuning_type(value):
 def _is_a8w4_g942(q_type, q_dtype_a, q_dtype_w) -> bool:
     """gfx942 a8w4 (MXFP8 A x MXFP4 W): `_g942` stage 1 + a16w4 stage 2."""
     return (
-        get_gfx() == "gfx942"
+        get_gfx_runtime() == "gfx942"
         and q_type == QuantType.per_1x32
         and q_dtype_a == dtypes.fp8
         and q_dtype_w == dtypes.fp4x2

@@ -1823,11 +1823,10 @@ def _flydsl_moe_stage1_impl(
     # The path is chosen by the kernel name, not by dtype and arch: any other fp8 x fp4
     # name on gfx942 expects other weights and inputs, so it raises below.
     if in_dtype == "a8w4_gfx942" or (a_dtype == "fp8" and b_dtype == "fp4"):
-        from flydsl.runtime.device import get_rocm_arch
+        from aiter.jit.utils.chip_info import get_gfx_runtime
 
-        _gfx942 = str(get_rocm_arch()).startswith("gfx942")
         if in_dtype != "a8w4_gfx942":
-            if _gfx942:
+            if get_gfx_runtime() == "gfx942":
                 raise NotImplementedError(
                     "fp8 x fp4 stage1 on gfx942 runs only the `_g942` kernels "
                     "(in_dtype='a8w4_gfx942'), got a kernel for another arch"
@@ -1837,10 +1836,7 @@ def _flydsl_moe_stage1_impl(
                 flydsl_a8w4_gemm1_gfx942,
             )
 
-            if not _gfx942:
-                raise NotImplementedError(
-                    f"gfx942 a8w4 stage1 runs on gfx942 only, got {get_rocm_arch()}"
-                )
+            # Off gfx942, compile_gemm1_a8w4_gfx942 raises for the compile target.
             if not a8w4_gfx942_supported(dev):
                 raise NotImplementedError(
                     "gfx942 a8w4 stage1 is enabled on MI325X only: on MI300X it is "
