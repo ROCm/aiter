@@ -19,6 +19,10 @@ combine, with and without a fused shared expert, for each megakernel:
     to AITER_MEGA_DECODE, large_m every larger one, and a compact plan started
     for a step small_m serves is dropped;
   * a captured graph's replay against the eager result, bit for bit.
+
+And large_m alone at a decode shape (96 experts a rank, hundreds of tokens):
+there its queue holds more items than CTAs, so a grid that is not resident at
+once deadlocks; it runs with timed-out waits counted instead of trapping.
 """
 
 from __future__ import annotations
@@ -47,6 +51,8 @@ STEPS = (1, 7, 16, 32)
 # large_m's steps (unbounded, so past small_m): few tokens, then up to the
 # instance's MAX_TOKENS.
 LARGE_STEPS = (5, 33, 48, 64)
+# large_m's residency case: DSV4.1-Flash's expert shape and experts per rank.
+RES_HIDDEN, RES_INTER, RES_EXPERTS_PER_RANK, RES_TOKENS = 5120, 2304, 96, 256
 
 
 def _skip_reason() -> str | None:
@@ -309,6 +315,85 @@ def _check_large(case, comm):
     del graph
 
 
+def _check_resident(rank, world, comm, device):
+    """large_m at a decode shape: bit for bit against the staged path, and no
+    wait timed out. Built with AITER_DMK_NOTRAP and a short timeout, so a grid
+    whose CTAs are not all resident shows up as counted timeouts, not a trap."""
+    import bench_mega_moe as B
+
+    from aiter.ops.flydsl.kernels.mega_moe_gfx1250 import (
+        MegaMoEGeometry,
+        MegaMoEGfx1250,
+        MegaMoERecipe,
+    )
+
+    H, I, EPR = RES_HIDDEN, RES_INTER, RES_EXPERTS_PER_RANK
+    check = _Checks("large_m resident grid")
+    spec = B.resolve_spec("a4w4_mxfp4")
+    g = torch.Generator(device=device).manual_seed(4049 + 7919 * rank)
+    w1 = torch.randn(EPR, 2 * I, H, generator=g, device=device, dtype=torch.bfloat16)
+    w2 = torch.randn(EPR, H, I, generator=g, device=device, dtype=torch.bfloat16)
+    w1.mul_(0.1)
+    w2.mul_(0.1)
+    w1, w2, w1s, w2s = B.shuffle_group(*B.raw_quant_weights(w1, w2), spec, EPR)
+    recipe = MegaMoERecipe.from_legacy(
+        stage1_fused=True,
+        stage2_fused=True,
+        dispatch_wire="fp4",
+        combine_quant="none",
+        activation=spec["activation"],
+        gate_mode=spec["gate_mode"].value,
+        quant_type=spec["aiter_qtype"],
+    )
+    geometry = MegaMoEGeometry(
+        rank=rank,
+        world_size=world,
+        model_dim=H,
+        inter_dim=I,
+        experts=EPR * world,
+        topk=TOPK,
+        max_tokens_per_rank=RES_TOKENS,
+    )
+    mega = MegaMoEGfx1250.from_recipe(recipe, geometry, communicator=comm)
+    lmk = mega._ep.large_mega
+    try:
+        assert lmk is not None, "AITER_MEGA_LARGE did not build large_m"
+        for i, t in enumerate((RES_TOKENS, RES_TOKENS // 2)):
+            tokens = max(1, t - 3 * rank)
+            ids, wts = B.make_routings(
+                1, tokens, EPR * world, TOPK, device, seed=31 * i + 100 * rank
+            )[0]
+            gen = torch.Generator().manual_seed(61 * i + 500 + rank)
+            x = torch.randn(tokens, H, generator=gen).to(torch.bfloat16).to(device)
+            x = B._rmsnorm(x)
+
+            def layer(on, x=x, ids=ids, wts=wts):
+                lmk.enabled = on
+                return mega(
+                    x,
+                    wts,
+                    ids,
+                    w1=w1,
+                    w2=w2,
+                    w1_scale=w1s,
+                    w2_scale=w2s,
+                    recv_token_bound=None,
+                ).clone()
+
+            large, staged, again = layer(True), layer(False), layer(True)
+            torch.cuda.synchronize()
+            what = f"tokens={tokens}"
+            check(sum(lmk.fails()) == 0, f"{what}: timed-out waits {lmk.fails()}")
+            check(torch.equal(large, staged), f"{what}: large_m != staged")
+            check(torch.equal(large, again), f"{what}: large_m not deterministic")
+            check.settle()
+    finally:
+        torch.cuda.synchronize()
+        comm.barrier()
+        mega.close()
+        comm.barrier()
+
+
 def _worker(local_rank, world, port, failures):
     os.environ.update(
         MASTER_ADDR="127.0.0.1",
@@ -351,6 +436,19 @@ def _worker(local_rank, world, port, failures):
         if local_rank == 0:
             print(f"[{name}] {status}", flush=True)
         dist.barrier()
+    # Read when the kernel is built: this case's kernels count timed-out waits
+    # (dmk.fails()) and go on, so a deadlocked grid fails the check, not the GPU.
+    os.environ.update(AITER_DMK_NOTRAP="1", AITER_DMK_TIMEOUT_S="10")
+    name = "large_m resident grid"
+    try:
+        _check_resident(local_rank, world, comm, device)
+        status = "ok"
+    except Exception:  # noqa: BLE001
+        failed.append(name)
+        status = "FAILED\n" + traceback.format_exc()
+    if local_rank == 0:
+        print(f"[{name}] {status}", flush=True)
+    dist.barrier()
     comm.destroy()
     dist.destroy_process_group()
     failures[local_rank] = len(failed)

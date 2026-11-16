@@ -510,7 +510,9 @@ def make_decode_mega(
     # N KB of the W1 slice its first item most likely needs, so that item finds
     # it in cache. V4.1-Flash DEP4: -1.4 (tpr 32) to -4.9 (tpr 128) us/layer;
     # below 32 tokens most guessed experts get no rows and it costs.
-    PREF_B = 0 if COMPACT else int(os.environ.get("AITER_DMK_PREFETCH_KB", "256")) * 1024
+    PREF_B = (
+        0 if COMPACT else int(os.environ.get("AITER_DMK_PREFETCH_KB", "256")) * 1024
+    )
     PREF_B = min(PREF_B, int(tile_n) * (H // 2))
     # Every CTA of the grid must be resident: a 4-wave CTA puts one wave on
     # each SIMD, so ctas_per_cu CTAs need that many waves per EU, which caps
@@ -1722,7 +1724,7 @@ def make_decode_mega(
                 )
 
             stamp(2)
-            if const_expr(PREF_B):  # noqa: SIM102 - preserve DSL staging
+            if const_expr(PREF_B):
                 # While the plan is pending HBM is idle: read the W1 slice this
                 # CTA's first item most likely needs (m-tile bid // NT1 is
                 # expert bid // NT1 when every expert before it has rows), so
@@ -1750,7 +1752,8 @@ def make_decode_mega(
                             fx.Vector(
                                 buffer_load(
                                     rsrc_w1p,
-                                    (p_off + fx.Int32(q * 4 * WAVE * 16)) // fx.Int32(4),
+                                    (p_off + fx.Int32(q * 4 * WAVE * 16))
+                                    // fx.Int32(4),
                                     vec_width=4,
                                     dtype=T.i32,
                                 )
