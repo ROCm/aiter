@@ -13,6 +13,9 @@ from ..kernels.kernels_common import get_warp_size
 from ..kernels.topk.radix_topk_one_block import (
     _COMPACT_CAPACITY,
     _MAX_ROW_ELEMENTS,
+    _SAMPLED_BOUND_MIN_ROWS_PER_K,
+    _long_row_block_threads,
+    _row_cache_enabled,
     build_radix_topk_one_block_module,
 )
 from ..kernels.topk.topk_launch import run_topk_launcher
@@ -29,6 +32,8 @@ from .row_lens import row_len_slot
 # Widths up to this value use the persistent one-workgroup kernel.
 _ONE_WORKGROUP_MAX_ROW_WIDTH = 20_000
 _SHORT_ROWS_1024_THREAD_MAX_ROWS = 256
+# Long rows past this many take 512-thread blocks, two resident per CU.
+_LONG_ROWS_512_THREAD_ARCHES = ("gfx1250",)
 
 
 @lru_cache(maxsize=128)
@@ -474,9 +479,25 @@ def flydsl_radix_topk_one_block(
     wave_size = get_warp_size(arch)
     stream = torch.cuda.current_stream(logits.device)
     short_rows = width <= _COMPACT_CAPACITY
-    block_threads = (
-        1024 if not short_rows or num_rows <= _SHORT_ROWS_1024_THREAD_MAX_ROWS else 256
-    )
+    sampled_bound = True
+    if short_rows:
+        block_threads = 1024 if num_rows <= _SHORT_ROWS_1024_THREAD_MAX_ROWS else 256
+    else:
+        block_threads = _long_row_block_threads(k, stable, arch, num_rows)
+        # Past _SHORT_ROWS_1024_THREAD_MAX_ROWS rows, decode rows the row cache
+        # does not take at 512 threads still go to 512-thread blocks. So do rows
+        # all shorter than the sampled path takes, built without the bound: its
+        # code slows their two passes, and the row cache only serves its rows.
+        if (
+            block_threads == 1024
+            and is_decode
+            and arch in _LONG_ROWS_512_THREAD_ARCHES
+            and num_rows > _SHORT_ROWS_1024_THREAD_MAX_ROWS
+        ):
+            if width < _SAMPLED_BOUND_MIN_ROWS_PER_K * k:
+                block_threads, sampled_bound = 512, False
+            elif not _row_cache_enabled(k, 512, stable, False, arch):
+                block_threads = 512
     launcher = build_radix_topk_one_block_module(
         k,
         block_threads=block_threads,
@@ -487,6 +508,7 @@ def flydsl_radix_topk_one_block(
         wave_size=wave_size,
         arch=arch,
         packed_rows=packed_rows,
+        sampled_bound=sampled_bound,
     )
     run_topk_launcher(
         launcher,

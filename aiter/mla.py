@@ -31,6 +31,7 @@ from aiter.ops.attention import (
     _MlaHeadPlanKind,
     mla_ps64_qh128_fp8_asm_fwd,
 )
+from aiter.plugin import route as _route
 
 _FLYDSL_MLA_REDUCE_TARGET_GFX = ("gfx942", "gfx950")
 _FLYDSL_MLA_REDUCE_TARGET_H = 16
@@ -1027,6 +1028,11 @@ def mla_decode_fwd(
     page_table=None,
     kv_csr_layout="page",
     fast_mode=True,
+    *,
+    q_aux=None,
+    kv_aux=None,
+    nvfp4_params=None,
+    nvfp4_lse=None,
 ):
     """MLA decode with explicit KV byte-layout selection.
 
@@ -1060,7 +1066,73 @@ def mla_decode_fwd(
     indptr, ignoring last-page values (the tensor is still required).
     Physical ``page_size`` remains 64. Token CSR is only supported by the
     shuffled QH64 path; it does not change the KV byte layout.
+
+    ``nvfp4_n128`` uses separate packed q/q_aux and kv_buffer/kv_aux tensors,
+    page CSR, H128 and one query per request. Provide nvfp4_params prepared by
+    prepare_mla_nvfp4_params; it owns the softmax scale and fixed NVFP4 gains,
+    so leave sm_scale/q_scale/kv_scale unset. nvfp4_lse is reusable scratch
+    even when return_lse=False. No planner, split-K, CP or implicit conversion.
     """
+    if kv_layout == "nvfp4_n128":
+        from aiter.ops.mla_nvfp4 import mla_decode_nvfp4_fwd
+
+        if max_seqlen_q != 1 or page_size != 64 or nhead_kv != 1:
+            raise ValueError(
+                "nvfp4_n128 requires max_seqlen_q=1, page_size=64, nhead_kv=1"
+            )
+        if kv_csr_layout != "page" or num_kv_splits not in (None, 1):
+            raise ValueError("nvfp4_n128 requires page CSR and num_kv_splits=1")
+        if return_logits or logit_cap != 0 or intra_batch_mode:
+            raise ValueError(
+                "nvfp4_n128 has no partial logits, logit cap or persistent mode"
+            )
+        if cp_world_size != 1 or cp_rank != 0 or g_kv_indptr is not None:
+            raise ValueError("nvfp4_n128 does not support context parallelism")
+        if any(
+            x is not None
+            for x in (
+                num_kv_splits_indptr,
+                work_meta_data,
+                work_indptr,
+                work_info_set,
+                reduce_indptr,
+                reduce_final_map,
+                reduce_partial_map,
+                seq_lens,
+                page_table,
+            )
+        ):
+            raise ValueError(
+                "nvfp4_n128 uses page CSR without planner or dense metadata"
+            )
+        if any(x is not None for x in (sm_scale, q_scale, kv_scale)):
+            raise ValueError(
+                "NVFP4 scales are encoded in nvfp4_params; omit scalar scales"
+            )
+        if q_aux is None or kv_aux is None or nvfp4_params is None:
+            raise ValueError("nvfp4_n128 requires q_aux, kv_aux and nvfp4_params")
+        if qo_indptr is not None and (
+            qo_indptr.dtype != torch.int32
+            or qo_indptr.device != q.device
+            or qo_indptr.shape != (q.shape[0] + 1,)
+            or not qo_indptr.is_contiguous()
+        ):
+            raise ValueError("qo_indptr must be int32 [B+1], containing [0,1,...,B]")
+        return mla_decode_nvfp4_fwd(
+            q,
+            q_aux,
+            kv_buffer,
+            kv_aux,
+            o,
+            kv_indptr,
+            kv_indices,
+            kv_last_page_lens,
+            params=nvfp4_params,
+            lse=nvfp4_lse,
+            return_lse=return_lse,
+        )
+    if any(x is not None for x in (q_aux, kv_aux, nvfp4_params, nvfp4_lse)):
+        raise ValueError("NVFP4 auxiliary tensors require kv_layout='nvfp4_n128'")
     if kv_csr_layout not in ("page", "token"):
         raise ValueError(f"unknown MLA kv_csr_layout: {kv_csr_layout!r}")
     kv_indptr_is_token_level = kv_csr_layout == "token"
@@ -1286,6 +1358,16 @@ def mla_decode_fwd(
             and get_gfx() == "gfx950"
         ):
             mgc = 32
+        # gfx950 fp8 gqa16 qlen1 kernel (a8w8_qh16_qseqlen1) does the same with
+        # SUB_KV=128 tiles.
+        if (
+            nhead == 16
+            and q.dtype == dtypes.fp8
+            and kv_buffer.dtype == dtypes.fp8
+            and max_seqlen_q == 1
+            and get_gfx() == "gfx950"
+        ):
+            mgc = 128
 
         # QH64's BF16 direct-output epilogue does not write LSE. Request FP32
         # partials and merge even a single split when the caller needs LSE.
@@ -2298,6 +2380,7 @@ def mla_prefill_reduce(
 # DSv4 MLA -- additive entry point. Does NOT touch any existing
 #   gqa_ratio=64, sub_Q=64, page_size=1, q_dtype=fp8, kv_dtype=fp8
 # ---------------------------------------------------------------------------
+@_route(op="mla_decode_fwd_v4_nm", version=1)
 def mla_decode_fwd_v4_nm(
     q,  # [total_query_len, num_heads, head_size]   FP8 packed Q+e8m0
     qrope,  # [total_query_len, num_heads, kv_rotary]   BF16
@@ -2664,6 +2747,7 @@ def mla_decode_fwd_v4_nm(
     return logits, attn_lse
 
 
+@_route(op="mla_decode_fwd_v4_nm_ps", version=1)
 def mla_decode_fwd_v4_nm_ps(
     q_packed,  # [N, 128, 512] FP8 packed Q+e8m0
     q_rope,  # [N, 128, 64] BF16
