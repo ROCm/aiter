@@ -19,8 +19,9 @@ kernel flushing through native `global_atomic_add_f32` measured 26-28% slower
 end to end (B=120: 59.2 vs 46.9 ms; B=1024: 494 vs 388 ms), no faster than
 the fallback pair. gfx942 has no packed fp32 atomic to amortise them.
 
-This is the default backward. Shapes outside `validate_hstu_attention_bwd`, and
-calls whose scratch does not fit, run the `hstu_attention_bwd_fallback_dvdk` +
+This is the default backward. Shapes outside `validate_hstu_attention_bwd`,
+calls whose scratch does not fit, calls under CUDA graph capture, and calls that
+opt out (`fused=False`, `AITER_HSTU_BWD_FUSED=0`) run the `hstu_attention_bwd_fallback_dvdk` +
 `hstu_attention_bwd_fallback_dq` pair instead, which computes the same
 gradients in two single-writer kernels.
 
@@ -30,9 +31,11 @@ KV subtiles exceeds the register budget.
 
 The two waves resident on each SIMD are held in *opposite* phases:
 
-    phase M : the 48 MFMAs, their LDS operand feed, the Q/dO DMA, the
-              transpose build, and the mask.
-    phase V : the fused SiLU / SiLU' gate.  No memory operations at all.
+    phase M : the 32 operand-group MFMAs, the dQ GEMM and the dS transpose, the
+              LDS operand feed, the Q/dO DMA and the Q^T / dO^T build.
+    phase V : the fused SiLU / SiLU' gate and the mask. Its only memory
+              operations are the dQ cross-wave reduction's LDS reads and the
+              HBM store.
 
 One wave group is in M while the other is in V, so the matrix core and the VALU
 pipe are both busy continuously.  Without this, the two resident waves sit in
@@ -136,14 +139,13 @@ NUM_OPERAND_GROUPS = 16
 #
 # In natural order the four chunks of one GEMM run back to back, and GEMM0 /
 # GEMM2 accumulate over `ks` into the SAME register per `og` -- a 4-deep
-# dependency chain with only KV_OWNED_SUBTILES (3) independent MFMAs between
-# consecutive links. At ~4 cy of issue each that is 12 cy against a ~16 cy MFMA
-# result latency, so every link stalls.
+# dependency chain with only KV_OWNED_SUBTILES (2) MFMAs per link. At ~4 cy of
+# issue each that is ~8 cy against a ~16 cy MFMA result latency, so every link
+# stalls.
 #
 # Interleaving the two independent GEMMs of each pair (0 with 2, 1 with 3)
-# doubles the spacing to 6 MFMAs, which covers the latency. Pure reordering:
-# every accumulator still sees its `ks` steps in the same sequence, so the
-# arithmetic is unchanged.
+# doubles the spacing to 4 MFMAs. Pure reordering: every accumulator still sees
+# its `ks` steps in the same sequence, so the arithmetic is unchanged.
 GROUP_ORDER = [0, 4, 1, 5, 2, 6, 3, 7, 8, 12, 9, 13, 10, 14, 11, 15]
 assert sorted(GROUP_ORDER) == list(range(NUM_OPERAND_GROUPS))
 
@@ -333,13 +335,9 @@ def build_hstu_attention_bwd(
     UNROLL = RM_SLOTS
     assert UNROLL % RM_SLOTS == 0 and UNROLL % T_SLOTS == 0
     RM_TILE_ELEMS = BLOCK_N * STRIDE
-    # Fragment-transpose scratch: one 16x16 bf16 region per (wave, subtile).
-    # PER-WAVE PRIVATE -- a wave transposes only its own kv rows -- so it
-    # needs no barrier, only `s_waitcnt lgkmcnt`, and it does not rotate, so
-    # it does not force UNROLL to lcm(...).
     # dQ staging: one BLOCK_N x head_dim fp32 tile per wave. The row stride is
     # padded by 4 dwords so the four quarter-waves of a b128 access land 4
-    # banks apart instead of 0 mod 64.
+    # banks apart instead of on the same bank.
     DQ_PAD = head_dim + 4
     # One PRIVATE slot per wave, written with ds_write and summed by the
     # flush. `ds_add_f32` into a shared slot is roughly 50x slower per op on
@@ -372,7 +370,8 @@ def build_hstu_attention_bwd(
     # The MFMA B operand for chunk c gives lane (m = lane%16, g = lane/16) the
     # 4 bf16 at [d = c*16 + m][q = g*4 .. +3] -- 8 bytes.  Indexed the obvious
     # way ([d][q], stride BLOCK_N+pad) the four chunks sit 16 rows apart, so
-    # feeding the burst costs 4 x `ds_read_b64` per tile, 8 across q_t + do_t.
+    # feeding the burst costs 4 source-level `ds_read_b64` per tile, 8 across
+    # q_t + do_t (the backend may already fuse some into `ds_read2_b64`).
     #
     # Order it [g][m][c][q] instead and those four 8-byte pieces become
     # adjacent: 32 contiguous bytes per lane, 2 x `ds_read_b128`, 4 reads total.
@@ -621,9 +620,9 @@ def build_hstu_attention_bwd(
             v_packs.append(per_og)
 
         # K stays unscaled, so GEMM0 yields the raw score `s` and the gate works
-        # on `z = alpha*s` symbolically (see gate_phase). P and dS are then
-        # missing a factor of alpha and 1/N respectively; all three outputs
-        # recover it in the one multiply their stores already do.
+        # on `z = alpha*s` symbolically (see gate_phase). P and dS then both
+        # lack alpha/N; dV, dK and dQ each recover it with `c_out_scale` in the
+        # one multiply their stores already do.
         c_out_scale = fx.Float32(alpha / max_seq_len)
         c_neg_alpha_log2e = fx.Float32(-alpha * _LOG2E)
         c_alpha = fx.Float32(alpha)
@@ -684,8 +683,8 @@ def build_hstu_attention_bwd(
                 bound.append(last_row_elem + gcol)
             # The DMA destination must be wave-uniform in an SGPR, so it is the
             # one LDS address that still goes through `inttoptr` -- that is how
-            # `m0` is written and it is what the shipping kernel does too. One
-            # base per slot, so the slot never becomes a runtime offset.
+            # `m0` is written. One base per slot, so the slot never becomes a
+            # runtime offset.
             lane0 = []
             for view in dst_views:
                 wave_byte = fx.Int32(
@@ -1012,8 +1011,9 @@ def build_hstu_attention_bwd(
             phase and reads a row the partner published a barrier ago, disjoint
             from the row written below.
 
-            Rows with no slot in the scratch -- below this tile's diagonal, or
-            at or past `q_upper` -- are steered to the shared trash row 0.
+            Rows with no slot in the scratch -- above this tile's diagonal
+            (`q < kv_start_row`), or at or past `q_upper` -- are steered to the
+            shared trash row 0.
             """
             acc, _g = _issued
             # The own-group sum is kept aside so g1's exchange write issues
@@ -1056,10 +1056,9 @@ def build_hstu_attention_bwd(
             rewriter lowers to its own function scope. Closing over it from out
             here is a NameError, not a late binding.
             """
-            # dS in the layout the dQ GEMM's A operand needs. Per-tile, unlike
-            # kt_packs: one scratch slot per subtile, written and read inside
-            # this phase by the owning wave only, so no barrier is involved and
-            # the slots never cross one.
+            # dS in the layout the dQ GEMM's B operand needs. Per-tile, unlike
+            # kt_packs, and register-only (one MFMA per subtile), so no LDS or
+            # barrier is involved.
             ds_t = [
                 transpose_frag(ds_prev[og]) for og in range_constexpr(KV_OWNED_SUBTILES)
             ]
@@ -1161,9 +1160,8 @@ def build_hstu_attention_bwd(
             # ---- dQ: partial over THIS workgroup's KV range ----------------
             # dQ[q][d] = sum_kv dS[q][kv].K[kv][d]. Both operands are
             # register-resident (transposed dS, kt_packs), so this needs no
-            # operand-window group and adds no window registers.
-            #
-            # C[m=q][n=d] over 4 d-chunks x KV_OWNED_SUBTILES kv steps.
+            # operand-window group and adds no window registers. It is 4 d-chunks
+            # x KV_OWNED_SUBTILES kv steps.
             rocdl.sched_barrier(0)
             # Operands SWAPPED: this computes dQ^T, C[m=d][n=q]. Same
             # arithmetic for free, different lane layout -- a lane then
@@ -1207,24 +1205,18 @@ def build_hstu_attention_bwd(
 
             rocdl.sched_barrier(0)
 
-            # The dQ staging writes are emitted INSIDE the transpose build,
-            # between its gather and its store.
+            # The last dQ staging chunk is emitted INSIDE the transpose build,
+            # between its gather and its store. It reads a dQ accumulator
+            # directly, and an MFMA result costs a non-MFMA consumer wait
+            # states, which the four `ds_read_u16` ahead of it cover. Placed
+            # after the whole transpose instead, it landed right before the
+            # phase's closing `lgkmcnt(0)` with nothing to cover its own
+            # retirement; here the transpose's own wait and store do it.
             #
-            # They read dQ accumulators directly, and an MFMA result costs a
-            # non-MFMA consumer wait states -- the hazard recogniser emits
-            # `s_nop 3`/`s_nop 6` and the writes absorb the rest. The four
-            # `ds_read_u16` ahead of them cover that. Sitting AFTER the whole
-            # transpose instead, they landed immediately before the phase's
-            # closing `lgkmcnt(0)` with nothing to cover their own retirement;
-            # here the transpose's own wait and store do it.
-            #
-            # Both sides are conflict-free 64-lane b128 accesses (8 accesses on
-            # the busiest bank, the floor) because of T_GPAD and DQ_PAD.
+            # The staging writes and the flush reads are conflict-free 64-lane
+            # b128 accesses (8 accesses on the busiest bank, the floor) because
+            # of DQ_PAD.
             def _dq_stage():
-                # Only the last chunk is left: the other three went out
-                # interleaved with the dQ GEMM above. This one has no following
-                # MFMA to cover it, so it keeps the transpose's four
-                # `ds_read_u16` as its hazard cover.
                 _dq_stage_chunk(K_STEPS - 1)
 
             rocdl.sched_barrier(0)
@@ -1378,14 +1370,6 @@ def build_hstu_attention_bwd(
             rocdl.s_waitcnt(lgkmcnt=0)
             phase_barrier()
 
-            # K in the kv-as-reduction layout, for the dQ GEMM's B operand.
-            # Loop-invariant, so paid ONCE per workgroup -- and it avoids
-            # re-reading K from HBM in a second layout. The flush applies the
-            # chain rule's alpha together with 1/N.
-            #
-            # Placed AFTER the prologue fence, not beside k_packs: up there it
-            # runs while the zeroing and the staging DMA are still in flight,
-            # and that corrupts dV/dK.
             # Only `dqg` needs clearing, and only its permanently-zero row --
             # but zero the whole thing, it is one short loop and leaves no
             # assumption about which rows g1 reads. `dqw` is fully overwritten
@@ -1396,6 +1380,10 @@ def build_hstu_attention_bwd(
                 dqg_flat[_zi] = fx.Float32(0.0)
             rocdl.s_waitcnt(lgkmcnt=0)
 
+            # K in the kv-as-reduction layout, for the dQ GEMM's A operand.
+            # Loop-invariant, so paid ONCE per workgroup -- and it avoids
+            # re-reading K from HBM in a second layout. The flush applies the
+            # chain rule's alpha together with 1/N.
             kt_packs = []
             for ks in range_constexpr(K_STEPS):
                 per_og = []
@@ -1720,11 +1708,8 @@ def build_hstu_attention_bwd_dq_reduce(
         d0 = fx.Int32(fx.get_scalar(fx.get_(thr, 2))) * fx.Int32(VEC)
         col = h * fx.Int32(head_dim) + d0
 
-        # The tail rows of the last block are clamped onto the last real row,
-        # so they read (and later rewrite) a valid element with the value that
-        # row would get anyway. Bounding the WRITE instead would need a dynamic
-        # `if` around a tensor subscript store, which makes the AST rewriter
-        # demand an scf.if result for the output tensor.
+        # The tail rows of the last block are clamped onto the last real row, so
+        # their loads stay in bounds; the stores below skip them.
         rr = []
         for s in range_constexpr(SLICES):
             _r = row0 + fx.Int32(s * ROW_GROUP) + row_sub
@@ -1808,16 +1793,24 @@ def build_hstu_attention_bwd_dq_reduce(
             fx.Float32(x)
             for x in (list(acc) if isinstance(acc, (list, tuple)) else [acc])
         ]
+        # Only real rows store. The clamped tail lanes would otherwise write the
+        # last row's element too, and past the first pass each of them has read
+        # the carry that a sibling wave may already have updated.
+        #
+        # `fx.generic_store`, not a subscript assignment: inside a dynamic `if`
+        # an assignment makes the AST rewriter demand an scf.if result for the
+        # tensor, while a call has no assignment target.
+        dst = fx.get_iter(out_dq if const_expr(last_pass) else dq_acc)
         for s in range_constexpr(SLICES):
-            for j in range_constexpr(VEC):
-                if const_expr(last_pass):
-                    out_dq[fx.Int64(seq_start + rr[s]), h, d0 + fx.Int32(j)] = res[
-                        s * VEC + j
-                    ].to(elem_dtype)
-                else:
-                    dq_acc[fx.Int64(seq_start + rr[s]), col + fx.Int32(j)] = res[
-                        s * VEC + j
-                    ]
+            if (row0 + fx.Int32(s * ROW_GROUP) + row_sub) < seq_len:
+                _dst_row = (
+                    dst + fx.Int64(seq_start + rr[s]) * fx.Int64(HD) + fx.Int64(col)
+                )
+                for j in range_constexpr(VEC):
+                    _out = res[s * VEC + j]
+                    if const_expr(last_pass):
+                        _out = _out.to(elem_dtype)
+                    fx.generic_store(_dst_row + fx.Int64(j), _out)
 
     @flyc.jit
     def launch_hstu_attention_bwd_dq_reduce(
@@ -1896,10 +1889,12 @@ def build_partial_offsets(rows, *, tile_lo=0, tile_hi=None):
     DENSE [max_tiles][L][H][D] layout does not fit at production shapes.
 
     Returns a flat int64 table indexed `b * max_tiles + t`, with -1 where tile
-    t has no slot in this pass (so an out-of-range read is a visible fault, not
-    silent corruption). The table keeps the full `max_tiles` stride, but the
-    offsets PACK from the start of the buffer so every pass reuses the same
-    scratch. Slot sizes sum to `span_scratch_rows` for the same span.
+    t has no slot in this pass. Nothing indexes such an entry: the fused kernel
+    steers every row of a slotless tile to the trash row, and the reduction
+    only visits tiles of its own pass. The table keeps the full `max_tiles`
+    stride, but the offsets PACK from the start of the buffer so every pass
+    reuses the same scratch. Slot sizes sum to `span_scratch_rows` for the same
+    span.
     """
     max_tiles = rows.shape[1]
     if tile_hi is None:
