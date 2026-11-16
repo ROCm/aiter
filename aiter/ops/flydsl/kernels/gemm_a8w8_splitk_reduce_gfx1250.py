@@ -29,6 +29,7 @@ def compile_gemm_a8w8_splitk_reduce(
     partial_dtype_str: str = "bf16",
     threads: int = BLOCK,
     cache_policy: int = 0,
+    device_index: int | None = None,
 ):
     if partial_dtype_str not in ("bf16", "f32") or out_dtype_str not in (
         "bf16",
@@ -53,6 +54,9 @@ def compile_gemm_a8w8_splitk_reduce(
 
     if partial_dtype_str != "bf16" or threads != BLOCK or cache_policy:
         name += f"_{partial_dtype_str}_t{threads}_cp{cache_policy}"
+
+    if device_index is not None:
+        name += f"_d{device_index}"
 
     @flyc.kernel(name=name, known_block_size=[block, 1, 1])
     def reduce_kernel(

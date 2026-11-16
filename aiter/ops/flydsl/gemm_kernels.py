@@ -299,7 +299,12 @@ def _split_planes_hgemm(a, b, out, bias, out_dtype, stream, params):
             out_dtype=torch.float32,
         )
         reducer = compile_gemm_a8w8_splitk_reduce(
-            split_k=5, partial_dtype_str="f32", threads=64, unroll=8, cache_policy=2
+            split_k=5,
+            partial_dtype_str="f32",
+            threads=64,
+            unroll=8,
+            cache_policy=2,
+            device_index=a.device.index,
         )
         elements = out.numel()
         _run_compiled(

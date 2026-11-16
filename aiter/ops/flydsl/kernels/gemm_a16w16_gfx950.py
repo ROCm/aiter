@@ -49,6 +49,7 @@ class GemmA16W16Gfx950Param:
     is_split_k: fx.Constexpr[bool]
     split_k_partials: fx.Constexpr[bool]
     split_count: fx.Constexpr[int]
+    device_index: fx.Constexpr[int]
     static_m: fx.Constexpr[int]
     static_n: fx.Constexpr[int]
     static_k: fx.Constexpr[int]
@@ -127,6 +128,7 @@ def make_gemm_a16w16_gfx950_param(
     static_m: int = 0,
     static_n: int = 0,
     static_k: int = 0,
+    device_index: int = 0,
 ) -> GemmA16W16Gfx950Param:
     if in_dtype_id not in (GEMM_A16W16_DTYPE_BF16, GEMM_A16W16_DTYPE_FP16):
         raise ValueError(f"unsupported in_dtype_id={in_dtype_id}")
@@ -306,6 +308,7 @@ def make_gemm_a16w16_gfx950_param(
         is_split_k=split_k > 1,
         split_k_partials=split_k_partials,
         split_count=split_k if split_k_partials else 0,
+        device_index=device_index,
         static_m=static_m,
         static_n=static_n,
         static_k=static_k,
@@ -340,7 +343,7 @@ def make_gemm_a16w16_gfx950_kernel_name(param: GemmA16W16Gfx950Param):
     out_suffix = "_fp32c" if param.out_dtype_id == GEMM_A16W16_DTYPE_FP32 else ""
     name = f"hgemm_{dtype_str}{out_suffix}_t{param.block_m}x{param.block_n}x{param.block_k}x{param.stages}"
     if param.split_k_partials:
-        name += f"_planes{param.split_count}_m{param.static_m}n{param.static_n}k{param.static_k}"
+        name += f"_planes{param.split_count}_m{param.static_m}n{param.static_n}k{param.static_k}_d{param.device_index}"
     else:
         name += "_kst4" if param.is_split_k else "_ks1"
     name += f"_w{param.m_waves}x{param.n_waves}x{param.k_waves}"
@@ -1753,7 +1756,7 @@ def gemm_a16w16(
 
     kwargs.update(user_kwargs or {})
     if partials:
-        kwargs.update(static_m=m, static_n=n, static_k=k)
+        kwargs.update(static_m=m, static_n=n, static_k=k, device_index=a.device.index)
     kwargs["a_is_transposed"] = a_is_transposed
     kwargs["b_is_transposed"] = b_is_transposed
     kwargs["in_dtype_id"] = (
