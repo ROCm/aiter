@@ -3540,12 +3540,12 @@ def _flydsl_v2_stage2_wrapper(
         )
     epilog = cfg["epilog"]
     ep32_native = (
-        cfg.get("ep32", False) and bm == 96
+        cfg.get("ep32", False) and (bm == 96 or (bm == 160 and out.shape[0] == 8192))
         and out.shape[1] == 3584 and inter_dim == 3072 and not cfg["use_nt"]
         and os.environ.get("G2_OUTPUT_NATIVE", "1") == "1"
     )
     ep32_sorted_reduce = ep32_native
-    ep32_native_bf16 = ep32_native and bm == 96 and os.environ.get("G2_NATIVE_BF16", "1") == "1"
+    ep32_native_bf16 = ep32_native and bm in (96, 160) and os.environ.get("G2_NATIVE_BF16", "1") == "1"
     if ep32_sorted_reduce:
         epilog = "reduce"
     max_sorted = inter_states.shape[0]

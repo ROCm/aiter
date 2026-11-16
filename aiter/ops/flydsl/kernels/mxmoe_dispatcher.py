@@ -792,7 +792,10 @@ def get_g2(
 
 @functools.cache
 def get_g2_ep32(use_nt, HIDDEN_MAX, INTER_MAX, use_valid_token_count, grid_wgs, BM=64, B_NT=False, variant="base", REDUCE=False, topk=1, NATIVE_C=False, NATIVE_BF16=False):
-    from .mxfp4_gemm2_ep32 import compile_gemm2_ep32
+    if BM == 160:
+        from .mxfp4_gemm2_ep32_bm160 import compile_gemm2_ep32_bm160 as compile_gemm2_ep32
+    else:
+        from .mxfp4_gemm2_ep32 import compile_gemm2_ep32
 
     return compile_gemm2_ep32(
         use_nt=bool(use_nt),
@@ -922,23 +925,27 @@ def mxfp4_moe_gemm2(
         if not bias.is_contiguous():
             bias = bias.contiguous()
     if ep32:
+        if BM == 160 and (M_logical, D_HIDDEN, D_INTER, epilog, native_bf16) != (
+            8192, 3584, 3072, "reduce", True
+        ):
+            raise ValueError("BM160 EP32 GEMM2 requires M8192 Kimi-K3 native BF16 staging")
         if native_bf16 and not (
-            BM == 96 and out.dtype == torch.bfloat16 and epilog == "reduce"
+            BM in (96, 160) and out.dtype == torch.bfloat16 and epilog == "reduce"
             and D_HIDDEN == 3584 and D_INTER == 3072
         ):
-            raise ValueError("weighted native BF16 output requires BM96 Kimi-K3 reduce staging")
+            raise ValueError("weighted native BF16 output requires BM96/BM160 Kimi-K3 reduce staging")
         # Dedicated EP32 A8W4 kernel (mxfp4_gemm2_ep32.py): fixed persistent grid.
         if (BN, BK, a_dtype, b_dtype, persist, out_dtype) != (
             256, 128, "fp8", "fp4", False, "bf16"
-        ) or epilog not in ("atomic", "reduce") or (epilog == "reduce" and BM != 96) or (BM, SBM) not in ((64, 64), (96, 96)) or bias is not None:
+        ) or epilog not in ("atomic", "reduce") or (epilog == "reduce" and BM not in (96, 160)) or (BM, SBM) not in ((64, 64), (96, 96), (160, 160)) or bias is not None:
             raise NotImplementedError(
-                "gemm2 ep32 supports BM64/sbm64 atomic or BM96/sbm96 reduce, BN256/BK128 A8W4 bf16 "
+                "gemm2 ep32 supports BM64/sbm64 atomic or BM96/BM160 matching-sort reduce, BN256/BK128 A8W4 bf16 "
                 "without bias"
             )
         launch = get_g2_ep32(
             use_nt, HIDDEN_MAX, D_INTER, bool(use_valid_token_count), 2 * get_cu_num(), BM=BM,
-            B_NT=BM == 96 and os.environ.get("G2_B_NT", "1") == "1",
-            variant=os.environ.get("G2_VARIANT", "native" if D_HIDDEN == 3584 and D_INTER == 3072 and (out.dtype == torch.float32 or native_bf16) else "base") if BM == 96 else "base",
+            B_NT=BM in (96, 160) and os.environ.get("G2_B_NT", "1") == "1",
+            variant=os.environ.get("G2_VARIANT", "native" if D_HIDDEN == 3584 and D_INTER == 3072 and (out.dtype == torch.float32 or native_bf16) else "base") if BM in (96, 160) else "base",
             REDUCE=epilog == "reduce", topk=topk,
             NATIVE_C=epilog == "reduce" and (out.dtype == torch.float32 or native_bf16) and os.environ.get("G2_OUTPUT_NATIVE", "1") == "1",
             NATIVE_BF16=native_bf16,

@@ -35,7 +35,9 @@ def _get_compiled_mxfp4_gemm1_port(
     k_wave=1,
     ep32=False,
 ):
-    if ep32:
+    if ep32 and BM == 160:
+        from .kernels.mxfp4_gemm1_ep32_bm160 import compile_gemm1_ep32_bm160 as compile_gemm1
+    elif ep32:
         from .kernels.mxfp4_gemm1_ep32 import compile_gemm1_ep32 as compile_gemm1
     else:
         from .kernels.mxfp4_gemm1 import compile_gemm1_a4w4_port as compile_gemm1
@@ -242,6 +244,8 @@ def flydsl_mxfp4_gemm1(
     ep32 selects the dedicated EP32 A8W4 kernel, which validates its own
     configuration at compile time.
     """
+    if ep32 and BM == 160 and n_tokens != 8192:
+        raise ValueError("The BM160 EP32 implementation is restricted to M8192")
     if not ep32:
         _assert_supported(
             D_HIDDEN=D_HIDDEN,
