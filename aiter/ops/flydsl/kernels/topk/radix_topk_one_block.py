@@ -66,8 +66,11 @@ _BOUNDED_ROW_CAPACITY_BY_ARCH = {
 # Vector steps whose keys stay in registers; longer rows reload the rest
 # from L2 after the bound is known (1024-thread blocks get 128 VGPRs a wave).
 _BOUNDED_REGISTER_STEPS = 8
-_BOUNDED_CANDIDATE_CAPACITY = 6144
-_BOUND_BIN_BITS = 10
+# 8192 candidates keep BoundedStorage at 96 KiB, below the 158 KiB arena-union
+# footprint, so the extra fallback headroom does not lower occupancy. Use the
+# full existing 2048-bin histogram to tighten the lower bound.
+_BOUNDED_CANDIDATE_CAPACITY = 2 * _COMPACT_CAPACITY
+_BOUND_BIN_BITS = _SHORT_RADIX_BITS[0]
 _STABLE_INDEX_SORT_MIN_ROW_LEN = 1 << 15
 _STABLE_COMPACT_SORT_MIN_ROW_LEN = 48 * 1024
 # Arches whose streaming rows always take the index sort: there it beats the
@@ -1390,9 +1393,6 @@ def build_radix_topk_one_block_body(
                     )
 
         # Bounded rows (wave32, stable): see _BOUNDED_ROW_CAPACITY_BY_ARCH.
-        def ballot_mask(pred):
-            return fx.Int32(fx.rocdl.ballot(T.i32, pred))
-
         def popcount(mask):
             return fx.Int32(fx.ctpop(mask))
 
