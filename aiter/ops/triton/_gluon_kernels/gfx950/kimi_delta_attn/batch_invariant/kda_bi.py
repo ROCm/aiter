@@ -98,6 +98,46 @@ def _f32_dot(a, b, acc, num_warps: gl.constexpr):
 
 
 @gluon.jit
+def _a_block(
+    q_i,
+    k_i,
+    g_i,
+    g_ref,
+    k_t,
+    g_t,
+    g_ref_t,
+    beta_i,
+    scale,
+    i: gl.constexpr,
+    num_warps: gl.constexpr,
+):
+    """Row block i of Aqk and of beta-scaled Akk, fp32 [16, 64] in f32_mfma_layout, from
+    register operands:
+    - f32_mfma_layout: q_i, k_i (bf16 [16, 128]), g_i (fp32 [16, 128]), g_ref (fp32
+      [1, 128], the gate cumsum of row 16 i) and beta_i (fp32 [16], SliceLayout(1, .));
+    - key_t_layout: k_t (bf16 [128, 64]), g_t (fp32 [128, 64]) and g_ref_t ([128, 1]).
+    Key columns >= 16 (i + 1) only need finite values: they are zeroed in the operand.
+    Exponents are relative to row 16 i. Aqk keeps c <= r, Akk c < r."""
+    MF: gl.constexpr = f32_mfma_layout(num_warps)
+    KT: gl.constexpr = key_t_layout(num_warps)
+    e = gl.exp2(g_i - g_ref)
+    qg = q_i.to(gl.float32) * e
+    kg = k_i.to(gl.float32) * e
+    col_t = gl.expand_dims(gl.arange(0, BT, layout=gl.SliceLayout(0, KT)), 0)
+    kn = gl.where(
+        col_t < (i + 1) * BC, k_t.to(gl.float32) * gl.exp2(g_ref_t - g_t), 0.0
+    )
+    z = gl.zeros([BC, BT], gl.float32, MF)
+    aqk = _f32_dot(qg, kn, z, num_warps) * scale
+    akk = _f32_dot(kg, kn, z, num_warps)
+    r2 = gl.expand_dims(gl.arange(0, BC, layout=gl.SliceLayout(1, MF)) + i * BC, 1)
+    c = gl.expand_dims(gl.arange(0, BT, layout=gl.SliceLayout(0, MF)), 0)
+    aqk = gl.where(r2 >= c, aqk, 0.0)
+    akk = gl.where(r2 > c, akk * gl.expand_dims(beta_i, 1), 0.0)
+    return aqk, akk
+
+
+@gluon.jit
 def _a_rows(
     s_q,
     s_k,
@@ -112,31 +152,29 @@ def _a_rows(
     i: gl.constexpr,
     num_warps: gl.constexpr,
 ):
-    """Row block i of Aqk (stored, bf16) and of beta-scaled Akk (to s_l, fp32): rows
-    [16 i, 16 i + 16) against all 64 columns. Exponents are relative to row 16 i; key rows
-    of later row blocks are zeroed in the operand. Aqk keeps c <= r, Akk c < r."""
+    """_a_block for row block i with its operands from the chunk's shared tiles; stores the
+    Aqk row block (bf16) and the Akk row block to s_l (fp32)."""
     MF: gl.constexpr = f32_mfma_layout(num_warps)
     KT: gl.constexpr = key_t_layout(num_warps)
-    g_i = s_g.slice(i * BC, BC).load(MF)
-    e = gl.exp2(g_i - s_g.slice(i * BC, 1).load(MF))
-    qg = s_q.slice(i * BC, BC).load(MF).to(gl.float32) * e
-    kg = s_k.slice(i * BC, BC).load(MF).to(gl.float32) * e
-    k_t = s_k.permute([1, 0]).load(KT).to(gl.float32)
-    g_t = s_g.permute([1, 0]).load(KT)
-    ref_t = s_g.slice(i * BC, 1).permute([1, 0]).load(KT)
-    col_t = gl.expand_dims(gl.arange(0, BT, layout=gl.SliceLayout(0, KT)), 0)
-    kn = gl.where(col_t < (i + 1) * BC, k_t * gl.exp2(ref_t - g_t), 0.0)
-    z = gl.zeros([BC, BT], gl.float32, MF)
-    aqk = _f32_dot(qg, kn, z, num_warps) * scale
-    akk = _f32_dot(kg, kn, z, num_warps)
     r = gl.arange(0, BC, layout=gl.SliceLayout(1, MF)) + i * BC
-    c = gl.expand_dims(gl.arange(0, BT, layout=gl.SliceLayout(0, MF)), 0)
-    b = gl.load(BETA + r.to(gl.int64) * sb, mask=r < n, other=0.0).to(gl.float32)
+    aqk, akk = _a_block(
+        s_q.slice(i * BC, BC).load(MF),
+        s_k.slice(i * BC, BC).load(MF),
+        s_g.slice(i * BC, BC).load(MF),
+        s_g.slice(i * BC, 1).load(MF),
+        s_k.permute([1, 0]).load(KT),
+        s_g.permute([1, 0]).load(KT),
+        s_g.slice(i * BC, 1).permute([1, 0]).load(KT),
+        gl.load(BETA + r.to(gl.int64) * sb, mask=r < n, other=0.0).to(gl.float32),
+        scale,
+        i,
+        num_warps,
+    )
     r2 = gl.expand_dims(r, 1)
-    aqk = gl.where(r2 >= c, aqk, 0.0)
-    akk = gl.where(r2 > c, akk * gl.expand_dims(b, 1), 0.0)
-    off = r2.to(gl.int64) * s_a + c
-    gl.store(AQK + off, aqk.to(gl.bfloat16), mask=(r2 < n) & (c < BT))
+    c = gl.expand_dims(gl.arange(0, BT, layout=gl.SliceLayout(0, MF)), 0)
+    gl.store(
+        AQK + r2.to(gl.int64) * s_a + c, aqk.to(gl.bfloat16), mask=(r2 < n) & (c < BT)
+    )
     s_l.slice(i * BC, BC).store(akk)
 
 
@@ -208,13 +246,19 @@ def _beta_rows(BETA, sb, i: gl.constexpr, n, num_warps: gl.constexpr):
 
 
 @gluon.jit
+def _w_rhs_block(k_i, g_i, beta_i):
+    """w right-hand side of one row block, k^ beta 2^G, from register operands (k_i bf16,
+    g_i fp32 [16, 128] and beta_i [16, 1] fp32, all in f32_mfma_layout)."""
+    return k_i.to(gl.float32) * beta_i * gl.exp2(g_i)
+
+
+@gluon.jit
 def _w_rhs(s_k, s_g, BETA, sb, i: gl.constexpr, n, num_warps: gl.constexpr):
     MF: gl.constexpr = f32_mfma_layout(num_warps)
-    k = s_k.slice(i * BC, BC).load(MF).to(gl.float32)
-    return (
-        k
-        * _beta_rows(BETA, sb, i, n, num_warps)
-        * gl.exp2(s_g.slice(i * BC, BC).load(MF))
+    return _w_rhs_block(
+        s_k.slice(i * BC, BC).load(MF),
+        s_g.slice(i * BC, BC).load(MF),
+        _beta_rows(BETA, sb, i, n, num_warps),
     )
 
 
