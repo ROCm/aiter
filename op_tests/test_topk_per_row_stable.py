@@ -14,6 +14,8 @@ import argparse
 
 import torch
 
+from aiter.jit.utils.chip_info import get_cu_num_device, get_gfx_runtime
+from aiter.ops import topk
 from aiter.ops.topk import top_k_per_row_decode, top_k_per_row_prefill
 
 
@@ -137,7 +139,7 @@ def check_prefill_many_tied_rows():
     return valid and det and ascending and matches_ref
 
 
-def check_decode(batch, ctx, k, next_n, tie_level, max_row_len=None):
+def check_decode(batch, ctx, k, next_n, tie_level, max_row_len=None, backend=None):
     num_rows = batch * next_n
     seq_lens = torch.full((batch,), ctx, dtype=torch.int32, device="cuda")
     row_idx = torch.arange(num_rows, device="cuda") // next_n
@@ -146,6 +148,11 @@ def check_decode(batch, ctx, k, next_n, tie_level, max_row_len=None):
     logits = make_logits(num_rows, ctx, tie_level, seed=321)
     for i in range(num_rows):
         logits[i, row_ends[i] :] = float("-inf")
+    idx = torch.empty((num_rows, k), dtype=torch.int32, device="cuda")
+    call = (logits, next_n, seq_lens, idx, num_rows, *logits.stride(), k, True)
+    if backend is not None:
+        got = topk.decode_backend_for_call(*call, max_row_len=max_row_len)
+        assert got == backend, f"decode b={batch} ctx={ctx} k={k} took {got}"
 
     def run():
         idx = torch.empty((num_rows, k), dtype=torch.int32, device="cuda")
@@ -263,6 +270,8 @@ def main():
     args = parser.parse_args()
 
     ks = [args.k] if args.k else [512, 1024, 2048]
+    card = (get_gfx_runtime(), get_cu_num_device(torch.cuda.current_device()))
+    adaptive_ks = topk._ADAPTIVE_BANDS.get(card, {}).get(True, {})
     all_ok = True
     for tie in ("none", "mild", "heavy"):
         for k in ks:
@@ -273,8 +282,12 @@ def main():
         for k in ks:
             all_ok &= check_decode(4, 4096, k, 1, tie)
             all_ok &= check_decode(4, 61440, k, 1, tie)
-            # A stated bound is what routes this shape to the adaptive kernel.
-            all_ok &= check_decode(4, 131072, k, 1, tie, max_row_len=131072)
+            # Every adaptive table holds this shape; the assert catches a refit
+            # that moves it off the kernel.
+            backend = topk.BACKEND_ADAPTIVE if k in adaptive_ks else None
+            all_ok &= check_decode(
+                1, 524288, k, 1, tie, max_row_len=524288, backend=backend
+            )
     # k > 2048 -> scan fallback
     for tie in ("none", "heavy"):
         all_ok &= check_prefill(2, 16384, 4096, tie)
