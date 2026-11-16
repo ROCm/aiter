@@ -12,13 +12,16 @@ from aiter.fused_moe_registry import register_fused_moe_impl
 
 from .moe_common import GateMode
 
-_MIN_FLYDSL_VERSION = Version("0.2.4")
+# 0.5.0 keys the JIT cache on the traced IR; aiter no longer adds its own key
+# material to separate configs, so an older FlyDSL would share their binaries.
+_MIN_FLYDSL_VERSION = Version("0.5.0")
 
 installed_flydsl_version = getattr(_flydsl, "__version__", None)
 if installed_flydsl_version is None:
     raise ImportError("`flydsl` is importable but its version cannot be determined.")
 
-_base_version = Version(installed_flydsl_version.split("+")[0])
+# base_version drops dev/local suffixes, so 0.5.0.dev1018 and 0.5.0+abc pass.
+_base_version = Version(Version(installed_flydsl_version).base_version)
 if _base_version < _MIN_FLYDSL_VERSION:
     raise ImportError(
         "Unsupported `flydsl` version: "

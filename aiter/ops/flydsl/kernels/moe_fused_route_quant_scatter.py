@@ -1418,11 +1418,6 @@ def build_moe_fused_quant_preshuffle_module(
     L = _quant_layout(feat_dim, quant_mode, wmma_rep)
     if payload_preshuffled and (quant_mode != "fp4" or feat_dim % 128):
         raise ValueError("preshuffled payload requires MXFP4 and K divisible by 128")
-    # Unpack into locals so the @kernel closure captures the quant_mode-derived
-    # scalars (is_fp8, payload geometry, ...). The JIT disk cache keys on the
-    # launch function's source + scalar closure values; if these stayed hidden
-    # inside the ``L`` namespace the fp4 and fp8 variants (same feat_dim/wmma_rep)
-    # would hash to the same key and silently share one binary.
     is_fp8 = L.is_fp8
     use_native = L.use_native
     use_pk8 = L.use_pk8
