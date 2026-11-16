@@ -1312,15 +1312,15 @@ def _gluon_fp8_mqa_logits_rows8_kernel(
     stride_kv_s = stride_kv_s.to(gl.int32)
     row_id = (gl.num_programs(0) - gl.program_id(0) - 1) * BLOCK_M
     row_id = row_id.to(gl.int64)
-    union_start = gl.maximum(gl.load(cu_start_ptr + row_id), 0)
-    union_end = gl.minimum(gl.load(cu_end_ptr + row_id), seq_len_kv)
-    for row in gl.static_range(1, BLOCK_M):
-        union_start = gl.minimum(
-            union_start, gl.maximum(gl.load(cu_start_ptr + row_id + row), 0)
-        )
-        union_end = gl.maximum(
-            union_end, gl.minimum(gl.load(cu_end_ptr + row_id + row), seq_len_kv)
-        )
+    # A row with an empty window takes [seq_len_kv, 0): it adds no keys to the union.
+    union_start = seq_len_kv
+    union_end = 0
+    for row in gl.static_range(BLOCK_M):
+        row_start = gl.maximum(gl.load(cu_start_ptr + row_id + row), 0)
+        row_end = gl.minimum(gl.load(cu_end_ptr + row_id + row), seq_len_kv)
+        live = row_start < row_end
+        union_start = gl.minimum(union_start, gl.where(live, row_start, seq_len_kv))
+        union_end = gl.maximum(union_end, gl.where(live, row_end, 0))
     # Each split owns whole tile pairs, with at most one partial pair at the end.
     pair_size: gl.constexpr = 2 * BLOCK_KV
     pairs = gl.cdiv(gl.maximum(union_end - union_start, 0), pair_size)
