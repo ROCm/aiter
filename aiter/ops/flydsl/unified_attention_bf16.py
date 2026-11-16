@@ -753,7 +753,7 @@ def _unified_attention_uniform(
         pout = workspace["temporary_output"][: scalars * _VALUE_DIM].view(
             *shape, _VALUE_DIM
         )
-        live_tiles = num_kv_heads * min(
+        live_task_upper_bound = num_kv_heads * min(
             capacity, num_seqs * -(-int(max_seqlen_k) // 256)
         )
         compiled = compile_pa_decode_pingpong(
@@ -764,7 +764,7 @@ def _unified_attention_uniform(
             block_size=k.shape[1],
             softmax_scale=float(softmax_scale),
             # One CTA per CU: fuse task pairs when live tasks can exceed the CUs.
-            pair_ctas=live_tiles > num_cu,
+            pair_ctas=live_task_upper_bound > num_cu,
         )
         no_scale = flyc.from_c_void_p(fx.Float32, 0)
         _run_compiled(

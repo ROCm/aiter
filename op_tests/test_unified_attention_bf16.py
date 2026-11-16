@@ -10,6 +10,7 @@ from aiter.jit.utils.chip_info import get_gfx_runtime
 
 pytest.importorskip("flydsl")
 
+import aiter.ops.flydsl.kernels.pa_decode_pingpong as pingpong
 import aiter.ops.triton.attention.unified_attention as triton_ua
 from aiter.ops.flydsl import unified_attention_bf16 as flydsl_ua
 from aiter.ops.flydsl import unified_attention_varlen
@@ -164,7 +165,7 @@ def route_spy(monkeypatch):
     calls = []
     for module, name, tag in (
         (flydsl_ua, "_unified_attention_varlen", "flydsl"),
-        (flydsl_ua, "_unified_attention_uniform", "flydsl"),
+        (flydsl_ua, "_unified_attention_uniform", "uniform"),
         (flydsl_ua, "_unified_attention_window", "flydsl"),
         (flydsl_ua, "_unified_attention_varlen_optimized", "optimized"),
         (triton_ua, "unified_attention", "triton"),
@@ -193,7 +194,7 @@ def route_spy(monkeypatch):
 def test_flydsl_mimo_matches_reference(page, lengths, route_spy):
     q, k, v, out, cu, used, table = _inputs(lengths, page, shared_page=True)
     result = _call(q, k, v, out, cu, used, table, backend="flydsl")
-    assert result is out and route_spy == ["flydsl"]
+    assert result is out and route_spy == ["uniform"]
     ref = _reference(q, k, v, used, table)
     _check(out, ref)
 
@@ -202,10 +203,10 @@ def test_flydsl_mimo_matches_reference(page, lengths, route_spy):
 def test_auto_selects_flydsl_and_matches_triton(page, route_spy):
     q, k, v, out, cu, used, table = _inputs(SKEWED[:8], page)
     _call(q, k, v, out, cu, used, table)
-    assert route_spy == ["flydsl"]
+    assert route_spy == ["uniform"]
     triton_out = torch.full_like(out, float("nan"))
     _call(q, k, v, triton_out, cu, used, table, backend="triton")
-    assert route_spy == ["flydsl", "triton"]
+    assert route_spy == ["uniform", "triton"]
     ref = _reference(q, k, v, used, table)
     _check(out, ref)
     _check(triton_out, ref)
@@ -215,7 +216,7 @@ def test_auto_selects_flydsl_and_matches_triton(page, route_spy):
 def test_flydsl_shorter_query_lengths(qlen, route_spy):
     q, k, v, out, cu, used, table = _inputs((4097, 129, 64), 128, qlen=qlen)
     _call(q, k, v, out, cu, used, table, qlen=qlen, backend="flydsl")
-    assert route_spy == ["flydsl"]
+    assert route_spy == ["uniform"]
     _check(out, _reference(q, k, v, used, table, qlen))
 
 
@@ -223,7 +224,7 @@ def test_flydsl_shorter_query_lengths(qlen, route_spy):
 def test_flydsl_two_kv_heads(qlen, route_spy):
     q, k, v, out, cu, used, table = _inputs((4097, 129, 300, 64), 64, qlen=qlen, hkv=2)
     _call(q, k, v, out, cu, used, table, qlen=qlen, backend="flydsl")
-    assert route_spy == ["flydsl"]
+    assert route_spy == ["uniform"]
     _check(out, _reference(q, k, v, used, table, qlen))
 
 
@@ -249,7 +250,7 @@ def test_shrinking_batch_reuses_workspace(route_spy):
         q, k, v, out, cu, used, table = _inputs(lengths, 128, qlen=1)
         _call(q, k, v, out, cu, used, table, qlen=1, backend="flydsl")
         _check(out, _reference(q, k, v, used, table, 1))
-    assert route_spy == ["flydsl", "flydsl"]
+    assert route_spy == ["uniform", "uniform"]
 
 
 def test_release_frees_workspaces_and_kernels(route_spy):
@@ -269,7 +270,7 @@ def test_release_frees_workspaces_and_kernels(route_spy):
     out.zero_()
     _call(q, k, v, out, cu, used, table, qlen=1, backend="flydsl")
     _check(out, _reference(q, k, v, used, table, 1))
-    assert route_spy == ["flydsl", "flydsl"]
+    assert route_spy == ["uniform", "uniform"]
 
 
 @pytest.mark.parametrize("page", [64, 128])
@@ -650,6 +651,55 @@ def test_graph_replay_follows_new_lengths(page):
         torch.cuda.synchronize()
         assert torch.cuda.memory_allocated() == allocated
         _check(out, _reference(q, k, v, used, table))
+
+
+@pytest.mark.parametrize(
+    "hkv,qlen,lengths",
+    [
+        # 512 slots and up to 512 live tasks: twice the CUs.
+        pytest.param(1, 4, (16384, 4097, 129, 8) * 16, id="hkv1"),
+        # 171 slots per KV head: the last CTA's second slot is past the plan.
+        pytest.param(3, 2, (8192, 300, 4097, 64, 2049) * 8, id="hkv3-odd"),
+    ],
+)
+def test_paired_graph_replay_follows_new_lengths(
+    hkv, qlen, lengths, monkeypatch, route_spy
+):
+    if torch.cuda.get_device_properties(0).multi_processor_count != 256:
+        pytest.skip("the task estimate is sized for 256 CUs")
+    capacity = flydsl_ua._plan_capacity(len(lengths), hkv, 256)
+    assert capacity % 2 == (hkv == 3)
+    paired = []
+    compile_launch = pingpong.compile_pa_decode_pingpong
+
+    def spy(**kw):
+        paired.append(kw.get("pair_ctas", False))
+        return compile_launch(**kw)
+
+    monkeypatch.setattr(pingpong, "compile_pa_decode_pingpong", spy)
+    q, k, v, out, cu, used, table = _inputs(lengths, 128, qlen=qlen, hkv=hkv)
+    max_k = max(lengths)
+    stream = torch.cuda.Stream()
+
+    def call():
+        _call(q, k, v, out, cu, used, table, qlen=qlen, max_k=max_k, backend="flydsl")
+
+    with torch.cuda.stream(stream):
+        call()
+    stream.synchronize()
+    _check(out, _reference(q, k, v, used, table, qlen))
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph, stream=stream):
+        call()
+    assert route_spy == ["uniform", "uniform"] and paired == [True, True]
+    # Mixed slots, then every adjacent pair fused, then none.
+    for replay in (lengths[::-1], (max_k,) * len(lengths), (8,) * len(lengths)):
+        used.copy_(torch.tensor(replay, dtype=torch.int32))
+        q.normal_()
+        out.fill_(float("nan"))
+        graph.replay()
+        torch.cuda.synchronize()
+        _check(out, _reference(q, k, v, used, table, qlen))
 
 
 def test_cold_capture_raises_for_explicit_flydsl():
