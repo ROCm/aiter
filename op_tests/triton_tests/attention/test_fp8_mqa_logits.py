@@ -416,6 +416,22 @@ def test_fp8_mqa_logits_empty_output(s_q, s_k, clean_logits):
 
 
 @torch.inference_mode()
+def test_fp8_mqa_logits_long_kv_caller_buffer(rows8_dispatch):
+    """The eight-row path writes the same scores into a strided caller buffer."""
+    torch.manual_seed(0)
+    inputs = _long_kv_test_inputs(16, 4223, 32, 128)
+    seq_len, seq_len_kv = inputs[0].shape[0], inputs[1].shape[0]
+    storage = torch.full(
+        (seq_len, seq_len_kv + 64), 7.0, dtype=torch.float32, device="cuda"
+    )
+    out = storage[:, :seq_len_kv]
+    logits = fp8_mqa_logits(*inputs, clean_logits=False, out=out)
+    assert logits.data_ptr() == out.data_ptr()
+    _check_long_kv_logits(out, inputs)
+    assert torch.all(storage[:, seq_len_kv:] == 7.0)
+
+
+@torch.inference_mode()
 def test_fp8_mqa_logits_long_kv_graph_replay(rows8_dispatch):
     """Alternate two graphs with fresh inputs and changing valid windows."""
     torch.manual_seed(0)
