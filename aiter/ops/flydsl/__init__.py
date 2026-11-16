@@ -200,6 +200,18 @@ _LAZY_IMPORTS = {
         ".kernels.minimax_m3_index_score_prefill",
         "alloc_score",
     ),
+    "sparse_pa_nvfp4_decode": (
+        ".kernels.sparse_pa_nvfp4_decode",
+        "sparse_pa_nvfp4_decode",
+    ),
+    "sparse_pa_nvfp4_decode_alloc": (
+        ".kernels.sparse_pa_nvfp4_decode",
+        "sparse_pa_nvfp4_decode_alloc",
+    ),
+    "sparse_pa_nvfp4_prefill": (
+        ".kernels.sparse_pa_nvfp4_prefill",
+        "sparse_pa_nvfp4_prefill",
+    ),
 }
 
 __all__ = [
@@ -261,6 +273,9 @@ __all__ = [
     "pa_decode",
     "prepare_gemm_a16wfp4_weight",
     "prepare_pa_decode_plan",
+    "sparse_pa_nvfp4_decode",
+    "sparse_pa_nvfp4_decode_alloc",
+    "sparse_pa_nvfp4_prefill",
 ]
 
 _fused_moe_impl_path = "aiter.ops.flydsl.fused_moe_gfx942:run_flydsl_moe_gfx942_impl"
