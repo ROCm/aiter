@@ -1685,6 +1685,13 @@ class GroupCoordinator:
         device_communicator; only the owner tears those down, since a second
         destroy raises and aborts teardown part-way.
         """
+        # Communicators first: their teardown may sync the ranks over cpu_group.
+        if self.device_communicator is not None:
+            if self._owns_device_communicator:
+                self.device_communicator.destroy()
+            # Drop it either way: a kept reference would route collectives into
+            # process groups that are destroyed below.
+            self.device_communicator = None
         if hasattr(self, "device_group"):
             if self._owns_device_group:
                 torch.distributed.destroy_process_group(self.device_group)
@@ -1693,12 +1700,6 @@ class GroupCoordinator:
             if self._owns_cpu_group:
                 torch.distributed.destroy_process_group(self.cpu_group)
             del self.cpu_group
-        if self.device_communicator is not None:
-            if self._owns_device_communicator:
-                self.device_communicator.destroy()
-            # Drop it either way: a kept reference would route collectives into
-            # process groups that are destroyed by now.
-            self.device_communicator = None
         if self.mq_broadcaster is not None:
             self.mq_broadcaster.close()
             self.mq_broadcaster = None

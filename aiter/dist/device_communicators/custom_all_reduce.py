@@ -21,6 +21,7 @@ import os
 import pickle
 from collections.abc import Callable
 from contextlib import contextmanager
+from datetime import timedelta
 from typing import Any, ClassVar, NamedTuple
 
 import torch
@@ -3892,7 +3893,24 @@ class CustomAllreduce:
             hadamard_rotate=hadamard_rotate,
         )
 
+    def _sync_peers_before_free(self):
+        # gfx1250 two-stage fused AR + RMSNorm has no end barrier, so a slower
+        # peer's stage 2 may still read this rank's meta buffer after this
+        # stream drains. Free it only after every rank has synchronized. The
+        # barrier is bounded, and skipped once the group is gone, so close()
+        # cannot hang on a peer that never closes.
+        try:
+            if not dist.is_initialized():
+                return
+            dist.get_rank(self.group)  # raises once the group is destroyed
+            torch.cuda.synchronize(self.device)
+            dist.monitored_barrier(self.group, timeout=timedelta(seconds=60))
+        except Exception as e:  # noqa: BLE001 - close() and __del__ never raise
+            logger.warning("custom allreduce: no teardown barrier (%s)", e)
+
     def close(self):
+        if getattr(self, "_is_gfx1250", False) and getattr(self, "_ptr", 0):
+            self._sync_peers_before_free()
         # Not gated on self.disabled: the one-shot holds an IPC inbox opened
         # against every peer, and those handles have to be released before the
         # process group goes away regardless of the slot's state.
