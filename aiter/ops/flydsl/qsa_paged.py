@@ -22,13 +22,10 @@ selected token ids. Decode runs a BLOCK_N=16 two-wave tile with split-K and
 an LSE merge; prefill runs BLOCK_N=32 two waves and writes output directly
 once the grid alone fills the machine. Softmax is online in log2 space and the
 split
-partials are FP32. Expand+tail and the sigmoid gate stay unfused.
-
-``qsa_layer`` runs the indexer,
-``qsa_expand_block_indices``, and sparse GQA. A rank-3 query pair missing
-from the measured table logs once. A query that is not rank 3 is not a
-table miss; the indexer or sparse GQA reports it. Sigmoid and partial
-RoPE stay outside the layer.
+partials are FP32. Expand+tail and the sigmoid gate stay unfused. A rank-3
+query whose ``(Hq, D)`` is missing from the measured table logs once and
+still runs. A query that is not rank 3 does not log; the support gate
+reports it.
 """
 
 import functools
@@ -125,23 +122,23 @@ def _qsa_support_arch() -> tuple[str | None, str | None]:
     return arch, None
 
 
-# GQA query ``(Hq, D)`` -> indexer head counts swept with it.
-# An unswept rank-3 pair still runs; the table only feeds the warning.
-# Sparse GQA does not read this table. Its grid is ``(rows, kv_heads, splits)``
-# from ``_launch_config``, so a different KV-head count is a different grid.
-# M past 512 reuses the M=512 single-split config.
-_FLYDSL_DISPATCH_TABLE = {
-    (24, 256): (4, 8),  # 24 query heads, 2 KV heads
-    (12, 256): (4, 8),  # Flash-Next TP2: 12 query heads, 1 KV head
-    (6, 256): (4, 8),  # Flash-Next TP4: 6 query heads, 1 KV head
-    (3, 256): (4, 8),  # Flash-Next TP8: 3 query heads, 1 KV head
-    (10, 128): (4, 8),
-}
+# Measured GQA queries ``(Hq, D)``. An unswept rank-3 query still runs;
+# the set only feeds the warning. KV heads are not part of the key: the
+# grid is ``(rows, kv_heads, splits)`` from ``_launch_config``. M past 512
+# reuses the M=512 single-split config.
+_MEASURED_GQA_QUERIES = frozenset(
+    {
+        (24, 256),  # 24 query heads, 2 KV heads
+        (12, 256),  # Flash-Next TP2: 12 query heads, 1 KV head
+        (6, 256),  # Flash-Next TP4: 6 query heads, 1 KV head
+        (3, 256),  # Flash-Next TP8: 3 query heads, 1 KV head
+        (10, 128),
+    }
+)
 
 __all__ = [
     "flydsl_qsa_paged_gqa",
     "qsa_indexer_block_ids",
-    "qsa_layer",
     "span_bytes",
 ]
 
@@ -158,64 +155,21 @@ def span_bytes(t: torch.Tensor) -> int:
     return (last + 1) * t.element_size()
 
 
-def _rank3_query_pair(
-    q_indexer: torch.Tensor, q_gqa: torch.Tensor
-) -> tuple[tuple[int, int], int] | None:
-    """``((Hq, D), indexer heads)`` when both queries are rank 3.
-
-    A scalar or any other rank is not a table key. The indexer and sparse GQA report that.
-    """
-    if q_indexer.dim() != 3 or q_gqa.dim() != 3:
-        return None
-    gqa_key = (int(q_gqa.shape[1]), int(q_gqa.shape[2]))
-    return gqa_key, int(q_indexer.shape[1])
-
-
-def _warn_unmeasured_query(q_indexer: torch.Tensor, q_gqa: torch.Tensor) -> None:
-    """Log an unswept rank-3 pair. A bad rank stays quiet."""
-    pair = _rank3_query_pair(q_indexer, q_gqa)
-    if pair is None:
+def _warn_unmeasured_gqa_query(q: torch.Tensor) -> None:
+    """Log an unswept rank-3 GQA query. A bad rank stays quiet."""
+    if q.dim() != 3:
         return
-    gqa_key, index_heads = pair
-    allowed = _FLYDSL_DISPATCH_TABLE.get(gqa_key)
-    if allowed is None or index_heads not in allowed:
-        _log_unmeasured_gqa_query(gqa_key, index_heads)
+    gqa_key = (int(q.shape[1]), int(q.shape[2]))
+    if gqa_key not in _MEASURED_GQA_QUERIES:
+        _log_unmeasured_gqa_query(gqa_key)
 
 
 @functools.cache
-def _log_unmeasured_gqa_query(gqa_key: tuple[int, int], index_heads: int) -> None:
-    """Log one table miss. The same pair does not log again."""
+def _log_unmeasured_gqa_query(gqa_key: tuple[int, int]) -> None:
+    """Log one table miss. The same query does not log again."""
     from aiter import logger
 
-    logger.warning(
-        "QSA: query pair (GQA %s, indexer heads %s) is not in the measured table",
-        gqa_key,
-        index_heads,
-    )
-
-
-def _expand_block_ids(
-    block_ids: torch.Tensor,
-    query_positions: torch.Tensor,
-    context_lens: torch.Tensor,
-    token_to_req: torch.Tensor,
-    compress_ratio: int,
-    token_topk: int,
-    indices: torch.Tensor | None,
-) -> torch.Tensor:
-    # In-tree expand. It is not fused into the indexer or sparse GQA, and it
-    # loads these three vectors without a stride.
-    from aiter.ops.qsa import qsa_expand_block_indices
-
-    return qsa_expand_block_indices(
-        block_ids,
-        query_positions.contiguous(),
-        context_lens.contiguous(),
-        token_to_req.contiguous(),
-        compress_ratio,
-        token_topk,
-        out=indices,
-    )
+    logger.warning("QSA: GQA query %s is not in the measured table", gqa_key)
 
 
 @functools.lru_cache(maxsize=8)
@@ -349,70 +303,6 @@ def _check_indexer_score_workspace(
             f"scores rows overlap: stride(0)={int(scores.stride(0))} "
             f"is below {n_columns}"
         )
-
-
-def _touched_byte_range(tensor: torch.Tensor) -> tuple[int, int] | None:
-    """Inclusive-exclusive addresses of the bytes ``tensor`` can touch."""
-    if tensor.numel() == 0:
-        return None
-    elem = tensor.element_size()
-    low = 0
-    high = 0
-    for size, stride in zip(tensor.shape, tensor.stride()):
-        step = (int(size) - 1) * int(stride) * elem
-        if step >= 0:
-            high += step
-        else:
-            low += step
-    base = tensor.data_ptr()
-    return base + low, base + high + elem
-
-
-def _tensors_overlap(left: torch.Tensor, right: torch.Tensor) -> bool:
-    """True when the two tensors can write the same byte."""
-    if left.device != right.device or left.numel() == 0 or right.numel() == 0:
-        return False
-    if left.untyped_storage().data_ptr() != right.untyped_storage().data_ptr():
-        return False
-    left_range = _touched_byte_range(left)
-    right_range = _touched_byte_range(right)
-    if left_range is None or right_range is None:
-        return False
-    return left_range[0] < right_range[1] and right_range[0] < left_range[1]
-
-
-def _check_expand_indices(
-    indices: torch.Tensor,
-    rows: int,
-    width: int,
-    device: torch.device,
-    block_ids: torch.Tensor | None,
-) -> None:
-    """Reject an expand buffer the kernel would write unsafely.
-
-    The buffer is int32 ``[rows, width]`` on ``device``, with a unit column
-    stride. More than one row needs ``stride(0) >= width``, which keeps a
-    padded workspace and rejects a broadcast view. It must not share bytes
-    with the caller's ``block_ids``.
-    """
-    if indices.dtype != torch.int32 or tuple(indices.shape) != (rows, width):
-        raise ValueError(
-            f"indices must be int32 [{rows}, {width}], "
-            f"got {indices.dtype} {tuple(indices.shape)}"
-        )
-    if indices.device != device:
-        raise ValueError(f"indices must be on {device}, got {indices.device}")
-    if indices.stride(-1) != 1:
-        raise ValueError(
-            f"indices needs a unit column stride, got {tuple(indices.stride())}"
-        )
-    if rows > 1 and int(indices.stride(0)) < width:
-        raise ValueError(
-            f"indices rows overlap: stride(0)={int(indices.stride(0))} "
-            f"is below {width}"
-        )
-    if block_ids is not None and _tensors_overlap(indices, block_ids):
-        raise ValueError("indices must not alias block_ids")
 
 
 def _pack_missing_pages(out, page_table, token_to_req, context_lens, k_cache):
@@ -787,6 +677,11 @@ def qsa_indexer_supported(
     return reason
 
 
+def qsa_indexer_row_bounded(rows: int, n_columns: int) -> bool:
+    """True when this shape selects with the row-bounded radix on the full width."""
+    return n_columns > _ONE_WORKGROUP_MAX_ROW_WIDTH and rows <= _DECODE_MAX_ROWS
+
+
 def qsa_indexer_selection_supported(token_topk: int, compress_ratio: int) -> str | None:
     """Why this token budget is outside the baked indexer contract, or None.
 
@@ -837,8 +732,7 @@ def _prepare_indexer_launch(
 ) -> tuple[int, str]:
     """Host checks for one indexer call. Returns ``(rows, arch)``.
 
-    Empty geometry still prepares successfully. The caller then writes
-    ``-1``, or ``qsa_layer`` passes zero columns to expand.
+    Empty geometry still prepares successfully. The caller then writes ``-1``.
     """
     reason = qsa_indexer_supported(q, k_cache, page_table, heads)
     if reason is not None:
@@ -913,7 +807,7 @@ def _write_indexer_block_ids(
     # finishes the later radix passes from the first-pass candidates when
     # those fit in LDS. Prefill (more than 64 rows) keeps the allocation
     # width and does not read it back.
-    row_bounded = n_columns > _ONE_WORKGROUP_MAX_ROW_WIDTH and m <= _DECODE_MAX_ROWS
+    row_bounded = qsa_indexer_row_bounded(m, n_columns)
     if n_columns <= _K:
         _run_compiled(
             _emit_plan(page_size, get_warp_size(arch)),
@@ -1164,6 +1058,9 @@ def flydsl_qsa_paged_gqa(
 ) -> torch.Tensor:
     """Write sparse GQA ``o [M, Hq, D]`` from paged K/V.
 
+    A rank-3 query whose ``(Hq, D)`` is outside the measured set logs once
+    and still runs. A query that is not rank 3 does not log.
+
     ``workspace`` is ``(partial_out, partial_lse)`` for a split launch.
     ``None`` allocates that pair. A one-split launch writes ``out``
     directly and does not read ``workspace``. ``num_cus`` is the CU count
@@ -1174,6 +1071,7 @@ def flydsl_qsa_paged_gqa(
     reason = flydsl_qsa_paged_gqa_supported(q, k_cache, v_cache, indices, page_table)
     if reason is not None:
         raise ValueError(f"[flydsl_qsa_paged_gqa] {reason}")
+    _warn_unmeasured_gqa_query(q)
     rows = q.shape[0]
     n_q_heads = int(q.shape[1])
     head_dim = int(q.shape[2])
@@ -1270,165 +1168,3 @@ def flydsl_qsa_paged_gqa(
         torch.cuda.current_stream(q.device),
     )
     return out
-
-
-def qsa_layer(
-    q_indexer: torch.Tensor,
-    index_k_cache: torch.Tensor,
-    index_page_table: torch.Tensor,
-    q_gqa: torch.Tensor,
-    k_cache: torch.Tensor,
-    v_cache: torch.Tensor,
-    kv_page_table: torch.Tensor,
-    token_to_req: torch.Tensor,
-    query_positions: torch.Tensor,
-    context_lens: torch.Tensor,
-    indices: torch.Tensor | None = None,
-    block_ids: torch.Tensor | None = None,
-    out: torch.Tensor | None = None,
-    token_topk: int = 2048,
-    compress_ratio: int = 4,
-    score_scale: float | None = None,
-    softmax_scale: float | None = None,
-    scores: torch.Tensor | None = None,
-) -> torch.Tensor:
-    """Run one QSA layer: indexer select, expand+tail, sparse GQA.
-
-    Returns the bf16 GQA tensor ``[M, Hq, D]``. A caller-provided ``out``
-    is that tensor.
-
-    The layer is the indexer, ``qsa_expand_block_indices``, and
-    ``flydsl_qsa_paged_gqa``. It raises on a token
-    budget other than 512 blocks at compress ratio 4. The live GPU must
-    be gfx942 or gfx950. ``get_gfx_runtime`` decides that, and any other
-    architecture raises. A rank-3 pair missing from the measured table
-    logs once and still runs. A query that is not rank 3 does not log;
-    the indexer or paged GQA reports it. Indexer scores are multiplied by ``score_scale``
-    and QK by ``softmax_scale``. ``None`` is ``head_dim**-0.5`` for that
-    tensor.
-
-    Args:
-        q_indexer: bf16 ``[M, H, 128]``. FlyDSL accepts ``H`` of 4 or 8.
-        index_k_cache: bf16 ``[pages, page_size, 1, 128]``. The D stride
-            is 1. The page, token, and head strides are multiples of 8
-            elements. The cache is read in place.
-        index_page_table: int32 ``[n_req, n_pages]``.
-        q_gqa: bf16 ``[M, Hq, D]``, on the same GPU as the other tensors.
-        k_cache, v_cache: bf16 ``[pages, page_size, Hkv, D]``, matching
-            each other in shape and stride, with a unit D stride and the
-            same 8-element stride rule. ``Hq`` divides across ``Hkv`` in
-            a group of at most 16. ``D`` is a multiple of 32 and fills
-            the paged GQA gather, K LDS map, and PV tile.
-        kv_page_table: int32 ``[n_req, n_pages]``.
-        token_to_req, query_positions: int32 ``[M]``.
-        context_lens: 1-D int32, with no more rows than ``index_page_table``.
-        indices: optional int32 ``[M, token_topk + compress_ratio - 1]``
-            expand buffer on the same device as ``q_indexer``. The column
-            stride is 1. When ``M`` is more than one, the row stride is at
-            least the width, and the buffer must not alias ``block_ids``.
-            ``None`` allocates it.
-        block_ids: optional caller-owned contiguous int32 ``[M, 512]``.
-            Each call overwrites it. A row is a packed set of unique
-            compressed block ids, then ``-1`` through column 512. The
-            order is not a score ranking, and an exact tie keeps the
-            smaller index. ``-1`` is padding, including a row with no
-            visible block. The incomplete tail is not stored here; expand
-            writes those token ids into ``indices``.
-        scores: optional fp32 ``[M, n_columns]`` workspace for the long-row
-            scorer. ``n_columns`` is ``index_page_table.shape[1] *
-            page_size``. The column stride is 1. When ``M`` is more than
-            one, the row stride is at least ``n_columns``. ``None``
-            allocates at most 128 MiB and reuses it across row chunks. A
-            caller buffer is the full matrix. The layer overwrites it and
-            does not return it. Emit ignores a buffer of that shape.
-        out: optional contiguous bf16 ``[M, Hq, D]`` matching ``q_gqa``.
-            ``None`` allocates it.
-        token_topk: selected tokens. The default is 2048, which is the
-            FlyDSL budget of 512 blocks.
-        compress_ratio: block size. The default, and the FlyDSL value, is 4.
-        score_scale, softmax_scale: see above.
-
-    A span past 4 GiB on a cache selects the wide gather compile. An empty
-    query writes a zero ``out`` and does not launch paged GQA. An empty
-    indexer cache or index page table has no selected blocks, but expand
-    still emits the causal tail and paged GQA gathers it from the GQA cache.
-    An empty GQA cache or KV page table writes a zero ``out`` and does not
-    launch paged GQA. Paged GQA gathers the token ids it is given and does not
-    check that they are causal. It allocates its own split partials on a
-    multi-split launch. The block ids are the selection for this call.
-    Sigmoid and partial RoPE stay outside this call.
-
-    Returns:
-        Sparse GQA output, bf16 ``[M, Hq, D]``.
-    """
-    reason = qsa_indexer_selection_supported(token_topk, compress_ratio)
-    if reason is not None:
-        raise ValueError(reason)
-    if indices is not None and q_indexer.dim() >= 1:
-        _check_expand_indices(
-            indices,
-            int(q_indexer.shape[0]),
-            token_topk + compress_ratio - 1,
-            q_indexer.device,
-            block_ids,
-        )
-    _warn_unmeasured_query(q_indexer, q_gqa)
-    # A bad rank is not a table key and has no head or D to read here.
-    extra = {}
-    if q_indexer.dim() == 3:
-        if score_scale is None:
-            score_scale = float(q_indexer.shape[2]) ** -0.5
-        extra["heads"] = (int(q_indexer.shape[1]),)
-    if score_scale is not None:
-        extra["score_scale"] = score_scale
-    heads = extra.get("heads", _SCORE_HEADS)
-    m, arch = _prepare_indexer_launch(
-        q_indexer,
-        index_k_cache,
-        index_page_table,
-        token_to_req,
-        query_positions,
-        context_lens,
-        block_ids,
-        scores,
-        heads,
-    )
-    if block_ids is None and _indexer_empty_geometry(
-        m, index_k_cache, index_page_table, context_lens
-    ):
-        # No compressed group is selected. The expand kernel does not read
-        # group ids when this axis is zero, but still emits the causal tail.
-        block_ids = torch.empty((m, 0), dtype=torch.int32, device=q_indexer.device)
-    else:
-        block_ids = _write_indexer_block_ids(
-            q_indexer,
-            index_k_cache,
-            index_page_table,
-            token_to_req,
-            query_positions,
-            context_lens,
-            block_ids,
-            extra.get("score_scale", _SCORE_SCALE),
-            scores,
-            m,
-            arch,
-        )
-    indices = _expand_block_ids(
-        block_ids,
-        query_positions,
-        context_lens,
-        token_to_req,
-        compress_ratio,
-        token_topk,
-        indices,
-    )
-    return flydsl_qsa_paged_gqa(
-        q_gqa,
-        k_cache,
-        v_cache,
-        indices,
-        kv_page_table,
-        token_to_req,
-        out=out,
-        softmax_scale=softmax_scale,
-    )
