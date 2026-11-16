@@ -19,6 +19,7 @@ FIELDS = [
     "failure_mode",
 ]
 
+
 def extract_failures(log_path):
     with open(log_path, errors="replace") as f:
         lines = f.readlines()
