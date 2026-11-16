@@ -32,6 +32,7 @@ from aiter.fused_moe_registry import (
     BoundFusedMoeImpl,
     FusedMoeImplResolutionError,
     FusedMoeRequest,
+    make_fused_moe_impl_kernel_name,
     resolve_fused_moe_impl,
 )
 from aiter.jit.core import AITER_CONFIGS, AITER_CSRC_DIR, PY, bd_dir, mp_lock
@@ -4947,6 +4948,13 @@ def get_2stage_cfgs(
         logger.warning(f"[fused_moe] {error}; using default heuristics.")
         cfg = None
         full_impl = None
+    # Only the clamped SiLU takes num_local_tokens on a FlyDSL row; the other
+    # rows keep the default heuristics for it.
+    clamped_silu = (
+        gfx == "gfx942"
+        and _swiglu_limit_is_active(swiglu_limit)
+        and activation == ActivationType.Silu
+    )
     if full_impl is not None and kernel_name1.startswith("impl__flydsl_"):
         unsupported = None
         if not weights_shuffled:
@@ -4961,7 +4969,7 @@ def get_2stage_cfgs(
             unsupported = "stage2_scatter"
         elif has_activation_scales:
             unsupported = "prequantized activations"
-        elif has_num_local_tokens:
+        elif has_num_local_tokens and not clamped_silu:
             unsupported = "num_local_tokens"
         elif hidden_pad or intermediate_pad:
             unsupported = "hidden/intermediate padding"
@@ -4976,6 +4984,36 @@ def get_2stage_cfgs(
                 f"[fused_moe] discarding FlyDSL whole-graph config for {keys}: "
                 f"unsupported {unsupported}; using default heuristics"
             )
+    # A clamped SiLU on gfx942 per-token FP8 weights with no FlyDSL row: the
+    # default heuristics take the 1-stage kernel, which drops swiglu_limit, so
+    # run the gfx942 FlyDSL backend (it applies the clamp) at its default
+    # config for this token count. Tuned FlyDSL rows still win.
+    if (
+        full_impl is None
+        and (cfg is None or cfg.get("run_1stage", False))
+        and clamped_silu
+        and q_type == QuantType.per_Token
+        and q_dtype_w == dtypes.fp8
+        and use_g1u1
+        and weights_shuffled
+        and gate_mode is GateMode.SEPARATED
+        and input_dtype in (None, dtypes.bf16)
+        and not (
+            doweight_stage1
+            or has_stage1_bias
+            or has_stage2_bias
+            or has_activation_scales
+            or has_stage2_scatter
+            or hidden_pad
+            or intermediate_pad
+        )
+    ):
+        from aiter.ops.flydsl.fused_moe_gfx942 import default_config
+
+        flydsl_config = default_config(token)
+        kernel_name1 = make_fused_moe_impl_kernel_name("flydsl_gfx942", flydsl_config)
+        full_impl = resolve_fused_moe_impl(kernel_name1)
+        cfg = {"block_m": int(flydsl_config.split("_", 1)[0]), "ksplit": 0}
     if is_ep and full_impl is not None:
         cfg = None
         full_impl = None
