@@ -192,6 +192,7 @@ def _gemm1_body_a8w4(
     inter_i32 = fx.Int32(INTER)
     # bf16 intermediate [sorted_size, inter]; padding-row stores are masked (see gemm1).
     _cumsum0 = _global_i32_at(arg_cumsum, fx.Int32(0))
+    # legacy buffer_ops: make_buffer_tensor takes a layout, not a scalar base + byte bound
     out_rsrc = buffer_ops.create_buffer_resource_from_addr(
         fx.Int64(arg_out).ir_value(),
         num_records_bytes=(fx.Int64(_cumsum0) * fx.Int64(INTER * 2)).ir_value(),
@@ -710,6 +711,7 @@ def _gemm1_body_a8w4(
                 u = fx.Float32(Vec(acc_up[mi][ni])[ii])
                 y = gate_up_act(act, [g], [u], situ)[0]
                 out_idx = sorted_row * inter_i32 + col_g_list[ni]
+                # legacy buffer_store: BufferCopy16b moves the OOB-sentinel offset by one
                 buffer_ops.buffer_store(
                     y.to(fx.BFloat16),
                     out_rsrc,
