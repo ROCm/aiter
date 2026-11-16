@@ -351,8 +351,6 @@ if PREBUILD_KERNELS != 0:
                 "mha_varlen_fwd_bf16_nlogits_nbias_mask_lse_ndropout_skip_nqscale",
                 "mha_varlen_fwd_bf16_nlogits_nbias_nmask_lse_ndropout_skip_nqscale",
                 "mha_varlen_fwd_bf16_nlogits_nbias_nmask_nlse_ndropout_nskip_nqscale",
-                "mha_varlen_fwd_bf16_nlogits_nbias_mask_lse_ndropout_nskip_nqscale",
-                "mha_varlen_fwd_fp16_nlogits_nbias_mask_nlse_ndropout_skip_nqscale",
                 "mha_varlen_fwd_fp16_nlogits_nbias_mask_nlse_ndropout_nskip_nqscale",
                 "mha_varlen_fwd_fp16_nlogits_nbias_nmask_nlse_ndropout_nskip_nqscale",
                 "mha_varlen_fwd_fp8bf16_nlogits_nbias_nmask_nlse_ndropout_nskip_pertensor",
