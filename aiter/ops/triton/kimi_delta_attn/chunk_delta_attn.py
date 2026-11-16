@@ -69,6 +69,9 @@ def chunk_kimi_delta_attn(
     out_gate: torch.Tensor | None = None,
     norm_weight: torch.Tensor | None = None,
     norm_eps: float = 1e-5,
+    checkpoint_state: torch.Tensor | None = None,
+    checkpoint_offsets: torch.Tensor | None = None,
+    checkpoint_state_indices: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor | None]:
     r"""
     Chunked Kimi Delta Attention forward pass using Triton (Forward only).
@@ -175,6 +178,17 @@ def chunk_kimi_delta_attn(
             `[V]` weight of the fused norm. Required with `out_gate`.
         norm_eps (float):
             Epsilon of the fused norm. Default: 1e-5.
+        checkpoint_state (torch.Tensor, optional):
+            fp32 `[rows, HV, V, K]` destination of mid-prefill state snapshots,
+            in the paged `state_cache` layout. It can be `state_cache` itself.
+        checkpoint_offsets (torch.Tensor, optional):
+            Integer `[N]`. Snapshot each sequence's state after this many of its
+            tokens. `0` skips the sequence. An offset that is not a multiple of
+            32 or not less than the sequence length writes nothing. Needs
+            `cu_seqlens` or `B` sequences, and the gfx950 Gluon FlashKDA path.
+        checkpoint_state_indices (torch.Tensor, optional):
+            Integer `[N]` destination row per sequence; a negative row skips the
+            sequence. Default: row `n` for sequence `n`.
 
     Returns:
         tuple[torch.Tensor, torch.Tensor | None]:
@@ -316,5 +330,8 @@ def chunk_kimi_delta_attn(
         out_gate=out_gate,
         norm_weight=norm_weight,
         norm_eps=norm_eps,
+        checkpoint_state=checkpoint_state,
+        checkpoint_offsets=checkpoint_offsets,
+        checkpoint_state_indices=checkpoint_state_indices,
     )
     return o.to(q.dtype), final_state

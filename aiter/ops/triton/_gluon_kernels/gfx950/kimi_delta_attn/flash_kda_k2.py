@@ -972,6 +972,8 @@ def k2_c_gluon(
     BV: gl.constexpr = 16,
     RMAX: gl.constexpr = 1,
     HAS_H0: gl.constexpr = False,
+    ckpt_state=None,
+    seg_ckpt=None,
 ):
     """Pass C: one segment's recurrence from its incoming state, writing outputs.
 
@@ -981,6 +983,9 @@ def k2_c_gluon(
     each chunk is one step late, once the row partials crossed the next barrier).
     ``xbuf``: the copier-wave walk instead. ``tab``: the scan in the same launch (BW
     = V); a pass C program reads h_in once its scan replica's flags rise.
+    ``seg_ckpt``: per segment, the ``ckpt_state`` element offset and the chunk
+    count after which the walk stores its state there (offset -1: none), for
+    mid-prefill checkpoints.
     """
     CW: gl.constexpr = xbuf is not None
     SCW: gl.constexpr = tab is not None
@@ -1064,6 +1069,9 @@ def k2_c_gluon(
         is_last = gl.load(seg_is_last + i_seg)
     if PAGED_CACHE:
         slot = gl.load(state_indices + i_n).to(gl.int64)
+    if seg_ckpt is not None:
+        ckpt_off = gl.load(seg_ckpt + 2 * i_seg)
+        ckpt_j = gl.load(seg_ckpt + 2 * i_seg + 1)
 
     # The launch's warp count, as a constexpr so it can name the kernel.
     gl.static_assert(NUM_WARPS == gl.num_warps())
@@ -1214,6 +1222,11 @@ def k2_c_gluon(
             s_kr.index(cur).permute((1, 0)), gl.DotOperandLayout(0, MMA, 8)
         )
         h = _update(h, kr_a, big_u, gt, MMA)
+        if seg_ckpt is not None:  # noqa: SIM102
+            if (j + 1 == ckpt_j) & (ckpt_off >= 0):
+                gl.amd.cdna4.buffer_store(
+                    h, ckpt_state + ckpt_off + i_h * (V * K), s_off_vk
+                )
         if not NORM:
             _issue_chunk(*nxt, 0, H, V, C, True, 12)
     if NORM:
@@ -1320,6 +1333,8 @@ def gluon_k2_c(
     xbuf=None,
     xepoch=None,
     scf=None,
+    ckpt_state=None,
+    seg_ckpt=None,
 ):
     paged = state_cache is not None
     nx = get_num_xcds()
@@ -1374,6 +1389,8 @@ def gluon_k2_c(
         xepoch=xepoch if scf is None else scf.pop("xepoch"),
         xbuf=xbuf,
         n_str=num_segs * H,
+        ckpt_state=ckpt_state,
+        seg_ckpt=seg_ckpt,
         **extra,
         num_warps=num_warps,
         waves_per_eu=2 if scf is not None and out_gate is None else 0,

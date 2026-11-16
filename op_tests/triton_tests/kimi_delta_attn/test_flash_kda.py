@@ -1333,6 +1333,9 @@ def test_positional_call_keeps_skipped_storage(monkeypatch):
         "out_gate": None,
         "norm_weight": None,
         "norm_eps": 1e-5,
+        "checkpoint_state": None,
+        "checkpoint_offsets": None,
+        "checkpoint_state_indices": None,
     }
     params = inspect.signature(flash_kda_fwd).parameters
     assert by_name.keys() == params.keys()
@@ -1402,3 +1405,152 @@ def test_cuda_graph_replay_matches_eager(lens, norm):
         chunk_kimi_delta_attn(**kw)
         torch.testing.assert_close(o_graph, out, atol=0, rtol=0)
         torch.testing.assert_close(s_graph, cache[indices], atol=0, rtol=0)
+
+
+def _checkpoint_call(lens, H=12, norm=False, seed=3):
+    """Inputs and kwargs for a paged varlen call, plus the initial states."""
+    T, n = sum(lens), len(lens)
+    args = make_inputs(1, T, H, seed=seed)
+    h0 = torch.randn(n, H, K_DIM, K_DIM, device=device, dtype=torch.float32) * 0.1
+    cache, indices, _storage = _paged_pool(n, H, h0)
+    kw = _kimi_kwargs(
+        *args,
+        cu_seqlens=_varlen(lens).to(torch.int32),
+        out=torch.empty_like(args[2]),
+        state_cache=cache,
+        state_indices=indices,
+        has_initial_state=torch.ones(n, device=device, dtype=torch.bool),
+    )
+    if norm:
+        kw["out_gate"] = torch.randn(1, T, H, K_DIM, device=device, dtype=dtype)
+        kw["norm_weight"] = torch.ones(K_DIM, device=device, dtype=torch.float32)
+    return args, kw, h0
+
+
+def _skip_unless_gfx950_gluon():
+    if _flash_kda.DEVICE_ARCH != "gfx950":
+        pytest.skip("prefill checkpoints are written on the gfx950 Gluon path")
+
+
+@pytest.mark.parametrize(
+    "lens,offsets,norm",
+    [
+        ([2136, 4608, 300], [1536, 3072, 0], False),
+        ([2136, 4608, 300], [1536, 3072, 0], True),
+        ([1112, 1112, 1112], [512, 1024, 0], True),
+        ([7680], [6144], False),
+        ([6272] + [128] * 15, [6144] + [0] * 15, True),
+        ([4096, 64], [64, 32], False),
+    ],
+)
+def test_checkpoint_matches_prefix_state(lens, offsets, norm):
+    """A checkpoint holds the state after `offset` tokens (a prefill of that
+    prefix), and the output and final state match a call without checkpoints."""
+    _skip_unless_gfx950_gluon()
+    H, n = 12, len(lens)
+    args, kw, h0 = _checkpoint_call(lens, H, norm)
+    cache0 = kw["state_cache"].clone()
+    chunk_kimi_delta_attn(**kw)
+    o_plain, cache_plain = kw["out"].clone(), kw["state_cache"].clone()
+
+    ckpt = torch.full((n + 2, H, K_DIM, K_DIM), float("nan"), device=device)
+    rows = torch.arange(n, device=device, dtype=torch.int32) + 2
+    rows[0] = 0
+    kw["state_cache"].copy_(cache0)
+    chunk_kimi_delta_attn(
+        **kw,
+        checkpoint_state=ckpt,
+        checkpoint_offsets=torch.tensor(offsets, device=device, dtype=torch.int32),
+        checkpoint_state_indices=rows,
+    )
+    assert rel_err(kw["out"], o_plain) < 1e-2
+    assert rel_err(kw["state_cache"], cache_plain) < 1e-2
+
+    # Reference: the default pipeline on each prefix, from the same start state.
+    q, k, v, g, beta, A_log, dt_bias, scale = args
+    starts = [0, *torch.tensor(lens).cumsum(0).tolist()[:-1]]
+    sel = [i for i, o in enumerate(offsets) if o > 0]
+    tok = torch.cat([torch.arange(starts[i], starts[i] + offsets[i]) for i in sel])
+    cut = lambda x: x[:, tok.to(device)].contiguous()  # noqa: E731
+    _, ref = run_reference(
+        cut(q),
+        cut(k),
+        cut(v),
+        cut(g),
+        cut(beta),
+        A_log,
+        dt_bias,
+        scale,
+        initial_state=h0[sel].contiguous(),
+        output_final_state=True,
+        state_v_first=True,
+        cu_seqlens=_varlen([offsets[i] for i in sel]),
+    )
+    got = ckpt[rows.long()[sel]]
+    assert torch.isfinite(got).all()
+    assert rel_err(got, ref) < 2e-2
+    for i in range(n):
+        if offsets[i] == 0:
+            assert torch.isnan(ckpt[rows[i].long()]).all()
+
+
+@pytest.mark.parametrize("offsets", [[100, 63, 65, 1024], [0, 0, 0, 0]])
+def test_unusable_checkpoint_offsets_write_nothing(offsets):
+    """Offsets that are not a chunk multiple, or not inside the sequence, store
+    nothing and leave the call unchanged."""
+    _skip_unless_gfx950_gluon()
+    lens = [1024] * 4
+    _, kw, _ = _checkpoint_call(lens)
+    cache0 = kw["state_cache"].clone()
+    chunk_kimi_delta_attn(**kw)
+    o_plain, cache_plain = kw["out"].clone(), kw["state_cache"].clone()
+    ckpt = torch.full((4, 12, K_DIM, K_DIM), float("nan"), device=device)
+    kw["state_cache"].copy_(cache0)
+    chunk_kimi_delta_attn(
+        **kw,
+        checkpoint_state=ckpt,
+        checkpoint_offsets=torch.tensor(offsets, device=device, dtype=torch.int32),
+    )
+    assert torch.isnan(ckpt).all()
+    assert torch.equal(kw["out"], o_plain)
+    assert torch.equal(kw["state_cache"], cache_plain)
+
+
+def test_checkpoint_negative_row_and_state_cache_destination():
+    """A negative row skips its sequence; the destination can be the paged
+    state cache itself (its free row 0 here)."""
+    _skip_unless_gfx950_gluon()
+    lens = [2048, 2048]
+    _, kw, _ = _checkpoint_call(lens)
+    cache = kw["state_cache"]
+    spare = cache[0].clone()
+    ref = torch.full((2, 12, K_DIM, K_DIM), float("nan"), device=device)
+    cache0 = cache.clone()
+    chunk_kimi_delta_attn(
+        **kw,
+        checkpoint_state=ref,
+        checkpoint_offsets=torch.tensor([1024, 1024], device=device),
+    )
+    cache.copy_(cache0)
+    chunk_kimi_delta_attn(
+        **kw,
+        checkpoint_state=cache,
+        checkpoint_offsets=torch.tensor([1024, 1024], device=device),
+        checkpoint_state_indices=torch.tensor([-1, 0], device=device),
+    )
+    assert torch.equal(cache[0], ref[1])
+    assert not torch.equal(cache[0], spare)
+    assert not torch.equal(cache[1:3], cache0[1:3])  # final states written
+
+
+def test_checkpoints_need_the_gfx950_gluon_path():
+    """Routes that cannot write checkpoints refuse them."""
+    on_gfx950 = _flash_kda.DEVICE_ARCH == "gfx950"
+    with _route(k1=False, k2=False) if on_gfx950 else contextlib.nullcontext():
+        _, kw, _ = _checkpoint_call([256])
+        with pytest.raises(NotImplementedError):
+            chunk_kimi_delta_attn(
+                **kw,
+                checkpoint_state=torch.zeros(1, 12, K_DIM, K_DIM, device=device),
+                checkpoint_offsets=torch.tensor([128], device=device),
+            )

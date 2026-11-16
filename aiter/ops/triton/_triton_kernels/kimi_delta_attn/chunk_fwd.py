@@ -75,6 +75,9 @@ def chunk_delta_attn_fwd(
     out_gate: torch.Tensor | None = None,
     norm_weight: torch.Tensor | None = None,
     norm_eps: float = 1e-5,
+    checkpoint_state: torch.Tensor | None = None,
+    checkpoint_offsets: torch.Tensor | None = None,
+    checkpoint_state_indices: torch.Tensor | None = None,
 ) -> tuple:
     """
     Forward pass for chunk_delta_attn.
@@ -171,6 +174,10 @@ def chunk_delta_attn_fwd(
             "out is only implemented on the FlashKDA path; use the returned "
             "tensor, or pass a call that flash_kda_supported accepts"
         )
+    if checkpoint_offsets is not None and not use_flash_kda:
+        raise NotImplementedError(
+            "prefill checkpoints are only implemented on the FlashKDA path"
+        )
 
     if use_flash_kda:
         o, final_state = flash_kda_fwd(
@@ -195,6 +202,9 @@ def chunk_delta_attn_fwd(
             out_gate=out_gate,
             norm_weight=norm_weight,
             norm_eps=norm_eps,
+            checkpoint_state=checkpoint_state,
+            checkpoint_offsets=checkpoint_offsets,
+            checkpoint_state_indices=checkpoint_state_indices,
         )
         return o, final_state, None, None, None, None, None, None, None
 

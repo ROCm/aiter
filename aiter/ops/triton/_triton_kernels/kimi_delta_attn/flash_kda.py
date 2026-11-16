@@ -1144,6 +1144,44 @@ def _seg_plan(seqs, C, L, H, taper):
         c += 0.05
 
 
+def _check_checkpoints(state, indices, H, V, K):
+    if state is None or state.dtype != torch.float32 or state.dim() != 4:
+        raise ValueError("checkpoint_state must be an fp32 [rows, H, V, K] tensor")
+    if tuple(state.shape[1:]) != (H, V, K) or state.stride()[1:] != (V * K, K, 1):
+        raise ValueError(
+            f"checkpoint_state rows must be packed [{H}, {V}, {K}] (V-first), got "
+            f"shape {tuple(state.shape)} and strides {state.stride()}"
+        )
+    if indices is not None and indices.dtype.is_floating_point:
+        raise ValueError("checkpoint_state_indices must be an integer tensor")
+
+
+def _checkpoint_chunks(offsets, seqs, C):
+    offs = offsets.tolist()
+    if len(offs) != len(seqs):
+        raise ValueError(f"checkpoint_offsets needs {len(seqs)} entries")
+    return tuple(
+        o // C if 0 < o < e - b and o % C == 0 else 0 for o, (b, e) in zip(offs, seqs)
+    )
+
+
+def _checkpoint_args(state, indices, ckpts, seg_lens, seg_seq, N):
+    has, at = [], []
+    for lens, c in zip(seg_lens, ckpts):
+        pos = 0
+        for m in lens:
+            has.append(pos < c <= pos + m)
+            at.append(c - pos if pos < c <= pos + m else 0)
+            pos += m
+    dev = seg_seq.device
+    rows = torch.arange(N, device=dev) if indices is None else indices.to(dev)
+    rows = rows.long()[seg_seq.long()]
+    flag = torch.tensor(has, device=dev) & (rows >= 0)
+    off = torch.where(flag, rows * state.stride(0), -1)
+    at = torch.tensor(at, dtype=torch.int64, device=dev)
+    return dict(ckpt_state=state, seg_ckpt=torch.stack([off, at], 1).contiguous())
+
+
 @functools.lru_cache(maxsize=64)
 def _scf_table(nsegs, H, NVS, device):
     NX = get_num_xcds()  # pid % NX = XCD (round-robin dispatch)
@@ -1366,6 +1404,9 @@ def flash_kda_fwd(
     out_gate: torch.Tensor | None = None,
     norm_weight: torch.Tensor | None = None,
     norm_eps: float = 1e-5,
+    checkpoint_state: torch.Tensor | None = None,
+    checkpoint_offsets: torch.Tensor | None = None,
+    checkpoint_state_indices: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor | None]:
     """
     Two-kernel KDA forward, with an optional segmented (context parallel) scan.
@@ -1411,6 +1452,14 @@ def flash_kda_fwd(
         norm_weight:        ``[V]`` weight of the fused norm; required with
                             ``out_gate``.
         norm_eps:           Epsilon of the fused norm.
+        checkpoint_state:   fp32 ``[rows, H, V, K]`` destination of mid-prefill
+                            state snapshots (the paged ``state_cache`` layout).
+        checkpoint_offsets: Integer ``[N]``: snapshot each sequence's state after
+                            this many of its tokens. ``0``, an offset that is
+                            not a multiple of ``C``, or one not less than the
+                            sequence length writes nothing. gfx950 Gluon only.
+        checkpoint_state_indices: Integer ``[N]`` destination row per sequence
+                            (default: row ``n``); a negative row writes nothing.
 
     Returns:
         ``(o, final_state)`` with ``o`` shaped like ``v``. ``final_state`` is
@@ -1459,6 +1508,12 @@ def flash_kda_fwd(
     )
     use_gluon_k1 = use_gluon_k1 and (gluon_pipeline or DEVICE_ARCH != "gfx950")
     use_gluon_k2 = use_gluon_k2 and (gluon_pipeline or DEVICE_ARCH != "gfx950")
+    if checkpoint_offsets is not None:
+        if not gluon_pipeline:
+            raise NotImplementedError(
+                "FlashKDA writes prefill checkpoints only on the gfx950 Gluon path"
+            )
+        _check_checkpoints(checkpoint_state, checkpoint_state_indices, H, V, K)
     # The gfx1250 Gluon kernels read q, k, g (K1) and v (K2) at their own token
     # stride. Every other kernel needs them packed.
     stride_q = stride_k = stride_g = H * K
@@ -1523,6 +1578,10 @@ def flash_kda_fwd(
             max(chunks_per_seg, plan.kwargs["TAPER_SEG_CHUNKS"]), n_chunks_max
         )
     seg_lens = _seg_plan(seqs, C, chunks_per_seg, H, gluon_pipeline and segmented)
+    ckpts = None
+    if checkpoint_offsets is not None:
+        ckpts = _checkpoint_chunks(checkpoint_offsets, seqs, C)
+        ckpts = ckpts if any(ckpts) else None
 
     CM_LOAD = "" if gluon_pipeline else ".cg"
     CM_STORE = "" if segmented or gluon_pipeline else ".wt"
@@ -1642,6 +1701,11 @@ def flash_kda_fwd(
 
     desc, seq_seg_off, num_segs, max_segs = _build_segments(seqs, C, seg_lens, dev)
     seg_chunk_base, seg_nchunks, seg_tok_base, seg_tok_end, seg_seq, seg_is_last = desc
+    ckpt_args = {}
+    if ckpts is not None:
+        ckpt_args = _checkpoint_args(
+            checkpoint_state, checkpoint_state_indices, ckpts, seg_lens, seg_seq, N
+        )
 
     # The kernel indexes h_in by segment, so normalize a V-first initial state
     # once here instead of carrying the layout through three passes.
@@ -1839,6 +1903,7 @@ def flash_kda_fwd(
                 norm
                 and paged
                 and not segmented
+                and ckpts is None
                 and 2 * bw == V
                 and per_xcd <= cus // nx
             ):
@@ -1894,6 +1959,7 @@ def flash_kda_fwd(
             seg_seq=seg_seq,
             seg_is_last=seg_is_last,
             **(paged_args if paged else unpaged_args),
+            **ckpt_args,
             TOTAL_TILES=total_tiles,
             H=H,
             K=K,
