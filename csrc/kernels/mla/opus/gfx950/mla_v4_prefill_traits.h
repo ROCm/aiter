@@ -140,12 +140,12 @@ struct opus_mla_v4_prefill_a16w16_16mx1_16nx4_traits
     static constexpr int k_ds_read_insts = (GEMM0_E_N * GEMM0_E_K * W_N * W_K) / (WARP_SIZE * VEC_KV);
     static constexpr int v_ds_read_insts = (GEMM1_E_N * GEMM1_E_K * W_N * W_K) / (WARP_SIZE * VEC_TR_V);
 
-    // The unsplit path exchanges P in fp32; split-K retains D_ATTN.
+    // Shared memory: the KV tile, the waves' row maxima and their fp32 P.
     static constexpr size_t smem_size_bytes()
     {
         return smem_kv_tile_elems * sizeof(D_ATTN)
-             + 2 * T_N * W_M * sizeof(D_ACC)
-             + T_N * W_M * W_N * (SPLIT ? sizeof(D_ATTN) : sizeof(D_ACC));
+             + T_N * W_M * sizeof(D_ACC)
+             + T_N * W_M * W_N * sizeof(D_ACC);
     }
 };
 
@@ -300,12 +300,12 @@ struct opus_mla_v4_prefill_a8w8_16mx1_16nx4_traits
     static constexpr int SMEM_KV_PAD = 8;
     static constexpr int SMEM_KV_ROW = D_HEAD_SIZE + SMEM_KV_PAD;
 
-    // Shared memory: kernel uses three static buffers (KV tile, m/l, P).
+    // Shared memory: the KV tile, the waves' row maxima and their fp32 P.
     static constexpr size_t smem_size_bytes()
     {
         return KV_TILE_SIZE * SMEM_KV_ROW * sizeof(D_ROPE)
-             + 2 * T_N * W_M * sizeof(D_ACC)
-             + T_N * W_M * W_N * sizeof(D_ROPE);
+             + T_N * W_M * sizeof(D_ACC)
+             + T_N * W_M * W_N * sizeof(D_ACC);
     }
 };
 
