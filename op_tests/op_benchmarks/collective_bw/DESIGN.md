@@ -54,6 +54,7 @@ module; the op's pattern is never changed; exact sizes only.
    roofline.py  Roofline(binary, settings).measure(traffics) -> {traffic: Roof};
                 measure_peaks(N) -> per-rank fabric peaks
    tb_dump.py   write every candidate as a runnable .cfg + README.md index
+   topology.py  the GPU driver's per-link max_bandwidth (KFD topology), for the link max
    report.py    grade(), markdown / CSV, shared CLI options, finish(), --tb-dry-run
    test_collective_bw.py       GPU-free tests (patterns, byte accounting, parser, grading)
    testdata/transferbench_v1.71.02.txt   captured output the parser is checked against
@@ -303,6 +304,7 @@ From the slowest rank's `t`:
 | busbw | `algbw * factor` (rccl-tests convention) |
 | wire GB/s | bytes one rank sends to other GPUs / t: the op's wire format, RCCL's bf16 |
 | wire/peak | `wire GB/s` / the fabric peak P, the faster probe (section 5.1) |
+| wire/max | `wire GB/s` / the per-rank link max (section 5.1): the bandwidth efficiency |
 | roof us | `roof_us(op traffic)`, blank if TransferBench is absent |
 | op eff | `roof us / op us` |
 | rccl roof us | `roof_us(rccl_traffic(op traffic))`: RCCL's bf16 bytes |
@@ -311,7 +313,7 @@ From the slowest rank's `t`:
 
 The table has one row per (case, op):
 
-`case | op | timing | roof us | op us | op eff | op busbw | op wire GB/s | op wire/peak | rccl roof us | rccl us | rccl eff | rccl busbw | rccl wire GB/s | rccl wire/peak | op spread us | variant | roof cfg | rccl roof cfg`
+`case | op | timing | roof us | op us | op eff | op busbw | op wire GB/s | op wire/peak | op wire/max | rccl roof us | rccl us | rccl eff | rccl busbw | rccl wire GB/s | rccl wire/peak | rccl wire/max | op spread us | variant | roof cfg | rccl roof cfg`
 
 `eff` and `wire/peak` answer different questions. `eff` is implementation
 efficiency: the op against a copy kernel making the *same moves* (its
@@ -365,9 +367,19 @@ bandwidth per rank at best, and how close does an implementation get?
   ring would read 1.18 of the peak.
 - **Two more references.** `best known`: the highest per-rank wire rate in
   the run, P included; TransferBench is not a ceiling (section 4.3), RCCL
-  beats it. `nominal`: an optional datasheet rate per link (`--link-gbps`,
-  `RoofSettings.link_gbps`) times the links a rank uses (N - 1 on xGMI, 1
-  on PCIe).
+  beats it. `max`, the **link max per rank**: the rated speed of one link
+  times the links a rank can use at once (N - 1 on an xGMI mesh, 1 on PCIe),
+  so `wire/max` is the bandwidth efficiency against the hardware. The rate
+  of one link is the GPU driver's (`topology.driver_link_gbps`): the
+  `max_bandwidth` of the KFD topology's `io_links`, the same sysfs tree the
+  link detection reads. On PCIe that is each GPU's link to its CPU, lanes x
+  signalling rate before line encoding (Gen5 x16: 64.0 GB/s, of which
+  128b/130b leaves 63.0); on xGMI each GPU's links to its peers. The
+  slowest such link on the host counts. `--link-gbps`
+  (`RoofSettings.link_gbps`) overrides it, e.g. with a datasheet rate where
+  the driver reports none (0). On the MI350P host (Gen5 x16) the max is
+  64.0 GB/s per rank at every N, and the one-peer probe reaches 56.4 of it
+  (0.88).
 - **Max means the large-message plateau.** The summary takes each
   implementation's largest message and shows its `wire MB per rank`, so a
   shape that is too small to saturate is visible.
@@ -376,7 +388,7 @@ bandwidth per rank at best, and how close does an implementation get?
 
 The report ends with one row per implementation:
 
-`link | collective | ranks | impl | case | wire MB per rank | wire GB/s per rank | wire/peak | wire/best known | wire/nominal | busbw GB/s | busbw/peak`
+`link | collective | ranks | impl | case | wire MB per rank | wire GB/s per rank | wire/peak | wire/best known | wire/max | busbw GB/s | busbw/peak`
 
 Measured on MI350X, xGMI, 16384x7168 all-reduce (peaks repeat within 0.3%
 across runs):

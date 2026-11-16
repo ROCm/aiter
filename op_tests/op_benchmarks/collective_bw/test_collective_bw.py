@@ -477,7 +477,7 @@ def test_measure_peaks():
 
 def test_summary_against_peaks():
     """Per implementation at its largest message: wire rate over the fabric
-    peak, the best known rate and the nominal rate; busbw over the peak."""
+    peak, the best known rate and the link maximum; busbw over the peak."""
     import report
     from measure import Record
     from roofline import Peak, Roof
@@ -495,7 +495,8 @@ def test_summary_against_peaks():
     peak = Peak(n, "all_peers", 150.0, 3, Roof(1.0, (1.0,), "serial w64 U"))
     peaks = {"all_peers": peak}
     s = RoofSettings(link_gbps=64.0)
-    rows = report.summary(records, peaks, "xgmi", s)
+    lmax = report.link_max("xgmi", n, s)
+    rows = report.summary(records, peaks, "xgmi", lmax)
     fly, rccl = rows
     assert fly["case"] == "b" and rccl["case"] == "b"
     fly_wire = patterns.fabric_bytes_per_rank(t_big) / 100.0 / 1e3
@@ -503,21 +504,20 @@ def test_summary_against_peaks():
     assert math.isclose(fly["wire GB/s per rank"], fly_wire)
     assert math.isclose(rccl["wire GB/s per rank"], rccl_wire)
     assert math.isclose(fly["wire/peak"], fly_wire / 150.0)
-    assert math.isclose(fly["wire/nominal"], fly_wire / (3 * 64.0))
+    assert math.isclose(fly["wire/max"], fly_wire / (3 * 64.0))
     best, where = report.best_known(records, peaks)
     assert best == max(150.0, rccl_wire, fly_wire)
     assert math.isclose(fly["wire/best known"], fly_wire / best)
     assert math.isclose(fly["busbw/peak"], 1.5 * big / 100.0 / 1e3 / 150.0)
     # The same per-rank peak is in every graded row.
-    (_, row) = report.grade(records, {}, {}, 150.0)
+    (_, row) = report.grade(records, {}, {}, 150.0, lmax.gbps)
     assert math.isclose(row["op wire/peak"], fly_wire / 150.0)
     assert math.isclose(row["rccl wire/peak"], rccl_wire / 150.0)
-    # Nominal: N - 1 links on xGMI, one on PCIe, none when unknown.
-    assert report.nominal_gbps("xgmi", 8, s) == 7 * 64.0
-    assert report.nominal_gbps("pcie", 8, s) == 64.0
-    assert math.isnan(report.nominal_gbps("unknown", 8, s))
-    assert math.isnan(report.nominal_gbps("xgmi", 8, DEFAULT))
-    lines = report.peak_lines(records, peaks, "xgmi", s)
+    assert math.isclose(row["op wire/max"], fly_wire / 192.0)
+    assert math.isclose(row["rccl wire/max"], rccl_wire / 192.0)
+    (_, row) = report.grade(records, {}, {}, 150.0)
+    assert math.isnan(row["op wire/max"])
+    lines = report.peak_lines(records, peaks, "xgmi", s, lmax)
     assert lines[0] == "- link: xgmi, 4 ranks"
     head = "- RCCL all-reduce roof pattern:"
     assert lines[1] == f"{head} all-pairs (push to every peer at once)"
@@ -525,7 +525,11 @@ def test_summary_against_peaks():
     assert "not measured" in lines[3]
     pcie = report.peak_lines(records, peaks, "pcie", s)
     assert pcie[1] == f"{head} ring (push to the next rank, rank order)"
-    assert "nominal per rank: 192.0 GB/s" in lines[-1]
+    assert lines[-1] == (
+        "- link max per rank (`max` in wire/max): 192.0 GB/s "
+        "(3 links x 64 GB/s; --link-gbps)"
+    )
+    assert "unknown" in report.peak_lines(records, peaks, "xgmi", s)[-1]
     assert "fabric peak per rank (`peak` in wire/peak): 150.0 GB/s" in lines[4]
 
 
@@ -551,7 +555,7 @@ def test_peak_is_the_faster_probe():
     assert report.fabric_peak({}) is None
     rccl_wire = 1.5 * nbytes / 480.0 / 1e3
     assert 46.3 < rccl_wire < 56.4
-    _fly, rccl = report.summary(records, peaks, "pcie", DEFAULT)
+    _fly, rccl = report.summary(records, peaks, "pcie")
     assert math.isclose(rccl["wire/peak"], rccl_wire / 56.4)
     assert report.best_known(records, peaks) == (56.4, "TransferBench fabric peak")
     (row,) = report.grade(records, {}, {}, report.fabric_peak(peaks).gbps)
@@ -561,6 +565,77 @@ def test_peak_is_the_faster_probe():
         "56.4 GB/s, the faster probe (push to the next rank only" in line
         for line in lines
     )
+
+
+def _kfd_tree(root, gpus, cpu_links, gpu_links=()):
+    """A fake KFD topology: CPU nodes 0..len(cpus)-1, then *gpus* GPU
+    nodes. *cpu_links*: (gpu, cpu, type, MB/s) io_links. *gpu_links*:
+    (gpu, gpu, type, MB/s) io_links."""
+    cpus = sorted({c for _g, c, _t, _bw in cpu_links})
+    nodes = [(i, 0, 0) for i in cpus] + [
+        (len(cpus) + g, 1000 + g, 512) for g in range(gpus)
+    ]
+    for node, gpu_id, simds in nodes:
+        d = Path(root) / str(node)
+        (d / "io_links").mkdir(parents=True)
+        (d / "gpu_id").write_text(f"{gpu_id}\n")
+        (d / "properties").write_text(f"cpu_cores_count 8\nsimd_count {simds}\n")
+    links = [(len(cpus) + g, c, t, bw) for g, c, t, bw in cpu_links]
+    links += [(len(cpus) + a, len(cpus) + b, t, bw) for a, b, t, bw in gpu_links]
+    for k, (src, dst, kind, bw) in enumerate(links):
+        d = Path(root) / str(src) / "io_links" / str(k)
+        d.mkdir()
+        (d / "properties").write_text(
+            f"type {kind}\nnode_from {src}\nnode_to {dst}\nweight 20\n"
+            f"min_bandwidth 0\nmax_bandwidth {bw}\n"
+        )
+
+
+def test_driver_link_gbps():
+    """PCIe: each GPU's uplink to its CPU; xGMI: its links to peer GPUs; the
+    slowest of each; None when the driver gives no rate."""
+    import tempfile
+
+    import topology
+
+    with tempfile.TemporaryDirectory() as tmp:
+        # This MI350P host: 2 sockets, 4 GPUs each, Gen5 x16 uplinks.
+        pcie = Path(tmp) / "pcie"
+        _kfd_tree(pcie, 8, [(g, g // 4, 2, 64000) for g in range(8)])
+        assert topology.driver_link_gbps("pcie", pcie) == 64.0
+        assert topology.driver_link_gbps("xgmi", pcie) is None
+        # One GPU trained down to Gen4: the host's rate is the slowest.
+        slow = Path(tmp) / "slow"
+        _kfd_tree(slow, 2, [(0, 0, 2, 64000), (1, 0, 2, 32000)])
+        assert topology.driver_link_gbps("pcie", slow) == 32.0
+        # xGMI mesh: GPU-GPU links count, the PCIe uplinks do not.
+        mesh = [(a, b, 11, 76800) for a in range(4) for b in range(4) if a != b]
+        xgmi = Path(tmp) / "xgmi"
+        _kfd_tree(xgmi, 4, [(g, 0, 2, 64000) for g in range(4)], mesh)
+        assert topology.driver_link_gbps("xgmi", xgmi) == 76.8
+        # A driver that reports no rate, a missing tree, an unknown link.
+        zero = Path(tmp) / "zero"
+        _kfd_tree(zero, 2, [(0, 0, 2, 0), (1, 0, 2, 0)])
+        assert topology.driver_link_gbps("pcie", zero) is None
+        assert topology.driver_link_gbps("pcie", Path(tmp) / "none") is None
+        assert topology.driver_link_gbps("unknown", pcie) is None
+
+
+def test_link_max():
+    """One link on PCIe, N - 1 on xGMI; --link-gbps overrides the driver."""
+    import report
+
+    def driver(link):
+        return {"pcie": 64.0, "xgmi": 76.8}.get(link)
+
+    lm = report.link_max("pcie", 8, DEFAULT, driver)
+    assert (lm.gbps, lm.links) == (64.0, 1) and "driver" in lm.source
+    lm = report.link_max("xgmi", 8, DEFAULT, driver)
+    assert math.isclose(lm.gbps, 7 * 76.8) and lm.links == 7
+    lm = report.link_max("xgmi", 4, RoofSettings(link_gbps=50.0), driver)
+    assert (lm.gbps, lm.source) == (150.0, "--link-gbps")
+    assert report.link_max("unknown", 8, DEFAULT, driver) is None
+    assert report.link_max("pcie", 8, DEFAULT, lambda link: None) is None
 
 
 def test_find_binary_respects_env(tmp_path=None):

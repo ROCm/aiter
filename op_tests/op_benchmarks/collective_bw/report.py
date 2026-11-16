@@ -19,6 +19,11 @@ Per op row:
   probe, push to all peers or to one), the same for every implementation.
   A section after the table sums this up per implementation at its largest
   message (``summary``).
+* ``op wire/max`` / ``rccl wire/max``, the bandwidth efficiency: the wire
+  rate over the per-rank link maximum (``link_max``): the rate of one link,
+  from the GPU driver's topology (``topology.driver_link_gbps``) unless
+  ``--link-gbps`` gives it, times the links a rank can use (N - 1 on an xGMI
+  mesh, 1 on PCIe).
 
 Both roofs are a stock copy kernel's best, not the link's peak, so an
 implementation with a better copy loop can reach an eff above 1.0 (see
@@ -30,7 +35,7 @@ from __future__ import annotations
 import csv
 import math
 import sys
-from dataclasses import replace
+from dataclasses import dataclass, replace
 from pathlib import Path
 
 from measure import RCCL, Record
@@ -42,6 +47,7 @@ from patterns import (
 )
 from roof_settings import DEFAULT, RoofSettings
 from roofline import Roof
+from topology import driver_link_gbps
 
 COLUMNS = (
     "case",
@@ -53,12 +59,14 @@ COLUMNS = (
     "op busbw GB/s",
     "op wire GB/s",
     "op wire/peak",
+    "op wire/max",
     "rccl roof us",
     "rccl us",
     "rccl eff",
     "rccl busbw GB/s",
     "rccl wire GB/s",
     "rccl wire/peak",
+    "rccl wire/max",
     "op spread us",
     "variant",
     "roof cfg",
@@ -96,13 +104,16 @@ def grade(
     roofs: dict,
     rccl_roofs: dict | None = None,
     peak_gbps: float | None = None,
+    max_gbps: float | None = None,
 ) -> list[dict]:
     """One row per (case, op). RCCL's columns repeat on every op row of
     its case. *roofs* is keyed by the op traffic, *rccl_roofs* by the
     RCCL record's traffic (``Roofline.measure_rccl``). *peak_gbps* is the
-    per-rank fabric peak."""
+    per-rank fabric peak, *max_gbps* the per-rank link maximum
+    (``link_max``)."""
     rccl_roofs = rccl_roofs or {}
     peak = peak_gbps or math.nan
+    lmax = max_gbps or math.nan
     rccl = {r.case: r for r in records if r.impl == RCCL}
     rows = []
     for r in records:
@@ -127,12 +138,14 @@ def grade(
                 "op busbw GB/s": busbw_gbps(r),
                 "op wire GB/s": wire_gbps(r),
                 "op wire/peak": wire_gbps(r) / peak,
+                "op wire/max": wire_gbps(r) / lmax,
                 "rccl roof us": rroof_us,
                 "rccl us": base.us if base else math.nan,
                 "rccl eff": rroof_us / base.us if base else math.nan,
                 "rccl busbw GB/s": busbw_gbps(base) if base else math.nan,
                 "rccl wire GB/s": wire_gbps(base) if base else math.nan,
                 "rccl wire/peak": wire_gbps(base) / peak if base else math.nan,
+                "rccl wire/max": wire_gbps(base) / lmax if base else math.nan,
                 "op spread us": r.spread_us,
                 "variant": r.variant or "",
                 "roof cfg": roof.label if roof else "",
@@ -215,8 +228,9 @@ def add_args(parser) -> None:
         "--link-gbps",
         type=float,
         default=None,
-        help="datasheet rate of one link, GB/s per direction, for the nominal\n"
-        "per-rank peak (N-1 links on xGMI, 1 on PCIe)",
+        help="rate of one link, GB/s per direction, for the per-rank link\n"
+        "maximum (N-1 links on xGMI, 1 on PCIe; default: the GPU driver's\n"
+        "max_bandwidth from the KFD topology)",
     )
     parser.add_argument(
         "--tb-dir",
@@ -257,14 +271,41 @@ def detect_link() -> str:
         return "unknown"
 
 
-def nominal_gbps(link: str, world_size: int, settings: RoofSettings) -> float:
-    """The datasheet per-rank peak: ``settings.link_gbps`` times the links a
-    rank can use at once (N - 1 on an xGMI mesh, 1 on PCIe). NaN without a
-    rate or a known link."""
+@dataclass(frozen=True)
+class LinkMax:
+    """The most one rank can send to other GPUs per second, by the links'
+    rated speed: ``links`` x ``per_link_gbps``, per direction."""
+
+    per_link_gbps: float
+    links: int
+    source: str
+
+    @property
+    def gbps(self) -> float:
+        return self.per_link_gbps * self.links
+
+
+def link_max(
+    link: str,
+    world_size: int,
+    settings: RoofSettings,
+    driver=driver_link_gbps,
+) -> LinkMax | None:
+    """The per-rank link maximum on *link*: the rate of one link times the
+    links a rank can use at once (N - 1 on an xGMI mesh, 1 on PCIe).
+
+    The rate is ``settings.link_gbps`` (``--link-gbps``) if set, else the
+    GPU driver's ``max_bandwidth`` (``driver(link)``. None for an unknown 
+    link or without a rate."""
     links = {"xgmi": world_size - 1, "pcie": 1}.get(link)
-    if settings.link_gbps is None or links is None:
-        return math.nan
-    return settings.link_gbps * links
+    if links is None:
+        return None
+    if settings.link_gbps is not None:
+        return LinkMax(settings.link_gbps, links, "--link-gbps")
+    rate = driver(link)
+    if rate is None:
+        return None
+    return LinkMax(rate, links, "GPU driver topology, KFD max_bandwidth")
 
 
 def fabric_peak(peaks: dict):
@@ -300,9 +341,14 @@ PEAK_NAMES = {
 
 
 def peak_lines(
-    records: list[Record], peaks: dict, link: str, settings: RoofSettings
+    records: list[Record],
+    peaks: dict,
+    link: str,
+    settings: RoofSettings,
+    lmax: LinkMax | None = None,
 ) -> list[str]:
-    """Header lines with the per-rank peaks the summary divides by."""
+    """Header lines with the per-rank peaks the summary divides by. *lmax*
+    is the per-rank link maximum (``link_max``)."""
     n = records[0].traffic.world_size if records else 0
     mib = settings.peak_bytes_per_peer >> 20
     out = [
@@ -330,13 +376,16 @@ def peak_lines(
         )
     gbps, where = best_known(records, peaks)
     out.append(f"- best known per rank in this run: {_fmt(gbps)} GB/s ({where})")
-    nominal = nominal_gbps(link, n, settings)
-    if math.isnan(nominal):
-        out.append("- nominal per rank: not set (--link-gbps)")
-    else:
+    if lmax is None:
         out.append(
-            f"- nominal per rank: {nominal:.1f} GB/s "
-            f"({settings.link_gbps:g} GB/s per link, datasheet)"
+            "- link max per rank (`max` in wire/max): unknown "
+            "(no driver rate; set --link-gbps)"
+        )
+    else:
+        links = "link" if lmax.links == 1 else "links"
+        out.append(
+            f"- link max per rank (`max` in wire/max): {lmax.gbps:.1f} GB/s "
+            f"({lmax.links} {links} x {lmax.per_link_gbps:g} GB/s; {lmax.source})"
         )
     return out
 
@@ -351,18 +400,22 @@ SUMMARY_COLUMNS = (
     "wire GB/s per rank",
     "wire/peak",
     "wire/best known",
-    "wire/nominal",
+    "wire/max",
     "busbw GB/s",
     "busbw/peak",
 )
 
 
 def summary(
-    records: list[Record], peaks: dict, link: str, settings: RoofSettings
+    records: list[Record],
+    peaks: dict,
+    link: str,
+    lmax: LinkMax | None = None,
 ) -> list[dict]:
     """Per implementation, at its largest message: the per-rank wire rate
     (bytes actually sent to other GPUs, slowest rank) against the per-rank
-    peaks, and the logical bus bandwidth against the fabric peak."""
+    peaks and the link maximum *lmax*, and the logical bus bandwidth against
+    the fabric peak."""
     pk = fabric_peak(peaks)
     peak = pk.gbps if pk is not None else math.nan
     best, _where = best_known(records, peaks)
@@ -371,7 +424,6 @@ def summary(
         mine = [r for r in records if r.impl == impl]
         r = max(mine, key=lambda x: x.traffic.logical_bytes)
         t = r.traffic
-        nominal = nominal_gbps(link, t.world_size, settings)
         wire, bus = wire_gbps(r), busbw_gbps(r)
         out.append(
             {
@@ -384,7 +436,7 @@ def summary(
                 "wire GB/s per rank": wire,
                 "wire/peak": wire / peak,
                 "wire/best known": wire / best,
-                "wire/nominal": wire / nominal,
+                "wire/max": wire / lmax.gbps if lmax else math.nan,
                 "busbw GB/s": bus,
                 "busbw/peak": bus / peak,
             }
@@ -410,9 +462,10 @@ _SUMMARY_NOTE = (
     "one rank sends to other GPUs (the op's wire format; RCCL's bf16) over the "
     "slowest rank's time. `peak` is the TransferBench fabric peak (the faster "
     "of push to all peers and push to one); `best known` the highest per-rank "
-    "wire rate in this run, peak included; `nominal` the datasheet rate "
-    "(`--link-gbps`). `busbw` counts logical bytes, so a quantized op can "
-    "exceed 1.0 of the peak."
+    "wire rate in this run, peak included; `max` the links' rated speed "
+    "(the GPU driver's, or `--link-gbps`), so `wire/max` is the bandwidth "
+    "efficiency. `busbw` counts logical bytes, so a quantized op can exceed "
+    "1.0 of the peak."
 )
 
 
@@ -448,10 +501,17 @@ def finish(
     )
     print(f"TransferBench configs: {configs}", flush=True)
     pk = fabric_peak(peaks)
-    rows = grade(records, roofs, rccl_roofs, pk.gbps if pk is not None else None)
-    extra = [*header, *peak_lines(records, peaks, link, settings)]
+    lmax = link_max(link, n, settings)
+    rows = grade(
+        records,
+        roofs,
+        rccl_roofs,
+        pk.gbps if pk is not None else None,
+        lmax.gbps if lmax is not None else None,
+    )
+    extra = [*header, *peak_lines(records, peaks, link, settings, lmax)]
     head = provenance(roofline, extra, settings=settings, configs=configs)
-    summ = summary(records, peaks, link, settings)
+    summ = summary(records, peaks, link, lmax)
     write(
         rows,
         head,

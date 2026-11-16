@@ -33,9 +33,10 @@ class RoofSettings:
     # The fabric-peak probes move this many bytes per (rank, peer) pair:
     # enough to saturate the links, so the probe measures bandwidth.
     peak_bytes_per_peer: int = 64 << 20
-    # Optional datasheet rate of one link, GB/s per direction. The nominal
-    # per-rank peak is this times the links a rank can use: N - 1 on an xGMI
-    # mesh, 1 on PCIe. None: no nominal peak in the report.
+    # Optional rate of one link, GB/s per direction (--link-gbps). The
+    # per-rank link maximum (report.link_max) is this times the links a rank
+    # can use: N - 1 on an xGMI mesh, 1 on PCIe. None: the GPU driver's rate
+    # from the KFD topology (topology.driver_link_gbps).
     link_gbps: float | None = None
     # Further TransferBench environment for every test. Validation walks
     # every element on the host, which costs far more than the transfers.
