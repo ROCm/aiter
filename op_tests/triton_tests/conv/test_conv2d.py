@@ -429,7 +429,7 @@ def test_prepared_padding_accepts_boundary_amounts(
 def test_prepared_padding_noop_does_not_materialize(
     monkeypatch, padding_mode, padding, layout
 ):
-    source = torch.ones(2, 3, 5, 7).transpose(2, 3)
+    source = torch.ones(2, 3, 5, 7, device="cuda", dtype=torch.float16).transpose(2, 3)
 
     def unexpected_materialization(*args, **kwargs):
         pytest.fail("no-op padding must not pad or convert the input layout")
@@ -445,17 +445,24 @@ def test_prepared_padding_noop_does_not_materialize(
 
 
 @pytest.mark.parametrize(
-    "shape,padding,padding_mode,layout,message",
+    "device,shape,padding,padding_mode,layout,message",
     [
-        ((3, 5, 7), 0, "zeros", "nchw", "must be 4-D NCHW"),
-        ((2, 3, 5, 7), 0, "reflect", "invalid", "layout must be"),
-        ((2, 3, 5, 7), 0, [], "nchw", "padding_mode must be one of"),
-        ((2, 3, 0, 7), 0, "zeros", "nchw", "spatial dimensions must be positive"),
-        ((2, 3, 5, 7), (-1, 0), "replicate", "nchw", "must be non-negative"),
-        ((2, 3, 5, 7), (1, 2, 3), "replicate", "nchw", "length-2 sequence"),
-        ((2, 3, 5, 7), (5, 0), "reflect", "nchw", "reflect padding"),
-        ((2, 3, 5, 7), (0, 8), "circular", "nchw", "circular padding"),
-        ((2, 3, 5, 7), 1, "replicate", "nchw", "requires a CUDA/ROCm tensor"),
+        ("cuda", (3, 5, 7), 0, "zeros", "nchw", "must be 4-D NCHW"),
+        ("cuda", (2, 3, 5, 7), 0, "reflect", "invalid", "layout must be"),
+        ("cuda", (2, 3, 5, 7), 0, [], "nchw", "padding_mode must be one of"),
+        (
+            "cuda",
+            (2, 3, 0, 7),
+            0,
+            "zeros",
+            "nchw",
+            "spatial dimensions must be positive",
+        ),
+        ("cuda", (2, 3, 5, 7), (-1, 0), "replicate", "nchw", "must be non-negative"),
+        ("cuda", (2, 3, 5, 7), (1, 2, 3), "replicate", "nchw", "length-2 sequence"),
+        ("cuda", (2, 3, 5, 7), (5, 0), "reflect", "nchw", "reflect padding"),
+        ("cuda", (2, 3, 5, 7), (0, 8), "circular", "nchw", "circular padding"),
+        ("cpu", (2, 3, 5, 7), 1, "replicate", "nchw", "requires a CUDA/ROCm tensor"),
     ],
     ids=[
         "rank",
@@ -470,9 +477,9 @@ def test_prepared_padding_noop_does_not_materialize(
     ],
 )
 def test_prepared_padding_validates_before_materialization(
-    shape, padding, padding_mode, layout, message, monkeypatch
+    device, shape, padding, padding_mode, layout, message, monkeypatch
 ):
-    source = torch.empty(shape)
+    source = torch.empty(shape, device=device, dtype=torch.float16)
 
     def unexpected_padding(*args, **kwargs):
         pytest.fail("invalid padding must be rejected before calling F.pad")
@@ -582,6 +589,8 @@ def test_padding_matches_reference(
     torch.manual_seed(0)
     channels = 5 if route_name in ("GENERAL", "ONE_X_ONE") else 65
     source = torch.randn(2, channels, 7, 9, device="cuda", dtype=dtype)
+    if layout == "nhwc" and padding_mode == "reflect":
+        source = source.contiguous(memory_format=torch.channels_last)
     weight = torch.randn(17, channels, *filter_shape, device="cuda", dtype=dtype)
     bias = torch.randn(17, device="cuda", dtype=dtype)
     padding = (1, 2)
