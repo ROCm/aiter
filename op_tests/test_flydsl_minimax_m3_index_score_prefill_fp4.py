@@ -738,9 +738,13 @@ def _with_xwide(ppw=None):
     return _Patch()
 
 
+REPEATS = 8  # launches per bit-exact case, all compared with the first
+
+
 def check_prefill_nvfp4_bit_exact(qls, seqs, heads, qdt, k_round):
-    """Exact-sum data against the fp32 oracle, bit for bit.
-    Dead slots (no visible token) may stay unwritten or be -inf, never a score; live ones must all be written.
+    """Exact-sum data against the fp32 oracle, bit for bit, and REPEATS launches that
+    return the same bytes. Dead slots (no visible token) may stay unwritten or be -inf,
+    never a score; live ones must all be written.
     """
     c = nv_case(qls, seqs, heads, exact_sum=True)
     ref = nv_oracle(c, c[k_round])
@@ -751,6 +755,16 @@ def check_prefill_nvfp4_bit_exact(qls, seqs, heads, qdt, k_round):
     assert bool(
         ((dead == SENTINEL) | torch.isneginf(dead)).all()
     ), "a dead slot got a score"
+    # A DMA pipeline that misses a wait races on LDS, which shows up as a different
+    # result on some launches only: every repeat must return the first launch's bytes
+    # (the whole buffer, dead slots included), as the decode suite's repeat check does.
+    first = got.view(torch.int32)
+    for i in range(REPEATS - 1):
+        again = run_nv(c, qdt, k_round).view(torch.int32)
+        n_bad = int((again != first).sum())
+        assert (
+            n_bad == 0
+        ), f"launch {i + 2} of {REPEATS} differs from the first in {n_bad} words"
 
 
 def check_prefill_nvfp4_matches_aiter(shape, qdt):
@@ -825,8 +839,11 @@ def check_prefill_nvfp4_exact_random(shape, qdt):
     live = torch.isfinite(ref)
     got = run_nv(cn, qdt, "exact")
     assert int((live & (got == SENTINEL)).sum()) == 0, "live slots left unwritten"
-    rel = (got[live] - ref[live]).abs() / ref[live].abs().clamp(min=1e-2)
-    assert float(rel.max()) <= 4e-6, f"{shape}: max rel error {float(rel.max())}"
+    # a few fp32 ulps: rtol 4e-6, and atol 4e-8 (= 4e-6 * 1e-2) near zero
+    err = checkAllclose(
+        ref[live], got[live], rtol=4e-6, atol=4e-8, msg=f"nvfp4_exact {shape}: "
+    )
+    assert err == 0, f"{shape}: mismatch fraction {err} against the oracle"
     rounded = run_nv(cn, qdt, "e4m3")
     assert not torch.equal(got[live], rounded[live]), "exact scored like e4m3"
 
