@@ -1043,8 +1043,9 @@ def main():
     parser.add_argument(
         "--num-tokens",
         type=str2tuple,
-        default=[16384, 4096, 1024, 256, 64, 1],
-        help="Comma-separated list of number of tokens (default: 16384,4096,1024,256,64,1)",
+        default=[16384, 4096, 2048, 1024, 256, 64, 1],
+        help="Comma-separated list of number of tokens "
+        "(default: 16384,4096,2048,1024,256,64,1)",
     )
     parser.add_argument(
         "--topk",

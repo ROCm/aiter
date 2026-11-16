@@ -1799,10 +1799,15 @@ void topk_gating_launch(const topk_gating_params& p)
             return;                                                         \
         }
             // E=384: WPT=2 (EPT=6) measured fastest on gfx1250 up to T=1024 (WPT=4
-            // and WPT=1 are 5-15% slower); above that prefill_n takes over.
-            if(num_tokens <= 1024)
+            // and WPT=1 are 5-15% slower), and the single-wave kernel still beats
+            // prefill_n (TPW=1) up to T=2048 on gfx1250; above that prefill_n
+            // takes over. Other wave32 targets keep the multiwave kernel to 1024.
+            if(num_tokens <= 2048)
             {
                 _DISPATCH_WAVE32_VWAVE_KERNEL(384, 2)
+            }
+            if(num_tokens <= 1024)
+            {
                 _DISPATCH_WAVE32_MULTIWAVE_KERNEL(384, 4)
             }
             // E=256 WPT=8 (EPT=1) is a low-token decode win on gfx1250 (measured
