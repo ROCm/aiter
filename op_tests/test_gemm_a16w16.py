@@ -706,9 +706,8 @@ def _asm_mismatches(x, w, out, block=1 << 28):
 def test_asm_4gib_operands():
     """A, B and out of 4 GiB or more.
 
-    Each operand's buffer descriptor holds a 32-bit size. The gfx950 kernels
-    give every tile its own 64-bit base, so they must be exact past 4 GiB; the
-    gfx942 kernels use one descriptor per operand, so the launcher must refuse.
+    Each buffer descriptor holds a 32-bit size; the kernels give every tile
+    its own 64-bit base, so they must be exact past 4 GiB.
     """
     gfx = get_gfx()
     if gfx not in ("gfx942", "gfx950"):
@@ -720,11 +719,14 @@ def test_asm_4gib_operands():
     # name None is the heuristic.
     plain = [
         (None, False, None),
-        ("_ZN5aiter24bf16gemm_bf16_tn_256x256E", False, 1),
-        ("_ZN5aiter36bf16gemm_bf16_tn_256x256_bpreshuffleE", True, 1),
         ("_ZN5aiter37bf16gemm_fp32bf16_tn_64x64_pf3_splitkE", False, 1),
         ("_ZN5aiter42bf16gemm_fp32bf16_tn_64x64_bshuffle_splitkE", True, 1),
     ]
+    if gfx == "gfx950":
+        plain += [
+            ("_ZN5aiter24bf16gemm_bf16_tn_256x256E", False, 1),
+            ("_ZN5aiter36bf16gemm_bf16_tn_256x256_bpreshuffleE", True, 1),
+        ]
     # *_clean kernels split K and need at most 1024 tiles, so only A or B
     # can reach 4 GiB.
     clean = [
@@ -739,8 +741,6 @@ def test_asm_4gib_operands():
         ("A", 32768, 64, k_clean, dtypes.fp32, clean),
         ("B", 64, 32768, k_clean, dtypes.fp32, clean),
     ]
-    if gfx == "gfx942":
-        cases = [c[:5] + ([(None, False, None)],) for c in cases[:3]]
     rows = []
     for operand, m, n, k, otype, kernels in cases:
         need = 2 * (m * k + 2 * n * k) + m * n * otype.itemsize + (4 << 30)
@@ -759,21 +759,15 @@ def test_asm_4gib_operands():
                 wshuffle = shuffle_weight(w, layout=(16, 16))
             out.fill_(float("nan"))
             case = f"asm {name or 'heuristic'} {shape}"
-            try:
-                aiter.gemm_a16w16_asm(
-                    x,
-                    wshuffle if bpreshuffle else w,
-                    out,
-                    None,
-                    split,
-                    name,
-                    bpreshuffle,
-                )
-            except RuntimeError as e:
-                assert gfx == "gfx942" and "smaller than 4 GiB" in str(e), e
-                rows.append({"case": case, "result": "rejected"})
-                continue
-            assert gfx == "gfx950", f"{case}: not rejected on {gfx}"
+            aiter.gemm_a16w16_asm(
+                x,
+                wshuffle if bpreshuffle else w,
+                out,
+                None,
+                split,
+                name,
+                bpreshuffle,
+            )
             bad = _asm_mismatches(x, w, out)
             assert bad == 0, f"{case}: {bad} of {m * n} elements wrong"
             rows.append({"case": case, "result": "exact"})
