@@ -73,6 +73,7 @@ def gemm_a16w16_persistent_kernel_(
     ADD_BIAS: tl.constexpr,
     SKIP_REDUCE: tl.constexpr,
     NUM_WGS: tl.constexpr,
+    NUM_XCDS: tl.constexpr,
     num_stages: tl.constexpr = 0,
     waves_per_eu: tl.constexpr = 0,
 ):
@@ -100,7 +101,7 @@ def gemm_a16w16_persistent_kernel_(
     # Persistent loop, flattens to main loop
     for tile_id in tl.range(start_pid, num_tiles, NUM_WGS, flatten=True):
         # remap tile index on num tiles
-        t = remap_xcd(tile_id, num_tiles, NUM_XCDS=8)
+        t = remap_xcd(tile_id, num_tiles, NUM_XCDS=NUM_XCDS)
         pid_k = t % NUM_KSPLIT
         pid = t // NUM_KSPLIT
 

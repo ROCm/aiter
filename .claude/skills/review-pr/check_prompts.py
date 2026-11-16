@@ -41,6 +41,11 @@ CHECKS = [
         "**Output rules (strictly enforced):**",
         '- `⚠️ The benchmark may not include setup cost` — no "Author must" conclusion',
     ),
+    (
+        "prompts/worker.md",
+        "## Step 7.8 — Design Assessment",
+        "and an over-bar PR carries a split.",
+    ),
 ]
 
 
@@ -75,6 +80,7 @@ def check_fail_classes():
 
 
 WORKFLOW = HERE.parents[2] / ".github" / "workflows" / "aiter-review-bot.yml"
+GATE_WATCH_WORKFLOW = HERE.parents[2] / ".github" / "workflows" / "review-bot-gate-watch.yml"
 
 
 def _notify_mod():
@@ -105,22 +111,29 @@ def check_budget_fits():
 
 
 def check_owner_fallbacks():
-    """Every message but two routes through _notify.py's class->owner map. The watchdog and the
-    lost-review report post their own comments and carry their own copy of a handle, so they
-    drift from the map in silence: the next owner updates _notify.py and still never hears that
-    the runner is down, or that a review vanished."""
-    wf = WORKFLOW.read_text(encoding="utf-8")
+    """Every message but two routes through _notify.py's class->owner map. The watchdog, the
+    lost-review report and the gate watch page on their own -- comments, or a failed job --
+    and each carries its own copy of a handle, so they drift from the map in silence: the next
+    owner updates _notify.py and still never hears that the runner is down, that a review
+    vanished, or that the hosted runners starved. The gate watch lives in a different workflow
+    file from the other two, so each row names the workflow that must pass its variable."""
     classes = _notify_mod().CLASSES
     rows = [
         ("watchdog.py", "env",
-         r'OWNER_OVERRIDE"\) or ""\)\.strip\(\) or "([A-Za-z0-9-]+)"'),
+         r'OWNER_OVERRIDE"\) or ""\)\.strip\(\) or "([A-Za-z0-9-]+)"',
+         "aiter-review-bot.yml"),
         ("lost_review.py", "flow",
-         r'OWNER_OVERRIDE"\) or ""\)\.strip\(\) or "([A-Za-z0-9-]+)"'),
+         r'OWNER_OVERRIDE"\) or ""\)\.strip\(\) or "([A-Za-z0-9-]+)"',
+         "aiter-review-bot.yml"),
         ("queue_gate.py", "env",
-         r'OWNER_OVERRIDE"\) or ""\)\.strip\(\) or "([A-Za-z0-9-]+)"'),
+         r'OWNER_OVERRIDE"\) or ""\)\.strip\(\) or "([A-Za-z0-9-]+)"',
+         "aiter-review-bot.yml"),
+        ("gate_watch.py", "env",
+         r'OWNER_OVERRIDE"\) or ""\)\.strip\(\) or "([A-Za-z0-9-]+)"',
+         "review-bot-gate-watch.yml"),
     ]
     bad = 0
-    for filename, cls, pattern in rows:
+    for filename, cls, pattern, wf_name in rows:
         m = re.search(pattern, (HERE / filename).read_text(encoding="utf-8"))
         var, default = classes[cls][:2]
         if not m:
@@ -132,13 +145,37 @@ def check_owner_fallbacks():
                   f"'{default}'")
             bad += 1
             continue
+        wf = (WORKFLOW.parent / wf_name).read_text(encoding="utf-8")
         if not re.search(r"OWNER_OVERRIDE: \$\{\{ vars\." + var + r" \}\}", wf):
-            print(f"\u274c {filename} defaults to _notify.py's {cls} owner but the workflow does "
+            print(f"\u274c {filename} defaults to _notify.py's {cls} owner but {wf_name} does "
                   f"not pass {var}")
             bad += 1
             continue
         print(f"\u2705 {filename} matches _notify.py's {cls} class: {default} via {var}")
     return 1 if bad else 0
+
+
+def check_gate_watch_window():
+    """gate_watch.py pages a stuck request exactly once by looking for it only inside a
+    one-poll-wide age window. The poll interval is the cron schedule, and it lives in a
+    different file from the window it widths: change one without the other and the watcher
+    either pages about the same stuck request every poll, or slips a request between two polls
+    into permanent silence -- and nothing errors either way."""
+    gw = (HERE / "gate_watch.py").read_text(encoding="utf-8")
+    wf = GATE_WATCH_WORKFLOW.read_text(encoding="utf-8")
+    m = re.search(r"^WINDOW_MINUTES = (\d+)", gw, re.M)
+    c = re.search(r'^\s*- cron: "\*/(\d+) \* \* \* \*"', wf, re.M)
+    if not m or not c:
+        print("\u274c cannot read WINDOW_MINUTES from gate_watch.py or the cron interval from "
+              "review-bot-gate-watch.yml")
+        return 1
+    window, cron = int(m.group(1)), int(c.group(1))
+    if window != cron:
+        print(f"\u274c the gate watch polls every {cron} min but its page window is {window} min "
+              f"wide -- exactly-once paging needs the window to be one poll wide")
+        return 1
+    print(f"\u2705 gate watch page window is one poll wide: {window} min")
+    return 0
 
 
 def check_no_self_trigger():
@@ -384,6 +421,7 @@ def main():
     bad += check_fail_classes()
     bad += check_budget_fits()
     bad += check_owner_fallbacks()
+    bad += check_gate_watch_window()
     bad += check_no_self_trigger()
     bad += check_notified_handoff()
     bad += check_runner_label_exclusive()

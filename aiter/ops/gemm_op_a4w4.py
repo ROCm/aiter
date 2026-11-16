@@ -14,6 +14,7 @@ from aiter.jit.utils.torch_guard import torch_compile_guard
 
 from ..jit.core import AITER_CONFIGS, AITER_LOG_TUNED_CONFIG, compile_ops
 from ..jit.utils.asm_guard import require_gfx1250_asm
+from ..jit.utils.build_targets import base_gfx_arch
 from ..jit.utils.chip_info import get_cu_num
 from ..jit.utils.chip_info import get_gfx_runtime as get_gfx
 from ..ops.gemm_op_common import get_padded_m
@@ -238,6 +239,11 @@ def _a4w4_mxscale_config(M: int, N: int, K: int) -> tuple[str, str] | None:
     rows = _load_a4w4_mxscale_tuned(
         AITER_CONFIGS.AITER_CONFIG_GEMM_A4W4_MXSCALE_BPRESHUFFLE_FILE
     )
+    # A0 bring-up: reuse gfx1250 family tuned rows when strict has none.
+    if base_gfx_arch(gfx) != gfx and gfx not in {
+        k[0] for k in rows if isinstance(k, tuple) and k
+    }:
+        gfx = base_gfx_arch(gfx)
     for gl in (None, 0, 1):
         row = rows.get(
             (gfx, cu_num, M if gl is None else get_padded_m(M, N, K, gl), N, K)
