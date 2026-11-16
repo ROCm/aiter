@@ -2738,8 +2738,8 @@ def can_impl_fmha_v3_bwd(
 
     def g7():
         # gfx942 hdim_q 192 7-GEMM kernels, run for a16 and a32 requests alike
-        # bwd_hd192_{bf16,fp16}_{,causal_,causal_br_}a16_[{rtne,rtna,rtz}_]pssk
-        # bwd_hd192_128_{bf16,fp16}_{,causal_,causal_br_}a16_[{rtne,rtna,rtz}_]pssk
+        # bwd_hd192_{bf16,fp16}_{,causal_,causal_br_}[{rtne,rtna,rtz}_]pssk
+        # bwd_hd192_128_{bf16,fp16}_{,causal_,causal_br_}[{rtne,rtna,rtz}_]pssk
         # They write dq with q's strides; a missing dq is allocated with empty_like(q).
         ret = hdim_q == 192 and hdim_v in (192, 128)
         dq_ = dq if dq is not None else torch.empty_like(q, device="meta")
@@ -3725,8 +3725,8 @@ def _flash_attn_varlen_backward(
 
     def g7():
         # gfx942 hdim_q 192 7-GEMM kernels, run for a16 and a32 requests alike
-        # bwd_hd192_{bf16,fp16}_{,causal_,causal_br_}a16_[{rtne,rtna,rtz}_]pssk_group
-        # bwd_hd192_128_{bf16,fp16}_{,causal_,causal_br_}a16_[{rtne,rtna,rtz}_]pssk_group
+        # bwd_hd192_{bf16,fp16}_{,causal_,causal_br_}[{rtne,rtna,rtz}_]pssk_group
+        # bwd_hd192_128_{bf16,fp16}_{,causal_,causal_br_}[{rtne,rtna,rtz}_]pssk_group
         # They write dq with q's strides; a missing dq is allocated with empty_like(q).
         ret = hdim_q == 192 and hdim_v in (192, 128)
         dq_ = dq if dq is not None else torch.empty_like(q, device="meta")

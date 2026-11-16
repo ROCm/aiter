@@ -288,10 +288,11 @@ float fmha_v3_bwd(mha_bwd_args a, const ck_tile::stream_config& s)
     // gfx942 hdim_q 192 (hdim_v 192 or 128): the hd192 / hd192_128 pssk kernels take precedence
     // over the a32 psskddv ones, which keep hdim_q in (128, 192).  These 7-GEMM (g7) kernels run
     // dK/dV workgroups (4 GEMMs, 128 keys each) and dQ workgroups (3 GEMMs, 128 queries each) in
-    // one dispatch and write dq / dk / dv once, so they are a16 rows without dq_acc or post
-    // kernel.  They write dq with q's strides, whose batch stride only matters in batch mode with
-    // batch > 1.  Other hdim_q 192 calls keep the requested kernels: psskddv for a32 at
-    // hdim_v 192, none for a16, the g7 rows being the only a16 hdim_q 192 ones.
+    // one dispatch and write dq / dk / dv once, without atomics, so they are atomic32 = 0 rows
+    // without dq_acc or post kernel.  They write dq with q's strides, whose batch stride only
+    // matters in batch mode with batch > 1.  Other hdim_q 192 calls keep the requested kernels:
+    // psskddv for a32 at hdim_v 192, none for a16, the g7 rows being the only atomic32 = 0
+    // hdim_q 192 ones.
     const bool gfx942_g7_hd192 =
         arch_id == "gfx942" && a.hdim_q == 192 && (a.hdim_v == 192 || a.hdim_v == 128) &&
         a.stride_dq == a.stride_q && a.nhead_stride_dq == a.nhead_stride_q &&
