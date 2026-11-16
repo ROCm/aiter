@@ -164,11 +164,14 @@ def get_GEMM_A16W16_tuned_config(
                         config["kernelName"]
                     )
                 )
-                # A BF16 row naming an FP32 kernel selects GEMM + conversion.
+                # FP32 accumulation or split-plane rows time the complete chain.
                 # Do not extend a measured compound policy through M padding.
                 if (
                     flydsl_config is not None
-                    and flydsl_config["out_dtype"] == "fp32"
+                    and (
+                        flydsl_config["out_dtype"] == "fp32"
+                        or flydsl_config["policy"] == "sp"
+                    )
                     and otype == str(dtypes.bf16)
                     and padded_M != M
                 ):
@@ -692,7 +695,7 @@ def flydsl_gemm(
         and otype == dtypes.bf16
         and flydsl_config["out_dtype"] == "fp32"
     )
-    if fp32_workspace and (
+    if (fp32_workspace or flydsl_config["policy"] == "sp") and (
         bias is not None
         or scale_a is not None
         or scale_b is not None
@@ -743,7 +746,11 @@ def flydsl_gemm(
         and bias.dtype == inp.dtype
     ):
         fused_bias = bias
-    if skinny or flydsl_config["policy"] in ("bs", *flydsl_gemm_kernels.TDM_POLICIES):
+    if skinny or flydsl_config["policy"] in (
+        "bs",
+        "sp",
+        *flydsl_gemm_kernels.TDM_POLICIES,
+    ):
         policy = flydsl_config["policy"]
     else:
         policy = "ht" if flydsl_config["use_half_tile_interleaved"] else "ft"

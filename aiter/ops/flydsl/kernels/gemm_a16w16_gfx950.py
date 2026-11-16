@@ -47,6 +47,11 @@ class GemmA16W16Gfx950Param:
     block_k: fx.Constexpr[int]
     stages: fx.Constexpr[int]
     is_split_k: fx.Constexpr[bool]
+    split_k_partials: fx.Constexpr[bool]
+    split_count: fx.Constexpr[int]
+    static_m: fx.Constexpr[int]
+    static_n: fx.Constexpr[int]
+    static_k: fx.Constexpr[int]
     m_waves: fx.Constexpr[int]
     n_waves: fx.Constexpr[int]
     k_waves: fx.Constexpr[int]
@@ -118,6 +123,10 @@ def make_gemm_a16w16_gfx950_param(
     mma_k: int = 32,
     k_stagger: int = 0,
     b_non_temporal: bool = False,
+    split_k_partials: bool = False,
+    static_m: int = 0,
+    static_n: int = 0,
+    static_k: int = 0,
 ) -> GemmA16W16Gfx950Param:
     if in_dtype_id not in (GEMM_A16W16_DTYPE_BF16, GEMM_A16W16_DTYPE_FP16):
         raise ValueError(f"unsupported in_dtype_id={in_dtype_id}")
@@ -143,6 +152,17 @@ def make_gemm_a16w16_gfx950_param(
         raise TypeError("b_non_temporal must be a bool")
     if group_m < 0:
         raise ValueError("group_m must be non-negative")
+    if split_k_partials and (
+        in_dtype_id != GEMM_A16W16_DTYPE_BF16
+        or out_dtype_id != GEMM_A16W16_DTYPE_FP32
+        or has_bias
+        or use_half_tile_interleaved
+        or k_waves != 1
+        or a_is_transposed
+        or not b_is_transposed
+        or min(static_m, static_n, static_k) <= 0
+    ):
+        raise ValueError("FP32 split planes require BF16 NT, no bias, FT and k_waves=1")
     in_dbytes = 2
     # Shared C uses the output dtype: fp32 output is never rounded to 16 bits.
     out_dbytes = 4 if out_dtype_id == GEMM_A16W16_DTYPE_FP32 else 2
@@ -284,6 +304,11 @@ def make_gemm_a16w16_gfx950_param(
         block_k=block_k,
         stages=stages,
         is_split_k=split_k > 1,
+        split_k_partials=split_k_partials,
+        split_count=split_k if split_k_partials else 0,
+        static_m=static_m,
+        static_n=static_n,
+        static_k=static_k,
         m_waves=m_waves,
         n_waves=n_waves,
         k_waves=k_waves,
@@ -314,7 +339,10 @@ def make_gemm_a16w16_gfx950_kernel_name(param: GemmA16W16Gfx950Param):
     # @flyc.kernel bodies, so old bf16-rounding fp32 binaries are never reused.
     out_suffix = "_fp32c" if param.out_dtype_id == GEMM_A16W16_DTYPE_FP32 else ""
     name = f"hgemm_{dtype_str}{out_suffix}_t{param.block_m}x{param.block_n}x{param.block_k}x{param.stages}"
-    name += "_kst4" if param.is_split_k else "_ks1"
+    if param.split_k_partials:
+        name += f"_planes{param.split_count}_m{param.static_m}n{param.static_n}k{param.static_k}"
+    else:
+        name += "_kst4" if param.is_split_k else "_ks1"
     name += f"_w{param.m_waves}x{param.n_waves}x{param.k_waves}"
     name += f"_gm{param.group_m}"
     name += f"_stg{param.k_stagger}" if param.k_stagger else ""
@@ -434,7 +462,8 @@ def async_load_to_lds(
             global_offset = safe_global_outer_idx * tile.leading_stride + global_k_idx
         src = fx.make_view(tile.src_base + global_offset, g2s_copy_layout)
         dst = fx.make_view(lds_ptr, g2s_copy_layout)
-        rocdl.sched_barrier(0)
+        if const_expr(not param.split_k_partials):
+            rocdl.sched_barrier(0)
         if const_expr(tile.non_temporal):
             # The async copy atom has no cache-policy operand. Keep the raw
             # load async too, so the existing asyncmark/wait_asyncmark groups
@@ -451,7 +480,8 @@ def async_load_to_lds(
             )
         else:
             fx.copy_atom_call(context.async_g2s_copy_atom, src, dst)
-        rocdl.sched_barrier(0)
+        if const_expr(not param.split_k_partials):
+            rocdl.sched_barrier(0)
         if i < load_iters - 1:
             lds_ptr = lds_ptr + block_threads * async_load_vec_size
 
@@ -531,7 +561,15 @@ def gemm_a16w16_gfx950_kernel(
     tiled_mma: fx.TiledMma,
     param: GemmA16W16Gfx950Param,
 ):
-    is_split_k = param.is_split_k
+    if const_expr(param.split_k_partials):
+        m, n, k = (
+            fx.Int32(param.static_m),
+            fx.Int32(param.static_n),
+            fx.Int32(param.static_k),
+        )
+        a_leading_stride = fx.Int32(param.static_k)
+        b_leading_stride = fx.Int32(param.static_k)
+    is_split_k = param.is_split_k and not param.split_k_partials
     is_slice_k = param.k_waves > 1
     block_m = param.block_m
     block_n = param.block_n
@@ -574,10 +612,17 @@ def gemm_a16w16_gfx950_kernel(
     )
     bid_m, bid_n = block_swizzle.swizzle(num_pid_m, num_pid_n, fx.block_idx.x)
     ks_idx = fx.block_idx.y
-    ks_begin = ks_idx * working_k
-    ks_end = ks_begin + working_k
-    ks_end = (ks_end < k).select(ks_end, k)
-    k_tiles = (ks_end - ks_begin) // block_k
+    if const_expr(param.split_k_partials):
+        # Balance whole K tiles: partitions differ by at most one tile.
+        tiles, extra = divmod(param.static_k // block_k, param.split_count)
+        prefix = (ks_idx < extra).select(ks_idx, fx.Int32(extra))
+        ks_begin = (ks_idx * tiles + prefix) * block_k
+        k_tiles = fx.Int32(tiles) + (ks_idx < extra).select(fx.Int32(1), fx.Int32(0))
+    else:
+        ks_begin = ks_idx * working_k
+        ks_end = ks_begin + working_k
+        ks_end = (ks_end < k).select(ks_end, k)
+        k_tiles = (ks_end - ks_begin) // block_k
     if const_expr(param.k_stagger > 0):
         # Rotate only the global K loads, never the LDS ring index. The
         # actual partition length also handles a shorter final split.
@@ -602,6 +647,11 @@ def gemm_a16w16_gfx950_kernel(
 
     a_buf = fx.rocdl.make_buffer_tensor(a, max_size=True)
     b_buf = fx.rocdl.make_buffer_tensor(b, max_size=True)
+    if const_expr(param.split_k_partials):
+        # Each partition overwrites its own FP32 plane; no zeroing or atomics.
+        out = fx.make_view(
+            fx.get_iter(out) + ks_idx * m * n, fx.make_layout((m, n), (n, 1))
+        )
     out_buf = fx.rocdl.make_buffer_tensor(out, max_size=True)
     if const_expr(param.has_bias):
         bias_buf = fx.rocdl.make_buffer_tensor(bias, max_size=True)
@@ -737,32 +787,55 @@ def gemm_a16w16_gfx950_kernel(
             fx.make_view(smem_b + read_stage * block_n * block_k, b_lds_layout)
         )
 
-        def compute_k_chunk(block_k_iter):
-            frag_A_chunk = frag_A[None, None, block_k_iter]
-            fx.copy(
-                b_s2r_copy_atom,
-                thr_sB_s2r[None, None, block_k_iter],
-                frag_B_retile[None, None, block_k_iter],
-            )
-            fx.copy(
-                a_s2r_copy_atom,
-                thr_sA_s2r[None, None, block_k_iter],
-                frag_A_retile[None, None, block_k_iter],
-            )
-            fx.gemm(
-                tiled_mma,
-                frag_C,
-                frag_A_chunk,
-                frag_B[None, None, block_k_iter],
-                frag_C,
-                traversal_order=fx.GemmTraversalOrder.KNM,
-            )
+        if const_expr(param.split_k_partials):
+            for ki in range_constexpr(k_mma_iters_per_wave):
+                fx.copy(
+                    b_s2r_copy_atom,
+                    thr_sB_s2r[None, None, ki],
+                    frag_B_retile[None, None, ki],
+                )
+                fx.copy(
+                    a_s2r_copy_atom,
+                    thr_sA_s2r[None, None, ki],
+                    frag_A_retile[None, None, ki],
+                )
+            for ki in range_constexpr(k_mma_iters_per_wave):
+                fx.gemm(
+                    tiled_mma,
+                    frag_C,
+                    frag_A[None, None, ki],
+                    frag_B[None, None, ki],
+                    frag_C,
+                    traversal_order=fx.GemmTraversalOrder.KNM_Serpentine,
+                )
+        else:
 
-        for k_slice in range_constexpr(k_waves):
-            if k_wave_idx == k_slice:
-                for block_k_iter in range_constexpr(k_mma_iters_per_wave):
-                    k_iter = k_slice * k_mma_iters_per_wave + block_k_iter
-                    compute_k_chunk(k_iter)
+            def compute_k_chunk(block_k_iter):
+                frag_A_chunk = frag_A[None, None, block_k_iter]
+                fx.copy(
+                    b_s2r_copy_atom,
+                    thr_sB_s2r[None, None, block_k_iter],
+                    frag_B_retile[None, None, block_k_iter],
+                )
+                fx.copy(
+                    a_s2r_copy_atom,
+                    thr_sA_s2r[None, None, block_k_iter],
+                    frag_A_retile[None, None, block_k_iter],
+                )
+                fx.gemm(
+                    tiled_mma,
+                    frag_C,
+                    frag_A_chunk,
+                    frag_B[None, None, block_k_iter],
+                    frag_C,
+                    traversal_order=fx.GemmTraversalOrder.KNM,
+                )
+
+            for k_slice in range_constexpr(k_waves):
+                if k_wave_idx == k_slice:
+                    for block_k_iter in range_constexpr(k_mma_iters_per_wave):
+                        k_iter = k_slice * k_mma_iters_per_wave + block_k_iter
+                        compute_k_chunk(k_iter)
 
     # Prime the staged LDS pipeline: preload the first `stages - 1` K tiles
     # before entering the main loop that overlaps async loads with compute.
@@ -774,7 +847,8 @@ def gemm_a16w16_gfx950_kernel(
         splitk_protocol.zero_c()
         expected_signal = splitk_protocol.take_ticket(split_k)
         splitk_protocol.publish(expected_signal)
-    rocdl.sched_barrier(0)
+    if const_expr(not param.split_k_partials):
+        rocdl.sched_barrier(0)
 
     main_loop_end = k_tiles - (stages - 1)
     for k_tile in range(0, main_loop_end, 1):
@@ -786,7 +860,8 @@ def gemm_a16w16_gfx950_kernel(
         async_load_a_to_lds(k_tile + (stages - 1), write_stage)
         rocdl.asyncmark()
         compute_stage(current_stage, k_tile)
-        rocdl.sched_barrier(0)
+        if const_expr(not param.split_k_partials):
+            rocdl.sched_barrier(0)
 
     current_stage = main_loop_end % stages
     for s in range_constexpr(0, stages - 1):
@@ -1458,7 +1533,7 @@ def make_gemm_a16w16_param_and_validate(m, n, k, kwargs):
         return None
     num_pid_m = (m + result.block_m - 1) // result.block_m
     num_pid_n = (n + result.block_n - 1) // result.block_n
-    if split_k > 1:
+    if split_k > 1 and not result.split_k_partials:
         c_elements_per_iteration = result.block_threads * cshuffle_r2g_vec_size
         if (
             num_pid_m * num_pid_n > SPLIT_K_SEMAPHORE_MAX_LEN
@@ -1469,6 +1544,10 @@ def make_gemm_a16w16_param_and_validate(m, n, k, kwargs):
 
 
 def assert_no_k_tail(k: int, kwargs: dict):
+    if kwargs.get("split_k_partials", False):
+        assert k % kwargs["block_k"] == 0
+        assert k // kwargs["block_k"] // kwargs["split_k"] >= kwargs["stages"] - 1
+        return
     split_k = kwargs["split_k"]
     block_k = kwargs["block_k"]
     stages = kwargs["stages"]
@@ -1620,6 +1699,20 @@ def gemm_a16w16(
                 f"{GFX950_DMA_BYTES}-byte-aligned data pointer and leading "
                 f"stride; got shape={tuple(b.shape)} and stride={b.stride()}"
             )
+    partials = bool((user_kwargs or {}).get("split_k_partials", False))
+    planes = (user_kwargs or {}).get("split_k", 1) if partials else 1
+    if partials and (
+        layout != "nt"
+        or not a.is_contiguous()
+        or not b.t().is_contiguous()
+        or a.dtype != torch.bfloat16
+        or bias is not None
+        or min(m, n, k, planes) <= 0
+        or planes * m * n * 4 >= 2**31
+        or m * k * 2 >= 2**31
+        or n * k * 2 >= 2**31
+    ):
+        raise ValueError("split planes require bounded contiguous BF16 NT inputs")
     if out_dtype is None:
         out_dtype = a.dtype if out is None else out.dtype
     if out_dtype not in (a.dtype, torch.float32):
@@ -1627,14 +1720,20 @@ def gemm_a16w16(
             f"unsupported output dtype {out_dtype}; expected {a.dtype} or torch.float32"
         )
     if out is None:
-        out = torch.empty((m, n), dtype=out_dtype, device=a.device)
+        out = torch.empty((planes * m, n), dtype=out_dtype, device=a.device)
     else:
         assert out.dtype == out_dtype
         assert out.device == device
         assert out.is_contiguous()
     out = out.view(-1, n)
-    assert out.shape[0] == m
+    assert out.shape[0] == planes * m
     assert out.dtype == out_dtype
+    if partials:
+        if out.data_ptr() % 16 or out.dtype != torch.float32:
+            raise ValueError("split-plane workspace must be aligned FP32")
+        lo, hi = out.data_ptr(), out.data_ptr() + out.nbytes
+        if any(lo < t.data_ptr() + t.nbytes and t.data_ptr() < hi for t in (a, b)):
+            raise ValueError("split-plane workspace must not overlap inputs")
 
     if bias is not None and not bias.is_contiguous():
         bias = bias.contiguous()
@@ -1653,6 +1752,8 @@ def gemm_a16w16(
     }
 
     kwargs.update(user_kwargs or {})
+    if partials:
+        kwargs.update(static_m=m, static_n=n, static_k=k)
     kwargs["a_is_transposed"] = a_is_transposed
     kwargs["b_is_transposed"] = b_is_transposed
     kwargs["in_dtype_id"] = (
@@ -1671,7 +1772,10 @@ def gemm_a16w16(
 
     param = make_gemm_a16w16_param_and_validate(m, n, k, kwargs)
     assert param is not None, "unsupported gemm_a16w16_gfx950 shape/config"
-    semaphore, signal = get_split_k_buffers(stream, device, split_k)
+    if partials:
+        semaphore, signal = out, out  # Unused by the non-atomic device path.
+    else:
+        semaphore, signal = get_split_k_buffers(stream, device, split_k)
     a_arg = _dynamic_tensor_arg(a, 0 if a_is_transposed else 1)
     b_arg = _dynamic_tensor_arg(b, 0 if b_is_transposed else 1)
     out_arg = _dynamic_tensor_arg(out, 1)

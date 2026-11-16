@@ -43,7 +43,7 @@ _HGEMM_KERNEL_RE = re.compile(
     r"x(?P<stages>\d+)_ks(?P<split_k>\d+)_"
     r"w(?P<m_waves>\d+)x(?P<n_waves>\d+)x(?P<k_waves>\d+)_"
     r"bias(?P<has_bias>[01])_ktail(?P<has_k_tail>[01])_"
-    r"gm(?P<group_m>\d+)(?:_stg(?P<k_stagger>\d+))?(?P<b_non_temporal>_bnt)?_p(?P<policy>ft|ht|hti|sk|bs|tdm|tdmi|tdma|tdmia)_"
+    r"gm(?P<group_m>\d+)(?:_stg(?P<k_stagger>\d+))?(?P<b_non_temporal>_bnt)?_p(?P<policy>ft|ht|hti|sk|bs|tdm|tdmi|tdma|tdmia|sp)_"
     r"(?P<target_gfx>gfx[0-9a-z]+(?:-[0-9a-z]+)*)$"
 )
 
@@ -89,7 +89,7 @@ def flydsl_hgemm_kernel_name(
             f"Unsupported output dtype {out_dtype_name} for input {dtype_name}"
         )
 
-    if config.get("policy") in (SKINNY_POLICY, "bs", *TDM_POLICIES):
+    if config.get("policy") in (SKINNY_POLICY, "bs", "sp", *TDM_POLICIES):
         policy = config["policy"]
     else:
         policy = "ht" if config["use_half_tile_interleaved"] else "ft"
@@ -108,7 +108,10 @@ def flydsl_hgemm_kernel_name(
         f"bias{int(has_bias)}_ktail0_gm{config['group_m']}{stagger_suffix}{memory_suffix}_p{policy}_"
         f"{gfx}"
     )
-    if policy in ("bs", *TDM_POLICIES) and get_flydsl_hgemm_kernel_params(name) is None:
+    if (
+        policy in ("bs", "sp", *TDM_POLICIES)
+        and get_flydsl_hgemm_kernel_params(name) is None
+    ):
         raise ValueError("unsupported FlyDSL kernel configuration")
     return name
 
@@ -163,6 +166,8 @@ def get_flydsl_hgemm_kernel_params(name: str) -> dict | None:
         "target_gfx": match.group("target_gfx"),
     }
 
+    if policy == "sp" and not _split_planes_name_supported(params):
+        return None
     if policy in TDM_POLICIES:
         interleave, atomic = TDM_POLICIES[policy]
         if (
@@ -205,6 +210,109 @@ def get_flydsl_hgemm_kernel_params(name: str) -> dict | None:
     if policy == "bs" and not band_stream_name_supported(params):
         return None
     return params
+
+
+def _split_planes_name_supported(params):
+    # Narrow opt-in coverage; legacy FT/HT names retain their atomic protocol.
+    expected = {
+        "target_gfx": "gfx950",
+        "dtype": "bf16",
+        "out_dtype": "bf16",
+        "has_bias": False,
+        "block_m": 128,
+        "block_n": 160,
+        "block_k": 64,
+        "stages": 3,
+        "split_k": 5,
+        "m_waves": 2,
+        "n_waves": 2,
+        "k_waves": 1,
+        "group_m": 0,
+        "k_stagger": 0,
+        "b_non_temporal": True,
+    }
+    return all(params.get(key) == value for key, value in expected.items())
+
+
+def _split_planes_hgemm(a, b, out, bias, out_dtype, stream, params):
+    from .kernels.gemm_a8w8_splitk_reduce_gfx1250 import compile_gemm_a8w8_splitk_reduce
+    from .kernels.tensor_shim import ptr_arg
+
+    if (
+        not _split_planes_name_supported(params)
+        or tuple(a.shape) != (128, 12288)
+        or tuple(b.shape) != (7168, 12288)
+        or bias is not None
+        or getattr(b, "is_shuffled", False)
+        or a.device.type != "cuda"
+        or out_dtype not in (None, torch.bfloat16)
+    ):
+        raise ValueError("split-plane HGEMM supports BF16 (128,7168,12288), no bias")
+    tensors = (a, b) + (() if out is None else (out,))
+    if any(
+        t.device != a.device
+        or t.dtype != torch.bfloat16
+        or t.layout != torch.strided
+        or not t.is_contiguous()
+        or t.is_conj()
+        or t.is_neg()
+        or t.requires_grad
+        or t.data_ptr() % 16
+        for t in tensors
+    ):
+        raise ValueError("split-plane HGEMM requires aligned contiguous BF16 tensors")
+    if out is not None:
+        if tuple(out.shape) != (128, 7168):
+            raise ValueError("split-plane HGEMM output shape must be (128,7168)")
+        lo, hi = out.data_ptr(), out.data_ptr() + out.nbytes
+        if any(lo < t.data_ptr() + t.nbytes and t.data_ptr() < hi for t in (a, b)):
+            raise ValueError("split-plane HGEMM output must not overlap an input")
+    with torch.cuda.stream(stream):
+        # Invocation-local scratch is graph/stream-allocator owned, not cached.
+        if out is None:
+            out = torch.empty((128, 7168), device=a.device, dtype=torch.bfloat16)
+        partials = torch.empty((5 * 128, 7168), device=a.device, dtype=torch.float32)
+        kwargs = {
+            k: params[k]
+            for k in (
+                "block_m",
+                "block_n",
+                "block_k",
+                "stages",
+                "split_k",
+                "m_waves",
+                "n_waves",
+                "k_waves",
+                "group_m",
+                "k_stagger",
+                "b_non_temporal",
+            )
+        }
+        kwargs.update(use_half_tile_interleaved=False, split_k_partials=True)
+        gemm_a16w16(
+            a,
+            b.t(),
+            out=partials,
+            user_kwargs=kwargs,
+            stream=stream,
+            layout="nt",
+            out_dtype=torch.float32,
+        )
+        reducer = compile_gemm_a8w8_splitk_reduce(
+            split_k=5, partial_dtype_str="f32", threads=64, unroll=8, cache_policy=2
+        )
+        elements = out.numel()
+        _run_compiled(
+            reducer,
+            ptr_arg(partials, fx.Float32),
+            ptr_arg(out, fx.BFloat16),
+            elements,
+            1,
+            elements,
+            elements * 4,
+            fx.Stream(stream),
+        )
+    return out
 
 
 def _validate_k_stagger(k_stagger, gfx, policy):
@@ -254,7 +362,10 @@ def flydsl_hgemm(
     benefit from caching. Both options default off.
     ``policy="tdm"/"tdmi"`` selects workspace TDM, plain/interleaved;
     ``"tdma"/"tdmia"`` selects BF16 packed-atomic split-K on gfx1250.
-    All four use the same-dtype output and the existing weight[N,K] convention.
+    ``policy="sp"`` selects independently written FP32 K partitions followed
+    by a BF16 reduction, currently qualified only for contiguous BF16
+    (M,N,K)=(128,7168,12288) on gfx950. B remains ordinary weight[N,K].
+    All four TDM policies use the same-dtype output and the existing weight[N,K] convention.
     ``policy="bs"`` selects the BF16 band-stream decode kernel for the
     validated 256-CU gfx950 M/N/K and configuration catalog. It requires
     no bias, split_k=1 and BF16 output. As on the legacy FT path, strided
@@ -262,7 +373,7 @@ def flydsl_hgemm(
     rather than silently selecting a different kernel.
     """
 
-    if policy not in ("ft", "ht", "hti", SKINNY_POLICY, "bs", *TDM_POLICIES):
+    if policy not in ("ft", "ht", "hti", SKINNY_POLICY, "bs", "sp", *TDM_POLICIES):
         raise ValueError(f"Unsupported FlyDSL HGEMM policy: {policy!r}")
     launch_stream = (
         torch.cuda.current_stream(device=a.device) if stream is None else stream
@@ -273,6 +384,32 @@ def flydsl_hgemm(
     gfx = get_gfx_runtime()
     _validate_k_stagger(k_stagger, gfx, policy)
     _validate_b_non_temporal(b_non_temporal, gfx, policy)
+    if policy == "sp":
+        return _split_planes_hgemm(
+            a,
+            b,
+            out,
+            bias,
+            out_dtype,
+            launch_stream,
+            {
+                "target_gfx": gfx,
+                "dtype": _normalize_dtype_name(a.dtype),
+                "out_dtype": _normalize_dtype_name(out_dtype or a.dtype),
+                "has_bias": bias is not None,
+                "block_m": block_m,
+                "block_n": block_n,
+                "block_k": block_k,
+                "stages": stages,
+                "split_k": split_k,
+                "m_waves": m_waves,
+                "n_waves": n_waves,
+                "k_waves": k_waves,
+                "group_m": group_m,
+                "k_stagger": k_stagger,
+                "b_non_temporal": b_non_temporal,
+            },
+        )
     if policy in TDM_POLICIES:
         if gfx != "gfx1250":
             raise RuntimeError("TDM HGEMM policies require gfx1250")

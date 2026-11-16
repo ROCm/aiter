@@ -27,6 +27,8 @@ def compile_gemm_a8w8_splitk_reduce(
     out_dtype_str: str = "bf16",
     unroll: int = 0,
     partial_dtype_str: str = "bf16",
+    threads: int = BLOCK,
+    cache_policy: int = 0,
 ):
     if partial_dtype_str not in ("bf16", "f32") or out_dtype_str not in (
         "bf16",
@@ -35,18 +37,24 @@ def compile_gemm_a8w8_splitk_reduce(
         raise ValueError("partials must be f32/bf16 and output must be bf16/f16")
     if split_k < 1:
         raise ValueError("split_k must be positive")
+    if threads not in (64, 128, 256, 512) or cache_policy not in (0, 2):
+        raise ValueError("unsupported reduction thread count or cache policy")
+    block = threads
     input_bytes = 4 if partial_dtype_str == "f32" else 2
     vec = 16 // input_bytes
     unroll = unroll or max(1, 4 // split_k)
     if unroll & (unroll - 1):
         raise ValueError(f"unroll must be a power of two, got {unroll}")
     is_f16 = out_dtype_str == "f16"
-    span = BLOCK * vec * unroll
+    span = block * vec * unroll
     name = format_kernel_name(
         f"gemm_a8w8_splitk_reduce_{out_dtype_str}_sk{split_k}_u{unroll}"
     )
 
-    @flyc.kernel(name=name, known_block_size=[BLOCK, 1, 1])
+    if partial_dtype_str != "bf16" or threads != BLOCK or cache_policy:
+        name += f"_{partial_dtype_str}_t{threads}_cp{cache_policy}"
+
+    @flyc.kernel(name=name, known_block_size=[block, 1, 1])
     def reduce_kernel(
         partials: fx.Pointer,
         out: fx.Pointer,
@@ -59,7 +67,9 @@ def compile_gemm_a8w8_splitk_reduce(
         vec_out = T.vec(vec, elem.ir_type)
         tid = gpu.thread_id("x")
         tile, run = gpu.block_id("x"), gpu.block_id("y")
-        input_atom = fx.make_copy_atom(fx.rocdl.BufferCopy128b(), input_elem)
+        input_atom = fx.make_copy_atom(
+            fx.rocdl.BufferCopy128b(cache_policy), input_elem
+        )
         output_atom = fx.make_copy_atom(
             fx.rocdl.BufferCopy64b() if input_bytes == 4 else fx.rocdl.BufferCopy128b(),
             elem,
@@ -94,7 +104,7 @@ def compile_gemm_a8w8_splitk_reduce(
         )
 
         tile_mn, tv_layout = fx.make_layout_tv(
-            fx.make_layout((1, BLOCK), (1, 1)), fx.make_layout((1, vec), (1, 1))
+            fx.make_layout((1, block), (1, 1)), fx.make_layout((1, vec), (1, 1))
         )
         input_thr = fx.make_tiled_copy(input_atom, tv_layout, tile_mn).get_slice(tid)
         output_thr = fx.make_tiled_copy(output_atom, tv_layout, tile_mn).get_slice(tid)
@@ -133,7 +143,7 @@ def compile_gemm_a8w8_splitk_reduce(
         n_tiles = (i64_run + fx.Int64(span - 1)) // fx.Int64(span)
         reduce_kernel(partials, out, i64_run, i32_ld, i64_slice_bytes).launch(
             grid=(n_tiles, fx.Int64(i32_runs), 1),
-            block=(BLOCK, 1, 1),
+            block=(block, 1, 1),
             stream=stream,
         )
 
