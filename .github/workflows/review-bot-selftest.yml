@@ -6,15 +6,19 @@
 # aiter-review-bot.yml is watched too: check_prompts.py asserts across the two files (the run
 # budget must fit the review job's timeout-minutes, the watchdog's owner must match _notify.py,
 # the runner label must be exclusive), so a change there can break a guard that lives here.
+# review-bot-gate-watch.yml is watched for the same reason: its cron interval must equal
+# gate_watch.py's page window.
 name: review-bot selftest
 
 on:
   pull_request:
     branches: [main]
-    paths: ['.claude/skills/review-pr/**', '.github/workflows/aiter-review-bot.yml']
+    paths: ['.claude/skills/review-pr/**', '.github/workflows/aiter-review-bot.yml',
+            '.github/workflows/review-bot-gate-watch.yml']
   push:
     branches: [main]
-    paths: ['.claude/skills/review-pr/**', '.github/workflows/aiter-review-bot.yml']
+    paths: ['.claude/skills/review-pr/**', '.github/workflows/aiter-review-bot.yml',
+            '.github/workflows/review-bot-gate-watch.yml']
   workflow_dispatch:
 
 permissions:

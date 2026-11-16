@@ -73,6 +73,7 @@ def _job_key(job: dict) -> tuple:
             job.get("g2_spart"),
             job.get("g2_bf16_lds"),
             bool(job.get("use_valid_token_count", False) and job["epilog"] == "atomic"),
+            bool(job.get("g2_scatter_lds_pairs", False)),
         )
     if job["stage"] == 1:
         return (
@@ -121,13 +122,11 @@ def parse_csv(
     ``swiglu_limit`` defaults to AITER_MXFP4_TUNE_SWIGLU_LIMIT, else the
     activation default.
     """
-    from aiter.fused_moe import (
-        _flydsl_stage2_fp8_enabled,
-        _mxfp4_intermediate_enabled,
-    )
     from aiter.ops.flydsl.moe_common import (
         DEFAULT_SITUV2_BETA,
         DEFAULT_SITUV2_LINEAR_BETA,
+        _flydsl_stage2_fp8_enabled,
+        _mxfp4_intermediate_enabled,
         resolve_swiglu_limit,
     )
     from aiter.ops.flydsl.mxfp4_gemm2_kernels import _epilog_of
@@ -270,12 +269,26 @@ def parse_csv(
                 )
                 for enable_bias in enable_bias_options:
                     effective_out_dtype = out_dtype
+                    # AITER_MXFP4_INTERMEDIATE matches _flydsl_v2_stage2_wrapper:
+                    # scatter quantizes BM128/BN128/BN256 without bias, and reduce
+                    # writes MXFP4 route rows when the hidden size is 32-aligned.
+                    # Stage2 FP8 keeps the reduce kernel; an unaligned hidden size
+                    # and doweight_stage1 stay on BF16, which is what runtime launches.
+                    route_weight_after_gemm = str(
+                        row.get("doweight_stage1", "0")
+                    ).strip() in ("", "0")
                     if (
                         v2_g2["epilog"] == "scatter"
                         and bm == 128
                         and v2_g2["tile_n"] in (128, 256)
                         and not enable_bias
                         and mxfp4_intermediate
+                    ) or (
+                        v2_g2["epilog"] == "reduce"
+                        and not stage2_fp8_route_out
+                        and mxfp4_intermediate
+                        and route_weight_after_gemm
+                        and model_dim % 32 == 0
                     ):
                         effective_out_dtype = "fp4"
                     for use_valid_token_count in count_options:
@@ -304,6 +317,10 @@ def parse_csv(
                                 "use_valid_token_count": use_valid_token_count,
                                 "g2_spart": v2_g2["spart"],
                                 "g2_bf16_lds": v2_g2["bf16_lds"],
+                                # Runtime uses the stock epilogue for bias or fp4 out.
+                                "g2_scatter_lds_pairs": v2_g2["scatter_lds_pairs"]
+                                and effective_out_dtype == "bf16"
+                                and not enable_bias,
                             }
                         )
             elif _is_mxfp4_kname(kn2):
@@ -380,6 +397,7 @@ def _compile_stage1(job):
         inter_sorted_quant=d,
         inter_sorted_shuffled_scale=d,
         hidden_states=d,
+        hidden_row_stride_bytes=job["D_HIDDEN"] * 2,
         n_tokens=job["n_tokens"],
         BM=job["BM"],
         BN=job["BN"],
@@ -452,6 +470,7 @@ def _compile_v2_stage2(job):
     if job["persist"]:
         max_sorted = max(max_sorted, job["cu_num"] * job["BM"])
     is_fp8_route_out = job["epilog"] == "reduce" and job["out_dtype"] == "fp8"
+    is_fp4_route_out = job["epilog"] == "reduce" and job["out_dtype"] == "fp4"
     out = torch.empty((job["BM"], job["N_OUT"]), dtype=torch.bfloat16, device="cpu")
     target_scale = None
     if job["epilog"] == "scatter":
@@ -474,6 +493,17 @@ def _compile_v2_stage2(job):
                 (
                     job["BM"] * job["topk"],
                     fp8out_row_bytes(job["N_OUT"]),
+                ),
+                dtype=torch.uint8,
+                device="cpu",
+            )
+        elif is_fp4_route_out:
+            from aiter.ops.flydsl.kernels.mxfp4_gemm_common import fp4out_row_bytes
+
+            target = torch.empty(
+                (
+                    job["BM"] * job["topk"],
+                    fp4out_row_bytes(job["N_OUT"]),
                 ),
                 dtype=torch.uint8,
                 device="cpu",
@@ -517,6 +547,7 @@ def _compile_v2_stage2(job):
         out_scale=target_scale,
         g2_spart=job.get("g2_spart"),
         g2_bf16_lds=job.get("g2_bf16_lds"),
+        g2_scatter_lds_pairs=job.get("g2_scatter_lds_pairs", False),
         bias=bias if job.get("enable_bias", False) else None,
         use_valid_token_count=bool(
             job.get("use_valid_token_count", False) and job["epilog"] == "atomic"
@@ -536,7 +567,8 @@ def _compile_v2_stage2(job):
             topk_ids=None,
             stream=0,
             is_fp8=is_fp8_route_out,
-            topk_weights=d if is_fp8_route_out else None,
+            topk_weights=d if (is_fp8_route_out or is_fp4_route_out) else None,
+            is_fp4=is_fp4_route_out,
         )
 
 
