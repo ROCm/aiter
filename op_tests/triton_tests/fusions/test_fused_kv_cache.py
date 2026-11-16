@@ -887,6 +887,62 @@ def test_fused_qk_rope_reshape_and_cache_qk_norm(
     assert int(filled.sum()) == int(written.sum())
 
 
+@pytest.mark.parametrize("T", [8, 130])
+def test_fused_qk_rope_reshape_and_cache_qk_norm_strided_weights(T: int):
+    """Strided norm weights, a [::2] view and an expanded scalar, give the result
+    of their contiguous copies."""
+    QH, KH, D, block_size, num_blocks = 8, 2, 64, 16, 32
+    torch.manual_seed(0)
+    q, k, _, _, _, positions, _, cos, sin = generate_rope_inputs(
+        1,
+        T,
+        KH,
+        QH // KH,
+        D,
+        cached=True,
+        reuse_freqs_front_part=True,
+        nope=False,
+        pos=True,
+        offs=False,
+        two_inputs=True,
+        layout="thd",
+        dtype=torch.bfloat16,
+    )
+    v = torch.randn_like(k)
+    q_w = (torch.rand(2 * D, dtype=torch.bfloat16, device="cuda") + 0.5)[::2]
+    k_w = torch.full((1,), 1.25, dtype=torch.bfloat16, device="cuda").expand(D)
+    scale = torch.ones(1, dtype=torch.float32, device="cuda")
+    slot_mapping = torch.randperm(num_blocks * block_size, device="cuda")[:T]
+
+    def run(q_w, k_w):
+        key_cache = torch.zeros(
+            (num_blocks, block_size, KH, D), dtype=torch.bfloat16, device="cuda"
+        )
+        return fused_qk_rope_reshape_and_cache(
+            q,
+            k,
+            v,
+            key_cache,
+            torch.zeros_like(key_cache),
+            slot_mapping,
+            positions,
+            cos,
+            sin,
+            scale,
+            scale,
+            True,
+            flash_layout=True,
+            apply_scale=False,
+            output_zeros=False,
+            upcast_operand=True,
+            q_norm_weight=q_w,
+            k_norm_weight=k_w,
+        )
+
+    for got, want in zip(run(q_w, k_w), run(q_w.contiguous(), k_w.contiguous())):
+        assert torch.equal(got, want)
+
+
 # gpt-oss-120b config: hidden_size=2880, num_attention_heads=64, num_key_value_heads=8, head_dim=64
 GPT_OSS_120B_HEAD_DIM = 64
 GPT_OSS_120B_NUM_ATTENTION_HEADS = 64

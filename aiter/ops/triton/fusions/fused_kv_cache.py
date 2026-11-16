@@ -800,6 +800,10 @@ def fused_qk_rope_reshape_and_cache(
         assert k_norm_weight.shape == (d,)
         assert (q_norm_weight is not None) == have_q, "q_norm_weight is needed with q"
         assert q_norm_weight is None or q_norm_weight.shape == (d,)
+        # The kernel reads the weights with unit stride.
+        k_norm_weight = k_norm_weight.contiguous()
+        if q_norm_weight is not None:
+            q_norm_weight = q_norm_weight.contiguous()
     else:
         assert q_norm_weight is None, "q_norm_weight needs k_norm_weight"
     saturate_fp8 = saturate_fp8 and kv_cache_dtype == e4m3_dtype
