@@ -96,8 +96,6 @@ __global__ void fused_qk_rmsnorm_group_quant_kernel(
         (1.0f / static_cast<float>(opus::finfo<DTYPE_O>::max()));
     static_assert(!PER_TOKEN_QUANT || !std::is_same_v<DTYPE_O, opus::fp4_t>,
                   "per-token quant only supports fp8 output");
-    static_assert(!E8M0_SCALE || (std::is_same_v<DTYPE_O, opus::fp8_t> && !PER_TOKEN_QUANT),
-                  "E8M0 scales are for fp8 group quant");
 
     int idx = blockIdx.x;
     if(idx >= m)
@@ -255,8 +253,8 @@ __global__ void fused_qk_rmsnorm_group_quant_kernel(
         {
             if constexpr(E8M0_SCALE)
             {
-                // Quantize the DTYPE_I values the unquantized kernel would store, so the
-                // result matches it + per_group_quant_hip(scale_type=fp8_e8m0) byte for byte.
+                // Quantize the DTYPE_I values this kernel's norm rounds to, as
+                // per_group_quant_hip(scale_type=fp8_e8m0) does on q_out_unquantized.
                 for(int i = 0; i < thread_data_size; ++i)
                 {
                     thread_data_f[i] = opus::cast<float>(opus::cast<DTYPE_I>(thread_data_f[i]));
@@ -303,15 +301,16 @@ __global__ void fused_qk_rmsnorm_group_quant_kernel(
                 float max = multithread_reduce_max_dpp<ReduceThreadSize>(thread_max);
                 if constexpr(E8M0_SCALE)
                 {
-                    // per_group_quant_hip's rule: amax capped as on gfx1250, RoundUp E8M0.
+                    // per_group_quant_hip's rule: RoundUp E8M0, capped at 2^127 (an Inf group).
                     constexpr aiter::MxDtype kMxDtype =
 #if defined(__gfx942__)
                         aiter::MxDtype::FP8_E4M3_FNUZ;
 #else
                         aiter::MxDtype::FP8_E4M3;
 #endif
-                    quant_scale = aiter::fp_f32_to_e8m0_scale<aiter::kDefaultMxScaleRoundMode, kMxDtype>(
-                        fminf(max, static_cast<float>(opus::finfo<DTYPE_O>::max()) * 0x1.0p119f));
+                    quant_scale = fminf(
+                        aiter::fp_f32_to_e8m0_scale<aiter::kDefaultMxScaleRoundMode, kMxDtype>(max),
+                        0x1.0p127f);
                 }
                 else
                 {
@@ -508,14 +507,13 @@ __global__ void fused_qk_rmsnorm_group_quant_kernel(
     {                                                                                                           \
         if(quant_is_fp8)                                                                                        \
         {                                                                                                       \
-            FUSED_RMSNORM_GROUP_QUANT_DISPATCH(opus::fp8_t,                                                    \
-                                               BlockSize,                                                       \
-                                               thread_data_size,                                                \
-                                               ReduceThreadSize,                                                \
-                                               ADD_RESIDUAL,                                                    \
-                                               OUTPUT_UNQUANT,                                                  \
-                                               GEMMA_NORM_V,                                                    \
-                                               NO_QUANT_V);                                                     \
+            FUSED_RMSNORM_FP8_ONLY_GROUP_QUANT_DISPATCH(BlockSize,                                              \
+                                                        thread_data_size,                                       \
+                                                        ReduceThreadSize,                                       \
+                                                        ADD_RESIDUAL,                                           \
+                                                        OUTPUT_UNQUANT,                                         \
+                                                        GEMMA_NORM_V,                                           \
+                                                        NO_QUANT_V);                                            \
         }                                                                                                       \
         else                                                                                                    \
         {                                                                                                       \
@@ -530,8 +528,32 @@ __global__ void fused_qk_rmsnorm_group_quant_kernel(
         }                                                                                                       \
     } while(0)
 
+// fp8 output, E8M0 or FP32 scales on the same kernel configs.
 #define FUSED_RMSNORM_FP8_ONLY_GROUP_QUANT_DISPATCH(BlockSize, thread_data_size, ReduceThreadSize, ADD_RESIDUAL, OUTPUT_UNQUANT, GEMMA_NORM_V, NO_QUANT_V) \
-    FUSED_RMSNORM_GROUP_QUANT_DISPATCH(opus::fp8_t, BlockSize, thread_data_size, ReduceThreadSize, ADD_RESIDUAL, OUTPUT_UNQUANT, GEMMA_NORM_V, NO_QUANT_V)
+    do                                                                                                          \
+    {                                                                                                           \
+        if(quant_e8m0)                                                                                          \
+        {                                                                                                       \
+            FUSED_RMSNORM_FP8_E8M0_GROUP_QUANT_DISPATCH(BlockSize,                                              \
+                                                        thread_data_size,                                       \
+                                                        ReduceThreadSize,                                       \
+                                                        ADD_RESIDUAL,                                           \
+                                                        OUTPUT_UNQUANT,                                         \
+                                                        GEMMA_NORM_V,                                           \
+                                                        NO_QUANT_V);                                            \
+        }                                                                                                       \
+        else                                                                                                    \
+        {                                                                                                       \
+            FUSED_RMSNORM_GROUP_QUANT_DISPATCH(opus::fp8_t,                                                    \
+                                               BlockSize,                                                       \
+                                               thread_data_size,                                                \
+                                               ReduceThreadSize,                                                \
+                                               ADD_RESIDUAL,                                                    \
+                                               OUTPUT_UNQUANT,                                                  \
+                                               GEMMA_NORM_V,                                                    \
+                                               NO_QUANT_V);                                                     \
+        }                                                                                                       \
+    } while(0)
 
 #define FUSED_RMSNORM_FP8_GROUP_QUANT_DISPATCH(BlockSize, thread_data_size, ReduceThreadSize, ADD_RESIDUAL, OUTPUT_UNQUANT, GEMMA_NORM_V, NO_QUANT_V) \
     FUSED_RMSNORM_GROUP_QUANT_RUNTIME_DISPATCH(BlockSize, thread_data_size, ReduceThreadSize, ADD_RESIDUAL, OUTPUT_UNQUANT, GEMMA_NORM_V, NO_QUANT_V)
@@ -1053,35 +1075,6 @@ void fused_qk_rmsnorm_group_quant(
         else
         {
             DISPATCH_RESIDUAL_UNQUANT_PER_TOKEN_(FUSED_RMSNORM_FP8_PER_TOKEN_QUANT_DISPATCH, 256, 32);
-        }
-    }
-    else if(quant_e8m0)
-    {
-        // The unquantized kernel's (BlockSize, thread_data_size) per width, so the norm
-        // reduces in the same order and the bf16 values quantized are the ones it stores.
-        AITER_CHECK(max_n <= 4096 || max_n > 6144,
-                    __func__,
-                    " E8M0 group quant does not support 4096 < n <= 6144, got ",
-                    max_n);
-        if(max_n <= 512)
-        {
-            DISPATCH_REDUCE_THREAD_SIZE_(FUSED_RMSNORM_FP8_E8M0_GROUP_QUANT_DISPATCH, 64, 8);
-        }
-        else if(max_n <= 1024)
-        {
-            DISPATCH_REDUCE_THREAD_SIZE_(FUSED_RMSNORM_FP8_E8M0_GROUP_QUANT_DISPATCH, 128, 8);
-        }
-        else if(max_n <= 2048)
-        {
-            DISPATCH_REDUCE_THREAD_SIZE_(FUSED_RMSNORM_FP8_E8M0_GROUP_QUANT_DISPATCH, 256, 8);
-        }
-        else if(max_n <= 4096)
-        {
-            DISPATCH_REDUCE_THREAD_SIZE_(FUSED_RMSNORM_FP8_E8M0_GROUP_QUANT_DISPATCH, 256, 16);
-        }
-        else
-        {
-            DISPATCH_REDUCE_THREAD_SIZE_(FUSED_RMSNORM_FP8_E8M0_GROUP_QUANT_DISPATCH, 256, 32);
         }
     }
     else
