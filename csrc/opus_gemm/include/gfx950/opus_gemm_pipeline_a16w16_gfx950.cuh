@@ -214,7 +214,19 @@ __global__ __launch_bounds__(Traits::BLOCK_SIZE, 2) void gemm_a16w16_kernel(opus
         int blocks_per_cycle = nXCD * C;
         int tid_per_group = W * num_tiles_n;
         int limit = (total_wgs / blocks_per_cycle) * blocks_per_cycle;
-        if (xy >= limit) {
+        // The fallback below assumes the swizzled range [0, limit) stops
+        // inside a full W-row group. When it stops inside the shorter last
+        // group, the swizzle filled that group win_h (< W) rows per column,
+        // so the fallback recomputes some tiles and never writes others
+        // (e.g. M=1, N=65552 with B_N=256 skips columns 65536+). Use linear
+        // order for exactly those grids; every other grid keeps its mapping.
+        const bool swizzle_tail_mismatch = limit != total_wgs
+            && limit % tid_per_group != 0
+            && num_tiles_m - (limit / tid_per_group) * W < W;
+        if (swizzle_tail_mismatch) {
+            tile_m_id = xy / num_tiles_n;
+            tile_n_id = xy % num_tiles_n;
+        } else if (xy >= limit) {
             // Swizzle covers new_xy ∈ [0, limit) contiguously. Within that,
             // (limit / tid_per_group) groups are full; the remainder lands in
             // a partial last group covering (covered_cols) complete tn
