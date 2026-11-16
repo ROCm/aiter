@@ -29,6 +29,9 @@ LDG_VEC = 8
 # Predicate-as-address: OOB load/store via a voffset no descriptor can hold.
 OOB_SENTINEL_ELEM = 0x7FFFFF80
 OOB_SENTINEL_BYTES = OOB_SENTINEL_ELEM * BF16_BYTES
+# The same for split-K's fp32 workspace: element 0x3FFFFFC0 is byte 0xFFFFFF00,
+# past any workspace within SPLITK_MAX_STAGING_BYTES.
+SPLITK_OOB_ELEM = 0x3FFFFFC0
 
 # Compile hints applied to both conv3d kernels. Empty by default; a caller that
 # needs to pass FlyDSL a hint sets it before the first compile.
@@ -947,6 +950,8 @@ class BlockCoords(NamedTuple):
     n_local: object
     ch_base: object
     k_off: object
+    # This block's split-K index (0 without a split).
+    split: object
 
 
 # gfx950 parts deal a dispatch's workgroups round-robin over this many XCDs,
@@ -1031,6 +1036,7 @@ def block_coords(grid, grid_m=None):
             split_idx = fx.Int64(gpu.block_id("z"))
         k_off = split_idx * (grid.tiles_per_split * grid.tile_k)
     else:
+        split_idx = 0
         k_off = 0
 
     return BlockCoords(
@@ -1039,14 +1045,15 @@ def block_coords(grid, grid_m=None):
         n_local=n_local,
         ch_base=ch_base,
         k_off=k_off,
+        split=split_idx,
     )
 
 
-# Scatter: (npq, K) tile back to NCDHW / NDHWC, plus split-K atomics.
+# Scatter: (npq, K) tile back to NCDHW / NDHWC, or split-K partials to the workspace.
 
 
-# Split-K staging must fit a 32-bit buffer num_records (unsigned voffset).
-SPLITK_MAX_STAGING_BYTES = 0xFFFFFFFF
+# The split-K workspace, (splitK, npq, K) fp32, must keep SPLITK_OOB_ELEM past its end.
+SPLITK_MAX_STAGING_BYTES = SPLITK_OOB_ELEM * 4
 
 # Heuristic cap: auto splitK stays under 2**31; explicit/CSV splitK may use the rest.
 SPLITK_AUTO_MAX_STAGING_BYTES = 0x7FFFFFFF
@@ -1071,8 +1078,10 @@ class OutputScatterPlan(NamedTuple):
     mi_n: int
 
     # How the store is done, decided once below. Booleans, so they cost a
-    # constant number of artifacts rather than one per resolution.
+    # constant number of artifacts rather than one per resolution; ``splitk``
+    # is the workspace's slab count.
     use_splitk: bool
+    splitk: int
     big_out: bool
     row_chk: bool
     n_tail: bool
@@ -1096,24 +1105,23 @@ def make_output_scatter_plan(param, geom, cfg, grid):
 
     big_out = (n * k * geom.do * geom.ho * geom.wo * BF16_BYTES) > 0x7FFFFFFF
 
+    ws_bytes = grid.splitk * npq * k * 4
     assert (
-        not use_splitk or npq * k * 4 <= SPLITK_MAX_STAGING_BYTES
-    ), f"split-K staging {npq * k * 4}B exceeds the {SPLITK_MAX_STAGING_BYTES}B buffer window"
+        not use_splitk or ws_bytes <= SPLITK_MAX_STAGING_BYTES
+    ), f"split-K workspace {ws_bytes}B exceeds the {SPLITK_MAX_STAGING_BYTES}B buffer window"
 
     need_chk = row_chk or n_tail
-    # A tail is masked by routing the store to the OOB sentinel, which needs a
-    # buffer descriptor to land in. Split-K accumulates through atomics and
-    # BIG_OUT addresses y flat, so neither has one, and ``OutputScatter.store``
-    # would have to branch on a runtime predicate it cannot evaluate at trace
-    # time. ``_resolve_splitk`` never auto-splits a shape with a tail (it wants
-    # npq % tile_m == 0 and kg % tile_n == 0 first), so this is only reachable
-    # through an explicit ``splitk=`` or a hand-written tuned row -- named here
-    # rather than left to fail inside the trace with no shape to point at.
-    assert not need_chk or not (use_splitk or big_out), (
-        f"{'split-K' if use_splitk else 'BIG_OUT'} cannot mask a tile tail, and this "
-        f"launch has one (row_chk={row_chk}, n_tail={n_tail}): npq={npq} against "
+    # A tail is masked by routing the store to an OOB voffset, which needs a
+    # buffer descriptor to land in (split-K's workspace has one); BIG_OUT
+    # addresses y flat and has none, and ``OutputScatter.store`` would have to
+    # branch on a runtime predicate it cannot evaluate at trace time.
+    # ``_resolve_splitk`` never auto-splits a shape with a tail, so a split
+    # tail only comes from an explicit ``splitk=`` or a tuned row.
+    assert not need_chk or not big_out, (
+        f"BIG_OUT cannot mask a tile tail, and this launch has one "
+        f"(row_chk={row_chk}, n_tail={n_tail}): npq={npq} against "
         f"tile_m={cfg.tile_m}, kg={kg} against tile_n={cfg.tile_n}. Use a tile that "
-        "divides the problem, or drop the split."
+        "divides the problem."
     )
     return OutputScatterPlan(
         k=k,
@@ -1124,14 +1132,15 @@ def make_output_scatter_plan(param, geom, cfg, grid):
         mi_m=mi_m,
         mi_n=mi_n,
         use_splitk=use_splitk,
+        splitk=grid.splitk,
         big_out=big_out,
         row_chk=row_chk,
         n_tail=n_tail,
         need_chk=need_chk,
-        # Routing a masked element to the OOB sentinel drops it without a
+        # Routing a masked element to an OOB voffset drops it without a
         # branch, but only where the store goes through a buffer descriptor:
-        # split-K atomics and the 64-bit BIG_OUT path have no such address.
-        route_store=need_chk and not use_splitk and not big_out,
+        # the 64-bit BIG_OUT path has no such address.
+        route_store=need_chk and not big_out,
         # Under a 2D output block four consecutive tile rows are four pixels
         # of one image row; Wo % 4 keeps them on one side of the W tail too.
         vec_store=(
@@ -1158,14 +1167,21 @@ class OutputScatter:
         self._y = y
         self._elem_ty = elem_ty
 
-        # fp32 while split-K stages through it, bf16 once it is the output.
+        # bf16 output, or under split-K the fp32 (splitK, npq, K) workspace:
+        # each split writes its own slab, so the sum over slabs the caller
+        # takes does not depend on the order the splits ran in.
         y_elems = ext.npq * plan.k
-        y_bytes = y_elems * (4 if plan.use_splitk else BF16_BYTES)
-        y_buf = fx.rocdl.make_buffer_tensor(y, num_records_bytes=y_bytes)
         if const_expr(plan.use_splitk):
-            # buffer_atomic_add needs the raw !llvm.ptr<8> descriptor, not a tensor.
-            self._y_rsrc = fx.rocdl.get_buffer_rsrc(fx.get_iter(y_buf))
+            ws_elems = y_elems * plan.splitk
+            y_buf = fx.rocdl.make_buffer_tensor(y, num_records_bytes=ws_elems * 4)
+            self._y_div = fx.logical_divide(
+                fx.Tensor(fx.make_view(fx.get_iter(y_buf), fx.make_layout(ws_elems, 1))),
+                fx.make_layout(1, 1),
+            )
+            self._y_atom_1 = fx.make_copy_atom(fx.rocdl.BufferCopy32b(), fx.Float32)
+            self._y_reg_1 = fx.make_rmem_tensor(1, fx.Float32)
         else:
+            y_buf = fx.rocdl.make_buffer_tensor(y, num_records_bytes=y_elems * BF16_BYTES)
             self._y_div = fx.logical_divide(
                 fx.Tensor(
                     fx.make_view(
@@ -1203,6 +1219,7 @@ class OutputScatter:
         c_col,
         row_of=None,
         row_ok=None,
+        split=0,
     ):
         """Write this block's accumulator out.
 
@@ -1213,12 +1230,15 @@ class OutputScatter:
         A 2D output block (kH x kW reuse) passes ``row_of(local)``, the GEMM
         row of tile-local row ``local`` (rows local..local+3 stay consecutive),
         and ``row_ok(local)``, whether that row is inside the output, which
-        replaces the ``row < npq`` tail test.
+        replaces the ``row < npq`` tail test. ``split`` is the block's split-K
+        index, the workspace slab it writes.
         """
         plan = self._plan
         elem_ty = self._elem_ty
         if const_expr(plan.big_out):
             self._y_elem_base = fx.Int64(fx.ptrtoint(fx.get_iter(self._y)))
+        if const_expr(plan.use_splitk):
+            slab = fx.Int64(split) * fx.Int64(self._ext.npq * plan.k)
 
         if const_expr(plan.has_bias and not plan.use_splitk):
             bias_vals = self._load_bias(n_offset, n_local, c_col)
@@ -1275,9 +1295,19 @@ class OutputScatter:
 
                     def _emit():
                         if const_expr(plan.use_splitk):
-                            off_b = fx.Int32(off_sk * 4)
-                            z0 = fx.Int32(0)
-                            buffer_atomic_add(a[i], self._y_rsrc, off_b, z0, z0)
+                            off_w = fx.Int32(slab + off_sk)
+                            if const_expr(plan.route_store):
+                                off_w = self._valid(row, col_loc, rv).select(
+                                    off_w, fx.Int32(SPLITK_OOB_ELEM)
+                                )
+                            fx.memref_store_vec(
+                                fx.full(1, a[i], fx.Float32), self._y_reg_1
+                            )
+                            fx.copy(
+                                self._y_atom_1,
+                                self._y_reg_1,
+                                fx.slice(self._y_div, (None, off_w)),
+                            )
                         else:
                             cval = (
                                 (a[i] + bias_val).to(elem_ty)

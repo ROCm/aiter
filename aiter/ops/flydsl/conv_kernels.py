@@ -773,7 +773,8 @@ def _resolve_splitk(
                 sk = min(4, max(1, num_cu // base), k_tiles)
     else:
         sk = max(1, splitk)
-    while sk > 1 and k_tiles % sk != 0:
+    # The workspace is one fp32 (npq, K) slab per split.
+    while sk > 1 and (k_tiles % sk != 0 or sk * npq * k * 4 > SPLITK_MAX_STAGING_BYTES):
         sk -= 1
     return sk
 
@@ -1014,7 +1015,8 @@ def _conv3d_impl(
         sk_arg = splitk if splitk is not None else tuned_splitk
         sk = _resolve_splitk(sk_arg, npq, crs, k, x.device, the_tile, groups)
         if sk > 1:
-            y = torch.zeros((npq, k), device=x.device, dtype=torch.float32)
+            # Every split writes its whole slab, so the workspace needs no zeroing.
+            y = torch.empty((sk, npq, k), device=x.device, dtype=torch.float32)
         else:
             out_shape = (n, do, ho, wo, k) if out_ndhwc else (n, k, do, ho, wo)
             y = torch.empty(out_shape, device=x.device, dtype=torch.bfloat16)
@@ -1084,10 +1086,17 @@ def _conv3d_impl(
         the_block_rows=chosen_block_rows,
     )
     if sk > 1:
+        y = y.sum(0)
+        if out_ndhwc:
+            out = torch.empty((n, do, ho, wo, k), device=x.device, dtype=torch.bfloat16)
+            o2 = out.view(npq, k)
+            if has_bias:
+                torch.add(y, bias_arg.view(1, k), out=o2)
+            else:
+                o2.copy_(y)
+            return out
         if has_bias:
             y = y + bias_arg.view(1, k)
-        if out_ndhwc:
-            return y.view(n, do, ho, wo, k).to(torch.bfloat16)
         out = torch.empty((n, k, do, ho, wo), device=x.device, dtype=torch.bfloat16)
         out.copy_(y.view(n, do, ho, wo, k).permute(0, 4, 1, 2, 3))
         return out

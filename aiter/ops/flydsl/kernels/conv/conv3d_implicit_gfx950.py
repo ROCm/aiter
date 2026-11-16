@@ -300,9 +300,10 @@ def compile_conv3d_implicit(param: Conv3dImplicitParam):
     elem_ty = fx.BFloat16
     N_CC = geom.cgp // cfg.tile_k
     if const_expr(im2col_plan.kh_reuse):
-        assert (
-            not grid.use_splitk
-        ), "kH x kW reuse walks whole groups; split-K is ruled out"
+        # Split-K hands each split N_CC / splitk consecutive channel blocks;
+        # a split still walks whole (kt, channel block) patches.
+        assert N_CC % grid.splitk == 0, (N_CC, grid.splitk)
+        N_CC_SPLIT = N_CC // grid.splitk
         KH_R, KH_C = im2col_plan.out_block
         PATCH_ELEMS = im2col_plan.patch_alloc_vecs * LDG_VEC
         SharedStorage = make_shared_storage(
@@ -314,7 +315,8 @@ def compile_conv3d_implicit(param: Conv3dImplicitParam):
             ),
         )
         # One group = one (kt, channel block): all kH*kW taps read one patch.
-        KH_GROUPS = [(kt_i, cc) for kt_i in range(param.kt) for cc in range(N_CC)]
+        # cc counts from the split's first channel block.
+        KH_GROUPS = [(kt_i, cc) for kt_i in range(param.kt) for cc in range(N_CC_SPLIT)]
         KH_STEPS = [
             (g, kt_i, cc, kh_i, kw_i)
             for g, (kt_i, cc) in enumerate(KH_GROUPS)
@@ -427,6 +429,8 @@ def compile_conv3d_implicit(param: Conv3dImplicitParam):
             r = fx.Int64(r)
             return (oh0 + r // KH_C < fx.Int64(ho)) & (ow0 + r % KH_C < fx.Int64(wo))
 
+        cc0 = blk.split * N_CC_SPLIT if const_expr(grid.use_splitk) else 0
+
         mma = MmaTiling(cfg, elem_ty, tid, lds, scratch=y)
         acc = mma.acc
         patch.bind_block(tid, m0)
@@ -449,14 +453,14 @@ def compile_conv3d_implicit(param: Conv3dImplicitParam):
         def load_patch(g, rounds):
             kt_i, cc = KH_GROUPS[g]
             base = (g % 2) * PATCH_ELEMS
-            for i, src, voff, live in patch.taps(kt_i, cc):
+            for i, src, voff, live in patch.taps(kt_i, cc0 + cc):
                 if const_expr(i in rounds):
                     park = None if live is None else (live, lds.b_park)
                     stager.copy(src, stager.dst(lds.a, base, i, park=park), voff)
 
         def load_b(s):
             _, kt_i, cc, kh_i, kw_i = KH_STEPS[s]
-            k_base = ((kt_i * KH + kh_i) * KW + kw_i) * CGP + cc * cfg.tile_k
+            k_base = ((kt_i * KH + kh_i) * KW + kw_i) * CGP + (cc0 + cc) * cfg.tile_k
             weights.stage(stager, lds, (s % PIPE) * cfg.tile_n * cfg.tile_k, k_base)
 
         n_steps = len(KH_STEPS)
@@ -514,6 +518,7 @@ def compile_conv3d_implicit(param: Conv3dImplicitParam):
             c_col=mma.c_col,
             row_of=row_of,
             row_ok=row_ok if const_expr(scatter_plan.row_chk) else None,
+            split=blk.split,
         )
 
     def _body(y, x, weight, bias, ext, grid_m):
@@ -590,6 +595,7 @@ def compile_conv3d_implicit(param: Conv3dImplicitParam):
             n_local=blk.n_local,
             c_row=mma.c_row,
             c_col=mma.c_col,
+            split=blk.split,
         )
 
     if im2col_plan.kh_reuse:

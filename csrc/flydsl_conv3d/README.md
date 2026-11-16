@@ -136,21 +136,22 @@ python3 csrc/flydsl_conv3d/conv3d_tune.py -i $M/wan21_vae_bf16_untuned_conv3d.cs
    and no patch.
 
    `splitK` is **not** swept: `_resolve_splitk` derives it per candidate and the
-   tuner pins that value so the column records what ran. Every row of both VAE
-   tables is `splitK=1`, and structurally so rather than by default -- a split
-   only buys occupancy where the M/N grid alone cannot fill the device, and 75
-   of the 76 rows are already at or above the heuristic's own 3/4*CU block bar,
-   where a split can do nothing but add an fp32 staging buffer and an atomic
-   reduce. The exception is Wan's `conv_out` at 368x544 (98 blocks), which
-   `_resolve_splitk` declines on `npq < 4096`.
+   tuner pins that value so the column records what ran. Every Wan2.1 and
+   Qwen-Image row is `splitK=1` -- a split only buys occupancy where the M/N
+   grid alone cannot fill the device, and 75 of those 76 rows are already at
+   or above the heuristic's own 3/4*CU block bar. The Wan2.2 table has five
+   split-K rows, all small-M layers (M = 1008 to 4032 against a K axis of 9k
+   to 28k) where the grid is short of the device or the tile is cut down to
+   fill it.
 
-   Note that split-K cannot currently be combined with a tile that leaves a
-   tail: the masked element is dropped by routing the store to the OOB
-   sentinel, which needs a buffer descriptor, and the split-K atomic has none.
-   `make_output_scatter_plan` asserts on it. The heuristic cannot reach that
-   combination (it requires `npq % tile_m == 0` and `kg % tile_n == 0` before
-   splitting), so it is only reachable through an explicit `splitk=` or a
-   hand-written row.
+   A split writes its fp32 partial sums to its own (npq, K) slab of a
+   (splitK, npq, K) workspace with plain stores, and the entry point sums the
+   slabs, adds the bias and casts to bf16. No atomics, so a split-K row returns
+   the same bits on every call, and nothing has to be zeroed first. A tile that
+   leaves a tail can split: the masked element goes to an out-of-range
+   workspace offset, the way the bf16 store drops its own. The kH x kW reuse
+   path splits by input-channel blocks (splitK must divide C/groups / 32, and
+   each split still walks whole patches); the kW reuse path does not split.
 
    `libtype` names the implementation the rest of the row configures, as it does
    in the GEMM tables. It is a result rather than part of the key: where a tuner
