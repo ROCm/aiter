@@ -23,7 +23,7 @@ import torch.nn.functional as F
 import aiter
 from aiter import dtypes, logger
 from aiter.jit.core import AITER_CONFIG_GEMM_BF16, get_asm_dir
-from aiter.jit.utils.chip_info import get_cu_num, get_gfx
+from aiter.jit.utils.chip_info import get_cu_num, get_gfx, get_gfx_runtime
 from aiter.ops.flydsl.gemm_a16w16_policy import (
     get_flydsl_a16w16_configs,
 )
@@ -307,7 +307,11 @@ def run_flydsl_gemm_bf16(
         k_waves=config["k_waves"],
         stages=config["stages"],
         group_m=config["group_m"],
-        policy="ht" if config["use_half_tile_interleaved"] else "ft",
+        k_stagger=config.get("k_stagger", 0),
+        b_non_temporal=config.get("b_non_temporal", False),
+        policy=config.get(
+            "policy", "ht" if config["use_half_tile_interleaved"] else "ft"
+        ),
         out_dtype=otype,
     )
     if bias is not None and fused_bias is None:
@@ -329,21 +333,22 @@ def get_flydsl_bf16_catalog(
     k: int,
     out_dtype: torch.dtype,
     has_bias: bool,
+    in_dtype: torch.dtype = torch.bfloat16,
 ):
     if flydsl_hgemm_kernel_name is None:
         return []
-    fused_bias = bool(has_bias and out_dtype == torch.bfloat16)
+    fused_bias = bool(has_bias and out_dtype == in_dtype)
     configs = get_flydsl_a16w16_configs(
         m,
         n,
         k,
-        torch.bfloat16,
+        in_dtype,
         out_dtype,
         fused_bias,
     )
     kernels = {
         flydsl_hgemm_kernel_name(
-            dtype=torch.bfloat16,
+            dtype=in_dtype,
             out_dtype=out_dtype,
             config=config,
             has_bias=fused_bias,
@@ -739,11 +744,14 @@ class GemmA16W16Tuner(GemmCommonTuner):
     def _get_flydsl_tasks(
         self, info_keys, has_bias, indtype, outdtype, scaleAB, is_shuffle, run_kwargs
     ):
-        if scaleAB or is_shuffle or indtype != dtypes.bf16:
+        supported_dtype = indtype == dtypes.bf16 or (
+            get_gfx_runtime() == "gfx1250" and indtype == dtypes.fp16
+        )
+        if scaleAB or is_shuffle or not supported_dtype:
             return []
         M, N, K = (int(info_keys[2]), int(info_keys[3]), int(info_keys[4]))
         rtol, atol = _default_tol(outdtype)
-        flydsl_catalog = get_flydsl_bf16_catalog(M, N, K, outdtype, has_bias)
+        flydsl_catalog = get_flydsl_bf16_catalog(M, N, K, outdtype, has_bias, indtype)
         tasks = []
         for solidx, kernel_name, config in flydsl_catalog:
             info = (
@@ -898,19 +906,24 @@ class GemmA16W16Tuner(GemmCommonTuner):
             verbose=args.verbose,
             rtol=rtol,
             atol=atol,
+            policy=self.policy_for(args),
         )
         rets = gemmobj.run_solutions()
         gemmobj.cleanup()
 
         result = []
-        for info, us, err_ratio in rets:
+        from aiter.utility.tune_result import TuneResult
+
+        for el in rets:
+            info, us, err_ratio = el
             shape_tuple, solidx, splitK, kernelName, libtype, bpreshuffle = info
             keys_10 = (gfx, cu_num) + shape_tuple
             result.append(
-                (
+                TuneResult(
                     (keys_10, solidx, splitK, kernelName, libtype, bpreshuffle),
                     us,
                     err_ratio,
+                    getattr(el, "watts", float("nan")),
                 )
             )
         return result
@@ -1025,25 +1038,26 @@ class GemmA16W16Tuner(GemmCommonTuner):
                     kernelName = "None"
             tflops, bw = self.calculate(el)
             key_dict = dict(zip(self.keys, keys))
+            metrics = {
+                "libtype": [libtype],
+                "solidx": [kernelId],
+                "splitK": [splitK],
+                "us": [time],
+                "kernelName": [kernelName],
+                "err_ratio": [err_ratio],
+                "tflops": [tflops],
+                "bw": [bw],
+            }
+            extra, watt_text = self.policy.result_metrics(el, tflops)
+            metrics.update(extra)
             if len(results) == self.topk:
                 print(
                     f"Tuning result for {str(key_dict).strip('{}')} is "
                     f"libtype={libtype} kernelId={kernelId} {kernelName} "
                     f"splitK={splitK}, {time}us, err_ratio={err_ratio}, "
-                    f"tflops={tflops} TFLOPS, bw={bw} GB/s"
+                    f"tflops={tflops} TFLOPS, bw={bw} GB/s{watt_text}"
                 )
-            key_dict.update(
-                {
-                    "libtype": [libtype],
-                    "solidx": [kernelId],
-                    "splitK": [splitK],
-                    "us": [time],
-                    "kernelName": [kernelName],
-                    "err_ratio": [err_ratio],
-                    "tflops": [tflops],
-                    "bw": [bw],
-                }
-            )
+            key_dict.update(metrics)
             rows.append(key_dict)
         # Build the frame once. Concatenating per row is O(n^2) in both time and
         # allocation: with -o2 (profile of every candidate) a 42-shape x ~600

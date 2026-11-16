@@ -1,12 +1,13 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-"""Host side of the gfx1250 stage-1 kernel (``AITER_MEGA_S1F=1``).
+"""Host side of the gfx1250 stage-1 kernel (on by default, ``AITER_MEGA_S1F=0``
+turns it off).
 
-The compact dispatch owns one ``_Stage1Fusion``. When the env switch is on and
-the shape fits, the compact plan emits the run table the kernel gathers from,
-and GEMM1 is replaced by that kernel. Anything else keeps dispatch and GEMM1
-as separate launches.
+The compact dispatch owns one ``_Stage1Fusion``. When the switch is on and the
+shape fits, the compact plan emits the run table the kernel gathers from, and
+GEMM1 is replaced by that kernel. Anything else keeps dispatch and GEMM1 as
+separate launches.
 """
 
 from __future__ import annotations
@@ -20,6 +21,7 @@ import torch
 
 from aiter import ActivationType
 
+from ..tensor_shim import _run_compiled, ptr_arg
 from .arena import _align_up
 
 _log = logging.getLogger("aiter")
@@ -40,27 +42,70 @@ _QUANT_FUSE_BLOCKS = int(os.environ.get("AITER_MEGA_QUANT_FUSE", "128"))
 
 # Smallest m-tile the flag region is sized for (one flag per tile/source).
 _S1F_MIN_TILE_M = 16
-#: The GEMM1 tile n / k every stage-1 variant embeds (with 1x4 waves). The
-#: CSV row's tile_n / tile_k / num_buffers only tune the unfused GEMM1, so the
-#: stage-1 kernel keeps its own; only the row's tile_m has to match.
+#: The GEMM1 tile n / k every stage-1 variant embeds (M256 uses 2x2 waves;
+#: smaller M tiles use 1x4). The CSV row's tile_n / tile_k / num_buffers only
+#: tune the unfused GEMM1, so the stage-1 kernel keeps its own; only the row's
+#: tile_m has to match.
 _S1F_TILE_N, _S1F_TILE_K = 256, 256
 #: Stage-1 variants by GEMM1 tile_m: (pipeline buffers, CTAs per CU).
 #:
+#: * 16 rows (decode): its own flag tile. Even 3 buffers take 112,384 B, so
+#:   three CTAs do not fit a CU; 4 buffers edge out 3 at tpr 8 / 64.
+#: * 32 rows (EP2 tpr 256 / 512): its own flag tile too, with the 16-row
+#:   layout; the tuned GEMM1 picks tile 32 there.
 #: * 64 rows: ~230 VGPRs, 133,632 B of arena, two CTAs per CU.
+#: * 96 rows: between the 64 and 128 variants, two CTAs per CU; its flag
+#:   tiles are 32 rows (``s1f_flag_m``).
 #: * 128 rows: twice the accumulators (398 VGPRs, no spills) in 162,816 B.
 #:   Two still fit: 2 x 163,840 B is exactly the 320 KB of LDS and two waves
 #:   of 398 VGPRs a SIMD.
 #: * 256 rows: ~800 VGPRs leave one wave per SIMD, so the CTA has the CU to
 #:   itself; 3 buffers (221,184 B) beat 4 at tpr 1536.
-#: * 96 rows: between the 64 and 128 variants, two CTAs per CU; its flag
-#:   tiles are 32 rows (``s1f_flag_m``).
 #:
 #: Every worker CTA has to be resident at once -- the producers hand tiles to
 #: consumers inside one launch -- so a variant whose CTAs per CU exceeds what
 #: VGPRs and LDS allow would hang, not just run slow.
-_S1F_VARIANTS = {64: (3, 2), 96: (3, 2), 128: (3, 2), 256: (3, 1)}
+_S1F_VARIANTS = {
+    16: (4, 2),
+    32: (4, 2),
+    64: (3, 2),
+    96: (3, 2),
+    128: (3, 2),
+    256: (3, 1),
+}
 #: m-tiles per group in the GEMM1 work order.
 _S1F_GROUP_M = 8
+# The S1F settings below (with S1F_BLOCK_RUNS in s1f_stage1.py and the compact
+# route schedule in config.py) come from DSV4.1-Flash DEP4 on MI455X, MLPerf
+# Endpoints agentic c512: +2.1% gen tok/s/GPU over S1F off.
+#: A step whose receive bound exceeds this runs the whole S1F=0 path (see
+#: _Stage1Fusion.step_off), so the widest prefill steps keep dispatch + GEMM1.
+_S1F_MAX_RECV = 4096
+#: Receive caps that differ from _S1F_MAX_RECV, by (world_size, topk).
+#: DSV4.1 Flash (top-6) runs stage-1 fused at every width on EP2 and EP4. At
+#: 8192 tokens/rank: 886 vs 959 us/layer on EP2, 900 vs 1063 on EP4. Top-7 is
+#: the same model with its shared expert fused: 1200 vs 1405 on EP2. Past
+#: 4096 tokens this compiles a few more plan widths (7 instead of 4 at 8192).
+_S1F_MAX_RECV_BY_SHAPE: dict = {
+    (2, 6): 1 << 30,
+    (4, 6): 1 << 30,
+    (2, 7): 1 << 30,
+    (4, 7): 1 << 30,
+}
+
+
+def s1f_max_recv(world_size: int, topk: int) -> int:
+    """Widest receive bound a step can have and still run the stage-1 kernel.
+
+    ``AITER_S1F_MAX_RECV`` overrides it for every shape; 0 removes the cap.
+    """
+    env = os.environ.get("AITER_S1F_MAX_RECV", "").strip()
+    if env:
+        cap = int(env)
+        return cap if cap > 0 else 1 << 30
+    return _S1F_MAX_RECV_BY_SHAPE.get((int(world_size), int(topk)), _S1F_MAX_RECV)
+
+
 #: Per-XCC GEMM1 queues (``make_s1f_stage1(xcc_queues=1)``) up to this tile_m:
 #: decode buckets have one m-tile per expert, so the order only decides how
 #: many XCCs read each m-tile's A. Wider tiles keep the global m-major order,
@@ -78,21 +123,14 @@ def _s1f_xcc_queues(tile_m: int) -> int:
     return int(mode)
 
 
-#: Placeholder reason for the one step that probes the GEMM1 configuration.
-_S1F_PROBING = "probing the GEMM1 configuration"
-# Decode steps have too little expert GEMM to hide the compact plan if the plan
-# waits out dispatch first. At or below this token count the next layer's plan
-# starts before dispatch returns and overlaps both.
-_DECODE_PLAN_OVERLAP_TOKENS = 128
-
-
 def read_s1f_mode() -> bool:
-    """``AITER_MEGA_S1F=1``: dispatch and GEMM1 as one persistent stage-1 kernel.
+    """Dispatch and GEMM1 as one persistent stage-1 kernel; on by default.
 
-    Compact flydsl path on the fp4 wire only. Unset (or 0) keeps dispatch and
-    GEMM1 as separate launches.
+    Compact flydsl path on the fp4 wire only: a config or step that does not
+    fit keeps dispatch and GEMM1 as separate launches. ``AITER_MEGA_S1F=0``
+    turns it off.
     """
-    mode = os.environ.get("AITER_MEGA_S1F", "0").strip() or "0"
+    mode = os.environ.get("AITER_MEGA_S1F", "1").strip() or "1"
     if mode not in ("0", "1"):
         raise ValueError(f"AITER_MEGA_S1F must be 0 or 1, got {mode!r}")
     return mode == "1"
@@ -106,13 +144,11 @@ def _s1f_cu_num() -> int:
 
 def _fallback_warn(owner, reasons) -> None:
     """Warn once per instance that this configuration keeps the default path."""
-    reasons = [r for r in reasons if r != _S1F_PROBING]
     if not reasons or getattr(owner, "_warned", False):
         return
     owner._warned = True
-    _log.warning(
-        "AITER_MEGA_S1F=1 falls back to dispatch + GEMM1: %s", "; ".join(reasons)
-    )
+    # S1F is on by default, so a config that does not fit is not a warning.
+    _log.info("S1F falls back to dispatch + GEMM1: %s", "; ".join(reasons))
 
 
 def tile_flag_nbytes(*, compact_rows: int, world_size: int) -> int:
@@ -195,7 +231,8 @@ class _Stage1Fusion:
         self.cu = 0
         self.tiles: set[int] = set()
         self.tile_cap = 0
-        self.g1_seen: dict = {}
+        # (align_m, quant_wmma_rep) of every step bound that runs the kernel.
+        self.launch_keys: set = set()
         self.step = None
         self.wire = None
         self.send_lists = ()
@@ -294,9 +331,7 @@ class _Stage1Fusion:
                 f"stage-1 tile {align_m} does not fit model_dim "
                 f"{self.d.config.hidden_dim} on {self.cu} CUs"
             )
-        elif (
-            int(align_m) > s1f_flag_m(align_m) and self.d.config.world_size > 4
-        ):
+        elif int(align_m) > s1f_flag_m(align_m) and self.d.config.world_size > 4:
             reasons.append(
                 f"step tile_m {align_m} with {self.d.config.world_size} ranks > 4"
             )
@@ -308,16 +343,39 @@ class _Stage1Fusion:
         """Whether the plan for ``align_m`` emits the stage-1 kernel's inputs."""
         return self.enabled and not self.tile_reasons(align_m)
 
-    def _g1_key(self):
-        step = self.d._step
-        return (int(step.align_m), int(step.recv_bound))
+    def step_reasons(self, step) -> list:
+        """Why ``step`` cannot run the stage-1 kernel, bias and activation aside.
 
-    def _gemm1_reasons(self) -> list:
-        reasons = self.tile_reasons(self.d._step.align_m)
-        seen = self.g1_seen.get(self._g1_key())
-        if seen is None:
-            return reasons + [_S1F_PROBING]
-        return reasons + list(seen)
+        GEMM1's tile_m is resolved with the step (``_compact_gemm_tiles``), so
+        the verdict is known before the step runs, captured or not.
+        """
+        reasons = self.tile_reasons(step.align_m)
+        if int(step.recv_bound) > self.max_recv():
+            reasons.append(f"recv_bound {int(step.recv_bound)} > {self.max_recv()}")
+        if int(step.g1_tile_m) != int(step.align_m):
+            reasons.append(f"GEMM1 tile_m {step.g1_tile_m} != {step.align_m}")
+        return reasons
+
+    def _recv_too_big(self) -> bool:
+        # The receive bound is identical on every rank.
+        step = getattr(self.d, "_step", None)
+        return step is not None and int(step.recv_bound) > self.max_recv()
+
+    def max_recv(self) -> int:
+        config = self.d.config
+        return s1f_max_recv(config.world_size, config.topk)
+
+    def step_off(self) -> bool:
+        """A step over ``max_recv()`` runs exactly the S1F=0 path.
+
+        Not only GEMM1: its compact plan keeps the S1F=0 key and width (one
+        kernel per alignment and slot, instead of one per launch width, block
+        count, tok_map and fused-quant choice). Before,
+        every new prefill width JIT-compiled a stage-1 plan inside the serving
+        loop (first ~100 s of a c512 run: 250-470 ms prefill steps), and the
+        wide stage-1 plan left the remaining prefill steps ~6% slower.
+        """
+        return self.enabled and self._recv_too_big()
 
     def eligible(self, bias1, bias2) -> bool:
         """Whether this step runs the stage-1 kernel (else: today's path)."""
@@ -338,7 +396,7 @@ class _Stage1Fusion:
         ):
             reasons.append("needs the fused GEMM1 requant epilogue")
         self.other_ok = not reasons
-        reasons += self._gemm1_reasons()
+        reasons += self.step_reasons(self.d._step)
         if reasons:
             _fallback_warn(self, reasons)
             return False
@@ -353,18 +411,7 @@ class _Stage1Fusion:
         """
         if not (self.enabled and self.other_ok):
             return False
-        seen = self.g1_seen.get(self._g1_key())
-        return (
-            seen is not None
-            and not seen
-            and not self.tile_reasons(self.d._step.align_m)
-        )
-
-    def should_probe(self) -> bool:
-        """The first step at this alignment records the real GEMM1 tile."""
-        if not self.enabled or torch.cuda.is_current_stream_capturing():
-            return False
-        return self.g1_seen.get(self._g1_key()) is None
+        return not self.step_reasons(self.d._step)
 
     def wants_fused_quant(self, run: bool) -> bool:
         """The plan can quantize only when it is launched with the hidden states."""
@@ -375,6 +422,7 @@ class _Stage1Fusion:
             and self.wire is not None
             and not d._plan_pending
             and self.plan_mode(d._step.align_m)
+            and not self.step_off()
         )
 
     def quantize(self, hidden, token_count: int, run: bool):
@@ -430,32 +478,6 @@ class _Stage1Fusion:
                 "AITER_MEGA_S1F: the GEMM1 launch never reached the stage-1 "
                 "hook, so this layer's rows were never dispatched"
             )
-
-    @staticmethod
-    def _mismatches(got: dict, align_m: int) -> tuple:
-        want = {"tile_m": int(align_m)}
-        return tuple(
-            f"GEMM1 {k} {got[k]} != {v}" for k, v in want.items() if got.get(k) != v
-        )
-
-    def probe(self, out, a, w, a_scales, w_scales, m_tile_map, **kw):
-        """Record this step's real GEMM1 configuration, then run it as usual."""
-        from aiter.ops.flydsl.grouped_gemm_mxfp4 import (
-            flydsl_grouped_gemm_a8w4_masked,
-        )
-
-        got = {
-            "tile_m": int(kw.get("tile_m", 64)),
-            "tile_n": int(kw.get("tile_n", 256)),
-            "tile_k": int(kw.get("tile_k", 256)),
-        }
-        mismatches = self._mismatches(got, self.d._step.align_m)
-        self.g1_seen[self._g1_key()] = mismatches
-        if mismatches:
-            _fallback_warn(self, list(mismatches))
-        return flydsl_grouped_gemm_a8w4_masked(
-            out, a, w, a_scales, w_scales, m_tile_map, **kw
-        )
 
     def _variant(self, tokens: int):
         from .s1f_stage1 import s1f_block_runs, s1f_producers
@@ -528,6 +550,14 @@ class _Stage1Fusion:
             self.launches[key] = launch
         return launch
 
+    @staticmethod
+    def _run(launch, args) -> None:
+        # Calling the @flyc.jit launcher rebuilds its cache key on every launch
+        # (~110 us/layer of host time in eager prefill). Its tensor arguments
+        # are layout-dynamic, so only their dtype and rank pick the artifact.
+        spec = tuple((a.dtype, a.dim()) for a in args if isinstance(a, torch.Tensor))
+        _run_compiled(launch, *args, specialization_key=spec)
+
     def _precompile(
         self,
         launch_args,
@@ -575,7 +605,7 @@ class _Stage1Fusion:
             )
             if id(launch) not in seen:
                 seen.add(id(launch))
-                launch(*launch_args(psum, send, runs, tsrc, 0))
+                self._run(launch, launch_args(psum, send, runs, tsrc, 0))
         torch.cuda.synchronize()
         d.res.arena._communicator.barrier()
 
@@ -624,8 +654,6 @@ class _Stage1Fusion:
         **_unused,
     ):
         """GEMM1 launch stand-in: runs this layer's dispatch and GEMM1."""
-        from aiter.ops.flydsl.kernels.tensor_shim import ptr_arg
-
         step = self.step
         if step is None:
             raise RuntimeError("AITER_MEGA_S1F: stage-1 hook called without a step")
@@ -656,7 +684,9 @@ class _Stage1Fusion:
         if bad or stage1_act not in (1, 2) or quant_scale is None:
             raise RuntimeError(
                 "AITER_MEGA_S1F: the stage-1 kernel embeds only its variants' "
-                f"GEMM1; mismatches (got, want): {bad}, stage1_act={stage1_act}"
+                f"GEMM1; mismatches (got, want): {bad}, stage1_act={stage1_act}. "
+                "A tile mismatch means _compact_gemm_tiles no longer resolves "
+                "the tiles fused_moe does"
             )
         tokens = int(step["token_count"])
         producers, block_runs = self._variant(tokens)
@@ -700,20 +730,27 @@ class _Stage1Fusion:
             "tdm_as_in_prologue": int(bool(tdm_as_in_prologue)),
             "iod_loc": int(loc_phase is not None),
         }
-        pkey = (align_m, int(stage1_act), int(quant_wmma_rep), *g1_opts.values())
-        if (
-            pkey not in self.precompiled
-            and not torch.cuda.is_current_stream_capturing()
+        # The first eager launch builds the launcher of every step bound that
+        # can run the kernel, so a bucket first seen in a graph capture does
+        # not JIT-compile there. The precompile launches are collective. A
+        # bound whose CSV row has other GEMM1 knobs builds on its first eager
+        # launch.
+        g1 = tuple(g1_opts.values())
+        keys = {(t, int(stage1_act), q, *g1) for t, q in self.launch_keys}
+        keys.add((align_m, int(stage1_act), int(quant_wmma_rep), *g1))
+        if not keys <= self.precompiled and (
+            not torch.cuda.is_current_stream_capturing()
         ):
-            self.precompiled.add(pkey)
-            self._precompile(
-                launch_args,
-                tile_m=align_m,
-                group_m=group_m,
-                stage1_act=int(stage1_act),
-                quant_wmma_rep=int(quant_wmma_rep),
-                **g1_opts,
-            )
+            for key in sorted(keys - self.precompiled):
+                self.precompiled.add(key)
+                self._precompile(
+                    launch_args,
+                    tile_m=key[0],
+                    group_m=group_m,
+                    stage1_act=key[1],
+                    quant_wmma_rep=key[2],
+                    **g1_opts,
+                )
         launch = self._launcher(
             tile_m=align_m,
             producers=producers,
@@ -723,8 +760,9 @@ class _Stage1Fusion:
             block_runs=block_runs,
             **g1_opts,
         )
-        launch(
-            *launch_args(
+        self._run(
+            launch,
+            launch_args(
                 m_tile_map, bufs["send_list"], bufs["runs"], bufs["tile_src"], tokens
-            )
+            ),
         )

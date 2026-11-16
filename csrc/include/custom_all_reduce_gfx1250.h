@@ -78,6 +78,24 @@ void fused_allreduce_rmsnorm_quant(fptr_t _fa,
                                    bool use_1stage,
                                    bool gemma_norm,
                                    int64_t bf16_out_ptr);
+// Lamport one-shot fused allreduce + residual + RMSNorm. all_ptrs are every
+// rank's buffer of lamport_ar_rms_buffer_size bytes, mapped here; max_bytes is
+// the largest input a call takes.
+int64_t lamport_ar_rms_buffer_size(int64_t world_size, int64_t max_bytes);
+void init_lamport_ar_rms(fptr_t _fa, const std::vector<int64_t>& all_ptrs, int64_t max_bytes);
+void fused_allreduce_rmsnorm_lamport(fptr_t _fa,
+                                     const aiter_tensor_t& inp,
+                                     const aiter_tensor_t& res_inp,
+                                     const aiter_tensor_t& res_out,
+                                     const aiter_tensor_t& out,
+                                     const aiter_tensor_t& w,
+                                     double eps,
+                                     bool gemma_norm);
+// Lamport one-shot all-reduce of inp + other on the init_lamport_ar_rms inbox.
+void allreduce_add_lamport(fptr_t _fa,
+                           const aiter_tensor_t& inp,
+                           const aiter_tensor_t& other,
+                           const aiter_tensor_t& out);
 void p2p_bw_test(fptr_t _fa,
                   const aiter_tensor_t& inp,
                   const aiter_tensor_t& out,
@@ -94,6 +112,7 @@ void reduce_scatter(fptr_t _fa,
                     int64_t reg_ptr, int64_t reg_bytes);
 void dispose(fptr_t _fa);
 int64_t meta_size(int64_t world_size);
+int64_t ll_ar_max_bytes(int64_t world_size);
 // register_input/output_buffer receive direct device pointers per rank.
 void register_input_buffer(fptr_t _fa,
                            int64_t self_ptr,

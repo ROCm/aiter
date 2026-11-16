@@ -650,6 +650,41 @@ def test_flydsl_decode_split_reuse():
     print("[flydsl_decode_split_reuse] PASS: eager, graph replay and streams")
 
 
+def test_flydsl_decode_gates():
+    """Each FlyDSL decode gate of this arch routes there and matches torch.topk.
+
+    Walks the gate table itself, at each gate's smallest width and its row
+    limit, so narrowing the sweep shapes cannot leave a gate untested.
+    """
+    arch = get_gfx()
+    if arch not in _FLYDSL_TOPK_DECODE_GATES or T._FLYDSL_TOPK_DECODE_DISABLED:
+        print("[flydsl_decode_gates] FlyDSL decode not served here; skipping")
+        return
+    torch.set_default_device("cuda:0")
+    for stable, gates in _FLYDSL_TOPK_DECODE_GATES[arch].items():
+        for min_width, max_width, num_rows in gates:
+            for k in T._FLYDSL_TOPK_DECODE_KS:
+                # At least 2k wide, so each row selects rather than copies.
+                width = max(min_width, 2 * k)
+                if max_width is not None and width > max_width:
+                    continue
+                seq_lens = torch.full((num_rows,), width, dtype=torch.int32)
+                row_starts = torch.zeros(num_rows, dtype=torch.int32)
+                logits = create_random_logits(row_starts, seq_lens, torch.float32, k)
+                indices = torch.empty((num_rows, k), dtype=torch.int32)
+                args = (logits, 1, seq_lens, indices, num_rows, width, 1)
+                what = f"stable={stable} width={width} rows={num_rows} k={k}"
+                assert T._should_use_flydsl_topk_decode(
+                    *args, k, stable
+                ), f"not routed to FlyDSL decode: {what}"
+                aiter.top_k_per_row_decode(*args, k=k, stable=stable)
+                ref = _decode_reference(logits, seq_lens, k)
+                assert compare_topk_results(
+                    logits, indices, ref, row_starts, seq_lens, k, stable=stable
+                ), f"flydsl decode gate mismatch: {what}"
+    print("[flydsl_decode_gates] PASS: every gate routes and matches torch.topk")
+
+
 def test_mb_workspace_reuse():
     """Regression for the persistent multi-block workspace + kernel self-reset.
 
@@ -1002,7 +1037,7 @@ parser.add_argument(
     "-c",
     "--context_len",
     type=int,
-    default=[8, 128, 1024, 3072, 4096, 8192, 16384, 32768, 65536, 90000, 128000],
+    default=[8, 4096, 32768, 90000],
     nargs="+",
     help="""number of kv.
     e.g.: -c 64""",
@@ -1012,7 +1047,7 @@ parser.add_argument(
     "-k",
     "--top_k",
     type=int,
-    default=[512, 1024, 2048],
+    default=[512, 2048],
     nargs="+",
     help="""top-k elements per row. The radix backend supports any positive
     int; the `_fast` ASM-kernel path only supports 2048 and is skipped
@@ -1045,7 +1080,7 @@ parser.add_argument(
     "-b",
     "--decode_batch_size",
     type=int,
-    default=[4, 8, 16, 24],
+    default=[4],
     nargs="+",
     help="""decode_batch_size batch size.
     e.g.: -b 4""",
@@ -1055,7 +1090,7 @@ parser.add_argument(
     "-n",
     "--next_n",
     type=int,
-    default=[1, 2, 3, 4],
+    default=[1, 4],
     nargs="+",
     help="""next_n elements per sequence in a row.
     e.g.: -n 4""",
@@ -1072,9 +1107,24 @@ parser.add_argument(
     e.g.: -d random""",
 )
 
+# CI runs `python3 <file>` with no arguments, so the defaults above stay small.
+_FULL_MATRIX = {
+    "context_len": [8, 128, 1024, 3072, 4096, 8192, 16384, 32768, 65536, 90000, 128000],
+    "top_k": [512, 1024, 2048],
+    "decode_batch_size": [4, 8, 16, 24],
+    "next_n": [1, 2, 3, 4],
+}
+
+parser.add_argument(
+    "--full",
+    action="store_true",
+    help="""run the full benchmark matrix; overrides -c, -k, -b and -n.""",
+)
+
 _REGRESSIONS = {
     "mb-workspace-reuse": test_mb_workspace_reuse,
     "flydsl-decode-split-reuse": test_flydsl_decode_split_reuse,
+    "flydsl-decode-gates": test_flydsl_decode_gates,
     "sampled-routing": test_prefill_sampled_routing,
     "sampled-layout": test_sampled_layout_contract,
     "sampled-nan": test_sampled_nan_order,
@@ -1092,6 +1142,8 @@ parser.add_argument(
 )
 
 args = parser.parse_args()
+if args.full:
+    vars(args).update(_FULL_MATRIX)
 
 # Regressions run in CI via `python3 <file>`.
 for name in args.regressions:

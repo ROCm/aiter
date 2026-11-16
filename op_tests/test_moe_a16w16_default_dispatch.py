@@ -1,15 +1,19 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
 
-"""Default-dispatch regressions for CK MoE.
+"""Default-dispatch regressions for CK MoE and a16w16 swiglu_limit.
 
 gfx942 A16W16 covers shards aligned to 64 but not 128 (for example 320).
 gfx950 fp8 stage2 covers shuffled inter_dim 384 (K=128) and 512 (K=256),
 rejects sizes that 128 does not divide, and rejects plain fp8 weights unless
 both w1 and w2 are shuffled. That rejection follows the live GPU, not
 GPU_ARCHS. gfx950 int8 uses that same stage2 K selection.
+
+A finite swiglu_limit on BF16 QuantType.No reroutes to FlyDSL a16wmix a16w16
+on gfx942/gfx950. Sentinels stay on CK.
 """
 
+import inspect
 import os
 import sys
 import tempfile
@@ -21,7 +25,14 @@ import torch.nn.functional as F
 import aiter.fused_moe as fused_moe_module
 from aiter import ActivationType, QuantType
 from aiter import dtypes as aiter_dtypes
-from aiter.fused_moe import fused_moe, get_2stage_cfgs, torch_moe
+from aiter.fused_moe import (
+    _can_reroute_bf16_to_a16wmix,
+    _flydsl_stage1_wrapper,
+    ck_moe_stage1,
+    fused_moe,
+    get_2stage_cfgs,
+    torch_moe,
+)
 from aiter.jit.utils.chip_info import get_gfx, get_gfx_runtime
 from aiter.ops.moe_op import ck_moe_stage2_fwd
 from aiter.ops.quant import pertoken_quant
@@ -448,3 +459,334 @@ def test_gfx950_stage2_selects_k_tile(inter_dim, block_m, quant_dtype):
             f"stage2 K={expected} marker {marker!r} missing from kernel trace: {snippet!r}"
         )
     assert other not in trace
+
+
+# ---------------------------------------------------------------------------
+# BF16 QuantType.No + finite swiglu_limit → FlyDSL a16wmix a16w16
+# ---------------------------------------------------------------------------
+
+_A16W16_S1 = "flydsl_moe1_abf16_wbf16_bf16_t16x128x128"
+_A16W16_S2 = "flydsl_moe2_abf16_wbf16_bf16_t16x128x128_atomic"
+_A16W16_ARCHS = ("gfx942", "gfx950")
+_SERVER = {"model_dim": 4096, "inter_dim": 512, "expert": 128, "topk": 8}
+
+
+def _patch_gfx(monkeypatch, gfx):
+    monkeypatch.setattr(fused_moe_module, "get_gfx", lambda: gfx)
+    monkeypatch.setattr(fused_moe_module, "get_gfx_runtime", lambda: gfx)
+
+
+def _a16w16_cfg_kwargs(
+    token=4,
+    *,
+    shuffled=True,
+    limit=7.0,
+    activation=ActivationType.Silu,
+):
+    return {
+        "token": token,
+        "model_dim": 256,
+        "inter_dim": 128,
+        "expert": 4,
+        "topk": 2,
+        "dtype": aiter_dtypes.bf16,
+        "q_dtype_a": aiter_dtypes.bf16,
+        "q_dtype_w": aiter_dtypes.bf16,
+        "q_type": QuantType.No,
+        "use_g1u1": True,
+        "activation": activation,
+        "doweight_stage1": False,
+        "hidden_pad": 0,
+        "intermediate_pad": 0,
+        "is_shuffled": shuffled,
+        "opus_weights_shuffled": shuffled,
+        "swiglu_limit": limit,
+    }
+
+
+def _reroute_base(**overrides):
+    base = {
+        "gfx": "gfx942",
+        "model_dim": 256,
+        "inter_dim": 128,
+        "dtype": aiter_dtypes.bf16,
+        "q_dtype_a": aiter_dtypes.bf16,
+        "q_dtype_w": aiter_dtypes.bf16,
+        "q_type": QuantType.No,
+        "activation": ActivationType.Silu,
+        "is_shuffled": True,
+        "use_g1u1": True,
+        "doweight_stage1": False,
+        "swiglu_limit": 7.0,
+        "has_stage1_bias": False,
+        "hidden_pad": 0,
+        "intermediate_pad": 0,
+    }
+    base.update(overrides)
+    return base
+
+
+def _stage1(metadata):
+    return getattr(metadata.stage1, "func", metadata.stage1)
+
+
+def _silu_hidden(gate, up, *, limit=None, symmetric=False):
+    if limit is not None:
+        if symmetric:
+            gate = gate.clamp(min=-limit, max=limit)
+        else:
+            gate = gate.clamp(max=limit)
+        up = up.clamp(min=-limit, max=limit)
+    return F.silu(gate) * up
+
+
+def _swiglu_hidden(gate, up, *, limit=None):
+    if limit is not None:
+        gate = gate.clamp(max=limit)
+        up = up.clamp(min=-limit, max=limit)
+    return gate * torch.sigmoid(1.702 * gate) * (up + 1.0)
+
+
+def _moe_ref(x, w1, w2, ids, weights, *, act, limit=None, symmetric=False):
+    tokens, model_dim = x.shape
+    expected = torch.zeros(tokens, model_dim, device=x.device, dtype=torch.float32)
+    for expert in range(w1.shape[0]):
+        rows, slots = torch.where(ids == expert)
+        if rows.numel() == 0:
+            continue
+        gate, up = F.linear(x[rows].float(), w1[expert].float()).chunk(2, dim=-1)
+        hidden = (
+            _silu_hidden(gate, up, limit=limit, symmetric=symmetric)
+            if act == "silu"
+            else _swiglu_hidden(gate, up, limit=limit)
+        )
+        y = F.linear(hidden, w2[expert].float())
+        expected.index_add_(0, rows, y * weights[rows, slots, None].float())
+    return expected
+
+
+def _run_fused(x, w1, w2, weights, ids, *, limit, activation):
+    return fused_moe(
+        x,
+        shuffle_weight(w1),
+        shuffle_weight(w2),
+        weights,
+        ids,
+        activation=activation,
+        quant_type=QuantType.No,
+        swiglu_limit=limit,
+    )
+
+
+def _bind_inputs(tokens, *, seed=0, limit=1.0):
+    torch.manual_seed(seed)
+    experts, model_dim, inter_dim, topk = 4, 256, 128, 2
+    x = torch.randn(tokens, model_dim, device="cuda", dtype=aiter_dtypes.bf16)
+    w1 = torch.randn(
+        experts, 2 * inter_dim, model_dim, device="cuda", dtype=aiter_dtypes.bf16
+    )
+    w2 = torch.randn(
+        experts, model_dim, inter_dim, device="cuda", dtype=aiter_dtypes.bf16
+    )
+    with torch.no_grad():
+        probe = F.linear(x[:1].float(), w1[0].float()).abs().max().item()
+        w1.mul_(max(4.0 * limit / max(probe, 1e-3), 1.0))
+    weights, ids = torch.softmax(
+        torch.randn(tokens, experts, device="cuda"), dim=-1
+    ).topk(topk, dim=-1)
+    return x, w1, w2, weights, ids.to(torch.int32)
+
+
+def test_a16w16_flydsl_names_are_bf16_only():
+    from aiter.ops.flydsl.moe_kernels import (
+        get_flydsl_kernel_params,
+        get_flydsl_stage1_kernels_a16w16,
+        get_flydsl_stage2_kernels_a16w16,
+    )
+
+    p1 = get_flydsl_kernel_params(_A16W16_S1)
+    p2 = get_flydsl_kernel_params(_A16W16_S2)
+    assert p1 is not None and p2 is not None
+    assert p1["a_dtype"] == "bf16" and p1["b_dtype"] == "bf16"
+    assert p2["mode"] == "atomic"
+    assert get_flydsl_kernel_params("flydsl_moe1_abf16_wbf16_f16_t16x128x128") is None
+    assert get_flydsl_stage1_kernels_a16w16("f16") == {}
+    assert get_flydsl_stage2_kernels_a16w16("f16") == {}
+
+
+def test_a16w16_force_reduce_stays_atomic(monkeypatch):
+    import functools
+
+    monkeypatch.setenv("AITER_FLYDSL_FORCE_REDUCE", "1")
+    stage2 = functools.partial(
+        fused_moe_module._flydsl_stage2_wrapper, kernelName=_A16W16_S2
+    )
+    assert not fused_moe_module._stage2_honors_runtime_reduce_override(stage2)
+    assert not fused_moe_module._stage2_runtime_uses_route_reduce(stage2, 4, 8192)
+
+
+@pytest.mark.parametrize("activation", [ActivationType.Silu, ActivationType.Swiglu])
+def test_a16w16_reroute_gates(activation):
+    base = _reroute_base(activation=activation)
+    assert _can_reroute_bf16_to_a16wmix(**base)
+    assert _can_reroute_bf16_to_a16wmix(**{**base, "gfx": "gfx950"})
+    for limit in (None, 0.0, float("inf")):
+        assert not _can_reroute_bf16_to_a16wmix(**{**base, "swiglu_limit": limit})
+    assert not _can_reroute_bf16_to_a16wmix(**{**base, "is_shuffled": False})
+    assert not _can_reroute_bf16_to_a16wmix(**{**base, "use_g1u1": False})
+    assert not _can_reroute_bf16_to_a16wmix(**{**base, "gfx": "gfx90a"})
+    assert not _can_reroute_bf16_to_a16wmix(**{**base, "gfx": "gfx1100"})
+
+
+@pytest.mark.parametrize("activation", [ActivationType.Silu, ActivationType.Swiglu])
+def test_a16w16_limit_selects_flydsl(monkeypatch, activation):
+    _patch_gfx(monkeypatch, "gfx942")
+    metadata = get_2stage_cfgs(**_a16w16_cfg_kwargs(activation=activation))
+    assert _stage1(metadata) is _flydsl_stage1_wrapper
+    assert metadata.stage1.keywords["kernelName"] == _A16W16_S1
+    assert metadata.stage2.keywords["kernelName"] == _A16W16_S2
+
+
+@pytest.mark.parametrize("limit", [None, 0.0, float("inf")])
+def test_a16w16_sentinels_stay_on_ck(monkeypatch, limit):
+    _patch_gfx(monkeypatch, "gfx942")
+    metadata = get_2stage_cfgs(**_a16w16_cfg_kwargs(limit=limit))
+    assert _stage1(metadata) is ck_moe_stage1
+    assert not metadata.run_1stage
+
+
+def test_a16w16_gfx90a_limit_stays_on_ck(monkeypatch):
+    _patch_gfx(monkeypatch, "gfx90a")
+    metadata = get_2stage_cfgs(**_a16w16_cfg_kwargs())
+    assert _stage1(metadata) is ck_moe_stage1
+
+
+def test_a16w16_aot_has_quanttype_no_recipe():
+    from aiter.aot.flydsl import moe as aot_moe
+
+    src = inspect.getsource(aot_moe._caller_inputs)
+    assert "QuantType.No" in src
+    assert "get_flydsl_stage1_kernels_a16w16" in src
+
+
+def test_a16w16_untuned_tile_follows_tokens(monkeypatch):
+    _patch_gfx(monkeypatch, "gfx942")
+    md16 = get_2stage_cfgs(**_a16w16_cfg_kwargs(token=4))
+    md32 = get_2stage_cfgs(**_a16w16_cfg_kwargs(token=2048))
+    assert md16.block_m == 16 and "t16x" in md16.stage1.keywords["kernelName"]
+    assert md32.block_m == 32 and "t32x" in md32.stage1.keywords["kernelName"]
+
+
+@pytest.mark.skipif(not _GFX942 and not _GFX950, reason="a16wmix a16w16 gfx942/950")
+@pytest.mark.parametrize(
+    "activation,act_name",
+    [(ActivationType.Silu, "silu"), (ActivationType.Swiglu, "swiglu")],
+)
+def test_a16w16_swiglu_limit_binds(activation, act_name):
+    limit = 1.0
+    x, w1, w2, weights, ids = _bind_inputs(4, limit=limit)
+    metadata = get_2stage_cfgs(
+        **_a16w16_cfg_kwargs(token=4, limit=limit, activation=activation)
+    )
+    assert _stage1(metadata) is _flydsl_stage1_wrapper
+    actual = _run_fused(x, w1, w2, weights, ids, limit=limit, activation=activation)
+    clamped = _moe_ref(x, w1, w2, ids, weights, act=act_name, limit=limit)
+    unclamped = _moe_ref(x, w1, w2, ids, weights, act=act_name, limit=None)
+    err_c = (actual.float() - clamped).abs().max().item()
+    err_u = (actual.float() - unclamped).abs().max().item()
+    assert err_c < err_u
+    huge = _run_fused(x, w1, w2, weights, ids, limit=1e9, activation=activation)
+    assert not torch.equal(actual, huge)
+
+
+@pytest.mark.skipif(not _GFX942 and not _GFX950, reason="a16wmix a16w16 gfx942/950")
+def test_a16w16_rejects_mismatched_block_size_m():
+    x, w1, w2, weights, ids = _bind_inputs(4, limit=1.0)
+    metadata = get_2stage_cfgs(
+        **_a16w16_cfg_kwargs(token=4, limit=1.0, activation=ActivationType.Silu)
+    )
+    assert metadata.block_m == 16
+    with pytest.raises(ValueError, match="block_size_M"):
+        fused_moe(
+            x,
+            shuffle_weight(w1),
+            shuffle_weight(w2),
+            weights,
+            ids,
+            activation=ActivationType.Silu,
+            quant_type=QuantType.No,
+            swiglu_limit=1.0,
+            block_size_M=32,
+        )
+
+
+@pytest.mark.skipif(not _GFX942 and not _GFX950, reason="a16wmix a16w16 gfx942/950")
+def test_a16w16_server_shape_clamp_binds():
+    limit = 7.0
+    hidden, inter, experts, topk = (
+        _SERVER[k] for k in ("model_dim", "inter_dim", "expert", "topk")
+    )
+    torch.manual_seed(20261016)
+    tokens = 32
+    x = torch.randn(tokens, hidden, device="cuda", dtype=aiter_dtypes.bf16)
+    w1 = (torch.randn(experts, 2 * inter, hidden, device="cuda") * 0.75).to(
+        aiter_dtypes.bf16
+    )
+    w2 = (torch.randn(experts, hidden, inter, device="cuda") / inter**0.5).to(
+        aiter_dtypes.bf16
+    )
+    weights, ids = torch.softmax(
+        torch.randn(tokens, experts, device="cuda"), dim=-1
+    ).topk(topk, dim=-1)
+    weights = weights / weights.sum(dim=-1, keepdim=True)
+    ids = ids.to(torch.int32)
+    metadata = get_2stage_cfgs(
+        **{**_a16w16_cfg_kwargs(token=tokens, limit=limit), **_SERVER}
+    )
+    assert metadata.stage1.keywords["kernelName"] == _A16W16_S1
+    actual = _run_fused(
+        x, w1, w2, weights, ids, limit=limit, activation=ActivationType.Silu
+    ).float()
+    loose = _run_fused(
+        x, w1, w2, weights, ids, limit=1e9, activation=ActivationType.Silu
+    ).float()
+    clamped = _moe_ref(x, w1, w2, ids, weights, act="silu", limit=limit)
+    unclamped = _moe_ref(x, w1, w2, ids, weights, act="silu", limit=None)
+    scale_c = clamped.abs().max().item()
+    err_c = (actual - clamped).abs().max().item()
+    err_u = (actual - unclamped).abs().max().item()
+    assert err_c <= 2e-2 * scale_c
+    assert err_u >= 10 * scale_c
+    assert not torch.equal(actual, loose)
+
+
+@pytest.mark.skipif(not _GFX942 and not _GFX950, reason="a16wmix a16w16 gfx942/950")
+def test_a16w16_server_shape_asymmetric_negative_gate():
+    limit = 1.0
+    hidden, inter, experts, topk = (
+        _SERVER[k] for k in ("model_dim", "inter_dim", "expert", "topk")
+    )
+    tokens = 32
+    w1 = torch.zeros(experts, 2 * inter, hidden, device="cuda", dtype=aiter_dtypes.bf16)
+    w2 = torch.zeros(experts, hidden, inter, device="cuda", dtype=aiter_dtypes.bf16)
+    w1[0, :inter, :] = -25.0 / hidden
+    w1[0, inter:, :] = 3.0 / hidden
+    w1[1, :inter, :] = 8.0 / hidden
+    w1[1, inter:, :] = 3.0 / hidden
+    w2[:2] = 1.0 / 64
+    x = torch.ones(tokens, hidden, device="cuda", dtype=aiter_dtypes.bf16)
+    ids = (
+        torch.arange(topk, device="cuda", dtype=torch.int32)
+        .unsqueeze(0)
+        .repeat(tokens, 1)
+    )
+    weights = torch.full((tokens, topk), 0.5, device="cuda")
+    actual = _run_fused(
+        x, w1, w2, weights, ids, limit=limit, activation=ActivationType.Silu
+    ).float()
+    asym = _moe_ref(x, w1, w2, ids, weights, act="silu", limit=limit)
+    sym = _moe_ref(x, w1, w2, ids, weights, act="silu", limit=limit, symmetric=True)
+    err_as = (actual - asym).abs().max().item()
+    err_sy = (actual - sym).abs().max().item()
+    assert err_as < 0.05
+    assert err_sy > 0.5

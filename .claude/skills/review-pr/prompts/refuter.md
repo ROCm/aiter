@@ -29,6 +29,13 @@ SURVIVED -- <what you opened>
 KILLED -- <what you opened>
 ```
 
+**A finding is a line starting with 🔴, ⚠️ or 📝 — nothing else is one.** The card's header
+block also carries status lines (`Review:`, `Validation:`, `Perf:`, `Size:`, `Design
+(advisory):`, `Human:`); they are not findings, take no verdict line, and are not yours to
+attack. The `Design (advisory)` and `Human:` lines report a routing decision that Step 8's
+`design` gate checks mechanically — whether the routed judgment is *right* is the routed
+human's, not yours.
+
 **Only these two verdicts** (from the text: `SURVIVED|KILLED`). `KILLED` means the finding comes off the card;
 use it only when you actually refute it. If you cannot refute it, it is `SURVIVED` — **even if you think it is overstated** —
 because severity is not yours to change; the card author sets it per SKILL.md.
@@ -43,6 +50,15 @@ Open each cited file:line and check it; look for a guard, call site, test or doc
 use the already-merged implementation in `merge-target/` to judge whether it is a **pre-existing repo convention** rather than a defect of this PR;
 check the time order of the PR base vs the relevant commits — "the author got it wrong" and "the PR is stale" are two different things;
 confirm the trigger condition is actually reachable.
+
+**FlyDSL facts that kill a finding.** Each of these produced wrong findings on aiter FlyDSL PRs; check the finding against them:
+- `flyc.compile(exe, *args)` with live args already launches once; a finding asking for an extra `cf(*args)` on that path is wrong (it would launch twice).
+- LDS capacity comes from `chip_info.get_lds_capacity_bytes()` (gfx950 is 160 KiB); `@fx.union` members alias, so recompute any LDS figure with every term.
+- `gpu.barrier()` / `s_barrier` are workgroup-scoped; a cross-workgroup deadlock needs a spin-wait on memory another workgroup writes. `mfma.call(..., set_prio=True)` emits an `s_barrier`.
+- `const_expr` / `range_constexpr` resolve at trace time; a tail covered by predication or a compile-time branch is handled.
+- A predicted lowering or compile failure on a path the PR's own tests run is refuted by those tests.
+- A proposed bound that rejects a legal call (empty shard, zero-length row, the caller's real transposed layout) is wrong.
+- Strides other than the unit-stride axis are runtime values; a padded-row view through a cached handle is correct.
 
 **Measure it for real when you can** — the box has MI300X (gfx942) GPUs. Running once beats reading ten times.
 

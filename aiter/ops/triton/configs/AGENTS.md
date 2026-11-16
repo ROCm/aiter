@@ -104,6 +104,7 @@ configs/gfx1250/96cu/gluon/moe/a8w4/DEFAULT.json
 | `utils/tuned_config_utils.py` | `get_tuned_kernel_config`, `autotune_configs` |
 | `utils/quant_config_utils.py` | `get_quant_config` (Gluon quant) |
 | `utils/normalization_config_utils.py` | `get_normalization_config` |
+| `utils/unified_attention_utils.py` | `get_unified_attention_config` (see [Unified attention](#unified-attention)) |
 
 Each function has one home. Do not add re-exports or forwarding wrappers.
 Attention and GMM kernels read their `DEFAULT.json` with
@@ -249,6 +250,60 @@ in lowercase (`mhc_fused_sinkhorn`).
   fallback to other families.
 
 `get_mhc_post_config(M, C)` reads `mhc_post/DEFAULT.json`.
+
+## PA decode
+
+`_get_dispatch_config(kv_dtype)` and `_get_launch_config(kernel, kv_blk_sz)`
+read `<arch>/triton/attention/pa_decode/DEFAULT.json`. Both return `None` when
+the arch has no file or no entry. `launch` has no built-in values in Python:
+an arch that runs the GQA decode kernel needs the `v1_w_dot` entry.
+
+| Table | Key | Meaning |
+| ----- | --- | ------- |
+| `dispatch.<bf16 or fp16>` | `v1_max_partitions` | Use the v1 kernel up to this number of 1024-token partitions. |
+| | `v1_min_programs`, `v1_busy_max_partitions` | With this many programs (batch x KV heads), v1 is also allowed up to the second value. |
+| | `split_target_programs` | Aim for this many programs when the GQA kernel splits a sequence. |
+| | `split_sizes` | Partition sizes to try, in tokens. A size must be a multiple of the page size. 1024 means do not split. |
+| | `split_max_partitions` | Largest number of partitions for one sequence. |
+| | `split_max_programs` | A grid with this many programs or more is not split. |
+| | `split_short_seq`, `split_short_min_programs` | A sequence shorter than the first value on a grid with at least the second value is not split. |
+| | `tdm_num_warps` | gfx1250 only. A call with unit K/V scales, no ALiBi, page 128, head size 56, 64 or 128 and a group of at most 16 runs the Gluon TDM kernel with this many warps, one of 1, 2, 4 or 8. `null` or no key turns it off. |
+| | `tdm_split_target_programs`, `tdm_split_sizes`, `tdm_split_max_partitions` | The Gluon kernel cuts a sequence into partitions when the grid has fewer programs than the first value. It takes the largest size in the list (tokens, a multiple of 128) that reaches the target within the partition cap, else the smallest size. Partials go through the v2 reduce kernel. `null` or no key keeps sequences whole. |
+| `launch.<v1_w_dot, v2_w_dot, v1_wo_dot or v2_wo_dot>` | `BLK_LEQ_<x>`, `any` | `num_warps`, `num_stages` and `waves_per_eu` for page sizes up to `<x>`, else `any`. `w_dot` kernels run GQA, `wo_dot` kernels run MHA. |
+
+- A `split_*` key is optional. Without `split_target_programs` the kernel does
+  not split.
+- A part with another CU count has its own tree, `gfx1250/96cu/` for a 96-CU
+  part (see [CU trees](#cu-trees)). The tree is read whole, so it repeats every
+  key of the plain `DEFAULT.json` and changes only the ones that differ.
+- Do not set `num_stages` to 3 or more on gfx1250. It can hang the GPU.
+- Keep `num_stages` at 1 in the gfx1250 PA decode `launch` table. A value of 2
+  gave a GPU memory fault in the page-16 GQA kernels on a 96-CU (DPX) part.
+
+## Unified attention
+
+`get_unified_attention_config(op, params, backend)` in
+`utils/unified_attention_utils.py` reads
+`<arch>/<backend>/attention/unified_attention/DEFAULT.json`. The file has one
+table for each op (`attn_2d`, `attn_3d`, `reduce`, `kv_split`) and a
+`"schema"` that gives the axes of each table, in order.
+
+- A key has only the axes that it needs, joined by `.`, for example
+  `D_LEQ_128.Q_LEQ_1.DT_fp8_fp8`. Each table has an `"any"` entry.
+- The loader tries the axes in the `"schema"` order, so the leftmost axis
+  has the highest precedence. On a number axis it tries `EQ`, then `LEQ`
+  bounds from low to high, then `GEQ` bounds from high to low, then `any`.
+- The dtype axis is `DT_<q>_<k>`: the query dtype, then the K cache dtype.
+  The tags are `bf16` (also for fp16), `fp8` and `nvfp4`.
+- A V cache with a dtype that is not the K cache dtype (A8K4V8: NVFP4 K,
+  fp8 V) has a three-dtype key, `DT_<q>_<k>_<v>`, for example
+  `DT_fp8_nvfp4_fp8`.
+- The dtype fallback order is: `DT_<q>_<k>_<v>` (only when the V dtype is
+  not the K dtype), `DT_<q>_<k>`, `DT_<q>_any`, `DT_any_<k>`, `any`. So an
+  A8K4V8 call without a `DT_fp8_nvfp4_fp8` entry uses the A8W4
+  `DT_fp8_nvfp4` entry.
+- Do not use `any` in a three-dtype key. Do not write a three-dtype key with
+  the same V and K tags: the loader never tries it.
 
 ## Autotune
 

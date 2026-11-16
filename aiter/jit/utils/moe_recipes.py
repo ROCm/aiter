@@ -16,6 +16,8 @@ _DTYPE_MAP = {
 }
 
 _QUANT_ALIAS = {"per_128x128": "per_1x128"}
+# Bump when the MoeKernel launch signature changes.
+MOE_MODULE_ABI_TAG = "abi2"
 
 
 def _build_moe_variant(
@@ -28,9 +30,11 @@ def _build_moe_variant(
     mul_routed_weight_stage: int,
     preshuffle_mode: bool,
     is_splitk: bool,
+    runtime_swiglu_limit: bool = False,
 ) -> tuple[str, list]:
     parts = [
         "module_moe_ck2stages",
+        MOE_MODULE_ABI_TAG,
         a_dtype,
         b_dtype,
         "preshuffle_on" if preshuffle_mode else "preshuffle_off",
@@ -41,12 +45,16 @@ def _build_moe_variant(
     ]
     if is_splitk:
         parts.append("splitk")
+    if runtime_swiglu_limit:
+        parts.append("runtime_swiglu_limit")
 
     flags = ""
     if preshuffle_mode and b_dtype == "fp4x2":
         flags += " --preshuffle"
     if is_splitk:
         flags += " --issplitk"
+    if runtime_swiglu_limit:
+        flags += " --runtime-swiglu-limit"
 
     md_name = "_".join(parts)
     blob_gen_cmd = [
@@ -105,6 +113,10 @@ def _should_include_splitk(row: dict, quant_type: str) -> bool:
         return False
 
 
+def _has_runtime_swiglu_limit(row: dict) -> bool:
+    return "swiglu_limit=" in str(row.get("_tag") or "")
+
+
 def _get_mul_weight_stage(row: dict) -> int:
     value = row.get("doweight_stage1")
     if not value:
@@ -127,6 +139,13 @@ def _get_tuned_fmoe_rows() -> list[dict]:
     tuned_paths.extend(
         p
         for p in sorted(model_configs_dir.glob("*tuned_fmoe*.csv"))
+        if "untuned" not in p.name
+    )
+    # Rows tuned with --swiglu_limit form their own family.
+    tuned_paths.append(configs_dir / "tuned_swiglu_limit_fmoe.csv")
+    tuned_paths.extend(
+        p
+        for p in sorted(model_configs_dir.glob("*tuned_swiglu_limit_fmoe*.csv"))
         if "untuned" not in p.name
     )
 
@@ -155,6 +174,13 @@ def get_moe_ck2stages_prebuild_variants(aiter_csrc_dir: str) -> list[dict]:
         activation = _normalize_activation(row["act_type"])
         mul_weight_stage = _get_mul_weight_stage(row)
         need_splitk = _should_include_splitk(row, quant_type)
+        runtime_swiglu_limit = (
+            _has_runtime_swiglu_limit(row)
+            and activation == "silu"
+            and quant_type == "per_1x128"
+            and a_dtype == "f8"
+            and b_dtype == "f8"
+        )
 
         if activation in ("swiglu", "situv2"):
             # Swiglu / SiTUv2 MXFP4 MoE are owned by FlyDSL; CK 2stages codegen
@@ -168,29 +194,35 @@ def get_moe_ck2stages_prebuild_variants(aiter_csrc_dir: str) -> list[dict]:
 
         for preshuffle in _infer_preshuffle_modes(b_dtype, quant_type):
             for splitk in [False, True] if need_splitk else [False]:
-                key = (
-                    a_dtype,
-                    b_dtype,
-                    c_dtype,
-                    quant_type,
-                    activation,
-                    mul_weight_stage,
-                    preshuffle,
-                    splitk,
+                runtime_limit_variants = (
+                    (False, True) if runtime_swiglu_limit and not splitk else (False,)
                 )
-                if key in seen:
-                    continue
-                seen.add(key)
-                md_name, blob_gen_cmd = _build_moe_variant(
-                    aiter_csrc_dir=aiter_csrc_dir,
-                    a_dtype=a_dtype,
-                    b_dtype=b_dtype,
-                    c_dtype=c_dtype,
-                    activation=activation,
-                    quant_type=quant_type,
-                    mul_routed_weight_stage=mul_weight_stage,
-                    preshuffle_mode=preshuffle,
-                    is_splitk=splitk,
-                )
-                results.append({"md_name": md_name, "blob_gen_cmd": blob_gen_cmd})
+                for enable_runtime_limit in runtime_limit_variants:
+                    key = (
+                        a_dtype,
+                        b_dtype,
+                        c_dtype,
+                        quant_type,
+                        activation,
+                        mul_weight_stage,
+                        preshuffle,
+                        splitk,
+                        enable_runtime_limit,
+                    )
+                    if key in seen:
+                        continue
+                    seen.add(key)
+                    md_name, blob_gen_cmd = _build_moe_variant(
+                        aiter_csrc_dir=aiter_csrc_dir,
+                        a_dtype=a_dtype,
+                        b_dtype=b_dtype,
+                        c_dtype=c_dtype,
+                        activation=activation,
+                        quant_type=quant_type,
+                        mul_routed_weight_stage=mul_weight_stage,
+                        preshuffle_mode=preshuffle,
+                        is_splitk=splitk,
+                        runtime_swiglu_limit=enable_runtime_limit,
+                    )
+                    results.append({"md_name": md_name, "blob_gen_cmd": blob_gen_cmd})
     return results

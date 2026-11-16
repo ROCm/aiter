@@ -154,7 +154,7 @@ inline __device__ bool opus_moe_stage2_a8w4_decode_load_route_metadata(
         int32_t a_base = 0;
         int32_t route_row = -1;
         float weight = 0.0f;
-        if(row < sorted_rows)
+        if(local_m < T::ROUTE_M_STRIDE && row < sorted_rows)
         {
             const int32_t packed = kargs.sorted_token_ids[row];
             const int token = opus_moe_token_id(packed);
@@ -183,7 +183,7 @@ inline __device__ bool opus_moe_stage2_a8w4_decode_load_route_metadata(
     }
     if constexpr(T::DIRECT_ATOMIC_OUT)
     {
-        if(route_base + T::B_M <= sorted_rows)
+        if(route_base + T::ROUTE_M_STRIDE <= sorted_rows)
         {
             __syncthreads();
             return true;
@@ -195,7 +195,7 @@ inline __device__ bool opus_moe_stage2_a8w4_decode_load_route_metadata(
         if constexpr(T::IS_BM32_BN256 || T::IS_BM64_BN256)
         {
             // Full sorted tiles do not need a route-count reduction.
-            if(route_base + T::B_M <= sorted_rows)
+            if(route_base + T::ROUTE_M_STRIDE <= sorted_rows)
             {
                 __syncthreads();
                 return true;
