@@ -59,20 +59,27 @@ def run_benchmark(args):
         ]
     ]
     if args.long_kv_cases:
+        # Rows around the eight-row gate, then prefill chunks of 1 and 4 requests.
         x_vals_list = [
-            [1, rows, keys, 32, 128, clean]
-            for rows, keys, clean in (
-                (8, 4095, 0),
-                (8, 4096, 0),
-                (8, 4097, 0),
-                (9, 4097, 0),
-                (24, 4223, 0),
-                (64, 573440, 0),
-                (1856, 116480, 0),
-                (4096, 8192, 0),
-                (4098, 8192, 0),
-                (4104, 8192, 0),
-                (8, 4097, 1),
+            [batch, rows, keys, 32, 128, clean, args.layout]
+            for batch, rows, keys, clean in (
+                (1, 8, 4095, 0),
+                (1, 8, 4096, 0),
+                (1, 8, 4097, 0),
+                (1, 9, 4097, 0),
+                (1, 24, 4223, 0),
+                (1, 64, 573440, 0),
+                (1, 1856, 116480, 0),
+                (1, 4096, 8192, 0),
+                (1, 4098, 8192, 0),
+                (1, 4104, 8192, 0),
+                (1, 8, 4097, 1),
+                (1, 4096, 32768, 0),
+                (1, 2048, 65536, 0),
+                (1, 1024, 131072, 0),
+                (4, 1024, 8192, 0),
+                (4, 1022, 8192, 0),
+                (4, 256, 32768, 0),
             )
         ]
     if args.metric == "time":
@@ -199,7 +206,8 @@ def main():
     parser.add_argument(
         "--long_kv_cases",
         action="store_true",
-        help="Benchmark long-KV row groups and fallback boundaries at H32/D128",
+        help="Benchmark H32/D128 long-KV shapes: eight-row gate boundaries and "
+        "prefill chunks. Uses --layout and ignores the other shape options",
     )
     parser.add_argument(
         "-o", action="store_true", help="Write performance results to CSV file"
