@@ -1357,9 +1357,15 @@ def test_adaptive_control_concurrent_replays(card):
 
     def check(cases, what):
         torch.cuda.synchronize()
-        for logits, _, out in cases:
-            want = logits.topk(top_k, dim=-1)[1].sort(dim=-1)[0]
-            assert torch.equal(out.long().sort(dim=-1)[0], want), what
+        for logits, seq_lens, out in cases:
+            assert compare_topk_results(
+                logits,
+                out.long(),
+                logits.topk(top_k, dim=-1)[1],
+                torch.zeros_like(seq_lens),
+                seq_lens,
+                top_k,
+            ), what
 
     def capture(stream, cases):
         graph = torch.cuda.CUDAGraph()
@@ -1684,9 +1690,18 @@ def test_decode_validated_once(card):
         topk.top_k_per_row_decode(*call, max_row_len=width)
         torch.cuda.synchronize()
         assert validate.call_count == 0, "the public call checked its tensors again"
-        got = indices.long() if stable else indices.long().sort(dim=-1).values
-        want = stable_reference(logits, top_k)
-        assert torch.equal(got, want), "public adaptive call mismatch"
+        if stable:
+            ok = torch.equal(indices.long(), stable_reference(logits, top_k))
+        else:
+            ok = compare_topk_results(
+                logits,
+                indices.long(),
+                logits.topk(top_k, dim=-1)[1],
+                torch.zeros_like(seq_lens),
+                seq_lens,
+                top_k,
+            )
+        assert ok, "public adaptive call mismatch"
         host._decode_with_backend(*call, topk.BACKEND_ADAPTIVE, width)
         assert validate.call_count == 1, "a direct call skipped its tensor check"
     wide = torch.empty(rows, top_k, dtype=torch.int64, device="cuda")
