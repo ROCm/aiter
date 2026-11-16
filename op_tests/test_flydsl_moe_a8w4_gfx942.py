@@ -36,20 +36,21 @@ from aiter.fused_moe import (
     torch_moe_stage2,
 )
 from aiter.jit.utils.chip_info import get_gfx
-from aiter.ops.flydsl.kernels.moe_2stage_a16wmix.gemm1_a8w4_gfx942 import (
-    flydsl_a8w4_gemm1_gfx942,
-    mxfp8_quant_a8w4_gfx942_ref,
-    shuffle_scale_a8w4_gfx942,
-    shuffle_weight_a8w4_gfx942,
-)
+from aiter.ops.flydsl.kernels.moe_2stage_a16wmix import flydsl_a8w4_gemm1_gfx942
 from aiter.ops.flydsl.moe_common import GateMode
 from aiter.ops.flydsl.moe_kernels import (
     a8w4_gfx942_supported,
     get_flydsl_kernel_params,
     is_a8w4_gfx942_kernel,
 )
-from aiter.ops.shuffle import shuffle_scale_a16w4, shuffle_weight_a16w4
+from aiter.ops.shuffle import (
+    shuffle_scale_a8w4_gfx942,
+    shuffle_scale_a16w4,
+    shuffle_weight_a8w4_gfx942,
+    shuffle_weight_a16w4,
+)
 from aiter.test_common import benchmark, checkAllclose, run_perftest
+from aiter.utility.fp4_utils import gfx942_mxfp8_block_exponent
 
 torch.set_default_device("cuda")
 
@@ -59,13 +60,18 @@ BETA, LINEAR_BETA = 4.0, 25.0  # Kimi-K3 SiTUv2
 
 
 def mxfp8_quant(x):
-    """x quantised to MXFP8 E4M3FNUZ in natural K order: ([M, K] fp8, [M, K / 32] e8m0),
-    the form a pre-quantised caller (e.g. an MXFP8 dispatch) passes as x + a1_scale."""
+    """Torch MXFP8 quantiser with the kernels' exponent rule: x [M, K] ->
+    (E4M3FNUZ [M, K] in natural K order, E8M0 [M, K / 32]), the form a pre-quantised
+    caller (e.g. an MXFP8 dispatch) passes as x + a1_scale. One power-of-two scale per
+    32 values with amax / scale <= 240. Not aiter's dynamic_mxfp8_quant, which derives
+    the scale for E4M3FN (max 448) and clips ~12 % of the values for E4M3FNUZ."""
     M, K = x.shape
-    q, e8m0 = mxfp8_quant_a8w4_gfx942_ref(x)
-    # undo the a8w4 byte order (0,2,4,6,1,3,5,7) within each 8
-    q = q.view(torch.float8_e4m3fnuz).view(M, K // 8, 2, 4).transpose(-1, -2)
-    return q.reshape(M, K).contiguous(), e8m0.view(dtypes.fp8_e8m0)
+    xb = x.float().view(M, K // 32, 32)
+    e = gfx942_mxfp8_block_exponent(xb.abs().amax(-1, keepdim=True))
+    q = (xb * torch.exp2(-e.float())).to(torch.float8_e4m3fnuz).view(M, K)
+    return q.contiguous(), (e + 127).to(torch.uint8).view(M, K // 32).view(
+        dtypes.fp8_e8m0
+    )
 
 
 def mxfp8_round(x):

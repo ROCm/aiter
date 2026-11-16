@@ -25,11 +25,14 @@ from flydsl.runtime.device import get_rocm_arch
 from aiter.ops.flydsl.kernels.tensor_shim import _run_compiled
 
 from .gemm1 import compile_gemm1_a16w4_port, gemm1_a16w4_grid
+from .gemm1_a8w4_gfx942 import compile_gemm1_a8w4_gfx942, flydsl_a8w4_gemm1_gfx942
 from .gemm2 import compile_gemm2_a16w4_port, gemm2_a16w4_grid
 
 __all__ = [
+    "compile_gemm1_a8w4_gfx942",
     "compile_gemm1_a16w4_port",
     "compile_gemm2_a16w4_port",
+    "flydsl_a8w4_gemm1_gfx942",
     "flydsl_a16w4_gemm1",
     "flydsl_a16w4_gemm2",
     "flydsl_a16w4_moe",

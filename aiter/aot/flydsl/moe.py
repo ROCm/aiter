@@ -352,7 +352,7 @@ def _caller_inputs(job: dict) -> dict:
             w2 = shuffle_weight_a16w4(w2, 16, False)
             w2_scale = shuffle_scale_a16w4(w2_scale, experts, False)
             if a8w4_gfx942:
-                from aiter.ops.flydsl.kernels.moe_2stage_a16wmix.gemm1_a8w4_gfx942 import (
+                from aiter.ops.shuffle import (
                     shuffle_scale_a8w4_gfx942,
                     shuffle_weight_a8w4_gfx942,
                 )

@@ -1895,7 +1895,7 @@ def _flydsl_moe_stage1_impl(
                     "(in_dtype='a8w4_gfx942'), got a kernel for another arch"
                 )
         else:
-            from aiter.ops.flydsl.kernels.moe_2stage_a16wmix.gemm1_a8w4_gfx942 import (
+            from aiter.ops.flydsl.kernels.moe_2stage_a16wmix import (
                 flydsl_a8w4_gemm1_gfx942,
             )
 

@@ -358,7 +358,7 @@ def _gemm1_body_a8w4(
                 amax = fx.maxnumf(amax, fmath.absf(xv))
             amax = fx.maxnumf(amax, dpp_xor_f32(amax, 1))
             amax = fx.maxnumf(amax, dpp_xor_f32(amax, 2))
-            # _mxfp8_exponent on the float bits: E - 7, +1 if the mantissa > 1.875
+            # fp4_utils.gfx942_mxfp8_block_exponent on the float bits: E - 7, +1 if the mantissa > 1.875
             bits = amax.bitcast(fx.Int32)
             ex = ((bits >> fx.Int32(23)) & fx.Int32(0xFF)) - fx.Int32(134)
             ex = ex + ((bits & fx.Int32(0x7FFFFF)) > fx.Int32(0x700000)).select(
@@ -716,78 +716,6 @@ def _gemm1_body_a8w4(
                     out_idx.ir_value(),
                     mask=valid,
                 )
-
-
-def _mxfp8_exponent(amax):
-    """Shared-exponent rule: the smallest e with amax / 2**e <= 240 (E4M3FNUZ max).
-
-    With amax = (1 + f) * 2**E this is E - 7, or E - 6 when 1 + f > 1.875, i.e.
-    ceil(log2(amax / 240)) computed on the float bits. Bitwise equal to aiter's
-    gfx942 ``fused_dynamic_mxfp8_quant_moe_sort`` (checked incl. amax = 1.875 * 2**E,
-    zero and -0 blocks), the in-kernel quant of the ``_qi`` kernels and the vLLM
-    accuracy plugin.
-    Clamped to the E8M0 range.
-    """
-    bits = amax.float().view(torch.int32)
-    e = ((bits >> 23) & 0xFF) - 127 - 7 + ((bits & 0x7FFFFF) > 0x700000).to(torch.int32)
-    return e.clamp(-127, 127)
-
-
-def mxfp8_quant_a8w4_gfx942_ref(x):
-    """Torch MXFP8 quantiser with the kernels' exponent rule (:func:`_mxfp8_exponent`).
-
-    bf16 ``[M, K]`` -> (E4M3FNUZ ``[M, K]`` in ``A8W4_K8_ORDER``, E8M0 ``[M, K/32]``).
-    Per-1x32 power-of-two scale with ``amax / scale <= 240``. Not aiter's
-    ``dynamic_mxfp8_quant``: that derives the scale for E4M3FN (max 448) and clips
-    ~12 % of the values when asked for E4M3FNUZ. Used by the op test's reference.
-    """
-    M, K = x.shape
-    xb = x.float().view(M, K // 32, 32)
-    e = _mxfp8_exponent(xb.abs().amax(-1, keepdim=True))
-    q = (xb * torch.exp2(-e.float())).to(torch.float8_e4m3fnuz).view(M, K // 8, 8)
-    q = q[..., list(A8W4_K8_ORDER)].reshape(M, K).contiguous()
-    return q, (e + 127).to(torch.uint8).view(M, K // 32).contiguous()
-
-
-def _mark_a8w4_gfx942(out_u8, src):
-    """`out_u8` viewed as `src` (dtype, shape), tagged ``a8w4_gfx942_layout = True``.
-
-    The relayout keeps shape and dtype, so the tag is the only way to tell it from the
-    a16w4 preshuffle; fused_moe checks it against the stage-1 kernel. Like
-    ``is_shuffled`` (carried over from `src`) it is a Python attribute of this tensor
-    object: views, copies and ``nn.Parameter`` wrapping drop it, so a caller that wraps
-    the result must set it on the final tensor again.
-    """
-    out = out_u8.view(src.dtype).view(src.shape)
-    out.a8w4_gfx942_layout = True
-    out.is_shuffled = getattr(src, "is_shuffled", False)
-    return out
-
-
-def shuffle_weight_a8w4_gfx942(w_a16w4_u8):
-    """Relayout a16w4-preshuffled MXFP4 W (``shuffle_weight_a16w4(w, 16, False)``).
-
-    In each 1 KB chunk (16 N rows x 128 K) the a16w4 order is [klane j][nlane][dword g]
-    (klane j = MX block j, dword g = its K [g*8, +8)). This writes [g][nlane][j], so a
-    lane of group g loads part g of all four blocks with the same dwordx4 address.
-    """
-    w = w_a16w4_u8.view(torch.uint8)
-    assert w.numel() % 1024 == 0, "W bytes must be a multiple of 1 KB"
-    out = w.reshape(-1, 4, 16, 4, 4).permute(0, 3, 2, 1, 4).contiguous()
-    return _mark_a8w4_gfx942(out, w_a16w4_u8)
-
-
-def shuffle_scale_a8w4_gfx942(s_a16w4_u8):
-    """Relayout a16w4-preshuffled E8M0 W scales (``shuffle_scale_a16w4(s, E, False)``).
-
-    Per 256 B chunk (32 N x 256 K) a16w4 holds dwords [klane 4][nlane 16] with bytes
-    [kpack_sub 2][npack 2]; this writes dwords [kpack_sub][npack][nlane] with bytes
-    [klane], i.e. one dword = the 4 block scales of one column and one 128-wide K group.
-    """
-    s = s_a16w4_u8.view(torch.uint8)
-    assert s.numel() % 256 == 0, "scale bytes must be a multiple of 256"
-    out = s.reshape(-1, 4, 16, 2, 2).permute(0, 3, 4, 2, 1).contiguous()
-    return _mark_a8w4_gfx942(out, s_a16w4_u8)
 
 
 @functools.cache

@@ -59,11 +59,6 @@ from aiter.jit.core import (
     get_asm_dir,
 )
 from aiter.jit.utils.chip_info import get_gfx, get_gfx_runtime, gfx_from_cu_num
-from aiter.ops.flydsl.kernels.moe_2stage_a16wmix.gemm1_a8w4_gfx942 import (
-    _mxfp8_exponent,
-    shuffle_scale_a8w4_gfx942,
-    shuffle_weight_a8w4_gfx942,
-)
 from aiter.ops.flydsl.moe_common import (
     DEFAULT_SITUV2_BETA,
     DEFAULT_SITUV2_LINEAR_BETA,
@@ -99,15 +94,17 @@ from aiter.ops.quant import (
 from aiter.ops.shuffle import (
     pack_int8_to_packed_int4,
     shuffle_scale,
+    shuffle_scale_a8w4_gfx942,
     shuffle_scale_a16w4,
     shuffle_scale_for_int4,
     shuffle_weight,
+    shuffle_weight_a8w4_gfx942,
     shuffle_weight_a16w4,
 )
 from aiter.utility import fp4_utils
 from aiter.utility.base_tuner import TunerCommon
 from aiter.utility.dtypes import str2ActivationType, str2Dtype
-from aiter.utility.fp4_utils import moe_mxfp4_sort
+from aiter.utility.fp4_utils import gfx942_mxfp8_block_exponent, moe_mxfp4_sort
 from aiter.utility.mp_tuner import _is_accelerator_error, mp_tuner
 from csrc.ck_gemm_moe_2stages_codegen.mxfp4_staged_search import (
     DEFAULT_SCREEN_TOPK,
@@ -2233,7 +2230,7 @@ class FmoeTuner(TunerCommon):
                     num_experts_upper_bound=expert,
                 )
                 xb = input.float().view(token, model_dim // 32, 32)
-                e = _mxfp8_exponent(xb.abs().amax(-1, keepdim=True)).float()
+                e = gfx942_mxfp8_block_exponent(xb.abs().amax(-1, keepdim=True)).float()
                 a1_qt_mxfp8_deq = (
                     ((xb * torch.exp2(-e)).to(dtypes.fp8).float() * torch.exp2(e))
                     .view(token, model_dim)
