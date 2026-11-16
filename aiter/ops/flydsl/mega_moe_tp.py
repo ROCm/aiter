@@ -84,6 +84,7 @@ from .kernels.mega_moe_tp.mega_moe_tp_config import PAD
 ERR_BIGM = 32
 
 __all__ = [
+    "shuffle_weight_mega_fp8",
     "COMM_MODES",
     "ERR_BIGM",
     "MegaMoeTP",
@@ -93,6 +94,19 @@ __all__ = [
 ]
 
 _ACTS = (ActivationType.Silu, ActivationType.Swiglu, ActivationType.Situv2)
+
+
+def shuffle_weight_mega_fp8(w: torch.Tensor) -> torch.Tensor:
+    """An MXFP8 (e4m3) weight [N, K] (N % 16 == 0, K % 128 == 0) in the order the fused
+    kernel's MXFP8 B loaders take: [N / 16][K / 128][half][lane][16 B], lane = 16 q + r
+    holding row r's K bytes 64 half + 16 q .. + 16 of the k-step (the fp8 MFMA operand: a
+    lane's 8 dwords are K 16 q .. + 16 and 64 + 16 q .. + 16). The scales:
+    fp4_utils.e8m0_shuffle of [N, K / 32], as MXFP4's."""
+    N, K = w.shape[-2:]
+    if N % 16 or K % 128:
+        raise ValueError(f"shuffle_weight_mega_fp8: need N % 16 == 0, K % 128 == 0: {N} {K}")
+    u = w.reshape(-1, N, K).view(torch.uint8).view(-1, N // 16, 16, K // 128, 2, 4, 16)
+    return u.permute(0, 1, 3, 4, 5, 2, 6).contiguous().view(w.shape).view(w.dtype)
 
 
 def mega_moe_tp_supported(gfx: str | None = None) -> bool:
@@ -158,7 +172,19 @@ class MegaMoeTP:
         w2_scale: torch.Tensor,
         group=None,
         device: torch.device | None = None,
+        w1_shared: torch.Tensor | None = None,
+        w1_shared_scale: torch.Tensor | None = None,
+        w2_shared: torch.Tensor | None = None,
+        w2_shared_scale: torch.Tensor | None = None,
     ):
+        """w1_shared ... : the shared expert (the last one, cfg.experts - 1) as MXFP8
+        (shuffle_weight_mega_fp8 + e8m0_shuffle) while the routed ones (w1 / w2: experts - 1
+        of them) are MXFP4; else every expert is MXFP4 in w1 / w2."""
+        shared = (w1_shared, w1_shared_scale, w2_shared, w2_shared_scale)
+        if any(t is not None for t in shared) and any(t is None for t in shared):
+            raise ValueError("MegaMoeTP: the shared expert's four MXFP8 tensors, or none")
+        shared = None if w1_shared is None else shared
+        self.shared = shared
         if cfg.activation not in _ACTS:
             raise ValueError(f"MegaMoeTP: unsupported activation {cfg.activation}")
         if not mega_moe_tp_supported():
@@ -243,6 +269,7 @@ class MegaMoeTP:
             group=group,
             device=device,
             fit_max_local=fit,
+            shared=shared,
         )
         if big_ok and bmin != 0 and self.engine.mmax < small_max:
             lim = self.engine.mmax + 1
@@ -366,6 +393,7 @@ class MegaMoeTP:
                 device=a["device"],
                 act=cfg.activation.name.lower(),
                 ygather=cfg.comm_mode == "ar",
+                shared=self.shared,
                 situ=(
                     cfg.beta if cfg.beta is not None else 1.0,
                     cfg.linear_beta if cfg.linear_beta is not None else 1.0,
@@ -399,12 +427,20 @@ class MegaMoeTP:
         w1_scale: torch.Tensor,
         w2: torch.Tensor,
         w2_scale: torch.Tensor,
+        w1_shared: torch.Tensor | None = None,
+        w1_shared_scale: torch.Tensor | None = None,
+        w2_shared: torch.Tensor | None = None,
+        w2_shared_scale: torch.Tensor | None = None,
     ) -> None:
-        """Run the next forwards on another layer's weights of the same shape."""
-        self.engine.set_weights(w1, w1_scale, w2, w2_scale)
+        """Run the next forwards on another layer's weights of the same shape (and the same
+        shared expert format)."""
+        shared = (w1_shared, w1_shared_scale, w2_shared, w2_shared_scale)
+        shared = None if w1_shared is None else shared
+        self.engine.set_weights(w1, w1_scale, w2, w2_scale, shared)
+        self.shared = shared
         self._bigm_args.update(w1=w1, w1_scale=w1_scale, w2=w2, w2_scale=w2_scale)
         if self._bigm is not None:
-            self._bigm.set_weights(w1, w1_scale, w2, w2_scale)
+            self._bigm.set_weights(w1, w1_scale, w2, w2_scale, shared=shared)
 
     def prepare(
         self,

@@ -131,7 +131,12 @@ class MegaMoeTPBigM:
         act="swiglu",
         ygather=False,
         situ=(1.0, 1.0),
+        shared=None,
     ):
+        """shared: the shared expert's (index experts) MXFP8 (w1, w1_scale, w2, w2_scale)
+        (mega_moe_tp.shuffle_weight_mega_fp8 + e8m0_shuffle); w1 / w2 then the routed ones
+        only (experts)"""
+        self.sh8 = shared is not None
         self.H, self.I, self.E, self.K = hidden, inter, experts, topk
         self.K1, self.NE = topk + 1, experts + 1
         self.tp = dist.get_world_size(group)
@@ -154,6 +159,7 @@ class MegaMoeTPBigM:
             w2.view(torch.uint8),
             w2_scale.view(torch.uint8),
         )
+        self.wsh = tuple(t.view(torch.uint8) for t in shared) if self.sh8 else None
         H, T, K1, tp = hidden, max_tokens, self.K1, self.tp
         # the E (reduce-scatter) rows: int8 + scales, or bf16 (AITER_BIGM_EB, comm_dtype bf16)
         RB = 2 * H if dict(self.opts).get("AITER_BIGM_EB") == "1" else i8_row_bytes(H)
@@ -464,14 +470,17 @@ class MegaMoeTPBigM:
             )
         return c
 
-    def set_weights(self, w1, w1_scale, w2, w2_scale):
+    def set_weights(self, w1, w1_scale, w2, w2_scale, shared=None):
         """the next launches use another layer's weights of the same shape"""
+        if (shared is not None) != self.sh8:
+            raise ValueError("MegaMoeTP big-M: the shared expert's MXFP8 weights, iff built so")
         self.w = (
             w1.view(torch.uint8),
             w1_scale.view(torch.uint8),
             w2.view(torch.uint8),
             w2_scale.view(torch.uint8),
         )
+        self.wsh = tuple(t.view(torch.uint8) for t in shared) if self.sh8 else None
 
     def _ucap(self, T):
         return unit_cap(
@@ -627,6 +636,7 @@ class MegaMoeTPBigM:
             situ_beta=self.situ[0],
             situ_linear_beta=self.situ[1],
             xl=xl,
+            sh8=self.sh8,
         )
 
     def io_rows_per_kernel(self, lo, hi):
@@ -711,6 +721,7 @@ class MegaMoeTPBigM:
                 w1s.data_ptr(),
                 w2.data_ptr(),
                 w2s.data_ptr(),
+                *((t.data_ptr() for t in self.wsh) if self.sh8 else (0, 0, 0, 0)),
                 self.ctrl.data_ptr(),
                 chunks.data_ptr(),
                 self.rank,

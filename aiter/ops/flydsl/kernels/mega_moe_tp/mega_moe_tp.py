@@ -310,10 +310,14 @@ class MegaMoeTPEngine:
         group=None,
         device: torch.device | None = None,
         fit_max_local: bool = False,
+        shared: tuple | None = None,
     ):
         """fit_max_local: max_local_tokens is an upper bound, lowered to the largest count
         the kernel takes (its tables, 32-bit offsets, LDS; see capacity) instead of
-        raising."""
+        raising. shared: (w1, w1_scale, w2, w2_scale) of the shared expert (the last one,
+        experts - 1) as MXFP8 (shuffle_weight_mega_fp8 + e8m0_shuffle); w1 / w2 then hold
+        the routed experts (experts - 1 of them) only."""
+        self.sh8 = shared is not None
         if not mega_moe_tp_shape_supported(model_dim, inter_dim, world_size):
             raise ValueError(
                 f"fused TP MegaMoE does not tile h{model_dim} i{inter_dim} tp{world_size}"
@@ -388,7 +392,7 @@ class MegaMoeTPEngine:
         if swiglu_limit is None:
             swiglu_limit = 7.0 if activation == "swiglu" else float("inf")
         self.swiglu_limit = float(swiglu_limit)
-        self._bind_weights(w1, w1_scale, w2, w2_scale)
+        self._bind_weights(w1, w1_scale, w2, w2_scale, shared)
 
         props = torch.cuda.get_device_properties(self.device)
         self.n_cta = int(props.multi_processor_count)
@@ -534,23 +538,36 @@ class MegaMoeTPEngine:
                 bad.append(f"{what} within 32-bit offsets")
         return bad
 
-    def _bind_weights(self, w1, w1_scale, w2, w2_scale) -> None:
+    def _bind_weights(self, w1, w1_scale, w2, w2_scale, shared=None) -> None:
         w = tuple(t.view(torch.uint8) for t in (w1, w1_scale, w2, w2_scale))
-        H, I, E = self.H, self.I, self.E
-        for name, t, n in (
+        H, I = self.H, self.I
+        E = self.E - 1 if self.sh8 else self.E  # (sh8: the routed experts' MXFP4)
+        need = [
             ("w1", w[0], E * 2 * I * H // 2),
             ("w1_scale", w[1], E * 2 * I * H // 32),
             ("w2", w[2], E * H * I // 2),
             ("w2_scale", w[3], E * H * I // 32),
-        ):
+        ]
+        if (shared is not None) != self.sh8:
+            raise ValueError("shared: the MXFP8 shared expert's weights, iff built with them")
+        if self.sh8:
+            sh = tuple(t.view(torch.uint8) for t in shared)
+            need += [
+                ("shared w1", sh[0], 2 * I * H),
+                ("shared w1_scale", sh[1], 2 * I * H // 32),
+                ("shared w2", sh[2], H * I),
+                ("shared w2_scale", sh[3], H * I // 32),
+            ]
+        for name, t, n in need:
             if t.device != self.device or not t.is_contiguous() or t.numel() < n:
                 raise ValueError(
                     f"{name}: need a contiguous tensor of >= {n} bytes on {self.device}"
                 )
         self.w1, self.w1s, self.w2, self.w2s = w
+        self.wsh = sh if self.sh8 else None
 
-    def set_weights(self, w1, w1_scale, w2, w2_scale) -> None:
-        self._bind_weights(w1, w1_scale, w2, w2_scale)
+    def set_weights(self, w1, w1_scale, w2, w2_scale, shared=None) -> None:
+        self._bind_weights(w1, w1_scale, w2, w2_scale, shared)
         self._args = (None, None)
 
     def _chunks(self, mt: int, mmax: int = 0, lb: bool = False) -> tuple[int, int]:
@@ -802,6 +819,12 @@ class MegaMoeTPEngine:
                 )
                 # (ar small-M: every row quantized by this rank's CTAs, agr rows each)
                 assert not cfg.alq or tot <= self.agr * (cfg.nc or self.n_cta)
+            elif self.sh8:
+                # (the MXFP8 shared expert's loaders: the small-M and big-M schedules)
+                raise ValueError(
+                    f"MXFP8 shared expert: {tot} tokens are beyond the small-M schedule "
+                    "(fp4 activations, <= 256 tokens; larger batches: big-M)"
+                )
             elif self.a16:
                 raise ValueError(
                     f'act_dtype="bf16": {tot} tokens are beyond the small-M schedule'
@@ -913,6 +936,7 @@ class MegaMoeTPEngine:
                 nsk=cfg.nsk,
                 xd=cfg.xd,
                 alq=cfg.alq,
+                sh8=self.sh8,
             )
             self._launchers[self._key(cfg)] = fn
         return fn
@@ -1060,6 +1084,7 @@ class MegaMoeTPEngine:
             self.w1s.data_ptr(),
             self.w2.data_ptr(),
             self.w2s.data_ptr(),
+            *((t.data_ptr() for t in self.wsh) if self.sh8 else (0, 0, 0, 0)),
             ptr(x),
             ptr(ids),
             ptr(tw),

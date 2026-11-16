@@ -155,6 +155,7 @@ def compile_mega_moe_tp(
     nsk: int = 0,
     xd: bool = False,
     alq: bool = False,
+    sh8: bool = False,
 ):
     """Build the launcher of one (shape, variant) instance; LaunchCfg (host) picks them.
 
@@ -460,6 +461,10 @@ def compile_mega_moe_tp(
         w1s: fx.Int64,
         w2: fx.Int64,
         w2s: fx.Int64,
+        w1h: fx.Int64,
+        w1hs: fx.Int64,
+        w2h: fx.Int64,
+        w2hs: fx.Int64,
         x: fx.Int64,
         ids_in: fx.Int64,
         tw_in: fx.Int64,
@@ -566,6 +571,10 @@ def compile_mega_moe_tp(
         w1s: fx.Int64,
         w2: fx.Int64,
         w2s: fx.Int64,
+        w1h: fx.Int64,
+        w1hs: fx.Int64,
+        w2h: fx.Int64,
+        w2hs: fx.Int64,
         x: fx.Int64,
         ids_in: fx.Int64,
         tw_in: fx.Int64,
@@ -652,12 +661,15 @@ def compile_bigm_kernel(
     situ_beta: float = 1.0,
     situ_linear_beta: float = 1.0,
     xl: bool = False,
+    sh8: bool = False,
 ):
     """act: the units' activation ("swiglu", "silu", "situv2" with situ_beta / situ_linear_beta);
     E < 1024 routed experts (+ the last one, counted apart: a fused shared expert, or the last
     routed one).
     tailq: 0 no tail, 1 the tail with the q gather, 2 the local tail (this rank's q rows),
     3 no tail, y of every rank's rows (bf16, the "q" region: the y gather of the ar mode).
+    sh8: the shared expert (index E) with MXFP8 weights (w1h / w1hs / w2h / w2hs), the routed
+    ones MXFP4 (w1 / w2: E experts).
     The MoE interface (MegaMoeTP.forward, ag_rs): the caller's normed own rows x [m, H] and their
     routing (ids / tw [m, K1], the shared expert's column included) are gathered; the tail sums the
     MoE output (y), and with tailq res_out = y + res_in, the next-layer norm + FP8 rows of every
@@ -799,6 +811,7 @@ def compile_bigm_kernel(
         (situ_beta, situ_linear_beta),
         AUX_SYS if RWT else 0,
         i8r=I8R,
+        sh8=sh8,
     )
     # partial units (tuned per plan): a unit of at most 64 rows (an expert's last) runs a
     # 64-row body (half the MFMA tiles; same LDS ranges, within the full layout), one of
@@ -809,11 +822,11 @@ def compile_bigm_kernel(
         bu = (BST, BS2, act, swiglu_limit, R8, (situ_beta, situ_linear_beta))
         rx_ = AUX_SYS if RWT else 0
         lay_h, unit_body_h = build_bigm_unit(
-            H, I, K1, RG // 2, NAB, *bu, rx_, i8r=I8R
+            H, I, K1, RG // 2, NAB, *bu, rx_, i8r=I8R, sh8=sh8
         )
         assert lay_h["BYTES"] <= lay["BYTES"]
         _, unit_body_q = build_bigm_unit(
-            H, I, K1, RG, NAB, *bu, rx_, mtc=6, i8r=I8R
+            H, I, K1, RG, NAB, *bu, rx_, mtc=6, i8r=I8R, sh8=sh8
         )
     # row-phase / plan scratch after the unit's LDS (also reused ranges)
     LBASE = lay["BYTES"]
@@ -927,6 +940,7 @@ def compile_bigm_kernel(
         + ("_ydb" if YDB else "")
         + ("_ydc" if YDC else "")
         + ("_trace" if BTRACE else "")
+        + ("_sh8" if sh8 else "")
         + ("_hu2" if HU else "")
         + ("_yq2" if QY != QQ else "")
         + ("_i8r" if I8R else "")
@@ -1133,6 +1147,10 @@ def compile_bigm_kernel(
         w1s: fx.Int64,
         w2: fx.Int64,
         w2s: fx.Int64,
+        w1h: fx.Int64,
+        w1hs: fx.Int64,
+        w2h: fx.Int64,
+        w2hs: fx.Int64,
         ctrl: fx.Int64,
         chunks: fx.Int64,  # [C][2] int32: (rows offset o, rows s) per rank
         rank: fx.Int32,
@@ -1903,6 +1921,8 @@ def compile_bigm_kernel(
                     r_rt,
                     nrt * i32(H * 2),
                 )
+                if const_expr(sh8):  # (the MXFP8 shared expert, index E)
+                    uargs = uargs + ((w1h, w2h, rsrc(w1hs), rsrc(w2hs), i32(E)),)
                 if const_expr(HU):
                     if rows <= i32(RG // 2):
                         unit_body_h(*uargs)
@@ -2597,6 +2617,10 @@ def compile_bigm_kernel(
         w1s: fx.Int64,
         w2: fx.Int64,
         w2s: fx.Int64,
+        w1h: fx.Int64,
+        w1hs: fx.Int64,
+        w2h: fx.Int64,
+        w2hs: fx.Int64,
         ctrl: fx.Int64,
         chunks: fx.Int64,
         rank: fx.Int32,

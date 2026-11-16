@@ -352,6 +352,7 @@ def kernel_config(
     nsk: int = 0,
     xd: bool = False,
     alq: bool = False,
+    sh8: bool = False,
 ):
     """The derived compile-time values of one compile_mega_moe_tp instance."""
     a8 = a8 or a16
@@ -494,6 +495,7 @@ def kernel_config(
         + (f"_bpf{BPF}" if BPF else "")
         + ("_xd" if XD else "")
         + ("_alq" if sm and ar and alq else "")
+        + ("_sh8" if sh8 else "")
         + ("_llb" if sm and ar and comm_bf16 and not ar2 and os.environ.get("AITER_MEGAMOE_TP_LLB", "0") == "1" else "")
     )
     # small-M schedule (smallm.py): needs the dynamic schedule's LL route rows
@@ -514,6 +516,10 @@ def kernel_config(
     LLB = bool(
         RAW and ARLL and comm_bf16 and os.environ.get("AITER_MEGAMOE_TP_LLB", "0") == "1"
     )
+    # the shared expert (the last one, E - 1) with MXFP8 weights (their own tensors: w1h /
+    # w2h + e8m0 scales), the routed ones MXFP4: its GEMM1 / GEMM2 take the W8 loaders
+    SH8 = bool(sh8)
+    SH = E - 1
     # (small-M ar: every rank holds every row) each rank quantizes all rows into its own
     # activation buffers instead of its 1 / tp all-gathered: no xGMI hop before GEMM1
     ALQ = bool(SM and ar and alq)
