@@ -1,7 +1,7 @@
 # Known pre-existing non-strict accuracy failures for test_moe_2stage.py's
 # full-profile matrix (mxfp4 per_1x32/Swiglu, gateMode=separated), MI35X
 # (gfx950), full default token sweep. Source: main run 41552231943, job
-# 125695520646.
+# 125695520646. See #8034 for background on these known failures.
 #
 # dtype and gateMode are included alongside token/qType/actType/AQDType/
 # WQDType so an unrelated failure (e.g. a different dtype or gate mode)
