@@ -5,8 +5,8 @@
 The expected pages are built in torch from the bf16 K / V / index-K rows the same op writes
 with kv_cache_dtype "auto" (norm + RoPE, rounded to bf16; checked against torch in
 test_fused_qknorm_idxrqknorm.py): scale = e4m3_rne(min(amax/6/gs, 448)) per 16 elements,
-e2m1 nearest grid value with ties to the even code, bytes placed by the page layout of
-ATOM's nvfp4_pages.py. Whole pages are compared byte for byte (checkAllclose with zero tolerance), on pages
+e2m1 nearest grid value with ties to the even code, bytes placed by the page format below.
+Whole pages are compared byte for byte (checkAllclose with zero tolerance), on pages
 pre-filled with garbage (a V nibble must clear its old value), with scattered, skipped and
 octet-sharing slots. The summary table times the nvfp4 write against the mxfp4 and fp8 write
 modes of the same kernel at 1 / 64 / 8192 / 32768 tokens.
@@ -360,6 +360,26 @@ REJECT = {  # name -> (kwargs of the op call, message of the refusal); a failed 
         {"index_cache_dtype": "auto"},
         "go together",
     ),
+    "index nvfp4 only, kv auto": (
+        {"kv_cache_dtype": "auto"},
+        "go together",
+    ),
+    "index nvfp4 only, kv mxfp4": (
+        {"kv_cache_dtype": "mxfp4"},
+        "go together",
+    ),
+    "kv nvfp4, index mxfp4": (
+        {"index_cache_dtype": "mxfp4"},
+        "go together",
+    ),
+    "index not whole pages": (
+        {"idx_bytes": HEAD_SIDE + 128},
+        "whole 9216 B pages",
+    ),
+    "index fewer pages than kv": (
+        {"idx_bytes": HEAD_SIDE},
+        "index_cache must contain at least num_blocks * block_size rows",
+    ),
     "no scales": (
         {"k_scale": None, "v_scale": None},
         "takes the fp32 global k_scale/v_scale",
@@ -379,7 +399,6 @@ def run_reject(name):
     pos = torch.zeros(n, dtype=torch.int64)
     slots = torch.arange(n, dtype=torch.int64)
     kv = torch.zeros(2, 2 * nkv * HEAD_SIDE, dtype=torch.uint8)
-    idx = torch.zeros(2, HEAD_SIDE, dtype=torch.uint8)
     kw = {
         "kv_cache_dtype": "nvfp4",
         "index_cache_dtype": "nvfp4",
@@ -388,6 +407,7 @@ def run_reject(name):
     }
     kw.update(REJECT[name][0])
     block = kw.pop("block", PAGE)
+    idx = torch.zeros(kw.pop("idx_bytes", 2 * HEAD_SIDE), dtype=torch.uint8)
     if kw.pop("alias", False):
         kv = kv[:1].expand(2, -1)  # page stride 0: both pages are the same bytes
     aiter.fused_qknorm_idxrqknorm(
